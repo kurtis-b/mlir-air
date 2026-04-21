@@ -19,7 +19,10 @@ import os
 import shutil
 import subprocess
 
-from ml_dtypes import bfloat16
+try:
+    from ml_dtypes import bfloat16
+except ImportError:
+    bfloat16 = None
 
 # Device name mappings aligned with mlir-aie (hostruntime.py, lit_config_helpers.py)
 # Maps generation name to list of model strings that may appear in xrt-smi
@@ -524,7 +527,7 @@ class XRTBackend(AirBackend):
                 bos = [xrt.ext.bo(self.device, s) for s in sizes_in_bytes]
 
                 for i, a in enumerate(args):
-                    if a.dtype == bfloat16:
+                    if bfloat16 is not None and a.dtype == bfloat16:
                         a = a.view(np.int16)
                     bos[i].write(a, 0)
                     bos[i].sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
@@ -593,7 +596,7 @@ class XRTBackend(AirBackend):
 
                 self.bo_instr.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
                 for i, a in enumerate(args):
-                    if a.dtype == bfloat16:
+                    if bfloat16 is not None and a.dtype == bfloat16:
                         # store bfloat16 in binary as int16
                         a = a.view(np.int16)
                     bos[i].write(a, 0)

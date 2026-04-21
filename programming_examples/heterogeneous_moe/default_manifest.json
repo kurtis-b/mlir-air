@@ -1,0 +1,42 @@
+{
+  "model": {
+    "batch_tokens": 4,
+    "hidden_size": 16,
+    "ffn_size": 32,
+    "dtype": "bf16"
+  },
+  "paths": {
+    "air_sources": "air",
+    "gpu_sources": "air_gpu",
+    "artifacts": "artifacts"
+  },
+  "runtime": {
+    "router_mode": "top2",
+    "transfer_mode": "auto",
+    "stage_backends": {
+      "router": "cpu",
+      "expert0": "cpu",
+      "expert1": "cpu",
+      "aggregation": "cpu"
+    }
+  },
+  "compiler": {
+    "npu_device": "npu2",
+    "gpu_arch": "gfx1150"
+  },
+  "benchmark": {
+    "warmup": 1,
+    "iterations": 3
+  },
+  "inputs": {
+    "seed": 17
+  },
+  "weights": {
+    "seed": 7
+  },
+  "artifacts": {
+    "router": {},
+    "expert": {},
+    "aggregation": {}
+  }
+}

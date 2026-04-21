@@ -12,8 +12,12 @@ from air.dialects.air import *
 import filelock
 from typing import List
 from collections import defaultdict
-from ml_dtypes import bfloat16
 import timeit
+
+try:
+    from ml_dtypes import bfloat16
+except ImportError:
+    bfloat16 = None
 
 TYPE_MAP_DICT = defaultdict(
     lambda: None,
@@ -32,9 +36,10 @@ TYPE_MAP_DICT = defaultdict(
         np.float16: T.f16,
         np.float32: T.f32,
         np.float64: T.f64,
-        bfloat16: T.bf16,
     },
 )
+if bfloat16 is not None:
+    TYPE_MAP_DICT[bfloat16] = T.bf16
 
 
 def type_mapper(np_dtype):
@@ -366,8 +371,11 @@ class XRTRunner:
                 else:
                     print(actual)
 
-            if expected.dtype in [np.float16, np.float32, np.float64, bfloat16]:
-                if expected.dtype == bfloat16:
+            float_types = [np.float16, np.float32, np.float64]
+            if bfloat16 is not None:
+                float_types.append(bfloat16)
+            if expected.dtype in float_types:
+                if bfloat16 is not None and expected.dtype == bfloat16:
                     expected = expected.astype(np.float64)
                     actual = actual.astype(np.float64)
 
@@ -495,13 +503,11 @@ class XRTRunner:
                 else:
                     print(actual)
 
-            if expected["values"][0].dtype in [
-                np.float16,
-                np.float32,
-                np.float64,
-                bfloat16,
-            ]:
-                if expected["values"][0].dtype == bfloat16:
+            float_types = [np.float16, np.float32, np.float64]
+            if bfloat16 is not None:
+                float_types.append(bfloat16)
+            if expected["values"][0].dtype in float_types:
+                if bfloat16 is not None and expected["values"][0].dtype == bfloat16:
                     expected["values"] = expected["values"].astype(np.float64)
                     actual = actual.astype(np.float64)
                 actual_stochastic = actual[tuple(expected["indices"])]
