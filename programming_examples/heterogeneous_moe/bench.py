@@ -11,10 +11,10 @@ from pathlib import Path
 from case_runner import RunCaseOptions, apply_case_to_manifest, run_case_with_trace
 from manifest import load_json, project_dir, save_json
 from orchestrator import MoERuntime
-from results import CSV_FIELDNAMES, result_csv_row
+from results import CSV_FIELDNAMES, correctness_failure_message, result_csv_row
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the fixed-placement heterogeneous MoE benchmark.")
     parser.add_argument("--manifest", default="default_manifest.json", help="Manifest path relative to this directory.")
     parser.add_argument("--prepare", action="store_true", help="Compile and load any selected non-CPU executors, then exit.")
@@ -41,8 +41,9 @@ def main() -> int:
     parser.add_argument("--transfer-summary-out", default=None, help="Optional JSON file for transfer accounting summary.")
     parser.add_argument("--device-events-out", default=None, help="Optional JSON file for host/device event summary.")
     parser.add_argument("--npu-dev-report-out", default=None, help="Optional JSON file for the host-side NPU development report.")
+    parser.add_argument("--require-correctness", action="store_true", help="Fail if final output validation is outside dtype tolerances.")
     parser.add_argument("--require-torch", action="store_true", help="Fail if torch-backed validation is unavailable or fails.")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     manifest_path = (project_dir() / args.manifest).resolve()
     manifest = load_json(manifest_path)
@@ -71,12 +72,16 @@ def main() -> int:
             iterations=args.iterations,
             warmup=args.warmup,
             measurement_mode=args.measurement_mode,
-            command_line=[sys.executable, *sys.argv],
+            command_line=[sys.executable, *sys.argv] if argv is None else [sys.executable, "bench.py", *argv],
         ),
     )
 
     if args.require_torch and not results["torch_validation"]["ok"]:
         raise SystemExit(f"torch validation failed: {results['torch_validation']['message']}")
+    if args.require_correctness:
+        failure = correctness_failure_message(results)
+        if failure is not None:
+            raise SystemExit(f"correctness validation failed: {failure}")
 
     print(results)
 

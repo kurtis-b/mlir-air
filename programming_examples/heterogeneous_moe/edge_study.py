@@ -18,7 +18,7 @@ PROFILE_SUITES = {
 }
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the canonical heterogeneous MoE edge-efficiency study.")
     parser.add_argument("--manifest", default="default_manifest.json", help="Base manifest relative to this directory.")
     parser.add_argument("--matrix", default="default_benchmark_matrix.json", help="Benchmark matrix relative to this directory.")
@@ -42,10 +42,11 @@ def main() -> int:
         help="Measure cold start, warm steady-state, or both.",
     )
     parser.add_argument("--allow-npu", action="store_true", help="Run NPU-tagged cases.")
+    parser.add_argument("--require-correctness", action="store_true", help="Fail if final output validation is outside dtype tolerances.")
     parser.add_argument("--require-torch", action="store_true", help="Fail if torch validation is unavailable or fails.")
     parser.add_argument("--workload-filter", nargs="*", default=[], help="Forwarded workload name filters.")
     parser.add_argument("--case-filter", nargs="*", default=[], help="Forwarded exact case-name filters.")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     root = project_dir()
     output_dir = (root / args.output_dir).resolve()
@@ -71,6 +72,8 @@ def main() -> int:
         cmd.extend(["--warmup", str(args.warmup)])
     if args.allow_npu:
         cmd.append("--allow-npu")
+    if args.require_correctness:
+        cmd.append("--require-correctness")
     if args.require_torch:
         cmd.append("--require-torch")
     if args.workload_filter:
@@ -85,7 +88,10 @@ def main() -> int:
         return completed.returncode
 
     suite_summary = load_json(suite_output / "summary.json")
-    study_summary = build_edge_study_summary(suite_summary, [sys.executable, *sys.argv])
+    study_summary = build_edge_study_summary(
+        suite_summary,
+        [sys.executable, *sys.argv] if argv is None else [sys.executable, "edge_study.py", *argv],
+    )
     save_json(output_dir / "edge_efficiency_summary.json", study_summary)
     (output_dir / "edge_efficiency_report.md").write_text(edge_study_markdown(study_summary), encoding="utf-8")
     print(f"Wrote edge-efficiency study outputs to {output_dir}")

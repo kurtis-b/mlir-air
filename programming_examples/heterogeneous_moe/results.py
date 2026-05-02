@@ -205,11 +205,27 @@ def correctness_summary(last_run: dict[str, Any]) -> dict[str, Any]:
     return {
         "validated": bool(last_run.get("stage_metrics")),
         "output_max_abs_error": output_metrics.get("max_abs_error"),
+        "output_atol": output_metrics.get("atol"),
+        "output_rtol": output_metrics.get("rtol"),
         "output_allclose": output_metrics.get("allclose"),
         "torch_ran": bool(torch_validation.get("ran")),
         "torch_ok": bool(torch_validation.get("ok")),
         "torch_message": torch_validation.get("message"),
     }
+
+
+def correctness_failure_message(result: dict[str, Any]) -> str | None:
+    correctness = result.get("correctness", {})
+    if not correctness.get("validated"):
+        return "correctness validation did not produce stage metrics"
+    if correctness.get("output_allclose"):
+        return None
+
+    output_metrics = result.get("stage_metrics", {}).get("output", {})
+    max_abs_error = output_metrics.get("max_abs_error")
+    atol = output_metrics.get("atol")
+    rtol = output_metrics.get("rtol")
+    return f"output correctness failed: max_abs_error={max_abs_error}, atol={atol}, rtol={rtol}"
 
 
 def benchmark_measurement_block(

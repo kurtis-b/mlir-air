@@ -4,3 +4,5 @@ nanobind>=2.9
 lit
 # lit requires psutil to set timeouts
 psutil
+pytest
+coverage

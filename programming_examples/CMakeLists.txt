@@ -118,4 +118,14 @@ add_lit_testsuite(check-programming-examples "Running AIR programming examples (
 )
 set_target_properties(check-programming-examples PROPERTIES FOLDER "Tests")
 
+if(Python3_Interpreter_FOUND)
+  add_custom_target(check-heterogeneous-moe-coverage
+    COMMAND ${Python3_EXECUTABLE} run_coverage.py
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/heterogeneous_moe
+    COMMENT "Running heterogeneous MoE Python coverage gate"
+    USES_TERMINAL
+  )
+  set_target_properties(check-heterogeneous-moe-coverage PROPERTIES FOLDER "Tests")
+endif()
+
 add_dependencies(check-all check-programming-examples)

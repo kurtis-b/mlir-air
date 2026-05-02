@@ -23,6 +23,7 @@ from reference import (
     routed_inputs,
     run_reference,
     topk_weights,
+    validation_tolerances,
 )
 from results import edge_study_limitations, stage_metrics
 from trace import TraceRecorder, summarize_device_events
@@ -322,7 +323,11 @@ class MoERuntime:
         torch_validation = {"ran": False, "ok": False, "message": "skipped"}
         if validate:
             reference = run_reference(self.cfg, inputs, self.weights, router_mode)
-            per_stage_metrics = stage_metrics(actual_bundle, reference)
+            per_stage_metrics = stage_metrics(
+                actual_bundle,
+                reference,
+                **validation_tolerances(self.cfg.dtype),
+            )
             max_abs_error = float(per_stage_metrics["output"]["max_abs_error"])
             torch_validation = optional_torch_validation(
                 inputs,
@@ -467,7 +472,11 @@ class MoERuntime:
         )
         if validate:
             reference = run_reference(logical_cfg, inputs, self.weights, router_mode)
-            per_stage_metrics = stage_metrics(actual_bundle, reference)
+            per_stage_metrics = stage_metrics(
+                actual_bundle,
+                reference,
+                **validation_tolerances(self.cfg.dtype),
+            )
             max_abs_error = float(per_stage_metrics["output"]["max_abs_error"])
             torch_validation = optional_torch_validation(
                 inputs,

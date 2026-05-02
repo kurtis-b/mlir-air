@@ -10,7 +10,7 @@ from manifest import load_json, project_dir
 from reports import matrix_report_markdown, write_markdown
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Render a markdown report from benchmark matrix outputs.")
     parser.add_argument(
         "--summary",
@@ -23,7 +23,7 @@ def main() -> int:
         help="Markdown report path relative to this directory.",
     )
     parser.add_argument("--title", default="Heterogeneous MoE CPU/GPU Report")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     summary_path = Path(args.summary)
     if not summary_path.is_absolute():

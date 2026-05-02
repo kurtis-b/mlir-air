@@ -25,7 +25,8 @@ def _check(cfg: KernelConfig) -> list[str]:
     return mismatches
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    del argv
     configs = [
         KernelConfig(batch_tokens=4, hidden_size=16, ffn_size=32, dtype="bf16"),
     ]

@@ -94,6 +94,8 @@ def array_error_metrics(
         "mean_abs_error": float(np.mean(abs_delta)),
         "rmse": float(np.sqrt(np.mean(np.square(delta_f64)))),
         "max_abs_expected": float(np.max(np.abs(expected_f32))),
+        "atol": float(atol),
+        "rtol": float(rtol),
         "allclose": bool(np.allclose(actual_f32, expected_f32, atol=atol, rtol=rtol)),
     }
 

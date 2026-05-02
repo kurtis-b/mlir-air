@@ -14,6 +14,7 @@ from compile import populate_artifacts
 from manifest import EDGE_STUDY_SCHEMA_VERSION, load_json, project_dir, save_json
 from reference import DEFAULT_INPUT_SCALE, DEFAULT_ROUTING_PROFILE, DEFAULT_WEIGHT_SCALE
 from reports import suite_summary_markdown
+from results import correctness_failure_message
 from workloads import required_backends, routing_stats, suite_workloads
 
 
@@ -83,7 +84,7 @@ def _workload_summary(workload: dict[str, Any], manifest_path: str, manifest: di
     }
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run expanded workload suites for the heterogeneous MoE example.")
     parser.add_argument("--manifest", default="default_manifest.json", help="Base manifest relative to this directory.")
     parser.add_argument("--matrix", default="default_benchmark_matrix.json", help="Base benchmark matrix relative to this directory.")
@@ -108,6 +109,7 @@ def main() -> int:
         help="Measure cold start, warm steady-state, or both. Validation is always untimed.",
     )
     parser.add_argument("--allow-npu", action="store_true", help="Run NPU-tagged cases in each suite.")
+    parser.add_argument("--require-correctness", action="store_true", help="Fail if final output validation is outside dtype tolerances.")
     parser.add_argument("--require-torch", action="store_true", help="Fail if torch validation is unavailable or fails.")
     parser.add_argument(
         "--workload-filter",
@@ -121,7 +123,7 @@ def main() -> int:
         default=[],
         help="Only run benchmark cases whose names exactly match one of these values.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     root = project_dir()
     base_manifest = load_json((root / args.manifest).resolve())
@@ -190,11 +192,17 @@ def main() -> int:
                     iterations=args.iterations,
                     warmup=args.warmup,
                     measurement_mode=args.measurement_mode,
-                    command_line=[sys.executable, *sys.argv],
+                    command_line=[sys.executable, *sys.argv]
+                    if argv is None
+                    else [sys.executable, "run_workload_suite.py", *argv],
                 ),
             )
             if args.require_torch and not result["torch_validation"]["ok"]:
                 raise SystemExit(f"torch validation failed for {case['name']}: {result['torch_validation']['message']}")
+            if args.require_correctness:
+                failure = correctness_failure_message(result)
+                if failure is not None:
+                    raise SystemExit(f"correctness validation failed for {case['name']}: {failure}")
             save_json(case_results_dir / f"{case['name']}.json", result)
             workload_summary["cases"].append(result)
             csv_rows.append(_csv_row(workload_summary, manifest, result))

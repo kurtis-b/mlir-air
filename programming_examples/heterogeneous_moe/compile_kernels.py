@@ -9,7 +9,7 @@ from compile import populate_artifacts
 from manifest import load_json, project_dir, save_json
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Compile heterogeneous MoE AIR kernels for NPU and/or GPU.")
     parser.add_argument(
         "--manifest",
@@ -28,7 +28,7 @@ def main() -> int:
         default="artifacts/compiled_manifest.json",
         help="Output manifest path relative to the heterogeneous_moe directory.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     manifest_path = (project_dir() / args.manifest).resolve()
     manifest_out_path = (project_dir() / args.manifest_out).resolve()

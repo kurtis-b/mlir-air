@@ -1,0 +1,26 @@
+[run]
+branch = true
+source = .
+data_file = artifacts/coverage/latest/.coverage
+
+[report]
+show_missing = true
+skip_covered = false
+precision = 2
+omit =
+    tests/*
+    test_*.py
+    run_coverage.py
+    artifacts/*
+    air/*
+    air_project/*
+    __pycache__/*
+exclude_also =
+    if __name__ == .__main__.:
+    raise SystemExit\(main\(\)\)
+
+[html]
+directory = artifacts/coverage/latest/html
+
+[xml]
+output = artifacts/coverage/latest/coverage.xml

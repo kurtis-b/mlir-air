@@ -33,6 +33,7 @@ The default kernel shape is intentionally small so the generated kernels stay ex
 - `kernels.py`: emits the canonical AIR sources under `air/` that feed both the NPU and GPU compile flows.
 - `compile_kernels.py`: compiles the AIR sources for the requested backends, then writes a sidecar manifest with artifact paths.
 - `bench.py`: runs one benchmark configuration and can write structured JSON, CSV, trace summaries, stage metrics, and NPU development reports.
+- `smoke_tests.py`: runs first-class golden, CPU, GPU, mixed GPU, and hardware-gated NPU smoke lanes with final-output correctness gating.
 - `run_matrix.py`: runs a benchmark matrix and writes per-case JSON, aggregate CSV/JSON, and traces.
 - `run_workload_suite.py`: runs expanded shape, routing-profile, and model-anchored sweeps, compiling per-shape artifacts as needed and writing suite summaries.
 - `edge_study.py`: runs a canonical edge-efficiency suite and summarizes whether mixed CPU/iGPU/NPU placements beat single-backend baselines after transfer and launch overhead.
@@ -60,7 +61,15 @@ python3 bench.py --iterations 1 --warmup 0 \
   --expert1-backend cpu \
   --aggregation-backend cpu \
   --router-mode top2 \
+  --require-correctness \
   --require-torch
+```
+
+CI-safe MoE smoke entrypoint:
+
+```bash
+cd <mlir-air-repo>/programming_examples/heterogeneous_moe
+python3 smoke_tests.py --lane ci
 ```
 
 ## Compile Kernels
@@ -82,7 +91,7 @@ That command writes `artifacts/compiled_manifest.json` and leaves the checked-in
 CPU-only:
 
 ```bash
-python3 bench.py --router-backend cpu --expert0-backend cpu --expert1-backend cpu --aggregation-backend cpu --require-torch
+python3 bench.py --router-backend cpu --expert0-backend cpu --expert1-backend cpu --aggregation-backend cpu --require-correctness --require-torch
 ```
 
 GPU-only:
@@ -96,6 +105,7 @@ python3 bench.py --manifest artifacts/compiled_manifest.json \
   --expert1-backend gpu \
   --aggregation-backend gpu \
   --router-mode top2 \
+  --require-correctness \
   --require-torch
 ```
 
@@ -104,8 +114,16 @@ CPU/GPU benchmark matrix plus markdown report:
 ```bash
 export LLVM_INSTALL_DIR=<path-to-llvm-amdgpu-install>
 export ROCM_PATH=${ROCM_PATH:-/opt/rocm}
-python3 run_matrix.py --manifest artifacts/compiled_manifest.json --require-torch
+python3 run_matrix.py --manifest artifacts/compiled_manifest.json --require-correctness --require-torch
 python3 report.py --summary artifacts/benchmarks/latest/summary.json
+```
+
+GPU and mixed CPU/GPU smoke lanes:
+
+```bash
+export LLVM_INSTALL_DIR=<path-to-llvm-amdgpu-install>
+export ROCM_PATH=${ROCM_PATH:-/opt/rocm}
+python3 smoke_tests.py --lane gpu-all
 ```
 
 Expanded workload suites:
@@ -115,7 +133,7 @@ export LLVM_INSTALL_DIR=<path-to-llvm-amdgpu-install>
 export ROCM_PATH=${ROCM_PATH:-/opt/rocm}
 export AIRCC_PATH=<path-to-aircc>
 export AIR_OPT_PATH=<path-to-air-opt>
-python3 run_workload_suite.py --allow-npu --iterations 1 --warmup 1 \
+python3 run_workload_suite.py --allow-npu --require-correctness --iterations 1 --warmup 1 \
   --output-dir artifacts/benchmarks/workload_suites/latest
 ```
 
@@ -127,6 +145,7 @@ export ROCM_PATH=${ROCM_PATH:-/opt/rocm}
 export AIRCC_PATH=<path-to-aircc>
 export AIR_OPT_PATH=<path-to-air-opt>
 python3 edge_study.py --profile routing --measurement-mode both --allow-npu \
+  --require-correctness \
   --iterations 3 --warmup 1 \
   --output-dir artifacts/benchmarks/edge_study/latest
 ```
@@ -141,6 +160,7 @@ export ROCM_PATH=${ROCM_PATH:-/opt/rocm}
 export AIRCC_PATH=<path-to-aircc>
 export AIR_OPT_PATH=<path-to-air-opt>
 python3 run_workload_suite.py --suite model_presets --allow-npu --require-torch \
+  --require-correctness \
   --iterations 1 --warmup 0 \
   --output-dir artifacts/benchmarks/workload_suites/model_presets_latest
 ```
@@ -154,7 +174,7 @@ export AIR_OPT_PATH=<path-to-air-opt>
 python3 run_workload_suite.py --suite model_presets \
   --workload-filter qwen36_35b_a3b_qbf16 \
   --case-filter cpu_top2 gpu_top2 \
-  --require-torch --iterations 1 --warmup 0 \
+  --require-correctness --require-torch --iterations 1 --warmup 0 \
   --output-dir artifacts/benchmarks/workload_suites/qwen_context_sweep
 ```
 
@@ -166,6 +186,7 @@ export ROCM_PATH=${ROCM_PATH:-/opt/rocm}
 export AIRCC_PATH=<path-to-aircc>
 export AIR_OPT_PATH=<path-to-air-opt>
 python3 run_workload_suite.py --suite shape_sweep --allow-npu --require-torch \
+  --require-correctness \
   --iterations 3 --warmup 1 \
   --output-dir artifacts/benchmarks/workload_suites/apr21_shape_sweep_stable
 ```
@@ -186,7 +207,8 @@ python3 bench.py \
 
 - The bias terms are omitted in v1 to keep the AIR kernel interface within the current Python XRT backend argument limit.
 - `peer` transfer mode currently models copy elision on CPU-facing edges and same-backend edges in the NumPy host-array runtime. Direct `npu <-> gpu` peer transfer is intentionally reported as unsupported in `peer` mode and falls back to host staging only in `auto`.
-- PyTorch validation now compares actual stage outputs against a PyTorch eager reference and can be required with `--require-torch`.
+- Final-output validation uses dtype-aware tolerances in the recorded stage metrics and can be required with `--require-correctness`.
+- PyTorch validation compares actual stage outputs against a PyTorch eager reference and can be required with `--require-torch`.
 - The example defaults to `bf16` because that matches the Ryzen NPU data path. The harness does not require `ml_dtypes`; it marshals `bf16` buffers as raw `uint16` bit patterns when talking to the device runtime.
 - The default manifest uses `inputs.scale = 0.5` and `weights.scale = 0.5`. Unit-scale random tensors exaggerated dense `bf16` accumulation drift on the NPU and were not a good correctness target for this small demo.
 - `run_workload_suite.py` now applies a shape-aware validation scale ladder for the expanded shape sweep: `4x16x32 -> 0.5`, `4x24x48 -> 0.375`, `8x32x64 -> 0.25`, `8x40x80 -> 0.1875`, and `8x48x96 -> 0.125`.

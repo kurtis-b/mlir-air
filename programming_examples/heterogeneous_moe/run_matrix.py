@@ -10,7 +10,7 @@ from pathlib import Path
 
 from case_runner import RunCaseOptions, contains_npu as _contains_npu, run_case_with_trace
 from manifest import EDGE_STUDY_SCHEMA_VERSION, load_json, project_dir, save_json
-from results import CSV_FIELDNAMES, result_csv_row
+from results import CSV_FIELDNAMES, correctness_failure_message, result_csv_row
 
 
 def _run_case(
@@ -19,6 +19,7 @@ def _run_case(
     iterations: int | None,
     warmup: int | None,
     measurement_mode: str,
+    command_line: list[str] | None = None,
 ) -> tuple[dict, object | None]:
     return run_case_with_trace(
         load_json(manifest_path),
@@ -29,12 +30,12 @@ def _run_case(
             iterations=iterations,
             warmup=warmup,
             measurement_mode=measurement_mode,
-            command_line=[sys.executable, *sys.argv],
+            command_line=command_line or [sys.executable, *sys.argv],
         ),
     )
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run a benchmark matrix for the heterogeneous MoE example.")
     parser.add_argument("--manifest", default="default_manifest.json", help="Manifest path relative to this directory.")
     parser.add_argument(
@@ -56,6 +57,7 @@ def main() -> int:
         help="Measure cold start, warm steady-state, or both. Validation is always untimed.",
     )
     parser.add_argument("--allow-npu", action="store_true", help="Run NPU-tagged cases in the matrix.")
+    parser.add_argument("--require-correctness", action="store_true", help="Fail if final output validation is outside dtype tolerances.")
     parser.add_argument("--require-torch", action="store_true", help="Fail if torch validation is unavailable or fails.")
     parser.add_argument(
         "--case-filter",
@@ -63,7 +65,7 @@ def main() -> int:
         default=[],
         help="Only run benchmark cases whose names exactly match one of these values.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     manifest_path = (project_dir() / args.manifest).resolve()
     matrix_path = (project_dir() / args.matrix).resolve()
@@ -95,9 +97,20 @@ def main() -> int:
             aggregate["skipped"].append({"case_name": case["name"], "reason": "NPU disabled for this run"})
             continue
 
-        result, trace = _run_case(manifest_path, case, args.iterations, args.warmup, args.measurement_mode)
+        result, trace = _run_case(
+            manifest_path,
+            case,
+            args.iterations,
+            args.warmup,
+            args.measurement_mode,
+            [sys.executable, *sys.argv] if argv is None else [sys.executable, "run_matrix.py", *argv],
+        )
         if args.require_torch and not result["torch_validation"]["ok"]:
             raise SystemExit(f"torch validation failed for {case['name']}: {result['torch_validation']['message']}")
+        if args.require_correctness:
+            failure = correctness_failure_message(result)
+            if failure is not None:
+                raise SystemExit(f"correctness validation failed for {case['name']}: {failure}")
 
         case_dir = output_dir / case["name"]
         case_dir.mkdir(parents=True, exist_ok=True)
