@@ -56,6 +56,20 @@ class MoERuntime:
         self._sources: dict[str, dict[str, Path]] = {}
         self.executors = self._make_executors()
         self._expert_pool = ThreadPoolExecutor(max_workers=2)
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._expert_pool.shutdown(wait=True)
+        self._closed = True
+
+    def __enter__(self) -> "MoERuntime":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        self.close()
+        return False
 
     def logical_batch_tokens(self) -> int:
         return int(self.manifest.get("workload", {}).get("routed_tokens", self.cfg.batch_tokens))

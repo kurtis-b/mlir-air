@@ -57,8 +57,8 @@ def main() -> int:
     }
 
     if args.prepare:
-        runtime = MoERuntime(apply_case_to_manifest(manifest, case))
-        runtime.prepare()
+        with MoERuntime(apply_case_to_manifest(manifest, case)) as runtime:
+            runtime.prepare()
         print("Prepared selected executors.")
         return 0
 

@@ -45,16 +45,16 @@ The default kernel shape is intentionally small so the generated kernels stay ex
 ## Sandbox Setup
 
 ```bash
-cd /home/cj/mlir-air/programming_examples/heterogeneous_moe
+cd <mlir-air-repo>/programming_examples/heterogeneous_moe
 ./setup_sandbox.sh
-source /home/cj/mlir-air/sandbox/bin/activate
+source ../../sandbox/bin/activate
 ```
 
 ## CPU Smoke Test
 
 ```bash
-cd /home/cj/mlir-air/programming_examples/heterogeneous_moe
-python bench.py --iterations 1 --warmup 0 \
+cd <mlir-air-repo>/programming_examples/heterogeneous_moe
+python3 bench.py --iterations 1 --warmup 0 \
   --router-backend cpu \
   --expert0-backend cpu \
   --expert1-backend cpu \
@@ -68,11 +68,11 @@ python bench.py --iterations 1 --warmup 0 \
 The checked-in compile inputs are the tiny default goldens under `air/`. Those AIR kernels drive both the NPU flow and the iGPU `air-to-rocdl` flow. Generated AIR variants and compiled outputs belong under ignored artifact/build roots such as `artifacts/`, `air_gpu/`, `air_probe*/`, and `air_project/`.
 
 ```bash
-cd /home/cj/mlir-air/programming_examples/heterogeneous_moe
-source /home/cj/mlir-air/sandbox/bin/activate
-export LLVM_INSTALL_DIR=/home/cj/mlir-air/llvm/install-amdgpu
-export ROCM_PATH=/opt/rocm
-python compile_kernels.py --backends gpu
+cd <mlir-air-repo>/programming_examples/heterogeneous_moe
+source ../../sandbox/bin/activate
+export LLVM_INSTALL_DIR=<path-to-llvm-amdgpu-install>
+export ROCM_PATH=${ROCM_PATH:-/opt/rocm}
+python3 compile_kernels.py --backends gpu
 ```
 
 That command writes `artifacts/compiled_manifest.json` and leaves the checked-in `default_manifest.json` portable.
@@ -82,15 +82,15 @@ That command writes `artifacts/compiled_manifest.json` and leaves the checked-in
 CPU-only:
 
 ```bash
-python bench.py --router-backend cpu --expert0-backend cpu --expert1-backend cpu --aggregation-backend cpu --require-torch
+python3 bench.py --router-backend cpu --expert0-backend cpu --expert1-backend cpu --aggregation-backend cpu --require-torch
 ```
 
 GPU-only:
 
 ```bash
-export LLVM_INSTALL_DIR=/home/cj/mlir-air/llvm/install-amdgpu
-export ROCM_PATH=/opt/rocm
-python bench.py --manifest artifacts/compiled_manifest.json \
+export LLVM_INSTALL_DIR=<path-to-llvm-amdgpu-install>
+export ROCM_PATH=${ROCM_PATH:-/opt/rocm}
+python3 bench.py --manifest artifacts/compiled_manifest.json \
   --router-backend gpu \
   --expert0-backend gpu \
   --expert1-backend gpu \
@@ -102,31 +102,31 @@ python bench.py --manifest artifacts/compiled_manifest.json \
 CPU/GPU benchmark matrix plus markdown report:
 
 ```bash
-export LLVM_INSTALL_DIR=/home/cj/mlir-air/llvm/install-amdgpu
-export ROCM_PATH=/opt/rocm
-python run_matrix.py --manifest artifacts/compiled_manifest.json --require-torch
-python report.py --summary artifacts/benchmarks/latest/summary.json
+export LLVM_INSTALL_DIR=<path-to-llvm-amdgpu-install>
+export ROCM_PATH=${ROCM_PATH:-/opt/rocm}
+python3 run_matrix.py --manifest artifacts/compiled_manifest.json --require-torch
+python3 report.py --summary artifacts/benchmarks/latest/summary.json
 ```
 
 Expanded workload suites:
 
 ```bash
-export LLVM_INSTALL_DIR=/home/cj/mlir-air/llvm/install-amdgpu
-export ROCM_PATH=/opt/rocm
-export AIRCC_PATH=/home/cj/mlir-air/build-npu/bin/aircc
-export AIR_OPT_PATH=/home/cj/mlir-air/build-rocdl-fix/bin/air-opt
-python run_workload_suite.py --allow-npu --iterations 1 --warmup 1 \
+export LLVM_INSTALL_DIR=<path-to-llvm-amdgpu-install>
+export ROCM_PATH=${ROCM_PATH:-/opt/rocm}
+export AIRCC_PATH=<path-to-aircc>
+export AIR_OPT_PATH=<path-to-air-opt>
+python3 run_workload_suite.py --allow-npu --iterations 1 --warmup 1 \
   --output-dir artifacts/benchmarks/workload_suites/latest
 ```
 
 Canonical edge-efficiency study:
 
 ```bash
-export LLVM_INSTALL_DIR=/home/cj/mlir-air/llvm/install-amdgpu
-export ROCM_PATH=/opt/rocm
-export AIRCC_PATH=/home/cj/mlir-air/build-npu/bin/aircc
-export AIR_OPT_PATH=/home/cj/mlir-air/build-rocdl-fix/bin/air-opt
-python edge_study.py --profile routing --measurement-mode both --allow-npu \
+export LLVM_INSTALL_DIR=<path-to-llvm-amdgpu-install>
+export ROCM_PATH=${ROCM_PATH:-/opt/rocm}
+export AIRCC_PATH=<path-to-aircc>
+export AIR_OPT_PATH=<path-to-air-opt>
+python3 edge_study.py --profile routing --measurement-mode both --allow-npu \
   --iterations 3 --warmup 1 \
   --output-dir artifacts/benchmarks/edge_study/latest
 ```
@@ -136,11 +136,11 @@ That command writes the raw workload-suite outputs under `suite/`, plus `edge_ef
 Modern MoE model presets:
 
 ```bash
-export LLVM_INSTALL_DIR=/home/cj/mlir-air/llvm/install-amdgpu
-export ROCM_PATH=/opt/rocm
-export AIRCC_PATH=/home/cj/mlir-air/build-npu/bin/aircc
-export AIR_OPT_PATH=/home/cj/mlir-air/build-rocdl-fix/bin/air-opt
-python run_workload_suite.py --suite model_presets --allow-npu --require-torch \
+export LLVM_INSTALL_DIR=<path-to-llvm-amdgpu-install>
+export ROCM_PATH=${ROCM_PATH:-/opt/rocm}
+export AIRCC_PATH=<path-to-aircc>
+export AIR_OPT_PATH=<path-to-air-opt>
+python3 run_workload_suite.py --suite model_presets --allow-npu --require-torch \
   --iterations 1 --warmup 0 \
   --output-dir artifacts/benchmarks/workload_suites/model_presets_latest
 ```
@@ -148,10 +148,10 @@ python run_workload_suite.py --suite model_presets --allow-npu --require-torch \
 Context-length smoke run for one preset:
 
 ```bash
-export LLVM_INSTALL_DIR=/home/cj/mlir-air/llvm/install-amdgpu
-export ROCM_PATH=/opt/rocm
-export AIR_OPT_PATH=/home/cj/mlir-air/build-rocdl-fix/bin/air-opt
-python run_workload_suite.py --suite model_presets \
+export LLVM_INSTALL_DIR=<path-to-llvm-amdgpu-install>
+export ROCM_PATH=${ROCM_PATH:-/opt/rocm}
+export AIR_OPT_PATH=<path-to-air-opt>
+python3 run_workload_suite.py --suite model_presets \
   --workload-filter qwen36_35b_a3b_qbf16 \
   --case-filter cpu_top2 gpu_top2 \
   --require-torch --iterations 1 --warmup 0 \
@@ -161,11 +161,11 @@ python run_workload_suite.py --suite model_presets \
 Stable shape sweep with the expanded five-tier ladder:
 
 ```bash
-export LLVM_INSTALL_DIR=/home/cj/mlir-air/llvm/install-amdgpu
-export ROCM_PATH=/opt/rocm
-export AIRCC_PATH=/home/cj/mlir-air/build-npu/bin/aircc
-export AIR_OPT_PATH=/home/cj/mlir-air/build-rocdl-fix/bin/air-opt
-python run_workload_suite.py --suite shape_sweep --allow-npu --require-torch \
+export LLVM_INSTALL_DIR=<path-to-llvm-amdgpu-install>
+export ROCM_PATH=${ROCM_PATH:-/opt/rocm}
+export AIRCC_PATH=<path-to-aircc>
+export AIR_OPT_PATH=<path-to-air-opt>
+python3 run_workload_suite.py --suite shape_sweep --allow-npu --require-torch \
   --iterations 3 --warmup 1 \
   --output-dir artifacts/benchmarks/workload_suites/apr21_shape_sweep_stable
 ```
@@ -173,7 +173,7 @@ python run_workload_suite.py --suite shape_sweep --allow-npu --require-torch \
 NPU development report without NPU execution:
 
 ```bash
-python bench.py \
+python3 bench.py \
   --router-backend cpu \
   --expert0-backend cpu \
   --expert1-backend cpu \

@@ -21,9 +21,17 @@ namespace {
 #define GEN_PASS_DEF_CONVERTGPUHOSTSTAGING
 #include "air/Conversion/GPUPasses.h.inc"
 
+struct StagedMemref {
+  Value hostMemref;
+  Value deviceMemref;
+};
+
 static bool shouldStageOperand(Value operand) {
   if (!isa<MemRefType>(operand.getType()))
     return false;
+  // v1 policy: AIR kernel operand mutability is not inferred yet, so every
+  // host memref is staged as inout. TODO: replace this with read/write
+  // inference once AIR-to-GPU preserves operand access information.
   Operation *definingOp = operand.getDefiningOp();
   return !definingOp || !isa<gpu::AllocOp>(definingOp);
 }
@@ -38,6 +46,48 @@ static SmallVector<Value> getDynamicSizes(OpBuilder &builder, Location loc,
   return dynamicSizes;
 }
 
+static Value createStagingAllocation(OpBuilder &builder, Location loc,
+                                     Value hostMemref) {
+  auto memrefType = cast<MemRefType>(hostMemref.getType());
+  auto dynamicSizes = getDynamicSizes(builder, loc, hostMemref);
+  auto alloc =
+      gpu::AllocOp::create(builder, loc, memrefType, Type(), ValueRange(),
+                           dynamicSizes, ValueRange(), false);
+  return alloc.getMemref();
+}
+
+static void copyInputToDevice(OpBuilder &builder, Location loc,
+                              StagedMemref staged) {
+  gpu::MemcpyOp::create(builder, loc, Type(), ValueRange(), staged.deviceMemref,
+                        staged.hostMemref);
+}
+
+static Value copyOutputToHost(OpBuilder &builder, Location loc,
+                              StagedMemref staged, Value dependency) {
+  SmallVector<Value> dependencies;
+  Type asyncTokenType;
+  if (dependency) {
+    dependencies.push_back(dependency);
+    asyncTokenType = dependency.getType();
+  }
+  auto copy = gpu::MemcpyOp::create(builder, loc, asyncTokenType, dependencies,
+                                    staged.hostMemref, staged.deviceMemref);
+  return copy.getAsyncToken();
+}
+
+static Value cleanupStagingAllocation(OpBuilder &builder, Location loc,
+                                      StagedMemref staged, Value dependency) {
+  SmallVector<Value> dependencies;
+  Type asyncTokenType;
+  if (dependency) {
+    dependencies.push_back(dependency);
+    asyncTokenType = dependency.getType();
+  }
+  auto dealloc = gpu::DeallocOp::create(builder, loc, asyncTokenType,
+                                        dependencies, staged.deviceMemref);
+  return dealloc.getAsyncToken();
+}
+
 struct ConvertGPUHostStagingPass
     : public xilinx::air::impl::ConvertGPUHostStagingBase<
           ConvertGPUHostStagingPass> {
@@ -50,7 +100,7 @@ struct ConvertGPUHostStagingPass
     Location loc = launchFunc.getLoc();
 
     SmallVector<Value> stagedOperands;
-    SmallVector<std::pair<Value, Value>> stagedMemrefs;
+    SmallVector<StagedMemref> stagedMemrefs;
     stagedOperands.reserve(launchFunc.getKernelOperands().size());
 
     for (Value operand : launchFunc.getKernelOperands()) {
@@ -59,16 +109,10 @@ struct ConvertGPUHostStagingPass
         continue;
       }
 
-      auto memrefType = cast<MemRefType>(operand.getType());
-      auto dynamicSizes = getDynamicSizes(builder, loc, operand);
-      auto alloc = gpu::AllocOp::create(builder, loc, memrefType, Type(),
-                                        ValueRange(), dynamicSizes,
-                                        ValueRange(), false);
-      Value deviceMemref = alloc.getMemref();
-      gpu::MemcpyOp::create(builder, loc, Type(), ValueRange(), deviceMemref,
-                            operand);
+      Value deviceMemref = createStagingAllocation(builder, loc, operand);
+      copyInputToDevice(builder, loc, {operand, deviceMemref});
       stagedOperands.push_back(deviceMemref);
-      stagedMemrefs.emplace_back(operand, deviceMemref);
+      stagedMemrefs.push_back({operand, deviceMemref});
     }
 
     if (stagedMemrefs.empty())
@@ -82,12 +126,12 @@ struct ConvertGPUHostStagingPass
             : std::nullopt;
     gpu::LaunchFuncOp newLaunch;
     if (Value asyncObject = launchFunc.getAsyncObject()) {
-      newLaunch = gpu::LaunchFuncOp::create(
-          builder, loc, launchFunc.getKernel(),
-          launchFunc.getGridSizeOperandValues(),
-          launchFunc.getBlockSizeOperandValues(),
-          launchFunc.getDynamicSharedMemorySize(), stagedOperands, asyncObject,
-          clusterSize);
+      newLaunch =
+          gpu::LaunchFuncOp::create(builder, loc, launchFunc.getKernel(),
+                                    launchFunc.getGridSizeOperandValues(),
+                                    launchFunc.getBlockSizeOperandValues(),
+                                    launchFunc.getDynamicSharedMemorySize(),
+                                    stagedOperands, asyncObject, clusterSize);
     } else {
       newLaunch = gpu::LaunchFuncOp::create(
           builder, loc, launchFunc.getKernel(),
@@ -96,22 +140,23 @@ struct ConvertGPUHostStagingPass
           launchFunc.getDynamicSharedMemorySize(), stagedOperands,
           launchFunc.getAsyncToken() ? launchFunc.getAsyncToken().getType()
                                      : Type(),
-          launchFunc.getAsyncDependencies(),
-          clusterSize);
+          launchFunc.getAsyncDependencies(), clusterSize);
     }
 
     builder.setInsertionPointAfter(newLaunch);
-    SmallVector<Value> asyncDependencies;
-    if (Value asyncToken = newLaunch.getAsyncToken())
-      asyncDependencies.push_back(asyncToken);
-    for (auto [hostMemref, deviceMemref] : stagedMemrefs)
-      gpu::MemcpyOp::create(builder, loc, Type(), asyncDependencies, hostMemref,
-                            deviceMemref);
-    for (auto [hostMemref, deviceMemref] : stagedMemrefs)
-      gpu::DeallocOp::create(builder, loc, Type(), ValueRange(), deviceMemref);
+    Value completionToken = newLaunch.getAsyncToken();
+    for (StagedMemref staged : stagedMemrefs)
+      completionToken = copyOutputToHost(builder, loc, staged, completionToken);
+    for (StagedMemref staged : stagedMemrefs)
+      completionToken =
+          cleanupStagingAllocation(builder, loc, staged, completionToken);
 
-    if (launchFunc->getNumResults() != 0)
-      launchFunc->replaceAllUsesWith(newLaunch->getResults());
+    if (launchFunc->getNumResults() != 0) {
+      if (!completionToken)
+        return launchFunc.emitOpError()
+               << "expected staged async launch to produce a completion token";
+      launchFunc.getAsyncToken().replaceAllUsesWith(completionToken);
+    }
     launchFunc.erase();
     return success();
   }

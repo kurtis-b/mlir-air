@@ -63,40 +63,45 @@ def run_case_with_trace(
     local_warmup = options.warmup if options.warmup is not None else case.get("warmup", manifest["benchmark"]["warmup"])
 
     setup_start = time.perf_counter_ns()
-    runtime = MoERuntime(manifest)
-    runtime.prepare()
-    setup_ms = (time.perf_counter_ns() - setup_start) / 1_000_000.0
+    runtime: MoERuntime | None = None
+    try:
+        runtime = MoERuntime(manifest)
+        runtime.prepare()
+        setup_ms = (time.perf_counter_ns() - setup_start) / 1_000_000.0
 
-    inputs, input_phase_timings, _ = generate_inputs(runtime, manifest)
-    timing = benchmark_runtime(
-        runtime,
-        inputs,
-        router_mode=manifest["runtime"]["router_mode"],
-        iterations=local_iterations,
-        warmup=local_warmup,
-        measurement_mode=options.measurement_mode,
-    )
-    last_run, validation_ms = validate_runtime(runtime, inputs, router_mode=manifest["runtime"]["router_mode"])
-    phase_timings_ms = {
-        **input_phase_timings,
-        **timing["phase_timings_ms"],
-        "compile_load_setup_ms": setup_ms,
-        "validation_ms": validation_ms,
-    }
-    result = build_case_result(
-        schema_version=EDGE_STUDY_SCHEMA_VERSION,
-        metadata=collect_run_metadata(options.manifest_path, manifest, command_line=options.command_line),
-        case_name=options.case_name or case.get("name", "adhoc"),
-        manifest=manifest,
-        iterations=local_iterations,
-        requested_warmup=local_warmup,
-        measurement_mode=options.measurement_mode,
-        timing=timing,
-        last_run=last_run,
-        validation_ms=validation_ms,
-        phase_timings_ms=phase_timings_ms,
-    )
-    return result, last_run.get("trace")
+        inputs, input_phase_timings, _ = generate_inputs(runtime, manifest)
+        timing = benchmark_runtime(
+            runtime,
+            inputs,
+            router_mode=manifest["runtime"]["router_mode"],
+            iterations=local_iterations,
+            warmup=local_warmup,
+            measurement_mode=options.measurement_mode,
+        )
+        last_run, validation_ms = validate_runtime(runtime, inputs, router_mode=manifest["runtime"]["router_mode"])
+        phase_timings_ms = {
+            **input_phase_timings,
+            **timing["phase_timings_ms"],
+            "compile_load_setup_ms": setup_ms,
+            "validation_ms": validation_ms,
+        }
+        result = build_case_result(
+            schema_version=EDGE_STUDY_SCHEMA_VERSION,
+            metadata=collect_run_metadata(options.manifest_path, manifest, command_line=options.command_line),
+            case_name=options.case_name or case.get("name", "adhoc"),
+            manifest=manifest,
+            iterations=local_iterations,
+            requested_warmup=local_warmup,
+            measurement_mode=options.measurement_mode,
+            timing=timing,
+            last_run=last_run,
+            validation_ms=validation_ms,
+            phase_timings_ms=phase_timings_ms,
+        )
+        return result, last_run.get("trace")
+    finally:
+        if runtime is not None:
+            runtime.close()
 
 
 def run_case(

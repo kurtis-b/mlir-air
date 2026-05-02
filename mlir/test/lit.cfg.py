@@ -73,6 +73,26 @@ llvm_config.use_default_substitutions()
 # directories.
 config.excludes = ["Inputs", "Examples", "CMakeLists.txt", "README.txt", "LICENSE.txt"]
 
+if config.air_enable_aie:
+    config.available_features.add("aie")
+else:
+    config.excludes.extend(
+        [
+            "AIRLowering",
+            "AIRRtToLLVM",
+            "AIRRtToNpu",
+            "AIRToAIE",
+            "AIRDependencyScheduleOpt",
+            "AIRLinalgCodegen",
+            "AIRMergeUnrolledDevices",
+            "AIRNormalizeForBounds",
+            "aircc",
+        ]
+    )
+
+if not config.runtime_test_target:
+    config.excludes.append("Channel")
+
 # test_source_root: The root path where tests are located.
 config.test_source_root = os.path.dirname(__file__)
 

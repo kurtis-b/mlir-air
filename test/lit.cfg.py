@@ -7,18 +7,28 @@
 # -*- Python -*-
 
 import os
-import platform
 import re
 import subprocess
-import tempfile
 import shutil
-from pathlib import Path
+import importlib.util
 import lit.formats
 import lit.util
 
 from lit.llvm import llvm_config
 from lit.llvm.subst import ToolSubst
 from lit.llvm.subst import FindTool
+
+
+def _load_lit_helpers():
+    helper_path = os.path.join(config.air_src_root, "utils", "lit_config_helpers.py")
+    spec = importlib.util.spec_from_file_location("air_lit_config_helpers", helper_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+lit_helpers = _load_lit_helpers()
+
 
 # Configuration file for the 'lit' test runner.
 
@@ -83,101 +93,19 @@ config.substitutions.append(
 llvm_config.with_environment("AIETOOLS", config.vitis_aietools_dir)
 
 
-def _discover_xrt_root():
-    candidates = []
-    for value in (
-        os.environ.get("XILINX_XRT"),
-        os.environ.get("XRT_DIR"),
-        config.xrt_dir,
-    ):
-        if value:
-            candidates.append(value)
-    xrtsmi = shutil.which("xrt-smi")
-    if xrtsmi:
-        candidates.append(str(Path(xrtsmi).resolve().parents[1]))
-    for root in candidates:
-        include_dir = os.path.join(root, "include")
-        lib_dir = os.path.join(root, "lib")
-        bin_dir = os.path.join(root, "bin")
-        if os.path.exists(os.path.join(bin_dir, "xrt-smi")) and os.path.isdir(
-            include_dir
-        ):
-            return root, bin_dir, lib_dir, include_dir
-    return config.xrt_dir, config.xrt_bin_dir, config.xrt_lib_dir, config.xrt_include_dir
-
-
-def _discover_libxaie():
-    candidates = []
-    for value in (
-        config.libxaie_dir,
-        os.environ.get("LIBXAIE_DIR"),
-        os.path.join(
-            config.aie_obj_root, "runtime_lib", config.runtime_test_target, "xaiengine"
-        ),
-        os.path.join(config.aie_obj_root, "runtime_lib", "x86_64", "xaiengine"),
-    ):
-        if value:
-            candidates.append(value)
-
-    for candidate in candidates:
-        include_dir = os.path.join(candidate, "include")
-        lib_dir = os.path.join(candidate, "lib")
-        if not os.path.exists(os.path.join(include_dir, "xaiengine", "xaiegbl.h")):
-            continue
-        for library_name in ("libxaiengine.so", "libxaienginecdo.so"):
-            library_path = os.path.join(lib_dir, library_name)
-            if not os.path.exists(library_path):
-                continue
-            compat_root = os.path.join(config.test_exec_root, "lit_support", "libxaie")
-            compat_include = os.path.join(compat_root, "include")
-            compat_lib = os.path.join(compat_root, "lib")
-            os.makedirs(compat_include, exist_ok=True)
-            os.makedirs(compat_lib, exist_ok=True)
-            root_header = os.path.join(compat_include, "xaiengine.h")
-            if os.path.lexists(root_header):
-                os.unlink(root_header)
-            os.symlink(os.path.join(include_dir, "xaiengine.h"), root_header)
-            include_link = os.path.join(compat_include, "xaiengine")
-            if os.path.lexists(include_link):
-                os.unlink(include_link)
-            os.symlink(os.path.join(include_dir, "xaiengine"), include_link)
-            library_link = os.path.join(compat_lib, "libxaiengine.so")
-            if os.path.lexists(library_link):
-                os.unlink(library_link)
-            os.symlink(library_path, library_link)
-            cdo_driver = None
-            for ancestor in [Path(candidate).resolve(), *Path(candidate).resolve().parents]:
-                maybe_driver = ancestor / "lib" / "libcdo_driver_mlir_aie.a"
-                if maybe_driver.exists():
-                    cdo_driver = maybe_driver
-                    break
-            if cdo_driver:
-                cdo_link = os.path.join(compat_lib, "libcdo_driver_mlir_aie.a")
-                if os.path.lexists(cdo_link):
-                    os.unlink(cdo_link)
-                os.symlink(cdo_driver, cdo_link)
-            return compat_root
-    return config.libxaie_dir
-
-
 config.xrt_dir, config.xrt_bin_dir, config.xrt_lib_dir, config.xrt_include_dir = (
-    _discover_xrt_root()
+    lit_helpers.discover_xrt_root(config)
 )
-config.libxaie_dir = _discover_libxaie()
+config.libxaie_dir = lit_helpers.discover_libxaie(
+    config, os.path.join(config.test_exec_root, "lit_support", "libxaie")
+)
 config.libxaie_support_flags = ""
 if os.path.exists(os.path.join(config.libxaie_dir, "lib", "libcdo_driver_mlir_aie.a")):
     config.libxaie_support_flags = (
         " -L"
         + os.path.join(config.libxaie_dir, "lib")
         + " -lcdo_driver_mlir_aie"
-    )
-if (
-    "chess" in config.available_features
-    or os.path.exists(
-        os.path.join(os.path.dirname(config.peano_tools_dir), "lib", "aie-none-unknown-elf", "crt0.o")
-    )
-):
-    config.available_features.add("aie1-toolchain")
+)
 config.environment["PYTHONPATH"] = "{}:{}:{}".format(
     os.path.join(config.air_obj_root, "python"),
     os.path.join(config.aie_obj_root, "python"),
@@ -223,54 +151,9 @@ run_on_npu1 = "echo"
 run_on_npu2 = "echo"
 xrt_flags = ""
 
-# XRT
-if config.xrt_lib_dir and config.enable_run_xrt_tests:
-    print("xrt found at", config.xrt_dir)
-    xrt_flags = "-I{} -L{} -luuid -lxrt_coreutil".format(
-        config.xrt_include_dir, config.xrt_lib_dir
-    )
-    config.available_features.add("xrt")
-
-    try:
-        xrtsmi = shutil.which("xrt-smi") or os.path.join(config.xrt_bin_dir, "xrt-smi")
-        result = subprocess.run(
-            [xrtsmi, "examine"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        result = result.stdout.decode("utf-8").split("\n")
-        # Older format is "|[0000:41:00.1]  ||RyzenAI-npu1  |"
-        # Newer format is "|[0000:41:00.1]  |NPU Phoenix  |"
-        p = re.compile(r"[\|]?(\[.+:.+:.+\]).+\|(RyzenAI-(npu\d)|NPU (\w+))\W*\|")
-        for l in result:
-            m = p.match(l)
-            if not m:
-                continue
-            print("Found Ryzen AI device:", m.group(1))
-            model = "unknown"
-            if m.group(3):
-                model = str(m.group(3))
-            if m.group(4):
-                model = str(m.group(4))
-            print(f"\tmodel: '{model}'")
-            config.available_features.add("ryzen_ai")
-            run_on_npu = (
-                f"flock /tmp/npu.lock {config.air_src_root}/utils/run_on_npu.sh"
-            )
-            if model in ["npu1", "Phoenix"]:
-                run_on_npu1 = run_on_npu
-                config.available_features.add("ryzen_ai_npu1")
-                print("Running tests on NPU1 with command line: ", run_on_npu1)
-            elif model in ["npu4", "Strix"]:
-                run_on_npu2 = run_on_npu
-                config.available_features.add("ryzen_ai_npu2")
-                print("Running tests on NPU4 with command line: ", run_on_npu2)
-            else:
-                print(f"WARNING: xrt-smi reported unknown NPU model '{model}'.")
-            break
-    except Exception as e:
-        print(f"Failed to run xrt-smi: {e}")
-else:
-    print("xrt not found or xrt tests disabled")
-    config.excludes.append("xrt")
+run_on_npu1, run_on_npu2, xrt_flags = lit_helpers.configure_xrt_features(
+    config, f"flock /tmp/npu.lock {config.air_src_root}/utils/run_on_npu.sh"
+)
 
 config.substitutions.append(("%run_on_npu1%", run_on_npu1))
 config.substitutions.append(("%run_on_npu2%", run_on_npu2))
@@ -364,6 +247,9 @@ else:
         )
     else:
         print("Chess not found")
+
+if "chess" in config.available_features or lit_helpers.has_peano_aie1_support(config):
+    config.available_features.add("aie1-toolchain")
 
 tool_dirs = [
     config.aie_tools_dir,

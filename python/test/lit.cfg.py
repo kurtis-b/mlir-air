@@ -9,14 +9,22 @@
 import os
 import sys
 import importlib.util
-import subprocess
-import re
-import shutil
-from pathlib import Path
 
 import lit.formats
 
 from lit.llvm import llvm_config
+
+
+def _load_lit_helpers():
+    helper_path = os.path.join(config.air_src_root, "utils", "lit_config_helpers.py")
+    spec = importlib.util.spec_from_file_location("air_lit_config_helpers", helper_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+lit_helpers = _load_lit_helpers()
+
 
 # Configuration file for the 'lit' test runner.
 
@@ -76,31 +84,8 @@ run_on_npu2 = "echo"
 xrt_flags = ""
 
 
-def _discover_xrt_root():
-    candidates = []
-    for value in (
-        os.environ.get("XILINX_XRT"),
-        os.environ.get("XRT_DIR"),
-        config.xrt_dir,
-    ):
-        if value:
-            candidates.append(value)
-    xrtsmi = shutil.which("xrt-smi")
-    if xrtsmi:
-        candidates.append(str(Path(xrtsmi).resolve().parents[1]))
-    for root in candidates:
-        include_dir = os.path.join(root, "include")
-        lib_dir = os.path.join(root, "lib")
-        bin_dir = os.path.join(root, "bin")
-        if os.path.exists(os.path.join(bin_dir, "xrt-smi")) and os.path.isdir(
-            include_dir
-        ):
-            return root, bin_dir, lib_dir, include_dir
-    return config.xrt_dir, config.xrt_bin_dir, config.xrt_lib_dir, config.xrt_include_dir
-
-
 config.xrt_dir, config.xrt_bin_dir, config.xrt_lib_dir, config.xrt_include_dir = (
-    _discover_xrt_root()
+    lit_helpers.discover_xrt_root(config)
 )
 config.environment["PYTHONPATH"] = "{}:{}:{}".format(
     os.path.join(config.air_obj_root, "python"),
@@ -108,53 +93,9 @@ config.environment["PYTHONPATH"] = "{}:{}:{}".format(
     os.path.join(config.xrt_dir, "python"),
 )
 
-# XRT
-if config.xrt_lib_dir and config.enable_run_xrt_tests:
-    print("xrt found at", config.xrt_dir)
-    xrt_flags = "-I{} -L{} -luuid -lxrt_coreutil".format(
-        config.xrt_include_dir, config.xrt_lib_dir
-    )
-    config.available_features.add("xrt")
-
-    try:
-        xrtsmi = shutil.which("xrt-smi") or os.path.join(config.xrt_bin_dir, "xrt-smi")
-        result = subprocess.run(
-            [xrtsmi, "examine"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        result = result.stdout.decode("utf-8").split("\n")
-        # Older format is "|[0000:41:00.1]  ||RyzenAI-npu1  |"
-        # Newer format is "|[0000:41:00.1]  |NPU Phoenix  |"
-        p = re.compile(r"[\|]?(\[.+:.+:.+\]).+\|(RyzenAI-(npu\d)|NPU (\w+))\W*\|")
-        for l in result:
-            m = p.match(l)
-            if not m:
-                continue
-            print("Found Ryzen AI device:", m.group(1))
-            model = "unknown"
-            if m.group(3):
-                model = str(m.group(3))
-            if m.group(4):
-                model = str(m.group(4))
-            print(f"\tmodel: '{model}'")
-            config.available_features.add("ryzen_ai")
-            run_on_npu = f"{config.air_src_root}/utils/run_on_npu.sh"
-            if model in ["npu1", "Phoenix"]:
-                run_on_npu1 = run_on_npu
-                config.available_features.add("ryzen_ai_npu1")
-                print("Running tests on NPU1 with command line: ", run_on_npu1)
-            elif model in ["npu4", "Strix"]:
-                run_on_npu2 = run_on_npu
-                config.available_features.add("ryzen_ai_npu2")
-                print("Running tests on NPU4 with command line: ", run_on_npu2)
-            else:
-                print("WARNING: xrt-smi reported unknown NPU model '{model}'.")
-            break
-    except:
-        print("Failed to run xrt-smi")
-        pass
-else:
-    print("xrt not found or xrt tests disabled")
-    config.excludes.append("xrt")
+run_on_npu1, run_on_npu2, xrt_flags = lit_helpers.configure_xrt_features(
+    config, f"{config.air_src_root}/utils/run_on_npu.sh"
+)
 
 config.substitutions.append(("%run_on_npu1%", run_on_npu1))
 config.substitutions.append(("%run_on_npu2%", run_on_npu2))
