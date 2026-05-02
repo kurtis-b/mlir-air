@@ -45,6 +45,48 @@ When a board is available, `%run_on_board test.elf` becomes `sudo test.elf`, exe
 
 Board tests must also be serialized because they assume exclusive access to the hardware.  Currently tests are serialized by adding `flock /tmp/board.lock` to the `%run_on_board` command line. The complete `%run_on_board <command line>` substitution is `sudo flock /tmp/board.lock <command line>`.
 
+## Branch Validation Lanes
+
+Use these lanes when validating changes across compiler, Python, GPU, MoE, and hardware-backed runtime paths. These are branch-validation lanes, not source line coverage metrics.
+
+CI-safe compiler and CPU checks:
+
+```
+$ ninja -C build-gpu-lit check-air-mlir
+$ ninja -C build-gpu-lit check-air-cpp
+$ ninja -C build-gpu-lit check-airmlir-conversion-airtorocdl
+$ cd programming_examples/heterogeneous_moe
+$ python3 smoke_tests.py --lane ci
+```
+
+GPU-local checks, when a ROCm/AMDGPU LLVM toolchain is configured:
+
+```
+$ cd programming_examples/heterogeneous_moe
+$ export LLVM_INSTALL_DIR=/home/cj/mlir-air/llvm/install-amdgpu
+$ export ROCM_PATH=${ROCM_PATH:-/opt/rocm}
+$ python3 smoke_tests.py --lane gpu-all
+```
+
+AIE/Python checks, from an AIE-enabled build with Python bindings and Peano available:
+
+```
+$ ninja -C build check-air-mlir
+$ ninja -C build check-air-python
+$ ninja -C build check-air-e2e-peano
+$ ninja -C build check-programming-examples-peano
+```
+
+NPU/XRT hardware checks must be opt-in. Source XRT setup, confirm `xrt-smi examine` reports the expected Ryzen AI NPU, configure with `ENABLE_RUN_XRT_TESTS=ON`, then run the hardware lane:
+
+```
+$ source /opt/xilinx/xrt/setup.sh
+$ xrt-smi examine
+$ ninja -C build-xrt check-air-e2e-peano
+$ cd programming_examples/heterogeneous_moe
+$ python3 smoke_tests.py --lane npu --allow-npu
+```
+
 -----
 
 <p align="center">Copyright&copy; 2019-2024 Advanced Micro Devices, Inc.</p>
