@@ -72,6 +72,24 @@ cd <mlir-air-repo>/programming_examples/heterogeneous_moe
 python3 smoke_tests.py --lane ci
 ```
 
+## Coverage
+
+The deterministic Python coverage gate is opt-in and writes reports under `artifacts/coverage/latest`:
+
+```bash
+cd <mlir-air-repo>/programming_examples/heterogeneous_moe
+python3 run_coverage.py
+```
+
+From a CMake build configured with Python, the same gate is available as a dedicated target:
+
+```bash
+cd <mlir-air-repo>
+ninja -C build check-heterogeneous-moe-coverage
+```
+
+This target is not part of `check-all`.
+
 ## Compile Kernels
 
 The checked-in compile inputs are the tiny default goldens under `air/`. Those AIR kernels drive both the NPU flow and the iGPU `air-to-rocdl` flow. Generated AIR variants and compiled outputs belong under ignored artifact/build roots such as `artifacts/`, `air_gpu/`, `air_probe*/`, and `air_project/`.

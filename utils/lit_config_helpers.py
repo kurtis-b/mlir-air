@@ -48,12 +48,16 @@ def discover_libxaie(config, compat_root):
     for value in (
         libxaie_dir,
         os.environ.get("LIBXAIE_DIR"),
-        os.path.join(aie_obj_root, "runtime_lib", runtime_target, "xaiengine")
-        if aie_obj_root
-        else None,
-        os.path.join(aie_obj_root, "runtime_lib", "x86_64", "xaiengine")
-        if aie_obj_root
-        else None,
+        (
+            os.path.join(aie_obj_root, "runtime_lib", runtime_target, "xaiengine")
+            if aie_obj_root
+            else None
+        ),
+        (
+            os.path.join(aie_obj_root, "runtime_lib", "x86_64", "xaiengine")
+            if aie_obj_root
+            else None
+        ),
     ):
         if value:
             candidates.append(value)
@@ -135,9 +139,7 @@ def detect_npu_model(xrt_bin_dir):
         [xrtsmi, "examine"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
     lines = result.stdout.decode("utf-8").split("\n")
-    pattern = re.compile(
-        r"[\|]?(\[.+:.+:.+\]).+\|(RyzenAI-(npu\d)|NPU (\w+))\W*\|"
-    )
+    pattern = re.compile(r"[\|]?(\[.+:.+:.+\]).+\|(RyzenAI-(npu\d)|NPU (\w+))\W*\|")
     for line in lines:
         match = pattern.match(line)
         if not match:

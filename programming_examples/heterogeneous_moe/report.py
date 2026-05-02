@@ -11,7 +11,9 @@ from reports import matrix_report_markdown, write_markdown
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Render a markdown report from benchmark matrix outputs.")
+    parser = argparse.ArgumentParser(
+        description="Render a markdown report from benchmark matrix outputs."
+    )
     parser.add_argument(
         "--summary",
         default="artifacts/benchmarks/latest/summary.json",
@@ -32,7 +34,9 @@ def main(argv: list[str] | None = None) -> int:
     if not out_path.is_absolute():
         out_path = project_dir() / out_path
 
-    write_markdown(matrix_report_markdown(load_json(summary_path), args.title), out_path)
+    write_markdown(
+        matrix_report_markdown(load_json(summary_path), args.title), out_path
+    )
     print(f"Wrote markdown report to {out_path}")
     return 0
 

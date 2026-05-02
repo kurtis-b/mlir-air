@@ -15,7 +15,6 @@ from manifest import load_json, project_dir, save_json
 from results import correctness_failure_message
 from test_golden_air import main as golden_air_main
 
-
 CPU_CASES = ["cpu_top1", "cpu_top2"]
 GPU_CASES = ["gpu_top1", "gpu_top2"]
 MIXED_GPU_CASES = [
@@ -99,11 +98,15 @@ def _run_cases(
             ),
         )
         if require_torch and not result["torch_validation"]["ok"]:
-            raise SystemExit(f"torch validation failed for {case['name']}: {result['torch_validation']['message']}")
+            raise SystemExit(
+                f"torch validation failed for {case['name']}: {result['torch_validation']['message']}"
+            )
         if require_correctness:
             failure = correctness_failure_message(result)
             if failure is not None:
-                raise SystemExit(f"correctness validation failed for {case['name']}: {failure}")
+                raise SystemExit(
+                    f"correctness validation failed for {case['name']}: {failure}"
+                )
         _save_result(output_dir, result)
         print(f"PASS {case['name']}")
         passed.append(case["name"])
@@ -111,16 +114,36 @@ def _run_cases(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run lightweight heterogeneous MoE smoke-test lanes.")
+    parser = argparse.ArgumentParser(
+        description="Run lightweight heterogeneous MoE smoke-test lanes."
+    )
     parser.add_argument(
         "--lane",
         nargs="+",
-        choices=["golden", "cpu", "gpu-compile", "gpu", "mixed-gpu", "npu", "ci", "gpu-all", "all"],
+        choices=[
+            "golden",
+            "cpu",
+            "gpu-compile",
+            "gpu",
+            "mixed-gpu",
+            "npu",
+            "ci",
+            "gpu-all",
+            "all",
+        ],
         default=["ci"],
         help="Smoke-test lanes to run. The default 'ci' lane runs golden AIR and CPU top1/top2.",
     )
-    parser.add_argument("--manifest", default="default_manifest.json", help="Base manifest path relative to this directory.")
-    parser.add_argument("--matrix", default="default_benchmark_matrix.json", help="Benchmark matrix path relative to this directory.")
+    parser.add_argument(
+        "--manifest",
+        default="default_manifest.json",
+        help="Base manifest path relative to this directory.",
+    )
+    parser.add_argument(
+        "--matrix",
+        default="default_benchmark_matrix.json",
+        help="Benchmark matrix path relative to this directory.",
+    )
     parser.add_argument(
         "--compiled-manifest-out",
         default="artifacts/compiled_manifest.json",
@@ -131,18 +154,44 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Use --compiled-manifest-out for non-CPU lanes instead of compiling artifacts first.",
     )
-    parser.add_argument("--output-dir", default="artifacts/smoke_tests/latest", help="Output directory relative to this directory.")
-    parser.add_argument("--iterations", type=int, default=1, help="Iterations for benchmark smoke cases.")
-    parser.add_argument("--warmup", type=int, default=0, help="Warmup iterations for benchmark smoke cases.")
+    parser.add_argument(
+        "--output-dir",
+        default="artifacts/smoke_tests/latest",
+        help="Output directory relative to this directory.",
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=1,
+        help="Iterations for benchmark smoke cases.",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=0,
+        help="Warmup iterations for benchmark smoke cases.",
+    )
     parser.add_argument(
         "--measurement-mode",
         choices=["cold", "warm", "both"],
         default="warm",
         help="Measure cold start, warm steady-state, or both. Validation is always untimed.",
     )
-    parser.add_argument("--allow-npu", action="store_true", help="Allow NPU smoke cases and artifact compilation.")
-    parser.add_argument("--no-require-correctness", action="store_true", help="Do not fail on final output correctness.")
-    parser.add_argument("--require-torch", action="store_true", help="Fail if torch validation is unavailable or fails.")
+    parser.add_argument(
+        "--allow-npu",
+        action="store_true",
+        help="Allow NPU smoke cases and artifact compilation.",
+    )
+    parser.add_argument(
+        "--no-require-correctness",
+        action="store_true",
+        help="Do not fail on final output correctness.",
+    )
+    parser.add_argument(
+        "--require-torch",
+        action="store_true",
+        help="Fail if torch validation is unavailable or fails.",
+    )
     args = parser.parse_args(argv)
 
     lanes = _expanded_lanes(args.lane)
@@ -177,7 +226,9 @@ def main(argv: list[str] | None = None) -> int:
     selected_cases = _matrix_cases(matrix, case_names)
     compiled_manifest = copy.deepcopy(base_manifest)
     compiled_manifest_for_cases = compiled_manifest
-    needs_compiled_manifest = any(_case_uses(case, "gpu") or _case_uses(case, "npu") for case in selected_cases)
+    needs_compiled_manifest = any(
+        _case_uses(case, "gpu") or _case_uses(case, "npu") for case in selected_cases
+    )
     if "gpu-compile" in lanes or needs_compiled_manifest:
         if args.use_existing_compiled_manifest:
             compiled_manifest = load_json(compiled_manifest_path)
@@ -185,16 +236,29 @@ def main(argv: list[str] | None = None) -> int:
             print(f"PASS compiled_manifest: {compiled_manifest_path}")
             passed.append("compiled_manifest")
         else:
-            backends = {"gpu"} if "gpu-compile" in lanes or any(_case_uses(case, "gpu") for case in selected_cases) else set()
+            backends = (
+                {"gpu"}
+                if "gpu-compile" in lanes
+                or any(_case_uses(case, "gpu") for case in selected_cases)
+                else set()
+            )
             if any(_case_uses(case, "npu") for case in selected_cases):
                 backends.add("npu")
-            compiled_manifest = populate_artifacts(copy.deepcopy(base_manifest), backends)
+            compiled_manifest = populate_artifacts(
+                copy.deepcopy(base_manifest), backends
+            )
             save_json(compiled_manifest_path, compiled_manifest)
-            print(f"PASS compile_{'_'.join(sorted(backends))}: {compiled_manifest_path}")
+            print(
+                f"PASS compile_{'_'.join(sorted(backends))}: {compiled_manifest_path}"
+            )
             passed.append(f"compile_{'_'.join(sorted(backends))}")
             compiled_manifest_for_cases = compiled_manifest
 
-    cpu_cases = [case for case in selected_cases if not _case_uses(case, "gpu") and not _case_uses(case, "npu")]
+    cpu_cases = [
+        case
+        for case in selected_cases
+        if not _case_uses(case, "gpu") and not _case_uses(case, "npu")
+    ]
     device_cases = [case for case in selected_cases if case not in cpu_cases]
     if cpu_cases:
         passed.extend(

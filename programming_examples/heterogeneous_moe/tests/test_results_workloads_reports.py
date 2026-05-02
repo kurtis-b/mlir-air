@@ -7,7 +7,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from case_runner import RunCaseOptions, apply_case_to_manifest, case_stage_backends, contains_npu, run_case
+from case_runner import (
+    RunCaseOptions,
+    apply_case_to_manifest,
+    case_stage_backends,
+    contains_npu,
+    run_case,
+)
 from kernels import KernelConfig
 from reference import random_inputs
 from reports import (
@@ -73,7 +79,10 @@ class TinyRuntime:
             }
         )
         if validate:
-            return {"stage_metrics": {"output": {"allclose": True}}, "torch_validation": {"ran": False, "ok": False}}
+            return {
+                "stage_metrics": {"output": {"allclose": True}},
+                "torch_validation": {"ran": False, "ok": False},
+            }
         return {"output": np.asarray(inputs)}
 
 
@@ -87,12 +96,26 @@ def test_latency_stats_and_runtime_measurement() -> None:
 
     runtime = TinyRuntime()
     inputs = np.ones((3, 4), dtype=np.float32)
-    timing = benchmark_runtime(runtime, inputs, router_mode="top2", iterations=2, warmup=1, measurement_mode="both")
+    timing = benchmark_runtime(
+        runtime,
+        inputs,
+        router_mode="top2",
+        iterations=2,
+        warmup=1,
+        measurement_mode="both",
+    )
     assert timing["effective_warmup"] == 1
     assert timing["measurement_runs"]["cold_start"]["iterations"] == 1
     assert timing["measurement_runs"]["warm"]["iterations"] == 2
 
-    cold = benchmark_runtime(runtime, inputs, router_mode="top1", iterations=9, warmup=9, measurement_mode="cold")
+    cold = benchmark_runtime(
+        runtime,
+        inputs,
+        router_mode="top1",
+        iterations=9,
+        warmup=9,
+        measurement_mode="cold",
+    )
     assert cold["effective_warmup"] == 0
     assert set(cold["measurement_runs"]) == {"cold_start"}
 
@@ -118,12 +141,16 @@ def test_generate_inputs_validate_and_stage_metrics(default_manifest: dict) -> N
     assert metrics["output"]["allclose"] is True
 
 
-def test_build_case_result_csv_and_correctness(default_manifest: dict, fake_last_run_factory) -> None:
+def test_build_case_result_csv_and_correctness(
+    default_manifest: dict, fake_last_run_factory
+) -> None:
     last_run = fake_last_run_factory()
     timing = {
         "latencies_ms": [1.0],
         "latency_ms": latency_stats([1.0]),
-        "measurement_runs": {"warm": {"iterations": 1, "latency_ms": latency_stats([1.0])}},
+        "measurement_runs": {
+            "warm": {"iterations": 1, "latency_ms": latency_stats([1.0])}
+        },
         "phase_timings_ms": {"timed_total_ms": 1.0},
         "effective_warmup": 0,
     }
@@ -149,7 +176,10 @@ def test_build_case_result_csv_and_correctness(default_manifest: dict, fake_last
     assert row["transfer_bytes"] == 128
 
     missing = {"correctness": {"validated": False}}
-    assert correctness_failure_message(missing) == "correctness validation did not produce stage metrics"
+    assert (
+        correctness_failure_message(missing)
+        == "correctness validation did not produce stage metrics"
+    )
     bad = {
         "correctness": {"validated": True, "output_allclose": False},
         "stage_metrics": {"output": {"max_abs_error": 9.0, "atol": 0.1, "rtol": 0.2}},
@@ -169,9 +199,20 @@ def test_build_case_result_csv_and_correctness(default_manifest: dict, fake_last
     assert block["compile_load_setup_ms"] == 0.2
 
 
-def test_edge_limitations_and_workload_selection(default_manifest: dict, default_matrix: dict) -> None:
-    manifest = {**default_manifest, "workload": {"weight_storage": "quantized", "compute_dtype": "bf16", "shared_expert_ffn_size": 16}}
-    limitations = edge_study_limitations(manifest, {"model": "model", "device_resident_buffers": False})
+def test_edge_limitations_and_workload_selection(
+    default_manifest: dict, default_matrix: dict
+) -> None:
+    manifest = {
+        **default_manifest,
+        "workload": {
+            "weight_storage": "quantized",
+            "compute_dtype": "bf16",
+            "shared_expert_ffn_size": 16,
+        },
+    }
+    limitations = edge_study_limitations(
+        manifest, {"model": "model", "device_resident_buffers": False}
+    )
     assert limitations["routing_topk_location"] == "cpu"
     assert any("quantized storage" in item for item in limitations["limitations"])
     assert any("Shared expert" in item for item in limitations["limitations"])
@@ -187,14 +228,18 @@ def test_edge_limitations_and_workload_selection(default_manifest: dict, default
     assert routed_tokens_for_context(preset, 0) == 1
 
 
-def test_workload_generation_and_routing_stats(default_manifest: dict, default_matrix: dict) -> None:
+def test_workload_generation_and_routing_stats(
+    default_manifest: dict, default_matrix: dict
+) -> None:
     shapes = shape_workloads(default_manifest, default_matrix)
     assert shapes[0]["suite"] == "shape_sweep"
     assert shapes[0]["manifest"]["inputs"]["scale"] == 0.5
     assert "shape_sweep" in shapes[0]["manifest"]["paths"]["artifacts"]
 
     routing = routing_workloads(default_manifest, default_matrix)
-    assert {workload["manifest"]["workload"]["routing_profile"] for workload in routing} == {
+    assert {
+        workload["manifest"]["workload"]["routing_profile"] for workload in routing
+    } == {
         "balanced",
         "expert0_hot",
         "expert1_hot",
@@ -203,21 +248,36 @@ def test_workload_generation_and_routing_stats(default_manifest: dict, default_m
 
     model_workloads = model_preset_workloads(default_manifest, default_matrix)
     assert len(model_workloads) == len(MODEL_PRESETS) * len(CONTEXT_LENGTHS)
-    assert model_workloads[0]["manifest"]["workload"]["context_length"] == CONTEXT_LENGTHS[0]
+    assert (
+        model_workloads[0]["manifest"]["workload"]["context_length"]
+        == CONTEXT_LENGTHS[0]
+    )
     assert model_workloads[-1]["model_preset"]["name"] == MODEL_PRESETS[-1]["name"]
 
-    combined = suite_workloads(["shape_sweep", "routing_sweep"], default_manifest, default_matrix)
+    combined = suite_workloads(
+        ["shape_sweep", "routing_sweep"], default_manifest, default_matrix
+    )
     assert len(combined) == len(shapes) + len(routing)
 
     stats = routing_stats(default_manifest)
     assert set(stats) == {"top1_token_counts", "top2_probability_mass"}
-    assert sum(stats["top1_token_counts"].values()) == default_manifest["model"]["batch_tokens"]
+    assert (
+        sum(stats["top1_token_counts"].values())
+        == default_manifest["model"]["batch_tokens"]
+    )
 
 
-def test_case_runner_cpu_path(default_manifest: dict, default_matrix: dict, tmp_path: Path) -> None:
+def test_case_runner_cpu_path(
+    default_manifest: dict, default_matrix: dict, tmp_path: Path
+) -> None:
     stage_case = {
         "name": "manual",
-        "stage_backends": {"router": "cpu", "expert0": "gpu", "expert1": "cpu", "aggregation": "gpu"},
+        "stage_backends": {
+            "router": "cpu",
+            "expert0": "gpu",
+            "expert1": "cpu",
+            "aggregation": "gpu",
+        },
         "transfer_mode": "auto",
         "router_mode": "top2",
     }
@@ -246,12 +306,25 @@ def test_case_runner_cpu_path(default_manifest: dict, default_matrix: dict, tmp_
 def test_matrix_and_suite_reports(fake_result_factory) -> None:
     cpu = fake_result_factory("cpu")
     gpu = fake_result_factory("gpu")
-    gpu["stage_backends"] = {"router": "gpu", "expert0": "gpu", "expert1": "gpu", "aggregation": "gpu"}
+    gpu["stage_backends"] = {
+        "router": "gpu",
+        "expert0": "gpu",
+        "expert1": "gpu",
+        "aggregation": "gpu",
+    }
     mixed = fake_result_factory("mixed")
-    mixed["stage_backends"] = {"router": "cpu", "expert0": "gpu", "expert1": "cpu", "aggregation": "gpu"}
+    mixed["stage_backends"] = {
+        "router": "cpu",
+        "expert0": "gpu",
+        "expert1": "cpu",
+        "aggregation": "gpu",
+    }
     mixed["latency_ms"]["mean"] = 0.5
 
-    summary = {"cases": [cpu, gpu, mixed], "skipped": [{"case_name": "npu", "reason": "disabled"}]}
+    summary = {
+        "cases": [cpu, gpu, mixed],
+        "skipped": [{"case_name": "npu", "reason": "disabled"}],
+    }
     text = matrix_report_markdown(summary, "Matrix")
     assert "# Matrix" in text
     assert "mixed" in text
@@ -282,7 +355,12 @@ def test_matrix_and_suite_reports(fake_result_factory) -> None:
 def test_edge_study_report_helpers(tmp_path: Path, fake_result_factory) -> None:
     single = fake_result_factory("single")
     mixed = fake_result_factory("mixed")
-    mixed["stage_backends"] = {"router": "cpu", "expert0": "gpu", "expert1": "cpu", "aggregation": "gpu"}
+    mixed["stage_backends"] = {
+        "router": "cpu",
+        "expert0": "gpu",
+        "expert1": "cpu",
+        "aggregation": "gpu",
+    }
     mixed["latency_ms"]["mean"] = 0.5
     mixed["transfer_summary"]["total_elapsed_us"] = 600.0
     workload = {

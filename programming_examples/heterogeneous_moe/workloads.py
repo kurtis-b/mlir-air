@@ -18,11 +18,41 @@ from reference import (
 )
 
 SHAPE_SWEEP = [
-    {"name": "small", "batch_tokens": 4, "hidden_size": 16, "ffn_size": 32, "scale": 0.5},
-    {"name": "smallplus", "batch_tokens": 4, "hidden_size": 24, "ffn_size": 48, "scale": 0.375},
-    {"name": "medium", "batch_tokens": 8, "hidden_size": 32, "ffn_size": 64, "scale": 0.25},
-    {"name": "midlarge", "batch_tokens": 8, "hidden_size": 40, "ffn_size": 80, "scale": 0.1875},
-    {"name": "large", "batch_tokens": 8, "hidden_size": 48, "ffn_size": 96, "scale": 0.125},
+    {
+        "name": "small",
+        "batch_tokens": 4,
+        "hidden_size": 16,
+        "ffn_size": 32,
+        "scale": 0.5,
+    },
+    {
+        "name": "smallplus",
+        "batch_tokens": 4,
+        "hidden_size": 24,
+        "ffn_size": 48,
+        "scale": 0.375,
+    },
+    {
+        "name": "medium",
+        "batch_tokens": 8,
+        "hidden_size": 32,
+        "ffn_size": 64,
+        "scale": 0.25,
+    },
+    {
+        "name": "midlarge",
+        "batch_tokens": 8,
+        "hidden_size": 40,
+        "ffn_size": 80,
+        "scale": 0.1875,
+    },
+    {
+        "name": "large",
+        "batch_tokens": 8,
+        "hidden_size": 48,
+        "ffn_size": 96,
+        "scale": 0.125,
+    },
 ]
 
 MODEL_PRESETS = [
@@ -97,7 +127,9 @@ def case_map(matrix: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {case["name"]: dict(case) for case in matrix["cases"]}
 
 
-def select_cases(matrix: dict[str, Any], names: list[str] | None = None) -> list[dict[str, Any]]:
+def select_cases(
+    matrix: dict[str, Any], names: list[str] | None = None
+) -> list[dict[str, Any]]:
     if names is None:
         return [dict(case) for case in matrix["cases"]]
     cases = case_map(matrix)
@@ -133,7 +165,9 @@ def routed_tokens_for_context(preset: dict[str, Any], context_length: int) -> in
 def routing_stats(manifest: dict[str, Any]) -> dict[str, Any]:
     workload = manifest.get("workload", {})
     cfg = KernelConfig(
-        batch_tokens=int(workload.get("routed_tokens", manifest["model"]["batch_tokens"])),
+        batch_tokens=int(
+            workload.get("routed_tokens", manifest["model"]["batch_tokens"])
+        ),
         hidden_size=manifest["model"]["hidden_size"],
         ffn_size=manifest["model"]["ffn_size"],
         dtype=manifest["model"]["dtype"],
@@ -141,16 +175,32 @@ def routing_stats(manifest: dict[str, Any]) -> dict[str, Any]:
     routing_profile = workload.get("routing_profile", DEFAULT_ROUTING_PROFILE)
     input_scale = float(manifest.get("inputs", {}).get("scale", DEFAULT_INPUT_SCALE))
     weight_scale = float(manifest.get("weights", {}).get("scale", DEFAULT_WEIGHT_SCALE))
-    inputs = random_inputs(cfg, manifest["inputs"]["seed"], scale=input_scale, routing_profile=routing_profile)
-    weights = random_weights(cfg, manifest["weights"]["seed"], scale=weight_scale, routing_profile=routing_profile)
+    inputs = random_inputs(
+        cfg,
+        manifest["inputs"]["seed"],
+        scale=input_scale,
+        routing_profile=routing_profile,
+    )
+    weights = random_weights(
+        cfg,
+        manifest["weights"]["seed"],
+        scale=weight_scale,
+        routing_profile=routing_profile,
+    )
     logits = router_logits(inputs, weights.router, cfg.dtype)
     top1 = topk_weights(logits, "top1", cfg.dtype)
     top2 = topk_weights(logits, "top2", cfg.dtype)
     top1_counts = top1.astype("float32").sum(axis=0)
     top2_mass = top2.astype("float32").sum(axis=0)
     return {
-        "top1_token_counts": {"expert0": int(round(float(top1_counts[0]))), "expert1": int(round(float(top1_counts[1])))},
-        "top2_probability_mass": {"expert0": float(top2_mass[0]), "expert1": float(top2_mass[1])},
+        "top1_token_counts": {
+            "expert0": int(round(float(top1_counts[0]))),
+            "expert1": int(round(float(top1_counts[1]))),
+        },
+        "top2_probability_mass": {
+            "expert0": float(top2_mass[0]),
+            "expert1": float(top2_mass[1]),
+        },
     }
 
 
@@ -158,12 +208,16 @@ def clone_manifest(base_manifest: dict[str, Any]) -> dict[str, Any]:
     return copy.deepcopy(base_manifest)
 
 
-def _set_generated_paths(manifest: dict[str, Any], artifact_root: str, source_root: str) -> None:
+def _set_generated_paths(
+    manifest: dict[str, Any], artifact_root: str, source_root: str
+) -> None:
     manifest["paths"]["artifacts"] = artifact_root
     manifest["paths"]["generated_air_sources"] = source_root
 
 
-def shape_workloads(base_manifest: dict[str, Any], matrix: dict[str, Any]) -> list[dict[str, Any]]:
+def shape_workloads(
+    base_manifest: dict[str, Any], matrix: dict[str, Any]
+) -> list[dict[str, Any]]:
     cases = select_cases(matrix)
     workloads = []
     for shape in SHAPE_SWEEP:
@@ -188,7 +242,9 @@ def shape_workloads(base_manifest: dict[str, Any], matrix: dict[str, Any]) -> li
     return workloads
 
 
-def routing_workloads(base_manifest: dict[str, Any], matrix: dict[str, Any]) -> list[dict[str, Any]]:
+def routing_workloads(
+    base_manifest: dict[str, Any], matrix: dict[str, Any]
+) -> list[dict[str, Any]]:
     cases = select_cases(matrix, ROUTING_CASE_NAMES)
     workloads = []
     shared_artifact_root = (
@@ -199,7 +255,11 @@ def routing_workloads(base_manifest: dict[str, Any], matrix: dict[str, Any]) -> 
         manifest = clone_manifest(base_manifest)
         manifest.setdefault("workload", {})["routing_profile"] = profile
         workload_name = f"{profile}_{manifest['model']['batch_tokens']}x{manifest['model']['hidden_size']}x{manifest['model']['ffn_size']}"
-        _set_generated_paths(manifest, f"{shared_artifact_root}/compiled", f"{shared_artifact_root}/air_sources")
+        _set_generated_paths(
+            manifest,
+            f"{shared_artifact_root}/compiled",
+            f"{shared_artifact_root}/air_sources",
+        )
         workloads.append(
             {
                 "suite": "routing_sweep",
@@ -211,7 +271,9 @@ def routing_workloads(base_manifest: dict[str, Any], matrix: dict[str, Any]) -> 
     return workloads
 
 
-def model_preset_workloads(base_manifest: dict[str, Any], matrix: dict[str, Any]) -> list[dict[str, Any]]:
+def model_preset_workloads(
+    base_manifest: dict[str, Any], matrix: dict[str, Any]
+) -> list[dict[str, Any]]:
     cases = select_cases(matrix)
     workloads = []
     for preset in MODEL_PRESETS:
@@ -233,7 +295,9 @@ def model_preset_workloads(base_manifest: dict[str, Any], matrix: dict[str, Any]
             workload["num_experts"] = preset["num_experts"]
             workload["active_experts"] = preset["active_experts"]
             workload["context_length"] = context_length
-            workload["routed_tokens"] = routed_tokens_for_context(preset, context_length)
+            workload["routed_tokens"] = routed_tokens_for_context(
+                preset, context_length
+            )
             if "shared_expert_ffn_size" in preset:
                 workload["shared_expert_ffn_size"] = preset["shared_expert_ffn_size"]
             workload_name = (

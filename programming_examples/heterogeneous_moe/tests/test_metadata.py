@@ -31,15 +31,23 @@ def test_metadata_command_success_and_failures(monkeypatch, tmp_path: Path) -> N
     assert _run_metadata_command(["tool"], cwd=tmp_path) is None
 
 
-def test_tool_path_and_collect_run_metadata(monkeypatch, tmp_path: Path, default_manifest: dict) -> None:
+def test_tool_path_and_collect_run_metadata(
+    monkeypatch, tmp_path: Path, default_manifest: dict
+) -> None:
     monkeypatch.setenv("AIRCC_PATH", "/opt/aircc")
     assert _tool_path("aircc", "AIRCC_PATH") == "/opt/aircc"
     monkeypatch.delenv("AIRCC_PATH")
     monkeypatch.setattr(metadata.shutil, "which", lambda name: f"/usr/bin/{name}")
     assert _tool_path("aircc") == "/usr/bin/aircc"
 
-    monkeypatch.setattr(metadata, "_run_metadata_command", lambda cmd, cwd=None, timeout_s=2.0: "abc" if "rev-parse" in cmd else "")
-    info = collect_run_metadata(tmp_path / "manifest.json", default_manifest, command_line=["cmd"])
+    monkeypatch.setattr(
+        metadata,
+        "_run_metadata_command",
+        lambda cmd, cwd=None, timeout_s=2.0: "abc" if "rev-parse" in cmd else "",
+    )
+    info = collect_run_metadata(
+        tmp_path / "manifest.json", default_manifest, command_line=["cmd"]
+    )
     assert info["schema_version"] == "edge-study-v1"
     assert info["command_line"] == ["cmd"]
     assert info["git"]["sha"] == "abc"

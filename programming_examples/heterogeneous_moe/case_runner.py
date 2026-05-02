@@ -11,7 +11,12 @@ from typing import Any
 from manifest import EDGE_STUDY_SCHEMA_VERSION, update_manifest_backends
 from metadata import collect_run_metadata
 from orchestrator import MoERuntime
-from results import benchmark_runtime, build_case_result, generate_inputs, validate_runtime
+from results import (
+    benchmark_runtime,
+    build_case_result,
+    generate_inputs,
+    validate_runtime,
+)
 from trace import TraceRecorder
 
 
@@ -40,7 +45,9 @@ def contains_npu(stage_backends: dict[str, str]) -> bool:
     return any(backend == "npu" for backend in stage_backends.values())
 
 
-def apply_case_to_manifest(manifest: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
+def apply_case_to_manifest(
+    manifest: dict[str, Any], case: dict[str, Any]
+) -> dict[str, Any]:
     stages = case_stage_backends(case)
     return update_manifest_backends(
         manifest,
@@ -59,8 +66,16 @@ def run_case_with_trace(
     options: RunCaseOptions,
 ) -> tuple[dict[str, Any], TraceRecorder | None]:
     manifest = apply_case_to_manifest(copy.deepcopy(manifest), case)
-    local_iterations = options.iterations or case.get("iterations") or manifest["benchmark"]["iterations"]
-    local_warmup = options.warmup if options.warmup is not None else case.get("warmup", manifest["benchmark"]["warmup"])
+    local_iterations = (
+        options.iterations
+        or case.get("iterations")
+        or manifest["benchmark"]["iterations"]
+    )
+    local_warmup = (
+        options.warmup
+        if options.warmup is not None
+        else case.get("warmup", manifest["benchmark"]["warmup"])
+    )
 
     setup_start = time.perf_counter_ns()
     runtime: MoERuntime | None = None
@@ -78,7 +93,9 @@ def run_case_with_trace(
             warmup=local_warmup,
             measurement_mode=options.measurement_mode,
         )
-        last_run, validation_ms = validate_runtime(runtime, inputs, router_mode=manifest["runtime"]["router_mode"])
+        last_run, validation_ms = validate_runtime(
+            runtime, inputs, router_mode=manifest["runtime"]["router_mode"]
+        )
         phase_timings_ms = {
             **input_phase_timings,
             **timing["phase_timings_ms"],
@@ -87,7 +104,9 @@ def run_case_with_trace(
         }
         result = build_case_result(
             schema_version=EDGE_STUDY_SCHEMA_VERSION,
-            metadata=collect_run_metadata(options.manifest_path, manifest, command_line=options.command_line),
+            metadata=collect_run_metadata(
+                options.manifest_path, manifest, command_line=options.command_line
+            ),
             case_name=options.case_name or case.get("name", "adhoc"),
             manifest=manifest,
             iterations=local_iterations,

@@ -13,7 +13,9 @@ from typing import Any
 from manifest import EDGE_STUDY_SCHEMA_VERSION, repo_dir, stable_json_hash
 
 
-def _run_metadata_command(cmd: list[str], cwd: Path | None = None, timeout_s: float = 2.0) -> str | None:
+def _run_metadata_command(
+    cmd: list[str], cwd: Path | None = None, timeout_s: float = 2.0
+) -> str | None:
     try:
         completed = subprocess.run(
             cmd,
@@ -44,7 +46,9 @@ def collect_run_metadata(
 ) -> dict[str, Any]:
     repo = repo_dir()
     git_sha = _run_metadata_command(["git", "rev-parse", "HEAD"], cwd=repo)
-    tracked_status = _run_metadata_command(["git", "status", "--short", "--untracked-files=no"], cwd=repo)
+    tracked_status = _run_metadata_command(
+        ["git", "status", "--short", "--untracked-files=no"], cwd=repo
+    )
     return {
         "schema_version": EDGE_STUDY_SCHEMA_VERSION,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -55,7 +59,9 @@ def collect_run_metadata(
             "repo": str(repo),
             "sha": git_sha,
             "tracked_dirty": bool(tracked_status),
-            "tracked_status_line_count": 0 if not tracked_status else len(tracked_status.splitlines()),
+            "tracked_status_line_count": (
+                0 if not tracked_status else len(tracked_status.splitlines())
+            ),
         },
         "host": {
             "platform": platform.platform(),

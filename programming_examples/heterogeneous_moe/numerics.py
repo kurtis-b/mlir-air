@@ -53,7 +53,11 @@ def quantize_array(values: np.ndarray, dtype_name: str) -> np.ndarray:
 def quantize_scalar(value: float, dtype_name: str) -> float:
     normalized = normalize_dtype_name(dtype_name)
     if normalized == "bf16":
-        return float(bf16_bits_to_float32(float32_to_bf16_bits(np.asarray([value], dtype=np.float32)))[0])
+        return float(
+            bf16_bits_to_float32(
+                float32_to_bf16_bits(np.asarray([value], dtype=np.float32))
+            )[0]
+        )
     if normalized == "f16":
         return float(np.float16(value))
     raise ValueError(f"Unsupported dtype: {dtype_name}")

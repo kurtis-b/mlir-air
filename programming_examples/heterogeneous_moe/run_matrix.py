@@ -8,7 +8,11 @@ import csv
 import sys
 from pathlib import Path
 
-from case_runner import RunCaseOptions, contains_npu as _contains_npu, run_case_with_trace
+from case_runner import (
+    RunCaseOptions,
+    contains_npu as _contains_npu,
+    run_case_with_trace,
+)
 from manifest import EDGE_STUDY_SCHEMA_VERSION, load_json, project_dir, save_json
 from results import CSV_FIELDNAMES, correctness_failure_message, result_csv_row
 
@@ -36,8 +40,14 @@ def _run_case(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run a benchmark matrix for the heterogeneous MoE example.")
-    parser.add_argument("--manifest", default="default_manifest.json", help="Manifest path relative to this directory.")
+    parser = argparse.ArgumentParser(
+        description="Run a benchmark matrix for the heterogeneous MoE example."
+    )
+    parser.add_argument(
+        "--manifest",
+        default="default_manifest.json",
+        help="Manifest path relative to this directory.",
+    )
     parser.add_argument(
         "--matrix",
         default="default_benchmark_matrix.json",
@@ -48,17 +58,34 @@ def main(argv: list[str] | None = None) -> int:
         default="artifacts/benchmarks/latest",
         help="Output directory for result JSON, CSV, traces, and report inputs.",
     )
-    parser.add_argument("--iterations", type=int, default=None, help="Override iteration count for every case.")
-    parser.add_argument("--warmup", type=int, default=None, help="Override warmup count for every case.")
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=None,
+        help="Override iteration count for every case.",
+    )
+    parser.add_argument(
+        "--warmup", type=int, default=None, help="Override warmup count for every case."
+    )
     parser.add_argument(
         "--measurement-mode",
         choices=["cold", "warm", "both"],
         default="warm",
         help="Measure cold start, warm steady-state, or both. Validation is always untimed.",
     )
-    parser.add_argument("--allow-npu", action="store_true", help="Run NPU-tagged cases in the matrix.")
-    parser.add_argument("--require-correctness", action="store_true", help="Fail if final output validation is outside dtype tolerances.")
-    parser.add_argument("--require-torch", action="store_true", help="Fail if torch validation is unavailable or fails.")
+    parser.add_argument(
+        "--allow-npu", action="store_true", help="Run NPU-tagged cases in the matrix."
+    )
+    parser.add_argument(
+        "--require-correctness",
+        action="store_true",
+        help="Fail if final output validation is outside dtype tolerances.",
+    )
+    parser.add_argument(
+        "--require-torch",
+        action="store_true",
+        help="Fail if torch validation is unavailable or fails.",
+    )
     parser.add_argument(
         "--case-filter",
         nargs="*",
@@ -78,7 +105,9 @@ def main(argv: list[str] | None = None) -> int:
     selected_cases = matrix["cases"]
     if args.case_filter:
         allowed_cases = set(args.case_filter)
-        selected_cases = [case for case in selected_cases if case["name"] in allowed_cases]
+        selected_cases = [
+            case for case in selected_cases if case["name"] in allowed_cases
+        ]
 
     aggregate = {
         "schema_version": EDGE_STUDY_SCHEMA_VERSION,
@@ -94,7 +123,9 @@ def main(argv: list[str] | None = None) -> int:
             "aggregation": case["aggregation_backend"],
         }
         if _contains_npu(stage_backends) and not args.allow_npu:
-            aggregate["skipped"].append({"case_name": case["name"], "reason": "NPU disabled for this run"})
+            aggregate["skipped"].append(
+                {"case_name": case["name"], "reason": "NPU disabled for this run"}
+            )
             continue
 
         result, trace = _run_case(
@@ -103,14 +134,22 @@ def main(argv: list[str] | None = None) -> int:
             args.iterations,
             args.warmup,
             args.measurement_mode,
-            [sys.executable, *sys.argv] if argv is None else [sys.executable, "run_matrix.py", *argv],
+            (
+                [sys.executable, *sys.argv]
+                if argv is None
+                else [sys.executable, "run_matrix.py", *argv]
+            ),
         )
         if args.require_torch and not result["torch_validation"]["ok"]:
-            raise SystemExit(f"torch validation failed for {case['name']}: {result['torch_validation']['message']}")
+            raise SystemExit(
+                f"torch validation failed for {case['name']}: {result['torch_validation']['message']}"
+            )
         if args.require_correctness:
             failure = correctness_failure_message(result)
             if failure is not None:
-                raise SystemExit(f"correctness validation failed for {case['name']}: {failure}")
+                raise SystemExit(
+                    f"correctness validation failed for {case['name']}: {failure}"
+                )
 
         case_dir = output_dir / case["name"]
         case_dir.mkdir(parents=True, exist_ok=True)

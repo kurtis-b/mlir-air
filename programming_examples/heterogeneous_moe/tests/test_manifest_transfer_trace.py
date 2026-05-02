@@ -22,7 +22,9 @@ from trace import TraceRecorder, summarize_device_events, trace_duration_us
 from transfer import TransferManager
 
 
-def test_manifest_paths_hash_and_backend_updates(tmp_path: Path, default_manifest: dict) -> None:
+def test_manifest_paths_hash_and_backend_updates(
+    tmp_path: Path, default_manifest: dict
+) -> None:
     payload = {"b": 2, "a": {"x": 1}}
     path = tmp_path / "nested" / "payload.json"
     save_json(path, payload)
@@ -73,7 +75,10 @@ def test_transfer_manager_modes_and_summaries() -> None:
     copied = peer.transfer("gpu", "gpu", noncontiguous, None, "gpu_to_gpu")
     assert alias is contiguous
     assert copied.flags.c_contiguous
-    assert peer.summary()["by_edge"]["cpu->gpu"]["actual_modes"]["numpy_host_array_model"] == 1
+    assert (
+        peer.summary()["by_edge"]["cpu->gpu"]["actual_modes"]["numpy_host_array_model"]
+        == 1
+    )
     with pytest.raises(RuntimeError, match="Peer transfer is not supported"):
         peer.transfer("gpu", "npu", contiguous, None, "unsupported")
 

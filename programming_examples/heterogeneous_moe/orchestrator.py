@@ -39,9 +39,15 @@ class MoERuntime:
             ffn_size=manifest["model"]["ffn_size"],
             dtype=manifest["model"]["dtype"],
         )
-        self.input_scale = float(manifest.get("inputs", {}).get("scale", DEFAULT_INPUT_SCALE))
-        self.weight_scale = float(manifest.get("weights", {}).get("scale", DEFAULT_WEIGHT_SCALE))
-        self.routing_profile = manifest.get("workload", {}).get("routing_profile", DEFAULT_ROUTING_PROFILE)
+        self.input_scale = float(
+            manifest.get("inputs", {}).get("scale", DEFAULT_INPUT_SCALE)
+        )
+        self.weight_scale = float(
+            manifest.get("weights", {}).get("scale", DEFAULT_WEIGHT_SCALE)
+        )
+        self.routing_profile = manifest.get("workload", {}).get(
+            "routing_profile", DEFAULT_ROUTING_PROFILE
+        )
         self.weights = random_weights(
             self.cfg,
             manifest["weights"]["seed"],
@@ -73,7 +79,11 @@ class MoERuntime:
         return False
 
     def logical_batch_tokens(self) -> int:
-        return int(self.manifest.get("workload", {}).get("routed_tokens", self.cfg.batch_tokens))
+        return int(
+            self.manifest.get("workload", {}).get(
+                "routed_tokens", self.cfg.batch_tokens
+            )
+        )
 
     def _sources_for(self, backend: str) -> dict[str, Path]:
         if backend not in self._sources:
@@ -134,7 +144,10 @@ class MoERuntime:
                 prepare()
 
     def _npu_stage_executed(self) -> bool:
-        return any(backend == "npu" for backend in self.manifest["runtime"]["stage_backends"].values())
+        return any(
+            backend == "npu"
+            for backend in self.manifest["runtime"]["stage_backends"].values()
+        )
 
     def _npu_sources_report(self) -> dict[str, str]:
         if "npu" not in self._sources:
@@ -169,24 +182,44 @@ class MoERuntime:
             "router": {
                 "input": encoded_array_summary(inputs, self.cfg.dtype),
                 "weights": encoded_array_summary(self.weights.router, self.cfg.dtype),
-                "expected_output": encoded_array_summary(reference["logits"], self.cfg.dtype),
+                "expected_output": encoded_array_summary(
+                    reference["logits"], self.cfg.dtype
+                ),
             },
             "expert0": {
-                "input": encoded_array_summary(reference["expert0_input"], self.cfg.dtype),
-                "w1": encoded_array_summary(self.expert_weights["expert0"][0], self.cfg.dtype),
-                "w2": encoded_array_summary(self.expert_weights["expert0"][1], self.cfg.dtype),
-                "expected_output": encoded_array_summary(reference["expert0_output"], self.cfg.dtype),
+                "input": encoded_array_summary(
+                    reference["expert0_input"], self.cfg.dtype
+                ),
+                "w1": encoded_array_summary(
+                    self.expert_weights["expert0"][0], self.cfg.dtype
+                ),
+                "w2": encoded_array_summary(
+                    self.expert_weights["expert0"][1], self.cfg.dtype
+                ),
+                "expected_output": encoded_array_summary(
+                    reference["expert0_output"], self.cfg.dtype
+                ),
             },
             "expert1": {
-                "input": encoded_array_summary(reference["expert1_input"], self.cfg.dtype),
-                "w1": encoded_array_summary(self.expert_weights["expert1"][0], self.cfg.dtype),
-                "w2": encoded_array_summary(self.expert_weights["expert1"][1], self.cfg.dtype),
-                "expected_output": encoded_array_summary(reference["expert1_output"], self.cfg.dtype),
+                "input": encoded_array_summary(
+                    reference["expert1_input"], self.cfg.dtype
+                ),
+                "w1": encoded_array_summary(
+                    self.expert_weights["expert1"][0], self.cfg.dtype
+                ),
+                "w2": encoded_array_summary(
+                    self.expert_weights["expert1"][1], self.cfg.dtype
+                ),
+                "expected_output": encoded_array_summary(
+                    reference["expert1_output"], self.cfg.dtype
+                ),
             },
             "aggregation": {
                 "input": encoded_array_summary(packed_experts, self.cfg.dtype),
                 "weights": encoded_array_summary(route_weights, self.cfg.dtype),
-                "expected_output": encoded_array_summary(reference["output"], self.cfg.dtype),
+                "expected_output": encoded_array_summary(
+                    reference["output"], self.cfg.dtype
+                ),
             },
             "notes": [
                 *notes,
@@ -224,20 +257,32 @@ class MoERuntime:
         if trace is None:
             logits = self.executors.router.run(inputs, self.weights.router)
         else:
-            with trace.span("router_math", "stage", "router", {"backend": stages["router"]}):
+            with trace.span(
+                "router_math", "stage", "router", {"backend": stages["router"]}
+            ):
                 logits = self.executors.router.run(inputs, self.weights.router)
-        logits_cpu = self.transfer.transfer(stages["router"], "cpu", logits, trace, "router_to_cpu")
+        logits_cpu = self.transfer.transfer(
+            stages["router"], "cpu", logits, trace, "router_to_cpu"
+        )
 
         if trace is None:
             route_weights = topk_weights(logits_cpu, router_mode, self.cfg.dtype)
-            expert0_in, expert1_in = routed_inputs(inputs, route_weights, self.cfg.dtype)
+            expert0_in, expert1_in = routed_inputs(
+                inputs, route_weights, self.cfg.dtype
+            )
         else:
             with trace.span("topk_select", "control", "cpu", {"mode": router_mode}):
                 route_weights = topk_weights(logits_cpu, router_mode, self.cfg.dtype)
-                expert0_in, expert1_in = routed_inputs(inputs, route_weights, self.cfg.dtype)
+                expert0_in, expert1_in = routed_inputs(
+                    inputs, route_weights, self.cfg.dtype
+                )
 
-        expert0_arg = self.transfer.transfer("cpu", stages["expert0"], expert0_in, trace, "cpu_to_expert0")
-        expert1_arg = self.transfer.transfer("cpu", stages["expert1"], expert1_in, trace, "cpu_to_expert1")
+        expert0_arg = self.transfer.transfer(
+            "cpu", stages["expert0"], expert0_in, trace, "cpu_to_expert0"
+        )
+        expert1_arg = self.transfer.transfer(
+            "cpu", stages["expert1"], expert1_in, trace, "cpu_to_expert1"
+        )
         expert0_w1 = self.transfer.transfer(
             "cpu",
             stages["expert0"],
@@ -292,19 +337,36 @@ class MoERuntime:
 
         aggregation_backend = stages["aggregation"]
         if trace is None:
-            packed_experts = pack_expert_outputs(expert0_out, expert1_out, self.cfg.dtype)
+            packed_experts = pack_expert_outputs(
+                expert0_out, expert1_out, self.cfg.dtype
+            )
         else:
-            with trace.span("pack_aggregation_inputs", "control", "cpu", {"source0": stages["expert0"], "source1": stages["expert1"]}):
-                packed_experts = pack_expert_outputs(expert0_out, expert1_out, self.cfg.dtype)
-        agg_experts = self.transfer.transfer("cpu", aggregation_backend, packed_experts, trace, "experts_to_aggregation")
-        agg_weights = self.transfer.transfer("cpu", aggregation_backend, route_weights, trace, "weights_to_aggregation")
+            with trace.span(
+                "pack_aggregation_inputs",
+                "control",
+                "cpu",
+                {"source0": stages["expert0"], "source1": stages["expert1"]},
+            ):
+                packed_experts = pack_expert_outputs(
+                    expert0_out, expert1_out, self.cfg.dtype
+                )
+        agg_experts = self.transfer.transfer(
+            "cpu", aggregation_backend, packed_experts, trace, "experts_to_aggregation"
+        )
+        agg_weights = self.transfer.transfer(
+            "cpu", aggregation_backend, route_weights, trace, "weights_to_aggregation"
+        )
 
         if trace is None:
             output = self.executors.aggregation.run(agg_experts, agg_weights)
         else:
-            with trace.span("aggregation", "stage", "aggregation", {"backend": aggregation_backend}):
+            with trace.span(
+                "aggregation", "stage", "aggregation", {"backend": aggregation_backend}
+            ):
                 output = self.executors.aggregation.run(agg_experts, agg_weights)
-        output_cpu = self.transfer.transfer(aggregation_backend, "cpu", output, trace, "aggregation_to_cpu")
+        output_cpu = self.transfer.transfer(
+            aggregation_backend, "cpu", output, trace, "aggregation_to_cpu"
+        )
 
         if not capture_details:
             return {"output": output_cpu}
@@ -338,7 +400,10 @@ class MoERuntime:
                 quantized_reference=reference,
             )
         else:
-            reference = {name: np.asarray(value, dtype=np.float32) for name, value in actual_bundle.items()}
+            reference = {
+                name: np.asarray(value, dtype=np.float32)
+                for name, value in actual_bundle.items()
+            }
             per_stage_metrics = {}
         npu_dev_report = self._npu_development_report(
             inputs,
@@ -375,7 +440,9 @@ class MoERuntime:
                 "input_scale": self.input_scale,
                 "weight_scale": self.weight_scale,
                 "kernel_chunk_tokens": self.cfg.batch_tokens,
-                "context_length": self.manifest.get("workload", {}).get("context_length"),
+                "context_length": self.manifest.get("workload", {}).get(
+                    "context_length"
+                ),
                 "routed_tokens": int(inputs.shape[0]),
                 "chunk_count": 1,
             },
@@ -401,7 +468,9 @@ class MoERuntime:
         if capture_details:
             self.transfer.reset_events()
         if inputs.shape[0] == self.cfg.batch_tokens:
-            return self._run_single(inputs, router_mode, validate=validate, capture_details=capture_details)
+            return self._run_single(
+                inputs, router_mode, validate=validate, capture_details=capture_details
+            )
 
         if not capture_details:
             router_mode = router_mode or self.manifest["runtime"]["router_mode"]
@@ -413,10 +482,14 @@ class MoERuntime:
                 valid_tokens = end - start
                 chunk = np.asarray(inputs[start:end], dtype=np.float32)
                 if valid_tokens < chunk_tokens:
-                    padded = np.zeros((chunk_tokens, self.cfg.hidden_size), dtype=np.float32)
+                    padded = np.zeros(
+                        (chunk_tokens, self.cfg.hidden_size), dtype=np.float32
+                    )
                     padded[:valid_tokens] = chunk
                     chunk = padded
-                self._run_single(chunk, router_mode, validate=False, capture_details=False)
+                self._run_single(
+                    chunk, router_mode, validate=False, capture_details=False
+                )
                 start = end
             return {"output": None}
 
@@ -443,27 +516,59 @@ class MoERuntime:
             valid_tokens = end - start
             chunk = np.asarray(inputs[start:end], dtype=np.float32)
             if valid_tokens < chunk_tokens:
-                padded = np.zeros((chunk_tokens, self.cfg.hidden_size), dtype=np.float32)
+                padded = np.zeros(
+                    (chunk_tokens, self.cfg.hidden_size), dtype=np.float32
+                )
                 padded[:valid_tokens] = chunk
                 chunk = padded
             chunk_result = self._run_single(chunk, router_mode, validate=False)
             chunk_results.append(chunk_result)
-            merged_trace.extend(chunk_result["trace"].snapshot(), ts_offset_us=trace_offset_us)
+            merged_trace.extend(
+                chunk_result["trace"].snapshot(), ts_offset_us=trace_offset_us
+            )
             trace_offset_us += float(chunk_result["trace_summary"]["span_us"]) + 1.0
 
-            actual_chunks["logits"].append(np.asarray(chunk_result["logits"][:valid_tokens], dtype=np.float32))
-            actual_chunks["weights"].append(np.asarray(chunk_result["weights"][:valid_tokens], dtype=np.float32))
-            actual_chunks["expert0_input"].append(np.asarray(chunk_result["expert0_input"][:valid_tokens], dtype=np.float32))
-            actual_chunks["expert1_input"].append(np.asarray(chunk_result["expert1_input"][:valid_tokens], dtype=np.float32))
-            actual_chunks["expert0_output"].append(np.asarray(chunk_result["expert0_output"][:valid_tokens], dtype=np.float32))
-            actual_chunks["expert1_output"].append(np.asarray(chunk_result["expert1_output"][:valid_tokens], dtype=np.float32))
-            actual_chunks["packed_expert_outputs"].append(
-                np.asarray(chunk_result["packed_expert_outputs"][:valid_tokens], dtype=np.float32)
+            actual_chunks["logits"].append(
+                np.asarray(chunk_result["logits"][:valid_tokens], dtype=np.float32)
             )
-            actual_chunks["output"].append(np.asarray(chunk_result["output"][:valid_tokens], dtype=np.float32))
+            actual_chunks["weights"].append(
+                np.asarray(chunk_result["weights"][:valid_tokens], dtype=np.float32)
+            )
+            actual_chunks["expert0_input"].append(
+                np.asarray(
+                    chunk_result["expert0_input"][:valid_tokens], dtype=np.float32
+                )
+            )
+            actual_chunks["expert1_input"].append(
+                np.asarray(
+                    chunk_result["expert1_input"][:valid_tokens], dtype=np.float32
+                )
+            )
+            actual_chunks["expert0_output"].append(
+                np.asarray(
+                    chunk_result["expert0_output"][:valid_tokens], dtype=np.float32
+                )
+            )
+            actual_chunks["expert1_output"].append(
+                np.asarray(
+                    chunk_result["expert1_output"][:valid_tokens], dtype=np.float32
+                )
+            )
+            actual_chunks["packed_expert_outputs"].append(
+                np.asarray(
+                    chunk_result["packed_expert_outputs"][:valid_tokens],
+                    dtype=np.float32,
+                )
+            )
+            actual_chunks["output"].append(
+                np.asarray(chunk_result["output"][:valid_tokens], dtype=np.float32)
+            )
             start = end
 
-        actual_bundle = {name: np.concatenate(chunks, axis=0) for name, chunks in actual_chunks.items()}
+        actual_bundle = {
+            name: np.concatenate(chunks, axis=0)
+            for name, chunks in actual_chunks.items()
+        }
         logical_cfg = KernelConfig(
             batch_tokens=total_tokens,
             hidden_size=self.cfg.hidden_size,
@@ -487,7 +592,10 @@ class MoERuntime:
                 quantized_reference=reference,
             )
         else:
-            reference = {name: np.asarray(value, dtype=np.float32) for name, value in actual_bundle.items()}
+            reference = {
+                name: np.asarray(value, dtype=np.float32)
+                for name, value in actual_bundle.items()
+            }
             per_stage_metrics = {}
             max_abs_error = None
             torch_validation = {"ran": False, "ok": False, "message": "skipped"}
@@ -524,7 +632,9 @@ class MoERuntime:
                 "input_scale": self.input_scale,
                 "weight_scale": self.weight_scale,
                 "kernel_chunk_tokens": chunk_tokens,
-                "context_length": self.manifest.get("workload", {}).get("context_length"),
+                "context_length": self.manifest.get("workload", {}).get(
+                    "context_length"
+                ),
                 "routed_tokens": total_tokens,
                 "chunk_count": len(chunk_results),
             },

@@ -9,6 +9,18 @@ $ cd build
 $ ninja check-air
 ```
 
+## Lint And Format
+
+Before sending a branch for review, run the repository format checks against files changed from the branch base:
+
+```
+$ git clang-format --diff upstream/main
+$ git diff --name-only upstream/main -- '*.py'
+$ /home/cj/mlir-air/sandbox/bin/python3 -m black --check --diff <changed-python-files>
+```
+
+To apply formatting, run `git clang-format upstream/main` and rerun Black on the same changed Python file list without `--check --diff`. The existing GitHub static-analysis workflow runs `clang-tidy`; there is no separate local `clang-tidy` gate required for the validation lanes below.
+
 ## Testing an Install Area
 
 It is almost always much faster to cross-compile these tools for embedded processors (e.g. ARM/AArch64) rather than compiling locally.  To test a cross-compiled build, the tests can be configured using cmake independently from the rest of the source code.  This leverages standard cmake mechanisms to export information about an install area.
@@ -47,7 +59,7 @@ Board tests must also be serialized because they assume exclusive access to the 
 
 ## Branch Validation Lanes
 
-Use these lanes when validating changes across compiler, Python, GPU, MoE, and hardware-backed runtime paths. These are branch-validation lanes, not source line coverage metrics.
+Use these lanes when validating changes across compiler, Python, GPU, MoE, and hardware-backed runtime paths. These are branch-validation lanes, not source line coverage metrics, except for the explicit opt-in MoE coverage target.
 
 CI-safe compiler and CPU checks:
 
@@ -55,9 +67,12 @@ CI-safe compiler and CPU checks:
 $ ninja -C build-gpu-lit check-air-mlir
 $ ninja -C build-gpu-lit check-air-cpp
 $ ninja -C build-gpu-lit check-airmlir-conversion-airtorocdl
+$ ninja -C build check-heterogeneous-moe-coverage
 $ cd programming_examples/heterogeneous_moe
 $ python3 smoke_tests.py --lane ci
 ```
+
+The MoE coverage target writes reports under `programming_examples/heterogeneous_moe/artifacts/coverage/latest` and remains outside `check-all`.
 
 GPU-local checks, when a ROCm/AMDGPU LLVM toolchain is configured:
 

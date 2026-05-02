@@ -31,7 +31,9 @@ def random_inputs(
     routing_profile: str = DEFAULT_ROUTING_PROFILE,
 ) -> np.ndarray:
     rng = np.random.default_rng(seed)
-    data = rng.standard_normal((cfg.batch_tokens, cfg.hidden_size), dtype=np.float32) * np.float32(scale)
+    data = rng.standard_normal(
+        (cfg.batch_tokens, cfg.hidden_size), dtype=np.float32
+    ) * np.float32(scale)
     if routing_profile == "expert0_hot":
         data = np.abs(data)
     elif routing_profile == "expert1_hot":
@@ -54,7 +56,9 @@ def _router_weights(
     routing_profile: str,
 ) -> np.ndarray:
     if routing_profile == "balanced":
-        data = rng.standard_normal((cfg.hidden_size, 2), dtype=np.float32) * np.float32(scale)
+        data = rng.standard_normal((cfg.hidden_size, 2), dtype=np.float32) * np.float32(
+            scale
+        )
         return quantize_array(data, cfg.dtype)
 
     profile_scale = np.float32(max(scale * 6.0, 1.0))
@@ -109,8 +113,12 @@ def random_weights(
     )
 
 
-def router_logits(inputs: np.ndarray, weights: np.ndarray, dtype_name: str) -> np.ndarray:
-    logits = np.asarray(inputs, dtype=np.float32) @ np.asarray(weights, dtype=np.float32)
+def router_logits(
+    inputs: np.ndarray, weights: np.ndarray, dtype_name: str
+) -> np.ndarray:
+    logits = np.asarray(inputs, dtype=np.float32) @ np.asarray(
+        weights, dtype=np.float32
+    )
     return quantize_array(logits, dtype_name)
 
 
@@ -130,44 +138,79 @@ def topk_weights(logits: np.ndarray, mode: str, dtype_name: str) -> np.ndarray:
         raise ValueError(f"Unsupported router mode: {mode}")
     indices = np.argmax(probs.astype(np.float32), axis=1)
     out = np.zeros_like(probs)
-    out[np.arange(probs.shape[0]), indices] = quantize_array(np.asarray([1.0], dtype=np.float32), dtype_name)[0]
+    out[np.arange(probs.shape[0]), indices] = quantize_array(
+        np.asarray([1.0], dtype=np.float32), dtype_name
+    )[0]
     return out
 
 
-def routed_inputs(inputs: np.ndarray, weights: np.ndarray, dtype_name: str) -> tuple[np.ndarray, np.ndarray]:
-    expert0 = quantize_array(inputs.astype(np.float32) * weights[:, 0:1].astype(np.float32), dtype_name)
-    expert1 = quantize_array(inputs.astype(np.float32) * weights[:, 1:2].astype(np.float32), dtype_name)
+def routed_inputs(
+    inputs: np.ndarray, weights: np.ndarray, dtype_name: str
+) -> tuple[np.ndarray, np.ndarray]:
+    expert0 = quantize_array(
+        inputs.astype(np.float32) * weights[:, 0:1].astype(np.float32), dtype_name
+    )
+    expert1 = quantize_array(
+        inputs.astype(np.float32) * weights[:, 1:2].astype(np.float32), dtype_name
+    )
     return expert0, expert1
 
 
-def expert_mlp(inputs: np.ndarray, w1: np.ndarray, w2: np.ndarray, dtype_name: str) -> np.ndarray:
+def expert_mlp(
+    inputs: np.ndarray, w1: np.ndarray, w2: np.ndarray, dtype_name: str
+) -> np.ndarray:
     hidden = np.asarray(inputs, dtype=np.float32) @ np.asarray(w1, dtype=np.float32)
     hidden = quantize_array(np.maximum(hidden, 0.0), dtype_name)
     output = np.asarray(hidden, dtype=np.float32) @ np.asarray(w2, dtype=np.float32)
     return quantize_array(output, dtype_name)
 
 
-def pack_expert_outputs(expert0: np.ndarray, expert1: np.ndarray, dtype_name: str) -> np.ndarray:
+def pack_expert_outputs(
+    expert0: np.ndarray, expert1: np.ndarray, dtype_name: str
+) -> np.ndarray:
     return quantize_array(np.concatenate((expert0, expert1), axis=1), dtype_name)
 
 
-def aggregate_outputs(expert0: np.ndarray, expert1: np.ndarray, weights: np.ndarray, dtype_name: str) -> np.ndarray:
-    lhs = quantize_array(np.asarray(expert0, dtype=np.float32) * np.asarray(weights[:, 0:1], dtype=np.float32), dtype_name)
-    rhs = quantize_array(np.asarray(expert1, dtype=np.float32) * np.asarray(weights[:, 1:2], dtype=np.float32), dtype_name)
-    return quantize_array(np.asarray(lhs, dtype=np.float32) + np.asarray(rhs, dtype=np.float32), dtype_name)
+def aggregate_outputs(
+    expert0: np.ndarray, expert1: np.ndarray, weights: np.ndarray, dtype_name: str
+) -> np.ndarray:
+    lhs = quantize_array(
+        np.asarray(expert0, dtype=np.float32)
+        * np.asarray(weights[:, 0:1], dtype=np.float32),
+        dtype_name,
+    )
+    rhs = quantize_array(
+        np.asarray(expert1, dtype=np.float32)
+        * np.asarray(weights[:, 1:2], dtype=np.float32),
+        dtype_name,
+    )
+    return quantize_array(
+        np.asarray(lhs, dtype=np.float32) + np.asarray(rhs, dtype=np.float32),
+        dtype_name,
+    )
 
 
-def aggregate_packed_outputs(experts: np.ndarray, weights: np.ndarray, dtype_name: str) -> np.ndarray:
+def aggregate_packed_outputs(
+    experts: np.ndarray, weights: np.ndarray, dtype_name: str
+) -> np.ndarray:
     split = experts.shape[1] // 2
-    return aggregate_outputs(experts[:, :split], experts[:, split:], weights, dtype_name)
+    return aggregate_outputs(
+        experts[:, :split], experts[:, split:], weights, dtype_name
+    )
 
 
-def run_reference(cfg: KernelConfig, inputs: np.ndarray, weights: MoEWeights, mode: str) -> dict[str, np.ndarray]:
+def run_reference(
+    cfg: KernelConfig, inputs: np.ndarray, weights: MoEWeights, mode: str
+) -> dict[str, np.ndarray]:
     logits = router_logits(inputs, weights.router, cfg.dtype)
     routes = topk_weights(logits, mode, cfg.dtype)
     expert0_in, expert1_in = routed_inputs(inputs, routes, cfg.dtype)
-    expert0_out = expert_mlp(expert0_in, weights.expert0_w1, weights.expert0_w2, cfg.dtype)
-    expert1_out = expert_mlp(expert1_in, weights.expert1_w1, weights.expert1_w2, cfg.dtype)
+    expert0_out = expert_mlp(
+        expert0_in, weights.expert0_w1, weights.expert0_w2, cfg.dtype
+    )
+    expert1_out = expert_mlp(
+        expert1_in, weights.expert1_w1, weights.expert1_w2, cfg.dtype
+    )
     packed_expert_outputs = pack_expert_outputs(expert0_out, expert1_out, cfg.dtype)
     aggregated = aggregate_packed_outputs(packed_expert_outputs, routes, cfg.dtype)
     return {
@@ -182,7 +225,9 @@ def run_reference(cfg: KernelConfig, inputs: np.ndarray, weights: MoEWeights, mo
     }
 
 
-def torch_reference(inputs: np.ndarray, weights: MoEWeights, mode: str) -> dict[str, np.ndarray]:
+def torch_reference(
+    inputs: np.ndarray, weights: MoEWeights, mode: str
+) -> dict[str, np.ndarray]:
     import torch
 
     x = torch.tensor(inputs.astype(np.float32))
@@ -200,22 +245,31 @@ def torch_reference(inputs: np.ndarray, weights: MoEWeights, mode: str) -> dict[
 
     expert0_in = x * routed[:, 0:1]
     expert1_in = x * routed[:, 1:2]
-    e0 = torch.relu(expert0_in @ torch.tensor(weights.expert0_w1.astype(np.float32))) @ torch.tensor(
-        weights.expert0_w2.astype(np.float32)
-    )
-    e1 = torch.relu(expert1_in @ torch.tensor(weights.expert1_w1.astype(np.float32))) @ torch.tensor(
-        weights.expert1_w2.astype(np.float32)
-    )
+    e0 = torch.relu(
+        expert0_in @ torch.tensor(weights.expert0_w1.astype(np.float32))
+    ) @ torch.tensor(weights.expert0_w2.astype(np.float32))
+    e1 = torch.relu(
+        expert1_in @ torch.tensor(weights.expert1_w1.astype(np.float32))
+    ) @ torch.tensor(weights.expert1_w2.astype(np.float32))
     packed = torch.cat((e0, e1), dim=1)
     out = e0 * routed[:, 0:1] + e1 * routed[:, 1:2]
     return {
         "logits": logits.detach().cpu().numpy().astype(np.float32, copy=False),
         "weights": routed.detach().cpu().numpy().astype(np.float32, copy=False),
-        "expert0_input": expert0_in.detach().cpu().numpy().astype(np.float32, copy=False),
-        "expert1_input": expert1_in.detach().cpu().numpy().astype(np.float32, copy=False),
+        "expert0_input": expert0_in.detach()
+        .cpu()
+        .numpy()
+        .astype(np.float32, copy=False),
+        "expert1_input": expert1_in.detach()
+        .cpu()
+        .numpy()
+        .astype(np.float32, copy=False),
         "expert0_output": e0.detach().cpu().numpy().astype(np.float32, copy=False),
         "expert1_output": e1.detach().cpu().numpy().astype(np.float32, copy=False),
-        "packed_expert_outputs": packed.detach().cpu().numpy().astype(np.float32, copy=False),
+        "packed_expert_outputs": packed.detach()
+        .cpu()
+        .numpy()
+        .astype(np.float32, copy=False),
         "output": out.detach().cpu().numpy().astype(np.float32, copy=False),
     }
 
@@ -272,7 +326,9 @@ def optional_torch_validation(
         result["actual_vs_torch"] = actual_metrics
         required_metrics = ["output"]
         result["required_metrics"] = required_metrics
-        result["ok"] = all(actual_metrics[name]["allclose"] for name in required_metrics)
+        result["ok"] = all(
+            actual_metrics[name]["allclose"] for name in required_metrics
+        )
         if not result["ok"]:
             result["message"] = "actual outputs differ from torch reference"
 

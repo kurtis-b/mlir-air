@@ -20,7 +20,15 @@ class TraceRecorder:
         self._events: list[dict[str, Any]] = []
         self._lock = threading.Lock()
 
-    def record(self, name: str, category: str, start_ns: int, end_ns: int, tid: str, args: dict[str, Any] | None = None) -> None:
+    def record(
+        self,
+        name: str,
+        category: str,
+        start_ns: int,
+        end_ns: int,
+        tid: str,
+        args: dict[str, Any] | None = None,
+    ) -> None:
         event = {
             "name": name,
             "cat": category,
@@ -35,7 +43,9 @@ class TraceRecorder:
             self._events.append(event)
 
     @contextlib.contextmanager
-    def span(self, name: str, category: str, tid: str, args: dict[str, Any] | None = None):
+    def span(
+        self, name: str, category: str, tid: str, args: dict[str, Any] | None = None
+    ):
         start = time.perf_counter_ns()
         try:
             yield
@@ -55,7 +65,9 @@ class TraceRecorder:
         with self._lock:
             return [dict(event) for event in self._events]
 
-    def extend(self, events: list[dict[str, Any]], *, ts_offset_us: float = 0.0) -> None:
+    def extend(
+        self, events: list[dict[str, Any]], *, ts_offset_us: float = 0.0
+    ) -> None:
         if not events:
             return
         base_ts = min(float(event["ts"]) for event in events)
@@ -70,7 +82,13 @@ class TraceRecorder:
     def summary(self) -> dict[str, Any]:
         events = self.snapshot()
         if not events:
-            return {"event_count": 0, "total_duration_us": 0.0, "span_us": 0.0, "by_name": {}, "overlap": {}}
+            return {
+                "event_count": 0,
+                "total_duration_us": 0.0,
+                "span_us": 0.0,
+                "by_name": {},
+                "overlap": {},
+            }
 
         by_name: dict[str, dict[str, float]] = {}
         for event in events:
@@ -95,11 +113,15 @@ class TraceRecorder:
             lhs_end = float(lhs["ts"]) + trace_duration_us(lhs)
             for rhs in expert1:
                 rhs_end = float(rhs["ts"]) + trace_duration_us(rhs)
-                overlap_us += max(0.0, min(lhs_end, rhs_end) - max(float(lhs["ts"]), float(rhs["ts"])))
+                overlap_us += max(
+                    0.0, min(lhs_end, rhs_end) - max(float(lhs["ts"]), float(rhs["ts"]))
+                )
 
         return {
             "event_count": len(events),
-            "total_duration_us": float(sum(trace_duration_us(event) for event in events)),
+            "total_duration_us": float(
+                sum(trace_duration_us(event) for event in events)
+            ),
             "span_us": float(end_us - start_us),
             "by_name": by_name,
             "overlap": {
@@ -124,11 +146,15 @@ def summarize_device_events(trace: TraceRecorder) -> dict[str, Any]:
         category_stats["count"] += 1
         category_stats["total_us"] += duration_us
         if category == "stage":
-            backend_stats = by_backend.setdefault(backend, {"count": 0, "total_us": 0.0, "stages": {}})
+            backend_stats = by_backend.setdefault(
+                backend, {"count": 0, "total_us": 0.0, "stages": {}}
+            )
             backend_stats["count"] += 1
             backend_stats["total_us"] += duration_us
             stage_name = str(event.get("name", "unknown"))
-            backend_stats["stages"][stage_name] = backend_stats["stages"].get(stage_name, 0.0) + duration_us
+            backend_stats["stages"][stage_name] = (
+                backend_stats["stages"].get(stage_name, 0.0) + duration_us
+            )
             stage_events.append(
                 {
                     "stage": stage_name,

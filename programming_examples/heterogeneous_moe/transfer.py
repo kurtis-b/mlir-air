@@ -43,7 +43,13 @@ class TransferManager:
             edge_key = f"{event['producer']}->{event['consumer']}"
             edge = by_edge.setdefault(
                 edge_key,
-                {"count": 0, "bytes": 0, "elapsed_us": 0.0, "copied_count": 0, "actual_modes": {}},
+                {
+                    "count": 0,
+                    "bytes": 0,
+                    "elapsed_us": 0.0,
+                    "copied_count": 0,
+                    "actual_modes": {},
+                },
             )
             mode = by_mode.setdefault(
                 event["actual_mode"],
@@ -55,14 +61,20 @@ class TransferManager:
                 bucket["elapsed_us"] += float(event["elapsed_us"])
                 if event["copied"]:
                     bucket["copied_count"] += 1
-            edge["actual_modes"][event["actual_mode"]] = edge["actual_modes"].get(event["actual_mode"], 0) + 1
+            edge["actual_modes"][event["actual_mode"]] = (
+                edge["actual_modes"].get(event["actual_mode"], 0) + 1
+            )
 
         return {
             "event_count": len(events),
             "total_bytes": int(sum(int(event["bytes"]) for event in events)),
-            "total_elapsed_us": float(sum(float(event["elapsed_us"]) for event in events)),
+            "total_elapsed_us": float(
+                sum(float(event["elapsed_us"]) for event in events)
+            ),
             "copied_count": int(sum(1 for event in events if event["copied"])),
-            "host_staged_count": int(sum(1 for event in events if event["actual_mode"] == "host_staged")),
+            "host_staged_count": int(
+                sum(1 for event in events if event["actual_mode"] == "host_staged")
+            ),
             "model": "numpy_host_array_transfer_model",
             "device_resident_buffers": False,
             "by_edge": by_edge,
@@ -84,7 +96,9 @@ class TransferManager:
         start_ns = time.perf_counter_ns()
         if trace is None:
             if actual == "numpy_host_array_model":
-                result = array if array.flags.c_contiguous else np.ascontiguousarray(array)
+                result = (
+                    array if array.flags.c_contiguous else np.ascontiguousarray(array)
+                )
             else:
                 result = np.array(array, copy=True, order="C")
         else:
@@ -101,7 +115,11 @@ class TransferManager:
                 },
             ):
                 if actual == "numpy_host_array_model":
-                    result = array if array.flags.c_contiguous else np.ascontiguousarray(array)
+                    result = (
+                        array
+                        if array.flags.c_contiguous
+                        else np.ascontiguousarray(array)
+                    )
                 else:
                     result = np.array(array, copy=True, order="C")
         end_ns = time.perf_counter_ns()
@@ -128,13 +146,21 @@ class TransferManager:
             return "host_staged"
         if self.mode == "peer":
             if (producer, consumer) not in self._PEER_SUPPORTED:
-                raise RuntimeError(f"Peer transfer is not supported for edge {producer}->{consumer}")
+                raise RuntimeError(
+                    f"Peer transfer is not supported for edge {producer}->{consumer}"
+                )
             return "numpy_host_array_model"
         if self.mode == "auto":
-            return "numpy_host_array_model" if (producer, consumer) in self._PEER_SUPPORTED else "host_staged"
+            return (
+                "numpy_host_array_model"
+                if (producer, consumer) in self._PEER_SUPPORTED
+                else "host_staged"
+            )
         raise ValueError(f"Unsupported transfer mode: {self.mode}")
 
-    def _mechanism(self, producer: str, consumer: str, actual: str, copied: bool) -> str:
+    def _mechanism(
+        self, producer: str, consumer: str, actual: str, copied: bool
+    ) -> str:
         if actual == "host_staged":
             return "numpy_host_copy"
         if producer == consumer and not copied:

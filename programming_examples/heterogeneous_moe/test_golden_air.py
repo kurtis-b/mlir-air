@@ -20,7 +20,9 @@ def _check(cfg: KernelConfig) -> list[str]:
             if not golden.exists():
                 mismatches.append(f"missing golden: {golden}")
                 continue
-            if generated[key].read_text(encoding="utf-8") != golden.read_text(encoding="utf-8"):
+            if generated[key].read_text(encoding="utf-8") != golden.read_text(
+                encoding="utf-8"
+            ):
                 mismatches.append(f"stale golden: {golden}")
     return mismatches
 

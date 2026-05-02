@@ -260,8 +260,12 @@ def aggregation_air(cfg: KernelConfig) -> str:
 
 
 def expert_air(cfg: KernelConfig) -> str:
-    hidden_reduction_tile, ffn_tile = _streaming_tile_sizes(cfg.hidden_size, cfg.ffn_size)
-    output_reduction_tile, out_tile = _streaming_tile_sizes(cfg.ffn_size, cfg.hidden_size)
+    hidden_reduction_tile, ffn_tile = _streaming_tile_sizes(
+        cfg.hidden_size, cfg.ffn_size
+    )
+    output_reduction_tile, out_tile = _streaming_tile_sizes(
+        cfg.ffn_size, cfg.hidden_size
+    )
     return _header("expert.air.mlir") + f"""module {{
   func.func @expert_mlp(%input: memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>,
                         %w1: memref<{cfg.hidden_size}x{cfg.ffn_size}x{cfg.dtype}>,
@@ -623,7 +627,9 @@ def split_expert_air_filenames(cfg: KernelConfig) -> dict[str, str]:
     }
 
 
-def write_split_expert_air_sources(cfg: KernelConfig, output_dir: Path) -> dict[str, Path]:
+def write_split_expert_air_sources(
+    cfg: KernelConfig, output_dir: Path
+) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     names = split_expert_air_filenames(cfg)
     rendered = {

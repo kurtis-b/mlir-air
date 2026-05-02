@@ -50,7 +50,9 @@ def stage_metrics(
     }
 
 
-def edge_study_limitations(manifest: dict[str, Any], transfer_summary: dict[str, Any]) -> dict[str, Any]:
+def edge_study_limitations(
+    manifest: dict[str, Any], transfer_summary: dict[str, Any]
+) -> dict[str, Any]:
     workload = manifest.get("workload", {})
     limitations = [
         "Router top-k selection is CPU-side in the current runtime.",
@@ -58,15 +60,24 @@ def edge_study_limitations(manifest: dict[str, Any], transfer_summary: dict[str,
         "Direct iGPU<->NPU peer transfer is not implemented; unsupported direct edges fall back to host staging in auto mode.",
         "This harness measures MoE routing and expert stages, not full transformer attention, KV-cache, or tokenizer overhead.",
     ]
-    if workload.get("weight_storage") == "quantized" and workload.get("compute_dtype") == "bf16":
-        limitations.append("Preset is labeled quantized storage, but the executable path computes bf16 tensors.")
+    if (
+        workload.get("weight_storage") == "quantized"
+        and workload.get("compute_dtype") == "bf16"
+    ):
+        limitations.append(
+            "Preset is labeled quantized storage, but the executable path computes bf16 tensors."
+        )
     if workload.get("shared_expert_ffn_size"):
-        limitations.append("Shared expert metadata is recorded, but shared-expert execution is not modeled in this harness.")
+        limitations.append(
+            "Shared expert metadata is recorded, but shared-expert execution is not modeled in this harness."
+        )
     return {
         "study_readiness": "measurement_infrastructure",
         "routing_topk_location": "cpu",
         "transfer_model": transfer_summary.get("model"),
-        "device_resident_buffers": bool(transfer_summary.get("device_resident_buffers")),
+        "device_resident_buffers": bool(
+            transfer_summary.get("device_resident_buffers")
+        ),
         "direct_igpu_npu_peer": "unsupported",
         "limitations": limitations,
     }
@@ -125,10 +136,14 @@ def logical_config(runtime: Any) -> KernelConfig:
     )
 
 
-def generate_inputs(runtime: Any, manifest: dict[str, Any]) -> tuple[np.ndarray, dict[str, Any], float]:
+def generate_inputs(
+    runtime: Any, manifest: dict[str, Any]
+) -> tuple[np.ndarray, dict[str, Any], float]:
     start = time.perf_counter_ns()
     input_scale = float(manifest.get("inputs", {}).get("scale", DEFAULT_INPUT_SCALE))
-    routing_profile = manifest.get("workload", {}).get("routing_profile", DEFAULT_ROUTING_PROFILE)
+    routing_profile = manifest.get("workload", {}).get(
+        "routing_profile", DEFAULT_ROUTING_PROFILE
+    )
     inputs = random_inputs(
         logical_config(runtime),
         manifest["inputs"]["seed"],
@@ -171,14 +186,18 @@ def benchmark_runtime(
                 validate=False,
                 capture_details=False,
             )
-        phase_timings_ms["warmup_total_ms"] = (time.perf_counter_ns() - warmup_start) / 1_000_000.0
+        phase_timings_ms["warmup_total_ms"] = (
+            time.perf_counter_ns() - warmup_start
+        ) / 1_000_000.0
         effective_warmup = warmup
 
         primary_latencies = []
         timed_start = time.perf_counter_ns()
         for _ in range(iterations):
             primary_latencies.append(_timed_run(runtime, inputs, router_mode))
-        phase_timings_ms["timed_total_ms"] = (time.perf_counter_ns() - timed_start) / 1_000_000.0
+        phase_timings_ms["timed_total_ms"] = (
+            time.perf_counter_ns() - timed_start
+        ) / 1_000_000.0
         measurement_runs["warm"] = {
             "iterations": iterations,
             "latency_ms": latency_stats(primary_latencies),
@@ -193,9 +212,13 @@ def benchmark_runtime(
     }
 
 
-def validate_runtime(runtime: Any, inputs: np.ndarray, *, router_mode: str) -> tuple[dict[str, Any], float]:
+def validate_runtime(
+    runtime: Any, inputs: np.ndarray, *, router_mode: str
+) -> tuple[dict[str, Any], float]:
     start = time.perf_counter_ns()
-    last_run = runtime.run(inputs, router_mode=router_mode, validate=True, capture_details=True)
+    last_run = runtime.run(
+        inputs, router_mode=router_mode, validate=True, capture_details=True
+    )
     return last_run, (time.perf_counter_ns() - start) / 1_000_000.0
 
 
@@ -294,7 +317,9 @@ def build_case_result(
             "measured_latency": timing["latency_ms"],
             "validation_ms": validation_ms,
             "compile_load_setup_ms": setup_ms,
-            "input_generation_ms": float(phase_timings_ms.get("input_generation_ms", 0.0)),
+            "input_generation_ms": float(
+                phase_timings_ms.get("input_generation_ms", 0.0)
+            ),
         },
         "phase_timings_ms": phase_timings_ms,
         "latency_ms": timing["latency_ms"],
@@ -308,7 +333,9 @@ def build_case_result(
         "transfer_summary": transfer_summary,
         "data_movement": {
             "transfer_model": transfer_summary.get("model"),
-            "device_resident_buffers": bool(transfer_summary.get("device_resident_buffers")),
+            "device_resident_buffers": bool(
+                transfer_summary.get("device_resident_buffers")
+            ),
             "host_staged_count": int(transfer_summary.get("host_staged_count", 0)),
             "direct_igpu_npu_peer": "unsupported",
         },

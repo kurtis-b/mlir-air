@@ -10,7 +10,9 @@ from manifest import load_json, project_dir, save_json
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Compile heterogeneous MoE AIR kernels for NPU and/or GPU.")
+    parser = argparse.ArgumentParser(
+        description="Compile heterogeneous MoE AIR kernels for NPU and/or GPU."
+    )
     parser.add_argument(
         "--manifest",
         default="default_manifest.json",

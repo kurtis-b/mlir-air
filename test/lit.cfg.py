@@ -102,10 +102,8 @@ config.libxaie_dir = lit_helpers.discover_libxaie(
 config.libxaie_support_flags = ""
 if os.path.exists(os.path.join(config.libxaie_dir, "lib", "libcdo_driver_mlir_aie.a")):
     config.libxaie_support_flags = (
-        " -L"
-        + os.path.join(config.libxaie_dir, "lib")
-        + " -lcdo_driver_mlir_aie"
-)
+        " -L" + os.path.join(config.libxaie_dir, "lib") + " -lcdo_driver_mlir_aie"
+    )
 config.environment["PYTHONPATH"] = "{}:{}:{}".format(
     os.path.join(config.air_obj_root, "python"),
     os.path.join(config.aie_obj_root, "python"),

@@ -11,9 +11,19 @@ from typing import Any
 
 import numpy as np
 
-from compile import compile_gpu, compile_npu, compile_npu_parallel_expert, default_gpu_shared_libs
+from compile import (
+    compile_gpu,
+    compile_npu,
+    compile_npu_parallel_expert,
+    default_gpu_shared_libs,
+)
 from kernels import KernelConfig
-from numerics import decode_npu_array, encode_npu_array, npu_buffer_dtype, quantize_array
+from numerics import (
+    decode_npu_array,
+    encode_npu_array,
+    npu_buffer_dtype,
+    quantize_array,
+)
 from reference import aggregate_packed_outputs, expert_mlp, router_logits
 
 _NPU_SPLIT_COMPILE_LOCK = threading.Lock()
@@ -22,7 +32,11 @@ _NPU_SPLIT_COMPILE_LOCK = threading.Lock()
 class _SharedLibraryWrapper:
     def __init__(self, library_path: Path, preload_paths: list[str]) -> None:
         mode = getattr(os, "RTLD_GLOBAL", 0) | getattr(os, "RTLD_NOW", 0)
-        self._preloads = [ctypes.CDLL(path, mode=mode) for path in preload_paths if Path(path).exists()]
+        self._preloads = [
+            ctypes.CDLL(path, mode=mode)
+            for path in preload_paths
+            if Path(path).exists()
+        ]
         self._library = ctypes.CDLL(str(library_path), mode=mode)
 
     def invoke(self, name: str, *args: ctypes.Structure) -> None:
@@ -30,13 +44,16 @@ class _SharedLibraryWrapper:
         try:
             func = getattr(self._library, symbol)
         except AttributeError as exc:
-            raise RuntimeError(f"GPU shared library could not find function '{symbol}'") from exc
+            raise RuntimeError(
+                f"GPU shared library could not find function '{symbol}'"
+            ) from exc
         func.restype = None
         func(*[ctypes.byref(arg) for arg in args])
 
 
 def _as_ctype(dtype: np.dtype[Any]) -> Any:
     if dtype == np.dtype(np.float16):
+
         class F16(ctypes.Structure):
             _fields_ = [("value", ctypes.c_int16)]
 
@@ -61,7 +78,9 @@ def _ranked_memref_descriptor(array: np.ndarray) -> ctypes.Structure:
     descriptor.aligned = array.ctypes.data_as(ctypes.POINTER(c_type))
     descriptor.offset = 0
     descriptor.shape = (ctypes.c_longlong * array.ndim)(*array.shape)
-    descriptor.strides = (ctypes.c_longlong * array.ndim)(*[stride // array.itemsize for stride in array.strides])
+    descriptor.strides = (ctypes.c_longlong * array.ndim)(
+        *[stride // array.itemsize for stride in array.strides]
+    )
     return descriptor
 
 
@@ -113,11 +132,15 @@ class NpuExecutor:
         if self.kind == "expert":
             output_dir = self.artifact_root / "npu"
             with _NPU_SPLIT_COMPILE_LOCK:
-                split_artifact = self.artifact if self.artifact.get("mode") in {"parallel_split", "tiled_split"} else compile_npu_parallel_expert(
-                    self.cfg,
-                    self.source.parent,
-                    output_dir,
-                    self.device,
+                split_artifact = (
+                    self.artifact
+                    if self.artifact.get("mode") in {"parallel_split", "tiled_split"}
+                    else compile_npu_parallel_expert(
+                        self.cfg,
+                        self.source.parent,
+                        output_dir,
+                        self.device,
+                    )
                 )
             self.artifact = split_artifact
             hidden_compiled = split_artifact["hidden"]["artifact"]
@@ -127,10 +150,14 @@ class NpuExecutor:
             self._split_backends = [hidden_backend, output_backend]
             self._split_invokers = {
                 "hidden": hidden_backend.load(
-                    XRTCompileArtifact(hidden_compiled["xclbin"], "MLIR_AIE", hidden_compiled["insts"])
+                    XRTCompileArtifact(
+                        hidden_compiled["xclbin"], "MLIR_AIE", hidden_compiled["insts"]
+                    )
                 ),
                 "output": output_backend.load(
-                    XRTCompileArtifact(output_compiled["xclbin"], "MLIR_AIE", output_compiled["insts"])
+                    XRTCompileArtifact(
+                        output_compiled["xclbin"], "MLIR_AIE", output_compiled["insts"]
+                    )
                 ),
             }
             return
@@ -157,7 +184,9 @@ class NpuExecutor:
                 if encoded_w1 is None:
                     encoded_w1 = encode_npu_array(arrays[1], self.dtype_name)
                     self._encoded_cache[hidden_key] = encoded_w1
-                hidden_result = self._split_invokers["hidden"](encoded_input, encoded_w1, hidden_output)
+                hidden_result = self._split_invokers["hidden"](
+                    encoded_input, encoded_w1, hidden_output
+                )
                 hidden_encoded = np.asarray(hidden_result[-1]).reshape(hidden_shape)
 
                 output_shape = (arrays[0].shape[0], arrays[2].shape[1])
@@ -167,8 +196,12 @@ class NpuExecutor:
                 if encoded_w2 is None:
                     encoded_w2 = encode_npu_array(arrays[2], self.dtype_name)
                     self._encoded_cache[output_key] = encoded_w2
-                result = self._split_invokers["output"](hidden_encoded, encoded_w2, output)
-                return decode_npu_array(np.asarray(result[-1]).reshape(output_shape), self.dtype_name)
+                result = self._split_invokers["output"](
+                    hidden_encoded, encoded_w2, output
+                )
+                return decode_npu_array(
+                    np.asarray(result[-1]).reshape(output_shape), self.dtype_name
+                )
 
             encoded_input = encode_npu_array(arrays[0], self.dtype_name)
             tiling = self.artifact["tiling"]
@@ -184,9 +217,13 @@ class NpuExecutor:
                 hidden_key = ("w1", id(arrays[1]), ff0, ff1)
                 encoded_w1 = self._weight_cache.get(hidden_key)
                 if encoded_w1 is None:
-                    encoded_w1 = encode_npu_array(np.ascontiguousarray(arrays[1][:, ff0:ff1]), self.dtype_name)
+                    encoded_w1 = encode_npu_array(
+                        np.ascontiguousarray(arrays[1][:, ff0:ff1]), self.dtype_name
+                    )
                     self._weight_cache[hidden_key] = encoded_w1
-                hidden_result = self._split_invokers["hidden"](encoded_input, encoded_w1, hidden_output)
+                hidden_result = self._split_invokers["hidden"](
+                    encoded_input, encoded_w1, hidden_output
+                )
                 hidden_encoded = np.asarray(hidden_result[-1]).reshape(hidden_shape)
                 for out0 in range(0, arrays[2].shape[1], output_tile):
                     out1 = out0 + output_tile
@@ -195,10 +232,17 @@ class NpuExecutor:
                     output_key = ("w2", id(arrays[2]), ff0, ff1, out0, out1)
                     encoded_w2 = self._weight_cache.get(output_key)
                     if encoded_w2 is None:
-                        encoded_w2 = encode_npu_array(np.ascontiguousarray(arrays[2][ff0:ff1, out0:out1]), self.dtype_name)
+                        encoded_w2 = encode_npu_array(
+                            np.ascontiguousarray(arrays[2][ff0:ff1, out0:out1]),
+                            self.dtype_name,
+                        )
                         self._weight_cache[output_key] = encoded_w2
-                    result = self._split_invokers["output"](hidden_encoded, encoded_w2, partial_output)
-                    partial = decode_npu_array(np.asarray(result[-1]).reshape(partial_shape), self.dtype_name)
+                    result = self._split_invokers["output"](
+                        hidden_encoded, encoded_w2, partial_output
+                    )
+                    partial = decode_npu_array(
+                        np.asarray(result[-1]).reshape(partial_shape), self.dtype_name
+                    )
                     accumulated[:, out0:out1] += np.asarray(partial, dtype=np.float32)
             return quantize_array(accumulated, self.dtype_name)
 
@@ -225,7 +269,9 @@ class NpuExecutor:
                 self._encoded_cache[cache_key] = cached
             encoded_args.append(cached)
         result = self._invoker(*encoded_args, output)
-        return decode_npu_array(np.asarray(result[-1]).reshape(output_shape), self.dtype_name)
+        return decode_npu_array(
+            np.asarray(result[-1]).reshape(output_shape), self.dtype_name
+        )
 
 
 class GpuExecutor:
@@ -265,11 +311,15 @@ class GpuExecutor:
                     "entry",
                     "expert_hidden" if name == "hidden" else "expert_output",
                 )
-                self._split_libraries[name] = _SharedLibraryWrapper(Path(part["so"]), preload_paths)
+                self._split_libraries[name] = _SharedLibraryWrapper(
+                    Path(part["so"]), preload_paths
+                )
             return
         if not compiled or "so" not in compiled:
             if self.kind == "expert":
-                raise RuntimeError("Missing compiled GPU expert artifact; run compile_kernels.py or populate_artifacts first.")
+                raise RuntimeError(
+                    "Missing compiled GPU expert artifact; run compile_kernels.py or populate_artifacts first."
+                )
             compiled = compile_gpu(
                 self.source,
                 self.artifact_root / "gpu",
@@ -279,7 +329,9 @@ class GpuExecutor:
         else:
             compiled = self.artifact
         self.function_name = compiled.get("entry", self.function_name)
-        self._library = _SharedLibraryWrapper(Path(compiled["so"]), default_gpu_shared_libs())
+        self._library = _SharedLibraryWrapper(
+            Path(compiled["so"]), default_gpu_shared_libs()
+        )
 
     def run(self, *arrays: np.ndarray) -> np.ndarray:
         self.prepare()
@@ -311,14 +363,18 @@ class GpuExecutor:
                 desc_w1,
                 _ranked_memref_descriptor(hidden),
             ]
-            self._split_libraries["hidden"].invoke(self._split_entries["hidden"], *hidden_descs)
+            self._split_libraries["hidden"].invoke(
+                self._split_entries["hidden"], *hidden_descs
+            )
 
             output_descs = [
                 _ranked_memref_descriptor(hidden),
                 desc_w2,
                 _ranked_memref_descriptor(output),
             ]
-            self._split_libraries["output"].invoke(self._split_entries["output"], *output_descs)
+            self._split_libraries["output"].invoke(
+                self._split_entries["output"], *output_descs
+            )
             return decode_npu_array(output, self.dtype_name)
 
         if self.kind == "router":
@@ -342,7 +398,9 @@ class GpuExecutor:
             if cache_key is None:
                 encoded = encode_npu_array(array, self.dtype_name)
                 encoded_args.append(encoded)
-                descriptors.append(_ranked_memref_descriptor(np.ascontiguousarray(encoded)))
+                descriptors.append(
+                    _ranked_memref_descriptor(np.ascontiguousarray(encoded))
+                )
                 continue
             encoded = self._encoded_cache.get(cache_key)
             descriptor = self._descriptor_cache.get(cache_key)

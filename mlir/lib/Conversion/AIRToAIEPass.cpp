@@ -6854,9 +6854,8 @@ public:
         if (clOutputPrefix != "/dev/null") {
           std::error_code EC;
           std::string fname = clOutputPrefix + aie_module_name + ".mlir";
-          if (std::error_code createEC =
-                  llvm::sys::fs::create_directories(
-                      llvm::sys::path::parent_path(fname))) {
+          if (std::error_code createEC = llvm::sys::fs::create_directories(
+                  llvm::sys::path::parent_path(fname))) {
             aie_module.emitError()
                 << "failed to create split-device output directory for '"
                 << fname << "': " << createEC.message();
@@ -6865,9 +6864,8 @@ public:
           }
           llvm::raw_fd_ostream aie_ostream(fname, EC);
           if (EC) {
-            aie_module.emitError()
-                << "failed to open split-device output '" << fname
-                << "': " << EC.message();
+            aie_module.emitError() << "failed to open split-device output '"
+                                   << fname << "': " << EC.message();
             signalPassFailure();
             return;
           }

@@ -59,7 +59,12 @@ def fake_last_run() -> dict[str, Any]:
     }
     return {
         "workload": {
-            "shape": {"batch_tokens": 2, "hidden_size": 4, "ffn_size": 8, "dtype": "f16"},
+            "shape": {
+                "batch_tokens": 2,
+                "hidden_size": 4,
+                "ffn_size": 8,
+                "dtype": "f16",
+            },
             "routing_profile": "balanced",
         },
         "max_abs_error": 0.01,
@@ -70,7 +75,11 @@ def fake_last_run() -> dict[str, Any]:
             "total_duration_us": 10.0,
             "span_us": 8.0,
             "by_name": {},
-            "overlap": {"expert0_expert1_us": 3.0, "expert0_count": 1, "expert1_count": 1},
+            "overlap": {
+                "expert0_expert1_us": 3.0,
+                "expert0_count": 1,
+                "expert1_count": 1,
+            },
         },
         "device_events": {"by_category": {"stage": {"count": 1, "total_us": 4.0}}},
         "transfer_events": [{"label": "x"}],
@@ -99,7 +108,14 @@ def fake_result(case_name: str = "case") -> dict[str, Any]:
         "measurement": {"runs": {}},
         "timing_breakdown_ms": {},
         "phase_timings_ms": {},
-        "latency_ms": {"mean": 1.0, "min": 1.0, "max": 1.0, "p50": 1.0, "p95": 1.0, "stdev": 0.0},
+        "latency_ms": {
+            "mean": 1.0,
+            "min": 1.0,
+            "max": 1.0,
+            "p50": 1.0,
+            "p95": 1.0,
+            "stdev": 0.0,
+        },
         "latencies_ms": [1.0],
         "correctness": {
             "validated": True,

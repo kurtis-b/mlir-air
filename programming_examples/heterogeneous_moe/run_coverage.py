@@ -9,11 +9,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 FAIL_UNDER_LINES = 90.0
 
 
-def _run(cmd: list[str], *, stdout_path: Path | None = None) -> subprocess.CompletedProcess[str]:
+def _run(
+    cmd: list[str], *, stdout_path: Path | None = None
+) -> subprocess.CompletedProcess[str]:
     if stdout_path is None:
         return subprocess.run(cmd, check=False, text=True)
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
@@ -35,8 +36,12 @@ def _totals(json_path: Path) -> dict[str, float]:
     branches = float(totals.get("num_branches", 0))
     covered_branches = float(totals.get("covered_branches", 0))
     return {
-        "line_percent": 100.0 if statements == 0 else covered_lines * 100.0 / statements,
-        "branch_percent": 100.0 if branches == 0 else covered_branches * 100.0 / branches,
+        "line_percent": (
+            100.0 if statements == 0 else covered_lines * 100.0 / statements
+        ),
+        "branch_percent": (
+            100.0 if branches == 0 else covered_branches * 100.0 / branches
+        ),
     }
 
 
@@ -62,7 +67,9 @@ def main(argv: list[str] | None = None) -> int:
 
     report_text = report_path.read_text(encoding="utf-8")
     print(report_text, end="" if report_text.endswith("\n") else "\n")
-    print(f"Line coverage: {totals['line_percent']:.2f}% (fail-under {FAIL_UNDER_LINES:.0f}%)")
+    print(
+        f"Line coverage: {totals['line_percent']:.2f}% (fail-under {FAIL_UNDER_LINES:.0f}%)"
+    )
     print(f"Branch coverage: {totals['branch_percent']:.2f}% (reported only)")
     print(f"Coverage reports written to {out_dir}")
 

@@ -145,8 +145,16 @@ def suite_summary_markdown(summary: dict[str, Any], title: str) -> str:
                         workload["name"],
                         display(preset.get("model_id")),
                         str(workload.get("context_length", "-")),
-                        str(workload.get("routed_tokens", workload["model"]["batch_tokens"])),
-                        str(workload.get("kernel_chunk_tokens", workload["model"]["batch_tokens"])),
+                        str(
+                            workload.get(
+                                "routed_tokens", workload["model"]["batch_tokens"]
+                            )
+                        ),
+                        str(
+                            workload.get(
+                                "kernel_chunk_tokens", workload["model"]["batch_tokens"]
+                            )
+                        ),
                         case["case_name"],
                         f"{case['latency_ms']['mean']:.3f}",
                         f"{case['latency_ms']['p95']:.3f}",
@@ -163,7 +171,12 @@ def suite_summary_markdown(summary: dict[str, Any], title: str) -> str:
 
 def is_single_backend(case: dict[str, Any]) -> bool:
     backends = case.get("stage_backends", {})
-    values = {backends.get("router"), backends.get("expert0"), backends.get("expert1"), backends.get("aggregation")}
+    values = {
+        backends.get("router"),
+        backends.get("expert0"),
+        backends.get("expert1"),
+        backends.get("aggregation"),
+    }
     return len(values) == 1
 
 
@@ -234,16 +247,24 @@ def summarize_workload(workload: dict[str, Any]) -> dict[str, Any]:
     cases = workload.get("cases", [])
     single = [case for case in cases if is_single_backend(case)]
     mixed = [case for case in cases if is_mixed_backend(case)]
-    fastest_single = min(single, key=lambda case: case["latency_ms"]["mean"], default=None)
-    fastest_mixed = min(mixed, key=lambda case: case["latency_ms"]["mean"], default=None)
-    fastest_overall = min(cases, key=lambda case: case["latency_ms"]["mean"], default=None)
+    fastest_single = min(
+        single, key=lambda case: case["latency_ms"]["mean"], default=None
+    )
+    fastest_mixed = min(
+        mixed, key=lambda case: case["latency_ms"]["mean"], default=None
+    )
+    fastest_overall = min(
+        cases, key=lambda case: case["latency_ms"]["mean"], default=None
+    )
     mixed_speedup_vs_best_single = None
     mixed_wins = False
     if fastest_single and fastest_mixed:
         single_ms = float(fastest_single["latency_ms"]["mean"])
         mixed_ms = float(fastest_mixed["latency_ms"]["mean"])
         mixed_speedup_vs_best_single = single_ms / mixed_ms if mixed_ms > 0.0 else None
-        mixed_wins = bool(mixed_speedup_vs_best_single and mixed_speedup_vs_best_single > 1.0)
+        mixed_wins = bool(
+            mixed_speedup_vs_best_single and mixed_speedup_vs_best_single > 1.0
+        )
     return {
         "suite": workload["suite"],
         "name": workload["name"],
@@ -261,8 +282,12 @@ def summarize_workload(workload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_edge_study_summary(suite_summary: dict[str, Any], command: list[str]) -> dict[str, Any]:
-    workload_summaries = [summarize_workload(workload) for workload in suite_summary.get("workloads", [])]
+def build_edge_study_summary(
+    suite_summary: dict[str, Any], command: list[str]
+) -> dict[str, Any]:
+    workload_summaries = [
+        summarize_workload(workload) for workload in suite_summary.get("workloads", [])
+    ]
     flat_cases = flatten_suite_cases(suite_summary)
     return {
         "schema_version": EDGE_STUDY_SCHEMA_VERSION,
@@ -281,7 +306,9 @@ def build_edge_study_summary(suite_summary: dict[str, Any], command: list[str]) 
         "workloads": workload_summaries,
         "case_count": len(flat_cases),
         "mixed_case_count": sum(1 for row in flat_cases if row["is_mixed_backend"]),
-        "single_backend_case_count": sum(1 for row in flat_cases if row["is_single_backend"]),
+        "single_backend_case_count": sum(
+            1 for row in flat_cases if row["is_single_backend"]
+        ),
     }
 
 

@@ -15,11 +15,31 @@ from results import CSV_FIELDNAMES, correctness_failure_message, result_csv_row
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run the fixed-placement heterogeneous MoE benchmark.")
-    parser.add_argument("--manifest", default="default_manifest.json", help="Manifest path relative to this directory.")
-    parser.add_argument("--prepare", action="store_true", help="Compile and load any selected non-CPU executors, then exit.")
-    parser.add_argument("--iterations", type=int, default=None, help="Override iteration count from the manifest.")
-    parser.add_argument("--warmup", type=int, default=None, help="Override warmup count from the manifest.")
+    parser = argparse.ArgumentParser(
+        description="Run the fixed-placement heterogeneous MoE benchmark."
+    )
+    parser.add_argument(
+        "--manifest",
+        default="default_manifest.json",
+        help="Manifest path relative to this directory.",
+    )
+    parser.add_argument(
+        "--prepare",
+        action="store_true",
+        help="Compile and load any selected non-CPU executors, then exit.",
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=None,
+        help="Override iteration count from the manifest.",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=None,
+        help="Override warmup count from the manifest.",
+    )
     parser.add_argument(
         "--measurement-mode",
         choices=["cold", "warm", "both"],
@@ -28,21 +48,67 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--router-mode", choices=["top1", "top2"], default=None)
     parser.add_argument("--router-backend", choices=["cpu", "npu", "gpu"], default=None)
-    parser.add_argument("--expert0-backend", choices=["cpu", "npu", "gpu"], default=None)
-    parser.add_argument("--expert1-backend", choices=["cpu", "npu", "gpu"], default=None)
-    parser.add_argument("--aggregation-backend", choices=["cpu", "npu", "gpu"], default=None)
-    parser.add_argument("--transfer-mode", choices=["host", "peer", "auto"], default=None)
-    parser.add_argument("--case-name", default=None, help="Optional label used in structured outputs.")
-    parser.add_argument("--results-out", default=None, help="Optional JSON file for benchmark results.")
-    parser.add_argument("--csv-out", default=None, help="Optional CSV file for a one-row benchmark summary.")
-    parser.add_argument("--trace-out", default=None, help="Optional Chrome-trace JSON output.")
-    parser.add_argument("--trace-summary-out", default=None, help="Optional JSON file for trace summary output.")
-    parser.add_argument("--stage-metrics-out", default=None, help="Optional JSON file for per-stage correctness metrics.")
-    parser.add_argument("--transfer-summary-out", default=None, help="Optional JSON file for transfer accounting summary.")
-    parser.add_argument("--device-events-out", default=None, help="Optional JSON file for host/device event summary.")
-    parser.add_argument("--npu-dev-report-out", default=None, help="Optional JSON file for the host-side NPU development report.")
-    parser.add_argument("--require-correctness", action="store_true", help="Fail if final output validation is outside dtype tolerances.")
-    parser.add_argument("--require-torch", action="store_true", help="Fail if torch-backed validation is unavailable or fails.")
+    parser.add_argument(
+        "--expert0-backend", choices=["cpu", "npu", "gpu"], default=None
+    )
+    parser.add_argument(
+        "--expert1-backend", choices=["cpu", "npu", "gpu"], default=None
+    )
+    parser.add_argument(
+        "--aggregation-backend", choices=["cpu", "npu", "gpu"], default=None
+    )
+    parser.add_argument(
+        "--transfer-mode", choices=["host", "peer", "auto"], default=None
+    )
+    parser.add_argument(
+        "--case-name", default=None, help="Optional label used in structured outputs."
+    )
+    parser.add_argument(
+        "--results-out", default=None, help="Optional JSON file for benchmark results."
+    )
+    parser.add_argument(
+        "--csv-out",
+        default=None,
+        help="Optional CSV file for a one-row benchmark summary.",
+    )
+    parser.add_argument(
+        "--trace-out", default=None, help="Optional Chrome-trace JSON output."
+    )
+    parser.add_argument(
+        "--trace-summary-out",
+        default=None,
+        help="Optional JSON file for trace summary output.",
+    )
+    parser.add_argument(
+        "--stage-metrics-out",
+        default=None,
+        help="Optional JSON file for per-stage correctness metrics.",
+    )
+    parser.add_argument(
+        "--transfer-summary-out",
+        default=None,
+        help="Optional JSON file for transfer accounting summary.",
+    )
+    parser.add_argument(
+        "--device-events-out",
+        default=None,
+        help="Optional JSON file for host/device event summary.",
+    )
+    parser.add_argument(
+        "--npu-dev-report-out",
+        default=None,
+        help="Optional JSON file for the host-side NPU development report.",
+    )
+    parser.add_argument(
+        "--require-correctness",
+        action="store_true",
+        help="Fail if final output validation is outside dtype tolerances.",
+    )
+    parser.add_argument(
+        "--require-torch",
+        action="store_true",
+        help="Fail if torch-backed validation is unavailable or fails.",
+    )
     args = parser.parse_args(argv)
 
     manifest_path = (project_dir() / args.manifest).resolve()
@@ -72,12 +138,18 @@ def main(argv: list[str] | None = None) -> int:
             iterations=args.iterations,
             warmup=args.warmup,
             measurement_mode=args.measurement_mode,
-            command_line=[sys.executable, *sys.argv] if argv is None else [sys.executable, "bench.py", *argv],
+            command_line=(
+                [sys.executable, *sys.argv]
+                if argv is None
+                else [sys.executable, "bench.py", *argv]
+            ),
         ),
     )
 
     if args.require_torch and not results["torch_validation"]["ok"]:
-        raise SystemExit(f"torch validation failed: {results['torch_validation']['message']}")
+        raise SystemExit(
+            f"torch validation failed: {results['torch_validation']['message']}"
+        )
     if args.require_correctness:
         failure = correctness_failure_message(results)
         if failure is not None:

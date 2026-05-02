@@ -24,10 +24,10 @@
 #include "air_host_impl.h"
 #include "air_queue.h"
 #include "airbin.h"
-#include "runtime.h"
 #include "hsa/hsa.h"
 #include "hsa/hsa_ext_amd.h"
 #include "hsa_ext_air.h"
+#include "runtime.h"
 #include <gelf.h>
 
 #define DEBUG_QUEUE

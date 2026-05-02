@@ -107,15 +107,26 @@ def test_random_weights_profiles_and_reference_math(small_cfg: KernelConfig) -> 
     top2 = topk_weights(logits, "top2", small_cfg.dtype)
     top1 = topk_weights(logits, "top1", small_cfg.dtype)
     expert0_in, expert1_in = routed_inputs(inputs, top2, small_cfg.dtype)
-    expert0_out = expert_mlp(expert0_in, weights.expert0_w1, weights.expert0_w2, small_cfg.dtype)
-    expert1_out = expert_mlp(expert1_in, weights.expert1_w1, weights.expert1_w2, small_cfg.dtype)
+    expert0_out = expert_mlp(
+        expert0_in, weights.expert0_w1, weights.expert0_w2, small_cfg.dtype
+    )
+    expert1_out = expert_mlp(
+        expert1_in, weights.expert1_w1, weights.expert1_w2, small_cfg.dtype
+    )
     packed = pack_expert_outputs(expert0_out, expert1_out, small_cfg.dtype)
 
     assert logits.shape == (2, 2)
-    np.testing.assert_allclose(probs.astype(np.float32).sum(axis=1), np.ones(2), atol=1e-3)
+    np.testing.assert_allclose(
+        probs.astype(np.float32).sum(axis=1), np.ones(2), atol=1e-3
+    )
     np.testing.assert_allclose(top2, probs)
-    np.testing.assert_allclose(top1.astype(np.float32).sum(axis=1), np.ones(2), atol=1e-3)
-    np.testing.assert_allclose(aggregate_packed_outputs(packed, top2, small_cfg.dtype), aggregate_outputs(expert0_out, expert1_out, top2, small_cfg.dtype))
+    np.testing.assert_allclose(
+        top1.astype(np.float32).sum(axis=1), np.ones(2), atol=1e-3
+    )
+    np.testing.assert_allclose(
+        aggregate_packed_outputs(packed, top2, small_cfg.dtype),
+        aggregate_outputs(expert0_out, expert1_out, top2, small_cfg.dtype),
+    )
 
     bundle = run_reference(small_cfg, inputs, weights, "top2")
     assert set(bundle) == {
@@ -134,7 +145,9 @@ def test_random_weights_profiles_and_reference_math(small_cfg: KernelConfig) -> 
         random_weights(small_cfg, seed=3, routing_profile="bad")
 
 
-def test_validation_tolerances_and_optional_torch_paths(monkeypatch, small_cfg: KernelConfig) -> None:
+def test_validation_tolerances_and_optional_torch_paths(
+    monkeypatch, small_cfg: KernelConfig
+) -> None:
     inputs = random_inputs(small_cfg, seed=4)
     weights = random_weights(small_cfg, seed=5)
     quantized = run_reference(small_cfg, inputs, weights, "top2")
@@ -149,7 +162,10 @@ def test_validation_tolerances_and_optional_torch_paths(monkeypatch, small_cfg: 
     assert result == {"ran": False, "ok": False, "message": "torch not installed"}
 
     def fake_torch(*args, **kwargs):
-        return {name: np.asarray(value, dtype=np.float32) for name, value in quantized.items()}
+        return {
+            name: np.asarray(value, dtype=np.float32)
+            for name, value in quantized.items()
+        }
 
     monkeypatch.setattr(reference, "torch_reference", fake_torch)
     result = optional_torch_validation(
@@ -166,6 +182,8 @@ def test_validation_tolerances_and_optional_torch_paths(monkeypatch, small_cfg: 
 
     bad_actual = {name: np.array(value, copy=True) for name, value in quantized.items()}
     bad_actual["output"] = bad_actual["output"] + np.float32(100.0)
-    result = optional_torch_validation(inputs, weights, "top2", small_cfg.dtype, actual=bad_actual)
+    result = optional_torch_validation(
+        inputs, weights, "top2", small_cfg.dtype, actual=bad_actual
+    )
     assert result["ok"] is False
     assert result["message"] == "actual outputs differ from torch reference"

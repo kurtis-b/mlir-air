@@ -18,7 +18,9 @@ from results import correctness_failure_message
 from workloads import required_backends, routing_stats, suite_workloads
 
 
-def _csv_row(workload: dict[str, Any], manifest: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+def _csv_row(
+    workload: dict[str, Any], manifest: dict[str, Any], result: dict[str, Any]
+) -> dict[str, Any]:
     model_preset = workload["model_preset"]
     return {
         "suite": workload["suite"],
@@ -56,7 +58,9 @@ def _csv_row(workload: dict[str, Any], manifest: dict[str, Any], result: dict[st
     }
 
 
-def _workload_summary(workload: dict[str, Any], manifest_path: str, manifest: dict[str, Any]) -> dict[str, Any]:
+def _workload_summary(
+    workload: dict[str, Any], manifest_path: str, manifest: dict[str, Any]
+) -> dict[str, Any]:
     workload_cfg = manifest.get("workload", {})
     return {
         "suite": workload["suite"],
@@ -73,10 +77,16 @@ def _workload_summary(workload: dict[str, Any], manifest_path: str, manifest: di
         },
         "routing_profile": workload_cfg.get("routing_profile", DEFAULT_ROUTING_PROFILE),
         "context_length": workload_cfg.get("context_length"),
-        "routed_tokens": int(workload_cfg.get("routed_tokens", manifest["model"]["batch_tokens"])),
+        "routed_tokens": int(
+            workload_cfg.get("routed_tokens", manifest["model"]["batch_tokens"])
+        ),
         "kernel_chunk_tokens": int(manifest["model"]["batch_tokens"]),
-        "input_scale": float(manifest.get("inputs", {}).get("scale", DEFAULT_INPUT_SCALE)),
-        "weight_scale": float(manifest.get("weights", {}).get("scale", DEFAULT_WEIGHT_SCALE)),
+        "input_scale": float(
+            manifest.get("inputs", {}).get("scale", DEFAULT_INPUT_SCALE)
+        ),
+        "weight_scale": float(
+            manifest.get("weights", {}).get("scale", DEFAULT_WEIGHT_SCALE)
+        ),
         "route_stats": routing_stats(manifest),
         "cases": [],
         "skipped": [],
@@ -85,9 +95,19 @@ def _workload_summary(workload: dict[str, Any], manifest_path: str, manifest: di
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run expanded workload suites for the heterogeneous MoE example.")
-    parser.add_argument("--manifest", default="default_manifest.json", help="Base manifest relative to this directory.")
-    parser.add_argument("--matrix", default="default_benchmark_matrix.json", help="Base benchmark matrix relative to this directory.")
+    parser = argparse.ArgumentParser(
+        description="Run expanded workload suites for the heterogeneous MoE example."
+    )
+    parser.add_argument(
+        "--manifest",
+        default="default_manifest.json",
+        help="Base manifest relative to this directory.",
+    )
+    parser.add_argument(
+        "--matrix",
+        default="default_benchmark_matrix.json",
+        help="Base benchmark matrix relative to this directory.",
+    )
     parser.add_argument(
         "--suite",
         nargs="+",
@@ -100,17 +120,34 @@ def main(argv: list[str] | None = None) -> int:
         default="artifacts/benchmarks/workload_suites/latest",
         help="Output directory relative to this directory.",
     )
-    parser.add_argument("--iterations", type=int, default=None, help="Override iteration count for every case.")
-    parser.add_argument("--warmup", type=int, default=None, help="Override warmup count for every case.")
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=None,
+        help="Override iteration count for every case.",
+    )
+    parser.add_argument(
+        "--warmup", type=int, default=None, help="Override warmup count for every case."
+    )
     parser.add_argument(
         "--measurement-mode",
         choices=["cold", "warm", "both"],
         default="warm",
         help="Measure cold start, warm steady-state, or both. Validation is always untimed.",
     )
-    parser.add_argument("--allow-npu", action="store_true", help="Run NPU-tagged cases in each suite.")
-    parser.add_argument("--require-correctness", action="store_true", help="Fail if final output validation is outside dtype tolerances.")
-    parser.add_argument("--require-torch", action="store_true", help="Fail if torch validation is unavailable or fails.")
+    parser.add_argument(
+        "--allow-npu", action="store_true", help="Run NPU-tagged cases in each suite."
+    )
+    parser.add_argument(
+        "--require-correctness",
+        action="store_true",
+        help="Fail if final output validation is outside dtype tolerances.",
+    )
+    parser.add_argument(
+        "--require-torch",
+        action="store_true",
+        help="Fail if torch validation is unavailable or fails.",
+    )
     parser.add_argument(
         "--workload-filter",
         nargs="*",
@@ -138,7 +175,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.case_filter:
         allowed = set(args.case_filter)
         for workload in workloads:
-            workload["cases"] = [case for case in workload["cases"] if case["name"] in allowed]
+            workload["cases"] = [
+                case for case in workload["cases"] if case["name"] in allowed
+            ]
 
     output_dir = (root / args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -180,7 +219,9 @@ def main(argv: list[str] | None = None) -> int:
                 "aggregation": case["aggregation_backend"],
             }
             if contains_npu(stage_backends) and not args.allow_npu:
-                workload_summary["skipped"].append({"case_name": case["name"], "reason": "NPU disabled for this run"})
+                workload_summary["skipped"].append(
+                    {"case_name": case["name"], "reason": "NPU disabled for this run"}
+                )
                 continue
 
             result, _trace = run_case_with_trace(
@@ -192,17 +233,23 @@ def main(argv: list[str] | None = None) -> int:
                     iterations=args.iterations,
                     warmup=args.warmup,
                     measurement_mode=args.measurement_mode,
-                    command_line=[sys.executable, *sys.argv]
-                    if argv is None
-                    else [sys.executable, "run_workload_suite.py", *argv],
+                    command_line=(
+                        [sys.executable, *sys.argv]
+                        if argv is None
+                        else [sys.executable, "run_workload_suite.py", *argv]
+                    ),
                 ),
             )
             if args.require_torch and not result["torch_validation"]["ok"]:
-                raise SystemExit(f"torch validation failed for {case['name']}: {result['torch_validation']['message']}")
+                raise SystemExit(
+                    f"torch validation failed for {case['name']}: {result['torch_validation']['message']}"
+                )
             if args.require_correctness:
                 failure = correctness_failure_message(result)
                 if failure is not None:
-                    raise SystemExit(f"correctness validation failed for {case['name']}: {failure}")
+                    raise SystemExit(
+                        f"correctness validation failed for {case['name']}: {failure}"
+                    )
             save_json(case_results_dir / f"{case['name']}.json", result)
             workload_summary["cases"].append(result)
             csv_rows.append(_csv_row(workload_summary, manifest, result))
@@ -255,7 +302,8 @@ def main(argv: list[str] | None = None) -> int:
             writer.writerow(row)
 
     (output_dir / "report.md").write_text(
-        suite_summary_markdown(suite_summary, "Heterogeneous MoE Workload Suites") + "\n",
+        suite_summary_markdown(suite_summary, "Heterogeneous MoE Workload Suites")
+        + "\n",
         encoding="utf-8",
     )
     print(f"Wrote workload suite outputs to {output_dir}")

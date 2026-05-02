@@ -433,8 +433,8 @@ uint64_t air_wait_all(std::vector<uint64_t> &signals) {
       air_packet_barrier_and(&barrier_pkt, signals_in_pkt[0], signals_in_pkt[1],
                              signals_in_pkt[2], signals_in_pkt[3],
                              signals_in_pkt[4]);
-      air::rocm::signalCreateOnAgent(
-          1, *_air_host_active_segment.agent, &barrier_pkt.completion_signal);
+      air::rocm::signalCreateOnAgent(1, *_air_host_active_segment.agent,
+                                     &barrier_pkt.completion_signal);
       air_queue_dispatch(_air_host_active_segment.q, packet_id, wr_idx,
                          &barrier_pkt);
 

@@ -1633,8 +1633,8 @@ static LogicalResult runAieCompilation() {
       if (failed(runCommand(linkCmd)))
         return failure();
     } else {
-      std::vector<std::string> arCmd = {
-          resolveToolPath("llvm-ar"), "rc", libFile.str().str()};
+      std::vector<std::string> arCmd = {resolveToolPath("llvm-ar"), "rc",
+                                        libFile.str().str()};
       for (const auto &obj : allObjFiles)
         arCmd.push_back(obj);
       if (failed(runCommand(arCmd)))

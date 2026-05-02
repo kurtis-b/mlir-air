@@ -8,7 +8,12 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from kernels import KernelConfig, default_air_filenames, write_default_air_sources, write_split_expert_air_sources
+from kernels import (
+    KernelConfig,
+    default_air_filenames,
+    write_default_air_sources,
+    write_split_expert_air_sources,
+)
 from manifest import artifact_root, generated_air_source_root
 
 
@@ -74,7 +79,9 @@ def _llvm_bin_dir() -> Path:
         return Path(env) / "bin"
     mlir_translate = shutil.which("mlir-translate")
     if not mlir_translate:
-        raise RuntimeError("LLVM_INSTALL_DIR is unset and mlir-translate is not on PATH")
+        raise RuntimeError(
+            "LLVM_INSTALL_DIR is unset and mlir-translate is not on PATH"
+        )
     return Path(mlir_translate).resolve().parent
 
 
@@ -128,7 +135,9 @@ def compile_npu(source: Path, output_dir: Path, device: str) -> dict[str, str]:
     return compile_npu_with_args(source, output_dir, device, [])
 
 
-def compile_npu_with_args(source: Path, output_dir: Path, device: str, extra_args: list[str]) -> dict[str, str]:
+def compile_npu_with_args(
+    source: Path, output_dir: Path, device: str, extra_args: list[str]
+) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     xclbin = output_dir / f"{source.stem}.{device}.xclbin"
     insts = output_dir / f"{source.stem}.{device}.insts.bin"
@@ -147,11 +156,15 @@ def compile_npu_with_args(source: Path, output_dir: Path, device: str, extra_arg
     return {"xclbin": str(xclbin), "insts": str(insts)}
 
 
-def compile_npu_if_needed(source: Path, output_dir: Path, device: str) -> dict[str, str]:
+def compile_npu_if_needed(
+    source: Path, output_dir: Path, device: str
+) -> dict[str, str]:
     return compile_npu_if_needed_with_args(source, output_dir, device, [])
 
 
-def compile_npu_if_needed_with_args(source: Path, output_dir: Path, device: str, extra_args: list[str]) -> dict[str, str]:
+def compile_npu_if_needed_with_args(
+    source: Path, output_dir: Path, device: str, extra_args: list[str]
+) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     xclbin = output_dir / f"{source.stem}.{device}.xclbin"
     insts = output_dir / f"{source.stem}.{device}.insts.bin"
@@ -166,10 +179,16 @@ def compile_npu_if_needed_with_args(source: Path, output_dir: Path, device: str,
 
 
 def _divisors_at_most(value: int, limit: int) -> list[int]:
-    return [candidate for candidate in range(min(value, limit), 0, -1) if value % candidate == 0]
+    return [
+        candidate
+        for candidate in range(min(value, limit), 0, -1)
+        if value % candidate == 0
+    ]
 
 
-def compile_npu_tiled_expert(cfg: KernelConfig, source_dir: Path, output_dir: Path, device: str) -> dict[str, Any]:
+def compile_npu_tiled_expert(
+    cfg: KernelConfig, source_dir: Path, output_dir: Path, device: str
+) -> dict[str, Any]:
     compile_args = ["--omit-ping-pong-transform"]
     best_error: list[str] = []
     for ffn_tile in _divisors_at_most(cfg.ffn_size, 128):
@@ -229,14 +248,20 @@ def compile_npu_tiled_expert(cfg: KernelConfig, source_dir: Path, output_dir: Pa
                 },
             }
 
-    error_text = "\n".join(best_error) if best_error else "No candidate tile shapes compiled successfully."
+    error_text = (
+        "\n".join(best_error)
+        if best_error
+        else "No candidate tile shapes compiled successfully."
+    )
     raise RuntimeError(
         f"Failed to compile tiled NPU expert for {cfg.batch_tokens}x{cfg.hidden_size}x{cfg.ffn_size} {cfg.dtype}.\n"
         f"{error_text}"
     )
 
 
-def compile_npu_parallel_expert(cfg: KernelConfig, source_dir: Path, output_dir: Path, device: str) -> dict[str, Any]:
+def compile_npu_parallel_expert(
+    cfg: KernelConfig, source_dir: Path, output_dir: Path, device: str
+) -> dict[str, Any]:
     compile_args = ["--omit-ping-pong-transform"]
     split_sources = write_split_expert_air_sources(cfg, source_dir)
     try:
@@ -268,7 +293,9 @@ def compile_npu_parallel_expert(cfg: KernelConfig, source_dir: Path, output_dir:
         return compile_npu_tiled_expert(cfg, source_dir, output_dir, device)
 
 
-def compile_gpu(source: Path, output_dir: Path, arch: str, entrypoint: str) -> dict[str, str]:
+def compile_gpu(
+    source: Path, output_dir: Path, arch: str, entrypoint: str
+) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     outlined_mlir = output_dir / f"{source.stem}.{arch}.outlined.mlir"
     output_mlir = output_dir / f"{source.stem}.{arch}.gpu.mlir"
@@ -326,10 +353,17 @@ def compile_gpu(source: Path, output_dir: Path, arch: str, entrypoint: str) -> d
         *rpaths,
     ]
     subprocess.run(clang_cmd, check=True)
-    return {"mlir": str(output_mlir), "llvm": str(output_llvm), "so": str(output_so), "entry": entrypoint}
+    return {
+        "mlir": str(output_mlir),
+        "llvm": str(output_llvm),
+        "so": str(output_so),
+        "entry": entrypoint,
+    }
 
 
-def compile_gpu_parallel_expert(cfg: KernelConfig, source_dir: Path, output_dir: Path, arch: str) -> dict[str, Any]:
+def compile_gpu_parallel_expert(
+    cfg: KernelConfig, source_dir: Path, output_dir: Path, arch: str
+) -> dict[str, Any]:
     split_sources = write_split_expert_air_sources(cfg, source_dir)
     hidden_artifact = compile_gpu(
         split_sources["expert_hidden"],
@@ -379,7 +413,9 @@ def populate_artifacts(manifest: dict[str, Any], backends: set[str]) -> dict[str
                     compiler_cfg["npu_device"],
                 )
             else:
-                artifact_entry["npu"] = compile_npu(source, artifact_dir / "npu", compiler_cfg["npu_device"])
+                artifact_entry["npu"] = compile_npu(
+                    source, artifact_dir / "npu", compiler_cfg["npu_device"]
+                )
         if "gpu" in backends:
             if key == "expert":
                 artifact_entry["gpu"] = compile_gpu_parallel_expert(
