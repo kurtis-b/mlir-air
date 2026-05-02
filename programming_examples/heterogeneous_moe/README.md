@@ -2,6 +2,8 @@
 
 This example is a fixed-shape, two-expert Mixture-of-Experts research harness for the MLIR-AIR repository. It exists to exercise one AIR kernel family across CPU, Ryzen iGPU, and Ryzen XDNA NPU execution paths while keeping the runtime small enough to inspect.
 
+This harness is now a prototype/reference being closed out. Future work on efficient Ryzen heterogeneous execution should move to the [LLM-linear roadmap](docs/ryzen_heterogeneous_execution_todo.md), which focuses on GEMM/GEMV, direct GPU/NPU handoff, and low-bit linear inference patterns rather than expanding this MoE harness.
+
 ## What It Proves
 
 - Router math, expert 0, expert 1, and aggregation can be assigned independently to `cpu`, `gpu`, or `npu`.
@@ -65,5 +67,6 @@ GPU commands need `LLVM_INSTALL_DIR`, `ROCM_PATH`, and `AIR_OPT_PATH` or matchin
 
 - [Exploration guide](docs/exploration.md): setup by backend, first runs, command recipes, hardware gates, artifact hygiene, and troubleshooting.
 - [Architecture guide](docs/architecture.md): dataflow, backend execution model, transfer semantics, manifest and result schemas, output interpretation, and limitations.
+- [Ryzen heterogeneous execution roadmap](docs/ryzen_heterogeneous_execution_todo.md): close-out evaluation for this MoE harness and ordered next steps for an MLIR-AIR-first LLM-linear benchmark.
 
 Keep `default_manifest.json` portable. Compiled paths belong in sidecar manifests under ignored artifact roots such as `artifacts/compiled_manifest.json` or workload-suite output directories.
