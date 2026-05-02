@@ -149,6 +149,50 @@ be zero for the GPU/NPU edge being claimed as direct.
 
 ### Milestone 1: bf16 Host-Staged LLM-Linear Benchmark
 
+Status as of May 2, 2026: implemented as
+`programming_examples/heterogeneous_moe/llm_linear` with top-level
+`compile_llm_linear.py` and `run_llm_linear_suite.py` CLIs.
+
+Implemented scope:
+
+- Portable `llm_linear/default_linear_manifest.json` and
+  `llm_linear/default_linear_matrix.json`.
+- Shape suites for `tiny_ci`, `medium`, and `llm_like` tiers.
+- Two-stage benchmark: prefill GEMM `X[M,K] @ Wp[K,H] -> P[M,H]`, then decode
+  GEMV `P[M-1,:] @ Wd[H,N] -> Y[N]`.
+- CPU NumPy reference validation for prefill, decode input, and final output.
+- AIR text generation for prefill and decode kernels plus GPU/NPU compile
+  helper wiring through the existing MLIR-AIR toolchain helpers.
+- Result JSON/CSV/report fields for placement, shape tier, dtype, bytes moved,
+  compile/load exclusion, cold/warm timing blocks, validation status, transfer
+  semantics, and device-residency truth flags.
+- Matrix cases for `cpu_only`, `gpu_only`, `npu_only`,
+  `gpu_prefill_npu_decode_host`, and `npu_prefill_gpu_decode_host`.
+- `transfer_mode=direct` is fail-closed and explicitly unsupported. Milestone 1
+  does not claim direct handoff.
+
+Verification run:
+
+```bash
+cd /home/cj/mlir-air/programming_examples/heterogeneous_moe
+../../sandbox/bin/python -m pytest tests/test_llm_linear_*
+../../sandbox/bin/python -m pytest tests
+../../sandbox/bin/python run_llm_linear_suite.py --suite tiny_ci --case-filter cpu_only --iterations 1 --warmup 0 --require-correctness
+```
+
+Observed result: focused LLM-linear tests passed, the full harness test suite
+passed with 62 tests, and the CPU-only tiny CI smoke wrote outputs under the
+ignored `llm_linear/artifacts/benchmarks/latest` tree.
+
+Hardware limitations not resolved in this milestone:
+
+- GPU and NPU compile/run paths are wired but were not executed in the CPU-safe
+  verification above.
+- Mixed GPU/NPU cases remain NumPy host-staged.
+- Direct GPU/NPU device-resident handoff remains the Milestone 2 blocker.
+- The generated AIR kernels are explicit bring-up sources, not tuned LLM-scale
+  tilings.
+
 Goal: replace the MoE-shaped question with the right linear-layer question while
 staying on the existing safe host-staged runtime model.
 

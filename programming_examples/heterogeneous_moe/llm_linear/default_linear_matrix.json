@@ -1,0 +1,34 @@
+{
+  "cases": [
+    {
+      "name": "cpu_only",
+      "prefill_backend": "cpu",
+      "decode_backend": "cpu",
+      "transfer_mode": "host"
+    },
+    {
+      "name": "gpu_only",
+      "prefill_backend": "gpu",
+      "decode_backend": "gpu",
+      "transfer_mode": "host"
+    },
+    {
+      "name": "npu_only",
+      "prefill_backend": "npu",
+      "decode_backend": "npu",
+      "transfer_mode": "host"
+    },
+    {
+      "name": "gpu_prefill_npu_decode_host",
+      "prefill_backend": "gpu",
+      "decode_backend": "npu",
+      "transfer_mode": "host"
+    },
+    {
+      "name": "npu_prefill_gpu_decode_host",
+      "prefill_backend": "npu",
+      "decode_backend": "gpu",
+      "transfer_mode": "host"
+    }
+  ]
+}
