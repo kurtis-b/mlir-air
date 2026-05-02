@@ -7,7 +7,7 @@
   },
   "paths": {
     "air_sources": "air",
-    "gpu_sources": "air_gpu",
+    "generated_air_sources": "artifacts/generated_air",
     "artifacts": "artifacts"
   },
   "runtime": {
@@ -29,10 +29,15 @@
     "iterations": 3
   },
   "inputs": {
-    "seed": 17
+    "seed": 17,
+    "scale": 0.5
   },
   "weights": {
-    "seed": 7
+    "seed": 7,
+    "scale": 0.5
+  },
+  "workload": {
+    "routing_profile": "balanced"
   },
   "artifacts": {
     "router": {},

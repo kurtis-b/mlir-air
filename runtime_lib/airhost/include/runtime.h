@@ -12,6 +12,19 @@
 namespace air {
 namespace rocm {
 
+constexpr hsa_device_type_t kHsaDeviceTypeAie =
+#ifdef HSA_DEVICE_TYPE_AIE
+    HSA_DEVICE_TYPE_AIE;
+#else
+    static_cast<hsa_device_type_t>(3);
+#endif
+
+inline hsa_status_t signalCreateOnAgent(hsa_signal_value_t initialValue,
+                                        hsa_agent_t agent,
+                                        hsa_signal_t *signal) {
+  return hsa_amd_signal_create(initialValue, 1, &agent, 0, signal);
+}
+
 class Runtime {
 public:
   Runtime() = default;

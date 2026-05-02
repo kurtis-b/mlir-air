@@ -1,0 +1,94 @@
+{
+  "cases": [
+    {
+      "name": "cpu_top1",
+      "router_mode": "top1",
+      "router_backend": "cpu",
+      "expert0_backend": "cpu",
+      "expert1_backend": "cpu",
+      "aggregation_backend": "cpu",
+      "transfer_mode": "host"
+    },
+    {
+      "name": "cpu_top2",
+      "router_mode": "top2",
+      "router_backend": "cpu",
+      "expert0_backend": "cpu",
+      "expert1_backend": "cpu",
+      "aggregation_backend": "cpu",
+      "transfer_mode": "host"
+    },
+    {
+      "name": "gpu_top1",
+      "router_mode": "top1",
+      "router_backend": "gpu",
+      "expert0_backend": "gpu",
+      "expert1_backend": "gpu",
+      "aggregation_backend": "gpu",
+      "transfer_mode": "auto"
+    },
+    {
+      "name": "gpu_top2",
+      "router_mode": "top2",
+      "router_backend": "gpu",
+      "expert0_backend": "gpu",
+      "expert1_backend": "gpu",
+      "aggregation_backend": "gpu",
+      "transfer_mode": "auto"
+    },
+    {
+      "name": "cpu_router_gpu_experts_cpu_agg_top2",
+      "router_mode": "top2",
+      "router_backend": "cpu",
+      "expert0_backend": "gpu",
+      "expert1_backend": "gpu",
+      "aggregation_backend": "cpu",
+      "transfer_mode": "auto"
+    },
+    {
+      "name": "gpu_router_cpu_experts_gpu_agg_top2",
+      "router_mode": "top2",
+      "router_backend": "gpu",
+      "expert0_backend": "cpu",
+      "expert1_backend": "cpu",
+      "aggregation_backend": "gpu",
+      "transfer_mode": "auto"
+    },
+    {
+      "name": "npu_top1",
+      "router_mode": "top1",
+      "router_backend": "npu",
+      "expert0_backend": "npu",
+      "expert1_backend": "npu",
+      "aggregation_backend": "npu",
+      "transfer_mode": "auto"
+    },
+    {
+      "name": "npu_top2",
+      "router_mode": "top2",
+      "router_backend": "npu",
+      "expert0_backend": "npu",
+      "expert1_backend": "npu",
+      "aggregation_backend": "npu",
+      "transfer_mode": "auto"
+    },
+    {
+      "name": "cpu_router_npu_experts_cpu_agg_top2",
+      "router_mode": "top2",
+      "router_backend": "cpu",
+      "expert0_backend": "npu",
+      "expert1_backend": "npu",
+      "aggregation_backend": "cpu",
+      "transfer_mode": "auto"
+    },
+    {
+      "name": "cpu_router_npu_gpu_experts_cpu_agg_top2",
+      "router_mode": "top2",
+      "router_backend": "cpu",
+      "expert0_backend": "npu",
+      "expert1_backend": "gpu",
+      "aggregation_backend": "cpu",
+      "transfer_mode": "auto"
+    }
+  ]
+}

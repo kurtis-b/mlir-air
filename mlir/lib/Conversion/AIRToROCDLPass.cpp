@@ -403,66 +403,96 @@ struct ConvertAIRToROCDLPass
     launchOp.erase();
   }
 
+  static void remapLaunchBlockArguments(air::LaunchOp launchOp,
+                                        gpu::LaunchOp gpuLaunchOp) {
+    Block &launchBlock = launchOp.getBody().front();
+    auto blockIds = gpuLaunchOp.getBlockIds();
+    auto gridSize = gpuLaunchOp.getGridSize();
+    SmallVector<Value, 3> launchIdValues = {blockIds.x, blockIds.y, blockIds.z};
+    SmallVector<Value, 3> launchSizeValues = {gridSize.x, gridSize.y, gridSize.z};
+
+    for (auto [i, arg] : llvm::enumerate(launchOp.getIds()))
+      launchBlock.getArgument(arg.getArgNumber()).replaceAllUsesWith(
+          launchIdValues[i]);
+    for (auto [i, arg] : llvm::enumerate(launchOp.getSize()))
+      launchBlock.getArgument(arg.getArgNumber()).replaceAllUsesWith(
+          launchSizeValues[i]);
+    for (unsigned i = 0; i < launchOp.getNumKernelOperands(); ++i)
+      launchOp.getKernelArgument(i).replaceAllUsesWith(launchOp.getKernelOperand(i));
+  }
+
+  static void moveLaunchBodyToGpuLaunch(air::LaunchOp launchOp,
+                                        gpu::LaunchOp gpuLaunchOp) {
+    remapLaunchBlockArguments(launchOp, gpuLaunchOp);
+    Block &launchBlock = launchOp.getBody().front();
+    Block &gpuLaunchBlock = gpuLaunchOp.getBody().front();
+    Operation *gpuTerminator = gpuLaunchBlock.getTerminator();
+    for (auto &operation :
+         llvm::make_early_inc_range(launchBlock.without_terminator()))
+      operation.moveBefore(gpuTerminator);
+  }
+
   void runOnOperation() override {
     ModuleOp module = getOperation();
     PassManager pm(module.getContext());
     OpBuilder builder(module.getContext());
-    mlir::ModuleOp moduleOp = getOperation();
-    Value gridXVal, gridYVal;
+    FrozenRewritePatternSet patterns([&]() {
+      RewritePatternSet ps(&getContext());
+      ps.add<AffineApplyToSubPattern, DMAMemcpyToSubPattern,
+             SCFForToSubPattern>(&getContext());
+      return ps;
+    }());
 
-    // Create a pattern rewriter to apply transformations to each function
-    PatternRewriter rewriter(moduleOp.getContext());
-    // Create a set of patterns for transformation
-    RewritePatternSet patterns(&getContext());
-    patterns.add<AffineApplyToSubPattern, DMAMemcpyToSubPattern,
-                 SCFForToSubPattern>(&getContext());
-    // Traverse the module and look for air.launch and air.herd ops.
-    module.walk([&](air::LaunchOp launchOp) {
+    SmallVector<air::LaunchOp> launchOps;
+    module.walk([&](air::LaunchOp launchOp) { launchOps.push_back(launchOp); });
+
+    for (air::LaunchOp launchOp : launchOps) {
+      Value gridXVal, gridYVal;
+      blkIdx.clear();
+      gridIdx.clear();
+
+      SmallVector<air::SegmentOp> segmentOps;
       launchOp.walk([&](air::SegmentOp segmentOp) {
-        segmentOp.walk([&](Operation *childOp) {
-          if (auto herdOp = dyn_cast_if_present<xilinx::air::HerdOp>(childOp)) {
-
-            gridXVal = launchOp.getSizeOperands()[0];
-            gridYVal = launchOp.getSizeOperands()[1];
-            blkIdx.push_back(herdOp.getSizeOperands()[0]);
-            blkIdx.push_back(herdOp.getSizeOperands()[1]);
-            gridIdx.push_back(launchOp.getSizeOperands()[0]);
-            gridIdx.push_back(launchOp.getSizeOperands()[1]);
-          }
+        segmentOps.push_back(segmentOp);
+        segmentOp.walk([&](xilinx::air::HerdOp herdOp) {
+          gridXVal = launchOp.getSizeOperands()[0];
+          gridYVal = launchOp.getSizeOperands()[1];
+          blkIdx.assign({herdOp.getSizeOperands()[0], herdOp.getSizeOperands()[1]});
+          gridIdx.assign({launchOp.getSizeOperands()[0], launchOp.getSizeOperands()[1]});
         });
-        gpu::LaunchOp gpuLaunchOp =
-            convertLaunchToGPULaunch(launchOp, builder, gridXVal, gridYVal);
-        Block &gpuLaunchBlock = gpuLaunchOp.getBody().front();
-        auto blockArgs = gpuLaunchBlock.getArguments();
-
-        gpuArgs.assign(blockArgs.begin(), blockArgs.end());
-        (void)applyPatternsGreedily(launchOp, std::move(patterns));
-        deleteAirHerd(segmentOp, builder, gpuLaunchOp);
-        deleteAirSegment(launchOp, builder, gpuLaunchOp);
       });
-    });
 
-    module.walk([&](gpu::LaunchOp gpuLaunchOp) {
-      module.walk([&](air::LaunchOp launchOp) {
-        Block &launchBlock = launchOp.getRegion().front();
-        mlir::Block &block = gpuLaunchOp.getBody().front();
-        for (auto &operation :
-             llvm::make_early_inc_range(launchBlock.without_terminator())) {
-          // Iterate over each operand of the operation
-          mlir::Operation &lastOp = block.back();
-          operation.moveBefore(&lastOp);
-        }
-      });
+      if (!gridXVal || !gridYVal || blkIdx.size() < 2) {
+        launchOp.emitOpError("expected air.launch to contain an air.herd with at least two size operands");
+        signalPassFailure();
+        return;
+      }
+
+      gpu::LaunchOp gpuLaunchOp =
+          convertLaunchToGPULaunch(launchOp, builder, gridXVal, gridYVal);
+      Block &gpuLaunchBlock = gpuLaunchOp.getBody().front();
+      auto blockArgs = gpuLaunchBlock.getArguments();
+      gpuArgs.assign(blockArgs.begin(), blockArgs.end());
+
+      (void)applyPatternsGreedily(launchOp, patterns);
+
+      for (air::SegmentOp segmentOp : segmentOps)
+        if (segmentOp)
+          deleteAirHerd(segmentOp, builder, gpuLaunchOp);
+      deleteAirSegment(launchOp, builder, gpuLaunchOp);
+      moveLaunchBodyToGpuLaunch(launchOp, gpuLaunchOp);
       hoistAlloc(gpuLaunchOp, builder);
-    });
-    module.walk([&](air::DmaMemcpyNdOp dmaOp) {
-      convertDMAToGPUMemcpy(dmaOp, builder);
-    });
-    module.walk([&](air::LaunchOp launchOp) {
+
       Block &launchBlock = launchOp.getBody().front();
-      launchBlock.getTerminator()->erase(); // Erase the terminator
-      launchOp.erase();                     // Erase the herd operation
-    });
+      launchBlock.getTerminator()->erase();
+      launchOp.erase();
+    }
+
+    SmallVector<air::DmaMemcpyNdOp> dmaOps;
+    module.walk([&](air::DmaMemcpyNdOp dmaOp) { dmaOps.push_back(dmaOp); });
+    for (air::DmaMemcpyNdOp dmaOp : dmaOps)
+      if (dmaOp)
+        convertDMAToGPUMemcpy(dmaOp, builder);
   }
 
   void getDependentDialects(mlir::DialectRegistry &registry) const override {
@@ -753,12 +783,15 @@ struct ConvertAIRToROCDLPass
     // Determine transfer sizes from whichever side has explicit sizes,
     // or fall back to the smaller memref's static shape.
     SmallVector<Value> transferSizes;
-    if (!srcSizes.empty()) {
+    if (!srcSizes.empty() && !dstSizes.empty()) {
+      transferSizes =
+          srcSizes.size() >= dstSizes.size() ? srcSizes : dstSizes;
+    } else if (!srcSizes.empty()) {
       transferSizes = srcSizes;
     } else if (!dstSizes.empty()) {
       transferSizes = dstSizes;
     } else {
-      ArrayRef<int64_t> shape = (srcType.getRank() <= dstType.getRank())
+      ArrayRef<int64_t> shape = (srcType.getRank() >= dstType.getRank())
                                     ? srcType.getShape()
                                     : dstType.getShape();
       for (int64_t s : shape)

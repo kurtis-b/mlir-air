@@ -1,3 +1,6 @@
-  __pycache__/
-  artifacts/
-  air_project/
+# Generated AIR sources and compiler output roots.
+air/*.air.mlir
+artifacts
+air_gpu
+air_project
+air_probe*/

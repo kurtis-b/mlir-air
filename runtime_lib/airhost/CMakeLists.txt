@@ -13,8 +13,10 @@ add_definitions(-DLIBXAIENGINEV2)
 
 # Only build the runtime if hsa was found and XAIE variables are set
 if (hsa-runtime64_FOUND AND XILINX_XAIE_INCLUDE_DIR AND XILINX_XAIE_LIBS)
-  include_directories(${XILINX_XAIE_INCLUDE_DIR})
-  link_libraries(${XILINX_XAIE_LIBS})
+  get_filename_component(XILINX_XAIE_INCLUDE_PARENT
+    ${XILINX_XAIE_INCLUDE_DIR} DIRECTORY)
+  include_directories(${XILINX_XAIE_INCLUDE_DIR} ${XILINX_XAIE_INCLUDE_PARENT})
+  find_library(ELF_LIBRARY elf REQUIRED)
 
   add_library(airhost STATIC
       memory.cpp
@@ -38,20 +40,18 @@ if (hsa-runtime64_FOUND AND XILINX_XAIE_INCLUDE_DIR AND XILINX_XAIE_LIBS)
     )
   set_property(TARGET airhost_shared PROPERTY POSITION_INDEPENDENT_CODE ON)
 
-  add_library(libelf_pic STATIC IMPORTED)
-  set_target_properties(libelf_pic PROPERTIES
-    IMPORTED_LOCATION "/lib/x86_64-linux-gnu/libelf.so"
-  )
-
   target_link_libraries(airhost
-    ${AIR_LIBXAIE_LIBS}
+    ${XILINX_XAIE_LIBS}
     dl
+    ${ELF_LIBRARY}
     hsa-runtime64::hsa-runtime64
   )
 
   target_link_libraries(airhost_shared
+    ${XILINX_XAIE_LIBS}
     hsa-runtime64::hsa-runtime64
-    libelf_pic
+    ${ELF_LIBRARY}
+    dl
   )
 
   set_target_properties(airhost PROPERTIES

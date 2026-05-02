@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
-from runtime import _load_json, _project_dir, _save_json, populate_artifacts
+from compile import populate_artifacts
+from manifest import load_json, project_dir, save_json
 
 
 def main() -> int:
@@ -23,16 +23,21 @@ def main() -> int:
         default=["npu", "gpu"],
         help="Backends to compile.",
     )
+    parser.add_argument(
+        "--manifest-out",
+        default="artifacts/compiled_manifest.json",
+        help="Output manifest path relative to the heterogeneous_moe directory.",
+    )
     args = parser.parse_args()
 
-    manifest_path = (_project_dir() / args.manifest).resolve()
-    manifest = _load_json(manifest_path)
+    manifest_path = (project_dir() / args.manifest).resolve()
+    manifest_out_path = (project_dir() / args.manifest_out).resolve()
+    manifest = load_json(manifest_path)
     manifest = populate_artifacts(manifest, set(args.backends))
-    _save_json(manifest_path, manifest)
-    print(f"Updated manifest with compiled artifacts: {manifest_path}")
+    save_json(manifest_out_path, manifest)
+    print(f"Wrote compiled manifest with artifacts: {manifest_out_path}")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

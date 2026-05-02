@@ -12,6 +12,7 @@ import re
 import subprocess
 import tempfile
 import shutil
+from pathlib import Path
 import lit.formats
 import lit.util
 
@@ -24,7 +25,12 @@ from lit.llvm.subst import FindTool
 # name: The name of this test suite.
 config.name = "AIR_TEST"
 
-config.test_format = lit.formats.ShTest(not llvm_config.use_lit_shell)
+config.recursiveExpansionLimit = 10
+config.test_format = lit.formats.ShTest(
+    not llvm_config.use_lit_shell,
+    extra_substitutions=[("%T", "%t.dir")],
+    preamble_commands=["rm -rf %T && mkdir -p %T"],
+)
 config.environment["PYTHONPATH"] = "{}:{}:{}".format(
     os.path.join(config.air_obj_root, "python"),
     os.path.join(config.aie_obj_root, "python"),
@@ -76,6 +82,109 @@ config.substitutions.append(
 # for xchesscc_wrapper
 llvm_config.with_environment("AIETOOLS", config.vitis_aietools_dir)
 
+
+def _discover_xrt_root():
+    candidates = []
+    for value in (
+        os.environ.get("XILINX_XRT"),
+        os.environ.get("XRT_DIR"),
+        config.xrt_dir,
+    ):
+        if value:
+            candidates.append(value)
+    xrtsmi = shutil.which("xrt-smi")
+    if xrtsmi:
+        candidates.append(str(Path(xrtsmi).resolve().parents[1]))
+    for root in candidates:
+        include_dir = os.path.join(root, "include")
+        lib_dir = os.path.join(root, "lib")
+        bin_dir = os.path.join(root, "bin")
+        if os.path.exists(os.path.join(bin_dir, "xrt-smi")) and os.path.isdir(
+            include_dir
+        ):
+            return root, bin_dir, lib_dir, include_dir
+    return config.xrt_dir, config.xrt_bin_dir, config.xrt_lib_dir, config.xrt_include_dir
+
+
+def _discover_libxaie():
+    candidates = []
+    for value in (
+        config.libxaie_dir,
+        os.environ.get("LIBXAIE_DIR"),
+        os.path.join(
+            config.aie_obj_root, "runtime_lib", config.runtime_test_target, "xaiengine"
+        ),
+        os.path.join(config.aie_obj_root, "runtime_lib", "x86_64", "xaiengine"),
+    ):
+        if value:
+            candidates.append(value)
+
+    for candidate in candidates:
+        include_dir = os.path.join(candidate, "include")
+        lib_dir = os.path.join(candidate, "lib")
+        if not os.path.exists(os.path.join(include_dir, "xaiengine", "xaiegbl.h")):
+            continue
+        for library_name in ("libxaiengine.so", "libxaienginecdo.so"):
+            library_path = os.path.join(lib_dir, library_name)
+            if not os.path.exists(library_path):
+                continue
+            compat_root = os.path.join(config.test_exec_root, "lit_support", "libxaie")
+            compat_include = os.path.join(compat_root, "include")
+            compat_lib = os.path.join(compat_root, "lib")
+            os.makedirs(compat_include, exist_ok=True)
+            os.makedirs(compat_lib, exist_ok=True)
+            root_header = os.path.join(compat_include, "xaiengine.h")
+            if os.path.lexists(root_header):
+                os.unlink(root_header)
+            os.symlink(os.path.join(include_dir, "xaiengine.h"), root_header)
+            include_link = os.path.join(compat_include, "xaiengine")
+            if os.path.lexists(include_link):
+                os.unlink(include_link)
+            os.symlink(os.path.join(include_dir, "xaiengine"), include_link)
+            library_link = os.path.join(compat_lib, "libxaiengine.so")
+            if os.path.lexists(library_link):
+                os.unlink(library_link)
+            os.symlink(library_path, library_link)
+            cdo_driver = None
+            for ancestor in [Path(candidate).resolve(), *Path(candidate).resolve().parents]:
+                maybe_driver = ancestor / "lib" / "libcdo_driver_mlir_aie.a"
+                if maybe_driver.exists():
+                    cdo_driver = maybe_driver
+                    break
+            if cdo_driver:
+                cdo_link = os.path.join(compat_lib, "libcdo_driver_mlir_aie.a")
+                if os.path.lexists(cdo_link):
+                    os.unlink(cdo_link)
+                os.symlink(cdo_driver, cdo_link)
+            return compat_root
+    return config.libxaie_dir
+
+
+config.xrt_dir, config.xrt_bin_dir, config.xrt_lib_dir, config.xrt_include_dir = (
+    _discover_xrt_root()
+)
+config.libxaie_dir = _discover_libxaie()
+config.libxaie_support_flags = ""
+if os.path.exists(os.path.join(config.libxaie_dir, "lib", "libcdo_driver_mlir_aie.a")):
+    config.libxaie_support_flags = (
+        " -L"
+        + os.path.join(config.libxaie_dir, "lib")
+        + " -lcdo_driver_mlir_aie"
+    )
+if (
+    "chess" in config.available_features
+    or os.path.exists(
+        os.path.join(os.path.dirname(config.peano_tools_dir), "lib", "aie-none-unknown-elf", "crt0.o")
+    )
+):
+    config.available_features.add("aie1-toolchain")
+config.environment["PYTHONPATH"] = "{}:{}:{}".format(
+    os.path.join(config.air_obj_root, "python"),
+    os.path.join(config.aie_obj_root, "python"),
+    os.path.join(config.xrt_dir, "python"),
+)
+config.substitutions.insert(0, ("%LIBXAIE_DIR%", config.libxaie_dir))
+
 if config.hsa_found:
     # Getting the path to the ROCm directory. hsa-runtime64 points to the cmake
     # directory so need to go up three directories
@@ -90,11 +199,14 @@ if config.hsa_found:
             + "/airhost/include"
             + " -L"
             + air_runtime_lib
-            + "/airhost -Wl,--whole-archive -lairhost"
-            + " -Wl,-R{}/lib -Wl,-rpath,{}/lib -Wl,--whole-archive".format(
-                config.libxaie_dir, rocm_root
-            )
-            + " -Wl,--no-whole-archive -lpthread -lstdc++ -lsysfs -ldl -lrt -lelf",
+            + "/airhost -Wl,--whole-archive -lairhost -Wl,--no-whole-archive"
+            + " -Wl,-rpath,"
+            + air_runtime_lib
+            + "/airhost -Wl,-rpath,"
+            + os.path.join(config.libxaie_dir, "lib")
+            + " -Wl,-rpath,{}/lib".format(rocm_root)
+            + config.libxaie_support_flags
+            + " -lpthread -lstdc++ -ldl -lrt -lelf",
         )
     )
     if config.enable_run_airhost_tests:
@@ -113,14 +225,14 @@ xrt_flags = ""
 
 # XRT
 if config.xrt_lib_dir and config.enable_run_xrt_tests:
-    print("xrt found at", os.path.dirname(config.xrt_lib_dir))
+    print("xrt found at", config.xrt_dir)
     xrt_flags = "-I{} -L{} -luuid -lxrt_coreutil".format(
         config.xrt_include_dir, config.xrt_lib_dir
     )
     config.available_features.add("xrt")
 
     try:
-        xrtsmi = os.path.join(config.xrt_bin_dir, "xrt-smi")
+        xrtsmi = shutil.which("xrt-smi") or os.path.join(config.xrt_bin_dir, "xrt-smi")
         result = subprocess.run(
             [xrtsmi, "examine"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
@@ -254,23 +366,45 @@ else:
         print("Chess not found")
 
 tool_dirs = [
-    config.peano_tools_dir,
     config.aie_tools_dir,
     config.aie_python_tools_dir,
     config.air_tools_dir,
     config.llvm_tools_dir,
+    config.peano_tools_dir,
 ]
+aiecc_args = []
+if "chess" not in config.available_features and os.path.exists(
+    os.path.join(config.peano_tools_dir, "llc")
+):
+    aiecc_args = [
+        "--no-xchesscc",
+        "--no-xbridge",
+        "--peano=" + os.path.dirname(config.peano_tools_dir),
+    ]
+aircc_args = []
+if "chess" not in config.available_features and os.path.exists(
+    os.path.join(config.peano_tools_dir, "llc")
+):
+    aircc_args = [
+        "--no-xchesscc",
+        "--no-xbridge",
+        "--peano=" + os.path.dirname(config.peano_tools_dir),
+    ]
+    if "ryzen_ai_npu2" in config.available_features:
+        aircc_args.append("--device=npu2")
+    elif "ryzen_ai_npu1" in config.available_features:
+        aircc_args.append("--device=npu1")
 tools = [
     "aie-opt",
     "aie-translate",
-    "aiecc.py",
-    "aircc",
+    ToolSubst("aiecc.py", command=FindTool("aiecc.py"), extra_args=aiecc_args),
+    ToolSubst("aircc", command=FindTool("aircc"), extra_args=aircc_args),
     "air-opt",
     "ld.lld",
-    "llc",
+    ToolSubst("llc", command=os.path.join(config.llvm_tools_dir, "llc")),
     "llvm-objdump",
     "mlir-translate",
-    "opt",
+    ToolSubst("opt", command=os.path.join(config.llvm_tools_dir, "opt")),
 ]
 
 llvm_config.add_tool_substitutions(tools, tool_dirs)

@@ -75,3 +75,36 @@ def decode_npu_array(values: np.ndarray, dtype_name: str) -> np.ndarray:
     if normalized == "f16":
         return np.ascontiguousarray(np.asarray(values, dtype=np.float16))
     raise ValueError(f"Unsupported dtype: {dtype_name}")
+
+
+def array_error_metrics(
+    actual: np.ndarray,
+    expected: np.ndarray,
+    *,
+    atol: float = 0.0,
+    rtol: float = 0.0,
+) -> dict[str, float | bool]:
+    actual_f32 = np.asarray(actual, dtype=np.float32)
+    expected_f32 = np.asarray(expected, dtype=np.float32)
+    delta = actual_f32 - expected_f32
+    abs_delta = np.abs(delta)
+    delta_f64 = np.asarray(delta, dtype=np.float64)
+    return {
+        "max_abs_error": float(np.max(abs_delta)),
+        "mean_abs_error": float(np.mean(abs_delta)),
+        "rmse": float(np.sqrt(np.mean(np.square(delta_f64)))),
+        "max_abs_expected": float(np.max(np.abs(expected_f32))),
+        "allclose": bool(np.allclose(actual_f32, expected_f32, atol=atol, rtol=rtol)),
+    }
+
+
+def encoded_array_summary(values: np.ndarray, dtype_name: str) -> dict[str, object]:
+    encoded = encode_npu_array(values, dtype_name)
+    return {
+        "shape": list(values.shape),
+        "host_dtype": str(np.asarray(values).dtype),
+        "encoded_dtype": str(encoded.dtype),
+        "elements": int(encoded.size),
+        "nbytes": int(encoded.nbytes),
+        "contiguous": bool(np.ascontiguousarray(values).flags.c_contiguous),
+    }

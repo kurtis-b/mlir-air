@@ -32,6 +32,45 @@ def _header(title: str) -> str:
 """
 
 
+def _largest_divisor_at_most(value: int, limit: int) -> int:
+    bound = min(value, limit)
+    for candidate in range(bound, 0, -1):
+        if value % candidate == 0:
+            return candidate
+    return 1
+
+
+def _expert_tile_sizes(cfg: KernelConfig) -> tuple[int, int]:
+    ffn_tile = _largest_divisor_at_most(cfg.ffn_size, 32)
+    out_tile = _largest_divisor_at_most(cfg.hidden_size, 16)
+    return ffn_tile, out_tile
+
+
+def _streaming_tile_sizes(
+    reduction_dim: int,
+    output_dim: int,
+    *,
+    reduction_limit: int = 128,
+    output_limit: int = 32,
+    max_weight_elems: int = 4096,
+) -> tuple[int, int]:
+    best = (1, 1)
+    best_area = 1
+    for reduction_tile in range(min(reduction_dim, reduction_limit), 0, -1):
+        if reduction_dim % reduction_tile != 0:
+            continue
+        for output_tile in range(min(output_dim, output_limit), 0, -1):
+            if output_dim % output_tile != 0:
+                continue
+            area = reduction_tile * output_tile
+            if area > max_weight_elems:
+                continue
+            if area > best_area:
+                best = (reduction_tile, output_tile)
+                best_area = area
+    return best
+
+
 def router_math_air(cfg: KernelConfig) -> str:
     return _header("router_math.air.mlir") + f"""module {{
   func.func @router_math(%input: memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>,
@@ -221,107 +260,140 @@ def aggregation_air(cfg: KernelConfig) -> str:
 
 
 def expert_air(cfg: KernelConfig) -> str:
-    packed_cols = cfg.ffn_size * 2
+    hidden_reduction_tile, ffn_tile = _streaming_tile_sizes(cfg.hidden_size, cfg.ffn_size)
+    output_reduction_tile, out_tile = _streaming_tile_sizes(cfg.ffn_size, cfg.hidden_size)
     return _header("expert.air.mlir") + f"""module {{
   func.func @expert_mlp(%input: memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>,
-                        %weights: memref<{cfg.hidden_size}x{packed_cols}x{cfg.dtype}>,
+                        %w1: memref<{cfg.hidden_size}x{cfg.ffn_size}x{cfg.dtype}>,
+                        %w2: memref<{cfg.ffn_size}x{cfg.hidden_size}x{cfg.dtype}>,
                         %output: memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>)
       attributes {{llvm.emit_c_interface}} {{
     %batch = arith.constant {cfg.batch_tokens} : index
     %one = arith.constant 1 : index
     air.launch (%tok, %lane) in (%ntok=%batch, %nlane=%one)
-        args(%launch_in=%input, %launch_w=%weights, %launch_out=%output)
+        args(%launch_in=%input, %launch_w1=%w1, %launch_w2=%w2, %launch_out=%output)
         : memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>,
-          memref<{cfg.hidden_size}x{packed_cols}x{cfg.dtype}>,
+          memref<{cfg.hidden_size}x{cfg.ffn_size}x{cfg.dtype}>,
+          memref<{cfg.ffn_size}x{cfg.hidden_size}x{cfg.dtype}>,
           memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}> {{
       air.segment @expert_segment
-          args(%seg_tok=%tok, %seg_in=%launch_in, %seg_w=%launch_w, %seg_out=%launch_out)
+          args(%seg_tok=%tok, %seg_in=%launch_in, %seg_w1=%launch_w1, %seg_w2=%launch_w2, %seg_out=%launch_out)
           : index,
             memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>,
-            memref<{cfg.hidden_size}x{packed_cols}x{cfg.dtype}>,
+            memref<{cfg.hidden_size}x{cfg.ffn_size}x{cfg.dtype}>,
+            memref<{cfg.ffn_size}x{cfg.hidden_size}x{cfg.dtype}>,
             memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}> {{
         %c0 = arith.constant 0 : index
         %c1 = arith.constant 1 : index
-        %c_hidden = arith.constant {cfg.hidden_size} : index
-        %c_ffn = arith.constant {cfg.ffn_size} : index
-        %c_packed = arith.constant {packed_cols} : index
-        %l2_in = memref.alloc() : memref<{cfg.hidden_size}x{cfg.dtype}, 1>
-        %l2_w = memref.alloc() : memref<{cfg.hidden_size}x{packed_cols}x{cfg.dtype}, 1>
-        %l2_out = memref.alloc() : memref<{cfg.hidden_size}x{cfg.dtype}, 1>
+        %l2_hidden = memref.alloc() : memref<{cfg.batch_tokens}x{cfg.ffn_size}x{cfg.dtype}, 1>
 
-        air.dma_memcpy_nd (%l2_in[%c0] [%c_hidden] [%c1],
-                           %seg_in[%seg_tok, %c0] [%c1, %c_hidden] [%c_hidden, %c1])
-            : (memref<{cfg.hidden_size}x{cfg.dtype}, 1>,
-               memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>)
-        air.dma_memcpy_nd (%l2_w[%c0, %c0] [%c_hidden, %c_packed] [%c_packed, %c1],
-                           %seg_w[%c0, %c0] [%c_hidden, %c_packed] [%c_packed, %c1])
-            : (memref<{cfg.hidden_size}x{packed_cols}x{cfg.dtype}, 1>,
-               memref<{cfg.hidden_size}x{packed_cols}x{cfg.dtype}>)
-
-        air.herd @expert_herd
+        air.herd @expert_hidden_herd
             tile (%tx, %ty) in (%sx=%c1, %sy=%c1)
-            args(%herd_in=%l2_in, %herd_w=%l2_w, %herd_out=%l2_out)
-            : memref<{cfg.hidden_size}x{cfg.dtype}, 1>,
-              memref<{cfg.hidden_size}x{packed_cols}x{cfg.dtype}, 1>,
-              memref<{cfg.hidden_size}x{cfg.dtype}, 1> {{
+            args(%herd_tok=%seg_tok, %herd_in=%seg_in, %herd_w1=%seg_w1, %herd_hidden=%l2_hidden)
+            : index,
+              memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>,
+              memref<{cfg.hidden_size}x{cfg.ffn_size}x{cfg.dtype}>,
+              memref<{cfg.batch_tokens}x{cfg.ffn_size}x{cfg.dtype}, 1> {{
           %h0 = arith.constant 0 : index
           %h1 = arith.constant 1 : index
           %h_hidden = arith.constant {cfg.hidden_size} : index
           %h_ffn = arith.constant {cfg.ffn_size} : index
-          %h_packed = arith.constant {packed_cols} : index
+          %h_reduction_tile = arith.constant {hidden_reduction_tile} : index
+          %h_ffn_tile = arith.constant {ffn_tile} : index
           %zero_inner = arith.constant 0.0 : {cfg.dtype}
-          %l1_in = memref.alloc() : memref<{cfg.hidden_size}x{cfg.dtype}, 2>
-          %l1_w = memref.alloc() : memref<{cfg.hidden_size}x{packed_cols}x{cfg.dtype}, 2>
-          %l1_hidden = memref.alloc() : memref<{cfg.ffn_size}x{cfg.dtype}, 2>
-          %l1_out = memref.alloc() : memref<{cfg.hidden_size}x{cfg.dtype}, 2>
+          %l1_in = memref.alloc() : memref<{hidden_reduction_tile}x{cfg.dtype}, 2>
+          %l1_w1 = memref.alloc() : memref<{hidden_reduction_tile}x{ffn_tile}x{cfg.dtype}, 2>
+          %l1_hidden = memref.alloc() : memref<{ffn_tile}x{cfg.dtype}, 2>
 
-          air.dma_memcpy_nd (%l1_in[%h0] [%h_hidden] [%h1],
-                             %herd_in[%h0] [%h_hidden] [%h1])
-              : (memref<{cfg.hidden_size}x{cfg.dtype}, 2>,
-                 memref<{cfg.hidden_size}x{cfg.dtype}, 1>)
-          air.dma_memcpy_nd (%l1_w[%h0, %h0] [%h_hidden, %h_packed] [%h_packed, %h1],
-                             %herd_w[%h0, %h0] [%h_hidden, %h_packed] [%h_packed, %h1])
-              : (memref<{cfg.hidden_size}x{packed_cols}x{cfg.dtype}, 2>,
-                 memref<{cfg.hidden_size}x{packed_cols}x{cfg.dtype}, 1>)
-
-          scf.for %j = %h0 to %h_ffn step %h1 {{
-            %acc_init = arith.constant 0.0 : {cfg.dtype}
-            %relu_in = scf.for %k = %h0 to %h_hidden step %h1 iter_args(%cur = %acc_init) -> ({cfg.dtype}) {{
-              %in_val = memref.load %l1_in[%k] : memref<{cfg.hidden_size}x{cfg.dtype}, 2>
-              %w_val = memref.load %l1_w[%k, %j] : memref<{cfg.hidden_size}x{packed_cols}x{cfg.dtype}, 2>
-              %prod = arith.mulf %in_val, %w_val : {cfg.dtype}
-              %next = arith.addf %cur, %prod : {cfg.dtype}
-              scf.yield %next : {cfg.dtype}
+          scf.for %ff = %h0 to %h_ffn step %h_ffn_tile {{
+            scf.for %j = %h0 to %h_ffn_tile step %h1 {{
+              memref.store %zero_inner, %l1_hidden[%j] : memref<{ffn_tile}x{cfg.dtype}, 2>
             }}
-            %keep = arith.cmpf ogt, %relu_in, %zero_inner : {cfg.dtype}
-            %relu = arith.select %keep, %relu_in, %zero_inner : {cfg.dtype}
-            memref.store %relu, %l1_hidden[%j] : memref<{cfg.ffn_size}x{cfg.dtype}, 2>
-          }}
-
-          scf.for %j = %h0 to %h_hidden step %h1 {{
-            %acc_init = arith.constant 0.0 : {cfg.dtype}
-            %final = scf.for %k = %h0 to %h_ffn step %h1 iter_args(%cur = %acc_init) -> ({cfg.dtype}) {{
-              %packed_col = arith.addi %k, %h_ffn : index
-              %in_val = memref.load %l1_hidden[%k] : memref<{cfg.ffn_size}x{cfg.dtype}, 2>
-              %w_val = memref.load %l1_w[%j, %packed_col] : memref<{cfg.hidden_size}x{packed_cols}x{cfg.dtype}, 2>
-              %prod = arith.mulf %in_val, %w_val : {cfg.dtype}
-              %next = arith.addf %cur, %prod : {cfg.dtype}
-              scf.yield %next : {cfg.dtype}
+            scf.for %k0 = %h0 to %h_hidden step %h_reduction_tile {{
+              air.dma_memcpy_nd (%l1_in[%h0] [%h_reduction_tile] [%h1],
+                                 %herd_in[%herd_tok, %k0] [%h1, %h_reduction_tile] [%h_hidden, %h1])
+                  : (memref<{hidden_reduction_tile}x{cfg.dtype}, 2>,
+                     memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>)
+              air.dma_memcpy_nd (%l1_w1[%h0, %h0] [%h_reduction_tile, %h_ffn_tile] [%h_ffn_tile, %h1],
+                                 %herd_w1[%k0, %ff] [%h_reduction_tile, %h_ffn_tile] [%h_ffn, %h1])
+                  : (memref<{hidden_reduction_tile}x{ffn_tile}x{cfg.dtype}, 2>,
+                     memref<{cfg.hidden_size}x{cfg.ffn_size}x{cfg.dtype}>)
+              scf.for %j = %h0 to %h_ffn_tile step %h1 {{
+                %acc_init = memref.load %l1_hidden[%j] : memref<{ffn_tile}x{cfg.dtype}, 2>
+                %sum = scf.for %k = %h0 to %h_reduction_tile step %h1 iter_args(%cur = %acc_init) -> ({cfg.dtype}) {{
+                  %in_val = memref.load %l1_in[%k] : memref<{hidden_reduction_tile}x{cfg.dtype}, 2>
+                  %w_val = memref.load %l1_w1[%k, %j] : memref<{hidden_reduction_tile}x{ffn_tile}x{cfg.dtype}, 2>
+                  %prod = arith.mulf %in_val, %w_val : {cfg.dtype}
+                  %next = arith.addf %cur, %prod : {cfg.dtype}
+                  scf.yield %next : {cfg.dtype}
+                }}
+                memref.store %sum, %l1_hidden[%j] : memref<{ffn_tile}x{cfg.dtype}, 2>
+              }}
             }}
-            memref.store %final, %l1_out[%j] : memref<{cfg.hidden_size}x{cfg.dtype}, 2>
+            scf.for %j = %h0 to %h_ffn_tile step %h1 {{
+              %relu_in = memref.load %l1_hidden[%j] : memref<{ffn_tile}x{cfg.dtype}, 2>
+              %keep = arith.cmpf ogt, %relu_in, %zero_inner : {cfg.dtype}
+              %relu = arith.select %keep, %relu_in, %zero_inner : {cfg.dtype}
+              memref.store %relu, %l1_hidden[%j] : memref<{ffn_tile}x{cfg.dtype}, 2>
+            }}
+            air.dma_memcpy_nd (%herd_hidden[%herd_tok, %ff] [%h1, %h_ffn_tile] [%h_ffn, %h1],
+                               %l1_hidden[%h0] [%h_ffn_tile] [%h1])
+                : (memref<{cfg.batch_tokens}x{cfg.ffn_size}x{cfg.dtype}, 1>,
+                   memref<{ffn_tile}x{cfg.dtype}, 2>)
           }}
-
-          air.dma_memcpy_nd (%herd_out[%h0] [%h_hidden] [%h1],
-                             %l1_out[%h0] [%h_hidden] [%h1])
-              : (memref<{cfg.hidden_size}x{cfg.dtype}, 1>,
-                 memref<{cfg.hidden_size}x{cfg.dtype}, 2>)
           air.herd_terminator
         }}
 
-        air.dma_memcpy_nd (%seg_out[%seg_tok, %c0] [%c1, %c_hidden] [%c_hidden, %c1],
-                           %l2_out[%c0] [%c_hidden] [%c1])
-            : (memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>,
-               memref<{cfg.hidden_size}x{cfg.dtype}, 1>)
+        air.herd @expert_output_herd
+            tile (%tx, %ty) in (%sx=%c1, %sy=%c1)
+            args(%herd_tok=%seg_tok, %herd_hidden=%l2_hidden, %herd_w2=%seg_w2, %herd_out=%seg_out)
+            : index,
+              memref<{cfg.batch_tokens}x{cfg.ffn_size}x{cfg.dtype}, 1>,
+              memref<{cfg.ffn_size}x{cfg.hidden_size}x{cfg.dtype}>,
+              memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}> {{
+          %h0 = arith.constant 0 : index
+          %h1 = arith.constant 1 : index
+          %h_hidden = arith.constant {cfg.hidden_size} : index
+          %h_ffn = arith.constant {cfg.ffn_size} : index
+          %h_reduction_tile = arith.constant {output_reduction_tile} : index
+          %h_out_tile = arith.constant {out_tile} : index
+          %zero_inner = arith.constant 0.0 : {cfg.dtype}
+          %l1_hidden = memref.alloc() : memref<{output_reduction_tile}x{cfg.dtype}, 2>
+          %l1_w2 = memref.alloc() : memref<{output_reduction_tile}x{out_tile}x{cfg.dtype}, 2>
+          %l1_out = memref.alloc() : memref<{out_tile}x{cfg.dtype}, 2>
+
+          scf.for %j0 = %h0 to %h_hidden step %h_out_tile {{
+            scf.for %j = %h0 to %h_out_tile step %h1 {{
+              memref.store %zero_inner, %l1_out[%j] : memref<{out_tile}x{cfg.dtype}, 2>
+            }}
+            scf.for %ff = %h0 to %h_ffn step %h_reduction_tile {{
+              air.dma_memcpy_nd (%l1_hidden[%h0] [%h_reduction_tile] [%h1],
+                                 %herd_hidden[%herd_tok, %ff] [%h1, %h_reduction_tile] [%h_ffn, %h1])
+                  : (memref<{output_reduction_tile}x{cfg.dtype}, 2>,
+                     memref<{cfg.batch_tokens}x{cfg.ffn_size}x{cfg.dtype}, 1>)
+              air.dma_memcpy_nd (%l1_w2[%h0, %h0] [%h_reduction_tile, %h_out_tile] [%h_out_tile, %h1],
+                                 %herd_w2[%ff, %j0] [%h_reduction_tile, %h_out_tile] [%h_hidden, %h1])
+                  : (memref<{output_reduction_tile}x{out_tile}x{cfg.dtype}, 2>,
+                     memref<{cfg.ffn_size}x{cfg.hidden_size}x{cfg.dtype}>)
+              scf.for %j = %h0 to %h_out_tile step %h1 {{
+                %acc_init = memref.load %l1_out[%j] : memref<{out_tile}x{cfg.dtype}, 2>
+                %final = scf.for %k = %h0 to %h_reduction_tile step %h1 iter_args(%cur = %acc_init) -> ({cfg.dtype}) {{
+                  %in_val = memref.load %l1_hidden[%k] : memref<{output_reduction_tile}x{cfg.dtype}, 2>
+                  %w_val = memref.load %l1_w2[%k, %j] : memref<{output_reduction_tile}x{out_tile}x{cfg.dtype}, 2>
+                  %prod = arith.mulf %in_val, %w_val : {cfg.dtype}
+                  %next = arith.addf %cur, %prod : {cfg.dtype}
+                  scf.yield %next : {cfg.dtype}
+                }}
+                memref.store %final, %l1_out[%j] : memref<{out_tile}x{cfg.dtype}, 2>
+              }}
+            }}
+            air.dma_memcpy_nd (%herd_out[%herd_tok, %j0] [%h1, %h_out_tile] [%h_hidden, %h1],
+                               %l1_out[%h0] [%h_out_tile] [%h1])
+                : (memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>,
+                   memref<{out_tile}x{cfg.dtype}, 2>)
+          }}
+          air.herd_terminator
+        }}
         air.segment_terminator
       }}
       air.launch_terminator
@@ -332,189 +404,182 @@ def expert_air(cfg: KernelConfig) -> str:
 """
 
 
-class _GpuSSAEmitter:
-    def __init__(self) -> None:
-        self._next = 0
-        self.lines: list[str] = []
-
-    def value(self, expr: str) -> str:
-        name = f"%v{self._next}"
-        self._next += 1
-        self.lines.append(f"      {name} = {expr}")
-        return name
-
-    def op(self, text: str) -> None:
-        self.lines.append(f"      {text}")
-
-
-def _gpu_index_constants(limit: int) -> tuple[list[str], dict[int, str]]:
-    lines = []
-    names = {}
-    for value in range(limit + 1):
-        name = f"%idx{value}"
-        lines.append(f"      {name} = arith.constant {value} : index")
-        names[value] = name
-    return lines, names
-
-
-def router_math_gpu_air(cfg: KernelConfig) -> str:
-    indices, idx = _gpu_index_constants(max(cfg.batch_tokens, cfg.hidden_size, cfg.router_weights))
-    body = _GpuSSAEmitter()
-    body.op(f"%zero = arith.constant 0.0 : {cfg.dtype}")
-    for row in range(cfg.batch_tokens):
-        for col in range(cfg.router_weights):
-            acc = "%zero"
-            for k in range(cfg.hidden_size):
-                in_val = body.value(
-                    f"memref.load %g_in[{idx[row]}, {idx[k]}] : memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>"
-                )
-                w_val = body.value(
-                    f"memref.load %g_w[{idx[k]}, {idx[col]}] : memref<{cfg.hidden_size}x2x{cfg.dtype}>"
-                )
-                prod = body.value(f"arith.mulf {in_val}, {w_val} : {cfg.dtype}")
-                acc = body.value(f"arith.addf {acc}, {prod} : {cfg.dtype}")
-            body.op(
-                f"memref.store {acc}, %g_out[{idx[row]}, {idx[col]}] : memref<{cfg.batch_tokens}x2x{cfg.dtype}>"
-            )
-    launch_body = "\n".join(indices + body.lines + ["      gpu.terminator"])
-    return _header("router_math.gpu.air.mlir") + f"""module {{
-  func.func @router_math_host(%input: memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>,
-                              %weights: memref<{cfg.hidden_size}x2x{cfg.dtype}>,
-                              %output: memref<{cfg.batch_tokens}x2x{cfg.dtype}>)
+def expert_hidden_air(cfg: KernelConfig) -> str:
+    reduction_tile, ffn_tile = _streaming_tile_sizes(
+        cfg.hidden_size,
+        cfg.ffn_size,
+        output_limit=min(cfg.ffn_size, 128),
+        max_weight_elems=16384,
+    )
+    ffn_tiles = cfg.ffn_size // ffn_tile
+    return _header("expert_hidden.air.mlir") + f"""module {{
+  func.func @expert_hidden(%input: memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>,
+                           %w1: memref<{cfg.hidden_size}x{cfg.ffn_size}x{cfg.dtype}>,
+                           %output: memref<{cfg.batch_tokens}x{cfg.ffn_size}x{cfg.dtype}>)
       attributes {{llvm.emit_c_interface}} {{
-    %c1 = arith.constant 1 : index
-    %g_in = gpu.alloc () : memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>
-    %g_w = gpu.alloc () : memref<{cfg.hidden_size}x2x{cfg.dtype}>
-    %g_out = gpu.alloc () : memref<{cfg.batch_tokens}x2x{cfg.dtype}>
-    gpu.memcpy %g_in, %input : memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>, memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>
-    gpu.memcpy %g_w, %weights : memref<{cfg.hidden_size}x2x{cfg.dtype}>, memref<{cfg.hidden_size}x2x{cfg.dtype}>
+    %batch = arith.constant {cfg.batch_tokens} : index
+    %one = arith.constant 1 : index
+    air.launch (%tok, %lane) in (%ntok=%batch, %nlane=%one)
+        args(%launch_in=%input, %launch_w1=%w1, %launch_out=%output)
+        : memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>,
+          memref<{cfg.hidden_size}x{cfg.ffn_size}x{cfg.dtype}>,
+          memref<{cfg.batch_tokens}x{cfg.ffn_size}x{cfg.dtype}> {{
+      air.segment @expert_hidden_segment
+          args(%seg_tok=%tok, %seg_in=%launch_in, %seg_w1=%launch_w1, %seg_out=%launch_out)
+          : index,
+            memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>,
+            memref<{cfg.hidden_size}x{cfg.ffn_size}x{cfg.dtype}>,
+            memref<{cfg.batch_tokens}x{cfg.ffn_size}x{cfg.dtype}> {{
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %c_tiles = arith.constant {ffn_tiles} : index
+        air.herd @expert_hidden_herd
+            tile (%tx, %ty) in (%sx=%c_tiles, %sy=%c1)
+            args(%herd_tok=%seg_tok, %herd_in=%seg_in, %herd_w1=%seg_w1, %herd_hidden=%seg_out)
+            : index,
+              memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>,
+              memref<{cfg.hidden_size}x{cfg.ffn_size}x{cfg.dtype}>,
+              memref<{cfg.batch_tokens}x{cfg.ffn_size}x{cfg.dtype}> {{
+          %h0 = arith.constant 0 : index
+          %h1 = arith.constant 1 : index
+          %h_hidden = arith.constant {cfg.hidden_size} : index
+          %h_ffn = arith.constant {cfg.ffn_size} : index
+          %h_reduction_tile = arith.constant {reduction_tile} : index
+          %h_ffn_tile = arith.constant {ffn_tile} : index
+          %ff = arith.muli %tx, %h_ffn_tile : index
+          %zero_inner = arith.constant 0.0 : {cfg.dtype}
+          %l1_in = memref.alloc() : memref<{reduction_tile}x{cfg.dtype}, 2>
+          %l1_w1 = memref.alloc() : memref<{reduction_tile}x{ffn_tile}x{cfg.dtype}, 2>
+          %l1_hidden = memref.alloc() : memref<{ffn_tile}x{cfg.dtype}, 2>
 
-    gpu.launch blocks(%bx, %by, %bz) in (%gridx = %c1, %gridy = %c1, %gridz = %c1)
-               threads(%tx, %ty, %tz) in (%blockx = %c1, %blocky = %c1, %blockz = %c1) {{
-{launch_body}
+          scf.for %j = %h0 to %h_ffn_tile step %h1 {{
+            memref.store %zero_inner, %l1_hidden[%j] : memref<{ffn_tile}x{cfg.dtype}, 2>
+          }}
+          scf.for %k0 = %h0 to %h_hidden step %h_reduction_tile {{
+            air.dma_memcpy_nd (%l1_in[%h0] [%h_reduction_tile] [%h1],
+                               %herd_in[%herd_tok, %k0] [%h1, %h_reduction_tile] [%h_hidden, %h1])
+                : (memref<{reduction_tile}x{cfg.dtype}, 2>,
+                   memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>)
+            air.dma_memcpy_nd (%l1_w1[%h0, %h0] [%h_reduction_tile, %h_ffn_tile] [%h_ffn_tile, %h1],
+                               %herd_w1[%k0, %ff] [%h_reduction_tile, %h_ffn_tile] [%h_ffn, %h1])
+                : (memref<{reduction_tile}x{ffn_tile}x{cfg.dtype}, 2>,
+                   memref<{cfg.hidden_size}x{cfg.ffn_size}x{cfg.dtype}>)
+            scf.for %j = %h0 to %h_ffn_tile step %h1 {{
+              %acc_init = memref.load %l1_hidden[%j] : memref<{ffn_tile}x{cfg.dtype}, 2>
+              %sum = scf.for %k = %h0 to %h_reduction_tile step %h1 iter_args(%cur = %acc_init) -> ({cfg.dtype}) {{
+                %in_val = memref.load %l1_in[%k] : memref<{reduction_tile}x{cfg.dtype}, 2>
+                %w_val = memref.load %l1_w1[%k, %j] : memref<{reduction_tile}x{ffn_tile}x{cfg.dtype}, 2>
+                %prod = arith.mulf %in_val, %w_val : {cfg.dtype}
+                %next = arith.addf %cur, %prod : {cfg.dtype}
+                scf.yield %next : {cfg.dtype}
+              }}
+              memref.store %sum, %l1_hidden[%j] : memref<{ffn_tile}x{cfg.dtype}, 2>
+            }}
+          }}
+          scf.for %j = %h0 to %h_ffn_tile step %h1 {{
+            %relu_in = memref.load %l1_hidden[%j] : memref<{ffn_tile}x{cfg.dtype}, 2>
+            %keep = arith.cmpf ogt, %relu_in, %zero_inner : {cfg.dtype}
+            %relu = arith.select %keep, %relu_in, %zero_inner : {cfg.dtype}
+            memref.store %relu, %l1_hidden[%j] : memref<{ffn_tile}x{cfg.dtype}, 2>
+          }}
+          air.dma_memcpy_nd (%herd_hidden[%herd_tok, %ff] [%h1, %h_ffn_tile] [%h_ffn, %h1],
+                             %l1_hidden[%h0] [%h_ffn_tile] [%h1])
+              : (memref<{cfg.batch_tokens}x{cfg.ffn_size}x{cfg.dtype}>,
+                 memref<{ffn_tile}x{cfg.dtype}, 2>)
+          air.herd_terminator
+        }}
+        air.segment_terminator
+      }}
+      air.launch_terminator
     }}
-    gpu.memcpy %output, %g_out : memref<{cfg.batch_tokens}x2x{cfg.dtype}>, memref<{cfg.batch_tokens}x2x{cfg.dtype}>
-    gpu.dealloc %g_in : memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>
-    gpu.dealloc %g_w : memref<{cfg.hidden_size}x2x{cfg.dtype}>
-    gpu.dealloc %g_out : memref<{cfg.batch_tokens}x2x{cfg.dtype}>
     return
   }}
 }}
 """
 
 
-def expert_gpu_air(cfg: KernelConfig) -> str:
-    indices, idx = _gpu_index_constants(max(cfg.batch_tokens, cfg.hidden_size, cfg.ffn_size))
-    body = _GpuSSAEmitter()
-    body.op(f"%zero = arith.constant 0.0 : {cfg.dtype}")
-    body.op(f"%hidden = memref.alloca() : memref<{cfg.batch_tokens}x{cfg.ffn_size}x{cfg.dtype}>")
-    for row in range(cfg.batch_tokens):
-        for ff in range(cfg.ffn_size):
-            acc = "%zero"
-            for k in range(cfg.hidden_size):
-                in_val = body.value(
-                    f"memref.load %g_in[{idx[row]}, {idx[k]}] : memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>"
-                )
-                w1_val = body.value(
-                    f"memref.load %g_w1[{idx[k]}, {idx[ff]}] : memref<{cfg.hidden_size}x{cfg.ffn_size}x{cfg.dtype}>"
-                )
-                prod = body.value(f"arith.mulf {in_val}, {w1_val} : {cfg.dtype}")
-                acc = body.value(f"arith.addf {acc}, {prod} : {cfg.dtype}")
-            keep = body.value(f"arith.cmpf ogt, {acc}, %zero : {cfg.dtype}")
-            relu = body.value(f"arith.select {keep}, {acc}, %zero : {cfg.dtype}")
-            body.op(
-                f"memref.store {relu}, %hidden[{idx[row]}, {idx[ff]}] : memref<{cfg.batch_tokens}x{cfg.ffn_size}x{cfg.dtype}>"
-            )
-    for row in range(cfg.batch_tokens):
-        for out_col in range(cfg.hidden_size):
-            acc = "%zero"
-            for ff in range(cfg.ffn_size):
-                hidden_val = body.value(
-                    f"memref.load %hidden[{idx[row]}, {idx[ff]}] : memref<{cfg.batch_tokens}x{cfg.ffn_size}x{cfg.dtype}>"
-                )
-                w2_val = body.value(
-                    f"memref.load %g_w2[{idx[ff]}, {idx[out_col]}] : memref<{cfg.ffn_size}x{cfg.hidden_size}x{cfg.dtype}>"
-                )
-                prod = body.value(f"arith.mulf {hidden_val}, {w2_val} : {cfg.dtype}")
-                acc = body.value(f"arith.addf {acc}, {prod} : {cfg.dtype}")
-            body.op(
-                f"memref.store {acc}, %g_out[{idx[row]}, {idx[out_col]}] : memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>"
-            )
-    launch_body = "\n".join(indices + body.lines + ["      gpu.terminator"])
-    return _header("expert.gpu.air.mlir") + f"""module {{
-  func.func @expert_mlp_host(%input: memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>,
-                             %w1: memref<{cfg.hidden_size}x{cfg.ffn_size}x{cfg.dtype}>,
-                             %w2: memref<{cfg.ffn_size}x{cfg.hidden_size}x{cfg.dtype}>,
-                             %output: memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>)
+def expert_output_air(cfg: KernelConfig) -> str:
+    reduction_tile, out_tile = _streaming_tile_sizes(
+        cfg.ffn_size,
+        cfg.hidden_size,
+        output_limit=min(cfg.hidden_size, 128),
+        max_weight_elems=16384,
+    )
+    output_tiles = cfg.hidden_size // out_tile
+    return _header("expert_output.air.mlir") + f"""module {{
+  func.func @expert_output(%hidden: memref<{cfg.batch_tokens}x{cfg.ffn_size}x{cfg.dtype}>,
+                           %w2: memref<{cfg.ffn_size}x{cfg.hidden_size}x{cfg.dtype}>,
+                           %output: memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>)
       attributes {{llvm.emit_c_interface}} {{
-    %c1 = arith.constant 1 : index
-    %g_in = gpu.alloc () : memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>
-    %g_w1 = gpu.alloc () : memref<{cfg.hidden_size}x{cfg.ffn_size}x{cfg.dtype}>
-    %g_w2 = gpu.alloc () : memref<{cfg.ffn_size}x{cfg.hidden_size}x{cfg.dtype}>
-    %g_out = gpu.alloc () : memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>
-    gpu.memcpy %g_in, %input : memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>, memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>
-    gpu.memcpy %g_w1, %w1 : memref<{cfg.hidden_size}x{cfg.ffn_size}x{cfg.dtype}>, memref<{cfg.hidden_size}x{cfg.ffn_size}x{cfg.dtype}>
-    gpu.memcpy %g_w2, %w2 : memref<{cfg.ffn_size}x{cfg.hidden_size}x{cfg.dtype}>, memref<{cfg.ffn_size}x{cfg.hidden_size}x{cfg.dtype}>
+    %batch = arith.constant {cfg.batch_tokens} : index
+    %one = arith.constant 1 : index
+    air.launch (%tok, %lane) in (%ntok=%batch, %nlane=%one)
+        args(%launch_hidden=%hidden, %launch_w2=%w2, %launch_out=%output)
+        : memref<{cfg.batch_tokens}x{cfg.ffn_size}x{cfg.dtype}>,
+          memref<{cfg.ffn_size}x{cfg.hidden_size}x{cfg.dtype}>,
+          memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}> {{
+      air.segment @expert_output_segment
+          args(%seg_tok=%tok, %seg_hidden=%launch_hidden, %seg_w2=%launch_w2, %seg_out=%launch_out)
+          : index,
+            memref<{cfg.batch_tokens}x{cfg.ffn_size}x{cfg.dtype}>,
+            memref<{cfg.ffn_size}x{cfg.hidden_size}x{cfg.dtype}>,
+            memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}> {{
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %c_tiles = arith.constant {output_tiles} : index
+        air.herd @expert_output_herd
+            tile (%tx, %ty) in (%sx=%c_tiles, %sy=%c1)
+            args(%herd_tok=%seg_tok, %herd_hidden=%seg_hidden, %herd_w2=%seg_w2, %herd_out=%seg_out)
+            : index,
+              memref<{cfg.batch_tokens}x{cfg.ffn_size}x{cfg.dtype}>,
+              memref<{cfg.ffn_size}x{cfg.hidden_size}x{cfg.dtype}>,
+              memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}> {{
+          %h0 = arith.constant 0 : index
+          %h1 = arith.constant 1 : index
+          %h_hidden = arith.constant {cfg.hidden_size} : index
+          %h_ffn = arith.constant {cfg.ffn_size} : index
+          %h_reduction_tile = arith.constant {reduction_tile} : index
+          %h_out_tile = arith.constant {out_tile} : index
+          %j0 = arith.muli %tx, %h_out_tile : index
+          %zero_inner = arith.constant 0.0 : {cfg.dtype}
+          %l1_hidden = memref.alloc() : memref<{reduction_tile}x{cfg.dtype}, 2>
+          %l1_w2 = memref.alloc() : memref<{reduction_tile}x{out_tile}x{cfg.dtype}, 2>
+          %l1_out = memref.alloc() : memref<{out_tile}x{cfg.dtype}, 2>
 
-    gpu.launch blocks(%bx, %by, %bz) in (%gridx = %c1, %gridy = %c1, %gridz = %c1)
-               threads(%tx, %ty, %tz) in (%blockx = %c1, %blocky = %c1, %blockz = %c1) {{
-{launch_body}
+          scf.for %j = %h0 to %h_out_tile step %h1 {{
+            memref.store %zero_inner, %l1_out[%j] : memref<{out_tile}x{cfg.dtype}, 2>
+          }}
+          scf.for %ff = %h0 to %h_ffn step %h_reduction_tile {{
+            air.dma_memcpy_nd (%l1_hidden[%h0] [%h_reduction_tile] [%h1],
+                               %herd_hidden[%herd_tok, %ff] [%h1, %h_reduction_tile] [%h_ffn, %h1])
+                : (memref<{reduction_tile}x{cfg.dtype}, 2>,
+                   memref<{cfg.batch_tokens}x{cfg.ffn_size}x{cfg.dtype}>)
+            air.dma_memcpy_nd (%l1_w2[%h0, %h0] [%h_reduction_tile, %h_out_tile] [%h_out_tile, %h1],
+                               %herd_w2[%ff, %j0] [%h_reduction_tile, %h_out_tile] [%h_hidden, %h1])
+                : (memref<{reduction_tile}x{out_tile}x{cfg.dtype}, 2>,
+                   memref<{cfg.ffn_size}x{cfg.hidden_size}x{cfg.dtype}>)
+            scf.for %j = %h0 to %h_out_tile step %h1 {{
+              %acc_init = memref.load %l1_out[%j] : memref<{out_tile}x{cfg.dtype}, 2>
+              %final = scf.for %k = %h0 to %h_reduction_tile step %h1 iter_args(%cur = %acc_init) -> ({cfg.dtype}) {{
+                %in_val = memref.load %l1_hidden[%k] : memref<{reduction_tile}x{cfg.dtype}, 2>
+                %w_val = memref.load %l1_w2[%k, %j] : memref<{reduction_tile}x{out_tile}x{cfg.dtype}, 2>
+                %prod = arith.mulf %in_val, %w_val : {cfg.dtype}
+                %next = arith.addf %cur, %prod : {cfg.dtype}
+                scf.yield %next : {cfg.dtype}
+              }}
+              memref.store %final, %l1_out[%j] : memref<{out_tile}x{cfg.dtype}, 2>
+            }}
+          }}
+          air.dma_memcpy_nd (%herd_out[%herd_tok, %j0] [%h1, %h_out_tile] [%h_hidden, %h1],
+                             %l1_out[%h0] [%h_out_tile] [%h1])
+              : (memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>,
+                 memref<{out_tile}x{cfg.dtype}, 2>)
+          air.herd_terminator
+        }}
+        air.segment_terminator
+      }}
+      air.launch_terminator
     }}
-    gpu.memcpy %output, %g_out : memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>, memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>
-    gpu.dealloc %g_in : memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>
-    gpu.dealloc %g_w1 : memref<{cfg.hidden_size}x{cfg.ffn_size}x{cfg.dtype}>
-    gpu.dealloc %g_w2 : memref<{cfg.ffn_size}x{cfg.hidden_size}x{cfg.dtype}>
-    gpu.dealloc %g_out : memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>
-    return
-  }}
-}}
-"""
-
-
-def aggregation_gpu_air(cfg: KernelConfig) -> str:
-    indices, idx = _gpu_index_constants(max(cfg.batch_tokens, cfg.hidden_size * 2))
-    body = _GpuSSAEmitter()
-    for row in range(cfg.batch_tokens):
-        w0 = body.value(
-            f"memref.load %g_w[{idx[row]}, {idx[0]}] : memref<{cfg.batch_tokens}x2x{cfg.dtype}>"
-        )
-        w1 = body.value(
-            f"memref.load %g_w[{idx[row]}, {idx[1]}] : memref<{cfg.batch_tokens}x2x{cfg.dtype}>"
-        )
-        for col in range(cfg.hidden_size):
-            lhs = body.value(
-                f"memref.load %g_exp[{idx[row]}, {idx[col]}] : memref<{cfg.batch_tokens}x{cfg.hidden_size * 2}x{cfg.dtype}>"
-            )
-            rhs = body.value(
-                f"memref.load %g_exp[{idx[row]}, {idx[col + cfg.hidden_size]}] : memref<{cfg.batch_tokens}x{cfg.hidden_size * 2}x{cfg.dtype}>"
-            )
-            lhs_scaled = body.value(f"arith.mulf {lhs}, {w0} : {cfg.dtype}")
-            rhs_scaled = body.value(f"arith.mulf {rhs}, {w1} : {cfg.dtype}")
-            total = body.value(f"arith.addf {lhs_scaled}, {rhs_scaled} : {cfg.dtype}")
-            body.op(
-                f"memref.store {total}, %g_out[{idx[row]}, {idx[col]}] : memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>"
-            )
-    launch_body = "\n".join(indices + body.lines + ["      gpu.terminator"])
-    return _header("aggregation.gpu.air.mlir") + f"""module {{
-  func.func @aggregate_outputs_host(%experts: memref<{cfg.batch_tokens}x{cfg.hidden_size * 2}x{cfg.dtype}>,
-                                    %weights: memref<{cfg.batch_tokens}x2x{cfg.dtype}>,
-                                    %output: memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>)
-      attributes {{llvm.emit_c_interface}} {{
-    %c1 = arith.constant 1 : index
-    %g_exp = gpu.alloc () : memref<{cfg.batch_tokens}x{cfg.hidden_size * 2}x{cfg.dtype}>
-    %g_w = gpu.alloc () : memref<{cfg.batch_tokens}x2x{cfg.dtype}>
-    %g_out = gpu.alloc () : memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>
-    gpu.memcpy %g_exp, %experts : memref<{cfg.batch_tokens}x{cfg.hidden_size * 2}x{cfg.dtype}>, memref<{cfg.batch_tokens}x{cfg.hidden_size * 2}x{cfg.dtype}>
-    gpu.memcpy %g_w, %weights : memref<{cfg.batch_tokens}x2x{cfg.dtype}>, memref<{cfg.batch_tokens}x2x{cfg.dtype}>
-
-    gpu.launch blocks(%bx, %by, %bz) in (%gridx = %c1, %gridy = %c1, %gridz = %c1)
-               threads(%tx, %ty, %tz) in (%blockx = %c1, %blocky = %c1, %blockz = %c1) {{
-{launch_body}
-    }}
-    gpu.memcpy %output, %g_out : memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>, memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>
-    gpu.dealloc %g_exp : memref<{cfg.batch_tokens}x{cfg.hidden_size * 2}x{cfg.dtype}>
-    gpu.dealloc %g_w : memref<{cfg.batch_tokens}x2x{cfg.dtype}>
-    gpu.dealloc %g_out : memref<{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.dtype}>
     return
   }}
 }}
@@ -550,27 +615,21 @@ def write_default_air_sources(cfg: KernelConfig, output_dir: Path) -> dict[str, 
     return paths
 
 
-def emit_all_gpu_kernels(cfg: KernelConfig) -> dict[str, str]:
-    return {
-        "router": router_math_gpu_air(cfg),
-        "expert": expert_gpu_air(cfg),
-        "aggregation": aggregation_gpu_air(cfg),
-    }
-
-
-def default_gpu_air_filenames(cfg: KernelConfig) -> dict[str, str]:
+def split_expert_air_filenames(cfg: KernelConfig) -> dict[str, str]:
     stem = f"{cfg.batch_tokens}x{cfg.hidden_size}x{cfg.ffn_size}_{cfg.dtype}"
     return {
-        "router": f"router_math_{cfg.batch_tokens}x{cfg.hidden_size}x2_{cfg.dtype}.gpu.air.mlir",
-        "expert": f"expert_mlp_{stem}.gpu.air.mlir",
-        "aggregation": f"aggregation_{cfg.batch_tokens}x{cfg.hidden_size}_{cfg.dtype}.gpu.air.mlir",
+        "expert_hidden": f"expert_hidden_{stem}.air.mlir",
+        "expert_output": f"expert_output_{stem}.air.mlir",
     }
 
 
-def write_default_gpu_air_sources(cfg: KernelConfig, output_dir: Path) -> dict[str, Path]:
+def write_split_expert_air_sources(cfg: KernelConfig, output_dir: Path) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    names = default_gpu_air_filenames(cfg)
-    rendered = emit_all_gpu_kernels(cfg)
+    names = split_expert_air_filenames(cfg)
+    rendered = {
+        "expert_hidden": expert_hidden_air(cfg),
+        "expert_output": expert_output_air(cfg),
+    }
     paths: dict[str, Path] = {}
     for key, name in names.items():
         path = output_dir / name

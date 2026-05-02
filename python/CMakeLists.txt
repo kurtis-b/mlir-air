@@ -4,6 +4,12 @@
 
 include(AddMLIRPython)
 
+# Keep every AIR nanobind module on a repo-specific domain, even in GPU-only
+# builds where the main AIR bindings block is skipped.
+if(NOT DEFINED MLIR_BINDINGS_PYTHON_NB_DOMAIN)
+  set(MLIR_BINDINGS_PYTHON_NB_DOMAIN "_air")
+endif()
+
 # Only build Python bindings if enabled
 if(AIE_ENABLE_BINDINGS_PYTHON)
   # The directory at which the Python import tree begins.
@@ -110,8 +116,6 @@ if(AIE_ENABLE_BINDINGS_PYTHON)
   # -Wl,-z,defs globally which prevents this.
   string(REPLACE "-Wl,-z,defs" "" CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS}")
 
-  # Set NB_DOMAIN for nanobind, to avoid domain conflict with other llvm projects.
-  set(MLIR_BINDINGS_PYTHON_NB_DOMAIN "_air")
   add_mlir_python_modules(AirMLIRPythonModules
     ROOT_PREFIX "${AIR_PYTHON_PACKAGES_DIR}/air"
     INSTALL_PREFIX "python/air"

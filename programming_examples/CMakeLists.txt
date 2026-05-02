@@ -25,12 +25,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED YES)
 find_package(MLIR REQUIRED CONFIG)
 find_package(Python3 COMPONENTS Interpreter)
 
+# OFF by default for Ryzen/NPU2 wheel-based setups that do not ship the
+# classic chess/Vitis toolchain.
+option(ENABLE_CHESS_TESTS "Enable backend tests using xchesscc" OFF)
+
 if(AIR_ENABLE_AIE)
   find_package(LibXAIE)
   if(NOT AIE_BINARY_DIR)
     find_package(AIE REQUIRED CONFIG)
   endif()
-  find_package(Vitis 2023.2 COMPONENTS AIE AIE2)
+  if(ENABLE_CHESS_TESTS)
+    find_package(Vitis 2023.2 QUIET COMPONENTS AIE AIE2)
+  endif()
 endif()
 
 if(NOT AIR_BINARY_DIR)
@@ -74,8 +80,6 @@ include_directories(${MLIR_INCLUDE_DIRS})
 include_directories(${PROJECT_SOURCE_DIR}/include)
 include_directories(${PROJECT_BINARY_DIR}/include)
 add_definitions(${LLVM_DEFINITIONS})
-
-set(ENABLE_CHESS_TESTS ON CACHE BOOL "Enable backend tests using xchesscc")
 
 set(AIR_TEST_LIT_ARGS "-sv --timeout 1000 --time-tests --order=random")
 

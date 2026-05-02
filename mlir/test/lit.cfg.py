@@ -20,7 +20,12 @@ from lit.llvm.subst import FindTool
 # name: The name of this test suite.
 config.name = "AIRMLIR"
 
-config.test_format = lit.formats.ShTest(not llvm_config.use_lit_shell)
+config.recursiveExpansionLimit = 10
+config.test_format = lit.formats.ShTest(
+    not llvm_config.use_lit_shell,
+    extra_substitutions=[("%T", "%t.dir")],
+    preamble_commands=["rm -rf %T && mkdir -p %T"],
+)
 
 # suffixes: A list of file extensions to treat as test files.
 config.suffixes = [".mlir"]

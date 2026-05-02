@@ -26,7 +26,7 @@ if(POLICY CMP0091)
 endif()
 
 if(POLICY CMP0116)
-  cmake_policy(SET CMP0116 OLD)
+  cmake_policy(SET CMP0116 NEW)
 endif()
 
 project(AIR LANGUAGES CXX C)

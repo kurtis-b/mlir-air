@@ -74,7 +74,7 @@ hsa_status_t find_aie(hsa_agent_t agent, void *data) {
     return status;
   }
 
-  if (device_type == HSA_DEVICE_TYPE_AIE) {
+  if (device_type == air::rocm::kHsaDeviceTypeAie) {
     aie_agents->push_back(agent);
   }
 
@@ -416,8 +416,8 @@ uint64_t air_wait_all(std::vector<uint64_t> &signals) {
       } else {
         // Create a dummy signal that will have a handle of 0
         hsa_signal_t dummy_signal;
-        hsa_amd_signal_create_on_agent(
-            0, 0, nullptr, _air_host_active_segment.agent, 0, &dummy_signal);
+        air::rocm::signalCreateOnAgent(0, *_air_host_active_segment.agent,
+                                       &dummy_signal);
         dummy_signal.handle =
             0; // The barrier and packet will ignore a signal with handle of 0
         signals_in_pkt.push_back(dummy_signal);
@@ -433,9 +433,8 @@ uint64_t air_wait_all(std::vector<uint64_t> &signals) {
       air_packet_barrier_and(&barrier_pkt, signals_in_pkt[0], signals_in_pkt[1],
                              signals_in_pkt[2], signals_in_pkt[3],
                              signals_in_pkt[4]);
-      hsa_amd_signal_create_on_agent(1, 0, nullptr,
-                                     _air_host_active_segment.agent, 0,
-                                     &barrier_pkt.completion_signal);
+      air::rocm::signalCreateOnAgent(
+          1, *_air_host_active_segment.agent, &barrier_pkt.completion_signal);
       air_queue_dispatch(_air_host_active_segment.q, packet_id, wr_idx,
                          &barrier_pkt);
 

@@ -44,6 +44,8 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
@@ -6852,7 +6854,23 @@ public:
         if (clOutputPrefix != "/dev/null") {
           std::error_code EC;
           std::string fname = clOutputPrefix + aie_module_name + ".mlir";
+          if (std::error_code createEC =
+                  llvm::sys::fs::create_directories(
+                      llvm::sys::path::parent_path(fname))) {
+            aie_module.emitError()
+                << "failed to create split-device output directory for '"
+                << fname << "': " << createEC.message();
+            signalPassFailure();
+            return;
+          }
           llvm::raw_fd_ostream aie_ostream(fname, EC);
+          if (EC) {
+            aie_module.emitError()
+                << "failed to open split-device output '" << fname
+                << "': " << EC.message();
+            signalPassFailure();
+            return;
+          }
           aie_module.print(aie_ostream);
         }
       } else {

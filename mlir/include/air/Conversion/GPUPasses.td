@@ -32,4 +32,18 @@ def ConvertGPUKernelOutline : Pass<"air-gpu-outlining", "ModuleOp"> {
   let options = [];
 }
 
+def ConvertGPUHostStaging : Pass<"air-gpu-host-staging", "ModuleOp"> {
+  let summary = "Stage host memrefs around gpu.launch_func calls";
+  let constructor = "xilinx::air::createGPUHostStagingPass()";
+  let description = [{
+    Inserts gpu.alloc/gpu.memcpy/gpu.dealloc around host-side gpu.launch_func
+    calls so AIR kernels lowered through ROCDL can be invoked through host
+    entrypoints without relying on textual IR rewriting.
+  }];
+  let dependentDialects = [
+    "func::FuncDialect", "gpu::GPUDialect", "memref::MemRefDialect"
+  ];
+  let options = [];
+}
+
 #endif // AIR_CONVERSION_GPU_PASSES

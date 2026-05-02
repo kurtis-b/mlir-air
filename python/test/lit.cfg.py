@@ -11,6 +11,8 @@ import sys
 import importlib.util
 import subprocess
 import re
+import shutil
+from pathlib import Path
 
 import lit.formats
 
@@ -21,7 +23,12 @@ from lit.llvm import llvm_config
 # name: The name of this test suite.
 config.name = "AIRPYTHON"
 
-config.test_format = lit.formats.ShTest(not llvm_config.use_lit_shell)
+config.recursiveExpansionLimit = 10
+config.test_format = lit.formats.ShTest(
+    not llvm_config.use_lit_shell,
+    extra_substitutions=[("%T", "%t.dir")],
+    preamble_commands=["rm -rf %T && mkdir -p %T"],
+)
 config.environment["PYTHONPATH"] = "{}:{}:{}".format(
     os.path.join(config.air_obj_root, "python"),
     os.path.join(config.aie_obj_root, "python"),
@@ -68,16 +75,49 @@ run_on_npu1 = "echo"
 run_on_npu2 = "echo"
 xrt_flags = ""
 
+
+def _discover_xrt_root():
+    candidates = []
+    for value in (
+        os.environ.get("XILINX_XRT"),
+        os.environ.get("XRT_DIR"),
+        config.xrt_dir,
+    ):
+        if value:
+            candidates.append(value)
+    xrtsmi = shutil.which("xrt-smi")
+    if xrtsmi:
+        candidates.append(str(Path(xrtsmi).resolve().parents[1]))
+    for root in candidates:
+        include_dir = os.path.join(root, "include")
+        lib_dir = os.path.join(root, "lib")
+        bin_dir = os.path.join(root, "bin")
+        if os.path.exists(os.path.join(bin_dir, "xrt-smi")) and os.path.isdir(
+            include_dir
+        ):
+            return root, bin_dir, lib_dir, include_dir
+    return config.xrt_dir, config.xrt_bin_dir, config.xrt_lib_dir, config.xrt_include_dir
+
+
+config.xrt_dir, config.xrt_bin_dir, config.xrt_lib_dir, config.xrt_include_dir = (
+    _discover_xrt_root()
+)
+config.environment["PYTHONPATH"] = "{}:{}:{}".format(
+    os.path.join(config.air_obj_root, "python"),
+    os.path.join(config.aie_obj_root, "python"),
+    os.path.join(config.xrt_dir, "python"),
+)
+
 # XRT
 if config.xrt_lib_dir and config.enable_run_xrt_tests:
-    print("xrt found at", os.path.dirname(config.xrt_lib_dir))
+    print("xrt found at", config.xrt_dir)
     xrt_flags = "-I{} -L{} -luuid -lxrt_coreutil".format(
         config.xrt_include_dir, config.xrt_lib_dir
     )
     config.available_features.add("xrt")
 
     try:
-        xrtsmi = os.path.join(config.xrt_bin_dir, "xrt-smi")
+        xrtsmi = shutil.which("xrt-smi") or os.path.join(config.xrt_bin_dir, "xrt-smi")
         result = subprocess.run(
             [xrtsmi, "examine"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )

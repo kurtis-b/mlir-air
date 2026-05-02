@@ -24,6 +24,7 @@
 #include "air_host_impl.h"
 #include "air_queue.h"
 #include "airbin.h"
+#include "runtime.h"
 #include "hsa/hsa.h"
 #include "hsa/hsa_ext_amd.h"
 #include "hsa_ext_air.h"
@@ -133,8 +134,7 @@ hsa_status_t air_queue_dispatch_and_wait(hsa_agent_t *agent, hsa_queue_t *q,
 
   // dispatch and wait has blocking semantics so we can internally create the
   // signal
-  hsa_amd_signal_create_on_agent(1, 0, nullptr, agent, 0,
-                                 &(pkt->completion_signal));
+  air::rocm::signalCreateOnAgent(1, *agent, &(pkt->completion_signal));
 
   // Write the packet to the queue
   air_write_pkt<hsa_agent_dispatch_packet_t>(q, packet_id, pkt);
@@ -163,8 +163,7 @@ hsa_status_t air_queue_dispatch_and_wait(hsa_agent_t *agent, hsa_queue_t *q,
 
   // dispatch and wait has blocking semantics so we can internally create the
   // signal
-  hsa_amd_signal_create_on_agent(1, 0, nullptr, agent, 0,
-                                 &(pkt->completion_signal));
+  air::rocm::signalCreateOnAgent(1, *agent, &(pkt->completion_signal));
 
   // Write the packet to the queue
   air_write_pkt<hsa_barrier_and_packet_t>(q, packet_id, pkt);

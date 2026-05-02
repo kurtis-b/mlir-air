@@ -10,104 +10,136 @@
 
 module {
   func.func @expert_mlp(%input: memref<4x16xbf16>,
-                        %weights: memref<16x64xbf16>,
+                        %w1: memref<16x32xbf16>,
+                        %w2: memref<32x16xbf16>,
                         %output: memref<4x16xbf16>)
       attributes {llvm.emit_c_interface} {
     %batch = arith.constant 4 : index
     %one = arith.constant 1 : index
     air.launch (%tok, %lane) in (%ntok=%batch, %nlane=%one)
-        args(%launch_in=%input, %launch_w=%weights, %launch_out=%output)
+        args(%launch_in=%input, %launch_w1=%w1, %launch_w2=%w2, %launch_out=%output)
         : memref<4x16xbf16>,
-          memref<16x64xbf16>,
+          memref<16x32xbf16>,
+          memref<32x16xbf16>,
           memref<4x16xbf16> {
       air.segment @expert_segment
-          args(%seg_tok=%tok, %seg_in=%launch_in, %seg_w=%launch_w, %seg_out=%launch_out)
+          args(%seg_tok=%tok, %seg_in=%launch_in, %seg_w1=%launch_w1, %seg_w2=%launch_w2, %seg_out=%launch_out)
           : index,
             memref<4x16xbf16>,
-            memref<16x64xbf16>,
+            memref<16x32xbf16>,
+            memref<32x16xbf16>,
             memref<4x16xbf16> {
         %c0 = arith.constant 0 : index
         %c1 = arith.constant 1 : index
-        %c_hidden = arith.constant 16 : index
-        %c_ffn = arith.constant 32 : index
-        %c_packed = arith.constant 64 : index
-        %l2_in = memref.alloc() : memref<16xbf16, 1>
-        %l2_w = memref.alloc() : memref<16x64xbf16, 1>
-        %l2_out = memref.alloc() : memref<16xbf16, 1>
+        %l2_hidden = memref.alloc() : memref<4x32xbf16, 1>
 
-        air.dma_memcpy_nd (%l2_in[%c0] [%c_hidden] [%c1],
-                           %seg_in[%seg_tok, %c0] [%c1, %c_hidden] [%c_hidden, %c1])
-            : (memref<16xbf16, 1>,
-               memref<4x16xbf16>)
-        air.dma_memcpy_nd (%l2_w[%c0, %c0] [%c_hidden, %c_packed] [%c_packed, %c1],
-                           %seg_w[%c0, %c0] [%c_hidden, %c_packed] [%c_packed, %c1])
-            : (memref<16x64xbf16, 1>,
-               memref<16x64xbf16>)
-
-        air.herd @expert_herd
+        air.herd @expert_hidden_herd
             tile (%tx, %ty) in (%sx=%c1, %sy=%c1)
-            args(%herd_in=%l2_in, %herd_w=%l2_w, %herd_out=%l2_out)
-            : memref<16xbf16, 1>,
-              memref<16x64xbf16, 1>,
-              memref<16xbf16, 1> {
+            args(%herd_tok=%seg_tok, %herd_in=%seg_in, %herd_w1=%seg_w1, %herd_hidden=%l2_hidden)
+            : index,
+              memref<4x16xbf16>,
+              memref<16x32xbf16>,
+              memref<4x32xbf16, 1> {
           %h0 = arith.constant 0 : index
           %h1 = arith.constant 1 : index
           %h_hidden = arith.constant 16 : index
           %h_ffn = arith.constant 32 : index
-          %h_packed = arith.constant 64 : index
+          %h_reduction_tile = arith.constant 16 : index
+          %h_ffn_tile = arith.constant 32 : index
           %zero_inner = arith.constant 0.0 : bf16
           %l1_in = memref.alloc() : memref<16xbf16, 2>
-          %l1_w = memref.alloc() : memref<16x64xbf16, 2>
+          %l1_w1 = memref.alloc() : memref<16x32xbf16, 2>
           %l1_hidden = memref.alloc() : memref<32xbf16, 2>
-          %l1_out = memref.alloc() : memref<16xbf16, 2>
 
-          air.dma_memcpy_nd (%l1_in[%h0] [%h_hidden] [%h1],
-                             %herd_in[%h0] [%h_hidden] [%h1])
-              : (memref<16xbf16, 2>,
-                 memref<16xbf16, 1>)
-          air.dma_memcpy_nd (%l1_w[%h0, %h0] [%h_hidden, %h_packed] [%h_packed, %h1],
-                             %herd_w[%h0, %h0] [%h_hidden, %h_packed] [%h_packed, %h1])
-              : (memref<16x64xbf16, 2>,
-                 memref<16x64xbf16, 1>)
-
-          scf.for %j = %h0 to %h_ffn step %h1 {
-            %acc_init = arith.constant 0.0 : bf16
-            %relu_in = scf.for %k = %h0 to %h_hidden step %h1 iter_args(%cur = %acc_init) -> (bf16) {
-              %in_val = memref.load %l1_in[%k] : memref<16xbf16, 2>
-              %w_val = memref.load %l1_w[%k, %j] : memref<16x64xbf16, 2>
-              %prod = arith.mulf %in_val, %w_val : bf16
-              %next = arith.addf %cur, %prod : bf16
-              scf.yield %next : bf16
+          scf.for %ff = %h0 to %h_ffn step %h_ffn_tile {
+            scf.for %j = %h0 to %h_ffn_tile step %h1 {
+              memref.store %zero_inner, %l1_hidden[%j] : memref<32xbf16, 2>
             }
-            %keep = arith.cmpf ogt, %relu_in, %zero_inner : bf16
-            %relu = arith.select %keep, %relu_in, %zero_inner : bf16
-            memref.store %relu, %l1_hidden[%j] : memref<32xbf16, 2>
-          }
-
-          scf.for %j = %h0 to %h_hidden step %h1 {
-            %acc_init = arith.constant 0.0 : bf16
-            %final = scf.for %k = %h0 to %h_ffn step %h1 iter_args(%cur = %acc_init) -> (bf16) {
-              %packed_col = arith.addi %k, %h_ffn : index
-              %in_val = memref.load %l1_hidden[%k] : memref<32xbf16, 2>
-              %w_val = memref.load %l1_w[%j, %packed_col] : memref<16x64xbf16, 2>
-              %prod = arith.mulf %in_val, %w_val : bf16
-              %next = arith.addf %cur, %prod : bf16
-              scf.yield %next : bf16
+            scf.for %k0 = %h0 to %h_hidden step %h_reduction_tile {
+              air.dma_memcpy_nd (%l1_in[%h0] [%h_reduction_tile] [%h1],
+                                 %herd_in[%herd_tok, %k0] [%h1, %h_reduction_tile] [%h_hidden, %h1])
+                  : (memref<16xbf16, 2>,
+                     memref<4x16xbf16>)
+              air.dma_memcpy_nd (%l1_w1[%h0, %h0] [%h_reduction_tile, %h_ffn_tile] [%h_ffn_tile, %h1],
+                                 %herd_w1[%k0, %ff] [%h_reduction_tile, %h_ffn_tile] [%h_ffn, %h1])
+                  : (memref<16x32xbf16, 2>,
+                     memref<16x32xbf16>)
+              scf.for %j = %h0 to %h_ffn_tile step %h1 {
+                %acc_init = memref.load %l1_hidden[%j] : memref<32xbf16, 2>
+                %sum = scf.for %k = %h0 to %h_reduction_tile step %h1 iter_args(%cur = %acc_init) -> (bf16) {
+                  %in_val = memref.load %l1_in[%k] : memref<16xbf16, 2>
+                  %w_val = memref.load %l1_w1[%k, %j] : memref<16x32xbf16, 2>
+                  %prod = arith.mulf %in_val, %w_val : bf16
+                  %next = arith.addf %cur, %prod : bf16
+                  scf.yield %next : bf16
+                }
+                memref.store %sum, %l1_hidden[%j] : memref<32xbf16, 2>
+              }
             }
-            memref.store %final, %l1_out[%j] : memref<16xbf16, 2>
+            scf.for %j = %h0 to %h_ffn_tile step %h1 {
+              %relu_in = memref.load %l1_hidden[%j] : memref<32xbf16, 2>
+              %keep = arith.cmpf ogt, %relu_in, %zero_inner : bf16
+              %relu = arith.select %keep, %relu_in, %zero_inner : bf16
+              memref.store %relu, %l1_hidden[%j] : memref<32xbf16, 2>
+            }
+            air.dma_memcpy_nd (%herd_hidden[%herd_tok, %ff] [%h1, %h_ffn_tile] [%h_ffn, %h1],
+                               %l1_hidden[%h0] [%h_ffn_tile] [%h1])
+                : (memref<4x32xbf16, 1>,
+                   memref<32xbf16, 2>)
           }
-
-          air.dma_memcpy_nd (%herd_out[%h0] [%h_hidden] [%h1],
-                             %l1_out[%h0] [%h_hidden] [%h1])
-              : (memref<16xbf16, 1>,
-                 memref<16xbf16, 2>)
           air.herd_terminator
         }
 
-        air.dma_memcpy_nd (%seg_out[%seg_tok, %c0] [%c1, %c_hidden] [%c_hidden, %c1],
-                           %l2_out[%c0] [%c_hidden] [%c1])
-            : (memref<4x16xbf16>,
-               memref<16xbf16, 1>)
+        air.herd @expert_output_herd
+            tile (%tx, %ty) in (%sx=%c1, %sy=%c1)
+            args(%herd_tok=%seg_tok, %herd_hidden=%l2_hidden, %herd_w2=%seg_w2, %herd_out=%seg_out)
+            : index,
+              memref<4x32xbf16, 1>,
+              memref<32x16xbf16>,
+              memref<4x16xbf16> {
+          %h0 = arith.constant 0 : index
+          %h1 = arith.constant 1 : index
+          %h_hidden = arith.constant 16 : index
+          %h_ffn = arith.constant 32 : index
+          %h_reduction_tile = arith.constant 32 : index
+          %h_out_tile = arith.constant 16 : index
+          %zero_inner = arith.constant 0.0 : bf16
+          %l1_hidden = memref.alloc() : memref<32xbf16, 2>
+          %l1_w2 = memref.alloc() : memref<32x16xbf16, 2>
+          %l1_out = memref.alloc() : memref<16xbf16, 2>
+
+          scf.for %j0 = %h0 to %h_hidden step %h_out_tile {
+            scf.for %j = %h0 to %h_out_tile step %h1 {
+              memref.store %zero_inner, %l1_out[%j] : memref<16xbf16, 2>
+            }
+            scf.for %ff = %h0 to %h_ffn step %h_reduction_tile {
+              air.dma_memcpy_nd (%l1_hidden[%h0] [%h_reduction_tile] [%h1],
+                                 %herd_hidden[%herd_tok, %ff] [%h1, %h_reduction_tile] [%h_ffn, %h1])
+                  : (memref<32xbf16, 2>,
+                     memref<4x32xbf16, 1>)
+              air.dma_memcpy_nd (%l1_w2[%h0, %h0] [%h_reduction_tile, %h_out_tile] [%h_out_tile, %h1],
+                                 %herd_w2[%ff, %j0] [%h_reduction_tile, %h_out_tile] [%h_hidden, %h1])
+                  : (memref<32x16xbf16, 2>,
+                     memref<32x16xbf16>)
+              scf.for %j = %h0 to %h_out_tile step %h1 {
+                %acc_init = memref.load %l1_out[%j] : memref<16xbf16, 2>
+                %final = scf.for %k = %h0 to %h_reduction_tile step %h1 iter_args(%cur = %acc_init) -> (bf16) {
+                  %in_val = memref.load %l1_hidden[%k] : memref<32xbf16, 2>
+                  %w_val = memref.load %l1_w2[%k, %j] : memref<32x16xbf16, 2>
+                  %prod = arith.mulf %in_val, %w_val : bf16
+                  %next = arith.addf %cur, %prod : bf16
+                  scf.yield %next : bf16
+                }
+                memref.store %final, %l1_out[%j] : memref<16xbf16, 2>
+              }
+            }
+            air.dma_memcpy_nd (%herd_out[%herd_tok, %j0] [%h1, %h_out_tile] [%h_hidden, %h1],
+                               %l1_out[%h0] [%h_out_tile] [%h1])
+                : (memref<4x16xbf16>,
+                   memref<16xbf16, 2>)
+          }
+          air.herd_terminator
+        }
         air.segment_terminator
       }
       air.launch_terminator

@@ -48,7 +48,7 @@ hsa_status_t Runtime::IterateAgents(hsa_agent_t agent, void *data) {
     return status;
   }
 
-  if (device_type == HSA_DEVICE_TYPE_AIE) {
+  if (device_type == kHsaDeviceTypeAie) {
     aie_agents->push_back(agent);
   }
 

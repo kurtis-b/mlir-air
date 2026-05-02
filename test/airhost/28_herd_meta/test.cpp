@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include <cstdio>
+#include <cstdint>
 #include <string>
 
 //#include "air_host.h"

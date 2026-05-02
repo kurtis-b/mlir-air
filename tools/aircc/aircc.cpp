@@ -583,6 +583,33 @@ static LogicalResult copyFile(StringRef src, StringRef dst) {
   return success();
 }
 
+static std::string resolveToolPath(StringRef tool) {
+  SmallString<256> candidate;
+
+  if (auto toolsDir = sys::Process::GetEnv("LLVM_TOOLS_DIR")) {
+    candidate = *toolsDir;
+    sys::path::append(candidate, tool);
+    if (sys::fs::exists(candidate))
+      return candidate.str().str();
+  }
+
+  if (auto installDir = sys::Process::GetEnv("LLVM_INSTALL_DIR")) {
+    candidate = *installDir;
+    sys::path::append(candidate, "bin", tool);
+    if (sys::fs::exists(candidate))
+      return candidate.str().str();
+  }
+
+  SmallString<256> exeDir(sys::fs::getMainExecutable(nullptr, nullptr));
+  sys::path::remove_filename(exeDir);
+  candidate = exeDir;
+  sys::path::append(candidate, tool);
+  if (sys::fs::exists(candidate))
+    return candidate.str().str();
+
+  return tool.str();
+}
+
 /// Run a single pass (wrapped in builtin.module) and save debug IR.
 static LogicalResult runSinglePass(StringRef passStr, ModuleOp moduleOp) {
   MLIRContext *ctx = moduleOp.getContext();
@@ -1338,24 +1365,28 @@ static LogicalResult runAieCompilation() {
                            aieCtrlLlvm.str().str(), "-o", llvmIr.str().str()})))
       return failure();
 
+    const std::string optTool = resolveToolPath("opt");
+    const std::string llvmDisTool = resolveToolPath("llvm-dis");
+    const std::string llcTool = resolveToolPath("llc");
+
     // Optimize LLVM IR
     SmallString<256> optBc(tmpDir);
     sys::path::append(optBc, airMlirFilename.str() + ".opt.bc");
     if (failed(runCommand(
-            {"opt", "-O3", llvmIr.str().str(), "-o", optBc.str().str()})))
+            {optTool, "-O3", llvmIr.str().str(), "-o", optBc.str().str()})))
       return failure();
 
     SmallString<256> optIr(tmpDir);
     sys::path::append(optIr, airMlirFilename.str() + ".opt.ll");
     if (failed(runCommand(
-            {"llvm-dis", optBc.str().str(), "-o", optIr.str().str()})))
+            {llvmDisTool, optBc.str().str(), "-o", optIr.str().str()})))
       return failure();
 
     // Compile to object file
     SmallString<256> objFile(tmpDir);
     sys::path::append(objFile, airMlirFilename.str() + ".o");
 
-    std::vector<std::string> llcCmd = {"llc", "-O3", "--filetype=obj",
+    std::vector<std::string> llcCmd = {llcTool, "-O3", "--filetype=obj",
                                        "--relocation-model=pic"};
     if (!hostTarget.empty()) {
       StringRef ht = hostTarget.getValue();
@@ -1602,7 +1633,8 @@ static LogicalResult runAieCompilation() {
       if (failed(runCommand(linkCmd)))
         return failure();
     } else {
-      std::vector<std::string> arCmd = {"llvm-ar", "rc", libFile.str().str()};
+      std::vector<std::string> arCmd = {
+          resolveToolPath("llvm-ar"), "rc", libFile.str().str()};
       for (const auto &obj : allObjFiles)
         arCmd.push_back(obj);
       if (failed(runCommand(arCmd)))
