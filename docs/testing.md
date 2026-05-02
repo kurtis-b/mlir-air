@@ -11,15 +11,25 @@ $ ninja check-air
 
 ## Lint And Format
 
-Before sending a branch for review, run the repository format checks against files changed from the branch base:
+Install the root pre-commit hooks if you want local staged-file hygiene:
 
 ```
+$ sandbox/bin/python3 -m pip install -r utils/requirements_dev.txt
+$ sandbox/bin/pre-commit install
+```
+
+Before sending a branch for review, run the repository hygiene checks against files changed from the branch base:
+
+```
+$ sandbox/bin/pre-commit run --from-ref upstream/main --to-ref HEAD
 $ git clang-format --diff upstream/main
 $ git diff --name-only upstream/main -- '*.py'
-$ /home/cj/mlir-air/sandbox/bin/python3 -m black --check --diff <changed-python-files>
+$ sandbox/bin/python3 -m black --check --diff <changed-python-files>
 ```
 
 To apply formatting, run `git clang-format upstream/main` and rerun Black on the same changed Python file list without `--check --diff`. The existing GitHub static-analysis workflow runs `clang-tidy`; there is no separate local `clang-tidy` gate required for the validation lanes below.
+
+These hooks are convenience checks only. CI and the documented validation lanes below remain authoritative because Git hooks are local and bypassable. Use `SKIP=<hook-id>` only for narrow local skips, not as branch validation.
 
 ## Testing an Install Area
 
@@ -78,7 +88,7 @@ GPU-local checks, when a ROCm/AMDGPU LLVM toolchain is configured:
 
 ```
 $ cd programming_examples/heterogeneous_moe
-$ export LLVM_INSTALL_DIR=/home/cj/mlir-air/llvm/install-amdgpu
+$ export LLVM_INSTALL_DIR="$(git rev-parse --show-toplevel)/llvm/install-amdgpu"
 $ export ROCM_PATH=${ROCM_PATH:-/opt/rocm}
 $ python3 smoke_tests.py --lane gpu-all
 ```
