@@ -82,7 +82,7 @@ $ cd programming_examples/heterogeneous_moe
 $ python3 smoke_tests.py --lane ci
 ```
 
-The MoE coverage target writes reports under `programming_examples/heterogeneous_moe/artifacts/coverage/latest` and remains outside `check-all`.
+The MoE coverage target writes reports under `programming_examples/heterogeneous_moe/artifacts/coverage/latest` and remains outside `check-all`. For MoE setup details, backend prerequisites, hardware gates, result interpretation, and troubleshooting, see the [heterogeneous MoE exploration guide](../programming_examples/heterogeneous_moe/docs/exploration.md).
 
 GPU-local checks, when a ROCm/AMDGPU LLVM toolchain is configured:
 
