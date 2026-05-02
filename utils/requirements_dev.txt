@@ -2,6 +2,7 @@ cmake>=3.30
 pybind11
 nanobind>=2.9
 lit
+pre-commit>=4.0
 # lit requires psutil to set timeouts
 psutil
 pytest

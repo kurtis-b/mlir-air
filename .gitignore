@@ -18,11 +18,11 @@ _x
 vck5000_aie_base_graph_hw.ltx
 vck5000_aie_base_graph_hw.xsa.link_summary
 Work
-build
-build_*
-build-xrt
-install
-install-xrt
+build/
+build_*/
+build-*/
+install/
+install-*/
 platform_repo
 myproj
 sw_comp
@@ -31,7 +31,10 @@ sysroot
 components
 air_project
 __pycache__/
-sandbox
+sandbox/
+my_install/
+llvm/
+/artifacts
 
 # build results
 libadf.a

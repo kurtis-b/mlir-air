@@ -1,0 +1,43 @@
+# Lightweight local hygiene. CI and the documented validation lanes remain authoritative.
+minimum_pre_commit_version: "4.0.0"
+
+exclude: |
+  (?x)^(
+    build/|
+    build-.*/|
+    build_.*/|
+    install/|
+    install-.*/|
+    my_install/|
+    llvm/|
+    sandbox/|
+    artifacts/|
+    programming_examples/heterogeneous_moe/artifacts/
+  )
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+
+  - repo: https://github.com/psf/black-pre-commit-mirror
+    rev: 26.3.1
+    hooks:
+      - id: black
+        language_version: python3.12
+        types_or: [python, pyi]
+
+  - repo: local
+    hooks:
+      - id: git-clang-format
+        name: git clang-format staged diff
+        entry: git clang-format --staged --diff --extensions c,h,cc,cpp,cxx,hpp,hxx,inc,td
+        language: system
+        pass_filenames: false
+        files: \.(c|h|cc|cpp|cxx|hpp|hxx|inc|td)$
