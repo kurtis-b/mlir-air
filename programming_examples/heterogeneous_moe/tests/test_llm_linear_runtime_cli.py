@@ -10,7 +10,9 @@ import pytest
 import compile_llm_linear
 import run_llm_linear_suite
 from llm_linear.manifest import load_json
-from llm_linear.reference import random_inputs
+from llm_linear.direct_bridge import DirectBridgeRunResult
+from numerics import decode_npu_array, encode_npu_array
+from llm_linear.reference import decode_gemv, prefill_gemm, random_inputs
 from llm_linear.results import (
     benchmark_runtime,
     build_case_result,
@@ -91,6 +93,81 @@ def test_linear_direct_transfer_fails_closed(moe_dir: Path, tmp_path: Path) -> N
         inputs = random_inputs(runtime.cfg, seed=manifest["inputs"]["seed"])
         with pytest.raises(DirectTransferUnsupported, match="GPU/NPU"):
             runtime.run(inputs)
+
+
+def test_linear_direct_runtime_records_native_handoff(
+    monkeypatch, moe_dir: Path, tmp_path: Path
+) -> None:
+    manifest = _tiny_cpu_manifest(moe_dir, tmp_path)
+    manifest["runtime"]["stage_backends"] = {"prefill": "gpu", "decode": "npu"}
+    manifest["runtime"]["transfer_mode"] = "direct"
+    manifest["artifacts"] = {
+        "prefill": {"gpu_direct": {"so": "prefill.so"}},
+        "decode": {"npu": {"xclbin": "decode.xclbin", "insts": "decode.insts.bin"}},
+    }
+
+    class FakeStatus:
+        available = True
+        library_path = "fake_bridge.so"
+        diagnostic = "ok"
+
+    class FakeBridge:
+        library_path = Path("fake_bridge.so")
+
+        def __init__(self, library_path=None):
+            pass
+
+        def run(
+            self,
+            *,
+            direction,
+            dtype,
+            shape,
+            input_buffer,
+            prefill_weights,
+            decode_weights,
+            output_buffer,
+            prefill_output_buffer,
+            decode_input_buffer,
+            artifacts,
+        ):
+            assert direction == "gpu_prefill_npu_decode"
+            x = decode_npu_array(input_buffer, dtype)
+            wp = decode_npu_array(prefill_weights, dtype)
+            wd = decode_npu_array(decode_weights, dtype)
+            prefill = prefill_gemm(x, wp, dtype)
+            decode_input = prefill[-1, :]
+            output = decode_gemv(decode_input, wd, dtype)
+            prefill_output_buffer[...] = encode_npu_array(prefill, dtype)
+            decode_input_buffer[...] = encode_npu_array(decode_input, dtype)
+            output_buffer[...] = encode_npu_array(output, dtype)
+            return DirectBridgeRunResult(
+                prefill_ms=1.0,
+                decode_ms=2.0,
+                handoff_us=0.0,
+                direct_bytes=int(prefill_output_buffer.nbytes),
+                subview_offset_bytes=int((shape[0] - 1) * shape[2] * 2),
+                mechanism="xrt_bo_export_import_hip_vmem_fd:test",
+                bo_flag=0,
+                import_method=2,
+                sync_events=[
+                    {"event": "hipDeviceSynchronize"},
+                    {"event": "xrtRunWait"},
+                ],
+                diagnostic="ok",
+            )
+
+    import llm_linear.runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "probe_direct_bridge", lambda: FakeStatus())
+    monkeypatch.setattr(runtime_module, "DirectBridge", FakeBridge)
+    with LinearRuntime(manifest) as runtime:
+        inputs = random_inputs(runtime.cfg, seed=manifest["inputs"]["seed"])
+        result = runtime.run(inputs, validate=True)
+    assert result["numpy_validation"]["status"] == "pass"
+    assert result["transfer_summary"]["device_resident_buffers"] is True
+    assert result["transfer_summary"]["direct_handoff"]["supported"] is True
+    assert result["transfer_events"][0]["numpy_host_materializations"] == 0
 
 
 def test_linear_direct_handoff_summary_schema() -> None:

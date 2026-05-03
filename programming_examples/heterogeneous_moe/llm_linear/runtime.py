@@ -20,7 +20,7 @@ from numerics import (
 from trace import TraceRecorder, summarize_device_events
 
 from .compile import ENTRYPOINTS, compile_gpu, compile_npu, resolve_air_sources
-from .direct_bridge import probe_direct_bridge
+from .direct_bridge import DirectBridge, DirectBridgeArtifacts, probe_direct_bridge
 from .manifest import artifact_root
 from .quantization import PackedLinearWeights, decode_gemv_fused_dequant
 from .reference import (
@@ -36,7 +36,11 @@ from .reference import (
     workload_bytes,
 )
 from .schema import validate_manifest
-from .transfer import DirectTransferUnsupported, LinearTransferManager
+from .transfer import (
+    DeviceResidentTensor,
+    DirectTransferUnsupported,
+    LinearTransferManager,
+)
 
 
 class CpuLinearExecutor:
@@ -190,6 +194,7 @@ class LinearRuntime:
         self.transfer = LinearTransferManager(manifest["runtime"]["transfer_mode"])
         self.artifact_root = artifact_root(manifest)
         self._sources: dict[str, dict[str, Path]] = {}
+        self._direct_bridge: DirectBridge | None = None
         self.executors = self._make_executors()
 
     def __enter__(self) -> "LinearRuntime":
@@ -243,12 +248,14 @@ class LinearRuntime:
     def prepare(self) -> None:
         if self.transfer.mode == "direct":
             self._require_direct_runtime()
+            self._ensure_direct_artifacts()
+            return
         for executor in (self.executors.prefill, self.executors.decode):
             prepare = getattr(executor, "prepare", None)
             if prepare:
                 prepare()
 
-    def _require_direct_runtime(self) -> None:
+    def _require_direct_runtime(self) -> DirectBridge:
         stages = self.manifest["runtime"]["stage_backends"]
         producer = stages["prefill"]
         consumer = stages["decode"]
@@ -260,10 +267,57 @@ class LinearRuntime:
                 f"handoff for {producer}->{consumer}, but the native bridge is "
                 f"not available: {status.diagnostic}"
             )
-        raise DirectTransferUnsupported(
-            "transfer_mode=direct found a native bridge probe, but the "
-            "llm_linear direct executor is not enabled yet; refusing to fall "
-            "back to host staging"
+        if self._direct_bridge is None:
+            try:
+                self._direct_bridge = DirectBridge(status.library_path)
+            except RuntimeError as exc:
+                raise DirectTransferUnsupported(str(exc)) from exc
+        return self._direct_bridge
+
+    def _ensure_direct_artifacts(self) -> None:
+        stages = self.manifest["runtime"]["stage_backends"]
+        artifacts = self.manifest.setdefault("artifacts", {})
+        compiler_cfg = self.manifest["compiler"]
+        if stages["prefill"] == "gpu" or stages["decode"] == "gpu":
+            gpu_sources = self._sources_for("gpu")
+            direct_dir = self.artifact_root / "gpu_direct"
+            for kind in ("prefill", "decode"):
+                if stages[kind] != "gpu":
+                    continue
+                artifact_entry = artifacts.setdefault(kind, {})
+                if "gpu_direct" not in artifact_entry:
+                    artifact_entry["gpu_direct"] = compile_gpu(
+                        gpu_sources[kind],
+                        direct_dir,
+                        compiler_cfg["gpu_arch"],
+                        ENTRYPOINTS[kind],
+                        host_staging=False,
+                    )
+        if stages["prefill"] == "npu" or stages["decode"] == "npu":
+            npu_sources = self._sources_for("npu")
+            npu_dir = self.artifact_root / "npu"
+            for kind in ("prefill", "decode"):
+                if stages[kind] != "npu":
+                    continue
+                artifact_entry = artifacts.setdefault(kind, {})
+                if "npu" not in artifact_entry:
+                    artifact_entry["npu"] = compile_npu(
+                        npu_sources[kind], npu_dir, compiler_cfg["npu_device"]
+                    )
+
+    def _direct_artifacts(self) -> DirectBridgeArtifacts:
+        artifacts = self.manifest.get("artifacts", {})
+        prefill_gpu = artifacts.get("prefill", {}).get("gpu_direct", {})
+        decode_gpu = artifacts.get("decode", {}).get("gpu_direct", {})
+        prefill_npu = artifacts.get("prefill", {}).get("npu", {})
+        decode_npu = artifacts.get("decode", {}).get("npu", {})
+        return DirectBridgeArtifacts(
+            gpu_prefill_so=prefill_gpu.get("so"),
+            gpu_decode_so=decode_gpu.get("so"),
+            npu_prefill_xclbin=prefill_npu.get("xclbin"),
+            npu_prefill_insts=prefill_npu.get("insts"),
+            npu_decode_xclbin=decode_npu.get("xclbin"),
+            npu_decode_insts=decode_npu.get("insts"),
         )
 
     def _npu_stage_executed(self) -> bool:
@@ -340,6 +394,193 @@ class LinearRuntime:
                 output = executor.run(*arrays)
         return output, (time.perf_counter_ns() - start_ns) / 1_000_000.0
 
+    def _run_direct(
+        self,
+        inputs: np.ndarray,
+        *,
+        validate: bool,
+        capture_details: bool,
+        trace: TraceRecorder | None,
+        e2e_start_ns: int,
+    ) -> dict[str, Any]:
+        bridge = self._require_direct_runtime()
+        self._ensure_direct_artifacts()
+        stages = self.manifest["runtime"]["stage_backends"]
+        direction = (
+            "gpu_prefill_npu_decode"
+            if stages["prefill"] == "gpu"
+            else "npu_prefill_gpu_decode"
+        )
+        input_encoded = encode_npu_array(inputs, self.cfg.dtype)
+        prefill_weights_encoded = encode_npu_array(self.weights.prefill, self.cfg.dtype)
+        decode_weights_encoded = encode_npu_array(self.weights.decode, self.cfg.dtype)
+        output_encoded = np.zeros((self.cfg.N,), dtype=npu_buffer_dtype(self.cfg.dtype))
+        prefill_encoded = (
+            np.zeros((self.cfg.M, self.cfg.H), dtype=npu_buffer_dtype(self.cfg.dtype))
+            if capture_details
+            else None
+        )
+        decode_input_encoded = (
+            np.zeros((self.cfg.H,), dtype=npu_buffer_dtype(self.cfg.dtype))
+            if capture_details
+            else None
+        )
+
+        def invoke_bridge() -> Any:
+            return bridge.run(
+                direction=direction,
+                dtype=self.cfg.dtype,
+                shape=(self.cfg.M, self.cfg.K, self.cfg.H, self.cfg.N),
+                input_buffer=input_encoded,
+                prefill_weights=prefill_weights_encoded,
+                decode_weights=decode_weights_encoded,
+                output_buffer=output_encoded,
+                prefill_output_buffer=prefill_encoded,
+                decode_input_buffer=decode_input_encoded,
+                artifacts=self._direct_artifacts(),
+            )
+
+        try:
+            if trace is None:
+                bridge_result = invoke_bridge()
+            else:
+                with trace.span(
+                    "direct_gpu_npu_linear",
+                    "stage",
+                    "direct_gpu_npu_linear",
+                    {
+                        "prefill_backend": stages["prefill"],
+                        "decode_backend": stages["decode"],
+                        "transfer_mode": "direct",
+                    },
+                ):
+                    bridge_result = invoke_bridge()
+        except RuntimeError as exc:
+            raise DirectTransferUnsupported(str(exc)) from exc
+
+        output_cpu = decode_npu_array(output_encoded, self.cfg.dtype)
+        timing_ms = {
+            "prefill": float(bridge_result.prefill_ms),
+            "decode": float(bridge_result.decode_ms),
+            "end_to_end": (time.perf_counter_ns() - e2e_start_ns) / 1_000_000.0,
+        }
+
+        if prefill_encoded is not None:
+            prefill_host = decode_npu_array(prefill_encoded, self.cfg.dtype)
+            assert decode_input_encoded is not None
+            decode_input = decode_npu_array(decode_input_encoded, self.cfg.dtype)
+        else:
+            prefill_host = np.empty((self.cfg.M, self.cfg.H), dtype=inputs.dtype)
+            decode_input = np.empty((self.cfg.H,), dtype=inputs.dtype)
+
+        self.transfer.record_direct_handoff(
+            producer=stages["prefill"],
+            consumer=stages["decode"],
+            tensor=DeviceResidentTensor(
+                owner="llm_linear_native_bridge",
+                backend=stages["prefill"],
+                dtype=str(input_encoded.dtype),
+                shape=(self.cfg.M, self.cfg.H),
+                strides=(self.cfg.H, 1),
+                byte_size=int(bridge_result.direct_bytes),
+                offset=int(bridge_result.subview_offset_bytes),
+                exported_handle_type="xrt_bo_export_fd",
+                sync_state="producer_complete_consumer_waited",
+                trace_id="prefill_to_decode",
+            ),
+            elapsed_us=float(bridge_result.handoff_us),
+            label="prefill_to_decode",
+            mechanism=bridge_result.mechanism,
+            sync_events=bridge_result.sync_events,
+            numpy_host_materializations=0,
+        )
+
+        if not capture_details:
+            return {
+                "prefill": prefill_host,
+                "decode_input": decode_input,
+                "output": output_cpu,
+                "timing_ms": timing_ms,
+            }
+
+        actual_bundle = {
+            "prefill": prefill_host,
+            "decode_input": decode_input,
+            "output": output_cpu,
+        }
+        reference = run_reference(self.cfg, inputs, self.weights)
+        if validate:
+            per_stage_metrics = stage_metrics(actual_bundle, reference, self.cfg.dtype)
+            validation_status = (
+                "pass"
+                if all(
+                    bool(metrics["allclose"]) for metrics in per_stage_metrics.values()
+                )
+                else "fail"
+            )
+        else:
+            per_stage_metrics = {}
+            validation_status = "skipped"
+
+        assert trace is not None
+        transfer_summary = self.transfer.summary()
+        return {
+            "prefill": prefill_host,
+            "decode_input": decode_input,
+            "output": output_cpu,
+            "reference": reference["output"],
+            "workload": {
+                "shape": {
+                    "M": self.cfg.M,
+                    "K": self.cfg.K,
+                    "H": self.cfg.H,
+                    "N": self.cfg.N,
+                    "dtype": self.cfg.dtype,
+                    "shape_tier": self.cfg.shape_tier,
+                },
+                "operation": "prefill_gemm_then_decode_gemv",
+                "bytes": workload_bytes(self.cfg),
+                "decode_weight_quantization": self._quantization_report(),
+                "input_scale": self.input_scale,
+                "weight_scale": self.weight_scale,
+            },
+            "timing_ms": timing_ms,
+            "stage_metrics": per_stage_metrics,
+            "numpy_validation": {
+                "ran": bool(validate),
+                "ok": validation_status == "pass",
+                "status": validation_status,
+            },
+            "trace": trace,
+            "trace_summary": trace.summary(),
+            "transfer_events": self.transfer.snapshot(),
+            "transfer_summary": transfer_summary,
+            "quantized_decode": {
+                "enabled": self.weights.decode_quantized is not None,
+                "detail": None,
+                "metadata": (
+                    None
+                    if self.weights.decode_quantized is None
+                    else self.weights.decode_quantized.descriptor()
+                ),
+            },
+            "device_events": summarize_device_events(trace),
+            "direct_bridge": {
+                "library_path": (
+                    None if bridge.library_path is None else str(bridge.library_path)
+                ),
+                "mechanism": bridge_result.mechanism,
+                "bo_flag": bridge_result.bo_flag,
+                "import_method": bridge_result.import_method,
+                "subview_offset_bytes": bridge_result.subview_offset_bytes,
+                "diagnostic": bridge_result.diagnostic,
+            },
+            "npu_development": self._npu_development_report(
+                inputs, reference, executed=self._npu_stage_executed()
+            ),
+            "limitations": linear_limitations(self.manifest, transfer_summary),
+        }
+
     def run(
         self,
         inputs: np.ndarray,
@@ -352,7 +593,13 @@ class LinearRuntime:
         trace = TraceRecorder() if capture_details else None
         e2e_start_ns = time.perf_counter_ns()
         if self.transfer.mode == "direct":
-            self._require_direct_runtime()
+            return self._run_direct(
+                inputs,
+                validate=validate,
+                capture_details=capture_details,
+                trace=trace,
+                e2e_start_ns=e2e_start_ns,
+            )
 
         x_arg = self.transfer.transfer(
             "cpu", stages["prefill"], inputs, trace, "input_to_prefill"

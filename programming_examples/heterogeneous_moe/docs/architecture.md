@@ -56,12 +56,14 @@ execution roadmap. It keeps the MoE harness archived as a reference and models:
 
 - prefill GEMM: `X[M,K] @ Wp[K,H] -> P[M,H]`
 - decode GEMV: `P[M-1,:] @ Wd[H,N] -> Y[N]`
-- CPU, GPU, NPU, host-staged mixed, and fail-closed direct mixed placements
+- CPU, GPU, NPU, host-staged mixed, and hardware-gated direct mixed placements
 
 The direct mixed cases use `transfer_mode=direct` and the
 `DeviceResidentTensor` result contract. They must not claim success unless a
 native bridge records an audited GPU/NPU edge with zero NumPy host
-materializations. Without that bridge, direct cases fail before host fallback.
+materializations. The checked-in bridge builds a C++ XRT/HIP path around
+XRT-owned BOs exported to HIP VMem mappings; if the platform probe cannot import
+those handles, direct cases fail before host fallback.
 
 Decode weights can be generated as packed `int4` or `uint4` storage for the
 CPU-safe fused-dequant GEMV path. Result JSON/CSV/report files separate decode
@@ -215,9 +217,11 @@ The most important interpretation details are:
 ## Known Limitations
 
 - Router top-k selection is CPU-side.
-- Direct iGPU-to-NPU peer transfer is unsupported.
+- Direct iGPU-to-NPU peer transfer is hardware-gated by the LLM-linear native
+  bridge probe.
 - Transfer accounting is host-visible and does not prove device-resident overlap.
-- LLM-linear direct cases are fail-closed until the native GPU/NPU bridge executor is enabled and hardware-verified.
+- LLM-linear direct cases are fail-closed unless the native GPU/NPU bridge probe
+  succeeds and hardware verification records an audited direct edge.
 - The harness models MoE routing and expert compute, not a full transformer.
 - Bias terms are omitted to keep the current runtime ABI small.
 - Quantized model presets execute bf16 math after dequantized weight loading.

@@ -315,6 +315,7 @@ def build_case_result(
         "quantized_decode": last_run.get("quantized_decode", {"enabled": False}),
         "trace_summary": last_run["trace_summary"],
         "device_events": last_run["device_events"],
+        "direct_bridge": last_run.get("direct_bridge"),
         "npu_development": last_run["npu_development"],
         "execution_truth": {
             "npu_executed": bool(last_run["npu_development"]["executed"]),

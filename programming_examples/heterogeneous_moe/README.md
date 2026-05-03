@@ -64,7 +64,7 @@ GPU commands need `LLVM_INSTALL_DIR`, `ROCM_PATH`, and `AIR_OPT_PATH` or matchin
 - `run_matrix.py`: matrix runner that writes per-case outputs plus aggregate JSON/CSV.
 - `run_workload_suite.py`: shape, routing, and model-preset workload suites.
 - `edge_study.py`: canonical edge-efficiency wrapper over workload suites.
-- `llm_linear/`: LLM-linear GEMM/GEMV benchmark for the Ryzen heterogeneous roadmap, including host-staged baselines, fail-closed direct handoff cases, int4/uint4 decode-weight packing, and crossover report plumbing.
+- `llm_linear/`: LLM-linear GEMM/GEMV benchmark for the Ryzen heterogeneous roadmap, including host-staged baselines, hardware-gated native direct handoff plumbing, int4/uint4 decode-weight packing, and crossover report plumbing.
 
 ## Deeper Docs
 

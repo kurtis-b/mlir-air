@@ -217,9 +217,9 @@ Acceptance:
 
 ### Milestone 2: Direct Bidirectional GPU/NPU Handoff
 
-Status as of May 3, 2026: partially implemented in `llm_linear` as a
-fail-closed interface and auditable result schema, but not accepted as a working
-direct handoff path.
+Status as of May 3, 2026: implemented through the AIR generator, runtime, and
+native bridge boundary, but not accepted as a working direct handoff path on the
+current machine because the low-level XRT/HIP import probe fails closed.
 
 Implemented scope:
 
@@ -234,26 +234,39 @@ Implemented scope:
   native bridge records such an edge.
 - GPU artifact compilation has a device-resident option that omits
   `air-gpu-host-staging` for future direct executor work.
+- LLM-linear AIR generation now stages L3 operands through DMA-visible L2/L1
+  buffers before herd access, removing the `air-to-rocdl`/GPU outlining blocker
+  caused by direct L3 `memref.load` operations inside herds.
+- `llm_linear/native/direct_bridge.cpp` provides a C ABI for XRT-owned BO
+  allocation/export, HIP VMem fd import, no-host-staging GPU shared-library
+  invocation, XRT kernel launch, synchronization reporting, and both
+  `gpu_prefill_npu_decode` and `npu_prefill_gpu_decode` directions.
+- `llm_linear/runtime.py` now calls the native bridge when
+  `transfer_mode=direct` is requested and the bridge probe succeeds. It records
+  the direct edge with zero NumPy host materializations and keeps host-staged
+  mixed execution as the baseline.
 
-Remaining blocker:
+Current hardware blocker:
 
-- The native runtime executor that actually imports/exports HIP VMem and XRT BO
-  handles and launches GPU/NPU kernels across that shared allocation is still
-  not enabled. Direct mode therefore remains fail-closed unless that executor is
-  completed and verified on hardware.
+- On the local Ryzen AI/XRT/HIP stack, the native probe isolates each candidate
+  XRT BO flag in a child process and reports that `p2p`, `device_only`,
+  `carveout`, and `normal` BO export handles all abort during HIP VMem fd
+  import. Direct mode therefore remains fail-closed on this machine until the
+  XRT/HIP interop layer can import one of those BO types without crashing.
 
 Goal: make the mixed path device-resident. This milestone is required before the
 roadmap can be considered finished.
 
 Checklist:
 
-- Design a future device-resident tensor interface for AIR runtime use.
-- Implement or prototype a C++/runtime bridge that can export/import the needed
-  GPU and NPU allocations or otherwise prove device-resident sharing.
-- Support both GPU-to-NPU and NPU-to-GPU edges.
-- Add explicit synchronization/fence ownership for each handoff.
-- Add trace and result fields that prove no NumPy host array is in the direct
-  handoff path.
+- Keep the checked-in `DeviceResidentTensor` interface as the AIR runtime
+  contract for direct mixed LLM-linear cases.
+- Use the checked-in C++ bridge as the implementation point for XRT BO export,
+  HIP VMem import, GPU direct shared-library calls, and XRT kernel launches.
+- Keep both GPU-to-NPU and NPU-to-GPU directions wired through the bridge.
+- Preserve explicit synchronization reporting for each handoff.
+- Preserve trace and result fields that prove no NumPy host array is in the
+  direct handoff path.
 - Keep the host-staged mixed path as a baseline and regression control.
 
 Acceptance:
@@ -369,6 +382,11 @@ For the current checked-in implementation:
 
 For direct-handoff acceptance:
 
+- The native bridge must build:
+  `llm_linear/native/build_direct_bridge.sh /tmp/libllm_linear_direct_bridge.so`.
+- `LLM_LINEAR_DIRECT_BRIDGE_SO=/tmp/libllm_linear_direct_bridge.so` must report a
+  successful `probe_direct_bridge()` on the target machine before direct cases
+  are run.
 - Correctness must pass against a CPU reference.
 - Host-staged and direct-handoff paths must be timed separately.
 - GPU-to-NPU and NPU-to-GPU handoff proof must be present in result artifacts.

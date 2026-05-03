@@ -206,10 +206,6 @@ def main(argv: list[str] | None = None) -> int:
                 "direct GPU/NPU cases require a native bridge before compilation: "
                 f"{status.diagnostic}"
             )
-        raise SystemExit(
-            "direct GPU/NPU native bridge probe succeeded, but the llm_linear "
-            "direct executor is not enabled yet"
-        )
 
     output_dir = resolve_package_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
