@@ -31,8 +31,9 @@ def suite_summary_markdown(summary: dict[str, Any], title: str) -> str:
             if quantized.get("enabled"):
                 metadata = quantized.get("metadata") or {}
                 detail = quantized.get("detail") or {}
+                fused = "hw" if quantized.get("hardware_fused") else "cpu"
                 quant = (
-                    f"{metadata.get('quant_kind')} "
+                    f"{quantized.get('quant_kind') or metadata.get('quant_kind')}:{fused} "
                     f"deq={detail.get('dequant_ms', 0.0):.6f}ms"
                 )
             lines.append(

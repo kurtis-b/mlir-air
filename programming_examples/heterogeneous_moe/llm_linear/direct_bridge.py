@@ -255,6 +255,7 @@ class DirectBridgeArtifacts:
     npu_prefill_insts: str | None = None
     npu_decode_xclbin: str | None = None
     npu_decode_insts: str | None = None
+    npu_decode_tile_n: int | None = None
     npu_kernel_name: str = "MLIR_AIE"
 
 
@@ -287,14 +288,22 @@ class _NativeRunConfig(ctypes.Structure):
         ("abi_version", ctypes.c_uint32),
         ("direction", ctypes.c_uint32),
         ("dtype", ctypes.c_uint32),
+        ("decode_storage", ctypes.c_uint32),
+        ("decode_block_size", ctypes.c_uint32),
+        ("decode_quant_axis", ctypes.c_uint32),
         ("reserved", ctypes.c_uint32),
+        ("decode_tile_n", ctypes.c_uint32),
         ("m", ctypes.c_uint64),
         ("k", ctypes.c_uint64),
         ("h", ctypes.c_uint64),
         ("n", ctypes.c_uint64),
+        ("decode_packed_bytes", ctypes.c_uint64),
+        ("decode_scale_bytes", ctypes.c_uint64),
         ("input", ctypes.c_void_p),
         ("prefill_weights", ctypes.c_void_p),
         ("decode_weights", ctypes.c_void_p),
+        ("decode_packed_weights", ctypes.c_void_p),
+        ("decode_scales", ctypes.c_void_p),
         ("output", ctypes.c_void_p),
         ("prefill_output", ctypes.c_void_p),
         ("decode_input", ctypes.c_void_p),
@@ -330,13 +339,20 @@ class _NativeGpuStageRunConfig(ctypes.Structure):
         ("abi_version", ctypes.c_uint32),
         ("stage", ctypes.c_uint32),
         ("dtype", ctypes.c_uint32),
+        ("decode_storage", ctypes.c_uint32),
+        ("decode_block_size", ctypes.c_uint32),
+        ("decode_quant_axis", ctypes.c_uint32),
         ("reserved", ctypes.c_uint32),
+        ("reserved1", ctypes.c_uint32),
         ("m", ctypes.c_uint64),
         ("k", ctypes.c_uint64),
         ("h", ctypes.c_uint64),
         ("n", ctypes.c_uint64),
+        ("decode_packed_bytes", ctypes.c_uint64),
+        ("decode_scale_bytes", ctypes.c_uint64),
         ("input", ctypes.c_void_p),
         ("weights", ctypes.c_void_p),
+        ("scales", ctypes.c_void_p),
         ("output", ctypes.c_void_p),
         ("gpu_so", ctypes.c_char_p),
     ]
@@ -353,13 +369,15 @@ class _NativeGpuStageRunResult(ctypes.Structure):
     ]
 
 
-ABI_VERSION = 1
+ABI_VERSION = 2
 GPU_PREFILL_NPU_DECODE = 0
 NPU_PREFILL_GPU_DECODE = 1
 GPU_STAGE_PREFILL = 0
 GPU_STAGE_DECODE = 1
 DTYPE_BF16 = 0
 DTYPE_F16 = 1
+DECODE_STORAGE_DENSE = 0
+DECODE_STORAGE_INT4 = 1
 
 _LOADED_LIBRARIES: dict[str, ctypes.CDLL] = {}
 
@@ -542,30 +560,48 @@ class DirectBridge:
         input_buffer: Any,
         prefill_weights: Any,
         decode_weights: Any,
+        decode_packed_weights: Any | None = None,
+        decode_scales: Any | None = None,
         output_buffer: Any,
         prefill_output_buffer: Any | None,
         decode_input_buffer: Any | None,
         artifacts: DirectBridgeArtifacts,
+        decode_storage: str = "dense",
+        decode_block_size: int = 0,
+        decode_quant_axis: int = 0,
     ) -> DirectBridgeRunResult:
         native_direction = {
             "gpu_prefill_npu_decode": GPU_PREFILL_NPU_DECODE,
             "npu_prefill_gpu_decode": NPU_PREFILL_GPU_DECODE,
         }[direction]
         native_dtype = {"bf16": DTYPE_BF16, "f16": DTYPE_F16}[dtype]
+        native_decode_storage = {
+            "bf16": DECODE_STORAGE_DENSE,
+            "dense": DECODE_STORAGE_DENSE,
+            "int4": DECODE_STORAGE_INT4,
+        }[decode_storage]
         m, k, h, n = [int(dim) for dim in shape]
         result = _NativeRunResult()
         config = _NativeRunConfig(
             abi_version=ABI_VERSION,
             direction=native_direction,
             dtype=native_dtype,
+            decode_storage=native_decode_storage,
+            decode_block_size=int(decode_block_size),
+            decode_quant_axis=int(decode_quant_axis),
             reserved=0,
+            decode_tile_n=int(artifacts.npu_decode_tile_n or n),
             m=m,
             k=k,
             h=h,
             n=n,
+            decode_packed_bytes=_array_nbytes(decode_packed_weights),
+            decode_scale_bytes=_array_nbytes(decode_scales),
             input=_array_ptr(input_buffer),
             prefill_weights=_array_ptr(prefill_weights),
             decode_weights=_array_ptr(decode_weights),
+            decode_packed_weights=_array_ptr(decode_packed_weights),
+            decode_scales=_array_ptr(decode_scales),
             output=_array_ptr(output_buffer),
             prefill_output=_array_ptr(prefill_output_buffer),
             decode_input=_array_ptr(decode_input_buffer),
@@ -605,8 +641,12 @@ class DirectBridge:
         shape: tuple[int, int, int, int],
         input_buffer: Any,
         weights: Any,
+        scales: Any | None = None,
         output_buffer: Any,
         gpu_so: str,
+        decode_storage: str = "dense",
+        decode_block_size: int = 0,
+        decode_quant_axis: int = 0,
     ) -> GpuStageRunResult:
         if self._gpu_stage_run is None:
             raise RuntimeError(
@@ -618,19 +658,31 @@ class DirectBridge:
             "decode": GPU_STAGE_DECODE,
         }[stage]
         native_dtype = {"bf16": DTYPE_BF16, "f16": DTYPE_F16}[dtype]
+        native_decode_storage = {
+            "bf16": DECODE_STORAGE_DENSE,
+            "dense": DECODE_STORAGE_DENSE,
+            "int4": DECODE_STORAGE_INT4,
+        }[decode_storage]
         m, k, h, n = [int(dim) for dim in shape]
         result = _NativeGpuStageRunResult()
         config = _NativeGpuStageRunConfig(
             abi_version=ABI_VERSION,
             stage=native_stage,
             dtype=native_dtype,
+            decode_storage=native_decode_storage,
+            decode_block_size=int(decode_block_size),
+            decode_quant_axis=int(decode_quant_axis),
             reserved=0,
+            reserved1=0,
             m=m,
             k=k,
             h=h,
             n=n,
+            decode_packed_bytes=_array_nbytes(weights),
+            decode_scale_bytes=_array_nbytes(scales),
             input=_array_ptr(input_buffer),
             weights=_array_ptr(weights),
+            scales=_array_ptr(scales),
             output=_array_ptr(output_buffer),
             gpu_so=_cstr(gpu_so),
         )
@@ -655,6 +707,12 @@ def _array_ptr(array: Any | None) -> int | None:
     if array is None:
         return None
     return int(array.ctypes.data)
+
+
+def _array_nbytes(array: Any | None) -> int:
+    if array is None:
+        return 0
+    return int(array.nbytes)
 
 
 def _cstr(value: str | None) -> bytes | None:

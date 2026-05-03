@@ -145,9 +145,19 @@ def _required_artifact_stage_backends(
 
 def _artifact_cache_key(
     manifest: dict[str, Any], stage_backends: dict[str, set[str]]
-) -> tuple[str, tuple[tuple[str, tuple[str, ...]], ...]]:
+) -> tuple[str, str, tuple[tuple[str, tuple[str, ...]], ...]]:
+    decode = manifest.get("weights", {}).get("decode", {})
+    decode_key = (
+        str(decode.get("storage", "bf16")) if isinstance(decode, dict) else "bf16"
+    )
+    if isinstance(decode, dict) and decode_key in {"int4", "uint4"}:
+        decode_key += (
+            f":b{int(decode.get('block_size', 32))}"
+            f":axis{int(decode.get('quant_axis', 0))}"
+        )
     return (
         manifest["paths"]["artifacts"],
+        decode_key,
         tuple(
             (stage, tuple(sorted(backends)))
             for stage, backends in sorted(stage_backends.items())
@@ -337,7 +347,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     csv_rows: list[dict[str, Any]] = []
     artifact_cache: dict[
-        tuple[str, tuple[tuple[str, tuple[str, ...]], ...]], dict[str, Any]
+        tuple[str, str, tuple[tuple[str, tuple[str, ...]], ...]], dict[str, Any]
     ] = {}
     command_line = (
         [sys.executable, *sys.argv]

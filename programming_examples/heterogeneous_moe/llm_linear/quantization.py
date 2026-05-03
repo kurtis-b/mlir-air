@@ -39,6 +39,7 @@ class PackedLinearWeights:
             "packing": self.metadata.packing,
             "packed_bytes": int(self.packed.nbytes),
             "scale_shape": [int(dim) for dim in self.scales.shape],
+            "scale_bytes": int(self.scales.nbytes),
             "zero_point_shape": (
                 None
                 if self.zero_points is None

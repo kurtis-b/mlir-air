@@ -20,7 +20,15 @@ from numerics import (
 )
 from trace import TraceRecorder, summarize_device_events
 
-from .compile import ENTRYPOINTS, compile_gpu, compile_npu, resolve_air_sources
+from .compile import (
+    ENTRYPOINTS,
+    compile_npu_stage,
+    compile_gpu,
+    decode_kernel_key,
+    decode_quantization_config,
+    resolve_air_sources,
+    validate_accelerator_decode_quantization,
+)
 from .direct_bridge import (
     DirectBridge,
     DirectBridgeArtifacts,
@@ -85,14 +93,18 @@ class GpuLinearExecutor:
         artifact_root_path: Path,
         arch: str,
         dtype_name: str,
+        decode_quantized: PackedLinearWeights | None = None,
+        kernel_key: str | None = None,
     ) -> None:
         self.kind = kind
+        self.kernel_key = kernel_key or kind
         self.source = source
         self.artifact = artifact
         self.artifact_root = artifact_root_path
         self.arch = arch
         self.dtype_name = dtype_name
-        self.function_name = ENTRYPOINTS[kind]
+        self.decode_quantized = decode_quantized
+        self.function_name = ENTRYPOINTS[self.kernel_key]
         self._library: _SharedLibraryWrapper | None = None
         self._native_bridge: DirectBridge | None = None
         self._native_artifact: dict[str, Any] | None = None
@@ -137,24 +149,38 @@ class GpuLinearExecutor:
         output_shape = _output_shape(self.kind, arrays)
         output = np.zeros(output_shape, dtype=npu_buffer_dtype(self.dtype_name))
         if self._native_bridge is not None and self._native_artifact is not None:
-            encoded_args = [
-                np.ascontiguousarray(encode_npu_array(array, self.dtype_name))
-                for array in arrays
-            ]
+            encoded_args = _encode_hardware_stage_args(
+                self.kind, self.kernel_key, arrays, self.dtype_name
+            )
             self._native_bridge.run_gpu_stage(
                 stage=self.kind,
                 dtype=self.dtype_name,
                 shape=_gpu_stage_shape(self.kind, arrays),
                 input_buffer=encoded_args[0],
                 weights=encoded_args[1],
+                scales=(encoded_args[2] if self.kernel_key == "decode_int4" else None),
                 output_buffer=output,
                 gpu_so=str(self._native_artifact["so"]),
+                decode_storage=(
+                    "int4" if self.kernel_key == "decode_int4" else "dense"
+                ),
+                decode_block_size=(
+                    0
+                    if self.decode_quantized is None
+                    else self.decode_quantized.metadata.block_size
+                ),
+                decode_quant_axis=(
+                    0
+                    if self.decode_quantized is None
+                    else self.decode_quantized.metadata.quant_axis
+                ),
             )
             return decode_npu_array(output, self.dtype_name)
         descriptors: list[ctypes.Structure] = []
-        for array in arrays:
-            encoded = encode_npu_array(array, self.dtype_name)
-            descriptors.append(_ranked_memref_descriptor(np.ascontiguousarray(encoded)))
+        for encoded in _encode_hardware_stage_args(
+            self.kind, self.kernel_key, arrays, self.dtype_name
+        ):
+            descriptors.append(_ranked_memref_descriptor(encoded))
         descriptors.append(_ranked_memref_descriptor(output))
         assert self._library is not None
         self._library.invoke(self.function_name, *descriptors)
@@ -170,13 +196,17 @@ class NpuLinearExecutor:
         artifact_root_path: Path,
         device: str,
         dtype_name: str,
+        decode_quantized: PackedLinearWeights | None = None,
+        kernel_key: str | None = None,
     ) -> None:
         self.kind = kind
+        self.kernel_key = kernel_key or kind
         self.source = source
         self.artifact = artifact
         self.artifact_root = artifact_root_path
         self.device = device
         self.dtype_name = dtype_name
+        self.decode_quantized = decode_quantized
         self._backend = None
         self._invoker = None
 
@@ -197,8 +227,16 @@ class NpuLinearExecutor:
         output_shape = _output_shape(self.kind, arrays)
         if self.kind == "prefill" and int(arrays[0].shape[0]) > 1:
             return self._run_prefill_rows(arrays, output_shape)
+        if (
+            self.kind == "decode"
+            and self.kernel_key == "decode_int4"
+            and int(self.artifact.get("tile_n", output_shape[0])) < int(output_shape[0])
+        ):
+            return self._run_decode_int4_tiles(arrays, output_shape)
         output = np.zeros(output_shape, dtype=npu_buffer_dtype(self.dtype_name))
-        encoded_args = [encode_npu_array(array, self.dtype_name) for array in arrays]
+        encoded_args = _encode_hardware_stage_args(
+            self.kind, self.kernel_key, arrays, self.dtype_name
+        )
         result = self._invoker(*encoded_args, output)
         return decode_npu_array(
             np.asarray(result[-1]).reshape(output_shape), self.dtype_name
@@ -211,20 +249,61 @@ class NpuLinearExecutor:
         output_dtype = npu_buffer_dtype(self.dtype_name)
         final_output = np.zeros(output_shape, dtype=output_dtype)
         encoded_weights = encode_npu_array(weights, self.dtype_name)
+        tile_h = min(int(self.artifact.get("tile_h", 512)), int(output_shape[1]))
+        row_output_shape = (1, tile_h)
 
         # Current NPU prefill kernels write row 0 for the medium multi-row
         # host baseline, so stage each requested row through row 0 explicitly.
         for row in range(int(input_array.shape[0])):
-            staged_input = np.zeros_like(input_array)
-            staged_input[0, :] = input_array[row, :]
-            row_output = np.zeros(output_shape, dtype=output_dtype)
+            staged_input = np.ascontiguousarray(input_array[row : row + 1, :])
+            encoded_input = encode_npu_array(staged_input, self.dtype_name)
+            for start in range(0, int(output_shape[1]), tile_h):
+                stop = min(start + tile_h, int(output_shape[1]))
+                width = stop - start
+                staged_weights = np.zeros(
+                    (weights.shape[0], tile_h), dtype=weights.dtype
+                )
+                staged_weights[:, :width] = weights[:, start:stop]
+                row_output = np.zeros(row_output_shape, dtype=output_dtype)
+                result = self._invoker(
+                    encoded_input,
+                    encode_npu_array(staged_weights, self.dtype_name),
+                    row_output,
+                )
+                encoded_result = np.asarray(result[-1]).reshape(row_output_shape)
+                final_output[row, start:stop] = encoded_result[0, :width]
+
+        return decode_npu_array(final_output, self.dtype_name)
+
+    def _run_decode_int4_tiles(
+        self, arrays: tuple[np.ndarray, ...], output_shape: tuple[int, ...]
+    ) -> np.ndarray:
+        decode_input, packed_weights, scales = arrays
+        output_dtype = npu_buffer_dtype(self.dtype_name)
+        final_output = np.zeros(output_shape, dtype=output_dtype)
+        tile_n = int(self.artifact.get("tile_n", output_shape[0]))
+        if tile_n <= 0 or tile_n % 8 != 0:
+            raise ValueError("NPU int4 decode tile_n must be a positive multiple of 8")
+        if int(output_shape[0]) % tile_n != 0:
+            raise ValueError("NPU int4 decode requires N divisible by tile_n")
+
+        encoded_input = np.ascontiguousarray(
+            encode_npu_array(decode_input, self.dtype_name)
+        )
+        packed_words_per_tile = tile_n // 8
+        for start in range(0, int(output_shape[0]), tile_n):
+            packed_start = start // 8
+            packed_stop = packed_start + packed_words_per_tile
+            tile_output = np.zeros((tile_n,), dtype=output_dtype)
             result = self._invoker(
-                encode_npu_array(staged_input, self.dtype_name),
-                encoded_weights,
-                row_output,
+                encoded_input,
+                np.ascontiguousarray(packed_weights[:, packed_start:packed_stop]),
+                np.ascontiguousarray(scales[:, start : start + tile_n]),
+                tile_output,
             )
-            encoded_result = np.asarray(result[-1]).reshape(output_shape)
-            final_output[row, :] = encoded_result[0, :]
+            final_output[start : start + tile_n] = np.asarray(result[-1]).reshape(
+                (tile_n,)
+            )
 
         return decode_npu_array(final_output, self.dtype_name)
 
@@ -239,6 +318,8 @@ def _output_shape(kind: str, arrays: tuple[np.ndarray, ...]) -> tuple[int, ...]:
     if kind == "prefill":
         return (int(arrays[0].shape[0]), int(arrays[1].shape[1]))
     if kind == "decode":
+        if len(arrays) == 3:
+            return (int(arrays[2].shape[1]),)
         return (int(arrays[1].shape[1]),)
     raise ValueError(f"Unknown executor kind: {kind}")
 
@@ -254,13 +335,60 @@ def _gpu_stage_shape(
             1,
         )
     if kind == "decode":
+        n = int(arrays[2].shape[1]) if len(arrays) == 3 else int(arrays[1].shape[1])
         return (
             1,
             1,
             int(arrays[0].shape[0]),
-            int(arrays[1].shape[1]),
+            n,
         )
     raise ValueError(f"Unknown GPU stage kind: {kind}")
+
+
+def _packed_decode_hardware_arrays(
+    packed: PackedLinearWeights,
+) -> tuple[np.ndarray, np.ndarray]:
+    h, n = packed.metadata.shape
+    if packed.metadata.quant_kind != "int4":
+        raise ValueError("hardware fused decode requires signed int4 weights")
+    if packed.metadata.quant_axis != 0:
+        raise ValueError("hardware fused decode requires quant_axis == 0")
+    if n % 8 != 0:
+        raise ValueError("hardware fused decode requires N divisible by 8")
+    packed_bytes = np.ascontiguousarray(np.asarray(packed.packed, dtype=np.uint8))
+    packed_matrix = np.ascontiguousarray(
+        packed_bytes.view(np.uint32).reshape((h, n // 8))
+    )
+    scales = np.ascontiguousarray(np.asarray(packed.scales, dtype=np.float32))
+    return packed_matrix, scales
+
+
+def _encode_hardware_stage_args(
+    kind: str,
+    kernel_key: str,
+    arrays: tuple[np.ndarray, ...],
+    dtype_name: str,
+) -> list[np.ndarray]:
+    if kernel_key == "decode_int4":
+        if kind != "decode" or len(arrays) != 3:
+            raise ValueError("decode_int4 expects input, packed weights, and scales")
+        return [
+            np.ascontiguousarray(encode_npu_array(arrays[0], dtype_name)),
+            np.ascontiguousarray(np.asarray(arrays[1], dtype=np.uint32)),
+            np.ascontiguousarray(np.asarray(arrays[2], dtype=np.float32)),
+        ]
+    return [
+        np.ascontiguousarray(encode_npu_array(array, dtype_name)) for array in arrays
+    ]
+
+
+def _raw_array_summary(array: np.ndarray) -> dict[str, Any]:
+    contiguous = np.ascontiguousarray(array)
+    return {
+        "dtype": str(contiguous.dtype),
+        "shape": [int(dim) for dim in contiguous.shape],
+        "nbytes": int(contiguous.nbytes),
+    }
 
 
 class LinearRuntime:
@@ -292,8 +420,38 @@ class LinearRuntime:
 
     def _sources_for(self, backend: str) -> dict[str, Path]:
         if backend not in self._sources:
-            self._sources[backend] = resolve_air_sources(self.manifest, backend)
+            stages = self.manifest["runtime"]["stage_backends"]
+            include_decode_int4 = (
+                stages.get("decode") == backend
+                and decode_quantization_config(self.manifest) is not None
+                and self._kernel_key_for_stage("decode", backend) == "decode_int4"
+            )
+            self._sources[backend] = resolve_air_sources(
+                self.manifest,
+                backend,
+                include_decode_int4=include_decode_int4,
+            )
         return self._sources[backend]
+
+    def _kernel_key_for_stage(self, kind: str, backend: str) -> str:
+        if kind == "decode" and backend in {"gpu", "npu"}:
+            if decode_quantization_config(self.manifest) is not None:
+                return decode_kernel_key(self.manifest)
+        return kind
+
+    def _decode_hardware_fused(self) -> bool:
+        backend = self.manifest["runtime"]["stage_backends"]["decode"]
+        return (
+            backend in {"gpu", "npu"}
+            and self.weights.decode_quantized is not None
+            and self._kernel_key_for_stage("decode", backend) == "decode_int4"
+        )
+
+    def _decode_weight_arrays_for_backend(self, backend: str) -> tuple[np.ndarray, ...]:
+        if backend in {"gpu", "npu"} and self.weights.decode_quantized is not None:
+            validate_accelerator_decode_quantization(self.manifest, require_int4=True)
+            return _packed_decode_hardware_arrays(self.weights.decode_quantized)
+        return (self.weights.decode,)
 
     def _make_executor(self, kind: str, backend: str) -> Any:
         if backend == "cpu":
@@ -303,8 +461,9 @@ class LinearRuntime:
                 self.weights.decode_quantized if kind == "decode" else None,
             )
 
-        artifact = self.manifest["artifacts"].get(kind, {}).get(backend, {})
-        source = self._sources_for(backend)[kind]
+        kernel_key = self._kernel_key_for_stage(kind, backend)
+        artifact = self.manifest["artifacts"].get(kernel_key, {}).get(backend, {})
+        source = self._sources_for(backend)[kernel_key]
         if backend == "gpu":
             return GpuLinearExecutor(
                 kind,
@@ -313,6 +472,8 @@ class LinearRuntime:
                 self.artifact_root,
                 self.manifest["compiler"]["gpu_arch"],
                 self.cfg.dtype,
+                self.weights.decode_quantized if kernel_key == "decode_int4" else None,
+                kernel_key=kernel_key,
             )
         if backend == "npu":
             return NpuLinearExecutor(
@@ -322,6 +483,8 @@ class LinearRuntime:
                 self.artifact_root,
                 self.manifest["compiler"]["npu_device"],
                 self.cfg.dtype,
+                self.weights.decode_quantized if kernel_key == "decode_int4" else None,
+                kernel_key=kernel_key,
             )
         raise ValueError(f"Unsupported backend: {backend}")
 
@@ -374,13 +537,14 @@ class LinearRuntime:
             for kind in ("prefill", "decode"):
                 if stages[kind] != "gpu":
                     continue
-                artifact_entry = artifacts.setdefault(kind, {})
+                kernel_key = self._kernel_key_for_stage(kind, "gpu")
+                artifact_entry = artifacts.setdefault(kernel_key, {})
                 if "gpu_direct" not in artifact_entry:
                     artifact_entry["gpu_direct"] = compile_gpu(
-                        gpu_sources[kind],
+                        gpu_sources[kernel_key],
                         direct_dir,
                         compiler_cfg["gpu_arch"],
-                        ENTRYPOINTS[kind],
+                        ENTRYPOINTS[kernel_key],
                         host_staging=False,
                     )
         if stages["prefill"] == "npu" or stages["decode"] == "npu":
@@ -389,18 +553,24 @@ class LinearRuntime:
             for kind in ("prefill", "decode"):
                 if stages[kind] != "npu":
                     continue
-                artifact_entry = artifacts.setdefault(kind, {})
+                kernel_key = self._kernel_key_for_stage(kind, "npu")
+                artifact_entry = artifacts.setdefault(kernel_key, {})
                 if "npu" not in artifact_entry:
-                    artifact_entry["npu"] = compile_npu(
-                        npu_sources[kind], npu_dir, compiler_cfg["npu_device"]
+                    artifact_entry["npu"] = compile_npu_stage(
+                        kernel_key,
+                        npu_sources[kernel_key],
+                        npu_dir,
+                        compiler_cfg["npu_device"],
                     )
 
     def _direct_artifacts(self) -> DirectBridgeArtifacts:
         artifacts = self.manifest.get("artifacts", {})
+        stages = self.manifest["runtime"]["stage_backends"]
+        decode_key = self._kernel_key_for_stage("decode", stages["decode"])
         prefill_gpu = artifacts.get("prefill", {}).get("gpu_direct", {})
-        decode_gpu = artifacts.get("decode", {}).get("gpu_direct", {})
+        decode_gpu = artifacts.get(decode_key, {}).get("gpu_direct", {})
         prefill_npu = artifacts.get("prefill", {}).get("npu", {})
-        decode_npu = artifacts.get("decode", {}).get("npu", {})
+        decode_npu = artifacts.get(decode_key, {}).get("npu", {})
         return DirectBridgeArtifacts(
             gpu_prefill_so=prefill_gpu.get("so"),
             gpu_decode_so=decode_gpu.get("so"),
@@ -408,6 +578,7 @@ class LinearRuntime:
             npu_prefill_insts=prefill_npu.get("insts"),
             npu_decode_xclbin=decode_npu.get("xclbin"),
             npu_decode_insts=decode_npu.get("insts"),
+            npu_decode_tile_n=decode_npu.get("tile_n"),
         )
 
     def _npu_stage_executed(self) -> bool:
@@ -445,7 +616,7 @@ class LinearRuntime:
                 "input": encoded_array_summary(
                     reference["decode_input"], self.cfg.dtype
                 ),
-                "weights": encoded_array_summary(self.weights.decode, self.cfg.dtype),
+                "weights": self._decode_weights_report(),
                 "weight_quantization": self._quantization_report(),
                 "expected_output": encoded_array_summary(
                     reference["output"], self.cfg.dtype
@@ -457,6 +628,25 @@ class LinearRuntime:
             ],
         }
 
+    def _decode_weights_report(self) -> dict[str, Any]:
+        packed = self.weights.decode_quantized
+        if packed is None:
+            return {"dense": encoded_array_summary(self.weights.decode, self.cfg.dtype)}
+        try:
+            packed_values, scales = _packed_decode_hardware_arrays(packed)
+        except ValueError:
+            packed_values = np.ascontiguousarray(
+                np.asarray(packed.packed, dtype=np.uint8)
+            )
+            scales = np.ascontiguousarray(np.asarray(packed.scales, dtype=np.float32))
+        return {
+            "dense_reference": encoded_array_summary(
+                self.weights.decode, self.cfg.dtype
+            ),
+            "packed_weights": _raw_array_summary(packed_values),
+            "scales": _raw_array_summary(scales),
+        }
+
     def _quantization_report(self) -> dict[str, Any]:
         packed = self.weights.decode_quantized
         if packed is None:
@@ -466,6 +656,37 @@ class LinearRuntime:
             "fused_decode": True,
             "metadata": packed.descriptor(),
             "dequantized_compute_dtype": self.cfg.dtype,
+        }
+
+    def _quantized_decode_report(
+        self,
+        *,
+        hardware_fused: bool,
+        detail: dict[str, float] | None,
+    ) -> dict[str, Any]:
+        packed = self.weights.decode_quantized
+        if packed is None:
+            return {
+                "enabled": False,
+                "quant_kind": None,
+                "hardware_fused": False,
+                "detail": detail,
+                "metadata": None,
+                "packed_bytes": 0,
+                "scale_bytes": 0,
+                "zero_point_bytes": 0,
+            }
+        return {
+            "enabled": True,
+            "quant_kind": packed.metadata.quant_kind,
+            "hardware_fused": bool(hardware_fused),
+            "detail": detail,
+            "metadata": packed.descriptor(),
+            "packed_bytes": int(packed.packed.nbytes),
+            "scale_bytes": int(packed.scales.nbytes),
+            "zero_point_bytes": int(
+                0 if packed.zero_points is None else packed.zero_points.nbytes
+            ),
         }
 
     def _stage_run(
@@ -503,7 +724,24 @@ class LinearRuntime:
         )
         input_encoded = encode_npu_array(inputs, self.cfg.dtype)
         prefill_weights_encoded = encode_npu_array(self.weights.prefill, self.cfg.dtype)
-        decode_weights_encoded = encode_npu_array(self.weights.decode, self.cfg.dtype)
+        decode_weights_encoded = None
+        decode_packed_encoded = None
+        decode_scales = None
+        if self.weights.decode_quantized is None:
+            decode_weights_encoded = encode_npu_array(
+                self.weights.decode, self.cfg.dtype
+            )
+            decode_storage = "dense"
+            decode_block_size = 0
+            decode_quant_axis = 0
+        else:
+            validate_accelerator_decode_quantization(self.manifest, require_int4=True)
+            decode_packed_encoded, decode_scales = _packed_decode_hardware_arrays(
+                self.weights.decode_quantized
+            )
+            decode_storage = "int4"
+            decode_block_size = self.weights.decode_quantized.metadata.block_size
+            decode_quant_axis = self.weights.decode_quantized.metadata.quant_axis
         output_encoded = np.zeros((self.cfg.N,), dtype=npu_buffer_dtype(self.cfg.dtype))
         prefill_encoded = (
             np.zeros((self.cfg.M, self.cfg.H), dtype=npu_buffer_dtype(self.cfg.dtype))
@@ -524,10 +762,15 @@ class LinearRuntime:
                 input_buffer=input_encoded,
                 prefill_weights=prefill_weights_encoded,
                 decode_weights=decode_weights_encoded,
+                decode_packed_weights=decode_packed_encoded,
+                decode_scales=decode_scales,
                 output_buffer=output_encoded,
                 prefill_output_buffer=prefill_encoded,
                 decode_input_buffer=decode_input_encoded,
                 artifacts=self._direct_artifacts(),
+                decode_storage=decode_storage,
+                decode_block_size=decode_block_size,
+                decode_quant_axis=decode_quant_axis,
             )
 
         try:
@@ -693,13 +936,10 @@ class LinearRuntime:
             "transfer_events": self.transfer.snapshot(),
             "transfer_summary": transfer_summary,
             "quantized_decode": {
-                "enabled": self.weights.decode_quantized is not None,
-                "detail": None,
-                "metadata": (
-                    None
-                    if self.weights.decode_quantized is None
-                    else self.weights.decode_quantized.descriptor()
-                ),
+                **self._quantized_decode_report(
+                    hardware_fused=self._decode_hardware_fused(),
+                    detail=None,
+                )
             },
             "device_events": summarize_device_events(trace),
             "direct_bridge": {
@@ -773,17 +1013,31 @@ class LinearRuntime:
         wd_arg = self.transfer.transfer(
             "cpu",
             stages["decode"],
-            self.weights.decode,
+            self._decode_weight_arrays_for_backend(stages["decode"])[0],
             trace,
-            "decode_weights_to_backend",
+            (
+                "decode_packed_weights_to_backend"
+                if self._decode_hardware_fused()
+                else "decode_weights_to_backend"
+            ),
         )
+        decode_weight_args = [wd_arg]
+        if self._decode_hardware_fused():
+            scales_arg = self.transfer.transfer(
+                "cpu",
+                stages["decode"],
+                self._decode_weight_arrays_for_backend(stages["decode"])[1],
+                trace,
+                "decode_scales_to_backend",
+            )
+            decode_weight_args.append(scales_arg)
         output, decode_ms = self._stage_run(
             self.executors.decode,
             trace,
             "decode_gemv",
             stages["decode"],
             decode_arg,
-            wd_arg,
+            *decode_weight_args,
         )
         output_cpu = self.transfer.transfer(
             stages["decode"], "cpu", output, trace, "decode_to_host"
@@ -859,13 +1113,10 @@ class LinearRuntime:
             "transfer_events": self.transfer.snapshot(),
             "transfer_summary": transfer_summary,
             "quantized_decode": {
-                "enabled": self.weights.decode_quantized is not None,
-                "detail": quantized_decode_detail,
-                "metadata": (
-                    None
-                    if self.weights.decode_quantized is None
-                    else self.weights.decode_quantized.descriptor()
-                ),
+                **self._quantized_decode_report(
+                    hardware_fused=self._decode_hardware_fused(),
+                    detail=quantized_decode_detail,
+                )
             },
             "device_events": summarize_device_events(trace),
             "npu_development": self._npu_development_report(

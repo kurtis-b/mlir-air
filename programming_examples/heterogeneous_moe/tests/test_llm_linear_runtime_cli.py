@@ -12,6 +12,7 @@ import numpy as np
 
 import compile_llm_linear
 import run_llm_linear_milestone2
+import run_llm_linear_milestone3
 import run_llm_linear_suite
 from llm_linear.manifest import load_json, resolve_package_path
 from llm_linear.direct_bridge import (
@@ -25,6 +26,7 @@ from llm_linear.direct_bridge import (
 import llm_linear.direct_bridge as direct_bridge_module
 from numerics import decode_npu_array, encode_npu_array
 from llm_linear.reference import decode_gemv, prefill_gemm, random_inputs
+from llm_linear.quantization import decode_gemv_fused_dequant
 from llm_linear.results import (
     benchmark_runtime,
     build_case_result,
@@ -141,6 +143,69 @@ def test_linear_runtime_quantized_decode_schema(moe_dir: Path, tmp_path: Path) -
     assert last_run["quantized_decode"]["detail"]["dequant_ms"] >= 0.0
 
 
+def test_linear_runtime_gpu_quantized_decode_receives_packed_buffers(
+    monkeypatch, moe_dir: Path, tmp_path: Path
+) -> None:
+    manifest = _tiny_cpu_manifest(moe_dir, tmp_path)
+    manifest["model"].update({"H": 8, "N": 8})
+    manifest["weights"]["decode"] = {
+        "storage": "int4",
+        "block_size": 4,
+        "quant_axis": 0,
+    }
+    manifest["runtime"]["stage_backends"] = {"prefill": "cpu", "decode": "gpu"}
+    captured: dict[str, object] = {}
+
+    class FakeGpuDecode:
+        def __init__(
+            self,
+            kind,
+            source,
+            artifact,
+            artifact_root_path,
+            arch,
+            dtype_name,
+            decode_quantized=None,
+            kernel_key=None,
+        ):
+            assert kind == "decode"
+            assert kernel_key == "decode_int4"
+            self.decode_quantized = decode_quantized
+            self.dtype_name = dtype_name
+            self.last_quantized_detail = None
+
+        def run(self, decode_input, packed, scales):
+            captured["packed_shape"] = packed.shape
+            captured["packed_dtype"] = packed.dtype
+            captured["scale_shape"] = scales.shape
+            captured["scale_dtype"] = scales.dtype
+            output, detail = decode_gemv_fused_dequant(
+                decode_input,
+                self.decode_quantized,
+                self.dtype_name,
+            )
+            self.last_quantized_detail = detail
+            return output
+
+    import llm_linear.runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "GpuLinearExecutor", FakeGpuDecode)
+    with LinearRuntime(manifest) as runtime:
+        inputs = random_inputs(runtime.cfg, seed=manifest["inputs"]["seed"])
+        last_run, _validation_ms = validate_runtime(runtime, inputs)
+
+    assert captured["packed_shape"] == (8, 1)
+    assert captured["packed_dtype"] == np.dtype("uint32")
+    assert captured["scale_shape"] == (2, 8)
+    assert captured["scale_dtype"] == np.dtype("float32")
+    assert last_run["numpy_validation"]["status"] == "pass"
+    assert last_run["quantized_decode"]["hardware_fused"] is True
+    labels = [event["label"] for event in last_run["transfer_events"]]
+    assert "decode_packed_weights_to_backend" in labels
+    assert "decode_scales_to_backend" in labels
+    assert "decode_weights_to_backend" not in labels
+
+
 def test_npu_prefill_executor_stages_multirow_inputs(tmp_path: Path) -> None:
     dtype = "bf16"
     inputs = np.asarray(
@@ -158,7 +223,7 @@ def test_npu_prefill_executor_stages_multirow_inputs(tmp_path: Path) -> None:
         decoded_input = decode_npu_array(np.asarray(encoded_input), dtype)
         staged_rows.append(decoded_input)
         row_sum = float(np.sum(decoded_input[0, :]))
-        output_view = np.asarray(output).reshape((3, 2))
+        output_view = np.asarray(output).reshape((1, 2))
         output_view[...] = 0
         output_view[0, :] = encode_npu_array(
             np.asarray([[row_sum, row_sum + 1.0]], dtype=np.float32),
@@ -182,8 +247,8 @@ def test_npu_prefill_executor_stages_multirow_inputs(tmp_path: Path) -> None:
     np.testing.assert_allclose(output, expected)
     assert len(staged_rows) == inputs.shape[0]
     for row, staged in enumerate(staged_rows):
+        assert staged.shape == (1, inputs.shape[1])
         np.testing.assert_allclose(staged[0, :], inputs[row, :])
-        np.testing.assert_allclose(staged[1:, :], 0.0)
 
 
 def test_linear_direct_transfer_fails_closed(moe_dir: Path, tmp_path: Path) -> None:
@@ -306,10 +371,15 @@ def test_linear_direct_runtime_records_native_handoff(
             input_buffer,
             prefill_weights,
             decode_weights,
+            decode_packed_weights=None,
+            decode_scales=None,
             output_buffer,
             prefill_output_buffer,
             decode_input_buffer,
             artifacts,
+            decode_storage="dense",
+            decode_block_size=0,
+            decode_quant_axis=0,
         ):
             assert direction == "gpu_prefill_npu_decode"
             x = decode_npu_array(input_buffer, dtype)
@@ -379,6 +449,98 @@ def test_linear_direct_runtime_records_native_handoff(
     sync_names = [item["event"] for item in event["sync_events"]]
     assert "xrtBoSubview" in sync_names
     assert "xrtBoCopy" not in sync_names
+
+
+def test_linear_direct_runtime_records_quantized_decode_buffers(
+    monkeypatch, moe_dir: Path, tmp_path: Path
+) -> None:
+    manifest = _tiny_cpu_manifest(moe_dir, tmp_path)
+    manifest["model"].update({"H": 8, "N": 8})
+    manifest["weights"]["decode"] = {
+        "storage": "int4",
+        "block_size": 4,
+        "quant_axis": 0,
+    }
+    manifest["runtime"]["stage_backends"] = {"prefill": "gpu", "decode": "npu"}
+    manifest["runtime"]["transfer_mode"] = "direct"
+    manifest["artifacts"] = {
+        "prefill": {"gpu_direct": {"so": "prefill.so"}},
+        "decode_int4": {
+            "npu": {"xclbin": "decode_int4.xclbin", "insts": "decode_int4.insts.bin"}
+        },
+    }
+    captured: dict[str, object] = {}
+
+    class FakeStatus:
+        available = True
+        library_path = "fake_bridge.so"
+        diagnostic = "ok"
+        probe_report = _direct_probe_report()
+
+    class FakeBridge:
+        library_path = Path("fake_bridge.so")
+
+        def __init__(self, library_path=None):
+            pass
+
+        def run(self, **kwargs):
+            captured.update(kwargs)
+            dtype = kwargs["dtype"]
+            shape = kwargs["shape"]
+            x = decode_npu_array(kwargs["input_buffer"], dtype)
+            wp = decode_npu_array(kwargs["prefill_weights"], dtype)
+            prefill = prefill_gemm(x, wp, dtype)
+            decode_input = prefill[-1, :]
+            assert kwargs["decode_weights"] is None
+            packed = kwargs["decode_packed_weights"]
+            scales = kwargs["decode_scales"]
+            assert packed.dtype == np.uint32
+            assert packed.shape == (shape[2], shape[3] // 8)
+            assert scales.dtype == np.float32
+            output, _detail = decode_gemv_fused_dequant(
+                decode_input,
+                runtime.weights.decode_quantized,
+                dtype,
+            )
+            kwargs["prefill_output_buffer"][...] = encode_npu_array(prefill, dtype)
+            kwargs["decode_input_buffer"][...] = encode_npu_array(decode_input, dtype)
+            kwargs["output_buffer"][...] = encode_npu_array(output, dtype)
+            return DirectBridgeRunResult(
+                prefill_ms=1.0,
+                decode_ms=2.0,
+                handoff_us=0.0,
+                direct_bytes=int(shape[2] * 2),
+                subview_offset_bytes=int((shape[0] - 1) * shape[2] * 2),
+                mechanism=DIRECT_MECHANISM,
+                bo_flag=0,
+                import_method=3,
+                sync_events=[
+                    {"event": "hipDeviceSynchronize"},
+                    {"event": "xrtBoSyncToDevice"},
+                    {"event": "xrtBoSubview"},
+                    {"event": "xrtRunWait"},
+                ],
+                diagnostic="ok",
+            )
+
+    import llm_linear.runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "probe_direct_bridge", lambda: FakeStatus())
+    monkeypatch.setattr(runtime_module, "DirectBridge", FakeBridge)
+    with LinearRuntime(manifest) as runtime:
+        inputs = random_inputs(runtime.cfg, seed=manifest["inputs"]["seed"])
+        result = runtime.run(inputs, validate=True)
+
+    assert captured["decode_storage"] == "int4"
+    assert captured["decode_block_size"] == 4
+    assert captured["decode_quant_axis"] == 0
+    assert result["numpy_validation"]["status"] == "pass"
+    assert result["quantized_decode"]["enabled"] is True
+    assert result["quantized_decode"]["quant_kind"] == "int4"
+    assert result["quantized_decode"]["hardware_fused"] is True
+    assert result["quantized_decode"]["packed_bytes"] == manifest["model"]["H"] * (
+        manifest["model"]["N"] // 2
+    )
 
 
 def test_linear_direct_handoff_summary_schema() -> None:
@@ -553,6 +715,40 @@ def test_milestone2_verifier_direct_contract(tmp_path: Path) -> None:
         "Reverting to host copy of buffers",
         "exec_buf: Operation not supported",
     }
+
+
+def test_milestone3_verifier_requires_hardware_fused_int4() -> None:
+    result = {
+        "case_name": "gpu_only",
+        "dtype": "bf16",
+        "shape": {"M": 4, "K": 128, "H": 128, "N": 64},
+        "stage_backends": {"prefill": "gpu", "decode": "gpu"},
+        "correctness": {
+            "validation_status": "pass",
+            "prefill_allclose": True,
+            "output_allclose": True,
+        },
+        "quantized_decode": {
+            "enabled": True,
+            "quant_kind": "int4",
+            "hardware_fused": True,
+            "packed_bytes": 4096,
+            "scale_bytes": 1024,
+            "metadata": {"quant_kind": "int4", "block_size": 32, "quant_axis": 0},
+        },
+    }
+    assert (
+        run_llm_linear_milestone3.validate_result_payload(result, require_direct=False)
+        == []
+    )
+    stale = copy.deepcopy(result)
+    stale["quantized_decode"]["hardware_fused"] = False
+    assert any(
+        "hardware_fused" in message
+        for message in run_llm_linear_milestone3.validate_result_payload(
+            stale, require_direct=False
+        )
+    )
 
 
 def test_compile_llm_linear_cli(monkeypatch, tmp_path: Path) -> None:

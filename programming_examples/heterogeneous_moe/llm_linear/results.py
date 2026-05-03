@@ -37,9 +37,11 @@ CSV_FIELDNAMES = [
     "device_resident_buffers",
     "direct_handoff_numpy_host_materializations",
     "decode_weight_storage",
+    "decode_hardware_fused",
     "decode_dequant_ms",
     "decode_linear_ms",
     "packed_weight_bytes_read",
+    "scale_bytes_read",
 ]
 
 
@@ -364,9 +366,15 @@ def result_csv_row(result: dict[str, Any]) -> dict[str, Any]:
             "direct_handoff_numpy_host_materializations"
         ),
         "decode_weight_storage": (
-            quant_metadata.get("quant_kind") if quantized.get("enabled") else "bf16"
+            quantized.get("quant_kind") or quant_metadata.get("quant_kind")
+            if quantized.get("enabled")
+            else "bf16"
         ),
+        "decode_hardware_fused": bool(quantized.get("hardware_fused")),
         "decode_dequant_ms": quant_detail.get("dequant_ms"),
         "decode_linear_ms": quant_detail.get("linear_ms"),
-        "packed_weight_bytes_read": quant_detail.get("packed_weight_bytes_read"),
+        "packed_weight_bytes_read": quant_detail.get("packed_weight_bytes_read")
+        or quantized.get("packed_bytes"),
+        "scale_bytes_read": quant_detail.get("scale_bytes_read")
+        or quantized.get("scale_bytes"),
     }

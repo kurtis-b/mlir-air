@@ -34,8 +34,24 @@ def _aligned_output_group(length: int) -> int:
     return 1
 
 
+def _aligned_prefill_output_group(cfg: LinearKernelConfig) -> int:
+    for group in (16, 8, 4, 2):
+        if cfg.H % group == 0 and cfg.K * group * 2 <= 32768:
+            return group
+    return 1
+
+
 def _aligned_decode_output_group(length: int) -> int:
     return 2 if length % 2 == 0 else 1
+
+
+def _require_int4_hardware_shape(cfg: LinearKernelConfig, block_size: int) -> None:
+    if block_size <= 0:
+        raise ValueError("decode int4 block_size must be positive")
+    if cfg.H % block_size != 0:
+        raise ValueError("decode int4 hardware requires H % block_size == 0")
+    if cfg.N % 8 != 0:
+        raise ValueError("decode int4 hardware requires N divisible by 8")
 
 
 def _header(title: str) -> str:
@@ -276,7 +292,7 @@ def _grouped_decode_gemv_air(cfg: LinearKernelConfig, output_group: int) -> str:
 
 
 def prefill_gemm_air(cfg: LinearKernelConfig, *, align_output_dma: bool = False) -> str:
-    output_group = _aligned_output_group(cfg.H) if align_output_dma else 1
+    output_group = _aligned_prefill_output_group(cfg) if align_output_dma else 1
     if output_group > 1:
         return _grouped_prefill_gemm_air(cfg, output_group)
     if output_group == 2:
@@ -651,23 +667,429 @@ def decode_gemv_air(cfg: LinearKernelConfig, *, align_output_dma: bool = False) 
 """
 
 
+def _int4_block_lane_reduction(
+    *,
+    lane: int,
+    block_size: int,
+    block_count: int,
+    output_group: int,
+    cfg: LinearKernelConfig,
+) -> str:
+    nibble = "low" if lane == 0 else "high"
+    return f"""            %sum_f32_{lane} = scf.for %bb{lane} = %h0 to %h_blocks step %h1 iter_args(%block_acc{lane} = %zero_acc_f32) -> (f32) {{
+              %scale_f32_{lane} = memref.load %l1_scales[%bb{lane}, %h{lane}] : memref<{block_count}x{output_group}xf32, 2>
+              %scale{lane} = arith.truncf %scale_f32_{lane} : f32 to {cfg.dtype}
+              %base{lane} = arith.muli %bb{lane}, %h_block : index
+              %block_sum_f32_{lane} = scf.for %ii{lane} = %h0 to %h_block step %h1 iter_args(%inner_acc{lane} = %block_acc{lane}) -> (f32) {{
+                %hh{lane} = arith.addi %base{lane}, %ii{lane} : index
+                %lhs{lane} = memref.load %l1_in[%hh{lane}] : memref<{cfg.H}x{cfg.dtype}, 2>
+                %packed_word{lane} = memref.load %l1_packed[%hh{lane}, %h0] : memref<{cfg.H}x1xi32, 2>
+                %lane_shift{lane} = arith.constant {lane * 4} : i32
+                %shifted{lane} = arith.shrui %packed_word{lane}, %lane_shift{lane} : i32
+                %nibble{lane} = arith.andi %shifted{lane}, %mask4 : i32
+                %is_neg{lane} = arith.cmpi uge, %nibble{lane}, %sign_bit : i32
+                %negative{lane} = arith.subi %nibble{lane}, %sign_extend_bias : i32
+                %q_i32_{lane} = arith.select %is_neg{lane}, %negative{lane}, %nibble{lane} : i32
+                %q_f32_{lane} = arith.sitofp %q_i32_{lane} : i32 to f32
+                %q{lane} = arith.truncf %q_f32_{lane} : f32 to {cfg.dtype}
+                %weight{lane} = arith.mulf %q{lane}, %scale{lane} : {cfg.dtype}
+                %lhs_f32_{lane} = arith.extf %lhs{lane} : {cfg.dtype} to f32
+                %weight_f32_{lane} = arith.extf %weight{lane} : {cfg.dtype} to f32
+                %prod{lane} = arith.mulf %lhs_f32_{lane}, %weight_f32_{lane} : f32
+                %next{lane} = arith.addf %inner_acc{lane}, %prod{lane} : f32
+                scf.yield %next{lane} : f32
+              }}
+              scf.yield %block_sum_f32_{lane} : f32
+            }}
+            %sum{lane} = arith.truncf %sum_f32_{lane} : f32 to {cfg.dtype}
+            memref.store %sum{lane}, %l1_out[%h{lane}] : memref<{output_group}x{cfg.dtype}, 2>
+            // {nibble} nibble"""
+
+
+def _int4_block_loop(
+    *,
+    block_size: int,
+    block_count: int,
+    blocks_per_tile: int,
+    output_group: int,
+    cfg: LinearKernelConfig,
+) -> str:
+    packed_cols_per_group = output_group // 8
+    dma_tile_rows = block_size * blocks_per_tile
+    return f"""          scf.for %lane_init = %h0 to %h_group step %h1 {{
+            memref.store %zero_acc_f32, %l1_acc[%lane_init] : memref<{output_group}xf32, 2>
+          }}
+          scf.for %tile_block = %h0 to %h_dma_tiles step %h1 {{
+            %tile_block_base = arith.muli %tile_block, %h_blocks_per_tile : index
+            %tile_row_base = arith.muli %tile_block_base, %h_block : index
+            air.dma_memcpy_nd (%l1_packed[%h0, %h0] [%h_dma_tile_rows, %h{packed_cols_per_group}] [%h{packed_cols_per_group}, %h1],
+                               %herd_packed[%tile_row_base, %h0] [%h_dma_tile_rows, %h{packed_cols_per_group}] [%h{packed_cols_per_group}, %h1])
+                : (memref<{dma_tile_rows}x{packed_cols_per_group}xi32, 2>,
+                   memref<{cfg.H}x{packed_cols_per_group}xi32, 1>)
+            scf.for %bb = %h0 to %h_blocks_per_tile step %h1 {{
+              %block_index = arith.addi %tile_block_base, %bb : index
+              %block_row_base = arith.muli %block_index, %h_block : index
+              %local_row_base = arith.muli %bb, %h_block : index
+              scf.for %lane_idx = %h0 to %h_group step %h1 {{
+                %acc_start = memref.load %l1_acc[%lane_idx] : memref<{output_group}xf32, 2>
+                %scale_f32 = memref.load %l1_scales[%block_index, %lane_idx] : memref<{block_count}x{output_group}xf32, 2>
+                %packed_col = arith.divui %lane_idx, %h_packed_lane_count : index
+                %lane_rem = arith.remui %lane_idx, %h_packed_lane_count : index
+                %lane_rem_i32 = arith.index_cast %lane_rem : index to i32
+                %lane_shift = arith.muli %lane_rem_i32, %shift_step : i32
+                %block_sum_f32 = scf.for %ii = %h0 to %h_block step %h1 iter_args(%inner_acc = %acc_start) -> (f32) {{
+                  %hh = arith.addi %block_row_base, %ii : index
+                  %local_hh = arith.addi %local_row_base, %ii : index
+                  %lhs = memref.load %l1_in[%hh] : memref<{cfg.H}x{cfg.dtype}, 2>
+                  %packed_word = memref.load %l1_packed[%local_hh, %packed_col] : memref<{dma_tile_rows}x{packed_cols_per_group}xi32, 2>
+                  %shifted = arith.shrui %packed_word, %lane_shift : i32
+                  %nibble = arith.andi %shifted, %mask4 : i32
+                  %is_neg = arith.cmpi uge, %nibble, %sign_bit : i32
+                  %negative = arith.subi %nibble, %sign_extend_bias : i32
+                  %q_i32 = arith.select %is_neg, %negative, %nibble : i32
+                  %q_f32 = arith.sitofp %q_i32 : i32 to f32
+                  %lhs_f32 = arith.extf %lhs : {cfg.dtype} to f32
+                  %weight_f32 = arith.mulf %q_f32, %scale_f32 : f32
+                  %prod = arith.mulf %lhs_f32, %weight_f32 : f32
+                  %next = arith.addf %inner_acc, %prod : f32
+                  scf.yield %next : f32
+                }}
+                memref.store %block_sum_f32, %l1_acc[%lane_idx] : memref<{output_group}xf32, 2>
+              }}
+            }}
+          }}
+          scf.for %lane_out = %h0 to %h_group step %h1 {{
+            %sum_f32 = memref.load %l1_acc[%lane_out] : memref<{output_group}xf32, 2>
+            %sum = arith.truncf %sum_f32 : f32 to {cfg.dtype}
+            memref.store %sum, %l1_out[%lane_out] : memref<{output_group}x{cfg.dtype}, 2>
+          }}"""
+
+
+def _int4_global_block_loop(
+    *,
+    block_size: int,
+    block_count: int,
+    output_group: int,
+    cfg: LinearKernelConfig,
+) -> str:
+    return f"""          air.dma_memcpy_nd (%l1_scales[%h0, %h0] [%h_blocks, %h_group] [%h_group, %h1],
+                             %herd_scales[%h0, %herd_col] [%h_blocks, %h_group] [%h_n, %h1])
+              : (memref<{block_count}x{output_group}xf32, 2>,
+                 memref<{block_count}x{cfg.N}xf32>)
+          scf.for %lane_init = %h0 to %h_group step %h1 {{
+            memref.store %zero_acc_f32, %l1_acc[%lane_init] : memref<{output_group}xf32, 2>
+          }}
+          scf.for %block_index = %h0 to %h_blocks step %h1 {{
+            %block_row_base = arith.muli %block_index, %h_block : index
+            air.dma_memcpy_nd (%l1_in[%h0] [%h_block] [%h1],
+                               %herd_in[%block_row_base] [%h_block] [%h1])
+                : (memref<{block_size}x{cfg.dtype}, 2>,
+                   memref<{cfg.H}x{cfg.dtype}>)
+            air.dma_memcpy_nd (%l1_packed[%h0, %h0] [%h_block, %h1] [%h1, %h1],
+                               %herd_packed[%block_row_base, %herd_col_group] [%h_block, %h1] [%h_packed_word_cols, %h1])
+                : (memref<{block_size}x1xi32, 2>,
+                   memref<{cfg.H}x{cfg.N // 8}xi32>)
+            scf.for %lane_idx = %h0 to %h_group step %h1 {{
+              %acc_start = memref.load %l1_acc[%lane_idx] : memref<{output_group}xf32, 2>
+              %scale_f32 = memref.load %l1_scales[%block_index, %lane_idx] : memref<{block_count}x{output_group}xf32, 2>
+              %lane_rem_i32 = arith.index_cast %lane_idx : index to i32
+              %lane_shift = arith.muli %lane_rem_i32, %shift_step : i32
+              %block_sum_f32 = scf.for %ii = %h0 to %h_block step %h1 iter_args(%inner_acc = %acc_start) -> (f32) {{
+                %lhs = memref.load %l1_in[%ii] : memref<{block_size}x{cfg.dtype}, 2>
+                %packed_word = memref.load %l1_packed[%ii, %h0] : memref<{block_size}x1xi32, 2>
+                %shifted = arith.shrui %packed_word, %lane_shift : i32
+                %nibble = arith.andi %shifted, %mask4 : i32
+                %is_neg = arith.cmpi uge, %nibble, %sign_bit : i32
+                %negative = arith.subi %nibble, %sign_extend_bias : i32
+                %q_i32 = arith.select %is_neg, %negative, %nibble : i32
+                %q_f32 = arith.sitofp %q_i32 : i32 to f32
+                %lhs_f32 = arith.extf %lhs : {cfg.dtype} to f32
+                %weight_f32 = arith.mulf %q_f32, %scale_f32 : f32
+                %prod = arith.mulf %lhs_f32, %weight_f32 : f32
+                %next = arith.addf %inner_acc, %prod : f32
+                scf.yield %next : f32
+              }}
+              memref.store %block_sum_f32, %l1_acc[%lane_idx] : memref<{output_group}xf32, 2>
+            }}
+          }}
+          scf.for %lane_out = %h0 to %h_group step %h1 {{
+            %sum_f32 = memref.load %l1_acc[%lane_out] : memref<{output_group}xf32, 2>
+            %sum = arith.truncf %sum_f32 : f32 to {cfg.dtype}
+            memref.store %sum, %l1_out[%lane_out] : memref<{output_group}x{cfg.dtype}, 2>
+          }}
+          air.dma_memcpy_nd (%herd_out[%herd_col] [%h_group] [%h1],
+                             %l1_out[%h0] [%h_group] [%h1])
+              : (memref<{cfg.N}x{cfg.dtype}>,
+                 memref<{output_group}x{cfg.dtype}, 2>)"""
+
+
+def decode_int4_gemv_air(
+    cfg: LinearKernelConfig,
+    *,
+    block_size: int = 32,
+    quant_axis: int = 0,
+    align_output_dma: bool = True,
+    use_global_loads: bool = False,
+) -> str:
+    if quant_axis != 0:
+        raise ValueError("decode int4 hardware requires quant_axis == 0")
+    _require_int4_hardware_shape(cfg, block_size)
+    output_group = 8
+    n_groups = cfg.N // output_group
+    launch_inner_groups = min(n_groups, 256)
+    if n_groups % launch_inner_groups != 0:
+        raise ValueError("decode int4 hardware requires launch groups divisible by 256")
+    launch_outer_groups = n_groups // launch_inner_groups
+    packed_word_cols = cfg.N // 8
+    packed_cols_per_group = output_group // 8
+    block_count = cfg.H // block_size
+    blocks_per_tile = 2 if block_count > 256 else 1
+    if block_count % blocks_per_tile != 0:
+        raise ValueError("decode int4 hardware requires block tiles to divide H")
+    dma_tile_rows = block_size * blocks_per_tile
+    dma_tile_count = block_count // blocks_per_tile
+    if use_global_loads:
+        reductions = _int4_global_block_loop(
+            block_size=block_size,
+            block_count=block_count,
+            output_group=output_group,
+            cfg=cfg,
+        )
+        return _header("decode_int4.air.mlir") + f"""module {{
+  func.func @llm_linear_decode_int4(%input: memref<{cfg.H}x{cfg.dtype}>,
+                                    %packed_weights: memref<{cfg.H}x{packed_word_cols}xi32>,
+                                    %scales: memref<{block_count}x{cfg.N}xf32>,
+                                    %output: memref<{cfg.N}x{cfg.dtype}>)
+      attributes {{llvm.emit_c_interface}} {{
+    %n_group_outer = arith.constant {launch_outer_groups} : index
+    %n_group_inner = arith.constant {launch_inner_groups} : index
+    %lane_count = arith.constant 1 : index
+    air.launch (%col_group_outer, %col_group_inner, %lane) in (%nouter=%n_group_outer, %ninner=%n_group_inner, %nlane=%lane_count)
+        args(%launch_in=%input, %launch_packed=%packed_weights,
+             %launch_scales=%scales, %launch_out=%output)
+        : memref<{cfg.H}x{cfg.dtype}>,
+          memref<{cfg.H}x{packed_word_cols}xi32>,
+          memref<{block_count}x{cfg.N}xf32>,
+          memref<{cfg.N}x{cfg.dtype}> {{
+      air.segment @decode_int4_segment
+          args(%seg_col_outer=%col_group_outer, %seg_col_inner=%col_group_inner,
+               %seg_in=%launch_in,
+               %seg_packed=%launch_packed, %seg_scales=%launch_scales,
+               %seg_out=%launch_out)
+          : index,
+            index,
+            memref<{cfg.H}x{cfg.dtype}>,
+            memref<{cfg.H}x{packed_word_cols}xi32>,
+            memref<{block_count}x{cfg.N}xf32>,
+            memref<{cfg.N}x{cfg.dtype}> {{
+        %c_group = arith.constant {output_group} : index
+        %c1 = arith.constant 1 : index
+        %c_launch_inner = arith.constant {launch_inner_groups} : index
+        %seg_col_base = arith.muli %seg_col_outer, %c_launch_inner : index
+        %seg_col_group = arith.addi %seg_col_base, %seg_col_inner : index
+        %seg_col = arith.muli %seg_col_group, %c_group : index
+        air.herd @decode_int4_herd
+            tile (%tx, %ty) in (%sx=%c1, %sy=%c1)
+            args(%herd_col_group=%seg_col_group, %herd_col=%seg_col,
+                 %herd_in=%seg_in, %herd_packed=%seg_packed,
+                 %herd_scales=%seg_scales, %herd_out=%seg_out)
+            : index,
+              index,
+              memref<{cfg.H}x{cfg.dtype}>,
+              memref<{cfg.H}x{packed_word_cols}xi32>,
+              memref<{block_count}x{cfg.N}xf32>,
+              memref<{cfg.N}x{cfg.dtype}> {{
+{_index_constants(output_group)}
+          %h_block = arith.constant {block_size} : index
+          %h_blocks = arith.constant {block_count} : index
+          %h_group = arith.constant {output_group} : index
+          %h_n = arith.constant {cfg.N} : index
+          %h_packed_word_cols = arith.constant {packed_word_cols} : index
+          %zero_acc_f32 = arith.constant 0.0 : f32
+          %shift_step = arith.constant 4 : i32
+          %mask4 = arith.constant 15 : i32
+          %sign_bit = arith.constant 8 : i32
+          %sign_extend_bias = arith.constant 16 : i32
+          %l1_in = memref.alloc() : memref<{block_size}x{cfg.dtype}, 2>
+          %l1_packed = memref.alloc() : memref<{block_size}x1xi32, 2>
+          %l1_scales = memref.alloc() : memref<{block_count}x{output_group}xf32, 2>
+          %l1_acc = memref.alloc() : memref<{output_group}xf32, 2>
+          %l1_out = memref.alloc() : memref<{output_group}x{cfg.dtype}, 2>
+
+{reductions}
+          air.herd_terminator
+        }}
+        air.segment_terminator
+      }}
+      air.launch_terminator
+    }}
+    return
+  }}
+}}
+"""
+    reductions = _int4_block_loop(
+        block_size=block_size,
+        block_count=block_count,
+        blocks_per_tile=blocks_per_tile,
+        output_group=output_group,
+        cfg=cfg,
+    )
+    return _header("decode_int4.air.mlir") + f"""module {{
+  func.func @llm_linear_decode_int4(%input: memref<{cfg.H}x{cfg.dtype}>,
+                                    %packed_weights: memref<{cfg.H}x{packed_word_cols}xi32>,
+                                    %scales: memref<{block_count}x{cfg.N}xf32>,
+                                    %output: memref<{cfg.N}x{cfg.dtype}>)
+      attributes {{llvm.emit_c_interface}} {{
+    %n_group_outer = arith.constant {launch_outer_groups} : index
+    %n_group_inner = arith.constant {launch_inner_groups} : index
+    %lane_count = arith.constant 1 : index
+    air.launch (%col_group_outer, %col_group_inner, %lane) in (%nouter=%n_group_outer, %ninner=%n_group_inner, %nlane=%lane_count)
+        args(%launch_in=%input, %launch_packed=%packed_weights,
+             %launch_scales=%scales, %launch_out=%output)
+        : memref<{cfg.H}x{cfg.dtype}>,
+          memref<{cfg.H}x{packed_word_cols}xi32>,
+          memref<{block_count}x{cfg.N}xf32>,
+          memref<{cfg.N}x{cfg.dtype}> {{
+      air.segment @decode_int4_segment
+          args(%seg_col_outer=%col_group_outer, %seg_col_inner=%col_group_inner,
+               %seg_in=%launch_in,
+               %seg_packed=%launch_packed, %seg_scales=%launch_scales,
+               %seg_out=%launch_out)
+          : index,
+            index,
+            memref<{cfg.H}x{cfg.dtype}>,
+            memref<{cfg.H}x{packed_word_cols}xi32>,
+            memref<{block_count}x{cfg.N}xf32>,
+            memref<{cfg.N}x{cfg.dtype}> {{
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %c_group = arith.constant {output_group} : index
+        %c_h = arith.constant {cfg.H} : index
+        %c_n = arith.constant {cfg.N} : index
+        %c_packed_word_cols = arith.constant {packed_word_cols} : index
+        %c_packed_group_cols = arith.constant {packed_cols_per_group} : index
+        %c_blocks = arith.constant {block_count} : index
+        %c_launch_inner = arith.constant {launch_inner_groups} : index
+        %seg_col_base = arith.muli %seg_col_outer, %c_launch_inner : index
+        %seg_col_group = arith.addi %seg_col_base, %seg_col_inner : index
+        %seg_col = arith.muli %seg_col_group, %c_group : index
+        %seg_col_word = arith.muli %seg_col_group, %c_packed_group_cols : index
+        %l2_in = memref.alloc() : memref<{cfg.H}x{cfg.dtype}, 1>
+        %l2_packed = memref.alloc() : memref<{cfg.H}x{packed_cols_per_group}xi32, 1>
+        %l2_scales = memref.alloc() : memref<{block_count}x{output_group}xf32, 1>
+        %l2_out = memref.alloc() : memref<{output_group}x{cfg.dtype}, 1>
+
+        air.dma_memcpy_nd (%l2_in[%c0] [%c_h] [%c1],
+                           %seg_in[%c0] [%c_h] [%c1])
+            : (memref<{cfg.H}x{cfg.dtype}, 1>,
+               memref<{cfg.H}x{cfg.dtype}>)
+        air.dma_memcpy_nd (%l2_packed[%c0, %c0] [%c_h, %c_packed_group_cols] [%c_packed_group_cols, %c1],
+                           %seg_packed[%c0, %seg_col_word] [%c_h, %c_packed_group_cols] [%c_packed_word_cols, %c1])
+            : (memref<{cfg.H}x{packed_cols_per_group}xi32, 1>,
+               memref<{cfg.H}x{packed_word_cols}xi32>)
+        air.dma_memcpy_nd (%l2_scales[%c0, %c0] [%c_blocks, %c_group] [%c_group, %c1],
+                           %seg_scales[%c0, %seg_col] [%c_blocks, %c_group] [%c_n, %c1])
+            : (memref<{block_count}x{output_group}xf32, 1>,
+               memref<{block_count}x{cfg.N}xf32>)
+        air.herd @decode_int4_herd
+            tile (%tx, %ty) in (%sx=%c1, %sy=%c1)
+            args(%herd_in=%l2_in, %herd_packed=%l2_packed,
+                 %herd_scales=%l2_scales, %herd_out=%l2_out)
+            : memref<{cfg.H}x{cfg.dtype}, 1>,
+              memref<{cfg.H}x{packed_cols_per_group}xi32, 1>,
+              memref<{block_count}x{output_group}xf32, 1>,
+              memref<{output_group}x{cfg.dtype}, 1> {{
+{_index_constants(output_group)}
+          %h_h = arith.constant {cfg.H} : index
+          %h_block = arith.constant {block_size} : index
+          %h_blocks = arith.constant {block_count} : index
+          %h_blocks_per_tile = arith.constant {blocks_per_tile} : index
+          %h_dma_tiles = arith.constant {dma_tile_count} : index
+          %h_dma_tile_rows = arith.constant {dma_tile_rows} : index
+          %h_group = arith.constant {output_group} : index
+          %h_packed_lane_count = arith.constant 8 : index
+          %zero_acc = arith.constant 0.0 : {cfg.dtype}
+          %zero_acc_f32 = arith.constant 0.0 : f32
+          %shift_step = arith.constant 4 : i32
+          %mask4 = arith.constant 15 : i32
+          %sign_bit = arith.constant 8 : i32
+          %sign_extend_bias = arith.constant 16 : i32
+          %l1_in = memref.alloc() : memref<{cfg.H}x{cfg.dtype}, 2>
+          %l1_packed = memref.alloc() : memref<{dma_tile_rows}x{packed_cols_per_group}xi32, 2>
+          %l1_scales = memref.alloc() : memref<{block_count}x{output_group}xf32, 2>
+          %l1_acc = memref.alloc() : memref<{output_group}xf32, 2>
+          %l1_out = memref.alloc() : memref<{output_group}x{cfg.dtype}, 2>
+
+          air.dma_memcpy_nd (%l1_in[%h0] [%h_h] [%h1],
+                             %herd_in[%h0] [%h_h] [%h1])
+              : (memref<{cfg.H}x{cfg.dtype}, 2>,
+                 memref<{cfg.H}x{cfg.dtype}, 1>)
+          air.dma_memcpy_nd (%l1_scales[%h0, %h0] [%h_blocks, %h_group] [%h_group, %h1],
+                             %herd_scales[%h0, %h0] [%h_blocks, %h_group] [%h_group, %h1])
+              : (memref<{block_count}x{output_group}xf32, 2>,
+                 memref<{block_count}x{output_group}xf32, 1>)
+
+{reductions}
+          air.dma_memcpy_nd (%herd_out[%h0] [%h_group] [%h1],
+                             %l1_out[%h0] [%h_group] [%h1])
+              : (memref<{output_group}x{cfg.dtype}, 1>, memref<{output_group}x{cfg.dtype}, 2>)
+          air.herd_terminator
+        }}
+
+        air.dma_memcpy_nd (%seg_out[%seg_col] [%c_group] [%c1],
+                           %l2_out[%c0] [%c_group] [%c1])
+            : (memref<{cfg.N}x{cfg.dtype}>,
+               memref<{output_group}x{cfg.dtype}, 1>)
+        air.segment_terminator
+      }}
+      air.launch_terminator
+    }}
+    return
+  }}
+}}
+"""
+
+
 def emit_all_kernels(
     cfg: LinearKernelConfig,
     *,
     align_output_dma: bool = False,
+    include_decode_int4: bool = False,
+    decode_int4_block_size: int = 32,
+    decode_int4_quant_axis: int = 0,
+    decode_int4_global_loads: bool = False,
 ) -> dict[str, str]:
-    return {
+    kernels = {
         "prefill": prefill_gemm_air(cfg, align_output_dma=align_output_dma),
         "decode": decode_gemv_air(cfg, align_output_dma=align_output_dma),
     }
+    if include_decode_int4:
+        kernels["decode_int4"] = decode_int4_gemv_air(
+            cfg,
+            block_size=decode_int4_block_size,
+            quant_axis=decode_int4_quant_axis,
+            align_output_dma=align_output_dma,
+            use_global_loads=decode_int4_global_loads,
+        )
+    return kernels
 
 
-def default_air_filenames(cfg: LinearKernelConfig) -> dict[str, str]:
+def default_air_filenames(
+    cfg: LinearKernelConfig,
+    *,
+    include_decode_int4: bool = False,
+    decode_int4_block_size: int = 32,
+) -> dict[str, str]:
     suffix = f"{cfg.dtype}.air.mlir"
-    return {
+    names = {
         "prefill": f"prefill_gemm_m{cfg.M}_k{cfg.K}_h{cfg.H}_{suffix}",
         "decode": f"decode_gemv_h{cfg.H}_n{cfg.N}_{suffix}",
     }
+    if include_decode_int4:
+        names["decode_int4"] = (
+            f"decode_int4_h{cfg.H}_n{cfg.N}_b{decode_int4_block_size}_{suffix}"
+        )
+    return names
 
 
 def write_default_air_sources(
@@ -675,12 +1097,24 @@ def write_default_air_sources(
     output_dir: Path,
     *,
     align_output_dma: bool = False,
+    include_decode_int4: bool = False,
+    decode_int4_block_size: int = 32,
+    decode_int4_quant_axis: int = 0,
+    decode_int4_global_loads: bool = False,
 ) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    names = default_air_filenames(cfg)
+    names = default_air_filenames(
+        cfg,
+        include_decode_int4=include_decode_int4,
+        decode_int4_block_size=decode_int4_block_size,
+    )
     sources = emit_all_kernels(
         cfg,
         align_output_dma=align_output_dma,
+        include_decode_int4=include_decode_int4,
+        decode_int4_block_size=decode_int4_block_size,
+        decode_int4_quant_axis=decode_int4_quant_axis,
+        decode_int4_global_loads=decode_int4_global_loads,
     )
     paths: dict[str, Path] = {}
     for key, text in sources.items():

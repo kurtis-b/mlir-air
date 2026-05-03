@@ -39,14 +39,22 @@ struct LlmLinearDirectRunConfig {
   uint32_t abi_version;
   uint32_t direction;
   uint32_t dtype;
+  uint32_t decode_storage;
+  uint32_t decode_block_size;
+  uint32_t decode_quant_axis;
   uint32_t reserved;
+  uint32_t decode_tile_n;
   uint64_t m;
   uint64_t k;
   uint64_t h;
   uint64_t n;
+  uint64_t decode_packed_bytes;
+  uint64_t decode_scale_bytes;
   const void *input;
   const void *prefill_weights;
   const void *decode_weights;
+  const void *decode_packed_weights;
+  const void *decode_scales;
   void *output;
   void *prefill_output;
   void *decode_input;
@@ -78,13 +86,20 @@ struct LlmLinearGpuStageRunConfig {
   uint32_t abi_version;
   uint32_t stage;
   uint32_t dtype;
+  uint32_t decode_storage;
+  uint32_t decode_block_size;
+  uint32_t decode_quant_axis;
   uint32_t reserved;
+  uint32_t reserved1;
   uint64_t m;
   uint64_t k;
   uint64_t h;
   uint64_t n;
+  uint64_t decode_packed_bytes;
+  uint64_t decode_scale_bytes;
   const void *input;
   const void *weights;
+  const void *scales;
   void *output;
   const char *gpu_so;
 };
@@ -110,11 +125,13 @@ int llm_linear_direct_bridge_run_gpu_stage(
 
 namespace {
 
-constexpr uint32_t kAbiVersion = 1;
+constexpr uint32_t kAbiVersion = 2;
 constexpr uint32_t kDirectionGpuPrefillNpuDecode = 0;
 constexpr uint32_t kDirectionNpuPrefillGpuDecode = 1;
 constexpr uint32_t kGpuStagePrefill = 0;
 constexpr uint32_t kGpuStageDecode = 1;
+constexpr uint32_t kDecodeStorageDense = 0;
+constexpr uint32_t kDecodeStorageInt4 = 1;
 constexpr uint32_t kImportXrtBoFromHipVmemFd = 3;
 constexpr const char *kContractNoHostCopies = "no_host_copies";
 constexpr const char *kHipVmemMechanism = "hip_vmem_export_xrt_bo_import_fd";
@@ -486,6 +503,8 @@ MemRef<2> memref2(void *ptr, int64_t d0, int64_t d1) {
 
 using PrefillFn = void (*)(MemRef<2> *, MemRef<2> *, MemRef<2> *);
 using DecodeFn = void (*)(MemRef<1> *, MemRef<2> *, MemRef<1> *);
+using DecodeInt4Fn = void (*)(MemRef<1> *, MemRef<2> *, MemRef<2> *,
+                              MemRef<1> *);
 
 class SharedLibrary {
 public:
@@ -583,9 +602,22 @@ public:
     run.wait();
   }
 
+  void run4(xrt::bo &arg0, xrt::bo &arg1, xrt::bo &arg2, xrt::bo &arg3) {
+    bo_instr_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    unsigned int opcode = 3;
+    unsigned int instr_count = static_cast<unsigned int>(instructions_.size());
+    auto run = kernel_(opcode, bo_instr_, instr_count, arg0, arg1, arg2, arg3);
+    run.wait();
+  }
+
   void run3(PooledHipVmemBo &arg0, PooledHipVmemBo &arg1,
             PooledHipVmemBo &arg2) {
     run3(arg0->bo(), arg1->bo(), arg2->bo());
+  }
+
+  void run4(PooledHipVmemBo &arg0, PooledHipVmemBo &arg1, PooledHipVmemBo &arg2,
+            PooledHipVmemBo &arg3) {
+    run4(arg0->bo(), arg1->bo(), arg2->bo(), arg3->bo());
   }
 
 private:
@@ -818,17 +850,93 @@ size_t elem_size(uint32_t dtype) {
   throw std::runtime_error("unsupported dtype enum in direct bridge");
 }
 
+bool decode_is_int4(uint32_t storage) {
+  if (storage == kDecodeStorageDense)
+    return false;
+  if (storage == kDecodeStorageInt4)
+    return true;
+  throw std::runtime_error("unsupported decode storage enum in direct bridge");
+}
+
+size_t decode_dense_weight_bytes(const LlmLinearDirectRunConfig &cfg) {
+  return cfg.h * cfg.n * elem_size(cfg.dtype);
+}
+
+size_t decode_int4_packed_bytes(uint64_t h, uint64_t n) { return h * (n / 2); }
+
+uint64_t decode_int4_packed_word_cols(uint64_t n) { return n / 8; }
+
+size_t decode_int4_scale_bytes(uint64_t h, uint64_t n, uint32_t block_size) {
+  return (h / block_size) * n * sizeof(float);
+}
+
+void stage_decode_int4_packed_tile(const LlmLinearDirectRunConfig &cfg,
+                                   uint64_t start_n, uint64_t tile_n,
+                                   std::vector<uint8_t> &dst) {
+  const uint64_t full_words = decode_int4_packed_word_cols(cfg.n);
+  const uint64_t tile_words = decode_int4_packed_word_cols(tile_n);
+  const uint64_t word_start = start_n / 8;
+  const auto *src = static_cast<const uint32_t *>(cfg.decode_packed_weights);
+  auto *out = reinterpret_cast<uint32_t *>(dst.data());
+  for (uint64_t row = 0; row < cfg.h; ++row) {
+    std::memcpy(out + row * tile_words, src + row * full_words + word_start,
+                tile_words * sizeof(uint32_t));
+  }
+}
+
+void stage_decode_int4_scale_tile(const LlmLinearDirectRunConfig &cfg,
+                                  uint64_t start_n, uint64_t tile_n,
+                                  std::vector<uint8_t> &dst) {
+  const uint64_t block_count = cfg.h / cfg.decode_block_size;
+  const auto *src = static_cast<const float *>(cfg.decode_scales);
+  auto *out = reinterpret_cast<float *>(dst.data());
+  for (uint64_t block = 0; block < block_count; ++block) {
+    std::memcpy(out + block * tile_n, src + block * cfg.n + start_n,
+                tile_n * sizeof(float));
+  }
+}
+
+void validate_decode_int4_metadata(uint64_t h, uint64_t n, uint32_t block_size,
+                                   uint32_t quant_axis) {
+  if (block_size == 0)
+    throw std::runtime_error("int4 decode block_size must be positive");
+  if (quant_axis != 0)
+    throw std::runtime_error("int4 decode hardware requires quant_axis == 0");
+  if ((h % block_size) != 0)
+    throw std::runtime_error(
+        "int4 decode hardware requires H % block_size == 0");
+  if ((n % 8) != 0)
+    throw std::runtime_error("int4 decode hardware requires N divisible by 8");
+}
+
 void validate_config(const LlmLinearDirectRunConfig &cfg) {
   if (cfg.abi_version != kAbiVersion)
     throw std::runtime_error("unsupported direct bridge ABI version");
   if (cfg.direction != kDirectionGpuPrefillNpuDecode &&
       cfg.direction != kDirectionNpuPrefillGpuDecode)
     throw std::runtime_error("unsupported direct bridge direction");
-  if (!cfg.input || !cfg.prefill_weights || !cfg.decode_weights || !cfg.output)
+  if (!cfg.input || !cfg.prefill_weights || !cfg.output)
     throw std::runtime_error("direct bridge run received null host buffer");
   if (cfg.m == 0 || cfg.k == 0 || cfg.h == 0 || cfg.n == 0)
     throw std::runtime_error("direct bridge run received zero shape dimension");
   (void)elem_size(cfg.dtype);
+  if (decode_is_int4(cfg.decode_storage)) {
+    validate_decode_int4_metadata(cfg.h, cfg.n, cfg.decode_block_size,
+                                  cfg.decode_quant_axis);
+    const size_t expected_packed = decode_int4_packed_bytes(cfg.h, cfg.n);
+    const size_t expected_scales =
+        decode_int4_scale_bytes(cfg.h, cfg.n, cfg.decode_block_size);
+    if (!cfg.decode_packed_weights || !cfg.decode_scales)
+      throw std::runtime_error(
+          "int4 direct bridge run received null packed/scales");
+    if (cfg.decode_packed_bytes != expected_packed ||
+        cfg.decode_scale_bytes != expected_scales)
+      throw std::runtime_error(
+          "int4 direct bridge run received invalid packed/scales byte counts");
+  } else if (!cfg.decode_weights) {
+    throw std::runtime_error(
+        "dense direct bridge run received null decode weights");
+  }
 }
 
 void validate_gpu_stage_config(const LlmLinearGpuStageRunConfig &cfg) {
@@ -844,6 +952,19 @@ void validate_gpu_stage_config(const LlmLinearGpuStageRunConfig &cfg) {
   if (cfg.stage == kGpuStageDecode && (cfg.h == 0 || cfg.n == 0))
     throw std::runtime_error("GPU decode stage received zero shape dimension");
   (void)elem_size(cfg.dtype);
+  if (cfg.stage == kGpuStageDecode && decode_is_int4(cfg.decode_storage)) {
+    validate_decode_int4_metadata(cfg.h, cfg.n, cfg.decode_block_size,
+                                  cfg.decode_quant_axis);
+    const size_t expected_packed = decode_int4_packed_bytes(cfg.h, cfg.n);
+    const size_t expected_scales =
+        decode_int4_scale_bytes(cfg.h, cfg.n, cfg.decode_block_size);
+    if (!cfg.scales)
+      throw std::runtime_error("int4 GPU decode stage received null scales");
+    if (cfg.decode_packed_bytes != expected_packed ||
+        cfg.decode_scale_bytes != expected_scales)
+      throw std::runtime_error(
+          "int4 GPU decode stage received invalid packed/scales byte counts");
+  }
 }
 
 void run_gpu_prefill(const LlmLinearDirectRunConfig &cfg,
@@ -875,6 +996,25 @@ void run_gpu_decode(const LlmLinearDirectRunConfig &cfg,
   check_hip(hipDeviceSynchronize(), "hipDeviceSynchronize(gpu decode)");
 }
 
+void run_gpu_decode_int4(const LlmLinearDirectRunConfig &cfg,
+                         PooledHipVmemBo &handoff, PooledHipVmemBo &packed,
+                         PooledHipVmemBo &scales, PooledHipVmemBo &output,
+                         uint64_t offset_bytes) {
+  SharedLibrary lib(cfg.gpu_decode_so);
+  DecodeInt4Fn decode = lib.symbol<DecodeInt4Fn>("llm_linear_decode_int4");
+  auto input_ref =
+      memref1(handoff->hip_ptr(offset_bytes), static_cast<int64_t>(cfg.h));
+  auto packed_ref =
+      memref2(packed->hip_ptr(), static_cast<int64_t>(cfg.h),
+              static_cast<int64_t>(decode_int4_packed_word_cols(cfg.n)));
+  auto scales_ref = memref2(scales->hip_ptr(),
+                            static_cast<int64_t>(cfg.h / cfg.decode_block_size),
+                            static_cast<int64_t>(cfg.n));
+  auto output_ref = memref1(output->hip_ptr(), static_cast<int64_t>(cfg.n));
+  decode(&input_ref, &packed_ref, &scales_ref, &output_ref);
+  check_hip(hipDeviceSynchronize(), "hipDeviceSynchronize(gpu int4 decode)");
+}
+
 void run_gpu_prefill_stage(const LlmLinearGpuStageRunConfig &cfg,
                            HipDeviceBuffer &input, HipDeviceBuffer &weights,
                            HipDeviceBuffer &output) {
@@ -903,6 +1043,25 @@ void run_gpu_decode_stage(const LlmLinearGpuStageRunConfig &cfg,
   check_hip(hipDeviceSynchronize(), "hipDeviceSynchronize(native gpu decode)");
 }
 
+void run_gpu_decode_int4_stage(const LlmLinearGpuStageRunConfig &cfg,
+                               HipDeviceBuffer &input, HipDeviceBuffer &packed,
+                               HipDeviceBuffer &scales,
+                               HipDeviceBuffer &output) {
+  SharedLibrary lib(cfg.gpu_so);
+  DecodeInt4Fn decode = lib.symbol<DecodeInt4Fn>("llm_linear_decode_int4");
+  auto input_ref = memref1(input.hip_ptr(), static_cast<int64_t>(cfg.h));
+  auto packed_ref =
+      memref2(packed.hip_ptr(), static_cast<int64_t>(cfg.h),
+              static_cast<int64_t>(decode_int4_packed_word_cols(cfg.n)));
+  auto scales_ref = memref2(scales.hip_ptr(),
+                            static_cast<int64_t>(cfg.h / cfg.decode_block_size),
+                            static_cast<int64_t>(cfg.n));
+  auto output_ref = memref1(output.hip_ptr(), static_cast<int64_t>(cfg.n));
+  decode(&input_ref, &packed_ref, &scales_ref, &output_ref);
+  check_hip(hipDeviceSynchronize(),
+            "hipDeviceSynchronize(native gpu int4 decode)");
+}
+
 void copy_gpu_decode_row(PooledHipVmemBo &handoff, PooledHipVmemBo &row,
                          size_t bytes, uint64_t offset_bytes) {
   if (bytes == 0)
@@ -921,19 +1080,42 @@ void run_gpu_to_npu(const LlmLinearDirectRunConfig &cfg,
   const size_t input_bytes = cfg.m * cfg.k * es;
   const size_t prefill_weight_bytes = cfg.k * cfg.h * es;
   const size_t handoff_bytes = cfg.m * cfg.h * es;
-  const size_t decode_weight_bytes = cfg.h * cfg.n * es;
+  const bool int4_decode = decode_is_int4(cfg.decode_storage);
+  const uint64_t decode_tile_n =
+      int4_decode ? std::min<uint64_t>(
+                        cfg.n, cfg.decode_tile_n ? cfg.decode_tile_n : cfg.n)
+                  : cfg.n;
+  if (int4_decode && (decode_tile_n == 0 || cfg.n % decode_tile_n != 0))
+    throw std::runtime_error("int4 direct NPU decode requires N % tile_n == 0");
+  const bool tiled_int4_decode = int4_decode && decode_tile_n < cfg.n;
+  const size_t decode_weight_bytes =
+      int4_decode ? decode_int4_packed_bytes(cfg.h, decode_tile_n)
+                  : decode_dense_weight_bytes(cfg);
+  const size_t decode_scale_bytes =
+      int4_decode
+          ? decode_int4_scale_bytes(cfg.h, decode_tile_n, cfg.decode_block_size)
+          : 0;
   const size_t output_bytes = cfg.n * es;
+  const size_t output_tile_bytes = decode_tile_n * es;
 
   auto &device = decode_kernel.device();
   auto input = acquire_hip_vmem_xrt_bo(device, input_bytes);
   auto prefill_weights = acquire_hip_vmem_xrt_bo(device, prefill_weight_bytes);
   auto handoff = acquire_hip_vmem_xrt_bo(device, handoff_bytes);
   auto decode_weights = acquire_hip_vmem_xrt_bo(device, decode_weight_bytes);
-  auto output = acquire_hip_vmem_xrt_bo(device, output_bytes);
+  auto decode_scales = int4_decode
+                           ? acquire_hip_vmem_xrt_bo(device, decode_scale_bytes)
+                           : PooledHipVmemBo();
+  auto output = acquire_hip_vmem_xrt_bo(
+      device, tiled_int4_decode ? output_tile_bytes : output_bytes);
 
   input->hip_write_host(cfg.input);
   prefill_weights->hip_write_host(cfg.prefill_weights);
-  decode_weights->xrt_write_host(cfg.decode_weights);
+  if (!tiled_int4_decode)
+    decode_weights->xrt_write_host(int4_decode ? cfg.decode_packed_weights
+                                               : cfg.decode_weights);
+  if (int4_decode && !tiled_int4_decode)
+    decode_scales->xrt_write_host(cfg.decode_scales);
 
   const uint64_t prefill_start = now_us();
   run_gpu_prefill(cfg, input, prefill_weights, handoff);
@@ -947,13 +1129,30 @@ void run_gpu_to_npu(const LlmLinearDirectRunConfig &cfg,
   result.handoff_us = now_us() - handoff_start;
 
   const uint64_t decode_start = now_us();
-  decode_kernel.run3(decode_input, decode_weights, output);
+  if (tiled_int4_decode) {
+    std::vector<uint8_t> staged_decode_weights(decode_weight_bytes, 0);
+    std::vector<uint8_t> staged_decode_scales(decode_scale_bytes, 0);
+    for (uint64_t start_n = 0; start_n < cfg.n; start_n += decode_tile_n) {
+      stage_decode_int4_packed_tile(cfg, start_n, decode_tile_n,
+                                    staged_decode_weights);
+      stage_decode_int4_scale_tile(cfg, start_n, decode_tile_n,
+                                   staged_decode_scales);
+      decode_weights->xrt_write_host(staged_decode_weights.data());
+      decode_scales->xrt_write_host(staged_decode_scales.data());
+      decode_kernel.run4(decode_input, decode_weights, decode_scales, output);
+      output->xrt_read_host(static_cast<uint8_t *>(cfg.output) + start_n * es);
+    }
+  } else if (int4_decode) {
+    decode_kernel.run4(decode_input, decode_weights, decode_scales, output);
+  } else {
+    decode_kernel.run3(decode_input, decode_weights, output);
+  }
   result.decode_us = now_us() - decode_start;
 
   if (cfg.prefill_output)
     handoff->sync_to_xrt(handoff_bytes);
-  decode_weights->sync_from_xrt(decode_weight_bytes);
-  output->xrt_read_host(cfg.output);
+  if (!tiled_int4_decode)
+    output->xrt_read_host(cfg.output);
   if (cfg.prefill_output)
     handoff->xrt_read_host(cfg.prefill_output);
   if (cfg.decode_input) {
@@ -974,41 +1173,61 @@ void run_npu_to_gpu(const LlmLinearDirectRunConfig &cfg,
   NpuKernel prefill_kernel(cfg.npu_prefill_xclbin, cfg.npu_prefill_insts,
                            cfg.npu_kernel_name);
   const size_t es = elem_size(cfg.dtype);
-  const size_t input_bytes = cfg.m * cfg.k * es;
-  const size_t prefill_weight_bytes = cfg.k * cfg.h * es;
+  const uint64_t prefill_tile_h = std::min<uint64_t>(cfg.h, 512);
+  const size_t row_input_bytes = cfg.k * es;
+  const size_t prefill_weight_tile_bytes = cfg.k * prefill_tile_h * es;
   const size_t handoff_bytes = cfg.m * cfg.h * es;
-  const size_t decode_weight_bytes = cfg.h * cfg.n * es;
+  const bool int4_decode = decode_is_int4(cfg.decode_storage);
+  const size_t decode_weight_bytes =
+      int4_decode ? decode_int4_packed_bytes(cfg.h, cfg.n)
+                  : decode_dense_weight_bytes(cfg);
+  const size_t decode_scale_bytes =
+      int4_decode ? decode_int4_scale_bytes(cfg.h, cfg.n, cfg.decode_block_size)
+                  : 0;
   const size_t output_bytes = cfg.n * es;
 
   auto &device = prefill_kernel.device();
-  auto input = acquire_hip_vmem_xrt_bo(device, input_bytes);
-  auto prefill_weights = acquire_hip_vmem_xrt_bo(device, prefill_weight_bytes);
+  auto input = acquire_hip_vmem_xrt_bo(device, row_input_bytes);
+  auto prefill_weights =
+      acquire_hip_vmem_xrt_bo(device, prefill_weight_tile_bytes);
   auto handoff = acquire_hip_vmem_xrt_bo(device, handoff_bytes);
-  auto prefill_temp = acquire_hip_vmem_xrt_bo(device, handoff_bytes);
+  auto prefill_temp = acquire_hip_vmem_xrt_bo(device, prefill_tile_h * es);
   auto decode_weights = acquire_hip_vmem_xrt_bo(device, decode_weight_bytes);
+  auto decode_scales = int4_decode
+                           ? acquire_hip_vmem_xrt_bo(device, decode_scale_bytes)
+                           : PooledHipVmemBo();
   auto output = acquire_hip_vmem_xrt_bo(device, output_bytes);
 
-  prefill_weights->xrt_write_host(cfg.prefill_weights);
-  decode_weights->hip_write_host(cfg.decode_weights);
+  decode_weights->hip_write_host(int4_decode ? cfg.decode_packed_weights
+                                             : cfg.decode_weights);
+  if (int4_decode)
+    decode_scales->hip_write_host(cfg.decode_scales);
 
-  const size_t row_input_bytes = cfg.k * es;
   const size_t row_output_bytes = cfg.h * es;
-  std::vector<uint8_t> staged_input(input_bytes, 0);
+  std::vector<uint8_t> staged_weights(prefill_weight_tile_bytes, 0);
   const uint64_t prefill_start = now_us();
   for (uint64_t row = 0; row < cfg.m; ++row) {
-    std::fill(staged_input.begin(), staged_input.end(), 0);
-    std::memcpy(staged_input.data(),
-                static_cast<const uint8_t *>(cfg.input) + row * row_input_bytes,
-                row_input_bytes);
-    input->xrt_write_host(staged_input.data());
-    trace_step("n2g: before npu prefill row");
-    prefill_kernel.run3(input, prefill_weights, prefill_temp);
-    trace_step("n2g: after npu prefill row");
-    prefill_temp->sync_from_xrt(row_output_bytes, 0);
-    check_hip(hipMemcpy(handoff->hip_ptr(row * row_output_bytes),
-                        prefill_temp->hip_ptr(), row_output_bytes,
-                        hipMemcpyDeviceToDevice),
-              "hipMemcpy D2D(npu prefill row handoff)");
+    input->xrt_write_host(static_cast<const uint8_t *>(cfg.input) +
+                          row * row_input_bytes);
+    for (uint64_t tile = 0; tile < cfg.h; tile += prefill_tile_h) {
+      const uint64_t width = std::min<uint64_t>(prefill_tile_h, cfg.h - tile);
+      std::fill(staged_weights.begin(), staged_weights.end(), 0);
+      for (uint64_t k = 0; k < cfg.k; ++k) {
+        const uint8_t *src = static_cast<const uint8_t *>(cfg.prefill_weights) +
+                             (k * cfg.h + tile) * es;
+        uint8_t *dst = staged_weights.data() + k * prefill_tile_h * es;
+        std::memcpy(dst, src, width * es);
+      }
+      prefill_weights->xrt_write_host(staged_weights.data());
+      trace_step("n2g: before npu prefill tile");
+      prefill_kernel.run3(input, prefill_weights, prefill_temp);
+      trace_step("n2g: after npu prefill tile");
+      prefill_temp->sync_from_xrt(width * es, 0);
+      check_hip(hipMemcpy(handoff->hip_ptr(row * row_output_bytes + tile * es),
+                          prefill_temp->hip_ptr(), width * es,
+                          hipMemcpyDeviceToDevice),
+                "hipMemcpy D2D(npu prefill tile handoff)");
+    }
   }
   check_hip(hipDeviceSynchronize(), "hipDeviceSynchronize(npu prefill rows)");
   result.prefill_us = now_us() - prefill_start;
@@ -1019,7 +1238,11 @@ void run_npu_to_gpu(const LlmLinearDirectRunConfig &cfg,
   const uint64_t offset = (cfg.m - 1) * cfg.h * es;
   trace_step("n2g: before gpu decode");
   const uint64_t decode_start = now_us();
-  run_gpu_decode(cfg, handoff, decode_weights, output, offset);
+  if (int4_decode)
+    run_gpu_decode_int4(cfg, handoff, decode_weights, decode_scales, output,
+                        offset);
+  else
+    run_gpu_decode(cfg, handoff, decode_weights, output, offset);
   result.decode_us = now_us() - decode_start;
   trace_step("n2g: after gpu decode");
 
@@ -1131,22 +1354,37 @@ llm_linear_direct_bridge_run_gpu_stage(const LlmLinearGpuStageRunConfig *config,
     check_hip(hipSetDevice(0), "hipSetDevice(0)");
     const size_t es = elem_size(config->dtype);
     const bool is_prefill = config->stage == kGpuStagePrefill;
+    const bool int4_decode =
+        !is_prefill && decode_is_int4(config->decode_storage);
     const size_t input_bytes =
         (is_prefill ? config->m * config->k : config->h) * es;
     const size_t weight_bytes =
-        (is_prefill ? config->k * config->h : config->h * config->n) * es;
+        is_prefill
+            ? config->k * config->h * es
+            : (int4_decode ? decode_int4_packed_bytes(config->h, config->n)
+                           : config->h * config->n * es);
+    const size_t scale_bytes =
+        int4_decode ? decode_int4_scale_bytes(config->h, config->n,
+                                              config->decode_block_size)
+                    : 0;
     const size_t output_bytes =
         (is_prefill ? config->m * config->h : config->n) * es;
 
     HipDeviceBuffer input(input_bytes);
     HipDeviceBuffer weights(weight_bytes);
+    auto scales =
+        int4_decode ? std::make_unique<HipDeviceBuffer>(scale_bytes) : nullptr;
     HipDeviceBuffer output(output_bytes);
     input.hip_write_host(config->input);
     weights.hip_write_host(config->weights);
+    if (int4_decode)
+      scales->hip_write_host(config->scales);
 
     const uint64_t stage_start = now_us();
     if (is_prefill)
       run_gpu_prefill_stage(*config, input, weights, output);
+    else if (int4_decode)
+      run_gpu_decode_int4_stage(*config, input, weights, *scales, output);
     else
       run_gpu_decode_stage(*config, input, weights, output);
     result->stage_us = now_us() - stage_start;
