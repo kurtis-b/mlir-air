@@ -218,8 +218,11 @@ Acceptance:
 ### Milestone 2: Direct Bidirectional GPU/NPU Handoff
 
 Status as of May 3, 2026: implemented through the AIR generator, runtime, and
-native bridge boundary, but not accepted as a working direct handoff path on the
-current machine because the low-level XRT/HIP import probe fails closed.
+native bridge boundary, and experimentally narrowed to a feasible low-level
+handoff direction. It is still not accepted as a working direct benchmark path
+because the checked-in native bridge owns handoff allocations from the XRT side,
+while the successful probe direction owns them from the HIP VMem side and
+imports them into XRT.
 
 Implemented scope:
 
@@ -246,13 +249,29 @@ Implemented scope:
   the direct edge with zero NumPy host materializations and keeps host-staged
   mixed execution as the baseline.
 
-Current hardware blocker:
+Current transfer-method evidence:
 
-- On the local Ryzen AI/XRT/HIP stack, the native probe isolates each candidate
-  XRT BO flag in a child process and reports that `p2p`, `device_only`,
-  `carveout`, and `normal` BO export handles all abort during HIP VMem fd
-  import. Direct mode therefore remains fail-closed on this machine until the
-  XRT/HIP interop layer can import one of those BO types without crashing.
+- The original XRT-owned direction remains blocked. Exporting XRT BOs into HIP
+  VMem or HIP external memory failed, timed out, or signaled for every tested BO
+  flag: `normal`, `cacheable`, `host_only`, `device_only`, `p2p`, `svm`, and
+  `carveout`.
+- HIP-owned VMem exported as a POSIX fd and imported with
+  `xrt::bo(device, export_handle)` passed the import probe and isolated
+  visibility checks. GPU writes were observed through the XRT BO, and XRT
+  writes were observed through the HIP virtual address, but repeated
+  process-level runs are not stable enough for benchmark acceptance.
+- A prebuilt NPU vecadd xclbin consumed and produced HIP-owned imported XRT BOs
+  successfully in a fresh probe run, proving this is the best candidate for
+  direct GPU/NPU handoff.
+- Repeated NPU vecadd probe runs later showed signal/hang instability, so the
+  next bridge must use persistent HIP VMem allocations, persistent XRT context,
+  and disciplined object lifetime rather than per-method allocation teardown.
+- `xrt::bo::flags::host_only` mapped and `hipHostRegister`-registered memory can
+  work as a shared host-memory path, but it is not the device-resident direct
+  handoff required for acceptance.
+
+Detailed probe notes are in
+[`npu_gpu_transfer_methods.md`](npu_gpu_transfer_methods.md).
 
 Goal: make the mixed path device-resident. This milestone is required before the
 roadmap can be considered finished.
@@ -261,8 +280,8 @@ Checklist:
 
 - Keep the checked-in `DeviceResidentTensor` interface as the AIR runtime
   contract for direct mixed LLM-linear cases.
-- Use the checked-in C++ bridge as the implementation point for XRT BO export,
-  HIP VMem import, GPU direct shared-library calls, and XRT kernel launches.
+- Pivot the checked-in C++ bridge from XRT-owned BO export to HIP-owned VMem fd
+  export plus XRT BO import.
 - Keep both GPU-to-NPU and NPU-to-GPU directions wired through the bridge.
 - Preserve explicit synchronization reporting for each handoff.
 - Preserve trace and result fields that prove no NumPy host array is in the
