@@ -375,8 +375,7 @@ Acceptance:
 
 ### Milestone 3: Fused int4 Weight Dequantization
 
-Status as of May 3, 2026: implemented for decode GEMV in the `llm_linear`
-CPU-safe path.
+Status as of May 3, 2026: accepted for the Milestone 3 hardware gate.
 
 Implemented scope:
 
@@ -385,19 +384,28 @@ Implemented scope:
   low-nibble-first packing metadata.
 - CPU decode supports fused unpack/dequantize plus linear GEMV and validates
   against a dequantize-then-linear baseline.
-- Result JSON/CSV/report fields include decode weight storage, dequant time,
-  linear time, packed bytes read, scale bytes read, and zero-point bytes read.
+- GPU and NPU decode support hardware-fused signed int4 GEMV for
+  `quant_axis=0`, `H % block_size == 0`, and `N % 8 == 0`.
+- Direct GPU/NPU bridge runs carry quantized decode metadata plus packed
+  weights and scales while keeping the Milestone 2 direct handoff ABI version
+  stable.
+- Result JSON/CSV/report fields include decode weight storage, block size,
+  quant axis, kernel key, hardware-fused eligibility, NPU tile width, dequant
+  time when applicable, linear time, packed bytes, scale bytes, and zero-point
+  bytes.
 
 Goal: test the low-bit decode pattern that makes NPU GEMV potentially
 interesting for LLM inference.
 
 Checklist:
 
-- Add int4 or uint4 packed-weight metadata as future benchmark input schema:
+- Add int4 or uint4 packed-weight metadata as benchmark input schema:
   block size, quant axis, signedness, scales, zero points when applicable, and
   packing layout.
-- Implement fused weight dequantization inside GEMV first, with bf16 compute and
-  CPU reference validation.
+- Implement fused weight dequantization inside GEMV, with bf16 compute and CPU
+  reference validation.
+- Generate GPU `streamed_l1` and NPU `staged_l2` AIR variants for signed int4
+  decode while preserving the generated function ABI.
 - Extend to GEMM only after GEMV correctness and layout are stable.
 - Compare fused dequant+linear against dequantize-then-linear baselines.
 - Keep representative patterns aligned with weight-only MatMul quantization
@@ -405,9 +413,18 @@ Checklist:
 
 Acceptance:
 
-- int4 dequant+GEMV matches the CPU reference within dtype-aware tolerances.
-- Reports separate dequant overhead, linear compute time, and bytes read when
-  that detail is available.
+- The accepted hardware command is:
+  `source /opt/xilinx/xrt/setup.sh && ../../sandbox/bin/python run_llm_linear_milestone3.py`.
+- The accepted output root is
+  `llm_linear/artifacts/benchmarks/milestone3_int4_hw`.
+- The accepted coverage is `tiny_ci`, `medium`, and `llm_like` across
+  `gpu_only`, `npu_only`, host-mixed GPU/NPU, and direct mixed GPU/NPU cases.
+- int4 dequant+GEMV matches the CPU reference within dtype-aware tolerances on
+  every accepted hardware case.
+- Acceptance logs must not contain `Reverting to host copy of buffers` or
+  `exec_buf: Operation not supported`.
+- Reports separate hardware-fused status, dequant overhead when measured,
+  linear compute time, and bytes read when that detail is available.
 - No current MoE result is reinterpreted as int4 evidence.
 
 ### Milestone 4: Final Crossover and Speedup Study
@@ -468,6 +485,8 @@ For the current checked-in implementation:
 - The README link to this file must resolve.
 - This file must record the accepted Milestone 2 command, output root, and date
   when the hardware acceptance wrapper passes.
+- This file must record the accepted Milestone 3 command, output root, covered
+  suites, and date when the int4 hardware acceptance wrapper passes.
 - Focused CPU-safe checks must pass:
   `../../sandbox/bin/python -m pytest tests/test_llm_linear_*`.
 - Full harness checks should pass when time allows:
@@ -488,6 +507,17 @@ For direct-handoff acceptance:
   a successful `probe_direct_bridge()` on the target machine before direct cases
   are run.
 - Correctness must pass against a CPU reference.
+
+For int4 hardware decode acceptance:
+
+- `../../sandbox/bin/python run_llm_linear_milestone3.py` is the preferred
+  acceptance wrapper. It builds the same bridge, runs `tiny_ci`, `medium`, and
+  `llm_like` signed-int4 decode suites, captures logs under
+  `llm_linear/artifacts/benchmarks/milestone3_int4_hw/logs/`, rejects the known
+  XRT host-copy warning strings, and validates quantized decode result JSON
+  fields.
+- GPU/NPU accelerator decode must remain fail-closed to signed `int4`,
+  `quant_axis=0`, `H % block_size == 0`, and `N % 8 == 0`.
 - Host-staged and direct-handoff paths must be timed separately.
 - GPU-to-NPU and NPU-to-GPU handoff proof must be present in result artifacts.
 - int4 dequant+linear correctness must pass before performance claims.

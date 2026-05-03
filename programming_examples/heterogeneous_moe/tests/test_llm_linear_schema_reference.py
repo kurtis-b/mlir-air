@@ -10,6 +10,7 @@ import pytest
 
 from llm_linear.manifest import load_json
 from llm_linear.quantization import (
+    decode_quantization_plan_from_manifest,
     decode_gemv_fused_dequant,
     dequantize_packed_weights,
     metadata_for_packed_weights,
@@ -135,3 +136,24 @@ def test_linear_quantized_decode_matches_dequantized_baseline() -> None:
     np.testing.assert_allclose(fused, baseline)
     assert detail["packed_weight_bytes_read"] == packed.packed.nbytes
     assert packed.descriptor()["quant_kind"] == "int4"
+    plan = decode_quantization_plan_from_manifest(
+        {
+            "weights": {
+                "decode": {
+                    "storage": "int4",
+                    "block_size": 4,
+                    "quant_axis": 0,
+                }
+            }
+        },
+        shape=(8, 16),
+        npu_decode_tile_n=8,
+    )
+    assert plan is not None
+    assert plan.kernel_key == "decode_int4"
+    assert plan.hardware_fused is True
+    assert plan.packed_shape == (8, 2)
+    assert plan.packed_bytes == 64
+    assert plan.scale_shape == (2, 16)
+    assert plan.scale_bytes == 128
+    assert plan.npu_decode_tile_n == 8

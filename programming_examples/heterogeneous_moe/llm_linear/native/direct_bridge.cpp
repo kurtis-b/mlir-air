@@ -858,46 +858,39 @@ bool decode_is_int4(uint32_t storage) {
   throw std::runtime_error("unsupported decode storage enum in direct bridge");
 }
 
-size_t decode_dense_weight_bytes(const LlmLinearDirectRunConfig &cfg) {
-  return cfg.h * cfg.n * elem_size(cfg.dtype);
-}
+struct DecodeLayout {
+  bool int4 = false;
+  uint64_t h = 0;
+  uint64_t n = 0;
+  size_t element_bytes = 0;
+  uint32_t block_size = 0;
+  uint32_t quant_axis = 0;
+  uint64_t block_count = 0;
+  uint64_t packed_word_cols = 0;
+  uint64_t tile_n = 0;
 
-size_t decode_int4_packed_bytes(uint64_t h, uint64_t n) { return h * (n / 2); }
-
-uint64_t decode_int4_packed_word_cols(uint64_t n) { return n / 8; }
-
-size_t decode_int4_scale_bytes(uint64_t h, uint64_t n, uint32_t block_size) {
-  return (h / block_size) * n * sizeof(float);
-}
-
-void stage_decode_int4_packed_tile(const LlmLinearDirectRunConfig &cfg,
-                                   uint64_t start_n, uint64_t tile_n,
-                                   std::vector<uint8_t> &dst) {
-  const uint64_t full_words = decode_int4_packed_word_cols(cfg.n);
-  const uint64_t tile_words = decode_int4_packed_word_cols(tile_n);
-  const uint64_t word_start = start_n / 8;
-  const auto *src = static_cast<const uint32_t *>(cfg.decode_packed_weights);
-  auto *out = reinterpret_cast<uint32_t *>(dst.data());
-  for (uint64_t row = 0; row < cfg.h; ++row) {
-    std::memcpy(out + row * tile_words, src + row * full_words + word_start,
-                tile_words * sizeof(uint32_t));
+  size_t dense_weight_bytes() const { return h * n * element_bytes; }
+  size_t packed_bytes() const { return h * (n / 2); }
+  size_t scale_bytes() const { return block_count * n * sizeof(float); }
+  size_t packed_tile_bytes() const { return h * (tile_n / 2); }
+  size_t scale_tile_bytes() const {
+    return block_count * tile_n * sizeof(float);
   }
-}
+  bool tiled_int4() const { return int4 && tile_n < n; }
+};
 
-void stage_decode_int4_scale_tile(const LlmLinearDirectRunConfig &cfg,
-                                  uint64_t start_n, uint64_t tile_n,
-                                  std::vector<uint8_t> &dst) {
-  const uint64_t block_count = cfg.h / cfg.decode_block_size;
-  const auto *src = static_cast<const float *>(cfg.decode_scales);
-  auto *out = reinterpret_cast<float *>(dst.data());
-  for (uint64_t block = 0; block < block_count; ++block) {
-    std::memcpy(out + block * tile_n, src + block * cfg.n + start_n,
-                tile_n * sizeof(float));
-  }
-}
+DecodeLayout make_decode_layout(uint64_t h, uint64_t n, uint32_t dtype,
+                                uint32_t storage, uint32_t block_size,
+                                uint32_t quant_axis,
+                                uint32_t requested_tile_n = 0) {
+  DecodeLayout layout;
+  layout.int4 = decode_is_int4(storage);
+  layout.h = h;
+  layout.n = n;
+  layout.element_bytes = elem_size(dtype);
+  if (!layout.int4)
+    return layout;
 
-void validate_decode_int4_metadata(uint64_t h, uint64_t n, uint32_t block_size,
-                                   uint32_t quant_axis) {
   if (block_size == 0)
     throw std::runtime_error("int4 decode block_size must be positive");
   if (quant_axis != 0)
@@ -907,6 +900,41 @@ void validate_decode_int4_metadata(uint64_t h, uint64_t n, uint32_t block_size,
         "int4 decode hardware requires H % block_size == 0");
   if ((n % 8) != 0)
     throw std::runtime_error("int4 decode hardware requires N divisible by 8");
+  layout.block_size = block_size;
+  layout.quant_axis = quant_axis;
+  layout.block_count = h / block_size;
+  layout.packed_word_cols = n / 8;
+  layout.tile_n =
+      std::min<uint64_t>(n, requested_tile_n ? requested_tile_n : n);
+  if (layout.tile_n == 0 || (layout.tile_n % 8) != 0 ||
+      (n % layout.tile_n) != 0)
+    throw std::runtime_error("int4 direct NPU decode requires N % tile_n == 0");
+  return layout;
+}
+
+void stage_decode_int4_packed_tile(const LlmLinearDirectRunConfig &cfg,
+                                   const DecodeLayout &layout, uint64_t start_n,
+                                   std::vector<uint8_t> &dst) {
+  const uint64_t tile_words = layout.tile_n / 8;
+  const uint64_t word_start = start_n / 8;
+  const auto *src = static_cast<const uint32_t *>(cfg.decode_packed_weights);
+  auto *out = reinterpret_cast<uint32_t *>(dst.data());
+  for (uint64_t row = 0; row < cfg.h; ++row) {
+    std::memcpy(out + row * tile_words,
+                src + row * layout.packed_word_cols + word_start,
+                tile_words * sizeof(uint32_t));
+  }
+}
+
+void stage_decode_int4_scale_tile(const LlmLinearDirectRunConfig &cfg,
+                                  const DecodeLayout &layout, uint64_t start_n,
+                                  std::vector<uint8_t> &dst) {
+  const auto *src = static_cast<const float *>(cfg.decode_scales);
+  auto *out = reinterpret_cast<float *>(dst.data());
+  for (uint64_t block = 0; block < layout.block_count; ++block) {
+    std::memcpy(out + block * layout.tile_n, src + block * cfg.n + start_n,
+                layout.tile_n * sizeof(float));
+  }
 }
 
 void validate_config(const LlmLinearDirectRunConfig &cfg) {
@@ -919,18 +947,15 @@ void validate_config(const LlmLinearDirectRunConfig &cfg) {
     throw std::runtime_error("direct bridge run received null host buffer");
   if (cfg.m == 0 || cfg.k == 0 || cfg.h == 0 || cfg.n == 0)
     throw std::runtime_error("direct bridge run received zero shape dimension");
-  (void)elem_size(cfg.dtype);
-  if (decode_is_int4(cfg.decode_storage)) {
-    validate_decode_int4_metadata(cfg.h, cfg.n, cfg.decode_block_size,
-                                  cfg.decode_quant_axis);
-    const size_t expected_packed = decode_int4_packed_bytes(cfg.h, cfg.n);
-    const size_t expected_scales =
-        decode_int4_scale_bytes(cfg.h, cfg.n, cfg.decode_block_size);
+  const DecodeLayout layout = make_decode_layout(
+      cfg.h, cfg.n, cfg.dtype, cfg.decode_storage, cfg.decode_block_size,
+      cfg.decode_quant_axis, cfg.decode_tile_n);
+  if (layout.int4) {
     if (!cfg.decode_packed_weights || !cfg.decode_scales)
       throw std::runtime_error(
           "int4 direct bridge run received null packed/scales");
-    if (cfg.decode_packed_bytes != expected_packed ||
-        cfg.decode_scale_bytes != expected_scales)
+    if (cfg.decode_packed_bytes != layout.packed_bytes() ||
+        cfg.decode_scale_bytes != layout.scale_bytes())
       throw std::runtime_error(
           "int4 direct bridge run received invalid packed/scales byte counts");
   } else if (!cfg.decode_weights) {
@@ -951,17 +976,14 @@ void validate_gpu_stage_config(const LlmLinearGpuStageRunConfig &cfg) {
     throw std::runtime_error("GPU prefill stage received zero shape dimension");
   if (cfg.stage == kGpuStageDecode && (cfg.h == 0 || cfg.n == 0))
     throw std::runtime_error("GPU decode stage received zero shape dimension");
-  (void)elem_size(cfg.dtype);
-  if (cfg.stage == kGpuStageDecode && decode_is_int4(cfg.decode_storage)) {
-    validate_decode_int4_metadata(cfg.h, cfg.n, cfg.decode_block_size,
-                                  cfg.decode_quant_axis);
-    const size_t expected_packed = decode_int4_packed_bytes(cfg.h, cfg.n);
-    const size_t expected_scales =
-        decode_int4_scale_bytes(cfg.h, cfg.n, cfg.decode_block_size);
+  const DecodeLayout layout =
+      make_decode_layout(cfg.h, cfg.n, cfg.dtype, cfg.decode_storage,
+                         cfg.decode_block_size, cfg.decode_quant_axis);
+  if (cfg.stage == kGpuStageDecode && layout.int4) {
     if (!cfg.scales)
       throw std::runtime_error("int4 GPU decode stage received null scales");
-    if (cfg.decode_packed_bytes != expected_packed ||
-        cfg.decode_scale_bytes != expected_scales)
+    if (cfg.decode_packed_bytes != layout.packed_bytes() ||
+        cfg.decode_scale_bytes != layout.scale_bytes())
       throw std::runtime_error(
           "int4 GPU decode stage received invalid packed/scales byte counts");
   }
@@ -997,19 +1019,18 @@ void run_gpu_decode(const LlmLinearDirectRunConfig &cfg,
 }
 
 void run_gpu_decode_int4(const LlmLinearDirectRunConfig &cfg,
-                         PooledHipVmemBo &handoff, PooledHipVmemBo &packed,
-                         PooledHipVmemBo &scales, PooledHipVmemBo &output,
-                         uint64_t offset_bytes) {
+                         const DecodeLayout &layout, PooledHipVmemBo &handoff,
+                         PooledHipVmemBo &packed, PooledHipVmemBo &scales,
+                         PooledHipVmemBo &output, uint64_t offset_bytes) {
   SharedLibrary lib(cfg.gpu_decode_so);
   DecodeInt4Fn decode = lib.symbol<DecodeInt4Fn>("llm_linear_decode_int4");
   auto input_ref =
       memref1(handoff->hip_ptr(offset_bytes), static_cast<int64_t>(cfg.h));
-  auto packed_ref =
-      memref2(packed->hip_ptr(), static_cast<int64_t>(cfg.h),
-              static_cast<int64_t>(decode_int4_packed_word_cols(cfg.n)));
-  auto scales_ref = memref2(scales->hip_ptr(),
-                            static_cast<int64_t>(cfg.h / cfg.decode_block_size),
-                            static_cast<int64_t>(cfg.n));
+  auto packed_ref = memref2(packed->hip_ptr(), static_cast<int64_t>(cfg.h),
+                            static_cast<int64_t>(layout.packed_word_cols));
+  auto scales_ref =
+      memref2(scales->hip_ptr(), static_cast<int64_t>(layout.block_count),
+              static_cast<int64_t>(layout.n));
   auto output_ref = memref1(output->hip_ptr(), static_cast<int64_t>(cfg.n));
   decode(&input_ref, &packed_ref, &scales_ref, &output_ref);
   check_hip(hipDeviceSynchronize(), "hipDeviceSynchronize(gpu int4 decode)");
@@ -1044,18 +1065,18 @@ void run_gpu_decode_stage(const LlmLinearGpuStageRunConfig &cfg,
 }
 
 void run_gpu_decode_int4_stage(const LlmLinearGpuStageRunConfig &cfg,
+                               const DecodeLayout &layout,
                                HipDeviceBuffer &input, HipDeviceBuffer &packed,
                                HipDeviceBuffer &scales,
                                HipDeviceBuffer &output) {
   SharedLibrary lib(cfg.gpu_so);
   DecodeInt4Fn decode = lib.symbol<DecodeInt4Fn>("llm_linear_decode_int4");
   auto input_ref = memref1(input.hip_ptr(), static_cast<int64_t>(cfg.h));
-  auto packed_ref =
-      memref2(packed.hip_ptr(), static_cast<int64_t>(cfg.h),
-              static_cast<int64_t>(decode_int4_packed_word_cols(cfg.n)));
-  auto scales_ref = memref2(scales.hip_ptr(),
-                            static_cast<int64_t>(cfg.h / cfg.decode_block_size),
-                            static_cast<int64_t>(cfg.n));
+  auto packed_ref = memref2(packed.hip_ptr(), static_cast<int64_t>(cfg.h),
+                            static_cast<int64_t>(layout.packed_word_cols));
+  auto scales_ref =
+      memref2(scales.hip_ptr(), static_cast<int64_t>(layout.block_count),
+              static_cast<int64_t>(layout.n));
   auto output_ref = memref1(output.hip_ptr(), static_cast<int64_t>(cfg.n));
   decode(&input_ref, &packed_ref, &scales_ref, &output_ref);
   check_hip(hipDeviceSynchronize(),
@@ -1080,41 +1101,34 @@ void run_gpu_to_npu(const LlmLinearDirectRunConfig &cfg,
   const size_t input_bytes = cfg.m * cfg.k * es;
   const size_t prefill_weight_bytes = cfg.k * cfg.h * es;
   const size_t handoff_bytes = cfg.m * cfg.h * es;
-  const bool int4_decode = decode_is_int4(cfg.decode_storage);
-  const uint64_t decode_tile_n =
-      int4_decode ? std::min<uint64_t>(
-                        cfg.n, cfg.decode_tile_n ? cfg.decode_tile_n : cfg.n)
-                  : cfg.n;
-  if (int4_decode && (decode_tile_n == 0 || cfg.n % decode_tile_n != 0))
-    throw std::runtime_error("int4 direct NPU decode requires N % tile_n == 0");
-  const bool tiled_int4_decode = int4_decode && decode_tile_n < cfg.n;
-  const size_t decode_weight_bytes =
-      int4_decode ? decode_int4_packed_bytes(cfg.h, decode_tile_n)
-                  : decode_dense_weight_bytes(cfg);
+  const DecodeLayout decode_layout = make_decode_layout(
+      cfg.h, cfg.n, cfg.dtype, cfg.decode_storage, cfg.decode_block_size,
+      cfg.decode_quant_axis, cfg.decode_tile_n);
+  const size_t decode_weight_bytes = decode_layout.int4
+                                         ? decode_layout.packed_tile_bytes()
+                                         : decode_layout.dense_weight_bytes();
   const size_t decode_scale_bytes =
-      int4_decode
-          ? decode_int4_scale_bytes(cfg.h, decode_tile_n, cfg.decode_block_size)
-          : 0;
+      decode_layout.int4 ? decode_layout.scale_tile_bytes() : 0;
   const size_t output_bytes = cfg.n * es;
-  const size_t output_tile_bytes = decode_tile_n * es;
+  const size_t output_tile_bytes = decode_layout.tile_n * es;
 
   auto &device = decode_kernel.device();
   auto input = acquire_hip_vmem_xrt_bo(device, input_bytes);
   auto prefill_weights = acquire_hip_vmem_xrt_bo(device, prefill_weight_bytes);
   auto handoff = acquire_hip_vmem_xrt_bo(device, handoff_bytes);
   auto decode_weights = acquire_hip_vmem_xrt_bo(device, decode_weight_bytes);
-  auto decode_scales = int4_decode
+  auto decode_scales = decode_layout.int4
                            ? acquire_hip_vmem_xrt_bo(device, decode_scale_bytes)
                            : PooledHipVmemBo();
   auto output = acquire_hip_vmem_xrt_bo(
-      device, tiled_int4_decode ? output_tile_bytes : output_bytes);
+      device, decode_layout.tiled_int4() ? output_tile_bytes : output_bytes);
 
   input->hip_write_host(cfg.input);
   prefill_weights->hip_write_host(cfg.prefill_weights);
-  if (!tiled_int4_decode)
-    decode_weights->xrt_write_host(int4_decode ? cfg.decode_packed_weights
-                                               : cfg.decode_weights);
-  if (int4_decode && !tiled_int4_decode)
+  if (!decode_layout.tiled_int4())
+    decode_weights->xrt_write_host(
+        decode_layout.int4 ? cfg.decode_packed_weights : cfg.decode_weights);
+  if (decode_layout.int4 && !decode_layout.tiled_int4())
     decode_scales->xrt_write_host(cfg.decode_scales);
 
   const uint64_t prefill_start = now_us();
@@ -1129,20 +1143,21 @@ void run_gpu_to_npu(const LlmLinearDirectRunConfig &cfg,
   result.handoff_us = now_us() - handoff_start;
 
   const uint64_t decode_start = now_us();
-  if (tiled_int4_decode) {
+  if (decode_layout.tiled_int4()) {
     std::vector<uint8_t> staged_decode_weights(decode_weight_bytes, 0);
     std::vector<uint8_t> staged_decode_scales(decode_scale_bytes, 0);
-    for (uint64_t start_n = 0; start_n < cfg.n; start_n += decode_tile_n) {
-      stage_decode_int4_packed_tile(cfg, start_n, decode_tile_n,
+    for (uint64_t start_n = 0; start_n < cfg.n;
+         start_n += decode_layout.tile_n) {
+      stage_decode_int4_packed_tile(cfg, decode_layout, start_n,
                                     staged_decode_weights);
-      stage_decode_int4_scale_tile(cfg, start_n, decode_tile_n,
+      stage_decode_int4_scale_tile(cfg, decode_layout, start_n,
                                    staged_decode_scales);
       decode_weights->xrt_write_host(staged_decode_weights.data());
       decode_scales->xrt_write_host(staged_decode_scales.data());
       decode_kernel.run4(decode_input, decode_weights, decode_scales, output);
       output->xrt_read_host(static_cast<uint8_t *>(cfg.output) + start_n * es);
     }
-  } else if (int4_decode) {
+  } else if (decode_layout.int4) {
     decode_kernel.run4(decode_input, decode_weights, decode_scales, output);
   } else {
     decode_kernel.run3(decode_input, decode_weights, output);
@@ -1151,7 +1166,7 @@ void run_gpu_to_npu(const LlmLinearDirectRunConfig &cfg,
 
   if (cfg.prefill_output)
     handoff->sync_to_xrt(handoff_bytes);
-  if (!tiled_int4_decode)
+  if (!decode_layout.tiled_int4())
     output->xrt_read_host(cfg.output);
   if (cfg.prefill_output)
     handoff->xrt_read_host(cfg.prefill_output);
@@ -1177,13 +1192,14 @@ void run_npu_to_gpu(const LlmLinearDirectRunConfig &cfg,
   const size_t row_input_bytes = cfg.k * es;
   const size_t prefill_weight_tile_bytes = cfg.k * prefill_tile_h * es;
   const size_t handoff_bytes = cfg.m * cfg.h * es;
-  const bool int4_decode = decode_is_int4(cfg.decode_storage);
-  const size_t decode_weight_bytes =
-      int4_decode ? decode_int4_packed_bytes(cfg.h, cfg.n)
-                  : decode_dense_weight_bytes(cfg);
+  const DecodeLayout decode_layout =
+      make_decode_layout(cfg.h, cfg.n, cfg.dtype, cfg.decode_storage,
+                         cfg.decode_block_size, cfg.decode_quant_axis);
+  const size_t decode_weight_bytes = decode_layout.int4
+                                         ? decode_layout.packed_bytes()
+                                         : decode_layout.dense_weight_bytes();
   const size_t decode_scale_bytes =
-      int4_decode ? decode_int4_scale_bytes(cfg.h, cfg.n, cfg.decode_block_size)
-                  : 0;
+      decode_layout.int4 ? decode_layout.scale_bytes() : 0;
   const size_t output_bytes = cfg.n * es;
 
   auto &device = prefill_kernel.device();
@@ -1193,14 +1209,14 @@ void run_npu_to_gpu(const LlmLinearDirectRunConfig &cfg,
   auto handoff = acquire_hip_vmem_xrt_bo(device, handoff_bytes);
   auto prefill_temp = acquire_hip_vmem_xrt_bo(device, prefill_tile_h * es);
   auto decode_weights = acquire_hip_vmem_xrt_bo(device, decode_weight_bytes);
-  auto decode_scales = int4_decode
+  auto decode_scales = decode_layout.int4
                            ? acquire_hip_vmem_xrt_bo(device, decode_scale_bytes)
                            : PooledHipVmemBo();
   auto output = acquire_hip_vmem_xrt_bo(device, output_bytes);
 
-  decode_weights->hip_write_host(int4_decode ? cfg.decode_packed_weights
-                                             : cfg.decode_weights);
-  if (int4_decode)
+  decode_weights->hip_write_host(decode_layout.int4 ? cfg.decode_packed_weights
+                                                    : cfg.decode_weights);
+  if (decode_layout.int4)
     decode_scales->hip_write_host(cfg.decode_scales);
 
   const size_t row_output_bytes = cfg.h * es;
@@ -1238,9 +1254,9 @@ void run_npu_to_gpu(const LlmLinearDirectRunConfig &cfg,
   const uint64_t offset = (cfg.m - 1) * cfg.h * es;
   trace_step("n2g: before gpu decode");
   const uint64_t decode_start = now_us();
-  if (int4_decode)
-    run_gpu_decode_int4(cfg, handoff, decode_weights, decode_scales, output,
-                        offset);
+  if (decode_layout.int4)
+    run_gpu_decode_int4(cfg, decode_layout, handoff, decode_weights,
+                        decode_scales, output, offset);
   else
     run_gpu_decode(cfg, handoff, decode_weights, output, offset);
   result.decode_us = now_us() - decode_start;
@@ -1354,19 +1370,17 @@ llm_linear_direct_bridge_run_gpu_stage(const LlmLinearGpuStageRunConfig *config,
     check_hip(hipSetDevice(0), "hipSetDevice(0)");
     const size_t es = elem_size(config->dtype);
     const bool is_prefill = config->stage == kGpuStagePrefill;
-    const bool int4_decode =
-        !is_prefill && decode_is_int4(config->decode_storage);
+    const DecodeLayout decode_layout = make_decode_layout(
+        config->h, config->n, config->dtype, config->decode_storage,
+        config->decode_block_size, config->decode_quant_axis);
+    const bool int4_decode = !is_prefill && decode_layout.int4;
     const size_t input_bytes =
         (is_prefill ? config->m * config->k : config->h) * es;
     const size_t weight_bytes =
-        is_prefill
-            ? config->k * config->h * es
-            : (int4_decode ? decode_int4_packed_bytes(config->h, config->n)
-                           : config->h * config->n * es);
-    const size_t scale_bytes =
-        int4_decode ? decode_int4_scale_bytes(config->h, config->n,
-                                              config->decode_block_size)
-                    : 0;
+        is_prefill ? config->k * config->h * es
+                   : (int4_decode ? decode_layout.packed_bytes()
+                                  : config->h * config->n * es);
+    const size_t scale_bytes = int4_decode ? decode_layout.scale_bytes() : 0;
     const size_t output_bytes =
         (is_prefill ? config->m * config->h : config->n) * es;
 
@@ -1384,7 +1398,8 @@ llm_linear_direct_bridge_run_gpu_stage(const LlmLinearGpuStageRunConfig *config,
     if (is_prefill)
       run_gpu_prefill_stage(*config, input, weights, output);
     else if (int4_decode)
-      run_gpu_decode_int4_stage(*config, input, weights, *scales, output);
+      run_gpu_decode_int4_stage(*config, decode_layout, input, weights, *scales,
+                                output);
     else
       run_gpu_decode_stage(*config, input, weights, output);
     result->stage_us = now_us() - stage_start;

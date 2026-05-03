@@ -51,16 +51,25 @@ Recommended exploration order:
 | LLM-linear CPU smoke | `../../sandbox/bin/python run_llm_linear_suite.py --suite tiny_ci --case-filter cpu_only --iterations 1 --warmup 0 --require-correctness` |
 | LLM-linear int4 decode CPU smoke | `../../sandbox/bin/python run_llm_linear_suite.py --suite tiny_ci --case-filter cpu_only --decode-weight-storage int4 --iterations 1 --warmup 0 --require-correctness` |
 | LLM-linear Milestone 2 direct acceptance | `source /opt/xilinx/xrt/setup.sh && ../../sandbox/bin/python run_llm_linear_milestone2.py` |
+| LLM-linear Milestone 3 int4 hardware acceptance | `source /opt/xilinx/xrt/setup.sh && ../../sandbox/bin/python run_llm_linear_milestone3.py` |
 
-GPU commands need `LLVM_INSTALL_DIR`, `ROCM_PATH`, and `AIR_OPT_PATH` or matching tools on `PATH`. NPU commands need `AIRCC_PATH`, XRT setup, visible hardware, and explicit `--allow-npu`. The Milestone 2 wrapper seeds the common local tool paths when they exist and rejects direct runs that emit the XRT host-copy fallback warning. See the [exploration guide](docs/exploration.md) for the setup matrix and troubleshooting flow.
+GPU commands need `LLVM_INSTALL_DIR`, `ROCM_PATH`, and `AIR_OPT_PATH` or matching tools on `PATH`. NPU commands need `AIRCC_PATH`, XRT setup, visible hardware, and explicit `--allow-npu`. The Milestone 2 and Milestone 3 wrappers seed the common local tool paths when they exist and reject direct runs that emit the XRT host-copy fallback warning. See the [exploration guide](docs/exploration.md) for the setup matrix and troubleshooting flow.
 
 LLM-linear Milestone 2 direct GPU/NPU handoff is accepted as of May 3, 2026 for
 the hardware gate. The accepted command is:
 `source /opt/xilinx/xrt/setup.sh && ../../sandbox/bin/python run_llm_linear_milestone2.py`.
 It writes evidence under `llm_linear/artifacts/benchmarks/milestone2_e2e` and
 covers the `medium_m8_k512_h512_n256` workload in both direct directions plus
-matching host-mixed baselines. The broader `medium` ladder, full CPU/GPU/NPU
-crossover, and `llm_like` studies remain future work.
+matching host-mixed baselines.
+
+LLM-linear Milestone 3 fused int4 decode is accepted as of May 3, 2026 for the
+hardware gate. The accepted command is:
+`source /opt/xilinx/xrt/setup.sh && ../../sandbox/bin/python run_llm_linear_milestone3.py`.
+It writes evidence under `llm_linear/artifacts/benchmarks/milestone3_int4_hw`
+and covers `tiny_ci`, `medium`, and `llm_like` workloads across CPU/GPU/NPU,
+host-mixed, and direct mixed cases with signed int4 decode weights. Accelerator
+decode remains intentionally narrow: signed int4, `quant_axis=0`,
+`H % block_size == 0`, and `N % 8 == 0`.
 
 ## Key Files
 

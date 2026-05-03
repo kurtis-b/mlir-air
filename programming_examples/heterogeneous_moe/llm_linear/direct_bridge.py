@@ -575,11 +575,7 @@ class DirectBridge:
             "npu_prefill_gpu_decode": NPU_PREFILL_GPU_DECODE,
         }[direction]
         native_dtype = {"bf16": DTYPE_BF16, "f16": DTYPE_F16}[dtype]
-        native_decode_storage = {
-            "bf16": DECODE_STORAGE_DENSE,
-            "dense": DECODE_STORAGE_DENSE,
-            "int4": DECODE_STORAGE_INT4,
-        }[decode_storage]
+        native_decode_storage = _native_decode_storage(decode_storage)
         m, k, h, n = [int(dim) for dim in shape]
         result = _NativeRunResult()
         config = _NativeRunConfig(
@@ -658,11 +654,7 @@ class DirectBridge:
             "decode": GPU_STAGE_DECODE,
         }[stage]
         native_dtype = {"bf16": DTYPE_BF16, "f16": DTYPE_F16}[dtype]
-        native_decode_storage = {
-            "bf16": DECODE_STORAGE_DENSE,
-            "dense": DECODE_STORAGE_DENSE,
-            "int4": DECODE_STORAGE_INT4,
-        }[decode_storage]
+        native_decode_storage = _native_decode_storage(decode_storage)
         m, k, h, n = [int(dim) for dim in shape]
         result = _NativeGpuStageRunResult()
         config = _NativeGpuStageRunConfig(
@@ -707,6 +699,14 @@ def _array_ptr(array: Any | None) -> int | None:
     if array is None:
         return None
     return int(array.ctypes.data)
+
+
+def _native_decode_storage(decode_storage: str) -> int:
+    return {
+        "bf16": DECODE_STORAGE_DENSE,
+        "dense": DECODE_STORAGE_DENSE,
+        "int4": DECODE_STORAGE_INT4,
+    }[decode_storage]
 
 
 def _array_nbytes(array: Any | None) -> int:

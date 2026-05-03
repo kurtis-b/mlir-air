@@ -63,7 +63,7 @@ tests and avoids relaunch instability with imported BOs. The probe also syncs
 all imported BO views back from the XRT side after each NPU run before HIP
 rewrites or reads them.
 
-For LLM-linear workload acceptance, use the Milestone 2 wrapper from
+For direct handoff workload acceptance, use the Milestone 2 wrapper from
 `programming_examples/heterogeneous_moe`:
 
 ```bash
@@ -76,8 +76,19 @@ runs the `medium_m8_k512_h512_n256` direct workload in both directions in fresh
 subprocesses, runs matching host-mixed baselines, captures logs under
 `llm_linear/artifacts/benchmarks/milestone2_e2e/logs/`, and fails if any log
 contains `Reverting to host copy of buffers` or
-`exec_buf: Operation not supported`. The broader `medium` ladder, full
-CPU/GPU/NPU crossover, and `llm_like` studies remain future work.
+`exec_buf: Operation not supported`.
+
+For fused int4 decode hardware acceptance, use the Milestone 3 wrapper:
+
+```bash
+source /opt/xilinx/xrt/setup.sh && ../../sandbox/bin/python run_llm_linear_milestone3.py
+```
+
+As of May 3, 2026, this wrapper is the accepted Milestone 3 hardware gate. It
+uses the same bridge ABI version and also passes quantized decode metadata,
+packed signed-int4 weights, and scale buffers for GPU/NPU decode. It writes logs
+and results under `llm_linear/artifacts/benchmarks/milestone3_int4_hw/` and
+covers the full `tiny_ci`, `medium`, and `llm_like` LLM-linear suites.
 
 The G2N path audits the selected decode row as the handoff tensor. It avoids
 `xrt::bo::copy`; when imported-parent sub-buffering is not viable, the bridge
@@ -85,3 +96,9 @@ uses a HIP device-to-device row copy into a row-sized HIP VMem allocation and
 passes that imported row BO to NPU decode. Result JSONs must report row-sized
 `direct_bytes`, the expected row offset `(M - 1) * H * 2`, and zero NumPy host
 materializations.
+
+For NPU int4 decode wider than the compiled tile width, the bridge stages static
+packed-weight and scale tiles from the host-side static weight buffers into the
+NPU decode BOs. That staging is static weight staging for the decode kernel; it
+is not a prefill-to-decode handoff materialization and does not weaken the
+Milestone 2 direct handoff contract.

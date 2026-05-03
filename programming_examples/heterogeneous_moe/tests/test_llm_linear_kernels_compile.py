@@ -45,6 +45,13 @@ def test_linear_air_text_generation(tmp_path: Path) -> None:
     assert "memref<2x8xf32>" in int4
     assert "scf.for %bb" in int4
     assert "arith.shrui" in int4
+    streamed = decode_int4_gemv_air(
+        LinearKernelConfig(M=2, K=4, H=8, N=8, dtype="f16"),
+        block_size=4,
+        quant_axis=0,
+        memory_strategy="streamed_l1",
+    )
+    assert "memref<2x8xf32>" in streamed
     assert set(
         emit_all_kernels(
             LinearKernelConfig(M=2, K=4, H=8, N=8, dtype="f16"),

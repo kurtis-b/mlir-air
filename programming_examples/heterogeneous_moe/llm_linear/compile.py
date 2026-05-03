@@ -17,6 +17,11 @@ from .kernels import (
     write_default_air_sources,
 )
 from .manifest import artifact_root, generated_air_source_root
+from .quantization import (
+    DecodeQuantizationPlan,
+    decode_quantization_plan_from_manifest,
+    validate_accelerator_decode_plan,
+)
 
 ENTRYPOINTS = {
     "prefill": "llm_linear_prefill",
@@ -44,6 +49,15 @@ def _npu_decode_source_cfg(cfg: LinearKernelConfig) -> LinearKernelConfig:
     )
 
 
+def decode_quantization_plan(manifest: dict[str, Any]) -> DecodeQuantizationPlan | None:
+    cfg = kernel_config_from_manifest(manifest)
+    return decode_quantization_plan_from_manifest(
+        manifest,
+        shape=(cfg.H, cfg.N),
+        npu_decode_tile_n=min(cfg.N, NPU_DECODE_TILE_N),
+    )
+
+
 def _write_npu_air_sources(
     manifest: dict[str, Any],
     *,
@@ -51,7 +65,7 @@ def _write_npu_air_sources(
 ) -> dict[str, Path]:
     cfg = kernel_config_from_manifest(manifest)
     prefill_cfg = _npu_source_cfg(cfg)
-    quant = decode_quantization_config(manifest)
+    quant = decode_quantization_plan(manifest)
     source_dir = generated_air_source_root(manifest) / "npu"
     source_dir.mkdir(parents=True, exist_ok=True)
     paths: dict[str, Path] = {}
@@ -74,54 +88,34 @@ def _write_npu_air_sources(
         int4_names = default_air_filenames(
             decode_cfg,
             include_decode_int4=True,
-            decode_int4_block_size=int(quant["block_size"]),
+            decode_int4_block_size=quant.block_size,
         )
         paths["decode_int4"] = source_dir / int4_names["decode_int4"]
         paths["decode_int4"].write_text(
             decode_int4_gemv_air(
                 decode_cfg,
-                block_size=int(quant["block_size"]),
-                quant_axis=int(quant["quant_axis"]),
+                block_size=quant.block_size,
+                quant_axis=quant.quant_axis,
                 align_output_dma=True,
+                memory_strategy="staged_l2",
             ),
             encoding="utf-8",
         )
     return paths
 
 
-def decode_quantization_config(manifest: dict[str, Any]) -> dict[str, int | str] | None:
-    decode = manifest.get("weights", {}).get("decode", {})
-    if not isinstance(decode, dict):
-        return None
-    storage = decode.get("storage", "bf16")
-    if storage in {None, "bf16", "dense"}:
-        return None
-    return {
-        "storage": str(storage),
-        "block_size": int(decode.get("block_size", 32)),
-        "quant_axis": int(decode.get("quant_axis", 0)),
-    }
+def decode_quantization_config(manifest: dict[str, Any]) -> dict[str, Any] | None:
+    plan = decode_quantization_plan(manifest)
+    return None if plan is None else plan.to_metadata_dict()
 
 
 def validate_accelerator_decode_quantization(
     manifest: dict[str, Any], *, require_int4: bool = False
-) -> dict[str, int | str] | None:
-    cfg = kernel_config_from_manifest(manifest)
-    quant = decode_quantization_config(manifest)
-    if quant is None:
-        if require_int4:
-            raise ValueError("accelerator quantized decode requires storage == int4")
-        return None
-    if quant["storage"] != "int4":
-        raise ValueError("accelerator quantized decode supports only signed int4")
-    block_size = int(quant["block_size"])
-    if int(quant["quant_axis"]) != 0:
-        raise ValueError("accelerator int4 decode requires quant_axis == 0")
-    if cfg.H % block_size != 0:
-        raise ValueError("accelerator int4 decode requires H % block_size == 0")
-    if cfg.N % 8 != 0:
-        raise ValueError("accelerator int4 decode requires N divisible by 8")
-    return quant
+) -> dict[str, Any] | None:
+    plan = validate_accelerator_decode_plan(
+        decode_quantization_plan(manifest), require_int4=require_int4
+    )
+    return None if plan is None else plan.to_metadata_dict()
 
 
 def compile_npu_stage(
@@ -134,11 +128,11 @@ def compile_npu_stage(
 
 
 def decode_kernel_key(manifest: dict[str, Any]) -> str:
-    quant = decode_quantization_config(manifest)
+    quant = decode_quantization_plan(manifest)
     if quant is None:
         return "decode"
-    validate_accelerator_decode_quantization(manifest, require_int4=True)
-    return "decode_int4"
+    validate_accelerator_decode_plan(quant, require_int4=True)
+    return quant.kernel_key
 
 
 def _write_sources_for_manifest(
@@ -150,16 +144,20 @@ def _write_sources_for_manifest(
     cfg = kernel_config_from_manifest(manifest)
     if backend == "npu":
         return _write_npu_air_sources(manifest, include_decode_int4=include_decode_int4)
-    quant = validate_accelerator_decode_quantization(manifest, require_int4=True)
+    quant = validate_accelerator_decode_plan(
+        decode_quantization_plan(manifest), require_int4=True
+    )
     assert quant is not None
     return write_default_air_sources(
         cfg,
         generated_air_source_root(manifest) / backend,
         align_output_dma=(backend in {"gpu", "npu"}),
         include_decode_int4=include_decode_int4,
-        decode_int4_block_size=int(quant["block_size"]),
-        decode_int4_quant_axis=int(quant["quant_axis"]),
-        decode_int4_global_loads=(backend == "gpu"),
+        decode_int4_block_size=quant.block_size,
+        decode_int4_quant_axis=quant.quant_axis,
+        decode_int4_memory_strategy=(
+            "streamed_l1" if backend == "gpu" else "staged_l2"
+        ),
     )
 
 
@@ -173,16 +171,16 @@ def resolve_air_sources(
         raise ValueError(f"Unsupported source backend: {backend}")
     cfg = kernel_config_from_manifest(manifest)
     source_dir = generated_air_source_root(manifest) / backend
-    quant = decode_quantization_config(manifest)
+    quant = decode_quantization_plan(manifest)
     if include_decode_int4 is None:
-        include_decode_int4 = bool(quant is not None and quant["storage"] == "int4")
+        include_decode_int4 = bool(quant is not None and quant.storage == "int4")
     if include_decode_int4:
         validate_accelerator_decode_quantization(manifest, require_int4=True)
     prefill_cfg = _npu_source_cfg(cfg) if backend == "npu" else cfg
     names = default_air_filenames(
         cfg,
         include_decode_int4=include_decode_int4,
-        decode_int4_block_size=(32 if quant is None else int(quant["block_size"])),
+        decode_int4_block_size=(32 if quant is None else quant.block_size),
     )
     if backend == "npu":
         names["prefill"] = default_air_filenames(prefill_cfg)["prefill"]
@@ -191,9 +189,7 @@ def resolve_air_sources(
             names["decode_int4"] = default_air_filenames(
                 decode_cfg,
                 include_decode_int4=True,
-                decode_int4_block_size=(
-                    32 if quant is None else int(quant["block_size"])
-                ),
+                decode_int4_block_size=(32 if quant is None else quant.block_size),
             )["decode_int4"]
     paths = {key: source_dir / name for key, name in names.items()}
     if not all(path.exists() for path in paths.values()):
@@ -223,10 +219,10 @@ def populate_artifacts(
     stage_backends = stage_backends or {
         key: set(backends) for key in default_air_filenames(cfg)
     }
-    quant = decode_quantization_config(manifest)
+    quant = decode_quantization_plan(manifest)
     include_decode_int4 = False
     if quant is not None and stage_backends.get("decode"):
-        validate_accelerator_decode_quantization(manifest, require_int4=True)
+        validate_accelerator_decode_plan(quant, require_int4=True)
         include_decode_int4 = True
         stage_backends = {
             ("decode_int4" if key == "decode" else key): set(value)
@@ -239,9 +235,9 @@ def populate_artifacts(
             source_root / "gpu",
             align_output_dma=True,
             include_decode_int4=include_decode_int4,
-            decode_int4_block_size=(32 if quant is None else int(quant["block_size"])),
-            decode_int4_quant_axis=(0 if quant is None else int(quant["quant_axis"])),
-            decode_int4_global_loads=True,
+            decode_int4_block_size=(32 if quant is None else quant.block_size),
+            decode_int4_quant_axis=(0 if quant is None else quant.quant_axis),
+            decode_int4_memory_strategy="streamed_l1",
         )
         if any("gpu" in needed for needed in stage_backends.values())
         else {}
@@ -286,17 +282,17 @@ def populate_direct_gpu_artifacts(
     cfg: LinearKernelConfig | None = None,
 ) -> dict[str, Any]:
     cfg = cfg or kernel_config_from_manifest(manifest)
-    quant = decode_quantization_config(manifest)
+    quant = decode_quantization_plan(manifest)
     include_decode_int4 = quant is not None
     if include_decode_int4:
-        validate_accelerator_decode_quantization(manifest, require_int4=True)
+        validate_accelerator_decode_plan(quant, require_int4=True)
     sources = write_default_air_sources(
         cfg,
         generated_air_source_root(manifest) / "gpu",
         include_decode_int4=include_decode_int4,
-        decode_int4_block_size=(32 if quant is None else int(quant["block_size"])),
-        decode_int4_quant_axis=(0 if quant is None else int(quant["quant_axis"])),
-        decode_int4_global_loads=True,
+        decode_int4_block_size=(32 if quant is None else quant.block_size),
+        decode_int4_quant_axis=(0 if quant is None else quant.quant_axis),
+        decode_int4_memory_strategy="streamed_l1",
     )
     artifact_dir = artifact_root(manifest) / "gpu_direct"
     artifact_dir.mkdir(parents=True, exist_ok=True)

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+DecodeInt4MemoryStrategy = Literal["staged_l2", "streamed_l1"]
 
 
 @dataclass(frozen=True)
@@ -667,45 +669,6 @@ def decode_gemv_air(cfg: LinearKernelConfig, *, align_output_dma: bool = False) 
 """
 
 
-def _int4_block_lane_reduction(
-    *,
-    lane: int,
-    block_size: int,
-    block_count: int,
-    output_group: int,
-    cfg: LinearKernelConfig,
-) -> str:
-    nibble = "low" if lane == 0 else "high"
-    return f"""            %sum_f32_{lane} = scf.for %bb{lane} = %h0 to %h_blocks step %h1 iter_args(%block_acc{lane} = %zero_acc_f32) -> (f32) {{
-              %scale_f32_{lane} = memref.load %l1_scales[%bb{lane}, %h{lane}] : memref<{block_count}x{output_group}xf32, 2>
-              %scale{lane} = arith.truncf %scale_f32_{lane} : f32 to {cfg.dtype}
-              %base{lane} = arith.muli %bb{lane}, %h_block : index
-              %block_sum_f32_{lane} = scf.for %ii{lane} = %h0 to %h_block step %h1 iter_args(%inner_acc{lane} = %block_acc{lane}) -> (f32) {{
-                %hh{lane} = arith.addi %base{lane}, %ii{lane} : index
-                %lhs{lane} = memref.load %l1_in[%hh{lane}] : memref<{cfg.H}x{cfg.dtype}, 2>
-                %packed_word{lane} = memref.load %l1_packed[%hh{lane}, %h0] : memref<{cfg.H}x1xi32, 2>
-                %lane_shift{lane} = arith.constant {lane * 4} : i32
-                %shifted{lane} = arith.shrui %packed_word{lane}, %lane_shift{lane} : i32
-                %nibble{lane} = arith.andi %shifted{lane}, %mask4 : i32
-                %is_neg{lane} = arith.cmpi uge, %nibble{lane}, %sign_bit : i32
-                %negative{lane} = arith.subi %nibble{lane}, %sign_extend_bias : i32
-                %q_i32_{lane} = arith.select %is_neg{lane}, %negative{lane}, %nibble{lane} : i32
-                %q_f32_{lane} = arith.sitofp %q_i32_{lane} : i32 to f32
-                %q{lane} = arith.truncf %q_f32_{lane} : f32 to {cfg.dtype}
-                %weight{lane} = arith.mulf %q{lane}, %scale{lane} : {cfg.dtype}
-                %lhs_f32_{lane} = arith.extf %lhs{lane} : {cfg.dtype} to f32
-                %weight_f32_{lane} = arith.extf %weight{lane} : {cfg.dtype} to f32
-                %prod{lane} = arith.mulf %lhs_f32_{lane}, %weight_f32_{lane} : f32
-                %next{lane} = arith.addf %inner_acc{lane}, %prod{lane} : f32
-                scf.yield %next{lane} : f32
-              }}
-              scf.yield %block_sum_f32_{lane} : f32
-            }}
-            %sum{lane} = arith.truncf %sum_f32_{lane} : f32 to {cfg.dtype}
-            memref.store %sum{lane}, %l1_out[%h{lane}] : memref<{output_group}x{cfg.dtype}, 2>
-            // {nibble} nibble"""
-
-
 def _int4_block_loop(
     *,
     block_size: int,
@@ -829,8 +792,10 @@ def decode_int4_gemv_air(
     block_size: int = 32,
     quant_axis: int = 0,
     align_output_dma: bool = True,
-    use_global_loads: bool = False,
+    memory_strategy: DecodeInt4MemoryStrategy = "staged_l2",
 ) -> str:
+    if memory_strategy not in {"staged_l2", "streamed_l1"}:
+        raise ValueError("decode int4 memory_strategy must be staged_l2 or streamed_l1")
     if quant_axis != 0:
         raise ValueError("decode int4 hardware requires quant_axis == 0")
     _require_int4_hardware_shape(cfg, block_size)
@@ -848,7 +813,7 @@ def decode_int4_gemv_air(
         raise ValueError("decode int4 hardware requires block tiles to divide H")
     dma_tile_rows = block_size * blocks_per_tile
     dma_tile_count = block_count // blocks_per_tile
-    if use_global_loads:
+    if memory_strategy == "streamed_l1":
         reductions = _int4_global_block_loop(
             block_size=block_size,
             block_count=block_count,
@@ -1057,7 +1022,7 @@ def emit_all_kernels(
     include_decode_int4: bool = False,
     decode_int4_block_size: int = 32,
     decode_int4_quant_axis: int = 0,
-    decode_int4_global_loads: bool = False,
+    decode_int4_memory_strategy: DecodeInt4MemoryStrategy = "staged_l2",
 ) -> dict[str, str]:
     kernels = {
         "prefill": prefill_gemm_air(cfg, align_output_dma=align_output_dma),
@@ -1069,7 +1034,7 @@ def emit_all_kernels(
             block_size=decode_int4_block_size,
             quant_axis=decode_int4_quant_axis,
             align_output_dma=align_output_dma,
-            use_global_loads=decode_int4_global_loads,
+            memory_strategy=decode_int4_memory_strategy,
         )
     return kernels
 
@@ -1100,7 +1065,7 @@ def write_default_air_sources(
     include_decode_int4: bool = False,
     decode_int4_block_size: int = 32,
     decode_int4_quant_axis: int = 0,
-    decode_int4_global_loads: bool = False,
+    decode_int4_memory_strategy: DecodeInt4MemoryStrategy = "staged_l2",
 ) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     names = default_air_filenames(
@@ -1114,7 +1079,7 @@ def write_default_air_sources(
         include_decode_int4=include_decode_int4,
         decode_int4_block_size=decode_int4_block_size,
         decode_int4_quant_axis=decode_int4_quant_axis,
-        decode_int4_global_loads=decode_int4_global_loads,
+        decode_int4_memory_strategy=decode_int4_memory_strategy,
     )
     paths: dict[str, Path] = {}
     for key, text in sources.items():

@@ -11,7 +11,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import run_llm_linear_milestone2 as milestone2
+from llm_linear.acceptance import (
+    MilestoneFailure,
+    resolve_project_path,
+    run_logged,
+    seed_default_tool_env,
+    validate_direct_result_payload,
+)
 
 DEFAULT_OUTPUT_ROOT = "llm_linear/artifacts/benchmarks/milestone3_int4_hw"
 REQUIRED_CASES = (
@@ -23,10 +29,6 @@ REQUIRED_CASES = (
     "npu_prefill_gpu_decode_direct",
 )
 REQUIRED_SUITES = ("tiny_ci", "medium", "llm_like")
-
-
-class MilestoneFailure(RuntimeError):
-    pass
 
 
 @dataclass(frozen=True)
@@ -107,7 +109,7 @@ def validate_output_dir(output_dir: Path, expected_cases: tuple[str, ...]) -> li
 def validate_result_payload(
     result: dict[str, Any], *, require_direct: bool
 ) -> list[str]:
-    errors = milestone2.validate_result_payload(result, require_direct=require_direct)
+    errors = validate_direct_result_payload(result, require_direct=require_direct)
     quantized = result.get("quantized_decode", {})
     if quantized.get("enabled") is not True:
         errors.append("quantized_decode.enabled is not true")
@@ -165,10 +167,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    output_root = milestone2.resolve_project_path(args.output_root)
+    output_root = resolve_project_path(args.output_root)
     logs_dir = output_root / "logs"
     env = os.environ.copy()
-    milestone2.seed_default_tool_env(env)
+    seed_default_tool_env(env)
     env["LLM_LINEAR_DIRECT_BRIDGE_SO"] = str(args.bridge_so)
     xrt_setup = args.xrt_setup if args.xrt_setup else None
 
@@ -183,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"unknown run-filter value(s): {sorted(requested - known)}")
 
     if not args.skip_build:
-        milestone2.run_logged(
+        run_logged(
             ["llm_linear/native/build_direct_bridge.sh", str(args.bridge_so)],
             log_path=logs_dir / "build_direct_bridge.log",
             env=env,
@@ -192,7 +194,7 @@ def main(argv: list[str] | None = None) -> int:
 
     for run in selected:
         log_path = logs_dir / f"{run.name}.log"
-        milestone2.run_logged(
+        run_logged(
             run.argv(args.python, args.output_root),
             log_path=log_path,
             env=env,
@@ -200,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
             unset_xrt_ld_library_path=False,
         )
         errors = validate_output_dir(
-            milestone2.resolve_project_path(run.output_dir(args.output_root)),
+            resolve_project_path(run.output_dir(args.output_root)),
             expected_cases=run.cases,
         )
         if errors:
@@ -215,6 +217,6 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (MilestoneFailure, milestone2.MilestoneFailure) as exc:
+    except MilestoneFailure as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         raise SystemExit(2)

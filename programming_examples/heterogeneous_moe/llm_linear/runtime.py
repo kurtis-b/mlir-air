@@ -25,9 +25,8 @@ from .compile import (
     compile_npu_stage,
     compile_gpu,
     decode_kernel_key,
-    decode_quantization_config,
+    decode_quantization_plan,
     resolve_air_sources,
-    validate_accelerator_decode_quantization,
 )
 from .direct_bridge import (
     DirectBridge,
@@ -36,7 +35,13 @@ from .direct_bridge import (
     probe_direct_bridge,
 )
 from .manifest import artifact_root
-from .quantization import PackedLinearWeights, decode_gemv_fused_dequant
+from .quantization import (
+    DecodeHardwareWeightArrays,
+    PackedLinearWeights,
+    decode_gemv_fused_dequant,
+    hardware_decode_weight_arrays,
+    validate_accelerator_decode_plan,
+)
 from .reference import (
     LinearConfig,
     LinearWeights,
@@ -314,6 +319,16 @@ class LinearStageExecutors:
     decode: Any
 
 
+@dataclass(frozen=True)
+class DirectDecodeBuffers:
+    storage: str
+    weights: np.ndarray | None
+    packed_weights: np.ndarray | None
+    scales: np.ndarray | None
+    block_size: int
+    quant_axis: int
+
+
 def _output_shape(kind: str, arrays: tuple[np.ndarray, ...]) -> tuple[int, ...]:
     if kind == "prefill":
         return (int(arrays[0].shape[0]), int(arrays[1].shape[1]))
@@ -343,24 +358,6 @@ def _gpu_stage_shape(
             n,
         )
     raise ValueError(f"Unknown GPU stage kind: {kind}")
-
-
-def _packed_decode_hardware_arrays(
-    packed: PackedLinearWeights,
-) -> tuple[np.ndarray, np.ndarray]:
-    h, n = packed.metadata.shape
-    if packed.metadata.quant_kind != "int4":
-        raise ValueError("hardware fused decode requires signed int4 weights")
-    if packed.metadata.quant_axis != 0:
-        raise ValueError("hardware fused decode requires quant_axis == 0")
-    if n % 8 != 0:
-        raise ValueError("hardware fused decode requires N divisible by 8")
-    packed_bytes = np.ascontiguousarray(np.asarray(packed.packed, dtype=np.uint8))
-    packed_matrix = np.ascontiguousarray(
-        packed_bytes.view(np.uint32).reshape((h, n // 8))
-    )
-    scales = np.ascontiguousarray(np.asarray(packed.scales, dtype=np.float32))
-    return packed_matrix, scales
 
 
 def _encode_hardware_stage_args(
@@ -398,6 +395,7 @@ class LinearRuntime:
         self.cfg = config_from_manifest(manifest)
         self.input_scale = float(manifest.get("inputs", {}).get("scale", 0.25))
         self.weight_scale = float(manifest.get("weights", {}).get("scale", 0.125))
+        self.decode_quantization_plan = decode_quantization_plan(manifest)
         self.decode_quantization = decode_quantization_from_manifest(manifest)
         self.weights = random_weights(
             self.cfg,
@@ -410,6 +408,7 @@ class LinearRuntime:
         self._sources: dict[str, dict[str, Path]] = {}
         self._direct_bridge: DirectBridge | None = None
         self._direct_probe_report: DirectBridgeProbeReport | None = None
+        self._decode_hardware_arrays: DecodeHardwareWeightArrays | None = None
         self.executors = self._make_executors()
 
     def __enter__(self) -> "LinearRuntime":
@@ -423,7 +422,7 @@ class LinearRuntime:
             stages = self.manifest["runtime"]["stage_backends"]
             include_decode_int4 = (
                 stages.get("decode") == backend
-                and decode_quantization_config(self.manifest) is not None
+                and self.decode_quantization_plan is not None
                 and self._kernel_key_for_stage("decode", backend) == "decode_int4"
             )
             self._sources[backend] = resolve_air_sources(
@@ -435,7 +434,7 @@ class LinearRuntime:
 
     def _kernel_key_for_stage(self, kind: str, backend: str) -> str:
         if kind == "decode" and backend in {"gpu", "npu"}:
-            if decode_quantization_config(self.manifest) is not None:
+            if self.decode_quantization_plan is not None:
                 return decode_kernel_key(self.manifest)
         return kind
 
@@ -444,14 +443,34 @@ class LinearRuntime:
         return (
             backend in {"gpu", "npu"}
             and self.weights.decode_quantized is not None
+            and self.decode_quantization_plan is not None
+            and self.decode_quantization_plan.hardware_fused
             and self._kernel_key_for_stage("decode", backend) == "decode_int4"
         )
 
     def _decode_weight_arrays_for_backend(self, backend: str) -> tuple[np.ndarray, ...]:
         if backend in {"gpu", "npu"} and self.weights.decode_quantized is not None:
-            validate_accelerator_decode_quantization(self.manifest, require_int4=True)
-            return _packed_decode_hardware_arrays(self.weights.decode_quantized)
+            arrays = self._decode_hardware_weight_arrays()
+            return arrays.packed, arrays.scales
         return (self.weights.decode,)
+
+    def _decode_hardware_weight_arrays(self) -> DecodeHardwareWeightArrays:
+        if self._decode_hardware_arrays is not None:
+            return self._decode_hardware_arrays
+        validate_accelerator_decode_plan(
+            self.decode_quantization_plan, require_int4=True
+        )
+        if self.weights.decode_quantized is None:
+            raise ValueError("hardware fused decode requires quantized weights")
+        self._decode_hardware_arrays = hardware_decode_weight_arrays(
+            self.weights.decode_quantized,
+            npu_decode_tile_n=(
+                None
+                if self.decode_quantization_plan is None
+                else self.decode_quantization_plan.npu_decode_tile_n
+            ),
+        )
+        return self._decode_hardware_arrays
 
     def _make_executor(self, kind: str, backend: str) -> Any:
         if backend == "cpu":
@@ -633,7 +652,9 @@ class LinearRuntime:
         if packed is None:
             return {"dense": encoded_array_summary(self.weights.decode, self.cfg.dtype)}
         try:
-            packed_values, scales = _packed_decode_hardware_arrays(packed)
+            arrays = self._decode_hardware_weight_arrays()
+            packed_values = arrays.packed
+            scales = arrays.scales
         except ValueError:
             packed_values = np.ascontiguousarray(
                 np.asarray(packed.packed, dtype=np.uint8)
@@ -651,10 +672,13 @@ class LinearRuntime:
         packed = self.weights.decode_quantized
         if packed is None:
             return {"storage": "bf16", "fused_decode": False}
+        plan = self.decode_quantization_plan
         return {
             "storage": packed.metadata.quant_kind,
             "fused_decode": True,
+            "hardware_fused": bool(plan.hardware_fused if plan is not None else False),
             "metadata": packed.descriptor(),
+            "plan": None if plan is None else plan.to_metadata_dict(),
             "dequantized_compute_dtype": self.cfg.dtype,
         }
 
@@ -676,14 +700,20 @@ class LinearRuntime:
                 "scale_bytes": 0,
                 "zero_point_bytes": 0,
             }
+        plan = self.decode_quantization_plan
         return {
             "enabled": True,
             "quant_kind": packed.metadata.quant_kind,
             "hardware_fused": bool(hardware_fused),
             "detail": detail,
             "metadata": packed.descriptor(),
-            "packed_bytes": int(packed.packed.nbytes),
-            "scale_bytes": int(packed.scales.nbytes),
+            "plan": None if plan is None else plan.to_metadata_dict(),
+            "packed_bytes": (
+                int(packed.packed.nbytes) if plan is None else plan.packed_bytes
+            ),
+            "scale_bytes": (
+                int(packed.scales.nbytes) if plan is None else plan.scale_bytes
+            ),
             "zero_point_bytes": int(
                 0 if packed.zero_points is None else packed.zero_points.nbytes
             ),
@@ -705,6 +735,26 @@ class LinearRuntime:
                 output = executor.run(*arrays)
         return output, (time.perf_counter_ns() - start_ns) / 1_000_000.0
 
+    def _direct_decode_buffers(self) -> DirectDecodeBuffers:
+        if self.weights.decode_quantized is None:
+            return DirectDecodeBuffers(
+                storage="dense",
+                weights=encode_npu_array(self.weights.decode, self.cfg.dtype),
+                packed_weights=None,
+                scales=None,
+                block_size=0,
+                quant_axis=0,
+            )
+        arrays = self._decode_hardware_weight_arrays()
+        return DirectDecodeBuffers(
+            storage="int4",
+            weights=None,
+            packed_weights=arrays.packed,
+            scales=arrays.scales,
+            block_size=arrays.plan.block_size,
+            quant_axis=arrays.plan.quant_axis,
+        )
+
     def _run_direct(
         self,
         inputs: np.ndarray,
@@ -724,24 +774,7 @@ class LinearRuntime:
         )
         input_encoded = encode_npu_array(inputs, self.cfg.dtype)
         prefill_weights_encoded = encode_npu_array(self.weights.prefill, self.cfg.dtype)
-        decode_weights_encoded = None
-        decode_packed_encoded = None
-        decode_scales = None
-        if self.weights.decode_quantized is None:
-            decode_weights_encoded = encode_npu_array(
-                self.weights.decode, self.cfg.dtype
-            )
-            decode_storage = "dense"
-            decode_block_size = 0
-            decode_quant_axis = 0
-        else:
-            validate_accelerator_decode_quantization(self.manifest, require_int4=True)
-            decode_packed_encoded, decode_scales = _packed_decode_hardware_arrays(
-                self.weights.decode_quantized
-            )
-            decode_storage = "int4"
-            decode_block_size = self.weights.decode_quantized.metadata.block_size
-            decode_quant_axis = self.weights.decode_quantized.metadata.quant_axis
+        decode_buffers = self._direct_decode_buffers()
         output_encoded = np.zeros((self.cfg.N,), dtype=npu_buffer_dtype(self.cfg.dtype))
         prefill_encoded = (
             np.zeros((self.cfg.M, self.cfg.H), dtype=npu_buffer_dtype(self.cfg.dtype))
@@ -761,16 +794,16 @@ class LinearRuntime:
                 shape=(self.cfg.M, self.cfg.K, self.cfg.H, self.cfg.N),
                 input_buffer=input_encoded,
                 prefill_weights=prefill_weights_encoded,
-                decode_weights=decode_weights_encoded,
-                decode_packed_weights=decode_packed_encoded,
-                decode_scales=decode_scales,
+                decode_weights=decode_buffers.weights,
+                decode_packed_weights=decode_buffers.packed_weights,
+                decode_scales=decode_buffers.scales,
                 output_buffer=output_encoded,
                 prefill_output_buffer=prefill_encoded,
                 decode_input_buffer=decode_input_encoded,
                 artifacts=self._direct_artifacts(),
-                decode_storage=decode_storage,
-                decode_block_size=decode_block_size,
-                decode_quant_axis=decode_quant_axis,
+                decode_storage=decode_buffers.storage,
+                decode_block_size=decode_buffers.block_size,
+                decode_quant_axis=decode_buffers.quant_axis,
             )
 
         try:
@@ -1010,10 +1043,11 @@ class LinearRuntime:
         decode_arg = self.transfer.transfer(
             "cpu", stages["decode"], decode_input, trace, "decode_input_to_backend"
         )
+        decode_weight_arrays = self._decode_weight_arrays_for_backend(stages["decode"])
         wd_arg = self.transfer.transfer(
             "cpu",
             stages["decode"],
-            self._decode_weight_arrays_for_backend(stages["decode"])[0],
+            decode_weight_arrays[0],
             trace,
             (
                 "decode_packed_weights_to_backend"
@@ -1026,7 +1060,7 @@ class LinearRuntime:
             scales_arg = self.transfer.transfer(
                 "cpu",
                 stages["decode"],
-                self._decode_weight_arrays_for_backend(stages["decode"])[1],
+                decode_weight_arrays[1],
                 trace,
                 "decode_scales_to_backend",
             )

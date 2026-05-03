@@ -11,6 +11,7 @@ from numerics import array_error_metrics, quantize_array
 from .quantization import (
     PackedLinearWeights,
     dequantize_packed_weights,
+    decode_quantization_plan_from_manifest,
     quantize_weight_matrix,
 )
 
@@ -42,19 +43,12 @@ class LinearWeights:
 def decode_quantization_from_manifest(
     manifest: dict[str, Any],
 ) -> dict[str, Any] | None:
-    decode = manifest.get("weights", {}).get("decode", {})
-    if not isinstance(decode, dict):
-        return None
-    storage = decode.get("storage", "bf16")
-    if storage in {None, "bf16", "dense"}:
-        return None
-    if storage not in {"int4", "uint4"}:
-        raise ValueError(f"weights.decode.storage is invalid: {storage}")
-    return {
-        "quant_kind": storage,
-        "block_size": int(decode.get("block_size", 32)),
-        "quant_axis": int(decode.get("quant_axis", 0)),
-    }
+    model = manifest["model"]
+    plan = decode_quantization_plan_from_manifest(
+        manifest,
+        shape=(int(model["H"]), int(model["N"])),
+    )
+    return None if plan is None else plan.quantize_kwargs()
 
 
 def config_from_manifest(manifest: dict[str, Any]) -> LinearConfig:

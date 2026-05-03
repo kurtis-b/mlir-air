@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 
@@ -30,13 +30,18 @@ class PackedLinearWeights:
     zero_points: np.ndarray | None = None
 
     def descriptor(self) -> dict[str, object]:
+        plan = decode_quantization_plan_for_metadata(self.metadata)
         return {
+            "storage": self.metadata.quant_kind,
             "quant_kind": self.metadata.quant_kind,
             "shape": list(self.metadata.shape),
             "block_size": self.metadata.block_size,
             "quant_axis": self.metadata.quant_axis,
             "signed": self.metadata.signed,
             "packing": self.metadata.packing,
+            "kernel_key": plan.kernel_key,
+            "hardware_fused": plan.hardware_fused,
+            "packed_shape": [int(dim) for dim in plan.packed_shape],
             "packed_bytes": int(self.packed.nbytes),
             "scale_shape": [int(dim) for dim in self.scales.shape],
             "scale_bytes": int(self.scales.nbytes),
@@ -46,6 +51,195 @@ class PackedLinearWeights:
                 else [int(dim) for dim in self.zero_points.shape]
             ),
         }
+
+
+@dataclass(frozen=True)
+class DecodeQuantizationPlan:
+    storage: QuantKind
+    block_size: int
+    quant_axis: int
+    shape: tuple[int, int] | None = None
+    npu_decode_tile_n: int | None = None
+
+    @property
+    def quant_kind(self) -> QuantKind:
+        return self.storage
+
+    @property
+    def signed(self) -> bool:
+        return self.storage == "int4"
+
+    @property
+    def hardware_fused(self) -> bool:
+        if self.shape is None:
+            return False
+        h, n = self.shape
+        return (
+            self.storage == "int4"
+            and self.quant_axis == 0
+            and self.block_size > 0
+            and h % self.block_size == 0
+            and n % 8 == 0
+        )
+
+    @property
+    def kernel_key(self) -> str:
+        return "decode_int4" if self.hardware_fused else "decode"
+
+    @property
+    def packed_shape(self) -> tuple[int, ...]:
+        if self.shape is None:
+            return ()
+        h, n = self.shape
+        if self.hardware_fused:
+            return (h, n // 8)
+        return ((h * n + 1) // 2,)
+
+    @property
+    def packed_bytes(self) -> int:
+        if self.shape is None:
+            return 0
+        h, n = self.shape
+        return (h * n + 1) // 2
+
+    @property
+    def scale_shape(self) -> tuple[int, ...]:
+        if self.shape is None:
+            return ()
+        if self.block_size <= 0:
+            return ()
+        h, n = self.shape
+        if self.quant_axis == 0:
+            return ((h + self.block_size - 1) // self.block_size, n)
+        return (h, (n + self.block_size - 1) // self.block_size)
+
+    @property
+    def scale_bytes(self) -> int:
+        if not self.scale_shape:
+            return 0
+        return int(np.prod(self.scale_shape)) * np.dtype(np.float32).itemsize
+
+    @property
+    def zero_point_shape(self) -> tuple[int, ...] | None:
+        return None if self.signed else self.scale_shape
+
+    @property
+    def zero_point_bytes(self) -> int:
+        if self.zero_point_shape is None:
+            return 0
+        return int(np.prod(self.zero_point_shape)) * np.dtype(np.uint8).itemsize
+
+    def quantize_kwargs(self) -> dict[str, Any]:
+        return {
+            "quant_kind": self.storage,
+            "block_size": self.block_size,
+            "quant_axis": self.quant_axis,
+        }
+
+    def to_metadata_dict(self) -> dict[str, Any]:
+        return {
+            "storage": self.storage,
+            "quant_kind": self.storage,
+            "block_size": self.block_size,
+            "quant_axis": self.quant_axis,
+            "kernel_key": self.kernel_key,
+            "hardware_fused": self.hardware_fused,
+            "packed_shape": [int(dim) for dim in self.packed_shape],
+            "packed_bytes": self.packed_bytes,
+            "scale_shape": [int(dim) for dim in self.scale_shape],
+            "scale_bytes": self.scale_bytes,
+            "npu_decode_tile_n": self.npu_decode_tile_n,
+        }
+
+
+@dataclass(frozen=True)
+class DecodeHardwareWeightArrays:
+    packed: np.ndarray
+    scales: np.ndarray
+    plan: DecodeQuantizationPlan
+
+
+def decode_quantization_plan_from_manifest(
+    manifest: dict[str, Any],
+    *,
+    shape: tuple[int, int] | None = None,
+    npu_decode_tile_n: int | None = None,
+) -> DecodeQuantizationPlan | None:
+    decode = manifest.get("weights", {}).get("decode", {})
+    if not isinstance(decode, dict):
+        return None
+    storage = decode.get("storage", "bf16")
+    if storage in {None, "bf16", "dense"}:
+        return None
+    if storage not in {"int4", "uint4"}:
+        raise ValueError(f"weights.decode.storage is invalid: {storage}")
+    return DecodeQuantizationPlan(
+        storage=storage,
+        block_size=int(decode.get("block_size", 32)),
+        quant_axis=int(decode.get("quant_axis", 0)),
+        shape=shape,
+        npu_decode_tile_n=npu_decode_tile_n,
+    )
+
+
+def decode_quantization_plan_for_metadata(
+    metadata: PackedWeightMetadata,
+    *,
+    npu_decode_tile_n: int | None = None,
+) -> DecodeQuantizationPlan:
+    return DecodeQuantizationPlan(
+        storage=metadata.quant_kind,
+        block_size=metadata.block_size,
+        quant_axis=metadata.quant_axis,
+        shape=metadata.shape,
+        npu_decode_tile_n=npu_decode_tile_n,
+    )
+
+
+def validate_accelerator_decode_plan(
+    plan: DecodeQuantizationPlan | None, *, require_int4: bool = False
+) -> DecodeQuantizationPlan | None:
+    if plan is None:
+        if require_int4:
+            raise ValueError("accelerator quantized decode requires storage == int4")
+        return None
+    if plan.storage != "int4":
+        raise ValueError("accelerator quantized decode supports only signed int4")
+    if plan.block_size <= 0:
+        raise ValueError("accelerator int4 decode requires positive block_size")
+    if plan.quant_axis != 0:
+        raise ValueError("accelerator int4 decode requires quant_axis == 0")
+    if plan.shape is None:
+        raise ValueError("accelerator int4 decode requires a concrete HxN shape")
+    h, n = plan.shape
+    if h % plan.block_size != 0:
+        raise ValueError("accelerator int4 decode requires H % block_size == 0")
+    if n % 8 != 0:
+        raise ValueError("accelerator int4 decode requires N divisible by 8")
+    return plan
+
+
+def hardware_decode_weight_arrays(
+    packed_weights: PackedLinearWeights,
+    *,
+    npu_decode_tile_n: int | None = None,
+) -> DecodeHardwareWeightArrays:
+    plan = decode_quantization_plan_for_metadata(
+        packed_weights.metadata, npu_decode_tile_n=npu_decode_tile_n
+    )
+    validate_accelerator_decode_plan(plan, require_int4=True)
+    packed_bytes = np.ascontiguousarray(
+        np.asarray(packed_weights.packed, dtype=np.uint8)
+    )
+    if int(packed_bytes.nbytes) != plan.packed_bytes:
+        raise ValueError("packed int4 decode buffer has an unexpected byte count")
+    packed_matrix = np.ascontiguousarray(
+        packed_bytes.view(np.uint32).reshape(plan.packed_shape)
+    )
+    scales = np.ascontiguousarray(np.asarray(packed_weights.scales, dtype=np.float32))
+    if tuple(int(dim) for dim in scales.shape) != plan.scale_shape:
+        raise ValueError("int4 decode scales have an unexpected shape")
+    return DecodeHardwareWeightArrays(packed=packed_matrix, scales=scales, plan=plan)
 
 
 def pack_4bit(values: np.ndarray, *, signed: bool = False) -> np.ndarray:

@@ -73,13 +73,23 @@ Milestone 2 is accepted as of May 3, 2026 with:
 `source /opt/xilinx/xrt/setup.sh && ../../sandbox/bin/python run_llm_linear_milestone2.py`.
 The accepted output root is `llm_linear/artifacts/benchmarks/milestone2_e2e`.
 That hardware gate covers `medium_m8_k512_h512_n256` in both direct directions
-plus matching host-mixed baselines, not the broader `medium` ladder. Full
-CPU/GPU/NPU crossover and `llm_like` studies remain later work.
+plus matching host-mixed baselines.
 
-Decode weights can be generated as packed `int4` or `uint4` storage for the
-CPU-safe fused-dequant GEMV path. Result JSON/CSV/report files separate decode
-dequant time, linear time, packed bytes read, scale bytes read, and zero-point
-bytes read when quantized decode is enabled.
+Milestone 3 is accepted as of May 3, 2026 with:
+`source /opt/xilinx/xrt/setup.sh && ../../sandbox/bin/python run_llm_linear_milestone3.py`.
+The accepted output root is
+`llm_linear/artifacts/benchmarks/milestone3_int4_hw`. That hardware gate covers
+the full `tiny_ci`, `medium`, and `llm_like` LLM-linear suites for `gpu_only`,
+`npu_only`, host-mixed GPU/NPU splits, and direct mixed GPU/NPU splits with
+signed int4 decode weights. Accelerator fused decode is fail-closed to signed
+`int4`, `quant_axis=0`, `H % block_size == 0`, and `N % 8 == 0`. CPU decode
+continues to support signed `int4` and unsigned `uint4` packed storage.
+
+Quantized decode result JSON/CSV/report fields include the requested storage,
+block size, quant axis, kernel key, hardware-fused eligibility, packed
+shape/bytes, scale shape/bytes, zero-point bytes when present, and the NPU
+decode tile width. CPU fused-dequant details still separate dequant time,
+linear time, packed bytes read, scale bytes read, and zero-point bytes read.
 
 ## Manifest Schema
 
@@ -176,6 +186,7 @@ Benchmark results use `schema_version = edge-study-v1`. Important fields include
 | `correctness`, `stage_metrics`, `torch_validation` | Final output and optional PyTorch validation status. |
 | `trace_summary`, `device_events` | Host-visible stage and event summaries from the untimed validation run. |
 | `transfer_events`, `transfer_summary` | Transfer accounting in the NumPy host-array model. |
+| `quantized_decode` | Decode quantization metadata, hardware-fused flag, packed/scales byte counts, and CPU fused-dequant timing detail when available. |
 | `npu_development` | NPU buffer layout, encoded dtype summaries, artifact/source paths, and `executed`. |
 | `execution_truth` | Booleans for NPU execution and timing exclusions. |
 | `limitations` | Reader-facing caveats for the run. |
@@ -186,6 +197,7 @@ The most important interpretation details are:
 - Validation runs once after timing and is not included in latency.
 - Compile/load setup is not included in latency.
 - `npu_development.executed` and `execution_truth.npu_executed` are the truth flags for NPU execution.
+- `quantized_decode.hardware_fused` is the truth flag for accelerator int4 decode; CPU-only int4/uint4 runs can still have `quantized_decode.enabled=true`.
 - Transfer bytes and elapsed times are host-array model events, not device DMA measurements.
 
 ## Output Layouts
@@ -236,5 +248,7 @@ The most important interpretation details are:
 - The harness models MoE routing and expert compute, not a full transformer.
 - Bias terms are omitted to keep the current runtime ABI small.
 - Quantized model presets execute bf16 math after dequantized weight loading.
-- LLM-linear int4/uint4 support currently covers decode GEMV, not prefill GEMM.
+- LLM-linear int4/uint4 support covers decode GEMV, not prefill GEMM.
+- Accelerator fused int4 decode supports only signed `int4`, `quant_axis=0`,
+  `H % block_size == 0`, and `N % 8 == 0`.
 - Shared expert metadata is recorded, but shared-expert execution is not modeled.
