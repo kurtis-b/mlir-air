@@ -7,6 +7,7 @@ from typing import Any
 VALID_BACKENDS = {"cpu", "gpu", "npu"}
 VALID_DTYPES = {"bf16", "f16"}
 VALID_TRANSFER_MODES = {"host", "direct"}
+VALID_DECODE_WEIGHT_STORAGE = {"bf16", "dense", "int4", "uint4"}
 
 
 def _require_positive_int(container: dict[str, Any], key: str) -> None:
@@ -41,6 +42,20 @@ def validate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     for section in ("inputs", "weights", "paths", "compiler", "artifacts"):
         if section not in manifest:
             raise ValueError(f"manifest.{section} is required")
+    decode_weights = manifest.get("weights", {}).get("decode")
+    if decode_weights is not None:
+        if not isinstance(decode_weights, dict):
+            raise ValueError("weights.decode must be an object when present")
+        storage = decode_weights.get("storage", "bf16")
+        if storage not in VALID_DECODE_WEIGHT_STORAGE:
+            raise ValueError(f"weights.decode.storage is invalid: {storage}")
+        if storage in {"int4", "uint4"}:
+            block_size = decode_weights.get("block_size", 32)
+            if not isinstance(block_size, int) or block_size <= 0:
+                raise ValueError("weights.decode.block_size must be a positive integer")
+            quant_axis = decode_weights.get("quant_axis", 0)
+            if quant_axis not in {0, 1}:
+                raise ValueError("weights.decode.quant_axis must be 0 or 1")
     return manifest
 
 

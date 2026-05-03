@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from llm_linear.compile import populate_artifacts
+from llm_linear.direct_bridge import probe_direct_bridge
 from llm_linear.manifest import (
     SCHEMA_VERSION,
     apply_case_to_manifest,
@@ -33,6 +34,7 @@ from llm_linear.results import (
 from llm_linear.runtime import LinearRuntime
 from llm_linear.schema import case_stage_backends, contains_npu, required_backends
 from llm_linear.suites import suite_workloads
+from llm_linear.transfer import DirectTransferUnsupported
 
 
 def _run_case(
@@ -114,8 +116,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--transfer-mode",
         choices=["host", "direct"],
-        default="host",
-        help="Transfer mode for all selected cases.",
+        default=None,
+        help="Override transfer mode for all selected cases.",
+    )
+    parser.add_argument(
+        "--decode-weight-storage",
+        choices=["bf16", "int4", "uint4"],
+        default="bf16",
+        help="Decode GEMV weight storage for this run.",
+    )
+    parser.add_argument(
+        "--decode-quant-block-size",
+        type=int,
+        default=32,
+        help="Block size for int4/uint4 decode weight quantization.",
+    )
+    parser.add_argument(
+        "--decode-quant-axis",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Quantization axis for packed decode weights.",
     )
     parser.add_argument(
         "--allow-npu", action="store_true", help="Run NPU-tagged cases in each suite."
@@ -139,13 +160,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.transfer_mode == "direct":
-        raise SystemExit(
-            "transfer_mode=direct is unsupported in llm_linear Milestone 1; "
-            "host-staged mixed paths are the only mixed paths in this implementation"
-        )
-
     base_manifest = load_json(resolve_package_path(args.manifest))
+    if args.decode_weight_storage != "bf16":
+        base_manifest.setdefault("weights", {})["decode"] = {
+            "storage": args.decode_weight_storage,
+            "block_size": int(args.decode_quant_block_size),
+            "quant_axis": int(args.decode_quant_axis),
+        }
     matrix = load_json(resolve_package_path(args.matrix))
     workloads = suite_workloads(args.suite, base_manifest, matrix)
     if args.workload_filter:
@@ -160,6 +181,35 @@ def main(argv: list[str] | None = None) -> int:
             workload["cases"] = [
                 case for case in workload["cases"] if case["name"] in allowed
             ]
+    if args.transfer_mode == "direct":
+        for workload in workloads:
+            for case in workload["cases"]:
+                backends = case_stage_backends(case)
+                if set(backends.values()) != {"gpu", "npu"}:
+                    raise SystemExit(
+                        "transfer_mode=direct only supports GPU/NPU mixed cases; "
+                        f"{case['name']} uses {backends['prefill']}->{backends['decode']}"
+                    )
+    direct_cases_selected = []
+    for workload in workloads:
+        for case in workload["cases"]:
+            backends = case_stage_backends(case)
+            effective_transfer = args.transfer_mode or case.get("transfer_mode", "host")
+            if effective_transfer == "direct" and (
+                args.allow_npu or not contains_npu(backends)
+            ):
+                direct_cases_selected.append(case["name"])
+    if direct_cases_selected:
+        status = probe_direct_bridge()
+        if not status.available:
+            raise SystemExit(
+                "direct GPU/NPU cases require a native bridge before compilation: "
+                f"{status.diagnostic}"
+            )
+        raise SystemExit(
+            "direct GPU/NPU native bridge probe succeeded, but the llm_linear "
+            "direct executor is not enabled yet"
+        )
 
     output_dir = resolve_package_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -167,7 +217,8 @@ def main(argv: list[str] | None = None) -> int:
     summary: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "measurement_mode": args.measurement_mode,
-        "transfer_mode": args.transfer_mode,
+        "transfer_mode": args.transfer_mode or "case",
+        "decode_weight_storage": args.decode_weight_storage,
         "workloads": [],
     }
     csv_rows: list[dict[str, Any]] = []
@@ -226,17 +277,20 @@ def main(argv: list[str] | None = None) -> int:
                 if args.warmup is not None
                 else int(case_manifest["benchmark"]["warmup"])
             )
-            result = _run_case(
-                case_manifest,
-                manifest_path,
-                case,
-                suite=workload["suite"],
-                workload_name=workload["name"],
-                iterations=iterations,
-                warmup=warmup,
-                measurement_mode=args.measurement_mode,
-                command_line=command_line,
-            )
+            try:
+                result = _run_case(
+                    case_manifest,
+                    manifest_path,
+                    case,
+                    suite=workload["suite"],
+                    workload_name=workload["name"],
+                    iterations=iterations,
+                    warmup=warmup,
+                    measurement_mode=args.measurement_mode,
+                    command_line=command_line,
+                )
+            except DirectTransferUnsupported as exc:
+                raise SystemExit(str(exc)) from exc
             if args.require_correctness:
                 failure = correctness_failure_message(result)
                 if failure is not None:

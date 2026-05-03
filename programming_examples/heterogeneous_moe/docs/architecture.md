@@ -49,6 +49,25 @@ The transfer manager records edge events between stage backends. Its model is in
 
 Supported peer edges are `cpu<->cpu`, `cpu<->gpu`, `gpu<->cpu`, `cpu<->npu`, `npu<->cpu`, `gpu<->gpu`, and `npu<->npu`. Direct `gpu<->npu` peer transfer is not implemented. Result files therefore report `transfer_summary.model = numpy_host_array_transfer_model` and `device_resident_buffers = false`.
 
+## LLM-Linear Roadmap Harness
+
+`llm_linear/` is the newer GEMM/GEMV benchmark used by the Ryzen heterogeneous
+execution roadmap. It keeps the MoE harness archived as a reference and models:
+
+- prefill GEMM: `X[M,K] @ Wp[K,H] -> P[M,H]`
+- decode GEMV: `P[M-1,:] @ Wd[H,N] -> Y[N]`
+- CPU, GPU, NPU, host-staged mixed, and fail-closed direct mixed placements
+
+The direct mixed cases use `transfer_mode=direct` and the
+`DeviceResidentTensor` result contract. They must not claim success unless a
+native bridge records an audited GPU/NPU edge with zero NumPy host
+materializations. Without that bridge, direct cases fail before host fallback.
+
+Decode weights can be generated as packed `int4` or `uint4` storage for the
+CPU-safe fused-dequant GEMV path. Result JSON/CSV/report files separate decode
+dequant time, linear time, packed bytes read, scale bytes read, and zero-point
+bytes read when quantized decode is enabled.
+
 ## Manifest Schema
 
 `default_manifest.json` is the portable base manifest. Its top-level sections are:
@@ -198,7 +217,9 @@ The most important interpretation details are:
 - Router top-k selection is CPU-side.
 - Direct iGPU-to-NPU peer transfer is unsupported.
 - Transfer accounting is host-visible and does not prove device-resident overlap.
+- LLM-linear direct cases are fail-closed until the native GPU/NPU bridge executor is enabled and hardware-verified.
 - The harness models MoE routing and expert compute, not a full transformer.
 - Bias terms are omitted to keep the current runtime ABI small.
 - Quantized model presets execute bf16 math after dequantized weight loading.
+- LLM-linear int4/uint4 support currently covers decode GEMV, not prefill GEMM.
 - Shared expert metadata is recorded, but shared-expert execution is not modeled.

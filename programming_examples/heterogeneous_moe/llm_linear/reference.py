@@ -8,6 +8,11 @@ from typing import Any
 import numpy as np
 
 from numerics import array_error_metrics, quantize_array
+from .quantization import (
+    PackedLinearWeights,
+    dequantize_packed_weights,
+    quantize_weight_matrix,
+)
 
 DEFAULT_INPUT_SCALE = 0.25
 DEFAULT_WEIGHT_SCALE = 0.125
@@ -31,6 +36,25 @@ class LinearConfig:
 class LinearWeights:
     prefill: np.ndarray
     decode: np.ndarray
+    decode_quantized: PackedLinearWeights | None = None
+
+
+def decode_quantization_from_manifest(
+    manifest: dict[str, Any],
+) -> dict[str, Any] | None:
+    decode = manifest.get("weights", {}).get("decode", {})
+    if not isinstance(decode, dict):
+        return None
+    storage = decode.get("storage", "bf16")
+    if storage in {None, "bf16", "dense"}:
+        return None
+    if storage not in {"int4", "uint4"}:
+        raise ValueError(f"weights.decode.storage is invalid: {storage}")
+    return {
+        "quant_kind": storage,
+        "block_size": int(decode.get("block_size", 32)),
+        "quant_axis": int(decode.get("quant_axis", 0)),
+    }
 
 
 def config_from_manifest(manifest: dict[str, Any]) -> LinearConfig:
@@ -54,7 +78,10 @@ def random_inputs(
 
 
 def random_weights(
-    cfg: LinearConfig, seed: int, scale: float = DEFAULT_WEIGHT_SCALE
+    cfg: LinearConfig,
+    seed: int,
+    scale: float = DEFAULT_WEIGHT_SCALE,
+    decode_quantization: dict[str, Any] | None = None,
 ) -> LinearWeights:
     rng = np.random.default_rng(seed)
 
@@ -62,7 +89,14 @@ def random_weights(
         values = rng.standard_normal(shape, dtype=np.float32) * np.float32(scale)
         return quantize_array(values, cfg.dtype)
 
-    return LinearWeights(prefill=arr((cfg.K, cfg.H)), decode=arr((cfg.H, cfg.N)))
+    prefill = arr((cfg.K, cfg.H))
+    decode = arr((cfg.H, cfg.N))
+    if decode_quantization is None:
+        return LinearWeights(prefill=prefill, decode=decode)
+
+    packed = quantize_weight_matrix(decode, **decode_quantization)
+    dequantized = dequantize_packed_weights(packed, dtype_name=cfg.dtype)
+    return LinearWeights(prefill=prefill, decode=dequantized, decode_quantized=packed)
 
 
 def prefill_gemm(

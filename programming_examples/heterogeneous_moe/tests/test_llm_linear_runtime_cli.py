@@ -19,7 +19,11 @@ from llm_linear.results import (
     validate_runtime,
 )
 from llm_linear.runtime import LinearRuntime
-from llm_linear.transfer import DirectTransferUnsupported
+from llm_linear.transfer import (
+    DeviceResidentTensor,
+    DirectTransferUnsupported,
+    LinearTransferManager,
+)
 
 
 def _tiny_cpu_manifest(moe_dir: Path, tmp_path: Path) -> dict:
@@ -65,13 +69,58 @@ def test_linear_runtime_result_schema(moe_dir: Path, tmp_path: Path) -> None:
     assert row["validation_status"] == "pass"
 
 
+def test_linear_runtime_quantized_decode_schema(moe_dir: Path, tmp_path: Path) -> None:
+    manifest = _tiny_cpu_manifest(moe_dir, tmp_path)
+    manifest["weights"]["decode"] = {
+        "storage": "int4",
+        "block_size": 4,
+        "quant_axis": 0,
+    }
+    with LinearRuntime(manifest) as runtime:
+        inputs = random_inputs(runtime.cfg, seed=manifest["inputs"]["seed"])
+        last_run, _validation_ms = validate_runtime(runtime, inputs)
+    assert last_run["numpy_validation"]["status"] == "pass"
+    assert last_run["quantized_decode"]["enabled"] is True
+    assert last_run["quantized_decode"]["detail"]["dequant_ms"] >= 0.0
+
+
 def test_linear_direct_transfer_fails_closed(moe_dir: Path, tmp_path: Path) -> None:
     manifest = _tiny_cpu_manifest(moe_dir, tmp_path)
     manifest["runtime"]["transfer_mode"] = "direct"
     with LinearRuntime(manifest) as runtime:
         inputs = random_inputs(runtime.cfg, seed=manifest["inputs"]["seed"])
-        with pytest.raises(DirectTransferUnsupported, match="unsupported"):
+        with pytest.raises(DirectTransferUnsupported, match="GPU/NPU"):
             runtime.run(inputs)
+
+
+def test_linear_direct_handoff_summary_schema() -> None:
+    transfer = LinearTransferManager("direct")
+    tensor = DeviceResidentTensor(
+        owner="prefill",
+        backend="gpu",
+        dtype="uint16",
+        shape=(4, 8),
+        strides=(8, 1),
+        byte_size=64,
+        exported_handle_type="dma_buf_fd",
+        sync_state="gpu_event_recorded",
+        trace_id="edge0",
+    )
+    transfer.record_direct_handoff(
+        producer="gpu",
+        consumer="npu",
+        tensor=tensor,
+        elapsed_us=12.5,
+        label="prefill_to_decode",
+        mechanism="xrt_bo_export_import_hip_vmem_fd",
+        sync_events=[{"producer": "gpu", "consumer": "npu"}],
+        numpy_host_materializations=0,
+    )
+    summary = transfer.summary()
+    assert summary["model"] == "device_resident_direct_handoff"
+    assert summary["device_resident_buffers"] is True
+    assert summary["numpy_host_materializations"] == 0
+    assert summary["direct_handoff"]["edges"][0]["numpy_host_materializations"] == 0
 
 
 def test_compile_llm_linear_cli(monkeypatch, tmp_path: Path) -> None:
@@ -118,9 +167,9 @@ def test_run_llm_linear_suite_cpu_filter_and_direct_failure(tmp_path: Path) -> N
     summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["workloads"][0]["cases"][0]["case_name"] == "cpu_only"
     assert (out_dir / "summary.csv").read_text(encoding="utf-8").startswith("suite,")
-    assert "Direct GPU/NPU handoff is unsupported" in (out_dir / "report.md").read_text(
+    assert "audited device-resident buffers" in (out_dir / "report.md").read_text(
         encoding="utf-8"
     )
 
-    with pytest.raises(SystemExit, match="direct is unsupported"):
+    with pytest.raises(SystemExit, match="GPU/NPU"):
         run_llm_linear_suite.main(["--transfer-mode", "direct"])

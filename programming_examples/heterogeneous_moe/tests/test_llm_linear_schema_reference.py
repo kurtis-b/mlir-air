@@ -10,12 +10,16 @@ import pytest
 
 from llm_linear.manifest import load_json
 from llm_linear.quantization import (
+    decode_gemv_fused_dequant,
+    dequantize_packed_weights,
     metadata_for_packed_weights,
     pack_4bit,
+    quantize_weight_matrix,
     unpack_4bit,
 )
 from llm_linear.reference import (
     LinearConfig,
+    decode_gemv,
     random_inputs,
     random_weights,
     run_reference,
@@ -51,6 +55,8 @@ def test_linear_manifest_matrix_and_required_backends(moe_dir: Path) -> None:
         "npu_only",
         "gpu_prefill_npu_decode_host",
         "npu_prefill_gpu_decode_host",
+        "gpu_prefill_npu_decode_direct",
+        "npu_prefill_gpu_decode_direct",
     } <= names
 
     cpu_case = matrix["cases"][0]
@@ -114,3 +120,18 @@ def test_linear_quantization_pack_metadata() -> None:
     )
     assert metadata.signed is True
     assert metadata.packing == "two_values_per_byte_low_nibble_first"
+
+
+def test_linear_quantized_decode_matches_dequantized_baseline() -> None:
+    rng = np.random.default_rng(3)
+    vector = rng.standard_normal(8, dtype=np.float32) * np.float32(0.25)
+    weights = rng.standard_normal((8, 6), dtype=np.float32) * np.float32(0.125)
+    packed = quantize_weight_matrix(
+        weights, quant_kind="int4", block_size=4, quant_axis=0
+    )
+    dequantized = dequantize_packed_weights(packed, dtype_name="f16")
+    fused, detail = decode_gemv_fused_dequant(vector, packed, "f16")
+    baseline = decode_gemv(vector, dequantized, "f16")
+    np.testing.assert_allclose(fused, baseline)
+    assert detail["packed_weight_bytes_read"] == packed.packed.nbytes
+    assert packed.descriptor()["quant_kind"] == "int4"

@@ -217,6 +217,31 @@ Acceptance:
 
 ### Milestone 2: Direct Bidirectional GPU/NPU Handoff
 
+Status as of May 3, 2026: partially implemented in `llm_linear` as a
+fail-closed interface and auditable result schema, but not accepted as a working
+direct handoff path.
+
+Implemented scope:
+
+- `DeviceResidentTensor` records owner, backend, dtype, shape, stride, byte
+  size, exported handle metadata, synchronization state, and trace identity.
+- `transfer_mode=direct` now means "prove a GPU/NPU direct edge or fail"; it no
+  longer silently falls back to host staging for direct mixed cases.
+- The benchmark matrix includes both direct split directions:
+  `gpu_prefill_npu_decode_direct` and `npu_prefill_gpu_decode_direct`.
+- Result artifacts can report `device_resident_direct_handoff`,
+  per-edge mechanisms, sync events, and NumPy host materialization counts when a
+  native bridge records such an edge.
+- GPU artifact compilation has a device-resident option that omits
+  `air-gpu-host-staging` for future direct executor work.
+
+Remaining blocker:
+
+- The native runtime executor that actually imports/exports HIP VMem and XRT BO
+  handles and launches GPU/NPU kernels across that shared allocation is still
+  not enabled. Direct mode therefore remains fail-closed unless that executor is
+  completed and verified on hardware.
+
 Goal: make the mixed path device-resident. This milestone is required before the
 roadmap can be considered finished.
 
@@ -243,6 +268,19 @@ Acceptance:
 
 ### Milestone 3: Fused int4 Weight Dequantization
 
+Status as of May 3, 2026: implemented for decode GEMV in the `llm_linear`
+CPU-safe path.
+
+Implemented scope:
+
+- Decode weights can be generated as signed int4 or uint4 packed storage with
+  block size, quant axis, scale layout, optional zero points, and
+  low-nibble-first packing metadata.
+- CPU decode supports fused unpack/dequantize plus linear GEMV and validates
+  against a dequantize-then-linear baseline.
+- Result JSON/CSV/report fields include decode weight storage, dequant time,
+  linear time, packed bytes read, scale bytes read, and zero-point bytes read.
+
 Goal: test the low-bit decode pattern that makes NPU GEMV potentially
 interesting for LLM inference.
 
@@ -267,6 +305,17 @@ Acceptance:
 
 ### Milestone 4: Final Crossover and Speedup Study
 
+Status as of May 3, 2026: report plumbing is implemented, but the final hardware
+study has not been run because Milestone 2 is not accepted.
+
+Implemented scope:
+
+- Suite reports now include a crossover section when audited direct mixed cases
+  are present.
+- Speedup rows compare each direct mixed split against CPU-only, GPU-only,
+  NPU-only, and the matching host-staged mixed split.
+- Each row is classified as `wins`, `loses`, or `inconclusive`.
+
 Goal: answer whether heterogeneous Ryzen execution wins, and where.
 
 Checklist:
@@ -288,32 +337,37 @@ Acceptance:
 
 ## Future Interfaces
 
-These are proposed future interfaces, not current public APIs:
+These are current or proposed interfaces:
 
-- `DeviceResidentTensor`: allocation owner, backend, dtype, shape, strides,
-  byte size, exported handle, synchronization state, and trace identity.
+- `DeviceResidentTensor`: current checked-in Python contract for allocation
+  owner, backend, dtype, shape, strides, byte size, exported handle metadata,
+  synchronization state, and trace identity.
 - `transfer_mode = direct`: request device-resident handoff and fail if an edge
   would fall back to a host array.
-- Quantized weight metadata: block size, signedness, quant axis, scale layout,
-  zero-point layout, and packed-weight byte order.
-- Result fields for direct handoff: edge mechanism, exported/imported handle
-  type, sync primitive, NumPy host materialization count, and device-residency
-  truth flags.
+- Quantized weight metadata: current decode-weight schema for block size,
+  signedness, quant axis, scale layout, zero-point layout, and packed-weight
+  byte order.
+- Result fields for direct handoff: current audit schema for edge mechanism,
+  exported/imported handle type, sync primitive, NumPy host materialization
+  count, and device-residency truth flags.
 
 Do not retrofit these names into the MoE harness unless doing so directly helps
 the LLM-linear benchmark. The MoE harness should remain a compact reference.
 
 ## Verification Requirements
 
-For this documentation-only change:
+For the current checked-in implementation:
 
 - The README link to this file must resolve.
-- This file must not claim that current direct GPU/NPU handoff exists.
-- This file must not claim that current int4 execution exists.
-- Optional CPU-safe checks from `programming_examples/heterogeneous_moe` remain:
-  `python3 smoke_tests.py --lane ci` and `python3 run_coverage.py`.
+- This file must not claim that current direct GPU/NPU handoff is accepted.
+- Focused CPU-safe checks must pass:
+  `../../sandbox/bin/python -m pytest tests/test_llm_linear_*`.
+- Full harness checks should pass when time allows:
+  `../../sandbox/bin/python -m pytest tests`.
+- A CPU-only tiny CI smoke should still write ignored outputs:
+  `../../sandbox/bin/python run_llm_linear_suite.py --suite tiny_ci --case-filter cpu_only --iterations 1 --warmup 0 --require-correctness`.
 
-For future implementation acceptance:
+For direct-handoff acceptance:
 
 - Correctness must pass against a CPU reference.
 - Host-staged and direct-handoff paths must be timed separately.

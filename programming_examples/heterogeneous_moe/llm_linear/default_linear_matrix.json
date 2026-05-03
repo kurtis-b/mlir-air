@@ -29,6 +29,18 @@
       "prefill_backend": "npu",
       "decode_backend": "gpu",
       "transfer_mode": "host"
+    },
+    {
+      "name": "gpu_prefill_npu_decode_direct",
+      "prefill_backend": "gpu",
+      "decode_backend": "npu",
+      "transfer_mode": "direct"
+    },
+    {
+      "name": "npu_prefill_gpu_decode_direct",
+      "prefill_backend": "npu",
+      "decode_backend": "gpu",
+      "transfer_mode": "direct"
     }
   ]
 }

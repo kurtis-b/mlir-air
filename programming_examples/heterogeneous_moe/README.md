@@ -48,6 +48,8 @@ Recommended exploration order:
 | One model-preset workload | `python3 run_workload_suite.py --suite model_presets --workload-filter qwen36_35b_a3b_qbf16 --case-filter cpu_top2 gpu_top2 --iterations 1 --warmup 0 --require-correctness` |
 | Edge-efficiency smoke study | `python3 edge_study.py --profile smoke --case-filter cpu_top2 gpu_top2 --iterations 1 --warmup 0 --require-correctness` |
 | NPU smoke lane | `python3 smoke_tests.py --lane npu --allow-npu` |
+| LLM-linear CPU smoke | `../../sandbox/bin/python run_llm_linear_suite.py --suite tiny_ci --case-filter cpu_only --iterations 1 --warmup 0 --require-correctness` |
+| LLM-linear int4 decode CPU smoke | `../../sandbox/bin/python run_llm_linear_suite.py --suite tiny_ci --case-filter cpu_only --decode-weight-storage int4 --iterations 1 --warmup 0 --require-correctness` |
 
 GPU commands need `LLVM_INSTALL_DIR`, `ROCM_PATH`, and `AIR_OPT_PATH` or matching tools on `PATH`. NPU commands need `AIRCC_PATH`, XRT setup, visible hardware, and explicit `--allow-npu`. See the [exploration guide](docs/exploration.md) for the setup matrix and troubleshooting flow.
 
@@ -62,6 +64,7 @@ GPU commands need `LLVM_INSTALL_DIR`, `ROCM_PATH`, and `AIR_OPT_PATH` or matchin
 - `run_matrix.py`: matrix runner that writes per-case outputs plus aggregate JSON/CSV.
 - `run_workload_suite.py`: shape, routing, and model-preset workload suites.
 - `edge_study.py`: canonical edge-efficiency wrapper over workload suites.
+- `llm_linear/`: LLM-linear GEMM/GEMV benchmark for the Ryzen heterogeneous roadmap, including host-staged baselines, fail-closed direct handoff cases, int4/uint4 decode-weight packing, and crossover report plumbing.
 
 ## Deeper Docs
 

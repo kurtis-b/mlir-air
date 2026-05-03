@@ -20,12 +20,15 @@ from numerics import (
 from trace import TraceRecorder, summarize_device_events
 
 from .compile import ENTRYPOINTS, compile_gpu, compile_npu, resolve_air_sources
+from .direct_bridge import probe_direct_bridge
 from .manifest import artifact_root
+from .quantization import PackedLinearWeights, decode_gemv_fused_dequant
 from .reference import (
     LinearConfig,
     LinearWeights,
     config_from_manifest,
     decode_gemv,
+    decode_quantization_from_manifest,
     prefill_gemm,
     random_weights,
     run_reference,
@@ -33,18 +36,32 @@ from .reference import (
     workload_bytes,
 )
 from .schema import validate_manifest
-from .transfer import LinearTransferManager
+from .transfer import DirectTransferUnsupported, LinearTransferManager
 
 
 class CpuLinearExecutor:
-    def __init__(self, kind: str, dtype_name: str) -> None:
+    def __init__(
+        self,
+        kind: str,
+        dtype_name: str,
+        decode_quantized: PackedLinearWeights | None = None,
+    ) -> None:
         self.kind = kind
         self.dtype_name = dtype_name
+        self.decode_quantized = decode_quantized
+        self.last_quantized_detail: dict[str, float] | None = None
 
     def run(self, *arrays: np.ndarray) -> np.ndarray:
+        self.last_quantized_detail = None
         if self.kind == "prefill":
             return prefill_gemm(arrays[0], arrays[1], self.dtype_name)
         if self.kind == "decode":
+            if self.decode_quantized is not None:
+                output, detail = decode_gemv_fused_dequant(
+                    arrays[0], self.decode_quantized, self.dtype_name
+                )
+                self.last_quantized_detail = detail
+                return output
             return decode_gemv(arrays[0], arrays[1], self.dtype_name)
         raise ValueError(f"Unknown CPU executor kind: {self.kind}")
 
@@ -163,8 +180,12 @@ class LinearRuntime:
         self.cfg = config_from_manifest(manifest)
         self.input_scale = float(manifest.get("inputs", {}).get("scale", 0.25))
         self.weight_scale = float(manifest.get("weights", {}).get("scale", 0.125))
+        self.decode_quantization = decode_quantization_from_manifest(manifest)
         self.weights = random_weights(
-            self.cfg, int(manifest["weights"]["seed"]), scale=self.weight_scale
+            self.cfg,
+            int(manifest["weights"]["seed"]),
+            scale=self.weight_scale,
+            decode_quantization=self.decode_quantization,
         )
         self.transfer = LinearTransferManager(manifest["runtime"]["transfer_mode"])
         self.artifact_root = artifact_root(manifest)
@@ -184,7 +205,11 @@ class LinearRuntime:
 
     def _make_executor(self, kind: str, backend: str) -> Any:
         if backend == "cpu":
-            return CpuLinearExecutor(kind, self.cfg.dtype)
+            return CpuLinearExecutor(
+                kind,
+                self.cfg.dtype,
+                self.weights.decode_quantized if kind == "decode" else None,
+            )
 
         artifact = self.manifest["artifacts"].get(kind, {}).get(backend, {})
         source = self._sources_for(backend)[kind]
@@ -216,10 +241,30 @@ class LinearRuntime:
         )
 
     def prepare(self) -> None:
+        if self.transfer.mode == "direct":
+            self._require_direct_runtime()
         for executor in (self.executors.prefill, self.executors.decode):
             prepare = getattr(executor, "prepare", None)
             if prepare:
                 prepare()
+
+    def _require_direct_runtime(self) -> None:
+        stages = self.manifest["runtime"]["stage_backends"]
+        producer = stages["prefill"]
+        consumer = stages["decode"]
+        self.transfer.require_direct_edge(producer, consumer, "prefill_to_decode")
+        status = probe_direct_bridge()
+        if not status.available:
+            raise DirectTransferUnsupported(
+                "transfer_mode=direct requested a GPU/NPU device-resident "
+                f"handoff for {producer}->{consumer}, but the native bridge is "
+                f"not available: {status.diagnostic}"
+            )
+        raise DirectTransferUnsupported(
+            "transfer_mode=direct found a native bridge probe, but the "
+            "llm_linear direct executor is not enabled yet; refusing to fall "
+            "back to host staging"
+        )
 
     def _npu_stage_executed(self) -> bool:
         return any(
@@ -257,14 +302,26 @@ class LinearRuntime:
                     reference["decode_input"], self.cfg.dtype
                 ),
                 "weights": encoded_array_summary(self.weights.decode, self.cfg.dtype),
+                "weight_quantization": self._quantization_report(),
                 "expected_output": encoded_array_summary(
                     reference["output"], self.cfg.dtype
                 ),
             },
             "notes": [
-                "Milestone 1 uses host-staged NumPy arrays for all mixed paths.",
-                "Direct device-resident GPU/NPU handoff is not implemented.",
+                "Host transfer mode uses NumPy arrays for mixed paths.",
+                "Direct device-resident GPU/NPU handoff is gated by the native bridge probe and refuses host fallback.",
             ],
+        }
+
+    def _quantization_report(self) -> dict[str, Any]:
+        packed = self.weights.decode_quantized
+        if packed is None:
+            return {"storage": "bf16", "fused_decode": False}
+        return {
+            "storage": packed.metadata.quant_kind,
+            "fused_decode": True,
+            "metadata": packed.descriptor(),
+            "dequantized_compute_dtype": self.cfg.dtype,
         }
 
     def _stage_run(
@@ -294,6 +351,8 @@ class LinearRuntime:
         stages = self.manifest["runtime"]["stage_backends"]
         trace = TraceRecorder() if capture_details else None
         e2e_start_ns = time.perf_counter_ns()
+        if self.transfer.mode == "direct":
+            self._require_direct_runtime()
 
         x_arg = self.transfer.transfer(
             "cpu", stages["prefill"], inputs, trace, "input_to_prefill"
@@ -338,6 +397,9 @@ class LinearRuntime:
         )
         output_cpu = self.transfer.transfer(
             stages["decode"], "cpu", output, trace, "decode_to_host"
+        )
+        quantized_decode_detail = getattr(
+            self.executors.decode, "last_quantized_detail", None
         )
         e2e_ms = (time.perf_counter_ns() - e2e_start_ns) / 1_000_000.0
 
@@ -391,6 +453,7 @@ class LinearRuntime:
                 },
                 "operation": "prefill_gemm_then_decode_gemv",
                 "bytes": workload_bytes(self.cfg),
+                "decode_weight_quantization": self._quantization_report(),
                 "input_scale": self.input_scale,
                 "weight_scale": self.weight_scale,
             },
@@ -405,6 +468,15 @@ class LinearRuntime:
             "trace_summary": trace.summary(),
             "transfer_events": self.transfer.snapshot(),
             "transfer_summary": transfer_summary,
+            "quantized_decode": {
+                "enabled": self.weights.decode_quantized is not None,
+                "detail": quantized_decode_detail,
+                "metadata": (
+                    None
+                    if self.weights.decode_quantized is None
+                    else self.weights.decode_quantized.descriptor()
+                ),
+            },
             "device_events": summarize_device_events(trace),
             "npu_development": self._npu_development_report(
                 inputs, reference, executed=self._npu_stage_executed()
@@ -417,17 +489,25 @@ def linear_limitations(
     manifest: dict[str, Any], transfer_summary: dict[str, Any]
 ) -> dict[str, Any]:
     return {
-        "study_readiness": "milestone_1_host_staged",
+        "study_readiness": (
+            "direct_handoff_ready"
+            if transfer_summary.get("device_resident_buffers")
+            else "host_staged_or_fail_closed_direct"
+        ),
         "transfer_model": transfer_summary.get("model"),
         "device_resident_buffers": bool(
             transfer_summary.get("device_resident_buffers")
         ),
-        "direct_igpu_npu_peer": "unsupported",
+        "direct_igpu_npu_peer": (
+            "supported"
+            if transfer_summary.get("device_resident_buffers")
+            else "fail_closed_without_native_bridge"
+        ),
         "compile_load_excluded_from_timed_iterations": True,
         "limitations": [
             "Milestone 1 measures a two-stage linear pipeline, not full attention, KV-cache, tokenizer, or sampling.",
-            "Mixed GPU/NPU paths are host-staged through NumPy arrays.",
-            "transfer_mode=direct is fail-closed and unsupported until the DeviceResidentTensor bridge exists.",
+            "Host transfer mode mixed GPU/NPU paths are staged through NumPy arrays.",
+            "transfer_mode=direct refuses host fallback unless a native DeviceResidentTensor bridge records an audited direct edge.",
             "Generated AIR sources are bring-up kernels and are not tuned LLM-scale tilings.",
         ],
         "placement": dict(manifest["runtime"]["stage_backends"]),

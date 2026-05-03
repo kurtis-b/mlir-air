@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = "llm-linear-v1"
+SCHEMA_VERSION = "llm-linear-v2"
 
 
 def package_dir() -> Path:

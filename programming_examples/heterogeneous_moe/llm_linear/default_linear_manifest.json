@@ -1,5 +1,5 @@
 {
-  "schema_version": "llm-linear-v1",
+  "schema_version": "llm-linear-v2",
   "model": {
     "M": 4,
     "K": 64,
@@ -33,7 +33,10 @@
   },
   "weights": {
     "seed": 11,
-    "scale": 0.125
+    "scale": 0.125,
+    "decode": {
+      "storage": "bf16"
+    }
   },
   "workload": {
     "suite": "tiny_ci",

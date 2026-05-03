@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 
-from llm_linear.compile import populate_artifacts
+from llm_linear.compile import populate_artifacts, populate_direct_gpu_artifacts
 from llm_linear.manifest import load_json, resolve_package_path, save_json
 from llm_linear.schema import validate_manifest
 
@@ -31,11 +31,18 @@ def main(argv: list[str] | None = None) -> int:
         default=["gpu"],
         help="Backends to compile.",
     )
+    parser.add_argument(
+        "--direct-gpu",
+        action="store_true",
+        help="Also compile device-resident GPU artifacts without host staging.",
+    )
     args = parser.parse_args(argv)
 
     manifest = load_json(resolve_package_path(args.manifest))
     validate_manifest(manifest)
     compiled = populate_artifacts(manifest, set(args.backends))
+    if args.direct_gpu:
+        compiled = populate_direct_gpu_artifacts(compiled)
     out_path = resolve_package_path(args.manifest_out)
     save_json(out_path, compiled)
     print(f"Wrote compiled llm_linear manifest to {out_path}")

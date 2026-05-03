@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -13,6 +14,35 @@ from trace import TraceRecorder
 
 class DirectTransferUnsupported(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class DeviceResidentTensor:
+    owner: str
+    backend: str
+    dtype: str
+    shape: tuple[int, ...]
+    strides: tuple[int, ...]
+    byte_size: int
+    offset: int = 0
+    exported_handle_type: str | None = None
+    exported_handle: int | None = None
+    sync_state: str = "producer_complete"
+    trace_id: str | None = None
+
+    def descriptor(self) -> dict[str, Any]:
+        return {
+            "owner": self.owner,
+            "backend": self.backend,
+            "dtype": self.dtype,
+            "shape": [int(dim) for dim in self.shape],
+            "strides": [int(dim) for dim in self.strides],
+            "byte_size": int(self.byte_size),
+            "offset": int(self.offset),
+            "exported_handle_type": self.exported_handle_type,
+            "sync_state": self.sync_state,
+            "trace_id": self.trace_id,
+        }
 
 
 class LinearTransferManager:
@@ -63,6 +93,18 @@ class LinearTransferManager:
         host_staged_count = int(
             sum(1 for event in events if event["actual_mode"] == "host_staged")
         )
+        direct_events = [
+            event
+            for event in events
+            if event["actual_mode"] == "device_resident_direct_handoff"
+        ]
+        direct_host_materializations = int(
+            sum(
+                int(event.get("numpy_host_materializations", 0))
+                for event in direct_events
+            )
+        )
+        direct_supported = bool(direct_events) and direct_host_materializations == 0
         return {
             "event_count": len(events),
             "total_bytes": int(sum(int(event["bytes"]) for event in events)),
@@ -72,18 +114,85 @@ class LinearTransferManager:
             "copied_count": int(sum(1 for event in events if event["copied"])),
             "host_staged_count": host_staged_count,
             "numpy_host_materializations": host_staged_count,
-            "model": "numpy_host_staged_linear_transfer",
-            "transfer_semantics": "host_staged",
-            "device_resident_buffers": False,
+            "direct_handoff_numpy_host_materializations": direct_host_materializations,
+            "model": (
+                "device_resident_direct_handoff"
+                if direct_supported
+                else "numpy_host_staged_linear_transfer"
+            ),
+            "transfer_semantics": (
+                "device_resident_direct_handoff" if direct_supported else "host_staged"
+            ),
+            "device_resident_buffers": direct_supported,
             "direct_handoff": {
                 "requested": self.mode == "direct",
-                "supported": False,
-                "mechanism": None,
-                "diagnostic": "transfer_mode=direct is unsupported in Milestone 1",
+                "supported": direct_supported,
+                "mechanism": (
+                    "xrt_bo_export_import_hip_vmem_fd" if direct_supported else None
+                ),
+                "edges": [
+                    {
+                        "producer": event["producer"],
+                        "consumer": event["consumer"],
+                        "mechanism": event["mechanism"],
+                        "sync_events": event.get("sync_events", []),
+                        "numpy_host_materializations": int(
+                            event.get("numpy_host_materializations", 0)
+                        ),
+                    }
+                    for event in direct_events
+                ],
+                "diagnostic": (
+                    None
+                    if direct_supported
+                    else "No audited device-resident GPU/NPU handoff event was recorded"
+                ),
             },
             "by_edge": by_edge,
             "by_mode": by_mode,
         }
+
+    def require_direct_edge(self, producer: str, consumer: str, label: str) -> None:
+        if self.mode != "direct":
+            return
+        if {producer, consumer} != {"gpu", "npu"}:
+            raise DirectTransferUnsupported(
+                f"transfer_mode=direct only supports GPU/NPU interstage edges; "
+                f"{label} requested {producer}->{consumer}"
+            )
+
+    def record_direct_handoff(
+        self,
+        *,
+        producer: str,
+        consumer: str,
+        tensor: DeviceResidentTensor,
+        elapsed_us: float,
+        label: str,
+        mechanism: str,
+        sync_events: list[dict[str, Any]],
+        numpy_host_materializations: int,
+    ) -> None:
+        self._record_event(
+            {
+                "label": label,
+                "producer": producer,
+                "consumer": consumer,
+                "requested_mode": self.mode,
+                "actual_mode": "device_resident_direct_handoff",
+                "mechanism": mechanism,
+                "dtype": tensor.dtype,
+                "shape": [int(dim) for dim in tensor.shape],
+                "bytes": int(tensor.byte_size),
+                "copied": False,
+                "contiguous_before": True,
+                "elapsed_us": float(elapsed_us),
+                "device_resident": True,
+                "tensor": tensor.descriptor(),
+                "sync_events": sync_events,
+                "numpy_host_materializations": int(numpy_host_materializations),
+            }
+        )
 
     def transfer(
         self,
@@ -93,12 +202,6 @@ class LinearTransferManager:
         trace: TraceRecorder | None,
         label: str,
     ) -> np.ndarray:
-        if self.mode == "direct":
-            raise DirectTransferUnsupported(
-                "transfer_mode=direct is unsupported for llm_linear Milestone 1; "
-                "use transfer_mode=host until the DeviceResidentTensor bridge exists"
-            )
-
         actual = "same_backend_alias" if producer == consumer else "host_staged"
         bytes_moved = int(array.nbytes)
         copied = actual == "host_staged" or not array.flags.c_contiguous

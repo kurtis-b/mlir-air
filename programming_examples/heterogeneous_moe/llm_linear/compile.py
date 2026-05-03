@@ -60,3 +60,26 @@ def populate_artifacts(
                 ENTRYPOINTS[key],
             )
     return manifest
+
+
+def populate_direct_gpu_artifacts(
+    manifest: dict[str, Any],
+    *,
+    cfg: LinearKernelConfig | None = None,
+) -> dict[str, Any]:
+    cfg = cfg or kernel_config_from_manifest(manifest)
+    sources = write_default_air_sources(cfg, generated_air_source_root(manifest))
+    artifact_dir = artifact_root(manifest) / "gpu_direct"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    compiler_cfg = manifest["compiler"]
+    artifacts = manifest.setdefault("artifacts", {})
+    for key, source in sources.items():
+        artifact_entry = artifacts.setdefault(key, {})
+        artifact_entry["gpu_direct"] = compile_gpu(
+            source,
+            artifact_dir,
+            compiler_cfg["gpu_arch"],
+            ENTRYPOINTS[key],
+            host_staging=False,
+        )
+    return manifest

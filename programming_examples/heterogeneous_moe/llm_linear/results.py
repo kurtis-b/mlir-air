@@ -35,6 +35,11 @@ CSV_FIELDNAMES = [
     "transfer_bytes",
     "host_staged_count",
     "device_resident_buffers",
+    "direct_handoff_numpy_host_materializations",
+    "decode_weight_storage",
+    "decode_dequant_ms",
+    "decode_linear_ms",
+    "packed_weight_bytes_read",
 ]
 
 
@@ -273,8 +278,12 @@ def build_case_result(
             "device_resident_buffers": bool(
                 transfer_summary.get("device_resident_buffers")
             ),
-            "direct_handoff_supported": False,
-            "direct_handoff_claimed": False,
+            "direct_handoff_supported": bool(
+                transfer_summary.get("direct_handoff", {}).get("supported")
+            ),
+            "direct_handoff_claimed": bool(
+                transfer_summary.get("device_resident_buffers")
+            ),
         },
         "iterations": iterations,
         "warmup": timing["effective_warmup"],
@@ -303,6 +312,7 @@ def build_case_result(
         },
         "transfer_events": last_run["transfer_events"],
         "transfer_summary": transfer_summary,
+        "quantized_decode": last_run.get("quantized_decode", {"enabled": False}),
         "trace_summary": last_run["trace_summary"],
         "device_events": last_run["device_events"],
         "npu_development": last_run["npu_development"],
@@ -322,6 +332,9 @@ def build_case_result(
 def result_csv_row(result: dict[str, Any]) -> dict[str, Any]:
     metrics = result.get("stage_metrics", {}).get("output", {})
     transfer = result.get("transfer_summary", {})
+    quantized = result.get("quantized_decode", {})
+    quant_detail = quantized.get("detail") or {}
+    quant_metadata = quantized.get("metadata") or {}
     shape = result["shape"]
     return {
         "suite": result.get("suite"),
@@ -346,4 +359,13 @@ def result_csv_row(result: dict[str, Any]) -> dict[str, Any]:
         "transfer_bytes": transfer.get("total_bytes"),
         "host_staged_count": transfer.get("host_staged_count"),
         "device_resident_buffers": transfer.get("device_resident_buffers"),
+        "direct_handoff_numpy_host_materializations": transfer.get(
+            "direct_handoff_numpy_host_materializations"
+        ),
+        "decode_weight_storage": (
+            quant_metadata.get("quant_kind") if quantized.get("enabled") else "bf16"
+        ),
+        "decode_dequant_ms": quant_detail.get("dequant_ms"),
+        "decode_linear_ms": quant_detail.get("linear_ms"),
+        "packed_weight_bytes_read": quant_detail.get("packed_weight_bytes_read"),
     }
