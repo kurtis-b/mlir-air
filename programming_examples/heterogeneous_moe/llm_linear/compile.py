@@ -25,11 +25,15 @@ def resolve_air_sources(manifest: dict[str, Any], backend: str) -> dict[str, Pat
     if backend not in {"gpu", "npu"}:
         raise ValueError(f"Unsupported source backend: {backend}")
     cfg = kernel_config_from_manifest(manifest)
-    source_dir = generated_air_source_root(manifest)
+    source_dir = generated_air_source_root(manifest) / backend
     names = default_air_filenames(cfg)
     paths = {key: source_dir / name for key, name in names.items()}
     if not all(path.exists() for path in paths.values()):
-        write_default_air_sources(cfg, source_dir)
+        write_default_air_sources(
+            cfg,
+            source_dir,
+            align_output_dma=(backend in {"gpu", "npu"}),
+        )
     return paths
 
 
@@ -38,23 +42,42 @@ def populate_artifacts(
     backends: set[str],
     *,
     cfg: LinearKernelConfig | None = None,
+    stage_backends: dict[str, set[str]] | None = None,
 ) -> dict[str, Any]:
     cfg = cfg or kernel_config_from_manifest(manifest)
-    sources = write_default_air_sources(cfg, generated_air_source_root(manifest))
+    stage_backends = stage_backends or {
+        key: set(backends) for key in default_air_filenames(cfg)
+    }
+    source_root = generated_air_source_root(manifest)
+    gpu_sources = (
+        write_default_air_sources(
+            cfg,
+            source_root / "gpu",
+            align_output_dma=True,
+        )
+        if any("gpu" in needed for needed in stage_backends.values())
+        else {}
+    )
+    npu_sources = (
+        write_default_air_sources(cfg, source_root / "npu", align_output_dma=True)
+        if any("npu" in needed for needed in stage_backends.values())
+        else {}
+    )
     artifact_dir = artifact_root(manifest)
     artifact_dir.mkdir(parents=True, exist_ok=True)
     compiler_cfg = manifest["compiler"]
     artifacts = manifest.setdefault("artifacts", {})
 
-    for key, source in sources.items():
+    for key in default_air_filenames(cfg):
         artifact_entry = artifacts.setdefault(key, {})
-        if "npu" in backends:
+        needed = stage_backends.get(key, set())
+        if "npu" in needed:
             artifact_entry["npu"] = compile_npu(
-                source, artifact_dir / "npu", compiler_cfg["npu_device"]
+                npu_sources[key], artifact_dir / "npu", compiler_cfg["npu_device"]
             )
-        if "gpu" in backends:
+        if "gpu" in needed:
             artifact_entry["gpu"] = compile_gpu(
-                source,
+                gpu_sources[key],
                 artifact_dir / "gpu",
                 compiler_cfg["gpu_arch"],
                 ENTRYPOINTS[key],
@@ -68,7 +91,9 @@ def populate_direct_gpu_artifacts(
     cfg: LinearKernelConfig | None = None,
 ) -> dict[str, Any]:
     cfg = cfg or kernel_config_from_manifest(manifest)
-    sources = write_default_air_sources(cfg, generated_air_source_root(manifest))
+    sources = write_default_air_sources(
+        cfg, generated_air_source_root(manifest) / "gpu"
+    )
     artifact_dir = artifact_root(manifest) / "gpu_direct"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     compiler_cfg = manifest["compiler"]

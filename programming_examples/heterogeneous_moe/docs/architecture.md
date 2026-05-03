@@ -61,9 +61,20 @@ execution roadmap. It keeps the MoE harness archived as a reference and models:
 The direct mixed cases use `transfer_mode=direct` and the
 `DeviceResidentTensor` result contract. They must not claim success unless a
 native bridge records an audited GPU/NPU edge with zero NumPy host
-materializations. The checked-in bridge builds a C++ XRT/HIP path around
-XRT-owned BOs exported to HIP VMem mappings; if the platform probe cannot import
-those handles, direct cases fail before host fallback.
+materializations. Result summaries report the direct contract as
+`no_host_copies`, the selected mechanism, its direct class, the structured probe
+report, `zero_host_copy=true`, and `device_resident_buffers` as a capability
+flag rather than the definition of direct. The checked-in bridge builds a C++
+XRT/HIP path around HIP-owned VMem allocations exported as POSIX fds and
+imported into XRT as `xrt::bo` views; if the platform probe cannot validate an
+audited zero-host-copy path, direct cases fail before host fallback.
+
+Milestone 2 is accepted as of May 3, 2026 with:
+`source /opt/xilinx/xrt/setup.sh && ../../sandbox/bin/python run_llm_linear_milestone2.py`.
+The accepted output root is `llm_linear/artifacts/benchmarks/milestone2_e2e`.
+That hardware gate covers `medium_m8_k512_h512_n256` in both direct directions
+plus matching host-mixed baselines, not the broader `medium` ladder. Full
+CPU/GPU/NPU crossover and `llm_like` studies remain later work.
 
 Decode weights can be generated as packed `int4` or `uint4` storage for the
 CPU-safe fused-dequant GEMV path. Result JSON/CSV/report files separate decode

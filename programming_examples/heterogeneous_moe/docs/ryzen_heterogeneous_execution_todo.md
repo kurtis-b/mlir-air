@@ -107,7 +107,9 @@ Host-staged mixed execution is a baseline, not the finish line.
 
 ## Handoff Gap
 
-The direct handoff gap is the central blocker.
+Direct GPU/NPU handoff was the central Milestone 2 gap. It is now accepted for
+the LLM-linear hardware gate described below, while broader crossover and
+`llm_like` evidence remain future work.
 
 The current Python/XRT path is host-oriented. In `python/air/backend/xrt.py`,
 runtime invocation allocates `pyxrt` BOs, writes NumPy arrays, calls
@@ -124,11 +126,12 @@ The lower-level runtime has pieces that may be usable:
 - The GPU runtime under `runtime_lib/airgpu` already has HIP VMem
   POSIX-file-descriptor export/import machinery for GPU peer mappings.
 
-Those facts are opportunities, not proof that iGPU/NPU direct sharing already
-works. Milestone 2 must build and validate a C++/runtime bridge or equivalent
-device-resident tensor abstraction before any "efficient heterogeneous" claim.
+Those facts drove the accepted Milestone 2 bridge: HIP-owned VMem allocations
+are exported as POSIX fds and imported into XRT as BO views. That accepted gate
+proves the direct path for `medium_m8_k512_h512_n256`; it does not by itself
+settle the full shape ladder or final speedup question.
 
-That future abstraction must define:
+Any direct-handoff abstraction must define:
 
 - Ownership: which runtime owns the allocation and exported handle.
 - Lifetime: how long an imported handle remains valid and who closes it.
@@ -189,7 +192,9 @@ Hardware limitations not resolved in this milestone:
 - GPU and NPU compile/run paths are wired but were not executed in the CPU-safe
   verification above.
 - Mixed GPU/NPU cases remain NumPy host-staged.
-- Direct GPU/NPU device-resident handoff remains the Milestone 2 blocker.
+- Direct GPU/NPU device-resident handoff was deferred to Milestone 2. It is now
+  accepted for the `medium_m8_k512_h512_n256` hardware gate, not for the broad
+  crossover study.
 - The generated AIR kernels are explicit bring-up sources, not tuned LLM-scale
   tilings.
 
@@ -217,19 +222,44 @@ Acceptance:
 
 ### Milestone 2: Direct Bidirectional GPU/NPU Handoff
 
-Status as of May 3, 2026: implemented through the AIR generator, runtime, and
-native bridge boundary, and experimentally narrowed to a feasible low-level
-handoff direction. It is still not accepted as a working direct benchmark path
-because the checked-in native bridge owns handoff allocations from the XRT side,
-while the successful probe direction owns them from the HIP VMem side and
-imports them into XRT.
+Status as of May 3, 2026: accepted for the Milestone 2 hardware gate. The
+checked-in AIR generator, runtime, and native bridge pass tiny direct
+regressions, the `medium_m8_k512_h512_n256` direct acceptance workload in both
+directions, and matching medium host-staged baselines. The checked-in native
+bridge owns handoff allocations from the HIP VMem side and imports them into
+XRT. Low-level 1000-iteration visibility and vecadd stress probes pass, and the
+accepted LLM-linear result artifacts demonstrate both split directions with
+audited no-host-copy metadata.
+
+Accepted evidence, collected May 3, 2026:
+
+- Command, from `programming_examples/heterogeneous_moe` after XRT setup:
+  `source /opt/xilinx/xrt/setup.sh && ../../sandbox/bin/python run_llm_linear_milestone2.py`
+- Output root:
+  `llm_linear/artifacts/benchmarks/milestone2_e2e`
+- Acceptance entries passed: `tiny_g2n_direct`, `tiny_n2g_direct`,
+  `medium_g2n_direct`, `medium_n2g_direct`, and `medium_host_mixed`.
+- Direct JSONs report `direct_handoff.contract=no_host_copies`,
+  `direct_handoff.supported=true`, `direct_handoff.zero_host_copy=true`,
+  `direct_handoff.mechanism=hip_vmem_export_xrt_bo_import_fd`,
+  `direct_handoff.direct_class=device_resident_zero_host_copy`,
+  `numpy_host_materializations=0`, bidirectional visibility, and
+  NPU-kernel verification.
+- Acceptance logs under
+  `llm_linear/artifacts/benchmarks/milestone2_e2e/logs/` contain no
+  `Reverting to host copy of buffers` or `exec_buf: Operation not supported`
+  markers.
 
 Implemented scope:
 
 - `DeviceResidentTensor` records owner, backend, dtype, shape, stride, byte
-  size, exported handle metadata, synchronization state, and trace identity.
+  size, exported handle metadata, synchronization state, trace identity,
+  mechanism, direct class, zero-host-copy status, and whether the buffer is
+  device-resident.
 - `transfer_mode=direct` now means "prove a GPU/NPU direct edge or fail"; it no
-  longer silently falls back to host staging for direct mixed cases.
+  longer silently falls back to host staging for direct mixed cases. The direct
+  contract is `no_host_copies`: CPU orchestration and explicit sync are allowed,
+  but NumPy/CPU materialization across the GPU/NPU edge is not.
 - The benchmark matrix includes both direct split directions:
   `gpu_prefill_npu_decode_direct` and `npu_prefill_gpu_decode_direct`.
 - Result artifacts can report `device_resident_direct_handoff`,
@@ -240,14 +270,36 @@ Implemented scope:
 - LLM-linear AIR generation now stages L3 operands through DMA-visible L2/L1
   buffers before herd access, removing the `air-to-rocdl`/GPU outlining blocker
   caused by direct L3 `memref.load` operations inside herds.
-- `llm_linear/native/direct_bridge.cpp` provides a C ABI for XRT-owned BO
-  allocation/export, HIP VMem fd import, no-host-staging GPU shared-library
-  invocation, XRT kernel launch, synchronization reporting, and both
-  `gpu_prefill_npu_decode` and `npu_prefill_gpu_decode` directions.
+- NPU LLM-linear AIR sources are generated separately from GPU sources. NPU and
+  host-staged GPU sources can group adjacent bf16/f16 outputs so output DMAs are
+  at least 4-byte aligned and grouped reductions accumulate in f32 before
+  truncating back to the storage dtype. Direct GPU artifacts keep the
+  no-host-staging device ABI used by the native bridge.
+- `llm_linear/native/direct_bridge.cpp` provides a C ABI for HIP VMem
+  allocation/export, XRT BO fd import, no-host-staging GPU shared-library
+  invocation, XRT kernel launch, structured probe-reporting, synchronization
+  reporting, and both `gpu_prefill_npu_decode` and
+  `npu_prefill_gpu_decode` directions.
+- The G2N direct bridge avoids `xrt::bo::copy`. It writes the selected prefill
+  row into a row-sized HIP VMem BO with a HIP device-to-device row copy, imports
+  that BO into XRT, and passes the row BO to NPU decode. This keeps the parent
+  prefill allocation available for validation while removing the XRT host-copy
+  fallback warning path.
+- The native bridge keeps loaded GPU shared libraries alive for the process
+  lifetime to avoid ROCm code-object teardown races after no-host-staging GPU
+  decode calls.
+- The LLM-linear suite bootstraps the native bridge before heavier Python
+  imports on direct runs. This avoids ROCm/XRT initialization-order failures
+  seen when HIP is initialized after some Python stdlib modules.
 - `llm_linear/runtime.py` now calls the native bridge when
   `transfer_mode=direct` is requested and the bridge probe succeeds. It records
-  the direct edge with zero NumPy host materializations and keeps host-staged
-  mixed execution as the baseline.
+  the direct edge with zero NumPy host materializations, the mechanism matrix
+  from the native probe, NPU-kernel verification from the direct run, and keeps
+  host-staged mixed execution as the baseline.
+- When the native bridge is available, host-staged GPU baselines use an explicit
+  host-copy wrapper around no-host-staging GPU device artifacts. This keeps the
+  host baseline semantics while avoiding the medium decode corruption observed
+  in the generated ROCDL host-staging wrapper.
 
 Current transfer-method evidence:
 
@@ -258,30 +310,39 @@ Current transfer-method evidence:
 - HIP-owned VMem exported as a POSIX fd and imported with
   `xrt::bo(device, export_handle)` passed the import probe and isolated
   visibility checks. GPU writes were observed through the XRT BO, and XRT
-  writes were observed through the HIP virtual address, but repeated
-  process-level runs are not stable enough for benchmark acceptance.
+  writes were observed through the HIP virtual address, including serial
+  1000-iteration stress runs in both directions.
 - A prebuilt NPU vecadd xclbin consumed and produced HIP-owned imported XRT BOs
-  successfully in a fresh probe run, proving this is the best candidate for
-  direct GPU/NPU handoff.
-- Repeated NPU vecadd probe runs later showed signal/hang instability, so the
-  next bridge must use persistent HIP VMem allocations, persistent XRT context,
-  and disciplined object lifetime rather than per-method allocation teardown.
+  successfully for 1000 iterations. The stable path uses XRT's `kernel(...)`
+  invocation form and syncs imported BOs back from the XRT side after NPU use
+  before HIP reuses them.
+- The bridge keeps HIP VMem allocations and imported XRT BOs alive in a
+  process-lifetime pool rather than relying on per-call teardown.
 - `xrt::bo::flags::host_only` mapped and `hipHostRegister`-registered memory can
-  work as a shared host-memory path, but it is not the device-resident direct
-  handoff required for acceptance.
+  work as a shared host-memory path. It is tracked as
+  `shared_host_zero_copy`, not as the current `device_resident_zero_host_copy`
+  bridge required for Milestone 2 acceptance.
+- Shared DRAM is not enough to prove direct handoff. The drivers must expose
+  compatible export/import handles, program IOMMU/PASID mappings for both
+  devices, preserve allocation and fd lifetime across both runtime views, and
+  provide explicit synchronization semantics that prevent stale data.
+- Old Milestone 2 and debug result roots are generated artifacts. Prune or
+  archive them under
+  `llm_linear/artifacts/benchmarks/archive/milestone2_pre_e2e_<timestamp>/`
+  before collecting fresh end-to-end evidence.
 
 Detailed probe notes are in
 [`npu_gpu_transfer_methods.md`](npu_gpu_transfer_methods.md).
 
-Goal: make the mixed path device-resident. This milestone is required before the
-roadmap can be considered finished.
+Goal: make the mixed path device-resident. This milestone is now accepted for
+the medium LLM-linear handoff gate; broader crossover and `llm_like` studies
+remain later work.
 
 Checklist:
 
 - Keep the checked-in `DeviceResidentTensor` interface as the AIR runtime
   contract for direct mixed LLM-linear cases.
-- Pivot the checked-in C++ bridge from XRT-owned BO export to HIP-owned VMem fd
-  export plus XRT BO import.
+- Keep the checked-in C++ bridge on HIP-owned VMem fd export plus XRT BO import.
 - Keep both GPU-to-NPU and NPU-to-GPU directions wired through the bridge.
 - Preserve explicit synchronization reporting for each handoff.
 - Preserve trace and result fields that prove no NumPy host array is in the
@@ -290,13 +351,27 @@ Checklist:
 
 Acceptance:
 
-- A GPU-produced tensor can be consumed by an NPU kernel without materializing a
-  NumPy host array on the claimed edge.
-- An NPU-produced tensor can be consumed by a GPU kernel without materializing a
-  NumPy host array on the claimed edge.
-- Direct handoff and host-staged handoff both run the same correctness tests.
-- Result artifacts distinguish direct handoff from host staging in a way that
-  can be audited after the run.
+- Tiny direct runs are regression coverage for
+  `gpu_prefill_npu_decode_direct` and `npu_prefill_gpu_decode_direct`.
+- Medium direct acceptance requires both `gpu_prefill_npu_decode_direct` and
+  `npu_prefill_gpu_decode_direct` on the
+  `medium_m8_k512_h512_n256` acceptance workload, each in a fresh subprocess,
+  with correctness passing.
+- Medium host-mixed comparison requires `gpu_prefill_npu_decode_host` and
+  `npu_prefill_gpu_decode_host` on the `medium_m8_k512_h512_n256` acceptance
+  workload.
+- Direct result JSONs must report `device_resident_buffers=true`,
+  `direct_handoff.contract=no_host_copies`, `direct_handoff.supported=true`,
+  `direct_handoff.zero_host_copy=true`,
+  `direct_handoff.mechanism=hip_vmem_export_xrt_bo_import_fd`,
+  `direct_handoff.direct_class=device_resident_zero_host_copy`, a structured
+  `direct_handoff.probe_report` with bidirectional visibility and NPU-kernel
+  verification, `numpy_host_materializations=0`, tensor owner `hip_vmem`,
+  imported view `xrt_bo`, POSIX fd export, row-sized `direct_bytes`, and
+  `subview_offset_bytes=(M - 1) * H * 2`.
+- Acceptance logs must not contain `Reverting to host copy of buffers` or
+  `exec_buf: Operation not supported`.
+- Full CPU/GPU/NPU crossover and the `llm_like` ladder remain later milestones.
 
 ### Milestone 3: Fused int4 Weight Dequantization
 
@@ -338,7 +413,7 @@ Acceptance:
 ### Milestone 4: Final Crossover and Speedup Study
 
 Status as of May 3, 2026: report plumbing is implemented, but the final hardware
-study has not been run because Milestone 2 is not accepted.
+study has not been run after Milestone 2 acceptance.
 
 Implemented scope:
 
@@ -391,7 +466,8 @@ the LLM-linear benchmark. The MoE harness should remain a compact reference.
 For the current checked-in implementation:
 
 - The README link to this file must resolve.
-- This file must not claim that current direct GPU/NPU handoff is accepted.
+- This file must record the accepted Milestone 2 command, output root, and date
+  when the hardware acceptance wrapper passes.
 - Focused CPU-safe checks must pass:
   `../../sandbox/bin/python -m pytest tests/test_llm_linear_*`.
 - Full harness checks should pass when time allows:
@@ -403,8 +479,13 @@ For direct-handoff acceptance:
 
 - The native bridge must build:
   `llm_linear/native/build_direct_bridge.sh /tmp/libllm_linear_direct_bridge.so`.
-- `LLM_LINEAR_DIRECT_BRIDGE_SO=/tmp/libllm_linear_direct_bridge.so` must report a
-  successful `probe_direct_bridge()` on the target machine before direct cases
+- `../../sandbox/bin/python run_llm_linear_milestone2.py` is the preferred
+  acceptance wrapper. It builds the bridge, runs each direct acceptance command
+  in a fresh subprocess, captures logs under
+  `llm_linear/artifacts/benchmarks/milestone2_e2e/logs/`, rejects the known XRT
+  host-copy warning strings, and validates direct result JSON fields.
+- `LLM_LINEAR_DIRECT_BRIDGE_SO=/tmp/libllm_linear_direct_bridge.so` must report
+  a successful `probe_direct_bridge()` on the target machine before direct cases
   are run.
 - Correctness must pass against a CPU reference.
 - Host-staged and direct-handoff paths must be timed separately.

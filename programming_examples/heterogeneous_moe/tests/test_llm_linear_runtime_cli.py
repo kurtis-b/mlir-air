@@ -2,15 +2,27 @@
 
 from __future__ import annotations
 
+import copy
+import ctypes
 import json
 from pathlib import Path
 
 import pytest
+import numpy as np
 
 import compile_llm_linear
+import run_llm_linear_milestone2
 import run_llm_linear_suite
-from llm_linear.manifest import load_json
-from llm_linear.direct_bridge import DirectBridgeRunResult
+from llm_linear.manifest import load_json, resolve_package_path
+from llm_linear.direct_bridge import (
+    DIRECT_CLASS_DEVICE_RESIDENT,
+    DIRECT_CLASS_SHARED_HOST,
+    DIRECT_CONTRACT,
+    DirectBridgeMechanismReport,
+    DirectBridgeProbeReport,
+    DirectBridgeRunResult,
+)
+import llm_linear.direct_bridge as direct_bridge_module
 from numerics import decode_npu_array, encode_npu_array
 from llm_linear.reference import decode_gemv, prefill_gemm, random_inputs
 from llm_linear.results import (
@@ -20,12 +32,14 @@ from llm_linear.results import (
     result_csv_row,
     validate_runtime,
 )
-from llm_linear.runtime import LinearRuntime
+from llm_linear.runtime import LinearRuntime, NpuLinearExecutor
 from llm_linear.transfer import (
     DeviceResidentTensor,
     DirectTransferUnsupported,
     LinearTransferManager,
 )
+
+DIRECT_MECHANISM = "hip_vmem_export_xrt_bo_import_fd"
 
 
 def _tiny_cpu_manifest(moe_dir: Path, tmp_path: Path) -> dict:
@@ -36,6 +50,38 @@ def _tiny_cpu_manifest(moe_dir: Path, tmp_path: Path) -> dict:
     manifest["runtime"]["stage_backends"] = {"prefill": "cpu", "decode": "cpu"}
     manifest["runtime"]["transfer_mode"] = "host"
     return manifest
+
+
+def _direct_probe_report(*, npu_verified: bool = False) -> DirectBridgeProbeReport:
+    sync_events = [
+        {"event": "hipDeviceSynchronize"},
+        {"event": "xrtBoSyncToDevice"},
+        {"event": "xrtRunWait"},
+    ]
+    mechanism = DirectBridgeMechanismReport(
+        mechanism=DIRECT_MECHANISM,
+        supported=True,
+        direct_eligible=True,
+        direct_class=DIRECT_CLASS_DEVICE_RESIDENT,
+        ownership="hip_vmem",
+        handle_type="posix_fd",
+        import_view="xrt_bo",
+        bidirectional_visibility=True,
+        npu_kernel_verification=npu_verified,
+        sync_events=sync_events if npu_verified else [],
+        host_materialization_count=0,
+        zero_host_copy=True,
+        device_resident_buffers=True,
+        diagnostic="ok",
+    )
+    return DirectBridgeProbeReport(
+        contract=DIRECT_CONTRACT,
+        direct_supported=True,
+        selected_mechanism=DIRECT_MECHANISM,
+        mechanisms=[mechanism],
+        diagnostic="ok",
+        library_path="fake_bridge.so",
+    )
 
 
 def test_linear_runtime_result_schema(moe_dir: Path, tmp_path: Path) -> None:
@@ -71,6 +117,15 @@ def test_linear_runtime_result_schema(moe_dir: Path, tmp_path: Path) -> None:
     assert row["validation_status"] == "pass"
 
 
+def test_linear_prefixed_output_paths_resolve_to_llm_linear_package(
+    moe_dir: Path,
+) -> None:
+    assert (
+        resolve_package_path("llm_linear/artifacts/benchmarks/example")
+        == moe_dir / "llm_linear" / "artifacts" / "benchmarks" / "example"
+    )
+
+
 def test_linear_runtime_quantized_decode_schema(moe_dir: Path, tmp_path: Path) -> None:
     manifest = _tiny_cpu_manifest(moe_dir, tmp_path)
     manifest["weights"]["decode"] = {
@@ -86,6 +141,51 @@ def test_linear_runtime_quantized_decode_schema(moe_dir: Path, tmp_path: Path) -
     assert last_run["quantized_decode"]["detail"]["dequant_ms"] >= 0.0
 
 
+def test_npu_prefill_executor_stages_multirow_inputs(tmp_path: Path) -> None:
+    dtype = "bf16"
+    inputs = np.asarray(
+        [
+            [1.0, 2.0, 3.0, 4.0],
+            [5.0, 6.0, 7.0, 8.0],
+            [9.0, 10.0, 11.0, 12.0],
+        ],
+        dtype=np.float32,
+    )
+    weights = np.ones((4, 2), dtype=np.float32)
+    staged_rows: list[np.ndarray] = []
+
+    def fake_invoker(encoded_input, encoded_weights, output):
+        decoded_input = decode_npu_array(np.asarray(encoded_input), dtype)
+        staged_rows.append(decoded_input)
+        row_sum = float(np.sum(decoded_input[0, :]))
+        output_view = np.asarray(output).reshape((3, 2))
+        output_view[...] = 0
+        output_view[0, :] = encode_npu_array(
+            np.asarray([[row_sum, row_sum + 1.0]], dtype=np.float32),
+            dtype,
+        )[0, :]
+        return (encoded_input, encoded_weights, output)
+
+    executor = NpuLinearExecutor(
+        "prefill",
+        Path("unused.mlir"),
+        {},
+        tmp_path,
+        "npu2",
+        dtype,
+    )
+    executor._invoker = fake_invoker
+
+    output = executor.run(inputs, weights)
+
+    expected = np.asarray([[10.0, 11.0], [26.0, 27.0], [42.0, 43.0]], dtype=np.float32)
+    np.testing.assert_allclose(output, expected)
+    assert len(staged_rows) == inputs.shape[0]
+    for row, staged in enumerate(staged_rows):
+        np.testing.assert_allclose(staged[0, :], inputs[row, :])
+        np.testing.assert_allclose(staged[1:, :], 0.0)
+
+
 def test_linear_direct_transfer_fails_closed(moe_dir: Path, tmp_path: Path) -> None:
     manifest = _tiny_cpu_manifest(moe_dir, tmp_path)
     manifest["runtime"]["transfer_mode"] = "direct"
@@ -93,6 +193,85 @@ def test_linear_direct_transfer_fails_closed(moe_dir: Path, tmp_path: Path) -> N
         inputs = random_inputs(runtime.cfg, seed=manifest["inputs"]["seed"])
         with pytest.raises(DirectTransferUnsupported, match="GPU/NPU"):
             runtime.run(inputs)
+
+
+def test_direct_bridge_probe_report_supported(monkeypatch) -> None:
+    payload = _direct_probe_report().to_dict()
+
+    class FakeProbe:
+        def __call__(self, buffer, capacity):
+            encoded = json.dumps(payload).encode("utf-8")
+            assert len(encoded) + 1 <= int(capacity)
+            ctypes.memmove(buffer, encoded, len(encoded) + 1)
+            return 0
+
+    class FakeLibrary:
+        llm_linear_direct_bridge_probe_report = FakeProbe()
+
+    monkeypatch.setattr(
+        direct_bridge_module,
+        "_load_library",
+        lambda path=None: (Path("fake_bridge.so"), FakeLibrary(), None),
+    )
+
+    status = direct_bridge_module.probe_direct_bridge()
+    assert status.available is True
+    assert status.probe_report is not None
+    assert status.probe_report.contract == DIRECT_CONTRACT
+    assert status.probe_report.selected_mechanism == DIRECT_MECHANISM
+    selected = status.probe_report.selected_report()
+    assert selected is not None
+    assert selected.zero_host_copy is True
+    assert selected.host_materialization_count == 0
+
+
+def test_direct_bridge_probe_report_failed(monkeypatch) -> None:
+    payload = {
+        "schema_version": 1,
+        "contract": DIRECT_CONTRACT,
+        "direct_supported": False,
+        "selected_mechanism": None,
+        "diagnostic": "no audited path",
+        "mechanisms": [
+            {
+                "mechanism": "numpy_host_staged_baseline",
+                "supported": True,
+                "direct_eligible": False,
+                "direct_class": "host_staged_copy",
+                "ownership": "host_numpy",
+                "handle_type": "host_pointer",
+                "import_view": "host_array",
+                "bidirectional_visibility": True,
+                "npu_kernel_verification": False,
+                "sync_events": [],
+                "host_materialization_count": 1,
+                "zero_host_copy": False,
+                "device_resident_buffers": False,
+                "diagnostic": "baseline only",
+            }
+        ],
+    }
+
+    class FakeProbe:
+        def __call__(self, buffer, capacity):
+            encoded = json.dumps(payload).encode("utf-8")
+            ctypes.memmove(buffer, encoded, len(encoded) + 1)
+            return 1
+
+    class FakeLibrary:
+        llm_linear_direct_bridge_probe_report = FakeProbe()
+
+    monkeypatch.setattr(
+        direct_bridge_module,
+        "_load_library",
+        lambda path=None: (Path("fake_bridge.so"), FakeLibrary(), None),
+    )
+
+    status = direct_bridge_module.probe_direct_bridge()
+    assert status.available is False
+    assert status.probe_report is not None
+    assert status.probe_report.direct_supported is False
+    assert "no audited path" in status.diagnostic
 
 
 def test_linear_direct_runtime_records_native_handoff(
@@ -110,6 +289,7 @@ def test_linear_direct_runtime_records_native_handoff(
         available = True
         library_path = "fake_bridge.so"
         diagnostic = "ok"
+        probe_report = _direct_probe_report()
 
     class FakeBridge:
         library_path = Path("fake_bridge.so")
@@ -141,17 +321,21 @@ def test_linear_direct_runtime_records_native_handoff(
             prefill_output_buffer[...] = encode_npu_array(prefill, dtype)
             decode_input_buffer[...] = encode_npu_array(decode_input, dtype)
             output_buffer[...] = encode_npu_array(output, dtype)
+            row_bytes = int(shape[2] * 2)
+            row_offset = int((shape[0] - 1) * shape[2] * 2)
             return DirectBridgeRunResult(
                 prefill_ms=1.0,
                 decode_ms=2.0,
                 handoff_us=0.0,
-                direct_bytes=int(prefill_output_buffer.nbytes),
-                subview_offset_bytes=int((shape[0] - 1) * shape[2] * 2),
-                mechanism="xrt_bo_export_import_hip_vmem_fd:test",
+                direct_bytes=row_bytes,
+                subview_offset_bytes=row_offset,
+                mechanism="hip_vmem_export_xrt_bo_import_fd",
                 bo_flag=0,
-                import_method=2,
+                import_method=3,
                 sync_events=[
                     {"event": "hipDeviceSynchronize"},
+                    {"event": "xrtBoSyncToDevice"},
+                    {"event": "xrtBoSubview"},
                     {"event": "xrtRunWait"},
                 ],
                 diagnostic="ok",
@@ -167,7 +351,34 @@ def test_linear_direct_runtime_records_native_handoff(
     assert result["numpy_validation"]["status"] == "pass"
     assert result["transfer_summary"]["device_resident_buffers"] is True
     assert result["transfer_summary"]["direct_handoff"]["supported"] is True
+    assert result["transfer_summary"]["direct_handoff"]["contract"] == DIRECT_CONTRACT
+    assert result["transfer_summary"]["direct_handoff"]["mechanism"] == DIRECT_MECHANISM
+    assert (
+        result["transfer_summary"]["direct_handoff"]["direct_class"]
+        == DIRECT_CLASS_DEVICE_RESIDENT
+    )
+    assert result["transfer_summary"]["direct_handoff"]["zero_host_copy"] is True
+    probe_report = result["transfer_summary"]["direct_handoff"]["probe_report"]
+    assert probe_report["selected_mechanism"] == DIRECT_MECHANISM
+    selected = probe_report["mechanisms"][0]
+    assert selected["bidirectional_visibility"] is True
+    assert selected["npu_kernel_verification"] is True
     assert result["transfer_events"][0]["numpy_host_materializations"] == 0
+    event = result["transfer_events"][0]
+    assert event["bytes"] == manifest["model"]["H"] * 2
+    assert event["direct_class"] == DIRECT_CLASS_DEVICE_RESIDENT
+    assert event["zero_host_copy"] is True
+    assert event["tensor"]["owner"] == "hip_vmem"
+    assert event["tensor"]["imported_view"] == "xrt_bo"
+    assert event["tensor"]["mechanism"] == DIRECT_MECHANISM
+    assert event["tensor"]["direct_class"] == DIRECT_CLASS_DEVICE_RESIDENT
+    assert (
+        event["tensor"]["offset"]
+        == (manifest["model"]["M"] - 1) * manifest["model"]["H"] * 2
+    )
+    sync_names = [item["event"] for item in event["sync_events"]]
+    assert "xrtBoSubview" in sync_names
+    assert "xrtBoCopy" not in sync_names
 
 
 def test_linear_direct_handoff_summary_schema() -> None:
@@ -179,9 +390,12 @@ def test_linear_direct_handoff_summary_schema() -> None:
         shape=(4, 8),
         strides=(8, 1),
         byte_size=64,
-        exported_handle_type="dma_buf_fd",
+        imported_view="xrt_bo",
+        exported_handle_type="posix_fd",
         sync_state="gpu_event_recorded",
         trace_id="edge0",
+        mechanism=DIRECT_MECHANISM,
+        direct_class=DIRECT_CLASS_DEVICE_RESIDENT,
     )
     transfer.record_direct_handoff(
         producer="gpu",
@@ -189,15 +403,156 @@ def test_linear_direct_handoff_summary_schema() -> None:
         tensor=tensor,
         elapsed_us=12.5,
         label="prefill_to_decode",
-        mechanism="xrt_bo_export_import_hip_vmem_fd",
+        mechanism=DIRECT_MECHANISM,
         sync_events=[{"producer": "gpu", "consumer": "npu"}],
         numpy_host_materializations=0,
+        direct_class=DIRECT_CLASS_DEVICE_RESIDENT,
+        probe_report=_direct_probe_report(npu_verified=True).to_dict(),
     )
     summary = transfer.summary()
     assert summary["model"] == "device_resident_direct_handoff"
     assert summary["device_resident_buffers"] is True
     assert summary["numpy_host_materializations"] == 0
+    assert summary["direct_handoff"]["contract"] == DIRECT_CONTRACT
+    assert summary["direct_handoff"]["mechanism"] == DIRECT_MECHANISM
+    assert summary["direct_handoff"]["direct_class"] == DIRECT_CLASS_DEVICE_RESIDENT
+    assert summary["direct_handoff"]["zero_host_copy"] is True
     assert summary["direct_handoff"]["edges"][0]["numpy_host_materializations"] == 0
+
+
+def test_linear_direct_handoff_shared_host_zero_copy_summary() -> None:
+    transfer = LinearTransferManager("direct")
+    tensor = DeviceResidentTensor(
+        owner="xrt_host_userptr",
+        backend="gpu",
+        dtype="uint16",
+        shape=(8,),
+        strides=(1,),
+        byte_size=16,
+        imported_view="hip_registered_host_pointer",
+        exported_handle_type="host_pointer",
+        mechanism="xrt_host_userptr_hip_registered_shared_host",
+        direct_class=DIRECT_CLASS_SHARED_HOST,
+        device_resident_buffers=False,
+    )
+    transfer.record_direct_handoff(
+        producer="gpu",
+        consumer="npu",
+        tensor=tensor,
+        elapsed_us=3.0,
+        label="shared_host_probe",
+        mechanism="xrt_host_userptr_hip_registered_shared_host",
+        sync_events=[],
+        numpy_host_materializations=0,
+        direct_class=DIRECT_CLASS_SHARED_HOST,
+        zero_host_copy=True,
+        device_resident_buffers=False,
+    )
+    summary = transfer.summary()
+    assert summary["direct_handoff"]["supported"] is True
+    assert summary["direct_handoff"]["zero_host_copy"] is True
+    assert summary["direct_handoff"]["direct_class"] == DIRECT_CLASS_SHARED_HOST
+    assert summary["device_resident_buffers"] is False
+    assert summary["model"] == "zero_host_copy_direct_handoff"
+
+
+def test_linear_direct_transfer_rejects_host_staged_fallback() -> None:
+    transfer = LinearTransferManager("direct")
+    with pytest.raises(DirectTransferUnsupported, match="refuses host-staged"):
+        transfer.transfer(
+            "gpu",
+            "npu",
+            np.zeros((2,), dtype=np.float32),
+            trace=None,
+            label="gpu_to_npu",
+        )
+
+
+def test_milestone2_verifier_direct_contract(tmp_path: Path) -> None:
+    probe_report = _direct_probe_report(npu_verified=True).to_dict()
+    result = {
+        "case_name": "gpu_prefill_npu_decode_direct",
+        "dtype": "bf16",
+        "shape": {"M": 4, "K": 128, "H": 128, "N": 64},
+        "stage_backends": {"prefill": "gpu", "decode": "npu"},
+        "correctness": {
+            "validation_status": "pass",
+            "prefill_allclose": True,
+            "output_allclose": True,
+        },
+        "transfer_summary": {
+            "numpy_host_materializations": 0,
+            "direct_handoff_numpy_host_materializations": 0,
+            "direct_handoff": {
+                "supported": True,
+                "contract": DIRECT_CONTRACT,
+                "mechanism": DIRECT_MECHANISM,
+                "direct_class": DIRECT_CLASS_DEVICE_RESIDENT,
+                "zero_host_copy": True,
+                "device_resident_buffers": True,
+                "probe_report": probe_report,
+            },
+        },
+        "execution_truth": {"numpy_host_materializations": 0},
+        "direct_bridge": {
+            "mechanism": DIRECT_MECHANISM,
+            "direct_class": DIRECT_CLASS_DEVICE_RESIDENT,
+            "zero_host_copy": True,
+            "device_resident_buffers": True,
+            "import_method": 3,
+            "subview_offset_bytes": 768,
+            "probe_report": probe_report,
+        },
+        "transfer_events": [
+            {
+                "actual_mode": "device_resident_direct_handoff",
+                "mechanism": DIRECT_MECHANISM,
+                "direct_class": DIRECT_CLASS_DEVICE_RESIDENT,
+                "zero_host_copy": True,
+                "device_resident_buffers": True,
+                "bytes": 256,
+                "numpy_host_materializations": 0,
+                "tensor": {
+                    "owner": "hip_vmem",
+                    "imported_view": "xrt_bo",
+                    "mechanism": DIRECT_MECHANISM,
+                    "direct_class": DIRECT_CLASS_DEVICE_RESIDENT,
+                    "zero_host_copy": True,
+                    "byte_size": 256,
+                    "offset": 768,
+                },
+                "sync_events": [
+                    {"event": "hipDeviceSynchronize"},
+                    {"event": "xrtBoSyncToDevice"},
+                    {"event": "xrtBoSubview"},
+                    {"event": "xrtRunWait"},
+                ],
+            }
+        ],
+    }
+    assert (
+        run_llm_linear_milestone2.validate_result_payload(result, require_direct=True)
+        == []
+    )
+
+    stale = copy.deepcopy(result)
+    stale["transfer_events"][0]["sync_events"][2] = {"event": "xrtBoCopy"}
+    assert any(
+        "xrtBoCopy" in message
+        for message in run_llm_linear_milestone2.validate_result_payload(
+            stale, require_direct=True
+        )
+    )
+
+    log_path = tmp_path / "acceptance.log"
+    log_path.write_text(
+        "warning: Reverting to host copy of buffers (exec_buf: Operation not supported)\n",
+        encoding="utf-8",
+    )
+    assert set(run_llm_linear_milestone2.scan_log_for_blockers(log_path)) == {
+        "Reverting to host copy of buffers",
+        "exec_buf: Operation not supported",
+    }
 
 
 def test_compile_llm_linear_cli(monkeypatch, tmp_path: Path) -> None:

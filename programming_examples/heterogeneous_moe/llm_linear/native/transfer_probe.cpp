@@ -68,6 +68,10 @@ void verify_bytes(const void *ptr, uint8_t value, size_t count) {
   }
 }
 
+uint8_t iteration_pattern(size_t iteration, uint8_t base) {
+  return static_cast<uint8_t>(base + (iteration % 97));
+}
+
 void gpu_fill(void *device_ptr, uint8_t value) {
   check_hip(hipMemset(device_ptr, value, kBytes), "hipMemset");
   check_hip(hipDeviceSynchronize(), "hipDeviceSynchronize");
@@ -252,31 +256,47 @@ HipExportedAllocation make_exported_hip_vmem() {
   return allocation;
 }
 
-void hip_vmem_gpu_write_xrt_read() {
+void hip_vmem_gpu_write_xrt_read_iterations(size_t iterations) {
   auto allocation = make_exported_hip_vmem();
   auto *device = new xrt::device(0);
   auto *bo =
       new xrt::bo(*device, static_cast<xrt::bo::export_handle>(allocation.fd));
-  gpu_fill(reinterpret_cast<void *>(allocation.va), 0x77);
   std::vector<uint8_t> host(kBytes, 0);
-  bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE, kBytes, 0);
-  bo->read(host.data(), kBytes, 0);
-  verify_bytes(host.data(), 0x77, kBytes);
+  for (size_t i = 0; i < iterations; ++i) {
+    uint8_t value = iteration_pattern(i, 0x30);
+    gpu_fill(reinterpret_cast<void *>(allocation.va), value);
+    bo->sync(XCL_BO_SYNC_BO_TO_DEVICE, kBytes, 0);
+    bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE, kBytes, 0);
+    bo->read(host.data(), kBytes, 0);
+    verify_bytes(host.data(), value, kBytes);
+  }
+}
+
+void hip_vmem_gpu_write_xrt_read() {
+  hip_vmem_gpu_write_xrt_read_iterations(1);
+}
+
+void hip_vmem_xrt_write_gpu_read_iterations(size_t iterations) {
+  auto allocation = make_exported_hip_vmem();
+  auto *device = new xrt::device(0);
+  auto *bo =
+      new xrt::bo(*device, static_cast<xrt::bo::export_handle>(allocation.fd));
+  std::vector<uint8_t> host(kBytes, 0);
+  for (size_t i = 0; i < iterations; ++i) {
+    uint8_t value = iteration_pattern(i, 0x60);
+    std::fill(host.begin(), host.end(), value);
+    bo->write(host.data(), kBytes, 0);
+    bo->sync(XCL_BO_SYNC_BO_TO_DEVICE, kBytes, 0);
+    std::fill(host.begin(), host.end(), 0);
+    check_hip(hipMemcpy(host.data(), reinterpret_cast<void *>(allocation.va),
+                        kBytes, hipMemcpyDeviceToHost),
+              "hipMemcpy imported HIP VMem to host");
+    verify_bytes(host.data(), value, kBytes);
+  }
 }
 
 void hip_vmem_xrt_write_gpu_read() {
-  auto allocation = make_exported_hip_vmem();
-  auto *device = new xrt::device(0);
-  auto *bo =
-      new xrt::bo(*device, static_cast<xrt::bo::export_handle>(allocation.fd));
-  std::vector<uint8_t> host(kBytes, 0x88);
-  bo->write(host.data(), kBytes, 0);
-  bo->sync(XCL_BO_SYNC_BO_TO_DEVICE, kBytes, 0);
-  std::fill(host.begin(), host.end(), 0);
-  check_hip(hipMemcpy(host.data(), reinterpret_cast<void *>(allocation.va),
-                      kBytes, hipMemcpyDeviceToHost),
-            "hipMemcpy imported HIP VMem to host");
-  verify_bytes(host.data(), 0x88, kBytes);
+  hip_vmem_xrt_write_gpu_read_iterations(1);
 }
 
 std::vector<uint32_t> read_instructions(const char *path) {
@@ -292,7 +312,7 @@ std::vector<uint32_t> read_instructions(const char *path) {
   return words;
 }
 
-void hip_vmem_imported_xrt_npu_vecadd() {
+void hip_vmem_imported_xrt_npu_vecadd_iterations(size_t iterations) {
   const char *xclbin_path = std::getenv("TRANSFER_PROBE_VECADD_XCLBIN");
   const char *insts_path = std::getenv("TRANSFER_PROBE_VECADD_INSTS");
   if (!xclbin_path || !insts_path)
@@ -308,16 +328,6 @@ void hip_vmem_imported_xrt_npu_vecadd() {
   std::vector<uint16_t> in0(elements, 0x3f80); // bf16 1.0
   std::vector<uint16_t> in1(elements, 0x4000); // bf16 2.0
   std::vector<uint16_t> out(elements, 0);
-  check_hip(hipMemcpy(reinterpret_cast<void *>(in0_alloc.va), in0.data(), bytes,
-                      hipMemcpyHostToDevice),
-            "hipMemcpy input0 H2D");
-  check_hip(hipMemcpy(reinterpret_cast<void *>(in1_alloc.va), in1.data(), bytes,
-                      hipMemcpyHostToDevice),
-            "hipMemcpy input1 H2D");
-  check_hip(hipMemcpy(reinterpret_cast<void *>(out_alloc.va), out.data(), bytes,
-                      hipMemcpyHostToDevice),
-            "hipMemcpy output H2D");
-
   xrt::device device(0);
   xrt::xclbin xclbin{std::string(xclbin_path)};
   auto uuid = device.register_xclbin(xclbin);
@@ -346,31 +356,135 @@ void hip_vmem_imported_xrt_npu_vecadd() {
   auto *out_bo =
       new xrt::bo(device, static_cast<xrt::bo::export_handle>(out_alloc.fd));
 
-  xrt::run run(kernel);
-  int opcode = 3;
-  uint32_t inst_count = static_cast<uint32_t>(insts.size());
-  run.set_arg(0, opcode);
-  run.set_arg(1, bo_instr);
-  run.set_arg(2, inst_count);
-  run.set_arg(3, *in0_bo);
-  run.set_arg(4, *in1_bo);
-  run.set_arg(5, *out_bo);
-  run.start();
-  auto state = run.wait();
-  if (state != ERT_CMD_STATE_COMPLETED)
-    throw std::runtime_error("NPU vecadd did not complete");
+  unsigned int opcode = 3;
+  unsigned int inst_count = static_cast<unsigned int>(insts.size());
 
-  out_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE, bytes, 0);
-  check_hip(hipMemcpy(out.data(), reinterpret_cast<void *>(out_alloc.va), bytes,
-                      hipMemcpyDeviceToHost),
-            "hipMemcpy output D2H");
-  for (size_t i = 0; i < elements; ++i) {
-    if (out[i] != 0x4040) {
-      std::ostringstream os;
-      os << "vecadd output mismatch at " << i << ": got 0x" << std::hex
-         << out[i] << ", expected 0x4040";
-      throw std::runtime_error(os.str());
+  for (size_t iter = 0; iter < iterations; ++iter) {
+    std::fill(out.begin(), out.end(), 0);
+    check_hip(hipMemcpy(reinterpret_cast<void *>(in0_alloc.va), in0.data(),
+                        bytes, hipMemcpyHostToDevice),
+              "hipMemcpy input0 H2D");
+    check_hip(hipMemcpy(reinterpret_cast<void *>(in1_alloc.va), in1.data(),
+                        bytes, hipMemcpyHostToDevice),
+              "hipMemcpy input1 H2D");
+    check_hip(hipMemcpy(reinterpret_cast<void *>(out_alloc.va), out.data(),
+                        bytes, hipMemcpyHostToDevice),
+              "hipMemcpy output H2D");
+    check_hip(hipDeviceSynchronize(), "hipDeviceSynchronize(vecadd inputs)");
+    bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    in0_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE, bytes, 0);
+    in1_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE, bytes, 0);
+    out_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE, bytes, 0);
+
+    auto run = kernel(opcode, bo_instr, inst_count, *in0_bo, *in1_bo, *out_bo);
+    run.wait();
+
+    in0_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE, bytes, 0);
+    in1_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE, bytes, 0);
+    out_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE, bytes, 0);
+    check_hip(hipMemcpy(out.data(), reinterpret_cast<void *>(out_alloc.va),
+                        bytes, hipMemcpyDeviceToHost),
+              "hipMemcpy output D2H");
+    for (size_t i = 0; i < elements; ++i) {
+      if (out[i] != 0x4040) {
+        std::ostringstream os;
+        os << "vecadd output mismatch at iteration " << iter << ", element "
+           << i << ": got 0x" << std::hex << out[i] << ", expected 0x4040";
+        throw std::runtime_error(os.str());
+      }
     }
+  }
+}
+
+void hip_vmem_imported_xrt_npu_vecadd() {
+  hip_vmem_imported_xrt_npu_vecadd_iterations(1);
+}
+
+void xrt_host_bo_npu_vecadd_iterations(size_t iterations) {
+  const char *xclbin_path = std::getenv("TRANSFER_PROBE_VECADD_XCLBIN");
+  const char *insts_path = std::getenv("TRANSFER_PROBE_VECADD_INSTS");
+  if (!xclbin_path || !insts_path)
+    throw std::runtime_error(
+        "set TRANSFER_PROBE_VECADD_XCLBIN and TRANSFER_PROBE_VECADD_INSTS");
+
+  constexpr size_t elements = 1024;
+  constexpr size_t bytes = elements * sizeof(uint16_t);
+  std::vector<uint16_t> in0(elements, 0x3f80); // bf16 1.0
+  std::vector<uint16_t> in1(elements, 0x4000); // bf16 2.0
+  std::vector<uint16_t> out(elements, 0);
+
+  xrt::device device(0);
+  xrt::xclbin xclbin{std::string(xclbin_path)};
+  auto uuid = device.register_xclbin(xclbin);
+  xrt::hw_context context(device, uuid);
+  std::string kernel_name;
+  for (const auto &candidate : xclbin.get_kernels()) {
+    std::string name = candidate.get_name();
+    if (name.find("MLIR_AIE") != std::string::npos) {
+      kernel_name = name;
+      break;
+    }
+  }
+  if (kernel_name.empty())
+    throw std::runtime_error("MLIR_AIE kernel not found in vecadd xclbin");
+  xrt::kernel kernel(context, kernel_name);
+  std::vector<uint32_t> insts = read_instructions(insts_path);
+  xrt::bo bo_instr(device, insts.size() * sizeof(uint32_t),
+                   xrt::bo::flags::cacheable, kernel.group_id(1));
+  bo_instr.write(insts.data(), insts.size() * sizeof(uint32_t), 0);
+
+  xrt::bo in0_bo(device, bytes, xrt::bo::flags::host_only, kernel.group_id(3));
+  xrt::bo in1_bo(device, bytes, xrt::bo::flags::host_only, kernel.group_id(4));
+  xrt::bo out_bo(device, bytes, xrt::bo::flags::host_only, kernel.group_id(5));
+
+  unsigned int opcode = 3;
+  unsigned int inst_count = static_cast<unsigned int>(insts.size());
+  for (size_t iter = 0; iter < iterations; ++iter) {
+    std::fill(out.begin(), out.end(), 0);
+    bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    in0_bo.write(in0.data(), bytes, 0);
+    in1_bo.write(in1.data(), bytes, 0);
+    out_bo.write(out.data(), bytes, 0);
+    in0_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE, bytes, 0);
+    in1_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE, bytes, 0);
+    out_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE, bytes, 0);
+
+    auto run = kernel(opcode, bo_instr, inst_count, in0_bo, in1_bo, out_bo);
+    run.wait();
+
+    out_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE, bytes, 0);
+    out_bo.read(out.data(), bytes, 0);
+    for (size_t i = 0; i < elements; ++i) {
+      if (out[i] != 0x4040) {
+        std::ostringstream os;
+        os << "host BO vecadd output mismatch at iteration " << iter
+           << ", element " << i << ": got 0x" << std::hex << out[i]
+           << ", expected 0x4040";
+        throw std::runtime_error(os.str());
+      }
+    }
+  }
+}
+
+void add_stress_methods(
+    std::vector<std::pair<std::string, std::function<void()>>> &methods) {
+  constexpr size_t kIterations[] = {1, 10, 100, 1000};
+  for (size_t iterations : kIterations) {
+    methods.push_back(
+        {"xrt_host_bo_npu_vecadd_stress_" + std::to_string(iterations),
+         [iterations] { xrt_host_bo_npu_vecadd_iterations(iterations); }});
+    methods.push_back(
+        {"hip_vmem_gpu_write_xrt_read_stress_" + std::to_string(iterations),
+         [iterations] { hip_vmem_gpu_write_xrt_read_iterations(iterations); }});
+    methods.push_back(
+        {"hip_vmem_xrt_write_gpu_read_stress_" + std::to_string(iterations),
+         [iterations] { hip_vmem_xrt_write_gpu_read_iterations(iterations); }});
+    methods.push_back({"hip_vmem_imported_xrt_npu_vecadd_stress_" +
+                           std::to_string(iterations),
+                       [iterations] {
+                         hip_vmem_imported_xrt_npu_vecadd_iterations(
+                             iterations);
+                       }});
   }
 }
 
@@ -393,6 +507,7 @@ int main(int argc, char **argv) {
       {"hip_vmem_xrt_write_gpu_read", hip_vmem_xrt_write_gpu_read},
       {"hip_vmem_imported_xrt_npu_vecadd", hip_vmem_imported_xrt_npu_vecadd},
   };
+  add_stress_methods(methods);
   for (const BoMode &mode : kBoModes) {
     methods.push_back({std::string("xrt_export_to_hip_vmem_") + mode.name,
                        [mode] { xrt_export_to_hip_vmem(mode.flag); }});

@@ -27,6 +27,17 @@ def kernel_config_from_manifest(manifest: dict[str, Any]) -> LinearKernelConfig:
     )
 
 
+def _aligned_output_group(length: int) -> int:
+    for group in (16, 8, 4, 2):
+        if length % group == 0:
+            return group
+    return 1
+
+
+def _aligned_decode_output_group(length: int) -> int:
+    return 2 if length % 2 == 0 else 1
+
+
 def _header(title: str) -> str:
     return f"""//===- {title} ---------------------------------*- MLIR -*-===//
 //
@@ -42,7 +53,330 @@ def _header(title: str) -> str:
 """
 
 
-def prefill_gemm_air(cfg: LinearKernelConfig) -> str:
+def _index_constants(count: int) -> str:
+    return "\n".join(
+        f"          %h{i} = arith.constant {i} : index" for i in range(count)
+    )
+
+
+def _grouped_reductions(
+    *,
+    group: int,
+    reduction_extent: int,
+    reduction_const: str,
+    loop_var: str,
+    weight_memref: str,
+    dtype: str,
+) -> str:
+    blocks = []
+    for idx in range(group):
+        blocks.append(
+            f"""          %sum{idx}_acc = scf.for %{loop_var} = %h0 to %{reduction_const} step %h1 iter_args(%acc = %zero_acc) -> (f32) {{
+            %lhs = memref.load %l1_in[%{loop_var}] : memref<{reduction_extent}x{dtype}, 2>
+            %rhs = memref.load %l1_w[%{loop_var}, %h{idx}] : memref<{weight_memref}, 2>
+            %lhs_acc = arith.extf %lhs : {dtype} to f32
+            %rhs_acc = arith.extf %rhs : {dtype} to f32
+            %prod = arith.mulf %lhs_acc, %rhs_acc : f32
+            %next = arith.addf %acc, %prod : f32
+            scf.yield %next : f32
+          }}
+          %sum{idx} = arith.truncf %sum{idx}_acc : f32 to {dtype}"""
+        )
+    stores = [
+        f"          memref.store %sum{idx}, %l1_out[%h{idx}] : memref<{group}x{dtype}, 2>"
+        for idx in range(group)
+    ]
+    return "\n".join(
+        ["          %zero_acc = arith.constant 0.0 : f32", *blocks, *stores]
+    )
+
+
+def _grouped_prefill_gemm_air(cfg: LinearKernelConfig, output_group: int) -> str:
+    h_groups = cfg.H // output_group
+    reductions = _grouped_reductions(
+        group=output_group,
+        reduction_extent=cfg.K,
+        reduction_const="h_k",
+        loop_var="kk",
+        weight_memref=f"{cfg.K}x{output_group}x{cfg.dtype}",
+        dtype=cfg.dtype,
+    )
+    return _header("prefill_gemm.air.mlir") + f"""module {{
+  func.func @llm_linear_prefill(%input: memref<{cfg.M}x{cfg.K}x{cfg.dtype}>,
+                                %weights: memref<{cfg.K}x{cfg.H}x{cfg.dtype}>,
+                                %output: memref<{cfg.M}x{cfg.H}x{cfg.dtype}>)
+      attributes {{llvm.emit_c_interface}} {{
+    %m = arith.constant {cfg.M} : index
+    %h_groups = arith.constant {h_groups} : index
+    air.launch (%row, %col_group) in (%nrow=%m, %ncol=%h_groups)
+        args(%launch_in=%input, %launch_w=%weights, %launch_out=%output)
+        : memref<{cfg.M}x{cfg.K}x{cfg.dtype}>,
+          memref<{cfg.K}x{cfg.H}x{cfg.dtype}>,
+          memref<{cfg.M}x{cfg.H}x{cfg.dtype}> {{
+      air.segment @prefill_segment
+          args(%seg_row=%row, %seg_col_group=%col_group,
+               %seg_in=%launch_in, %seg_w=%launch_w, %seg_out=%launch_out)
+          : index, index,
+            memref<{cfg.M}x{cfg.K}x{cfg.dtype}>,
+            memref<{cfg.K}x{cfg.H}x{cfg.dtype}>,
+            memref<{cfg.M}x{cfg.H}x{cfg.dtype}> {{
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %c_group = arith.constant {output_group} : index
+        %c_k = arith.constant {cfg.K} : index
+        %c_h = arith.constant {cfg.H} : index
+        %seg_col = arith.muli %seg_col_group, %c_group : index
+        %l2_in = memref.alloc() : memref<{cfg.K}x{cfg.dtype}, 1>
+        %l2_w = memref.alloc() : memref<{cfg.K}x{output_group}x{cfg.dtype}, 1>
+        %l2_out = memref.alloc() : memref<{output_group}x{cfg.dtype}, 1>
+
+        air.dma_memcpy_nd (%l2_in[%c0] [%c_k] [%c1],
+                           %seg_in[%seg_row, %c0] [%c1, %c_k] [%c_k, %c1])
+            : (memref<{cfg.K}x{cfg.dtype}, 1>,
+               memref<{cfg.M}x{cfg.K}x{cfg.dtype}>)
+        air.dma_memcpy_nd (%l2_w[%c0, %c0] [%c_k, %c_group] [%c_group, %c1],
+                           %seg_w[%c0, %seg_col] [%c_k, %c_group] [%c_h, %c1])
+            : (memref<{cfg.K}x{output_group}x{cfg.dtype}, 1>,
+               memref<{cfg.K}x{cfg.H}x{cfg.dtype}>)
+        air.herd @prefill_herd
+            tile (%tx, %ty) in (%sx=%c1, %sy=%c1)
+            args(%herd_in=%l2_in, %herd_w=%l2_w, %herd_out=%l2_out)
+            : memref<{cfg.K}x{cfg.dtype}, 1>,
+              memref<{cfg.K}x{output_group}x{cfg.dtype}, 1>,
+              memref<{output_group}x{cfg.dtype}, 1> {{
+{_index_constants(output_group)}
+          %h_k = arith.constant {cfg.K} : index
+          %h_group = arith.constant {output_group} : index
+          %zero = arith.constant 0.0 : {cfg.dtype}
+          %l1_in = memref.alloc() : memref<{cfg.K}x{cfg.dtype}, 2>
+          %l1_w = memref.alloc() : memref<{cfg.K}x{output_group}x{cfg.dtype}, 2>
+          %l1_out = memref.alloc() : memref<{output_group}x{cfg.dtype}, 2>
+
+          air.dma_memcpy_nd (%l1_in[%h0] [%h_k] [%h1],
+                             %herd_in[%h0] [%h_k] [%h1])
+              : (memref<{cfg.K}x{cfg.dtype}, 2>,
+                 memref<{cfg.K}x{cfg.dtype}, 1>)
+          air.dma_memcpy_nd (%l1_w[%h0, %h0] [%h_k, %h_group] [%h_group, %h1],
+                             %herd_w[%h0, %h0] [%h_k, %h_group] [%h_group, %h1])
+              : (memref<{cfg.K}x{output_group}x{cfg.dtype}, 2>,
+                 memref<{cfg.K}x{output_group}x{cfg.dtype}, 1>)
+
+{reductions}
+          air.dma_memcpy_nd (%herd_out[%h0] [%h_group] [%h1],
+                             %l1_out[%h0] [%h_group] [%h1])
+              : (memref<{output_group}x{cfg.dtype}, 1>,
+                 memref<{output_group}x{cfg.dtype}, 2>)
+          air.herd_terminator
+        }}
+
+        air.dma_memcpy_nd (%seg_out[%seg_row, %seg_col] [%c1, %c_group] [%c_h, %c1],
+                           %l2_out[%c0] [%c_group] [%c1])
+            : (memref<{cfg.M}x{cfg.H}x{cfg.dtype}>,
+               memref<{output_group}x{cfg.dtype}, 1>)
+        air.segment_terminator
+      }}
+      air.launch_terminator
+    }}
+    return
+  }}
+}}
+"""
+
+
+def _grouped_decode_gemv_air(cfg: LinearKernelConfig, output_group: int) -> str:
+    n_groups = cfg.N // output_group
+    reductions = _grouped_reductions(
+        group=output_group,
+        reduction_extent=cfg.H,
+        reduction_const="h_h",
+        loop_var="hh",
+        weight_memref=f"{cfg.H}x{output_group}x{cfg.dtype}",
+        dtype=cfg.dtype,
+    )
+    return _header("decode_gemv.air.mlir") + f"""module {{
+  func.func @llm_linear_decode(%input: memref<{cfg.H}x{cfg.dtype}>,
+                               %weights: memref<{cfg.H}x{cfg.N}x{cfg.dtype}>,
+                               %output: memref<{cfg.N}x{cfg.dtype}>)
+      attributes {{llvm.emit_c_interface}} {{
+    %n_groups = arith.constant {n_groups} : index
+    %lane_count = arith.constant 1 : index
+    air.launch (%col_group, %lane) in (%ncol=%n_groups, %nlane=%lane_count)
+        args(%launch_in=%input, %launch_w=%weights, %launch_out=%output)
+        : memref<{cfg.H}x{cfg.dtype}>,
+          memref<{cfg.H}x{cfg.N}x{cfg.dtype}>,
+          memref<{cfg.N}x{cfg.dtype}> {{
+      air.segment @decode_segment
+          args(%seg_col_group=%col_group, %seg_in=%launch_in,
+               %seg_w=%launch_w, %seg_out=%launch_out)
+          : index,
+            memref<{cfg.H}x{cfg.dtype}>,
+            memref<{cfg.H}x{cfg.N}x{cfg.dtype}>,
+            memref<{cfg.N}x{cfg.dtype}> {{
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %c_group = arith.constant {output_group} : index
+        %c_h = arith.constant {cfg.H} : index
+        %c_n = arith.constant {cfg.N} : index
+        %seg_col = arith.muli %seg_col_group, %c_group : index
+        %l2_in = memref.alloc() : memref<{cfg.H}x{cfg.dtype}, 1>
+        %l2_w = memref.alloc() : memref<{cfg.H}x{output_group}x{cfg.dtype}, 1>
+        %l2_out = memref.alloc() : memref<{output_group}x{cfg.dtype}, 1>
+
+        air.dma_memcpy_nd (%l2_in[%c0] [%c_h] [%c1],
+                           %seg_in[%c0] [%c_h] [%c1])
+            : (memref<{cfg.H}x{cfg.dtype}, 1>,
+               memref<{cfg.H}x{cfg.dtype}>)
+        air.dma_memcpy_nd (%l2_w[%c0, %c0] [%c_h, %c_group] [%c_group, %c1],
+                           %seg_w[%c0, %seg_col] [%c_h, %c_group] [%c_n, %c1])
+            : (memref<{cfg.H}x{output_group}x{cfg.dtype}, 1>,
+               memref<{cfg.H}x{cfg.N}x{cfg.dtype}>)
+        air.herd @decode_herd
+            tile (%tx, %ty) in (%sx=%c1, %sy=%c1)
+            args(%herd_in=%l2_in, %herd_w=%l2_w, %herd_out=%l2_out)
+            : memref<{cfg.H}x{cfg.dtype}, 1>,
+              memref<{cfg.H}x{output_group}x{cfg.dtype}, 1>,
+              memref<{output_group}x{cfg.dtype}, 1> {{
+{_index_constants(output_group)}
+          %h_h = arith.constant {cfg.H} : index
+          %h_group = arith.constant {output_group} : index
+          %zero = arith.constant 0.0 : {cfg.dtype}
+          %l1_in = memref.alloc() : memref<{cfg.H}x{cfg.dtype}, 2>
+          %l1_w = memref.alloc() : memref<{cfg.H}x{output_group}x{cfg.dtype}, 2>
+          %l1_out = memref.alloc() : memref<{output_group}x{cfg.dtype}, 2>
+
+          air.dma_memcpy_nd (%l1_in[%h0] [%h_h] [%h1],
+                             %herd_in[%h0] [%h_h] [%h1])
+              : (memref<{cfg.H}x{cfg.dtype}, 2>,
+                 memref<{cfg.H}x{cfg.dtype}, 1>)
+          air.dma_memcpy_nd (%l1_w[%h0, %h0] [%h_h, %h_group] [%h_group, %h1],
+                             %herd_w[%h0, %h0] [%h_h, %h_group] [%h_group, %h1])
+              : (memref<{cfg.H}x{output_group}x{cfg.dtype}, 2>,
+                 memref<{cfg.H}x{output_group}x{cfg.dtype}, 1>)
+
+{reductions}
+          air.dma_memcpy_nd (%herd_out[%h0] [%h_group] [%h1],
+                             %l1_out[%h0] [%h_group] [%h1])
+              : (memref<{output_group}x{cfg.dtype}, 1>,
+                 memref<{output_group}x{cfg.dtype}, 2>)
+          air.herd_terminator
+        }}
+
+        air.dma_memcpy_nd (%seg_out[%seg_col] [%c_group] [%c1],
+                           %l2_out[%c0] [%c_group] [%c1])
+            : (memref<{cfg.N}x{cfg.dtype}>,
+               memref<{output_group}x{cfg.dtype}, 1>)
+        air.segment_terminator
+      }}
+      air.launch_terminator
+    }}
+    return
+  }}
+}}
+"""
+
+
+def prefill_gemm_air(cfg: LinearKernelConfig, *, align_output_dma: bool = False) -> str:
+    output_group = _aligned_output_group(cfg.H) if align_output_dma else 1
+    if output_group > 1:
+        return _grouped_prefill_gemm_air(cfg, output_group)
+    if output_group == 2:
+        h_groups = cfg.H // output_group
+        return _header("prefill_gemm.air.mlir") + f"""module {{
+  func.func @llm_linear_prefill(%input: memref<{cfg.M}x{cfg.K}x{cfg.dtype}>,
+                                %weights: memref<{cfg.K}x{cfg.H}x{cfg.dtype}>,
+                                %output: memref<{cfg.M}x{cfg.H}x{cfg.dtype}>)
+      attributes {{llvm.emit_c_interface}} {{
+    %m = arith.constant {cfg.M} : index
+    %h_groups = arith.constant {h_groups} : index
+    air.launch (%row, %col_group) in (%nrow=%m, %ncol=%h_groups)
+        args(%launch_in=%input, %launch_w=%weights, %launch_out=%output)
+        : memref<{cfg.M}x{cfg.K}x{cfg.dtype}>,
+          memref<{cfg.K}x{cfg.H}x{cfg.dtype}>,
+          memref<{cfg.M}x{cfg.H}x{cfg.dtype}> {{
+      air.segment @prefill_segment
+          args(%seg_row=%row, %seg_col_group=%col_group,
+               %seg_in=%launch_in, %seg_w=%launch_w, %seg_out=%launch_out)
+          : index, index,
+            memref<{cfg.M}x{cfg.K}x{cfg.dtype}>,
+            memref<{cfg.K}x{cfg.H}x{cfg.dtype}>,
+            memref<{cfg.M}x{cfg.H}x{cfg.dtype}> {{
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %c2 = arith.constant 2 : index
+        %c_k = arith.constant {cfg.K} : index
+        %c_h = arith.constant {cfg.H} : index
+        %seg_col = arith.muli %seg_col_group, %c2 : index
+        %l2_in = memref.alloc() : memref<{cfg.K}x{cfg.dtype}, 1>
+        %l2_w = memref.alloc() : memref<{cfg.K}x2x{cfg.dtype}, 1>
+        %l2_out = memref.alloc() : memref<2x{cfg.dtype}, 1>
+
+        air.dma_memcpy_nd (%l2_in[%c0] [%c_k] [%c1],
+                           %seg_in[%seg_row, %c0] [%c1, %c_k] [%c_k, %c1])
+            : (memref<{cfg.K}x{cfg.dtype}, 1>,
+               memref<{cfg.M}x{cfg.K}x{cfg.dtype}>)
+        air.dma_memcpy_nd (%l2_w[%c0, %c0] [%c_k, %c2] [%c2, %c1],
+                           %seg_w[%c0, %seg_col] [%c_k, %c2] [%c_h, %c1])
+            : (memref<{cfg.K}x2x{cfg.dtype}, 1>,
+               memref<{cfg.K}x{cfg.H}x{cfg.dtype}>)
+        air.herd @prefill_herd
+            tile (%tx, %ty) in (%sx=%c1, %sy=%c1)
+            args(%herd_in=%l2_in, %herd_w=%l2_w, %herd_out=%l2_out)
+            : memref<{cfg.K}x{cfg.dtype}, 1>,
+              memref<{cfg.K}x2x{cfg.dtype}, 1>,
+              memref<2x{cfg.dtype}, 1> {{
+          %h0 = arith.constant 0 : index
+          %h1 = arith.constant 1 : index
+          %h2 = arith.constant 2 : index
+          %h_k = arith.constant {cfg.K} : index
+          %zero = arith.constant 0.0 : {cfg.dtype}
+          %l1_in = memref.alloc() : memref<{cfg.K}x{cfg.dtype}, 2>
+          %l1_w = memref.alloc() : memref<{cfg.K}x2x{cfg.dtype}, 2>
+          %l1_out = memref.alloc() : memref<2x{cfg.dtype}, 2>
+
+          air.dma_memcpy_nd (%l1_in[%h0] [%h_k] [%h1],
+                             %herd_in[%h0] [%h_k] [%h1])
+              : (memref<{cfg.K}x{cfg.dtype}, 2>,
+                 memref<{cfg.K}x{cfg.dtype}, 1>)
+          air.dma_memcpy_nd (%l1_w[%h0, %h0] [%h_k, %h2] [%h2, %h1],
+                             %herd_w[%h0, %h0] [%h_k, %h2] [%h2, %h1])
+              : (memref<{cfg.K}x2x{cfg.dtype}, 2>,
+                 memref<{cfg.K}x2x{cfg.dtype}, 1>)
+
+          %sum0 = scf.for %kk = %h0 to %h_k step %h1 iter_args(%acc = %zero) -> ({cfg.dtype}) {{
+            %lhs = memref.load %l1_in[%kk] : memref<{cfg.K}x{cfg.dtype}, 2>
+            %rhs = memref.load %l1_w[%kk, %h0] : memref<{cfg.K}x2x{cfg.dtype}, 2>
+            %prod = arith.mulf %lhs, %rhs : {cfg.dtype}
+            %next = arith.addf %acc, %prod : {cfg.dtype}
+            scf.yield %next : {cfg.dtype}
+          }}
+          %sum1 = scf.for %kk = %h0 to %h_k step %h1 iter_args(%acc = %zero) -> ({cfg.dtype}) {{
+            %lhs = memref.load %l1_in[%kk] : memref<{cfg.K}x{cfg.dtype}, 2>
+            %rhs = memref.load %l1_w[%kk, %h1] : memref<{cfg.K}x2x{cfg.dtype}, 2>
+            %prod = arith.mulf %lhs, %rhs : {cfg.dtype}
+            %next = arith.addf %acc, %prod : {cfg.dtype}
+            scf.yield %next : {cfg.dtype}
+          }}
+          memref.store %sum0, %l1_out[%h0] : memref<2x{cfg.dtype}, 2>
+          memref.store %sum1, %l1_out[%h1] : memref<2x{cfg.dtype}, 2>
+          air.dma_memcpy_nd (%herd_out[%h0] [%h2] [%h1],
+                             %l1_out[%h0] [%h2] [%h1])
+              : (memref<2x{cfg.dtype}, 1>, memref<2x{cfg.dtype}, 2>)
+          air.herd_terminator
+        }}
+
+        air.dma_memcpy_nd (%seg_out[%seg_row, %seg_col] [%c1, %c2] [%c_h, %c1],
+                           %l2_out[%c0] [%c2] [%c1])
+            : (memref<{cfg.M}x{cfg.H}x{cfg.dtype}>,
+               memref<2x{cfg.dtype}, 1>)
+        air.segment_terminator
+      }}
+      air.launch_terminator
+    }}
+    return
+  }}
+}}
+"""
+
     return _header("prefill_gemm.air.mlir") + f"""module {{
   func.func @llm_linear_prefill(%input: memref<{cfg.M}x{cfg.K}x{cfg.dtype}>,
                                 %weights: memref<{cfg.K}x{cfg.H}x{cfg.dtype}>,
@@ -129,7 +463,108 @@ def prefill_gemm_air(cfg: LinearKernelConfig) -> str:
 """
 
 
-def decode_gemv_air(cfg: LinearKernelConfig) -> str:
+def decode_gemv_air(cfg: LinearKernelConfig, *, align_output_dma: bool = False) -> str:
+    output_group = _aligned_decode_output_group(cfg.N) if align_output_dma else 1
+    if output_group > 1:
+        return _grouped_decode_gemv_air(cfg, output_group)
+    if output_group == 2:
+        n_groups = cfg.N // output_group
+        return _header("decode_gemv.air.mlir") + f"""module {{
+  func.func @llm_linear_decode(%input: memref<{cfg.H}x{cfg.dtype}>,
+                               %weights: memref<{cfg.H}x{cfg.N}x{cfg.dtype}>,
+                               %output: memref<{cfg.N}x{cfg.dtype}>)
+      attributes {{llvm.emit_c_interface}} {{
+    %n_groups = arith.constant {n_groups} : index
+    %lane_count = arith.constant 1 : index
+    air.launch (%col_group, %lane) in (%ncol=%n_groups, %nlane=%lane_count)
+        args(%launch_in=%input, %launch_w=%weights, %launch_out=%output)
+        : memref<{cfg.H}x{cfg.dtype}>,
+          memref<{cfg.H}x{cfg.N}x{cfg.dtype}>,
+          memref<{cfg.N}x{cfg.dtype}> {{
+      air.segment @decode_segment
+          args(%seg_col_group=%col_group, %seg_in=%launch_in,
+               %seg_w=%launch_w, %seg_out=%launch_out)
+          : index,
+            memref<{cfg.H}x{cfg.dtype}>,
+            memref<{cfg.H}x{cfg.N}x{cfg.dtype}>,
+            memref<{cfg.N}x{cfg.dtype}> {{
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %c2 = arith.constant 2 : index
+        %c_h = arith.constant {cfg.H} : index
+        %c_n = arith.constant {cfg.N} : index
+        %seg_col = arith.muli %seg_col_group, %c2 : index
+        %l2_in = memref.alloc() : memref<{cfg.H}x{cfg.dtype}, 1>
+        %l2_w = memref.alloc() : memref<{cfg.H}x2x{cfg.dtype}, 1>
+        %l2_out = memref.alloc() : memref<2x{cfg.dtype}, 1>
+
+        air.dma_memcpy_nd (%l2_in[%c0] [%c_h] [%c1],
+                           %seg_in[%c0] [%c_h] [%c1])
+            : (memref<{cfg.H}x{cfg.dtype}, 1>,
+               memref<{cfg.H}x{cfg.dtype}>)
+        air.dma_memcpy_nd (%l2_w[%c0, %c0] [%c_h, %c2] [%c2, %c1],
+                           %seg_w[%c0, %seg_col] [%c_h, %c2] [%c_n, %c1])
+            : (memref<{cfg.H}x2x{cfg.dtype}, 1>,
+               memref<{cfg.H}x{cfg.N}x{cfg.dtype}>)
+        air.herd @decode_herd
+            tile (%tx, %ty) in (%sx=%c1, %sy=%c1)
+            args(%herd_in=%l2_in, %herd_w=%l2_w, %herd_out=%l2_out)
+            : memref<{cfg.H}x{cfg.dtype}, 1>,
+              memref<{cfg.H}x2x{cfg.dtype}, 1>,
+              memref<2x{cfg.dtype}, 1> {{
+          %h0 = arith.constant 0 : index
+          %h1 = arith.constant 1 : index
+          %h2 = arith.constant 2 : index
+          %h_h = arith.constant {cfg.H} : index
+          %zero = arith.constant 0.0 : {cfg.dtype}
+          %l1_in = memref.alloc() : memref<{cfg.H}x{cfg.dtype}, 2>
+          %l1_w = memref.alloc() : memref<{cfg.H}x2x{cfg.dtype}, 2>
+          %l1_out = memref.alloc() : memref<2x{cfg.dtype}, 2>
+
+          air.dma_memcpy_nd (%l1_in[%h0] [%h_h] [%h1],
+                             %herd_in[%h0] [%h_h] [%h1])
+              : (memref<{cfg.H}x{cfg.dtype}, 2>,
+                 memref<{cfg.H}x{cfg.dtype}, 1>)
+          air.dma_memcpy_nd (%l1_w[%h0, %h0] [%h_h, %h2] [%h2, %h1],
+                             %herd_w[%h0, %h0] [%h_h, %h2] [%h2, %h1])
+              : (memref<{cfg.H}x2x{cfg.dtype}, 2>,
+                 memref<{cfg.H}x2x{cfg.dtype}, 1>)
+
+          %sum0 = scf.for %hh = %h0 to %h_h step %h1 iter_args(%acc = %zero) -> ({cfg.dtype}) {{
+            %lhs = memref.load %l1_in[%hh] : memref<{cfg.H}x{cfg.dtype}, 2>
+            %rhs = memref.load %l1_w[%hh, %h0] : memref<{cfg.H}x2x{cfg.dtype}, 2>
+            %prod = arith.mulf %lhs, %rhs : {cfg.dtype}
+            %next = arith.addf %acc, %prod : {cfg.dtype}
+            scf.yield %next : {cfg.dtype}
+          }}
+          %sum1 = scf.for %hh = %h0 to %h_h step %h1 iter_args(%acc = %zero) -> ({cfg.dtype}) {{
+            %lhs = memref.load %l1_in[%hh] : memref<{cfg.H}x{cfg.dtype}, 2>
+            %rhs = memref.load %l1_w[%hh, %h1] : memref<{cfg.H}x2x{cfg.dtype}, 2>
+            %prod = arith.mulf %lhs, %rhs : {cfg.dtype}
+            %next = arith.addf %acc, %prod : {cfg.dtype}
+            scf.yield %next : {cfg.dtype}
+          }}
+          memref.store %sum0, %l1_out[%h0] : memref<2x{cfg.dtype}, 2>
+          memref.store %sum1, %l1_out[%h1] : memref<2x{cfg.dtype}, 2>
+          air.dma_memcpy_nd (%herd_out[%h0] [%h2] [%h1],
+                             %l1_out[%h0] [%h2] [%h1])
+              : (memref<2x{cfg.dtype}, 1>, memref<2x{cfg.dtype}, 2>)
+          air.herd_terminator
+        }}
+
+        air.dma_memcpy_nd (%seg_out[%seg_col] [%c2] [%c1],
+                           %l2_out[%c0] [%c2] [%c1])
+            : (memref<{cfg.N}x{cfg.dtype}>,
+               memref<2x{cfg.dtype}, 1>)
+        air.segment_terminator
+      }}
+      air.launch_terminator
+    }}
+    return
+  }}
+}}
+"""
+
     return _header("decode_gemv.air.mlir") + f"""module {{
   func.func @llm_linear_decode(%input: memref<{cfg.H}x{cfg.dtype}>,
                                %weights: memref<{cfg.H}x{cfg.N}x{cfg.dtype}>,
@@ -216,10 +651,14 @@ def decode_gemv_air(cfg: LinearKernelConfig) -> str:
 """
 
 
-def emit_all_kernels(cfg: LinearKernelConfig) -> dict[str, str]:
+def emit_all_kernels(
+    cfg: LinearKernelConfig,
+    *,
+    align_output_dma: bool = False,
+) -> dict[str, str]:
     return {
-        "prefill": prefill_gemm_air(cfg),
-        "decode": decode_gemv_air(cfg),
+        "prefill": prefill_gemm_air(cfg, align_output_dma=align_output_dma),
+        "decode": decode_gemv_air(cfg, align_output_dma=align_output_dma),
     }
 
 
@@ -232,11 +671,17 @@ def default_air_filenames(cfg: LinearKernelConfig) -> dict[str, str]:
 
 
 def write_default_air_sources(
-    cfg: LinearKernelConfig, output_dir: Path
+    cfg: LinearKernelConfig,
+    output_dir: Path,
+    *,
+    align_output_dma: bool = False,
 ) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     names = default_air_filenames(cfg)
-    sources = emit_all_kernels(cfg)
+    sources = emit_all_kernels(
+        cfg,
+        align_output_dma=align_output_dma,
+    )
     paths: dict[str, Path] = {}
     for key, text in sources.items():
         path = output_dir / names[key]

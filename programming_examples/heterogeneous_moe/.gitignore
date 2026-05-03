@@ -1,6 +1,7 @@
 # Generated AIR sources and compiler output roots.
 air/*.air.mlir
 artifacts
+.pytest_cache/
 air_gpu
 air_project
 air_probe*/

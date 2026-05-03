@@ -22,10 +22,17 @@ def test_linear_air_text_generation(tmp_path: Path) -> None:
     cfg = LinearKernelConfig(M=2, K=4, H=8, N=3, dtype="f16")
     prefill = prefill_gemm_air(cfg)
     decode = decode_gemv_air(cfg)
+    npu_prefill = prefill_gemm_air(cfg, align_output_dma=True)
+    npu_decode = decode_gemv_air(
+        LinearKernelConfig(M=2, K=4, H=8, N=4, dtype="f16"),
+        align_output_dma=True,
+    )
     assert "func.func @llm_linear_prefill" in prefill
     assert "memref<2x4xf16>" in prefill
     assert "func.func @llm_linear_decode" in decode
     assert "memref<8x3xf16>" in decode
+    assert "memref<4x8xf16" in npu_prefill
+    assert "memref<8x2xf16" in npu_decode
     assert set(emit_all_kernels(cfg)) == {"prefill", "decode"}
 
     names = default_air_filenames(cfg)

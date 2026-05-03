@@ -3,10 +3,105 @@
 
 from __future__ import annotations
 
+import ctypes
+import os
+import subprocess
+import sys
+
+_BOOTSTRAP_DIRECT_BRIDGE_LIB: ctypes.CDLL | None = None
+_BOOTSTRAP_ENV = "LLM_LINEAR_DIRECT_BRIDGE_BOOTSTRAPPED"
+
+
+def _reexec_with_direct_bridge_bootstrap() -> None:
+    if __name__ != "__main__":
+        return
+    if os.environ.get("LLM_LINEAR_DIRECT_BRIDGE_FORCE_REEXEC") != "1":
+        return
+    if not os.environ.get("LLM_LINEAR_DIRECT_BRIDGE_SO"):
+        return
+    if os.environ.get(_BOOTSTRAP_ENV) == "1":
+        return
+    env = os.environ.copy()
+    env[_BOOTSTRAP_ENV] = "1"
+    code = """
+import ctypes
+import os
+import runpy
+import sys
+
+
+def _load_direct_bridge(raw):
+    if not raw:
+        return None
+    saved = {
+        name: os.environ.pop(name, None)
+        for name in ("LD_LIBRARY_PATH", "PYTHONPATH")
+    }
+    try:
+        mode = getattr(os, "RTLD_GLOBAL", 0) | getattr(os, "RTLD_NOW", 0)
+        lib = ctypes.CDLL(raw, mode=mode)
+        probe = getattr(lib, "llm_linear_direct_bridge_probe", None)
+        if probe is not None:
+            probe.restype = ctypes.c_int
+            probe()
+        return lib
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+lib = _load_direct_bridge(os.environ.get("LLM_LINEAR_DIRECT_BRIDGE_SO"))
+sys._llm_linear_direct_bridge_bootstrap = lib
+script = sys.argv[1]
+sys.argv = [script] + sys.argv[2:]
+runpy.run_path(script, run_name="__main__")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code, __file__, *sys.argv[1:]],
+        env=env,
+        check=False,
+    )
+    raise SystemExit(completed.returncode)
+
+
+_reexec_with_direct_bridge_bootstrap()
+
+
+def _bootstrap_direct_bridge() -> None:
+    global _BOOTSTRAP_DIRECT_BRIDGE_LIB
+    raw_path = os.environ.get("LLM_LINEAR_DIRECT_BRIDGE_SO")
+    if not raw_path or _BOOTSTRAP_DIRECT_BRIDGE_LIB is not None:
+        return
+    try:
+        saved = {
+            name: os.environ.pop(name, None)
+            for name in ("LD_LIBRARY_PATH", "PYTHONPATH")
+        }
+        try:
+            mode = getattr(os, "RTLD_GLOBAL", 0) | getattr(os, "RTLD_NOW", 0)
+            library = ctypes.CDLL(raw_path, mode=mode)
+            probe = getattr(library, "llm_linear_direct_bridge_probe")
+            probe.restype = ctypes.c_int
+            probe()
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        _BOOTSTRAP_DIRECT_BRIDGE_LIB = library
+    except Exception:
+        _BOOTSTRAP_DIRECT_BRIDGE_LIB = None
+
+
+_bootstrap_direct_bridge()
+
 import argparse
 import copy
 import csv
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -32,9 +127,32 @@ from llm_linear.results import (
     validate_runtime,
 )
 from llm_linear.runtime import LinearRuntime
-from llm_linear.schema import case_stage_backends, contains_npu, required_backends
+from llm_linear.schema import case_stage_backends, contains_npu
 from llm_linear.suites import suite_workloads
 from llm_linear.transfer import DirectTransferUnsupported
+
+
+def _required_artifact_stage_backends(
+    cases: list[dict[str, Any]], allow_npu: bool
+) -> dict[str, set[str]]:
+    needed: dict[str, set[str]] = {"prefill": set(), "decode": set()}
+    for case in cases:
+        for stage, backend in case_stage_backends(case).items():
+            if backend == "gpu" or (backend == "npu" and allow_npu):
+                needed[stage].add(backend)
+    return {stage: backends for stage, backends in needed.items() if backends}
+
+
+def _artifact_cache_key(
+    manifest: dict[str, Any], stage_backends: dict[str, set[str]]
+) -> tuple[str, tuple[tuple[str, tuple[str, ...]], ...]]:
+    return (
+        manifest["paths"]["artifacts"],
+        tuple(
+            (stage, tuple(sorted(backends)))
+            for stage, backends in sorted(stage_backends.items())
+        ),
+    )
 
 
 def _run_case(
@@ -218,7 +336,9 @@ def main(argv: list[str] | None = None) -> int:
         "workloads": [],
     }
     csv_rows: list[dict[str, Any]] = []
-    artifact_cache: dict[tuple[str, tuple[str, ...]], dict[str, Any]] = {}
+    artifact_cache: dict[
+        tuple[str, tuple[tuple[str, tuple[str, ...]], ...]], dict[str, Any]
+    ] = {}
     command_line = (
         [sys.executable, *sys.argv]
         if argv is None
@@ -227,12 +347,23 @@ def main(argv: list[str] | None = None) -> int:
 
     for workload in workloads:
         manifest = workload["manifest"]
-        needed_backends = required_backends(workload["cases"], args.allow_npu)
-        if needed_backends:
-            cache_key = (manifest["paths"]["artifacts"], tuple(sorted(needed_backends)))
+        needed_artifacts = _required_artifact_stage_backends(
+            workload["cases"], args.allow_npu
+        )
+        if needed_artifacts:
+            needed_backends = {
+                backend
+                for backends in needed_artifacts.values()
+                for backend in backends
+            }
+            cache_key = _artifact_cache_key(manifest, needed_artifacts)
             cached_artifacts = artifact_cache.get(cache_key)
             if cached_artifacts is None:
-                manifest = populate_artifacts(manifest, needed_backends)
+                manifest = populate_artifacts(
+                    manifest,
+                    needed_backends,
+                    stage_backends=needed_artifacts,
+                )
                 artifact_cache[cache_key] = copy.deepcopy(manifest["artifacts"])
             else:
                 manifest["artifacts"] = copy.deepcopy(cached_artifacts)

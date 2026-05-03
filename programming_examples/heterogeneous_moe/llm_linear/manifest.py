@@ -8,7 +8,6 @@ import os
 import platform
 import shutil
 import subprocess
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +44,8 @@ def resolve_package_path(path: str | Path) -> Path:
     candidate = Path(path).expanduser()
     if candidate.is_absolute():
         return candidate
+    if candidate.parts and candidate.parts[0] == package_dir().name:
+        return project_dir() / candidate
     return package_dir() / candidate
 
 
@@ -109,6 +110,8 @@ def collect_run_metadata(
     *,
     command_line: list[str] | None = None,
 ) -> dict[str, Any]:
+    from datetime import datetime, timezone
+
     repo = repo_dir()
     git_sha = _run_metadata_command(["git", "rev-parse", "HEAD"], cwd=repo)
     tracked_status = _run_metadata_command(

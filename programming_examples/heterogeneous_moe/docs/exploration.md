@@ -201,6 +201,23 @@ python3 run_workload_suite.py --suite shape_sweep \
   --output-dir artifacts/benchmarks/workload_suites/npu_shape_sweep
 ```
 
+## LLM-Linear Milestone 2 Direct Acceptance
+
+The LLM-linear direct GPU/NPU handoff hardware gate is accepted as of May 3,
+2026. Run it from `programming_examples/heterogeneous_moe` with:
+
+```bash
+source /opt/xilinx/xrt/setup.sh && ../../sandbox/bin/python run_llm_linear_milestone2.py
+```
+
+The wrapper writes accepted evidence under
+`llm_linear/artifacts/benchmarks/milestone2_e2e`, builds the native direct
+bridge, runs `tiny_g2n_direct`, `tiny_n2g_direct`, `medium_g2n_direct`,
+`medium_n2g_direct`, and `medium_host_mixed`, and rejects logs containing the
+known XRT host-copy fallback markers. The accepted medium workload is
+`medium_m8_k512_h512_n256`; the broader `medium` ladder, CPU/GPU/NPU crossover,
+and `llm_like` studies remain future work.
+
 ## Artifact Hygiene
 
 Keep `default_manifest.json` portable. It should not contain machine-local compiled paths. Generated sources, shared libraries, NPU binaries, benchmark trees, coverage reports, and sidecar manifests belong under ignored roots such as:
