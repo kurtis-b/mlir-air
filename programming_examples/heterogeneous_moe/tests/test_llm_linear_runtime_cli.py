@@ -13,6 +13,7 @@ import numpy as np
 import compile_llm_linear
 import run_llm_linear_milestone2
 import run_llm_linear_milestone3
+import run_llm_linear_milestone4
 import run_llm_linear_suite
 from llm_linear.manifest import load_json, resolve_package_path
 from llm_linear.direct_bridge import (
@@ -34,7 +35,7 @@ from llm_linear.results import (
     result_csv_row,
     validate_runtime,
 )
-from llm_linear.runtime import LinearRuntime, NpuLinearExecutor
+from llm_linear.runtime import GpuLinearExecutor, LinearRuntime, NpuLinearExecutor
 from llm_linear.transfer import (
     DeviceResidentTensor,
     DirectTransferUnsupported,
@@ -42,6 +43,15 @@ from llm_linear.transfer import (
 )
 
 DIRECT_MECHANISM = "hip_vmem_export_xrt_bo_import_fd"
+LINEAR_MILESTONE4_STAGE_BACKENDS = {
+    "cpu_only": {"prefill": "cpu", "decode": "cpu"},
+    "gpu_only": {"prefill": "gpu", "decode": "gpu"},
+    "npu_only": {"prefill": "npu", "decode": "npu"},
+    "gpu_prefill_npu_decode_host": {"prefill": "gpu", "decode": "npu"},
+    "npu_prefill_gpu_decode_host": {"prefill": "npu", "decode": "gpu"},
+    "gpu_prefill_npu_decode_direct": {"prefill": "gpu", "decode": "npu"},
+    "npu_prefill_gpu_decode_direct": {"prefill": "npu", "decode": "gpu"},
+}
 
 
 def _tiny_cpu_manifest(moe_dir: Path, tmp_path: Path) -> dict:
@@ -84,6 +94,157 @@ def _direct_probe_report(*, npu_verified: bool = False) -> DirectBridgeProbeRepo
         diagnostic="ok",
         library_path="fake_bridge.so",
     )
+
+
+def _milestone4_result(
+    case_name: str,
+    *,
+    mean_ms: float,
+    decode_weight_storage: str = "bf16",
+    hardware_fused: bool = True,
+) -> dict[str, object]:
+    stage_backends = LINEAR_MILESTONE4_STAGE_BACKENDS[case_name]
+    shape = {"M": 4, "K": 128, "H": 128, "N": 64}
+    result: dict[str, object] = {
+        "case_name": case_name,
+        "suite": "tiny_ci",
+        "workload_name": "unit",
+        "dtype": "bf16",
+        "shape": shape,
+        "stage_backends": stage_backends,
+        "placement": stage_backends,
+        "latency_ms": {"mean": mean_ms, "p50": mean_ms, "p95": mean_ms},
+        "stage_latency_ms": {
+            "prefill": {"mean": mean_ms * 0.4},
+            "decode": {"mean": mean_ms * 0.5},
+            "end_to_end": {"mean": mean_ms},
+        },
+        "correctness": {
+            "validation_status": "pass",
+            "prefill_allclose": True,
+            "output_allclose": True,
+        },
+        "transfer_summary": {
+            "total_bytes": 256,
+            "total_elapsed_us": 10.0,
+            "numpy_host_materializations": 1,
+            "direct_handoff_numpy_host_materializations": 0,
+            "device_resident_buffers": False,
+        },
+        "execution_truth": {"numpy_host_materializations": 1},
+        "transfer_events": [],
+        "quantized_decode": {"enabled": False},
+    }
+    if decode_weight_storage == "int4":
+        result["quantized_decode"] = {
+            "enabled": True,
+            "quant_kind": "int4",
+            "hardware_fused": hardware_fused,
+            "packed_bytes": 4096,
+            "scale_bytes": 1024,
+            "metadata": {"quant_kind": "int4", "block_size": 32, "quant_axis": 0},
+        }
+    if case_name.endswith("_direct"):
+        probe_report = _direct_probe_report(npu_verified=True).to_dict()
+        expected_bytes = shape["H"] * 2
+        expected_offset = (shape["M"] - 1) * shape["H"] * 2
+        result["transfer_summary"] = {
+            "total_bytes": expected_bytes,
+            "total_elapsed_us": 20.0,
+            "numpy_host_materializations": 0,
+            "direct_handoff_numpy_host_materializations": 0,
+            "device_resident_buffers": True,
+            "direct_handoff": {
+                "supported": True,
+                "contract": DIRECT_CONTRACT,
+                "mechanism": DIRECT_MECHANISM,
+                "direct_class": DIRECT_CLASS_DEVICE_RESIDENT,
+                "zero_host_copy": True,
+                "device_resident_buffers": True,
+                "probe_report": probe_report,
+            },
+        }
+        result["execution_truth"] = {"numpy_host_materializations": 0}
+        result["direct_bridge"] = {
+            "mechanism": DIRECT_MECHANISM,
+            "direct_class": DIRECT_CLASS_DEVICE_RESIDENT,
+            "zero_host_copy": True,
+            "device_resident_buffers": True,
+            "import_method": 3,
+            "subview_offset_bytes": expected_offset,
+            "probe_report": probe_report,
+        }
+        result["transfer_events"] = [
+            {
+                "actual_mode": "device_resident_direct_handoff",
+                "mechanism": DIRECT_MECHANISM,
+                "direct_class": DIRECT_CLASS_DEVICE_RESIDENT,
+                "zero_host_copy": True,
+                "device_resident_buffers": True,
+                "bytes": expected_bytes,
+                "numpy_host_materializations": 0,
+                "tensor": {
+                    "owner": "hip_vmem",
+                    "imported_view": "xrt_bo",
+                    "mechanism": DIRECT_MECHANISM,
+                    "direct_class": DIRECT_CLASS_DEVICE_RESIDENT,
+                    "zero_host_copy": True,
+                    "byte_size": expected_bytes,
+                    "offset": expected_offset,
+                },
+                "sync_events": [
+                    {"event": "hipDeviceSynchronize"},
+                    {"event": "xrtBoSyncToDevice"},
+                    {"event": "xrtBoSubview"},
+                    {"event": "xrtRunWait"},
+                ],
+            }
+        ]
+    return result
+
+
+def _write_milestone4_output(
+    output_dir: Path, *, decode_weight_storage: str = "bf16"
+) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "schema_version": "llm-linear-v1",
+        "measurement_mode": "both",
+        "transfer_mode": "case",
+        "decode_weight_storage": decode_weight_storage,
+        "workloads": [],
+    }
+    for suite, workload in sorted(run_llm_linear_milestone4.expected_workload_keys()):
+        workload_cases = []
+        for case in run_llm_linear_milestone4.REQUIRED_CASES:
+            decode_backend = LINEAR_MILESTONE4_STAGE_BACKENDS[case]["decode"]
+            hardware_fused = decode_backend in {"gpu", "npu"}
+            mean_ms = 1.0 if case.endswith("_direct") else 2.0
+            result = _milestone4_result(
+                case,
+                mean_ms=mean_ms,
+                decode_weight_storage=decode_weight_storage,
+                hardware_fused=hardware_fused,
+            )
+            result["suite"] = suite
+            result["workload_name"] = workload
+            workload_cases.append(result)
+            case_path = output_dir / suite / workload / "cases" / f"{case}.json"
+            case_path.parent.mkdir(parents=True, exist_ok=True)
+            case_path.write_text(json.dumps(result), encoding="utf-8")
+        summary["workloads"].append(
+            {
+                "suite": suite,
+                "name": workload,
+                "shape": {"name": workload},
+                "cases": workload_cases,
+                "skipped": [],
+            }
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    (output_dir / "summary.csv").write_text("suite,workload\n", encoding="utf-8")
+    (output_dir / "report.md").write_text("# report\n", encoding="utf-8")
+    return summary
 
 
 def test_linear_runtime_result_schema(moe_dir: Path, tmp_path: Path) -> None:
@@ -167,6 +328,7 @@ def test_linear_runtime_gpu_quantized_decode_receives_packed_buffers(
             dtype_name,
             decode_quantized=None,
             kernel_key=None,
+            shape=None,
         ):
             assert kind == "decode"
             assert kernel_key == "decode_int4"
@@ -249,6 +411,89 @@ def test_npu_prefill_executor_stages_multirow_inputs(tmp_path: Path) -> None:
     for row, staged in enumerate(staged_rows):
         assert staged.shape == (1, inputs.shape[1])
         np.testing.assert_allclose(staged[0, :], inputs[row, :])
+
+
+def test_npu_dense_decode_executor_tiles_weight_columns(tmp_path: Path) -> None:
+    executor = NpuLinearExecutor(
+        "decode",
+        Path("unused.mlir"),
+        {"tile_n": 2},
+        tmp_path,
+        "npu2",
+        "bf16",
+        kernel_key="decode",
+    )
+    staged_weights: list[np.ndarray] = []
+
+    def fake_invoker(encoded_input, encoded_weights, output):
+        del encoded_input
+        staged_weights.append(decode_npu_array(encoded_weights, "bf16"))
+        values = np.asarray(
+            [len(staged_weights), len(staged_weights) + 10.0], dtype=np.float32
+        )
+        output[...] = encode_npu_array(values, "bf16")
+        return (encoded_weights, output)
+
+    executor._invoker = fake_invoker
+    decode_input = np.asarray([1.0, 2.0, 3.0], dtype=np.float32)
+    weights = np.asarray(
+        [
+            [1.0, 2.0, 3.0, 4.0],
+            [5.0, 6.0, 7.0, 8.0],
+            [9.0, 10.0, 11.0, 12.0],
+        ],
+        dtype=np.float32,
+    )
+
+    output = executor.run(decode_input, weights)
+
+    assert len(staged_weights) == 2
+    np.testing.assert_allclose(staged_weights[0], weights[:, :2])
+    np.testing.assert_allclose(staged_weights[1], weights[:, 2:])
+    np.testing.assert_allclose(output, [1.0, 11.0, 2.0, 12.0])
+
+
+def test_gpu_dense_decode_executor_tiles_hidden_rows(tmp_path: Path) -> None:
+    executor = GpuLinearExecutor(
+        "decode",
+        Path("unused.mlir"),
+        {"tile_h": 2, "tile_n": 4},
+        tmp_path,
+        "gfx1150",
+        "bf16",
+        kernel_key="decode",
+    )
+    staged_inputs: list[np.ndarray] = []
+    staged_weights: list[np.ndarray] = []
+
+    def descriptor_array(descriptor):
+        shape = tuple(int(dim) for dim in descriptor.shape)
+        return np.ctypeslib.as_array(descriptor.aligned, shape=shape)
+
+    class FakeLibrary:
+        def invoke(self, function_name, input_desc, weight_desc, output_desc):
+            assert function_name == "llm_linear_decode"
+            decoded_input = decode_npu_array(descriptor_array(input_desc), "bf16")
+            decoded_weights = decode_npu_array(descriptor_array(weight_desc), "bf16")
+            staged_inputs.append(decoded_input.copy())
+            staged_weights.append(decoded_weights.copy())
+            partial = decoded_input.astype(np.float32) @ decoded_weights.astype(
+                np.float32
+            )
+            descriptor_array(output_desc)[...] = encode_npu_array(partial, "bf16")
+
+    executor._library = FakeLibrary()
+    decode_input = np.asarray([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    weights = np.ones((4, 4), dtype=np.float32)
+
+    output = executor.run(decode_input, weights)
+
+    assert len(staged_inputs) == 2
+    np.testing.assert_allclose(staged_inputs[0], [1.0, 2.0])
+    np.testing.assert_allclose(staged_inputs[1], [3.0, 4.0])
+    np.testing.assert_allclose(staged_weights[0], weights[:2, :])
+    np.testing.assert_allclose(staged_weights[1], weights[2:, :])
+    np.testing.assert_allclose(output, [10.0, 10.0, 10.0, 10.0])
 
 
 def test_linear_direct_transfer_fails_closed(moe_dir: Path, tmp_path: Path) -> None:
@@ -749,6 +994,125 @@ def test_milestone3_verifier_requires_hardware_fused_int4() -> None:
             stale, require_direct=False
         )
     )
+
+
+def test_milestone4_verifier_complete_cases_and_crossover(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "bf16"
+    summary = _write_milestone4_output(output_dir, decode_weight_storage="bf16")
+    assert (
+        run_llm_linear_milestone4.validate_output_dir(
+            output_dir, decode_weight_storage="bf16"
+        )
+        == []
+    )
+
+    rows = run_llm_linear_milestone4.crossover_rows(summary)
+    assert len(rows) == (
+        len(run_llm_linear_milestone4.expected_workload_keys()) * 2 * 4
+    )
+    assert all(row["baseline"] for row in rows)
+    assert {row["classification"] for row in rows} == {"wins"}
+
+    broken = output_dir / "broken"
+    broken_summary = copy.deepcopy(summary)
+    first_workload = broken_summary["workloads"][0]
+    first_workload["cases"] = [
+        case for case in first_workload["cases"] if case["case_name"] != "npu_only"
+    ]
+    broken.mkdir()
+    (broken / "summary.json").write_text(json.dumps(broken_summary), encoding="utf-8")
+    errors = run_llm_linear_milestone4.validate_output_dir(
+        broken, decode_weight_storage="bf16"
+    )
+    assert any("missing expected case" in message for message in errors)
+
+
+def test_milestone4_verifier_direct_and_fallback_contract(tmp_path: Path) -> None:
+    direct = _milestone4_result(
+        "gpu_prefill_npu_decode_direct",
+        mean_ms=1.0,
+    )
+    assert (
+        run_llm_linear_milestone4.validate_result_payload(
+            direct, decode_weight_storage="bf16", require_direct=True
+        )
+        == []
+    )
+    stale = copy.deepcopy(direct)
+    stale["transfer_events"][0]["sync_events"][2] = {"event": "xrtBoCopy"}
+    assert any(
+        "xrtBoCopy" in message
+        for message in run_llm_linear_milestone4.validate_result_payload(
+            stale, decode_weight_storage="bf16", require_direct=True
+        )
+    )
+
+    log_path = tmp_path / "milestone4.log"
+    log_path.write_text(
+        "error: exec_buf: Operation not supported\n"
+        "warning: Reverting to host copy of buffers\n",
+        encoding="utf-8",
+    )
+    assert set(run_llm_linear_milestone4.scan_log_for_blockers(log_path)) == {
+        "Reverting to host copy of buffers",
+        "exec_buf: Operation not supported",
+    }
+
+
+def test_milestone4_int4_cpu_allows_non_hardware_fused_decode() -> None:
+    cpu = _milestone4_result(
+        "cpu_only",
+        mean_ms=2.0,
+        decode_weight_storage="int4",
+        hardware_fused=False,
+    )
+    assert (
+        run_llm_linear_milestone4.validate_result_payload(
+            cpu, decode_weight_storage="int4", require_direct=False
+        )
+        == []
+    )
+
+    gpu = _milestone4_result(
+        "gpu_only",
+        mean_ms=2.0,
+        decode_weight_storage="int4",
+        hardware_fused=False,
+    )
+    assert any(
+        "hardware_fused" in message
+        for message in run_llm_linear_milestone4.validate_result_payload(
+            gpu, decode_weight_storage="int4", require_direct=False
+        )
+    )
+
+
+def test_milestone4_wrapper_commands_and_summary_report(tmp_path: Path) -> None:
+    run = run_llm_linear_milestone4.ACCEPTANCE_RUNS[1]
+    argv = run.argv(Path("python"), "root")
+    assert argv[:3] == ["python", "run_llm_linear_suite.py", "--suite"]
+    assert argv[argv.index("--suite") + 1 : argv.index("--case-filter")] == [
+        "tiny_ci",
+        "medium",
+        "llm_like",
+    ]
+    assert "--measurement-mode" in argv
+    assert argv[argv.index("--measurement-mode") + 1] == "both"
+    assert argv[argv.index("--iterations") + 1] == "5"
+    assert argv[argv.index("--warmup") + 1] == "2"
+    assert "--decode-quant-block-size" in argv
+    assert argv[argv.index("--output-dir") + 1].endswith("root/int4")
+
+    summary = _write_milestone4_output(tmp_path / "int4", decode_weight_storage="int4")
+    report = run_llm_linear_milestone4.milestone4_summary_markdown(
+        {"int4": summary}, tmp_path
+    )
+    assert "## int4" in report
+    assert "Baseline" in report
+    assert "Classification" in report
+    assert "wins" in report
 
 
 def test_compile_llm_linear_cli(monkeypatch, tmp_path: Path) -> None:

@@ -56,6 +56,31 @@ def _require_int4_hardware_shape(cfg: LinearKernelConfig, block_size: int) -> No
         raise ValueError("decode int4 hardware requires N divisible by 8")
 
 
+def _require_dense_decode_tile_shape(
+    cfg: LinearKernelConfig, tile_h: int, output_group: int
+) -> None:
+    if tile_h <= 0:
+        raise ValueError("dense NPU decode tile_h must be positive")
+    if output_group <= 0 or cfg.N % output_group != 0:
+        raise ValueError("dense NPU decode requires N divisible by output_group")
+    if cfg.H > tile_h and cfg.H % tile_h != 0:
+        raise ValueError(
+            "dense NPU decode requires H divisible by tile_h when H exceeds tile_h"
+        )
+
+
+def _effective_dense_decode_tile_h(cfg: LinearKernelConfig, tile_h: int) -> int:
+    if cfg.H <= tile_h:
+        return cfg.H
+    base_tile_count = cfg.H // tile_h
+    if base_tile_count <= 8:
+        return tile_h
+    for tile_count in (4, 5, 6, 7, 8):
+        if cfg.H % tile_count == 0:
+            return cfg.H // tile_count
+    return tile_h
+
+
 def _header(title: str) -> str:
     return f"""//===- {title} ---------------------------------*- MLIR -*-===//
 //
@@ -481,8 +506,326 @@ def prefill_gemm_air(cfg: LinearKernelConfig, *, align_output_dma: bool = False)
 """
 
 
-def decode_gemv_air(cfg: LinearKernelConfig, *, align_output_dma: bool = False) -> str:
+def _streamed_dense_decode_gemv_air(
+    cfg: LinearKernelConfig, output_group: int, tile_h: int
+) -> str:
+    _require_dense_decode_tile_shape(cfg, tile_h, output_group)
+    large_h_streaming = cfg.H > tile_h and (cfg.H // tile_h) > 8
+    effective_tile_h = _effective_dense_decode_tile_h(cfg, tile_h)
+    tile_count = cfg.H // effective_tile_h
+    if large_h_streaming:
+        return _global_streamed_dense_decode_gemv_air(
+            cfg, output_group, effective_tile_h, tile_count
+        )
+    n_groups = cfg.N // output_group
+    index_constants = _index_constants(max(output_group, 2))
+    tile_blocks = _streamed_dense_decode_tile_blocks(
+        cfg=cfg,
+        output_group=output_group,
+        effective_tile_h=effective_tile_h,
+        tile_count=tile_count,
+    )
+    return _header("decode_gemv.air.mlir") + f"""module {{
+  func.func @llm_linear_decode(%input: memref<{cfg.H}x{cfg.dtype}>,
+                               %weights: memref<{cfg.H}x{cfg.N}x{cfg.dtype}>,
+                               %output: memref<{cfg.N}x{cfg.dtype}>)
+      attributes {{llvm.emit_c_interface}} {{
+    %n_groups = arith.constant {n_groups} : index
+    %lane_count = arith.constant 1 : index
+    air.launch (%col_group, %lane) in (%ncol=%n_groups, %nlane=%lane_count)
+        args(%launch_in=%input, %launch_w=%weights, %launch_out=%output)
+        : memref<{cfg.H}x{cfg.dtype}>,
+          memref<{cfg.H}x{cfg.N}x{cfg.dtype}>,
+          memref<{cfg.N}x{cfg.dtype}> {{
+      air.segment @decode_segment
+          args(%seg_col_group=%col_group, %seg_in=%launch_in,
+               %seg_w=%launch_w, %seg_out=%launch_out)
+          : index,
+            memref<{cfg.H}x{cfg.dtype}>,
+            memref<{cfg.H}x{cfg.N}x{cfg.dtype}>,
+            memref<{cfg.N}x{cfg.dtype}> {{
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %c_group = arith.constant {output_group} : index
+        %c_h = arith.constant {cfg.H} : index
+        %c_n = arith.constant {cfg.N} : index
+        %seg_col = arith.muli %seg_col_group, %c_group : index
+        %l2_in = memref.alloc() : memref<{cfg.H}x{cfg.dtype}, 1>
+        %l2_w = memref.alloc() : memref<{cfg.H}x{output_group}x{cfg.dtype}, 1>
+        %l2_out = memref.alloc() : memref<{output_group}x{cfg.dtype}, 1>
+
+        air.dma_memcpy_nd (%l2_in[%c0] [%c_h] [%c1],
+                           %seg_in[%c0] [%c_h] [%c1])
+            : (memref<{cfg.H}x{cfg.dtype}, 1>,
+               memref<{cfg.H}x{cfg.dtype}>)
+        air.dma_memcpy_nd (%l2_w[%c0, %c0] [%c_h, %c_group] [%c_group, %c1],
+                           %seg_w[%c0, %seg_col] [%c_h, %c_group] [%c_n, %c1])
+            : (memref<{cfg.H}x{output_group}x{cfg.dtype}, 1>,
+               memref<{cfg.H}x{cfg.N}x{cfg.dtype}>)
+        air.herd @decode_herd
+            tile (%tx, %ty) in (%sx=%c1, %sy=%c1)
+            args(%herd_in=%l2_in, %herd_w=%l2_w, %herd_out=%l2_out)
+            : memref<{cfg.H}x{cfg.dtype}, 1>,
+              memref<{cfg.H}x{output_group}x{cfg.dtype}, 1>,
+              memref<{output_group}x{cfg.dtype}, 1> {{
+{index_constants}
+          %h_tile_h = arith.constant {effective_tile_h} : index
+          %h_tiles = arith.constant {tile_count} : index
+          %h_group = arith.constant {output_group} : index
+          %zero_acc_f32 = arith.constant 0.0 : f32
+          %l1_in = memref.alloc() : memref<{effective_tile_h}x{cfg.dtype}, 2>
+          %l1_w = memref.alloc() : memref<{effective_tile_h}x{output_group}x{cfg.dtype}, 2>
+          %l1_out = memref.alloc() : memref<{output_group}x{cfg.dtype}, 2>
+
+{tile_blocks}
+          air.dma_memcpy_nd (%herd_out[%h0] [%h_group] [%h1],
+                             %l1_out[%h0] [%h_group] [%h1])
+              : (memref<{output_group}x{cfg.dtype}, 1>,
+                 memref<{output_group}x{cfg.dtype}, 2>)
+          air.herd_terminator
+        }}
+
+        air.dma_memcpy_nd (%seg_out[%seg_col] [%c_group] [%c1],
+                           %l2_out[%c0] [%c_group] [%c1])
+            : (memref<{cfg.N}x{cfg.dtype}>,
+               memref<{output_group}x{cfg.dtype}, 1>)
+        air.segment_terminator
+      }}
+      air.launch_terminator
+    }}
+    return
+  }}
+}}
+"""
+
+
+def _global_streamed_dense_decode_gemv_air(
+    cfg: LinearKernelConfig,
+    output_group: int,
+    effective_tile_h: int,
+    tile_count: int,
+) -> str:
+    n_groups = cfg.N // output_group
+    index_constants = _index_constants(max(output_group, 2))
+    tile_blocks = _global_dense_decode_tile_blocks(
+        cfg=cfg,
+        output_group=output_group,
+        effective_tile_h=effective_tile_h,
+        tile_count=tile_count,
+    )
+    return _header("decode_gemv.air.mlir") + f"""module {{
+  func.func @llm_linear_decode(%input: memref<{cfg.H}x{cfg.dtype}>,
+                               %weights: memref<{cfg.H}x{cfg.N}x{cfg.dtype}>,
+                               %output: memref<{cfg.N}x{cfg.dtype}>)
+      attributes {{llvm.emit_c_interface}} {{
+    %n_groups = arith.constant {n_groups} : index
+    %lane_count = arith.constant 1 : index
+    air.launch (%col_group, %lane) in (%ncol=%n_groups, %nlane=%lane_count)
+        args(%launch_in=%input, %launch_w=%weights, %launch_out=%output)
+        : memref<{cfg.H}x{cfg.dtype}>,
+          memref<{cfg.H}x{cfg.N}x{cfg.dtype}>,
+          memref<{cfg.N}x{cfg.dtype}> {{
+      air.segment @decode_segment
+          args(%seg_col_group=%col_group, %seg_in=%launch_in,
+               %seg_w=%launch_w, %seg_out=%launch_out)
+          : index,
+            memref<{cfg.H}x{cfg.dtype}>,
+            memref<{cfg.H}x{cfg.N}x{cfg.dtype}>,
+            memref<{cfg.N}x{cfg.dtype}> {{
+        %c1 = arith.constant 1 : index
+        %c_group = arith.constant {output_group} : index
+        %seg_col = arith.muli %seg_col_group, %c_group : index
+        air.herd @decode_herd
+            tile (%tx, %ty) in (%sx=%c1, %sy=%c1)
+            args(%herd_col=%seg_col, %herd_in=%seg_in,
+                 %herd_w=%seg_w, %herd_out=%seg_out)
+            : index,
+              memref<{cfg.H}x{cfg.dtype}>,
+              memref<{cfg.H}x{cfg.N}x{cfg.dtype}>,
+              memref<{cfg.N}x{cfg.dtype}> {{
+{index_constants}
+          %h_tile_h = arith.constant {effective_tile_h} : index
+          %h_tiles = arith.constant {tile_count} : index
+          %h_group = arith.constant {output_group} : index
+          %h_n = arith.constant {cfg.N} : index
+          %zero_acc_f32 = arith.constant 0.0 : f32
+          %l1_in = memref.alloc() : memref<{effective_tile_h}x{cfg.dtype}, 2>
+          %l1_w = memref.alloc() : memref<{effective_tile_h}x{output_group}x{cfg.dtype}, 2>
+          %l1_out = memref.alloc() : memref<{output_group}x{cfg.dtype}, 2>
+
+{tile_blocks}
+          air.dma_memcpy_nd (%herd_out[%herd_col] [%h_group] [%h1],
+                             %l1_out[%h0] [%h_group] [%h1])
+              : (memref<{cfg.N}x{cfg.dtype}>,
+                 memref<{output_group}x{cfg.dtype}, 2>)
+          air.herd_terminator
+        }}
+        air.segment_terminator
+      }}
+      air.launch_terminator
+    }}
+    return
+  }}
+}}
+"""
+
+
+def _streamed_dense_decode_tile_blocks(
+    *,
+    cfg: LinearKernelConfig,
+    output_group: int,
+    effective_tile_h: int,
+    tile_count: int,
+) -> str:
+    if tile_count > 8:
+        return _streamed_dense_decode_tile_loop(
+            cfg=cfg,
+            output_group=output_group,
+            effective_tile_h=effective_tile_h,
+        )
+    lines: list[str] = []
+    current_acc = ["%zero_acc_f32" for _ in range(output_group)]
+    for tile_idx in range(tile_count):
+        row_base = tile_idx * effective_tile_h
+        lines.extend(
+            [
+                f"          %h_row_{tile_idx} = arith.constant {row_base} : index",
+                "          air.dma_memcpy_nd (%l1_in[%h0] [%h_tile_h] [%h1],",
+                f"                             %herd_in[%h_row_{tile_idx}] [%h_tile_h] [%h1])",
+                f"              : (memref<{effective_tile_h}x{cfg.dtype}, 2>,",
+                f"                 memref<{cfg.H}x{cfg.dtype}, 1>)",
+                "          air.dma_memcpy_nd (%l1_w[%h0, %h0] [%h_tile_h, %h_group] [%h_group, %h1],",
+                f"                             %herd_w[%h_row_{tile_idx}, %h0] [%h_tile_h, %h_group] [%h_group, %h1])",
+                f"              : (memref<{effective_tile_h}x{output_group}x{cfg.dtype}, 2>,",
+                f"                 memref<{cfg.H}x{output_group}x{cfg.dtype}, 1>)",
+            ]
+        )
+        for lane in range(output_group):
+            acc_name = f"%acc{lane}_t{tile_idx}"
+            lines.extend(
+                [
+                    f"          {acc_name} = scf.for %ii{lane}_t{tile_idx} = %h0 to %h_tile_h step %h1 iter_args(%acc = {current_acc[lane]}) -> (f32) {{",
+                    f"            %lhs{lane}_t{tile_idx} = memref.load %l1_in[%ii{lane}_t{tile_idx}] : memref<{effective_tile_h}x{cfg.dtype}, 2>",
+                    f"            %rhs{lane}_t{tile_idx} = memref.load %l1_w[%ii{lane}_t{tile_idx}, %h{lane}] : memref<{effective_tile_h}x{output_group}x{cfg.dtype}, 2>",
+                    f"            %lhs{lane}_f32_t{tile_idx} = arith.extf %lhs{lane}_t{tile_idx} : {cfg.dtype} to f32",
+                    f"            %rhs{lane}_f32_t{tile_idx} = arith.extf %rhs{lane}_t{tile_idx} : {cfg.dtype} to f32",
+                    f"            %prod{lane}_t{tile_idx} = arith.mulf %lhs{lane}_f32_t{tile_idx}, %rhs{lane}_f32_t{tile_idx} : f32",
+                    f"            %next{lane}_t{tile_idx} = arith.addf %acc, %prod{lane}_t{tile_idx} : f32",
+                    f"            scf.yield %next{lane}_t{tile_idx} : f32",
+                    "          }",
+                ]
+            )
+            current_acc[lane] = acc_name
+    for lane, acc_name in enumerate(current_acc):
+        lines.extend(
+            [
+                f"          %sum{lane} = arith.truncf {acc_name} : f32 to {cfg.dtype}",
+                f"          memref.store %sum{lane}, %l1_out[%h{lane}] : memref<{output_group}x{cfg.dtype}, 2>",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _global_dense_decode_tile_blocks(
+    *,
+    cfg: LinearKernelConfig,
+    output_group: int,
+    effective_tile_h: int,
+    tile_count: int,
+) -> str:
+    lines: list[str] = []
+    current_acc = ["%zero_acc_f32" for _ in range(output_group)]
+    for tile_idx in range(tile_count):
+        row_base = tile_idx * effective_tile_h
+        lines.extend(
+            [
+                f"          %h_row_{tile_idx} = arith.constant {row_base} : index",
+                "          air.dma_memcpy_nd (%l1_in[%h0] [%h_tile_h] [%h1],",
+                f"                             %herd_in[%h_row_{tile_idx}] [%h_tile_h] [%h1])",
+                f"              : (memref<{effective_tile_h}x{cfg.dtype}, 2>,",
+                f"                 memref<{cfg.H}x{cfg.dtype}>)",
+                "          air.dma_memcpy_nd (%l1_w[%h0, %h0] [%h_tile_h, %h_group] [%h_group, %h1],",
+                f"                             %herd_w[%h_row_{tile_idx}, %herd_col] [%h_tile_h, %h_group] [%h_n, %h1])",
+                f"              : (memref<{effective_tile_h}x{output_group}x{cfg.dtype}, 2>,",
+                f"                 memref<{cfg.H}x{cfg.N}x{cfg.dtype}>)",
+            ]
+        )
+        for lane in range(output_group):
+            acc_name = f"%gacc{lane}_t{tile_idx}"
+            lines.extend(
+                [
+                    f"          {acc_name} = scf.for %gii{lane}_t{tile_idx} = %h0 to %h_tile_h step %h1 iter_args(%acc = {current_acc[lane]}) -> (f32) {{",
+                    f"            %glhs{lane}_t{tile_idx} = memref.load %l1_in[%gii{lane}_t{tile_idx}] : memref<{effective_tile_h}x{cfg.dtype}, 2>",
+                    f"            %grhs{lane}_t{tile_idx} = memref.load %l1_w[%gii{lane}_t{tile_idx}, %h{lane}] : memref<{effective_tile_h}x{output_group}x{cfg.dtype}, 2>",
+                    f"            %glhs{lane}_f32_t{tile_idx} = arith.extf %glhs{lane}_t{tile_idx} : {cfg.dtype} to f32",
+                    f"            %grhs{lane}_f32_t{tile_idx} = arith.extf %grhs{lane}_t{tile_idx} : {cfg.dtype} to f32",
+                    f"            %gprod{lane}_t{tile_idx} = arith.mulf %glhs{lane}_f32_t{tile_idx}, %grhs{lane}_f32_t{tile_idx} : f32",
+                    f"            %gnext{lane}_t{tile_idx} = arith.addf %acc, %gprod{lane}_t{tile_idx} : f32",
+                    f"            scf.yield %gnext{lane}_t{tile_idx} : f32",
+                    "          }",
+                ]
+            )
+            current_acc[lane] = acc_name
+    for lane, acc_name in enumerate(current_acc):
+        lines.extend(
+            [
+                f"          %gsum{lane} = arith.truncf {acc_name} : f32 to {cfg.dtype}",
+                f"          memref.store %gsum{lane}, %l1_out[%h{lane}] : memref<{output_group}x{cfg.dtype}, 2>",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _streamed_dense_decode_tile_loop(
+    *,
+    cfg: LinearKernelConfig,
+    output_group: int,
+    effective_tile_h: int,
+) -> str:
+    return f"""          %l1_acc = memref.alloc() : memref<{output_group}xf32, 2>
+          scf.for %lane_init = %h0 to %h_group step %h1 {{
+            memref.store %zero_acc_f32, %l1_acc[%lane_init] : memref<{output_group}xf32, 2>
+          }}
+          scf.for %tile = %h0 to %h_tiles step %h1 {{
+            %row_base = arith.muli %tile, %h_tile_h : index
+            air.dma_memcpy_nd (%l1_in[%h0] [%h_tile_h] [%h1],
+                               %herd_in[%row_base] [%h_tile_h] [%h1])
+                : (memref<{effective_tile_h}x{cfg.dtype}, 2>,
+                   memref<{cfg.H}x{cfg.dtype}, 1>)
+            air.dma_memcpy_nd (%l1_w[%h0, %h0] [%h_tile_h, %h_group] [%h_group, %h1],
+                               %herd_w[%row_base, %h0] [%h_tile_h, %h_group] [%h_group, %h1])
+                : (memref<{effective_tile_h}x{output_group}x{cfg.dtype}, 2>,
+                   memref<{cfg.H}x{output_group}x{cfg.dtype}, 1>)
+            scf.for %lane_idx = %h0 to %h_group step %h1 {{
+              %acc_start = memref.load %l1_acc[%lane_idx] : memref<{output_group}xf32, 2>
+              %tile_sum_f32 = scf.for %ii = %h0 to %h_tile_h step %h1 iter_args(%acc = %acc_start) -> (f32) {{
+                %lhs = memref.load %l1_in[%ii] : memref<{effective_tile_h}x{cfg.dtype}, 2>
+                %rhs = memref.load %l1_w[%ii, %lane_idx] : memref<{effective_tile_h}x{output_group}x{cfg.dtype}, 2>
+                %lhs_f32 = arith.extf %lhs : {cfg.dtype} to f32
+                %rhs_f32 = arith.extf %rhs : {cfg.dtype} to f32
+                %prod = arith.mulf %lhs_f32, %rhs_f32 : f32
+                %next = arith.addf %acc, %prod : f32
+                scf.yield %next : f32
+              }}
+              memref.store %tile_sum_f32, %l1_acc[%lane_idx] : memref<{output_group}xf32, 2>
+            }}
+          }}
+          scf.for %lane_out = %h0 to %h_group step %h1 {{
+            %sum_f32 = memref.load %l1_acc[%lane_out] : memref<{output_group}xf32, 2>
+            %sum = arith.truncf %sum_f32 : f32 to {cfg.dtype}
+            memref.store %sum, %l1_out[%lane_out] : memref<{output_group}x{cfg.dtype}, 2>
+          }}"""
+
+
+def decode_gemv_air(
+    cfg: LinearKernelConfig,
+    *,
+    align_output_dma: bool = False,
+    dense_tile_h: int | None = None,
+) -> str:
     output_group = _aligned_decode_output_group(cfg.N) if align_output_dma else 1
+    if dense_tile_h is not None:
+        return _streamed_dense_decode_gemv_air(cfg, output_group, dense_tile_h)
     if output_group > 1:
         return _grouped_decode_gemv_air(cfg, output_group)
     if output_group == 2:
@@ -1019,6 +1362,7 @@ def emit_all_kernels(
     cfg: LinearKernelConfig,
     *,
     align_output_dma: bool = False,
+    dense_decode_tile_h: int | None = None,
     include_decode_int4: bool = False,
     decode_int4_block_size: int = 32,
     decode_int4_quant_axis: int = 0,
@@ -1026,7 +1370,11 @@ def emit_all_kernels(
 ) -> dict[str, str]:
     kernels = {
         "prefill": prefill_gemm_air(cfg, align_output_dma=align_output_dma),
-        "decode": decode_gemv_air(cfg, align_output_dma=align_output_dma),
+        "decode": decode_gemv_air(
+            cfg,
+            align_output_dma=align_output_dma,
+            dense_tile_h=dense_decode_tile_h,
+        ),
     }
     if include_decode_int4:
         kernels["decode_int4"] = decode_int4_gemv_air(
@@ -1062,6 +1410,7 @@ def write_default_air_sources(
     output_dir: Path,
     *,
     align_output_dma: bool = False,
+    dense_decode_tile_h: int | None = None,
     include_decode_int4: bool = False,
     decode_int4_block_size: int = 32,
     decode_int4_quant_axis: int = 0,
@@ -1076,6 +1425,7 @@ def write_default_air_sources(
     sources = emit_all_kernels(
         cfg,
         align_output_dma=align_output_dma,
+        dense_decode_tile_h=dense_decode_tile_h,
         include_decode_int4=include_decode_int4,
         decode_int4_block_size=decode_int4_block_size,
         decode_int4_quant_axis=decode_int4_quant_axis,

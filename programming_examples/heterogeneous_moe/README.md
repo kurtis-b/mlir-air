@@ -52,8 +52,9 @@ Recommended exploration order:
 | LLM-linear int4 decode CPU smoke | `../../sandbox/bin/python run_llm_linear_suite.py --suite tiny_ci --case-filter cpu_only --decode-weight-storage int4 --iterations 1 --warmup 0 --require-correctness` |
 | LLM-linear Milestone 2 direct acceptance | `source /opt/xilinx/xrt/setup.sh && ../../sandbox/bin/python run_llm_linear_milestone2.py` |
 | LLM-linear Milestone 3 int4 hardware acceptance | `source /opt/xilinx/xrt/setup.sh && ../../sandbox/bin/python run_llm_linear_milestone3.py` |
+| LLM-linear Milestone 4 crossover study | `source /opt/xilinx/xrt/setup.sh && ../../sandbox/bin/python run_llm_linear_milestone4.py` |
 
-GPU commands need `LLVM_INSTALL_DIR`, `ROCM_PATH`, and `AIR_OPT_PATH` or matching tools on `PATH`. NPU commands need `AIRCC_PATH`, XRT setup, visible hardware, and explicit `--allow-npu`. The Milestone 2 and Milestone 3 wrappers seed the common local tool paths when they exist and reject direct runs that emit the XRT host-copy fallback warning. See the [exploration guide](docs/exploration.md) for the setup matrix and troubleshooting flow.
+GPU commands need `LLVM_INSTALL_DIR`, `ROCM_PATH`, and `AIR_OPT_PATH` or matching tools on `PATH`. NPU commands need `AIRCC_PATH`, XRT setup, visible hardware, and explicit `--allow-npu`. The Milestone 2, Milestone 3, and Milestone 4 wrappers seed the common local tool paths when they exist and reject direct runs that emit the XRT host-copy fallback warning. See the [exploration guide](docs/exploration.md) for the setup matrix and troubleshooting flow.
 
 LLM-linear Milestone 2 direct GPU/NPU handoff is accepted as of May 3, 2026 for
 the hardware gate. The accepted command is:
@@ -70,6 +71,18 @@ and covers `tiny_ci`, `medium`, and `llm_like` workloads across CPU/GPU/NPU,
 host-mixed, and direct mixed cases with signed int4 decode weights. Accelerator
 decode remains intentionally narrow: signed int4, `quant_axis=0`,
 `H % block_size == 0`, and `N % 8 == 0`.
+
+LLM-linear Milestone 4 final crossover is accepted as of May 4, 2026 for the
+hardware gate. The accepted command is:
+`source /opt/xilinx/xrt/setup.sh && ../../sandbox/bin/python run_llm_linear_milestone4.py`.
+It writes accepted evidence under
+`llm_linear/artifacts/benchmarks/milestone4_crossover/{bf16,int4}` plus a
+top-level summary report at
+`llm_linear/artifacts/benchmarks/milestone4_crossover/report.md`. The final
+crossover result is mixed: BF16 and signed int4 each report 13 wins, 32 losses,
+and 3 inconclusive direct/baseline comparisons. Direct mixed execution wins on
+larger accelerator baselines, but does not establish a universal crossover;
+prefill dominates most direct mixed cases.
 
 ## Key Files
 

@@ -429,11 +429,38 @@ Acceptance:
 
 ### Milestone 4: Final Crossover and Speedup Study
 
-Status as of May 3, 2026: report plumbing is implemented, but the final hardware
-study has not been run after Milestone 2 acceptance.
+Status as of May 4, 2026: accepted for the final LLM-linear crossover hardware
+gate. The accepted command is:
+`source /opt/xilinx/xrt/setup.sh && ../../sandbox/bin/python run_llm_linear_milestone4.py`.
+The accepted output root is
+`llm_linear/artifacts/benchmarks/milestone4_crossover`, with the top-level
+summary in `llm_linear/artifacts/benchmarks/milestone4_crossover/report.md`.
+All required BF16 and signed-int4 cases passed correctness, direct proof
+validation, int4 metadata validation, and fallback-marker rejection.
+
+Final conclusion: direct mixed execution is useful but not universally faster.
+BF16 and signed int4 each classify as 13 wins, 32 losses, and 3 inconclusive
+direct/baseline comparisons. Wins concentrate on larger accelerator baselines;
+tiny shapes and `medium_m8_k512_h512_n256` lose, and CPU-only remains faster for
+the measured shapes. The dominant direct bottleneck is prefill for most direct
+mixed cases: 10 of 12 BF16 direct cases and 8 of 12 int4 direct cases.
 
 Implemented scope:
 
+- `run_llm_linear_milestone4.py` builds
+  `/tmp/libllm_linear_direct_bridge.so` by default, then runs the LLM-linear
+  suite once for `bf16` decode weights and once for signed `int4` decode weights.
+- The wrapper covers `tiny_ci`, `medium`, and `llm_like` across `cpu_only`,
+  `gpu_only`, `npu_only`, both host-staged mixed splits, and both direct-handoff
+  mixed splits.
+- The wrapper uses `--measurement-mode both --iterations 5 --warmup 2`, requires
+  correctness, rejects the known XRT host-copy fallback log markers, validates
+  direct handoff proof fields, validates int4 quantized metadata, and requires
+  crossover rows against CPU-only, GPU-only, NPU-only, and the matching host
+  mixed baseline.
+- Accepted runs write per-storage suite outputs under
+  `llm_linear/artifacts/benchmarks/milestone4_crossover/{bf16,int4}` plus a
+  top-level `report.md` and `milestone4_summary.md`.
 - Suite reports now include a crossover section when audited direct mixed cases
   are present.
 - Speedup rows compare each direct mixed split against CPU-only, GPU-only,
@@ -454,6 +481,10 @@ Checklist:
 
 Acceptance:
 
+- The preferred hardware command is:
+  `source /opt/xilinx/xrt/setup.sh && ../../sandbox/bin/python run_llm_linear_milestone4.py`.
+- The accepted output root must be
+  `llm_linear/artifacts/benchmarks/milestone4_crossover`.
 - Every speedup claim names its baseline and shape range.
 - The final report shows when direct-handoff mixed execution beats GPU-only,
   NPU-only, and host-staged mixed execution.
@@ -487,6 +518,8 @@ For the current checked-in implementation:
   when the hardware acceptance wrapper passes.
 - This file must record the accepted Milestone 3 command, output root, covered
   suites, and date when the int4 hardware acceptance wrapper passes.
+- This file must record the Milestone 4 command, output root, date, and
+  conclusion when the crossover wrapper passes or blocks.
 - Focused CPU-safe checks must pass:
   `../../sandbox/bin/python -m pytest tests/test_llm_linear_*`.
 - Full harness checks should pass when time allows:
@@ -523,6 +556,19 @@ For int4 hardware decode acceptance:
 - int4 dequant+linear correctness must pass before performance claims.
 - Crossover and speedup tables must include CPU-only, iGPU-only, NPU-only,
   host-staged mixed, and direct-handoff mixed baselines.
+
+For final crossover acceptance:
+
+- `../../sandbox/bin/python run_llm_linear_milestone4.py` is the preferred
+  acceptance wrapper. It builds the same bridge, runs `bf16` and signed `int4`
+  suites across `tiny_ci`, `medium`, and `llm_like`, captures logs under
+  `llm_linear/artifacts/benchmarks/milestone4_crossover/logs/`, rejects the
+  known XRT host-copy warning strings, validates direct proof fields, validates
+  int4 decode metadata, and writes the top-level Milestone 4 report.
+- CPU-only int4 decode may report `hardware_fused=false`; GPU and NPU int4
+  decode must report `hardware_fused=true`.
+- Every workload must emit crossover rows for each direct mixed split against
+  CPU-only, iGPU-only, NPU-only, and its matching host-staged mixed baseline.
 
 ## Close-Out Rule
 

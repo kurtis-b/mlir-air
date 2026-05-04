@@ -22,10 +22,12 @@ from trace import TraceRecorder, summarize_device_events
 
 from .compile import (
     ENTRYPOINTS,
+    GPU_DENSE_DECODE_TILE_H,
     compile_npu_stage,
     compile_gpu,
     decode_kernel_key,
     decode_quantization_plan,
+    _npu_dense_decode_tile_metadata,
     resolve_air_sources,
 )
 from .direct_bridge import (
@@ -34,6 +36,7 @@ from .direct_bridge import (
     DirectBridgeProbeReport,
     probe_direct_bridge,
 )
+from .kernels import LinearKernelConfig
 from .manifest import artifact_root
 from .quantization import (
     DecodeHardwareWeightArrays,
@@ -60,6 +63,9 @@ from .transfer import (
     DirectTransferUnsupported,
     LinearTransferManager,
 )
+
+GPU_NATIVE_INT4_DECODE_MAX_H = 11008
+GPU_NATIVE_INT4_DECODE_MAX_N = 4096
 
 
 class CpuLinearExecutor:
@@ -100,6 +106,7 @@ class GpuLinearExecutor:
         dtype_name: str,
         decode_quantized: PackedLinearWeights | None = None,
         kernel_key: str | None = None,
+        shape: tuple[int, int, int, int] | None = None,
     ) -> None:
         self.kind = kind
         self.kernel_key = kernel_key or kind
@@ -109,6 +116,7 @@ class GpuLinearExecutor:
         self.arch = arch
         self.dtype_name = dtype_name
         self.decode_quantized = decode_quantized
+        self.shape = shape
         self.function_name = ENTRYPOINTS[self.kernel_key]
         self._library: _SharedLibraryWrapper | None = None
         self._native_bridge: DirectBridge | None = None
@@ -119,7 +127,9 @@ class GpuLinearExecutor:
             return
         from compile import default_gpu_shared_libs
 
-        if os.environ.get("LLM_LINEAR_DIRECT_BRIDGE_SO"):
+        if os.environ.get("LLM_LINEAR_DIRECT_BRIDGE_SO") and (
+            self.kind == "prefill" or self._uses_native_bridge_for_int4_decode()
+        ):
             try:
                 bridge = DirectBridge()
                 if getattr(bridge, "_gpu_stage_run", None) is not None:
@@ -152,6 +162,8 @@ class GpuLinearExecutor:
     def run(self, *arrays: np.ndarray) -> np.ndarray:
         self.prepare()
         output_shape = _output_shape(self.kind, arrays)
+        if self._uses_tiled_dense_decode(arrays, output_shape):
+            return self._run_decode_dense_tiles(arrays, output_shape)
         output = np.zeros(output_shape, dtype=npu_buffer_dtype(self.dtype_name))
         if self._native_bridge is not None and self._native_artifact is not None:
             encoded_args = _encode_hardware_stage_args(
@@ -190,6 +202,72 @@ class GpuLinearExecutor:
         assert self._library is not None
         self._library.invoke(self.function_name, *descriptors)
         return decode_npu_array(output, self.dtype_name)
+
+    def _uses_native_bridge_for_int4_decode(self) -> bool:
+        if self.kernel_key != "decode_int4":
+            return False
+        if self.shape is None:
+            return False
+        _m, _k, h, n = self.shape
+        return h <= GPU_NATIVE_INT4_DECODE_MAX_H and n <= GPU_NATIVE_INT4_DECODE_MAX_N
+
+    def _uses_tiled_dense_decode(
+        self, arrays: tuple[np.ndarray, ...], output_shape: tuple[int, ...]
+    ) -> bool:
+        return (
+            self.kind == "decode"
+            and self.kernel_key == "decode"
+            and (
+                int(self.artifact.get("tile_h", arrays[0].shape[0]))
+                < int(arrays[0].shape[0])
+                or int(self.artifact.get("tile_n", output_shape[0]))
+                < int(output_shape[0])
+            )
+        )
+
+    def _run_decode_dense_tiles(
+        self, arrays: tuple[np.ndarray, ...], output_shape: tuple[int, ...]
+    ) -> np.ndarray:
+        decode_input, weights = arrays
+        output_dtype = npu_buffer_dtype(self.dtype_name)
+        final_output = np.zeros(output_shape, dtype=np.float32)
+        tile_h = int(self.artifact.get("tile_h", int(decode_input.shape[0])))
+        tile_n = int(self.artifact.get("tile_n", int(output_shape[0])))
+        if tile_h <= 0:
+            raise ValueError("GPU dense decode tile_h must be positive")
+        if tile_n <= 0:
+            raise ValueError("GPU dense decode tile_n must be positive")
+        if int(decode_input.shape[0]) % tile_h != 0:
+            raise ValueError("GPU dense decode requires H divisible by tile_h")
+        if int(output_shape[0]) % tile_n != 0:
+            raise ValueError("GPU dense decode requires N divisible by tile_n")
+        assert self._library is not None
+
+        for start in range(0, int(output_shape[0]), tile_n):
+            accum = np.zeros((tile_n,), dtype=np.float32)
+            for h_start in range(0, int(decode_input.shape[0]), tile_h):
+                h_stop = h_start + tile_h
+                tile_output = np.zeros((tile_n,), dtype=output_dtype)
+                tile_args = [
+                    np.ascontiguousarray(
+                        encode_npu_array(decode_input[h_start:h_stop], self.dtype_name)
+                    ),
+                    np.ascontiguousarray(
+                        encode_npu_array(
+                            weights[h_start:h_stop, start : start + tile_n],
+                            self.dtype_name,
+                        )
+                    ),
+                    tile_output,
+                ]
+                descriptors = [
+                    _ranked_memref_descriptor(encoded) for encoded in tile_args
+                ]
+                self._library.invoke(self.function_name, *descriptors)
+                accum += decode_npu_array(tile_output, self.dtype_name)
+            final_output[start : start + tile_n] = accum
+
+        return final_output
 
 
 class NpuLinearExecutor:
@@ -232,6 +310,17 @@ class NpuLinearExecutor:
         output_shape = _output_shape(self.kind, arrays)
         if self.kind == "prefill" and int(arrays[0].shape[0]) > 1:
             return self._run_prefill_rows(arrays, output_shape)
+        if (
+            self.kind == "decode"
+            and self.kernel_key == "decode"
+            and (
+                int(self.artifact.get("tile_h", arrays[0].shape[0]))
+                < int(arrays[0].shape[0])
+                or int(self.artifact.get("tile_n", output_shape[0]))
+                < int(output_shape[0])
+            )
+        ):
+            return self._run_decode_dense_tiles(arrays, output_shape)
         if (
             self.kind == "decode"
             and self.kernel_key == "decode_int4"
@@ -280,6 +369,45 @@ class NpuLinearExecutor:
 
         return decode_npu_array(final_output, self.dtype_name)
 
+    def _run_decode_dense_tiles(
+        self, arrays: tuple[np.ndarray, ...], output_shape: tuple[int, ...]
+    ) -> np.ndarray:
+        decode_input, weights = arrays
+        output_dtype = npu_buffer_dtype(self.dtype_name)
+        final_output = np.zeros(output_shape, dtype=np.float32)
+        tile_h = int(self.artifact.get("tile_h", int(decode_input.shape[0])))
+        tile_n = int(self.artifact.get("tile_n", output_shape[0]))
+        if tile_h <= 0:
+            raise ValueError("NPU dense decode tile_h must be positive")
+        if tile_n <= 0:
+            raise ValueError("NPU dense decode tile_n must be positive")
+        if int(decode_input.shape[0]) % tile_h != 0:
+            raise ValueError("NPU dense decode requires H divisible by tile_h")
+        if int(output_shape[0]) % tile_n != 0:
+            raise ValueError("NPU dense decode requires N divisible by tile_n")
+
+        for start in range(0, int(output_shape[0]), tile_n):
+            accum = np.zeros((tile_n,), dtype=np.float32)
+            for h_start in range(0, int(decode_input.shape[0]), tile_h):
+                h_stop = h_start + tile_h
+                tile_output = np.zeros((tile_n,), dtype=output_dtype)
+                tile_input = np.ascontiguousarray(
+                    encode_npu_array(decode_input[h_start:h_stop], self.dtype_name)
+                )
+                tile_weights = np.ascontiguousarray(
+                    encode_npu_array(
+                        weights[h_start:h_stop, start : start + tile_n],
+                        self.dtype_name,
+                    )
+                )
+                result = self._invoker(tile_input, tile_weights, tile_output)
+                accum += decode_npu_array(
+                    np.asarray(result[-1]).reshape((tile_n,)), self.dtype_name
+                )
+            final_output[start : start + tile_n] = accum
+
+        return final_output
+
     def _run_decode_int4_tiles(
         self, arrays: tuple[np.ndarray, ...], output_shape: tuple[int, ...]
     ) -> np.ndarray:
@@ -317,6 +445,10 @@ class NpuLinearExecutor:
 class LinearStageExecutors:
     prefill: Any
     decode: Any
+
+
+def kernel_config_from_runtime_cfg(cfg: LinearConfig) -> LinearKernelConfig:
+    return LinearKernelConfig(M=cfg.M, K=cfg.K, H=cfg.H, N=cfg.N, dtype=cfg.dtype)
 
 
 @dataclass(frozen=True)
@@ -481,9 +613,12 @@ class LinearRuntime:
             )
 
         kernel_key = self._kernel_key_for_stage(kind, backend)
-        artifact = self.manifest["artifacts"].get(kernel_key, {}).get(backend, {})
+        artifact = dict(self.manifest["artifacts"].get(kernel_key, {}).get(backend, {}))
         source = self._sources_for(backend)[kernel_key]
         if backend == "gpu":
+            if kernel_key == "decode":
+                artifact.setdefault("tile_h", min(self.cfg.H, GPU_DENSE_DECODE_TILE_H))
+                artifact.setdefault("tile_n", self.cfg.N)
             return GpuLinearExecutor(
                 kind,
                 source,
@@ -493,8 +628,18 @@ class LinearRuntime:
                 self.cfg.dtype,
                 self.weights.decode_quantized if kernel_key == "decode_int4" else None,
                 kernel_key=kernel_key,
+                shape=(self.cfg.M, self.cfg.K, self.cfg.H, self.cfg.N),
             )
         if backend == "npu":
+            if kernel_key == "decode":
+                artifact.update(
+                    {
+                        key: artifact.get(key, value)
+                        for key, value in _npu_dense_decode_tile_metadata(
+                            kernel_config_from_runtime_cfg(self.cfg)
+                        ).items()
+                    }
+                )
             return NpuLinearExecutor(
                 kind,
                 source,
@@ -566,6 +711,11 @@ class LinearRuntime:
                         ENTRYPOINTS[kernel_key],
                         host_staging=False,
                     )
+                if kernel_key == "decode":
+                    artifact_entry["gpu_direct"].setdefault(
+                        "tile_h", min(self.cfg.H, GPU_DENSE_DECODE_TILE_H)
+                    )
+                    artifact_entry["gpu_direct"].setdefault("tile_n", self.cfg.N)
         if stages["prefill"] == "npu" or stages["decode"] == "npu":
             npu_sources = self._sources_for("npu")
             npu_dir = self.artifact_root / "npu"
@@ -581,6 +731,11 @@ class LinearRuntime:
                         npu_dir,
                         compiler_cfg["npu_device"],
                     )
+                if kernel_key == "decode":
+                    for key, value in _npu_dense_decode_tile_metadata(
+                        kernel_config_from_runtime_cfg(self.cfg)
+                    ).items():
+                        artifact_entry["npu"].setdefault(key, value)
 
     def _direct_artifacts(self) -> DirectBridgeArtifacts:
         artifacts = self.manifest.get("artifacts", {})
@@ -593,10 +748,13 @@ class LinearRuntime:
         return DirectBridgeArtifacts(
             gpu_prefill_so=prefill_gpu.get("so"),
             gpu_decode_so=decode_gpu.get("so"),
+            gpu_decode_tile_h=decode_gpu.get("tile_h"),
+            gpu_decode_tile_n=decode_gpu.get("tile_n"),
             npu_prefill_xclbin=prefill_npu.get("xclbin"),
             npu_prefill_insts=prefill_npu.get("insts"),
             npu_decode_xclbin=decode_npu.get("xclbin"),
             npu_decode_insts=decode_npu.get("insts"),
+            npu_decode_tile_h=decode_npu.get("tile_h"),
             npu_decode_tile_n=decode_npu.get("tile_n"),
         )
 

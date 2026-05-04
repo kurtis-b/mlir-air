@@ -107,7 +107,7 @@ from pathlib import Path
 from typing import Any
 
 from llm_linear.compile import populate_artifacts
-from llm_linear.direct_bridge import probe_direct_bridge
+from llm_linear.direct_bridge import cleanup_direct_bridge, probe_direct_bridge
 from llm_linear.manifest import (
     SCHEMA_VERSION,
     apply_case_to_manifest,
@@ -440,6 +440,7 @@ def main(argv: list[str] | None = None) -> int:
 
         save_json(suite_dir / "summary.json", workload_summary)
         summary["workloads"].append(workload_summary)
+        cleanup_direct_bridge()
 
     save_json(output_dir / "summary.json", summary)
     with (output_dir / "summary.csv").open("w", newline="", encoding="utf-8") as handle:

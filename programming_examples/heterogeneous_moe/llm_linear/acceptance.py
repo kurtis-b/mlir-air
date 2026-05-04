@@ -71,7 +71,6 @@ def seed_default_tool_env(env: dict[str, str]) -> None:
     python_paths = [
         path
         for path in (
-            repo / "build" / "python",
             repo / "install-xrt" / "python",
             repo / "build-xrt" / "python",
             repo / "python",
@@ -91,7 +90,16 @@ def shell_command(
 ) -> list[str]:
     argv_command = " ".join(shlex.quote(str(item)) for item in argv)
     if xrt_setup is not None:
-        command = f"source {shlex.quote(str(xrt_setup))} && "
+        command = (
+            'export _MLIR_AIR_SAVED_PATH="${PATH:-}" && '
+            'export _MLIR_AIR_SAVED_PYTHONPATH="${PYTHONPATH:-}" && '
+            f"source {shlex.quote(str(xrt_setup))} && "
+            'if [ -n "${_MLIR_AIR_SAVED_PATH:-}" ]; then '
+            'export PATH="${_MLIR_AIR_SAVED_PATH}:${PATH:-}"; fi && '
+            'if [ -n "${_MLIR_AIR_SAVED_PYTHONPATH:-}" ]; then '
+            'export PYTHONPATH="${_MLIR_AIR_SAVED_PYTHONPATH}:${PYTHONPATH:-}"; '
+            "fi && "
+        )
         if unset_xrt_ld_library_path:
             command += "unset LD_LIBRARY_PATH && "
         command += f"exec {argv_command}"

@@ -30,11 +30,17 @@ ENTRYPOINTS = {
 }
 
 NPU_COMPILE_ARGS = {
+    "decode": ["--air-channel-multiplexing=L1"],
     "decode_int4": ["--air-channel-multiplexing=L1"],
 }
 
 NPU_PREFILL_TILE_H = 512
+NPU_DENSE_DECODE_TILE_H = 256
+NPU_DENSE_DECODE_TILE_N = 256
+NPU_DENSE_DECODE_MAX_OUTER_TILE_H = 4096
 NPU_DECODE_TILE_N = 2048
+GPU_DENSE_DECODE_TILE_H = 256
+GPU_INT4_DECODE_MEMORY_STRATEGY = "streamed_l1"
 
 
 def _npu_source_cfg(cfg: LinearKernelConfig) -> LinearKernelConfig:
@@ -47,6 +53,114 @@ def _npu_decode_source_cfg(cfg: LinearKernelConfig) -> LinearKernelConfig:
     return LinearKernelConfig(
         M=cfg.M, K=cfg.K, H=cfg.H, N=min(cfg.N, NPU_DECODE_TILE_N), dtype=cfg.dtype
     )
+
+
+def _require_dense_decode_tile_shape(
+    cfg: LinearKernelConfig, *, tile_h: int, tile_n: int, backend: str
+) -> None:
+    if tile_h <= 0:
+        raise ValueError(f"{backend} dense decode tile_h must be positive")
+    if tile_n <= 0:
+        raise ValueError(f"{backend} dense decode tile_n must be positive")
+    if cfg.H > tile_h and cfg.H % tile_h != 0:
+        raise ValueError(
+            f"{backend} dense decode requires H divisible by tile_h "
+            "when H exceeds tile_h"
+        )
+    if cfg.N > tile_n and cfg.N % tile_n != 0:
+        raise ValueError(
+            f"{backend} dense decode requires N divisible by tile_n "
+            "when N exceeds tile_n"
+        )
+
+
+def _npu_dense_decode_outer_tile_h(cfg: LinearKernelConfig) -> int:
+    if cfg.H <= NPU_DENSE_DECODE_TILE_H:
+        return cfg.H
+    candidates = []
+    for tile_count in (1, 2, 4, 5, 6, 7, 8, 11, 16, 32, 43):
+        if cfg.H % tile_count == 0:
+            candidate = cfg.H // tile_count
+            if candidate >= NPU_DENSE_DECODE_TILE_H:
+                candidates.append(candidate)
+    bounded = [
+        value for value in candidates if value <= NPU_DENSE_DECODE_MAX_OUTER_TILE_H
+    ]
+    if bounded:
+        return max(bounded)
+    if cfg.H % NPU_DENSE_DECODE_TILE_H == 0:
+        return NPU_DENSE_DECODE_TILE_H
+    raise ValueError(
+        "NPU dense decode requires H to be divisible by a supported outer tile"
+    )
+
+
+def _npu_dense_decode_inner_tile_h(outer_tile_h: int) -> int:
+    if outer_tile_h <= NPU_DENSE_DECODE_TILE_H:
+        return outer_tile_h
+    for tile_count in (4, 5, 6, 7, 8):
+        if outer_tile_h % tile_count == 0:
+            return outer_tile_h // tile_count
+    if outer_tile_h % NPU_DENSE_DECODE_TILE_H == 0:
+        return NPU_DENSE_DECODE_TILE_H
+    raise ValueError("NPU dense decode outer tile requires a supported inner H tile")
+
+
+def _npu_dense_decode_source_cfg(cfg: LinearKernelConfig) -> LinearKernelConfig:
+    outer_tile_h = _npu_dense_decode_outer_tile_h(cfg)
+    _require_dense_decode_tile_shape(
+        cfg,
+        tile_h=outer_tile_h,
+        tile_n=NPU_DENSE_DECODE_TILE_N,
+        backend="NPU",
+    )
+    return LinearKernelConfig(
+        M=cfg.M,
+        K=cfg.K,
+        H=outer_tile_h,
+        N=min(cfg.N, NPU_DENSE_DECODE_TILE_N),
+        dtype=cfg.dtype,
+    )
+
+
+def _gpu_dense_decode_source_cfg(cfg: LinearKernelConfig) -> LinearKernelConfig:
+    _require_dense_decode_tile_shape(
+        cfg,
+        tile_h=GPU_DENSE_DECODE_TILE_H,
+        tile_n=cfg.N,
+        backend="GPU",
+    )
+    return LinearKernelConfig(
+        M=cfg.M,
+        K=cfg.K,
+        H=min(cfg.H, GPU_DENSE_DECODE_TILE_H),
+        N=cfg.N,
+        dtype=cfg.dtype,
+    )
+
+
+def _gpu_dense_decode_tile_metadata(cfg: LinearKernelConfig) -> dict[str, int]:
+    _require_dense_decode_tile_shape(
+        cfg,
+        tile_h=GPU_DENSE_DECODE_TILE_H,
+        tile_n=cfg.N,
+        backend="GPU",
+    )
+    return {"tile_h": min(cfg.H, GPU_DENSE_DECODE_TILE_H), "tile_n": cfg.N}
+
+
+def _npu_dense_decode_tile_metadata(cfg: LinearKernelConfig) -> dict[str, int]:
+    outer_tile_h = _npu_dense_decode_outer_tile_h(cfg)
+    _require_dense_decode_tile_shape(
+        cfg,
+        tile_h=outer_tile_h,
+        tile_n=NPU_DENSE_DECODE_TILE_N,
+        backend="NPU",
+    )
+    return {
+        "tile_h": outer_tile_h,
+        "tile_n": min(cfg.N, NPU_DENSE_DECODE_TILE_N),
+    }
 
 
 def decode_quantization_plan(manifest: dict[str, Any]) -> DecodeQuantizationPlan | None:
@@ -76,10 +190,16 @@ def _write_npu_air_sources(
         prefill_gemm_air(prefill_cfg, align_output_dma=True), encoding="utf-8"
     )
 
-    decode_name = default_air_filenames(cfg)["decode"]
+    dense_decode_cfg = _npu_dense_decode_source_cfg(cfg)
+    decode_name = default_air_filenames(dense_decode_cfg)["decode"]
     paths["decode"] = source_dir / decode_name
     paths["decode"].write_text(
-        decode_gemv_air(cfg, align_output_dma=True), encoding="utf-8"
+        decode_gemv_air(
+            dense_decode_cfg,
+            align_output_dma=True,
+            dense_tile_h=_npu_dense_decode_inner_tile_h(dense_decode_cfg.H),
+        ),
+        encoding="utf-8",
     )
 
     if include_decode_int4:
@@ -98,6 +218,56 @@ def _write_npu_air_sources(
                 quant_axis=quant.quant_axis,
                 align_output_dma=True,
                 memory_strategy="staged_l2",
+            ),
+            encoding="utf-8",
+        )
+    return paths
+
+
+def _write_gpu_air_sources(
+    manifest: dict[str, Any],
+    *,
+    include_decode_int4: bool,
+) -> dict[str, Path]:
+    cfg = kernel_config_from_manifest(manifest)
+    quant = decode_quantization_plan(manifest)
+    source_dir = generated_air_source_root(manifest) / "gpu"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    paths: dict[str, Path] = {}
+
+    prefill_name = default_air_filenames(cfg)["prefill"]
+    paths["prefill"] = source_dir / prefill_name
+    paths["prefill"].write_text(
+        prefill_gemm_air(cfg, align_output_dma=True), encoding="utf-8"
+    )
+
+    dense_decode_cfg = _gpu_dense_decode_source_cfg(cfg)
+    decode_name = default_air_filenames(dense_decode_cfg)["decode"]
+    paths["decode"] = source_dir / decode_name
+    paths["decode"].write_text(
+        decode_gemv_air(
+            dense_decode_cfg,
+            align_output_dma=True,
+            dense_tile_h=GPU_DENSE_DECODE_TILE_H,
+        ),
+        encoding="utf-8",
+    )
+
+    if include_decode_int4:
+        assert quant is not None
+        int4_names = default_air_filenames(
+            cfg,
+            include_decode_int4=True,
+            decode_int4_block_size=quant.block_size,
+        )
+        paths["decode_int4"] = source_dir / int4_names["decode_int4"]
+        paths["decode_int4"].write_text(
+            decode_int4_gemv_air(
+                cfg,
+                block_size=quant.block_size,
+                quant_axis=quant.quant_axis,
+                align_output_dma=True,
+                memory_strategy=GPU_INT4_DECODE_MEMORY_STRATEGY,
             ),
             encoding="utf-8",
         )
@@ -144,6 +314,8 @@ def _write_sources_for_manifest(
     cfg = kernel_config_from_manifest(manifest)
     if backend == "npu":
         return _write_npu_air_sources(manifest, include_decode_int4=include_decode_int4)
+    if backend == "gpu":
+        return _write_gpu_air_sources(manifest, include_decode_int4=include_decode_int4)
     quant = validate_accelerator_decode_plan(
         decode_quantization_plan(manifest), require_int4=True
     )
@@ -156,7 +328,7 @@ def _write_sources_for_manifest(
         decode_int4_block_size=quant.block_size,
         decode_int4_quant_axis=quant.quant_axis,
         decode_int4_memory_strategy=(
-            "streamed_l1" if backend == "gpu" else "staged_l2"
+            GPU_INT4_DECODE_MEMORY_STRATEGY if backend == "gpu" else "staged_l2"
         ),
     )
 
@@ -184,6 +356,8 @@ def resolve_air_sources(
     )
     if backend == "npu":
         names["prefill"] = default_air_filenames(prefill_cfg)["prefill"]
+        dense_decode_cfg = _npu_dense_decode_source_cfg(cfg)
+        names["decode"] = default_air_filenames(dense_decode_cfg)["decode"]
         if include_decode_int4:
             decode_cfg = _npu_decode_source_cfg(cfg)
             names["decode_int4"] = default_air_filenames(
@@ -191,11 +365,14 @@ def resolve_air_sources(
                 include_decode_int4=True,
                 decode_int4_block_size=(32 if quant is None else quant.block_size),
             )["decode_int4"]
+    if backend == "gpu":
+        dense_decode_cfg = _gpu_dense_decode_source_cfg(cfg)
+        names["decode"] = default_air_filenames(dense_decode_cfg)["decode"]
     paths = {key: source_dir / name for key, name in names.items()}
     if not all(path.exists() for path in paths.values()):
         if backend == "npu":
             _write_npu_air_sources(manifest, include_decode_int4=include_decode_int4)
-        elif include_decode_int4:
+        elif backend == "gpu":
             _write_sources_for_manifest(
                 manifest, backend, include_decode_int4=include_decode_int4
             )
@@ -230,15 +407,7 @@ def populate_artifacts(
         }
     source_root = generated_air_source_root(manifest)
     gpu_sources = (
-        write_default_air_sources(
-            cfg,
-            source_root / "gpu",
-            align_output_dma=True,
-            include_decode_int4=include_decode_int4,
-            decode_int4_block_size=(32 if quant is None else quant.block_size),
-            decode_int4_quant_axis=(0 if quant is None else quant.quant_axis),
-            decode_int4_memory_strategy="streamed_l1",
-        )
+        _write_gpu_air_sources(manifest, include_decode_int4=include_decode_int4)
         if any("gpu" in needed for needed in stage_backends.values())
         else {}
     )
@@ -264,6 +433,8 @@ def populate_artifacts(
             )
             if key == "prefill":
                 artifact_entry["npu"]["tile_h"] = min(cfg.H, NPU_PREFILL_TILE_H)
+            if key == "decode":
+                artifact_entry["npu"].update(_npu_dense_decode_tile_metadata(cfg))
             if key == "decode_int4":
                 artifact_entry["npu"]["tile_n"] = min(cfg.N, NPU_DECODE_TILE_N)
         if "gpu" in needed:
@@ -273,6 +444,8 @@ def populate_artifacts(
                 compiler_cfg["gpu_arch"],
                 ENTRYPOINTS[key],
             )
+            if key == "decode":
+                artifact_entry["gpu"].update(_gpu_dense_decode_tile_metadata(cfg))
     return manifest
 
 
@@ -286,14 +459,7 @@ def populate_direct_gpu_artifacts(
     include_decode_int4 = quant is not None
     if include_decode_int4:
         validate_accelerator_decode_plan(quant, require_int4=True)
-    sources = write_default_air_sources(
-        cfg,
-        generated_air_source_root(manifest) / "gpu",
-        include_decode_int4=include_decode_int4,
-        decode_int4_block_size=(32 if quant is None else quant.block_size),
-        decode_int4_quant_axis=(0 if quant is None else quant.quant_axis),
-        decode_int4_memory_strategy="streamed_l1",
-    )
+    sources = _write_gpu_air_sources(manifest, include_decode_int4=include_decode_int4)
     artifact_dir = artifact_root(manifest) / "gpu_direct"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     compiler_cfg = manifest["compiler"]
@@ -307,4 +473,6 @@ def populate_direct_gpu_artifacts(
             ENTRYPOINTS[key],
             host_staging=False,
         )
+        if key == "decode":
+            artifact_entry["gpu_direct"].update(_gpu_dense_decode_tile_metadata(cfg))
     return manifest

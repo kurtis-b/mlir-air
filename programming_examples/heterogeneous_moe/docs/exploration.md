@@ -215,8 +215,25 @@ The wrapper writes accepted evidence under
 bridge, runs `tiny_g2n_direct`, `tiny_n2g_direct`, `medium_g2n_direct`,
 `medium_n2g_direct`, and `medium_host_mixed`, and rejects logs containing the
 known XRT host-copy fallback markers. The accepted medium workload is
-`medium_m8_k512_h512_n256`; the broader `medium` ladder, CPU/GPU/NPU crossover,
-and `llm_like` studies remain future work.
+`medium_m8_k512_h512_n256`.
+
+## LLM-Linear Milestone 4 Crossover Acceptance
+
+The final LLM-linear crossover hardware gate is accepted as of May 4, 2026. Run
+it from `programming_examples/heterogeneous_moe` with:
+
+```bash
+source /opt/xilinx/xrt/setup.sh && ../../sandbox/bin/python run_llm_linear_milestone4.py
+```
+
+The wrapper writes accepted evidence under
+`llm_linear/artifacts/benchmarks/milestone4_crossover`, including per-storage
+BF16 and signed-int4 suite outputs plus the top-level `report.md`. It covers
+`tiny_ci`, `medium`, and `llm_like` across CPU-only, GPU-only, NPU-only,
+host-staged mixed, and audited direct mixed cases. The final report classifies
+both BF16 and int4 as 13 wins, 32 losses, and 3 inconclusive direct/baseline
+comparisons: direct mixed execution helps some larger accelerator baselines, but
+the study does not show a universal crossover.
 
 ## Artifact Hygiene
 

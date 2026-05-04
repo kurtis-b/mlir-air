@@ -34,6 +34,23 @@ def test_linear_air_text_generation(tmp_path: Path) -> None:
     assert "memref<8x3xf16>" in decode
     assert "memref<4x8xf16" in npu_prefill
     assert "memref<8x2xf16" in npu_decode
+    tiled_decode = decode_gemv_air(
+        LinearKernelConfig(M=2, K=4, H=512, N=4, dtype="f16"),
+        align_output_dma=True,
+        dense_tile_h=256,
+    )
+    assert "%h_tile_h = arith.constant 256 : index" in tiled_decode
+    assert "%h_tiles = arith.constant 2 : index" in tiled_decode
+    assert "memref<256xf16, 2>" in tiled_decode
+    assert "memref<256x2xf16, 2>" in tiled_decode
+    assert "memref<512xf16, 2>" not in tiled_decode
+    assert "memref<512x2xf16, 2>" not in tiled_decode
+    with pytest.raises(ValueError, match="H divisible by tile_h"):
+        decode_gemv_air(
+            LinearKernelConfig(M=2, K=4, H=384, N=4, dtype="f16"),
+            align_output_dma=True,
+            dense_tile_h=256,
+        )
     assert set(emit_all_kernels(cfg)) == {"prefill", "decode"}
     int4 = decode_int4_gemv_air(
         LinearKernelConfig(M=2, K=4, H=8, N=8, dtype="f16"),
@@ -98,17 +115,67 @@ def test_linear_compile_populates_artifacts(
             "insts": str(output_dir / f"{source.stem}.insts.bin"),
         }
 
+    def fake_npu_with_args(
+        source: Path, output_dir: Path, device: str, extra_args: list[str]
+    ) -> dict[str, str]:
+        calls.append(("npu", " ".join(extra_args)))
+        return {
+            "xclbin": str(output_dir / f"{source.stem}.xclbin"),
+            "insts": str(output_dir / f"{source.stem}.insts.bin"),
+        }
+
     monkeypatch.setattr(linear_compile, "compile_gpu", fake_gpu)
     monkeypatch.setattr(linear_compile, "compile_npu", fake_npu)
+    monkeypatch.setattr(linear_compile, "compile_npu_with_args", fake_npu_with_args)
     populated = linear_compile.populate_artifacts(manifest, {"gpu", "npu"})
     assert populated["artifacts"]["prefill"]["gpu"]["entry"] == "llm_linear_prefill"
+    assert populated["artifacts"]["decode"]["gpu"]["tile_h"] == 64
+    assert populated["artifacts"]["decode"]["gpu"]["tile_n"] == 32
     assert populated["artifacts"]["decode"]["npu"]["xclbin"].endswith(".xclbin")
+    assert populated["artifacts"]["decode"]["npu"]["tile_h"] == 64
+    assert populated["artifacts"]["decode"]["npu"]["tile_n"] == 32
     assert ("gpu", "llm_linear_decode") in calls
+    assert ("npu", "--air-channel-multiplexing=L1") in calls
 
     sources = linear_compile.resolve_air_sources(manifest, "gpu")
     assert set(sources) == {"prefill", "decode"}
     with pytest.raises(ValueError, match="Unsupported source backend"):
         linear_compile.resolve_air_sources(manifest, "cpu")
+
+
+def test_gpu_dense_decode_source_uses_h_tile(tmp_path: Path, moe_dir: Path) -> None:
+    manifest = load_json(moe_dir / "llm_linear" / "default_linear_manifest.json")
+    manifest["model"].update({"H": 512, "N": 512})
+    manifest["paths"]["artifacts"] = str(tmp_path / "artifacts")
+    manifest["paths"]["generated_air_sources"] = str(tmp_path / "air")
+
+    sources = linear_compile.resolve_air_sources(
+        manifest, "gpu", include_decode_int4=False
+    )
+
+    assert sources["decode"].name == "decode_gemv_h256_n512_bf16.air.mlir"
+    text = sources["decode"].read_text(encoding="utf-8")
+    assert "func.func @llm_linear_decode" in text
+    assert "memref<256x512xbf16>" in text
+    assert "%h_tile_h = arith.constant 256 : index" in text
+    assert "memref<512x2xbf16, 1>" not in text
+
+
+def test_npu_dense_decode_source_uses_n_tile(tmp_path: Path, moe_dir: Path) -> None:
+    manifest = load_json(moe_dir / "llm_linear" / "default_linear_manifest.json")
+    manifest["model"].update({"H": 512, "N": 512})
+    manifest["paths"]["artifacts"] = str(tmp_path / "artifacts")
+    manifest["paths"]["generated_air_sources"] = str(tmp_path / "air")
+
+    sources = linear_compile.resolve_air_sources(
+        manifest, "npu", include_decode_int4=False
+    )
+
+    assert sources["decode"].name == "decode_gemv_h512_n256_bf16.air.mlir"
+    text = sources["decode"].read_text(encoding="utf-8")
+    assert "func.func @llm_linear_decode" in text
+    assert "memref<512x256xbf16>" in text
+    assert "%h_tile_h = arith.constant 128 : index" in text
 
 
 def test_linear_compile_routes_int4_decode_artifacts(

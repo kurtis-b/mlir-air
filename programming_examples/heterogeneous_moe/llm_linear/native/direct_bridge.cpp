@@ -33,6 +33,8 @@
 #include <utility>
 #include <vector>
 
+#include <unistd.h>
+
 extern "C" {
 
 struct LlmLinearDirectRunConfig {
@@ -42,7 +44,7 @@ struct LlmLinearDirectRunConfig {
   uint32_t decode_storage;
   uint32_t decode_block_size;
   uint32_t decode_quant_axis;
-  uint32_t reserved;
+  uint32_t decode_tile_h;
   uint32_t decode_tile_n;
   uint64_t m;
   uint64_t k;
@@ -116,6 +118,7 @@ struct LlmLinearGpuStageRunResult {
 int llm_linear_direct_bridge_probe();
 int llm_linear_direct_bridge_probe_report(char *buffer, uint64_t capacity);
 int llm_linear_direct_bridge_last_error(char *buffer, uint64_t capacity);
+int llm_linear_direct_bridge_cleanup();
 int llm_linear_direct_bridge_run(const LlmLinearDirectRunConfig *config,
                                  LlmLinearDirectRunResult *result);
 int llm_linear_direct_bridge_run_gpu_stage(
@@ -326,6 +329,24 @@ struct HipVmemXrtBuffer {
   HipVmemXrtBuffer(const HipVmemXrtBuffer &) = delete;
   HipVmemXrtBuffer &operator=(const HipVmemXrtBuffer &) = delete;
 
+  ~HipVmemXrtBuffer() {
+    xrt_bo.reset();
+    if (fd >= 0) {
+      (void)close(fd);
+      fd = -1;
+    }
+    if (va) {
+      (void)hipDeviceSynchronize();
+      (void)hipMemUnmap(va, allocation_size);
+      (void)hipMemAddressFree(va, allocation_size);
+      va = 0;
+    }
+    if (handle) {
+      (void)hipMemRelease(handle);
+      handle = {};
+    }
+  }
+
   void *hip_ptr(uint64_t offset = 0) {
     return static_cast<void *>(static_cast<uint8_t *>(va) + offset);
   }
@@ -482,6 +503,21 @@ PooledHipVmemBo acquire_hip_vmem_xrt_bo(const xrt::device &device,
   buffer->in_use = true;
   hip_vmem_pool().push_back(buffer);
   return PooledHipVmemBo(buffer);
+}
+
+void cleanup_hip_vmem_pool() {
+  std::lock_guard<std::mutex> lock(pool_mutex());
+  auto &pool = hip_vmem_pool();
+  for (HipVmemXrtBuffer *buffer : pool) {
+    if (buffer && buffer->in_use)
+      throw std::runtime_error(
+          "cannot cleanup direct bridge pool during a run");
+  }
+  for (HipVmemXrtBuffer *buffer : pool)
+    delete buffer;
+  pool.clear();
+  (void)hipDeviceSynchronize();
+  (void)hipDeviceReset();
 }
 
 template <int Rank>
@@ -850,6 +886,20 @@ size_t elem_size(uint32_t dtype) {
   throw std::runtime_error("unsupported dtype enum in direct bridge");
 }
 
+float bf16_to_float(uint16_t value) {
+  uint32_t bits = static_cast<uint32_t>(value) << 16;
+  float out = 0.0f;
+  std::memcpy(&out, &bits, sizeof(out));
+  return out;
+}
+
+uint16_t float_to_bf16(float value) {
+  uint32_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  bits += 0x7fffU + ((bits >> 16) & 1U);
+  return static_cast<uint16_t>(bits >> 16);
+}
+
 bool decode_is_int4(uint32_t storage) {
   if (storage == kDecodeStorageDense)
     return false;
@@ -867,27 +917,40 @@ struct DecodeLayout {
   uint32_t quant_axis = 0;
   uint64_t block_count = 0;
   uint64_t packed_word_cols = 0;
+  uint64_t tile_h = 0;
   uint64_t tile_n = 0;
 
   size_t dense_weight_bytes() const { return h * n * element_bytes; }
+  size_t dense_tile_bytes() const { return tile_h * tile_n * element_bytes; }
   size_t packed_bytes() const { return h * (n / 2); }
   size_t scale_bytes() const { return block_count * n * sizeof(float); }
   size_t packed_tile_bytes() const { return h * (tile_n / 2); }
   size_t scale_tile_bytes() const {
     return block_count * tile_n * sizeof(float);
   }
+  bool tiled_dense() const { return !int4 && (tile_h < h || tile_n < n); }
   bool tiled_int4() const { return int4 && tile_n < n; }
+  bool tiled_decode() const { return tile_h < h || tile_n < n; }
 };
 
 DecodeLayout make_decode_layout(uint64_t h, uint64_t n, uint32_t dtype,
                                 uint32_t storage, uint32_t block_size,
                                 uint32_t quant_axis,
+                                uint32_t requested_tile_h = 0,
                                 uint32_t requested_tile_n = 0) {
   DecodeLayout layout;
   layout.int4 = decode_is_int4(storage);
   layout.h = h;
   layout.n = n;
   layout.element_bytes = elem_size(dtype);
+  layout.tile_h =
+      std::min<uint64_t>(h, requested_tile_h ? requested_tile_h : h);
+  layout.tile_n =
+      std::min<uint64_t>(n, requested_tile_n ? requested_tile_n : n);
+  if (layout.tile_h == 0 || (h % layout.tile_h) != 0)
+    throw std::runtime_error("direct NPU decode requires H % tile_h == 0");
+  if (layout.tile_n == 0 || (n % layout.tile_n) != 0)
+    throw std::runtime_error("direct NPU decode requires N % tile_n == 0");
   if (!layout.int4)
     return layout;
 
@@ -904,12 +967,22 @@ DecodeLayout make_decode_layout(uint64_t h, uint64_t n, uint32_t dtype,
   layout.quant_axis = quant_axis;
   layout.block_count = h / block_size;
   layout.packed_word_cols = n / 8;
-  layout.tile_n =
-      std::min<uint64_t>(n, requested_tile_n ? requested_tile_n : n);
-  if (layout.tile_n == 0 || (layout.tile_n % 8) != 0 ||
-      (n % layout.tile_n) != 0)
+  if ((layout.tile_n % 8) != 0)
     throw std::runtime_error("int4 direct NPU decode requires N % tile_n == 0");
   return layout;
+}
+
+void stage_decode_dense_weight_tile(const LlmLinearDirectRunConfig &cfg,
+                                    const DecodeLayout &layout,
+                                    uint64_t start_h, uint64_t start_n,
+                                    std::vector<uint8_t> &dst) {
+  const auto *src = static_cast<const uint8_t *>(cfg.decode_weights);
+  for (uint64_t row = 0; row < layout.tile_h; ++row) {
+    const uint8_t *row_src =
+        src + ((start_h + row) * cfg.n + start_n) * layout.element_bytes;
+    uint8_t *row_dst = dst.data() + row * layout.tile_n * layout.element_bytes;
+    std::memcpy(row_dst, row_src, layout.tile_n * layout.element_bytes);
+  }
 }
 
 void stage_decode_int4_packed_tile(const LlmLinearDirectRunConfig &cfg,
@@ -949,7 +1022,7 @@ void validate_config(const LlmLinearDirectRunConfig &cfg) {
     throw std::runtime_error("direct bridge run received zero shape dimension");
   const DecodeLayout layout = make_decode_layout(
       cfg.h, cfg.n, cfg.dtype, cfg.decode_storage, cfg.decode_block_size,
-      cfg.decode_quant_axis, cfg.decode_tile_n);
+      cfg.decode_quant_axis, cfg.decode_tile_h, cfg.decode_tile_n);
   if (layout.int4) {
     if (!cfg.decode_packed_weights || !cfg.decode_scales)
       throw std::runtime_error(
@@ -1016,6 +1089,24 @@ void run_gpu_decode(const LlmLinearDirectRunConfig &cfg,
   auto output_ref = memref1(output->hip_ptr(), static_cast<int64_t>(cfg.n));
   decode(&input_ref, &weight_ref, &output_ref);
   check_hip(hipDeviceSynchronize(), "hipDeviceSynchronize(gpu decode)");
+}
+
+void run_gpu_decode_dense_tile(DecodeFn decode,
+                               const LlmLinearDirectRunConfig &cfg,
+                               const DecodeLayout &layout,
+                               PooledHipVmemBo &handoff,
+                               PooledHipVmemBo &weights,
+                               PooledHipVmemBo &output, uint64_t offset_bytes) {
+  auto input_ref = memref1(handoff->hip_ptr(offset_bytes),
+                           static_cast<int64_t>(layout.tile_h));
+  auto weight_ref =
+      memref2(weights->hip_ptr(), static_cast<int64_t>(layout.tile_h),
+              static_cast<int64_t>(layout.tile_n));
+  auto output_ref =
+      memref1(output->hip_ptr(), static_cast<int64_t>(layout.tile_n));
+  decode(&input_ref, &weight_ref, &output_ref);
+  check_hip(hipDeviceSynchronize(),
+            "hipDeviceSynchronize(gpu dense decode tile)");
 }
 
 void run_gpu_decode_int4(const LlmLinearDirectRunConfig &cfg,
@@ -1103,10 +1194,12 @@ void run_gpu_to_npu(const LlmLinearDirectRunConfig &cfg,
   const size_t handoff_bytes = cfg.m * cfg.h * es;
   const DecodeLayout decode_layout = make_decode_layout(
       cfg.h, cfg.n, cfg.dtype, cfg.decode_storage, cfg.decode_block_size,
-      cfg.decode_quant_axis, cfg.decode_tile_n);
-  const size_t decode_weight_bytes = decode_layout.int4
-                                         ? decode_layout.packed_tile_bytes()
-                                         : decode_layout.dense_weight_bytes();
+      cfg.decode_quant_axis, cfg.decode_tile_h, cfg.decode_tile_n);
+  const size_t decode_weight_bytes =
+      decode_layout.int4
+          ? decode_layout.packed_tile_bytes()
+          : (decode_layout.tiled_dense() ? decode_layout.dense_tile_bytes()
+                                         : decode_layout.dense_weight_bytes());
   const size_t decode_scale_bytes =
       decode_layout.int4 ? decode_layout.scale_tile_bytes() : 0;
   const size_t output_bytes = cfg.n * es;
@@ -1121,11 +1214,11 @@ void run_gpu_to_npu(const LlmLinearDirectRunConfig &cfg,
                            ? acquire_hip_vmem_xrt_bo(device, decode_scale_bytes)
                            : PooledHipVmemBo();
   auto output = acquire_hip_vmem_xrt_bo(
-      device, decode_layout.tiled_int4() ? output_tile_bytes : output_bytes);
+      device, decode_layout.tiled_decode() ? output_tile_bytes : output_bytes);
 
   input->hip_write_host(cfg.input);
   prefill_weights->hip_write_host(cfg.prefill_weights);
-  if (!decode_layout.tiled_int4())
+  if (!decode_layout.tiled_decode())
     decode_weights->xrt_write_host(
         decode_layout.int4 ? cfg.decode_packed_weights : cfg.decode_weights);
   if (decode_layout.int4 && !decode_layout.tiled_int4())
@@ -1135,15 +1228,55 @@ void run_gpu_to_npu(const LlmLinearDirectRunConfig &cfg,
   run_gpu_prefill(cfg, input, prefill_weights, handoff);
   result.prefill_us = now_us() - prefill_start;
   const uint64_t offset = (cfg.m - 1) * cfg.h * es;
-  const size_t decode_input_bytes = cfg.h * es;
+  const size_t full_decode_input_bytes = cfg.h * es;
+  const size_t decode_input_bytes = decode_layout.tiled_dense()
+                                        ? decode_layout.tile_h * es
+                                        : full_decode_input_bytes;
   auto decode_input = acquire_hip_vmem_xrt_bo(device, decode_input_bytes);
-  const uint64_t handoff_start = now_us();
-  copy_gpu_decode_row(handoff, decode_input, decode_input_bytes, offset);
-  decode_input->sync_to_xrt(decode_input_bytes);
-  result.handoff_us = now_us() - handoff_start;
+  if (!decode_layout.tiled_dense()) {
+    const uint64_t handoff_start = now_us();
+    copy_gpu_decode_row(handoff, decode_input, decode_input_bytes, offset);
+    decode_input->sync_to_xrt(decode_input_bytes);
+    result.handoff_us = now_us() - handoff_start;
+  } else {
+    result.handoff_us = 0;
+  }
 
   const uint64_t decode_start = now_us();
-  if (decode_layout.tiled_int4()) {
+  if (decode_layout.tiled_dense()) {
+    if (cfg.dtype != 0)
+      throw std::runtime_error("tiled dense direct NPU decode requires bf16");
+    std::vector<uint8_t> staged_decode_weights(decode_weight_bytes, 0);
+    std::vector<uint8_t> partial_output(output_tile_bytes, 0);
+    std::vector<uint8_t> zero_output(output_tile_bytes, 0);
+    std::vector<float> accum(decode_layout.tile_n, 0.0f);
+    for (uint64_t start_n = 0; start_n < cfg.n;
+         start_n += decode_layout.tile_n) {
+      std::fill(accum.begin(), accum.end(), 0.0f);
+      for (uint64_t start_h = 0; start_h < cfg.h;
+           start_h += decode_layout.tile_h) {
+        const uint64_t handoff_start = now_us();
+        copy_gpu_decode_row(handoff, decode_input, decode_input_bytes,
+                            offset + start_h * es);
+        decode_input->sync_to_xrt(decode_input_bytes);
+        result.handoff_us += now_us() - handoff_start;
+        stage_decode_dense_weight_tile(cfg, decode_layout, start_h, start_n,
+                                       staged_decode_weights);
+        decode_weights->xrt_write_host(staged_decode_weights.data());
+        output->xrt_write_host(zero_output.data());
+        decode_kernel.run3(decode_input, decode_weights, output);
+        output->xrt_read_host(partial_output.data(), output_tile_bytes, 0);
+        const auto *partial =
+            reinterpret_cast<const uint16_t *>(partial_output.data());
+        for (uint64_t lane = 0; lane < decode_layout.tile_n; ++lane)
+          accum[lane] += bf16_to_float(partial[lane]);
+      }
+      auto *dst = reinterpret_cast<uint16_t *>(
+          static_cast<uint8_t *>(cfg.output) + start_n * es);
+      for (uint64_t lane = 0; lane < decode_layout.tile_n; ++lane)
+        dst[lane] = float_to_bf16(accum[lane]);
+    }
+  } else if (decode_layout.tiled_int4()) {
     std::vector<uint8_t> staged_decode_weights(decode_weight_bytes, 0);
     std::vector<uint8_t> staged_decode_scales(decode_scale_bytes, 0);
     for (uint64_t start_n = 0; start_n < cfg.n;
@@ -1166,14 +1299,17 @@ void run_gpu_to_npu(const LlmLinearDirectRunConfig &cfg,
 
   if (cfg.prefill_output)
     handoff->sync_to_xrt(handoff_bytes);
-  if (!decode_layout.tiled_int4())
+  if (!decode_layout.tiled_decode())
     output->xrt_read_host(cfg.output);
   if (cfg.prefill_output)
     handoff->xrt_read_host(cfg.prefill_output);
   if (cfg.decode_input) {
-    decode_input->xrt_read_host(cfg.decode_input);
+    if (decode_layout.tiled_dense())
+      handoff->xrt_read_host(cfg.decode_input, full_decode_input_bytes, offset);
+    else
+      decode_input->xrt_read_host(cfg.decode_input);
   }
-  result.direct_bytes = decode_input_bytes;
+  result.direct_bytes = full_decode_input_bytes;
   result.subview_offset_bytes = offset;
   copy_cstr(result.sync_events, sizeof(result.sync_events),
             "hipDeviceSynchronize:producer=gpu_prefill;"
@@ -1192,15 +1328,18 @@ void run_npu_to_gpu(const LlmLinearDirectRunConfig &cfg,
   const size_t row_input_bytes = cfg.k * es;
   const size_t prefill_weight_tile_bytes = cfg.k * prefill_tile_h * es;
   const size_t handoff_bytes = cfg.m * cfg.h * es;
-  const DecodeLayout decode_layout =
-      make_decode_layout(cfg.h, cfg.n, cfg.dtype, cfg.decode_storage,
-                         cfg.decode_block_size, cfg.decode_quant_axis);
-  const size_t decode_weight_bytes = decode_layout.int4
-                                         ? decode_layout.packed_bytes()
-                                         : decode_layout.dense_weight_bytes();
+  const DecodeLayout decode_layout = make_decode_layout(
+      cfg.h, cfg.n, cfg.dtype, cfg.decode_storage, cfg.decode_block_size,
+      cfg.decode_quant_axis, cfg.decode_tile_h, cfg.decode_tile_n);
+  const size_t decode_weight_bytes =
+      decode_layout.int4
+          ? decode_layout.packed_bytes()
+          : (decode_layout.tiled_dense() ? decode_layout.dense_tile_bytes()
+                                         : decode_layout.dense_weight_bytes());
   const size_t decode_scale_bytes =
       decode_layout.int4 ? decode_layout.scale_bytes() : 0;
   const size_t output_bytes = cfg.n * es;
+  const size_t output_tile_bytes = decode_layout.tile_n * es;
 
   auto &device = prefill_kernel.device();
   auto input = acquire_hip_vmem_xrt_bo(device, row_input_bytes);
@@ -1212,10 +1351,12 @@ void run_npu_to_gpu(const LlmLinearDirectRunConfig &cfg,
   auto decode_scales = decode_layout.int4
                            ? acquire_hip_vmem_xrt_bo(device, decode_scale_bytes)
                            : PooledHipVmemBo();
-  auto output = acquire_hip_vmem_xrt_bo(device, output_bytes);
+  auto output = acquire_hip_vmem_xrt_bo(
+      device, decode_layout.tiled_decode() ? output_tile_bytes : output_bytes);
 
-  decode_weights->hip_write_host(decode_layout.int4 ? cfg.decode_packed_weights
-                                                    : cfg.decode_weights);
+  if (!decode_layout.tiled_decode())
+    decode_weights->hip_write_host(
+        decode_layout.int4 ? cfg.decode_packed_weights : cfg.decode_weights);
   if (decode_layout.int4)
     decode_scales->hip_write_host(cfg.decode_scales);
 
@@ -1254,17 +1395,50 @@ void run_npu_to_gpu(const LlmLinearDirectRunConfig &cfg,
   const uint64_t offset = (cfg.m - 1) * cfg.h * es;
   trace_step("n2g: before gpu decode");
   const uint64_t decode_start = now_us();
-  if (decode_layout.int4)
+  if (decode_layout.tiled_dense()) {
+    if (cfg.dtype != 0)
+      throw std::runtime_error("tiled dense direct GPU decode requires bf16");
+    std::vector<uint8_t> staged_decode_weights(decode_weight_bytes, 0);
+    std::vector<uint8_t> partial_output(output_tile_bytes, 0);
+    std::vector<float> accum(decode_layout.tile_n, 0.0f);
+    SharedLibrary lib(cfg.gpu_decode_so);
+    DecodeFn decode = lib.symbol<DecodeFn>("llm_linear_decode");
+    for (uint64_t start_n = 0; start_n < cfg.n;
+         start_n += decode_layout.tile_n) {
+      std::fill(accum.begin(), accum.end(), 0.0f);
+      for (uint64_t start_h = 0; start_h < cfg.h;
+           start_h += decode_layout.tile_h) {
+        stage_decode_dense_weight_tile(cfg, decode_layout, start_h, start_n,
+                                       staged_decode_weights);
+        decode_weights->hip_write_host(staged_decode_weights.data());
+        run_gpu_decode_dense_tile(decode, cfg, decode_layout, handoff,
+                                  decode_weights, output,
+                                  offset + start_h * es);
+        output->hip_read_host(partial_output.data());
+        const auto *partial =
+            reinterpret_cast<const uint16_t *>(partial_output.data());
+        for (uint64_t lane = 0; lane < decode_layout.tile_n; ++lane)
+          accum[lane] += bf16_to_float(partial[lane]);
+      }
+      auto *dst = reinterpret_cast<uint16_t *>(
+          static_cast<uint8_t *>(cfg.output) + start_n * es);
+      for (uint64_t lane = 0; lane < decode_layout.tile_n; ++lane)
+        dst[lane] = float_to_bf16(accum[lane]);
+    }
+  } else if (decode_layout.int4) {
     run_gpu_decode_int4(cfg, decode_layout, handoff, decode_weights,
                         decode_scales, output, offset);
-  else
+  } else {
     run_gpu_decode(cfg, handoff, decode_weights, output, offset);
+  }
   result.decode_us = now_us() - decode_start;
   trace_step("n2g: after gpu decode");
 
-  trace_step("n2g: before output hip_read_host");
-  output->hip_read_host(cfg.output);
-  trace_step("n2g: after output hip_read_host");
+  if (!decode_layout.tiled_decode()) {
+    trace_step("n2g: before output hip_read_host");
+    output->hip_read_host(cfg.output);
+    trace_step("n2g: after output hip_read_host");
+  }
   if (cfg.prefill_output)
     handoff->hip_read_host(cfg.prefill_output);
   if (cfg.decode_input) {
@@ -1319,6 +1493,17 @@ extern "C" int llm_linear_direct_bridge_last_error(char *buffer,
                                                    uint64_t capacity) {
   copy_cstr(buffer, static_cast<size_t>(capacity), g_last_error);
   return 0;
+}
+
+extern "C" int llm_linear_direct_bridge_cleanup() {
+  try {
+    cleanup_hip_vmem_pool();
+    set_last_error("ok");
+    return 0;
+  } catch (const std::exception &exc) {
+    set_last_error(exc.what());
+    return 1;
+  }
 }
 
 extern "C" int

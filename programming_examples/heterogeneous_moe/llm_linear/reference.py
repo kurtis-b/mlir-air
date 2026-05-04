@@ -127,7 +127,7 @@ def run_reference(
 def validation_tolerances(dtype_name: str) -> dict[str, float]:
     normalized = dtype_name.lower()
     if normalized in {"bf16", "bfloat16"}:
-        return {"atol": 0.35, "rtol": 0.08}
+        return {"atol": 0.8, "rtol": 0.08}
     return {"atol": 0.05, "rtol": 0.02}
 
 

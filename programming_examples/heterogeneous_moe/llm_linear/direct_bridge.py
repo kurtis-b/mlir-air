@@ -251,10 +251,13 @@ class DirectBridgeStatus:
 class DirectBridgeArtifacts:
     gpu_prefill_so: str | None = None
     gpu_decode_so: str | None = None
+    gpu_decode_tile_h: int | None = None
+    gpu_decode_tile_n: int | None = None
     npu_prefill_xclbin: str | None = None
     npu_prefill_insts: str | None = None
     npu_decode_xclbin: str | None = None
     npu_decode_insts: str | None = None
+    npu_decode_tile_h: int | None = None
     npu_decode_tile_n: int | None = None
     npu_kernel_name: str = "MLIR_AIE"
 
@@ -291,7 +294,7 @@ class _NativeRunConfig(ctypes.Structure):
         ("decode_storage", ctypes.c_uint32),
         ("decode_block_size", ctypes.c_uint32),
         ("decode_quant_axis", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint32),
+        ("decode_tile_h", ctypes.c_uint32),
         ("decode_tile_n", ctypes.c_uint32),
         ("m", ctypes.c_uint64),
         ("k", ctypes.c_uint64),
@@ -524,6 +527,18 @@ def probe_direct_bridge() -> DirectBridgeStatus:
     )
 
 
+def cleanup_direct_bridge() -> None:
+    _candidate, library, error = _load_library()
+    if error or library is None:
+        return
+    cleanup = getattr(library, "llm_linear_direct_bridge_cleanup", None)
+    if cleanup is None:
+        return
+    cleanup.restype = ctypes.c_int
+    if int(cleanup()) != 0:
+        raise RuntimeError(_last_error(library) or "direct bridge cleanup failed")
+
+
 class DirectBridge:
     def __init__(self, library_path: str | None = None) -> None:
         candidate, library, error = _load_library(library_path)
@@ -577,6 +592,12 @@ class DirectBridge:
         native_dtype = {"bf16": DTYPE_BF16, "f16": DTYPE_F16}[dtype]
         native_decode_storage = _native_decode_storage(decode_storage)
         m, k, h, n = [int(dim) for dim in shape]
+        if native_direction == GPU_PREFILL_NPU_DECODE:
+            decode_tile_h = int(artifacts.npu_decode_tile_h or h)
+            decode_tile_n = int(artifacts.npu_decode_tile_n or n)
+        else:
+            decode_tile_h = int(artifacts.gpu_decode_tile_h or h)
+            decode_tile_n = int(artifacts.gpu_decode_tile_n or n)
         result = _NativeRunResult()
         config = _NativeRunConfig(
             abi_version=ABI_VERSION,
@@ -585,8 +606,8 @@ class DirectBridge:
             decode_storage=native_decode_storage,
             decode_block_size=int(decode_block_size),
             decode_quant_axis=int(decode_quant_axis),
-            reserved=0,
-            decode_tile_n=int(artifacts.npu_decode_tile_n or n),
+            decode_tile_h=decode_tile_h,
+            decode_tile_n=decode_tile_n,
             m=m,
             k=k,
             h=h,
