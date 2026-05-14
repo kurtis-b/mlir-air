@@ -14,6 +14,7 @@ import compile_llm_linear
 import run_llm_linear_milestone2
 import run_llm_linear_milestone3
 import run_llm_linear_milestone4
+import run_llm_linear_milestone5_accelerator_only
 import run_llm_linear_suite
 from llm_linear.manifest import load_json, resolve_package_path
 from llm_linear.direct_bridge import (
@@ -203,6 +204,68 @@ def _milestone4_result(
     return result
 
 
+def _milestone5_result(
+    case_name: str,
+    *,
+    mean_ms: float,
+    decode_weight_storage: str = "bf16",
+    hardware_fused: bool = True,
+) -> dict[str, object]:
+    result = _milestone4_result(
+        case_name,
+        mean_ms=mean_ms,
+        decode_weight_storage=decode_weight_storage,
+        hardware_fused=hardware_fused,
+    )
+    result["measurement"] = {
+        "runs": {"warm": {"latency_ms": {"mean": mean_ms}, "iterations": 7}}
+    }
+    is_cpu = case_name == "cpu_only"
+    implementation = {"kind": "native_cpu_numpy" if is_cpu else "air_generated"}
+    proof_status = "not_requested" if is_cpu else "valid_device_residency"
+    result["performance_proof"] = {
+        "implementation": implementation,
+        "flops": {"total_flops": 1024},
+        "tensor_bytes": {
+            "logical_total_tensor_bytes": 512,
+            "static_weight_bytes": 256,
+            "per_request_bytes": 128,
+        },
+        "actual_cpu_conversion_bytes": {"total_bytes": 2048 if is_cpu else 0},
+        "cache_fit": {"classification": "fits_l3"},
+        "arithmetic_intensity_flop_per_byte": {"timed_hot_loop_bytes": 8.0},
+        "launches": {"total": 0 if is_cpu else 2},
+        "weight_residency": {
+            "enabled": not is_cpu,
+            "requested": not is_cpu,
+            "valid_device_residency": not is_cpu,
+            "proof_status": proof_status,
+            "timed_weight_upload_bytes": 0,
+            "static_weight_bytes": 256,
+            "resident_by_stage": {
+                "prefill": not is_cpu,
+                "decode": not is_cpu,
+            },
+        },
+        "transfer": {
+            "timed_input_output_bytes": 128,
+            "timed_intermediate_host_transfer_bytes": 0,
+            "full_prefill_semantics_preserved": True,
+        },
+        "overheads": {
+            "host_accumulation_bytes": 0,
+            "kernel_run_launch_count": 0 if is_cpu else 2,
+            "timed_allocation_count": 0,
+            "compile_load_excluded": True,
+        },
+        "counters": {"perf": {"available": False, "captured": False}},
+        "cpu_native": {"isa_flags": ["avx2"], "threads": {}} if is_cpu else None,
+        "physical_plausibility": {"status": "not_evaluated"},
+    }
+    result["implementation"] = implementation
+    return result
+
+
 def _write_milestone4_output(
     output_dir: Path, *, decode_weight_storage: str = "bf16"
 ) -> dict[str, object]:
@@ -302,6 +365,161 @@ def test_linear_runtime_quantized_decode_schema(moe_dir: Path, tmp_path: Path) -
     assert last_run["numpy_validation"]["status"] == "pass"
     assert last_run["quantized_decode"]["enabled"] is True
     assert last_run["quantized_decode"]["detail"]["dequant_ms"] >= 0.0
+
+
+def test_linear_runtime_rejects_numpy_only_resident_weight_claims(
+    monkeypatch, moe_dir: Path, tmp_path: Path
+) -> None:
+    manifest = _tiny_cpu_manifest(moe_dir, tmp_path)
+    manifest["runtime"]["stage_backends"] = {"prefill": "gpu", "decode": "gpu"}
+    manifest["runtime"]["resident_weights"] = True
+
+    class FakeGpuLinear:
+        def __init__(
+            self,
+            kind,
+            source,
+            artifact,
+            artifact_root_path,
+            arch,
+            dtype_name,
+            decode_quantized=None,
+            kernel_key=None,
+            shape=None,
+        ):
+            self.kind = kind
+            self.dtype_name = dtype_name
+            self.last_quantized_detail = None
+
+        def prepare(self):
+            pass
+
+        def run(self, *arrays):
+            if self.kind == "prefill":
+                return prefill_gemm(arrays[0], arrays[1], self.dtype_name)
+            return decode_gemv(arrays[0], arrays[1], self.dtype_name)
+
+    import llm_linear.runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "GpuLinearExecutor", FakeGpuLinear)
+    with LinearRuntime(manifest) as runtime:
+        runtime.prepare()
+        inputs = random_inputs(runtime.cfg, seed=manifest["inputs"]["seed"])
+        timing = benchmark_runtime(
+            runtime, inputs, iterations=1, warmup=0, measurement_mode="warm"
+        )
+        last_run, validation_ms = validate_runtime(runtime, inputs)
+    labels = {event["label"] for event in last_run["transfer_events"]}
+    assert "prefill_weights_to_backend" in labels
+    assert "decode_weights_to_backend" in labels
+    assert "decode_input_to_backend" in labels
+    assert last_run["resident_weights"]["requested"] is True
+    assert last_run["resident_weights"]["enabled"] is False
+    assert last_run["resident_weights"]["proof_status"] == "invalid_or_unavailable"
+
+    result = build_case_result(
+        metadata={"command_line": ["test"]},
+        case_name="gpu_only",
+        manifest=manifest,
+        iterations=1,
+        requested_warmup=0,
+        measurement_mode="warm",
+        timing=timing,
+        last_run=last_run,
+        validation_ms=validation_ms,
+        phase_timings_ms={"compile_load_setup_ms": 0.0},
+        suite="tiny_ci",
+        workload_name="unit",
+    )
+    proof = result["performance_proof"]
+    assert proof["weight_residency"]["valid_device_residency"] is False
+    assert proof["weight_residency"]["timed_weight_upload_bytes"] > 0
+    assert proof["transfer"]["timed_intermediate_host_transfer_bytes"] > 0
+    assert proof["transfer"]["resident_same_backend_decode_row"] is False
+
+
+def test_linear_runtime_verified_resident_weights_exclude_timed_uploads(
+    monkeypatch, moe_dir: Path, tmp_path: Path
+) -> None:
+    manifest = _tiny_cpu_manifest(moe_dir, tmp_path)
+    manifest["runtime"]["stage_backends"] = {"prefill": "gpu", "decode": "gpu"}
+    manifest["runtime"]["resident_weights"] = True
+
+    class FakeGpuLinear:
+        def __init__(
+            self,
+            kind,
+            source,
+            artifact,
+            artifact_root_path,
+            arch,
+            dtype_name,
+            decode_quantized=None,
+            kernel_key=None,
+            shape=None,
+        ):
+            self.kind = kind
+            self.dtype_name = dtype_name
+            self.last_quantized_detail = None
+            self.last_host_accumulation_bytes = 0
+            self.prepare_static_calls = 0
+
+        def prepare(self):
+            pass
+
+        def prepare_static_weights(self, *arrays):
+            self.prepare_static_calls += 1
+            return {
+                "args": arrays,
+                "device_resident": True,
+                "storage_kind": "hip_device_allocation",
+                "static_upload_bytes": sum(array.nbytes for array in arrays),
+            }
+
+        def run(self, *arrays):
+            if self.kind == "prefill":
+                return prefill_gemm(arrays[0], arrays[1], self.dtype_name)
+            return decode_gemv(arrays[0], arrays[1], self.dtype_name)
+
+    import llm_linear.runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "GpuLinearExecutor", FakeGpuLinear)
+    with LinearRuntime(manifest) as runtime:
+        runtime.prepare()
+        assert runtime.executors.prefill.prepare_static_calls == 1
+        assert runtime.executors.decode.prepare_static_calls == 1
+        runtime.prepare()
+        assert runtime.executors.prefill.prepare_static_calls == 1
+        assert runtime.executors.decode.prepare_static_calls == 1
+        inputs = random_inputs(runtime.cfg, seed=manifest["inputs"]["seed"])
+        timing = benchmark_runtime(
+            runtime, inputs, iterations=1, warmup=0, measurement_mode="warm"
+        )
+        last_run, validation_ms = validate_runtime(runtime, inputs)
+    labels = {event["label"] for event in last_run["transfer_events"]}
+    assert "prefill_weights_to_backend" not in labels
+    assert "decode_weights_to_backend" not in labels
+    assert "decode_input_to_backend" not in labels
+    assert last_run["resident_weights"]["enabled"] is True
+
+    result = build_case_result(
+        metadata={"command_line": ["test"]},
+        case_name="gpu_only",
+        manifest=manifest,
+        iterations=1,
+        requested_warmup=0,
+        measurement_mode="warm",
+        timing=timing,
+        last_run=last_run,
+        validation_ms=validation_ms,
+        phase_timings_ms={"compile_load_setup_ms": 0.0},
+        suite="tiny_ci",
+        workload_name="unit",
+    )
+    proof = result["performance_proof"]
+    assert proof["weight_residency"]["timed_weight_upload_bytes"] == 0
+    assert proof["transfer"]["timed_intermediate_host_transfer_bytes"] == 0
+    assert proof["transfer"]["resident_same_backend_decode_row"] is True
 
 
 def test_linear_runtime_gpu_quantized_decode_receives_packed_buffers(
@@ -411,6 +629,48 @@ def test_npu_prefill_executor_stages_multirow_inputs(tmp_path: Path) -> None:
     for row, staged in enumerate(staged_rows):
         assert staged.shape == (1, inputs.shape[1])
         np.testing.assert_allclose(staged[0, :], inputs[row, :])
+
+
+def test_gpu_prefill_executor_stages_multirow_inputs(tmp_path: Path) -> None:
+    executor = GpuLinearExecutor(
+        "prefill",
+        Path("unused.mlir"),
+        {"source_m": 1},
+        tmp_path,
+        "gfx1150",
+        "bf16",
+    )
+    staged_inputs: list[np.ndarray] = []
+
+    def descriptor_array(descriptor):
+        shape = tuple(int(dim) for dim in descriptor.shape)
+        return np.ctypeslib.as_array(descriptor.aligned, shape=shape)
+
+    class FakeLibrary:
+        def invoke(self, function_name, input_desc, weight_desc, output_desc):
+            assert function_name == "llm_linear_prefill"
+            decoded_input = decode_npu_array(descriptor_array(input_desc), "bf16")
+            decoded_weights = decode_npu_array(descriptor_array(weight_desc), "bf16")
+            staged_inputs.append(decoded_input.copy())
+            partial = decoded_input.astype(np.float32) @ decoded_weights.astype(
+                np.float32
+            )
+            descriptor_array(output_desc)[...] = encode_npu_array(partial, "bf16")
+
+    executor._library = FakeLibrary()
+    inputs = np.asarray(
+        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
+        dtype=np.float32,
+    )
+    weights = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+
+    output = executor.run(inputs, weights)
+
+    assert len(staged_inputs) == inputs.shape[0]
+    for row, staged in enumerate(staged_inputs):
+        assert staged.shape == (1, inputs.shape[1])
+        np.testing.assert_allclose(staged[0, :], inputs[row, :])
+    np.testing.assert_allclose(output, inputs @ weights)
 
 
 def test_npu_dense_decode_executor_tiles_weight_columns(tmp_path: Path) -> None:
@@ -1113,6 +1373,77 @@ def test_milestone4_wrapper_commands_and_summary_report(tmp_path: Path) -> None:
     assert "Baseline" in report
     assert "Classification" in report
     assert "wins" in report
+
+
+def test_milestone5_verifier_speedup_residency_and_falsification() -> None:
+    cases = {
+        "cpu_only": _milestone5_result("cpu_only", mean_ms=12.0),
+        "gpu_only": _milestone5_result("gpu_only", mean_ms=8.0),
+        "npu_only": _milestone5_result("npu_only", mean_ms=9.0),
+    }
+    assert (
+        run_llm_linear_milestone5_accelerator_only.validate_result_payload(
+            cases["gpu_only"], decode_weight_storage="bf16"
+        )
+        == []
+    )
+    assert run_llm_linear_milestone5_accelerator_only.validate_speedups(cases) == []
+
+    slow = copy.deepcopy(cases)
+    slow["gpu_only"]["measurement"]["runs"]["warm"]["latency_ms"]["mean"] = 11.0
+    errors = run_llm_linear_milestone5_accelerator_only.validate_speedups(slow)
+    assert any("below" in message for message in errors)
+    slow["gpu_only"]["falsification"] = {
+        "status": "falsified",
+        "evidence": {"roofline": "native CPU ceiling exceeds accelerator ceiling"},
+    }
+    assert run_llm_linear_milestone5_accelerator_only.validate_speedups(slow) == []
+
+    stale = copy.deepcopy(cases["npu_only"])
+    stale["performance_proof"]["weight_residency"]["timed_weight_upload_bytes"] = 4
+    assert any(
+        "timed_weight_upload_bytes" in message
+        for message in run_llm_linear_milestone5_accelerator_only.validate_result_payload(
+            stale, decode_weight_storage="bf16"
+        )
+    )
+
+
+def test_milestone5_wrapper_command_and_report(tmp_path: Path) -> None:
+    run = run_llm_linear_milestone5_accelerator_only.ACCEPTANCE_RUNS[1]
+    argv = run.case_argv(
+        Path("python"),
+        "root",
+        suite="medium",
+        workload="medium_m8",
+        case="gpu_only",
+    )
+    assert argv[:3] == ["python", "run_llm_linear_suite.py", "--suite"]
+    assert argv[argv.index("--suite") + 1] == "medium"
+    assert "--resident-weights" in argv
+    assert argv[argv.index("--measurement-mode") + 1] == "warm"
+    assert argv[argv.index("--case-filter") + 1] == "gpu_only"
+    assert argv[argv.index("--output-dir") + 1].endswith("root/int4")
+
+    summary = {
+        "workloads": [
+            {
+                "suite": "medium",
+                "name": "unit",
+                "cases": [
+                    _milestone5_result("cpu_only", mean_ms=12.0),
+                    _milestone5_result("gpu_only", mean_ms=8.0),
+                    _milestone5_result("npu_only", mean_ms=9.0),
+                ],
+            }
+        ]
+    }
+    report = run_llm_linear_milestone5_accelerator_only.milestone5_summary_markdown(
+        {"bf16": summary}, tmp_path
+    )
+    assert "Milestone 5" in report
+    assert "gpu_only" in report
+    assert "pass" in report
 
 
 def test_compile_llm_linear_cli(monkeypatch, tmp_path: Path) -> None:

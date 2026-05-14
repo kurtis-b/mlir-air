@@ -248,6 +248,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Override transfer mode for all selected cases.",
     )
     parser.add_argument(
+        "--resident-weights",
+        action="store_true",
+        help=(
+            "Prepare static prefill/decode weights before timed iterations and "
+            "measure only per-request inputs, intermediate compute, and final outputs."
+        ),
+    )
+    parser.add_argument(
         "--decode-weight-storage",
         choices=["bf16", "int4", "uint4"],
         default="bf16",
@@ -289,6 +297,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     base_manifest = load_json(resolve_package_path(args.manifest))
+    if args.resident_weights:
+        base_manifest.setdefault("runtime", {})["resident_weights"] = True
     if args.decode_weight_storage != "bf16":
         base_manifest.setdefault("weights", {})["decode"] = {
             "storage": args.decode_weight_storage,

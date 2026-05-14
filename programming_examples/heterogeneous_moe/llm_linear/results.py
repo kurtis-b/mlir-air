@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 
 from .manifest import SCHEMA_VERSION
+from .performance import build_performance_proof
 from .reference import config_from_manifest, random_inputs, workload_bytes
 
 CSV_FIELDNAMES = [
@@ -42,6 +43,22 @@ CSV_FIELDNAMES = [
     "decode_linear_ms",
     "packed_weight_bytes_read",
     "scale_bytes_read",
+    "implementation_kind",
+    "total_flops",
+    "logical_tensor_bytes",
+    "actual_cpu_conversion_bytes",
+    "cache_fit",
+    "arithmetic_intensity_flop_per_byte",
+    "launch_count",
+    "residency_proof_status",
+    "valid_device_residency",
+    "resident_weight_bytes",
+    "timed_weight_upload_bytes",
+    "timed_input_output_transfer_bytes",
+    "timed_intermediate_host_transfer_bytes",
+    "intermediate_residency",
+    "timed_allocation_count",
+    "host_accumulation_bytes",
 ]
 
 
@@ -79,6 +96,9 @@ def _percentile(ordered: list[float], percentile: float) -> float:
 
 
 def _timed_run(runtime: Any, inputs: np.ndarray) -> dict[str, float]:
+    run_hot = getattr(runtime, "run_hot", None)
+    if run_hot is not None:
+        return run_hot(inputs)["timing_ms"]
     return runtime.run(inputs, validate=False, capture_details=False)["timing_ms"]
 
 
@@ -249,6 +269,11 @@ def build_case_result(
     cfg = config_from_manifest(manifest)
     stage_backends = dict(manifest["runtime"]["stage_backends"])
     transfer_summary = last_run["transfer_summary"]
+    performance_proof = build_performance_proof(
+        cfg=cfg,
+        manifest=manifest,
+        last_run=last_run,
+    )
     measurement = benchmark_measurement_block(
         measurement_mode=measurement_mode,
         iterations=iterations,
@@ -261,6 +286,7 @@ def build_case_result(
     return {
         "schema_version": SCHEMA_VERSION,
         "metadata": metadata,
+        "implementation": performance_proof["implementation"],
         "suite": suite,
         "workload_name": workload_name,
         "case_name": case_name,
@@ -312,9 +338,13 @@ def build_case_result(
             "static_tensor_bytes": workload_bytes(cfg),
             "compile_load_excluded": True,
         },
+        "performance_proof": performance_proof,
         "transfer_events": last_run["transfer_events"],
         "transfer_summary": transfer_summary,
         "quantized_decode": last_run.get("quantized_decode", {"enabled": False}),
+        "resident_weights": last_run.get(
+            "resident_weights", {"enabled": False, "timed_weight_restaging": True}
+        ),
         "trace_summary": last_run["trace_summary"],
         "device_events": last_run["device_events"],
         "direct_bridge": last_run.get("direct_bridge"),
@@ -338,6 +368,17 @@ def result_csv_row(result: dict[str, Any]) -> dict[str, Any]:
     quantized = result.get("quantized_decode", {})
     quant_detail = quantized.get("detail") or {}
     quant_metadata = quantized.get("metadata") or {}
+    proof = result.get("performance_proof", {})
+    implementation = result.get("implementation", {}) or proof.get("implementation", {})
+    flops = proof.get("flops", {})
+    tensor_bytes = proof.get("tensor_bytes", {})
+    conversion = proof.get("actual_cpu_conversion_bytes", {})
+    cache_fit = proof.get("cache_fit", {})
+    intensity = proof.get("arithmetic_intensity_flop_per_byte", {})
+    launches = proof.get("launches", {})
+    residency = proof.get("weight_residency", {})
+    proof_transfer = proof.get("transfer", {})
+    overheads = proof.get("overheads", {})
     shape = result["shape"]
     return {
         "suite": result.get("suite"),
@@ -377,4 +418,24 @@ def result_csv_row(result: dict[str, Any]) -> dict[str, Any]:
         or quantized.get("packed_bytes"),
         "scale_bytes_read": quant_detail.get("scale_bytes_read")
         or quantized.get("scale_bytes"),
+        "implementation_kind": implementation.get("kind"),
+        "total_flops": flops.get("total_flops"),
+        "logical_tensor_bytes": tensor_bytes.get("logical_total_tensor_bytes"),
+        "actual_cpu_conversion_bytes": conversion.get("total_bytes"),
+        "cache_fit": cache_fit.get("classification"),
+        "arithmetic_intensity_flop_per_byte": intensity.get("timed_hot_loop_bytes"),
+        "launch_count": launches.get("total"),
+        "residency_proof_status": residency.get("proof_status"),
+        "valid_device_residency": residency.get("valid_device_residency"),
+        "resident_weight_bytes": residency.get("static_weight_bytes"),
+        "timed_weight_upload_bytes": residency.get("timed_weight_upload_bytes"),
+        "timed_input_output_transfer_bytes": proof_transfer.get(
+            "timed_input_output_bytes"
+        ),
+        "timed_intermediate_host_transfer_bytes": proof_transfer.get(
+            "timed_intermediate_host_transfer_bytes"
+        ),
+        "intermediate_residency": proof_transfer.get("intermediate_residency"),
+        "timed_allocation_count": overheads.get("timed_allocation_count"),
+        "host_accumulation_bytes": overheads.get("host_accumulation_bytes"),
     }

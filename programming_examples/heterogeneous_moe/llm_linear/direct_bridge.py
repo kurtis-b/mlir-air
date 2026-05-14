@@ -286,6 +286,25 @@ class GpuStageRunResult:
     diagnostic: str
 
 
+@dataclass(frozen=True)
+class ResidentPipelinePrepareResult:
+    handle: int
+    storage_kind: str
+    static_upload_bytes: int
+    diagnostic: str
+
+
+@dataclass(frozen=True)
+class ResidentPipelineRunResult:
+    prefill_ms: float
+    decode_ms: float
+    input_upload_ms: float
+    output_readback_ms: float
+    launch_count: int
+    timed_allocation_count: int
+    diagnostic: str
+
+
 class _NativeRunConfig(ctypes.Structure):
     _fields_ = [
         ("abi_version", ctypes.c_uint32),
@@ -372,11 +391,88 @@ class _NativeGpuStageRunResult(ctypes.Structure):
     ]
 
 
+class _NativeResidentPipelinePrepareConfig(ctypes.Structure):
+    _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("backend", ctypes.c_uint32),
+        ("dtype", ctypes.c_uint32),
+        ("decode_storage", ctypes.c_uint32),
+        ("decode_block_size", ctypes.c_uint32),
+        ("decode_quant_axis", ctypes.c_uint32),
+        ("gpu_decode_tile_h", ctypes.c_uint32),
+        ("gpu_decode_tile_n", ctypes.c_uint32),
+        ("npu_decode_tile_h", ctypes.c_uint32),
+        ("npu_decode_tile_n", ctypes.c_uint32),
+        ("m", ctypes.c_uint64),
+        ("k", ctypes.c_uint64),
+        ("h", ctypes.c_uint64),
+        ("n", ctypes.c_uint64),
+        ("decode_packed_bytes", ctypes.c_uint64),
+        ("decode_scale_bytes", ctypes.c_uint64),
+        ("prefill_weights", ctypes.c_void_p),
+        ("decode_weights", ctypes.c_void_p),
+        ("decode_packed_weights", ctypes.c_void_p),
+        ("decode_scales", ctypes.c_void_p),
+        ("gpu_prefill_so", ctypes.c_char_p),
+        ("gpu_decode_so", ctypes.c_char_p),
+        ("npu_prefill_xclbin", ctypes.c_char_p),
+        ("npu_prefill_insts", ctypes.c_char_p),
+        ("npu_decode_xclbin", ctypes.c_char_p),
+        ("npu_decode_insts", ctypes.c_char_p),
+        ("npu_kernel_name", ctypes.c_char_p),
+    ]
+
+
+class _NativeResidentPipelinePrepareResult(ctypes.Structure):
+    _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("reserved0", ctypes.c_uint32),
+        ("reserved1", ctypes.c_uint32),
+        ("reserved2", ctypes.c_uint32),
+        ("handle", ctypes.c_uint64),
+        ("static_upload_bytes", ctypes.c_uint64),
+        ("storage_kind", ctypes.c_char * 64),
+        ("diagnostic", ctypes.c_char * 512),
+    ]
+
+
+class _NativeResidentPipelineRunConfig(ctypes.Structure):
+    _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("capture_details", ctypes.c_uint32),
+        ("reserved0", ctypes.c_uint32),
+        ("reserved1", ctypes.c_uint32),
+        ("handle", ctypes.c_uint64),
+        ("input", ctypes.c_void_p),
+        ("output", ctypes.c_void_p),
+        ("prefill_output", ctypes.c_void_p),
+        ("decode_input", ctypes.c_void_p),
+    ]
+
+
+class _NativeResidentPipelineRunResult(ctypes.Structure):
+    _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("reserved0", ctypes.c_uint32),
+        ("reserved1", ctypes.c_uint32),
+        ("reserved2", ctypes.c_uint32),
+        ("prefill_us", ctypes.c_uint64),
+        ("decode_us", ctypes.c_uint64),
+        ("input_upload_us", ctypes.c_uint64),
+        ("output_readback_us", ctypes.c_uint64),
+        ("launch_count", ctypes.c_uint64),
+        ("timed_allocation_count", ctypes.c_uint64),
+        ("diagnostic", ctypes.c_char * 512),
+    ]
+
+
 ABI_VERSION = 2
 GPU_PREFILL_NPU_DECODE = 0
 NPU_PREFILL_GPU_DECODE = 1
 GPU_STAGE_PREFILL = 0
 GPU_STAGE_DECODE = 1
+RESIDENT_BACKEND_GPU = 0
+RESIDENT_BACKEND_NPU = 1
 DTYPE_BF16 = 0
 DTYPE_F16 = 1
 DECODE_STORAGE_DENSE = 0
@@ -565,6 +661,30 @@ class DirectBridge:
                 ctypes.POINTER(_NativeGpuStageRunResult),
             ]
             self._gpu_stage_run.restype = ctypes.c_int
+        self._prepare_resident_pipeline = getattr(
+            library, "llm_linear_direct_bridge_prepare_resident_pipeline", None
+        )
+        if self._prepare_resident_pipeline is not None:
+            self._prepare_resident_pipeline.argtypes = [
+                ctypes.POINTER(_NativeResidentPipelinePrepareConfig),
+                ctypes.POINTER(_NativeResidentPipelinePrepareResult),
+            ]
+            self._prepare_resident_pipeline.restype = ctypes.c_int
+        self._run_resident_pipeline = getattr(
+            library, "llm_linear_direct_bridge_run_resident_pipeline", None
+        )
+        if self._run_resident_pipeline is not None:
+            self._run_resident_pipeline.argtypes = [
+                ctypes.POINTER(_NativeResidentPipelineRunConfig),
+                ctypes.POINTER(_NativeResidentPipelineRunResult),
+            ]
+            self._run_resident_pipeline.restype = ctypes.c_int
+        self._release_resident_pipeline = getattr(
+            library, "llm_linear_direct_bridge_release_resident_pipeline", None
+        )
+        if self._release_resident_pipeline is not None:
+            self._release_resident_pipeline.argtypes = [ctypes.c_uint64]
+            self._release_resident_pipeline.restype = ctypes.c_int
 
     def run(
         self,
@@ -707,6 +827,131 @@ class DirectBridge:
             stage_ms=float(result.stage_us) / 1000.0,
             diagnostic=diagnostic or "ok",
         )
+
+    def prepare_resident_pipeline(
+        self,
+        *,
+        backend: str,
+        dtype: str,
+        shape: tuple[int, int, int, int],
+        prefill_weights: Any,
+        decode_weights: Any | None,
+        decode_packed_weights: Any | None = None,
+        decode_scales: Any | None = None,
+        artifacts: DirectBridgeArtifacts,
+        decode_storage: str = "dense",
+        decode_block_size: int = 0,
+        decode_quant_axis: int = 0,
+    ) -> ResidentPipelinePrepareResult:
+        if self._prepare_resident_pipeline is None:
+            raise RuntimeError(
+                "direct bridge library is missing "
+                "llm_linear_direct_bridge_prepare_resident_pipeline"
+            )
+        native_backend = {
+            "gpu": RESIDENT_BACKEND_GPU,
+            "npu": RESIDENT_BACKEND_NPU,
+        }[backend]
+        native_dtype = {"bf16": DTYPE_BF16, "f16": DTYPE_F16}[dtype]
+        native_decode_storage = _native_decode_storage(decode_storage)
+        m, k, h, n = [int(dim) for dim in shape]
+        result = _NativeResidentPipelinePrepareResult()
+        config = _NativeResidentPipelinePrepareConfig(
+            abi_version=ABI_VERSION,
+            backend=native_backend,
+            dtype=native_dtype,
+            decode_storage=native_decode_storage,
+            decode_block_size=int(decode_block_size),
+            decode_quant_axis=int(decode_quant_axis),
+            gpu_decode_tile_h=int(artifacts.gpu_decode_tile_h or h),
+            gpu_decode_tile_n=int(artifacts.gpu_decode_tile_n or n),
+            npu_decode_tile_h=int(artifacts.npu_decode_tile_h or h),
+            npu_decode_tile_n=int(artifacts.npu_decode_tile_n or n),
+            m=m,
+            k=k,
+            h=h,
+            n=n,
+            decode_packed_bytes=_array_nbytes(decode_packed_weights),
+            decode_scale_bytes=_array_nbytes(decode_scales),
+            prefill_weights=_array_ptr(prefill_weights),
+            decode_weights=_array_ptr(decode_weights),
+            decode_packed_weights=_array_ptr(decode_packed_weights),
+            decode_scales=_array_ptr(decode_scales),
+            gpu_prefill_so=_cstr(artifacts.gpu_prefill_so),
+            gpu_decode_so=_cstr(artifacts.gpu_decode_so),
+            npu_prefill_xclbin=_cstr(artifacts.npu_prefill_xclbin),
+            npu_prefill_insts=_cstr(artifacts.npu_prefill_insts),
+            npu_decode_xclbin=_cstr(artifacts.npu_decode_xclbin),
+            npu_decode_insts=_cstr(artifacts.npu_decode_insts),
+            npu_kernel_name=_cstr(artifacts.npu_kernel_name),
+        )
+        ok = (
+            int(
+                self._prepare_resident_pipeline(
+                    ctypes.byref(config), ctypes.byref(result)
+                )
+            )
+            == 0
+        )
+        diagnostic = _decode_char_array(result.diagnostic) or _last_error(self._library)
+        if not ok:
+            raise RuntimeError(diagnostic or "resident pipeline prepare failed")
+        return ResidentPipelinePrepareResult(
+            handle=int(result.handle),
+            storage_kind=_decode_char_array(result.storage_kind),
+            static_upload_bytes=int(result.static_upload_bytes),
+            diagnostic=diagnostic or "ok",
+        )
+
+    def run_resident_pipeline(
+        self,
+        *,
+        handle: int,
+        input_buffer: Any,
+        output_buffer: Any,
+        prefill_output_buffer: Any | None = None,
+        decode_input_buffer: Any | None = None,
+        capture_details: bool = False,
+    ) -> ResidentPipelineRunResult:
+        if self._run_resident_pipeline is None:
+            raise RuntimeError(
+                "direct bridge library is missing "
+                "llm_linear_direct_bridge_run_resident_pipeline"
+            )
+        result = _NativeResidentPipelineRunResult()
+        config = _NativeResidentPipelineRunConfig(
+            abi_version=ABI_VERSION,
+            capture_details=1 if capture_details else 0,
+            reserved0=0,
+            reserved1=0,
+            handle=int(handle),
+            input=_array_ptr(input_buffer),
+            output=_array_ptr(output_buffer),
+            prefill_output=_array_ptr(prefill_output_buffer),
+            decode_input=_array_ptr(decode_input_buffer),
+        )
+        ok = (
+            int(self._run_resident_pipeline(ctypes.byref(config), ctypes.byref(result)))
+            == 0
+        )
+        diagnostic = _decode_char_array(result.diagnostic) or _last_error(self._library)
+        if not ok:
+            raise RuntimeError(diagnostic or "resident pipeline run failed")
+        return ResidentPipelineRunResult(
+            prefill_ms=float(result.prefill_us) / 1000.0,
+            decode_ms=float(result.decode_us) / 1000.0,
+            input_upload_ms=float(result.input_upload_us) / 1000.0,
+            output_readback_ms=float(result.output_readback_us) / 1000.0,
+            launch_count=int(result.launch_count),
+            timed_allocation_count=int(result.timed_allocation_count),
+            diagnostic=diagnostic or "ok",
+        )
+
+    def release_resident_pipeline(self, handle: int) -> None:
+        if self._release_resident_pipeline is None:
+            return
+        if int(self._release_resident_pipeline(int(handle))) != 0:
+            raise RuntimeError(_last_error(self._library) or "resident release failed")
 
 
 def _optional_str(value: Any) -> str | None:

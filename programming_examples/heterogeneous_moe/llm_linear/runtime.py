@@ -79,9 +79,11 @@ class CpuLinearExecutor:
         self.dtype_name = dtype_name
         self.decode_quantized = decode_quantized
         self.last_quantized_detail: dict[str, float] | None = None
+        self.last_host_accumulation_bytes = 0
 
     def run(self, *arrays: np.ndarray) -> np.ndarray:
         self.last_quantized_detail = None
+        self.last_host_accumulation_bytes = 0
         if self.kind == "prefill":
             return prefill_gemm(arrays[0], arrays[1], self.dtype_name)
         if self.kind == "decode":
@@ -121,6 +123,7 @@ class GpuLinearExecutor:
         self._library: _SharedLibraryWrapper | None = None
         self._native_bridge: DirectBridge | None = None
         self._native_artifact: dict[str, Any] | None = None
+        self.last_host_accumulation_bytes = 0
 
     def prepare(self) -> None:
         if self._library is not None or self._native_bridge is not None:
@@ -161,7 +164,10 @@ class GpuLinearExecutor:
 
     def run(self, *arrays: np.ndarray) -> np.ndarray:
         self.prepare()
+        self.last_host_accumulation_bytes = 0
         output_shape = _output_shape(self.kind, arrays)
+        if self._uses_row_staged_prefill(arrays, output_shape):
+            return self._run_prefill_rows(arrays, output_shape)
         if self._uses_tiled_dense_decode(arrays, output_shape):
             return self._run_decode_dense_tiles(arrays, output_shape)
         output = np.zeros(output_shape, dtype=npu_buffer_dtype(self.dtype_name))
@@ -210,6 +216,40 @@ class GpuLinearExecutor:
             return False
         _m, _k, h, n = self.shape
         return h <= GPU_NATIVE_INT4_DECODE_MAX_H and n <= GPU_NATIVE_INT4_DECODE_MAX_N
+
+    def _uses_row_staged_prefill(
+        self, arrays: tuple[np.ndarray, ...], output_shape: tuple[int, ...]
+    ) -> bool:
+        return (
+            self.kind == "prefill"
+            and int(output_shape[0]) > 1
+            and int(self.artifact.get("source_m", int(output_shape[0]))) == 1
+        )
+
+    def _run_prefill_rows(
+        self, arrays: tuple[np.ndarray, ...], output_shape: tuple[int, ...]
+    ) -> np.ndarray:
+        input_array, weights = arrays
+        output_dtype = npu_buffer_dtype(self.dtype_name)
+        final_output = np.zeros(output_shape, dtype=output_dtype)
+        encoded_weights = np.ascontiguousarray(
+            encode_npu_array(weights, self.dtype_name)
+        )
+        assert self._library is not None
+
+        for row in range(int(input_array.shape[0])):
+            row_input = np.ascontiguousarray(input_array[row : row + 1, :])
+            row_output = np.zeros((1, output_shape[1]), dtype=output_dtype)
+            row_args = [
+                np.ascontiguousarray(encode_npu_array(row_input, self.dtype_name)),
+                encoded_weights,
+                row_output,
+            ]
+            descriptors = [_ranked_memref_descriptor(encoded) for encoded in row_args]
+            self._library.invoke(self.function_name, *descriptors)
+            final_output[row : row + 1, :] = row_output
+
+        return decode_npu_array(final_output, self.dtype_name)
 
     def _uses_tiled_dense_decode(
         self, arrays: tuple[np.ndarray, ...], output_shape: tuple[int, ...]
@@ -264,7 +304,11 @@ class GpuLinearExecutor:
                     _ranked_memref_descriptor(encoded) for encoded in tile_args
                 ]
                 self._library.invoke(self.function_name, *descriptors)
-                accum += decode_npu_array(tile_output, self.dtype_name)
+                partial = decode_npu_array(tile_output, self.dtype_name)
+                self.last_host_accumulation_bytes += int(
+                    partial.astype(np.float32, copy=False).nbytes
+                )
+                accum += partial
             final_output[start : start + tile_n] = accum
 
         return final_output
@@ -292,6 +336,7 @@ class NpuLinearExecutor:
         self.decode_quantized = decode_quantized
         self._backend = None
         self._invoker = None
+        self.last_host_accumulation_bytes = 0
 
     def prepare(self) -> None:
         if self._invoker is not None:
@@ -307,6 +352,7 @@ class NpuLinearExecutor:
 
     def run(self, *arrays: np.ndarray) -> np.ndarray:
         self.prepare()
+        self.last_host_accumulation_bytes = 0
         output_shape = _output_shape(self.kind, arrays)
         if self.kind == "prefill" and int(arrays[0].shape[0]) > 1:
             return self._run_prefill_rows(arrays, output_shape)
@@ -401,9 +447,13 @@ class NpuLinearExecutor:
                     )
                 )
                 result = self._invoker(tile_input, tile_weights, tile_output)
-                accum += decode_npu_array(
+                partial = decode_npu_array(
                     np.asarray(result[-1]).reshape((tile_n,)), self.dtype_name
                 )
+                self.last_host_accumulation_bytes += int(
+                    partial.astype(np.float32, copy=False).nbytes
+                )
+                accum += partial
             final_output[start : start + tile_n] = accum
 
         return final_output
@@ -459,6 +509,40 @@ class DirectDecodeBuffers:
     scales: np.ndarray | None
     block_size: int
     quant_axis: int
+
+
+@dataclass(frozen=True)
+class ResidentWeightHandle:
+    args: tuple[Any, ...]
+    storage_kind: str
+    device_resident: bool
+    static_upload_bytes: int
+    diagnostic: str
+
+    def to_report(
+        self, *, backend: str, requested: bool, static_bytes: int
+    ) -> dict[str, Any]:
+        return {
+            "backend": backend,
+            "requested": bool(requested),
+            "resident": bool(self.device_resident),
+            "device_resident": bool(self.device_resident),
+            "storage_kind": self.storage_kind,
+            "bytes": int(static_bytes),
+            "static_upload_bytes": int(self.static_upload_bytes),
+            "timed_upload_bytes": 0 if self.device_resident else int(static_bytes),
+            "diagnostic": self.diagnostic,
+        }
+
+
+@dataclass
+class ResidentPipelineState:
+    bridge: DirectBridge
+    handle: int
+    backend: str
+    storage_kind: str
+    static_upload_bytes: int
+    diagnostic: str
 
 
 def _output_shape(kind: str, arrays: tuple[np.ndarray, ...]) -> tuple[int, ...]:
@@ -536,17 +620,23 @@ class LinearRuntime:
             decode_quantization=self.decode_quantization,
         )
         self.transfer = LinearTransferManager(manifest["runtime"]["transfer_mode"])
+        self.resident_weights_enabled = bool(
+            manifest["runtime"].get("resident_weights", False)
+        )
         self.artifact_root = artifact_root(manifest)
         self._sources: dict[str, dict[str, Path]] = {}
         self._direct_bridge: DirectBridge | None = None
         self._direct_probe_report: DirectBridgeProbeReport | None = None
         self._decode_hardware_arrays: DecodeHardwareWeightArrays | None = None
+        self._resident_weight_handles: dict[str, ResidentWeightHandle] = {}
+        self._resident_pipeline: ResidentPipelineState | None = None
         self.executors = self._make_executors()
 
     def __enter__(self) -> "LinearRuntime":
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        self.release()
         return False
 
     def _sources_for(self, backend: str) -> dict[str, Path]:
@@ -660,6 +750,9 @@ class LinearRuntime:
         )
 
     def prepare(self) -> None:
+        if self.resident_weights_enabled:
+            if not self._prepare_resident_pipeline():
+                self._prepare_resident_weight_args()
         if self.transfer.mode == "direct":
             self._require_direct_runtime()
             self._ensure_direct_artifacts()
@@ -668,6 +761,250 @@ class LinearRuntime:
             prepare = getattr(executor, "prepare", None)
             if prepare:
                 prepare()
+
+    def run_hot(self, inputs: np.ndarray) -> dict[str, Any]:
+        return self.run(inputs, validate=False, capture_details=False)
+
+    def release(self) -> None:
+        if self._resident_pipeline is not None:
+            self._resident_pipeline.bridge.release_resident_pipeline(
+                self._resident_pipeline.handle
+            )
+            self._resident_pipeline = None
+        for executor in (self.executors.prefill, self.executors.decode):
+            release = getattr(executor, "release", None)
+            if release:
+                release()
+        self._resident_weight_handles.clear()
+
+    def _same_accelerator_backend(self) -> str | None:
+        stages = self.manifest["runtime"]["stage_backends"]
+        backend = stages.get("prefill")
+        if backend == stages.get("decode") and backend in {"gpu", "npu"}:
+            return backend
+        return None
+
+    def _prepare_resident_pipeline(self) -> bool:
+        backend = self._same_accelerator_backend()
+        if backend is None:
+            return False
+        if self._resident_pipeline is not None:
+            return True
+        if not os.environ.get("LLM_LINEAR_DIRECT_BRIDGE_SO"):
+            return False
+        status = probe_direct_bridge()
+        if not status.available:
+            raise DirectTransferUnsupported(
+                "resident accelerator pipeline requested, but the native "
+                f"bridge is unavailable: {status.diagnostic}"
+            )
+        bridge = DirectBridge(status.library_path)
+        self._direct_bridge = bridge
+        self._direct_probe_report = getattr(status, "probe_report", None)
+        self._ensure_direct_artifacts()
+        decode_buffers = self._direct_decode_buffers()
+        prefill_weights = np.ascontiguousarray(
+            encode_npu_array(self.weights.prefill, self.cfg.dtype)
+        )
+        result = bridge.prepare_resident_pipeline(
+            backend=backend,
+            dtype=self.cfg.dtype,
+            shape=(self.cfg.M, self.cfg.K, self.cfg.H, self.cfg.N),
+            prefill_weights=prefill_weights,
+            decode_weights=decode_buffers.weights,
+            decode_packed_weights=decode_buffers.packed_weights,
+            decode_scales=decode_buffers.scales,
+            artifacts=self._direct_artifacts(),
+            decode_storage=decode_buffers.storage,
+            decode_block_size=decode_buffers.block_size,
+            decode_quant_axis=decode_buffers.quant_axis,
+        )
+        self._resident_pipeline = ResidentPipelineState(
+            bridge=bridge,
+            handle=result.handle,
+            backend=backend,
+            storage_kind=result.storage_kind,
+            static_upload_bytes=result.static_upload_bytes,
+            diagnostic=result.diagnostic,
+        )
+        decode_static_arrays = tuple(
+            array
+            for array in (
+                decode_buffers.weights,
+                decode_buffers.packed_weights,
+                decode_buffers.scales,
+            )
+            if array is not None
+        )
+        self._resident_weight_handles["prefill"] = ResidentWeightHandle(
+            args=(result.handle,),
+            storage_kind=result.storage_kind,
+            device_resident=True,
+            static_upload_bytes=int(prefill_weights.nbytes),
+            diagnostic=result.diagnostic,
+        )
+        self._resident_weight_handles["decode"] = ResidentWeightHandle(
+            args=(result.handle,),
+            storage_kind=result.storage_kind,
+            device_resident=True,
+            static_upload_bytes=int(
+                sum(array.nbytes for array in decode_static_arrays)
+            ),
+            diagnostic=result.diagnostic,
+        )
+        return True
+
+    def _prepare_resident_weight_args(self) -> None:
+        stages = self.manifest["runtime"]["stage_backends"]
+        for kind in ("prefill", "decode"):
+            backend = stages[kind]
+            if backend not in {"gpu", "npu"}:
+                continue
+            if kind in self._resident_weight_handles:
+                continue
+            arrays = tuple(
+                np.ascontiguousarray(array)
+                for array in self._static_weight_arrays_for_stage(kind, backend)
+            )
+            executor = getattr(self.executors, kind)
+            prepare_static = getattr(executor, "prepare_static_weights", None)
+            prepared = prepare_static(*arrays) if prepare_static else None
+            self._resident_weight_handles[kind] = self._coerce_resident_handle(
+                prepared, arrays
+            )
+
+    def _static_weight_arrays_for_stage(
+        self, kind: str, backend: str
+    ) -> tuple[np.ndarray, ...]:
+        if kind == "prefill":
+            return (self.weights.prefill,)
+        if kind == "decode":
+            return self._decode_weight_arrays_for_backend(backend)
+        raise ValueError(f"Unknown static weight stage: {kind}")
+
+    def _coerce_resident_handle(
+        self,
+        prepared: Any,
+        arrays: tuple[np.ndarray, ...],
+    ) -> ResidentWeightHandle:
+        static_bytes = int(sum(array.nbytes for array in arrays))
+        if isinstance(prepared, ResidentWeightHandle):
+            return prepared
+        if isinstance(prepared, dict):
+            raw_args = prepared.get("args", ())
+            args = tuple(raw_args) if isinstance(raw_args, (list, tuple)) else ()
+            storage_kind = str(prepared.get("storage_kind") or "unknown")
+            requested_device_resident = bool(prepared.get("device_resident"))
+            valid = requested_device_resident and self._valid_resident_storage_kind(
+                storage_kind
+            )
+            diagnostic = str(
+                prepared.get("diagnostic")
+                or ("ok" if valid else "executor did not provide device residency")
+            )
+            return ResidentWeightHandle(
+                args=args if valid else (),
+                storage_kind=storage_kind,
+                device_resident=valid,
+                static_upload_bytes=int(
+                    prepared.get("static_upload_bytes", static_bytes)
+                ),
+                diagnostic=diagnostic,
+            )
+        return ResidentWeightHandle(
+            args=(),
+            storage_kind="host_numpy_prepared",
+            device_resident=False,
+            static_upload_bytes=static_bytes,
+            diagnostic=(
+                "resident_weights requested, but this executor did not return "
+                "persistent HIP allocations or XRT BOs for static weights"
+            ),
+        )
+
+    def _valid_resident_storage_kind(self, storage_kind: str) -> bool:
+        lowered = storage_kind.lower()
+        if "numpy" in lowered or lowered.startswith("host"):
+            return False
+        return lowered in {
+            "hip_device_allocation",
+            "hip_vmem",
+            "hip_vmem_bo",
+            "xrt_bo",
+            "xrt_static_bo",
+            "device_resident_buffer",
+        }
+
+    def _resident_weight_args_for_stage(
+        self, kind: str, backend: str
+    ) -> tuple[Any, ...] | None:
+        if not self.resident_weights_enabled or backend not in {"gpu", "npu"}:
+            return None
+        handle = self._resident_weight_handles.get(kind)
+        if handle is None or not handle.device_resident:
+            return None
+        return handle.args
+
+    def _resident_weight_report(self) -> dict[str, Any]:
+        stages = self.manifest["runtime"]["stage_backends"]
+        requested = self.resident_weights_enabled
+        reports: dict[str, dict[str, Any]] = {}
+        for kind in ("prefill", "decode"):
+            backend = stages[kind]
+            static_bytes = int(
+                sum(
+                    array.nbytes
+                    for array in self._static_weight_arrays_for_stage(kind, backend)
+                )
+            )
+            handle = self._resident_weight_handles.get(kind)
+            if backend not in {"gpu", "npu"}:
+                reports[kind] = {
+                    "backend": backend,
+                    "requested": bool(requested),
+                    "resident": False,
+                    "device_resident": False,
+                    "storage_kind": "cpu_native",
+                    "bytes": static_bytes,
+                    "static_upload_bytes": 0,
+                    "timed_upload_bytes": 0,
+                    "diagnostic": "CPU weights are native host inputs",
+                }
+            elif handle is None:
+                reports[kind] = {
+                    "backend": backend,
+                    "requested": bool(requested),
+                    "resident": False,
+                    "device_resident": False,
+                    "storage_kind": "not_prepared",
+                    "bytes": static_bytes,
+                    "static_upload_bytes": 0,
+                    "timed_upload_bytes": static_bytes,
+                    "diagnostic": "prepare() was not called for static weights",
+                }
+            else:
+                reports[kind] = handle.to_report(
+                    backend=backend, requested=requested, static_bytes=static_bytes
+                )
+        accelerator_reports = [
+            report for report in reports.values() if report["backend"] in {"gpu", "npu"}
+        ]
+        valid_device_residency = bool(accelerator_reports) and all(
+            bool(report["device_resident"]) for report in accelerator_reports
+        )
+        return {
+            "requested": bool(requested),
+            "enabled": bool(valid_device_residency),
+            "valid_device_residency": bool(valid_device_residency),
+            "proof_status": (
+                "valid_device_residency"
+                if valid_device_residency
+                else "not_requested" if not requested else "invalid_or_unavailable"
+            ),
+            "prefill": reports["prefill"],
+            "decode": reports["decode"],
+            "timed_weight_restaging": not valid_device_residency,
+        }
 
     def _require_direct_runtime(self) -> DirectBridge:
         stages = self.manifest["runtime"]["stage_backends"]
@@ -893,6 +1230,34 @@ class LinearRuntime:
                 output = executor.run(*arrays)
         return output, (time.perf_counter_ns() - start_ns) / 1_000_000.0
 
+    def _execution_overhead_report(
+        self,
+        *,
+        timing_ms: dict[str, float],
+        transfer_summary: dict[str, Any],
+    ) -> dict[str, Any]:
+        host_accumulation_bytes = int(
+            getattr(self.executors.decode, "last_host_accumulation_bytes", 0) or 0
+        )
+        return {
+            "implementation_by_stage": self._implementation_by_stage(),
+            "timed_allocation_count": int(transfer_summary.get("copied_count", 0)),
+            "timed_allocation_count_model": (
+                "observed_numpy_transfer_copies_only; backend-internal "
+                "allocations require hardware counters or native runtime hooks"
+            ),
+            "host_accumulation_bytes": host_accumulation_bytes,
+            "stage_timings_ms": {key: float(value) for key, value in timing_ms.items()},
+            "compile_load_excluded": True,
+        }
+
+    def _implementation_by_stage(self) -> dict[str, str]:
+        stages = self.manifest["runtime"]["stage_backends"]
+        return {
+            stage: ("native_cpu_numpy" if backend == "cpu" else "air_generated")
+            for stage, backend in stages.items()
+        }
+
     def _direct_decode_buffers(self) -> DirectDecodeBuffers:
         if self.weights.decode_quantized is None:
             return DirectDecodeBuffers(
@@ -912,6 +1277,170 @@ class LinearRuntime:
             block_size=arrays.plan.block_size,
             quant_axis=arrays.plan.quant_axis,
         )
+
+    def _run_resident_pipeline(
+        self,
+        inputs: np.ndarray,
+        *,
+        validate: bool,
+        capture_details: bool,
+        trace: TraceRecorder | None,
+        e2e_start_ns: int,
+    ) -> dict[str, Any]:
+        state = self._resident_pipeline
+        if state is None:
+            raise RuntimeError("resident pipeline was not prepared")
+        input_encoded = np.ascontiguousarray(encode_npu_array(inputs, self.cfg.dtype))
+        output_encoded = np.zeros((self.cfg.N,), dtype=npu_buffer_dtype(self.cfg.dtype))
+        prefill_encoded = (
+            np.zeros((self.cfg.M, self.cfg.H), dtype=npu_buffer_dtype(self.cfg.dtype))
+            if capture_details
+            else None
+        )
+        decode_input_encoded = (
+            np.zeros((self.cfg.H,), dtype=npu_buffer_dtype(self.cfg.dtype))
+            if capture_details
+            else None
+        )
+
+        def invoke_pipeline() -> Any:
+            return state.bridge.run_resident_pipeline(
+                handle=state.handle,
+                input_buffer=input_encoded,
+                output_buffer=output_encoded,
+                prefill_output_buffer=prefill_encoded,
+                decode_input_buffer=decode_input_encoded,
+                capture_details=capture_details,
+            )
+
+        if trace is None:
+            pipeline_result = invoke_pipeline()
+        else:
+            with trace.span(
+                f"resident_{state.backend}_linear",
+                "stage",
+                f"resident_{state.backend}_linear",
+                {"backend": state.backend, "resident_weights": True},
+            ):
+                pipeline_result = invoke_pipeline()
+
+        output_cpu = decode_npu_array(output_encoded, self.cfg.dtype)
+        timing_ms = {
+            "prefill": float(pipeline_result.prefill_ms),
+            "decode": float(pipeline_result.decode_ms),
+            "end_to_end": (time.perf_counter_ns() - e2e_start_ns) / 1_000_000.0,
+        }
+
+        if prefill_encoded is not None:
+            prefill_host = decode_npu_array(prefill_encoded, self.cfg.dtype)
+            assert decode_input_encoded is not None
+            decode_input = decode_npu_array(decode_input_encoded, self.cfg.dtype)
+        else:
+            prefill_host = np.empty((self.cfg.M, self.cfg.H), dtype=inputs.dtype)
+            decode_input = np.empty((self.cfg.H,), dtype=inputs.dtype)
+
+        if not capture_details:
+            return {
+                "prefill": prefill_host,
+                "decode_input": decode_input,
+                "output": output_cpu,
+                "timing_ms": timing_ms,
+            }
+
+        actual_bundle = {
+            "prefill": prefill_host,
+            "decode_input": decode_input,
+            "output": output_cpu,
+        }
+        reference = run_reference(self.cfg, inputs, self.weights)
+        if validate:
+            per_stage_metrics = stage_metrics(actual_bundle, reference, self.cfg.dtype)
+            validation_status = (
+                "pass"
+                if all(
+                    bool(metrics["allclose"]) for metrics in per_stage_metrics.values()
+                )
+                else "fail"
+            )
+        else:
+            per_stage_metrics = {}
+            validation_status = "skipped"
+
+        assert trace is not None
+        transfer_summary = self.transfer.summary()
+        execution_overhead = self._execution_overhead_report(
+            timing_ms=timing_ms,
+            transfer_summary=transfer_summary,
+        )
+        execution_overhead.update(
+            {
+                "timed_allocation_count": int(pipeline_result.timed_allocation_count),
+                "native_pipeline": {
+                    "backend": state.backend,
+                    "storage_kind": state.storage_kind,
+                    "input_upload_ms": float(pipeline_result.input_upload_ms),
+                    "output_readback_ms": float(pipeline_result.output_readback_ms),
+                    "launch_count_observed": int(pipeline_result.launch_count),
+                    "diagnostic": pipeline_result.diagnostic,
+                },
+            }
+        )
+        return {
+            "prefill": prefill_host,
+            "decode_input": decode_input,
+            "output": output_cpu,
+            "reference": reference["output"],
+            "workload": {
+                "shape": {
+                    "M": self.cfg.M,
+                    "K": self.cfg.K,
+                    "H": self.cfg.H,
+                    "N": self.cfg.N,
+                    "dtype": self.cfg.dtype,
+                    "shape_tier": self.cfg.shape_tier,
+                },
+                "operation": "prefill_gemm_then_decode_gemv",
+                "bytes": workload_bytes(self.cfg),
+                "decode_weight_quantization": self._quantization_report(),
+                "input_scale": self.input_scale,
+                "weight_scale": self.weight_scale,
+            },
+            "timing_ms": timing_ms,
+            "stage_metrics": per_stage_metrics,
+            "numpy_validation": {
+                "ran": bool(validate),
+                "ok": validation_status == "pass",
+                "status": validation_status,
+            },
+            "trace": trace,
+            "trace_summary": trace.summary(),
+            "transfer_events": self.transfer.snapshot(),
+            "transfer_summary": transfer_summary,
+            "execution_overhead": execution_overhead,
+            "quantized_decode": {
+                **self._quantized_decode_report(
+                    hardware_fused=self._decode_hardware_fused(),
+                    detail=None,
+                )
+            },
+            "resident_weights": self._resident_weight_report(),
+            "device_events": summarize_device_events(trace),
+            "direct_bridge": {
+                "library_path": (
+                    None
+                    if state.bridge.library_path is None
+                    else str(state.bridge.library_path)
+                ),
+                "resident_pipeline": True,
+                "backend": state.backend,
+                "storage_kind": state.storage_kind,
+                "diagnostic": state.diagnostic,
+            },
+            "npu_development": self._npu_development_report(
+                inputs, reference, executed=self._npu_stage_executed()
+            ),
+            "limitations": linear_limitations(self.manifest, transfer_summary),
+        }
 
     def _run_direct(
         self,
@@ -1095,6 +1624,10 @@ class LinearRuntime:
 
         assert trace is not None
         transfer_summary = self.transfer.summary()
+        execution_overhead = self._execution_overhead_report(
+            timing_ms=timing_ms,
+            transfer_summary=transfer_summary,
+        )
         return {
             "prefill": prefill_host,
             "decode_input": decode_input,
@@ -1126,12 +1659,14 @@ class LinearRuntime:
             "trace_summary": trace.summary(),
             "transfer_events": self.transfer.snapshot(),
             "transfer_summary": transfer_summary,
+            "execution_overhead": execution_overhead,
             "quantized_decode": {
                 **self._quantized_decode_report(
                     hardware_fused=self._decode_hardware_fused(),
                     detail=None,
                 )
             },
+            "resident_weights": self._resident_weight_report(),
             "device_events": summarize_device_events(trace),
             "direct_bridge": {
                 "library_path": (
@@ -1174,17 +1709,31 @@ class LinearRuntime:
                 trace=trace,
                 e2e_start_ns=e2e_start_ns,
             )
+        if self._resident_pipeline is not None:
+            return self._run_resident_pipeline(
+                inputs,
+                validate=validate,
+                capture_details=capture_details,
+                trace=trace,
+                e2e_start_ns=e2e_start_ns,
+            )
 
         x_arg = self.transfer.transfer(
             "cpu", stages["prefill"], inputs, trace, "input_to_prefill"
         )
-        wp_arg = self.transfer.transfer(
-            "cpu",
-            stages["prefill"],
-            self.weights.prefill,
-            trace,
-            "prefill_weights_to_backend",
+        resident_prefill_weights = self._resident_weight_args_for_stage(
+            "prefill", stages["prefill"]
         )
+        if resident_prefill_weights is None:
+            wp_arg = self.transfer.transfer(
+                "cpu",
+                stages["prefill"],
+                self.weights.prefill,
+                trace,
+                "prefill_weights_to_backend",
+            )
+        else:
+            wp_arg = resident_prefill_weights[0]
         prefill, prefill_ms = self._stage_run(
             self.executors.prefill,
             trace,
@@ -1193,36 +1742,64 @@ class LinearRuntime:
             x_arg,
             wp_arg,
         )
-        prefill_host = self.transfer.transfer(
-            stages["prefill"], "cpu", prefill, trace, "prefill_to_host"
+        resident_decode_weights = self._resident_weight_args_for_stage(
+            "decode", stages["decode"]
         )
+        same_resident_accelerator = (
+            resident_prefill_weights is not None
+            and resident_decode_weights is not None
+            and stages["prefill"] == stages["decode"]
+            and stages["prefill"] in {"gpu", "npu"}
+        )
+        if same_resident_accelerator:
+            decode_input = np.ascontiguousarray(prefill[self.cfg.M - 1, :])
+            decode_arg = decode_input
+            if capture_details:
+                prefill_host = self.transfer.transfer(
+                    stages["prefill"],
+                    "cpu",
+                    prefill,
+                    trace,
+                    "prefill_to_host_validation",
+                )
+            else:
+                prefill_host = prefill
+        else:
+            prefill_host = self.transfer.transfer(
+                stages["prefill"], "cpu", prefill, trace, "prefill_to_host"
+            )
+            decode_input = np.ascontiguousarray(prefill_host[self.cfg.M - 1, :])
+            decode_arg = self.transfer.transfer(
+                "cpu", stages["decode"], decode_input, trace, "decode_input_to_backend"
+            )
 
-        decode_input = np.ascontiguousarray(prefill_host[self.cfg.M - 1, :])
-        decode_arg = self.transfer.transfer(
-            "cpu", stages["decode"], decode_input, trace, "decode_input_to_backend"
-        )
-        decode_weight_arrays = self._decode_weight_arrays_for_backend(stages["decode"])
-        wd_arg = self.transfer.transfer(
-            "cpu",
-            stages["decode"],
-            decode_weight_arrays[0],
-            trace,
-            (
-                "decode_packed_weights_to_backend"
-                if self._decode_hardware_fused()
-                else "decode_weights_to_backend"
-            ),
-        )
-        decode_weight_args = [wd_arg]
-        if self._decode_hardware_fused():
-            scales_arg = self.transfer.transfer(
+        if resident_decode_weights is None:
+            decode_weight_arrays = self._decode_weight_arrays_for_backend(
+                stages["decode"]
+            )
+            wd_arg = self.transfer.transfer(
                 "cpu",
                 stages["decode"],
-                decode_weight_arrays[1],
+                decode_weight_arrays[0],
                 trace,
-                "decode_scales_to_backend",
+                (
+                    "decode_packed_weights_to_backend"
+                    if self._decode_hardware_fused()
+                    else "decode_weights_to_backend"
+                ),
             )
-            decode_weight_args.append(scales_arg)
+            decode_weight_args = [wd_arg]
+            if self._decode_hardware_fused():
+                scales_arg = self.transfer.transfer(
+                    "cpu",
+                    stages["decode"],
+                    decode_weight_arrays[1],
+                    trace,
+                    "decode_scales_to_backend",
+                )
+                decode_weight_args.append(scales_arg)
+        else:
+            decode_weight_args = list(resident_decode_weights)
         output, decode_ms = self._stage_run(
             self.executors.decode,
             trace,
@@ -1273,6 +1850,10 @@ class LinearRuntime:
 
         assert trace is not None
         transfer_summary = self.transfer.summary()
+        execution_overhead = self._execution_overhead_report(
+            timing_ms=timing_ms,
+            transfer_summary=transfer_summary,
+        )
         return {
             "prefill": prefill_host,
             "decode_input": decode_input,
@@ -1304,12 +1885,14 @@ class LinearRuntime:
             "trace_summary": trace.summary(),
             "transfer_events": self.transfer.snapshot(),
             "transfer_summary": transfer_summary,
+            "execution_overhead": execution_overhead,
             "quantized_decode": {
                 **self._quantized_decode_report(
                     hardware_fused=self._decode_hardware_fused(),
                     detail=quantized_decode_detail,
                 )
             },
+            "resident_weights": self._resident_weight_report(),
             "device_events": summarize_device_events(trace),
             "npu_development": self._npu_development_report(
                 inputs, reference, executed=self._npu_stage_executed()
@@ -1337,6 +1920,9 @@ def linear_limitations(
             else "fail_closed_without_native_bridge"
         ),
         "compile_load_excluded_from_timed_iterations": True,
+        "resident_weights_requested": bool(
+            manifest.get("runtime", {}).get("resident_weights", False)
+        ),
         "limitations": [
             "Milestone 1 measures a two-stage linear pipeline, not full attention, KV-cache, tokenizer, or sampling.",
             "Host transfer mode mixed GPU/NPU paths are staged through NumPy arrays.",

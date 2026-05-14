@@ -8,6 +8,10 @@
 // on the Ryzen AI stack and keeps the HIP handle, fd, VA, and XRT BO alive in a
 // process-lifetime pool.
 
+#ifndef __AMDGCN_WAVEFRONT_SIZE
+#define __AMDGCN_WAVEFRONT_SIZE 32
+#endif
+#include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
 
 #include <xrt/experimental/xrt_hw_context.h>
@@ -30,6 +34,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -115,6 +120,73 @@ struct LlmLinearGpuStageRunResult {
   char diagnostic[512];
 };
 
+struct LlmLinearResidentPipelinePrepareConfig {
+  uint32_t abi_version;
+  uint32_t backend;
+  uint32_t dtype;
+  uint32_t decode_storage;
+  uint32_t decode_block_size;
+  uint32_t decode_quant_axis;
+  uint32_t gpu_decode_tile_h;
+  uint32_t gpu_decode_tile_n;
+  uint32_t npu_decode_tile_h;
+  uint32_t npu_decode_tile_n;
+  uint64_t m;
+  uint64_t k;
+  uint64_t h;
+  uint64_t n;
+  uint64_t decode_packed_bytes;
+  uint64_t decode_scale_bytes;
+  const void *prefill_weights;
+  const void *decode_weights;
+  const void *decode_packed_weights;
+  const void *decode_scales;
+  const char *gpu_prefill_so;
+  const char *gpu_decode_so;
+  const char *npu_prefill_xclbin;
+  const char *npu_prefill_insts;
+  const char *npu_decode_xclbin;
+  const char *npu_decode_insts;
+  const char *npu_kernel_name;
+};
+
+struct LlmLinearResidentPipelinePrepareResult {
+  uint32_t abi_version;
+  uint32_t reserved0;
+  uint32_t reserved1;
+  uint32_t reserved2;
+  uint64_t handle;
+  uint64_t static_upload_bytes;
+  char storage_kind[64];
+  char diagnostic[512];
+};
+
+struct LlmLinearResidentPipelineRunConfig {
+  uint32_t abi_version;
+  uint32_t capture_details;
+  uint32_t reserved0;
+  uint32_t reserved1;
+  uint64_t handle;
+  const void *input;
+  void *output;
+  void *prefill_output;
+  void *decode_input;
+};
+
+struct LlmLinearResidentPipelineRunResult {
+  uint32_t abi_version;
+  uint32_t reserved0;
+  uint32_t reserved1;
+  uint32_t reserved2;
+  uint64_t prefill_us;
+  uint64_t decode_us;
+  uint64_t input_upload_us;
+  uint64_t output_readback_us;
+  uint64_t launch_count;
+  uint64_t timed_allocation_count;
+  char diagnostic[512];
+};
+
 int llm_linear_direct_bridge_probe();
 int llm_linear_direct_bridge_probe_report(char *buffer, uint64_t capacity);
 int llm_linear_direct_bridge_last_error(char *buffer, uint64_t capacity);
@@ -124,6 +196,13 @@ int llm_linear_direct_bridge_run(const LlmLinearDirectRunConfig *config,
 int llm_linear_direct_bridge_run_gpu_stage(
     const LlmLinearGpuStageRunConfig *config,
     LlmLinearGpuStageRunResult *result);
+int llm_linear_direct_bridge_prepare_resident_pipeline(
+    const LlmLinearResidentPipelinePrepareConfig *config,
+    LlmLinearResidentPipelinePrepareResult *result);
+int llm_linear_direct_bridge_run_resident_pipeline(
+    const LlmLinearResidentPipelineRunConfig *config,
+    LlmLinearResidentPipelineRunResult *result);
+int llm_linear_direct_bridge_release_resident_pipeline(uint64_t handle);
 }
 
 namespace {
@@ -133,6 +212,8 @@ constexpr uint32_t kDirectionGpuPrefillNpuDecode = 0;
 constexpr uint32_t kDirectionNpuPrefillGpuDecode = 1;
 constexpr uint32_t kGpuStagePrefill = 0;
 constexpr uint32_t kGpuStageDecode = 1;
+constexpr uint32_t kResidentBackendGpu = 0;
+constexpr uint32_t kResidentBackendNpu = 1;
 constexpr uint32_t kDecodeStorageDense = 0;
 constexpr uint32_t kDecodeStorageInt4 = 1;
 constexpr uint32_t kImportXrtBoFromHipVmemFd = 3;
@@ -443,6 +524,13 @@ struct HipDeviceBuffer {
     check_hip(hipMemcpy(dst, hip_ptr(), size, hipMemcpyDeviceToHost),
               "hipMemcpy D2H(native GPU stage)");
   }
+
+  void hip_read_host(void *dst, size_t bytes, size_t offset) {
+    if (!dst || bytes == 0)
+      return;
+    check_hip(hipMemcpy(dst, hip_ptr(offset), bytes, hipMemcpyDeviceToHost),
+              "hipMemcpy D2H(native GPU stage subrange)");
+  }
 };
 
 std::mutex &pool_mutex() {
@@ -537,6 +625,11 @@ MemRef<2> memref2(void *ptr, int64_t d0, int64_t d1) {
   return MemRef<2>{ptr, ptr, 0, {d0, d1}, {d1, 1}};
 }
 
+MemRef<2> memref2_strided(void *ptr, int64_t d0, int64_t d1, int64_t s0,
+                          int64_t s1) {
+  return MemRef<2>{ptr, ptr, 0, {d0, d1}, {s0, s1}};
+}
+
 using PrefillFn = void (*)(MemRef<2> *, MemRef<2> *, MemRef<2> *);
 using DecodeFn = void (*)(MemRef<1> *, MemRef<2> *, MemRef<1> *);
 using DecodeInt4Fn = void (*)(MemRef<1> *, MemRef<2> *, MemRef<2> *,
@@ -606,9 +699,12 @@ std::vector<uint32_t> read_instructions(const char *path) {
 class NpuKernel {
 public:
   NpuKernel(const char *xclbin_path, const char *insts_path,
-            const char *kernel_substr)
-      : device_(0), xclbin_(std::string(xclbin_path)),
-        uuid_(device_.register_xclbin(xclbin_)), context_(device_, uuid_) {
+            const char *kernel_substr,
+            std::shared_ptr<xrt::device> shared_device = nullptr)
+      : device_(shared_device ? std::move(shared_device)
+                              : std::make_shared<xrt::device>(0)),
+        xclbin_(std::string(xclbin_path)),
+        uuid_(device_->register_xclbin(xclbin_)), context_(*device_, uuid_) {
     std::string needle =
         kernel_substr && kernel_substr[0] ? kernel_substr : "MLIR_AIE";
     std::string kernel_name;
@@ -623,13 +719,13 @@ public:
       throw std::runtime_error("NPU kernel not found in xclbin: " + needle);
     kernel_ = xrt::kernel(context_, kernel_name);
     instructions_ = read_instructions(insts_path);
-    bo_instr_ = xrt::bo(device_, instructions_.size() * sizeof(uint32_t),
+    bo_instr_ = xrt::bo(*device_, instructions_.size() * sizeof(uint32_t),
                         xrt::bo::flags::cacheable, kernel_.group_id(1));
     bo_instr_.write(instructions_.data(),
                     instructions_.size() * sizeof(uint32_t), 0);
   }
 
-  xrt::device &device() { return device_; }
+  xrt::device &device() { return *device_; }
   void run3(xrt::bo &arg0, xrt::bo &arg1, xrt::bo &arg2) {
     bo_instr_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     unsigned int opcode = 3;
@@ -657,7 +753,7 @@ public:
   }
 
 private:
-  xrt::device device_;
+  std::shared_ptr<xrt::device> device_;
   xrt::xclbin xclbin_;
   xrt::uuid uuid_;
   xrt::hw_context context_;
@@ -898,6 +994,63 @@ uint16_t float_to_bf16(float value) {
   std::memcpy(&bits, &value, sizeof(bits));
   bits += 0x7fffU + ((bits >> 16) & 1U);
   return static_cast<uint16_t>(bits >> 16);
+}
+
+__device__ float device_bf16_to_float(uint16_t value) {
+  union {
+    uint32_t u;
+    float f;
+  } bits;
+  bits.u = static_cast<uint32_t>(value) << 16;
+  return bits.f;
+}
+
+__device__ uint16_t device_float_to_bf16(float value) {
+  union {
+    uint32_t u;
+    float f;
+  } bits;
+  bits.f = value;
+  bits.u += 0x7fffU + ((bits.u >> 16) & 1U);
+  return static_cast<uint16_t>(bits.u >> 16);
+}
+
+__global__ void accumulate_bf16_to_f32_kernel(const uint16_t *src, float *dst,
+                                              uint64_t count) {
+  uint64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < count)
+    dst[i] += device_bf16_to_float(src[i]);
+}
+
+__global__ void f32_to_bf16_kernel(const float *src, uint16_t *dst,
+                                   uint64_t count) {
+  uint64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < count)
+    dst[i] = device_float_to_bf16(src[i]);
+}
+
+void launch_accumulate_bf16_to_f32(void *src, void *dst, uint64_t count) {
+  if (count == 0)
+    return;
+  const uint32_t threads = 256;
+  const uint32_t blocks =
+      static_cast<uint32_t>((count + threads - 1) / threads);
+  hipLaunchKernelGGL(accumulate_bf16_to_f32_kernel, dim3(blocks), dim3(threads),
+                     0, 0, static_cast<const uint16_t *>(src),
+                     static_cast<float *>(dst), count);
+  check_hip(hipGetLastError(), "launch accumulate_bf16_to_f32_kernel");
+}
+
+void launch_f32_to_bf16(void *src, void *dst, uint64_t count) {
+  if (count == 0)
+    return;
+  const uint32_t threads = 256;
+  const uint32_t blocks =
+      static_cast<uint32_t>((count + threads - 1) / threads);
+  hipLaunchKernelGGL(f32_to_bf16_kernel, dim3(blocks), dim3(threads), 0, 0,
+                     static_cast<const float *>(src),
+                     static_cast<uint16_t *>(dst), count);
+  check_hip(hipGetLastError(), "launch f32_to_bf16_kernel");
 }
 
 bool decode_is_int4(uint32_t storage) {
@@ -1454,6 +1607,465 @@ void run_npu_to_gpu(const LlmLinearDirectRunConfig &cfg,
             "hipMemcpyDtoH:final_output");
 }
 
+DecodeLayout
+make_resident_decode_layout(const LlmLinearResidentPipelinePrepareConfig &cfg) {
+  const bool gpu = cfg.backend == kResidentBackendGpu;
+  return make_decode_layout(cfg.h, cfg.n, cfg.dtype, cfg.decode_storage,
+                            cfg.decode_block_size, cfg.decode_quant_axis,
+                            gpu ? cfg.gpu_decode_tile_h : cfg.npu_decode_tile_h,
+                            gpu ? cfg.gpu_decode_tile_n
+                                : cfg.npu_decode_tile_n);
+}
+
+void validate_resident_prepare_config(
+    const LlmLinearResidentPipelinePrepareConfig &cfg) {
+  if (cfg.abi_version != kAbiVersion)
+    throw std::runtime_error("unsupported resident pipeline ABI version");
+  if (cfg.backend != kResidentBackendGpu && cfg.backend != kResidentBackendNpu)
+    throw std::runtime_error("unsupported resident pipeline backend");
+  if (!cfg.prefill_weights || cfg.m == 0 || cfg.k == 0 || cfg.h == 0 ||
+      cfg.n == 0)
+    throw std::runtime_error(
+        "resident pipeline received invalid shape/weights");
+  const DecodeLayout layout = make_resident_decode_layout(cfg);
+  if (layout.int4) {
+    if (!cfg.decode_packed_weights || !cfg.decode_scales)
+      throw std::runtime_error("resident int4 pipeline missing packed/scales");
+    if (cfg.decode_packed_bytes != layout.packed_bytes() ||
+        cfg.decode_scale_bytes != layout.scale_bytes())
+      throw std::runtime_error(
+          "resident int4 pipeline received invalid packed/scales byte counts");
+  } else if (!cfg.decode_weights) {
+    throw std::runtime_error("resident dense pipeline missing decode weights");
+  }
+  if (cfg.backend == kResidentBackendGpu) {
+    if (!cfg.gpu_prefill_so || !cfg.gpu_prefill_so[0] || !cfg.gpu_decode_so ||
+        !cfg.gpu_decode_so[0])
+      throw std::runtime_error("resident GPU pipeline missing GPU libraries");
+  } else {
+    if (!cfg.npu_prefill_xclbin || !cfg.npu_prefill_insts ||
+        !cfg.npu_decode_xclbin || !cfg.npu_decode_insts)
+      throw std::runtime_error("resident NPU pipeline missing NPU artifacts");
+  }
+}
+
+class ResidentPipeline {
+public:
+  virtual ~ResidentPipeline() = default;
+  virtual void run(const LlmLinearResidentPipelineRunConfig &cfg,
+                   LlmLinearResidentPipelineRunResult &result) = 0;
+  virtual const char *storage_kind() const = 0;
+  uint64_t static_upload_bytes() const { return static_upload_bytes_; }
+
+protected:
+  uint64_t static_upload_bytes_ = 0;
+};
+
+class GpuResidentPipeline final : public ResidentPipeline {
+public:
+  explicit GpuResidentPipeline(
+      const LlmLinearResidentPipelinePrepareConfig &cfg)
+      : m_(cfg.m), k_(cfg.k), h_(cfg.h), n_(cfg.n), dtype_(cfg.dtype),
+        es_(elem_size(cfg.dtype)), layout_(make_resident_decode_layout(cfg)),
+        prefill_lib_(std::make_unique<SharedLibrary>(cfg.gpu_prefill_so)),
+        decode_lib_(std::make_unique<SharedLibrary>(cfg.gpu_decode_so)),
+        input_(std::make_unique<HipDeviceBuffer>(cfg.m * cfg.k * es_)),
+        prefill_weights_(
+            std::make_unique<HipDeviceBuffer>(cfg.k * cfg.h * es_)),
+        handoff_(std::make_unique<HipDeviceBuffer>(cfg.m * cfg.h * es_)),
+        output_(std::make_unique<HipDeviceBuffer>(cfg.n * es_)) {
+    check_hip(hipSetDevice(0), "hipSetDevice(0)");
+    prefill_fn_ = prefill_lib_->symbol<PrefillFn>("llm_linear_prefill");
+    prefill_weights_->hip_write_host(cfg.prefill_weights);
+    static_upload_bytes_ += cfg.k * cfg.h * es_;
+    if (layout_.int4) {
+      decode_int4_fn_ =
+          decode_lib_->symbol<DecodeInt4Fn>("llm_linear_decode_int4");
+      decode_weights_ =
+          std::make_unique<HipDeviceBuffer>(layout_.packed_bytes());
+      decode_scales_ = std::make_unique<HipDeviceBuffer>(layout_.scale_bytes());
+      decode_weights_->hip_write_host(cfg.decode_packed_weights);
+      decode_scales_->hip_write_host(cfg.decode_scales);
+      static_upload_bytes_ += layout_.packed_bytes() + layout_.scale_bytes();
+    } else {
+      decode_fn_ = decode_lib_->symbol<DecodeFn>("llm_linear_decode");
+      decode_weights_ =
+          std::make_unique<HipDeviceBuffer>(layout_.dense_weight_bytes());
+      decode_weights_->hip_write_host(cfg.decode_weights);
+      static_upload_bytes_ += layout_.dense_weight_bytes();
+      if (layout_.tiled_dense()) {
+        partial_ = std::make_unique<HipDeviceBuffer>(layout_.tile_n * es_);
+        accum_ =
+            std::make_unique<HipDeviceBuffer>(layout_.tile_n * sizeof(float));
+      }
+    }
+  }
+
+  const char *storage_kind() const override { return "hip_device_allocation"; }
+
+  void run(const LlmLinearResidentPipelineRunConfig &cfg,
+           LlmLinearResidentPipelineRunResult &result) override {
+    if (!cfg.input || !cfg.output)
+      throw std::runtime_error("resident GPU run missing input/output");
+    const uint64_t upload_start = now_us();
+    input_->hip_write_host(cfg.input);
+    result.input_upload_us = now_us() - upload_start;
+
+    const uint64_t prefill_start = now_us();
+    for (uint64_t row = 0; row < m_; ++row) {
+      auto input_ref =
+          memref2(input_->hip_ptr(row * k_ * es_), 1, static_cast<int64_t>(k_));
+      auto weight_ref =
+          memref2(prefill_weights_->hip_ptr(), static_cast<int64_t>(k_),
+                  static_cast<int64_t>(h_));
+      auto output_ref = memref2(handoff_->hip_ptr(row * h_ * es_), 1,
+                                static_cast<int64_t>(h_));
+      prefill_fn_(&input_ref, &weight_ref, &output_ref);
+      result.launch_count += 1;
+    }
+    check_hip(hipDeviceSynchronize(),
+              "hipDeviceSynchronize(resident gpu prefill)");
+    result.prefill_us = now_us() - prefill_start;
+
+    const uint64_t decode_start = now_us();
+    const uint64_t offset = (m_ - 1) * h_ * es_;
+    if (layout_.int4) {
+      auto input_ref =
+          memref1(handoff_->hip_ptr(offset), static_cast<int64_t>(h_));
+      auto packed_ref =
+          memref2(decode_weights_->hip_ptr(), static_cast<int64_t>(h_),
+                  static_cast<int64_t>(layout_.packed_word_cols));
+      auto scales_ref = memref2(decode_scales_->hip_ptr(),
+                                static_cast<int64_t>(layout_.block_count),
+                                static_cast<int64_t>(n_));
+      auto output_ref = memref1(output_->hip_ptr(), static_cast<int64_t>(n_));
+      decode_int4_fn_(&input_ref, &packed_ref, &scales_ref, &output_ref);
+      result.launch_count += 1;
+      check_hip(hipDeviceSynchronize(),
+                "hipDeviceSynchronize(resident gpu int4 decode)");
+    } else if (layout_.tiled_dense()) {
+      check_hip(hipMemset(accum_->hip_ptr(), 0, layout_.tile_n * sizeof(float)),
+                "hipMemset(resident gpu decode accum)");
+      for (uint64_t start_h = 0; start_h < h_; start_h += layout_.tile_h) {
+        auto input_ref = memref1(handoff_->hip_ptr(offset + start_h * es_),
+                                 static_cast<int64_t>(layout_.tile_h));
+        auto weight_ref = memref2_strided(
+            decode_weights_->hip_ptr((start_h * n_) * es_),
+            static_cast<int64_t>(layout_.tile_h),
+            static_cast<int64_t>(layout_.tile_n), static_cast<int64_t>(n_), 1);
+        auto partial_ref =
+            memref1(partial_->hip_ptr(), static_cast<int64_t>(layout_.tile_n));
+        decode_fn_(&input_ref, &weight_ref, &partial_ref);
+        result.launch_count += 1;
+        check_hip(hipDeviceSynchronize(),
+                  "hipDeviceSynchronize(resident gpu dense decode tile)");
+        launch_accumulate_bf16_to_f32(partial_->hip_ptr(), accum_->hip_ptr(),
+                                      layout_.tile_n);
+      }
+      launch_f32_to_bf16(accum_->hip_ptr(), output_->hip_ptr(), layout_.tile_n);
+      check_hip(hipDeviceSynchronize(),
+                "hipDeviceSynchronize(resident gpu dense decode reduction)");
+    } else {
+      auto input_ref =
+          memref1(handoff_->hip_ptr(offset), static_cast<int64_t>(h_));
+      auto weight_ref =
+          memref2(decode_weights_->hip_ptr(), static_cast<int64_t>(h_),
+                  static_cast<int64_t>(n_));
+      auto output_ref = memref1(output_->hip_ptr(), static_cast<int64_t>(n_));
+      decode_fn_(&input_ref, &weight_ref, &output_ref);
+      result.launch_count += 1;
+      check_hip(hipDeviceSynchronize(),
+                "hipDeviceSynchronize(resident gpu dense decode)");
+    }
+    result.decode_us = now_us() - decode_start;
+
+    const uint64_t read_start = now_us();
+    output_->hip_read_host(cfg.output);
+    result.output_readback_us = now_us() - read_start;
+    if (cfg.capture_details && cfg.prefill_output)
+      handoff_->hip_read_host(cfg.prefill_output);
+    if (cfg.capture_details && cfg.decode_input)
+      handoff_->hip_read_host(cfg.decode_input, h_ * es_, offset);
+  }
+
+private:
+  uint64_t m_;
+  uint64_t k_;
+  uint64_t h_;
+  uint64_t n_;
+  uint32_t dtype_;
+  size_t es_;
+  DecodeLayout layout_;
+  std::unique_ptr<SharedLibrary> prefill_lib_;
+  std::unique_ptr<SharedLibrary> decode_lib_;
+  PrefillFn prefill_fn_ = nullptr;
+  DecodeFn decode_fn_ = nullptr;
+  DecodeInt4Fn decode_int4_fn_ = nullptr;
+  std::unique_ptr<HipDeviceBuffer> input_;
+  std::unique_ptr<HipDeviceBuffer> prefill_weights_;
+  std::unique_ptr<HipDeviceBuffer> handoff_;
+  std::unique_ptr<HipDeviceBuffer> decode_weights_;
+  std::unique_ptr<HipDeviceBuffer> decode_scales_;
+  std::unique_ptr<HipDeviceBuffer> output_;
+  std::unique_ptr<HipDeviceBuffer> partial_;
+  std::unique_ptr<HipDeviceBuffer> accum_;
+};
+
+class NpuResidentPipeline final : public ResidentPipeline {
+public:
+  explicit NpuResidentPipeline(
+      const LlmLinearResidentPipelinePrepareConfig &cfg)
+      : m_(cfg.m), k_(cfg.k), h_(cfg.h), n_(cfg.n), dtype_(cfg.dtype),
+        es_(elem_size(cfg.dtype)), layout_(make_resident_decode_layout(cfg)),
+        prefill_tile_h_(std::min<uint64_t>(cfg.h, 512)),
+        device_(std::make_shared<xrt::device>(0)),
+        prefill_kernel_(std::make_unique<NpuKernel>(
+            cfg.npu_prefill_xclbin, cfg.npu_prefill_insts, cfg.npu_kernel_name,
+            device_)),
+        decode_kernel_(std::make_unique<NpuKernel>(
+            cfg.npu_decode_xclbin, cfg.npu_decode_insts, cfg.npu_kernel_name,
+            device_)) {
+    check_hip(hipSetDevice(0), "hipSetDevice(0)");
+    auto &device = prefill_kernel_->device();
+    input_row_ = acquire_hip_vmem_xrt_bo(device, k_ * es_);
+    handoff_ = acquire_hip_vmem_xrt_bo(device, m_ * h_ * es_);
+    prefill_temp_ = acquire_hip_vmem_xrt_bo(device, prefill_tile_h_ * es_);
+    output_full_ = acquire_hip_vmem_xrt_bo(device, n_ * es_);
+    output_tile_ = acquire_hip_vmem_xrt_bo(device, layout_.tile_n * es_);
+
+    prepare_prefill_weight_tiles(cfg, device);
+    if (layout_.int4)
+      prepare_int4_decode_tiles(cfg, device);
+    else
+      prepare_dense_decode_tiles(cfg, device);
+  }
+
+  const char *storage_kind() const override { return "xrt_static_bo"; }
+
+  void run(const LlmLinearResidentPipelineRunConfig &cfg,
+           LlmLinearResidentPipelineRunResult &result) override {
+    if (!cfg.input || !cfg.output)
+      throw std::runtime_error("resident NPU run missing input/output");
+    const uint64_t prefill_start = now_us();
+    for (uint64_t row = 0; row < m_; ++row) {
+      const uint64_t upload_start = now_us();
+      input_row_->xrt_write_host(static_cast<const uint8_t *>(cfg.input) +
+                                 row * k_ * es_);
+      result.input_upload_us += now_us() - upload_start;
+      for (uint64_t tile = 0; tile < prefill_weight_tiles_.size(); ++tile) {
+        const uint64_t start_h = tile * prefill_tile_h_;
+        const uint64_t width =
+            std::min<uint64_t>(prefill_tile_h_, h_ - start_h);
+        prefill_kernel_->run3(input_row_, prefill_weight_tiles_[tile],
+                              prefill_temp_);
+        result.launch_count += 1;
+        prefill_temp_->sync_from_xrt(width * es_, 0);
+        check_hip(hipMemcpy(handoff_->hip_ptr(row * h_ * es_ + start_h * es_),
+                            prefill_temp_->hip_ptr(), width * es_,
+                            hipMemcpyDeviceToDevice),
+                  "hipMemcpy D2D(resident npu prefill tile)");
+      }
+    }
+    check_hip(hipDeviceSynchronize(),
+              "hipDeviceSynchronize(resident npu prefill)");
+    result.prefill_us = now_us() - prefill_start;
+
+    const uint64_t decode_start = now_us();
+    if (layout_.int4)
+      run_int4_decode(cfg, result);
+    else
+      run_dense_decode(cfg, result);
+    result.decode_us = now_us() - decode_start;
+
+    const uint64_t read_start = now_us();
+    output_full_->hip_read_host(cfg.output);
+    result.output_readback_us = now_us() - read_start;
+    const uint64_t offset = (m_ - 1) * h_ * es_;
+    if (cfg.capture_details && cfg.prefill_output)
+      handoff_->hip_read_host(cfg.prefill_output);
+    if (cfg.capture_details && cfg.decode_input)
+      handoff_->hip_read_host(cfg.decode_input, h_ * es_, offset);
+  }
+
+private:
+  void prepare_prefill_weight_tiles(
+      const LlmLinearResidentPipelinePrepareConfig &cfg, xrt::device &device) {
+    const uint64_t tiles = (h_ + prefill_tile_h_ - 1) / prefill_tile_h_;
+    prefill_weight_tiles_.reserve(static_cast<size_t>(tiles));
+    std::vector<uint8_t> staged(k_ * prefill_tile_h_ * es_, 0);
+    const auto *src = static_cast<const uint8_t *>(cfg.prefill_weights);
+    for (uint64_t tile = 0; tile < tiles; ++tile) {
+      const uint64_t start_h = tile * prefill_tile_h_;
+      const uint64_t width = std::min<uint64_t>(prefill_tile_h_, h_ - start_h);
+      std::fill(staged.begin(), staged.end(), 0);
+      for (uint64_t k = 0; k < k_; ++k) {
+        std::memcpy(staged.data() + k * prefill_tile_h_ * es_,
+                    src + (k * h_ + start_h) * es_, width * es_);
+      }
+      auto bo = acquire_hip_vmem_xrt_bo(device, staged.size());
+      bo->xrt_write_host(staged.data());
+      static_upload_bytes_ += staged.size();
+      prefill_weight_tiles_.push_back(std::move(bo));
+    }
+  }
+
+  void
+  prepare_dense_decode_tiles(const LlmLinearResidentPipelinePrepareConfig &cfg,
+                             xrt::device &device) {
+    decode_input_ = acquire_hip_vmem_xrt_bo(device, layout_.tile_h * es_);
+    accum_ = std::make_unique<HipDeviceBuffer>(layout_.tile_n * sizeof(float));
+    const uint64_t h_tiles = h_ / layout_.tile_h;
+    const uint64_t n_tiles = n_ / layout_.tile_n;
+    decode_weight_tiles_.reserve(static_cast<size_t>(h_tiles * n_tiles));
+    std::vector<uint8_t> staged(layout_.dense_tile_bytes(), 0);
+    const auto *src = static_cast<const uint8_t *>(cfg.decode_weights);
+    for (uint64_t start_n = 0; start_n < n_; start_n += layout_.tile_n) {
+      for (uint64_t start_h = 0; start_h < h_; start_h += layout_.tile_h) {
+        for (uint64_t row = 0; row < layout_.tile_h; ++row) {
+          std::memcpy(staged.data() + row * layout_.tile_n * es_,
+                      src + ((start_h + row) * n_ + start_n) * es_,
+                      layout_.tile_n * es_);
+        }
+        auto bo = acquire_hip_vmem_xrt_bo(device, staged.size());
+        bo->xrt_write_host(staged.data());
+        static_upload_bytes_ += staged.size();
+        decode_weight_tiles_.push_back(std::move(bo));
+      }
+    }
+  }
+
+  void
+  prepare_int4_decode_tiles(const LlmLinearResidentPipelinePrepareConfig &cfg,
+                            xrt::device &device) {
+    decode_input_ = acquire_hip_vmem_xrt_bo(device, h_ * es_);
+    const uint64_t n_tiles = n_ / layout_.tile_n;
+    decode_weight_tiles_.reserve(static_cast<size_t>(n_tiles));
+    decode_scale_tiles_.reserve(static_cast<size_t>(n_tiles));
+    std::vector<uint8_t> packed(layout_.packed_tile_bytes(), 0);
+    std::vector<uint8_t> scales(layout_.scale_tile_bytes(), 0);
+    const auto *packed_src =
+        static_cast<const uint32_t *>(cfg.decode_packed_weights);
+    const auto *scale_src = static_cast<const float *>(cfg.decode_scales);
+    const uint64_t packed_words_per_tile = layout_.tile_n / 8;
+    for (uint64_t start_n = 0; start_n < n_; start_n += layout_.tile_n) {
+      const uint64_t word_start = start_n / 8;
+      auto *packed_dst = reinterpret_cast<uint32_t *>(packed.data());
+      for (uint64_t row = 0; row < h_; ++row) {
+        std::memcpy(packed_dst + row * packed_words_per_tile,
+                    packed_src + row * layout_.packed_word_cols + word_start,
+                    packed_words_per_tile * sizeof(uint32_t));
+      }
+      auto *scale_dst = reinterpret_cast<float *>(scales.data());
+      for (uint64_t block = 0; block < layout_.block_count; ++block) {
+        std::memcpy(scale_dst + block * layout_.tile_n,
+                    scale_src + block * n_ + start_n,
+                    layout_.tile_n * sizeof(float));
+      }
+      auto packed_bo = acquire_hip_vmem_xrt_bo(device, packed.size());
+      auto scale_bo = acquire_hip_vmem_xrt_bo(device, scales.size());
+      packed_bo->xrt_write_host(packed.data());
+      scale_bo->xrt_write_host(scales.data());
+      static_upload_bytes_ += packed.size() + scales.size();
+      decode_weight_tiles_.push_back(std::move(packed_bo));
+      decode_scale_tiles_.push_back(std::move(scale_bo));
+    }
+  }
+
+  void run_dense_decode(const LlmLinearResidentPipelineRunConfig &,
+                        LlmLinearResidentPipelineRunResult &result) {
+    const uint64_t offset = (m_ - 1) * h_ * es_;
+    uint64_t weight_index = 0;
+    for (uint64_t start_n = 0; start_n < n_; start_n += layout_.tile_n) {
+      check_hip(hipMemset(accum_->hip_ptr(), 0, layout_.tile_n * sizeof(float)),
+                "hipMemset(resident npu decode accum)");
+      for (uint64_t start_h = 0; start_h < h_; start_h += layout_.tile_h) {
+        check_hip(hipMemcpy(decode_input_->hip_ptr(),
+                            handoff_->hip_ptr(offset + start_h * es_),
+                            layout_.tile_h * es_, hipMemcpyDeviceToDevice),
+                  "hipMemcpy D2D(resident npu decode input tile)");
+        check_hip(hipDeviceSynchronize(),
+                  "hipDeviceSynchronize(resident npu decode input tile)");
+        decode_input_->sync_to_xrt(layout_.tile_h * es_);
+        decode_kernel_->run3(decode_input_, decode_weight_tiles_[weight_index],
+                             output_tile_);
+        result.launch_count += 1;
+        output_tile_->sync_from_xrt(layout_.tile_n * es_);
+        launch_accumulate_bf16_to_f32(output_tile_->hip_ptr(),
+                                      accum_->hip_ptr(), layout_.tile_n);
+        ++weight_index;
+      }
+      launch_f32_to_bf16(accum_->hip_ptr(),
+                         output_full_->hip_ptr(start_n * es_), layout_.tile_n);
+      check_hip(hipDeviceSynchronize(),
+                "hipDeviceSynchronize(resident npu decode reduction)");
+    }
+  }
+
+  void run_int4_decode(const LlmLinearResidentPipelineRunConfig &,
+                       LlmLinearResidentPipelineRunResult &result) {
+    const uint64_t offset = (m_ - 1) * h_ * es_;
+    check_hip(hipMemcpy(decode_input_->hip_ptr(), handoff_->hip_ptr(offset),
+                        h_ * es_, hipMemcpyDeviceToDevice),
+              "hipMemcpy D2D(resident npu int4 decode input)");
+    check_hip(hipDeviceSynchronize(),
+              "hipDeviceSynchronize(resident npu int4 decode input)");
+    decode_input_->sync_to_xrt(h_ * es_);
+    uint64_t tile = 0;
+    for (uint64_t start_n = 0; start_n < n_; start_n += layout_.tile_n) {
+      decode_kernel_->run4(decode_input_, decode_weight_tiles_[tile],
+                           decode_scale_tiles_[tile], output_tile_);
+      result.launch_count += 1;
+      output_tile_->sync_from_xrt(layout_.tile_n * es_);
+      check_hip(hipMemcpy(output_full_->hip_ptr(start_n * es_),
+                          output_tile_->hip_ptr(), layout_.tile_n * es_,
+                          hipMemcpyDeviceToDevice),
+                "hipMemcpy D2D(resident npu int4 output tile)");
+      ++tile;
+    }
+    check_hip(hipDeviceSynchronize(),
+              "hipDeviceSynchronize(resident npu int4 output)");
+  }
+
+  uint64_t m_;
+  uint64_t k_;
+  uint64_t h_;
+  uint64_t n_;
+  uint32_t dtype_;
+  size_t es_;
+  DecodeLayout layout_;
+  uint64_t prefill_tile_h_;
+  std::shared_ptr<xrt::device> device_;
+  std::unique_ptr<NpuKernel> prefill_kernel_;
+  std::unique_ptr<NpuKernel> decode_kernel_;
+  PooledHipVmemBo input_row_;
+  PooledHipVmemBo handoff_;
+  PooledHipVmemBo prefill_temp_;
+  PooledHipVmemBo decode_input_;
+  PooledHipVmemBo output_tile_;
+  PooledHipVmemBo output_full_;
+  std::vector<PooledHipVmemBo> prefill_weight_tiles_;
+  std::vector<PooledHipVmemBo> decode_weight_tiles_;
+  std::vector<PooledHipVmemBo> decode_scale_tiles_;
+  std::unique_ptr<HipDeviceBuffer> accum_;
+};
+
+std::mutex &resident_pipeline_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_map<uint64_t, std::unique_ptr<ResidentPipeline>> &
+resident_pipelines() {
+  static auto *pipelines =
+      new std::unordered_map<uint64_t, std::unique_ptr<ResidentPipeline>>();
+  return *pipelines;
+}
+
+uint64_t next_resident_pipeline_handle() {
+  static uint64_t next = 1;
+  return next++;
+}
+
 } // namespace
 
 extern "C" int llm_linear_direct_bridge_probe() {
@@ -1596,6 +2208,91 @@ llm_linear_direct_bridge_run_gpu_stage(const LlmLinearGpuStageRunConfig *config,
   } catch (const std::exception &exc) {
     set_last_error(exc.what());
     copy_cstr(result->diagnostic, sizeof(result->diagnostic), exc.what());
+    return 1;
+  }
+}
+
+extern "C" int llm_linear_direct_bridge_prepare_resident_pipeline(
+    const LlmLinearResidentPipelinePrepareConfig *config,
+    LlmLinearResidentPipelinePrepareResult *result) {
+  if (!config || !result) {
+    set_last_error("null resident pipeline prepare config/result");
+    return 1;
+  }
+  std::memset(result, 0, sizeof(*result));
+  result->abi_version = kAbiVersion;
+  try {
+    validate_resident_prepare_config(*config);
+    ScopedUnsetEnv scoped_pythonpath("PYTHONPATH");
+    ScopedUnsetEnv scoped_ld_library_path("LD_LIBRARY_PATH");
+    check_hip(hipSetDevice(0), "hipSetDevice(0)");
+    std::unique_ptr<ResidentPipeline> pipeline;
+    if (config->backend == kResidentBackendGpu)
+      pipeline = std::make_unique<GpuResidentPipeline>(*config);
+    else
+      pipeline = std::make_unique<NpuResidentPipeline>(*config);
+
+    const uint64_t handle = next_resident_pipeline_handle();
+    result->handle = handle;
+    result->static_upload_bytes = pipeline->static_upload_bytes();
+    copy_cstr(result->storage_kind, sizeof(result->storage_kind),
+              pipeline->storage_kind());
+    {
+      std::lock_guard<std::mutex> lock(resident_pipeline_mutex());
+      resident_pipelines()[handle] = std::move(pipeline);
+    }
+    copy_cstr(result->diagnostic, sizeof(result->diagnostic), "ok");
+    set_last_error("ok");
+    return 0;
+  } catch (const std::exception &exc) {
+    set_last_error(exc.what());
+    copy_cstr(result->diagnostic, sizeof(result->diagnostic), exc.what());
+    return 1;
+  }
+}
+
+extern "C" int llm_linear_direct_bridge_run_resident_pipeline(
+    const LlmLinearResidentPipelineRunConfig *config,
+    LlmLinearResidentPipelineRunResult *result) {
+  if (!config || !result) {
+    set_last_error("null resident pipeline run config/result");
+    return 1;
+  }
+  std::memset(result, 0, sizeof(*result));
+  result->abi_version = kAbiVersion;
+  try {
+    if (config->abi_version != kAbiVersion)
+      throw std::runtime_error("unsupported resident pipeline run ABI version");
+    ResidentPipeline *pipeline = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(resident_pipeline_mutex());
+      auto it = resident_pipelines().find(config->handle);
+      if (it == resident_pipelines().end())
+        throw std::runtime_error("unknown resident pipeline handle");
+      pipeline = it->second.get();
+    }
+    pipeline->run(*config, *result);
+    copy_cstr(result->diagnostic, sizeof(result->diagnostic), "ok");
+    set_last_error("ok");
+    return 0;
+  } catch (const std::exception &exc) {
+    set_last_error(exc.what());
+    copy_cstr(result->diagnostic, sizeof(result->diagnostic), exc.what());
+    return 1;
+  }
+}
+
+extern "C" int
+llm_linear_direct_bridge_release_resident_pipeline(uint64_t handle) {
+  try {
+    std::lock_guard<std::mutex> lock(resident_pipeline_mutex());
+    auto it = resident_pipelines().find(handle);
+    if (it != resident_pipelines().end())
+      resident_pipelines().erase(it);
+    set_last_error("ok");
+    return 0;
+  } catch (const std::exception &exc) {
+    set_last_error(exc.what());
     return 1;
   }
 }

@@ -49,6 +49,10 @@ def _npu_source_cfg(cfg: LinearKernelConfig) -> LinearKernelConfig:
     )
 
 
+def _gpu_prefill_source_cfg(cfg: LinearKernelConfig) -> LinearKernelConfig:
+    return LinearKernelConfig(M=1, K=cfg.K, H=cfg.H, N=cfg.N, dtype=cfg.dtype)
+
+
 def _npu_decode_source_cfg(cfg: LinearKernelConfig) -> LinearKernelConfig:
     return LinearKernelConfig(
         M=cfg.M, K=cfg.K, H=cfg.H, N=min(cfg.N, NPU_DECODE_TILE_N), dtype=cfg.dtype
@@ -230,15 +234,16 @@ def _write_gpu_air_sources(
     include_decode_int4: bool,
 ) -> dict[str, Path]:
     cfg = kernel_config_from_manifest(manifest)
+    prefill_cfg = _gpu_prefill_source_cfg(cfg)
     quant = decode_quantization_plan(manifest)
     source_dir = generated_air_source_root(manifest) / "gpu"
     source_dir.mkdir(parents=True, exist_ok=True)
     paths: dict[str, Path] = {}
 
-    prefill_name = default_air_filenames(cfg)["prefill"]
+    prefill_name = default_air_filenames(prefill_cfg)["prefill"]
     paths["prefill"] = source_dir / prefill_name
     paths["prefill"].write_text(
-        prefill_gemm_air(cfg, align_output_dma=True), encoding="utf-8"
+        prefill_gemm_air(prefill_cfg, align_output_dma=True), encoding="utf-8"
     )
 
     dense_decode_cfg = _gpu_dense_decode_source_cfg(cfg)
@@ -366,6 +371,8 @@ def resolve_air_sources(
                 decode_int4_block_size=(32 if quant is None else quant.block_size),
             )["decode_int4"]
     if backend == "gpu":
+        prefill_cfg = _gpu_prefill_source_cfg(cfg)
+        names["prefill"] = default_air_filenames(prefill_cfg)["prefill"]
         dense_decode_cfg = _gpu_dense_decode_source_cfg(cfg)
         names["decode"] = default_air_filenames(dense_decode_cfg)["decode"]
     paths = {key: source_dir / name for key, name in names.items()}
@@ -444,6 +451,8 @@ def populate_artifacts(
                 compiler_cfg["gpu_arch"],
                 ENTRYPOINTS[key],
             )
+            if key == "prefill":
+                artifact_entry["gpu"]["source_m"] = 1
             if key == "decode":
                 artifact_entry["gpu"].update(_gpu_dense_decode_tile_metadata(cfg))
     return manifest

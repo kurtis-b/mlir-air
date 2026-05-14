@@ -129,6 +129,7 @@ def test_linear_compile_populates_artifacts(
     monkeypatch.setattr(linear_compile, "compile_npu_with_args", fake_npu_with_args)
     populated = linear_compile.populate_artifacts(manifest, {"gpu", "npu"})
     assert populated["artifacts"]["prefill"]["gpu"]["entry"] == "llm_linear_prefill"
+    assert populated["artifacts"]["prefill"]["gpu"]["source_m"] == 1
     assert populated["artifacts"]["decode"]["gpu"]["tile_h"] == 64
     assert populated["artifacts"]["decode"]["gpu"]["tile_n"] == 32
     assert populated["artifacts"]["decode"]["npu"]["xclbin"].endswith(".xclbin")
@@ -139,6 +140,7 @@ def test_linear_compile_populates_artifacts(
 
     sources = linear_compile.resolve_air_sources(manifest, "gpu")
     assert set(sources) == {"prefill", "decode"}
+    assert sources["prefill"].name.startswith("prefill_gemm_m1_")
     with pytest.raises(ValueError, match="Unsupported source backend"):
         linear_compile.resolve_air_sources(manifest, "cpu")
 
