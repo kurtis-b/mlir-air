@@ -1,8 +1,7 @@
 # Backend ISA And Disassembly Workflow
 
-This note records the artifact-level disassembly workflow used on a local
-Ryzen AI development system. It covers the three backends that commonly appear
-in this checkout:
+`utils/isa_inspect/disassemble.sh` provides one local CLI for compile-time ISA
+inspection across CPU, GPU, and NPU artifacts.
 
 | Backend | Local target | Primary artifact | Primary tool |
 |---------|--------------|------------------|--------------|
@@ -11,216 +10,86 @@ in this checkout:
 | NPU core | `aie2p` | per-core AIE ELF | Peano `llvm-objdump` |
 | NPU runtime stream | `aie2txn` | `air.insts.bin` transaction/control binary | XRT `aiebu-dump` |
 
-The workflows below are compile-time inspection paths. They do not require
-running a kernel on hardware unless the input artifact is missing and must be
-generated first.
+Run `utils/isa_inspect/disassemble.sh --help` or
+`utils/isa_inspect/disassemble.sh <cpu|gpu|npu> --help` for option details.
 
 ## Setup
 
-The scripts under `utils/isa_inspect/` respect explicit tool variables and also
-try the repo-local install directories that are normally present after a local
-build.
+Use the existing environment setup scripts directly.
 
 ```bash
-# GPU inspection
 source utils/env_setup_gpu.sh install-gpu llvm/install-amdgpu
-
-# NPU inspection
 source utils/env_setup.sh install-xrt <mlir-aie-install> <llvm-aie-install> my_install/mlir
 source /opt/xilinx/xrt/setup.sh
 ```
 
-Useful overrides:
+Useful overrides include:
 
 ```bash
+export AIR_GPU_CHIP=gfx1150
 export AIR_OPT=/path/to/air-opt
 export MLIR_OPT=/path/to/mlir-opt
-export LLVM_INSTALL_DIR=/path/to/llvm
+export LLVM_INSTALL_DIR=/path/to/llvm/install
+export LLVM_READOBJ=/path/to/llvm-readobj
+export LLVM_OBJDUMP=/path/to/llvm-objdump
+export LLVM_NM=/path/to/llvm-nm
 export PEANO_INSTALL_DIR=/path/to/llvm-aie
 export AIEBU_DUMP=/opt/xilinx/xrt/bin/aiebu-dump
 ```
 
-## CPU: x86-64 Host Artifacts
+The CLI also checks common repo-local install locations before falling back to
+tools on `PATH`.
 
-Use the CPU script for host-side objects, shared libraries, and executables.
+## Examples
+
+CPU host artifact:
 
 ```bash
-utils/isa_inspect/cpu_disassemble.sh install-gpu/lib/libairgpu.so \
-  --output-dir /tmp/air_cpu_isa
+utils/isa_inspect/disassemble.sh cpu install-gpu/lib/libairgpu.so \
+  --output-dir /tmp/air_cpu_isa \
+  --symbol mgpuLaunchKernel \
+  --expect 'Disassembly of section|file format elf64-x86-64'
 ```
 
-The script writes:
-
-- `*.headers.txt`: ELF headers, sections, and symbols from `llvm-readobj`.
-- `*.dynamic.txt`: dynamic table and needed libraries when present.
-- `*.symbols.txt`: demangled symbol table when `llvm-nm` is available.
-- `*.disasm.s`: Intel-syntax x86-64 disassembly from `llvm-objdump`.
-
-To focus a large shared library, pass exact symbol names:
+GPU AIR input:
 
 ```bash
-utils/isa_inspect/cpu_disassemble.sh install-gpu/lib/libairgpu.so \
-  --symbol mgpuModuleLoad \
-  --symbol mgpuLaunchKernel
-```
-
-Reference material:
-
-- Intel 64 and IA-32 Architectures Software Developer's Manual:
-  <https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html>
-- AMD64 Architecture Programmer's Manual:
-  <https://www.amd.com/en/developer/resources/developer-guides-manuals.html>
-- LLVM command guides for `llvm-readobj` and `llvm-objdump`:
-  <https://llvm.org/docs/CommandGuide/>
-
-## GPU: AMDGPU `gfx1150`
-
-The AIR GPU path lowers AIR to `gpu.module`, attaches a ROCDL target, and uses
-`gpu-module-to-binary` in two complementary modes:
-
-- `gpu-module-to-binary{format=isa}` emits readable AMDGPU assembly in a
-  `gpu.binary` object. The helper script also extracts that MLIR string to a
-  standalone `.s` file.
-- `gpu-module-to-binary{format=bin}` emits the final ELF code object embedded in
-  MLIR. The helper script extracts that payload to a `.hsaco` file and runs
-  `llvm-readobj --notes` so the code-object metadata is visible: VGPR count,
-  SGPR count, workgroup size, wavefront size, and target ID.
-
-Example:
-
-```bash
-utils/isa_inspect/gpu_disassemble.sh test/gpu/int8_gemm/air_sync.mlir \
+utils/isa_inspect/disassemble.sh gpu test/gpu/int8_gemm/air_sync.mlir \
   --gpu-arch gfx1150 \
   --output-dir /tmp/air_gpu_isa \
   --expect v_wmma_i32_16x16x16_iu8 \
   --forbid 'v_wmma_.*16x16x64|v_swmmac|swmmac'
 ```
 
-The script writes:
-
-- `*.rocdl.mlir`: AIR lowered toward GPU/ROCDL.
-- `*.outline.mlir`: GPU module outlining result.
-- `*.outline_llvm.mlir`: affine/SCF/linalg lowered before ROCDL conversion.
-- `*.isa.mlir`: MLIR containing `gpu.binary` assembly payload.
-- `*.isa.s`: extracted readable AMDGPU assembly.
-- `*.bin.mlir`: MLIR containing the binary code object payload.
-- `*.hsaco`: extracted AMDGPU ELF code object from `format=bin`.
-- `*.code_object.readobj.txt`: ELF headers, sections, symbols, and AMDGPU notes.
-- `*.final.mlir`: host-lowered MLIR with the embedded binary target.
-- `*.summary.txt`: compact target, metadata, and tool summary.
-
-For the local `int8_gemm` smoke test, the important checks are:
-
-- target metadata names `gfx1150`;
-- the extracted code-object metadata reports `wavefront_size = 32`;
-- VGPR and SGPR counts are present;
-- the ISA contains `v_wmma_i32_16x16x16_iu8`;
-- the ISA does not contain gfx12-only WMMA forms such as `v_swmmac`.
-
-Reference material:
-
-- MLIR GPU dialect serialization and `gpu.binary` behavior:
-  <https://mlir.llvm.org/docs/Dialects/GPU/>
-- LLVM AMDGPU backend usage and code-object metadata:
-  <https://llvm.org/docs/AMDGPUUsage.html>
-
-## NPU: AIE2P Core ISA
-
-The AIE2P core ISA lives in the per-core ELF files generated by the AIE/Peano
-backend. These files are usually under an `air_project/` directory and have
-names like `*_core_<col>_<row>.elf`.
-
-Use Peano's `llvm-objdump`, not `aiebu-dump`, for actual core instructions:
+NPU core ELF or transaction stream:
 
 ```bash
-"$PEANO_INSTALL_DIR/bin/llvm-objdump" \
-  -d --triple=aie2p-none-unknown-elf --mcpu=aie2p \
-  path/to/air_project/segment_0_core_0_2.elf
-```
-
-The wrapper script auto-detects ELF input and dispatches to that command:
-
-```bash
-utils/isa_inspect/npu_disassemble.sh \
-  path/to/air_project/segment_0_core_0_2.elf \
-  --output-dir /tmp/air_npu_core_isa
-```
-
-The output `*.aie2p.disasm.s` should contain AIE2P mnemonics such as `movxm`,
-`padda`, `vlda`, `vst`, `acq`, `rel`, and vector operations emitted by the
-kernel.
-
-## NPU: Transaction And Control Streams
-
-`air.insts.bin` is not a per-core vector ISA object. It is an NPU runtime
-transaction/control-code binary: register writes, block writes, DDR patch
-records, timer records, and synchronization operations consumed by the XRT/NPU
-runtime stack.
-
-Use XRT's AIEBU tools for this layer:
-
-```bash
-/opt/xilinx/xrt/bin/aiebu-dump path/to/air.insts.bin -d -m aie2txn
-/opt/xilinx/xrt/bin/aiebu-dump path/to/air.insts.bin -p -m aie2txn
-```
-
-The NPU script auto-detects non-ELF input as a transaction/control stream:
-
-```bash
-utils/isa_inspect/npu_disassemble.sh path/to/air.insts.bin \
-  --output-dir /tmp/air_npu_ctrl
-```
-
-The disassembly output should show operations such as:
-
-- `XAIE_IO_WRITE`
-- `XAIE_IO_BLOCKWRITE`
-- `XAIE_IO_MASKWRITE`
-- `XAIE_IO_CUSTOM_OP_DDR_PATCH`
-- `XAIE_IO_CUSTOM_OP_TCT`
-
-The profile output reports opcode frequency counts for the control-code binary.
-This is useful for checking runtime stream shape, but it is not a replacement
-for `llvm-objdump` on per-core AIE2P ELFs.
-
-Reference material:
-
-- Xilinx AIEBU repository and user manual:
-  <https://github.com/Xilinx/aiebu>
-- `aiebu-dump` manual page:
-  <https://manpages.ubuntu.com/manpages/resolute/man1/aiebu-dump.1.html>
-
-## End-To-End Smoke Checks
-
-GPU:
-
-```bash
-utils/isa_inspect/gpu_disassemble.sh test/gpu/int8_gemm/air_sync.mlir \
-  --gpu-arch gfx1150 \
-  --output-dir /tmp/air_gpu_isa \
-  --expect v_wmma_i32_16x16x16_iu8
-```
-
-NPU core ELF:
-
-```bash
-utils/isa_inspect/npu_disassemble.sh path/to/*_core_*.elf \
+utils/isa_inspect/disassemble.sh npu path/to/segment_0_core_0_2.elf \
+  --kind elf \
   --output-dir /tmp/air_npu_core_isa \
   --expect movxm
 ```
 
-NPU control stream:
+For `air.insts.bin`, use the same `npu` subcommand with `--kind txn` or the
+default `--kind auto`, and expect `XAIE_IO_` control-stream operations.
 
-```bash
-utils/isa_inspect/npu_disassemble.sh path/to/air.insts.bin \
-  --output-dir /tmp/air_npu_ctrl \
-  --expect XAIE_IO_
-```
+## Outputs
 
-CPU:
+Each subcommand writes backend-specific artifacts plus `*.summary.txt`. GPU
+inspection preserves `${prefix}.final.mlir` for runtime smoke scripts and emits
+readable ISA as `${prefix}.isa.s`.
 
-```bash
-utils/isa_inspect/cpu_disassemble.sh install-gpu/lib/libairgpu.so \
-  --output-dir /tmp/air_cpu_isa \
-  --expect 'file format elf64-x86-64|Disassembly of section'
-```
+## References
+
+- Intel 64 and IA-32 Architectures Software Developer's Manual:
+  <https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html>
+- AMD64 Architecture Programmer's Manual:
+  <https://www.amd.com/en/developer/resources/developer-guides-manuals.html>
+- LLVM command guides:
+  <https://llvm.org/docs/CommandGuide/>
+- MLIR GPU dialect serialization:
+  <https://mlir.llvm.org/docs/Dialects/GPU/>
+- LLVM AMDGPU backend and code-object metadata:
+  <https://llvm.org/docs/AMDGPUUsage.html>
+- Xilinx AIEBU:
+  <https://github.com/Xilinx/aiebu>
