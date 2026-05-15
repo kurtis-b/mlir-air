@@ -15,6 +15,7 @@ from executors import (
     GpuExecutor,
     NpuExecutor,
     StageExecutors,
+    _SharedLibraryWrapper,
     _ranked_memref_descriptor,
 )
 from kernels import KernelConfig
@@ -60,6 +61,32 @@ def test_ranked_memref_descriptor_for_float_dtypes() -> None:
     assert tuple(f32_desc.strides) == (3, 1)
     assert tuple(f16_desc.shape) == (2, 2)
     assert f16_desc.offset == 0
+
+
+def test_shared_library_wrapper_keeps_generated_gpu_symbols_local(
+    monkeypatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[str, int]] = []
+
+    class FakeLibrary:
+        pass
+
+    def fake_cdll(path: str, *, mode: int) -> FakeLibrary:
+        calls.append((str(path), mode))
+        return FakeLibrary()
+
+    monkeypatch.setattr(executors.ctypes, "CDLL", fake_cdll)
+    monkeypatch.setattr(executors.os, "RTLD_GLOBAL", 0x100, raising=False)
+    monkeypatch.setattr(executors.os, "RTLD_LOCAL", 0x200, raising=False)
+    monkeypatch.setattr(executors.os, "RTLD_NOW", 0x2, raising=False)
+
+    preload = tmp_path / "libmlir_runner_utils.so"
+    preload.write_text("", encoding="utf-8")
+    kernel = tmp_path / "prefill_gemm.so"
+
+    _SharedLibraryWrapper(kernel, [str(preload), str(tmp_path / "missing.so")])
+
+    assert calls == [(str(preload), 0x102), (str(kernel), 0x202)]
 
 
 def _filled_invoker(value: float):

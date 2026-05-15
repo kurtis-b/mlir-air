@@ -294,22 +294,28 @@ def compile_npu_parallel_expert(
 
 
 def compile_gpu(
-    source: Path, output_dir: Path, arch: str, entrypoint: str
+    source: Path,
+    output_dir: Path,
+    arch: str,
+    entrypoint: str,
+    *,
+    host_staging: bool = True,
 ) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    outlined_mlir = output_dir / f"{source.stem}.{arch}.outlined.mlir"
-    output_mlir = output_dir / f"{source.stem}.{arch}.gpu.mlir"
-    output_llvm = output_dir / f"{source.stem}.{arch}.ll"
-    output_so = output_dir / f"{source.stem}.{arch}.so"
+    mode_suffix = "host" if host_staging else "device"
+    outlined_mlir = output_dir / f"{source.stem}.{arch}.{mode_suffix}.outlined.mlir"
+    output_mlir = output_dir / f"{source.stem}.{arch}.{mode_suffix}.gpu.mlir"
+    output_llvm = output_dir / f"{source.stem}.{arch}.{mode_suffix}.ll"
+    output_so = output_dir / f"{source.stem}.{arch}.{mode_suffix}.so"
     outline_cmd = [
         _air_opt_tool(),
         str(source),
         "-air-to-rocdl",
         "-air-gpu-outlining",
-        "-air-gpu-host-staging",
-        "-o",
-        str(outlined_mlir),
     ]
+    if host_staging:
+        outline_cmd.append("-air-gpu-host-staging")
+    outline_cmd.extend(["-o", str(outlined_mlir)])
     subprocess.run(outline_cmd, check=True)
     pipeline = (
         f"builtin.module("
@@ -358,6 +364,7 @@ def compile_gpu(
         "llvm": str(output_llvm),
         "so": str(output_so),
         "entry": entrypoint,
+        "host_staging": host_staging,
     }
 
 

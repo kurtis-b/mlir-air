@@ -1,0 +1,50 @@
+{
+  "schema_version": "llm-linear-v3",
+  "model": {
+    "M": 4,
+    "K": 64,
+    "H": 64,
+    "N": 32,
+    "dtype": "bf16",
+    "shape_tier": "tiny_ci"
+  },
+  "paths": {
+    "generated_air_sources": "artifacts/generated_air",
+    "artifacts": "artifacts"
+  },
+  "runtime": {
+    "transfer_mode": "host",
+    "stage_backends": {
+      "prefill": "cpu",
+      "decode": "cpu"
+    }
+  },
+  "compiler": {
+    "npu_device": "npu2",
+    "gpu_arch": "gfx1150"
+  },
+  "benchmark": {
+    "warmup": 1,
+    "iterations": 3
+  },
+  "inputs": {
+    "seed": 31,
+    "scale": 0.25
+  },
+  "weights": {
+    "seed": 11,
+    "scale": 0.125,
+    "decode": {
+      "storage": "bf16"
+    }
+  },
+  "workload": {
+    "suite": "tiny_ci",
+    "name": "default",
+    "description": "bf16 prefill GEMM followed by bf16 decode GEMV"
+  },
+  "artifacts": {
+    "prefill": {},
+    "decode": {}
+  }
+}

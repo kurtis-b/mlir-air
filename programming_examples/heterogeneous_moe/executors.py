@@ -31,13 +31,17 @@ _NPU_SPLIT_COMPILE_LOCK = threading.Lock()
 
 class _SharedLibraryWrapper:
     def __init__(self, library_path: Path, preload_paths: list[str]) -> None:
-        mode = getattr(os, "RTLD_GLOBAL", 0) | getattr(os, "RTLD_NOW", 0)
+        preload_mode = getattr(os, "RTLD_GLOBAL", 0) | getattr(os, "RTLD_NOW", 0)
+        library_mode = getattr(os, "RTLD_LOCAL", 0) | getattr(os, "RTLD_NOW", 0)
         self._preloads = [
-            ctypes.CDLL(path, mode=mode)
+            ctypes.CDLL(path, mode=preload_mode)
             for path in preload_paths
             if Path(path).exists()
         ]
-        self._library = ctypes.CDLL(str(library_path), mode=mode)
+        # Generated MLIR GPU libraries reuse helper/global symbol names across
+        # shapes and stages. Keep runtime dependencies global, but keep each
+        # generated kernel library local to avoid cross-workload interposition.
+        self._library = ctypes.CDLL(str(library_path), mode=library_mode)
 
     def invoke(self, name: str, *args: ctypes.Structure) -> None:
         symbol = "_mlir_ciface_" + name
