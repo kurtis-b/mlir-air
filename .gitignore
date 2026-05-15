@@ -20,9 +20,13 @@ vck5000_aie_base_graph_hw.xsa.link_summary
 Work
 build
 build_*
+build-gpu
 build-xrt
 install
+install-gpu
 install-xrt
+llvm
+my_install
 platform_repo
 myproj
 sw_comp
