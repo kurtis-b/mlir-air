@@ -10,6 +10,7 @@ runtimes and compilers.
 - [Building](building.md)
 - [Running Examples](running.md)
 - [AIRCC](aircc.md)
+- [Backend ISA And Disassembly Workflow](backend_isa_disassembly.md)
 
 ### Generated MLIR Documentation
 - [AIR Dialect](AIRDialect.html)
