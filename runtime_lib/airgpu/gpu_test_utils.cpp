@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 
 #include "hip/hip_runtime.h"
@@ -40,6 +41,22 @@ extern "C" void mgpuInit(float *A, float *B, int64_t N, int64_t M) {
       A[M * y + x] = static_cast<float>(i);
       B[M * y + x] = (x == y) ? 1.0f : 0.0f;
       i++;
+    }
+  }
+}
+
+/// Initialize signed INT8 inputs for INT32 matmul testing.
+extern "C" void mgpuInitI8I32(int8_t *A, int8_t *B, int64_t M, int64_t N,
+                              int64_t K) {
+  for (int64_t i = 0; i < M; ++i) {
+    for (int64_t k = 0; k < K; ++k) {
+      A[i * K + k] = static_cast<int8_t>(((i + 3 * k) & 15) - 8);
+    }
+  }
+
+  for (int64_t k = 0; k < K; ++k) {
+    for (int64_t j = 0; j < N; ++j) {
+      B[k * N + j] = static_cast<int8_t>(((5 * k + j) & 15) - 8);
     }
   }
 }
@@ -73,6 +90,41 @@ extern "C" void mgpuCheckOutput(float *device, float *hostA, float *hostB,
   if (!mismatch) {
     std::cout << "Output Matched!\n";
   }
+}
+
+/// Stochastically verify signed INT8 x INT8 -> INT32 matmul output.
+extern "C" int32_t mgpuCheckOutputI8I32(int32_t *device, const int8_t *hostA,
+                                        const int8_t *hostB, int64_t M,
+                                        int64_t N, int64_t K,
+                                        int64_t samples) {
+  int32_t mismatches = 0;
+  for (int64_t s = 0; s < samples; ++s) {
+    int64_t i = (s * 131 + 17) % M;
+    int64_t j = (s * 197 + 29) % N;
+    int32_t expected = 0;
+    for (int64_t k = 0; k < K; ++k) {
+      expected += static_cast<int32_t>(hostA[i * K + k]) *
+                  static_cast<int32_t>(hostB[k * N + j]);
+    }
+
+    int32_t actual = device[i * N + j];
+    if (actual != expected) {
+      if (mismatches < 8) {
+        std::cout << "INT8 mismatch at (" << i << ", " << j << "): expected "
+                  << expected << " != actual " << actual << std::endl;
+      }
+      ++mismatches;
+    }
+  }
+
+  if (mismatches == 0) {
+    std::cout << "INT8 Output Matched! samples=" << samples << "\n";
+  } else {
+    std::cout << "INT8 Output Mismatches: " << mismatches << " / " << samples
+              << "\n";
+    std::abort();
+  }
+  return mismatches;
 }
 
 /// Measure elapsed time between two GPU events.

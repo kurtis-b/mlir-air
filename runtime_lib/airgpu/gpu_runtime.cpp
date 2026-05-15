@@ -12,21 +12,23 @@
 
 #include "symmetric_heap.h"
 #include "vmem_allocator.h"
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <hip/hip_runtime.h>
+#include <limits>
 #include <mutex>
 
-#define HIP_REPORT_IF_ERROR(expr)                                              \
-  {                                                                            \
-    hipError_t result = (expr);                                                \
-    if (result != hipSuccess) {                                                \
-      fprintf(stderr, "'%s' failed with '%s'\n", #expr,                        \
-              hipGetErrorString(result));                                      \
-    }                                                                          \
-  }
+static void reportHipError(const char *expr, hipError_t result) {
+  if (result != hipSuccess)
+    fprintf(stderr, "'%s' failed with '%s'\n", expr,
+            hipGetErrorString(result));
+}
+
+#define HIP_REPORT_IF_ERROR(expr) reportHipError(#expr, (expr))
 
 // Matches LLVM's StridedMemRefType used in mlir-runner
 template <typename T, int N>
@@ -44,6 +46,65 @@ struct StridedMemRefType {
 
 static VMemAllocator *g_allocator = nullptr;
 static SymmetricHeap *g_symmetric_heap = nullptr;
+
+struct BenchmarkStats {
+  uint64_t count = 0;
+  double totalMs = 0.0;
+  double minMs = std::numeric_limits<double>::infinity();
+  double maxMs = 0.0;
+
+  void reset() {
+    count = 0;
+    totalMs = 0.0;
+    minMs = std::numeric_limits<double>::infinity();
+    maxMs = 0.0;
+  }
+
+  void record(double ms) {
+    ++count;
+    totalMs += ms;
+    if (ms < minMs)
+      minMs = ms;
+    if (ms > maxMs)
+      maxMs = ms;
+  }
+};
+
+static std::atomic<bool> g_kernel_profiling_enabled{false};
+static std::mutex g_benchmark_mutex;
+static BenchmarkStats g_kernel_event_stats;
+static BenchmarkStats g_host_dispatch_wait_stats;
+
+static void recordKernelEventMs(double ms) {
+  if (ms < 0.0)
+    return;
+  std::lock_guard<std::mutex> lock(g_benchmark_mutex);
+  g_kernel_event_stats.record(ms);
+}
+
+static void printBenchmarkStats(const char *domain, const BenchmarkStats &stats,
+                                double ops) {
+  if (stats.count == 0) {
+    printf("timing_domain=%s count=0 min_ms=nan mean_ms=nan max_ms=nan "
+           "tops=nan\n",
+           domain);
+    return;
+  }
+
+  double meanMs = stats.totalMs / static_cast<double>(stats.count);
+  double tops = ops / (meanMs * 1.0e9);
+  printf("timing_domain=%s count=%llu min_ms=%.6f mean_ms=%.6f max_ms=%.6f "
+         "tops=%.6f\n",
+         domain, static_cast<unsigned long long>(stats.count), stats.minMs,
+         meanMs, stats.maxMs, tops);
+}
+
+static double meanTops(const BenchmarkStats &stats, double ops) {
+  if (stats.count == 0)
+    return std::numeric_limits<double>::quiet_NaN();
+  double meanMs = stats.totalMs / static_cast<double>(stats.count);
+  return ops / (meanMs * 1.0e9);
+}
 
 // Lazy-init the standalone allocator (only when mgpuMemAlloc is called
 // without a symmetric heap).  Avoids pinning device 0 at library load time.
@@ -97,9 +158,124 @@ extern "C" void mgpuLaunchKernel(hipFunction_t function, intptr_t gridX,
                                  intptr_t blockZ, int32_t smem,
                                  hipStream_t stream, void **params,
                                  void **extra, size_t /*paramsCount*/) {
-  HIP_REPORT_IF_ERROR(hipModuleLaunchKernel(function, gridX, gridY, gridZ,
-                                            blockX, blockY, blockZ, smem,
-                                            stream, params, extra));
+  if (!g_kernel_profiling_enabled.load(std::memory_order_acquire)) {
+    HIP_REPORT_IF_ERROR(hipModuleLaunchKernel(function, gridX, gridY, gridZ,
+                                              blockX, blockY, blockZ, smem,
+                                              stream, params, extra));
+    return;
+  }
+
+  hipEvent_t start = nullptr;
+  hipEvent_t stop = nullptr;
+  hipError_t result = hipEventCreate(&start);
+  if (result != hipSuccess) {
+    reportHipError("hipEventCreate(&start)", result);
+    HIP_REPORT_IF_ERROR(hipModuleLaunchKernel(function, gridX, gridY, gridZ,
+                                              blockX, blockY, blockZ, smem,
+                                              stream, params, extra));
+    return;
+  }
+
+  result = hipEventCreate(&stop);
+  if (result != hipSuccess) {
+    reportHipError("hipEventCreate(&stop)", result);
+    HIP_REPORT_IF_ERROR(hipEventDestroy(start));
+    HIP_REPORT_IF_ERROR(hipModuleLaunchKernel(function, gridX, gridY, gridZ,
+                                              blockX, blockY, blockZ, smem,
+                                              stream, params, extra));
+    return;
+  }
+
+  bool canProfile = true;
+  result = hipEventRecord(start, stream);
+  if (result != hipSuccess) {
+    reportHipError("hipEventRecord(start, stream)", result);
+    canProfile = false;
+  }
+
+  hipError_t launchResult = hipModuleLaunchKernel(
+      function, gridX, gridY, gridZ, blockX, blockY, blockZ, smem, stream,
+      params, extra);
+  reportHipError("hipModuleLaunchKernel(function, gridX, gridY, gridZ, blockX, "
+                 "blockY, blockZ, smem, stream, params, extra)",
+                 launchResult);
+
+  result = hipEventRecord(stop, stream);
+  if (result != hipSuccess) {
+    reportHipError("hipEventRecord(stop, stream)", result);
+    canProfile = false;
+  }
+
+  if (canProfile && launchResult == hipSuccess) {
+    result = hipEventSynchronize(stop);
+    if (result != hipSuccess) {
+      reportHipError("hipEventSynchronize(stop)", result);
+    } else {
+      float elapsedMs = 0.0f;
+      result = hipEventElapsedTime(&elapsedMs, start, stop);
+      if (result == hipSuccess)
+        recordKernelEventMs(static_cast<double>(elapsedMs));
+      else
+        reportHipError("hipEventElapsedTime(&elapsedMs, start, stop)", result);
+    }
+  }
+
+  HIP_REPORT_IF_ERROR(hipEventDestroy(stop));
+  HIP_REPORT_IF_ERROR(hipEventDestroy(start));
+}
+
+extern "C" void mgpuBenchmarkReset() {
+  std::lock_guard<std::mutex> lock(g_benchmark_mutex);
+  g_kernel_event_stats.reset();
+  g_host_dispatch_wait_stats.reset();
+}
+
+extern "C" void mgpuBenchmarkSetKernelProfiling(int32_t enabled) {
+  g_kernel_profiling_enabled.store(enabled != 0, std::memory_order_release);
+}
+
+extern "C" int64_t mgpuHostTimeNs() {
+  auto now = std::chrono::steady_clock::now().time_since_epoch();
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+}
+
+extern "C" void mgpuBenchmarkRecordHostNs(int64_t elapsedNs) {
+  if (elapsedNs < 0)
+    return;
+
+  double elapsedMs = static_cast<double>(elapsedNs) / 1.0e6;
+  std::lock_guard<std::mutex> lock(g_benchmark_mutex);
+  g_host_dispatch_wait_stats.record(elapsedMs);
+}
+
+extern "C" void mgpuBenchmarkPrintI8I32(int64_t m, int64_t n, int64_t k,
+                                        int64_t warmups,
+                                        int64_t iterations) {
+  BenchmarkStats kernelEventStats;
+  BenchmarkStats hostDispatchWaitStats;
+  {
+    std::lock_guard<std::mutex> lock(g_benchmark_mutex);
+    kernelEventStats = g_kernel_event_stats;
+    hostDispatchWaitStats = g_host_dispatch_wait_stats;
+  }
+
+  double ops = 2.0 * static_cast<double>(m) * static_cast<double>(n) *
+               static_cast<double>(k);
+
+  printf("backend=gpu\n");
+  printf("shape=%lldx%lldx%lld\n", static_cast<long long>(m),
+         static_cast<long long>(n), static_cast<long long>(k));
+  printf("warmups=%lld iterations=%lld\n", static_cast<long long>(warmups),
+         static_cast<long long>(iterations));
+  printBenchmarkStats("kernel_event", kernelEventStats, ops);
+  printBenchmarkStats("host_dispatch_wait", hostDispatchWaitStats, ops);
+  double kernelTops = meanTops(kernelEventStats, ops);
+  constexpr double kRadeon890MInt8PeakTops = 23.7568;
+  printf("gpu_peak_int8_tops=%.4f kernel_event_peak_pct=%.2f "
+         "kernel_event_gap_tops=%.4f\n",
+         kRadeon890MInt8PeakTops,
+         (kernelTops / kRadeon890MInt8PeakTops) * 100.0,
+         kRadeon890MInt8PeakTops - kernelTops);
 }
 
 // ===========================================================================
@@ -150,14 +326,29 @@ extern "C" void mgpuEventRecord(hipEvent_t event, hipStream_t stream) {
 // Memory — VMem-backed (the key difference from LLVM's runtime)
 // ===========================================================================
 
+static bool useHipMallocAllocator() {
+  const char *env = std::getenv("AIRGPU_USE_HIP_MALLOC");
+  return env && std::strcmp(env, "0") != 0;
+}
+
 extern "C" void *mgpuMemAlloc(uint64_t sizeBytes, hipStream_t /*stream*/,
                               bool /*isHostShared*/) {
+  if (useHipMallocAllocator()) {
+    void *ptr = nullptr;
+    HIP_REPORT_IF_ERROR(hipMalloc(&ptr, static_cast<size_t>(sizeBytes)));
+    return ptr;
+  }
   return getDefaultAllocator()->allocate(static_cast<size_t>(sizeBytes));
 }
 
 extern "C" void mgpuMemFree(void *ptr, hipStream_t /*stream*/) {
-  if (ptr)
-    getDefaultAllocator()->free(ptr);
+  if (!ptr)
+    return;
+  if (useHipMallocAllocator()) {
+    HIP_REPORT_IF_ERROR(hipFree(ptr));
+    return;
+  }
+  getDefaultAllocator()->free(ptr);
 }
 
 // ===========================================================================
