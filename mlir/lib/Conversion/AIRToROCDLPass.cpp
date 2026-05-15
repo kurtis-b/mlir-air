@@ -13,11 +13,13 @@
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/Linalg/Passes.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h" // Includes the ops like scf::ForOp
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
@@ -33,6 +35,8 @@ using namespace xilinx::air;
 namespace {
 #define GEN_PASS_DEF_CONVERTAIRTOROCDL
 #include "air/Conversion/Passes.h.inc"
+
+static constexpr const char kInt8GemmWmmaAttr[] = "air.gpu.int8_gemm_wmma";
 
 SmallVector<mlir::BlockArgument, 4> gpuArgs;
 class AffineApplyToSubPattern
@@ -244,6 +248,62 @@ struct ConvertAIRToROCDLPass
   SmallVector<Value, 4> blkIdx;
   SmallVector<Value, 4> gridIdx;
 
+  static bool hasStaticMemRef(Value value, ArrayRef<int64_t> shape,
+                              unsigned elementWidth) {
+    auto type = dyn_cast<MemRefType>(value.getType());
+    return type && type.getShape() == shape &&
+           type.getElementType().isInteger(elementWidth);
+  }
+
+  LogicalResult lowerMarkedInt8GemmLaunch(air::LaunchOp launchOp) {
+    if (launchOp.getNumKernelOperands() != 3)
+      return launchOp.emitOpError(kInt8GemmWmmaAttr)
+             << " expects exactly A, B, and C kernel operands";
+
+    Value a = launchOp.getKernelOperand(0);
+    Value b = launchOp.getKernelOperand(1);
+    Value c = launchOp.getKernelOperand(2);
+    if (!hasStaticMemRef(a, {1024, 1024}, 8) ||
+        !hasStaticMemRef(b, {1024, 1024}, 8) ||
+        !hasStaticMemRef(c, {1024, 1024}, 32))
+      return launchOp.emitOpError(kInt8GemmWmmaAttr)
+             << " only supports memref<1024x1024xi8>, "
+                "memref<1024x1024xi8>, memref<1024x1024xi32>";
+
+    OpBuilder builder(launchOp);
+    Location loc = launchOp.getLoc();
+    Value gridX = arith::ConstantIndexOp::create(builder, loc, 32);
+    Value gridY = arith::ConstantIndexOp::create(builder, loc, 16);
+    Value gridZ = arith::ConstantIndexOp::create(builder, loc, 1);
+    Value blockX = arith::ConstantIndexOp::create(builder, loc, 256);
+    Value blockY = arith::ConstantIndexOp::create(builder, loc, 1);
+    Value blockZ = arith::ConstantIndexOp::create(builder, loc, 1);
+
+    auto gpuLaunch = gpu::LaunchOp::create(builder, loc, gridX, gridY, gridZ,
+                                           blockX, blockY, blockZ);
+    gpuLaunch->setAttr(kInt8GemmWmmaAttr, UnitAttr::get(launchOp.getContext()));
+    gpuLaunch->setAttr("air.gpu.int8_gemm_variant",
+                       builder.getStringAttr("lds_single_buffer"));
+
+    {
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(&gpuLaunch.getBody().front());
+      Value c0 = arith::ConstantIndexOp::create(builder, loc, 0);
+      Value a0 = memref::LoadOp::create(builder, loc, a, ValueRange{c0, c0});
+      Value b0 = memref::LoadOp::create(builder, loc, b, ValueRange{c0, c0});
+      Value a32 =
+          arith::ExtSIOp::create(builder, loc, builder.getI32Type(), a0);
+      Value b32 =
+          arith::ExtSIOp::create(builder, loc, builder.getI32Type(), b0);
+      Value sum = arith::AddIOp::create(builder, loc, a32, b32);
+      memref::StoreOp::create(builder, loc, sum, c, ValueRange{c0, c0});
+      gpu::TerminatorOp::create(builder, loc);
+    }
+
+    launchOp.erase();
+    return success();
+  }
+
   static DenseI32ArrayAttr maybeConstantDimsAttr(gpu::KernelDim3 dims) {
     SmallVector<int32_t, 3> constants;
     MLIRContext *ctx = dims.x.getContext();
@@ -409,6 +469,18 @@ struct ConvertAIRToROCDLPass
     OpBuilder builder(module.getContext());
     mlir::ModuleOp moduleOp = getOperation();
     Value gridXVal, gridYVal;
+
+    SmallVector<air::LaunchOp> markedLaunches;
+    module.walk([&](air::LaunchOp launchOp) {
+      if (launchOp->hasAttr(kInt8GemmWmmaAttr))
+        markedLaunches.push_back(launchOp);
+    });
+    for (air::LaunchOp launchOp : markedLaunches) {
+      if (failed(lowerMarkedInt8GemmLaunch(launchOp))) {
+        signalPassFailure();
+        return;
+      }
+    }
 
     // Create a pattern rewriter to apply transformations to each function
     PatternRewriter rewriter(moduleOp.getContext());
