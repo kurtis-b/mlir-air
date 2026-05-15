@@ -3,6 +3,8 @@
 
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
+PYTHON ?= python3
+
 # Architecture selection: aie2 or aie2p (default)
 AIE_TARGET ?= aie2p
 
@@ -49,16 +51,16 @@ run: run-$(AIE_TARGET)
 
 run-aie2:
 	mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && python $(srcdir)/run.py --input-ir ${INPUT_IR_PATH} --transform-script ${TRANSFORM_SCRIPT}
+	cd $(BUILD_DIR) && $(PYTHON) $(srcdir)/run.py --input-ir ${INPUT_IR_PATH} --transform-script ${TRANSFORM_SCRIPT}
 
 run-aie2p:
 	mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && python $(srcdir)/run.py --input-ir ${INPUT_IR_PATH} --transform-script ${TRANSFORM_SCRIPT}
+	cd $(BUILD_DIR) && $(PYTHON) $(srcdir)/run.py --input-ir ${INPUT_IR_PATH} --transform-script ${TRANSFORM_SCRIPT}
 
 # Compile xclbin only (no execution)
 compile-xclbin:
 	mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && python $(srcdir)/run.py --input-ir ${INPUT_IR_PATH} --transform-script $(TRANSFORM_SCRIPT) --compile-only
+	cd $(BUILD_DIR) && $(PYTHON) $(srcdir)/run.py --input-ir ${INPUT_IR_PATH} --transform-script $(TRANSFORM_SCRIPT) --compile-only
 
 # Profile using C++ executable
 profile: compile-xclbin build-test-exe
@@ -97,7 +99,7 @@ build-test-exe:
 # Debug IR: dump transformed IR to file and exit
 debug_ir:
 	mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && python $(srcdir)/run.py --input-ir ${INPUT_IR_PATH} --transform-script $(TRANSFORM_SCRIPT) --debug-ir $(DEBUG_IR_PATH)
+	cd $(BUILD_DIR) && $(PYTHON) $(srcdir)/run.py --input-ir ${INPUT_IR_PATH} --transform-script $(TRANSFORM_SCRIPT) --debug-ir $(DEBUG_IR_PATH)
 
 clean:
 	rm -rf $(BUILD_DIR) __pycache__
