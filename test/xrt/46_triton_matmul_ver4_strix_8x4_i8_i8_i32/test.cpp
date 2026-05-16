@@ -41,7 +41,11 @@ void add_default_options(cxxopts::Options &options) {
       cxxopts::value<std::string>())("size_m,M", "Matrix size M",
                                      cxxopts::value<int>())(
       "size_n,N", "Matrix size N", cxxopts::value<int>())(
-      "size_k,K", "Matrix size K", cxxopts::value<int>());
+      "size_k,K", "Matrix size K", cxxopts::value<int>())(
+      "warmups", "Warmup iterations",
+      cxxopts::value<unsigned>()->default_value("10"))(
+      "iterations", "Timed iterations",
+      cxxopts::value<unsigned>()->default_value("20"));
 }
 
 int main(int argc, const char *argv[]) {
@@ -154,26 +158,30 @@ int main(int argc, const char *argv[]) {
   bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   bo_c.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-  unsigned n_iterations = 20;
-  unsigned n_warmup_iterations = 10;
+  unsigned n_iterations = vm["iterations"].as<unsigned>();
+  unsigned n_warmup_iterations = vm["warmups"].as<unsigned>();
+  if (n_iterations == 0) {
+    std::cerr << "--iterations must be greater than zero\n";
+    return 2;
+  }
   unsigned num_iter = n_iterations + n_warmup_iterations;
-  float npu_time_total = 0;
-  float npu_time_min = 9999999;
-  float npu_time_max = 0;
+  double npu_time_total = 0;
+  double npu_time_min = std::numeric_limits<double>::infinity();
+  double npu_time_max = 0;
 
   // For int8 matmul: 2 ops (multiply + add) per element
-  float macs = 2.0 * float(M) * float(K) * float(N);
+  double macs = 2.0 * double(M) * double(K) * double(N);
 
   for (unsigned iter = 0; iter < num_iter; iter++) {
 
     if (verbosity >= 1) {
       std::cout << "Running Kernel.\n";
     }
-    auto start = std::chrono::high_resolution_clock::now();
+    auto start = std::chrono::steady_clock::now();
     unsigned int opcode = 3;
     auto run = kernel(opcode, bo_instr, instr_v.size(), bo_a, bo_b, bo_c);
     run.wait();
-    auto stop = std::chrono::high_resolution_clock::now();
+    auto stop = std::chrono::steady_clock::now();
     bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
     if (iter < n_warmup_iterations) {
@@ -183,28 +191,40 @@ int main(int argc, const char *argv[]) {
 
     memcpy(CVec.data(), bufC, (CVec.size() * sizeof(C_DATATYPE)));
 
-    float npu_time =
-        std::chrono::duration_cast<std::chrono::microseconds>(stop - start)
-            .count();
+    double npu_time =
+        std::chrono::duration<double, std::micro>(stop - start).count();
 
     npu_time_total += npu_time;
     npu_time_min = (npu_time < npu_time_min) ? npu_time : npu_time_min;
     npu_time_max = (npu_time > npu_time_max) ? npu_time : npu_time_max;
   }
 
+  double avg_us = npu_time_total / n_iterations;
+  double avg_gops = macs / (1000 * avg_us);
+  double max_gops = macs / (1000 * npu_time_min);
+  double min_gops = macs / (1000 * npu_time_max);
+
   std::cout << std::endl
-            << "Avg NPU matmul time: " << npu_time_total / n_iterations << "us."
-            << std::endl;
-  std::cout << "Avg NPU gflops: "
-            << macs / (1000 * npu_time_total / n_iterations) << std::endl;
+            << "Avg NPU matmul time: " << avg_us << "us." << std::endl;
+  std::cout << "Avg NPU gflops: " << avg_gops << std::endl;
 
   std::cout << std::endl
             << "Min NPU matmul time: " << npu_time_min << "us." << std::endl;
-  std::cout << "Max NPU gflops: " << macs / (1000 * npu_time_min) << std::endl;
+  std::cout << "Max NPU gflops: " << max_gops << std::endl;
 
   std::cout << std::endl
             << "Max NPU matmul time: " << npu_time_max << "us." << std::endl;
-  std::cout << "Min NPU gflops: " << macs / (1000 * npu_time_max) << std::endl;
+  std::cout << "Min NPU gflops: " << min_gops << std::endl;
+
+  std::cout << "backend=npu\n";
+  std::cout << "shape=" << M << "x" << N << "x" << K << "\n";
+  std::cout << "warmups=" << n_warmup_iterations << "\n";
+  std::cout << "iterations=" << n_iterations << "\n";
+  std::cout << "timing_domain=host_run_wait\n";
+  std::cout << "avg_us=" << avg_us << "\n";
+  std::cout << "min_us=" << npu_time_min << "\n";
+  std::cout << "max_us=" << npu_time_max << "\n";
+  std::cout << "gops=" << avg_gops << "\n";
 
   return 0;
 }

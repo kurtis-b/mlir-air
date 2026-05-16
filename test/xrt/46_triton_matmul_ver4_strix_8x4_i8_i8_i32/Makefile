@@ -33,6 +33,10 @@ N ?= 1024
 # Verbosity level for test output (0 = minimal, 1+ = verbose)
 VERBOSITY ?= 0
 
+# Profiling loop counts
+WARMUPS ?= 10
+ITERATIONS ?= 20
+
 # Debug IR output path (used with debug_ir target)
 DEBUG_IR_PATH ?= ir_debug/final.mlir
 
@@ -64,7 +68,7 @@ compile-xclbin:
 
 # Profile using C++ executable
 profile: compile-xclbin build-test-exe
-	cd $(BUILD_DIR) && ./test.exe -x air.xclbin -k MLIR_AIE -i air.insts.bin -M $(M) -K $(K) -N $(N) -v $(VERBOSITY)
+	cd $(BUILD_DIR) && ./test.exe -x air.xclbin -k MLIR_AIE -i air.insts.bin -M $(M) -K $(K) -N $(N) -v $(VERBOSITY) --warmups $(WARMUPS) --iterations $(ITERATIONS)
 
 # Build the C++ test executable
 build-test-exe:

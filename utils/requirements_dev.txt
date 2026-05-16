@@ -2,5 +2,6 @@ cmake>=3.30
 pybind11
 nanobind>=2.9
 lit
+pre-commit
 # lit requires psutil to set timeouts
 psutil
