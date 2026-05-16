@@ -29,6 +29,44 @@ using C_DATATYPE = int32_t;
 
 static inline int8_t random_int8_t() { return (int8_t)(rand() % 8); }
 
+static C_DATATYPE reference_element(const std::vector<A_DATATYPE> &a,
+                                    const std::vector<B_DATATYPE> &b, int row,
+                                    int col, int K, int N) {
+  C_DATATYPE sum = 0;
+  for (int k = 0; k < K; ++k)
+    sum += static_cast<C_DATATYPE>(a[row * K + k]) *
+           static_cast<C_DATATYPE>(b[k * N + col]);
+  return sum;
+}
+
+static bool verify_samples(const std::vector<A_DATATYPE> &a,
+                           const std::vector<B_DATATYPE> &b,
+                           const std::vector<C_DATATYPE> &c, int M, int K,
+                           int N) {
+  const std::array<std::pair<int, int>, 9> samples = {
+      {{0, 0},
+       {0, std::min(N - 1, 31)},
+       {std::min(M - 1, 3), std::min(N - 1, 5)},
+       {std::min(M - 1, 17), std::min(N - 1, 19)},
+       {std::min(M - 1, 127), std::min(N - 1, 64)},
+       {std::min(M - 1, 255), std::min(N - 1, 255)},
+       {std::min(M - 1, 511), std::min(N - 1, 17)},
+       {std::min(M - 1, 700), std::min(N - 1, 901)},
+       {M - 1, N - 1}}};
+  bool valid = true;
+  for (auto [row, col] : samples) {
+    C_DATATYPE expected = reference_element(a, b, row, col, K, N);
+    C_DATATYPE observed = c[row * N + col];
+    if (expected == observed)
+      continue;
+    std::cerr << "mismatch at (" << row << ", " << col
+              << "): expected=" << expected << " observed=" << observed
+              << "\n";
+    valid = false;
+  }
+  return valid;
+}
+
 void add_default_options(cxxopts::Options &options) {
   options.add_options()("help,h", "produce help message")(
       "xclbin,x", "the input xclbin path", cxxopts::value<std::string>())(
@@ -182,14 +220,11 @@ int main(int argc, const char *argv[]) {
     auto run = kernel(opcode, bo_instr, instr_v.size(), bo_a, bo_b, bo_c);
     run.wait();
     auto stop = std::chrono::steady_clock::now();
-    bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
     if (iter < n_warmup_iterations) {
       /* Warmup iterations do not count towards average runtime. */
       continue;
     }
-
-    memcpy(CVec.data(), bufC, (CVec.size() * sizeof(C_DATATYPE)));
 
     double npu_time =
         std::chrono::duration<double, std::micro>(stop - start).count();
@@ -198,6 +233,10 @@ int main(int argc, const char *argv[]) {
     npu_time_min = (npu_time < npu_time_min) ? npu_time : npu_time_min;
     npu_time_max = (npu_time > npu_time_max) ? npu_time : npu_time_max;
   }
+
+  bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  memcpy(CVec.data(), bufC, (CVec.size() * sizeof(C_DATATYPE)));
+  bool valid = verify_samples(AVec, BVec, CVec, M, K, N);
 
   double avg_us = npu_time_total / n_iterations;
   double avg_gops = macs / (1000 * avg_us);
@@ -225,6 +264,7 @@ int main(int argc, const char *argv[]) {
   std::cout << "min_us=" << npu_time_min << "\n";
   std::cout << "max_us=" << npu_time_max << "\n";
   std::cout << "gops=" << avg_gops << "\n";
+  std::cout << "validation=" << (valid ? "PASS" : "FAIL") << "\n";
 
-  return 0;
+  return valid ? 0 : 1;
 }

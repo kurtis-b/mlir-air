@@ -8,10 +8,10 @@
 // REQUIRES: gpu
 // RUN: air-opt %s -air-to-rocdl -air-gpu-outlining | FileCheck %s
 
-// CHECK: gpu.launch_func @{{.*}}::@{{.*}} blocks in (%c32, %c16, %c1) threads in (%c256, %c1, %c1)
+// CHECK: gpu.launch_func @{{.*}}::@{{.*}} blocks in (%c16, %c16, %c1) threads in (%c256, %c1, %c1)
 // CHECK: gpu.module @
 // CHECK: gpu.func @{{.*}} kernel
-// CHECK-SAME: air.gpu.int8_gemm_variant = "lds_single_buffer"
+// CHECK-SAME: air.gpu.int8_gemm_variant = "lds_dual_column"
 // CHECK: rocdl.wmma.i32.16x16x16.iu8
 // CHECK-NOT: rocdl.wmma.i32.16x16x64
 // CHECK-NOT: swmmac

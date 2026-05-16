@@ -272,7 +272,7 @@ struct ConvertAIRToROCDLPass
 
     OpBuilder builder(launchOp);
     Location loc = launchOp.getLoc();
-    Value gridX = arith::ConstantIndexOp::create(builder, loc, 32);
+    Value gridX = arith::ConstantIndexOp::create(builder, loc, 16);
     Value gridY = arith::ConstantIndexOp::create(builder, loc, 16);
     Value gridZ = arith::ConstantIndexOp::create(builder, loc, 1);
     Value blockX = arith::ConstantIndexOp::create(builder, loc, 256);
@@ -283,7 +283,7 @@ struct ConvertAIRToROCDLPass
                                            blockX, blockY, blockZ);
     gpuLaunch->setAttr(kInt8GemmWmmaAttr, UnitAttr::get(launchOp.getContext()));
     gpuLaunch->setAttr("air.gpu.int8_gemm_variant",
-                       builder.getStringAttr("lds_single_buffer"));
+                       builder.getStringAttr("lds_dual_column"));
 
     {
       OpBuilder::InsertionGuard guard(builder);

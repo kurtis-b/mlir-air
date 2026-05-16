@@ -36,6 +36,7 @@ VERBOSITY ?= 0
 # Profiling loop counts
 WARMUPS ?= 10
 ITERATIONS ?= 20
+RUNTIME_LOOP_TILING ?= 2,4
 
 # Debug IR output path (used with debug_ir target)
 DEBUG_IR_PATH ?= ir_debug/final.mlir
@@ -55,16 +56,16 @@ run: run-$(AIE_TARGET)
 
 run-aie2:
 	mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && $(PYTHON) $(srcdir)/run.py --input-ir ${INPUT_IR_PATH} --transform-script ${TRANSFORM_SCRIPT}
+	cd $(BUILD_DIR) && $(PYTHON) $(srcdir)/run.py --input-ir ${INPUT_IR_PATH} --transform-script ${TRANSFORM_SCRIPT} --runtime-loop-tiling-sizes $(RUNTIME_LOOP_TILING)
 
 run-aie2p:
 	mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && $(PYTHON) $(srcdir)/run.py --input-ir ${INPUT_IR_PATH} --transform-script ${TRANSFORM_SCRIPT}
+	cd $(BUILD_DIR) && $(PYTHON) $(srcdir)/run.py --input-ir ${INPUT_IR_PATH} --transform-script ${TRANSFORM_SCRIPT} --runtime-loop-tiling-sizes $(RUNTIME_LOOP_TILING)
 
 # Compile xclbin only (no execution)
 compile-xclbin:
 	mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && $(PYTHON) $(srcdir)/run.py --input-ir ${INPUT_IR_PATH} --transform-script $(TRANSFORM_SCRIPT) --compile-only
+	cd $(BUILD_DIR) && $(PYTHON) $(srcdir)/run.py --input-ir ${INPUT_IR_PATH} --transform-script $(TRANSFORM_SCRIPT) --runtime-loop-tiling-sizes $(RUNTIME_LOOP_TILING) --compile-only
 
 # Profile using C++ executable
 profile: compile-xclbin build-test-exe
@@ -103,7 +104,7 @@ build-test-exe:
 # Debug IR: dump transformed IR to file and exit
 debug_ir:
 	mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && $(PYTHON) $(srcdir)/run.py --input-ir ${INPUT_IR_PATH} --transform-script $(TRANSFORM_SCRIPT) --debug-ir $(DEBUG_IR_PATH)
+	cd $(BUILD_DIR) && $(PYTHON) $(srcdir)/run.py --input-ir ${INPUT_IR_PATH} --transform-script $(TRANSFORM_SCRIPT) --runtime-loop-tiling-sizes $(RUNTIME_LOOP_TILING) --debug-ir $(DEBUG_IR_PATH)
 
 clean:
 	rm -rf $(BUILD_DIR) __pycache__

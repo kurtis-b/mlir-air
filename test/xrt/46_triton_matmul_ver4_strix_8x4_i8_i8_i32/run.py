@@ -55,9 +55,26 @@ parser.add_argument(
     metavar="OUTPUT_FILE",
     help="Print the transformed IR to the specified file and exit (for debugging)",
 )
+parser.add_argument(
+    "--runtime-loop-tiling-sizes",
+    type=str,
+    dest="runtime_loop_tiling_sizes",
+    default="2,4",
+    metavar="M,N",
+    help="Comma-separated AIR runtime loop tiling sizes (default: 2,4)",
+)
 args = parser.parse_args()
 
 with air.ir.Context() as ctx, Location.unknown():
+    runtime_loop_tiling_sizes = [
+        int(value) for value in args.runtime_loop_tiling_sizes.split(",")
+    ]
+    if len(runtime_loop_tiling_sizes) != 2 or any(
+        value <= 0 for value in runtime_loop_tiling_sizes
+    ):
+        raise ValueError(
+            "--runtime-loop-tiling-sizes must contain two positive integers"
+        )
 
     ################################################
     ## Input SCF and Linalg IR
@@ -140,7 +157,7 @@ with air.ir.Context() as ctx, Location.unknown():
             omit_while_true_loop=False,
             output_format=args.output_format,
             instance_name="bare_matmul",
-            runtime_loop_tiling_sizes=[4, 4],
+            runtime_loop_tiling_sizes=runtime_loop_tiling_sizes,
         )
         module_function = backend.compile(air_module)
         backend.unload()
@@ -168,7 +185,7 @@ with air.ir.Context() as ctx, Location.unknown():
 
         runner = XRTRunner(
             omit_while_true_loop=False,
-            runtime_loop_tiling_sizes=[4, 4],
+            runtime_loop_tiling_sizes=runtime_loop_tiling_sizes,
             output_format=args.output_format,
             instance_name="bare_matmul",
             # verbose=True,

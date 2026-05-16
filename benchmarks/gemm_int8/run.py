@@ -336,7 +336,7 @@ def npu_backend(ctx: RunContext) -> BackendResult:
         result.status = "WARN"
     if ctx.run_enabled and (run_log := result.logs.get("profile")) and run_log.exists():
         parse_host_perf(ctx, result, run_log, "host run.wait")
-        result.perf_notes = f"warmups={last_kv_value(run_log, 'warmups') or ctx.warmups}; excludes output BO sync; timing wraps run.wait"
+        result.perf_notes = f"warmups={last_kv_value(run_log, 'warmups') or ctx.warmups}; validation={last_kv_value(run_log, 'validation') or 'unknown'}; excludes output BO sync; timing wraps run.wait"
     return result
 
 

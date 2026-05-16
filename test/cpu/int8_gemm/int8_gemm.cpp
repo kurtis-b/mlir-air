@@ -138,21 +138,65 @@ bool cpuSupportsVnni() {
 extern "C" __attribute__((noinline, used,
                           target("avx512f,avx512bw,avx512vl,avx512vnni")))
 void cpu_i8_gemm_vnni(const int8_t *a, const int8_t *bt, int32_t *c) {
+  constexpr int kColumnBlock = 8;
   for (int i = 0; i < kM; ++i) {
     const int8_t *aRow = a + i * kK;
-    for (int j = 0; j < kN; ++j) {
-      const int8_t *bCol = bt + j * kK;
-      __m512i acc = _mm512_setzero_si512();
+    for (int j = 0; j < kN; j += kColumnBlock) {
+      const int8_t *bCol0 = bt + (j + 0) * kK;
+      const int8_t *bCol1 = bt + (j + 1) * kK;
+      const int8_t *bCol2 = bt + (j + 2) * kK;
+      const int8_t *bCol3 = bt + (j + 3) * kK;
+      const int8_t *bCol4 = bt + (j + 4) * kK;
+      const int8_t *bCol5 = bt + (j + 5) * kK;
+      const int8_t *bCol6 = bt + (j + 6) * kK;
+      const int8_t *bCol7 = bt + (j + 7) * kK;
+      __m512i acc0 = _mm512_setzero_si512();
+      __m512i acc1 = _mm512_setzero_si512();
+      __m512i acc2 = _mm512_setzero_si512();
+      __m512i acc3 = _mm512_setzero_si512();
+      __m512i acc4 = _mm512_setzero_si512();
+      __m512i acc5 = _mm512_setzero_si512();
+      __m512i acc6 = _mm512_setzero_si512();
+      __m512i acc7 = _mm512_setzero_si512();
 
       for (int k = 0; k < kK; k += 64) {
         __m512i avec =
             _mm512_loadu_si512(reinterpret_cast<const __m512i *>(aRow + k));
-        __m512i bvec =
-            _mm512_loadu_si512(reinterpret_cast<const __m512i *>(bCol + k));
-        acc = _mm512_dpbusd_epi32(acc, avec, bvec);
+        acc0 = _mm512_dpbusd_epi32(
+            acc0, avec,
+            _mm512_loadu_si512(reinterpret_cast<const __m512i *>(bCol0 + k)));
+        acc1 = _mm512_dpbusd_epi32(
+            acc1, avec,
+            _mm512_loadu_si512(reinterpret_cast<const __m512i *>(bCol1 + k)));
+        acc2 = _mm512_dpbusd_epi32(
+            acc2, avec,
+            _mm512_loadu_si512(reinterpret_cast<const __m512i *>(bCol2 + k)));
+        acc3 = _mm512_dpbusd_epi32(
+            acc3, avec,
+            _mm512_loadu_si512(reinterpret_cast<const __m512i *>(bCol3 + k)));
+        acc4 = _mm512_dpbusd_epi32(
+            acc4, avec,
+            _mm512_loadu_si512(reinterpret_cast<const __m512i *>(bCol4 + k)));
+        acc5 = _mm512_dpbusd_epi32(
+            acc5, avec,
+            _mm512_loadu_si512(reinterpret_cast<const __m512i *>(bCol5 + k)));
+        acc6 = _mm512_dpbusd_epi32(
+            acc6, avec,
+            _mm512_loadu_si512(reinterpret_cast<const __m512i *>(bCol6 + k)));
+        acc7 = _mm512_dpbusd_epi32(
+            acc7, avec,
+            _mm512_loadu_si512(reinterpret_cast<const __m512i *>(bCol7 + k)));
       }
 
-      c[i * kN + j] = _mm512_reduce_add_epi32(acc);
+      int32_t *cRow = c + i * kN + j;
+      cRow[0] = _mm512_reduce_add_epi32(acc0);
+      cRow[1] = _mm512_reduce_add_epi32(acc1);
+      cRow[2] = _mm512_reduce_add_epi32(acc2);
+      cRow[3] = _mm512_reduce_add_epi32(acc3);
+      cRow[4] = _mm512_reduce_add_epi32(acc4);
+      cRow[5] = _mm512_reduce_add_epi32(acc5);
+      cRow[6] = _mm512_reduce_add_epi32(acc6);
+      cRow[7] = _mm512_reduce_add_epi32(acc7);
     }
   }
 }

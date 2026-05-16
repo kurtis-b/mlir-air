@@ -318,7 +318,7 @@ struct ConvertGPUKernelOutlinePass
     auto i8Type = IntegerType::get(ctx, 8);
     auto i32Type = IntegerType::get(ctx, 32);
     auto aLdsType = MemRefType::get({64, 16}, i8Type, {}, 3);
-    auto bLdsType = MemRefType::get({32, 16}, i8Type, {}, 3);
+    auto bLdsType = MemRefType::get({64, 16}, i8Type, {}, 3);
     Value aLds = func.addWorkgroupAttribution(aLdsType, loc);
     Value bLds = func.addWorkgroupAttribution(bLdsType, loc);
 
@@ -331,7 +331,6 @@ struct ConvertGPUKernelOutlinePass
     Value c16 = cidx(builder, loc, 16);
     Value c32 = cidx(builder, loc, 32);
     Value c64 = cidx(builder, loc, 64);
-    Value c256 = cidx(builder, loc, 256);
     Value c1024 = cidx(builder, loc, 1024);
 
     Value blockX = gpu::BlockIdOp::create(builder, loc, builder.getIndexType(),
@@ -348,7 +347,7 @@ struct ConvertGPUKernelOutlinePass
     Value waveTileRow = arith::RemSIOp::create(builder, loc, wave, c4);
     Value waveTileCol = arith::DivSIOp::create(builder, loc, wave, c4);
     Value blockRowBase = arith::MulIOp::create(builder, loc, blockY, c64);
-    Value blockColBase = arith::MulIOp::create(builder, loc, blockX, c32);
+    Value blockColBase = arith::MulIOp::create(builder, loc, blockX, c64);
     Value waveRowBase = arith::MulIOp::create(builder, loc, waveTileRow, c16);
     Value waveColBase = arith::MulIOp::create(builder, loc, waveTileCol, c16);
     Value tileRow = arith::AddIOp::create(builder, loc, blockRowBase,
@@ -359,11 +358,12 @@ struct ConvertGPUKernelOutlinePass
     auto vec8i32 = VectorType::get({8}, i32Type);
     Value initAcc = arith::ConstantOp::create(builder, loc,
                                               builder.getZeroAttr(vec8i32));
-    auto kLoop =
-        scf::ForOp::create(builder, loc, c0, c1024, c16, ValueRange{initAcc});
+    auto kLoop = scf::ForOp::create(builder, loc, c0, c1024, c16,
+                                    ValueRange{initAcc, initAcc});
     builder.setInsertionPointToStart(kLoop.getBody());
     Value k = kLoop.getInductionVar();
-    Value acc = kLoop.getRegionIterArg(0);
+    Value acc0 = kLoop.getRegionIterArg(0);
+    Value acc1 = kLoop.getRegionIterArg(1);
 
     for (int chunk = 0; chunk < 4; ++chunk) {
       Value copyIdx = tx;
@@ -381,12 +381,13 @@ struct ConvertGPUKernelOutlinePass
       memref::StoreOp::create(builder, loc, value, aLds,
                               ValueRange{aRow, aCol});
     }
-    for (int chunk = 0; chunk < 2; ++chunk) {
+    for (int chunk = 0; chunk < 4; ++chunk) {
       Value copyIdx = tx;
       if (chunk != 0)
-        copyIdx = arith::AddIOp::create(builder, loc, tx, c256);
-      Value bRow = arith::DivSIOp::create(builder, loc, copyIdx, c32);
-      Value bCol = arith::RemSIOp::create(builder, loc, copyIdx, c32);
+        copyIdx = arith::AddIOp::create(builder, loc, tx,
+                                        cidx(builder, loc, chunk * 256));
+      Value bRow = arith::DivSIOp::create(builder, loc, copyIdx, c64);
+      Value bCol = arith::RemSIOp::create(builder, loc, copyIdx, c64);
       Value globalRow = arith::AddIOp::create(builder, loc, k, bRow);
       Value globalCol =
           arith::AddIOp::create(builder, loc, blockColBase, bCol);
@@ -401,33 +402,49 @@ struct ConvertGPUKernelOutlinePass
     Value aRow = arith::AddIOp::create(builder, loc, waveRowBase, lane16);
     Value aPacked =
         loadPackedContiguousI8x16AsI32x4(builder, loc, aLds, aRow, c0);
-    Value bRow = arith::AddIOp::create(builder, loc, waveColBase, lane16);
-    Value bPacked =
-        loadPackedContiguousI8x16AsI32x4(builder, loc, bLds, bRow, c0);
+    Value bRow0 = arith::AddIOp::create(builder, loc, waveColBase, lane16);
+    Value bRow1 = arith::AddIOp::create(builder, loc, bRow0, c32);
+    Value bPacked0 =
+        loadPackedContiguousI8x16AsI32x4(builder, loc, bLds, bRow0, c0);
+    Value bPacked1 =
+        loadPackedContiguousI8x16AsI32x4(builder, loc, bLds, bRow1, c0);
     OperationState wmmaState(loc, "rocdl.wmma.i32.16x16x16.iu8");
     wmmaState.addTypes(vec8i32);
-    wmmaState.addOperands({aPacked, bPacked, acc});
+    wmmaState.addOperands({aPacked, bPacked0, acc0});
     wmmaState.addAttribute("signA", builder.getBoolAttr(true));
     wmmaState.addAttribute("signB", builder.getBoolAttr(true));
     wmmaState.addAttribute("clamp", builder.getBoolAttr(false));
-    Value nextAcc = builder.create(wmmaState)->getResult(0);
+    Value nextAcc0 = builder.create(wmmaState)->getResult(0);
+    OperationState wmmaState1(loc, "rocdl.wmma.i32.16x16x16.iu8");
+    wmmaState1.addTypes(vec8i32);
+    wmmaState1.addOperands({aPacked, bPacked1, acc1});
+    wmmaState1.addAttribute("signA", builder.getBoolAttr(true));
+    wmmaState1.addAttribute("signB", builder.getBoolAttr(true));
+    wmmaState1.addAttribute("clamp", builder.getBoolAttr(false));
+    Value nextAcc1 = builder.create(wmmaState1)->getResult(0);
 
     gpu::BarrierOp::create(builder, loc);
-    scf::YieldOp::create(builder, loc, nextAcc);
+    scf::YieldOp::create(builder, loc, ValueRange{nextAcc0, nextAcc1});
 
     builder.setInsertionPointAfter(kLoop);
-    Value finalAcc = kLoop.getResult(0);
+    Value finalAcc0 = kLoop.getResult(0);
+    Value finalAcc1 = kLoop.getResult(1);
     for (int element = 0; element < 8; ++element) {
       Value elemIdx = cidx(builder, loc, element);
       Value rowInTile = arith::AddIOp::create(
           builder, loc,
           arith::MulIOp::create(builder, loc, elemIdx, c2), laneHalf);
       Value dstRow = arith::AddIOp::create(builder, loc, tileRow, rowInTile);
-      Value dstCol = arith::AddIOp::create(builder, loc, tileCol, lane16);
+      Value dstCol0 = arith::AddIOp::create(builder, loc, tileCol, lane16);
       Value value =
-          vector::ExtractOp::create(builder, loc, finalAcc, element);
+          vector::ExtractOp::create(builder, loc, finalAcc0, element);
       memref::StoreOp::create(builder, loc, value, c,
-                              ValueRange{dstRow, dstCol});
+                              ValueRange{dstRow, dstCol0});
+      Value dstCol1 = arith::AddIOp::create(builder, loc, dstCol0, c32);
+      Value value1 =
+          vector::ExtractOp::create(builder, loc, finalAcc1, element);
+      memref::StoreOp::create(builder, loc, value1, c,
+                              ValueRange{dstRow, dstCol1});
     }
 
     gpu::ReturnOp::create(builder, loc);
@@ -662,7 +679,7 @@ struct ConvertGPUKernelOutlinePass
         if (useInt8Wmma) {
           outlinedFunc->setAttr(kInt8GemmWmmaAttr, UnitAttr::get(ctx));
           outlinedFunc->setAttr("air.gpu.int8_gemm_variant",
-                                builder.getStringAttr("lds_single_buffer"));
+                                builder.getStringAttr("lds_dual_column"));
         }
         SymbolTable gpuModuleSymbolTable(gpuModule);
         // insert the GPUFuncOp into GPUModuleOp.
