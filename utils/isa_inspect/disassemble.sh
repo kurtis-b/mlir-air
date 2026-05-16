@@ -6,17 +6,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-usage() {
-  cat <<'EOF'
+usage() { cat <<'EOF'
 Usage: disassemble.sh <cpu|gpu|npu> [options] <input>
 Run `disassemble.sh <backend> --help` for backend options.
 EOF
 }
 
-cpu_usage() {
-  cat <<'EOF'
+cpu_usage() { cat <<'EOF'
 Usage: disassemble.sh cpu [options] <object|shared-library|executable>
-
   -o, --output-dir DIR  artifact directory
   --prefix NAME         output prefix (default: input basename)
   --symbol NAME         exact symbol; repeatable
@@ -26,10 +23,8 @@ Tool overrides: LLVM_INSTALL_DIR, LLVM_READOBJ, LLVM_OBJDUMP, LLVM_NM
 EOF
 }
 
-gpu_usage() {
-  cat <<'EOF'
+gpu_usage() { cat <<'EOF'
 Usage: disassemble.sh gpu [options] <input.air.mlir>
-
   --gpu-arch CHIP       AMDGPU chip (default: AIR_GPU_CHIP or gfx1150)
   -o, --output-dir DIR  artifact directory
   --prefix NAME         output prefix (default: input basename)
@@ -41,10 +36,8 @@ Tool overrides: AIR_OPT, MLIR_OPT, LLVM_READOBJ, MLIR_AIR_INSTALL_DIR, LLVM_INST
 EOF
 }
 
-npu_usage() {
-  cat <<'EOF'
+npu_usage() { cat <<'EOF'
 Usage: disassemble.sh npu [options] <core.elf|air.insts.bin>
-
   -o, --output-dir DIR  artifact directory
   --prefix NAME         output prefix (default: input basename)
   --kind auto|elf|txn   input interpretation (default: auto)
@@ -71,55 +64,54 @@ first_executable() {
 }
 
 find_tool() {
-  local outvar="$1"
+  local outvar="$1" found
   shift
-  local current="${!outvar:-}"
-  [ -z "$current" ] || return 0
-  printf -v "$outvar" '%s' "$(first_executable "$@" || true)"
+  [ -z "${!outvar:-}" ] || return 0
+  found="$(first_executable "$@" || true)"
+  printf -v "$outvar" '%s' "$found"
 }
 
 require_tool() {
-  local envvar="$1"
-  local hint="$2"
-  local tool="${!envvar:-}"
-  [ -z "$tool" ] || { [ ! -x "$tool" ] && ! command -v "$tool" >/dev/null 2>&1; } || return 0
+  local envvar="$1" hint="$2" tool
+  tool="${!envvar:-}"
+  if [ -n "$tool" ] && { [ -x "$tool" ] || command -v "$tool" >/dev/null 2>&1; }; then return 0; fi
   die "could not find $envvar. $hint"
 }
 
 require_input() {
-  local input="$1"
-  local message="$2"
-  local usage_fn="$3"
+  local input="$1" message="$2" usage_fn="$3"
   if [ -z "$input" ]; then echo "ERROR: $message" >&2; "$usage_fn" >&2; exit 2; fi
   [ -f "$input" ] || die "input file not found: $input"
 }
 
 set_prefix_outdir() {
-  local backend="$1"
-  local input="$2"
-  local basename
-  basename="$(basename "$input")"
-  PREFIX="${PREFIX:-${basename%.*}}"
+  local backend="$1" input="$2" base
+  base="$(basename "$input")"
+  PREFIX="${PREFIX:-${base%.*}}"
   OUTDIR="${OUTDIR:-${TMPDIR:-/tmp}/air_${backend}_isa_${PREFIX}}"
   mkdir -p "$OUTDIR"
 }
 
 check_expected() {
-  local file="$1"
+  local file="$1" pattern
   shift
-  local pattern
   for pattern in "$@"; do
-    if grep -Eq "$pattern" "$file"; then continue; fi
-    echo "ERROR: expected pattern not found: $pattern" >&2
-    echo "Checked file: $file" >&2
-    exit 1
+    grep -Eq "$pattern" "$file" || die "expected pattern not found: $pattern"$'\n'"Checked file: $file"
   done
+}
+
+check_forbidden() {
+  local file="$1" pattern
+  shift
+  for pattern in "$@"; do
+    grep -Eq "$pattern" "$file" && die "forbidden ISA pattern found: $pattern"$'\n'"ISA file: $file"
+  done
+  return 0
 }
 
 extract_mlir_attr() {
   python3 - "$1" "$2" "$3" "$4" <<'PY'
-import re
-import sys
+import re, sys
 src, dst, attr, mode = sys.argv[1:]
 text = open(src, encoding="utf-8").read()
 matches = re.findall(rf'{re.escape(attr)} = "((?:[^"\\]|\\.)*)"', text, flags=re.S)
@@ -127,35 +119,25 @@ if not matches:
     raise SystemExit(f"no gpu.object {attr} payload found in {src}")
 hexdigits = set("0123456789abcdefABCDEF")
 def decode(value):
-    out = bytearray()
-    i = 0
+    out = bytearray(); i = 0
     while i < len(value):
         if value[i] == "\\" and i + 2 < len(value) and value[i + 1] in hexdigits and value[i + 2] in hexdigits:
-            out.append(int(value[i + 1:i + 3], 16))
-            i += 3
+            out.append(int(value[i + 1:i + 3], 16)); i += 3
         elif value[i] == "\\" and i + 1 < len(value):
-            i += 1
-            out.append(ord(value[i]))
-            i += 1
+            i += 1; out.append(ord(value[i])); i += 1
         else:
-            out.append(ord(value[i]))
-            i += 1
+            out.append(ord(value[i])); i += 1
     return bytes(out)
 if mode == "bin":
     open(dst, "wb").write(decode(matches[0]))
 else:
-    with open(dst, "wb") as output:
-        for index, match in enumerate(matches):
-            if index:
-                output.write(b"\n")
-            output.write(decode(match))
+    open(dst, "wb").write(b"\n".join(decode(match) for match in matches))
 PY
 }
 
 run_cpu() {
-  OUTDIR=""
-  PREFIX=""
-  local input=""
+  OUTDIR=""; PREFIX=""
+  local input="" symbol headers dynamic symtab disasm summary
   local -a symbols=() expect=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -169,64 +151,28 @@ run_cpu() {
     esac
   done
   require_input "$input" "missing input artifact" cpu_usage
-
-  local -a readobj_candidates=() objdump_candidates=() nm_candidates=()
-  [ -z "${LLVM_INSTALL_DIR:-}" ] || readobj_candidates+=("$LLVM_INSTALL_DIR/bin/llvm-readobj")
-  readobj_candidates+=("$REPO_DIR/llvm/install-amdgpu/bin/llvm-readobj" "$REPO_DIR/llvm/install/bin/llvm-readobj" llvm-readobj)
-  [ -z "${LLVM_INSTALL_DIR:-}" ] || objdump_candidates+=("$LLVM_INSTALL_DIR/bin/llvm-objdump")
-  objdump_candidates+=("$REPO_DIR/llvm/install-amdgpu/bin/llvm-objdump" "$REPO_DIR/llvm/install/bin/llvm-objdump" llvm-objdump)
-  [ -z "${LLVM_INSTALL_DIR:-}" ] || nm_candidates+=("$LLVM_INSTALL_DIR/bin/llvm-nm")
-  nm_candidates+=("$REPO_DIR/llvm/install-amdgpu/bin/llvm-nm" "$REPO_DIR/llvm/install/bin/llvm-nm" llvm-nm)
-  find_tool LLVM_READOBJ "${readobj_candidates[@]}"
-  find_tool LLVM_OBJDUMP "${objdump_candidates[@]}"
-  find_tool LLVM_NM "${nm_candidates[@]}"
+  find_tool LLVM_READOBJ "${LLVM_INSTALL_DIR:+$LLVM_INSTALL_DIR/bin/llvm-readobj}" "$REPO_DIR/llvm/install-amdgpu/bin/llvm-readobj" "$REPO_DIR/llvm/install/bin/llvm-readobj" llvm-readobj
+  find_tool LLVM_OBJDUMP "${LLVM_INSTALL_DIR:+$LLVM_INSTALL_DIR/bin/llvm-objdump}" "$REPO_DIR/llvm/install-amdgpu/bin/llvm-objdump" "$REPO_DIR/llvm/install/bin/llvm-objdump" llvm-objdump
+  find_tool LLVM_NM "${LLVM_INSTALL_DIR:+$LLVM_INSTALL_DIR/bin/llvm-nm}" "$REPO_DIR/llvm/install-amdgpu/bin/llvm-nm" "$REPO_DIR/llvm/install/bin/llvm-nm" llvm-nm
   require_tool LLVM_READOBJ "Set LLVM_INSTALL_DIR or LLVM_READOBJ."
   require_tool LLVM_OBJDUMP "Set LLVM_INSTALL_DIR or LLVM_OBJDUMP."
-
   set_prefix_outdir cpu "$input"
-  local headers="$OUTDIR/${PREFIX}.headers.txt"
-  local dynamic="$OUTDIR/${PREFIX}.dynamic.txt"
-  local symtab="$OUTDIR/${PREFIX}.symbols.txt"
-  local disasm="$OUTDIR/${PREFIX}.disasm.s"
-  local summary="$OUTDIR/${PREFIX}.summary.txt"
-
+  headers="$OUTDIR/${PREFIX}.headers.txt"; dynamic="$OUTDIR/${PREFIX}.dynamic.txt"
+  symtab="$OUTDIR/${PREFIX}.symbols.txt"; disasm="$OUTDIR/${PREFIX}.disasm.s"; summary="$OUTDIR/${PREFIX}.summary.txt"
   "$LLVM_READOBJ" --file-headers --section-headers --symbols "$input" > "$headers"
   "$LLVM_READOBJ" --dynamic-table --needed-libs "$input" > "$dynamic" 2>&1 || printf 'dynamic table unavailable for this artifact\n' > "$dynamic"
-  if [ -n "${LLVM_NM:-}" ]; then
-    "$LLVM_NM" -C --defined-only "$input" > "$symtab" 2>&1 || true
-  else
-    printf 'llvm-nm not found; symbol table skipped\n' > "$symtab"
-  fi
-
+  if [ -n "${LLVM_NM:-}" ]; then "$LLVM_NM" -C --defined-only "$input" > "$symtab" 2>&1 || true; else printf 'llvm-nm not found; symbol table skipped\n' > "$symtab"; fi
   local -a objdump_args=(-d -C --x86-asm-syntax=intel)
-  local symbol
-  for symbol in "${symbols[@]}"; do
-    objdump_args+=(--disassemble-symbols="$symbol")
-  done
+  for symbol in "${symbols[@]}"; do objdump_args+=(--disassemble-symbols="$symbol"); done
   "$LLVM_OBJDUMP" "${objdump_args[@]}" "$input" > "$disasm"
-
-  {
-    echo "# CPU disassembly summary"
-    echo "input: $input"
-    echo "llvm_readobj: $LLVM_READOBJ"
-    echo "llvm_objdump: $LLVM_OBJDUMP"
-    echo "llvm_nm: ${LLVM_NM:-unavailable}"
-    [ "${#symbols[@]}" -eq 0 ] || echo "symbols: ${symbols[*]}"
-    echo; echo "## Artifacts"; printf '%s\n' "$headers" "$dynamic" "$symtab" "$disasm"
-    echo; echo "## Header preview"; sed -n '1,80p' "$headers"
-    echo; echo "## Disassembly preview"; sed -n '1,80p' "$disasm"
-  } > "$summary"
+  { echo "# CPU disassembly summary"; echo "input: $input"; echo "llvm_readobj: $LLVM_READOBJ"; echo "llvm_objdump: $LLVM_OBJDUMP"; echo "llvm_nm: ${LLVM_NM:-unavailable}"; [ "${#symbols[@]}" -eq 0 ] || echo "symbols: ${symbols[*]}"; echo; echo "## Artifacts"; printf '%s\n' "$headers" "$dynamic" "$symtab" "$disasm"; } > "$summary"
   check_expected "$disasm" "${expect[@]}"
-  echo "Wrote CPU disassembly artifacts to $OUTDIR"
-  echo "Summary: $summary"
+  echo "Wrote CPU disassembly artifacts to $OUTDIR"; echo "Summary: $summary"
 }
 
 run_gpu() {
-  OUTDIR=""
-  PREFIX=""
-  local gpu_chip="${AIR_GPU_CHIP:-gfx1150}"
-  local opt_level="3"
-  local input=""
+  OUTDIR=""; PREFIX=""
+  local gpu_chip="${AIR_GPU_CHIP:-gfx1150}" opt_level="3" input="" rocdl_mlir outline_mlir outline_llvm_mlir isa_mlir isa_asm bin_mlir code_object readobj final_mlir summary rocdl_pipeline
   local -a expect=() forbid=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -242,79 +188,35 @@ run_gpu() {
     esac
   done
   require_input "$input" "missing input AIR MLIR file" gpu_usage
-
-  local -a air_opt_candidates=() mlir_opt_candidates=() readobj_candidates=()
-  [ -z "${MLIR_AIR_INSTALL_DIR:-}" ] || air_opt_candidates+=("$MLIR_AIR_INSTALL_DIR/bin/air-opt")
-  air_opt_candidates+=("$REPO_DIR/install-gpu/bin/air-opt" "$REPO_DIR/install/bin/air-opt" air-opt)
-  [ -z "${LLVM_INSTALL_DIR:-}" ] || mlir_opt_candidates+=("$LLVM_INSTALL_DIR/bin/mlir-opt")
-  mlir_opt_candidates+=("$REPO_DIR/llvm/install-amdgpu/bin/mlir-opt" "$REPO_DIR/llvm/install/bin/mlir-opt" mlir-opt)
-  find_tool AIR_OPT "${air_opt_candidates[@]}"
-  find_tool MLIR_OPT "${mlir_opt_candidates[@]}"
+  find_tool AIR_OPT "${MLIR_AIR_INSTALL_DIR:+$MLIR_AIR_INSTALL_DIR/bin/air-opt}" "$REPO_DIR/install-gpu/bin/air-opt" "$REPO_DIR/install/bin/air-opt" air-opt
+  find_tool MLIR_OPT "${LLVM_INSTALL_DIR:+$LLVM_INSTALL_DIR/bin/mlir-opt}" "$REPO_DIR/llvm/install-amdgpu/bin/mlir-opt" "$REPO_DIR/llvm/install/bin/mlir-opt" mlir-opt
   require_tool AIR_OPT "Set AIR_OPT or source utils/env_setup_gpu.sh."
   require_tool MLIR_OPT "Set MLIR_OPT or source utils/env_setup_gpu.sh."
-  readobj_candidates=("$(dirname "$MLIR_OPT")/llvm-readobj")
-  [ -z "${LLVM_INSTALL_DIR:-}" ] || readobj_candidates+=("$LLVM_INSTALL_DIR/bin/llvm-readobj")
-  readobj_candidates+=("$REPO_DIR/llvm/install-amdgpu/bin/llvm-readobj" "$REPO_DIR/llvm/install/bin/llvm-readobj" llvm-readobj)
-  find_tool LLVM_READOBJ "${readobj_candidates[@]}"
+  find_tool LLVM_READOBJ "$(dirname "$MLIR_OPT")/llvm-readobj" "${LLVM_INSTALL_DIR:+$LLVM_INSTALL_DIR/bin/llvm-readobj}" "$REPO_DIR/llvm/install-amdgpu/bin/llvm-readobj" "$REPO_DIR/llvm/install/bin/llvm-readobj" llvm-readobj
   command -v python3 >/dev/null 2>&1 || die "python3 is required to extract readable ISA from MLIR string escapes."
-
   set_prefix_outdir gpu "$input"
-  local rocdl_mlir="$OUTDIR/${PREFIX}.rocdl.mlir"
-  local outline_mlir="$OUTDIR/${PREFIX}.outline.mlir"
-  local outline_llvm_mlir="$OUTDIR/${PREFIX}.outline_llvm.mlir"
-  local isa_mlir="$OUTDIR/${PREFIX}.isa.mlir"
-  local isa_asm="$OUTDIR/${PREFIX}.isa.s"
-  local bin_mlir="$OUTDIR/${PREFIX}.bin.mlir"
-  local code_object="$OUTDIR/${PREFIX}.hsaco"
-  local readobj="$OUTDIR/${PREFIX}.code_object.readobj.txt"
-  local final_mlir="$OUTDIR/${PREFIX}.final.mlir"
-  local summary="$OUTDIR/${PREFIX}.summary.txt"
-
+  rocdl_mlir="$OUTDIR/${PREFIX}.rocdl.mlir"; outline_mlir="$OUTDIR/${PREFIX}.outline.mlir"; outline_llvm_mlir="$OUTDIR/${PREFIX}.outline_llvm.mlir"
+  isa_mlir="$OUTDIR/${PREFIX}.isa.mlir"; isa_asm="$OUTDIR/${PREFIX}.isa.s"; bin_mlir="$OUTDIR/${PREFIX}.bin.mlir"; code_object="$OUTDIR/${PREFIX}.hsaco"
+  readobj="$OUTDIR/${PREFIX}.code_object.readobj.txt"; final_mlir="$OUTDIR/${PREFIX}.final.mlir"; summary="$OUTDIR/${PREFIX}.summary.txt"
   echo "Lowering AIR to GPU/ROCDL for $gpu_chip"
   "$AIR_OPT" "$input" -air-to-rocdl -o "$rocdl_mlir"
   "$AIR_OPT" "$rocdl_mlir" -air-gpu-outlining -o "$outline_mlir"
   "$MLIR_OPT" "--pass-pipeline=builtin.module(func.func(lower-affine,convert-linalg-to-loops,convert-scf-to-cf),gpu-kernel-outlining)" "$outline_mlir" -o "$outline_llvm_mlir"
-
-  local rocdl_pipeline="rocdl-attach-target{chip=${gpu_chip} O=${opt_level}},gpu.module(convert-scf-to-cf,convert-gpu-to-rocdl{chipset=${gpu_chip} runtime=HIP},reconcile-unrealized-casts)"
+  rocdl_pipeline="rocdl-attach-target{chip=${gpu_chip} O=${opt_level}},gpu.module(convert-scf-to-cf,convert-gpu-to-rocdl{chipset=${gpu_chip} runtime=HIP},reconcile-unrealized-casts)"
   "$MLIR_OPT" "--pass-pipeline=builtin.module(${rocdl_pipeline},gpu-module-to-binary{format=isa})" "$outline_llvm_mlir" -o "$isa_mlir"
   "$MLIR_OPT" "--pass-pipeline=builtin.module(${rocdl_pipeline},gpu-module-to-binary{format=bin})" "$outline_llvm_mlir" -o "$bin_mlir"
   "$MLIR_OPT" "--pass-pipeline=builtin.module(${rocdl_pipeline},gpu-module-to-binary{format=bin},func.func(gpu-async-region,convert-scf-to-cf),gpu-to-llvm,convert-to-llvm,reconcile-unrealized-casts)" "$outline_llvm_mlir" -o "$final_mlir"
-
   extract_mlir_attr "$isa_mlir" "$isa_asm" assembly text
   extract_mlir_attr "$bin_mlir" "$code_object" bin bin
-  if [ -n "${LLVM_READOBJ:-}" ]; then
-    "$LLVM_READOBJ" --file-headers --notes --sections --symbols "$code_object" > "$readobj"
-  else
-    printf 'llvm-readobj not found; code object metadata dump skipped\n' > "$readobj"
-  fi
-
+  if [ -n "${LLVM_READOBJ:-}" ]; then "$LLVM_READOBJ" --file-headers --notes --sections --symbols "$code_object" > "$readobj"; else printf 'llvm-readobj not found; code object metadata dump skipped\n' > "$readobj"; fi
   {
-    echo "# GPU ISA summary"
-    echo "input: $input"
-    echo "gpu_arch: $gpu_chip"
-    echo "air_opt: $AIR_OPT"
-    echo "mlir_opt: $MLIR_OPT"
-    echo "llvm_readobj: ${LLVM_READOBJ:-unavailable}"
+    echo "# GPU ISA summary"; echo "input: $input"; echo "gpu_arch: $gpu_chip"; echo "air_opt: $AIR_OPT"; echo "mlir_opt: $MLIR_OPT"; echo "llvm_readobj: ${LLVM_READOBJ:-unavailable}"
     echo; echo "## Artifacts"; printf '%s\n' "$rocdl_mlir" "$outline_mlir" "$outline_llvm_mlir" "$isa_mlir" "$isa_asm" "$bin_mlir" "$code_object" "$readobj" "$final_mlir"
-    echo; echo "## Final gpu.binary target"
-    grep -aoE 'gpu\.binary @[A-Za-z0-9_.$-]+|chip = "[^"]+"|group_segment_fixed_size = [0-9]+ : i64|max_flat_workgroup_size = [0-9]+ : i64|reqd_workgroup_size = array<i32: [^>]+>|sgpr_count = [0-9]+ : i64|sgpr_spill_count = [0-9]+ : i64|vgpr_count = [0-9]+ : i64|vgpr_spill_count = [0-9]+ : i64|wavefront_size = [0-9]+ : i64' "$final_mlir" || true
-    echo; echo "## Code object metadata"
-    grep -E 'Format:|Arch:|EF_AMDGPU|NT_AMDGPU_METADATA|amdhsa\.kernels|\.name:|\.sgpr_count|\.sgpr_spill_count|\.vgpr_count|\.vgpr_spill_count|\.wavefront_size|amdhsa\.target' "$readobj" || true
-    echo; echo "## ISA metadata markers"
-    grep -E 'amdgcn_target|amdhsa_kernel|amdhsa_next_free_vgpr|amdhsa_next_free_sgpr|amdhsa_wavefront_size32|amdhsa\.target|\.sgpr_count|\.vgpr_count|\.wavefront_size' "$isa_asm" || true
+    echo; grep -aoE 'gpu\.binary @[A-Za-z0-9_.$-]+|chip = "[^"]+"|sgpr_spill_count = [0-9]+ : i64|vgpr_spill_count = [0-9]+ : i64|sgpr_count = [0-9]+ : i64|vgpr_count = [0-9]+ : i64|wavefront_size = [0-9]+ : i64' "$final_mlir" || true
+    grep -E 'Format:|Arch:|EF_AMDGPU|NT_AMDGPU_METADATA|\.sgpr_count|\.sgpr_spill_count|\.vgpr_count|\.vgpr_spill_count|\.wavefront_size|amdhsa\.target' "$readobj" || true
   } > "$summary"
-
-  check_expected "$isa_asm" "${expect[@]}"
-  local pattern
-  for pattern in "${forbid[@]}"; do
-    if grep -Eq "$pattern" "$isa_asm"; then
-      echo "ERROR: forbidden ISA pattern found: $pattern" >&2
-      echo "ISA file: $isa_asm" >&2
-      exit 1
-    fi
-  done
-  echo "Wrote GPU ISA artifacts to $OUTDIR"
-  echo "Summary: $summary"
+  check_expected "$isa_asm" "${expect[@]}"; check_forbidden "$isa_asm" "${forbid[@]}"
+  echo "Wrote GPU ISA artifacts to $OUTDIR"; echo "Summary: $summary"
 }
 
 is_elf() {
@@ -324,14 +226,8 @@ is_elf() {
 }
 
 run_npu() {
-  OUTDIR=""
-  PREFIX=""
-  local kind="auto"
-  local mcpu="aie2p"
-  local triple="aie2p-none-unknown-elf"
-  local aiebu_mode="aie2txn"
-  local run_profile=1
-  local input=""
+  OUTDIR=""; PREFIX=""
+  local kind="auto" mcpu="aie2p" triple="aie2p-none-unknown-elf" aiebu_mode="aie2txn" run_profile=1 input="" summary check_file
   local -a expect=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -351,68 +247,29 @@ run_npu() {
   case "$kind" in auto|elf|txn) ;; *) die "--kind must be auto, elf, or txn" 2 ;; esac
   require_input "$input" "missing input artifact" npu_usage
   [ "$kind" != "auto" ] || { if is_elf "$input"; then kind="elf"; else kind="txn"; fi; }
-  set_prefix_outdir npu "$input"
-  local summary="$OUTDIR/${PREFIX}.summary.txt"
-  local check_file
-
+  set_prefix_outdir npu "$input"; summary="$OUTDIR/${PREFIX}.summary.txt"
   if [ "$kind" = "elf" ]; then
-    local -a objdump_candidates=()
-    [ -z "${PEANO_INSTALL_DIR:-}" ] || objdump_candidates+=("$PEANO_INSTALL_DIR/bin/llvm-objdump")
     shopt -s nullglob
-    objdump_candidates+=("$REPO_DIR"/sandbox/lib/python*/site-packages/llvm-aie/bin/llvm-objdump)
+    find_tool LLVM_OBJDUMP "${PEANO_INSTALL_DIR:+$PEANO_INSTALL_DIR/bin/llvm-objdump}" "$REPO_DIR"/sandbox/lib/python*/site-packages/llvm-aie/bin/llvm-objdump "$REPO_DIR/my_install/mlir/bin/llvm-objdump" llvm-objdump
     shopt -u nullglob
-    objdump_candidates+=("$REPO_DIR/my_install/mlir/bin/llvm-objdump" llvm-objdump)
-    find_tool LLVM_OBJDUMP "${objdump_candidates[@]}"
     require_tool LLVM_OBJDUMP "Set PEANO_INSTALL_DIR or LLVM_OBJDUMP."
-    local objdump_dir
-    objdump_dir="$(dirname "$LLVM_OBJDUMP")"
-    [ -n "${LLVM_READOBJ:-}" ] || LLVM_READOBJ="$(first_executable "$objdump_dir/llvm-readobj" llvm-readobj || true)"
-    local disasm="$OUTDIR/${PREFIX}.${mcpu}.disasm.s"
-    local headers="$OUTDIR/${PREFIX}.headers.txt"
+    [ -n "${LLVM_READOBJ:-}" ] || LLVM_READOBJ="$(first_executable "$(dirname "$LLVM_OBJDUMP")/llvm-readobj" llvm-readobj || true)"
+    local disasm="$OUTDIR/${PREFIX}.${mcpu}.disasm.s" headers="$OUTDIR/${PREFIX}.headers.txt"
     "$LLVM_OBJDUMP" -d "--triple=${triple}" "--mcpu=${mcpu}" "$input" > "$disasm"
-    if [ -n "${LLVM_READOBJ:-}" ]; then
-      "$LLVM_READOBJ" --file-headers --section-headers --symbols "$input" > "$headers"
-    else
-      printf 'llvm-readobj not found; header dump skipped\n' > "$headers"
-    fi
-    {
-      echo "# NPU core ISA summary"
-      echo "input: $input"
-      echo "kind: elf"
-      echo "triple: $triple"
-      echo "mcpu: $mcpu"
-      echo "llvm_objdump: $LLVM_OBJDUMP"
-      echo "llvm_readobj: ${LLVM_READOBJ:-unavailable}"
-      echo; echo "## Artifacts"; printf '%s\n' "$disasm" "$headers"
-      echo; echo "## Disassembly preview"; sed -n '1,80p' "$disasm"
-    } > "$summary"
+    if [ -n "${LLVM_READOBJ:-}" ]; then "$LLVM_READOBJ" --file-headers --section-headers --symbols "$input" > "$headers"; else printf 'llvm-readobj not found; header dump skipped\n' > "$headers"; fi
+    { echo "# NPU core ISA summary"; echo "input: $input"; echo "kind: elf"; echo "triple: $triple"; echo "mcpu: $mcpu"; echo "llvm_objdump: $LLVM_OBJDUMP"; echo "llvm_readobj: ${LLVM_READOBJ:-unavailable}"; echo; echo "## Artifacts"; printf '%s\n' "$disasm" "$headers"; } > "$summary"
     check_file="$disasm"
   else
     [ -n "${AIEBU_DUMP:-}" ] || AIEBU_DUMP="$(first_executable /opt/xilinx/xrt/bin/aiebu-dump aiebu-dump || true)"
     require_tool AIEBU_DUMP "Source /opt/xilinx/xrt/setup.sh or set AIEBU_DUMP."
-    local disasm="$OUTDIR/${PREFIX}.${aiebu_mode}.disasm.txt"
-    local profile="$OUTDIR/${PREFIX}.${aiebu_mode}.profile.txt"
+    local disasm="$OUTDIR/${PREFIX}.${aiebu_mode}.disasm.txt" profile="$OUTDIR/${PREFIX}.${aiebu_mode}.profile.txt"
     "$AIEBU_DUMP" "$input" -d -m "$aiebu_mode" > "$disasm"
-    if [ "$run_profile" -eq 1 ]; then
-      "$AIEBU_DUMP" "$input" -p -m "$aiebu_mode" > "$profile"
-    else
-      printf 'aiebu-dump profile skipped by --no-profile\n' > "$profile"
-    fi
-    {
-      echo "# NPU transaction/control stream summary"
-      echo "input: $input"
-      echo "kind: txn"
-      echo "aiebu_mode: $aiebu_mode"
-      echo "aiebu_dump: $AIEBU_DUMP"
-      echo; echo "## Artifacts"; printf '%s\n' "$disasm" "$profile"
-      echo; echo "## Disassembly preview"; sed -n '1,80p' "$disasm"
-      echo; echo "## Opcode frequency preview"; sed -n '1,80p' "$profile"
-    } > "$summary"
+    if [ "$run_profile" -eq 1 ]; then "$AIEBU_DUMP" "$input" -p -m "$aiebu_mode" > "$profile"; else printf 'aiebu-dump profile skipped by --no-profile\n' > "$profile"; fi
+    { echo "# NPU transaction/control stream summary"; echo "input: $input"; echo "kind: txn"; echo "aiebu_mode: $aiebu_mode"; echo "aiebu_dump: $AIEBU_DUMP"; echo; echo "## Artifacts"; printf '%s\n' "$disasm" "$profile"; } > "$summary"
     check_file="$disasm"
   fi
   check_expected "$check_file" "${expect[@]}"
-  echo "Wrote NPU disassembly artifacts to $OUTDIR"
-  echo "Summary: $summary"
+  echo "Wrote NPU disassembly artifacts to $OUTDIR"; echo "Summary: $summary"
 }
 
 case "${1:-}" in
