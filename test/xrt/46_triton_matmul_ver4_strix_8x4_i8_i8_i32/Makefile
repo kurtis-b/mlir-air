@@ -37,6 +37,7 @@ VERBOSITY ?= 0
 WARMUPS ?= 10
 ITERATIONS ?= 20
 RUNTIME_LOOP_TILING ?= 2,4
+B_LAYOUT ?= row
 
 # Debug IR output path (used with debug_ir target)
 DEBUG_IR_PATH ?= ir_debug/final.mlir
@@ -45,7 +46,7 @@ DEBUG_IR_PATH ?= ir_debug/final.mlir
 BUILD_DIR := build
 
 # Environment setup
-AIEOPT_DIR = $(shell realpath $(dir $(shell which aie-opt))/..)
+AIEOPT_DIR ?= $(shell realpath $(dir $(shell which aie-opt))/..)
 
 .PHONY: all run run-aie2 run-aie2p compile-xclbin profile build-test-exe debug_ir clean
 
@@ -69,7 +70,7 @@ compile-xclbin:
 
 # Profile using C++ executable
 profile: compile-xclbin build-test-exe
-	cd $(BUILD_DIR) && ./test.exe -x air.xclbin -k MLIR_AIE -i air.insts.bin -M $(M) -K $(K) -N $(N) -v $(VERBOSITY) --warmups $(WARMUPS) --iterations $(ITERATIONS)
+	cd $(BUILD_DIR) && ./test.exe -x air.xclbin -k MLIR_AIE -i air.insts.bin -M $(M) -K $(K) -N $(N) -v $(VERBOSITY) --warmups $(WARMUPS) --iterations $(ITERATIONS) --b-layout $(B_LAYOUT)
 
 # Build the C++ test executable
 build-test-exe:

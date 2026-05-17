@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Sequence
 
 M = N = K = 1024
+TARGET_TOPS = {"cpu": 4.0, "gpu": 15.0, "npu": 36.0}
 
 
 def positive_int(value: str) -> int:
@@ -72,6 +73,28 @@ def to_tops(gops: str) -> str:
         return "n/a"
 
 
+def parse_gops_tops(gops: str) -> float | None:
+    try:
+        return float(gops) / 1000.0 if gops else None
+    except ValueError:
+        return None
+
+
+def parse_tops(value: str) -> float | None:
+    try:
+        return float(value) if value else None
+    except ValueError:
+        return None
+
+
+def set_perf_tops(result: "BackendResult", tops: float | None) -> None:
+    result.perf_tops = tops
+    if tops is None or result.target_tops is None:
+        result.target_pct = "n/a"
+        return
+    result.target_pct = f"{(tops / result.target_tops) * 100.0:.1f}%"
+
+
 def us_to_ms(us: str) -> str:
     try:
         return f"{float(us) / 1000.0:.6f}" if us else "n/a"
@@ -99,6 +122,8 @@ class RunContext:
     iterations: int
     gpu_arch: str
     run_enabled: bool
+    cpu_threads: int
+    npu_runtime_loop_tiling: str
 
     @property
     def disassemble(self) -> Path:
@@ -117,6 +142,9 @@ class BackendResult:
     perf_count: str = "n/a"
     perf_latency: str = "n/a"
     perf_throughput: str = "n/a"
+    perf_tops: float | None = None
+    target_tops: float | None = None
+    target_pct: str = "n/a"
     perf_notes: str = "not run"
     logs: dict[str, Path] = field(default_factory=dict)
 
@@ -124,6 +152,7 @@ class BackendResult:
 def backend_result(ctx: RunContext, name: str, create: bool = False) -> BackendResult:
     build_dir = ctx.build_root / name
     result = BackendResult(name, build_dir, build_dir / "artifacts")
+    result.target_tops = TARGET_TOPS.get(name)
     if create:
         result.build_dir.mkdir(parents=True, exist_ok=True)
         result.artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -165,6 +194,7 @@ def parse_host_perf(ctx: RunContext, result: BackendResult, log: Path, domain: s
     result.perf_count = last_kv_value(log, "iterations") or str(ctx.iterations)
     result.perf_latency = f"mean {avg_us or 'n/a'} us ({us_to_ms(avg_us)} ms), min {min_us or 'n/a'} us, max {max_us or 'n/a'} us"
     result.perf_throughput = f"{gops or 'n/a'} GOPS ({to_tops(gops)} TOPS)"
+    set_perf_tops(result, parse_gops_tops(gops))
 
 
 def cpu_backend(ctx: RunContext) -> BackendResult:
@@ -181,7 +211,7 @@ def cpu_backend(ctx: RunContext) -> BackendResult:
         result.status, result.evidence = "FAIL", f"CPU disassembly did not show required VNNI marker; see {log}"
         return result
     if ctx.run_enabled:
-        ok, log = run_logged(ctx, result, "run", [binary, "--warmups", ctx.warmups, "--iterations", ctx.iterations])
+        ok, log = run_logged(ctx, result, "run", [binary, "--warmups", ctx.warmups, "--iterations", ctx.iterations, "--threads", ctx.cpu_threads])
         result.runtime = f"ran; see {log}" if ok else result.runtime
         if not ok:
             note_run_failure(result, log)
@@ -194,10 +224,11 @@ def cpu_backend(ctx: RunContext) -> BackendResult:
     if ctx.run_enabled and (run_log := result.logs.get("run")) and run_log.exists():
         avg_us, min_us, max_us, gops = (last_kv_value(run_log, key) for key in ("avg_us", "min_us", "max_us", "gops"))
         result.perf_domain = last_kv_value(run_log, "timing_domain") or "host_steady_clock"
-        result.perf_count = str(ctx.iterations)
+        result.perf_count = last_kv_value(run_log, "iterations") or str(ctx.iterations)
         result.perf_latency = f"mean {avg_us or 'n/a'} us, min {min_us or 'n/a'} us, max {max_us or 'n/a'} us"
         result.perf_throughput = f"{gops or 'n/a'} GOPS ({to_tops(gops)} TOPS)"
-        result.perf_notes = f"warmups={ctx.warmups}; validation={last_kv_value(run_log, 'validation') or 'unknown'}"
+        set_perf_tops(result, parse_gops_tops(gops))
+        result.perf_notes = f"threads={last_kv_value(run_log, 'threads') or ctx.cpu_threads}; warmups={ctx.warmups}; validation={last_kv_value(run_log, 'validation') or 'unknown'}"
     return result
 
 
@@ -211,6 +242,15 @@ def gpu_tools(repo: Path) -> tuple[str | None, str | None]:
     if not airgpu and (candidate := repo / "install-gpu" / "lib" / "libairgpu.so").exists():
         airgpu = str(candidate)
     return runner, airgpu
+
+
+def gpu_compile_env(repo: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    if not env.get("AIR_OPT") and (candidate := repo / "build-gpu" / "bin" / "air-opt").exists():
+        env["AIR_OPT"] = str(candidate)
+    if not env.get("MLIR_OPT") and (candidate := repo / "llvm" / "install-amdgpu" / "bin" / "mlir-opt").exists():
+        env["MLIR_OPT"] = str(candidate)
+    return env
 
 
 def render_gpu_mlir(source: Path, dest: Path, ctx: RunContext) -> None:
@@ -240,7 +280,7 @@ def gpu_backend(ctx: RunContext) -> BackendResult:
         write_text(log, f"failed to render GPU MLIR: {exc}\n")
         result.status, result.evidence = "WARN", f"GPU MLIR render failed; see {log}"
         return result
-    ok, log = run_logged(ctx, result, "disassemble", [ctx.disassemble, "gpu", "--gpu-arch", ctx.gpu_arch, "--output-dir", result.artifacts_dir, "--prefix", "gpu_int8_gemm", "--expect", "v_wmma_i32_16x16x16_iu8", "--forbid", r"v_wmma_.*16x16x64|v_swmmac|swmmac", generated])
+    ok, log = run_logged(ctx, result, "disassemble", [ctx.disassemble, "gpu", "--gpu-arch", ctx.gpu_arch, "--output-dir", result.artifacts_dir, "--prefix", "gpu_int8_gemm", "--expect", "v_wmma_i32_16x16x16_iu8", "--forbid", r"v_wmma_.*16x16x64|v_swmmac|swmmac", generated], env=gpu_compile_env(ctx.repo))
     if not ok:
         result.status, result.evidence = "WARN", f"GPU lowering/disassembly failed or required marker was absent; see {log}"
         return result
@@ -272,7 +312,9 @@ def gpu_backend(ctx: RunContext) -> BackendResult:
         result.perf_domain = "kernel_event"
         result.perf_count = timing_field(run_log, "kernel_event", "count") or "n/a"
         result.perf_latency = f"mean {timing_field(run_log, 'kernel_event', 'mean_ms') or 'n/a'} ms, min {timing_field(run_log, 'kernel_event', 'min_ms') or 'n/a'} ms, max {timing_field(run_log, 'kernel_event', 'max_ms') or 'n/a'} ms"
-        result.perf_throughput = f"{timing_field(run_log, 'kernel_event', 'tops') or 'n/a'} TOPS"
+        gpu_tops = timing_field(run_log, "kernel_event", "tops")
+        result.perf_throughput = f"{gpu_tops or 'n/a'} TOPS"
+        set_perf_tops(result, parse_tops(gpu_tops))
         result.perf_notes = f"host_dispatch_wait_mean_ms={timing_field(run_log, 'host_dispatch_wait', 'mean_ms') or 'n/a'}; peak_pct={last_kv_value(run_log, 'kernel_event_peak_pct') or 'n/a'}; warmups={ctx.warmups}"
     return result
 
@@ -283,6 +325,30 @@ def find_npu_elves(build_dir: Path) -> list[Path]:
 
 def npu_env(ctx: RunContext) -> dict[str, str]:
     env = os.environ.copy()
+    if not env.get("PYTHON") and (candidate := ctx.repo / "sandbox" / "bin" / "python3").exists():
+        env["PYTHON"] = str(candidate)
+    for candidate in sorted((ctx.repo / "sandbox" / "lib").glob("python*/site-packages/mlir_aie")):
+        if (candidate / "runtime_lib" / "x86_64" / "test_lib" / "include" / "cxxopts.hpp").exists():
+            env.setdefault("AIEOPT_DIR", str(candidate))
+            break
+    bin_paths = []
+    for candidate in (ctx.repo / "install-xrt" / "bin", ctx.repo / "install" / "bin", ctx.repo / "build-xrt" / "bin", ctx.repo / "build" / "bin", ctx.repo / "sandbox" / "bin"):
+        if (candidate / "aircc").exists() or (candidate / "aiecc").exists() or (candidate / "aiecc.py").exists():
+            bin_paths.append(str(candidate))
+    if bin_paths:
+        env["PATH"] = os.pathsep.join([*bin_paths, env.get("PATH", "")]).rstrip(os.pathsep)
+    python_paths = []
+    for candidate in (
+        ctx.repo / "install-xrt" / "python",
+        ctx.repo / "install" / "python",
+        ctx.repo / "build-xrt" / "python",
+        ctx.repo / "build" / "python",
+        ctx.repo / "python",
+    ):
+        if (candidate / "air" / "backend" / "xrt.py").exists():
+            python_paths.append(str(candidate))
+    if python_paths:
+        env["PYTHONPATH"] = os.pathsep.join([*python_paths, env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
     for path in [env.get("PEANO_INSTALL_DIR", ""), *(str(path) for path in sorted((ctx.repo / "sandbox/lib").glob("python*/site-packages/llvm-aie")))]:
         if path and (Path(path) / "bin" / "llc").exists():
             env["PEANO_INSTALL_DIR"] = path
@@ -294,16 +360,19 @@ def npu_backend(ctx: RunContext) -> BackendResult:
     result = backend_result(ctx, "npu", True)
     env = npu_env(ctx)
     source_dir = ctx.repo / "test" / "xrt" / "46_triton_matmul_ver4_strix_8x4_i8_i8_i32"
-    reused = (result.build_dir / "air.xclbin").exists() and (result.build_dir / "air.insts.bin").exists() and find_npu_elves(result.build_dir)
+    build_stamp = result.build_dir / "gemm_int8_build_key.txt"
+    build_key = f"runtime_loop_tiling={ctx.npu_runtime_loop_tiling}\n"
+    reused = (result.build_dir / "air.xclbin").exists() and (result.build_dir / "air.insts.bin").exists() and find_npu_elves(result.build_dir) and read_text(build_stamp) == build_key
     if reused:
         compile_note = f"reused build_dir={result.build_dir}"
         write_text(log_path(ctx, result, "build"), f"Reusing existing NPU artifacts in {result.build_dir}\n")
     else:
         compile_note = "fresh compile"
-        ok, log = run_logged(ctx, result, "build", ["make", "-C", source_dir, f"BUILD_DIR={result.build_dir}", "AIE_TARGET=aie2p", f"M={M}", f"K={K}", f"N={N}", "compile-xclbin"], env=env)
+        ok, log = run_logged(ctx, result, "build", ["make", "-C", source_dir, f"BUILD_DIR={result.build_dir}", "AIE_TARGET=aie2p", f"M={M}", f"K={K}", f"N={N}", f"RUNTIME_LOOP_TILING={ctx.npu_runtime_loop_tiling}", "compile-xclbin"], env=env)
         if not ok:
             result.status, result.evidence = "WARN", f"NPU compile-xclbin failed; see {log}"
             return result
+        write_text(build_stamp, build_key)
     elves = find_npu_elves(result.build_dir)
     if not elves:
         result.status, result.evidence = "WARN", f"NPU build produced no per-core ELF files under {result.build_dir}"
@@ -321,11 +390,14 @@ def npu_backend(ctx: RunContext) -> BackendResult:
     if ctx.run_enabled:
         exe = result.build_dir / "test.exe"
         if not exe.exists():
-            run_logged(ctx, result, "build_test_exe", ["make", "-C", source_dir, f"BUILD_DIR={result.build_dir}", "AIE_TARGET=aie2p", "build-test-exe"], env=env)
-        ok, log = run_logged(ctx, result, "profile", ["./test.exe", "-x", "air.xclbin", "-k", "MLIR_AIE", "-i", "air.insts.bin", "-M", M, "-K", K, "-N", N, "-v", "0", "--warmups", ctx.warmups, "--iterations", ctx.iterations], cwd=result.build_dir, env=env)
-        result.runtime = f"ran; see {log}" if ok else result.runtime
-        if not ok:
-            note_run_failure(result, log, "profile")
+            ok, log = run_logged(ctx, result, "build_test_exe", ["make", "-C", source_dir, f"BUILD_DIR={result.build_dir}", "AIE_TARGET=aie2p", "build-test-exe"], env=env)
+            if not ok or not exe.exists():
+                note_run_failure(result, log, "build-test-exe")
+        if exe.exists():
+            ok, log = run_logged(ctx, result, "profile", ["./test.exe", "-x", "air.xclbin", "-k", "MLIR_AIE", "-i", "air.insts.bin", "-M", M, "-K", K, "-N", N, "-v", "0", "--warmups", ctx.warmups, "--iterations", ctx.iterations, "--b-layout", "row"], cwd=result.build_dir, env=env)
+            result.runtime = f"ran; see {log}" if ok else result.runtime
+            if not ok:
+                note_run_failure(result, log, "profile")
     combined = "\n".join(read_text(path) for path in sorted(result.artifacts_dir.glob("*.disasm.s")))
     vmac = count_regex(combined, r"\bvmac\b")
     vloads = count_regex(combined, r"\bvld[ab]?\b|\bvlda\b|\bvldb\b")
@@ -336,12 +408,23 @@ def npu_backend(ctx: RunContext) -> BackendResult:
         result.status = "WARN"
     if ctx.run_enabled and (run_log := result.logs.get("profile")) and run_log.exists():
         parse_host_perf(ctx, result, run_log, "host run.wait")
-        result.perf_notes = f"warmups={last_kv_value(run_log, 'warmups') or ctx.warmups}; validation={last_kv_value(run_log, 'validation') or 'unknown'}; excludes output BO sync; timing wraps run.wait"
+        result.perf_notes = f"runtime_loop_tiling={ctx.npu_runtime_loop_tiling}; b_layout={last_kv_value(run_log, 'b_layout') or 'row'}; warmups={last_kv_value(run_log, 'warmups') or ctx.warmups}; validation={last_kv_value(run_log, 'validation') or 'unknown'}; excludes output BO sync; timing wraps run.wait"
     return result
 
 
 def selected_backends(name: str) -> list[str]:
     return ["cpu", "gpu", "npu"] if name == "all" else [name]
+
+
+def strict_failed(results: dict[str, BackendResult], selected: set[str], run_enabled: bool) -> bool:
+    for name in selected:
+        result = results[name]
+        if result.status not in {"PASS", "SKIP"}:
+            return True
+        if run_enabled and result.target_tops is not None:
+            if result.perf_tops is None or result.perf_tops < result.target_tops:
+                return True
+    return False
 
 
 def write_report(report: Path, ctx: RunContext, args: argparse.Namespace, results: dict[str, BackendResult]) -> None:
@@ -350,16 +433,17 @@ def write_report(report: Path, ctx: RunContext, args: argparse.Namespace, result
         f.write("# GEMM int8 Benchmark Report\n\n")
         f.write(f"Artifacts: `{ctx.out_dir}`\n\n")
         f.write("## Run Controls\n\n| Field | Value |\n| --- | --- |\n")
-        for key, value in (("Selected backend", args.backend), ("Execute kernels", args.run), ("Strict mode", args.strict), ("Warmups", args.warmups), ("Iterations", args.iterations), ("Build root", ctx.build_root), ("GPU arch", args.gpu_arch), ("Shape", f"M=N=K={M}, int8 x int8 -> int32")):
+        for key, value in (("Selected backend", args.backend), ("Execute kernels", args.run), ("Strict mode", args.strict), ("Warmups", args.warmups), ("Iterations", args.iterations), ("CPU threads", args.cpu_threads), ("NPU runtime loop tiling", args.npu_runtime_loop_tiling), ("Build root", ctx.build_root), ("GPU arch", args.gpu_arch), ("Shape", f"M=N=K={M}, int8 x int8 -> int32")):
             f.write(f"| {key} | `{value}` |\n")
         f.write("\n## ISA Verdicts\n\n| Backend | Status | Evidence | Runtime |\n| --- | --- | --- | --- |\n")
         for name in ("cpu", "gpu", "npu"):
             result = results[name]
             f.write(f"| {name.upper()} | {result.status} | {result.evidence} | {result.runtime} |\n")
-        f.write("\n## Performance\n\n| Backend | Timing domain | Count | Latency | Throughput | Notes |\n| --- | --- | --- | --- | --- | --- |\n")
+        f.write("\n## Performance\n\n| Backend | Timing domain | Count | Latency | Throughput | Target TOPS | % of Target | Notes |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n")
         for name in ("cpu", "gpu", "npu"):
             result = results[name]
-            f.write(f"| {name.upper()} | {result.perf_domain} | {result.perf_count} | {result.perf_latency} | {result.perf_throughput} | {result.perf_notes} |\n")
+            target = f"{result.target_tops:.3f}" if result.target_tops is not None else "n/a"
+            f.write(f"| {name.upper()} | {result.perf_domain} | {result.perf_count} | {result.perf_latency} | {result.perf_throughput} | {target} | {result.target_pct} | {result.perf_notes} |\n")
         f.write("\n## Logs\n\n")
         for name in ("cpu", "gpu", "npu"):
             result = results[name]
@@ -375,15 +459,26 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--run", action="store_true", help="execute selected kernels")
     parser.add_argument("--strict", action="store_true", help="exit non-zero when any selected backend is not PASS")
     parser.add_argument("--gpu-arch", default=os.environ.get("AIR_GPU_CHIP", "gfx1150"), help="AMDGPU chip for GPU lowering (default: AIR_GPU_CHIP or gfx1150)")
+    parser.add_argument("--cpu-threads", type=positive_int, default=12, help="CPU worker threads passed to the CPU benchmark (default: 12)")
+    parser.add_argument("--npu-runtime-loop-tiling", default="2,4", metavar="M,N", help="AIR runtime loop tiling sizes for NPU compile (default: 2,4)")
     parser.add_argument("--warmups", type=nonnegative_int, default=10, help="warmup iterations for every backend (default: 10)")
     parser.add_argument("--iterations", type=positive_int, default=20, help="timed iterations for every backend (default: 20)")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    tiling_values = args.npu_runtime_loop_tiling.split(",")
+    if len(tiling_values) != 2:
+        parser.error("--npu-runtime-loop-tiling must contain two positive integers")
+    try:
+        parsed_tiling = [positive_int(value) for value in tiling_values]
+    except argparse.ArgumentTypeError as exc:
+        parser.error(f"--npu-runtime-loop-tiling: {exc}")
+    args.npu_runtime_loop_tiling = f"{parsed_tiling[0]},{parsed_tiling[1]}"
+    return args
 
 
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
     out_dir = args.out_dir.resolve()
-    ctx = RunContext(Path(__file__).resolve().parents[2], out_dir, args.build_dir.resolve() if args.build_dir else out_dir / "build", out_dir / "logs", args.warmups, args.iterations, args.gpu_arch, args.run)
+    ctx = RunContext(Path(__file__).resolve().parents[2], out_dir, args.build_dir.resolve() if args.build_dir else out_dir / "build", out_dir / "logs", args.warmups, args.iterations, args.gpu_arch, args.run, args.cpu_threads, args.npu_runtime_loop_tiling)
     for path in (ctx.out_dir, ctx.build_root, ctx.logs_dir):
         path.mkdir(parents=True, exist_ok=True)
     selected = set(selected_backends(args.backend))
@@ -395,7 +490,7 @@ def main(argv: Sequence[str]) -> int:
     report = out_dir / "gemm_int8_report.md"
     write_report(report, ctx, args, results)
     print(f"Report: {report}")
-    return 1 if args.strict and any(results[name].status not in {"PASS", "SKIP"} for name in selected) else 0
+    return 1 if args.strict and strict_failed(results, selected, args.run) else 0
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ CXX ?= g++
 BUILD_DIR ?= build
 TARGET := $(BUILD_DIR)/int8_gemm_cpu
 
-CXXFLAGS ?= -O3 -g -std=c++17 -Wall -Wextra -march=native -fno-omit-frame-pointer
+CXXFLAGS ?= -O3 -g -std=c++17 -Wall -Wextra -march=native -fno-omit-frame-pointer -pthread
 
 .PHONY: all clean
 

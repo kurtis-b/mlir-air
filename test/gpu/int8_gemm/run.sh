@@ -7,6 +7,12 @@ REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 TMPDIR="${TMPDIR:-/tmp/air_int8_gemm}"
 GPU_CHIP="${AIR_GPU_CHIP:-gfx1150}"
 export AIRGPU_USE_HIP_MALLOC="${AIRGPU_USE_HIP_MALLOC:-1}"
+if [ -z "${AIR_OPT:-}" ] && [ -x "$REPO_DIR/build-gpu/bin/air-opt" ]; then
+  export AIR_OPT="$REPO_DIR/build-gpu/bin/air-opt"
+fi
+if [ -z "${MLIR_OPT:-}" ] && [ -x "$REPO_DIR/llvm/install-amdgpu/bin/mlir-opt" ]; then
+  export MLIR_OPT="$REPO_DIR/llvm/install-amdgpu/bin/mlir-opt"
+fi
 mkdir -p "$TMPDIR"
 
 "$REPO_DIR/utils/isa_inspect/disassemble.sh" gpu --gpu-arch "$GPU_CHIP" \

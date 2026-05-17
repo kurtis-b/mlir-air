@@ -29,6 +29,16 @@ using C_DATATYPE = int32_t;
 
 static inline int8_t random_int8_t() { return (int8_t)(rand() % 8); }
 
+enum class BLayout { RowMajor, ColumnMajor };
+
+static BLayout parse_b_layout(const std::string &layout) {
+  if (layout == "row")
+    return BLayout::RowMajor;
+  if (layout == "column")
+    return BLayout::ColumnMajor;
+  throw std::runtime_error("--b-layout must be 'row' or 'column'");
+}
+
 static C_DATATYPE reference_element(const std::vector<A_DATATYPE> &a,
                                     const std::vector<B_DATATYPE> &b, int row,
                                     int col, int K, int N) {
@@ -83,7 +93,9 @@ void add_default_options(cxxopts::Options &options) {
       "warmups", "Warmup iterations",
       cxxopts::value<unsigned>()->default_value("10"))(
       "iterations", "Timed iterations",
-      cxxopts::value<unsigned>()->default_value("20"));
+      cxxopts::value<unsigned>()->default_value("20"))(
+      "b-layout", "Device B buffer layout: row or column",
+      cxxopts::value<std::string>()->default_value("row"));
 }
 
 int main(int argc, const char *argv[]) {
@@ -98,6 +110,7 @@ int main(int argc, const char *argv[]) {
   int M = vm["size_m"].as<int>();
   int K = vm["size_k"].as<int>();
   int N = vm["size_n"].as<int>();
+  BLayout b_layout = parse_b_layout(vm["b-layout"].as<std::string>());
 
   int A_VOLUME = M * K;
   int B_VOLUME = K * N;
@@ -182,7 +195,15 @@ int main(int argc, const char *argv[]) {
   for (int i = 0; i < B_VOLUME; i++) {
     BVec[i] = random_int8_t();
   }
-  memcpy(bufB, BVec.data(), (BVec.size() * sizeof(B_DATATYPE)));
+  std::vector<B_DATATYPE> BDevice(B_VOLUME);
+  if (b_layout == BLayout::RowMajor) {
+    BDevice = BVec;
+  } else {
+    for (int k = 0; k < K; ++k)
+      for (int n = 0; n < N; ++n)
+        BDevice[n * K + k] = BVec[k * N + n];
+  }
+  memcpy(bufB, BDevice.data(), (BDevice.size() * sizeof(B_DATATYPE)));
 
   C_DATATYPE *bufC = bo_c.map<C_DATATYPE *>();
   std::vector<C_DATATYPE> CVec(C_VOLUME, 0);
@@ -257,6 +278,8 @@ int main(int argc, const char *argv[]) {
 
   std::cout << "backend=npu\n";
   std::cout << "shape=" << M << "x" << N << "x" << K << "\n";
+  std::cout << "b_layout="
+            << (b_layout == BLayout::RowMajor ? "row" : "column") << "\n";
   std::cout << "warmups=" << n_warmup_iterations << "\n";
   std::cout << "iterations=" << n_iterations << "\n";
   std::cout << "timing_domain=host_run_wait\n";

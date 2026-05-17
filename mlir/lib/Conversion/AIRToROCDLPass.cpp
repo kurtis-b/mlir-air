@@ -283,7 +283,7 @@ struct ConvertAIRToROCDLPass
                                            blockX, blockY, blockZ);
     gpuLaunch->setAttr(kInt8GemmWmmaAttr, UnitAttr::get(launchOp.getContext()));
     gpuLaunch->setAttr("air.gpu.int8_gemm_variant",
-                       builder.getStringAttr("lds_dual_column"));
+                       builder.getStringAttr("lds_vectorized_64x64"));
 
     {
       OpBuilder::InsertionGuard guard(builder);
