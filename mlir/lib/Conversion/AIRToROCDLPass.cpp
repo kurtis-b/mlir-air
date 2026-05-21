@@ -8,6 +8,7 @@
 #include "air/Conversion/GPUPassDetail.h"
 #include "air/Dialect/AIR/AIRDialect.h"
 #include "air/Util/Util.h"
+#include "Int8GemmWmmaConfig.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/GPUToROCDL/GPUToROCDLPass.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
@@ -31,54 +32,11 @@
 using namespace mlir;
 using namespace xilinx;
 using namespace xilinx::air;
+using namespace xilinx::air::gpu_int8_gemm;
 
 namespace {
 #define GEN_PASS_DEF_CONVERTAIRTOROCDL
 #include "air/Conversion/Passes.h.inc"
-
-static constexpr const char kInt8GemmWmmaAttr[] = "air.gpu.int8_gemm_wmma";
-static constexpr const char kInt8GemmVariantAttr[] =
-    "air.gpu.int8_gemm_variant";
-static constexpr const char kInt8GemmGroupAttr[] =
-    "air.gpu.int8_gemm_group_m";
-static constexpr const char kInt8GemmDefaultVariant[] = "lds_128x64_wmma4";
-static constexpr const char kInt8GemmBPackVariant[] = "lds_128x64_bpack";
-static constexpr const char kInt8GemmBPackSwizzleVariant[] =
-    "lds_128x64_bpack_swizzle";
-static constexpr const char kInt8GemmBPackPipe2Variant[] =
-    "lds_128x64_bpack_pipe2";
-static constexpr const char kInt8GemmBPackPipe2GroupedVariant[] =
-    "lds_128x64_bpack_pipe2_grouped";
-static constexpr const char kInt8GemmBPackSwizzleGroupedVariant[] =
-    "lds_128x64_bpack_swizzle_grouped";
-static constexpr const char kInt8GemmBPackFragVariant[] =
-    "lds_128x64_bpack_frag";
-static constexpr const char kInt8GemmBPackSwizzlePipe2_128x128Variant[] =
-    "lds_128x128_bpack_swizzle_pipe2";
-static constexpr const char kInt8GemmBPackSwizzlePipe2LoopedVariant[] =
-    "lds_128x64_bpack_swizzle_pipe2_looped";
-static constexpr const char kInt8GemmBPackSwizzleLooped_128x128Variant[] =
-    "lds_128x128_bpack_swizzle_looped";
-static constexpr const char kInt8GemmBPackSwizzlePipe2Looped_64x128Variant[] =
-    "lds_64x128_bpack_swizzle_pipe2_looped";
-
-static bool isSupportedInt8GemmVariant(StringRef variant) {
-  return variant == kInt8GemmDefaultVariant ||
-         variant == kInt8GemmBPackVariant ||
-         variant == kInt8GemmBPackSwizzleVariant ||
-         variant == kInt8GemmBPackPipe2Variant ||
-         variant == kInt8GemmBPackPipe2GroupedVariant ||
-         variant == kInt8GemmBPackSwizzleGroupedVariant ||
-         variant == kInt8GemmBPackFragVariant ||
-         variant == kInt8GemmBPackSwizzlePipe2_128x128Variant ||
-         variant == kInt8GemmBPackSwizzlePipe2LoopedVariant ||
-         variant == kInt8GemmBPackSwizzleLooped_128x128Variant ||
-         variant == kInt8GemmBPackSwizzlePipe2Looped_64x128Variant;
-}
-
-static bool isSupportedInt8GemmGroupSize(uint32_t groupSize) {
-  return groupSize == 2 || groupSize == 4 || groupSize == 8;
-}
 
 SmallVector<mlir::BlockArgument, 4> gpuArgs;
 class AffineApplyToSubPattern
@@ -328,19 +286,20 @@ struct ConvertAIRToROCDLPass
       return launchOp.emitOpError(kInt8GemmWmmaAttr)
              << " unsupported group size '" << groupSize << "'";
 
+    auto config = getInt8GemmKernelConfig(variant);
+    if (!config)
+      return launchOp.emitOpError(kInt8GemmWmmaAttr)
+             << " unsupported variant '" << variant << "'";
+
     OpBuilder builder(launchOp);
     Location loc = launchOp.getLoc();
-    bool wideCols = variant == kInt8GemmBPackSwizzlePipe2_128x128Variant ||
-                    variant == kInt8GemmBPackSwizzleLooped_128x128Variant ||
-                    variant == kInt8GemmBPackSwizzlePipe2Looped_64x128Variant;
-    bool shortRows = variant == kInt8GemmBPackSwizzlePipe2Looped_64x128Variant;
     Value gridX = arith::ConstantIndexOp::create(builder, loc,
-                                                 wideCols ? 8 : 16);
+                                                 1024 / config->blockCols);
     Value gridY = arith::ConstantIndexOp::create(builder, loc,
-                                                 shortRows ? 16 : 8);
+                                                 1024 / config->blockRows);
     Value gridZ = arith::ConstantIndexOp::create(builder, loc, 1);
     Value blockX = arith::ConstantIndexOp::create(builder, loc,
-                                                  shortRows ? 128 : 256);
+                                                  config->blockThreads);
     Value blockY = arith::ConstantIndexOp::create(builder, loc, 1);
     Value blockZ = arith::ConstantIndexOp::create(builder, loc, 1);
 

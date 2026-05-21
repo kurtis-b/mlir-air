@@ -1,0 +1,131 @@
+//===- Int8GemmWmmaConfig.h -----------------------------------*- C++ -*-===//
+//
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: MIT
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef MLIR_AIR_LIB_CONVERSION_INT8GEMMWMMACONFIG_H
+#define MLIR_AIR_LIB_CONVERSION_INT8GEMMWMMACONFIG_H
+
+#include "llvm/ADT/StringRef.h"
+#include <cstdint>
+#include <optional>
+
+namespace xilinx::air::gpu_int8_gemm {
+
+static constexpr const char kInt8GemmWmmaAttr[] = "air.gpu.int8_gemm_wmma";
+static constexpr const char kInt8GemmVariantAttr[] =
+    "air.gpu.int8_gemm_variant";
+static constexpr const char kInt8GemmGroupAttr[] =
+    "air.gpu.int8_gemm_group_m";
+
+static constexpr const char kInt8GemmDefaultVariant[] = "lds_128x64_wmma4";
+static constexpr const char kInt8GemmBPackVariant[] = "lds_128x64_bpack";
+static constexpr const char kInt8GemmBPackSwizzleVariant[] =
+    "lds_128x64_bpack_swizzle";
+static constexpr const char kInt8GemmBPackPipe2Variant[] =
+    "lds_128x64_bpack_pipe2";
+static constexpr const char kInt8GemmBPackPipe2GroupedVariant[] =
+    "lds_128x64_bpack_pipe2_grouped";
+static constexpr const char kInt8GemmBPackSwizzleGroupedVariant[] =
+    "lds_128x64_bpack_swizzle_grouped";
+static constexpr const char kInt8GemmBPackFragVariant[] =
+    "lds_128x64_bpack_frag";
+static constexpr const char kInt8GemmBPackSwizzlePipe2_128x128Variant[] =
+    "lds_128x128_bpack_swizzle_pipe2";
+static constexpr const char kInt8GemmBPackSwizzlePipe2LoopedVariant[] =
+    "lds_128x64_bpack_swizzle_pipe2_looped";
+static constexpr const char kInt8GemmBPackSwizzleLooped_128x128Variant[] =
+    "lds_128x128_bpack_swizzle_looped";
+static constexpr const char kInt8GemmBPackSwizzlePipe2Looped_64x128Variant[] =
+    "lds_64x128_bpack_swizzle_pipe2_looped";
+static constexpr const char kInt8GemmBPackSwizzlePipe2LoopedK32Variant[] =
+    "lds_128x64_bpack_swizzle_pipe2_k32_looped";
+static constexpr const char kInt8GemmBPackSwizzlePipe2LoopedK128Variant[] =
+    "lds_128x64_bpack_swizzle_pipe2_k128_looped";
+static constexpr const char kInt8GemmBPackSwizzleLooped_128x128K32Variant[] =
+    "lds_128x128_bpack_swizzle_k32_looped";
+static constexpr const char kInt8GemmBPackSwizzleLooped_128x128K128Variant[] =
+    "lds_128x128_bpack_swizzle_k128_looped";
+static constexpr const char kInt8GemmBPackSwizzleBRegK64LoopedVariant[] =
+    "lds_128x64_bpack_swizzle_breg_k64_looped";
+
+enum class PipelineKind {
+  SingleBufferLoop,
+  Pipe2UnrolledCopy,
+  Pipe2UnrolledPrefetch,
+  Pipe2LoopedPrefetch,
+};
+
+struct Int8GemmKernelConfig {
+  llvm::StringRef variant;
+  int64_t blockRows;
+  int64_t blockCols;
+  int64_t kPerBlock;
+  int64_t blockThreads;
+  int64_t ldsStages;
+  bool swizzledLds;
+  bool packedB;
+  bool groupedBlocks;
+  bool directBFromGlobal;
+  PipelineKind pipeline;
+  uint32_t defaultGroupM;
+
+  int64_t waveCount() const { return blockThreads / 32; }
+};
+
+static const Int8GemmKernelConfig kInt8GemmKernelConfigs[] = {
+    {kInt8GemmDefaultVariant, 128, 64, 64, 256, 1, false, false, false, false,
+     PipelineKind::SingleBufferLoop, 4},
+    {kInt8GemmBPackVariant, 128, 64, 64, 256, 1, false, true, false, false,
+     PipelineKind::SingleBufferLoop, 4},
+    {kInt8GemmBPackSwizzleVariant, 128, 64, 64, 256, 1, true, true, false,
+     false, PipelineKind::SingleBufferLoop, 4},
+    {kInt8GemmBPackPipe2Variant, 128, 64, 64, 256, 2, false, true, false,
+     false, PipelineKind::Pipe2UnrolledCopy, 4},
+    {kInt8GemmBPackPipe2GroupedVariant, 128, 64, 64, 256, 2, false, true,
+     true, false, PipelineKind::Pipe2UnrolledCopy, 4},
+    {kInt8GemmBPackSwizzleGroupedVariant, 128, 64, 64, 256, 1, true, true,
+     true, false, PipelineKind::SingleBufferLoop, 4},
+    {kInt8GemmBPackFragVariant, 128, 64, 64, 256, 1, false, true, false, true,
+     PipelineKind::SingleBufferLoop, 4},
+    {kInt8GemmBPackSwizzlePipe2_128x128Variant, 128, 128, 64, 256, 2, true,
+     true, false, false, PipelineKind::Pipe2UnrolledPrefetch, 4},
+    {kInt8GemmBPackSwizzlePipe2LoopedVariant, 128, 64, 64, 256, 2, true, true,
+     false, false, PipelineKind::Pipe2LoopedPrefetch, 4},
+    {kInt8GemmBPackSwizzleLooped_128x128Variant, 128, 128, 64, 256, 1, true,
+     true, false, false, PipelineKind::SingleBufferLoop, 4},
+    {kInt8GemmBPackSwizzlePipe2Looped_64x128Variant, 64, 128, 64, 128, 2,
+     true, true, false, false, PipelineKind::Pipe2LoopedPrefetch, 4},
+    {kInt8GemmBPackSwizzlePipe2LoopedK32Variant, 128, 64, 32, 256, 2, true,
+     true, false, false, PipelineKind::Pipe2LoopedPrefetch, 4},
+    {kInt8GemmBPackSwizzlePipe2LoopedK128Variant, 128, 64, 128, 256, 2, true,
+     true, false, false, PipelineKind::Pipe2LoopedPrefetch, 4},
+    {kInt8GemmBPackSwizzleLooped_128x128K32Variant, 128, 128, 32, 256, 1,
+     true, true, false, false, PipelineKind::SingleBufferLoop, 4},
+    {kInt8GemmBPackSwizzleLooped_128x128K128Variant, 128, 128, 128, 256, 1,
+     true, true, false, false, PipelineKind::SingleBufferLoop, 4},
+    {kInt8GemmBPackSwizzleBRegK64LoopedVariant, 128, 64, 64, 256, 2, true,
+     true, false, true, PipelineKind::Pipe2LoopedPrefetch, 4},
+};
+
+inline std::optional<Int8GemmKernelConfig>
+getInt8GemmKernelConfig(llvm::StringRef variant) {
+  for (const auto &config : kInt8GemmKernelConfigs)
+    if (variant == config.variant)
+      return config;
+  return std::nullopt;
+}
+
+inline bool isSupportedInt8GemmVariant(llvm::StringRef variant) {
+  return getInt8GemmKernelConfig(variant).has_value();
+}
+
+inline bool isSupportedInt8GemmGroupSize(uint32_t groupSize) {
+  return groupSize == 2 || groupSize == 4 || groupSize == 8;
+}
+
+} // namespace xilinx::air::gpu_int8_gemm
+
+#endif // MLIR_AIR_LIB_CONVERSION_INT8GEMMWMMACONFIG_H

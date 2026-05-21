@@ -17,6 +17,11 @@
 // RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_swizzle_pipe2_looped" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,GRID64,PIPE64LOOP
 // RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_bpack_swizzle_looped" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,GRID128,WIDELOOP
 // RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_64x128_bpack_swizzle_pipe2_looped" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,GRID64X128,SHORTPIPE
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_swizzle_pipe2_k32_looped" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,GRID64,PIPE64K32
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_swizzle_pipe2_k128_looped" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,GRID64,PIPE64K128
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_bpack_swizzle_k32_looped" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,GRID128,WIDEK32
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_bpack_swizzle_k128_looped" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,GRID128,WIDEK128
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_swizzle_breg_k64_looped" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,GRID64,BREG64
 // RUN: not air-opt %s -air-to-rocdl="int8-gemm-variant=not_a_variant" 2>&1 | FileCheck %s --check-prefix=BAD
 // RUN: not air-opt %s -air-to-rocdl="int8-gemm-group-size=6" 2>&1 | FileCheck %s --check-prefix=BADGROUP
 
@@ -37,6 +42,11 @@
 // PIPE64LOOP-SAME: air.gpu.int8_gemm_variant = "lds_128x64_bpack_swizzle_pipe2_looped"
 // WIDELOOP-SAME: air.gpu.int8_gemm_variant = "lds_128x128_bpack_swizzle_looped"
 // SHORTPIPE-SAME: air.gpu.int8_gemm_variant = "lds_64x128_bpack_swizzle_pipe2_looped"
+// PIPE64K32-SAME: air.gpu.int8_gemm_variant = "lds_128x64_bpack_swizzle_pipe2_k32_looped"
+// PIPE64K128-SAME: air.gpu.int8_gemm_variant = "lds_128x64_bpack_swizzle_pipe2_k128_looped"
+// WIDEK32-SAME: air.gpu.int8_gemm_variant = "lds_128x128_bpack_swizzle_k32_looped"
+// WIDEK128-SAME: air.gpu.int8_gemm_variant = "lds_128x128_bpack_swizzle_k128_looped"
+// BREG64-SAME: air.gpu.int8_gemm_variant = "lds_128x64_bpack_swizzle_breg_k64_looped"
 // CHECK: rocdl.wmma.i32.16x16x16.iu8
 // CHECK-NOT: rocdl.wmma.i32.16x16x64
 // CHECK-NOT: swmmac
