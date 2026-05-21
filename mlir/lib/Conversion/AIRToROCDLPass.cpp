@@ -53,6 +53,8 @@ static constexpr const char kInt8GemmBPackSwizzleGroupedVariant[] =
     "lds_128x64_bpack_swizzle_grouped";
 static constexpr const char kInt8GemmBPackFragVariant[] =
     "lds_128x64_bpack_frag";
+static constexpr const char kInt8GemmBPackSwizzlePipe2_128x128Variant[] =
+    "lds_128x128_bpack_swizzle_pipe2";
 
 static bool isSupportedInt8GemmVariant(StringRef variant) {
   return variant == kInt8GemmDefaultVariant ||
@@ -61,7 +63,8 @@ static bool isSupportedInt8GemmVariant(StringRef variant) {
          variant == kInt8GemmBPackPipe2Variant ||
          variant == kInt8GemmBPackPipe2GroupedVariant ||
          variant == kInt8GemmBPackSwizzleGroupedVariant ||
-         variant == kInt8GemmBPackFragVariant;
+         variant == kInt8GemmBPackFragVariant ||
+         variant == kInt8GemmBPackSwizzlePipe2_128x128Variant;
 }
 
 static bool isSupportedInt8GemmGroupSize(uint32_t groupSize) {
@@ -318,7 +321,9 @@ struct ConvertAIRToROCDLPass
 
     OpBuilder builder(launchOp);
     Location loc = launchOp.getLoc();
-    Value gridX = arith::ConstantIndexOp::create(builder, loc, 16);
+    bool wideTile = variant == kInt8GemmBPackSwizzlePipe2_128x128Variant;
+    Value gridX = arith::ConstantIndexOp::create(builder, loc,
+                                                 wideTile ? 8 : 16);
     Value gridY = arith::ConstantIndexOp::create(builder, loc, 8);
     Value gridZ = arith::ConstantIndexOp::create(builder, loc, 1);
     Value blockX = arith::ConstantIndexOp::create(builder, loc, 256);

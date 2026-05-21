@@ -33,6 +33,7 @@ GPU_INT8_GEMM_VARIANTS = (
     "lds_128x64_bpack_pipe2_grouped",
     "lds_128x64_bpack_swizzle_grouped",
     "lds_128x64_bpack_frag",
+    "lds_128x128_bpack_swizzle_pipe2",
 )
 GPU_INT8_GEMM_SWEEP_VARIANTS = GPU_INT8_GEMM_VARIANTS
 DEFAULT_GPU_INT8_GEMM_GROUP_SIZE = 4
@@ -40,9 +41,15 @@ GPU_INT8_GEMM_GROUP_SIZES = (2, 4, 8)
 DEFAULT_GPU_INT8_GEMM_SWEEP_GROUP_SIZES = GPU_INT8_GEMM_GROUP_SIZES
 DEFAULT_GPU_INT8_GEMM_SWEEP_REPETITIONS = 3
 GPU_INT8_GEMM_GROUPED_SWIZZLE_VARIANT = "lds_128x64_bpack_swizzle_grouped"
-GPU_INT8_GEMM_SWEEP_PROFILES = ("full", "default-decision")
+GPU_INT8_GEMM_SWEEP_PROFILES = ("full", "default-decision", "gfx1150-rewrite")
 DEFAULT_GPU_INT8_GEMM_SWEEP_PROFILE = "full"
 DEFAULT_GPU_INT8_GEMM_DEFAULT_THRESHOLD_PCT = 3.0
+GPU_INT8_GEMM_GFX1150_REWRITE_CANDIDATES = (
+    ("lds_128x64_wmma4", 4),
+    ("lds_128x64_bpack_swizzle", 4),
+    ("lds_128x64_bpack_swizzle_grouped", 2),
+    ("lds_128x128_bpack_swizzle_pipe2", 4),
+)
 GPU_INT8_GEMM_DEFAULT_DECISION_CANDIDATES = (
     (GPU_INT8_GEMM_BASE_WMMA_VARIANT, 4),
     ("lds_128x64_bpack_swizzle", 4),
@@ -52,6 +59,7 @@ GPU_INT8_GEMM_DEFAULT_DECISION_CANDIDATES = (
 )
 GPU_STATIC_COUNTER_KEYS = (
     "wmma",
+    "lds_bytes_per_workgroup",
     "barriers",
     "vgprs",
     "sgprs",
@@ -67,6 +75,7 @@ GPU_STATIC_COUNTER_KEYS = (
 )
 GPU_STATIC_COUNTER_LABELS = {
     "wmma": "WMMA",
+    "lds_bytes_per_workgroup": "LDS bytes/workgroup",
     "barriers": "barriers",
     "vgprs": "VGPRs",
     "sgprs": "SGPRs",
@@ -175,6 +184,19 @@ def gpu_variant_uses_fragment_b(variant: str) -> bool:
 
 def gpu_b_pack_function(variant: str) -> str:
     return "mgpuPackBFragI8I32" if gpu_variant_uses_fragment_b(variant) else "mgpuPackBI8I32"
+
+
+def gpu_static_lds_bytes_per_workgroup(variant: str) -> int:
+    if variant == "lds_128x64_bpack_frag":
+        return 128 * 64
+    pipelined_variants = {
+        "lds_128x64_bpack_pipe2",
+        "lds_128x64_bpack_pipe2_grouped",
+        "lds_128x128_bpack_swizzle_pipe2",
+    }
+    buffers = 2 if variant in pipelined_variants else 1
+    b_rows = 128 if variant == "lds_128x128_bpack_swizzle_pipe2" else 64
+    return buffers * ((128 * 64) + (b_rows * 64))
 
 
 def to_tops(gops: str) -> str:
@@ -550,6 +572,7 @@ def gpu_backend(ctx: RunContext) -> BackendResult:
     scratch = count_regex(isa, r"uses_flat_scratch\s+1")
     spills = count_regex(summary, r"spill_count = [1-9]|_spill_count: [1-9]")
     variant = mlir_string_attr(outline_mlir, "air.gpu.int8_gemm_variant") or "unknown"
+    lds_bytes_per_workgroup = gpu_static_lds_bytes_per_workgroup(variant)
     group_m = mlir_int_attr(outline_mlir, "air.gpu.int8_gemm_group_m") or str(ctx.gpu_int8_gemm_group_size)
     vgprs = summary_metric(summary, ".vgpr_count") or "n/a"
     sgprs = summary_metric(summary, ".sgpr_count") or "n/a"
@@ -564,7 +587,9 @@ def gpu_backend(ctx: RunContext) -> BackendResult:
     if ctx.run_enabled and "failed" in result.runtime and result.status == "PASS":
         result.status = "WARN"
     result.evidence = (
-        f"variant={variant}, group_m={group_m}, wmma={wmma}, barriers={barriers}, vgprs={vgprs}, "
+        f"variant={variant}, group_m={group_m}, wmma={wmma}, "
+        f"lds_bytes_per_workgroup={lds_bytes_per_workgroup}, "
+        f"barriers={barriers}, vgprs={vgprs}, "
         f"sgprs={sgprs}, scratch_markers={scratch}, spills={spills}, "
         f"global_load_b128={global_load_b128}, global_load_lds={global_load_lds}, "
         f"ds_store_b128={ds_store_b128}, ds_store_b8={ds_store_b8}, "
@@ -593,6 +618,8 @@ def gpu_sweep_candidates(
     variants: Sequence[str],
     group_sizes: Sequence[int],
 ) -> list[tuple[str, int]]:
+    if sweep_profile == "gfx1150-rewrite":
+        return list(GPU_INT8_GEMM_GFX1150_REWRITE_CANDIDATES)
     if sweep_profile == "default-decision":
         return list(GPU_INT8_GEMM_DEFAULT_DECISION_CANDIDATES)
     return [

@@ -54,6 +54,8 @@ static constexpr const char kInt8GemmBPackSwizzleGroupedVariant[] =
     "lds_128x64_bpack_swizzle_grouped";
 static constexpr const char kInt8GemmBPackFragVariant[] =
     "lds_128x64_bpack_frag";
+static constexpr const char kInt8GemmBPackSwizzlePipe2_128x128Variant[] =
+    "lds_128x128_bpack_swizzle_pipe2";
 
 static bool isSupportedInt8GemmVariant(StringRef variant) {
   return variant == kInt8GemmDefaultVariant ||
@@ -62,7 +64,8 @@ static bool isSupportedInt8GemmVariant(StringRef variant) {
          variant == kInt8GemmBPackPipe2Variant ||
          variant == kInt8GemmBPackPipe2GroupedVariant ||
          variant == kInt8GemmBPackSwizzleGroupedVariant ||
-         variant == kInt8GemmBPackFragVariant;
+         variant == kInt8GemmBPackFragVariant ||
+         variant == kInt8GemmBPackSwizzlePipe2_128x128Variant;
 }
 
 static bool isSupportedInt8GemmGroupSize(uint32_t groupSize) {
@@ -333,12 +336,17 @@ struct ConvertGPUKernelOutlinePass
 
     bool packedB = variant != kInt8GemmDefaultVariant;
     bool swizzledLds = variant == kInt8GemmBPackSwizzleVariant ||
-                       variant == kInt8GemmBPackSwizzleGroupedVariant;
+                       variant == kInt8GemmBPackSwizzleGroupedVariant ||
+                       variant == kInt8GemmBPackSwizzlePipe2_128x128Variant;
     bool pipelined = variant == kInt8GemmBPackPipe2Variant ||
-                     variant == kInt8GemmBPackPipe2GroupedVariant;
+                     variant == kInt8GemmBPackPipe2GroupedVariant ||
+                     variant == kInt8GemmBPackSwizzlePipe2_128x128Variant;
     bool groupedBlocks = variant == kInt8GemmBPackPipe2GroupedVariant ||
                          variant == kInt8GemmBPackSwizzleGroupedVariant;
     bool directBFragments = variant == kInt8GemmBPackFragVariant;
+    bool wideTile = variant == kInt8GemmBPackSwizzlePipe2_128x128Variant;
+    int64_t blockCols = wideTile ? 128 : 64;
+    int64_t numColTiles = blockCols / 16;
 
     Location loc = func.getLoc();
     MLIRContext *ctx = func.getContext();
@@ -348,7 +356,7 @@ struct ConvertGPUKernelOutlinePass
     auto i8Type = IntegerType::get(ctx, 8);
     auto i32Type = IntegerType::get(ctx, 32);
     auto aLdsType = MemRefType::get({128, 64}, i8Type, {}, 3);
-    auto bLdsType = MemRefType::get({64, 64}, i8Type, {}, 3);
+    auto bLdsType = MemRefType::get({blockCols, 64}, i8Type, {}, 3);
     Value aLds = func.addWorkgroupAttribution(aLdsType, loc);
     Value bLds;
     Value aLdsNext;
@@ -372,6 +380,7 @@ struct ConvertGPUKernelOutlinePass
     Value c32 = cidx(builder, loc, 32);
     Value c64 = cidx(builder, loc, 64);
     Value c128 = cidx(builder, loc, 128);
+    Value cBlockCols = wideTile ? c128 : c64;
     Value c1024 = cidx(builder, loc, 1024);
     Value c4096 = cidx(builder, loc, 4096);
 
@@ -404,7 +413,8 @@ struct ConvertGPUKernelOutlinePass
     Value lane16 = arith::RemSIOp::create(builder, loc, lane, c16);
     Value laneHalf = arith::DivSIOp::create(builder, loc, lane, c16);
     Value blockRowBase = arith::MulIOp::create(builder, loc, blockY, c128);
-    Value blockColBase = arith::MulIOp::create(builder, loc, blockX, c64);
+    Value blockColBase =
+        arith::MulIOp::create(builder, loc, blockX, cBlockCols);
     Value waveRowBase = arith::MulIOp::create(builder, loc, wave, c16);
     Value tileRow = arith::AddIOp::create(builder, loc, blockRowBase,
                                           waveRowBase);
@@ -450,7 +460,7 @@ struct ConvertGPUKernelOutlinePass
           builder, loc, memref, row, maybeSwizzledColBase(row, colBase));
     };
 
-    auto copyATile = [&](Value dst, Value kBase, Value linearIndex) {
+    auto prefetchATile = [&](Value kBase, Value linearIndex) {
       Value copyARow = arith::DivSIOp::create(builder, loc, linearIndex, c64);
       Value copyACol = arith::RemSIOp::create(builder, loc, linearIndex, c64);
       Value globalARow =
@@ -458,21 +468,43 @@ struct ConvertGPUKernelOutlinePass
       Value globalACol = arith::AddIOp::create(builder, loc, kBase, copyACol);
       Value aVec = vector::LoadOp::create(builder, loc, vec16i8, a,
                                           ValueRange{globalARow, globalACol});
-      storeContiguousI8x16(dst, copyARow, copyACol, aVec);
+      return aVec;
+    };
+
+    auto storeATilePrefetch = [&](Value dst, Value linearIndex, Value bytes) {
+      Value copyARow = arith::DivSIOp::create(builder, loc, linearIndex, c64);
+      Value copyACol = arith::RemSIOp::create(builder, loc, linearIndex, c64);
+      storeContiguousI8x16(dst, copyARow, copyACol, bytes);
+    };
+
+    auto copyATile = [&](Value dst, Value kBase, Value linearIndex) {
+      storeATilePrefetch(dst, linearIndex, prefetchATile(kBase, linearIndex));
+    };
+
+    auto prefetchPackedBTile = [&](Value kBase, Value linearIndex) {
+      Value bTileCol = arith::DivSIOp::create(builder, loc, linearIndex, c64);
+      Value bTileK = arith::RemSIOp::create(builder, loc, linearIndex, c64);
+      Value globalBRow =
+          arith::AddIOp::create(builder, loc, blockColBase, bTileCol);
+      Value globalBCol = arith::AddIOp::create(builder, loc, kBase, bTileK);
+      Value bVec = vector::LoadOp::create(builder, loc, vec16i8, b,
+                                          ValueRange{globalBRow, globalBCol});
+      return bVec;
+    };
+
+    auto storePackedBPrefetch = [&](Value dst, Value linearIndex,
+                                    Value bytes) {
+      Value bTileCol = arith::DivSIOp::create(builder, loc, linearIndex, c64);
+      Value bTileK = arith::RemSIOp::create(builder, loc, linearIndex, c64);
+      storeContiguousI8x16(dst, bTileCol, bTileK, bytes);
     };
 
     auto copyBTile = [&](Value dst, Value kBase, Value linearIndex) {
       if (directBFragments)
         return;
       if (packedB) {
-        Value bTileCol = arith::DivSIOp::create(builder, loc, linearIndex, c64);
-        Value bTileK = arith::RemSIOp::create(builder, loc, linearIndex, c64);
-        Value globalBRow =
-            arith::AddIOp::create(builder, loc, blockColBase, bTileCol);
-        Value globalBCol = arith::AddIOp::create(builder, loc, kBase, bTileK);
-        Value bVec = vector::LoadOp::create(
-            builder, loc, vec16i8, b, ValueRange{globalBRow, globalBCol});
-        storeContiguousI8x16(dst, bTileCol, bTileK, bVec);
+        storePackedBPrefetch(dst, linearIndex,
+                             prefetchPackedBTile(kBase, linearIndex));
         return;
       }
 
@@ -497,6 +529,37 @@ struct ConvertGPUKernelOutlinePass
       copyATile(aDst, kBase,
                 arith::AddIOp::create(builder, loc, copyIdx16, c4096));
       copyBTile(bDst, kBase, copyIdx16);
+      if (wideTile)
+        copyBTile(bDst, kBase,
+                  arith::AddIOp::create(builder, loc, copyIdx16, c4096));
+    };
+
+    struct TilePrefetch {
+      Value a0;
+      Value a1;
+      Value b0;
+      Value b1;
+    };
+
+    auto prefetchTileToRegs = [&](Value kBase) {
+      TilePrefetch prefetch;
+      prefetch.a0 = prefetchATile(kBase, copyIdx16);
+      prefetch.a1 = prefetchATile(
+          kBase, arith::AddIOp::create(builder, loc, copyIdx16, c4096));
+      prefetch.b0 = prefetchPackedBTile(kBase, copyIdx16);
+      prefetch.b1 = prefetchPackedBTile(
+          kBase, arith::AddIOp::create(builder, loc, copyIdx16, c4096));
+      return prefetch;
+    };
+
+    auto storePrefetchToLds = [&](Value aDst, Value bDst,
+                                  const TilePrefetch &prefetch) {
+      Value secondChunk =
+          arith::AddIOp::create(builder, loc, copyIdx16, c4096);
+      storeATilePrefetch(aDst, copyIdx16, prefetch.a0);
+      storeATilePrefetch(aDst, secondChunk, prefetch.a1);
+      storePackedBPrefetch(bDst, copyIdx16, prefetch.b0);
+      storePackedBPrefetch(bDst, secondChunk, prefetch.b1);
     };
 
     auto computeTile = [&](Value aSrc, Value bSrc, Value kBase,
@@ -505,7 +568,7 @@ struct ConvertGPUKernelOutlinePass
         Value kkOffset = cidx(builder, loc, kk);
         Value aRow = arith::AddIOp::create(builder, loc, waveRowBase, lane16);
         Value aPacked = loadPackedFromLds(aSrc, aRow, kkOffset);
-        for (int col = 0; col < 64; col += 16) {
+        for (int col = 0; col < blockCols; col += 16) {
           Value bRow = col == 0
                            ? lane16
                            : arith::AddIOp::create(builder, loc, lane16,
@@ -526,10 +589,31 @@ struct ConvertGPUKernelOutlinePass
       }
     };
 
-    SmallVector<Value, 4> finalAccs;
-    finalAccs.reserve(4);
-    if (pipelined) {
-      finalAccs.assign(4, initAcc);
+    SmallVector<Value, 8> finalAccs;
+    finalAccs.reserve(numColTiles);
+    if (wideTile) {
+      finalAccs.assign(numColTiles, initAcc);
+      TilePrefetch prefetch = prefetchTileToRegs(c0);
+      storePrefetchToLds(aLds, bLds, prefetch);
+      gpu::BarrierOp::create(builder, loc);
+      for (int tile = 0; tile < 16; ++tile) {
+        Value currentA = (tile % 2 == 0) ? aLds : aLdsNext;
+        Value currentB = (tile % 2 == 0) ? bLds : bLdsNext;
+        Value nextA = (tile % 2 == 0) ? aLdsNext : aLds;
+        Value nextB = (tile % 2 == 0) ? bLdsNext : bLds;
+        Value kBase = cidx(builder, loc, tile * 64);
+        TilePrefetch nextPrefetch;
+        if (tile + 1 < 16)
+          nextPrefetch = prefetchTileToRegs(cidx(builder, loc,
+                                                 (tile + 1) * 64));
+        computeTile(currentA, currentB, kBase, finalAccs);
+        if (tile + 1 < 16) {
+          storePrefetchToLds(nextA, nextB, nextPrefetch);
+          gpu::BarrierOp::create(builder, loc);
+        }
+      }
+    } else if (pipelined) {
+      finalAccs.assign(numColTiles, initAcc);
       copyTile(aLds, bLds, c0);
       gpu::BarrierOp::create(builder, loc);
       for (int tile = 0; tile < 16; ++tile) {
@@ -545,7 +629,7 @@ struct ConvertGPUKernelOutlinePass
           gpu::BarrierOp::create(builder, loc);
       }
     } else {
-      SmallVector<Value, 4> initAccs(4, initAcc);
+      SmallVector<Value, 8> initAccs(numColTiles, initAcc);
       auto kLoop = scf::ForOp::create(builder, loc, c0, c1024, c64,
                                       ValueRange(initAccs));
       builder.setInsertionPointToStart(kLoop.getBody());
@@ -553,9 +637,9 @@ struct ConvertGPUKernelOutlinePass
       copyTile(aLds, bLds, k);
       gpu::BarrierOp::create(builder, loc);
 
-      SmallVector<Value, 4> nextAccs;
-      nextAccs.reserve(4);
-      for (unsigned i = 0; i < 4; ++i)
+      SmallVector<Value, 8> nextAccs;
+      nextAccs.reserve(numColTiles);
+      for (int64_t i = 0; i < numColTiles; ++i)
         nextAccs.push_back(kLoop.getRegionIterArg(i));
       computeTile(aLds, bLds, k, nextAccs);
 
@@ -563,7 +647,7 @@ struct ConvertGPUKernelOutlinePass
       scf::YieldOp::create(builder, loc, ValueRange(nextAccs));
 
       builder.setInsertionPointAfter(kLoop);
-      for (unsigned i = 0; i < 4; ++i)
+      for (int64_t i = 0; i < numColTiles; ++i)
         finalAccs.push_back(kLoop.getResult(i));
     }
 
@@ -574,7 +658,7 @@ struct ConvertGPUKernelOutlinePass
           arith::MulIOp::create(builder, loc, elemIdx, c2), laneHalf);
       Value dstRow = arith::AddIOp::create(builder, loc, tileRow, rowInTile);
       Value dstColBase = arith::AddIOp::create(builder, loc, tileCol, lane16);
-      for (int col = 0; col < 64; col += 16) {
+      for (int col = 0; col < blockCols; col += 16) {
         Value dstCol = col == 0
                            ? dstColBase
                            : arith::AddIOp::create(builder, loc, dstColBase,

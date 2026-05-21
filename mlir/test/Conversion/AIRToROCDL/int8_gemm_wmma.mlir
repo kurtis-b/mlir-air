@@ -6,17 +6,19 @@
 //===----------------------------------------------------------------------===//
 
 // REQUIRES: gpu
-// RUN: air-opt %s -air-to-rocdl -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,DEFAULT
-// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,BPACK
-// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_swizzle" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,SWIZZLE
-// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_pipe2" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,PIPE2
-// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_pipe2_grouped" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,GROUPED
-// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_swizzle_grouped int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,SWIZZLEGROUP
-// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_frag" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,FRAG
+// RUN: air-opt %s -air-to-rocdl -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,GRID64,DEFAULT
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,GRID64,BPACK
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_swizzle" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,GRID64,SWIZZLE
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_pipe2" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,GRID64,PIPE2
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_pipe2_grouped" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,GRID64,GROUPED
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_swizzle_grouped int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID64,SWIZZLEGROUP
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_frag" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,GRID64,FRAG
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_bpack_swizzle_pipe2" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,GRID128,PIPE128
 // RUN: not air-opt %s -air-to-rocdl="int8-gemm-variant=not_a_variant" 2>&1 | FileCheck %s --check-prefix=BAD
 // RUN: not air-opt %s -air-to-rocdl="int8-gemm-group-size=6" 2>&1 | FileCheck %s --check-prefix=BADGROUP
 
-// CHECK: gpu.launch_func @{{.*}}::@{{.*}} blocks in (%c16, %c8, %c1) threads in (%c256, %c1, %c1)
+// GRID64: gpu.launch_func @{{.*}}::@{{.*}} blocks in (%c16, %c8, %c1) threads in (%c256, %c1, %c1)
+// GRID128: gpu.launch_func @{{.*}}::@{{.*}} blocks in (%c8{{(_[0-9]+)?}}, %c8{{(_[0-9]+)?}}, %c1) threads in (%c256, %c1, %c1)
 // CHECK: gpu.module @
 // CHECK: gpu.func @{{.*}} kernel
 // DEFAULT-SAME: air.gpu.int8_gemm_variant = "lds_128x64_wmma4"
@@ -27,6 +29,7 @@
 // SWIZZLEGROUP-SAME: air.gpu.int8_gemm_group_m = 8 : i32
 // SWIZZLEGROUP-SAME: air.gpu.int8_gemm_variant = "lds_128x64_bpack_swizzle_grouped"
 // FRAG-SAME: air.gpu.int8_gemm_variant = "lds_128x64_bpack_frag"
+// PIPE128-SAME: air.gpu.int8_gemm_variant = "lds_128x128_bpack_swizzle_pipe2"
 // CHECK: rocdl.wmma.i32.16x16x16.iu8
 // CHECK-NOT: rocdl.wmma.i32.16x16x64
 // CHECK-NOT: swmmac
