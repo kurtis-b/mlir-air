@@ -23,9 +23,10 @@ from typing import Sequence
 
 M = N = K = 1024
 TARGET_TOPS = {"cpu": 4.0, "gpu": 15.0, "npu": 36.0}
-DEFAULT_GPU_INT8_GEMM_VARIANT = "lds_128x64_wmma4"
+GPU_INT8_GEMM_BASE_WMMA_VARIANT = "lds_128x64_wmma4"
+DEFAULT_GPU_INT8_GEMM_VARIANT = GPU_INT8_GEMM_BASE_WMMA_VARIANT
 GPU_INT8_GEMM_VARIANTS = (
-    DEFAULT_GPU_INT8_GEMM_VARIANT,
+    GPU_INT8_GEMM_BASE_WMMA_VARIANT,
     "lds_128x64_bpack",
     "lds_128x64_bpack_swizzle",
     "lds_128x64_bpack_pipe2",
@@ -39,6 +40,46 @@ GPU_INT8_GEMM_GROUP_SIZES = (2, 4, 8)
 DEFAULT_GPU_INT8_GEMM_SWEEP_GROUP_SIZES = GPU_INT8_GEMM_GROUP_SIZES
 DEFAULT_GPU_INT8_GEMM_SWEEP_REPETITIONS = 3
 GPU_INT8_GEMM_GROUPED_SWIZZLE_VARIANT = "lds_128x64_bpack_swizzle_grouped"
+GPU_INT8_GEMM_SWEEP_PROFILES = ("full", "default-decision")
+DEFAULT_GPU_INT8_GEMM_SWEEP_PROFILE = "full"
+DEFAULT_GPU_INT8_GEMM_DEFAULT_THRESHOLD_PCT = 3.0
+GPU_INT8_GEMM_DEFAULT_DECISION_CANDIDATES = (
+    (GPU_INT8_GEMM_BASE_WMMA_VARIANT, 4),
+    ("lds_128x64_bpack_swizzle", 4),
+    ("lds_128x64_bpack_swizzle_grouped", 2),
+    ("lds_128x64_bpack_swizzle_grouped", 4),
+    ("lds_128x64_bpack_swizzle_grouped", 8),
+)
+GPU_STATIC_COUNTER_KEYS = (
+    "wmma",
+    "barriers",
+    "vgprs",
+    "sgprs",
+    "scratch_markers",
+    "spills",
+    "global_load_b128",
+    "global_load_lds",
+    "ds_store_b128",
+    "ds_store_b8",
+    "ds_load_b128",
+    "global_store_b32",
+    "waitcnt",
+)
+GPU_STATIC_COUNTER_LABELS = {
+    "wmma": "WMMA",
+    "barriers": "barriers",
+    "vgprs": "VGPRs",
+    "sgprs": "SGPRs",
+    "scratch_markers": "scratch markers",
+    "spills": "spills",
+    "global_load_b128": "global_load_b128",
+    "global_load_lds": "global_load_lds",
+    "ds_store_b128": "ds_store_b128",
+    "ds_store_b8": "ds_store_b8",
+    "ds_load_b128": "ds_load_b128",
+    "global_store_b32": "global_store_b32",
+    "waitcnt": "waitcnt",
+}
 
 
 def positive_int(value: str) -> int:
@@ -51,6 +92,13 @@ def positive_int(value: str) -> int:
 def nonnegative_int(value: str) -> int:
     parsed = int(value, 10)
     if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
+
+
+def nonnegative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0.0:
         raise argparse.ArgumentTypeError("value must be non-negative")
     return parsed
 
@@ -118,7 +166,7 @@ def summary_metric(path: Path, metric_name: str) -> str:
 
 
 def gpu_variant_uses_packed_b(variant: str) -> bool:
-    return variant != DEFAULT_GPU_INT8_GEMM_VARIANT
+    return variant != GPU_INT8_GEMM_BASE_WMMA_VARIANT
 
 
 def gpu_variant_uses_fragment_b(variant: str) -> bool:
@@ -159,6 +207,14 @@ def parse_float(value: str) -> float | None:
 
 def fmt_float(value: float | None) -> str:
     return f"{value:.6f}" if value is not None else ""
+
+
+def stddev_or_zero(values: Sequence[float]) -> float:
+    return statistics.stdev(values) if len(values) > 1 else 0.0
+
+
+def coefficient_of_variation_pct(mean: float, stddev: float) -> float:
+    return (stddev / mean) * 100.0 if mean else 0.0
 
 
 def set_perf_tops(result: "BackendResult", tops: float | None) -> None:
@@ -308,6 +364,8 @@ def gpu_tools(repo: Path) -> tuple[str | None, str | None]:
     if not runner and (candidate := repo / "llvm" / "install-amdgpu" / "bin" / "mlir-runner").exists():
         runner = str(candidate)
     airgpu = os.environ.get("AIRGPU_LIB")
+    if not airgpu and (candidate := repo / "build-gpu" / "lib" / "libairgpu.so").exists():
+        airgpu = str(candidate)
     if not airgpu and os.environ.get("MLIR_AIR_INSTALL_DIR"):
         airgpu = str(Path(os.environ["MLIR_AIR_INSTALL_DIR"]) / "lib" / "libairgpu.so")
     if not airgpu and (candidate := repo / "install-gpu" / "lib" / "libairgpu.so").exists():
@@ -356,12 +414,22 @@ def summarize_gpu_repetition_metrics(logs: Sequence[Path]) -> dict[str, float]:
     mean_ms = [entry["mean_ms"] for entry in metrics]
     min_ms = [entry["min_ms"] for entry in metrics]
     tops = [entry["tops"] for entry in metrics]
+    mean_mean_ms = statistics.mean(mean_ms)
+    stddev_mean_ms = stddev_or_zero(mean_ms)
+    mean_tops = statistics.mean(tops)
+    stddev_tops = stddev_or_zero(tops)
     return {
         "repetitions": float(len(metrics)),
         "median_mean_ms": statistics.median(mean_ms),
         "min_mean_ms": min(mean_ms),
+        "mean_mean_ms": mean_mean_ms,
+        "stddev_mean_ms": stddev_mean_ms,
+        "cv_mean_ms_pct": coefficient_of_variation_pct(mean_mean_ms, stddev_mean_ms),
         "best_kernel_min_ms": min(min_ms),
         "median_tops": statistics.median(tops),
+        "mean_tops": mean_tops,
+        "stddev_tops": stddev_tops,
+        "cv_tops_pct": coefficient_of_variation_pct(mean_tops, stddev_tops),
         "max_tops": max(tops),
     }
 
@@ -374,10 +442,19 @@ def apply_gpu_repetition_summary(ctx: RunContext, result: BackendResult, summary
     result.perf_count = f"{repetitions}x{ctx.iterations}"
     result.perf_latency = (
         f"median mean {summary['median_mean_ms']:.6f} ms, "
+        f"mean mean {summary['mean_mean_ms']:.6f} ms, "
+        f"stddev mean {summary['stddev_mean_ms']:.6f} ms, "
+        f"cv {summary['cv_mean_ms_pct']:.3f}%, "
         f"min mean {summary['min_mean_ms']:.6f} ms, "
         f"best kernel min {summary['best_kernel_min_ms']:.6f} ms"
     )
-    result.perf_throughput = f"median {summary['median_tops']:.6f} TOPS, max {summary['max_tops']:.6f} TOPS"
+    result.perf_throughput = (
+        f"median {summary['median_tops']:.6f} TOPS, "
+        f"mean {summary['mean_tops']:.6f} TOPS, "
+        f"stddev {summary['stddev_tops']:.6f} TOPS, "
+        f"cv {summary['cv_tops_pct']:.3f}%, "
+        f"max {summary['max_tops']:.6f} TOPS"
+    )
     set_perf_tops(result, summary["median_tops"])
     result.perf_notes = f"variant={variant}; group_m={group_size}; repetitions={repetitions}; warmups={ctx.warmups}"
     result.runtime = f"ran {repetitions} repetition(s); see {', '.join(str(log) for log in run_logs)}"
@@ -510,21 +587,205 @@ def evidence_map(result: BackendResult) -> dict[str, str]:
     return dict(re.findall(r"([A-Za-z0-9_.-]+)=([^,\s]+)", result.evidence))
 
 
-def run_gpu_variant_sweep(
+def gpu_sweep_candidates(
     ctx: RunContext,
+    sweep_profile: str,
     variants: Sequence[str],
     group_sizes: Sequence[int],
-    repetitions: int,
-) -> BackendResult:
-    rows: list[dict[str, str]] = []
-    results: list[BackendResult] = []
-    candidates = [
+) -> list[tuple[str, int]]:
+    if sweep_profile == "default-decision":
+        return list(GPU_INT8_GEMM_DEFAULT_DECISION_CANDIDATES)
+    return [
         (variant, group_size)
         for variant in variants
         for group_size in (
             group_sizes if variant == GPU_INT8_GEMM_GROUPED_SWIZZLE_VARIANT else (ctx.gpu_int8_gemm_group_size,)
         )
     ]
+
+
+def row_float(row: dict[str, str], key: str) -> float | None:
+    return parse_float(row.get(key, ""))
+
+
+def row_int(row: dict[str, str], key: str) -> int | None:
+    try:
+        value = row.get(key, "")
+        return int(value) if value else None
+    except ValueError:
+        return None
+
+
+def gpu_row_label(row: dict[str, str]) -> str:
+    return f"{row.get('variant', 'unknown')} group_m={row.get('group_m', 'n/a')}"
+
+
+def is_current_gpu_default(row: dict[str, str]) -> bool:
+    return row.get("variant") == DEFAULT_GPU_INT8_GEMM_VARIANT and row_int(row, "group_m") == DEFAULT_GPU_INT8_GEMM_GROUP_SIZE
+
+
+def ranked_gpu_rows(rows: Sequence[dict[str, str]]) -> list[dict[str, str]]:
+    timed_rows = [row for row in rows if row_float(row, "median_tops") is not None]
+    return sorted(
+        timed_rows,
+        key=lambda row: (-(row_float(row, "median_tops") or 0.0), row.get("variant", ""), row_int(row, "group_m") or 0),
+    )
+
+
+def median_tops_gap_pct(top: dict[str, str], runner_up: dict[str, str]) -> float | None:
+    top_tops = row_float(top, "median_tops")
+    runner_tops = row_float(runner_up, "median_tops")
+    if top_tops is None or runner_tops is None or runner_tops <= 0.0:
+        return None
+    return ((top_tops - runner_tops) / runner_tops) * 100.0
+
+
+def static_counters_nearly_identical(top: dict[str, str], runner_up: dict[str, str]) -> bool:
+    for key in GPU_STATIC_COUNTER_KEYS:
+        top_value = row_float(top, key)
+        runner_value = row_float(runner_up, key)
+        if top_value is None or runner_value is None:
+            if top.get(key, "") != runner_up.get(key, ""):
+                return False
+            continue
+        min_tolerance = 2.0 if key in {"vgprs", "sgprs"} else 1.0
+        tolerance = max(min_tolerance, max(abs(top_value), abs(runner_value)) * 0.05)
+        if abs(top_value - runner_value) > tolerance:
+            return False
+    return True
+
+
+def counter_delta(runner_up: dict[str, str], top: dict[str, str], key: str) -> str:
+    runner_value = row_float(runner_up, key)
+    top_value = row_float(top, key)
+    if runner_value is None or top_value is None:
+        return "n/a"
+    delta = runner_value - top_value
+    return f"{delta:+.0f}" if delta.is_integer() else f"{delta:+.3f}"
+
+
+def counter_much_higher(slower: dict[str, str], faster: dict[str, str], key: str, min_abs_delta: float) -> bool:
+    slower_value = row_float(slower, key)
+    faster_value = row_float(faster, key)
+    if slower_value is None or faster_value is None:
+        return False
+    delta = slower_value - faster_value
+    if delta < min_abs_delta:
+        return False
+    if faster_value == 0.0:
+        return True
+    return (delta / abs(faster_value)) * 100.0 >= 10.0
+
+
+def gpu_gap_analysis_notes(top: dict[str, str] | None, runner_up: dict[str, str] | None, gap_pct: float | None) -> list[str]:
+    if not top or not runner_up:
+        return ["Insufficient parseable runtime rows to compare the top candidates."]
+    notes: list[str] = []
+    top_cv = row_float(top, "cv_tops_pct") or 0.0
+    runner_cv = row_float(runner_up, "cv_tops_pct") or 0.0
+    cv_ceiling = max(top_cv, runner_cv)
+    if gap_pct is not None and gap_pct < cv_ceiling:
+        notes.append(f"Noise-limited: the top-vs-runner-up median TOPS gap ({gap_pct:.3f}%) is smaller than the larger top-candidate CV ({cv_ceiling:.3f}%).")
+    elif gap_pct is not None:
+        notes.append(f"The median TOPS gap ({gap_pct:.3f}%) is larger than the larger top-candidate CV ({cv_ceiling:.3f}%).")
+    if static_counters_nearly_identical(top, runner_up):
+        notes.append("The disassembly counters are nearly identical, so these static counters do not explain a stable winner.")
+    else:
+        notes.append("The top candidates differ in static disassembly counters; see the counter table below.")
+    likely_causes = []
+    for key, label, min_abs_delta in (("barriers", "barriers", 2.0), ("waitcnt", "waitcnt", 2.0), ("vgprs", "VGPRs", 8.0)):
+        if counter_much_higher(runner_up, top, key, min_abs_delta):
+            likely_causes.append(label)
+    if likely_causes:
+        notes.append(f"The runner-up is slower while carrying much higher {', '.join(likely_causes)}, which is a likely static reason for the gap.")
+    return notes
+
+
+def write_gpu_default_decision(
+    ctx: RunContext,
+    rows: Sequence[dict[str, str]],
+    repetitions: int,
+    threshold_pct: float,
+    sweep_profile: str,
+    csv_path: Path,
+    sweep_md_path: Path,
+) -> Path:
+    decision_path = ctx.out_dir / "gpu_default_decision.md"
+    ranked = ranked_gpu_rows(rows)
+    top = ranked[0] if ranked else None
+    runner_up = ranked[1] if len(ranked) > 1 else None
+    gap_pct = median_tops_gap_pct(top, runner_up) if top and runner_up else None
+    all_pass = bool(rows) and all(row.get("status") == "PASS" for row in rows)
+    all_parseable = bool(rows) and all(row_int(row, "repetitions") == repetitions for row in rows)
+    gap_pass = gap_pct is not None and gap_pct >= threshold_pct
+    top_is_current = bool(top and is_current_gpu_default(top))
+    promote = bool(all_pass and all_parseable and gap_pass and not top_is_current)
+    recommendation = "PROMOTE" if promote else "KEEP_CURRENT_DEFAULT"
+    blockers: list[str] = []
+    if not all_pass:
+        blockers.append("one or more sweep rows did not PASS")
+    if not all_parseable:
+        blockers.append(f"not every row produced {repetitions} parseable timing repetitions")
+    if gap_pct is None:
+        blockers.append("top-vs-runner-up gap is unavailable")
+    elif not gap_pass:
+        blockers.append(f"top-vs-runner-up gap {gap_pct:.3f}% is below the {threshold_pct:.3f}% threshold")
+    if top_is_current:
+        blockers.append("the top candidate is already the current benchmark default")
+    if promote:
+        decision_reason = f"all rows passed, every row produced {repetitions} parseable timings, and the top candidate clears the {threshold_pct:.3f}% promotion threshold"
+    else:
+        decision_reason = "; ".join(blockers) if blockers else "promotion conditions were not all satisfied"
+
+    with decision_path.open("w", encoding="utf-8") as f:
+        f.write("# GPU INT8 GEMM Default Decision\n\n")
+        f.write(f"Recommendation: `{recommendation}`\n\n")
+        f.write("## Decision Inputs\n\n| Field | Value |\n| --- | --- |\n")
+        f.write(f"| Sweep profile | `{sweep_profile}` |\n")
+        f.write(f"| Current benchmark default | `{DEFAULT_GPU_INT8_GEMM_VARIANT} group_m={DEFAULT_GPU_INT8_GEMM_GROUP_SIZE}` |\n")
+        f.write(f"| Promotion threshold | `{threshold_pct:.3f}%` |\n")
+        f.write(f"| Top candidate | `{gpu_row_label(top) if top else 'n/a'}` |\n")
+        f.write(f"| Runner-up | `{gpu_row_label(runner_up) if runner_up else 'n/a'}` |\n")
+        f.write(f"| Top-vs-runner-up gap | `{gap_pct:.3f}%` |\n" if gap_pct is not None else "| Top-vs-runner-up gap | `n/a` |\n")
+        f.write(f"| Decision reason | {decision_reason} |\n")
+        f.write("\n## Promotion Gates\n\n| Gate | Status |\n| --- | --- |\n")
+        f.write(f"| All rows PASS | `{'yes' if all_pass else 'no'}` |\n")
+        f.write(f"| Parseable repetitions per row | `{'yes' if all_parseable else 'no'}` |\n")
+        f.write(f"| Gap >= threshold | `{'yes' if gap_pass else 'no'}` |\n")
+        f.write(f"| Top differs from current default | `{'yes' if not top_is_current else 'no'}` |\n")
+        f.write("\n## Ranking\n\n")
+        f.write("| Rank | Variant | Group M | Current Default | Status | Reps | Median TOPS | Mean TOPS | Stddev TOPS | CV TOPS % | Median Mean ms | Mean Mean ms | Stddev Mean ms | CV Mean ms % |\n")
+        f.write("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+        for rank, row in enumerate(ranked, start=1):
+            f.write(
+                f"| {rank} | `{row['variant']}` | {row['group_m']} | {'yes' if is_current_gpu_default(row) else 'no'} | {row['status']} | {row['repetitions']} | "
+                f"{row['median_tops'] or 'n/a'} | {row['mean_tops'] or 'n/a'} | {row['stddev_tops'] or 'n/a'} | {row['cv_tops_pct'] or 'n/a'} | "
+                f"{row['median_mean_ms'] or 'n/a'} | {row['mean_mean_ms'] or 'n/a'} | {row['stddev_mean_ms'] or 'n/a'} | {row['cv_mean_ms_pct'] or 'n/a'} |\n"
+            )
+        f.write("\n## Gap Analysis\n\n")
+        for note in gpu_gap_analysis_notes(top, runner_up, gap_pct):
+            f.write(f"- {note}\n")
+        if top and runner_up:
+            f.write("\n| Counter | Top | Runner-up | Runner-up - Top |\n| --- | --- | --- | --- |\n")
+            for key in GPU_STATIC_COUNTER_KEYS:
+                f.write(f"| {GPU_STATIC_COUNTER_LABELS[key]} | {top.get(key) or 'n/a'} | {runner_up.get(key) or 'n/a'} | {counter_delta(runner_up, top, key)} |\n")
+        f.write("\n## Artifacts\n\n")
+        f.write(f"- Sweep CSV: `{csv_path}`\n")
+        f.write(f"- Sweep report: `{sweep_md_path}`\n")
+    return decision_path
+
+
+def run_gpu_variant_sweep(
+    ctx: RunContext,
+    sweep_profile: str,
+    variants: Sequence[str],
+    group_sizes: Sequence[int],
+    repetitions: int,
+    default_threshold_pct: float,
+) -> BackendResult:
+    rows: list[dict[str, str]] = []
+    results: list[BackendResult] = []
+    candidates = gpu_sweep_candidates(ctx, sweep_profile, variants, group_sizes)
     for variant, group_size in candidates:
         prefix = sanitize_prefix(f"{variant}_g{group_size}" if variant == GPU_INT8_GEMM_GROUPED_SWIZZLE_VARIANT else variant)
         variant_ctx = RunContext(
@@ -577,8 +838,14 @@ def run_gpu_variant_sweep(
             "repetitions": str(int(metrics.get("repetitions", 0))) if metrics else "0",
             "median_mean_ms": fmt_float(metrics.get("median_mean_ms")),
             "min_mean_ms": fmt_float(metrics.get("min_mean_ms")),
+            "mean_mean_ms": fmt_float(metrics.get("mean_mean_ms")),
+            "stddev_mean_ms": fmt_float(metrics.get("stddev_mean_ms")),
+            "cv_mean_ms_pct": fmt_float(metrics.get("cv_mean_ms_pct")),
             "best_kernel_min_ms": fmt_float(metrics.get("best_kernel_min_ms")),
             "median_tops": fmt_float(metrics.get("median_tops")),
+            "mean_tops": fmt_float(metrics.get("mean_tops")),
+            "stddev_tops": fmt_float(metrics.get("stddev_tops")),
+            "cv_tops_pct": fmt_float(metrics.get("cv_tops_pct")),
             "max_tops": fmt_float(metrics.get("max_tops")),
             "timing_domain": result.perf_domain,
             "count": result.perf_count,
@@ -589,7 +856,7 @@ def run_gpu_variant_sweep(
             "run_logs": ";".join(str(log) for log in run_logs),
             "disassemble_log": str(result.logs.get("disassemble", "")),
         }
-        for key in ("wmma", "barriers", "vgprs", "sgprs", "scratch_markers", "spills", "global_load_b128", "global_load_lds", "ds_store_b128", "ds_store_b8", "ds_load_b128", "global_store_b32", "waitcnt"):
+        for key in GPU_STATIC_COUNTER_KEYS:
             row[key] = evidence.get(key, "")
         rows.append(row)
 
@@ -617,14 +884,22 @@ def run_gpu_variant_sweep(
     with md_path.open("w", encoding="utf-8") as f:
         f.write("# GPU INT8 GEMM Variant Sweep\n\n")
         f.write(f"Best variant: `{best_label}`\n\n")
-        f.write("| Variant | Group M | Status | Reps | Median TOPS | Max TOPS | Median Mean ms | Min Mean ms | VGPRs | Spills | ds_store_b8 | waitcnt | Artifacts |\n")
-        f.write("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+        f.write("| Variant | Group M | Status | Reps | Median TOPS | Mean TOPS | Stddev TOPS | CV TOPS % | Max TOPS | Median Mean ms | Mean Mean ms | Stddev Mean ms | CV Mean ms % | Min Mean ms | VGPRs | Spills | ds_store_b8 | waitcnt | Artifacts |\n")
+        f.write("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
         for row in rows:
-            f.write(f"| `{row['variant']}` | {row['group_m']} | {row['status']} | {row['repetitions']} | {row['median_tops'] or 'n/a'} | {row['max_tops'] or 'n/a'} | {row['median_mean_ms'] or 'n/a'} | {row['min_mean_ms'] or 'n/a'} | {row['vgprs'] or 'n/a'} | {row['spills'] or 'n/a'} | {row['ds_store_b8'] or 'n/a'} | {row['waitcnt'] or 'n/a'} | `{row['artifacts']}` |\n")
+            f.write(
+                f"| `{row['variant']}` | {row['group_m']} | {row['status']} | {row['repetitions']} | "
+                f"{row['median_tops'] or 'n/a'} | {row['mean_tops'] or 'n/a'} | {row['stddev_tops'] or 'n/a'} | {row['cv_tops_pct'] or 'n/a'} | {row['max_tops'] or 'n/a'} | "
+                f"{row['median_mean_ms'] or 'n/a'} | {row['mean_mean_ms'] or 'n/a'} | {row['stddev_mean_ms'] or 'n/a'} | {row['cv_mean_ms_pct'] or 'n/a'} | {row['min_mean_ms'] or 'n/a'} | "
+                f"{row['vgprs'] or 'n/a'} | {row['spills'] or 'n/a'} | {row['ds_store_b8'] or 'n/a'} | {row['waitcnt'] or 'n/a'} | `{row['artifacts']}` |\n"
+            )
         f.write(f"\nCSV: `{csv_path}`\n")
 
+    decision_path = write_gpu_default_decision(ctx, rows, repetitions, default_threshold_pct, sweep_profile, csv_path, md_path) if ctx.run_enabled else None
     best.runtime = f"{best.runtime}; sweep csv {csv_path}; sweep report {md_path}"
-    best.perf_notes = f"best_variant={best_label}; sweep_candidates={len(rows)}; {best.perf_notes}"
+    if decision_path:
+        best.runtime = f"{best.runtime}; default decision {decision_path}"
+    best.perf_notes = f"best_variant={best_label}; sweep_profile={sweep_profile}; sweep_candidates={len(rows)}; {best.perf_notes}"
     return best
 
 def find_npu_elves(build_dir: Path) -> list[Path]:
@@ -741,7 +1016,7 @@ def write_report(report: Path, ctx: RunContext, args: argparse.Namespace, result
         f.write("# GEMM int8 Benchmark Report\n\n")
         f.write(f"Artifacts: `{ctx.out_dir}`\n\n")
         f.write("## Run Controls\n\n| Field | Value |\n| --- | --- |\n")
-        for key, value in (("Selected backend", args.backend), ("Execute kernels", args.run), ("Strict mode", args.strict), ("GPU sweep variants", args.gpu_sweep_variants), ("GPU sweep repetitions", args.gpu_sweep_repetitions), ("GPU sweep group sizes", ",".join(str(size) for size in args.gpu_sweep_group_sizes)), ("Warmups", args.warmups), ("Iterations", args.iterations), ("CPU threads", args.cpu_threads), ("NPU runtime loop tiling", args.npu_runtime_loop_tiling), ("Build root", ctx.build_root), ("GPU arch", args.gpu_arch), ("GPU int8 GEMM variant", args.gpu_int8_gemm_variant), ("GPU int8 GEMM group size", args.gpu_int8_gemm_group_size), ("Shape", f"M=N=K={M}, int8 x int8 -> int32")):
+        for key, value in (("Selected backend", args.backend), ("Execute kernels", args.run), ("Strict mode", args.strict), ("GPU sweep variants", args.gpu_sweep_variants), ("GPU sweep profile", args.gpu_sweep_profile), ("GPU sweep repetitions", args.gpu_sweep_repetitions), ("GPU sweep group sizes", ",".join(str(size) for size in args.gpu_sweep_group_sizes)), ("GPU default threshold pct", args.gpu_default_threshold_pct), ("Warmups", args.warmups), ("Iterations", args.iterations), ("CPU threads", args.cpu_threads), ("NPU runtime loop tiling", args.npu_runtime_loop_tiling), ("Build root", ctx.build_root), ("GPU arch", args.gpu_arch), ("GPU int8 GEMM variant", args.gpu_int8_gemm_variant), ("GPU int8 GEMM group size", args.gpu_int8_gemm_group_size), ("Shape", f"M=N=K={M}, int8 x int8 -> int32")):
             f.write(f"| {key} | `{value}` |\n")
         f.write("\n## ISA Verdicts\n\n| Backend | Status | Evidence | Runtime |\n| --- | --- | --- | --- |\n")
         for name in ("cpu", "gpu", "npu"):
@@ -770,8 +1045,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--gpu-int8-gemm-variant", choices=GPU_INT8_GEMM_VARIANTS, default=os.environ.get("AIR_INT8_GEMM_VARIANT", DEFAULT_GPU_INT8_GEMM_VARIANT), help="GPU INT8 GEMM lowering variant (default: %(default)s)")
     parser.add_argument("--gpu-int8-gemm-group-size", type=gpu_group_size, default=gpu_group_size(os.environ.get("AIR_INT8_GEMM_GROUP_SIZE", str(DEFAULT_GPU_INT8_GEMM_GROUP_SIZE))), choices=GPU_INT8_GEMM_GROUP_SIZES, help="GPU INT8 GEMM grouped M size for grouped variants (default: %(default)s)")
     parser.add_argument("--gpu-sweep-variants", action="store_true", help="run the fixed GPU INT8 GEMM variant sweep and write CSV/Markdown evidence")
-    parser.add_argument("--gpu-sweep-group-sizes", type=gpu_group_sizes, default=DEFAULT_GPU_INT8_GEMM_SWEEP_GROUP_SIZES, help="comma-separated grouped M sizes for grouped swizzle sweep rows (default: 2,4,8)")
+    parser.add_argument("--gpu-sweep-profile", choices=GPU_INT8_GEMM_SWEEP_PROFILES, default=DEFAULT_GPU_INT8_GEMM_SWEEP_PROFILE, help="GPU INT8 GEMM sweep profile (default: full)")
+    parser.add_argument("--gpu-sweep-group-sizes", type=gpu_group_sizes, default=DEFAULT_GPU_INT8_GEMM_SWEEP_GROUP_SIZES, help="comma-separated grouped M sizes for grouped swizzle sweep rows in full profile (default: 2,4,8)")
     parser.add_argument("--gpu-sweep-repetitions", type=positive_int, default=DEFAULT_GPU_INT8_GEMM_SWEEP_REPETITIONS, help="runtime repetitions per GPU sweep candidate (default: 3)")
+    parser.add_argument("--gpu-default-threshold-pct", type=nonnegative_float, default=DEFAULT_GPU_INT8_GEMM_DEFAULT_THRESHOLD_PCT, help="minimum top-vs-runner-up median TOPS gap required to recommend promoting the GPU benchmark default (default: 3.0)")
     parser.add_argument("--cpu-threads", type=positive_int, default=12, help="CPU worker threads passed to the CPU benchmark (default: 12)")
     parser.add_argument("--npu-runtime-loop-tiling", default="2,4", metavar="M,N", help="AIR runtime loop tiling sizes for NPU compile (default: 2,4)")
     parser.add_argument("--warmups", type=nonnegative_int, default=10, help="warmup iterations for every backend (default: 10)")
@@ -787,6 +1064,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     args.npu_runtime_loop_tiling = f"{parsed_tiling[0]},{parsed_tiling[1]}"
     if args.gpu_sweep_variants and args.backend not in {"all", "gpu"}:
         parser.error("--gpu-sweep-variants requires --backend all or --backend gpu")
+    if args.gpu_sweep_profile != DEFAULT_GPU_INT8_GEMM_SWEEP_PROFILE and not args.gpu_sweep_variants:
+        parser.error("--gpu-sweep-profile requires --gpu-sweep-variants")
     return args
 
 
@@ -800,7 +1079,7 @@ def main(argv: Sequence[str]) -> int:
     runners = {"cpu": cpu_backend, "gpu": gpu_backend, "npu": npu_backend}
     results = {name: backend_result(ctx, name) for name in ("cpu", "gpu", "npu")}
     if args.gpu_sweep_variants:
-        results["gpu"] = run_gpu_variant_sweep(ctx, GPU_INT8_GEMM_SWEEP_VARIANTS, args.gpu_sweep_group_sizes, args.gpu_sweep_repetitions)
+        results["gpu"] = run_gpu_variant_sweep(ctx, args.gpu_sweep_profile, GPU_INT8_GEMM_SWEEP_VARIANTS, args.gpu_sweep_group_sizes, args.gpu_sweep_repetitions, args.gpu_default_threshold_pct)
     else:
         for name in ("cpu", "gpu", "npu"):
             if name in selected:
