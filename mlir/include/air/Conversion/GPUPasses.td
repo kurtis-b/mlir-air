@@ -21,7 +21,10 @@ def ConvertAIRToROCDL : Pass<"air-to-rocdl", "ModuleOp"> {
   let options = [
     Option<"clInt8GemmVariant", "int8-gemm-variant", "std::string",
            /*default=*/"\"lds_128x64_wmma4\"",
-           "INT8 GEMM kernel variant for launches marked air.gpu.int8_gemm_wmma">
+           "INT8 GEMM kernel variant for launches marked air.gpu.int8_gemm_wmma">,
+    Option<"clInt8GemmGroupSize", "int8-gemm-group-size", "uint32_t",
+           /*default=*/"4",
+           "INT8 GEMM grouped block M dimension for grouped variants">
   ];
 }
 
@@ -53,7 +56,10 @@ def ConvertGPUKernelOutline : Pass<"air-gpu-outlining", "ModuleOp"> {
   let options = [
     Option<"clInt8GemmVariant", "int8-gemm-variant", "std::string",
            /*default=*/"\"lds_128x64_wmma4\"",
-           "INT8 GEMM kernel variant for launches marked air.gpu.int8_gemm_wmma">
+           "INT8 GEMM kernel variant for launches marked air.gpu.int8_gemm_wmma">,
+    Option<"clInt8GemmGroupSize", "int8-gemm-group-size", "uint32_t",
+           /*default=*/"4",
+           "INT8 GEMM grouped block M dimension for grouped variants">
   ];
 }
 

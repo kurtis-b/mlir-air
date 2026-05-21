@@ -39,6 +39,8 @@ namespace {
 static constexpr const char kInt8GemmWmmaAttr[] = "air.gpu.int8_gemm_wmma";
 static constexpr const char kInt8GemmVariantAttr[] =
     "air.gpu.int8_gemm_variant";
+static constexpr const char kInt8GemmGroupAttr[] =
+    "air.gpu.int8_gemm_group_m";
 static constexpr const char kInt8GemmDefaultVariant[] = "lds_128x64_wmma4";
 static constexpr const char kInt8GemmBPackVariant[] = "lds_128x64_bpack";
 static constexpr const char kInt8GemmBPackSwizzleVariant[] =
@@ -47,6 +49,8 @@ static constexpr const char kInt8GemmBPackPipe2Variant[] =
     "lds_128x64_bpack_pipe2";
 static constexpr const char kInt8GemmBPackPipe2GroupedVariant[] =
     "lds_128x64_bpack_pipe2_grouped";
+static constexpr const char kInt8GemmBPackSwizzleGroupedVariant[] =
+    "lds_128x64_bpack_swizzle_grouped";
 static constexpr const char kInt8GemmBPackFragVariant[] =
     "lds_128x64_bpack_frag";
 
@@ -56,7 +60,12 @@ static bool isSupportedInt8GemmVariant(StringRef variant) {
          variant == kInt8GemmBPackSwizzleVariant ||
          variant == kInt8GemmBPackPipe2Variant ||
          variant == kInt8GemmBPackPipe2GroupedVariant ||
+         variant == kInt8GemmBPackSwizzleGroupedVariant ||
          variant == kInt8GemmBPackFragVariant;
+}
+
+static bool isSupportedInt8GemmGroupSize(uint32_t groupSize) {
+  return groupSize == 2 || groupSize == 4 || groupSize == 8;
 }
 
 SmallVector<mlir::BlockArgument, 4> gpuArgs;
@@ -299,6 +308,14 @@ struct ConvertAIRToROCDLPass
       return launchOp.emitOpError(kInt8GemmWmmaAttr)
              << " unsupported variant '" << variant << "'";
 
+    uint32_t groupSize = clInt8GemmGroupSize;
+    if (auto groupAttr =
+            launchOp->getAttrOfType<IntegerAttr>(kInt8GemmGroupAttr))
+      groupSize = groupAttr.getInt();
+    if (!isSupportedInt8GemmGroupSize(groupSize))
+      return launchOp.emitOpError(kInt8GemmWmmaAttr)
+             << " unsupported group size '" << groupSize << "'";
+
     OpBuilder builder(launchOp);
     Location loc = launchOp.getLoc();
     Value gridX = arith::ConstantIndexOp::create(builder, loc, 16);
@@ -312,6 +329,8 @@ struct ConvertAIRToROCDLPass
                                            blockX, blockY, blockZ);
     gpuLaunch->setAttr(kInt8GemmWmmaAttr, UnitAttr::get(launchOp.getContext()));
     gpuLaunch->setAttr(kInt8GemmVariantAttr, builder.getStringAttr(variant));
+    gpuLaunch->setAttr(kInt8GemmGroupAttr,
+                       builder.getI32IntegerAttr(groupSize));
 
     {
       OpBuilder::InsertionGuard guard(builder);

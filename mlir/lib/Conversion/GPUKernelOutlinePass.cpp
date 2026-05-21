@@ -40,6 +40,8 @@ namespace {
 static constexpr const char kInt8GemmWmmaAttr[] = "air.gpu.int8_gemm_wmma";
 static constexpr const char kInt8GemmVariantAttr[] =
     "air.gpu.int8_gemm_variant";
+static constexpr const char kInt8GemmGroupAttr[] =
+    "air.gpu.int8_gemm_group_m";
 static constexpr const char kInt8GemmDefaultVariant[] = "lds_128x64_wmma4";
 static constexpr const char kInt8GemmBPackVariant[] = "lds_128x64_bpack";
 static constexpr const char kInt8GemmBPackSwizzleVariant[] =
@@ -48,6 +50,8 @@ static constexpr const char kInt8GemmBPackPipe2Variant[] =
     "lds_128x64_bpack_pipe2";
 static constexpr const char kInt8GemmBPackPipe2GroupedVariant[] =
     "lds_128x64_bpack_pipe2_grouped";
+static constexpr const char kInt8GemmBPackSwizzleGroupedVariant[] =
+    "lds_128x64_bpack_swizzle_grouped";
 static constexpr const char kInt8GemmBPackFragVariant[] =
     "lds_128x64_bpack_frag";
 
@@ -57,7 +61,12 @@ static bool isSupportedInt8GemmVariant(StringRef variant) {
          variant == kInt8GemmBPackSwizzleVariant ||
          variant == kInt8GemmBPackPipe2Variant ||
          variant == kInt8GemmBPackPipe2GroupedVariant ||
+         variant == kInt8GemmBPackSwizzleGroupedVariant ||
          variant == kInt8GemmBPackFragVariant;
+}
+
+static bool isSupportedInt8GemmGroupSize(uint32_t groupSize) {
+  return groupSize == 2 || groupSize == 4 || groupSize == 8;
 }
 
 SmallVector<mlir::BlockArgument, 4> gpuArgs;
@@ -299,7 +308,8 @@ struct ConvertGPUKernelOutlinePass
   }
 
   static LogicalResult emitInt8GemmWmmaKernel(gpu::GPUFuncOp func,
-                                             StringRef variant) {
+                                             StringRef variant,
+                                             uint32_t groupSize) {
     Block &body = func.getBody().front();
     if (func.getFunctionType().getNumInputs() != 3)
       return func.emitOpError(kInt8GemmWmmaAttr)
@@ -317,12 +327,17 @@ struct ConvertGPUKernelOutlinePass
     if (!isSupportedInt8GemmVariant(variant))
       return func.emitOpError(kInt8GemmWmmaAttr)
              << " unsupported variant '" << variant << "'";
+    if (!isSupportedInt8GemmGroupSize(groupSize))
+      return func.emitOpError(kInt8GemmWmmaAttr)
+             << " unsupported group size '" << groupSize << "'";
 
     bool packedB = variant != kInt8GemmDefaultVariant;
-    bool swizzledLds = variant == kInt8GemmBPackSwizzleVariant;
+    bool swizzledLds = variant == kInt8GemmBPackSwizzleVariant ||
+                       variant == kInt8GemmBPackSwizzleGroupedVariant;
     bool pipelined = variant == kInt8GemmBPackPipe2Variant ||
                      variant == kInt8GemmBPackPipe2GroupedVariant;
-    bool groupedBlocks = variant == kInt8GemmBPackPipe2GroupedVariant;
+    bool groupedBlocks = variant == kInt8GemmBPackPipe2GroupedVariant ||
+                         variant == kInt8GemmBPackSwizzleGroupedVariant;
     bool directBFragments = variant == kInt8GemmBPackFragVariant;
 
     Location loc = func.getLoc();
@@ -351,6 +366,8 @@ struct ConvertGPUKernelOutlinePass
     Value c0 = cidx(builder, loc, 0);
     Value c2 = cidx(builder, loc, 2);
     Value c4 = cidx(builder, loc, 4);
+    Value cGroupM = cidx(builder, loc, groupSize);
+    Value cGroupTileCount = cidx(builder, loc, groupSize * 16);
     Value c16 = cidx(builder, loc, 16);
     Value c32 = cidx(builder, loc, 32);
     Value c64 = cidx(builder, loc, 64);
@@ -371,16 +388,15 @@ struct ConvertGPUKernelOutlinePass
       Value linearBlock = arith::AddIOp::create(
           builder, loc, arith::MulIOp::create(builder, loc, physicalBlockY, c16),
           physicalBlockX);
-      Value groupTileCount = cidx(builder, loc, 64);
       Value groupId = arith::DivSIOp::create(builder, loc, linearBlock,
-                                             groupTileCount);
+                                             cGroupTileCount);
       Value pidInGroup = arith::RemSIOp::create(builder, loc, linearBlock,
-                                                groupTileCount);
-      Value firstM = arith::MulIOp::create(builder, loc, groupId, c4);
+                                                cGroupTileCount);
+      Value firstM = arith::MulIOp::create(builder, loc, groupId, cGroupM);
       blockY = arith::AddIOp::create(
           builder, loc, firstM,
-          arith::RemSIOp::create(builder, loc, pidInGroup, c4));
-      blockX = arith::DivSIOp::create(builder, loc, pidInGroup, c4);
+          arith::RemSIOp::create(builder, loc, pidInGroup, cGroupM));
+      blockX = arith::DivSIOp::create(builder, loc, pidInGroup, cGroupM);
     }
 
     Value wave = arith::DivSIOp::create(builder, loc, tx, c32);
@@ -803,6 +819,10 @@ struct ConvertGPUKernelOutlinePass
         if (auto variantAttr =
                 launchOp->getAttrOfType<StringAttr>(kInt8GemmVariantAttr))
           variant = variantAttr.getValue();
+        uint32_t groupSize = clInt8GemmGroupSize;
+        if (auto groupAttr =
+                launchOp->getAttrOfType<IntegerAttr>(kInt8GemmGroupAttr))
+          groupSize = groupAttr.getInt();
         if (useInt8Wmma) {
           if (!isSupportedInt8GemmVariant(variant)) {
             launchOp.emitOpError(kInt8GemmWmmaAttr)
@@ -810,15 +830,23 @@ struct ConvertGPUKernelOutlinePass
             signalPassFailure();
             return;
           }
+          if (!isSupportedInt8GemmGroupSize(groupSize)) {
+            launchOp.emitOpError(kInt8GemmWmmaAttr)
+                << " unsupported group size '" << groupSize << "'";
+            signalPassFailure();
+            return;
+          }
           outlinedFunc->setAttr(kInt8GemmWmmaAttr, UnitAttr::get(ctx));
           outlinedFunc->setAttr(kInt8GemmVariantAttr,
                                 builder.getStringAttr(variant));
+          outlinedFunc->setAttr(kInt8GemmGroupAttr,
+                                builder.getI32IntegerAttr(groupSize));
         }
         SymbolTable gpuModuleSymbolTable(gpuModule);
         // insert the GPUFuncOp into GPUModuleOp.
         gpuModuleSymbolTable.insert(outlinedFunc);
         if (useInt8Wmma &&
-            failed(emitInt8GemmWmmaKernel(outlinedFunc, variant))) {
+            failed(emitInt8GemmWmmaKernel(outlinedFunc, variant, groupSize))) {
           signalPassFailure();
           return;
         }
