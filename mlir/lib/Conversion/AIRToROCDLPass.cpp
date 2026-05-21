@@ -55,6 +55,12 @@ static constexpr const char kInt8GemmBPackFragVariant[] =
     "lds_128x64_bpack_frag";
 static constexpr const char kInt8GemmBPackSwizzlePipe2_128x128Variant[] =
     "lds_128x128_bpack_swizzle_pipe2";
+static constexpr const char kInt8GemmBPackSwizzlePipe2LoopedVariant[] =
+    "lds_128x64_bpack_swizzle_pipe2_looped";
+static constexpr const char kInt8GemmBPackSwizzleLooped_128x128Variant[] =
+    "lds_128x128_bpack_swizzle_looped";
+static constexpr const char kInt8GemmBPackSwizzlePipe2Looped_64x128Variant[] =
+    "lds_64x128_bpack_swizzle_pipe2_looped";
 
 static bool isSupportedInt8GemmVariant(StringRef variant) {
   return variant == kInt8GemmDefaultVariant ||
@@ -64,7 +70,10 @@ static bool isSupportedInt8GemmVariant(StringRef variant) {
          variant == kInt8GemmBPackPipe2GroupedVariant ||
          variant == kInt8GemmBPackSwizzleGroupedVariant ||
          variant == kInt8GemmBPackFragVariant ||
-         variant == kInt8GemmBPackSwizzlePipe2_128x128Variant;
+         variant == kInt8GemmBPackSwizzlePipe2_128x128Variant ||
+         variant == kInt8GemmBPackSwizzlePipe2LoopedVariant ||
+         variant == kInt8GemmBPackSwizzleLooped_128x128Variant ||
+         variant == kInt8GemmBPackSwizzlePipe2Looped_64x128Variant;
 }
 
 static bool isSupportedInt8GemmGroupSize(uint32_t groupSize) {
@@ -321,12 +330,17 @@ struct ConvertAIRToROCDLPass
 
     OpBuilder builder(launchOp);
     Location loc = launchOp.getLoc();
-    bool wideTile = variant == kInt8GemmBPackSwizzlePipe2_128x128Variant;
+    bool wideCols = variant == kInt8GemmBPackSwizzlePipe2_128x128Variant ||
+                    variant == kInt8GemmBPackSwizzleLooped_128x128Variant ||
+                    variant == kInt8GemmBPackSwizzlePipe2Looped_64x128Variant;
+    bool shortRows = variant == kInt8GemmBPackSwizzlePipe2Looped_64x128Variant;
     Value gridX = arith::ConstantIndexOp::create(builder, loc,
-                                                 wideTile ? 8 : 16);
-    Value gridY = arith::ConstantIndexOp::create(builder, loc, 8);
+                                                 wideCols ? 8 : 16);
+    Value gridY = arith::ConstantIndexOp::create(builder, loc,
+                                                 shortRows ? 16 : 8);
     Value gridZ = arith::ConstantIndexOp::create(builder, loc, 1);
-    Value blockX = arith::ConstantIndexOp::create(builder, loc, 256);
+    Value blockX = arith::ConstantIndexOp::create(builder, loc,
+                                                  shortRows ? 128 : 256);
     Value blockY = arith::ConstantIndexOp::create(builder, loc, 1);
     Value blockZ = arith::ConstantIndexOp::create(builder, loc, 1);
 

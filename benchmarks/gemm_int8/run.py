@@ -34,6 +34,9 @@ GPU_INT8_GEMM_VARIANTS = (
     "lds_128x64_bpack_swizzle_grouped",
     "lds_128x64_bpack_frag",
     "lds_128x128_bpack_swizzle_pipe2",
+    "lds_128x64_bpack_swizzle_pipe2_looped",
+    "lds_128x128_bpack_swizzle_looped",
+    "lds_64x128_bpack_swizzle_pipe2_looped",
 )
 GPU_INT8_GEMM_SWEEP_VARIANTS = GPU_INT8_GEMM_VARIANTS
 DEFAULT_GPU_INT8_GEMM_GROUP_SIZE = 4
@@ -41,7 +44,7 @@ GPU_INT8_GEMM_GROUP_SIZES = (2, 4, 8)
 DEFAULT_GPU_INT8_GEMM_SWEEP_GROUP_SIZES = GPU_INT8_GEMM_GROUP_SIZES
 DEFAULT_GPU_INT8_GEMM_SWEEP_REPETITIONS = 3
 GPU_INT8_GEMM_GROUPED_SWIZZLE_VARIANT = "lds_128x64_bpack_swizzle_grouped"
-GPU_INT8_GEMM_SWEEP_PROFILES = ("full", "default-decision", "gfx1150-rewrite")
+GPU_INT8_GEMM_SWEEP_PROFILES = ("full", "default-decision", "gfx1150-rewrite", "gfx1150-next")
 DEFAULT_GPU_INT8_GEMM_SWEEP_PROFILE = "full"
 DEFAULT_GPU_INT8_GEMM_DEFAULT_THRESHOLD_PCT = 3.0
 GPU_INT8_GEMM_GFX1150_REWRITE_CANDIDATES = (
@@ -49,6 +52,13 @@ GPU_INT8_GEMM_GFX1150_REWRITE_CANDIDATES = (
     ("lds_128x64_bpack_swizzle", 4),
     ("lds_128x64_bpack_swizzle_grouped", 2),
     ("lds_128x128_bpack_swizzle_pipe2", 4),
+)
+GPU_INT8_GEMM_GFX1150_NEXT_CANDIDATES = (
+    ("lds_128x64_bpack_swizzle", 4),
+    ("lds_128x64_bpack_swizzle_grouped", 2),
+    ("lds_128x64_bpack_swizzle_pipe2_looped", 4),
+    ("lds_128x128_bpack_swizzle_looped", 4),
+    ("lds_64x128_bpack_swizzle_pipe2_looped", 4),
 )
 GPU_INT8_GEMM_DEFAULT_DECISION_CANDIDATES = (
     (GPU_INT8_GEMM_BASE_WMMA_VARIANT, 4),
@@ -193,10 +203,18 @@ def gpu_static_lds_bytes_per_workgroup(variant: str) -> int:
         "lds_128x64_bpack_pipe2",
         "lds_128x64_bpack_pipe2_grouped",
         "lds_128x128_bpack_swizzle_pipe2",
+        "lds_128x64_bpack_swizzle_pipe2_looped",
+        "lds_64x128_bpack_swizzle_pipe2_looped",
     }
+    wide_b_variants = {
+        "lds_128x128_bpack_swizzle_pipe2",
+        "lds_128x128_bpack_swizzle_looped",
+        "lds_64x128_bpack_swizzle_pipe2_looped",
+    }
+    a_rows = 64 if variant == "lds_64x128_bpack_swizzle_pipe2_looped" else 128
+    b_rows = 128 if variant in wide_b_variants else 64
     buffers = 2 if variant in pipelined_variants else 1
-    b_rows = 128 if variant == "lds_128x128_bpack_swizzle_pipe2" else 64
-    return buffers * ((128 * 64) + (b_rows * 64))
+    return buffers * ((a_rows * 64) + (b_rows * 64))
 
 
 def to_tops(gops: str) -> str:
@@ -620,6 +638,8 @@ def gpu_sweep_candidates(
 ) -> list[tuple[str, int]]:
     if sweep_profile == "gfx1150-rewrite":
         return list(GPU_INT8_GEMM_GFX1150_REWRITE_CANDIDATES)
+    if sweep_profile == "gfx1150-next":
+        return list(GPU_INT8_GEMM_GFX1150_NEXT_CANDIDATES)
     if sweep_profile == "default-decision":
         return list(GPU_INT8_GEMM_DEFAULT_DECISION_CANDIDATES)
     return [

@@ -56,6 +56,12 @@ static constexpr const char kInt8GemmBPackFragVariant[] =
     "lds_128x64_bpack_frag";
 static constexpr const char kInt8GemmBPackSwizzlePipe2_128x128Variant[] =
     "lds_128x128_bpack_swizzle_pipe2";
+static constexpr const char kInt8GemmBPackSwizzlePipe2LoopedVariant[] =
+    "lds_128x64_bpack_swizzle_pipe2_looped";
+static constexpr const char kInt8GemmBPackSwizzleLooped_128x128Variant[] =
+    "lds_128x128_bpack_swizzle_looped";
+static constexpr const char kInt8GemmBPackSwizzlePipe2Looped_64x128Variant[] =
+    "lds_64x128_bpack_swizzle_pipe2_looped";
 
 static bool isSupportedInt8GemmVariant(StringRef variant) {
   return variant == kInt8GemmDefaultVariant ||
@@ -65,7 +71,10 @@ static bool isSupportedInt8GemmVariant(StringRef variant) {
          variant == kInt8GemmBPackPipe2GroupedVariant ||
          variant == kInt8GemmBPackSwizzleGroupedVariant ||
          variant == kInt8GemmBPackFragVariant ||
-         variant == kInt8GemmBPackSwizzlePipe2_128x128Variant;
+         variant == kInt8GemmBPackSwizzlePipe2_128x128Variant ||
+         variant == kInt8GemmBPackSwizzlePipe2LoopedVariant ||
+         variant == kInt8GemmBPackSwizzleLooped_128x128Variant ||
+         variant == kInt8GemmBPackSwizzlePipe2Looped_64x128Variant;
 }
 
 static bool isSupportedInt8GemmGroupSize(uint32_t groupSize) {
@@ -335,17 +344,28 @@ struct ConvertGPUKernelOutlinePass
              << " unsupported group size '" << groupSize << "'";
 
     bool packedB = variant != kInt8GemmDefaultVariant;
+    bool loopedPipeline = variant == kInt8GemmBPackSwizzlePipe2LoopedVariant ||
+                          variant == kInt8GemmBPackSwizzlePipe2Looped_64x128Variant;
+    bool wideStaticPipeline = variant == kInt8GemmBPackSwizzlePipe2_128x128Variant;
+    bool wideLooped = variant == kInt8GemmBPackSwizzleLooped_128x128Variant;
+    bool shortRows = variant == kInt8GemmBPackSwizzlePipe2Looped_64x128Variant;
     bool swizzledLds = variant == kInt8GemmBPackSwizzleVariant ||
                        variant == kInt8GemmBPackSwizzleGroupedVariant ||
-                       variant == kInt8GemmBPackSwizzlePipe2_128x128Variant;
+                       wideStaticPipeline || loopedPipeline || wideLooped;
     bool pipelined = variant == kInt8GemmBPackPipe2Variant ||
                      variant == kInt8GemmBPackPipe2GroupedVariant ||
-                     variant == kInt8GemmBPackSwizzlePipe2_128x128Variant;
+                     wideStaticPipeline || loopedPipeline;
     bool groupedBlocks = variant == kInt8GemmBPackPipe2GroupedVariant ||
                          variant == kInt8GemmBPackSwizzleGroupedVariant;
     bool directBFragments = variant == kInt8GemmBPackFragVariant;
-    bool wideTile = variant == kInt8GemmBPackSwizzlePipe2_128x128Variant;
+    bool wideTile = wideStaticPipeline || wideLooped || shortRows;
+    int64_t blockRows = shortRows ? 64 : 128;
     int64_t blockCols = wideTile ? 128 : 64;
+    int64_t blockThreads = shortRows ? 128 : 256;
+    int64_t copyStrideElems = blockThreads * 16;
+    int64_t aCopyChunks = (blockRows * 64 + copyStrideElems - 1) / copyStrideElems;
+    int64_t bCopyChunks = directBFragments ? 0 :
+                          (blockCols * 64 + copyStrideElems - 1) / copyStrideElems;
     int64_t numColTiles = blockCols / 16;
 
     Location loc = func.getLoc();
@@ -355,7 +375,7 @@ struct ConvertGPUKernelOutlinePass
 
     auto i8Type = IntegerType::get(ctx, 8);
     auto i32Type = IntegerType::get(ctx, 32);
-    auto aLdsType = MemRefType::get({128, 64}, i8Type, {}, 3);
+    auto aLdsType = MemRefType::get({blockRows, 64}, i8Type, {}, 3);
     auto bLdsType = MemRefType::get({blockCols, 64}, i8Type, {}, 3);
     Value aLds = func.addWorkgroupAttribution(aLdsType, loc);
     Value bLds;
@@ -380,9 +400,11 @@ struct ConvertGPUKernelOutlinePass
     Value c32 = cidx(builder, loc, 32);
     Value c64 = cidx(builder, loc, 64);
     Value c128 = cidx(builder, loc, 128);
-    Value cBlockCols = wideTile ? c128 : c64;
+    Value cBlockRows = cidx(builder, loc, blockRows);
+    Value cBlockCols = cidx(builder, loc, blockCols);
+    Value c896 = cidx(builder, loc, 896);
+    Value c960 = cidx(builder, loc, 960);
     Value c1024 = cidx(builder, loc, 1024);
-    Value c4096 = cidx(builder, loc, 4096);
 
     Value physicalBlockX = gpu::BlockIdOp::create(
         builder, loc, builder.getIndexType(), gpu::Dimension::x);
@@ -412,7 +434,7 @@ struct ConvertGPUKernelOutlinePass
     Value lane = arith::RemSIOp::create(builder, loc, tx, c32);
     Value lane16 = arith::RemSIOp::create(builder, loc, lane, c16);
     Value laneHalf = arith::DivSIOp::create(builder, loc, lane, c16);
-    Value blockRowBase = arith::MulIOp::create(builder, loc, blockY, c128);
+    Value blockRowBase = arith::MulIOp::create(builder, loc, blockY, cBlockRows);
     Value blockColBase =
         arith::MulIOp::create(builder, loc, blockX, cBlockCols);
     Value waveRowBase = arith::MulIOp::create(builder, loc, wave, c16);
@@ -524,42 +546,42 @@ struct ConvertGPUKernelOutlinePass
       }
     };
 
+    auto copyLinearIndex = [&](int64_t chunk) -> Value {
+      if (chunk == 0)
+        return copyIdx16;
+      return arith::AddIOp::create(
+          builder, loc, copyIdx16, cidx(builder, loc, chunk * copyStrideElems));
+    };
+
     auto copyTile = [&](Value aDst, Value bDst, Value kBase) {
-      copyATile(aDst, kBase, copyIdx16);
-      copyATile(aDst, kBase,
-                arith::AddIOp::create(builder, loc, copyIdx16, c4096));
-      copyBTile(bDst, kBase, copyIdx16);
-      if (wideTile)
-        copyBTile(bDst, kBase,
-                  arith::AddIOp::create(builder, loc, copyIdx16, c4096));
+      for (int64_t chunk = 0; chunk < aCopyChunks; ++chunk)
+        copyATile(aDst, kBase, copyLinearIndex(chunk));
+      for (int64_t chunk = 0; chunk < bCopyChunks; ++chunk)
+        copyBTile(bDst, kBase, copyLinearIndex(chunk));
     };
 
     struct TilePrefetch {
-      Value a0;
-      Value a1;
-      Value b0;
-      Value b1;
+      SmallVector<Value, 4> a;
+      SmallVector<Value, 4> b;
     };
 
     auto prefetchTileToRegs = [&](Value kBase) {
       TilePrefetch prefetch;
-      prefetch.a0 = prefetchATile(kBase, copyIdx16);
-      prefetch.a1 = prefetchATile(
-          kBase, arith::AddIOp::create(builder, loc, copyIdx16, c4096));
-      prefetch.b0 = prefetchPackedBTile(kBase, copyIdx16);
-      prefetch.b1 = prefetchPackedBTile(
-          kBase, arith::AddIOp::create(builder, loc, copyIdx16, c4096));
+      for (int64_t chunk = 0; chunk < aCopyChunks; ++chunk)
+        prefetch.a.push_back(prefetchATile(kBase, copyLinearIndex(chunk)));
+      for (int64_t chunk = 0; chunk < bCopyChunks; ++chunk)
+        prefetch.b.push_back(prefetchPackedBTile(kBase, copyLinearIndex(chunk)));
       return prefetch;
     };
 
     auto storePrefetchToLds = [&](Value aDst, Value bDst,
                                   const TilePrefetch &prefetch) {
-      Value secondChunk =
-          arith::AddIOp::create(builder, loc, copyIdx16, c4096);
-      storeATilePrefetch(aDst, copyIdx16, prefetch.a0);
-      storeATilePrefetch(aDst, secondChunk, prefetch.a1);
-      storePackedBPrefetch(bDst, copyIdx16, prefetch.b0);
-      storePackedBPrefetch(bDst, secondChunk, prefetch.b1);
+      for (auto indexed : llvm::enumerate(prefetch.a))
+        storeATilePrefetch(aDst, copyLinearIndex(indexed.index()),
+                           indexed.value());
+      for (auto indexed : llvm::enumerate(prefetch.b))
+        storePackedBPrefetch(bDst, copyLinearIndex(indexed.index()),
+                             indexed.value());
     };
 
     auto computeTile = [&](Value aSrc, Value bSrc, Value kBase,
@@ -591,7 +613,43 @@ struct ConvertGPUKernelOutlinePass
 
     SmallVector<Value, 8> finalAccs;
     finalAccs.reserve(numColTiles);
-    if (wideTile) {
+    if (loopedPipeline) {
+      SmallVector<Value, 8> initAccs(numColTiles, initAcc);
+      copyTile(aLds, bLds, c0);
+      gpu::BarrierOp::create(builder, loc);
+
+      auto kLoop = scf::ForOp::create(builder, loc, c0, c896, c128,
+                                      ValueRange(initAccs));
+      builder.setInsertionPointToStart(kLoop.getBody());
+      Value k = kLoop.getInductionVar();
+      Value kNext = arith::AddIOp::create(builder, loc, k, c64);
+      Value kNextPair = arith::AddIOp::create(builder, loc, k, c128);
+
+      TilePrefetch nextPrefetch = prefetchTileToRegs(kNext);
+      SmallVector<Value, 8> nextAccs;
+      nextAccs.reserve(numColTiles);
+      for (int64_t i = 0; i < numColTiles; ++i)
+        nextAccs.push_back(kLoop.getRegionIterArg(i));
+      computeTile(aLds, bLds, k, nextAccs);
+      storePrefetchToLds(aLdsNext, bLdsNext, nextPrefetch);
+      gpu::BarrierOp::create(builder, loc);
+
+      TilePrefetch nextPairPrefetch = prefetchTileToRegs(kNextPair);
+      computeTile(aLdsNext, bLdsNext, kNext, nextAccs);
+      storePrefetchToLds(aLds, bLds, nextPairPrefetch);
+      gpu::BarrierOp::create(builder, loc);
+      scf::YieldOp::create(builder, loc, ValueRange(nextAccs));
+
+      builder.setInsertionPointAfter(kLoop);
+      for (int64_t i = 0; i < numColTiles; ++i)
+        finalAccs.push_back(kLoop.getResult(i));
+
+      TilePrefetch lastPrefetch = prefetchTileToRegs(c960);
+      computeTile(aLds, bLds, c896, finalAccs);
+      storePrefetchToLds(aLdsNext, bLdsNext, lastPrefetch);
+      gpu::BarrierOp::create(builder, loc);
+      computeTile(aLdsNext, bLdsNext, c960, finalAccs);
+    } else if (wideStaticPipeline) {
       finalAccs.assign(numColTiles, initAcc);
       TilePrefetch prefetch = prefetchTileToRegs(c0);
       storePrefetchToLds(aLds, bLds, prefetch);
