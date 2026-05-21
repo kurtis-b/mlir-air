@@ -6,6 +6,12 @@
 .claude/*
 !.claude/skills/
 
+# Version-control .codex/skills/ (the Codex equivalent of the shared
+# LLM-deployment skills) while keeping other repo-local Codex state local.
+!.codex/
+.codex/*
+!.codex/skills/
+
 # make artifacts
 CMakeFiles/
 CMakeCache.txt
@@ -40,6 +46,7 @@ components
 air_project
 __pycache__/
 sandbox
+agents/.state/
 
 # build results
 libadf.a
