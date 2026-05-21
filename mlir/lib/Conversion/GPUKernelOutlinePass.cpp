@@ -38,7 +38,14 @@ namespace {
 #include "air/Conversion/Passes.h.inc"
 
 static constexpr const char kInt8GemmWmmaAttr[] = "air.gpu.int8_gemm_wmma";
-static constexpr const char kInt8GemmWmmaVariant[] = "lds_128x64_wmma4";
+static constexpr const char kInt8GemmVariantAttr[] =
+    "air.gpu.int8_gemm_variant";
+static constexpr const char kInt8GemmDefaultVariant[] = "lds_128x64_wmma4";
+static constexpr const char kInt8GemmBPackVariant[] = "lds_128x64_bpack";
+
+static bool isSupportedInt8GemmVariant(StringRef variant) {
+  return variant == kInt8GemmDefaultVariant || variant == kInt8GemmBPackVariant;
+}
 
 SmallVector<mlir::BlockArgument, 4> gpuArgs;
 class AffineApplyToSubPattern
@@ -278,7 +285,8 @@ struct ConvertGPUKernelOutlinePass
     return vector::BitCastOp::create(builder, loc, vec4i32, bytes);
   }
 
-  static LogicalResult emitInt8GemmWmmaKernel(gpu::GPUFuncOp func) {
+  static LogicalResult emitInt8GemmWmmaKernel(gpu::GPUFuncOp func,
+                                             StringRef variant) {
     Block &body = func.getBody().front();
     if (func.getFunctionType().getNumInputs() != 3)
       return func.emitOpError(kInt8GemmWmmaAttr)
@@ -293,7 +301,11 @@ struct ConvertGPUKernelOutlinePass
       return func.emitOpError(kInt8GemmWmmaAttr)
              << " only supports memref<1024x1024xi8>, "
                 "memref<1024x1024xi8>, memref<1024x1024xi32>";
+    if (!isSupportedInt8GemmVariant(variant))
+      return func.emitOpError(kInt8GemmWmmaAttr)
+             << " unsupported variant '" << variant << "'";
 
+    bool packedB = variant == kInt8GemmBPackVariant;
     Location loc = func.getLoc();
     MLIRContext *ctx = func.getContext();
     while (!body.getOperations().empty())
@@ -362,6 +374,19 @@ struct ConvertGPUKernelOutlinePass
     copyATile(arith::AddIOp::create(builder, loc, copyIdx16, c4096));
 
     auto copyBTile = [&](Value linearIndex) {
+      if (packedB) {
+        Value bTileCol = arith::DivSIOp::create(builder, loc, linearIndex, c64);
+        Value bTileK = arith::RemSIOp::create(builder, loc, linearIndex, c64);
+        Value globalBRow =
+            arith::AddIOp::create(builder, loc, blockColBase, bTileCol);
+        Value globalBCol = arith::AddIOp::create(builder, loc, k, bTileK);
+        Value bVec = vector::LoadOp::create(
+            builder, loc, vec16i8, b, ValueRange{globalBRow, globalBCol});
+        vector::StoreOp::create(builder, loc, bVec, bLds,
+                                ValueRange{bTileCol, bTileK});
+        return;
+      }
+
       Value bRow = arith::DivSIOp::create(builder, loc, linearIndex, c64);
       Value bCol = arith::RemSIOp::create(builder, loc, linearIndex, c64);
       Value globalBRow = arith::AddIOp::create(builder, loc, k, bRow);
@@ -666,15 +691,26 @@ struct ConvertGPUKernelOutlinePass
         gpu::GPUFuncOp outlinedFunc =
             outlineKernelFuncImpl(launchOp, gfname, operands, filteredOperands);
         bool useInt8Wmma = launchOp->hasAttr(kInt8GemmWmmaAttr);
+        StringRef variant = clInt8GemmVariant;
+        if (auto variantAttr =
+                launchOp->getAttrOfType<StringAttr>(kInt8GemmVariantAttr))
+          variant = variantAttr.getValue();
         if (useInt8Wmma) {
+          if (!isSupportedInt8GemmVariant(variant)) {
+            launchOp.emitOpError(kInt8GemmWmmaAttr)
+                << " unsupported variant '" << variant << "'";
+            signalPassFailure();
+            return;
+          }
           outlinedFunc->setAttr(kInt8GemmWmmaAttr, UnitAttr::get(ctx));
-          outlinedFunc->setAttr("air.gpu.int8_gemm_variant",
-                                builder.getStringAttr(kInt8GemmWmmaVariant));
+          outlinedFunc->setAttr(kInt8GemmVariantAttr,
+                                builder.getStringAttr(variant));
         }
         SymbolTable gpuModuleSymbolTable(gpuModule);
         // insert the GPUFuncOp into GPUModuleOp.
         gpuModuleSymbolTable.insert(outlinedFunc);
-        if (useInt8Wmma && failed(emitInt8GemmWmmaKernel(outlinedFunc))) {
+        if (useInt8Wmma &&
+            failed(emitInt8GemmWmmaKernel(outlinedFunc, variant))) {
           signalPassFailure();
           return;
         }

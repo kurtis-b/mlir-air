@@ -6,15 +6,19 @@
 //===----------------------------------------------------------------------===//
 
 // REQUIRES: gpu
-// RUN: air-opt %s -air-to-rocdl -air-gpu-outlining | FileCheck %s
+// RUN: air-opt %s -air-to-rocdl -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,DEFAULT
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,BPACK
+// RUN: not air-opt %s -air-to-rocdl="int8-gemm-variant=not_a_variant" 2>&1 | FileCheck %s --check-prefix=BAD
 
 // CHECK: gpu.launch_func @{{.*}}::@{{.*}} blocks in (%c16, %c8, %c1) threads in (%c256, %c1, %c1)
 // CHECK: gpu.module @
 // CHECK: gpu.func @{{.*}} kernel
-// CHECK-SAME: air.gpu.int8_gemm_variant = "lds_128x64_wmma4"
+// DEFAULT-SAME: air.gpu.int8_gemm_variant = "lds_128x64_wmma4"
+// BPACK-SAME: air.gpu.int8_gemm_variant = "lds_128x64_bpack"
 // CHECK: rocdl.wmma.i32.16x16x16.iu8
 // CHECK-NOT: rocdl.wmma.i32.16x16x64
 // CHECK-NOT: swmmac
+// BAD: unsupported variant 'not_a_variant'
 
 module {
   func.func @forward(%arg0: memref<1024x1024xi8>, %arg1: memref<1024x1024xi8>, %arg2: memref<1024x1024xi32>) {

@@ -29,6 +29,7 @@ Usage: disassemble.sh gpu [options] <input.air.mlir>
   -o, --output-dir DIR  artifact directory
   --prefix NAME         output prefix (default: input basename)
   --opt-level N         ROCDL optimization level (default: 3)
+  --int8-gemm-variant V AIR GPU INT8 GEMM variant for marked launches
   --expect REGEX        required extracted-ISA pattern; repeatable
   --forbid REGEX        forbidden extracted-ISA pattern; repeatable
   -h, --help            show this help
@@ -172,7 +173,7 @@ run_cpu() {
 
 run_gpu() {
   OUTDIR=""; PREFIX=""
-  local gpu_chip="${AIR_GPU_CHIP:-gfx1150}" opt_level="3" input="" rocdl_mlir outline_mlir outline_llvm_mlir isa_mlir isa_asm bin_mlir code_object readobj final_mlir summary rocdl_pipeline
+  local gpu_chip="${AIR_GPU_CHIP:-gfx1150}" opt_level="3" int8_gemm_variant="${AIR_INT8_GEMM_VARIANT:-}" input="" rocdl_mlir outline_mlir outline_llvm_mlir isa_mlir isa_asm bin_mlir code_object readobj final_mlir summary rocdl_pipeline air_to_rocdl_pass air_gpu_outlining_pass
   local -a expect=() forbid=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -180,6 +181,7 @@ run_gpu() {
       -o|--output-dir) OUTDIR="${2:?missing value for --output-dir}"; shift 2 ;;
       --prefix) PREFIX="${2:?missing value for --prefix}"; shift 2 ;;
       --opt-level) opt_level="${2:?missing value for --opt-level}"; shift 2 ;;
+      --int8-gemm-variant) int8_gemm_variant="${2:?missing value for --int8-gemm-variant}"; shift 2 ;;
       --expect) expect+=("${2:?missing value for --expect}"); shift 2 ;;
       --forbid) forbid+=("${2:?missing value for --forbid}"); shift 2 ;;
       -h|--help) gpu_usage; exit 0 ;;
@@ -199,8 +201,14 @@ run_gpu() {
   isa_mlir="$OUTDIR/${PREFIX}.isa.mlir"; isa_asm="$OUTDIR/${PREFIX}.isa.s"; bin_mlir="$OUTDIR/${PREFIX}.bin.mlir"; code_object="$OUTDIR/${PREFIX}.hsaco"
   readobj="$OUTDIR/${PREFIX}.code_object.readobj.txt"; final_mlir="$OUTDIR/${PREFIX}.final.mlir"; summary="$OUTDIR/${PREFIX}.summary.txt"
   echo "Lowering AIR to GPU/ROCDL for $gpu_chip"
-  "$AIR_OPT" "$input" -air-to-rocdl -o "$rocdl_mlir"
-  "$AIR_OPT" "$rocdl_mlir" -air-gpu-outlining -o "$outline_mlir"
+  air_to_rocdl_pass="-air-to-rocdl"
+  air_gpu_outlining_pass="-air-gpu-outlining"
+  if [ -n "$int8_gemm_variant" ]; then
+    air_to_rocdl_pass="-air-to-rocdl=int8-gemm-variant=${int8_gemm_variant}"
+    air_gpu_outlining_pass="-air-gpu-outlining=int8-gemm-variant=${int8_gemm_variant}"
+  fi
+  "$AIR_OPT" "$input" "$air_to_rocdl_pass" -o "$rocdl_mlir"
+  "$AIR_OPT" "$rocdl_mlir" "$air_gpu_outlining_pass" -o "$outline_mlir"
   "$MLIR_OPT" "--pass-pipeline=builtin.module(func.func(lower-affine,convert-linalg-to-loops,convert-scf-to-cf),gpu-kernel-outlining)" "$outline_mlir" -o "$outline_llvm_mlir"
   rocdl_pipeline="rocdl-attach-target{chip=${gpu_chip} O=${opt_level}},gpu.module(convert-scf-to-cf,convert-gpu-to-rocdl{chipset=${gpu_chip} runtime=HIP},reconcile-unrealized-casts)"
   "$MLIR_OPT" "--pass-pipeline=builtin.module(${rocdl_pipeline},gpu-module-to-binary{format=isa})" "$outline_llvm_mlir" -o "$isa_mlir"
@@ -210,7 +218,7 @@ run_gpu() {
   extract_mlir_attr "$bin_mlir" "$code_object" bin bin
   if [ -n "${LLVM_READOBJ:-}" ]; then "$LLVM_READOBJ" --file-headers --notes --sections --symbols "$code_object" > "$readobj"; else printf 'llvm-readobj not found; code object metadata dump skipped\n' > "$readobj"; fi
   {
-    echo "# GPU ISA summary"; echo "input: $input"; echo "gpu_arch: $gpu_chip"; echo "air_opt: $AIR_OPT"; echo "mlir_opt: $MLIR_OPT"; echo "llvm_readobj: ${LLVM_READOBJ:-unavailable}"
+    echo "# GPU ISA summary"; echo "input: $input"; echo "gpu_arch: $gpu_chip"; [ -z "$int8_gemm_variant" ] || echo "int8_gemm_variant: $int8_gemm_variant"; echo "air_opt: $AIR_OPT"; echo "mlir_opt: $MLIR_OPT"; echo "llvm_readobj: ${LLVM_READOBJ:-unavailable}"
     echo; echo "## Artifacts"; printf '%s\n' "$rocdl_mlir" "$outline_mlir" "$outline_llvm_mlir" "$isa_mlir" "$isa_asm" "$bin_mlir" "$code_object" "$readobj" "$final_mlir"
     echo; grep -aoE 'gpu\.binary @[A-Za-z0-9_.$-]+|chip = "[^"]+"|sgpr_spill_count = [0-9]+ : i64|vgpr_spill_count = [0-9]+ : i64|sgpr_count = [0-9]+ : i64|vgpr_count = [0-9]+ : i64|wavefront_size = [0-9]+ : i64' "$final_mlir" || true
     grep -E 'Format:|Arch:|EF_AMDGPU|NT_AMDGPU_METADATA|\.sgpr_count|\.sgpr_spill_count|\.vgpr_count|\.vgpr_spill_count|\.wavefront_size|amdhsa\.target' "$readobj" || true

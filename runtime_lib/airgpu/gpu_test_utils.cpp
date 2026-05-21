@@ -61,6 +61,17 @@ extern "C" void mgpuInitI8I32(int8_t *A, int8_t *B, int64_t M, int64_t N,
   }
 }
 
+/// Pack row-major B[K,N] into Bpacked[N,K] for GPU kernels that avoid an LDS
+/// transpose on the B operand. Validation still uses the original B buffer.
+extern "C" void mgpuPackBI8I32(const int8_t *B, int8_t *BPacked, int64_t N,
+                                int64_t K) {
+  for (int64_t j = 0; j < N; ++j) {
+    for (int64_t k = 0; k < K; ++k) {
+      BPacked[j * K + k] = B[k * N + j];
+    }
+  }
+}
+
 /// Verify matmul output matches expected results.
 /// Compares device output against host reference with epsilon tolerance.
 extern "C" void mgpuCheckOutput(float *device, float *hostA, float *hostB,

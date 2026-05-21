@@ -21,6 +21,8 @@ from typing import Sequence
 
 M = N = K = 1024
 TARGET_TOPS = {"cpu": 4.0, "gpu": 15.0, "npu": 36.0}
+DEFAULT_GPU_INT8_GEMM_VARIANT = "lds_128x64_wmma4"
+GPU_INT8_GEMM_VARIANTS = (DEFAULT_GPU_INT8_GEMM_VARIANT, "lds_128x64_bpack")
 
 
 def positive_int(value: str) -> int:
@@ -74,6 +76,10 @@ def mlir_string_attr(path: Path, attr_name: str) -> str:
 def summary_metric(path: Path, metric_name: str) -> str:
     matches = re.findall(rf'{re.escape(metric_name)}:\s*([^\s]+)', read_text(path))
     return matches[-1] if matches else ""
+
+
+def gpu_variant_uses_packed_b(variant: str) -> bool:
+    return variant == "lds_128x64_bpack"
 
 
 def to_tops(gops: str) -> str:
@@ -131,6 +137,7 @@ class RunContext:
     warmups: int
     iterations: int
     gpu_arch: str
+    gpu_int8_gemm_variant: str
     run_enabled: bool
     cpu_threads: int
     npu_runtime_loop_tiling: str
@@ -272,7 +279,52 @@ def render_gpu_mlir(source: Path, dest: Path, ctx: RunContext) -> None:
         ("%c5_i64 = arith.constant 5 : i64", f"%c5_i64 = arith.constant {ctx.iterations} : i64"),
     ):
         text = replace_once(text, old, new)
+    if gpu_variant_uses_packed_b(ctx.gpu_int8_gemm_variant):
+        text = render_gpu_packed_b_mlir(text)
     write_text(dest, text)
+
+
+def render_gpu_packed_b_mlir(text: str) -> str:
+    text = replace_once(
+        text,
+        "  llvm.func @mgpuCheckOutputI8I32(!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, i64, i64) -> i32\n",
+        "  llvm.func @mgpuCheckOutputI8I32(!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, i64, i64) -> i32\n"
+        "  llvm.func @mgpuPackBI8I32(!llvm.ptr, !llvm.ptr, i64, i64)\n",
+    )
+    text = replace_once(
+        text,
+        "    %alloc_1 = memref.alloc() : memref<1024x1024xi32>\n",
+        "    %alloc_1 = memref.alloc() : memref<1024x1024xi32>\n"
+        "    %alloc_2 = memref.alloc() : memref<1024x1024xi8>\n",
+    )
+    text = replace_once(
+        text,
+        "    %b_ptr = llvm.inttoptr %b_ptr_i64 : i64 to !llvm.ptr\n",
+        "    %b_ptr = llvm.inttoptr %b_ptr_i64 : i64 to !llvm.ptr\n"
+        "    %bpack_intptr = memref.extract_aligned_pointer_as_index %alloc_2 : memref<1024x1024xi8> -> index\n"
+        "    %bpack_ptr_i64 = arith.index_cast %bpack_intptr : index to i64\n"
+        "    %bpack_ptr = llvm.inttoptr %bpack_ptr_i64 : i64 to !llvm.ptr\n",
+    )
+    text = replace_once(
+        text,
+        "    llvm.call @mgpuInitI8I32(%a_ptr, %b_ptr, %m64, %n64, %k64) : (!llvm.ptr, !llvm.ptr, i64, i64, i64) -> ()\n",
+        "    llvm.call @mgpuInitI8I32(%a_ptr, %b_ptr, %m64, %n64, %k64) : (!llvm.ptr, !llvm.ptr, i64, i64, i64) -> ()\n"
+        "    llvm.call @mgpuPackBI8I32(%b_ptr, %bpack_ptr, %n64, %k64) : (!llvm.ptr, !llvm.ptr, i64, i64) -> ()\n",
+    )
+    text = replace_once(
+        text,
+        "    gpu.memcpy %memref_2, %alloc_0 : memref<1024x1024xi8>, memref<1024x1024xi8>\n",
+        "    gpu.memcpy %memref_2, %alloc_2 : memref<1024x1024xi8>, memref<1024x1024xi8>\n",
+    )
+    text = replace_once(
+        text,
+        "    memref.dealloc %alloc_0 : memref<1024x1024xi8>\n"
+        "    memref.dealloc %alloc_1 : memref<1024x1024xi32>\n",
+        "    memref.dealloc %alloc_0 : memref<1024x1024xi8>\n"
+        "    memref.dealloc %alloc_1 : memref<1024x1024xi32>\n"
+        "    memref.dealloc %alloc_2 : memref<1024x1024xi8>\n",
+    )
+    return text
 
 
 def gpu_backend(ctx: RunContext) -> BackendResult:
@@ -291,7 +343,7 @@ def gpu_backend(ctx: RunContext) -> BackendResult:
         write_text(log, f"failed to render GPU MLIR: {exc}\n")
         result.status, result.evidence = "WARN", f"GPU MLIR render failed; see {log}"
         return result
-    ok, log = run_logged(ctx, result, "disassemble", [ctx.disassemble, "gpu", "--gpu-arch", ctx.gpu_arch, "--output-dir", result.artifacts_dir, "--prefix", "gpu_int8_gemm", "--expect", "v_wmma_i32_16x16x16_iu8", "--forbid", r"v_wmma_.*16x16x64|v_swmmac|swmmac", generated], env=gpu_compile_env(ctx.repo))
+    ok, log = run_logged(ctx, result, "disassemble", [ctx.disassemble, "gpu", "--gpu-arch", ctx.gpu_arch, "--int8-gemm-variant", ctx.gpu_int8_gemm_variant, "--output-dir", result.artifacts_dir, "--prefix", "gpu_int8_gemm", "--expect", "v_wmma_i32_16x16x16_iu8", "--forbid", r"v_wmma_.*16x16x64|v_swmmac|swmmac", generated], env=gpu_compile_env(ctx.repo))
     if not ok:
         result.status, result.evidence = "WARN", f"GPU lowering/disassembly failed or required marker was absent; see {log}"
         return result
@@ -318,10 +370,23 @@ def gpu_backend(ctx: RunContext) -> BackendResult:
     variant = mlir_string_attr(outline_mlir, "air.gpu.int8_gemm_variant") or "unknown"
     vgprs = summary_metric(summary, ".vgpr_count") or "n/a"
     sgprs = summary_metric(summary, ".sgpr_count") or "n/a"
+    global_load_b128 = count_regex(isa, r"\bglobal_load_b128\b")
+    global_load_lds = count_regex(isa, r"\bglobal_load(?:_async)?(?:_to)?_lds")
+    ds_store_b128 = count_regex(isa, r"\bds_store_b128\b")
+    ds_store_b8 = count_regex(isa, r"\bds_store_b8(?:_d16_hi)?\b")
+    ds_load_b128 = count_regex(isa, r"\bds_(?:read|load)_b128\b")
+    global_store_b32 = count_regex(isa, r"\bglobal_store_b32\b")
+    waitcnt = count_regex(isa, r"\bs_waitcnt\b")
     result.status = "PASS" if wmma and scratch == 0 and spills == 0 else "FAIL"
     if ctx.run_enabled and "failed" in result.runtime and result.status == "PASS":
         result.status = "WARN"
-    result.evidence = f"variant={variant}, wmma={wmma}, barriers={barriers}, vgprs={vgprs}, sgprs={sgprs}, scratch_markers={scratch}, spills={spills}"
+    result.evidence = (
+        f"variant={variant}, wmma={wmma}, barriers={barriers}, vgprs={vgprs}, "
+        f"sgprs={sgprs}, scratch_markers={scratch}, spills={spills}, "
+        f"global_load_b128={global_load_b128}, global_load_lds={global_load_lds}, "
+        f"ds_store_b128={ds_store_b128}, ds_store_b8={ds_store_b8}, "
+        f"ds_load_b128={ds_load_b128}, global_store_b32={global_store_b32}, waitcnt={waitcnt}"
+    )
     if ctx.run_enabled and (run_log := result.logs.get("run")) and run_log.exists():
         result.perf_domain = "kernel_event"
         result.perf_count = timing_field(run_log, "kernel_event", "count") or "n/a"
@@ -447,7 +512,7 @@ def write_report(report: Path, ctx: RunContext, args: argparse.Namespace, result
         f.write("# GEMM int8 Benchmark Report\n\n")
         f.write(f"Artifacts: `{ctx.out_dir}`\n\n")
         f.write("## Run Controls\n\n| Field | Value |\n| --- | --- |\n")
-        for key, value in (("Selected backend", args.backend), ("Execute kernels", args.run), ("Strict mode", args.strict), ("Warmups", args.warmups), ("Iterations", args.iterations), ("CPU threads", args.cpu_threads), ("NPU runtime loop tiling", args.npu_runtime_loop_tiling), ("Build root", ctx.build_root), ("GPU arch", args.gpu_arch), ("Shape", f"M=N=K={M}, int8 x int8 -> int32")):
+        for key, value in (("Selected backend", args.backend), ("Execute kernels", args.run), ("Strict mode", args.strict), ("Warmups", args.warmups), ("Iterations", args.iterations), ("CPU threads", args.cpu_threads), ("NPU runtime loop tiling", args.npu_runtime_loop_tiling), ("Build root", ctx.build_root), ("GPU arch", args.gpu_arch), ("GPU int8 GEMM variant", args.gpu_int8_gemm_variant), ("Shape", f"M=N=K={M}, int8 x int8 -> int32")):
             f.write(f"| {key} | `{value}` |\n")
         f.write("\n## ISA Verdicts\n\n| Backend | Status | Evidence | Runtime |\n| --- | --- | --- | --- |\n")
         for name in ("cpu", "gpu", "npu"):
@@ -473,6 +538,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--run", action="store_true", help="execute selected kernels")
     parser.add_argument("--strict", action="store_true", help="exit non-zero when any selected backend is not PASS")
     parser.add_argument("--gpu-arch", default=os.environ.get("AIR_GPU_CHIP", "gfx1150"), help="AMDGPU chip for GPU lowering (default: AIR_GPU_CHIP or gfx1150)")
+    parser.add_argument("--gpu-int8-gemm-variant", choices=GPU_INT8_GEMM_VARIANTS, default=os.environ.get("AIR_INT8_GEMM_VARIANT", DEFAULT_GPU_INT8_GEMM_VARIANT), help="GPU INT8 GEMM lowering variant (default: %(default)s)")
     parser.add_argument("--cpu-threads", type=positive_int, default=12, help="CPU worker threads passed to the CPU benchmark (default: 12)")
     parser.add_argument("--npu-runtime-loop-tiling", default="2,4", metavar="M,N", help="AIR runtime loop tiling sizes for NPU compile (default: 2,4)")
     parser.add_argument("--warmups", type=nonnegative_int, default=10, help="warmup iterations for every backend (default: 10)")
@@ -492,7 +558,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
     out_dir = args.out_dir.resolve()
-    ctx = RunContext(Path(__file__).resolve().parents[2], out_dir, args.build_dir.resolve() if args.build_dir else out_dir / "build", out_dir / "logs", args.warmups, args.iterations, args.gpu_arch, args.run, args.cpu_threads, args.npu_runtime_loop_tiling)
+    ctx = RunContext(Path(__file__).resolve().parents[2], out_dir, args.build_dir.resolve() if args.build_dir else out_dir / "build", out_dir / "logs", args.warmups, args.iterations, args.gpu_arch, args.gpu_int8_gemm_variant, args.run, args.cpu_threads, args.npu_runtime_loop_tiling)
     for path in (ctx.out_dir, ctx.build_root, ctx.logs_dir):
         path.mkdir(parents=True, exist_ok=True)
     selected = set(selected_backends(args.backend))

@@ -18,7 +18,11 @@ def ConvertAIRToROCDL : Pass<"air-to-rocdl", "ModuleOp"> {
   let dependentDialects = [
     "gpu::GPUDialect", "ROCDL::ROCDLDialect", "LLVM::LLVMDialect"
   ];
-  let options = [];
+  let options = [
+    Option<"clInt8GemmVariant", "int8-gemm-variant", "std::string",
+           /*default=*/"\"lds_128x64_wmma4\"",
+           "INT8 GEMM kernel variant for launches marked air.gpu.int8_gemm_wmma">
+  ];
 }
 
 def AIRTranslateToLLVM : Pass<"air-translate-to-llvm", "ModuleOp"> {
@@ -46,7 +50,11 @@ def ConvertGPUKernelOutline : Pass<"air-gpu-outlining", "ModuleOp"> {
   let dependentDialects = [
     "gpu::GPUDialect", "ROCDL::ROCDLDialect", "LLVM::LLVMDialect"
   ];
-  let options = [];
+  let options = [
+    Option<"clInt8GemmVariant", "int8-gemm-variant", "std::string",
+           /*default=*/"\"lds_128x64_wmma4\"",
+           "INT8 GEMM kernel variant for launches marked air.gpu.int8_gemm_wmma">
+  ];
 }
 
 def AIRRankToMgpu : Pass<"air-rank-to-mgpu", "ModuleOp"> {

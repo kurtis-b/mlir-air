@@ -37,7 +37,14 @@ namespace {
 #include "air/Conversion/Passes.h.inc"
 
 static constexpr const char kInt8GemmWmmaAttr[] = "air.gpu.int8_gemm_wmma";
-static constexpr const char kInt8GemmWmmaVariant[] = "lds_128x64_wmma4";
+static constexpr const char kInt8GemmVariantAttr[] =
+    "air.gpu.int8_gemm_variant";
+static constexpr const char kInt8GemmDefaultVariant[] = "lds_128x64_wmma4";
+static constexpr const char kInt8GemmBPackVariant[] = "lds_128x64_bpack";
+
+static bool isSupportedInt8GemmVariant(StringRef variant) {
+  return variant == kInt8GemmDefaultVariant || variant == kInt8GemmBPackVariant;
+}
 
 SmallVector<mlir::BlockArgument, 4> gpuArgs;
 class AffineApplyToSubPattern
@@ -271,6 +278,14 @@ struct ConvertAIRToROCDLPass
              << " only supports memref<1024x1024xi8>, "
                 "memref<1024x1024xi8>, memref<1024x1024xi32>";
 
+    StringRef variant = clInt8GemmVariant;
+    if (auto variantAttr =
+            launchOp->getAttrOfType<StringAttr>(kInt8GemmVariantAttr))
+      variant = variantAttr.getValue();
+    if (!isSupportedInt8GemmVariant(variant))
+      return launchOp.emitOpError(kInt8GemmWmmaAttr)
+             << " unsupported variant '" << variant << "'";
+
     OpBuilder builder(launchOp);
     Location loc = launchOp.getLoc();
     Value gridX = arith::ConstantIndexOp::create(builder, loc, 16);
@@ -283,8 +298,7 @@ struct ConvertAIRToROCDLPass
     auto gpuLaunch = gpu::LaunchOp::create(builder, loc, gridX, gridY, gridZ,
                                            blockX, blockY, blockZ);
     gpuLaunch->setAttr(kInt8GemmWmmaAttr, UnitAttr::get(launchOp.getContext()));
-    gpuLaunch->setAttr("air.gpu.int8_gemm_variant",
-                       builder.getStringAttr(kInt8GemmWmmaVariant));
+    gpuLaunch->setAttr(kInt8GemmVariantAttr, builder.getStringAttr(variant));
 
     {
       OpBuilder::InsertionGuard guard(builder);
