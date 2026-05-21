@@ -72,6 +72,13 @@ extern "C" void mgpuPackBI8I32(const int8_t *B, int8_t *BPacked, int64_t N,
   }
 }
 
+/// Pack row-major B[K,N] into the fragment-friendly Bpacked[N,K] layout used
+/// by kernels that load B fragments directly from global memory.
+extern "C" void mgpuPackBFragI8I32(const int8_t *B, int8_t *BPacked, int64_t N,
+                                    int64_t K) {
+  mgpuPackBI8I32(B, BPacked, N, K);
+}
+
 /// Verify matmul output matches expected results.
 /// Compares device output against host reference with epsilon tolerance.
 extern "C" void mgpuCheckOutput(float *device, float *hostA, float *hostB,

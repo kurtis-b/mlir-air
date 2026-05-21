@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import re
 import shlex
@@ -22,7 +23,15 @@ from typing import Sequence
 M = N = K = 1024
 TARGET_TOPS = {"cpu": 4.0, "gpu": 15.0, "npu": 36.0}
 DEFAULT_GPU_INT8_GEMM_VARIANT = "lds_128x64_wmma4"
-GPU_INT8_GEMM_VARIANTS = (DEFAULT_GPU_INT8_GEMM_VARIANT, "lds_128x64_bpack")
+GPU_INT8_GEMM_VARIANTS = (
+    DEFAULT_GPU_INT8_GEMM_VARIANT,
+    "lds_128x64_bpack",
+    "lds_128x64_bpack_swizzle",
+    "lds_128x64_bpack_pipe2",
+    "lds_128x64_bpack_pipe2_grouped",
+    "lds_128x64_bpack_frag",
+)
+GPU_INT8_GEMM_SWEEP_VARIANTS = GPU_INT8_GEMM_VARIANTS
 
 
 def positive_int(value: str) -> int:
@@ -79,7 +88,15 @@ def summary_metric(path: Path, metric_name: str) -> str:
 
 
 def gpu_variant_uses_packed_b(variant: str) -> bool:
-    return variant == "lds_128x64_bpack"
+    return variant != DEFAULT_GPU_INT8_GEMM_VARIANT
+
+
+def gpu_variant_uses_fragment_b(variant: str) -> bool:
+    return variant == "lds_128x64_bpack_frag"
+
+
+def gpu_b_pack_function(variant: str) -> str:
+    return "mgpuPackBFragI8I32" if gpu_variant_uses_fragment_b(variant) else "mgpuPackBI8I32"
 
 
 def to_tops(gops: str) -> str:
@@ -280,16 +297,17 @@ def render_gpu_mlir(source: Path, dest: Path, ctx: RunContext) -> None:
     ):
         text = replace_once(text, old, new)
     if gpu_variant_uses_packed_b(ctx.gpu_int8_gemm_variant):
-        text = render_gpu_packed_b_mlir(text)
+        text = render_gpu_packed_b_mlir(text, ctx.gpu_int8_gemm_variant)
     write_text(dest, text)
 
 
-def render_gpu_packed_b_mlir(text: str) -> str:
+def render_gpu_packed_b_mlir(text: str, variant: str) -> str:
+    pack_function = gpu_b_pack_function(variant)
     text = replace_once(
         text,
         "  llvm.func @mgpuCheckOutputI8I32(!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, i64, i64) -> i32\n",
         "  llvm.func @mgpuCheckOutputI8I32(!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, i64, i64) -> i32\n"
-        "  llvm.func @mgpuPackBI8I32(!llvm.ptr, !llvm.ptr, i64, i64)\n",
+        f"  llvm.func @{pack_function}(!llvm.ptr, !llvm.ptr, i64, i64)\n",
     )
     text = replace_once(
         text,
@@ -309,7 +327,7 @@ def render_gpu_packed_b_mlir(text: str) -> str:
         text,
         "    llvm.call @mgpuInitI8I32(%a_ptr, %b_ptr, %m64, %n64, %k64) : (!llvm.ptr, !llvm.ptr, i64, i64, i64) -> ()\n",
         "    llvm.call @mgpuInitI8I32(%a_ptr, %b_ptr, %m64, %n64, %k64) : (!llvm.ptr, !llvm.ptr, i64, i64, i64) -> ()\n"
-        "    llvm.call @mgpuPackBI8I32(%b_ptr, %bpack_ptr, %n64, %k64) : (!llvm.ptr, !llvm.ptr, i64, i64) -> ()\n",
+        f"    llvm.call @{pack_function}(%b_ptr, %bpack_ptr, %n64, %k64) : (!llvm.ptr, !llvm.ptr, i64, i64) -> ()\n",
     )
     text = replace_once(
         text,
@@ -396,6 +414,83 @@ def gpu_backend(ctx: RunContext) -> BackendResult:
         set_perf_tops(result, parse_tops(gpu_tops))
         result.perf_notes = f"variant={variant}; host_dispatch_wait_mean_ms={timing_field(run_log, 'host_dispatch_wait', 'mean_ms') or 'n/a'}; peak_pct={last_kv_value(run_log, 'kernel_event_peak_pct') or 'n/a'}; warmups={ctx.warmups}"
     return result
+
+
+
+def evidence_map(result: BackendResult) -> dict[str, str]:
+    return dict(re.findall(r"([A-Za-z0-9_.-]+)=([^,\s]+)", result.evidence))
+
+
+def run_gpu_variant_sweep(ctx: RunContext, variants: Sequence[str]) -> BackendResult:
+    rows: list[dict[str, str]] = []
+    results: list[BackendResult] = []
+    for variant in variants:
+        prefix = sanitize_prefix(variant)
+        variant_ctx = RunContext(
+            ctx.repo,
+            ctx.out_dir / "gpu_sweep" / prefix,
+            ctx.build_root / "gpu_sweep" / prefix,
+            ctx.logs_dir / "gpu_sweep" / prefix,
+            ctx.warmups,
+            ctx.iterations,
+            ctx.gpu_arch,
+            variant,
+            ctx.run_enabled,
+            ctx.cpu_threads,
+            ctx.npu_runtime_loop_tiling,
+        )
+        for path in (variant_ctx.out_dir, variant_ctx.build_root, variant_ctx.logs_dir):
+            path.mkdir(parents=True, exist_ok=True)
+        result = gpu_backend(variant_ctx)
+        results.append(result)
+        evidence = evidence_map(result)
+        row = {
+            "variant": variant,
+            "status": result.status,
+            "tops": f"{result.perf_tops:.6f}" if result.perf_tops is not None else "",
+            "timing_domain": result.perf_domain,
+            "count": result.perf_count,
+            "latency": result.perf_latency,
+            "throughput": result.perf_throughput,
+            "runtime": result.runtime,
+            "artifacts": str(result.artifacts_dir),
+            "run_log": str(result.logs.get("run", "")),
+            "disassemble_log": str(result.logs.get("disassemble", "")),
+        }
+        for key in ("wmma", "barriers", "vgprs", "sgprs", "scratch_markers", "spills", "global_load_b128", "global_load_lds", "ds_store_b128", "ds_store_b8", "ds_load_b128", "global_store_b32", "waitcnt"):
+            row[key] = evidence.get(key, "")
+        rows.append(row)
+
+    csv_path = ctx.out_dir / "gpu_variant_sweep.csv"
+    md_path = ctx.out_dir / "gpu_variant_sweep.md"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(rows[0].keys()) if rows else ["variant", "status"]
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    ranked = [result for result in results if result.status == "PASS" and result.perf_tops is not None]
+    if ranked:
+        best = max(ranked, key=lambda result: result.perf_tops or 0.0)
+        best_variant = evidence_map(best).get("variant", ctx.gpu_int8_gemm_variant)
+    else:
+        passing = [result for result in results if result.status == "PASS"]
+        best = passing[0] if passing else (results[0] if results else backend_result(ctx, "gpu"))
+        best_variant = "n/a (runtime disabled)" if not ctx.run_enabled else evidence_map(best).get("variant", ctx.gpu_int8_gemm_variant)
+
+    with md_path.open("w", encoding="utf-8") as f:
+        f.write("# GPU INT8 GEMM Variant Sweep\n\n")
+        f.write(f"Best variant: `{best_variant}`\n\n")
+        f.write("| Variant | Status | TOPS | Latency | VGPRs | Spills | ds_store_b8 | waitcnt | Artifacts |\n")
+        f.write("| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+        for row in rows:
+            f.write(f"| `{row['variant']}` | {row['status']} | {row['tops'] or 'n/a'} | {row['latency']} | {row['vgprs'] or 'n/a'} | {row['spills'] or 'n/a'} | {row['ds_store_b8'] or 'n/a'} | {row['waitcnt'] or 'n/a'} | `{row['artifacts']}` |\n")
+        f.write(f"\nCSV: `{csv_path}`\n")
+
+    best.runtime = f"{best.runtime}; sweep csv {csv_path}; sweep report {md_path}"
+    best.perf_notes = f"best_variant={best_variant}; sweep_variants={len(rows)}; {best.perf_notes}"
+    return best
 
 
 def find_npu_elves(build_dir: Path) -> list[Path]:
@@ -512,7 +607,7 @@ def write_report(report: Path, ctx: RunContext, args: argparse.Namespace, result
         f.write("# GEMM int8 Benchmark Report\n\n")
         f.write(f"Artifacts: `{ctx.out_dir}`\n\n")
         f.write("## Run Controls\n\n| Field | Value |\n| --- | --- |\n")
-        for key, value in (("Selected backend", args.backend), ("Execute kernels", args.run), ("Strict mode", args.strict), ("Warmups", args.warmups), ("Iterations", args.iterations), ("CPU threads", args.cpu_threads), ("NPU runtime loop tiling", args.npu_runtime_loop_tiling), ("Build root", ctx.build_root), ("GPU arch", args.gpu_arch), ("GPU int8 GEMM variant", args.gpu_int8_gemm_variant), ("Shape", f"M=N=K={M}, int8 x int8 -> int32")):
+        for key, value in (("Selected backend", args.backend), ("Execute kernels", args.run), ("Strict mode", args.strict), ("GPU sweep variants", args.gpu_sweep_variants), ("Warmups", args.warmups), ("Iterations", args.iterations), ("CPU threads", args.cpu_threads), ("NPU runtime loop tiling", args.npu_runtime_loop_tiling), ("Build root", ctx.build_root), ("GPU arch", args.gpu_arch), ("GPU int8 GEMM variant", args.gpu_int8_gemm_variant), ("Shape", f"M=N=K={M}, int8 x int8 -> int32")):
             f.write(f"| {key} | `{value}` |\n")
         f.write("\n## ISA Verdicts\n\n| Backend | Status | Evidence | Runtime |\n| --- | --- | --- | --- |\n")
         for name in ("cpu", "gpu", "npu"):
@@ -539,6 +634,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--strict", action="store_true", help="exit non-zero when any selected backend is not PASS")
     parser.add_argument("--gpu-arch", default=os.environ.get("AIR_GPU_CHIP", "gfx1150"), help="AMDGPU chip for GPU lowering (default: AIR_GPU_CHIP or gfx1150)")
     parser.add_argument("--gpu-int8-gemm-variant", choices=GPU_INT8_GEMM_VARIANTS, default=os.environ.get("AIR_INT8_GEMM_VARIANT", DEFAULT_GPU_INT8_GEMM_VARIANT), help="GPU INT8 GEMM lowering variant (default: %(default)s)")
+    parser.add_argument("--gpu-sweep-variants", action="store_true", help="run the fixed GPU INT8 GEMM variant sweep and write CSV/Markdown evidence")
     parser.add_argument("--cpu-threads", type=positive_int, default=12, help="CPU worker threads passed to the CPU benchmark (default: 12)")
     parser.add_argument("--npu-runtime-loop-tiling", default="2,4", metavar="M,N", help="AIR runtime loop tiling sizes for NPU compile (default: 2,4)")
     parser.add_argument("--warmups", type=nonnegative_int, default=10, help="warmup iterations for every backend (default: 10)")
@@ -552,6 +648,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     except argparse.ArgumentTypeError as exc:
         parser.error(f"--npu-runtime-loop-tiling: {exc}")
     args.npu_runtime_loop_tiling = f"{parsed_tiling[0]},{parsed_tiling[1]}"
+    if args.gpu_sweep_variants and args.backend not in {"all", "gpu"}:
+        parser.error("--gpu-sweep-variants requires --backend all or --backend gpu")
     return args
 
 
@@ -561,12 +659,15 @@ def main(argv: Sequence[str]) -> int:
     ctx = RunContext(Path(__file__).resolve().parents[2], out_dir, args.build_dir.resolve() if args.build_dir else out_dir / "build", out_dir / "logs", args.warmups, args.iterations, args.gpu_arch, args.gpu_int8_gemm_variant, args.run, args.cpu_threads, args.npu_runtime_loop_tiling)
     for path in (ctx.out_dir, ctx.build_root, ctx.logs_dir):
         path.mkdir(parents=True, exist_ok=True)
-    selected = set(selected_backends(args.backend))
+    selected = {"gpu"} if args.gpu_sweep_variants else set(selected_backends(args.backend))
     runners = {"cpu": cpu_backend, "gpu": gpu_backend, "npu": npu_backend}
     results = {name: backend_result(ctx, name) for name in ("cpu", "gpu", "npu")}
-    for name in ("cpu", "gpu", "npu"):
-        if name in selected:
-            results[name] = runners[name](ctx)
+    if args.gpu_sweep_variants:
+        results["gpu"] = run_gpu_variant_sweep(ctx, GPU_INT8_GEMM_SWEEP_VARIANTS)
+    else:
+        for name in ("cpu", "gpu", "npu"):
+            if name in selected:
+                results[name] = runners[name](ctx)
     report = out_dir / "gemm_int8_report.md"
     write_report(report, ctx, args, results)
     print(f"Report: {report}")

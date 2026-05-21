@@ -8,6 +8,10 @@
 // REQUIRES: gpu
 // RUN: air-opt %s -air-to-rocdl -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,DEFAULT
 // RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,BPACK
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_swizzle" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,SWIZZLE
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_pipe2" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,PIPE2
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_pipe2_grouped" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,GROUPED
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_frag" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,FRAG
 // RUN: not air-opt %s -air-to-rocdl="int8-gemm-variant=not_a_variant" 2>&1 | FileCheck %s --check-prefix=BAD
 
 // CHECK: gpu.launch_func @{{.*}}::@{{.*}} blocks in (%c16, %c8, %c1) threads in (%c256, %c1, %c1)
@@ -15,6 +19,10 @@
 // CHECK: gpu.func @{{.*}} kernel
 // DEFAULT-SAME: air.gpu.int8_gemm_variant = "lds_128x64_wmma4"
 // BPACK-SAME: air.gpu.int8_gemm_variant = "lds_128x64_bpack"
+// SWIZZLE-SAME: air.gpu.int8_gemm_variant = "lds_128x64_bpack_swizzle"
+// PIPE2-SAME: air.gpu.int8_gemm_variant = "lds_128x64_bpack_pipe2"
+// GROUPED-SAME: air.gpu.int8_gemm_variant = "lds_128x64_bpack_pipe2_grouped"
+// FRAG-SAME: air.gpu.int8_gemm_variant = "lds_128x64_bpack_frag"
 // CHECK: rocdl.wmma.i32.16x16x16.iu8
 // CHECK-NOT: rocdl.wmma.i32.16x16x64
 // CHECK-NOT: swmmac

@@ -41,9 +41,22 @@ static constexpr const char kInt8GemmVariantAttr[] =
     "air.gpu.int8_gemm_variant";
 static constexpr const char kInt8GemmDefaultVariant[] = "lds_128x64_wmma4";
 static constexpr const char kInt8GemmBPackVariant[] = "lds_128x64_bpack";
+static constexpr const char kInt8GemmBPackSwizzleVariant[] =
+    "lds_128x64_bpack_swizzle";
+static constexpr const char kInt8GemmBPackPipe2Variant[] =
+    "lds_128x64_bpack_pipe2";
+static constexpr const char kInt8GemmBPackPipe2GroupedVariant[] =
+    "lds_128x64_bpack_pipe2_grouped";
+static constexpr const char kInt8GemmBPackFragVariant[] =
+    "lds_128x64_bpack_frag";
 
 static bool isSupportedInt8GemmVariant(StringRef variant) {
-  return variant == kInt8GemmDefaultVariant || variant == kInt8GemmBPackVariant;
+  return variant == kInt8GemmDefaultVariant ||
+         variant == kInt8GemmBPackVariant ||
+         variant == kInt8GemmBPackSwizzleVariant ||
+         variant == kInt8GemmBPackPipe2Variant ||
+         variant == kInt8GemmBPackPipe2GroupedVariant ||
+         variant == kInt8GemmBPackFragVariant;
 }
 
 SmallVector<mlir::BlockArgument, 4> gpuArgs;
