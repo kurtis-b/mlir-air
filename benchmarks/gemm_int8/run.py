@@ -66,6 +66,16 @@ def timing_field(path: Path, domain: str, field_name: str) -> str:
     return ""
 
 
+def mlir_string_attr(path: Path, attr_name: str) -> str:
+    matches = re.findall(rf'{re.escape(attr_name)} = "([^"]+)"', read_text(path))
+    return matches[-1] if matches else ""
+
+
+def summary_metric(path: Path, metric_name: str) -> str:
+    matches = re.findall(rf'{re.escape(metric_name)}:\s*([^\s]+)', read_text(path))
+    return matches[-1] if matches else ""
+
+
 def to_tops(gops: str) -> str:
     try:
         return f"{float(gops) / 1000.0:.6f}" if gops else "n/a"
@@ -271,6 +281,7 @@ def gpu_backend(ctx: RunContext) -> BackendResult:
     generated = result.build_dir / "int8_gemm.air_sync.mlir"
     isa = result.artifacts_dir / "gpu_int8_gemm.isa.s"
     summary = result.artifacts_dir / "gpu_int8_gemm.summary.txt"
+    outline_mlir = result.artifacts_dir / "gpu_int8_gemm.outline.mlir"
     final_mlir = result.artifacts_dir / "gpu_int8_gemm.final.mlir"
     try:
         render_gpu_mlir(source, generated, ctx)
@@ -304,10 +315,13 @@ def gpu_backend(ctx: RunContext) -> BackendResult:
     barriers = count_regex(isa, r"\bs_barrier\b")
     scratch = count_regex(isa, r"uses_flat_scratch\s+1")
     spills = count_regex(summary, r"spill_count = [1-9]|_spill_count: [1-9]")
+    variant = mlir_string_attr(outline_mlir, "air.gpu.int8_gemm_variant") or "unknown"
+    vgprs = summary_metric(summary, ".vgpr_count") or "n/a"
+    sgprs = summary_metric(summary, ".sgpr_count") or "n/a"
     result.status = "PASS" if wmma and scratch == 0 and spills == 0 else "FAIL"
     if ctx.run_enabled and "failed" in result.runtime and result.status == "PASS":
         result.status = "WARN"
-    result.evidence = f"wmma={wmma}, barriers={barriers}, scratch_markers={scratch}, spills={spills}"
+    result.evidence = f"variant={variant}, wmma={wmma}, barriers={barriers}, vgprs={vgprs}, sgprs={sgprs}, scratch_markers={scratch}, spills={spills}"
     if ctx.run_enabled and (run_log := result.logs.get("run")) and run_log.exists():
         result.perf_domain = "kernel_event"
         result.perf_count = timing_field(run_log, "kernel_event", "count") or "n/a"
@@ -315,7 +329,7 @@ def gpu_backend(ctx: RunContext) -> BackendResult:
         gpu_tops = timing_field(run_log, "kernel_event", "tops")
         result.perf_throughput = f"{gpu_tops or 'n/a'} TOPS"
         set_perf_tops(result, parse_tops(gpu_tops))
-        result.perf_notes = f"host_dispatch_wait_mean_ms={timing_field(run_log, 'host_dispatch_wait', 'mean_ms') or 'n/a'}; peak_pct={last_kv_value(run_log, 'kernel_event_peak_pct') or 'n/a'}; warmups={ctx.warmups}"
+        result.perf_notes = f"variant={variant}; host_dispatch_wait_mean_ms={timing_field(run_log, 'host_dispatch_wait', 'mean_ms') or 'n/a'}; peak_pct={last_kv_value(run_log, 'kernel_event_peak_pct') or 'n/a'}; warmups={ctx.warmups}"
     return result
 
 

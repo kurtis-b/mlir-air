@@ -37,6 +37,7 @@ namespace {
 #include "air/Conversion/Passes.h.inc"
 
 static constexpr const char kInt8GemmWmmaAttr[] = "air.gpu.int8_gemm_wmma";
+static constexpr const char kInt8GemmWmmaVariant[] = "lds_128x64_wmma4";
 
 SmallVector<mlir::BlockArgument, 4> gpuArgs;
 class AffineApplyToSubPattern
@@ -273,7 +274,7 @@ struct ConvertAIRToROCDLPass
     OpBuilder builder(launchOp);
     Location loc = launchOp.getLoc();
     Value gridX = arith::ConstantIndexOp::create(builder, loc, 16);
-    Value gridY = arith::ConstantIndexOp::create(builder, loc, 16);
+    Value gridY = arith::ConstantIndexOp::create(builder, loc, 8);
     Value gridZ = arith::ConstantIndexOp::create(builder, loc, 1);
     Value blockX = arith::ConstantIndexOp::create(builder, loc, 256);
     Value blockY = arith::ConstantIndexOp::create(builder, loc, 1);
@@ -283,7 +284,7 @@ struct ConvertAIRToROCDLPass
                                            blockX, blockY, blockZ);
     gpuLaunch->setAttr(kInt8GemmWmmaAttr, UnitAttr::get(launchOp.getContext()));
     gpuLaunch->setAttr("air.gpu.int8_gemm_variant",
-                       builder.getStringAttr("lds_vectorized_64x64"));
+                       builder.getStringAttr(kInt8GemmWmmaVariant));
 
     {
       OpBuilder::InsertionGuard guard(builder);
