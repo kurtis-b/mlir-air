@@ -24,6 +24,8 @@ from typing import Sequence
 M = N = K = 1024
 TARGET_TOPS = {"cpu": 4.0, "gpu": 15.0, "npu": 36.0}
 GPU_INT8_GEMM_BASE_WMMA_VARIANT = "lds_128x64_wmma4"
+GPU_INT8_GEMM_AIR_TUNED_DIRECT_VARIANT = "global_128x128_bpack_w4_direct"
+GPU_INT8_GEMM_ROCMLIR_LIKE_VARIANT = "lds_128x128_rocmlir_k32_pipe3"
 DEFAULT_GPU_INT8_GEMM_VARIANT = GPU_INT8_GEMM_BASE_WMMA_VARIANT
 
 
@@ -41,6 +43,9 @@ class GpuInt8GemmVariantConfig:
     direct_b_from_global: bool
     pipeline: str
     default_group_m: int = 4
+    wave_tile_rows: int = 16
+    wave_tile_cols: int | None = None
+    lds_k_padding: int = 0
 
     @property
     def wave_count(self) -> int:
@@ -52,13 +57,18 @@ class GpuInt8GemmVariantConfig:
 
     @property
     def lds_bytes_per_workgroup(self) -> int:
-        a_bytes = self.block_rows * self.k_per_block * self.lds_stages
-        b_bytes = 0 if self.direct_b_from_global else self.block_cols * self.k_per_block * self.lds_stages
+        k_stride = self.k_per_block + self.lds_k_padding
+        a_bytes = self.block_rows * k_stride * self.lds_stages
+        b_bytes = 0 if self.direct_b_from_global else self.block_cols * k_stride * self.lds_stages
         return a_bytes + b_bytes
 
     @property
+    def effective_wave_tile_cols(self) -> int:
+        return self.wave_tile_cols or self.block_cols
+
+    @property
     def dynamic_wmma_per_wave(self) -> int:
-        return (K // 16) * (self.block_cols // 16)
+        return (K // 16) * (self.wave_tile_rows // 16) * (self.effective_wave_tile_cols // 16)
 
     @property
     def dynamic_wmma_per_workgroup(self) -> int:
@@ -66,6 +76,10 @@ class GpuInt8GemmVariantConfig:
 
     @property
     def dynamic_barriers(self) -> int:
+        if self.lds_stages == 0:
+            return 0
+        if self.pipeline == "rocmlir_like_pipe3":
+            return 2 * ((self.k_tiles - 2 + 2) // 3) + 1
         return self.k_tiles if self.lds_stages == 2 else 2 * self.k_tiles
 
 
@@ -86,6 +100,20 @@ GPU_INT8_GEMM_VARIANT_CONFIGS = (
     GpuInt8GemmVariantConfig("lds_128x128_bpack_swizzle_k32_looped", 128, 128, 32, 256, 1, True, True, False, False, "single"),
     GpuInt8GemmVariantConfig("lds_128x128_bpack_swizzle_k128_looped", 128, 128, 128, 256, 1, True, True, False, False, "single"),
     GpuInt8GemmVariantConfig("lds_128x64_bpack_swizzle_breg_k64_looped", 128, 64, 64, 256, 2, True, True, False, True, "pipe2_looped_prefetch"),
+    GpuInt8GemmVariantConfig("lds_128x64_bpack_swizzle_k32_w4_pipe2", 128, 64, 32, 128, 2, True, True, True, False, "tensile_like_pipe2", 8, 32, 64),
+    GpuInt8GemmVariantConfig("lds_128x64_bpack_swizzle_k32_w4_pipe2_pad", 128, 64, 32, 128, 2, True, True, True, False, "tensile_like_pipe2", 8, 32, 64, 16),
+    GpuInt8GemmVariantConfig("lds_64x128_bpack_swizzle_k32_w4_pipe2", 64, 128, 32, 128, 2, True, True, True, False, "tensile_like_pipe2", 8, 32, 64),
+    GpuInt8GemmVariantConfig("lds_64x128_bpack_swizzle_k32_w4_pipe2_pad", 64, 128, 32, 128, 2, True, True, True, False, "tensile_like_pipe2", 8, 32, 64, 16),
+    GpuInt8GemmVariantConfig("lds_128x128_bpack_swizzle_k32_w4_pipe2", 128, 128, 32, 128, 2, True, True, True, False, "tensile_like_pipe2", 8, 64, 64),
+    GpuInt8GemmVariantConfig("lds_128x128_bpack_swizzle_k32_w4_pipe2_pad", 128, 128, 32, 128, 2, True, True, True, False, "tensile_like_pipe2", 8, 64, 64, 16),
+    GpuInt8GemmVariantConfig("lds_128x64_bpack_swizzle_k32_w4_pipe2_short", 128, 64, 32, 128, 2, True, True, True, False, "tensile_like_pipe2_short", 8, 32, 64),
+    GpuInt8GemmVariantConfig("lds_128x64_bpack_swizzle_k32_w4_pipe2_short_pad", 128, 64, 32, 128, 2, True, True, True, False, "tensile_like_pipe2_short", 8, 32, 64, 16),
+    GpuInt8GemmVariantConfig("lds_64x128_bpack_swizzle_k32_w4_pipe2_short", 64, 128, 32, 128, 2, True, True, True, False, "tensile_like_pipe2_short", 8, 32, 64),
+    GpuInt8GemmVariantConfig("lds_64x128_bpack_swizzle_k32_w4_pipe2_short_pad", 64, 128, 32, 128, 2, True, True, True, False, "tensile_like_pipe2_short", 8, 32, 64, 16),
+    GpuInt8GemmVariantConfig("lds_128x128_bpack_swizzle_k32_w4_pipe2_short", 128, 128, 32, 128, 2, True, True, True, False, "tensile_like_pipe2_short", 8, 64, 64),
+    GpuInt8GemmVariantConfig("lds_128x128_bpack_swizzle_k32_w4_pipe2_short_pad", 128, 128, 32, 128, 2, True, True, True, False, "tensile_like_pipe2_short", 8, 64, 64, 16),
+    GpuInt8GemmVariantConfig(GPU_INT8_GEMM_ROCMLIR_LIKE_VARIANT, 128, 128, 32, 128, 3, False, True, True, False, "rocmlir_like_pipe3", 8, 64, 64, 0),
+    GpuInt8GemmVariantConfig(GPU_INT8_GEMM_AIR_TUNED_DIRECT_VARIANT, 128, 128, 32, 128, 0, False, True, True, True, "air_tuned_direct", 8, 64, 64),
 )
 GPU_INT8_GEMM_VARIANT_BY_NAME = {config.variant: config for config in GPU_INT8_GEMM_VARIANT_CONFIGS}
 GPU_INT8_GEMM_VARIANTS = tuple(GPU_INT8_GEMM_VARIANT_BY_NAME)
@@ -95,10 +123,59 @@ GPU_INT8_GEMM_GROUP_SIZES = (2, 4, 8)
 DEFAULT_GPU_INT8_GEMM_SWEEP_GROUP_SIZES = GPU_INT8_GEMM_GROUP_SIZES
 DEFAULT_GPU_INT8_GEMM_SWEEP_REPETITIONS = 3
 GPU_INT8_GEMM_GROUPED_SWIZZLE_VARIANT = "lds_128x64_bpack_swizzle_grouped"
-GPU_INT8_GEMM_SWEEP_PROFILES = ("full", "default-decision", "gfx1150-rewrite", "gfx1150-next", "gfx1150-kshape", "gfx1150-breg")
+GPU_INT8_GEMM_SWEEP_PROFILES = ("full", "default-decision", "gfx1150-rewrite", "gfx1150-next", "gfx1150-kshape", "gfx1150-breg", "gfx1150-tensile-like", "gfx1150-short-live", "gfx1150-air-tuned-direct", "gfx1150-rocmlir-like")
 DEFAULT_GPU_INT8_GEMM_SWEEP_PROFILE = "full"
 DEFAULT_GPU_INT8_GEMM_DEFAULT_THRESHOLD_PCT = 3.0
 DEFAULT_GPU_INT8_GEMM_DEFAULT_IMPROVEMENT_PCT = 10.0
+GPU_PROVIDER_BASELINES = ("hip_wmma", "rocwmma", "air_tuned", "rocblas_tensile", "ck_tile")
+GPU_PROVIDER_EXECUTABLE = "hip_int8_gemm_baseline"
+GPU_ROCMLIR_REFERENCE_PROVIDER = "rocmlir_reference"
+GPU_ROCMLIR_REFERENCE_SOURCE = "compiler-reference"
+GPU_PROVIDER_2X_TARGET_TOPS = 2.0 * 3.29
+GPU_PROVIDER_ROCBLAS_PARITY_PCT = 95.0
+DEFAULT_GPU_PROVIDER_VALIDATION_SAMPLES = 256
+GEMM_INT8_OPS = 2.0 * M * N * K
+GEMM_INT8_IDEAL_BYTES = M * K + K * N + M * N * 4
+GPU_PROVIDER_BASELINE_FIELDNAMES = (
+    "provider",
+    "source",
+    "status",
+    "available",
+    "validation",
+    "mismatches",
+    "repetitions",
+    "median_mean_ms",
+    "min_mean_ms",
+    "mean_mean_ms",
+    "stddev_mean_ms",
+    "cv_mean_ms_pct",
+    "best_kernel_min_ms",
+    "median_tops",
+    "mean_tops",
+    "stddev_tops",
+    "cv_tops_pct",
+    "max_tops",
+    "target_tops_2x",
+    "target_pct_2x",
+    "meets_2x",
+    "ideal_bytes",
+    "operational_intensity_ops_per_byte",
+    "ideal_bandwidth_gbs",
+    "wmma",
+    "global_load_b128",
+    "global_load_u8",
+    "ds_read_b128",
+    "ds_swizzle",
+    "global_store_b32",
+    "scratch_markers",
+    "spills",
+    "build_log",
+    "run_log",
+    "disassemble_log",
+    "profile_log",
+    "artifacts",
+    "notes",
+)
 GPU_INT8_GEMM_GFX1150_REWRITE_CANDIDATES = (
     ("lds_128x64_wmma4", 4),
     ("lds_128x64_bpack_swizzle", 4),
@@ -124,6 +201,41 @@ GPU_INT8_GEMM_GFX1150_KSHAPE_CANDIDATES = (
 GPU_INT8_GEMM_GFX1150_BREG_CANDIDATES = (
     ("lds_128x64_bpack_swizzle_pipe2_looped", 4),
     ("lds_128x64_bpack_swizzle_breg_k64_looped", 4),
+)
+GPU_INT8_GEMM_GFX1150_TENSILE_LIKE_CANDIDATES = (
+    ("lds_128x64_bpack_swizzle", 4),
+    ("lds_128x128_bpack_swizzle_k32_looped", 4),
+    ("lds_128x64_bpack_swizzle_k32_w4_pipe2", 8),
+    ("lds_128x64_bpack_swizzle_k32_w4_pipe2_pad", 8),
+    ("lds_64x128_bpack_swizzle_k32_w4_pipe2", 8),
+    ("lds_64x128_bpack_swizzle_k32_w4_pipe2_pad", 8),
+    ("lds_128x128_bpack_swizzle_k32_w4_pipe2", 8),
+    ("lds_128x128_bpack_swizzle_k32_w4_pipe2_pad", 8),
+    ("lds_128x64_bpack_swizzle_k32_w4_pipe2_short", 8),
+    ("lds_128x64_bpack_swizzle_k32_w4_pipe2_short_pad", 8),
+    ("lds_64x128_bpack_swizzle_k32_w4_pipe2_short", 8),
+    ("lds_64x128_bpack_swizzle_k32_w4_pipe2_short_pad", 8),
+    ("lds_128x128_bpack_swizzle_k32_w4_pipe2_short", 8),
+    ("lds_128x128_bpack_swizzle_k32_w4_pipe2_short_pad", 8),
+)
+GPU_INT8_GEMM_GFX1150_SHORT_LIVE_CANDIDATES = (
+    ("lds_128x64_bpack_swizzle", 4),
+    ("lds_128x128_bpack_swizzle_k32_w4_pipe2_pad", 8),
+    ("lds_128x64_bpack_swizzle_k32_w4_pipe2_short", 8),
+    ("lds_128x64_bpack_swizzle_k32_w4_pipe2_short_pad", 8),
+    ("lds_64x128_bpack_swizzle_k32_w4_pipe2_short", 8),
+    ("lds_64x128_bpack_swizzle_k32_w4_pipe2_short_pad", 8),
+    ("lds_128x128_bpack_swizzle_k32_w4_pipe2_short", 8),
+    ("lds_128x128_bpack_swizzle_k32_w4_pipe2_short_pad", 8),
+)
+GPU_INT8_GEMM_GFX1150_AIR_TUNED_DIRECT_CANDIDATES = (
+    ("lds_128x64_bpack_swizzle", 4),
+    (GPU_INT8_GEMM_AIR_TUNED_DIRECT_VARIANT, 8),
+)
+GPU_INT8_GEMM_GFX1150_ROCMLIR_LIKE_CANDIDATES = (
+    ("lds_128x64_bpack_swizzle", 4),
+    (GPU_INT8_GEMM_ROCMLIR_LIKE_VARIANT, 8),
+    (GPU_INT8_GEMM_AIR_TUNED_DIRECT_VARIANT, 8),
 )
 GPU_INT8_GEMM_DEFAULT_DECISION_CANDIDATES = (
     (GPU_INT8_GEMM_BASE_WMMA_VARIANT, 4),
@@ -667,7 +779,11 @@ def gpu_backend(ctx: RunContext) -> BackendResult:
         write_text(log, f"failed to render GPU MLIR: {exc}\n")
         result.status, result.evidence = "WARN", f"GPU MLIR render failed; see {log}"
         return result
-    ok, log = run_logged(ctx, result, "disassemble", [ctx.disassemble, "gpu", "--gpu-arch", ctx.gpu_arch, "--int8-gemm-variant", ctx.gpu_int8_gemm_variant, "--int8-gemm-group-size", ctx.gpu_int8_gemm_group_size, "--output-dir", result.artifacts_dir, "--prefix", "gpu_int8_gemm", "--expect", "v_wmma_i32_16x16x16_iu8", "--forbid", r"v_wmma_.*16x16x64|v_swmmac|swmmac", generated], env=gpu_compile_env(ctx.repo))
+    requested_config = gpu_variant_config(ctx.gpu_int8_gemm_variant)
+    forbid = r"v_wmma_.*16x16x64|v_swmmac|swmmac"
+    if requested_config.lds_stages == 0:
+        forbid = rf"{forbid}|\bs_barrier\b|\bds_(?:read|load|store|write)_|uses_flat_scratch\s+1"
+    ok, log = run_logged(ctx, result, "disassemble", [ctx.disassemble, "gpu", "--gpu-arch", ctx.gpu_arch, "--int8-gemm-variant", ctx.gpu_int8_gemm_variant, "--int8-gemm-group-size", ctx.gpu_int8_gemm_group_size, "--output-dir", result.artifacts_dir, "--prefix", "gpu_int8_gemm", "--expect", "v_wmma_i32_16x16x16_iu8", "--forbid", forbid, generated], env=gpu_compile_env(ctx.repo))
     if not ok:
         result.status, result.evidence = "WARN", f"GPU lowering/disassembly failed or required marker was absent; see {log}"
         return result
@@ -701,7 +817,17 @@ def gpu_backend(ctx: RunContext) -> BackendResult:
     dynamic_waitcnt_estimate = gpu_dynamic_waitcnt_estimate(waitcnt, wmma, config)
     wmma_per_barrier = fmt_ratio(dynamic_wmma_per_wave, dynamic_barriers)
     wmma_per_waitcnt = fmt_ratio(dynamic_wmma_per_wave, dynamic_waitcnt_estimate)
-    result.status = "PASS" if wmma and scratch == 0 and spills == 0 else "FAIL"
+    no_lds_direct_ok = True
+    if config.lds_stages == 0:
+        no_lds_direct_ok = (
+            lds_bytes_per_workgroup == 0
+            and barriers == 0
+            and global_load_lds == 0
+            and ds_store_b128 == 0
+            and ds_store_b8 == 0
+            and ds_load_b128 == 0
+        )
+    result.status = "PASS" if wmma and scratch == 0 and spills == 0 and no_lds_direct_ok else "FAIL"
     if ctx.run_enabled and "failed" in result.runtime and result.status == "PASS":
         result.status = "WARN"
     result.evidence = (
@@ -735,6 +861,17 @@ def evidence_map(result: BackendResult) -> dict[str, str]:
     return dict(re.findall(r"([A-Za-z0-9_.-]+)=([^,\s]+)", result.evidence))
 
 
+def gpu_sweep_group_sizes_for_variant(
+    ctx: RunContext, variant: str, group_sizes: Sequence[int]
+) -> Sequence[int]:
+    config = gpu_variant_config(variant)
+    if not config.grouped_blocks:
+        return (ctx.gpu_int8_gemm_group_size,)
+    if config.pipeline in {"air_tuned_direct", "rocmlir_like_pipe3"}:
+        return (config.default_group_m,)
+    return group_sizes
+
+
 def gpu_sweep_candidates(
     ctx: RunContext,
     sweep_profile: str,
@@ -749,14 +886,20 @@ def gpu_sweep_candidates(
         return list(GPU_INT8_GEMM_GFX1150_KSHAPE_CANDIDATES)
     if sweep_profile == "gfx1150-breg":
         return list(GPU_INT8_GEMM_GFX1150_BREG_CANDIDATES)
+    if sweep_profile == "gfx1150-tensile-like":
+        return list(GPU_INT8_GEMM_GFX1150_TENSILE_LIKE_CANDIDATES)
+    if sweep_profile == "gfx1150-short-live":
+        return list(GPU_INT8_GEMM_GFX1150_SHORT_LIVE_CANDIDATES)
+    if sweep_profile == "gfx1150-air-tuned-direct":
+        return list(GPU_INT8_GEMM_GFX1150_AIR_TUNED_DIRECT_CANDIDATES)
+    if sweep_profile == "gfx1150-rocmlir-like":
+        return list(GPU_INT8_GEMM_GFX1150_ROCMLIR_LIKE_CANDIDATES)
     if sweep_profile == "default-decision":
         return list(GPU_INT8_GEMM_DEFAULT_DECISION_CANDIDATES)
     return [
         (variant, group_size)
         for variant in variants
-        for group_size in (
-            group_sizes if variant == GPU_INT8_GEMM_GROUPED_SWIZZLE_VARIANT else (ctx.gpu_int8_gemm_group_size,)
-        )
+        for group_size in gpu_sweep_group_sizes_for_variant(ctx, variant, group_sizes)
     ]
 
 
@@ -973,7 +1116,7 @@ def run_gpu_variant_sweep(
     results: list[BackendResult] = []
     candidates = gpu_sweep_candidates(ctx, sweep_profile, variants, group_sizes)
     for variant, group_size in candidates:
-        prefix = sanitize_prefix(f"{variant}_g{group_size}" if variant == GPU_INT8_GEMM_GROUPED_SWIZZLE_VARIANT else variant)
+        prefix = sanitize_prefix(f"{variant}_g{group_size}" if gpu_variant_config(variant).grouped_blocks else variant)
         variant_ctx = RunContext(
             ctx.repo,
             ctx.out_dir / "gpu_sweep" / prefix,
@@ -1089,6 +1232,603 @@ def run_gpu_variant_sweep(
     best.perf_notes = f"best_variant={best_label}; sweep_profile={sweep_profile}; sweep_candidates={len(rows)}; {best.perf_notes}"
     return best
 
+
+def prepend_env_path(env: dict[str, str], key: str, path: Path) -> None:
+    existing = env.get(key, "")
+    entries = [str(path)]
+    if existing:
+        entries.append(existing)
+    env[key] = os.pathsep.join(entries)
+
+
+def rocm_root() -> Path:
+    return Path(os.environ.get("ROCM_PATH", "/opt/rocm"))
+
+
+def hipcc_path(rocm: Path) -> str | None:
+    if os.environ.get("HIPCC"):
+        return os.environ["HIPCC"]
+    candidate = rocm / "bin" / "hipcc"
+    if candidate.exists():
+        return str(candidate)
+    return shutil.which("hipcc")
+
+
+def rocm_tool(rocm: Path, name: str) -> str | None:
+    for candidate in (rocm / "bin" / name, rocm / "lib" / "llvm" / "bin" / name):
+        if candidate.exists():
+            return str(candidate)
+    return shutil.which(name)
+
+
+def gpu_provider_env(rocm: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    lib = rocm / "lib"
+    if lib.exists():
+        prepend_env_path(env, "LD_LIBRARY_PATH", lib)
+    return env
+
+
+def provider_summary_line(log: Path, provider: str) -> dict[str, str]:
+    for line in reversed(read_text(log).splitlines()):
+        if f"provider={provider}" in line and "status=" in line:
+            return dict(re.findall(r"([A-Za-z0-9_.-]+)=([^\s]+)", line))
+    return {}
+
+
+def provider_symbol_body(isa: str, symbol: str) -> str:
+    lines = isa.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if symbol in line and re.search(r"^[0-9a-fA-F]+\s+<.*>:", line.strip()):
+            start = index
+            break
+    if start is None:
+        return ""
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        if re.search(r"^[0-9a-fA-F]+\s+<.*>:", lines[index].strip()):
+            end = index
+            break
+    return "\n".join(lines[start:end])
+
+
+def provider_static_counters(provider: str, disassembly: dict[str, str]) -> dict[str, str]:
+    if provider == "hip_wmma":
+        body = provider_symbol_body(disassembly.get("isa", ""), "hipWmmaKernel")
+    elif provider == "rocwmma":
+        body = provider_symbol_body(disassembly.get("isa", ""), "rocwmmaKernel")
+    elif provider == "air_tuned":
+        body = provider_symbol_body(disassembly.get("isa", ""), "airTuned128x128Kernel")
+    else:
+        body = ""
+    if not body:
+        return {}
+    return {
+        "wmma": str(count_regex(body, r"\bv_wmma_i32_16x16x16_iu8\b")),
+        "global_load_b128": str(count_regex(body, r"\bglobal_load_b128\b")),
+        "global_load_u8": str(count_regex(body, r"\bglobal_load(?:_d16(?:_hi)?)?_u8\b")),
+        "ds_read_b128": str(count_regex(body, r"\bds_(?:read|load)_b128\b")),
+        "ds_swizzle": str(count_regex(body, r"\bds_swizzle_b32\b")),
+        "global_store_b32": str(count_regex(body, r"\bglobal_store_b32\b")),
+        "scratch_markers": str(count_regex(body, r"scratch")),
+        "spills": "0" if "scratch" not in body else "unknown",
+    }
+
+
+def generic_gpu_static_counters(isa_text: str, metadata_text: str = "") -> dict[str, str]:
+    scratch_markers = count_regex(isa_text, r"\bscratch\b") + count_regex(metadata_text, r"uses_flat_scratch:\s*1|uses_flat_scratch\s+1")
+    spill_markers = count_regex(metadata_text, r"spill_count:\s*[1-9]|_spill_count:\s*[1-9]|spill_count = [1-9]")
+    return {
+        "wmma": str(count_regex(isa_text, r"\bv_wmma_i32_16x16x16_iu8\b")),
+        "global_load_b128": str(count_regex(isa_text, r"\b(?:global|buffer)_load_b128\b")),
+        "global_load_u8": str(count_regex(isa_text, r"\b(?:global|buffer)_load(?:_d16(?:_hi)?)?_u8\b")),
+        "ds_read_b128": str(count_regex(isa_text, r"\bds_(?:read|load)_b128\b")),
+        "ds_swizzle": str(count_regex(isa_text, r"\bds_swizzle_b32\b")),
+        "global_store_b32": str(count_regex(isa_text, r"\b(?:global|buffer)_store_b32\b")),
+        "scratch_markers": str(scratch_markers),
+        "spills": str(spill_markers),
+    }
+
+
+def first_existing(paths: Sequence[Path]) -> Path | None:
+    for path in paths:
+        if path.exists():
+            return path
+    return None
+
+
+def first_glob(root: Path, patterns: Sequence[str]) -> Path | None:
+    for pattern in patterns:
+        matches = sorted(root.glob(pattern))
+        if matches:
+            return matches[0]
+    return None
+
+
+def rocmlir_tool(bin_dir: Path | None, name: str) -> str | None:
+    if bin_dir:
+        candidate = bin_dir / name
+        if candidate.exists():
+            return str(candidate)
+    return shutil.which(name)
+
+
+def rocmlir_reference_paths(artifacts_dir: Path | None, provider_artifacts_dir: Path) -> dict[str, Path | None]:
+    roots = [path for path in (artifacts_dir, provider_artifacts_dir) if path and path.exists() and any(path.iterdir())]
+    result: dict[str, Path | None] = {"root": artifacts_dir if artifacts_dir and artifacts_dir.exists() and any(artifacts_dir.iterdir()) else None}
+    if not roots:
+        return result
+    search_root = roots[0]
+    result["root"] = search_root
+    result["isa"] = first_existing(
+        [
+            search_root / "rocmlir_reference.isa.s",
+            search_root / "rocmlir.isa.s",
+            search_root / "kernel.isa.s",
+        ]
+    ) or first_glob(search_root, ("*.isa.s", "*.s"))
+    result["hsaco"] = first_existing(
+        [
+            search_root / "rocmlir_reference.hsaco",
+            search_root / "rocmlir.hsaco",
+            search_root / "kernel.hsaco",
+        ]
+    ) or first_glob(search_root, ("*.hsaco", "*.co"))
+    result["readobj"] = first_existing(
+        [
+            search_root / "rocmlir_reference.readobj.txt",
+            search_root / "rocmlir.readobj.txt",
+            search_root / "kernel.readobj.txt",
+        ]
+    ) or first_glob(search_root, ("*.readobj.txt", "*readobj*.txt", "*metadata*.txt"))
+    result["mlir"] = first_existing(
+        [
+            search_root / "rocmlir_reference.mlir",
+            search_root / "rocmlir.mlir",
+            search_root / "kernel.mlir",
+        ]
+    ) or first_glob(search_root, ("*.mlir",))
+    result["profile"] = first_glob(search_root, ("*kernel_stats.csv", "*profile*.csv", "*rocprof*.csv"))
+    return result
+
+
+def materialize_rocmlir_reference_artifacts(
+    ctx: RunContext,
+    result: BackendResult,
+    paths: dict[str, Path | None],
+    rocm: Path,
+    target_chip: str,
+) -> tuple[Path | None, Path | None, list[str]]:
+    notes: list[str] = []
+    isa_path = paths.get("isa")
+    readobj_path = paths.get("readobj")
+    hsaco = paths.get("hsaco")
+    if not hsaco or not hsaco.exists():
+        return isa_path, readobj_path, notes
+    if not isa_path or not isa_path.exists():
+        llvm_objdump = rocm_tool(rocm, "llvm-objdump")
+        if llvm_objdump:
+            isa_path = result.artifacts_dir / "rocmlir_reference.isa.s"
+            ok, _ = run_capture(isa_path, [llvm_objdump, "-d", f"--mcpu={target_chip}", hsaco], env=gpu_provider_env(rocm))
+            if ok:
+                notes.append(f"disassembled_hsaco={hsaco}")
+            else:
+                notes.append(f"rocMLIR HSACO disassembly failed for {hsaco}")
+        else:
+            notes.append("llvm-objdump unavailable; rocMLIR HSACO was not disassembled")
+    if not readobj_path or not readobj_path.exists():
+        llvm_readobj = rocm_tool(rocm, "llvm-readobj")
+        if llvm_readobj:
+            readobj_path = result.artifacts_dir / "rocmlir_reference.readobj.txt"
+            ok, _ = run_capture(readobj_path, [llvm_readobj, "--file-headers", "--notes", "--sections", "--symbols", hsaco], env=gpu_provider_env(rocm))
+            if ok:
+                notes.append(f"readobj_hsaco={hsaco}")
+            else:
+                notes.append(f"rocMLIR HSACO readobj failed for {hsaco}")
+        else:
+            notes.append("llvm-readobj unavailable; rocMLIR metadata was not extracted")
+    return isa_path, readobj_path, notes
+
+
+def rocmlir_reference_row(
+    ctx: RunContext,
+    bin_dir: Path | None,
+    artifacts_dir: Path | None,
+    target_chip: str,
+) -> dict[str, str]:
+    result = backend_result(ctx, "gpu_rocmlir_reference", True)
+    rocm = rocm_root()
+    gen = rocmlir_tool(bin_dir, "rocmlir-gen")
+    driver = rocmlir_tool(bin_dir, "rocmlir-driver")
+    paths = rocmlir_reference_paths(artifacts_dir, result.artifacts_dir)
+    root = paths.get("root")
+    if not root:
+        notes = "rocMLIR artifacts not found; pass --rocmlir-artifacts-dir with ISA, HSACO, readobj, or MLIR artifacts"
+        if bin_dir:
+            tool_state = f"rocmlir-gen={'yes' if gen else 'no'}, rocmlir-driver={'yes' if driver else 'no'}"
+            notes = f"{notes}; --rocmlir-bin-dir={bin_dir}; {tool_state}; generation is intentionally not used as a provider path"
+        return provider_empty_row(GPU_ROCMLIR_REFERENCE_PROVIDER, GPU_ROCMLIR_REFERENCE_SOURCE, "SKIP", "no", notes)
+    isa_path, readobj_path, notes = materialize_rocmlir_reference_artifacts(ctx, result, paths, rocm, target_chip)
+    row = provider_empty_row(GPU_ROCMLIR_REFERENCE_PROVIDER, GPU_ROCMLIR_REFERENCE_SOURCE, "PASS", "yes", "")
+    row["validation"] = "n/a"
+    row["artifacts"] = str(root)
+    if isa_path:
+        row["disassemble_log"] = str(isa_path)
+    if readobj_path:
+        row["profile_log"] = str(readobj_path)
+    if paths.get("profile"):
+        row["profile_log"] = ";".join(item for item in (row.get("profile_log", ""), str(paths["profile"])) if item)
+    if paths.get("mlir"):
+        notes.append(f"mlir={paths['mlir']}")
+    if paths.get("hsaco"):
+        notes.append(f"hsaco={paths['hsaco']}")
+    if bin_dir:
+        notes.append(f"rocmlir_bin_dir={bin_dir}")
+    notes.append(f"target_chip={target_chip}")
+    isa_text = read_text(isa_path) if isa_path else ""
+    readobj_text = read_text(readobj_path) if readobj_path else ""
+    if isa_text:
+        row.update(generic_gpu_static_counters(isa_text, readobj_text))
+        if row.get("wmma") in {"", "0"}:
+            row["status"] = "WARN"
+            notes.append("rocMLIR ISA did not contain v_wmma_i32_16x16x16_iu8")
+    else:
+        row["status"] = "WARN"
+        notes.append("rocMLIR ISA not found; row contains metadata/artifact paths only")
+    row["notes"] = "; ".join(notes)
+    provider_target_fields(row)
+    return row
+
+
+def write_gpu_rocmlir_reference_report(ctx: RunContext, row: dict[str, str]) -> tuple[Path, Path]:
+    csv_path = ctx.out_dir / "gpu_rocmlir_reference.csv"
+    md_path = ctx.out_dir / "gpu_rocmlir_reference.md"
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(GPU_PROVIDER_BASELINE_FIELDNAMES))
+        writer.writeheader()
+        writer.writerow(row)
+    with md_path.open("w", encoding="utf-8") as f:
+        f.write("# GPU INT8 GEMM rocMLIR Reference\n\n")
+        f.write("This row is static compiler-reference evidence. It is not a runtime provider and it is not an MLIR-AIR fallback path.\n\n")
+        f.write("| Provider | Source | Status | Available | WMMA | b128 Loads | LDS Reads | Scratch | Artifacts | Notes |\n")
+        f.write("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+        f.write(
+            f"| `{row['provider']}` | {row['source']} | {row['status']} | {row['available']} | "
+            f"{row['wmma'] or 'n/a'} | {row['global_load_b128'] or 'n/a'} | {row['ds_read_b128'] or 'n/a'} | "
+            f"{row['scratch_markers'] or 'n/a'} | `{row['artifacts'] or 'n/a'}` | {row['notes'] or 'n/a'} |\n"
+        )
+        f.write(f"\nCSV: `{csv_path}`\n")
+    return csv_path, md_path
+
+
+def provider_metric(row: dict[str, str], key: str) -> float | None:
+    return parse_float(row.get(key, ""))
+
+
+def provider_target_fields(row: dict[str, str]) -> None:
+    median_tops = provider_metric(row, "median_tops")
+    median_ms = provider_metric(row, "median_mean_ms")
+    row["target_tops_2x"] = f"{GPU_PROVIDER_2X_TARGET_TOPS:.6f}"
+    row["ideal_bytes"] = str(GEMM_INT8_IDEAL_BYTES)
+    row["operational_intensity_ops_per_byte"] = f"{GEMM_INT8_OPS / GEMM_INT8_IDEAL_BYTES:.6f}"
+    if median_tops is None:
+        row["target_pct_2x"] = ""
+        row["meets_2x"] = "no"
+        row["ideal_bandwidth_gbs"] = ""
+        return
+    row["target_pct_2x"] = f"{(median_tops / GPU_PROVIDER_2X_TARGET_TOPS) * 100.0:.3f}"
+    row["meets_2x"] = "yes" if median_tops >= GPU_PROVIDER_2X_TARGET_TOPS else "no"
+    if median_ms is not None and median_ms > 0.0:
+        row["ideal_bandwidth_gbs"] = f"{GEMM_INT8_IDEAL_BYTES / (median_ms * 1.0e-3) / 1.0e9:.6f}"
+    else:
+        row["ideal_bandwidth_gbs"] = ""
+
+
+def provider_empty_row(provider: str, source: str, status: str, available: str, notes: str) -> dict[str, str]:
+    row = {key: "" for key in GPU_PROVIDER_BASELINE_FIELDNAMES}
+    row.update({"provider": provider, "source": source, "status": status, "available": available, "notes": notes})
+    provider_target_fields(row)
+    return row
+
+
+def gpu_result_validation(result: BackendResult) -> str:
+    for log in result.logs.values():
+        text = read_text(log)
+        if "INT8 Output Mismatches" in text or "mismatch" in text.lower():
+            return "FAIL"
+        if "INT8 Output Matched" in text:
+            return "PASS"
+    return "" if result.perf_tops is None else "PASS"
+
+
+def gpu_result_to_provider_row(result: BackendResult) -> dict[str, str]:
+    evidence = evidence_map(result)
+    variant = evidence.get("variant", DEFAULT_GPU_INT8_GEMM_VARIANT)
+    group = evidence.get("group_m", str(DEFAULT_GPU_INT8_GEMM_GROUP_SIZE))
+    row = provider_empty_row(f"mlir_air:{variant}:g{group}", "mlir-air", result.status, "yes", result.perf_notes)
+    row["validation"] = gpu_result_validation(result)
+    row["run_log"] = ";".join(str(path) for stem, path in sorted(result.logs.items()) if stem.startswith("run"))
+    row["disassemble_log"] = str(result.logs.get("disassemble", ""))
+    row["artifacts"] = str(result.artifacts_dir)
+    if result.perf_tops is not None:
+        row["median_tops"] = f"{result.perf_tops:.6f}"
+    median_ms = re.search(r"median mean ([0-9.]+) ms", result.perf_latency)
+    if median_ms:
+        row["median_mean_ms"] = median_ms.group(1)
+    reps = re.match(r"([0-9]+)x", result.perf_count)
+    if reps:
+        row["repetitions"] = reps.group(1)
+    for key in (*GPU_STATIC_COUNTER_KEYS, *GPU_DYNAMIC_COUNTER_KEYS):
+        if key in evidence and key in row:
+            row[key] = evidence[key]
+    provider_target_fields(row)
+    return row
+
+
+def build_gpu_provider_binary(ctx: RunContext, result: BackendResult, rocm: Path) -> tuple[bool, Path, Path | None]:
+    source = ctx.repo / "benchmarks" / "gemm_int8" / "providers" / "hip_int8_gemm_baseline.cpp"
+    binary = result.build_dir / GPU_PROVIDER_EXECUTABLE
+    hipcc = hipcc_path(rocm)
+    log = log_path(ctx, result, "provider_build")
+    if not hipcc:
+        write_text(log, "ERROR: hipcc not found\n")
+        return False, log, None
+    argv = [
+        hipcc,
+        f"--rocm-path={rocm}",
+        "-O3",
+        f"--offload-arch={ctx.gpu_arch}",
+        "-std=c++17",
+        "-isystem",
+        rocm / "include",
+        source,
+        "-L",
+        rocm / "lib",
+        f"-Wl,-rpath,{rocm / 'lib'}",
+        "-lrocblas",
+        "-o",
+        binary,
+    ]
+    ok, log = run_capture(log, argv, env=gpu_provider_env(rocm))
+    return ok and binary.exists(), log, binary if binary.exists() else None
+
+
+def collect_gpu_provider_disassembly(ctx: RunContext, result: BackendResult, binary: Path, rocm: Path) -> dict[str, str]:
+    roc_obj_ls = rocm_tool(rocm, "roc-obj-ls")
+    roc_obj_extract = rocm_tool(rocm, "roc-obj-extract")
+    llvm_objdump = rocm_tool(rocm, "llvm-objdump")
+    llvm_readobj = rocm_tool(rocm, "llvm-readobj")
+    if not roc_obj_ls or not roc_obj_extract or not llvm_objdump:
+        return {"notes": "ROCm code-object extraction tools unavailable"}
+    list_log = log_path(ctx, result, "provider_code_objects")
+    ok, _ = run_capture(list_log, [roc_obj_ls, binary], env=gpu_provider_env(rocm))
+    if not ok:
+        return {"list_log": str(list_log), "notes": "roc-obj-ls failed"}
+    uris = []
+    for line in read_text(list_log).splitlines():
+        if "hipv4" in line and f"--{ctx.gpu_arch}" in line:
+            uris.append(line.split()[-1])
+    extract_dir = result.artifacts_dir / "code_objects"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    for index, uri in enumerate(uris):
+        run_logged(ctx, result, f"provider_extract_{index}", [roc_obj_extract, "-o", extract_dir, uri], env=gpu_provider_env(rocm))
+    isa_parts: list[str] = []
+    disasm_paths: list[str] = []
+    readobj_paths: list[str] = []
+    for index, code_object in enumerate(sorted(extract_dir.glob("*.co"))):
+        disasm = result.artifacts_dir / f"provider_{index}.isa.s"
+        ok, _ = run_capture(disasm, [llvm_objdump, "-d", f"--mcpu={ctx.gpu_arch}", code_object], env=gpu_provider_env(rocm))
+        if ok:
+            isa_parts.append(read_text(disasm))
+            disasm_paths.append(str(disasm))
+        if llvm_readobj:
+            readobj = result.artifacts_dir / f"provider_{index}.readobj.txt"
+            ok, _ = run_capture(readobj, [llvm_readobj, "--file-headers", "--notes", "--sections", "--symbols", code_object], env=gpu_provider_env(rocm))
+            if ok:
+                readobj_paths.append(str(readobj))
+    return {"isa": "\n".join(isa_parts), "disassemble_log": ";".join(disasm_paths), "readobj_log": ";".join(readobj_paths), "list_log": str(list_log)}
+
+
+def run_gpu_provider_profile(ctx: RunContext, result: BackendResult, binary: Path, provider: str, rocm: Path, validation_samples: int) -> str:
+    rocprof = rocm_tool(rocm, "rocprofv3")
+    if not rocprof:
+        return ""
+    profile_dir = result.artifacts_dir / "profiles" / provider
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    log = log_path(ctx, result, f"provider_profile_{sanitize_prefix(provider)}")
+    argv = [
+        rocprof,
+        "--kernel-trace",
+        "--stats",
+        "--summary",
+        "--output-format",
+        "csv",
+        "--output-directory",
+        profile_dir,
+        "--output-file",
+        provider,
+        "--",
+        binary,
+        "--provider",
+        provider,
+        "--warmups",
+        ctx.warmups,
+        "--iterations",
+        ctx.iterations,
+        "--repetitions",
+        1,
+        "--validation-samples",
+        validation_samples,
+    ]
+    run_capture(log, argv, env=gpu_provider_env(rocm))
+    return str(log)
+
+
+def run_gpu_provider_binary(ctx: RunContext, result: BackendResult, binary: Path, provider: str, rocm: Path, repetitions: int, validation_samples: int, profile: bool, disassembly: dict[str, str], build_log: Path) -> dict[str, str]:
+    log = log_path(ctx, result, f"provider_run_{sanitize_prefix(provider)}")
+    argv = [
+        binary,
+        "--provider",
+        provider,
+        "--warmups",
+        ctx.warmups,
+        "--iterations",
+        ctx.iterations,
+        "--repetitions",
+        repetitions,
+        "--validation-samples",
+        validation_samples,
+    ]
+    ok, _ = run_capture(log, argv, env=gpu_provider_env(rocm))
+    summary = provider_summary_line(log, provider)
+    if not summary:
+        row = provider_empty_row(provider, "external", "WARN" if ok else "FAIL", "yes", f"summary line missing; see {log}")
+    else:
+        source = "air-owned" if provider == "air_tuned" else "external"
+        row = provider_empty_row(provider, source, summary.get("status", "PASS" if ok else "FAIL"), "yes", "")
+        for key in (
+            "validation",
+            "mismatches",
+            "repetitions",
+            "median_mean_ms",
+            "min_mean_ms",
+            "mean_mean_ms",
+            "stddev_mean_ms",
+            "cv_mean_ms_pct",
+            "best_kernel_min_ms",
+            "median_tops",
+            "mean_tops",
+            "stddev_tops",
+            "cv_tops_pct",
+            "max_tops",
+        ):
+            row[key] = summary.get(key, "")
+    row["build_log"] = str(build_log)
+    row["run_log"] = str(log)
+    row["artifacts"] = str(result.artifacts_dir)
+    row["disassemble_log"] = disassembly.get("disassemble_log", "")
+    row.update(provider_static_counters(provider, disassembly))
+    if provider == "rocblas_tensile":
+        row["notes"] = "rocBLAS GEMM_EX uses installed Tensile libraries; harness binary does not contain the library kernel ISA"
+    elif provider == "air_tuned":
+        row["notes"] = "AIR-owned fixed-contract raw WMMA kernel: 128x128 macro tile, 64x64 wave tile, four waves, grouped-M launch, host-packed B"
+    elif not row.get("notes"):
+        row["notes"] = disassembly.get("notes", "")
+    if profile and row["status"] == "PASS":
+        row["profile_log"] = run_gpu_provider_profile(ctx, result, binary, provider, rocm, validation_samples)
+    provider_target_fields(row)
+    return row
+
+
+def write_gpu_provider_baseline_report(ctx: RunContext, rows: Sequence[dict[str, str]], repetitions: int) -> tuple[Path, Path]:
+    csv_path = ctx.out_dir / "gpu_provider_baselines.csv"
+    md_path = ctx.out_dir / "gpu_provider_baselines.md"
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(GPU_PROVIDER_BASELINE_FIELDNAMES))
+        writer.writeheader()
+        writer.writerows(rows)
+    ranked = sorted(
+        [row for row in rows if row.get("status") == "PASS" and row.get("validation") in {"", "PASS"} and provider_metric(row, "median_tops") is not None],
+        key=lambda row: -(provider_metric(row, "median_tops") or 0.0),
+    )
+    top = ranked[0] if ranked else None
+    runner_up = ranked[1] if len(ranked) > 1 else None
+    gap_pct = median_tops_gap_pct(top, runner_up) if top and runner_up else None
+    cv_ceiling = max(provider_metric(top, "cv_tops_pct") or 0.0, provider_metric(runner_up, "cv_tops_pct") or 0.0) if top and runner_up else 0.0
+    reaches_2x = bool(top and (provider_metric(top, "median_tops") or 0.0) >= GPU_PROVIDER_2X_TARGET_TOPS)
+    stable_gap = bool(gap_pct is not None and gap_pct >= 3.0 and gap_pct >= cv_ceiling)
+    air_ranked = [row for row in ranked if row.get("source") == "air-owned"]
+    best_air = air_ranked[0] if air_ranked else None
+    rocblas = next((row for row in rows if row.get("provider") == "rocblas_tensile" and provider_metric(row, "median_tops") is not None), None)
+    air_vs_rocblas_pct = None
+    if best_air and rocblas and provider_metric(rocblas, "median_tops"):
+        air_vs_rocblas_pct = ((provider_metric(best_air, "median_tops") or 0.0) / (provider_metric(rocblas, "median_tops") or 1.0)) * 100.0
+    air_reaches_2x = bool(best_air and (provider_metric(best_air, "median_tops") or 0.0) >= GPU_PROVIDER_2X_TARGET_TOPS)
+    air_reaches_rocblas_parity = bool(air_vs_rocblas_pct is not None and air_vs_rocblas_pct >= GPU_PROVIDER_ROCBLAS_PARITY_PCT)
+    if best_air and top and top.get("provider") == best_air.get("provider") and air_reaches_2x and air_reaches_rocblas_parity and stable_gap:
+        recommendation = "AIR_TUNED_PROVIDER_CANDIDATE"
+    elif air_reaches_2x and not air_reaches_rocblas_parity:
+        recommendation = "AIR_TUNED_2X_BUT_ROCBLAS_STILL_LEADS"
+    elif reaches_2x and stable_gap:
+        recommendation = "EXTERNAL_PROVIDER_CANDIDATE"
+    else:
+        recommendation = "NO_STABLE_2X_PROVIDER"
+    with md_path.open("w", encoding="utf-8") as f:
+        f.write("# GPU INT8 GEMM Provider Baselines\n\n")
+        f.write(f"Recommendation: `{recommendation}`\n\n")
+        f.write("## Gates\n\n| Field | Value |\n| --- | --- |\n")
+        f.write(f"| Required repetitions | `{repetitions}` |\n")
+        f.write(f"| 2x target TOPS | `{GPU_PROVIDER_2X_TARGET_TOPS:.6f}` |\n")
+        f.write(f"| Top provider | `{top['provider'] if top else 'n/a'}` |\n")
+        f.write(f"| Runner-up | `{runner_up['provider'] if runner_up else 'n/a'}` |\n")
+        f.write(f"| Top-vs-runner-up gap | `{gap_pct:.3f}%` |\n" if gap_pct is not None else "| Top-vs-runner-up gap | `n/a` |\n")
+        f.write(f"| CV ceiling | `{cv_ceiling:.3f}%` |\n")
+        f.write(f"| Stable >=3% gap | `{'yes' if stable_gap else 'no'}` |\n")
+        f.write(f"| Top reaches 2x | `{'yes' if reaches_2x else 'no'}` |\n")
+        f.write(f"| Best AIR-owned provider | `{best_air['provider'] if best_air else 'n/a'}` |\n")
+        f.write(f"| Best AIR-owned reaches 2x | `{'yes' if air_reaches_2x else 'no'}` |\n")
+        f.write(f"| AIR-owned / rocBLAS TOPS | `{air_vs_rocblas_pct:.3f}%` |\n" if air_vs_rocblas_pct is not None else "| AIR-owned / rocBLAS TOPS | `n/a` |\n")
+        f.write(f"| AIR-owned reaches {GPU_PROVIDER_ROCBLAS_PARITY_PCT:.1f}% rocBLAS | `{'yes' if air_reaches_rocblas_parity else 'no'}` |\n")
+        f.write("\n## Results\n\n")
+        f.write("| Provider | Source | Status | Validation | Reps | Median ms | Median TOPS | 2x Target % | WMMA | Scratch | Notes |\n")
+        f.write("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+        for row in rows:
+            f.write(
+                f"| `{row['provider']}` | {row['source']} | {row['status']} | {row['validation'] or 'n/a'} | {row['repetitions'] or '0'} | "
+                f"{row['median_mean_ms'] or 'n/a'} | {row['median_tops'] or 'n/a'} | {row['target_pct_2x'] or 'n/a'} | "
+                f"{row['wmma'] or 'n/a'} | {row['scratch_markers'] or 'n/a'} | {row['notes'] or 'n/a'} |\n"
+            )
+        f.write("\n## Roofline Inputs\n\n")
+        f.write(f"Ideal bytes per GEMM: `{GEMM_INT8_IDEAL_BYTES}`\n\n")
+        f.write(f"Ideal operational intensity: `{GEMM_INT8_OPS / GEMM_INT8_IDEAL_BYTES:.6f}` ops/byte\n\n")
+        f.write("| Provider | Median TOPS | Ideal GB/s At Median | Bottleneck Classification |\n")
+        f.write("| --- | --- | --- | --- |\n")
+        for row in rows:
+            classification = "unclassified"
+            if row.get("provider") == "hip_wmma" and provider_metric(row, "global_load_u8"):
+                classification = "B operand global-gather pressure"
+            elif row.get("provider") == "air_tuned" and row.get("meets_2x") == "yes":
+                classification = "AIR-owned candidate passes 2x throughput gate; compare against rocBLAS before promotion"
+            elif row.get("provider") == "air_tuned":
+                classification = "AIR-owned candidate below 2x throughput gate"
+            elif row.get("meets_2x") == "yes":
+                classification = "passes 2x throughput gate; use profiler counters before promotion"
+            elif provider_metric(row, "median_tops") is not None:
+                classification = "below 2x throughput gate"
+            f.write(f"| `{row['provider']}` | {row['median_tops'] or 'n/a'} | {row['ideal_bandwidth_gbs'] or 'n/a'} | {classification} |\n")
+        f.write(f"\nCSV: `{csv_path}`\n")
+    return csv_path, md_path
+
+
+def run_gpu_provider_baselines(
+    ctx: RunContext,
+    gpu_result: BackendResult,
+    repetitions: int,
+    validation_samples: int,
+    profile: bool,
+    rocmlir_row: dict[str, str] | None = None,
+) -> tuple[Path, Path]:
+    result = backend_result(ctx, "gpu_provider_baselines", True)
+    rocm = rocm_root()
+    rows: list[dict[str, str]] = [gpu_result_to_provider_row(gpu_result)]
+    ok, build_log, binary = build_gpu_provider_binary(ctx, result, rocm)
+    if ok and binary:
+        disassembly = collect_gpu_provider_disassembly(ctx, result, binary, rocm)
+        for provider in ("hip_wmma", "rocwmma", "air_tuned", "rocblas_tensile"):
+            rows.append(run_gpu_provider_binary(ctx, result, binary, provider, rocm, repetitions, validation_samples, profile, disassembly, build_log))
+    else:
+        for provider in ("hip_wmma", "rocwmma", "air_tuned", "rocblas_tensile"):
+            row = provider_empty_row(provider, "external", "WARN", "unknown", f"provider build failed; see {build_log}")
+            row["build_log"] = str(build_log)
+            rows.append(row)
+    if rocmlir_row is not None:
+        rows.append(rocmlir_row)
+    ck_available = (rocm / "include" / "ck_tile").exists() or (rocm / "include" / "ck").exists()
+    ck_notes = "CK/CK-Tile headers found; fixed-contract CK driver is not wired into this harness yet" if ck_available else "CK/CK-Tile headers not found"
+    rows.append(provider_empty_row("ck_tile", "external", "SKIP", "yes" if ck_available else "no", ck_notes))
+    return write_gpu_provider_baseline_report(ctx, rows, repetitions)
+
 def find_npu_elves(build_dir: Path) -> list[Path]:
     return sorted(build_dir.rglob("bare_matmul*_core_*.elf")) or sorted(build_dir.rglob("*.elf"))
 
@@ -1203,7 +1943,7 @@ def write_report(report: Path, ctx: RunContext, args: argparse.Namespace, result
         f.write("# GEMM int8 Benchmark Report\n\n")
         f.write(f"Artifacts: `{ctx.out_dir}`\n\n")
         f.write("## Run Controls\n\n| Field | Value |\n| --- | --- |\n")
-        for key, value in (("Selected backend", args.backend), ("Execute kernels", args.run), ("Strict mode", args.strict), ("GPU sweep variants", args.gpu_sweep_variants), ("GPU sweep profile", args.gpu_sweep_profile), ("GPU sweep repetitions", args.gpu_sweep_repetitions), ("GPU sweep group sizes", ",".join(str(size) for size in args.gpu_sweep_group_sizes)), ("GPU default threshold pct", args.gpu_default_threshold_pct), ("Warmups", args.warmups), ("Iterations", args.iterations), ("CPU threads", args.cpu_threads), ("NPU runtime loop tiling", args.npu_runtime_loop_tiling), ("Build root", ctx.build_root), ("GPU arch", args.gpu_arch), ("GPU int8 GEMM variant", args.gpu_int8_gemm_variant), ("GPU int8 GEMM group size", args.gpu_int8_gemm_group_size), ("Shape", f"M=N=K={M}, int8 x int8 -> int32")):
+        for key, value in (("Selected backend", args.backend), ("Execute kernels", args.run), ("Strict mode", args.strict), ("GPU sweep variants", args.gpu_sweep_variants), ("GPU sweep profile", args.gpu_sweep_profile), ("GPU sweep repetitions", args.gpu_sweep_repetitions), ("GPU sweep group sizes", ",".join(str(size) for size in args.gpu_sweep_group_sizes)), ("GPU default threshold pct", args.gpu_default_threshold_pct), ("GPU provider baselines", args.gpu_provider_baselines), ("GPU provider profile", args.gpu_provider_profile), ("GPU provider validation samples", args.gpu_provider_validation_samples), ("GPU rocMLIR reference", args.gpu_rocmlir_reference), ("rocMLIR bin dir", args.rocmlir_bin_dir or "n/a"), ("rocMLIR artifacts dir", args.rocmlir_artifacts_dir or "n/a"), ("rocMLIR target chip", args.rocmlir_target_chip or args.gpu_arch), ("Warmups", args.warmups), ("Iterations", args.iterations), ("CPU threads", args.cpu_threads), ("NPU runtime loop tiling", args.npu_runtime_loop_tiling), ("Build root", ctx.build_root), ("GPU arch", args.gpu_arch), ("GPU int8 GEMM variant", args.gpu_int8_gemm_variant), ("GPU int8 GEMM group size", args.gpu_int8_gemm_group_size), ("Shape", f"M=N=K={M}, int8 x int8 -> int32")):
             f.write(f"| {key} | `{value}` |\n")
         f.write("\n## ISA Verdicts\n\n| Backend | Status | Evidence | Runtime |\n| --- | --- | --- | --- |\n")
         for name in ("cpu", "gpu", "npu"):
@@ -1214,6 +1954,18 @@ def write_report(report: Path, ctx: RunContext, args: argparse.Namespace, result
             result = results[name]
             target = f"{result.target_tops:.3f}" if result.target_tops is not None else "n/a"
             f.write(f"| {name.upper()} | {result.perf_domain} | {result.perf_count} | {result.perf_latency} | {result.perf_throughput} | {target} | {result.target_pct} | {result.perf_notes} |\n")
+        if args.gpu_provider_baselines:
+            provider_csv = ctx.out_dir / "gpu_provider_baselines.csv"
+            provider_md = ctx.out_dir / "gpu_provider_baselines.md"
+            f.write("\n## GPU Provider Baselines\n\n")
+            f.write(f"- CSV: `{provider_csv}`\n")
+            f.write(f"- Report: `{provider_md}`\n")
+        if args.gpu_rocmlir_reference:
+            rocmlir_csv = ctx.out_dir / "gpu_rocmlir_reference.csv"
+            rocmlir_md = ctx.out_dir / "gpu_rocmlir_reference.md"
+            f.write("\n## GPU rocMLIR Reference\n\n")
+            f.write(f"- CSV: `{rocmlir_csv}`\n")
+            f.write(f"- Report: `{rocmlir_md}`\n")
         f.write("\n## Logs\n\n")
         for name in ("cpu", "gpu", "npu"):
             result = results[name]
@@ -1236,6 +1988,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--gpu-sweep-group-sizes", type=gpu_group_sizes, default=DEFAULT_GPU_INT8_GEMM_SWEEP_GROUP_SIZES, help="comma-separated grouped M sizes for grouped swizzle sweep rows in full profile (default: 2,4,8)")
     parser.add_argument("--gpu-sweep-repetitions", type=positive_int, default=DEFAULT_GPU_INT8_GEMM_SWEEP_REPETITIONS, help="runtime repetitions per GPU sweep candidate (default: 3)")
     parser.add_argument("--gpu-default-threshold-pct", type=nonnegative_float, default=DEFAULT_GPU_INT8_GEMM_DEFAULT_THRESHOLD_PCT, help="minimum top-vs-runner-up median TOPS gap required to recommend promoting the GPU benchmark default (default: 3.0)")
+    parser.add_argument("--gpu-provider-baselines", action="store_true", help="run fixed-shape external GPU provider baselines and write CSV/Markdown evidence")
+    parser.add_argument("--gpu-provider-profile", action="store_true", help="run rocprofv3 kernel trace/stat capture for GPU provider baselines")
+    parser.add_argument("--gpu-provider-validation-samples", type=positive_int, default=DEFAULT_GPU_PROVIDER_VALIDATION_SAMPLES, help="sampled output checks per GPU provider run (default: 256)")
+    parser.add_argument("--gpu-rocmlir-reference", action="store_true", help="ingest optional rocMLIR static reference artifacts for the fixed GPU INT8 GEMM contract")
+    parser.add_argument("--rocmlir-bin-dir", type=Path, default=None, help="optional directory containing rocMLIR tools; used only for tool availability notes")
+    parser.add_argument("--rocmlir-artifacts-dir", type=Path, default=None, help="directory containing rocMLIR reference ISA, HSACO, readobj, MLIR, or profile artifacts")
+    parser.add_argument("--rocmlir-target-chip", default=None, help="AMDGPU chip used to disassemble rocMLIR HSACO artifacts (default: --gpu-arch)")
     parser.add_argument("--cpu-threads", type=positive_int, default=12, help="CPU worker threads passed to the CPU benchmark (default: 12)")
     parser.add_argument("--npu-runtime-loop-tiling", default="2,4", metavar="M,N", help="AIR runtime loop tiling sizes for NPU compile (default: 2,4)")
     parser.add_argument("--warmups", type=nonnegative_int, default=10, help="warmup iterations for every backend (default: 10)")
@@ -1253,6 +2012,16 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         parser.error("--gpu-sweep-variants requires --backend all or --backend gpu")
     if args.gpu_sweep_profile != DEFAULT_GPU_INT8_GEMM_SWEEP_PROFILE and not args.gpu_sweep_variants:
         parser.error("--gpu-sweep-profile requires --gpu-sweep-variants")
+    if args.gpu_provider_baselines and args.backend not in {"all", "gpu"}:
+        parser.error("--gpu-provider-baselines requires --backend all or --backend gpu")
+    if args.gpu_rocmlir_reference and args.backend not in {"all", "gpu"}:
+        parser.error("--gpu-rocmlir-reference requires --backend all or --backend gpu")
+    if (args.rocmlir_bin_dir or args.rocmlir_artifacts_dir or args.rocmlir_target_chip) and not args.gpu_rocmlir_reference:
+        parser.error("--rocmlir-bin-dir, --rocmlir-artifacts-dir, and --rocmlir-target-chip require --gpu-rocmlir-reference")
+    if args.gpu_provider_baselines and not args.run:
+        parser.error("--gpu-provider-baselines requires --run")
+    if args.gpu_provider_profile and not args.gpu_provider_baselines:
+        parser.error("--gpu-provider-profile requires --gpu-provider-baselines")
     return args
 
 
@@ -1263,6 +2032,10 @@ def main(argv: Sequence[str]) -> int:
     for path in (ctx.out_dir, ctx.build_root, ctx.logs_dir):
         path.mkdir(parents=True, exist_ok=True)
     selected = {"gpu"} if args.gpu_sweep_variants else set(selected_backends(args.backend))
+    if args.gpu_provider_baselines:
+        selected.add("gpu")
+    if args.gpu_rocmlir_reference:
+        selected.add("gpu")
     runners = {"cpu": cpu_backend, "gpu": gpu_backend, "npu": npu_backend}
     results = {name: backend_result(ctx, name) for name in ("cpu", "gpu", "npu")}
     if args.gpu_sweep_variants:
@@ -1271,6 +2044,12 @@ def main(argv: Sequence[str]) -> int:
         for name in ("cpu", "gpu", "npu"):
             if name in selected:
                 results[name] = runners[name](ctx)
+    rocmlir_row = None
+    if args.gpu_rocmlir_reference:
+        rocmlir_row = rocmlir_reference_row(ctx, args.rocmlir_bin_dir, args.rocmlir_artifacts_dir, args.rocmlir_target_chip or args.gpu_arch)
+        write_gpu_rocmlir_reference_report(ctx, rocmlir_row)
+    if args.gpu_provider_baselines:
+        run_gpu_provider_baselines(ctx, results["gpu"], args.gpu_sweep_repetitions, args.gpu_provider_validation_samples, args.gpu_provider_profile, rocmlir_row)
     report = out_dir / "gemm_int8_report.md"
     write_report(report, ctx, args, results)
     print(f"Report: {report}")

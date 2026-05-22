@@ -308,20 +308,73 @@ struct ConvertGPUKernelOutlinePass
              << " unsupported variant '" << variant << "'";
 
     bool packedB = config->packedB;
+    bool directGlobalPipeline =
+        config->pipeline == PipelineKind::AirTunedDirect;
     bool loopedPipeline =
-        config->pipeline == PipelineKind::Pipe2LoopedPrefetch;
+        config->pipeline == PipelineKind::Pipe2LoopedPrefetch ||
+        config->pipeline == PipelineKind::TensileLikePipe2;
+    bool shortLivedLoopedPipeline =
+        config->pipeline == PipelineKind::TensileLikePipe2ShortLived;
+    bool rocmlirLikePipe3 =
+        config->pipeline == PipelineKind::RocmlirLikePipe3;
     bool staticPrefetchPipeline =
         config->pipeline == PipelineKind::Pipe2UnrolledPrefetch;
     bool unrolledCopyPipeline =
         config->pipeline == PipelineKind::Pipe2UnrolledCopy;
     bool swizzledLds = config->swizzledLds;
-    bool pipelined = config->ldsStages == 2;
+    bool pipelined = config->ldsStages >= 2;
+    bool tripleBuffered = config->ldsStages >= 3;
+    bool usesLds = !directGlobalPipeline;
     bool groupedBlocks = config->groupedBlocks;
     bool directBFragments = config->directBFromGlobal;
     int64_t blockRows = config->blockRows;
     int64_t blockCols = config->blockCols;
     int64_t kPerBlock = config->kPerBlock;
+    int64_t ldsKStride = kPerBlock + config->ldsKPadding;
     int64_t blockThreads = config->blockThreads;
+    int64_t blockDimX = config->effectiveBlockDimX();
+    int64_t blockDimY = config->effectiveBlockDimY();
+    if (blockDimX * blockDimY != blockThreads)
+      return func.emitOpError(kInt8GemmWmmaAttr)
+             << " workgroup dimensions do not match thread count for variant '"
+             << variant << "'";
+    int64_t waveTileRows = config->waveTileRows;
+    int64_t waveTileCols = config->effectiveWaveTileCols();
+    if (waveTileRows <= 0 || waveTileCols <= 0 ||
+        blockRows % waveTileRows != 0 || blockCols % waveTileCols != 0 ||
+        waveTileRows % 16 != 0 || waveTileCols % 16 != 0)
+      return func.emitOpError(kInt8GemmWmmaAttr)
+             << " invalid wave tile for variant '" << variant << "'";
+    int64_t wavesM = config->wavesM();
+    int64_t wavesN = config->wavesN();
+    if (wavesM * wavesN != config->waveCount())
+      return func.emitOpError(kInt8GemmWmmaAttr)
+             << " wave tile shape does not cover workgroup tile for variant '"
+             << variant << "'";
+    int64_t waveRowTiles = waveTileRows / 16;
+    int64_t waveColTiles = waveTileCols / 16;
+    if (directGlobalPipeline &&
+        (blockRows != 128 || blockCols != 128 || kPerBlock != 32 ||
+         blockThreads != 128 || waveTileRows != 64 || waveTileCols != 64 ||
+         !packedB || !groupedBlocks || !directBFragments || swizzledLds ||
+         config->ldsStages != 0))
+      return func.emitOpError(kInt8GemmWmmaAttr)
+             << " direct global variant only supports the fixed air_tuned "
+                "1024x1024x1024 contract";
+    if (directGlobalPipeline && groupSize != 8)
+      return func.emitOpError(kInt8GemmWmmaAttr)
+             << " direct global variant requires group size 8";
+    if (rocmlirLikePipe3 &&
+        (blockRows != 128 || blockCols != 128 || kPerBlock != 32 ||
+         blockThreads != 128 || waveTileRows != 64 || waveTileCols != 64 ||
+         !packedB || !groupedBlocks || directBFragments || swizzledLds ||
+         config->ldsStages != 3))
+      return func.emitOpError(kInt8GemmWmmaAttr)
+             << " rocMLIR-like variant only supports the fixed "
+                "1024x1024x1024 contract";
+    if (rocmlirLikePipe3 && groupSize != 8)
+      return func.emitOpError(kInt8GemmWmmaAttr)
+             << " rocMLIR-like variant requires group size 8";
     int64_t copyStrideElems = blockThreads * 16;
     int64_t aCopyChunks =
         (blockRows * kPerBlock + copyStrideElems - 1) / copyStrideElems;
@@ -329,7 +382,7 @@ struct ConvertGPUKernelOutlinePass
         directBFragments
             ? 0
             : (blockCols * kPerBlock + copyStrideElems - 1) / copyStrideElems;
-    int64_t numColTiles = blockCols / 16;
+    int64_t accCount = waveRowTiles * waveColTiles;
     int64_t kTiles = 1024 / kPerBlock;
 
     Location loc = func.getLoc();
@@ -339,21 +392,33 @@ struct ConvertGPUKernelOutlinePass
 
     auto i8Type = IntegerType::get(ctx, 8);
     auto i32Type = IntegerType::get(ctx, 32);
-    auto aLdsType = MemRefType::get({blockRows, kPerBlock}, i8Type, {}, 3);
-    auto bLdsType = MemRefType::get({blockCols, kPerBlock}, i8Type, {}, 3);
-    Value aLds = func.addWorkgroupAttribution(aLdsType, loc);
+    auto aLdsType = MemRefType::get({blockRows, ldsKStride}, i8Type, {}, 3);
+    auto bLdsType = MemRefType::get({blockCols, ldsKStride}, i8Type, {}, 3);
+    Value aLds;
     Value bLds;
     Value aLdsNext;
     Value bLdsNext;
-    if (!directBFragments)
-      bLds = func.addWorkgroupAttribution(bLdsType, loc);
-    if (pipelined) {
+    Value aLdsThird;
+    Value bLdsThird;
+    if (usesLds) {
+      aLds = func.addWorkgroupAttribution(aLdsType, loc);
+      if (!directBFragments)
+        bLds = func.addWorkgroupAttribution(bLdsType, loc);
+    }
+    if (usesLds && pipelined) {
       aLdsNext = func.addWorkgroupAttribution(aLdsType, loc);
       if (!directBFragments)
         bLdsNext = func.addWorkgroupAttribution(bLdsType, loc);
     }
+    if (usesLds && tripleBuffered) {
+      aLdsThird = func.addWorkgroupAttribution(aLdsType, loc);
+      if (!directBFragments)
+        bLdsThird = func.addWorkgroupAttribution(bLdsType, loc);
+    }
 
     OpBuilder builder(ctx);
+    if (directGlobalPipeline)
+      func->setAttr("rocdl.waves_per_eu", builder.getI32IntegerAttr(1));
     builder.setInsertionPointToStart(&body);
 
     Value c0 = cidx(builder, loc, 0);
@@ -363,11 +428,17 @@ struct ConvertGPUKernelOutlinePass
     Value cGroupTileCount = cidx(builder, loc, groupSize * (1024 / blockCols));
     Value c16 = cidx(builder, loc, 16);
     Value c32 = cidx(builder, loc, 32);
+    Value cBlockDimX = cidx(builder, loc, blockDimX);
     Value cBlockRows = cidx(builder, loc, blockRows);
     Value cBlockCols = cidx(builder, loc, blockCols);
     Value cKPerBlock = cidx(builder, loc, kPerBlock);
-    Value cSwizzleGroups = cidx(builder, loc, std::min<int64_t>(4, kPerBlock / 16));
+    Value cWaveTileRows = cidx(builder, loc, waveTileRows);
+    Value cWaveTileCols = cidx(builder, loc, waveTileCols);
+    Value cWavesN = cidx(builder, loc, wavesN);
+    Value cSwizzleGroups =
+        cidx(builder, loc, std::min<int64_t>(4, kPerBlock / 16));
     Value c2KPerBlock = cidx(builder, loc, 2 * kPerBlock);
+    Value c3KPerBlock = cidx(builder, loc, 3 * kPerBlock);
     Value cPipeLoopUpper = cidx(builder, loc, 1024 - 2 * kPerBlock);
     Value cPenultimateK = cidx(builder, loc, 1024 - 2 * kPerBlock);
     Value cLastK = cidx(builder, loc, 1024 - kPerBlock);
@@ -379,6 +450,8 @@ struct ConvertGPUKernelOutlinePass
         builder, loc, builder.getIndexType(), gpu::Dimension::y);
     Value tx = gpu::ThreadIdOp::create(builder, loc, builder.getIndexType(),
                                        gpu::Dimension::x);
+    Value ty = gpu::ThreadIdOp::create(builder, loc, builder.getIndexType(),
+                                       gpu::Dimension::y);
 
     Value blockX = physicalBlockX;
     Value blockY = physicalBlockY;
@@ -397,17 +470,40 @@ struct ConvertGPUKernelOutlinePass
       blockX = arith::DivSIOp::create(builder, loc, pidInGroup, cGroupM);
     }
 
-    Value wave = arith::DivSIOp::create(builder, loc, tx, c32);
-    Value lane = arith::RemSIOp::create(builder, loc, tx, c32);
+    Value linearThread = tx;
+    if (blockDimY != 1) {
+      Value yOffset = arith::MulIOp::create(builder, loc, ty, cBlockDimX);
+      linearThread = arith::AddIOp::create(builder, loc, tx, yOffset);
+    }
+    Value wave = blockDimX == 32
+                     ? ty
+                     : arith::DivSIOp::create(builder, loc, linearThread, c32)
+                           .getResult();
+    Value lane = blockDimX == 32
+                     ? tx
+                     : arith::RemSIOp::create(builder, loc, linearThread, c32)
+                           .getResult();
     Value lane16 = arith::RemSIOp::create(builder, loc, lane, c16);
     Value laneHalf = arith::DivSIOp::create(builder, loc, lane, c16);
     Value blockRowBase = arith::MulIOp::create(builder, loc, blockY, cBlockRows);
     Value blockColBase =
         arith::MulIOp::create(builder, loc, blockX, cBlockCols);
-    Value waveRowBase = arith::MulIOp::create(builder, loc, wave, c16);
+    Value waveM = wavesN == 1
+                      ? wave
+                      : arith::DivSIOp::create(builder, loc, wave, cWavesN)
+                            .getResult();
+    Value waveN = wavesN == 1
+                      ? c0
+                      : arith::RemSIOp::create(builder, loc, wave, cWavesN)
+                            .getResult();
+    Value waveRowBase =
+        arith::MulIOp::create(builder, loc, waveM, cWaveTileRows);
+    Value waveColBase =
+        arith::MulIOp::create(builder, loc, waveN, cWaveTileCols);
     Value tileRow = arith::AddIOp::create(builder, loc, blockRowBase,
                                           waveRowBase);
-    Value tileCol = blockColBase;
+    Value tileCol = arith::AddIOp::create(builder, loc, blockColBase,
+                                          waveColBase);
 
     auto vec8i32 = VectorType::get({8}, i32Type);
     Value initAcc = arith::ConstantOp::create(builder, loc,
@@ -415,7 +511,7 @@ struct ConvertGPUKernelOutlinePass
     auto vec16i8 = VectorType::get({16}, i8Type);
     Value zeroVec16i8 = arith::ConstantOp::create(
         builder, loc, builder.getZeroAttr(vec16i8));
-    Value copyIdx16 = arith::MulIOp::create(builder, loc, tx, c16);
+    Value copyIdx16 = arith::MulIOp::create(builder, loc, linearThread, c16);
 
     auto inLinearBounds = [&](Value linearIndex, int64_t elementCount) {
       return arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::ult,
@@ -474,6 +570,23 @@ struct ConvertGPUKernelOutlinePass
       } else {
         builder.setInsertionPointToStart(ifOp.thenBlock());
         createStore();
+        scf::YieldOp::create(builder, loc);
+      }
+    };
+
+    auto ifIndexLessThan = [&](Value value, Value upper, auto createBody) {
+      auto ifOp = scf::IfOp::create(
+          builder, loc, TypeRange{},
+          arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::ult,
+                                value, upper),
+          /*withElse=*/false);
+      OpBuilder::InsertionGuard guard(builder);
+      if (Operation *yield = existingTerminator(ifOp.thenBlock())) {
+        builder.setInsertionPoint(yield);
+        createBody();
+      } else {
+        builder.setInsertionPointToStart(ifOp.thenBlock());
+        createBody();
         scf::YieldOp::create(builder, loc);
       }
     };
@@ -634,13 +747,23 @@ struct ConvertGPUKernelOutlinePass
                            SmallVectorImpl<Value> &accs) {
       for (int kk = 0; kk < kPerBlock; kk += 16) {
         Value kkOffset = cidx(builder, loc, kk);
-        Value aRow = arith::AddIOp::create(builder, loc, waveRowBase, lane16);
-        Value aPacked = loadPackedFromLds(aSrc, aRow, kkOffset);
-        for (int col = 0; col < blockCols; col += 16) {
-          Value bRow = col == 0
-                           ? lane16
-                           : arith::AddIOp::create(builder, loc, lane16,
-                                                  cidx(builder, loc, col));
+        SmallVector<Value, 4> aPackedRows;
+        aPackedRows.reserve(waveRowTiles);
+        for (int row = 0; row < waveTileRows; row += 16) {
+          Value aRow = arith::AddIOp::create(builder, loc, waveRowBase, lane16);
+          if (row != 0)
+            aRow = arith::AddIOp::create(builder, loc, aRow,
+                                         cidx(builder, loc, row));
+          aPackedRows.push_back(loadPackedFromLds(aSrc, aRow, kkOffset));
+        }
+
+        SmallVector<Value, 4> bPackedCols;
+        bPackedCols.reserve(waveColTiles);
+        for (int col = 0; col < waveTileCols; col += 16) {
+          Value bRow = arith::AddIOp::create(builder, loc, waveColBase, lane16);
+          if (col != 0)
+            bRow = arith::AddIOp::create(builder, loc, bRow,
+                                         cidx(builder, loc, col));
           Value bPacked;
           if (directBFragments) {
             Value globalBRow =
@@ -652,15 +775,166 @@ struct ConvertGPUKernelOutlinePass
           } else {
             bPacked = loadPackedFromLds(bSrc, bRow, kkOffset);
           }
-          accs[col / 16] = createWmma(aPacked, bPacked, accs[col / 16]);
+          bPackedCols.push_back(bPacked);
+        }
+
+        for (int64_t rowTile = 0; rowTile < waveRowTiles; ++rowTile) {
+          for (int64_t colTile = 0; colTile < waveColTiles; ++colTile) {
+            int64_t accIndex = rowTile * waveColTiles + colTile;
+            accs[accIndex] = createWmma(aPackedRows[rowTile],
+                                        bPackedCols[colTile], accs[accIndex]);
+          }
+        }
+      }
+    };
+
+    auto computeTileDirect = [&](Value kOffset, SmallVectorImpl<Value> &accs) {
+      SmallVector<Value, 4> aPackedRows;
+      aPackedRows.reserve(waveRowTiles);
+      for (int row = 0; row < waveTileRows; row += 16) {
+        Value aRow = arith::AddIOp::create(builder, loc, waveRowBase, lane16);
+        if (row != 0)
+          aRow = arith::AddIOp::create(builder, loc, aRow,
+                                       cidx(builder, loc, row));
+        Value globalARow =
+            arith::AddIOp::create(builder, loc, blockRowBase, aRow);
+        aPackedRows.push_back(loadPackedContiguousI8x16AsI32x4(
+            builder, loc, a, globalARow, kOffset));
+      }
+
+      SmallVector<Value, 4> bPackedCols;
+      bPackedCols.reserve(waveColTiles);
+      for (int col = 0; col < waveTileCols; col += 16) {
+        Value bRow = arith::AddIOp::create(builder, loc, waveColBase, lane16);
+        if (col != 0)
+          bRow = arith::AddIOp::create(builder, loc, bRow,
+                                       cidx(builder, loc, col));
+        Value globalBRow =
+            arith::AddIOp::create(builder, loc, blockColBase, bRow);
+        bPackedCols.push_back(loadPackedContiguousI8x16AsI32x4(
+            builder, loc, b, globalBRow, kOffset));
+      }
+
+      for (int64_t rowTile = 0; rowTile < waveRowTiles; ++rowTile) {
+        for (int64_t colTile = 0; colTile < waveColTiles; ++colTile) {
+          int64_t accIndex = rowTile * waveColTiles + colTile;
+          accs[accIndex] = createWmma(aPackedRows[rowTile],
+                                      bPackedCols[colTile], accs[accIndex]);
         }
       }
     };
 
     SmallVector<Value, 8> finalAccs;
-    finalAccs.reserve(numColTiles);
-    if (loopedPipeline) {
-      SmallVector<Value, 8> initAccs(numColTiles, initAcc);
+    finalAccs.reserve(accCount);
+    if (directGlobalPipeline) {
+      SmallVector<Value, 8> initAccs(accCount, initAcc);
+      auto kLoop = scf::ForOp::create(builder, loc, c0, c1024, cKPerBlock,
+                                      ValueRange(initAccs));
+      auto unroll = LLVM::LoopUnrollAttr::get(
+          ctx, builder.getBoolAttr(true), IntegerAttr(), BoolAttr(),
+          BoolAttr(), LLVM::LoopAnnotationAttr(), LLVM::LoopAnnotationAttr(),
+          LLVM::LoopAnnotationAttr());
+      auto annotation = LLVM::LoopAnnotationAttr::get(
+          ctx, builder.getBoolAttr(true), LLVM::LoopVectorizeAttr(),
+          LLVM::LoopInterleaveAttr(), unroll, LLVM::LoopUnrollAndJamAttr(),
+          LLVM::LoopLICMAttr(), LLVM::LoopDistributeAttr(),
+          LLVM::LoopPipelineAttr(), LLVM::LoopPeeledAttr(),
+          LLVM::LoopUnswitchAttr(), BoolAttr(), BoolAttr(), FusedLoc(),
+          FusedLoc(), ArrayRef<LLVM::AccessGroupAttr>());
+      kLoop->setAttr("llvm.loop_annotation", annotation);
+      builder.setInsertionPointToStart(kLoop.getBody());
+      Value k = kLoop.getInductionVar();
+      Value kNext = arith::AddIOp::create(builder, loc, k, c16);
+
+      SmallVector<Value, 8> nextAccs;
+      nextAccs.reserve(accCount);
+      for (int64_t i = 0; i < accCount; ++i)
+        nextAccs.push_back(kLoop.getRegionIterArg(i));
+      computeTileDirect(k, nextAccs);
+      computeTileDirect(kNext, nextAccs);
+      scf::YieldOp::create(builder, loc, ValueRange(nextAccs));
+
+      builder.setInsertionPointAfter(kLoop);
+      for (int64_t i = 0; i < accCount; ++i)
+        finalAccs.push_back(kLoop.getResult(i));
+    } else if (rocmlirLikePipe3) {
+      SmallVector<Value, 8> initAccs(accCount, initAcc);
+      copyTile(aLds, bLds, c0);
+      copyTile(aLdsNext, bLdsNext, cKPerBlock);
+      copyTile(aLdsThird, bLdsThird, c2KPerBlock);
+      gpu::BarrierOp::create(builder, loc);
+
+      auto kLoop = scf::ForOp::create(builder, loc, c0, cPenultimateK,
+                                      c3KPerBlock, ValueRange(initAccs));
+      builder.setInsertionPointToStart(kLoop.getBody());
+      Value k = kLoop.getInductionVar();
+      Value kNext = arith::AddIOp::create(builder, loc, k, cKPerBlock);
+      Value kNextPair = arith::AddIOp::create(builder, loc, k, c2KPerBlock);
+      Value kNextTriple = arith::AddIOp::create(builder, loc, k, c3KPerBlock);
+      Value kNextQuad =
+          arith::AddIOp::create(builder, loc, kNextTriple, cKPerBlock);
+      Value kNextPenta =
+          arith::AddIOp::create(builder, loc, kNextQuad, cKPerBlock);
+
+      SmallVector<Value, 8> nextAccs;
+      nextAccs.reserve(accCount);
+      for (int64_t i = 0; i < accCount; ++i)
+        nextAccs.push_back(kLoop.getRegionIterArg(i));
+
+      computeTile(aLds, bLds, k, nextAccs);
+      computeTile(aLdsNext, bLdsNext, kNext, nextAccs);
+      computeTile(aLdsThird, bLdsThird, kNextPair, nextAccs);
+      gpu::BarrierOp::create(builder, loc);
+
+      copyTile(aLds, bLds, kNextTriple);
+      copyTile(aLdsNext, bLdsNext, kNextQuad);
+      ifIndexLessThan(kNextPenta, c1024, [&]() {
+        copyTile(aLdsThird, bLdsThird, kNextPenta);
+      });
+      gpu::BarrierOp::create(builder, loc);
+      scf::YieldOp::create(builder, loc, ValueRange(nextAccs));
+
+      builder.setInsertionPointAfter(kLoop);
+      for (int64_t i = 0; i < accCount; ++i)
+        finalAccs.push_back(kLoop.getResult(i));
+
+      computeTile(aLds, bLds, cPenultimateK, finalAccs);
+      computeTile(aLdsNext, bLdsNext, cLastK, finalAccs);
+    } else if (shortLivedLoopedPipeline) {
+      SmallVector<Value, 8> initAccs(accCount, initAcc);
+      copyTile(aLds, bLds, c0);
+      gpu::BarrierOp::create(builder, loc);
+
+      auto kLoop = scf::ForOp::create(builder, loc, c0, cPipeLoopUpper,
+                                      c2KPerBlock, ValueRange(initAccs));
+      builder.setInsertionPointToStart(kLoop.getBody());
+      Value k = kLoop.getInductionVar();
+      Value kNext = arith::AddIOp::create(builder, loc, k, cKPerBlock);
+      Value kNextPair = arith::AddIOp::create(builder, loc, k, c2KPerBlock);
+
+      copyTile(aLdsNext, bLdsNext, kNext);
+      SmallVector<Value, 8> nextAccs;
+      nextAccs.reserve(accCount);
+      for (int64_t i = 0; i < accCount; ++i)
+        nextAccs.push_back(kLoop.getRegionIterArg(i));
+      computeTile(aLds, bLds, k, nextAccs);
+      gpu::BarrierOp::create(builder, loc);
+
+      copyTile(aLds, bLds, kNextPair);
+      computeTile(aLdsNext, bLdsNext, kNext, nextAccs);
+      gpu::BarrierOp::create(builder, loc);
+      scf::YieldOp::create(builder, loc, ValueRange(nextAccs));
+
+      builder.setInsertionPointAfter(kLoop);
+      for (int64_t i = 0; i < accCount; ++i)
+        finalAccs.push_back(kLoop.getResult(i));
+
+      copyTile(aLdsNext, bLdsNext, cLastK);
+      computeTile(aLds, bLds, cPenultimateK, finalAccs);
+      gpu::BarrierOp::create(builder, loc);
+      computeTile(aLdsNext, bLdsNext, cLastK, finalAccs);
+    } else if (loopedPipeline) {
+      SmallVector<Value, 8> initAccs(accCount, initAcc);
       copyTile(aLds, bLds, c0);
       gpu::BarrierOp::create(builder, loc);
 
@@ -673,8 +947,8 @@ struct ConvertGPUKernelOutlinePass
 
       TilePrefetch nextPrefetch = prefetchTileToRegs(kNext);
       SmallVector<Value, 8> nextAccs;
-      nextAccs.reserve(numColTiles);
-      for (int64_t i = 0; i < numColTiles; ++i)
+      nextAccs.reserve(accCount);
+      for (int64_t i = 0; i < accCount; ++i)
         nextAccs.push_back(kLoop.getRegionIterArg(i));
       computeTile(aLds, bLds, k, nextAccs);
       storePrefetchToLds(aLdsNext, bLdsNext, nextPrefetch);
@@ -687,7 +961,7 @@ struct ConvertGPUKernelOutlinePass
       scf::YieldOp::create(builder, loc, ValueRange(nextAccs));
 
       builder.setInsertionPointAfter(kLoop);
-      for (int64_t i = 0; i < numColTiles; ++i)
+      for (int64_t i = 0; i < accCount; ++i)
         finalAccs.push_back(kLoop.getResult(i));
 
       TilePrefetch lastPrefetch = prefetchTileToRegs(cLastK);
@@ -696,7 +970,7 @@ struct ConvertGPUKernelOutlinePass
       gpu::BarrierOp::create(builder, loc);
       computeTile(aLdsNext, bLdsNext, cLastK, finalAccs);
     } else if (staticPrefetchPipeline) {
-      finalAccs.assign(numColTiles, initAcc);
+      finalAccs.assign(accCount, initAcc);
       TilePrefetch prefetch = prefetchTileToRegs(c0);
       storePrefetchToLds(aLds, bLds, prefetch);
       gpu::BarrierOp::create(builder, loc);
@@ -717,7 +991,7 @@ struct ConvertGPUKernelOutlinePass
         }
       }
     } else if (unrolledCopyPipeline) {
-      finalAccs.assign(numColTiles, initAcc);
+      finalAccs.assign(accCount, initAcc);
       copyTile(aLds, bLds, c0);
       gpu::BarrierOp::create(builder, loc);
       for (int tile = 0; tile < kTiles; ++tile) {
@@ -734,7 +1008,7 @@ struct ConvertGPUKernelOutlinePass
           gpu::BarrierOp::create(builder, loc);
       }
     } else {
-      SmallVector<Value, 8> initAccs(numColTiles, initAcc);
+      SmallVector<Value, 8> initAccs(accCount, initAcc);
       auto kLoop = scf::ForOp::create(builder, loc, c0, c1024, cKPerBlock,
                                       ValueRange(initAccs));
       builder.setInsertionPointToStart(kLoop.getBody());
@@ -743,8 +1017,8 @@ struct ConvertGPUKernelOutlinePass
       gpu::BarrierOp::create(builder, loc);
 
       SmallVector<Value, 8> nextAccs;
-      nextAccs.reserve(numColTiles);
-      for (int64_t i = 0; i < numColTiles; ++i)
+      nextAccs.reserve(accCount);
+      for (int64_t i = 0; i < accCount; ++i)
         nextAccs.push_back(kLoop.getRegionIterArg(i));
       computeTile(aLds, bLds, k, nextAccs);
 
@@ -752,26 +1026,38 @@ struct ConvertGPUKernelOutlinePass
       scf::YieldOp::create(builder, loc, ValueRange(nextAccs));
 
       builder.setInsertionPointAfter(kLoop);
-      for (int64_t i = 0; i < numColTiles; ++i)
+      for (int64_t i = 0; i < accCount; ++i)
         finalAccs.push_back(kLoop.getResult(i));
     }
 
-    for (int element = 0; element < 8; ++element) {
-      Value elemIdx = cidx(builder, loc, element);
-      Value rowInTile = arith::AddIOp::create(
-          builder, loc,
-          arith::MulIOp::create(builder, loc, elemIdx, c2), laneHalf);
-      Value dstRow = arith::AddIOp::create(builder, loc, tileRow, rowInTile);
-      Value dstColBase = arith::AddIOp::create(builder, loc, tileCol, lane16);
-      for (int col = 0; col < blockCols; col += 16) {
-        Value dstCol = col == 0
-                           ? dstColBase
-                           : arith::AddIOp::create(builder, loc, dstColBase,
-                                                  cidx(builder, loc, col));
-        Value value = vector::ExtractOp::create(builder, loc,
-                                                finalAccs[col / 16], element);
-        memref::StoreOp::create(builder, loc, value, c,
-                                ValueRange{dstRow, dstCol});
+    for (int64_t rowTile = 0; rowTile < waveRowTiles; ++rowTile) {
+      Value dstTileRow = rowTile == 0
+                             ? tileRow
+                             : arith::AddIOp::create(
+                                   builder, loc, tileRow,
+                                   cidx(builder, loc, rowTile * 16))
+                                   .getResult();
+      for (int element = 0; element < 8; ++element) {
+        Value elemIdx = cidx(builder, loc, element);
+        Value rowInTile = arith::AddIOp::create(
+            builder, loc,
+            arith::MulIOp::create(builder, loc, elemIdx, c2), laneHalf);
+        Value dstRow = arith::AddIOp::create(builder, loc, dstTileRow,
+                                             rowInTile);
+        Value dstColBase = arith::AddIOp::create(builder, loc, tileCol, lane16);
+        for (int64_t colTile = 0; colTile < waveColTiles; ++colTile) {
+          Value dstCol = colTile == 0
+                             ? dstColBase
+                             : arith::AddIOp::create(
+                                   builder, loc, dstColBase,
+                                   cidx(builder, loc, colTile * 16))
+                                   .getResult();
+          int64_t accIndex = rowTile * waveColTiles + colTile;
+          Value value = vector::ExtractOp::create(builder, loc,
+                                                  finalAccs[accIndex], element);
+          memref::StoreOp::create(builder, loc, value, c,
+                                  ValueRange{dstRow, dstCol});
+        }
       }
     }
 

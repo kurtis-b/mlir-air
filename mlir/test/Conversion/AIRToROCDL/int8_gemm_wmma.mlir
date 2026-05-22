@@ -22,12 +22,34 @@
 // RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_bpack_swizzle_k32_looped" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,GRID128,WIDEK32
 // RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_bpack_swizzle_k128_looped" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,GRID128,WIDEK128
 // RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_swizzle_breg_k64_looped" -air-gpu-outlining | FileCheck %s --check-prefixes=CHECK,GRID64,BREG64
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_swizzle_k32_w4_pipe2 int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID64W4,TLIKE64
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_swizzle_k32_w4_pipe2_pad int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID64W4,TLIKE64PAD
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_64x128_bpack_swizzle_k32_w4_pipe2 int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID64X128W4,TLIKE64X128
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_64x128_bpack_swizzle_k32_w4_pipe2_pad int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID64X128W4,TLIKE64X128PAD
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_bpack_swizzle_k32_w4_pipe2 int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID128W4,TLIKE
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_bpack_swizzle_k32_w4_pipe2_pad int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID128W4,TLIKEPAD
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_swizzle_k32_w4_pipe2_short int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID64W4,TSHORT64
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x64_bpack_swizzle_k32_w4_pipe2_short_pad int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID64W4,TSHORT64PAD
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_64x128_bpack_swizzle_k32_w4_pipe2_short int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID64X128W4,TSHORT64X128
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_64x128_bpack_swizzle_k32_w4_pipe2_short_pad int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID64X128W4,TSHORT64X128PAD
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_bpack_swizzle_k32_w4_pipe2_short int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID128W4,TSHORT
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_bpack_swizzle_k32_w4_pipe2_short_pad int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID128W4,TSHORTPAD
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_rocmlir_k32_pipe3 int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID128W4,ROCMLIRLIKE
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=global_128x128_bpack_w4_direct int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID128DIRECT,DIRECT
+// RUN: not air-opt %s -air-to-rocdl="int8-gemm-variant=global_128x128_bpack_w4_direct int8-gemm-group-size=4" -air-gpu-outlining="int8-gemm-group-size=4" 2>&1 | FileCheck %s --check-prefix=BADDIRECTGROUP
+// RUN: not air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_rocmlir_k32_pipe3 int8-gemm-group-size=4" -air-gpu-outlining="int8-gemm-group-size=4" 2>&1 | FileCheck %s --check-prefix=BADROCMLIRGROUP
 // RUN: not air-opt %s -air-to-rocdl="int8-gemm-variant=not_a_variant" 2>&1 | FileCheck %s --check-prefix=BAD
 // RUN: not air-opt %s -air-to-rocdl="int8-gemm-group-size=6" 2>&1 | FileCheck %s --check-prefix=BADGROUP
 
+// DIRECT: #llvm.loop_unroll<disable = true>
+// DIRECT-NEXT: #llvm.loop_annotation<disableNonforced = true, unroll = #loop_unroll>
 // GRID64: gpu.launch_func @{{.*}}::@{{.*}} blocks in (%c16, %c8, %c1) threads in (%c256, %c1, %c1)
+// GRID64W4: gpu.launch_func @{{.*}}::@{{.*}} blocks in (%c16, %c8, %c1) threads in (%c32, %c4, %c1)
 // GRID128: gpu.launch_func @{{.*}}::@{{.*}} blocks in (%c8{{(_[0-9]+)?}}, %c8{{(_[0-9]+)?}}, %c1) threads in (%c256, %c1, %c1)
+// GRID128W4: gpu.launch_func @{{.*}}::@{{.*}} blocks in (%c8{{(_[0-9]+)?}}, %c8{{(_[0-9]+)?}}, %c1) threads in (%c32, %c4, %c1)
+// GRID128DIRECT: gpu.launch_func @{{.*}}::@{{.*}} blocks in (%c8{{(_[0-9]+)?}}, %c8{{(_[0-9]+)?}}, %c1) threads in (%c128, %c1, %c1)
 // GRID64X128: gpu.launch_func @{{.*}}::@{{.*}} blocks in (%c8{{(_[0-9]+)?}}, %c16{{(_[0-9]+)?}}, %c1) threads in (%c128, %c1, %c1)
+// GRID64X128W4: gpu.launch_func @{{.*}}::@{{.*}} blocks in (%c8{{(_[0-9]+)?}}, %c16{{(_[0-9]+)?}}, %c1) threads in (%c32, %c4, %c1)
 // CHECK: gpu.module @
 // CHECK: gpu.func @{{.*}} kernel
 // DEFAULT-SAME: air.gpu.int8_gemm_variant = "lds_128x64_wmma4"
@@ -47,11 +69,52 @@
 // WIDEK32-SAME: air.gpu.int8_gemm_variant = "lds_128x128_bpack_swizzle_k32_looped"
 // WIDEK128-SAME: air.gpu.int8_gemm_variant = "lds_128x128_bpack_swizzle_k128_looped"
 // BREG64-SAME: air.gpu.int8_gemm_variant = "lds_128x64_bpack_swizzle_breg_k64_looped"
+// TLIKE64-SAME: air.gpu.int8_gemm_group_m = 8 : i32
+// TLIKE64-SAME: air.gpu.int8_gemm_variant = "lds_128x64_bpack_swizzle_k32_w4_pipe2"
+// TLIKE64PAD-SAME: air.gpu.int8_gemm_group_m = 8 : i32
+// TLIKE64PAD-SAME: air.gpu.int8_gemm_variant = "lds_128x64_bpack_swizzle_k32_w4_pipe2_pad"
+// TLIKE64X128-SAME: air.gpu.int8_gemm_group_m = 8 : i32
+// TLIKE64X128-SAME: air.gpu.int8_gemm_variant = "lds_64x128_bpack_swizzle_k32_w4_pipe2"
+// TLIKE64X128PAD-SAME: air.gpu.int8_gemm_group_m = 8 : i32
+// TLIKE64X128PAD-SAME: air.gpu.int8_gemm_variant = "lds_64x128_bpack_swizzle_k32_w4_pipe2_pad"
+// TLIKE-SAME: air.gpu.int8_gemm_group_m = 8 : i32
+// TLIKE-SAME: air.gpu.int8_gemm_variant = "lds_128x128_bpack_swizzle_k32_w4_pipe2"
+// TLIKEPAD-SAME: air.gpu.int8_gemm_group_m = 8 : i32
+// TLIKEPAD-SAME: air.gpu.int8_gemm_variant = "lds_128x128_bpack_swizzle_k32_w4_pipe2_pad"
+// TSHORT64-SAME: air.gpu.int8_gemm_group_m = 8 : i32
+// TSHORT64-SAME: air.gpu.int8_gemm_variant = "lds_128x64_bpack_swizzle_k32_w4_pipe2_short"
+// TSHORT64PAD-SAME: air.gpu.int8_gemm_group_m = 8 : i32
+// TSHORT64PAD-SAME: air.gpu.int8_gemm_variant = "lds_128x64_bpack_swizzle_k32_w4_pipe2_short_pad"
+// TSHORT64X128-SAME: air.gpu.int8_gemm_group_m = 8 : i32
+// TSHORT64X128-SAME: air.gpu.int8_gemm_variant = "lds_64x128_bpack_swizzle_k32_w4_pipe2_short"
+// TSHORT64X128PAD-SAME: air.gpu.int8_gemm_group_m = 8 : i32
+// TSHORT64X128PAD-SAME: air.gpu.int8_gemm_variant = "lds_64x128_bpack_swizzle_k32_w4_pipe2_short_pad"
+// TSHORT-SAME: air.gpu.int8_gemm_group_m = 8 : i32
+// TSHORT-SAME: air.gpu.int8_gemm_variant = "lds_128x128_bpack_swizzle_k32_w4_pipe2_short"
+// TSHORTPAD-SAME: air.gpu.int8_gemm_group_m = 8 : i32
+// TSHORTPAD-SAME: air.gpu.int8_gemm_variant = "lds_128x128_bpack_swizzle_k32_w4_pipe2_short_pad"
+// ROCMLIRLIKE-SAME: air.gpu.int8_gemm_group_m = 8 : i32
+// ROCMLIRLIKE-SAME: air.gpu.int8_gemm_variant = "lds_128x128_rocmlir_k32_pipe3"
+// ROCMLIRLIKE: memref<128x32xi8, 3>
+// ROCMLIRLIKE: gpu.barrier
+// DIRECT: air.gpu.int8_gemm_group_m = 8 : i32
+// DIRECT-SAME: air.gpu.int8_gemm_variant = "global_128x128_bpack_w4_direct"
+// DIRECT-NOT: memref<{{.*}}, 3>
+// DIRECT-NOT: gpu.barrier
+// DIRECT: scf.for
+// DIRECT-SAME: step %c32{{.*}}
+// DIRECT-NOT: gpu.barrier
 // CHECK: rocdl.wmma.i32.16x16x16.iu8
 // CHECK-NOT: rocdl.wmma.i32.16x16x64
 // CHECK-NOT: swmmac
+// DIRECT: rocdl.wmma.i32.16x16x16.iu8
+// DIRECT: } {llvm.loop_annotation = #loop_annotation}
+// DIRECT-NOT: gpu.barrier
+// DIRECT: gpu.return
 // BAD: unsupported variant 'not_a_variant'
 // BADGROUP: unsupported group size '6'
+// BADDIRECTGROUP: direct global variant requires group size 8
+// BADROCMLIRGROUP: rocMLIR-like variant requires group size 8
 
 module {
   func.func @forward(%arg0: memref<1024x1024xi8>, %arg1: memref<1024x1024xi8>, %arg2: memref<1024x1024xi32>) {

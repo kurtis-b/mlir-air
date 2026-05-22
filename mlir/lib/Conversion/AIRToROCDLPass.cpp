@@ -298,9 +298,10 @@ struct ConvertAIRToROCDLPass
     Value gridY = arith::ConstantIndexOp::create(builder, loc,
                                                  1024 / config->blockRows);
     Value gridZ = arith::ConstantIndexOp::create(builder, loc, 1);
-    Value blockX = arith::ConstantIndexOp::create(builder, loc,
-                                                  config->blockThreads);
-    Value blockY = arith::ConstantIndexOp::create(builder, loc, 1);
+    Value blockX = arith::ConstantIndexOp::create(
+        builder, loc, config->effectiveBlockDimX());
+    Value blockY = arith::ConstantIndexOp::create(
+        builder, loc, config->effectiveBlockDimY());
     Value blockZ = arith::ConstantIndexOp::create(builder, loc, 1);
 
     auto gpuLaunch = gpu::LaunchOp::create(builder, loc, gridX, gridY, gridZ,
