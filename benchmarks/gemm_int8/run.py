@@ -705,6 +705,7 @@ def run_gpu_final_mlir(ctx: RunContext, result: BackendResult, final_mlir: Path,
         return False, log
     env = os.environ.copy()
     env.setdefault("AIRGPU_USE_HIP_MALLOC", "1")
+    env.setdefault("AIRGPU_BENCHMARK_STREAM", "1")
     return run_capture(log, [runner, "--entry-point-result=void", f"--shared-libs={airgpu}", final_mlir], env=env)
 
 

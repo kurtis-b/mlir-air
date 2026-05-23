@@ -74,12 +74,88 @@ static std::atomic<bool> g_kernel_profiling_enabled{false};
 static std::mutex g_benchmark_mutex;
 static BenchmarkStats g_kernel_event_stats;
 static BenchmarkStats g_host_dispatch_wait_stats;
+static hipStream_t g_benchmark_stream = nullptr;
+static hipEvent_t g_benchmark_start_event = nullptr;
+static hipEvent_t g_benchmark_stop_event = nullptr;
+static uint64_t g_benchmark_launch_count = 0;
+static bool g_benchmark_batch_failed = false;
 
 static void recordKernelEventMs(double ms) {
   if (ms < 0.0)
     return;
   std::lock_guard<std::mutex> lock(g_benchmark_mutex);
   g_kernel_event_stats.record(ms);
+}
+
+static void recordKernelEventBatchMs(double averageMs, uint64_t count) {
+  if (averageMs < 0.0 || count == 0)
+    return;
+  std::lock_guard<std::mutex> lock(g_benchmark_mutex);
+  for (uint64_t i = 0; i < count; ++i)
+    g_kernel_event_stats.record(averageMs);
+}
+
+static bool isBenchmarkStream(hipStream_t stream) {
+  return stream && stream == g_benchmark_stream;
+}
+
+static bool usePersistentBenchmarkStream() {
+  const char *env = std::getenv("AIRGPU_BENCHMARK_STREAM");
+  return env && std::strcmp(env, "0") != 0;
+}
+
+static void resetBenchmarkBatch(bool destroyStream) {
+  if (g_benchmark_start_event) {
+    HIP_REPORT_IF_ERROR(hipEventDestroy(g_benchmark_start_event));
+    g_benchmark_start_event = nullptr;
+  }
+  if (g_benchmark_stop_event) {
+    HIP_REPORT_IF_ERROR(hipEventDestroy(g_benchmark_stop_event));
+    g_benchmark_stop_event = nullptr;
+  }
+  if (destroyStream && g_benchmark_stream) {
+    HIP_REPORT_IF_ERROR(hipStreamDestroy(g_benchmark_stream));
+    g_benchmark_stream = nullptr;
+  }
+  g_benchmark_launch_count = 0;
+  g_benchmark_batch_failed = false;
+}
+
+static void finalizeBenchmarkBatch() {
+  if (!g_benchmark_stream)
+    return;
+
+  if (!g_benchmark_batch_failed && g_benchmark_launch_count > 0 &&
+      g_benchmark_stop_event) {
+    hipError_t result = hipEventSynchronize(g_benchmark_stop_event);
+    if (result != hipSuccess) {
+      reportHipError("hipEventSynchronize(g_benchmark_stop_event)", result);
+    } else {
+      float elapsedMs = 0.0f;
+      result = hipEventElapsedTime(&elapsedMs, g_benchmark_start_event,
+                                   g_benchmark_stop_event);
+      if (result == hipSuccess) {
+        recordKernelEventBatchMs(
+            static_cast<double>(elapsedMs) /
+                static_cast<double>(g_benchmark_launch_count),
+            g_benchmark_launch_count);
+      } else {
+        reportHipError("hipEventElapsedTime(&elapsedMs, g_benchmark_start_event, "
+                       "g_benchmark_stop_event)",
+                       result);
+      }
+    }
+  } else {
+    HIP_REPORT_IF_ERROR(hipStreamSynchronize(g_benchmark_stream));
+  }
+
+  resetBenchmarkBatch(!usePersistentBenchmarkStream());
+}
+
+static hipStream_t getBenchmarkStream() {
+  if (!g_benchmark_stream)
+    HIP_REPORT_IF_ERROR(hipStreamCreate(&g_benchmark_stream));
+  return g_benchmark_stream;
 }
 
 static void printBenchmarkStats(const char *domain, const BenchmarkStats &stats,
@@ -165,6 +241,46 @@ extern "C" void mgpuLaunchKernel(hipFunction_t function, intptr_t gridX,
     return;
   }
 
+  if (isBenchmarkStream(stream)) {
+    if (!g_benchmark_start_event)
+      HIP_REPORT_IF_ERROR(hipEventCreate(&g_benchmark_start_event));
+    if (!g_benchmark_stop_event)
+      HIP_REPORT_IF_ERROR(hipEventCreate(&g_benchmark_stop_event));
+    if (!g_benchmark_start_event || !g_benchmark_stop_event)
+      g_benchmark_batch_failed = true;
+
+    if (!g_benchmark_batch_failed && g_benchmark_launch_count == 0) {
+      hipError_t result = hipEventRecord(g_benchmark_start_event, stream);
+      if (result != hipSuccess) {
+        reportHipError("hipEventRecord(g_benchmark_start_event, stream)",
+                       result);
+        g_benchmark_batch_failed = true;
+      }
+    }
+
+    hipError_t launchResult = hipModuleLaunchKernel(
+        function, gridX, gridY, gridZ, blockX, blockY, blockZ, smem, stream,
+        params, extra);
+    reportHipError("hipModuleLaunchKernel(function, gridX, gridY, gridZ, blockX, "
+                   "blockY, blockZ, smem, stream, params, extra)",
+                   launchResult);
+
+    if (launchResult == hipSuccess)
+      ++g_benchmark_launch_count;
+    else
+      g_benchmark_batch_failed = true;
+
+    if (!g_benchmark_batch_failed) {
+      hipError_t result = hipEventRecord(g_benchmark_stop_event, stream);
+      if (result != hipSuccess) {
+        reportHipError("hipEventRecord(g_benchmark_stop_event, stream)",
+                       result);
+        g_benchmark_batch_failed = true;
+      }
+    }
+    return;
+  }
+
   hipEvent_t start = nullptr;
   hipEvent_t stop = nullptr;
   hipError_t result = hipEventCreate(&start);
@@ -225,13 +341,20 @@ extern "C" void mgpuLaunchKernel(hipFunction_t function, intptr_t gridX,
 }
 
 extern "C" void mgpuBenchmarkReset() {
+  resetBenchmarkBatch(!usePersistentBenchmarkStream());
   std::lock_guard<std::mutex> lock(g_benchmark_mutex);
   g_kernel_event_stats.reset();
   g_host_dispatch_wait_stats.reset();
 }
 
 extern "C" void mgpuBenchmarkSetKernelProfiling(int32_t enabled) {
-  g_kernel_profiling_enabled.store(enabled != 0, std::memory_order_release);
+  if (enabled != 0) {
+    resetBenchmarkBatch(!usePersistentBenchmarkStream());
+    g_kernel_profiling_enabled.store(true, std::memory_order_release);
+    return;
+  }
+  g_kernel_profiling_enabled.store(false, std::memory_order_release);
+  finalizeBenchmarkBatch();
 }
 
 extern "C" int64_t mgpuHostTimeNs() {
@@ -283,16 +406,24 @@ extern "C" void mgpuBenchmarkPrintI8I32(int64_t m, int64_t n, int64_t k,
 // ===========================================================================
 
 extern "C" hipStream_t mgpuStreamCreate() {
+  if (g_kernel_profiling_enabled.load(std::memory_order_acquire) ||
+      usePersistentBenchmarkStream())
+    return getBenchmarkStream();
   hipStream_t stream = nullptr;
   HIP_REPORT_IF_ERROR(hipStreamCreate(&stream));
   return stream;
 }
 
 extern "C" void mgpuStreamDestroy(hipStream_t stream) {
+  if (isBenchmarkStream(stream))
+    return;
   HIP_REPORT_IF_ERROR(hipStreamDestroy(stream));
 }
 
 extern "C" void mgpuStreamSynchronize(hipStream_t stream) {
+  if (g_kernel_profiling_enabled.load(std::memory_order_acquire) &&
+      isBenchmarkStream(stream))
+    return;
   HIP_REPORT_IF_ERROR(hipStreamSynchronize(stream));
 }
 
