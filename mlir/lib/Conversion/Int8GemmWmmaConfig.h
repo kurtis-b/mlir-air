@@ -82,6 +82,18 @@ static constexpr const char kInt8GemmRocmlirLikePipe3Variant[] =
     "lds_128x128_rocmlir_k32_pipe3";
 static constexpr const char kInt8GemmAirTunedDirectVariant[] =
     "global_128x128_bpack_w4_direct";
+static constexpr const char kInt8GemmAirTunedDirectCanonicalVariant[] =
+    "global_128x128_bpack_w4_direct_canonical";
+static constexpr const char kInt8GemmAirTunedDirectPrefetchVariant[] =
+    "global_128x128_bpack_w4_prefetch";
+static constexpr const char kInt8GemmAirTunedDirectRawPtrVariant[] =
+    "global_128x128_bpack_w4_direct_rawptr";
+static constexpr const char kInt8GemmAirTunedDirectRawPtrU2Variant[] =
+    "global_128x128_bpack_w4_direct_rawptr_u2";
+static constexpr const char kInt8GemmTensileK32Pipe2Variant[] =
+    "lds_128x128_tensile_k32_pipe2";
+static constexpr const char kInt8GemmTensileK32Pipe2PadVariant[] =
+    "lds_128x128_tensile_k32_pipe2_pad";
 
 enum class PipelineKind {
   SingleBufferLoop,
@@ -92,6 +104,10 @@ enum class PipelineKind {
   TensileLikePipe2ShortLived,
   RocmlirLikePipe3,
   AirTunedDirect,
+  AirTunedDirectCanonical,
+  AirTunedDirectPrefetch,
+  AirTunedDirectRawPtr,
+  AirTunedDirectRawPtrU2,
 };
 
 struct Int8GemmKernelConfig {
@@ -190,10 +206,22 @@ static const Int8GemmKernelConfig kInt8GemmKernelConfigs[] = {
     {kInt8GemmBPackSwizzleK32W4Pipe2ShortPadVariant, 128, 128, 32, 128, 2,
      true, true, true, false, PipelineKind::TensileLikePipe2ShortLived, 8, 64,
      64, 16, 32, 4},
+    {kInt8GemmTensileK32Pipe2Variant, 128, 128, 32, 128, 2, true, true, true,
+     false, PipelineKind::TensileLikePipe2, 8, 64, 64, 0, 32, 4},
+    {kInt8GemmTensileK32Pipe2PadVariant, 128, 128, 32, 128, 2, true, true,
+     true, false, PipelineKind::TensileLikePipe2, 8, 64, 64, 16, 32, 4},
     {kInt8GemmRocmlirLikePipe3Variant, 128, 128, 32, 128, 3, false, true,
      true, false, PipelineKind::RocmlirLikePipe3, 8, 64, 64, 0, 32, 4},
     {kInt8GemmAirTunedDirectVariant, 128, 128, 32, 128, 0, false, true, true,
      true, PipelineKind::AirTunedDirect, 8, 64, 64},
+    {kInt8GemmAirTunedDirectCanonicalVariant, 128, 128, 16, 128, 0, false,
+     true, true, true, PipelineKind::AirTunedDirectCanonical, 8, 64, 64},
+    {kInt8GemmAirTunedDirectPrefetchVariant, 128, 128, 32, 128, 0, false,
+     true, true, true, PipelineKind::AirTunedDirectPrefetch, 8, 64, 64},
+    {kInt8GemmAirTunedDirectRawPtrVariant, 128, 128, 32, 128, 0, false,
+     true, true, true, PipelineKind::AirTunedDirectRawPtr, 8, 64, 64},
+    {kInt8GemmAirTunedDirectRawPtrU2Variant, 128, 128, 16, 128, 0, false,
+     true, true, true, PipelineKind::AirTunedDirectRawPtrU2, 8, 64, 64},
 };
 
 inline std::optional<Int8GemmKernelConfig>
@@ -210,6 +238,15 @@ inline bool isSupportedInt8GemmVariant(llvm::StringRef variant) {
 
 inline bool isSupportedInt8GemmGroupSize(uint32_t groupSize) {
   return groupSize == 2 || groupSize == 4 || groupSize == 8;
+}
+
+inline bool usesRawPtrKernelAbi(const Int8GemmKernelConfig &config) {
+  return config.pipeline == PipelineKind::AirTunedDirectRawPtr ||
+         config.pipeline == PipelineKind::AirTunedDirectRawPtrU2;
+}
+
+inline bool usesLinearGroupedGrid(const Int8GemmKernelConfig &config) {
+  return usesRawPtrKernelAbi(config);
 }
 
 } // namespace xilinx::air::gpu_int8_gemm

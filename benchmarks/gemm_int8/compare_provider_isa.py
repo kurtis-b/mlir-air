@@ -28,6 +28,20 @@ DEFAULT_AIR_TUNED_PROVIDER = "air_tuned"
 ROCMLIR_REFERENCE_PROVIDER = "rocmlir_reference"
 ROCMLIR_REFERENCE_SOURCE = "compiler-reference"
 AIR_TUNED_DIRECT_VARIANT = "global_128x128_bpack_w4_direct"
+DIRECT_CANONICAL_VARIANT = "global_128x128_bpack_w4_direct_canonical"
+DIRECT_PREFETCH_VARIANT = "global_128x128_bpack_w4_prefetch"
+DIRECT_RAWPTR_VARIANT = "global_128x128_bpack_w4_direct_rawptr"
+DIRECT_RAWPTR_U2_VARIANT = "global_128x128_bpack_w4_direct_rawptr_u2"
+DIRECT_VARIANTS = {
+    AIR_TUNED_DIRECT_VARIANT,
+    DIRECT_CANONICAL_VARIANT,
+    DIRECT_PREFETCH_VARIANT,
+    DIRECT_RAWPTR_VARIANT,
+    DIRECT_RAWPTR_U2_VARIANT,
+}
+ACCEPTED_MLIR_AIR_BASELINE_VARIANT = "lds_128x128_rocmlir_k32_pipe3"
+AIR_TUNED_ACCEPTANCE_PCT = 95.0
+CANDIDATE_IMPROVEMENT_PCT = 5.0
 DEFAULT_TENSILE_LIBRARY = (
     "TensileLibrary_Type_I8I_HPA_Contraction_l_Ailk_Bljk_Cijk_Dijk_gfx1150.co"
 )
@@ -62,6 +76,21 @@ FIELDNAMES = (
     "validation",
     "median_tops",
     "cv_tops_pct",
+    "mlir_air_pct_of_air_tuned",
+    "passes_air_tuned_95pct",
+    "candidate_improvement_pct",
+    "keep_candidate",
+    "static_delta_wmma",
+    "static_delta_global_load_b128",
+    "static_delta_lds_ops",
+    "static_delta_barriers",
+    "static_delta_waitcnt",
+    "static_delta_vgprs",
+    "static_delta_sgprs",
+    "static_delta_lds_bytes",
+    "static_delta_scratch_markers",
+    "static_delta_vgpr_spills",
+    "static_delta_sgpr_spills",
     "profile_avg_ns",
     "profile_calls",
     "macro_tile_m",
@@ -147,6 +176,7 @@ class KernelEvidence:
     metadata_path: str = ""
     profile_path: str = ""
     notes: list[str] = field(default_factory=list)
+    extra_fields: dict[str, str] = field(default_factory=dict)
 
     def to_row(self) -> dict[str, str]:
         row = {key: "" for key in FIELDNAMES}
@@ -189,6 +219,7 @@ class KernelEvidence:
         )
         lds_ops = self.counters.get("ds_read", 0) + self.counters.get("ds_write", 0)
         row["lds_ops_per_wmma"] = ratio(lds_ops, self.counters.get("wmma", 0))
+        row.update(self.extra_fields)
         row["notes"] = "; ".join(note for note in self.notes if note)
         return row
 
@@ -463,18 +494,30 @@ def parse_mlir_schedule(evidence: KernelEvidence, summary_text: str) -> None:
         evidence.macro_tile_m, evidence.macro_tile_n = tile.group(1), tile.group(2)
     ktile = re.search(r"_k(\d+)", variant)
     evidence.k_tile = (
-        "32"
-        if variant == AIR_TUNED_DIRECT_VARIANT
-        else (ktile.group(1) if ktile else "64")
+        "16"
+        if variant in {DIRECT_CANONICAL_VARIANT, DIRECT_RAWPTR_U2_VARIANT}
+        else (
+            "32" if variant in DIRECT_VARIANTS else (ktile.group(1) if ktile else "64")
+        )
     )
     evidence.matrix_instruction = "16x16x16_iu8"
     if variant:
         evidence.notes.append(f"variant={variant}")
-    if variant == AIR_TUNED_DIRECT_VARIANT:
+    if variant in DIRECT_VARIANTS:
         evidence.notes.append("wave_tile=64x64")
         evidence.notes.append("groupM=8")
         evidence.notes.append("B_layout=packed_NxK")
         evidence.notes.append("pipeline=direct_global_no_lds")
+        if variant == DIRECT_CANONICAL_VARIANT:
+            evidence.notes.append("schedule=canonical_k16_no_lds")
+        elif variant == DIRECT_PREFETCH_VARIANT:
+            evidence.notes.append("schedule=register_prefetch_k32")
+        elif variant == DIRECT_RAWPTR_VARIANT:
+            evidence.notes.append("schedule=rawptr_linear_grid_k32")
+            evidence.notes.append("kernel_abi=bare_ptr")
+        elif variant == DIRECT_RAWPTR_U2_VARIANT:
+            evidence.notes.append("schedule=rawptr_linear_grid_k16_unroll2")
+            evidence.notes.append("kernel_abi=bare_ptr")
 
 
 def parse_tensile_schedule(evidence: KernelEvidence, kernel: str) -> None:
@@ -829,7 +872,10 @@ def build_mlir_evidence(
         return evidence
     evidence.counters = count_isa(read_text(isa_path))
     parse_mlir_schedule(evidence, summary)
-    if any(note == f"variant={AIR_TUNED_DIRECT_VARIANT}" for note in evidence.notes):
+    if any(
+        note.startswith("variant=") and note.split("=", 1)[1] in DIRECT_VARIANTS
+        for note in evidence.notes
+    ):
         evidence.source = "compiler-generated direct"
     readobj_path = gpu_artifacts / "gpu_int8_gemm.code_object.readobj.txt"
     readobj_text = read_text(readobj_path)
@@ -861,6 +907,7 @@ def build_mlir_evidence(
         evidence.notes.append(
             "MLIR rocprof stats not found; rerun analyzer with --profile-mlir for dynamic kernel stats"
         )
+    annotate_mlir_candidate_retention(evidence, sweep_rows, selected_row, sweep_row)
     return evidence
 
 
@@ -1207,6 +1254,94 @@ def numeric(value: str) -> float | None:
         return None
 
 
+def annotate_mlir_candidate_retention(
+    evidence: KernelEvidence,
+    sweep_rows: Sequence[dict[str, str]],
+    selected_row: dict[str, str],
+    sweep_row: dict[str, str],
+) -> None:
+    selected_variant = sweep_row.get("variant") or selected_row.get("variant", "")
+    baseline_row = row_for_variant(sweep_rows, ACCEPTED_MLIR_AIR_BASELINE_VARIANT)
+    baseline_tops = parse_csv_float(baseline_row.get("median_tops", ""))
+    selected_tops = numeric(evidence.median_tops)
+    if selected_variant == ACCEPTED_MLIR_AIR_BASELINE_VARIANT:
+        evidence.extra_fields["candidate_improvement_pct"] = "0.000"
+        evidence.extra_fields["keep_candidate"] = "accepted_best"
+        return
+    if baseline_tops is None or baseline_tops <= 0.0 or selected_tops is None:
+        return
+    improvement = ((selected_tops - baseline_tops) / baseline_tops) * 100.0
+    evidence.extra_fields["candidate_improvement_pct"] = f"{improvement:.3f}"
+    validated = evidence.status == "PASS" and evidence.validation in {"", "PASS"}
+    no_scratch = evidence.counters.get("scratch_markers", 0) == 0
+    no_spills = evidence.vgpr_spills in {"", "0"} and evidence.sgpr_spills in {"", "0"}
+    keep = (
+        validated
+        and no_scratch
+        and no_spills
+        and improvement >= CANDIDATE_IMPROVEMENT_PCT
+    )
+    evidence.extra_fields["keep_candidate"] = "yes" if keep else "no"
+
+
+def static_delta(lhs: str, rhs: str) -> str:
+    lhs_value = numeric(lhs)
+    rhs_value = numeric(rhs)
+    if lhs_value is None or rhs_value is None:
+        return ""
+    delta = lhs_value - rhs_value
+    return f"{delta:+.0f}" if delta.is_integer() else f"{delta:+.3f}"
+
+
+def annotate_mlir_air_tuned_gate(
+    mlir: KernelEvidence, air_tuned: KernelEvidence
+) -> None:
+    mlir_tops = numeric(mlir.median_tops)
+    tuned_tops = numeric(air_tuned.median_tops)
+    if mlir_tops is not None and tuned_tops is not None and tuned_tops > 0.0:
+        pct = (mlir_tops / tuned_tops) * 100.0
+        mlir.extra_fields["mlir_air_pct_of_air_tuned"] = f"{pct:.3f}"
+        mlir.extra_fields["passes_air_tuned_95pct"] = (
+            "yes" if pct >= AIR_TUNED_ACCEPTANCE_PCT else "no"
+        )
+    m_row = mlir.to_row()
+    a_row = air_tuned.to_row()
+    lds_ops_m = str(mlir.counters.get("ds_read", 0) + mlir.counters.get("ds_write", 0))
+    lds_ops_a = str(
+        air_tuned.counters.get("ds_read", 0) + air_tuned.counters.get("ds_write", 0)
+    )
+    delta_sources = {
+        "static_delta_wmma": (m_row.get("wmma", ""), a_row.get("wmma", "")),
+        "static_delta_global_load_b128": (
+            m_row.get("global_load_b128", ""),
+            a_row.get("global_load_b128", ""),
+        ),
+        "static_delta_lds_ops": (lds_ops_m, lds_ops_a),
+        "static_delta_barriers": (m_row.get("barriers", ""), a_row.get("barriers", "")),
+        "static_delta_waitcnt": (m_row.get("waitcnt", ""), a_row.get("waitcnt", "")),
+        "static_delta_vgprs": (m_row.get("vgprs", ""), a_row.get("vgprs", "")),
+        "static_delta_sgprs": (m_row.get("sgprs", ""), a_row.get("sgprs", "")),
+        "static_delta_lds_bytes": (
+            m_row.get("group_segment_bytes", ""),
+            a_row.get("group_segment_bytes", ""),
+        ),
+        "static_delta_scratch_markers": (
+            m_row.get("scratch_markers", ""),
+            a_row.get("scratch_markers", ""),
+        ),
+        "static_delta_vgpr_spills": (
+            m_row.get("vgpr_spills", ""),
+            a_row.get("vgpr_spills", ""),
+        ),
+        "static_delta_sgpr_spills": (
+            m_row.get("sgpr_spills", ""),
+            a_row.get("sgpr_spills", ""),
+        ),
+    }
+    for key, (lhs, rhs) in delta_sources.items():
+        mlir.extra_fields[key] = static_delta(lhs, rhs)
+
+
 def air_tuned_comparison_notes(
     mlir: KernelEvidence, air_tuned: KernelEvidence
 ) -> list[str]:
@@ -1422,6 +1557,59 @@ def write_reports(
                 f"{row['group_segment_bytes'] or 'n/a'} | {row['wmma'] or '0'} | {row['barriers'] or '0'} | "
                 f"{row['waitcnt'] or '0'} | `{row['isa_path'] or 'n/a'}` |\n"
             )
+        mlir_row = mlir.to_row()
+        f.write("\n## Optimization Gates\n\n")
+        f.write("| Field | Value |\n| --- | --- |\n")
+        f.write(
+            "| MLIR-AIR / air_tuned median TOPS | `{}` |\n".format(
+                (mlir_row.get("mlir_air_pct_of_air_tuned", "") + "%")
+                if mlir_row.get("mlir_air_pct_of_air_tuned", "")
+                else "n/a"
+            )
+        )
+        f.write(
+            "| Passes 95% air_tuned gate | `{}` |\n".format(
+                mlir_row.get("passes_air_tuned_95pct", "") or "n/a"
+            )
+        )
+        f.write(
+            "| Candidate improvement vs accepted best | `{}` |\n".format(
+                (mlir_row.get("candidate_improvement_pct", "") + "%")
+                if mlir_row.get("candidate_improvement_pct", "")
+                else "n/a"
+            )
+        )
+        f.write(
+            "| Keep candidate | `{}` |\n".format(
+                mlir_row.get("keep_candidate", "") or "n/a"
+            )
+        )
+        f.write(
+            "| Static delta WMMA | `{}` |\n".format(
+                mlir_row.get("static_delta_wmma", "") or "n/a"
+            )
+        )
+        f.write(
+            "| Static delta b128 global loads | `{}` |\n".format(
+                mlir_row.get("static_delta_global_load_b128", "") or "n/a"
+            )
+        )
+        f.write(
+            "| Static delta LDS ops | `{}` |\n".format(
+                mlir_row.get("static_delta_lds_ops", "") or "n/a"
+            )
+        )
+        f.write(
+            "| Static delta waitcnt | `{}` |\n".format(
+                mlir_row.get("static_delta_waitcnt", "") or "n/a"
+            )
+        )
+        f.write(
+            "| Static delta VGPR / SGPR | `{}` / `{}` |\n".format(
+                mlir_row.get("static_delta_vgprs", "") or "n/a",
+                mlir_row.get("static_delta_sgprs", "") or "n/a",
+            )
+        )
         f.write("\n## Static Ratios\n\n")
         f.write(
             "| Kernel | WMMA/barrier | WMMA/waitcnt | global_load_b128/WMMA | LDS ops/WMMA | ds_swizzle | Scratch |\n"
@@ -1584,6 +1772,7 @@ def main(argv: Sequence[str]) -> int:
     tensile = build_tensile_evidence(
         args, rows, llvm_objdump, llvm_readobj, artifacts_dir
     )
+    annotate_mlir_air_tuned_gate(mlir, air_tuned)
     report_rows = [mlir.to_row()]
     if air_tuned.status != "SKIP":
         report_rows.append(air_tuned.to_row())

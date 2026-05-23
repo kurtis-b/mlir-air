@@ -293,10 +293,13 @@ struct ConvertAIRToROCDLPass
 
     OpBuilder builder(launchOp);
     Location loc = launchOp.getLoc();
-    Value gridX = arith::ConstantIndexOp::create(builder, loc,
-                                                 1024 / config->blockCols);
-    Value gridY = arith::ConstantIndexOp::create(builder, loc,
-                                                 1024 / config->blockRows);
+    int64_t gridTilesM = 1024 / config->blockRows;
+    int64_t gridTilesN = 1024 / config->blockCols;
+    int64_t gridXSize = usesLinearGroupedGrid(*config) ? gridTilesM * gridTilesN
+                                                       : gridTilesN;
+    int64_t gridYSize = usesLinearGroupedGrid(*config) ? 1 : gridTilesM;
+    Value gridX = arith::ConstantIndexOp::create(builder, loc, gridXSize);
+    Value gridY = arith::ConstantIndexOp::create(builder, loc, gridYSize);
     Value gridZ = arith::ConstantIndexOp::create(builder, loc, 1);
     Value blockX = arith::ConstantIndexOp::create(
         builder, loc, config->effectiveBlockDimX());

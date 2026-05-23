@@ -31,6 +31,7 @@ Usage: disassemble.sh gpu [options] <input.air.mlir>
   --opt-level N         ROCDL optimization level (default: 3)
   --int8-gemm-variant V AIR GPU INT8 GEMM variant for marked launches
   --int8-gemm-group-size N AIR GPU INT8 GEMM grouped M size
+  --gpu-bare-ptr-kernels use bare-pointer GPU kernel ABI/lowering
   --expect REGEX        required extracted-ISA pattern; repeatable
   --forbid REGEX        forbidden extracted-ISA pattern; repeatable
   -h, --help            show this help
@@ -174,7 +175,8 @@ run_cpu() {
 
 run_gpu() {
   OUTDIR=""; PREFIX=""
-  local gpu_chip="${AIR_GPU_CHIP:-gfx1150}" opt_level="3" int8_gemm_variant="${AIR_INT8_GEMM_VARIANT:-}" int8_gemm_group_size="${AIR_INT8_GEMM_GROUP_SIZE:-}" input="" rocdl_mlir outline_mlir outline_llvm_mlir isa_mlir isa_asm bin_mlir code_object readobj final_mlir summary rocdl_pipeline air_to_rocdl_pass air_gpu_outlining_pass air_to_rocdl_options air_gpu_outlining_options
+  local gpu_chip="${AIR_GPU_CHIP:-gfx1150}" opt_level="3" int8_gemm_variant="${AIR_INT8_GEMM_VARIANT:-}" int8_gemm_group_size="${AIR_INT8_GEMM_GROUP_SIZE:-}" input="" rocdl_mlir outline_mlir outline_llvm_mlir isa_mlir isa_asm bin_mlir code_object readobj final_mlir summary rocdl_pipeline rocdl_convert_options gpu_to_llvm_pass air_to_rocdl_pass air_gpu_outlining_pass air_to_rocdl_options air_gpu_outlining_options
+  local use_bare_ptr_kernel=0
   local -a expect=() forbid=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -184,6 +186,7 @@ run_gpu() {
       --opt-level) opt_level="${2:?missing value for --opt-level}"; shift 2 ;;
       --int8-gemm-variant) int8_gemm_variant="${2:?missing value for --int8-gemm-variant}"; shift 2 ;;
       --int8-gemm-group-size) int8_gemm_group_size="${2:?missing value for --int8-gemm-group-size}"; shift 2 ;;
+      --gpu-bare-ptr-kernels) use_bare_ptr_kernel=1; shift ;;
       --expect) expect+=("${2:?missing value for --expect}"); shift 2 ;;
       --forbid) forbid+=("${2:?missing value for --forbid}"); shift 2 ;;
       -h|--help) gpu_usage; exit 0 ;;
@@ -219,18 +222,27 @@ run_gpu() {
     air_to_rocdl_pass="-air-to-rocdl=${air_to_rocdl_options}"
     air_gpu_outlining_pass="-air-gpu-outlining=${air_gpu_outlining_options}"
   fi
+  case "$int8_gemm_variant" in
+    *rawptr*) use_bare_ptr_kernel=1 ;;
+  esac
   "$AIR_OPT" "$input" "$air_to_rocdl_pass" -o "$rocdl_mlir"
   "$AIR_OPT" "$rocdl_mlir" "$air_gpu_outlining_pass" -o "$outline_mlir"
   "$MLIR_OPT" "--pass-pipeline=builtin.module(func.func(lower-affine,convert-linalg-to-loops,convert-scf-to-cf),gpu-kernel-outlining)" "$outline_mlir" -o "$outline_llvm_mlir"
-  rocdl_pipeline="rocdl-attach-target{chip=${gpu_chip} O=${opt_level}},gpu.module(convert-scf-to-cf,convert-gpu-to-rocdl{chipset=${gpu_chip} runtime=HIP},reconcile-unrealized-casts)"
+  rocdl_convert_options="chipset=${gpu_chip} runtime=HIP"
+  gpu_to_llvm_pass="gpu-to-llvm"
+  if [ "$use_bare_ptr_kernel" -eq 1 ]; then
+    rocdl_convert_options="${rocdl_convert_options} index-bitwidth=32 use-bare-ptr-memref-call-conv=true"
+    gpu_to_llvm_pass="gpu-to-llvm{use-bare-pointers-for-kernels=true}"
+  fi
+  rocdl_pipeline="rocdl-attach-target{chip=${gpu_chip} O=${opt_level}},gpu.module(convert-scf-to-cf,convert-gpu-to-rocdl{${rocdl_convert_options}},reconcile-unrealized-casts)"
   "$MLIR_OPT" "--pass-pipeline=builtin.module(${rocdl_pipeline},gpu-module-to-binary{format=isa})" "$outline_llvm_mlir" -o "$isa_mlir"
   "$MLIR_OPT" "--pass-pipeline=builtin.module(${rocdl_pipeline},gpu-module-to-binary{format=bin})" "$outline_llvm_mlir" -o "$bin_mlir"
-  "$MLIR_OPT" "--pass-pipeline=builtin.module(${rocdl_pipeline},gpu-module-to-binary{format=bin},func.func(gpu-async-region,convert-scf-to-cf),gpu-to-llvm,convert-to-llvm,reconcile-unrealized-casts)" "$outline_llvm_mlir" -o "$final_mlir"
+  "$MLIR_OPT" "--pass-pipeline=builtin.module(${rocdl_pipeline},gpu-module-to-binary{format=bin},func.func(gpu-async-region,convert-scf-to-cf),${gpu_to_llvm_pass},convert-to-llvm,reconcile-unrealized-casts)" "$outline_llvm_mlir" -o "$final_mlir"
   extract_mlir_attr "$isa_mlir" "$isa_asm" assembly text
   extract_mlir_attr "$bin_mlir" "$code_object" bin bin
   if [ -n "${LLVM_READOBJ:-}" ]; then "$LLVM_READOBJ" --file-headers --notes --sections --symbols "$code_object" > "$readobj"; else printf 'llvm-readobj not found; code object metadata dump skipped\n' > "$readobj"; fi
   {
-    echo "# GPU ISA summary"; echo "input: $input"; echo "gpu_arch: $gpu_chip"; [ -z "$int8_gemm_variant" ] || echo "int8_gemm_variant: $int8_gemm_variant"; [ -z "$int8_gemm_group_size" ] || echo "int8_gemm_group_size: $int8_gemm_group_size"; echo "air_opt: $AIR_OPT"; echo "mlir_opt: $MLIR_OPT"; echo "llvm_readobj: ${LLVM_READOBJ:-unavailable}"
+    echo "# GPU ISA summary"; echo "input: $input"; echo "gpu_arch: $gpu_chip"; [ -z "$int8_gemm_variant" ] || echo "int8_gemm_variant: $int8_gemm_variant"; [ -z "$int8_gemm_group_size" ] || echo "int8_gemm_group_size: $int8_gemm_group_size"; echo "bare_ptr_kernel_abi: $use_bare_ptr_kernel"; echo "air_opt: $AIR_OPT"; echo "mlir_opt: $MLIR_OPT"; echo "llvm_readobj: ${LLVM_READOBJ:-unavailable}"
     echo; echo "## Artifacts"; printf '%s\n' "$rocdl_mlir" "$outline_mlir" "$outline_llvm_mlir" "$isa_mlir" "$isa_asm" "$bin_mlir" "$code_object" "$readobj" "$final_mlir"
     echo; grep -aoE 'gpu\.binary @[A-Za-z0-9_.$-]+|chip = "[^"]+"|sgpr_spill_count = [0-9]+ : i64|vgpr_spill_count = [0-9]+ : i64|sgpr_count = [0-9]+ : i64|vgpr_count = [0-9]+ : i64|wavefront_size = [0-9]+ : i64' "$final_mlir" || true
     grep -E 'Format:|Arch:|EF_AMDGPU|NT_AMDGPU_METADATA|\.sgpr_count|\.sgpr_spill_count|\.vgpr_count|\.vgpr_spill_count|\.wavefront_size|amdhsa\.target' "$readobj" || true
