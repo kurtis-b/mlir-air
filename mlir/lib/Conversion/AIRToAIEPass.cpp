@@ -6998,7 +6998,8 @@ void AIRLinalgToFuncPass::runOnOperation() {
   target.addLegalDialect<affine::AffineDialect, arith::ArithDialect,
                          func::FuncDialect, memref::MemRefDialect,
                          scf::SCFDialect, air::airDialect, AIE::AIEDialect,
-                         cf::ControlFlowDialect, ub::UBDialect>();
+                         cf::ControlFlowDialect, ub::UBDialect,
+                         vector::VectorDialect>();
   target.addLegalOp<ModuleOp, func::FuncOp, func::ReturnOp>();
   RewritePatternSet patterns(&getContext());
   patterns.insert<AIRLinalgOpToLibraryCallRewrite>(&getContext(), clLinkWith);

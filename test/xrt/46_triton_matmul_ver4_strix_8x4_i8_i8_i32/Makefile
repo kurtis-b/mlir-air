@@ -61,6 +61,18 @@ WARMUPS ?= 10
 ITERATIONS ?= 20
 RUNTIME_LOOP_TILING ?= 2,4
 TRANSFORM_VARIANT ?= default
+KERNEL_IMPL ?= vectorized
+EXTERNAL_KERNEL_OBJECT ?= $(abspath $(BUILD_DIR)/mm.o)
+ifeq ($(KERNEL_IMPL),external-mmul)
+  ifneq ($(AIE_TARGET),aie2p)
+    $(error KERNEL_IMPL=external-mmul requires AIE_TARGET=aie2p)
+  endif
+  ifneq ($(TARGET_DEVICE),npu2)
+    $(error KERNEL_IMPL=external-mmul requires TARGET_DEVICE=npu2)
+  endif
+  EXTERNAL_KERNEL_ARG := --external-kernel-object $(EXTERNAL_KERNEL_OBJECT)
+  EXTERNAL_KERNEL_DEP := $(EXTERNAL_KERNEL_OBJECT)
+endif
 
 # Trace controls. Trace timing is diagnostic and should not be used for acceptance.
 TRACE_SIZE ?= 0
@@ -77,6 +89,13 @@ STATIC_REPORT_PREFIX ?= npu_gemm
 # Environment setup.
 AIEOPT_DIR ?= $(shell realpath $(dir $(shell which aie-opt))/..)
 DISASSEMBLE ?= $(repodir)/utils/isa_inspect/disassemble.sh
+ifeq ($(AIE_TARGET),aie2p)
+  PEANO_TARGET := aie2p-none-unknown-elf
+else
+  PEANO_TARGET := aie2-none-unknown-elf
+endif
+WARNING_FLAGS ?= -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body
+PEANO_FLAGS ?= -O2 -std=c++20 --target=$(PEANO_TARGET) $(WARNING_FLAGS) -DNDEBUG -I$(AIEOPT_DIR)/include
 
 RUN_PY_COMMON_ARGS := \
 	$(INPUT_IR_ARG) \
@@ -90,6 +109,8 @@ RUN_PY_COMMON_ARGS := \
 	--output-format $(OUTPUT_FORMAT) \
 	--artifact-dir $(ARTIFACT_DIR) \
 	--transform-variant $(TRANSFORM_VARIANT) \
+	--kernel-impl $(KERNEL_IMPL) \
+	$(EXTERNAL_KERNEL_ARG) \
 	--trace-size $(TRACE_SIZE) \
 	--trace-offset $(TRACE_OFFSET) \
 	--trace-file $(TRACE_FILE) \
@@ -112,23 +133,34 @@ PROFILE_ARGS := \
 	--acceptance-tops $(ACCEPTANCE_TOPS) \
 	$(REQUIRE_ACCEPTANCE_ARG)
 
-.PHONY: all run run-aie2 run-aie2p compile-xclbin profile build-test-exe debug_ir static-report disassemble acceptance-int8 clean
+.PHONY: all run run-aie2 run-aie2p compile-xclbin profile build-test-exe build-external-mmul debug_ir static-report disassemble acceptance-int8 acceptance-int8-external clean
 
 all: run
 
 run: run-$(AIE_TARGET)
 
-run-aie2:
+run-aie2: $(EXTERNAL_KERNEL_DEP)
 	mkdir -p $(BUILD_DIR) $(ARTIFACT_DIR)
 	cd $(BUILD_DIR) && $(PYTHON) $(srcdir)/run.py $(RUN_PY_COMMON_ARGS)
 
-run-aie2p:
+run-aie2p: $(EXTERNAL_KERNEL_DEP)
 	mkdir -p $(BUILD_DIR) $(ARTIFACT_DIR)
 	cd $(BUILD_DIR) && $(PYTHON) $(srcdir)/run.py $(RUN_PY_COMMON_ARGS)
 
-compile-xclbin: static-report
+compile-xclbin: static-report $(EXTERNAL_KERNEL_DEP)
 	mkdir -p $(BUILD_DIR) $(ARTIFACT_DIR)
 	cd $(BUILD_DIR) && $(PYTHON) $(srcdir)/run.py $(RUN_PY_COMMON_ARGS) --compile-only
+
+build-external-mmul: $(EXTERNAL_KERNEL_OBJECT)
+
+$(EXTERNAL_KERNEL_OBJECT): $(srcdir)/mm.cc
+	@mkdir -p $(dir $@)
+	@if [ -z "$(PEANO_INSTALL_DIR)" ]; then \
+		echo "Error: PEANO_INSTALL_DIR is not set. Please source the Peano environment or export PEANO_INSTALL_DIR."; \
+		exit 1; \
+	fi
+	$(PEANO_INSTALL_DIR)/bin/clang++ $(PEANO_FLAGS) -c $< -o $@
+	@echo "Kernel compiled successfully: $@"
 
 profile: compile-xclbin build-test-exe
 	cd $(BUILD_DIR) && ./test.exe $(PROFILE_ARGS)
@@ -139,6 +171,16 @@ acceptance-int8:
 		TILE_M=$(SOTA_TILE_M) TILE_N=$(SOTA_TILE_N) \
 		OUTPUT_TYPE=int8 B_LAYOUT=column TRANSFORM_VARIANT=sota-int8 \
 		WARMUPS=20 ITERATIONS=100 VALIDATION=samples REQUIRE_ACCEPTANCE=1 \
+		ACCEPTANCE_TOPS=$(ACCEPTANCE_TOPS) BUILD_DIR=$(BUILD_DIR) \
+		ARTIFACT_DIR=$(ARTIFACT_DIR) TRANSFORM_SCRIPT_PATH=$(TRANSFORM_SCRIPT)
+
+acceptance-int8-external:
+	$(MAKE) -f $(srcdir)/Makefile profile \
+		M=$(SOTA_M) K=$(SOTA_K) N=$(SOTA_N) \
+		TILE_M=$(SOTA_TILE_M) TILE_N=$(SOTA_TILE_N) \
+		OUTPUT_TYPE=int8 B_LAYOUT=column TRANSFORM_VARIANT=sota-int8 \
+		KERNEL_IMPL=external-mmul WARMUPS=20 ITERATIONS=100 \
+		VALIDATION=samples REQUIRE_ACCEPTANCE=1 \
 		ACCEPTANCE_TOPS=$(ACCEPTANCE_TOPS) BUILD_DIR=$(BUILD_DIR) \
 		ARTIFACT_DIR=$(ARTIFACT_DIR) TRANSFORM_SCRIPT_PATH=$(TRANSFORM_SCRIPT)
 
@@ -186,6 +228,7 @@ static-report:
 		--runtime-loop-tiling $(RUNTIME_LOOP_TILING) \
 		--trace-size $(TRACE_SIZE) \
 		--transform-variant $(TRANSFORM_VARIANT) \
+		--kernel-impl $(KERNEL_IMPL) \
 		--acceptance-tops $(ACCEPTANCE_TOPS) \
 		--transform-script $(TRANSFORM_SCRIPT) \
 		--transformed-ir $(BUILD_DIR)/$(DEBUG_IR_PATH) \

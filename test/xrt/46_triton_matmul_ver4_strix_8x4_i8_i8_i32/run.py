@@ -24,6 +24,7 @@ DEFAULT_TILE_M = 512
 DEFAULT_TILE_N = 256
 SOTA_TILE_M = 576
 SOTA_TILE_N = 1152
+EXTERNAL_MMUL_FUNCTION = "matmul_i8_i8_i8_acc32_strix"
 
 
 def positive_int(value: str) -> int:
@@ -68,12 +69,7 @@ def validate_shape(m: int, k: int, n: int, tile_m: int, tile_n: int) -> None:
         raise ValueError("; ".join(errors))
 
 
-def render_transform_variant(transform_text: str, variant: str) -> str:
-    if variant == "default":
-        return transform_text
-    if variant != "sota-int8":
-        raise ValueError(f"unknown transform variant: {variant}")
-
+def render_sota_int8_transform(transform_text: str) -> str:
     replacements = [
         (
             "tile_using_for %copy1 tile_sizes [0, 64]",
@@ -118,6 +114,85 @@ def render_transform_variant(transform_text: str, variant: str) -> str:
             raise ValueError(f"expected one transform fragment for {old!r}")
         rendered = rendered.replace(old, new, 1)
     return rendered
+
+
+def render_external_mmul_transform(transform_text: str) -> str:
+    rendered = render_sota_int8_transform(transform_text)
+    phase9_marker = (
+        "    //==========================================================================\n"
+        "    // PHASE 9:"
+    )
+    if rendered.count(phase9_marker) != 1:
+        raise ValueError("expected one PHASE 9 marker in transform script")
+    prefix = rendered.split(phase9_marker, 1)[0]
+    return (
+        prefix
+        + f"""    //==========================================================================
+    // PHASE 9: ROUTE COMPUTE TO EXTERNAL AIE2P MMUL KERNEL
+    // Purpose: Keep the existing memory layout and herd mapping while replacing
+    // the scalar/vector.contract compute body with a linked Peano mmul kernel.
+    //==========================================================================
+
+        %generic_fill = transform.structured.match ops{{["linalg.generic"]}} attributes{{init_fill}} in %arg1 : (!transform.any_op) -> !transform.any_op
+        %inner_most_fills, %vec_fill_loops:2 =
+          transform.structured.tile_using_for %generic_fill tile_sizes [1, 1]
+          : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+
+        %matmul_external = transform.structured.match ops{{["linalg.generic"]}} attributes{{matmul_compute}} in %arg1 : (!transform.any_op) -> !transform.any_op
+        %mmul_name = transform.param.constant "{EXTERNAL_MMUL_FUNCTION}" -> !transform.any_param
+        transform.annotate %matmul_external "library_call" = %mmul_name : !transform.any_op, !transform.any_param
+
+    //==========================================================================
+    // PHASE 10: CONVERT TO AIE HERDS AND VECTORIZE NON-COMPUTE HERDS
+    // Purpose: Map parallel work to the 8x4 logical AIE split. The compute herd
+    // stays as a library call so aircc lowers it to the linked AIE2P object.
+    //==========================================================================
+
+        %forall1 = transform.structured.match ops{{["scf.forall"]}} attributes{{prologue_forall}} in %arg1 : (!transform.any_op) -> !transform.any_op
+        %forall2 = transform.structured.match ops{{["scf.forall"]}} attributes{{compute_forall}} in %arg1 : (!transform.any_op) -> !transform.any_op
+        %forall3 = transform.structured.match ops{{["scf.forall"]}} attributes{{epilogue_forall}} in %arg1 : (!transform.any_op) -> !transform.any_op
+        %parallel1 = transform.loop.forall_to_parallel %forall1  : (!transform.any_op) -> !transform.any_op
+        %herd1 = transform.air.par_to_herd %parallel1 {{first_dim = 1}} : (!transform.any_op) -> !transform.any_op
+        transform.annotate %herd1 "prologue_herd" : !transform.any_op
+        %parallel2 = transform.loop.forall_to_parallel %forall2  : (!transform.any_op) -> !transform.any_op
+        %herd2 = transform.air.par_to_herd %parallel2 {{first_dim = 1}} : (!transform.any_op) -> !transform.any_op
+        transform.annotate %herd2 "compute_herd" : !transform.any_op
+        %parallel3 = transform.loop.forall_to_parallel %forall3  : (!transform.any_op) -> !transform.any_op
+        %herd3 = transform.air.par_to_herd %parallel3 {{first_dim = 1}} : (!transform.any_op) -> !transform.any_op
+        transform.annotate %herd3 "epilogue_herd" : !transform.any_op
+
+        %vectorized_herd1 = transform.air.herd_vectorize %herd1 : (!transform.any_op) -> !transform.any_op
+        %vectorized_herd3 = transform.air.herd_vectorize %herd3 : (!transform.any_op) -> !transform.any_op
+
+        %func7 = transform.structured.match ops{{["func.func"]}} in %arg1 : (!transform.any_op) -> !transform.any_op
+        transform.apply_patterns to %func7 {{
+            transform.apply_patterns.linalg.tiling_canonicalization
+            transform.apply_patterns.scf.for_loop_canonicalization
+            transform.apply_patterns.canonicalization
+            transform.apply_patterns.memref.fold_memref_alias_ops
+        }} : !transform.any_op
+        %func_fold_1 = transform.structured.match ops{{["func.func"]}} in %arg1 : (!transform.any_op) -> !transform.any_op
+        %func_folded_1 = transform.air.fold_unit_extent_dims %func_fold_1 : (!transform.any_op) -> !transform.any_op
+
+    transform.yield
+  }}
+}}
+"""
+    )
+
+
+def render_transform_variant(
+    transform_text: str, variant: str, kernel_impl: str
+) -> str:
+    if kernel_impl == "external-mmul":
+        if variant != "sota-int8":
+            raise ValueError("external-mmul requires --transform-variant=sota-int8")
+        return render_external_mmul_transform(transform_text)
+    if variant == "default":
+        return transform_text
+    if variant == "sota-int8":
+        return render_sota_int8_transform(transform_text)
+    raise ValueError(f"unknown transform variant: {variant}")
 
 
 def build_matmul_ir(
@@ -215,6 +290,8 @@ def write_compile_config(args: argparse.Namespace, generated_ir: str | None) -> 
         "runtime_loop_tiling_sizes": args.runtime_loop_tiling_sizes,
         "transform_script": args.transform_script,
         "transform_variant": args.transform_variant,
+        "kernel_impl": args.kernel_impl,
+        "external_kernel_object": args.external_kernel_object,
         "input_ir": args.input_ir or "generated",
         "output_format": args.output_format,
         "target_device": args.target_device,
@@ -263,6 +340,17 @@ def parse_args() -> argparse.Namespace:
         choices=["default", "sota-int8"],
         default="default",
         help="Optional transform rewrite applied after loading --transform-script",
+    )
+    parser.add_argument(
+        "--kernel-impl",
+        choices=["vectorized", "external-mmul"],
+        default="vectorized",
+        help="Compute implementation selected after tiling (default: vectorized)",
+    )
+    parser.add_argument(
+        "--external-kernel-object",
+        default=None,
+        help="Object file linked when --kernel-impl=external-mmul",
     )
     parser.add_argument(
         "--compile-only",
@@ -325,6 +413,22 @@ def parse_args() -> argparse.Namespace:
         args.runtime_loop_tiling_sizes
     )
     validate_shape(args.m, args.k, args.n, args.tile_m, args.tile_n)
+    if args.kernel_impl == "external-mmul":
+        errors = []
+        if args.transform_variant != "sota-int8":
+            errors.append("external-mmul requires --transform-variant=sota-int8")
+        if args.output_type != "int8":
+            errors.append("external-mmul currently supports --output-type=int8 only")
+        if args.tile_m != SOTA_TILE_M or args.tile_n != SOTA_TILE_N:
+            errors.append(
+                f"external-mmul requires tile shape {SOTA_TILE_M}x{SOTA_TILE_N}"
+            )
+        if args.k % 72:
+            errors.append("external-mmul requires K to be a multiple of 72")
+        if not args.external_kernel_object:
+            errors.append("external-mmul requires --external-kernel-object")
+        if errors:
+            raise ValueError("; ".join(errors))
     return args
 
 
@@ -358,6 +462,7 @@ with air.ir.Context() as ctx, Location.unknown():
     transform_ir_string = render_transform_variant(
         Path(args.transform_script).read_text(encoding="utf-8"),
         args.transform_variant,
+        args.kernel_impl,
     )
     if args.artifact_dir:
         artifact_dir = Path(args.artifact_dir)
@@ -412,6 +517,8 @@ with air.ir.Context() as ctx, Location.unknown():
         trace_size=args.trace_size,
         target_device=args.target_device,
     )
+    if args.kernel_impl == "external-mmul":
+        backend_kwargs["lower_linalg_to_func"] = args.external_kernel_object
 
     if args.compile_only:
         print(f"Compile-only mode: generating {output_ext} binary...")
@@ -427,6 +534,9 @@ with air.ir.Context() as ctx, Location.unknown():
         print(f"output_type={args.output_type}")
         print(f"b_layout={args.b_layout}")
         print(f"transform_variant={args.transform_variant}")
+        print(f"kernel_impl={args.kernel_impl}")
+        if args.external_kernel_object:
+            print(f"external_kernel_object={args.external_kernel_object}")
         raise SystemExit(0)
 
     input_type = np.int8

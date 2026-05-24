@@ -18,6 +18,7 @@ DEFAULT_TILE_M = 512
 DEFAULT_TILE_N = 256
 DEFAULT_ACCEPTANCE_TOPS = 36.15
 PUBLISHED_SOTA_TOPS = 38.05
+EXTERNAL_MMUL_FUNCTION = "matmul_i8_i8_i8_acc32_strix"
 
 
 def positive_int(value: str) -> int:
@@ -238,6 +239,10 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
         "b_layout": args.b_layout,
         "runtime_loop_tiling": args.runtime_loop_tiling,
         "transform_variant": args.transform_variant,
+        "kernel_impl": args.kernel_impl,
+        "external_kernel_function": (
+            EXTERNAL_MMUL_FUNCTION if args.kernel_impl == "external-mmul" else None
+        ),
         "trace_mode": "packet" if args.trace_size else "off",
         "trace_size": args.trace_size,
         "transform": transform,
@@ -282,6 +287,7 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
             "k_reduction_in_time": transform["k_reduction_elements_per_step"] < args.k,
             "bd_overlap_candidate": pingpong_eligible
             and args.runtime_loop_tiling != "1,1",
+            "dense_aie2p_mmul_candidate": args.kernel_impl == "external-mmul",
         },
     }
 
@@ -307,6 +313,9 @@ def write_markdown(path: Path, report: dict[str, Any], json_path: Path) -> None:
         f.write(f"| B layout | `{report['b_layout']}` |\n")
         f.write(f"| Runtime loop tiling | `{report['runtime_loop_tiling']}` |\n")
         f.write(f"| Transform variant | `{report['transform_variant']}` |\n")
+        f.write(f"| Kernel impl | `{report['kernel_impl']}` |\n")
+        if report["external_kernel_function"]:
+            f.write(f"| External kernel | `{report['external_kernel_function']}` |\n")
         f.write(f"| Trace mode | `{report['trace_mode']}` |\n")
         f.write(f"| Acceptance TOPS | `{report['acceptance_tops']:.2f}` |\n")
         f.write(f"| Published SOTA TOPS | `{report['published_sota_tops']:.2f}` |\n")
@@ -374,6 +383,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trace-size", type=nonnegative_int, default=0)
     parser.add_argument(
         "--transform-variant", choices=["default", "sota-int8"], default="default"
+    )
+    parser.add_argument(
+        "--kernel-impl", choices=["vectorized", "external-mmul"], default="vectorized"
     )
     parser.add_argument(
         "--acceptance-tops", type=positive_float, default=DEFAULT_ACCEPTANCE_TOPS
