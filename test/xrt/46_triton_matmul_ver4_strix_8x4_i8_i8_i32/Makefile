@@ -62,7 +62,11 @@ ITERATIONS ?= 20
 RUNTIME_LOOP_TILING ?= 2,4
 TRANSFORM_VARIANT ?= default
 KERNEL_IMPL ?= vectorized
-EXTERNAL_KERNEL_OBJECT ?= $(abspath $(BUILD_DIR)/mm.o)
+OMIT_PING_PONG ?=
+EXTERNAL_K_PACKS ?= 9
+EXTERNAL_BLOCK_M ?= 2
+EXTERNAL_BLOCK_N ?= 2
+EXTERNAL_KERNEL_OBJECT ?= $(abspath $(BUILD_DIR)/mm_k$(EXTERNAL_K_PACKS)_bm$(EXTERNAL_BLOCK_M)_bn$(EXTERNAL_BLOCK_N).o)
 ifeq ($(KERNEL_IMPL),external-mmul)
   ifneq ($(AIE_TARGET),aie2p)
     $(error KERNEL_IMPL=external-mmul requires AIE_TARGET=aie2p)
@@ -72,6 +76,9 @@ ifeq ($(KERNEL_IMPL),external-mmul)
   endif
   EXTERNAL_KERNEL_ARG := --external-kernel-object $(EXTERNAL_KERNEL_OBJECT)
   EXTERNAL_KERNEL_DEP := $(EXTERNAL_KERNEL_OBJECT)
+endif
+ifneq ($(OMIT_PING_PONG),)
+  OMIT_PING_PONG_ARG := --omit-ping-pong $(OMIT_PING_PONG)
 endif
 
 # Trace controls. Trace timing is diagnostic and should not be used for acceptance.
@@ -111,6 +118,10 @@ RUN_PY_COMMON_ARGS := \
 	--transform-variant $(TRANSFORM_VARIANT) \
 	--kernel-impl $(KERNEL_IMPL) \
 	$(EXTERNAL_KERNEL_ARG) \
+	--external-k-packs $(EXTERNAL_K_PACKS) \
+	--external-block-m $(EXTERNAL_BLOCK_M) \
+	--external-block-n $(EXTERNAL_BLOCK_N) \
+	$(OMIT_PING_PONG_ARG) \
 	--trace-size $(TRACE_SIZE) \
 	--trace-offset $(TRACE_OFFSET) \
 	--trace-file $(TRACE_FILE) \
@@ -159,7 +170,7 @@ $(EXTERNAL_KERNEL_OBJECT): $(srcdir)/mm.cc
 		echo "Error: PEANO_INSTALL_DIR is not set. Please source the Peano environment or export PEANO_INSTALL_DIR."; \
 		exit 1; \
 	fi
-	$(PEANO_INSTALL_DIR)/bin/clang++ $(PEANO_FLAGS) -c $< -o $@
+	$(PEANO_INSTALL_DIR)/bin/clang++ $(PEANO_FLAGS) -DEXTERNAL_K_PACKS=$(EXTERNAL_K_PACKS) -DEXTERNAL_BLOCK_M=$(EXTERNAL_BLOCK_M) -DEXTERNAL_BLOCK_N=$(EXTERNAL_BLOCK_N) -c $< -o $@
 	@echo "Kernel compiled successfully: $@"
 
 profile: compile-xclbin build-test-exe
@@ -229,6 +240,10 @@ static-report:
 		--trace-size $(TRACE_SIZE) \
 		--transform-variant $(TRANSFORM_VARIANT) \
 		--kernel-impl $(KERNEL_IMPL) \
+		--external-k-packs $(EXTERNAL_K_PACKS) \
+		--external-block-m $(EXTERNAL_BLOCK_M) \
+		--external-block-n $(EXTERNAL_BLOCK_N) \
+		$(OMIT_PING_PONG_ARG) \
 		--acceptance-tops $(ACCEPTANCE_TOPS) \
 		--transform-script $(TRANSFORM_SCRIPT) \
 		--transformed-ir $(BUILD_DIR)/$(DEBUG_IR_PATH) \

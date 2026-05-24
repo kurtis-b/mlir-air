@@ -25,6 +25,9 @@ DEFAULT_TILE_N = 256
 SOTA_TILE_M = 576
 SOTA_TILE_N = 1152
 EXTERNAL_MMUL_FUNCTION = "matmul_i8_i8_i8_acc32_strix"
+DEFAULT_EXTERNAL_K_PACKS = 9
+DEFAULT_EXTERNAL_BLOCK_M = 2
+DEFAULT_EXTERNAL_BLOCK_N = 2
 
 
 def positive_int(value: str) -> int:
@@ -69,19 +72,20 @@ def validate_shape(m: int, k: int, n: int, tile_m: int, tile_n: int) -> None:
         raise ValueError("; ".join(errors))
 
 
-def render_sota_int8_transform(transform_text: str) -> str:
+def render_sota_int8_transform(transform_text: str, k_packs: int = 9) -> str:
+    k_elements = k_packs * 8
     replacements = [
         (
             "tile_using_for %copy1 tile_sizes [0, 64]",
-            "tile_using_for %copy1 tile_sizes [0, 72]",
+            f"tile_using_for %copy1 tile_sizes [0, {k_elements}]",
         ),
         (
             "tile_using_for %copy2 tile_sizes [64]",
-            "tile_using_for %copy2 tile_sizes [72]",
+            f"tile_using_for %copy2 tile_sizes [{k_elements}]",
         ),
         (
             "tile_using_for %packed_c tile_sizes [0, 0, 8]",
-            "tile_using_for %packed_c tile_sizes [0, 0, 9]",
+            f"tile_using_for %packed_c tile_sizes [0, 0, {k_packs}]",
         ),
         (
             "tile_using_forall %matmul_1 tile_sizes [8, 8, 0]",
@@ -116,8 +120,8 @@ def render_sota_int8_transform(transform_text: str) -> str:
     return rendered
 
 
-def render_external_mmul_transform(transform_text: str) -> str:
-    rendered = render_sota_int8_transform(transform_text)
+def render_external_mmul_transform(transform_text: str, k_packs: int) -> str:
+    rendered = render_sota_int8_transform(transform_text, k_packs)
     phase9_marker = (
         "    //==========================================================================\n"
         "    // PHASE 9:"
@@ -182,12 +186,12 @@ def render_external_mmul_transform(transform_text: str) -> str:
 
 
 def render_transform_variant(
-    transform_text: str, variant: str, kernel_impl: str
+    transform_text: str, variant: str, kernel_impl: str, external_k_packs: int
 ) -> str:
     if kernel_impl == "external-mmul":
         if variant != "sota-int8":
             raise ValueError("external-mmul requires --transform-variant=sota-int8")
-        return render_external_mmul_transform(transform_text)
+        return render_external_mmul_transform(transform_text, external_k_packs)
     if variant == "default":
         return transform_text
     if variant == "sota-int8":
@@ -292,6 +296,10 @@ def write_compile_config(args: argparse.Namespace, generated_ir: str | None) -> 
         "transform_variant": args.transform_variant,
         "kernel_impl": args.kernel_impl,
         "external_kernel_object": args.external_kernel_object,
+        "external_k_packs": args.external_k_packs,
+        "external_block_m": args.external_block_m,
+        "external_block_n": args.external_block_n,
+        "omit_ping_pong": args.omit_ping_pong,
         "input_ir": args.input_ir or "generated",
         "output_format": args.output_format,
         "target_device": args.target_device,
@@ -351,6 +359,30 @@ def parse_args() -> argparse.Namespace:
         "--external-kernel-object",
         default=None,
         help="Object file linked when --kernel-impl=external-mmul",
+    )
+    parser.add_argument(
+        "--external-k-packs",
+        type=positive_int,
+        default=DEFAULT_EXTERNAL_K_PACKS,
+        help="Packed K tiles consumed by the external mmul kernel (default: 9)",
+    )
+    parser.add_argument(
+        "--external-block-m",
+        type=positive_int,
+        default=DEFAULT_EXTERNAL_BLOCK_M,
+        help="External mmul register-block packs along M (default: 2)",
+    )
+    parser.add_argument(
+        "--external-block-n",
+        type=positive_int,
+        default=DEFAULT_EXTERNAL_BLOCK_N,
+        help="External mmul register-block packs along N (default: 2)",
+    )
+    parser.add_argument(
+        "--omit-ping-pong",
+        choices=["L1", "L2", "all"],
+        default=None,
+        help="Forward --omit-ping-pong-transform to aircc for residency experiments",
     )
     parser.add_argument(
         "--compile-only",
@@ -423,8 +455,26 @@ def parse_args() -> argparse.Namespace:
             errors.append(
                 f"external-mmul requires tile shape {SOTA_TILE_M}x{SOTA_TILE_N}"
             )
-        if args.k % 72:
-            errors.append("external-mmul requires K to be a multiple of 72")
+        k_residency = args.external_k_packs * 8
+        block_shape = (args.external_block_m, args.external_block_n)
+        if block_shape not in ((2, 2), (3, 2)):
+            errors.append("external-mmul supports register blocks 2x2 or 3x2")
+        if args.external_k_packs > 18:
+            errors.append("external-mmul supports at most 18 packed K tiles")
+        if (
+            args.external_k_packs > DEFAULT_EXTERNAL_K_PACKS
+            and args.omit_ping_pong
+            not in (
+                "L1",
+                "all",
+            )
+        ):
+            errors.append(
+                "external-mmul K residency above 9 packs exceeds L1 with "
+                "ping-ponged A/B buffers; pass --omit-ping-pong L1 or all"
+            )
+        if args.k % k_residency:
+            errors.append(f"external-mmul requires K to be a multiple of {k_residency}")
         if not args.external_kernel_object:
             errors.append("external-mmul requires --external-kernel-object")
         if errors:
@@ -463,6 +513,7 @@ with air.ir.Context() as ctx, Location.unknown():
         Path(args.transform_script).read_text(encoding="utf-8"),
         args.transform_variant,
         args.kernel_impl,
+        args.external_k_packs,
     )
     if args.artifact_dir:
         artifact_dir = Path(args.artifact_dir)
@@ -519,6 +570,8 @@ with air.ir.Context() as ctx, Location.unknown():
     )
     if args.kernel_impl == "external-mmul":
         backend_kwargs["lower_linalg_to_func"] = args.external_kernel_object
+    if args.omit_ping_pong:
+        backend_kwargs["omit_pingpong"] = args.omit_ping_pong
 
     if args.compile_only:
         print(f"Compile-only mode: generating {output_ext} binary...")
@@ -537,6 +590,9 @@ with air.ir.Context() as ctx, Location.unknown():
         print(f"kernel_impl={args.kernel_impl}")
         if args.external_kernel_object:
             print(f"external_kernel_object={args.external_kernel_object}")
+        print(f"external_k_packs={args.external_k_packs}")
+        print(f"external_block={args.external_block_m}x{args.external_block_n}")
+        print(f"omit_ping_pong={args.omit_ping_pong}")
         raise SystemExit(0)
 
     input_type = np.int8

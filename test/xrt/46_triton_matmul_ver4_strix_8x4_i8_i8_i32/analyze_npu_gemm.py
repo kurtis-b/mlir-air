@@ -19,6 +19,9 @@ DEFAULT_TILE_N = 256
 DEFAULT_ACCEPTANCE_TOPS = 36.15
 PUBLISHED_SOTA_TOPS = 38.05
 EXTERNAL_MMUL_FUNCTION = "matmul_i8_i8_i8_acc32_strix"
+DEFAULT_EXTERNAL_K_PACKS = 9
+DEFAULT_EXTERNAL_BLOCK_M = 2
+DEFAULT_EXTERNAL_BLOCK_N = 2
 
 
 def positive_int(value: str) -> int:
@@ -51,24 +54,27 @@ def read_text(path: Path | None) -> str:
         return ""
 
 
-def render_transform_variant(transform_text: str, variant: str) -> str:
+def render_transform_variant(
+    transform_text: str, variant: str, k_packs: int = 9
+) -> str:
     if variant == "default":
         return transform_text
     if variant != "sota-int8":
         raise ValueError(f"unknown transform variant: {variant}")
 
+    k_elements = k_packs * 8
     replacements = [
         (
             "tile_using_for %copy1 tile_sizes [0, 64]",
-            "tile_using_for %copy1 tile_sizes [0, 72]",
+            f"tile_using_for %copy1 tile_sizes [0, {k_elements}]",
         ),
         (
             "tile_using_for %copy2 tile_sizes [64]",
-            "tile_using_for %copy2 tile_sizes [72]",
+            f"tile_using_for %copy2 tile_sizes [{k_elements}]",
         ),
         (
             "tile_using_for %packed_c tile_sizes [0, 0, 8]",
-            "tile_using_for %packed_c tile_sizes [0, 0, 9]",
+            f"tile_using_for %packed_c tile_sizes [0, 0, {k_packs}]",
         ),
         (
             "tile_using_forall %matmul_1 tile_sizes [8, 8, 0]",
@@ -180,7 +186,9 @@ def bytes_fmt(value: int) -> str:
 
 def make_report(args: argparse.Namespace) -> dict[str, Any]:
     transform_text = render_transform_variant(
-        read_text(args.transform_script), args.transform_variant
+        read_text(args.transform_script),
+        args.transform_variant,
+        args.external_k_packs if args.kernel_impl == "external-mmul" else 9,
     )
     final_ir = read_text(args.transformed_ir)
     transform = parse_transform(transform_text)
@@ -195,11 +203,28 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
     }
     core_m, core_n = transform["core_tile_elements"]
     k_step = transform["k_reduction_elements_per_step"]
+    a_step_bytes = core_m * k_step
+    b_step_bytes = k_step * core_n
+    c_bytes = core_m * core_n * out_bytes
+    estimated_stack_bytes = 1024
+    l1_budget_bytes = 64 * 1024
+    single_buffered_working_set_bytes = a_step_bytes + b_step_bytes + c_bytes
+    pingpong_working_set_bytes = 2 * (a_step_bytes + b_step_bytes) + c_bytes
     core_l1 = {
-        "a_step_bytes": core_m * k_step,
-        "b_step_bytes": k_step * core_n,
-        "c_bytes": core_m * core_n * out_bytes,
-        "double_buffered_a_b_step_bytes": 2 * (core_m * k_step + k_step * core_n),
+        "a_step_bytes": a_step_bytes,
+        "b_step_bytes": b_step_bytes,
+        "c_bytes": c_bytes,
+        "double_buffered_a_b_step_bytes": 2 * (a_step_bytes + b_step_bytes),
+        "single_buffered_working_set_bytes": single_buffered_working_set_bytes,
+        "pingpong_working_set_bytes": pingpong_working_set_bytes,
+        "estimated_stack_bytes": estimated_stack_bytes,
+        "l1_budget_bytes": l1_budget_bytes,
+        "fits_single_buffer_estimate": (
+            single_buffered_working_set_bytes + estimated_stack_bytes <= l1_budget_bytes
+        ),
+        "fits_pingpong_estimate": (
+            pingpong_working_set_bytes + estimated_stack_bytes <= l1_budget_bytes
+        ),
     }
     packed_m = args.tile_m // transform["pack_sizes"][0]
     packed_n = args.tile_n // transform["pack_sizes"][1]
@@ -207,11 +232,31 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
         packed_m // transform["forall_tile_packs"][0],
         packed_n // transform["forall_tile_packs"][1],
     ]
-    pingpong_eligible = bool(
+    transform_pingpong_candidate = bool(
         transform["has_l2_fuse"]
         and transform["has_l1_allocs"]
         and transform["has_l2_result_alloc"]
     )
+    l1_pingpong_requested = args.omit_ping_pong not in ("L1", "all")
+    pingpong_eligible = bool(
+        transform_pingpong_candidate
+        and l1_pingpong_requested
+        and core_l1["fits_pingpong_estimate"]
+    )
+    if not transform_pingpong_candidate:
+        pingpong_reason = "missing loop fusion or expected L1/L2 allocation markers in transform script"
+    elif not l1_pingpong_requested:
+        pingpong_reason = "L1 ping-pong transform is explicitly omitted"
+    elif not core_l1["fits_pingpong_estimate"]:
+        pingpong_reason = (
+            "estimated L1 working set exceeds the 64 KiB core-memory budget with "
+            "ping-ponged A/B buffers"
+        )
+    else:
+        pingpong_reason = (
+            "L3 copy loops are fused with the K-reduction loop, L1/L2 allocations "
+            "are present, and the estimated L1 working set fits"
+        )
     b_dma = (
         f"B source is row-major KxN; tile view strides [{args.n},1], contiguous along N"
         if args.b_layout == "row"
@@ -243,6 +288,18 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
         "external_kernel_function": (
             EXTERNAL_MMUL_FUNCTION if args.kernel_impl == "external-mmul" else None
         ),
+        "external_k_packs": args.external_k_packs,
+        "external_block": [args.external_block_m, args.external_block_n],
+        "external_block_accumulators": (
+            args.external_block_m * args.external_block_n
+            if args.kernel_impl == "external-mmul"
+            else None
+        ),
+        "external_block_spill_risk": (
+            args.kernel_impl == "external-mmul"
+            and args.external_block_m * args.external_block_n > 4
+        ),
+        "omit_ping_pong": args.omit_ping_pong,
         "trace_mode": "packet" if args.trace_size else "off",
         "trace_size": args.trace_size,
         "transform": transform,
@@ -272,11 +329,7 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
         },
         "pingpong_eligibility": {
             "eligible": pingpong_eligible,
-            "reason": (
-                "L3 copy loops are fused with the K-reduction loop and L1/L2 allocations are present"
-                if pingpong_eligible
-                else "missing loop fusion or expected L1/L2 allocation markers in transform script"
-            ),
+            "reason": pingpong_reason,
         },
         "sota_design_checks": {
             "output_stationary_c": True,
@@ -313,9 +366,18 @@ def write_markdown(path: Path, report: dict[str, Any], json_path: Path) -> None:
         f.write(f"| B layout | `{report['b_layout']}` |\n")
         f.write(f"| Runtime loop tiling | `{report['runtime_loop_tiling']}` |\n")
         f.write(f"| Transform variant | `{report['transform_variant']}` |\n")
+        f.write(f"| Omit ping-pong | `{report['omit_ping_pong']}` |\n")
         f.write(f"| Kernel impl | `{report['kernel_impl']}` |\n")
         if report["external_kernel_function"]:
             f.write(f"| External kernel | `{report['external_kernel_function']}` |\n")
+            f.write(f"| External K packs | `{report['external_k_packs']}` |\n")
+            f.write(f"| External block | `{report['external_block']}` |\n")
+            f.write(
+                f"| External accumulators | `{report['external_block_accumulators']}` |\n"
+            )
+            f.write(
+                f"| External spill risk | `{'yes' if report['external_block_spill_risk'] else 'no'}` |\n"
+            )
         f.write(f"| Trace mode | `{report['trace_mode']}` |\n")
         f.write(f"| Acceptance TOPS | `{report['acceptance_tops']:.2f}` |\n")
         f.write(f"| Published SOTA TOPS | `{report['published_sota_tops']:.2f}` |\n")
@@ -342,6 +404,22 @@ def write_markdown(path: Path, report: dict[str, Any], json_path: Path) -> None:
         f.write(f"| L1 C per core | `{bytes_fmt(l1['c_bytes'])}` |\n")
         f.write(
             f"| L1 double-buffer A/B step | `{bytes_fmt(l1['double_buffered_a_b_step_bytes'])}` |\n"
+        )
+        f.write(
+            f"| L1 single-buffer working set | `{bytes_fmt(l1['single_buffered_working_set_bytes'])}` |\n"
+        )
+        f.write(
+            f"| L1 ping-pong working set | `{bytes_fmt(l1['pingpong_working_set_bytes'])}` |\n"
+        )
+        f.write(
+            f"| L1 estimated stack | `{bytes_fmt(l1['estimated_stack_bytes'])}` |\n"
+        )
+        f.write(f"| L1 budget | `{bytes_fmt(l1['l1_budget_bytes'])}` |\n")
+        f.write(
+            f"| L1 fits single-buffer estimate | `{'yes' if l1['fits_single_buffer_estimate'] else 'no'}` |\n"
+        )
+        f.write(
+            f"| L1 fits ping-pong estimate | `{'yes' if l1['fits_pingpong_estimate'] else 'no'}` |\n"
         )
         f.write(f"| A DMA | {report['dma_contiguity']['A']} |\n")
         f.write(f"| B DMA | {report['dma_contiguity']['B']} |\n")
@@ -387,6 +465,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kernel-impl", choices=["vectorized", "external-mmul"], default="vectorized"
     )
+    parser.add_argument(
+        "--external-k-packs",
+        type=positive_int,
+        default=DEFAULT_EXTERNAL_K_PACKS,
+    )
+    parser.add_argument(
+        "--external-block-m", type=positive_int, default=DEFAULT_EXTERNAL_BLOCK_M
+    )
+    parser.add_argument(
+        "--external-block-n", type=positive_int, default=DEFAULT_EXTERNAL_BLOCK_N
+    )
+    parser.add_argument("--omit-ping-pong", choices=["L1", "L2", "all"], default=None)
     parser.add_argument(
         "--acceptance-tops", type=positive_float, default=DEFAULT_ACCEPTANCE_TOPS
     )
