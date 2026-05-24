@@ -2035,6 +2035,9 @@ void L2MemrefToMemTileMap(
                     "memtile placement");
     return;
   }
+  std::map<AIE::TileOp, int64_t> memtileToSizeMap;
+  for (auto t : memtiles)
+    memtileToSizeMap[t] = m.getTargetModel().getMemTileSize();
 
   // First stage in memref placement: grouping memrefs referenced by the same
   // air.channel.
@@ -2058,24 +2061,139 @@ void L2MemrefToMemTileMap(
       memref_buckets.push_back(SmallVector<memref::AllocOp>{alloc});
     }
   }
+
+  SmallVector<int64_t> bucketSizes(memref_buckets.size(), 0);
+  for (int bi = 0; bi < (int)memref_buckets.size(); bi++) {
+    for (auto alloc : memref_buckets[bi]) {
+      MemRefType ty = llvm::cast<MemRefType>(alloc.getMemref().getType());
+      bucketSizes[bi] +=
+          air::getElementSizeInBytes(ty) * air::getTensorVolume(ty);
+    }
+  }
+
   // Second stage in memref placement: round-robin placement of memref groups
   // to memtiles. This distributes buffer count evenly, which correlates well
   // with DMA channel/BD pressure.
+  SmallVector<int> bucketMemtileIdx(memref_buckets.size(), -1);
   int memtile_id = 0;
-  for (auto &bucket : memref_buckets) {
-    for (auto bucket_elem : bucket) {
+  for (int bi = 0; bi < (int)memref_buckets.size(); bi++) {
+    auto &bucket = memref_buckets[bi];
+    for (auto bucket_elem : bucket)
       memrefToMemTileMap[bucket_elem] = memtiles[memtile_id];
-    }
+    memtileToSizeMap[memtiles[memtile_id]] -= bucketSizes[bi];
+    bucketMemtileIdx[bi] = memtile_id;
     memtile_id++;
     memtile_id %= memtiles.size();
   }
 
-  // RFC #1567 Stage C #4: bucket placement uses round-robin only. The
-  // column-affinity swap optimization that previously lived here was
-  // removed; the proper replacement is to defer memtile placement to
-  // mlir-aie's SequentialPlacer (now flow-aware via #3055). That migration
-  // requires deferring the placer call until after aie.flow ops materialize
-  // and is tracked as a follow-up.
+  // Third stage: improve locality for L2 buffers whose channel users are all
+  // in one core column. The default round-robin placement balances buffer
+  // count, but on NPU2 a transposed herd can otherwise place B/C tile buffers
+  // on the opposite half of the array, creating unroutable cross-column DMA.
+  // Pairwise swaps keep the same number of buckets on every memtile and are
+  // capacity checked, so this is a narrow topology fix until memtile placement
+  // can be deferred to the flow-aware AIE placer.
+  DenseMap<int64_t, int> colToMemtileIdx;
+  for (int i = 0; i < (int)memtiles.size(); i++) {
+    assert(!colToMemtileIdx.count(memtiles[i].getCol()) &&
+           "multiple memtiles in same column not supported by L2 column "
+           "affinity optimization");
+    colToMemtileIdx[memtiles[i].getCol()] = i;
+  }
+
+  DenseMap<air::ChannelOp, SmallVector<int64_t>> channelToCoreCols;
+  auto getCoreCols = [&](air::ChannelOp channelOp) -> ArrayRef<int64_t> {
+    auto it = channelToCoreCols.find(channelOp);
+    if (it != channelToCoreCols.end())
+      return it->second;
+    llvm::SmallSet<int64_t, 8> cols;
+    for (auto put : air::getChannelPutOpThroughSymbol(channelOp, m))
+      if (auto core = put->getParentOfType<AIE::CoreOp>())
+        cols.insert(core.getTileOp().getCol());
+    for (auto get : air::getChannelGetOpThroughSymbol(channelOp, m))
+      if (auto core = get->getParentOfType<AIE::CoreOp>())
+        cols.insert(core.getTileOp().getCol());
+    auto &entry = channelToCoreCols[channelOp];
+    entry.assign(cols.begin(), cols.end());
+    return entry;
+  };
+
+  SmallVector<int64_t> bucketAffinityCol(memref_buckets.size(), -1);
+  for (int bi = 0; bi < (int)memref_buckets.size(); bi++) {
+    llvm::SmallSet<int64_t, 8> cols;
+    for (auto alloc : memref_buckets[bi]) {
+      for (auto user : alloc.getMemref().getUsers()) {
+        auto chanIf = dyn_cast<air::ChannelInterface>(user);
+        if (!chanIf)
+          continue;
+        auto channelOp = air::getChannelDeclarationThroughSymbol(chanIf);
+        if (!channelOp)
+          continue;
+        for (int64_t c : getCoreCols(channelOp))
+          cols.insert(c);
+      }
+    }
+    if (cols.size() == 1)
+      bucketAffinityCol[bi] = *cols.begin();
+    LLVM_DEBUG(llvm::dbgs()
+               << "L2MemrefToMemTileMap: bucket " << bi << " has "
+               << memref_buckets[bi].size() << " alloc(s), affinity col = "
+               << bucketAffinityCol[bi] << "\n");
+  }
+
+  auto isOnAffinityMemtile = [&](int bi) -> bool {
+    if (bucketAffinityCol[bi] < 0)
+      return false;
+    auto it = colToMemtileIdx.find(bucketAffinityCol[bi]);
+    return it != colToMemtileIdx.end() && it->second == bucketMemtileIdx[bi];
+  };
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (int i = 0; i < (int)memref_buckets.size(); i++) {
+      if (bucketAffinityCol[i] < 0 || isOnAffinityMemtile(i))
+        continue;
+      auto affinityIt = colToMemtileIdx.find(bucketAffinityCol[i]);
+      if (affinityIt == colToMemtileIdx.end())
+        continue;
+      int targetMtIdx = affinityIt->second;
+
+      for (int j = 0; j < (int)memref_buckets.size(); j++) {
+        if (i == j || bucketMemtileIdx[j] != targetMtIdx ||
+            isOnAffinityMemtile(j))
+          continue;
+
+        int mtI = bucketMemtileIdx[i];
+        int mtJ = bucketMemtileIdx[j];
+        int64_t deltaI = bucketSizes[j] - bucketSizes[i];
+        int64_t deltaJ = bucketSizes[i] - bucketSizes[j];
+        if (memtileToSizeMap[memtiles[mtI]] + deltaI < 0)
+          continue;
+        if (memtileToSizeMap[memtiles[mtJ]] + deltaJ < 0)
+          continue;
+
+        LLVM_DEBUG(llvm::dbgs()
+                   << "L2MemrefToMemTileMap: swapping bucket " << i
+                   << " (affinity col " << bucketAffinityCol[i]
+                   << ", on memtile " << mtI << ") with bucket " << j
+                   << " (affinity col " << bucketAffinityCol[j]
+                   << ", on memtile " << mtJ << ")\n");
+        memtileToSizeMap[memtiles[mtI]] += deltaI;
+        memtileToSizeMap[memtiles[mtJ]] += deltaJ;
+        bucketMemtileIdx[i] = mtJ;
+        bucketMemtileIdx[j] = mtI;
+        for (auto alloc : memref_buckets[i])
+          memrefToMemTileMap[alloc] = memtiles[mtJ];
+        for (auto alloc : memref_buckets[j])
+          memrefToMemTileMap[alloc] = memtiles[mtI];
+        changed = true;
+        break;
+      }
+      if (changed)
+        break;
+    }
+  }
 }
 
 void allocL2Buffers(AIE::DeviceOp m,
@@ -6919,7 +7037,8 @@ FailureOr<ModuleOp> convertAIRToAIE(mlir::RewriterBase &rewriter,
       /* .generate_shim_dma = */ false,
       /* .insert_trace_packet_flow = */ false,
       /* .use_lock_race_condition_fix = */ true,
-      /* .device = */ *device};
+      /* .device = */ *device,
+      /* .stack_size = */ 1024};
   std::vector<std::pair<ModuleOp, air::HerdOp>> aie_modules;
   p.walk([&](air::HerdOp h) { aie_modules.push_back({aie_module, h}); });
   for (auto &p : aie_modules) {
