@@ -99,6 +99,8 @@ RUN_PY_COMMON_ARGS := \
 PROFILE_ARGS := \
 	-x air.xclbin -k MLIR_AIE -i air.insts.bin \
 	-M $(M) -K $(K) -N $(N) \
+	--tile_m $(TILE_M) \
+	--tile_n $(TILE_N) \
 	-v $(VERBOSITY) \
 	--warmups $(WARMUPS) \
 	--iterations $(ITERATIONS) \

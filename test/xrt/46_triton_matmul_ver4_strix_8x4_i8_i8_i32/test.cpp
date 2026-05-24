@@ -184,6 +184,8 @@ void add_default_options(cxxopts::Options &options) {
                                      cxxopts::value<int>())(
       "size_n,N", "Matrix size N", cxxopts::value<int>())(
       "size_k,K", "Matrix size K", cxxopts::value<int>())(
+      "tile_m", "Launch tile M", cxxopts::value<int>()->default_value("512"))(
+      "tile_n", "Launch tile N", cxxopts::value<int>()->default_value("256"))(
       "warmups", "Warmup iterations",
       cxxopts::value<unsigned>()->default_value("10"))(
       "iterations", "Timed iterations",
@@ -211,15 +213,25 @@ static int run_profile(const cxxopts::ParseResult &vm, OutputType output_type,
   int M = vm["size_m"].as<int>();
   int K = vm["size_k"].as<int>();
   int N = vm["size_n"].as<int>();
+  int tile_n = vm["tile_n"].as<int>();
   if (M <= 0 || K <= 0 || N <= 0) {
     std::cerr << "M, K, and N must be greater than zero\n";
     return 2;
   }
+  if (tile_n <= 0 || N % tile_n != 0) {
+    std::cerr << "--tile_n must be positive and divide N\n";
+    return 2;
+  }
+
+  int n_tiles = N / tile_n;
+  int b_pitch = tile_n + 4;
 
   size_t A_VOLUME = static_cast<size_t>(M) * K;
   size_t B_VOLUME = static_cast<size_t>(K) * N;
   size_t B_STORAGE_VOLUME =
-      b_layout == BLayout::ColumnMajor ? B_VOLUME * 4 : B_VOLUME;
+      b_layout == BLayout::ColumnMajor
+          ? static_cast<size_t>(n_tiles) * K * b_pitch
+          : B_VOLUME;
   size_t C_VOLUME = static_cast<size_t>(M) * N;
 
   size_t A_SIZE = A_VOLUME * sizeof(A_DATATYPE);
@@ -294,9 +306,13 @@ static int run_profile(const cxxopts::ParseResult &vm, OutputType output_type,
   if (b_layout == BLayout::RowMajor) {
     BDevice = BVec;
   } else {
-    for (int k = 0; k < K; ++k)
-      for (int n = 0; n < N; ++n)
-        BDevice[(static_cast<size_t>(n) * K + k) * 4] = BVec[k * N + n];
+    for (int tile = 0; tile < n_tiles; ++tile) {
+      int n_base = tile * tile_n;
+      for (int k = 0; k < K; ++k)
+        for (int n_inner = 0; n_inner < tile_n; ++n_inner)
+          BDevice[(static_cast<size_t>(tile) * K + k) * b_pitch + n_inner] =
+              BVec[k * N + n_base + n_inner];
+    }
   }
   memcpy(bufB, BDevice.data(), BDevice.size() * sizeof(B_DATATYPE));
 
@@ -378,6 +394,9 @@ static int run_profile(const cxxopts::ParseResult &vm, OutputType output_type,
   std::cout << "shape=" << M << "x" << K << "x" << N << "\n";
   std::cout << "output_type=" << output_type_name(output_type) << "\n";
   std::cout << "b_layout=" << layout_name(b_layout) << "\n";
+  std::cout << "tile_n=" << tile_n << "\n";
+  if (b_layout == BLayout::ColumnMajor)
+    std::cout << "b_pitch=" << b_pitch << "\n";
   std::cout << "warmups=" << n_warmup_iterations << "\n";
   std::cout << "iterations=" << n_iterations << "\n";
   std::cout << "validation_mode=" << validation_name(validation_mode) << "\n";

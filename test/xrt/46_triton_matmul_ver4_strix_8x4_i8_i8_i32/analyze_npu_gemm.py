@@ -81,6 +81,18 @@ def render_transform_variant(transform_text: str, variant: str) -> str:
             "tile_using_forall %unpack_op tile_sizes [64, 64]",
             "tile_using_forall %unpack_op tile_sizes [144, 144]",
         ),
+        (
+            "%herd1 = transform.air.par_to_herd %parallel1 :",
+            "%herd1 = transform.air.par_to_herd %parallel1 {first_dim = 1} :",
+        ),
+        (
+            "%herd2 = transform.air.par_to_herd %parallel2 :",
+            "%herd2 = transform.air.par_to_herd %parallel2 {first_dim = 1} :",
+        ),
+        (
+            "%herd3 = transform.air.par_to_herd %parallel3 :",
+            "%herd3 = transform.air.par_to_herd %parallel3 {first_dim = 1} :",
+        ),
     ]
     rendered = transform_text
     for old, new in replacements:
@@ -202,7 +214,7 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
     b_dma = (
         f"B source is row-major KxN; tile view strides [{args.n},1], contiguous along N"
         if args.b_layout == "row"
-        else f"B source is padded column-major; logical DMA offsets stay in K/N coordinates with strides [4,{args.k * 4}]"
+        else f"B source is packed by N tile [N/tile_N,K,tile_N+4]; logical tile strides [{args.tile_n + 4},1]"
     )
     dependency_nodes = [
         "L3_A_copy",
@@ -246,16 +258,20 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
         },
         "dependency_graph": {
             "nodes": dependency_nodes,
-            "shape": "L3 copies fused into K-reduction compute loop, followed by output unpack/store"
-            if transform["has_l2_fuse"]
-            else "unfused L3 copies followed by compute and output store",
+            "shape": (
+                "L3 copies fused into K-reduction compute loop, followed by output unpack/store"
+                if transform["has_l2_fuse"]
+                else "unfused L3 copies followed by compute and output store"
+            ),
             "dma_memcpy_nd_count": dma_count,
         },
         "pingpong_eligibility": {
             "eligible": pingpong_eligible,
-            "reason": "L3 copy loops are fused with the K-reduction loop and L1/L2 allocations are present"
-            if pingpong_eligible
-            else "missing loop fusion or expected L1/L2 allocation markers in transform script",
+            "reason": (
+                "L3 copy loops are fused with the K-reduction loop and L1/L2 allocations are present"
+                if pingpong_eligible
+                else "missing loop fusion or expected L1/L2 allocation markers in transform script"
+            ),
         },
         "sota_design_checks": {
             "output_stationary_c": True,

@@ -17,7 +17,6 @@ from air.compiler.util import run_transform
 from air.ir import *
 import air.passmanager
 
-
 DEFAULT_M = 1024
 DEFAULT_K = 1024
 DEFAULT_N = 1024
@@ -100,6 +99,18 @@ def render_transform_variant(transform_text: str, variant: str) -> str:
             "tile_using_forall %unpack_op tile_sizes [64, 64]",
             "tile_using_forall %unpack_op tile_sizes [144, 144]",
         ),
+        (
+            "%herd1 = transform.air.par_to_herd %parallel1 :",
+            "%herd1 = transform.air.par_to_herd %parallel1 {first_dim = 1} :",
+        ),
+        (
+            "%herd2 = transform.air.par_to_herd %parallel2 :",
+            "%herd2 = transform.air.par_to_herd %parallel2 {first_dim = 1} :",
+        ),
+        (
+            "%herd3 = transform.air.par_to_herd %parallel3 :",
+            "%herd3 = transform.air.par_to_herd %parallel3 {first_dim = 1} :",
+        ),
     ]
     rendered = transform_text
     for old, new in replacements:
@@ -136,12 +147,17 @@ def build_matmul_ir(
     memref.copy %reinterpret_cast_0, %alloc_1 : memref<{k}x{tile_n}xi8, strided<{b_strides}, offset: ?>> to memref<{k}x{tile_n}xi8>
     %b_tensor = bufferization.to_tensor %alloc_1 restrict writable : memref<{k}x{tile_n}xi8> to tensor<{k}x{tile_n}xi8>"""
     else:
-        # Physical B is stored as padded column-major. Logical B[k,n] is at
-        # byte offset (n * K + k) * 4, which preserves column-major traversal
-        # while satisfying the NPU DMA 32-bit address-generation granularity.
-        b_offset_code = ""
-        b_offset_value = "%n_offset"
-        b_strides = f"[4, {k * 4}]"
+        # Physical B is packed by N tile: [N/tile_N, K, tile_N + 4]. The
+        # padded pitch prevents AIR-to-AIE channel lowering from collapsing the
+        # selected B tile into a default-contiguous view and dropping the
+        # N-tile base offset.
+        b_pitch = tile_n + 4
+        b_tile_span = k * b_pitch
+        b_offset_code = f"""%n_tile_index = arith.index_cast %arg7 : i32 to index
+    %cBTileSpan = arith.constant {b_tile_span} : index
+    %b_offset = arith.muli %n_tile_index, %cBTileSpan : index"""
+        b_offset_value = "%b_offset"
+        b_strides = f"[{b_pitch}, 1]"
         b_tensor_type = f"tensor<{k}x{tile_n}xi8>"
         matmul_op = "linalg.matmul"
         b_tensor_code = f"""    %reinterpret_cast_0 = memref.reinterpret_cast %arg1 to offset: [{b_offset_value}], sizes: [{k}, {tile_n}], strides: {b_strides} : memref<*xi8> to memref<{k}x{tile_n}xi8, strided<{b_strides}, offset: ?>>
@@ -157,7 +173,6 @@ module {{
     {zero}
     %cK = arith.constant {k} : index
     %cN = arith.constant {n} : index
-    %c4 = arith.constant 4 : index
     %cTileN_i32 = arith.constant {tile_n} : i32
     %cTileM_i32 = arith.constant {tile_m} : i32
     %m_tile_i32 = arith.muli %arg6, %cTileM_i32 : i32
@@ -422,8 +437,12 @@ with air.ir.Context() as ctx, Location.unknown():
     if args.b_layout == "row":
         B_device = B
     else:
-        B_device = np.zeros((args.n, args.k, 4), dtype=input_type)
-        B_device[:, :, 0] = B.T
+        b_tiles = args.n // args.tile_n
+        b_pitch = args.tile_n + 4
+        B_device = np.zeros((b_tiles, args.k, b_pitch), dtype=input_type)
+        for tile in range(b_tiles):
+            start = tile * args.tile_n
+            B_device[tile, :, : args.tile_n] = B[:, start : start + args.tile_n]
         B_device = B_device.reshape(-1)
 
     C_i32 = np.matmul(A.astype(np.int32), B.astype(np.int32))
