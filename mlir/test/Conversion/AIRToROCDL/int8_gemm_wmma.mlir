@@ -35,6 +35,9 @@
 // RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_bpack_swizzle_k32_w4_pipe2_short int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID128W4,TSHORT
 // RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_bpack_swizzle_k32_w4_pipe2_short_pad int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID128W4,TSHORTPAD
 // RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_rocmlir_k32_pipe3 int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID128W4,ROCMLIRLIKE
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_tensile_k32_pipe3 int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID128W4,TENSILEPIPE3
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_tensile_k32_pipe3_pad int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID128W4,TENSILEPIPE3PAD
+// RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_tensile_k32_pipe3_wpe2 int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID128W4,TENSILEPIPE3WPE2
 // RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_tensile_k32_pipe2 int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID128W4,TENSILEPIPE2
 // RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_tensile_k32_pipe2_pad int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID128W4,TENSILEPIPE2PAD
 // RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=global_128x128_bpack_w4_direct int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID128DIRECT,DIRECT
@@ -44,6 +47,9 @@
 // RUN: air-opt %s -air-to-rocdl="int8-gemm-variant=global_128x128_bpack_w4_direct_rawptr_u2 int8-gemm-group-size=8" -air-gpu-outlining="int8-gemm-group-size=8" | FileCheck %s --check-prefixes=CHECK,GRID128RAWPTR,RAWPTRU2
 // RUN: not air-opt %s -air-to-rocdl="int8-gemm-variant=global_128x128_bpack_w4_direct int8-gemm-group-size=4" -air-gpu-outlining="int8-gemm-group-size=4" 2>&1 | FileCheck %s --check-prefix=BADDIRECTGROUP
 // RUN: not air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_rocmlir_k32_pipe3 int8-gemm-group-size=4" -air-gpu-outlining="int8-gemm-group-size=4" 2>&1 | FileCheck %s --check-prefix=BADROCMLIRGROUP
+// RUN: not air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_tensile_k32_pipe3 int8-gemm-group-size=4" -air-gpu-outlining="int8-gemm-group-size=4" 2>&1 | FileCheck %s --check-prefix=BADTENSILEPIPE3GROUP
+// RUN: not air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_tensile_k32_pipe3_pad int8-gemm-group-size=4" -air-gpu-outlining="int8-gemm-group-size=4" 2>&1 | FileCheck %s --check-prefix=BADTENSILEPIPE3GROUP
+// RUN: not air-opt %s -air-to-rocdl="int8-gemm-variant=lds_128x128_tensile_k32_pipe3_wpe2 int8-gemm-group-size=4" -air-gpu-outlining="int8-gemm-group-size=4" 2>&1 | FileCheck %s --check-prefix=BADTENSILEPIPE3GROUP
 // RUN: not air-opt %s -air-to-rocdl="int8-gemm-variant=not_a_variant" 2>&1 | FileCheck %s --check-prefix=BAD
 // RUN: not air-opt %s -air-to-rocdl="int8-gemm-group-size=6" 2>&1 | FileCheck %s --check-prefix=BADGROUP
 
@@ -108,6 +114,19 @@
 // ROCMLIRLIKE-SAME: air.gpu.int8_gemm_variant = "lds_128x128_rocmlir_k32_pipe3"
 // ROCMLIRLIKE: memref<128x32xi8, 3>
 // ROCMLIRLIKE: gpu.barrier
+// TENSILEPIPE3-SAME: air.gpu.int8_gemm_group_m = 8 : i32
+// TENSILEPIPE3-SAME: air.gpu.int8_gemm_variant = "lds_128x128_tensile_k32_pipe3"
+// TENSILEPIPE3: memref<128x32xi8, 3>
+// TENSILEPIPE3: gpu.barrier
+// TENSILEPIPE3PAD-SAME: air.gpu.int8_gemm_group_m = 8 : i32
+// TENSILEPIPE3PAD-SAME: air.gpu.int8_gemm_variant = "lds_128x128_tensile_k32_pipe3_pad"
+// TENSILEPIPE3PAD: memref<128x48xi8, 3>
+// TENSILEPIPE3PAD: gpu.barrier
+// TENSILEPIPE3WPE2-SAME: air.gpu.int8_gemm_group_m = 8 : i32
+// TENSILEPIPE3WPE2-SAME: air.gpu.int8_gemm_variant = "lds_128x128_tensile_k32_pipe3_wpe2"
+// TENSILEPIPE3WPE2-SAME: rocdl.waves_per_eu = 2 : i32
+// TENSILEPIPE3WPE2: memref<128x32xi8, 3>
+// TENSILEPIPE3WPE2: gpu.barrier
 // TENSILEPIPE2-SAME: air.gpu.int8_gemm_group_m = 8 : i32
 // TENSILEPIPE2-SAME: air.gpu.int8_gemm_variant = "lds_128x128_tensile_k32_pipe2"
 // TENSILEPIPE2: memref<128x32xi8, 3>
@@ -166,6 +185,7 @@
 // BADGROUP: unsupported group size '6'
 // BADDIRECTGROUP: direct global variant requires group size 8
 // BADROCMLIRGROUP: rocMLIR-like variant requires group size 8
+// BADTENSILEPIPE3GROUP: Tensile-like pipe3 variant requires group size 8
 
 module {
   func.func @forward(%arg0: memref<1024x1024xi8>, %arg1: memref<1024x1024xi8>, %arg2: memref<1024x1024xi32>) {

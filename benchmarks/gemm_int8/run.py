@@ -32,6 +32,9 @@ GPU_INT8_GEMM_DIRECT_RAWPTR_U2_VARIANT = "global_128x128_bpack_w4_direct_rawptr_
 GPU_INT8_GEMM_ROCMLIR_LIKE_VARIANT = "lds_128x128_rocmlir_k32_pipe3"
 GPU_INT8_GEMM_TENSILE_K32_PIPE2_VARIANT = "lds_128x128_tensile_k32_pipe2"
 GPU_INT8_GEMM_TENSILE_K32_PIPE2_PAD_VARIANT = "lds_128x128_tensile_k32_pipe2_pad"
+GPU_INT8_GEMM_TENSILE_K32_PIPE3_VARIANT = "lds_128x128_tensile_k32_pipe3"
+GPU_INT8_GEMM_TENSILE_K32_PIPE3_PAD_VARIANT = "lds_128x128_tensile_k32_pipe3_pad"
+GPU_INT8_GEMM_TENSILE_K32_PIPE3_WPE2_VARIANT = "lds_128x128_tensile_k32_pipe3_wpe2"
 DEFAULT_GPU_INT8_GEMM_VARIANT = GPU_INT8_GEMM_BASE_WMMA_VARIANT
 
 
@@ -52,6 +55,7 @@ class GpuInt8GemmVariantConfig:
     wave_tile_rows: int = 16
     wave_tile_cols: int | None = None
     lds_k_padding: int = 0
+    waves_per_eu: int = 0
 
     @property
     def wave_count(self) -> int:
@@ -84,7 +88,7 @@ class GpuInt8GemmVariantConfig:
     def dynamic_barriers(self) -> int:
         if self.lds_stages == 0:
             return 0
-        if self.pipeline == "rocmlir_like_pipe3":
+        if self.pipeline in {"rocmlir_like_pipe3", "tensile_like_pipe3"}:
             return 2 * ((self.k_tiles - 2 + 2) // 3) + 1
         return self.k_tiles if self.lds_stages == 2 else 2 * self.k_tiles
 
@@ -121,6 +125,9 @@ GPU_INT8_GEMM_VARIANT_CONFIGS = (
     GpuInt8GemmVariantConfig(GPU_INT8_GEMM_TENSILE_K32_PIPE2_VARIANT, 128, 128, 32, 128, 2, True, True, True, False, "tensile_like_pipe2", 8, 64, 64),
     GpuInt8GemmVariantConfig(GPU_INT8_GEMM_TENSILE_K32_PIPE2_PAD_VARIANT, 128, 128, 32, 128, 2, True, True, True, False, "tensile_like_pipe2", 8, 64, 64, 16),
     GpuInt8GemmVariantConfig(GPU_INT8_GEMM_ROCMLIR_LIKE_VARIANT, 128, 128, 32, 128, 3, False, True, True, False, "rocmlir_like_pipe3", 8, 64, 64, 0),
+    GpuInt8GemmVariantConfig(GPU_INT8_GEMM_TENSILE_K32_PIPE3_VARIANT, 128, 128, 32, 128, 3, True, True, True, False, "tensile_like_pipe3", 8, 64, 64, 0),
+    GpuInt8GemmVariantConfig(GPU_INT8_GEMM_TENSILE_K32_PIPE3_PAD_VARIANT, 128, 128, 32, 128, 3, True, True, True, False, "tensile_like_pipe3", 8, 64, 64, 16),
+    GpuInt8GemmVariantConfig(GPU_INT8_GEMM_TENSILE_K32_PIPE3_WPE2_VARIANT, 128, 128, 32, 128, 3, True, True, True, False, "tensile_like_pipe3", 8, 64, 64, 0, 2),
     GpuInt8GemmVariantConfig(GPU_INT8_GEMM_AIR_TUNED_DIRECT_VARIANT, 128, 128, 32, 128, 0, False, True, True, True, "air_tuned_direct", 8, 64, 64),
     GpuInt8GemmVariantConfig(GPU_INT8_GEMM_DIRECT_CANONICAL_VARIANT, 128, 128, 16, 128, 0, False, True, True, True, "air_tuned_direct_canonical", 8, 64, 64),
     GpuInt8GemmVariantConfig(GPU_INT8_GEMM_DIRECT_PREFETCH_VARIANT, 128, 128, 32, 128, 0, False, True, True, True, "air_tuned_direct_prefetch", 8, 64, 64),
@@ -135,10 +142,12 @@ GPU_INT8_GEMM_GROUP_SIZES = (2, 4, 8)
 DEFAULT_GPU_INT8_GEMM_SWEEP_GROUP_SIZES = GPU_INT8_GEMM_GROUP_SIZES
 DEFAULT_GPU_INT8_GEMM_SWEEP_REPETITIONS = 3
 GPU_INT8_GEMM_GROUPED_SWIZZLE_VARIANT = "lds_128x64_bpack_swizzle_grouped"
-GPU_INT8_GEMM_SWEEP_PROFILES = ("full", "default-decision", "gfx1150-rewrite", "gfx1150-next", "gfx1150-kshape", "gfx1150-breg", "gfx1150-tensile-like", "gfx1150-short-live", "gfx1150-air-tuned-direct", "gfx1150-rocmlir-like", "gfx1150-opt-direct-canonical", "gfx1150-opt-direct-prefetch", "gfx1150-opt-tensile-pipe2", "gfx1150-opt-rawptr", "gfx1150-opt-rawptr-u2", "gfx1150-opt-chain")
+GPU_INT8_GEMM_SWEEP_PROFILES = ("full", "default-decision", "gfx1150-rewrite", "gfx1150-next", "gfx1150-kshape", "gfx1150-breg", "gfx1150-tensile-like", "gfx1150-short-live", "gfx1150-air-tuned-direct", "gfx1150-rocmlir-like", "gfx1150-consistency", "gfx1150-opt-direct-canonical", "gfx1150-opt-direct-prefetch", "gfx1150-opt-tensile-pipe2", "gfx1150-opt-rawptr", "gfx1150-opt-rawptr-u2", "gfx1150-opt-chain")
 DEFAULT_GPU_INT8_GEMM_SWEEP_PROFILE = "full"
 DEFAULT_GPU_INT8_GEMM_DEFAULT_THRESHOLD_PCT = 3.0
 DEFAULT_GPU_INT8_GEMM_DEFAULT_IMPROVEMENT_PCT = 5.0
+GPU_INT8_GEMM_CONSISTENCY_MIN_TOPS = 8.35
+GPU_INT8_GEMM_CONSISTENCY_TARGET_TOPS = 8.50
 GPU_AIR_TUNED_ACCEPTANCE_PCT = 95.0
 GPU_CANDIDATE_IMPROVEMENT_PCT = 5.0
 GPU_INT8_GEMM_ACCEPTED_BEST_VARIANT = GPU_INT8_GEMM_ROCMLIR_LIKE_VARIANT
@@ -170,6 +179,7 @@ GPU_PROVIDER_BASELINE_FIELDNAMES = (
     "mean_tops",
     "stddev_tops",
     "cv_tops_pct",
+    "min_tops",
     "max_tops",
     "target_tops_2x",
     "target_pct_2x",
@@ -191,6 +201,8 @@ GPU_PROVIDER_BASELINE_FIELDNAMES = (
     "waitcnt",
     "vgprs",
     "sgprs",
+    "vgpr_spills",
+    "sgpr_spills",
     "lds_bytes_per_workgroup",
     "global_load_lds",
     "ds_store_b128",
@@ -198,6 +210,9 @@ GPU_PROVIDER_BASELINE_FIELDNAMES = (
     "ds_load_b128",
     "scratch_markers",
     "spills",
+    "tops_by_rep",
+    "mean_ms_by_rep",
+    "mlir_air_pct_of_rocblas_tensile",
     "build_log",
     "run_log",
     "disassemble_log",
@@ -266,8 +281,16 @@ GPU_INT8_GEMM_GFX1150_ROCMLIR_LIKE_CANDIDATES = (
     (GPU_INT8_GEMM_ROCMLIR_LIKE_VARIANT, 8),
     (GPU_INT8_GEMM_AIR_TUNED_DIRECT_VARIANT, 8),
 )
+GPU_INT8_GEMM_GFX1150_CONSISTENCY_CANDIDATES = (
+    (GPU_INT8_GEMM_ACCEPTED_BEST_VARIANT, GPU_INT8_GEMM_ACCEPTED_BEST_GROUP_SIZE),
+    (GPU_INT8_GEMM_TENSILE_K32_PIPE3_VARIANT, 8),
+    (GPU_INT8_GEMM_TENSILE_K32_PIPE3_PAD_VARIANT, 8),
+    (GPU_INT8_GEMM_TENSILE_K32_PIPE3_WPE2_VARIANT, 8),
+)
 GPU_INT8_GEMM_GFX1150_OPT_COMMON_CANDIDATES = tuple(dict.fromkeys((
     (GPU_INT8_GEMM_ACCEPTED_BEST_VARIANT, GPU_INT8_GEMM_ACCEPTED_BEST_GROUP_SIZE),
+    (GPU_INT8_GEMM_TENSILE_K32_PIPE3_VARIANT, 8),
+    (GPU_INT8_GEMM_TENSILE_K32_PIPE3_WPE2_VARIANT, 8),
     (GPU_INT8_GEMM_AIR_TUNED_DIRECT_VARIANT, 8),
     (GPU_INT8_GEMM_ROCMLIR_LIKE_VARIANT, 8),
 )))
@@ -317,6 +340,8 @@ GPU_STATIC_COUNTER_KEYS = (
     "barriers",
     "vgprs",
     "sgprs",
+    "vgpr_spills",
+    "sgpr_spills",
     "scratch_markers",
     "spills",
     "global_load_b128",
@@ -339,6 +364,8 @@ GPU_RESOURCE_COUNTER_KEYS = (
     "lds_bytes_per_workgroup",
     "vgprs",
     "sgprs",
+    "vgpr_spills",
+    "sgpr_spills",
     "scratch_markers",
     "spills",
 )
@@ -349,6 +376,8 @@ GPU_STATIC_COUNTER_LABELS = {
     "barriers": "static barriers",
     "vgprs": "VGPRs",
     "sgprs": "SGPRs",
+    "vgpr_spills": "VGPR spills",
+    "sgpr_spills": "SGPR spills",
     "scratch_markers": "scratch markers",
     "spills": "spills",
     "global_load_b128": "static global_load_b128",
@@ -369,6 +398,8 @@ GPU_DYNAMIC_COUNTER_LABELS = {
     "lds_bytes_per_workgroup": "LDS bytes/workgroup",
     "vgprs": "VGPRs",
     "sgprs": "SGPRs",
+    "vgpr_spills": "VGPR spills",
+    "sgpr_spills": "SGPR spills",
     "scratch_markers": "scratch markers",
     "spills": "spills",
 }
@@ -456,6 +487,18 @@ def summary_metric(path: Path, metric_name: str) -> str:
     return matches[-1] if matches else ""
 
 
+def gpu_summary_metadata_metric(path: Path, metric_name: str) -> str:
+    text = read_text(path)
+    for pattern in (
+        rf'\.{re.escape(metric_name)}:\s*([^\s]+)',
+        rf'\b{re.escape(metric_name)}\s*=\s*([0-9]+)\s*:',
+    ):
+        matches = re.findall(pattern, text)
+        if matches:
+            return matches[-1]
+    return ""
+
+
 def gpu_variant_config(variant: str) -> GpuInt8GemmVariantConfig:
     try:
         return GPU_INT8_GEMM_VARIANT_BY_NAME[variant]
@@ -513,6 +556,13 @@ def parse_tops(value: str) -> float | None:
 def parse_float(value: str) -> float | None:
     try:
         return float(value) if value else None
+    except ValueError:
+        return None
+
+
+def parse_int_value(value: str) -> int | None:
+    try:
+        return int(value) if value else None
     except ValueError:
         return None
 
@@ -719,9 +769,25 @@ def gpu_run_metrics(log: Path) -> dict[str, float]:
     return {key: value for key, value in fields.items() if value is not None}
 
 
-def summarize_gpu_repetition_metrics(logs: Sequence[Path]) -> dict[str, float]:
+def gpu_repetition_metric_entries(logs: Sequence[Path]) -> list[dict[str, float]]:
     metrics = [gpu_run_metrics(log) for log in logs]
-    metrics = [entry for entry in metrics if {"mean_ms", "min_ms", "tops"} <= set(entry)]
+    return [entry for entry in metrics if {"mean_ms", "min_ms", "tops"} <= set(entry)]
+
+
+def format_metric_series(values: Sequence[float]) -> str:
+    return ",".join(f"{value:.6f}" for value in values)
+
+
+def gpu_repetition_series(logs: Sequence[Path]) -> dict[str, str]:
+    metrics = gpu_repetition_metric_entries(logs)
+    return {
+        "tops_by_rep": format_metric_series([entry["tops"] for entry in metrics]),
+        "mean_ms_by_rep": format_metric_series([entry["mean_ms"] for entry in metrics]),
+    }
+
+
+def summarize_gpu_repetition_metrics(logs: Sequence[Path]) -> dict[str, float]:
+    metrics = gpu_repetition_metric_entries(logs)
     if not metrics:
         return {}
     mean_ms = [entry["mean_ms"] for entry in metrics]
@@ -743,6 +809,7 @@ def summarize_gpu_repetition_metrics(logs: Sequence[Path]) -> dict[str, float]:
         "mean_tops": mean_tops,
         "stddev_tops": stddev_tops,
         "cv_tops_pct": coefficient_of_variation_pct(mean_tops, stddev_tops),
+        "min_tops": min(tops),
         "max_tops": max(tops),
     }
 
@@ -865,12 +932,20 @@ def gpu_backend(ctx: RunContext) -> BackendResult:
     wmma = count_regex(isa, r"\bv_wmma_i32_16x16x16_iu8\b")
     barriers = count_regex(isa, r"\bs_barrier\b")
     scratch = count_regex(isa, r"uses_flat_scratch\s+1")
-    spills = count_regex(summary, r"spill_count = [1-9]|_spill_count: [1-9]")
     variant = mlir_string_attr(outline_mlir, "air.gpu.int8_gemm_variant") or "unknown"
     lds_bytes_per_workgroup = gpu_static_lds_bytes_per_workgroup(variant)
     group_m = mlir_int_attr(outline_mlir, "air.gpu.int8_gemm_group_m") or str(ctx.gpu_int8_gemm_group_size)
-    vgprs = summary_metric(summary, ".vgpr_count") or "n/a"
-    sgprs = summary_metric(summary, ".sgpr_count") or "n/a"
+    vgprs = gpu_summary_metadata_metric(summary, "vgpr_count") or "n/a"
+    sgprs = gpu_summary_metadata_metric(summary, "sgpr_count") or "n/a"
+    vgpr_spills = gpu_summary_metadata_metric(summary, "vgpr_spill_count") or "0"
+    sgpr_spills = gpu_summary_metadata_metric(summary, "sgpr_spill_count") or "0"
+    parsed_vgpr_spills = parse_int_value(vgpr_spills)
+    parsed_sgpr_spills = parse_int_value(sgpr_spills)
+    spills = (
+        parsed_vgpr_spills + parsed_sgpr_spills
+        if parsed_vgpr_spills is not None and parsed_sgpr_spills is not None
+        else count_regex(summary, r"spill_count = [1-9]|_spill_count: [1-9]")
+    )
     global_load_b128 = count_regex(isa, r"\bglobal_load_b128\b")
     global_load_lds = count_regex(isa, r"\bglobal_load(?:_async)?(?:_to)?_lds")
     ds_store_b128 = count_regex(isa, r"\bds_store_b128\b")
@@ -895,14 +970,17 @@ def gpu_backend(ctx: RunContext) -> BackendResult:
             and ds_store_b8 == 0
             and ds_load_b128 == 0
         )
-    result.status = "PASS" if wmma and scratch == 0 and spills == 0 and no_lds_direct_ok else "FAIL"
+    parsed_vgprs = parse_int_value(vgprs)
+    vgpr_ok = parsed_vgprs is not None and parsed_vgprs < 256
+    result.status = "PASS" if wmma and scratch == 0 and spills == 0 and vgpr_ok and no_lds_direct_ok else "FAIL"
     if ctx.run_enabled and "failed" in result.runtime and result.status == "PASS":
         result.status = "WARN"
     result.evidence = (
         f"variant={variant}, group_m={group_m}, wmma={wmma}, "
         f"lds_bytes_per_workgroup={lds_bytes_per_workgroup}, "
         f"barriers={barriers}, vgprs={vgprs}, "
-        f"sgprs={sgprs}, scratch_markers={scratch}, spills={spills}, "
+        f"sgprs={sgprs}, vgpr_spills={vgpr_spills}, "
+        f"sgpr_spills={sgpr_spills}, scratch_markers={scratch}, spills={spills}, "
         f"global_load_b128={global_load_b128}, global_load_lds={global_load_lds}, "
         f"ds_store_b128={ds_store_b128}, ds_store_b8={ds_store_b8}, "
         f"ds_load_b128={ds_load_b128}, global_store_b32={global_store_b32}, waitcnt={waitcnt}, "
@@ -935,7 +1013,7 @@ def gpu_sweep_group_sizes_for_variant(
     config = gpu_variant_config(variant)
     if not config.grouped_blocks:
         return (ctx.gpu_int8_gemm_group_size,)
-    if config.pipeline in {"air_tuned_direct", "air_tuned_direct_canonical", "air_tuned_direct_prefetch", "air_tuned_direct_rawptr", "air_tuned_direct_rawptr_u2", "rocmlir_like_pipe3"}:
+    if config.pipeline in {"air_tuned_direct", "air_tuned_direct_canonical", "air_tuned_direct_prefetch", "air_tuned_direct_rawptr", "air_tuned_direct_rawptr_u2", "rocmlir_like_pipe3", "tensile_like_pipe3"}:
         return (config.default_group_m,)
     return group_sizes
 
@@ -962,6 +1040,8 @@ def gpu_sweep_candidates(
         return list(GPU_INT8_GEMM_GFX1150_AIR_TUNED_DIRECT_CANDIDATES)
     if sweep_profile == "gfx1150-rocmlir-like":
         return list(GPU_INT8_GEMM_GFX1150_ROCMLIR_LIKE_CANDIDATES)
+    if sweep_profile == "gfx1150-consistency":
+        return list(GPU_INT8_GEMM_GFX1150_CONSISTENCY_CANDIDATES)
     if sweep_profile == "gfx1150-opt-direct-canonical":
         return list(GPU_INT8_GEMM_GFX1150_OPT_DIRECT_CANONICAL_CANDIDATES)
     if sweep_profile == "gfx1150-opt-direct-prefetch":
@@ -1036,8 +1116,12 @@ def annotate_gpu_sweep_candidate_gates(rows: Sequence[dict[str, str]]) -> None:
             row["keep_candidate"] = "accepted_best"
         else:
             no_scratch = row_int(row, "scratch_markers") in (None, 0)
-            no_spills = row_int(row, "spills") in (None, 0)
-            keep = row.get("status") == "PASS" and no_scratch and no_spills and improvement >= GPU_CANDIDATE_IMPROVEMENT_PCT
+            no_vgpr_spills = row_int(row, "vgpr_spills") in (None, 0)
+            no_sgpr_spills = row_int(row, "sgpr_spills") in (None, 0)
+            no_spills = row_int(row, "spills") in (None, 0) and no_vgpr_spills and no_sgpr_spills
+            vgprs = row_int(row, "vgprs")
+            vgpr_ok = vgprs is not None and vgprs < 256
+            keep = row.get("status") == "PASS" and no_scratch and no_spills and vgpr_ok and improvement >= GPU_CANDIDATE_IMPROVEMENT_PCT
             row["keep_candidate"] = "yes" if keep else "no"
 
 
@@ -1215,6 +1299,121 @@ def write_gpu_default_decision(
     return decision_path
 
 
+def gpu_static_gate_status(row: dict[str, str]) -> str:
+    vgprs = row_int(row, "vgprs")
+    no_scratch = row_int(row, "scratch_markers") in (None, 0)
+    no_vgpr_spills = row_int(row, "vgpr_spills") in (None, 0)
+    no_sgpr_spills = row_int(row, "sgpr_spills") in (None, 0)
+    no_spills = row_int(row, "spills") in (None, 0) and no_vgpr_spills and no_sgpr_spills
+    vgpr_ok = vgprs is not None and vgprs < 256
+    return "PASS" if row.get("status") == "PASS" and no_scratch and no_spills and vgpr_ok else "FAIL"
+
+
+def write_gpu_stability_report(
+    ctx: RunContext,
+    rows: Sequence[dict[str, str]],
+    repetitions: int,
+    sweep_profile: str,
+    rocblas_tensile_tops: float | None = None,
+) -> tuple[Path, Path]:
+    csv_path = ctx.out_dir / "gpu_stability_report.csv"
+    md_path = ctx.out_dir / "gpu_stability_report.md"
+    baseline = next((row for row in rows if is_accepted_gpu_best(row)), None)
+    baseline_tops = row_float(baseline, "median_tops") if baseline else None
+    fieldnames = (
+        "sweep_profile",
+        "variant",
+        "group_m",
+        "status",
+        "static_gate",
+        "repetitions",
+        "tops_by_rep",
+        "mean_ms_by_rep",
+        "median_tops",
+        "min_tops",
+        "max_tops",
+        "cv_tops_pct",
+        "accepted_best_delta_pct",
+        "rocblas_tensile_pct",
+        "consistency_min_gate",
+        "consistency_target_gate",
+        "vgprs",
+        "sgprs",
+        "vgpr_spills",
+        "sgpr_spills",
+        "spills",
+        "scratch_markers",
+        "artifacts",
+        "run_logs",
+    )
+    out_rows: list[dict[str, str]] = []
+    for row in rows:
+        median_tops = row_float(row, "median_tops")
+        accepted_delta = ""
+        if baseline_tops is not None and baseline_tops > 0.0 and median_tops is not None:
+            accepted_delta = f"{((median_tops - baseline_tops) / baseline_tops) * 100.0:.3f}"
+        rocblas_pct = ""
+        if rocblas_tensile_tops is not None and rocblas_tensile_tops > 0.0 and median_tops is not None:
+            rocblas_pct = f"{(median_tops / rocblas_tensile_tops) * 100.0:.3f}"
+        reps = row_int(row, "repetitions") or 0
+        pass_status = row.get("status") == "PASS"
+        min_gate = bool(pass_status and reps == repetitions and median_tops is not None and median_tops >= GPU_INT8_GEMM_CONSISTENCY_MIN_TOPS)
+        target_gate = bool(pass_status and reps == repetitions and median_tops is not None and median_tops >= GPU_INT8_GEMM_CONSISTENCY_TARGET_TOPS)
+        out_rows.append({
+            "sweep_profile": row.get("sweep_profile", sweep_profile),
+            "variant": row.get("variant", ""),
+            "group_m": row.get("group_m", ""),
+            "status": row.get("status", ""),
+            "static_gate": gpu_static_gate_status(row),
+            "repetitions": row.get("repetitions", ""),
+            "tops_by_rep": row.get("tops_by_rep", ""),
+            "mean_ms_by_rep": row.get("mean_ms_by_rep", ""),
+            "median_tops": row.get("median_tops", ""),
+            "min_tops": row.get("min_tops", ""),
+            "max_tops": row.get("max_tops", ""),
+            "cv_tops_pct": row.get("cv_tops_pct", ""),
+            "accepted_best_delta_pct": accepted_delta,
+            "rocblas_tensile_pct": rocblas_pct,
+            "consistency_min_gate": "yes" if min_gate else "no",
+            "consistency_target_gate": "yes" if target_gate else "no",
+            "vgprs": row.get("vgprs", ""),
+            "sgprs": row.get("sgprs", ""),
+            "vgpr_spills": row.get("vgpr_spills", ""),
+            "sgpr_spills": row.get("sgpr_spills", ""),
+            "spills": row.get("spills", ""),
+            "scratch_markers": row.get("scratch_markers", ""),
+            "artifacts": row.get("artifacts", ""),
+            "run_logs": row.get("run_logs", ""),
+        })
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(out_rows)
+    ranked = sorted(out_rows, key=lambda row: (-(row_float(row, "median_tops") or 0.0), row.get("variant", "")))
+    with md_path.open("w", encoding="utf-8") as f:
+        f.write("# GPU INT8 GEMM Stability Report\n\n")
+        f.write("## Gates\n\n| Field | Value |\n| --- | --- |\n")
+        f.write(f"| Sweep profile | `{sweep_profile}` |\n")
+        f.write(f"| Required repetitions | `{repetitions}` |\n")
+        f.write(f"| Accepted best | `{GPU_INT8_GEMM_ACCEPTED_BEST_VARIANT} group_m={GPU_INT8_GEMM_ACCEPTED_BEST_GROUP_SIZE}` |\n")
+        f.write(f"| Minimum consistency TOPS | `{GPU_INT8_GEMM_CONSISTENCY_MIN_TOPS:.2f}` |\n")
+        f.write(f"| Preferred consistency TOPS | `{GPU_INT8_GEMM_CONSISTENCY_TARGET_TOPS:.2f}` |\n")
+        f.write(f"| rocBLAS/Tensile median TOPS | `{rocblas_tensile_tops:.6f}` |\n" if rocblas_tensile_tops is not None else "| rocBLAS/Tensile median TOPS | `n/a` |\n")
+        f.write("\n## Candidates\n\n")
+        f.write("| Rank | Variant | Group M | Status | Static Gate | Reps | TOPS by Rep | Median | Min | Max | CV % | Accepted Delta % | rocBLAS/Tensile % | >=8.35 | >=8.50 | VGPRs | SGPRs | VGPR Spills | SGPR Spills | Scratch | Artifacts |\n")
+        f.write("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+        for rank, row in enumerate(ranked, start=1):
+            f.write(
+                f"| {rank} | `{row['variant']}` | {row['group_m']} | {row['status']} | {row['static_gate']} | {row['repetitions'] or '0'} | "
+                f"`{row['tops_by_rep'] or 'n/a'}` | {row['median_tops'] or 'n/a'} | {row['min_tops'] or 'n/a'} | {row['max_tops'] or 'n/a'} | "
+                f"{row['cv_tops_pct'] or 'n/a'} | {row['accepted_best_delta_pct'] or 'n/a'} | {row['rocblas_tensile_pct'] or 'n/a'} | "
+                f"{row['consistency_min_gate']} | {row['consistency_target_gate']} | {row['vgprs'] or 'n/a'} | {row['sgprs'] or 'n/a'} | "
+                f"{row['vgpr_spills'] or 'n/a'} | {row['sgpr_spills'] or 'n/a'} | {row['scratch_markers'] or 'n/a'} | `{row['artifacts'] or 'n/a'}` |\n"
+            )
+        f.write(f"\nCSV: `{csv_path}`\n")
+    return csv_path, md_path
+
+
 def run_gpu_variant_sweep(
     ctx: RunContext,
     sweep_profile: str,
@@ -1271,7 +1470,9 @@ def run_gpu_variant_sweep(
         results.append(result)
         evidence = evidence_map(result)
         metrics = summarize_gpu_repetition_metrics(run_logs) if run_logs else {}
+        series = gpu_repetition_series(run_logs) if run_logs else {"tops_by_rep": "", "mean_ms_by_rep": ""}
         row = {
+            "sweep_profile": sweep_profile,
             "variant": variant,
             "group_m": str(group_size),
             "status": result.status,
@@ -1286,6 +1487,7 @@ def run_gpu_variant_sweep(
             "mean_tops": fmt_float(metrics.get("mean_tops")),
             "stddev_tops": fmt_float(metrics.get("stddev_tops")),
             "cv_tops_pct": fmt_float(metrics.get("cv_tops_pct")),
+            "min_tops": fmt_float(metrics.get("min_tops")),
             "max_tops": fmt_float(metrics.get("max_tops")),
             "timing_domain": result.perf_domain,
             "count": result.perf_count,
@@ -1295,6 +1497,8 @@ def run_gpu_variant_sweep(
             "artifacts": str(result.artifacts_dir),
             "run_logs": ";".join(str(log) for log in run_logs),
             "disassemble_log": str(result.logs.get("disassemble", "")),
+            "tops_by_rep": series["tops_by_rep"],
+            "mean_ms_by_rep": series["mean_ms_by_rep"],
         }
         for key in (*GPU_STATIC_COUNTER_KEYS, *GPU_DYNAMIC_COUNTER_KEYS):
             row[key] = evidence.get(key, "")
@@ -1310,6 +1514,8 @@ def run_gpu_variant_sweep(
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+    stability_csv_path, stability_md_path = write_gpu_stability_report(ctx, rows, repetitions, sweep_profile)
 
     retained_ranked = [
         result
@@ -1352,7 +1558,7 @@ def run_gpu_variant_sweep(
         f.write(f"\nCSV: `{csv_path}`\n")
 
     decision_path = write_gpu_default_decision(ctx, rows, repetitions, default_threshold_pct, sweep_profile, csv_path, md_path) if ctx.run_enabled else None
-    best.runtime = f"{best.runtime}; sweep csv {csv_path}; sweep report {md_path}"
+    best.runtime = f"{best.runtime}; sweep csv {csv_path}; sweep report {md_path}; stability csv {stability_csv_path}; stability report {stability_md_path}"
     if decision_path:
         best.runtime = f"{best.runtime}; default decision {decision_path}"
     best_row = next((row for result, row in zip(results, rows) if result is best), None)
@@ -1407,6 +1613,24 @@ def provider_summary_line(log: Path, provider: str) -> dict[str, str]:
     return {}
 
 
+def provider_repetition_series(log: Path, provider: str) -> dict[str, str]:
+    tops: list[float] = []
+    mean_ms: list[float] = []
+    for line in read_text(log).splitlines():
+        if f"provider={provider}" not in line or "repetition=" not in line:
+            continue
+        fields = dict(re.findall(r"([A-Za-z0-9_.-]+)=([^\s]+)", line))
+        if (value := parse_float(fields.get("tops", ""))) is not None:
+            tops.append(value)
+        if (value := parse_float(fields.get("mean_ms", ""))) is not None:
+            mean_ms.append(value)
+    return {
+        "tops_by_rep": format_metric_series(tops),
+        "mean_ms_by_rep": format_metric_series(mean_ms),
+        "min_tops": fmt_float(min(tops) if tops else None),
+    }
+
+
 def provider_symbol_body(isa: str, symbol: str) -> str:
     lines = isa.splitlines()
     start = None
@@ -1451,7 +1675,13 @@ def provider_static_counters(provider: str, disassembly: dict[str, str]) -> dict
 
 def generic_gpu_static_counters(isa_text: str, metadata_text: str = "") -> dict[str, str]:
     scratch_markers = count_regex(isa_text, r"\bscratch\b") + count_regex(metadata_text, r"uses_flat_scratch:\s*1|uses_flat_scratch\s+1")
+    vgpr_spill_matches = re.findall(r"\.vgpr_spill_count:\s*([0-9]+)|vgpr_spill_count\s*=\s*([0-9]+)", metadata_text)
+    sgpr_spill_matches = re.findall(r"\.sgpr_spill_count:\s*([0-9]+)|sgpr_spill_count\s*=\s*([0-9]+)", metadata_text)
+    vgpr_spills = next((value for match in reversed(vgpr_spill_matches) for value in match if value), "")
+    sgpr_spills = next((value for match in reversed(sgpr_spill_matches) for value in match if value), "")
     spill_markers = count_regex(metadata_text, r"spill_count:\s*[1-9]|_spill_count:\s*[1-9]|spill_count = [1-9]")
+    if vgpr_spills and sgpr_spills:
+        spill_markers = int(vgpr_spills) + int(sgpr_spills)
     return {
         "wmma": str(count_regex(isa_text, r"\bv_wmma_i32_16x16x16_iu8\b")),
         "global_load_b128": str(count_regex(isa_text, r"\b(?:global|buffer)_load_b128\b")),
@@ -1462,6 +1692,8 @@ def generic_gpu_static_counters(isa_text: str, metadata_text: str = "") -> dict[
         "barriers": str(count_regex(isa_text, r"\bs_barrier\b")),
         "waitcnt": str(count_regex(isa_text, r"\bs_waitcnt\b")),
         "scratch_markers": str(scratch_markers),
+        "vgpr_spills": vgpr_spills,
+        "sgpr_spills": sgpr_spills,
         "spills": str(spill_markers),
     }
 
@@ -1683,11 +1915,17 @@ def gpu_result_to_provider_row(result: BackendResult) -> dict[str, str]:
     group = evidence.get("group_m", str(DEFAULT_GPU_INT8_GEMM_GROUP_SIZE))
     row = provider_empty_row(f"mlir_air:{variant}:g{group}", "mlir-air", result.status, "yes", result.perf_notes)
     row["validation"] = gpu_result_validation(result)
-    row["run_log"] = ";".join(str(path) for stem, path in sorted(result.logs.items()) if stem.startswith("run"))
+    run_logs = [path for stem, path in sorted(result.logs.items()) if stem.startswith("run")]
+    row["run_log"] = ";".join(str(path) for path in run_logs)
     row["disassemble_log"] = str(result.logs.get("disassemble", ""))
     row["artifacts"] = str(result.artifacts_dir)
     if result.perf_tops is not None:
         row["median_tops"] = f"{result.perf_tops:.6f}"
+    if run_logs:
+        row.update(gpu_repetition_series(run_logs))
+        metrics = summarize_gpu_repetition_metrics(run_logs)
+        for key in ("min_tops", "max_tops", "mean_tops", "stddev_tops", "cv_tops_pct", "min_mean_ms", "mean_mean_ms", "stddev_mean_ms", "cv_mean_ms_pct", "best_kernel_min_ms"):
+            row[key] = fmt_float(metrics.get(key))
     median_ms = re.search(r"median mean ([0-9.]+) ms", result.perf_latency)
     if median_ms:
         row["median_mean_ms"] = median_ms.group(1)
@@ -1842,6 +2080,7 @@ def run_gpu_provider_binary(ctx: RunContext, result: BackendResult, binary: Path
             "max_tops",
         ):
             row[key] = summary.get(key, "")
+        row.update(provider_repetition_series(log, provider))
     row["build_log"] = str(build_log)
     row["run_log"] = str(log)
     row["artifacts"] = str(result.artifacts_dir)
@@ -1862,19 +2101,23 @@ def run_gpu_provider_binary(ctx: RunContext, result: BackendResult, binary: Path
 def annotate_gpu_provider_air_tuned_gates(rows: Sequence[dict[str, str]]) -> None:
     air_tuned = next((row for row in rows if row.get("provider") == "air_tuned"), None)
     tuned_tops = provider_metric(air_tuned, "median_tops") if air_tuned else None
+    rocblas = next((row for row in rows if row.get("provider") == "rocblas_tensile"), None)
+    rocblas_tops = provider_metric(rocblas, "median_tops") if rocblas else None
     for row in rows:
         row.setdefault("mlir_air_pct_of_air_tuned", "")
         row.setdefault("passes_air_tuned_95pct", "")
+        row.setdefault("mlir_air_pct_of_rocblas_tensile", "")
         row.setdefault("candidate_improvement_pct", "")
         row.setdefault("keep_candidate", "")
         if row.get("source") != "mlir-air":
             continue
         mlir_tops = provider_metric(row, "median_tops")
-        if mlir_tops is None or tuned_tops is None or tuned_tops <= 0.0:
-            continue
-        pct = (mlir_tops / tuned_tops) * 100.0
-        row["mlir_air_pct_of_air_tuned"] = f"{pct:.3f}"
-        row["passes_air_tuned_95pct"] = "yes" if pct >= GPU_AIR_TUNED_ACCEPTANCE_PCT else "no"
+        if mlir_tops is not None and tuned_tops is not None and tuned_tops > 0.0:
+            pct = (mlir_tops / tuned_tops) * 100.0
+            row["mlir_air_pct_of_air_tuned"] = f"{pct:.3f}"
+            row["passes_air_tuned_95pct"] = "yes" if pct >= GPU_AIR_TUNED_ACCEPTANCE_PCT else "no"
+        if mlir_tops is not None and rocblas_tops is not None and rocblas_tops > 0.0:
+            row["mlir_air_pct_of_rocblas_tensile"] = f"{(mlir_tops / rocblas_tops) * 100.0:.3f}"
 
 
 def write_gpu_provider_baseline_report(ctx: RunContext, rows: Sequence[dict[str, str]], repetitions: int) -> tuple[Path, Path]:
@@ -1901,8 +2144,13 @@ def write_gpu_provider_baseline_report(ctx: RunContext, rows: Sequence[dict[str,
     air_vs_rocblas_pct = None
     if best_air and rocblas and provider_metric(rocblas, "median_tops"):
         air_vs_rocblas_pct = ((provider_metric(best_air, "median_tops") or 0.0) / (provider_metric(rocblas, "median_tops") or 1.0)) * 100.0
+    mlir_air = next((row for row in rows if row.get("source") == "mlir-air"), None)
+    mlir_air_vs_rocblas_pct = None
+    if mlir_air and rocblas and provider_metric(rocblas, "median_tops"):
+        mlir_air_vs_rocblas_pct = ((provider_metric(mlir_air, "median_tops") or 0.0) / (provider_metric(rocblas, "median_tops") or 1.0)) * 100.0
     air_reaches_2x = bool(best_air and (provider_metric(best_air, "median_tops") or 0.0) >= GPU_PROVIDER_2X_TARGET_TOPS)
     air_reaches_rocblas_parity = bool(air_vs_rocblas_pct is not None and air_vs_rocblas_pct >= GPU_PROVIDER_ROCBLAS_PARITY_PCT)
+    mlir_air_reaches_rocblas_parity = bool(mlir_air_vs_rocblas_pct is not None and mlir_air_vs_rocblas_pct >= GPU_PROVIDER_ROCBLAS_PARITY_PCT)
     if best_air and top and top.get("provider") == best_air.get("provider") and air_reaches_2x and air_reaches_rocblas_parity and stable_gap:
         recommendation = "AIR_TUNED_PROVIDER_CANDIDATE"
     elif air_reaches_2x and not air_reaches_rocblas_parity:
@@ -1927,19 +2175,21 @@ def write_gpu_provider_baseline_report(ctx: RunContext, rows: Sequence[dict[str,
         f.write(f"| Best AIR-owned reaches 2x | `{'yes' if air_reaches_2x else 'no'}` |\n")
         f.write(f"| AIR-owned / rocBLAS TOPS | `{air_vs_rocblas_pct:.3f}%` |\n" if air_vs_rocblas_pct is not None else "| AIR-owned / rocBLAS TOPS | `n/a` |\n")
         f.write(f"| AIR-owned reaches {GPU_PROVIDER_ROCBLAS_PARITY_PCT:.1f}% rocBLAS | `{'yes' if air_reaches_rocblas_parity else 'no'}` |\n")
-        mlir_air = next((row for row in rows if row.get("source") == "mlir-air"), None)
+        f.write(f"| MLIR-AIR / rocBLAS TOPS | `{mlir_air_vs_rocblas_pct:.3f}%` |\n" if mlir_air_vs_rocblas_pct is not None else "| MLIR-AIR / rocBLAS TOPS | `n/a` |\n")
+        f.write(f"| MLIR-AIR reaches {GPU_PROVIDER_ROCBLAS_PARITY_PCT:.1f}% rocBLAS | `{'yes' if mlir_air_reaches_rocblas_parity else 'no'}` |\n")
         mlir_air_pct = mlir_air.get("mlir_air_pct_of_air_tuned", "") if mlir_air else ""
         mlir_air_gate = mlir_air.get("passes_air_tuned_95pct", "") if mlir_air else ""
         f.write("| MLIR-AIR / air_tuned TOPS | `{}` |\n".format((mlir_air_pct + "%") if mlir_air_pct else "n/a"))
         f.write("| MLIR-AIR reaches {:.1f}% air_tuned | `{}` |\n".format(GPU_AIR_TUNED_ACCEPTANCE_PCT, "yes" if mlir_air_gate == "yes" else "no"))
         f.write("\n## Results\n\n")
-        f.write("| Provider | Source | Status | Validation | Reps | Median ms | Median TOPS | 2x Target % | WMMA | Scratch | Notes |\n")
-        f.write("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+        f.write("| Provider | Source | Status | Validation | Reps | TOPS by Rep | Median ms | Median TOPS | 2x Target % | rocBLAS % | WMMA | Scratch | Notes |\n")
+        f.write("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
         for row in rows:
+            rocblas_pct = row.get("mlir_air_pct_of_rocblas_tensile", "") if row.get("source") == "mlir-air" else ""
             f.write(
                 f"| `{row['provider']}` | {row['source']} | {row['status']} | {row['validation'] or 'n/a'} | {row['repetitions'] or '0'} | "
-                f"{row['median_mean_ms'] or 'n/a'} | {row['median_tops'] or 'n/a'} | {row['target_pct_2x'] or 'n/a'} | "
-                f"{row['wmma'] or 'n/a'} | {row['scratch_markers'] or 'n/a'} | {row['notes'] or 'n/a'} |\n"
+                f"`{row['tops_by_rep'] or 'n/a'}` | {row['median_mean_ms'] or 'n/a'} | {row['median_tops'] or 'n/a'} | {row['target_pct_2x'] or 'n/a'} | "
+                f"{rocblas_pct or 'n/a'} | {row['wmma'] or 'n/a'} | {row['scratch_markers'] or 'n/a'} | {row['notes'] or 'n/a'} |\n"
             )
         f.write("\n## Roofline Inputs\n\n")
         f.write(f"Ideal bytes per GEMM: `{GEMM_INT8_IDEAL_BYTES}`\n\n")
@@ -1989,7 +2239,16 @@ def run_gpu_provider_baselines(
     ck_available = (rocm / "include" / "ck_tile").exists() or (rocm / "include" / "ck").exists()
     ck_notes = "CK/CK-Tile headers found; fixed-contract CK driver is not wired into this harness yet" if ck_available else "CK/CK-Tile headers not found"
     rows.append(provider_empty_row("ck_tile", "external", "SKIP", "yes" if ck_available else "no", ck_notes))
-    return write_gpu_provider_baseline_report(ctx, rows, repetitions)
+    provider_paths = write_gpu_provider_baseline_report(ctx, rows, repetitions)
+    sweep_csv = ctx.out_dir / "gpu_variant_sweep.csv"
+    if sweep_csv.exists():
+        with sweep_csv.open("r", encoding="utf-8", newline="") as f:
+            sweep_rows = list(csv.DictReader(f))
+        if sweep_rows:
+            rocblas = next((row for row in rows if row.get("provider") == "rocblas_tensile"), None)
+            rocblas_tops = provider_metric(rocblas, "median_tops") if rocblas else None
+            write_gpu_stability_report(ctx, sweep_rows, repetitions, sweep_rows[0].get("sweep_profile", "from gpu_variant_sweep.csv"), rocblas_tops)
+    return provider_paths
 
 def find_npu_elves(build_dir: Path) -> list[Path]:
     return sorted(build_dir.rglob("bare_matmul*_core_*.elf")) or sorted(build_dir.rglob("*.elf"))
@@ -2116,6 +2375,12 @@ def write_report(report: Path, ctx: RunContext, args: argparse.Namespace, result
             result = results[name]
             target = f"{result.target_tops:.3f}" if result.target_tops is not None else "n/a"
             f.write(f"| {name.upper()} | {result.perf_domain} | {result.perf_count} | {result.perf_latency} | {result.perf_throughput} | {target} | {result.target_pct} | {result.perf_notes} |\n")
+        if args.gpu_sweep_variants:
+            stability_csv = ctx.out_dir / "gpu_stability_report.csv"
+            stability_md = ctx.out_dir / "gpu_stability_report.md"
+            f.write("\n## GPU Stability Report\n\n")
+            f.write(f"- CSV: `{stability_csv}`\n")
+            f.write(f"- Report: `{stability_md}`\n")
         if args.gpu_provider_baselines:
             provider_csv = ctx.out_dir / "gpu_provider_baselines.csv"
             provider_md = ctx.out_dir / "gpu_provider_baselines.md"

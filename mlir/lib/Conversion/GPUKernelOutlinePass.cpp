@@ -326,6 +326,8 @@ struct ConvertGPUKernelOutlinePass
         config->pipeline == PipelineKind::TensileLikePipe2;
     bool shortLivedLoopedPipeline =
         config->pipeline == PipelineKind::TensileLikePipe2ShortLived;
+    bool tensileLikePipe3 =
+        config->pipeline == PipelineKind::TensileLikePipe3;
     bool rocmlirLikePipe3 =
         config->pipeline == PipelineKind::RocmlirLikePipe3;
     bool staticPrefetchPipeline =
@@ -377,6 +379,17 @@ struct ConvertGPUKernelOutlinePass
     if (directGlobalPipeline && groupSize != 8)
       return func.emitOpError(kInt8GemmWmmaAttr)
              << " direct global variant requires group size 8";
+    if (tensileLikePipe3 &&
+        (blockRows != 128 || blockCols != 128 || kPerBlock != 32 ||
+         blockThreads != 128 || waveTileRows != 64 || waveTileCols != 64 ||
+         !packedB || !groupedBlocks || directBFragments || !swizzledLds ||
+         config->ldsStages != 3))
+      return func.emitOpError(kInt8GemmWmmaAttr)
+             << " Tensile-like pipe3 variant only supports the fixed "
+                "1024x1024x1024 contract";
+    if (tensileLikePipe3 && groupSize != 8)
+      return func.emitOpError(kInt8GemmWmmaAttr)
+             << " Tensile-like pipe3 variant requires group size 8";
     if (rocmlirLikePipe3 &&
         (blockRows != 128 || blockCols != 128 || kPerBlock != 32 ||
          blockThreads != 128 || waveTileRows != 64 || waveTileCols != 64 ||
@@ -430,8 +443,12 @@ struct ConvertGPUKernelOutlinePass
     }
 
     OpBuilder builder(ctx);
-    if (directGlobalPipeline)
-      func->setAttr("rocdl.waves_per_eu", builder.getI32IntegerAttr(1));
+    int64_t wavesPerEu = config->wavesPerEu;
+    if (wavesPerEu == 0 && directGlobalPipeline)
+      wavesPerEu = 1;
+    if (wavesPerEu > 0)
+      func->setAttr("rocdl.waves_per_eu",
+                    builder.getI32IntegerAttr(wavesPerEu));
     builder.setInsertionPointToStart(&body);
 
     Value c0 = cidx(builder, loc, 0);
@@ -741,12 +758,56 @@ struct ConvertGPUKernelOutlinePass
       SmallVector<Value, 4> b;
     };
 
+    auto guardedVectorPrefetchIf = [&](Value condition,
+                                        auto createLoad) -> Value {
+      auto ifOp = scf::IfOp::create(builder, loc, TypeRange{vec16i8},
+                                    condition, /*withElse=*/true);
+      {
+        OpBuilder::InsertionGuard guard(builder);
+        if (Operation *yield = existingTerminator(ifOp.thenBlock())) {
+          builder.setInsertionPoint(yield);
+          yield->setOperands(createLoad());
+        } else {
+          builder.setInsertionPointToStart(ifOp.thenBlock());
+          Value loaded = createLoad();
+          scf::YieldOp::create(builder, loc, loaded);
+        }
+      }
+      {
+        OpBuilder::InsertionGuard guard(builder);
+        if (Operation *yield = existingTerminator(ifOp.elseBlock())) {
+          yield->setOperands(zeroVec16i8);
+        } else {
+          builder.setInsertionPointToStart(ifOp.elseBlock());
+          scf::YieldOp::create(builder, loc, zeroVec16i8);
+        }
+      }
+      return ifOp.getResult(0);
+    };
+
     auto prefetchTileToRegs = [&](Value kBase) {
       TilePrefetch prefetch;
       for (int64_t chunk = 0; chunk < aCopyChunks; ++chunk)
         prefetch.a.push_back(prefetchATile(kBase, copyLinearIndex(chunk)));
       for (int64_t chunk = 0; chunk < bCopyChunks; ++chunk)
         prefetch.b.push_back(prefetchPackedBTile(kBase, copyLinearIndex(chunk)));
+      return prefetch;
+    };
+
+    auto prefetchTileToRegsIf = [&](Value kBase, Value condition) {
+      TilePrefetch prefetch;
+      for (int64_t chunk = 0; chunk < aCopyChunks; ++chunk) {
+        Value linearIndex = copyLinearIndex(chunk);
+        prefetch.a.push_back(guardedVectorPrefetchIf(condition, [&]() {
+          return prefetchATile(kBase, linearIndex);
+        }));
+      }
+      for (int64_t chunk = 0; chunk < bCopyChunks; ++chunk) {
+        Value linearIndex = copyLinearIndex(chunk);
+        prefetch.b.push_back(guardedVectorPrefetchIf(condition, [&]() {
+          return prefetchPackedBTile(kBase, linearIndex);
+        }));
+      }
       return prefetch;
     };
 
@@ -947,6 +1008,55 @@ struct ConvertGPUKernelOutlinePass
       builder.setInsertionPointAfter(kLoop);
       for (int64_t i = 0; i < accCount; ++i)
         finalAccs.push_back(kLoop.getResult(i));
+    } else if (tensileLikePipe3) {
+      SmallVector<Value, 8> initAccs(accCount, initAcc);
+      storePrefetchToLds(aLds, bLds, prefetchTileToRegs(c0));
+      storePrefetchToLds(aLdsNext, bLdsNext, prefetchTileToRegs(cKPerBlock));
+      storePrefetchToLds(aLdsThird, bLdsThird,
+                         prefetchTileToRegs(c2KPerBlock));
+      gpu::BarrierOp::create(builder, loc);
+
+      auto kLoop = scf::ForOp::create(builder, loc, c0, cPenultimateK,
+                                      c3KPerBlock, ValueRange(initAccs));
+      builder.setInsertionPointToStart(kLoop.getBody());
+      Value k = kLoop.getInductionVar();
+      Value kNext = arith::AddIOp::create(builder, loc, k, cKPerBlock);
+      Value kNextPair = arith::AddIOp::create(builder, loc, k, c2KPerBlock);
+      Value kNextTriple = arith::AddIOp::create(builder, loc, k, c3KPerBlock);
+      Value kNextQuad =
+          arith::AddIOp::create(builder, loc, kNextTriple, cKPerBlock);
+      Value kNextPenta =
+          arith::AddIOp::create(builder, loc, kNextQuad, cKPerBlock);
+      Value kNextPentaInBounds = arith::CmpIOp::create(
+          builder, loc, arith::CmpIPredicate::ult, kNextPenta, c1024);
+
+      TilePrefetch nextTriplePrefetch = prefetchTileToRegs(kNextTriple);
+      TilePrefetch nextQuadPrefetch = prefetchTileToRegs(kNextQuad);
+      TilePrefetch nextPentaPrefetch =
+          prefetchTileToRegsIf(kNextPenta, kNextPentaInBounds);
+
+      SmallVector<Value, 8> nextAccs;
+      nextAccs.reserve(accCount);
+      for (int64_t i = 0; i < accCount; ++i)
+        nextAccs.push_back(kLoop.getRegionIterArg(i));
+
+      computeTile(aLds, bLds, k, nextAccs);
+      computeTile(aLdsNext, bLdsNext, kNext, nextAccs);
+      computeTile(aLdsThird, bLdsThird, kNextPair, nextAccs);
+      gpu::BarrierOp::create(builder, loc);
+
+      storePrefetchToLds(aLds, bLds, nextTriplePrefetch);
+      storePrefetchToLds(aLdsNext, bLdsNext, nextQuadPrefetch);
+      storePrefetchToLds(aLdsThird, bLdsThird, nextPentaPrefetch);
+      gpu::BarrierOp::create(builder, loc);
+      scf::YieldOp::create(builder, loc, ValueRange(nextAccs));
+
+      builder.setInsertionPointAfter(kLoop);
+      for (int64_t i = 0; i < accCount; ++i)
+        finalAccs.push_back(kLoop.getResult(i));
+
+      computeTile(aLds, bLds, cPenultimateK, finalAccs);
+      computeTile(aLdsNext, bLdsNext, cLastK, finalAccs);
     } else if (rocmlirLikePipe3) {
       SmallVector<Value, 8> initAccs(accCount, initAcc);
       copyTile(aLds, bLds, c0);

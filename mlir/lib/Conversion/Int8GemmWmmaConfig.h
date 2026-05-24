@@ -94,6 +94,12 @@ static constexpr const char kInt8GemmTensileK32Pipe2Variant[] =
     "lds_128x128_tensile_k32_pipe2";
 static constexpr const char kInt8GemmTensileK32Pipe2PadVariant[] =
     "lds_128x128_tensile_k32_pipe2_pad";
+static constexpr const char kInt8GemmTensileK32Pipe3Variant[] =
+    "lds_128x128_tensile_k32_pipe3";
+static constexpr const char kInt8GemmTensileK32Pipe3PadVariant[] =
+    "lds_128x128_tensile_k32_pipe3_pad";
+static constexpr const char kInt8GemmTensileK32Pipe3Wpe2Variant[] =
+    "lds_128x128_tensile_k32_pipe3_wpe2";
 
 enum class PipelineKind {
   SingleBufferLoop,
@@ -102,6 +108,7 @@ enum class PipelineKind {
   Pipe2LoopedPrefetch,
   TensileLikePipe2,
   TensileLikePipe2ShortLived,
+  TensileLikePipe3,
   RocmlirLikePipe3,
   AirTunedDirect,
   AirTunedDirectCanonical,
@@ -128,6 +135,7 @@ struct Int8GemmKernelConfig {
   int64_t ldsKPadding = 0;
   int64_t blockDimX = 0;
   int64_t blockDimY = 1;
+  int64_t wavesPerEu = 0;
 
   int64_t waveCount() const { return blockThreads / 32; }
   int64_t effectiveWaveTileCols() const {
@@ -210,6 +218,14 @@ static const Int8GemmKernelConfig kInt8GemmKernelConfigs[] = {
      false, PipelineKind::TensileLikePipe2, 8, 64, 64, 0, 32, 4},
     {kInt8GemmTensileK32Pipe2PadVariant, 128, 128, 32, 128, 2, true, true,
      true, false, PipelineKind::TensileLikePipe2, 8, 64, 64, 16, 32, 4},
+    {kInt8GemmTensileK32Pipe3Variant, 128, 128, 32, 128, 3, true, true,
+     true, false, PipelineKind::TensileLikePipe3, 8, 64, 64, 0, 32, 4},
+    {kInt8GemmTensileK32Pipe3PadVariant, 128, 128, 32, 128, 3, true,
+     true, true, false, PipelineKind::TensileLikePipe3, 8, 64, 64, 16,
+     32, 4},
+    {kInt8GemmTensileK32Pipe3Wpe2Variant, 128, 128, 32, 128, 3, true,
+     true, true, false, PipelineKind::TensileLikePipe3, 8, 64, 64, 0,
+     32, 4, 2},
     {kInt8GemmRocmlirLikePipe3Variant, 128, 128, 32, 128, 3, false, true,
      true, false, PipelineKind::RocmlirLikePipe3, 8, 64, 64, 0, 32, 4},
     {kInt8GemmAirTunedDirectVariant, 128, 128, 32, 128, 0, false, true, true,
