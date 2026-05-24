@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import os
 import re
 import shlex
@@ -22,7 +23,16 @@ from pathlib import Path
 from typing import Sequence
 
 M = N = K = 1024
-TARGET_TOPS = {"cpu": 4.0, "gpu": 15.0, "npu": 36.0}
+NPU_SOTA_M = 4032
+NPU_SOTA_K = 4320
+NPU_SOTA_N = 4608
+NPU_DEFAULT_TILE_M = 512
+NPU_DEFAULT_TILE_N = 256
+NPU_SOTA_TILE_M = 576
+NPU_SOTA_TILE_N = 1152
+NPU_PUBLISHED_SOTA_TOPS = 38.05
+NPU_ACCEPTANCE_TOPS = 36.15
+TARGET_TOPS = {"cpu": 4.0, "gpu": 15.0, "npu": NPU_ACCEPTANCE_TOPS}
 GPU_INT8_GEMM_BASE_WMMA_VARIANT = "lds_128x64_wmma4"
 GPU_INT8_GEMM_AIR_TUNED_DIRECT_VARIANT = "global_128x128_bpack_w4_direct"
 GPU_INT8_GEMM_DIRECT_CANONICAL_VARIANT = "global_128x128_bpack_w4_direct_canonical"
@@ -425,6 +435,13 @@ def nonnegative_float(value: str) -> float:
     return parsed
 
 
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0.0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
+    return parsed
+
+
 def gpu_group_size(value: str) -> int:
     parsed = positive_int(value)
     if parsed not in GPU_INT8_GEMM_GROUP_SIZES:
@@ -453,6 +470,13 @@ def read_text(path: Path) -> str:
 def write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def file_digest(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return "missing"
 
 
 def count_regex(text_or_path: str | Path, pattern: str) -> int:
@@ -618,6 +642,18 @@ class RunContext:
     run_enabled: bool
     cpu_threads: int
     npu_runtime_loop_tiling: str
+    npu_m: int
+    npu_k: int
+    npu_n: int
+    npu_tile_m: int
+    npu_tile_n: int
+    npu_output_type: str
+    npu_b_layout: str
+    npu_transform_script: Path | None
+    npu_transform_variant: str
+    npu_trace_size: int
+    npu_trace_offset: int
+    npu_acceptance_tops: float
 
     @property
     def disassemble(self) -> Path:
@@ -684,11 +720,12 @@ def note_run_failure(result: BackendResult, log: Path, label: str = "run") -> No
 
 def parse_host_perf(ctx: RunContext, result: BackendResult, log: Path, domain: str) -> None:
     avg_us, min_us, max_us, gops = (last_kv_value(log, key) for key in ("avg_us", "min_us", "max_us", "gops"))
+    avg_tops = last_kv_value(log, "avg_tops")
     result.perf_domain = domain
     result.perf_count = last_kv_value(log, "iterations") or str(ctx.iterations)
     result.perf_latency = f"mean {avg_us or 'n/a'} us ({us_to_ms(avg_us)} ms), min {min_us or 'n/a'} us, max {max_us or 'n/a'} us"
-    result.perf_throughput = f"{gops or 'n/a'} GOPS ({to_tops(gops)} TOPS)"
-    set_perf_tops(result, parse_gops_tops(gops))
+    result.perf_throughput = f"{gops or 'n/a'} GOPS ({avg_tops or to_tops(gops)} TOPS)"
+    set_perf_tops(result, parse_float(avg_tops) if avg_tops else parse_gops_tops(gops))
 
 
 def cpu_backend(ctx: RunContext) -> BackendResult:
@@ -1440,6 +1477,18 @@ def run_gpu_variant_sweep(
             False,
             ctx.cpu_threads,
             ctx.npu_runtime_loop_tiling,
+            ctx.npu_m,
+            ctx.npu_k,
+            ctx.npu_n,
+            ctx.npu_tile_m,
+            ctx.npu_tile_n,
+            ctx.npu_output_type,
+            ctx.npu_b_layout,
+            ctx.npu_transform_script,
+            ctx.npu_transform_variant,
+            ctx.npu_trace_size,
+            ctx.npu_trace_offset,
+            ctx.npu_acceptance_tops,
         )
         for path in (variant_ctx.out_dir, variant_ctx.build_root, variant_ctx.logs_dir):
             path.mkdir(parents=True, exist_ok=True)
@@ -2258,90 +2307,276 @@ def npu_env(ctx: RunContext) -> dict[str, str]:
     env = os.environ.copy()
     if not env.get("PYTHON") and (candidate := ctx.repo / "sandbox" / "bin" / "python3").exists():
         env["PYTHON"] = str(candidate)
-    for candidate in sorted((ctx.repo / "sandbox" / "lib").glob("python*/site-packages/mlir_aie")):
-        if (candidate / "runtime_lib" / "x86_64" / "test_lib" / "include" / "cxxopts.hpp").exists():
+
+    site_package_roots = [
+        *(ctx.repo / "sandbox" / "lib").glob("python*/site-packages"),
+        *Path("/home/cj/iron/ironenv/lib").glob("python*/site-packages"),
+    ]
+
+    mlir_aie_dir = None
+    for candidate in [Path(env.get("MLIR_AIE_INSTALL_DIR", "")), *(root / "mlir_aie" for root in site_package_roots)]:
+        if candidate and (candidate / "runtime_lib" / "x86_64" / "test_lib" / "include" / "cxxopts.hpp").exists():
+            mlir_aie_dir = candidate
             env.setdefault("AIEOPT_DIR", str(candidate))
+            env.setdefault("MLIR_AIE_INSTALL_DIR", str(candidate))
             break
+
+    peano_dir = None
+    for path in [env.get("PEANO_INSTALL_DIR", ""), *(str(root / "llvm-aie") for root in site_package_roots)]:
+        if path and (Path(path) / "bin" / "llc").exists():
+            peano_dir = Path(path)
+            env["PEANO_INSTALL_DIR"] = str(peano_dir)
+            break
+
+    xrt_dir = Path(env.get("XILINX_XRT", "") or "/opt/xilinx/xrt")
+    if (xrt_dir / "bin" / "xrt-smi").exists():
+        env.setdefault("XILINX_XRT", str(xrt_dir))
+
     bin_paths = []
-    for candidate in (ctx.repo / "install-xrt" / "bin", ctx.repo / "install" / "bin", ctx.repo / "build-xrt" / "bin", ctx.repo / "build" / "bin", ctx.repo / "sandbox" / "bin"):
-        if (candidate / "aircc").exists() or (candidate / "aiecc").exists() or (candidate / "aiecc.py").exists():
+    for candidate in (
+        xrt_dir / "bin",
+        ctx.repo / "install-xrt" / "bin",
+        ctx.repo / "install" / "bin",
+        ctx.repo / "build-xrt" / "bin",
+        ctx.repo / "build" / "bin",
+        ctx.repo / "sandbox" / "bin",
+        mlir_aie_dir / "bin" if mlir_aie_dir else None,
+        peano_dir / "bin" if peano_dir else None,
+    ):
+        if candidate and candidate.exists():
             bin_paths.append(str(candidate))
     if bin_paths:
         env["PATH"] = os.pathsep.join([*bin_paths, env.get("PATH", "")]).rstrip(os.pathsep)
+
     python_paths = []
     for candidate in (
+        xrt_dir / "python",
         ctx.repo / "install-xrt" / "python",
         ctx.repo / "install" / "python",
         ctx.repo / "build-xrt" / "python",
         ctx.repo / "build" / "python",
         ctx.repo / "python",
+        mlir_aie_dir / "python" if mlir_aie_dir else None,
     ):
-        if (candidate / "air" / "backend" / "xrt.py").exists():
+        if candidate and candidate.exists():
             python_paths.append(str(candidate))
     if python_paths:
         env["PYTHONPATH"] = os.pathsep.join([*python_paths, env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
-    for path in [env.get("PEANO_INSTALL_DIR", ""), *(str(path) for path in sorted((ctx.repo / "sandbox/lib").glob("python*/site-packages/llvm-aie")))]:
-        if path and (Path(path) / "bin" / "llc").exists():
-            env["PEANO_INSTALL_DIR"] = path
-            break
+
+    lib_paths = []
+    for candidate in (
+        xrt_dir / "lib",
+        ctx.repo / "install-xrt" / "lib",
+        ctx.repo / "install" / "lib",
+        mlir_aie_dir / "lib" if mlir_aie_dir else None,
+        ctx.repo / "my_install" / "mlir" / "lib",
+    ):
+        if candidate and candidate.exists():
+            lib_paths.append(str(candidate))
+    if lib_paths:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join([*lib_paths, env.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
     return env
+
+
+def npu_make_args(ctx: RunContext, source_dir: Path, transform_script: Path) -> list[str]:
+    return [
+        "make",
+        "-C",
+        source_dir,
+        f"BUILD_DIR={ctx.build_root / 'npu'}",
+        f"ARTIFACT_DIR={ctx.build_root / 'npu' / 'artifacts'}",
+        "AIE_TARGET=aie2p",
+        "TARGET_DEVICE=npu2",
+        f"M={ctx.npu_m}",
+        f"K={ctx.npu_k}",
+        f"N={ctx.npu_n}",
+        f"TILE_M={ctx.npu_tile_m}",
+        f"TILE_N={ctx.npu_tile_n}",
+        f"OUTPUT_TYPE={ctx.npu_output_type}",
+        f"B_LAYOUT={ctx.npu_b_layout}",
+        f"RUNTIME_LOOP_TILING={ctx.npu_runtime_loop_tiling}",
+        f"TRANSFORM_SCRIPT_PATH={transform_script}",
+        f"TRANSFORM_VARIANT={ctx.npu_transform_variant}",
+        f"TRACE_SIZE={ctx.npu_trace_size}",
+        f"TRACE_OFFSET={ctx.npu_trace_offset}",
+        f"ACCEPTANCE_TOPS={ctx.npu_acceptance_tops}",
+    ]
 
 
 def npu_backend(ctx: RunContext) -> BackendResult:
     result = backend_result(ctx, "npu", True)
     env = npu_env(ctx)
     source_dir = ctx.repo / "test" / "xrt" / "46_triton_matmul_ver4_strix_8x4_i8_i8_i32"
+    transform_script = ctx.npu_transform_script or source_dir / "transform_aie2p.mlir"
+    make_base = npu_make_args(ctx, source_dir, transform_script)
     build_stamp = result.build_dir / "gemm_int8_build_key.txt"
-    build_key = f"runtime_loop_tiling={ctx.npu_runtime_loop_tiling}\n"
-    reused = (result.build_dir / "air.xclbin").exists() and (result.build_dir / "air.insts.bin").exists() and find_npu_elves(result.build_dir) and read_text(build_stamp) == build_key
+    build_key = "\n".join(
+        [
+            f"m={ctx.npu_m}",
+            f"k={ctx.npu_k}",
+            f"n={ctx.npu_n}",
+            f"tile_m={ctx.npu_tile_m}",
+            f"tile_n={ctx.npu_tile_n}",
+            f"output_type={ctx.npu_output_type}",
+            f"b_layout={ctx.npu_b_layout}",
+            f"runtime_loop_tiling={ctx.npu_runtime_loop_tiling}",
+            f"transform_variant={ctx.npu_transform_variant}",
+            f"trace_size={ctx.npu_trace_size}",
+            f"trace_offset={ctx.npu_trace_offset}",
+            f"transform_script={transform_script}",
+            f"transform_sha256={file_digest(transform_script)}",
+        ]
+    ) + "\n"
+
+    ok, static_log = run_logged(ctx, result, "static_report", [*make_base, "static-report"], env=env)
+    static_note = f"static_report={result.artifacts_dir / 'npu_gemm.static.md'}" if ok else f"static report failed; see {static_log}"
+
+    reused = (
+        (result.build_dir / "air.xclbin").exists()
+        and (result.build_dir / "air.insts.bin").exists()
+        and find_npu_elves(result.build_dir)
+        and read_text(build_stamp) == build_key
+    )
     if reused:
         compile_note = f"reused build_dir={result.build_dir}"
         write_text(log_path(ctx, result, "build"), f"Reusing existing NPU artifacts in {result.build_dir}\n")
     else:
         compile_note = "fresh compile"
-        ok, log = run_logged(ctx, result, "build", ["make", "-C", source_dir, f"BUILD_DIR={result.build_dir}", "AIE_TARGET=aie2p", f"M={M}", f"K={K}", f"N={N}", f"RUNTIME_LOOP_TILING={ctx.npu_runtime_loop_tiling}", "compile-xclbin"], env=env)
+        ok, log = run_logged(ctx, result, "build", [*make_base, "compile-xclbin"], env=env)
         if not ok:
-            result.status, result.evidence = "WARN", f"NPU compile-xclbin failed; see {log}"
+            result.status, result.evidence = "WARN", f"NPU compile-xclbin failed; see {log}; {static_note}"
             return result
         write_text(build_stamp, build_key)
+
     elves = find_npu_elves(result.build_dir)
     if not elves:
-        result.status, result.evidence = "WARN", f"NPU build produced no per-core ELF files under {result.build_dir}"
+        result.status, result.evidence = "WARN", f"NPU build produced no per-core ELF files under {result.build_dir}; {static_note}"
         return result
+
     disasm_failures = 0
     for elf in elves:
         prefix = sanitize_prefix(str(elf.relative_to(result.build_dir).with_suffix("")))
-        ok, _ = run_logged(ctx, result, f"disassemble_{prefix}", [ctx.disassemble, "npu", "--kind", "elf", "--mcpu", "aie2p", "--triple", "aie2p-none-unknown-elf", "--output-dir", result.artifacts_dir, "--prefix", prefix, elf], env=env)
+        ok, _ = run_logged(
+            ctx,
+            result,
+            f"disassemble_{prefix}",
+            [
+                ctx.disassemble,
+                "npu",
+                "--kind",
+                "elf",
+                "--mcpu",
+                "aie2p",
+                "--triple",
+                "aie2p-none-unknown-elf",
+                "--output-dir",
+                result.artifacts_dir,
+                "--prefix",
+                prefix,
+                elf,
+            ],
+            env=env,
+        )
         disasm_failures += 0 if ok else 1
+
     txn_note = "transaction stream not generated"
     insts = result.build_dir / "air.insts.bin"
     if insts.exists():
-        ok, log = run_logged(ctx, result, "disassemble_air_insts", [ctx.disassemble, "npu", "--kind", "txn", "--output-dir", result.artifacts_dir, "--prefix", "npu_air_insts", insts], env=env)
+        ok, log = run_logged(
+            ctx,
+            result,
+            "disassemble_air_insts",
+            [
+                ctx.disassemble,
+                "npu",
+                "--kind",
+                "txn",
+                "--output-dir",
+                result.artifacts_dir,
+                "--prefix",
+                "npu_air_insts",
+                insts,
+            ],
+            env=env,
+        )
         txn_note = "transaction stream disassembled" if ok else f"transaction stream disassembly failed; see {log}"
+
     if ctx.run_enabled:
         exe = result.build_dir / "test.exe"
         if not exe.exists():
-            ok, log = run_logged(ctx, result, "build_test_exe", ["make", "-C", source_dir, f"BUILD_DIR={result.build_dir}", "AIE_TARGET=aie2p", "build-test-exe"], env=env)
+            ok, log = run_logged(ctx, result, "build_test_exe", [*make_base, "build-test-exe"], env=env)
             if not ok or not exe.exists():
                 note_run_failure(result, log, "build-test-exe")
         if exe.exists():
-            ok, log = run_logged(ctx, result, "profile", ["./test.exe", "-x", "air.xclbin", "-k", "MLIR_AIE", "-i", "air.insts.bin", "-M", M, "-K", K, "-N", N, "-v", "0", "--warmups", ctx.warmups, "--iterations", ctx.iterations, "--b-layout", "row"], cwd=result.build_dir, env=env)
+            ok, log = run_logged(
+                ctx,
+                result,
+                "profile",
+                [
+                    "./test.exe",
+                    "-x",
+                    "air.xclbin",
+                    "-k",
+                    "MLIR_AIE",
+                    "-i",
+                    "air.insts.bin",
+                    "-M",
+                    ctx.npu_m,
+                    "-K",
+                    ctx.npu_k,
+                    "-N",
+                    ctx.npu_n,
+                    "-v",
+                    "0",
+                    "--warmups",
+                    ctx.warmups,
+                    "--iterations",
+                    ctx.iterations,
+                    "--b-layout",
+                    ctx.npu_b_layout,
+                    "--output-type",
+                    ctx.npu_output_type,
+                    "--validation",
+                    "samples",
+                    "--validation-samples",
+                    "64",
+                    "--seed",
+                    "42",
+                    "--acceptance-tops",
+                    ctx.npu_acceptance_tops,
+                ],
+                cwd=result.build_dir,
+                env=env,
+            )
             result.runtime = f"ran; see {log}" if ok else result.runtime
             if not ok:
                 note_run_failure(result, log, "profile")
+
     combined = "\n".join(read_text(path) for path in sorted(result.artifacts_dir.glob("*.disasm.s")))
     vmac = count_regex(combined, r"\bvmac\b")
+    mmul = count_regex(combined, r"\bmmul\b|aie::mmul")
     vloads = count_regex(combined, r"\bvld[ab]?\b|\bvlda\b|\bvldb\b")
     vstores = count_regex(combined, r"\bvst\b")
-    result.evidence = f"{compile_note}, core_elves={len(elves)}, disasm_failures={disasm_failures}, vmac={vmac}, vloads={vloads}, vstores={vstores}, {txn_note}"
-    result.status = "PASS" if disasm_failures == 0 and vmac > 0 else "WARN"
+    nops = count_regex(combined, r"\bnop\b")
+    spills = count_regex(combined, r"\bspill\b|\bspills\b")
+    result.evidence = (
+        f"{compile_note}, core_elves={len(elves)}, disasm_failures={disasm_failures}, "
+        f"vmac={vmac}, mmul_markers={mmul}, vloads={vloads}, vstores={vstores}, "
+        f"nops={nops}, spills={spills}, {txn_note}, {static_note}"
+    )
+    result.status = "PASS" if disasm_failures == 0 and (vmac > 0 or mmul > 0) else "WARN"
     if ctx.run_enabled and "failed" in result.runtime and result.status == "PASS":
         result.status = "WARN"
     if ctx.run_enabled and (run_log := result.logs.get("profile")) and run_log.exists():
         parse_host_perf(ctx, result, run_log, "host run.wait")
-        result.perf_notes = f"runtime_loop_tiling={ctx.npu_runtime_loop_tiling}; b_layout={last_kv_value(run_log, 'b_layout') or 'row'}; warmups={last_kv_value(run_log, 'warmups') or ctx.warmups}; validation={last_kv_value(run_log, 'validation') or 'unknown'}; excludes output BO sync; timing wraps run.wait"
+        result.perf_notes = (
+            f"shape={ctx.npu_m}x{ctx.npu_k}x{ctx.npu_n}; tile={ctx.npu_tile_m}x{ctx.npu_tile_n}; output_type={last_kv_value(run_log, 'output_type') or ctx.npu_output_type}; "
+            f"b_layout={last_kv_value(run_log, 'b_layout') or ctx.npu_b_layout}; runtime_loop_tiling={ctx.npu_runtime_loop_tiling}; transform_variant={ctx.npu_transform_variant}; "
+            f"warmups={last_kv_value(run_log, 'warmups') or ctx.warmups}; validation={last_kv_value(run_log, 'validation') or 'unknown'}; "
+            f"meets_acceptance={last_kv_value(run_log, 'meets_acceptance') or 'unknown'}; target={ctx.npu_acceptance_tops:.2f} TOPS; "
+            f"trace_size={ctx.npu_trace_size}; excludes output BO sync; timing wraps run.wait"
+        )
     return result
-
 
 def selected_backends(name: str) -> list[str]:
     return ["cpu", "gpu", "npu"] if name == "all" else [name]
@@ -2364,7 +2599,43 @@ def write_report(report: Path, ctx: RunContext, args: argparse.Namespace, result
         f.write("# GEMM int8 Benchmark Report\n\n")
         f.write(f"Artifacts: `{ctx.out_dir}`\n\n")
         f.write("## Run Controls\n\n| Field | Value |\n| --- | --- |\n")
-        for key, value in (("Selected backend", args.backend), ("Execute kernels", args.run), ("Strict mode", args.strict), ("GPU sweep variants", args.gpu_sweep_variants), ("GPU sweep profile", args.gpu_sweep_profile), ("GPU sweep repetitions", args.gpu_sweep_repetitions), ("GPU sweep group sizes", ",".join(str(size) for size in args.gpu_sweep_group_sizes)), ("GPU default threshold pct", args.gpu_default_threshold_pct), ("GPU provider baselines", args.gpu_provider_baselines), ("GPU provider profile", args.gpu_provider_profile), ("GPU provider validation samples", args.gpu_provider_validation_samples), ("GPU rocMLIR reference", args.gpu_rocmlir_reference), ("rocMLIR bin dir", args.rocmlir_bin_dir or "n/a"), ("rocMLIR artifacts dir", args.rocmlir_artifacts_dir or "n/a"), ("rocMLIR target chip", args.rocmlir_target_chip or args.gpu_arch), ("Warmups", args.warmups), ("Iterations", args.iterations), ("CPU threads", args.cpu_threads), ("NPU runtime loop tiling", args.npu_runtime_loop_tiling), ("Build root", ctx.build_root), ("GPU arch", args.gpu_arch), ("GPU int8 GEMM variant", args.gpu_int8_gemm_variant), ("GPU int8 GEMM group size", args.gpu_int8_gemm_group_size), ("Shape", f"M=N=K={M}, int8 x int8 -> int32")):
+        controls = (
+            ("Selected backend", args.backend),
+            ("Execute kernels", args.run),
+            ("Strict mode", args.strict),
+            ("Warmups", args.warmups),
+            ("Iterations", args.iterations),
+            ("CPU threads", args.cpu_threads),
+            ("Build root", ctx.build_root),
+            ("GPU arch", args.gpu_arch),
+            ("GPU int8 GEMM variant", args.gpu_int8_gemm_variant),
+            ("GPU int8 GEMM group size", args.gpu_int8_gemm_group_size),
+            ("GPU sweep variants", args.gpu_sweep_variants),
+            ("GPU sweep profile", args.gpu_sweep_profile),
+            ("GPU sweep repetitions", args.gpu_sweep_repetitions),
+            ("GPU sweep group sizes", ",".join(str(size) for size in args.gpu_sweep_group_sizes)),
+            ("GPU default threshold pct", args.gpu_default_threshold_pct),
+            ("GPU provider baselines", args.gpu_provider_baselines),
+            ("GPU provider profile", args.gpu_provider_profile),
+            ("GPU provider validation samples", args.gpu_provider_validation_samples),
+            ("GPU rocMLIR reference", args.gpu_rocmlir_reference),
+            ("rocMLIR bin dir", args.rocmlir_bin_dir or "n/a"),
+            ("rocMLIR artifacts dir", args.rocmlir_artifacts_dir or "n/a"),
+            ("rocMLIR target chip", args.rocmlir_target_chip or args.gpu_arch),
+            ("Shared CPU/GPU shape", f"M=N=K={M}, int8 x int8 -> int32"),
+            ("NPU shape", f"M={args.npu_m} K={args.npu_k} N={args.npu_n}"),
+            ("NPU tile shape", f"M={args.npu_tile_m} N={args.npu_tile_n}"),
+            ("NPU output type", args.npu_output_type),
+            ("NPU B layout", args.npu_b_layout),
+            ("NPU runtime loop tiling", args.npu_runtime_loop_tiling),
+            ("NPU transform script", args.npu_transform_script or "default transform_aie2p.mlir"),
+            ("NPU transform variant", args.npu_transform_variant),
+            ("NPU trace size", args.npu_trace_size),
+            ("NPU trace offset", args.npu_trace_offset),
+            ("NPU published SOTA TOPS", f"{NPU_PUBLISHED_SOTA_TOPS:.2f}"),
+            ("NPU acceptance TOPS", f"{args.npu_acceptance_tops:.2f}"),
+        )
+        for key, value in controls:
             f.write(f"| {key} | `{value}` |\n")
         f.write("\n## ISA Verdicts\n\n| Backend | Status | Evidence | Runtime |\n| --- | --- | --- | --- |\n")
         for name in ("cpu", "gpu", "npu"):
@@ -2424,9 +2695,34 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--rocmlir-target-chip", default=None, help="AMDGPU chip used to disassemble rocMLIR HSACO artifacts (default: --gpu-arch)")
     parser.add_argument("--cpu-threads", type=positive_int, default=12, help="CPU worker threads passed to the CPU benchmark (default: 12)")
     parser.add_argument("--npu-runtime-loop-tiling", default="2,4", metavar="M,N", help="AIR runtime loop tiling sizes for NPU compile (default: 2,4)")
+    parser.add_argument("--npu-m", type=positive_int, default=M, help="NPU GEMM M dimension (default: 1024)")
+    parser.add_argument("--npu-k", type=positive_int, default=K, help="NPU GEMM K dimension (default: 1024)")
+    parser.add_argument("--npu-n", type=positive_int, default=N, help="NPU GEMM N dimension (default: 1024)")
+    parser.add_argument("--npu-tile-m", type=positive_int, default=NPU_DEFAULT_TILE_M, help="NPU launch tile M dimension (default: 512)")
+    parser.add_argument("--npu-tile-n", type=positive_int, default=NPU_DEFAULT_TILE_N, help="NPU launch tile N dimension (default: 256)")
+    parser.add_argument("--npu-sota", action="store_true", help="use the XDNA2 INT8 SOTA acceptance shape/layout/transform")
+    parser.add_argument("--npu-output-type", choices=["int32", "int8"], default="int32", help="NPU C output element type (default: int32)")
+    parser.add_argument("--npu-b-layout", choices=["row", "column"], default="row", help="NPU device B layout (default: row)")
+    parser.add_argument("--npu-transform-script", type=Path, default=None, help="optional NPU transform script override")
+    parser.add_argument("--npu-transform-variant", choices=["default", "sota-int8"], default="default", help="NPU transform rewrite variant (default: default)")
+    parser.add_argument("--npu-trace-size", type=nonnegative_int, default=0, help="NPU trace size in bytes; nonzero makes timing diagnostic")
+    parser.add_argument("--npu-trace-offset", type=nonnegative_int, default=0, help="NPU trace offset in bytes")
+    parser.add_argument("--npu-acceptance-tops", type=positive_float, default=NPU_ACCEPTANCE_TOPS, help="NPU acceptance threshold in average TOPS (default: 36.15)")
     parser.add_argument("--warmups", type=nonnegative_int, default=10, help="warmup iterations for every backend (default: 10)")
     parser.add_argument("--iterations", type=positive_int, default=20, help="timed iterations for every backend (default: 20)")
     args = parser.parse_args(argv)
+    if args.npu_sota:
+        args.npu_m = NPU_SOTA_M
+        args.npu_k = NPU_SOTA_K
+        args.npu_n = NPU_SOTA_N
+        args.npu_tile_m = NPU_SOTA_TILE_M
+        args.npu_tile_n = NPU_SOTA_TILE_N
+        args.npu_output_type = "int8"
+        args.npu_b_layout = "column"
+        args.npu_transform_variant = "sota-int8"
+        args.warmups = max(args.warmups, 20)
+        args.iterations = max(args.iterations, 100)
+
     tiling_values = args.npu_runtime_loop_tiling.split(",")
     if len(tiling_values) != 2:
         parser.error("--npu-runtime-loop-tiling must contain two positive integers")
@@ -2435,6 +2731,16 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     except argparse.ArgumentTypeError as exc:
         parser.error(f"--npu-runtime-loop-tiling: {exc}")
     args.npu_runtime_loop_tiling = f"{parsed_tiling[0]},{parsed_tiling[1]}"
+    if args.npu_m % args.npu_tile_m:
+        parser.error("--npu-m must be a multiple of --npu-tile-m")
+    if args.npu_n % args.npu_tile_n:
+        parser.error("--npu-n must be a multiple of --npu-tile-n")
+    if args.npu_tile_m % 8 or args.npu_tile_n % 8:
+        parser.error("--npu-tile-m and --npu-tile-n must be multiples of 8")
+    if args.npu_k % 8:
+        parser.error("--npu-k must be a multiple of 8")
+    if args.npu_transform_script is not None:
+        args.npu_transform_script = args.npu_transform_script.resolve()
     if args.gpu_sweep_variants and args.backend not in {"all", "gpu"}:
         parser.error("--gpu-sweep-variants requires --backend all or --backend gpu")
     if args.gpu_sweep_profile != DEFAULT_GPU_INT8_GEMM_SWEEP_PROFILE and not args.gpu_sweep_variants:
@@ -2455,7 +2761,32 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
     out_dir = args.out_dir.resolve()
-    ctx = RunContext(Path(__file__).resolve().parents[2], out_dir, args.build_dir.resolve() if args.build_dir else out_dir / "build", out_dir / "logs", args.warmups, args.iterations, args.gpu_arch, args.gpu_int8_gemm_variant, args.gpu_int8_gemm_group_size, args.run, args.cpu_threads, args.npu_runtime_loop_tiling)
+    ctx = RunContext(
+        Path(__file__).resolve().parents[2],
+        out_dir,
+        args.build_dir.resolve() if args.build_dir else out_dir / "build",
+        out_dir / "logs",
+        args.warmups,
+        args.iterations,
+        args.gpu_arch,
+        args.gpu_int8_gemm_variant,
+        args.gpu_int8_gemm_group_size,
+        args.run,
+        args.cpu_threads,
+        args.npu_runtime_loop_tiling,
+        args.npu_m,
+        args.npu_k,
+        args.npu_n,
+        args.npu_tile_m,
+        args.npu_tile_n,
+        args.npu_output_type,
+        args.npu_b_layout,
+        args.npu_transform_script,
+        args.npu_transform_variant,
+        args.npu_trace_size,
+        args.npu_trace_offset,
+        args.npu_acceptance_tops,
+    )
     for path in (ctx.out_dir, ctx.build_root, ctx.logs_dir):
         path.mkdir(parents=True, exist_ok=True)
     selected = {"gpu"} if args.gpu_sweep_variants else set(selected_backends(args.backend))

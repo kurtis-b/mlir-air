@@ -11,3 +11,4 @@
 // Run profiling (compile xclbin, build test exe, run performance test)
 // RUN: mkdir -p test_npu2_peano && cd test_npu2_peano && export PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR && export XILINX_XRT=%XRT_DIR && make -f %S/Makefile profile | FileCheck %s --check-prefix=PROFILE
 // PROFILE: Avg NPU gflops:
+// PROFILE: validation=PASS
