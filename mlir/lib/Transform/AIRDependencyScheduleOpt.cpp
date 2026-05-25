@@ -553,8 +553,10 @@ private:
 struct HoistMemallocInForPattern : public OpRewritePattern<memref::AllocOp> {
   using OpRewritePattern<memref::AllocOp>::OpRewritePattern;
 
-  HoistMemallocInForPattern(MLIRContext *ctx, bool keepMemrefDealloc)
-      : OpRewritePattern(ctx), keepMemrefDealloc(keepMemrefDealloc) {}
+  HoistMemallocInForPattern(MLIRContext *ctx, bool keepMemrefDealloc,
+                            std::string hoistAttrName = "hoist_alloc")
+      : OpRewritePattern(ctx), keepMemrefDealloc(keepMemrefDealloc),
+        hoistAttrName(hoistAttrName) {}
 
   LogicalResult matchAndRewrite(memref::AllocOp alloc_op,
                                 PatternRewriter &rewriter) const override {
@@ -575,8 +577,8 @@ struct HoistMemallocInForPattern : public OpRewritePattern<memref::AllocOp> {
     }
 
     // Check if alloc is the target
-    if (!alloc_op->hasAttr("hoist_alloc") &&
-        !alloc_exec->hasAttr("hoist_alloc"))
+    if (!alloc_op->hasAttr(hoistAttrName) &&
+        !alloc_exec->hasAttr(hoistAttrName))
       return failure();
 
     // Get parent for loop
@@ -612,13 +614,14 @@ struct HoistMemallocInForPattern : public OpRewritePattern<memref::AllocOp> {
       dealloc_exec->moveAfter(for_op);
 
     // Erase alloc hoisting attr
-    alloc_op->removeAttr("hoist_alloc");
+    alloc_op->removeAttr(hoistAttrName);
 
     return success();
   }
 
 private:
   bool keepMemrefDealloc;
+  std::string hoistAttrName;
 
   void skipOverOpInDependencyGraph(OpBuilder &builder, Operation *op,
                                    mlir::Region &region) const {
@@ -1578,8 +1581,11 @@ struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
   using OpRewritePattern<scf::ForOp>::OpRewritePattern;
 
   LabelScfForLoopForPingPongPattern(MLIRContext *ctx,
-                                    std::string omitMemorySpace)
-      : OpRewritePattern(ctx), omitMemorySpace(omitMemorySpace) {}
+                                    std::string omitMemorySpace,
+                                    std::string partialMemorySpace,
+                                    std::string partialBuffer)
+      : OpRewritePattern(ctx), omitMemorySpace(omitMemorySpace),
+        partialMemorySpace(partialMemorySpace), partialBuffer(partialBuffer) {}
 
   LogicalResult matchAndRewrite(scf::ForOp for_op,
                                 PatternRewriter &rewriter) const override {
@@ -1598,18 +1604,14 @@ struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
     if (alloc_ops.empty())
       return failure();
 
-    // Check if we should skip this loop based on memory space
+    SmallVector<Operation *> ping_pong_alloc_ops = alloc_ops;
+    SmallVector<Operation *> single_buffer_alloc_ops;
+
+    // Check if we should skip this loop based on memory space.
     if (!omitMemorySpace.empty()) {
       bool shouldSkip = false;
       for (auto op : alloc_ops) {
-        auto alloc_op = dyn_cast_if_present<memref::AllocOp>(op);
-        if (!alloc_op)
-          continue;
-        auto memref_type = llvm::cast<MemRefType>(alloc_op.getType());
-
-        // Check if this alloc's memory space matches the omit criteria
-        if ((omitMemorySpace == "L1" && air::isL1(memref_type)) ||
-            (omitMemorySpace == "L2" && air::isL2(memref_type))) {
+        if (matchesMemorySpace(op, omitMemorySpace)) {
           shouldSkip = true;
           break;
         }
@@ -1618,19 +1620,71 @@ struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
         return failure();
     }
 
-    // Label the scf.for loop and all its child memref.allocs
+    // Partial ping-pong keeps one operand stream single-buffered. This is
+    // useful when full A/B double buffering exceeds a core-memory budget, but
+    // one stream can still be overlapped with compute.
+    if (!partialMemorySpace.empty()) {
+      ping_pong_alloc_ops.clear();
+      for (auto op : alloc_ops) {
+        if (!matchesMemorySpace(op, partialMemorySpace))
+          continue;
+        if (matchesPartialBuffer(op))
+          ping_pong_alloc_ops.push_back(op);
+        else
+          single_buffer_alloc_ops.push_back(op);
+      }
+      if (ping_pong_alloc_ops.empty())
+        return failure();
+    }
+
+    // Label the scf.for loop and selected child memref.allocs.
     int unroll_factor = 2; // Unroll factor hardened as 2. TODO: add support for
                            // an arbitrary factor.
     for_op->setAttr("unroll", rewriter.getI32IntegerAttr(unroll_factor));
-    for (auto op : alloc_ops) {
+    for (auto op : ping_pong_alloc_ops) {
       op->setAttr("hoist_alloc", rewriter.getBoolAttr(true));
+    }
+    for (auto op : single_buffer_alloc_ops) {
+      op->setAttr("hoist_alloc_single_buffer", rewriter.getBoolAttr(true));
     }
 
     return success();
   }
 
 private:
+  bool matchesMemorySpace(Operation *op, const std::string &memorySpace) const {
+    if (memorySpace.empty())
+      return true;
+    auto alloc_op = dyn_cast_if_present<memref::AllocOp>(op);
+    if (!alloc_op)
+      return false;
+    auto memref_type = llvm::cast<MemRefType>(alloc_op.getType());
+    return (memorySpace == "L1" && air::isL1(memref_type)) ||
+           (memorySpace == "L2" && air::isL2(memref_type));
+  }
+
+  bool matchesPartialBuffer(Operation *op) const {
+    if (partialBuffer.empty())
+      return true;
+    auto alloc_op = dyn_cast_if_present<memref::AllocOp>(op);
+    if (!alloc_op)
+      return false;
+    auto memref_type = llvm::cast<MemRefType>(alloc_op.getType());
+    if (memref_type.getRank() < 2)
+      return false;
+    auto shape = memref_type.getShape();
+    if (shape[0] < 0 || shape[1] < 0)
+      return false;
+    if (partialBuffer == "a")
+      return shape[0] < shape[1];
+    if (partialBuffer == "b")
+      return shape[0] > shape[1];
+    return false;
+  }
+
   std::string omitMemorySpace;
+  std::string partialMemorySpace;
+  std::string partialBuffer;
 };
 
 struct LabelScfForLoopInAIRSegment : public OpRewritePattern<scf::ForOp> {
@@ -3338,6 +3392,14 @@ public:
     (void)applyPatternsGreedily(funcOp, std::move(patterns));
   }
 
+  void runHoistPartialSingleBufferMemallocPatterns(func::FuncOp funcOp) {
+    MLIRContext *ctx = funcOp.getContext();
+    RewritePatternSet patterns(&getContext());
+    patterns.insert<HoistMemallocInForPattern>(ctx, clKeepMemrefDealloc,
+                                               "hoist_alloc_single_buffer");
+    (void)applyPatternsGreedily(funcOp, std::move(patterns));
+  }
+
   void runConstructPingPongDependencyPatterns(func::FuncOp funcOp) {
     MLIRContext *ctx = funcOp.getContext();
     RewritePatternSet patterns(&getContext());
@@ -3364,6 +3426,7 @@ public:
       // Check if loop is the target
       op->removeAttr("unroll");
       op->removeAttr("hoist_alloc");
+      op->removeAttr("hoist_alloc_single_buffer");
       op->removeAttr("unrolled_iteration");
       op->removeAttr("isolated");
       op->removeAttr("ping_pong");
@@ -3383,6 +3446,10 @@ public:
     for (auto f : funcOps)
       runOpAnnotationPatterns(f);
     LLVM_DEBUG(llvm::dbgs() << "After annotation:\n" << module << "\n");
+    for (auto f : funcOps)
+      runHoistPartialSingleBufferMemallocPatterns(f);
+    LLVM_DEBUG(llvm::dbgs() << "After single-buffer hoist:\n"
+                            << module << "\n");
     for (auto f : funcOps)
       runLoopUnroll(f);
     LLVM_DEBUG(llvm::dbgs() << "After unroll:\n" << module << "\n");
@@ -3411,8 +3478,8 @@ public:
   void runOptPatterns(func::FuncOp funcOp) {
     MLIRContext *ctx = funcOp.getContext();
     RewritePatternSet patterns(&getContext());
-    // Use the clOmitMemorySpace option from the pass
-    patterns.insert<LabelScfForLoopForPingPongPattern>(ctx, clOmitMemorySpace);
+    patterns.insert<LabelScfForLoopForPingPongPattern>(
+        ctx, clOmitMemorySpace, clPartialMemorySpace, clPartialBuffer);
     (void)applyPatternsGreedily(funcOp, std::move(patterns));
   }
 

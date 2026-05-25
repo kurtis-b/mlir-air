@@ -8,6 +8,7 @@
 // RUN: air-opt %s -air-label-scf-for-to-ping-pong | FileCheck %s --check-prefix=DEFAULT
 // RUN: air-opt %s -air-label-scf-for-to-ping-pong='omit-memory-space=L1' | FileCheck %s --check-prefix=OMIT_L1
 // RUN: air-opt %s -air-label-scf-for-to-ping-pong='omit-memory-space=L2' | FileCheck %s --check-prefix=OMIT_L2
+// RUN: air-opt %s -air-label-scf-for-to-ping-pong='partial-memory-space=L1 partial-buffer=a' | FileCheck %s --check-prefix=PARTIAL_A
 
 // Test ping-pong labeling with memory space filtering.
 
@@ -21,7 +22,7 @@ module {
     %0 = air.launch async (%arg4, %arg5) in (%arg6=%c1, %arg7=%c1) args(%arg8=%arg0, %arg9=%arg1) : memref<256x1024xbf16>, memref<1024x1024xbf16> attributes {id = 7 : i32} {
       %1 = air.segment async  args(%arg15=%arg4, %arg16=%arg5, %arg17=%arg6, %arg18=%arg7, %arg19=%arg8, %arg20=%arg9) : index, index, index, index, memref<256x1024xbf16>, memref<1024x1024xbf16> {
         %c4 = arith.constant 4 : index
-        
+
         // L2 loop (memory space 1) - should be labeled by default, skipped when omit-memory-space=L2
         %c0_seg = arith.constant 0 : index
         %c64_seg = arith.constant 64 : index
@@ -46,7 +47,7 @@ module {
           }
           scf.yield %async_token_8 : !air.async.token
         }
-        
+
         %2 = air.herd @herd_0 async tile (%arg21, %arg22) in (%arg23=%c4, %arg24=%c4) {
           %c0 = arith.constant 0 : index
           %c64 = arith.constant 64 : index
@@ -77,4 +78,34 @@ module {
     }
     return
   }
+  // PARTIAL_A-LABEL: func.func @partial_l1
+  func.func @partial_l1() {
+    %c0 = arith.constant 0 : index
+    %c16 = arith.constant 16 : index
+    %c8 = arith.constant 8 : index
+    %async_token = air.wait_all async
+    // PARTIAL_A: scf.for
+    // PARTIAL_A-DAG: memref.alloc() {hoist_alloc = true} : memref<4x8xi8, 2>
+    // PARTIAL_A-DAG: memref.alloc() {hoist_alloc_single_buffer = true} : memref<8x4xi8, 2>
+    // PARTIAL_A: } {unroll = 2 : i32}
+    %0 = scf.for %arg0 = %c0 to %c16 step %c8 iter_args(%arg1 = %async_token) -> (!air.async.token) {
+      %async_token_0, %a = air.execute [%arg1] -> (memref<4x8xi8, 2>) {
+        %alloc = memref.alloc() : memref<4x8xi8, 2>
+        air.execute_terminator %alloc : memref<4x8xi8, 2>
+      }
+      %async_token_1, %b = air.execute [%async_token_0] -> (memref<8x4xi8, 2>) {
+        %alloc = memref.alloc() : memref<8x4xi8, 2>
+        air.execute_terminator %alloc : memref<8x4xi8, 2>
+      }
+      %async_token_2 = air.execute [%async_token_1] {
+        memref.dealloc %a : memref<4x8xi8, 2>
+      }
+      %async_token_3 = air.execute [%async_token_2] {
+        memref.dealloc %b : memref<8x4xi8, 2>
+      }
+      scf.yield %async_token_3 : !air.async.token
+    }
+    return
+  }
+
 }

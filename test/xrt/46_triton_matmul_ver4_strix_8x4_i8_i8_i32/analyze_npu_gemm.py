@@ -210,6 +210,21 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
     l1_budget_bytes = 64 * 1024
     single_buffered_working_set_bytes = a_step_bytes + b_step_bytes + c_bytes
     pingpong_working_set_bytes = 2 * (a_step_bytes + b_step_bytes) + c_bytes
+    partial_pingpong_a_working_set_bytes = 2 * a_step_bytes + b_step_bytes + c_bytes
+    partial_pingpong_b_working_set_bytes = a_step_bytes + 2 * b_step_bytes + c_bytes
+    k_pack_bytes_a = core_m * transform["pack_sizes"][2]
+    k_pack_bytes_b = core_n * transform["pack_sizes"][2]
+    l1_available_for_ab = l1_budget_bytes - estimated_stack_bytes - c_bytes
+    max_full_pingpong_k_packs = max(
+        0, l1_available_for_ab // (2 * (k_pack_bytes_a + k_pack_bytes_b))
+    )
+    max_partial_pingpong_k_packs = max(
+        0,
+        l1_available_for_ab
+        // min(
+            2 * k_pack_bytes_a + k_pack_bytes_b, k_pack_bytes_a + 2 * k_pack_bytes_b
+        ),
+    )
     core_l1 = {
         "a_step_bytes": a_step_bytes,
         "b_step_bytes": b_step_bytes,
@@ -217,13 +232,25 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
         "double_buffered_a_b_step_bytes": 2 * (a_step_bytes + b_step_bytes),
         "single_buffered_working_set_bytes": single_buffered_working_set_bytes,
         "pingpong_working_set_bytes": pingpong_working_set_bytes,
+        "partial_pingpong_a_working_set_bytes": partial_pingpong_a_working_set_bytes,
+        "partial_pingpong_b_working_set_bytes": partial_pingpong_b_working_set_bytes,
         "estimated_stack_bytes": estimated_stack_bytes,
         "l1_budget_bytes": l1_budget_bytes,
+        "max_full_pingpong_k_packs": max_full_pingpong_k_packs,
+        "max_partial_pingpong_k_packs": max_partial_pingpong_k_packs,
         "fits_single_buffer_estimate": (
             single_buffered_working_set_bytes + estimated_stack_bytes <= l1_budget_bytes
         ),
         "fits_pingpong_estimate": (
             pingpong_working_set_bytes + estimated_stack_bytes <= l1_budget_bytes
+        ),
+        "fits_partial_pingpong_estimate": (
+            min(
+                partial_pingpong_a_working_set_bytes,
+                partial_pingpong_b_working_set_bytes,
+            )
+            + estimated_stack_bytes
+            <= l1_budget_bytes
         ),
     }
     packed_m = args.tile_m // transform["pack_sizes"][0]
@@ -237,20 +264,35 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
         and transform["has_l1_allocs"]
         and transform["has_l2_result_alloc"]
     )
+    partial_l1_pingpong_requested = args.omit_ping_pong in (
+        "L1-partial-a",
+        "L1-partial-b",
+    )
     l1_pingpong_requested = args.omit_ping_pong not in ("L1", "all")
     pingpong_eligible = bool(
         transform_pingpong_candidate
         and l1_pingpong_requested
-        and core_l1["fits_pingpong_estimate"]
+        and (
+            core_l1["fits_pingpong_estimate"]
+            or (
+                partial_l1_pingpong_requested
+                and core_l1["fits_partial_pingpong_estimate"]
+            )
+        )
     )
     if not transform_pingpong_candidate:
         pingpong_reason = "missing loop fusion or expected L1/L2 allocation markers in transform script"
     elif not l1_pingpong_requested:
         pingpong_reason = "L1 ping-pong transform is explicitly omitted"
+    elif partial_l1_pingpong_requested and core_l1["fits_partial_pingpong_estimate"]:
+        pingpong_reason = (
+            "partial L1 ping-pong is requested and the estimated single-stream "
+            "double-buffered working set fits the 64 KiB core-memory budget"
+        )
     elif not core_l1["fits_pingpong_estimate"]:
         pingpong_reason = (
             "estimated L1 working set exceeds the 64 KiB core-memory budget with "
-            "ping-ponged A/B buffers"
+            "fully ping-ponged A/B buffers"
         )
     else:
         pingpong_reason = (
@@ -300,6 +342,11 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
             and args.external_block_m * args.external_block_n > 4
         ),
         "omit_ping_pong": args.omit_ping_pong,
+        "requires_partial_l1_pingpong": (
+            args.kernel_impl == "external-mmul"
+            and not core_l1["fits_pingpong_estimate"]
+            and core_l1["fits_partial_pingpong_estimate"]
+        ),
         "trace_mode": "packet" if args.trace_size else "off",
         "trace_size": args.trace_size,
         "transform": transform,
@@ -367,6 +414,9 @@ def write_markdown(path: Path, report: dict[str, Any], json_path: Path) -> None:
         f.write(f"| Runtime loop tiling | `{report['runtime_loop_tiling']}` |\n")
         f.write(f"| Transform variant | `{report['transform_variant']}` |\n")
         f.write(f"| Omit ping-pong | `{report['omit_ping_pong']}` |\n")
+        f.write(
+            f"| Requires partial L1 ping-pong | `{'yes' if report['requires_partial_l1_pingpong'] else 'no'}` |\n"
+        )
         f.write(f"| Kernel impl | `{report['kernel_impl']}` |\n")
         if report["external_kernel_function"]:
             f.write(f"| External kernel | `{report['external_kernel_function']}` |\n")
@@ -412,14 +462,29 @@ def write_markdown(path: Path, report: dict[str, Any], json_path: Path) -> None:
             f"| L1 ping-pong working set | `{bytes_fmt(l1['pingpong_working_set_bytes'])}` |\n"
         )
         f.write(
+            f"| L1 partial ping-pong A working set | `{bytes_fmt(l1['partial_pingpong_a_working_set_bytes'])}` |\n"
+        )
+        f.write(
+            f"| L1 partial ping-pong B working set | `{bytes_fmt(l1['partial_pingpong_b_working_set_bytes'])}` |\n"
+        )
+        f.write(
             f"| L1 estimated stack | `{bytes_fmt(l1['estimated_stack_bytes'])}` |\n"
         )
         f.write(f"| L1 budget | `{bytes_fmt(l1['l1_budget_bytes'])}` |\n")
+        f.write(
+            f"| Max full ping-pong K packs | `{l1['max_full_pingpong_k_packs']}` |\n"
+        )
+        f.write(
+            f"| Max partial ping-pong K packs | `{l1['max_partial_pingpong_k_packs']}` |\n"
+        )
         f.write(
             f"| L1 fits single-buffer estimate | `{'yes' if l1['fits_single_buffer_estimate'] else 'no'}` |\n"
         )
         f.write(
             f"| L1 fits ping-pong estimate | `{'yes' if l1['fits_pingpong_estimate'] else 'no'}` |\n"
+        )
+        f.write(
+            f"| L1 fits partial ping-pong estimate | `{'yes' if l1['fits_partial_pingpong_estimate'] else 'no'}` |\n"
         )
         f.write(f"| A DMA | {report['dma_contiguity']['A']} |\n")
         f.write(f"| B DMA | {report['dma_contiguity']['B']} |\n")
@@ -476,7 +541,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--external-block-n", type=positive_int, default=DEFAULT_EXTERNAL_BLOCK_N
     )
-    parser.add_argument("--omit-ping-pong", choices=["L1", "L2", "all"], default=None)
+    parser.add_argument(
+        "--omit-ping-pong",
+        choices=["L1", "L2", "all", "L1-partial-a", "L1-partial-b"],
+        default=None,
+    )
     parser.add_argument(
         "--acceptance-tops", type=positive_float, default=DEFAULT_ACCEPTANCE_TOPS
     )

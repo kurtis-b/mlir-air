@@ -300,6 +300,7 @@ def write_compile_config(args: argparse.Namespace, generated_ir: str | None) -> 
         "external_block_m": args.external_block_m,
         "external_block_n": args.external_block_n,
         "omit_ping_pong": args.omit_ping_pong,
+        "aircc_debug_ir": args.aircc_debug_ir,
         "input_ir": args.input_ir or "generated",
         "output_format": args.output_format,
         "target_device": args.target_device,
@@ -380,7 +381,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--omit-ping-pong",
-        choices=["L1", "L2", "all"],
+        choices=["L1", "L2", "all", "L1-partial-a", "L1-partial-b"],
         default=None,
         help="Forward --omit-ping-pong-transform to aircc for residency experiments",
     )
@@ -388,6 +389,11 @@ def parse_args() -> argparse.Namespace:
         "--compile-only",
         action="store_true",
         help="Only compile without running validation",
+    )
+    parser.add_argument(
+        "--aircc-debug-ir",
+        action="store_true",
+        help="Forward --debug-ir to aircc and keep pass-by-pass IR under the build directory",
     )
     parser.add_argument(
         "--output-format",
@@ -467,11 +473,14 @@ def parse_args() -> argparse.Namespace:
             not in (
                 "L1",
                 "all",
+                "L1-partial-a",
+                "L1-partial-b",
             )
         ):
             errors.append(
                 "external-mmul K residency above 9 packs exceeds L1 with "
-                "ping-ponged A/B buffers; pass --omit-ping-pong L1 or all"
+                "fully ping-ponged A/B buffers; pass --omit-ping-pong L1, "
+                "all, L1-partial-a, or L1-partial-b"
             )
         if args.k % k_residency:
             errors.append(f"external-mmul requires K to be a multiple of {k_residency}")
@@ -567,6 +576,7 @@ with air.ir.Context() as ctx, Location.unknown():
         trace_offset=args.trace_offset,
         trace_size=args.trace_size,
         target_device=args.target_device,
+        debug_ir=args.aircc_debug_ir,
     )
     if args.kernel_impl == "external-mmul":
         backend_kwargs["lower_linalg_to_func"] = args.external_kernel_object
@@ -593,6 +603,7 @@ with air.ir.Context() as ctx, Location.unknown():
         print(f"external_k_packs={args.external_k_packs}")
         print(f"external_block={args.external_block_m}x{args.external_block_n}")
         print(f"omit_ping_pong={args.omit_ping_pong}")
+        print(f"aircc_debug_ir={args.aircc_debug_ir}")
         raise SystemExit(0)
 
     input_type = np.int8

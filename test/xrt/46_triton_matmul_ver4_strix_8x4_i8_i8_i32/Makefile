@@ -63,6 +63,7 @@ RUNTIME_LOOP_TILING ?= 2,4
 TRANSFORM_VARIANT ?= default
 KERNEL_IMPL ?= vectorized
 OMIT_PING_PONG ?=
+AIRCC_DEBUG_IR ?= 0
 EXTERNAL_K_PACKS ?= 9
 EXTERNAL_BLOCK_M ?= 2
 EXTERNAL_BLOCK_N ?= 2
@@ -79,6 +80,9 @@ ifeq ($(KERNEL_IMPL),external-mmul)
 endif
 ifneq ($(OMIT_PING_PONG),)
   OMIT_PING_PONG_ARG := --omit-ping-pong $(OMIT_PING_PONG)
+endif
+ifeq ($(AIRCC_DEBUG_IR),1)
+  AIRCC_DEBUG_IR_ARG := --aircc-debug-ir
 endif
 
 # Trace controls. Trace timing is diagnostic and should not be used for acceptance.
@@ -122,6 +126,7 @@ RUN_PY_COMMON_ARGS := \
 	--external-block-m $(EXTERNAL_BLOCK_M) \
 	--external-block-n $(EXTERNAL_BLOCK_N) \
 	$(OMIT_PING_PONG_ARG) \
+	$(AIRCC_DEBUG_IR_ARG) \
 	--trace-size $(TRACE_SIZE) \
 	--trace-offset $(TRACE_OFFSET) \
 	--trace-file $(TRACE_FILE) \

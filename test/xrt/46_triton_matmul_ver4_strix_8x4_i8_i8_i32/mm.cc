@@ -72,20 +72,20 @@ extern "C" void matmul_i8_i8_i8_acc32_strix(int8 *__restrict pA,
             MMUL C20(aie::load_v<MMUL::size_C>(pC20));
             MMUL C21(aie::load_v<MMUL::size_C>(pC21));
 
+            const int8 __aie_dm_resource_a *__restrict pA0 =
+                (const int8 __aie_dm_resource_a *)(pA + m * MMUL::size_A);
+            const int8 __aie_dm_resource_a *__restrict pA1 =
+                (const int8 __aie_dm_resource_a *)(pA + (m + 1) * MMUL::size_A);
+            const int8 __aie_dm_resource_a *__restrict pA2 =
+                (const int8 __aie_dm_resource_a *)(pA + (m + 2) * MMUL::size_A);
+            const int8 __aie_dm_resource_b *__restrict pB0 =
+                (const int8 __aie_dm_resource_b *)(pB + n * kBStrideN);
+            const int8 __aie_dm_resource_b *__restrict pB1 =
+                (const int8 __aie_dm_resource_b *)(pB + (n + 1) * kBStrideN);
+
             for (unsigned k = 0; k < kKPackCount; ++k)
               chess_prepare_for_pipelining chess_loop_range(EXTERNAL_K_PACKS,
                                                             EXTERNAL_K_PACKS) {
-                const int8 *__restrict pA0 =
-                    pA + k * kAStrideK + m * MMUL::size_A;
-                const int8 *__restrict pA1 =
-                    pA + k * kAStrideK + (m + 1) * MMUL::size_A;
-                const int8 *__restrict pA2 =
-                    pA + k * kAStrideK + (m + 2) * MMUL::size_A;
-                const int8 *__restrict pB0 =
-                    pB + n * kBStrideN + k * MMUL::size_B;
-                const int8 *__restrict pB1 =
-                    pB + (n + 1) * kBStrideN + k * MMUL::size_B;
-
                 aie::vector<int8, MMUL::size_A> A0 =
                     aie::load_v<MMUL::size_A>(pA0);
                 aie::vector<int8, MMUL::size_A> A1 =
@@ -96,6 +96,12 @@ extern "C" void matmul_i8_i8_i8_acc32_strix(int8 *__restrict pA,
                     aie::load_v<MMUL::size_B>(pB0);
                 aie::vector<int8, MMUL::size_B> B1 =
                     aie::load_v<MMUL::size_B>(pB1);
+
+                pA0 += kAStrideK;
+                pA1 += kAStrideK;
+                pA2 += kAStrideK;
+                pB0 += MMUL::size_B;
+                pB1 += MMUL::size_B;
 
                 C00.mac(A0, B0);
                 C01.mac(A0, B1);
@@ -129,18 +135,18 @@ extern "C" void matmul_i8_i8_i8_acc32_strix(int8 *__restrict pA,
             MMUL C10(aie::load_v<MMUL::size_C>(pC10));
             MMUL C11(aie::load_v<MMUL::size_C>(pC11));
 
+            const int8 __aie_dm_resource_a *__restrict pA0 =
+                (const int8 __aie_dm_resource_a *)(pA + m * MMUL::size_A);
+            const int8 __aie_dm_resource_a *__restrict pA1 =
+                (const int8 __aie_dm_resource_a *)(pA + (m + 1) * MMUL::size_A);
+            const int8 __aie_dm_resource_b *__restrict pB0 =
+                (const int8 __aie_dm_resource_b *)(pB + n * kBStrideN);
+            const int8 __aie_dm_resource_b *__restrict pB1 =
+                (const int8 __aie_dm_resource_b *)(pB + (n + 1) * kBStrideN);
+
             for (unsigned k = 0; k < kKPackCount; ++k)
               chess_prepare_for_pipelining chess_loop_range(EXTERNAL_K_PACKS,
                                                             EXTERNAL_K_PACKS) {
-                const int8 *__restrict pA0 =
-                    pA + k * kAStrideK + m * MMUL::size_A;
-                const int8 *__restrict pA1 =
-                    pA + k * kAStrideK + (m + 1) * MMUL::size_A;
-                const int8 *__restrict pB0 =
-                    pB + n * kBStrideN + k * MMUL::size_B;
-                const int8 *__restrict pB1 =
-                    pB + (n + 1) * kBStrideN + k * MMUL::size_B;
-
                 aie::vector<int8, MMUL::size_A> A0 =
                     aie::load_v<MMUL::size_A>(pA0);
                 aie::vector<int8, MMUL::size_A> A1 =
@@ -149,6 +155,11 @@ extern "C" void matmul_i8_i8_i8_acc32_strix(int8 *__restrict pA,
                     aie::load_v<MMUL::size_B>(pB0);
                 aie::vector<int8, MMUL::size_B> B1 =
                     aie::load_v<MMUL::size_B>(pB1);
+
+                pA0 += kAStrideK;
+                pA1 += kAStrideK;
+                pB0 += MMUL::size_B;
+                pB1 += MMUL::size_B;
 
                 C00.mac(A0, B0);
                 C01.mac(A0, B1);
