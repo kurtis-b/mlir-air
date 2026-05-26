@@ -346,7 +346,7 @@ PROFILE_ARGS := \
 	--acceptance-tops $(ACCEPTANCE_TOPS) \
 	$(REQUIRE_ACCEPTANCE_ARG)
 
-.PHONY: all run run-aie2 run-aie2p compile-xclbin profile build-test-exe build-external-mmul inspect-external-mmul inspect-atb-reference probe-xllvm-mmul debug_ir static-report disassemble acceptance-int8 acceptance-int8-external acceptance-int8-atb acceptance-int8-atb-v2 acceptance-int8-atb-v2-candidate clean
+.PHONY: all run run-aie2 run-aie2p compile-xclbin profile build-test-exe build-external-mmul inspect-external-mmul inspect-atb-reference probe-xllvm-mmul debug_ir static-report disassemble acceptance-int8 acceptance-int8-external profile-int8-full-m-k18 acceptance-int8-atb acceptance-int8-atb-v2 acceptance-int8-atb-v2-candidate clean
 
 all: run
 
@@ -363,7 +363,7 @@ run-aie2p: $(EXTERNAL_KERNEL_DEP)
 compile-xclbin: static-report $(EXTERNAL_KERNEL_DEP) $(EXTERNAL_ASM_REPORT_DEP)
 	mkdir -p $(BUILD_DIR) $(ARTIFACT_DIR)
 	cd $(BUILD_DIR) && $(PYTHON) $(srcdir)/run.py $(RUN_PY_COMMON_ARGS) --compile-only
-	@if [ "$(TRANSFORM_VARIANT)" = "sota-int8-atb" ] || [ "$(TRANSFORM_VARIANT)" = "sota-int8-atb-v2" ]; then \
+	@if [ "$(KERNEL_IMPL)" = "external-mmul" ] || [ "$(TRANSFORM_VARIANT)" = "sota-int8-atb" ] || [ "$(TRANSFORM_VARIANT)" = "sota-int8-atb-v2" ]; then \
 		$(MAKE) -f $(srcdir)/Makefile static-report BUILD_DIR=$(BUILD_DIR) ARTIFACT_DIR=$(ARTIFACT_DIR) LOWERED_IR_PATH=$(ARTIFACT_DIR)/air_module.lowered.mlir; \
 	fi
 	@if [ "$(KERNEL_IMPL)" = "external-mmul" ]; then \
@@ -485,6 +485,19 @@ acceptance-int8-external:
 		KERNEL_IMPL=external-mmul WARMUPS=20 ITERATIONS=100 \
 		VALIDATION=samples REQUIRE_ACCEPTANCE=1 \
 		ACCEPTANCE_TOPS=$(ACCEPTANCE_TOPS) BUILD_DIR=$(BUILD_DIR) \
+		ARTIFACT_DIR=$(ARTIFACT_DIR) TRANSFORM_SCRIPT_PATH=$(TRANSFORM_SCRIPT)
+
+profile-int8-full-m-k18:
+	$(MAKE) -f $(srcdir)/Makefile profile \
+		M=$(SOTA_M) K=$(SOTA_K) N=$(SOTA_N) \
+		TILE_M=$(SOTA_TILE_M) TILE_N=$(SOTA_TILE_N) \
+		OUTPUT_TYPE=int8 B_LAYOUT=column TRANSFORM_VARIANT=sota-int8 \
+		KERNEL_IMPL=external-mmul EXTERNAL_KERNEL_STYLE=native-mmul \
+		EXTERNAL_BLOCK_M=2 EXTERNAL_BLOCK_N=2 EXTERNAL_K_PACKS=18 \
+		EXTERNAL_CORE_M_PACKS=18 EXTERNAL_ACTIVE_M_PACKS=18 EXTERNAL_CORE_N_PACKS=18 EXTERNAL_C_STRIDE_M_PACKS=18 \
+		ATB_K_CHUNK_ELEMENTS=432 OMIT_PING_PONG=L1 RUNTIME_LOOP_TILING=2,4 \
+		WARMUPS=20 ITERATIONS=100 VALIDATION=samples REQUIRE_ACCEPTANCE=0 \
+		PERFORMANCE_MODE=1 ACCEPTANCE_TOPS=$(ACCEPTANCE_TOPS) BUILD_DIR=$(BUILD_DIR) \
 		ARTIFACT_DIR=$(ARTIFACT_DIR) TRANSFORM_SCRIPT_PATH=$(TRANSFORM_SCRIPT)
 
 acceptance-int8-atb:

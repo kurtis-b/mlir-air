@@ -277,6 +277,14 @@ def is_atb_v2(variant: str) -> bool:
     return variant == "sota-int8-atb-v2"
 
 
+def uses_full_m_external_k_chunking(args: argparse.Namespace) -> bool:
+    return (
+        args.kernel_impl == "external-mmul"
+        and args.transform_variant == "sota-int8"
+        and args.external_k_packs > DEFAULT_EXTERNAL_K_PACKS
+    )
+
+
 def choose_atb_k_chunk_elements(
     problem_k: int,
     requested: int,
@@ -1146,6 +1154,7 @@ def write_compile_config(args: argparse.Namespace, generated_ir: str | None) -> 
         "external_core_n_packs": args.external_core_n_packs,
         "external_c_stride_m_packs": args.external_c_stride_m_packs,
         "atb_k_chunk_elements": args.atb_k_chunk_elements,
+        "effective_k_chunk_elements": args.effective_atb_k_chunk_elements,
         "effective_atb_k_chunk_elements": args.effective_atb_k_chunk_elements,
         "omit_ping_pong": args.omit_ping_pong,
         "aircc_debug_ir": args.aircc_debug_ir,
@@ -1463,6 +1472,13 @@ def parse_args() -> argparse.Namespace:
             args.external_k_packs * 8,
             max_chunk=ATB_V2_MAX_A_L2_CHUNK_ELEMENTS,
         )
+    elif uses_full_m_external_k_chunking(args):
+        args.effective_atb_k_chunk_elements = choose_atb_k_chunk_elements(
+            args.k,
+            args.atb_k_chunk_elements,
+            args.external_k_packs * 8,
+            max_chunk=DEFAULT_ATB_K_CHUNK_ELEMENTS,
+        )
     return args
 
 
@@ -1509,7 +1525,18 @@ with air.ir.Context() as ctx, Location.unknown():
         )
     transform_ir = Module.parse(transform_ir_string)
     run_transform(transform_ir, air_module)
-    if args.transform_variant == "sota-int8-atb":
+    if uses_full_m_external_k_chunking(args) and args.effective_atb_k_chunk_elements:
+        air_module = Module.parse(
+            rewrite_atb_k_chunk_buffers(
+                str(air_module),
+                args.tile_m,
+                args.tile_n,
+                args.k,
+                args.external_k_packs * 8,
+                args.effective_atb_k_chunk_elements,
+            )
+        )
+    elif args.transform_variant == "sota-int8-atb":
         air_module = Module.parse(
             rewrite_atb_active_a_buffers(str(air_module), args.external_active_m_packs)
         )

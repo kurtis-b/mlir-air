@@ -80,6 +80,14 @@ def is_atb_v2(variant: str) -> bool:
     return variant == "sota-int8-atb-v2"
 
 
+def uses_full_m_external_k_chunking(args: argparse.Namespace) -> bool:
+    return (
+        args.kernel_impl == "external-mmul"
+        and args.transform_variant == "sota-int8"
+        and args.external_k_packs > DEFAULT_EXTERNAL_K_PACKS
+    )
+
+
 def choose_atb_k_chunk_elements(
     problem_k: int,
     requested: int,
@@ -496,12 +504,22 @@ def make_report(args: argparse.Namespace) -> dict[str, Any]:
             "atb-k18"
             if is_atb_variant(args.transform_variant)
             else (
-                "acceptance"
-                if args.external_k_packs == DEFAULT_EXTERNAL_K_PACKS
-                else "diagnostic-k-residency"
+                "full-m-k-chunked"
+                if uses_full_m_external_k_chunking(args)
+                else (
+                    "acceptance"
+                    if args.external_k_packs == DEFAULT_EXTERNAL_K_PACKS
+                    else "diagnostic-k-residency"
+                )
             )
         ),
         "external_k_packs": args.external_k_packs,
+        "external_k_chunk_elements": args.effective_atb_k_chunk_elements or None,
+        "external_l3_k_chunks": (
+            math.ceil(args.k / args.effective_atb_k_chunk_elements)
+            if args.effective_atb_k_chunk_elements
+            else None
+        ),
         "external_block": [args.external_block_m, args.external_block_n],
         "external_core_m_packs": args.external_core_m_packs,
         "external_active_m_packs": args.external_active_m_packs,
@@ -923,6 +941,13 @@ def write_markdown(path: Path, report: dict[str, Any], json_path: Path) -> None:
             f.write(
                 f"| External K-pack status | `{report['external_k_pack_status']}` |\n"
             )
+            if report["external_k_chunk_elements"]:
+                f.write(
+                    f"| External K chunk elements | `{report['external_k_chunk_elements']}` |\n"
+                )
+                f.write(
+                    f"| External L3 K chunks | `{report['external_l3_k_chunks']}` |\n"
+                )
             f.write(f"| External block | `{report['external_block']}` |\n")
             f.write(
                 f"| External core M packs | `{report['external_core_m_packs']}` |\n"
@@ -1175,6 +1200,13 @@ def parse_args() -> argparse.Namespace:
             args.atb_k_chunk_elements,
             args.external_k_packs * 8,
             max_chunk=ATB_V2_MAX_A_L2_CHUNK_ELEMENTS,
+        )
+    elif uses_full_m_external_k_chunking(args):
+        args.effective_atb_k_chunk_elements = choose_atb_k_chunk_elements(
+            args.k,
+            args.atb_k_chunk_elements,
+            args.external_k_packs * 8,
+            max_chunk=DEFAULT_ATB_K_CHUNK_ELEMENTS,
         )
     elif is_atb_variant(args.transform_variant):
         args.effective_atb_k_chunk_elements = args.external_k_packs * 8
