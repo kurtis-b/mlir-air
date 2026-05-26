@@ -8,8 +8,8 @@ AIE_TARGET ?= aie2
 # Tile sizes
 ifeq ($(AIE_TARGET),aie2p)
   TILE_M ?= 64
-  TILE_K_L2 ?= 128
-  TILE_K_L1 ?= 32
+  TILE_K_L2 ?= 256
+  TILE_K_L1 ?= 64
   TILE_N ?= 128
 else
   TILE_M ?= 128
