@@ -34,7 +34,11 @@ ifdef PEANO_INSTALL_DIR
 OUTPUT_FORMAT ?= xclbin
 OUTPUT_FORMAT_FLAG = --output-format $(OUTPUT_FORMAT)
   # DIRECT_CODEGEN_FLAG can be overridden from command line (e.g., make DIRECT_CODEGEN_FLAG= run4x4)
-  DIRECT_CODEGEN_FLAG ?= --direct-codegen
+  ifeq ($(AIE_TARGET),aie2p)
+    DIRECT_CODEGEN_FLAG ?=
+  else
+    DIRECT_CODEGEN_FLAG ?= --direct-codegen
+  endif
 else
   BUILD_DIR := build_chess
   DIRECT_CODEGEN_FLAG ?=
