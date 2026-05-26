@@ -1410,10 +1410,17 @@ LogicalResult air::foldForLoopNestAsExtendedSizesAndStrides(
       trip_count = *getStaticScfForTripCountAsInt(sfo);
     Value new_wrap = arith::ConstantIndexOp::create(builder, loc, trip_count);
     // Skip stride modulo if memref is unranked.
+    int64_t raw_stride_value = ind_var_factor;
     int64_t new_stride_value =
         getTensorVolume(memref.getType()) == 1
             ? ind_var_factor
             : ind_var_factor % getTensorVolume(memref.getType());
+    // A loop-dependent offset that wraps by exactly the buffer volume is not a
+    // repeat. Folding it to stride 0 would alias distinct logical iterations
+    // onto the first tile after memref shrinkage. Leave such loops for the BD
+    // chain unroller so each iteration keeps its own channel op.
+    if (raw_stride_value != 0 && new_stride_value == 0)
+      return failure();
     Value new_stride =
         arith::ConstantIndexOp::create(builder, loc, new_stride_value);
 

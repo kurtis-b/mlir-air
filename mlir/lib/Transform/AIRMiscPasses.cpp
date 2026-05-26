@@ -2079,6 +2079,8 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
   auto ctx = func.getContext();
   SmallVector<memref::AllocOp> allocOps;
   func.walk([&](memref::AllocOp allocOp) {
+    if (allocOp->hasAttr("air.no_l2_split"))
+      return;
     if (allocOp->getParentOfType<air::SegmentOp>() &&
         air::isL2(llvm::cast<MemRefType>(allocOp.getMemref().getType()))) {
       allocOps.push_back(allocOp);
@@ -2235,6 +2237,103 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
       return rootStrideFactor;
     };
 
+    auto getMemrefDimStride = [](int dimOnMemref,
+                                 SmallVector<int> memrefShape) {
+      int stride = 1;
+      for (int i = memrefShape.size() - 1; i > dimOnMemref; i--)
+        stride *= memrefShape[i];
+      return stride;
+    };
+
+    auto getMemrefDimOuterStride = [&](int dimOnMemref,
+                                       SmallVector<int> memrefShape) {
+      return getMemrefDimStride(dimOnMemref, memrefShape) *
+             memrefShape[dimOnMemref];
+    };
+
+    auto evaluateOffsetAtLoopIv = [&](Value offsetVal, scf::ForOp forOp,
+                                      int64_t ivValue)
+        -> std::optional<int64_t> {
+      if (auto constOffset = getConstantIntValue(offsetVal))
+        return *constOffset;
+
+      affine::AffineApplyOp apply =
+          dyn_cast_if_present<affine::AffineApplyOp>(
+              offsetVal.getDefiningOp());
+      if (auto exec = dyn_cast_if_present<air::ExecuteOp>(
+              offsetVal.getDefiningOp()))
+        for (auto &childOp : exec.getChildOps())
+          if (auto applyChild =
+                  dyn_cast_if_present<affine::AffineApplyOp>(childOp))
+            apply = applyChild;
+      if (!apply)
+        return std::nullopt;
+
+      SmallVector<std::optional<int64_t>> symInts;
+      SmallVector<std::optional<int64_t>> dimInts;
+      auto resolveOperand = [&](Value operand) -> std::optional<int64_t> {
+        if (operand == forOp.getInductionVar())
+          return ivValue;
+        if (auto constVal = getConstantIntValue(operand))
+          return *constVal;
+        return std::nullopt;
+      };
+      for (auto operand : apply.getSymbolOperands())
+        symInts.push_back(resolveOperand(operand));
+      for (auto operand : apply.getDimOperands())
+        dimInts.push_back(resolveOperand(operand));
+      return air::evaluateConstantsInMap(apply.getAffineMap(), symInts,
+                                         dimInts, ctx);
+    };
+
+    auto getPackedLoopRootSize =
+        [&](air::ChannelInterface ci, int dimOnMemref, int offsetDim)
+        -> std::optional<int> {
+      auto forOp = getScfForFromVal(ci.getOffsets()[offsetDim]);
+      if (!forOp)
+        return std::nullopt;
+      auto tripCount = air::getStaticScfForTripCountAsInt(forOp);
+      auto lb = getConstantIntValue(forOp.getLowerBound());
+      auto step = getConstantIntValue(forOp.getStep());
+      if (!tripCount || !lb || !step)
+        return std::nullopt;
+
+      int64_t lastIv = *lb + (*tripCount - 1) * (*step);
+      auto firstOffset =
+          evaluateOffsetAtLoopIv(ci.getOffsets()[offsetDim], forOp, *lb);
+      auto lastOffset =
+          evaluateOffsetAtLoopIv(ci.getOffsets()[offsetDim], forOp, lastIv);
+      if (!firstOffset || !lastOffset)
+        return std::nullopt;
+
+      auto memrefShape = air::getTensorShape(ci.getMemref().getType());
+      int memrefStride = getMemrefDimStride(dimOnMemref, memrefShape);
+      int outerStride = getMemrefDimOuterStride(dimOnMemref, memrefShape);
+      int64_t span = *lastOffset > *firstOffset
+                         ? *lastOffset - *firstOffset
+                         : *firstOffset - *lastOffset;
+      bool hasAdditionalTiledDim = false;
+
+      for (unsigned i = 0; i < ci.getStrides().size(); i++) {
+        auto stride = getConstantIntValue(ci.getStrides()[i]);
+        auto size = getConstantIntValue(ci.getSizes()[i]);
+        if (!stride || !size)
+          return std::nullopt;
+        if (*stride < memrefStride || *stride >= outerStride)
+          continue;
+        span += (*size - 1) * (*stride / memrefStride);
+        if ((int)i != offsetDim)
+          hasAdditionalTiledDim = true;
+      }
+
+      if (!hasAdditionalTiledDim)
+        return std::nullopt;
+      int64_t size = span + 1;
+      if (size <= 0 || size > memrefShape[dimOnMemref])
+        return std::nullopt;
+      return (int)size;
+    };
+
     for (unsigned i = 0; i < putgets.size(); i++) {
       // Infer the size at splitDim for both overlapping and non-overlapping
       // access pattern.
@@ -2245,8 +2344,12 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
       if (auto rootOffset = getRootOffset(ci.getOffsets()[*offsetDimOpt]))
         splitDimOffset = *rootOffset;
       // Infer size at splitDim.
-      if (auto rootSize = getRootSize(ci.getOffsets()[*offsetDimOpt],
-                                      ci.getSizes()[*offsetDimOpt]))
+      auto packedRootSize =
+          getPackedLoopRootSize(ci, *splitDim, *offsetDimOpt);
+      if (packedRootSize)
+        splitDimSize = *packedRootSize;
+      else if (auto rootSize = getRootSize(ci.getOffsets()[*offsetDimOpt],
+                                           ci.getSizes()[*offsetDimOpt]))
         splitDimSize = *rootSize;
       // Infer stride (factor) at splitDim. If the root comes from an scf.for
       // loop, and if the loop has non-unit step size, then that multiplier
@@ -2255,7 +2358,7 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
       // dimension at inner-most dimension).
       auto rootStrideFactor = getRootStrideFactor(
           ci.getOffsets()[*offsetDimOpt], ci.getStrides()[*offsetDimOpt]);
-      if (rootStrideFactor && ci.getOffsets().size() > 1) {
+      if (rootStrideFactor && !packedRootSize && ci.getOffsets().size() > 1) {
         splitDimStrideFactor = *rootStrideFactor;
         // Cancel out the non-unit step size on the for loop, to get contiguous
         // access pattern on memrefs after split.

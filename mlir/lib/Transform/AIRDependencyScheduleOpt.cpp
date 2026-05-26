@@ -5221,6 +5221,17 @@ struct ShrinkMemrefSizesByAccessPattern
     if (boundsAreAllOnes)
       return failure(); // Memref access pattern analysis failed
     if (shrinkMemref) {
+      for (auto user : users) {
+        auto chanOp = dyn_cast_if_present<air::ChannelInterface>(user);
+        if (!chanOp)
+          continue;
+        if (hasLoopVariantAccessToShrunkMemrefSlice(
+                chanOp, memref_shape, overall_access_bounds)) {
+          alloc->setAttr("air.shrinkage", rewriter.getBoolAttr(false));
+          return failure();
+        }
+      }
+
       // Shrink access patterns to memref.
       for (auto user : users) {
         auto chanOp = dyn_cast_if_present<air::ChannelInterface>(user);
@@ -5324,6 +5335,43 @@ private:
     if (std::find(vec.begin(), vec.end(), entry) == vec.end()) {
       vec.push_back(entry);
     }
+  }
+
+  bool valueDependsOnLoopInductionVar(
+      Value value, llvm::SmallPtrSetImpl<Value> &seen) const {
+    if (!seen.insert(value).second)
+      return false;
+    if (auto blockArg = dyn_cast<BlockArgument>(value)) {
+      Operation *owner = blockArg.getOwner()->getParentOp();
+      if (auto forOp = dyn_cast_if_present<scf::ForOp>(owner))
+        return forOp.getInductionVar() == blockArg;
+      if (auto forOp = dyn_cast_if_present<affine::AffineForOp>(owner))
+        return forOp.getInductionVar() == blockArg;
+      return false;
+    }
+    Operation *def = value.getDefiningOp();
+    if (!def)
+      return false;
+    for (Value operand : def->getOperands())
+      if (valueDependsOnLoopInductionVar(operand, seen))
+        return true;
+    return false;
+  }
+
+  bool hasLoopVariantAccessToShrunkMemrefSlice(
+      air::ChannelInterface chanOp, SmallVector<int> memrefShape,
+      SmallVector<int64_t> overallAccessBounds) const {
+    SmallVector<Value> offsets = chanOp.getOffsets();
+    if (offsets.size() != memrefShape.size())
+      return false;
+    for (unsigned i = 0; i < offsets.size(); i++) {
+      if (overallAccessBounds[i] >= memrefShape[i])
+        continue;
+      llvm::SmallPtrSet<Value, 8> seen;
+      if (valueDependsOnLoopInductionVar(offsets[i], seen))
+        return true;
+    }
+    return false;
   }
 
   LogicalResult getAllChanUsers(Value memref, SmallVector<Operation *> &users,
