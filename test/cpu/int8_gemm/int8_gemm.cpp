@@ -22,21 +22,23 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <immintrin.h>
 
 namespace {
 
-constexpr int kM = 1024;
-constexpr int kN = 1024;
-constexpr int kK = 1024;
+constexpr int kDefaultSize = 1024;
 constexpr int kMR = 4;
 constexpr int kNR = 32;
 constexpr int kKGroup = 4;
 constexpr int kDefaultThreads = 12;
 
 struct Options {
+  int m = kDefaultSize;
+  int n = kDefaultSize;
+  int k = kDefaultSize;
   int warmups = 0;
   int iterations = 1;
   int threads = kDefaultThreads;
@@ -44,7 +46,7 @@ struct Options {
 };
 
 void usage(const char *argv0) {
-  std::cout << "Usage: " << argv0
+  std::cout << "Usage: " << argv0 << " [--size N] [--m M] [--n N] [--k K]"
             << " [--warmups N] [--iterations N] [--threads N]"
             << " [--no-verify]\n";
 }
@@ -60,6 +62,21 @@ int parseInt(const char *value, const char *name, bool allowZero = true) {
   return static_cast<int>(parsed);
 }
 
+bool isPowerOfTwoGreaterThan512(int value) {
+  return value > 512 && (value & (value - 1)) == 0;
+}
+
+void validateShape(const Options &options) {
+  if (!isPowerOfTwoGreaterThan512(options.m) ||
+      !isPowerOfTwoGreaterThan512(options.n) ||
+      !isPowerOfTwoGreaterThan512(options.k))
+    throw std::runtime_error(
+        "M, N, and K must be powers of two greater than 512");
+  if (options.m % kMR != 0 || options.n % kNR != 0 ||
+      options.k % (2 * kKGroup) != 0)
+    throw std::runtime_error("shape is not divisible by the VNNI tile shape");
+}
+
 Options parseOptions(int argc, char **argv) {
   Options options;
   for (int i = 1; i < argc; ++i) {
@@ -67,6 +84,33 @@ Options parseOptions(int argc, char **argv) {
     if (arg == "--help" || arg == "-h") {
       usage(argv[0]);
       std::exit(0);
+    }
+    if (arg == "--size") {
+      if (++i == argc)
+        throw std::runtime_error("missing value for --size");
+      int size = parseInt(argv[i], "--size", false);
+      options.m = size;
+      options.n = size;
+      options.k = size;
+      continue;
+    }
+    if (arg == "--m") {
+      if (++i == argc)
+        throw std::runtime_error("missing value for --m");
+      options.m = parseInt(argv[i], "--m", false);
+      continue;
+    }
+    if (arg == "--n") {
+      if (++i == argc)
+        throw std::runtime_error("missing value for --n");
+      options.n = parseInt(argv[i], "--n", false);
+      continue;
+    }
+    if (arg == "--k") {
+      if (++i == argc)
+        throw std::runtime_error("missing value for --k");
+      options.k = parseInt(argv[i], "--k", false);
+      continue;
     }
     if (arg == "--warmups") {
       if (++i == argc)
@@ -94,60 +138,72 @@ Options parseOptions(int argc, char **argv) {
   }
   if (options.iterations == 0)
     throw std::runtime_error("--iterations must be greater than zero");
+  validateShape(options);
   return options;
 }
 
 void initializeInputs(std::vector<int8_t> &a, std::vector<int8_t> &b,
-                      int8_t *bPacked) {
-  for (int i = 0; i < kM; ++i) {
-    for (int k = 0; k < kK; ++k) {
-      a[i * kK + k] = static_cast<int8_t>((i * 3 + k * 5 + 1) & 7);
-    }
+                      int8_t *bPacked, int m, int n, int kDim) {
+  for (int i = 0; i < m; ++i) {
+    for (int k = 0; k < kDim; ++k)
+      a[static_cast<std::size_t>(i) * kDim + k] =
+          static_cast<int8_t>((i * 3 + k * 5 + 1) & 7);
   }
-  for (int k = 0; k < kK; ++k) {
-    for (int j = 0; j < kN; ++j) {
+  for (int k = 0; k < kDim; ++k) {
+    for (int j = 0; j < n; ++j) {
       int8_t value = static_cast<int8_t>((k * 7 + j * 11 + 3) & 7);
-      b[k * kN + j] = value;
+      b[static_cast<std::size_t>(k) * n + j] = value;
     }
   }
 
-  for (int panel = 0; panel < kN; panel += kNR) {
-    int8_t *panelBase = bPacked + (panel / kNR) * kK * kNR;
-    for (int k = 0; k < kK; k += kKGroup) {
-      int8_t *kBase = panelBase + (k / kKGroup) * kNR * kKGroup;
+  for (int panel = 0; panel < n; panel += kNR) {
+    int8_t *panelBase =
+        bPacked + static_cast<std::size_t>(panel / kNR) * kDim * kNR;
+    for (int k = 0; k < kDim; k += kKGroup) {
+      int8_t *kBase =
+          panelBase + static_cast<std::size_t>(k / kKGroup) * kNR * kKGroup;
       for (int col = 0; col < kNR; ++col) {
         for (int byte = 0; byte < kKGroup; ++byte)
-          kBase[col * kKGroup + byte] = b[(k + byte) * kN + panel + col];
+          kBase[col * kKGroup + byte] =
+              b[static_cast<std::size_t>(k + byte) * n + panel + col];
       }
     }
   }
 }
 
 int32_t referenceElement(const std::vector<int8_t> &a,
-                         const std::vector<int8_t> &b, int row, int col) {
+                         const std::vector<int8_t> &b, int n, int kDim, int row,
+                         int col) {
   int32_t sum = 0;
-  for (int k = 0; k < kK; ++k)
-    sum += static_cast<int32_t>(a[row * kK + k]) *
-           static_cast<int32_t>(b[k * kN + col]);
+  for (int k = 0; k < kDim; ++k)
+    sum += static_cast<int32_t>(a[static_cast<std::size_t>(row) * kDim + k]) *
+           static_cast<int32_t>(b[static_cast<std::size_t>(k) * n + col]);
   return sum;
 }
 
 bool verifySamples(const std::vector<int8_t> &a, const std::vector<int8_t> &b,
-                   const int32_t *c) {
-  constexpr int samples[][2] = {{0, 0},     {0, 31},    {3, 5},
-                                {17, 19},   {127, 64},  {255, 255},
-                                {511, 17},  {700, 901}, {1023, 1023}};
+                   const int32_t *c, int m, int n, int kDim) {
+  std::vector<std::pair<int, int>> samples = {
+      {0, 0},
+      {0, std::min(n - 1, 31)},
+      {std::min(m - 1, 3), std::min(n - 1, 5)},
+      {m / 8, n / 16},
+      {m / 4, n / 4},
+      {m / 2, n / 2},
+      {(3 * m) / 4, (7 * n) / 8},
+      {m - 1, n - 1},
+  };
+
   bool ok = true;
   for (const auto &sample : samples) {
-    int row = sample[0];
-    int col = sample[1];
-    int32_t expected = referenceElement(a, b, row, col);
-    int32_t observed = c[row * kN + col];
+    int row = sample.first;
+    int col = sample.second;
+    int32_t expected = referenceElement(a, b, n, kDim, row, col);
+    int32_t observed = c[static_cast<std::size_t>(row) * n + col];
     if (expected == observed)
       continue;
     std::cerr << "mismatch at (" << row << ", " << col
-              << "): expected=" << expected << " observed=" << observed
-              << "\n";
+              << "): expected=" << expected << " observed=" << observed << "\n";
     ok = false;
   }
   return ok;
@@ -189,17 +245,18 @@ bool cpuSupportsVnni() {
 } // namespace
 
 extern "C" __attribute__((noinline, used,
-                          target("avx512f,avx512bw,avx512vl,avx512vnni")))
-void cpu_i8_gemm_vnni(const int8_t *__restrict__ a,
-                      const int8_t *__restrict__ bPacked,
-                      int32_t *__restrict__ c, int rowBegin, int rowEnd) {
+                          target("avx512f,avx512bw,avx512vl,avx512vnni"))) void
+cpu_i8_gemm_vnni(const int8_t *__restrict__ a,
+                 const int8_t *__restrict__ bPacked, int32_t *__restrict__ c,
+                 int n, int kDim, int rowBegin, int rowEnd) {
   for (int i = rowBegin; i < rowEnd; i += kMR) {
-    const int8_t *aRow0 = a + (i + 0) * kK;
-    const int8_t *aRow1 = a + (i + 1) * kK;
-    const int8_t *aRow2 = a + (i + 2) * kK;
-    const int8_t *aRow3 = a + (i + 3) * kK;
-    for (int j = 0; j < kN; j += kNR) {
-      const int8_t *bPanel = bPacked + (j / kNR) * kK * kNR;
+    const int8_t *aRow0 = a + static_cast<std::size_t>(i + 0) * kDim;
+    const int8_t *aRow1 = a + static_cast<std::size_t>(i + 1) * kDim;
+    const int8_t *aRow2 = a + static_cast<std::size_t>(i + 2) * kDim;
+    const int8_t *aRow3 = a + static_cast<std::size_t>(i + 3) * kDim;
+    for (int j = 0; j < n; j += kNR) {
+      const int8_t *bPanel =
+          bPacked + static_cast<std::size_t>(j / kNR) * kDim * kNR;
       __m512i acc00 = _mm512_setzero_si512();
       __m512i acc01 = _mm512_setzero_si512();
       __m512i acc10 = _mm512_setzero_si512();
@@ -214,9 +271,8 @@ void cpu_i8_gemm_vnni(const int8_t *__restrict__ a,
       const int8_t *a2Ptr = aRow2;
       const int8_t *a3Ptr = aRow3;
       const int8_t *bK = bPanel;
-      for (int k = 0; k < kK; k += 2 * kKGroup,
-               bK += 2 * kNR * kKGroup, a0Ptr += 2 * kKGroup,
-               a1Ptr += 2 * kKGroup, a2Ptr += 2 * kKGroup,
+      for (int k = 0; k < kDim; k += 2 * kKGroup, bK += 2 * kNR * kKGroup,
+               a0Ptr += 2 * kKGroup, a1Ptr += 2 * kKGroup, a2Ptr += 2 * kKGroup,
                a3Ptr += 2 * kKGroup) {
         for (int u = 0; u < 2; ++u) {
           const int8_t *bStep = bK + u * kNR * kKGroup;
@@ -247,10 +303,10 @@ void cpu_i8_gemm_vnni(const int8_t *__restrict__ a,
         }
       }
 
-      int32_t *cRow0 = c + (i + 0) * kN + j;
-      int32_t *cRow1 = c + (i + 1) * kN + j;
-      int32_t *cRow2 = c + (i + 2) * kN + j;
-      int32_t *cRow3 = c + (i + 3) * kN + j;
+      int32_t *cRow0 = c + static_cast<std::size_t>(i + 0) * n + j;
+      int32_t *cRow1 = c + static_cast<std::size_t>(i + 1) * n + j;
+      int32_t *cRow2 = c + static_cast<std::size_t>(i + 2) * n + j;
+      int32_t *cRow3 = c + static_cast<std::size_t>(i + 3) * n + j;
       _mm512_store_si512(reinterpret_cast<__m512i *>(cRow0), acc00);
       _mm512_store_si512(reinterpret_cast<__m512i *>(cRow0 + 16), acc01);
       _mm512_store_si512(reinterpret_cast<__m512i *>(cRow1), acc10);
@@ -267,10 +323,10 @@ void pinCurrentThreadToCpu(int cpu);
 
 class GemmThreadTeam {
 public:
-  GemmThreadTeam(const int8_t *a, const int8_t *bPacked, int32_t *c,
-                 int requestedThreads)
-      : a(a), bPacked(bPacked), c(c),
-        numThreads(std::min(std::max(1, requestedThreads), kM / kMR)),
+  GemmThreadTeam(const int8_t *a, const int8_t *bPacked, int32_t *c, int m,
+                 int n, int kDim, int requestedThreads)
+      : a(a), bPacked(bPacked), c(c), n(n), kDim(kDim), mRows(m),
+        numThreads(std::min(std::max(1, requestedThreads), m / kMR)),
         stop(false) {
     if (numThreads == 1)
       return;
@@ -278,7 +334,7 @@ public:
         pthread_barrier_init(&doneBarrier, nullptr, numThreads + 1) != 0)
       throw std::runtime_error("failed to initialize pthread barriers");
     workers.reserve(numThreads);
-    int rowBlocks = kM / kMR;
+    int rowBlocks = m / kMR;
     for (int thread = 0; thread < numThreads; ++thread) {
       int blockBegin = (rowBlocks * thread) / numThreads;
       int blockEnd = (rowBlocks * (thread + 1)) / numThreads;
@@ -290,8 +346,8 @@ public:
           pthread_barrier_wait(&startBarrier);
           if (stop.load(std::memory_order_acquire))
             break;
-          cpu_i8_gemm_vnni(this->a, this->bPacked, this->c, rowBegin,
-                            rowEnd);
+          cpu_i8_gemm_vnni(this->a, this->bPacked, this->c, this->n, this->kDim,
+                           rowBegin, rowEnd);
           pthread_barrier_wait(&doneBarrier);
         }
       });
@@ -314,7 +370,7 @@ public:
 
   void runOnce() {
     if (numThreads == 1) {
-      cpu_i8_gemm_vnni(a, bPacked, c, 0, kM);
+      cpu_i8_gemm_vnni(a, bPacked, c, n, kDim, 0, mRows);
       return;
     }
     pthread_barrier_wait(&startBarrier);
@@ -327,6 +383,9 @@ private:
   const int8_t *a;
   const int8_t *bPacked;
   int32_t *c;
+  int n;
+  int kDim;
+  int mRows = 0;
   int numThreads;
   std::atomic<bool> stop;
   pthread_barrier_t startBarrier;
@@ -334,8 +393,8 @@ private:
   std::vector<std::thread> workers;
 };
 
-void clearOutput(int32_t *c) {
-  std::fill(c, c + static_cast<std::size_t>(kM) * kN, 0);
+void clearOutput(int32_t *c, int m, int n) {
+  std::fill(c, c + static_cast<std::size_t>(m) * n, 0);
 }
 
 void pinCurrentThreadToCpu(int cpu) {
@@ -357,16 +416,17 @@ int main(int argc, char **argv) {
       return 2;
     }
 
-    std::vector<int8_t> a(kM * kK);
-    std::vector<int8_t> b(kK * kN);
-    AlignedPtr<int8_t> bPacked =
-        makeAlignedBuffer<int8_t>(static_cast<std::size_t>(kN) * kK);
-    AlignedPtr<int32_t> c =
-        makeAlignedBuffer<int32_t>(static_cast<std::size_t>(kM) * kN);
-    initializeInputs(a, b, bPacked.get());
-    clearOutput(c.get());
+    std::vector<int8_t> a(static_cast<std::size_t>(options.m) * options.k);
+    std::vector<int8_t> b(static_cast<std::size_t>(options.k) * options.n);
+    AlignedPtr<int8_t> bPacked = makeAlignedBuffer<int8_t>(
+        static_cast<std::size_t>(options.n) * options.k);
+    AlignedPtr<int32_t> c = makeAlignedBuffer<int32_t>(
+        static_cast<std::size_t>(options.m) * options.n);
+    initializeInputs(a, b, bPacked.get(), options.m, options.n, options.k);
+    clearOutput(c.get(), options.m, options.n);
 
-    GemmThreadTeam team(a.data(), bPacked.get(), c.get(), options.threads);
+    GemmThreadTeam team(a.data(), bPacked.get(), c.get(), options.m, options.n,
+                        options.k, options.threads);
 
     for (int i = 0; i < options.warmups; ++i)
       team.runOnce();
@@ -378,19 +438,23 @@ int main(int argc, char **argv) {
       auto start = std::chrono::steady_clock::now();
       team.runOnce();
       auto stop = std::chrono::steady_clock::now();
-      double us = std::chrono::duration<double, std::micro>(stop - start).count();
+      double us =
+          std::chrono::duration<double, std::micro>(stop - start).count();
       totalUs += us;
       minUs = std::min(minUs, us);
       maxUs = std::max(maxUs, us);
     }
 
-    bool valid = !options.verify || verifySamples(a, b, c.get());
+    bool valid = !options.verify ||
+                 verifySamples(a, b, c.get(), options.m, options.n, options.k);
     double avgUs = totalUs / static_cast<double>(options.iterations);
-    double gigaOps = (2.0 * kM * kN * kK) / (avgUs * 1000.0);
+    double gigaOps =
+        (2.0 * options.m * options.n * options.k) / (avgUs * 1000.0);
 
     std::cout << "backend=cpu\n";
     std::cout << "kernel=cpu_i8_gemm_vnni\n";
-    std::cout << "shape=" << kM << "x" << kN << "x" << kK << "\n";
+    std::cout << "shape=" << options.m << "x" << options.n << "x" << options.k
+              << "\n";
     std::cout << "dtype=i8xi8_to_i32\n";
     std::cout << "layout=A_row_major,B_packed_NR32_K4\n";
     std::cout << "threads=" << team.threads() << "\n";
