@@ -5,28 +5,76 @@
 
 import argparse
 
-import numpy as np
 from ml_dtypes import bfloat16
 
 from air.ir import *
+from air.dialects.affine import apply as affine_apply
 from air.dialects.air import *
 from air.dialects.func import FuncOp, CallOp
 from air.dialects.memref import AllocOp, DeallocOp
 from air.backend.xrt import XRTBackend
 from air.backend.xrt_runner import XRTRunner, type_mapper
 
-from common import random_q4nx_block, q4nx_dequant_reference
+from common import random_q4nx_blocks, q4nx_dequant_blocks_reference
+
+
+def _affine_mul(factor):
+    return AffineMap.get(
+        0,
+        1,
+        [AffineExpr.get_mul(AffineSymbolExpr.get(0), AffineConstantExpr.get(factor))],
+    )
+
+
+def _affine_grid_index(tile_extent):
+    return AffineMap.get(
+        0,
+        2,
+        [
+            AffineExpr.get_add(
+                AffineExpr.get_mul(
+                    AffineSymbolExpr.get(0), AffineConstantExpr.get(tile_extent)
+                ),
+                AffineSymbolExpr.get(1),
+            )
+        ],
+    )
+
+
+def _affine_linear_block(col_blocks):
+    return AffineMap.get(
+        0,
+        2,
+        [
+            AffineExpr.get_add(
+                AffineExpr.get_mul(
+                    AffineSymbolExpr.get(0), AffineConstantExpr.get(col_blocks)
+                ),
+                AffineSymbolExpr.get(1),
+            )
+        ],
+    )
 
 
 @module_builder
-def build_module(rows, cols, kernel_name="q4nx_dequant_block", object_file="q4nx.o"):
+def build_module(
+    rows,
+    cols,
+    kernel_name="q4nx_dequant_block",
+    object_file="q4nx.o",
+    row_blocks=1,
+    col_blocks=1,
+    herd_rows=1,
+    herd_cols=1,
+):
     bf16_type = type_mapper(bfloat16)
     i8_type = IntegerType.get_signless(8)
     packed_elems = rows * cols // 2
+    total_blocks = row_blocks * col_blocks
 
-    l3_w_ty = MemRefType.get([packed_elems], i8_type)
-    l3_param_ty = MemRefType.get([cols], bf16_type)
-    l3_out_ty = MemRefType.get([rows, cols], bf16_type)
+    l3_w_ty = MemRefType.get([total_blocks * packed_elems], i8_type)
+    l3_param_ty = MemRefType.get([total_blocks * cols], bf16_type)
+    l3_out_ty = MemRefType.get([row_blocks * rows, col_blocks * cols], bf16_type)
 
     l1_space = IntegerAttr.get(T.i32(), MemorySpace.L1)
     l1_w_ty = MemRefType.get([packed_elems], i8_type, memory_space=l1_space)
@@ -41,29 +89,72 @@ def build_module(rows, cols, kernel_name="q4nx_dequant_block", object_file="q4nx
     dequant_func.attributes["link_with"] = StringAttr.get(object_file)
     dequant_func.attributes["llvm.emit_c_interface"] = UnitAttr.get()
 
+    block_i_map = _affine_grid_index(herd_rows)
+    block_j_map = _affine_grid_index(herd_cols)
+    linear_block_map = _affine_linear_block(col_blocks)
+    packed_offset_map = _affine_mul(packed_elems)
+    param_offset_map = _affine_mul(cols)
+    row_offset_map = _affine_mul(rows)
+    col_offset_map = _affine_mul(cols)
+
     @FuncOp.from_py_func(l3_w_ty, l3_param_ty, l3_param_ty, l3_out_ty)
     def q4nx_dequant(arg_w, arg_scale, arg_min, arg_out):
-        @launch(operands=[arg_w, arg_scale, arg_min, arg_out])
-        def launch_body(lw, ls, lm, lo):
-            @segment(name="q4nx_seg", operands=[lw, ls, lm, lo])
-            def segment_body(sw, ss, sm, so):
+        @launch(
+            operands=[arg_w, arg_scale, arg_min, arg_out],
+            sizes=[row_blocks // herd_rows, col_blocks // herd_cols],
+        )
+        def launch_body(lx, ly, _lsx, _lsy, lw, ls, lm, lo):
+            @segment(name="q4nx_seg", operands=[lx, ly, lw, ls, lm, lo])
+            def segment_body(sx, sy, sw, ss, sm, so):
                 @herd(
                     name="q4nx_herd",
-                    sizes=[1, 1],
-                    operands=[sw, ss, sm, so],
+                    sizes=[herd_rows, herd_cols],
+                    operands=[sx, sy, sw, ss, sm, so],
                     link_with=object_file,
                 )
-                def herd_body(_tx, _ty, _sx, _sy, hw, hs, hm, ho):
+                def herd_body(_tx, _ty, _sx, _sy, bx, by, hw, hs, hm, ho):
+                    block_i = affine_apply(block_i_map, [bx, _tx])
+                    block_j = affine_apply(block_j_map, [by, _ty])
+                    block_linear = affine_apply(linear_block_map, [block_i, block_j])
+                    packed_offset = affine_apply(packed_offset_map, [block_linear])
+                    param_offset = affine_apply(param_offset_map, [block_linear])
+                    row_offset = affine_apply(row_offset_map, [block_i])
+                    col_offset = affine_apply(col_offset_map, [block_j])
+
                     l1_w = AllocOp(l1_w_ty, [], [])
                     l1_s = AllocOp(l1_param_ty, [], [])
                     l1_m = AllocOp(l1_param_ty, [], [])
                     l1_out = AllocOp(l1_out_ty, [], [])
 
-                    dma_memcpy_nd(l1_w, hw)
-                    dma_memcpy_nd(l1_s, hs)
-                    dma_memcpy_nd(l1_m, hm)
+                    dma_memcpy_nd(
+                        l1_w,
+                        hw,
+                        src_offsets=[packed_offset],
+                        src_sizes=[packed_elems],
+                        src_strides=[1],
+                    )
+                    dma_memcpy_nd(
+                        l1_s,
+                        hs,
+                        src_offsets=[param_offset],
+                        src_sizes=[cols],
+                        src_strides=[1],
+                    )
+                    dma_memcpy_nd(
+                        l1_m,
+                        hm,
+                        src_offsets=[param_offset],
+                        src_sizes=[cols],
+                        src_strides=[1],
+                    )
                     CallOp(dequant_func, [l1_w, l1_s, l1_m, l1_out])
-                    dma_memcpy_nd(ho, l1_out)
+                    dma_memcpy_nd(
+                        ho,
+                        l1_out,
+                        dst_offsets=[row_offset, col_offset],
+                        dst_sizes=[rows, cols],
+                        dst_strides=[col_blocks * cols, 1],
+                    )
 
                     DeallocOp(l1_w)
                     DeallocOp(l1_s)
@@ -77,6 +168,10 @@ def main():
     parser.add_argument("-p", "--print-module-only", action="store_true")
     parser.add_argument("--rows", type=int, default=32)
     parser.add_argument("--cols", type=int, default=256)
+    parser.add_argument("--row-blocks", type=int, default=1)
+    parser.add_argument("--col-blocks", type=int, default=1)
+    parser.add_argument("--herd-rows", type=int, default=1)
+    parser.add_argument("--herd-cols", type=int, default=1)
     parser.add_argument("--kernel-name", default="q4nx_dequant_block")
     parser.add_argument("--object-file", default="q4nx.o")
     parser.add_argument(
@@ -89,14 +184,31 @@ def main():
 
     if args.rows * args.cols % 2 != 0:
         parser.error("rows*cols must be even for int4 packing")
+    if args.row_blocks % args.herd_rows != 0:
+        parser.error("row-blocks must be divisible by herd-rows")
+    if args.col_blocks % args.herd_cols != 0:
+        parser.error("col-blocks must be divisible by herd-cols")
 
-    module = build_module(args.rows, args.cols, args.kernel_name, args.object_file)
+    module = build_module(
+        args.rows,
+        args.cols,
+        args.kernel_name,
+        args.object_file,
+        args.row_blocks,
+        args.col_blocks,
+        args.herd_rows,
+        args.herd_cols,
+    )
     if args.print_module_only:
         print(module)
         return
 
-    _, packed, scale, min_offset = random_q4nx_block(args.rows, args.cols, seed=1)
-    expected = q4nx_dequant_reference(packed, scale, min_offset, args.rows, args.cols)
+    packed, scale, min_offset = random_q4nx_blocks(
+        args.row_blocks, args.col_blocks, args.rows, args.cols, seed=1
+    )
+    expected = q4nx_dequant_blocks_reference(
+        packed, scale, min_offset, args.rows, args.cols
+    )
 
     backend_opts = dict(
         verbose=args.verbose,
@@ -111,7 +223,7 @@ def main():
         raise SystemExit(
             runner.run_test(
                 module,
-                inputs=[packed, scale, min_offset],
+                inputs=[packed.reshape(-1), scale.reshape(-1), min_offset.reshape(-1)],
                 expected_outputs=[expected],
                 rtol=1e-1,
                 atol=5e-2,

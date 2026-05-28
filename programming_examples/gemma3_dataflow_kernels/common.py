@@ -40,6 +40,25 @@ def random_q4nx_block(rows: int, cols: int, seed: int = 0):
     return q, packed.view(np.int8), scale, min_offset
 
 
+def random_q4nx_blocks(
+    row_blocks: int, col_blocks: int, rows: int, cols: int, seed: int = 0
+):
+    rng = np.random.default_rng(seed)
+    packed = np.empty((row_blocks, col_blocks, rows * cols // 2), dtype=np.int8)
+    scale = np.empty((row_blocks, col_blocks, cols), dtype=bfloat16)
+    min_offset = np.empty((row_blocks, col_blocks, cols), dtype=bfloat16)
+
+    for rb in range(row_blocks):
+        for cb in range(col_blocks):
+            q = rng.integers(0, 16, size=(rows, cols), dtype=np.uint8)
+            packed[rb, cb] = pack_int4_low_first(q).view(np.int8)
+            scale[rb, cb] = rng.uniform(0.005, 0.05, size=(cols,)).astype(bfloat16)
+            min_offset[rb, cb] = rng.uniform(-0.4, 0.2, size=(cols,)).astype(
+                bfloat16
+            )
+    return packed, scale, min_offset
+
+
 def q4nx_dequant_reference(
     packed_i8: np.ndarray, scale: np.ndarray, min_offset: np.ndarray, rows: int, cols: int
 ) -> np.ndarray:
@@ -49,6 +68,24 @@ def q4nx_dequant_reference(
     ref = q.astype(np.float32) * scale.astype(np.float32)[None, :]
     ref += min_offset.astype(np.float32)[None, :]
     return ref.astype(bfloat16)
+
+
+def q4nx_dequant_blocks_reference(
+    packed_i8: np.ndarray,
+    scale: np.ndarray,
+    min_offset: np.ndarray,
+    rows: int,
+    cols: int,
+) -> np.ndarray:
+    row_blocks, col_blocks = packed_i8.shape[:2]
+    out = np.empty((row_blocks * rows, col_blocks * cols), dtype=bfloat16)
+    for rb in range(row_blocks):
+        for cb in range(col_blocks):
+            block = q4nx_dequant_reference(
+                packed_i8[rb, cb], scale[rb, cb], min_offset[rb, cb], rows, cols
+            )
+            out[rb * rows : (rb + 1) * rows, cb * cols : (cb + 1) * cols] = block
+    return out
 
 
 def fused_dqp_reference(
@@ -62,6 +99,23 @@ def fused_dqp_reference(
     w = q4nx_dequant_reference(packed_i8, scale, min_offset, rows, cols)
     out = w.astype(np.float32) @ activation.astype(np.float32)
     return out.astype(bfloat16)
+
+
+def fused_dqp_blocks_reference(
+    packed_i8: np.ndarray,
+    scale: np.ndarray,
+    min_offset: np.ndarray,
+    activation: np.ndarray,
+    rows: int,
+    cols: int,
+) -> np.ndarray:
+    row_blocks = packed_i8.shape[0]
+    out = np.empty((row_blocks, rows), dtype=bfloat16)
+    for rb in range(row_blocks):
+        out[rb] = fused_dqp_reference(
+            packed_i8[rb], scale[rb], min_offset[rb], activation, rows, cols
+        )
+    return out
 
 
 def attention_reference(

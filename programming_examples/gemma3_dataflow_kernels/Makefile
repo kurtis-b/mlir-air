@@ -28,6 +28,21 @@ PEANOWRAP2P_OPT_FLAGS = -O3 -std=c++20 --target=aie2p-none-unknown-elf ${WARNING
 
 Q4NX_ROWS ?= 32
 Q4NX_COLS ?= 256
+Q4NX_ROW_BLOCKS ?= 1
+Q4NX_COL_BLOCKS ?= 1
+Q4NX_HERD_ROWS ?= 1
+Q4NX_HERD_COLS ?= 1
+OPT_Q4NX_ROW_BLOCKS ?= 4
+OPT_Q4NX_COL_BLOCKS ?= 2
+OPT_Q4NX_HERD_ROWS ?= 4
+OPT_Q4NX_HERD_COLS ?= 2
+
+FUSED_DQP_ROW_BLOCKS ?= 1
+FUSED_DQP_HERD_ROWS ?= 1
+FUSED_DQP_HERD_COLS ?= 1
+OPT_FUSED_DQP_ROW_BLOCKS ?= 2
+OPT_FUSED_DQP_HERD_ROWS ?= 2
+OPT_FUSED_DQP_HERD_COLS ?= 1
 
 MM_M ?= 128
 MM_K ?= 256
@@ -66,11 +81,23 @@ FLOWKV_QUERY_BASE ?= $(shell echo $$(( $(KV_LEN) - 1 )))
 WINDOW_LEN ?= 0
 FLOWQKV_CAUSAL ?= 1
 FLOWKV_CAUSAL ?= 1
+FLOW_GROUPS ?= 1
+FLOW_HERD_ROWS ?= 1
+FLOW_HERD_COLS ?= 1
+OPT_FLOW_GROUPS ?= 4
+OPT_FLOW_HERD_ROWS ?= 4
+OPT_FLOW_HERD_COLS ?= 1
+OPT_FLOWQKV_GROUPS ?= $(OPT_FLOW_GROUPS)
+OPT_FLOWQKV_HERD_ROWS ?= $(OPT_FLOW_HERD_ROWS)
+OPT_FLOWQKV_HERD_COLS ?= $(OPT_FLOW_HERD_COLS)
+OPT_FLOWKV_GROUPS ?= 1
+OPT_FLOWKV_HERD_ROWS ?= 1
+OPT_FLOWKV_HERD_COLS ?= 1
 FLOWQKV_CAUSAL_FLAG := $(if $(filter 1 true yes,$(FLOWQKV_CAUSAL)),--causal,)
 FLOWKV_CAUSAL_FLAG := $(if $(filter 1 true yes,$(FLOWKV_CAUSAL)),--causal,)
 
 all: run-q4nx run-mm run-fused-dqp run-flowqkv run-flowkv
-all-opt: run-q4nx-opt run-mm-opt run-fused-dqp-opt run-flowqkv-opt run-flowkv-opt
+all-opt: run-fused-dqp-opt run-q4nx-opt run-mm-opt run-flowqkv-opt run-flowkv-opt
 compile-opt-kernels: compile-q4nx-opt-kernel compile-mm-opt-kernel compile-fused-dqp-opt-kernel compile-flowqkv-opt-kernel compile-flowkv-opt-kernel
 
 dump-asm-opt: dump-asm-q4nx-opt dump-asm-mm-opt dump-asm-fused-dqp-opt dump-asm-flowqkv-opt dump-asm-flowkv-opt
@@ -85,7 +112,9 @@ prepare-air-project:
 	mkdir -p $(BUILD_DIR)/air_project
 
 print-q4nx:
-	python3 $(srcdir)/q4nx.py -p --rows $(Q4NX_ROWS) --cols $(Q4NX_COLS) $(OUTPUT_FORMAT_FLAG)
+	python3 $(srcdir)/q4nx.py -p --rows $(Q4NX_ROWS) --cols $(Q4NX_COLS) \
+		--row-blocks $(Q4NX_ROW_BLOCKS) --col-blocks $(Q4NX_COL_BLOCKS) \
+		--herd-rows $(Q4NX_HERD_ROWS) --herd-cols $(Q4NX_HERD_COLS) $(OUTPUT_FORMAT_FLAG)
 
 compile-q4nx-kernel: check-peano
 	mkdir -p $(BUILD_DIR)
@@ -97,6 +126,8 @@ run-q4nx: compile-q4nx-kernel prepare-air-project
 	cp $(BUILD_DIR)/q4nx.o $(BUILD_DIR)/air_project/q4nx.o
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
 		python3 $(srcdir)/q4nx.py --rows $(Q4NX_ROWS) --cols $(Q4NX_COLS) \
+		--row-blocks $(Q4NX_ROW_BLOCKS) --col-blocks $(Q4NX_COL_BLOCKS) \
+		--herd-rows $(Q4NX_HERD_ROWS) --herd-cols $(Q4NX_HERD_COLS) \
 		--compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG)
 
 compile-q4nx-opt-kernel: check-peano
@@ -109,11 +140,15 @@ run-q4nx-opt: compile-q4nx-opt-kernel prepare-air-project
 	cp $(BUILD_DIR)/q4nx_opt.o $(BUILD_DIR)/air_project/q4nx_opt.o
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
 		python3 $(srcdir)/q4nx.py --rows $(Q4NX_ROWS) --cols $(Q4NX_COLS) \
+		--row-blocks $(OPT_Q4NX_ROW_BLOCKS) --col-blocks $(OPT_Q4NX_COL_BLOCKS) \
+		--herd-rows $(OPT_Q4NX_HERD_ROWS) --herd-cols $(OPT_Q4NX_HERD_COLS) \
 		--kernel-name q4nx_dequant_block_opt --object-file q4nx_opt.o \
 		--compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG)
 
 print-fused-dqp:
-	python3 $(srcdir)/fused_dqp.py -p --rows $(Q4NX_ROWS) --cols $(Q4NX_COLS) $(OUTPUT_FORMAT_FLAG)
+	python3 $(srcdir)/fused_dqp.py -p --rows $(Q4NX_ROWS) --cols $(Q4NX_COLS) \
+		--row-blocks $(FUSED_DQP_ROW_BLOCKS) \
+		--herd-rows $(FUSED_DQP_HERD_ROWS) --herd-cols $(FUSED_DQP_HERD_COLS) $(OUTPUT_FORMAT_FLAG)
 
 compile-fused-dqp-kernel: check-peano
 	mkdir -p $(BUILD_DIR)
@@ -125,6 +160,8 @@ run-fused-dqp: compile-fused-dqp-kernel prepare-air-project
 	cp $(BUILD_DIR)/fused_dqp.o $(BUILD_DIR)/air_project/fused_dqp.o
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
 		python3 $(srcdir)/fused_dqp.py --rows $(Q4NX_ROWS) --cols $(Q4NX_COLS) \
+		--row-blocks $(FUSED_DQP_ROW_BLOCKS) \
+		--herd-rows $(FUSED_DQP_HERD_ROWS) --herd-cols $(FUSED_DQP_HERD_COLS) \
 		--compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG)
 
 compile-fused-dqp-opt-kernel: check-peano
@@ -137,6 +174,8 @@ run-fused-dqp-opt: compile-fused-dqp-opt-kernel prepare-air-project
 	cp $(BUILD_DIR)/fused_dqp_opt.o $(BUILD_DIR)/air_project/fused_dqp_opt.o
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
 		python3 $(srcdir)/fused_dqp.py --rows $(Q4NX_ROWS) --cols $(Q4NX_COLS) \
+		--row-blocks $(OPT_FUSED_DQP_ROW_BLOCKS) \
+		--herd-rows $(OPT_FUSED_DQP_HERD_ROWS) --herd-cols $(OPT_FUSED_DQP_HERD_COLS) \
 		--kernel-name fused_dqp_block_opt --object-file fused_dqp_opt.o \
 		--compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG)
 
@@ -183,8 +222,10 @@ run-mm-opt: compile-mm-opt-kernel prepare-air-project
 
 print-flowqkv:
 	python3 $(srcdir)/flowqkv.py -p --q-chunk $(Q_CHUNK) --kv-len $(KV_LEN) \
-		--head-dim $(HEAD_DIM) --query-base $(FLOWQKV_QUERY_BASE) \
-		--window-len $(WINDOW_LEN) $(FLOWQKV_CAUSAL_FLAG) $(OUTPUT_FORMAT_FLAG)
+		--head-dim $(HEAD_DIM) --groups $(FLOW_GROUPS) \
+		--herd-rows $(FLOW_HERD_ROWS) --herd-cols $(FLOW_HERD_COLS) \
+		--query-base $(FLOWQKV_QUERY_BASE) --window-len $(WINDOW_LEN) \
+		$(FLOWQKV_CAUSAL_FLAG) $(OUTPUT_FORMAT_FLAG)
 
 compile-flowqkv-kernel: check-peano
 	mkdir -p $(BUILD_DIR)
@@ -198,9 +239,10 @@ run-flowqkv: compile-flowqkv-kernel prepare-air-project
 	cp $(BUILD_DIR)/flowqkv.o $(BUILD_DIR)/air_project/flowqkv.o
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
 		python3 $(srcdir)/flowqkv.py --q-chunk $(Q_CHUNK) --kv-len $(KV_LEN) \
-		--head-dim $(HEAD_DIM) --query-base $(FLOWQKV_QUERY_BASE) \
-		--window-len $(WINDOW_LEN) $(FLOWQKV_CAUSAL_FLAG) \
-		--compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG)
+		--head-dim $(HEAD_DIM) --groups $(FLOW_GROUPS) \
+		--herd-rows $(FLOW_HERD_ROWS) --herd-cols $(FLOW_HERD_COLS) \
+		--query-base $(FLOWQKV_QUERY_BASE) --window-len $(WINDOW_LEN) \
+		$(FLOWQKV_CAUSAL_FLAG) --compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG)
 
 compile-flowqkv-opt-kernel: check-peano
 	mkdir -p $(BUILD_DIR)
@@ -214,13 +256,15 @@ run-flowqkv-opt: compile-flowqkv-opt-kernel prepare-air-project
 	cp $(BUILD_DIR)/flowqkv_opt.o $(BUILD_DIR)/air_project/flowqkv_opt.o
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
 		python3 $(srcdir)/flowqkv.py --q-chunk $(Q_CHUNK) --kv-len $(KV_LEN) \
-		--head-dim $(HEAD_DIM) --query-base $(FLOWQKV_QUERY_BASE) \
-		--window-len $(WINDOW_LEN) $(FLOWQKV_CAUSAL_FLAG) \
-		--kernel-name flowqkv_chunk_bf16_opt --object-file flowqkv_opt.o \
+		--head-dim $(HEAD_DIM) --groups $(OPT_FLOWQKV_GROUPS) \
+		--herd-rows $(OPT_FLOWQKV_HERD_ROWS) --herd-cols $(OPT_FLOWQKV_HERD_COLS) \
+		--query-base $(FLOWQKV_QUERY_BASE) --window-len $(WINDOW_LEN) \
+		$(FLOWQKV_CAUSAL_FLAG) --kernel-name flowqkv_chunk_bf16_opt --object-file flowqkv_opt.o \
 		--compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG)
 
 print-flowkv:
 	python3 $(srcdir)/flowkv.py -p --kv-len $(KV_LEN) --head-dim $(HEAD_DIM) \
+		--groups $(FLOW_GROUPS) --herd-rows $(FLOW_HERD_ROWS) --herd-cols $(FLOW_HERD_COLS) \
 		--query-base $(FLOWKV_QUERY_BASE) --window-len $(WINDOW_LEN) \
 		$(FLOWKV_CAUSAL_FLAG) $(OUTPUT_FORMAT_FLAG)
 
@@ -236,6 +280,7 @@ run-flowkv: compile-flowkv-kernel prepare-air-project
 	cp $(BUILD_DIR)/flowkv.o $(BUILD_DIR)/air_project/flowkv.o
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
 		python3 $(srcdir)/flowkv.py --kv-len $(KV_LEN) --head-dim $(HEAD_DIM) \
+		--groups $(FLOW_GROUPS) --herd-rows $(FLOW_HERD_ROWS) --herd-cols $(FLOW_HERD_COLS) \
 		--query-base $(FLOWKV_QUERY_BASE) --window-len $(WINDOW_LEN) \
 		$(FLOWKV_CAUSAL_FLAG) --compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG)
 
@@ -251,6 +296,7 @@ run-flowkv-opt: compile-flowkv-opt-kernel prepare-air-project
 	cp $(BUILD_DIR)/flowkv_opt.o $(BUILD_DIR)/air_project/flowkv_opt.o
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
 		python3 $(srcdir)/flowkv.py --kv-len $(KV_LEN) --head-dim $(HEAD_DIM) \
+		--groups $(OPT_FLOWKV_GROUPS) --herd-rows $(OPT_FLOWKV_HERD_ROWS) --herd-cols $(OPT_FLOWKV_HERD_COLS) \
 		--query-base $(FLOWKV_QUERY_BASE) --window-len $(WINDOW_LEN) \
 		$(FLOWKV_CAUSAL_FLAG) --kernel-name flowkv_decode_bf16_opt --object-file flowkv_opt.o \
 		--compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG)
