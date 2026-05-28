@@ -173,27 +173,51 @@ extern "C" void matmul_i8_i8_i8_acc32_strix(int8 *__restrict pA,
   static_assert(MMUL::size_A == 64);
   static_assert(MMUL::size_B == 64);
   static_assert(MMUL::size_C == 64);
-  static_assert(EXTERNAL_K_PACKS == 9, "retained SOTA route uses K9 residency");
-  static_assert(EXTERNAL_BLOCK_M == 3 && EXTERNAL_BLOCK_N == 2,
-                "retained SOTA route uses a 3x2 hand-scheduled block");
-  static_assert(EXTERNAL_CORE_M_PACKS == 18 && EXTERNAL_ACTIVE_M_PACKS == 18,
-                "retained SOTA route uses the full 18-pack M core tile");
-  static_assert(EXTERNAL_CORE_N_PACKS == 18,
-                "retained SOTA route uses the full 18-pack N core tile");
-  static_assert(EXTERNAL_C_STRIDE_M_PACKS == 18,
-                "retained SOTA route uses full-core C stride");
+  constexpr bool kLegacySotaProfile =
+      EXTERNAL_K_PACKS == 9 && EXTERNAL_BLOCK_M == 3 &&
+      EXTERNAL_BLOCK_N == 2 && EXTERNAL_CORE_M_PACKS == 18 &&
+      EXTERNAL_ACTIVE_M_PACKS == 18 && EXTERNAL_CORE_N_PACKS == 18 &&
+      EXTERNAL_C_STRIDE_M_PACKS == 18;
+  constexpr bool kPowerOfTwoProfile =
+      EXTERNAL_K_PACKS == 8 && EXTERNAL_BLOCK_M == 2 &&
+      EXTERNAL_BLOCK_N == 2 && EXTERNAL_CORE_M_PACKS == 16 &&
+      EXTERNAL_ACTIVE_M_PACKS == 16 && EXTERNAL_CORE_N_PACKS == 16 &&
+      EXTERNAL_C_STRIDE_M_PACKS == 16;
+  static_assert(kLegacySotaProfile || kPowerOfTwoProfile,
+                "supported profiles are legacy 18x18/K9 and power2 16x16/K8");
+  static_assert(EXTERNAL_BLOCK_N == 2,
+                "retained hand-scheduled kernel writes N in 2-pack groups");
+  static_assert(EXTERNAL_CORE_M_PACKS == EXTERNAL_ACTIVE_M_PACKS,
+                "partial active-M profiles need a separate C routing contract");
+  static_assert(EXTERNAL_CORE_M_PACKS == EXTERNAL_C_STRIDE_M_PACKS,
+                "C stride must match the full core M pack count");
 
   constexpr unsigned kActiveMPackCount = EXTERNAL_ACTIVE_M_PACKS;
   constexpr unsigned kNPackCount = EXTERNAL_CORE_N_PACKS;
+  static_assert(EXTERNAL_BLOCK_M != 3 || kActiveMPackCount % 3 == 0,
+                "3x2 profile requires M packs to be divisible by 3");
+  static_assert(EXTERNAL_BLOCK_M != 2 ||
+                    (kActiveMPackCount % 2 == 0 && kNPackCount % 2 == 0),
+                "2x2 profile requires even M and N pack counts");
 
   aie::set_saturation(aie::saturation_mode::none);
 
-  for (unsigned m = 0; m < kActiveMPackCount; m += 3)
-    EXTERNAL_M_LOOP_ATTR(kActiveMPackCount / 3, kActiveMPackCount / 3) {
-      for (unsigned n = 0; n < kNPackCount; n += 2)
-        EXTERNAL_N_LOOP_ATTR(kNPackCount / 2, kNPackCount / 2) {
-          matmul_pack_2x2_streamed<MMUL>(pA, pB, pC, m, n);
-          matmul_pack_1x2_streamed<MMUL>(pA, pB, pC, m + 2, n);
-        }
-    }
+  if constexpr (EXTERNAL_BLOCK_M == 3) {
+    for (unsigned m = 0; m < kActiveMPackCount; m += 3)
+      EXTERNAL_M_LOOP_ATTR(kActiveMPackCount / 3, kActiveMPackCount / 3) {
+        for (unsigned n = 0; n < kNPackCount; n += 2)
+          EXTERNAL_N_LOOP_ATTR(kNPackCount / 2, kNPackCount / 2) {
+            matmul_pack_2x2_streamed<MMUL>(pA, pB, pC, m, n);
+            matmul_pack_1x2_streamed<MMUL>(pA, pB, pC, m + 2, n);
+          }
+      }
+  } else {
+    for (unsigned m = 0; m < kActiveMPackCount; m += 2)
+      EXTERNAL_M_LOOP_ATTR(kActiveMPackCount / 2, kActiveMPackCount / 2) {
+        for (unsigned n = 0; n < kNPackCount; n += 2)
+          EXTERNAL_N_LOOP_ATTR(kNPackCount / 2, kNPackCount / 2) {
+            matmul_pack_2x2_streamed<MMUL>(pA, pB, pC, m, n);
+          }
+      }
+  }
 }

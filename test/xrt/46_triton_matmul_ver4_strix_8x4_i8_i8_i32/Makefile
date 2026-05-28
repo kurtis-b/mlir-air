@@ -38,6 +38,12 @@ SOTA_K ?= 4320
 SOTA_N ?= 4608
 SOTA_TILE_M ?= 576
 SOTA_TILE_N ?= 1152
+POWER2_M ?= 4096
+POWER2_K ?= 4096
+POWER2_N ?= 4096
+POWER2_TILE_M ?= 512
+POWER2_TILE_N ?= 1024
+POWER2_RUNTIME_LOOP_TILING ?= 1,4
 
 # Benchmark contract.
 OUTPUT_TYPE ?= int32
@@ -170,7 +176,7 @@ PROFILE_ARGS := \
 	--acceptance-tops $(ACCEPTANCE_TOPS) \
 	$(REQUIRE_ACCEPTANCE_ARG)
 
-.PHONY: all run run-aie2 run-aie2p compile-xclbin profile build-test-exe build-external-mmul debug_ir acceptance-int8 acceptance-int8-external profile-int8-sota-best clean
+.PHONY: all run run-aie2 run-aie2p compile-xclbin profile build-test-exe build-external-mmul debug_ir acceptance-int8 acceptance-int8-external profile-int8-sota-best profile-int8-power2-best clean
 
 all: run
 
@@ -226,6 +232,20 @@ profile-int8-sota-best:
 		EXTERNAL_CORE_M_PACKS=18 EXTERNAL_ACTIVE_M_PACKS=18 \
 		EXTERNAL_CORE_N_PACKS=18 EXTERNAL_C_STRIDE_M_PACKS=18 \
 		RUNTIME_LOOP_TILING=2,4 TRACE_SIZE=0 AIRCC_DEBUG_IR=0 \
+		WARMUPS=5 ITERATIONS=20 VALIDATION=samples REQUIRE_ACCEPTANCE=0 \
+		ACCEPTANCE_TOPS=$(ACCEPTANCE_TOPS) BUILD_DIR=$(BUILD_DIR) \
+		ARTIFACT_DIR=$(ARTIFACT_DIR) TRANSFORM_SCRIPT_PATH=$(TRANSFORM_SCRIPT)
+
+profile-int8-power2-best:
+	$(MAKE) -f $(srcdir)/Makefile profile \
+		M=$(POWER2_M) K=$(POWER2_K) N=$(POWER2_N) \
+		TILE_M=$(POWER2_TILE_M) TILE_N=$(POWER2_TILE_N) \
+		OUTPUT_TYPE=int8 B_LAYOUT=column TRANSFORM_VARIANT=sota-int8 \
+		KERNEL_IMPL=external-mmul EXTERNAL_KERNEL_STYLE=hand-scheduled \
+		EXTERNAL_BLOCK_M=2 EXTERNAL_BLOCK_N=2 EXTERNAL_K_PACKS=8 \
+		EXTERNAL_CORE_M_PACKS=16 EXTERNAL_ACTIVE_M_PACKS=16 \
+		EXTERNAL_CORE_N_PACKS=16 EXTERNAL_C_STRIDE_M_PACKS=16 \
+		RUNTIME_LOOP_TILING=$(POWER2_RUNTIME_LOOP_TILING) TRACE_SIZE=0 AIRCC_DEBUG_IR=0 \
 		WARMUPS=5 ITERATIONS=20 VALIDATION=samples REQUIRE_ACCEPTANCE=0 \
 		ACCEPTANCE_TOPS=$(ACCEPTANCE_TOPS) BUILD_DIR=$(BUILD_DIR) \
 		ARTIFACT_DIR=$(ARTIFACT_DIR) TRANSFORM_SCRIPT_PATH=$(TRANSFORM_SCRIPT)

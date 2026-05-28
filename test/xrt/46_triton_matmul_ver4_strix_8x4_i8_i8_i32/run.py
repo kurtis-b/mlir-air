@@ -24,6 +24,8 @@ DEFAULT_TILE_M = 512
 DEFAULT_TILE_N = 256
 SOTA_TILE_M = 576
 SOTA_TILE_N = 1152
+POWER2_TILE_M = 512
+POWER2_TILE_N = 1024
 EXTERNAL_MMUL_FUNCTION = "matmul_i8_i8_i8_acc32_strix"
 DEFAULT_EXTERNAL_K_PACKS = 9
 DEFAULT_EXTERNAL_BLOCK_M = 3
@@ -78,8 +80,15 @@ def validate_shape(m: int, k: int, n: int, tile_m: int, tile_n: int) -> None:
         raise ValueError("; ".join(errors))
 
 
-def render_sota_int8_transform(transform_text: str, k_packs: int = 9) -> str:
+def render_sota_int8_transform(
+    transform_text: str,
+    k_packs: int = 9,
+    m_packs: int = 18,
+    n_packs: int = 18,
+) -> str:
     k_elements = k_packs * 8
+    m_elements = m_packs * 8
+    n_elements = n_packs * 8
     replacements = [
         (
             "tile_using_for %copy1 tile_sizes [0, 64]",
@@ -95,15 +104,15 @@ def render_sota_int8_transform(transform_text: str, k_packs: int = 9) -> str:
         ),
         (
             "tile_using_forall %matmul_1 tile_sizes [8, 8, 0]",
-            "tile_using_forall %matmul_1 tile_sizes [18, 18, 0]",
+            f"tile_using_forall %matmul_1 tile_sizes [{m_packs}, {n_packs}, 0]",
         ),
         (
             "tile_using_forall %interchanged_fill_op tile_sizes [8, 8]",
-            "tile_using_forall %interchanged_fill_op tile_sizes [18, 18]",
+            f"tile_using_forall %interchanged_fill_op tile_sizes [{m_packs}, {n_packs}]",
         ),
         (
             "tile_using_forall %unpack_op tile_sizes [64, 64]",
-            "tile_using_forall %unpack_op tile_sizes [144, 144]",
+            f"tile_using_forall %unpack_op tile_sizes [{m_elements}, {n_elements}]",
         ),
         (
             "%herd1 = transform.air.par_to_herd %parallel1 :",
@@ -129,9 +138,13 @@ def render_sota_int8_transform(transform_text: str, k_packs: int = 9) -> str:
 def render_external_mmul_transform(
     transform_text: str,
     k_packs: int,
+    m_packs: int,
+    n_packs: int,
     fuse_l3_l2: bool = True,
 ) -> str:
-    rendered = render_sota_int8_transform(transform_text, k_packs)
+    rendered = render_sota_int8_transform(
+        transform_text, k_packs, m_packs=m_packs, n_packs=n_packs
+    )
     phase8_marker = (
         "    //==========================================================================\n"
         "    // PHASE 8:"
@@ -206,13 +219,18 @@ def render_transform_variant(
     external_k_packs: int,
     problem_k: int,
     external_active_m_packs: int,
+    external_core_n_packs: int,
 ) -> str:
     if kernel_impl == "external-mmul":
         if variant != "sota-int8":
             raise ValueError("external-mmul requires --transform-variant=sota-int8")
         fuse_l3_l2 = problem_k > external_k_packs * 8
         return render_external_mmul_transform(
-            transform_text, external_k_packs, fuse_l3_l2=fuse_l3_l2
+            transform_text,
+            external_k_packs,
+            external_active_m_packs,
+            external_core_n_packs,
+            fuse_l3_l2=fuse_l3_l2,
         )
     if variant == "default":
         return transform_text
@@ -290,10 +308,9 @@ module {{
     %empty = tensor.empty() : tensor<{tile_m}x{tile_n}x{out_mlir}>
     %filled = linalg.fill ins({zero_value} : {out_mlir}) outs(%empty : tensor<{tile_m}x{tile_n}x{out_mlir}>) -> tensor<{tile_m}x{tile_n}x{out_mlir}>
     %matmul = {matmul_op} ins(%a_tensor, %b_tensor : tensor<{tile_m}x{k}xi8>, {b_tensor_type}) outs(%filled : tensor<{tile_m}x{tile_n}x{out_mlir}>) -> tensor<{tile_m}x{tile_n}x{out_mlir}>
-    %c_row_offset = arith.muli %m_offset, %cN : index
-    %c_offset = arith.addi %c_row_offset, %n_offset : index
-    %reinterpret_cast_2 = memref.reinterpret_cast %arg2 to offset: [%c_offset], sizes: [{tile_m}, {tile_n}], strides: [{n}, 1] : memref<*x{out_mlir}> to memref<{tile_m}x{tile_n}x{out_mlir}, strided<[{n}, 1], offset: ?>>
-    bufferization.materialize_in_destination %matmul in writable %reinterpret_cast_2 : (tensor<{tile_m}x{tile_n}x{out_mlir}>, memref<{tile_m}x{tile_n}x{out_mlir}, strided<[{n}, 1], offset: ?>>) -> ()
+    %c_full = memref.reinterpret_cast %arg2 to offset: [0], sizes: [{m}, {n}], strides: [{n}, 1] : memref<*x{out_mlir}> to memref<{m}x{n}x{out_mlir}, strided<[{n}, 1]>>
+    %c_tile = memref.subview %c_full[%m_offset, %n_offset] [{tile_m}, {tile_n}] [1, 1] : memref<{m}x{n}x{out_mlir}, strided<[{n}, 1]>> to memref<{tile_m}x{tile_n}x{out_mlir}, strided<[{n}, 1], offset: ?>>
+    bufferization.materialize_in_destination %matmul in writable %c_tile : (tensor<{tile_m}x{tile_n}x{out_mlir}>, memref<{tile_m}x{tile_n}x{out_mlir}, strided<[{n}, 1], offset: ?>>) -> ()
     return
   }}
 }}
@@ -529,28 +546,40 @@ def parse_args() -> argparse.Namespace:
             errors.append("external-mmul currently supports --output-type=int8 only")
         if args.b_layout != "column":
             errors.append("external-mmul requires --b-layout=column")
-        if args.tile_m != SOTA_TILE_M or args.tile_n != SOTA_TILE_N:
+        if args.external_schedule != DEFAULT_EXTERNAL_SCHEDULE:
             errors.append(
-                f"external-mmul requires tile shape {SOTA_TILE_M}x{SOTA_TILE_N}"
+                f"external-mmul requires external_schedule={DEFAULT_EXTERNAL_SCHEDULE}"
+            )
+        if args.external_kernel_style != DEFAULT_EXTERNAL_KERNEL_STYLE:
+            errors.append(
+                f"external-mmul requires external_kernel_style={DEFAULT_EXTERNAL_KERNEL_STYLE}"
+            )
+        if args.external_c_stride_m_packs != args.external_core_m_packs:
+            errors.append("external-mmul requires C stride to match core M packs")
+        expected_tile_m = args.external_active_m_packs * 8 * 4
+        expected_tile_n = args.external_core_n_packs * 8 * 8
+        if args.tile_m != expected_tile_m or args.tile_n != expected_tile_n:
+            errors.append(
+                "external-mmul tile shape must match the 8x4 herd core tile: "
+                f"expected {expected_tile_m}x{expected_tile_n}"
             )
         k_residency = args.external_k_packs * 8
-        required_external = {
-            "external_schedule": DEFAULT_EXTERNAL_SCHEDULE,
-            "external_kernel_style": DEFAULT_EXTERNAL_KERNEL_STYLE,
-            "external_k_packs": DEFAULT_EXTERNAL_K_PACKS,
-            "external_block_m": DEFAULT_EXTERNAL_BLOCK_M,
-            "external_block_n": DEFAULT_EXTERNAL_BLOCK_N,
-            "external_core_m_packs": DEFAULT_EXTERNAL_CORE_M_PACKS,
-            "external_active_m_packs": DEFAULT_EXTERNAL_ACTIVE_M_PACKS,
-            "external_core_n_packs": DEFAULT_EXTERNAL_CORE_N_PACKS,
-            "external_c_stride_m_packs": DEFAULT_EXTERNAL_CORE_M_PACKS,
+        supported_external_configs = {
+            (9, 3, 2, 18, 18, 18, 18): f"legacy SOTA {SOTA_TILE_M}x{SOTA_TILE_N}",
+            (8, 2, 2, 16, 16, 16, 16): f"power-of-two {POWER2_TILE_M}x{POWER2_TILE_N}",
         }
-        for name, expected in required_external.items():
-            actual = getattr(args, name)
-            if actual != expected:
-                errors.append(
-                    f"retained external-mmul SOTA route requires {name}={expected}"
-                )
+        actual_external_config = (
+            args.external_k_packs,
+            args.external_block_m,
+            args.external_block_n,
+            args.external_core_m_packs,
+            args.external_active_m_packs,
+            args.external_core_n_packs,
+            args.external_c_stride_m_packs,
+        )
+        if actual_external_config not in supported_external_configs:
+            supported = ", ".join(supported_external_configs.values())
+            errors.append(f"unsupported external-mmul profile; supported profiles: {supported}")
         if args.k % k_residency:
             errors.append(f"external-mmul requires K to be a multiple of {k_residency}")
         if not args.external_kernel_object:
@@ -594,6 +623,7 @@ with air.ir.Context() as ctx, Location.unknown():
         args.external_k_packs,
         args.k,
         args.external_active_m_packs,
+        args.external_core_n_packs,
     )
     if args.artifact_dir:
         artifact_dir = Path(args.artifact_dir)
