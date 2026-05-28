@@ -23,7 +23,7 @@ def AffineLoopOptPass : Pass<"affine-loop-opt", "func::FuncOp"> {
                "llvm::cl::ZeroOrMore">,
     Option<"clFastSpace", "affine-opt-copy-fast-space", "unsigned", /*default=*/"1",
            "Fast memory space to use for affine data copy">,
-    Option<"clSlowSpace", "affine-opt-copy-slow-space", "unsigned",
+    Option<"clSlowSpace", "affine-opt-copy-slow-space", "unsigned", 
             /*default=*/"0",
             "slow memory space to use for affine data copy">,
     Option<"clSeparate", "affine-opt-tile-separate", "bool", /*default=*/"false",
@@ -40,14 +40,14 @@ def AIRAutomaticTiling: Pass<"air-automatic-tiling", "func::FuncOp"> {
     " factorization";
   let constructor = "xilinx::air::createAIRAutomaticTilingPass()";
   let description = [{
-    This pass performs multi-dimensional tiling of loop nests. If the tile
-    sizes are specified in the command line, all loops in loops nests will be
-    tiled along with the input factors. If no input tiling sizes are received,
-    the pass tiles all loops in loop bands with prime factors of the original
-    loop tripcounts. This pass assumes that loops are in normalized form and
+    This pass performs multi-dimensional tiling of loop nests. If the tile 
+    sizes are specified in the command line, all loops in loops nests will be 
+    tiled along with the input factors. If no input tiling sizes are received, 
+    the pass tiles all loops in loop bands with prime factors of the original 
+    loop tripcounts. This pass assumes that loops are in normalized form and 
     the loop spaces are hyper-rectangular.
 
-    Example 1: Manual tiling
+    Example 1: Manual tiling 
 
     `-air-automatic-tiling="loop-tile-sizes=64,2,2" -affine-simplify-structures -cse`
 
@@ -192,20 +192,20 @@ def AIRHerdPlacementPass : Pass<"air-place-herds", "ModuleOp"> {
   ];
 
   let description = [{
-    This pass performs placement of air herds onto a segment with a
+    This pass performs placement of air herds onto a segment with a 
     specific number of rows and columns. Assumes segment
-    size (provided with an anchor point) will fit on physical board
-    dimensions. The placement starts at the bottom left of the segment
-    and tries to place the largest herd as it moves to the right side of
-    the row. If it can't place the largest herd remaining in a given tile,
-    it will try again with smaller and smaller herds.
+    size (provided with an anchor point) will fit on physical board 
+    dimensions. The placement starts at the bottom left of the segment 
+    and tries to place the largest herd as it moves to the right side of 
+    the row. If it can't place the largest herd remaining in a given tile, 
+    it will try again with smaller and smaller herds. 
 
     Example with grid size set to 8 rows and 10 columns:
 
     `-air-place-herds"num-rows=8 num-cols=10 row-anchor=0 col-anchor=0"`
 
-  Input:
-    ```mlir
+  Input: 
+    ```mlir 
     #map0 = affine_map<()[s0] -> (s0 * 64)>
     #map1 = affine_map<()[s0] -> (s0 * 512)>
     #map2 = affine_map<()[s0] -> (s0 * 32)>
@@ -292,12 +292,12 @@ def AIRresolveTensorOpOperandConflictsWithNewTensors : Pass<"air-resolve-tensor-
   let summary = "Resolve tensor OpOperands leading to explicit reuse of a buffer for both reading and writing data";
   let constructor = "xilinx::air::createAIRresolveTensorOpOperandConflictsWithNewTensors()";
   let description = [{
-    This pass resolves tensor OpOperands which use the same Value for both reads
-    and writes, leading to explicit reuse of a buffer for both reading and
-    writing data. This buffer reuse could lead to L2 data movement deadlock
+    This pass resolves tensor OpOperands which use the same Value for both reads 
+    and writes, leading to explicit reuse of a buffer for both reading and 
+    writing data. This buffer reuse could lead to L2 data movement deadlock 
     arising from shared use of an L2 buffer by multiple dataflows.
 
-    This pass calls the bufferization::AnalysisState for buffer read-write
+    This pass calls the bufferization::AnalysisState for buffer read-write 
     analysis. It also calls bufferization::allocateTensorForShapedValue to
     allocate new buffers.
   }];
@@ -377,12 +377,12 @@ def AIRRegularizeLoop: Pass<"air-regularize-loop", "func::FuncOp"> {
   let constructor = "xilinx::air::createAIRRegularizeLoopPass()";
   let description = [{
     This pass regularizes loop nests by moving intermediate operations between
-    subloops in a loop nest inside the innermost loop body. The pass is
-    essentiallythe inverse of the affine loop invariant code motion pass. For
-    each opeation that makes the loop nest non-perfect, the pass will check
-    recursively if the content of the operation is independent of the induction
-    variable of the inner loop. And if it is independent, the operation will be
-    moved inside the inner loop body until the induction variable of the inner
+    subloops in a loop nest inside the innermost loop body. The pass is 
+    essentiallythe inverse of the affine loop invariant code motion pass. For 
+    each opeation that makes the loop nest non-perfect, the pass will check 
+    recursively if the content of the operation is independent of the induction 
+    variable of the inner loop. And if it is independent, the operation will be 
+    moved inside the inner loop body until the induction variable of the inner 
     loop is dependent on the operation or there are no loops at the same level.
 
     Example: Regularize a loop nest with `-air-regularize-loop`
@@ -463,16 +463,16 @@ def AIRLoopPermutation: Pass<"air-loop-permutation", "func::FuncOp"> {
   let summary = "Change the loop ordering according to the input mapping";
   let constructor = "xilinx::air::createAIRLoopPermutationPass()";
   let description = [{
-    This pass performs a loop nest reordering according to the input mapping.
-    The i-th loop will be moved from position i -> permMap[i] where the counting
+    This pass performs a loop nest reordering according to the input mapping. 
+    The i-th loop will be moved from position i -> permMap[i] where the counting 
     of i starts at the outermost loop. The pass transforms only
-    perfect loop nests. The specified ordering starts from 0, and should be of
-    the same length as the loop nest size. Each number is required to appear once in
+    perfect loop nests. The specified ordering starts from 0, and should be of 
+    the same length as the loop nest size. Each number is required to appear once in 
     the input mapping.
 
     Example: Permute a loop nest with `-air-loop-permutation="loop-order=4,3,2,1,0"`
 
-    Input:
+    Input: 
 
     ```mlir
     #map0 = affine_map<(d0, d1, d2) -> (d0 + d1 * 7 + d2 * 14)>
@@ -543,7 +543,7 @@ def AIRLoopPermutation: Pass<"air-loop-permutation", "func::FuncOp"> {
                "llvm::cl::OneOrMore">,
     Option<"clLabel", "air-label", "std::string", /*default=*/"",
            "Transform loops with the given label">,
-    Option<"clPostLabel", "air-post-label", "std::string",
+    Option<"clPostLabel", "air-post-label", "std::string", 
             /*default=*/"",
             "Label to apply to transformed loop nest">
   ];
@@ -553,10 +553,10 @@ def AIRLoopMergingPass: Pass<"air-loop-merging", "func::FuncOp"> {
   let summary = "Merge several nested subloops into a single loop";
   let constructor = "xilinx::air::createAIRLoopMergingPass()";
   let description = [{
-    This pass transforms several perfectly nested subloops into a single
+    This pass transforms several perfectly nested subloops into a single 
     loop. The trip count of the new single loop is the product of all
-    trip counts in subloops. The original loop induction variables are
-    restored using floordiv and modulo operations. Users can specify which
+    trip counts in subloops. The original loop induction variables are 
+    restored using floordiv and modulo operations. Users can specify which 
     loop levels they want to merge together.
 
     Example: Merge subloops with `-air-loop-merging="loop-merge-levels=1,2,3" -affine-simplify-structures -cse`
@@ -629,7 +629,7 @@ def AIRDependency : Pass<"air-dependency", "ModuleOp"> {
   let constructor = "xilinx::air::createAIRDependencyPass()";
   let description = [{
     This pass analyzes dependencies among air.async_region ops, and constructs
-    the dependency relationship between asynchronous events for scheduling.
+    the dependency relationship between asynchronous events for scheduling. 
     The pass also generates a dot file which visualizes the dependency graph.
 
     Example 1: Simple data depdendency tracing
@@ -873,8 +873,8 @@ def AIRBroadcastDetection: Pass<"air-broadcast-detection", "ModuleOp"> {
   let description = [{
     This pass detects DMA broadcast opportunities by tracing the source indices'
     dependence to the induction variables of any parent spatial loop space. Upon
-    successful detection, the DMA shall be annotated by an affine set attribute
-    named 'broadcast_pattern'.
+    successful detection, the DMA shall be annotated by an affine set attribute 
+    named 'broadcast_pattern'. 
   }];
 }
 
@@ -883,7 +883,7 @@ def AIRPruneLinalgGenericInputDma: Pass<"air-prune-linalg-generic-input-dma", "M
   let constructor = "xilinx::air::createAIRPruneLinalgGenericInputDma()";
   let description = [{
     This pass detects and prunes redundant DMA which copies into linalg generic
-    input operands.
+    input operands. 
   }];
 }
 
@@ -891,9 +891,9 @@ def AIRAnnotateFrontAndBackOpsInForPattern: Pass<"air-annotate-front-and-back-op
   let summary = "Annotates ops in for loop body which are at the front and back of the body's dependency graph";
   let constructor = "xilinx::air::createAIRAnnotateFrontAndBackOpsInForPattern()";
   let description = [{
-    This pass analyzes the loop body of an asynchronous for loop and annotates the
+    This pass analyzes the loop body of an asynchronous for loop and annotates the 
     asynchronous operations which are located at the front and back of the loop
-    body's dependency tree. This pass is used in the ping-pong pattern transformation
+    body's dependency tree. This pass is used in the ping-pong pattern transformation 
     to detect the insertion and exit points in data producer and consumer sub-trees.
   }];
 }
@@ -902,9 +902,9 @@ def AIRHoistMemallocInForPattern: Pass<"air-hoist-alloc-in-for-pattern", "Module
   let summary = "Hoist pairs of alloc and dealloc ops out of for loop";
   let constructor = "xilinx::air::createAIRHoistMemallocInForPattern()";
   let description = [{
-    This pass hoists pairs of `alloc` and `dealloc` ops out of a for loop body, to
+    This pass hoists pairs of `alloc` and `dealloc` ops out of a for loop body, to 
     represent the static allocation of memories. This pass is used in the ping-pong
-    pattern transformation to identify and isolate the statically allocated ping and
+    pattern transformation to identify and isolate the statically allocated ping and 
     pong buffers.
   }];
   let options = [
@@ -927,11 +927,11 @@ def AIRConstructPingPongDependencyPattern: Pass<"air-construct-ping-pong-depende
   let summary = "Transform an scf.for loop into ping-pong pattern";
   let constructor = "xilinx::air::createAIRConstructPingPongDependencyPattern()";
   let description = [{
-    This pass transform an `scf.for` loop into ping-pong pattern, by constructing
-    dependency edges to connect explicitly unrolled and annotated data producer and
+    This pass transform an `scf.for` loop into ping-pong pattern, by constructing 
+    dependency edges to connect explicitly unrolled and annotated data producer and 
     consumer processes for ping and pong buffers, respectively. The dependency edges,
-    being yielded across loop iterations, directly represent a compute scheduling
-    scheme which leads to concurrency between communication and compute in the form of
+    being yielded across loop iterations, directly represent a compute scheduling 
+    scheme which leads to concurrency between communication and compute in the form of 
     ping-pong buffering.
   }];
 }
@@ -941,7 +941,7 @@ def AIRHoistOpsNotUsingPingPongPattern: Pass<"air-hoist-ops-not-using-ping-pong"
   let constructor = "xilinx::air::createAIRHoistOpsNotUsingPingPongPattern()";
   let description = [{
     This pass isolates an `scf.for` loop in preparation for ping-pong transformation,
-    by identifying child operations which are not direct consumers or producers of the
+    by identifying child operations which are not direct consumers or producers of the 
     memref targetted for ping-pong buffering, and hoisting said operations out of the
     scf.for loop.
   }];
@@ -951,8 +951,8 @@ def AIRPingPongTransformationPattern: Pass<"air-ping-pong-transform", "ModuleOp"
   let summary = "Lower to pipelining pattern";
   let constructor = "xilinx::air::createAIRPingPongTransformationPattern()";
   let description = [{
-    This pass lowers to pipelining pattern. This pass looks for the target ping and
-    pong buffers, and a surrounding scf.for loop, to construct explicit dependency
+    This pass lowers to pipelining pattern. This pass looks for the target ping and 
+    pong buffers, and a surrounding scf.for loop, to construct explicit dependency 
     edges which represent a ping-pong buffering scheduling.
   }];
   let options = [
@@ -974,11 +974,7 @@ def AIRLabelScfForLoopForPingPongPattern: Pass<"air-label-scf-for-to-ping-pong",
   }];
   let options = [
     Option<"clOmitMemorySpace", "omit-memory-space", "std::string", /*default=*/"\"\"",
-            "Omit ping-pong labeling for the specified memory space. Supported values: '', 'L1', 'L2'. Empty string means label all loops (default).">,
-    Option<"clPartialMemorySpace", "partial-memory-space", "std::string", /*default=*/"\"\"",
-            "Only label a subset of ping-pong allocs in the specified memory space. Supported values: '', 'L1', 'L2'.">,
-    Option<"clPartialBuffer", "partial-buffer", "std::string", /*default=*/"\"\"",
-            "When partial-memory-space is set, select ranked memrefs by GEMM operand shape: 'a' selects shape[0] < shape[1], 'b' selects shape[0] > shape[1]. Empty means all matching allocs.">
+            "Omit ping-pong labeling for the specified memory space. Supported values: '', 'L1', 'L2'. Empty string means label all loops (default).">
   ];
 }
 
@@ -1016,7 +1012,7 @@ def AIRUnrollChannelByFactorPattern: Pass<"air-unroll-channel-by-factor", "Modul
     available bandwidth for this data movement.
   }];
   let options = [
-    Option<"clChanName", "channel-name", "std::string",
+    Option<"clChanName", "channel-name", "std::string", 
             /*default=*/"\"\"",
             "Target channel to unroll.">,
     Option<"clUnrollDim", "unroll-dim", "int", /*default=*/"0",
@@ -1030,10 +1026,10 @@ def AIRFuseChannels: Pass<"air-fuse-channels", "ModuleOp"> {
   let summary = "Fuse multiple air.channel ops into one";
   let constructor = "xilinx::air::createAIRFuseChannels()";
   let description = [{
-    This pass fuses multiple air.channel ops into one. The condition for fusing channels
-    is such that the puts and gets of all candidate channels mush share the same control
-    loop hierarchy, where every parent loops must have matching loop bounds. The
-    'aggressive-mode' option, when enabled, will attempt to use as few air.channels as
+    This pass fuses multiple air.channel ops into one. The condition for fusing channels 
+    is such that the puts and gets of all candidate channels mush share the same control 
+    loop hierarchy, where every parent loops must have matching loop bounds. The 
+    'aggressive-mode' option, when enabled, will attempt to use as few air.channels as 
     possible by time-multiplexing air.channel.puts and air.channel.gets to share the same
     air.channel symbol.
   }];
@@ -1048,7 +1044,7 @@ def AIRIsolateAsyncDmaLoopNests: Pass<"air-isolate-async-dma-loop-nests", "Modul
   let summary = "Hoist dma ops into perfectly nested loop";
   let constructor = "xilinx::air::createAIRIsolateAsyncDmaLoopNests()";
   let description = [{
-    This pass isolates loops containing dma memcpy ops into perfectly nested loops, by
+    This pass isolates loops containing dma memcpy ops into perfectly nested loops, by 
     hoisting them out of their previous parent loop.
   }];
   let options = [
@@ -1115,13 +1111,13 @@ def AIRLoopFusion: Pass<"air-loop-fusion", "func::FuncOp"> {
   let summary = "Hoist dma ops into perfectly nested loop";
   let constructor = "xilinx::air::createAIRLoopFusion()";
   let description = [{
-    Optimizes the data movement around L2 memories by rearranging and potentially
-    fusing perfect `scf.for` loop nests of `air.channel.put` and `air.channel.get`,
-    which access the same L2 memref, into `scf.for` loop nest patterns mappable to a
+    Optimizes the data movement around L2 memories by rearranging and potentially 
+    fusing perfect `scf.for` loop nests of `air.channel.put` and `air.channel.get`, 
+    which access the same L2 memref, into `scf.for` loop nest patterns mappable to a 
     complex finite-state machine consisting of a multiple of AIE DMA Block Descriptors.
   }];
   let options = [
-    Option<"clFusionScope", "fusion-scope", "std::string",
+    Option<"clFusionScope", "fusion-scope", "std::string", 
             /*default=*/"\"segment\"",
             "AIR hierarchy scope to perform loop fusion under. Must be one of [all, segment, launch].">
   ];
@@ -1228,7 +1224,7 @@ def AIRDependencyCanonicalize: Pass<"air-dependency-canonicalize", "ModuleOp"> {
   let options = [
     Option<"clDumpGraph", "dump-graph", "bool", /*default=*/"false",
             "Dump post-canonicalization dot graphs.">,
-    Option<"clDumpDir", "output-dir", "std::string",
+    Option<"clDumpDir", "output-dir", "std::string", 
             /*default=*/"\"\"",
             "Target directory to dump dot graphs.">
   ];
@@ -1242,7 +1238,7 @@ def AIRDependencyParseGraph: Pass<"air-dependency-parse-graph", "ModuleOp"> {
     dot files for graph visualization.
   }];
   let options = [
-    Option<"clDumpDir", "output-dir", "std::string",
+    Option<"clDumpDir", "output-dir", "std::string", 
             /*default=*/"\"\"",
             "Target directory to dump dot graphs.">,
     Option<"clShowCores", "show-cores", "bool", /*default=*/"false",
@@ -1289,7 +1285,7 @@ def AIRPipelineReducePass : Pass<"air-pipeline-reduce", "func::FuncOp"> {
                "llvm::cl::ZeroOrMore">,
     Option<"clPipelineDepth", "pipeline-depth", "int", /*default=*/"4",
            "Pipeline depth to generate">,
-    Option<"clPipelineDirection", "pipeline-direction", "std::string",
+    Option<"clPipelineDirection", "pipeline-direction", "std::string", 
             /*default=*/"\"horiz\"",
             "Pipeline direction attribute to use. Can be 'vert' or 'horiz'">,
     Option<"clPromoteSubViews", "promote", "bool", /*default=*/"false",
@@ -1331,9 +1327,9 @@ def AIRFuseNestedHerdPass : Pass<"air-fuse-nested-herd", "func::FuncOp"> {
            "The order of tile sizes, must be one of outer-inner (default) or inner-outer.">
   ];
   let description = [{
-    Fuse a perfectly nested pair of air.herd loops into a single air.herd,
-    preserving iteration space and semantics. The new herd's 2D tile shape is
-    formed from the chosen ordering of the outer and inner herd dimensions
+    Fuse a perfectly nested pair of air.herd loops into a single air.herd, 
+    preserving iteration space and semantics. The new herd's 2D tile shape is 
+    formed from the chosen ordering of the outer and inner herd dimensions 
     (e.g., outer x inner -> 2x4, or inner x outer -> 4x2).
   }];
 }
@@ -1471,7 +1467,7 @@ def AIRSplitL2MemrefForBufferConstraintPass : Pass<"air-split-l2-memref", "func:
         %22 = air.channel.put async [%arg8]  @channel_12[%c1, %c0_7] (%arg5[%2, %arg7] [%c32, %c256] [%c1024, %c1]) {id = 2 : i32} : (memref<512x1024xi32>)
         %23 = air.channel.put async [%arg8]  @channel_12[%c2, %c0_7] (%arg5[%3, %arg7] [%c32, %c256] [%c1024, %c1]) {id = 3 : i32} : (memref<512x1024xi32>)
         %24 = air.channel.put async [%arg8]  @channel_12[%c3, %c0_7] (%arg5[%4, %arg7] [%c32, %c256] [%c1024, %c1]) {id = 4 : i32} : (memref<512x1024xi32>)
-        %25 = air.wait_all async [%21, %22, %23, %24]
+        %25 = air.wait_all async [%21, %22, %23, %24] 
         scf.yield %25 : !air.async.token
       }
       ...
@@ -1499,7 +1495,7 @@ def AIRSplitL2MemrefForBufferConstraintPass : Pass<"air-split-l2-memref", "func:
           %69 = air.channel.get async [%arg8]  @channel_12[%c1_19, %c0_22] (%results_56[%c0_43, %arg7] [%c32_18, %c256_24] [%c1024_44, %c1_45]) {id = 14 : i32} : (memref<32x1024xi32, 1>)
           %70 = air.channel.get async [%arg8]  @channel_12[%c2_17, %c0_22] (%results_58[%c0_36, %arg7] [%c32_18, %c256_24] [%c1024_37, %c1_38]) {id = 15 : i32} : (memref<32x1024xi32, 1>)
           %71 = air.channel.get async [%arg8]  @channel_12[%c3_16, %c0_22] (%results_60[%c0_29, %arg7] [%c32_18, %c256_24] [%c1024_30, %c1_31]) {id = 16 : i32} : (memref<32x1024xi32, 1>)
-          %72 = air.wait_all async [%68, %69, %70, %71]
+          %72 = air.wait_all async [%68, %69, %70, %71] 
           scf.yield %72 : !air.async.token
         }
         ...
@@ -1511,7 +1507,7 @@ def AIRSplitL2MemrefForBufferConstraintPass : Pass<"air-split-l2-memref", "func:
           %68 = air.channel.put async [%async_token_177]  @channel_0[] (%results_54[%c0_22, %c0_46, %results_178] [%c4_21, %c32_18, %c8] [%c8_47, %c1024_48, %c1_49]) {id = 21 : i32} : (memref<32x1024xi32, 1>)
           scf.yield %68 : !air.async.token
         }
-        %32 = air.wait_all async [%async_token_55]
+        %32 = air.wait_all async [%async_token_55] 
         %33 = scf.for %arg7 = %c0_22 to %c128_20 step %c4_21 iter_args(%arg8 = %32) -> (!air.async.token) {
           %async_token_177, %results_178 = air.execute [%arg8] -> (index) {
             %69 = affine.apply affine_map<()[s0] -> (s0 * 8)>()[%arg7]
@@ -1520,7 +1516,7 @@ def AIRSplitL2MemrefForBufferConstraintPass : Pass<"air-split-l2-memref", "func:
           %68 = air.channel.put async [%async_token_177]  @channel_1[] (%results_56[%c0_22, %c0_39, %results_178] [%c4_21, %c32_18, %c8] [%c8_40, %c1024_41, %c1_42]) {id = 22 : i32} : (memref<32x1024xi32, 1>)
           scf.yield %68 : !air.async.token
         }
-        %34 = air.wait_all async [%async_token_57]
+        %34 = air.wait_all async [%async_token_57] 
         %35 = scf.for %arg7 = %c0_22 to %c128_20 step %c4_21 iter_args(%arg8 = %34) -> (!air.async.token) {
           %async_token_177, %results_178 = air.execute [%arg8] -> (index) {
             %69 = affine.apply affine_map<()[s0] -> (s0 * 8)>()[%arg7]
@@ -1529,7 +1525,7 @@ def AIRSplitL2MemrefForBufferConstraintPass : Pass<"air-split-l2-memref", "func:
           %68 = air.channel.put async [%async_token_177]  @channel_2[] (%results_58[%c0_22, %c0_32, %results_178] [%c4_21, %c32_18, %c8] [%c8_33, %c1024_34, %c1_35]) {id = 23 : i32} : (memref<32x1024xi32, 1>)
           scf.yield %68 : !air.async.token
         }
-        %36 = air.wait_all async [%async_token_59]
+        %36 = air.wait_all async [%async_token_59] 
         %37 = scf.for %arg7 = %c0_22 to %c128_20 step %c4_21 iter_args(%arg8 = %36) -> (!air.async.token) {
           %async_token_177, %results_178 = air.execute [%arg8] -> (index) {
             %69 = affine.apply affine_map<()[s0] -> (s0 * 8)>()[%arg7]
@@ -1555,8 +1551,8 @@ def DmaToChannel : Pass<"air-dma-to-channel", "ModuleOp"> {
   let summary = "Convert air.dma_memcpy_nd to air.channel";
   let constructor = "xilinx::air::createDmaToChannelPass()";
   let description =  [{
-    Transforms direct memory access (DMA) operations into channel-based
-    communications, consisting of a series of channel put and get operations
+    Transforms direct memory access (DMA) operations into channel-based 
+    communications, consisting of a series of channel put and get operations 
     via shared channel constructs.
 
     Example:
@@ -1691,30 +1687,30 @@ def AIRMergeUnrolledDevices : Pass<"air-merge-unrolled-devices", "ModuleOp"> {
     This pass merges multiple aie.device operations that were created from
     segment unrolling back into a single aie.device. The tiles from each
     source device are offset horizontally based on their unroll index.
-
+    
     The pass identifies related devices using the naming convention
     `{segment_name}_{unroll_x}_{unroll_y}` and the `segment_unroll_x/y`
     attributes, then:
-
+    
     1. Computes the bounding box width of each source device based on device type
     2. Creates a merged device with the computed full device type
     3. Clones all ops, offsetting tile columns by (unroll_x * width)
     4. Merges the airrt.segment_metadata entries
     5. Removes the original unrolled device ops
-
+    
     Example:
-
+    
     Input:
     ```mlir
     aie.device(npu2_4col) @segment_with_unroll_0_0 { ... tile(0,2) ... }
     aie.device(npu2_4col) @segment_with_unroll_1_0 { ... tile(0,2) ... }
     ```
-
+    
     Output:
     ```mlir
     aie.device(npu2) @segment_with_unroll {
       // From segment_with_unroll_0_0 (no offset)
-      %tile_0_2 = aie.tile(0, 2)
+      %tile_0_2 = aie.tile(0, 2)  
       // From segment_with_unroll_1_0 (offset by 4 columns)
       %tile_4_2 = aie.tile(4, 2)
       ...

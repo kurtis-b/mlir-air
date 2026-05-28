@@ -1967,10 +1967,6 @@ struct LowerScfTokenPattern : public OpRewritePattern<scf::ForOp> {
     if (fop->hasAttr("unroll")) {
       new_fop->setAttr("unroll", fop->getAttr("unroll"));
     }
-    if (fop->hasAttr("atb_two_buffer_pipeline"))
-      new_fop->setAttr("atb_two_buffer_pipeline",
-                       fop->getAttr("atb_two_buffer_pipeline"));
-
     // use the new for op's results
     int idx = 0;
     unsigned tokenResultIdx = 0;
@@ -5140,55 +5136,6 @@ public:
     return lastAccessOp;
   }
 
-  bool isAtbActiveABuffer(Value buffer) {
-    auto memrefType = dyn_cast_if_present<MemRefType>(buffer.getType());
-    if (!memrefType || air::getMemorySpace(memrefType) != air::MemorySpace::L1)
-      return false;
-    if (memrefType.getRank() != 4)
-      return false;
-    ArrayRef<int64_t> shape = memrefType.getShape();
-    return shape[0] == 18 && shape[1] == 6 && shape[2] == 8 &&
-           shape[3] == 8;
-  }
-
-  /// The ATB active-M software pipeline prefetches A in one branch of a marked
-  /// loop and consumes it in a later sibling branch. The generic lifetime scan
-  /// only sees following ops in the memcpy block, so it releases the inbound
-  /// free lock before compute. Scan the marked loop body instead and place the
-  /// release after the matching buffer use.
-  Operation *findLastReadOrWriteInAtbPipelineLoop(Operation *memcpyOp,
-                                                  Value destBuffer) {
-    if (!isAtbActiveABuffer(destBuffer))
-      return nullptr;
-
-    auto loop = memcpyOp->getParentOfType<scf::ForOp>();
-    while (loop && !loop->hasAttr("atb_two_buffer_pipeline"))
-      loop = loop->getParentOfType<scf::ForOp>();
-    if (!loop)
-      return nullptr;
-
-    bool seenMemcpy = false;
-    Operation *lastAccessOp = nullptr;
-    SetVector<Value> bufferViews;
-    bufferViews.insert(destBuffer);
-
-    loop.getBody()->walk([&](Operation *op) {
-      if (auto view = dyn_cast_if_present<ViewLikeOpInterface>(op)) {
-        if (llvm::is_contained(bufferViews, view.getViewSource()))
-          bufferViews.insert(view->getResult(0));
-      }
-
-      if (op == memcpyOp) {
-        seenMemcpy = true;
-        return;
-      }
-
-      if (seenMemcpy && isReadOrWriteToBuffer(op, bufferViews))
-        lastAccessOp = op;
-    });
-    return lastAccessOp;
-  }
-
   LogicalResult allocateCoreLocksPerMemcpyOp(
       OpBuilder builder, air::MemcpyInterface memcpyOpIf,
       llvm::SetVector<Operation *> &allocs_to_remap,
@@ -5293,15 +5240,7 @@ public:
       AIE::UseLockOp::create(builder, nextWriter->getLoc(), relLockOp,
                              AIE::LockAction::Release, lockRelValue);
     } else if (tileInbound.value()) {
-      if (auto lastAccessOp =
-              findLastReadOrWriteInAtbPipelineLoop(memcpyOpIf, alloc)) {
-        // The matching compute use is inside the marked pipeline loop, not in
-        // the same branch/block as the channel get.
-        builder.setInsertionPointAfter(lastAccessOp);
-        AIE::UseLockOp::create(builder, lastAccessOp->getLoc(), relLockOp,
-                               AIE::LockAction::Release, lockRelValue);
-      } else if (auto lastAccessOp =
-                     findLastReadOrWriteOp(memcpyOpIf, alloc)) {
+      if (auto lastAccessOp = findLastReadOrWriteOp(memcpyOpIf, alloc)) {
         // Lifetime ends after the last read/write access to buffer.
         builder.setInsertionPointAfter(lastAccessOp);
         AIE::UseLockOp::create(builder, lastAccessOp->getLoc(), relLockOp,

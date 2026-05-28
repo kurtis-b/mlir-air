@@ -7,13 +7,12 @@
 
 // Test that air-dma-to-channel auto-detects when packet switching is needed
 // for multi-herd designs. Two 1x1 herds with 2 inputs each = 4 input channels.
-// Per-column shim DMA limit = 2. Since 4 > 2, three input channels are
-// upgraded to dma_packet, leaving one stream slot and one packet slot.
-// Output channels (2 total) do not exceed the per-column limit.
+// Per-column shim DMA limit = 2. Since 4 > 2, input channels are upgraded to
+// dma_packet. Output channels (2 total) do not exceed the per-column limit.
 
 // RUN: air-opt %s -air-dma-to-channel | FileCheck %s
 
-// CHECK-COUNT-3: air.channel {{.*}} {channel_type = "npu_dma_packet"}
+// CHECK-COUNT-4: air.channel {{.*}} {channel_type = "npu_dma_packet"}
 // CHECK-NOT: channel_type = "npu_dma_packet"
 
 module {

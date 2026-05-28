@@ -2,27 +2,11 @@
 # SPDX-License-Identifier: MIT
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
-# AIE_TARGET can be set to 'aie2' (default) or 'aie2p' to select the target architecture.
-AIE_TARGET ?= aie2
-
 # Tile sizes
-ifeq ($(AIE_TARGET),aie2p)
-  TILE_M ?= 64
-  TILE_K_L2 ?= 256
-  TILE_K_L1 ?= 64
-  TILE_N ?= 128
-else
-  TILE_M ?= 128
-  TILE_K_L2 ?= 64
-  TILE_K_L1 ?= 32
-  TILE_N ?= 64
-endif
-
-ifeq ($(AIE_TARGET),aie2p)
-  PROFILE_TILE_K_L2 ?= 512
-else
-  PROFILE_TILE_K_L2 ?= $(TILE_K_L2)
-endif
+TILE_M ?= 128
+TILE_K_L2 ?= 64
+TILE_K_L1 ?= 32
+TILE_N ?= 64
 
 # Recommended tile configuration for run3x3 (576x576x576): TILE_M=64 TILE_K_L2=288 TILE_K_L1=48
 
@@ -40,11 +24,7 @@ ifdef PEANO_INSTALL_DIR
 OUTPUT_FORMAT ?= xclbin
 OUTPUT_FORMAT_FLAG = --output-format $(OUTPUT_FORMAT)
   # DIRECT_CODEGEN_FLAG can be overridden from command line (e.g., make DIRECT_CODEGEN_FLAG= run4x4)
-  ifeq ($(AIE_TARGET),aie2p)
-    DIRECT_CODEGEN_FLAG ?=
-  else
-    DIRECT_CODEGEN_FLAG ?= --direct-codegen
-  endif
+  DIRECT_CODEGEN_FLAG ?= --direct-codegen
 else
   BUILD_DIR := build_chess
   DIRECT_CODEGEN_FLAG ?=
@@ -55,6 +35,7 @@ WARNING_FLAGS = -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty
 PEANOWRAP2_FLAGS = -O2 -std=c++20 --target=aie2-none-unknown-elf ${WARNING_FLAGS} -DNDEBUG -I ${AIEOPT_DIR}/include
 PEANOWRAP2P_FLAGS = -O2 -std=c++20 --target=aie2p-none-unknown-elf ${WARNING_FLAGS} -DNDEBUG -I ${AIEOPT_DIR}/include
 
+# AIE_TARGET can be set to 'aie2' (default) or 'aie2p' to select the target architecture.
 # COMPILE_MODE can be set to 'compile-and-run' (default), 'compile-and-xclbin', or 'compile-only'.
 # Usage examples:
 #   make run4x4                                              # aie2, compile-and-run (default)
@@ -62,6 +43,7 @@ PEANOWRAP2P_FLAGS = -O2 -std=c++20 --target=aie2p-none-unknown-elf ${WARNING_FLA
 #   make run4x4 COMPILE_MODE=compile-and-xclbin              # aie2, generate xclbin (requires XRT)
 #   make run4x4 COMPILE_MODE=compile-only                    # aie2, no xclbin (no XRT needed)
 #   make run4x4 AIE_TARGET=aie2p COMPILE_MODE=compile-only   # aie2p, no xclbin (no XRT needed)
+AIE_TARGET ?= aie2
 COMPILE_MODE ?= compile-and-run
 
 # Select compiler flags based on AIE_TARGET
@@ -121,10 +103,10 @@ compile-kernel-1x1:
 
 run3x3: compile-kernel
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} python3 ${srcdir}/run.py --herd-m 3 --herd-n 3 --m 1152 --n 1152 --k 1152 --tile-m $(TILE_M) --tile-k-l2 $(TILE_K_L2) --tile-k-l1 $(TILE_K_L1) --tile-n $(TILE_N) --compile-mode $(COMPILE_MODE) --arch $(AIE_TARGET) $(DIRECT_CODEGEN_FLAG)
-
+	
 profile: compile-kernel build-test-exe
-	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && python ${srcdir}/run.py --m 1024 --k 1024 --n 1024 \
-		--tile-m $(TILE_M) --tile-k-l2 $(PROFILE_TILE_K_L2) --tile-k-l1 $(TILE_K_L1) --tile-n $(TILE_N) --herd-m $(MAX_HERD_M) --herd-n $(MAX_HERD_N) --compile-mode compile-and-xclbin --arch $(AIE_TARGET) $(DIRECT_CODEGEN_FLAG)
+	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && python ../run.py --m 1024 --k 1024 --n 1024 \
+		--tile-m $(TILE_M) --tile-k-l2 $(TILE_K_L2) --tile-k-l1 $(TILE_K_L1) --tile-n $(TILE_N) --herd-m $(MAX_HERD_M) --herd-n $(MAX_HERD_N) --compile-mode compile-and-xclbin --arch $(AIE_TARGET) $(DIRECT_CODEGEN_FLAG)
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ./test.exe -x air.xclbin -k MLIR_AIE -i air.insts.bin -M 1024 -K 1024 -N 1024
 
 # Measure the e2e latencies across a range of problem shapes.

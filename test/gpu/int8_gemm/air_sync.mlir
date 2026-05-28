@@ -8,6 +8,7 @@
 #map = affine_map<()[s0] -> (s0 * 128)>
 module {
   llvm.func @mgpuInitI8I32(!llvm.ptr, !llvm.ptr, i64, i64, i64)
+  llvm.func @mgpuPackBI8I32(!llvm.ptr, !llvm.ptr, i64, i64)
   llvm.func @mgpuCheckOutputI8I32(!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, i64, i64, i64) -> i32
   llvm.func @mgpuBenchmarkReset()
   llvm.func @mgpuBenchmarkSetKernelProfiling(i32)
@@ -33,22 +34,27 @@ module {
     %c256_i64 = arith.constant 256 : i64
     %alloc = memref.alloc() : memref<1024x1024xi8>
     %alloc_0 = memref.alloc() : memref<1024x1024xi8>
+    %alloc_b_packed = memref.alloc() : memref<1024x1024xi8>
     %alloc_1 = memref.alloc() : memref<1024x1024xi32>
     %intptr = memref.extract_aligned_pointer_as_index %alloc : memref<1024x1024xi8> -> index
     %intptr_0 = memref.extract_aligned_pointer_as_index %alloc_0 : memref<1024x1024xi8> -> index
+    %intptr_b_packed = memref.extract_aligned_pointer_as_index %alloc_b_packed : memref<1024x1024xi8> -> index
     %m64 = arith.index_cast %c1024 : index to i64
     %n64 = arith.index_cast %c1024 : index to i64
     %k64 = arith.index_cast %c1024 : index to i64
     %a_ptr_i64 = arith.index_cast %intptr : index to i64
     %b_ptr_i64 = arith.index_cast %intptr_0 : index to i64
+    %b_packed_ptr_i64 = arith.index_cast %intptr_b_packed : index to i64
     %a_ptr = llvm.inttoptr %a_ptr_i64 : i64 to !llvm.ptr
     %b_ptr = llvm.inttoptr %b_ptr_i64 : i64 to !llvm.ptr
+    %b_packed_ptr = llvm.inttoptr %b_packed_ptr_i64 : i64 to !llvm.ptr
     llvm.call @mgpuInitI8I32(%a_ptr, %b_ptr, %m64, %n64, %k64) : (!llvm.ptr, !llvm.ptr, i64, i64, i64) -> ()
+    llvm.call @mgpuPackBI8I32(%b_ptr, %b_packed_ptr, %n64, %k64) : (!llvm.ptr, !llvm.ptr, i64, i64) -> ()
 
     %memref = gpu.alloc () : memref<1024x1024xi8>
     gpu.memcpy %memref, %alloc : memref<1024x1024xi8>, memref<1024x1024xi8>
     %memref_2 = gpu.alloc () : memref<1024x1024xi8>
-    gpu.memcpy %memref_2, %alloc_0 : memref<1024x1024xi8>, memref<1024x1024xi8>
+    gpu.memcpy %memref_2, %alloc_b_packed : memref<1024x1024xi8>, memref<1024x1024xi8>
     %memref_3 = gpu.alloc () : memref<1024x1024xi32>
 
     scf.for %warmup = %c0 to %c10 step %c1 {
@@ -77,6 +83,7 @@ module {
     gpu.dealloc %memref_3 : memref<1024x1024xi32>
     memref.dealloc %alloc : memref<1024x1024xi8>
     memref.dealloc %alloc_0 : memref<1024x1024xi8>
+    memref.dealloc %alloc_b_packed : memref<1024x1024xi8>
     memref.dealloc %alloc_1 : memref<1024x1024xi32>
     return
   }

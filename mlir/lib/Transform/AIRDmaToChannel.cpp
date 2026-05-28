@@ -1675,8 +1675,7 @@ struct DmaToChannelPass : public air::impl::DmaToChannelBase<DmaToChannelPass> {
       // Broadcast channels can spread across their column span (first
       // dimension of broadcast_shape); non-broadcast channels all compete
       // for the same column. Broadcast channels are grouped by column span
-      // since channels with different spans distribute independently. Any
-      // packetized channels in one direction consume one physical packet slot.
+      // since channels with different spans distribute independently.
       auto computePerColumnPressure =
           [](const SmallVector<air::ChannelOp> &channels,
              int64_t preExistingPackets) -> int64_t {
@@ -1706,8 +1705,7 @@ struct DmaToChannelPass : public air::impl::DmaToChannelBase<DmaToChannelPass> {
         for (auto &[span, count] : broadcastCountBySpan)
           broadcastPressure += (count + span - 1) / span;
 
-        int64_t packetPressure = preExistingPackets > 0 ? 1 : 0;
-        return numNonBroadcast + broadcastPressure + packetPressure;
+        return numNonBroadcast + broadcastPressure + preExistingPackets;
       };
 
       int64_t shimChannelsPerCol = clShimDmaChannelsPerCol;
@@ -1717,37 +1715,15 @@ struct DmaToChannelPass : public air::impl::DmaToChannelBase<DmaToChannelPass> {
           computePerColumnPressure(outputChannels, preExistingOutputPackets);
 
       auto upgradeToPacket = [&](SmallVector<air::ChannelOp> &channels,
-                                 StringRef direction, int64_t pressure,
-                                 int64_t preExistingPackets) {
-        SmallVector<air::ChannelOp> selectedChannels;
-        bool hasBroadcast = llvm::any_of(
-            channels, [](air::ChannelOp chanOp) { return chanOp.isBroadcast(); });
-
-        if (hasBroadcast) {
-          // Broadcast groups contribute fractional column pressure. Keep them
-          // conservative until packet-flow placement can split groups exactly.
-          selectedChannels.append(channels.begin(), channels.end());
-        } else {
-          (void)preExistingPackets;
-          int64_t keepStreaming =
-              std::max<int64_t>(0, shimChannelsPerCol - 1);
-          int64_t upgradeCount = std::max<int64_t>(
-              0, static_cast<int64_t>(channels.size()) - keepStreaming);
-          upgradeCount = std::min<int64_t>(
-              upgradeCount, static_cast<int64_t>(channels.size()));
-          for (int64_t i = 0; i < upgradeCount; ++i)
-            selectedChannels.push_back(channels[i]);
-        }
-
-        if (selectedChannels.empty())
-          return;
-        seg->emitWarning() << "auto-upgrading " << selectedChannels.size()
-                           << " of " << channels.size() << " " << direction
+                                 StringRef direction, int64_t pressure) {
+        seg->emitWarning() << "auto-upgrading " << channels.size() << " "
+                           << direction
                            << " channels to dma_packet (per-column pressure "
                            << pressure << " exceeds shim DMA limit of "
                            << shimChannelsPerCol << ")";
-        for (auto chanOp : selectedChannels)
+        for (auto chanOp : channels) {
           chanOp.setChannelType(StringAttr::get(context, "npu_dma_packet"));
+        }
       };
 
       // Force mode: upgrade all shim-bound channels unconditionally.
@@ -1764,11 +1740,9 @@ struct DmaToChannelPass : public air::impl::DmaToChannelBase<DmaToChannelPass> {
       }
 
       if (inputPressure > shimChannelsPerCol)
-        upgradeToPacket(inputChannels, "input", inputPressure,
-                        preExistingInputPackets);
+        upgradeToPacket(inputChannels, "input", inputPressure);
       if (outputPressure > shimChannelsPerCol)
-        upgradeToPacket(outputChannels, "output", outputPressure,
-                        preExistingOutputPackets);
+        upgradeToPacket(outputChannels, "output", outputPressure);
     });
   }
 

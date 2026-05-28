@@ -17,7 +17,6 @@
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -554,10 +553,8 @@ private:
 struct HoistMemallocInForPattern : public OpRewritePattern<memref::AllocOp> {
   using OpRewritePattern<memref::AllocOp>::OpRewritePattern;
 
-  HoistMemallocInForPattern(MLIRContext *ctx, bool keepMemrefDealloc,
-                            std::string hoistAttrName = "hoist_alloc")
-      : OpRewritePattern(ctx), keepMemrefDealloc(keepMemrefDealloc),
-        hoistAttrName(hoistAttrName) {}
+  HoistMemallocInForPattern(MLIRContext *ctx, bool keepMemrefDealloc)
+      : OpRewritePattern(ctx), keepMemrefDealloc(keepMemrefDealloc) {}
 
   LogicalResult matchAndRewrite(memref::AllocOp alloc_op,
                                 PatternRewriter &rewriter) const override {
@@ -578,8 +575,8 @@ struct HoistMemallocInForPattern : public OpRewritePattern<memref::AllocOp> {
     }
 
     // Check if alloc is the target
-    if (!alloc_op->hasAttr(hoistAttrName) &&
-        !alloc_exec->hasAttr(hoistAttrName))
+    if (!alloc_op->hasAttr("hoist_alloc") &&
+        !alloc_exec->hasAttr("hoist_alloc"))
       return failure();
 
     // Get parent for loop
@@ -615,14 +612,13 @@ struct HoistMemallocInForPattern : public OpRewritePattern<memref::AllocOp> {
       dealloc_exec->moveAfter(for_op);
 
     // Erase alloc hoisting attr
-    alloc_op->removeAttr(hoistAttrName);
+    alloc_op->removeAttr("hoist_alloc");
 
     return success();
   }
 
 private:
   bool keepMemrefDealloc;
-  std::string hoistAttrName;
 
   void skipOverOpInDependencyGraph(OpBuilder &builder, Operation *op,
                                    mlir::Region &region) const {
@@ -1510,388 +1506,6 @@ private:
   }
 };
 
-struct ConstructAtbActiveMTwoBufferPipelinePattern
-    : public OpRewritePattern<scf::ForOp> {
-  using OpRewritePattern<scf::ForOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(scf::ForOp for_op,
-                                PatternRewriter &rewriter) const override {
-    if (for_op->hasAttr("atb_two_buffer_pipeline"))
-      return failure();
-    auto lb = getConstantIntValue(for_op.getLowerBound());
-    auto ub = getConstantIntValue(for_op.getUpperBound());
-    auto step = getConstantIntValue(for_op.getStep());
-    if (!lb || !ub || !step || *lb != 0 || *ub != 18 || *step != 6)
-      return failure();
-    if (for_op.getInitArgs().size() != 1 ||
-        !isa<air::AsyncTokenType>(for_op.getInitArgs()[0].getType()))
-      return failure();
-
-    air::ExecuteOp allocExec;
-    Value activeMemref;
-    for (auto exec : for_op.getOps<air::ExecuteOp>()) {
-      if (exec.getNumResults() != 2)
-        continue;
-      Value memrefResult = exec.getResult(1);
-      if (!isAtbActiveABuffer(memrefResult.getType()))
-        continue;
-      bool hasAlloc = false;
-      exec.walk([&](memref::AllocOp alloc) {
-        if (isAtbActiveABuffer(alloc.getType()))
-          hasAlloc = true;
-      });
-      if (!hasAlloc)
-        continue;
-      if (allocExec)
-        return failure();
-      allocExec = exec;
-      activeMemref = memrefResult;
-    }
-    if (!allocExec)
-      return failure();
-
-    air::ExecuteOp computeExec;
-    air::ExecuteOp deallocExec;
-    for (auto exec : for_op.getOps<air::ExecuteOp>()) {
-      if (exec == allocExec)
-        continue;
-      if (executeContainsCallUsing(exec, activeMemref)) {
-        if (computeExec)
-          return failure();
-        computeExec = exec;
-      }
-      if (executeContainsDeallocOf(exec, activeMemref)) {
-        if (deallocExec)
-          return failure();
-        deallocExec = exec;
-      }
-    }
-    if (!computeExec || !deallocExec)
-      return failure();
-
-    Operation *producerRoot =
-        getProducerRootForCompute(for_op, computeExec, allocExec);
-    if (!producerRoot)
-      return failure();
-    Value producerToken = getTokenResult(producerRoot);
-    Value computeToken = getTokenResult(computeExec.getOperation());
-    if (!producerToken || !computeToken)
-      return failure();
-
-    OpBuilder::InsertionGuard guard(rewriter);
-    Location loc = for_op.getLoc();
-    Value upstreamToken = for_op.getInitArgs()[0];
-
-    rewriter.setInsertionPoint(for_op);
-    IRMapping pingAllocMap;
-    Operation *pingAllocOp =
-        rewriter.clone(*allocExec.getOperation(), pingAllocMap);
-    auto pingAllocExec = cast<air::ExecuteOp>(pingAllocOp);
-    setAsyncDeps(pingAllocOp, ValueRange{upstreamToken});
-    Value pingBuffer = pingAllocExec.getResult(1);
-
-    IRMapping pongAllocMap;
-    Operation *pongAllocOp =
-        rewriter.clone(*allocExec.getOperation(), pongAllocMap);
-    auto pongAllocExec = cast<air::ExecuteOp>(pongAllocOp);
-    setAsyncDeps(pongAllocOp, ValueRange{upstreamToken});
-    Value pongBuffer = pongAllocExec.getResult(1);
-
-    Value pipelineUpper = arith::ConstantIndexOp::create(rewriter, loc, 24);
-    Value computePingCutover =
-        arith::ConstantIndexOp::create(rewriter, loc, 12);
-
-    SmallVector<Value, 4> loopInitArgs{
-        upstreamToken, pingAllocExec.getAsyncToken(),
-        pongAllocExec.getAsyncToken(), upstreamToken};
-    scf::ForOp newLoop = scf::ForOp::create(
-        rewriter, loc, for_op.getLowerBound(), pipelineUpper,
-        for_op.getStep(), loopInitArgs);
-    for (auto attr : for_op->getAttrs())
-      newLoop->setAttr(attr.getName(), attr.getValue());
-    newLoop->setAttr("atb_two_buffer_pipeline", rewriter.getBoolAttr(true));
-
-    BlockArgument lastPrefetchToken = newLoop.getRegionIterArgs()[0];
-    BlockArgument pingFreeToken = newLoop.getRegionIterArgs()[1];
-    BlockArgument pongFreeToken = newLoop.getRegionIterArgs()[2];
-    BlockArgument lastComputeToken = newLoop.getRegionIterArgs()[3];
-
-    rewriter.setInsertionPointToStart(newLoop.getBody());
-    Value hasPrefetch = arith::CmpIOp::create(
-        rewriter, loc, arith::CmpIPredicate::slt, newLoop.getInductionVar(),
-        for_op.getUpperBound());
-    Value hasCompute = arith::CmpIOp::create(
-        rewriter, loc, arith::CmpIPredicate::ne, newLoop.getInductionVar(),
-        for_op.getLowerBound());
-    Value prefetchPing =
-        arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ne,
-                              newLoop.getInductionVar(), for_op.getStep());
-    Value computePing =
-        arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ne,
-                              newLoop.getInductionVar(), computePingCutover);
-    Value computeIv =
-        arith::SubIOp::create(rewriter, loc, newLoop.getInductionVar(),
-                              for_op.getStep());
-
-    auto prefetchIf = scf::IfOp::create(
-        rewriter, loc,
-        TypeRange{air::AsyncTokenType::get(rewriter.getContext())},
-        hasPrefetch,
-        /*withElseRegion=*/true);
-    {
-      OpBuilder::InsertionGuard prefetchGuard(rewriter);
-      rewriter.setInsertionPointToStart(prefetchIf.thenBlock());
-      auto targetIf = scf::IfOp::create(
-          rewriter, loc,
-          TypeRange{air::AsyncTokenType::get(rewriter.getContext())},
-          prefetchPing,
-          /*withElseRegion=*/true);
-      {
-        OpBuilder::InsertionGuard targetGuard(rewriter);
-        rewriter.setInsertionPointToStart(targetIf.thenBlock());
-        IRMapping producerMap;
-        mapLoopValuesForClone(producerMap, for_op, newLoop.getInductionVar(),
-                              lastPrefetchToken, pingFreeToken, activeMemref,
-                              pingBuffer, allocExec);
-        Operation *producer = rewriter.clone(*producerRoot, producerMap);
-        scf::YieldOp::create(rewriter, loc, getTokenResult(producer));
-      }
-      {
-        OpBuilder::InsertionGuard targetGuard(rewriter);
-        rewriter.setInsertionPointToStart(targetIf.elseBlock());
-        IRMapping producerMap;
-        mapLoopValuesForClone(producerMap, for_op, newLoop.getInductionVar(),
-                              lastPrefetchToken, pongFreeToken, activeMemref,
-                              pongBuffer, allocExec);
-        Operation *producer = rewriter.clone(*producerRoot, producerMap);
-        scf::YieldOp::create(rewriter, loc, getTokenResult(producer));
-      }
-      scf::YieldOp::create(rewriter, loc, targetIf.getResult(0));
-    }
-    {
-      OpBuilder::InsertionGuard prefetchGuard(rewriter);
-      rewriter.setInsertionPointToStart(prefetchIf.elseBlock());
-      scf::YieldOp::create(rewriter, loc, lastPrefetchToken);
-    }
-
-    auto computeIf = scf::IfOp::create(
-        rewriter, loc,
-        TypeRange{air::AsyncTokenType::get(rewriter.getContext()),
-                  air::AsyncTokenType::get(rewriter.getContext()),
-                  air::AsyncTokenType::get(rewriter.getContext())},
-        hasCompute,
-        /*withElseRegion=*/true);
-    {
-      OpBuilder::InsertionGuard computeGuard(rewriter);
-      rewriter.setInsertionPointToStart(computeIf.thenBlock());
-      auto targetIf = scf::IfOp::create(
-          rewriter, loc,
-          TypeRange{air::AsyncTokenType::get(rewriter.getContext()),
-                    air::AsyncTokenType::get(rewriter.getContext()),
-                    air::AsyncTokenType::get(rewriter.getContext())},
-          computePing,
-          /*withElseRegion=*/true);
-      {
-        OpBuilder::InsertionGuard targetGuard(rewriter);
-        rewriter.setInsertionPointToStart(targetIf.thenBlock());
-        IRMapping computeMap;
-        computeMap.map(for_op.getInductionVar(), computeIv);
-        for (BlockArgument oldArg : for_op.getRegionIterArgs())
-          if (isa<air::AsyncTokenType>(oldArg.getType()))
-            computeMap.map(oldArg, lastPrefetchToken);
-        computeMap.map(activeMemref, pingBuffer);
-        computeMap.map(allocExec.getAsyncToken(), pingFreeToken);
-        mapTokenResults(producerRoot, lastPrefetchToken, computeMap);
-        cloneLoopLocalDefsForCompute(rewriter, computeExec, for_op,
-                                     computeMap);
-        Operation *newCompute =
-            rewriter.clone(*computeExec.getOperation(), computeMap);
-        setAsyncDeps(newCompute,
-                     ValueRange{lastPrefetchToken, lastComputeToken});
-        Value newComputeToken = getTokenResult(newCompute);
-        scf::YieldOp::create(rewriter, loc,
-                             ValueRange{newComputeToken, pongFreeToken,
-                                        newComputeToken});
-      }
-      {
-        OpBuilder::InsertionGuard targetGuard(rewriter);
-        rewriter.setInsertionPointToStart(targetIf.elseBlock());
-        IRMapping computeMap;
-        computeMap.map(for_op.getInductionVar(), computeIv);
-        for (BlockArgument oldArg : for_op.getRegionIterArgs())
-          if (isa<air::AsyncTokenType>(oldArg.getType()))
-            computeMap.map(oldArg, lastPrefetchToken);
-        computeMap.map(activeMemref, pongBuffer);
-        computeMap.map(allocExec.getAsyncToken(), pongFreeToken);
-        mapTokenResults(producerRoot, lastPrefetchToken, computeMap);
-        cloneLoopLocalDefsForCompute(rewriter, computeExec, for_op,
-                                     computeMap);
-        Operation *newCompute =
-            rewriter.clone(*computeExec.getOperation(), computeMap);
-        setAsyncDeps(newCompute,
-                     ValueRange{lastPrefetchToken, lastComputeToken});
-        Value newComputeToken = getTokenResult(newCompute);
-        scf::YieldOp::create(rewriter, loc,
-                             ValueRange{pingFreeToken, newComputeToken,
-                                        newComputeToken});
-      }
-      scf::YieldOp::create(rewriter, loc,
-                           ValueRange{targetIf.getResult(0),
-                                      targetIf.getResult(1),
-                                      targetIf.getResult(2)});
-    }
-    {
-      OpBuilder::InsertionGuard computeGuard(rewriter);
-      rewriter.setInsertionPointToStart(computeIf.elseBlock());
-      scf::YieldOp::create(rewriter, loc,
-                           ValueRange{pingFreeToken, pongFreeToken,
-                                      lastComputeToken});
-    }
-
-    if (!newLoop.getBody()->empty())
-      if (auto yield = dyn_cast<scf::YieldOp>(&newLoop.getBody()->back()))
-        rewriter.eraseOp(yield);
-    rewriter.setInsertionPointToEnd(newLoop.getBody());
-    scf::YieldOp::create(rewriter, loc,
-                         ValueRange{prefetchIf.getResult(0),
-                                    computeIf.getResult(0),
-                                    computeIf.getResult(1),
-                                    computeIf.getResult(2)});
-
-    Value finalDone = newLoop.getResult(3);
-    rewriter.setInsertionPointAfter(newLoop);
-    Operation *pingDealloc =
-        cloneDeallocForBuffer(rewriter, deallocExec, activeMemref, pingBuffer,
-                              computeToken, finalDone);
-    rewriter.setInsertionPointAfter(pingDealloc);
-    cloneDeallocForBuffer(rewriter, deallocExec, activeMemref, pongBuffer,
-                          computeToken, finalDone);
-
-    for_op.getResult(0).replaceAllUsesWith(finalDone);
-    rewriter.eraseOp(for_op);
-    return success();
-  }
-
-private:
-  bool isAtbActiveABuffer(Type type) const {
-    auto memrefType = dyn_cast<MemRefType>(type);
-    if (!memrefType || memrefType.getRank() != 4)
-      return false;
-    ArrayRef<int64_t> shape = memrefType.getShape();
-    return shape[0] == 18 && shape[1] == 6 && shape[2] == 8 && shape[3] == 8;
-  }
-
-  bool executeContainsCallUsing(air::ExecuteOp exec, Value value) const {
-    bool found = false;
-    exec.walk([&](func::CallOp call) {
-      if (llvm::is_contained(call->getOperands(), value))
-        found = true;
-    });
-    return found;
-  }
-
-  bool executeContainsDeallocOf(air::ExecuteOp exec, Value value) const {
-    bool found = false;
-    exec.walk([&](memref::DeallocOp dealloc) {
-      if (dealloc.getMemref() == value)
-        found = true;
-    });
-    return found;
-  }
-
-  Value getTokenResult(Operation *op) const {
-    if (!op)
-      return nullptr;
-    if (auto async = dyn_cast<air::AsyncOpInterface>(op))
-      if (async.getAsyncToken())
-        return async.getAsyncToken();
-    for (Value result : op->getResults())
-      if (isa<air::AsyncTokenType>(result.getType()))
-        return result;
-    return nullptr;
-  }
-
-  void setAsyncDeps(Operation *op, ValueRange deps) const {
-    auto async = dyn_cast<air::AsyncOpInterface>(op);
-    if (!async)
-      return;
-    clearAsyncDependenciesOfAsyncOp(async);
-    for (Value dep : deps)
-      addAsyncDependencyIfNew(op, dep);
-  }
-
-  Operation *getProducerRootForCompute(scf::ForOp forOp,
-                                       air::ExecuteOp computeExec,
-                                       air::ExecuteOp allocExec) const {
-    for (Value dep : computeExec.getAsyncDependencies()) {
-      Operation *def = dep.getDefiningOp();
-      if (!def || def == allocExec.getOperation())
-        continue;
-      Operation *root = def;
-      while (root && root->getParentOp() != forOp.getOperation())
-        root = root->getParentOp();
-      if (root && root != computeExec.getOperation() &&
-          root != allocExec.getOperation())
-        return root;
-    }
-    return nullptr;
-  }
-
-  void mapTokenResults(Operation *op, Value replacement,
-                       IRMapping &mapping) const {
-    for (Value result : op->getResults())
-      if (isa<air::AsyncTokenType>(result.getType()))
-        mapping.map(result, replacement);
-  }
-
-  void cloneLoopLocalDefsForCompute(PatternRewriter &rewriter,
-                                    air::ExecuteOp computeExec,
-                                    scf::ForOp oldLoop,
-                                    IRMapping &mapping) const {
-    for (auto call : computeExec.getOps<func::CallOp>())
-      for (Value operand : call->getOperands())
-        cloneLoopLocalDef(rewriter, operand, oldLoop, mapping);
-  }
-
-  void cloneLoopLocalDef(PatternRewriter &rewriter, Value value,
-                         scf::ForOp oldLoop, IRMapping &mapping) const {
-    if (mapping.contains(value))
-      return;
-    Operation *def = value.getDefiningOp();
-    if (!def || !oldLoop->isProperAncestor(def))
-      return;
-    for (Value operand : def->getOperands())
-      cloneLoopLocalDef(rewriter, operand, oldLoop, mapping);
-    rewriter.clone(*def, mapping);
-  }
-
-  void mapLoopValuesForClone(IRMapping &mapping, scf::ForOp oldLoop,
-                             Value mappedIv, Value mappedLoopToken,
-                             Value mappedAllocToken, Value oldBuffer,
-                             Value mappedBuffer,
-                             air::ExecuteOp allocExec) const {
-    mapping.map(oldLoop.getInductionVar(), mappedIv);
-    for (BlockArgument iterArg : oldLoop.getRegionIterArgs())
-      if (isa<air::AsyncTokenType>(iterArg.getType()))
-        mapping.map(iterArg, mappedLoopToken);
-    mapping.map(allocExec.getAsyncToken(), mappedAllocToken);
-    mapping.map(oldBuffer, mappedBuffer);
-  }
-
-  Operation *cloneDeallocForBuffer(PatternRewriter &rewriter,
-                                   air::ExecuteOp deallocExec, Value oldBuffer,
-                                   Value newBuffer, Value oldComputeToken,
-                                   Value finalDone) const {
-    IRMapping deallocMap;
-    deallocMap.map(oldBuffer, newBuffer);
-    deallocMap.map(oldComputeToken, finalDone);
-    Operation *newDealloc =
-        rewriter.clone(*deallocExec.getOperation(), deallocMap);
-    setAsyncDeps(newDealloc, ValueRange{finalDone});
-    return newDealloc;
-  }
-};
-
 struct HoistOpsNotUsingPingPongPattern : public OpRewritePattern<scf::ForOp> {
   using OpRewritePattern<scf::ForOp>::OpRewritePattern;
 
@@ -1964,11 +1578,8 @@ struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
   using OpRewritePattern<scf::ForOp>::OpRewritePattern;
 
   LabelScfForLoopForPingPongPattern(MLIRContext *ctx,
-                                    std::string omitMemorySpace,
-                                    std::string partialMemorySpace,
-                                    std::string partialBuffer)
-      : OpRewritePattern(ctx), omitMemorySpace(omitMemorySpace),
-        partialMemorySpace(partialMemorySpace), partialBuffer(partialBuffer) {}
+                                    std::string omitMemorySpace)
+      : OpRewritePattern(ctx), omitMemorySpace(omitMemorySpace) {}
 
   LogicalResult matchAndRewrite(scf::ForOp for_op,
                                 PatternRewriter &rewriter) const override {
@@ -1987,14 +1598,18 @@ struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
     if (alloc_ops.empty())
       return failure();
 
-    SmallVector<Operation *> ping_pong_alloc_ops = alloc_ops;
-    SmallVector<Operation *> single_buffer_alloc_ops;
-
-    // Check if we should skip this loop based on memory space.
+    // Check if we should skip this loop based on memory space
     if (!omitMemorySpace.empty()) {
       bool shouldSkip = false;
       for (auto op : alloc_ops) {
-        if (matchesMemorySpace(op, omitMemorySpace)) {
+        auto alloc_op = dyn_cast_if_present<memref::AllocOp>(op);
+        if (!alloc_op)
+          continue;
+        auto memref_type = llvm::cast<MemRefType>(alloc_op.getType());
+
+        // Check if this alloc's memory space matches the omit criteria
+        if ((omitMemorySpace == "L1" && air::isL1(memref_type)) ||
+            (omitMemorySpace == "L2" && air::isL2(memref_type))) {
           shouldSkip = true;
           break;
         }
@@ -2003,71 +1618,19 @@ struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
         return failure();
     }
 
-    // Partial ping-pong keeps one operand stream single-buffered. This is
-    // useful when full A/B double buffering exceeds a core-memory budget, but
-    // one stream can still be overlapped with compute.
-    if (!partialMemorySpace.empty()) {
-      ping_pong_alloc_ops.clear();
-      for (auto op : alloc_ops) {
-        if (!matchesMemorySpace(op, partialMemorySpace))
-          continue;
-        if (matchesPartialBuffer(op))
-          ping_pong_alloc_ops.push_back(op);
-        else
-          single_buffer_alloc_ops.push_back(op);
-      }
-      if (ping_pong_alloc_ops.empty())
-        return failure();
-    }
-
-    // Label the scf.for loop and selected child memref.allocs.
+    // Label the scf.for loop and all its child memref.allocs
     int unroll_factor = 2; // Unroll factor hardened as 2. TODO: add support for
                            // an arbitrary factor.
     for_op->setAttr("unroll", rewriter.getI32IntegerAttr(unroll_factor));
-    for (auto op : ping_pong_alloc_ops) {
+    for (auto op : alloc_ops) {
       op->setAttr("hoist_alloc", rewriter.getBoolAttr(true));
-    }
-    for (auto op : single_buffer_alloc_ops) {
-      op->setAttr("hoist_alloc_single_buffer", rewriter.getBoolAttr(true));
     }
 
     return success();
   }
 
 private:
-  bool matchesMemorySpace(Operation *op, const std::string &memorySpace) const {
-    if (memorySpace.empty())
-      return true;
-    auto alloc_op = dyn_cast_if_present<memref::AllocOp>(op);
-    if (!alloc_op)
-      return false;
-    auto memref_type = llvm::cast<MemRefType>(alloc_op.getType());
-    return (memorySpace == "L1" && air::isL1(memref_type)) ||
-           (memorySpace == "L2" && air::isL2(memref_type));
-  }
-
-  bool matchesPartialBuffer(Operation *op) const {
-    if (partialBuffer.empty())
-      return true;
-    auto alloc_op = dyn_cast_if_present<memref::AllocOp>(op);
-    if (!alloc_op)
-      return false;
-    auto memref_type = llvm::cast<MemRefType>(alloc_op.getType());
-    if (memref_type.getRank() < 2)
-      return false;
-    auto shape = memref_type.getShape();
-    if (shape[0] < 0 || shape[1] < 0)
-      return false;
-    if (partialBuffer == "a")
-      return shape[0] < shape[1];
-    if (partialBuffer == "b")
-      return shape[0] > shape[1];
-    return false;
-  }
-
   std::string omitMemorySpace;
-  std::string partialMemorySpace;
-  std::string partialBuffer;
 };
 
 struct LabelScfForLoopInAIRSegment : public OpRewritePattern<scf::ForOp> {
@@ -3753,13 +3316,6 @@ public:
       const AIRPingPongTransformationPatternOptions &options)
       : AIRPingPongTransformationPatternBase(options) {}
 
-  void runAtbActiveMTwoBufferPipelinePatterns(func::FuncOp funcOp) {
-    MLIRContext *ctx = funcOp.getContext();
-    RewritePatternSet patterns(&getContext());
-    patterns.insert<ConstructAtbActiveMTwoBufferPipelinePattern>(ctx);
-    (void)applyPatternsGreedily(funcOp, std::move(patterns));
-  }
-
   void runIsolateScfForOpForPingPong(func::FuncOp funcOp) {
     MLIRContext *ctx = funcOp.getContext();
     RewritePatternSet patterns(&getContext());
@@ -3779,14 +3335,6 @@ public:
     MLIRContext *ctx = funcOp.getContext();
     RewritePatternSet patterns(&getContext());
     patterns.insert<HoistMemallocInForPattern>(ctx, clKeepMemrefDealloc);
-    (void)applyPatternsGreedily(funcOp, std::move(patterns));
-  }
-
-  void runHoistPartialSingleBufferMemallocPatterns(func::FuncOp funcOp) {
-    MLIRContext *ctx = funcOp.getContext();
-    RewritePatternSet patterns(&getContext());
-    patterns.insert<HoistMemallocInForPattern>(ctx, clKeepMemrefDealloc,
-                                               "hoist_alloc_single_buffer");
     (void)applyPatternsGreedily(funcOp, std::move(patterns));
   }
 
@@ -3816,7 +3364,6 @@ public:
       // Check if loop is the target
       op->removeAttr("unroll");
       op->removeAttr("hoist_alloc");
-      op->removeAttr("hoist_alloc_single_buffer");
       op->removeAttr("unrolled_iteration");
       op->removeAttr("isolated");
       op->removeAttr("ping_pong");
@@ -3832,18 +3379,10 @@ public:
     SmallVector<func::FuncOp, 4> funcOps;
     module.walk([&](func::FuncOp op) { funcOps.push_back(op); });
     for (auto f : funcOps)
-      runAtbActiveMTwoBufferPipelinePatterns(f);
-    LLVM_DEBUG(llvm::dbgs() << "After ATB active-M pipeline:\n"
-                            << module << "\n");
-    for (auto f : funcOps)
       runIsolateScfForOpForPingPong(f);
     for (auto f : funcOps)
       runOpAnnotationPatterns(f);
     LLVM_DEBUG(llvm::dbgs() << "After annotation:\n" << module << "\n");
-    for (auto f : funcOps)
-      runHoistPartialSingleBufferMemallocPatterns(f);
-    LLVM_DEBUG(llvm::dbgs() << "After single-buffer hoist:\n"
-                            << module << "\n");
     for (auto f : funcOps)
       runLoopUnroll(f);
     LLVM_DEBUG(llvm::dbgs() << "After unroll:\n" << module << "\n");
@@ -3872,8 +3411,8 @@ public:
   void runOptPatterns(func::FuncOp funcOp) {
     MLIRContext *ctx = funcOp.getContext();
     RewritePatternSet patterns(&getContext());
-    patterns.insert<LabelScfForLoopForPingPongPattern>(
-        ctx, clOmitMemorySpace, clPartialMemorySpace, clPartialBuffer);
+    // Use the clOmitMemorySpace option from the pass
+    patterns.insert<LabelScfForLoopForPingPongPattern>(ctx, clOmitMemorySpace);
     (void)applyPatternsGreedily(funcOp, std::move(patterns));
   }
 
@@ -5615,17 +5154,6 @@ struct ShrinkMemrefSizesByAccessPattern
     if (boundsAreAllOnes)
       return failure(); // Memref access pattern analysis failed
     if (shrinkMemref) {
-      for (auto user : users) {
-        auto chanOp = dyn_cast_if_present<air::ChannelInterface>(user);
-        if (!chanOp)
-          continue;
-        if (hasLoopVariantAccessToShrunkMemrefSlice(
-                chanOp, memref_shape, overall_access_bounds)) {
-          alloc->setAttr("air.shrinkage", rewriter.getBoolAttr(false));
-          return failure();
-        }
-      }
-
       // Shrink access patterns to memref.
       for (auto user : users) {
         auto chanOp = dyn_cast_if_present<air::ChannelInterface>(user);
@@ -5729,43 +5257,6 @@ private:
     if (std::find(vec.begin(), vec.end(), entry) == vec.end()) {
       vec.push_back(entry);
     }
-  }
-
-  bool valueDependsOnLoopInductionVar(
-      Value value, llvm::SmallPtrSetImpl<Value> &seen) const {
-    if (!seen.insert(value).second)
-      return false;
-    if (auto blockArg = dyn_cast<BlockArgument>(value)) {
-      Operation *owner = blockArg.getOwner()->getParentOp();
-      if (auto forOp = dyn_cast_if_present<scf::ForOp>(owner))
-        return forOp.getInductionVar() == blockArg;
-      if (auto forOp = dyn_cast_if_present<affine::AffineForOp>(owner))
-        return forOp.getInductionVar() == blockArg;
-      return false;
-    }
-    Operation *def = value.getDefiningOp();
-    if (!def)
-      return false;
-    for (Value operand : def->getOperands())
-      if (valueDependsOnLoopInductionVar(operand, seen))
-        return true;
-    return false;
-  }
-
-  bool hasLoopVariantAccessToShrunkMemrefSlice(
-      air::ChannelInterface chanOp, SmallVector<int> memrefShape,
-      SmallVector<int64_t> overallAccessBounds) const {
-    SmallVector<Value> offsets = chanOp.getOffsets();
-    if (offsets.size() != memrefShape.size())
-      return false;
-    for (unsigned i = 0; i < offsets.size(); i++) {
-      if (overallAccessBounds[i] >= memrefShape[i])
-        continue;
-      llvm::SmallPtrSet<Value, 8> seen;
-      if (valueDependsOnLoopInductionVar(offsets[i], seen))
-        return true;
-    }
-    return false;
   }
 
   LogicalResult getAllChanUsers(Value memref, SmallVector<Operation *> &users,

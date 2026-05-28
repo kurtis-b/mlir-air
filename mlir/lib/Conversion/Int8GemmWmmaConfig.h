@@ -20,86 +20,8 @@ static constexpr const char kInt8GemmVariantAttr[] =
 static constexpr const char kInt8GemmGroupAttr[] =
     "air.gpu.int8_gemm_group_m";
 
-static constexpr const char kInt8GemmDefaultVariant[] = "lds_128x64_wmma4";
-static constexpr const char kInt8GemmBPackVariant[] = "lds_128x64_bpack";
-static constexpr const char kInt8GemmBPackSwizzleVariant[] =
-    "lds_128x64_bpack_swizzle";
-static constexpr const char kInt8GemmBPackPipe2Variant[] =
-    "lds_128x64_bpack_pipe2";
-static constexpr const char kInt8GemmBPackPipe2GroupedVariant[] =
-    "lds_128x64_bpack_pipe2_grouped";
-static constexpr const char kInt8GemmBPackSwizzleGroupedVariant[] =
-    "lds_128x64_bpack_swizzle_grouped";
-static constexpr const char kInt8GemmBPackFragVariant[] =
-    "lds_128x64_bpack_frag";
-static constexpr const char kInt8GemmBPackSwizzlePipe2_128x128Variant[] =
-    "lds_128x128_bpack_swizzle_pipe2";
-static constexpr const char kInt8GemmBPackSwizzlePipe2LoopedVariant[] =
-    "lds_128x64_bpack_swizzle_pipe2_looped";
-static constexpr const char kInt8GemmBPackSwizzleLooped_128x128Variant[] =
-    "lds_128x128_bpack_swizzle_looped";
-static constexpr const char kInt8GemmBPackSwizzlePipe2Looped_64x128Variant[] =
-    "lds_64x128_bpack_swizzle_pipe2_looped";
-static constexpr const char kInt8GemmBPackSwizzlePipe2LoopedK32Variant[] =
-    "lds_128x64_bpack_swizzle_pipe2_k32_looped";
-static constexpr const char kInt8GemmBPackSwizzlePipe2LoopedK128Variant[] =
-    "lds_128x64_bpack_swizzle_pipe2_k128_looped";
-static constexpr const char kInt8GemmBPackSwizzleLooped_128x128K32Variant[] =
-    "lds_128x128_bpack_swizzle_k32_looped";
-static constexpr const char kInt8GemmBPackSwizzleLooped_128x128K128Variant[] =
-    "lds_128x128_bpack_swizzle_k128_looped";
-static constexpr const char kInt8GemmBPackSwizzleBRegK64LoopedVariant[] =
-    "lds_128x64_bpack_swizzle_breg_k64_looped";
-static constexpr const char kInt8GemmBPackSwizzleK32W4Pipe2_128x64Variant[] =
-    "lds_128x64_bpack_swizzle_k32_w4_pipe2";
-static constexpr const char kInt8GemmBPackSwizzleK32W4Pipe2Pad_128x64Variant[] =
-    "lds_128x64_bpack_swizzle_k32_w4_pipe2_pad";
-static constexpr const char kInt8GemmBPackSwizzleK32W4Pipe2_64x128Variant[] =
-    "lds_64x128_bpack_swizzle_k32_w4_pipe2";
-static constexpr const char kInt8GemmBPackSwizzleK32W4Pipe2Pad_64x128Variant[] =
-    "lds_64x128_bpack_swizzle_k32_w4_pipe2_pad";
-static constexpr const char kInt8GemmBPackSwizzleK32W4Pipe2Variant[] =
-    "lds_128x128_bpack_swizzle_k32_w4_pipe2";
-static constexpr const char kInt8GemmBPackSwizzleK32W4Pipe2PadVariant[] =
-    "lds_128x128_bpack_swizzle_k32_w4_pipe2_pad";
-static constexpr const char
-    kInt8GemmBPackSwizzleK32W4Pipe2Short_128x64Variant[] =
-        "lds_128x64_bpack_swizzle_k32_w4_pipe2_short";
-static constexpr const char
-    kInt8GemmBPackSwizzleK32W4Pipe2ShortPad_128x64Variant[] =
-        "lds_128x64_bpack_swizzle_k32_w4_pipe2_short_pad";
-static constexpr const char
-    kInt8GemmBPackSwizzleK32W4Pipe2Short_64x128Variant[] =
-        "lds_64x128_bpack_swizzle_k32_w4_pipe2_short";
-static constexpr const char
-    kInt8GemmBPackSwizzleK32W4Pipe2ShortPad_64x128Variant[] =
-        "lds_64x128_bpack_swizzle_k32_w4_pipe2_short_pad";
-static constexpr const char kInt8GemmBPackSwizzleK32W4Pipe2ShortVariant[] =
-    "lds_128x128_bpack_swizzle_k32_w4_pipe2_short";
-static constexpr const char kInt8GemmBPackSwizzleK32W4Pipe2ShortPadVariant[] =
-    "lds_128x128_bpack_swizzle_k32_w4_pipe2_short_pad";
-static constexpr const char kInt8GemmRocmlirLikePipe3Variant[] =
+static constexpr const char kInt8GemmDefaultVariant[] =
     "lds_128x128_rocmlir_k32_pipe3";
-static constexpr const char kInt8GemmAirTunedDirectVariant[] =
-    "global_128x128_bpack_w4_direct";
-static constexpr const char kInt8GemmAirTunedDirectCanonicalVariant[] =
-    "global_128x128_bpack_w4_direct_canonical";
-static constexpr const char kInt8GemmAirTunedDirectPrefetchVariant[] =
-    "global_128x128_bpack_w4_prefetch";
-static constexpr const char kInt8GemmAirTunedDirectRawPtrVariant[] =
-    "global_128x128_bpack_w4_direct_rawptr";
-static constexpr const char kInt8GemmAirTunedDirectRawPtrU2Variant[] =
-    "global_128x128_bpack_w4_direct_rawptr_u2";
-static constexpr const char kInt8GemmTensileK32Pipe2Variant[] =
-    "lds_128x128_tensile_k32_pipe2";
-static constexpr const char kInt8GemmTensileK32Pipe2PadVariant[] =
-    "lds_128x128_tensile_k32_pipe2_pad";
-static constexpr const char kInt8GemmTensileK32Pipe3Variant[] =
-    "lds_128x128_tensile_k32_pipe3";
-static constexpr const char kInt8GemmTensileK32Pipe3PadVariant[] =
-    "lds_128x128_tensile_k32_pipe3_pad";
-static constexpr const char kInt8GemmTensileK32Pipe3Wpe2Variant[] =
-    "lds_128x128_tensile_k32_pipe3_wpe2";
 
 enum class PipelineKind {
   SingleBufferLoop,
@@ -152,93 +74,10 @@ struct Int8GemmKernelConfig {
 };
 
 static const Int8GemmKernelConfig kInt8GemmKernelConfigs[] = {
-    {kInt8GemmDefaultVariant, 128, 64, 64, 256, 1, false, false, false, false,
-     PipelineKind::SingleBufferLoop, 4},
-    {kInt8GemmBPackVariant, 128, 64, 64, 256, 1, false, true, false, false,
-     PipelineKind::SingleBufferLoop, 4},
-    {kInt8GemmBPackSwizzleVariant, 128, 64, 64, 256, 1, true, true, false,
-     false, PipelineKind::SingleBufferLoop, 4},
-    {kInt8GemmBPackPipe2Variant, 128, 64, 64, 256, 2, false, true, false,
-     false, PipelineKind::Pipe2UnrolledCopy, 4},
-    {kInt8GemmBPackPipe2GroupedVariant, 128, 64, 64, 256, 2, false, true,
-     true, false, PipelineKind::Pipe2UnrolledCopy, 4},
-    {kInt8GemmBPackSwizzleGroupedVariant, 128, 64, 64, 256, 1, true, true,
-     true, false, PipelineKind::SingleBufferLoop, 4},
-    {kInt8GemmBPackFragVariant, 128, 64, 64, 256, 1, false, true, false, true,
-     PipelineKind::SingleBufferLoop, 4},
-    {kInt8GemmBPackSwizzlePipe2_128x128Variant, 128, 128, 64, 256, 2, true,
-     true, false, false, PipelineKind::Pipe2UnrolledPrefetch, 4},
-    {kInt8GemmBPackSwizzlePipe2LoopedVariant, 128, 64, 64, 256, 2, true, true,
-     false, false, PipelineKind::Pipe2LoopedPrefetch, 4},
-    {kInt8GemmBPackSwizzleLooped_128x128Variant, 128, 128, 64, 256, 1, true,
-     true, false, false, PipelineKind::SingleBufferLoop, 4},
-    {kInt8GemmBPackSwizzlePipe2Looped_64x128Variant, 64, 128, 64, 128, 2,
-     true, true, false, false, PipelineKind::Pipe2LoopedPrefetch, 4},
-    {kInt8GemmBPackSwizzlePipe2LoopedK32Variant, 128, 64, 32, 256, 2, true,
-     true, false, false, PipelineKind::Pipe2LoopedPrefetch, 4},
-    {kInt8GemmBPackSwizzlePipe2LoopedK128Variant, 128, 64, 128, 256, 2, true,
-     true, false, false, PipelineKind::Pipe2LoopedPrefetch, 4},
-    {kInt8GemmBPackSwizzleLooped_128x128K32Variant, 128, 128, 32, 256, 1,
-     true, true, false, false, PipelineKind::SingleBufferLoop, 4},
-    {kInt8GemmBPackSwizzleLooped_128x128K128Variant, 128, 128, 128, 256, 1,
-     true, true, false, false, PipelineKind::SingleBufferLoop, 4},
-    {kInt8GemmBPackSwizzleBRegK64LoopedVariant, 128, 64, 64, 256, 2, true,
-     true, false, true, PipelineKind::Pipe2LoopedPrefetch, 4},
-    {kInt8GemmBPackSwizzleK32W4Pipe2_128x64Variant, 128, 64, 32, 128, 2,
-     true, true, true, false, PipelineKind::TensileLikePipe2, 8, 32, 64, 0, 32, 4},
-    {kInt8GemmBPackSwizzleK32W4Pipe2Pad_128x64Variant, 128, 64, 32, 128, 2,
-     true, true, true, false, PipelineKind::TensileLikePipe2, 8, 32, 64, 16, 32, 4},
-    {kInt8GemmBPackSwizzleK32W4Pipe2_64x128Variant, 64, 128, 32, 128, 2,
-     true, true, true, false, PipelineKind::TensileLikePipe2, 8, 32, 64, 0, 32, 4},
-    {kInt8GemmBPackSwizzleK32W4Pipe2Pad_64x128Variant, 64, 128, 32, 128, 2,
-     true, true, true, false, PipelineKind::TensileLikePipe2, 8, 32, 64, 16, 32, 4},
-    {kInt8GemmBPackSwizzleK32W4Pipe2Variant, 128, 128, 32, 128, 2, true,
-     true, true, false, PipelineKind::TensileLikePipe2, 8, 64, 64, 0, 32, 4},
-    {kInt8GemmBPackSwizzleK32W4Pipe2PadVariant, 128, 128, 32, 128, 2, true,
-     true, true, false, PipelineKind::TensileLikePipe2, 8, 64, 64, 16, 32, 4},
-    {kInt8GemmBPackSwizzleK32W4Pipe2Short_128x64Variant, 128, 64, 32, 128, 2,
-     true, true, true, false, PipelineKind::TensileLikePipe2ShortLived, 8, 32,
-     64, 0, 32, 4},
-    {kInt8GemmBPackSwizzleK32W4Pipe2ShortPad_128x64Variant, 128, 64, 32, 128,
-     2, true, true, true, false, PipelineKind::TensileLikePipe2ShortLived, 8,
-     32, 64, 16, 32, 4},
-    {kInt8GemmBPackSwizzleK32W4Pipe2Short_64x128Variant, 64, 128, 32, 128, 2,
-     true, true, true, false, PipelineKind::TensileLikePipe2ShortLived, 8, 32,
-     64, 0, 32, 4},
-    {kInt8GemmBPackSwizzleK32W4Pipe2ShortPad_64x128Variant, 64, 128, 32, 128,
-     2, true, true, true, false, PipelineKind::TensileLikePipe2ShortLived, 8,
-     32, 64, 16, 32, 4},
-    {kInt8GemmBPackSwizzleK32W4Pipe2ShortVariant, 128, 128, 32, 128, 2, true,
-     true, true, false, PipelineKind::TensileLikePipe2ShortLived, 8, 64, 64,
-     0, 32, 4},
-    {kInt8GemmBPackSwizzleK32W4Pipe2ShortPadVariant, 128, 128, 32, 128, 2,
-     true, true, true, false, PipelineKind::TensileLikePipe2ShortLived, 8, 64,
-     64, 16, 32, 4},
-    {kInt8GemmTensileK32Pipe2Variant, 128, 128, 32, 128, 2, true, true, true,
-     false, PipelineKind::TensileLikePipe2, 8, 64, 64, 0, 32, 4},
-    {kInt8GemmTensileK32Pipe2PadVariant, 128, 128, 32, 128, 2, true, true,
-     true, false, PipelineKind::TensileLikePipe2, 8, 64, 64, 16, 32, 4},
-    {kInt8GemmTensileK32Pipe3Variant, 128, 128, 32, 128, 3, true, true,
-     true, false, PipelineKind::TensileLikePipe3, 8, 64, 64, 0, 32, 4},
-    {kInt8GemmTensileK32Pipe3PadVariant, 128, 128, 32, 128, 3, true,
-     true, true, false, PipelineKind::TensileLikePipe3, 8, 64, 64, 16,
-     32, 4},
-    {kInt8GemmTensileK32Pipe3Wpe2Variant, 128, 128, 32, 128, 3, true,
-     true, true, false, PipelineKind::TensileLikePipe3, 8, 64, 64, 0,
-     32, 4, 2},
-    {kInt8GemmRocmlirLikePipe3Variant, 128, 128, 32, 128, 3, false, true,
+    {kInt8GemmDefaultVariant, 128, 128, 32, 128, 3, false, true,
      true, false, PipelineKind::RocmlirLikePipe3, 8, 64, 64, 0, 32, 4},
-    {kInt8GemmAirTunedDirectVariant, 128, 128, 32, 128, 0, false, true, true,
-     true, PipelineKind::AirTunedDirect, 8, 64, 64},
-    {kInt8GemmAirTunedDirectCanonicalVariant, 128, 128, 16, 128, 0, false,
-     true, true, true, PipelineKind::AirTunedDirectCanonical, 8, 64, 64},
-    {kInt8GemmAirTunedDirectPrefetchVariant, 128, 128, 32, 128, 0, false,
-     true, true, true, PipelineKind::AirTunedDirectPrefetch, 8, 64, 64},
-    {kInt8GemmAirTunedDirectRawPtrVariant, 128, 128, 32, 128, 0, false,
-     true, true, true, PipelineKind::AirTunedDirectRawPtr, 8, 64, 64},
-    {kInt8GemmAirTunedDirectRawPtrU2Variant, 128, 128, 16, 128, 0, false,
-     true, true, true, PipelineKind::AirTunedDirectRawPtrU2, 8, 64, 64},
 };
+
 
 inline std::optional<Int8GemmKernelConfig>
 getInt8GemmKernelConfig(llvm::StringRef variant) {
@@ -253,7 +92,7 @@ inline bool isSupportedInt8GemmVariant(llvm::StringRef variant) {
 }
 
 inline bool isSupportedInt8GemmGroupSize(uint32_t groupSize) {
-  return groupSize == 2 || groupSize == 4 || groupSize == 8;
+  return groupSize == 8;
 }
 
 inline bool usesRawPtrKernelAbi(const Int8GemmKernelConfig &config) {

@@ -189,9 +189,8 @@ static cl::opt<bool>
 // matching Python argparse nargs="?" const="all" behavior.
 static cl::opt<std::string> omitPingpong(
     "omit-ping-pong-transform",
-    cl::desc("Omit or specialize ping-pong buffering (values: '', L1, L2, all, "
-             "L1-partial-a, L1-partial-b). Using the flag without a value is "
-             "equivalent to 'all'."),
+    cl::desc("Omit ping-pong buffering (values: '', L1, L2, all). "
+             "Using the flag without a value is equivalent to 'all'."),
     cl::init(""), cl::ValueOptional, cl::cat(airCompilerOptions));
 
 static cl::opt<std::string>
@@ -851,21 +850,15 @@ static std::string buildOptimizationPipeline() {
   }
 
   // Ping-pong transform
-  const std::string ppMode = omitPingpong.getValue();
-  const bool partialL1PingPong =
-      ppMode == "L1-partial-a" || ppMode == "L1-partial-b";
-  if (ppMode.empty() || ppMode == "L1" || ppMode == "L2" || partialL1PingPong) {
+  if (omitPingpong.getValue().empty() || omitPingpong.getValue() == "L1" ||
+      omitPingpong.getValue() == "L2") {
     std::string labelPass = "air-label-scf-for-to-ping-pong";
     std::string ppPass = "air-ping-pong-transform";
-    if (ppMode == "L1" || ppMode == "L2") {
-      labelPass =
-          "air-label-scf-for-to-ping-pong{omit-memory-space=" + ppMode + "}";
-      ppPass = "air-ping-pong-transform{omit-memory-space=" + ppMode + "}";
-    } else if (partialL1PingPong) {
-      const std::string partialBuffer = ppMode == "L1-partial-a" ? "a" : "b";
-      labelPass = "air-label-scf-for-to-ping-pong{partial-memory-space=L1 "
-                  "partial-buffer=" +
-                  partialBuffer + "}";
+    if (omitPingpong.getValue() == "L1" || omitPingpong.getValue() == "L2") {
+      labelPass = "air-label-scf-for-to-ping-pong{omit-memory-space=" +
+                  omitPingpong.getValue() + "}";
+      ppPass = "air-ping-pong-transform{omit-memory-space=" +
+               omitPingpong.getValue() + "}";
     }
     os << "," << labelPass << "," << ppPass << ",canonicalize,cse";
   }
