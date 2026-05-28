@@ -88,16 +88,16 @@ static inline void matmul_vectorized_2x2_mmul(const T_in *__restrict pA,
 #endif
             {
               aie::vector<T_in, MMUL::size_A> A0 =
-                  aie::load_v<MMUL::size_A>(pA1);
+                  aie::load_v<MMUL::size_A, aie_dm_resource::a>(pA1);
               pA1 += rowA * MMUL::size_A;
               aie::vector<T_in, MMUL::size_A> A1 =
-                  aie::load_v<MMUL::size_A>(pA2);
+                  aie::load_v<MMUL::size_A, aie_dm_resource::b>(pA2);
               pA2 += rowA * MMUL::size_A;
               aie::vector<T_in, MMUL::size_B> B0 =
-                  aie::load_v<MMUL::size_B>(pB1);
+                  aie::load_v<MMUL::size_B, aie_dm_resource::c>(pB1);
               pB1 += MMUL::size_B;
               aie::vector<T_in, MMUL::size_B> B1 =
-                  aie::load_v<MMUL::size_B>(pB2);
+                  aie::load_v<MMUL::size_B, aie_dm_resource::d>(pB2);
               pB2 += MMUL::size_B;
 
               C00.mac(A0, B0);

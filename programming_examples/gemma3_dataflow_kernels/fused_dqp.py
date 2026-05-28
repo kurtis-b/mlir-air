@@ -19,7 +19,7 @@ from common import random_q4nx_block, fused_dqp_reference
 
 
 @module_builder
-def build_module(rows, cols):
+def build_module(rows, cols, kernel_name="fused_dqp_block", object_file="fused_dqp.o"):
     bf16_type = type_mapper(bfloat16)
     i8_type = IntegerType.get_signless(8)
     packed_elems = rows * cols // 2
@@ -36,11 +36,11 @@ def build_module(rows, cols):
     l1_out_ty = MemRefType.get([rows], bf16_type, memory_space=l1_space)
 
     dqp_func = FuncOp(
-        "fused_dqp_block",
+        kernel_name,
         ([l1_w_ty, l1_param_ty, l1_param_ty, l1_act_ty, l1_out_ty], []),
         visibility="private",
     )
-    dqp_func.attributes["link_with"] = StringAttr.get("fused_dqp.o")
+    dqp_func.attributes["link_with"] = StringAttr.get(object_file)
     dqp_func.attributes["llvm.emit_c_interface"] = UnitAttr.get()
 
     @FuncOp.from_py_func(l3_w_ty, l3_param_ty, l3_param_ty, l3_act_ty, l3_out_ty)
@@ -53,7 +53,7 @@ def build_module(rows, cols):
                     name="fused_dqp_herd",
                     sizes=[1, 1],
                     operands=[sw, ss, sm, sa, so],
-                    link_with="fused_dqp.o",
+                    link_with=object_file,
                 )
                 def herd_body(_tx, _ty, _sx, _sy, hw, hs, hm, ha, ho):
                     l1_w = AllocOp(l1_w_ty, [], [])
@@ -82,6 +82,8 @@ def main():
     parser.add_argument("-p", "--print-module-only", action="store_true")
     parser.add_argument("--rows", type=int, default=32)
     parser.add_argument("--cols", type=int, default=256)
+    parser.add_argument("--kernel-name", default="fused_dqp_block")
+    parser.add_argument("--object-file", default="fused_dqp.o")
     parser.add_argument(
         "--compile-mode",
         choices=["compile-only", "compile-and-run"],
@@ -93,7 +95,7 @@ def main():
     if args.rows * args.cols % 2 != 0:
         parser.error("rows*cols must be even for int4 packing")
 
-    module = build_module(args.rows, args.cols)
+    module = build_module(args.rows, args.cols, args.kernel_name, args.object_file)
     if args.print_module_only:
         print(module)
         return

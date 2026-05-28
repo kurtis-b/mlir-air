@@ -22,6 +22,8 @@ def main():
     parser.add_argument("--query-base", type=int, default=0)
     parser.add_argument("--window-len", type=int, default=0)
     parser.add_argument("--causal", action="store_true")
+    parser.add_argument("--kernel-name", default="flowqkv_chunk_bf16")
+    parser.add_argument("--object-file", default="flowqkv.o")
     parser.add_argument(
         "--compile-mode",
         choices=["compile-only", "compile-and-run"],
@@ -34,8 +36,8 @@ def main():
         args.q_chunk,
         args.kv_len,
         args.head_dim,
-        "flowqkv_chunk_bf16",
-        "flowqkv.o",
+        args.kernel_name,
+        args.object_file,
         "flowqkv",
     )
     if args.print_module_only:

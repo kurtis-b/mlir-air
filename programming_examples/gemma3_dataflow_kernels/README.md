@@ -5,17 +5,19 @@ patterns described in "Mapping Gemma3 onto an Edge Dataflow Architecture".
 The goal is to make each kernel concrete, testable, and easy to iterate on
 before integrating them into an end-to-end Gemma3 runtime.
 
-The examples are intentionally correctness-first:
+The examples include correctness-first and optimized Peano variants:
 
-- `q4nx.py` / `q4nx.cc`: dequantize one Q4NX 32x256 int4 block to bf16.
+- `q4nx.py` / `q4nx.cc` / `q4nx_opt.cc`: dequantize one Q4NX 32x256 int4
+  block to bf16.
 - `bf16_tiled_mm.py`: run the existing AIE2P tiled bf16 matrix-multiply
-  generator with Gemma-style defaults.
-- `fused_dqp.py` / `fused_dqp.cc`: fuse Q4NX dequantization with one 32x256
-  matrix-vector block projection.
-- `flowqkv.py` / `flow_attention.cc`: chunked prefill attention over one KV
-  group using online softmax accumulation.
-- `flowkv.py` / `flow_attention.cc`: decode attention as the Q-chunk-size-1
-  specialization of the same chunked attention.
+  generator with Gemma-style defaults; optimized targets reuse
+  `../matrix_multiplication/bf16/mm_aie2p.cc` with `OPT_PERF_ENABLED`.
+- `fused_dqp.py` / `fused_dqp.cc` / `fused_dqp_opt.cc`: fuse Q4NX
+  dequantization with one 32x256 matrix-vector block projection.
+- `flowqkv.py` / `flow_attention.cc` / `flow_attention_opt.cc`: chunked prefill
+  attention over one KV group using online softmax accumulation.
+- `flowkv.py` / `flow_attention.cc` / `flow_attention_opt.cc`: decode attention as
+  the Q-chunk-size-1 specialization of the same chunked attention.
 
 These are not FastFlowLM binary reproductions and do not use disassembly.
 They are source-level kernels built from the paper's public description and
@@ -31,6 +33,23 @@ make run-mm
 make run-fused-dqp
 make run-flowqkv
 make run-flowkv
+```
+
+Optimized Peano compile/run targets use the `*-opt` suffix:
+
+```bash
+make all-opt COMPILE_MODE=compile-only OUTPUT_FORMAT=elf
+make run-q4nx-opt COMPILE_MODE=compile-only OUTPUT_FORMAT=elf
+make run-mm-opt COMPILE_MODE=compile-only OUTPUT_FORMAT=elf
+make run-fused-dqp-opt COMPILE_MODE=compile-only OUTPUT_FORMAT=elf
+make run-flowqkv-opt COMPILE_MODE=compile-only OUTPUT_FORMAT=elf
+make run-flowkv-opt COMPILE_MODE=compile-only OUTPUT_FORMAT=elf
+```
+
+Generate optimized Peano disassembly:
+
+```bash
+make dump-asm-opt COMPILE_MODE=compile-only OUTPUT_FORMAT=elf
 ```
 
 Print generated AIR without compiling:
@@ -58,7 +77,11 @@ scale and one bf16 minimum offset, and dequantization is:
 w_bf16[row, col] = scale[col] * q4[row, col] + min[col]
 ```
 
-`FlowQKV` and `FlowKV` currently use a single herd and scalar C++ loops for
-the attention math. They preserve the algorithmic semantics and validation
-surface while leaving the full 8-column/CT-pair paper mapping as the next
-optimization step.
+The optimized Q4NX and FusedDQP microkernels expand packed int4 values in
+8-column groups and use BF16 vector multiply-add/reduce operations. The
+optimized FlowQKV/FlowKV microkernels vectorize BF16 dot products and value
+accumulation while preserving the same online-softmax semantics.
+
+The optimized attention kernels are still single-herd microkernels. They are
+not yet the paper's full multi-CT, KV-partitioned schedule with explicit
+inter-CT reductions and stream overlap; that remains the next integration step.

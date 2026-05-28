@@ -53,7 +53,7 @@ def main():
         bfloat16,
         bfloat16,
         arch="aie2p",
-        direct_codegen=True,
+        direct_codegen=False,
     )
     if args.print_module_only:
         print(module)
@@ -66,11 +66,13 @@ def main():
 
     backend_opts = dict(
         verbose=args.verbose,
-        omit_pingpong=True,
         output_format=args.output_format,
         instance_name="matmul_bf16",
         target_device="npu2",
-        runtime_loop_tiling_sizes=[1, 1],
+        omit_while_true_loop=False,
+        runtime_loop_tiling_sizes=[2, 2],
+        stack_size=2048,
+        lower_linalg_to_func="mm.o",
     )
     if args.compile_mode == "compile-and-run":
         runner = XRTRunner(**backend_opts)
