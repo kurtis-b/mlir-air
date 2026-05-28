@@ -29,6 +29,8 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/RegionUtils.h"
+#include <array>
+#include <optional>
 using namespace mlir;
 using namespace xilinx;
 using namespace xilinx::air;
@@ -248,11 +250,38 @@ struct ConvertAIRToROCDLPass
   SmallVector<Value, 4> blkIdx;
   SmallVector<Value, 4> gridIdx;
 
-  static bool hasStaticMemRef(Value value, ArrayRef<int64_t> shape,
-                              unsigned elementWidth) {
-    auto type = dyn_cast<MemRefType>(value.getType());
-    return type && type.getShape() == shape &&
-           type.getElementType().isInteger(elementWidth);
+  static bool isPowerOfTwoGreaterThan512(int64_t value) {
+    return value > 512 && (value & (value - 1)) == 0;
+  }
+
+  static std::optional<std::array<int64_t, 3>>
+  getSupportedInt8GemmShape(Value a, Value b, Value c,
+                            const Int8GemmKernelConfig &config) {
+    auto aType = dyn_cast<MemRefType>(a.getType());
+    auto bType = dyn_cast<MemRefType>(b.getType());
+    auto cType = dyn_cast<MemRefType>(c.getType());
+    if (!aType || !bType || !cType || aType.getRank() != 2 ||
+        bType.getRank() != 2 || cType.getRank() != 2 ||
+        !aType.hasStaticShape() || !bType.hasStaticShape() ||
+        !cType.hasStaticShape() || !aType.getElementType().isInteger(8) ||
+        !bType.getElementType().isInteger(8) ||
+        !cType.getElementType().isInteger(32))
+      return std::nullopt;
+
+    int64_t m = aType.getDimSize(0);
+    int64_t k = aType.getDimSize(1);
+    int64_t n = bType.getDimSize(0);
+    if (bType.getDimSize(1) != k || cType.getDimSize(0) != m ||
+        cType.getDimSize(1) != n)
+      return std::nullopt;
+    if (!isPowerOfTwoGreaterThan512(m) || !isPowerOfTwoGreaterThan512(n) ||
+        !isPowerOfTwoGreaterThan512(k))
+      return std::nullopt;
+    if (m % config.blockRows != 0 || n % config.blockCols != 0 ||
+        k % config.kPerBlock != 0)
+      return std::nullopt;
+
+    return std::array<int64_t, 3>{m, n, k};
   }
 
   LogicalResult lowerMarkedInt8GemmLaunch(air::LaunchOp launchOp) {
@@ -263,13 +292,6 @@ struct ConvertAIRToROCDLPass
     Value a = launchOp.getKernelOperand(0);
     Value b = launchOp.getKernelOperand(1);
     Value c = launchOp.getKernelOperand(2);
-    if (!hasStaticMemRef(a, {1024, 1024}, 8) ||
-        !hasStaticMemRef(b, {1024, 1024}, 8) ||
-        !hasStaticMemRef(c, {1024, 1024}, 32))
-      return launchOp.emitOpError(kInt8GemmWmmaAttr)
-             << " only supports memref<1024x1024xi8>, "
-                "memref<1024x1024xi8>, memref<1024x1024xi32>";
-
     StringRef variant = clInt8GemmVariant;
     if (auto variantAttr =
             launchOp->getAttrOfType<StringAttr>(kInt8GemmVariantAttr))
@@ -291,10 +313,19 @@ struct ConvertAIRToROCDLPass
       return launchOp.emitOpError(kInt8GemmWmmaAttr)
              << " unsupported variant '" << variant << "'";
 
+    auto shape = getSupportedInt8GemmShape(a, b, c, *config);
+    if (!shape)
+      return launchOp.emitOpError(kInt8GemmWmmaAttr)
+             << " only supports static power-of-two INT8 GEMM shapes greater "
+                "than 512 with A[M,K], packed B[N,K], C[M,N], and dimensions "
+                "divisible by the selected WMMA tile";
+    int64_t mDim = (*shape)[0];
+    int64_t nDim = (*shape)[1];
+
     OpBuilder builder(launchOp);
     Location loc = launchOp.getLoc();
-    int64_t gridTilesM = 1024 / config->blockRows;
-    int64_t gridTilesN = 1024 / config->blockCols;
+    int64_t gridTilesM = mDim / config->blockRows;
+    int64_t gridTilesN = nDim / config->blockCols;
     int64_t gridXSize = usesLinearGroupedGrid(*config) ? gridTilesM * gridTilesN
                                                        : gridTilesN;
     int64_t gridYSize = usesLinearGroupedGrid(*config) ? 1 : gridTilesM;

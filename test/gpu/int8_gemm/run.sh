@@ -8,6 +8,7 @@ TMPDIR="${TMPDIR:-/tmp/air_int8_gemm}"
 GPU_CHIP="${AIR_GPU_CHIP:-gfx1150}"
 GPU_VARIANT="${AIR_INT8_GEMM_VARIANT:-lds_128x128_rocmlir_k32_pipe3}"
 GPU_GROUP_SIZE="${AIR_INT8_GEMM_GROUP_SIZE:-8}"
+GPU_SIZE="${AIR_INT8_GEMM_SIZE:-1024}"
 export AIRGPU_USE_HIP_MALLOC="${AIRGPU_USE_HIP_MALLOC:-1}"
 export AIRGPU_BENCHMARK_STREAM="${AIRGPU_BENCHMARK_STREAM:-1}"
 
@@ -20,7 +21,26 @@ fi
 [ -x "${AIR_OPT:-}" ] || { echo "ERROR: AIR_OPT not found" >&2; exit 1; }
 [ -x "${MLIR_OPT:-}" ] || { echo "ERROR: MLIR_OPT not found" >&2; exit 1; }
 
+case "$GPU_SIZE" in
+  ''|*[!0-9]*) echo "ERROR: AIR_INT8_GEMM_SIZE must be an integer" >&2; exit 1 ;;
+esac
+if (( GPU_SIZE <= 512 || (GPU_SIZE & (GPU_SIZE - 1)) != 0 )); then
+  echo "ERROR: AIR_INT8_GEMM_SIZE must be a power of two greater than 512" >&2
+  exit 1
+fi
+
 mkdir -p "$TMPDIR"
+INPUT_MLIR="$SCRIPT_DIR/air_sync.mlir"
+if [ "$GPU_SIZE" != "1024" ]; then
+  INPUT_MLIR="$TMPDIR/int8_gemm_${GPU_SIZE}.mlir"
+  python3 - "$SCRIPT_DIR/air_sync.mlir" "$INPUT_MLIR" "$GPU_SIZE" <<'PY_RESIZE'
+import sys
+src, dst, size = sys.argv[1:]
+text = open(src, encoding="utf-8").read()
+open(dst, "w", encoding="utf-8").write(text.replace("1024", size))
+PY_RESIZE
+fi
+
 ROCDL_MLIR="$TMPDIR/int8_gemm.rocdl.mlir"
 OUTLINE_MLIR="$TMPDIR/int8_gemm.outline.mlir"
 OUTLINE_LLVM_MLIR="$TMPDIR/int8_gemm.outline_llvm.mlir"
@@ -32,7 +52,7 @@ AIR_TO_ROCDL="-air-to-rocdl=int8-gemm-variant=${GPU_VARIANT} int8-gemm-group-siz
 AIR_GPU_OUTLINING="-air-gpu-outlining=int8-gemm-variant=${GPU_VARIANT} int8-gemm-group-size=${GPU_GROUP_SIZE}"
 ROCDL_PIPELINE="rocdl-attach-target{chip=${GPU_CHIP} O=3},gpu.module(convert-scf-to-cf,convert-gpu-to-rocdl{chipset=${GPU_CHIP} runtime=HIP},reconcile-unrealized-casts)"
 
-"$AIR_OPT" "$SCRIPT_DIR/air_sync.mlir" "$AIR_TO_ROCDL" -o "$ROCDL_MLIR"
+"$AIR_OPT" "$INPUT_MLIR" "$AIR_TO_ROCDL" -o "$ROCDL_MLIR"
 "$AIR_OPT" "$ROCDL_MLIR" "$AIR_GPU_OUTLINING" -o "$OUTLINE_MLIR"
 "$MLIR_OPT" "--pass-pipeline=builtin.module(func.func(lower-affine,convert-linalg-to-loops,convert-scf-to-cf),gpu-kernel-outlining)" "$OUTLINE_MLIR" -o "$OUTLINE_LLVM_MLIR"
 "$MLIR_OPT" "--pass-pipeline=builtin.module(${ROCDL_PIPELINE},gpu-module-to-binary{format=isa})" "$OUTLINE_LLVM_MLIR" -o "$ISA_MLIR"

@@ -31,6 +31,8 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include <algorithm>
+#include <array>
+#include <optional>
 using namespace mlir;
 using namespace xilinx;
 using namespace xilinx::air;
@@ -251,11 +253,38 @@ struct ConvertGPUKernelOutlinePass
   SmallVector<Value, 4> blkIdx;
   SmallVector<Value, 4> gridIdx;
 
-  static bool hasStaticMemRef(Value value, ArrayRef<int64_t> shape,
-                              unsigned elementWidth) {
-    auto type = dyn_cast<MemRefType>(value.getType());
-    return type && type.getShape() == shape &&
-           type.getElementType().isInteger(elementWidth);
+  static bool isPowerOfTwoGreaterThan512(int64_t value) {
+    return value > 512 && (value & (value - 1)) == 0;
+  }
+
+  static std::optional<std::array<int64_t, 3>>
+  getSupportedInt8GemmShape(Value a, Value b, Value c,
+                            const Int8GemmKernelConfig &config) {
+    auto aType = dyn_cast<MemRefType>(a.getType());
+    auto bType = dyn_cast<MemRefType>(b.getType());
+    auto cType = dyn_cast<MemRefType>(c.getType());
+    if (!aType || !bType || !cType || aType.getRank() != 2 ||
+        bType.getRank() != 2 || cType.getRank() != 2 ||
+        !aType.hasStaticShape() || !bType.hasStaticShape() ||
+        !cType.hasStaticShape() || !aType.getElementType().isInteger(8) ||
+        !bType.getElementType().isInteger(8) ||
+        !cType.getElementType().isInteger(32))
+      return std::nullopt;
+
+    int64_t m = aType.getDimSize(0);
+    int64_t k = aType.getDimSize(1);
+    int64_t n = bType.getDimSize(0);
+    if (bType.getDimSize(1) != k || cType.getDimSize(0) != m ||
+        cType.getDimSize(1) != n)
+      return std::nullopt;
+    if (!isPowerOfTwoGreaterThan512(m) || !isPowerOfTwoGreaterThan512(n) ||
+        !isPowerOfTwoGreaterThan512(k))
+      return std::nullopt;
+    if (m % config.blockRows != 0 || n % config.blockCols != 0 ||
+        k % config.kPerBlock != 0)
+      return std::nullopt;
+
+    return std::array<int64_t, 3>{m, n, k};
   }
 
   static Value cidx(OpBuilder &builder, Location loc, int64_t value) {
@@ -289,12 +318,6 @@ struct ConvertGPUKernelOutlinePass
     Value a = body.getArgument(0);
     Value b = body.getArgument(1);
     Value c = body.getArgument(2);
-    if (!hasStaticMemRef(a, {1024, 1024}, 8) ||
-        !hasStaticMemRef(b, {1024, 1024}, 8) ||
-        !hasStaticMemRef(c, {1024, 1024}, 32))
-      return func.emitOpError(kInt8GemmWmmaAttr)
-             << " only supports memref<1024x1024xi8>, "
-                "memref<1024x1024xi8>, memref<1024x1024xi32>";
     if (!isSupportedInt8GemmVariant(variant))
       return func.emitOpError(kInt8GemmWmmaAttr)
              << " unsupported variant '" << variant << "'";
@@ -306,6 +329,15 @@ struct ConvertGPUKernelOutlinePass
     if (!config)
       return func.emitOpError(kInt8GemmWmmaAttr)
              << " unsupported variant '" << variant << "'";
+
+    auto shape = getSupportedInt8GemmShape(a, b, c, *config);
+    if (!shape)
+      return func.emitOpError(kInt8GemmWmmaAttr)
+             << " only supports static power-of-two INT8 GEMM shapes greater "
+                "than 512 with A[M,K], packed B[N,K], C[M,N], and dimensions "
+                "divisible by the selected WMMA tile";
+    int64_t nDim = (*shape)[1];
+    int64_t kDim = (*shape)[2];
 
     bool packedB = config->packedB;
     bool directLegacyPipeline =
@@ -409,7 +441,9 @@ struct ConvertGPUKernelOutlinePass
             ? 0
             : (blockCols * kPerBlock + copyStrideElems - 1) / copyStrideElems;
     int64_t accCount = waveRowTiles * waveColTiles;
-    int64_t kTiles = 1024 / kPerBlock;
+    int64_t kTiles = kDim / kPerBlock;
+    int64_t pipe3MainTiles = ((kTiles - 2) / 3) * 3;
+    int64_t pipe3TailTiles = kTiles - pipe3MainTiles;
 
     Location loc = func.getLoc();
     MLIRContext *ctx = func.getContext();
@@ -454,8 +488,8 @@ struct ConvertGPUKernelOutlinePass
     Value c0 = cidx(builder, loc, 0);
     Value c2 = cidx(builder, loc, 2);
     Value cGroupM = cidx(builder, loc, groupSize);
-    Value cGridTileCols = cidx(builder, loc, 1024 / blockCols);
-    Value cGroupTileCount = cidx(builder, loc, groupSize * (1024 / blockCols));
+    Value cGridTileCols = cidx(builder, loc, nDim / blockCols);
+    Value cGroupTileCount = cidx(builder, loc, groupSize * (nDim / blockCols));
     Value c16 = cidx(builder, loc, 16);
     Value c32 = cidx(builder, loc, 32);
     Value cBlockDimX = cidx(builder, loc, blockDimX);
@@ -469,10 +503,12 @@ struct ConvertGPUKernelOutlinePass
         cidx(builder, loc, std::min<int64_t>(4, kPerBlock / 16));
     Value c2KPerBlock = cidx(builder, loc, 2 * kPerBlock);
     Value c3KPerBlock = cidx(builder, loc, 3 * kPerBlock);
-    Value cPipeLoopUpper = cidx(builder, loc, 1024 - 2 * kPerBlock);
-    Value cPenultimateK = cidx(builder, loc, 1024 - 2 * kPerBlock);
-    Value cLastK = cidx(builder, loc, 1024 - kPerBlock);
-    Value c1024 = cidx(builder, loc, 1024);
+    Value cPipeLoopUpper = cidx(builder, loc, kDim - 2 * kPerBlock);
+    Value cPenultimateK = cidx(builder, loc, kDim - 2 * kPerBlock);
+    Value cLastK = cidx(builder, loc, kDim - kPerBlock);
+    Value cKDim = cidx(builder, loc, kDim);
+    Value cPipe3LoopUpper =
+        cidx(builder, loc, pipe3MainTiles * kPerBlock);
 
     Value physicalBlockX = gpu::BlockIdOp::create(
         builder, loc, builder.getIndexType(), gpu::Dimension::x);
@@ -947,7 +983,7 @@ struct ConvertGPUKernelOutlinePass
     finalAccs.reserve(accCount);
     if (directCanonicalPipeline || directRawPtrU2Pipeline) {
       SmallVector<Value, 8> initAccs(accCount, initAcc);
-      auto kLoop = scf::ForOp::create(builder, loc, c0, c1024, cKPerBlock,
+      auto kLoop = scf::ForOp::create(builder, loc, c0, cKDim, cKPerBlock,
                                       ValueRange(initAccs));
       setLoopUnrollCount(kLoop, directRawPtrU2Pipeline ? 2 : 4);
       builder.setInsertionPointToStart(kLoop.getBody());
@@ -965,7 +1001,7 @@ struct ConvertGPUKernelOutlinePass
         finalAccs.push_back(kLoop.getResult(i));
     } else if (directPrefetchPipeline) {
       SmallVector<Value, 8> initAccs(accCount, initAcc);
-      auto kLoop = scf::ForOp::create(builder, loc, c0, c1024, cKPerBlock,
+      auto kLoop = scf::ForOp::create(builder, loc, c0, cKDim, cKPerBlock,
                                       ValueRange(initAccs));
       setLoopUnrollCount(kLoop, 4);
       builder.setInsertionPointToStart(kLoop.getBody());
@@ -987,7 +1023,7 @@ struct ConvertGPUKernelOutlinePass
         finalAccs.push_back(kLoop.getResult(i));
     } else if (directLegacyPipeline || directRawPtrPipeline) {
       SmallVector<Value, 8> initAccs(accCount, initAcc);
-      auto kLoop = scf::ForOp::create(builder, loc, c0, c1024, cKPerBlock,
+      auto kLoop = scf::ForOp::create(builder, loc, c0, cKDim, cKPerBlock,
                                       ValueRange(initAccs));
       if (directRawPtrPipeline)
         setLoopUnrollDisable(kLoop);
@@ -1016,7 +1052,7 @@ struct ConvertGPUKernelOutlinePass
                          prefetchTileToRegs(c2KPerBlock));
       gpu::BarrierOp::create(builder, loc);
 
-      auto kLoop = scf::ForOp::create(builder, loc, c0, cPenultimateK,
+      auto kLoop = scf::ForOp::create(builder, loc, c0, cPipe3LoopUpper,
                                       c3KPerBlock, ValueRange(initAccs));
       builder.setInsertionPointToStart(kLoop.getBody());
       Value k = kLoop.getInductionVar();
@@ -1028,7 +1064,7 @@ struct ConvertGPUKernelOutlinePass
       Value kNextPenta =
           arith::AddIOp::create(builder, loc, kNextQuad, cKPerBlock);
       Value kNextPentaInBounds = arith::CmpIOp::create(
-          builder, loc, arith::CmpIPredicate::ult, kNextPenta, c1024);
+          builder, loc, arith::CmpIPredicate::ult, kNextPenta, cKDim);
 
       TilePrefetch nextTriplePrefetch = prefetchTileToRegs(kNextTriple);
       TilePrefetch nextQuadPrefetch = prefetchTileToRegs(kNextQuad);
@@ -1055,8 +1091,36 @@ struct ConvertGPUKernelOutlinePass
       for (int64_t i = 0; i < accCount; ++i)
         finalAccs.push_back(kLoop.getResult(i));
 
-      computeTile(aLds, bLds, cPenultimateK, finalAccs);
-      computeTile(aLdsNext, bLdsNext, cLastK, finalAccs);
+      Value pipe3TailBase = cidx(builder, loc, pipe3MainTiles * kPerBlock);
+      computeTile(aLds, bLds, pipe3TailBase, finalAccs);
+      if (pipe3TailTiles >= 2)
+        computeTile(aLdsNext, bLdsNext,
+                    cidx(builder, loc, (pipe3MainTiles + 1) * kPerBlock),
+                    finalAccs);
+      if (pipe3TailTiles >= 3)
+        computeTile(aLdsThird, bLdsThird,
+                    cidx(builder, loc, (pipe3MainTiles + 2) * kPerBlock),
+                    finalAccs);
+      if (pipe3TailTiles > 3) {
+        gpu::BarrierOp::create(builder, loc);
+        storePrefetchToLds(
+            aLds, bLds,
+            prefetchTileToRegs(
+                cidx(builder, loc, (pipe3MainTiles + 3) * kPerBlock)));
+        if (pipe3TailTiles > 4)
+          storePrefetchToLds(
+              aLdsNext, bLdsNext,
+              prefetchTileToRegs(
+                  cidx(builder, loc, (pipe3MainTiles + 4) * kPerBlock)));
+        gpu::BarrierOp::create(builder, loc);
+        computeTile(aLds, bLds,
+                    cidx(builder, loc, (pipe3MainTiles + 3) * kPerBlock),
+                    finalAccs);
+        if (pipe3TailTiles > 4)
+          computeTile(aLdsNext, bLdsNext,
+                      cidx(builder, loc, (pipe3MainTiles + 4) * kPerBlock),
+                      finalAccs);
+      }
     } else if (rocmlirLikePipe3) {
       SmallVector<Value, 8> initAccs(accCount, initAcc);
       copyTile(aLds, bLds, c0);
@@ -1064,7 +1128,7 @@ struct ConvertGPUKernelOutlinePass
       copyTile(aLdsThird, bLdsThird, c2KPerBlock);
       gpu::BarrierOp::create(builder, loc);
 
-      auto kLoop = scf::ForOp::create(builder, loc, c0, cPenultimateK,
+      auto kLoop = scf::ForOp::create(builder, loc, c0, cPipe3LoopUpper,
                                       c3KPerBlock, ValueRange(initAccs));
       builder.setInsertionPointToStart(kLoop.getBody());
       Value k = kLoop.getInductionVar();
@@ -1088,7 +1152,7 @@ struct ConvertGPUKernelOutlinePass
 
       copyTile(aLds, bLds, kNextTriple);
       copyTile(aLdsNext, bLdsNext, kNextQuad);
-      ifIndexLessThan(kNextPenta, c1024, [&]() {
+      ifIndexLessThan(kNextPenta, cKDim, [&]() {
         copyTile(aLdsThird, bLdsThird, kNextPenta);
       });
       gpu::BarrierOp::create(builder, loc);
@@ -1098,8 +1162,32 @@ struct ConvertGPUKernelOutlinePass
       for (int64_t i = 0; i < accCount; ++i)
         finalAccs.push_back(kLoop.getResult(i));
 
-      computeTile(aLds, bLds, cPenultimateK, finalAccs);
-      computeTile(aLdsNext, bLdsNext, cLastK, finalAccs);
+      Value pipe3TailBase = cidx(builder, loc, pipe3MainTiles * kPerBlock);
+      computeTile(aLds, bLds, pipe3TailBase, finalAccs);
+      if (pipe3TailTiles >= 2)
+        computeTile(aLdsNext, bLdsNext,
+                    cidx(builder, loc, (pipe3MainTiles + 1) * kPerBlock),
+                    finalAccs);
+      if (pipe3TailTiles >= 3)
+        computeTile(aLdsThird, bLdsThird,
+                    cidx(builder, loc, (pipe3MainTiles + 2) * kPerBlock),
+                    finalAccs);
+      if (pipe3TailTiles > 3) {
+        gpu::BarrierOp::create(builder, loc);
+        copyTile(aLds, bLds,
+                 cidx(builder, loc, (pipe3MainTiles + 3) * kPerBlock));
+        if (pipe3TailTiles > 4)
+          copyTile(aLdsNext, bLdsNext,
+                   cidx(builder, loc, (pipe3MainTiles + 4) * kPerBlock));
+        gpu::BarrierOp::create(builder, loc);
+        computeTile(aLds, bLds,
+                    cidx(builder, loc, (pipe3MainTiles + 3) * kPerBlock),
+                    finalAccs);
+        if (pipe3TailTiles > 4)
+          computeTile(aLdsNext, bLdsNext,
+                      cidx(builder, loc, (pipe3MainTiles + 4) * kPerBlock),
+                      finalAccs);
+      }
     } else if (shortLivedLoopedPipeline) {
       SmallVector<Value, 8> initAccs(accCount, initAcc);
       copyTile(aLds, bLds, c0);
@@ -1209,7 +1297,7 @@ struct ConvertGPUKernelOutlinePass
       }
     } else {
       SmallVector<Value, 8> initAccs(accCount, initAcc);
-      auto kLoop = scf::ForOp::create(builder, loc, c0, c1024, cKPerBlock,
+      auto kLoop = scf::ForOp::create(builder, loc, c0, cKDim, cKPerBlock,
                                       ValueRange(initAccs));
       builder.setInsertionPointToStart(kLoop.getBody());
       Value k = kLoop.getInductionVar();
