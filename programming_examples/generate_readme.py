@@ -229,6 +229,12 @@ EXAMPLES = [
         "datatypes": "bf16",
     },
     {
+        "category": "LLM Kernels",
+        "name": "Gemma3 Dataflow Kernels",
+        "path": "gemma3_dataflow_kernels",
+        "datatypes": "int4, bf16",
+    },
+    {
         "category": "Data Movement",
         "name": "Passthrough (DMA)",
         "path": "passthrough/passthrough_dma",
