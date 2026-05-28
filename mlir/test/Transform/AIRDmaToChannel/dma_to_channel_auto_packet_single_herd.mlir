@@ -7,10 +7,11 @@
 
 // Test that auto-packet detection works for single-herd segments.
 // One 1x1 herd with 3 inputs = 3 input channels > per-column limit of 2.
+// Two channels are upgraded, leaving one stream slot and one packet slot.
 
 // RUN: air-opt %s -air-dma-to-channel 2>&1 | FileCheck %s
 
-// CHECK-COUNT-3: air.channel {{.*}} {channel_type = "npu_dma_packet"}
+// CHECK-COUNT-2: air.channel {{.*}} {channel_type = "npu_dma_packet"}
 // CHECK-NOT: channel_type = "npu_dma_packet"
 
 module {

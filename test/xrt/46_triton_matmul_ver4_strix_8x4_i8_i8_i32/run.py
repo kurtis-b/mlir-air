@@ -867,7 +867,11 @@ def rewrite_atb_active_a_buffers(module_text: str, active_m_packs: int) -> str:
 
 
 def rewrite_atb_v2_active_a_buffers(
-    module_text: str, active_m_packs: int, external_kernel_object: str | None
+    module_text: str,
+    active_m_packs: int,
+    external_kernel_object: str | None,
+    use_static_c_offset: bool,
+    external_c_stride_m_packs: int,
 ) -> str:
     if active_m_packs != ATB_EXTERNAL_ACTIVE_M_PACKS:
         raise ValueError("ATB v2 active-A rewrite currently expects 6 active M packs")
@@ -938,7 +942,29 @@ def rewrite_atb_v2_active_a_buffers(
             f"offset: [0], sizes: [18, 18, 8, 8], "
             f"strides: [{full_c_n_stride}, 64, 8, 1] : {full_c_type} to {local_c_type}\n"
         )
-        body = body[: c_line_match.start()] + body[c_line_match.end() :]
+        if use_static_c_offset:
+            c_routing_insert = full_c_insert
+            body = body[: c_line_match.start()] + body[c_line_match.end() :]
+        else:
+            local_c_base = f"%{active_a[1:]}_c_base"
+            local_c_base_type = c_type.replace(
+                f"18x{active_m_packs}x8x8xi8", "18x1x8x8xi8", 1
+            )
+            explicit_c_insert = (
+                f"{body_indent}{local_c_base} = memref.subview {c_mem}"
+                f"[{n_off}, {m_off}, 0, 0] [18, 1, 8, 8] [1, 1, 1, 1] : "
+                f"{c_mem_type} to {local_c_base_type}\n"
+                f"{body_indent}{local_c} = memref.reinterpret_cast {local_c_base} to "
+                f"offset: [0], sizes: [18, 18, 8, 8], "
+                f"strides: [{full_c_n_stride}, 64, 8, 1] : "
+                f"{local_c_base_type} to {local_c_type}\n"
+            )
+            c_routing_insert = ""
+            body = (
+                body[: c_line_match.start()]
+                + explicit_c_insert
+                + body[c_line_match.end() :]
+            )
         body = _rewrite_active_a_input_type(body, active_a, active_m_packs)
         old_outs = f"outs({c_view} : {c_type})"
         outs_pos = body.find(old_outs)
@@ -969,7 +995,7 @@ def rewrite_atb_v2_active_a_buffers(
         return (
             match.group("base_line")
             + match.group("between")
-            + full_c_insert
+            + c_routing_insert
             + match.group("loop_line")
             + active_pack
             + body
@@ -1153,6 +1179,7 @@ def write_compile_config(args: argparse.Namespace, generated_ir: str | None) -> 
         "external_active_m_packs": args.external_active_m_packs,
         "external_core_n_packs": args.external_core_n_packs,
         "external_c_stride_m_packs": args.external_c_stride_m_packs,
+        "external_atb_c_offset": args.external_atb_c_offset,
         "atb_k_chunk_elements": args.atb_k_chunk_elements,
         "effective_k_chunk_elements": args.effective_atb_k_chunk_elements,
         "effective_atb_k_chunk_elements": args.effective_atb_k_chunk_elements,
@@ -1277,6 +1304,13 @@ def parse_args() -> argparse.Namespace:
         type=positive_int,
         default=DEFAULT_ATB_K_CHUNK_ELEMENTS,
         help="Maximum K elements per ATB v2 L2 chunk before lowering",
+    )
+    parser.add_argument(
+        "--external-atb-c-offset",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Use the external kernel static ATB active-M C offset counter",
     )
     parser.add_argument(
         "--omit-ping-pong",
@@ -1412,6 +1446,13 @@ def parse_args() -> argparse.Namespace:
         ):
             errors.append(
                 "EXTERNAL_KERNEL_STYLE=native-mmul-atb-ref is only valid with sota-int8-atb-v2"
+            )
+        if (
+            args.external_kernel_style == "native-mmul-atb-ref"
+            and args.external_atb_c_offset != 1
+        ):
+            errors.append(
+                "EXTERNAL_KERNEL_STYLE=native-mmul-atb-ref requires --external-atb-c-offset=1"
             )
         if is_atb_variant(args.transform_variant):
             if args.transform_variant == "sota-int8-atb":
@@ -1550,7 +1591,11 @@ with air.ir.Context() as ctx, Location.unknown():
             args.effective_atb_k_chunk_elements,
         )
         atb_module_text = rewrite_atb_v2_active_a_buffers(
-            atb_module_text, args.external_active_m_packs, args.external_kernel_object
+            atb_module_text,
+            args.external_active_m_packs,
+            args.external_kernel_object,
+            bool(args.external_atb_c_offset),
+            args.external_c_stride_m_packs,
         )
         air_module = Module.parse(atb_module_text)
 

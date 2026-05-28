@@ -23,10 +23,22 @@ module attributes {torch.debug_module_name = "mmult"} {
           linalg.matmul ins(%arg7, %arg8 : memref<32x32xi32, 2>, memref<32x32xi32, 2>) outs(%arg9 : memref<32x32xi32, 2>)
           air.execute_terminator
         } {id = 1 : i32}
-        %2 = air.wait_all async [%asyncToken] 
+        %2 = air.wait_all async [%asyncToken]
         scf.yield %2 : !air.async.token
       }
-      air.wait_all [%1] 
+      air.wait_all [%1]
+      %true = arith.cmpi slt, %c0, %c2 : index
+      // CHECK: scf.if %{{.*}} {
+      // CHECK-NOT: scf.if {{.*}} -> !air.async.token
+      %3 = scf.if %true -> (!air.async.token) {
+        %4 = air.execute [%0] {
+          air.execute_terminator
+        }
+        scf.yield %4 : !air.async.token
+      } else {
+        scf.yield %0 : !air.async.token
+      }
+      air.wait_all [%3]
     }
     return
   }

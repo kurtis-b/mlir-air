@@ -321,6 +321,7 @@ RUN_PY_COMMON_ARGS := \
 	--external-active-m-packs $(EXTERNAL_ACTIVE_M_PACKS) \
 	--external-core-n-packs $(EXTERNAL_CORE_N_PACKS) \
 	--external-c-stride-m-packs $(EXTERNAL_C_STRIDE_M_PACKS) \
+	--external-atb-c-offset $(EXTERNAL_ATB_C_OFFSET) \
 	--atb-k-chunk-elements $(ATB_K_CHUNK_ELEMENTS) \
 	$(OMIT_PING_PONG_ARG) \
 	$(AIRCC_DEBUG_IR_ARG) \

@@ -427,7 +427,11 @@ SmallVector<Value> getAsyncDependenciesFromOpImpl(air::AsyncOpInterface op) {
   return op.getAsyncDependencies();
 }
 SmallVector<Value> getAsyncDependenciesFromOpImpl(scf::ForOp op) {
-  return op.getInitArgs();
+  SmallVector<Value> deps;
+  for (Value initArg : op.getInitArgs())
+    if (isa<air::AsyncTokenType>(initArg.getType()))
+      deps.push_back(initArg);
+  return deps;
 }
 SmallVector<Value> getAsyncDependenciesFromOpImpl(scf::ParallelOp op) {
   return op.getInitVals();

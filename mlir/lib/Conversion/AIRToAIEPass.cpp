@@ -257,6 +257,27 @@ LogicalResult outlineAIECores(OpBuilder &builder, AIE::DeviceOp aie_device,
     h->setAttr(row_name,
                IntegerAttr::get(IntegerType::get(ctx, 32), row_offset));
 
+  auto getLinkWithForHerd = [&]() -> StringAttr {
+    if (auto attr = h->getAttrOfType<StringAttr>("link_with"))
+      return attr;
+    ModuleOp moduleOp = h->getParentOfType<ModuleOp>();
+    if (!moduleOp)
+      return {};
+    StringAttr linkWith;
+    h.walk([&](func::CallOp callOp) {
+      if (linkWith)
+        return WalkResult::interrupt();
+      auto fnDecl = dyn_cast_or_null<func::FuncOp>(
+          SymbolTable::lookupSymbolIn(moduleOp, callOp.getCallee()));
+      if (!fnDecl)
+        return WalkResult::advance();
+      linkWith = fnDecl->getAttrOfType<StringAttr>("link_with");
+      return linkWith ? WalkResult::interrupt() : WalkResult::advance();
+    });
+    return linkWith;
+  };
+  StringAttr herdLinkWith = getLinkWithForHerd();
+
   for (auto y = 0; y < herd_size_y; y++) {
     for (auto x = 0; x < herd_size_x; x++) {
       auto hloc = h.getLoc();
@@ -310,9 +331,9 @@ LogicalResult outlineAIECores(OpBuilder &builder, AIE::DeviceOp aie_device,
         if (auto sym =
                 h->getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName()))
           core->setAttr("air.herd_name", sym);
-        if (auto a = h->getAttrOfType<StringAttr>("link_with"))
-          core->setAttr("link_with", a);
       }
+      if (herdLinkWith)
+        core->setAttr("link_with", herdLinkWith);
 
       // Collect IDs from all parent hierarchy ops (Launch, Segment, etc.).
       // These values become compile-time constants and don't need RTP slots.
@@ -557,6 +578,10 @@ LogicalResult outlineAIECores(OpBuilder &builder, AIE::DeviceOp aie_device,
         if (auto call = dyn_cast_if_present<func::CallOp>(op)) {
           auto fn = aie_device.lookupSymbol<func::FuncOp>(call.getCallee());
           if (!fn) {
+            func::FuncOp origFn;
+            if (auto parentModule = aie_device->getParentOfType<ModuleOp>())
+              origFn =
+                  parentModule.lookupSymbol<func::FuncOp>(call.getCallee());
             // Normalize memref types: strip strided layout so that
             // convert-func-to-llvm with bare-ptr calling convention can
             // handle the declaration. External kernels use C ABI (raw
@@ -579,13 +604,9 @@ LogicalResult outlineAIECores(OpBuilder &builder, AIE::DeviceOp aie_device,
             fn.setPrivate();
             // Copy attributes from the original declaration in the parent
             // module (e.g. link_with, llvm.emit_c_interface).
-            if (auto parentModule = aie_device->getParentOfType<ModuleOp>()) {
-              if (auto origFn = parentModule.lookupSymbol<func::FuncOp>(
-                      call.getCallee())) {
-                for (auto attr : origFn->getDiscardableAttrs())
-                  fn->setAttr(attr.getName(), attr.getValue());
-              }
-            }
+            if (origFn)
+              for (auto attr : origFn->getDiscardableAttrs())
+                fn->setAttr(attr.getName(), attr.getValue());
             // Fallback: if link_with was not found from parent module,
             // use the attribute from the aie.core op.
             if (!fn->hasAttr("link_with")) {
@@ -1701,6 +1722,13 @@ struct LowerAIRExecutePattern : public OpRewritePattern<air::ExecuteOp> {
 
   LogicalResult matchAndRewrite(air::ExecuteOp op,
                                 PatternRewriter &rewriter) const override {
+    if (op.getNumResults() > 0) {
+      Value asyncResult = op.getResult(0);
+      if (llvm::isa<air::AsyncTokenType>(asyncResult.getType()) &&
+          !hasOnlyAsyncDependencyUses(asyncResult))
+        return failure();
+    }
+
     auto &bb = op.getRegion().front();
     unsigned idx = 0;
     for (auto &arg : bb.getArguments()) {
@@ -1712,11 +1740,17 @@ struct LowerAIRExecutePattern : public OpRewritePattern<air::ExecuteOp> {
                              op.getAsyncDependencies());
     }
     if (op.getNumResults() > 0) {
-      rewriter.setInsertionPointAfter(op);
-      auto w = air::WaitAllOp::create(
-          rewriter, op->getLoc(), air::AsyncTokenType::get(op->getContext()),
-          SmallVector<Value, 1>{});
-      op.getResult(0).replaceAllUsesWith(w.getResult(0));
+      Value asyncResult = op.getResult(0);
+      if (llvm::isa<air::AsyncTokenType>(asyncResult.getType()) &&
+          hasOnlyAsyncDependencyUses(asyncResult)) {
+        dropAsyncDependencyUses(asyncResult);
+      } else {
+        rewriter.setInsertionPointAfter(op);
+        auto w = air::WaitAllOp::create(
+            rewriter, op->getLoc(), air::AsyncTokenType::get(op->getContext()),
+            SmallVector<Value, 1>{});
+        asyncResult.replaceAllUsesWith(w.getResult(0));
+      }
     }
     op.walk([&](air::ExecuteTerminatorOp t) {
       int resultIdx = 1;
@@ -1729,6 +1763,24 @@ struct LowerAIRExecutePattern : public OpRewritePattern<air::ExecuteOp> {
 
     rewriter.eraseOp(op);
     return success();
+  }
+
+private:
+  bool hasOnlyAsyncDependencyUses(Value token) const {
+    for (OpOperand &use : token.getUses())
+      if (!dyn_cast<air::AsyncOpInterface>(use.getOwner()))
+        return false;
+    return true;
+  }
+
+  void dropAsyncDependencyUses(Value token) const {
+    while (!token.use_empty()) {
+      auto asyncUser =
+          dyn_cast<air::AsyncOpInterface>(token.use_begin()->getOwner());
+      if (!asyncUser)
+        return;
+      air::eraseAsyncDependencyFromAsyncOp(asyncUser, token);
+    }
   }
 };
 
@@ -1744,6 +1796,127 @@ void lowerAirExecute(AIE::DeviceOp d) {
   (void)applyPatternsGreedily(d, std::move(patterns));
 }
 
+
+struct LowerScfIfTokenPattern : public OpRewritePattern<scf::IfOp> {
+  using OpRewritePattern<scf::IfOp>::OpRewritePattern;
+
+  LowerScfIfTokenPattern(MLIRContext *ctx) : OpRewritePattern(ctx) {}
+
+  LogicalResult matchAndRewrite(scf::IfOp ifOp,
+                                PatternRewriter &rewriter) const override {
+    if (ifOp.getNumResults() == 0)
+      return failure();
+
+    SmallVector<Type, 4> resultTypes;
+    bool hasTokenResult = false;
+    for (Type resultType : ifOp.getResultTypes()) {
+      if (isa<air::AsyncTokenType>(resultType)) {
+        hasTokenResult = true;
+        continue;
+      }
+      resultTypes.push_back(resultType);
+    }
+    if (!hasTokenResult)
+      return failure();
+
+    Value replacementToken;
+    for (Value dep : air::getAsyncDependenciesFromOp(ifOp.getOperation())) {
+      if (isa<air::AsyncTokenType>(dep.getType())) {
+        replacementToken = dep;
+        break;
+      }
+    }
+
+    for (Value result : ifOp.getResults()) {
+      if (!isa<air::AsyncTokenType>(result.getType()))
+        continue;
+      if (!replacementToken && !hasOnlyAsyncDependencyUses(result))
+        return failure();
+    }
+
+    auto newIf = scf::IfOp::create(rewriter, ifOp.getLoc(), resultTypes,
+                                   ifOp.getCondition(), ifOp.elseBlock());
+
+    if (failed(cloneRegionWithoutTokenYields(rewriter, ifOp.getThenRegion(),
+                                             newIf.getThenRegion())))
+      return failure();
+    if (ifOp.elseBlock())
+      if (failed(cloneRegionWithoutTokenYields(rewriter, ifOp.getElseRegion(),
+                                               newIf.getElseRegion())))
+        return failure();
+
+    unsigned resultIdx = 0;
+    for (Value result : ifOp.getResults()) {
+      if (isa<air::AsyncTokenType>(result.getType())) {
+        if (replacementToken)
+          result.replaceAllUsesWith(replacementToken);
+        else
+          dropAsyncDependencyUses(result);
+      } else {
+        result.replaceAllUsesWith(newIf.getResult(resultIdx++));
+      }
+    }
+
+    rewriter.eraseOp(ifOp);
+    return success();
+  }
+
+private:
+  LogicalResult cloneRegionWithoutTokenYields(PatternRewriter &rewriter,
+                                              Region &oldRegion,
+                                              Region &newRegion) const {
+    if (oldRegion.empty() || newRegion.empty())
+      return failure();
+
+    Block *oldBlock = &oldRegion.front();
+    Block *newBlock = &newRegion.front();
+    auto oldYield = dyn_cast<scf::YieldOp>(oldBlock->getTerminator());
+    if (!oldYield)
+      return failure();
+
+    while (!newBlock->empty())
+      rewriter.eraseOp(&newBlock->back());
+
+    IRMapping mapping;
+    rewriter.setInsertionPointToStart(newBlock);
+    for (Operation &bodyOp : oldBlock->without_terminator())
+      rewriter.clone(bodyOp, mapping);
+
+    SmallVector<Value, 4> yieldOperands;
+    SmallVector<Value, 4> tokenOperands;
+    for (Value operand : oldYield.getOperands()) {
+      Value mapped = mapping.lookupOrDefault(operand);
+      if (isa<air::AsyncTokenType>(mapped.getType()))
+        tokenOperands.push_back(mapped);
+      else
+        yieldOperands.push_back(mapped);
+    }
+
+    if (!tokenOperands.empty())
+      air::WaitAllOp::create(rewriter, oldYield.getLoc(), SmallVector<Type, 1>{},
+                             tokenOperands);
+    scf::YieldOp::create(rewriter, oldYield.getLoc(), yieldOperands);
+    return success();
+  }
+
+  bool hasOnlyAsyncDependencyUses(Value token) const {
+    for (OpOperand &use : token.getUses())
+      if (!dyn_cast<air::AsyncOpInterface>(use.getOwner()))
+        return false;
+    return true;
+  }
+
+  void dropAsyncDependencyUses(Value token) const {
+    while (!token.use_empty()) {
+      auto asyncUser =
+          dyn_cast<air::AsyncOpInterface>(token.use_begin()->getOwner());
+      if (!asyncUser)
+        return;
+      air::eraseAsyncDependencyFromAsyncOp(asyncUser, token);
+    }
+  }
+};
+
 struct LowerScfTokenPattern : public OpRewritePattern<scf::ForOp> {
   using OpRewritePattern<scf::ForOp>::OpRewritePattern;
 
@@ -1756,6 +1929,7 @@ struct LowerScfTokenPattern : public OpRewritePattern<scf::ForOp> {
       return failure();
 
     SmallVector<Value, 4> iter_args;
+    SmallVector<Value, 4> token_init_args;
     BitVector iter_args_idx(fop.getNumOperands());
 
     // erase air.event from the iter args
@@ -1765,6 +1939,7 @@ struct LowerScfTokenPattern : public OpRewritePattern<scf::ForOp> {
                          fop.getNumControlOperands());
       if (llvm::isa<air::AsyncTokenType>(v.getType())) {
         block_arg.replaceAllUsesWith(v);
+        token_init_args.push_back(v);
         iter_args_idx.set(block_arg.getArgNumber());
       } else {
         iter_args.push_back(v);
@@ -1792,18 +1967,21 @@ struct LowerScfTokenPattern : public OpRewritePattern<scf::ForOp> {
     if (fop->hasAttr("unroll")) {
       new_fop->setAttr("unroll", fop->getAttr("unroll"));
     }
+    if (fop->hasAttr("atb_two_buffer_pipeline"))
+      new_fop->setAttr("atb_two_buffer_pipeline",
+                       fop->getAttr("atb_two_buffer_pipeline"));
 
     // use the new for op's results
     int idx = 0;
+    unsigned tokenResultIdx = 0;
     for (auto r : fop.getResults()) {
-      if (llvm::isa<air::AsyncTokenType>(r.getType()))
-        r.replaceAllUsesWith(
-            air::WaitAllOp::create(rewriter, fop->getLoc(),
-                                   air::AsyncTokenType::get(fop->getContext()),
-                                   SmallVector<Value, 1>{})
-                .getResult(0));
-      else
+      if (llvm::isa<air::AsyncTokenType>(r.getType())) {
+        if (tokenResultIdx >= token_init_args.size())
+          return failure();
+        r.replaceAllUsesWith(token_init_args[tokenResultIdx++]);
+      } else {
         r.replaceAllUsesWith(new_fop.getResult(idx++));
+      }
     }
 
     // remove air.async.token from the yield op
@@ -1872,6 +2050,13 @@ void lowerScfAirTokens(AIE::DeviceOp m) {
   RewritePatternSet patterns(ctx);
   patterns.insert<LowerScfTokenPattern>(ctx);
   patterns.insert<AttachMustProgressPattern>(ctx);
+  (void)applyPatternsGreedily(m, std::move(patterns));
+}
+
+void lowerScfIfAirTokens(AIE::DeviceOp m) {
+  auto ctx = m->getContext();
+  RewritePatternSet patterns(ctx);
+  patterns.insert<LowerScfIfTokenPattern>(ctx);
   (void)applyPatternsGreedily(m, std::move(patterns));
 }
 
@@ -2885,6 +3070,13 @@ struct OpRemovalPattern : public OpConversionPattern<OpT> {
       if (res.use_empty())
         continue;
       if (isa<air::AsyncTokenType>(res.getType())) {
+        if (auto waitAll = dyn_cast<air::WaitAllOp>(op.getOperation())) {
+          if (waitAll.getAsyncDependencies().empty() &&
+              hasOnlyAsyncDependencyUses(res)) {
+            dropAsyncDependencyUses(res);
+            continue;
+          }
+        }
         res.replaceAllUsesWith(
             air::WaitAllOp::create(rewriter, op->getLoc(),
                                    air::AsyncTokenType::get(op->getContext()),
@@ -2894,6 +3086,24 @@ struct OpRemovalPattern : public OpConversionPattern<OpT> {
     }
     rewriter.eraseOp(op);
     return success();
+  }
+
+private:
+  bool hasOnlyAsyncDependencyUses(Value token) const {
+    for (OpOperand &use : token.getUses())
+      if (!dyn_cast<air::AsyncOpInterface>(use.getOwner()))
+        return false;
+    return true;
+  }
+
+  void dropAsyncDependencyUses(Value token) const {
+    while (!token.use_empty()) {
+      auto asyncUser =
+          dyn_cast<air::AsyncOpInterface>(token.use_begin()->getOwner());
+      if (!asyncUser)
+        return;
+      air::eraseAsyncDependencyFromAsyncOp(asyncUser, token);
+    }
   }
 };
 
@@ -3071,6 +3281,10 @@ public:
     specializeHerdAffineIf(device);
     lowerAirExecute(device);
     lowerScfAirTokens(device);
+    lowerScfIfAirTokens(device);
+    lowerAirExecute(device);
+    lowerScfAirTokens(device);
+    lowerScfIfAirTokens(device);
     if (stopAfter == PipelineStage::AfterLowerExecute)
       return success();
 
@@ -3130,6 +3344,12 @@ public:
     lowerMemRefCopyToLoops(device);
     if (stopAfter == PipelineStage::AfterLowerMemRefCopy)
       return success();
+
+    // Later lowering can introduce or expose token-carrying scf.for loops.
+    // Strip those before final wait_all cleanup so empty token seeds do not
+    // survive as illegal placeholders.
+    lowerScfAirTokens(device);
+    lowerScfIfAirTokens(device);
 
     // Complete stage: Canonicalization and op removal
     RewritePatternSet patterns(ctx);
@@ -4920,6 +5140,55 @@ public:
     return lastAccessOp;
   }
 
+  bool isAtbActiveABuffer(Value buffer) {
+    auto memrefType = dyn_cast_if_present<MemRefType>(buffer.getType());
+    if (!memrefType || air::getMemorySpace(memrefType) != air::MemorySpace::L1)
+      return false;
+    if (memrefType.getRank() != 4)
+      return false;
+    ArrayRef<int64_t> shape = memrefType.getShape();
+    return shape[0] == 18 && shape[1] == 6 && shape[2] == 8 &&
+           shape[3] == 8;
+  }
+
+  /// The ATB active-M software pipeline prefetches A in one branch of a marked
+  /// loop and consumes it in a later sibling branch. The generic lifetime scan
+  /// only sees following ops in the memcpy block, so it releases the inbound
+  /// free lock before compute. Scan the marked loop body instead and place the
+  /// release after the matching buffer use.
+  Operation *findLastReadOrWriteInAtbPipelineLoop(Operation *memcpyOp,
+                                                  Value destBuffer) {
+    if (!isAtbActiveABuffer(destBuffer))
+      return nullptr;
+
+    auto loop = memcpyOp->getParentOfType<scf::ForOp>();
+    while (loop && !loop->hasAttr("atb_two_buffer_pipeline"))
+      loop = loop->getParentOfType<scf::ForOp>();
+    if (!loop)
+      return nullptr;
+
+    bool seenMemcpy = false;
+    Operation *lastAccessOp = nullptr;
+    SetVector<Value> bufferViews;
+    bufferViews.insert(destBuffer);
+
+    loop.getBody()->walk([&](Operation *op) {
+      if (auto view = dyn_cast_if_present<ViewLikeOpInterface>(op)) {
+        if (llvm::is_contained(bufferViews, view.getViewSource()))
+          bufferViews.insert(view->getResult(0));
+      }
+
+      if (op == memcpyOp) {
+        seenMemcpy = true;
+        return;
+      }
+
+      if (seenMemcpy && isReadOrWriteToBuffer(op, bufferViews))
+        lastAccessOp = op;
+    });
+    return lastAccessOp;
+  }
+
   LogicalResult allocateCoreLocksPerMemcpyOp(
       OpBuilder builder, air::MemcpyInterface memcpyOpIf,
       llvm::SetVector<Operation *> &allocs_to_remap,
@@ -5023,6 +5292,27 @@ public:
       builder.setInsertionPoint(nextWriter);
       AIE::UseLockOp::create(builder, nextWriter->getLoc(), relLockOp,
                              AIE::LockAction::Release, lockRelValue);
+    } else if (tileInbound.value()) {
+      if (auto lastAccessOp =
+              findLastReadOrWriteInAtbPipelineLoop(memcpyOpIf, alloc)) {
+        // The matching compute use is inside the marked pipeline loop, not in
+        // the same branch/block as the channel get.
+        builder.setInsertionPointAfter(lastAccessOp);
+        AIE::UseLockOp::create(builder, lastAccessOp->getLoc(), relLockOp,
+                               AIE::LockAction::Release, lockRelValue);
+      } else if (auto lastAccessOp =
+                     findLastReadOrWriteOp(memcpyOpIf, alloc)) {
+        // Lifetime ends after the last read/write access to buffer.
+        builder.setInsertionPointAfter(lastAccessOp);
+        AIE::UseLockOp::create(builder, lastAccessOp->getLoc(), relLockOp,
+                               AIE::LockAction::Release, lockRelValue);
+      } else {
+        // Lifetime ends at end of block.
+        auto t = memcpyOpIf->getBlock()->getTerminator();
+        builder.setInsertionPoint(t);
+        AIE::UseLockOp::create(builder, t->getLoc(), relLockOp,
+                               AIE::LockAction::Release, lockRelValue);
+      }
     } else if (auto lastAccessOp = findLastReadOrWriteOp(memcpyOpIf, alloc)) {
       // Lifetime ends after the last read/write access to buffer.
       builder.setInsertionPointAfter(lastAccessOp);
@@ -6439,8 +6729,10 @@ public:
       patterns.insert<SpecializeAffineIfPattern>(ctx);
     if (clTestPatterns.find("specialize-scf-if") != std::string::npos)
       patterns.insert<SpecializeScfIfPattern>(ctx);
-    if (clTestPatterns.find("lower-scf-tokens") != std::string::npos)
+    if (clTestPatterns.find("lower-scf-tokens") != std::string::npos) {
+      patterns.insert<LowerScfIfTokenPattern>(ctx);
       patterns.insert<LowerScfTokenPattern>(ctx);
+    }
 
     ShimTileAllocator shimTileAlloc(AIE::getTargetModel(*device));
     std::map<Operation *, AIE::ObjectFifoCreateOp> linksToComplete;
@@ -6574,6 +6866,10 @@ public:
         specializeHerdAffineIf(device);
         lowerAirExecute(device);
         lowerScfAirTokens(device);
+        lowerScfIfAirTokens(device);
+        lowerAirExecute(device);
+        lowerScfAirTokens(device);
+        lowerScfIfAirTokens(device);
         specializeChannelBundle(device, chan_to_chan_map);
         // Only remove orphaned channels when segment unroll is active
         if (device->hasAttr("segment_unroll_x") ||
@@ -6596,6 +6892,10 @@ public:
         specializeHerdAffineIf(device);
         lowerAirExecute(device);
         lowerScfAirTokens(device);
+        lowerScfIfAirTokens(device);
+        lowerAirExecute(device);
+        lowerScfAirTokens(device);
+        lowerScfIfAirTokens(device);
         specializeChannelBundle(device, chan_to_chan_map);
         // Only remove orphaned channels when segment unroll is active
         if (device->hasAttr("segment_unroll_x") ||
@@ -6749,6 +7049,9 @@ public:
         for (auto &n : shimTileAlloc.chan_names)
           labelAIRDmaOpsWithMetadataObjFifo(channel_ops, n, chan_to_chan_map);
       }
+
+      lowerScfAirTokens(device);
+      lowerScfIfAirTokens(device);
 
       RewritePatternSet patterns(ctx);
       air::WaitAllOp::getCanonicalizationPatterns(patterns, ctx);
