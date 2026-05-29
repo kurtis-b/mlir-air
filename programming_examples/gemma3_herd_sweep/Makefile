@@ -12,6 +12,8 @@ endif
 
 OUTPUT_FORMAT ?= elf
 OUTPUT_FORMAT_FLAG := --output-format $(OUTPUT_FORMAT)
+DEBUG_IR ?= 0
+DEBUG_IR_FLAG := $(if $(filter 1 true yes,$(DEBUG_IR)),--debug-ir,)
 COMPILE_MODE ?= compile-only
 HERD_SHAPE ?= 2x4
 HERD_DIMS := $(subst x, ,$(HERD_SHAPE))
@@ -70,6 +72,7 @@ FLOWQKV_KV_STAGING ?= pipeline
 FLOWKV_KV_STAGING ?= pipeline
 FUSED_DQP_COL_BLOCKS ?= 1
 FUSED_DQP_COL_CHUNK ?= 32
+FUSED_DQP_PIPE_ROW_CHUNK ?= 16
 PAPER_FUSED_DQP_COL_BLOCKS ?= 2
 PAPER_KV_GROUPS ?= 4
 PAPER_HEADS_PER_KV ?= 2
@@ -105,7 +108,7 @@ run-q4nx: compile-q4nx-kernel prepare-air-project
 		python3 $(srcdir)/q4nx.py --rows $(Q4NX_ROWS) --cols $(Q4NX_COLS) \
 		--herd-shape $(HERD_SHAPE) --kernel-name q4nx_dequant_block_opt \
 		--object-file q4nx.o --compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG) \
-		--output-mode $(Q4NX_OUTPUT_MODE)
+		$(DEBUG_IR_FLAG) --output-mode $(Q4NX_OUTPUT_MODE)
 
 # Logical 8x4 Q4NX workload using two host-side physical 4x4 row bands.
 run-q4nx-8x4-rowband-fallback: compile-q4nx-kernel prepare-air-project
@@ -114,7 +117,7 @@ run-q4nx-8x4-rowband-fallback: compile-q4nx-kernel prepare-air-project
 		python3 $(srcdir)/q4nx.py --rows $(Q4NX_ROWS) --cols $(Q4NX_COLS) \
 		--herd-shape 4x4 --row-blocks 4 --col-blocks 4 --repeat-row-bands 2 \
 		--kernel-name q4nx_dequant_block_opt --object-file q4nx.o \
-		--compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG) --output-mode l2-gather
+		--compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG) $(DEBUG_IR_FLAG) --output-mode l2-gather
 
 compile-fused-dqp-kernel: check-peano
 	mkdir -p $(BUILD_DIR)
@@ -122,6 +125,7 @@ compile-fused-dqp-kernel: check-peano
 		-DQ4NX_ROWS=$(Q4NX_ROWS) -DQ4NX_COLS=$(Q4NX_COLS) \
 		-DFUSED_DQP_COL_BLOCKS=$(FUSED_DQP_COL_BLOCKS) \
 		-DFUSED_DQP_COL_CHUNK=$(FUSED_DQP_COL_CHUNK) \
+		-DFUSED_DQP_PIPE_ROW_CHUNK=$(FUSED_DQP_PIPE_ROW_CHUNK) \
 		-c $(srcdir)/fused_dqp_opt.cc -o $(BUILD_DIR)/fused_dqp.o
 
 run-fused-dqp: compile-fused-dqp-kernel prepare-air-project
@@ -130,8 +134,9 @@ run-fused-dqp: compile-fused-dqp-kernel prepare-air-project
 		python3 $(srcdir)/fused_dqp.py --rows $(Q4NX_ROWS) --cols $(Q4NX_COLS) \
 		--herd-shape $(HERD_SHAPE) --kernel-name fused_dqp_block_opt \
 		--object-file fused_dqp.o --compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG) \
-		--output-mode $(FUSED_DQP_OUTPUT_MODE) --schedule-mode $(FUSED_DQP_SCHEDULE_MODE) \
-		--col-blocks $(FUSED_DQP_COL_BLOCKS) --col-chunk $(FUSED_DQP_COL_CHUNK)
+		$(DEBUG_IR_FLAG) --output-mode $(FUSED_DQP_OUTPUT_MODE) --schedule-mode $(FUSED_DQP_SCHEDULE_MODE) \
+		--col-blocks $(FUSED_DQP_COL_BLOCKS) --col-chunk $(FUSED_DQP_COL_CHUNK) \
+		--pipe-row-chunk $(FUSED_DQP_PIPE_ROW_CHUNK)
 
 run-fused-dqp-paper:
 	$(MAKE) -f $(this_makefile) run-fused-dqp HERD_SHAPE=4x4 FUSED_DQP_SCHEDULE_MODE=paper \
@@ -139,7 +144,8 @@ run-fused-dqp-paper:
 
 run-fused-dqp-pipeline:
 	$(MAKE) -f $(this_makefile) run-fused-dqp HERD_SHAPE=8x4 FUSED_DQP_SCHEDULE_MODE=pipeline \
-		FUSED_DQP_OUTPUT_MODE=l2-gather FUSED_DQP_COL_BLOCKS=$(PAPER_FUSED_DQP_COL_BLOCKS)
+		FUSED_DQP_OUTPUT_MODE=l2-gather FUSED_DQP_COL_BLOCKS=$(PAPER_FUSED_DQP_COL_BLOCKS) \
+		FUSED_DQP_COL_CHUNK=8 FUSED_DQP_PIPE_ROW_CHUNK=16
 
 compile-mm-kernel: check-peano
 	mkdir -p $(BUILD_DIR)
@@ -175,7 +181,7 @@ run-flowqkv: compile-flowqkv-kernel prepare-air-project
 		--query-base $(FLOWQKV_QUERY_BASE) --window-len $(WINDOW_LEN) \
 		$(FLOWQKV_CAUSAL_FLAG) --kernel-name flowqkv_chunk_bf16_opt \
 		--object-file flowqkv.o --compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG) \
-		--output-mode $(FLOWQKV_OUTPUT_MODE) --schedule-mode $(FLOWQKV_SCHEDULE_MODE) \
+		$(DEBUG_IR_FLAG) --output-mode $(FLOWQKV_OUTPUT_MODE) --schedule-mode $(FLOWQKV_SCHEDULE_MODE) \
 		--kv-groups $(PAPER_KV_GROUPS) --heads-per-kv $(PAPER_HEADS_PER_KV) \
 		--kv-staging $(FLOWQKV_KV_STAGING) --variant $(FLOWQKV_VARIANT)
 
@@ -195,14 +201,14 @@ run-flowkv: compile-flowkv-kernel prepare-air-project
 		--window-len $(WINDOW_LEN) $(FLOWKV_CAUSAL_FLAG) \
 		--kernel-name flowkv_decode_bf16_opt --object-file flowkv.o \
 		--compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG) \
-		--output-mode $(FLOWKV_OUTPUT_MODE) --schedule-mode $(FLOWKV_SCHEDULE_MODE) \
+		$(DEBUG_IR_FLAG) --output-mode $(FLOWKV_OUTPUT_MODE) --schedule-mode $(FLOWKV_SCHEDULE_MODE) \
 		--kv-groups $(PAPER_KV_GROUPS) --heads-per-kv $(PAPER_HEADS_PER_KV) \
 		--kv-staging $(FLOWKV_KV_STAGING) --variant $(FLOWKV_VARIANT)
 
 run-flowqkv-paper:
 	$(MAKE) -f $(this_makefile) run-flowqkv HERD_SHAPE=8x4 FLOWQKV_SCHEDULE_MODE=paper \
 		FLOWQKV_OUTPUT_MODE=l2-gather Q_CHUNK=$(PAPER_Q_CHUNK) KV_LEN=$(PAPER_KV_LEN) \
-		KV_CHUNK=$(KV_CHUNK) HEAD_DIM=$(PAPER_HEAD_DIM)
+		KV_CHUNK=$(PAPER_KV_CHUNK) HEAD_DIM=$(PAPER_HEAD_DIM)
 
 run-flowkv-paper:
 	$(MAKE) -f $(this_makefile) run-flowkv HERD_SHAPE=2x4 FLOWKV_SCHEDULE_MODE=paper \

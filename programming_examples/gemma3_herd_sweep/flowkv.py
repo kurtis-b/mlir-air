@@ -41,6 +41,7 @@ def main():
     parser = argparse.ArgumentParser(description="FlowKV decode attention")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("-p", "--print-module-only", action="store_true")
+    parser.add_argument("--debug-ir", action="store_true")
     parser.add_argument("--kv-len", type=int, default=32)
     parser.add_argument("--kv-chunk", type=int, default=32)
     parser.add_argument("--head-dim", type=int, default=64)
@@ -275,6 +276,7 @@ def main():
         output_format=args.output_format,
         verbose=args.verbose,
         instance_name=instance_name,
+        debug_ir=args.debug_ir,
     )
 
 

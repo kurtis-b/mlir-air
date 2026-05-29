@@ -92,6 +92,11 @@ def _index_constant(value):
     return ConstantOp(index_type, IntegerAttr.get(index_type, value))
 
 
+def _i32_constant(value):
+    i32_type = T.i32()
+    return ConstantOp(i32_type, IntegerAttr.get(i32_type, value))
+
+
 def _pack_l3_inputs(packed: np.ndarray, params: np.ndarray) -> np.ndarray:
     packed_i8 = np.ascontiguousarray(packed, dtype=np.int8)
     params_i8 = np.ascontiguousarray(params).view(np.int8).reshape(
@@ -474,12 +479,13 @@ def build_paper_module(
 def build_pipeline_module(
     rows,
     cols,
-    dequant_kernel_name="fused_dqp_dequant_colchunk_opt",
-    project_kernel_name="fused_dqp_project_colchunk_opt",
+    dequant_kernel_name="fused_dqp_dequant_tile_opt",
+    project_kernel_name="fused_dqp_project_tile_opt",
     object_file="fused_dqp.o",
     row_blocks=1,
     col_blocks=1,
-    col_chunk=32,
+    col_chunk=8,
+    pipe_row_chunk=16,
     herd_rows=4,
     herd_cols=4,
     output_mode="l2-gather",
@@ -492,6 +498,8 @@ def build_pipeline_module(
         raise ValueError("FusedDQP pipeline mode expects cols divisible by col-chunk")
     if col_chunk % 8 != 0:
         raise ValueError("FusedDQP pipeline mode expects col-chunk divisible by 8")
+    if pipe_row_chunk <= 0 or rows % pipe_row_chunk != 0:
+        raise ValueError("FusedDQP pipeline mode expects rows divisible by pipe-row-chunk")
     use_l2_gather = output_mode == "l2-gather"
 
     pipe_rows = herd_rows // 2
@@ -524,8 +532,8 @@ def build_pipeline_module(
     l1_pack_all_ty = MemRefType.get(
         [col_blocks * block_bytes], i8_type, memory_space=l1_space
     )
-    l1_deq_chunk_ty = MemRefType.get(
-        [rows, col_chunk], bf16_type, memory_space=l1_space
+    l1_deq_tile_ty = MemRefType.get(
+        [pipe_row_chunk, col_chunk], bf16_type, memory_space=l1_space
     )
     l1_act_all_ty = MemRefType.get(
         [col_blocks * cols], bf16_type, memory_space=l1_space
@@ -535,7 +543,7 @@ def build_pipeline_module(
 
     dequant_func = FuncOp(
         dequant_kernel_name,
-        ([T.i32(), T.i32(), l1_pack_all_ty, l1_deq_chunk_ty], []),
+        ([T.i32(), T.i32(), T.i32(), l1_pack_all_ty, l1_deq_tile_ty], []),
         visibility="private",
     )
     dequant_func.attributes["link_with"] = StringAttr.get(object_file)
@@ -543,7 +551,7 @@ def build_pipeline_module(
 
     project_func = FuncOp(
         project_kernel_name,
-        ([l1_deq_chunk_ty, l1_act_chunk_ty, l1_out_ty], []),
+        ([T.i32(), l1_deq_tile_ty, l1_act_chunk_ty, l1_out_ty], []),
         visibility="private",
     )
     project_func.attributes["link_with"] = StringAttr.get(object_file)
@@ -598,7 +606,7 @@ def build_pipeline_module(
                 )
                 def dequant_body(_tx, _ty, _sx, _sy, hpack):
                     l1_pack_all = AllocOp(l1_pack_all_ty, [], [])
-                    l1_deq_chunk = AllocOp(l1_deq_chunk_ty, [], [])
+                    l1_deq_tile = AllocOp(l1_deq_tile_ty, [], [])
 
                     dma_memcpy_nd(
                         l1_pack_all,
@@ -615,18 +623,21 @@ def build_pipeline_module(
 
                     for cb in range_(0, col_blocks, 1):
                         cb_i32 = arith.IndexCastOp(T.i32(), cb).result
-                        for col_offset in range_(0, cols, col_chunk):
-                            col_i32 = arith.IndexCastOp(T.i32(), col_offset).result
-                            CallOp(
-                                dequant_func,
-                                [cb_i32, col_i32, l1_pack_all, l1_deq_chunk],
-                            )
-                            ChannelPut(deq_chan, l1_deq_chunk, indices=[_tx, _ty])
+                        for row_offset in range_(0, rows, pipe_row_chunk):
+                            row_i32 = arith.IndexCastOp(T.i32(), row_offset).result
+                            for col_offset in range_(0, cols, col_chunk):
+                                col_i32 = arith.IndexCastOp(T.i32(), col_offset).result
+                                CallOp(
+                                    dequant_func,
+                                    [cb_i32, row_i32, col_i32, l1_pack_all, l1_deq_tile],
+                                )
+                                ChannelPut(deq_chan, l1_deq_tile, indices=[_tx, _ty])
+                                yield_([])
                             yield_([])
                         yield_([])
 
                     DeallocOp(l1_pack_all)
-                    DeallocOp(l1_deq_chunk)
+                    DeallocOp(l1_deq_tile)
 
                 @herd(
                     name="fused_dqp_project_herd",
@@ -637,7 +648,7 @@ def build_pipeline_module(
                 def project_body(_tx, _ty, _sx, _sy, bbase, hact, h_out):
                     block_idx = affine_apply(block_map, [bbase, _tx, _ty])
                     l1_act_all = AllocOp(l1_act_all_ty, [], [])
-                    l1_deq_chunk = AllocOp(l1_deq_chunk_ty, [], [])
+                    l1_deq_tile = AllocOp(l1_deq_tile_ty, [], [])
                     l1_act_chunk = AllocOp(l1_act_chunk_ty, [], [])
                     l1_out = AllocOp(l1_out_ty, [], [])
                     zero = ConstantOp(bf16_type, 0.0)
@@ -652,14 +663,20 @@ def build_pipeline_module(
                     )
 
                     for cb in range_(0, col_blocks, 1):
-                        for col_offset in range_(0, cols, col_chunk):
-                            act_offset = affine_apply(act_offset_map, [cb, col_offset])
-                            ChannelGet(deq_chan, l1_deq_chunk, indices=[_tx, _ty])
-                            l1_a_src = subview(
-                                l1_act_all.result, [act_offset], [col_chunk], [1]
-                            )
-                            linalg.copy(l1_a_src, outs=[l1_act_chunk])
-                            CallOp(project_func, [l1_deq_chunk, l1_act_chunk, l1_out])
+                        for row_offset in range_(0, rows, pipe_row_chunk):
+                            row_i32 = arith.IndexCastOp(T.i32(), row_offset).result
+                            for col_offset in range_(0, cols, col_chunk):
+                                act_offset = affine_apply(act_offset_map, [cb, col_offset])
+                                ChannelGet(deq_chan, l1_deq_tile, indices=[_tx, _ty])
+                                l1_a_src = subview(
+                                    l1_act_all.result, [act_offset], [col_chunk], [1]
+                                )
+                                linalg.copy(l1_a_src, outs=[l1_act_chunk])
+                                CallOp(
+                                    project_func,
+                                    [row_i32, l1_deq_tile, l1_act_chunk, l1_out],
+                                )
+                                yield_([])
                             yield_([])
                         yield_([])
 
@@ -681,7 +698,7 @@ def build_pipeline_module(
                         )
 
                     DeallocOp(l1_act_all)
-                    DeallocOp(l1_deq_chunk)
+                    DeallocOp(l1_deq_tile)
                     DeallocOp(l1_act_chunk)
                     DeallocOp(l1_out)
 
@@ -713,12 +730,14 @@ def main():
     parser = argparse.ArgumentParser(description="FusedDQP block projection")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("-p", "--print-module-only", action="store_true")
+    parser.add_argument("--debug-ir", action="store_true")
     parser.add_argument("--rows", type=int, default=32)
     parser.add_argument("--cols", type=int, default=256)
     parser.add_argument("--herd-shape", choices=SUPPORTED_HERD_SHAPES, default="2x4")
     parser.add_argument("--row-blocks", type=int, default=None)
     parser.add_argument("--col-blocks", type=int, default=1)
     parser.add_argument("--col-chunk", type=int, default=32)
+    parser.add_argument("--pipe-row-chunk", type=int, default=16)
     parser.add_argument("--herd-rows", type=int, default=None)
     parser.add_argument("--herd-cols", type=int, default=None)
     parser.add_argument("--schedule-mode", choices=(*SCHEDULE_MODES, "pipeline"), default="smoke")
@@ -752,6 +771,10 @@ def main():
         parser.error("pipeline schedule requires cols divisible by col-chunk")
     if args.schedule_mode == "pipeline" and args.col_chunk % 8 != 0:
         parser.error("pipeline schedule requires col-chunk divisible by 8")
+    if args.schedule_mode == "pipeline" and (
+        args.pipe_row_chunk <= 0 or args.rows % args.pipe_row_chunk != 0
+    ):
+        parser.error("pipeline schedule requires rows divisible by pipe-row-chunk")
 
     try:
         output_mode = resolve_output_mode(
@@ -777,12 +800,13 @@ def main():
         module = build_pipeline_module(
             args.rows,
             args.cols,
-            "fused_dqp_dequant_colchunk_opt",
-            "fused_dqp_project_colchunk_opt",
+            "fused_dqp_dequant_tile_opt",
+            "fused_dqp_project_tile_opt",
             args.object_file,
             args.row_blocks,
             args.col_blocks,
             args.col_chunk,
+            args.pipe_row_chunk,
             args.herd_rows,
             args.herd_cols,
             output_mode,
@@ -861,6 +885,7 @@ def main():
         target_device="npu2",
         runtime_loop_tiling_sizes=[1, 1],
         use_lock_race_condition_fix=True,
+        debug_ir=args.debug_ir,
     )
     if args.compile_mode == "compile-and-run":
         runner = XRTRunner(**backend_opts)

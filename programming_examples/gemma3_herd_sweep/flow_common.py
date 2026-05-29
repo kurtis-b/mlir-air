@@ -508,6 +508,7 @@ def build_flowqkv_pipeline_module(
     herd_cols=4,
     output_mode="l2-gather",
     query_base=0,
+    kv_chunk=32,
 ):
     if output_mode not in ("direct", "l2-gather"):
         raise ValueError(f"unsupported output mode: {output_mode}")
@@ -517,7 +518,10 @@ def build_flowqkv_pipeline_module(
         raise ValueError("FlowQKV pipeline mode expects one KV group per CT column")
     if query_base != 0:
         raise ValueError("FlowQKV pipeline mode currently expects query-base 0")
+    if kv_chunk <= 0 or kv_len % kv_chunk != 0:
+        raise ValueError("FlowQKV pipeline mode expects kv_len divisible by positive kv_chunk")
     use_l2_gather = output_mode == "l2-gather"
+    kv_chunks = kv_len // kv_chunk
 
     pipe_rows = herd_rows // 2
     bf16_type = type_mapper(bfloat16)
@@ -531,7 +535,9 @@ def build_flowqkv_pipeline_module(
         bf16_type,
         memory_space=l2_space,
     )
-    kv_l2_ty = MemRefType.get([kv_groups, kv_len, head_dim], bf16_type, memory_space=l2_space)
+    kv_l2_ty = MemRefType.get(
+        [kv_groups, kv_len, head_dim], bf16_type, memory_space=l2_space
+    )
     if use_l2_gather:
         out_l2_ty = MemRefType.get(
             [pipe_rows, herd_cols, q_chunk, head_dim],
@@ -541,13 +547,16 @@ def build_flowqkv_pipeline_module(
 
     l1_space = IntegerAttr.get(T.i32(), MemorySpace.L1)
     q_l1_ty = MemRefType.get([q_chunk, head_dim], bf16_type, memory_space=l1_space)
-    kv_l1_ty = MemRefType.get([kv_len, head_dim], bf16_type, memory_space=l1_space)
-    attn_l1_ty = MemRefType.get([q_chunk, kv_len], bf16_type, memory_space=l1_space)
+    k_l1_ty = MemRefType.get([kv_len, head_dim], bf16_type, memory_space=l1_space)
+    v_chunk_l1_ty = MemRefType.get(
+        [kv_chunk, head_dim], bf16_type, memory_space=l1_space
+    )
+    attn_l1_ty = MemRefType.get([q_chunk, kv_chunk], bf16_type, memory_space=l1_space)
     out_l1_ty = MemRefType.get([q_chunk, head_dim], bf16_type, memory_space=l1_space)
 
     score_func = FuncOp(
         score_kernel_func,
-        ([T.i32(), q_l1_ty, kv_l1_ty, attn_l1_ty], []),
+        ([T.i32(), T.i32(), q_l1_ty, k_l1_ty, attn_l1_ty], []),
         visibility="private",
     )
     score_func.attributes["link_with"] = StringAttr.get(object_file)
@@ -555,7 +564,7 @@ def build_flowqkv_pipeline_module(
 
     apply_func = FuncOp(
         apply_kernel_func,
-        ([attn_l1_ty, kv_l1_ty, out_l1_ty], []),
+        ([T.i32(), attn_l1_ty, v_chunk_l1_ty, out_l1_ty], []),
         visibility="private",
     )
     apply_func.attributes["link_with"] = StringAttr.get(object_file)
@@ -589,8 +598,8 @@ def build_flowqkv_pipeline_module(
                 )
                 def score_body(_tx, _ty, _sx, _sy, hq, hk):
                     l1_q = AllocOp(q_l1_ty, [], [])
-                    l1_k = AllocOp(kv_l1_ty, [], [])
-                    l1_attn = AllocOp(attn_l1_ty, [], [])
+                    l1_k = AllocOp(k_l1_ty, [], [])
+                    l1_attn = [AllocOp(attn_l1_ty, [], []) for _ in range(kv_chunks)]
 
                     dma_memcpy_nd(
                         l1_q,
@@ -613,12 +622,18 @@ def build_flowqkv_pipeline_module(
                     )
                     qbase_idx = affine_apply(query_base_map, [_tx])
                     qbase_i32 = arith.IndexCastOp(T.i32(), qbase_idx).result
-                    CallOp(score_func, [qbase_i32, l1_q, l1_k, l1_attn])
-                    ChannelPut(attn_chan, l1_attn, indices=[_tx, _ty])
+                    for chunk in range(kv_chunks):
+                        chunk_i32 = _i32_constant(chunk * kv_chunk)
+                        CallOp(
+                            score_func,
+                            [qbase_i32, chunk_i32, l1_q, l1_k, l1_attn[chunk]],
+                        )
+                        ChannelPut(attn_chan, l1_attn[chunk], indices=[_tx, _ty])
 
                     DeallocOp(l1_q)
                     DeallocOp(l1_k)
-                    DeallocOp(l1_attn)
+                    for chunk in range(kv_chunks):
+                        DeallocOp(l1_attn[chunk])
 
                 @herd(
                     name=f"{public_name}_apply_herd",
@@ -627,19 +642,33 @@ def build_flowqkv_pipeline_module(
                     link_with=object_file,
                 )
                 def apply_body(_tx, _ty, _sx, _sy, hv, ho):
-                    l1_attn = AllocOp(attn_l1_ty, [], [])
-                    l1_v = AllocOp(kv_l1_ty, [], [])
+                    l1_attn = [AllocOp(attn_l1_ty, [], []) for _ in range(kv_chunks)]
+                    l1_v_full = AllocOp(k_l1_ty, [], [])
+                    l1_v_chunk = AllocOp(v_chunk_l1_ty, [], [])
                     l1_out = AllocOp(out_l1_ty, [], [])
 
-                    ChannelGet(attn_chan, l1_attn, indices=[_tx, _ty])
                     dma_memcpy_nd(
-                        l1_v,
+                        l1_v_full,
                         hv,
                         src_offsets=[_ty, 0, 0],
                         src_sizes=[1, kv_len, head_dim],
                         src_strides=[kv_len * head_dim, head_dim, 1],
                     )
-                    CallOp(apply_func, [l1_attn, l1_v, l1_out])
+                    for chunk in range(kv_chunks):
+                        chunk_offset = chunk * kv_chunk
+                        chunk_i32 = _i32_constant(chunk_offset)
+                        ChannelGet(attn_chan, l1_attn[chunk], indices=[_tx, _ty])
+                        l1_v_src = subview(
+                            l1_v_full.result,
+                            [chunk_offset, 0],
+                            [kv_chunk, head_dim],
+                            [1, 1],
+                        )
+                        linalg.copy(l1_v_src, outs=[l1_v_chunk])
+                        CallOp(
+                            apply_func,
+                            [chunk_i32, l1_attn[chunk], l1_v_chunk, l1_out],
+                        )
                     if use_l2_gather:
                         dma_memcpy_nd(
                             ho,
@@ -667,8 +696,10 @@ def build_flowqkv_pipeline_module(
                             ],
                         )
 
-                    DeallocOp(l1_attn)
-                    DeallocOp(l1_v)
+                    for chunk in range(kv_chunks):
+                        DeallocOp(l1_attn[chunk])
+                    DeallocOp(l1_v_full)
+                    DeallocOp(l1_v_chunk)
                     DeallocOp(l1_out)
 
                 if use_l2_gather:
@@ -678,7 +709,6 @@ def build_flowqkv_pipeline_module(
                 DeallocOp(l2_q)
                 DeallocOp(l2_k)
                 DeallocOp(l2_v)
-
 
 @module_builder
 def build_flowkv_pipeline_module(
@@ -858,6 +888,7 @@ def run_or_compile(
     instance_name,
     rtol=2e-1,
     atol=1e-1,
+    debug_ir=False,
 ):
     backend_opts = dict(
         verbose=verbose,
@@ -866,6 +897,7 @@ def run_or_compile(
         instance_name=instance_name,
         target_device="npu2",
         runtime_loop_tiling_sizes=[1, 1],
+        debug_ir=debug_ir,
     )
     if compile_mode == "compile-and-run":
         runner = XRTRunner(**backend_opts)

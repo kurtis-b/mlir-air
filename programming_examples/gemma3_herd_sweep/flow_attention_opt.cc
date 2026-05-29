@@ -271,6 +271,94 @@ static void flowqkv_apply_impl(const bfloat16 *__restrict attn,
     }
   }
 }
+
+static void flowqkv_scores_chunk_impl(int32_t query_base, int32_t chunk_offset,
+                                      const bfloat16 *__restrict q,
+                                      const bfloat16 *__restrict k,
+                                      bfloat16 *__restrict attn_chunk) {
+  const float inv_sqrt_d = 1.0f / __builtin_sqrtf((float)HEAD_DIM);
+
+  ::aie::set_rounding(kFlowRoundMode);
+
+  for (unsigned qi = 0; qi < Q_CHUNK; ++qi) {
+    bfloat16 *__restrict attn_row = attn_chunk + qi * KV_CHUNK;
+    for (unsigned j = 0; j < KV_CHUNK; ++j) {
+      attn_row[j] = static_cast<bfloat16>(0.0f);
+    }
+
+    unsigned end = KV_LEN;
+    if constexpr (CAUSAL != 0) {
+      const unsigned causal_end = static_cast<unsigned>(query_base) + qi + 1;
+      end = causal_end < end ? causal_end : end;
+    }
+    unsigned start = 0;
+    if constexpr (WINDOW_LEN > 0) {
+      start = (end > WINDOW_LEN) ? (end - WINDOW_LEN) : 0;
+    }
+    if (end <= start)
+      continue;
+
+    float scores[KV_LEN];
+    float max_score = -3.402823466e38f;
+    const bfloat16 *__restrict q_row = q + qi * HEAD_DIM;
+    for (unsigned kk = start; kk < end; ++kk)
+      chess_prepare_for_pipelining chess_loop_range(4, ) {
+        const float score = dot_bf16_v8(q_row, k + kk * HEAD_DIM) * inv_sqrt_d;
+        scores[kk] = score;
+        max_score = score > max_score ? score : max_score;
+      }
+
+    float denom = 0.0f;
+    for (unsigned kk = start; kk < end; ++kk)
+      chess_prepare_for_pipelining chess_loop_range(4, ) {
+        const float weight = fast_exp_approx(scores[kk] - max_score);
+        scores[kk] = weight;
+        denom += weight;
+      }
+
+    const float inv_denom = denom > 0.0f ? (1.0f / denom) : 0.0f;
+    const unsigned base = static_cast<unsigned>(chunk_offset);
+    for (unsigned j = 0; j < KV_CHUNK; ++j) {
+      const unsigned kk = base + j;
+      if (kk >= start && kk < end) {
+        attn_row[j] = static_cast<bfloat16>(scores[kk] * inv_denom);
+      }
+    }
+  }
+}
+
+static void flowqkv_apply_chunk_impl(int32_t chunk_offset,
+                                     const bfloat16 *__restrict attn_chunk,
+                                     const bfloat16 *__restrict v_chunk,
+                                     bfloat16 *__restrict out) {
+  constexpr int VecLen = 8;
+  static_assert(HEAD_DIM % VecLen == 0,
+                "optimized FlowQKV apply expects head_dim divisible by 8");
+
+  ::aie::set_rounding(kFlowRoundMode);
+
+  const unsigned base = static_cast<unsigned>(chunk_offset);
+  for (unsigned qi = 0; qi < Q_CHUNK; ++qi) {
+    const bfloat16 *__restrict attn_row = attn_chunk + qi * KV_CHUNK;
+    for (unsigned d = 0; d < HEAD_DIM; d += VecLen) {
+      aie::accum<accfloat, VecLen> acc = aie::zeros<accfloat, VecLen>();
+      if (base != 0) {
+        aie::vector<bfloat16, VecLen> out_vec =
+            aie::load_v<VecLen, aie_dm_resource::a>(out + qi * HEAD_DIM + d);
+        acc = aie::accum<accfloat, VecLen>(out_vec);
+      }
+      for (unsigned j = 0; j < KV_CHUNK; ++j)
+        chess_prepare_for_pipelining chess_loop_range(4, ) {
+          aie::vector<bfloat16, VecLen> w =
+              aie::broadcast<bfloat16, VecLen>(attn_row[j]);
+          aie::vector<bfloat16, VecLen> vv = aie::load_v<VecLen, aie_dm_resource::c>(
+              v_chunk + j * HEAD_DIM + d);
+          acc = mac(acc, w, vv);
+        }
+      aie::store_v(out + qi * HEAD_DIM + d, acc.to_vector<bfloat16>());
+    }
+  }
+}
 static void flowkv_scores_impl(const bfloat16 *__restrict q,
                                const bfloat16 *__restrict k,
                                bfloat16 *__restrict attn) {
@@ -448,6 +536,20 @@ void flowqkv_apply_bf16_opt(const bfloat16 *__restrict attn,
                             const bfloat16 *__restrict v,
                             bfloat16 *__restrict out) {
   flowqkv_apply_impl(attn, v, out);
+}
+
+void flowqkv_scores_chunk_bf16_opt(int32_t query_base, int32_t chunk_offset,
+                                   const bfloat16 *__restrict q,
+                                   const bfloat16 *__restrict k,
+                                   bfloat16 *__restrict attn_chunk) {
+  flowqkv_scores_chunk_impl(query_base, chunk_offset, q, k, attn_chunk);
+}
+
+void flowqkv_apply_chunk_bf16_opt(int32_t chunk_offset,
+                                  const bfloat16 *__restrict attn_chunk,
+                                  const bfloat16 *__restrict v_chunk,
+                                  bfloat16 *__restrict out) {
+  flowqkv_apply_chunk_impl(chunk_offset, attn_chunk, v_chunk, out);
 }
 
 void flowkv_decode_bf16_opt(const bfloat16 *__restrict q,

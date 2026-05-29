@@ -300,6 +300,7 @@ def main():
     )
     parser.add_argument("--output-format", choices=["xclbin", "elf"], default="xclbin")
     parser.add_argument("--output-mode", choices=OUTPUT_MODES, default="auto")
+    parser.add_argument("--debug-ir", action="store_true")
     args = parser.parse_args()
 
     shape_rows, shape_cols = parse_herd_shape(args.herd_shape)
@@ -361,6 +362,7 @@ def main():
         target_device="npu2",
         runtime_loop_tiling_sizes=[1, 1],
         use_lock_race_condition_fix=True,
+        debug_ir=args.debug_ir,
     )
     if args.compile_mode == "compile-and-run":
         runner = XRTRunner(**backend_opts)

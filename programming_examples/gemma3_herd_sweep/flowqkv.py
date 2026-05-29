@@ -49,6 +49,7 @@ def main():
     parser = argparse.ArgumentParser(description="FlowQKV chunked attention")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("-p", "--print-module-only", action="store_true")
+    parser.add_argument("--debug-ir", action="store_true")
     parser.add_argument("--q-chunk", type=int, default=4)
     parser.add_argument("--kv-len", type=int, default=32)
     parser.add_argument("--kv-chunk", type=int, default=32)
@@ -106,8 +107,8 @@ def main():
                 args.q_chunk,
                 args.kv_len,
                 args.head_dim,
-                "flowqkv_scores_bf16_opt",
-                "flowqkv_apply_bf16_opt",
+                "flowqkv_scores_chunk_bf16_opt",
+                "flowqkv_apply_chunk_bf16_opt",
                 args.object_file,
                 "flowqkv",
                 args.kv_groups,
@@ -115,6 +116,7 @@ def main():
                 args.herd_cols,
                 output_mode,
                 args.query_base,
+                args.kv_chunk,
             )
             instance_name = "flowqkv_pipeline"
         elif args.kv_staging == "shared":
@@ -299,6 +301,7 @@ def main():
         output_format=args.output_format,
         verbose=args.verbose,
         instance_name=instance_name,
+        debug_ir=args.debug_ir,
     )
 
 
