@@ -1,0 +1,17 @@
+// (c) Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// REQUIRES: peano
+// RUN: %python %S/run.py -p | FileCheck %s
+// RUN: mkdir -p test_peano_elf
+// RUN: cd test_peano_elf
+// RUN: export PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR
+// RUN: %python %S/run.py --compile-mode compile-only --output-format elf
+
+// CHECK: air.channel @fused_dqp_pipe_deq [4, 4]
+// CHECK: air.herd @fused_dqp_dequant_herd
+// CHECK: air.channel.put
+// CHECK-SAME: @fused_dqp_pipe_deq
+// CHECK: air.herd @fused_dqp_project_herd
+// CHECK: air.channel.get
+// CHECK-SAME: @fused_dqp_pipe_deq

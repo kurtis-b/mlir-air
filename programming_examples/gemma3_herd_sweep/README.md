@@ -179,4 +179,7 @@ disabled, and when both Peano dequant/project calls are removed from a temporary
 diagnostic module. The first bad boundary is therefore the lowered AIE/runtime
 execution of the two-herd inter-worker channel schedule, not the FusedDQP
 microkernels or the supported L2-gather output route. Keep this mode
-diagnostic-only until the channel/lock/DMA schedule is fixed.
+diagnostic-only until the channel/lock/DMA schedule is fixed. The focused
+reproducer is `test/xrt/56_gemma_fused_dqp_channel_repro`; its lit coverage is
+compile-only, while `run.py --compile-mode compile-and-run --output-format elf`
+reproduces the timeout on current hardware.
