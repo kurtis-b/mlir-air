@@ -78,9 +78,15 @@ fail during argument parsing instead of reaching AIR lowering.
 | FlowQKV | direct, l2-gather | direct, l2-gather | l2-gather |
 | FlowKV | direct | direct | l2-gather |
 
-Q4NX and FusedDQP 8x4 direct output exhaust shim DMA channels. FlowQKV and
-FlowKV 8x4 direct output are likewise not exposed; FlowKV small-shape L2 gather
-is not exposed because it fails AIE routing.
+Q4NX and FusedDQP 8x4 direct output exhaust shim DMA channels. A
+packet-direct diagnostic route was also tested for both kernels, but it is not
+exposed as a supported mode: the AIR is compile-legal, while hardware either
+permutes/corrupts output tiles or hangs when extra ordering channels are added.
+The first bad artifact is the lowered NPU runtime sequence, where multiple
+per-shim packet receives are configured through the first packet DMA allocation
+for that shim even when the source AIR uses separate named packet channels.
+FlowQKV and FlowKV 8x4 direct output are likewise not exposed; FlowKV
+small-shape L2 gather is not exposed because it fails AIE routing.
 
 `run-q4nx-8x4-rowband-fallback` is a logical 8x4 Q4NX workload using two
 sequential host-side physical 4x4 row-band executions. It is a
@@ -122,7 +128,9 @@ paper's 16x8 row/column sub-blocks internally. FusedDQP `pipeline` mode is a
 diagnostic two-herd dequant/project mapping that streams dequantized `16x8`
 row/column tiles over an AIR channel. It is compile-legal with debug IR, but
 current hardware execution still times out with no active context left after
-XRT cleanup, so it should not be reported as a passing physical result.
+XRT cleanup. This remains true after reducing to one column block and after
+using a larger column chunk to reduce inner channel iterations, so it should not
+be reported as a passing physical result.
 
 FlowQKV and FlowKV smoke mode map one attention group per CT. Q, K, and V are
 packed as one BF16 input per group, staged through L2, and split into contiguous
