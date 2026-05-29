@@ -26,6 +26,10 @@ make run-mm HERD_SHAPE=4x4 COMPILE_MODE=compile-only OUTPUT_FORMAT=elf
 make run-fused-dqp HERD_SHAPE=8x4 COMPILE_MODE=compile-only OUTPUT_FORMAT=elf
 make run-flowqkv HERD_SHAPE=4x4 COMPILE_MODE=compile-only OUTPUT_FORMAT=elf
 make run-flowkv HERD_SHAPE=2x4 COMPILE_MODE=compile-only OUTPUT_FORMAT=elf
+make run-q4nx-8x4-rowband-fallback COMPILE_MODE=compile-only OUTPUT_FORMAT=elf
+make run-fused-dqp-paper COMPILE_MODE=compile-only OUTPUT_FORMAT=elf
+make run-flowqkv-paper COMPILE_MODE=compile-only OUTPUT_FORMAT=elf
+make run-flowkv-paper COMPILE_MODE=compile-only OUTPUT_FORMAT=elf
 ```
 
 Run the full compile sweep:
@@ -56,31 +60,79 @@ workload size. The Python drivers expose the same setting as `--herd-shape`.
 | `8x4` | 32 | 32 Q4NX/projection/attention groups, MM M=256 N=128 |
 
 The problem dimensions remain intentionally compact so the example is usable as
-a compile and runtime smoke test. Override `Q_CHUNK`, `KV_LEN`, `HEAD_DIM`,
-`MM_M`, `MM_N`, and related Make variables for larger experiments.
+a compile and runtime smoke test. Override `Q_CHUNK`, `KV_LEN`, `KV_CHUNK`,
+`HEAD_DIM`, `MM_M`, `MM_N`, and related Make variables for larger experiments.
+
+`Q4NX_OUTPUT_MODE`, `FUSED_DQP_OUTPUT_MODE`, `FLOWQKV_OUTPUT_MODE`, and
+`FLOWKV_OUTPUT_MODE` select `auto`, `direct`, or `l2-gather` where supported.
+`auto` keeps Q4NX on L2-gather for every shape and uses
+L2-gather for 8x4 FusedDQP/FlowQKV/FlowKV routes. Unsupported combinations
+fail during argument parsing instead of reaching AIR lowering.
+
+| Kernel | 2x4 modes | 4x4 modes | 8x4 modes |
+| --- | --- | --- | --- |
+| Q4NX | direct, l2-gather | direct, l2-gather | l2-gather |
+| FusedDQP | direct, l2-gather | direct, l2-gather | l2-gather |
+| FlowQKV | direct, l2-gather | direct, l2-gather | l2-gather |
+| FlowKV | direct | direct | l2-gather |
+
+Q4NX and FusedDQP 8x4 direct output exhaust shim DMA channels. FlowQKV and
+FlowKV 8x4 direct output are likewise not exposed; FlowKV small-shape L2 gather
+is not exposed because it fails AIE routing.
+
+`run-q4nx-8x4-rowband-fallback` is a logical 8x4 Q4NX workload using two
+sequential host-side physical 4x4 row-band executions. It is a
+fallback/workaround target, not a full physical 8x4 utilization result.
+
+`FUSED_DQP_SCHEDULE_MODE`, `FLOWQKV_SCHEDULE_MODE`, and
+`FLOWKV_SCHEDULE_MODE` select `smoke` or `paper`. The default `smoke` mode keeps
+the validated compact herd sweep. The `run-*-paper` targets enable the
+paper-style data layouts and online accumulator kernels with compact defaults;
+use `PAPER_FUSED_DQP_COL_BLOCKS`, `PAPER_KV_LEN`, `PAPER_HEAD_DIM`,
+`PAPER_KV_GROUPS`, and `PAPER_HEADS_PER_KV` to scale those targets.
+`FLOWQKV_KV_STAGING` and `FLOWKV_KV_STAGING` select `replicated`,
+`shared`, or `pipeline` paper K/V staging. FlowQKV defaults to `replicated` to
+keep the 8x4 compile path bounded. FlowKV defaults to `pipeline`, which maps
+the decode path onto a two-stage CT0-to-CT1 channel pipeline.
 
 ## Mapping Notes
 
 Q4NX maps one 32x256 dequantization block per CT. Packed weights and the BF16
-scale/min parameter pack are staged from L3 to L2, then each CT pulls its tile to
-L1. Scale and min are copied into contiguous L1 buffers before calling the Peano
-microkernel. Results are gathered through L2 before returning to L3.
+scale/min parameter pack are packed into one L3 byte buffer, staged to L2, then
+split into contiguous L1 buffers before calling the Peano microkernel. All
+shapes use the L2-gather output route by default; direct output is limited to
+2x4 and 4x4 because 8x4 direct output exhausts shim DMA channels.
 
 BF16 tiled MM reuses the optimized AIE2P GEMM path. Matrix rows scale with herd
 rows and matrix columns scale with herd columns. The wrapper keeps the GEMM
 L3/L2/L1 tiling, Peano microkernel, and runtime tiling behavior from the
 reference programming example.
 
-FusedDQP maps one 32x256 projection row block per CT. The wrapper packs scale,
-min, and the activation vector into a single BF16 per-block input so each CT uses
-one BF16 staged input plus one packed-weight staged input. The 2x4 and 4x4 shapes
-write the small projection result directly to L3; 8x4 gathers results through L2
-to stay within shim-channel limits.
+FusedDQP smoke mode maps one 32x256 projection row block per CT. The wrapper
+packs weights, scale, min, and the activation vector into one L3 byte buffer,
+then splits the payload in L1 before the Peano call. Paper mode keeps the Q4NX
+weight block plus scale/min pack per row/column block, stages the activation
+vector once per column block, and accumulates across `COL_BLOCKS` using the
+`fused_dqp_accum_block_opt` entry point. The optimized kernel processes the
+paper's 16x8 row/column sub-blocks internally.
 
-FlowQKV and FlowKV map one attention group per CT in this source-level example.
-Q, K, and V are packed as one BF16 input per group, staged through L2, and split
-into contiguous Q/K/V L1 buffers before the Peano attention microkernel runs.
-The 8x4 shape gathers outputs through L2; smaller shapes write outputs directly.
+FlowQKV and FlowKV smoke mode map one attention group per CT. Q, K, and V are
+packed as one BF16 input per group, staged through L2, and split into contiguous
+Q/K/V L1 buffers before the Peano attention microkernel runs. FlowQKV paper mode
+uses tile-shaped Q data and maps CTs to shared GQA K/V groups. The default
+`replicated` K/V staging materializes each CT's selected K/V group in the input
+buffer before L2 staging, which keeps the 8x4 compile path bounded. The opt-in
+`shared` staging mode keeps source-level shared per-KV-group K/V inputs as a
+diagnostic, but it expands to a large fanout schedule during lowering. FlowKV
+paper mode now uses the paper's 2x4 / four-KV-group placement as two 1x4 herds:
+a score/softmax herd produces BF16 attention weights, sends them over an AIR
+worker-to-worker channel, and an apply herd consumes the weights with V to
+produce the decode output. The fused Flow attention microkernel still uses
+chunked online-softmax state (`m`, `l`, and `Y`) instead of a full score buffer;
+the split FlowKV pipeline uses a materialized BF16 attention vector at the CT
+boundary because that is the explicit inter-stage payload.
 
 These examples are meant to be readable, sweepable AIR mappings. They do not use
 binary disassembly, generated instruction traces, or model-runtime integration.
+The paper modes are experimental kernel-level mappings and should not be reported
+as end-to-end FastFlowLM or Gemma3 runtime parity.

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+this_makefile := $(realpath $(firstword $(MAKEFILE_LIST)))
 
 ifdef PEANO_INSTALL_DIR
   BUILD_DIR := build_peano
@@ -46,18 +47,40 @@ MM_TILE_N_DIV_8 := $(shell echo $$(( $(MM_TILE_N) / 8 )))
 
 Q_CHUNK ?= 4
 KV_LEN ?= 32
+KV_CHUNK ?= 32
 HEAD_DIM ?= 64
 FLOWQKV_QUERY_BASE ?= 0
 FLOWKV_QUERY_BASE ?= $(shell echo $$(( $(KV_LEN) - 1 )))
 WINDOW_LEN ?= 0
 FLOWQKV_CAUSAL ?= 1
 FLOWKV_CAUSAL ?= 1
+FLOWQKV_VARIANT ?= causal
+FLOWKV_VARIANT ?= causal
 FLOWQKV_CAUSAL_FLAG := $(if $(filter 1 true yes,$(FLOWQKV_CAUSAL)),--causal,)
 FLOWKV_CAUSAL_FLAG := $(if $(filter 1 true yes,$(FLOWKV_CAUSAL)),--causal,)
 
+Q4NX_OUTPUT_MODE ?= auto
+FUSED_DQP_OUTPUT_MODE ?= auto
+FLOWQKV_OUTPUT_MODE ?= auto
+FLOWKV_OUTPUT_MODE ?= auto
+FUSED_DQP_SCHEDULE_MODE ?= smoke
+FLOWQKV_SCHEDULE_MODE ?= smoke
+FLOWKV_SCHEDULE_MODE ?= smoke
+FLOWQKV_KV_STAGING ?= replicated
+FLOWKV_KV_STAGING ?= pipeline
+FUSED_DQP_COL_BLOCKS ?= 1
+PAPER_FUSED_DQP_COL_BLOCKS ?= 2
+PAPER_KV_GROUPS ?= 4
+PAPER_HEADS_PER_KV ?= 2
+PAPER_Q_CHUNK ?= $(Q_CHUNK)
+PAPER_KV_LEN ?= $(KV_LEN)
+PAPER_HEAD_DIM ?= $(HEAD_DIM)
+SWEEP_OUTPUT_MODES ?= auto
+SWEEP_OUTPUT_MODE_FLAGS := $(foreach mode,$(SWEEP_OUTPUT_MODES),--output-mode $(mode))
+
 all: run-q4nx run-mm run-fused-dqp run-flowqkv run-flowkv
 sweep:
-	python3 $(srcdir)/sweep_herds.py --compile-mode $(COMPILE_MODE) --output-format $(OUTPUT_FORMAT)
+	python3 $(srcdir)/sweep_herds.py --compile-mode $(COMPILE_MODE) --output-format $(OUTPUT_FORMAT) $(SWEEP_OUTPUT_MODE_FLAGS)
 
 check-peano:
 	@if [ -z "$(PEANO_INSTALL_DIR)" ] || [ ! -x "$(PEANO_INSTALL_DIR)/bin/clang++" ]; then \
@@ -79,7 +102,17 @@ run-q4nx: compile-q4nx-kernel prepare-air-project
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
 		python3 $(srcdir)/q4nx.py --rows $(Q4NX_ROWS) --cols $(Q4NX_COLS) \
 		--herd-shape $(HERD_SHAPE) --kernel-name q4nx_dequant_block_opt \
-		--object-file q4nx.o --compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG)
+		--object-file q4nx.o --compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG) \
+		--output-mode $(Q4NX_OUTPUT_MODE)
+
+# Logical 8x4 Q4NX workload using two host-side physical 4x4 row bands.
+run-q4nx-8x4-rowband-fallback: compile-q4nx-kernel prepare-air-project
+	cp $(BUILD_DIR)/q4nx.o $(BUILD_DIR)/air_project/q4nx.o
+	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
+		python3 $(srcdir)/q4nx.py --rows $(Q4NX_ROWS) --cols $(Q4NX_COLS) \
+		--herd-shape 4x4 --row-blocks 4 --col-blocks 4 --repeat-row-bands 2 \
+		--kernel-name q4nx_dequant_block_opt --object-file q4nx.o \
+		--compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG) --output-mode l2-gather
 
 compile-fused-dqp-kernel: check-peano
 	mkdir -p $(BUILD_DIR)
@@ -92,7 +125,13 @@ run-fused-dqp: compile-fused-dqp-kernel prepare-air-project
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
 		python3 $(srcdir)/fused_dqp.py --rows $(Q4NX_ROWS) --cols $(Q4NX_COLS) \
 		--herd-shape $(HERD_SHAPE) --kernel-name fused_dqp_block_opt \
-		--object-file fused_dqp.o --compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG)
+		--object-file fused_dqp.o --compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG) \
+		--output-mode $(FUSED_DQP_OUTPUT_MODE) --schedule-mode $(FUSED_DQP_SCHEDULE_MODE) \
+		--col-blocks $(FUSED_DQP_COL_BLOCKS)
+
+run-fused-dqp-paper:
+	$(MAKE) -f $(this_makefile) run-fused-dqp HERD_SHAPE=4x4 FUSED_DQP_SCHEDULE_MODE=paper \
+		FUSED_DQP_OUTPUT_MODE=l2-gather FUSED_DQP_COL_BLOCKS=$(PAPER_FUSED_DQP_COL_BLOCKS)
 
 compile-mm-kernel: check-peano
 	mkdir -p $(BUILD_DIR)
@@ -115,7 +154,7 @@ run-mm: compile-mm-kernel prepare-air-project
 compile-flowqkv-kernel: check-peano
 	mkdir -p $(BUILD_DIR)
 	$(PEANO_INSTALL_DIR)/bin/clang++ ${PEANOWRAP2P_OPT_FLAGS} \
-		-DQ_CHUNK=$(Q_CHUNK) -DKV_LEN=$(KV_LEN) -DHEAD_DIM=$(HEAD_DIM) \
+		-DQ_CHUNK=$(Q_CHUNK) -DKV_LEN=$(KV_LEN) -DKV_CHUNK=$(KV_CHUNK) -DHEAD_DIM=$(HEAD_DIM) \
 		-DQUERY_BASE=$(FLOWQKV_QUERY_BASE) -DWINDOW_LEN=$(WINDOW_LEN) \
 		-DCAUSAL=$(if $(filter 1 true yes,$(FLOWQKV_CAUSAL)),1,0) \
 		-c $(srcdir)/flow_attention_opt.cc -o $(BUILD_DIR)/flowqkv.o
@@ -124,15 +163,18 @@ run-flowqkv: compile-flowqkv-kernel prepare-air-project
 	cp $(BUILD_DIR)/flowqkv.o $(BUILD_DIR)/air_project/flowqkv.o
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
 		python3 $(srcdir)/flowqkv.py --q-chunk $(Q_CHUNK) --kv-len $(KV_LEN) \
-		--head-dim $(HEAD_DIM) --herd-shape $(HERD_SHAPE) \
+		--kv-chunk $(KV_CHUNK) --head-dim $(HEAD_DIM) --herd-shape $(HERD_SHAPE) \
 		--query-base $(FLOWQKV_QUERY_BASE) --window-len $(WINDOW_LEN) \
 		$(FLOWQKV_CAUSAL_FLAG) --kernel-name flowqkv_chunk_bf16_opt \
-		--object-file flowqkv.o --compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG)
+		--object-file flowqkv.o --compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG) \
+		--output-mode $(FLOWQKV_OUTPUT_MODE) --schedule-mode $(FLOWQKV_SCHEDULE_MODE) \
+		--kv-groups $(PAPER_KV_GROUPS) --heads-per-kv $(PAPER_HEADS_PER_KV) \
+		--kv-staging $(FLOWQKV_KV_STAGING) --variant $(FLOWQKV_VARIANT)
 
 compile-flowkv-kernel: check-peano
 	mkdir -p $(BUILD_DIR)
 	$(PEANO_INSTALL_DIR)/bin/clang++ ${PEANOWRAP2P_OPT_FLAGS} \
-		-DQ_CHUNK=1 -DKV_LEN=$(KV_LEN) -DHEAD_DIM=$(HEAD_DIM) \
+		-DQ_CHUNK=1 -DKV_LEN=$(KV_LEN) -DKV_CHUNK=$(KV_CHUNK) -DHEAD_DIM=$(HEAD_DIM) \
 		-DQUERY_BASE=$(FLOWKV_QUERY_BASE) -DWINDOW_LEN=$(WINDOW_LEN) \
 		-DCAUSAL=$(if $(filter 1 true yes,$(FLOWKV_CAUSAL)),1,0) \
 		-c $(srcdir)/flow_attention_opt.cc -o $(BUILD_DIR)/flowkv.o
@@ -140,11 +182,26 @@ compile-flowkv-kernel: check-peano
 run-flowkv: compile-flowkv-kernel prepare-air-project
 	cp $(BUILD_DIR)/flowkv.o $(BUILD_DIR)/air_project/flowkv.o
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
-		python3 $(srcdir)/flowkv.py --kv-len $(KV_LEN) --head-dim $(HEAD_DIM) \
+		python3 $(srcdir)/flowkv.py --kv-len $(KV_LEN) --kv-chunk $(KV_CHUNK) --head-dim $(HEAD_DIM) \
 		--herd-shape $(HERD_SHAPE) --query-base $(FLOWKV_QUERY_BASE) \
 		--window-len $(WINDOW_LEN) $(FLOWKV_CAUSAL_FLAG) \
 		--kernel-name flowkv_decode_bf16_opt --object-file flowkv.o \
-		--compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG)
+		--compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG) \
+		--output-mode $(FLOWKV_OUTPUT_MODE) --schedule-mode $(FLOWKV_SCHEDULE_MODE) \
+		--kv-groups $(PAPER_KV_GROUPS) --heads-per-kv $(PAPER_HEADS_PER_KV) \
+		--kv-staging $(FLOWKV_KV_STAGING) --variant $(FLOWKV_VARIANT)
+
+run-flowqkv-paper:
+	$(MAKE) -f $(this_makefile) run-flowqkv HERD_SHAPE=8x4 FLOWQKV_SCHEDULE_MODE=paper \
+		FLOWQKV_OUTPUT_MODE=l2-gather Q_CHUNK=$(PAPER_Q_CHUNK) KV_LEN=$(PAPER_KV_LEN) \
+		KV_CHUNK=$(KV_CHUNK) HEAD_DIM=$(PAPER_HEAD_DIM)
+
+run-flowkv-paper:
+	$(MAKE) -f $(this_makefile) run-flowkv HERD_SHAPE=2x4 FLOWKV_SCHEDULE_MODE=paper \
+		FLOWKV_OUTPUT_MODE=direct KV_LEN=$(PAPER_KV_LEN) KV_CHUNK=$(KV_CHUNK) \
+		HEAD_DIM=$(PAPER_HEAD_DIM)
+
+profile-paper: run-fused-dqp-paper run-flowqkv-paper run-flowkv-paper
 
 clean:
 	rm -rf build_peano build_chess __pycache__

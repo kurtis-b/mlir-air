@@ -1,9 +1,9 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 //
-// Optimized FlowQKV/FlowKV attention microkernels. These kernels keep the
-// correctness-first online-softmax semantics while vectorizing the BF16 dot
-// products and value accumulation on AIE2P vector lanes.
+// Optimized FlowQKV/FlowKV attention microkernels. The implementation uses
+// chunked online-softmax accumulation, matching the paper equations for m/l/Y
+// state while keeping the source-level AIR wrapper compact.
 
 #include <aie_api/aie.hpp>
 #include <cstdint>
@@ -14,6 +14,10 @@
 
 #ifndef KV_LEN
 #define KV_LEN 32
+#endif
+
+#ifndef KV_CHUNK
+#define KV_CHUNK 32
 #endif
 
 #ifndef HEAD_DIM
@@ -56,8 +60,10 @@ static inline float dot_bf16_v8(const bfloat16 *__restrict lhs,
   float sum = 0.0f;
   for (unsigned d = 0; d < HEAD_DIM; d += VecLen)
     chess_prepare_for_pipelining chess_loop_range(4, ) {
-      aie::vector<bfloat16, VecLen> qv = aie::load_v<VecLen, aie_dm_resource::a>(lhs + d);
-      aie::vector<bfloat16, VecLen> kv = aie::load_v<VecLen, aie_dm_resource::b>(rhs + d);
+      aie::vector<bfloat16, VecLen> qv =
+          aie::load_v<VecLen, aie_dm_resource::a>(lhs + d);
+      aie::vector<bfloat16, VecLen> kv =
+          aie::load_v<VecLen, aie_dm_resource::b>(rhs + d);
       aie::accum<accfloat, VecLen> prod = aie::mul(qv, kv);
       sum += aie::reduce_add(prod.to_vector<float>());
     }
@@ -69,9 +75,9 @@ static void attention_chunk_opt(const bfloat16 *__restrict q,
                                 const bfloat16 *__restrict k,
                                 const bfloat16 *__restrict v,
                                 bfloat16 *__restrict out) {
-  constexpr int VecLen = 8;
-  static_assert(HEAD_DIM % VecLen == 0,
-                "optimized Flow attention expects head_dim divisible by 8");
+  static_assert(KV_CHUNK > 0, "KV_CHUNK must be positive");
+  static_assert(KV_LEN % KV_CHUNK == 0,
+                "optimized Flow attention expects kv_len divisible by kv_chunk");
   const float inv_sqrt_d = 1.0f / __builtin_sqrtf((float)HEAD_DIM);
 
   ::aie::set_rounding(kFlowRoundMode);
@@ -87,36 +93,109 @@ static void attention_chunk_opt(const bfloat16 *__restrict q,
       start = (end > WINDOW_LEN) ? (end - WINDOW_LEN) : 0;
     }
 
-    float scores[KV_LEN];
+    float y[HEAD_DIM];
+    for (unsigned d = 0; d < HEAD_DIM; ++d) {
+      y[d] = 0.0f;
+    }
     float max_score = -3.402823466e38f;
+    float denom = 0.0f;
+
     const bfloat16 *__restrict q_row = q + qi * HEAD_DIM;
-    for (unsigned kk = start; kk < end; ++kk) {
-      const float score = dot_bf16_v8(q_row, k + kk * HEAD_DIM) * inv_sqrt_d;
+    for (unsigned chunk = 0; chunk < KV_LEN; chunk += KV_CHUNK) {
+      const unsigned chunk_end = chunk + KV_CHUNK;
+      const unsigned active_begin = start > chunk ? start : chunk;
+      const unsigned active_end = end < chunk_end ? end : chunk_end;
+      if (active_end <= active_begin)
+        continue;
+
+      for (unsigned kk = active_begin; kk < active_end; ++kk)
+        chess_prepare_for_pipelining chess_loop_range(4, ) {
+          const float score = dot_bf16_v8(q_row, k + kk * HEAD_DIM) * inv_sqrt_d;
+          const float new_max = score > max_score ? score : max_score;
+          const float carry = denom > 0.0f ? fast_exp_approx(max_score - new_max) : 0.0f;
+          const float weight = fast_exp_approx(score - new_max);
+
+          const bfloat16 *__restrict v_row = v + kk * HEAD_DIM;
+          for (unsigned d = 0; d < HEAD_DIM; ++d) {
+            y[d] = y[d] * carry + weight * static_cast<float>(v_row[d]);
+          }
+          denom = denom * carry + weight;
+          max_score = new_max;
+        }
+    }
+
+    const float inv_denom = denom > 0.0f ? (1.0f / denom) : 0.0f;
+    for (unsigned d = 0; d < HEAD_DIM; ++d) {
+      out[qi * HEAD_DIM + d] = static_cast<bfloat16>(y[d] * inv_denom);
+    }
+  }
+}
+
+static void flowkv_scores_impl(const bfloat16 *__restrict q,
+                               const bfloat16 *__restrict k,
+                               bfloat16 *__restrict attn) {
+  const float inv_sqrt_d = 1.0f / __builtin_sqrtf((float)HEAD_DIM);
+
+  ::aie::set_rounding(kFlowRoundMode);
+
+  unsigned end = KV_LEN;
+  if constexpr (CAUSAL != 0) {
+    const unsigned causal_end = QUERY_BASE + 1;
+    end = causal_end < end ? causal_end : end;
+  }
+  unsigned start = 0;
+  if constexpr (WINDOW_LEN > 0) {
+    start = (end > WINDOW_LEN) ? (end - WINDOW_LEN) : 0;
+  }
+
+  for (unsigned kk = 0; kk < KV_LEN; ++kk) {
+    attn[kk] = static_cast<bfloat16>(0.0f);
+  }
+
+  float scores[KV_LEN];
+  float max_score = -3.402823466e38f;
+  for (unsigned kk = start; kk < end; ++kk)
+    chess_prepare_for_pipelining chess_loop_range(4, ) {
+      const float score = dot_bf16_v8(q, k + kk * HEAD_DIM) * inv_sqrt_d;
       scores[kk] = score;
       max_score = score > max_score ? score : max_score;
     }
 
-    float denom = 0.0f;
-    for (unsigned kk = start; kk < end; ++kk) {
+  float denom = 0.0f;
+  for (unsigned kk = start; kk < end; ++kk)
+    chess_prepare_for_pipelining chess_loop_range(4, ) {
       const float weight = fast_exp_approx(scores[kk] - max_score);
       scores[kk] = weight;
       denom += weight;
     }
-    const float inv_denom = denom > 0.0f ? (1.0f / denom) : 0.0f;
 
-    for (unsigned d = 0; d < HEAD_DIM; d += VecLen) {
-      aie::accum<accfloat, VecLen> acc = aie::zeros<accfloat, VecLen>();
-      for (unsigned kk = start; kk < end; ++kk)
-        chess_prepare_for_pipelining chess_loop_range(4, ) {
-          const bfloat16 weight = static_cast<bfloat16>(scores[kk] * inv_denom);
-          aie::vector<bfloat16, VecLen> w =
-              aie::broadcast<bfloat16, VecLen>(weight);
-          aie::vector<bfloat16, VecLen> vv =
-              aie::load_v<VecLen, aie_dm_resource::c>(v + kk * HEAD_DIM + d);
-          acc = mac(acc, w, vv);
-        }
-      aie::store_v(out + qi * HEAD_DIM + d, acc.to_vector<bfloat16>());
+  const float inv_denom = denom > 0.0f ? (1.0f / denom) : 0.0f;
+  for (unsigned kk = start; kk < end; ++kk)
+    chess_prepare_for_pipelining chess_loop_range(4, ) {
+      attn[kk] = static_cast<bfloat16>(scores[kk] * inv_denom);
     }
+}
+
+static void flowkv_apply_impl(const bfloat16 *__restrict attn,
+                              const bfloat16 *__restrict v,
+                              bfloat16 *__restrict out) {
+  constexpr int VecLen = 8;
+  static_assert(HEAD_DIM % VecLen == 0,
+                "optimized FlowKV apply expects head_dim divisible by 8");
+
+  ::aie::set_rounding(kFlowRoundMode);
+
+  for (unsigned d = 0; d < HEAD_DIM; d += VecLen) {
+    aie::accum<accfloat, VecLen> acc = aie::zeros<accfloat, VecLen>();
+    for (unsigned kk = 0; kk < KV_LEN; ++kk)
+      chess_prepare_for_pipelining chess_loop_range(4, ) {
+        aie::vector<bfloat16, VecLen> w =
+            aie::broadcast<bfloat16, VecLen>(attn[kk]);
+        aie::vector<bfloat16, VecLen> vv =
+            aie::load_v<VecLen, aie_dm_resource::c>(v + kk * HEAD_DIM + d);
+        acc = mac(acc, w, vv);
+      }
+    aie::store_v(out + d, acc.to_vector<bfloat16>());
   }
 }
 
@@ -134,6 +213,18 @@ void flowkv_decode_bf16_opt(const bfloat16 *__restrict q,
                             const bfloat16 *__restrict v,
                             bfloat16 *__restrict out) {
   attention_chunk_opt<1>(q, k, v, out);
+}
+
+void flowkv_scores_bf16_opt(const bfloat16 *__restrict q,
+                            const bfloat16 *__restrict k,
+                            bfloat16 *__restrict attn) {
+  flowkv_scores_impl(q, k, attn);
+}
+
+void flowkv_apply_bf16_opt(const bfloat16 *__restrict attn,
+                           const bfloat16 *__restrict v,
+                           bfloat16 *__restrict out) {
+  flowkv_apply_impl(attn, v, out);
 }
 
 } // extern "C"

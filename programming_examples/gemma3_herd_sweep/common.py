@@ -12,6 +12,41 @@ from ml_dtypes import bfloat16
 Q4NX_ROWS = 32
 Q4NX_COLS = 256
 SUPPORTED_HERD_SHAPES = ("2x4", "4x4", "8x4")
+SCHEDULE_MODES = ("smoke", "paper")
+FLOW_VARIANTS = ("causal", "swa")
+FLOW_KV_STAGING_MODES = ("replicated", "shared", "pipeline")
+OUTPUT_MODES = ("auto", "direct", "l2-gather")
+OUTPUT_MODE_KERNELS = ("q4nx", "fused_dqp", "flowqkv", "flowkv")
+
+_OUTPUT_MODE_SUPPORT = {
+    "q4nx": {
+        "2x4": ("direct", "l2-gather"),
+        "4x4": ("direct", "l2-gather"),
+        "8x4": ("l2-gather",),
+    },
+    "fused_dqp": {
+        "2x4": ("direct", "l2-gather"),
+        "4x4": ("direct", "l2-gather"),
+        "8x4": ("l2-gather",),
+    },
+    "flowqkv": {
+        "2x4": ("direct", "l2-gather"),
+        "4x4": ("direct", "l2-gather"),
+        "8x4": ("l2-gather",),
+    },
+    "flowkv": {
+        "2x4": ("direct",),
+        "4x4": ("direct",),
+        "8x4": ("l2-gather",),
+    },
+}
+
+_AUTO_OUTPUT_MODE = {
+    "q4nx": "l2-gather",
+    "fused_dqp": "direct",
+    "flowqkv": "direct",
+    "flowkv": "direct",
+}
 
 
 def parse_herd_shape(shape: str) -> tuple[int, int]:
@@ -20,6 +55,56 @@ def parse_herd_shape(shape: str) -> tuple[int, int]:
         raise ValueError(f"herd shape must be one of: {supported}")
     rows, cols = shape.split("x", 1)
     return int(rows), int(cols)
+
+
+def herd_shape_name(herd_rows: int, herd_cols: int) -> str:
+    return f"{herd_rows}x{herd_cols}"
+
+
+def supported_output_modes(
+    kernel: str, herd_rows: int, herd_cols: int
+) -> tuple[str, ...]:
+    shape = herd_shape_name(herd_rows, herd_cols)
+    try:
+        return _OUTPUT_MODE_SUPPORT[kernel][shape]
+    except KeyError as exc:
+        if kernel not in OUTPUT_MODE_KERNELS:
+            supported = ", ".join(OUTPUT_MODE_KERNELS)
+            raise ValueError(f"kernel must be one of: {supported}") from exc
+        supported = ", ".join(SUPPORTED_HERD_SHAPES)
+        raise ValueError(f"herd shape must be one of: {supported}") from exc
+
+
+def is_output_mode_supported(
+    mode: str, herd_rows: int, herd_cols: int, kernel: str
+) -> bool:
+    if mode == "auto":
+        return True
+    if mode not in OUTPUT_MODES:
+        return False
+    return mode in supported_output_modes(kernel, herd_rows, herd_cols)
+
+
+def resolve_output_mode(
+    mode: str, herd_rows: int, herd_cols: int, kernel: str
+) -> str:
+    if mode not in OUTPUT_MODES:
+        supported = ", ".join(OUTPUT_MODES)
+        raise ValueError(f"output mode must be one of: {supported}")
+    modes = supported_output_modes(kernel, herd_rows, herd_cols)
+    if mode == "auto":
+        mode = _AUTO_OUTPUT_MODE[kernel]
+        if mode not in modes:
+            mode = "l2-gather"
+    if mode in modes:
+        return mode
+
+    supported = ", ".join(modes)
+    shape = herd_shape_name(herd_rows, herd_cols)
+    raise ValueError(
+        f"output mode {mode!r} is not supported for {kernel} {shape}; "
+        f"supported modes: {supported}"
+    )
 
 
 def pack_int4_low_first(values: np.ndarray) -> np.ndarray:
@@ -127,6 +212,30 @@ def fused_dqp_blocks_reference(
     return out
 
 
+def fused_dqp_paper_reference(
+    packed_i8: np.ndarray,
+    scale: np.ndarray,
+    min_offset: np.ndarray,
+    activation: np.ndarray,
+    rows: int,
+    cols: int,
+) -> np.ndarray:
+    row_blocks, col_blocks = packed_i8.shape[:2]
+    out = np.zeros((row_blocks, rows), dtype=np.float32)
+    for rb in range(row_blocks):
+        for cb in range(col_blocks):
+            block = fused_dqp_reference(
+                packed_i8[rb, cb],
+                scale[rb, cb],
+                min_offset[rb, cb],
+                activation[cb],
+                rows,
+                cols,
+            )
+            out[rb] += block.astype(np.float32)
+    return out.astype(bfloat16)
+
+
 def attention_reference(
     q: np.ndarray,
     k: np.ndarray,
@@ -159,3 +268,35 @@ def attention_reference(
         weights /= np.sum(weights)
         out[qi] = weights @ vf[start:end]
     return out.astype(bfloat16)
+
+
+def tiled_attention_reference(
+    q_tiles: np.ndarray,
+    k: np.ndarray,
+    v: np.ndarray,
+    *,
+    kv_groups: int,
+    heads_per_kv: int,
+    query_base: int = 0,
+    causal: bool = False,
+    window_len: int = 0,
+) -> np.ndarray:
+    herd_rows, herd_cols = q_tiles.shape[:2]
+    out = np.empty_like(q_tiles)
+    tiles_per_query_chunk = kv_groups * heads_per_kv
+    for tx in range(herd_rows):
+        for ty in range(herd_cols):
+            linear = tx * herd_cols + ty
+            q_slot = linear // tiles_per_query_chunk
+            rem = linear % tiles_per_query_chunk
+            kv_group = rem // heads_per_kv
+            tile_query_base = query_base + q_slot * q_tiles.shape[2]
+            out[tx, ty] = attention_reference(
+                q_tiles[tx, ty],
+                k[kv_group],
+                v[kv_group],
+                query_base=tile_query_base,
+                causal=causal,
+                window_len=window_len,
+            )
+    return out

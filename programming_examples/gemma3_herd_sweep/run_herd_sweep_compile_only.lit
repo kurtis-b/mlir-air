@@ -7,3 +7,14 @@
 // RUN: cd test_gemma3_herd_sweep
 // RUN: make -f %S/Makefile clean PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR
 // RUN: make -f %S/Makefile sweep PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR COMPILE_MODE=compile-only OUTPUT_FORMAT=elf
+// RUN: make -f %S/Makefile sweep PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR COMPILE_MODE=compile-only OUTPUT_FORMAT=elf SWEEP_OUTPUT_MODES="direct l2-gather"
+// RUN: make -f %S/Makefile run-fused-dqp-paper PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR COMPILE_MODE=compile-only OUTPUT_FORMAT=elf PAPER_FUSED_DQP_COL_BLOCKS=2
+// RUN: make -f %S/Makefile run-flowqkv-paper PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR COMPILE_MODE=compile-only OUTPUT_FORMAT=elf PAPER_KV_LEN=32 PAPER_HEAD_DIM=64
+// RUN: make -f %S/Makefile run-flowkv-paper PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR COMPILE_MODE=compile-only OUTPUT_FORMAT=elf PAPER_KV_LEN=32 PAPER_HEAD_DIM=64
+// RUN: not python3 %S/q4nx.py --herd-shape 8x4 --output-mode direct --print-module-only 2>&1 | FileCheck %s --check-prefix=UNSUPPORTED-Q4NX
+// RUN: not python3 %S/fused_dqp.py --herd-shape 8x4 --output-mode direct --print-module-only 2>&1 | FileCheck %s --check-prefix=UNSUPPORTED-FUSED
+// RUN: not python3 %S/flowkv.py --herd-shape 2x4 --output-mode l2-gather --print-module-only 2>&1 | FileCheck %s --check-prefix=UNSUPPORTED-FLOWKV
+
+// UNSUPPORTED-Q4NX: output mode {{.*}}direct{{.*}} is not supported for q4nx 8x4; supported modes: l2-gather
+// UNSUPPORTED-FUSED: output mode {{.*}}direct{{.*}} is not supported for fused_dqp 8x4; supported modes: l2-gather
+// UNSUPPORTED-FLOWKV: output mode {{.*}}l2-gather{{.*}} is not supported for flowkv 2x4; supported modes: direct
