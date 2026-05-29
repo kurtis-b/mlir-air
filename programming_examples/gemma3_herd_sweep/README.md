@@ -156,3 +156,27 @@ These examples are meant to be readable, sweepable AIR mappings. They do not use
 binary disassembly, generated instruction traces, or model-runtime integration.
 The paper modes are experimental kernel-level mappings and should not be reported
 as end-to-end FastFlowLM or Gemma3 runtime parity.
+
+## Hardware Acceptance Snapshot
+
+Status as of 2026-05-29 on NPU Strix, XRT 2.21.0, compact defaults
+(`KV_LEN=32`, `HEAD_DIM=64`, `OUTPUT_FORMAT=elf`):
+
+| Target set | Result |
+| --- | --- |
+| 2x4 `run-q4nx`, `run-mm`, `run-fused-dqp`, `run-flowqkv`, `run-flowkv` | PASS |
+| 4x4 `run-q4nx`, `run-mm`, `run-fused-dqp`, `run-flowqkv`, `run-flowkv` | PASS |
+| 8x4 `run-mm`, `run-flowqkv`, `run-flowkv`, `run-q4nx`, `run-fused-dqp` | PASS |
+| `run-q4nx-8x4-rowband-fallback` | PASS as logical row-band fallback |
+| `run-fused-dqp-paper`, `run-flowqkv-paper`, `run-flowkv-paper` | PASS |
+| `run-fused-dqp-pipeline` | TIMEOUT, diagnostic-only |
+
+The FusedDQP pipeline timeout reproduces as `ERT_CMD_STATE_TIMEOUT` with
+`ctx_pc=0x28B060AD`; `xrt-smi examine -r all` immediately after each timeout
+shows no active hardware contexts. The timeout remains when runtime-loop tiling
+is removed, when ping-pong buffering is enabled, when the lock-race fix is
+disabled, and when both Peano dequant/project calls are removed from a temporary
+diagnostic module. The first bad boundary is therefore the lowered AIE/runtime
+execution of the two-herd inter-worker channel schedule, not the FusedDQP
+microkernels or the supported L2-gather output route. Keep this mode
+diagnostic-only until the channel/lock/DMA schedule is fixed.
