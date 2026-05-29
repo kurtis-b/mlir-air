@@ -66,14 +66,16 @@ FLOWKV_OUTPUT_MODE ?= auto
 FUSED_DQP_SCHEDULE_MODE ?= smoke
 FLOWQKV_SCHEDULE_MODE ?= smoke
 FLOWKV_SCHEDULE_MODE ?= smoke
-FLOWQKV_KV_STAGING ?= replicated
+FLOWQKV_KV_STAGING ?= pipeline
 FLOWKV_KV_STAGING ?= pipeline
 FUSED_DQP_COL_BLOCKS ?= 1
+FUSED_DQP_COL_CHUNK ?= 32
 PAPER_FUSED_DQP_COL_BLOCKS ?= 2
 PAPER_KV_GROUPS ?= 4
 PAPER_HEADS_PER_KV ?= 2
 PAPER_Q_CHUNK ?= $(Q_CHUNK)
 PAPER_KV_LEN ?= $(KV_LEN)
+PAPER_KV_CHUNK ?= 16
 PAPER_HEAD_DIM ?= $(HEAD_DIM)
 SWEEP_OUTPUT_MODES ?= auto
 SWEEP_OUTPUT_MODE_FLAGS := $(foreach mode,$(SWEEP_OUTPUT_MODES),--output-mode $(mode))
@@ -118,6 +120,8 @@ compile-fused-dqp-kernel: check-peano
 	mkdir -p $(BUILD_DIR)
 	$(PEANO_INSTALL_DIR)/bin/clang++ ${PEANOWRAP2P_OPT_FLAGS} \
 		-DQ4NX_ROWS=$(Q4NX_ROWS) -DQ4NX_COLS=$(Q4NX_COLS) \
+		-DFUSED_DQP_COL_BLOCKS=$(FUSED_DQP_COL_BLOCKS) \
+		-DFUSED_DQP_COL_CHUNK=$(FUSED_DQP_COL_CHUNK) \
 		-c $(srcdir)/fused_dqp_opt.cc -o $(BUILD_DIR)/fused_dqp.o
 
 run-fused-dqp: compile-fused-dqp-kernel prepare-air-project
@@ -127,10 +131,14 @@ run-fused-dqp: compile-fused-dqp-kernel prepare-air-project
 		--herd-shape $(HERD_SHAPE) --kernel-name fused_dqp_block_opt \
 		--object-file fused_dqp.o --compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG) \
 		--output-mode $(FUSED_DQP_OUTPUT_MODE) --schedule-mode $(FUSED_DQP_SCHEDULE_MODE) \
-		--col-blocks $(FUSED_DQP_COL_BLOCKS)
+		--col-blocks $(FUSED_DQP_COL_BLOCKS) --col-chunk $(FUSED_DQP_COL_CHUNK)
 
 run-fused-dqp-paper:
 	$(MAKE) -f $(this_makefile) run-fused-dqp HERD_SHAPE=4x4 FUSED_DQP_SCHEDULE_MODE=paper \
+		FUSED_DQP_OUTPUT_MODE=l2-gather FUSED_DQP_COL_BLOCKS=$(PAPER_FUSED_DQP_COL_BLOCKS)
+
+run-fused-dqp-pipeline:
+	$(MAKE) -f $(this_makefile) run-fused-dqp HERD_SHAPE=8x4 FUSED_DQP_SCHEDULE_MODE=pipeline \
 		FUSED_DQP_OUTPUT_MODE=l2-gather FUSED_DQP_COL_BLOCKS=$(PAPER_FUSED_DQP_COL_BLOCKS)
 
 compile-mm-kernel: check-peano
@@ -198,7 +206,7 @@ run-flowqkv-paper:
 
 run-flowkv-paper:
 	$(MAKE) -f $(this_makefile) run-flowkv HERD_SHAPE=2x4 FLOWKV_SCHEDULE_MODE=paper \
-		FLOWKV_OUTPUT_MODE=direct KV_LEN=$(PAPER_KV_LEN) KV_CHUNK=$(KV_CHUNK) \
+		FLOWKV_OUTPUT_MODE=direct KV_LEN=$(PAPER_KV_LEN) KV_CHUNK=$(PAPER_KV_CHUNK) \
 		HEAD_DIM=$(PAPER_HEAD_DIM)
 
 profile-paper: run-fused-dqp-paper run-flowqkv-paper run-flowkv-paper

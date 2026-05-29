@@ -88,12 +88,13 @@ fallback/workaround target, not a full physical 8x4 utilization result.
 `FLOWKV_SCHEDULE_MODE` select `smoke` or `paper`. The default `smoke` mode keeps
 the validated compact herd sweep. The `run-*-paper` targets enable the
 paper-style data layouts and online accumulator kernels with compact defaults;
-use `PAPER_FUSED_DQP_COL_BLOCKS`, `PAPER_KV_LEN`, `PAPER_HEAD_DIM`,
-`PAPER_KV_GROUPS`, and `PAPER_HEADS_PER_KV` to scale those targets.
+use `PAPER_FUSED_DQP_COL_BLOCKS`, `PAPER_KV_LEN`, `PAPER_KV_CHUNK`,
+`PAPER_HEAD_DIM`, `PAPER_KV_GROUPS`, and `PAPER_HEADS_PER_KV` to scale
+those targets.
 `FLOWQKV_KV_STAGING` and `FLOWKV_KV_STAGING` select `replicated`,
-`shared`, or `pipeline` paper K/V staging. FlowQKV defaults to `replicated` to
-keep the 8x4 compile path bounded. FlowKV defaults to `pipeline`, which maps
-the decode path onto a two-stage CT0-to-CT1 channel pipeline.
+`shared`, or `pipeline` paper K/V staging. FlowQKV and FlowKV default to
+`pipeline`, mapping the attention score/softmax work and value-apply work onto
+separate herds connected by an AIR channel.
 
 ## Mapping Notes
 
@@ -114,23 +115,30 @@ then splits the payload in L1 before the Peano call. Paper mode keeps the Q4NX
 weight block plus scale/min pack per row/column block, stages the activation
 vector once per column block, and accumulates across `COL_BLOCKS` using the
 `fused_dqp_accum_block_opt` entry point. The optimized kernel processes the
-paper's 16x8 row/column sub-blocks internally.
+paper's 16x8 row/column sub-blocks internally. FusedDQP `pipeline` mode is a
+diagnostic two-herd dequant/project mapping that streams dequantized column
+chunks over an AIR channel; it is compile-legal, but current hardware execution
+still times out and should not be reported as a passing physical result.
 
 FlowQKV and FlowKV smoke mode map one attention group per CT. Q, K, and V are
 packed as one BF16 input per group, staged through L2, and split into contiguous
 Q/K/V L1 buffers before the Peano attention microkernel runs. FlowQKV paper mode
 uses tile-shaped Q data and maps CTs to shared GQA K/V groups. The default
-`replicated` K/V staging materializes each CT's selected K/V group in the input
-buffer before L2 staging, which keeps the 8x4 compile path bounded. The opt-in
-`shared` staging mode keeps source-level shared per-KV-group K/V inputs as a
-diagnostic, but it expands to a large fanout schedule during lowering. FlowKV
-paper mode now uses the paper's 2x4 / four-KV-group placement as two 1x4 herds:
-a score/softmax herd produces BF16 attention weights, sends them over an AIR
-worker-to-worker channel, and an apply herd consumes the weights with V to
+`pipeline` staging splits the physical rows into score/softmax and value-apply
+stages, with Q/K/V staged through L2 and only the attention weights crossing the
+inter-herd AIR channel. The `replicated` K/V staging materializes each CT's
+selected K/V group in the input buffer before L2 staging and remains available
+as a compact diagnostic. The `shared` staging mode keeps source-level shared
+per-KV-group K/V inputs as a diagnostic, but it expands to a larger fanout
+schedule during lowering. FlowKV paper mode uses the paper's 2x4 /
+four-KV-group placement as two 1x4 herds: a score/softmax herd produces BF16
+attention weights in `PAPER_KV_CHUNK` pieces, sends those chunks over an AIR
+worker-to-worker channel, and an apply herd accumulates the chunks with V to
 produce the decode output. The fused Flow attention microkernel still uses
-chunked online-softmax state (`m`, `l`, and `Y`) instead of a full score buffer;
-the split FlowKV pipeline uses a materialized BF16 attention vector at the CT
-boundary because that is the explicit inter-stage payload.
+chunked online-softmax state (`m`, `l`, and `Y`) instead of a full score buffer.
+The split FlowKV pipeline now chunks the CT boundary; FlowQKV still materializes
+its small `Q_CHUNK x KV_LEN` BF16 attention tile as the explicit inter-stage
+payload.
 
 These examples are meant to be readable, sweepable AIR mappings. They do not use
 binary disassembly, generated instruction traces, or model-runtime integration.

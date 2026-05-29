@@ -19,7 +19,12 @@ from common import (
     resolve_output_mode,
     tiled_attention_reference,
 )
-from flow_common import build_flow_module, build_flow_paper_module, run_or_compile
+from flow_common import (
+    build_flow_module,
+    build_flow_paper_module,
+    build_flowqkv_pipeline_module,
+    run_or_compile,
+)
 
 
 def _paper_causal(args):
@@ -30,6 +35,14 @@ def _paper_window_len(args):
     if args.variant != "swa":
         return args.window_len
     return args.window_len if args.window_len > 0 else args.kv_len
+
+
+def _qbase_kernel_name(kernel_name: str) -> str:
+    if kernel_name == "flowqkv_chunk_bf16_opt":
+        return "flowqkv_chunk_qbase_bf16_opt"
+    if kernel_name.endswith("_opt"):
+        return f"{kernel_name[:-4]}_qbase_opt"
+    return f"{kernel_name}_qbase"
 
 
 def main():
@@ -80,17 +93,36 @@ def main():
 
     instance_name = "flow_attention"
     if args.schedule_mode == "paper":
-        if args.kv_staging == "pipeline":
-            parser.error("pipeline K/V staging is only implemented for FlowKV decode")
         tiles_per_query_chunk = args.kv_groups * args.heads_per_kv
         if herd_tiles % tiles_per_query_chunk != 0:
             parser.error("herd CT count must be divisible by kv-groups*heads-per-kv")
-        if args.kv_staging == "shared":
+        qbase_kernel_name = _qbase_kernel_name(args.kernel_name)
+        if args.kv_staging == "pipeline":
+            if args.herd_rows % 2 != 0:
+                parser.error("pipeline FlowQKV paper mode expects an even CT row count")
+            if args.herd_cols != args.kv_groups:
+                parser.error("pipeline FlowQKV paper mode expects herd-cols == kv-groups")
+            module = build_flowqkv_pipeline_module(
+                args.q_chunk,
+                args.kv_len,
+                args.head_dim,
+                "flowqkv_scores_bf16_opt",
+                "flowqkv_apply_bf16_opt",
+                args.object_file,
+                "flowqkv",
+                args.kv_groups,
+                args.herd_rows,
+                args.herd_cols,
+                output_mode,
+                args.query_base,
+            )
+            instance_name = "flowqkv_pipeline"
+        elif args.kv_staging == "shared":
             module = build_flow_paper_module(
                 args.q_chunk,
                 args.kv_len,
                 args.head_dim,
-                args.kernel_name,
+                qbase_kernel_name,
                 args.object_file,
                 "flowqkv",
                 args.kv_groups,
@@ -98,6 +130,8 @@ def main():
                 args.herd_rows,
                 args.herd_cols,
                 output_mode,
+                dynamic_query_base=True,
+                query_base=args.query_base,
             )
             instance_name = "flow_attention_paper"
         else:
@@ -105,7 +139,7 @@ def main():
                 args.q_chunk,
                 args.kv_len,
                 args.head_dim,
-                args.kernel_name,
+                qbase_kernel_name,
                 args.object_file,
                 "flowqkv",
                 herd_tiles,
@@ -113,6 +147,9 @@ def main():
                 args.herd_cols,
                 output_mode,
                 l2_gather_layout="rowcol",
+                dynamic_query_base=True,
+                query_base=args.query_base,
+                tiles_per_query_chunk=tiles_per_query_chunk,
             )
         if args.print_module_only:
             print(module)
@@ -120,11 +157,6 @@ def main():
 
         rng = np.random.default_rng(3)
         val_range = 0.35
-        q = rng.uniform(
-            -val_range,
-            val_range,
-            (args.herd_rows, args.herd_cols, args.q_chunk, args.head_dim),
-        ).astype(bfloat16)
         k = rng.uniform(
             -val_range,
             val_range,
@@ -135,41 +167,67 @@ def main():
             val_range,
             (args.kv_groups, args.kv_len, args.head_dim),
         ).astype(bfloat16)
-        expected_tiles = tiled_attention_reference(
-            q,
-            k,
-            v,
-            kv_groups=args.kv_groups,
-            heads_per_kv=args.heads_per_kv,
-            query_base=args.query_base,
-            causal=_paper_causal(args),
-            window_len=_paper_window_len(args),
-        ).astype(bfloat16)
-        if args.kv_staging == "shared":
-            expected = expected_tiles
+        if args.kv_staging == "pipeline":
+            pipe_rows = args.herd_rows // 2
+            q = rng.uniform(
+                -val_range,
+                val_range,
+                (pipe_rows, args.herd_cols, args.q_chunk, args.head_dim),
+            ).astype(bfloat16)
+            expected = np.empty_like(q)
+            for row in range(pipe_rows):
+                tile_query_base = args.query_base + row * args.q_chunk
+                for group in range(args.kv_groups):
+                    expected[row, group] = attention_reference(
+                        q[row, group],
+                        k[group],
+                        v[group],
+                        query_base=tile_query_base,
+                        causal=_paper_causal(args),
+                        window_len=_paper_window_len(args),
+                    )
             inputs = [q, k, v]
         else:
-            expected = expected_tiles.reshape(herd_tiles, args.q_chunk, args.head_dim)
-            q_flat = q.reshape(herd_tiles, args.q_chunk, args.head_dim)
-            qkv = np.empty(
-                (herd_tiles, args.q_chunk + 2 * args.kv_len, args.head_dim),
-                dtype=bfloat16,
-            )
-            for tile in range(herd_tiles):
-                kv_group = (tile % tiles_per_query_chunk) // args.heads_per_kv
-                qkv[tile, : args.q_chunk, :] = q_flat[tile]
-                qkv[tile, args.q_chunk : args.q_chunk + args.kv_len, :] = k[
-                    kv_group
-                ]
-                qkv[tile, args.q_chunk + args.kv_len :, :] = v[kv_group]
-            inputs = [
-                qkv.reshape(
-                    args.herd_rows,
-                    args.herd_cols,
-                    qkv.shape[-2],
-                    qkv.shape[-1],
+            q = rng.uniform(
+                -val_range,
+                val_range,
+                (args.herd_rows, args.herd_cols, args.q_chunk, args.head_dim),
+            ).astype(bfloat16)
+            expected_tiles = tiled_attention_reference(
+                q,
+                k,
+                v,
+                kv_groups=args.kv_groups,
+                heads_per_kv=args.heads_per_kv,
+                query_base=args.query_base,
+                causal=_paper_causal(args),
+                window_len=_paper_window_len(args),
+            ).astype(bfloat16)
+            if args.kv_staging == "shared":
+                expected = expected_tiles
+                inputs = [q, k, v]
+            else:
+                expected = expected_tiles.reshape(herd_tiles, args.q_chunk, args.head_dim)
+                q_flat = q.reshape(herd_tiles, args.q_chunk, args.head_dim)
+                qkv = np.empty(
+                    (herd_tiles, args.q_chunk + 2 * args.kv_len, args.head_dim),
+                    dtype=bfloat16,
                 )
-            ]
+                for tile in range(herd_tiles):
+                    kv_group = (tile % tiles_per_query_chunk) // args.heads_per_kv
+                    qkv[tile, : args.q_chunk, :] = q_flat[tile]
+                    qkv[tile, args.q_chunk : args.q_chunk + args.kv_len, :] = k[
+                        kv_group
+                    ]
+                    qkv[tile, args.q_chunk + args.kv_len :, :] = v[kv_group]
+                inputs = [
+                    qkv.reshape(
+                        args.herd_rows,
+                        args.herd_cols,
+                        qkv.shape[-2],
+                        qkv.shape[-1],
+                    )
+                ]
     else:
         args.groups = args.groups if args.groups is not None else herd_tiles
         if args.groups % herd_tiles != 0:

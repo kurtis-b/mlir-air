@@ -16,6 +16,14 @@
 #define Q4NX_COLS 256
 #endif
 
+#ifndef FUSED_DQP_COL_BLOCKS
+#define FUSED_DQP_COL_BLOCKS 1
+#endif
+
+#ifndef FUSED_DQP_COL_CHUNK
+#define FUSED_DQP_COL_CHUNK 32
+#endif
+
 constexpr aie::rounding_mode kDqpRoundMode = aie::rounding_mode::conv_even;
 
 static inline bfloat16 q4_to_bf16(uint8_t packed, bool high) {
@@ -78,6 +86,79 @@ static void fused_dqp_impl(const uint8_t *__restrict packed,
   }
 }
 
+static void fused_dqp_dequant_colchunk_impl(
+    int32_t block_index, int32_t col_offset, const uint8_t *__restrict packed_all,
+    bfloat16 *__restrict deq_chunk) {
+  constexpr int VecLen = 8;
+  constexpr unsigned PackedElems = Q4NX_ROWS * Q4NX_COLS / 2;
+  constexpr unsigned ParamElems = 2 * Q4NX_COLS;
+  constexpr unsigned BlockBytes = PackedElems + ParamElems * sizeof(bfloat16);
+  static_assert(Q4NX_COLS % VecLen == 0,
+                "optimized FusedDQP expects column count divisible by 8");
+  static_assert(FUSED_DQP_COL_CHUNK % VecLen == 0,
+                "optimized FusedDQP column chunk must be divisible by 8");
+
+  ::aie::set_rounding(kDqpRoundMode);
+
+  const uint8_t *__restrict packed =
+      packed_all + static_cast<unsigned>(block_index) * BlockBytes;
+  const bfloat16 *__restrict params =
+      reinterpret_cast<const bfloat16 *>(packed + PackedElems);
+  const bfloat16 *__restrict scale = params;
+  const bfloat16 *__restrict min_offset = params + Q4NX_COLS;
+  const unsigned col_base = static_cast<unsigned>(col_offset);
+
+  for (unsigned row = 0; row < Q4NX_ROWS; ++row) {
+    for (unsigned c = 0; c < FUSED_DQP_COL_CHUNK; c += VecLen)
+      chess_prepare_for_pipelining chess_loop_range(4, ) {
+        const unsigned col = col_base + c;
+        const unsigned idx = row * Q4NX_COLS + col;
+        const uint8_t p0 = packed[(idx >> 1) + 0];
+        const uint8_t p1 = packed[(idx >> 1) + 1];
+        const uint8_t p2 = packed[(idx >> 1) + 2];
+        const uint8_t p3 = packed[(idx >> 1) + 3];
+        const bfloat16 q_buf[VecLen] = {
+            q4_to_bf16(p0, false), q4_to_bf16(p0, true),
+            q4_to_bf16(p1, false), q4_to_bf16(p1, true),
+            q4_to_bf16(p2, false), q4_to_bf16(p2, true),
+            q4_to_bf16(p3, false), q4_to_bf16(p3, true),
+        };
+
+        aie::vector<bfloat16, VecLen> q = aie::load_v<VecLen>(q_buf);
+        aie::vector<bfloat16, VecLen> s = aie::load_v<VecLen>(scale + col);
+        aie::vector<bfloat16, VecLen> m = aie::load_v<VecLen>(min_offset + col);
+        aie::accum<accfloat, VecLen> w = aie::mul(q, s);
+        w = aie::add(w, m);
+        aie::store_v(deq_chunk + row * FUSED_DQP_COL_CHUNK + c,
+                     w.to_vector<bfloat16>());
+      }
+  }
+}
+
+static void fused_dqp_project_colchunk_impl(
+    const bfloat16 *__restrict deq_chunk,
+    const bfloat16 *__restrict activation_chunk, bfloat16 *__restrict out) {
+  constexpr int VecLen = 8;
+  static_assert(FUSED_DQP_COL_CHUNK % VecLen == 0,
+                "optimized FusedDQP column chunk must be divisible by 8");
+
+  ::aie::set_rounding(kDqpRoundMode);
+
+  for (unsigned row = 0; row < Q4NX_ROWS; ++row) {
+    float acc = static_cast<float>(out[row]);
+    for (unsigned col = 0; col < FUSED_DQP_COL_CHUNK; col += VecLen)
+      chess_prepare_for_pipelining chess_loop_range(4, ) {
+        aie::vector<bfloat16, VecLen> w = aie::load_v<VecLen>(
+            deq_chunk + row * FUSED_DQP_COL_CHUNK + col);
+        aie::vector<bfloat16, VecLen> a =
+            aie::load_v<VecLen>(activation_chunk + col);
+        aie::accum<accfloat, VecLen> prod = aie::mul(w, a);
+        acc += aie::reduce_add(prod.to_vector<float>());
+      }
+    out[row] = static_cast<bfloat16>(acc);
+  }
+}
+
 extern "C" {
 
 void fused_dqp_block_opt(const uint8_t *__restrict packed,
@@ -86,6 +167,19 @@ void fused_dqp_block_opt(const uint8_t *__restrict packed,
                          const bfloat16 *__restrict activation,
                          bfloat16 *__restrict out) {
   fused_dqp_impl<false>(packed, scale, min_offset, activation, out);
+}
+
+void fused_dqp_dequant_colchunk_opt(int32_t block_index, int32_t col_offset,
+                                    const uint8_t *__restrict packed_all,
+                                    bfloat16 *__restrict deq_chunk) {
+  fused_dqp_dequant_colchunk_impl(block_index, col_offset, packed_all,
+                                  deq_chunk);
+}
+
+void fused_dqp_project_colchunk_opt(const bfloat16 *__restrict deq_chunk,
+                                    const bfloat16 *__restrict activation_chunk,
+                                    bfloat16 *__restrict out) {
+  fused_dqp_project_colchunk_impl(deq_chunk, activation_chunk, out);
 }
 
 void fused_dqp_accum_block_opt(const uint8_t *__restrict packed,

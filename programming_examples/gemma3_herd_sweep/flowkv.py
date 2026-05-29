@@ -97,14 +97,15 @@ def main():
             module = build_flowkv_pipeline_module(
                 args.kv_len,
                 args.head_dim,
-                "flowkv_scores_bf16_opt",
-                "flowkv_apply_bf16_opt",
+                "flowkv_scores_chunk_bf16_opt",
+                "flowkv_apply_chunk_bf16_opt",
                 args.object_file,
                 "flowkv",
                 args.kv_groups,
                 args.herd_rows,
                 args.herd_cols,
                 output_mode,
+                args.kv_chunk,
             )
             instance_name = "flowkv_pipeline"
         elif args.kv_staging == "shared":

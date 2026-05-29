@@ -12,7 +12,8 @@ from air.ir import *
 from air.dialects.affine import apply as affine_apply
 from air.dialects.air import *
 from air.dialects.arith import ConstantOp
-from air.dialects import linalg
+from air.dialects import linalg, arith
+from air.dialects.scf import for_ as range_, yield_
 from air.dialects.func import FuncOp, CallOp
 from air.dialects.memref import AllocOp, DeallocOp, subview, view
 from air.backend.xrt import XRTBackend
@@ -64,6 +65,21 @@ def _affine_linear_local(herd_cols):
             AffineExpr.get_add(
                 AffineExpr.get_mul(
                     AffineSymbolExpr.get(0), AffineConstantExpr.get(herd_cols)
+                ),
+                AffineSymbolExpr.get(1),
+            )
+        ],
+    )
+
+
+def _affine_block_col_offset(cols):
+    return AffineMap.get(
+        0,
+        2,
+        [
+            AffineExpr.get_add(
+                AffineExpr.get_mul(
+                    AffineSymbolExpr.get(0), AffineConstantExpr.get(cols)
                 ),
                 AffineSymbolExpr.get(1),
             )
@@ -453,6 +469,238 @@ def build_paper_module(
                 DeallocOp(l2_act)
 
 
+
+@module_builder
+def build_pipeline_module(
+    rows,
+    cols,
+    dequant_kernel_name="fused_dqp_dequant_colchunk_opt",
+    project_kernel_name="fused_dqp_project_colchunk_opt",
+    object_file="fused_dqp.o",
+    row_blocks=1,
+    col_blocks=1,
+    col_chunk=32,
+    herd_rows=4,
+    herd_cols=4,
+    output_mode="l2-gather",
+):
+    if output_mode not in ("direct", "l2-gather"):
+        raise ValueError(f"unsupported output mode: {output_mode}")
+    if herd_rows % 2 != 0:
+        raise ValueError("FusedDQP pipeline mode expects an even number of CT rows")
+    if cols % col_chunk != 0:
+        raise ValueError("FusedDQP pipeline mode expects cols divisible by col-chunk")
+    if col_chunk % 8 != 0:
+        raise ValueError("FusedDQP pipeline mode expects col-chunk divisible by 8")
+    use_l2_gather = output_mode == "l2-gather"
+
+    pipe_rows = herd_rows // 2
+    pipe_tiles = pipe_rows * herd_cols
+    bf16_type = type_mapper(bfloat16)
+    i8_type = IntegerType.get_signless(8)
+    packed_elems = rows * cols // 2
+    param_elems = 2 * cols
+    block_bytes = packed_elems + param_elems * np.dtype(bfloat16).itemsize
+
+    l3_pack_ty = MemRefType.get(
+        [row_blocks // herd_cols, herd_cols, col_blocks, block_bytes], i8_type
+    )
+    l3_act_ty = MemRefType.get([col_blocks, cols], bf16_type)
+    l3_out_ty = MemRefType.get([row_blocks, rows], bf16_type)
+
+    l2_space = IntegerAttr.get(T.i32(), MemorySpace.L2)
+    l2_pack_ty = MemRefType.get(
+        [pipe_rows, herd_cols, col_blocks, block_bytes],
+        i8_type,
+        memory_space=l2_space,
+    )
+    l2_act_ty = MemRefType.get([col_blocks, cols], bf16_type, memory_space=l2_space)
+    if use_l2_gather:
+        l2_out_ty = MemRefType.get(
+            [pipe_rows, herd_cols, rows], bf16_type, memory_space=l2_space
+        )
+
+    l1_space = IntegerAttr.get(T.i32(), MemorySpace.L1)
+    l1_pack_all_ty = MemRefType.get(
+        [col_blocks * block_bytes], i8_type, memory_space=l1_space
+    )
+    l1_deq_chunk_ty = MemRefType.get(
+        [rows, col_chunk], bf16_type, memory_space=l1_space
+    )
+    l1_act_all_ty = MemRefType.get(
+        [col_blocks * cols], bf16_type, memory_space=l1_space
+    )
+    l1_act_chunk_ty = MemRefType.get([col_chunk], bf16_type, memory_space=l1_space)
+    l1_out_ty = MemRefType.get([rows], bf16_type, memory_space=l1_space)
+
+    dequant_func = FuncOp(
+        dequant_kernel_name,
+        ([T.i32(), T.i32(), l1_pack_all_ty, l1_deq_chunk_ty], []),
+        visibility="private",
+    )
+    dequant_func.attributes["link_with"] = StringAttr.get(object_file)
+    dequant_func.attributes["llvm.emit_c_interface"] = UnitAttr.get()
+
+    project_func = FuncOp(
+        project_kernel_name,
+        ([l1_deq_chunk_ty, l1_act_chunk_ty, l1_out_ty], []),
+        visibility="private",
+    )
+    project_func.attributes["link_with"] = StringAttr.get(object_file)
+    project_func.attributes["llvm.emit_c_interface"] = UnitAttr.get()
+
+    block_map = _affine_linear_tile(herd_cols)
+    act_offset_map = _affine_block_col_offset(cols)
+    launch_offset_map = _affine_mul(pipe_tiles)
+    launch_row_offset_map = _affine_mul(pipe_rows)
+    deq_chan = "fused_dqp_pipe_deq"
+    Channel(deq_chan, size=[pipe_rows, herd_cols])
+
+    @FuncOp.from_py_func(l3_pack_ty, l3_act_ty, l3_out_ty)
+    def fused_dqp_pipeline(arg_pack, arg_act, arg_out):
+        @launch(
+            operands=[arg_pack, arg_act, arg_out],
+            sizes=[row_blocks // pipe_tiles, 1],
+        )
+        def launch_body(lx, _ly, _lsx, _lsy, lpack, lact, lo):
+            launch_base = affine_apply(launch_offset_map, [lx])
+            launch_row_base = affine_apply(launch_row_offset_map, [lx])
+
+            @segment(
+                name="fused_dqp_pipeline_seg",
+                operands=[launch_base, launch_row_base, lpack, lact, lo],
+            )
+            def segment_body(base, row_base, spack, sact, so):
+                l2_pack = AllocOp(l2_pack_ty, [], [])
+                l2_act = AllocOp(l2_act_ty, [], [])
+                if use_l2_gather:
+                    l2_out = AllocOp(l2_out_ty, [], [])
+
+                dma_memcpy_nd(
+                    l2_pack,
+                    spack,
+                    src_offsets=[row_base, 0, 0, 0],
+                    src_sizes=[pipe_rows, herd_cols, col_blocks, block_bytes],
+                    src_strides=[
+                        herd_cols * col_blocks * block_bytes,
+                        col_blocks * block_bytes,
+                        block_bytes,
+                        1,
+                    ],
+                )
+                dma_memcpy_nd(l2_act, sact)
+
+                @herd(
+                    name="fused_dqp_dequant_herd",
+                    sizes=[pipe_rows, herd_cols],
+                    operands=[l2_pack],
+                    link_with=object_file,
+                )
+                def dequant_body(_tx, _ty, _sx, _sy, hpack):
+                    l1_pack_all = AllocOp(l1_pack_all_ty, [], [])
+                    l1_deq_chunk = AllocOp(l1_deq_chunk_ty, [], [])
+
+                    dma_memcpy_nd(
+                        l1_pack_all,
+                        hpack,
+                        src_offsets=[_tx, _ty, 0, 0],
+                        src_sizes=[1, 1, col_blocks, block_bytes],
+                        src_strides=[
+                            herd_cols * col_blocks * block_bytes,
+                            col_blocks * block_bytes,
+                            block_bytes,
+                            1,
+                        ],
+                    )
+
+                    for cb in range_(0, col_blocks, 1):
+                        cb_i32 = arith.IndexCastOp(T.i32(), cb).result
+                        for col_offset in range_(0, cols, col_chunk):
+                            col_i32 = arith.IndexCastOp(T.i32(), col_offset).result
+                            CallOp(
+                                dequant_func,
+                                [cb_i32, col_i32, l1_pack_all, l1_deq_chunk],
+                            )
+                            ChannelPut(deq_chan, l1_deq_chunk, indices=[_tx, _ty])
+                            yield_([])
+                        yield_([])
+
+                    DeallocOp(l1_pack_all)
+                    DeallocOp(l1_deq_chunk)
+
+                @herd(
+                    name="fused_dqp_project_herd",
+                    sizes=[pipe_rows, herd_cols],
+                    operands=[base, l2_act, l2_out if use_l2_gather else so],
+                    link_with=object_file,
+                )
+                def project_body(_tx, _ty, _sx, _sy, bbase, hact, h_out):
+                    block_idx = affine_apply(block_map, [bbase, _tx, _ty])
+                    l1_act_all = AllocOp(l1_act_all_ty, [], [])
+                    l1_deq_chunk = AllocOp(l1_deq_chunk_ty, [], [])
+                    l1_act_chunk = AllocOp(l1_act_chunk_ty, [], [])
+                    l1_out = AllocOp(l1_out_ty, [], [])
+                    zero = ConstantOp(bf16_type, 0.0)
+                    linalg.fill(zero, outs=[l1_out])
+
+                    dma_memcpy_nd(
+                        l1_act_all,
+                        hact,
+                        src_offsets=[0, 0],
+                        src_sizes=[col_blocks, cols],
+                        src_strides=[cols, 1],
+                    )
+
+                    for cb in range_(0, col_blocks, 1):
+                        for col_offset in range_(0, cols, col_chunk):
+                            act_offset = affine_apply(act_offset_map, [cb, col_offset])
+                            ChannelGet(deq_chan, l1_deq_chunk, indices=[_tx, _ty])
+                            l1_a_src = subview(
+                                l1_act_all.result, [act_offset], [col_chunk], [1]
+                            )
+                            linalg.copy(l1_a_src, outs=[l1_act_chunk])
+                            CallOp(project_func, [l1_deq_chunk, l1_act_chunk, l1_out])
+                            yield_([])
+                        yield_([])
+
+                    if use_l2_gather:
+                        dma_memcpy_nd(
+                            h_out,
+                            l1_out,
+                            dst_offsets=[_tx, _ty, 0],
+                            dst_sizes=[1, 1, rows],
+                            dst_strides=[herd_cols * rows, rows, 1],
+                        )
+                    else:
+                        dma_memcpy_nd(
+                            h_out,
+                            l1_out,
+                            dst_offsets=[block_idx, 0],
+                            dst_sizes=[1, rows],
+                            dst_strides=[rows, 1],
+                        )
+
+                    DeallocOp(l1_act_all)
+                    DeallocOp(l1_deq_chunk)
+                    DeallocOp(l1_act_chunk)
+                    DeallocOp(l1_out)
+
+                if use_l2_gather:
+                    dma_memcpy_nd(
+                        so,
+                        l2_out,
+                        dst_offsets=[base, 0],
+                        dst_sizes=[pipe_tiles, rows],
+                        dst_strides=[rows, 1],
+                        src_offsets=[0, 0, 0],
+                        src_sizes=[pipe_rows, herd_cols, rows],
+                        src_strides=[herd_cols * rows, rows, 1],
+                    )
+                    DeallocOp(l2_out)
+
+                DeallocOp(l2_pack)
+                DeallocOp(l2_act)
+
 def _paper_kernel_name(kernel_name: str) -> str:
     if kernel_name == "fused_dqp_block":
         return "fused_dqp_accum_block"
@@ -470,9 +718,10 @@ def main():
     parser.add_argument("--herd-shape", choices=SUPPORTED_HERD_SHAPES, default="2x4")
     parser.add_argument("--row-blocks", type=int, default=None)
     parser.add_argument("--col-blocks", type=int, default=1)
+    parser.add_argument("--col-chunk", type=int, default=32)
     parser.add_argument("--herd-rows", type=int, default=None)
     parser.add_argument("--herd-cols", type=int, default=None)
-    parser.add_argument("--schedule-mode", choices=SCHEDULE_MODES, default="smoke")
+    parser.add_argument("--schedule-mode", choices=(*SCHEDULE_MODES, "pipeline"), default="smoke")
     parser.add_argument("--kernel-name", default="fused_dqp_block")
     parser.add_argument("--object-file", default="fused_dqp.o")
     parser.add_argument(
@@ -492,10 +741,17 @@ def main():
 
     if args.rows * args.cols % 2 != 0:
         parser.error("rows*cols must be even for int4 packing")
-    if args.row_blocks % herd_tiles != 0:
-        parser.error("row-blocks must be divisible by herd-rows*herd-cols")
+    row_block_divisor = (args.herd_rows // 2) * args.herd_cols if args.schedule_mode == "pipeline" else herd_tiles
+    if args.row_blocks % row_block_divisor != 0:
+        parser.error("row-blocks must be divisible by the active pipeline tile count")
     if args.col_blocks < 1:
         parser.error("col-blocks must be positive")
+    if args.col_chunk < 1:
+        parser.error("col-chunk must be positive")
+    if args.schedule_mode == "pipeline" and args.cols % args.col_chunk != 0:
+        parser.error("pipeline schedule requires cols divisible by col-chunk")
+    if args.schedule_mode == "pipeline" and args.col_chunk % 8 != 0:
+        parser.error("pipeline schedule requires col-chunk divisible by 8")
 
     try:
         output_mode = resolve_output_mode(
@@ -517,6 +773,20 @@ def main():
             args.herd_cols,
             output_mode,
         )
+    elif args.schedule_mode == "pipeline":
+        module = build_pipeline_module(
+            args.rows,
+            args.cols,
+            "fused_dqp_dequant_colchunk_opt",
+            "fused_dqp_project_colchunk_opt",
+            args.object_file,
+            args.row_blocks,
+            args.col_blocks,
+            args.col_chunk,
+            args.herd_rows,
+            args.herd_cols,
+            output_mode,
+        )
     else:
         module = build_module(
             args.rows,
@@ -533,7 +803,7 @@ def main():
         return
 
     rng = np.random.default_rng(2)
-    if args.schedule_mode == "paper":
+    if args.schedule_mode in ("paper", "pipeline"):
         packed, scale, min_offset = random_q4nx_blocks(
             args.row_blocks, args.col_blocks, args.rows, args.cols, seed=2
         )
@@ -578,7 +848,11 @@ def main():
             packed_l3.reshape(args.row_blocks // args.herd_cols, args.herd_cols, -1)
         ]
 
-    instance_name = "fused_dqp_paper" if args.schedule_mode == "paper" else "fused_dqp"
+    instance_name = (
+        "fused_dqp_pipeline"
+        if args.schedule_mode == "pipeline"
+        else "fused_dqp_paper" if args.schedule_mode == "paper" else "fused_dqp"
+    )
     backend_opts = dict(
         verbose=args.verbose,
         omit_pingpong=True,
