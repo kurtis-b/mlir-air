@@ -499,11 +499,15 @@ Implemented evidence and blocker:
 - `run_model_loop_nonlinears.lit`, `run_model_loop_results.lit`, and
   `run_model_loop_paper_compare.lit` cover the nonlinear metadata, measured
   result records, and paper-match fallback gate.
+- `gemma3_norm_weight_plan.py` now records the BF16 vector static-input
+  contract needed before RMSNorm and QK-Norm can be promoted: 1B has 156 norm
+  tensors totaling 266,240 bytes, while 4B text and the 4B vision text stack
+  each have 204 norm tensors totaling 731,136 bytes. The compact metadata is
+  saved in `results/gemma3_norm_weight_plan_evidence.json`.
 - Remaining work for full Phase E completion is model launch/binding
-  validation for the promoted GeGLU path, Gemma model wiring for RMSNorm and
-  QK-Norm once norm static weights are planned/preloaded, plus RoPE, residual,
-  logits, and sampling promotion or measured timing treatment in end-to-end
-  execution.
+  validation for the promoted GeGLU path, norm-weight XRT preload and binding
+  for RMSNorm/QK-Norm, plus RoPE, residual, logits, and sampling promotion or
+  measured timing treatment in end-to-end execution.
 
 ### Phase F: end-to-end 1B text reproduction
 
@@ -1370,8 +1374,9 @@ Milestones:
 
 - Reuse `weighted_rms_norm` for RMSNorm where layout-compatible.
 - Reuse or wrap RoPE only after the Gemma rotation convention is documented.
-- Add the norm-weight BO/preload path needed to use the validated weighted
-  RMSNorm wrapper for Gemma RMSNorm and QK-Norm in the model loop.
+- Use `gemma3_norm_weight_plan.py` to add the norm-weight BO/preload path
+  needed to use the validated weighted RMSNorm wrapper for Gemma RMSNorm and
+  QK-Norm in the model loop.
 - Keep the promoted GeGLU/MLP activation path as a model NPU candidate and
   validate launch/argument binding before counting it in timed model results.
 - Add residual/add/multiply vector kernels only when they reduce host fallback

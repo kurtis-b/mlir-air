@@ -24,3 +24,11 @@ source control unless they are reviewed as compact fixtures.
   first 9,126,805,504-byte KV-cache BO after allocating 4,454,893,568 bytes.
   This is allocation evidence only; it is not a kernel launch, correctness,
   timing, or paper-parity result.
+
+
+## Norm Weight Plan Evidence
+
+- `gemma3_norm_weight_plan_evidence.json`: compact safetensor-metadata evidence
+  for the BF16 norm vectors needed by RMSNorm and QK-Norm promotion. It records
+  tensor counts and byte totals only; it is not XRT preload, kernel launch,
+  correctness, timing, or paper-parity evidence.

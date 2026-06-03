@@ -1,0 +1,127 @@
+{
+  "results": [
+    {
+      "blockers": [],
+      "evidence_kind": "norm-weight-shape-plan",
+      "families": [
+        {
+          "family": "input_layernorm",
+          "static_bo_bytes": 59904,
+          "tensor_count": 26
+        },
+        {
+          "family": "post_attention_layernorm",
+          "static_bo_bytes": 59904,
+          "tensor_count": 26
+        },
+        {
+          "family": "pre_feedforward_layernorm",
+          "static_bo_bytes": 59904,
+          "tensor_count": 26
+        },
+        {
+          "family": "post_feedforward_layernorm",
+          "static_bo_bytes": 59904,
+          "tensor_count": 26
+        },
+        {
+          "family": "q_norm",
+          "static_bo_bytes": 13312,
+          "tensor_count": 26
+        },
+        {
+          "family": "k_norm",
+          "static_bo_bytes": 13312,
+          "tensor_count": 26
+        }
+      ],
+      "layers": 26,
+      "model_variant": "gemma3-1b",
+      "static_bo_bytes": 266240,
+      "status": "READY_FOR_NORM_WEIGHT_PRELOAD",
+      "tensor_count": 156
+    },
+    {
+      "blockers": [],
+      "evidence_kind": "norm-weight-shape-plan",
+      "families": [
+        {
+          "family": "input_layernorm",
+          "static_bo_bytes": 174080,
+          "tensor_count": 34
+        },
+        {
+          "family": "post_attention_layernorm",
+          "static_bo_bytes": 174080,
+          "tensor_count": 34
+        },
+        {
+          "family": "pre_feedforward_layernorm",
+          "static_bo_bytes": 174080,
+          "tensor_count": 34
+        },
+        {
+          "family": "post_feedforward_layernorm",
+          "static_bo_bytes": 174080,
+          "tensor_count": 34
+        },
+        {
+          "family": "q_norm",
+          "static_bo_bytes": 17408,
+          "tensor_count": 34
+        },
+        {
+          "family": "k_norm",
+          "static_bo_bytes": 17408,
+          "tensor_count": 34
+        }
+      ],
+      "layers": 34,
+      "model_variant": "gemma3-4b",
+      "static_bo_bytes": 731136,
+      "status": "READY_FOR_NORM_WEIGHT_PRELOAD",
+      "tensor_count": 204
+    },
+    {
+      "blockers": [],
+      "evidence_kind": "norm-weight-shape-plan",
+      "families": [
+        {
+          "family": "input_layernorm",
+          "static_bo_bytes": 174080,
+          "tensor_count": 34
+        },
+        {
+          "family": "post_attention_layernorm",
+          "static_bo_bytes": 174080,
+          "tensor_count": 34
+        },
+        {
+          "family": "pre_feedforward_layernorm",
+          "static_bo_bytes": 174080,
+          "tensor_count": 34
+        },
+        {
+          "family": "post_feedforward_layernorm",
+          "static_bo_bytes": 174080,
+          "tensor_count": 34
+        },
+        {
+          "family": "q_norm",
+          "static_bo_bytes": 17408,
+          "tensor_count": 34
+        },
+        {
+          "family": "k_norm",
+          "static_bo_bytes": 17408,
+          "tensor_count": 34
+        }
+      ],
+      "layers": 34,
+      "model_variant": "gemma3-4b-vision",
+      "static_bo_bytes": 731136,
+      "status": "READY_FOR_NORM_WEIGHT_PRELOAD",
+      "tensor_count": 204
+    }
+  ]
+}
