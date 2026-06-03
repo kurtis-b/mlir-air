@@ -19,9 +19,9 @@ source control unless they are reviewed as compact fixtures.
 
 - `gemma3_bo_allocation_evidence.json`: compact Strix/XRT evidence for full
   paper-shape BO allocation. The current benchmark-cell entries validate
-  `gemma3-1b` at 32k prompt/32k decode context with 68 BOs totaling
-  1,997,929,984 bytes, and `gemma3-4b` plus `gemma3-4b-vision` at 32k
-  prompt/128k decode context with 84 BOs totaling 7,260,882,944 bytes. The
+  `gemma3-1b` at 32k prompt/32k decode context with 69 BOs totaling
+  1,998,196,224 bytes, and `gemma3-4b` plus `gemma3-4b-vision` at 32k
+  prompt/128k decode context with 85 BOs totaling 7,261,614,080 bytes. The
   ledger also preserves earlier monolithic-KV failures where 4B text and vision
   hit the local XRT host-memory allocation limit at the first
   9,126,805,504-byte KV-cache BO after allocating 4,454,893,568 bytes. This is

@@ -17,6 +17,7 @@ from pathlib import Path
 
 from gemma3_artifacts import MODEL_SPECS, model_spec
 from gemma3_npu_preflight import Gemma3NPUPreflightPlan, build_preflight_plan
+from gemma3_norm_weight_plan import Gemma3NormWeightPlan, build_norm_weight_plan
 from gemma3_weight_plan import Gemma3StaticWeightPlan, build_weight_plan
 
 
@@ -147,6 +148,7 @@ def _kv_cache_records(
 def build_bo_plan_from_preflight(
     preflight: Gemma3NPUPreflightPlan,
     weight_plan: Gemma3StaticWeightPlan,
+    norm_weight_plan: Gemma3NormWeightPlan | None = None,
     *,
     prompt_len: int,
     decode_context: int,
@@ -186,6 +188,18 @@ def build_bo_plan_from_preflight(
             static=True,
             notes="Q4NX packed weights plus scale/min metadata",
         ),
+    ]
+    if norm_weight_plan is not None and norm_weight_plan.static_bo_bytes > 0:
+        records.append(
+            _record(
+                "static_norm_weights",
+                "model",
+                (norm_weight_plan.static_bo_bytes // BF16_BYTES,),
+                static=True,
+                notes="BF16 RMSNorm/QK-Norm vector weights",
+            )
+        )
+    records.extend([
         _record("token_embeddings", "model", (prompt_len, hidden), notes="host-prepared embedding input"),
         _record("layer_input", "layer", (prompt_len, hidden), notes="ping buffer"),
         _record("layer_output", "layer", (prompt_len, hidden), notes="pong buffer"),
@@ -201,8 +215,9 @@ def build_bo_plan_from_preflight(
         _record("decode_k", "decode", (1, kv_heads, head_dim), notes="decode key append"),
         _record("decode_v", "decode", (1, kv_heads, head_dim), notes="decode value append"),
         _record("decode_attention_out", "decode", (1, hidden), notes="FlowKV output"),
-    ] + kv_records
-    static_bytes = weight_plan.static_bo_bytes
+    ])
+    records.extend(kv_records)
+    static_bytes = sum(record.bytes for record in records if record.static)
     dynamic_bytes = sum(record.bytes for record in records if not record.static)
     return Gemma3BOPlan(
         model_variant=preflight.model_variant,
@@ -234,9 +249,11 @@ def build_bo_plan(
     decode_context = decode_context or spec.max_decode_context
     preflight = build_preflight_plan(model_variant, weights_dir=weights_dir)
     weight_plan = build_weight_plan(model_variant, weights_dir=weights_dir)
+    norm_weight_plan = build_norm_weight_plan(model_variant, weights_dir=weights_dir)
     return build_bo_plan_from_preflight(
         preflight,
         weight_plan,
+        norm_weight_plan,
         prompt_len=prompt_len,
         decode_context=decode_context,
         kv_strategy=kv_strategy,
@@ -270,8 +287,18 @@ def _self_test() -> None:
         records=(),
         blockers=(),
     )
-    plan = build_bo_plan_from_preflight(preflight, weight_plan, prompt_len=1024, decode_context=2048)
-    if plan.status != "READY_FOR_BO_ALLOCATION" or plan.static_bytes != 36003840:
+    norm_weight_plan = Gemma3NormWeightPlan(
+        model_variant="gemma3-1b",
+        status="READY_FOR_NORM_WEIGHT_PRELOAD",
+        layers=2,
+        tensor_count=12,
+        static_bo_bytes=20480,
+        families=(),
+        records=(),
+        blockers=(),
+    )
+    plan = build_bo_plan_from_preflight(preflight, weight_plan, norm_weight_plan, prompt_len=1024, decode_context=2048)
+    if plan.status != "READY_FOR_BO_ALLOCATION" or plan.static_bytes != 36024320:
         raise AssertionError(plan)
     if plan.kv_strategy != "benchmark-cell" or plan.kv_record_count != 4:
         raise AssertionError(plan)

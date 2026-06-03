@@ -514,10 +514,14 @@ Implemented evidence and blocker:
   Transformers `Gemma3DecoderLayer` norm order: `post_attention_layernorm`
   runs before the attention residual, and `pre_feedforward_layernorm` plus
   `post_feedforward_layernorm` wrap the MLP before the MLP residual.
-- Remaining work for full Phase E completion is model launch/binding
-  validation for the promoted GeGLU path, norm-weight argument binding for
-  RMSNorm/QK-Norm, plus RoPE, residual, logits, and sampling promotion or
-  measured timing treatment in end-to-end execution.
+- `gemma3_bo_plan.py` now includes a dedicated `static_norm_weights` BO when
+  norm weights are planned, and `gemma3_buffer_binding.py` maps RMSNorm/QK-Norm
+  families to that BO while keeping projection families on
+  `static_projection_weights`. This is a model-runner argument contract; it is
+  not yet a validated norm-kernel launch.
+- Remaining work for full Phase E completion is model launch and argument-order
+  validation for the promoted GeGLU and norm paths, plus RoPE, residual, logits,
+  and sampling promotion or measured timing treatment in end-to-end execution.
 
 ### Phase F: end-to-end 1B text reproduction
 
@@ -579,12 +583,13 @@ Blocked evidence:
   ledger; a full local 4B-vision text-stack contiguous static-preload XRT
   smoke wrote all 238 planned text projection tensors into one static BO, totaling
   2,005,401,600 bytes, and updated the same evidence ledger. A full local 1B benchmark-cell paper-shape BO allocation smoke allocated all
-  68 planned BOs for prompt 32k/decode 32k, totaling 1,997,929,984 bytes, and
+  69 planned BOs for prompt 32k/decode 32k, totaling 1,998,196,224 bytes, and
   saved `results/gemma3_bo_allocation_evidence.json`. Full local 4B text and
-  4B-vision text-stack benchmark-cell allocation smokes each allocated all 84
-  planned BOs for prompt 32k/decode 128k, totaling 7,260,882,944 bytes. The
-  largest BO is the 2,005,401,600-byte static projection-weight BO; the largest
-  K/V BO is a 268,435,456-byte global-attention layer slice. The same evidence
+  4B-vision text-stack benchmark-cell allocation smokes each allocated all 85
+  planned BOs for prompt 32k/decode 128k, totaling 7,261,614,080 bytes. The
+  largest BO is the 2,005,401,600-byte static projection-weight BO, with a
+  separate 731,136-byte `static_norm_weights` BO; the largest K/V BO is a
+  268,435,456-byte global-attention layer slice. The same evidence
   ledger preserves earlier monolithic-KV failures where 4B text and vision
   requested 22,708,504,576 bytes and failed at the first 9,126,805,504-byte
   `kv_cache_k` BO after allocating 4,454,893,568 bytes. Those old records are
@@ -628,7 +633,8 @@ Blocked evidence:
   binding, nonlinear model-stage promotion, and fresh paper-shape hardware
   reruns are not complete. Full paper-shape BO allocation validation is now
   complete for 4B text under the benchmark-cell KV plan: prompt 32k/decode 128k
-  allocates 84 BOs totaling 7,260,882,944 bytes on local Strix/XRT. The old
+  allocates 85 BOs totaling 7,261,614,080 bytes on local Strix/XRT, including
+  the dedicated static norm-weight BO. The old
   monolithic KV plan requested 22,708,504,576 bytes, including one
   9,126,805,504-byte `kv_cache_k` BO and one 9,126,805,504-byte `kv_cache_v`
   BO, and stopped at `kv_cache_k` with `xrt-bo-allocation-failed` after
@@ -672,8 +678,9 @@ Blocked evidence:
   launch, kernel argument binding, nonlinear model-stage promotion, fresh
   paper-shape hardware reruns, and the vision NPU path are not complete.
   Paper-shape text-stack BO allocation is complete under the same
-  benchmark-cell KV plan as 4B text: prompt 32k/decode 128k allocates 84 BOs
-  totaling 7,260,882,944 bytes on local Strix/XRT. The evidence ledger also
+  benchmark-cell KV plan as 4B text: prompt 32k/decode 128k allocates 85 BOs
+  totaling 7,261,614,080 bytes on local Strix/XRT, including the dedicated
+  static norm-weight BO. The evidence ledger also
   preserves the older monolithic-KV strategy failure at the first
   9,126,805,504-byte `kv_cache_k` BO after allocating 4,454,893,568 bytes.
   Measured host fallback records account for text

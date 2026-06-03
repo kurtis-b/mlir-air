@@ -20,6 +20,7 @@ from gemma3_artifacts import MODEL_SPECS, model_spec
 from gemma3_bo_plan import KV_STRATEGIES, Gemma3BOPlan, build_bo_plan_from_preflight
 from gemma3_npu_preflight import Gemma3NPUPreflightPlan, ProjectionPlan, build_preflight_plan
 from gemma3_npu_wiring import Gemma3NPUStage, Gemma3NPUWiringPlan, build_wiring_plan_from_preflight
+from gemma3_norm_weight_plan import Gemma3NormWeightPlan, build_norm_weight_plan
 from gemma3_weight_plan import (
     Gemma3ProjectionWeightRecord,
     Gemma3StaticWeightPlan,
@@ -30,6 +31,23 @@ from gemma3_weight_plan import (
 
 PREFILL_STATE = "layer_input"
 DECODE_STATE = "decode_token_state"
+NORM_WEIGHT_FAMILIES = {
+    "input_layernorm",
+    "post_attention_layernorm",
+    "pre_feedforward_layernorm",
+    "post_feedforward_layernorm",
+    "q_norm",
+    "k_norm",
+}
+PROJECTION_WEIGHT_FAMILIES = {
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+}
 
 
 @dataclass(frozen=True)
@@ -41,6 +59,7 @@ class Gemma3BufferBinding:
     inputs: tuple[str, ...]
     outputs: tuple[str, ...]
     static_weight_families: tuple[str, ...]
+    static_weight_bos: tuple[str, ...]
     mutable_buffers: tuple[str, ...]
     virtual_buffers: tuple[str, ...]
     status: str
@@ -50,13 +69,14 @@ class Gemma3BufferBinding:
         inputs = ",".join(self.inputs) if self.inputs else "none"
         outputs = ",".join(self.outputs) if self.outputs else "none"
         weights = ",".join(self.static_weight_families) if self.static_weight_families else "none"
+        weight_bos = ",".join(self.static_weight_bos) if self.static_weight_bos else "none"
         mutable = ",".join(self.mutable_buffers) if self.mutable_buffers else "none"
         virtual = ",".join(self.virtual_buffers) if self.virtual_buffers else "none"
         blockers = ",".join(self.blockers) if self.blockers else "none"
         return (
             f"buffer_binding {self.phase}:L{self.layer_index}:{self.role} "
             f"backend={self.backend} inputs={inputs} outputs={outputs} "
-            f"weights={weights} mutable={mutable} virtual={virtual} "
+            f"weights={weights} weight_bos={weight_bos} mutable={mutable} virtual={virtual} "
             f"status={self.status} blockers={blockers}"
         )
 
@@ -157,8 +177,18 @@ def _role_contract(stage: Gemma3NPUStage, bo_keys: set[str]) -> tuple[tuple[str,
     raise ValueError(f"unhandled Gemma3 stage role: {stage.role}")
 
 
+def _static_weight_bos(weight_families: tuple[str, ...]) -> tuple[str, ...]:
+    bos: list[str] = []
+    if any(family in PROJECTION_WEIGHT_FAMILIES for family in weight_families):
+        bos.append("static_projection_weights")
+    if any(family in NORM_WEIGHT_FAMILIES for family in weight_families):
+        bos.append("static_norm_weights")
+    return tuple(dict.fromkeys(bos))
+
+
 def _stage_binding(stage: Gemma3NPUStage, bo_keys: set[str]) -> Gemma3BufferBinding:
     inputs, outputs, weights, mutable = _role_contract(stage, bo_keys)
+    static_weight_bos = _static_weight_bos(weights)
     virtual = tuple(
         dict.fromkeys(
             key
@@ -179,6 +209,7 @@ def _stage_binding(stage: Gemma3NPUStage, bo_keys: set[str]) -> Gemma3BufferBind
         inputs=inputs,
         outputs=outputs,
         static_weight_families=weights,
+        static_weight_bos=static_weight_bos,
         mutable_buffers=mutable,
         virtual_buffers=virtual,
         status=status,
@@ -198,8 +229,8 @@ def build_buffer_binding_plan_from_components(
     referenced_bo_keys = {
         key
         for binding in bindings
-        for key in binding.inputs + binding.outputs + binding.mutable_buffers
-        if key in bo_keys or key.startswith("kv_cache_")
+        for key in binding.inputs + binding.outputs + binding.mutable_buffers + binding.static_weight_bos
+        if key in bo_keys or key.startswith("kv_cache_") or key.startswith("static_")
     }
     missing = tuple(sorted(key for key in referenced_bo_keys if key not in bo_keys))
     virtual = tuple(
@@ -249,9 +280,11 @@ def build_buffer_binding_plan(
     decode_context = decode_context or spec.max_decode_context
     preflight = build_preflight_plan(model_variant, weights_dir=weights_dir)
     weight_plan = build_weight_plan(model_variant, weights_dir=weights_dir)
+    norm_weight_plan = build_norm_weight_plan(model_variant, weights_dir=weights_dir)
     bo_plan = build_bo_plan_from_preflight(
         preflight,
         weight_plan,
+        norm_weight_plan,
         prompt_len=prompt_len,
         decode_context=decode_context,
         kv_strategy=kv_strategy,
@@ -291,6 +324,19 @@ def _fake_preflight() -> Gemma3NPUPreflightPlan:
     )
 
 
+def _fake_norm_weight_plan() -> Gemma3NormWeightPlan:
+    return Gemma3NormWeightPlan(
+        model_variant="gemma3-1b",
+        status="READY_FOR_NORM_WEIGHT_PRELOAD",
+        layers=2,
+        tensor_count=12,
+        static_bo_bytes=20480,
+        families=(),
+        records=(),
+        blockers=(),
+    )
+
+
 def _fake_weight_plan() -> Gemma3StaticWeightPlan:
     records = (
         Gemma3ProjectionWeightRecord(0, "q_proj", "fixture.q", (1024, 1152), (1024, 1280), 32, 5, 655360, 81920, 81920, 819200, True),
@@ -317,7 +363,7 @@ def _fake_weight_plan() -> Gemma3StaticWeightPlan:
 def _self_test() -> None:
     preflight = _fake_preflight()
     weight_plan = _fake_weight_plan()
-    bo_plan = build_bo_plan_from_preflight(preflight, weight_plan, prompt_len=16, decode_context=16)
+    bo_plan = build_bo_plan_from_preflight(preflight, weight_plan, _fake_norm_weight_plan(), prompt_len=16, decode_context=16)
     plan = build_buffer_binding_plan_from_components(
         model_variant="gemma3-1b",
         bo_plan=bo_plan,
@@ -328,7 +374,7 @@ def _self_test() -> None:
         raise AssertionError(plan.binding_count)
     if plan.missing_bo_keys:
         raise AssertionError(plan.missing_bo_keys)
-    if plan.persistent_bo_count != 20:
+    if plan.persistent_bo_count != 21:
         raise AssertionError(plan.persistent_bo_count)
     if plan.static_weight_family_count != 13:
         raise AssertionError(plan.static_weight_family_count)

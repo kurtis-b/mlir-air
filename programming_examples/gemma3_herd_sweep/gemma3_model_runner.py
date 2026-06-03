@@ -23,6 +23,7 @@ from gemma3_bo_plan import KV_STRATEGIES, Gemma3BOPlan, Gemma3BORecord, build_bo
 from gemma3_buffer_binding import Gemma3BufferBindingPlan, build_buffer_binding_plan_from_components
 from gemma3_npu_preflight import Gemma3NPUPreflightPlan, ProjectionPlan, build_preflight_plan
 from gemma3_npu_wiring import Gemma3NPUWiringPlan, build_wiring_plan_from_preflight
+from gemma3_norm_weight_plan import Gemma3NormWeightPlan, build_norm_weight_plan
 from gemma3_weight_plan import (
     Gemma3ProjectionWeightRecord,
     Gemma3StaticWeightPlan,
@@ -297,9 +298,11 @@ def build_model_runner_plan(
     decode_context = decode_context or spec.max_decode_context
     preflight = build_preflight_plan(model_variant, weights_dir=weights_dir)
     weight_plan = build_weight_plan(model_variant, weights_dir=weights_dir)
+    norm_weight_plan = build_norm_weight_plan(model_variant, weights_dir=weights_dir)
     bo_plan = build_bo_plan_from_preflight(
         preflight,
         weight_plan,
+        norm_weight_plan,
         prompt_len=prompt_len,
         decode_context=decode_context,
         kv_strategy=kv_strategy,
@@ -372,6 +375,19 @@ def _fake_preflight() -> Gemma3NPUPreflightPlan:
     )
 
 
+def _fake_norm_weight_plan() -> Gemma3NormWeightPlan:
+    return Gemma3NormWeightPlan(
+        model_variant="gemma3-1b",
+        status="READY_FOR_NORM_WEIGHT_PRELOAD",
+        layers=2,
+        tensor_count=12,
+        static_bo_bytes=20480,
+        families=(),
+        records=(),
+        blockers=(),
+    )
+
+
 def _fake_weight_plan() -> Gemma3StaticWeightPlan:
     records = (
         Gemma3ProjectionWeightRecord(0, "q_proj", "model.layers.0.self_attn.q_proj.weight", (1024, 1152), (1024, 1280), 32, 5, 655360, 81920, 81920, 819200, True),
@@ -417,7 +433,7 @@ def _self_test() -> None:
         ),
         blockers=("paper-shape-bo-allocation-not-validated",),
     )
-    binding_bo_plan = build_bo_plan_from_preflight(preflight, weight_plan, prompt_len=16, decode_context=16)
+    binding_bo_plan = build_bo_plan_from_preflight(preflight, weight_plan, _fake_norm_weight_plan(), prompt_len=16, decode_context=16)
     buffer_binding_plan = build_buffer_binding_plan_from_components(
         model_variant="gemma3-1b",
         bo_plan=binding_bo_plan,
