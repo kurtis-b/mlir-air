@@ -598,12 +598,19 @@ Implementation requirements:
 - Implement 4B decode TPS for 1k, 2k, 4k, 8k, 16k, 32k, 64k, and 128k context
   lengths.
 - Track out-of-capacity behavior separately from failures.
+- Replace the current monolithic all-layer K/V BO plan with a
+  benchmark-cell-specific KV allocation plan before retrying 64k/128k decode:
+  split K/V by layer and, where useful, by page/chunk; allocate full-context KV
+  only for global layers; and clamp local SWA layers to the sliding window where
+  the kernel contract allows it.
 - Use `l2-gather` full-physical routes where direct shim output is illegal.
 
 Acceptance:
 
-- Correctness passes for all 4B text sequence lengths that fit local memory and
-  host memory limits.
+- Correctness passes for all 4B text sequence lengths that fit the
+  benchmark-cell-specific memory plan.
+- 64k/128k allocation avoids the current single huge KV BO mmap failure and has
+  dry-run plus XRT evidence showing per-layer/page K/V allocation totals.
 - NPU, CPU, and iGPU local results are compared against Tables 2 and 4.
 - Any 64k/128k deviation includes explicit KV-cache, memory, or schedule data.
 
@@ -613,15 +620,22 @@ Blocked evidence:
   local 4B artifacts are available but model-kernel launch, kernel argument
   binding, nonlinear model-stage promotion, and fresh paper-shape hardware
   reruns are not complete. Full paper-shape BO allocation validation is
-  complete for 1B only; the local 4B probe requested 22,708,504,576 bytes and
-  stopped at `kv_cache_k` with `xrt-bo-allocation-failed` after allocating
-  4,454,893,568 bytes. Measured host fallback
+  complete for 1B only; the current local 4B monolithic KV plan requested
+  22,708,504,576 bytes, including one 9,126,805,504-byte `kv_cache_k` BO and
+  one 9,126,805,504-byte `kv_cache_v` BO, and stopped at `kv_cache_k` with
+  `xrt-bo-allocation-failed` after allocating 4,454,893,568 bytes. Treat this
+  as a failure of the current simultaneous all-layer KV BO strategy, not proof
+  that Strix cannot run the benchmark. The next implementation path is a
+  benchmark-cell-specific plan with preallocated weights/work buffers and
+  per-layer/per-page KV slices sized from the prompt/context being benchmarked.
+  Measured host fallback
   records account for timing metadata but do not replace nonlinear NPU
   validation.
 - `gemma3_npu_wiring.py` emits the 4B text per-layer NPU candidate and host
   fallback plan from local artifacts, including the 5-local/1-global attention
-  pattern, but no 64k/128k local paper claim is emitted without real KV-cache,
-  memory, kernel-launch, kernel argument-binding, and schedule evidence.
+  pattern, but no 64k/128k local paper claim is emitted without the revised
+  KV-cache allocation evidence, kernel-launch evidence, kernel argument-binding
+  evidence, correctness, and schedule data.
 
 ### Phase H: 4B vision path reproduction
 
@@ -649,9 +663,12 @@ Blocked evidence:
   local 4B vision artifacts and processor files are available but the model-kernel
   launch, kernel argument binding, nonlinear model-stage promotion, fresh
   paper-shape hardware reruns, and the vision NPU path are not complete.
-  Paper-shape BO allocation is explicitly blocked on the same local XRT
-  host-memory limit as 4B text: the text-stack probe requested 22,708,504,576
-  bytes and stopped at `kv_cache_k` after allocating 4,454,893,568 bytes.
+  Paper-shape BO allocation is explicitly blocked on the same current
+  monolithic KV strategy as 4B text: the text-stack probe requested
+  22,708,504,576 bytes and stopped at the first 9,126,805,504-byte `kv_cache_k`
+  BO after allocating 4,454,893,568 bytes. The vision text-stack retry should
+  use the same benchmark-cell-specific, per-layer/page KV allocation strategy
+  as 4B text before treating the result as a hardware-capacity limit.
   Measured host fallback records account for text
   nonlinear timing metadata but do not validate vision hardware.
 - Existing text-only synthetic and blocked-result tests keep vision optional;
@@ -752,8 +769,10 @@ Implemented evidence and blocker:
   limits from kernel launch or validation failures. `gemma3-1b` now has
   committed full paper-shape BO allocation evidence for 32k prefill/decode;
   `gemma3-4b` and `gemma3-4b-vision` have committed allocation-failure
-  evidence showing the current local Strix/XRT host-memory limit at the first
-  9,126,805,504-byte KV-cache BO.
+  evidence showing that the current monolithic all-layer KV plan fails at the
+  first 9,126,805,504-byte KV-cache BO on local Strix/XRT. Future result
+  records must distinguish this strategy failure from a benchmark-cell-specific
+  per-layer/page KV allocation failure.
 - `gemma3_static_preload.py` can save real Q4NX static-weight preload smoke JSON
   so future model-runner failures can distinguish serialization/preload from
   kernel binding and execution failures. `gemma3-1b`, `gemma3-4b`, and the `gemma3-4b-vision` text stack now have
@@ -1253,6 +1272,21 @@ For prefill:
 - Append K/V for the whole prompt chunk.
 - FlowQKV reads the current query chunk and all relevant previous K/V chunks.
 - Causal mode must mask future tokens inside the current chunk.
+
+Benchmark-cell allocation policy:
+
+- Build the KV allocation plan from the exact prompt length and decode context
+  being benchmarked; do not use one global maximum allocation for all cells.
+- Preallocate projection weights, norm weights, and reusable work buffers once
+  per benchmark cell.
+- Split K/V storage by layer and by page/chunk where needed to avoid single
+  multi-GB BO mmap failures.
+- Local SWA layers should allocate/read only the legal sliding window when the
+  kernel contract does not require older tokens.
+- Global layers should allocate/read the full current context for that benchmark
+  cell.
+- Kernel argument binding must name the exact layer/page KV slices consumed or
+  produced by each stage.
 
 For decode:
 
