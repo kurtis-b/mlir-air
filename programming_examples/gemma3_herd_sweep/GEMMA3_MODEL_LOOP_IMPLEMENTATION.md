@@ -382,6 +382,24 @@ Acceptance:
   production model routes until their timeout/channel issues are fixed.
 - Kernel-level performance is logged but not used as end-to-end paper parity.
 
+Implemented evidence and blocker:
+
+- `gemma3_kernel_parity.py` defines the standalone production-candidate matrix
+  for Q4NX, BF16 MM, FusedDQP, FlowQKV, and FlowKV, including paper-layout
+  targets where the current sweep already exposes them.
+- The matrix records the compile-only and hardware command contract for each
+  role, herd shape, output mode, schedule mode, production/diagnostic class,
+  and current snapshot status.
+- `run_model_loop_kernel_parity.lit` validates that 8x4 public routes use
+  `l2-gather`, that paper-layout FlowQKV/FusedDQP/FlowKV targets remain visible,
+  and that diagnostic-only routes keep their explicit failure classes.
+- Diagnostic exclusions are classified as hardware resource limit
+  (`8x4 direct`), packet S2MM backend limitation (`packet-direct`), or
+  channel/runtime scheduling bug (FlowKV small `l2-gather`).
+- Fresh paper-shape hardware validation and kernel latency capture are still
+  blocked by the same real-artifact and environment-comparability gaps recorded
+  in Phases B and C; snapshot status must not be used as new paper evidence.
+
 ### Phase E: nonlinear and vector-kernel promotion
 
 Goal: remove or account for host fallbacks so local timing can be compared to
