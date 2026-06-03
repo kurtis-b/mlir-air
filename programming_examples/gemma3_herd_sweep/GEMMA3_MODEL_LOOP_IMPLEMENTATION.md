@@ -339,6 +339,22 @@ Acceptance:
   length.
 - Q4NX pack/dequant round-trip error is recorded per projection family.
 
+Implemented evidence and blocker:
+
+- `gemma3_artifacts.py` defines paper-model metadata for `gemma3-1b`,
+  `gemma3-4b`, and `gemma3-4b-vision`, including paper prompt/decode lengths.
+- Deterministic prompt-ID fixtures validate 1k-128k sequence-length plumbing
+  without requiring AIR imports.
+- `Q4NXPackingContract` records the block size, low-nibble order, BF16
+  scale/min metadata, matrix order, and dequant formula.
+- `run_model_loop_artifacts.lit` covers metadata, prompt-length generation,
+  discovery, and strict-load blocking diagnostics.
+- Real Gemma3 artifact loading is currently blocked in this environment because
+  local Gemma3 safetensors were not found and tokenizer/safetensor Python
+  packages are not installed. This prevents full Phase C completion and all
+  later real-model paper-parity phases until artifacts and dependencies are
+  provided.
+
 ### Phase D: standalone kernel parity
 
 Goal: prove each paper kernel role independently before using it in end-to-end
