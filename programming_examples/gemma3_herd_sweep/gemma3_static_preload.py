@@ -51,6 +51,8 @@ def has_full_xrt_preload_evidence(model_variant: str, path: Path | None = None) 
             continue
         if item.get("status") != "FULL_XRT_PRELOAD_PASS" or not item.get("full_model"):
             continue
+        if item.get("allocation_mode") != "contiguous-static-bo":
+            continue
         tensor_count = int(item.get("tensor_count", -1))
         planned_count = int(item.get("planned_tensor_count", -2))
         requested = int(item.get("requested_bytes", -1))
@@ -74,6 +76,7 @@ class Gemma3StaticPreloadRecord:
     requested_bytes: int
     serialized_bytes: int
     xrt_written_bytes: int
+    bo_offset: int
     checksum: str
     status: str
 
@@ -81,7 +84,7 @@ class Gemma3StaticPreloadRecord:
         return (
             f"static_preload L{self.layer_index} family={self.family} "
             f"requested={self.requested_bytes} serialized={self.serialized_bytes} "
-            f"xrt_written={self.xrt_written_bytes} status={self.status} "
+            f"xrt_written={self.xrt_written_bytes} offset={self.bo_offset} status={self.status} "
             f"sha256={self.checksum[:16]}"
         )
 
@@ -92,6 +95,7 @@ class Gemma3StaticPreloadReport:
     status: str
     full_model: bool
     planned_tensor_count: int
+    allocation_mode: str
     tensor_count: int
     requested_bytes: int
     serialized_bytes: int
@@ -105,6 +109,7 @@ class Gemma3StaticPreloadReport:
         lines = [
             f"static_preload model={self.model_variant} status={self.status} "
             f"full_model={self.full_model} planned_tensors={self.planned_tensor_count} "
+            f"allocation_mode={self.allocation_mode} "
             f"tensors={self.tensor_count} requested={self.requested_bytes} "
             f"serialized={self.serialized_bytes} xrt_written={self.xrt_written_bytes} "
             f"blockers={blockers}"
@@ -188,6 +193,7 @@ def build_static_preload_report(
     family: str | None = "q_proj",
     max_tensors: int = 1,
     full_model: bool = False,
+    contiguous_bo: bool = False,
     xrt_smoke: bool = False,
     device_index: int = 0,
 ) -> Gemma3StaticPreloadReport:
@@ -214,6 +220,11 @@ def build_static_preload_report(
         xrt = xrt_module
         device = xrt.device(device_index)
 
+    contiguous_static_bo = None
+    if xrt_smoke and contiguous_bo:
+        contiguous_static_bo = xrt.bo(device, plan.static_bo_bytes, xrt.bo.host_only, 0)
+
+    offset = 0
     records: list[Gemma3StaticPreloadRecord] = []
     for record in selected:
         payload = serialize_q4nx_matrix(_load_matrix(inventory.safetensors, record.tensor_key))
@@ -224,7 +235,12 @@ def build_static_preload_report(
             )
         written = 0
         status = "SERIALIZED"
-        if xrt_smoke:
+        bo_offset = offset
+        if xrt_smoke and contiguous_static_bo is not None:
+            contiguous_static_bo.write(payload, bo_offset)
+            written = len(payload)
+            status = "XRT_PRELOAD_SMOKE_PASS"
+        elif xrt_smoke:
             bo = xrt.bo(device, len(payload), xrt.bo.host_only, 0)
             bo.write(payload, 0)
             bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
@@ -238,16 +254,27 @@ def build_static_preload_report(
                 requested_bytes=record.static_bo_bytes,
                 serialized_bytes=len(payload),
                 xrt_written_bytes=written,
+                bo_offset=bo_offset,
                 checksum=hashlib.sha256(payload).hexdigest(),
                 status=status,
             )
         )
+        offset += len(payload)
+    if contiguous_static_bo is not None:
+        contiguous_static_bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+
+    allocation_mode = "contiguous-static-bo" if contiguous_bo else "per-tensor-bo" if xrt_smoke else "serialized-only"
     complete = (
         full_model
         and len(records) == plan.tensor_count
         and sum(record.serialized_bytes for record in records) == plan.static_bo_bytes
     )
-    if complete and xrt_smoke and sum(record.xrt_written_bytes for record in records) == plan.static_bo_bytes:
+    if (
+        complete
+        and xrt_smoke
+        and contiguous_bo
+        and sum(record.xrt_written_bytes for record in records) == plan.static_bo_bytes
+    ):
         status = "FULL_XRT_PRELOAD_PASS"
         blockers: tuple[str, ...] = ()
     elif complete:
@@ -261,6 +288,7 @@ def build_static_preload_report(
         status=status,
         full_model=full_model,
         planned_tensor_count=plan.tensor_count,
+        allocation_mode=allocation_mode,
         tensor_count=len(records),
         requested_bytes=sum(record.requested_bytes for record in records),
         serialized_bytes=sum(record.serialized_bytes for record in records),
@@ -278,12 +306,13 @@ def _self_test() -> None:
     if len(payload) != expected:
         raise AssertionError((len(payload), expected))
     checksum = hashlib.sha256(payload).hexdigest()
-    record = Gemma3StaticPreloadRecord(0, "q_proj", "fixture", expected, len(payload), 0, checksum, "SERIALIZED")
+    record = Gemma3StaticPreloadRecord(0, "q_proj", "fixture", expected, len(payload), 0, 0, checksum, "SERIALIZED")
     report = Gemma3StaticPreloadReport(
         "gemma3-1b",
         "SERIALIZED",
         False,
         1,
+        "serialized-only",
         1,
         expected,
         len(payload),
@@ -299,6 +328,7 @@ def _self_test() -> None:
         "FULL_XRT_PRELOAD_PASS",
         True,
         1,
+        "contiguous-static-bo",
         1,
         expected,
         expected,
@@ -325,6 +355,7 @@ def main() -> int:
     parser.add_argument("--family", choices=("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"), default="q_proj")
     parser.add_argument("--max-tensors", type=int, default=1)
     parser.add_argument("--full-model", action="store_true")
+    parser.add_argument("--contiguous-bo", action="store_true")
     parser.add_argument("--xrt-smoke", action="store_true")
     parser.add_argument("--device-index", type=int, default=0)
     parser.add_argument("--include-records", action="store_true")
@@ -341,6 +372,7 @@ def main() -> int:
         family=args.family,
         max_tensors=args.max_tensors,
         full_model=args.full_model,
+        contiguous_bo=args.contiguous_bo,
         xrt_smoke=args.xrt_smoke,
         device_index=args.device_index,
     )

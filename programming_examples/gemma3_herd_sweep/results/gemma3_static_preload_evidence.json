@@ -1,13 +1,15 @@
 {
   "results": [
     {
+      "allocation_mode": "contiguous-static-bo",
       "blockers": [],
-      "elapsed_seconds": 3.7120646230177954,
+      "elapsed_seconds": 3.785374615981709,
       "full_model": true,
       "model_variant": "gemma3-1b",
       "planned_tensor_count": 182,
       "records": [
         {
+          "bo_offset": 0,
           "checksum": "5be46e0c2053859b7fc5f7be31482766cf2952a80a003bcfa747c2cfafb6a9e9",
           "family": "down_proj",
           "layer_index": 0,
@@ -18,6 +20,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 4976640,
           "checksum": "0758c0c44e59c22d1fd9a9d37fa6080ee7c9dee60fe8a19e934861a9fa97e348",
           "family": "gate_proj",
           "layer_index": 0,
@@ -28,6 +31,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 10506240,
           "checksum": "72ad2d355879bade76ca9a852ec9c4453a8c8f4c46323e884212c65eef12403d",
           "family": "up_proj",
           "layer_index": 0,
@@ -38,6 +42,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 16035840,
           "checksum": "6028900e7a71322c86289f383c2c8a1dac9d5e9eb6e362dff446539f3f04b185",
           "family": "k_proj",
           "layer_index": 0,
@@ -48,6 +53,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 16240640,
           "checksum": "7f2b778f2d8bda927563dc5c4b0f75c2a8739176a227409b844ff4e51b08bc45",
           "family": "o_proj",
           "layer_index": 0,
@@ -58,6 +64,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 16977920,
           "checksum": "87247022163a1f1514611b616020a3083e6a217816830fb52c60cc712902425a",
           "family": "q_proj",
           "layer_index": 0,
@@ -68,6 +75,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 17797120,
           "checksum": "2e1eddf269a9a19ac58d6a9eeb66e4a4124be8af680d9e7682ced9ec9cfe6acc",
           "family": "v_proj",
           "layer_index": 0,
@@ -78,6 +86,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 18001920,
           "checksum": "949ebfccf129a308cfc6faa35613ea0dc25903cd7b0ec3c063977e3ca1f7afef",
           "family": "down_proj",
           "layer_index": 1,
@@ -88,6 +97,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 22978560,
           "checksum": "ba58368f823b92780d9fc50fe5152c9549841af49c3f977cb10ec24e0f25bc00",
           "family": "gate_proj",
           "layer_index": 1,
@@ -98,6 +108,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 28508160,
           "checksum": "56b0e311d2f1ad69a152d3767c087cb9feae152343b5de085c0dc7ed8444c9b3",
           "family": "up_proj",
           "layer_index": 1,
@@ -108,6 +119,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 34037760,
           "checksum": "a163564718c90a6717207de0483e568813f50b81a390a5a828c30e415f65f7a4",
           "family": "k_proj",
           "layer_index": 1,
@@ -118,6 +130,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 34242560,
           "checksum": "652ba46253b1465a780dc700716653dcf2d5512690d09403c3a76d35bed5a395",
           "family": "o_proj",
           "layer_index": 1,
@@ -128,6 +141,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 34979840,
           "checksum": "4bf435ccc4a322203c04b552ed466d77375bb7393feeb0b8a2081851ce4b3436",
           "family": "q_proj",
           "layer_index": 1,
@@ -138,6 +152,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 35799040,
           "checksum": "60b74cc997b401311ac7555710fb2c972fa8d26f9ae8f1fbcf15e2b72986b364",
           "family": "v_proj",
           "layer_index": 1,
@@ -148,6 +163,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 36003840,
           "checksum": "27c2a9e4776d3394ea347df4a9eadd67e6e253f4b2f3abc6674ff627a172913e",
           "family": "down_proj",
           "layer_index": 10,
@@ -158,6 +174,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 40980480,
           "checksum": "772aef866e09643847275414000345278f36576bc4f7113b50f99bb10b125009",
           "family": "gate_proj",
           "layer_index": 10,
@@ -168,6 +185,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 46510080,
           "checksum": "7a478b0774f3f7bf40f0c4546817883a281e72d46c83519e106ff3bbd9f9ae62",
           "family": "up_proj",
           "layer_index": 10,
@@ -178,6 +196,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 52039680,
           "checksum": "764a85616c04a51f8bde4240f0c723cba20a0cea8d1c1883785210a6db970d0b",
           "family": "k_proj",
           "layer_index": 10,
@@ -188,6 +207,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 52244480,
           "checksum": "fc484bcbd24467acdcc5226c509ccf962dd36573cc354c1b56bf231907a962c6",
           "family": "o_proj",
           "layer_index": 10,
@@ -198,6 +218,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 52981760,
           "checksum": "f35407bcc23ad27c844ebd74a5c26a94b33c11f4a824ceb8dcdd4c052038227e",
           "family": "q_proj",
           "layer_index": 10,
@@ -208,6 +229,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 53800960,
           "checksum": "b869bfa36c9baaee215fc289e7647d58ce127e18c5812bbc58d9f02acf1d4c13",
           "family": "v_proj",
           "layer_index": 10,
@@ -218,6 +240,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 54005760,
           "checksum": "04471b00514c74caebfd1a47b21a193493b9840a523996bde482e2d8a0209614",
           "family": "down_proj",
           "layer_index": 11,
@@ -228,6 +251,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 58982400,
           "checksum": "eb2805b94be7cc38dc093ee5df5121bc80c251c09f561315979993dda9b1e4a9",
           "family": "gate_proj",
           "layer_index": 11,
@@ -238,6 +262,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 64512000,
           "checksum": "21addca06a3e266c48fad090b8927126d793894d8cc90e28f16230aff407f514",
           "family": "up_proj",
           "layer_index": 11,
@@ -248,6 +273,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 70041600,
           "checksum": "fa1d9154a183ef73692437c5c667dab3169fea64398fdcacbd4fe08fcc31a87a",
           "family": "k_proj",
           "layer_index": 11,
@@ -258,6 +284,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 70246400,
           "checksum": "446ecf576578446c6fb95b0b5e3520e9910f3a755a51080fe607f8692b31ee53",
           "family": "o_proj",
           "layer_index": 11,
@@ -268,6 +295,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 70983680,
           "checksum": "e1c68f0bc17e24468efaff11cb1664e4bfebf2b4873e34988d33f3d173bca8f7",
           "family": "q_proj",
           "layer_index": 11,
@@ -278,6 +306,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 71802880,
           "checksum": "89d6f4cb1f5142ce1d33ee7792de57cf9bacf730af071a70aab4089bca490a69",
           "family": "v_proj",
           "layer_index": 11,
@@ -288,6 +317,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 72007680,
           "checksum": "ec83004a939734d2334188025d7c08ec5fc8347cd1e219bb75ce1413949499a4",
           "family": "down_proj",
           "layer_index": 12,
@@ -298,6 +328,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 76984320,
           "checksum": "eb4d56215a97e045970ea2f1ef87b2c3497467aeaa88373cf78eadb0635d9cab",
           "family": "gate_proj",
           "layer_index": 12,
@@ -308,6 +339,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 82513920,
           "checksum": "5e57cd24e3b34c50654ada9b35cf07766f70de4c07f344edbb9eaf887f99f403",
           "family": "up_proj",
           "layer_index": 12,
@@ -318,6 +350,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 88043520,
           "checksum": "0910d71054b01cff68dd23c438bab753c94e4dba6271c5f360da76836092c0a6",
           "family": "k_proj",
           "layer_index": 12,
@@ -328,6 +361,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 88248320,
           "checksum": "c2bca9b64a91133f9b30fcccefa8489525e910ee70656b9193301bfc6ce5a57e",
           "family": "o_proj",
           "layer_index": 12,
@@ -338,6 +372,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 88985600,
           "checksum": "92f33b88e7d644f82ae8b0849a51c8a743b957dd76eaf73edb0157c7d513dd89",
           "family": "q_proj",
           "layer_index": 12,
@@ -348,6 +383,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 89804800,
           "checksum": "ef24199ebd8acda056ae0214d072b8becd56f4f4137d8b1cb95296bd2f9a172b",
           "family": "v_proj",
           "layer_index": 12,
@@ -358,6 +394,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 90009600,
           "checksum": "12456c0fe0480d2ba090dcdd724b77fe6e1c65f24882f85de01173902da4cd85",
           "family": "down_proj",
           "layer_index": 13,
@@ -368,6 +405,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 94986240,
           "checksum": "39adaeb0f1a87d908c24a27e33f86227b9fa6f06fa562f5daeee41a93e483792",
           "family": "gate_proj",
           "layer_index": 13,
@@ -378,6 +416,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 100515840,
           "checksum": "84ddbe21fe3e1e058b0d777feed5c98456dbcd8e1b7dac2bf0584b8adc752897",
           "family": "up_proj",
           "layer_index": 13,
@@ -388,6 +427,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 106045440,
           "checksum": "c681bbe5be234077f0d417d8237474f88fe944322f74f3846fb8b11f5f56b9f1",
           "family": "k_proj",
           "layer_index": 13,
@@ -398,6 +438,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 106250240,
           "checksum": "c0238c75ab52a46645afd24031034a3c95ab221b649d14174f874db3e9cdc8a0",
           "family": "o_proj",
           "layer_index": 13,
@@ -408,6 +449,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 106987520,
           "checksum": "f7ee460357fb8444ea0d520d5aad3bb864e631c928284a525597c3ad9dbcfffa",
           "family": "q_proj",
           "layer_index": 13,
@@ -418,6 +460,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 107806720,
           "checksum": "168f1220195cb78787b66affb648223d8c57c1d3bd49995d3423b710ee051a19",
           "family": "v_proj",
           "layer_index": 13,
@@ -428,6 +471,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 108011520,
           "checksum": "46f402ab30c801ad3941f8ecf7dbbdb00d70969fc5cef9f26e009719bf7858d9",
           "family": "down_proj",
           "layer_index": 14,
@@ -438,6 +482,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 112988160,
           "checksum": "276907652dad4a7fbaff7e93fb4dcca126a5db9883f0ba86ed2ab002707f73ee",
           "family": "gate_proj",
           "layer_index": 14,
@@ -448,6 +493,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 118517760,
           "checksum": "c661171fade8f956466c4ad13a16e4401542af9883c9cba91416581f628f2997",
           "family": "up_proj",
           "layer_index": 14,
@@ -458,6 +504,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 124047360,
           "checksum": "20511df3a000c9651462478ac72cf3634d0a4ccd16e68d3c22daedeb810cabe2",
           "family": "k_proj",
           "layer_index": 14,
@@ -468,6 +515,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 124252160,
           "checksum": "13b80743a19d76593a20f55a311ab0acfbfe1f149c39dbd68aa7b4d70fd9d183",
           "family": "o_proj",
           "layer_index": 14,
@@ -478,6 +526,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 124989440,
           "checksum": "f0a6081725b0775366beeebcf74d7bd0197b225dcc406123877395453c0efee2",
           "family": "q_proj",
           "layer_index": 14,
@@ -488,6 +537,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 125808640,
           "checksum": "65500bdd55118b0e6b8c317581bfd1a51e17f83ad61d7a85da8f6f61875808d9",
           "family": "v_proj",
           "layer_index": 14,
@@ -498,6 +548,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 126013440,
           "checksum": "ef650915f58c93fed408729905e5620bf8cbbd06db9c0f8a94891e9a49b626b4",
           "family": "down_proj",
           "layer_index": 15,
@@ -508,6 +559,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 130990080,
           "checksum": "4cde817d7f4cbba4c37daa0b7c47e2b7a6a4203bf9da79f70d11d6bd607cdd7c",
           "family": "gate_proj",
           "layer_index": 15,
@@ -518,6 +570,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 136519680,
           "checksum": "669801139c867f3dee4bf67f93d9d8491a08c04caa0ab8d0c87747723576411e",
           "family": "up_proj",
           "layer_index": 15,
@@ -528,6 +581,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 142049280,
           "checksum": "f70020a8eaf1beb41b76ecda67c871f4124dccd2b7b980ecc1f9c01b4f685b8c",
           "family": "k_proj",
           "layer_index": 15,
@@ -538,6 +592,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 142254080,
           "checksum": "b257756346a7f325a0b3f9ca6b747a492ba125f52c1616567db0edf04396750a",
           "family": "o_proj",
           "layer_index": 15,
@@ -548,6 +603,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 142991360,
           "checksum": "ef615c60b10d27c765f2b04775fdd066a46bdc281bceb1f8d9a0e11dd474bb25",
           "family": "q_proj",
           "layer_index": 15,
@@ -558,6 +614,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 143810560,
           "checksum": "734bdf643b3cc7986a89aed3ab42276dd464c4e2df80c0b3dbc1b83f4f31dfb1",
           "family": "v_proj",
           "layer_index": 15,
@@ -568,6 +625,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 144015360,
           "checksum": "ad412a045070a1e87c03d65de7add8601b01c600ed41a1135a32e2d370b112a8",
           "family": "down_proj",
           "layer_index": 16,
@@ -578,6 +636,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 148992000,
           "checksum": "ede29e27334b94c09e28c300a01ba9487b57573c59a75c2e4f8a8676ebcb345a",
           "family": "gate_proj",
           "layer_index": 16,
@@ -588,6 +647,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 154521600,
           "checksum": "52740642c5da422e0558519653617a04d573fabd2ac1cb3a7b73a328e85ede13",
           "family": "up_proj",
           "layer_index": 16,
@@ -598,6 +658,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 160051200,
           "checksum": "6b04077c36bcb08a16865c30172be8b6dab6cceda994f1cb7ba696d417c55ee2",
           "family": "k_proj",
           "layer_index": 16,
@@ -608,6 +669,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 160256000,
           "checksum": "5da59ad98b7dae7e44b3842c90ad35a0caec0642049f7592a575c04aaff36e34",
           "family": "o_proj",
           "layer_index": 16,
@@ -618,6 +680,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 160993280,
           "checksum": "38c58c17f08ef28b40ca978987e3a77843bc2d3b6abfc352854e0aa3ab17c8e6",
           "family": "q_proj",
           "layer_index": 16,
@@ -628,6 +691,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 161812480,
           "checksum": "e773ca140833599884f2d54e1109419d3eefe1ff3e67cc1b9e47a57bf4d4f7ca",
           "family": "v_proj",
           "layer_index": 16,
@@ -638,6 +702,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 162017280,
           "checksum": "5c639cb235df782c56ba19f819234c4180ad1c5d5fbed966b30c15ca6cfe76a0",
           "family": "down_proj",
           "layer_index": 17,
@@ -648,6 +713,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 166993920,
           "checksum": "7392e0a469d0ca6232d593b86269f63d6457b42867f088db09f91c6bc778c826",
           "family": "gate_proj",
           "layer_index": 17,
@@ -658,6 +724,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 172523520,
           "checksum": "4efe9549836cff438ee9a1e0c1b9485231b91e6733dead5d37960224ba0413a0",
           "family": "up_proj",
           "layer_index": 17,
@@ -668,6 +735,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 178053120,
           "checksum": "e58fbe526314a530e2e31fad8cee287329e78b9e9bdab14f3c001259f22563ff",
           "family": "k_proj",
           "layer_index": 17,
@@ -678,6 +746,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 178257920,
           "checksum": "d778a6f4eff43edc3d04805f805ecd5265b29792bf4bcfbe8a27d83b2e80f2e9",
           "family": "o_proj",
           "layer_index": 17,
@@ -688,6 +757,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 178995200,
           "checksum": "30ba8239269900ad96bca263d499b849c559bea96a0d5b9b14f300903c850d60",
           "family": "q_proj",
           "layer_index": 17,
@@ -698,6 +768,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 179814400,
           "checksum": "ac897f014fb6d227ec3b7132dc8cd09cab83106e90d12040b0f9bec39b2b0a4c",
           "family": "v_proj",
           "layer_index": 17,
@@ -708,6 +779,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 180019200,
           "checksum": "213a484a5284f58fc36821ca14e5503538585ea83d0b1800dc5e34e2a4cabead",
           "family": "down_proj",
           "layer_index": 18,
@@ -718,6 +790,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 184995840,
           "checksum": "c820de47f365e2f1d97f765f4c9f7bdb444c235434ae6aa4889e03f580b7057d",
           "family": "gate_proj",
           "layer_index": 18,
@@ -728,6 +801,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 190525440,
           "checksum": "5a24c6a4d1905bc442ff794eaf1fb9598c010a9cfea255032916c08ce155426a",
           "family": "up_proj",
           "layer_index": 18,
@@ -738,6 +812,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 196055040,
           "checksum": "b1e1aca05f8234a0f7a65832c72f018327ffe511abf80a1e3f5c694167e62515",
           "family": "k_proj",
           "layer_index": 18,
@@ -748,6 +823,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 196259840,
           "checksum": "4e3e2e9c108860db6d704a473df96e41f758059845d525ac41dd43a8bb0ca934",
           "family": "o_proj",
           "layer_index": 18,
@@ -758,6 +834,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 196997120,
           "checksum": "552931b01bc7e4c51c78f6badea49fb927e1aa040fb80034c262262cf57afcb6",
           "family": "q_proj",
           "layer_index": 18,
@@ -768,6 +845,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 197816320,
           "checksum": "d8bcc944d47b7a9523c5784a96629411688bf7f610bd11b49fb7e3a6ac4684f1",
           "family": "v_proj",
           "layer_index": 18,
@@ -778,6 +856,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 198021120,
           "checksum": "d5be1904f5b903be13a1ecdd061d8c8602092829d8ff6e1951b889c6b9d4fe8b",
           "family": "down_proj",
           "layer_index": 19,
@@ -788,6 +867,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 202997760,
           "checksum": "1351b8123c1107e8bd2f8afd2338d78197c69dafb497e12766318b3584dd07ba",
           "family": "gate_proj",
           "layer_index": 19,
@@ -798,6 +878,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 208527360,
           "checksum": "fbc3519944e71c1ddd7677778c2a20ea235c0cb6b38b09675ad317a2fc9028d0",
           "family": "up_proj",
           "layer_index": 19,
@@ -808,6 +889,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 214056960,
           "checksum": "372d8f4453e89e269f2aa64a84ec507783141f9ebf333eeadde33bbaca5cb92c",
           "family": "k_proj",
           "layer_index": 19,
@@ -818,6 +900,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 214261760,
           "checksum": "9039a96194f3ea9137058c94789d95d12d4e9c472fdf440d9f698e746b3112be",
           "family": "o_proj",
           "layer_index": 19,
@@ -828,6 +911,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 214999040,
           "checksum": "0135e9829e6036ec5d943133851de2625777bc390eb4b663456c0f24c224a982",
           "family": "q_proj",
           "layer_index": 19,
@@ -838,6 +922,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 215818240,
           "checksum": "465fb6f25ca8f06a634713846b0490263a723fbc7bf888de6ac061082b9f1302",
           "family": "v_proj",
           "layer_index": 19,
@@ -848,6 +933,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 216023040,
           "checksum": "559c5bf72c737c88960f72308e4eb6521a373ede1f2c0b67ca24528c9fc496a9",
           "family": "down_proj",
           "layer_index": 2,
@@ -858,6 +944,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 220999680,
           "checksum": "6429fb0fb35e18c948c77faf60c4e4ea9464e9c38facbbd4f9fb23e39761f660",
           "family": "gate_proj",
           "layer_index": 2,
@@ -868,6 +955,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 226529280,
           "checksum": "8d25ef11a50d155a78716b274cdbac965bbcc158480652fac73714b54c13a5a3",
           "family": "up_proj",
           "layer_index": 2,
@@ -878,6 +966,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 232058880,
           "checksum": "f330edf1047bc1f67d97a0dbc36a831e98686c2e468d2594414bcfebcdf0d23e",
           "family": "k_proj",
           "layer_index": 2,
@@ -888,6 +977,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 232263680,
           "checksum": "b082db7310e95cee5539af5a84cdb4716074522545c8d9535c633c0f2f467c5a",
           "family": "o_proj",
           "layer_index": 2,
@@ -898,6 +988,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 233000960,
           "checksum": "fced8a10b0f102bd33a03827f72e7fad049d2f4db1deff163383b97e2b226053",
           "family": "q_proj",
           "layer_index": 2,
@@ -908,6 +999,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 233820160,
           "checksum": "5da46ba985c533c5093d4b7f0fdcdc55b04300d30a1361d1bb946f43378b8846",
           "family": "v_proj",
           "layer_index": 2,
@@ -918,6 +1010,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 234024960,
           "checksum": "43ad28d29b465c12af4169c8d1243d708955bb12793003cdf0d08d3cca5727a5",
           "family": "down_proj",
           "layer_index": 20,
@@ -928,6 +1021,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 239001600,
           "checksum": "b3ae920def9d16bdbf86bb737de14c39cb4bde114280964b4d932ff68ae070be",
           "family": "gate_proj",
           "layer_index": 20,
@@ -938,6 +1032,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 244531200,
           "checksum": "b523a95d21338c3fcc0a61006ac74024b9f0b4daaa75b3448300a85cb9bec496",
           "family": "up_proj",
           "layer_index": 20,
@@ -948,6 +1043,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 250060800,
           "checksum": "9164c618d82c45a914e2bc01999309ce77014ae808bd42e7218eea689cfb28c6",
           "family": "k_proj",
           "layer_index": 20,
@@ -958,6 +1054,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 250265600,
           "checksum": "d904389c6373faffaa923ec219d277f97879ea53662cd8f14cad5b08b924ce42",
           "family": "o_proj",
           "layer_index": 20,
@@ -968,6 +1065,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 251002880,
           "checksum": "83680d7d52657ac99a79219ef434c04fe63bf19f944a5c6a52e7ccdee9563402",
           "family": "q_proj",
           "layer_index": 20,
@@ -978,6 +1076,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 251822080,
           "checksum": "f42988ed4dae42eab11d1d0171d8553a64eb9f7b2ba0eb2f95c295b5b65c04c8",
           "family": "v_proj",
           "layer_index": 20,
@@ -988,6 +1087,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 252026880,
           "checksum": "1215062535ac9970527f3aa04a81ec4d958a900d891da2d953e08cb762918e34",
           "family": "down_proj",
           "layer_index": 21,
@@ -998,6 +1098,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 257003520,
           "checksum": "4d85fe9df6942be35d301f82430b93d4f46dc9df7285cf842107ed83cda784ba",
           "family": "gate_proj",
           "layer_index": 21,
@@ -1008,6 +1109,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 262533120,
           "checksum": "1b7add0451680769eb4e57dfdecc94476a158a8f5b85b4456ee22ebacb09e809",
           "family": "up_proj",
           "layer_index": 21,
@@ -1018,6 +1120,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 268062720,
           "checksum": "4ae0670400546fc34e2de215b501892e5d2e4ca28e2e40120448fde698e476e6",
           "family": "k_proj",
           "layer_index": 21,
@@ -1028,6 +1131,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 268267520,
           "checksum": "85086f168596b53956c2607b4d2559861169626bd677f680874564b0f5113c21",
           "family": "o_proj",
           "layer_index": 21,
@@ -1038,6 +1142,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 269004800,
           "checksum": "31696e270ba62cb5595f0b222bd7cec86c02c468b836633c30a020f24c926633",
           "family": "q_proj",
           "layer_index": 21,
@@ -1048,6 +1153,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 269824000,
           "checksum": "626fe7cea98a639fa2405a20cf4a37318f8ce478c485b7e23d6bb64dbf816c60",
           "family": "v_proj",
           "layer_index": 21,
@@ -1058,6 +1164,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 270028800,
           "checksum": "885c29bbddf8109a1f839f8bb0c82558eacb984d82d4b1d9aae36ac4d12de8eb",
           "family": "down_proj",
           "layer_index": 22,
@@ -1068,6 +1175,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 275005440,
           "checksum": "49e8a015117971dbce3b61a9685ef8377f920619546dcdce04ab7e1b746e8212",
           "family": "gate_proj",
           "layer_index": 22,
@@ -1078,6 +1186,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 280535040,
           "checksum": "48000aaa8ee8865b5edced5a639e2725184af260a8894bf31df2ffc1a6ac6fe3",
           "family": "up_proj",
           "layer_index": 22,
@@ -1088,6 +1197,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 286064640,
           "checksum": "b14a0d473a86632beb57afa1974a06a186a8d1ec950568238c23be94f7ee9bb6",
           "family": "k_proj",
           "layer_index": 22,
@@ -1098,6 +1208,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 286269440,
           "checksum": "35d138772e8a0dba4dcf0defa971cfc7e2282a4c40161264e9c0be4b17e5d920",
           "family": "o_proj",
           "layer_index": 22,
@@ -1108,6 +1219,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 287006720,
           "checksum": "b2e09f4d86fbfeeaf49c7b384b4604df7def33901ca1d7fbe2d5d81079b286c5",
           "family": "q_proj",
           "layer_index": 22,
@@ -1118,6 +1230,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 287825920,
           "checksum": "8a608c82532dbd4cdb6b43ef97818fa6f4d0c3da27c0b175939fa7497c59d89c",
           "family": "v_proj",
           "layer_index": 22,
@@ -1128,6 +1241,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 288030720,
           "checksum": "bc514af209584c2e7100adc6937091320c69cc3b973743b5fa3ee40cab3a6190",
           "family": "down_proj",
           "layer_index": 23,
@@ -1138,6 +1252,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 293007360,
           "checksum": "3dbfb294f1d70629c15de4a865f430077ee751110366e7ef9e593e47ce41aafa",
           "family": "gate_proj",
           "layer_index": 23,
@@ -1148,6 +1263,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 298536960,
           "checksum": "0da38c09e634420fcbc0f73ad3eb6291cf7b6d21074acd9252680c94c817c756",
           "family": "up_proj",
           "layer_index": 23,
@@ -1158,6 +1274,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 304066560,
           "checksum": "8e08fec73bda444608dc67ac0f23d6c28a164fb03e92eeb04539dc5b603df5e0",
           "family": "k_proj",
           "layer_index": 23,
@@ -1168,6 +1285,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 304271360,
           "checksum": "2641f42f446d759a5380b2c63956f46779434d7d1a0f521e0681faf99e5a97ae",
           "family": "o_proj",
           "layer_index": 23,
@@ -1178,6 +1296,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 305008640,
           "checksum": "cb8eb1bb1394ed7a21345c28b9f3fd8751b27075e6e4f06f6ba22a0093645a1b",
           "family": "q_proj",
           "layer_index": 23,
@@ -1188,6 +1307,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 305827840,
           "checksum": "3383e17a2ee85cd109b50c8c1492b091e423b40a301b3fb2595084e2be8235f3",
           "family": "v_proj",
           "layer_index": 23,
@@ -1198,6 +1318,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 306032640,
           "checksum": "7b686f212b85cae5eda686301947d8208a40d73ac9beb5cbefd0ed5a1f367547",
           "family": "down_proj",
           "layer_index": 24,
@@ -1208,6 +1329,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 311009280,
           "checksum": "cf4262d003142b5f9c80f9f457a366ae7e16a9ce09c7c9f685e81d91c770a2f4",
           "family": "gate_proj",
           "layer_index": 24,
@@ -1218,6 +1340,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 316538880,
           "checksum": "665ba5a1b9accc2f6e7b2c0a9e8e35d5d4a1191e69da286640d7b3b20020a661",
           "family": "up_proj",
           "layer_index": 24,
@@ -1228,6 +1351,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 322068480,
           "checksum": "edf46991d692d844a598c309e1ee4d44675f7ae9a5200e161e4f964be667c8b8",
           "family": "k_proj",
           "layer_index": 24,
@@ -1238,6 +1362,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 322273280,
           "checksum": "7f51b8c634836692ff9b63ecd02243080296fd0419152b798d4ba127dcc8e92c",
           "family": "o_proj",
           "layer_index": 24,
@@ -1248,6 +1373,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 323010560,
           "checksum": "b982c1ec06a9666d5d1fed23e1ad9f8e31ac3e3a0e21be85d3a5167a156403f8",
           "family": "q_proj",
           "layer_index": 24,
@@ -1258,6 +1384,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 323829760,
           "checksum": "464bf9cbe9c53cb983aadbfa710e263b091c10c50626b3ed472806a68f06bac5",
           "family": "v_proj",
           "layer_index": 24,
@@ -1268,6 +1395,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 324034560,
           "checksum": "6143e20625a0b07d7ae00858231d1f86a5c361b092f600a44557f0229d79f122",
           "family": "down_proj",
           "layer_index": 25,
@@ -1278,6 +1406,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 329011200,
           "checksum": "0d1ce9641ac7c06aef35a81f300cbe6445b5f8a1791b9fcba3cdbe3e005b986a",
           "family": "gate_proj",
           "layer_index": 25,
@@ -1288,6 +1417,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 334540800,
           "checksum": "486e33494e6db38154685ad0030c0d18b2ceef7cafb6a33176044362cdd90ad6",
           "family": "up_proj",
           "layer_index": 25,
@@ -1298,6 +1428,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 340070400,
           "checksum": "d70cbe6aecada2add06316d0874bdce6ed11117618cdf015b5117cfdd230b0b9",
           "family": "k_proj",
           "layer_index": 25,
@@ -1308,6 +1439,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 340275200,
           "checksum": "7b68c74d3a548fd1dcbef20f2793961b367b076ba328fcea18ae15bdabab396e",
           "family": "o_proj",
           "layer_index": 25,
@@ -1318,6 +1450,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 341012480,
           "checksum": "6b7246c4879713b532b9abaf02e5d6219b44045703eab209116a084a91499b3b",
           "family": "q_proj",
           "layer_index": 25,
@@ -1328,6 +1461,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 341831680,
           "checksum": "80cbf057f9f52941cfe1d198b1b3aafe680b2477c5cbf9e0f5ec28132b30456b",
           "family": "v_proj",
           "layer_index": 25,
@@ -1338,6 +1472,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 342036480,
           "checksum": "67079e2823e461c14cf2a098383fe09f2b656289a143d83bf7ac60ef6c5077b4",
           "family": "down_proj",
           "layer_index": 3,
@@ -1348,6 +1483,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 347013120,
           "checksum": "dc1e23c1838e73ea705113a6f65db43f0f26a4b75513fde2a45dbd9e74c31a8c",
           "family": "gate_proj",
           "layer_index": 3,
@@ -1358,6 +1494,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 352542720,
           "checksum": "39a04e60377c29867d00075c679d9c20355580c532e9b42b3414b1207010828e",
           "family": "up_proj",
           "layer_index": 3,
@@ -1368,6 +1505,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 358072320,
           "checksum": "287258e97a93f5f4a016764691d8439c8c6e3e992e8b3aa77b1762344a09d3db",
           "family": "k_proj",
           "layer_index": 3,
@@ -1378,6 +1516,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 358277120,
           "checksum": "33210e6bcfbfe81031ab0937ee2bc828f68bffb8f75376bb51c78a35c9e98ea6",
           "family": "o_proj",
           "layer_index": 3,
@@ -1388,6 +1527,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 359014400,
           "checksum": "4e444135a728a368a0817313175deba609458f54bdaf636e1b9b40af1a946f4d",
           "family": "q_proj",
           "layer_index": 3,
@@ -1398,6 +1538,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 359833600,
           "checksum": "d4321bbe37cbf95f1fc1f17c1f78cb6980e9dd8a0a81558178cc8897f7b4cdc0",
           "family": "v_proj",
           "layer_index": 3,
@@ -1408,6 +1549,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 360038400,
           "checksum": "5055f27ce3f4bbd93eb0b8ce20ef7769fc1e098a9972d26fe1732a7c59f96c1c",
           "family": "down_proj",
           "layer_index": 4,
@@ -1418,6 +1560,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 365015040,
           "checksum": "6aade5dfb07619920272f4c6bf05dd6ab534747f69ce4fd2428436de12ee23ed",
           "family": "gate_proj",
           "layer_index": 4,
@@ -1428,6 +1571,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 370544640,
           "checksum": "d461dd0002fcd67ddd4821e5439024d704868aa9489aacf9941ca9523b4f7210",
           "family": "up_proj",
           "layer_index": 4,
@@ -1438,6 +1582,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 376074240,
           "checksum": "e3e829c14cb2a4524a513841e57c41db6f3da660ba893c10d9e56c7d99a56d20",
           "family": "k_proj",
           "layer_index": 4,
@@ -1448,6 +1593,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 376279040,
           "checksum": "9be57cf8c171c01b66a8f9fcde938a02a5195f1a2ecf5bd33d940b9159aff49e",
           "family": "o_proj",
           "layer_index": 4,
@@ -1458,6 +1604,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 377016320,
           "checksum": "c76a2fb913b0ca43db89ffae836a47cafd4ad939832c06b679bddcd93821f6fc",
           "family": "q_proj",
           "layer_index": 4,
@@ -1468,6 +1615,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 377835520,
           "checksum": "ae4ce7c01307e52d15eb8e2fd46f52128c27d2a94e6ba9102b6e8905245c8e63",
           "family": "v_proj",
           "layer_index": 4,
@@ -1478,6 +1626,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 378040320,
           "checksum": "5925f6eb8069510647a665cb917b9d75b44770233fdea7ccbec906abab3f25ab",
           "family": "down_proj",
           "layer_index": 5,
@@ -1488,6 +1637,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 383016960,
           "checksum": "40d51ff976ea4daaa8e6c12d6834199002a262221e42735023ac86bf7a522e18",
           "family": "gate_proj",
           "layer_index": 5,
@@ -1498,6 +1648,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 388546560,
           "checksum": "677736d0f90ec1f7732f86f6ab18059559dbdd07013860a2a2d9b86e06e4550d",
           "family": "up_proj",
           "layer_index": 5,
@@ -1508,6 +1659,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 394076160,
           "checksum": "9a36d7d84db3fd355aa82060ebb21491b0355f73b6898741bec81d73df4cb0d4",
           "family": "k_proj",
           "layer_index": 5,
@@ -1518,6 +1670,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 394280960,
           "checksum": "b064269f157a55c946d1874874fd260bdf347303d4c53cb966dffdd496de172d",
           "family": "o_proj",
           "layer_index": 5,
@@ -1528,6 +1681,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 395018240,
           "checksum": "ac3350fceb058a8b873d8c5633924298f5a16e0dc0722e0c805c7b204ead3b53",
           "family": "q_proj",
           "layer_index": 5,
@@ -1538,6 +1692,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 395837440,
           "checksum": "721273adc983dcb310c4fca48b03d5bb7829790f219a1c0f32a55d6d3af331a7",
           "family": "v_proj",
           "layer_index": 5,
@@ -1548,6 +1703,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 396042240,
           "checksum": "7447e49d3e937e5d94efba4e70522d4d10bf623034a4d0c3e6608e44236277e0",
           "family": "down_proj",
           "layer_index": 6,
@@ -1558,6 +1714,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 401018880,
           "checksum": "da946f9a7c636d17a699975227150b2762a764af471e437cced1dce8022d8f79",
           "family": "gate_proj",
           "layer_index": 6,
@@ -1568,6 +1725,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 406548480,
           "checksum": "bcd6e440141cca28b1a8a98fe4e558e49bd1a1790693df7ccedb2b89790e595d",
           "family": "up_proj",
           "layer_index": 6,
@@ -1578,6 +1736,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 412078080,
           "checksum": "8d5da0f6734db9a5251dae9428f0775d8735f79162f92c7664718c61f165e8ed",
           "family": "k_proj",
           "layer_index": 6,
@@ -1588,6 +1747,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 412282880,
           "checksum": "531c99a4456c3519c41c22ffa9d34c4b7338d935e05fc1292dbc33a349e5bd94",
           "family": "o_proj",
           "layer_index": 6,
@@ -1598,6 +1758,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 413020160,
           "checksum": "681d8d845777e80e3cbcb1eef64330ec02a30dbd0e3a0c8790633dc8a4d021fb",
           "family": "q_proj",
           "layer_index": 6,
@@ -1608,6 +1769,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 413839360,
           "checksum": "1eeb9c7cf45c14345b267702dbebdf4cd07e810907ce5bb7bbdc031e49f1f8d9",
           "family": "v_proj",
           "layer_index": 6,
@@ -1618,6 +1780,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 414044160,
           "checksum": "cf0e6984b28f7893bc0d4d7f4a081acc63c578a7388853823adf94d0a22afc56",
           "family": "down_proj",
           "layer_index": 7,
@@ -1628,6 +1791,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 419020800,
           "checksum": "dfae97f3c897a0d5f5b5a39e8c1e122ec2b9e5dbd317a7a1aafa845171d923eb",
           "family": "gate_proj",
           "layer_index": 7,
@@ -1638,6 +1802,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 424550400,
           "checksum": "4a5b822902e127bd97764e19909d0f9613b43ea46e38a33ce9c56d4a9b42bf25",
           "family": "up_proj",
           "layer_index": 7,
@@ -1648,6 +1813,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 430080000,
           "checksum": "219d4c0d9b6598f67cf921f4fafac0a611c1881f8b839266d1824a895e6a3a7d",
           "family": "k_proj",
           "layer_index": 7,
@@ -1658,6 +1824,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 430284800,
           "checksum": "f0f722060ad49f976ffe3ad2e153555088a418b59caa9fa24eec1aab612b2c43",
           "family": "o_proj",
           "layer_index": 7,
@@ -1668,6 +1835,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 431022080,
           "checksum": "fe9569e2a79e0687f9a8e5dacaacf7d032e686dfafd7181a4abe963d5e741d17",
           "family": "q_proj",
           "layer_index": 7,
@@ -1678,6 +1846,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 431841280,
           "checksum": "207b5a1fe2b653a366691858aa13e5076113ecd1642ad1582532c4064a019562",
           "family": "v_proj",
           "layer_index": 7,
@@ -1688,6 +1857,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 432046080,
           "checksum": "4182e08ba0b998192c3c9054aff5dadf25cbe317e7db20054c01e7fb3710f7cd",
           "family": "down_proj",
           "layer_index": 8,
@@ -1698,6 +1868,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 437022720,
           "checksum": "6b5ab01e1b2824a04b259f059ab1fa81facd148e5a938a8ad8223f2ca4d5bf36",
           "family": "gate_proj",
           "layer_index": 8,
@@ -1708,6 +1879,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 442552320,
           "checksum": "00a73b1b979c3795d0e5beb6d6aa98353b3ce1001bebf48451e298047ae7421e",
           "family": "up_proj",
           "layer_index": 8,
@@ -1718,6 +1890,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 448081920,
           "checksum": "84be773d65b2f0cb530b9f88909ad8c7129c334bf2917998a15c98b0024fe2bb",
           "family": "k_proj",
           "layer_index": 8,
@@ -1728,6 +1901,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 448286720,
           "checksum": "6305b1b72bb026058c06745b4831790528805603e77eaed07572de0eabdc73f7",
           "family": "o_proj",
           "layer_index": 8,
@@ -1738,6 +1912,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 449024000,
           "checksum": "4184564cce8fbec04812af80f5be531f6f55b24e9d8e60fb44bc5e8f0e9abcf9",
           "family": "q_proj",
           "layer_index": 8,
@@ -1748,6 +1923,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 449843200,
           "checksum": "113c039b12f3ca39b2a2d35e22b4c07e5cf762d89931a9b4eaba974e84252cea",
           "family": "v_proj",
           "layer_index": 8,
@@ -1758,6 +1934,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 450048000,
           "checksum": "d25a431886f26246ebe57191240a4e1565e343b4d948d3d790ca2b0c64775dbe",
           "family": "down_proj",
           "layer_index": 9,
@@ -1768,6 +1945,7 @@
           "xrt_written_bytes": 4976640
         },
         {
+          "bo_offset": 455024640,
           "checksum": "0e422da217a44396d1ba90943a12dd0874f790beafe57e01388a35adad6542b8",
           "family": "gate_proj",
           "layer_index": 9,
@@ -1778,6 +1956,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 460554240,
           "checksum": "468ad98f60227f52dc8a66d9ef0510c679d0b065eda70eea15d7fc2fca5de727",
           "family": "up_proj",
           "layer_index": 9,
@@ -1788,6 +1967,7 @@
           "xrt_written_bytes": 5529600
         },
         {
+          "bo_offset": 466083840,
           "checksum": "1800c5c45077b8a499c042991940ccb61b32a7a40dca476fcd86ed953216cbe2",
           "family": "k_proj",
           "layer_index": 9,
@@ -1798,6 +1978,7 @@
           "xrt_written_bytes": 204800
         },
         {
+          "bo_offset": 466288640,
           "checksum": "5f8979bba3b37d42944fb50790e9f6e5aa02d6f725bcb2e62ec554b71eb93931",
           "family": "o_proj",
           "layer_index": 9,
@@ -1808,6 +1989,7 @@
           "xrt_written_bytes": 737280
         },
         {
+          "bo_offset": 467025920,
           "checksum": "3feda3bcbb65fe3007dd98972a04d37604405a37e8dacee14713a94d9b93195c",
           "family": "q_proj",
           "layer_index": 9,
@@ -1818,6 +2000,7 @@
           "xrt_written_bytes": 819200
         },
         {
+          "bo_offset": 467845120,
           "checksum": "ae88e8eae870b16644fc5fa576322938045e643c724ca038ce4e139f4a50719b",
           "family": "v_proj",
           "layer_index": 9,

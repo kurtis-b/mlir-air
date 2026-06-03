@@ -524,8 +524,7 @@ Blocked evidence:
 - `gemma3_reproduction_blockers.py` reports Phase F as `BLOCKED` because
   local 1B artifacts are available but model-kernel launch, kernel argument
   binding, full paper-shape BO allocation validation, nonlinear model-stage
-  promotion, and fresh paper-shape hardware reruns are not complete. Full
-  static-weight BO preload validation is complete for 1B only. The prior
+  promotion, and fresh paper-shape hardware reruns are not complete. Full contiguous static-weight BO preload validation is complete for 1B only. The prior
   unmeasured-nonlinear fallback blocker is retired by measured CPU-reference
   fallback records, but those records are not NPU promotion evidence.
 - Dependency-light CPU/HF smoke paths now validate local 1B text, 4B text,
@@ -543,8 +542,8 @@ Blocked evidence:
   allocation/preload smoke coverage; a local 1B smoke run allocated 5,303,808
   bytes and saved `/tmp/gemma3_1b_xrt_bo_smoke.json`. `gemma3_static_preload.py`
   serializes real projection tensors into the Q4NX packed/scale/min byte stream
-  and can write selected tensors into XRT BOs. A full local 1B static-preload
-  XRT smoke wrote all 182 planned text projection tensors, totaling
+  and can write selected tensors into XRT BOs. A full local 1B contiguous static-preload
+  XRT smoke wrote all 182 planned text projection tensors into one static BO, totaling
   468,049,920 bytes, and saved
   `results/gemma3_static_preload_evidence.json`; 4B and vision full-static
   preload remain validation blockers. Full paper-shape BO allocation remains a
@@ -713,7 +712,7 @@ Implemented evidence and blocker:
   launch or validation failures.
 - `gemma3_static_preload.py` can save real Q4NX static-weight preload smoke JSON
   so future model-runner failures can distinguish serialization/preload from
-  kernel binding and execution failures. `gemma3-1b` now has committed full-XRT
+  kernel binding and execution failures. `gemma3-1b` now has committed full contiguous-XRT
   preload evidence with no static-preload blockers.
 - `gemma3_buffer_binding.py` records that runtime BO and virtual-intermediate
   binding is planned with no missing BO keys in the self-test fixture; remaining
