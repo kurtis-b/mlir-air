@@ -1,12 +1,14 @@
 # RUN: %PYTHON %S/gemma3_artifacts.py --self-test | FileCheck %s --check-prefix=SELF
 # RUN: %PYTHON %S/gemma3_artifacts.py --model-variant gemma3-4b --prompt-len 131072 | FileCheck %s --check-prefix=PROMPT
-# RUN: %PYTHON %S/gemma3_artifacts.py --model-variant gemma3-1b --discover | FileCheck %s --check-prefix=DISCOVER
-# RUN: %PYTHON %S/gemma3_artifacts.py --model-variant gemma3-1b --manifest | FileCheck %s --check-prefix=MANIFEST
-# RUN: %PYTHON %S/gemma3_artifacts.py --model-variant gemma3-4b-vision --manifest | FileCheck %s --check-prefix=VISION-MANIFEST
+# RUN: env GEMMA3_MODEL_ROOT=%t.no_models %PYTHON %S/gemma3_artifacts.py --model-variant gemma3-1b --discover | FileCheck %s --check-prefix=DISCOVER
+# RUN: env GEMMA3_MODEL_ROOT=%t.no_models %PYTHON %S/gemma3_artifacts.py --model-variant gemma3-1b --manifest | FileCheck %s --check-prefix=MANIFEST
+# RUN: env GEMMA3_MODEL_ROOT=%t.no_models %PYTHON %S/gemma3_artifacts.py --model-variant gemma3-4b-vision --manifest | FileCheck %s --check-prefix=VISION-MANIFEST
 # RUN: rm -rf %t.gemma3_fake
 # RUN: mkdir -p %t.gemma3_fake
 # RUN: touch %t.gemma3_fake/model.safetensors %t.gemma3_fake/config.json %t.gemma3_fake/tokenizer.json
 # RUN: %PYTHON %S/gemma3_artifacts.py --model-variant gemma3-1b --weights-dir %t.gemma3_fake --manifest | FileCheck %s --check-prefix=FAKE
+# RUN: %PYTHON -c "import json, pathlib; pathlib.Path('%t.gemma3_fake/config.json').write_text(json.dumps({'model_type':'gemma3_text','hidden_size':1152,'num_hidden_layers':26,'vocab_size':262144}))"
+# RUN: %PYTHON %S/gemma3_artifacts.py --model-variant gemma3-1b --weights-dir %t.gemma3_fake --config-summary | FileCheck %s --check-prefix=CONFIG
 # RUN: not %PYTHON %S/gemma3_artifacts.py --model-variant gemma3-1b --weights-dir %t.missing --strict-load | FileCheck %s --check-prefix=BLOCKED
 # SELF: model gemma3-1b vision=False
 # SELF: model gemma3-4b vision=False
@@ -22,4 +24,6 @@
 # FAKE: "config_path":
 # FAKE: "safetensors":
 # FAKE: "tokenizer_path":
+# CONFIG: "hidden_size": 1152
+# CONFIG: "num_hidden_layers": 26
 # BLOCKED: GEMMA3_ARTIFACT_LOAD_BLOCKED: real Gemma3 artifact loading is blocked

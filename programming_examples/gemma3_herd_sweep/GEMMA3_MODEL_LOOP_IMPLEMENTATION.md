@@ -337,8 +337,8 @@ Implementation requirements:
 Acceptance:
 
 - CPU-only real-model load succeeds for 1B and 4B without importing AIR modules.
-- Tokenizer round-trip and prompt length checks pass for every paper sequence
-  length.
+- Tokenizer-backed prompt generation and round-trip checks pass for the local
+  real tokenizer at paper sequence lengths.
 - Q4NX pack/dequant round-trip error is recorded per projection family.
 
 Implemented evidence and blocker:
@@ -359,9 +359,11 @@ Implemented evidence and blocker:
 - `gemma3_artifacts.py` records official source repositories, manifest
   validation, optional snapshot download support, and safetensor shape
   inspection when the package is available.
-- Real Gemma3 artifact loading is still blocked until authenticated official
-  Gemma3 safetensors, config, tokenizer, and vision processor files are present
-  locally as required by each variant.
+- Real Gemma3 artifact loading has been validated against the local default
+  model root `/home/cj/models` for `gemma3-1b`, `gemma3-4b`, and
+  `gemma3-4b-vision`; the remaining blocker is real model execution, not
+  artifact availability. The artifact checker also supports `GEMMA3_MODEL_ROOT`
+  and default per-variant directories for reproducible local discovery.
 
 ### Phase D: standalone kernel parity
 
@@ -480,8 +482,8 @@ Blocked evidence:
   Gemma3 1B safetensors/tokenizer artifacts are missing. The prior
   unmeasured-nonlinear fallback blocker is retired by measured CPU-reference
   fallback records, but those records are not NPU promotion evidence.
-- No CPU/iGPU/NPU paper baseline or speedup claim is emitted while these
-  blockers remain.
+- No CPU/iGPU/NPU paper baseline or speedup claim is emitted while real-model
+  execution remains unimplemented.
 
 ### Phase G: end-to-end 4B text reproduction
 

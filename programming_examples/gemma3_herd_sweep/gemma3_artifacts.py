@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -42,6 +43,14 @@ class Gemma3ModelSpec:
                 f"{self.model_variant} {phase} length {sequence_length} is not a paper target; "
                 f"supported lengths: {lengths}"
             )
+
+
+DEFAULT_MODEL_ROOT_ENV = "GEMMA3_MODEL_ROOT"
+DEFAULT_MODEL_DIR_NAMES = {
+    "gemma3-1b": "gemma-3-1b-pt",
+    "gemma3-4b": "gemma-3-4b-pt",
+    "gemma3-4b-vision": "gemma-3-4b-pt",
+}
 
 
 OFFICIAL_MODEL_REPOS = {
@@ -99,6 +108,8 @@ class Gemma3ArtifactInventory:
     weights_dir: str | None
     source_repo: str
     has_vision: bool
+    default_weights_dir: str | None
+    default_weights_dir_used: bool
     config_path: str | None
     tokenizer_path: str | None
     processor_path: str | None
@@ -140,6 +151,8 @@ class Gemma3ArtifactManifest:
     model_variant: str
     source_repo: str
     has_vision: bool
+    default_weights_dir: str | None
+    default_weights_dir_used: bool
     weights_dir: str | None
     config_path: str | None
     tokenizer_path: str | None
@@ -184,6 +197,30 @@ def optional_package_status() -> dict[str, bool]:
     return status
 
 
+def default_model_root() -> Path:
+    return Path(os.environ.get(DEFAULT_MODEL_ROOT_ENV, str(Path.home() / "models"))).expanduser()
+
+
+def default_weights_dir(model_variant: str, *, model_root: Path | None = None) -> Path:
+    model_spec(model_variant)
+    root = model_root or default_model_root()
+    return root / DEFAULT_MODEL_DIR_NAMES[model_variant]
+
+
+def resolve_weights_dir(
+    model_variant: str,
+    weights_dir: Path | None,
+    *,
+    use_default: bool = True,
+) -> tuple[Path | None, Path]:
+    default_dir = default_weights_dir(model_variant)
+    if weights_dir is not None:
+        return weights_dir.expanduser(), default_dir
+    if use_default and default_dir.exists():
+        return default_dir, default_dir
+    return None, default_dir
+
+
 def _find_safetensors(weights_dir: Path | None) -> tuple[str, ...]:
     if weights_dir is None or not weights_dir.exists():
         return tuple()
@@ -225,20 +262,28 @@ def discover_model_artifacts(
     weights_dir: Path | None = None,
     tokenizer: Path | None = None,
     source_repo: str | None = None,
+    use_default_weights_dir: bool = True,
 ) -> Gemma3ArtifactInventory:
     spec = model_spec(model_variant)
-    tokenizer_path = _resolve_tokenizer(weights_dir, tokenizer)
-    config_path = _resolve_config(weights_dir)
-    processor_path = _resolve_processor(weights_dir)
+    resolved_weights_dir, default_dir = resolve_weights_dir(
+        model_variant,
+        weights_dir,
+        use_default=use_default_weights_dir,
+    )
+    tokenizer_path = _resolve_tokenizer(resolved_weights_dir, tokenizer)
+    config_path = _resolve_config(resolved_weights_dir)
+    processor_path = _resolve_processor(resolved_weights_dir)
     return Gemma3ArtifactInventory(
         model_variant=model_variant,
-        weights_dir=str(weights_dir) if weights_dir is not None else None,
+        weights_dir=str(resolved_weights_dir) if resolved_weights_dir is not None else None,
         source_repo=source_repo or official_model_repo(model_variant),
         has_vision=spec.has_vision,
+        default_weights_dir=str(default_dir),
+        default_weights_dir_used=weights_dir is None and resolved_weights_dir == default_dir,
         config_path=str(config_path) if config_path is not None else None,
         tokenizer_path=str(tokenizer_path) if tokenizer_path is not None else None,
         processor_path=str(processor_path) if processor_path is not None else None,
-        safetensors=_find_safetensors(weights_dir),
+        safetensors=_find_safetensors(resolved_weights_dir),
         config_exists=bool(config_path and config_path.exists()),
         tokenizer_exists=bool(tokenizer_path and tokenizer_path.exists()),
         processor_exists=bool(processor_path and processor_path.exists()),
@@ -290,12 +335,14 @@ def artifact_manifest(
     tokenizer: Path | None = None,
     source_repo: str | None = None,
     include_tensor_shapes: bool = False,
+    use_default_weights_dir: bool = True,
 ) -> Gemma3ArtifactManifest:
     inventory = discover_model_artifacts(
         model_variant,
         weights_dir=weights_dir,
         tokenizer=tokenizer,
         source_repo=source_repo,
+        use_default_weights_dir=use_default_weights_dir,
     )
     blockers = _manifest_blockers(inventory)
     tensor_shapes = _safetensor_shapes(inventory.safetensors) if include_tensor_shapes else {}
@@ -306,6 +353,8 @@ def artifact_manifest(
         model_variant=model_variant,
         source_repo=inventory.source_repo,
         has_vision=inventory.has_vision,
+        default_weights_dir=inventory.default_weights_dir,
+        default_weights_dir_used=inventory.default_weights_dir_used,
         weights_dir=inventory.weights_dir,
         config_path=inventory.config_path,
         tokenizer_path=inventory.tokenizer_path,
@@ -343,6 +392,98 @@ def download_model_snapshot(
     )
 
 
+def load_config_summary(inventory: Gemma3ArtifactInventory) -> dict[str, Any]:
+    if not inventory.config_path:
+        return {"status": "BLOCKED", "blocker": "missing-config-json"}
+    data = json.loads(Path(inventory.config_path).read_text(encoding="utf-8"))
+    text_config = data.get("text_config", data)
+    summary: dict[str, Any] = {
+        "status": "READY",
+        "model_variant": inventory.model_variant,
+        "model_type": data.get("model_type"),
+        "architectures": data.get("architectures", []),
+        "text_model_type": text_config.get("model_type"),
+        "hidden_size": text_config.get("hidden_size"),
+        "intermediate_size": text_config.get("intermediate_size"),
+        "num_hidden_layers": text_config.get("num_hidden_layers"),
+        "num_attention_heads": text_config.get("num_attention_heads"),
+        "num_key_value_heads": text_config.get("num_key_value_heads"),
+        "head_dim": text_config.get("head_dim"),
+        "vocab_size": text_config.get("vocab_size", data.get("vocab_size")),
+        "sliding_window": text_config.get("sliding_window", data.get("sliding_window")),
+        "torch_dtype": data.get("torch_dtype", text_config.get("torch_dtype")),
+        "max_position_embeddings": text_config.get("max_position_embeddings", data.get("max_position_embeddings")),
+    }
+    vision_config = data.get("vision_config")
+    if isinstance(vision_config, dict):
+        summary.update(
+            {
+                "vision_model_type": vision_config.get("model_type"),
+                "vision_hidden_size": vision_config.get("hidden_size"),
+                "vision_intermediate_size": vision_config.get("intermediate_size"),
+                "vision_num_hidden_layers": vision_config.get("num_hidden_layers"),
+                "vision_num_attention_heads": vision_config.get("num_attention_heads"),
+                "vision_image_size": vision_config.get("image_size"),
+                "vision_patch_size": vision_config.get("patch_size"),
+                "mm_tokens_per_image": data.get("mm_tokens_per_image"),
+                "image_token_index": data.get("image_token_index"),
+            }
+        )
+    return summary
+
+
+def real_tokenizer_prompt_ids(
+    model_variant: str,
+    sequence_length: int,
+    *,
+    weights_dir: Path | None = None,
+    tokenizer: Path | None = None,
+    seed_text: str = "gemma3 paper reproduction prompt",
+) -> tuple[np.ndarray, dict[str, Any]]:
+    spec = model_spec(model_variant)
+    phase = "decode" if sequence_length in spec.decode_lengths else "prefill"
+    spec.validate_sequence_length(sequence_length, phase=phase)
+    inventory = load_real_model_artifacts(
+        model_variant,
+        weights_dir=weights_dir,
+        tokenizer=tokenizer,
+        strict=True,
+    )
+    if not inventory.tokenizer_path:
+        raise Gemma3ArtifactError("real tokenizer prompt generation requires tokenizer.json")
+    try:
+        from tokenizers import Tokenizer
+    except Exception as exc:
+        raise Gemma3ArtifactError("python:tokenizers is required for real prompt generation") from exc
+
+    tokenizer_obj = Tokenizer.from_file(inventory.tokenizer_path)
+    base = (seed_text.strip() or "gemma3") + " "
+    seed_ids = tokenizer_obj.encode(base).ids
+    if not seed_ids:
+        raise Gemma3ArtifactError("real tokenizer produced no seed tokens")
+    repeat_ids = seed_ids[1:] if len(seed_ids) > 1 else seed_ids
+    ids = list(seed_ids)
+    while len(ids) < sequence_length:
+        ids.extend(repeat_ids[: sequence_length - len(ids)])
+    trimmed = np.asarray(ids[:sequence_length], dtype=np.int64)
+    sample = trimmed[: min(64, len(trimmed))].tolist()
+    decoded = tokenizer_obj.decode(sample) if sample else ""
+    roundtrip = tokenizer_obj.encode(decoded).ids if decoded else []
+    metadata = {
+        "model_variant": model_variant,
+        "sequence_length": sequence_length,
+        "tokenizer_path": inventory.tokenizer_path,
+        "weights_dir": inventory.weights_dir,
+        "seed_token_count": len(seed_ids),
+        "prompt_repetitions": (sequence_length + max(1, len(repeat_ids)) - 1) // max(1, len(repeat_ids)),
+        "checksum": int(trimmed.sum()),
+        "first_token_ids": trimmed[:8].tolist(),
+        "roundtrip_nonempty": bool(roundtrip),
+        "roundtrip_token_count": len(roundtrip),
+    }
+    return trimmed, metadata
+
+
 def deterministic_prompt_token_ids(model_variant: str, sequence_length: int, *, seed_text: str = "gemma3-paper") -> np.ndarray:
     spec = model_spec(model_variant)
     phase = "decode" if sequence_length in spec.decode_lengths else "prefill"
@@ -358,7 +499,7 @@ def deterministic_prompt_token_ids(model_variant: str, sequence_length: int, *, 
 def load_real_model_artifacts(
     model_variant: str,
     *,
-    weights_dir: Path,
+    weights_dir: Path | None = None,
     tokenizer: Path | None = None,
     strict: bool = True,
 ) -> Gemma3ArtifactInventory:
@@ -423,6 +564,10 @@ def main() -> int:
     parser.add_argument("--download", action="store_true")
     parser.add_argument("--download-dir", type=Path)
     parser.add_argument("--source-repo")
+    parser.add_argument("--no-default-model-dir", action="store_true")
+    parser.add_argument("--config-summary", action="store_true")
+    parser.add_argument("--real-prompt", action="store_true")
+    parser.add_argument("--seed-text", default="gemma3 paper reproduction prompt")
     parser.add_argument("--print-specs", action="store_true")
     parser.add_argument("--prompt-len", type=int)
     parser.add_argument("--self-test", action="store_true")
@@ -434,8 +579,23 @@ def main() -> int:
     if args.print_specs:
         print(format_model_specs())
     if args.prompt_len is not None:
-        prompt = deterministic_prompt_token_ids(args.model_variant, args.prompt_len)
-        print(f"GEMMA3_PROMPT_IDS: model={args.model_variant} len={len(prompt)} checksum={int(prompt.sum())}")
+        if args.real_prompt:
+            prompt, metadata = real_tokenizer_prompt_ids(
+                args.model_variant,
+                args.prompt_len,
+                weights_dir=args.weights_dir,
+                tokenizer=args.tokenizer,
+                seed_text=args.seed_text,
+            )
+            print(
+                f"GEMMA3_REAL_PROMPT_IDS: model={args.model_variant} "
+                f"len={len(prompt)} checksum={metadata['checksum']} "
+                f"roundtrip_nonempty={metadata['roundtrip_nonempty']} "
+                f"tokenizer={metadata['tokenizer_path']}"
+            )
+        else:
+            prompt = deterministic_prompt_token_ids(args.model_variant, args.prompt_len)
+            print(f"GEMMA3_PROMPT_IDS: model={args.model_variant} len={len(prompt)} checksum={int(prompt.sum())}")
     if args.download:
         try:
             target_dir = args.download_dir or Path("gemma3_artifacts") / args.model_variant
@@ -455,14 +615,24 @@ def main() -> int:
             tokenizer=args.tokenizer,
             source_repo=args.source_repo,
             include_tensor_shapes=args.tensor_shapes,
+            use_default_weights_dir=not args.no_default_model_dir,
         )
         print(json.dumps(manifest.to_json_dict(), indent=2, sort_keys=True))
+    if args.config_summary:
+        inventory = discover_model_artifacts(
+            args.model_variant,
+            weights_dir=args.weights_dir,
+            tokenizer=args.tokenizer,
+            source_repo=args.source_repo,
+            use_default_weights_dir=not args.no_default_model_dir,
+        )
+        print(json.dumps(load_config_summary(inventory), indent=2, sort_keys=True))
     if args.discover or args.strict_load:
         try:
             if args.strict_load:
                 inventory = load_real_model_artifacts(
                     args.model_variant,
-                    weights_dir=args.weights_dir or Path("."),
+                    weights_dir=args.weights_dir,
                     tokenizer=args.tokenizer,
                     strict=True,
                 )
@@ -472,6 +642,7 @@ def main() -> int:
                     weights_dir=args.weights_dir,
                     tokenizer=args.tokenizer,
                     source_repo=args.source_repo,
+                    use_default_weights_dir=not args.no_default_model_dir,
                 )
         except Gemma3ArtifactError as exc:
             print(f"GEMMA3_ARTIFACT_LOAD_BLOCKED: {exc}")

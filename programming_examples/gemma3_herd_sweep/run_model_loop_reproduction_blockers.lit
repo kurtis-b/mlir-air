@@ -1,4 +1,4 @@
-# RUN: %PYTHON %S/gemma3_reproduction_blockers.py --self-test | FileCheck %s
+# RUN: env GEMMA3_MODEL_ROOT=%t.no_models %PYTHON %S/gemma3_reproduction_blockers.py --self-test | FileCheck %s
 # CHECK: phase F model=gemma3-1b status=BLOCKED blockers=missing-safetensors,missing-config-json,missing-tokenizer
 # CHECK: phase G model=gemma3-4b status=BLOCKED blockers=missing-safetensors,missing-config-json,missing-tokenizer
 # CHECK: phase H model=gemma3-4b-vision status=BLOCKED blockers=missing-safetensors,missing-config-json,missing-tokenizer,missing-processor

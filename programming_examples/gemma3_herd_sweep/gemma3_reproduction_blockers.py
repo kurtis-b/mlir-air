@@ -80,11 +80,16 @@ def phase_blocker_statuses(weights_dir: Path | None = None) -> tuple[PhaseBlocke
         ("G", "gemma3-4b", ()),
         ("H", "gemma3-4b-vision", tuple(_vision_blockers())),
     ):
+        artifact_blockers = _artifact_blockers(model_variant, weights_dir)
+        execution_blockers = (
+            ["real-model-execution-not-implemented"] if not artifact_blockers else []
+        )
         blockers = tuple(
             dict.fromkeys(
-                _artifact_blockers(model_variant, weights_dir)
+                artifact_blockers
                 + env_blockers
                 + nonlinear_blockers
+                + execution_blockers
                 + list(extra)
             )
         )
