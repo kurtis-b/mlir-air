@@ -504,10 +504,11 @@ Acceptance:
 Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase F as `BLOCKED` because
-  local 1B artifacts are available but end-to-end NPU model execution is not
-  implemented. The prior unmeasured-nonlinear fallback blocker is retired by
-  measured CPU-reference fallback records, but those records are not NPU
-  promotion evidence.
+  local 1B artifacts are available but the XRT model runner, static weight BO
+  preloading, layer-intermediate BO plan, nonlinear model-stage promotion, and
+  fresh paper-shape hardware reruns are not complete. The prior
+  unmeasured-nonlinear fallback blocker is retired by measured CPU-reference
+  fallback records, but those records are not NPU promotion evidence.
 - Dependency-light CPU/HF smoke paths now validate local 1B text, 4B text,
   and 4B synthetic-image weights/tokenizer/processor execution without AIR
   imports. `gemma3_npu_preflight.py` records
@@ -545,9 +546,11 @@ Acceptance:
 Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase G as `BLOCKED` because
-  local 4B artifacts are available but end-to-end NPU model execution is not
-  implemented. Measured host fallback records account for timing metadata but do
-  not replace nonlinear NPU validation.
+  local 4B artifacts are available but the XRT model runner, static weight BO
+  preloading, layer-intermediate BO plan, nonlinear model-stage promotion, and
+  fresh paper-shape hardware reruns are not complete. Measured host fallback
+  records account for timing metadata but do not replace nonlinear NPU
+  validation.
 - `gemma3_npu_wiring.py` emits the 4B text per-layer NPU candidate and host
   fallback plan from local artifacts, including the 5-local/1-global attention
   pattern, but no 64k/128k local paper claim is emitted without real KV-cache,
@@ -576,10 +579,11 @@ Acceptance:
 Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase H as `BLOCKED` because
-  local 4B vision artifacts and processor files are available but end-to-end NPU
-  model execution and the vision NPU path are not implemented. Measured host
-  fallback records account for text nonlinear timing metadata but do not
-  validate vision hardware.
+  local 4B vision artifacts and processor files are available but the XRT model
+  runner, static weight BO preloading, layer-intermediate BO plan, nonlinear
+  model-stage promotion, fresh paper-shape hardware reruns, and the vision NPU
+  path are not complete. Measured host fallback records account for text
+  nonlinear timing metadata but do not validate vision hardware.
 - Existing text-only synthetic and blocked-result tests keep vision optional;
   the enabled vision smoke is a CPU-reference contract for non-causal attention
   and visual context token shape only. No vision TTFT or speedup claim is

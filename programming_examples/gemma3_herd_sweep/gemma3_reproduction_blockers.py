@@ -53,6 +53,15 @@ def _artifact_blockers(model_variant: str, weights_dir: Path | None = None) -> l
 
 
 
+def _execution_blockers(model_variant: str, weights_dir: Path | None = None) -> list[str]:
+    try:
+        from gemma3_npu_wiring import build_wiring_plan
+
+        return list(build_wiring_plan(model_variant, weights_dir=weights_dir).blockers)
+    except Exception:
+        return ["npu-model-execution-not-implemented"]
+
+
 def _vision_blockers() -> list[str]:
     try:
         result = run_vision_prefill_or_disabled(
@@ -82,7 +91,7 @@ def phase_blocker_statuses(weights_dir: Path | None = None) -> tuple[PhaseBlocke
     ):
         artifact_blockers = _artifact_blockers(model_variant, weights_dir)
         execution_blockers = (
-            ["npu-model-execution-not-implemented"] if not artifact_blockers else []
+            _execution_blockers(model_variant, weights_dir) if not artifact_blockers else []
         )
         blockers = tuple(
             dict.fromkeys(
