@@ -1,0 +1,5 @@
+# RUN: %PYTHON %S/gemma3_static_preload.py --self-test | FileCheck %s
+# CHECK: static_preload model=gemma3-1b status=SERIALIZED tensors=1 requested=5120 serialized=5120
+# CHECK-SAME: blockers=full-static-weight-bo-preload-not-validated
+# CHECK: static_preload L0 family=q_proj requested=5120 serialized=5120 xrt_written=0 status=SERIALIZED
+# CHECK: GEMMA3_STATIC_PRELOAD_SELF_TEST: PASS
