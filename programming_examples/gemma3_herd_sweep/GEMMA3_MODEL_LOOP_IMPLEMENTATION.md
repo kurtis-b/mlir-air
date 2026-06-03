@@ -77,6 +77,9 @@ Implemented files:
 - `gemma3_real_execution.py`: CPU/HF real-artifact smoke path for the 1B model,
   proving local weights/tokenizer can execute without AIR imports while making
   no paper timing claim.
+- `gemma3_npu_preflight.py`: real-shape NPU preflight planner that derives
+  projection padding, Q4NX block counts, attention metadata, and the remaining
+  NPU execution blocker from local artifacts.
 
 Focused lit coverage:
 
@@ -88,6 +91,7 @@ Focused lit coverage:
 - `run_model_loop_scaling.lit`
 - `run_model_loop_vision.lit`
 - `run_model_loop_real_execution.lit`
+- `run_model_loop_npu_preflight.lit`
 - `../gemma3_dataflow_kernels/run_geglu_compile_only.lit`
 
 Current phase status:
@@ -488,9 +492,10 @@ Blocked evidence:
   unmeasured-nonlinear fallback blocker is retired by measured CPU-reference
   fallback records, but those records are not NPU promotion evidence.
 - A dependency-light 1B CPU/HF smoke path now validates local real weights and
-  tokenizer execution without AIR imports. No CPU/iGPU/NPU paper baseline or
-  speedup claim is emitted until benchmark-length execution and NPU model
-  execution are implemented.
+  tokenizer execution without AIR imports. `gemma3_npu_preflight.py` records
+  real projection padding and Q4NX block counts needed for NPU wiring. No
+  CPU/iGPU/NPU paper baseline or speedup claim is emitted until
+  benchmark-length execution and NPU model execution are implemented.
 
 ### Phase G: end-to-end 4B text reproduction
 

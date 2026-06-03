@@ -1,0 +1,6 @@
+# RUN: %PYTHON %S/gemma3_npu_preflight.py --self-test | FileCheck %s
+# CHECK: projection family=q_proj shape=1024x1152 padded=1024x1280
+# CHECK-SAME: padding=True
+# CHECK: projection family=o_proj shape=1152x1024 padded=1152x1024
+# CHECK-SAME: padding=False
+# CHECK: GEMMA3_NPU_PREFLIGHT_SELF_TEST: PASS
