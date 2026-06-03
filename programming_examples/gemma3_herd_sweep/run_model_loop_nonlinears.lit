@@ -1,7 +1,15 @@
 # RUN: %PYTHON %S/gemma3_nonlinears.py | FileCheck %s
 # CHECK: nonlinear rms_norm status=standalone-npu-reuse-candidate
+# CHECK-SAME: cpu_ref=gemma3_reference.rms_norm
+# CHECK-SAME: hardware=pending-gemma-wrapper-hardware
 # CHECK: nonlinear qk_norm status=standalone-npu-reuse-candidate
+# CHECK-SAME: cpu_ref=gemma3_reference.qk_norm
 # CHECK: nonlinear rope status=kernel-source-reuse-candidate
+# CHECK-SAME: compile=source-only-no-gemma-air-wrapper
 # CHECK: nonlinear mlp_activation status=gemma-specific-compile-only-candidate
+# CHECK-SAME: tolerance=rtol=1e-1 atol=5e-2 planned-runner-tolerance
 # CHECK: nonlinear residual_add status=host-fallback
+# CHECK-SAME: timed_window=unmeasured-host-fallback
+# CHECK: nonlinear_paper_gate=PAPER_MATCH_BLOCKED unresolved=5
+# CHECK: nonlinear_blocker operation=rms_norm timed_window=unmeasured-host-fallback
 # CHECK: GEMMA3_NONLINEAR_REGISTRY_SELF_TEST: PASS

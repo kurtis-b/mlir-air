@@ -35,6 +35,13 @@ REQUIRED_HEADLINE_CONFLICTS = {
     "power_efficiency_npu_vs_igpu",
     "power_efficiency_npu_vs_cpu",
 }
+TIMED_PAPER_METRICS = {
+    "prefill_ttft_seconds",
+    "decode_tps",
+    "vision_ttft_seconds",
+    "prefill_tps_per_watt_speedup",
+    "decode_tps_per_watt_speedup",
+}
 
 
 @dataclass(frozen=True)
@@ -108,6 +115,18 @@ def target_by_id(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def compare_one(target: dict[str, Any], local: dict[str, Any], threshold_pct: float) -> Comparison:
     if local.get("correctness", "PASS") != "PASS":
         return Comparison(target["id"], target["metric"], local.get("local_value"), target.get("paper_value"), None, "LOCAL_FAIL", str(local.get("correctness")))
+    if target.get("classification_hint") != "OOC" and target.get("metric") in TIMED_PAPER_METRICS:
+        fallback_names = unmeasured_host_fallbacks(local)
+        if fallback_names:
+            return Comparison(
+                target["id"],
+                target["metric"],
+                local.get("local_value"),
+                target.get("paper_value"),
+                None,
+                "UNMEASURED_HOST_FALLBACK",
+                "unmeasured_host_fallbacks=" + ",".join(fallback_names),
+            )
     if target.get("classification_hint") == "OOC":
         classification = "PAPER_MATCH" if local.get("classification") == "OOC" else "EXPLAINED_DEVIATION"
         return Comparison(target["id"], target["metric"], None, None, None, classification, "paper target is out-of-capacity")
@@ -141,6 +160,36 @@ def compare_one(target: dict[str, Any], local: dict[str, Any], threshold_pct: fl
 
 def _deviation_class(local: dict[str, Any]) -> str:
     return "EXPLAINED_DEVIATION" if local.get("explanation") else "LOCAL_FAIL"
+
+
+def _fallback_name(item: Any) -> str:
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        return str(item.get("name") or item.get("operation") or item.get("stage") or "unknown")
+    return str(item)
+
+
+def _fallback_is_unmeasured(item: Any) -> bool:
+    if isinstance(item, str):
+        return True
+    if not isinstance(item, dict):
+        return True
+    contributes = bool(item.get("contributes_to_timing", item.get("timed_window", True)))
+    measured = bool(item.get("measured", False))
+    status = str(item.get("status", ""))
+    if status in {"measured", "npu", "validated", "hardware-validated"}:
+        measured = True
+    return contributes and not measured
+
+
+def unmeasured_host_fallbacks(local: dict[str, Any]) -> tuple[str, ...]:
+    names: list[str] = []
+    for key in ("unmeasured_host_fallbacks", "host_fallbacks"):
+        for item in local.get(key, []) or []:
+            if _fallback_is_unmeasured(item):
+                names.append(_fallback_name(item))
+    return tuple(dict.fromkeys(names))
 
 
 def compare_results(data: dict[str, Any], local_results: dict[str, Any]) -> list[Comparison]:
@@ -180,6 +229,18 @@ def _fixture() -> dict[str, Any]:
                 "local_value": 100.0,
                 "correctness": "PASS",
             },
+            {
+                "target_id": "decode_tps_gemma3_1b_npu_1024",
+                "local_value": 1000.0,
+                "correctness": "PASS",
+                "host_fallbacks": [
+                    {
+                        "name": "rms_norm",
+                        "contributes_to_timing": True,
+                        "measured": False,
+                    }
+                ],
+            },
         ],
     }
 
@@ -207,7 +268,11 @@ def main() -> int:
     if args.self_test:
         comparisons = compare_results(data, _fixture())
         classes = {comparison.classification for comparison in comparisons}
-        if "PAPER_MATCH" not in classes or "EXPLAINED_DEVIATION" not in classes:
+        if (
+            "PAPER_MATCH" not in classes
+            or "EXPLAINED_DEVIATION" not in classes
+            or "UNMEASURED_HOST_FALLBACK" not in classes
+        ):
             raise AssertionError(f"fixture did not exercise expected comparison classes: {classes}")
         for comparison in comparisons:
             print(comparison.format())

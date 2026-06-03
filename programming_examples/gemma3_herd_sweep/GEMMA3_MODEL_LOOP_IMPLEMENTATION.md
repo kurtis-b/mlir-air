@@ -424,6 +424,23 @@ Acceptance:
 - Each promoted nonlinear has CPU reference, compile-only lit, hardware
   validation, and tolerance data.
 
+Implemented evidence and blocker:
+
+- `gemma3_nonlinears.py` now records CPU reference, tensor contract,
+  compile-lit availability, hardware-validation status, tolerance policy, and
+  timed-window status for RMSNorm, QK-Norm, RoPE, GeGLU, and residual add.
+- The registry keeps all nonlinear/vector stages as unmeasured host fallbacks
+  until Gemma-specific AIR wrappers and hardware validation exist, so none are
+  promoted into paper-match timing yet.
+- `gemma3_paper_compare.py` rejects `PAPER_MATCH` for timed paper metrics when
+  local result JSON declares an unmeasured host fallback that contributes to the
+  timed window; the comparison class is `UNMEASURED_HOST_FALLBACK`.
+- `run_model_loop_nonlinears.lit` and `run_model_loop_paper_compare.lit` cover
+  the nonlinear metadata and paper-match fallback gate.
+- Remaining work for full Phase E completion is real hardware validation for
+  promoted wrappers and measured timing inclusion/exclusion for each fallback;
+  this is blocked by the real-artifact/environment gaps recorded earlier.
+
 ### Phase F: end-to-end 1B text reproduction
 
 Goal: reproduce Gemma3 1B prefill and decode tables.

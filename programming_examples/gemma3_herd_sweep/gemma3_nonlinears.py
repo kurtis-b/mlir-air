@@ -24,7 +24,12 @@ class Gemma3NonlinearSpec:
     model_status: str
     implementation_path: str
     compile_lit: str | None
+    cpu_reference: str
     tensor_contract: str
+    compile_status: str
+    hardware_status: str
+    tolerance: str
+    timed_window_status: str
     fallback: str
     notes: str
 
@@ -38,12 +43,19 @@ class Gemma3NonlinearSpec:
             return True
         return (_REPO_ROOT / self.compile_lit).exists()
 
+    @property
+    def blocks_paper_match(self) -> bool:
+        return self.timed_window_status == "unmeasured-host-fallback"
+
     def format(self) -> str:
         lit = self.compile_lit if self.compile_lit else "none"
         return (
             f"nonlinear {self.operation} status={self.model_status} "
             f"source={self.implementation_path} compile_lit={lit} "
-            f"fallback={self.fallback} contract={self.tensor_contract}"
+            f"cpu_ref={self.cpu_reference} compile={self.compile_status} "
+            f"hardware={self.hardware_status} tolerance={self.tolerance} "
+            f"timed_window={self.timed_window_status} fallback={self.fallback} "
+            f"contract={self.tensor_contract}"
         )
 
 
@@ -55,7 +67,12 @@ def nonlinear_registry(config: Gemma3TextConfig | None = None) -> tuple[Gemma3No
             model_status="standalone-npu-reuse-candidate",
             implementation_path="programming_examples/weighted_rms_norm/weighted_rms_norm.py",
             compile_lit="programming_examples/weighted_rms_norm/run_makefile_peano.lit",
+            cpu_reference="gemma3_reference.rms_norm",
             tensor_contract=f"flatten [*, {config.emb_dim}] rows to weighted_rms_norm[M,N]",
+            compile_status="compile-lit-available",
+            hardware_status="pending-gemma-wrapper-hardware",
+            tolerance="cpu-shape-checksum-only",
+            timed_window_status="unmeasured-host-fallback",
             fallback="host CPU reference until Gemma launch wiring is validated",
             notes="Weighted RMSNorm math matches Gemma row RMSNorm.",
         ),
@@ -64,10 +81,15 @@ def nonlinear_registry(config: Gemma3TextConfig | None = None) -> tuple[Gemma3No
             model_status="standalone-npu-reuse-candidate",
             implementation_path="programming_examples/weighted_rms_norm/weighted_rms_norm.py",
             compile_lit="programming_examples/weighted_rms_norm/run_makefile_peano.lit",
+            cpu_reference="gemma3_reference.qk_norm",
             tensor_contract=(
                 f"flatten [tokens, heads, {config.head_dim}] to "
                 f"[tokens * heads, {config.head_dim}]"
             ),
+            compile_status="compile-lit-available",
+            hardware_status="pending-per-head-layout-hardware",
+            tolerance="cpu-shape-checksum-only",
+            timed_window_status="unmeasured-host-fallback",
             fallback="host CPU reference until per-head BO layout is validated",
             notes="Same RMS math, with per-head weights and no cross-head reduction.",
         ),
@@ -76,7 +98,12 @@ def nonlinear_registry(config: Gemma3TextConfig | None = None) -> tuple[Gemma3No
             model_status="kernel-source-reuse-candidate",
             implementation_path="programming_examples/llama32_1b/kernel_builder/rope_halfsplit.cc",
             compile_lit=None,
+            cpu_reference="gemma3_reference.apply_rope_halfsplit",
             tensor_contract=f"half-split LUT [cos..., sin...] over head_dim={config.head_dim}",
+            compile_status="source-only-no-gemma-air-wrapper",
+            hardware_status="pending-gemma-air-wrapper-hardware",
+            tolerance="identity-lut-cpu-checksum-only",
+            timed_window_status="unmeasured-host-fallback",
             fallback="host CPU reference until a Gemma AIR wrapper is added",
             notes="The standalone rope_sincos example is head_size=48/even-odd and is not used.",
         ),
@@ -85,7 +112,12 @@ def nonlinear_registry(config: Gemma3TextConfig | None = None) -> tuple[Gemma3No
             model_status="gemma-specific-compile-only-candidate",
             implementation_path="programming_examples/gemma3_dataflow_kernels/geglu.py",
             compile_lit="programming_examples/gemma3_dataflow_kernels/run_geglu_compile_only.lit",
+            cpu_reference="gemma3_reference.geglu",
             tensor_contract=f"GeGLU gate/up vectors of hidden_dim={config.hidden_dim}",
+            compile_status="compile-lit-available",
+            hardware_status="pending-hardware-validation",
+            tolerance="rtol=1e-1 atol=5e-2 planned-runner-tolerance",
+            timed_window_status="unmeasured-host-fallback",
             fallback="host CPU reference until hardware validation is recorded",
             notes="Existing ffn_swiglu uses SiLU, so Gemma GeGLU needs its own kernel.",
         ),
@@ -94,11 +126,20 @@ def nonlinear_registry(config: Gemma3TextConfig | None = None) -> tuple[Gemma3No
             model_status="host-fallback",
             implementation_path="programming_examples/llama32_1b/multi_launch_builder/o_ffn_multi.py",
             compile_lit=None,
+            cpu_reference="gemma3_reference residual add sites",
             tensor_contract=f"elementwise add over emb_dim={config.emb_dim}",
+            compile_status="not-promoted",
+            hardware_status="not-promoted",
+            tolerance="exact-bf16-cpu-contract",
+            timed_window_status="unmeasured-host-fallback",
             fallback="host CPU reference until fused layer builders are introduced",
             notes="Reuse the Llama multi-launch placement pattern, not its model math.",
         ),
     )
+
+
+def paper_match_blockers(config: Gemma3TextConfig | None = None) -> tuple[Gemma3NonlinearSpec, ...]:
+    return tuple(spec for spec in nonlinear_registry(config) if spec.blocks_paper_match)
 
 
 def validate_registry_paths(config: Gemma3TextConfig | None = None) -> None:
@@ -169,6 +210,10 @@ def _self_test() -> None:
     print(format_registry(config))
     for name, checksum in checksums.items():
         print(f"{name}_checksum={checksum:.6f}")
+    blockers = paper_match_blockers(config)
+    print(f"nonlinear_paper_gate=PAPER_MATCH_BLOCKED unresolved={len(blockers)}")
+    for blocker in blockers:
+        print(f"nonlinear_blocker operation={blocker.operation} timed_window={blocker.timed_window_status}")
     print("GEMMA3_NONLINEAR_REGISTRY_SELF_TEST: PASS")
 
 
