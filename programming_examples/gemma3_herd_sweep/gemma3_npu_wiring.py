@@ -20,6 +20,7 @@ from gemma3_artifacts import MODEL_SPECS
 from gemma3_kernel_parity import kernel_parity_targets
 from gemma3_nonlinears import nonlinear_registry
 from gemma3_npu_preflight import Gemma3NPUPreflightPlan, ProjectionPlan, build_preflight_plan
+from gemma3_static_preload import has_full_xrt_preload_evidence
 
 
 TEXT_STAGE_TEMPLATE = (
@@ -156,7 +157,11 @@ def _stage_status(
     return "host-fallback", ("model-stage-not-promoted",)
 
 
-def build_wiring_plan_from_preflight(preflight: Gemma3NPUPreflightPlan) -> Gemma3NPUWiringPlan:
+def build_wiring_plan_from_preflight(
+    preflight: Gemma3NPUPreflightPlan,
+    *,
+    use_static_preload_evidence: bool = False,
+) -> Gemma3NPUWiringPlan:
     if preflight.layers is None or preflight.hidden_size is None or preflight.head_dim is None:
         raise ValueError("preflight plan must include layer count, hidden size, and head dim")
     routes = _kernel_route_lookup()
@@ -188,11 +193,15 @@ def build_wiring_plan_from_preflight(preflight: Gemma3NPUPreflightPlan) -> Gemma
     blockers = [
         "model-kernel-launch-not-wired",
         "model-kernel-argument-binding-not-validated",
-        "full-static-weight-bo-preload-not-validated",
         "paper-shape-bo-allocation-not-validated",
         "nonlinear-model-stage-promotion-incomplete",
         "paper-shape-hardware-rerun-required",
     ]
+    if not (
+        use_static_preload_evidence
+        and has_full_xrt_preload_evidence(preflight.model_variant)
+    ):
+        blockers.insert(2, "full-static-weight-bo-preload-not-validated")
     if preflight.model_variant.endswith("vision"):
         blockers.append("vision-npu-path-not-implemented")
 
@@ -218,7 +227,8 @@ def build_wiring_plan(
     weights_dir: Path | None = None,
 ) -> Gemma3NPUWiringPlan:
     return build_wiring_plan_from_preflight(
-        build_preflight_plan(model_variant, weights_dir=weights_dir)
+        build_preflight_plan(model_variant, weights_dir=weights_dir),
+        use_static_preload_evidence=True,
     )
 
 

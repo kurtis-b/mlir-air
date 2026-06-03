@@ -28,6 +28,44 @@ from gemma3_artifacts import MODEL_SPECS, load_real_model_artifacts
 from gemma3_weight_plan import Gemma3ProjectionWeightRecord, build_weight_plan
 
 
+DEFAULT_STATIC_PRELOAD_EVIDENCE = Path(__file__).with_name("results") / "gemma3_static_preload_evidence.json"
+
+
+def load_static_preload_evidence(path: Path | None = None) -> list[dict[str, object]]:
+    path = path or DEFAULT_STATIC_PRELOAD_EVIDENCE
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and isinstance(data.get("results"), list):
+        return list(data["results"])
+    if isinstance(data, dict):
+        return [data]
+    if isinstance(data, list):
+        return list(data)
+    raise ValueError(f"unsupported static preload evidence format: {path}")
+
+
+def has_full_xrt_preload_evidence(model_variant: str, path: Path | None = None) -> bool:
+    for item in load_static_preload_evidence(path):
+        if item.get("model_variant") != model_variant:
+            continue
+        if item.get("status") != "FULL_XRT_PRELOAD_PASS" or not item.get("full_model"):
+            continue
+        tensor_count = int(item.get("tensor_count", -1))
+        planned_count = int(item.get("planned_tensor_count", -2))
+        requested = int(item.get("requested_bytes", -1))
+        serialized = int(item.get("serialized_bytes", -2))
+        written = int(item.get("xrt_written_bytes", -3))
+        blockers = item.get("blockers", [])
+        if (
+            tensor_count == planned_count
+            and requested == serialized == written
+            and not blockers
+        ):
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class Gemma3StaticPreloadRecord:
     layer_index: int
@@ -52,6 +90,8 @@ class Gemma3StaticPreloadRecord:
 class Gemma3StaticPreloadReport:
     model_variant: str
     status: str
+    full_model: bool
+    planned_tensor_count: int
     tensor_count: int
     requested_bytes: int
     serialized_bytes: int
@@ -64,6 +104,7 @@ class Gemma3StaticPreloadReport:
         blockers = ",".join(self.blockers) if self.blockers else "none"
         lines = [
             f"static_preload model={self.model_variant} status={self.status} "
+            f"full_model={self.full_model} planned_tensors={self.planned_tensor_count} "
             f"tensors={self.tensor_count} requested={self.requested_bytes} "
             f"serialized={self.serialized_bytes} xrt_written={self.xrt_written_bytes} "
             f"blockers={blockers}"
@@ -146,6 +187,7 @@ def build_static_preload_report(
     layer_index: int | None = 0,
     family: str | None = "q_proj",
     max_tensors: int = 1,
+    full_model: bool = False,
     xrt_smoke: bool = False,
     device_index: int = 0,
 ) -> Gemma3StaticPreloadReport:
@@ -154,6 +196,10 @@ def build_static_preload_report(
     start = perf_counter()
     inventory = load_real_model_artifacts(model_variant, weights_dir=weights_dir, strict=True)
     plan = build_weight_plan(model_variant, weights_dir=weights_dir)
+    if full_model:
+        layer_index = None
+        family = None
+        max_tensors = plan.tensor_count
     selected = _select_records(plan.records, layer_index=layer_index, family=family, max_tensors=max_tensors)
     if not selected:
         raise RuntimeError("no static projection records matched the preload filter")
@@ -196,10 +242,25 @@ def build_static_preload_report(
                 status=status,
             )
         )
-    blockers = ("full-static-weight-bo-preload-not-validated",)
+    complete = (
+        full_model
+        and len(records) == plan.tensor_count
+        and sum(record.serialized_bytes for record in records) == plan.static_bo_bytes
+    )
+    if complete and xrt_smoke and sum(record.xrt_written_bytes for record in records) == plan.static_bo_bytes:
+        status = "FULL_XRT_PRELOAD_PASS"
+        blockers: tuple[str, ...] = ()
+    elif complete:
+        status = "FULL_SERIALIZED_PASS"
+        blockers = ("full-static-weight-xrt-preload-not-validated",)
+    else:
+        status = "XRT_PRELOAD_SMOKE_PASS" if xrt_smoke else "SERIALIZED"
+        blockers = ("full-static-weight-bo-preload-not-validated",)
     return Gemma3StaticPreloadReport(
         model_variant=model_variant,
-        status="XRT_PRELOAD_SMOKE_PASS" if xrt_smoke else "SERIALIZED",
+        status=status,
+        full_model=full_model,
+        planned_tensor_count=plan.tensor_count,
         tensor_count=len(records),
         requested_bytes=sum(record.requested_bytes for record in records),
         serialized_bytes=sum(record.serialized_bytes for record in records),
@@ -221,6 +282,8 @@ def _self_test() -> None:
     report = Gemma3StaticPreloadReport(
         "gemma3-1b",
         "SERIALIZED",
+        False,
+        1,
         1,
         expected,
         len(payload),
@@ -229,7 +292,27 @@ def _self_test() -> None:
         ("full-static-weight-bo-preload-not-validated",),
         (record,),
     )
+    if has_full_xrt_preload_evidence("gemma3-missing-fixture", path=Path("/tmp/gemma3_missing_static_preload_evidence.json")):
+        raise AssertionError("unexpected missing evidence pass")
+    full_report = Gemma3StaticPreloadReport(
+        "gemma3-1b",
+        "FULL_XRT_PRELOAD_PASS",
+        True,
+        1,
+        1,
+        expected,
+        expected,
+        expected,
+        0.0,
+        (),
+        (record,),
+    )
+    tmp = Path("/tmp/gemma3_static_preload_self_test_evidence.json")
+    tmp.write_text(json.dumps({"results": [full_report.to_json_dict()]}, sort_keys=True), encoding="utf-8")
+    if not has_full_xrt_preload_evidence("gemma3-1b", path=tmp):
+        raise AssertionError("expected full preload evidence pass")
     print(report.format(include_records=True))
+    print("GEMMA3_STATIC_PRELOAD_EVIDENCE_SELF_TEST: PASS")
     print("GEMMA3_STATIC_PRELOAD_SELF_TEST: PASS")
 
 
@@ -241,6 +324,7 @@ def main() -> int:
     parser.add_argument("--layer-index", type=int, default=0)
     parser.add_argument("--family", choices=("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"), default="q_proj")
     parser.add_argument("--max-tensors", type=int, default=1)
+    parser.add_argument("--full-model", action="store_true")
     parser.add_argument("--xrt-smoke", action="store_true")
     parser.add_argument("--device-index", type=int, default=0)
     parser.add_argument("--include-records", action="store_true")
@@ -256,6 +340,7 @@ def main() -> int:
         layer_index=args.layer_index,
         family=args.family,
         max_tensors=args.max_tensors,
+        full_model=args.full_model,
         xrt_smoke=args.xrt_smoke,
         device_index=args.device_index,
     )

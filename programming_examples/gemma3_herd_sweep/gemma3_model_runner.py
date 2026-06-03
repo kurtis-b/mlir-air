@@ -29,6 +29,7 @@ from gemma3_weight_plan import (
     Gemma3WeightFamilySummary,
     build_weight_plan,
 )
+from gemma3_static_preload import has_full_xrt_preload_evidence
 from gemma3_xrt_runner import Gemma3XRTRunnerReport, allocate_smoke, dry_run_allocation_plan
 
 
@@ -204,6 +205,7 @@ def build_model_runner_plan_from_components(
     buffer_binding_plan: Gemma3BufferBindingPlan,
     bo_report: Gemma3XRTRunnerReport,
     max_static_tensors: int = 4,
+    static_preload_validated: bool = False,
 ) -> Gemma3ModelRunnerPlan:
     if max_static_tensors <= 0:
         raise ValueError("max_static_tensors must be positive")
@@ -229,6 +231,12 @@ def build_model_runner_plan_from_components(
         for index, step in enumerate(steps)
     ]
     blockers = list(MODEL_RUNNER_BLOCKERS)
+    if static_preload_validated:
+        blockers = [
+            blocker
+            for blocker in blockers
+            if blocker != "full-static-weight-bo-preload-not-validated"
+        ]
     if model_variant.endswith("vision"):
         blockers.append("vision-npu-path-not-implemented")
     return Gemma3ModelRunnerPlan(
@@ -282,7 +290,11 @@ def build_model_runner_plan(
         prompt_len=prompt_len,
         decode_context=decode_context,
     )
-    wiring = build_wiring_plan_from_preflight(preflight)
+    static_preload_validated = has_full_xrt_preload_evidence(model_variant)
+    wiring = build_wiring_plan_from_preflight(
+        preflight,
+        use_static_preload_evidence=static_preload_validated,
+    )
     buffer_binding_plan = build_buffer_binding_plan_from_components(
         model_variant=model_variant,
         bo_plan=bo_plan,
@@ -312,6 +324,7 @@ def build_model_runner_plan(
         buffer_binding_plan=buffer_binding_plan,
         bo_report=bo_report,
         max_static_tensors=max_static_tensors,
+        static_preload_validated=static_preload_validated,
     )
 
 
