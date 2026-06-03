@@ -90,6 +90,8 @@ Implemented files:
   byte estimates for future BO preloading.
 - `gemma3_bo_plan.py`: shape-only activation, KV-cache, intermediate, logits,
   and static-weight BO planning for future XRT allocation and binding.
+- `gemma3_xrt_runner.py`: capped `pyxrt` BO allocation/preload smoke runner
+  that exercises real XRT allocation without claiming full paper-shape runtime.
 
 Focused lit coverage:
 
@@ -105,6 +107,7 @@ Focused lit coverage:
 - `run_model_loop_npu_wiring.lit`
 - `run_model_loop_weight_plan.lit`
 - `run_model_loop_bo_plan.lit`
+- `run_model_loop_xrt_runner.lit`
 - `../gemma3_dataflow_kernels/run_geglu_compile_only.lit`
 
 Current phase status:
@@ -508,7 +511,7 @@ Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase F as `BLOCKED` because
   local 1B artifacts are available but the XRT model runner, static weight BO
-  preloading, XRT BO allocation/binding, nonlinear model-stage promotion, and
+  preloading, full paper-shape BO allocation validation, nonlinear model-stage promotion, and
   fresh paper-shape hardware reruns are not complete. The prior
   unmeasured-nonlinear fallback blocker is retired by measured CPU-reference
   fallback records, but those records are not NPU promotion evidence.
@@ -518,11 +521,14 @@ Blocked evidence:
   real projection padding and Q4NX block counts needed for NPU wiring.
   `gemma3_npu_wiring.py` maps each real-shape text layer into prefill/decode
   stage roles, NPU kernel candidates, host fallbacks, local/global attention
-  windows, and remaining runner blockers. `gemma3_weight_plan.py` records real text-stack
-  projection static BO byte estimates for future preloading. `gemma3_bo_plan.py`
-  records the activation, KV-cache, and intermediate BO shape/byte contract.
-  `gemma3_real_execution.py` also has a CPU/HF warmup/timed-iteration benchmark
-  path for small local smoke runs. No
+  windows, and remaining runner blockers. `gemma3_weight_plan.py` records real
+  text-stack projection static BO byte estimates for future preloading.
+  `gemma3_bo_plan.py` records the activation, KV-cache, and intermediate BO
+  shape/byte contract. `gemma3_xrt_runner.py` provides capped real-XRT BO
+  allocation/preload smoke coverage; a local 1B smoke run allocated 5,303,808
+  bytes and saved `/tmp/gemma3_1b_xrt_bo_smoke.json`. Full paper-shape BO
+  allocation remains a validation blocker. `gemma3_real_execution.py` also has
+  a CPU/HF warmup/timed-iteration benchmark path for small local smoke runs. No
   CPU/iGPU/NPU paper baseline or speedup claim is emitted until benchmark-length
   execution and NPU model execution are implemented.
 
@@ -551,7 +557,7 @@ Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase G as `BLOCKED` because
   local 4B artifacts are available but the XRT model runner, static weight BO
-  preloading, XRT BO allocation/binding, nonlinear model-stage promotion, and
+  preloading, full paper-shape BO allocation validation, nonlinear model-stage promotion, and
   fresh paper-shape hardware reruns are not complete. Measured host fallback
   records account for timing metadata but do not replace nonlinear NPU
   validation.
@@ -584,7 +590,7 @@ Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase H as `BLOCKED` because
   local 4B vision artifacts and processor files are available but the XRT model
-  runner, static weight BO preloading, XRT BO allocation/binding, nonlinear
+  runner, static weight BO preloading, full paper-shape BO allocation validation, nonlinear
   model-stage promotion, fresh paper-shape hardware reruns, and the vision NPU
   path are not complete. Measured host fallback records account for text
   nonlinear timing metadata but do not validate vision hardware.
@@ -681,6 +687,9 @@ Implemented evidence and blocker:
   and records command, git/environment metadata, artifact inventory, execution
   wiring blockers when real NPU artifacts are present, nonlinear host fallbacks,
   null power fields, and explicit blocked classification.
+- `gemma3_xrt_runner.py` can save capped BO allocation/preload smoke JSON so
+  future paper-result records can distinguish BO allocation limits from kernel
+  launch or validation failures.
 - `gemma3_paper_compare.py --compare` accepts either a single result cell or a
   wrapper with `results`, and can emit Markdown and CSV summaries.
 - `run_model_loop_results.lit` covers blocked real-artifact result generation,

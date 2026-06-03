@@ -1,0 +1,7 @@
+# RUN: %PYTHON %S/gemma3_xrt_runner.py --self-test | FileCheck %s
+# CHECK: xrt_runner model=gemma3-1b status=DRY_RUN device=-1 prompt_len=16 decode_context=16
+# CHECK-SAME: allocations=2 skipped=1 blockers=xrt-hardware-not-touched
+# CHECK: xrt_bo name=static_projection_weights requested=4096 allocated=4096 status=PLANNED_FULL static=True
+# CHECK: xrt_bo name=layer_input requested=2048 allocated=2048 status=PLANNED_FULL static=False
+# CHECK: xrt_bo name=kv_cache_k requested=4096 allocated=0 status=SKIPPED_TOTAL_CAP static=False
+# CHECK: GEMMA3_XRT_RUNNER_SELF_TEST: PASS
