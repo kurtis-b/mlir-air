@@ -19,8 +19,52 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-from gemma3_artifacts import MODEL_SPECS
+from gemma3_artifacts import MODEL_SPECS, model_spec
 from gemma3_bo_plan import Gemma3BOPlan, Gemma3BORecord, build_bo_plan
+
+
+DEFAULT_BO_ALLOCATION_EVIDENCE = Path(__file__).with_name("results") / "gemma3_bo_allocation_evidence.json"
+
+
+def load_bo_allocation_evidence(path: Path | None = None) -> list[dict[str, object]]:
+    path = path or DEFAULT_BO_ALLOCATION_EVIDENCE
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and "model_variant" in data:
+        return [data]
+    if isinstance(data, dict) and isinstance(data.get("results"), list):
+        return list(data["results"])
+    if isinstance(data, dict):
+        return [data]
+    if isinstance(data, list):
+        return list(data)
+    raise ValueError(f"unsupported BO allocation evidence format: {path}")
+
+
+def has_paper_shape_bo_allocation_evidence(model_variant: str, path: Path | None = None) -> bool:
+    spec = model_spec(model_variant)
+    prompt_len = max(spec.prefill_lengths)
+    decode_context = spec.max_decode_context
+    for item in load_bo_allocation_evidence(path):
+        if item.get("model_variant") != model_variant:
+            continue
+        if item.get("status") != "FULL_ALLOCATE_PASS":
+            continue
+        if int(item.get("prompt_len", -1)) != prompt_len:
+            continue
+        if int(item.get("decode_context", -1)) != decode_context:
+            continue
+        requested = int(item.get("requested_bytes", -1))
+        allocated = int(item.get("allocated_bytes", -2))
+        if requested != allocated:
+            continue
+        if int(item.get("skipped_count", -1)) != 0:
+            continue
+        if item.get("blockers", []):
+            continue
+        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -166,12 +210,23 @@ def allocate_smoke(
             )
         )
     elapsed = perf_counter() - start
-    blockers = ["paper-shape-bo-allocation-not-validated"]
-    if any(result.status == "ALLOCATED_TRUNCATED" for result in results):
-        blockers.append("allocation-cap-truncated")
+    full_allocation = (
+        allocated_total == plan.total_bytes
+        and all(result.status == "ALLOCATED_FULL" for result in results)
+        and not any(result.allocated_bytes == 0 for result in results)
+    )
+    if full_allocation:
+        status = "FULL_ALLOCATE_PASS"
+        blockers: tuple[str, ...] = ()
+    else:
+        status = "ALLOCATE_SMOKE_PASS"
+        blocker_list = ["paper-shape-bo-allocation-not-validated"]
+        if any(result.status == "ALLOCATED_TRUNCATED" for result in results):
+            blocker_list.append("allocation-cap-truncated")
+        blockers = tuple(blocker_list)
     return Gemma3XRTRunnerReport(
         model_variant=plan.model_variant,
-        status="ALLOCATE_SMOKE_PASS",
+        status=status,
         device_index=device_index,
         prompt_len=plan.prompt_len,
         decode_context=plan.decode_context,
@@ -182,7 +237,7 @@ def allocate_smoke(
         allocation_count=sum(result.allocated_bytes > 0 for result in results),
         skipped_count=sum(result.allocated_bytes == 0 for result in results),
         elapsed_seconds=elapsed,
-        blockers=tuple(blockers),
+        blockers=blockers,
         results=tuple(results),
     )
 
@@ -208,6 +263,8 @@ def _self_test() -> None:
     report = dry_run_allocation_plan(plan, max_total_bytes=6144, max_bo_bytes=4096)
     if report.allocation_count != 2 or report.skipped_count != 1:
         raise AssertionError(report)
+    if has_paper_shape_bo_allocation_evidence("gemma3-1b", path=Path("/tmp/gemma3_missing_bo_evidence.json")):
+        raise AssertionError("unexpected missing BO evidence pass")
     print(report.format(include_records=True))
     print("GEMMA3_XRT_RUNNER_SELF_TEST: PASS")
 

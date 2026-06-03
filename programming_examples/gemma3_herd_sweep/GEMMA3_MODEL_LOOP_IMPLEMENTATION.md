@@ -90,8 +90,9 @@ Implemented files:
   byte estimates for future BO preloading.
 - `gemma3_bo_plan.py`: shape-only activation, KV-cache, intermediate, logits,
   and static-weight BO planning for future XRT allocation and binding.
-- `gemma3_xrt_runner.py`: capped `pyxrt` BO allocation/preload smoke runner
-  that exercises real XRT allocation without claiming full paper-shape runtime.
+- `gemma3_xrt_runner.py`: capped and full-plan `pyxrt` BO allocation/preload
+  smoke runner that exercises real XRT allocation without claiming kernel
+  execution or paper-shape runtime.
 - `gemma3_static_preload.py`: real safetensor-to-Q4NX serialization and XRT BO
   preload smoke for selected projection tensors, plus full-model evidence
   recognition when every planned projection tensor is serialized and written.
@@ -523,8 +524,9 @@ Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase F as `BLOCKED` because
   local 1B artifacts are available but model-kernel launch, kernel argument
-  binding, full paper-shape BO allocation validation, nonlinear model-stage
-  promotion, and fresh paper-shape hardware reruns are not complete. Full contiguous static-weight BO preload validation is complete for 1B, 4B text, and the 4B vision text stack. The prior
+  binding, nonlinear model-stage promotion, and fresh paper-shape hardware
+  reruns are not complete. Full paper-shape BO allocation validation is
+  complete for 1B only. Full contiguous static-weight BO preload validation is complete for 1B, 4B text, and the 4B vision text stack. The prior
   unmeasured-nonlinear fallback blocker is retired by measured CPU-reference
   fallback records, but those records are not NPU promotion evidence.
 - Dependency-light CPU/HF smoke paths now validate local 1B text, 4B text,
@@ -550,8 +552,10 @@ Blocked evidence:
   one static BO, totaling 2,005,401,600 bytes, and updated the same evidence
   ledger; a full local 4B-vision text-stack contiguous static-preload XRT smoke wrote all
   238 planned text projection tensors into one static BO, totaling
-  2,005,401,600 bytes, and updated the same evidence ledger. Full paper-shape
-  BO allocation remains a validation blocker. `gemma3_real_execution.py` also has
+  2,005,401,600 bytes, and updated the same evidence ledger. A full local 1B paper-shape BO allocation smoke allocated all 18 planned BOs
+  for prompt 32k/decode 32k, totaling 2,724,593,152 bytes, and saved
+  `results/gemma3_bo_allocation_evidence.json`; 4B and vision paper-shape BO
+  allocation remain validation blockers. `gemma3_real_execution.py` also has
   a CPU/HF warmup/timed-iteration benchmark path for small local smoke runs. No
   CPU/iGPU/NPU paper baseline or speedup claim is emitted until benchmark-length
   execution and NPU model execution are implemented.
@@ -581,8 +585,9 @@ Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase G as `BLOCKED` because
   local 4B artifacts are available but model-kernel launch, kernel argument
-  binding, full paper-shape BO allocation validation, nonlinear model-stage
-  promotion, and fresh paper-shape hardware reruns are not complete. Measured host fallback
+  binding, nonlinear model-stage promotion, and fresh paper-shape hardware
+  reruns are not complete. Full paper-shape BO allocation validation is
+  complete for 1B only. Measured host fallback
   records account for timing metadata but do not replace nonlinear NPU
   validation.
 - `gemma3_npu_wiring.py` emits the 4B text per-layer NPU candidate and host
@@ -711,9 +716,10 @@ Implemented evidence and blocker:
   and records command, git/environment metadata, artifact inventory, execution
   wiring blockers when real NPU artifacts are present, nonlinear host fallbacks,
   null power fields, and explicit blocked classification.
-- `gemma3_xrt_runner.py` can save capped BO allocation/preload smoke JSON so
-  future paper-result records can distinguish BO allocation limits from kernel
-  launch or validation failures.
+- `gemma3_xrt_runner.py` can save capped and full-plan BO allocation/preload
+  smoke JSON so future paper-result records can distinguish BO allocation
+  limits from kernel launch or validation failures. `gemma3-1b` now has
+  committed full paper-shape BO allocation evidence for 32k prefill/decode.
 - `gemma3_static_preload.py` can save real Q4NX static-weight preload smoke JSON
   so future model-runner failures can distinguish serialization/preload from
   kernel binding and execution failures. `gemma3-1b`, `gemma3-4b`, and the `gemma3-4b-vision` text stack now have

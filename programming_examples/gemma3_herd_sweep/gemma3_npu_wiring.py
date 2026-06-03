@@ -21,6 +21,7 @@ from gemma3_kernel_parity import kernel_parity_targets
 from gemma3_nonlinears import nonlinear_registry
 from gemma3_npu_preflight import Gemma3NPUPreflightPlan, ProjectionPlan, build_preflight_plan
 from gemma3_static_preload import has_full_xrt_preload_evidence
+from gemma3_xrt_runner import has_paper_shape_bo_allocation_evidence
 
 
 TEXT_STAGE_TEMPLATE = (
@@ -161,6 +162,7 @@ def build_wiring_plan_from_preflight(
     preflight: Gemma3NPUPreflightPlan,
     *,
     use_static_preload_evidence: bool = False,
+    use_bo_allocation_evidence: bool = False,
 ) -> Gemma3NPUWiringPlan:
     if preflight.layers is None or preflight.hidden_size is None or preflight.head_dim is None:
         raise ValueError("preflight plan must include layer count, hidden size, and head dim")
@@ -193,15 +195,23 @@ def build_wiring_plan_from_preflight(
     blockers = [
         "model-kernel-launch-not-wired",
         "model-kernel-argument-binding-not-validated",
-        "paper-shape-bo-allocation-not-validated",
-        "nonlinear-model-stage-promotion-incomplete",
-        "paper-shape-hardware-rerun-required",
     ]
     if not (
         use_static_preload_evidence
         and has_full_xrt_preload_evidence(preflight.model_variant)
     ):
-        blockers.insert(2, "full-static-weight-bo-preload-not-validated")
+        blockers.append("full-static-weight-bo-preload-not-validated")
+    if not (
+        use_bo_allocation_evidence
+        and has_paper_shape_bo_allocation_evidence(preflight.model_variant)
+    ):
+        blockers.append("paper-shape-bo-allocation-not-validated")
+    blockers.extend(
+        [
+            "nonlinear-model-stage-promotion-incomplete",
+            "paper-shape-hardware-rerun-required",
+        ]
+    )
     if preflight.model_variant.endswith("vision"):
         blockers.append("vision-npu-path-not-implemented")
 
@@ -229,6 +239,7 @@ def build_wiring_plan(
     return build_wiring_plan_from_preflight(
         build_preflight_plan(model_variant, weights_dir=weights_dir),
         use_static_preload_evidence=True,
+        use_bo_allocation_evidence=True,
     )
 
 

@@ -1,0 +1,183 @@
+{
+  "results": [
+    {
+      "allocated_bytes": 2724593152,
+      "allocation_count": 18,
+      "blockers": [],
+      "decode_context": 32768,
+      "device_index": 0,
+      "elapsed_seconds": 14.350619739969261,
+      "max_bo_bytes": 3000000000,
+      "max_total_bytes": 3000000000,
+      "model_variant": "gemma3-1b",
+      "prompt_len": 32768,
+      "requested_bytes": 2724593152,
+      "results": [
+        {
+          "allocated_bytes": 468049920,
+          "name": "static_projection_weights",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "deterministic-pattern",
+          "requested_bytes": 468049920,
+          "static": true,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 75497472,
+          "name": "token_embeddings",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 75497472,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 75497472,
+          "name": "layer_input",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 75497472,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 75497472,
+          "name": "layer_output",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 75497472,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 2304,
+          "name": "decode_token_state",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 2304,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 67108864,
+          "name": "prefill_q",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 67108864,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 16777216,
+          "name": "prefill_k",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 16777216,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 16777216,
+          "name": "prefill_v",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 16777216,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 75497472,
+          "name": "prefill_attention_out",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 75497472,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 452984832,
+          "name": "mlp_gate",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 452984832,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 452984832,
+          "name": "mlp_up",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 452984832,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 75497472,
+          "name": "mlp_down",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 75497472,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 2048,
+          "name": "decode_q",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 2048,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 512,
+          "name": "decode_k",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 512,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 512,
+          "name": "decode_v",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 512,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 2304,
+          "name": "decode_attention_out",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 2304,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 436207616,
+          "name": "kv_cache_k",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 436207616,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 436207616,
+          "name": "kv_cache_v",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 436207616,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        }
+      ],
+      "skipped_count": 0,
+      "status": "FULL_ALLOCATE_PASS"
+    }
+  ]
+}
