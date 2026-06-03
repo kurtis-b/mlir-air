@@ -15,7 +15,7 @@ import argparse
 from pathlib import Path
 
 from gemma3_config import describe_kernel_sequence, synthetic_text_config
-from gemma3_decode import run_synthetic_text_loop
+from gemma3_model_loop import Gemma3SyntheticSession
 from gemma3_runtime import format_manifest, prepare_runtime
 
 
@@ -27,10 +27,18 @@ def main() -> int:
     mode.add_argument("--print-sequence", action="store_true")
     parser.add_argument("--cache-dir", type=Path, default=Path("gemma3_kernel_cache"))
     parser.add_argument("--verify", action="store_true")
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--include-stages", action="store_true")
     parser.add_argument("--layers", type=int, default=2)
+    parser.add_argument("--local-window-len", type=int, default=None)
+    parser.add_argument("--prefill-chunks", type=int, default=2)
+    parser.add_argument("--decode-tokens", type=int, default=2)
     args = parser.parse_args()
 
-    config = synthetic_text_config(n_layers=args.layers)
+    config_kwargs = {"n_layers": args.layers}
+    if args.local_window_len is not None:
+        config_kwargs["local_window_len"] = args.local_window_len
+    config = synthetic_text_config(**config_kwargs)
 
     if args.print_sequence:
         print(describe_kernel_sequence(config))
@@ -46,8 +54,13 @@ def main() -> int:
     print(format_manifest(manifest))
     print("GEMMA3_RUNTIME_RUN_ONLY: manifest loaded")
     if args.verify:
-        report = run_synthetic_text_loop(config, manifest=manifest)
-        print(report.format())
+        session = Gemma3SyntheticSession(config=config, manifest=manifest, profile=args.profile)
+        report = session.run(
+            prefill_chunks=args.prefill_chunks,
+            decode_tokens=args.decode_tokens,
+            include_stages=args.include_stages,
+        )
+        print(report.format(profile=args.profile, include_stages=args.include_stages))
         print("GEMMA3_SYNTHETIC_VERIFY: PASS")
     else:
         print("GEMMA3_NPU_EXECUTION: not implemented; use --verify for CPU reference")
