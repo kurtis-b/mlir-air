@@ -2,10 +2,11 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""Real Gemma3 execution smoke helpers.
+"""Real Gemma3 execution smoke and CPU benchmark helpers.
 
 This module is deliberately CPU/HF oriented. It proves that local real Gemma3
-artifacts can execute without importing AIR or claiming NPU paper parity.
+artifacts can execute without importing AIR and can produce baseline timing
+records without claiming NPU paper parity.
 """
 
 from __future__ import annotations
@@ -56,6 +57,37 @@ class Gemma3RealExecutionReport:
         )
 
 
+@dataclass(frozen=True)
+class Gemma3RealBenchmarkReport:
+    model_variant: str
+    backend: str
+    status: str
+    metric: str
+    weights_dir: str | None
+    prompt_token_count: int
+    decode_tokens: int
+    warmup_iters: int
+    timed_iters: int
+    local_value: float
+    unit: str
+    load_seconds: float
+    mean_seconds: float
+    logits_shape: tuple[int, ...]
+    notes: tuple[str, ...] = ()
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def format(self) -> str:
+        shape = "x".join(str(dim) for dim in self.logits_shape) if self.logits_shape else "none"
+        return (
+            f"real_benchmark model={self.model_variant} backend={self.backend} "
+            f"status={self.status} metric={self.metric} tokens={self.prompt_token_count} "
+            f"decode_tokens={self.decode_tokens} local={self.local_value:.6f} "
+            f"unit={self.unit} mean_s={self.mean_seconds:.6f} logits_shape={shape}"
+        )
+
+
 def _trim_inputs(inputs: Any, max_prompt_tokens: int) -> Any:
     if max_prompt_tokens <= 0:
         raise ValueError("max_prompt_tokens must be positive")
@@ -67,14 +99,14 @@ def _trim_inputs(inputs: Any, max_prompt_tokens: int) -> Any:
     return inputs
 
 
-def run_cpu_smoke(
+def _load_cpu_model_inputs(
     *,
     model_variant: str,
-    weights_dir: Path | None = None,
-    prompt: str = "Gemma3 paper reproduction smoke.",
-    max_prompt_tokens: int = 16,
-    vision_smoke: bool = False,
-) -> Gemma3RealExecutionReport:
+    weights_dir: Path | None,
+    prompt: str,
+    max_prompt_tokens: int,
+    vision_smoke: bool,
+) -> tuple[Any, Any, Any, Any, Any, float]:
     try:
         import torch
     except Exception as exc:
@@ -126,7 +158,29 @@ def run_cpu_smoke(
             inputs = processor(text=prompt, return_tensors="pt")
             inputs = _trim_inputs(inputs, max_prompt_tokens)
     model.eval()
-    load_seconds = perf_counter() - load_start
+    return inventory, model, tokenizer, processor, inputs, perf_counter() - load_start
+
+
+def run_cpu_smoke(
+    *,
+    model_variant: str,
+    weights_dir: Path | None = None,
+    prompt: str = "Gemma3 paper reproduction smoke.",
+    max_prompt_tokens: int = 16,
+    vision_smoke: bool = False,
+) -> Gemma3RealExecutionReport:
+    try:
+        import torch
+    except Exception as exc:
+        raise Gemma3ExecutionError("python:torch is required") from exc
+
+    inventory, model, tokenizer, processor, inputs, load_seconds = _load_cpu_model_inputs(
+        model_variant=model_variant,
+        weights_dir=weights_dir,
+        prompt=prompt,
+        max_prompt_tokens=max_prompt_tokens,
+        vision_smoke=vision_smoke,
+    )
 
     prompt_token_count = int(inputs["input_ids"].shape[-1])
     pixel_values = inputs.get("pixel_values") if hasattr(inputs, "get") else None
@@ -159,6 +213,87 @@ def run_cpu_smoke(
     )
 
 
+def run_cpu_benchmark(
+    *,
+    model_variant: str,
+    weights_dir: Path | None = None,
+    prompt: str = "Gemma3 paper reproduction benchmark.",
+    max_prompt_tokens: int = 16,
+    metric: str = "prefill_ttft_seconds",
+    decode_tokens: int = 1,
+    warmup_iters: int = 0,
+    timed_iters: int = 1,
+    vision_smoke: bool = False,
+) -> Gemma3RealBenchmarkReport:
+    if metric not in ("prefill_ttft_seconds", "decode_tps", "vision_ttft_seconds"):
+        raise ValueError("metric must be prefill_ttft_seconds, decode_tps, or vision_ttft_seconds")
+    if timed_iters <= 0 or warmup_iters < 0:
+        raise ValueError("timed_iters must be positive and warmup_iters must be non-negative")
+    if metric == "decode_tps" and decode_tokens <= 0:
+        raise ValueError("decode_tps requires positive decode_tokens")
+    try:
+        import torch
+    except Exception as exc:
+        raise Gemma3ExecutionError("python:torch is required") from exc
+
+    inventory, model, _tokenizer, _processor, inputs, load_seconds = _load_cpu_model_inputs(
+        model_variant=model_variant,
+        weights_dir=weights_dir,
+        prompt=prompt,
+        max_prompt_tokens=max_prompt_tokens,
+        vision_smoke=vision_smoke or metric == "vision_ttft_seconds",
+    )
+    prompt_token_count = int(inputs["input_ids"].shape[-1])
+
+    def run_once() -> Any:
+        if metric == "decode_tps":
+            return model.generate(
+                **inputs,
+                max_new_tokens=decode_tokens,
+                do_sample=False,
+                use_cache=True,
+            )
+        return model(**inputs)
+
+    with torch.no_grad():
+        for _ in range(warmup_iters):
+            run_once()
+        elapsed = 0.0
+        output = None
+        for _ in range(timed_iters):
+            start = perf_counter()
+            output = run_once()
+            elapsed += perf_counter() - start
+    mean_seconds = elapsed / float(timed_iters)
+
+    if metric == "decode_tps":
+        local_value = float(decode_tokens) / mean_seconds if mean_seconds else 0.0
+        unit = "tokens_per_second"
+        logits_shape: tuple[int, ...] = ()
+    else:
+        local_value = mean_seconds
+        unit = "seconds"
+        logits_shape = tuple(int(dim) for dim in output.logits.shape)
+
+    return Gemma3RealBenchmarkReport(
+        model_variant=model_variant,
+        backend="cpu-hf",
+        status="PASS",
+        metric=metric,
+        weights_dir=inventory.weights_dir,
+        prompt_token_count=prompt_token_count,
+        decode_tokens=decode_tokens if metric == "decode_tps" else 0,
+        warmup_iters=warmup_iters,
+        timed_iters=timed_iters,
+        local_value=local_value,
+        unit=unit,
+        load_seconds=load_seconds,
+        mean_seconds=mean_seconds,
+        logits_shape=logits_shape,
+        notes=("not paper-comparable until full sequence/backend matrix is run",),
+    )
+
+
 def _self_test() -> None:
     report = Gemma3RealExecutionReport(
         model_variant="gemma3-1b",
@@ -179,18 +314,49 @@ def _self_test() -> None:
     )
     if report.to_json_dict()["status"] != "PASS":
         raise AssertionError(report)
+    benchmark = Gemma3RealBenchmarkReport(
+        model_variant="gemma3-1b",
+        backend="cpu-hf",
+        status="PASS",
+        metric="prefill_ttft_seconds",
+        weights_dir="/tmp/gemma",
+        prompt_token_count=4,
+        decode_tokens=0,
+        warmup_iters=0,
+        timed_iters=1,
+        local_value=0.2,
+        unit="seconds",
+        load_seconds=0.1,
+        mean_seconds=0.2,
+        logits_shape=(1, 4, 8),
+        notes=("fixture",),
+    )
     print(report.format())
+    print(benchmark.format())
     print("GEMMA3_REAL_EXECUTION_SELF_TEST: PASS")
 
 
+def _write_json(path: Path, report: Gemma3RealExecutionReport | Gemma3RealBenchmarkReport) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(report.to_json_dict(), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Gemma3 real execution smoke helper")
+    parser = argparse.ArgumentParser(description="Gemma3 real execution smoke and CPU benchmark helper")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--cpu-smoke", action="store_true")
+    parser.add_argument("--cpu-benchmark", action="store_true")
     parser.add_argument("--model-variant", choices=sorted(MODEL_SPECS), default="gemma3-1b")
     parser.add_argument("--weights-dir", type=Path)
     parser.add_argument("--prompt", default="Gemma3 paper reproduction smoke.")
     parser.add_argument("--max-prompt-tokens", type=int, default=16)
+    parser.add_argument("--metric", choices=["prefill_ttft_seconds", "decode_tps", "vision_ttft_seconds"], default="prefill_ttft_seconds")
+    parser.add_argument("--decode-tokens", type=int, default=1)
+    parser.add_argument("--warmup-iters", type=int, default=0)
+    parser.add_argument("--timed-iters", type=int, default=1)
     parser.add_argument("--vision-smoke", action="store_true")
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
@@ -212,14 +378,31 @@ def main() -> int:
             return 2
         print(report.format())
         if args.json:
-            args.json.parent.mkdir(parents=True, exist_ok=True)
-            args.json.write_text(
-                json.dumps(report.to_json_dict(), indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
+            _write_json(args.json, report)
             print(f"GEMMA3_REAL_EXECUTION_JSON: {args.json}")
         return 0
-    parser.error("one of --self-test or --cpu-smoke is required")
+    if args.cpu_benchmark:
+        try:
+            report = run_cpu_benchmark(
+                model_variant=args.model_variant,
+                weights_dir=args.weights_dir,
+                prompt=args.prompt,
+                max_prompt_tokens=args.max_prompt_tokens,
+                metric=args.metric,
+                decode_tokens=args.decode_tokens,
+                warmup_iters=args.warmup_iters,
+                timed_iters=args.timed_iters,
+                vision_smoke=args.vision_smoke,
+            )
+        except (Gemma3ExecutionError, ValueError) as exc:
+            print(f"GEMMA3_REAL_BENCHMARK_BLOCKED: {exc}")
+            return 2
+        print(report.format())
+        if args.json:
+            _write_json(args.json, report)
+            print(f"GEMMA3_REAL_BENCHMARK_JSON: {args.json}")
+        return 0
+    parser.error("one of --self-test, --cpu-smoke, or --cpu-benchmark is required")
 
 
 if __name__ == "__main__":

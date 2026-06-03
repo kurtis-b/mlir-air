@@ -74,10 +74,10 @@ Implemented files:
 - `gemma3_inference.py`: Llama32-style entrypoint with compile-only, run-only,
   verify, profile, layer-count, prompt-chunk, decode-token, local-window, and
   stage-log controls.
-- `gemma3_real_execution.py`: CPU/HF real-artifact smoke path for the 1B,
-  4B text, and 4B synthetic-image model paths, proving local weights,
-  tokenizer, and processor can execute without AIR imports while making no
-  paper timing claim.
+- `gemma3_real_execution.py`: CPU/HF real-artifact smoke and small benchmark
+  paths for the 1B, 4B text, and 4B synthetic-image model paths, proving local
+  weights, tokenizer, and processor can execute without AIR imports while
+  making no paper timing claim.
 - `gemma3_npu_preflight.py`: real-shape NPU preflight planner that derives
   projection padding, Q4NX block counts, attention metadata, and the remaining
   NPU execution blocker from local artifacts.
@@ -504,9 +504,10 @@ Blocked evidence:
   real projection padding and Q4NX block counts needed for NPU wiring.
   `gemma3_npu_wiring.py` maps each real-shape text layer into prefill/decode
   stage roles, NPU kernel candidates, host fallbacks, local/global attention
-  windows, and remaining runner blockers. No CPU/iGPU/NPU paper baseline or
-  speedup claim is emitted until benchmark-length execution and NPU model
-  execution are implemented.
+  windows, and remaining runner blockers. `gemma3_real_execution.py` also has a
+  CPU/HF warmup/timed-iteration benchmark path for small local smoke runs. No
+  CPU/iGPU/NPU paper baseline or speedup claim is emitted until benchmark-length
+  execution and NPU model execution are implemented.
 
 ### Phase G: end-to-end 4B text reproduction
 

@@ -1,4 +1,6 @@
 # RUN: %PYTHON %S/gemma3_real_execution.py --self-test | FileCheck %s
 # CHECK: real_execution model=gemma3-1b backend=cpu-hf status=PASS
 # CHECK-SAME: model_class=Gemma3ForCausalLM
+# CHECK: real_benchmark model=gemma3-1b backend=cpu-hf status=PASS metric=prefill_ttft_seconds
+# CHECK-SAME: unit=seconds
 # CHECK: GEMMA3_REAL_EXECUTION_SELF_TEST: PASS
