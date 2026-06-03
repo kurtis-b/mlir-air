@@ -70,6 +70,10 @@ def _buffer_policy(kernel: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
         return ("norm_weight",), ("normalized",)
     if kernel == "rope":
         return ("rope_lut",), ("roped",)
+    if kernel == "mlp_activation":
+        return tuple(), ("activated",)
+    if kernel == "residual_add":
+        return tuple(), ("residual",)
     return tuple(), tuple()
 
 

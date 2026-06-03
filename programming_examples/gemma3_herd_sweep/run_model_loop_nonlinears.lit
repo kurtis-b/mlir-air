@@ -1,0 +1,7 @@
+# RUN: %PYTHON %S/gemma3_nonlinears.py | FileCheck %s
+# CHECK: nonlinear rms_norm status=standalone-npu-reuse-candidate
+# CHECK: nonlinear qk_norm status=standalone-npu-reuse-candidate
+# CHECK: nonlinear rope status=kernel-source-reuse-candidate
+# CHECK: nonlinear mlp_activation status=gemma-specific-compile-only-candidate
+# CHECK: nonlinear residual_add status=host-fallback
+# CHECK: GEMMA3_NONLINEAR_REGISTRY_SELF_TEST: PASS

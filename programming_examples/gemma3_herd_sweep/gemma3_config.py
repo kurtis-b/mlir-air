@@ -147,11 +147,15 @@ class Gemma3TextConfig:
                     Gemma3KernelStep("prefill", layer.layer_index, "rope", "n/a", "host-fallback", "rope candidate"),
                     Gemma3KernelStep("prefill", layer.layer_index, "qk_norm", "n/a", "host-fallback", "Gemma-specific candidate"),
                     Gemma3KernelStep("prefill", layer.layer_index, "flowqkv", modes["flowqkv"], "npu"),
+                    Gemma3KernelStep("prefill", layer.layer_index, "residual_add", "n/a", "host-fallback", "Llama multi-launch pattern candidate"),
+                    Gemma3KernelStep("prefill", layer.layer_index, "mlp_activation", "n/a", "host-fallback", "gemma3_dataflow_kernels/geglu candidate"),
                     Gemma3KernelStep("decode", layer.layer_index, "fused_dqp", modes["fused_dqp"], "npu"),
                     Gemma3KernelStep("decode", layer.layer_index, "rms_norm", "n/a", "host-fallback", "weighted_rms_norm candidate"),
                     Gemma3KernelStep("decode", layer.layer_index, "rope", "n/a", "host-fallback", "rope candidate"),
                     Gemma3KernelStep("decode", layer.layer_index, "qk_norm", "n/a", "host-fallback", "Gemma-specific candidate"),
                     Gemma3KernelStep("decode", layer.layer_index, "flowkv", modes["flowkv"], "npu"),
+                    Gemma3KernelStep("decode", layer.layer_index, "residual_add", "n/a", "host-fallback", "Llama multi-launch pattern candidate"),
+                    Gemma3KernelStep("decode", layer.layer_index, "mlp_activation", "n/a", "host-fallback", "gemma3_dataflow_kernels/geglu candidate"),
                 ]
             )
         return tuple(steps)
