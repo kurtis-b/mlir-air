@@ -657,8 +657,9 @@ Implemented evidence and blocker:
   timed iterations, result JSON, paper comparison, power sampling, trace size,
   and debug-IR intent.
 - `gemma3_results.py` writes one result JSON cell for the requested paper target
-  and records command, git/environment metadata, artifact inventory, nonlinear
-  host fallbacks, null power fields, and explicit blocked classification.
+  and records command, git/environment metadata, artifact inventory, execution
+  wiring blockers when real NPU artifacts are present, nonlinear host fallbacks,
+  null power fields, and explicit blocked classification.
 - `gemma3_paper_compare.py --compare` accepts either a single result cell or a
   wrapper with `results`, and can emit Markdown and CSV summaries.
 - `run_model_loop_results.lit` covers blocked real-artifact result generation,

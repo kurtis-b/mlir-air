@@ -77,6 +77,8 @@ def main() -> int:
         print(format_result(result))
         if result["classification"] == "MISSING_REAL_ARTIFACTS":
             print("GEMMA3_PAPER_BENCHMARK_BLOCKED: missing_real_artifacts")
+        if result["classification"] == "REAL_MODEL_EXECUTION_NOT_IMPLEMENTED":
+            print("GEMMA3_PAPER_BENCHMARK_BLOCKED: real_model_execution_not_implemented")
         if args.result_json:
             write_result_json(result, args.result_json)
             print(f"GEMMA3_RESULT_JSON: {args.result_json}")

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import shlex
+from types import SimpleNamespace
 import sys
 from pathlib import Path
 from typing import Any
@@ -84,6 +85,46 @@ def missing_artifact_notes(inventory: Any) -> list[str]:
     return notes
 
 
+def execution_wiring_record_from_plan(plan: Any) -> dict[str, Any]:
+    return {
+        "status": plan.status,
+        "layers": plan.layers,
+        "stage_count": plan.stage_count,
+        "npu_candidate_count": plan.npu_candidate_count,
+        "host_fallback_count": plan.host_fallback_count,
+        "host_runtime_count": plan.host_runtime_count,
+        "blockers": list(plan.blockers),
+    }
+
+
+def build_execution_wiring_record(
+    *,
+    model_variant: str,
+    backend: str,
+    weights_dir: Path | None,
+    artifacts_ready: bool,
+) -> dict[str, Any] | None:
+    if backend != "npu" or not artifacts_ready:
+        return None
+    try:
+        from gemma3_npu_wiring import build_wiring_plan
+
+        return execution_wiring_record_from_plan(
+            build_wiring_plan(model_variant, weights_dir=weights_dir)
+        )
+    except Exception as exc:
+        return {
+            "status": "WIRING_FAILED",
+            "layers": None,
+            "stage_count": None,
+            "npu_candidate_count": None,
+            "host_fallback_count": None,
+            "host_runtime_count": None,
+            "blockers": ["npu-wiring-preflight-failed"],
+            "error": str(exc),
+        }
+
+
 def fallback_records(
     *,
     measure_host_fallbacks: bool = True,
@@ -155,6 +196,12 @@ def build_paper_result(
         require_hardware=False,
     )
     power = capture_power_snapshot(sample=power_sample, run_id=target["id"])
+    execution_wiring = build_execution_wiring_record(
+        model_variant=model_variant,
+        backend=backend,
+        weights_dir=weights_dir,
+        artifacts_ready=inventory.can_load_real_artifacts,
+    )
 
     notes = missing_artifact_notes(inventory)
     host_fallbacks = fallback_records(
@@ -176,6 +223,11 @@ def build_paper_result(
         classification = "REAL_MODEL_EXECUTION_NOT_IMPLEMENTED"
         correctness = "BLOCKED_EXECUTION_NOT_IMPLEMENTED"
         notes.append("real artifact inventory is present but execution is not implemented")
+        if execution_wiring:
+            notes.append(
+                "execution wiring blockers: "
+                + ",".join(execution_wiring.get("blockers", []))
+            )
     if env.get("missing_paper_fields"):
         notes.append("environment is not paper-comparable: " + ",".join(env["missing_paper_fields"]))
     if power_sample:
@@ -223,6 +275,7 @@ def build_paper_result(
         "environment_comparable": env.get("paper_comparable"),
         "missing_environment_fields": env.get("missing_paper_fields", []),
         "artifact_inventory": inventory.to_json_dict(),
+        "execution_wiring": execution_wiring,
         "notes": notes,
     }
 
@@ -264,7 +317,25 @@ def _self_test() -> None:
         raise AssertionError("expected nonlinear fallback records")
     if any(not item.get("measured") for item in result["host_fallbacks"]):
         raise AssertionError("expected measured host fallback records")
+    wiring = execution_wiring_record_from_plan(
+        SimpleNamespace(
+            status="BLOCKED",
+            layers=2,
+            stage_count=52,
+            npu_candidate_count=20,
+            host_fallback_count=28,
+            host_runtime_count=4,
+            blockers=("xrt-model-runner-not-wired",),
+        )
+    )
+    if wiring["blockers"] != ["xrt-model-runner-not-wired"]:
+        raise AssertionError(wiring)
     print(format_result(result))
+    print(
+        "GEMMA3_EXECUTION_WIRING_RECORD: "
+        f"status={wiring['status']} stages={wiring['stage_count']} "
+        f"blockers={','.join(wiring['blockers'])}"
+    )
     print("GEMMA3_RESULT_JSON_SELF_TEST: PASS")
 
 
