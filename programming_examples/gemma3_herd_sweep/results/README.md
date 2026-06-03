@@ -32,3 +32,13 @@ source control unless they are reviewed as compact fixtures.
   for the BF16 norm vectors needed by RMSNorm and QK-Norm promotion. It records
   tensor counts and byte totals only; it is not XRT preload, kernel launch,
   correctness, timing, or paper-parity evidence.
+
+
+## Norm Preload Evidence
+
+- `gemma3_norm_preload_evidence.json`: compact Strix/XRT evidence that the
+  RMSNorm/QK-Norm BF16 vectors for `gemma3-1b`, `gemma3-4b`, and the
+  `gemma3-4b-vision` text stack were serialized and written into one contiguous
+  XRT BO per variant. This is norm-weight preload evidence only; it is not
+  kernel argument binding, launch, correctness, timing, or paper-parity
+  evidence.

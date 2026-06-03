@@ -1,0 +1,43 @@
+{
+  "results": [
+    {
+      "allocation_mode": "contiguous-norm-bo",
+      "blockers": [],
+      "evidence_kind": "norm-weight-xrt-preload",
+      "full_model": true,
+      "model_variant": "gemma3-1b",
+      "planned_tensor_count": 156,
+      "requested_bytes": 266240,
+      "serialized_bytes": 266240,
+      "status": "FULL_NORM_XRT_PRELOAD_PASS",
+      "tensor_count": 156,
+      "xrt_written_bytes": 266240
+    },
+    {
+      "allocation_mode": "contiguous-norm-bo",
+      "blockers": [],
+      "evidence_kind": "norm-weight-xrt-preload",
+      "full_model": true,
+      "model_variant": "gemma3-4b",
+      "planned_tensor_count": 204,
+      "requested_bytes": 731136,
+      "serialized_bytes": 731136,
+      "status": "FULL_NORM_XRT_PRELOAD_PASS",
+      "tensor_count": 204,
+      "xrt_written_bytes": 731136
+    },
+    {
+      "allocation_mode": "contiguous-norm-bo",
+      "blockers": [],
+      "evidence_kind": "norm-weight-xrt-preload",
+      "full_model": true,
+      "model_variant": "gemma3-4b-vision",
+      "planned_tensor_count": 204,
+      "requested_bytes": 731136,
+      "serialized_bytes": 731136,
+      "status": "FULL_NORM_XRT_PRELOAD_PASS",
+      "tensor_count": 204,
+      "xrt_written_bytes": 731136
+    }
+  ]
+}

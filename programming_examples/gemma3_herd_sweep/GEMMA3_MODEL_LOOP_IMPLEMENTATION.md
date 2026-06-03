@@ -504,9 +504,13 @@ Implemented evidence and blocker:
   tensors totaling 266,240 bytes, while 4B text and the 4B vision text stack
   each have 204 norm tensors totaling 731,136 bytes. The compact metadata is
   saved in `results/gemma3_norm_weight_plan_evidence.json`.
+- `gemma3_norm_preload.py` now serializes those BF16 vectors and validates full
+  contiguous XRT BO preload for all three local variants: 266,240 bytes for 1B
+  and 731,136 bytes each for 4B text and 4B vision text-stack. The compact
+  XRT evidence is saved in `results/gemma3_norm_preload_evidence.json`.
 - Remaining work for full Phase E completion is model launch/binding
-  validation for the promoted GeGLU path, norm-weight XRT preload and binding
-  for RMSNorm/QK-Norm, plus RoPE, residual, logits, and sampling promotion or
+  validation for the promoted GeGLU path, norm-weight argument binding for
+  RMSNorm/QK-Norm, plus RoPE, residual, logits, and sampling promotion or
   measured timing treatment in end-to-end execution.
 
 ### Phase F: end-to-end 1B text reproduction
@@ -551,7 +555,9 @@ Blocked evidence:
   records real text-stack projection static BO byte estimates for future
   preloading.
   `gemma3_bo_plan.py` records the activation, KV-cache, and intermediate BO
-  shape/byte contract. `gemma3_xrt_runner.py` provides capped real-XRT BO
+  shape/byte contract. `gemma3_norm_preload.py` validates full contiguous XRT
+  preload for the RMSNorm/QK-Norm BF16 vectors needed by future nonlinear
+  promotion. `gemma3_xrt_runner.py` provides capped real-XRT BO
   allocation/preload smoke coverage; a local 1B smoke run allocated 5,303,808
   bytes and saved `/tmp/gemma3_1b_xrt_bo_smoke.json`. `gemma3_static_preload.py`
   serializes real projection tensors into the Q4NX packed/scale/min byte stream
@@ -1374,9 +1380,9 @@ Milestones:
 
 - Reuse `weighted_rms_norm` for RMSNorm where layout-compatible.
 - Reuse or wrap RoPE only after the Gemma rotation convention is documented.
-- Use `gemma3_norm_weight_plan.py` to add the norm-weight BO/preload path
-  needed to use the validated weighted RMSNorm wrapper for Gemma RMSNorm and
-  QK-Norm in the model loop.
+- Use `gemma3_norm_weight_plan.py` and `gemma3_norm_preload.py` to bind the
+  preloaded norm-weight BOs into the validated weighted RMSNorm wrapper for
+  Gemma RMSNorm and QK-Norm in the model loop.
 - Keep the promoted GeGLU/MLP activation path as a model NPU candidate and
   validate launch/argument binding before counting it in timed model results.
 - Add residual/add/multiply vector kernels only when they reduce host fallback
