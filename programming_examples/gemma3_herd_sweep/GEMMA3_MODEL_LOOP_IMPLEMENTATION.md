@@ -74,6 +74,9 @@ Implemented files:
 - `gemma3_inference.py`: Llama32-style entrypoint with compile-only, run-only,
   verify, profile, layer-count, prompt-chunk, decode-token, local-window, and
   stage-log controls.
+- `gemma3_real_execution.py`: CPU/HF real-artifact smoke path for the 1B model,
+  proving local weights/tokenizer can execute without AIR imports while making
+  no paper timing claim.
 
 Focused lit coverage:
 
@@ -84,6 +87,7 @@ Focused lit coverage:
 - `run_model_loop_session.lit`
 - `run_model_loop_scaling.lit`
 - `run_model_loop_vision.lit`
+- `run_model_loop_real_execution.lit`
 - `../gemma3_dataflow_kernels/run_geglu_compile_only.lit`
 
 Current phase status:
@@ -362,7 +366,7 @@ Implemented evidence and blocker:
   when real weights are available.
 - Real Gemma3 artifact loading has been validated against the local default
   model root `/home/cj/models` for `gemma3-1b`, `gemma3-4b`, and
-  `gemma3-4b-vision`; the remaining blocker is real model execution, not
+  `gemma3-4b-vision`; the remaining blocker is NPU model execution, not
   artifact availability. The artifact checker also supports `GEMMA3_MODEL_ROOT`
   and default per-variant directories for reproducible local discovery.
 
@@ -483,8 +487,10 @@ Blocked evidence:
   Gemma3 1B safetensors/tokenizer artifacts are missing. The prior
   unmeasured-nonlinear fallback blocker is retired by measured CPU-reference
   fallback records, but those records are not NPU promotion evidence.
-- No CPU/iGPU/NPU paper baseline or speedup claim is emitted while real-model
-  execution remains unimplemented.
+- A dependency-light 1B CPU/HF smoke path now validates local real weights and
+  tokenizer execution without AIR imports. No CPU/iGPU/NPU paper baseline or
+  speedup claim is emitted until benchmark-length execution and NPU model
+  execution are implemented.
 
 ### Phase G: end-to-end 4B text reproduction
 

@@ -82,7 +82,7 @@ def phase_blocker_statuses(weights_dir: Path | None = None) -> tuple[PhaseBlocke
     ):
         artifact_blockers = _artifact_blockers(model_variant, weights_dir)
         execution_blockers = (
-            ["real-model-execution-not-implemented"] if not artifact_blockers else []
+            ["npu-model-execution-not-implemented"] if not artifact_blockers else []
         )
         blockers = tuple(
             dict.fromkeys(
