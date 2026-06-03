@@ -1,0 +1,4 @@
+# RUN: %PYTHON %S/gemma3_environment.py --self-test | FileCheck %s --check-prefix=SELF
+# RUN: %PYTHON %S/gemma3_environment.py | FileCheck %s --check-prefix=SUMMARY
+# SELF: GEMMA3_ENV_CAPTURE_SELF_TEST: comparable=
+# SUMMARY: GEMMA3_ENV_CAPTURE: comparable=

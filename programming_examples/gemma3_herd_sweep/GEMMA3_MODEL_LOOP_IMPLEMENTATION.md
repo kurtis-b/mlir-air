@@ -304,6 +304,17 @@ Acceptance:
 - Timeout or packet-route diagnostic runs require a following
   `xrt-smi examine -r all` record.
 
+Implemented evidence:
+
+- `gemma3_environment.py` captures git, Python, install paths, tool versions,
+  CPU/memory, PCI hints, XRT availability, NPU power-mode hints, and runtime
+  timing metadata.
+- `gemma3_paper_compare.py --environment` rejects paper comparison when
+  required environment fields are missing unless explicitly overridden.
+- `run_model_loop_environment.lit` covers self-test and summary capture.
+- Current no-hardware capture reports `paper_comparable=False`; missing fields
+  are explicit rather than silently accepted.
+
 ### Phase C: real Gemma3 model artifacts
 
 Goal: replace synthetic token IDs and weights with reproducible Gemma3 1B and

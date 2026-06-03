@@ -8,11 +8,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 DEFAULT_TARGETS = Path(__file__).with_name("paper_targets.json")
+_GEMMA_DIR = Path(__file__).resolve().parent
+if str(_GEMMA_DIR) not in sys.path:
+    sys.path.insert(0, str(_GEMMA_DIR))
+from gemma3_environment import validate_environment_for_paper
 REQUIRED_METRICS = {
     "prefill_ttft_seconds",
     "decode_tps",
@@ -184,6 +189,8 @@ def main() -> int:
     parser.add_argument("--targets", type=Path, default=DEFAULT_TARGETS)
     parser.add_argument("--validate", action="store_true")
     parser.add_argument("--compare", type=Path)
+    parser.add_argument("--environment", type=Path)
+    parser.add_argument("--allow-incomplete-environment", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
@@ -191,6 +198,8 @@ def main() -> int:
     validate_targets(data)
     if args.validate:
         print(f"GEMMA3_PAPER_TARGETS_VALID: targets={len(data['targets'])} conflicts={len(data['headline_conflicts'])}")
+    if args.environment and not args.allow_incomplete_environment:
+        validate_environment_for_paper(json.loads(args.environment.read_text(encoding="utf-8")))
     if args.compare:
         local_results = json.loads(args.compare.read_text(encoding="utf-8"))
         for comparison in compare_results(data, local_results):
