@@ -524,7 +524,7 @@ Blocked evidence:
 - `gemma3_reproduction_blockers.py` reports Phase F as `BLOCKED` because
   local 1B artifacts are available but model-kernel launch, kernel argument
   binding, full paper-shape BO allocation validation, nonlinear model-stage
-  promotion, and fresh paper-shape hardware reruns are not complete. Full contiguous static-weight BO preload validation is complete for 1B only. The prior
+  promotion, and fresh paper-shape hardware reruns are not complete. Full contiguous static-weight BO preload validation is complete for 1B and 4B text only. The prior
   unmeasured-nonlinear fallback blocker is retired by measured CPU-reference
   fallback records, but those records are not NPU promotion evidence.
 - Dependency-light CPU/HF smoke paths now validate local 1B text, 4B text,
@@ -545,8 +545,10 @@ Blocked evidence:
   and can write selected tensors into XRT BOs. A full local 1B contiguous static-preload
   XRT smoke wrote all 182 planned text projection tensors into one static BO, totaling
   468,049,920 bytes, and saved
-  `results/gemma3_static_preload_evidence.json`; 4B and vision full-static
-  preload remain validation blockers. Full paper-shape BO allocation remains a
+  `results/gemma3_static_preload_evidence.json`. A full local 4B contiguous
+  static-preload XRT smoke wrote all 238 planned text projection tensors into
+  one static BO, totaling 2,005,401,600 bytes, and updated the same evidence
+  ledger; vision full-static preload remains a validation blocker. Full paper-shape BO allocation remains a
   validation blocker. `gemma3_real_execution.py` also has
   a CPU/HF warmup/timed-iteration benchmark path for small local smoke runs. No
   CPU/iGPU/NPU paper baseline or speedup claim is emitted until benchmark-length
@@ -577,8 +579,8 @@ Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase G as `BLOCKED` because
   local 4B artifacts are available but model-kernel launch, kernel argument
-  binding, full static weight BO preload validation, full paper-shape BO
-  allocation validation, nonlinear model-stage promotion, and fresh paper-shape hardware reruns are not complete. Measured host fallback
+  binding, full paper-shape BO allocation validation, nonlinear model-stage
+  promotion, and fresh paper-shape hardware reruns are not complete. Measured host fallback
   records account for timing metadata but do not replace nonlinear NPU
   validation.
 - `gemma3_npu_wiring.py` emits the 4B text per-layer NPU candidate and host
@@ -712,7 +714,7 @@ Implemented evidence and blocker:
   launch or validation failures.
 - `gemma3_static_preload.py` can save real Q4NX static-weight preload smoke JSON
   so future model-runner failures can distinguish serialization/preload from
-  kernel binding and execution failures. `gemma3-1b` now has committed full contiguous-XRT
+  kernel binding and execution failures. `gemma3-1b` and `gemma3-4b` now have committed full contiguous-XRT
   preload evidence with no static-preload blockers.
 - `gemma3_buffer_binding.py` records that runtime BO and virtual-intermediate
   binding is planned with no missing BO keys in the self-test fixture; remaining
