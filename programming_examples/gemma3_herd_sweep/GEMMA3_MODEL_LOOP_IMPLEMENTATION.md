@@ -110,6 +110,491 @@ source /home/cj/iron/ironenv/bin/activate && sandbox/bin/lit -v --filter=geglu_c
 No hardware run, NPU power-mode change, clean rebuild, or `/home/cj/mlir-aie`
 edit is part of this synthetic model-loop completion.
 
+## Paper Reproduction Target
+
+The next roadmap goal is to turn the current synthetic, source-level Gemma3
+model-loop scaffold into an iterative reproduction of the paper's implementation
+and results. Until every item in this section has local evidence, do not claim
+that this repository matches the paper.
+
+### Source-of-truth policy
+
+Track both paper result sources because they currently disagree:
+
+- arXiv PDF/HTML v2 result tables and body text are the primary numeric target:
+  <https://arxiv.org/pdf/2602.06063> and
+  <https://arxiv.org/html/2602.06063v2>.
+- arXiv abstract and public FastFlowLM pages remain secondary headline sources:
+  <https://arxiv.org/abs/2602.06063> and
+  <https://fastflowlm.com/docs/benchmarks/gemma3_results/>.
+- If PDF/table values and abstract/site values conflict, record both values in
+  the result ledger, compare against the PDF/table value first, and add a note
+  explaining the mismatch.
+- Treat a local result as `PAPER_MATCH` only when it is within 20% of the paper
+  value for the same model, sequence length, backend, metric, and power mode.
+- Treat a local result outside 20% as `EXPLAINED_DEVIATION` only when the root
+  cause is documented with a concrete artifact: different hardware, runtime,
+  power mode, unsupported route, compile/runtime failure, fallback path, or
+  measurement-method mismatch.
+
+Similarity formulas:
+
+```text
+latency_delta_pct = abs(local_seconds - paper_seconds) / paper_seconds * 100
+throughput_delta_pct = abs(local_tps - paper_tps) / paper_tps * 100
+speedup_delta_pct = abs(local_speedup - paper_speedup) / paper_speedup * 100
+power_delta_pct = abs(local_watts - paper_watts) / paper_watts * 100
+```
+
+Only compare timings after correctness passes. Do not use lit wall time, compile
+time, manifest generation time, or synthetic checksum time as model latency.
+
+### Paper headline conflict ledger
+
+| Source | NPU vs iGPU prefill | NPU vs iGPU decode | NPU vs CPU prefill | NPU vs CPU decode | Power efficiency |
+| --- | ---: | ---: | ---: | ---: | --- |
+| PDF/HTML v2 body | up to 7.5x | up to 5.9x | up to 23.7x | up to 2.7x | up to 96.7x vs iGPU, 157.7x vs CPU |
+| arXiv abstract / secondary pages | up to 5.2x | up to 4.8x | up to 33.5x | up to 2.2x | up to 67.2x vs iGPU, 222.9x vs CPU |
+
+Acceptance for the repo should target the PDF/HTML v2 tables. The abstract/site
+numbers are still tracked so that any future paper-version or FastFlowLM-version
+reconciliation is explicit.
+
+### Paper result targets to reproduce
+
+Prefill TTFT targets are seconds. Decode targets are tokens per second.
+
+| Metric | Model | Backend | 1k | 2k | 4k | 8k | 16k | 32k | 64k | 128k |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Prefill TTFT | 1B | NPU | 0.95 | 1.47 | 2.46 | 4.42 | 8.45 | 17.19 | n/a | n/a |
+| Prefill TTFT | 1B | iGPU | 0.51 | 1.14 | 2.61 | 6.64 | 21.3 | 95.1 | n/a | n/a |
+| Prefill TTFT | 1B | CPU | 4.06 | 8.06 | 17.2 | 36.2 | 75.5 | 165 | n/a | n/a |
+| Prefill TTFT | 4B | NPU | 1.81 | 2.81 | 4.79 | 8.37 | 16.17 | 33.5 | n/a | n/a |
+| Prefill TTFT | 4B | iGPU | 2.05 | 4.26 | 9.54 | 23.8 | 71.5 | 265 | n/a | n/a |
+| Prefill TTFT | 4B | CPU | 20.3 | 42.4 | 85.4 | 176 | 766 | 832 | n/a | n/a |
+| Decode TPS | 1B | NPU | 41.1 | 40.5 | 39.5 | 37.3 | 33.6 | 27.9 | OOC | OOC |
+| Decode TPS | 1B | iGPU | 38.0 | 53.9 | 42.3 | 33.5 | 25.0 | 13.6 | n/a | n/a |
+| Decode TPS | 1B | CPU | 41.9 | 40.8 | 41.7 | 40.2 | 38.1 | 33.8 | n/a | n/a |
+| Decode TPS | 4B | NPU | 18.2 | 18.0 | 17.8 | 17.3 | 16.3 | 14.8 | 13.2 | 11.2 |
+| Decode TPS | 4B | iGPU | 18.6 | 17.4 | 15.3 | 12.6 | 9.2 | 5.9 | 3.3 | 1.9 |
+| Decode TPS | 4B | CPU | 14.6 | 13.5 | 13.9 | 13.0 | 11.4 | 10.8 | 7.5 | 4.1 |
+
+Vision target from the paper body:
+
+| Metric | Model | Backend | Value |
+| --- | --- | --- | ---: |
+| Vision TTFT | 4B vision tower | NPU | 2.6 sec |
+| Vision TTFT | 4B vision tower | iGPU | 7.45 sec |
+| Vision TTFT | 4B vision tower | CPU | 38.55 sec |
+| Vision speedup | 4B vision tower | NPU vs iGPU | 2.9x |
+| Vision speedup | 4B vision tower | NPU vs CPU | 14.8x |
+
+Average power targets from the paper's cross-hardware power table:
+
+| Category | Model | CPU W | GPU W | NPU W | Total W |
+| --- | --- | ---: | ---: | ---: | ---: |
+| NPU decoding | 1B | 2.8 | 0 | 1.8 | 4.6 |
+| NPU decoding | 4B | 2.9 | 0 | 1.6 | 4.5 |
+| NPU prefill | 1B | 0.0 | 3.1 | 1.2 | 4.3 |
+| NPU prefill | 4B | 0.0 | 3.4 | 1.1 | 4.5 |
+| iGPU decoding | 1B | 31 | 22 | 0 | 53 |
+| iGPU decoding | 4B | 31 | 23 | 0 | 54 |
+| iGPU prefill | 1B | 33 | 24 | 0 | 57 |
+| iGPU prefill | 4B | 33 | 25 | 0 | 58 |
+| CPU decoding | 1B | 29 | 0 | 0 | 29 |
+| CPU decoding | 4B | 26 | 0 | 0 | 26 |
+| CPU prefill | 1B | 24 | 0 | 0 | 24 |
+| CPU prefill | 4B | 30 | 0 | 0 | 30 |
+
+Power-efficiency targets from the paper body:
+
+| Mode | Model | NPU vs iGPU TPS/W | NPU vs CPU TPS/W |
+| --- | --- | --- | --- |
+| Prefill | 1B | 6.9x-69.7x | 22.9x-50.7x |
+| Prefill | 4B | 13.9x-96.7x | 70.6x-157.7x |
+| Decode | 1B | 12.4x-24.2x | 6.2x-5.2x as written in PDF/HTML |
+| Decode | 4B | 11.9x-71.1x | 7.2x-15.8x |
+
+The `6.2x-5.2x` CPU decode range is recorded exactly as the paper text presents
+it. Future implementation should verify whether this is a descending range, a
+typographical error, or a derived value from the figure.
+
+### Current gap to paper parity
+
+| Area | Current state | Paper-parity requirement |
+| --- | --- | --- |
+| Model weights | Synthetic Q4NX/BF16-compatible weights only | Real Gemma3 1B and 4B weights, quantized/packed in the same Q4NX contract used by the NPU kernels |
+| Tokenizer and prompts | Synthetic token IDs | Real tokenizer, deterministic prompts, and sequence lengths 1k-32k for 1B and 1k-128k decode for 4B |
+| Text runtime | Host-driven synthetic loop with CPU references and manifests | End-to-end NPU execution for all validated model substeps, with host fallbacks removed or measured separately |
+| Vision runtime | Disabled contract only | 4B vision prefill path with non-causal attention and visual context token handoff into text prefill |
+| Nonlinear operations | CPU fallbacks plus standalone GeGLU candidate | RMSNorm, QK-Norm, RoPE, residual add, activation, logits, and sampling either validated on NPU or explicitly accounted for in timing |
+| Baselines | No comparable CPU/iGPU model path | CPU and iGPU runs for the exact same model variant, prompt lengths, output count, tokenizer, and measurement window |
+| Timing | Synthetic profile/event logs only | TTFT and decode TPS with warmup, timed iterations, and compile/setup excluded |
+| Power | No local power logs | CPU/GPU/NPU/total watt readings aligned with benchmark windows and TPS/W calculations |
+| Accuracy | Synthetic checksums only | Model-output agreement against CPU reference and paper-compatible prompts, plus tolerance policy for quantized outputs |
+| Result comparison | No result JSON ledger | Machine-readable paper/local comparison with percent deltas and pass/deviation labels |
+
+## Iterative Paper-Match Implementation Loop
+
+Each iteration should do exactly one paper-parity increment:
+
+1. Identify the next missing result cell or capability.
+2. Add the smallest implementation needed for that cell.
+3. Run compile-only checks before hardware.
+4. Run correctness before timing.
+5. Run timing before power/TPS-W.
+6. Save the command, environment, result JSON, and logs.
+7. Update this document's evidence ledger.
+8. Commit that iteration before moving to the next cell.
+
+Do not broaden public support matrices, sweep modes, or paper claims until the
+same mode passes compile, correctness, hardware, and paper-comparison checks.
+
+### Phase A: paper metric extraction and ledger generation
+
+Goal: create an explicit, versioned local representation of every paper result
+cell before implementing more runtime code.
+
+Implementation requirements:
+
+- Add a paper-result data file under the Gemma example tree, preferably JSON or
+  CSV, containing every TTFT, decode TPS, vision TTFT, power, speedup, and TPS/W
+  target listed above.
+- Include source fields for `pdf_v2`, `html_v2`, `abstract`, and `fastflowlm`
+  where values differ.
+- Add a parser/checker that validates the result file has all required model,
+  backend, metric, and sequence-length cells.
+- Add a comparison utility that reads local benchmark JSON and emits
+  `PAPER_MATCH`, `EXPLAINED_DEVIATION`, `LOCAL_FAIL`, or `MISSING_LOCAL_RESULT`.
+
+Acceptance:
+
+- The result-target file is complete for all tables above.
+- The checker reports the abstract/PDF headline conflict without failing.
+- A synthetic local result fixture can be compared and classified within or
+  outside the 20% threshold.
+
+### Phase B: hardware and environment parity capture
+
+Goal: make every local result reproducible and comparable.
+
+Implementation requirements:
+
+- Capture branch, commit, dirty worktree, build directory, MLIR-AIR install,
+  MLIR-AIE install, Peano install, LLVM install, XRT version, `xrt-smi examine`,
+  NPU power mode, CPU model, GPU/iGPU model, memory size, kernel artifact type,
+  and Python environment.
+- Record whether the run used `xclbin` or `elf`, whether trace was enabled, and
+  whether compile/setup time was excluded.
+- Refuse paper-comparison output when required environment fields are missing.
+
+Acceptance:
+
+- A no-hardware dry run can produce a complete environment JSON with missing
+  hardware fields marked explicitly.
+- A hardware run records XRT and NPU state before and after execution.
+- Timeout or packet-route diagnostic runs require a following
+  `xrt-smi examine -r all` record.
+
+### Phase C: real Gemma3 model artifacts
+
+Goal: replace synthetic token IDs and weights with reproducible Gemma3 1B and
+4B artifacts.
+
+Implementation requirements:
+
+- Add model metadata for Gemma3 1B text, Gemma3 4B text, and Gemma3 4B vision.
+- Add tokenizer loading and deterministic prompt generation for 1k, 2k, 4k,
+  8k, 16k, 32k, 64k, and 128k contexts where supported.
+- Add real safetensor loading or an explicit import path for already-converted
+  weights.
+- Define the exact Q4NX packing contract for every projected matrix:
+  row/column order, group size, scale/min storage, low-nibble order, transpose
+  policy, and BF16 conversion points.
+- Preserve a CPU reference path for every model variant before NPU promotion.
+
+Acceptance:
+
+- CPU-only real-model load succeeds for 1B and 4B without importing AIR modules.
+- Tokenizer round-trip and prompt length checks pass for every paper sequence
+  length.
+- Q4NX pack/dequant round-trip error is recorded per projection family.
+
+### Phase D: standalone kernel parity
+
+Goal: prove each paper kernel role independently before using it in end-to-end
+model timing.
+
+Implementation requirements:
+
+- Keep Q4NX, BF16 MM, FusedDQP, FlowQKV, and FlowKV as separately testable
+  artifacts.
+- Scale from compact smoke shapes to paper shapes, then to full paper sequence
+  lengths.
+- For each kernel, record correctness versus CPU reference, compile time,
+  runtime latency, output mode, herd shape, schedule mode, KV staging, and
+  unsupported-mode classification.
+- Keep 8x4 direct S2MM over-allocation unsupported and use `l2-gather` for
+  full-physical public model paths.
+- Keep `packet-direct` diagnostic-only until packet S2MM receive behavior has
+  three consecutive correct hardware runs per affected kernel.
+
+Acceptance:
+
+- Every kernel used by model timing has passing compile and hardware validation
+  for its exact paper-mode shape.
+- FlowKV small-shape `l2-gather` and FusedDQP `pipeline` remain excluded from
+  production model routes until their timeout/channel issues are fixed.
+- Kernel-level performance is logged but not used as end-to-end paper parity.
+
+### Phase E: nonlinear and vector-kernel promotion
+
+Goal: remove or account for host fallbacks so local timing can be compared to
+paper end-to-end timing.
+
+Implementation requirements:
+
+- Reuse `weighted_rms_norm` for RMSNorm and QK-Norm when layout matches.
+- Reuse or wrap Llama32 half-split RoPE for Gemma head dimensions.
+- Use the Gemma GeGLU kernel candidate for activation only after standalone
+  compile and hardware validation.
+- Add residual add, elementwise multiply, logits/LM head, and sampling kernels
+  only when they reduce measured model-loop overhead and preserve tensor
+  contracts.
+- Record every remaining host fallback in result JSON, including whether it is
+  included in timing.
+
+Acceptance:
+
+- No paper-match timing can be labeled `PAPER_MATCH` while an unmeasured host
+  fallback contributes to the timed window.
+- Each promoted nonlinear has CPU reference, compile-only lit, hardware
+  validation, and tolerance data.
+
+### Phase F: end-to-end 1B text reproduction
+
+Goal: reproduce Gemma3 1B prefill and decode tables.
+
+Implementation requirements:
+
+- Add a real 1B text session with tokenizer, real weights, real KV cache,
+  static weight BO preloading, and per-layer artifact reuse.
+- Implement prefill TTFT for 1k, 2k, 4k, 8k, 16k, and 32k prompts.
+- Implement decode TPS at 1k, 2k, 4k, 8k, 16k, and 32k context lengths.
+- Run CPU, iGPU, and NPU backends with the same prompt/token settings.
+- Compare NPU, iGPU, CPU, and derived speedups against the paper table.
+
+Acceptance:
+
+- Correctness passes for all 1B paper sequence lengths.
+- Every NPU TTFT/TPS cell is within 20% of the PDF/HTML v2 target or has an
+  explained deviation.
+- CPU/iGPU baselines are present before speedup claims are emitted.
+
+### Phase G: end-to-end 4B text reproduction
+
+Goal: reproduce Gemma3 4B text prefill and decode tables.
+
+Implementation requirements:
+
+- Add a real 4B text session with the 5-local/1-global layer pattern and the
+  paper's full supported decode range.
+- Implement 4B prefill TTFT for 1k-32k prompts.
+- Implement 4B decode TPS for 1k, 2k, 4k, 8k, 16k, 32k, 64k, and 128k context
+  lengths.
+- Track out-of-capacity behavior separately from failures.
+- Use `l2-gather` full-physical routes where direct shim output is illegal.
+
+Acceptance:
+
+- Correctness passes for all 4B text sequence lengths that fit local memory and
+  host memory limits.
+- NPU, CPU, and iGPU local results are compared against Tables 2 and 4.
+- Any 64k/128k deviation includes explicit KV-cache, memory, or schedule data.
+
+### Phase H: 4B vision path reproduction
+
+Goal: replace the disabled vision contract with the paper's vision-tower
+inference result.
+
+Implementation requirements:
+
+- Add vision input preprocessing and image-token contract.
+- Implement non-causal full attention for the vision path.
+- Produce visual context tokens that seed the text prefill path.
+- Measure vision TTFT separately from text-only prefill.
+- Run NPU, iGPU, and CPU vision baselines.
+
+Acceptance:
+
+- Vision can still be disabled with unchanged text-only results.
+- 4B vision TTFT is compared against 2.6 sec NPU, 7.45 sec iGPU, and 38.55 sec
+  CPU targets.
+- NPU vision speedups are compared against 2.9x over iGPU and 14.8x over CPU.
+
+### Phase I: benchmark harness and result JSON
+
+Goal: make all paper comparisons one-command reproducible.
+
+Future CLI shape:
+
+```bash
+python3 gemma3_inference.py --paper-benchmark \
+  --model-variant gemma3-1b \
+  --backend npu \
+  --weights-dir <path> \
+  --tokenizer <path> \
+  --prompt-len 32768 \
+  --decode-tokens 128 \
+  --result-json results/gemma3_1b_npu_32k.json
+```
+
+Expected CLI additions:
+
+- `--model-variant {gemma3-1b,gemma3-4b,gemma3-4b-vision}`
+- `--weights-dir`
+- `--tokenizer`
+- `--backend {cpu,igpu,npu}`
+- `--prompt-len`
+- `--decode-tokens`
+- `--paper-benchmark`
+- `--warmup-iters`
+- `--timed-iters`
+- `--result-json`
+- `--power-sample`
+- `--compare-paper`
+- `--trace-size`
+- `--debug-ir`
+
+Result JSON schema:
+
+```json
+{
+  "schema_version": 1,
+  "paper_source": "arxiv_pdf_v2",
+  "paper_table": "Table 4",
+  "model_variant": "gemma3-4b",
+  "backend": "npu",
+  "metric": "decode_tps",
+  "sequence_length": 131072,
+  "decode_tokens": 128,
+  "local_value": 11.2,
+  "paper_value": 11.2,
+  "unit": "tokens_per_second",
+  "delta_pct": 0.0,
+  "classification": "PAPER_MATCH",
+  "correctness": "PASS",
+  "host_fallbacks": [],
+  "command": "...",
+  "git_commit": "...",
+  "dirty_worktree": false,
+  "xrt_version": "...",
+  "npu_power_mode": "...",
+  "artifact_format": "elf",
+  "warmup_iters": 3,
+  "timed_iters": 10,
+  "compile_time_included": false,
+  "power_watts": {
+    "cpu": 2.9,
+    "gpu": 0.0,
+    "npu": 1.6,
+    "total": 4.5
+  },
+  "notes": []
+}
+```
+
+Acceptance:
+
+- A paper benchmark run writes one result JSON per result cell.
+- A comparison command generates Markdown and CSV summaries.
+- Missing or failed cells are visible and cannot be silently skipped.
+
+### Phase J: power and TPS/W reproduction
+
+Goal: reproduce the paper's average power table and TPS/W improvement ranges.
+
+Implementation requirements:
+
+- Define a power-sampling backend before collecting numbers: XRT telemetry,
+  platform telemetry, RAPL, or another reproducible source.
+- Align power sampling windows with timed inference windows.
+- Record CPU/GPU/NPU/total watts separately when telemetry supports it.
+- Compute TPS/W using the same timed throughput used for the paper comparison.
+- Never combine timing from one run with power from another run unless both run
+  IDs are recorded and the method is documented.
+
+Acceptance:
+
+- Local average watts are compared against the power table.
+- TPS/W improvement ranges are computed for every model/backend/mode with local
+  CPU/iGPU/NPU values.
+- Any unavailable rail or telemetry source is reported as `MISSING_POWER_FIELD`,
+  not zero.
+
+### Phase K: final paper-parity report
+
+Goal: produce a report that can answer whether the implementation and results
+match the paper.
+
+Implementation requirements:
+
+- Generate a Markdown report with one row per paper result cell.
+- Include paper value, local value, delta, classification, command, and log path.
+- Include a separate section for abstract/PDF/site conflicts.
+- Include a separate section for unsupported modes and why they are not paper
+  parity blockers or are still blockers.
+- Include accuracy/correctness summary before performance summary.
+
+Acceptance:
+
+- The final report can state one of:
+  - `MATCHES_PAPER`: all required cells are within 20% and correctness passes.
+  - `MATCHES_WITH_EXPLAINED_DEVIATIONS`: all cells are present, but some exceed
+    20% with accepted explanations.
+  - `DOES_NOT_MATCH_PAPER`: one or more required cells are missing, incorrect,
+    unsupported, or unexplained.
+- The report is backed by committed source changes and saved result artifacts.
+
+### Artifact and result directory policy
+
+Use source-controlled files for plans, target tables, scripts, and small
+fixtures. Keep large or machine-specific artifacts out of source unless they are
+explicitly reviewed.
+
+Recommended paths:
+
+```text
+programming_examples/gemma3_herd_sweep/paper_targets.json
+programming_examples/gemma3_herd_sweep/gemma3_paper_compare.py
+programming_examples/gemma3_herd_sweep/results/README.md
+programming_examples/gemma3_herd_sweep/results/*.json
+programming_examples/gemma3_herd_sweep/results/*.md
+programming_examples/gemma3_herd_sweep/results/*.csv
+programming_examples/gemma3_herd_sweep/power_logs/*.json
+programming_examples/gemma3_herd_sweep/kernel_cache/
+```
+
+Do not commit xclbins, ELFs, large safetensors, tokenizer caches, trace dumps,
+or generated debug IR unless the file is intentionally added as a compact test
+fixture.
+
+### Paper-match guardrails
+
+- Do not claim FastFlowLM parity until real weights, tokenizer, CPU/iGPU/NPU
+  baselines, correctness, timing, and power are all present.
+- Do not claim a paper speedup from NPU-only data; speedup requires local CPU or
+  iGPU baseline data from the same benchmark harness.
+- Do not claim TPS/W without local power logs.
+- Do not hide host fallbacks in timed windows.
+- Do not expose diagnostic modes in sweeps just to fill result cells.
+- Do not edit `/home/cj/mlir-aie`, reboot, change NPU power mode, or clean
+  rebuild without explicit approval.
+- Do not treat compile-only success as runtime support.
+- Do not treat synthetic checksums as model accuracy.
+- Always separate compile failure, validation failure, runtime timeout,
+  unsupported mode, and paper deviation.
+
 ## Paper Concepts To Preserve
 
 The implementation should preserve the following architectural ideas from the
