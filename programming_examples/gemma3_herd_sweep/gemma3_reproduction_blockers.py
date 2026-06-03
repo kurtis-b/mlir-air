@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026, Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Gemma3 real paper-reproduction blocker ledger."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+
+from gemma3_artifacts import discover_model_artifacts
+from gemma3_environment import capture_environment
+from gemma3_nonlinears import paper_match_blockers
+
+
+@dataclass(frozen=True)
+class PhaseBlockerStatus:
+    phase: str
+    model_variant: str
+    status: str
+    blockers: tuple[str, ...]
+
+    def format(self) -> str:
+        blockers = ",".join(self.blockers) if self.blockers else "none"
+        return (
+            f"phase {self.phase} model={self.model_variant} "
+            f"status={self.status} blockers={blockers}"
+        )
+
+
+def _artifact_blockers(model_variant: str, weights_dir: Path | None = None) -> list[str]:
+    inventory = discover_model_artifacts(model_variant, weights_dir=weights_dir)
+    blockers: list[str] = []
+    if not inventory.has_weight_files:
+        blockers.append("missing-safetensors")
+    if not inventory.tokenizer_exists:
+        blockers.append("missing-tokenizer")
+    if not inventory.optional_packages.get("safetensors", False):
+        blockers.append("missing-python-safetensors")
+    if not any(inventory.optional_packages.get(pkg, False) for pkg in ("tokenizers", "sentencepiece", "transformers")):
+        blockers.append("missing-python-tokenizer-package")
+    return blockers
+
+
+def phase_blocker_statuses(weights_dir: Path | None = None) -> tuple[PhaseBlockerStatus, ...]:
+    env = capture_environment(require_hardware=False)
+    env_blockers = ["environment-not-paper-comparable"] if env.get("missing_paper_fields") else []
+    nonlinear_blockers = ["unmeasured-nonlinear-host-fallbacks"] if paper_match_blockers() else []
+    rows = []
+    for phase, model_variant, extra in (
+        ("F", "gemma3-1b", ()),
+        ("G", "gemma3-4b", ()),
+        ("H", "gemma3-4b-vision", ("vision-npu-path-not-implemented",)),
+    ):
+        blockers = tuple(
+            dict.fromkeys(
+                _artifact_blockers(model_variant, weights_dir)
+                + env_blockers
+                + nonlinear_blockers
+                + list(extra)
+            )
+        )
+        rows.append(
+            PhaseBlockerStatus(
+                phase=phase,
+                model_variant=model_variant,
+                status="BLOCKED" if blockers else "READY",
+                blockers=blockers,
+            )
+        )
+    return tuple(rows)
+
+
+def _self_test() -> None:
+    statuses = phase_blocker_statuses()
+    if len(statuses) != 3:
+        raise AssertionError(statuses)
+    for status in statuses:
+        if status.status != "BLOCKED":
+            raise AssertionError(status)
+        print(status.format())
+    print("GEMMA3_REPRODUCTION_BLOCKERS_SELF_TEST: PASS")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Gemma3 paper-reproduction blocker ledger")
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--weights-dir", type=Path)
+    args = parser.parse_args()
+
+    if args.self_test:
+        _self_test()
+        return 0
+    for status in phase_blocker_statuses(weights_dir=args.weights_dir):
+        print(status.format())
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

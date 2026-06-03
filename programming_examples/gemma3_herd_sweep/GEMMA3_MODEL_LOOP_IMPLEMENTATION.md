@@ -461,6 +461,15 @@ Acceptance:
   explained deviation.
 - CPU/iGPU baselines are present before speedup claims are emitted.
 
+Blocked evidence:
+
+- `gemma3_reproduction_blockers.py` reports Phase F as `BLOCKED` because real
+  Gemma3 1B safetensors/tokenizer artifacts, tokenizer/safetensor Python
+  packages, paper-comparable environment fields, and measured nonlinear
+  fallback status are missing.
+- No CPU/iGPU/NPU paper baseline or speedup claim is emitted while these
+  blockers remain.
+
 ### Phase G: end-to-end 4B text reproduction
 
 Goal: reproduce Gemma3 4B text prefill and decode tables.
@@ -482,6 +491,15 @@ Acceptance:
 - NPU, CPU, and iGPU local results are compared against Tables 2 and 4.
 - Any 64k/128k deviation includes explicit KV-cache, memory, or schedule data.
 
+Blocked evidence:
+
+- `gemma3_reproduction_blockers.py` reports Phase G as `BLOCKED` because real
+  Gemma3 4B safetensors/tokenizer artifacts, tokenizer/safetensor Python
+  packages, paper-comparable environment fields, and measured nonlinear
+  fallback status are missing.
+- 64k/128k decode cells remain target-ledger entries only; no local paper claim
+  is emitted without real KV-cache, memory, and schedule evidence.
+
 ### Phase H: 4B vision path reproduction
 
 Goal: replace the disabled vision contract with the paper's vision-tower
@@ -501,6 +519,15 @@ Acceptance:
 - 4B vision TTFT is compared against 2.6 sec NPU, 7.45 sec iGPU, and 38.55 sec
   CPU targets.
 - NPU vision speedups are compared against 2.9x over iGPU and 14.8x over CPU.
+
+Blocked evidence:
+
+- `gemma3_reproduction_blockers.py` reports Phase H as `BLOCKED` because real
+  Gemma3 4B vision artifacts, tokenizer/safetensor Python packages,
+  paper-comparable environment fields, measured nonlinear fallback status, and
+  the NPU vision path are missing.
+- Existing text-only synthetic and blocked-result tests keep vision optional;
+  no vision TTFT or speedup claim is emitted without real vision execution.
 
 ### Phase I: benchmark harness and result JSON
 
