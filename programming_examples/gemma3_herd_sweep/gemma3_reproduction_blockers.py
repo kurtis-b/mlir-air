@@ -12,7 +12,8 @@ from pathlib import Path
 
 from gemma3_artifacts import discover_model_artifacts
 from gemma3_environment import capture_environment
-from gemma3_nonlinears import paper_match_blockers
+from gemma3_paper_compare import unmeasured_host_fallbacks
+from gemma3_results import fallback_records
 
 
 @dataclass(frozen=True)
@@ -47,7 +48,11 @@ def _artifact_blockers(model_variant: str, weights_dir: Path | None = None) -> l
 def phase_blocker_statuses(weights_dir: Path | None = None) -> tuple[PhaseBlockerStatus, ...]:
     env = capture_environment(require_hardware=False)
     env_blockers = ["environment-not-paper-comparable"] if env.get("missing_paper_fields") else []
-    nonlinear_blockers = ["unmeasured-nonlinear-host-fallbacks"] if paper_match_blockers() else []
+    nonlinear_blockers = (
+        ["unmeasured-nonlinear-host-fallbacks"]
+        if unmeasured_host_fallbacks({"host_fallbacks": fallback_records()})
+        else []
+    )
     rows = []
     for phase, model_variant, extra in (
         ("F", "gemma3-1b", ()),

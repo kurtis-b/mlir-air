@@ -15,7 +15,7 @@ from typing import Any
 
 from gemma3_artifacts import MODEL_SPECS, discover_model_artifacts, model_spec
 from gemma3_environment import capture_environment
-from gemma3_nonlinears import paper_match_blockers
+from gemma3_nonlinears import measure_cpu_contracts, paper_match_blockers
 from gemma3_paper_compare import load_targets, target_by_id
 from gemma3_power import capture_power_snapshot
 
@@ -80,16 +80,37 @@ def missing_artifact_notes(inventory: Any) -> list[str]:
     return notes
 
 
-def fallback_records() -> list[dict[str, Any]]:
-    return [
-        {
-            "name": blocker.operation,
-            "status": blocker.timed_window_status,
-            "contributes_to_timing": True,
-            "measured": False,
-        }
-        for blocker in paper_match_blockers()
-    ]
+def fallback_records(
+    *,
+    measure_host_fallbacks: bool = True,
+    fallback_timed_iters: int = 3,
+) -> list[dict[str, Any]]:
+    measurements = (
+        measure_cpu_contracts(timed_iters=fallback_timed_iters)
+        if measure_host_fallbacks
+        else {}
+    )
+    records: list[dict[str, Any]] = []
+    for blocker in paper_match_blockers():
+        measurement = measurements.get(blocker.operation, {})
+        measured = bool(measurement)
+        records.append(
+            {
+                "name": blocker.operation,
+                "status": "measured-host-fallback" if measured else blocker.timed_window_status,
+                "contributes_to_timing": True,
+                "measured": measured,
+                "backend": "cpu-reference" if measured else "host-fallback",
+                "elapsed_ms": measurement.get("elapsed_ms"),
+                "timed_iters": measurement.get("timed_iters", 0),
+                "measurement_source": measurement.get("measurement_source", "not-measured"),
+                "tensor_contract": blocker.tensor_contract,
+                "implementation_path": blocker.implementation_path,
+                "hardware_status": blocker.hardware_status,
+                "npu_promoted": blocker.hardware_status == "hardware-validated",
+            }
+        )
+    return records
 
 
 def build_paper_result(
@@ -109,6 +130,8 @@ def build_paper_result(
     power_sample: bool = False,
     trace_size: int | None = None,
     debug_ir: bool = False,
+    measure_host_fallbacks: bool = True,
+    fallback_timed_iters: int = 3,
 ) -> dict[str, Any]:
     metric = infer_metric(model_variant, decode_tokens, metric)
     phase = "decode" if metric == "decode_tps" else "prefill"
@@ -130,6 +153,18 @@ def build_paper_result(
     power = capture_power_snapshot(sample=power_sample, run_id=target["id"])
 
     notes = missing_artifact_notes(inventory)
+    host_fallbacks = fallback_records(
+        measure_host_fallbacks=measure_host_fallbacks,
+        fallback_timed_iters=fallback_timed_iters,
+    )
+    if host_fallbacks:
+        if all(item.get("measured") for item in host_fallbacks):
+            notes.append(
+                "nonlinear host fallbacks measured as CPU-reference microbenchmarks; "
+                "not NPU-promoted"
+            )
+        else:
+            notes.append("one or more nonlinear host fallbacks are unmeasured")
     if not inventory.can_load_real_artifacts:
         classification = "MISSING_REAL_ARTIFACTS"
         correctness = "BLOCKED_REAL_ARTIFACTS"
@@ -167,7 +202,7 @@ def build_paper_result(
         "delta_pct": None,
         "classification": classification,
         "correctness": correctness,
-        "host_fallbacks": fallback_records(),
+        "host_fallbacks": host_fallbacks,
         "command": command_text,
         "git_commit": env["git"].get("commit"),
         "dirty_worktree": env["git"].get("dirty_worktree"),
@@ -223,6 +258,8 @@ def _self_test() -> None:
         raise AssertionError(result["classification"])
     if not result["host_fallbacks"]:
         raise AssertionError("expected nonlinear fallback records")
+    if any(not item.get("measured") for item in result["host_fallbacks"]):
+        raise AssertionError("expected measured host fallback records")
     print(format_result(result))
     print("GEMMA3_RESULT_JSON_SELF_TEST: PASS")
 
@@ -244,6 +281,8 @@ def main() -> int:
     parser.add_argument("--power-sample", action="store_true")
     parser.add_argument("--trace-size", type=int)
     parser.add_argument("--debug-ir", action="store_true")
+    parser.add_argument("--skip-host-fallback-measurement", action="store_true")
+    parser.add_argument("--fallback-timed-iters", type=int, default=3)
     parser.add_argument("--result-json", type=Path)
     args = parser.parse_args()
 
@@ -266,6 +305,8 @@ def main() -> int:
         power_sample=args.power_sample,
         trace_size=args.trace_size,
         debug_ir=args.debug_ir,
+        measure_host_fallbacks=not args.skip_host_fallback_measurement,
+        fallback_timed_iters=args.fallback_timed_iters,
         command=sys.argv,
     )
     print(format_result(result))

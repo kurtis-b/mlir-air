@@ -1,7 +1,7 @@
 # RUN: %PYTHON %S/gemma3_results.py --self-test | FileCheck %s --check-prefix=SELF
 # RUN: %PYTHON %S/gemma3_inference.py --paper-benchmark --model-variant gemma3-1b --backend npu --weights-dir %t.missing --prompt-len 1024 --decode-tokens 128 --result-json %t.result.json --compare-paper | FileCheck %s --check-prefix=BENCH
 # RUN: %PYTHON %S/gemma3_paper_compare.py --compare %t.result.json --summary-md %t.summary.md --summary-csv %t.summary.csv | FileCheck %s --check-prefix=SUMMARY
-# RUN: %PYTHON -c "import json, pathlib; data=json.loads(pathlib.Path('%t.result.json').read_text()); assert data['target_id'] == 'decode_tps_gemma3_1b_npu_1024'; assert data['classification'] == 'MISSING_REAL_ARTIFACTS'; assert data['power_watts']['npu'] is None; print('RESULT_JSON_SCHEMA_OK')" | FileCheck %s --check-prefix=JSON
+# RUN: %PYTHON -c "import json, pathlib; data=json.loads(pathlib.Path('%t.result.json').read_text()); assert data['target_id'] == 'decode_tps_gemma3_1b_npu_1024'; assert data['classification'] == 'MISSING_REAL_ARTIFACTS'; assert data['power_watts']['npu'] is None; assert data['host_fallbacks']; assert all(item['status'] == 'measured-host-fallback' for item in data['host_fallbacks']); assert all(item['measured'] for item in data['host_fallbacks']); assert all(item['elapsed_ms'] is not None for item in data['host_fallbacks']); print('RESULT_JSON_SCHEMA_OK')" | FileCheck %s --check-prefix=JSON
 # SELF: GEMMA3_PAPER_RESULT target=decode_tps_gemma3_1b_npu_1024 class=MISSING_REAL_ARTIFACTS
 # SELF: GEMMA3_RESULT_JSON_SELF_TEST: PASS
 # BENCH: GEMMA3_PAPER_RESULT target=decode_tps_gemma3_1b_npu_1024 class=MISSING_REAL_ARTIFACTS correctness=BLOCKED_REAL_ARTIFACTS

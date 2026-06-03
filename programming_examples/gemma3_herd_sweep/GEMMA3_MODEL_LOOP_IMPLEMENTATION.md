@@ -227,7 +227,7 @@ typographical error, or a derived value from the figure.
 | Tokenizer and prompts | Synthetic token IDs | Real tokenizer, deterministic prompts, and sequence lengths 1k-32k for 1B and 1k-128k decode for 4B |
 | Text runtime | Host-driven synthetic loop with CPU references and manifests | End-to-end NPU execution for all validated model substeps, with host fallbacks removed or measured separately |
 | Vision runtime | Disabled contract only | 4B vision prefill path with non-causal attention and visual context token handoff into text prefill |
-| Nonlinear operations | CPU fallbacks plus standalone GeGLU candidate | RMSNorm, QK-Norm, RoPE, residual add, activation, logits, and sampling either validated on NPU or explicitly accounted for in timing |
+| Nonlinear operations | CPU fallbacks plus standalone GeGLU candidate; host fallback microbenchmarks are recorded in result JSON | RMSNorm, QK-Norm, RoPE, residual add, activation, logits, and sampling either validated on NPU or explicitly accounted for in timing |
 | Baselines | No comparable CPU/iGPU model path | CPU and iGPU runs for the exact same model variant, prompt lengths, output count, tokenizer, and measurement window |
 | Timing | Synthetic profile/event logs only | TTFT and decode TPS with warmup, timed iterations, and compile/setup excluded |
 | Power | No local power logs | CPU/GPU/NPU/total watt readings aligned with benchmark windows and TPS/W calculations |
@@ -312,8 +312,9 @@ Implemented evidence:
 - `gemma3_paper_compare.py --environment` rejects paper comparison when
   required environment fields are missing unless explicitly overridden.
 - `run_model_loop_environment.lit` covers self-test and summary capture.
-- Current no-hardware capture reports `paper_comparable=False`; missing fields
-  are explicit rather than silently accepted.
+- Current no-hardware capture recovers repo-local tool paths and reports a
+  paper-comparable software environment; hardware fields remain explicit rather
+  than silently accepted when hardware is not required.
 
 ### Phase C: real Gemma3 model artifacts
 
@@ -433,17 +434,22 @@ Implemented evidence and blocker:
 - `gemma3_nonlinears.py` now records CPU reference, tensor contract,
   compile-lit availability, hardware-validation status, tolerance policy, and
   timed-window status for RMSNorm, QK-Norm, RoPE, GeGLU, and residual add.
-- The registry keeps all nonlinear/vector stages as unmeasured host fallbacks
-  until Gemma-specific AIR wrappers and hardware validation exist, so none are
-  promoted into paper-match timing yet.
+- The registry keeps all nonlinear/vector stages as host fallbacks until
+  Gemma-specific AIR wrappers and hardware validation exist, so none are
+  promoted into NPU paper-match timing yet.
+- `gemma3_results.py` now records fallback entries with backend, elapsed-ms,
+  timed-iteration count, measurement source, tensor contract, hardware status,
+  and `npu_promoted=false` for CPU-reference fallbacks.
 - `gemma3_paper_compare.py` rejects `PAPER_MATCH` for timed paper metrics when
   local result JSON declares an unmeasured host fallback that contributes to the
-  timed window; the comparison class is `UNMEASURED_HOST_FALLBACK`.
-- `run_model_loop_nonlinears.lit` and `run_model_loop_paper_compare.lit` cover
-  the nonlinear metadata and paper-match fallback gate.
+  timed window; measured host fallback records are accepted as accounted timing
+  but do not claim NPU promotion.
+- `run_model_loop_nonlinears.lit`, `run_model_loop_results.lit`, and
+  `run_model_loop_paper_compare.lit` cover the nonlinear metadata, measured
+  result records, and paper-match fallback gate.
 - Remaining work for full Phase E completion is real hardware validation for
-  promoted wrappers and measured timing inclusion/exclusion for each fallback;
-  this is blocked by the real-artifact/environment gaps recorded earlier.
+  promoted wrappers and end-to-end real-artifact timing; this is blocked by the
+  real-artifact gaps recorded earlier.
 
 ### Phase F: end-to-end 1B text reproduction
 
@@ -468,8 +474,9 @@ Acceptance:
 Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase F as `BLOCKED` while real
-  Gemma3 1B safetensors/tokenizer artifacts and measured nonlinear fallback
-  status are missing.
+  Gemma3 1B safetensors/tokenizer artifacts are missing. The prior
+  unmeasured-nonlinear fallback blocker is retired by measured CPU-reference
+  fallback records, but those records are not NPU promotion evidence.
 - No CPU/iGPU/NPU paper baseline or speedup claim is emitted while these
   blockers remain.
 
@@ -497,8 +504,9 @@ Acceptance:
 Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase G as `BLOCKED` while real
-  Gemma3 4B safetensors/tokenizer artifacts and measured nonlinear fallback
-  status are missing.
+  Gemma3 4B safetensors/tokenizer artifacts are missing. Measured host fallback
+  records account for timing metadata but do not replace nonlinear NPU
+  validation.
 - 64k/128k decode cells remain target-ledger entries only; no local paper claim
   is emitted without real KV-cache, memory, and schedule evidence.
 
@@ -525,8 +533,9 @@ Acceptance:
 Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase H as `BLOCKED` while real
-  Gemma3 4B vision artifacts, measured nonlinear fallback status, and the NPU
-  vision path are missing.
+  Gemma3 4B vision artifacts and the NPU vision path are missing. Measured host
+  fallback records account for text nonlinear timing metadata but do not
+  implement the vision path.
 - Existing text-only synthetic and blocked-result tests keep vision optional;
   no vision TTFT or speedup claim is emitted without real vision execution.
 

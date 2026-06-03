@@ -179,7 +179,13 @@ def _fallback_is_unmeasured(item: Any) -> bool:
     contributes = bool(item.get("contributes_to_timing", item.get("timed_window", True)))
     measured = bool(item.get("measured", False))
     status = str(item.get("status", ""))
-    if status in {"measured", "npu", "validated", "hardware-validated"}:
+    if status in {
+        "measured",
+        "measured-host-fallback",
+        "npu",
+        "validated",
+        "hardware-validated",
+    }:
         measured = True
     return contributes and not measured
 
@@ -273,6 +279,19 @@ def _fixture() -> dict[str, Any]:
                         "name": "rms_norm",
                         "contributes_to_timing": True,
                         "measured": False,
+                    }
+                ],
+            },
+            {
+                "target_id": "decode_tps_gemma3_1b_npu_2048",
+                "local_value": 40.5,
+                "correctness": "PASS",
+                "host_fallbacks": [
+                    {
+                        "name": "rms_norm",
+                        "status": "measured-host-fallback",
+                        "contributes_to_timing": True,
+                        "measured": True,
                     }
                 ],
             },

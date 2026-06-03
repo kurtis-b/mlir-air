@@ -3,4 +3,5 @@
 # CHECK: phase G model=gemma3-4b status=BLOCKED blockers=missing-safetensors,missing-tokenizer
 # CHECK: phase H model=gemma3-4b-vision status=BLOCKED blockers=missing-safetensors,missing-tokenizer
 # CHECK-SAME: vision-npu-path-not-implemented
+# CHECK-NOT: unmeasured-nonlinear-host-fallbacks
 # CHECK: GEMMA3_REPRODUCTION_BLOCKERS_SELF_TEST: PASS

@@ -50,6 +50,8 @@ def main() -> int:
     parser.add_argument("--compare-paper", action="store_true")
     parser.add_argument("--trace-size", type=int)
     parser.add_argument("--debug-ir", action="store_true")
+    parser.add_argument("--skip-host-fallback-measurement", action="store_true")
+    parser.add_argument("--fallback-timed-iters", type=int, default=3)
     args = parser.parse_args()
 
     if args.paper_benchmark:
@@ -69,6 +71,8 @@ def main() -> int:
             power_sample=args.power_sample,
             trace_size=args.trace_size,
             debug_ir=args.debug_ir,
+            measure_host_fallbacks=not args.skip_host_fallback_measurement,
+            fallback_timed_iters=args.fallback_timed_iters,
         )
         print(format_result(result))
         if result["classification"] == "MISSING_REAL_ARTIFACTS":

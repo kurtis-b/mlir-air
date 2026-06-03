@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
+from typing import Any
 
 import numpy as np
 from ml_dtypes import bfloat16
@@ -199,6 +201,59 @@ def validate_cpu_contracts(config: Gemma3TextConfig | None = None) -> dict[str, 
     }
 
 
+def measure_cpu_contracts(
+    config: Gemma3TextConfig | None = None,
+    *,
+    timed_iters: int = 3,
+) -> dict[str, dict[str, Any]]:
+    if timed_iters <= 0:
+        raise ValueError("timed_iters must be positive")
+    config = config or synthetic_text_config()
+    rng = np.random.default_rng(123)
+    x = rng.normal(size=(2, config.emb_dim)).astype(np.float32).astype(bfloat16)
+    row_weight = np.linspace(0.5, 1.5, config.emb_dim, dtype=np.float32).astype(bfloat16)
+    q = rng.normal(size=(2, config.n_heads, config.head_dim)).astype(np.float32).astype(bfloat16)
+    head_weight = np.linspace(0.75, 1.25, config.head_dim, dtype=np.float32).astype(bfloat16)
+    rope_lut = np.tile(
+        np.concatenate(
+            [
+                np.ones(config.head_dim // 2, dtype=np.float32),
+                np.zeros(config.head_dim // 2, dtype=np.float32),
+            ]
+        ),
+        (2, 1),
+    ).astype(bfloat16)
+    gate = rng.normal(size=(2, config.hidden_dim)).astype(np.float32).astype(bfloat16)
+    up = rng.normal(size=(2, config.hidden_dim)).astype(np.float32).astype(bfloat16)
+    residual_rhs = rms_norm(x, row_weight)
+
+    def residual_add() -> np.ndarray:
+        return (x.astype(np.float32) + residual_rhs.astype(np.float32)).astype(bfloat16)
+
+    operations = {
+        "rms_norm": lambda: rms_norm(x, row_weight),
+        "qk_norm": lambda: qk_norm(q, head_weight),
+        "rope": lambda: apply_rope_halfsplit(q, rope_lut[:, None, :]),
+        "mlp_activation": lambda: geglu(gate, up),
+        "residual_add": residual_add,
+    }
+    measurements: dict[str, dict[str, Any]] = {}
+    for name, operation in operations.items():
+        output = operation()
+        start = perf_counter()
+        for _ in range(timed_iters):
+            output = operation()
+        elapsed_ms = (perf_counter() - start) * 1000.0 / float(timed_iters)
+        measurements[name] = {
+            "elapsed_ms": elapsed_ms,
+            "timed_iters": timed_iters,
+            "shape": tuple(int(dim) for dim in output.shape),
+            "checksum": float(np.sum(output.astype(np.float32))),
+            "measurement_source": "synthetic-cpu-contract-microbenchmark",
+        }
+    return measurements
+
+
 def format_registry(config: Gemma3TextConfig | None = None) -> str:
     return "\n".join(spec.format() for spec in nonlinear_registry(config))
 
@@ -207,9 +262,16 @@ def _self_test() -> None:
     config = synthetic_text_config(n_layers=2)
     validate_registry_paths(config)
     checksums = validate_cpu_contracts(config)
+    measurements = measure_cpu_contracts(config, timed_iters=1)
     print(format_registry(config))
     for name, checksum in checksums.items():
         print(f"{name}_checksum={checksum:.6f}")
+    for name, measurement in measurements.items():
+        print(
+            f"{name}_fallback_measurement=measured-host-fallback "
+            f"elapsed_ms={measurement['elapsed_ms']:.6f} "
+            f"source={measurement['measurement_source']}"
+        )
     blockers = paper_match_blockers(config)
     print(f"nonlinear_paper_gate=PAPER_MATCH_BLOCKED unresolved={len(blockers)}")
     for blocker in blockers:
