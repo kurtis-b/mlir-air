@@ -188,7 +188,7 @@ def build_wiring_plan_from_preflight(preflight: Gemma3NPUPreflightPlan) -> Gemma
     blockers = [
         "xrt-model-runner-not-wired",
         "static-weight-bo-preload-not-wired",
-        "layer-intermediate-bo-plan-not-wired",
+        "xrt-bo-allocation-not-wired",
         "nonlinear-model-stage-promotion-incomplete",
         "paper-shape-hardware-rerun-required",
     ]
