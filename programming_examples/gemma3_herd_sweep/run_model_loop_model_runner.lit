@@ -1,7 +1,7 @@
 # RUN: %PYTHON %S/gemma3_model_runner.py --self-test | FileCheck %s
 # CHECK: model_runner model=gemma3-1b status=BLOCKED layers=2 prompt_len=16 decode_context=16 steps=57
 # CHECK-SAME: bo_status=DRY_RUN
-# CHECK-SAME: bo_allocations=2 bo_skipped=1 static_preload_tensors=2 buffer_status=READY_FOR_MODEL_RUNNER buffer_bindings=52 virtual_buffers=16 argument_binding_blockers=20 kernel_launches=20 host_fallbacks=28 host_runtime=4
+# CHECK-SAME: bo_allocations=2 bo_skipped=1 static_preload_tensors=2 buffer_status=READY_FOR_MODEL_RUNNER buffer_bindings=52 virtual_buffers=16 argument_binding_blockers=24 kernel_launches=24 host_fallbacks=24 host_runtime=4
 # CHECK-SAME: blockers=model-kernel-launch-not-wired,model-kernel-argument-binding-not-validated,full-static-weight-bo-preload-not-validated,paper-shape-bo-allocation-not-validated,nonlinear-model-stage-promotion-incomplete,paper-shape-hardware-rerun-required
 # CHECK: runner_step 0 phase=setup layer=model role=allocate_bo:static_projection_weights action=plan_bo backend=dry-run
 # CHECK: runner_step 2 phase=setup layer=model role=allocate_bo:kv_cache_k action=plan_bo backend=dry-run
@@ -11,4 +11,6 @@
 # CHECK: runner_step 5 phase=prefill layer=L0 role=pre_attention_norm action=run_host_fallback
 # CHECK: runner_step 6 phase=prefill layer=L0 role=qkv_projection action=launch_kernel backend=npu-candidate kernel=q4nx+bf16_mm
 # CHECK-SAME: blockers=model-kernel-launch-not-wired,paper-shape-hardware-rerun-required
+# CHECK: runner_step 15 phase=prefill layer=L0 role=mlp_activation action=launch_kernel backend=npu-candidate kernel=mlp_activation route=geglu/standalone-elf-smoke
+# CHECK-SAME: status=standalone-hardware-smoke-model-candidate blockers=model-kernel-launch-not-wired,paper-shape-hardware-rerun-required
 # CHECK: GEMMA3_MODEL_RUNNER_SELF_TEST: PASS

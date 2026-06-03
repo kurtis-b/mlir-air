@@ -482,10 +482,13 @@ Implemented evidence and blocker:
 - `gemma3_nonlinears.py` now records CPU reference, tensor contract,
   compile-lit availability, hardware-validation status, tolerance policy, and
   timed-window status for RMSNorm, QK-Norm, RoPE, GeGLU, and residual add.
-- The registry keeps nonlinear/vector stages as host fallbacks until
-  Gemma-specific model wiring uses validated kernels. RMSNorm, QK-Norm, and
-  GeGLU now have standalone ELF hardware-smoke validation, but they are not
-  promoted into model timing yet.
+- The registry keeps nonlinear/vector stages conservative until
+  Gemma-specific model wiring uses validated kernels. GeGLU/MLP activation now
+  enters the model wiring as an NPU launch candidate using its standalone ELF
+  hardware-smoke evidence, but it is not model-timed until launch and argument
+  binding are validated. RMSNorm and QK-Norm remain host fallbacks until their
+  norm-weight BO/preload path is added; RoPE and residual add still need Gemma
+  wrappers or explicit measured fallback treatment.
 - `gemma3_results.py` now records fallback entries with backend, elapsed-ms,
   timed-iteration count, measurement source, tensor contract, hardware status,
   and `npu_promoted=false` for CPU-reference fallbacks.
@@ -496,9 +499,11 @@ Implemented evidence and blocker:
 - `run_model_loop_nonlinears.lit`, `run_model_loop_results.lit`, and
   `run_model_loop_paper_compare.lit` cover the nonlinear metadata, measured
   result records, and paper-match fallback gate.
-- Remaining work for full Phase E completion is Gemma model wiring for the
-  validated RMSNorm, QK-Norm, and GeGLU paths plus RoPE, residual, logits, and
-  sampling promotion or measured timing treatment in end-to-end execution.
+- Remaining work for full Phase E completion is model launch/binding
+  validation for the promoted GeGLU path, Gemma model wiring for RMSNorm and
+  QK-Norm once norm static weights are planned/preloaded, plus RoPE, residual,
+  logits, and sampling promotion or measured timing treatment in end-to-end
+  execution.
 
 ### Phase F: end-to-end 1B text reproduction
 
@@ -535,7 +540,9 @@ Blocked evidence:
   real projection padding and Q4NX block counts needed for NPU wiring.
   `gemma3_npu_wiring.py` maps each real-shape text layer into prefill/decode
   stage roles, NPU kernel candidates, host fallbacks, local/global attention
-  windows, and remaining launch/argument-binding blockers.
+  windows, and remaining launch/argument-binding blockers; GeGLU/MLP activation
+  is now represented as a model NPU candidate backed by standalone hardware
+  smoke evidence.
   `gemma3_weight_plan.py`
   records real text-stack projection static BO byte estimates for future
   preloading.
@@ -1363,9 +1370,10 @@ Milestones:
 
 - Reuse `weighted_rms_norm` for RMSNorm where layout-compatible.
 - Reuse or wrap RoPE only after the Gemma rotation convention is documented.
-- Add Gemma QK-Norm under `gemma3_dataflow_kernels` if no existing wrapper fits.
-- Select GELU/GeGLU/SwiGLU from Gemma evidence, then reuse `gelu`, `ffn_swiglu`,
-  or add a Gemma-specific activation kernel.
+- Add the norm-weight BO/preload path needed to use the validated weighted
+  RMSNorm wrapper for Gemma RMSNorm and QK-Norm in the model loop.
+- Keep the promoted GeGLU/MLP activation path as a model NPU candidate and
+  validate launch/argument binding before counting it in timed model results.
 - Add residual/add/multiply vector kernels only when they reduce host fallback
   cost without changing tensor contracts.
 
