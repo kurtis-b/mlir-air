@@ -19,6 +19,7 @@ from gemma3_environment import capture_environment
 from gemma3_nonlinears import measure_cpu_contracts, paper_match_blockers
 from gemma3_paper_compare import load_targets, target_by_id
 from gemma3_power import capture_power_snapshot
+from gemma3_real_execution import Gemma3ExecutionError, run_cpu_benchmark
 
 DEFAULT_POWER_WATTS = {"cpu": None, "gpu": None, "npu": None, "total": None}
 TABLE_BY_METRIC = {
@@ -189,6 +190,31 @@ def build_model_runner_record(
             "error": str(exc),
         }
 
+
+def _paper_delta_pct(target: dict[str, Any], local_value: float) -> tuple[float | None, float | None]:
+    if "paper_min" in target and "paper_max" in target:
+        low = float(target["paper_min"])
+        high = float(target["paper_max"])
+        if low <= local_value <= high:
+            return 0.0, None
+        nearest = low if local_value < low else high
+        return abs(local_value - nearest) / nearest * 100.0, nearest
+    paper_value = target.get("paper_value")
+    if paper_value is None:
+        return None, None
+    paper_value = float(paper_value)
+    if paper_value == 0.0:
+        return (0.0 if local_value == 0.0 else float("inf")), paper_value
+    return abs(local_value - paper_value) / paper_value * 100.0, paper_value
+
+
+def _classification_for_delta(delta_pct: float | None) -> str:
+    if delta_pct is None:
+        return "EXPLAINED_DEVIATION"
+    threshold = float(load_targets().get("similarity_threshold_pct", 20.0))
+    return "PAPER_MATCH" if delta_pct <= threshold else "EXPLAINED_DEVIATION"
+
+
 def fallback_records(
     *,
     measure_host_fallbacks: bool = True,
@@ -275,9 +301,13 @@ def build_paper_result(
     )
 
     notes = missing_artifact_notes(inventory)
-    host_fallbacks = fallback_records(
-        measure_host_fallbacks=measure_host_fallbacks,
-        fallback_timed_iters=fallback_timed_iters,
+    host_fallbacks = (
+        fallback_records(
+            measure_host_fallbacks=measure_host_fallbacks,
+            fallback_timed_iters=fallback_timed_iters,
+        )
+        if backend == "npu"
+        else []
     )
     if host_fallbacks:
         if all(item.get("measured") for item in host_fallbacks):
@@ -287,9 +317,57 @@ def build_paper_result(
             )
         else:
             notes.append("one or more nonlinear host fallbacks are unmeasured")
+
+    local_value: float | None = None
+    delta_pct: float | None = None
+    real_benchmark: dict[str, Any] | None = None
+    explanation: str | None = None
     if not inventory.can_load_real_artifacts:
         classification = "MISSING_REAL_ARTIFACTS"
         correctness = "BLOCKED_REAL_ARTIFACTS"
+    elif backend == "cpu":
+        try:
+            benchmark = run_cpu_benchmark(
+                model_variant=model_variant,
+                weights_dir=weights_dir,
+                max_prompt_tokens=prompt_len,
+                metric=metric,
+                decode_tokens=decode_tokens,
+                warmup_iters=warmup_iters,
+                timed_iters=timed_iters,
+                power_sample=power_sample,
+                run_id=target["id"],
+            )
+        except (Gemma3ExecutionError, ValueError) as exc:
+            classification = "REAL_MODEL_EXECUTION_FAILED"
+            correctness = "LOCAL_FAIL"
+            notes.append(f"real CPU/HF execution failed: {exc}")
+        else:
+            local_value = float(benchmark.local_value)
+            delta_pct, nearest_paper_value = _paper_delta_pct(target, local_value)
+            classification = _classification_for_delta(delta_pct)
+            correctness = "PASS"
+            if classification == "EXPLAINED_DEVIATION":
+                explanation = (
+                    "local CPU/HF measurement uses this Strix host and Transformers runtime; "
+                    "it is a baseline cell, not validated NPU paper parity"
+                )
+            real_benchmark = benchmark.to_json_dict()
+            notes.extend(benchmark.notes)
+            notes.append(
+                "CPU/HF baseline uses local Transformers execution; it is not an NPU paper-parity claim"
+            )
+            if nearest_paper_value is not None:
+                notes.append(f"nearest_paper_value={nearest_paper_value:g}")
+            if benchmark.power_snapshot:
+                power_data = benchmark.power_snapshot
+                power = SimpleNamespace(
+                    watts=power_data.get("watts", DEFAULT_POWER_WATTS),
+                    field_status=power_data.get("field_status", {}),
+                    sampling_backend=power_data.get("sampling_backend"),
+                    aligned_with_timed_window=power_data.get("aligned_with_timed_window", False),
+                    notes=tuple(power_data.get("notes", ())),
+                )
     else:
         classification = "REAL_MODEL_EXECUTION_NOT_IMPLEMENTED"
         correctness = "BLOCKED_EXECUTION_NOT_IMPLEMENTED"
@@ -328,12 +406,13 @@ def build_paper_result(
         "metric": metric,
         "sequence_length": prompt_len,
         "decode_tokens": decode_tokens,
-        "local_value": None,
+        "local_value": local_value,
         "paper_value": paper_value,
         "unit": target.get("unit", UNIT_BY_METRIC.get(metric, "unknown")),
-        "delta_pct": None,
+        "delta_pct": delta_pct,
         "classification": classification,
         "correctness": correctness,
+        "explanation": explanation,
         "host_fallbacks": host_fallbacks,
         "command": command_text,
         "git_commit": env["git"].get("commit"),
@@ -353,6 +432,7 @@ def build_paper_result(
         "artifact_inventory": inventory.to_json_dict(),
         "execution_wiring": execution_wiring,
         "model_runner": model_runner,
+        "real_benchmark": real_benchmark,
         "notes": notes,
     }
 

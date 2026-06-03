@@ -1,0 +1,136 @@
+{
+  "artifact_format": "elf",
+  "artifact_inventory": {
+    "can_load_real_artifacts": true,
+    "config_exists": true,
+    "config_path": "/home/cj/models/gemma-3-1b-pt/config.json",
+    "default_weights_dir": "/home/cj/models/gemma-3-1b-pt",
+    "default_weights_dir_used": true,
+    "has_vision": false,
+    "has_weight_files": true,
+    "model_variant": "gemma3-1b",
+    "optional_packages": {
+      "safetensors": true,
+      "sentencepiece": true,
+      "tokenizers": true,
+      "transformers": true
+    },
+    "processor_exists": false,
+    "processor_path": null,
+    "q4nx_contract": {
+      "cols": 256,
+      "logical_formula": "w_bf16[row, col] = scale[col] * q4[row, col] + min[col]",
+      "matrix_order": "projection weights are stored as out_dim x in_dim blocks",
+      "min_offset_dtype": "bfloat16",
+      "packed_nibble_order": "low_nibble_first",
+      "rows": 32,
+      "scale_dtype": "bfloat16"
+    },
+    "safetensors": [
+      "/home/cj/models/gemma-3-1b-pt/model.safetensors"
+    ],
+    "source_repo": "google/gemma-3-1b-pt",
+    "tokenizer_exists": true,
+    "tokenizer_path": "/home/cj/models/gemma-3-1b-pt/tokenizer.json",
+    "weights_dir": "/home/cj/models/gemma-3-1b-pt"
+  },
+  "backend": "cpu",
+  "classification": "EXPLAINED_DEVIATION",
+  "command": "gemma3_inference.py --paper-benchmark --model-variant gemma3-1b --backend cpu --prompt-len 1024 --decode-tokens 0 --metric prefill_ttft_seconds --warmup-iters 0 --timed-iters 1 --power-sample --compare-paper --result-json programming_examples/gemma3_herd_sweep/results/gemma3_1b_cpu_prefill_1k_initial.json",
+  "compile_time_included": false,
+  "correctness": "PASS",
+  "decode_tokens": 0,
+  "delta_pct": 61.05514699449818,
+  "dirty_worktree": true,
+  "environment_comparable": true,
+  "execution_wiring": null,
+  "explanation": "local CPU/HF measurement uses this Strix host and Transformers runtime; it is a baseline cell, not validated NPU paper parity",
+  "git_commit": "0ad5250f81fa1183d08c411bfd0edad567ff7c22",
+  "host_fallbacks": [],
+  "local_value": 1.581161032023374,
+  "metric": "prefill_ttft_seconds",
+  "missing_environment_fields": [],
+  "model_runner": null,
+  "model_variant": "gemma3-1b",
+  "notes": [
+    "real CPU/HF measurement for the requested sequence length",
+    "prefill_ttft measures one full prompt forward pass",
+    "CPU/HF baseline uses local Transformers execution; it is not an NPU paper-parity claim",
+    "nearest_paper_value=4.06",
+    "permission denied reading /sys/class/powercap/intel-rapl:0/energy_uj",
+    "permission denied reading /sys/class/powercap/intel-rapl:0:0/energy_uj",
+    "no readable RAPL energy counters"
+  ],
+  "npu_power_mode": "Power Mode             : Default",
+  "paper_source": "arxiv_pdf_v2",
+  "paper_table": "prefill/decode text tables",
+  "paper_value": 4.06,
+  "power_aligned_with_timed_window": false,
+  "power_sampling_backend": "rapl-unavailable",
+  "power_status": {
+    "cpu": "MISSING_POWER_FIELD",
+    "gpu": "MISSING_POWER_FIELD",
+    "npu": "MISSING_POWER_FIELD",
+    "total": "MISSING_POWER_FIELD"
+  },
+  "power_watts": {
+    "cpu": null,
+    "gpu": null,
+    "npu": null,
+    "total": null
+  },
+  "real_benchmark": {
+    "backend": "cpu-hf",
+    "decode_tokens": 0,
+    "load_seconds": 1.771319017978385,
+    "local_value": 1.581161032023374,
+    "logits_shape": [
+      1,
+      1024,
+      262144
+    ],
+    "mean_seconds": 1.581161032023374,
+    "metric": "prefill_ttft_seconds",
+    "model_variant": "gemma3-1b",
+    "notes": [
+      "real CPU/HF measurement for the requested sequence length",
+      "prefill_ttft measures one full prompt forward pass"
+    ],
+    "power_snapshot": {
+      "aligned_with_timed_window": false,
+      "field_status": {
+        "cpu": "MISSING_POWER_FIELD",
+        "gpu": "MISSING_POWER_FIELD",
+        "npu": "MISSING_POWER_FIELD",
+        "total": "MISSING_POWER_FIELD"
+      },
+      "notes": [
+        "permission denied reading /sys/class/powercap/intel-rapl:0/energy_uj",
+        "permission denied reading /sys/class/powercap/intel-rapl:0:0/energy_uj",
+        "no readable RAPL energy counters"
+      ],
+      "run_id": "prefill_ttft_seconds_gemma3_1b_cpu_1024",
+      "sampling_backend": "rapl-unavailable",
+      "schema_version": 1,
+      "watts": {
+        "cpu": null,
+        "gpu": null,
+        "npu": null,
+        "total": null
+      }
+    },
+    "prompt_token_count": 1024,
+    "status": "PASS",
+    "timed_iters": 1,
+    "unit": "seconds",
+    "warmup_iters": 0,
+    "weights_dir": "/home/cj/models/gemma-3-1b-pt"
+  },
+  "schema_version": 1,
+  "sequence_length": 1024,
+  "target_id": "prefill_ttft_seconds_gemma3_1b_cpu_1024",
+  "timed_iters": 1,
+  "unit": "seconds",
+  "warmup_iters": 0,
+  "xrt_version": "Version              : 2.21.75"
+}

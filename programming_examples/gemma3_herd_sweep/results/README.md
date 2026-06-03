@@ -5,6 +5,25 @@ JSON result cells, Markdown summaries, and CSV summaries. Large model weights,
 tokenizer caches, xclbins, ELFs, trace dumps, and debug IR should stay out of
 source control unless they are reviewed as compact fixtures.
 
+## Initial 1k CPU/NPU Paper-Cell Evidence
+
+- `gemma3_1b_cpu_prefill_1k_initial.json`: real local Gemma3 1B CPU/HF 1k
+  prefill TTFT measurement. Local runtime-only TTFT is 1.581161032 s versus the
+  paper CPU target of 4.06 s, classified as `EXPLAINED_DEVIATION`.
+- `gemma3_1b_cpu_decode_1k_initial.json`: real local Gemma3 1B CPU/HF 1k
+  decode-only TPS measurement. The helper builds the KV cache before the timed
+  section and times 16 token steps. Local TPS is 13.637000294 versus the paper
+  CPU target of 41.9, classified as `EXPLAINED_DEVIATION`.
+- `gemma3_1b_npu_prefill_1k_blocked_initial.json` and
+  `gemma3_1b_npu_decode_1k_blocked_initial.json`: matching NPU paper cells that
+  record `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` rather than timing data because
+  model-kernel launch, kernel argument binding, nonlinear model-stage
+  promotion, and paper-shape hardware reruns remain incomplete.
+- Power sampling was requested for these cells, but all CPU/GPU/NPU/total rails
+  remain `MISSING_POWER_FIELD`: XRT reports `Estimated Power: N/A`, RAPL
+  energy counters deny reads, and available sensor output does not expose a
+  CPU/NPU/total timed-window wattage rail.
+
 
 ## Static Preload Evidence
 

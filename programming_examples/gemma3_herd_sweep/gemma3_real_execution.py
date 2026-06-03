@@ -19,6 +19,7 @@ from time import perf_counter
 from typing import Any
 
 from gemma3_artifacts import MODEL_SPECS, Gemma3ArtifactError, load_real_model_artifacts
+from gemma3_power import begin_power_window, finish_power_window
 
 
 class Gemma3ExecutionError(RuntimeError):
@@ -73,6 +74,7 @@ class Gemma3RealBenchmarkReport:
     load_seconds: float
     mean_seconds: float
     logits_shape: tuple[int, ...]
+    power_snapshot: dict[str, Any] | None = None
     notes: tuple[str, ...] = ()
 
     def to_json_dict(self) -> dict[str, Any]:
@@ -97,6 +99,27 @@ def _trim_inputs(inputs: Any, max_prompt_tokens: int) -> Any:
         if "attention_mask" in inputs:
             inputs["attention_mask"] = inputs["attention_mask"][..., :max_prompt_tokens]
     return inputs
+
+
+def _exact_text_inputs(tokenizer: Any, torch_module: Any, prompt: str, target_tokens: int) -> dict[str, Any]:
+    if target_tokens <= 0:
+        raise ValueError("target_tokens must be positive")
+    tokenized = tokenizer(
+        prompt.strip() or "Gemma3 paper reproduction benchmark.",
+        add_special_tokens=True,
+        return_attention_mask=False,
+    )
+    ids = list(tokenized["input_ids"])
+    if ids and isinstance(ids[0], list):
+        ids = list(ids[0])
+    if not ids:
+        raise Gemma3ExecutionError("tokenizer produced no prompt tokens")
+    repeat_ids = ids[1:] if len(ids) > 1 else ids
+    while len(ids) < target_tokens:
+        ids.extend(repeat_ids[: target_tokens - len(ids)])
+    input_ids = torch_module.tensor([ids[:target_tokens]], dtype=torch_module.long)
+    attention_mask = torch_module.ones_like(input_ids)
+    return {"input_ids": input_ids, "attention_mask": attention_mask}
 
 
 def _load_cpu_model_inputs(
@@ -136,8 +159,7 @@ def _load_cpu_model_inputs(
             inventory.weights_dir,
             dtype=torch.bfloat16,
         )
-        inputs = tokenizer(prompt, return_tensors="pt")
-        inputs = _trim_inputs(inputs, max_prompt_tokens)
+        inputs = _exact_text_inputs(tokenizer, torch, prompt, max_prompt_tokens)
     else:
         try:
             from PIL import Image
@@ -155,8 +177,7 @@ def _load_cpu_model_inputs(
             text = prompt if "<start_of_image>" in prompt else "<start_of_image> " + prompt
             inputs = processor(text=text, images=image, return_tensors="pt")
         else:
-            inputs = processor(text=prompt, return_tensors="pt")
-            inputs = _trim_inputs(inputs, max_prompt_tokens)
+            inputs = _exact_text_inputs(tokenizer, torch, prompt, max_prompt_tokens)
     model.eval()
     return inventory, model, tokenizer, processor, inputs, perf_counter() - load_start
 
@@ -224,6 +245,8 @@ def run_cpu_benchmark(
     warmup_iters: int = 0,
     timed_iters: int = 1,
     vision_smoke: bool = False,
+    power_sample: bool = False,
+    run_id: str | None = None,
 ) -> Gemma3RealBenchmarkReport:
     if metric not in ("prefill_ttft_seconds", "decode_tps", "vision_ttft_seconds"):
         raise ValueError("metric must be prefill_ttft_seconds, decode_tps, or vision_ttft_seconds")
@@ -245,25 +268,67 @@ def run_cpu_benchmark(
     )
     prompt_token_count = int(inputs["input_ids"].shape[-1])
 
-    def run_once() -> Any:
-        if metric == "decode_tps":
-            return model.generate(
-                **inputs,
-                max_new_tokens=decode_tokens,
-                do_sample=False,
-                use_cache=True,
-            )
+    def run_prefill() -> Any:
         return model(**inputs)
 
-    with torch.no_grad():
-        for _ in range(warmup_iters):
-            run_once()
-        elapsed = 0.0
+    def prepare_decode_state() -> tuple[Any, Any, Any]:
+        prefill_output = model(**inputs, use_cache=True)
+        past_key_values = prefill_output.past_key_values
+        next_token = prefill_output.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.clone()
+        return past_key_values, next_token, attention_mask
+
+    def run_decode_tokens(state: tuple[Any, Any, Any]) -> Any:
+        past_key_values, next_token, attention_mask = state
         output = None
-        for _ in range(timed_iters):
-            start = perf_counter()
-            output = run_once()
-            elapsed += perf_counter() - start
+        for _ in range(decode_tokens):
+            decode_inputs: dict[str, Any] = {
+                "input_ids": next_token,
+                "past_key_values": past_key_values,
+                "use_cache": True,
+            }
+            if attention_mask is not None:
+                extension = torch.ones(
+                    (attention_mask.shape[0], 1),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+                attention_mask = torch.cat([attention_mask, extension], dim=-1)
+                decode_inputs["attention_mask"] = attention_mask
+            output = model(**decode_inputs)
+            past_key_values = output.past_key_values
+            next_token = output.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        return output
+
+    with torch.no_grad():
+        if metric == "decode_tps":
+            for _ in range(warmup_iters):
+                run_decode_tokens(prepare_decode_state())
+            decode_states = [prepare_decode_state() for _ in range(timed_iters)]
+            elapsed = 0.0
+            output = None
+            power_window = begin_power_window(sample=power_sample, run_id=run_id)
+            for state in decode_states:
+                start = perf_counter()
+                output = run_decode_tokens(state)
+                elapsed += perf_counter() - start
+        else:
+            for _ in range(warmup_iters):
+                run_prefill()
+            elapsed = 0.0
+            output = None
+            power_window = begin_power_window(sample=power_sample, run_id=run_id)
+            for _ in range(timed_iters):
+                start = perf_counter()
+                output = run_prefill()
+                elapsed += perf_counter() - start
+    power_snapshot = (
+        finish_power_window(power_window, elapsed_seconds=elapsed).to_json_dict()
+        if power_sample
+        else None
+    )
     mean_seconds = elapsed / float(timed_iters)
 
     if metric == "decode_tps":
@@ -290,7 +355,13 @@ def run_cpu_benchmark(
         load_seconds=load_seconds,
         mean_seconds=mean_seconds,
         logits_shape=logits_shape,
-        notes=("not paper-comparable until full sequence/backend matrix is run",),
+        power_snapshot=power_snapshot,
+        notes=(
+            "real CPU/HF measurement for the requested sequence length",
+            "decode_tps excludes prefill by constructing the KV cache before the timed decode loop"
+            if metric == "decode_tps"
+            else "prefill_ttft measures one full prompt forward pass",
+        ),
     )
 
 
@@ -358,6 +429,8 @@ def main() -> int:
     parser.add_argument("--warmup-iters", type=int, default=0)
     parser.add_argument("--timed-iters", type=int, default=1)
     parser.add_argument("--vision-smoke", action="store_true")
+    parser.add_argument("--power-sample", action="store_true")
+    parser.add_argument("--run-id")
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
 
@@ -393,6 +466,8 @@ def main() -> int:
                 warmup_iters=args.warmup_iters,
                 timed_iters=args.timed_iters,
                 vision_smoke=args.vision_smoke,
+                power_sample=args.power_sample,
+                run_id=args.run_id,
             )
         except (Gemma3ExecutionError, ValueError) as exc:
             print(f"GEMMA3_REAL_BENCHMARK_BLOCKED: {exc}")
