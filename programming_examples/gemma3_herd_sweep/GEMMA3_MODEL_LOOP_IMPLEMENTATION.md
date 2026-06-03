@@ -81,6 +81,10 @@ Implemented files:
 - `gemma3_npu_preflight.py`: real-shape NPU preflight planner that derives
   projection padding, Q4NX block counts, attention metadata, and the remaining
   NPU execution blocker from local artifacts.
+- `gemma3_npu_wiring.py`: real-shape per-layer execution wiring manifest that
+  records prefill/decode stage roles, NPU kernel candidates, host fallbacks,
+  attention windows, and the remaining XRT/model-runner blockers without
+  claiming execution.
 
 Focused lit coverage:
 
@@ -93,6 +97,7 @@ Focused lit coverage:
 - `run_model_loop_vision.lit`
 - `run_model_loop_real_execution.lit`
 - `run_model_loop_npu_preflight.lit`
+- `run_model_loop_npu_wiring.lit`
 - `../gemma3_dataflow_kernels/run_geglu_compile_only.lit`
 
 Current phase status:
@@ -235,7 +240,7 @@ typographical error, or a derived value from the figure.
 | --- | --- | --- |
 | Model weights | Synthetic Q4NX/BF16-compatible weights only | Real Gemma3 1B and 4B weights, quantized/packed in the same Q4NX contract used by the NPU kernels |
 | Tokenizer and prompts | Synthetic token IDs | Real tokenizer, deterministic prompts, and sequence lengths 1k-32k for 1B and 1k-128k decode for 4B |
-| Text runtime | Host-driven synthetic loop with CPU references and manifests | End-to-end NPU execution for all validated model substeps, with host fallbacks removed or measured separately |
+| Text runtime | Host-driven synthetic loop with CPU references, manifests, real-shape preflight, and per-layer NPU wiring metadata | End-to-end NPU execution for all validated model substeps, with host fallbacks removed or measured separately |
 | Vision runtime | Disabled contract plus synthetic CPU non-causal vision prefill and visual context token handoff contract | 4B vision prefill path with non-causal attention validated on NPU and timed against paper |
 | Nonlinear operations | CPU fallbacks plus standalone GeGLU candidate; host fallback microbenchmarks are recorded in result JSON | RMSNorm, QK-Norm, RoPE, residual add, activation, logits, and sampling either validated on NPU or explicitly accounted for in timing |
 | Baselines | No comparable CPU/iGPU model path | CPU and iGPU runs for the exact same model variant, prompt lengths, output count, tokenizer, and measurement window |
@@ -488,16 +493,20 @@ Acceptance:
 
 Blocked evidence:
 
-- `gemma3_reproduction_blockers.py` reports Phase F as `BLOCKED` while real
-  Gemma3 1B safetensors/tokenizer artifacts are missing. The prior
-  unmeasured-nonlinear fallback blocker is retired by measured CPU-reference
-  fallback records, but those records are not NPU promotion evidence.
+- `gemma3_reproduction_blockers.py` reports Phase F as `BLOCKED` because
+  local 1B artifacts are available but end-to-end NPU model execution is not
+  implemented. The prior unmeasured-nonlinear fallback blocker is retired by
+  measured CPU-reference fallback records, but those records are not NPU
+  promotion evidence.
 - Dependency-light CPU/HF smoke paths now validate local 1B text, 4B text,
   and 4B synthetic-image weights/tokenizer/processor execution without AIR
   imports. `gemma3_npu_preflight.py` records
-  real projection padding and Q4NX block counts needed for NPU wiring. No
-  CPU/iGPU/NPU paper baseline or speedup claim is emitted until
-  benchmark-length execution and NPU model execution are implemented.
+  real projection padding and Q4NX block counts needed for NPU wiring.
+  `gemma3_npu_wiring.py` maps each real-shape text layer into prefill/decode
+  stage roles, NPU kernel candidates, host fallbacks, local/global attention
+  windows, and remaining runner blockers. No CPU/iGPU/NPU paper baseline or
+  speedup claim is emitted until benchmark-length execution and NPU model
+  execution are implemented.
 
 ### Phase G: end-to-end 4B text reproduction
 
@@ -522,12 +531,14 @@ Acceptance:
 
 Blocked evidence:
 
-- `gemma3_reproduction_blockers.py` reports Phase G as `BLOCKED` while real
-  Gemma3 4B safetensors/tokenizer artifacts are missing. Measured host fallback
-  records account for timing metadata but do not replace nonlinear NPU
-  validation.
-- 64k/128k decode cells remain target-ledger entries only; no local paper claim
-  is emitted without real KV-cache, memory, and schedule evidence.
+- `gemma3_reproduction_blockers.py` reports Phase G as `BLOCKED` because
+  local 4B artifacts are available but end-to-end NPU model execution is not
+  implemented. Measured host fallback records account for timing metadata but do
+  not replace nonlinear NPU validation.
+- `gemma3_npu_wiring.py` emits the 4B text per-layer NPU candidate and host
+  fallback plan from local artifacts, including the 5-local/1-global attention
+  pattern, but no 64k/128k local paper claim is emitted without real KV-cache,
+  memory, XRT runner, and schedule evidence.
 
 ### Phase H: 4B vision path reproduction
 
@@ -551,10 +562,11 @@ Acceptance:
 
 Blocked evidence:
 
-- `gemma3_reproduction_blockers.py` reports Phase H as `BLOCKED` while real
-  Gemma3 4B vision artifacts and processor files are missing and the synthetic
-  vision contract is not NPU-validated. Measured host fallback records account
-  for text nonlinear timing metadata but do not validate vision hardware.
+- `gemma3_reproduction_blockers.py` reports Phase H as `BLOCKED` because
+  local 4B vision artifacts and processor files are available but end-to-end NPU
+  model execution and the vision NPU path are not implemented. Measured host
+  fallback records account for text nonlinear timing metadata but do not
+  validate vision hardware.
 - Existing text-only synthetic and blocked-result tests keep vision optional;
   the enabled vision smoke is a CPU-reference contract for non-causal attention
   and visual context token shape only. No vision TTFT or speedup claim is
