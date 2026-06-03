@@ -21,6 +21,7 @@ from gemma3_weight_plan import Gemma3StaticWeightPlan, build_weight_plan
 
 
 BF16_BYTES = 2
+KV_STRATEGIES = ("benchmark-cell", "monolithic")
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,9 @@ class Gemma3BOPlan:
     layers: int
     prompt_len: int
     decode_context: int
+    kv_strategy: str
+    kv_record_count: int
+    max_bo_bytes: int
     total_bytes: int
     dynamic_bytes: int
     static_bytes: int
@@ -60,7 +64,9 @@ class Gemma3BOPlan:
         lines = [
             f"bo_plan model={self.model_variant} status={self.status} "
             f"layers={self.layers} prompt_len={self.prompt_len} "
-            f"decode_context={self.decode_context} total_bytes={self.total_bytes} "
+            f"decode_context={self.decode_context} kv_strategy={self.kv_strategy} "
+            f"kv_records={self.kv_record_count} max_bo_bytes={self.max_bo_bytes} "
+            f"total_bytes={self.total_bytes} "
             f"dynamic_bytes={self.dynamic_bytes} static_bytes={self.static_bytes} "
             f"blockers={blockers}"
         ]
@@ -93,12 +99,58 @@ def _record(name: str, scope: str, shape: tuple[int, ...], *, static: bool = Fal
     )
 
 
+def _attention_kind(layer_index: int) -> str:
+    return "global_full" if layer_index % 6 == 5 else "local_swa"
+
+
+def _local_cache_tokens(decode_context: int, sliding_window: int | None) -> int:
+    if sliding_window is None or sliding_window <= 0:
+        return decode_context
+    return min(decode_context, int(sliding_window))
+
+
+def _kv_cache_records(
+    *,
+    layers: int,
+    decode_context: int,
+    kv_heads: int,
+    head_dim: int,
+    sliding_window: int | None,
+    kv_strategy: str,
+) -> list[Gemma3BORecord]:
+    if kv_strategy not in KV_STRATEGIES:
+        choices = ", ".join(KV_STRATEGIES)
+        raise ValueError(f"kv_strategy must be one of: {choices}")
+    if kv_strategy == "monolithic":
+        return [
+            _record("kv_cache_k", "model", (layers, decode_context, kv_heads, head_dim), notes="all-layer K cache"),
+            _record("kv_cache_v", "model", (layers, decode_context, kv_heads, head_dim), notes="all-layer V cache"),
+        ]
+
+    records: list[Gemma3BORecord] = []
+    for layer_index in range(layers):
+        attention_kind = _attention_kind(layer_index)
+        cache_tokens = decode_context if attention_kind == "global_full" else _local_cache_tokens(decode_context, sliding_window)
+        if attention_kind == "global_full":
+            notes = "global attention layer K/V cache; full decode context"
+        else:
+            notes = f"local SWA layer K/V cache; window={cache_tokens}"
+        records.extend(
+            [
+                _record(f"kv_cache_k_L{layer_index}", "layer", (cache_tokens, kv_heads, head_dim), notes=f"{notes}; K"),
+                _record(f"kv_cache_v_L{layer_index}", "layer", (cache_tokens, kv_heads, head_dim), notes=f"{notes}; V"),
+            ]
+        )
+    return records
+
+
 def build_bo_plan_from_preflight(
     preflight: Gemma3NPUPreflightPlan,
     weight_plan: Gemma3StaticWeightPlan,
     *,
     prompt_len: int,
     decode_context: int,
+    kv_strategy: str = "benchmark-cell",
 ) -> Gemma3BOPlan:
     if prompt_len <= 0 or decode_context <= 0:
         raise ValueError("prompt_len and decode_context must be positive")
@@ -115,6 +167,14 @@ def build_bo_plan_from_preflight(
     heads = int(preflight.num_attention_heads)
     kv_heads = int(preflight.num_key_value_heads)
     head_dim = int(preflight.head_dim)
+    kv_records = _kv_cache_records(
+        layers=layers,
+        decode_context=decode_context,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        sliding_window=preflight.sliding_window,
+        kv_strategy=kv_strategy,
+    )
 
     records = [
         Gemma3BORecord(
@@ -141,9 +201,7 @@ def build_bo_plan_from_preflight(
         _record("decode_k", "decode", (1, kv_heads, head_dim), notes="decode key append"),
         _record("decode_v", "decode", (1, kv_heads, head_dim), notes="decode value append"),
         _record("decode_attention_out", "decode", (1, hidden), notes="FlowKV output"),
-        _record("kv_cache_k", "model", (layers, decode_context, kv_heads, head_dim), notes="all-layer K cache"),
-        _record("kv_cache_v", "model", (layers, decode_context, kv_heads, head_dim), notes="all-layer V cache"),
-    ]
+    ] + kv_records
     static_bytes = weight_plan.static_bo_bytes
     dynamic_bytes = sum(record.bytes for record in records if not record.static)
     return Gemma3BOPlan(
@@ -152,6 +210,9 @@ def build_bo_plan_from_preflight(
         layers=layers,
         prompt_len=prompt_len,
         decode_context=decode_context,
+        kv_strategy=kv_strategy,
+        kv_record_count=len(kv_records),
+        max_bo_bytes=max(record.bytes for record in records),
         total_bytes=static_bytes + dynamic_bytes,
         dynamic_bytes=dynamic_bytes,
         static_bytes=static_bytes,
@@ -166,6 +227,7 @@ def build_bo_plan(
     weights_dir: Path | None = None,
     prompt_len: int | None = None,
     decode_context: int | None = None,
+    kv_strategy: str = "benchmark-cell",
 ) -> Gemma3BOPlan:
     spec = model_spec(model_variant)
     prompt_len = prompt_len or spec.prefill_lengths[0]
@@ -177,6 +239,7 @@ def build_bo_plan(
         weight_plan,
         prompt_len=prompt_len,
         decode_context=decode_context,
+        kv_strategy=kv_strategy,
     )
 
 
@@ -210,7 +273,11 @@ def _self_test() -> None:
     plan = build_bo_plan_from_preflight(preflight, weight_plan, prompt_len=1024, decode_context=2048)
     if plan.status != "READY_FOR_BO_ALLOCATION" or plan.static_bytes != 36003840:
         raise AssertionError(plan)
-    if not any(record.name == "kv_cache_k" and record.shape == (2, 2048, 1, 256) for record in plan.records):
+    if plan.kv_strategy != "benchmark-cell" or plan.kv_record_count != 4:
+        raise AssertionError(plan)
+    if not any(record.name == "kv_cache_k_L0" and record.shape == (512, 1, 256) for record in plan.records):
+        raise AssertionError(plan.records)
+    if not any(record.name == "kv_cache_k_L1" and record.shape == (512, 1, 256) for record in plan.records):
         raise AssertionError(plan.records)
     print(plan.format(include_records=True))
     print("GEMMA3_BO_PLAN_SELF_TEST: PASS")
@@ -223,6 +290,7 @@ def main() -> int:
     parser.add_argument("--weights-dir", type=Path)
     parser.add_argument("--prompt-len", type=int)
     parser.add_argument("--decode-context", type=int)
+    parser.add_argument("--kv-strategy", choices=KV_STRATEGIES, default="benchmark-cell")
     parser.add_argument("--include-records", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
@@ -235,6 +303,7 @@ def main() -> int:
         weights_dir=args.weights_dir,
         prompt_len=args.prompt_len,
         decode_context=args.decode_context,
+        kv_strategy=args.kv_strategy,
     )
     if args.json:
         print(json.dumps(plan.to_json_dict(), indent=2, sort_keys=True))

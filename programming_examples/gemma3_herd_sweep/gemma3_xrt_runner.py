@@ -20,7 +20,7 @@ from time import perf_counter
 from typing import Any
 
 from gemma3_artifacts import MODEL_SPECS, model_spec
-from gemma3_bo_plan import Gemma3BOPlan, Gemma3BORecord, build_bo_plan
+from gemma3_bo_plan import KV_STRATEGIES, Gemma3BOPlan, Gemma3BORecord, build_bo_plan
 
 
 DEFAULT_BO_ALLOCATION_EVIDENCE = Path(__file__).with_name("results") / "gemma3_bo_allocation_evidence.json"
@@ -46,6 +46,14 @@ def has_paper_shape_bo_allocation_evidence(model_variant: str, path: Path | None
     spec = model_spec(model_variant)
     prompt_len = max(spec.prefill_lengths)
     decode_context = spec.max_decode_context
+    try:
+        expected_plan = build_bo_plan(
+            model_variant,
+            prompt_len=prompt_len,
+            decode_context=decode_context,
+        )
+    except Exception:
+        return False
     for item in load_bo_allocation_evidence(path):
         if item.get("model_variant") != model_variant:
             continue
@@ -58,6 +66,10 @@ def has_paper_shape_bo_allocation_evidence(model_variant: str, path: Path | None
         requested = int(item.get("requested_bytes", -1))
         allocated = int(item.get("allocated_bytes", -2))
         if requested != allocated:
+            continue
+        if requested != expected_plan.total_bytes:
+            continue
+        if item.get("kv_strategy") != expected_plan.kv_strategy:
             continue
         if int(item.get("skipped_count", -1)) != 0:
             continue
@@ -92,6 +104,7 @@ class Gemma3XRTRunnerReport:
     device_index: int
     prompt_len: int
     decode_context: int
+    kv_strategy: str
     max_total_bytes: int
     max_bo_bytes: int
     requested_bytes: int
@@ -107,7 +120,8 @@ class Gemma3XRTRunnerReport:
         lines = [
             f"xrt_runner model={self.model_variant} status={self.status} "
             f"device={self.device_index} prompt_len={self.prompt_len} "
-            f"decode_context={self.decode_context} requested={self.requested_bytes} "
+            f"decode_context={self.decode_context} kv_strategy={self.kv_strategy} "
+            f"requested={self.requested_bytes} "
             f"allocated={self.allocated_bytes} allocations={self.allocation_count} "
             f"skipped={self.skipped_count} blockers={blockers}"
         ]
@@ -152,6 +166,7 @@ def dry_run_allocation_plan(
         device_index=-1,
         prompt_len=plan.prompt_len,
         decode_context=plan.decode_context,
+        kv_strategy=plan.kv_strategy,
         max_total_bytes=max_total_bytes,
         max_bo_bytes=max_bo_bytes,
         requested_bytes=plan.total_bytes,
@@ -259,6 +274,7 @@ def allocate_smoke(
         device_index=device_index,
         prompt_len=plan.prompt_len,
         decode_context=plan.decode_context,
+        kv_strategy=plan.kv_strategy,
         max_total_bytes=max_total_bytes,
         max_bo_bytes=max_bo_bytes,
         requested_bytes=plan.total_bytes,
@@ -283,6 +299,9 @@ def _self_test() -> None:
         layers=2,
         prompt_len=16,
         decode_context=16,
+        kv_strategy="monolithic",
+        kv_record_count=1,
+        max_bo_bytes=max(record.bytes for record in records),
         total_bytes=sum(record.bytes for record in records),
         dynamic_bytes=sum(record.bytes for record in records if not record.static),
         static_bytes=sum(record.bytes for record in records if record.static),
@@ -307,6 +326,7 @@ def main() -> int:
     parser.add_argument("--weights-dir", type=Path)
     parser.add_argument("--prompt-len", type=int)
     parser.add_argument("--decode-context", type=int)
+    parser.add_argument("--kv-strategy", choices=KV_STRATEGIES, default="benchmark-cell")
     parser.add_argument("--device-index", type=int, default=0)
     parser.add_argument("--max-total-bytes", type=int, default=64 * 1024 * 1024)
     parser.add_argument("--max-bo-bytes", type=int, default=8 * 1024 * 1024)
@@ -324,6 +344,7 @@ def main() -> int:
         weights_dir=args.weights_dir,
         prompt_len=args.prompt_len,
         decode_context=args.decode_context,
+        kv_strategy=args.kv_strategy,
     )
     if args.allocate_smoke:
         report = allocate_smoke(

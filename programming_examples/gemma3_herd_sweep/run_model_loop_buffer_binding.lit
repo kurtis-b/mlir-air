@@ -1,14 +1,14 @@
 # RUN: %PYTHON %S/gemma3_buffer_binding.py --self-test | FileCheck %s
 # CHECK: buffer_plan model=gemma3-1b status=READY_FOR_MODEL_RUNNER layers=2 bindings=60
-# CHECK-SAME: persistent_bos=18
+# CHECK-SAME: persistent_bos=20
 # CHECK-SAME: static_weight_families=13
 # CHECK-SAME: missing_bos=none blockers=model-kernel-argument-binding-not-validated
 # CHECK: buffer_binding prefill:L0:pre_attention_norm backend=host-fallback inputs=layer_input
 # CHECK-SAME: outputs=prefill_L0_pre_attention_norm
 # CHECK: buffer_binding prefill:L0:qkv_projection backend=npu-candidate inputs=prefill_L0_pre_attention_norm outputs=prefill_q,prefill_k,prefill_v weights=q_proj,k_proj,v_proj
 # CHECK-SAME: status=KERNEL_ARGUMENT_BINDING_PLANNED blockers=model-kernel-argument-binding-not-validated
-# CHECK: buffer_binding prefill:L0:kv_cache_append backend=host-runtime inputs=prefill_k,prefill_v outputs=kv_cache_k,kv_cache_v
-# CHECK-SAME: mutable=kv_cache_k,kv_cache_v
+# CHECK: buffer_binding prefill:L0:kv_cache_append backend=host-runtime inputs=prefill_k,prefill_v outputs=kv_cache_k_L0,kv_cache_v_L0
+# CHECK-SAME: mutable=kv_cache_k_L0,kv_cache_v_L0
 # CHECK-SAME: status=BUFFER_BINDING_PLANNED blockers=none
-# CHECK: buffer_binding decode:L0:attention backend=npu-candidate inputs=decode_q,kv_cache_k,kv_cache_v outputs=decode_attention_out
+# CHECK: buffer_binding decode:L0:attention backend=npu-candidate inputs=decode_q,kv_cache_k_L0,kv_cache_v_L0 outputs=decode_attention_out
 # CHECK: GEMMA3_BUFFER_BINDING_SELF_TEST: PASS

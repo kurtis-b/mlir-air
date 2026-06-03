@@ -88,8 +88,10 @@ Implemented files:
 - `gemma3_weight_plan.py`: text-stack static projection-weight planning for real
   safetensors, including Q4NX padded block counts and packed weight/scale/min
   byte estimates for future BO preloading.
-- `gemma3_bo_plan.py`: shape-only activation, KV-cache, intermediate, logits,
-  and static-weight BO planning for future XRT allocation and binding.
+- `gemma3_bo_plan.py`: shape-only activation, benchmark-cell per-layer
+  KV-cache, intermediate, logits, and static-weight BO planning for future XRT
+  allocation and binding, with a monolithic KV strategy retained for diagnostic
+  reproduction.
 - `gemma3_xrt_runner.py`: capped and full-plan `pyxrt` BO allocation/preload
   smoke runner that exercises real XRT allocation without claiming kernel
   execution or paper-shape runtime.
@@ -98,7 +100,7 @@ Implemented files:
   recognition when every planned projection tensor is serialized and written.
 - `gemma3_buffer_binding.py`: runtime buffer-binding manifest that assigns
   persistent BO keys, virtual intermediate keys, static-weight families, and
-  mutable KV-cache buffers per model stage.
+  layer-specific mutable KV-cache buffers per model stage.
 - `gemma3_model_runner.py`: launch-order manifest that composes BO planning,
   static-preload planning, and per-layer kernel/fallback wiring without
   claiming kernel execution.
@@ -543,8 +545,10 @@ Blocked evidence:
   local 1B artifacts are available but model-kernel launch, kernel argument
   binding, nonlinear model-stage promotion, and fresh paper-shape hardware
   reruns are not complete. Full paper-shape BO allocation validation is
-  complete for 1B only. Full contiguous static-weight BO preload validation is complete for 1B, 4B text, and the 4B vision text stack. The prior
-  unmeasured-nonlinear fallback blocker is retired by measured CPU-reference
+  complete for 1B, 4B text, and the 4B vision text stack under the
+  benchmark-cell KV allocation plan. Full contiguous static-weight BO preload
+  validation is complete for 1B, 4B text, and the 4B vision text stack. The
+  prior unmeasured-nonlinear fallback blocker is retired by measured CPU-reference
   fallback records, but those records are not NPU promotion evidence.
 - Dependency-light CPU/HF smoke paths now validate local 1B text, 4B text,
   and 4B synthetic-image weights/tokenizer/processor execution without AIR
@@ -566,22 +570,25 @@ Blocked evidence:
   allocation/preload smoke coverage; a local 1B smoke run allocated 5,303,808
   bytes and saved `/tmp/gemma3_1b_xrt_bo_smoke.json`. `gemma3_static_preload.py`
   serializes real projection tensors into the Q4NX packed/scale/min byte stream
-  and can write selected tensors into XRT BOs. A full local 1B contiguous static-preload
-  XRT smoke wrote all 182 planned text projection tensors into one static BO, totaling
-  468,049,920 bytes, and saved
+  and can write selected tensors into XRT BOs. A full local 1B contiguous
+  static-preload XRT smoke wrote all 182 planned text projection tensors into
+  one static BO, totaling 468,049,920 bytes, and saved
   `results/gemma3_static_preload_evidence.json`. A full local 4B contiguous
   static-preload XRT smoke wrote all 238 planned text projection tensors into
   one static BO, totaling 2,005,401,600 bytes, and updated the same evidence
-  ledger; a full local 4B-vision text-stack contiguous static-preload XRT smoke wrote all
-  238 planned text projection tensors into one static BO, totaling
-  2,005,401,600 bytes, and updated the same evidence ledger. A full local 1B paper-shape BO allocation smoke allocated all 18 planned BOs
-  for prompt 32k/decode 32k, totaling 2,724,593,152 bytes, and saved
-  `results/gemma3_bo_allocation_evidence.json`. Full local 4B text and
-  4B-vision text-stack allocation probes each allocated the first 16 planned
-  BOs, totaling 4,454,893,568 bytes, then XRT failed to mmap the first
-  9,126,805,504-byte `kv_cache_k` BO on the 31 GB Strix host; those records
-  are saved in the same evidence ledger as explicit host-memory allocation
-  blockers. `gemma3_real_execution.py` also has
+  ledger; a full local 4B-vision text-stack contiguous static-preload XRT
+  smoke wrote all 238 planned text projection tensors into one static BO, totaling
+  2,005,401,600 bytes, and updated the same evidence ledger. A full local 1B benchmark-cell paper-shape BO allocation smoke allocated all
+  68 planned BOs for prompt 32k/decode 32k, totaling 1,997,929,984 bytes, and
+  saved `results/gemma3_bo_allocation_evidence.json`. Full local 4B text and
+  4B-vision text-stack benchmark-cell allocation smokes each allocated all 84
+  planned BOs for prompt 32k/decode 128k, totaling 7,260,882,944 bytes. The
+  largest BO is the 2,005,401,600-byte static projection-weight BO; the largest
+  K/V BO is a 268,435,456-byte global-attention layer slice. The same evidence
+  ledger preserves earlier monolithic-KV failures where 4B text and vision
+  requested 22,708,504,576 bytes and failed at the first 9,126,805,504-byte
+  `kv_cache_k` BO after allocating 4,454,893,568 bytes. Those old records are
+  strategy-failure evidence, not current BO allocation blockers. `gemma3_real_execution.py` also has
   a CPU/HF warmup/timed-iteration benchmark path for small local smoke runs. No
   CPU/iGPU/NPU paper baseline or speedup claim is emitted until benchmark-length
   execution and NPU model execution are implemented.
@@ -598,19 +605,19 @@ Implementation requirements:
 - Implement 4B decode TPS for 1k, 2k, 4k, 8k, 16k, 32k, 64k, and 128k context
   lengths.
 - Track out-of-capacity behavior separately from failures.
-- Replace the current monolithic all-layer K/V BO plan with a
-  benchmark-cell-specific KV allocation plan before retrying 64k/128k decode:
-  split K/V by layer and, where useful, by page/chunk; allocate full-context KV
-  only for global layers; and clamp local SWA layers to the sliding window where
-  the kernel contract allows it.
+- Use the implemented benchmark-cell-specific KV allocation plan for 64k/128k
+  decode: split K/V by layer; allocate full-context KV only for global layers;
+  and clamp local SWA layers to the sliding window where the kernel contract
+  allows it. Keep the old monolithic all-layer K/V plan only as a diagnostic
+  reproducer.
 - Use `l2-gather` full-physical routes where direct shim output is illegal.
 
 Acceptance:
 
 - Correctness passes for all 4B text sequence lengths that fit the
   benchmark-cell-specific memory plan.
-- 64k/128k allocation avoids the current single huge KV BO mmap failure and has
-  dry-run plus XRT evidence showing per-layer/page K/V allocation totals.
+- 64k/128k allocation avoids the old single huge KV BO mmap failure and has
+  dry-run plus XRT evidence showing per-layer K/V allocation totals.
 - NPU, CPU, and iGPU local results are compared against Tables 2 and 4.
 - Any 64k/128k deviation includes explicit KV-cache, memory, or schedule data.
 
@@ -619,23 +626,24 @@ Blocked evidence:
 - `gemma3_reproduction_blockers.py` reports Phase G as `BLOCKED` because
   local 4B artifacts are available but model-kernel launch, kernel argument
   binding, nonlinear model-stage promotion, and fresh paper-shape hardware
-  reruns are not complete. Full paper-shape BO allocation validation is
-  complete for 1B only; the current local 4B monolithic KV plan requested
-  22,708,504,576 bytes, including one 9,126,805,504-byte `kv_cache_k` BO and
-  one 9,126,805,504-byte `kv_cache_v` BO, and stopped at `kv_cache_k` with
-  `xrt-bo-allocation-failed` after allocating 4,454,893,568 bytes. Treat this
-  as a failure of the current simultaneous all-layer KV BO strategy, not proof
-  that Strix cannot run the benchmark. The next implementation path is a
-  benchmark-cell-specific plan with preallocated weights/work buffers and
-  per-layer/per-page KV slices sized from the prompt/context being benchmarked.
-  Measured host fallback
+  reruns are not complete. Full paper-shape BO allocation validation is now
+  complete for 4B text under the benchmark-cell KV plan: prompt 32k/decode 128k
+  allocates 84 BOs totaling 7,260,882,944 bytes on local Strix/XRT. The old
+  monolithic KV plan requested 22,708,504,576 bytes, including one
+  9,126,805,504-byte `kv_cache_k` BO and one 9,126,805,504-byte `kv_cache_v`
+  BO, and stopped at `kv_cache_k` with `xrt-bo-allocation-failed` after
+  allocating 4,454,893,568 bytes. Treat that preserved record as a failure of
+  the simultaneous all-layer KV BO strategy, not proof that Strix cannot run
+  the benchmark. The next implementation path is kernel argument binding,
+  launch, correctness, schedule, and timing validation using the per-layer KV
+  BO contract. Measured host fallback
   records account for timing metadata but do not replace nonlinear NPU
   validation.
 - `gemma3_npu_wiring.py` emits the 4B text per-layer NPU candidate and host
   fallback plan from local artifacts, including the 5-local/1-global attention
-  pattern, but no 64k/128k local paper claim is emitted without the revised
-  KV-cache allocation evidence, kernel-launch evidence, kernel argument-binding
-  evidence, correctness, and schedule data.
+  pattern, but no 64k/128k local paper claim is emitted without kernel-launch
+  evidence, kernel argument-binding evidence, correctness, schedule data, and
+  timing data using the revised KV-cache allocation contract.
 
 ### Phase H: 4B vision path reproduction
 
@@ -663,12 +671,11 @@ Blocked evidence:
   local 4B vision artifacts and processor files are available but the model-kernel
   launch, kernel argument binding, nonlinear model-stage promotion, fresh
   paper-shape hardware reruns, and the vision NPU path are not complete.
-  Paper-shape BO allocation is explicitly blocked on the same current
-  monolithic KV strategy as 4B text: the text-stack probe requested
-  22,708,504,576 bytes and stopped at the first 9,126,805,504-byte `kv_cache_k`
-  BO after allocating 4,454,893,568 bytes. The vision text-stack retry should
-  use the same benchmark-cell-specific, per-layer/page KV allocation strategy
-  as 4B text before treating the result as a hardware-capacity limit.
+  Paper-shape text-stack BO allocation is complete under the same
+  benchmark-cell KV plan as 4B text: prompt 32k/decode 128k allocates 84 BOs
+  totaling 7,260,882,944 bytes on local Strix/XRT. The evidence ledger also
+  preserves the older monolithic-KV strategy failure at the first
+  9,126,805,504-byte `kv_cache_k` BO after allocating 4,454,893,568 bytes.
   Measured host fallback records account for text
   nonlinear timing metadata but do not validate vision hardware.
 - Existing text-only synthetic and blocked-result tests keep vision optional;
@@ -766,17 +773,19 @@ Implemented evidence and blocker:
   null power fields, and explicit blocked classification.
 - `gemma3_xrt_runner.py` can save capped and full-plan BO allocation/preload
   smoke JSON so future paper-result records can distinguish BO allocation
-  limits from kernel launch or validation failures. `gemma3-1b` now has
-  committed full paper-shape BO allocation evidence for 32k prefill/decode;
-  `gemma3-4b` and `gemma3-4b-vision` have committed allocation-failure
-  evidence showing that the current monolithic all-layer KV plan fails at the
-  first 9,126,805,504-byte KV-cache BO on local Strix/XRT. Future result
-  records must distinguish this strategy failure from a benchmark-cell-specific
-  per-layer/page KV allocation failure.
+  limits from kernel launch or validation failures. `gemma3-1b`, `gemma3-4b`,
+  and `gemma3-4b-vision` now have committed full paper-shape BO allocation
+  evidence under the benchmark-cell KV plan. The same ledger preserves
+  monolithic all-layer KV allocation-failure evidence for 4B text and vision,
+  showing failure at the first 9,126,805,504-byte KV-cache BO on local
+  Strix/XRT. Future result records must include `kv_strategy` and distinguish
+  allocation strategy failures from kernel launch, correctness, or timing
+  failures.
 - `gemma3_static_preload.py` can save real Q4NX static-weight preload smoke JSON
   so future model-runner failures can distinguish serialization/preload from
-  kernel binding and execution failures. `gemma3-1b`, `gemma3-4b`, and the `gemma3-4b-vision` text stack now have
-  committed full contiguous-XRT preload evidence with no static-preload blockers.
+  kernel binding and execution failures. `gemma3-1b`, `gemma3-4b`, and the
+  `gemma3-4b-vision` text stack now have committed full contiguous-XRT preload
+  evidence with no static-preload blockers.
 - `gemma3_buffer_binding.py` records that runtime BO and virtual-intermediate
   binding is planned with no missing BO keys in the self-test fixture; remaining
   model-runner binding risk is kernel argument-order validation.
@@ -1102,7 +1111,7 @@ an AIR-level scheduler only after the host loop proves the data contracts.
 load_model_metadata()
 load_or_generate_quantized_weights()
 allocate_activation_buffers()
-allocate_kv_cache()
+allocate_kv_cache(benchmark_cell_per_layer_strategy)
 
 if image_inputs:
   run_vision_prefill_or_host_fallback()

@@ -19,7 +19,7 @@ import json
 from pathlib import Path
 
 from gemma3_artifacts import MODEL_SPECS, model_spec
-from gemma3_bo_plan import Gemma3BOPlan, Gemma3BORecord, build_bo_plan_from_preflight
+from gemma3_bo_plan import KV_STRATEGIES, Gemma3BOPlan, Gemma3BORecord, build_bo_plan_from_preflight
 from gemma3_buffer_binding import Gemma3BufferBindingPlan, build_buffer_binding_plan_from_components
 from gemma3_npu_preflight import Gemma3NPUPreflightPlan, ProjectionPlan, build_preflight_plan
 from gemma3_npu_wiring import Gemma3NPUWiringPlan, build_wiring_plan_from_preflight
@@ -285,6 +285,7 @@ def build_model_runner_plan(
     weights_dir: Path | None = None,
     prompt_len: int | None = None,
     decode_context: int | None = None,
+    kv_strategy: str = "benchmark-cell",
     max_static_tensors: int = 4,
     max_total_bytes: int = 64 * 1024 * 1024,
     max_bo_bytes: int = 8 * 1024 * 1024,
@@ -301,6 +302,7 @@ def build_model_runner_plan(
         weight_plan,
         prompt_len=prompt_len,
         decode_context=decode_context,
+        kv_strategy=kv_strategy,
     )
     static_preload_validated = has_full_xrt_preload_evidence(model_variant)
     bo_allocation_validated = has_paper_shape_bo_allocation_evidence(model_variant)
@@ -402,8 +404,11 @@ def _self_test() -> None:
         layers=2,
         prompt_len=16,
         decode_context=16,
-        total_bytes=12288,
-        dynamic_bytes=8192,
+        kv_strategy="monolithic",
+        kv_record_count=1,
+        max_bo_bytes=4096,
+        total_bytes=10240,
+        dynamic_bytes=6144,
         static_bytes=4096,
         records=(
             Gemma3BORecord("static_projection_weights", "model", "q4nx", (4096,), 4096, True, "fixture"),
@@ -452,6 +457,7 @@ def main() -> int:
     parser.add_argument("--weights-dir", type=Path)
     parser.add_argument("--prompt-len", type=int)
     parser.add_argument("--decode-context", type=int)
+    parser.add_argument("--kv-strategy", choices=KV_STRATEGIES, default="benchmark-cell")
     parser.add_argument("--max-static-tensors", type=int, default=4)
     parser.add_argument("--max-total-bytes", type=int, default=64 * 1024 * 1024)
     parser.add_argument("--max-bo-bytes", type=int, default=8 * 1024 * 1024)
@@ -469,6 +475,7 @@ def main() -> int:
         weights_dir=args.weights_dir,
         prompt_len=args.prompt_len,
         decode_context=args.decode_context,
+        kv_strategy=args.kv_strategy,
         max_static_tensors=args.max_static_tensors,
         max_total_bytes=args.max_total_bytes,
         max_bo_bytes=args.max_bo_bytes,

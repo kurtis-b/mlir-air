@@ -17,7 +17,7 @@ import json
 from pathlib import Path
 
 from gemma3_artifacts import MODEL_SPECS, model_spec
-from gemma3_bo_plan import Gemma3BOPlan, build_bo_plan_from_preflight
+from gemma3_bo_plan import KV_STRATEGIES, Gemma3BOPlan, build_bo_plan_from_preflight
 from gemma3_npu_preflight import Gemma3NPUPreflightPlan, ProjectionPlan, build_preflight_plan
 from gemma3_npu_wiring import Gemma3NPUStage, Gemma3NPUWiringPlan, build_wiring_plan_from_preflight
 from gemma3_weight_plan import (
@@ -102,7 +102,14 @@ def _prefix(stage: Gemma3NPUStage) -> str:
     return f"{stage.phase}_L{stage.layer_index}_{stage.role}"
 
 
-def _role_contract(stage: Gemma3NPUStage) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+def _kv_cache_keys(stage: Gemma3NPUStage, bo_keys: set[str]) -> tuple[str, str]:
+    layer_keys = (f"kv_cache_k_L{stage.layer_index}", f"kv_cache_v_L{stage.layer_index}")
+    if all(key in bo_keys for key in layer_keys):
+        return layer_keys
+    return ("kv_cache_k", "kv_cache_v")
+
+
+def _role_contract(stage: Gemma3NPUStage, bo_keys: set[str]) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     state = _state_key(stage.phase)
     q = f"{stage.phase}_q"
     k = f"{stage.phase}_k"
@@ -124,9 +131,11 @@ def _role_contract(stage: Gemma3NPUStage) -> tuple[tuple[str, ...], tuple[str, .
     if stage.role == "qk_norm":
         return (q, k), (q, k), ("q_norm", "k_norm"), ()
     if stage.role == "kv_cache_append":
-        return (k, v), ("kv_cache_k", "kv_cache_v"), (), ("kv_cache_k", "kv_cache_v")
+        kv_cache_k, kv_cache_v = _kv_cache_keys(stage, bo_keys)
+        return (k, v), (kv_cache_k, kv_cache_v), (), (kv_cache_k, kv_cache_v)
     if stage.role == "attention":
-        return (q, "kv_cache_k", "kv_cache_v"), (attention_out,), (), ()
+        kv_cache_k, kv_cache_v = _kv_cache_keys(stage, bo_keys)
+        return (q, kv_cache_k, kv_cache_v), (attention_out,), (), ()
     if stage.role == "output_projection":
         return (attention_out,), (attn_proj,), ("o_proj",), ()
     if stage.role == "post_attention_norm":
@@ -149,7 +158,7 @@ def _role_contract(stage: Gemma3NPUStage) -> tuple[tuple[str, ...], tuple[str, .
 
 
 def _stage_binding(stage: Gemma3NPUStage, bo_keys: set[str]) -> Gemma3BufferBinding:
-    inputs, outputs, weights, mutable = _role_contract(stage)
+    inputs, outputs, weights, mutable = _role_contract(stage, bo_keys)
     virtual = tuple(
         dict.fromkeys(
             key
@@ -233,6 +242,7 @@ def build_buffer_binding_plan(
     weights_dir: Path | None = None,
     prompt_len: int | None = None,
     decode_context: int | None = None,
+    kv_strategy: str = "benchmark-cell",
 ) -> Gemma3BufferBindingPlan:
     spec = model_spec(model_variant)
     prompt_len = prompt_len or spec.prefill_lengths[0]
@@ -244,6 +254,7 @@ def build_buffer_binding_plan(
         weight_plan,
         prompt_len=prompt_len,
         decode_context=decode_context,
+        kv_strategy=kv_strategy,
     )
     return build_buffer_binding_plan_from_components(
         model_variant=model_variant,
@@ -317,6 +328,8 @@ def _self_test() -> None:
         raise AssertionError(plan.binding_count)
     if plan.missing_bo_keys:
         raise AssertionError(plan.missing_bo_keys)
+    if plan.persistent_bo_count != 20:
+        raise AssertionError(plan.persistent_bo_count)
     if plan.static_weight_family_count != 13:
         raise AssertionError(plan.static_weight_family_count)
     if "model-kernel-argument-binding-not-validated" not in plan.blockers:
@@ -332,6 +345,7 @@ def main() -> int:
     parser.add_argument("--weights-dir", type=Path)
     parser.add_argument("--prompt-len", type=int)
     parser.add_argument("--decode-context", type=int)
+    parser.add_argument("--kv-strategy", choices=KV_STRATEGIES, default="benchmark-cell")
     parser.add_argument("--include-bindings", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
@@ -344,6 +358,7 @@ def main() -> int:
         weights_dir=args.weights_dir,
         prompt_len=args.prompt_len,
         decode_context=args.decode_context,
+        kv_strategy=args.kv_strategy,
     )
     if args.json:
         print(json.dumps(plan.to_json_dict(), indent=2, sort_keys=True))
