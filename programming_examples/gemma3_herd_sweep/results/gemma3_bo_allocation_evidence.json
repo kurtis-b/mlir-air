@@ -178,6 +178,370 @@
       ],
       "skipped_count": 0,
       "status": "FULL_ALLOCATE_PASS"
+    },
+    {
+      "allocated_bytes": 4454893568,
+      "allocation_count": 16,
+      "blockers": [
+        "paper-shape-bo-allocation-not-validated",
+        "xrt-bo-allocation-failed"
+      ],
+      "decode_context": 131072,
+      "device_index": 0,
+      "elapsed_seconds": 0.7771472969907336,
+      "max_bo_bytes": 23000000000,
+      "max_total_bytes": 23000000000,
+      "model_variant": "gemma3-4b",
+      "prompt_len": 32768,
+      "requested_bytes": 22708504576,
+      "results": [
+        {
+          "allocated_bytes": 2005401600,
+          "name": "static_projection_weights",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 2005401600,
+          "static": true,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 167772160,
+          "name": "token_embeddings",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 167772160,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 167772160,
+          "name": "layer_input",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 167772160,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 167772160,
+          "name": "layer_output",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 167772160,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 5120,
+          "name": "decode_token_state",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 5120,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 134217728,
+          "name": "prefill_q",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 134217728,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 67108864,
+          "name": "prefill_k",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 67108864,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 67108864,
+          "name": "prefill_v",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 67108864,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 167772160,
+          "name": "prefill_attention_out",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 167772160,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 671088640,
+          "name": "mlp_gate",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 671088640,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 671088640,
+          "name": "mlp_up",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 671088640,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 167772160,
+          "name": "mlp_down",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 167772160,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 4096,
+          "name": "decode_q",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 4096,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 2048,
+          "name": "decode_k",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 2048,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 2048,
+          "name": "decode_v",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 2048,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 5120,
+          "name": "decode_attention_out",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 5120,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 0,
+          "name": "kv_cache_k",
+          "notes": "RuntimeError: mmap(addr=0x7fbda5200000, len=9126805504, prot=3, flags=8209, offset=8816979968) failed (err=-11): Resource temporarily unavailable",
+          "preload": "none",
+          "requested_bytes": 9126805504,
+          "static": false,
+          "status": "ALLOCATE_FAILED"
+        },
+        {
+          "allocated_bytes": 0,
+          "name": "kv_cache_v",
+          "notes": "prior BO allocation failed",
+          "preload": "none",
+          "requested_bytes": 9126805504,
+          "static": false,
+          "status": "SKIPPED_AFTER_FAILURE"
+        }
+      ],
+      "skipped_count": 2,
+      "status": "ALLOCATE_SMOKE_FAIL"
+    },
+    {
+      "allocated_bytes": 4454893568,
+      "allocation_count": 16,
+      "blockers": [
+        "paper-shape-bo-allocation-not-validated",
+        "xrt-bo-allocation-failed"
+      ],
+      "decode_context": 131072,
+      "device_index": 0,
+      "elapsed_seconds": 0.7563158530392684,
+      "max_bo_bytes": 23000000000,
+      "max_total_bytes": 23000000000,
+      "model_variant": "gemma3-4b-vision",
+      "prompt_len": 32768,
+      "requested_bytes": 22708504576,
+      "results": [
+        {
+          "allocated_bytes": 2005401600,
+          "name": "static_projection_weights",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 2005401600,
+          "static": true,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 167772160,
+          "name": "token_embeddings",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 167772160,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 167772160,
+          "name": "layer_input",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 167772160,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 167772160,
+          "name": "layer_output",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 167772160,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 5120,
+          "name": "decode_token_state",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 5120,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 134217728,
+          "name": "prefill_q",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 134217728,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 67108864,
+          "name": "prefill_k",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 67108864,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 67108864,
+          "name": "prefill_v",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 67108864,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 167772160,
+          "name": "prefill_attention_out",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 167772160,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 671088640,
+          "name": "mlp_gate",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 671088640,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 671088640,
+          "name": "mlp_up",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 671088640,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 167772160,
+          "name": "mlp_down",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 167772160,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 4096,
+          "name": "decode_q",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 4096,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 2048,
+          "name": "decode_k",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 2048,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 2048,
+          "name": "decode_v",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 2048,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 5120,
+          "name": "decode_attention_out",
+          "notes": "smoke allocation under explicit cap",
+          "preload": "none",
+          "requested_bytes": 5120,
+          "static": false,
+          "status": "ALLOCATED_FULL"
+        },
+        {
+          "allocated_bytes": 0,
+          "name": "kv_cache_k",
+          "notes": "RuntimeError: mmap(addr=0x7b5277e00000, len=9126805504, prot=3, flags=8209, offset=8816979968) failed (err=-11): Resource temporarily unavailable",
+          "preload": "none",
+          "requested_bytes": 9126805504,
+          "static": false,
+          "status": "ALLOCATE_FAILED"
+        },
+        {
+          "allocated_bytes": 0,
+          "name": "kv_cache_v",
+          "notes": "prior BO allocation failed",
+          "preload": "none",
+          "requested_bytes": 9126805504,
+          "static": false,
+          "status": "SKIPPED_AFTER_FAILURE"
+        }
+      ],
+      "skipped_count": 2,
+      "status": "ALLOCATE_SMOKE_FAIL"
     }
   ]
 }

@@ -554,8 +554,12 @@ Blocked evidence:
   238 planned text projection tensors into one static BO, totaling
   2,005,401,600 bytes, and updated the same evidence ledger. A full local 1B paper-shape BO allocation smoke allocated all 18 planned BOs
   for prompt 32k/decode 32k, totaling 2,724,593,152 bytes, and saved
-  `results/gemma3_bo_allocation_evidence.json`; 4B and vision paper-shape BO
-  allocation remain validation blockers. `gemma3_real_execution.py` also has
+  `results/gemma3_bo_allocation_evidence.json`. Full local 4B text and
+  4B-vision text-stack allocation probes each allocated the first 16 planned
+  BOs, totaling 4,454,893,568 bytes, then XRT failed to mmap the first
+  9,126,805,504-byte `kv_cache_k` BO on the 31 GB Strix host; those records
+  are saved in the same evidence ledger as explicit host-memory allocation
+  blockers. `gemma3_real_execution.py` also has
   a CPU/HF warmup/timed-iteration benchmark path for small local smoke runs. No
   CPU/iGPU/NPU paper baseline or speedup claim is emitted until benchmark-length
   execution and NPU model execution are implemented.
@@ -587,7 +591,9 @@ Blocked evidence:
   local 4B artifacts are available but model-kernel launch, kernel argument
   binding, nonlinear model-stage promotion, and fresh paper-shape hardware
   reruns are not complete. Full paper-shape BO allocation validation is
-  complete for 1B only. Measured host fallback
+  complete for 1B only; the local 4B probe requested 22,708,504,576 bytes and
+  stopped at `kv_cache_k` with `xrt-bo-allocation-failed` after allocating
+  4,454,893,568 bytes. Measured host fallback
   records account for timing metadata but do not replace nonlinear NPU
   validation.
 - `gemma3_npu_wiring.py` emits the 4B text per-layer NPU candidate and host
@@ -619,9 +625,12 @@ Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase H as `BLOCKED` because
   local 4B vision artifacts and processor files are available but the model-kernel
-  launch, kernel argument binding, full paper-shape BO allocation validation,
-  nonlinear model-stage promotion, fresh paper-shape hardware reruns, and the vision NPU
-  path are not complete. Measured host fallback records account for text
+  launch, kernel argument binding, nonlinear model-stage promotion, fresh
+  paper-shape hardware reruns, and the vision NPU path are not complete.
+  Paper-shape BO allocation is explicitly blocked on the same local XRT
+  host-memory limit as 4B text: the text-stack probe requested 22,708,504,576
+  bytes and stopped at `kv_cache_k` after allocating 4,454,893,568 bytes.
+  Measured host fallback records account for text
   nonlinear timing metadata but do not validate vision hardware.
 - Existing text-only synthetic and blocked-result tests keep vision optional;
   the enabled vision smoke is a CPU-reference contract for non-causal attention
@@ -719,7 +728,10 @@ Implemented evidence and blocker:
 - `gemma3_xrt_runner.py` can save capped and full-plan BO allocation/preload
   smoke JSON so future paper-result records can distinguish BO allocation
   limits from kernel launch or validation failures. `gemma3-1b` now has
-  committed full paper-shape BO allocation evidence for 32k prefill/decode.
+  committed full paper-shape BO allocation evidence for 32k prefill/decode;
+  `gemma3-4b` and `gemma3-4b-vision` have committed allocation-failure
+  evidence showing the current local Strix/XRT host-memory limit at the first
+  9,126,805,504-byte KV-cache BO.
 - `gemma3_static_preload.py` can save real Q4NX static-weight preload smoke JSON
   so future model-runner failures can distinguish serialization/preload from
   kernel binding and execution failures. `gemma3-1b`, `gemma3-4b`, and the `gemma3-4b-vision` text stack now have

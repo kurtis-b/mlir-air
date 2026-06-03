@@ -183,14 +183,40 @@ def allocate_smoke(
     allocated_total = 0
     bos: list[Any] = []
     results: list[Gemma3XRTBOResult] = []
-    for record in plan.records:
+    for index, record in enumerate(plan.records):
         remaining = max_total_bytes - allocated_total
         if remaining <= 0:
             results.append(Gemma3XRTBOResult(record.name, record.bytes, 0, "SKIPPED_TOTAL_CAP", record.static, "none", "total byte cap reached"))
             continue
         alloc_bytes = min(record.bytes, max_bo_bytes, remaining)
         status = "ALLOCATED_FULL" if alloc_bytes == record.bytes else "ALLOCATED_TRUNCATED"
-        bo = xrt.bo(device, alloc_bytes, xrt.bo.host_only, 0)
+        try:
+            bo = xrt.bo(device, alloc_bytes, xrt.bo.host_only, 0)
+        except Exception as exc:
+            results.append(
+                Gemma3XRTBOResult(
+                    record.name,
+                    record.bytes,
+                    0,
+                    "ALLOCATE_FAILED",
+                    record.static,
+                    "none",
+                    f"{type(exc).__name__}: {exc}",
+                )
+            )
+            for skipped in plan.records[index + 1 :]:
+                results.append(
+                    Gemma3XRTBOResult(
+                        skipped.name,
+                        skipped.bytes,
+                        0,
+                        "SKIPPED_AFTER_FAILURE",
+                        skipped.static,
+                        "none",
+                        "prior BO allocation failed",
+                    )
+                )
+            break
         preload = "none"
         if record.static and preload_static or (not record.static and preload_dynamic):
             bo.write(_preload_pattern(record.name, alloc_bytes), 0)
@@ -215,12 +241,15 @@ def allocate_smoke(
         and all(result.status == "ALLOCATED_FULL" for result in results)
         and not any(result.allocated_bytes == 0 for result in results)
     )
+    allocation_failed = any(result.status == "ALLOCATE_FAILED" for result in results)
     if full_allocation:
         status = "FULL_ALLOCATE_PASS"
         blockers: tuple[str, ...] = ()
     else:
-        status = "ALLOCATE_SMOKE_PASS"
+        status = "ALLOCATE_SMOKE_FAIL" if allocation_failed else "ALLOCATE_SMOKE_PASS"
         blocker_list = ["paper-shape-bo-allocation-not-validated"]
+        if allocation_failed:
+            blocker_list.append("xrt-bo-allocation-failed")
         if any(result.status == "ALLOCATED_TRUNCATED" for result in results):
             blocker_list.append("allocation-cap-truncated")
         blockers = tuple(blocker_list)
@@ -281,6 +310,7 @@ def main() -> int:
     parser.add_argument("--device-index", type=int, default=0)
     parser.add_argument("--max-total-bytes", type=int, default=64 * 1024 * 1024)
     parser.add_argument("--max-bo-bytes", type=int, default=8 * 1024 * 1024)
+    parser.add_argument("--no-preload-static", action="store_true")
     parser.add_argument("--preload-dynamic", action="store_true")
     parser.add_argument("--include-records", action="store_true")
     parser.add_argument("--json", type=Path)
@@ -301,7 +331,7 @@ def main() -> int:
             device_index=args.device_index,
             max_total_bytes=args.max_total_bytes,
             max_bo_bytes=args.max_bo_bytes,
-            preload_static=True,
+            preload_static=not args.no_preload_static,
             preload_dynamic=args.preload_dynamic,
         )
     elif args.dry_run:
