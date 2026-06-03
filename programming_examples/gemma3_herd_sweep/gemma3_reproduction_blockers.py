@@ -11,9 +11,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from gemma3_artifacts import discover_model_artifacts
+from gemma3_config import synthetic_text_config
 from gemma3_environment import capture_environment
 from gemma3_paper_compare import unmeasured_host_fallbacks
 from gemma3_results import fallback_records
+from gemma3_vision import Gemma3VisionConfig, run_vision_prefill_or_disabled
 
 
 @dataclass(frozen=True)
@@ -36,13 +38,32 @@ def _artifact_blockers(model_variant: str, weights_dir: Path | None = None) -> l
     blockers: list[str] = []
     if not inventory.has_weight_files:
         blockers.append("missing-safetensors")
+    if not inventory.config_exists:
+        blockers.append("missing-config-json")
     if not inventory.tokenizer_exists:
         blockers.append("missing-tokenizer")
+    if inventory.has_vision and not inventory.processor_exists:
+        blockers.append("missing-processor")
     if not inventory.optional_packages.get("safetensors", False):
         blockers.append("missing-python-safetensors")
     if not any(inventory.optional_packages.get(pkg, False) for pkg in ("tokenizers", "sentencepiece", "transformers")):
         blockers.append("missing-python-tokenizer-package")
     return blockers
+
+
+
+
+def _vision_blockers() -> list[str]:
+    try:
+        result = run_vision_prefill_or_disabled(
+            synthetic_text_config(n_layers=2, local_window_len=4),
+            Gemma3VisionConfig(enabled=True, image_token_count=4),
+        )
+    except Exception:
+        return ["vision-path-contract-missing"]
+    if result.status != "synthetic-cpu-reference":
+        return ["vision-path-contract-missing"]
+    return ["vision-npu-path-not-validated"]
 
 
 def phase_blocker_statuses(weights_dir: Path | None = None) -> tuple[PhaseBlockerStatus, ...]:
@@ -57,7 +78,7 @@ def phase_blocker_statuses(weights_dir: Path | None = None) -> tuple[PhaseBlocke
     for phase, model_variant, extra in (
         ("F", "gemma3-1b", ()),
         ("G", "gemma3-4b", ()),
-        ("H", "gemma3-4b-vision", ("vision-npu-path-not-implemented",)),
+        ("H", "gemma3-4b-vision", tuple(_vision_blockers())),
     ):
         blockers = tuple(
             dict.fromkeys(

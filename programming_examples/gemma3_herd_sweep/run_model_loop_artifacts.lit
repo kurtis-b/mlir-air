@@ -2,6 +2,7 @@
 # RUN: %PYTHON %S/gemma3_artifacts.py --model-variant gemma3-4b --prompt-len 131072 | FileCheck %s --check-prefix=PROMPT
 # RUN: %PYTHON %S/gemma3_artifacts.py --model-variant gemma3-1b --discover | FileCheck %s --check-prefix=DISCOVER
 # RUN: %PYTHON %S/gemma3_artifacts.py --model-variant gemma3-1b --manifest | FileCheck %s --check-prefix=MANIFEST
+# RUN: %PYTHON %S/gemma3_artifacts.py --model-variant gemma3-4b-vision --manifest | FileCheck %s --check-prefix=VISION-MANIFEST
 # RUN: rm -rf %t.gemma3_fake
 # RUN: mkdir -p %t.gemma3_fake
 # RUN: touch %t.gemma3_fake/model.safetensors %t.gemma3_fake/config.json %t.gemma3_fake/tokenizer.json
@@ -16,6 +17,8 @@
 # DISCOVER: "tokenizer_exists": false
 # MANIFEST: "source_repo": "google/gemma-3-1b-pt"
 # MANIFEST: "validation_status": "BLOCKED"
+# VISION-MANIFEST: "missing-processor"
+# VISION-MANIFEST: "has_vision": true
 # FAKE: "config_path":
 # FAKE: "safetensors":
 # FAKE: "tokenizer_path":

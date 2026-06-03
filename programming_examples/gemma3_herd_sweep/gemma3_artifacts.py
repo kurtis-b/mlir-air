@@ -98,6 +98,7 @@ class Gemma3ArtifactInventory:
     model_variant: str
     weights_dir: str | None
     source_repo: str
+    has_vision: bool
     config_path: str | None
     tokenizer_path: str | None
     processor_path: str | None
@@ -118,6 +119,7 @@ class Gemma3ArtifactInventory:
             self.has_weight_files
             and self.config_exists
             and self.tokenizer_exists
+            and (not self.has_vision or self.processor_exists)
             and self.optional_packages.get("safetensors", False)
             and (
                 self.optional_packages.get("tokenizers", False)
@@ -137,6 +139,7 @@ class Gemma3ArtifactInventory:
 class Gemma3ArtifactManifest:
     model_variant: str
     source_repo: str
+    has_vision: bool
     weights_dir: str | None
     config_path: str | None
     tokenizer_path: str | None
@@ -223,7 +226,7 @@ def discover_model_artifacts(
     tokenizer: Path | None = None,
     source_repo: str | None = None,
 ) -> Gemma3ArtifactInventory:
-    model_spec(model_variant)
+    spec = model_spec(model_variant)
     tokenizer_path = _resolve_tokenizer(weights_dir, tokenizer)
     config_path = _resolve_config(weights_dir)
     processor_path = _resolve_processor(weights_dir)
@@ -231,6 +234,7 @@ def discover_model_artifacts(
         model_variant=model_variant,
         weights_dir=str(weights_dir) if weights_dir is not None else None,
         source_repo=source_repo or official_model_repo(model_variant),
+        has_vision=spec.has_vision,
         config_path=str(config_path) if config_path is not None else None,
         tokenizer_path=str(tokenizer_path) if tokenizer_path is not None else None,
         processor_path=str(processor_path) if processor_path is not None else None,
@@ -251,6 +255,8 @@ def _manifest_blockers(inventory: Gemma3ArtifactInventory) -> list[str]:
         blockers.append("missing-config-json")
     if not inventory.tokenizer_exists:
         blockers.append("missing-tokenizer")
+    if inventory.has_vision and not inventory.processor_exists:
+        blockers.append("missing-processor")
     if not inventory.optional_packages.get("safetensors", False):
         blockers.append("missing-python-safetensors")
     if not any(inventory.optional_packages.get(pkg, False) for pkg in ("tokenizers", "sentencepiece", "transformers")):
@@ -299,6 +305,7 @@ def artifact_manifest(
     return Gemma3ArtifactManifest(
         model_variant=model_variant,
         source_repo=inventory.source_repo,
+        has_vision=inventory.has_vision,
         weights_dir=inventory.weights_dir,
         config_path=inventory.config_path,
         tokenizer_path=inventory.tokenizer_path,
@@ -364,6 +371,8 @@ def load_real_model_artifacts(
             missing.append("config.json")
         if not inventory.tokenizer_exists:
             missing.append("tokenizer.json/tokenizer.model/tokenizer.spm")
+        if inventory.has_vision and not inventory.processor_exists:
+            missing.append("processor_config.json/image_processor_config.json")
         for package, available in inventory.optional_packages.items():
             if package == "safetensors" and not available:
                 missing.append("python:safetensors")

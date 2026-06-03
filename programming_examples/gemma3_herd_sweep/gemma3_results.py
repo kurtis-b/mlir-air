@@ -71,8 +71,12 @@ def missing_artifact_notes(inventory: Any) -> list[str]:
     notes: list[str] = []
     if not inventory.has_weight_files:
         notes.append("missing *.safetensors")
+    if not inventory.config_exists:
+        notes.append("missing config.json")
     if not inventory.tokenizer_exists:
         notes.append("missing tokenizer file")
+    if getattr(inventory, "has_vision", False) and not inventory.processor_exists:
+        notes.append("missing vision processor file")
     if not inventory.optional_packages.get("safetensors", False):
         notes.append("missing python:safetensors")
     if not any(inventory.optional_packages.get(pkg, False) for pkg in ("tokenizers", "sentencepiece", "transformers")):

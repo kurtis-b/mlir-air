@@ -68,8 +68,9 @@ Implemented files:
   and decode tokens, compact logs, optional stage logs, and failure context.
 - `gemma3_scaling.py`: public-mode scaling policy checks for `2x4`, `4x4`, and
   `8x4`, including classified unsupported-mode diagnostics.
-- `gemma3_vision.py`: disabled vision-path contract proving text-only results
-  are unchanged when vision is compiled out or unused.
+- `gemma3_vision.py`: disabled text-only contract plus a synthetic non-causal
+  vision prefill contract that produces visual context tokens without claiming
+  NPU validation.
 - `gemma3_inference.py`: Llama32-style entrypoint with compile-only, run-only,
   verify, profile, layer-count, prompt-chunk, decode-token, local-window, and
   stage-log controls.
@@ -226,7 +227,7 @@ typographical error, or a derived value from the figure.
 | Model weights | Synthetic Q4NX/BF16-compatible weights only | Real Gemma3 1B and 4B weights, quantized/packed in the same Q4NX contract used by the NPU kernels |
 | Tokenizer and prompts | Synthetic token IDs | Real tokenizer, deterministic prompts, and sequence lengths 1k-32k for 1B and 1k-128k decode for 4B |
 | Text runtime | Host-driven synthetic loop with CPU references and manifests | End-to-end NPU execution for all validated model substeps, with host fallbacks removed or measured separately |
-| Vision runtime | Disabled contract only | 4B vision prefill path with non-causal attention and visual context token handoff into text prefill |
+| Vision runtime | Disabled contract plus synthetic CPU non-causal vision prefill and visual context token handoff contract | 4B vision prefill path with non-causal attention validated on NPU and timed against paper |
 | Nonlinear operations | CPU fallbacks plus standalone GeGLU candidate; host fallback microbenchmarks are recorded in result JSON | RMSNorm, QK-Norm, RoPE, residual add, activation, logits, and sampling either validated on NPU or explicitly accounted for in timing |
 | Baselines | No comparable CPU/iGPU model path | CPU and iGPU runs for the exact same model variant, prompt lengths, output count, tokenizer, and measurement window |
 | Timing | Synthetic profile/event logs only | TTFT and decode TPS with warmup, timed iterations, and compile/setup excluded |
@@ -349,7 +350,8 @@ Implemented evidence and blocker:
 - `Q4NXPackingContract` records the block size, low-nibble order, BF16
   scale/min metadata, matrix order, and dequant formula.
 - `run_model_loop_artifacts.lit` covers metadata, prompt-length generation,
-  discovery, and strict-load blocking diagnostics.
+  discovery, strict-load blocking diagnostics, and the additional processor-file
+  requirement for vision artifacts.
 - `requirements.txt` records the approved Python packages for artifact loading,
   tokenizer/processor setup, Hugging Face snapshot access, and safetensor shape
   inspection. These dependencies were installed in the active `ironenv` during
@@ -358,7 +360,8 @@ Implemented evidence and blocker:
   validation, optional snapshot download support, and safetensor shape
   inspection when the package is available.
 - Real Gemma3 artifact loading is still blocked until authenticated official
-  Gemma3 safetensors and tokenizer/processor files are present locally.
+  Gemma3 safetensors, config, tokenizer, and vision processor files are present
+  locally as required by each variant.
 
 ### Phase D: standalone kernel parity
 
@@ -533,11 +536,13 @@ Acceptance:
 Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase H as `BLOCKED` while real
-  Gemma3 4B vision artifacts and the NPU vision path are missing. Measured host
-  fallback records account for text nonlinear timing metadata but do not
-  implement the vision path.
+  Gemma3 4B vision artifacts and processor files are missing and the synthetic
+  vision contract is not NPU-validated. Measured host fallback records account
+  for text nonlinear timing metadata but do not validate vision hardware.
 - Existing text-only synthetic and blocked-result tests keep vision optional;
-  no vision TTFT or speedup claim is emitted without real vision execution.
+  the enabled vision smoke is a CPU-reference contract for non-causal attention
+  and visual context token shape only. No vision TTFT or speedup claim is
+  emitted without real vision execution.
 
 ### Phase I: benchmark harness and result JSON
 

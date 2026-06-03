@@ -1,5 +1,8 @@
 # RUN: %PYTHON %S/gemma3_vision.py | FileCheck %s
-# CHECK: vision enabled=False status=disabled tokens=0
+# CHECK: vision enabled=False status=disabled attention=vision_nca tokens=0
+# CHECK: vision enabled=True status=synthetic-cpu-reference attention=vision_nca tokens=4
+# CHECK: vision_stage vision_attention status=host-reference
+# CHECK-SAME: causal=False
 # CHECK: text_baseline_checksum=
 # CHECK: text_with_disabled_vision_checksum=
-# CHECK: GEMMA3_VISION_DISABLED_SELF_TEST: PASS
+# CHECK: GEMMA3_VISION_CONTRACT_SELF_TEST: PASS
