@@ -357,8 +357,9 @@ Implemented evidence and blocker:
   inspection. These dependencies were installed in the active `ironenv` during
   blocker-fix work.
 - `gemma3_artifacts.py` records official source repositories, manifest
-  validation, optional snapshot download support, and safetensor shape
-  inspection when the package is available.
+  validation, optional snapshot download support, safetensor shape inspection,
+  and Q4NX quantize/dequantize round-trip error for projection-family samples
+  when real weights are available.
 - Real Gemma3 artifact loading has been validated against the local default
   model root `/home/cj/models` for `gemma3-1b`, `gemma3-4b`, and
   `gemma3-4b-vision`; the remaining blocker is real model execution, not

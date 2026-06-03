@@ -16,7 +16,8 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from common import Q4NX_COLS, Q4NX_ROWS
+from common import Q4NX_COLS, Q4NX_ROWS, pack_int4_low_first, q4nx_dequant_reference
+from ml_dtypes import bfloat16
 
 
 class Gemma3ArtifactError(RuntimeError):
@@ -46,6 +47,17 @@ class Gemma3ModelSpec:
 
 
 DEFAULT_MODEL_ROOT_ENV = "GEMMA3_MODEL_ROOT"
+Q4NX_PROJECTION_FAMILIES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
+
+
 DEFAULT_MODEL_DIR_NAMES = {
     "gemma3-1b": "gemma-3-1b-pt",
     "gemma3-4b": "gemma-3-4b-pt",
@@ -525,6 +537,147 @@ def load_real_model_artifacts(
     return inventory
 
 
+def q4nx_roundtrip_sample(
+    matrix: np.ndarray,
+    *,
+    rows: int = Q4NX_ROWS,
+    cols: int = Q4NX_COLS,
+) -> dict[str, Any]:
+    source = np.asarray(matrix, dtype=np.float32)
+    sample = np.zeros((rows, cols), dtype=np.float32)
+    copy_rows = min(rows, source.shape[0])
+    copy_cols = min(cols, source.shape[1])
+    sample[:copy_rows, :copy_cols] = source[:copy_rows, :copy_cols]
+    col_min = sample.min(axis=0)
+    col_max = sample.max(axis=0)
+    scale = (col_max - col_min) / 15.0
+    scale = np.where(scale == 0.0, 1.0, scale)
+    q = np.rint((sample - col_min[None, :]) / scale[None, :])
+    q = np.clip(q, 0, 15).astype(np.uint8)
+    packed = pack_int4_low_first(q).view(np.int8)
+    dequant = q4nx_dequant_reference(
+        packed,
+        scale.astype(bfloat16),
+        col_min.astype(bfloat16),
+        rows,
+        cols,
+    ).astype(np.float32)
+    compared = dequant[:copy_rows, :copy_cols] - source[:copy_rows, :copy_cols]
+    abs_error = np.abs(compared)
+    return {
+        "sample_rows": rows,
+        "sample_cols": cols,
+        "copied_rows": copy_rows,
+        "copied_cols": copy_cols,
+        "max_abs_error": float(abs_error.max()) if abs_error.size else 0.0,
+        "mean_abs_error": float(abs_error.mean()) if abs_error.size else 0.0,
+        "packed_bytes": int(packed.size),
+    }
+
+
+def _projection_key_for_family(keys: Iterable[str], family: str) -> str | None:
+    suffix = f".{family}.weight"
+    matches = [key for key in keys if key.endswith(suffix)]
+    if not matches:
+        matches = [key for key in keys if suffix in key]
+    return sorted(matches)[0] if matches else None
+
+
+def _load_safetensor_matrix(paths: Iterable[str], key: str) -> np.ndarray:
+    try:
+        from safetensors import safe_open
+    except Exception as exc:
+        raise Gemma3ArtifactError("python:safetensors is required for Q4NX round-trip") from exc
+    try:
+        import torch  # noqa: F401
+    except Exception as exc:
+        raise Gemma3ArtifactError("python:torch is required for BF16 safetensor loading") from exc
+    for filename in paths:
+        with safe_open(filename, framework="pt", device="cpu") as handle:
+            if key in handle.keys():
+                tensor = handle.get_tensor(key)
+                return tensor.float().cpu().numpy()
+    raise Gemma3ArtifactError(f"tensor key not found in safetensors: {key}")
+
+
+def q4nx_roundtrip_report(
+    model_variant: str,
+    *,
+    weights_dir: Path | None = None,
+    tokenizer: Path | None = None,
+) -> list[dict[str, Any]]:
+    inventory = load_real_model_artifacts(
+        model_variant,
+        weights_dir=weights_dir,
+        tokenizer=tokenizer,
+        strict=True,
+    )
+    try:
+        from safetensors import safe_open
+    except Exception as exc:
+        raise Gemma3ArtifactError("python:safetensors is required for Q4NX round-trip") from exc
+    keys: list[str] = []
+    for filename in inventory.safetensors:
+        with safe_open(filename, framework="pt", device="cpu") as handle:
+            keys.extend(handle.keys())
+    records: list[dict[str, Any]] = []
+    for family in Q4NX_PROJECTION_FAMILIES:
+        key = _projection_key_for_family(keys, family)
+        if key is None:
+            records.append({"family": family, "status": "MISSING_TENSOR"})
+            continue
+        matrix = _load_safetensor_matrix(inventory.safetensors, key)
+        sample = q4nx_roundtrip_sample(matrix)
+        rows, cols = matrix.shape
+        records.append(
+            {
+                "family": family,
+                "status": "PASS",
+                "tensor_key": key,
+                "shape": (int(rows), int(cols)),
+                "full_shape_requires_padding": (
+                    rows % Q4NX_ROWS != 0 or cols % Q4NX_COLS != 0
+                ),
+                **sample,
+            }
+        )
+    return records
+
+
+def format_q4nx_roundtrip(records: list[dict[str, Any]]) -> str:
+    lines = []
+    for record in records:
+        if record.get("status") != "PASS":
+            lines.append(
+                f"q4nx_roundtrip family={record['family']} status={record['status']}"
+            )
+            continue
+        shape = "x".join(str(dim) for dim in record["shape"])
+        lines.append(
+            f"q4nx_roundtrip family={record['family']} status=PASS "
+            f"shape={shape} sample={record['sample_rows']}x{record['sample_cols']} "
+            f"max_abs_error={record['max_abs_error']:.6f} "
+            f"mean_abs_error={record['mean_abs_error']:.6f} "
+            f"padding={record['full_shape_requires_padding']}"
+        )
+    return "\n".join(lines)
+
+
+def _q4nx_roundtrip_self_test() -> None:
+    rng = np.random.default_rng(19)
+    matrix = rng.normal(size=(Q4NX_ROWS, Q4NX_COLS)).astype(np.float32)
+    record = q4nx_roundtrip_sample(matrix)
+    if record["copied_rows"] != Q4NX_ROWS or record["copied_cols"] != Q4NX_COLS:
+        raise AssertionError(record)
+    if record["max_abs_error"] <= 0.0:
+        raise AssertionError("expected lossy int4 round-trip error")
+    print(
+        f"q4nx_roundtrip_self_test sample={record['sample_rows']}x{record['sample_cols']} "
+        f"max_abs_error={record['max_abs_error']:.6f}"
+    )
+    print("GEMMA3_Q4NX_ROUNDTRIP_SELF_TEST: PASS")
+
+
 def format_model_specs() -> str:
     lines = []
     for spec in MODEL_SPECS.values():
@@ -566,6 +719,8 @@ def main() -> int:
     parser.add_argument("--source-repo")
     parser.add_argument("--no-default-model-dir", action="store_true")
     parser.add_argument("--config-summary", action="store_true")
+    parser.add_argument("--q4nx-roundtrip", action="store_true")
+    parser.add_argument("--q4nx-roundtrip-self-test", action="store_true")
     parser.add_argument("--real-prompt", action="store_true")
     parser.add_argument("--seed-text", default="gemma3 paper reproduction prompt")
     parser.add_argument("--print-specs", action="store_true")
@@ -575,6 +730,9 @@ def main() -> int:
 
     if args.self_test:
         _self_test()
+        return 0
+    if args.q4nx_roundtrip_self_test:
+        _q4nx_roundtrip_self_test()
         return 0
     if args.print_specs:
         print(format_model_specs())
@@ -627,6 +785,17 @@ def main() -> int:
             use_default_weights_dir=not args.no_default_model_dir,
         )
         print(json.dumps(load_config_summary(inventory), indent=2, sort_keys=True))
+    if args.q4nx_roundtrip:
+        try:
+            records = q4nx_roundtrip_report(
+                args.model_variant,
+                weights_dir=args.weights_dir,
+                tokenizer=args.tokenizer,
+            )
+        except Gemma3ArtifactError as exc:
+            print(f"GEMMA3_Q4NX_ROUNDTRIP_BLOCKED: {exc}")
+            return 2
+        print(format_q4nx_roundtrip(records))
     if args.discover or args.strict_load:
         try:
             if args.strict_load:

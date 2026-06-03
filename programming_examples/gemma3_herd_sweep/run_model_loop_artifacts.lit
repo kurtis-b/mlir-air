@@ -1,4 +1,5 @@
 # RUN: %PYTHON %S/gemma3_artifacts.py --self-test | FileCheck %s --check-prefix=SELF
+# RUN: %PYTHON %S/gemma3_artifacts.py --q4nx-roundtrip-self-test | FileCheck %s --check-prefix=Q4NX
 # RUN: %PYTHON %S/gemma3_artifacts.py --model-variant gemma3-4b --prompt-len 131072 | FileCheck %s --check-prefix=PROMPT
 # RUN: env GEMMA3_MODEL_ROOT=%t.no_models %PYTHON %S/gemma3_artifacts.py --model-variant gemma3-1b --discover | FileCheck %s --check-prefix=DISCOVER
 # RUN: env GEMMA3_MODEL_ROOT=%t.no_models %PYTHON %S/gemma3_artifacts.py --model-variant gemma3-1b --manifest | FileCheck %s --check-prefix=MANIFEST
@@ -14,6 +15,8 @@
 # SELF: model gemma3-4b vision=False
 # SELF: model gemma3-4b-vision vision=True
 # SELF: GEMMA3_ARTIFACT_CONTRACT_SELF_TEST: PASS
+# Q4NX: q4nx_roundtrip_self_test sample=32x256
+# Q4NX: GEMMA3_Q4NX_ROUNDTRIP_SELF_TEST: PASS
 # PROMPT: GEMMA3_PROMPT_IDS: model=gemma3-4b len=131072
 # DISCOVER: "source_repo": "google/gemma-3-1b-pt"
 # DISCOVER: "tokenizer_exists": false
