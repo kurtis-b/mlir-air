@@ -1,0 +1,13 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// RUN: rm -rf %t.gemma3_cache
+// RUN: python3 %S/gemma3_inference.py --compile-only --cache-dir %t.gemma3_cache | FileCheck %s --check-prefix=COMPILE
+// RUN: python3 %S/gemma3_inference.py --run-only --verify --cache-dir %t.gemma3_cache | FileCheck %s --check-prefix=EXEC
+// RUN: not python3 %S/gemma3_inference.py --run-only --cache-dir %t.missing 2>&1 | FileCheck %s --check-prefix=MISSING
+
+// COMPILE: artifact gemma3_prefill_L0_q4nx phase=prefill kernel=q4nx mode=l2-gather schedule=n/a status=npu
+// COMPILE: GEMMA3_RUNTIME_COMPILE_ONLY: wrote
+// EXEC: GEMMA3_RUNTIME_RUN_ONLY: manifest loaded
+// EXEC: GEMMA3_SYNTHETIC_VERIFY: PASS
+// MISSING: Gemma3 runtime manifest is missing:
