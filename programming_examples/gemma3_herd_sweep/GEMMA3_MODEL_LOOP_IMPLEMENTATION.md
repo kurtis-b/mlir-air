@@ -85,6 +85,9 @@ Implemented files:
   records prefill/decode stage roles, NPU kernel candidates, host fallbacks,
   attention windows, and the remaining XRT/model-runner blockers without
   claiming execution.
+- `gemma3_weight_plan.py`: text-stack static projection-weight planning for real
+  safetensors, including Q4NX padded block counts and packed weight/scale/min
+  byte estimates for future BO preloading.
 
 Focused lit coverage:
 
@@ -98,6 +101,7 @@ Focused lit coverage:
 - `run_model_loop_real_execution.lit`
 - `run_model_loop_npu_preflight.lit`
 - `run_model_loop_npu_wiring.lit`
+- `run_model_loop_weight_plan.lit`
 - `../gemma3_dataflow_kernels/run_geglu_compile_only.lit`
 
 Current phase status:
@@ -354,6 +358,8 @@ Acceptance:
 - Tokenizer-backed prompt generation and round-trip checks pass for the local
   real tokenizer at paper sequence lengths.
 - Q4NX pack/dequant round-trip error is recorded per projection family.
+- Real text projection-weight static BO planning records every Q4NX projection tensor
+  shape, padded block count, and packed weight/scale/min byte estimate.
 
 Implemented evidence and blocker:
 
@@ -379,6 +385,9 @@ Implemented evidence and blocker:
   `gemma3-4b-vision`; the remaining blocker is NPU model execution, not
   artifact availability. The artifact checker also supports `GEMMA3_MODEL_ROOT`
   and default per-variant directories for reproducible local discovery.
+- `gemma3_weight_plan.py` scans real text-stack safetensor metadata without materializing
+  full tensors and emits the static projection BO plan needed before model
+  runner weight preloading.
 
 ### Phase D: standalone kernel parity
 
@@ -504,8 +513,10 @@ Blocked evidence:
   real projection padding and Q4NX block counts needed for NPU wiring.
   `gemma3_npu_wiring.py` maps each real-shape text layer into prefill/decode
   stage roles, NPU kernel candidates, host fallbacks, local/global attention
-  windows, and remaining runner blockers. `gemma3_real_execution.py` also has a
-  CPU/HF warmup/timed-iteration benchmark path for small local smoke runs. No
+  windows, and remaining runner blockers. `gemma3_weight_plan.py` records real text-stack
+  projection static BO byte estimates for future preloading.
+  `gemma3_real_execution.py` also has a CPU/HF warmup/timed-iteration benchmark
+  path for small local smoke runs. No
   CPU/iGPU/NPU paper baseline or speedup claim is emitted until benchmark-length
   execution and NPU model execution are implemented.
 
