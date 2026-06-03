@@ -42,6 +42,74 @@ order a Gemma3 text model needs, records the shape and buffer contracts, and
 then replaces host fallbacks with NPU kernels only after isolated compile and
 hardware evidence is clean.
 
+## Implemented Synthetic Loop Status
+
+The first implementable text-only loop is now implemented as source-level
+Gemma3 examples. It remains a synthetic correctness and control-plane artifact,
+not a real Gemma3 deployment or hardware performance claim.
+
+Implemented files:
+
+- `gemma3_config.py`: text config, layer metadata, public output-mode defaults,
+  and explicit nonlinear fallback steps.
+- `gemma3_weights.py`: deterministic synthetic Q4NX/BF16-compatible weights.
+- `gemma3_reference.py`: CPU references for projections, attention, nonlinear
+  operations, residuals, logits, embeddings, and KV-cache updates.
+- `gemma3_runtime.py`: manifest/cache preparation with compile-only and
+  run-only validation.
+- `gemma3_prefill.py`: synthetic text prefill orchestration with per-stage
+  checksums, cache metadata, and local/global KV sweep reporting.
+- `gemma3_decode.py`: one-token decode orchestration with FlowKV-compatible
+  `Q_CHUNK=1` metadata and cache growth checks.
+- `gemma3_nonlinears.py`: nonlinear reuse registry and CPU contract checks.
+- `../gemma3_dataflow_kernels/geglu.py`: Gemma-specific GeGLU standalone AIR
+  kernel candidate with reference and compile-only lit coverage.
+- `gemma3_model_loop.py`: unified synthetic session for multiple prompt chunks
+  and decode tokens, compact logs, optional stage logs, and failure context.
+- `gemma3_scaling.py`: public-mode scaling policy checks for `2x4`, `4x4`, and
+  `8x4`, including classified unsupported-mode diagnostics.
+- `gemma3_vision.py`: disabled vision-path contract proving text-only results
+  are unchanged when vision is compiled out or unused.
+- `gemma3_inference.py`: Llama32-style entrypoint with compile-only, run-only,
+  verify, profile, layer-count, prompt-chunk, decode-token, local-window, and
+  stage-log controls.
+
+Focused lit coverage:
+
+- `run_model_loop_reference.lit`
+- `run_model_loop_runtime.lit`
+- `run_model_loop_prefill_decode.lit`
+- `run_model_loop_nonlinears.lit`
+- `run_model_loop_session.lit`
+- `run_model_loop_scaling.lit`
+- `run_model_loop_vision.lit`
+- `../gemma3_dataflow_kernels/run_geglu_compile_only.lit`
+
+Current phase status:
+
+| Phase | Status | Evidence |
+| --- | --- | --- |
+| Phase 0 | Complete | README link, support matrix, known unsupported-mode classes, and this status section are present. |
+| Phase 1 | Complete | Config, weights, and CPU references are implemented without AIR imports. |
+| Phase 2 | Complete | Manifest preparation supports compile-only/run-only and refuses missing or mismatched artifacts. |
+| Phase 3 | Complete | Two-chunk synthetic prefill records Q4NX/BF16/FlowQKV stages and distinct local/global KV sweeps. |
+| Phase 4 | Complete | Repeated one-token decode grows cache lengths and records FlowKV-compatible stage metadata. |
+| Phase 5 | Complete for standalone promotion readiness | RMSNorm/QK-Norm reuse, RoPE half-split source reuse, GeGLU kernel candidate, and fallback policy are documented and tested. |
+| Phase 6 | Complete | The synthetic transformer layer skeleton includes attention, output projection, residual, MLP, and deterministic stage checksums. |
+| Phase 7 | Complete | Multi-layer, multi-chunk, multi-token text loop is implemented in `Gemma3SyntheticSession`. |
+| Phase 8 | Policy complete, no performance claims | Scaling manifests and unsupported-mode diagnostics are checked; timing and hardware numbers are intentionally absent. |
+| Phase 9 | Disabled contract complete | Vision can be disabled entirely and text-only checksums/cache lengths are unchanged. |
+
+Latest focused verification commands used for this status:
+
+```bash
+source /home/cj/iron/ironenv/bin/activate && sandbox/bin/lit -v --filter=model_loop build-xrt/programming_examples
+source /home/cj/iron/ironenv/bin/activate && sandbox/bin/lit -v --filter=geglu_compile_only build-xrt/programming_examples
+```
+
+No hardware run, NPU power-mode change, clean rebuild, or `/home/cj/mlir-aie`
+edit is part of this synthetic model-loop completion.
+
 ## Paper Concepts To Preserve
 
 The implementation should preserve the following architectural ideas from the
