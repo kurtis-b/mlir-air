@@ -1,0 +1,5 @@
+# RUN: %PYTHON %S/gemma3_vision.py | FileCheck %s
+# CHECK: vision enabled=False status=disabled tokens=0
+# CHECK: text_baseline_checksum=
+# CHECK: text_with_disabled_vision_checksum=
+# CHECK: GEMMA3_VISION_DISABLED_SELF_TEST: PASS
