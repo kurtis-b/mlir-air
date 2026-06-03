@@ -35,6 +35,20 @@ REQUIRED_PAPER_ENV_FIELDS = (
     "npu.power_mode",
 )
 
+REPO_TOOL_CANDIDATES = {
+    "aircc": (
+        REPO_ROOT / "install-xrt" / "bin" / "aircc",
+        REPO_ROOT / "build-xrt" / "bin" / "aircc",
+    ),
+    "air-opt": (
+        REPO_ROOT / "install-xrt" / "bin" / "air-opt",
+        REPO_ROOT / "build-xrt" / "bin" / "air-opt",
+    ),
+    "aiecc": (
+        REPO_ROOT / "sandbox" / "bin" / "aiecc",
+    ),
+}
+
 
 def _run(args: list[str], *, cwd: Path = REPO_ROOT, timeout: int = 10) -> dict[str, Any]:
     try:
@@ -68,9 +82,19 @@ def _first_line(text: str) -> str | None:
     return None
 
 
-def _tool(name: str) -> dict[str, Any]:
+def _find_tool(name: str) -> tuple[str | None, str | None]:
     path = shutil.which(name)
-    info: dict[str, Any] = {"path": path, "available": bool(path)}
+    if path:
+        return path, "PATH"
+    for candidate in REPO_TOOL_CANDIDATES.get(name, ()):
+        if candidate.exists():
+            return str(candidate), "repo-local"
+    return None, None
+
+
+def _tool(name: str) -> dict[str, Any]:
+    path, source = _find_tool(name)
+    info: dict[str, Any] = {"path": path, "available": bool(path), "source": source}
     if path:
         version = _run([path, "--version"], timeout=5)
         info["version_line"] = _first_line(version.get("stdout", "") or version.get("stderr", ""))
@@ -245,6 +269,10 @@ def _self_test() -> None:
             raise AssertionError(f"missing environment key: {key}")
     if env["runtime"]["artifact_format"] != "elf":
         raise AssertionError("default artifact format should be elf")
+    for name in ("aircc", "air-opt", "aiecc"):
+        tool = env["tools"][name]
+        if tool["available"] and tool["source"] not in ("PATH", "repo-local"):
+            raise AssertionError(f"unexpected tool source for {name}: {tool['source']}")
     print(f"GEMMA3_ENV_CAPTURE_SELF_TEST: comparable={env['paper_comparable']} missing={len(env['missing_paper_fields'])}")
 
 
