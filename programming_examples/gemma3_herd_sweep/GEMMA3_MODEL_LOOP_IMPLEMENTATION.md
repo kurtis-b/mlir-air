@@ -83,7 +83,7 @@ Implemented files:
   NPU execution blocker from local artifacts.
 - `gemma3_npu_wiring.py`: real-shape per-layer execution wiring manifest that
   records prefill/decode stage roles, NPU kernel candidates, host fallbacks,
-  attention windows, and the remaining launch/binding blockers without
+  attention windows, and the remaining launch/argument-binding blockers without
   claiming execution.
 - `gemma3_weight_plan.py`: text-stack static projection-weight planning for real
   safetensors, including Q4NX padded block counts and packed weight/scale/min
@@ -94,6 +94,9 @@ Implemented files:
   that exercises real XRT allocation without claiming full paper-shape runtime.
 - `gemma3_static_preload.py`: real safetensor-to-Q4NX serialization and XRT BO
   preload smoke for selected projection tensors.
+- `gemma3_buffer_binding.py`: runtime buffer-binding manifest that assigns
+  persistent BO keys, virtual intermediate keys, static-weight families, and
+  mutable KV-cache buffers per model stage.
 - `gemma3_model_runner.py`: launch-order manifest that composes BO planning,
   static-preload planning, and per-layer kernel/fallback wiring without
   claiming kernel execution.
@@ -115,6 +118,7 @@ Focused lit coverage:
 - `run_model_loop_xrt_runner.lit`
 - `run_model_loop_static_preload.lit`
 - `run_model_loop_model_runner.lit`
+- `run_model_loop_buffer_binding.lit`
 - `../gemma3_dataflow_kernels/run_geglu_compile_only.lit`
 
 Current phase status:
@@ -517,7 +521,7 @@ Acceptance:
 Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase F as `BLOCKED` because
-  local 1B artifacts are available but model-kernel launch, runtime buffer
+  local 1B artifacts are available but model-kernel launch, kernel argument
   binding, full static weight BO preload validation, full paper-shape BO
   allocation validation, nonlinear model-stage promotion, and fresh paper-shape
   hardware reruns are not complete. The prior
@@ -529,7 +533,8 @@ Blocked evidence:
   real projection padding and Q4NX block counts needed for NPU wiring.
   `gemma3_npu_wiring.py` maps each real-shape text layer into prefill/decode
   stage roles, NPU kernel candidates, host fallbacks, local/global attention
-  windows, and remaining launch/binding blockers. `gemma3_weight_plan.py`
+  windows, and remaining launch/argument-binding blockers.
+  `gemma3_weight_plan.py`
   records real text-stack projection static BO byte estimates for future
   preloading.
   `gemma3_bo_plan.py` records the activation, KV-cache, and intermediate BO
@@ -567,14 +572,15 @@ Acceptance:
 Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase G as `BLOCKED` because
-  local 4B artifacts are available but model-kernel launch, runtime buffer binding, full static weight BO preload validation, full paper-shape BO allocation validation, nonlinear model-stage promotion, and
-  fresh paper-shape hardware reruns are not complete. Measured host fallback
+  local 4B artifacts are available but model-kernel launch, kernel argument
+  binding, full static weight BO preload validation, full paper-shape BO
+  allocation validation, nonlinear model-stage promotion, and fresh paper-shape hardware reruns are not complete. Measured host fallback
   records account for timing metadata but do not replace nonlinear NPU
   validation.
 - `gemma3_npu_wiring.py` emits the 4B text per-layer NPU candidate and host
   fallback plan from local artifacts, including the 5-local/1-global attention
   pattern, but no 64k/128k local paper claim is emitted without real KV-cache,
-  memory, kernel-launch, buffer-binding, and schedule evidence.
+  memory, kernel-launch, kernel argument-binding, and schedule evidence.
 
 ### Phase H: 4B vision path reproduction
 
@@ -599,8 +605,9 @@ Acceptance:
 Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase H as `BLOCKED` because
-  local 4B vision artifacts and processor files are available but the model-kernel launch, runtime buffer binding, full static weight BO preload validation, full paper-shape BO allocation validation, nonlinear
-  model-stage promotion, fresh paper-shape hardware reruns, and the vision NPU
+  local 4B vision artifacts and processor files are available but the model-kernel
+  launch, kernel argument binding, full static weight BO preload validation, full
+  paper-shape BO allocation validation, nonlinear model-stage promotion, fresh paper-shape hardware reruns, and the vision NPU
   path are not complete. Measured host fallback records account for text
   nonlinear timing metadata but do not validate vision hardware.
 - Existing text-only synthetic and blocked-result tests keep vision optional;
@@ -702,9 +709,12 @@ Implemented evidence and blocker:
 - `gemma3_static_preload.py` can save real Q4NX static-weight preload smoke JSON
   so future model-runner failures can distinguish serialization/preload from
   kernel binding and execution failures.
+- `gemma3_buffer_binding.py` records that runtime BO and virtual-intermediate
+  binding is planned with no missing BO keys in the self-test fixture; remaining
+  model-runner binding risk is kernel argument-order validation.
 - `gemma3_model_runner.py` records launch-order state in result JSON so blocked
   paper cells distinguish BO planning, static preload planning, kernel launch,
-  host fallback, and runtime buffer-binding gaps.
+  host fallback, runtime buffer-binding state, and kernel argument-binding gaps.
 - `gemma3_paper_compare.py --compare` accepts either a single result cell or a
   wrapper with `results`, and can emit Markdown and CSV summaries.
 - `run_model_loop_results.lit` covers blocked real-artifact result generation,

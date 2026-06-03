@@ -150,7 +150,7 @@ def _stage_status(
     if backend == "npu-candidate":
         return "candidate-only", ("model-kernel-launch-not-wired", "paper-shape-hardware-rerun-required")
     if backend == "host-runtime":
-        return "host-runtime-contract", ("model-runtime-buffer-binding-not-wired",)
+        return "host-runtime-contract", ()
     if kernel in nonlinear_status and nonlinear_status[kernel].startswith("hardware-smoke-pass"):
         return "standalone-hardware-smoke-host-fallback", ("model-stage-not-promoted",)
     return "host-fallback", ("model-stage-not-promoted",)
@@ -187,7 +187,7 @@ def build_wiring_plan_from_preflight(preflight: Gemma3NPUPreflightPlan) -> Gemma
 
     blockers = [
         "model-kernel-launch-not-wired",
-        "model-runtime-buffer-binding-not-wired",
+        "model-kernel-argument-binding-not-validated",
         "full-static-weight-bo-preload-not-validated",
         "paper-shape-bo-allocation-not-validated",
         "nonlinear-model-stage-promotion-incomplete",

@@ -20,6 +20,7 @@ from pathlib import Path
 
 from gemma3_artifacts import MODEL_SPECS, model_spec
 from gemma3_bo_plan import Gemma3BOPlan, Gemma3BORecord, build_bo_plan_from_preflight
+from gemma3_buffer_binding import Gemma3BufferBindingPlan, build_buffer_binding_plan_from_components
 from gemma3_npu_preflight import Gemma3NPUPreflightPlan, ProjectionPlan, build_preflight_plan
 from gemma3_npu_wiring import Gemma3NPUWiringPlan, build_wiring_plan_from_preflight
 from gemma3_weight_plan import (
@@ -33,7 +34,7 @@ from gemma3_xrt_runner import Gemma3XRTRunnerReport, allocate_smoke, dry_run_all
 
 MODEL_RUNNER_BLOCKERS = (
     "model-kernel-launch-not-wired",
-    "model-runtime-buffer-binding-not-wired",
+    "model-kernel-argument-binding-not-validated",
     "full-static-weight-bo-preload-not-validated",
     "paper-shape-bo-allocation-not-validated",
     "nonlinear-model-stage-promotion-incomplete",
@@ -80,6 +81,10 @@ class Gemma3ModelRunnerPlan:
     bo_allocation_count: int
     bo_skipped_count: int
     static_preload_tensor_count: int
+    buffer_binding_status: str
+    buffer_binding_count: int
+    virtual_buffer_count: int
+    kernel_argument_binding_blocker_count: int
     kernel_launch_count: int
     host_fallback_count: int
     host_runtime_count: int
@@ -95,6 +100,8 @@ class Gemma3ModelRunnerPlan:
             f"bo_status={self.bo_allocation_status} bo_requested={self.bo_requested_bytes} "
             f"bo_allocated={self.bo_allocated_bytes} bo_allocations={self.bo_allocation_count} "
             f"bo_skipped={self.bo_skipped_count} static_preload_tensors={self.static_preload_tensor_count} "
+            f"buffer_status={self.buffer_binding_status} buffer_bindings={self.buffer_binding_count} "
+            f"virtual_buffers={self.virtual_buffer_count} argument_binding_blockers={self.kernel_argument_binding_blocker_count} "
             f"kernel_launches={self.kernel_launch_count} host_fallbacks={self.host_fallback_count} "
             f"host_runtime={self.host_runtime_count} blockers={blockers}"
         ]
@@ -194,6 +201,7 @@ def build_model_runner_plan_from_components(
     bo_plan: Gemma3BOPlan,
     weight_plan: Gemma3StaticWeightPlan,
     wiring: Gemma3NPUWiringPlan,
+    buffer_binding_plan: Gemma3BufferBindingPlan,
     bo_report: Gemma3XRTRunnerReport,
     max_static_tensors: int = 4,
 ) -> Gemma3ModelRunnerPlan:
@@ -236,6 +244,13 @@ def build_model_runner_plan_from_components(
         bo_allocation_count=bo_report.allocation_count,
         bo_skipped_count=bo_report.skipped_count,
         static_preload_tensor_count=min(max_static_tensors, len(weight_plan.records)),
+        buffer_binding_status=buffer_binding_plan.status,
+        buffer_binding_count=buffer_binding_plan.binding_count,
+        virtual_buffer_count=buffer_binding_plan.virtual_buffer_count,
+        kernel_argument_binding_blocker_count=sum(
+            "model-kernel-argument-binding-not-validated" in binding.blockers
+            for binding in buffer_binding_plan.bindings
+        ),
         kernel_launch_count=wiring.npu_candidate_count,
         host_fallback_count=wiring.host_fallback_count,
         host_runtime_count=wiring.host_runtime_count,
@@ -268,6 +283,12 @@ def build_model_runner_plan(
         decode_context=decode_context,
     )
     wiring = build_wiring_plan_from_preflight(preflight)
+    buffer_binding_plan = build_buffer_binding_plan_from_components(
+        model_variant=model_variant,
+        bo_plan=bo_plan,
+        weight_plan=weight_plan,
+        wiring=wiring,
+    )
     if allocate_bo_smoke:
         bo_report = allocate_smoke(
             bo_plan,
@@ -288,6 +309,7 @@ def build_model_runner_plan(
         bo_plan=bo_plan,
         weight_plan=weight_plan,
         wiring=wiring,
+        buffer_binding_plan=buffer_binding_plan,
         bo_report=bo_report,
         max_static_tensors=max_static_tensors,
     )
@@ -362,12 +384,20 @@ def _self_test() -> None:
         ),
         blockers=("paper-shape-bo-allocation-not-validated",),
     )
+    binding_bo_plan = build_bo_plan_from_preflight(preflight, weight_plan, prompt_len=16, decode_context=16)
+    buffer_binding_plan = build_buffer_binding_plan_from_components(
+        model_variant="gemma3-1b",
+        bo_plan=binding_bo_plan,
+        weight_plan=weight_plan,
+        wiring=build_wiring_plan_from_preflight(preflight),
+    )
     bo_report = dry_run_allocation_plan(bo_plan, max_total_bytes=6144, max_bo_bytes=4096)
     plan = build_model_runner_plan_from_components(
         model_variant="gemma3-1b",
         bo_plan=bo_plan,
         weight_plan=weight_plan,
         wiring=build_wiring_plan_from_preflight(preflight),
+        buffer_binding_plan=buffer_binding_plan,
         bo_report=bo_report,
         max_static_tensors=2,
     )
@@ -377,6 +407,10 @@ def _self_test() -> None:
         raise AssertionError((plan.bo_allocation_count, plan.bo_skipped_count))
     if plan.static_preload_tensor_count != 2:
         raise AssertionError(plan.static_preload_tensor_count)
+    if plan.buffer_binding_status != "READY_FOR_MODEL_RUNNER" or plan.buffer_binding_count != 52:
+        raise AssertionError(plan)
+    if plan.kernel_argument_binding_blocker_count != 20:
+        raise AssertionError(plan.kernel_argument_binding_blocker_count)
     if plan.kernel_launch_count != 20 or plan.host_fallback_count != 28 or plan.host_runtime_count != 4:
         raise AssertionError(plan)
     print(plan.format(include_steps=True))
