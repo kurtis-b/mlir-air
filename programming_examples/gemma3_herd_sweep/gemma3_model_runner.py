@@ -458,9 +458,9 @@ def _self_test() -> None:
         raise AssertionError(plan.static_preload_tensor_count)
     if plan.buffer_binding_status != "READY_FOR_MODEL_RUNNER" or plan.buffer_binding_count != 60:
         raise AssertionError(plan)
-    if plan.kernel_argument_binding_blocker_count != 24:
+    if plan.kernel_argument_binding_blocker_count != 44:
         raise AssertionError(plan.kernel_argument_binding_blocker_count)
-    if plan.kernel_launch_count != 24 or plan.host_fallback_count != 32 or plan.host_runtime_count != 4:
+    if plan.kernel_launch_count != 44 or plan.host_fallback_count != 12 or plan.host_runtime_count != 4:
         raise AssertionError(plan)
     print(plan.format(include_steps=True))
     print("GEMMA3_MODEL_RUNNER_SELF_TEST: PASS")

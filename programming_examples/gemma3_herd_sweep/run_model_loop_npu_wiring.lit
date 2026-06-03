@@ -1,9 +1,11 @@
 # RUN: %PYTHON %S/gemma3_npu_wiring.py --self-test | FileCheck %s
 # CHECK: npu_wiring model=gemma3-1b status=BLOCKED layers=6
 # CHECK-SAME: stages=180
-# CHECK-SAME: npu_candidates=72
-# CHECK-SAME: host_fallbacks=96
+# CHECK-SAME: npu_candidates=132
+# CHECK-SAME: host_fallbacks=36
 # CHECK-SAME: blockers=model-kernel-launch-not-wired,model-kernel-argument-binding-not-validated,full-static-weight-bo-preload-not-validated,paper-shape-bo-allocation-not-validated,nonlinear-model-stage-promotion-incomplete,paper-shape-hardware-rerun-required
+# CHECK: stage prefill:L0:0:pre_attention_norm backend=npu-candidate kernel=rms_norm route=weighted_rms_norm/standalone-elf-smoke
+# CHECK-SAME: status=standalone-hardware-smoke-model-candidate blockers=model-kernel-launch-not-wired,paper-shape-hardware-rerun-required
 # CHECK: stage prefill:L0:1:qkv_projection backend=npu-candidate kernel=q4nx+bf16_mm route=8x4/l2-gather/smoke+8x4/n/a/smoke
 # CHECK-SAME: attention=local_swa window=512
 # CHECK-SAME: blockers=model-kernel-launch-not-wired,paper-shape-hardware-rerun-required

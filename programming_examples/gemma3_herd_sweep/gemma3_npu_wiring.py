@@ -147,15 +147,24 @@ def _stage_route(kernel: str, routes: dict[str, str]) -> str:
         return "+".join(pieces)
     if kernel == "mlp_activation":
         return "geglu/standalone-elf-smoke"
+    if kernel in ("rms_norm", "qk_norm"):
+        return "weighted_rms_norm/standalone-elf-smoke"
     return routes.get(kernel, "host")
 
 
-def _stage_backend(backend: str, kernel: str, nonlinear_status: dict[str, str]) -> str:
-    if (
-        backend == "host-fallback"
-        and kernel == "mlp_activation"
-        and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass")
-    ):
+def _stage_backend(
+    backend: str,
+    kernel: str,
+    nonlinear_status: dict[str, str],
+    preflight: Gemma3NPUPreflightPlan,
+) -> str:
+    if backend != "host-fallback":
+        return backend
+    if kernel == "mlp_activation" and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass"):
+        return "npu-candidate"
+    if kernel == "qk_norm" and int(preflight.head_dim or 0) == 256 and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass"):
+        return "npu-candidate"
+    if kernel == "rms_norm" and int(preflight.hidden_size or 0) == 1152 and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass"):
         return "npu-candidate"
     return backend
 
@@ -168,7 +177,7 @@ def _stage_status(
     launch_blockers = ("model-kernel-launch-not-wired", "paper-shape-hardware-rerun-required")
     if backend == "npu-candidate":
         if (
-            kernel == "mlp_activation"
+            kernel in ("mlp_activation", "rms_norm", "qk_norm")
             and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass")
         ):
             return "standalone-hardware-smoke-model-candidate", launch_blockers
@@ -196,7 +205,7 @@ def build_wiring_plan_from_preflight(
         attention_kind = _attention_kind(layer_index)
         layer_window = 0 if attention_kind == "global_full" else window_len
         for stage_index, (phase, role, backend, kernel, contract) in enumerate(TEXT_STAGE_TEMPLATE):
-            stage_backend = _stage_backend(backend, kernel, nonlinear_status)
+            stage_backend = _stage_backend(backend, kernel, nonlinear_status, preflight)
             status, blockers = _stage_status(stage_backend, kernel, nonlinear_status)
             stages.append(
                 Gemma3NPUStage(
@@ -297,9 +306,9 @@ def _self_test() -> None:
     plan = build_wiring_plan_from_preflight(_fake_preflight())
     if plan.stage_count != 6 * len(TEXT_STAGE_TEMPLATE):
         raise AssertionError(plan.stage_count)
-    if plan.npu_candidate_count != 6 * 12:
+    if plan.npu_candidate_count != 6 * 22:
         raise AssertionError(plan.npu_candidate_count)
-    if plan.host_fallback_count != 6 * 16:
+    if plan.host_fallback_count != 6 * 6:
         raise AssertionError(plan.host_fallback_count)
     global_attention = [stage for stage in plan.stages if stage.layer_index == 5 and stage.role == "attention"]
     if not global_attention or any(stage.attention_kind != "global_full" or stage.window_len != 0 for stage in global_attention):

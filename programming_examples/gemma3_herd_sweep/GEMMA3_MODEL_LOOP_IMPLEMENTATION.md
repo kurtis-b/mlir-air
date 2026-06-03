@@ -488,9 +488,12 @@ Implemented evidence and blocker:
   Gemma-specific model wiring uses validated kernels. GeGLU/MLP activation now
   enters the model wiring as an NPU launch candidate using its standalone ELF
   hardware-smoke evidence, but it is not model-timed until launch and argument
-  binding are validated. RMSNorm and QK-Norm remain host fallbacks until their
-  norm-weight BO/preload path is added; RoPE and residual add still need Gemma
-  wrappers or explicit measured fallback treatment.
+  binding are validated. RMSNorm and QK-Norm now enter the wiring as
+  `weighted_rms_norm` NPU candidates where standalone evidence matches the
+  shape contract: 1B RMSNorm rows use the M=8/N=1152 smoke, and QK-Norm uses
+  the flattened per-head M=32/N=256 smoke. 4B RMSNorm remains pending an
+  N=2560 standalone smoke before promotion. RoPE and residual add still need
+  Gemma wrappers or explicit measured fallback treatment.
 - `gemma3_results.py` now records fallback entries with backend, elapsed-ms,
   timed-iteration count, measurement source, tensor contract, hardware status,
   and `npu_promoted=false` for CPU-reference fallbacks.
@@ -517,8 +520,10 @@ Implemented evidence and blocker:
 - `gemma3_bo_plan.py` now includes a dedicated `static_norm_weights` BO when
   norm weights are planned, and `gemma3_buffer_binding.py` maps RMSNorm/QK-Norm
   families to that BO while keeping projection families on
-  `static_projection_weights`. This is a model-runner argument contract; it is
-  not yet a validated norm-kernel launch.
+  `static_projection_weights`. `gemma3_npu_wiring.py` promotes matching norm
+  stages to `weighted_rms_norm/standalone-elf-smoke` model candidates. This is
+  a model-runner argument and launch-intent contract; it is not yet a validated
+  model-timed norm-kernel launch.
 - Remaining work for full Phase E completion is model launch and argument-order
   validation for the promoted GeGLU and norm paths, plus RoPE, residual, logits,
   and sampling promotion or measured timing treatment in end-to-end execution.
