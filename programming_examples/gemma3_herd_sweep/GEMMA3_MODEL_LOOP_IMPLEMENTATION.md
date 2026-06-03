@@ -656,6 +656,22 @@ Acceptance:
     unsupported, or unexplained.
 - The report is backed by committed source changes and saved result artifacts.
 
+Implemented evidence and blocker:
+
+- `gemma3_report.py` renders one Markdown row per paper target cell, including
+  paper value, local value, delta, classification, correctness, command, log
+  path, and note.
+- The report puts correctness summary before performance summary, then lists all
+  result cells, headline source conflicts, and unsupported/diagnostic mode
+  classifications from the kernel parity matrix.
+- The report status is `MATCHES_PAPER`, `MATCHES_WITH_EXPLAINED_DEVIATIONS`, or
+  `DOES_NOT_MATCH_PAPER`; with current blocked/missing real results it correctly
+  reports `DOES_NOT_MATCH_PAPER`.
+- `run_model_loop_report.lit` covers self-test, blocked-result input, Markdown
+  output, required sections, and final status.
+- The report generator is complete, but a positive paper-parity status remains
+  blocked until all required paper cells have real local results.
+
 ### Artifact and result directory policy
 
 Use source-controlled files for plans, target tables, scripts, and small
