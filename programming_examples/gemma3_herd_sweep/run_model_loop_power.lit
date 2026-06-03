@@ -1,0 +1,8 @@
+# RUN: %PYTHON %S/gemma3_power.py --self-test | FileCheck %s --check-prefix=SELF
+# RUN: %PYTHON %S/gemma3_power.py --sample --json | FileCheck %s --check-prefix=JSON
+# SELF: GEMMA3_POWER_SNAPSHOT backend=
+# SELF-SAME: cpu=MISSING_POWER_FIELD,gpu=MISSING_POWER_FIELD,npu=MISSING_POWER_FIELD,total=MISSING_POWER_FIELD
+# SELF: GEMMA3_POWER_CONTRACT_SELF_TEST: PASS
+# JSON: "cpu": "MISSING_POWER_FIELD"
+# JSON: "npu": "MISSING_POWER_FIELD"
+# JSON: "total": null

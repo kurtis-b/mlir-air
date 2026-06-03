@@ -17,6 +17,7 @@ from gemma3_artifacts import MODEL_SPECS, discover_model_artifacts, model_spec
 from gemma3_environment import capture_environment
 from gemma3_nonlinears import paper_match_blockers
 from gemma3_paper_compare import load_targets, target_by_id
+from gemma3_power import capture_power_snapshot
 
 DEFAULT_POWER_WATTS = {"cpu": None, "gpu": None, "npu": None, "total": None}
 TABLE_BY_METRIC = {
@@ -126,6 +127,7 @@ def build_paper_result(
         timing_window="runtime_only",
         require_hardware=False,
     )
+    power = capture_power_snapshot(sample=power_sample, run_id=target["id"])
 
     notes = missing_artifact_notes(inventory)
     if not inventory.can_load_real_artifacts:
@@ -138,7 +140,7 @@ def build_paper_result(
     if env.get("missing_paper_fields"):
         notes.append("environment is not paper-comparable: " + ",".join(env["missing_paper_fields"]))
     if power_sample:
-        notes.append("power sampling requested but no telemetry backend is implemented")
+        notes.extend(power.notes)
     if trace_size is not None:
         notes.append(f"trace_size={trace_size} requested for future NPU run")
     if debug_ir:
@@ -175,7 +177,10 @@ def build_paper_result(
         "warmup_iters": warmup_iters,
         "timed_iters": timed_iters,
         "compile_time_included": compile_time_included,
-        "power_watts": dict(DEFAULT_POWER_WATTS),
+        "power_watts": power.watts,
+        "power_status": power.field_status,
+        "power_sampling_backend": power.sampling_backend,
+        "power_aligned_with_timed_window": power.aligned_with_timed_window,
         "environment_comparable": env.get("paper_comparable"),
         "missing_environment_fields": env.get("missing_paper_fields", []),
         "artifact_inventory": inventory.to_json_dict(),

@@ -619,6 +619,19 @@ Acceptance:
 - Any unavailable rail or telemetry source is reported as `MISSING_POWER_FIELD`,
   not zero.
 
+Implemented evidence and blocker:
+
+- `gemma3_power.py` defines the power telemetry contract, including CPU/GPU/NPU
+  and total rails, timed-window alignment metadata, run IDs, missing-field
+  classification, and TPS/W helper calculations.
+- `gemma3_results.py` includes power watts, per-rail power status,
+  sampling-backend metadata, and timed-window alignment in every paper result
+  JSON; unavailable rails are `null` with `MISSING_POWER_FIELD`, never zero.
+- `run_model_loop_power.lit` covers the missing-telemetry contract and verifies
+  that JSON output keeps watts null while statuses classify missing rails.
+- Full power-table comparison and TPS/W reproduction remain blocked until a
+  real timed inference run and an approved telemetry backend are available.
+
 ### Phase K: final paper-parity report
 
 Goal: produce a report that can answer whether the implementation and results
