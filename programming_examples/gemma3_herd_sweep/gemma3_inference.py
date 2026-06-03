@@ -15,7 +15,7 @@ import argparse
 from pathlib import Path
 
 from gemma3_config import describe_kernel_sequence, synthetic_text_config
-from gemma3_reference import run_synthetic_prefill_decode_smoke
+from gemma3_decode import run_synthetic_text_loop
 from gemma3_runtime import format_manifest, prepare_runtime
 
 
@@ -46,9 +46,8 @@ def main() -> int:
     print(format_manifest(manifest))
     print("GEMMA3_RUNTIME_RUN_ONLY: manifest loaded")
     if args.verify:
-        smoke = run_synthetic_prefill_decode_smoke()
-        print(f"prefill_checksum={smoke['prefill_checksum']:.6f}")
-        print(f"decode_checksum={smoke['decode_checksum']:.6f}")
+        report = run_synthetic_text_loop(config, manifest=manifest)
+        print(report.format())
         print("GEMMA3_SYNTHETIC_VERIFY: PASS")
     else:
         print("GEMMA3_NPU_EXECUTION: not implemented; use --verify for CPU reference")
