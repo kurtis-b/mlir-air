@@ -72,11 +72,11 @@ def nonlinear_registry(config: Gemma3TextConfig | None = None) -> tuple[Gemma3No
             cpu_reference="gemma3_reference.rms_norm",
             tensor_contract=f"flatten [*, {config.emb_dim}] rows to weighted_rms_norm[M,N]",
             compile_status="compile-lit-available",
-            hardware_status="hardware-smoke-pass-M8-N1152-elf",
+            hardware_status="hardware-smoke-pass-M8-N1152-N2560-elf",
             tolerance="rtol=5e-2 atol=5e-1 corr>=0.99 hardware-smoke",
             timed_window_status="unmeasured-host-fallback",
             fallback="host CPU reference until Gemma model wiring uses the validated standalone kernel",
-            notes="Standalone weighted_rms_norm ELF compile-and-run passed for M=8 N=1152.",
+            notes="Standalone weighted_rms_norm ELF compile-and-run passed for M=8 N=1152 and M=8 N=2560.",
         ),
         Gemma3NonlinearSpec(
             operation="qk_norm",

@@ -164,7 +164,11 @@ def _stage_backend(
         return "npu-candidate"
     if kernel == "qk_norm" and int(preflight.head_dim or 0) == 256 and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass"):
         return "npu-candidate"
-    if kernel == "rms_norm" and int(preflight.hidden_size or 0) == 1152 and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass"):
+    if (
+        kernel == "rms_norm"
+        and int(preflight.hidden_size or 0) in (1152, 2560)
+        and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass")
+    ):
         return "npu-candidate"
     return backend
 

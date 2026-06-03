@@ -490,10 +490,10 @@ Implemented evidence and blocker:
   hardware-smoke evidence, but it is not model-timed until launch and argument
   binding are validated. RMSNorm and QK-Norm now enter the wiring as
   `weighted_rms_norm` NPU candidates where standalone evidence matches the
-  shape contract: 1B RMSNorm rows use the M=8/N=1152 smoke, and QK-Norm uses
-  the flattened per-head M=32/N=256 smoke. 4B RMSNorm remains pending an
-  N=2560 standalone smoke before promotion. RoPE and residual add still need
-  Gemma wrappers or explicit measured fallback treatment.
+  shape contract: 1B RMSNorm rows use the M=8/N=1152 smoke, 4B text/vision
+  RMSNorm rows use the M=8/N=2560 smoke, and QK-Norm uses the flattened
+  per-head M=32/N=256 smoke. RoPE and residual add still need Gemma wrappers
+  or explicit measured fallback treatment.
 - `gemma3_results.py` now records fallback entries with backend, elapsed-ms,
   timed-iteration count, measurement source, tensor contract, hardware status,
   and `npu_promoted=false` for CPU-reference fallbacks.
@@ -521,8 +521,10 @@ Implemented evidence and blocker:
   norm weights are planned, and `gemma3_buffer_binding.py` maps RMSNorm/QK-Norm
   families to that BO while keeping projection families on
   `static_projection_weights`. `gemma3_npu_wiring.py` promotes matching norm
-  stages to `weighted_rms_norm/standalone-elf-smoke` model candidates. This is
-  a model-runner argument and launch-intent contract; it is not yet a validated
+  stages to `weighted_rms_norm/standalone-elf-smoke` model candidates, including
+  the local Strix/XRT M=8/N=2560 standalone smoke with 0.999983 output
+  correlation for 4B RMSNorm. This is a model-runner argument and launch-intent
+  contract; it is not yet a validated
   model-timed norm-kernel launch.
 - Remaining work for full Phase E completion is model launch and argument-order
   validation for the promoted GeGLU and norm paths, plus RoPE, residual, logits,

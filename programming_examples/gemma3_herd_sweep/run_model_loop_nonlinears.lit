@@ -1,7 +1,7 @@
 # RUN: %PYTHON %S/gemma3_nonlinears.py | FileCheck %s
 # CHECK: nonlinear rms_norm status=standalone-npu-reuse-candidate
 # CHECK-SAME: cpu_ref=gemma3_reference.rms_norm
-# CHECK-SAME: hardware=hardware-smoke-pass-M8-N1152-elf
+# CHECK-SAME: hardware=hardware-smoke-pass-M8-N1152-N2560-elf
 # CHECK: nonlinear qk_norm status=standalone-npu-reuse-candidate
 # CHECK-SAME: cpu_ref=gemma3_reference.qk_norm
 # CHECK-SAME: hardware=hardware-smoke-pass-M32-N256-elf
