@@ -9,9 +9,9 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from common import (
+    ALL_OUTPUT_MODES,
     FLOW_VARIANTS,
     FLOW_KV_STAGING_MODES,
-    OUTPUT_MODES,
     SCHEDULE_MODES,
     SUPPORTED_HERD_SHAPES,
     parse_herd_shape,
@@ -65,7 +65,12 @@ def main():
         default="compile-and-run",
     )
     parser.add_argument("--output-format", choices=["xclbin", "elf"], default="xclbin")
-    parser.add_argument("--output-mode", choices=OUTPUT_MODES, default="auto")
+    parser.add_argument("--output-mode", default="auto")
+    parser.add_argument(
+        "--allow-unsupported-output-mode",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
 
     shape_rows, shape_cols = parse_herd_shape(args.herd_shape)
@@ -76,14 +81,26 @@ def main():
     if args.kv_chunk <= 0 or args.kv_len % args.kv_chunk != 0:
         parser.error("kv-len must be divisible by a positive kv-chunk")
 
-    try:
-        output_mode = resolve_output_mode(
-            args.output_mode, args.herd_rows, args.herd_cols, "flowkv"
-        )
-    except ValueError as exc:
-        parser.error(str(exc))
+    if args.allow_unsupported_output_mode:
+        if args.output_mode not in ALL_OUTPUT_MODES:
+            parser.error(f"output mode must be one of: {', '.join(ALL_OUTPUT_MODES)}")
+        if args.output_mode == "auto":
+            parser.error("diagnostic output-mode bypass requires an explicit mode")
+        if args.output_mode not in ("direct", "l2-gather"):
+            parser.error(
+                "diagnostic output-mode bypass supports only direct or l2-gather"
+            )
+        output_mode = args.output_mode
+    else:
+        try:
+            output_mode = resolve_output_mode(
+                args.output_mode, args.herd_rows, args.herd_cols, "flowkv"
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
 
     instance_name = "flow_attention"
+    small_l2_gather = output_mode == "l2-gather" and args.herd_rows < 8
     if args.schedule_mode == "paper":
         tiles_per_query_chunk = args.kv_groups * args.heads_per_kv
         if herd_tiles % tiles_per_query_chunk != 0:
@@ -136,7 +153,8 @@ def main():
                 args.herd_rows,
                 args.herd_cols,
                 output_mode,
-                l2_gather_layout="linear",
+                l2_gather_layout="rowcol" if small_l2_gather else "linear",
+                l2_gather_via_channel=small_l2_gather,
             )
         if args.print_module_only:
             print(module)
@@ -224,7 +242,8 @@ def main():
             args.herd_rows,
             args.herd_cols,
             output_mode,
-            l2_gather_layout="linear",
+            l2_gather_layout="rowcol" if small_l2_gather else "linear",
+            l2_gather_via_channel=small_l2_gather,
         )
         if args.print_module_only:
             print(module)

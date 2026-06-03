@@ -106,13 +106,17 @@ def build_flow_module(
     dynamic_query_base=False,
     query_base=0,
     tiles_per_query_chunk=None,
+    l2_gather_via_channel=False,
 ):
     if output_mode not in ("direct", "l2-gather"):
         raise ValueError(f"unsupported output mode: {output_mode}")
     if l2_gather_layout not in ("rowcol", "linear"):
         raise ValueError(f"unsupported L2 gather layout: {l2_gather_layout}")
     use_l2_gather = output_mode == "l2-gather"
+    if l2_gather_via_channel and not use_l2_gather:
+        raise ValueError("channel-staged L2 gather requires output mode l2-gather")
     use_rowcol_l2_gather = use_l2_gather and l2_gather_layout == "rowcol"
+    use_l2_gather_via_channel = use_l2_gather and l2_gather_via_channel
     if dynamic_query_base and not tiles_per_query_chunk:
         raise ValueError("dynamic query-base mode needs tiles_per_query_chunk")
 
@@ -167,6 +171,10 @@ def build_flow_module(
     query_base_map = None
     if dynamic_query_base:
         query_base_map = _affine_query_base(q_chunk, tiles_per_query_chunk, query_base)
+    out_channel = None
+    if use_l2_gather_via_channel:
+        out_channel = f"{public_name}_l2_gather_out"
+        Channel(out_channel, size=[herd_rows, herd_cols])
 
     @FuncOp.from_py_func(qkv_l3_ty, out_l3_ty)
     def flow_attention(arg_qkv, arg_out):
@@ -257,7 +265,9 @@ def build_flow_module(
                     else:
                         CallOp(attn_func, [l1_q, l1_k, l1_v, l1_out])
                     if use_l2_gather:
-                        if use_rowcol_l2_gather:
+                        if use_l2_gather_via_channel:
+                            ChannelPut(out_channel, l1_out, indices=[_tx, _ty])
+                        elif use_rowcol_l2_gather:
                             dma_memcpy_nd(
                                 ho,
                                 l1_out,
@@ -294,6 +304,33 @@ def build_flow_module(
                     DeallocOp(l1_out)
 
                 if use_l2_gather:
+                    if use_l2_gather_via_channel:
+                        for row in range(herd_rows):
+                            for col in range(herd_cols):
+                                if use_rowcol_l2_gather:
+                                    ChannelGet(
+                                        out_channel,
+                                        l2_out,
+                                        offsets=[row, col, 0, 0],
+                                        sizes=[1, 1, q_chunk, head_dim],
+                                        strides=[
+                                            herd_cols * q_chunk * head_dim,
+                                            q_chunk * head_dim,
+                                            head_dim,
+                                            1,
+                                        ],
+                                        indices=[row, col],
+                                    )
+                                else:
+                                    local_idx_static = row * herd_cols + col
+                                    ChannelGet(
+                                        out_channel,
+                                        l2_out,
+                                        offsets=[local_idx_static, 0, 0],
+                                        sizes=[1, q_chunk, head_dim],
+                                        strides=[q_chunk * head_dim, head_dim, 1],
+                                        indices=[row, col],
+                                    )
                     if use_rowcol_l2_gather:
                         dma_memcpy_nd(
                             so,

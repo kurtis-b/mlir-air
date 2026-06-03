@@ -16,6 +16,7 @@ from common import (
     SUPPORTED_HERD_SHAPES,
     is_output_mode_supported,
     parse_herd_shape,
+    unsupported_output_mode_reason,
 )
 
 KERNEL_TARGETS = (
@@ -80,9 +81,13 @@ def main() -> int:
                 if not is_output_mode_supported(
                     output_mode, herd_rows, herd_cols, kernel
                 ):
+                    reason = unsupported_output_mode_reason(
+                        output_mode, herd_rows, herd_cols, kernel
+                    )
+                    suffix = f": {reason}" if reason else ""
                     print(
                         f"==> skip {target} HERD_SHAPE={shape} "
-                        f"OUTPUT_MODE={output_mode} (unsupported)",
+                        f"OUTPUT_MODE={output_mode} (unsupported{suffix})",
                         flush=True,
                     )
                     continue

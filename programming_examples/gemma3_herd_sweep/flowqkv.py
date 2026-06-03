@@ -11,7 +11,6 @@ from ml_dtypes import bfloat16
 from common import (
     FLOW_VARIANTS,
     FLOW_KV_STAGING_MODES,
-    OUTPUT_MODES,
     SCHEDULE_MODES,
     SUPPORTED_HERD_SHAPES,
     parse_herd_shape,
@@ -74,7 +73,7 @@ def main():
         default="compile-and-run",
     )
     parser.add_argument("--output-format", choices=["xclbin", "elf"], default="xclbin")
-    parser.add_argument("--output-mode", choices=OUTPUT_MODES, default="auto")
+    parser.add_argument("--output-mode", default="auto")
     args = parser.parse_args()
 
     shape_rows, shape_cols = parse_herd_shape(args.herd_shape)

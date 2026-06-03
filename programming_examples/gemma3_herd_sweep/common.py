@@ -16,6 +16,8 @@ SCHEDULE_MODES = ("smoke", "paper")
 FLOW_VARIANTS = ("causal", "swa")
 FLOW_KV_STAGING_MODES = ("replicated", "shared", "pipeline")
 OUTPUT_MODES = ("auto", "direct", "l2-gather")
+DIAGNOSTIC_OUTPUT_MODES = ("packet-direct",)
+ALL_OUTPUT_MODES = OUTPUT_MODES + DIAGNOSTIC_OUTPUT_MODES
 OUTPUT_MODE_KERNELS = ("q4nx", "fused_dqp", "flowqkv", "flowkv")
 
 _OUTPUT_MODE_SUPPORT = {
@@ -46,6 +48,41 @@ _AUTO_OUTPUT_MODE = {
     "fused_dqp": "direct",
     "flowqkv": "direct",
     "flowkv": "direct",
+}
+
+_OUTPUT_MODE_UNSUPPORTED_REASONS = {
+    ("q4nx", "8x4", "direct"): (
+        "direct output from the full 8x4 herd exceeds the shim S2MM DMA "
+        "channel budget; use l2-gather"
+    ),
+    ("fused_dqp", "8x4", "direct"): (
+        "direct output from the full 8x4 herd exceeds the shim S2MM DMA "
+        "channel budget; use l2-gather"
+    ),
+    ("flowqkv", "8x4", "direct"): (
+        "direct output from the full 8x4 herd exceeds the shim S2MM DMA "
+        "channel budget; use l2-gather"
+    ),
+    ("flowkv", "8x4", "direct"): (
+        "direct output from the full 8x4 herd exceeds the shim S2MM DMA "
+        "channel budget; use l2-gather"
+    ),
+    ("flowkv", "2x4", "l2-gather"): (
+        "FlowKV small-shape L2 gather is diagnostic-only: channel-staged "
+        "compile passes, but hardware validation is not clean; use direct"
+    ),
+    ("flowkv", "4x4", "l2-gather"): (
+        "FlowKV small-shape L2 gather is diagnostic-only: channel-staged "
+        "compile passes, but hardware validation is not clean; use direct"
+    ),
+    ("q4nx", "8x4", "packet-direct"): (
+        "packet-direct is diagnostic-only: shared shim S2MM packet output "
+        "currently corrupts hardware validation; use l2-gather"
+    ),
+    ("fused_dqp", "8x4", "packet-direct"): (
+        "packet-direct is diagnostic-only: shared shim S2MM packet output "
+        "currently corrupts hardware validation; use l2-gather"
+    ),
 }
 
 
@@ -80,16 +117,36 @@ def is_output_mode_supported(
 ) -> bool:
     if mode == "auto":
         return True
-    if mode not in OUTPUT_MODES:
+    if mode not in ALL_OUTPUT_MODES:
         return False
     return mode in supported_output_modes(kernel, herd_rows, herd_cols)
+
+
+def unsupported_output_mode_reason(
+    mode: str, herd_rows: int, herd_cols: int, kernel: str
+) -> str | None:
+    shape = herd_shape_name(herd_rows, herd_cols)
+    reason = _OUTPUT_MODE_UNSUPPORTED_REASONS.get((kernel, shape, mode))
+    if reason:
+        return reason
+    if mode == "packet-direct" and kernel in ("q4nx", "fused_dqp"):
+        return (
+            "packet-direct is diagnostic-only: shared shim S2MM packet output "
+            "does not have passing hardware validation; use l2-gather"
+        )
+    if mode == "packet-direct":
+        return (
+            "packet-direct is diagnostic-only and has no passing hardware "
+            "validation for this kernel/shape"
+        )
+    return None
 
 
 def resolve_output_mode(
     mode: str, herd_rows: int, herd_cols: int, kernel: str
 ) -> str:
-    if mode not in OUTPUT_MODES:
-        supported = ", ".join(OUTPUT_MODES)
+    if mode not in ALL_OUTPUT_MODES:
+        supported = ", ".join(ALL_OUTPUT_MODES)
         raise ValueError(f"output mode must be one of: {supported}")
     modes = supported_output_modes(kernel, herd_rows, herd_cols)
     if mode == "auto":
@@ -101,8 +158,13 @@ def resolve_output_mode(
 
     supported = ", ".join(modes)
     shape = herd_shape_name(herd_rows, herd_cols)
+    reason = unsupported_output_mode_reason(mode, herd_rows, herd_cols, kernel)
+    if reason:
+        reason = f" ({reason})"
+    else:
+        reason = ""
     raise ValueError(
-        f"output mode {mode!r} is not supported for {kernel} {shape}; "
+        f"output mode {mode!r} is not supported for {kernel} {shape}{reason}; "
         f"supported modes: {supported}"
     )
 

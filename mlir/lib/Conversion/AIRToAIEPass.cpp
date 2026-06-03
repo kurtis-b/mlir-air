@@ -3568,12 +3568,14 @@ public:
   /// \note This is a simpler lookup than getExistingPacketFlowOpFromDevice
   ///       because it doesn't need to resolve flowID through channel symbols.
   AIE::PacketFlowOp
-  getExistingPacketFlowOpFromRuntime(mlir::Value source,
-                                     xilinx::AIE::WireBundle sourceBundle,
-                                     uint32_t sourceChannel) {
+  getExistingPacketFlowOpFromRuntime(mlir::Value endpoint,
+                                     xilinx::AIE::WireBundle bundle,
+                                     uint32_t channel,
+                                     bool matchDestination = false) {
     // Search for the packet flow without flowID checking
-    return findPacketFlowOp(source, sourceBundle, sourceChannel,
-                            /*checkFlowID=*/false, /*flowID=*/-1);
+    return findPacketFlowOp(endpoint, bundle, channel,
+                            /*checkFlowID=*/false, /*flowID=*/-1,
+                            matchDestination);
   }
 
 private:
@@ -3582,26 +3584,38 @@ private:
   /// This helper method encapsulates the common packet flow lookup logic,
   /// allowing both getExistingPacketFlowOpFromDevice and
   /// getExistingPacketFlowOpFromRuntime to reuse the same search implementation
-  /// while differing only in whether they check the flowID.
-  AIE::PacketFlowOp findPacketFlowOp(mlir::Value source,
-                                     xilinx::AIE::WireBundle sourceBundle,
-                                     uint32_t sourceChannel, bool checkFlowID,
-                                     int flowID) {
+  /// while differing only in whether they check the flowID. Runtime S2MM
+  /// packet-output DMAs need destination-side matching because the shim tile is
+  /// the packet destination rather than the packet source.
+  AIE::PacketFlowOp findPacketFlowOp(mlir::Value endpoint,
+                                     xilinx::AIE::WireBundle bundle,
+                                     uint32_t channel, bool checkFlowID,
+                                     int flowID,
+                                     bool matchDestination = false) {
     AIE::DeviceOp aieDeviceOp =
-        source.getParentRegion()->getParentOfType<AIE::DeviceOp>();
+        endpoint.getParentRegion()->getParentOfType<AIE::DeviceOp>();
     AIE::PacketFlowOp packetFlowOp = nullptr;
 
     aieDeviceOp.walk([&](AIE::PacketFlowOp pktFlowOp) {
-      auto pktSrcOp = getPacketSourceOpInPacketFlowOp(pktFlowOp, source);
-      if (!pktSrcOp)
-        return;
+      std::optional<xilinx::AIE::WireBundle> pktBundle;
+      std::optional<int> pktChannel;
+      if (matchDestination) {
+        auto pktDestOp = getPacketDestOpInPacketFlowOp(pktFlowOp, endpoint);
+        if (!pktDestOp)
+          return;
+        pktBundle = pktDestOp.getBundle();
+        pktChannel = pktDestOp.getChannel();
+      } else {
+        auto pktSrcOp = getPacketSourceOpInPacketFlowOp(pktFlowOp, endpoint);
+        if (!pktSrcOp)
+          return;
+        pktBundle = pktSrcOp.getBundle();
+        pktChannel = pktSrcOp.getChannel();
+      }
 
-      auto pktSrcBundle = pktSrcOp.getBundle();
-      if (pktSrcBundle != sourceBundle)
+      if (*pktBundle != bundle)
         return;
-
-      auto pktSrcChannel = pktSrcOp.getChannel();
-      if (pktSrcChannel != (int)sourceChannel)
+      if (*pktChannel != (int)channel)
         return;
 
       // Only check flowID if requested (device context requires it)
@@ -4282,19 +4296,29 @@ public:
                 (uint32_t)f.S2MM_alloc[i].dma_channel.channel, flowID);
             // Update global shim flow ID following the local packet assignment.
             globalShimFlowID = std::max(globalShimFlowID, flowID);
-            // Store flow ID in matching MM2S shim alloc for labeling phase.
-            // Use the packet flow op's actual ID, not the mutated flowID
-            // (createPacketFlowOp post-increments flowID by reference).
+            // Store flow ID in the matching shim-side allocation for the
+            // metadata/packet-labeling phase. L3->AIE packet inputs use shim
+            // MM2S; AIE->L3 packet outputs use shim S2MM. Use the packet flow
+            // op's actual ID, not the mutated flowID (createPacketFlowOp
+            // post-increments flowID by reference).
             int storedFlowID = pktFlowOp ? pktFlowOp.getID() : flowID;
-            for (auto &sa : shim_dma_alloc.mm2s_allocs) {
-              if (sa.getDmaTile() == f.MM2S_alloc.getDmaTile() &&
-                  sa.dma_channel == f.MM2S_alloc.dma_channel &&
-                  sa.col == f.MM2S_alloc.col && sa.row == f.MM2S_alloc.row &&
-                  sa.dma_id == f.MM2S_alloc.dma_id) {
-                sa.packet_flow_id = storedFlowID;
-                break;
+            auto setShimPacketFlowId =
+                [&](std::vector<air::allocation_info_t> &allocs,
+                    air::allocation_info_t &flowAlloc) {
+              for (auto &sa : allocs) {
+                if (sa.getDmaTile() == flowAlloc.getDmaTile() &&
+                    sa.dma_channel == flowAlloc.dma_channel &&
+                    sa.col == flowAlloc.col && sa.row == flowAlloc.row &&
+                    sa.dma_id == flowAlloc.dma_id) {
+                  sa.packet_flow_id = storedFlowID;
+                  break;
+                }
               }
-            }
+            };
+            if (f.MM2S_alloc.getDmaTile().isShimNOCorPLTile())
+              setShimPacketFlowId(shim_dma_alloc.mm2s_allocs, f.MM2S_alloc);
+            if (f.S2MM_alloc[i].getDmaTile().isShimNOCorPLTile())
+              setShimPacketFlowId(shim_dma_alloc.s2mm_allocs, f.S2MM_alloc[i]);
           } else {
             // Intra-device flows use per-device flow ID (can restart from 0)
             intraDeviceFlowOpToFlowIdMap.insert(f.air_flow_op);
@@ -4527,21 +4551,24 @@ public:
   }
 
   // Annotate AIR DMA ops that correspond to a SHIM DMA allocation with packet
-  // information, specifically for MM2S (host-to-AIE) directions.
+  // information. MM2S packet inputs match the shim tile as packet source; S2MM
+  // packet outputs match the shim tile as packet destination.
   LogicalResult labelMemcpyOpsWithPacketFlow(air::MemcpyInterface memcpyOpIf,
                                              StringAttr dmaNameAttr,
                                              AIE::TileOp tileOp, int channel,
-                                             int packetFlowId = -1) {
+                                             int packetFlowId = -1,
+                                             bool matchDestination = false) {
     // When a packet flow ID is available (from flow creation phase), use
     // exact flow ID matching to disambiguate multiple flows sharing the
-    // same shim DMA channel. Otherwise fall back to source-only lookup.
+    // same shim DMA channel. Otherwise fall back to endpoint-only lookup.
     AIE::PacketFlowOp pktFlowOp;
     if (packetFlowId >= 0)
       pktFlowOp = findPacketFlowOp(tileOp, AIE::WireBundle::DMA, channel,
-                                   /*checkFlowID=*/true, packetFlowId);
+                                   /*checkFlowID=*/true, packetFlowId,
+                                   matchDestination);
     if (!pktFlowOp)
       pktFlowOp = getExistingPacketFlowOpFromRuntime(
-          tileOp, AIE::WireBundle::DMA, channel);
+          tileOp, AIE::WireBundle::DMA, channel, matchDestination);
     if (!pktFlowOp)
       return success();
 
@@ -4776,13 +4803,18 @@ public:
 
         // Create shim allocation op in the allocation's own DeviceOp.
         builder.setInsertionPoint(deviceOp.getBody()->getTerminator());
+        AIE::PacketInfoAttr packetInfoAttr = nullptr;
+        if (t.packet_flow_id >= 0)
+          packetInfoAttr =
+              AIE::PacketInfoAttr::get(ctx, /*pkt_type=*/0, t.packet_flow_id);
+
         if (!SymbolTable::lookupSymbolIn(deviceOp, shim_name)) {
           auto shimAllocationOp = AIE::ShimDMAAllocationOp::create(
               builder, builder.getUnknownLoc(), shim_name_attr, t.getDmaTile(),
               AIE::DMAChannelDirAttr::get(ctx, dir),
               builder.getI64IntegerAttr(t.dma_channel.channel),
               /*plio*/ builder.getBoolAttr(false),
-              /*packet*/ nullptr);
+              /*packet*/ packetInfoAttr);
 
           // Get the tile-side channel op's MemRefType, needed when creating the
           // memref.global.
@@ -4810,12 +4842,15 @@ public:
         memcpyIfOp->setAttr("metadataArray",
                             builder.getArrayAttr(updatedMetadata));
 
-        // Annotate shim DMA packed-flow ops with packet information,
-        // specifically for MM2S (host-to-AIE) directions.
-        if (dir == AIE::DMAChannelDir::MM2S)
+        // Annotate shim DMA packet-flow ops with packet information. S2MM
+        // output DMAs must carry the packet ID too, otherwise multiple logical
+        // packet outputs sharing one physical shim channel are indistinguishable
+        // in the runtime sequence.
+        if (t.packet_flow_id >= 0)
           if (failed(labelMemcpyOpsWithPacketFlow(
                   memcpyIfOp, shim_name_attr, t.getDmaTile(),
-                  t.dma_channel.channel, t.packet_flow_id)))
+                  t.dma_channel.channel, t.packet_flow_id,
+                  /*matchDestination=*/dir == AIE::DMAChannelDir::S2MM)))
             return failure();
       }
 

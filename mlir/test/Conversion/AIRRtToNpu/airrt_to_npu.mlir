@@ -1005,3 +1005,36 @@ module {
     }
   }
 }
+
+
+// -----
+
+// Packet S2MM shim allocations sharing the same physical shim channel must not
+// be deduplicated. Each logical output channel carries a distinct packet ID.
+
+// CHECK-LABEL: aie.runtime_sequence @packet_s2mm_distinct_allocs
+// CHECK-SAME: (%[[VAL_0:.*]]: memref<64xi32>, %[[VAL_1:.*]]: memref<64xi32>) {
+// CHECK:   aiex.dma_configure_task_for @out_pkt0 {
+// CHECK:     aie.dma_bd(%[[VAL_0]] : memref<64xi32>, 0, 64{{.*}}) {packet = #aie.packet_info<pkt_type = 0, pkt_id = 0>}
+// CHECK:   aiex.dma_configure_task_for @out_pkt1 {
+// CHECK:     aie.dma_bd(%[[VAL_1]] : memref<64xi32>, 0, 64{{.*}}) {packet = #aie.packet_info<pkt_type = 0, pkt_id = 1>}
+
+module {
+  aie.device(npu1_1col) {
+    %tile_0_0 = aie.tile(0, 0)
+    aie.shim_dma_allocation @out_pkt0(%tile_0_0, S2MM, 0) {packet = #aie.packet_info<pkt_type = 0, pkt_id = 0>}
+    aie.shim_dma_allocation @out_pkt1(%tile_0_0, S2MM, 0) {packet = #aie.packet_info<pkt_type = 0, pkt_id = 1>}
+  } {sym_name = "packet_s2mm_segment"}
+  airrt.module_metadata{}
+  func.func @packet_s2mm_distinct_allocs(%arg0: memref<64xi32>, %arg1: memref<64xi32>) {
+    %c0_i64 = arith.constant 0 : i64
+    %c1_i64 = arith.constant 1 : i64
+    %c64_i64 = arith.constant 64 : i64
+    %c1_i32 = arith.constant 1 : i32
+    %c2_i32 = arith.constant 2 : i32
+    airrt.dma_memcpy_nd(%c1_i32, %c0_i64, %c0_i64, %arg0[%c0_i64, %c0_i64, %c0_i64, %c0_i64], [%c1_i64, %c1_i64, %c1_i64, %c64_i64], [%c0_i64, %c0_i64, %c0_i64, %c0_i64]) {metadata = @out_pkt0, packet = #aie.packet_info<pkt_type = 0, pkt_id = 0>} : (i32, i64, i64, memref<64xi32>, [i64, i64, i64, i64], [i64, i64, i64, i64], [i64, i64, i64, i64])
+    airrt.dma_memcpy_nd(%c2_i32, %c0_i64, %c0_i64, %arg1[%c0_i64, %c0_i64, %c0_i64, %c0_i64], [%c1_i64, %c1_i64, %c1_i64, %c64_i64], [%c0_i64, %c0_i64, %c0_i64, %c0_i64]) {metadata = @out_pkt1, packet = #aie.packet_info<pkt_type = 0, pkt_id = 1>} : (i32, i64, i64, memref<64xi32>, [i64, i64, i64, i64], [i64, i64, i64, i64], [i64, i64, i64, i64])
+    %p = airrt.segment_load "packet_s2mm_segment" : i64
+    return
+  }
+}

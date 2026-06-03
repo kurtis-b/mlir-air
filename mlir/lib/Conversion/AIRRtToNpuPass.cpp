@@ -2027,21 +2027,23 @@ struct AIRRtToNpuPass : public impl::AIRRtToNpuBase<AIRRtToNpuPass> {
           [&](AIE::ShimDMAAllocationOp alloc) { allocs.insert(alloc); });
       llvm::SmallSet<AIE::ShimDMAAllocationOp, 1> uniqueAllocs;
 
-      // Map each unique set of <dir, chan, col> to a shim dma alloc op
-      // within THIS device only
+      // Map each unique set of <dir, chan, col, packet> to a shim dma
+      // allocation op within THIS device only.
       DenseMap<StringRef, StringRef> uniqueAllocMap;
       for (auto alloc : allocs) {
         AIE::TileOp shimtile = alloc.getTileOp();
-        std::tuple<bool, int, int> allocInfo = {
+        std::tuple<bool, int, int, AIE::PacketInfoAttr> allocInfo = {
             alloc.getChannelDir() == AIE::DMAChannelDir::MM2S,
-            alloc.getChannelIndex(), shimtile.getCol()};
+            alloc.getChannelIndex(), shimtile.getCol(),
+            alloc.getPacketAttr()};
 
         auto it =
             llvm::find_if(uniqueAllocs, [&](AIE::ShimDMAAllocationOp ualloc) {
               AIE::TileOp shimtile = ualloc.getTileOp();
-              std::tuple<bool, int, int> uallocInfo = {
+              std::tuple<bool, int, int, AIE::PacketInfoAttr> uallocInfo = {
                   ualloc.getChannelDir() == AIE::DMAChannelDir::MM2S,
-                  ualloc.getChannelIndex(), shimtile.getCol()};
+                  ualloc.getChannelIndex(), shimtile.getCol(),
+                  ualloc.getPacketAttr()};
               return allocInfo == uallocInfo;
             });
         if (it != uniqueAllocs.end()) {

@@ -3,6 +3,8 @@
 This programming example collects source-level MLIR-AIR/NPU2 kernels for a
 Gemma3-style transformer dataflow and makes their physical herd shape selectable
 from the command line. The supported shapes are `2x4`, `4x4`, and `8x4`.
+For the roadmap from these standalone kernels to a host-driven Gemma3 model
+loop, see [Gemma3 Model Loop Implementation](GEMMA3_MODEL_LOOP_IMPLEMENTATION.md).
 
 The example uses Peano/AIE2P microkernels throughout:
 
@@ -69,7 +71,10 @@ a compile and runtime smoke test. Override `Q_CHUNK`, `KV_LEN`, `KV_CHUNK`,
 `FLOWKV_OUTPUT_MODE` select `auto`, `direct`, or `l2-gather` where supported.
 `auto` keeps Q4NX on L2-gather for every shape and uses
 L2-gather for 8x4 FusedDQP/FlowQKV/FlowKV routes. Unsupported combinations
-fail during argument parsing instead of reaching AIR lowering.
+fail during argument parsing with the resource, packet-backend, routing,
+or runtime-scheduling reason instead of reaching AIR lowering. Individual
+drivers also accept `packet-direct` only to report the diagnostic unsupported
+reason; sweeps do not expose it.
 
 | Kernel | 2x4 modes | 4x4 modes | 8x4 modes |
 | --- | --- | --- | --- |
@@ -80,13 +85,17 @@ fail during argument parsing instead of reaching AIR lowering.
 
 Q4NX and FusedDQP 8x4 direct output exhaust shim DMA channels. A
 packet-direct diagnostic route was also tested for both kernels, but it is not
-exposed as a supported mode: the AIR is compile-legal, while hardware either
-permutes/corrupts output tiles or hangs when extra ordering channels are added.
-The first bad artifact is the lowered NPU runtime sequence, where multiple
-per-shim packet receives are configured through the first packet DMA allocation
-for that shim even when the source AIR uses separate named packet channels.
-FlowQKV and FlowKV 8x4 direct output are likewise not exposed; FlowKV
-small-shape L2 gather is not exposed because it fails AIE routing.
+exposed as a supported mode: the AIR is compile-legal and now lowers to
+distinct packet-tagged shim allocations, but hardware validation corrupts output
+when multiple independent CT rows share one shim S2MM packet channel. Treat the
+remaining packet-direct issue as a packet-route/shim DMA schedule limitation,
+not as a full-physical Gemma success path. FlowQKV and FlowKV 8x4 direct output
+are likewise not exposed. FlowKV small-shape L2 gather is not exposed because
+the source-level diagnostic route now compiles only when staged through an
+explicit CT-to-L2 output channel, but 2x4 hardware execution still times out
+with `ERT_CMD_STATE_TIMEOUT` and `ctx_pc=0x28B060AD`; `xrt-smi examine -r all`
+then reports no active contexts. Treat this remaining mode as a channel/runtime
+scheduling bug, not as a supported gather route.
 
 `run-q4nx-8x4-rowband-fallback` is a logical 8x4 Q4NX workload using two
 sequential host-side physical 4x4 row-band executions. It is a
@@ -171,10 +180,11 @@ Status as of 2026-05-29 on NPU Strix, XRT 2.21.0, compact defaults
 | `run-fused-dqp-paper`, `run-flowqkv-paper`, `run-flowkv-paper` | PASS |
 | `run-fused-dqp-pipeline` | TIMEOUT, diagnostic-only |
 
-The FusedDQP pipeline timeout reproduces as `ERT_CMD_STATE_TIMEOUT` with
-`ctx_pc=0x28B060AD`; `xrt-smi examine -r all` immediately after each timeout
-shows no active hardware contexts. The timeout remains when runtime-loop tiling
-is removed, when ping-pong buffering is enabled, when the lock-race fix is
+The FlowKV 2x4 L2-gather diagnostic and FusedDQP pipeline timeout both
+reproduce as `ERT_CMD_STATE_TIMEOUT` with `ctx_pc=0x28B060AD`; a follow-up
+`xrt-smi examine -r all` shows no active hardware contexts. The timeout
+remains when runtime-loop tiling is removed, when ping-pong buffering is
+enabled, when the lock-race fix is
 disabled, and when both Peano dequant/project calls are removed from a temporary
 diagnostic module. The first bad boundary is therefore the lowered AIE/runtime
 execution of the two-herd inter-worker channel schedule, not the FusedDQP

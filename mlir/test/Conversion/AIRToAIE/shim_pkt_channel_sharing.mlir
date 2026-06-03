@@ -19,9 +19,9 @@
 // CHECK: aie.packet_flow(1)
 // CHECK: aie.packet_flow(2)
 // CHECK: aie.shim_dma_allocation @air_out({{.*}}, S2MM, 0)
-// CHECK: aie.shim_dma_allocation @air_pkt_in_0({{.*}}, MM2S, 0)
-// CHECK: aie.shim_dma_allocation @air_pkt_in_1({{.*}}, MM2S, 0)
-// CHECK: aie.shim_dma_allocation @air_pkt_in_2({{.*}}, MM2S, 0)
+// CHECK: aie.shim_dma_allocation @air_pkt_in_0({{.*}}, MM2S, 0, <pkt_type = 0, pkt_id = 0>)
+// CHECK: aie.shim_dma_allocation @air_pkt_in_1({{.*}}, MM2S, 0, <pkt_type = 0, pkt_id = 1>)
+// CHECK: aie.shim_dma_allocation @air_pkt_in_2({{.*}}, MM2S, 0, <pkt_type = 0, pkt_id = 2>)
 
 module {
   air.channel @pkt_in_0 [1, 1] {channel_type = "npu_dma_packet"}

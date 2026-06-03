@@ -110,3 +110,35 @@ module {
     return
   }
 }
+
+// -----
+
+// CHECK-LABEL: @loop_invariant_channel_put_preserves_repetition
+// CHECK-COUNT-4: air.channel.put async
+
+// AIE1: error{{.*}}'func.func' op AIE1 architecture does not come with memtiles.
+
+module {
+  air.channel @channel_repeated [1, 1]
+  func.func @loop_invariant_channel_put_preserves_repetition() {
+    %0 = air.launch async () in () {
+      %1 = air.segment @segment_0 async  {
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %c4 = arith.constant 4 : index
+        %async_token, %results = air.execute -> (memref<16x8xbf16, 2>) {
+          %alloc = memref.alloc() : memref<16x8xbf16, 2>
+          air.execute_terminator %alloc : memref<16x8xbf16, 2>
+        }
+        %2 = scf.for %arg0 = %c0 to %c4 step %c1 iter_args(%arg1 = %async_token) -> (!air.async.token) {
+          %3 = air.channel.put async [%arg1]  @channel_repeated[%c0, %c0] (%results[] [] []) {id = 1 : i32} : (memref<16x8xbf16, 2>)
+          scf.yield %3 : !air.async.token
+        }
+        %async_token_0 = air.execute [%2] {
+          memref.dealloc %results : memref<16x8xbf16, 2>
+        }
+      }
+    }
+    return
+  }
+}

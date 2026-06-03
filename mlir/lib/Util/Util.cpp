@@ -1398,11 +1398,11 @@ LogicalResult air::foldForLoopNestAsExtendedSizesAndStrides(
         }
       }
     }
-    // Skip loops that don't affect the channel offset (stride=0).
-    // LLVM 23's canonicalize no longer hoists loop-invariant channel ops,
-    // so we skip them here when requested to avoid stride=0 DMA dimensions.
+    // Do not fold loop-invariant channel operations when zero-stride
+    // dimensions are disallowed. Dropping this dimension while erasing the
+    // loop would change the number of channel transactions.
     if (skipZeroStride && ind_var_factor == 0)
-      continue;
+      return failure();
     int trip_count = -1;
     if (auto afo = dyn_cast_if_present<affine::AffineForOp>(o))
       trip_count = *getStaticAffineForTripCountAsInt(afo);
@@ -1444,7 +1444,7 @@ LogicalResult air::foldForLoopNestAsExtendedSizesAndStrides(
         }
         maxIndex += (trip_count - 1) * new_stride_value;
         if (maxIndex >= bufferVolume)
-          continue;
+          return failure();
       }
     }
 

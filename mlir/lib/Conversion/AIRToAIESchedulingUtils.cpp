@@ -1100,12 +1100,23 @@ FailureOr<air::allocation_info_t> air::ShimDMAAllocator::allocNewDmaChannel(
       colTripCount++;
       if (colTripCount > (int)dma_columns.size()) {
         return memcpyOp->emitOpError(
-            "failed to map to shim dma channels: out of channels.");
+                   "failed to map to shim dma channels: ")
+               << (dir == AIE::DMAChannelDir::S2MM ? "S2MM" : "MM2S")
+               << " direct L3 route exceeded " << shim_dma_channels
+               << " physical channels per shim column across "
+               << dma_columns.size()
+               << " shim columns; use an L2 gather/output aggregation route "
+                  "or a validated packet route";
       }
     }
   }
   if (dma_channel >= shim_dma_channels) {
-    return memcpyOp.emitOpError("out of shim dma channels.");
+    return memcpyOp.emitOpError(
+               "failed to map to shim dma channels: ")
+           << (dir == AIE::DMAChannelDir::S2MM ? "S2MM" : "MM2S")
+           << " direct L3 route exceeded " << shim_dma_channels
+           << " physical channels per shim column; use an L2 gather/output "
+              "aggregation route or a validated packet route";
   }
   auto tileRes = air::createTileViaPlacer(device, AIE::AIETileType::ShimNOCTile,
                                           dma_col, /*row_hint=*/std::nullopt);

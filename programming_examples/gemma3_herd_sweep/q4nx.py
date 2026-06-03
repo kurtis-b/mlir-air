@@ -19,7 +19,6 @@ from air.backend.xrt import XRTBackend
 from air.backend.xrt_runner import XRTRunner, type_mapper
 
 from common import (
-    OUTPUT_MODES,
     SUPPORTED_HERD_SHAPES,
     parse_herd_shape,
     random_q4nx_blocks,
@@ -299,7 +298,7 @@ def main():
         default="compile-and-run",
     )
     parser.add_argument("--output-format", choices=["xclbin", "elf"], default="xclbin")
-    parser.add_argument("--output-mode", choices=OUTPUT_MODES, default="auto")
+    parser.add_argument("--output-mode", default="auto")
     parser.add_argument("--debug-ir", action="store_true")
     args = parser.parse_args()
 
