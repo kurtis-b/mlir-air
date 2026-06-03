@@ -508,6 +508,10 @@ Implemented evidence and blocker:
   contiguous XRT BO preload for all three local variants: 266,240 bytes for 1B
   and 731,136 bytes each for 4B text and 4B vision text-stack. The compact
   XRT evidence is saved in `results/gemma3_norm_preload_evidence.json`.
+- `gemma3_npu_wiring.py` and `gemma3_buffer_binding.py` now match the local
+  Transformers `Gemma3DecoderLayer` norm order: `post_attention_layernorm`
+  runs before the attention residual, and `pre_feedforward_layernorm` plus
+  `post_feedforward_layernorm` wrap the MLP before the MLP residual.
 - Remaining work for full Phase E completion is model launch/binding
   validation for the promoted GeGLU path, norm-weight argument binding for
   RMSNorm/QK-Norm, plus RoPE, residual, logits, and sampling promotion or
@@ -550,7 +554,8 @@ Blocked evidence:
   stage roles, NPU kernel candidates, host fallbacks, local/global attention
   windows, and remaining launch/argument-binding blockers; GeGLU/MLP activation
   is now represented as a model NPU candidate backed by standalone hardware
-  smoke evidence.
+  smoke evidence, and the norm/residual ordering follows the local HF Gemma3
+  decoder layer.
   `gemma3_weight_plan.py`
   records real text-stack projection static BO byte estimates for future
   preloading.
@@ -1405,6 +1410,8 @@ Milestones:
 
 - Define exact buffer handoff between attention output and output projection.
 - Define gate/up/down projection order for the MLP path.
+- Preserve Gemma3's post-attention, pre-feedforward, and post-feedforward norm
+  placement from the HF decoder layer.
 - Use Llama32-style intermediate names and per-stage checksum logging.
 - Keep host fallbacks explicit until each nonlinear has NPU evidence.
 

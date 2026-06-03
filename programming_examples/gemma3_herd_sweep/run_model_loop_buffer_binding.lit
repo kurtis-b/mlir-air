@@ -1,7 +1,7 @@
 # RUN: %PYTHON %S/gemma3_buffer_binding.py --self-test | FileCheck %s
-# CHECK: buffer_plan model=gemma3-1b status=READY_FOR_MODEL_RUNNER layers=2 bindings=52
+# CHECK: buffer_plan model=gemma3-1b status=READY_FOR_MODEL_RUNNER layers=2 bindings=60
 # CHECK-SAME: persistent_bos=18
-# CHECK-SAME: static_weight_families=3
+# CHECK-SAME: static_weight_families=13
 # CHECK-SAME: missing_bos=none blockers=model-kernel-argument-binding-not-validated
 # CHECK: buffer_binding prefill:L0:pre_attention_norm backend=host-fallback inputs=layer_input
 # CHECK-SAME: outputs=prefill_L0_pre_attention_norm

@@ -108,37 +108,43 @@ def _role_contract(stage: Gemma3NPUStage) -> tuple[tuple[str, ...], tuple[str, .
     k = f"{stage.phase}_k"
     v = f"{stage.phase}_v"
     attention_out = f"{stage.phase}_attention_out"
-    norm = f"{stage.phase}_L{stage.layer_index}_pre_attention_norm"
-    post_norm = f"{stage.phase}_L{stage.layer_index}_post_attention_norm"
+    pre_attention_norm = f"{stage.phase}_L{stage.layer_index}_pre_attention_norm"
+    post_attention_norm = f"{stage.phase}_L{stage.layer_index}_post_attention_norm"
+    pre_feedforward_norm = f"{stage.phase}_L{stage.layer_index}_pre_feedforward_norm"
+    post_feedforward_norm = f"{stage.phase}_L{stage.layer_index}_post_feedforward_norm"
     activation = f"{stage.phase}_L{stage.layer_index}_mlp_activation"
     attn_proj = f"{stage.phase}_L{stage.layer_index}_attention_projection"
 
     if stage.role == "pre_attention_norm":
-        return (state,), (norm,), (), ()
+        return (state,), (pre_attention_norm,), ("input_layernorm",), ()
     if stage.role == "qkv_projection":
-        return (norm,), (q, k, v), ("q_proj", "k_proj", "v_proj"), ()
+        return (pre_attention_norm,), (q, k, v), ("q_proj", "k_proj", "v_proj"), ()
     if stage.role == "rope":
         return (q, k), (q, k), (), ()
     if stage.role == "qk_norm":
-        return (q, k), (q, k), (), ()
+        return (q, k), (q, k), ("q_norm", "k_norm"), ()
     if stage.role == "kv_cache_append":
         return (k, v), ("kv_cache_k", "kv_cache_v"), (), ("kv_cache_k", "kv_cache_v")
     if stage.role == "attention":
         return (q, "kv_cache_k", "kv_cache_v"), (attention_out,), (), ()
     if stage.role == "output_projection":
         return (attention_out,), (attn_proj,), ("o_proj",), ()
-    if stage.role == "attention_residual":
-        return (state, attn_proj), (state,), (), ()
     if stage.role == "post_attention_norm":
-        return (state,), (post_norm,), (), ()
+        return (attn_proj,), (post_attention_norm,), ("post_attention_layernorm",), ()
+    if stage.role == "attention_residual":
+        return (state, post_attention_norm), (state,), (), ()
+    if stage.role == "pre_feedforward_norm":
+        return (state,), (pre_feedforward_norm,), ("pre_feedforward_layernorm",), ()
     if stage.role == "mlp_gate_up_projection":
-        return (post_norm,), ("mlp_gate", "mlp_up"), ("gate_proj", "up_proj"), ()
+        return (pre_feedforward_norm,), ("mlp_gate", "mlp_up"), ("gate_proj", "up_proj"), ()
     if stage.role == "mlp_activation":
         return ("mlp_gate", "mlp_up"), (activation,), (), ()
     if stage.role == "mlp_down_projection":
         return (activation,), ("mlp_down",), ("down_proj",), ()
+    if stage.role == "post_feedforward_norm":
+        return ("mlp_down",), (post_feedforward_norm,), ("post_feedforward_layernorm",), ()
     if stage.role == "mlp_residual":
-        return (state, "mlp_down"), (state,), (), ()
+        return (state, post_feedforward_norm), (state,), (), ()
     raise ValueError(f"unhandled Gemma3 stage role: {stage.role}")
 
 
@@ -208,7 +214,13 @@ def build_buffer_binding_plan_from_components(
         binding_count=len(bindings),
         persistent_bo_count=len(bo_keys),
         virtual_buffer_count=len(virtual),
-        static_weight_family_count=len({family.family for family in weight_plan.families}),
+        static_weight_family_count=len(
+            {
+                family
+                for binding in bindings
+                for family in binding.static_weight_families
+            }
+        ),
         missing_bo_keys=missing,
         blockers=tuple(dict.fromkeys(blockers)),
         bindings=bindings,
@@ -301,11 +313,11 @@ def _self_test() -> None:
         weight_plan=weight_plan,
         wiring=build_wiring_plan_from_preflight(preflight),
     )
-    if plan.binding_count != 52:
+    if plan.binding_count != 60:
         raise AssertionError(plan.binding_count)
     if plan.missing_bo_keys:
         raise AssertionError(plan.missing_bo_keys)
-    if plan.static_weight_family_count != 3:
+    if plan.static_weight_family_count != 13:
         raise AssertionError(plan.static_weight_family_count)
     if "model-kernel-argument-binding-not-validated" not in plan.blockers:
         raise AssertionError(plan.blockers)

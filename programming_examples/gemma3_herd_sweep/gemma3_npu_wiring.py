@@ -25,31 +25,35 @@ from gemma3_xrt_runner import has_paper_shape_bo_allocation_evidence
 
 
 TEXT_STAGE_TEMPLATE = (
-    ("prefill", "pre_attention_norm", "host-fallback", "rms_norm", "weighted_rms_norm candidate"),
+    ("prefill", "pre_attention_norm", "host-fallback", "rms_norm", "input_layernorm before self-attention"),
     ("prefill", "qkv_projection", "npu-candidate", "q4nx+bf16_mm", "Q4NX dequant plus BF16 MM"),
     ("prefill", "rope", "host-fallback", "rope", "Llama half-split source candidate"),
     ("prefill", "qk_norm", "host-fallback", "qk_norm", "weighted_rms_norm per-head candidate"),
     ("prefill", "kv_cache_append", "host-runtime", "host", "append K/V tensors after projection"),
     ("prefill", "attention", "npu-candidate", "flowqkv", "causal local/global FlowQKV"),
     ("prefill", "output_projection", "npu-candidate", "q4nx+bf16_mm", "Q4NX dequant plus BF16 MM"),
+    ("prefill", "post_attention_norm", "host-fallback", "rms_norm", "post_attention_layernorm before attention residual"),
     ("prefill", "attention_residual", "host-fallback", "residual_add", "residual add after attention"),
-    ("prefill", "post_attention_norm", "host-fallback", "rms_norm", "weighted_rms_norm candidate"),
+    ("prefill", "pre_feedforward_norm", "host-fallback", "rms_norm", "pre_feedforward_layernorm before MLP"),
     ("prefill", "mlp_gate_up_projection", "npu-candidate", "q4nx+bf16_mm", "Q4NX dequant plus BF16 MM"),
-    ("prefill", "mlp_activation", "host-fallback", "mlp_activation", "standalone GeGLU hardware-smoke only"),
+    ("prefill", "mlp_activation", "host-fallback", "mlp_activation", "standalone GeGLU hardware-smoke candidate"),
     ("prefill", "mlp_down_projection", "npu-candidate", "q4nx+bf16_mm", "Q4NX dequant plus BF16 MM"),
+    ("prefill", "post_feedforward_norm", "host-fallback", "rms_norm", "post_feedforward_layernorm before MLP residual"),
     ("prefill", "mlp_residual", "host-fallback", "residual_add", "residual add after MLP"),
-    ("decode", "pre_attention_norm", "host-fallback", "rms_norm", "weighted_rms_norm candidate"),
+    ("decode", "pre_attention_norm", "host-fallback", "rms_norm", "input_layernorm before self-attention"),
     ("decode", "qkv_projection", "npu-candidate", "fused_dqp", "FusedDQP decode projection"),
     ("decode", "rope", "host-fallback", "rope", "Llama half-split source candidate"),
     ("decode", "qk_norm", "host-fallback", "qk_norm", "weighted_rms_norm per-head candidate"),
     ("decode", "kv_cache_append", "host-runtime", "host", "append one K/V entry"),
     ("decode", "attention", "npu-candidate", "flowkv", "Q_CHUNK=1 FlowKV"),
     ("decode", "output_projection", "npu-candidate", "fused_dqp", "FusedDQP decode projection"),
+    ("decode", "post_attention_norm", "host-fallback", "rms_norm", "post_attention_layernorm before attention residual"),
     ("decode", "attention_residual", "host-fallback", "residual_add", "residual add after attention"),
-    ("decode", "post_attention_norm", "host-fallback", "rms_norm", "weighted_rms_norm candidate"),
+    ("decode", "pre_feedforward_norm", "host-fallback", "rms_norm", "pre_feedforward_layernorm before MLP"),
     ("decode", "mlp_gate_up_projection", "npu-candidate", "fused_dqp", "FusedDQP decode projection"),
-    ("decode", "mlp_activation", "host-fallback", "mlp_activation", "standalone GeGLU hardware-smoke only"),
+    ("decode", "mlp_activation", "host-fallback", "mlp_activation", "standalone GeGLU hardware-smoke candidate"),
     ("decode", "mlp_down_projection", "npu-candidate", "fused_dqp", "FusedDQP decode projection"),
+    ("decode", "post_feedforward_norm", "host-fallback", "rms_norm", "post_feedforward_layernorm before MLP residual"),
     ("decode", "mlp_residual", "host-fallback", "residual_add", "residual add after MLP"),
 )
 
@@ -295,7 +299,7 @@ def _self_test() -> None:
         raise AssertionError(plan.stage_count)
     if plan.npu_candidate_count != 6 * 12:
         raise AssertionError(plan.npu_candidate_count)
-    if plan.host_fallback_count != 6 * 12:
+    if plan.host_fallback_count != 6 * 16:
         raise AssertionError(plan.host_fallback_count)
     global_attention = [stage for stage in plan.stages if stage.layer_index == 5 and stage.role == "attention"]
     if not global_attention or any(stage.attention_kind != "global_full" or stage.window_len != 0 for stage in global_attention):
