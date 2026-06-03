@@ -33,8 +33,10 @@ class Gemma3RealExecutionReport:
     tokenizer_path: str | None
     model_class: str
     tokenizer_class: str
+    processor_class: str | None
     prompt_token_count: int
     logits_shape: tuple[int, ...]
+    pixel_values_shape: tuple[int, ...] | None
     logits_checksum: float
     load_seconds: float
     forward_seconds: float
@@ -71,17 +73,12 @@ def run_cpu_smoke(
     weights_dir: Path | None = None,
     prompt: str = "Gemma3 paper reproduction smoke.",
     max_prompt_tokens: int = 16,
+    vision_smoke: bool = False,
 ) -> Gemma3RealExecutionReport:
-    if model_variant != "gemma3-1b":
-        raise Gemma3ExecutionError(
-            "CPU smoke currently validates gemma3-1b only; 4B text/vision need "
-            "separate memory and processor evidence"
-        )
     try:
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
     except Exception as exc:
-        raise Gemma3ExecutionError("python:torch and python:transformers are required") from exc
+        raise Gemma3ExecutionError("python:torch is required") from exc
 
     try:
         inventory = load_real_model_artifacts(
@@ -94,18 +91,48 @@ def run_cpu_smoke(
     if inventory.weights_dir is None:
         raise Gemma3ExecutionError("resolved weights_dir is missing")
 
+    include_image = vision_smoke or model_variant == "gemma3-4b-vision"
     load_start = perf_counter()
-    tokenizer = AutoTokenizer.from_pretrained(inventory.weights_dir)
-    model = AutoModelForCausalLM.from_pretrained(
-        inventory.weights_dir,
-        dtype=torch.bfloat16,
-    )
+    processor = None
+    if model_variant == "gemma3-1b":
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+        except Exception as exc:
+            raise Gemma3ExecutionError("python:transformers is required") from exc
+        tokenizer = AutoTokenizer.from_pretrained(inventory.weights_dir)
+        model = AutoModelForCausalLM.from_pretrained(
+            inventory.weights_dir,
+            dtype=torch.bfloat16,
+        )
+        inputs = tokenizer(prompt, return_tensors="pt")
+        inputs = _trim_inputs(inputs, max_prompt_tokens)
+    else:
+        try:
+            from PIL import Image
+            from transformers import AutoModelForImageTextToText, AutoProcessor
+        except Exception as exc:
+            raise Gemma3ExecutionError("python:transformers and python:Pillow are required") from exc
+        processor = AutoProcessor.from_pretrained(inventory.weights_dir)
+        model = AutoModelForImageTextToText.from_pretrained(
+            inventory.weights_dir,
+            dtype=torch.bfloat16,
+        )
+        tokenizer = processor.tokenizer
+        if include_image:
+            image = Image.new("RGB", (224, 224), color=(32, 64, 96))
+            text = prompt if "<start_of_image>" in prompt else "<start_of_image> " + prompt
+            inputs = processor(text=text, images=image, return_tensors="pt")
+        else:
+            inputs = processor(text=prompt, return_tensors="pt")
+            inputs = _trim_inputs(inputs, max_prompt_tokens)
     model.eval()
     load_seconds = perf_counter() - load_start
 
-    inputs = tokenizer(prompt, return_tensors="pt")
-    inputs = _trim_inputs(inputs, max_prompt_tokens)
     prompt_token_count = int(inputs["input_ids"].shape[-1])
+    pixel_values = inputs.get("pixel_values") if hasattr(inputs, "get") else None
+    pixel_values_shape = (
+        tuple(int(dim) for dim in pixel_values.shape) if pixel_values is not None else None
+    )
     forward_start = perf_counter()
     with torch.no_grad():
         output = model(**inputs)
@@ -121,8 +148,10 @@ def run_cpu_smoke(
         tokenizer_path=inventory.tokenizer_path,
         model_class=type(model).__name__,
         tokenizer_class=type(tokenizer).__name__,
+        processor_class=type(processor).__name__ if processor is not None else None,
         prompt_token_count=prompt_token_count,
         logits_shape=tuple(int(dim) for dim in logits.shape),
+        pixel_values_shape=pixel_values_shape,
         logits_checksum=checksum,
         load_seconds=load_seconds,
         forward_seconds=forward_seconds,
@@ -139,8 +168,10 @@ def _self_test() -> None:
         tokenizer_path="/tmp/gemma/tokenizer.json",
         model_class="Gemma3ForCausalLM",
         tokenizer_class="GemmaTokenizer",
+        processor_class=None,
         prompt_token_count=4,
         logits_shape=(1, 4, 8),
+        pixel_values_shape=None,
         logits_checksum=1.25,
         load_seconds=0.1,
         forward_seconds=0.2,
@@ -160,6 +191,7 @@ def main() -> int:
     parser.add_argument("--weights-dir", type=Path)
     parser.add_argument("--prompt", default="Gemma3 paper reproduction smoke.")
     parser.add_argument("--max-prompt-tokens", type=int, default=16)
+    parser.add_argument("--vision-smoke", action="store_true")
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
 
@@ -173,6 +205,7 @@ def main() -> int:
                 weights_dir=args.weights_dir,
                 prompt=args.prompt,
                 max_prompt_tokens=args.max_prompt_tokens,
+                vision_smoke=args.vision_smoke,
             )
         except Gemma3ExecutionError as exc:
             print(f"GEMMA3_REAL_EXECUTION_BLOCKED: {exc}")

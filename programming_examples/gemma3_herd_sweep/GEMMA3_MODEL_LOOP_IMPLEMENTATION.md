@@ -74,9 +74,10 @@ Implemented files:
 - `gemma3_inference.py`: Llama32-style entrypoint with compile-only, run-only,
   verify, profile, layer-count, prompt-chunk, decode-token, local-window, and
   stage-log controls.
-- `gemma3_real_execution.py`: CPU/HF real-artifact smoke path for the 1B model,
-  proving local weights/tokenizer can execute without AIR imports while making
-  no paper timing claim.
+- `gemma3_real_execution.py`: CPU/HF real-artifact smoke path for the 1B,
+  4B text, and 4B synthetic-image model paths, proving local weights,
+  tokenizer, and processor can execute without AIR imports while making no
+  paper timing claim.
 - `gemma3_npu_preflight.py`: real-shape NPU preflight planner that derives
   projection padding, Q4NX block counts, attention metadata, and the remaining
   NPU execution blocker from local artifacts.
@@ -491,8 +492,9 @@ Blocked evidence:
   Gemma3 1B safetensors/tokenizer artifacts are missing. The prior
   unmeasured-nonlinear fallback blocker is retired by measured CPU-reference
   fallback records, but those records are not NPU promotion evidence.
-- A dependency-light 1B CPU/HF smoke path now validates local real weights and
-  tokenizer execution without AIR imports. `gemma3_npu_preflight.py` records
+- Dependency-light CPU/HF smoke paths now validate local 1B text, 4B text,
+  and 4B synthetic-image weights/tokenizer/processor execution without AIR
+  imports. `gemma3_npu_preflight.py` records
   real projection padding and Q4NX block counts needed for NPU wiring. No
   CPU/iGPU/NPU paper baseline or speedup claim is emitted until
   benchmark-length execution and NPU model execution are implemented.
