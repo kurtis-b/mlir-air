@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from dataclasses import dataclass
@@ -192,16 +193,50 @@ def unmeasured_host_fallbacks(local: dict[str, Any]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(names))
 
 
+def _result_rows(local_results: dict[str, Any]) -> list[dict[str, Any]]:
+    if "results" in local_results:
+        return list(local_results.get("results", []))
+    if "target_id" in local_results:
+        return [local_results]
+    return []
+
+
 def compare_results(data: dict[str, Any], local_results: dict[str, Any]) -> list[Comparison]:
     threshold = float(data.get("similarity_threshold_pct", 20.0))
     targets = target_by_id(data)
     results = []
-    for local in local_results.get("results", []):
+    for local in _result_rows(local_results):
         target_id = local.get("target_id")
         if target_id not in targets:
             raise ValueError(f"local result references unknown paper target: {target_id}")
         results.append(compare_one(targets[target_id], local, threshold))
     return results
+
+
+def write_markdown_summary(comparisons: list[Comparison], path: Path) -> None:
+    lines = [
+        "| Target | Metric | Local | Paper | Delta | Classification | Note |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for item in comparisons:
+        delta = "n/a" if item.delta_pct is None else f"{item.delta_pct:.2f}%"
+        paper = "n/a" if item.paper_value is None else f"{item.paper_value:g}"
+        local = "n/a" if item.local_value is None else f"{item.local_value:g}"
+        lines.append(
+            f"| {item.target_id} | {item.metric} | {local} | {paper} | "
+            f"{delta} | {item.classification} | {item.note} |"
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_csv_summary(comparisons: list[Comparison], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["target_id", "metric", "local_value", "paper_value", "delta_pct", "classification", "note"])
+        for item in comparisons:
+            writer.writerow([item.target_id, item.metric, item.local_value, item.paper_value, item.delta_pct, item.classification, item.note])
 
 
 def _fixture() -> dict[str, Any]:
@@ -250,6 +285,8 @@ def main() -> int:
     parser.add_argument("--targets", type=Path, default=DEFAULT_TARGETS)
     parser.add_argument("--validate", action="store_true")
     parser.add_argument("--compare", type=Path)
+    parser.add_argument("--summary-md", type=Path)
+    parser.add_argument("--summary-csv", type=Path)
     parser.add_argument("--environment", type=Path)
     parser.add_argument("--allow-incomplete-environment", action="store_true")
     parser.add_argument("--self-test", action="store_true")
@@ -263,8 +300,15 @@ def main() -> int:
         validate_environment_for_paper(json.loads(args.environment.read_text(encoding="utf-8")))
     if args.compare:
         local_results = json.loads(args.compare.read_text(encoding="utf-8"))
-        for comparison in compare_results(data, local_results):
+        comparisons = compare_results(data, local_results)
+        for comparison in comparisons:
             print(comparison.format())
+        if args.summary_md:
+            write_markdown_summary(comparisons, args.summary_md)
+            print(f"GEMMA3_COMPARE_SUMMARY_MD: {args.summary_md}")
+        if args.summary_csv:
+            write_csv_summary(comparisons, args.summary_csv)
+            print(f"GEMMA3_COMPARE_SUMMARY_CSV: {args.summary_csv}")
     if args.self_test:
         comparisons = compare_results(data, _fixture())
         classes = {comparison.classification for comparison in comparisons}

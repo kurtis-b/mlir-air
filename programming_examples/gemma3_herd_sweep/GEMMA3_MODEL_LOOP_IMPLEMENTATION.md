@@ -580,6 +580,23 @@ Acceptance:
 - A comparison command generates Markdown and CSV summaries.
 - Missing or failed cells are visible and cannot be silently skipped.
 
+Implemented evidence and blocker:
+
+- `gemma3_inference.py --paper-benchmark` accepts the paper CLI shape for model
+  variant, backend, weights, tokenizer, prompt length, decode tokens, warmup,
+  timed iterations, result JSON, paper comparison, power sampling, trace size,
+  and debug-IR intent.
+- `gemma3_results.py` writes one result JSON cell for the requested paper target
+  and records command, git/environment metadata, artifact inventory, nonlinear
+  host fallbacks, null power fields, and explicit blocked classification.
+- `gemma3_paper_compare.py --compare` accepts either a single result cell or a
+  wrapper with `results`, and can emit Markdown and CSV summaries.
+- `run_model_loop_results.lit` covers blocked real-artifact result generation,
+  paper comparison, Markdown/CSV summary emission, and JSON schema essentials.
+- The harness is implemented, but real `PAPER_MATCH` cells remain blocked until
+  Phases F-H can run with real artifacts, validated kernels, and comparable
+  hardware/power telemetry.
+
 ### Phase J: power and TPS/W reproduction
 
 Goal: reproduce the paper's average power table and TPS/W improvement ranges.
