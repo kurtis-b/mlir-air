@@ -349,11 +349,15 @@ Implemented evidence and blocker:
   scale/min metadata, matrix order, and dequant formula.
 - `run_model_loop_artifacts.lit` covers metadata, prompt-length generation,
   discovery, and strict-load blocking diagnostics.
-- Real Gemma3 artifact loading is currently blocked in this environment because
-  local Gemma3 safetensors were not found and tokenizer/safetensor Python
-  packages are not installed. This prevents full Phase C completion and all
-  later real-model paper-parity phases until artifacts and dependencies are
-  provided.
+- `requirements.txt` records the approved Python packages for artifact loading,
+  tokenizer/processor setup, Hugging Face snapshot access, and safetensor shape
+  inspection. These dependencies were installed in the active `ironenv` during
+  blocker-fix work.
+- `gemma3_artifacts.py` records official source repositories, manifest
+  validation, optional snapshot download support, and safetensor shape
+  inspection when the package is available.
+- Real Gemma3 artifact loading is still blocked until authenticated official
+  Gemma3 safetensors and tokenizer/processor files are present locally.
 
 ### Phase D: standalone kernel parity
 
@@ -463,10 +467,9 @@ Acceptance:
 
 Blocked evidence:
 
-- `gemma3_reproduction_blockers.py` reports Phase F as `BLOCKED` because real
-  Gemma3 1B safetensors/tokenizer artifacts, tokenizer/safetensor Python
-  packages, paper-comparable environment fields, and measured nonlinear
-  fallback status are missing.
+- `gemma3_reproduction_blockers.py` reports Phase F as `BLOCKED` while real
+  Gemma3 1B safetensors/tokenizer artifacts and measured nonlinear fallback
+  status are missing.
 - No CPU/iGPU/NPU paper baseline or speedup claim is emitted while these
   blockers remain.
 
@@ -493,10 +496,9 @@ Acceptance:
 
 Blocked evidence:
 
-- `gemma3_reproduction_blockers.py` reports Phase G as `BLOCKED` because real
-  Gemma3 4B safetensors/tokenizer artifacts, tokenizer/safetensor Python
-  packages, paper-comparable environment fields, and measured nonlinear
-  fallback status are missing.
+- `gemma3_reproduction_blockers.py` reports Phase G as `BLOCKED` while real
+  Gemma3 4B safetensors/tokenizer artifacts and measured nonlinear fallback
+  status are missing.
 - 64k/128k decode cells remain target-ledger entries only; no local paper claim
   is emitted without real KV-cache, memory, and schedule evidence.
 
@@ -522,10 +524,9 @@ Acceptance:
 
 Blocked evidence:
 
-- `gemma3_reproduction_blockers.py` reports Phase H as `BLOCKED` because real
-  Gemma3 4B vision artifacts, tokenizer/safetensor Python packages,
-  paper-comparable environment fields, measured nonlinear fallback status, and
-  the NPU vision path are missing.
+- `gemma3_reproduction_blockers.py` reports Phase H as `BLOCKED` while real
+  Gemma3 4B vision artifacts, measured nonlinear fallback status, and the NPU
+  vision path are missing.
 - Existing text-only synthetic and blocked-result tests keep vision optional;
   no vision TTFT or speedup claim is emitted without real vision execution.
 
