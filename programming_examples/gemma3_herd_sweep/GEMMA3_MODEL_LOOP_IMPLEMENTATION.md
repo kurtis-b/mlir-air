@@ -274,6 +274,14 @@ Acceptance:
 - A synthetic local result fixture can be compared and classified within or
   outside the 20% threshold.
 
+Implemented evidence:
+
+- `paper_targets.json` records 141 paper target cells and 6 headline conflicts.
+- `gemma3_paper_compare.py --validate` validates target completeness.
+- `gemma3_paper_compare.py --self-test` exercises `PAPER_MATCH`,
+  `EXPLAINED_DEVIATION`, and out-of-capacity comparisons.
+- `run_model_loop_paper_compare.lit` covers validation and fixture comparison.
+
 ### Phase B: hardware and environment parity capture
 
 Goal: make every local result reproducible and comparable.

@@ -1,0 +1,1517 @@
+{
+  "schema_version": 1,
+  "similarity_threshold_pct": 20.0,
+  "primary_sources": [
+    {
+      "name": "arxiv_pdf_v2",
+      "url": "https://arxiv.org/pdf/2602.06063"
+    },
+    {
+      "name": "arxiv_html_v2",
+      "url": "https://arxiv.org/html/2602.06063v2"
+    }
+  ],
+  "secondary_sources": [
+    {
+      "name": "arxiv_abs",
+      "url": "https://arxiv.org/abs/2602.06063"
+    },
+    {
+      "name": "fastflowlm_gemma3_results",
+      "url": "https://fastflowlm.com/docs/benchmarks/gemma3_results/"
+    }
+  ],
+  "headline_conflicts": [
+    {
+      "metric": "prefill_speedup_npu_vs_igpu",
+      "primary_pdf_v2": 7.5,
+      "secondary_abstract": 5.2,
+      "unit": "speedup"
+    },
+    {
+      "metric": "decode_speedup_npu_vs_igpu",
+      "primary_pdf_v2": 5.9,
+      "secondary_abstract": 4.8,
+      "unit": "speedup"
+    },
+    {
+      "metric": "prefill_speedup_npu_vs_cpu",
+      "primary_pdf_v2": 23.7,
+      "secondary_abstract": 33.5,
+      "unit": "speedup"
+    },
+    {
+      "metric": "decode_speedup_npu_vs_cpu",
+      "primary_pdf_v2": 2.7,
+      "secondary_abstract": 2.2,
+      "unit": "speedup"
+    },
+    {
+      "metric": "power_efficiency_npu_vs_igpu",
+      "primary_pdf_v2": 96.7,
+      "secondary_abstract": 67.2,
+      "unit": "speedup"
+    },
+    {
+      "metric": "power_efficiency_npu_vs_cpu",
+      "primary_pdf_v2": 157.7,
+      "secondary_abstract": 222.9,
+      "unit": "speedup"
+    }
+  ],
+  "targets": [
+    {
+      "id": "prefill_ttft_seconds_gemma3_1b_npu_1024",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "sequence_length": 1024,
+      "paper_value": 0.95,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_1b_npu_2048",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "sequence_length": 2048,
+      "paper_value": 1.47,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_1b_npu_4096",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "sequence_length": 4096,
+      "paper_value": 2.46,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_1b_npu_8192",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "sequence_length": 8192,
+      "paper_value": 4.42,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_1b_npu_16384",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "sequence_length": 16384,
+      "paper_value": 8.45,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_1b_npu_32768",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "sequence_length": 32768,
+      "paper_value": 17.19,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_1b_igpu_1024",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-1b",
+      "backend": "igpu",
+      "sequence_length": 1024,
+      "paper_value": 0.51,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_1b_igpu_2048",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-1b",
+      "backend": "igpu",
+      "sequence_length": 2048,
+      "paper_value": 1.14,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_1b_igpu_4096",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-1b",
+      "backend": "igpu",
+      "sequence_length": 4096,
+      "paper_value": 2.61,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_1b_igpu_8192",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-1b",
+      "backend": "igpu",
+      "sequence_length": 8192,
+      "paper_value": 6.64,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_1b_igpu_16384",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-1b",
+      "backend": "igpu",
+      "sequence_length": 16384,
+      "paper_value": 21.3,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_1b_igpu_32768",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-1b",
+      "backend": "igpu",
+      "sequence_length": 32768,
+      "paper_value": 95.1,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_1b_cpu_1024",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-1b",
+      "backend": "cpu",
+      "sequence_length": 1024,
+      "paper_value": 4.06,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_1b_cpu_2048",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-1b",
+      "backend": "cpu",
+      "sequence_length": 2048,
+      "paper_value": 8.06,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_1b_cpu_4096",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-1b",
+      "backend": "cpu",
+      "sequence_length": 4096,
+      "paper_value": 17.2,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_1b_cpu_8192",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-1b",
+      "backend": "cpu",
+      "sequence_length": 8192,
+      "paper_value": 36.2,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_1b_cpu_16384",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-1b",
+      "backend": "cpu",
+      "sequence_length": 16384,
+      "paper_value": 75.5,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_1b_cpu_32768",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-1b",
+      "backend": "cpu",
+      "sequence_length": 32768,
+      "paper_value": 165,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_4b_npu_1024",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "sequence_length": 1024,
+      "paper_value": 1.81,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_4b_npu_2048",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "sequence_length": 2048,
+      "paper_value": 2.81,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_4b_npu_4096",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "sequence_length": 4096,
+      "paper_value": 4.79,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_4b_npu_8192",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "sequence_length": 8192,
+      "paper_value": 8.37,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_4b_npu_16384",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "sequence_length": 16384,
+      "paper_value": 16.17,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_4b_npu_32768",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "sequence_length": 32768,
+      "paper_value": 33.5,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_4b_igpu_1024",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "sequence_length": 1024,
+      "paper_value": 2.05,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_4b_igpu_2048",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "sequence_length": 2048,
+      "paper_value": 4.26,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_4b_igpu_4096",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "sequence_length": 4096,
+      "paper_value": 9.54,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_4b_igpu_8192",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "sequence_length": 8192,
+      "paper_value": 23.8,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_4b_igpu_16384",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "sequence_length": 16384,
+      "paper_value": 71.5,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_4b_igpu_32768",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "sequence_length": 32768,
+      "paper_value": 265,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_4b_cpu_1024",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "sequence_length": 1024,
+      "paper_value": 20.3,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_4b_cpu_2048",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "sequence_length": 2048,
+      "paper_value": 42.4,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_4b_cpu_4096",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "sequence_length": 4096,
+      "paper_value": 85.4,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_4b_cpu_8192",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "sequence_length": 8192,
+      "paper_value": 176,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_4b_cpu_16384",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "sequence_length": 16384,
+      "paper_value": 766,
+      "unit": "seconds"
+    },
+    {
+      "id": "prefill_ttft_seconds_gemma3_4b_cpu_32768",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_ttft_seconds",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "sequence_length": 32768,
+      "paper_value": 832,
+      "unit": "seconds"
+    },
+    {
+      "id": "decode_tps_gemma3_1b_npu_1024",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "sequence_length": 1024,
+      "paper_value": 41.1,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_1b_npu_2048",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "sequence_length": 2048,
+      "paper_value": 40.5,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_1b_npu_4096",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "sequence_length": 4096,
+      "paper_value": 39.5,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_1b_npu_8192",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "sequence_length": 8192,
+      "paper_value": 37.3,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_1b_npu_16384",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "sequence_length": 16384,
+      "paper_value": 33.6,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_1b_npu_32768",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "sequence_length": 32768,
+      "paper_value": 27.9,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_1b_igpu_1024",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-1b",
+      "backend": "igpu",
+      "sequence_length": 1024,
+      "paper_value": 38.0,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_1b_igpu_2048",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-1b",
+      "backend": "igpu",
+      "sequence_length": 2048,
+      "paper_value": 53.9,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_1b_igpu_4096",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-1b",
+      "backend": "igpu",
+      "sequence_length": 4096,
+      "paper_value": 42.3,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_1b_igpu_8192",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-1b",
+      "backend": "igpu",
+      "sequence_length": 8192,
+      "paper_value": 33.5,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_1b_igpu_16384",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-1b",
+      "backend": "igpu",
+      "sequence_length": 16384,
+      "paper_value": 25.0,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_1b_igpu_32768",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-1b",
+      "backend": "igpu",
+      "sequence_length": 32768,
+      "paper_value": 13.6,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_1b_cpu_1024",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-1b",
+      "backend": "cpu",
+      "sequence_length": 1024,
+      "paper_value": 41.9,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_1b_cpu_2048",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-1b",
+      "backend": "cpu",
+      "sequence_length": 2048,
+      "paper_value": 40.8,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_1b_cpu_4096",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-1b",
+      "backend": "cpu",
+      "sequence_length": 4096,
+      "paper_value": 41.7,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_1b_cpu_8192",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-1b",
+      "backend": "cpu",
+      "sequence_length": 8192,
+      "paper_value": 40.2,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_1b_cpu_16384",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-1b",
+      "backend": "cpu",
+      "sequence_length": 16384,
+      "paper_value": 38.1,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_1b_cpu_32768",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-1b",
+      "backend": "cpu",
+      "sequence_length": 32768,
+      "paper_value": 33.8,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_npu_1024",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "sequence_length": 1024,
+      "paper_value": 18.2,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_npu_2048",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "sequence_length": 2048,
+      "paper_value": 18.0,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_npu_4096",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "sequence_length": 4096,
+      "paper_value": 17.8,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_npu_8192",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "sequence_length": 8192,
+      "paper_value": 17.3,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_npu_16384",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "sequence_length": 16384,
+      "paper_value": 16.3,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_npu_32768",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "sequence_length": 32768,
+      "paper_value": 14.8,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_npu_65536",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "sequence_length": 65536,
+      "paper_value": 13.2,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_npu_131072",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "sequence_length": 131072,
+      "paper_value": 11.2,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_igpu_1024",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "sequence_length": 1024,
+      "paper_value": 18.6,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_igpu_2048",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "sequence_length": 2048,
+      "paper_value": 17.4,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_igpu_4096",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "sequence_length": 4096,
+      "paper_value": 15.3,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_igpu_8192",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "sequence_length": 8192,
+      "paper_value": 12.6,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_igpu_16384",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "sequence_length": 16384,
+      "paper_value": 9.2,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_igpu_32768",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "sequence_length": 32768,
+      "paper_value": 5.9,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_igpu_65536",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "sequence_length": 65536,
+      "paper_value": 3.3,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_igpu_131072",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "sequence_length": 131072,
+      "paper_value": 1.9,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_cpu_1024",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "sequence_length": 1024,
+      "paper_value": 14.6,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_cpu_2048",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "sequence_length": 2048,
+      "paper_value": 13.5,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_cpu_4096",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "sequence_length": 4096,
+      "paper_value": 13.9,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_cpu_8192",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "sequence_length": 8192,
+      "paper_value": 13.0,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_cpu_16384",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "sequence_length": 16384,
+      "paper_value": 11.4,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_cpu_32768",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "sequence_length": 32768,
+      "paper_value": 10.8,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_cpu_65536",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "sequence_length": 65536,
+      "paper_value": 7.5,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_4b_cpu_131072",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "sequence_length": 131072,
+      "paper_value": 4.1,
+      "unit": "tokens_per_second"
+    },
+    {
+      "id": "decode_tps_gemma3_1b_npu_65536",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "sequence_length": 65536,
+      "unit": "tokens_per_second",
+      "classification_hint": "OOC"
+    },
+    {
+      "id": "decode_tps_gemma3_1b_npu_131072",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "sequence_length": 131072,
+      "unit": "tokens_per_second",
+      "classification_hint": "OOC"
+    },
+    {
+      "id": "vision_ttft_seconds_gemma3_4b_vision_npu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "vision_ttft_seconds",
+      "model_variant": "gemma3-4b-vision",
+      "backend": "npu",
+      "paper_value": 2.6,
+      "unit": "seconds"
+    },
+    {
+      "id": "vision_ttft_seconds_gemma3_4b_vision_igpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "vision_ttft_seconds",
+      "model_variant": "gemma3-4b-vision",
+      "backend": "igpu",
+      "paper_value": 7.45,
+      "unit": "seconds"
+    },
+    {
+      "id": "vision_ttft_seconds_gemma3_4b_vision_cpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "vision_ttft_seconds",
+      "model_variant": "gemma3-4b-vision",
+      "backend": "cpu",
+      "paper_value": 38.55,
+      "unit": "seconds"
+    },
+    {
+      "id": "vision_speedup_gemma3_4b_vision_npu_vs_igpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "vision_speedup",
+      "model_variant": "gemma3-4b-vision",
+      "backend": "npu_vs_igpu",
+      "paper_value": 2.9,
+      "unit": "speedup"
+    },
+    {
+      "id": "vision_speedup_gemma3_4b_vision_npu_vs_cpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "vision_speedup",
+      "model_variant": "gemma3-4b-vision",
+      "backend": "npu_vs_cpu",
+      "paper_value": 14.8,
+      "unit": "speedup"
+    },
+    {
+      "id": "average_power_watts_npu_decoding_gemma3-1b_cpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "paper_value": 2.8,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "cpu"
+    },
+    {
+      "id": "average_power_watts_npu_decoding_gemma3-1b_gpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "paper_value": 0,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "gpu"
+    },
+    {
+      "id": "average_power_watts_npu_decoding_gemma3-1b_npu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "paper_value": 1.8,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "npu"
+    },
+    {
+      "id": "average_power_watts_npu_decoding_gemma3-1b_total",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "paper_value": 4.6,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "total"
+    },
+    {
+      "id": "average_power_watts_npu_decoding_gemma3-4b_cpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "paper_value": 2.9,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "cpu"
+    },
+    {
+      "id": "average_power_watts_npu_decoding_gemma3-4b_gpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "paper_value": 0,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "gpu"
+    },
+    {
+      "id": "average_power_watts_npu_decoding_gemma3-4b_npu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "paper_value": 1.6,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "npu"
+    },
+    {
+      "id": "average_power_watts_npu_decoding_gemma3-4b_total",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "paper_value": 4.5,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "total"
+    },
+    {
+      "id": "average_power_watts_npu_prefill_gemma3-1b_cpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "paper_value": 0.0,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "cpu"
+    },
+    {
+      "id": "average_power_watts_npu_prefill_gemma3-1b_gpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "paper_value": 3.1,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "gpu"
+    },
+    {
+      "id": "average_power_watts_npu_prefill_gemma3-1b_npu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "paper_value": 1.2,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "npu"
+    },
+    {
+      "id": "average_power_watts_npu_prefill_gemma3-1b_total",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "npu",
+      "paper_value": 4.3,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "total"
+    },
+    {
+      "id": "average_power_watts_npu_prefill_gemma3-4b_cpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "paper_value": 0.0,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "cpu"
+    },
+    {
+      "id": "average_power_watts_npu_prefill_gemma3-4b_gpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "paper_value": 3.4,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "gpu"
+    },
+    {
+      "id": "average_power_watts_npu_prefill_gemma3-4b_npu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "paper_value": 1.1,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "npu"
+    },
+    {
+      "id": "average_power_watts_npu_prefill_gemma3-4b_total",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "npu",
+      "paper_value": 4.5,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "total"
+    },
+    {
+      "id": "average_power_watts_igpu_decoding_gemma3-1b_cpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "igpu",
+      "paper_value": 31,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "cpu"
+    },
+    {
+      "id": "average_power_watts_igpu_decoding_gemma3-1b_gpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "igpu",
+      "paper_value": 22,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "gpu"
+    },
+    {
+      "id": "average_power_watts_igpu_decoding_gemma3-1b_npu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "igpu",
+      "paper_value": 0,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "npu"
+    },
+    {
+      "id": "average_power_watts_igpu_decoding_gemma3-1b_total",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "igpu",
+      "paper_value": 53,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "total"
+    },
+    {
+      "id": "average_power_watts_igpu_decoding_gemma3-4b_cpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "paper_value": 31,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "cpu"
+    },
+    {
+      "id": "average_power_watts_igpu_decoding_gemma3-4b_gpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "paper_value": 23,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "gpu"
+    },
+    {
+      "id": "average_power_watts_igpu_decoding_gemma3-4b_npu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "paper_value": 0,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "npu"
+    },
+    {
+      "id": "average_power_watts_igpu_decoding_gemma3-4b_total",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "paper_value": 54,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "total"
+    },
+    {
+      "id": "average_power_watts_igpu_prefill_gemma3-1b_cpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "igpu",
+      "paper_value": 33,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "cpu"
+    },
+    {
+      "id": "average_power_watts_igpu_prefill_gemma3-1b_gpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "igpu",
+      "paper_value": 24,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "gpu"
+    },
+    {
+      "id": "average_power_watts_igpu_prefill_gemma3-1b_npu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "igpu",
+      "paper_value": 0,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "npu"
+    },
+    {
+      "id": "average_power_watts_igpu_prefill_gemma3-1b_total",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "igpu",
+      "paper_value": 57,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "total"
+    },
+    {
+      "id": "average_power_watts_igpu_prefill_gemma3-4b_cpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "paper_value": 33,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "cpu"
+    },
+    {
+      "id": "average_power_watts_igpu_prefill_gemma3-4b_gpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "paper_value": 25,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "gpu"
+    },
+    {
+      "id": "average_power_watts_igpu_prefill_gemma3-4b_npu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "paper_value": 0,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "npu"
+    },
+    {
+      "id": "average_power_watts_igpu_prefill_gemma3-4b_total",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "igpu",
+      "paper_value": 58,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "total"
+    },
+    {
+      "id": "average_power_watts_cpu_decoding_gemma3-1b_cpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "cpu",
+      "paper_value": 29,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "cpu"
+    },
+    {
+      "id": "average_power_watts_cpu_decoding_gemma3-1b_gpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "cpu",
+      "paper_value": 0,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "gpu"
+    },
+    {
+      "id": "average_power_watts_cpu_decoding_gemma3-1b_npu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "cpu",
+      "paper_value": 0,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "npu"
+    },
+    {
+      "id": "average_power_watts_cpu_decoding_gemma3-1b_total",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "cpu",
+      "paper_value": 29,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "total"
+    },
+    {
+      "id": "average_power_watts_cpu_decoding_gemma3-4b_cpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "paper_value": 26,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "cpu"
+    },
+    {
+      "id": "average_power_watts_cpu_decoding_gemma3-4b_gpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "paper_value": 0,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "gpu"
+    },
+    {
+      "id": "average_power_watts_cpu_decoding_gemma3-4b_npu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "paper_value": 0,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "npu"
+    },
+    {
+      "id": "average_power_watts_cpu_decoding_gemma3-4b_total",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "paper_value": 26,
+      "unit": "watts",
+      "mode": "decoding",
+      "rail": "total"
+    },
+    {
+      "id": "average_power_watts_cpu_prefill_gemma3-1b_cpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "cpu",
+      "paper_value": 24,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "cpu"
+    },
+    {
+      "id": "average_power_watts_cpu_prefill_gemma3-1b_gpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "cpu",
+      "paper_value": 0,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "gpu"
+    },
+    {
+      "id": "average_power_watts_cpu_prefill_gemma3-1b_npu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "cpu",
+      "paper_value": 0,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "npu"
+    },
+    {
+      "id": "average_power_watts_cpu_prefill_gemma3-1b_total",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-1b",
+      "backend": "cpu",
+      "paper_value": 24,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "total"
+    },
+    {
+      "id": "average_power_watts_cpu_prefill_gemma3-4b_cpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "paper_value": 30,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "cpu"
+    },
+    {
+      "id": "average_power_watts_cpu_prefill_gemma3-4b_gpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "paper_value": 0,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "gpu"
+    },
+    {
+      "id": "average_power_watts_cpu_prefill_gemma3-4b_npu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "paper_value": 0,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "npu"
+    },
+    {
+      "id": "average_power_watts_cpu_prefill_gemma3-4b_total",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "average_power_watts",
+      "model_variant": "gemma3-4b",
+      "backend": "cpu",
+      "paper_value": 30,
+      "unit": "watts",
+      "mode": "prefill",
+      "rail": "total"
+    },
+    {
+      "id": "prefill_tps_per_watt_speedup_gemma3_1b_npu_vs_igpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_tps_per_watt_speedup",
+      "model_variant": "gemma3-1b",
+      "backend": "npu_vs_igpu",
+      "unit": "speedup_range",
+      "paper_min": 6.9,
+      "paper_max": 69.7
+    },
+    {
+      "id": "prefill_tps_per_watt_speedup_gemma3_1b_npu_vs_cpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_tps_per_watt_speedup",
+      "model_variant": "gemma3-1b",
+      "backend": "npu_vs_cpu",
+      "unit": "speedup_range",
+      "paper_min": 22.9,
+      "paper_max": 50.7
+    },
+    {
+      "id": "prefill_tps_per_watt_speedup_gemma3_4b_npu_vs_igpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_tps_per_watt_speedup",
+      "model_variant": "gemma3-4b",
+      "backend": "npu_vs_igpu",
+      "unit": "speedup_range",
+      "paper_min": 13.9,
+      "paper_max": 96.7
+    },
+    {
+      "id": "prefill_tps_per_watt_speedup_gemma3_4b_npu_vs_cpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "prefill_tps_per_watt_speedup",
+      "model_variant": "gemma3-4b",
+      "backend": "npu_vs_cpu",
+      "unit": "speedup_range",
+      "paper_min": 70.6,
+      "paper_max": 157.7
+    },
+    {
+      "id": "decode_tps_per_watt_speedup_gemma3_1b_npu_vs_igpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps_per_watt_speedup",
+      "model_variant": "gemma3-1b",
+      "backend": "npu_vs_igpu",
+      "unit": "speedup_range",
+      "paper_min": 12.4,
+      "paper_max": 24.2
+    },
+    {
+      "id": "decode_tps_per_watt_speedup_gemma3_1b_npu_vs_cpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps_per_watt_speedup",
+      "model_variant": "gemma3-1b",
+      "backend": "npu_vs_cpu",
+      "unit": "speedup_range",
+      "paper_min": 5.2,
+      "paper_max": 6.2
+    },
+    {
+      "id": "decode_tps_per_watt_speedup_gemma3_4b_npu_vs_igpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps_per_watt_speedup",
+      "model_variant": "gemma3-4b",
+      "backend": "npu_vs_igpu",
+      "unit": "speedup_range",
+      "paper_min": 11.9,
+      "paper_max": 71.1
+    },
+    {
+      "id": "decode_tps_per_watt_speedup_gemma3_4b_npu_vs_cpu",
+      "paper_source": "arxiv_pdf_v2",
+      "metric": "decode_tps_per_watt_speedup",
+      "model_variant": "gemma3-4b",
+      "backend": "npu_vs_cpu",
+      "unit": "speedup_range",
+      "paper_min": 7.2,
+      "paper_max": 15.8
+    }
+  ]
+}
