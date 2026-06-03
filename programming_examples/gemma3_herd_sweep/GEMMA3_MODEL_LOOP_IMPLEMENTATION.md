@@ -449,9 +449,9 @@ Implemented evidence and blocker:
 - `gemma3_nonlinears.py` now records CPU reference, tensor contract,
   compile-lit availability, hardware-validation status, tolerance policy, and
   timed-window status for RMSNorm, QK-Norm, RoPE, GeGLU, and residual add.
-- The registry keeps all nonlinear/vector stages as host fallbacks until
-  Gemma-specific AIR wrappers and hardware validation exist, so none are
-  promoted into NPU paper-match timing yet.
+- The registry keeps nonlinear/vector stages as host fallbacks until
+  Gemma-specific model wiring uses validated kernels. GeGLU now has standalone
+  ELF hardware-smoke validation, but it is not promoted into model timing yet.
 - `gemma3_results.py` now records fallback entries with backend, elapsed-ms,
   timed-iteration count, measurement source, tensor contract, hardware status,
   and `npu_promoted=false` for CPU-reference fallbacks.
@@ -462,9 +462,9 @@ Implemented evidence and blocker:
 - `run_model_loop_nonlinears.lit`, `run_model_loop_results.lit`, and
   `run_model_loop_paper_compare.lit` cover the nonlinear metadata, measured
   result records, and paper-match fallback gate.
-- Remaining work for full Phase E completion is real hardware validation for
-  promoted wrappers and end-to-end real-artifact timing; this is blocked by the
-  real-artifact gaps recorded earlier.
+- Remaining work for full Phase E completion is Gemma model wiring for the
+  validated GeGLU path plus RMSNorm, QK-Norm, RoPE, residual, logits, and
+  sampling promotion or measured timing treatment in end-to-end execution.
 
 ### Phase F: end-to-end 1B text reproduction
 
