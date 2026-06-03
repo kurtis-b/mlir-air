@@ -9,6 +9,7 @@ source control unless they are reviewed as compact fixtures.
 ## Static Preload Evidence
 
 - `gemma3_static_preload_evidence.json`: compact Strix/XRT evidence that
-  `gemma3-1b` and `gemma3-4b` serialized and wrote all planned text
-  projection tensors into one contiguous XRT BO per model. This is static-weight preload evidence only; it is not a model
+  `gemma3-1b`, `gemma3-4b`, and the `gemma3-4b-vision` text stack
+  serialized and wrote all planned text projection tensors into one contiguous
+  XRT BO per model variant. This is static-weight preload evidence only; it is not a model
   kernel launch, correctness, timing, or paper-parity result.
