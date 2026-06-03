@@ -97,6 +97,24 @@ def execution_wiring_record_from_plan(plan: Any) -> dict[str, Any]:
     }
 
 
+def model_runner_record_from_plan(plan: Any) -> dict[str, Any]:
+    return {
+        "status": plan.status,
+        "layers": plan.layers,
+        "step_count": plan.step_count,
+        "bo_allocation_status": plan.bo_allocation_status,
+        "bo_requested_bytes": plan.bo_requested_bytes,
+        "bo_allocated_bytes": plan.bo_allocated_bytes,
+        "bo_allocation_count": plan.bo_allocation_count,
+        "bo_skipped_count": plan.bo_skipped_count,
+        "static_preload_tensor_count": plan.static_preload_tensor_count,
+        "kernel_launch_count": plan.kernel_launch_count,
+        "host_fallback_count": plan.host_fallback_count,
+        "host_runtime_count": plan.host_runtime_count,
+        "blockers": list(plan.blockers),
+    }
+
+
 def build_execution_wiring_record(
     *,
     model_variant: str,
@@ -124,6 +142,44 @@ def build_execution_wiring_record(
             "error": str(exc),
         }
 
+
+def build_model_runner_record(
+    *,
+    model_variant: str,
+    backend: str,
+    weights_dir: Path | None,
+    artifacts_ready: bool,
+    prompt_len: int,
+) -> dict[str, Any] | None:
+    if backend != "npu" or not artifacts_ready:
+        return None
+    try:
+        from gemma3_model_runner import build_model_runner_plan
+
+        return model_runner_record_from_plan(
+            build_model_runner_plan(
+                model_variant,
+                weights_dir=weights_dir,
+                prompt_len=prompt_len,
+            )
+        )
+    except Exception as exc:
+        return {
+            "status": "MODEL_RUNNER_PLAN_FAILED",
+            "layers": None,
+            "step_count": None,
+            "bo_allocation_status": None,
+            "bo_requested_bytes": None,
+            "bo_allocated_bytes": None,
+            "bo_allocation_count": None,
+            "bo_skipped_count": None,
+            "static_preload_tensor_count": None,
+            "kernel_launch_count": None,
+            "host_fallback_count": None,
+            "host_runtime_count": None,
+            "blockers": ["model-runner-plan-failed"],
+            "error": str(exc),
+        }
 
 def fallback_records(
     *,
@@ -202,6 +258,13 @@ def build_paper_result(
         weights_dir=weights_dir,
         artifacts_ready=inventory.can_load_real_artifacts,
     )
+    model_runner = build_model_runner_record(
+        model_variant=model_variant,
+        backend=backend,
+        weights_dir=weights_dir,
+        artifacts_ready=inventory.can_load_real_artifacts,
+        prompt_len=prompt_len,
+    )
 
     notes = missing_artifact_notes(inventory)
     host_fallbacks = fallback_records(
@@ -227,6 +290,11 @@ def build_paper_result(
             notes.append(
                 "execution wiring blockers: "
                 + ",".join(execution_wiring.get("blockers", []))
+            )
+        if model_runner:
+            notes.append(
+                "model runner blockers: "
+                + ",".join(model_runner.get("blockers", []))
             )
     if env.get("missing_paper_fields"):
         notes.append("environment is not paper-comparable: " + ",".join(env["missing_paper_fields"]))
@@ -276,6 +344,7 @@ def build_paper_result(
         "missing_environment_fields": env.get("missing_paper_fields", []),
         "artifact_inventory": inventory.to_json_dict(),
         "execution_wiring": execution_wiring,
+        "model_runner": model_runner,
         "notes": notes,
     }
 
@@ -325,10 +394,10 @@ def _self_test() -> None:
             npu_candidate_count=20,
             host_fallback_count=28,
             host_runtime_count=4,
-            blockers=("xrt-model-runner-not-wired",),
+            blockers=("model-kernel-launch-not-wired",),
         )
     )
-    if wiring["blockers"] != ["xrt-model-runner-not-wired"]:
+    if wiring["blockers"] != ["model-kernel-launch-not-wired"]:
         raise AssertionError(wiring)
     print(format_result(result))
     print(

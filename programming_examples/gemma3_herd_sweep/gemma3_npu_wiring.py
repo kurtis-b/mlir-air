@@ -148,9 +148,9 @@ def _stage_status(
     nonlinear_status: dict[str, str],
 ) -> tuple[str, tuple[str, ...]]:
     if backend == "npu-candidate":
-        return "candidate-only", ("xrt-model-runner-not-wired", "paper-shape-hardware-rerun-required")
+        return "candidate-only", ("model-kernel-launch-not-wired", "paper-shape-hardware-rerun-required")
     if backend == "host-runtime":
-        return "host-runtime-contract", ("xrt-model-runner-not-wired",)
+        return "host-runtime-contract", ("model-runtime-buffer-binding-not-wired",)
     if kernel in nonlinear_status and nonlinear_status[kernel].startswith("hardware-smoke-pass"):
         return "standalone-hardware-smoke-host-fallback", ("model-stage-not-promoted",)
     return "host-fallback", ("model-stage-not-promoted",)
@@ -186,7 +186,8 @@ def build_wiring_plan_from_preflight(preflight: Gemma3NPUPreflightPlan) -> Gemma
             )
 
     blockers = [
-        "xrt-model-runner-not-wired",
+        "model-kernel-launch-not-wired",
+        "model-runtime-buffer-binding-not-wired",
         "full-static-weight-bo-preload-not-validated",
         "paper-shape-bo-allocation-not-validated",
         "nonlinear-model-stage-promotion-incomplete",
