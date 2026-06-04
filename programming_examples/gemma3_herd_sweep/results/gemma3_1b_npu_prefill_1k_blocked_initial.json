@@ -36,12 +36,12 @@
   },
   "backend": "npu",
   "classification": "REAL_MODEL_EXECUTION_NOT_IMPLEMENTED",
-  "command": "gemma3_inference.py --paper-benchmark --model-variant gemma3-1b --backend npu --prompt-len 1024 --decode-tokens 0 --metric prefill_ttft_seconds --warmup-iters 0 --timed-iters 1 --power-sample --compare-paper --result-json programming_examples/gemma3_herd_sweep/results/gemma3_1b_npu_prefill_1k_blocked_initial.json",
+  "command": "gemma3_inference.py --paper-benchmark --model-variant gemma3-1b --backend npu --prompt-len 1024 --decode-tokens 0 --metric prefill_ttft_seconds --warmup-iters 1 --timed-iters 3 --power-sample --compare-paper --result-json /tmp/gemma3_1b_npu_prefill_1k_blocked_clean.json",
   "compile_time_included": false,
   "correctness": "BLOCKED_EXECUTION_NOT_IMPLEMENTED",
   "decode_tokens": 0,
   "delta_pct": null,
-  "dirty_worktree": true,
+  "dirty_worktree": false,
   "environment_comparable": true,
   "execution_wiring": {
     "blockers": [
@@ -58,12 +58,12 @@
     "status": "BLOCKED"
   },
   "explanation": null,
-  "git_commit": "e8895a6721af233ca66390cdfae8c99311a8d375",
+  "git_commit": "dfe9c65822046aca2b485da0bfa73fbcf3447372",
   "host_fallbacks": [
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.009638334934910139,
+      "elapsed_ms": 0.009397665659586588,
       "hardware_status": "hardware-smoke-pass-M8-N1152-N2560-elf",
       "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
       "measured": true,
@@ -77,7 +77,7 @@
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.008666344607869783,
+      "elapsed_ms": 0.008479323393354813,
       "hardware_status": "hardware-smoke-pass-M32-N256-elf",
       "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
       "measured": true,
@@ -91,7 +91,7 @@
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.007641327101737261,
+      "elapsed_ms": 0.007681005323926608,
       "hardware_status": "pending-gemma-air-wrapper-hardware",
       "implementation_path": "programming_examples/llama32_1b/kernel_builder/rope_halfsplit.cc",
       "measured": true,
@@ -105,7 +105,7 @@
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.010092315884927908,
+      "elapsed_ms": 0.009697997787346443,
       "hardware_status": "hardware-smoke-pass-n1024-tile256-elf",
       "implementation_path": "programming_examples/gemma3_dataflow_kernels/geglu.py",
       "measured": true,
@@ -119,7 +119,7 @@
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.0021776650100946426,
+      "elapsed_ms": 0.002130652622630199,
       "hardware_status": "not-promoted",
       "implementation_path": "programming_examples/llama32_1b/multi_launch_builder/o_ffn_multi.py",
       "measured": true,
@@ -167,10 +167,7 @@
     "raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges",
     "xrt-smi is available, but direct NPU rail parsing reports N/A on this host",
     "instantaneous snapshots do not report watts; use begin_power_window/finish_power_window around timed inference",
-    "direct RAPL sysfs package counter is unavailable: permission denied reading /sys/class/powercap/intel-rapl:0/energy_uj",
-    "permission denied reading /sys/class/powercap/intel-rapl:0/energy_uj",
-    "permission denied reading /sys/class/powercap/intel-rapl:0:0/energy_uj",
-    "no readable RAPL energy counters"
+    "direct RAPL sysfs package counter is readable; timed-window integration will use energy_uj deltas"
   ],
   "npu_power_mode": "Power Mode             : Default",
   "paper_source": "arxiv_pdf_v2",
@@ -194,8 +191,8 @@
   "schema_version": 1,
   "sequence_length": 1024,
   "target_id": "prefill_ttft_seconds_gemma3_1b_npu_1024",
-  "timed_iters": 1,
+  "timed_iters": 3,
   "unit": "seconds",
-  "warmup_iters": 0,
+  "warmup_iters": 1,
   "xrt_version": "Version              : 2.21.75"
 }
