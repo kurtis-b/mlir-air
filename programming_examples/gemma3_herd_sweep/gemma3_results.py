@@ -192,6 +192,47 @@ def load_staged_npu_diagnostic(model_variant: str) -> dict[str, Any] | None:
     }
 
 
+def load_decode_loop_diagnostic(model_variant: str) -> dict[str, Any] | None:
+    if model_variant != "gemma3-1b":
+        return None
+    try:
+        from gemma3_decode_loop_probe import DEFAULT_LOOP_PROBE_EVIDENCE
+
+        data = json.loads(DEFAULT_LOOP_PROBE_EVIDENCE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if data.get("status") != "DECODE_LOOP_DIAGNOSTIC_PASS":
+        return None
+    return {
+        "status": data.get("status"),
+        "sequence_kind": data.get("sequence_kind"),
+        "phase": data.get("phase"),
+        "layer_count": data.get("layer_count"),
+        "decode_tokens": data.get("decode_tokens"),
+        "prompt_context_length": data.get("prompt_context_length"),
+        "correctness": "PASS",
+        "timed_kernel_count": data.get("timed_kernel_count"),
+        "timed_kernel_seconds": data.get("timed_kernel_seconds"),
+        "measured_loop_seconds": data.get("measured_loop_seconds"),
+        "diagnostic_decode_tps_loop_wall": data.get("diagnostic_decode_tps_loop_wall"),
+        "diagnostic_decode_tps_kernel_only": data.get("diagnostic_decode_tps_kernel_only"),
+        "paper_decode_tps_1k": data.get("paper_decode_tps_1k"),
+        "loop_wall_delta_pct_vs_paper_decode_tps_1k": data.get("loop_wall_delta_pct_vs_paper_decode_tps_1k"),
+        "kernel_only_delta_pct_vs_paper_decode_tps_1k": data.get("kernel_only_delta_pct_vs_paper_decode_tps_1k"),
+        "timing_window": data.get("timing_window"),
+        "timing_notes": data.get("timing_notes", []),
+        "power_snapshot": data.get("power_snapshot"),
+        "segmented_kernel_power_snapshot": data.get("segmented_kernel_power_snapshot"),
+        "remaining_paper_gaps": data.get("remaining_paper_gaps", []),
+        "source_result": str(DEFAULT_LOOP_PROBE_EVIDENCE),
+        "notes": [
+            "diagnostic staged 26-layer decode-loop timing; not a measured paper TTFT/TPS cell",
+            "loop-wall TPS includes current runner BO writes, sync/readback, and host fallback compute",
+            "kernel-only TPS excludes BO writes, sync/readback, and host fallback compute",
+        ],
+    }
+
+
 def build_model_runner_record(
     *,
     model_variant: str,
@@ -368,6 +409,7 @@ def build_paper_result(
     delta_pct: float | None = None
     real_benchmark: dict[str, Any] | None = None
     npu_staged_diagnostic: dict[str, Any] | None = None
+    npu_decode_loop_diagnostic: dict[str, Any] | None = None
     explanation: str | None = None
     if not inventory.can_load_real_artifacts:
         classification = "MISSING_REAL_ARTIFACTS"
@@ -427,6 +469,14 @@ def build_paper_result(
                 "staged NPU diagnostic available: "
                 f"timed_kernel_seconds={npu_staged_diagnostic.get('timed_kernel_seconds')} "
                 f"estimated_26_layer_decode_tps_kernel_only={npu_staged_diagnostic.get('estimated_26_layer_decode_tps_kernel_only')}"
+            )
+        npu_decode_loop_diagnostic = load_decode_loop_diagnostic(model_variant)
+        if npu_decode_loop_diagnostic:
+            notes.append(
+                "staged NPU decode-loop diagnostic available: "
+                f"measured_loop_seconds={npu_decode_loop_diagnostic.get('measured_loop_seconds')} "
+                f"diagnostic_decode_tps_loop_wall={npu_decode_loop_diagnostic.get('diagnostic_decode_tps_loop_wall')} "
+                f"diagnostic_decode_tps_kernel_only={npu_decode_loop_diagnostic.get('diagnostic_decode_tps_kernel_only')}"
             )
         if execution_wiring:
             notes.append(
@@ -490,6 +540,7 @@ def build_paper_result(
         "model_runner": model_runner,
         "real_benchmark": real_benchmark,
         "npu_staged_diagnostic": npu_staged_diagnostic,
+        "npu_decode_loop_diagnostic": npu_decode_loop_diagnostic,
         "notes": notes,
     }
 
