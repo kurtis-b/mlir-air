@@ -1,0 +1,44 @@
+{
+  "blockers": [],
+  "command": [
+    "/home/cj/iron/ironenv/bin/python3",
+    "/home/cj/mlir-air/programming_examples/weighted_rms_norm/weighted_rms_norm.py",
+    "--M",
+    "1024",
+    "--N",
+    "1152",
+    "--herd-x",
+    "1",
+    "--output-format",
+    "elf",
+    "--compile-mode",
+    "compile-and-run"
+  ],
+  "correlation": 0.999984,
+  "dirty_worktree": false,
+  "elapsed_seconds": 0.926089350017719,
+  "git_commit": "cfcda717c6b571d610becdf82afd0e71985329bf",
+  "herd_x": 1,
+  "kernel": "rms_norm",
+  "layer_index": 0,
+  "model_variant": "gemma3-1b",
+  "output_format": "elf",
+  "phase": "prefill",
+  "returncode": 0,
+  "role": "pre_attention_norm",
+  "route": "weighted_rms_norm/standalone-elf-smoke",
+  "schema_version": 1,
+  "shape": [
+    1024,
+    1152
+  ],
+  "status": "FIRST_KERNEL_LAUNCH_PASS",
+  "stderr_tail": [],
+  "stdout_tail": [
+    "Weighted RMSNorm: M=1024, N=1152, herd=[1,1]",
+    "XRTBackend: llvm-aie package detected via PEANO_INSTALL_DIR: /home/cj/mlir-air/sandbox/lib/python3.12/site-packages/llvm-aie",
+    "Output 0 correlation: 0.999984 (threshold: 0.99)",
+    "PASS!"
+  ],
+  "threshold": 0.99
+}

@@ -35,6 +35,16 @@ arguments, and zero binding blockers.
 the generated paper-target comparison summary.
 
 
+## First Kernel Launch Probe Evidence
+
+- `gemma3_1b_first_kernel_launch_probe.json`: compact Strix/XRT evidence that
+  the promoted Gemma3 1B pre-attention RMSNorm shape (`1024x1152`) launches as
+  an ELF on the NPU with output correlation 0.999984 against the standalone CPU
+  reference. This is first-stage launch evidence only; it is not a full
+  model-runner launch, TTFT/TPS timing, pseudo-NPU power, or paper-parity
+  result.
+
+
 ## Static Preload Evidence
 
 - `gemma3_static_preload_evidence.json`: compact Strix/XRT evidence that
