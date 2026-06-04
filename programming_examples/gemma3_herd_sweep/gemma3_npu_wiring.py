@@ -18,10 +18,15 @@ from pathlib import Path
 
 from gemma3_artifacts import MODEL_SPECS
 from gemma3_kernel_parity import kernel_parity_targets
+from gemma3_launch_probe import has_runner_owned_first_kernel_launch_evidence
 from gemma3_nonlinears import nonlinear_registry
 from gemma3_npu_preflight import Gemma3NPUPreflightPlan, ProjectionPlan, build_preflight_plan
 from gemma3_static_preload import has_full_xrt_preload_evidence
 from gemma3_xrt_runner import has_paper_shape_bo_allocation_evidence
+
+
+MODEL_KERNEL_LAUNCH_BLOCKER = "model-kernel-launch-not-wired"
+MODEL_SUBSTEP_SEQUENCE_BLOCKER = "model-substep-sequence-not-wired"
 
 
 TEXT_STAGE_TEMPLATE = (
@@ -177,9 +182,13 @@ def _stage_status(
     backend: str,
     kernel: str,
     nonlinear_status: dict[str, str],
+    *,
+    first_kernel_stage_validated: bool = False,
 ) -> tuple[str, tuple[str, ...]]:
-    launch_blockers = ("model-kernel-launch-not-wired", "paper-shape-hardware-rerun-required")
+    launch_blockers = (MODEL_KERNEL_LAUNCH_BLOCKER, "paper-shape-hardware-rerun-required")
     if backend == "npu-candidate":
+        if first_kernel_stage_validated:
+            return "runner-owned-first-kernel-launch-pass", ()
         if (
             kernel in ("mlp_activation", "rms_norm", "qk_norm")
             and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass")
@@ -198,11 +207,16 @@ def build_wiring_plan_from_preflight(
     *,
     use_static_preload_evidence: bool = False,
     use_bo_allocation_evidence: bool = False,
+    use_first_kernel_launch_evidence: bool = False,
 ) -> Gemma3NPUWiringPlan:
     if preflight.layers is None or preflight.hidden_size is None or preflight.head_dim is None:
         raise ValueError("preflight plan must include layer count, hidden size, and head dim")
     routes = _kernel_route_lookup()
     nonlinear_status = _nonlinear_status_lookup()
+    first_kernel_launch_validated = (
+        use_first_kernel_launch_evidence
+        and has_runner_owned_first_kernel_launch_evidence(preflight.model_variant)
+    )
     window_len = int(preflight.sliding_window or 0)
     stages: list[Gemma3NPUStage] = []
     for layer_index in range(int(preflight.layers)):
@@ -210,7 +224,18 @@ def build_wiring_plan_from_preflight(
         layer_window = 0 if attention_kind == "global_full" else window_len
         for stage_index, (phase, role, backend, kernel, contract) in enumerate(TEXT_STAGE_TEMPLATE):
             stage_backend = _stage_backend(backend, kernel, nonlinear_status, preflight)
-            status, blockers = _stage_status(stage_backend, kernel, nonlinear_status)
+            first_kernel_stage_validated = (
+                first_kernel_launch_validated
+                and phase == "prefill"
+                and layer_index == 0
+                and role == "pre_attention_norm"
+            )
+            status, blockers = _stage_status(
+                stage_backend,
+                kernel,
+                nonlinear_status,
+                first_kernel_stage_validated=first_kernel_stage_validated,
+            )
             stages.append(
                 Gemma3NPUStage(
                     phase=phase,
@@ -229,7 +254,9 @@ def build_wiring_plan_from_preflight(
             )
 
     blockers = [
-        "model-kernel-launch-not-wired",
+        MODEL_SUBSTEP_SEQUENCE_BLOCKER
+        if first_kernel_launch_validated
+        else MODEL_KERNEL_LAUNCH_BLOCKER,
     ]
     if not (
         use_static_preload_evidence
@@ -275,6 +302,7 @@ def build_wiring_plan(
         build_preflight_plan(model_variant, weights_dir=weights_dir),
         use_static_preload_evidence=True,
         use_bo_allocation_evidence=True,
+        use_first_kernel_launch_evidence=True,
     )
 
 

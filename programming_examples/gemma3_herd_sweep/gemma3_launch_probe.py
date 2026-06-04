@@ -39,6 +39,7 @@ DEFAULT_THRESHOLD = 0.99
 DEFAULT_TENSOR_KEY = "model.layers.0.input_layernorm.weight"
 DEFAULT_INPUT_DISTRIBUTION = "bounded-uniform-seed0"
 PROBE_KINDS = ("model-rmsnorm", "standalone-rmsnorm")
+DEFAULT_LAUNCH_PROBE_EVIDENCE = Path(__file__).with_name("results") / "gemma3_1b_first_kernel_launch_probe.json"
 MODEL_RMSNORM_ARGUMENT_KEYS = (
     "layer_input",
     "static_norm_weights",
@@ -150,6 +151,45 @@ def _parse_correlation(stdout: str) -> tuple[float | None, float | None]:
     if not match:
         return None, None
     return float(match.group("value")), float(match.group("threshold"))
+
+
+def _is_runner_owned_first_kernel_launch_evidence(data: object, *, model_variant: str) -> bool:
+    if not isinstance(data, dict):
+        return False
+    argument_binding = data.get("argument_binding")
+    if not isinstance(argument_binding, dict):
+        return False
+    return (
+        data.get("schema_version") == 1
+        and data.get("model_variant") == model_variant
+        and data.get("status") == "FIRST_KERNEL_LAUNCH_PASS"
+        and data.get("probe_kind") == "model-rmsnorm"
+        and data.get("phase") == DEFAULT_PHASE
+        and data.get("layer_index") == DEFAULT_LAYER
+        and data.get("role") == DEFAULT_ROLE
+        and data.get("kernel") == DEFAULT_KERNEL
+        and data.get("route") == DEFAULT_ROUTE
+        and data.get("output_format") == DEFAULT_OUTPUT_FORMAT
+        and data.get("bo_binding_mode") == "runner-owned-persistent-bo"
+        and not data.get("blockers")
+        and argument_binding.get("status") == "ARGUMENT_BINDING_VALIDATED"
+        and tuple(argument_binding.get("argument_keys", ())) == MODEL_RMSNORM_ARGUMENT_KEYS
+        and argument_binding.get("static_norm_tensor_key") == DEFAULT_TENSOR_KEY
+        and argument_binding.get("static_norm_tensor_offset_bytes") == 0
+        and "runner-owned-bo-launch-not-wired" not in tuple(data.get("remaining_model_runner_gaps", ()))
+    )
+
+
+def has_runner_owned_first_kernel_launch_evidence(
+    model_variant: str,
+    path: Path | None = None,
+) -> bool:
+    evidence_path = path or DEFAULT_LAUNCH_PROBE_EVIDENCE
+    try:
+        data = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return _is_runner_owned_first_kernel_launch_evidence(data, model_variant=model_variant)
 
 
 def _git_info(repo: Path) -> tuple[str | None, bool | None]:
@@ -800,6 +840,12 @@ PASS!
         raise AssertionError(result)
     if result.correlation != 0.999984 or result.threshold != 0.99:
         raise AssertionError((result.correlation, result.threshold))
+    if not _is_runner_owned_first_kernel_launch_evidence(result.to_json_dict(), model_variant=DEFAULT_MODEL):
+        raise AssertionError(result.to_json_dict())
+    stale = dict(result.to_json_dict())
+    stale["bo_binding_mode"] = "xrt-runner-transient-bo"
+    if _is_runner_owned_first_kernel_launch_evidence(stale, model_variant=DEFAULT_MODEL):
+        raise AssertionError(stale)
     print(result.format())
     print("GEMMA3_LAUNCH_PROBE_SELF_TEST: PASS")
 

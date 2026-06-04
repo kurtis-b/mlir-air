@@ -22,7 +22,12 @@ from gemma3_bo_plan import KV_STRATEGIES, Gemma3BOPlan, Gemma3BORecord, build_bo
 from gemma3_argument_binding import Gemma3KernelArgumentBindingPlan, build_argument_binding_plan_from_components
 from gemma3_buffer_binding import Gemma3BufferBindingPlan, build_buffer_binding_plan_from_components
 from gemma3_npu_preflight import Gemma3NPUPreflightPlan, ProjectionPlan, build_preflight_plan
-from gemma3_npu_wiring import Gemma3NPUWiringPlan, build_wiring_plan_from_preflight
+from gemma3_npu_wiring import (
+    MODEL_KERNEL_LAUNCH_BLOCKER,
+    MODEL_SUBSTEP_SEQUENCE_BLOCKER,
+    Gemma3NPUWiringPlan,
+    build_wiring_plan_from_preflight,
+)
 from gemma3_norm_weight_plan import Gemma3NormWeightPlan, build_norm_weight_plan
 from gemma3_weight_plan import (
     Gemma3ProjectionWeightRecord,
@@ -241,6 +246,13 @@ def build_model_runner_plan_from_components(
         for index, step in enumerate(steps)
     ]
     blockers = list(MODEL_RUNNER_BLOCKERS)
+    if MODEL_SUBSTEP_SEQUENCE_BLOCKER in wiring.blockers:
+        blockers = [
+            MODEL_SUBSTEP_SEQUENCE_BLOCKER
+            if blocker == MODEL_KERNEL_LAUNCH_BLOCKER
+            else blocker
+            for blocker in blockers
+        ]
     if static_preload_validated:
         blockers = [
             blocker
@@ -317,6 +329,7 @@ def build_model_runner_plan(
         preflight,
         use_static_preload_evidence=static_preload_validated,
         use_bo_allocation_evidence=bo_allocation_validated,
+        use_first_kernel_launch_evidence=True,
     )
     buffer_binding_plan = build_buffer_binding_plan_from_components(
         model_variant=model_variant,
