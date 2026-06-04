@@ -230,7 +230,6 @@ def build_wiring_plan_from_preflight(
 
     blockers = [
         "model-kernel-launch-not-wired",
-        "model-kernel-argument-binding-not-validated",
     ]
     if not (
         use_static_preload_evidence

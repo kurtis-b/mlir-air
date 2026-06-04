@@ -25,8 +25,10 @@ The iGPU cells set `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` and use ROCm SMI
 for timed-window GPU rail sampling. CPU cells use direct RAPL sysfs package
 energy through the `power` group. iGPU CPU/total rails remain
 `MISSING_POWER_FIELD`; NPU timing and pseudo-NPU power remain blocked by model
-kernel launch, kernel argument binding, nonlinear model-stage promotion, and
-fresh paper-shape hardware reruns.
+kernel launch, nonlinear model-stage promotion, and fresh paper-shape hardware
+reruns. Kernel argument-layout validation is complete for the real 1B 1k/32k
+context model-runner plan: 572 NPU candidate layouts, 1,924 positional
+arguments, and zero binding blockers.
 
 `gemma3_1b_initial_1k_results.json` bundles these six cells, and
 `gemma3_1b_initial_1k_summary.md` / `gemma3_1b_initial_1k_summary.csv` contain
@@ -70,5 +72,4 @@ the generated paper-target comparison summary.
   RMSNorm/QK-Norm BF16 vectors for `gemma3-1b`, `gemma3-4b`, and the
   `gemma3-4b-vision` text stack were serialized and written into one contiguous
   XRT BO per variant. This is norm-weight preload evidence only; it is not
-  kernel argument binding, launch, correctness, timing, or paper-parity
-  evidence.
+  kernel launch, correctness, timing, or paper-parity evidence.

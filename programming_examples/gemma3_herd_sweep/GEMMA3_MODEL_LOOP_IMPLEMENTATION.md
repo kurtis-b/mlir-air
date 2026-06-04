@@ -83,8 +83,8 @@ Implemented files:
   NPU execution blocker from local artifacts.
 - `gemma3_npu_wiring.py`: real-shape per-layer execution wiring manifest that
   records prefill/decode stage roles, NPU kernel candidates, host fallbacks,
-  attention windows, and the remaining launch/argument-binding blockers without
-  claiming execution.
+  attention windows, and the remaining launch blockers without claiming
+  execution.
 - `gemma3_weight_plan.py`: text-stack static projection-weight planning for real
   safetensors, including Q4NX padded block counts and packed weight/scale/min
   byte estimates for future BO preloading.
@@ -101,9 +101,13 @@ Implemented files:
 - `gemma3_buffer_binding.py`: runtime buffer-binding manifest that assigns
   persistent BO keys, virtual intermediate keys, static-weight families, and
   layer-specific mutable KV-cache buffers per model stage.
+- `gemma3_argument_binding.py`: deterministic positional kernel argument-layout
+  validation for every NPU candidate stage, including persistent BOs, static
+  BOs, mutable KV buffers, virtual intermediates, shapes, dtypes, directions,
+  and missing-storage diagnostics.
 - `gemma3_model_runner.py`: launch-order manifest that composes BO planning,
-  static-preload planning, and per-layer kernel/fallback wiring without
-  claiming kernel execution.
+  static-preload planning, buffer bindings, argument layouts, and per-layer
+  kernel/fallback wiring without claiming kernel execution.
 
 Focused lit coverage:
 
@@ -123,6 +127,7 @@ Focused lit coverage:
 - `run_model_loop_static_preload.lit`
 - `run_model_loop_model_runner.lit`
 - `run_model_loop_buffer_binding.lit`
+- `run_model_loop_argument_binding.lit`
 - `../gemma3_dataflow_kernels/run_geglu_compile_only.lit`
 
 Current phase status:
@@ -303,9 +308,9 @@ The next implementation loops should stay on 1B 1k NPU text before expanding to
 
 | Priority | Target | Done when |
 | ---: | --- | --- |
-| 1 | Resolve `model-kernel-argument-binding-not-validated` | Every first-run NPU kernel candidate has a generated argument layout matched to bound BO keys and checked against the runtime launch order. |
+| 1 | Complete: resolve `model-kernel-argument-binding-not-validated` | `gemma3_argument_binding.py --self-test` validates 44 fixture NPU candidate layouts with 148 positional args and no missing storage; the real 1B 1k/32k-context plan validates 572 NPU candidate layouts with 1,924 positional args and zero argument-binding blockers. |
 | 2 | Resolve `model-kernel-launch-not-wired` | The model runner can launch one real NPU kernel from the 1B plan using the validated BO bindings, then one substep sequence, then one full layer. |
-| 3 | Reduce `nonlinear-model-stage-promotion-incomplete` | Each remaining nonlinear stage is either promoted through standalone NPU evidence and model launch/binding validation, or explicitly measured and classified as a timed host fallback. |
+| 3 | Reduce `nonlinear-model-stage-promotion-incomplete` | Each remaining nonlinear stage is either promoted through standalone NPU evidence and model launch validation, or explicitly measured and classified as a timed host fallback. |
 | 4 | Re-run 1B 1k NPU paper cells | Prefill and decode result JSONs contain real local NPU TTFT/TPS or a narrower, artifact-backed failure classification. |
 | 5 | Capture pseudo-NPU power | The NPU timed-window package watts and pre-run quiescent package watts are both readable through direct RAPL, and the result JSON records their delta. |
 | 6 | Expand cautiously | Only after 1B 1k NPU correctness, timing, and pseudo-power evidence is clean should the loop expand to more 1B lengths, 4B text, or vision. |
@@ -332,10 +337,10 @@ skip directly from manifests to full-model timing.
 1. Confirm prerequisites: full paper-shape BO allocation, full static projection
    preload, norm preload, buffer-binding manifest, and model-runner manifest are
    all present for `gemma3-1b`.
-2. Generate or validate a concrete argument-layout record for the first NPU
-   kernel candidate in the 1B prefill path. The record must name every BO key,
-   virtual intermediate, shape, dtype, layer index, KV slice, and static-weight
-   offset used by the launch.
+2. Generate or validate concrete argument-layout records for the 1B prefill
+   and decode NPU candidates. This is now implemented for storage, direction,
+   shape, dtype, layer index, and KV-buffer identity; static-weight sub-offsets
+   still need kernel-specific ABI plumbing during launch wiring.
 3. Launch one real kernel with real BO bindings and compare its output against
    the existing CPU reference for that stage. Save a small JSON/log artifact
    even if it fails.
@@ -649,9 +654,9 @@ Implemented evidence and blocker:
   correlation for 4B RMSNorm. This is a model-runner argument and launch-intent
   contract; it is not yet a validated
   model-timed norm-kernel launch.
-- Remaining work for full Phase E completion is model launch and argument-order
-  validation for the promoted GeGLU and norm paths, plus RoPE, residual, logits,
-  and sampling promotion or measured timing treatment in end-to-end execution.
+- Remaining work for full Phase E completion is model launch validation for
+  the promoted GeGLU and norm paths, plus RoPE, residual, logits, and sampling
+  promotion or measured timing treatment in end-to-end execution.
 
 ### Phase F: end-to-end 1B text reproduction
 
@@ -676,9 +681,12 @@ Acceptance:
 Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase F as `BLOCKED` because
-  local 1B artifacts are available but model-kernel launch, kernel argument
-  binding, nonlinear model-stage promotion, and fresh paper-shape hardware
-  reruns are not complete. Full paper-shape BO allocation validation is
+  local 1B artifacts are available but model-kernel launch, nonlinear
+  model-stage promotion, and fresh paper-shape hardware reruns are not complete.
+  Kernel argument-layout validation is complete for the real 1B 1k/32k-context
+  plan: 572 NPU candidate layouts and 1,924 positional arguments validate with
+  no missing storage, shape, dtype, direction, or KV-buffer identity blockers.
+  Full paper-shape BO allocation validation is
   complete for 1B, 4B text, and the 4B vision text stack under the
   benchmark-cell KV allocation plan. Full contiguous static-weight BO preload
   validation is complete for 1B, 4B text, and the 4B vision text stack. The
@@ -708,14 +716,15 @@ Blocked evidence:
   paper cell. The decode helper constructs the 1k KV cache before the timed
   window and times only 16 token-by-token decode steps. The matching 1k NPU
   result records remain blocked JSON cells with
-  `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` because model kernel launch, kernel
-  argument binding, nonlinear model-stage promotion, and fresh paper-shape
-  hardware reruns remain incomplete.
+  `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` because model kernel launch, nonlinear
+  model-stage promotion, and fresh paper-shape hardware reruns remain
+  incomplete.
   `gemma3_npu_preflight.py` records
   real projection padding and Q4NX block counts needed for NPU wiring.
   `gemma3_npu_wiring.py` maps each real-shape text layer into prefill/decode
   stage roles, NPU kernel candidates, host fallbacks, local/global attention
-  windows, and remaining launch/argument-binding blockers; GeGLU/MLP activation
+  windows, and remaining launch blockers; `gemma3_argument_binding.py` validates
+  the corresponding positional argument layouts; GeGLU/MLP activation
   is now represented as a model NPU candidate backed by standalone hardware
   smoke evidence, and the norm/residual ordering follows the local HF Gemma3
   decoder layer.
@@ -785,9 +794,9 @@ Acceptance:
 Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase G as `BLOCKED` because
-  local 4B artifacts are available but model-kernel launch, kernel argument
-  binding, nonlinear model-stage promotion, and fresh paper-shape hardware
-  reruns are not complete. Full paper-shape BO allocation validation is now
+  local 4B artifacts are available but model-kernel launch, nonlinear
+  model-stage promotion, and fresh paper-shape hardware reruns are not complete.
+  Full paper-shape BO allocation validation is now
   complete for 4B text under the benchmark-cell KV plan: prompt 32k/decode 128k
   allocates 85 BOs totaling 7,261,614,080 bytes on local Strix/XRT, including
   the dedicated static norm-weight BO. The old
@@ -796,16 +805,16 @@ Blocked evidence:
   BO, and stopped at `kv_cache_k` with `xrt-bo-allocation-failed` after
   allocating 4,454,893,568 bytes. Treat that preserved record as a failure of
   the simultaneous all-layer KV BO strategy, not proof that Strix cannot run
-  the benchmark. The next implementation path is kernel argument binding,
-  launch, correctness, schedule, and timing validation using the per-layer KV
-  BO contract. Measured host fallback
+  the benchmark. The next implementation path is kernel launch, correctness,
+  schedule, and timing validation using the per-layer KV BO contract. Measured
+  host fallback
   records account for timing metadata but do not replace nonlinear NPU
   validation.
 - `gemma3_npu_wiring.py` emits the 4B text per-layer NPU candidate and host
   fallback plan from local artifacts, including the 5-local/1-global attention
   pattern, but no 64k/128k local paper claim is emitted without kernel-launch
-  evidence, kernel argument-binding evidence, correctness, schedule data, and
-  timing data using the revised KV-cache allocation contract.
+  evidence, correctness, schedule data, and timing data using the revised
+  KV-cache allocation contract.
 
 ### Phase H: 4B vision path reproduction
 
@@ -831,8 +840,8 @@ Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase H as `BLOCKED` because
   local 4B vision artifacts and processor files are available but the model-kernel
-  launch, kernel argument binding, nonlinear model-stage promotion, fresh
-  paper-shape hardware reruns, and the vision NPU path are not complete.
+  launch, nonlinear model-stage promotion, fresh paper-shape hardware reruns,
+  and the vision NPU path are not complete.
   Paper-shape text-stack BO allocation is complete under the same
   benchmark-cell KV plan as 4B text: prompt 32k/decode 128k allocates 85 BOs
   totaling 7,261,614,080 bytes on local Strix/XRT, including the dedicated
@@ -950,11 +959,14 @@ Implemented evidence and blocker:
   `gemma3-4b-vision` text stack now have committed full contiguous-XRT preload
   evidence with no static-preload blockers.
 - `gemma3_buffer_binding.py` records that runtime BO and virtual-intermediate
-  binding is planned with no missing BO keys in the self-test fixture; remaining
-  model-runner binding risk is kernel argument-order validation.
+  binding is planned with no missing BO keys in the self-test fixture.
+- `gemma3_argument_binding.py` records deterministic positional argument layouts
+  for NPU candidates. The self-test validates 44 fixture candidate layouts with
+  148 positional arguments; the real 1B 1k/32k-context text plan validates 572
+  candidate layouts with 1,924 positional arguments and zero binding blockers.
 - `gemma3_model_runner.py` records launch-order state in result JSON so blocked
   paper cells distinguish BO planning, static preload planning, kernel launch,
-  host fallback, runtime buffer-binding state, and kernel argument-binding gaps.
+  host fallback, runtime buffer-binding state, and argument-layout status.
 - `gemma3_paper_compare.py --compare` accepts either a single result cell or a
   wrapper with `results`, and can emit Markdown and CSV summaries. The initial
   1B 1k CPU/iGPU measured cells plus NPU blocked cells are bundled in
@@ -1612,7 +1624,7 @@ Milestones:
   preloaded norm-weight BOs into the validated weighted RMSNorm wrapper for
   Gemma RMSNorm and QK-Norm in the model loop.
 - Keep the promoted GeGLU/MLP activation path as a model NPU candidate and
-  validate launch/argument binding before counting it in timed model results.
+  validate launch ABI against the generated argument layout before counting it in timed model results.
 - Add residual/add/multiply vector kernels only when they reduce host fallback
   cost without changing tensor contracts.
 

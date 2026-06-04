@@ -5,8 +5,8 @@
 """Gemma3 model-loop runtime buffer binding plan.
 
 The binding plan assigns persistent BO keys and virtual intermediate keys to
-each per-layer prefill/decode stage. It does not bind compiled kernel argument
-orders or launch kernels; that remains a separate validation blocker.
+each per-layer prefill/decode stage. Positional kernel argument-order validation
+is handled by gemma3_argument_binding.py; launch execution remains separate.
 """
 
 from __future__ import annotations
@@ -199,8 +199,7 @@ def _stage_binding(stage: Gemma3NPUStage, bo_keys: set[str]) -> Gemma3BufferBind
     blockers = ()
     status = "BUFFER_BINDING_PLANNED"
     if stage.backend == "npu-candidate":
-        blockers = ("model-kernel-argument-binding-not-validated",)
-        status = "KERNEL_ARGUMENT_BINDING_PLANNED"
+        status = "BUFFER_BINDING_READY_FOR_ARGUMENT_LAYOUT"
     return Gemma3BufferBinding(
         phase=stage.phase,
         layer_index=stage.layer_index,
@@ -246,7 +245,7 @@ def build_buffer_binding_plan_from_components(
     if missing:
         blockers.append("missing-runtime-bo-binding")
     if any(binding.blockers for binding in bindings):
-        blockers.append("model-kernel-argument-binding-not-validated")
+        blockers.append("runtime-buffer-binding-blocked")
     return Gemma3BufferBindingPlan(
         model_variant=model_variant,
         status="READY_FOR_MODEL_RUNNER" if not missing else "BLOCKED",
@@ -378,7 +377,7 @@ def _self_test() -> None:
         raise AssertionError(plan.persistent_bo_count)
     if plan.static_weight_family_count != 13:
         raise AssertionError(plan.static_weight_family_count)
-    if "model-kernel-argument-binding-not-validated" not in plan.blockers:
+    if plan.blockers:
         raise AssertionError(plan.blockers)
     print(plan.format(include_bindings=True))
     print("GEMMA3_BUFFER_BINDING_SELF_TEST: PASS")
