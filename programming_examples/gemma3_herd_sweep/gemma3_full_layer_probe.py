@@ -1,0 +1,683 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026, Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Gemma3 real-weight staged decode full-layer probe.
+
+This diagnostic wires one Gemma3 1B layer-0 decode pass with real weights. The
+projection stages launch on the NPU through the FusedDQP column-block route; the
+remaining nonlinear/vector stages are explicit host fallbacks. This is full-layer
+staged correctness evidence, not a full model loop, TTFT/TPS timing, pseudo-NPU
+power, or a paper-parity result.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, dataclass
+import json
+from pathlib import Path
+import sys
+import time
+
+from gemma3_artifacts import MODEL_SPECS
+from gemma3_qkv_substep_probe import _projection_backend_options
+from gemma3_substep_probe import (
+    DEFAULT_INPUT_DISTRIBUTION,
+    DEFAULT_LAYER,
+    DEFAULT_MODEL,
+    DEFAULT_NORM_TENSOR_KEY,
+    DEFAULT_OUTPUT_FORMAT,
+    DEFAULT_PHASE,
+    DEFAULT_THRESHOLD,
+    _activate_probe_env,
+    _correlation,
+    _git_info,
+    _load_safetensor_array,
+    _load_static_norm_payload,
+    _repo_root,
+    _resolve_weights_dir,
+    _run_elf_with_runner_bos,
+    _shape_text,
+    _tail,
+)
+
+DEFAULT_SEQUENCE_KIND = "decode-full-layer-staged"
+DEFAULT_FULL_LAYER_PROBE_EVIDENCE = (
+    Path(__file__).with_name("results")
+    / "gemma3_1b_decode_full_layer_probe.json"
+)
+FULL_LAYER_PROJECTION_FAMILIES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
+PROJECTION_SHAPES = {
+    "q_proj": (1024, 1152),
+    "k_proj": (256, 1152),
+    "v_proj": (256, 1152),
+    "o_proj": (1152, 1024),
+    "gate_proj": (6912, 1152),
+    "up_proj": (6912, 1152),
+    "down_proj": (1152, 6912),
+}
+PROJECTION_OUTPUT_SHAPES = {
+    "q_proj": (1024,),
+    "k_proj": (256,),
+    "v_proj": (256,),
+    "o_proj": (1152,),
+    "gate_proj": (6912,),
+    "up_proj": (6912,),
+    "down_proj": (1152,),
+}
+NORM_TENSOR_KEYS = {
+    "input_layernorm": "model.layers.0.input_layernorm.weight",
+    "q_norm": "model.layers.0.self_attn.q_norm.weight",
+    "k_norm": "model.layers.0.self_attn.k_norm.weight",
+    "post_attention_layernorm": "model.layers.0.post_attention_layernorm.weight",
+    "pre_feedforward_layernorm": "model.layers.0.pre_feedforward_layernorm.weight",
+    "post_feedforward_layernorm": "model.layers.0.post_feedforward_layernorm.weight",
+}
+
+
+@dataclass(frozen=True)
+class ProjectionEvidence:
+    family: str
+    tensor_key: str
+    shape: tuple[int, int]
+    padded_shape: tuple[int, int]
+    row_blocks: int
+    col_blocks: int
+    projection_correlation: float | None
+    dense_projection_correlation: float | None
+
+
+@dataclass(frozen=True)
+class Gemma3FullLayerProbeResult:
+    schema_version: int
+    model_variant: str
+    status: str
+    sequence_kind: str
+    phase: str
+    layer_index: int
+    stages: tuple[str, ...]
+    input_shape: tuple[int, ...]
+    output_shape: tuple[int, ...]
+    output_format: str
+    bo_binding_mode: str
+    norm_tensor_keys: dict[str, str]
+    projection_tensor_keys: dict[str, str]
+    projection_weight_layout: str
+    host_fallbacks: tuple[str, ...]
+    input_distribution: str
+    rms_correlation: float | None
+    projection_evidence: tuple[ProjectionEvidence, ...]
+    attention_correlation: float | None
+    mlp_activation_correlation: float | None
+    final_output_correlation: float | None
+    dense_final_output_correlation: float | None
+    threshold: float
+    remaining_model_runner_gaps: tuple[str, ...]
+    command: tuple[str, ...]
+    returncode: int | None
+    elapsed_seconds: float | None
+    blockers: tuple[str, ...]
+    git_commit: str | None
+    dirty_worktree: bool | None
+    stdout_tail: tuple[str, ...]
+    stderr_tail: tuple[str, ...]
+
+    @staticmethod
+    def _corr_text(value: float | None) -> str:
+        return "n/a" if value is None else f"{value:.6f}"
+
+    def format(self) -> str:
+        blockers = ",".join(self.blockers) if self.blockers else "none"
+        gaps = (
+            ",".join(self.remaining_model_runner_gaps)
+            if self.remaining_model_runner_gaps
+            else "none"
+        )
+        stages = "|".join(self.stages) if self.stages else "none"
+        host_fallbacks = "|".join(self.host_fallbacks) if self.host_fallbacks else "none"
+        projection_corrs = "|".join(
+            f"{item.family}:{self._corr_text(item.projection_correlation)}"
+            for item in self.projection_evidence
+        )
+        dense_corrs = "|".join(
+            f"{item.family}:{self._corr_text(item.dense_projection_correlation)}"
+            for item in self.projection_evidence
+        )
+        return (
+            f"full_layer_probe model={self.model_variant} status={self.status} "
+            f"sequence={self.sequence_kind} phase={self.phase} layer=L{self.layer_index} "
+            f"stages={stages} input={_shape_text(self.input_shape)} "
+            f"output={_shape_text(self.output_shape)} output_format={self.output_format} "
+            f"bo_binding={self.bo_binding_mode} weight_layout={self.projection_weight_layout} "
+            f"host_fallbacks={host_fallbacks} input_distribution={self.input_distribution} "
+            f"rms_correlation={self._corr_text(self.rms_correlation)} "
+            f"projection_correlations={projection_corrs} "
+            f"dense_projection_correlations={dense_corrs} "
+            f"attention_correlation={self._corr_text(self.attention_correlation)} "
+            f"mlp_activation_correlation={self._corr_text(self.mlp_activation_correlation)} "
+            f"final_output_correlation={self._corr_text(self.final_output_correlation)} "
+            f"dense_final_output_correlation={self._corr_text(self.dense_final_output_correlation)} "
+            f"threshold={self.threshold:g} model_runner_gaps={gaps} blockers={blockers}"
+        )
+
+    def to_json_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+def _is_decode_full_layer_evidence(data: object, *, model_variant: str) -> bool:
+    if not isinstance(data, dict):
+        return False
+    return (
+        data.get("schema_version") == 1
+        and data.get("model_variant") == model_variant
+        and data.get("status") == "FULL_LAYER_SEQUENCE_PASS"
+        and data.get("sequence_kind") == DEFAULT_SEQUENCE_KIND
+        and data.get("phase") == DEFAULT_PHASE
+        and data.get("layer_index") == DEFAULT_LAYER
+        and data.get("output_format") == DEFAULT_OUTPUT_FORMAT
+        and data.get("bo_binding_mode") == "runner-owned-persistent-bo"
+        and not data.get("blockers")
+        and "full-1b-loop-not-wired" in tuple(data.get("remaining_model_runner_gaps", ()))
+    )
+
+
+def has_decode_full_layer_evidence(
+    model_variant: str,
+    path: Path | None = None,
+) -> bool:
+    evidence_path = path or DEFAULT_FULL_LAYER_PROBE_EVIDENCE
+    try:
+        data = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return _is_decode_full_layer_evidence(data, model_variant=model_variant)
+
+
+def _ceil_to(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def _projection_tensor_keys(model_variant: str, weights_dir: Path) -> dict[str, str]:
+    from gemma3_weight_plan import build_weight_plan
+
+    plan = build_weight_plan(model_variant, weights_dir=weights_dir)
+    keys = {}
+    for record in plan.records:
+        if record.layer_index == DEFAULT_LAYER and record.family in FULL_LAYER_PROJECTION_FAMILIES:
+            keys[record.family] = record.tensor_key
+    missing = [family for family in FULL_LAYER_PROJECTION_FAMILIES if family not in keys]
+    if missing:
+        raise RuntimeError(f"missing layer-0 projection tensors: {missing}")
+    return keys
+
+
+def _repack_matrix_for_fused_dqp(weight, *, row_block_multiple: int = 8):
+    import numpy as np
+    from ml_dtypes import bfloat16
+    from common import Q4NX_COLS, Q4NX_ROWS, pack_int4_low_first
+
+    rows, cols = weight.shape
+    padded_rows = _ceil_to(_ceil_to(int(rows), Q4NX_ROWS) // Q4NX_ROWS, row_block_multiple) * Q4NX_ROWS
+    padded_cols = _ceil_to(int(cols), Q4NX_COLS)
+    row_blocks = padded_rows // Q4NX_ROWS
+    col_blocks = padded_cols // Q4NX_COLS
+    padded = np.zeros((padded_rows, padded_cols), dtype=np.float32)
+    padded[:rows, :cols] = weight.astype(np.float32)
+    packed = np.empty(
+        (row_blocks, col_blocks, Q4NX_ROWS * Q4NX_COLS // 2),
+        dtype=np.int8,
+    )
+    scale = np.empty((row_blocks, col_blocks, Q4NX_COLS), dtype=bfloat16)
+    min_offset = np.empty((row_blocks, col_blocks, Q4NX_COLS), dtype=bfloat16)
+    for rb in range(row_blocks):
+        r0 = rb * Q4NX_ROWS
+        r1 = r0 + Q4NX_ROWS
+        for cb in range(col_blocks):
+            c0 = cb * Q4NX_COLS
+            c1 = c0 + Q4NX_COLS
+            block = padded[r0:r1, c0:c1]
+            mn = block.min(axis=0)
+            mx = block.max(axis=0)
+            sc = (mx - mn) / 15.0
+            quant_scale = np.where(sc == 0.0, 1.0, sc)
+            q = np.rint((block - mn[None, :]) / quant_scale[None, :])
+            q = np.clip(q, 0, 15).astype(np.uint8)
+            packed[rb, cb] = pack_int4_low_first(q).view(np.int8)
+            scale[rb, cb] = sc.astype(bfloat16)
+            min_offset[rb, cb] = mn.astype(bfloat16)
+    return packed, scale, min_offset, padded
+
+
+def _run_projection(
+    *,
+    family: str,
+    weight,
+    activation,
+    object_file: Path,
+):
+    import numpy as np
+    from ml_dtypes import bfloat16
+    from common import fused_dqp_paper_reference
+    from fused_dqp import _pack_l3_inputs, build_paper_module
+
+    expected_shape = PROJECTION_SHAPES[family]
+    if tuple(weight.shape) != expected_shape:
+        raise RuntimeError(f"expected {family} shape {expected_shape}, got {weight.shape}")
+    out_dim, in_dim = expected_shape
+    packed, scale, min_offset, padded_weight = _repack_matrix_for_fused_dqp(weight)
+    row_blocks, col_blocks = packed.shape[:2]
+    activation_padded = np.zeros((col_blocks * 256,), dtype=bfloat16)
+    activation_padded[:in_dim] = activation.reshape(-1).astype(bfloat16)
+    activation_blocks = activation_padded.reshape(col_blocks, 256)
+    module = build_paper_module(
+        32,
+        256,
+        "fused_dqp_accum_block_opt",
+        str(object_file),
+        row_blocks,
+        1,
+        2,
+        4,
+        "direct",
+    )
+    expected = fused_dqp_paper_reference(
+        packed,
+        scale,
+        min_offset,
+        activation_blocks,
+        32,
+        256,
+    )
+    accum = np.zeros(expected.shape, dtype=np.float32)
+    for col_block in range(col_blocks):
+        cb_slice = slice(col_block, col_block + 1)
+        params = np.empty((row_blocks, 1, 512), dtype=bfloat16)
+        params[..., :256] = scale[:, cb_slice, :]
+        params[..., 256:] = min_offset[:, cb_slice, :]
+        packed_l3 = _pack_l3_inputs(packed[:, cb_slice, :], params).reshape(
+            row_blocks // 4,
+            4,
+            1,
+            -1,
+        )
+        partial = _run_elf_with_runner_bos(
+            mlir_module=module,
+            backend_options=_projection_backend_options(),
+            inputs=[packed_l3, activation_blocks[cb_slice, :]],
+            output_shape=expected.shape,
+            output_dtype=bfloat16,
+        )
+        accum += partial.astype(np.float32)
+    actual_padded = accum.astype(bfloat16).reshape(-1)
+    expected_padded = expected.reshape(-1)
+    actual = actual_padded[:out_dim].astype(bfloat16)
+    expected_vec = expected_padded[:out_dim].astype(bfloat16)
+    dense_expected = (weight.astype(np.float32) @ activation.reshape(-1).astype(np.float32)).astype(bfloat16)
+    projection_corr = _correlation(actual, expected_vec)
+    dense_corr = _correlation(actual, dense_expected)
+    evidence = ProjectionEvidence(
+        family=family,
+        tensor_key="",
+        shape=expected_shape,
+        padded_shape=tuple(int(dim) for dim in padded_weight.shape),
+        row_blocks=int(row_blocks),
+        col_blocks=int(col_blocks),
+        projection_correlation=projection_corr,
+        dense_projection_correlation=dense_corr,
+    )
+    return actual, expected_vec, dense_expected, evidence
+
+
+def _rms_host(x, weight, eps: float = 1e-5):
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    xf = x.astype(np.float32)
+    wf = weight.astype(np.float32)
+    rms = np.sqrt(np.mean(xf * xf, axis=-1, keepdims=True) + eps)
+    return ((xf / rms) * wf).astype(bfloat16)
+
+
+def _gelu_tanh(x):
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    xf = x.astype(np.float32)
+    inner = 0.7978845608 * (xf + 0.044715 * xf * xf * xf)
+    return (0.5 * xf * (1.0 + np.tanh(inner))).astype(bfloat16)
+
+
+def _geglu(gate, up):
+    from ml_dtypes import bfloat16
+
+    return (_gelu_tanh(gate).astype("float32") * up.astype("float32")).astype(bfloat16)
+
+
+def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResult:
+    _activate_probe_env()
+    import numpy as np
+    from ml_dtypes import bfloat16
+    from weighted_rms_norm import build_module as build_rms_module
+    from weighted_rms_norm import rms_norm_reference
+
+    repo = _repo_root()
+    git_commit, dirty = _git_info(repo)
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    blockers: list[str] = []
+    projection_keys: dict[str, str] = {}
+    projection_evidence: list[ProjectionEvidence] = []
+    start = time.perf_counter()
+
+    try:
+        weights_dir = _resolve_weights_dir(args.model_variant, args.weights_dir)
+        norm_payload, input_norm_weight, norm_offset = _load_static_norm_payload(
+            weights_dir,
+            args.model_variant,
+            args.norm_tensor_key,
+        )
+        norm_weights = {
+            name: _load_safetensor_array(weights_dir, key).astype(bfloat16).reshape(-1)
+            for name, key in NORM_TENSOR_KEYS.items()
+        }
+        projection_keys = _projection_tensor_keys(args.model_variant, weights_dir)
+        object_file = Path(__file__).with_name("build_peano") / "fused_dqp.o"
+        if not object_file.exists():
+            raise RuntimeError(f"missing FusedDQP object file: {object_file}")
+
+        rng = np.random.default_rng(0)
+        x_input = rng.uniform(-0.5, 0.5, size=(1, 1152)).astype(bfloat16)
+        norm_expected = rms_norm_reference(x_input, input_norm_weight)
+        rms_module = build_rms_module(1, 1152, bfloat16, 16, herd_x=1)
+        norm_actual = _run_elf_with_runner_bos(
+            mlir_module=rms_module,
+            backend_options=dict(
+                verbose=False,
+                omit_while_true_loop=False,
+                output_format=DEFAULT_OUTPUT_FORMAT,
+                instance_name="weighted_rms_norm",
+                runtime_loop_tiling_sizes=[4, 4],
+            ),
+            inputs=[x_input, norm_payload],
+            output_shape=norm_expected.shape,
+            output_dtype=bfloat16,
+        )
+        rms_correlation = _correlation(norm_actual, norm_expected)
+        stdout_lines.append(f"RMSNorm correlation: {rms_correlation:.6f}")
+        if rms_correlation < DEFAULT_THRESHOLD:
+            blockers.append("decode-rmsnorm-correlation-low")
+
+        actual: dict[str, object] = {"input_norm": norm_actual.reshape(-1)}
+        expected: dict[str, object] = {"input_norm": norm_expected.reshape(-1)}
+        dense: dict[str, object] = {}
+        for family in ("q_proj", "k_proj", "v_proj"):
+            weight = _load_safetensor_array(weights_dir, projection_keys[family])
+            actual_vec, expected_vec, dense_vec, evidence = _run_projection(
+                family=family,
+                weight=weight,
+                activation=actual["input_norm"],
+                object_file=object_file,
+            )
+            projection_evidence.append(
+                ProjectionEvidence(
+                    family=evidence.family,
+                    tensor_key=projection_keys[family],
+                    shape=evidence.shape,
+                    padded_shape=evidence.padded_shape,
+                    row_blocks=evidence.row_blocks,
+                    col_blocks=evidence.col_blocks,
+                    projection_correlation=evidence.projection_correlation,
+                    dense_projection_correlation=evidence.dense_projection_correlation,
+                )
+            )
+            actual[family] = actual_vec
+            expected[family] = expected_vec
+            dense[family] = dense_vec
+            stdout_lines.append(f"{family} correlation: {evidence.projection_correlation:.6f}")
+            if evidence.projection_correlation is None or evidence.projection_correlation < DEFAULT_THRESHOLD:
+                blockers.append(f"decode-{family}-correlation-low")
+
+        q_actual = actual["q_proj"].reshape(4, 256)
+        k_actual = actual["k_proj"].reshape(1, 256)
+        v_actual = actual["v_proj"].reshape(1, 256)
+        q_expected = expected["q_proj"].reshape(4, 256)
+        k_expected = expected["k_proj"].reshape(1, 256)
+        v_expected = expected["v_proj"].reshape(1, 256)
+
+        # current_pos=0 makes half-split RoPE an identity; keep the host stage explicit.
+        qn_actual = _rms_host(q_actual, norm_weights["q_norm"])
+        kn_actual = _rms_host(k_actual, norm_weights["k_norm"])
+        qn_expected = _rms_host(q_expected, norm_weights["q_norm"])
+        kn_expected = _rms_host(k_expected, norm_weights["k_norm"])
+        _ = qn_actual, kn_actual, qn_expected, kn_expected
+        attention_actual = np.tile(v_actual.reshape(1, 256), (4, 1)).reshape(1024).astype(bfloat16)
+        attention_expected = np.tile(v_expected.reshape(1, 256), (4, 1)).reshape(1024).astype(bfloat16)
+        attention_correlation = _correlation(attention_actual, attention_expected)
+
+        o_weight = _load_safetensor_array(weights_dir, projection_keys["o_proj"])
+        o_actual, o_expected, o_dense, evidence = _run_projection(
+            family="o_proj",
+            weight=o_weight,
+            activation=attention_actual,
+            object_file=object_file,
+        )
+        projection_evidence.append(
+            ProjectionEvidence(evidence.family, projection_keys["o_proj"], evidence.shape, evidence.padded_shape, evidence.row_blocks, evidence.col_blocks, evidence.projection_correlation, evidence.dense_projection_correlation)
+        )
+        stdout_lines.append(f"o_proj correlation: {evidence.projection_correlation:.6f}")
+        if evidence.projection_correlation is None or evidence.projection_correlation < DEFAULT_THRESHOLD:
+            blockers.append("decode-o_proj-correlation-low")
+
+        post_attention_actual = _rms_host(o_actual.reshape(1, 1152), norm_weights["post_attention_layernorm"])
+        post_attention_expected = _rms_host(o_expected.reshape(1, 1152), norm_weights["post_attention_layernorm"])
+        residual_actual = (x_input.astype(np.float32) + post_attention_actual.astype(np.float32)).astype(bfloat16)
+        residual_expected = (x_input.astype(np.float32) + post_attention_expected.astype(np.float32)).astype(bfloat16)
+
+        pre_ff_actual = _rms_host(residual_actual, norm_weights["pre_feedforward_layernorm"])
+        pre_ff_expected = _rms_host(residual_expected, norm_weights["pre_feedforward_layernorm"])
+        gate_actual, gate_expected, _, gate_evidence = _run_projection(
+            family="gate_proj",
+            weight=_load_safetensor_array(weights_dir, projection_keys["gate_proj"]),
+            activation=pre_ff_actual.reshape(-1),
+            object_file=object_file,
+        )
+        up_actual, up_expected, _, up_evidence = _run_projection(
+            family="up_proj",
+            weight=_load_safetensor_array(weights_dir, projection_keys["up_proj"]),
+            activation=pre_ff_actual.reshape(-1),
+            object_file=object_file,
+        )
+        for fam, ev in (("gate_proj", gate_evidence), ("up_proj", up_evidence)):
+            projection_evidence.append(
+                ProjectionEvidence(ev.family, projection_keys[fam], ev.shape, ev.padded_shape, ev.row_blocks, ev.col_blocks, ev.projection_correlation, ev.dense_projection_correlation)
+            )
+            stdout_lines.append(f"{fam} correlation: {ev.projection_correlation:.6f}")
+            if ev.projection_correlation is None or ev.projection_correlation < DEFAULT_THRESHOLD:
+                blockers.append(f"decode-{fam}-correlation-low")
+        mlp_actual = _geglu(gate_actual, up_actual)
+        mlp_expected = _geglu(gate_expected, up_expected)
+        mlp_activation_correlation = _correlation(mlp_actual, mlp_expected)
+
+        down_actual, down_expected, _, down_evidence = _run_projection(
+            family="down_proj",
+            weight=_load_safetensor_array(weights_dir, projection_keys["down_proj"]),
+            activation=mlp_actual,
+            object_file=object_file,
+        )
+        projection_evidence.append(
+            ProjectionEvidence(down_evidence.family, projection_keys["down_proj"], down_evidence.shape, down_evidence.padded_shape, down_evidence.row_blocks, down_evidence.col_blocks, down_evidence.projection_correlation, down_evidence.dense_projection_correlation)
+        )
+        stdout_lines.append(f"down_proj correlation: {down_evidence.projection_correlation:.6f}")
+        if down_evidence.projection_correlation is None or down_evidence.projection_correlation < DEFAULT_THRESHOLD:
+            blockers.append("decode-down_proj-correlation-low")
+
+        post_ff_actual = _rms_host(down_actual.reshape(1, 1152), norm_weights["post_feedforward_layernorm"])
+        post_ff_expected = _rms_host(down_expected.reshape(1, 1152), norm_weights["post_feedforward_layernorm"])
+        output_actual = (residual_actual.astype(np.float32) + post_ff_actual.astype(np.float32)).astype(bfloat16).reshape(-1)
+        output_expected = (residual_expected.astype(np.float32) + post_ff_expected.astype(np.float32)).astype(bfloat16).reshape(-1)
+        final_output_correlation = _correlation(output_actual, output_expected)
+        dense_final_output_correlation = None
+        stdout_lines.append(f"final output correlation: {final_output_correlation:.6f}")
+        if final_output_correlation < DEFAULT_THRESHOLD:
+            blockers.append("decode-full-layer-output-correlation-low")
+        returncode = 0 if not blockers else 1
+    except Exception as exc:
+        blockers.append(f"decode-full-layer-probe-failed:{exc}")
+        rms_correlation = None
+        attention_correlation = None
+        mlp_activation_correlation = None
+        final_output_correlation = None
+        dense_final_output_correlation = None
+        norm_offset = None
+        norm_payload = None
+        returncode = 1
+        stderr_lines.append(str(exc))
+
+    elapsed = time.perf_counter() - start
+    status = "FULL_LAYER_SEQUENCE_PASS" if not blockers else "FULL_LAYER_SEQUENCE_BLOCKED"
+    return Gemma3FullLayerProbeResult(
+        schema_version=1,
+        model_variant=args.model_variant,
+        status=status,
+        sequence_kind=DEFAULT_SEQUENCE_KIND,
+        phase=DEFAULT_PHASE,
+        layer_index=DEFAULT_LAYER,
+        stages=(
+            "decode:L0:pre_attention_norm",
+            "decode:L0:qkv_projection",
+            "decode:L0:qk_norm",
+            "decode:L0:rope_identity_pos0",
+            "decode:L0:single_token_attention_host",
+            "decode:L0:output_projection",
+            "decode:L0:post_attention_norm",
+            "decode:L0:attention_residual",
+            "decode:L0:pre_feedforward_norm",
+            "decode:L0:mlp_gate_up_projection",
+            "decode:L0:mlp_activation",
+            "decode:L0:mlp_down_projection",
+            "decode:L0:post_feedforward_norm",
+            "decode:L0:mlp_residual",
+        ),
+        input_shape=(1, 1152),
+        output_shape=(1152,),
+        output_format=DEFAULT_OUTPUT_FORMAT,
+        bo_binding_mode="runner-owned-persistent-bo",
+        norm_tensor_keys=NORM_TENSOR_KEYS,
+        projection_tensor_keys=projection_keys,
+        projection_weight_layout="fused-dqp-paper-repacked-full-layer-colblock-loop",
+        host_fallbacks=("qk_norm", "rope", "single_token_attention", "post_attention_norm", "residual_add", "pre_feedforward_norm", "mlp_activation", "post_feedforward_norm"),
+        input_distribution=DEFAULT_INPUT_DISTRIBUTION,
+        rms_correlation=rms_correlation,
+        projection_evidence=tuple(projection_evidence),
+        attention_correlation=attention_correlation,
+        mlp_activation_correlation=mlp_activation_correlation,
+        final_output_correlation=final_output_correlation,
+        dense_final_output_correlation=dense_final_output_correlation,
+        threshold=DEFAULT_THRESHOLD,
+        remaining_model_runner_gaps=("full-1b-loop-not-wired",),
+        command=tuple(sys.argv),
+        returncode=returncode,
+        elapsed_seconds=elapsed,
+        blockers=tuple(dict.fromkeys(blockers)),
+        git_commit=git_commit,
+        dirty_worktree=dirty,
+        stdout_tail=_tail("\n".join(stdout_lines)),
+        stderr_tail=_tail("\n".join(stderr_lines)),
+    )
+
+
+def _self_test() -> None:
+    projection_evidence = tuple(
+        ProjectionEvidence(
+            family=family,
+            tensor_key=f"model.layers.0.fixture.{family}.weight",
+            shape=PROJECTION_SHAPES[family],
+            padded_shape=PROJECTION_SHAPES[family],
+            row_blocks=8,
+            col_blocks=1,
+            projection_correlation=1.0,
+            dense_projection_correlation=0.995,
+        )
+        for family in FULL_LAYER_PROJECTION_FAMILIES
+    )
+    result = Gemma3FullLayerProbeResult(
+        schema_version=1,
+        model_variant=DEFAULT_MODEL,
+        status="FULL_LAYER_SEQUENCE_PASS",
+        sequence_kind=DEFAULT_SEQUENCE_KIND,
+        phase=DEFAULT_PHASE,
+        layer_index=DEFAULT_LAYER,
+        stages=("decode:L0:pre_attention_norm", "decode:L0:qkv_projection", "decode:L0:mlp_residual"),
+        input_shape=(1, 1152),
+        output_shape=(1152,),
+        output_format=DEFAULT_OUTPUT_FORMAT,
+        bo_binding_mode="runner-owned-persistent-bo",
+        norm_tensor_keys=NORM_TENSOR_KEYS,
+        projection_tensor_keys={family: f"model.layers.0.fixture.{family}.weight" for family in FULL_LAYER_PROJECTION_FAMILIES},
+        projection_weight_layout="fused-dqp-paper-repacked-full-layer-colblock-loop",
+        host_fallbacks=("qk_norm", "rope", "single_token_attention", "mlp_activation"),
+        input_distribution=DEFAULT_INPUT_DISTRIBUTION,
+        rms_correlation=0.999991,
+        projection_evidence=projection_evidence,
+        attention_correlation=1.0,
+        mlp_activation_correlation=1.0,
+        final_output_correlation=0.999998,
+        dense_final_output_correlation=None,
+        threshold=DEFAULT_THRESHOLD,
+        remaining_model_runner_gaps=("full-1b-loop-not-wired",),
+        command=("python3", "gemma3_full_layer_probe.py", "--self-test"),
+        returncode=0,
+        elapsed_seconds=0.125,
+        blockers=(),
+        git_commit="fixture",
+        dirty_worktree=False,
+        stdout_tail=("final output correlation: 0.999998",),
+        stderr_tail=(),
+    )
+    if result.status != "FULL_LAYER_SEQUENCE_PASS":
+        raise AssertionError(result)
+    if not _is_decode_full_layer_evidence(result.to_json_dict(), model_variant=DEFAULT_MODEL):
+        raise AssertionError(result.to_json_dict())
+    stale = dict(result.to_json_dict())
+    stale["remaining_model_runner_gaps"] = ["full-layer-not-wired"]
+    if _is_decode_full_layer_evidence(stale, model_variant=DEFAULT_MODEL):
+        raise AssertionError(stale)
+    print(result.format())
+    print("GEMMA3_FULL_LAYER_PROBE_SELF_TEST: PASS")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Gemma3 staged decode full-layer probe")
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--run-hardware", action="store_true")
+    parser.add_argument("--model-variant", choices=sorted(MODEL_SPECS), default=DEFAULT_MODEL)
+    parser.add_argument("--weights-dir", type=Path)
+    parser.add_argument("--norm-tensor-key", default=DEFAULT_NORM_TENSOR_KEY)
+    parser.add_argument("--result-json", type=Path)
+    args = parser.parse_args()
+
+    if args.self_test:
+        _self_test()
+        return 0
+    if not args.run_hardware:
+        raise SystemExit("pass --run-hardware to touch the NPU; --self-test is hardware-free")
+    result = _run_hardware_sequence(args)
+    print(result.format())
+    if args.result_json:
+        args.result_json.parent.mkdir(parents=True, exist_ok=True)
+        args.result_json.write_text(json.dumps(result.to_json_dict(), indent=2, sort_keys=True) + "\n")
+        print(f"GEMMA3_FULL_LAYER_PROBE_JSON: {args.result_json}")
+    return 0 if result.status == "FULL_LAYER_SEQUENCE_PASS" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

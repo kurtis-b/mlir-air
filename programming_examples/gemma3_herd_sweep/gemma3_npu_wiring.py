@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 
 from gemma3_artifacts import MODEL_SPECS
+from gemma3_full_layer_probe import has_decode_full_layer_evidence
 from gemma3_kernel_parity import kernel_parity_targets
 from gemma3_launch_probe import has_runner_owned_first_kernel_launch_evidence
 from gemma3_nonlinears import nonlinear_registry
@@ -31,6 +32,7 @@ MODEL_KERNEL_LAUNCH_BLOCKER = "model-kernel-launch-not-wired"
 MODEL_SUBSTEP_SEQUENCE_BLOCKER = "model-substep-sequence-not-wired"
 MODEL_FULL_QKV_SUBSTEP_BLOCKER = "model-full-qkv-substep-not-wired"
 MODEL_FULL_LAYER_BLOCKER = "model-full-layer-not-wired"
+MODEL_FULL_1B_LOOP_BLOCKER = "full-1b-loop-not-wired"
 
 
 TEXT_STAGE_TEMPLATE = (
@@ -214,6 +216,7 @@ def build_wiring_plan_from_preflight(
     use_first_kernel_launch_evidence: bool = False,
     use_decode_q_projection_substep_evidence: bool = False,
     use_decode_qkv_substep_evidence: bool = False,
+    use_decode_full_layer_evidence: bool = False,
 ) -> Gemma3NPUWiringPlan:
     if preflight.layers is None or preflight.hidden_size is None or preflight.head_dim is None:
         raise ValueError("preflight plan must include layer count, hidden size, and head dim")
@@ -230,6 +233,10 @@ def build_wiring_plan_from_preflight(
     decode_qkv_substep_validated = (
         use_decode_qkv_substep_evidence
         and has_decode_qkv_substep_evidence(preflight.model_variant)
+    )
+    decode_full_layer_validated = (
+        use_decode_full_layer_evidence
+        and has_decode_full_layer_evidence(preflight.model_variant)
     )
     window_len = int(preflight.sliding_window or 0)
     stages: list[Gemma3NPUStage] = []
@@ -251,6 +258,30 @@ def build_wiring_plan_from_preflight(
                 first_kernel_stage_validated=first_kernel_stage_validated,
             )
             if (
+                decode_full_layer_validated
+                and phase == "decode"
+                and layer_index == 0
+                and role
+                in (
+                    "pre_attention_norm",
+                    "qkv_projection",
+                    "qk_norm",
+                    "rope",
+                    "attention",
+                    "output_projection",
+                    "post_attention_norm",
+                    "attention_residual",
+                    "pre_feedforward_norm",
+                    "mlp_gate_up_projection",
+                    "mlp_activation",
+                    "mlp_down_projection",
+                    "post_feedforward_norm",
+                    "mlp_residual",
+                )
+            ):
+                status = "runner-owned-decode-full-layer-staged-pass"
+                blockers = ()
+            elif (
                 decode_qkv_substep_validated
                 and phase == "decode"
                 and layer_index == 0
@@ -283,7 +314,9 @@ def build_wiring_plan_from_preflight(
                 )
             )
 
-    if decode_qkv_substep_validated:
+    if decode_full_layer_validated:
+        blockers = [MODEL_FULL_1B_LOOP_BLOCKER]
+    elif decode_qkv_substep_validated:
         blockers = [MODEL_FULL_LAYER_BLOCKER]
     elif decode_q_projection_substep_validated:
         blockers = [MODEL_FULL_QKV_SUBSTEP_BLOCKER]
@@ -338,6 +371,7 @@ def build_wiring_plan(
         use_first_kernel_launch_evidence=True,
         use_decode_q_projection_substep_evidence=True,
         use_decode_qkv_substep_evidence=True,
+        use_decode_full_layer_evidence=True,
     )
 
 
