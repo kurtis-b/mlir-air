@@ -435,8 +435,8 @@ def finish_power_window(window: Gemma3PowerWindow, *, elapsed_seconds: float) ->
     aligned = any(value is not None for value in watts.values())
     if not aligned and not notes:
         notes.append("power sampling requested but no readable timed-window telemetry was available")
-    if not window.pkg_samples and _wants_pkg_sampler(window.target_backend):
-        notes.append("no timed-window package-watt samples were captured")
+    if pkg_avg is None and _wants_pkg_sampler(window.target_backend):
+        notes.append("no timed-window package power data was captured")
     if not window.gpu_samples and _wants_gpu_sampler(window.target_backend):
         notes.append("no timed-window ROCm SMI samples were captured")
     return Gemma3PowerSnapshot(

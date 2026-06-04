@@ -2,17 +2,18 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""Real Gemma3 execution smoke and CPU benchmark helpers.
+"""Real Gemma3 execution smoke and Torch benchmark helpers.
 
-This module is deliberately CPU/HF oriented. It proves that local real Gemma3
-artifacts can execute without importing AIR and can produce baseline timing
-records without claiming NPU paper parity.
+This module is deliberately Torch/HF oriented. It proves that local real Gemma3
+artifacts can execute without importing AIR and can produce baseline CPU/iGPU
+timing records without claiming NPU paper parity.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import perf_counter
@@ -122,18 +123,52 @@ def _exact_text_inputs(tokenizer: Any, torch_module: Any, prompt: str, target_to
     return {"input_ids": input_ids, "attention_mask": attention_mask}
 
 
-def _load_cpu_model_inputs(
+def _move_inputs_to_device(inputs: Any, device: Any) -> Any:
+    if hasattr(inputs, "to"):
+        return inputs.to(device)
+    moved: dict[str, Any] = {}
+    for key, value in inputs.items():
+        moved[key] = value.to(device) if hasattr(value, "to") else value
+    return moved
+
+
+def _synchronize_device(torch_module: Any, device: Any) -> None:
+    if getattr(device, "type", None) == "cuda" and torch_module.cuda.is_available():
+        torch_module.cuda.synchronize(device)
+
+
+def _torch_device_for_backend(torch_module: Any, torch_backend: str) -> Any:
+    if torch_backend == "cpu":
+        return torch_module.device("cpu")
+    if torch_backend == "igpu":
+        if not torch_module.cuda.is_available():
+            raise Gemma3ExecutionError("torch.cuda is unavailable for iGPU/ROCm benchmark")
+        return torch_module.device("cuda")
+    raise ValueError("torch_backend must be cpu or igpu")
+
+
+def _backend_report_name(torch_backend: str) -> str:
+    if torch_backend == "cpu":
+        return "cpu-hf"
+    if torch_backend == "igpu":
+        return "igpu-hf-rocm"
+    raise ValueError("torch_backend must be cpu or igpu")
+
+
+def _load_torch_model_inputs(
     *,
     model_variant: str,
     weights_dir: Path | None,
     prompt: str,
     max_prompt_tokens: int,
     vision_smoke: bool,
-) -> tuple[Any, Any, Any, Any, Any, float]:
+    torch_backend: str = "cpu",
+) -> tuple[Any, Any, Any, Any, Any, Any, float]:
     try:
         import torch
     except Exception as exc:
         raise Gemma3ExecutionError("python:torch is required") from exc
+    device = _torch_device_for_backend(torch, torch_backend)
 
     try:
         inventory = load_real_model_artifacts(
@@ -179,7 +214,29 @@ def _load_cpu_model_inputs(
         else:
             inputs = _exact_text_inputs(tokenizer, torch, prompt, max_prompt_tokens)
     model.eval()
-    return inventory, model, tokenizer, processor, inputs, perf_counter() - load_start
+    model.to(device)
+    inputs = _move_inputs_to_device(inputs, device)
+    _synchronize_device(torch, device)
+    return inventory, model, tokenizer, processor, inputs, device, perf_counter() - load_start
+
+
+def _load_cpu_model_inputs(
+    *,
+    model_variant: str,
+    weights_dir: Path | None,
+    prompt: str,
+    max_prompt_tokens: int,
+    vision_smoke: bool,
+) -> tuple[Any, Any, Any, Any, Any, float]:
+    inventory, model, tokenizer, processor, inputs, _device, load_seconds = _load_torch_model_inputs(
+        model_variant=model_variant,
+        weights_dir=weights_dir,
+        prompt=prompt,
+        max_prompt_tokens=max_prompt_tokens,
+        vision_smoke=vision_smoke,
+        torch_backend="cpu",
+    )
+    return inventory, model, tokenizer, processor, inputs, load_seconds
 
 
 def run_cpu_smoke(
@@ -234,7 +291,7 @@ def run_cpu_smoke(
     )
 
 
-def run_cpu_benchmark(
+def run_torch_benchmark(
     *,
     model_variant: str,
     weights_dir: Path | None = None,
@@ -247,6 +304,7 @@ def run_cpu_benchmark(
     vision_smoke: bool = False,
     power_sample: bool = False,
     run_id: str | None = None,
+    torch_backend: str = "cpu",
 ) -> Gemma3RealBenchmarkReport:
     if metric not in ("prefill_ttft_seconds", "decode_tps", "vision_ttft_seconds"):
         raise ValueError("metric must be prefill_ttft_seconds, decode_tps, or vision_ttft_seconds")
@@ -259,13 +317,15 @@ def run_cpu_benchmark(
     except Exception as exc:
         raise Gemma3ExecutionError("python:torch is required") from exc
 
-    inventory, model, _tokenizer, _processor, inputs, load_seconds = _load_cpu_model_inputs(
+    inventory, model, _tokenizer, _processor, inputs, device, load_seconds = _load_torch_model_inputs(
         model_variant=model_variant,
         weights_dir=weights_dir,
         prompt=prompt,
         max_prompt_tokens=max_prompt_tokens,
         vision_smoke=vision_smoke or metric == "vision_ttft_seconds",
+        torch_backend=torch_backend,
     )
+    backend_name = _backend_report_name(torch_backend)
     prompt_token_count = int(inputs["input_ids"].shape[-1])
 
     def run_prefill() -> Any:
@@ -306,23 +366,31 @@ def run_cpu_benchmark(
         if metric == "decode_tps":
             for _ in range(warmup_iters):
                 run_decode_tokens(prepare_decode_state())
+                _synchronize_device(torch, device)
             decode_states = [prepare_decode_state() for _ in range(timed_iters)]
+            _synchronize_device(torch, device)
             elapsed = 0.0
             output = None
-            power_window = begin_power_window(sample=power_sample, run_id=run_id, target_backend="cpu")
+            power_window = begin_power_window(sample=power_sample, run_id=run_id, target_backend=torch_backend)
             for state in decode_states:
+                _synchronize_device(torch, device)
                 start = perf_counter()
                 output = run_decode_tokens(state)
+                _synchronize_device(torch, device)
                 elapsed += perf_counter() - start
         else:
             for _ in range(warmup_iters):
                 run_prefill()
+                _synchronize_device(torch, device)
             elapsed = 0.0
             output = None
-            power_window = begin_power_window(sample=power_sample, run_id=run_id, target_backend="cpu")
+            _synchronize_device(torch, device)
+            power_window = begin_power_window(sample=power_sample, run_id=run_id, target_backend=torch_backend)
             for _ in range(timed_iters):
+                _synchronize_device(torch, device)
                 start = perf_counter()
                 output = run_prefill()
+                _synchronize_device(torch, device)
                 elapsed += perf_counter() - start
     power_snapshot = (
         finish_power_window(power_window, elapsed_seconds=elapsed).to_json_dict()
@@ -340,9 +408,24 @@ def run_cpu_benchmark(
         unit = "seconds"
         logits_shape = tuple(int(dim) for dim in output.logits.shape)
 
+    notes = [
+        f"real {backend_name} measurement for the requested sequence length",
+        "decode_tps excludes prefill by constructing the KV cache before the timed decode loop"
+        if metric == "decode_tps"
+        else "prefill_ttft measures one full prompt forward pass",
+        "model load, device placement, tokenizer work, and input construction are outside the timed region",
+    ]
+    if torch_backend == "igpu":
+        aotriton = os.environ.get("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL")
+        notes.append(
+            f"TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL={aotriton}"
+            if aotriton
+            else "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL is unset"
+        )
+
     return Gemma3RealBenchmarkReport(
         model_variant=model_variant,
-        backend="cpu-hf",
+        backend=backend_name,
         status="PASS",
         metric=metric,
         weights_dir=inventory.weights_dir,
@@ -356,12 +439,37 @@ def run_cpu_benchmark(
         mean_seconds=mean_seconds,
         logits_shape=logits_shape,
         power_snapshot=power_snapshot,
-        notes=(
-            "real CPU/HF measurement for the requested sequence length",
-            "decode_tps excludes prefill by constructing the KV cache before the timed decode loop"
-            if metric == "decode_tps"
-            else "prefill_ttft measures one full prompt forward pass",
-        ),
+        notes=tuple(notes),
+    )
+
+
+def run_cpu_benchmark(
+    *,
+    model_variant: str,
+    weights_dir: Path | None = None,
+    prompt: str = "Gemma3 paper reproduction benchmark.",
+    max_prompt_tokens: int = 16,
+    metric: str = "prefill_ttft_seconds",
+    decode_tokens: int = 1,
+    warmup_iters: int = 0,
+    timed_iters: int = 1,
+    vision_smoke: bool = False,
+    power_sample: bool = False,
+    run_id: str | None = None,
+) -> Gemma3RealBenchmarkReport:
+    return run_torch_benchmark(
+        model_variant=model_variant,
+        weights_dir=weights_dir,
+        prompt=prompt,
+        max_prompt_tokens=max_prompt_tokens,
+        metric=metric,
+        decode_tokens=decode_tokens,
+        warmup_iters=warmup_iters,
+        timed_iters=timed_iters,
+        vision_smoke=vision_smoke,
+        power_sample=power_sample,
+        run_id=run_id,
+        torch_backend="cpu",
     )
 
 
@@ -416,10 +524,11 @@ def _write_json(path: Path, report: Gemma3RealExecutionReport | Gemma3RealBenchm
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Gemma3 real execution smoke and CPU benchmark helper")
+    parser = argparse.ArgumentParser(description="Gemma3 real execution smoke and Torch benchmark helper")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--cpu-smoke", action="store_true")
     parser.add_argument("--cpu-benchmark", action="store_true")
+    parser.add_argument("--torch-backend", choices=["cpu", "igpu"], default="cpu")
     parser.add_argument("--model-variant", choices=sorted(MODEL_SPECS), default="gemma3-1b")
     parser.add_argument("--weights-dir", type=Path)
     parser.add_argument("--prompt", default="Gemma3 paper reproduction smoke.")
@@ -456,7 +565,7 @@ def main() -> int:
         return 0
     if args.cpu_benchmark:
         try:
-            report = run_cpu_benchmark(
+            report = run_torch_benchmark(
                 model_variant=args.model_variant,
                 weights_dir=args.weights_dir,
                 prompt=args.prompt,
@@ -468,6 +577,7 @@ def main() -> int:
                 vision_smoke=args.vision_smoke,
                 power_sample=args.power_sample,
                 run_id=args.run_id,
+                torch_backend=args.torch_backend,
             )
         except (Gemma3ExecutionError, ValueError) as exc:
             print(f"GEMMA3_REAL_BENCHMARK_BLOCKED: {exc}")

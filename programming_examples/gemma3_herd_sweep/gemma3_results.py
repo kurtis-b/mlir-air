@@ -19,7 +19,7 @@ from gemma3_environment import capture_environment
 from gemma3_nonlinears import measure_cpu_contracts, paper_match_blockers
 from gemma3_paper_compare import load_targets, target_by_id
 from gemma3_power import capture_power_snapshot
-from gemma3_real_execution import Gemma3ExecutionError, run_cpu_benchmark
+from gemma3_real_execution import Gemma3ExecutionError, run_torch_benchmark
 
 DEFAULT_POWER_WATTS = {"cpu": None, "gpu": None, "npu": None, "total": None}
 TABLE_BY_METRIC = {
@@ -325,9 +325,10 @@ def build_paper_result(
     if not inventory.can_load_real_artifacts:
         classification = "MISSING_REAL_ARTIFACTS"
         correctness = "BLOCKED_REAL_ARTIFACTS"
-    elif backend == "cpu":
+    elif backend in ("cpu", "igpu"):
+        torch_backend_name = "CPU/HF" if backend == "cpu" else "iGPU/HF ROCm"
         try:
-            benchmark = run_cpu_benchmark(
+            benchmark = run_torch_benchmark(
                 model_variant=model_variant,
                 weights_dir=weights_dir,
                 max_prompt_tokens=prompt_len,
@@ -337,11 +338,12 @@ def build_paper_result(
                 timed_iters=timed_iters,
                 power_sample=power_sample,
                 run_id=target["id"],
+                torch_backend=backend,
             )
         except (Gemma3ExecutionError, ValueError) as exc:
             classification = "REAL_MODEL_EXECUTION_FAILED"
             correctness = "LOCAL_FAIL"
-            notes.append(f"real CPU/HF execution failed: {exc}")
+            notes.append(f"real {torch_backend_name} execution failed: {exc}")
         else:
             local_value = float(benchmark.local_value)
             delta_pct, nearest_paper_value = _paper_delta_pct(target, local_value)
@@ -349,13 +351,13 @@ def build_paper_result(
             correctness = "PASS"
             if classification == "EXPLAINED_DEVIATION":
                 explanation = (
-                    "local CPU/HF measurement uses this Strix host and Transformers runtime; "
+                    f"local {torch_backend_name} measurement uses this Strix host and Transformers runtime; "
                     "it is a baseline cell, not validated NPU paper parity"
                 )
             real_benchmark = benchmark.to_json_dict()
             notes.extend(benchmark.notes)
             notes.append(
-                "CPU/HF baseline uses local Transformers execution; it is not an NPU paper-parity claim"
+                f"{torch_backend_name} baseline uses local Transformers execution; it is not an NPU paper-parity claim"
             )
             if nearest_paper_value is not None:
                 notes.append(f"nearest_paper_value={nearest_paper_value:g}")
