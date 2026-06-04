@@ -7,8 +7,10 @@
 This diagnostic runs the existing staged full-layer decode route repeatedly
 across Gemma3 1B layers with one reusable ELF runner cache. It is not a paper
 TTFT/TPS result: attention is still the single-token staged fallback, logits and
-sampling are absent, and the current FusedDQP route still writes packed inputs
-per launch. The result records exactly which timing windows are measured.
+sampling are absent. The default diagnostic preloads packed projection inputs
+into runner-owned BO sets before timing; dynamic mode can still rewrite them per
+launch for comparison. The result records exactly which timing windows are
+measured.
 """
 
 from __future__ import annotations
@@ -90,6 +92,8 @@ class Gemma3DecodeLoopProbeResult:
     output_format: str
     runner_reuse_mode: str
     norm_argument_mode: str
+    static_projection_argument_mode: str
+    static_projection_bo_set_count: int
     input_shape: tuple[int, ...]
     output_shape: tuple[int, ...]
     input_distribution: str
@@ -131,7 +135,9 @@ class Gemma3DecodeLoopProbeResult:
             f"decode_tokens={self.decode_tokens} context={self.prompt_context_length} "
             f"input={_shape_text(self.input_shape)} output={_shape_text(self.output_shape)} "
             f"output_format={self.output_format} runner_reuse={self.runner_reuse_mode} "
-            f"norm_arg={self.norm_argument_mode} timed_kernel_count={self.timed_kernel_count} "
+            f"norm_arg={self.norm_argument_mode} static_projection_arg={self.static_projection_argument_mode} "
+            f"static_projection_bo_sets={self.static_projection_bo_set_count} "
+            f"timed_kernel_count={self.timed_kernel_count} "
             f"timed_kernel_seconds={self._value_text(self.timed_kernel_seconds)} "
             f"measured_loop_seconds={self._value_text(self.measured_loop_seconds)} "
             f"diagnostic_decode_tps_loop_wall={self._value_text(self.diagnostic_decode_tps_loop_wall)} "
@@ -271,17 +277,69 @@ def _prepare_layer_plans(model_variant: str, weights_dir: Path, layers: int):
     return norm_plans, projection_plans
 
 
+def _projection_bo_set_key(plan: _PackedProjectionPlan, col_block: int) -> tuple[object, ...]:
+    return ("fused-dqp-static-projection", plan.tensor_key, int(col_block))
+
+
+def _projection_static_input_key(plan: _PackedProjectionPlan, col_block: int) -> tuple[object, ...]:
+    return ("packed-l3", plan.tensor_key, int(col_block))
+
+
+def _packed_l3_for_col_block(plan: _PackedProjectionPlan, col_block: int):
+    import numpy as np
+    from ml_dtypes import bfloat16
+    from fused_dqp import _pack_l3_inputs
+
+    cb_slice = slice(col_block, col_block + 1)
+    params = np.empty((plan.row_blocks, 1, 512), dtype=bfloat16)
+    params[..., :256] = plan.scale[:, cb_slice, :]
+    params[..., 256:] = plan.min_offset[:, cb_slice, :]
+    return _pack_l3_inputs(plan.packed[:, cb_slice, :], params).reshape(
+        plan.row_blocks // 4,
+        4,
+        1,
+        -1,
+    )
+
+
+def _preload_static_projection_bo_sets(
+    projection_plans: dict[int, dict[str, _PackedProjectionPlan]],
+    runner_cache: _ReusableElfRunnerCache,
+) -> int:
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    count = 0
+    zero_activation = np.zeros((1, 256), dtype=bfloat16)
+    for layer_plans in projection_plans.values():
+        for plan in layer_plans.values():
+            output_shape = (plan.padded_shape[0],)
+            for col_block in range(plan.col_blocks):
+                runner_cache.prepare(
+                    key=("fused_dqp_accum_block_opt", int(plan.row_blocks)),
+                    mlir_module=plan.mlir_module,
+                    backend_options=_projection_backend_options(),
+                    inputs=[_packed_l3_for_col_block(plan, col_block), zero_activation],
+                    output_shape=output_shape,
+                    output_dtype=bfloat16,
+                    bo_set_key=_projection_bo_set_key(plan, col_block),
+                    static_input_keys=[_projection_static_input_key(plan, col_block), None],
+                )
+                count += 1
+    return count
+
+
 def _run_packed_projection(
     plan: _PackedProjectionPlan,
     activation,
     runner_cache: _ReusableElfRunnerCache,
     timed_kernel_seconds: list[float] | None,
     power_meter,
+    static_projection_argument_mode: str,
 ):
     import numpy as np
     from ml_dtypes import bfloat16
     from common import fused_dqp_paper_reference
-    from fused_dqp import _pack_l3_inputs
 
     out_dim, in_dim = plan.shape
     activation_padded = np.zeros((plan.col_blocks * 256,), dtype=bfloat16)
@@ -291,24 +349,18 @@ def _run_packed_projection(
     accum = np.zeros(expected.shape, dtype=np.float32)
     for col_block in range(plan.col_blocks):
         cb_slice = slice(col_block, col_block + 1)
-        params = np.empty((plan.row_blocks, 1, 512), dtype=bfloat16)
-        params[..., :256] = plan.scale[:, cb_slice, :]
-        params[..., 256:] = plan.min_offset[:, cb_slice, :]
-        packed_l3 = _pack_l3_inputs(plan.packed[:, cb_slice, :], params).reshape(
-            plan.row_blocks // 4,
-            4,
-            1,
-            -1,
-        )
+        static_mode = static_projection_argument_mode == "preloaded-runner-bo-set"
         partial = runner_cache.run(
             key=("fused_dqp_accum_block_opt", int(plan.row_blocks)),
             mlir_module=plan.mlir_module,
             backend_options=_projection_backend_options(),
-            inputs=[packed_l3, activation_blocks[cb_slice, :]],
+            inputs=[_packed_l3_for_col_block(plan, col_block), activation_blocks[cb_slice, :]],
             output_shape=expected.shape,
             output_dtype=bfloat16,
             timed_kernel_seconds=timed_kernel_seconds,
             power_meter=power_meter,
+            bo_set_key=_projection_bo_set_key(plan, col_block) if static_mode else None,
+            static_input_keys=[_projection_static_input_key(plan, col_block), None] if static_mode else None,
         )
         accum += partial.astype(np.float32)
     actual = accum.astype(bfloat16).reshape(-1)[:out_dim]
@@ -335,6 +387,7 @@ def _run_one_layer(
     runner_cache: _ReusableElfRunnerCache,
     timed_kernel_seconds: list[float] | None,
     power_meter,
+    static_projection_argument_mode: str,
 ) -> tuple[Any, LayerLoopEvidence, list[str]]:
     from ml_dtypes import bfloat16
     from weighted_rms_norm import build_module as build_rms_module
@@ -376,6 +429,7 @@ def _run_one_layer(
             runner_cache,
             timed_kernel_seconds,
             power_meter,
+            static_projection_argument_mode,
         )
         projection_evidence.append(evidence)
         actual[family] = actual_vec
@@ -397,7 +451,7 @@ def _run_one_layer(
     attention_expected = np.tile(v_expected.reshape(1, 256), (4, 1)).reshape(1024).astype(bfloat16)
 
     o_actual, o_expected, evidence = _run_packed_projection(
-        projection_plans["o_proj"], attention_actual, runner_cache, timed_kernel_seconds, power_meter
+        projection_plans["o_proj"], attention_actual, runner_cache, timed_kernel_seconds, power_meter, static_projection_argument_mode
     )
     projection_evidence.append(evidence)
     if evidence.projection_correlation is None or evidence.projection_correlation < DEFAULT_THRESHOLD:
@@ -411,10 +465,10 @@ def _run_one_layer(
     pre_ff_actual = _rms_host(residual_actual, norm_plan.norm_weights["pre_feedforward_layernorm"])
     pre_ff_expected = _rms_host(residual_expected, norm_plan.norm_weights["pre_feedforward_layernorm"])
     gate_actual, gate_expected, gate_evidence = _run_packed_projection(
-        projection_plans["gate_proj"], pre_ff_actual.reshape(-1), runner_cache, timed_kernel_seconds, power_meter
+        projection_plans["gate_proj"], pre_ff_actual.reshape(-1), runner_cache, timed_kernel_seconds, power_meter, static_projection_argument_mode
     )
     up_actual, up_expected, up_evidence = _run_packed_projection(
-        projection_plans["up_proj"], pre_ff_actual.reshape(-1), runner_cache, timed_kernel_seconds, power_meter
+        projection_plans["up_proj"], pre_ff_actual.reshape(-1), runner_cache, timed_kernel_seconds, power_meter, static_projection_argument_mode
     )
     for family, evidence in (("gate_proj", gate_evidence), ("up_proj", up_evidence)):
         projection_evidence.append(evidence)
@@ -424,7 +478,7 @@ def _run_one_layer(
     mlp_expected = _geglu(gate_expected, up_expected)
 
     down_actual, down_expected, down_evidence = _run_packed_projection(
-        projection_plans["down_proj"], mlp_actual, runner_cache, timed_kernel_seconds, power_meter
+        projection_plans["down_proj"], mlp_actual, runner_cache, timed_kernel_seconds, power_meter, static_projection_argument_mode
     )
     projection_evidence.append(down_evidence)
     if down_evidence.projection_correlation is None or down_evidence.projection_correlation < DEFAULT_THRESHOLD:
@@ -473,6 +527,8 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
     start = time.perf_counter()
     loop_elapsed: float | None = None
     power_snapshot: dict[str, object] | None = None
+    static_projection_argument_mode = "preloaded-runner-bo-set"
+    static_projection_bo_set_count = 0
     returncode = 1
     try:
         if args.model_variant != DEFAULT_MODEL:
@@ -483,6 +539,14 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         norm_plans, projection_plans = _prepare_layer_plans(args.model_variant, weights_dir, args.layers)
         runner_cache = _ReusableElfRunnerCache(enabled=not args.no_reuse_elf)
         runner_cache.__enter__()
+        static_projection_argument_mode = (
+            "per-launch-write"
+            if args.dynamic_static_weight_writes or args.no_reuse_elf
+            else "preloaded-runner-bo-set"
+        )
+        static_projection_bo_set_count = 0
+        if static_projection_argument_mode == "preloaded-runner-bo-set":
+            static_projection_bo_set_count = _preload_static_projection_bo_sets(projection_plans, runner_cache)
         rng = np.random.default_rng(0)
         warmup_input = rng.uniform(-0.5, 0.5, size=(1, 1152)).astype(bfloat16)
         for layer_index in range(min(args.warmup_layers, args.layers)):
@@ -494,6 +558,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 runner_cache=runner_cache,
                 timed_kernel_seconds=None,
                 power_meter=None,
+                static_projection_argument_mode=static_projection_argument_mode,
             )
             if warmup_blockers:
                 blockers.extend(f"warmup:{item}" for item in warmup_blockers)
@@ -514,6 +579,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                     runner_cache=runner_cache,
                     timed_kernel_seconds=timed_kernel_samples,
                     power_meter=segment_power,
+                    static_projection_argument_mode=static_projection_argument_mode,
                 )
                 layer_evidence.append(evidence)
                 blockers.extend(layer_blockers)
@@ -546,6 +612,8 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         output_format=DEFAULT_OUTPUT_FORMAT,
         runner_reuse_mode=("reused-elf-persistent-bo" if not args.no_reuse_elf else "per-launch-compile-load"),
         norm_argument_mode="selected-vector",
+        static_projection_argument_mode=static_projection_argument_mode,
+        static_projection_bo_set_count=static_projection_bo_set_count,
         input_shape=(1, 1152),
         output_shape=(1, 1152),
         input_distribution=DEFAULT_INPUT_DISTRIBUTION,
@@ -571,7 +639,8 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         timing_window="post-warmup-loop-wall-and-segmented-run-start-wait2",
         timing_notes=(
             "warmup layers compile/load ELF runners and allocate runner-owned BOs before measured loop timing",
-            "measured_loop_seconds starts after warmup and includes current implementation BO writes, output sync/readback, and host fallback compute",
+            "preloaded-runner-bo-set mode allocates BO sets and writes packed projection static inputs before measured loop timing",
+            "measured_loop_seconds starts after warmup and includes current implementation dynamic BO writes, output sync/readback, and host fallback compute",
             "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls and excludes compile, ELF load, BO allocation, BO writes, sync/readback, and host fallback compute",
             "attention is the staged single-token fallback, not paper 1k KV-cache attention",
             "logits and sampling are not wired, so this is a diagnostic decode-loop throughput, not an official paper decode TPS cell",
@@ -584,7 +653,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             "paper-1k-kv-attention-not-wired",
             "logits-sampling-not-wired",
             "host-fallbacks-still-present",
-            "static-weight-bo-preload-not-used-by-fused-dqp-route",
+            "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route",
         ),
         command=tuple(sys.argv),
         returncode=returncode,
@@ -621,6 +690,8 @@ def _self_test() -> None:
         output_format=DEFAULT_OUTPUT_FORMAT,
         runner_reuse_mode="reused-elf-persistent-bo",
         norm_argument_mode="selected-vector",
+        static_projection_argument_mode="preloaded-runner-bo-set",
+        static_projection_bo_set_count=1456,
         input_shape=(1, 1152),
         output_shape=(1, 1152),
         input_distribution=DEFAULT_INPUT_DISTRIBUTION,
@@ -667,6 +738,7 @@ def main() -> int:
     parser.add_argument("--warmup-layers", type=int, default=1)
     parser.add_argument("--result-json", type=Path)
     parser.add_argument("--power-sample", action="store_true")
+    parser.add_argument("--dynamic-static-weight-writes", action="store_true", help="diagnostic fallback: write packed projection static inputs inside each launch")
     parser.add_argument("--no-reuse-elf", action="store_true")
     args = parser.parse_args()
 

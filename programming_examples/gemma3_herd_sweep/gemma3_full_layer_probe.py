@@ -262,7 +262,80 @@ class _ReusableElfRunner:
         self.kernel = cache.xrt.ext.kernel(self.context, self.artifact.kernel)
         self.bos = None
         self.sizes: list[int] | None = None
+        self.static_keys: list[object | None] | None = None
+        self.bo_sets: dict[tuple[object, ...], dict[str, object]] = {}
         self._np = np
+
+    def _arrays_and_sizes(self, inputs: list[object]):
+        y_out = self._np.zeros(self.output_shape, dtype=self.output_dtype)
+        arrays = [*inputs, y_out]
+        sizes = [array.size * array.itemsize for array in arrays]
+        return arrays, sizes
+
+    def _state_for(self, *, arrays: list[object], sizes: list[int], bo_set_key: tuple[object, ...] | None):
+        if bo_set_key is None:
+            if self.bos is None:
+                self.sizes = sizes
+                self.static_keys = [None] * len(arrays)
+                self.bos = [self.cache.xrt.ext.bo(self.cache.device, size) for size in sizes]
+            elif self.sizes != sizes:
+                raise RuntimeError(f"reused ELF runner size mismatch: expected {self.sizes}, got {sizes}")
+            return self.bos, self.static_keys
+
+        state = self.bo_sets.get(bo_set_key)
+        if state is None:
+            state = {
+                "sizes": sizes,
+                "static_keys": [None] * len(arrays),
+                "bos": [self.cache.xrt.ext.bo(self.cache.device, size) for size in sizes],
+            }
+            self.bo_sets[bo_set_key] = state
+        elif state["sizes"] != sizes:
+            raise RuntimeError(
+                f"reused ELF runner BO-set size mismatch for {bo_set_key}: "
+                f"expected {state['sizes']}, got {sizes}"
+            )
+        return state["bos"], state["static_keys"]
+
+    def _write_args(
+        self,
+        *,
+        bos,
+        arrays: list[object],
+        static_keys: list[object | None],
+        requested_static_keys: list[object | None],
+        write_dynamic: bool,
+    ) -> None:
+        for index, (bo, array) in enumerate(zip(bos, arrays)):
+            requested_key = requested_static_keys[index]
+            if requested_key is None and not write_dynamic:
+                continue
+            if requested_key is not None and static_keys[index] == requested_key:
+                continue
+            _write_bo_arg(self.cache.xrt, bo, array)
+            if requested_key is not None:
+                static_keys[index] = requested_key
+
+    def prepare(
+        self,
+        *,
+        inputs: list[object],
+        bo_set_key: tuple[object, ...],
+        static_input_keys: list[object | None],
+    ) -> None:
+        if len(static_input_keys) != len(inputs):
+            raise RuntimeError(
+                f"static_input_keys length mismatch: expected {len(inputs)}, got {len(static_input_keys)}"
+            )
+        arrays, sizes = self._arrays_and_sizes(inputs)
+        bos, static_keys = self._state_for(arrays=arrays, sizes=sizes, bo_set_key=bo_set_key)
+        self._write_args(
+            bos=bos,
+            arrays=arrays,
+            static_keys=static_keys,
+            requested_static_keys=[*static_input_keys, None],
+            write_dynamic=False,
+        )
 
     def run(
         self,
@@ -270,19 +343,26 @@ class _ReusableElfRunner:
         inputs: list[object],
         timed_kernel_seconds: list[float] | None,
         power_meter,
+        bo_set_key: tuple[object, ...] | None = None,
+        static_input_keys: list[object | None] | None = None,
     ):
-        y_out = self._np.zeros(self.output_shape, dtype=self.output_dtype)
-        arrays = [*inputs, y_out]
-        sizes = [array.size * array.itemsize for array in arrays]
-        if self.bos is None:
-            self.sizes = sizes
-            self.bos = [self.cache.xrt.ext.bo(self.cache.device, size) for size in sizes]
-        elif self.sizes != sizes:
-            raise RuntimeError(f"reused ELF runner size mismatch: expected {self.sizes}, got {sizes}")
-        for bo, array in zip(self.bos, arrays):
-            _write_bo_arg(self.cache.xrt, bo, array)
+        arrays, sizes = self._arrays_and_sizes(inputs)
+        bos, static_keys = self._state_for(arrays=arrays, sizes=sizes, bo_set_key=bo_set_key)
+        if static_input_keys is None:
+            static_input_keys = [None] * len(inputs)
+        if len(static_input_keys) != len(inputs):
+            raise RuntimeError(
+                f"static_input_keys length mismatch: expected {len(inputs)}, got {len(static_input_keys)}"
+            )
+        self._write_args(
+            bos=bos,
+            arrays=arrays,
+            static_keys=static_keys,
+            requested_static_keys=[*static_input_keys, None],
+            write_dynamic=True,
+        )
         run = self.cache.xrt.run(self.kernel)
-        for index, bo in enumerate(self.bos):
+        for index, bo in enumerate(bos):
             run.set_arg(index, bo)
         if power_meter is not None:
             power_meter.begin_segment()
@@ -294,10 +374,11 @@ class _ReusableElfRunner:
             timed_kernel_seconds.append(timed_elapsed)
         if power_meter is not None:
             power_meter.end_segment(timed_elapsed)
-        self.bos[-1].sync(self.cache.xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
-        return self.bos[-1].read(sizes[-1], 0).view(self.output_dtype).reshape(self.output_shape)
+        bos[-1].sync(self.cache.xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+        return bos[-1].read(sizes[-1], 0).view(self.output_dtype).reshape(self.output_shape)
 
     def close(self) -> None:
+        self.bo_sets.clear()
         self.backend.unload()
 
 
@@ -333,28 +414,15 @@ class _ReusableElfRunnerCache:
         if self.lock is not None:
             self.lock.release()
 
-    def run(
+    def _runner(
         self,
         *,
         key: tuple[object, ...],
         mlir_module,
         backend_options: dict[str, object],
-        inputs: list[object],
         output_shape: tuple[int, ...],
         output_dtype,
-        timed_kernel_seconds: list[float] | None = None,
-        power_meter=None,
-    ):
-        if not self.enabled:
-            return _run_elf_with_runner_bos(
-                mlir_module=mlir_module,
-                backend_options=backend_options,
-                inputs=inputs,
-                output_shape=output_shape,
-                output_dtype=output_dtype,
-                timed_kernel_seconds=timed_kernel_seconds,
-                power_meter=power_meter,
-            )
+    ) -> _ReusableElfRunner:
         runner_key = (*key, tuple(output_shape), str(output_dtype))
         runner = self.runners.get(runner_key)
         if runner is None:
@@ -366,10 +434,72 @@ class _ReusableElfRunnerCache:
                 output_dtype=output_dtype,
             )
             self.runners[runner_key] = runner
+        return runner
+
+    def prepare(
+        self,
+        *,
+        key: tuple[object, ...],
+        mlir_module,
+        backend_options: dict[str, object],
+        inputs: list[object],
+        output_shape: tuple[int, ...],
+        output_dtype,
+        bo_set_key: tuple[object, ...],
+        static_input_keys: list[object | None],
+    ) -> None:
+        if not self.enabled:
+            return
+        runner = self._runner(
+            key=key,
+            mlir_module=mlir_module,
+            backend_options=backend_options,
+            output_shape=output_shape,
+            output_dtype=output_dtype,
+        )
+        runner.prepare(
+            inputs=inputs,
+            bo_set_key=bo_set_key,
+            static_input_keys=static_input_keys,
+        )
+
+    def run(
+        self,
+        *,
+        key: tuple[object, ...],
+        mlir_module,
+        backend_options: dict[str, object],
+        inputs: list[object],
+        output_shape: tuple[int, ...],
+        output_dtype,
+        timed_kernel_seconds: list[float] | None = None,
+        power_meter=None,
+        bo_set_key: tuple[object, ...] | None = None,
+        static_input_keys: list[object | None] | None = None,
+    ):
+        if not self.enabled:
+            return _run_elf_with_runner_bos(
+                mlir_module=mlir_module,
+                backend_options=backend_options,
+                inputs=inputs,
+                output_shape=output_shape,
+                output_dtype=output_dtype,
+                timed_kernel_seconds=timed_kernel_seconds,
+                power_meter=power_meter,
+            )
+        runner = self._runner(
+            key=key,
+            mlir_module=mlir_module,
+            backend_options=backend_options,
+            output_shape=output_shape,
+            output_dtype=output_dtype,
+        )
         return runner.run(
             inputs=inputs,
             timed_kernel_seconds=timed_kernel_seconds,
             power_meter=power_meter,
+            bo_set_key=bo_set_key,
+            static_input_keys=static_input_keys,
         )
 
 
