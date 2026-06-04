@@ -150,6 +150,48 @@ def build_execution_wiring_record(
         }
 
 
+def load_staged_npu_diagnostic(model_variant: str) -> dict[str, Any] | None:
+    if model_variant != "gemma3-1b":
+        return None
+    try:
+        from gemma3_full_layer_probe import DEFAULT_FULL_LAYER_PROBE_EVIDENCE, has_decode_full_layer_evidence
+
+        if not has_decode_full_layer_evidence(model_variant):
+            return None
+        data = json.loads(DEFAULT_FULL_LAYER_PROBE_EVIDENCE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    timed = data.get("timed_kernel_seconds")
+    estimated_tps = data.get("estimated_26_layer_decode_tps_kernel_only")
+    paper_decode_tps = 41.1
+    delta_pct = None
+    if estimated_tps is not None:
+        delta_pct = abs(float(estimated_tps) - paper_decode_tps) / paper_decode_tps * 100.0
+    return {
+        "status": data.get("status"),
+        "sequence_kind": data.get("sequence_kind"),
+        "phase": data.get("phase"),
+        "layer_index": data.get("layer_index"),
+        "correctness": "PASS" if data.get("status") == "FULL_LAYER_SEQUENCE_PASS" else "BLOCKED",
+        "timed_kernel_count": data.get("timed_kernel_count"),
+        "timed_kernel_seconds": timed,
+        "timed_kernel_mean_seconds": data.get("timed_kernel_mean_seconds"),
+        "diagnostic_layer_passes_per_second": data.get("diagnostic_layer_passes_per_second"),
+        "estimated_26_layer_decode_tps_kernel_only": estimated_tps,
+        "paper_decode_tps_1k": paper_decode_tps,
+        "delta_pct_vs_paper_decode_tps_1k": delta_pct,
+        "timing_window": data.get("timing_window"),
+        "timing_notes": data.get("timing_notes", []),
+        "power_snapshot": data.get("power_snapshot"),
+        "remaining_model_runner_gaps": data.get("remaining_model_runner_gaps", []),
+        "source_result": str(DEFAULT_FULL_LAYER_PROBE_EVIDENCE),
+        "notes": [
+            "diagnostic staged layer-0 kernel-only timing; not a measured paper TTFT/TPS cell",
+            "26-layer decode TPS is extrapolated from one staged layer and excludes host fallback compute",
+        ],
+    }
+
+
 def build_model_runner_record(
     *,
     model_variant: str,
@@ -325,6 +367,7 @@ def build_paper_result(
     local_value: float | None = None
     delta_pct: float | None = None
     real_benchmark: dict[str, Any] | None = None
+    npu_staged_diagnostic: dict[str, Any] | None = None
     explanation: str | None = None
     if not inventory.can_load_real_artifacts:
         classification = "MISSING_REAL_ARTIFACTS"
@@ -378,6 +421,13 @@ def build_paper_result(
         classification = "REAL_MODEL_EXECUTION_NOT_IMPLEMENTED"
         correctness = "BLOCKED_EXECUTION_NOT_IMPLEMENTED"
         notes.append("real artifact inventory is present but execution is not implemented")
+        npu_staged_diagnostic = load_staged_npu_diagnostic(model_variant)
+        if npu_staged_diagnostic:
+            notes.append(
+                "staged NPU diagnostic available: "
+                f"timed_kernel_seconds={npu_staged_diagnostic.get('timed_kernel_seconds')} "
+                f"estimated_26_layer_decode_tps_kernel_only={npu_staged_diagnostic.get('estimated_26_layer_decode_tps_kernel_only')}"
+            )
         if execution_wiring:
             notes.append(
                 "execution wiring blockers: "
@@ -439,6 +489,7 @@ def build_paper_result(
         "execution_wiring": execution_wiring,
         "model_runner": model_runner,
         "real_benchmark": real_benchmark,
+        "npu_staged_diagnostic": npu_staged_diagnostic,
         "notes": notes,
     }
 
