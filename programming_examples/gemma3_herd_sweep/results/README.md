@@ -27,7 +27,7 @@ energy through the `power` group. iGPU CPU/total rails remain
 `MISSING_POWER_FIELD`; NPU timing and pseudo-NPU power remain blocked by full 1B
 loop wiring, nonlinear model-stage promotion, and fresh paper-shape hardware
 reruns. Kernel argument-layout validation is complete for the real 1B 1k/32k
-context model-runner plan: 676 NPU candidate layouts, 2,132 positional
+context model-runner plan: 728 NPU candidate layouts, 2,236 positional
 arguments, and zero binding blockers. Staged decode layer-0 correctness and
 segmented kernel-only timing evidence is now present and attached under
 `npu_staged_diagnostic` in the blocked NPU paper-cell JSONs, but official NPU
@@ -47,6 +47,11 @@ the generated paper-target comparison summary.
   promotes residual add from pure host fallback to standalone NPU candidate
   status in the wiring manifest, but it is not yet model-loop timing or
   paper-parity evidence.
+- `gemma3_rope_halfsplit_smoke.json`: compact Strix/XRT evidence that the
+  Gemma3 half-split RoPE AIR wrapper compiles and runs as an ELF hardware
+  smoke for `rows=4`, `head_dim=256`, and `herd_x=4`. This promotes RoPE to
+  standalone NPU candidate status in the wiring manifest, but it is not yet
+  model-loop timing or paper-parity evidence.
 
 ## First Kernel Launch Probe Evidence
 

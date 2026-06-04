@@ -38,7 +38,7 @@ MODEL_FULL_1B_LOOP_BLOCKER = "full-1b-loop-not-wired"
 TEXT_STAGE_TEMPLATE = (
     ("prefill", "pre_attention_norm", "host-fallback", "rms_norm", "input_layernorm before self-attention"),
     ("prefill", "qkv_projection", "npu-candidate", "q4nx+bf16_mm", "Q4NX dequant plus BF16 MM"),
-    ("prefill", "rope", "host-fallback", "rope", "Llama half-split source candidate"),
+    ("prefill", "rope", "host-fallback", "rope", "Gemma half-split RoPE standalone smoke candidate"),
     ("prefill", "qk_norm", "host-fallback", "qk_norm", "weighted_rms_norm per-head candidate"),
     ("prefill", "kv_cache_append", "host-runtime", "host", "append K/V tensors after projection"),
     ("prefill", "attention", "npu-candidate", "flowqkv", "causal local/global FlowQKV"),
@@ -53,7 +53,7 @@ TEXT_STAGE_TEMPLATE = (
     ("prefill", "mlp_residual", "host-fallback", "residual_add", "residual add after MLP"),
     ("decode", "pre_attention_norm", "host-fallback", "rms_norm", "input_layernorm before self-attention"),
     ("decode", "qkv_projection", "npu-candidate", "fused_dqp", "FusedDQP decode projection"),
-    ("decode", "rope", "host-fallback", "rope", "Llama half-split source candidate"),
+    ("decode", "rope", "host-fallback", "rope", "Gemma half-split RoPE standalone smoke candidate"),
     ("decode", "qk_norm", "host-fallback", "qk_norm", "weighted_rms_norm per-head candidate"),
     ("decode", "kv_cache_append", "host-runtime", "host", "append one K/V entry"),
     ("decode", "attention", "npu-candidate", "flowkv", "Q_CHUNK=1 FlowKV"),
@@ -160,6 +160,8 @@ def _stage_route(kernel: str, routes: dict[str, str]) -> str:
         return "geglu/standalone-elf-smoke"
     if kernel in ("rms_norm", "qk_norm"):
         return "weighted_rms_norm/standalone-elf-smoke"
+    if kernel == "rope":
+        return "rope_halfsplit/standalone-elf-smoke"
     if kernel == "residual_add":
         return "residual_add/standalone-elf-smoke"
     return routes.get(kernel, "host")
@@ -176,6 +178,8 @@ def _stage_backend(
     if kernel == "mlp_activation" and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass"):
         return "npu-candidate"
     if kernel == "qk_norm" and int(preflight.head_dim or 0) == 256 and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass"):
+        return "npu-candidate"
+    if kernel == "rope" and int(preflight.head_dim or 0) == 256 and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass"):
         return "npu-candidate"
     if (
         kernel == "rms_norm"
@@ -204,7 +208,7 @@ def _stage_status(
         if first_kernel_stage_validated:
             return "runner-owned-first-kernel-launch-pass", ()
         if (
-            kernel in ("mlp_activation", "rms_norm", "qk_norm", "residual_add")
+            kernel in ("mlp_activation", "rms_norm", "qk_norm", "rope", "residual_add")
             and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass")
         ):
             return "standalone-hardware-smoke-model-candidate", launch_blockers
@@ -414,15 +418,17 @@ def _self_test() -> None:
     plan = build_wiring_plan_from_preflight(_fake_preflight())
     if plan.stage_count != 6 * len(TEXT_STAGE_TEMPLATE):
         raise AssertionError(plan.stage_count)
-    if plan.npu_candidate_count != 6 * 26:
+    if plan.npu_candidate_count != 6 * 28:
         raise AssertionError(plan.npu_candidate_count)
-    if plan.host_fallback_count != 6 * 2:
+    if plan.host_fallback_count != 0:
         raise AssertionError(plan.host_fallback_count)
     global_attention = [stage for stage in plan.stages if stage.layer_index == 5 and stage.role == "attention"]
     if not global_attention or any(stage.attention_kind != "global_full" or stage.window_len != 0 for stage in global_attention):
         raise AssertionError(global_attention)
     print(plan.format())
     for stage in plan.stages[:8]:
+        print(stage.format())
+    for stage in [stage for stage in plan.stages if stage.role == "rope"][:2]:
         print(stage.format())
     for stage in [stage for stage in plan.stages if stage.role == "mlp_activation"][:2]:
         print(stage.format())

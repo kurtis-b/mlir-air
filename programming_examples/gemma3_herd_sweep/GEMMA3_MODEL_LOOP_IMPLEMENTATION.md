@@ -167,7 +167,7 @@ Current phase status:
 | Phase 2 | Complete | Manifest preparation supports compile-only/run-only and refuses missing or mismatched artifacts. |
 | Phase 3 | Complete | Two-chunk synthetic prefill records Q4NX/BF16/FlowQKV stages and distinct local/global KV sweeps. |
 | Phase 4 | Complete | Repeated one-token decode grows cache lengths and records FlowKV-compatible stage metadata. |
-| Phase 5 | Complete for standalone promotion readiness | RMSNorm/QK-Norm reuse, RoPE half-split source reuse, GeGLU kernel candidate, and fallback policy are documented and tested. |
+| Phase 5 | Complete for standalone promotion readiness | RMSNorm/QK-Norm reuse, RoPE half-split AIR wrapper reuse, GeGLU, residual-add, and fallback policy are documented and tested. |
 | Phase 6 | Complete | The synthetic transformer layer skeleton includes attention, output projection, residual, MLP, and deterministic stage checksums. |
 | Phase 7 | Complete | Multi-layer, multi-chunk, multi-token text loop is implemented in `Gemma3SyntheticSession`. |
 | Phase 8 | Policy complete, no performance claims | Scaling manifests and unsupported-mode diagnostics are checked; timing and hardware numbers are intentionally absent. |
@@ -336,9 +336,9 @@ The next implementation loops should stay on 1B 1k NPU text before expanding to
 
 | Priority | Target | Done when |
 | ---: | --- | --- |
-| 1 | Complete: resolve `model-kernel-argument-binding-not-validated` | `gemma3_argument_binding.py --self-test` validates 52 fixture NPU candidate layouts with 164 positional args and no missing storage; the real 1B 1k/32k-context plan validates 676 NPU candidate layouts with 2,132 positional args and zero argument-binding blockers. |
+| 1 | Complete: resolve `model-kernel-argument-binding-not-validated` | `gemma3_argument_binding.py --self-test` validates 56 fixture NPU candidate layouts with 172 positional args and no missing storage; the real 1B 1k/32k-context plan validates 728 NPU candidate layouts with 2,236 positional args and zero argument-binding blockers. |
 | 2 | Partially complete: resolve `model-kernel-launch-not-wired` | The first promoted Gemma3 1B pre-attention RMSNorm shape (`1024x1152`, ELF) launches on the NPU with correlation 0.999983 using the validated first-stage positional layout (`layer_input`, `static_norm_weights`, `prefill_L0_pre_attention_norm`), a full contiguous static norm payload whose layer-0 vector is at byte offset 0, and runner-owned pyxrt BO allocation/binding. The decode RMSNorm-to-`q_proj` substep passes with RMSNorm correlation 0.999991, q-projection correlation 1.000000, and dense original-weight correlation 0.994609. The decode RMSNorm-to-Q/K/V substep passes with Q/K/V projection correlations all 1.000000 and dense original-weight correlations 0.994609/0.995959/0.995720. The staged decode layer-0 and layer-1 probes now launch RMSNorm plus q/k/v/o/gate/up/down projection families on the NPU and validate final layer-output correlation 1.000000 against quantized staged references. Layer 1 exposed and fixed the missing static-norm offset/sub-BO path by using a preselected BF16 norm-vector argument (`model.layers.1.input_layernorm.weight` at byte offset 10240 in the contiguous norm BO, passed as a 2304-byte argument). The staged 26-layer decode-loop diagnostic now measures one post-warmup token across all 26 real layers, preloads packed projection inputs into 1,456 runner-owned BO sets before timing, and uses no-allocation static metadata placeholders in the timed projection path, but it remains diagnostic because 1k KV-cache attention, logits/sampling, host fallback promotion, and the production contiguous static-weight BO route are not complete. For 1B, committed evidence now narrows the real-artifact blocker to `full-1b-loop-not-wired`; the remaining launch work is paper-shaped prefill/decode loop integration and timed paper-cell measurement, not first-kernel, single-layer, or diagnostic repeated-layer correctness. |
-| 3 | Reduce `nonlinear-model-stage-promotion-incomplete` | Each remaining nonlinear stage is either promoted through standalone NPU evidence and model launch validation, or explicitly measured and classified as a timed host fallback. |
+| 3 | Reduce `nonlinear-model-stage-promotion-incomplete` | Standalone NPU evidence now covers RMSNorm, QK-Norm, RoPE, GeGLU, and residual add; the remaining work is composed model-stage launch validation, logits/sampling treatment, and timed paper-cell execution. |
 | 4 | Re-run 1B 1k NPU paper cells | Prefill and decode result JSONs contain real local NPU TTFT/TPS or a narrower, artifact-backed failure classification. |
 | 5 | Partially complete: capture pseudo-NPU power | Direct RAPL is readable when the run is launched under `sg power`. The refreshed layer-0 staged full-layer diagnostic records segmented package-energy deltas over only NPU `run.start()/wait2()` windows: 0.158887 s across 57 kernel launches, 21.939 W segmented package power, and 9.005 W pseudo-NPU package-delta from a 12.933 W quiescent sample. The layer-1 diagnostic records 0.142578 s across the same 57 launch windows, 17.420 W segmented package power, and 5.918 W pseudo-NPU package-delta from an 11.502 W quiescent sample. The staged 26-layer decode-loop diagnostic records a post-warmup full-loop RAPL window of 15.975 W package power and 9.482 W pseudo-NPU package-delta while measuring 0.173242 diagnostic loop-wall TPS. Official paper-cell pseudo-NPU power remains blocked until paper-shaped prefill/decode execution exists. |
 | 6 | Expand cautiously | Only after 1B 1k NPU correctness, timing, and pseudo-power evidence is clean should the loop expand to more 1B lengths, 4B text, or vision. |
@@ -653,8 +653,9 @@ Implemented evidence and blocker:
   per-head M=32/N=256 smoke. Residual add now has a Gemma-specific BF16 AIR
   wrapper with compile-only lit coverage and a Strix/XRT ELF hardware smoke
   for n=1152/tile_n=288, so attention and MLP residual stages enter wiring as
-  NPU candidates. RoPE still needs a Gemma AIR wrapper or explicit measured
-  fallback treatment.
+  NPU candidates. RoPE now has a Gemma half-split AIR wrapper with compile-only
+  lit coverage and a Strix/XRT ELF hardware smoke for rows=4/head_dim=256, so
+  RoPE stages also enter wiring as NPU candidates.
 - `gemma3_results.py` now records fallback entries with backend, elapsed-ms,
   timed-iteration count, measurement source, tensor contract, hardware status,
   and `npu_promoted=false` for CPU-reference fallbacks.
@@ -694,9 +695,9 @@ Implemented evidence and blocker:
   correlation for 4B RMSNorm. This is a model-runner argument and launch-intent
   contract; it is not yet a validated
   model-timed norm-kernel launch.
-- Remaining work for full Phase E completion is model launch validation for
-  the promoted GeGLU and norm paths, plus RoPE, residual, logits, and sampling
-  promotion or measured timing treatment in end-to-end execution.
+- Remaining work for full Phase E completion is composed model launch
+  validation for the promoted nonlinear paths, plus logits/sampling promotion
+  or measured timing treatment in end-to-end execution.
 
 ### Phase F: end-to-end 1B text reproduction
 
@@ -724,7 +725,7 @@ Blocked evidence:
   local 1B artifacts are available but model-kernel launch, nonlinear
   model-stage promotion, and fresh paper-shape hardware reruns are not complete.
   Kernel argument-layout validation is complete for the real 1B 1k/32k-context
-  plan: 676 NPU candidate layouts and 2,132 positional arguments validate with
+  plan: 728 NPU candidate layouts and 2,236 positional arguments validate with
   no missing storage, shape, dtype, direction, or KV-buffer identity blockers.
   First-kernel launch evidence is present for the promoted Gemma3 1B
   pre-attention RMSNorm shape: `gemma3_1b_first_kernel_launch_probe.json`
@@ -756,8 +757,9 @@ Blocked evidence:
   BO offset 10240 and validates RMSNorm correlation 0.999991, all seven
   projection correlations at 1.000000, and final layer-output correlation
   1.000000. QK-Norm, RoPE, single-token attention, residual additions, GeGLU,
-  and post-norm vector stages remain explicit host fallbacks in both
-  diagnostics. The refreshed layer-0 diagnostic also records segmented NPU
+  and post-norm vector stages remain explicit host-reference steps in the
+  staged diagnostics, even though the model-runner manifest now has standalone
+  NPU candidates for the nonlinear vector stages. The refreshed layer-0 diagnostic also records segmented NPU
   kernel timing and RAPL: 57 `run.start()/wait2()` launch windows total
   0.158887 s for one staged layer in reused-ELF mode, corresponding to
   6.293770 staged layer passes/s and a clearly non-paper-comparable 26-layer
@@ -789,11 +791,10 @@ Blocked evidence:
   benchmark-cell KV allocation plan. Full contiguous static-weight BO preload
   validation is complete for 1B, 4B text, and the 4B vision text stack. The
   prior unmeasured-nonlinear fallback blocker is retired by measured CPU-reference
-  fallback records, but those records are not NPU promotion evidence. Residual
-  add now has standalone NPU evidence and is represented as an NPU candidate in
-  the wiring manifest; the remaining nonlinear promotion blocker is model-stage
-  launch integration plus RoPE and any logits/sampling work needed for a paper
-  cell.
+  fallback records, but those records are not NPU promotion evidence. Residual add and RoPE now have standalone NPU evidence and are represented
+  as NPU candidates in the wiring manifest; the remaining nonlinear promotion
+  blocker is composed model-stage launch integration plus any logits/sampling
+  work needed for a paper cell.
 - Dependency-light Torch/HF smoke paths now validate local 1B text, 4B text,
   and 4B synthetic-image weights/tokenizer/processor execution without AIR
   imports. Initial local Gemma3 1B 1k CPU/iGPU paper-cell measurements are
@@ -1065,9 +1066,9 @@ Implemented evidence and blocker:
 - `gemma3_buffer_binding.py` records that runtime BO and virtual-intermediate
   binding is planned with no missing BO keys in the self-test fixture.
 - `gemma3_argument_binding.py` records deterministic positional argument layouts
-  for NPU candidates. The self-test validates 52 fixture candidate layouts with
-  164 positional arguments; the real 1B 1k/32k-context text plan validates 676
-  candidate layouts with 2,132 positional arguments and zero binding blockers.
+  for NPU candidates. The self-test validates 56 fixture candidate layouts with
+  172 positional arguments; the real 1B 1k/32k-context text plan validates 728
+  candidate layouts with 2,236 positional arguments and zero binding blockers.
 - `gemma3_model_runner.py` records launch-order state in result JSON so blocked
   paper cells distinguish BO planning, static preload planning, kernel launch,
   host fallback, runtime buffer-binding state, and argument-layout status.
@@ -1316,6 +1317,7 @@ The paper groups Gemma3 work into three implementation classes:
 | FlowQKV | `run-flowqkv`, `run-flowqkv-paper` | `flowqkv.py`, `flow_attention_opt.cc` | Prefill attention | Smoke and paper targets pass with supported modes. |
 | FlowKV | `run-flowkv`, `run-flowkv-paper` | `flowkv.py`, `flow_attention_opt.cc` | Decode attention | Direct small routes and 8x4 gather route pass; small gather remains diagnostic-only. |
 | Residual add | `run_residual_add_compile_only.lit` | `residual_add.py` | Attention and MLP residual paths | ELF compile-only and n=1152/tile_n=288 hardware smoke pass; model-stage launch integration still pending. |
+| RoPE | `run_rope_halfsplit_compile_only.lit` | `rope_halfsplit.py`, `../llama32_1b/kernel_builder/rope_halfsplit.cc` | Q/K rotary embedding | ELF compile-only and rows=4/head_dim=256 hardware smoke pass; model-stage launch integration still pending. |
 
 Current public output modes are:
 
@@ -1422,11 +1424,11 @@ Nonlinear operations needed by Gemma3 must follow this order:
 | Operation | Preferred source | Gemma rule |
 | --- | --- | --- |
 | RMSNorm | `programming_examples/weighted_rms_norm`, plus Llama CPU reference | Reuse for attention/FFN/final norm if Gemma row layout matches; otherwise add a Gemma wrapper around the same math. |
-| RoPE | `llama32_1b/kernel_builder/rope_halfsplit.cc`, `programming_examples/rope_sincos` | Use half-split LUT only if Gemma uses the same convention; otherwise add `gemma3_dataflow_kernels/gemma_rope.py/.cc`. |
+| RoPE | `gemma3_dataflow_kernels/rope_halfsplit.py`, `llama32_1b/kernel_builder/rope_halfsplit.cc` | Use the validated half-split LUT wrapper for head_dim=256; keep `rope_sincos` as a semantics reference only because its even/odd layout differs. |
 | QK-Norm | weighted RMSNorm pattern | Implement as per-head Q/K normalization with CPU reference first; add `gemma3_dataflow_kernels/qk_norm.py/.cc` if existing RMSNorm cannot express the layout. |
 | MLP activation | `programming_examples/gelu`, `programming_examples/ffn_swiglu`, Llama `silu_and_mul` | Confirm Gemma activation from config/paper evidence before choosing GELU/GeGLU/SwiGLU; do not copy Llama SwiGLU by assumption. |
 | Elementwise multiply | `programming_examples/ffn_swiglu`, Llama `silu_and_mul` | Reuse if activation semantics match; otherwise add a standalone Gemma elementwise kernel. |
-| Residual add | Llama multi-launch builder patterns | Keep host-side initially; promote through a small Gemma vector kernel or fused builder once shape checks are stable. |
+| Residual add | `gemma3_dataflow_kernels/residual_add.py` | Use the validated standalone BF16 vector add wrapper until a fused model-stage route is measured. |
 | Softmax | FlowQKV/FlowKV attention kernels | Keep inside attention kernels unless a separate model-level softmax is required. |
 | LM head/logits | Llama LM-head GEMV multi-launch pattern | Reuse only after Gemma vocab size, embedding dim, partitioning, and weight layout are documented. |
 | Sampling | Host-side | Keep deterministic or host-side until logits correctness is validated. |
@@ -1871,6 +1873,7 @@ test -d programming_examples/llama32_1b
 test -d programming_examples/gemma3_dataflow_kernels
 test -d programming_examples/weighted_rms_norm
 test -d programming_examples/rope_sincos
+test -f programming_examples/gemma3_dataflow_kernels/rope_halfsplit.py
 test -d programming_examples/gelu
 test -d programming_examples/ffn_swiglu
 ```
@@ -1879,14 +1882,16 @@ Existing nonlinear candidates to evaluate before adding Gemma-specific kernels:
 
 ```bash
 make -C programming_examples/weighted_rms_norm run OUTPUT_FORMAT=elf
+python3 programming_examples/gemma3_dataflow_kernels/rope_halfsplit.py --compile-mode compile-only --output-format elf
 make -C programming_examples/rope_sincos run AIE_TARGET=aie2p OUTPUT_FORMAT=elf
 make -C programming_examples/gelu run OUTPUT_FORMAT=elf
 make -C programming_examples/ffn_swiglu/decode run OUTPUT_FORMAT=elf
 ```
 
-These standalone targets are reuse candidates, not Gemma dependencies yet. Add
-focused compile-only lit coverage for any nonlinear before the Gemma model loop
-depends on it.
+These standalone targets are reuse candidates; `rope_halfsplit.py` and
+`residual_add.py` are Gemma-specific standalone candidates with focused
+compile-only lit coverage. Add focused compile-only lit coverage for any new
+nonlinear before the Gemma model loop depends on it.
 
 Compiler tools:
 

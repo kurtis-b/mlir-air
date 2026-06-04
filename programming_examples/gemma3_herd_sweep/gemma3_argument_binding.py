@@ -147,6 +147,20 @@ def _virtual_shape(key: str, bo_plan: Gemma3BOPlan, preflight: Gemma3NPUPrefligh
         return None
     hidden = int(preflight.hidden_size)
     intermediate = int(preflight.intermediate_size)
+    heads = int(preflight.num_attention_heads or 0)
+    kv_heads = int(preflight.num_key_value_heads or 0)
+    head_dim = int(preflight.head_dim or 0)
+    if key.startswith("prefill_") or key.startswith("decode_"):
+        phase, name = key.split("_", 1)
+        tokens = bo_plan.prompt_len if phase == "prefill" else 1
+        if name == "q" and heads and head_dim:
+            return (tokens, heads, head_dim)
+        if name in {"k", "v"} and kv_heads and head_dim:
+            return (tokens, kv_heads, head_dim)
+        if name == "attention_out":
+            return (tokens, hidden)
+        if name in {"mlp_gate", "mlp_up", "mlp_down"}:
+            return (tokens, intermediate)
     match = _LAYER_VIRTUAL_RE.match(key)
     if not match:
         return None
@@ -398,9 +412,9 @@ def _self_test() -> None:
         wiring=wiring,
         buffer_binding_plan=buffer_binding_plan,
     )
-    if plan.status != "READY_FOR_KERNEL_LAUNCH" or plan.argument_binding_count != 52:
+    if plan.status != "READY_FOR_KERNEL_LAUNCH" or plan.argument_binding_count != 56:
         raise AssertionError(plan)
-    if plan.argument_count != 164:
+    if plan.argument_count != 172:
         raise AssertionError(plan)
     if plan.missing_argument_count != 0 or plan.blockers:
         raise AssertionError(plan)
@@ -410,6 +424,9 @@ def _self_test() -> None:
     qkv = next(binding for binding in plan.bindings if binding.role == "qkv_projection" and binding.phase == "prefill")
     if qkv.argument_count != 5:
         raise AssertionError(qkv)
+    rope = next(binding for binding in plan.bindings if binding.role == "rope" and binding.phase == "prefill")
+    if rope.argument_count != 2 or rope.route != "rope_halfsplit/standalone-elf-smoke":
+        raise AssertionError(rope)
     print(plan.format(include_bindings=True, include_arguments=True))
     print("GEMMA3_ARGUMENT_BINDING_SELF_TEST: PASS")
 

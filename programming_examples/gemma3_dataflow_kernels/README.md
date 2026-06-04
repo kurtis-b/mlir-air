@@ -20,6 +20,8 @@ The examples include correctness-first and optimized Peano variants:
   the Q-chunk-size-1 specialization of the same grouped attention.
 - `residual_add.py`: BF16 elementwise residual add for Gemma attention and MLP
   residual paths.
+- `rope_halfsplit.py`: Gemma half-split RoPE AIR wrapper that reuses the
+  Llama32 AIE2P `rope_halfsplit.cc` microkernel for head-dim 256 tensors.
 
 These are not FastFlowLM binary reproductions and do not use disassembly.
 They are source-level kernels built from the public paper description and
@@ -36,6 +38,7 @@ make run-fused-dqp
 make run-flowqkv
 make run-flowkv
 python3 residual_add.py --compile-mode compile-only --output-format elf
+python3 rope_halfsplit.py --compile-mode compile-only --output-format elf
 ```
 
 Optimized Peano compile/run targets use the `*-opt` suffix:

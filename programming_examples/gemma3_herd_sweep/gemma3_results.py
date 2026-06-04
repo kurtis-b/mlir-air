@@ -399,8 +399,8 @@ def build_paper_result(
     if host_fallbacks:
         if all(item.get("measured") for item in host_fallbacks):
             notes.append(
-                "nonlinear host fallbacks measured as CPU-reference microbenchmarks; "
-                "not NPU-promoted"
+                "standalone nonlinear NPU candidates remain outside the composed model "
+                "timed window; CPU-reference microbenchmarks are recorded for fallback accounting"
             )
         else:
             notes.append("one or more nonlinear host fallbacks are unmeasured")

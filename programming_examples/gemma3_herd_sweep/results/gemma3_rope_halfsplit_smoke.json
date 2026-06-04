@@ -1,0 +1,16 @@
+{
+  "compile_mode": "compile-and-run",
+  "head_dim": 256,
+  "herd_x": 4,
+  "kernel": "gemma3_rope_halfsplit",
+  "object_file": "rope.o",
+  "output_format": "elf",
+  "returncode": 0,
+  "rows": 4,
+  "schema_version": 1,
+  "status": "HARDWARE_SMOKE_PASS",
+  "tolerance": {
+    "atol": 0.05,
+    "rtol": 0.05
+  }
+}
