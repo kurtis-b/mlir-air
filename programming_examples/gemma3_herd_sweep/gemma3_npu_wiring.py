@@ -160,6 +160,8 @@ def _stage_route(kernel: str, routes: dict[str, str]) -> str:
         return "geglu/standalone-elf-smoke"
     if kernel in ("rms_norm", "qk_norm"):
         return "weighted_rms_norm/standalone-elf-smoke"
+    if kernel == "residual_add":
+        return "residual_add/standalone-elf-smoke"
     return routes.get(kernel, "host")
 
 
@@ -181,6 +183,12 @@ def _stage_backend(
         and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass")
     ):
         return "npu-candidate"
+    if (
+        kernel == "residual_add"
+        and int(preflight.hidden_size or 0) in (1152, 2560)
+        and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass")
+    ):
+        return "npu-candidate"
     return backend
 
 
@@ -196,7 +204,7 @@ def _stage_status(
         if first_kernel_stage_validated:
             return "runner-owned-first-kernel-launch-pass", ()
         if (
-            kernel in ("mlp_activation", "rms_norm", "qk_norm")
+            kernel in ("mlp_activation", "rms_norm", "qk_norm", "residual_add")
             and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass")
         ):
             return "standalone-hardware-smoke-model-candidate", launch_blockers
@@ -406,9 +414,9 @@ def _self_test() -> None:
     plan = build_wiring_plan_from_preflight(_fake_preflight())
     if plan.stage_count != 6 * len(TEXT_STAGE_TEMPLATE):
         raise AssertionError(plan.stage_count)
-    if plan.npu_candidate_count != 6 * 22:
+    if plan.npu_candidate_count != 6 * 26:
         raise AssertionError(plan.npu_candidate_count)
-    if plan.host_fallback_count != 6 * 6:
+    if plan.host_fallback_count != 6 * 2:
         raise AssertionError(plan.host_fallback_count)
     global_attention = [stage for stage in plan.stages if stage.layer_index == 5 and stage.role == "attention"]
     if not global_attention or any(stage.attention_kind != "global_full" or stage.window_len != 0 for stage in global_attention):
@@ -417,6 +425,8 @@ def _self_test() -> None:
     for stage in plan.stages[:8]:
         print(stage.format())
     for stage in [stage for stage in plan.stages if stage.role == "mlp_activation"][:2]:
+        print(stage.format())
+    for stage in [stage for stage in plan.stages if stage.kernel == "residual_add"][:2]:
         print(stage.format())
     for stage in global_attention:
         print(stage.format())

@@ -18,6 +18,8 @@ The examples include correctness-first and optimized Peano variants:
   attention over one or more KV groups using online softmax accumulation.
 - `flowkv.py` / `flow_attention.cc` / `flow_attention_opt.cc`: decode attention as
   the Q-chunk-size-1 specialization of the same grouped attention.
+- `residual_add.py`: BF16 elementwise residual add for Gemma attention and MLP
+  residual paths.
 
 These are not FastFlowLM binary reproductions and do not use disassembly.
 They are source-level kernels built from the public paper description and
@@ -33,6 +35,7 @@ make run-mm
 make run-fused-dqp
 make run-flowqkv
 make run-flowkv
+python3 residual_add.py --compile-mode compile-only --output-format elf
 ```
 
 Optimized Peano compile/run targets use the `*-opt` suffix:

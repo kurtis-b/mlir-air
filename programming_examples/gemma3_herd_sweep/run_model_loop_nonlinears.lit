@@ -10,7 +10,8 @@
 # CHECK: nonlinear mlp_activation status=gemma-specific-compile-only-candidate
 # CHECK-SAME: hardware=hardware-smoke-pass-n1024-tile256-elf
 # CHECK-SAME: tolerance=rtol=1e-1 atol=5e-2 hardware-smoke
-# CHECK: nonlinear residual_add status=host-fallback
+# CHECK: nonlinear residual_add status=standalone-npu-reuse-candidate
+# CHECK-SAME: hardware=hardware-smoke-pass-n1152-tile288-elf
 # CHECK-SAME: timed_window=unmeasured-host-fallback
 # CHECK: nonlinear_paper_gate=PAPER_MATCH_BLOCKED unresolved=5
 # CHECK: nonlinear_blocker operation=rms_norm timed_window=unmeasured-host-fallback

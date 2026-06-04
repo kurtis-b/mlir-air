@@ -1,0 +1,15 @@
+{
+  "compile_mode": "compile-and-run",
+  "kernel": "gemma3_residual_add",
+  "n": 1152,
+  "output_format": "elf",
+  "returncode": 0,
+  "schema_version": 1,
+  "status": "HARDWARE_SMOKE_PASS",
+  "tile_n": 288,
+  "tolerance": {
+    "atol": 0.05,
+    "rtol": 0.05
+  },
+  "vector_size": 16
+}

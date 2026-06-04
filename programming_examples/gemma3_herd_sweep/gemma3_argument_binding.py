@@ -398,7 +398,9 @@ def _self_test() -> None:
         wiring=wiring,
         buffer_binding_plan=buffer_binding_plan,
     )
-    if plan.status != "READY_FOR_KERNEL_LAUNCH" or plan.argument_binding_count != 44:
+    if plan.status != "READY_FOR_KERNEL_LAUNCH" or plan.argument_binding_count != 52:
+        raise AssertionError(plan)
+    if plan.argument_count != 164:
         raise AssertionError(plan)
     if plan.missing_argument_count != 0 or plan.blockers:
         raise AssertionError(plan)
