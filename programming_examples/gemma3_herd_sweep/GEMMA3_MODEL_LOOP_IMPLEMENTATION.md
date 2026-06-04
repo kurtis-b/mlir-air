@@ -108,6 +108,10 @@ Implemented files:
 - `gemma3_launch_probe.py`: diagnostic first-kernel launch probe for the
   promoted Gemma3 1B pre-attention RMSNorm stage; hardware is touched only with
   `--run-hardware`, while lit covers parsing and evidence formatting.
+- `gemma3_substep_probe.py`: diagnostic Gemma3 1B decode RMSNorm-to-`q_proj`
+  substep probe. It launches real layer-0 RMSNorm and five FusedDQP q-projection
+  col-blocks with real weights and runner-owned pyxrt BOs, then validates the
+  accumulated q vector against CPU references.
 - `gemma3_model_runner.py`: launch-order manifest that composes BO planning,
   static-preload planning, buffer bindings, argument layouts, and per-layer
   kernel/fallback wiring without claiming kernel execution.
@@ -132,6 +136,7 @@ Focused lit coverage:
 - `run_model_loop_buffer_binding.lit`
 - `run_model_loop_argument_binding.lit`
 - `run_model_loop_launch_probe.lit`
+- `run_model_loop_substep_probe.lit`
 - `../gemma3_dataflow_kernels/run_geglu_compile_only.lit`
 
 Current phase status:
@@ -313,7 +318,7 @@ The next implementation loops should stay on 1B 1k NPU text before expanding to
 | Priority | Target | Done when |
 | ---: | --- | --- |
 | 1 | Complete: resolve `model-kernel-argument-binding-not-validated` | `gemma3_argument_binding.py --self-test` validates 44 fixture NPU candidate layouts with 148 positional args and no missing storage; the real 1B 1k/32k-context plan validates 572 NPU candidate layouts with 1,924 positional args and zero argument-binding blockers. |
-| 2 | Partially complete: resolve `model-kernel-launch-not-wired` | The first promoted Gemma3 1B pre-attention RMSNorm shape (`1024x1152`, ELF) launches on the NPU with correlation 0.999983 using the validated first-stage positional layout (`layer_input`, `static_norm_weights`, `prefill_L0_pre_attention_norm`), a full contiguous static norm payload whose layer-0 vector is at byte offset 0, and runner-owned pyxrt BO allocation/binding. For 1B, committed evidence now narrows the real-artifact blocker to `model-substep-sequence-not-wired`; the remaining launch work is one substep sequence and then one full layer with intermediate correctness checks. |
+| 2 | Partially complete: resolve `model-kernel-launch-not-wired` | The first promoted Gemma3 1B pre-attention RMSNorm shape (`1024x1152`, ELF) launches on the NPU with correlation 0.999983 using the validated first-stage positional layout (`layer_input`, `static_norm_weights`, `prefill_L0_pre_attention_norm`), a full contiguous static norm payload whose layer-0 vector is at byte offset 0, and runner-owned pyxrt BO allocation/binding. The decode RMSNorm-to-`q_proj` substep now also passes on NPU with real layer-0 weights: RMSNorm correlation 0.999991, accumulated q-projection correlation 1.000000 against the quantized FusedDQP reference, and dense original-weight correlation 0.994609. For 1B, committed evidence now narrows the real-artifact blocker to `model-full-qkv-substep-not-wired`; the remaining launch work is full Q/K/V projection, then one full layer with intermediate correctness checks. |
 | 3 | Reduce `nonlinear-model-stage-promotion-incomplete` | Each remaining nonlinear stage is either promoted through standalone NPU evidence and model launch validation, or explicitly measured and classified as a timed host fallback. |
 | 4 | Re-run 1B 1k NPU paper cells | Prefill and decode result JSONs contain real local NPU TTFT/TPS or a narrower, artifact-backed failure classification. |
 | 5 | Capture pseudo-NPU power | The NPU timed-window package watts and pre-run quiescent package watts are both readable through direct RAPL, and the result JSON records their delta. |
@@ -349,7 +354,9 @@ skip directly from manifests to full-model timing.
    the existing CPU reference for that stage. Save a small JSON/log artifact
    even if it fails.
 4. Extend from one kernel to one substep sequence, preserving intermediate
-   correctness checks and per-stage logs.
+   correctness checks and per-stage logs. The first narrow decode RMSNorm-to-
+   `q_proj` substep is now validated; full Q/K/V projection remains before the
+   qkv stage can be treated as complete.
 5. Extend from one substep sequence to one full transformer layer with host
    fallbacks still explicit.
 6. Extend from one layer to full 1B 1k prefill. Time only after correctness
@@ -697,9 +704,18 @@ Blocked evidence:
   `prefill_L0_pre_attention_norm`). The worker passes the full contiguous
   `static_norm_weights` payload as argument 1, with the actual layer-0
   `input_layernorm.weight` vector at byte offset 0, allocates/binds the three
-  pyxrt BOs directly, and validates output correlation 0.999983. The real 1B
-  blocker report now narrows the launch blocker to `model-substep-sequence-not-wired`;
-  substep sequencing, full-layer correctness, and timed TTFT/TPS remain blocked. Full paper-shape BO allocation validation is
+  pyxrt BOs directly, and validates output correlation 0.999983. Decode
+  RMSNorm-to-`q_proj` substep evidence is also present:
+  `gemma3_1b_decode_rmsnorm_qproj_substep_probe.json` records a real layer-0
+  RMSNorm launch followed by five real FusedDQP q-projection col-block launches
+  with host accumulation. It validates RMSNorm correlation 0.999991, accumulated
+  q-projection correlation 1.000000 against the quantized FusedDQP reference,
+  and dense original-weight q-projection correlation 0.994609. This split route
+  is a staged correctness probe because the current full 5-col-block paper
+  module over-allocates tile memory for this shape. The real 1B blocker report
+  now narrows the launch blocker to `model-full-qkv-substep-not-wired`; full
+  Q/K/V projection, full-layer correctness, and timed TTFT/TPS remain blocked.
+  Full paper-shape BO allocation validation is
   complete for 1B, 4B text, and the 4B vision text stack under the
   benchmark-cell KV allocation plan. Full contiguous static-weight BO preload
   validation is complete for 1B, 4B text, and the 4B vision text stack. The
@@ -986,10 +1002,16 @@ Implemented evidence and blocker:
   model-runner layout, passes the full contiguous static norm payload as the
   static argument, allocates/binds the three pyxrt BOs directly, and validates
   output correlation 0.999983 against the standalone CPU reference.
-  `gemma3_npu_wiring.py` and `gemma3_model_runner.py` consume that evidence to
-  report `model-substep-sequence-not-wired` for the real 1B plan instead of the
-  stale first-kernel launch blocker. This is not a substep sequence, full
-  model-runner launch, or timed paper cell.
+- `gemma3_substep_probe.py --run-hardware` records the next decode substep
+  evidence: real layer-0 RMSNorm plus real `q_proj` through a five-col-block
+  FusedDQP loop with host accumulation. The committed Strix result validates
+  RMSNorm correlation 0.999991, q-projection correlation 1.000000 against the
+  quantized FusedDQP reference, and dense original-weight correlation 0.994609.
+  `gemma3_npu_wiring.py` and `gemma3_model_runner.py` consume the first-kernel
+  and substep evidence to report `model-full-qkv-substep-not-wired` for the real
+  1B plan instead of the stale first-kernel or substep-sequence blocker. This is
+  not full QKV, a full model-runner launch, TTFT/TPS timing, pseudo-NPU power,
+  or a paper cell.
 - `gemma3_paper_compare.py --compare` accepts either a single result cell or a
   wrapper with `results`, and can emit Markdown and CSV summaries. The initial
   1B 1k CPU/iGPU measured cells plus NPU blocked cells are bundled in
