@@ -263,32 +263,155 @@ typographical error, or a derived value from the figure.
 
 | Area | Current state | Paper-parity requirement |
 | --- | --- | --- |
-| Model weights | Synthetic Q4NX/BF16-compatible weights only | Real Gemma3 1B and 4B weights, quantized/packed in the same Q4NX contract used by the NPU kernels |
-| Tokenizer and prompts | Synthetic token IDs | Real tokenizer, deterministic prompts, and sequence lengths 1k-32k for 1B and 1k-128k decode for 4B |
+| Model weights | Synthetic weights plus local real Gemma3 artifact discovery, full static projection preload evidence, and norm-weight preload evidence | Real Gemma3 1B and 4B weights, quantized/packed in the same Q4NX contract used by the NPU kernels |
+| Tokenizer and prompts | Synthetic token IDs plus real tokenizer execution for initial 1B CPU/iGPU 1k baseline cells | Real tokenizer, deterministic prompts, and sequence lengths 1k-32k for 1B and 1k-128k decode for 4B |
 | Text runtime | Host-driven synthetic loop with CPU references, manifests, real-shape preflight, and per-layer NPU wiring metadata | End-to-end NPU execution for all validated model substeps, with host fallbacks removed or measured separately |
 | Vision runtime | Disabled contract plus synthetic CPU non-causal vision prefill and visual context token handoff contract | 4B vision prefill path with non-causal attention validated on NPU and timed against paper |
 | Nonlinear operations | CPU fallbacks plus standalone GeGLU candidate; host fallback microbenchmarks are recorded in result JSON | RMSNorm, QK-Norm, RoPE, residual add, activation, logits, and sampling either validated on NPU or explicitly accounted for in timing |
-| Baselines | No comparable CPU/iGPU model path | CPU and iGPU runs for the exact same model variant, prompt lengths, output count, tokenizer, and measurement window |
-| Timing | Synthetic profile/event logs only | TTFT and decode TPS with warmup, timed iterations, and compile/setup excluded |
-| Power | No local power logs | CPU/GPU/NPU/total watt readings aligned with benchmark windows and TPS/W calculations |
+| Baselines | Initial 1B 1k CPU/HF and iGPU/HF ROCm cells are measured; iGPU prefill matches the paper 1k iGPU target, CPU and decode cells are explained deviations | CPU and iGPU runs for every paper model variant, prompt length, output count, tokenizer, and measurement window |
+| Timing | Initial 1B 1k CPU/iGPU TTFT and decode TPS exclude load/setup; NPU timing is still blocked before launch | TTFT and decode TPS with warmup, timed iterations, and compile/setup excluded |
+| Power | CPU cells use direct RAPL package energy; iGPU cells use ROCm SMI GPU rail; pseudo-NPU RAPL package delta awaits real timed NPU execution | CPU/GPU/NPU/total watt readings aligned with benchmark windows and TPS/W calculations |
 | Accuracy | Synthetic checksums only | Model-output agreement against CPU reference and paper-compatible prompts, plus tolerance policy for quantized outputs |
-| Result comparison | No result JSON ledger | Machine-readable paper/local comparison with percent deltas and pass/deviation labels |
+| Result comparison | Paper target ledger, initial 1B 1k result bundle, and Markdown/CSV summaries exist | Machine-readable paper/local comparison for every paper cell with percent deltas and pass/deviation labels |
 
 ## Iterative Paper-Match Implementation Loop
 
-Each iteration should do exactly one paper-parity increment:
+Each iteration should do exactly one paper-parity increment and should finish
+with a committed evidence update before the next increment starts.
 
-1. Identify the next missing result cell or capability.
-2. Add the smallest implementation needed for that cell.
-3. Run compile-only checks before hardware.
-4. Run correctness before timing.
-5. Run timing before power/TPS-W.
-6. Save the command, environment, result JSON, and logs.
-7. Update this document's evidence ledger.
-8. Commit that iteration before moving to the next cell.
+1. Start from a clean git worktree, or explicitly record unrelated dirty files
+   before doing any work.
+2. Run `gemma3_reproduction_blockers.py` and select exactly one blocker or one
+   missing paper cell.
+3. Add the smallest implementation needed for that blocker or cell.
+4. Run compile-only checks before hardware.
+5. Run correctness before timing.
+6. Run timing before power/TPS/W.
+7. Save the command, environment, result JSON, comparison summary, and relevant
+   logs.
+8. Update this document's evidence ledger and the small result-artifact README.
+9. Commit that iteration before moving to the next blocker or paper cell.
 
-Do not broaden public support matrices, sweep modes, or paper claims until the
-same mode passes compile, correctness, hardware, and paper-comparison checks.
+Do not broaden public support matrices, sweep modes, output-mode exposure, or
+paper claims until the same mode passes compile, correctness, hardware, and
+paper-comparison checks.
+
+### Current next-loop priorities
+
+The next implementation loops should stay on 1B 1k NPU text before expanding to
+4B, vision, or longer context lengths.
+
+| Priority | Target | Done when |
+| ---: | --- | --- |
+| 1 | Resolve `model-kernel-argument-binding-not-validated` | Every first-run NPU kernel candidate has a generated argument layout matched to bound BO keys and checked against the runtime launch order. |
+| 2 | Resolve `model-kernel-launch-not-wired` | The model runner can launch one real NPU kernel from the 1B plan using the validated BO bindings, then one substep sequence, then one full layer. |
+| 3 | Reduce `nonlinear-model-stage-promotion-incomplete` | Each remaining nonlinear stage is either promoted through standalone NPU evidence and model launch/binding validation, or explicitly measured and classified as a timed host fallback. |
+| 4 | Re-run 1B 1k NPU paper cells | Prefill and decode result JSONs contain real local NPU TTFT/TPS or a narrower, artifact-backed failure classification. |
+| 5 | Capture pseudo-NPU power | The NPU timed-window package watts and pre-run quiescent package watts are both readable through direct RAPL, and the result JSON records their delta. |
+| 6 | Expand cautiously | Only after 1B 1k NPU correctness, timing, and pseudo-power evidence is clean should the loop expand to more 1B lengths, 4B text, or vision. |
+
+### Blocker-resolution decision tree
+
+Use the first failing artifact to classify the loop result. Do not continue to
+timing or power after a compile, launch, or correctness failure.
+
+| Failure point | Required evidence | Classification to use |
+| --- | --- | --- |
+| AIR/NPU compile fails | Exact `aircc` command, `-v`, `--debug-ir` directory, last good IR, and whether the failure is AIR transform, AIR-to-AIE, Peano, xclbin/ELF packaging, or host build | compiler/lowering blocker |
+| XRT artifact load fails | xclbin/ELF/insts paths, XRT error text, target device, artifact format, and XRT version | runtime artifact-load blocker |
+| Kernel launch fails | Kernel name, launch order, BO binding manifest, argument layout, XRT error text, and layer/stage/token | launch/binding blocker |
+| Correctness fails | Layer/stage/token, tensor shape, expected/reference checksum or max error, observed checksum or max error, quantization route, output mode, and tolerance | correctness blocker |
+| Timeout or hang | Command, logs, last emitted stage, output mode, artifact format, and `xrt-smi examine -r all` after the timeout | channel/runtime scheduling blocker |
+| Performance gap after correctness passes | Result JSON, comparison summary, warmup/timed iterations, runtime path, output mode, trace setting, and likely root cause | `EXPLAINED_DEVIATION` only if evidence is concrete |
+
+### NPU 1B 1k first-measurement runbook
+
+The first real NPU measurement should be built in staged proof points. Do not
+skip directly from manifests to full-model timing.
+
+1. Confirm prerequisites: full paper-shape BO allocation, full static projection
+   preload, norm preload, buffer-binding manifest, and model-runner manifest are
+   all present for `gemma3-1b`.
+2. Generate or validate a concrete argument-layout record for the first NPU
+   kernel candidate in the 1B prefill path. The record must name every BO key,
+   virtual intermediate, shape, dtype, layer index, KV slice, and static-weight
+   offset used by the launch.
+3. Launch one real kernel with real BO bindings and compare its output against
+   the existing CPU reference for that stage. Save a small JSON/log artifact
+   even if it fails.
+4. Extend from one kernel to one substep sequence, preserving intermediate
+   correctness checks and per-stage logs.
+5. Extend from one substep sequence to one full transformer layer with host
+   fallbacks still explicit.
+6. Extend from one layer to full 1B 1k prefill. Time only after correctness
+   passes.
+7. Build the 1k KV cache outside the timed decode window, then time 16
+   token-by-token NPU decode steps for the initial decode TPS cell.
+8. Refresh `gemma3_1b_npu_prefill_1k_blocked_initial.json` and
+   `gemma3_1b_npu_decode_1k_blocked_initial.json` into measured NPU result cells
+   only when they contain real local execution evidence.
+9. Rebuild `gemma3_1b_initial_1k_results.json`,
+   `gemma3_1b_initial_1k_summary.md`, and
+   `gemma3_1b_initial_1k_summary.csv` after any NPU result-cell change.
+
+### Measurement-window and telemetry policy
+
+Result JSONs must describe exactly what is timed.
+
+- Prefill TTFT excludes compile, model load, tokenizer work, input construction,
+  device placement, BO creation, BO preload, xclbin/ELF load, and kernel
+  argument binding.
+- Decode TPS excludes prefill and KV-cache construction; it times only the
+  token-by-token decode loop for the requested number of decode tokens.
+- CPU power uses direct RAPL package energy and maps package watts to CPU and
+  total for CPU-only baseline cells.
+- iGPU power uses ROCm SMI socket graphics package power and leaves CPU/total
+  rails `MISSING_POWER_FIELD` unless a separate package/CPU rail sampler is
+  explicitly added.
+- NPU power uses pseudo-NPU package delta: direct RAPL package watts during the
+  timed NPU window minus direct RAPL quiescent package watts sampled immediately
+  before the run.
+- Never combine timing from one run with power from another unless both run IDs
+  are recorded and the method is documented in the result JSON.
+
+### Clean-provenance and commit policy
+
+- Commit implementation code before final measurement runs when feasible.
+- If final measurement output would make the worktree dirty before later cells
+  run, write final JSONs to `/tmp` from a clean tree, verify
+  `dirty_worktree: false`, then copy them into `results/`.
+- Every committed result bundle should have clean provenance where feasible.
+- Each loop should end with one focused commit. Do not mix unrelated user
+  changes, broad refactors, or stale generated artifacts into the same commit.
+- If an iteration discovers a blocker instead of fixing it, commit the narrower
+  blocker evidence and update this document with the exact next smallest step.
+
+### Evidence-update checklist
+
+For each iteration, update only the sections whose evidence changed:
+
+- Phase F/G/H blocker text when blocker status changes.
+- Phase I when result schema, result bundles, comparison summaries, or report
+  behavior changes.
+- Phase J when power telemetry behavior or availability changes.
+- `results/README.md` when a small committed result artifact is added or
+  refreshed.
+- `gemma3_1b_initial_1k_results.json` and its Markdown/CSV summaries when any
+  initial 1B 1k CPU/iGPU/NPU result cell changes.
+- `gemma3_paper_compare.py --compare` output should be regenerated for changed
+  result bundles.
+
+### Do not do yet
+
+- Do not expand to 4B or vision timing before 1B 1k NPU launch, correctness,
+  timing, and pseudo-power evidence exists.
+- Do not expose diagnostic output modes as public supported modes without
+  compile and hardware evidence.
+- Do not silently rewrite unsupported output modes; keep early diagnostics.
+- Do not use 8x4 direct output as a production path unless new hardware evidence
+  disproves the current shim S2MM resource-limit classification.
+- Do not perform a clean rebuild, reboot, NPU power-mode change, or
+  `/home/cj/mlir-aie` edit without explicit approval.
 
 ### Phase A: paper metric extraction and ledger generation
 
