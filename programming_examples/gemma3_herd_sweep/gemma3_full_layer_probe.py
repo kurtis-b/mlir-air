@@ -21,6 +21,7 @@ import sys
 import time
 
 from gemma3_artifacts import MODEL_SPECS
+from gemma3_power import MISSING_POWER_FIELD
 from gemma3_qkv_substep_probe import _projection_backend_options
 from gemma3_substep_probe import (
     DEFAULT_INPUT_DISTRIBUTION,
@@ -120,6 +121,14 @@ class Gemma3FullLayerProbeResult:
     mlp_activation_correlation: float | None
     final_output_correlation: float | None
     dense_final_output_correlation: float | None
+    timed_kernel_count: int
+    timed_kernel_seconds: float | None
+    timed_kernel_mean_seconds: float | None
+    diagnostic_layer_passes_per_second: float | None
+    estimated_26_layer_decode_tps_kernel_only: float | None
+    timing_window: str
+    timing_notes: tuple[str, ...]
+    power_snapshot: dict[str, object] | None
     threshold: float
     remaining_model_runner_gaps: tuple[str, ...]
     command: tuple[str, ...]
@@ -166,6 +175,11 @@ class Gemma3FullLayerProbeResult:
             f"mlp_activation_correlation={self._corr_text(self.mlp_activation_correlation)} "
             f"final_output_correlation={self._corr_text(self.final_output_correlation)} "
             f"dense_final_output_correlation={self._corr_text(self.dense_final_output_correlation)} "
+            f"timed_kernel_count={self.timed_kernel_count} "
+            f"timed_kernel_seconds={self._corr_text(self.timed_kernel_seconds)} "
+            f"diagnostic_layer_passes_per_second={self._corr_text(self.diagnostic_layer_passes_per_second)} "
+            f"estimated_26_layer_decode_tps_kernel_only={self._corr_text(self.estimated_26_layer_decode_tps_kernel_only)} "
+            f"timing_window={self.timing_window} "
             f"threshold={self.threshold:g} model_runner_gaps={gaps} blockers={blockers}"
         )
 
@@ -204,6 +218,111 @@ def has_decode_full_layer_evidence(
 
 def _ceil_to(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
+
+
+class _SegmentedRAPLPowerMeter:
+    def __init__(self, *, sample: bool, run_id: str | None) -> None:
+        self.sample = sample
+        self.run_id = run_id
+        self.notes: list[str] = []
+        self.baseline_pkg_watts: float | None = None
+        self.energy_delta_uj = 0
+        self.elapsed_seconds = 0.0
+        self.max_range_uj: int | None = None
+        self._segment_start_uj: int | None = None
+        self._segment_max_range_uj: int | None = None
+        self.sampling_backend = "not-requested"
+        if not sample:
+            self.notes.append("power sampling was not requested")
+            return
+        self.sampling_backend = "rapl-sysfs-segmented"
+        try:
+            from gemma3_power import _sample_rapl_pkg_watts
+
+            baseline, note, backend = _sample_rapl_pkg_watts()
+        except Exception as exc:
+            baseline, note, backend = None, str(exc), "rapl-sysfs"
+        if backend:
+            self.sampling_backend = backend + "+segmented"
+        if baseline is None:
+            self.notes.append("quiescent direct RAPL package power sample unavailable: " + (note or "unknown"))
+        else:
+            self.baseline_pkg_watts = float(baseline)
+            self.notes.append(f"quiescent_pkg_watts={self.baseline_pkg_watts:.6f}")
+
+    def begin_segment(self) -> None:
+        if not self.sample:
+            return
+        try:
+            from gemma3_power import _read_rapl_package_energy
+
+            start, max_range, error = _read_rapl_package_energy()
+        except Exception as exc:
+            start, max_range, error = None, None, str(exc)
+        if error or start is None:
+            self.notes.append("timed direct RAPL package segment start unavailable: " + (error or "missing start reading"))
+            self._segment_start_uj = None
+            self._segment_max_range_uj = None
+            return
+        self._segment_start_uj = int(start)
+        self._segment_max_range_uj = max_range
+        if max_range is not None:
+            self.max_range_uj = max_range
+
+    def end_segment(self, elapsed_seconds: float) -> None:
+        if not self.sample or self._segment_start_uj is None:
+            return
+        try:
+            from gemma3_power import _read_rapl_package_energy
+
+            end, _max_range, error = _read_rapl_package_energy()
+        except Exception as exc:
+            end, error = None, str(exc)
+        if error or end is None:
+            self.notes.append("timed direct RAPL package segment end unavailable: " + (error or "missing end reading"))
+            return
+        delta = int(end) - self._segment_start_uj
+        max_range = self._segment_max_range_uj or self.max_range_uj
+        if delta < 0 and max_range:
+            delta += int(max_range)
+        if delta < 0:
+            self.notes.append("invalid negative RAPL package energy delta in timed segment")
+            return
+        self.energy_delta_uj += delta
+        self.elapsed_seconds += max(float(elapsed_seconds), 0.0)
+
+    def snapshot(self) -> dict[str, object] | None:
+        if not self.sample:
+            return None
+        watts: dict[str, float | None] = {rail: None for rail in ("cpu", "gpu", "npu", "total")}
+        status = {rail: MISSING_POWER_FIELD for rail in ("cpu", "gpu", "npu", "total")}
+        notes = list(dict.fromkeys(self.notes))
+        aligned = False
+        if self.elapsed_seconds > 0.0 and self.energy_delta_uj > 0:
+            pkg_avg = (self.energy_delta_uj / 1_000_000.0) / self.elapsed_seconds
+            watts["total"] = pkg_avg
+            status["total"] = "RAPL_SYSFS_PACKAGE_SEGMENTED"
+            aligned = True
+            notes.append("package watts use direct RAPL sysfs energy_uj deltas summed over NPU run.start/wait2 segments")
+            if self.baseline_pkg_watts is not None:
+                watts["npu"] = max(pkg_avg - self.baseline_pkg_watts, 0.0)
+                status["npu"] = "PSEUDO_RAPL_SYSFS_DELTA_SEGMENTED"
+                notes.append("NPU rail is pseudo power: segmented package watts minus quiescent package watts before the run")
+            else:
+                notes.append("pseudo-NPU power requires a quiescent package-watt sample before the run")
+        else:
+            notes.append("no readable segmented RAPL package energy was captured")
+        return {
+            "schema_version": 1,
+            "sampling_backend": self.sampling_backend,
+            "aligned_with_timed_window": aligned,
+            "watts": watts,
+            "field_status": status,
+            "run_id": self.run_id,
+            "notes": notes,
+            "segmented_elapsed_seconds": self.elapsed_seconds,
+            "segmented_energy_delta_uj": self.energy_delta_uj,
+        }
 
 
 def _projection_tensor_keys(model_variant: str, weights_dir: Path) -> dict[str, str]:
@@ -263,6 +382,8 @@ def _run_projection(
     weight,
     activation,
     object_file: Path,
+    timed_kernel_seconds: list[float] | None = None,
+    power_meter=None,
 ):
     import numpy as np
     from ml_dtypes import bfloat16
@@ -315,6 +436,8 @@ def _run_projection(
             inputs=[packed_l3, activation_blocks[cb_slice, :]],
             output_shape=expected.shape,
             output_dtype=bfloat16,
+            timed_kernel_seconds=timed_kernel_seconds,
+            power_meter=power_meter,
         )
         accum += partial.astype(np.float32)
     actual_padded = accum.astype(bfloat16).reshape(-1)
@@ -376,6 +499,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
     blockers: list[str] = []
     projection_keys: dict[str, str] = {}
     projection_evidence: list[ProjectionEvidence] = []
+    timed_kernel_samples: list[float] = []
+    power_meter = _SegmentedRAPLPowerMeter(
+        sample=bool(getattr(args, "power_sample", False)),
+        run_id="gemma3_1b_decode_full_layer_probe",
+    )
     start = time.perf_counter()
 
     try:
@@ -410,6 +538,8 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
             inputs=[x_input, norm_payload],
             output_shape=norm_expected.shape,
             output_dtype=bfloat16,
+            timed_kernel_seconds=timed_kernel_samples,
+            power_meter=power_meter,
         )
         rms_correlation = _correlation(norm_actual, norm_expected)
         stdout_lines.append(f"RMSNorm correlation: {rms_correlation:.6f}")
@@ -426,6 +556,8 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
                 weight=weight,
                 activation=actual["input_norm"],
                 object_file=object_file,
+                timed_kernel_seconds=timed_kernel_samples,
+                power_meter=power_meter,
             )
             projection_evidence.append(
                 ProjectionEvidence(
@@ -469,6 +601,8 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
             weight=o_weight,
             activation=attention_actual,
             object_file=object_file,
+            timed_kernel_seconds=timed_kernel_samples,
+            power_meter=power_meter,
         )
         projection_evidence.append(
             ProjectionEvidence(evidence.family, projection_keys["o_proj"], evidence.shape, evidence.padded_shape, evidence.row_blocks, evidence.col_blocks, evidence.projection_correlation, evidence.dense_projection_correlation)
@@ -489,12 +623,16 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
             weight=_load_safetensor_array(weights_dir, projection_keys["gate_proj"]),
             activation=pre_ff_actual.reshape(-1),
             object_file=object_file,
+            timed_kernel_seconds=timed_kernel_samples,
+            power_meter=power_meter,
         )
         up_actual, up_expected, _, up_evidence = _run_projection(
             family="up_proj",
             weight=_load_safetensor_array(weights_dir, projection_keys["up_proj"]),
             activation=pre_ff_actual.reshape(-1),
             object_file=object_file,
+            timed_kernel_seconds=timed_kernel_samples,
+            power_meter=power_meter,
         )
         for fam, ev in (("gate_proj", gate_evidence), ("up_proj", up_evidence)):
             projection_evidence.append(
@@ -512,6 +650,8 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
             weight=_load_safetensor_array(weights_dir, projection_keys["down_proj"]),
             activation=mlp_actual,
             object_file=object_file,
+            timed_kernel_seconds=timed_kernel_samples,
+            power_meter=power_meter,
         )
         projection_evidence.append(
             ProjectionEvidence(down_evidence.family, projection_keys["down_proj"], down_evidence.shape, down_evidence.padded_shape, down_evidence.row_blocks, down_evidence.col_blocks, down_evidence.projection_correlation, down_evidence.dense_projection_correlation)
@@ -543,6 +683,10 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         stderr_lines.append(str(exc))
 
     elapsed = time.perf_counter() - start
+    timed_total = sum(timed_kernel_samples) if timed_kernel_samples else None
+    timed_mean = (timed_total / len(timed_kernel_samples)) if timed_total is not None and timed_kernel_samples else None
+    diagnostic_layer_tps = (1.0 / timed_total) if timed_total and timed_total > 0.0 else None
+    estimated_decode_tps = (1.0 / (timed_total * 26.0)) if timed_total and timed_total > 0.0 else None
     status = "FULL_LAYER_SEQUENCE_PASS" if not blockers else "FULL_LAYER_SEQUENCE_BLOCKED"
     return Gemma3FullLayerProbeResult(
         schema_version=1,
@@ -582,6 +726,18 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         mlp_activation_correlation=mlp_activation_correlation,
         final_output_correlation=final_output_correlation,
         dense_final_output_correlation=dense_final_output_correlation,
+        timed_kernel_count=len(timed_kernel_samples),
+        timed_kernel_seconds=timed_total,
+        timed_kernel_mean_seconds=timed_mean,
+        diagnostic_layer_passes_per_second=diagnostic_layer_tps,
+        estimated_26_layer_decode_tps_kernel_only=estimated_decode_tps,
+        timing_window="segmented-run-start-wait2-only",
+        timing_notes=(
+            "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls for this staged layer",
+            "compile, ELF load, BO allocation, BO writes/preload, argument binding, output sync/readback, and host fallback compute are excluded",
+            "estimated_26_layer_decode_tps_kernel_only is an extrapolation from one layer and is not a measured full-model decode TPS",
+        ),
+        power_snapshot=power_meter.snapshot(),
         threshold=DEFAULT_THRESHOLD,
         remaining_model_runner_gaps=("full-1b-loop-not-wired",),
         command=tuple(sys.argv),
@@ -632,6 +788,14 @@ def _self_test() -> None:
         mlp_activation_correlation=1.0,
         final_output_correlation=0.999998,
         dense_final_output_correlation=None,
+        timed_kernel_count=len(projection_evidence) + 1,
+        timed_kernel_seconds=0.123,
+        timed_kernel_mean_seconds=0.123 / float(len(projection_evidence) + 1),
+        diagnostic_layer_passes_per_second=1.0 / 0.123,
+        estimated_26_layer_decode_tps_kernel_only=1.0 / (0.123 * 26.0),
+        timing_window="segmented-run-start-wait2-only",
+        timing_notes=("fixture",),
+        power_snapshot=None,
         threshold=DEFAULT_THRESHOLD,
         remaining_model_runner_gaps=("full-1b-loop-not-wired",),
         command=("python3", "gemma3_full_layer_probe.py", "--self-test"),
@@ -663,6 +827,7 @@ def main() -> int:
     parser.add_argument("--weights-dir", type=Path)
     parser.add_argument("--norm-tensor-key", default=DEFAULT_NORM_TENSOR_KEY)
     parser.add_argument("--result-json", type=Path)
+    parser.add_argument("--power-sample", action="store_true")
     args = parser.parse_args()
 
     if args.self_test:

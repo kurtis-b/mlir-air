@@ -353,6 +353,8 @@ def _run_elf_with_runner_bos(
     inputs: list[object],
     output_shape: tuple[int, ...],
     output_dtype,
+    timed_kernel_seconds: list[float] | None = None,
+    power_meter=None,
 ):
     import numpy as np
     from air.backend.xrt import XRTBackend
@@ -381,8 +383,16 @@ def _run_elf_with_runner_bos(
         run = xrt.run(kernel)
         for index, bo in enumerate(bos):
             run.set_arg(index, bo)
+        if power_meter is not None:
+            power_meter.begin_segment()
+        timed_start = time.perf_counter()
         run.start()
         run.wait2()
+        timed_elapsed = time.perf_counter() - timed_start
+        if timed_kernel_seconds is not None:
+            timed_kernel_seconds.append(timed_elapsed)
+        if power_meter is not None:
+            power_meter.end_segment(timed_elapsed)
         bos[-1].sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
         actual = bos[-1].read(sizes[-1], 0).view(output_dtype).reshape(output_shape)
     backend.unload()
