@@ -5,29 +5,32 @@ JSON result cells, Markdown summaries, and CSV summaries. Large model weights,
 tokenizer caches, xclbins, ELFs, trace dumps, and debug IR should stay out of
 source control unless they are reviewed as compact fixtures.
 
-## Initial 1k CPU/NPU Paper-Cell Evidence
+## Initial 1k CPU/iGPU/NPU Paper-Cell Evidence
 
-- `gemma3_1b_cpu_prefill_1k_initial.json`: real local Gemma3 1B CPU/HF 1k
-  prefill TTFT measurement. Local runtime-only TTFT is 1.495274677 s versus the
-  paper CPU target of 4.06 s, classified as `EXPLAINED_DEVIATION`.
-- `gemma3_1b_cpu_decode_1k_initial.json`: real local Gemma3 1B CPU/HF 1k
-  decode-only TPS measurement. The helper builds the KV cache before the timed
-  section and times 16 token steps. Local TPS is 15.844624648 versus the paper
-  CPU target of 41.9, classified as `EXPLAINED_DEVIATION`.
-- `gemma3_1b_npu_prefill_1k_blocked_initial.json` and
-  `gemma3_1b_npu_decode_1k_blocked_initial.json`: matching NPU paper cells that
-  record `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` rather than timing data because
-  model-kernel launch, kernel argument binding, nonlinear model-stage
-  promotion, and paper-shape hardware reruns remain incomplete.
-- Power sampling was requested for these cells, but all CPU/GPU/NPU/total rails
-  remain `MISSING_POWER_FIELD`: XRT reports `Estimated Power: N/A`; ROCm SMI can sample future iGPU
-  timed-window power; CPU package watts and pseudo-NPU package-delta watts now
-  prefer direct RAPL sysfs package-energy deltas from
-  `/sys/class/powercap/intel-rapl:0/energy_uj`, with `turbostat_pkgwatt` or
-  raw `turbostat` only as fallback. Direct RAPL reads are enabled through the `power` group for the refreshed
-  CPU result cells. The saved prefill cell reports 49.493 W package/total, and
-  the saved decode cell reports 40.510 W package/total. Pseudo-NPU power still
-  requires a real timed NPU run.
+The initial 1B 1k baseline cells use prompt length 1024, one warmup iteration,
+three timed iterations, and 16 decode tokens. The timed region excludes model
+load, tokenizer work, input construction, device placement, compile, BO
+creation/preload, xclbin/ELF load, and kernel argument setup.
+
+| File | Backend | Metric | Local | Paper | Classification | Power |
+| --- | --- | --- | ---: | ---: | --- | --- |
+| `gemma3_1b_cpu_prefill_1k_initial.json` | CPU/HF | Prefill TTFT | 1.430773033 s | 4.06 s | `EXPLAINED_DEVIATION` | 45.643 W RAPL package/total |
+| `gemma3_1b_cpu_decode_1k_initial.json` | CPU/HF | Decode TPS | 12.400321286 | 41.9 | `EXPLAINED_DEVIATION` | 45.727 W RAPL package/total |
+| `gemma3_1b_igpu_prefill_1k_initial.json` | iGPU/HF ROCm | Prefill TTFT | 0.527177805 s | 0.51 s | `PAPER_MATCH` | 37.273 W ROCm SMI GPU rail |
+| `gemma3_1b_igpu_decode_1k_initial.json` | iGPU/HF ROCm | Decode TPS | 13.738045814 | 38.0 | `EXPLAINED_DEVIATION` | 42.871 W ROCm SMI GPU rail |
+| `gemma3_1b_npu_prefill_1k_blocked_initial.json` | NPU | Prefill TTFT | blocked | 0.95 s | `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` | pseudo-NPU RAPL delta pending |
+| `gemma3_1b_npu_decode_1k_blocked_initial.json` | NPU | Decode TPS | blocked | 41.1 | `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` | pseudo-NPU RAPL delta pending |
+
+The iGPU cells set `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` and use ROCm SMI
+for timed-window GPU rail sampling. CPU cells use direct RAPL sysfs package
+energy through the `power` group. iGPU CPU/total rails remain
+`MISSING_POWER_FIELD`; NPU timing and pseudo-NPU power remain blocked by model
+kernel launch, kernel argument binding, nonlinear model-stage promotion, and
+fresh paper-shape hardware reruns.
+
+`gemma3_1b_initial_1k_results.json` bundles these six cells, and
+`gemma3_1b_initial_1k_summary.md` / `gemma3_1b_initial_1k_summary.csv` contain
+the generated paper-target comparison summary.
 
 
 ## Static Preload Evidence

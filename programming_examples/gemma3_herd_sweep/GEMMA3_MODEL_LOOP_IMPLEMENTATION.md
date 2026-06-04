@@ -561,19 +561,33 @@ Blocked evidence:
   validation is complete for 1B, 4B text, and the 4B vision text stack. The
   prior unmeasured-nonlinear fallback blocker is retired by measured CPU-reference
   fallback records, but those records are not NPU promotion evidence.
-- Dependency-light CPU/HF smoke paths now validate local 1B text, 4B text,
+- Dependency-light Torch/HF smoke paths now validate local 1B text, 4B text,
   and 4B synthetic-image weights/tokenizer/processor execution without AIR
-  imports. The initial local Gemma3 1B 1k CPU/HF paper-cell measurements are
-  saved under `results/`: prefill TTFT is 1.495274677 s versus the paper CPU
-  target of 4.06 s (`EXPLAINED_DEVIATION`, 63.17% faster), and decode-only TPS
-  is 15.844624648 tokens/s versus the paper CPU target of 41.9 tokens/s
-  (`EXPLAINED_DEVIATION`, 62.18% slower). The decode helper constructs the 1k
-  KV cache before the timed window and times only 16 token-by-token decode
-  steps. These are CPU/HF baseline measurements on the local Strix host, not
-  NPU paper-parity claims. The matching 1k NPU result records are saved as
-  blocked JSON cells with `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` because model
-  kernel launch, kernel argument binding, nonlinear model-stage promotion, and
-  fresh paper-shape hardware reruns remain incomplete.
+  imports. Initial local Gemma3 1B 1k CPU/iGPU paper-cell measurements are
+  saved under `results/` and use `warmup_iters=1`, `timed_iters=3`, prompt
+  length 1024, and 16 decode tokens. The timed region excludes model load,
+  tokenizer work, input construction, device placement, compile, BO creation,
+  BO preload, xclbin/ELF load, and kernel argument setup. These are local
+  Torch/HF baseline measurements on the Strix host, not NPU paper-parity
+  claims.
+
+  | Backend | Metric | Local | Paper target | Delta | Classification | Timed power |
+  | --- | --- | ---: | ---: | ---: | --- | --- |
+  | CPU/HF | Prefill TTFT 1k | 1.430773033 s | 4.06 s | 64.76% faster | `EXPLAINED_DEVIATION` | 45.643 W package/total by direct RAPL |
+  | CPU/HF | Decode 1k | 12.400321286 TPS | 41.9 TPS | 70.40% slower | `EXPLAINED_DEVIATION` | 45.727 W package/total by direct RAPL |
+  | iGPU/HF ROCm | Prefill TTFT 1k | 0.527177805 s | 0.51 s | 3.37% slower | `PAPER_MATCH` | 37.273 W ROCm SMI GPU rail |
+  | iGPU/HF ROCm | Decode 1k | 13.738045814 TPS | 38.0 TPS | 63.85% slower | `EXPLAINED_DEVIATION` | 42.871 W ROCm SMI GPU rail |
+  | NPU | Prefill TTFT 1k | blocked | 0.95 s | n/a | `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` | pseudo-NPU RAPL delta pending real timed NPU run |
+  | NPU | Decode 1k | blocked | 41.1 TPS | n/a | `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` | pseudo-NPU RAPL delta pending real timed NPU run |
+
+  iGPU runs set `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`; without that
+  setting, local prefill was materially slower and did not match the iGPU 1k
+  paper cell. The decode helper constructs the 1k KV cache before the timed
+  window and times only 16 token-by-token decode steps. The matching 1k NPU
+  result records remain blocked JSON cells with
+  `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` because model kernel launch, kernel
+  argument binding, nonlinear model-stage promotion, and fresh paper-shape
+  hardware reruns remain incomplete.
   `gemma3_npu_preflight.py` records
   real projection padding and Q4NX block counts needed for NPU wiring.
   `gemma3_npu_wiring.py` maps each real-shape text layer into prefill/decode
@@ -611,10 +625,11 @@ Blocked evidence:
   ledger preserves earlier monolithic-KV failures where 4B text and vision
   requested 22,708,504,576 bytes and failed at the first 9,126,805,504-byte
   `kv_cache_k` BO after allocating 4,454,893,568 bytes. Those old records are
-  strategy-failure evidence, not current BO allocation blockers. `gemma3_real_execution.py` also has
-  a CPU/HF warmup/timed-iteration benchmark path for small local smoke runs. No
-  CPU/iGPU/NPU paper baseline or speedup claim is emitted until benchmark-length
-  execution and NPU model execution are implemented.
+  strategy-failure evidence, not current BO allocation blockers. `gemma3_real_execution.py` now has
+  a Torch/HF warmup/timed-iteration benchmark path for CPU and ROCm iGPU local
+  baseline runs. No NPU paper baseline or NPU speedup claim is emitted until
+  benchmark-length NPU model execution is implemented.
+
 
 ### Phase G: end-to-end 4B text reproduction
 
@@ -818,7 +833,10 @@ Implemented evidence and blocker:
   paper cells distinguish BO planning, static preload planning, kernel launch,
   host fallback, runtime buffer-binding state, and kernel argument-binding gaps.
 - `gemma3_paper_compare.py --compare` accepts either a single result cell or a
-  wrapper with `results`, and can emit Markdown and CSV summaries.
+  wrapper with `results`, and can emit Markdown and CSV summaries. The initial
+  1B 1k CPU/iGPU measured cells plus NPU blocked cells are bundled in
+  `results/gemma3_1b_initial_1k_results.json`, with generated Markdown and CSV
+  summaries saved beside it.
 - `run_model_loop_results.lit` covers blocked real-artifact result generation,
   paper comparison, Markdown/CSV summary emission, and JSON schema essentials.
 - The harness is implemented, but real `PAPER_MATCH` cells remain blocked until
@@ -857,15 +875,19 @@ Implemented evidence and blocker:
   JSON; unavailable rails are `null` with `MISSING_POWER_FIELD`, never zero.
 - `run_model_loop_power.lit` covers the missing-telemetry contract and verifies
   that JSON output keeps watts null while statuses classify missing rails.
-- Initial 1k CPU/HF paper-cell result JSONs request power sampling, but local
-  power remains `MISSING_POWER_FIELD`: `xrt-smi examine -r all` reports
-  `Estimated Power: N/A`; `rocm-smi --showpower` is parseable for future iGPU
-  timed windows; CPU package watts and pseudo-NPU package-delta watts now
-  prefer the direct RAPL sysfs package-energy counter
-  `/sys/class/powercap/intel-rapl:0/energy_uj`, using `turbostat_pkgwatt` or
-  raw `turbostat` only as fallback. Direct RAPL reads are now enabled through the `power` group. The initial
-  CPU/HF 1k result JSONs contain aligned package-power samples: 49.493 W for
-  prefill and 40.510 W for decode. NPU package-delta power remains pending a
+- Initial 1k CPU/HF and iGPU/HF paper-cell result JSONs request timed-window
+  power sampling. CPU cells use direct RAPL sysfs package-energy deltas from
+  `/sys/class/powercap/intel-rapl:0/energy_uj`; the refreshed CPU prefill cell
+  reports 45.643 W package/total versus the paper CPU-prefill 1B power target
+  of 24 W, and the refreshed CPU decode cell reports 45.727 W package/total
+  versus the paper CPU-decode 1B target of 29 W. iGPU cells use ROCm SMI socket
+  graphics package power; the refreshed iGPU prefill cell reports 37.273 W on
+  the GPU rail versus the paper iGPU-prefill 1B GPU rail target of 24 W, and
+  the refreshed iGPU decode cell reports 42.871 W on the GPU rail versus the
+  paper iGPU-decode 1B GPU rail target of 22 W. iGPU CPU and total rails remain
+  `MISSING_POWER_FIELD` because this iteration did not combine ROCm SMI with a
+  separate package/CPU rail measurement. `xrt-smi examine -r all` still reports
+  `Estimated Power: N/A`, so pseudo-NPU package-delta power remains pending a
   real timed NPU run.
 - Full power-table comparison and TPS/W reproduction remain blocked until a
   real timed inference run and an approved telemetry backend are available.

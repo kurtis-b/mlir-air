@@ -36,18 +36,18 @@
   },
   "backend": "cpu",
   "classification": "EXPLAINED_DEVIATION",
-  "command": "gemma3_inference.py --paper-benchmark --model-variant gemma3-1b --backend cpu --prompt-len 1024 --decode-tokens 0 --metric prefill_ttft_seconds --warmup-iters 1 --timed-iters 3 --power-sample --compare-paper --result-json programming_examples/gemma3_herd_sweep/results/gemma3_1b_cpu_prefill_1k_initial.json",
+  "command": "gemma3_inference.py --paper-benchmark --model-variant gemma3-1b --backend cpu --prompt-len 1024 --decode-tokens 0 --metric prefill_ttft_seconds --warmup-iters 1 --timed-iters 3 --power-sample --compare-paper --result-json /tmp/gemma3_1b_cpu_prefill_1k_clean.json",
   "compile_time_included": false,
   "correctness": "PASS",
   "decode_tokens": 0,
-  "delta_pct": 65.54208399838048,
+  "delta_pct": 64.75928490090664,
   "dirty_worktree": false,
   "environment_comparable": true,
   "execution_wiring": null,
   "explanation": "local CPU/HF measurement uses this Strix host and Transformers runtime; it is a baseline cell, not validated NPU paper parity",
-  "git_commit": "ba1222fd37c87f43a1499984147885611f608e0d",
+  "git_commit": "6b3b8b1fb51295e94f083ec2f31de3dae4f36559",
   "host_fallbacks": [],
-  "local_value": 1.3989913896657526,
+  "local_value": 1.430773033023191,
   "metric": "prefill_ttft_seconds",
   "missing_environment_fields": [],
   "model_runner": null,
@@ -76,22 +76,22 @@
     "total": "RAPL_SYSFS_PACKAGE"
   },
   "power_watts": {
-    "cpu": 46.3453712526595,
+    "cpu": 45.64307137427586,
     "gpu": null,
     "npu": null,
-    "total": 46.3453712526595
+    "total": 45.64307137427586
   },
   "real_benchmark": {
     "backend": "cpu-hf",
     "decode_tokens": 0,
-    "load_seconds": 1.7708443410228938,
-    "local_value": 1.3989913896657526,
+    "load_seconds": 1.8337415689602494,
+    "local_value": 1.430773033023191,
     "logits_shape": [
       1,
       1024,
       262144
     ],
-    "mean_seconds": 1.3989913896657526,
+    "mean_seconds": 1.430773033023191,
     "metric": "prefill_ttft_seconds",
     "model_variant": "gemma3-1b",
     "notes": [
@@ -117,10 +117,10 @@
       "sampling_backend": "rapl-sysfs+turbostat+rocm-smi",
       "schema_version": 1,
       "watts": {
-        "cpu": 46.3453712526595,
+        "cpu": 45.64307137427586,
         "gpu": null,
         "npu": null,
-        "total": 46.3453712526595
+        "total": 45.64307137427586
       }
     },
     "prompt_token_count": 1024,

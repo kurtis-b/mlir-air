@@ -36,18 +36,18 @@
   },
   "backend": "igpu",
   "classification": "PAPER_MATCH",
-  "command": "gemma3_inference.py --paper-benchmark --model-variant gemma3-1b --backend igpu --prompt-len 1024 --decode-tokens 0 --metric prefill_ttft_seconds --warmup-iters 1 --timed-iters 3 --power-sample --compare-paper --result-json programming_examples/gemma3_herd_sweep/results/gemma3_1b_igpu_prefill_1k_initial.json",
+  "command": "gemma3_inference.py --paper-benchmark --model-variant gemma3-1b --backend igpu --prompt-len 1024 --decode-tokens 0 --metric prefill_ttft_seconds --warmup-iters 1 --timed-iters 3 --power-sample --compare-paper --result-json /tmp/gemma3_1b_igpu_prefill_1k_clean.json",
   "compile_time_included": false,
   "correctness": "PASS",
   "decode_tokens": 0,
-  "delta_pct": 4.0922479743588305,
-  "dirty_worktree": true,
+  "delta_pct": 3.3681970556857106,
+  "dirty_worktree": false,
   "environment_comparable": true,
   "execution_wiring": null,
   "explanation": null,
-  "git_commit": "ba1222fd37c87f43a1499984147885611f608e0d",
+  "git_commit": "6b3b8b1fb51295e94f083ec2f31de3dae4f36559",
   "host_fallbacks": [],
-  "local_value": 0.53087046466923,
+  "local_value": 0.5271778049839971,
   "metric": "prefill_ttft_seconds",
   "missing_environment_fields": [],
   "model_runner": null,
@@ -77,21 +77,21 @@
   },
   "power_watts": {
     "cpu": null,
-    "gpu": 37.2804,
+    "gpu": 37.272800000000004,
     "npu": null,
     "total": null
   },
   "real_benchmark": {
     "backend": "igpu-hf-rocm",
     "decode_tokens": 0,
-    "load_seconds": 2.3923125530127436,
-    "local_value": 0.53087046466923,
+    "load_seconds": 2.404083944973536,
+    "local_value": 0.5271778049839971,
     "logits_shape": [
       1,
       1024,
       262144
     ],
-    "mean_seconds": 0.53087046466923,
+    "mean_seconds": 0.5271778049839971,
     "metric": "prefill_ttft_seconds",
     "model_variant": "gemma3-1b",
     "notes": [
@@ -118,7 +118,7 @@
       "schema_version": 1,
       "watts": {
         "cpu": null,
-        "gpu": 37.2804,
+        "gpu": 37.272800000000004,
         "npu": null,
         "total": null
       }
