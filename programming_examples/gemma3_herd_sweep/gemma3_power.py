@@ -46,6 +46,9 @@ class Gemma3PowerWindow:
     target_backend: str | None
     baseline_pkg_watts: float | None
     run_id: str | None
+    rapl_start_uj: int | None = None
+    rapl_max_energy_range_uj: int | None = None
+    pkg_sampler_enabled: bool = False
     notes: list[str] = field(default_factory=list)
     pkg_samples: list[float] = field(default_factory=list)
     gpu_samples: list[float] = field(default_factory=list)
@@ -99,6 +102,66 @@ def _parse_rocm_smi_watts(text: str) -> float | None:
     return None
 
 
+def _find_rapl_package_dir() -> Path | None:
+    powercap = Path("/sys/class/powercap")
+    if not powercap.exists():
+        return None
+    candidates = sorted(powercap.glob("intel-rapl:*"))
+    package_candidates: list[Path] = []
+    for path in candidates:
+        if not (path / "energy_uj").exists():
+            continue
+        name = ""
+        try:
+            name = (path / "name").read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+        if name.startswith("package"):
+            package_candidates.append(path)
+    if package_candidates:
+        return package_candidates[0]
+    fallback = powercap / "intel-rapl:0"
+    return fallback if (fallback / "energy_uj").exists() else None
+
+
+def _read_rapl_package_energy() -> tuple[int | None, int | None, str | None]:
+    package_dir = _find_rapl_package_dir()
+    if package_dir is None:
+        return None, None, "RAPL package energy counter was not found"
+    energy, error = _read_int(package_dir / "energy_uj")
+    if error or energy is None:
+        return None, None, error or f"failed reading {package_dir / 'energy_uj'}"
+    max_range, range_error = _read_int(package_dir / "max_energy_range_uj")
+    if range_error and "permission denied" not in range_error:
+        return energy, None, range_error
+    return energy, max_range, None
+
+
+def _rapl_delta_watts(start_uj: int, end_uj: int, max_range_uj: int | None, elapsed_seconds: float) -> tuple[float | None, str | None]:
+    if elapsed_seconds <= 0.0:
+        return None, "elapsed_seconds must be positive for RAPL package power calculation"
+    delta_uj = end_uj - start_uj
+    if delta_uj < 0 and max_range_uj:
+        delta_uj += max_range_uj
+    if delta_uj < 0:
+        return None, "invalid negative RAPL package energy delta"
+    return (delta_uj / 1_000_000.0) / elapsed_seconds, None
+
+
+def _sample_rapl_pkg_watts(interval_seconds: float = 0.1) -> tuple[float | None, str | None, str]:
+    start, max_range, start_error = _read_rapl_package_energy()
+    if start_error or start is None:
+        return None, start_error or "RAPL package start reading unavailable", "rapl-sysfs"
+    time.sleep(max(interval_seconds, 0.0))
+    end, _end_range, end_error = _read_rapl_package_energy()
+    if end_error or end is None:
+        return None, end_error or "RAPL package end reading unavailable", "rapl-sysfs"
+    value, delta_error = _rapl_delta_watts(start, end, max_range, max(interval_seconds, 1e-9))
+    if delta_error or value is None:
+        return None, delta_error or "RAPL package delta unavailable", "rapl-sysfs"
+    return value, None, "rapl-sysfs"
+
+
 def _sample_turbostat_pkgwatt() -> tuple[float | None, str | None, str]:
     helper = os.environ.get("GEMMA3_TURBOSTAT_PKGWATT") or shutil.which("turbostat_pkgwatt")
     if helper:
@@ -150,11 +213,13 @@ def _wants_gpu_sampler(target_backend: str | None) -> bool:
 def _available_backend() -> tuple[str, list[str]]:
     notes: list[str] = []
     backends: list[str] = []
+    if _find_rapl_package_dir() is not None:
+        backends.append("rapl-sysfs")
     if os.environ.get("GEMMA3_TURBOSTAT_PKGWATT") or shutil.which("turbostat_pkgwatt"):
         backends.append("turbostat_pkgwatt")
     elif shutil.which("turbostat"):
         backends.append("turbostat")
-        notes.append("raw turbostat is available, but PkgWatt sampling may require matching linux-tools and privileges")
+        notes.append("raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges")
     if shutil.which("rocm-smi"):
         backends.append("rocm-smi")
     elif shutil.which("amd-smi"):
@@ -224,7 +289,7 @@ def _read_rapl_energy() -> tuple[dict[str, int], dict[str, int | None], list[str
 def _sampler_loop(window: Gemma3PowerWindow, sample_interval_seconds: float) -> None:
     assert window.stop_event is not None
     while not window.stop_event.is_set():
-        if _wants_pkg_sampler(window.target_backend):
+        if window.pkg_sampler_enabled:
             value, note, _backend = _sample_turbostat_pkgwatt()
             if value is not None:
                 window.pkg_samples.append(value)
@@ -258,12 +323,24 @@ def begin_power_window(
         )
     backend, notes = _available_backend()
     baseline_pkg_watts = None
+    rapl_start_uj = None
+    rapl_max_energy_range_uj = None
+    pkg_sampler_enabled = False
     if _wants_pkg_sampler(target_backend):
-        baseline_pkg_watts, note, pkg_backend = _sample_turbostat_pkgwatt()
-        if pkg_backend not in backend:
-            backend = "+".join(item for item in (backend, pkg_backend) if item and item != "missing") or pkg_backend
-        if note:
-            notes.append("quiescent package power sample unavailable: " + note)
+        baseline_pkg_watts, baseline_note, baseline_backend = _sample_rapl_pkg_watts()
+        if baseline_backend not in backend:
+            backend = "+".join(item for item in (backend, baseline_backend) if item and item != "missing") or baseline_backend
+        if baseline_note:
+            notes.append("quiescent direct RAPL package power sample unavailable: " + baseline_note)
+            baseline_pkg_watts, fallback_note, fallback_backend = _sample_turbostat_pkgwatt()
+            if fallback_backend not in backend:
+                backend = "+".join(item for item in (backend, fallback_backend) if item and item != "missing") or fallback_backend
+            if fallback_note:
+                notes.append("quiescent fallback package power sample unavailable: " + fallback_note)
+        rapl_start_uj, rapl_max_energy_range_uj, rapl_start_error = _read_rapl_package_energy()
+        if rapl_start_error or rapl_start_uj is None:
+            notes.append("timed direct RAPL package start unavailable: " + (rapl_start_error or "missing start reading"))
+            pkg_sampler_enabled = True
     window = Gemma3PowerWindow(
         schema_version=1,
         sampling_backend=backend,
@@ -271,10 +348,13 @@ def begin_power_window(
         target_backend=target_backend,
         baseline_pkg_watts=baseline_pkg_watts,
         run_id=run_id,
+        rapl_start_uj=rapl_start_uj,
+        rapl_max_energy_range_uj=rapl_max_energy_range_uj,
+        pkg_sampler_enabled=pkg_sampler_enabled,
         notes=list(notes),
         stop_event=threading.Event(),
     )
-    if _wants_pkg_sampler(target_backend) or _wants_gpu_sampler(target_backend):
+    if pkg_sampler_enabled or _wants_gpu_sampler(target_backend):
         window.sampler_thread = threading.Thread(
             target=_sampler_loop,
             args=(window, sample_interval_seconds),
@@ -304,27 +384,49 @@ def finish_power_window(window: Gemma3PowerWindow, *, elapsed_seconds: float) ->
     if elapsed_seconds <= 0.0:
         notes.append("elapsed_seconds must be positive for power calculation")
     pkg_avg = fmean(window.pkg_samples) if window.pkg_samples else None
+    pkg_status = "PKGWATT_PACKAGE"
+    pkg_note = "package watts use turbostat package-watt fallback"
+    if window.rapl_start_uj is not None:
+        rapl_end_uj, _rapl_end_range, rapl_end_error = _read_rapl_package_energy()
+        if rapl_end_error or rapl_end_uj is None:
+            notes.append("timed direct RAPL package end unavailable: " + (rapl_end_error or "missing end reading"))
+        else:
+            rapl_pkg_avg, rapl_delta_error = _rapl_delta_watts(
+                window.rapl_start_uj,
+                rapl_end_uj,
+                window.rapl_max_energy_range_uj,
+                elapsed_seconds,
+            )
+            if rapl_delta_error or rapl_pkg_avg is None:
+                notes.append(rapl_delta_error or "direct RAPL package delta unavailable")
+            else:
+                pkg_avg = rapl_pkg_avg
+                pkg_status = "RAPL_SYSFS_PACKAGE"
+                pkg_note = "package watts use direct RAPL sysfs energy_uj delta over the timed window"
     gpu_avg = fmean(window.gpu_samples) if window.gpu_samples else None
     if window.target_backend == "cpu" and pkg_avg is not None:
-        _set_watt(watts, status, "cpu", pkg_avg, "PKGWATT_PACKAGE")
-        _set_watt(watts, status, "total", pkg_avg, "PKGWATT_PACKAGE")
-        notes.append("CPU rail uses turbostat package watts; package power is treated as total for this CPU baseline")
+        _set_watt(watts, status, "cpu", pkg_avg, pkg_status)
+        _set_watt(watts, status, "total", pkg_avg, pkg_status)
+        notes.append("CPU rail uses package watts; package power is treated as total for this CPU baseline")
+        notes.append(pkg_note)
     elif window.target_backend == "npu" and pkg_avg is not None:
-        _set_watt(watts, status, "total", pkg_avg, "PKGWATT_PACKAGE")
+        _set_watt(watts, status, "total", pkg_avg, pkg_status)
         if window.baseline_pkg_watts is not None:
             pseudo_npu = max(pkg_avg - window.baseline_pkg_watts, 0.0)
-            _set_watt(watts, status, "npu", pseudo_npu, "PSEUDO_PKGWATT_DELTA")
+            pseudo_status = "PSEUDO_RAPL_SYSFS_DELTA" if pkg_status == "RAPL_SYSFS_PACKAGE" else "PSEUDO_PKGWATT_DELTA"
+            _set_watt(watts, status, "npu", pseudo_npu, pseudo_status)
             notes.append(
                 "NPU rail is pseudo power: average package watts during timed window minus quiescent package watts before the run"
             )
             notes.append(f"quiescent_pkg_watts={window.baseline_pkg_watts:.6f}")
+            notes.append(pkg_note)
         else:
             notes.append("pseudo-NPU power requires a quiescent package-watt sample before the run")
     elif window.target_backend in ("igpu", "gpu") and gpu_avg is not None:
         _set_watt(watts, status, "gpu", gpu_avg, "ROCM_SMI_SOCKET_GRAPHICS")
         notes.append("iGPU rail uses ROCm SMI socket graphics package power sampled during the timed window")
         if pkg_avg is not None:
-            _set_watt(watts, status, "total", pkg_avg, "PKGWATT_PACKAGE")
+            _set_watt(watts, status, "total", pkg_avg, pkg_status)
     elif pkg_avg is not None:
         _set_watt(watts, status, "total", pkg_avg, "PKGWATT_PACKAGE")
         notes.append("package-watt samples were captured, but no target backend mapped them to a specific rail")
@@ -354,11 +456,14 @@ def capture_power_snapshot(*, sample: bool, run_id: str | None = None) -> Gemma3
         notes.append("power sampling was not requested")
     else:
         notes.append("instantaneous snapshots do not report watts; use begin_power_window/finish_power_window around timed inference")
-        readings, _ranges, rapl_notes = _read_rapl_energy()
-        if readings:
-            notes.append("RAPL counters are readable, but timed-window integration uses package-watt sampling instead")
+        rapl_energy, _rapl_range, rapl_error = _read_rapl_package_energy()
+        if rapl_energy is not None:
+            notes.append("direct RAPL sysfs package counter is readable; timed-window integration will use energy_uj deltas")
         else:
-            notes.extend(rapl_notes)
+            notes.append("direct RAPL sysfs package counter is unavailable: " + (rapl_error or "missing counter"))
+            readings, _ranges, rapl_notes = _read_rapl_energy()
+            if not readings:
+                notes.extend(rapl_notes)
     watts = {rail: None for rail in RAILS}
     status = {rail: MISSING_POWER_FIELD for rail in RAILS}
     return Gemma3PowerSnapshot(
@@ -429,6 +534,9 @@ def _self_test() -> None:
         raise AssertionError("PkgWatt parser failed")
     if _parse_rocm_smi_watts("Current Socket Graphics Package Power (W): 9.029") != 9.029:
         raise AssertionError("ROCm SMI parser failed")
+    watts, err = _rapl_delta_watts(100, 1_100_100, None, 1.1)
+    if err or watts != 1.0:
+        raise AssertionError((watts, err))
     window = Gemma3PowerWindow(
         schema_version=1,
         sampling_backend="fixture",

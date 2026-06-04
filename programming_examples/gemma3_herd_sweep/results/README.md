@@ -8,11 +8,11 @@ source control unless they are reviewed as compact fixtures.
 ## Initial 1k CPU/NPU Paper-Cell Evidence
 
 - `gemma3_1b_cpu_prefill_1k_initial.json`: real local Gemma3 1B CPU/HF 1k
-  prefill TTFT measurement. Local runtime-only TTFT is 1.727778663 s versus the
+  prefill TTFT measurement. Local runtime-only TTFT is 1.551954058 s versus the
   paper CPU target of 4.06 s, classified as `EXPLAINED_DEVIATION`.
 - `gemma3_1b_cpu_decode_1k_initial.json`: real local Gemma3 1B CPU/HF 1k
   decode-only TPS measurement. The helper builds the KV cache before the timed
-  section and times 16 token steps. Local TPS is 14.280128371 versus the paper
+  section and times 16 token steps. Local TPS is 13.683719230 versus the paper
   CPU target of 41.9, classified as `EXPLAINED_DEVIATION`.
 - `gemma3_1b_npu_prefill_1k_blocked_initial.json` and
   `gemma3_1b_npu_decode_1k_blocked_initial.json`: matching NPU paper cells that
@@ -21,9 +21,12 @@ source control unless they are reviewed as compact fixtures.
   promotion, and paper-shape hardware reruns remain incomplete.
 - Power sampling was requested for these cells, but all CPU/GPU/NPU/total rails
   remain `MISSING_POWER_FIELD`: XRT reports `Estimated Power: N/A`; ROCm SMI can sample future iGPU
-  timed-window power; CPU package watts and pseudo-NPU package-delta watts need
-  `turbostat_pkgwatt` or working raw `turbostat` PkgWatt support. Current raw
-  `turbostat` is blocked by missing `linux-tools-6.14.0-1020-oem`.
+  timed-window power; CPU package watts and pseudo-NPU package-delta watts now
+  prefer direct RAPL sysfs package-energy deltas from
+  `/sys/class/powercap/intel-rapl:0/energy_uj`, with `turbostat_pkgwatt` or
+  raw `turbostat` only as fallback. Current direct RAPL reads are
+  permission-denied for this user, and raw `turbostat` is blocked by missing
+  `linux-tools-6.14.0-1020-oem`.
 
 
 ## Static Preload Evidence
