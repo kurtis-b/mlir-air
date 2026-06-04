@@ -79,6 +79,7 @@ class Gemma3KernelLaunchProbeResult:
     tensor_key: str | None
     input_distribution: str | None
     argument_binding: Gemma3LaunchArgumentBindingEvidence | None
+    bo_binding_mode: str
     remaining_model_runner_gaps: tuple[str, ...]
     command: tuple[str, ...]
     returncode: int | None
@@ -128,7 +129,7 @@ class Gemma3KernelLaunchProbeResult:
             f"tensor={tensor} input={distribution} correlation={correlation} "
             f"threshold={self.threshold:g} arg_binding={arg_binding} "
             f"arg_count={arg_count} arg_keys={arg_keys} static_norm={static_norm} "
-            f"model_runner_gaps={gaps} blockers={blockers}"
+            f"bo_binding={self.bo_binding_mode} model_runner_gaps={gaps} blockers={blockers}"
         )
 
     def to_json_dict(self) -> dict[str, object]:
@@ -404,6 +405,7 @@ def _build_model_worker_command(
     output_format: str,
     tensor_key: str,
     use_full_static_norm_bo: bool,
+    use_runner_owned_bos: bool,
 ) -> tuple[str, ...]:
     command = [
         sys.executable,
@@ -426,6 +428,8 @@ def _build_model_worker_command(
     ]
     if use_full_static_norm_bo:
         command.append("--use-full-static-norm-bo")
+    if use_runner_owned_bos:
+        command.append("--use-runner-owned-bos")
     return tuple(command)
 
 
@@ -436,6 +440,7 @@ def _result_from_completed_process(
     tensor_key: str | None,
     input_distribution: str | None,
     argument_binding: Gemma3LaunchArgumentBindingEvidence | None,
+    bo_binding_mode: str,
     remaining_model_runner_gaps: tuple[str, ...],
     command: tuple[str, ...],
     returncode: int,
@@ -477,6 +482,7 @@ def _result_from_completed_process(
         tensor_key=tensor_key,
         input_distribution=input_distribution,
         argument_binding=argument_binding,
+        bo_binding_mode=bo_binding_mode,
         remaining_model_runner_gaps=remaining_model_runner_gaps,
         command=command,
         returncode=returncode,
@@ -498,6 +504,7 @@ def _run_probe_command(
     tensor_key: str | None,
     input_distribution: str | None,
     argument_binding: Gemma3LaunchArgumentBindingEvidence | None,
+    bo_binding_mode: str,
     command: tuple[str, ...],
     m: int,
     n: int,
@@ -525,6 +532,7 @@ def _run_probe_command(
         tensor_key=tensor_key,
         input_distribution=input_distribution,
         argument_binding=argument_binding,
+        bo_binding_mode=bo_binding_mode,
         remaining_model_runner_gaps=remaining_model_runner_gaps,
         command=command,
         returncode=proc.returncode,
@@ -560,6 +568,7 @@ def run_rmsnorm_launch_probe(
             tensor_key=None,
             input_distribution="standalone-random-seed0",
             argument_binding=None,
+            bo_binding_mode="xrt-runner-transient-bo",
             command=command,
             m=m,
             n=n,
@@ -585,6 +594,7 @@ def run_rmsnorm_launch_probe(
             output_format=output_format,
             tensor_key=tensor_key,
             use_full_static_norm_bo=True,
+            use_runner_owned_bos=True,
         )
         return _run_probe_command(
             model_variant=model_variant,
@@ -592,7 +602,8 @@ def run_rmsnorm_launch_probe(
             tensor_key=tensor_key,
             input_distribution=DEFAULT_INPUT_DISTRIBUTION,
             argument_binding=argument_binding,
-            remaining_model_runner_gaps=("runner-owned-bo-launch-not-wired",),
+            bo_binding_mode="runner-owned-persistent-bo",
+            remaining_model_runner_gaps=("substep-sequence-not-wired", "full-layer-not-wired"),
             command=command,
             m=m,
             n=n,
@@ -647,6 +658,77 @@ def _load_static_norm_payload(weights_dir: Path, model_variant: str, tensor_key:
     return static_norm_weights, selected, selected_offset
 
 
+def _correlation(actual, expected) -> float:
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    actual_flat = actual.reshape(-1)
+    expected_flat = expected.reshape(-1)
+    if actual.dtype == bfloat16:
+        actual_flat = actual_flat.astype(np.float64)
+    if expected.dtype == bfloat16:
+        expected_flat = expected_flat.astype(np.float64)
+    return float(np.corrcoef(actual_flat, expected_flat)[0, 1])
+
+
+def _write_bo_arg(xrt, bo, array) -> None:
+    from ml_dtypes import bfloat16
+
+    payload = array.view("int16") if array.dtype == bfloat16 else array
+    bo.write(payload, 0)
+    bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+
+
+def _run_with_runner_owned_bos(args: argparse.Namespace, mlir_module, x_input, norm_arg, y_expected) -> int:
+    import os
+    import tempfile as tempfile_module
+    import numpy as np
+    from air.backend.xrt import XRTBackend
+    from filelock import FileLock
+    from ml_dtypes import bfloat16
+
+    if args.output_format != "elf":
+        raise RuntimeError("runner-owned BO probe currently requires --output-format elf")
+    try:
+        import pyxrt as xrt
+    except Exception as exc:
+        raise RuntimeError("python:pyxrt is required for runner-owned BO launch") from exc
+
+    backend = XRTBackend(
+        verbose=False,
+        omit_while_true_loop=False,
+        output_format=args.output_format,
+        instance_name="weighted_rms_norm",
+        runtime_loop_tiling_sizes=[4, 4],
+    )
+    artifact = backend.compile(mlir_module)
+    with FileLock(os.path.join(tempfile_module.gettempdir(), "npu.lock")):
+        device = xrt.device(0)
+        elf = xrt.elf(artifact.output_binary)
+        context = xrt.hw_context(device, elf)
+        kernel = xrt.ext.kernel(context, artifact.kernel)
+        y_out = np.zeros(y_expected.shape, dtype=bfloat16)
+        arrays = [x_input, norm_arg, y_out]
+        sizes = [array.size * array.itemsize for array in arrays]
+        bos = [xrt.ext.bo(device, size) for size in sizes]
+        for bo, array in zip(bos, arrays):
+            _write_bo_arg(xrt, bo, array)
+        run = xrt.run(kernel)
+        for index, bo in enumerate(bos):
+            run.set_arg(index, bo)
+        run.start()
+        run.wait2()
+        bos[2].sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+        actual = bos[2].read(sizes[2], 0).view(y_expected.dtype).reshape(y_expected.shape)
+    corr = _correlation(actual, y_expected)
+    print(f"Output 0 correlation: {corr:.6f} (threshold: {DEFAULT_THRESHOLD})")
+    if corr >= DEFAULT_THRESHOLD:
+        print("PASS!")
+        return 0
+    print("failed.")
+    return -1
+
+
 def _model_rmsnorm_worker(args: argparse.Namespace) -> int:
     import numpy as np
     from ml_dtypes import bfloat16
@@ -670,6 +752,8 @@ def _model_rmsnorm_worker(args: argparse.Namespace) -> int:
     x_input = np.random.rand(args.m, args.n).astype(bfloat16)
     y_expected = rms_norm_reference(x_input, weight)
     mlir_module = build_module(args.m, args.n, bfloat16, 16, herd_x=args.herd_x)
+    if args.use_runner_owned_bos:
+        return _run_with_runner_owned_bos(args, mlir_module, x_input, norm_arg, y_expected)
     runner = XRTRunner(
         verbose=False,
         omit_while_true_loop=False,
@@ -698,7 +782,8 @@ PASS!
         tensor_key=DEFAULT_TENSOR_KEY,
         input_distribution=DEFAULT_INPUT_DISTRIBUTION,
         argument_binding=_fixture_argument_binding_evidence(),
-        remaining_model_runner_gaps=("runner-owned-bo-launch-not-wired",),
+        bo_binding_mode="runner-owned-persistent-bo",
+        remaining_model_runner_gaps=("substep-sequence-not-wired", "full-layer-not-wired"),
         command=("python3", "gemma3_launch_probe.py"),
         returncode=0,
         elapsed_seconds=0.125,
@@ -733,6 +818,7 @@ def main() -> int:
     parser.add_argument("--output-format", choices=("elf", "xclbin"), default=DEFAULT_OUTPUT_FORMAT)
     parser.add_argument("--tensor-key", default=DEFAULT_TENSOR_KEY)
     parser.add_argument("--use-full-static-norm-bo", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--use-runner-owned-bos", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--result-json", type=Path)
     args = parser.parse_args()
 
