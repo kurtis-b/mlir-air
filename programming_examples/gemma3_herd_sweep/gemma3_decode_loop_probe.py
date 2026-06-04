@@ -1,0 +1,688 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026, Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Gemma3 real-weight staged decode loop probe.
+
+This diagnostic runs the existing staged full-layer decode route repeatedly
+across Gemma3 1B layers with one reusable ELF runner cache. It is not a paper
+TTFT/TPS result: attention is still the single-token staged fallback, logits and
+sampling are absent, and the current FusedDQP route still writes packed inputs
+per launch. The result records exactly which timing windows are measured.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, dataclass
+import json
+from pathlib import Path
+import sys
+import time
+from typing import Any
+
+from gemma3_artifacts import MODEL_SPECS
+from gemma3_full_layer_probe import (
+    DEFAULT_FULL_LAYER_PROBE_EVIDENCE,
+    FULL_LAYER_PROJECTION_FAMILIES,
+    PROJECTION_SHAPES,
+    ProjectionEvidence,
+    _ReusableElfRunnerCache,
+    _SegmentedRAPLPowerMeter,
+    _ceil_to,
+    _geglu,
+    _norm_tensor_keys,
+    _projection_tensor_keys,
+    _rms_host,
+)
+from gemma3_power import begin_power_window, finish_power_window
+from gemma3_qkv_substep_probe import _projection_backend_options
+from gemma3_substep_probe import (
+    DEFAULT_INPUT_DISTRIBUTION,
+    DEFAULT_MODEL,
+    DEFAULT_OUTPUT_FORMAT,
+    DEFAULT_PHASE,
+    DEFAULT_THRESHOLD,
+    _activate_probe_env,
+    _correlation,
+    _git_info,
+    _load_safetensor_array,
+    _load_static_norm_payload,
+    _repo_root,
+    _resolve_weights_dir,
+    _shape_text,
+    _tail,
+)
+
+DEFAULT_SEQUENCE_KIND = "decode-loop-staged-full-1b"
+DEFAULT_LOOP_PROBE_EVIDENCE = (
+    Path(__file__).with_name("results") / "gemma3_1b_decode_loop_probe.json"
+)
+PAPER_DECODE_TPS_1K = 41.1
+
+
+@dataclass(frozen=True)
+class LayerLoopEvidence:
+    layer_index: int
+    norm_tensor_key: str
+    static_norm_tensor_offset_bytes: int
+    static_norm_argument_bytes: int
+    rms_correlation: float | None
+    final_output_correlation: float | None
+    projection_evidence: tuple[ProjectionEvidence, ...]
+    timed_kernel_count: int
+    timed_kernel_seconds: float | None
+
+    def to_json_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class Gemma3DecodeLoopProbeResult:
+    schema_version: int
+    model_variant: str
+    status: str
+    sequence_kind: str
+    phase: str
+    layer_count: int
+    decode_tokens: int
+    prompt_context_length: int
+    output_format: str
+    runner_reuse_mode: str
+    norm_argument_mode: str
+    input_shape: tuple[int, ...]
+    output_shape: tuple[int, ...]
+    input_distribution: str
+    host_fallbacks: tuple[str, ...]
+    timed_kernel_count: int
+    timed_kernel_seconds: float | None
+    timed_kernel_mean_seconds: float | None
+    measured_loop_seconds: float | None
+    diagnostic_decode_tps_loop_wall: float | None
+    diagnostic_decode_tps_kernel_only: float | None
+    paper_decode_tps_1k: float
+    loop_wall_delta_pct_vs_paper_decode_tps_1k: float | None
+    kernel_only_delta_pct_vs_paper_decode_tps_1k: float | None
+    timing_window: str
+    timing_notes: tuple[str, ...]
+    power_snapshot: dict[str, object] | None
+    segmented_kernel_power_snapshot: dict[str, object] | None
+    layer_evidence: tuple[LayerLoopEvidence, ...]
+    remaining_paper_gaps: tuple[str, ...]
+    command: tuple[str, ...]
+    returncode: int | None
+    elapsed_seconds: float | None
+    blockers: tuple[str, ...]
+    git_commit: str | None
+    dirty_worktree: bool | None
+    stdout_tail: tuple[str, ...]
+    stderr_tail: tuple[str, ...]
+
+    @staticmethod
+    def _value_text(value: float | None) -> str:
+        return "n/a" if value is None else f"{value:.6f}"
+
+    def format(self) -> str:
+        blockers = ",".join(self.blockers) if self.blockers else "none"
+        gaps = ",".join(self.remaining_paper_gaps) if self.remaining_paper_gaps else "none"
+        return (
+            f"decode_loop_probe model={self.model_variant} status={self.status} "
+            f"sequence={self.sequence_kind} phase={self.phase} layers={self.layer_count} "
+            f"decode_tokens={self.decode_tokens} context={self.prompt_context_length} "
+            f"input={_shape_text(self.input_shape)} output={_shape_text(self.output_shape)} "
+            f"output_format={self.output_format} runner_reuse={self.runner_reuse_mode} "
+            f"norm_arg={self.norm_argument_mode} timed_kernel_count={self.timed_kernel_count} "
+            f"timed_kernel_seconds={self._value_text(self.timed_kernel_seconds)} "
+            f"measured_loop_seconds={self._value_text(self.measured_loop_seconds)} "
+            f"diagnostic_decode_tps_loop_wall={self._value_text(self.diagnostic_decode_tps_loop_wall)} "
+            f"diagnostic_decode_tps_kernel_only={self._value_text(self.diagnostic_decode_tps_kernel_only)} "
+            f"paper_decode_tps_1k={self.paper_decode_tps_1k:g} "
+            f"threshold={DEFAULT_THRESHOLD:g} paper_gaps={gaps} blockers={blockers}"
+        )
+
+    def to_json_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class _NormPlan:
+    tensor_key: str
+    weight: Any
+    offset_bytes: int
+    static_bo_bytes: int
+    argument_bytes: int
+    norm_weights: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _PackedProjectionPlan:
+    family: str
+    tensor_key: str
+    shape: tuple[int, int]
+    padded_shape: tuple[int, int]
+    row_blocks: int
+    col_blocks: int
+    packed: Any
+    scale: Any
+    min_offset: Any
+    mlir_module: Any
+
+
+def _delta_pct(local_tps: float | None) -> float | None:
+    if local_tps is None:
+        return None
+    return abs(float(local_tps) - PAPER_DECODE_TPS_1K) / PAPER_DECODE_TPS_1K * 100.0
+
+
+def _repack_projection(weight, *, row_block_multiple: int = 8):
+    import numpy as np
+    from ml_dtypes import bfloat16
+    from common import Q4NX_COLS, Q4NX_ROWS, pack_int4_low_first
+
+    rows, cols = weight.shape
+    padded_rows = _ceil_to(_ceil_to(int(rows), Q4NX_ROWS) // Q4NX_ROWS, row_block_multiple) * Q4NX_ROWS
+    padded_cols = _ceil_to(int(cols), Q4NX_COLS)
+    row_blocks = padded_rows // Q4NX_ROWS
+    col_blocks = padded_cols // Q4NX_COLS
+    padded = np.zeros((padded_rows, padded_cols), dtype=np.float32)
+    padded[:rows, :cols] = weight.astype(np.float32)
+    packed = np.empty((row_blocks, col_blocks, Q4NX_ROWS * Q4NX_COLS // 2), dtype=np.int8)
+    scale = np.empty((row_blocks, col_blocks, Q4NX_COLS), dtype=bfloat16)
+    min_offset = np.empty((row_blocks, col_blocks, Q4NX_COLS), dtype=bfloat16)
+    for rb in range(row_blocks):
+        r0 = rb * Q4NX_ROWS
+        r1 = r0 + Q4NX_ROWS
+        for cb in range(col_blocks):
+            c0 = cb * Q4NX_COLS
+            c1 = c0 + Q4NX_COLS
+            block = padded[r0:r1, c0:c1]
+            mn = block.min(axis=0)
+            mx = block.max(axis=0)
+            sc = (mx - mn) / 15.0
+            quant_scale = np.where(sc == 0.0, 1.0, sc)
+            q = np.rint((block - mn[None, :]) / quant_scale[None, :])
+            q = np.clip(q, 0, 15).astype(np.uint8)
+            packed[rb, cb] = pack_int4_low_first(q).view(np.int8)
+            scale[rb, cb] = sc.astype(bfloat16)
+            min_offset[rb, cb] = mn.astype(bfloat16)
+    return packed, scale, min_offset, (padded_rows, padded_cols)
+
+
+def _prepare_layer_plans(model_variant: str, weights_dir: Path, layers: int):
+    from fused_dqp import build_paper_module
+    from ml_dtypes import bfloat16
+
+    object_file = Path(__file__).with_name("build_peano") / "fused_dqp.o"
+    if not object_file.exists():
+        raise RuntimeError(f"missing FusedDQP object file: {object_file}")
+    norm_plans: dict[int, _NormPlan] = {}
+    projection_plans: dict[int, dict[str, _PackedProjectionPlan]] = {}
+    module_cache: dict[int, Any] = {}
+    for layer_index in range(layers):
+        norm_keys = _norm_tensor_keys(layer_index)
+        tensor_key = norm_keys["input_layernorm"]
+        norm_payload, norm_weight, norm_offset = _load_static_norm_payload(weights_dir, model_variant, tensor_key)
+        norm_weights = {
+            name: _load_safetensor_array(weights_dir, key).astype(bfloat16).reshape(-1)
+            for name, key in norm_keys.items()
+        }
+        norm_plans[layer_index] = _NormPlan(
+            tensor_key=tensor_key,
+            weight=norm_weight,
+            offset_bytes=int(norm_offset),
+            static_bo_bytes=int(norm_payload.nbytes),
+            argument_bytes=int(norm_weight.nbytes),
+            norm_weights=norm_weights,
+        )
+        keys = _projection_tensor_keys(model_variant, weights_dir, layer_index)
+        layer_projection_plans: dict[str, _PackedProjectionPlan] = {}
+        for family in FULL_LAYER_PROJECTION_FAMILIES:
+            weight = _load_safetensor_array(weights_dir, keys[family])
+            expected_shape = PROJECTION_SHAPES[family]
+            if tuple(weight.shape) != expected_shape:
+                raise RuntimeError(f"expected {family} shape {expected_shape}, got {weight.shape}")
+            packed, scale, min_offset, padded_shape = _repack_projection(weight)
+            row_blocks = int(packed.shape[0])
+            if row_blocks not in module_cache:
+                module_cache[row_blocks] = build_paper_module(
+                    32,
+                    256,
+                    "fused_dqp_accum_block_opt",
+                    str(object_file),
+                    row_blocks,
+                    1,
+                    2,
+                    4,
+                    "direct",
+                )
+            layer_projection_plans[family] = _PackedProjectionPlan(
+                family=family,
+                tensor_key=keys[family],
+                shape=expected_shape,
+                padded_shape=tuple(int(dim) for dim in padded_shape),
+                row_blocks=row_blocks,
+                col_blocks=int(packed.shape[1]),
+                packed=packed,
+                scale=scale,
+                min_offset=min_offset,
+                mlir_module=module_cache[row_blocks],
+            )
+        projection_plans[layer_index] = layer_projection_plans
+    return norm_plans, projection_plans
+
+
+def _run_packed_projection(
+    plan: _PackedProjectionPlan,
+    activation,
+    runner_cache: _ReusableElfRunnerCache,
+    timed_kernel_seconds: list[float] | None,
+    power_meter,
+):
+    import numpy as np
+    from ml_dtypes import bfloat16
+    from common import fused_dqp_paper_reference
+    from fused_dqp import _pack_l3_inputs
+
+    out_dim, in_dim = plan.shape
+    activation_padded = np.zeros((plan.col_blocks * 256,), dtype=bfloat16)
+    activation_padded[:in_dim] = activation.reshape(-1).astype(bfloat16)
+    activation_blocks = activation_padded.reshape(plan.col_blocks, 256)
+    expected = fused_dqp_paper_reference(plan.packed, plan.scale, plan.min_offset, activation_blocks, 32, 256)
+    accum = np.zeros(expected.shape, dtype=np.float32)
+    for col_block in range(plan.col_blocks):
+        cb_slice = slice(col_block, col_block + 1)
+        params = np.empty((plan.row_blocks, 1, 512), dtype=bfloat16)
+        params[..., :256] = plan.scale[:, cb_slice, :]
+        params[..., 256:] = plan.min_offset[:, cb_slice, :]
+        packed_l3 = _pack_l3_inputs(plan.packed[:, cb_slice, :], params).reshape(
+            plan.row_blocks // 4,
+            4,
+            1,
+            -1,
+        )
+        partial = runner_cache.run(
+            key=("fused_dqp_accum_block_opt", int(plan.row_blocks)),
+            mlir_module=plan.mlir_module,
+            backend_options=_projection_backend_options(),
+            inputs=[packed_l3, activation_blocks[cb_slice, :]],
+            output_shape=expected.shape,
+            output_dtype=bfloat16,
+            timed_kernel_seconds=timed_kernel_seconds,
+            power_meter=power_meter,
+        )
+        accum += partial.astype(np.float32)
+    actual = accum.astype(bfloat16).reshape(-1)[:out_dim]
+    expected_vec = expected.reshape(-1)[:out_dim].astype(bfloat16)
+    evidence = ProjectionEvidence(
+        family=plan.family,
+        tensor_key=plan.tensor_key,
+        shape=plan.shape,
+        padded_shape=plan.padded_shape,
+        row_blocks=plan.row_blocks,
+        col_blocks=plan.col_blocks,
+        projection_correlation=_correlation(actual, expected_vec),
+        dense_projection_correlation=None,
+    )
+    return actual, expected_vec, evidence
+
+
+def _run_one_layer(
+    *,
+    layer_index: int,
+    x_input,
+    norm_plan: _NormPlan,
+    projection_plans: dict[str, _PackedProjectionPlan],
+    runner_cache: _ReusableElfRunnerCache,
+    timed_kernel_seconds: list[float] | None,
+    power_meter,
+) -> tuple[Any, LayerLoopEvidence, list[str]]:
+    from ml_dtypes import bfloat16
+    from weighted_rms_norm import build_module as build_rms_module
+    from weighted_rms_norm import rms_norm_reference
+    import numpy as np
+
+    blockers: list[str] = []
+    start_count = len(timed_kernel_seconds) if timed_kernel_seconds is not None else 0
+    start_seconds = sum(timed_kernel_seconds) if timed_kernel_seconds is not None else 0.0
+    norm_expected = rms_norm_reference(x_input, norm_plan.weight)
+    rms_module = build_rms_module(1, 1152, bfloat16, 16, herd_x=1)
+    norm_actual = runner_cache.run(
+        key=("weighted_rms_norm", 1, 1152),
+        mlir_module=rms_module,
+        backend_options=dict(
+            verbose=False,
+            omit_while_true_loop=False,
+            output_format=DEFAULT_OUTPUT_FORMAT,
+            instance_name="weighted_rms_norm",
+            runtime_loop_tiling_sizes=[4, 4],
+        ),
+        inputs=[x_input, norm_plan.weight],
+        output_shape=norm_expected.shape,
+        output_dtype=bfloat16,
+        timed_kernel_seconds=timed_kernel_seconds,
+        power_meter=power_meter,
+    )
+    rms_corr = _correlation(norm_actual, norm_expected)
+    if rms_corr < DEFAULT_THRESHOLD:
+        blockers.append(f"L{layer_index}:rmsnorm-correlation-low")
+
+    actual: dict[str, Any] = {"input_norm": norm_actual.reshape(-1)}
+    expected: dict[str, Any] = {"input_norm": norm_expected.reshape(-1)}
+    projection_evidence: list[ProjectionEvidence] = []
+    for family in ("q_proj", "k_proj", "v_proj"):
+        actual_vec, expected_vec, evidence = _run_packed_projection(
+            projection_plans[family],
+            actual["input_norm"],
+            runner_cache,
+            timed_kernel_seconds,
+            power_meter,
+        )
+        projection_evidence.append(evidence)
+        actual[family] = actual_vec
+        expected[family] = expected_vec
+        if evidence.projection_correlation is None or evidence.projection_correlation < DEFAULT_THRESHOLD:
+            blockers.append(f"L{layer_index}:{family}-correlation-low")
+
+    q_actual = actual["q_proj"].reshape(4, 256)
+    k_actual = actual["k_proj"].reshape(1, 256)
+    v_actual = actual["v_proj"].reshape(1, 256)
+    q_expected = expected["q_proj"].reshape(4, 256)
+    k_expected = expected["k_proj"].reshape(1, 256)
+    v_expected = expected["v_proj"].reshape(1, 256)
+    _ = _rms_host(q_actual, norm_plan.norm_weights["q_norm"])
+    _ = _rms_host(k_actual, norm_plan.norm_weights["k_norm"])
+    _ = _rms_host(q_expected, norm_plan.norm_weights["q_norm"])
+    _ = _rms_host(k_expected, norm_plan.norm_weights["k_norm"])
+    attention_actual = np.tile(v_actual.reshape(1, 256), (4, 1)).reshape(1024).astype(bfloat16)
+    attention_expected = np.tile(v_expected.reshape(1, 256), (4, 1)).reshape(1024).astype(bfloat16)
+
+    o_actual, o_expected, evidence = _run_packed_projection(
+        projection_plans["o_proj"], attention_actual, runner_cache, timed_kernel_seconds, power_meter
+    )
+    projection_evidence.append(evidence)
+    if evidence.projection_correlation is None or evidence.projection_correlation < DEFAULT_THRESHOLD:
+        blockers.append(f"L{layer_index}:o_proj-correlation-low")
+
+    post_attention_actual = _rms_host(o_actual.reshape(1, 1152), norm_plan.norm_weights["post_attention_layernorm"])
+    post_attention_expected = _rms_host(o_expected.reshape(1, 1152), norm_plan.norm_weights["post_attention_layernorm"])
+    residual_actual = (x_input.astype(np.float32) + post_attention_actual.astype(np.float32)).astype(bfloat16)
+    residual_expected = (x_input.astype(np.float32) + post_attention_expected.astype(np.float32)).astype(bfloat16)
+
+    pre_ff_actual = _rms_host(residual_actual, norm_plan.norm_weights["pre_feedforward_layernorm"])
+    pre_ff_expected = _rms_host(residual_expected, norm_plan.norm_weights["pre_feedforward_layernorm"])
+    gate_actual, gate_expected, gate_evidence = _run_packed_projection(
+        projection_plans["gate_proj"], pre_ff_actual.reshape(-1), runner_cache, timed_kernel_seconds, power_meter
+    )
+    up_actual, up_expected, up_evidence = _run_packed_projection(
+        projection_plans["up_proj"], pre_ff_actual.reshape(-1), runner_cache, timed_kernel_seconds, power_meter
+    )
+    for family, evidence in (("gate_proj", gate_evidence), ("up_proj", up_evidence)):
+        projection_evidence.append(evidence)
+        if evidence.projection_correlation is None or evidence.projection_correlation < DEFAULT_THRESHOLD:
+            blockers.append(f"L{layer_index}:{family}-correlation-low")
+    mlp_actual = _geglu(gate_actual, up_actual)
+    mlp_expected = _geglu(gate_expected, up_expected)
+
+    down_actual, down_expected, down_evidence = _run_packed_projection(
+        projection_plans["down_proj"], mlp_actual, runner_cache, timed_kernel_seconds, power_meter
+    )
+    projection_evidence.append(down_evidence)
+    if down_evidence.projection_correlation is None or down_evidence.projection_correlation < DEFAULT_THRESHOLD:
+        blockers.append(f"L{layer_index}:down_proj-correlation-low")
+
+    post_ff_actual = _rms_host(down_actual.reshape(1, 1152), norm_plan.norm_weights["post_feedforward_layernorm"])
+    post_ff_expected = _rms_host(down_expected.reshape(1, 1152), norm_plan.norm_weights["post_feedforward_layernorm"])
+    output_actual = (residual_actual.astype(np.float32) + post_ff_actual.astype(np.float32)).astype(bfloat16)
+    output_expected = (residual_expected.astype(np.float32) + post_ff_expected.astype(np.float32)).astype(bfloat16)
+    final_corr = _correlation(output_actual.reshape(-1), output_expected.reshape(-1))
+    if final_corr < DEFAULT_THRESHOLD:
+        blockers.append(f"L{layer_index}:final-output-correlation-low")
+    end_count = len(timed_kernel_seconds) if timed_kernel_seconds is not None else start_count
+    end_seconds = sum(timed_kernel_seconds) if timed_kernel_seconds is not None else start_seconds
+    evidence = LayerLoopEvidence(
+        layer_index=layer_index,
+        norm_tensor_key=norm_plan.tensor_key,
+        static_norm_tensor_offset_bytes=norm_plan.offset_bytes,
+        static_norm_argument_bytes=norm_plan.argument_bytes,
+        rms_correlation=rms_corr,
+        final_output_correlation=final_corr,
+        projection_evidence=tuple(projection_evidence),
+        timed_kernel_count=end_count - start_count,
+        timed_kernel_seconds=end_seconds - start_seconds,
+    )
+    return output_actual.reshape(1, 1152), evidence, blockers
+
+
+def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeResult:
+    _activate_probe_env()
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    repo = _repo_root()
+    git_commit, dirty = _git_info(repo)
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    blockers: list[str] = []
+    layer_evidence: list[LayerLoopEvidence] = []
+    timed_kernel_samples: list[float] = []
+    runner_cache: _ReusableElfRunnerCache | None = None
+    segment_power = _SegmentedRAPLPowerMeter(
+        sample=bool(args.power_sample),
+        run_id="gemma3_1b_decode_loop_probe_kernel_segments",
+    )
+    start = time.perf_counter()
+    loop_elapsed: float | None = None
+    power_snapshot: dict[str, object] | None = None
+    returncode = 1
+    try:
+        if args.model_variant != DEFAULT_MODEL:
+            raise RuntimeError("decode loop probe currently supports gemma3-1b only")
+        if args.layers <= 0:
+            raise RuntimeError("--layers must be positive")
+        weights_dir = _resolve_weights_dir(args.model_variant, args.weights_dir)
+        norm_plans, projection_plans = _prepare_layer_plans(args.model_variant, weights_dir, args.layers)
+        runner_cache = _ReusableElfRunnerCache(enabled=not args.no_reuse_elf)
+        runner_cache.__enter__()
+        rng = np.random.default_rng(0)
+        warmup_input = rng.uniform(-0.5, 0.5, size=(1, 1152)).astype(bfloat16)
+        for layer_index in range(min(args.warmup_layers, args.layers)):
+            warmup_input, _evidence, warmup_blockers = _run_one_layer(
+                layer_index=layer_index,
+                x_input=warmup_input,
+                norm_plan=norm_plans[layer_index],
+                projection_plans=projection_plans[layer_index],
+                runner_cache=runner_cache,
+                timed_kernel_seconds=None,
+                power_meter=None,
+            )
+            if warmup_blockers:
+                blockers.extend(f"warmup:{item}" for item in warmup_blockers)
+        x_input = rng.uniform(-0.5, 0.5, size=(1, 1152)).astype(bfloat16)
+        power_window = begin_power_window(
+            sample=bool(args.power_sample),
+            run_id="gemma3_1b_decode_loop_probe",
+            target_backend="npu",
+        )
+        loop_start = time.perf_counter()
+        for token_index in range(args.decode_tokens):
+            for layer_index in range(args.layers):
+                x_input, evidence, layer_blockers = _run_one_layer(
+                    layer_index=layer_index,
+                    x_input=x_input,
+                    norm_plan=norm_plans[layer_index],
+                    projection_plans=projection_plans[layer_index],
+                    runner_cache=runner_cache,
+                    timed_kernel_seconds=timed_kernel_samples,
+                    power_meter=segment_power,
+                )
+                layer_evidence.append(evidence)
+                blockers.extend(layer_blockers)
+            stdout_lines.append(f"decode token {token_index}: final checksum={float(x_input.astype(np.float32).sum()):.6f}")
+        loop_elapsed = time.perf_counter() - loop_start
+        power_snapshot = finish_power_window(power_window, elapsed_seconds=loop_elapsed).to_json_dict()
+        returncode = 0 if not blockers else 1
+    except Exception as exc:
+        blockers.append(f"decode-loop-probe-failed:{exc}")
+        stderr_lines.append(str(exc))
+    finally:
+        if runner_cache is not None:
+            runner_cache.__exit__(None, None, None)
+
+    elapsed = time.perf_counter() - start
+    timed_total = sum(timed_kernel_samples) if timed_kernel_samples else None
+    timed_mean = (timed_total / len(timed_kernel_samples)) if timed_total is not None and timed_kernel_samples else None
+    loop_tps = (args.decode_tokens / loop_elapsed) if loop_elapsed and loop_elapsed > 0.0 else None
+    kernel_tps = (args.decode_tokens / timed_total) if timed_total and timed_total > 0.0 else None
+    status = "DECODE_LOOP_DIAGNOSTIC_PASS" if not blockers else "DECODE_LOOP_DIAGNOSTIC_BLOCKED"
+    return Gemma3DecodeLoopProbeResult(
+        schema_version=1,
+        model_variant=args.model_variant,
+        status=status,
+        sequence_kind=DEFAULT_SEQUENCE_KIND,
+        phase=DEFAULT_PHASE,
+        layer_count=args.layers,
+        decode_tokens=args.decode_tokens,
+        prompt_context_length=args.prompt_context_length,
+        output_format=DEFAULT_OUTPUT_FORMAT,
+        runner_reuse_mode=("reused-elf-persistent-bo" if not args.no_reuse_elf else "per-launch-compile-load"),
+        norm_argument_mode="selected-vector",
+        input_shape=(1, 1152),
+        output_shape=(1, 1152),
+        input_distribution=DEFAULT_INPUT_DISTRIBUTION,
+        host_fallbacks=(
+            "qk_norm",
+            "rope_identity_pos0",
+            "single_token_attention_no_kv_cache",
+            "post_attention_norm",
+            "residual_add",
+            "pre_feedforward_norm",
+            "mlp_activation",
+            "post_feedforward_norm",
+        ),
+        timed_kernel_count=len(timed_kernel_samples),
+        timed_kernel_seconds=timed_total,
+        timed_kernel_mean_seconds=timed_mean,
+        measured_loop_seconds=loop_elapsed,
+        diagnostic_decode_tps_loop_wall=loop_tps,
+        diagnostic_decode_tps_kernel_only=kernel_tps,
+        paper_decode_tps_1k=PAPER_DECODE_TPS_1K,
+        loop_wall_delta_pct_vs_paper_decode_tps_1k=_delta_pct(loop_tps),
+        kernel_only_delta_pct_vs_paper_decode_tps_1k=_delta_pct(kernel_tps),
+        timing_window="post-warmup-loop-wall-and-segmented-run-start-wait2",
+        timing_notes=(
+            "warmup layers compile/load ELF runners and allocate runner-owned BOs before measured loop timing",
+            "measured_loop_seconds starts after warmup and includes current implementation BO writes, output sync/readback, and host fallback compute",
+            "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls and excludes compile, ELF load, BO allocation, BO writes, sync/readback, and host fallback compute",
+            "attention is the staged single-token fallback, not paper 1k KV-cache attention",
+            "logits and sampling are not wired, so this is a diagnostic decode-loop throughput, not an official paper decode TPS cell",
+        ),
+        power_snapshot=power_snapshot,
+        segmented_kernel_power_snapshot=segment_power.snapshot(),
+        layer_evidence=tuple(layer_evidence),
+        remaining_paper_gaps=(
+            "prefill-kv-cache-not-constructed",
+            "paper-1k-kv-attention-not-wired",
+            "logits-sampling-not-wired",
+            "host-fallbacks-still-present",
+            "static-weight-bo-preload-not-used-by-fused-dqp-route",
+        ),
+        command=tuple(sys.argv),
+        returncode=returncode,
+        elapsed_seconds=elapsed,
+        blockers=tuple(dict.fromkeys(blockers)),
+        git_commit=git_commit,
+        dirty_worktree=dirty,
+        stdout_tail=_tail("\n".join(stdout_lines)),
+        stderr_tail=_tail("\n".join(stderr_lines)),
+    )
+
+
+def _self_test() -> None:
+    evidence = LayerLoopEvidence(
+        layer_index=0,
+        norm_tensor_key="model.layers.0.input_layernorm.weight",
+        static_norm_tensor_offset_bytes=0,
+        static_norm_argument_bytes=2304,
+        rms_correlation=0.999991,
+        final_output_correlation=1.0,
+        projection_evidence=(),
+        timed_kernel_count=57,
+        timed_kernel_seconds=0.15,
+    )
+    result = Gemma3DecodeLoopProbeResult(
+        schema_version=1,
+        model_variant=DEFAULT_MODEL,
+        status="DECODE_LOOP_DIAGNOSTIC_PASS",
+        sequence_kind=DEFAULT_SEQUENCE_KIND,
+        phase=DEFAULT_PHASE,
+        layer_count=26,
+        decode_tokens=1,
+        prompt_context_length=1024,
+        output_format=DEFAULT_OUTPUT_FORMAT,
+        runner_reuse_mode="reused-elf-persistent-bo",
+        norm_argument_mode="selected-vector",
+        input_shape=(1, 1152),
+        output_shape=(1, 1152),
+        input_distribution=DEFAULT_INPUT_DISTRIBUTION,
+        host_fallbacks=("qk_norm",),
+        timed_kernel_count=1482,
+        timed_kernel_seconds=3.9,
+        timed_kernel_mean_seconds=3.9 / 1482.0,
+        measured_loop_seconds=5.0,
+        diagnostic_decode_tps_loop_wall=0.2,
+        diagnostic_decode_tps_kernel_only=1.0 / 3.9,
+        paper_decode_tps_1k=PAPER_DECODE_TPS_1K,
+        loop_wall_delta_pct_vs_paper_decode_tps_1k=_delta_pct(0.2),
+        kernel_only_delta_pct_vs_paper_decode_tps_1k=_delta_pct(1.0 / 3.9),
+        timing_window="fixture",
+        timing_notes=("fixture",),
+        power_snapshot=None,
+        segmented_kernel_power_snapshot=None,
+        layer_evidence=(evidence,),
+        remaining_paper_gaps=("paper-1k-kv-attention-not-wired",),
+        command=("python3", "gemma3_decode_loop_probe.py", "--self-test"),
+        returncode=0,
+        elapsed_seconds=5.5,
+        blockers=(),
+        git_commit="fixture",
+        dirty_worktree=False,
+        stdout_tail=(),
+        stderr_tail=(),
+    )
+    if result.status != "DECODE_LOOP_DIAGNOSTIC_PASS":
+        raise AssertionError(result)
+    print(result.format())
+    print("GEMMA3_DECODE_LOOP_PROBE_SELF_TEST: PASS")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Gemma3 staged decode loop probe")
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--run-hardware", action="store_true")
+    parser.add_argument("--model-variant", choices=sorted(MODEL_SPECS), default=DEFAULT_MODEL)
+    parser.add_argument("--weights-dir", type=Path)
+    parser.add_argument("--layers", type=int, default=26)
+    parser.add_argument("--decode-tokens", type=int, default=1)
+    parser.add_argument("--prompt-context-length", type=int, default=1024)
+    parser.add_argument("--warmup-layers", type=int, default=1)
+    parser.add_argument("--result-json", type=Path)
+    parser.add_argument("--power-sample", action="store_true")
+    parser.add_argument("--no-reuse-elf", action="store_true")
+    args = parser.parse_args()
+
+    if args.self_test:
+        _self_test()
+        return 0
+    if not args.run_hardware:
+        raise SystemExit("pass --run-hardware to touch the NPU; --self-test is hardware-free")
+    result = _run_hardware_sequence(args)
+    print(result.format())
+    if args.result_json:
+        args.result_json.parent.mkdir(parents=True, exist_ok=True)
+        args.result_json.write_text(json.dumps(result.to_json_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"GEMMA3_DECODE_LOOP_PROBE_JSON: {args.result_json}")
+    return 0 if result.status == "DECODE_LOOP_DIAGNOSTIC_PASS" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
