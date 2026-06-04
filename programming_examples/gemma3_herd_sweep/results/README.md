@@ -89,13 +89,13 @@ the generated paper-target comparison summary.
   references, dense original-weight correlations
   0.994609/0.995959/0.995720/0.997551/0.996684/0.996802/0.997577, attention and
   GeGLU host-stage correlations at 1.000000, and final layer-output correlation
-  1.000000. The refreshed JSON records 57 segmented NPU `run.start()/wait2()`
-  launch windows totaling 0.202900 s for one staged layer, or 4.928547 staged
-  layer passes/s. Its 26-layer kernel-only extrapolation is 0.189559 decode TPS,
-  far below the paper's 41.1 TPS 1B/1k NPU decode target and not a measured
-  full-model decode TPS. Direct RAPL under `sg power` reports 11.981 W segmented
-  package power and a clamped 0.0 W pseudo-NPU delta because the 15.634 W
-  quiescent package sample was higher than the timed segment average. The JSON
+  1.000000. The refreshed JSON records 57 segmented NPU `run.start()/wait2()` launch
+  windows totaling 0.148046 s for one staged layer in reused-ELF mode, or
+  6.754643 staged layer passes/s. Its 26-layer kernel-only extrapolation is
+  0.259794 decode TPS, far below the paper's 41.1 TPS 1B/1k NPU decode target
+  and not a measured full-model decode TPS. Direct RAPL under `sg power` reports
+  14.788 W segmented package power and a 2.973 W pseudo-NPU delta from an
+  11.815 W quiescent package sample. The JSON
   records `full-1b-loop-not-wired` as the remaining model runner gap. This is
   staged correctness and diagnostic kernel-only timing evidence only; it is not
   a repeated model-runner loop, TTFT/TPS timing, pseudo-NPU paper power, or
