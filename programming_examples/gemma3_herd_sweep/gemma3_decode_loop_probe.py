@@ -311,6 +311,10 @@ def _packed_l3_static_placeholder(plan: _PackedProjectionPlan):
     return _prepared_static_arg(shape, np.dtype(np.int8), int(np.prod(shape)))
 
 
+def _projection_output_shape(plan: _PackedProjectionPlan) -> tuple[int, int]:
+    return (int(plan.row_blocks), 32)
+
+
 def _preload_static_projection_bo_sets(
     projection_plans: dict[int, dict[str, _PackedProjectionPlan]],
     runner_cache: _ReusableElfRunnerCache,
@@ -322,7 +326,7 @@ def _preload_static_projection_bo_sets(
     zero_activation = np.zeros((1, 256), dtype=bfloat16)
     for layer_plans in projection_plans.values():
         for plan in layer_plans.values():
-            output_shape = (plan.padded_shape[0],)
+            output_shape = _projection_output_shape(plan)
             for col_block in range(plan.col_blocks):
                 runner_cache.prepare(
                     key=("fused_dqp_accum_block_opt", int(plan.row_blocks)),
@@ -355,6 +359,9 @@ def _run_packed_projection(
     activation_padded[:in_dim] = activation.reshape(-1).astype(bfloat16)
     activation_blocks = activation_padded.reshape(plan.col_blocks, 256)
     expected = fused_dqp_paper_reference(plan.packed, plan.scale, plan.min_offset, activation_blocks, 32, 256)
+    output_shape = _projection_output_shape(plan)
+    if tuple(expected.shape) != output_shape:
+        raise RuntimeError(f"projection output shape mismatch: expected {output_shape}, got {expected.shape}")
     accum = np.zeros(expected.shape, dtype=np.float32)
     for col_block in range(plan.col_blocks):
         cb_slice = slice(col_block, col_block + 1)
@@ -365,7 +372,7 @@ def _run_packed_projection(
             mlir_module=plan.mlir_module,
             backend_options=_projection_backend_options(),
             inputs=[static_l3, activation_blocks[cb_slice, :]],
-            output_shape=expected.shape,
+            output_shape=output_shape,
             output_dtype=bfloat16,
             timed_kernel_seconds=timed_kernel_seconds,
             power_meter=power_meter,
