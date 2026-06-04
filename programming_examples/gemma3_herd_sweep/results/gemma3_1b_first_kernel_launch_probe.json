@@ -1,4 +1,33 @@
 {
+  "argument_binding": {
+    "argument_count": 3,
+    "argument_directions": [
+      "input",
+      "static",
+      "output"
+    ],
+    "argument_keys": [
+      "layer_input",
+      "static_norm_weights",
+      "prefill_L0_pre_attention_norm"
+    ],
+    "argument_shapes": [
+      "1024x1152",
+      "133120",
+      "1024x1152"
+    ],
+    "argument_storage": [
+      "persistent-bo",
+      "persistent-bo",
+      "virtual-buffer"
+    ],
+    "blockers": [],
+    "static_norm_bo_bytes": 266240,
+    "static_norm_tensor_bytes": 2304,
+    "static_norm_tensor_key": "model.layers.0.input_layernorm.weight",
+    "static_norm_tensor_offset_bytes": 0,
+    "status": "ARGUMENT_BINDING_VALIDATED"
+  },
   "blockers": [],
   "command": [
     "/home/cj/iron/ironenv/bin/python3",
@@ -17,12 +46,13 @@
     "--output-format",
     "elf",
     "--tensor-key",
-    "model.layers.0.input_layernorm.weight"
+    "model.layers.0.input_layernorm.weight",
+    "--use-full-static-norm-bo"
   ],
   "correlation": 0.999983,
   "dirty_worktree": false,
-  "elapsed_seconds": 1.723893627000507,
-  "git_commit": "c17ff2be1103a5a41eaf05bad687ce615e8b0e62",
+  "elapsed_seconds": 2.7683158930158243,
+  "git_commit": "62804d8530789467e93db636b2d74a0b5a188035",
   "herd_x": 1,
   "input_distribution": "bounded-uniform-seed0",
   "kernel": "rms_norm",
@@ -31,6 +61,9 @@
   "output_format": "elf",
   "phase": "prefill",
   "probe_kind": "model-rmsnorm",
+  "remaining_model_runner_gaps": [
+    "runner-owned-bo-launch-not-wired"
+  ],
   "returncode": 0,
   "role": "pre_attention_norm",
   "route": "weighted_rms_norm/standalone-elf-smoke",
