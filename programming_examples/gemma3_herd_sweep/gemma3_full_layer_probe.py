@@ -6,8 +6,8 @@
 
 This diagnostic wires one Gemma3 1B decode layer pass with real weights. The
 projection stages launch on the NPU through the FusedDQP column-block route;
-RoPE launches through the Gemma half-split wrapper; the remaining
-nonlinear/vector stages are explicit host fallbacks. This is full-layer
+RoPE and residual adds launch through Gemma standalone wrappers; the
+remaining nonlinear/vector stages are explicit host fallbacks. This is full-layer
 staged correctness evidence, not a full model loop, TTFT/TPS timing, pseudo-NPU
 power, or a paper-parity result.
 """
@@ -132,6 +132,8 @@ class Gemma3FullLayerProbeResult:
     attention_correlation: float | None
     rope_q_correlation: float | None
     rope_k_correlation: float | None
+    attention_residual_correlation: float | None
+    mlp_residual_correlation: float | None
     mlp_activation_correlation: float | None
     final_output_correlation: float | None
     dense_final_output_correlation: float | None
@@ -192,6 +194,8 @@ class Gemma3FullLayerProbeResult:
             f"attention_correlation={self._corr_text(self.attention_correlation)} "
             f"rope_correlations=q:{self._corr_text(self.rope_q_correlation)}|"
             f"k:{self._corr_text(self.rope_k_correlation)} "
+            f"residual_correlations=attention:{self._corr_text(self.attention_residual_correlation)}|"
+            f"mlp:{self._corr_text(self.mlp_residual_correlation)} "
             f"mlp_activation_correlation={self._corr_text(self.mlp_activation_correlation)} "
             f"final_output_correlation={self._corr_text(self.final_output_correlation)} "
             f"dense_final_output_correlation={self._corr_text(self.dense_final_output_correlation)} "
@@ -803,12 +807,16 @@ def _geglu(gate, up):
 
 
 def _rope_module_helpers():
-    dataflow_dir = _repo_root() / "programming_examples/gemma3_dataflow_kernels"
+    dataflow_dir = _dataflow_dir()
     if str(dataflow_dir) not in sys.path:
         sys.path.insert(0, str(dataflow_dir))
     from rope_halfsplit import build_module, compile_rope_kernel, rope_halfsplit_reference
 
     return build_module, compile_rope_kernel, rope_halfsplit_reference
+
+
+def _dataflow_dir() -> Path:
+    return _repo_root() / "programming_examples/gemma3_dataflow_kernels"
 
 
 def _identity_rope_lut(rows: int, head_dim: int, dtype):
@@ -860,6 +868,52 @@ def _run_rope_stage(
     )
     expected = rope_halfsplit_reference(x, lut)
     return actual.astype(bfloat16), expected.astype(bfloat16)
+
+
+def _residual_module_helpers():
+    dataflow_dir = _dataflow_dir()
+    if str(dataflow_dir) not in sys.path:
+        sys.path.insert(0, str(dataflow_dir))
+    from residual_add import build_module, residual_add_reference
+
+    return build_module, residual_add_reference
+
+
+def _run_residual_stage(
+    *,
+    name: str,
+    lhs,
+    rhs,
+    runner_cache: _ReusableElfRunnerCache,
+    timed_kernel_seconds: list[float] | None = None,
+    power_meter=None,
+):
+    from ml_dtypes import bfloat16
+
+    build_module, residual_add_reference = _residual_module_helpers()
+    lhs_flat = lhs.reshape(-1).astype(bfloat16)
+    rhs_flat = rhs.reshape(-1).astype(bfloat16)
+    n = int(lhs_flat.size)
+    tile_n = 288 if n % (288 * 2) == 0 else max(16, n // 2)
+    module = build_module(n, tile_n, bfloat16, 16)
+    actual = runner_cache.run(
+        key=("residual_add", name, n, tile_n),
+        mlir_module=module,
+        backend_options=dict(
+            verbose=False,
+            omit_while_true_loop=False,
+            output_format=DEFAULT_OUTPUT_FORMAT,
+            instance_name="gemma3_residual_add",
+            runtime_loop_tiling_sizes=[4, 4],
+        ),
+        inputs=[lhs_flat, rhs_flat],
+        output_shape=(n,),
+        output_dtype=bfloat16,
+        timed_kernel_seconds=timed_kernel_seconds,
+        power_meter=power_meter,
+    )
+    expected = residual_add_reference(lhs_flat, rhs_flat)
+    return actual.reshape(lhs.shape).astype(bfloat16), expected.reshape(lhs.shape).astype(bfloat16)
 
 
 def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResult:
@@ -1040,8 +1094,19 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
 
         post_attention_actual = _rms_host(o_actual.reshape(1, 1152), norm_weights["post_attention_layernorm"])
         post_attention_expected = _rms_host(o_expected.reshape(1, 1152), norm_weights["post_attention_layernorm"])
-        residual_actual = (x_input.astype(np.float32) + post_attention_actual.astype(np.float32)).astype(bfloat16)
+        residual_actual, attention_residual_reference = _run_residual_stage(
+            name="attention",
+            lhs=x_input.reshape(-1),
+            rhs=post_attention_actual.reshape(-1),
+            runner_cache=runner_cache,
+            timed_kernel_seconds=timed_kernel_samples,
+            power_meter=power_meter,
+        )
+        residual_actual = residual_actual.reshape(1, 1152)
         residual_expected = (x_input.astype(np.float32) + post_attention_expected.astype(np.float32)).astype(bfloat16)
+        attention_residual_correlation = _correlation(residual_actual, residual_expected)
+        if _correlation(residual_actual, attention_residual_reference.reshape(1, 1152)) < DEFAULT_THRESHOLD:
+            blockers.append("decode-attention-residual-add-correlation-low")
 
         pre_ff_actual = _rms_host(residual_actual, norm_weights["pre_feedforward_layernorm"])
         pre_ff_expected = _rms_host(residual_expected, norm_weights["pre_feedforward_layernorm"])
@@ -1092,8 +1157,19 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
 
         post_ff_actual = _rms_host(down_actual.reshape(1, 1152), norm_weights["post_feedforward_layernorm"])
         post_ff_expected = _rms_host(down_expected.reshape(1, 1152), norm_weights["post_feedforward_layernorm"])
-        output_actual = (residual_actual.astype(np.float32) + post_ff_actual.astype(np.float32)).astype(bfloat16).reshape(-1)
+        output_actual_arr, mlp_residual_reference = _run_residual_stage(
+            name="mlp",
+            lhs=residual_actual.reshape(-1),
+            rhs=post_ff_actual.reshape(-1),
+            runner_cache=runner_cache,
+            timed_kernel_seconds=timed_kernel_samples,
+            power_meter=power_meter,
+        )
+        output_actual = output_actual_arr.reshape(-1)
         output_expected = (residual_expected.astype(np.float32) + post_ff_expected.astype(np.float32)).astype(bfloat16).reshape(-1)
+        mlp_residual_correlation = _correlation(output_actual, output_expected)
+        if _correlation(output_actual, mlp_residual_reference.reshape(-1)) < DEFAULT_THRESHOLD:
+            blockers.append("decode-mlp-residual-add-correlation-low")
         final_output_correlation = _correlation(output_actual, output_expected)
         dense_final_output_correlation = None
         stdout_lines.append(f"final output correlation: {final_output_correlation:.6f}")
@@ -1106,6 +1182,8 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         attention_correlation = None
         rope_q_correlation = None
         rope_k_correlation = None
+        attention_residual_correlation = None
+        mlp_residual_correlation = None
         mlp_activation_correlation = None
         final_output_correlation = None
         dense_final_output_correlation = None
@@ -1162,13 +1240,15 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         norm_tensor_keys=norm_tensor_keys,
         projection_tensor_keys=projection_keys,
         projection_weight_layout="fused-dqp-paper-repacked-full-layer-colblock-loop",
-        host_fallbacks=("qk_norm", "single_token_attention", "post_attention_norm", "residual_add", "pre_feedforward_norm", "mlp_activation", "post_feedforward_norm"),
+        host_fallbacks=("qk_norm", "single_token_attention", "post_attention_norm", "pre_feedforward_norm", "mlp_activation", "post_feedforward_norm"),
         input_distribution=DEFAULT_INPUT_DISTRIBUTION,
         rms_correlation=rms_correlation,
         projection_evidence=tuple(projection_evidence),
         attention_correlation=attention_correlation,
         rope_q_correlation=rope_q_correlation,
         rope_k_correlation=rope_k_correlation,
+        attention_residual_correlation=attention_residual_correlation,
+        mlp_residual_correlation=mlp_residual_correlation,
         mlp_activation_correlation=mlp_activation_correlation,
         final_output_correlation=final_output_correlation,
         dense_final_output_correlation=dense_final_output_correlation,
@@ -1241,6 +1321,8 @@ def _self_test() -> None:
         attention_correlation=1.0,
         rope_q_correlation=1.0,
         rope_k_correlation=1.0,
+        attention_residual_correlation=1.0,
+        mlp_residual_correlation=1.0,
         mlp_activation_correlation=1.0,
         final_output_correlation=0.999998,
         dense_final_output_correlation=None,

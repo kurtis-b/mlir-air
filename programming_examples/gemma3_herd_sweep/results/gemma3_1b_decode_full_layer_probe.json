@@ -1,5 +1,6 @@
 {
   "attention_correlation": 1.0,
+  "attention_residual_correlation": 0.9999948316035948,
   "blockers": [],
   "bo_binding_mode": "runner-owned-persistent-bo",
   "command": [
@@ -12,21 +13,20 @@
     "--layer-index",
     "0",
     "--result-json",
-    "/tmp/gemma3_1b_decode_full_layer_rope_probe.json",
+    "/tmp/gemma3_1b_decode_full_layer_rope_residual_probe.json",
     "--power-sample"
   ],
   "dense_final_output_correlation": null,
-  "diagnostic_layer_passes_per_second": 7.072880991247826,
+  "diagnostic_layer_passes_per_second": 6.785184753502201,
   "dirty_worktree": true,
-  "elapsed_seconds": 8.26616641698638,
-  "estimated_26_layer_decode_tps_kernel_only": 0.2720338842787625,
-  "final_output_correlation": 0.9999999999999998,
-  "git_commit": "74c98e735e8ca4f0df44dfff73ab315d3e3644a5",
+  "elapsed_seconds": 9.127694278024137,
+  "estimated_26_layer_decode_tps_kernel_only": 0.2609686443654693,
+  "final_output_correlation": 0.9999919711063615,
+  "git_commit": "42d661550fe2cbf1bc4ffcf58028d14aa8a7f962",
   "host_fallbacks": [
     "qk_norm",
     "single_token_attention",
     "post_attention_norm",
-    "residual_add",
     "pre_feedforward_norm",
     "mlp_activation",
     "post_feedforward_norm"
@@ -38,6 +38,7 @@
   ],
   "layer_index": 0,
   "mlp_activation_correlation": 1.0,
+  "mlp_residual_correlation": 0.9999919711063615,
   "model_variant": "gemma3-1b",
   "norm_tensor_key": "model.layers.0.input_layernorm.weight",
   "norm_tensor_keys": {
@@ -62,20 +63,20 @@
       "total": "RAPL_SYSFS_PACKAGE_SEGMENTED"
     },
     "notes": [
-      "quiescent_pkg_watts=19.135060",
+      "quiescent_pkg_watts=13.572900",
       "package watts use direct RAPL sysfs energy_uj deltas summed over NPU run.start/wait2 segments",
       "NPU rail is pseudo power: segmented package watts minus quiescent package watts before the run"
     ],
     "run_id": "gemma3_1b_decode_full_layer_probe",
     "sampling_backend": "rapl-sysfs+segmented",
     "schema_version": 1,
-    "segmented_elapsed_seconds": 0.1413851019460708,
-    "segmented_energy_delta_uj": 3590223,
+    "segmented_elapsed_seconds": 0.1473799220402725,
+    "segmented_energy_delta_uj": 3477908,
     "watts": {
       "cpu": null,
       "gpu": null,
-      "npu": 6.25816001104074,
-      "total": 25.39322001104074
+      "npu": 10.025348335683333,
+      "total": 23.598248335683333
     }
   },
   "projection_evidence": [
@@ -145,13 +146,13 @@
     },
     {
       "col_blocks": 5,
-      "dense_projection_correlation": 0.9966835226235318,
+      "dense_projection_correlation": 0.9966809953683484,
       "family": "gate_proj",
       "padded_shape": [
         6912,
         1280
       ],
-      "projection_correlation": 1.0,
+      "projection_correlation": 0.9999999999999999,
       "row_blocks": 216,
       "shape": [
         6912,
@@ -161,13 +162,13 @@
     },
     {
       "col_blocks": 5,
-      "dense_projection_correlation": 0.9968017827013622,
+      "dense_projection_correlation": 0.9968091826861156,
       "family": "up_proj",
       "padded_shape": [
         6912,
         1280
       ],
-      "projection_correlation": 1.0,
+      "projection_correlation": 0.9999999929604897,
       "row_blocks": 216,
       "shape": [
         6912,
@@ -177,13 +178,13 @@
     },
     {
       "col_blocks": 27,
-      "dense_projection_correlation": 0.9975772087081185,
+      "dense_projection_correlation": 0.9975889751149124,
       "family": "down_proj",
       "padded_shape": [
         1280,
         6912
       ],
-      "projection_correlation": 1.0,
+      "projection_correlation": 0.9999999999999999,
       "row_blocks": 40,
       "shape": [
         1152,
@@ -245,12 +246,12 @@
     "gate_proj correlation: 1.000000",
     "up_proj correlation: 1.000000",
     "down_proj correlation: 1.000000",
-    "final output correlation: 1.000000"
+    "final output correlation: 0.999992"
   ],
   "threshold": 0.99,
-  "timed_kernel_count": 59,
-  "timed_kernel_mean_seconds": 0.0023963576601028947,
-  "timed_kernel_seconds": 0.1413851019460708,
+  "timed_kernel_count": 61,
+  "timed_kernel_mean_seconds": 0.0024160642957421724,
+  "timed_kernel_seconds": 0.1473799220402725,
   "timing_notes": [
     "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls for this staged layer",
     "compile, ELF load, BO allocation, BO writes/preload, argument binding, output sync/readback, and host fallback compute are excluded",

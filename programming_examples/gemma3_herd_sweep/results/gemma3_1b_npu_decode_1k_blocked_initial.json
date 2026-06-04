@@ -57,12 +57,12 @@
     "status": "BLOCKED"
   },
   "explanation": null,
-  "git_commit": "74c98e735e8ca4f0df44dfff73ab315d3e3644a5",
+  "git_commit": "42d661550fe2cbf1bc4ffcf58028d14aa8a7f962",
   "host_fallbacks": [
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.009761676968385776,
+      "elapsed_ms": 0.00957799299309651,
       "hardware_status": "hardware-smoke-pass-M8-N1152-N2560-elf",
       "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
       "measured": true,
@@ -76,7 +76,7 @@
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.008846322695414225,
+      "elapsed_ms": 0.008986991209288439,
       "hardware_status": "hardware-smoke-pass-M32-N256-elf",
       "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
       "measured": true,
@@ -90,7 +90,7 @@
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.008022005204111338,
+      "elapsed_ms": 0.007811351679265499,
       "hardware_status": "hardware-smoke-pass-rows4-head256-elf",
       "implementation_path": "programming_examples/gemma3_dataflow_kernels/rope_halfsplit.py",
       "measured": true,
@@ -104,7 +104,7 @@
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.010326000240941843,
+      "elapsed_ms": 0.010148990744103989,
       "hardware_status": "hardware-smoke-pass-n1024-tile256-elf",
       "implementation_path": "programming_examples/gemma3_dataflow_kernels/geglu.py",
       "measured": true,
@@ -118,7 +118,7 @@
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.002257661738743385,
+      "elapsed_ms": 0.0021776650100946426,
       "hardware_status": "hardware-smoke-pass-n1152-tile288-elf",
       "implementation_path": "programming_examples/gemma3_dataflow_kernels/residual_add.py",
       "measured": true,
@@ -162,7 +162,7 @@
   "notes": [
     "standalone nonlinear NPU candidates remain outside the composed model timed window; CPU-reference microbenchmarks are recorded for fallback accounting",
     "real artifact inventory is present but execution is not implemented",
-    "staged NPU diagnostic available: timed_kernel_seconds=0.1413851019460708 estimated_26_layer_decode_tps_kernel_only=0.2720338842787625",
+    "staged NPU diagnostic available: timed_kernel_seconds=0.1473799220402725 estimated_26_layer_decode_tps_kernel_only=0.2609686443654693",
     "staged NPU decode-loop diagnostic available: measured_loop_seconds=5.772286672028713 diagnostic_decode_tps_loop_wall=0.17324156903810575 diagnostic_decode_tps_kernel_only=0.27725198489572966",
     "execution wiring blockers: full-1b-loop-not-wired,nonlinear-model-stage-promotion-incomplete,paper-shape-hardware-rerun-required",
     "model runner blockers: full-1b-loop-not-wired,nonlinear-model-stage-promotion-incomplete,paper-shape-hardware-rerun-required",
@@ -266,9 +266,9 @@
   "npu_power_mode": "Power Mode             : Default",
   "npu_staged_diagnostic": {
     "correctness": "PASS",
-    "delta_pct_vs_paper_decode_tps_1k": 99.33811706988136,
-    "diagnostic_layer_passes_per_second": 7.072880991247826,
-    "estimated_26_layer_decode_tps_kernel_only": 0.2720338842787625,
+    "delta_pct_vs_paper_decode_tps_1k": 99.36503979473122,
+    "diagnostic_layer_passes_per_second": 6.785184753502201,
+    "estimated_26_layer_decode_tps_kernel_only": 0.2609686443654693,
     "layer_index": 0,
     "notes": [
       "diagnostic staged layer-0 kernel-only timing; not a measured paper TTFT/TPS cell",
@@ -285,20 +285,20 @@
         "total": "RAPL_SYSFS_PACKAGE_SEGMENTED"
       },
       "notes": [
-        "quiescent_pkg_watts=19.135060",
+        "quiescent_pkg_watts=13.572900",
         "package watts use direct RAPL sysfs energy_uj deltas summed over NPU run.start/wait2 segments",
         "NPU rail is pseudo power: segmented package watts minus quiescent package watts before the run"
       ],
       "run_id": "gemma3_1b_decode_full_layer_probe",
       "sampling_backend": "rapl-sysfs+segmented",
       "schema_version": 1,
-      "segmented_elapsed_seconds": 0.1413851019460708,
-      "segmented_energy_delta_uj": 3590223,
+      "segmented_elapsed_seconds": 0.1473799220402725,
+      "segmented_energy_delta_uj": 3477908,
       "watts": {
         "cpu": null,
         "gpu": null,
-        "npu": 6.25816001104074,
-        "total": 25.39322001104074
+        "npu": 10.025348335683333,
+        "total": 23.598248335683333
       }
     },
     "remaining_model_runner_gaps": [
@@ -307,9 +307,9 @@
     "sequence_kind": "decode-full-layer-staged",
     "source_result": "/home/cj/mlir-air/programming_examples/gemma3_herd_sweep/results/gemma3_1b_decode_full_layer_probe.json",
     "status": "FULL_LAYER_SEQUENCE_PASS",
-    "timed_kernel_count": 59,
-    "timed_kernel_mean_seconds": 0.0023963576601028947,
-    "timed_kernel_seconds": 0.1413851019460708,
+    "timed_kernel_count": 61,
+    "timed_kernel_mean_seconds": 0.0024160642957421724,
+    "timed_kernel_seconds": 0.1473799220402725,
     "timing_notes": [
       "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls for this staged layer",
       "compile, ELF load, BO allocation, BO writes/preload, argument binding, output sync/readback, and host fallback compute are excluded",
