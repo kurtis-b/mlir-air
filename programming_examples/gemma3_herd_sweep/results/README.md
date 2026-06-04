@@ -28,8 +28,9 @@ energy through the `power` group. iGPU CPU/total rails remain
 loop wiring, nonlinear model-stage promotion, and fresh paper-shape hardware
 reruns. Kernel argument-layout validation is complete for the real 1B 1k/32k
 context model-runner plan: 572 NPU candidate layouts, 1,924 positional
-arguments, and zero binding blockers. Staged decode layer-0 correctness evidence
-is now present, but it is not a timed paper-cell run.
+arguments, and zero binding blockers. Staged decode layer-0 correctness and
+segmented kernel-only timing evidence is now present, but it is not a timed
+paper-cell run.
 
 `gemma3_1b_initial_1k_results.json` bundles these six cells, and
 `gemma3_1b_initial_1k_summary.md` / `gemma3_1b_initial_1k_summary.csv` contain
@@ -87,9 +88,17 @@ the generated paper-target comparison summary.
   references, dense original-weight correlations
   0.994609/0.995959/0.995720/0.997551/0.996684/0.996802/0.997577, attention and
   GeGLU host-stage correlations at 1.000000, and final layer-output correlation
-  1.000000. The JSON records `full-1b-loop-not-wired` as the remaining model
-  runner gap. This is staged correctness evidence only; it is not a repeated
-  model-runner loop, TTFT/TPS timing, pseudo-NPU power, or paper-parity evidence.
+  1.000000. The refreshed JSON records 57 segmented NPU `run.start()/wait2()`
+  launch windows totaling 0.202900 s for one staged layer, or 4.928547 staged
+  layer passes/s. Its 26-layer kernel-only extrapolation is 0.189559 decode TPS,
+  far below the paper's 41.1 TPS 1B/1k NPU decode target and not a measured
+  full-model decode TPS. Direct RAPL under `sg power` reports 11.981 W segmented
+  package power and a clamped 0.0 W pseudo-NPU delta because the 15.634 W
+  quiescent package sample was higher than the timed segment average. The JSON
+  records `full-1b-loop-not-wired` as the remaining model runner gap. This is
+  staged correctness and diagnostic kernel-only timing evidence only; it is not
+  a repeated model-runner loop, TTFT/TPS timing, pseudo-NPU paper power, or
+  paper-parity evidence.
 
 
 ## Static Preload Evidence

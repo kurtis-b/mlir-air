@@ -5,6 +5,7 @@
   "command": [
     "programming_examples/gemma3_herd_sweep/gemma3_full_layer_probe.py",
     "--run-hardware",
+    "--power-sample",
     "--model-variant",
     "gemma3-1b",
     "--weights-dir",
@@ -13,10 +14,12 @@
     "programming_examples/gemma3_herd_sweep/results/gemma3_1b_decode_full_layer_probe.json"
   ],
   "dense_final_output_correlation": null,
+  "diagnostic_layer_passes_per_second": 4.928546647169876,
   "dirty_worktree": false,
-  "elapsed_seconds": 68.5259989570477,
+  "elapsed_seconds": 68.90850497101201,
+  "estimated_26_layer_decode_tps_kernel_only": 0.18955948642961062,
   "final_output_correlation": 0.9999999999999998,
-  "git_commit": "6c5871ec3104ca479184e9d85edcfca821d07f20",
+  "git_commit": "aabff5c92b72885b52a0f40b77816e986260a1b9",
   "host_fallbacks": [
     "qk_norm",
     "rope",
@@ -48,6 +51,31 @@
     1152
   ],
   "phase": "decode",
+  "power_snapshot": {
+    "aligned_with_timed_window": true,
+    "field_status": {
+      "cpu": "MISSING_POWER_FIELD",
+      "gpu": "MISSING_POWER_FIELD",
+      "npu": "PSEUDO_RAPL_SYSFS_DELTA_SEGMENTED",
+      "total": "RAPL_SYSFS_PACKAGE_SEGMENTED"
+    },
+    "notes": [
+      "quiescent_pkg_watts=15.634410",
+      "package watts use direct RAPL sysfs energy_uj deltas summed over NPU run.start/wait2 segments",
+      "NPU rail is pseudo power: segmented package watts minus quiescent package watts before the run"
+    ],
+    "run_id": "gemma3_1b_decode_full_layer_probe",
+    "sampling_backend": "rapl-sysfs+segmented",
+    "schema_version": 1,
+    "segmented_elapsed_seconds": 0.20289957092609257,
+    "segmented_energy_delta_uj": 2430842,
+    "watts": {
+      "cpu": null,
+      "gpu": null,
+      "npu": 0.0,
+      "total": 11.980518188899717
+    }
+  },
   "projection_evidence": [
     {
       "col_blocks": 5,
@@ -208,5 +236,14 @@
     "down_proj correlation: 1.000000",
     "final output correlation: 1.000000"
   ],
-  "threshold": 0.99
+  "threshold": 0.99,
+  "timed_kernel_count": 57,
+  "timed_kernel_mean_seconds": 0.0035596415951946064,
+  "timed_kernel_seconds": 0.20289957092609257,
+  "timing_notes": [
+    "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls for this staged layer",
+    "compile, ELF load, BO allocation, BO writes/preload, argument binding, output sync/readback, and host fallback compute are excluded",
+    "estimated_26_layer_decode_tps_kernel_only is an extrapolation from one layer and is not a measured full-model decode TPS"
+  ],
+  "timing_window": "segmented-run-start-wait2-only"
 }

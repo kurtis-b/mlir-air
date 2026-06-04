@@ -332,7 +332,7 @@ The next implementation loops should stay on 1B 1k NPU text before expanding to
 | 2 | Partially complete: resolve `model-kernel-launch-not-wired` | The first promoted Gemma3 1B pre-attention RMSNorm shape (`1024x1152`, ELF) launches on the NPU with correlation 0.999983 using the validated first-stage positional layout (`layer_input`, `static_norm_weights`, `prefill_L0_pre_attention_norm`), a full contiguous static norm payload whose layer-0 vector is at byte offset 0, and runner-owned pyxrt BO allocation/binding. The decode RMSNorm-to-`q_proj` substep passes with RMSNorm correlation 0.999991, q-projection correlation 1.000000, and dense original-weight correlation 0.994609. The decode RMSNorm-to-Q/K/V substep passes with Q/K/V projection correlations all 1.000000 and dense original-weight correlations 0.994609/0.995959/0.995720. The staged decode layer-0 probe now launches RMSNorm plus q/k/v/o/gate/up/down projection families on the NPU and validates final layer-output correlation 1.000000 against the quantized staged reference, with host fallbacks explicitly recorded for QK-Norm, RoPE, single-token attention, residuals, GeGLU, and post-norm vector stages. For 1B, committed evidence now narrows the real-artifact blocker to `full-1b-loop-not-wired`; the remaining launch work is repeated layer/token loop integration and timed paper-cell measurement, not first-kernel or single-layer correctness. |
 | 3 | Reduce `nonlinear-model-stage-promotion-incomplete` | Each remaining nonlinear stage is either promoted through standalone NPU evidence and model launch validation, or explicitly measured and classified as a timed host fallback. |
 | 4 | Re-run 1B 1k NPU paper cells | Prefill and decode result JSONs contain real local NPU TTFT/TPS or a narrower, artifact-backed failure classification. |
-| 5 | Capture pseudo-NPU power | The NPU timed-window package watts and pre-run quiescent package watts are both readable through direct RAPL, and the result JSON records their delta. |
+| 5 | Partially complete: capture pseudo-NPU power | Direct RAPL is readable when the run is launched under `sg power`. The staged full-layer diagnostic now records segmented package-energy deltas over only NPU `run.start()/wait2()` windows: 0.202900 s across 57 kernel launches, 11.981 W segmented package power, and 0.0 W pseudo-NPU delta because the 15.634 W quiescent sample was higher than the segmented run average. Official paper-cell pseudo-NPU power remains blocked until a repeated full-model timed window exists. |
 | 6 | Expand cautiously | Only after 1B 1k NPU correctness, timing, and pseudo-power evidence is clean should the loop expand to more 1B lengths, 4B text, or vision. |
 
 ### Blocker-resolution decision tree
@@ -734,11 +734,18 @@ Blocked evidence:
   0.994609/0.995959/0.995720/0.997551/0.996684/0.996802/0.997577, and the final
   layer-output correlation is 1.000000. QK-Norm, RoPE, single-token attention,
   residual additions, GeGLU, and post-norm vector stages remain explicit host
-  fallbacks in that diagnostic. These split routes are staged correctness probes
-  because the current full 5-col-block paper module over-allocates tile memory
-  for this shape. The real 1B blocker report now narrows the launch blocker to
-  `full-1b-loop-not-wired`; repeated full-model loop wiring and timed TTFT/TPS
-  remain blocked. Full paper-shape BO allocation validation is
+  fallbacks in that diagnostic. The refreshed diagnostic also records segmented
+  NPU kernel timing and RAPL: 57 `run.start()/wait2()` launch windows total
+  0.202900 s for one staged layer, corresponding to 4.928547 staged layer
+  passes/s and a clearly non-paper-comparable 26-layer kernel-only extrapolation
+  of 0.189559 decode TPS versus the paper's 41.1 TPS 1B/1k NPU target. The
+  segmented package average is 11.981 W; the pseudo-NPU delta is 0.0 W because
+  the 15.634 W quiescent package sample was higher than the timed segment
+  average. These split routes are staged correctness and diagnostic timing
+  probes because the current full 5-col-block paper module over-allocates tile
+  memory for this shape. The real 1B blocker report now narrows the launch
+  blocker to `full-1b-loop-not-wired`; repeated full-model loop wiring and
+  timed TTFT/TPS remain blocked. Full paper-shape BO allocation validation is
   complete for 1B, 4B text, and the 4B vision text stack under the
   benchmark-cell KV allocation plan. Full contiguous static-weight BO preload
   validation is complete for 1B, 4B text, and the 4B vision text stack. The
@@ -1035,19 +1042,28 @@ Implemented evidence and blocker:
   The committed Strix result validates RMSNorm correlation 0.999991, Q/K/V
   projection correlations of 1.000000/1.000000/1.000000, and dense original-
   weight correlations of 0.994609/0.995959/0.995720.
-- `gemma3_full_layer_probe.py --run-hardware` records staged decode layer-0
-  evidence using real Gemma3 1B weights. The committed Strix result validates
-  RMSNorm correlation 0.999991, all seven NPU projection-family correlations at
-  1.000000 against quantized staged references, dense original-weight
-  correlations of 0.994609/0.995959/0.995720/0.997551/0.996684/0.996802/0.997577,
-  attention and GeGLU host-stage correlations at 1.000000, and final layer-output
-  correlation 1.000000. The JSON records 68.526 s elapsed for diagnostic
-  compile/load/run work, which is intentionally not a TTFT/TPS timing window.
-  `gemma3_npu_wiring.py` and `gemma3_model_runner.py` consume the first-kernel,
-  q-only, Q/K/V, and full-layer evidence to report `full-1b-loop-not-wired` for
-  the real 1B plan instead of the stale first-kernel, substep-sequence, or
-  full-layer blocker. This is not a repeated model-runner loop, TTFT/TPS timing,
-  pseudo-NPU power, or a paper cell.
+- `gemma3_full_layer_probe.py --run-hardware --power-sample` records staged
+  decode layer-0 evidence using real Gemma3 1B weights. The committed Strix
+  result validates RMSNorm correlation 0.999991, all seven NPU projection-family
+  correlations at 1.000000 against quantized staged references, dense
+  original-weight correlations of
+  0.994609/0.995959/0.995720/0.997551/0.996684/0.996802/0.997577, attention and
+  GeGLU host-stage correlations at 1.000000, and final layer-output correlation
+  1.000000. The JSON records 68.909 s elapsed for diagnostic compile/load/run
+  work, which is intentionally not a TTFT/TPS timing window. It also records a
+  segmented kernel-only timing window that excludes compile, ELF load, BO
+  allocation, BO writes/preload, argument binding, output sync/readback, and
+  host fallback compute: 57 NPU launches total 0.202900 s, or 4.928547 staged
+  layer passes/s. A 26-layer kernel-only extrapolation is 0.189559 decode TPS,
+  about 216.8x below the paper's 41.1 TPS 1B/1k NPU decode target; this is an
+  extrapolation, not a measured full-model TPS. Direct RAPL under `sg power`
+  reports 11.981 W segmented package power, 15.634 W quiescent package power,
+  and a clamped 0.0 W pseudo-NPU delta. `gemma3_npu_wiring.py` and
+  `gemma3_model_runner.py` consume the first-kernel, q-only, Q/K/V, and
+  full-layer evidence to report `full-1b-loop-not-wired` for the real 1B plan
+  instead of the stale first-kernel, substep-sequence, or full-layer blocker.
+  This is not a repeated model-runner loop, TTFT/TPS timing, pseudo-NPU paper
+  power, or a paper cell.
 - `gemma3_paper_compare.py --compare` accepts either a single result cell or a
   wrapper with `results`, and can emit Markdown and CSV summaries. The initial
   1B 1k CPU/iGPU measured cells plus NPU blocked cells are bundled in
