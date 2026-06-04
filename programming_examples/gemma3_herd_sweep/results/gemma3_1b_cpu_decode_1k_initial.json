@@ -40,14 +40,14 @@
   "compile_time_included": false,
   "correctness": "PASS",
   "decode_tokens": 16,
-  "delta_pct": 63.94797476639946,
+  "delta_pct": 65.49246130442523,
   "dirty_worktree": true,
   "environment_comparable": true,
   "execution_wiring": null,
   "explanation": "local CPU/HF measurement uses this Strix host and Transformers runtime; it is a baseline cell, not validated NPU paper parity",
-  "git_commit": "31d2db3df0393d7d5fa2c8ad42947fde29a2e7d9",
+  "git_commit": "ba1222fd37c87f43a1499984147885611f608e0d",
   "host_fallbacks": [],
-  "local_value": 15.105798572878625,
+  "local_value": 14.45865871344583,
   "metric": "decode_tps",
   "missing_environment_fields": [],
   "model_runner": null,
@@ -76,18 +76,18 @@
     "total": "RAPL_SYSFS_PACKAGE"
   },
   "power_watts": {
-    "cpu": 46.09396436749866,
+    "cpu": 46.04142535583038,
     "gpu": null,
     "npu": null,
-    "total": 46.09396436749866
+    "total": 46.04142535583038
   },
   "real_benchmark": {
     "backend": "cpu-hf",
     "decode_tokens": 16,
-    "load_seconds": 1.7351002750219777,
-    "local_value": 15.105798572878625,
+    "load_seconds": 1.7680995929986238,
+    "local_value": 14.45865871344583,
     "logits_shape": [],
-    "mean_seconds": 1.0591959056522076,
+    "mean_seconds": 1.1066033383249305,
     "metric": "decode_tps",
     "model_variant": "gemma3-1b",
     "notes": [
@@ -113,10 +113,10 @@
       "sampling_backend": "rapl-sysfs+turbostat+rocm-smi",
       "schema_version": 1,
       "watts": {
-        "cpu": 46.09396436749866,
+        "cpu": 46.04142535583038,
         "gpu": null,
         "npu": null,
-        "total": 46.09396436749866
+        "total": 46.04142535583038
       }
     },
     "prompt_token_count": 1024,

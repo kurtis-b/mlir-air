@@ -40,14 +40,14 @@
   "compile_time_included": false,
   "correctness": "PASS",
   "decode_tokens": 0,
-  "delta_pct": 13.503217649207834,
+  "delta_pct": 4.0922479743588305,
   "dirty_worktree": true,
   "environment_comparable": true,
   "execution_wiring": null,
   "explanation": null,
-  "git_commit": "31d2db3df0393d7d5fa2c8ad42947fde29a2e7d9",
+  "git_commit": "ba1222fd37c87f43a1499984147885611f608e0d",
   "host_fallbacks": [],
-  "local_value": 0.57886641001096,
+  "local_value": 0.53087046466923,
   "metric": "prefill_ttft_seconds",
   "missing_environment_fields": [],
   "model_runner": null,
@@ -77,21 +77,21 @@
   },
   "power_watts": {
     "cpu": null,
-    "gpu": 36.39783333333333,
+    "gpu": 37.2804,
     "npu": null,
     "total": null
   },
   "real_benchmark": {
     "backend": "igpu-hf-rocm",
     "decode_tokens": 0,
-    "load_seconds": 2.418281706981361,
-    "local_value": 0.57886641001096,
+    "load_seconds": 2.3923125530127436,
+    "local_value": 0.53087046466923,
     "logits_shape": [
       1,
       1024,
       262144
     ],
-    "mean_seconds": 0.57886641001096,
+    "mean_seconds": 0.53087046466923,
     "metric": "prefill_ttft_seconds",
     "model_variant": "gemma3-1b",
     "notes": [
@@ -118,7 +118,7 @@
       "schema_version": 1,
       "watts": {
         "cpu": null,
-        "gpu": 36.39783333333333,
+        "gpu": 37.2804,
         "npu": null,
         "total": null
       }
