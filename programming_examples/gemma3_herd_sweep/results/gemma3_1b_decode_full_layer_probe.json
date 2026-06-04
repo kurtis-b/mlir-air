@@ -1,6 +1,6 @@
 {
   "attention_correlation": 1.0,
-  "attention_residual_correlation": 0.9999948316035948,
+  "attention_residual_correlation": 0.9999560140833623,
   "blockers": [],
   "bo_binding_mode": "runner-owned-persistent-bo",
   "command": [
@@ -13,32 +13,29 @@
     "--layer-index",
     "0",
     "--result-json",
-    "/tmp/gemma3_1b_decode_full_layer_rope_residual_probe.json",
+    "/tmp/gemma3_1b_decode_full_layer_norms_probe.json",
     "--power-sample"
   ],
   "dense_final_output_correlation": null,
-  "diagnostic_layer_passes_per_second": 6.785184753502201,
+  "diagnostic_layer_passes_per_second": 6.479753799645861,
   "dirty_worktree": true,
-  "elapsed_seconds": 9.127694278024137,
-  "estimated_26_layer_decode_tps_kernel_only": 0.2609686443654693,
-  "final_output_correlation": 0.9999919711063615,
-  "git_commit": "42d661550fe2cbf1bc4ffcf58028d14aa8a7f962",
+  "elapsed_seconds": 10.89808258699486,
+  "estimated_26_layer_decode_tps_kernel_only": 0.2492212999863793,
+  "final_output_correlation": 0.9999547746476887,
+  "git_commit": "30547ff4fa2dbfa6249c6556661d51942b7ab92d",
   "host_fallbacks": [
-    "qk_norm",
     "single_token_attention",
-    "post_attention_norm",
-    "pre_feedforward_norm",
-    "mlp_activation",
-    "post_feedforward_norm"
+    "mlp_activation"
   ],
   "input_distribution": "bounded-uniform-seed0",
   "input_shape": [
     1,
     1152
   ],
+  "k_norm_correlation": 0.9999897597951505,
   "layer_index": 0,
-  "mlp_activation_correlation": 1.0,
-  "mlp_residual_correlation": 0.9999919711063615,
+  "mlp_activation_correlation": 0.9999999974613263,
+  "mlp_residual_correlation": 0.9999547746476887,
   "model_variant": "gemma3-1b",
   "norm_tensor_key": "model.layers.0.input_layernorm.weight",
   "norm_tensor_keys": {
@@ -54,6 +51,8 @@
     1152
   ],
   "phase": "decode",
+  "post_attention_norm_correlation": 0.9999853383396051,
+  "post_feedforward_norm_correlation": 0.9999787945665852,
   "power_snapshot": {
     "aligned_with_timed_window": true,
     "field_status": {
@@ -63,22 +62,23 @@
       "total": "RAPL_SYSFS_PACKAGE_SEGMENTED"
     },
     "notes": [
-      "quiescent_pkg_watts=13.572900",
+      "quiescent_pkg_watts=15.748700",
       "package watts use direct RAPL sysfs energy_uj deltas summed over NPU run.start/wait2 segments",
       "NPU rail is pseudo power: segmented package watts minus quiescent package watts before the run"
     ],
     "run_id": "gemma3_1b_decode_full_layer_probe",
     "sampling_backend": "rapl-sysfs+segmented",
     "schema_version": 1,
-    "segmented_elapsed_seconds": 0.1473799220402725,
-    "segmented_energy_delta_uj": 3477908,
+    "segmented_elapsed_seconds": 0.15432685113046318,
+    "segmented_energy_delta_uj": 3161592,
     "watts": {
       "cpu": null,
       "gpu": null,
-      "npu": 10.025348335683333,
-      "total": 23.598248335683333
+      "npu": 4.737637774929961,
+      "total": 20.48633777492996
     }
   },
+  "pre_feedforward_norm_correlation": 0.9998914157097206,
   "projection_evidence": [
     {
       "col_blocks": 5,
@@ -146,13 +146,13 @@
     },
     {
       "col_blocks": 5,
-      "dense_projection_correlation": 0.9966809953683484,
+      "dense_projection_correlation": 0.996685955083438,
       "family": "gate_proj",
       "padded_shape": [
         6912,
         1280
       ],
-      "projection_correlation": 0.9999999999999999,
+      "projection_correlation": 0.9999999997127289,
       "row_blocks": 216,
       "shape": [
         6912,
@@ -162,13 +162,13 @@
     },
     {
       "col_blocks": 5,
-      "dense_projection_correlation": 0.9968091826861156,
+      "dense_projection_correlation": 0.9968062232154467,
       "family": "up_proj",
       "padded_shape": [
         6912,
         1280
       ],
-      "projection_correlation": 0.9999999929604897,
+      "projection_correlation": 1.0,
       "row_blocks": 216,
       "shape": [
         6912,
@@ -178,13 +178,13 @@
     },
     {
       "col_blocks": 27,
-      "dense_projection_correlation": 0.9975889751149124,
+      "dense_projection_correlation": 0.9975814324268635,
       "family": "down_proj",
       "padded_shape": [
         1280,
         6912
       ],
-      "projection_correlation": 0.9999999999999999,
+      "projection_correlation": 1.0,
       "row_blocks": 40,
       "shape": [
         1152,
@@ -203,6 +203,7 @@
     "v_proj": "model.layers.0.self_attn.v_proj.weight"
   },
   "projection_weight_layout": "fused-dqp-paper-repacked-full-layer-colblock-loop",
+  "q_norm_correlation": 0.9999884798689984,
   "remaining_model_runner_gaps": [
     "full-1b-loop-not-wired"
   ],
@@ -246,12 +247,12 @@
     "gate_proj correlation: 1.000000",
     "up_proj correlation: 1.000000",
     "down_proj correlation: 1.000000",
-    "final output correlation: 0.999992"
+    "final output correlation: 0.999955"
   ],
   "threshold": 0.99,
-  "timed_kernel_count": 61,
-  "timed_kernel_mean_seconds": 0.0024160642957421724,
-  "timed_kernel_seconds": 0.1473799220402725,
+  "timed_kernel_count": 66,
+  "timed_kernel_mean_seconds": 0.0023382856231888363,
+  "timed_kernel_seconds": 0.15432685113046318,
   "timing_notes": [
     "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls for this staged layer",
     "compile, ELF load, BO allocation, BO writes/preload, argument binding, output sync/readback, and host fallback compute are excluded",

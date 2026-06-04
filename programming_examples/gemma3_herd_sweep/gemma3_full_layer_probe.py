@@ -132,6 +132,11 @@ class Gemma3FullLayerProbeResult:
     attention_correlation: float | None
     rope_q_correlation: float | None
     rope_k_correlation: float | None
+    q_norm_correlation: float | None
+    k_norm_correlation: float | None
+    post_attention_norm_correlation: float | None
+    pre_feedforward_norm_correlation: float | None
+    post_feedforward_norm_correlation: float | None
     attention_residual_correlation: float | None
     mlp_residual_correlation: float | None
     mlp_activation_correlation: float | None
@@ -192,6 +197,11 @@ class Gemma3FullLayerProbeResult:
             f"projection_correlations={projection_corrs} "
             f"dense_projection_correlations={dense_corrs} "
             f"attention_correlation={self._corr_text(self.attention_correlation)} "
+            f"norm_correlations=q:{self._corr_text(self.q_norm_correlation)}|"
+            f"k:{self._corr_text(self.k_norm_correlation)}|"
+            f"post_attention:{self._corr_text(self.post_attention_norm_correlation)}|"
+            f"pre_ff:{self._corr_text(self.pre_feedforward_norm_correlation)}|"
+            f"post_ff:{self._corr_text(self.post_feedforward_norm_correlation)} "
             f"rope_correlations=q:{self._corr_text(self.rope_q_correlation)}|"
             f"k:{self._corr_text(self.rope_k_correlation)} "
             f"residual_correlations=attention:{self._corr_text(self.attention_residual_correlation)}|"
@@ -832,6 +842,42 @@ def _identity_rope_lut(rows: int, head_dim: int, dtype):
     return np.tile(row, (rows, 1)).astype(dtype)
 
 
+def _run_rms_stage(
+    *,
+    name: str,
+    x,
+    weight,
+    runner_cache: _ReusableElfRunnerCache,
+    timed_kernel_seconds: list[float] | None = None,
+    power_meter=None,
+):
+    from ml_dtypes import bfloat16
+    from weighted_rms_norm import build_module as build_rms_module
+    from weighted_rms_norm import rms_norm_reference
+
+    x_2d = x.reshape((-1, int(weight.size))).astype(bfloat16)
+    rows, width = (int(dim) for dim in x_2d.shape)
+    module = build_rms_module(rows, width, bfloat16, 16, herd_x=1)
+    actual = runner_cache.run(
+        key=("weighted_rms_norm", name, rows, width),
+        mlir_module=module,
+        backend_options=dict(
+            verbose=False,
+            omit_while_true_loop=False,
+            output_format=DEFAULT_OUTPUT_FORMAT,
+            instance_name="weighted_rms_norm",
+            runtime_loop_tiling_sizes=[4, 4],
+        ),
+        inputs=[x_2d, weight.reshape(-1).astype(bfloat16)],
+        output_shape=x_2d.shape,
+        output_dtype=bfloat16,
+        timed_kernel_seconds=timed_kernel_seconds,
+        power_meter=power_meter,
+    )
+    expected = rms_norm_reference(x_2d, weight.reshape(-1).astype(bfloat16))
+    return actual.reshape(x.shape).astype(bfloat16), expected.reshape(x.shape).astype(bfloat16)
+
+
 def _run_rope_stage(
     *,
     name: str,
@@ -1043,10 +1089,30 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
 
         # current_pos=0 makes half-split RoPE an identity, but launch the
         # validated Gemma RoPE wrapper here to prove model-stage integration.
-        qn_actual = _rms_host(q_actual, norm_weights["q_norm"])
-        kn_actual = _rms_host(k_actual, norm_weights["k_norm"])
+        qn_actual, qn_reference = _run_rms_stage(
+            name="q_norm",
+            x=q_actual,
+            weight=norm_weights["q_norm"],
+            runner_cache=runner_cache,
+            timed_kernel_seconds=timed_kernel_samples,
+            power_meter=power_meter,
+        )
+        kn_actual, kn_reference = _run_rms_stage(
+            name="k_norm",
+            x=k_actual,
+            weight=norm_weights["k_norm"],
+            runner_cache=runner_cache,
+            timed_kernel_seconds=timed_kernel_samples,
+            power_meter=power_meter,
+        )
         qn_expected = _rms_host(q_expected, norm_weights["q_norm"])
         kn_expected = _rms_host(k_expected, norm_weights["k_norm"])
+        q_norm_correlation = _correlation(qn_actual, qn_expected)
+        k_norm_correlation = _correlation(kn_actual, kn_expected)
+        if _correlation(qn_actual, qn_reference) < DEFAULT_THRESHOLD:
+            blockers.append("decode-q-norm-correlation-low")
+        if _correlation(kn_actual, kn_reference) < DEFAULT_THRESHOLD:
+            blockers.append("decode-k-norm-correlation-low")
         q_rope_actual, q_rope_expected = _run_rope_stage(
             name="q",
             x=qn_actual,
@@ -1092,8 +1158,18 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         if evidence.projection_correlation is None or evidence.projection_correlation < DEFAULT_THRESHOLD:
             blockers.append("decode-o_proj-correlation-low")
 
-        post_attention_actual = _rms_host(o_actual.reshape(1, 1152), norm_weights["post_attention_layernorm"])
+        post_attention_actual, post_attention_reference = _run_rms_stage(
+            name="post_attention_norm",
+            x=o_actual.reshape(1, 1152),
+            weight=norm_weights["post_attention_layernorm"],
+            runner_cache=runner_cache,
+            timed_kernel_seconds=timed_kernel_samples,
+            power_meter=power_meter,
+        )
         post_attention_expected = _rms_host(o_expected.reshape(1, 1152), norm_weights["post_attention_layernorm"])
+        post_attention_norm_correlation = _correlation(post_attention_actual, post_attention_expected)
+        if _correlation(post_attention_actual, post_attention_reference) < DEFAULT_THRESHOLD:
+            blockers.append("decode-post-attention-norm-correlation-low")
         residual_actual, attention_residual_reference = _run_residual_stage(
             name="attention",
             lhs=x_input.reshape(-1),
@@ -1108,8 +1184,18 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         if _correlation(residual_actual, attention_residual_reference.reshape(1, 1152)) < DEFAULT_THRESHOLD:
             blockers.append("decode-attention-residual-add-correlation-low")
 
-        pre_ff_actual = _rms_host(residual_actual, norm_weights["pre_feedforward_layernorm"])
+        pre_ff_actual, pre_ff_reference = _run_rms_stage(
+            name="pre_feedforward_norm",
+            x=residual_actual,
+            weight=norm_weights["pre_feedforward_layernorm"],
+            runner_cache=runner_cache,
+            timed_kernel_seconds=timed_kernel_samples,
+            power_meter=power_meter,
+        )
         pre_ff_expected = _rms_host(residual_expected, norm_weights["pre_feedforward_layernorm"])
+        pre_feedforward_norm_correlation = _correlation(pre_ff_actual, pre_ff_expected)
+        if _correlation(pre_ff_actual, pre_ff_reference) < DEFAULT_THRESHOLD:
+            blockers.append("decode-pre-feedforward-norm-correlation-low")
         gate_actual, gate_expected, _, gate_evidence = _run_projection(
             family="gate_proj",
             weight=_load_safetensor_array(weights_dir, projection_keys["gate_proj"]),
@@ -1155,8 +1241,18 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         if down_evidence.projection_correlation is None or down_evidence.projection_correlation < DEFAULT_THRESHOLD:
             blockers.append("decode-down_proj-correlation-low")
 
-        post_ff_actual = _rms_host(down_actual.reshape(1, 1152), norm_weights["post_feedforward_layernorm"])
+        post_ff_actual, post_ff_reference = _run_rms_stage(
+            name="post_feedforward_norm",
+            x=down_actual.reshape(1, 1152),
+            weight=norm_weights["post_feedforward_layernorm"],
+            runner_cache=runner_cache,
+            timed_kernel_seconds=timed_kernel_samples,
+            power_meter=power_meter,
+        )
         post_ff_expected = _rms_host(down_expected.reshape(1, 1152), norm_weights["post_feedforward_layernorm"])
+        post_feedforward_norm_correlation = _correlation(post_ff_actual, post_ff_expected)
+        if _correlation(post_ff_actual, post_ff_reference) < DEFAULT_THRESHOLD:
+            blockers.append("decode-post-feedforward-norm-correlation-low")
         output_actual_arr, mlp_residual_reference = _run_residual_stage(
             name="mlp",
             lhs=residual_actual.reshape(-1),
@@ -1180,6 +1276,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         blockers.append(f"decode-full-layer-probe-failed:{exc}")
         rms_correlation = None
         attention_correlation = None
+        q_norm_correlation = None
+        k_norm_correlation = None
+        post_attention_norm_correlation = None
+        pre_feedforward_norm_correlation = None
+        post_feedforward_norm_correlation = None
         rope_q_correlation = None
         rope_k_correlation = None
         attention_residual_correlation = None
@@ -1240,11 +1341,16 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         norm_tensor_keys=norm_tensor_keys,
         projection_tensor_keys=projection_keys,
         projection_weight_layout="fused-dqp-paper-repacked-full-layer-colblock-loop",
-        host_fallbacks=("qk_norm", "single_token_attention", "post_attention_norm", "pre_feedforward_norm", "mlp_activation", "post_feedforward_norm"),
+        host_fallbacks=("single_token_attention", "mlp_activation"),
         input_distribution=DEFAULT_INPUT_DISTRIBUTION,
         rms_correlation=rms_correlation,
         projection_evidence=tuple(projection_evidence),
         attention_correlation=attention_correlation,
+        q_norm_correlation=q_norm_correlation,
+        k_norm_correlation=k_norm_correlation,
+        post_attention_norm_correlation=post_attention_norm_correlation,
+        pre_feedforward_norm_correlation=pre_feedforward_norm_correlation,
+        post_feedforward_norm_correlation=post_feedforward_norm_correlation,
         rope_q_correlation=rope_q_correlation,
         rope_k_correlation=rope_k_correlation,
         attention_residual_correlation=attention_residual_correlation,
@@ -1314,11 +1420,16 @@ def _self_test() -> None:
         norm_tensor_keys=NORM_TENSOR_KEYS,
         projection_tensor_keys={family: f"model.layers.0.fixture.{family}.weight" for family in FULL_LAYER_PROJECTION_FAMILIES},
         projection_weight_layout="fused-dqp-paper-repacked-full-layer-colblock-loop",
-        host_fallbacks=("qk_norm", "single_token_attention", "mlp_activation"),
+        host_fallbacks=("single_token_attention", "mlp_activation"),
         input_distribution=DEFAULT_INPUT_DISTRIBUTION,
         rms_correlation=0.999991,
         projection_evidence=projection_evidence,
         attention_correlation=1.0,
+        q_norm_correlation=1.0,
+        k_norm_correlation=1.0,
+        post_attention_norm_correlation=1.0,
+        pre_feedforward_norm_correlation=1.0,
+        post_feedforward_norm_correlation=1.0,
         rope_q_correlation=1.0,
         rope_k_correlation=1.0,
         attention_residual_correlation=1.0,

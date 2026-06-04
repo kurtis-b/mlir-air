@@ -97,26 +97,29 @@ the generated paper-target comparison summary.
 ## Full Layer Probe Evidence
 
 - `gemma3_1b_decode_full_layer_probe.json`: compact Strix/XRT evidence for one
-  staged Gemma3 1B decode layer-0 pass. It launches RMSNorm plus q/k/v/o/gate/up/down
-  projection families on the NPU through split FusedDQP column-block loops with
-  real weights and runner-owned BOs. RMSNorm uses `norm_arg=selected-vector`,
-  which passes the 2304-byte BF16 norm vector directly while preserving the
-  recorded contiguous norm BO offset contract. It validates RMSNorm correlation
-  0.999991, all seven projection correlations at 1.000000 against quantized
-  staged references, dense original-weight correlations
-  0.994609/0.995959/0.995720/0.997551/0.996684/0.996802/0.997577, attention and
+  staged Gemma3 1B decode layer-0 pass. It launches pre-attention RMSNorm, Q/K
+  RMSNorm, post-attention RMSNorm, pre/post-feedforward RMSNorm, and
+  q/k/v/o/gate/up/down projection families on the NPU through split weighted
+  RMSNorm and FusedDQP wrappers with real weights and runner-owned BOs. RMSNorm
+  uses `norm_arg=selected-vector`, which passes the 2304-byte BF16 norm vector
+  directly while preserving the recorded contiguous norm BO offset contract. It
+  validates Q/K/post-attention/pre-FF/post-FF norm correlations of
+  0.999988/0.999990/0.999985/0.999891/0.999979, all seven projection
+  correlations at 1.000000 against quantized staged references, dense
+  original-weight correlations
+  0.994609/0.995959/0.995720/0.997551/0.996686/0.996806/0.997581, attention and
   GeGLU host-stage correlations at 1.000000, and final layer-output correlation
-  1.000000. The refreshed JSON also launches Gemma half-split RoPE for Q/K at
+  0.999955. The refreshed JSON also launches Gemma half-split RoPE for Q/K at
   identity position 0 and both residual adds through the Gemma residual-add
   wrapper, validating RoPE correlations at 1.000000/1.000000 and residual
-  correlations at 0.999995/0.999992. It records 61 segmented NPU
-  `run.start()/wait2()` launch windows totaling 0.147380 s for one staged layer
-  in reused-ELF mode, or 6.785185 staged layer passes/s. Its 26-layer
-  kernel-only extrapolation is 0.260969 decode TPS, far below the paper's 41.1
+  correlations at 0.999956/0.999955. It records 66 segmented NPU
+  `run.start()/wait2()` launch windows totaling 0.154327 s for one staged layer
+  in reused-ELF mode, or 6.479754 staged layer passes/s. Its 26-layer
+  kernel-only extrapolation is 0.249221 decode TPS, far below the paper's 41.1
   TPS 1B/1k NPU decode target and not a measured full-model decode TPS. Direct
-  RAPL under `sg power` reports 23.598 W segmented package power and a 10.025 W
-  pseudo-NPU package-delta from a 13.573 W quiescent package sample. The JSON records `full-1b-loop-not-wired`
-  as the remaining model runner gap.
+  RAPL under `sg power` reports 20.486 W segmented package power and a 4.738 W
+  pseudo-NPU package-delta from a 15.749 W quiescent package sample. The JSON
+  records `full-1b-loop-not-wired` as the remaining model runner gap.
 
 - `gemma3_1b_decode_full_layer_L1_probe.json`: compact Strix/XRT evidence that
   the same staged route works for layer 1 after fixing the nonzero-layer norm
