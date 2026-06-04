@@ -41,12 +41,12 @@ the generated paper-target comparison summary.
   the promoted Gemma3 1B pre-attention RMSNorm shape (`1024x1152`) launches as
   an ELF on the NPU with the validated first-stage positional layout
   (`layer_input`, `static_norm_weights`, `prefill_L0_pre_attention_norm`). The
-  worker passes the full contiguous `static_norm_weights` payload as argument 1;
-  the actual layer-0 `input_layernorm.weight` vector starts at byte offset 0 and
-  validates with output correlation 0.999983 against the standalone CPU
-  reference. This is first-stage launch evidence only; it is not a
-  runner-owned persistent-BO launch, full model-runner launch, TTFT/TPS timing,
-  pseudo-NPU power, or paper-parity result.
+  worker passes the full contiguous `static_norm_weights` payload as argument 1,
+  allocates/binds the three pyxrt BOs directly, and uses the actual layer-0
+  `input_layernorm.weight` vector at byte offset 0. It validates with output
+  correlation 0.999983 against the standalone CPU reference. This is first-stage
+  launch evidence only; it is not a substep sequence, full model-runner launch,
+  TTFT/TPS timing, pseudo-NPU power, or paper-parity result.
 
 
 ## Static Preload Evidence

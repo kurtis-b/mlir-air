@@ -29,6 +29,7 @@
     "status": "ARGUMENT_BINDING_VALIDATED"
   },
   "blockers": [],
+  "bo_binding_mode": "runner-owned-persistent-bo",
   "command": [
     "/home/cj/iron/ironenv/bin/python3",
     "/home/cj/mlir-air/programming_examples/gemma3_herd_sweep/gemma3_launch_probe.py",
@@ -47,12 +48,13 @@
     "elf",
     "--tensor-key",
     "model.layers.0.input_layernorm.weight",
-    "--use-full-static-norm-bo"
+    "--use-full-static-norm-bo",
+    "--use-runner-owned-bos"
   ],
   "correlation": 0.999983,
   "dirty_worktree": false,
-  "elapsed_seconds": 2.7683158930158243,
-  "git_commit": "62804d8530789467e93db636b2d74a0b5a188035",
+  "elapsed_seconds": 2.2334101190208457,
+  "git_commit": "717e428af989f8f4bb76f999cdd82a09936026ac",
   "herd_x": 1,
   "input_distribution": "bounded-uniform-seed0",
   "kernel": "rms_norm",
@@ -62,7 +64,8 @@
   "phase": "prefill",
   "probe_kind": "model-rmsnorm",
   "remaining_model_runner_gaps": [
-    "runner-owned-bo-launch-not-wired"
+    "substep-sequence-not-wired",
+    "full-layer-not-wired"
   ],
   "returncode": 0,
   "role": "pre_attention_norm",
