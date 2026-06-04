@@ -76,14 +76,18 @@ PROJECTION_OUTPUT_SHAPES = {
     "up_proj": (6912,),
     "down_proj": (1152,),
 }
-NORM_TENSOR_KEYS = {
-    "input_layernorm": "model.layers.0.input_layernorm.weight",
-    "q_norm": "model.layers.0.self_attn.q_norm.weight",
-    "k_norm": "model.layers.0.self_attn.k_norm.weight",
-    "post_attention_layernorm": "model.layers.0.post_attention_layernorm.weight",
-    "pre_feedforward_layernorm": "model.layers.0.pre_feedforward_layernorm.weight",
-    "post_feedforward_layernorm": "model.layers.0.post_feedforward_layernorm.weight",
-}
+def _norm_tensor_keys(layer_index: int) -> dict[str, str]:
+    return {
+        "input_layernorm": f"model.layers.{layer_index}.input_layernorm.weight",
+        "q_norm": f"model.layers.{layer_index}.self_attn.q_norm.weight",
+        "k_norm": f"model.layers.{layer_index}.self_attn.k_norm.weight",
+        "post_attention_layernorm": f"model.layers.{layer_index}.post_attention_layernorm.weight",
+        "pre_feedforward_layernorm": f"model.layers.{layer_index}.pre_feedforward_layernorm.weight",
+        "post_feedforward_layernorm": f"model.layers.{layer_index}.post_feedforward_layernorm.weight",
+    }
+
+
+NORM_TENSOR_KEYS = _norm_tensor_keys(DEFAULT_LAYER)
 
 
 @dataclass(frozen=True)
@@ -462,17 +466,17 @@ class _SegmentedRAPLPowerMeter:
         }
 
 
-def _projection_tensor_keys(model_variant: str, weights_dir: Path) -> dict[str, str]:
+def _projection_tensor_keys(model_variant: str, weights_dir: Path, layer_index: int) -> dict[str, str]:
     from gemma3_weight_plan import build_weight_plan
 
     plan = build_weight_plan(model_variant, weights_dir=weights_dir)
     keys = {}
     for record in plan.records:
-        if record.layer_index == DEFAULT_LAYER and record.family in FULL_LAYER_PROJECTION_FAMILIES:
+        if record.layer_index == layer_index and record.family in FULL_LAYER_PROJECTION_FAMILIES:
             keys[record.family] = record.tensor_key
     missing = [family for family in FULL_LAYER_PROJECTION_FAMILIES if family not in keys]
     if missing:
-        raise RuntimeError(f"missing layer-0 projection tensors: {missing}")
+        raise RuntimeError(f"missing layer-{layer_index} projection tensors: {missing}")
     return keys
 
 
@@ -637,6 +641,8 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
     stderr_lines: list[str] = []
     blockers: list[str] = []
     projection_keys: dict[str, str] = {}
+    layer_index = int(getattr(args, "layer_index", DEFAULT_LAYER))
+    norm_tensor_keys = _norm_tensor_keys(layer_index)
     projection_evidence: list[ProjectionEvidence] = []
     timed_kernel_samples: list[float] = []
     runner_reuse_enabled = not bool(getattr(args, "no_reuse_elf", False))
@@ -649,16 +655,17 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
 
     try:
         weights_dir = _resolve_weights_dir(args.model_variant, args.weights_dir)
+        norm_tensor_key = args.norm_tensor_key or norm_tensor_keys["input_layernorm"]
         norm_payload, input_norm_weight, norm_offset = _load_static_norm_payload(
             weights_dir,
             args.model_variant,
-            args.norm_tensor_key,
+            norm_tensor_key,
         )
         norm_weights = {
             name: _load_safetensor_array(weights_dir, key).astype(bfloat16).reshape(-1)
-            for name, key in NORM_TENSOR_KEYS.items()
+            for name, key in norm_tensor_keys.items()
         }
-        projection_keys = _projection_tensor_keys(args.model_variant, weights_dir)
+        projection_keys = _projection_tensor_keys(args.model_variant, weights_dir, layer_index)
         object_file = Path(__file__).with_name("build_peano") / "fused_dqp.o"
         if not object_file.exists():
             raise RuntimeError(f"missing FusedDQP object file: {object_file}")
@@ -846,29 +853,29 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         status=status,
         sequence_kind=DEFAULT_SEQUENCE_KIND,
         phase=DEFAULT_PHASE,
-        layer_index=DEFAULT_LAYER,
+        layer_index=layer_index,
         stages=(
-            "decode:L0:pre_attention_norm",
-            "decode:L0:qkv_projection",
-            "decode:L0:qk_norm",
-            "decode:L0:rope_identity_pos0",
-            "decode:L0:single_token_attention_host",
-            "decode:L0:output_projection",
-            "decode:L0:post_attention_norm",
-            "decode:L0:attention_residual",
-            "decode:L0:pre_feedforward_norm",
-            "decode:L0:mlp_gate_up_projection",
-            "decode:L0:mlp_activation",
-            "decode:L0:mlp_down_projection",
-            "decode:L0:post_feedforward_norm",
-            "decode:L0:mlp_residual",
+            f"decode:L{layer_index}:pre_attention_norm",
+            f"decode:L{layer_index}:qkv_projection",
+            f"decode:L{layer_index}:qk_norm",
+            f"decode:L{layer_index}:rope_identity_pos0",
+            f"decode:L{layer_index}:single_token_attention_host",
+            f"decode:L{layer_index}:output_projection",
+            f"decode:L{layer_index}:post_attention_norm",
+            f"decode:L{layer_index}:attention_residual",
+            f"decode:L{layer_index}:pre_feedforward_norm",
+            f"decode:L{layer_index}:mlp_gate_up_projection",
+            f"decode:L{layer_index}:mlp_activation",
+            f"decode:L{layer_index}:mlp_down_projection",
+            f"decode:L{layer_index}:post_feedforward_norm",
+            f"decode:L{layer_index}:mlp_residual",
         ),
         input_shape=(1, 1152),
         output_shape=(1152,),
         output_format=DEFAULT_OUTPUT_FORMAT,
         bo_binding_mode="runner-owned-persistent-bo",
         runner_reuse_mode=("reused-elf-persistent-bo" if runner_reuse_enabled else "per-launch-compile-load"),
-        norm_tensor_keys=NORM_TENSOR_KEYS,
+        norm_tensor_keys=norm_tensor_keys,
         projection_tensor_keys=projection_keys,
         projection_weight_layout="fused-dqp-paper-repacked-full-layer-colblock-loop",
         host_fallbacks=("qk_norm", "rope", "single_token_attention", "post_attention_norm", "residual_add", "pre_feedforward_norm", "mlp_activation", "post_feedforward_norm"),
@@ -980,7 +987,8 @@ def main() -> int:
     parser.add_argument("--run-hardware", action="store_true")
     parser.add_argument("--model-variant", choices=sorted(MODEL_SPECS), default=DEFAULT_MODEL)
     parser.add_argument("--weights-dir", type=Path)
-    parser.add_argument("--norm-tensor-key", default=DEFAULT_NORM_TENSOR_KEY)
+    parser.add_argument("--layer-index", type=int, default=DEFAULT_LAYER)
+    parser.add_argument("--norm-tensor-key")
     parser.add_argument("--result-json", type=Path)
     parser.add_argument("--power-sample", action="store_true")
     parser.add_argument("--no-reuse-elf", action="store_true", help="diagnostic fallback: compile/load every launch")
