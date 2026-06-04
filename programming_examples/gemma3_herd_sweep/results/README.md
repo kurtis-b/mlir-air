@@ -119,22 +119,23 @@ power, or paper-parity evidence.
 ## Decode Loop Probe Evidence
 
 - `gemma3_1b_decode_loop_probe.json`: compact Strix/XRT evidence for one staged
-  Gemma3 1B decode token across all 26 real layers. The probe preloads and
-  repacks real layer weights before timing, warms one layer to compile/load
-  reusable ELF runners and allocate runner-owned BOs, then measures the
-  post-warmup loop. It validates every layer with RMSNorm and final-output
-  correlations above 0.99998 and all projection correlations at approximately
-  1.000000. The post-warmup loop wall window is 5.879730 s, or 0.170076
-  diagnostic TPS. The summed NPU `run.start()/wait2()` windows total 3.641984 s
-  across 1,482 launches, or 0.274576 kernel-only diagnostic TPS. Compared with
-  the paper's 41.1 TPS 1B/1k NPU decode target, those diagnostics are 99.586%
-  and 99.332% low, respectively. Full-window direct RAPL reports 17.127 W
-  package power and a 4.050 W pseudo-NPU package-delta from a 13.077 W
+  Gemma3 1B decode token across all 26 real layers. The probe preloads packed
+  projection inputs into 1,456 runner-owned BO sets before timing, warms one
+  layer to compile/load reusable ELF runners and allocate runner-owned BOs, then
+  measures the post-warmup loop with static projection arguments represented by
+  no-allocation metadata placeholders. It validates every layer with RMSNorm and
+  final-output correlations above 0.99998 and all projection correlations at
+  approximately 1.000000. The post-warmup loop wall window is 5.772287 s, or
+  0.173242 diagnostic TPS. The summed NPU `run.start()/wait2()` windows total
+  3.606827 s across 1,482 launches, or 0.277252 kernel-only diagnostic TPS.
+  Compared with the paper's 41.1 TPS 1B/1k NPU decode target, those diagnostics
+  are 99.578% and 99.325% low, respectively. Full-window direct RAPL reports
+  15.975 W package power and a 9.482 W pseudo-NPU package-delta from a 6.494 W
   quiescent package sample. The segmented kernel-only pseudo-NPU delta is not
   usable in this run because its quiescent sample was taken while preparation
   was already busy. This remains diagnostic, not a paper cell: 1k KV-cache
-  attention, logits/sampling, host fallback promotion, and static-weight BO
-  reuse by the FusedDQP route are still not complete.
+  attention, logits/sampling, host fallback promotion, and the production
+  contiguous static-weight BO route are still not complete.
 
 
 ## Static Preload Evidence
