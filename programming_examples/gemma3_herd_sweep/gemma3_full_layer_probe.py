@@ -239,6 +239,25 @@ def _ceil_to(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
 
 
+@dataclass(frozen=True)
+class _PreparedStaticArg:
+    shape: tuple[int, ...]
+    dtype: object
+    nbytes: int
+
+
+def _prepared_static_arg(shape: tuple[int, ...], dtype, nbytes: int) -> _PreparedStaticArg:
+    return _PreparedStaticArg(
+        shape=tuple(int(dim) for dim in shape),
+        dtype=dtype,
+        nbytes=int(nbytes),
+    )
+
+
+def _prepared_static_arg_like(array) -> _PreparedStaticArg:
+    return _prepared_static_arg(array.shape, array.dtype, int(array.size * array.itemsize))
+
+
 class _ReusableElfRunner:
     def __init__(
         self,
@@ -269,7 +288,10 @@ class _ReusableElfRunner:
     def _arrays_and_sizes(self, inputs: list[object]):
         y_out = self._np.zeros(self.output_shape, dtype=self.output_dtype)
         arrays = [*inputs, y_out]
-        sizes = [array.size * array.itemsize for array in arrays]
+        sizes = [
+            array.nbytes if isinstance(array, _PreparedStaticArg) else array.size * array.itemsize
+            for array in arrays
+        ]
         return arrays, sizes
 
     def _state_for(self, *, arrays: list[object], sizes: list[int], bo_set_key: tuple[object, ...] | None):
@@ -312,6 +334,11 @@ class _ReusableElfRunner:
                 continue
             if requested_key is not None and static_keys[index] == requested_key:
                 continue
+            if isinstance(array, _PreparedStaticArg):
+                raise RuntimeError(
+                    "prepared static placeholder reached a BO write; "
+                    "preload the matching static input before timed execution"
+                )
             _write_bo_arg(self.cache.xrt, bo, array)
             if requested_key is not None:
                 static_keys[index] = requested_key

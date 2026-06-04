@@ -32,6 +32,7 @@ from gemma3_full_layer_probe import (
     _ReusableElfRunnerCache,
     _SegmentedRAPLPowerMeter,
     _ceil_to,
+    _prepared_static_arg,
     _geglu,
     _norm_tensor_keys,
     _projection_tensor_keys,
@@ -302,6 +303,14 @@ def _packed_l3_for_col_block(plan: _PackedProjectionPlan, col_block: int):
     )
 
 
+def _packed_l3_static_placeholder(plan: _PackedProjectionPlan):
+    import numpy as np
+
+    block_bytes = int(plan.packed.shape[-1]) + 512 * np.dtype(plan.scale.dtype).itemsize
+    shape = (plan.row_blocks // 4, 4, 1, block_bytes)
+    return _prepared_static_arg(shape, np.dtype(np.int8), int(np.prod(shape)))
+
+
 def _preload_static_projection_bo_sets(
     projection_plans: dict[int, dict[str, _PackedProjectionPlan]],
     runner_cache: _ReusableElfRunnerCache,
@@ -350,11 +359,12 @@ def _run_packed_projection(
     for col_block in range(plan.col_blocks):
         cb_slice = slice(col_block, col_block + 1)
         static_mode = static_projection_argument_mode == "preloaded-runner-bo-set"
+        static_l3 = _packed_l3_static_placeholder(plan) if static_mode else _packed_l3_for_col_block(plan, col_block)
         partial = runner_cache.run(
             key=("fused_dqp_accum_block_opt", int(plan.row_blocks)),
             mlir_module=plan.mlir_module,
             backend_options=_projection_backend_options(),
-            inputs=[_packed_l3_for_col_block(plan, col_block), activation_blocks[cb_slice, :]],
+            inputs=[static_l3, activation_blocks[cb_slice, :]],
             output_shape=expected.shape,
             output_dtype=bfloat16,
             timed_kernel_seconds=timed_kernel_seconds,
