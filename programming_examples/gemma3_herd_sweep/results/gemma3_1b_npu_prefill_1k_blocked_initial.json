@@ -5,7 +5,7 @@
     "config_exists": true,
     "config_path": "/home/cj/models/gemma-3-1b-pt/config.json",
     "default_weights_dir": "/home/cj/models/gemma-3-1b-pt",
-    "default_weights_dir_used": true,
+    "default_weights_dir_used": false,
     "has_vision": false,
     "has_weight_files": true,
     "model_variant": "gemma3-1b",
@@ -36,7 +36,7 @@
   },
   "backend": "npu",
   "classification": "REAL_MODEL_EXECUTION_NOT_IMPLEMENTED",
-  "command": "gemma3_inference.py --paper-benchmark --model-variant gemma3-1b --backend npu --prompt-len 1024 --decode-tokens 0 --metric prefill_ttft_seconds --warmup-iters 1 --timed-iters 3 --power-sample --compare-paper --result-json /tmp/gemma3_1b_npu_prefill_1k_blocked_clean.json",
+  "command": "gemma3_inference.py --paper-benchmark --model-variant gemma3-1b --backend npu --weights-dir /home/cj/models/gemma-3-1b-pt --prompt-len 1024 --decode-tokens 0 --metric prefill_ttft_seconds --warmup-iters 1 --timed-iters 3 --power-sample --compare-paper --result-json /tmp/gemma3_1b_npu_prefill_1k_argbind.json",
   "compile_time_included": false,
   "correctness": "BLOCKED_EXECUTION_NOT_IMPLEMENTED",
   "decode_tokens": 0,
@@ -46,7 +46,6 @@
   "execution_wiring": {
     "blockers": [
       "model-kernel-launch-not-wired",
-      "model-kernel-argument-binding-not-validated",
       "nonlinear-model-stage-promotion-incomplete",
       "paper-shape-hardware-rerun-required"
     ],
@@ -58,12 +57,12 @@
     "status": "BLOCKED"
   },
   "explanation": null,
-  "git_commit": "dfe9c65822046aca2b485da0bfa73fbcf3447372",
+  "git_commit": "41a2024d96cb0f8a6c40defa219c559b8d19e941",
   "host_fallbacks": [
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.009397665659586588,
+      "elapsed_ms": 0.009771669283509254,
       "hardware_status": "hardware-smoke-pass-M8-N1152-N2560-elf",
       "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
       "measured": true,
@@ -77,7 +76,7 @@
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.008479323393354813,
+      "elapsed_ms": 0.009164000706126293,
       "hardware_status": "hardware-smoke-pass-M32-N256-elf",
       "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
       "measured": true,
@@ -91,7 +90,7 @@
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.007681005323926608,
+      "elapsed_ms": 0.007958345425625643,
       "hardware_status": "pending-gemma-air-wrapper-hardware",
       "implementation_path": "programming_examples/llama32_1b/kernel_builder/rope_halfsplit.cc",
       "measured": true,
@@ -105,7 +104,7 @@
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.009697997787346443,
+      "elapsed_ms": 0.010095672526707252,
       "hardware_status": "hardware-smoke-pass-n1024-tile256-elf",
       "implementation_path": "programming_examples/gemma3_dataflow_kernels/geglu.py",
       "measured": true,
@@ -119,7 +118,7 @@
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.002130652622630199,
+      "elapsed_ms": 0.00216066837310791,
       "hardware_status": "not-promoted",
       "implementation_path": "programming_examples/llama32_1b/multi_launch_builder/o_ffn_multi.py",
       "measured": true,
@@ -137,7 +136,6 @@
   "model_runner": {
     "blockers": [
       "model-kernel-launch-not-wired",
-      "model-kernel-argument-binding-not-validated",
       "nonlinear-model-stage-promotion-incomplete",
       "paper-shape-hardware-rerun-required"
     ],
@@ -150,7 +148,9 @@
     "buffer_binding_status": "READY_FOR_MODEL_RUNNER",
     "host_fallback_count": 156,
     "host_runtime_count": 52,
-    "kernel_argument_binding_blocker_count": 572,
+    "kernel_argument_binding_blocker_count": 0,
+    "kernel_argument_binding_count": 572,
+    "kernel_argument_binding_status": "READY_FOR_KERNEL_LAUNCH",
     "kernel_launch_count": 572,
     "layers": 26,
     "static_preload_tensor_count": 4,
@@ -162,8 +162,8 @@
   "notes": [
     "nonlinear host fallbacks measured as CPU-reference microbenchmarks; not NPU-promoted",
     "real artifact inventory is present but execution is not implemented",
-    "execution wiring blockers: model-kernel-launch-not-wired,model-kernel-argument-binding-not-validated,nonlinear-model-stage-promotion-incomplete,paper-shape-hardware-rerun-required",
-    "model runner blockers: model-kernel-launch-not-wired,model-kernel-argument-binding-not-validated,nonlinear-model-stage-promotion-incomplete,paper-shape-hardware-rerun-required",
+    "execution wiring blockers: model-kernel-launch-not-wired,nonlinear-model-stage-promotion-incomplete,paper-shape-hardware-rerun-required",
+    "model runner blockers: model-kernel-launch-not-wired,nonlinear-model-stage-promotion-incomplete,paper-shape-hardware-rerun-required",
     "raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges",
     "xrt-smi is available, but direct NPU rail parsing reports N/A on this host",
     "instantaneous snapshots do not report watts; use begin_power_window/finish_power_window around timed inference",
