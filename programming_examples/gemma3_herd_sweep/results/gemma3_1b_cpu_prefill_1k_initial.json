@@ -40,14 +40,14 @@
   "compile_time_included": false,
   "correctness": "PASS",
   "decode_tokens": 0,
-  "delta_pct": 61.77453059115874,
-  "dirty_worktree": true,
+  "delta_pct": 63.17057445813934,
+  "dirty_worktree": false,
   "environment_comparable": true,
   "execution_wiring": null,
   "explanation": "local CPU/HF measurement uses this Strix host and Transformers runtime; it is a baseline cell, not validated NPU paper parity",
-  "git_commit": "e8895a6721af233ca66390cdfae8c99311a8d375",
+  "git_commit": "b4fea603a6298ca295abaea4e44829603efc9211",
   "host_fallbacks": [],
-  "local_value": 1.5519540579989552,
+  "local_value": 1.4952746769995429,
   "metric": "prefill_ttft_seconds",
   "missing_environment_fields": [],
   "model_runner": null,
@@ -59,41 +59,39 @@
     "nearest_paper_value=4.06",
     "raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges",
     "xrt-smi is available, but direct NPU rail parsing reports N/A on this host",
-    "quiescent direct RAPL package power sample unavailable: permission denied reading /sys/class/powercap/intel-rapl:0/energy_uj",
-    "quiescent fallback package power sample unavailable: turbostat PkgWatt failed: WARNING: turbostat not found for kernel 6.14.0-1020\n\n  You may need to install the following packages for this specific kernel:\n    linux-tools-6.14.0-1020-oem\n    linux-cloud-tools-6.14.0-1020-oem\n\n  You may also want to install one of the following packages to keep up to date:\n    linux-tools-oem\n    linux-cloud-tools-oem",
-    "timed direct RAPL package start unavailable: permission denied reading /sys/class/powercap/intel-rapl:0/energy_uj",
-    "turbostat PkgWatt failed: WARNING: turbostat not found for kernel 6.14.0-1020\n\n  You may need to install the following packages for this specific kernel:\n    linux-tools-6.14.0-1020-oem\n    linux-cloud-tools-6.14.0-1020-oem\n\n  You may also want to install one of the following packages to keep up to date:\n    linux-tools-oem\n    linux-cloud-tools-oem",
+    "CPU rail uses package watts; package power is treated as total for this CPU baseline",
+    "package watts use direct RAPL sysfs energy_uj delta over the timed window",
     "no timed-window package-watt samples were captured"
   ],
   "npu_power_mode": "Power Mode             : Default",
   "paper_source": "arxiv_pdf_v2",
   "paper_table": "prefill/decode text tables",
   "paper_value": 4.06,
-  "power_aligned_with_timed_window": false,
+  "power_aligned_with_timed_window": true,
   "power_sampling_backend": "rapl-sysfs+turbostat+rocm-smi",
   "power_status": {
-    "cpu": "MISSING_POWER_FIELD",
+    "cpu": "RAPL_SYSFS_PACKAGE",
     "gpu": "MISSING_POWER_FIELD",
     "npu": "MISSING_POWER_FIELD",
-    "total": "MISSING_POWER_FIELD"
+    "total": "RAPL_SYSFS_PACKAGE"
   },
   "power_watts": {
-    "cpu": null,
+    "cpu": 49.49307384012003,
     "gpu": null,
     "npu": null,
-    "total": null
+    "total": 49.49307384012003
   },
   "real_benchmark": {
     "backend": "cpu-hf",
     "decode_tokens": 0,
-    "load_seconds": 1.7824311159783974,
-    "local_value": 1.5519540579989552,
+    "load_seconds": 1.7755729369819164,
+    "local_value": 1.4952746769995429,
     "logits_shape": [
       1,
       1024,
       262144
     ],
-    "mean_seconds": 1.5519540579989552,
+    "mean_seconds": 1.4952746769995429,
     "metric": "prefill_ttft_seconds",
     "model_variant": "gemma3-1b",
     "notes": [
@@ -101,30 +99,28 @@
       "prefill_ttft measures one full prompt forward pass"
     ],
     "power_snapshot": {
-      "aligned_with_timed_window": false,
+      "aligned_with_timed_window": true,
       "field_status": {
-        "cpu": "MISSING_POWER_FIELD",
+        "cpu": "RAPL_SYSFS_PACKAGE",
         "gpu": "MISSING_POWER_FIELD",
         "npu": "MISSING_POWER_FIELD",
-        "total": "MISSING_POWER_FIELD"
+        "total": "RAPL_SYSFS_PACKAGE"
       },
       "notes": [
         "raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges",
         "xrt-smi is available, but direct NPU rail parsing reports N/A on this host",
-        "quiescent direct RAPL package power sample unavailable: permission denied reading /sys/class/powercap/intel-rapl:0/energy_uj",
-        "quiescent fallback package power sample unavailable: turbostat PkgWatt failed: WARNING: turbostat not found for kernel 6.14.0-1020\n\n  You may need to install the following packages for this specific kernel:\n    linux-tools-6.14.0-1020-oem\n    linux-cloud-tools-6.14.0-1020-oem\n\n  You may also want to install one of the following packages to keep up to date:\n    linux-tools-oem\n    linux-cloud-tools-oem",
-        "timed direct RAPL package start unavailable: permission denied reading /sys/class/powercap/intel-rapl:0/energy_uj",
-        "turbostat PkgWatt failed: WARNING: turbostat not found for kernel 6.14.0-1020\n\n  You may need to install the following packages for this specific kernel:\n    linux-tools-6.14.0-1020-oem\n    linux-cloud-tools-6.14.0-1020-oem\n\n  You may also want to install one of the following packages to keep up to date:\n    linux-tools-oem\n    linux-cloud-tools-oem",
+        "CPU rail uses package watts; package power is treated as total for this CPU baseline",
+        "package watts use direct RAPL sysfs energy_uj delta over the timed window",
         "no timed-window package-watt samples were captured"
       ],
       "run_id": "prefill_ttft_seconds_gemma3_1b_cpu_1024",
       "sampling_backend": "rapl-sysfs+turbostat+rocm-smi",
       "schema_version": 1,
       "watts": {
-        "cpu": null,
+        "cpu": 49.49307384012003,
         "gpu": null,
         "npu": null,
-        "total": null
+        "total": 49.49307384012003
       }
     },
     "prompt_token_count": 1024,

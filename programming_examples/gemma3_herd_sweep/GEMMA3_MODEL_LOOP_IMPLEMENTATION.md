@@ -564,10 +564,10 @@ Blocked evidence:
 - Dependency-light CPU/HF smoke paths now validate local 1B text, 4B text,
   and 4B synthetic-image weights/tokenizer/processor execution without AIR
   imports. The initial local Gemma3 1B 1k CPU/HF paper-cell measurements are
-  saved under `results/`: prefill TTFT is 1.551954058 s versus the paper CPU
-  target of 4.06 s (`EXPLAINED_DEVIATION`, 61.77% faster), and decode-only TPS
-  is 13.683719230 tokens/s versus the paper CPU target of 41.9 tokens/s
-  (`EXPLAINED_DEVIATION`, 67.34% slower). The decode helper constructs the 1k
+  saved under `results/`: prefill TTFT is 1.495274677 s versus the paper CPU
+  target of 4.06 s (`EXPLAINED_DEVIATION`, 63.17% faster), and decode-only TPS
+  is 15.844624648 tokens/s versus the paper CPU target of 41.9 tokens/s
+  (`EXPLAINED_DEVIATION`, 62.18% slower). The decode helper constructs the 1k
   KV cache before the timed window and times only 16 token-by-token decode
   steps. These are CPU/HF baseline measurements on the local Strix host, not
   NPU paper-parity claims. The matching 1k NPU result records are saved as
@@ -863,10 +863,10 @@ Implemented evidence and blocker:
   timed windows; CPU package watts and pseudo-NPU package-delta watts now
   prefer the direct RAPL sysfs package-energy counter
   `/sys/class/powercap/intel-rapl:0/energy_uj`, using `turbostat_pkgwatt` or
-  raw `turbostat` only as fallback. On the current host, direct RAPL reads are
-  permission-denied for this user and raw `turbostat` reports that
-  `linux-tools-6.14.0-1020-oem` is missing, so CPU/NPU/total watts remain
-  unavailable until one package-power source is made readable.
+  raw `turbostat` only as fallback. Direct RAPL reads are now enabled through the `power` group. The initial
+  CPU/HF 1k result JSONs contain aligned package-power samples: 49.493 W for
+  prefill and 40.510 W for decode. NPU package-delta power remains pending a
+  real timed NPU run.
 - Full power-table comparison and TPS/W reproduction remain blocked until a
   real timed inference run and an approved telemetry backend are available.
 
