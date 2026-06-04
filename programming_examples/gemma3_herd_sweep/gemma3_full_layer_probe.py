@@ -40,6 +40,7 @@ from gemma3_substep_probe import (
     _resolve_weights_dir,
     _run_elf_with_runner_bos,
     _shape_text,
+    _write_bo_arg,
     _tail,
 )
 
@@ -110,6 +111,7 @@ class Gemma3FullLayerProbeResult:
     output_shape: tuple[int, ...]
     output_format: str
     bo_binding_mode: str
+    runner_reuse_mode: str
     norm_tensor_keys: dict[str, str]
     projection_tensor_keys: dict[str, str]
     projection_weight_layout: str
@@ -166,7 +168,8 @@ class Gemma3FullLayerProbeResult:
             f"sequence={self.sequence_kind} phase={self.phase} layer=L{self.layer_index} "
             f"stages={stages} input={_shape_text(self.input_shape)} "
             f"output={_shape_text(self.output_shape)} output_format={self.output_format} "
-            f"bo_binding={self.bo_binding_mode} weight_layout={self.projection_weight_layout} "
+            f"bo_binding={self.bo_binding_mode} runner_reuse={self.runner_reuse_mode} "
+            f"weight_layout={self.projection_weight_layout} "
             f"host_fallbacks={host_fallbacks} input_distribution={self.input_distribution} "
             f"rms_correlation={self._corr_text(self.rms_correlation)} "
             f"projection_correlations={projection_corrs} "
@@ -218,6 +221,140 @@ def has_decode_full_layer_evidence(
 
 def _ceil_to(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
+
+
+class _ReusableElfRunner:
+    def __init__(
+        self,
+        cache,
+        *,
+        mlir_module,
+        backend_options: dict[str, object],
+        output_shape: tuple[int, ...],
+        output_dtype,
+    ) -> None:
+        import numpy as np
+        from air.backend.xrt import XRTBackend
+
+        self.cache = cache
+        self.output_shape = tuple(output_shape)
+        self.output_dtype = output_dtype
+        self.backend = XRTBackend(**backend_options)
+        self.artifact = self.backend.compile(mlir_module)
+        self.elf = cache.xrt.elf(self.artifact.output_binary)
+        self.context = cache.xrt.hw_context(cache.device, self.elf)
+        self.kernel = cache.xrt.ext.kernel(self.context, self.artifact.kernel)
+        self.bos = None
+        self.sizes: list[int] | None = None
+        self._np = np
+
+    def run(
+        self,
+        *,
+        inputs: list[object],
+        timed_kernel_seconds: list[float] | None,
+        power_meter,
+    ):
+        y_out = self._np.zeros(self.output_shape, dtype=self.output_dtype)
+        arrays = [*inputs, y_out]
+        sizes = [array.size * array.itemsize for array in arrays]
+        if self.bos is None:
+            self.sizes = sizes
+            self.bos = [self.cache.xrt.ext.bo(self.cache.device, size) for size in sizes]
+        elif self.sizes != sizes:
+            raise RuntimeError(f"reused ELF runner size mismatch: expected {self.sizes}, got {sizes}")
+        for bo, array in zip(self.bos, arrays):
+            _write_bo_arg(self.cache.xrt, bo, array)
+        run = self.cache.xrt.run(self.kernel)
+        for index, bo in enumerate(self.bos):
+            run.set_arg(index, bo)
+        if power_meter is not None:
+            power_meter.begin_segment()
+        timed_start = time.perf_counter()
+        run.start()
+        run.wait2()
+        timed_elapsed = time.perf_counter() - timed_start
+        if timed_kernel_seconds is not None:
+            timed_kernel_seconds.append(timed_elapsed)
+        if power_meter is not None:
+            power_meter.end_segment(timed_elapsed)
+        self.bos[-1].sync(self.cache.xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+        return self.bos[-1].read(sizes[-1], 0).view(self.output_dtype).reshape(self.output_shape)
+
+    def close(self) -> None:
+        self.backend.unload()
+
+
+class _ReusableElfRunnerCache:
+    def __init__(self, *, enabled: bool) -> None:
+        self.enabled = enabled
+        self.runners: dict[tuple[object, ...], _ReusableElfRunner] = {}
+        self.lock = None
+        self.xrt = None
+        self.device = None
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        import os
+        import tempfile
+        from filelock import FileLock
+
+        try:
+            import pyxrt as xrt
+        except Exception as exc:
+            raise RuntimeError("python:pyxrt is required for Gemma3 reusable ELF runner") from exc
+        self.xrt = xrt
+        self.lock = FileLock(os.path.join(tempfile.gettempdir(), "npu.lock"))
+        self.lock.acquire()
+        self.device = xrt.device(0)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        for runner in self.runners.values():
+            runner.close()
+        self.runners.clear()
+        if self.lock is not None:
+            self.lock.release()
+
+    def run(
+        self,
+        *,
+        key: tuple[object, ...],
+        mlir_module,
+        backend_options: dict[str, object],
+        inputs: list[object],
+        output_shape: tuple[int, ...],
+        output_dtype,
+        timed_kernel_seconds: list[float] | None = None,
+        power_meter=None,
+    ):
+        if not self.enabled:
+            return _run_elf_with_runner_bos(
+                mlir_module=mlir_module,
+                backend_options=backend_options,
+                inputs=inputs,
+                output_shape=output_shape,
+                output_dtype=output_dtype,
+                timed_kernel_seconds=timed_kernel_seconds,
+                power_meter=power_meter,
+            )
+        runner_key = (*key, tuple(output_shape), str(output_dtype))
+        runner = self.runners.get(runner_key)
+        if runner is None:
+            runner = _ReusableElfRunner(
+                self,
+                mlir_module=mlir_module,
+                backend_options=backend_options,
+                output_shape=output_shape,
+                output_dtype=output_dtype,
+            )
+            self.runners[runner_key] = runner
+        return runner.run(
+            inputs=inputs,
+            timed_kernel_seconds=timed_kernel_seconds,
+            power_meter=power_meter,
+        )
 
 
 class _SegmentedRAPLPowerMeter:
@@ -382,6 +519,7 @@ def _run_projection(
     weight,
     activation,
     object_file: Path,
+    runner_cache: _ReusableElfRunnerCache,
     timed_kernel_seconds: list[float] | None = None,
     power_meter=None,
 ):
@@ -430,7 +568,8 @@ def _run_projection(
             1,
             -1,
         )
-        partial = _run_elf_with_runner_bos(
+        partial = runner_cache.run(
+            key=("fused_dqp_accum_block_opt", int(row_blocks)),
             mlir_module=module,
             backend_options=_projection_backend_options(),
             inputs=[packed_l3, activation_blocks[cb_slice, :]],
@@ -500,6 +639,8 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
     projection_keys: dict[str, str] = {}
     projection_evidence: list[ProjectionEvidence] = []
     timed_kernel_samples: list[float] = []
+    runner_reuse_enabled = not bool(getattr(args, "no_reuse_elf", False))
+    runner_cache: _ReusableElfRunnerCache | None = None
     power_meter = _SegmentedRAPLPowerMeter(
         sample=bool(getattr(args, "power_sample", False)),
         run_id="gemma3_1b_decode_full_layer_probe",
@@ -526,7 +667,10 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         x_input = rng.uniform(-0.5, 0.5, size=(1, 1152)).astype(bfloat16)
         norm_expected = rms_norm_reference(x_input, input_norm_weight)
         rms_module = build_rms_module(1, 1152, bfloat16, 16, herd_x=1)
-        norm_actual = _run_elf_with_runner_bos(
+        runner_cache = _ReusableElfRunnerCache(enabled=runner_reuse_enabled)
+        runner_cache.__enter__()
+        norm_actual = runner_cache.run(
+            key=("weighted_rms_norm", 1, 1152),
             mlir_module=rms_module,
             backend_options=dict(
                 verbose=False,
@@ -556,6 +700,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
                 weight=weight,
                 activation=actual["input_norm"],
                 object_file=object_file,
+                runner_cache=runner_cache,
                 timed_kernel_seconds=timed_kernel_samples,
                 power_meter=power_meter,
             )
@@ -601,6 +746,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
             weight=o_weight,
             activation=attention_actual,
             object_file=object_file,
+            runner_cache=runner_cache,
             timed_kernel_seconds=timed_kernel_samples,
             power_meter=power_meter,
         )
@@ -623,6 +769,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
             weight=_load_safetensor_array(weights_dir, projection_keys["gate_proj"]),
             activation=pre_ff_actual.reshape(-1),
             object_file=object_file,
+            runner_cache=runner_cache,
             timed_kernel_seconds=timed_kernel_samples,
             power_meter=power_meter,
         )
@@ -631,6 +778,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
             weight=_load_safetensor_array(weights_dir, projection_keys["up_proj"]),
             activation=pre_ff_actual.reshape(-1),
             object_file=object_file,
+            runner_cache=runner_cache,
             timed_kernel_seconds=timed_kernel_samples,
             power_meter=power_meter,
         )
@@ -650,6 +798,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
             weight=_load_safetensor_array(weights_dir, projection_keys["down_proj"]),
             activation=mlp_actual,
             object_file=object_file,
+            runner_cache=runner_cache,
             timed_kernel_seconds=timed_kernel_samples,
             power_meter=power_meter,
         )
@@ -681,6 +830,9 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         norm_payload = None
         returncode = 1
         stderr_lines.append(str(exc))
+    finally:
+        if runner_cache is not None:
+            runner_cache.__exit__(None, None, None)
 
     elapsed = time.perf_counter() - start
     timed_total = sum(timed_kernel_samples) if timed_kernel_samples else None
@@ -715,6 +867,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         output_shape=(1152,),
         output_format=DEFAULT_OUTPUT_FORMAT,
         bo_binding_mode="runner-owned-persistent-bo",
+        runner_reuse_mode=("reused-elf-persistent-bo" if runner_reuse_enabled else "per-launch-compile-load"),
         norm_tensor_keys=NORM_TENSOR_KEYS,
         projection_tensor_keys=projection_keys,
         projection_weight_layout="fused-dqp-paper-repacked-full-layer-colblock-loop",
@@ -735,6 +888,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         timing_notes=(
             "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls for this staged layer",
             "compile, ELF load, BO allocation, BO writes/preload, argument binding, output sync/readback, and host fallback compute are excluded",
+            "reused ELF mode compiles, loads, allocates BOs, and binds kernel arguments before the timed launch segments",
             "estimated_26_layer_decode_tps_kernel_only is an extrapolation from one layer and is not a measured full-model decode TPS",
         ),
         power_snapshot=power_meter.snapshot(),
@@ -777,6 +931,7 @@ def _self_test() -> None:
         output_shape=(1152,),
         output_format=DEFAULT_OUTPUT_FORMAT,
         bo_binding_mode="runner-owned-persistent-bo",
+        runner_reuse_mode="reused-elf-persistent-bo",
         norm_tensor_keys=NORM_TENSOR_KEYS,
         projection_tensor_keys={family: f"model.layers.0.fixture.{family}.weight" for family in FULL_LAYER_PROJECTION_FAMILIES},
         projection_weight_layout="fused-dqp-paper-repacked-full-layer-colblock-loop",
@@ -828,6 +983,7 @@ def main() -> int:
     parser.add_argument("--norm-tensor-key", default=DEFAULT_NORM_TENSOR_KEY)
     parser.add_argument("--result-json", type=Path)
     parser.add_argument("--power-sample", action="store_true")
+    parser.add_argument("--no-reuse-elf", action="store_true", help="diagnostic fallback: compile/load every launch")
     args = parser.parse_args()
 
     if args.self_test:
