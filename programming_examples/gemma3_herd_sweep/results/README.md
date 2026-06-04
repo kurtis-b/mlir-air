@@ -24,11 +24,12 @@ creation/preload, xclbin/ELF load, and kernel argument setup.
 The iGPU cells set `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` and use ROCm SMI
 for timed-window GPU rail sampling. CPU cells use direct RAPL sysfs package
 energy through the `power` group. iGPU CPU/total rails remain
-`MISSING_POWER_FIELD`; NPU timing and pseudo-NPU power remain blocked by
-full-layer wiring, nonlinear model-stage promotion, and fresh paper-shape
-hardware reruns. Kernel argument-layout validation is complete for the real 1B
-1k/32k context model-runner plan: 572 NPU candidate layouts, 1,924 positional
-arguments, and zero binding blockers.
+`MISSING_POWER_FIELD`; NPU timing and pseudo-NPU power remain blocked by full 1B
+loop wiring, nonlinear model-stage promotion, and fresh paper-shape hardware
+reruns. Kernel argument-layout validation is complete for the real 1B 1k/32k
+context model-runner plan: 572 NPU candidate layouts, 1,924 positional
+arguments, and zero binding blockers. Staged decode layer-0 correctness evidence
+is now present, but it is not a timed paper-cell run.
 
 `gemma3_1b_initial_1k_results.json` bundles these six cells, and
 `gemma3_1b_initial_1k_summary.md` / `gemma3_1b_initial_1k_summary.csv` contain
@@ -74,6 +75,21 @@ the generated paper-target comparison summary.
   dense original-weight correlations 0.994609/0.995959/0.995720. This is staged
   correctness evidence only; it is not a full layer, TTFT/TPS timing,
   pseudo-NPU power, or paper-parity evidence.
+
+
+## Full Layer Probe Evidence
+
+- `gemma3_1b_decode_full_layer_probe.json`: compact Strix/XRT evidence for one
+  staged Gemma3 1B decode layer-0 pass. It launches RMSNorm plus q/k/v/o/gate/up/down
+  projection families on the NPU through split FusedDQP column-block loops with
+  real weights and runner-owned BOs. It validates RMSNorm correlation 0.999991,
+  all seven projection correlations at 1.000000 against quantized staged
+  references, dense original-weight correlations
+  0.994609/0.995959/0.995720/0.997551/0.996684/0.996802/0.997577, attention and
+  GeGLU host-stage correlations at 1.000000, and final layer-output correlation
+  1.000000. The JSON records `full-1b-loop-not-wired` as the remaining model
+  runner gap. This is staged correctness evidence only; it is not a repeated
+  model-runner loop, TTFT/TPS timing, pseudo-NPU power, or paper-parity evidence.
 
 
 ## Static Preload Evidence
