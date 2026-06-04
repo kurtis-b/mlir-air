@@ -4,7 +4,7 @@
 
 """Gemma3 real-weight staged decode full-layer probe.
 
-This diagnostic wires one Gemma3 1B layer-0 decode pass with real weights. The
+This diagnostic wires one Gemma3 1B decode layer pass with real weights. The
 projection stages launch on the NPU through the FusedDQP column-block route; the
 remaining nonlinear/vector stages are explicit host fallbacks. This is full-layer
 staged correctness evidence, not a full model loop, TTFT/TPS timing, pseudo-NPU
@@ -116,6 +116,11 @@ class Gemma3FullLayerProbeResult:
     output_format: str
     bo_binding_mode: str
     runner_reuse_mode: str
+    norm_tensor_key: str
+    static_norm_argument_mode: str
+    static_norm_tensor_offset_bytes: int | None
+    static_norm_bo_bytes: int | None
+    static_norm_argument_bytes: int | None
     norm_tensor_keys: dict[str, str]
     projection_tensor_keys: dict[str, str]
     projection_weight_layout: str
@@ -173,6 +178,9 @@ class Gemma3FullLayerProbeResult:
             f"stages={stages} input={_shape_text(self.input_shape)} "
             f"output={_shape_text(self.output_shape)} output_format={self.output_format} "
             f"bo_binding={self.bo_binding_mode} runner_reuse={self.runner_reuse_mode} "
+            f"norm_arg={self.static_norm_argument_mode} "
+            f"norm_tensor={self.norm_tensor_key}@{self.static_norm_tensor_offset_bytes}/"
+            f"bo={self.static_norm_bo_bytes}/arg={self.static_norm_argument_bytes} "
             f"weight_layout={self.projection_weight_layout} "
             f"host_fallbacks={host_fallbacks} input_distribution={self.input_distribution} "
             f"rms_correlation={self._corr_text(self.rms_correlation)} "
@@ -206,6 +214,10 @@ def _is_decode_full_layer_evidence(data: object, *, model_variant: str) -> bool:
         and data.get("layer_index") == DEFAULT_LAYER
         and data.get("output_format") == DEFAULT_OUTPUT_FORMAT
         and data.get("bo_binding_mode") == "runner-owned-persistent-bo"
+        and data.get("static_norm_argument_mode") in {
+            "selected-vector",
+            "contiguous-payload",
+        }
         and not data.get("blockers")
         and "full-1b-loop-not-wired" in tuple(data.get("remaining_model_runner_gaps", ()))
     )
@@ -661,6 +673,21 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
             args.model_variant,
             norm_tensor_key,
         )
+        norm_argument_mode = args.norm_argument_mode
+        if norm_argument_mode == "auto":
+            norm_argument_mode = "selected-vector"
+        if norm_argument_mode == "selected-vector":
+            norm_argument = input_norm_weight
+        elif norm_argument_mode == "contiguous-payload":
+            if norm_offset != 0:
+                raise RuntimeError(
+                    "contiguous norm payload has no offset ABI for this RMSNorm probe: "
+                    f"{norm_tensor_key} starts at byte offset {norm_offset}; "
+                    "use selected-vector or add explicit offset/sub-BO plumbing"
+                )
+            norm_argument = norm_payload
+        else:
+            raise RuntimeError(f"unsupported norm argument mode: {norm_argument_mode}")
         norm_weights = {
             name: _load_safetensor_array(weights_dir, key).astype(bfloat16).reshape(-1)
             for name, key in norm_tensor_keys.items()
@@ -686,7 +713,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
                 instance_name="weighted_rms_norm",
                 runtime_loop_tiling_sizes=[4, 4],
             ),
-            inputs=[x_input, norm_payload],
+            inputs=[x_input, norm_argument],
             output_shape=norm_expected.shape,
             output_dtype=bfloat16,
             timed_kernel_seconds=timed_kernel_samples,
@@ -835,6 +862,9 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         dense_final_output_correlation = None
         norm_offset = None
         norm_payload = None
+        norm_tensor_key = ""
+        norm_argument_mode = getattr(args, "norm_argument_mode", "selected-vector")
+        norm_argument = None
         returncode = 1
         stderr_lines.append(str(exc))
     finally:
@@ -875,6 +905,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         output_format=DEFAULT_OUTPUT_FORMAT,
         bo_binding_mode="runner-owned-persistent-bo",
         runner_reuse_mode=("reused-elf-persistent-bo" if runner_reuse_enabled else "per-launch-compile-load"),
+        norm_tensor_key=norm_tensor_key,
+        static_norm_argument_mode=norm_argument_mode,
+        static_norm_tensor_offset_bytes=norm_offset,
+        static_norm_bo_bytes=None if norm_payload is None else int(norm_payload.nbytes),
+        static_norm_argument_bytes=None if norm_argument is None else int(norm_argument.nbytes),
         norm_tensor_keys=norm_tensor_keys,
         projection_tensor_keys=projection_keys,
         projection_weight_layout="fused-dqp-paper-repacked-full-layer-colblock-loop",
@@ -896,6 +931,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
             "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls for this staged layer",
             "compile, ELF load, BO allocation, BO writes/preload, argument binding, output sync/readback, and host fallback compute are excluded",
             "reused ELF mode compiles, loads, allocates BOs, and binds kernel arguments before the timed launch segments",
+            "RMSNorm uses a preselected BF16 norm-vector argument because the current two-argument RMSNorm ABI has no static-norm BO offset parameter",
             "estimated_26_layer_decode_tps_kernel_only is an extrapolation from one layer and is not a measured full-model decode TPS",
         ),
         power_snapshot=power_meter.snapshot(),
@@ -939,6 +975,11 @@ def _self_test() -> None:
         output_format=DEFAULT_OUTPUT_FORMAT,
         bo_binding_mode="runner-owned-persistent-bo",
         runner_reuse_mode="reused-elf-persistent-bo",
+        norm_tensor_key=DEFAULT_NORM_TENSOR_KEY,
+        static_norm_argument_mode="selected-vector",
+        static_norm_tensor_offset_bytes=0,
+        static_norm_bo_bytes=266240,
+        static_norm_argument_bytes=2304,
         norm_tensor_keys=NORM_TENSOR_KEYS,
         projection_tensor_keys={family: f"model.layers.0.fixture.{family}.weight" for family in FULL_LAYER_PROJECTION_FAMILIES},
         projection_weight_layout="fused-dqp-paper-repacked-full-layer-colblock-loop",
@@ -989,6 +1030,12 @@ def main() -> int:
     parser.add_argument("--weights-dir", type=Path)
     parser.add_argument("--layer-index", type=int, default=DEFAULT_LAYER)
     parser.add_argument("--norm-tensor-key")
+    parser.add_argument(
+        "--norm-argument-mode",
+        choices=("auto", "selected-vector", "contiguous-payload"),
+        default="selected-vector",
+        help="RMSNorm static weight argument mode; selected-vector is the model-loop-compatible offset workaround",
+    )
     parser.add_argument("--result-json", type=Path)
     parser.add_argument("--power-sample", action="store_true")
     parser.add_argument("--no-reuse-elf", action="store_true", help="diagnostic fallback: compile/load every launch")
