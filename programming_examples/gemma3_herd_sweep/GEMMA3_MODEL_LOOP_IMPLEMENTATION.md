@@ -105,6 +105,9 @@ Implemented files:
   validation for every NPU candidate stage, including persistent BOs, static
   BOs, mutable KV buffers, virtual intermediates, shapes, dtypes, directions,
   and missing-storage diagnostics.
+- `gemma3_launch_probe.py`: diagnostic first-kernel launch probe for the
+  promoted Gemma3 1B pre-attention RMSNorm stage; hardware is touched only with
+  `--run-hardware`, while lit covers parsing and evidence formatting.
 - `gemma3_model_runner.py`: launch-order manifest that composes BO planning,
   static-preload planning, buffer bindings, argument layouts, and per-layer
   kernel/fallback wiring without claiming kernel execution.
@@ -128,6 +131,7 @@ Focused lit coverage:
 - `run_model_loop_model_runner.lit`
 - `run_model_loop_buffer_binding.lit`
 - `run_model_loop_argument_binding.lit`
+- `run_model_loop_launch_probe.lit`
 - `../gemma3_dataflow_kernels/run_geglu_compile_only.lit`
 
 Current phase status:
