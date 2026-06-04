@@ -84,22 +84,36 @@ the generated paper-target comparison summary.
 - `gemma3_1b_decode_full_layer_probe.json`: compact Strix/XRT evidence for one
   staged Gemma3 1B decode layer-0 pass. It launches RMSNorm plus q/k/v/o/gate/up/down
   projection families on the NPU through split FusedDQP column-block loops with
-  real weights and runner-owned BOs. It validates RMSNorm correlation 0.999991,
-  all seven projection correlations at 1.000000 against quantized staged
-  references, dense original-weight correlations
+  real weights and runner-owned BOs. RMSNorm uses `norm_arg=selected-vector`,
+  which passes the 2304-byte BF16 norm vector directly while preserving the
+  recorded contiguous norm BO offset contract. It validates RMSNorm correlation
+  0.999991, all seven projection correlations at 1.000000 against quantized
+  staged references, dense original-weight correlations
   0.994609/0.995959/0.995720/0.997551/0.996684/0.996802/0.997577, attention and
   GeGLU host-stage correlations at 1.000000, and final layer-output correlation
-  1.000000. The refreshed JSON records 57 segmented NPU `run.start()/wait2()` launch
-  windows totaling 0.148046 s for one staged layer in reused-ELF mode, or
-  6.754643 staged layer passes/s. Its 26-layer kernel-only extrapolation is
-  0.259794 decode TPS, far below the paper's 41.1 TPS 1B/1k NPU decode target
+  1.000000. The refreshed JSON records 57 segmented NPU `run.start()/wait2()`
+  launch windows totaling 0.158887 s for one staged layer in reused-ELF mode,
+  or 6.293770 staged layer passes/s. Its 26-layer kernel-only extrapolation is
+  0.242068 decode TPS, far below the paper's 41.1 TPS 1B/1k NPU decode target
   and not a measured full-model decode TPS. Direct RAPL under `sg power` reports
-  14.788 W segmented package power and a 2.973 W pseudo-NPU delta from an
-  11.815 W quiescent package sample. The JSON
-  records `full-1b-loop-not-wired` as the remaining model runner gap. This is
-  staged correctness and diagnostic kernel-only timing evidence only; it is not
-  a repeated model-runner loop, TTFT/TPS timing, pseudo-NPU paper power, or
-  paper-parity evidence.
+  21.939 W segmented package power and a 9.005 W pseudo-NPU package-delta from a
+  12.933 W quiescent package sample. The JSON records `full-1b-loop-not-wired`
+  as the remaining model runner gap.
+
+- `gemma3_1b_decode_full_layer_L1_probe.json`: compact Strix/XRT evidence that
+  the same staged route works for layer 1 after fixing the nonzero-layer norm
+  argument. The layer-1 `input_layernorm.weight` vector starts at byte offset
+  10240 in the contiguous norm BO and is passed as a 2304-byte selected-vector
+  argument. It validates RMSNorm correlation 0.999991, all seven projection
+  correlations at 1.000000, and final layer-output correlation 1.000000. The
+  JSON records 57 segmented launch windows totaling 0.142578 s, or 7.013715
+  staged layer passes/s; the 26-layer kernel-only extrapolation is 0.269758
+  decode TPS. Direct RAPL reports 17.420 W segmented package power and a
+  5.918 W pseudo-NPU package-delta from an 11.502 W quiescent package sample.
+
+These are staged correctness and diagnostic kernel-only timing artifacts only;
+they are not a repeated model-runner loop, TTFT/TPS timing, pseudo-NPU paper
+power, or paper-parity evidence.
 
 
 ## Static Preload Evidence

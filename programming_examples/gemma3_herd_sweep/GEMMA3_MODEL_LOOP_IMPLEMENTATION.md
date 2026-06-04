@@ -116,11 +116,13 @@ Implemented files:
   substep probe. It launches real layer-0 RMSNorm plus real q/k/v FusedDQP
   col-block loops and validates the accumulated Q/K/V vectors against CPU
   references.
-- `gemma3_full_layer_probe.py`: diagnostic Gemma3 1B staged decode layer-0
-  probe. It launches RMSNorm plus all seven projection families on the NPU
-  through FusedDQP column-block loops while keeping QK-Norm, RoPE, single-token
-  attention, residuals, and GeGLU/post-norm vector stages as explicit host
-  fallbacks.
+- `gemma3_full_layer_probe.py`: diagnostic Gemma3 1B staged decode layer
+  probe with a selectable `--layer-index`. It launches RMSNorm plus all seven
+  projection families on the NPU through FusedDQP column-block loops while
+  keeping QK-Norm, RoPE, single-token attention, residuals, and GeGLU/post-norm
+  vector stages as explicit host fallbacks. RMSNorm uses a preselected BF16
+  norm-vector argument until the two-argument RMSNorm ABI grows static-BO
+  offset/sub-BO plumbing.
 - `gemma3_model_runner.py`: launch-order manifest that composes BO planning,
   static-preload planning, buffer bindings, argument layouts, and per-layer
   kernel/fallback wiring without claiming kernel execution.
@@ -329,10 +331,10 @@ The next implementation loops should stay on 1B 1k NPU text before expanding to
 | Priority | Target | Done when |
 | ---: | --- | --- |
 | 1 | Complete: resolve `model-kernel-argument-binding-not-validated` | `gemma3_argument_binding.py --self-test` validates 44 fixture NPU candidate layouts with 148 positional args and no missing storage; the real 1B 1k/32k-context plan validates 572 NPU candidate layouts with 1,924 positional args and zero argument-binding blockers. |
-| 2 | Partially complete: resolve `model-kernel-launch-not-wired` | The first promoted Gemma3 1B pre-attention RMSNorm shape (`1024x1152`, ELF) launches on the NPU with correlation 0.999983 using the validated first-stage positional layout (`layer_input`, `static_norm_weights`, `prefill_L0_pre_attention_norm`), a full contiguous static norm payload whose layer-0 vector is at byte offset 0, and runner-owned pyxrt BO allocation/binding. The decode RMSNorm-to-`q_proj` substep passes with RMSNorm correlation 0.999991, q-projection correlation 1.000000, and dense original-weight correlation 0.994609. The decode RMSNorm-to-Q/K/V substep passes with Q/K/V projection correlations all 1.000000 and dense original-weight correlations 0.994609/0.995959/0.995720. The staged decode layer-0 probe now launches RMSNorm plus q/k/v/o/gate/up/down projection families on the NPU and validates final layer-output correlation 1.000000 against the quantized staged reference, with host fallbacks explicitly recorded for QK-Norm, RoPE, single-token attention, residuals, GeGLU, and post-norm vector stages. For 1B, committed evidence now narrows the real-artifact blocker to `full-1b-loop-not-wired`; the remaining launch work is repeated layer/token loop integration and timed paper-cell measurement, not first-kernel or single-layer correctness. |
+| 2 | Partially complete: resolve `model-kernel-launch-not-wired` | The first promoted Gemma3 1B pre-attention RMSNorm shape (`1024x1152`, ELF) launches on the NPU with correlation 0.999983 using the validated first-stage positional layout (`layer_input`, `static_norm_weights`, `prefill_L0_pre_attention_norm`), a full contiguous static norm payload whose layer-0 vector is at byte offset 0, and runner-owned pyxrt BO allocation/binding. The decode RMSNorm-to-`q_proj` substep passes with RMSNorm correlation 0.999991, q-projection correlation 1.000000, and dense original-weight correlation 0.994609. The decode RMSNorm-to-Q/K/V substep passes with Q/K/V projection correlations all 1.000000 and dense original-weight correlations 0.994609/0.995959/0.995720. The staged decode layer-0 and layer-1 probes now launch RMSNorm plus q/k/v/o/gate/up/down projection families on the NPU and validate final layer-output correlation 1.000000 against quantized staged references. Layer 1 exposed and fixed the missing static-norm offset/sub-BO path by using a preselected BF16 norm-vector argument (`model.layers.1.input_layernorm.weight` at byte offset 10240 in the contiguous norm BO, passed as a 2304-byte argument). Host fallbacks remain explicit for QK-Norm, RoPE, single-token attention, residuals, GeGLU, and post-norm vector stages. For 1B, committed evidence now narrows the real-artifact blocker to `full-1b-loop-not-wired`; the remaining launch work is repeated layer/token loop integration and timed paper-cell measurement, not first-kernel or single-layer correctness. |
 | 3 | Reduce `nonlinear-model-stage-promotion-incomplete` | Each remaining nonlinear stage is either promoted through standalone NPU evidence and model launch validation, or explicitly measured and classified as a timed host fallback. |
 | 4 | Re-run 1B 1k NPU paper cells | Prefill and decode result JSONs contain real local NPU TTFT/TPS or a narrower, artifact-backed failure classification. |
-| 5 | Partially complete: capture pseudo-NPU power | Direct RAPL is readable when the run is launched under `sg power`. The staged full-layer diagnostic now records segmented package-energy deltas over only NPU `run.start()/wait2()` windows: 0.148046 s across 57 kernel launches, 14.788 W segmented package power, and 2.973 W pseudo-NPU delta from an 11.815 W quiescent sample. Official paper-cell pseudo-NPU power remains blocked until a repeated full-model timed window exists. |
+| 5 | Partially complete: capture pseudo-NPU power | Direct RAPL is readable when the run is launched under `sg power`. The refreshed layer-0 staged full-layer diagnostic records segmented package-energy deltas over only NPU `run.start()/wait2()` windows: 0.158887 s across 57 kernel launches, 21.939 W segmented package power, and 9.005 W pseudo-NPU package-delta from a 12.933 W quiescent sample. The layer-1 diagnostic records 0.142578 s across the same 57 launch windows, 17.420 W segmented package power, and 5.918 W pseudo-NPU package-delta from an 11.502 W quiescent sample. Official paper-cell pseudo-NPU power remains blocked until a repeated full-model timed window exists. |
 | 6 | Expand cautiously | Only after 1B 1k NPU correctness, timing, and pseudo-power evidence is clean should the loop expand to more 1B lengths, 4B text, or vision. |
 
 ### Blocker-resolution decision tree
@@ -732,15 +734,23 @@ Blocked evidence:
   FusedDQP column-block loops, all projection correlations are 1.000000 against
   the quantized staged references, dense original-weight correlations are
   0.994609/0.995959/0.995720/0.997551/0.996684/0.996802/0.997577, and the final
-  layer-output correlation is 1.000000. QK-Norm, RoPE, single-token attention,
-  residual additions, GeGLU, and post-norm vector stages remain explicit host
-  fallbacks in that diagnostic. The refreshed diagnostic also records segmented
-  NPU kernel timing and RAPL: 57 `run.start()/wait2()` launch windows total
-  0.148046 s for one staged layer in reused-ELF mode, corresponding to
-  6.754643 staged layer passes/s and a clearly non-paper-comparable 26-layer
-  kernel-only extrapolation of 0.259794 decode TPS versus the paper's 41.1 TPS
-  1B/1k NPU target. The segmented package average is 14.788 W; the pseudo-NPU
-  delta is 2.973 W over an 11.815 W quiescent package sample. These split routes are staged correctness and diagnostic timing
+  layer-output correlation is 1.000000. Layer-1 evidence is present in
+  `gemma3_1b_decode_full_layer_L1_probe.json`; it uses the selected-vector
+  norm argument for `model.layers.1.input_layernorm.weight` at contiguous norm
+  BO offset 10240 and validates RMSNorm correlation 0.999991, all seven
+  projection correlations at 1.000000, and final layer-output correlation
+  1.000000. QK-Norm, RoPE, single-token attention, residual additions, GeGLU,
+  and post-norm vector stages remain explicit host fallbacks in both
+  diagnostics. The refreshed layer-0 diagnostic also records segmented NPU
+  kernel timing and RAPL: 57 `run.start()/wait2()` launch windows total
+  0.158887 s for one staged layer in reused-ELF mode, corresponding to
+  6.293770 staged layer passes/s and a clearly non-paper-comparable 26-layer
+  kernel-only extrapolation of 0.242068 decode TPS versus the paper's 41.1 TPS
+  1B/1k NPU target. The segmented package average is 21.939 W; the pseudo-NPU
+  delta is 9.005 W over a 12.933 W quiescent package sample. The layer-1
+  diagnostic records 0.142578 s, 7.013715 staged layer passes/s, a 0.269758
+  kernel-only extrapolated decode TPS, 17.420 W segmented package power, and a
+  5.918 W pseudo-NPU package-delta over an 11.502 W quiescent sample. These split routes are staged correctness and diagnostic timing
   probes because the current full 5-col-block paper module over-allocates tile
   memory for this shape. The real 1B blocker report now narrows the launch
   blocker to `full-1b-loop-not-wired`; repeated full-model loop wiring and
@@ -1044,22 +1054,27 @@ Implemented evidence and blocker:
   projection correlations of 1.000000/1.000000/1.000000, and dense original-
   weight correlations of 0.994609/0.995959/0.995720.
 - `gemma3_full_layer_probe.py --run-hardware --power-sample` records staged
-  decode layer-0 evidence using real Gemma3 1B weights. The committed Strix
-  result validates RMSNorm correlation 0.999991, all seven NPU projection-family
-  correlations at 1.000000 against quantized staged references, dense
-  original-weight correlations of
+  decode layer evidence using real Gemma3 1B weights. The committed layer-0
+  Strix result validates RMSNorm correlation 0.999991, all seven NPU
+  projection-family correlations at 1.000000 against quantized staged
+  references, dense original-weight correlations of
   0.994609/0.995959/0.995720/0.997551/0.996684/0.996802/0.997577, attention and
   GeGLU host-stage correlations at 1.000000, and final layer-output correlation
-  1.000000. The JSON records 68.909 s elapsed for diagnostic compile/load/run
-  work, which is intentionally not a TTFT/TPS timing window. It also records a
-  segmented kernel-only timing window that excludes compile, ELF load, BO
-  allocation, BO writes/preload, argument binding, output sync/readback, and
-  host fallback compute: 57 NPU launches total 0.148046 s, or 6.754643 staged layer passes/s. A
-  26-layer kernel-only extrapolation is 0.259794 decode TPS, about 158.2x below
-  the paper's 41.1 TPS 1B/1k NPU decode target; this is an extrapolation, not a
-  measured full-model TPS. Direct RAPL under `sg power` reports 14.788 W
-  segmented package power, 11.815 W quiescent package power, and a 2.973 W
-  pseudo-NPU delta. `gemma3_npu_wiring.py` and
+  1.000000. The committed layer-1 result validates the same staged route after
+  switching RMSNorm to a selected-vector norm argument for the layer-1 norm at
+  static norm BO offset 10240. The layer-0 JSON records 7.218 s elapsed for
+  diagnostic compile/load/run work, which is intentionally not a TTFT/TPS timing
+  window. It also records a segmented kernel-only timing window that excludes
+  compile, ELF load, BO allocation, BO writes/preload, argument binding, output
+  sync/readback, and host fallback compute: 57 NPU launches total 0.158887 s,
+  or 6.293770 staged layer passes/s. A 26-layer kernel-only extrapolation is
+  0.242068 decode TPS, about 169.8x below the paper's 41.1 TPS 1B/1k NPU decode
+  target; this is an extrapolation, not a measured full-model TPS. Direct RAPL
+  under `sg power` reports 21.939 W segmented package power, 12.933 W quiescent
+  package power, and a 9.005 W pseudo-NPU package-delta. Layer 1 records
+  0.142578 s across 57 launches, or 7.013715 staged layer passes/s, with a
+  0.269758 kernel-only extrapolated decode TPS and a 5.918 W pseudo-NPU
+  package-delta. `gemma3_npu_wiring.py` and
   `gemma3_model_runner.py` consume the first-kernel, q-only, Q/K/V, and
   full-layer evidence to report `full-1b-loop-not-wired` for the real 1B plan
   instead of the stale first-kernel, substep-sequence, or full-layer blocker.
