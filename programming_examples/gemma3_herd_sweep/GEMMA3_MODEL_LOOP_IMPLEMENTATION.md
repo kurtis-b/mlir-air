@@ -313,7 +313,7 @@ The next implementation loops should stay on 1B 1k NPU text before expanding to
 | Priority | Target | Done when |
 | ---: | --- | --- |
 | 1 | Complete: resolve `model-kernel-argument-binding-not-validated` | `gemma3_argument_binding.py --self-test` validates 44 fixture NPU candidate layouts with 148 positional args and no missing storage; the real 1B 1k/32k-context plan validates 572 NPU candidate layouts with 1,924 positional args and zero argument-binding blockers. |
-| 2 | Partially complete: resolve `model-kernel-launch-not-wired` | The first promoted Gemma3 1B pre-attention RMSNorm shape (`1024x1152`, ELF) launches on the NPU with correlation 0.999984. The blocker remains until the model runner launches the first stage through its own BO/argument path, then one substep sequence, then one full layer. |
+| 2 | Partially complete: resolve `model-kernel-launch-not-wired` | The first promoted Gemma3 1B pre-attention RMSNorm shape (`1024x1152`, ELF) launches on the NPU with correlation 0.999983. The blocker remains until the model runner launches the first stage through its own BO/argument path, then one substep sequence, then one full layer. |
 | 3 | Reduce `nonlinear-model-stage-promotion-incomplete` | Each remaining nonlinear stage is either promoted through standalone NPU evidence and model launch validation, or explicitly measured and classified as a timed host fallback. |
 | 4 | Re-run 1B 1k NPU paper cells | Prefill and decode result JSONs contain real local NPU TTFT/TPS or a narrower, artifact-backed failure classification. |
 | 5 | Capture pseudo-NPU power | The NPU timed-window package watts and pre-run quiescent package watts are both readable through direct RAPL, and the result JSON records their delta. |
@@ -692,8 +692,8 @@ Blocked evidence:
   no missing storage, shape, dtype, direction, or KV-buffer identity blockers.
   First-kernel launch evidence is present for the promoted Gemma3 1B
   pre-attention RMSNorm shape: `gemma3_1b_first_kernel_launch_probe.json`
-  records a local Strix/XRT ELF launch at shape 1024x1152 with output
-  correlation 0.999984. This is standalone stage evidence only; full model-runner
+  records a local Strix/XRT ELF launch at shape 1024x1152 using the actual
+  layer-0 `input_layernorm.weight` vector with output correlation 0.999983. This is standalone stage evidence only; full model-runner
   launch wiring, substep sequencing, full-layer correctness, and timed TTFT/TPS
   remain blocked. Full paper-shape BO allocation validation is
   complete for 1B, 4B text, and the 4B vision text stack under the
@@ -979,7 +979,7 @@ Implemented evidence and blocker:
 - `gemma3_launch_probe.py --run-hardware` records first-kernel launch evidence
   for the promoted Gemma3 1B pre-attention RMSNorm stage. The committed Strix
   result launches the 1024x1152 ELF probe and validates output correlation
-  0.999984 against the standalone CPU reference; it is not a full model-runner
+  0.999983 against the standalone CPU reference; it is not a full model-runner
   launch or timed paper cell.
 - `gemma3_paper_compare.py --compare` accepts either a single result cell or a
   wrapper with `results`, and can emit Markdown and CSV summaries. The initial
