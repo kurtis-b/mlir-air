@@ -309,7 +309,7 @@ def run_cpu_benchmark(
             decode_states = [prepare_decode_state() for _ in range(timed_iters)]
             elapsed = 0.0
             output = None
-            power_window = begin_power_window(sample=power_sample, run_id=run_id)
+            power_window = begin_power_window(sample=power_sample, run_id=run_id, target_backend="cpu")
             for state in decode_states:
                 start = perf_counter()
                 output = run_decode_tokens(state)
@@ -319,7 +319,7 @@ def run_cpu_benchmark(
                 run_prefill()
             elapsed = 0.0
             output = None
-            power_window = begin_power_window(sample=power_sample, run_id=run_id)
+            power_window = begin_power_window(sample=power_sample, run_id=run_id, target_backend="cpu")
             for _ in range(timed_iters):
                 start = perf_counter()
                 output = run_prefill()

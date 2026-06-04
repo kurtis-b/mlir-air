@@ -564,10 +564,10 @@ Blocked evidence:
 - Dependency-light CPU/HF smoke paths now validate local 1B text, 4B text,
   and 4B synthetic-image weights/tokenizer/processor execution without AIR
   imports. The initial local Gemma3 1B 1k CPU/HF paper-cell measurements are
-  saved under `results/`: prefill TTFT is 1.581161032 s versus the paper CPU
-  target of 4.06 s (`EXPLAINED_DEVIATION`, 61.06% faster), and decode-only TPS
-  is 13.637000294 tokens/s versus the paper CPU target of 41.9 tokens/s
-  (`EXPLAINED_DEVIATION`, 67.45% slower). The decode helper constructs the 1k
+  saved under `results/`: prefill TTFT is 1.727778663 s versus the paper CPU
+  target of 4.06 s (`EXPLAINED_DEVIATION`, 57.44% faster), and decode-only TPS
+  is 14.280128371 tokens/s versus the paper CPU target of 41.9 tokens/s
+  (`EXPLAINED_DEVIATION`, 65.92% slower). The decode helper constructs the 1k
   KV cache before the timed window and times only 16 token-by-token decode
   steps. These are CPU/HF baseline measurements on the local Strix host, not
   NPU paper-parity claims. The matching 1k NPU result records are saved as
@@ -859,10 +859,11 @@ Implemented evidence and blocker:
   that JSON output keeps watts null while statuses classify missing rails.
 - Initial 1k CPU/HF paper-cell result JSONs request power sampling, but local
   power remains `MISSING_POWER_FIELD`: `xrt-smi examine -r all` reports
-  `Estimated Power: N/A`, `/sys/class/powercap` RAPL energy counters exist but
-  deny reads to this user, and `sensors` exposes no CPU/NPU rail or reliable
-  total timed-window wattage. The only visible wattage-like value is iGPU PPT,
-  which is not enough for CPU/NPU/total paper-table comparison.
+  `Estimated Power: N/A`; `rocm-smi --showpower` is parseable for future iGPU
+  timed windows; CPU package watts and pseudo-NPU package-delta watts require
+  `turbostat_pkgwatt` or working raw `turbostat` PkgWatt support. On the
+  current kernel, raw `turbostat` reports that `linux-tools-6.14.0-1020-oem`
+  is missing, so CPU/NPU/total watts remain unavailable.
 - Full power-table comparison and TPS/W reproduction remain blocked until a
   real timed inference run and an approved telemetry backend are available.
 

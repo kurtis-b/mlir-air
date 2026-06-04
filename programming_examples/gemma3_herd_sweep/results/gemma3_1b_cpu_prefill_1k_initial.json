@@ -40,14 +40,14 @@
   "compile_time_included": false,
   "correctness": "PASS",
   "decode_tokens": 0,
-  "delta_pct": 61.05514699449818,
+  "delta_pct": 57.44387529591979,
   "dirty_worktree": true,
   "environment_comparable": true,
   "execution_wiring": null,
   "explanation": "local CPU/HF measurement uses this Strix host and Transformers runtime; it is a baseline cell, not validated NPU paper parity",
-  "git_commit": "0ad5250f81fa1183d08c411bfd0edad567ff7c22",
+  "git_commit": "c970f17d42af130bc816e5e2ba0fe8976f968f77",
   "host_fallbacks": [],
-  "local_value": 1.581161032023374,
+  "local_value": 1.7277786629856564,
   "metric": "prefill_ttft_seconds",
   "missing_environment_fields": [],
   "model_runner": null,
@@ -57,16 +57,18 @@
     "prefill_ttft measures one full prompt forward pass",
     "CPU/HF baseline uses local Transformers execution; it is not an NPU paper-parity claim",
     "nearest_paper_value=4.06",
-    "permission denied reading /sys/class/powercap/intel-rapl:0/energy_uj",
-    "permission denied reading /sys/class/powercap/intel-rapl:0:0/energy_uj",
-    "no readable RAPL energy counters"
+    "raw turbostat is available, but PkgWatt sampling may require matching linux-tools and privileges",
+    "xrt-smi is available, but direct NPU rail parsing reports N/A on this host",
+    "quiescent package power sample unavailable: turbostat PkgWatt failed: WARNING: turbostat not found for kernel 6.14.0-1020\n\n  You may need to install the following packages for this specific kernel:\n    linux-tools-6.14.0-1020-oem\n    linux-cloud-tools-6.14.0-1020-oem\n\n  You may also want to install one of the following packages to keep up to date:\n    linux-tools-oem\n    linux-cloud-tools-oem",
+    "turbostat PkgWatt failed: WARNING: turbostat not found for kernel 6.14.0-1020\n\n  You may need to install the following packages for this specific kernel:\n    linux-tools-6.14.0-1020-oem\n    linux-cloud-tools-6.14.0-1020-oem\n\n  You may also want to install one of the following packages to keep up to date:\n    linux-tools-oem\n    linux-cloud-tools-oem",
+    "no timed-window package-watt samples were captured"
   ],
   "npu_power_mode": "Power Mode             : Default",
   "paper_source": "arxiv_pdf_v2",
   "paper_table": "prefill/decode text tables",
   "paper_value": 4.06,
   "power_aligned_with_timed_window": false,
-  "power_sampling_backend": "rapl-unavailable",
+  "power_sampling_backend": "turbostat+rocm-smi",
   "power_status": {
     "cpu": "MISSING_POWER_FIELD",
     "gpu": "MISSING_POWER_FIELD",
@@ -82,14 +84,14 @@
   "real_benchmark": {
     "backend": "cpu-hf",
     "decode_tokens": 0,
-    "load_seconds": 1.771319017978385,
-    "local_value": 1.581161032023374,
+    "load_seconds": 1.8956640040269122,
+    "local_value": 1.7277786629856564,
     "logits_shape": [
       1,
       1024,
       262144
     ],
-    "mean_seconds": 1.581161032023374,
+    "mean_seconds": 1.7277786629856564,
     "metric": "prefill_ttft_seconds",
     "model_variant": "gemma3-1b",
     "notes": [
@@ -105,12 +107,14 @@
         "total": "MISSING_POWER_FIELD"
       },
       "notes": [
-        "permission denied reading /sys/class/powercap/intel-rapl:0/energy_uj",
-        "permission denied reading /sys/class/powercap/intel-rapl:0:0/energy_uj",
-        "no readable RAPL energy counters"
+        "raw turbostat is available, but PkgWatt sampling may require matching linux-tools and privileges",
+        "xrt-smi is available, but direct NPU rail parsing reports N/A on this host",
+        "quiescent package power sample unavailable: turbostat PkgWatt failed: WARNING: turbostat not found for kernel 6.14.0-1020\n\n  You may need to install the following packages for this specific kernel:\n    linux-tools-6.14.0-1020-oem\n    linux-cloud-tools-6.14.0-1020-oem\n\n  You may also want to install one of the following packages to keep up to date:\n    linux-tools-oem\n    linux-cloud-tools-oem",
+        "turbostat PkgWatt failed: WARNING: turbostat not found for kernel 6.14.0-1020\n\n  You may need to install the following packages for this specific kernel:\n    linux-tools-6.14.0-1020-oem\n    linux-cloud-tools-6.14.0-1020-oem\n\n  You may also want to install one of the following packages to keep up to date:\n    linux-tools-oem\n    linux-cloud-tools-oem",
+        "no timed-window package-watt samples were captured"
       ],
       "run_id": "prefill_ttft_seconds_gemma3_1b_cpu_1024",
-      "sampling_backend": "rapl-unavailable",
+      "sampling_backend": "turbostat+rocm-smi",
       "schema_version": 1,
       "watts": {
         "cpu": null,
