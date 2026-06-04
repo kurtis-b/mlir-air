@@ -1,0 +1,83 @@
+{
+  "activation_shape": [
+    5,
+    256
+  ],
+  "blockers": [],
+  "bo_binding_mode": "runner-owned-persistent-bo",
+  "command": [
+    "programming_examples/gemma3_herd_sweep/gemma3_qkv_substep_probe.py",
+    "--run-hardware",
+    "--model-variant",
+    "gemma3-1b",
+    "--weights-dir",
+    "/home/cj/models/gemma-3-1b-pt",
+    "--result-json",
+    "programming_examples/gemma3_herd_sweep/results/gemma3_1b_decode_rmsnorm_qkv_substep_probe.json"
+  ],
+  "dense_k_projection_correlation": 0.9959587142737489,
+  "dense_q_projection_correlation": 0.9946089748511104,
+  "dense_v_projection_correlation": 0.9957198491631029,
+  "dirty_worktree": false,
+  "elapsed_seconds": 17.772367939993273,
+  "git_commit": "9e5a626a0388c551598a30f5e24c3402bd35db31",
+  "input_distribution": "bounded-uniform-seed0",
+  "input_shape": [
+    1,
+    1152
+  ],
+  "k_projection_correlation": 1.0,
+  "k_projection_shape": [
+    256
+  ],
+  "layer_index": 0,
+  "model_variant": "gemma3-1b",
+  "norm_shape": [
+    1,
+    1152
+  ],
+  "norm_tensor_key": "model.layers.0.input_layernorm.weight",
+  "output_format": "elf",
+  "phase": "decode",
+  "projection_tensor_keys": {
+    "k_proj": "model.layers.0.self_attn.k_proj.weight",
+    "q_proj": "model.layers.0.self_attn.q_proj.weight",
+    "v_proj": "model.layers.0.self_attn.v_proj.weight"
+  },
+  "projection_weight_layout": "fused-dqp-paper-repacked-qkv-colblock-loop",
+  "q_projection_correlation": 1.0,
+  "q_projection_shape": [
+    1024
+  ],
+  "remaining_model_runner_gaps": [
+    "full-layer-not-wired"
+  ],
+  "returncode": 0,
+  "rms_correlation": 0.999990967713172,
+  "schema_version": 1,
+  "sequence_kind": "decode-rmsnorm-qkv",
+  "stages": [
+    "decode:L0:pre_attention_norm",
+    "decode:L0:q_projection",
+    "decode:L0:k_projection",
+    "decode:L0:v_projection"
+  ],
+  "static_norm_bo_bytes": 266240,
+  "static_norm_tensor_offset_bytes": 0,
+  "status": "QKV_SUBSTEP_SEQUENCE_PASS",
+  "stderr_tail": [],
+  "stdout_tail": [
+    "RMSNorm correlation: 0.999991",
+    "q_proj correlation: 1.000000",
+    "dense q_proj correlation: 0.994609",
+    "k_proj correlation: 1.000000",
+    "dense k_proj correlation: 0.995959",
+    "v_proj correlation: 1.000000",
+    "dense v_proj correlation: 0.995720"
+  ],
+  "threshold": 0.99,
+  "v_projection_correlation": 1.0,
+  "v_projection_shape": [
+    256
+  ]
+}
