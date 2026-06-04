@@ -106,13 +106,15 @@ the generated paper-target comparison summary.
   staged references, dense original-weight correlations
   0.994609/0.995959/0.995720/0.997551/0.996684/0.996802/0.997577, attention and
   GeGLU host-stage correlations at 1.000000, and final layer-output correlation
-  1.000000. The refreshed JSON records 57 segmented NPU `run.start()/wait2()`
-  launch windows totaling 0.158887 s for one staged layer in reused-ELF mode,
-  or 6.293770 staged layer passes/s. Its 26-layer kernel-only extrapolation is
-  0.242068 decode TPS, far below the paper's 41.1 TPS 1B/1k NPU decode target
-  and not a measured full-model decode TPS. Direct RAPL under `sg power` reports
-  21.939 W segmented package power and a 9.005 W pseudo-NPU package-delta from a
-  12.933 W quiescent package sample. The JSON records `full-1b-loop-not-wired`
+  1.000000. The refreshed JSON also launches Gemma half-split RoPE for Q/K at
+  identity position 0 and validates RoPE correlations at 1.000000/1.000000. It
+  records 59 segmented NPU `run.start()/wait2()` launch windows totaling
+  0.141385 s for one staged layer in reused-ELF mode, or 7.072881 staged layer
+  passes/s. Its 26-layer kernel-only extrapolation is 0.272034 decode TPS, far
+  below the paper's 41.1 TPS 1B/1k NPU decode target and not a measured
+  full-model decode TPS. Direct RAPL under `sg power` reports 25.393 W segmented
+  package power and a 6.258 W pseudo-NPU package-delta from a 19.135 W
+  quiescent package sample. The JSON records `full-1b-loop-not-wired`
   as the remaining model runner gap.
 
 - `gemma3_1b_decode_full_layer_L1_probe.json`: compact Strix/XRT evidence that

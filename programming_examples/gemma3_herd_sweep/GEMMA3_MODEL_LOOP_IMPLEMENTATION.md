@@ -118,9 +118,10 @@ Implemented files:
   references.
 - `gemma3_full_layer_probe.py`: diagnostic Gemma3 1B staged decode layer
   probe with a selectable `--layer-index`. It launches RMSNorm plus all seven
-  projection families on the NPU through FusedDQP column-block loops while
-  keeping QK-Norm, RoPE, single-token attention, residuals, and GeGLU/post-norm
-  vector stages as explicit host fallbacks. RMSNorm uses a preselected BF16
+  projection families on the NPU through FusedDQP column-block loops; layer 0
+  also launches RoPE through the Gemma half-split wrapper. QK-Norm,
+  single-token attention, residuals, and GeGLU/post-norm vector stages remain
+  explicit host-reference stages in this diagnostic. RMSNorm uses a preselected BF16
   norm-vector argument until the two-argument RMSNorm ABI grows static-BO
   offset/sub-BO plumbing.
 - `gemma3_decode_loop_probe.py`: diagnostic Gemma3 1B staged decode loop probe.
@@ -338,9 +339,9 @@ The next implementation loops should stay on 1B 1k NPU text before expanding to
 | ---: | --- | --- |
 | 1 | Complete: resolve `model-kernel-argument-binding-not-validated` | `gemma3_argument_binding.py --self-test` validates 56 fixture NPU candidate layouts with 172 positional args and no missing storage; the real 1B 1k/32k-context plan validates 728 NPU candidate layouts with 2,236 positional args and zero argument-binding blockers. |
 | 2 | Partially complete: resolve `model-kernel-launch-not-wired` | The first promoted Gemma3 1B pre-attention RMSNorm shape (`1024x1152`, ELF) launches on the NPU with correlation 0.999983 using the validated first-stage positional layout (`layer_input`, `static_norm_weights`, `prefill_L0_pre_attention_norm`), a full contiguous static norm payload whose layer-0 vector is at byte offset 0, and runner-owned pyxrt BO allocation/binding. The decode RMSNorm-to-`q_proj` substep passes with RMSNorm correlation 0.999991, q-projection correlation 1.000000, and dense original-weight correlation 0.994609. The decode RMSNorm-to-Q/K/V substep passes with Q/K/V projection correlations all 1.000000 and dense original-weight correlations 0.994609/0.995959/0.995720. The staged decode layer-0 and layer-1 probes now launch RMSNorm plus q/k/v/o/gate/up/down projection families on the NPU and validate final layer-output correlation 1.000000 against quantized staged references. Layer 1 exposed and fixed the missing static-norm offset/sub-BO path by using a preselected BF16 norm-vector argument (`model.layers.1.input_layernorm.weight` at byte offset 10240 in the contiguous norm BO, passed as a 2304-byte argument). The staged 26-layer decode-loop diagnostic now measures one post-warmup token across all 26 real layers, preloads packed projection inputs into 1,456 runner-owned BO sets before timing, and uses no-allocation static metadata placeholders in the timed projection path, but it remains diagnostic because 1k KV-cache attention, logits/sampling, host fallback promotion, and the production contiguous static-weight BO route are not complete. For 1B, committed evidence now narrows the real-artifact blocker to `full-1b-loop-not-wired`; the remaining launch work is paper-shaped prefill/decode loop integration and timed paper-cell measurement, not first-kernel, single-layer, or diagnostic repeated-layer correctness. |
-| 3 | Reduce `nonlinear-model-stage-promotion-incomplete` | Standalone NPU evidence now covers RMSNorm, QK-Norm, RoPE, GeGLU, and residual add; the remaining work is composed model-stage launch validation, logits/sampling treatment, and timed paper-cell execution. |
+| 3 | Reduce `nonlinear-model-stage-promotion-incomplete` | Standalone NPU evidence now covers RMSNorm, QK-Norm, RoPE, GeGLU, and residual add; RoPE also has layer-0 staged model-launch evidence. The remaining work is composed model-stage launch validation for the rest of the nonlinear/vector stages, logits/sampling treatment, and timed paper-cell execution. |
 | 4 | Re-run 1B 1k NPU paper cells | Prefill and decode result JSONs contain real local NPU TTFT/TPS or a narrower, artifact-backed failure classification. |
-| 5 | Partially complete: capture pseudo-NPU power | Direct RAPL is readable when the run is launched under `sg power`. The refreshed layer-0 staged full-layer diagnostic records segmented package-energy deltas over only NPU `run.start()/wait2()` windows: 0.158887 s across 57 kernel launches, 21.939 W segmented package power, and 9.005 W pseudo-NPU package-delta from a 12.933 W quiescent sample. The layer-1 diagnostic records 0.142578 s across the same 57 launch windows, 17.420 W segmented package power, and 5.918 W pseudo-NPU package-delta from an 11.502 W quiescent sample. The staged 26-layer decode-loop diagnostic records a post-warmup full-loop RAPL window of 15.975 W package power and 9.482 W pseudo-NPU package-delta while measuring 0.173242 diagnostic loop-wall TPS. Official paper-cell pseudo-NPU power remains blocked until paper-shaped prefill/decode execution exists. |
+| 5 | Partially complete: capture pseudo-NPU power | Direct RAPL is readable when the run is launched under `sg power`. The refreshed layer-0 staged full-layer diagnostic records segmented package-energy deltas over only NPU `run.start()/wait2()` windows: 0.141385 s across 59 kernel launches after adding staged RoPE, 25.393 W segmented package power, and 6.258 W pseudo-NPU package-delta from a 19.135 W quiescent sample. The layer-1 diagnostic records 0.142578 s across the same 57 launch windows, 17.420 W segmented package power, and 5.918 W pseudo-NPU package-delta from an 11.502 W quiescent sample. The staged 26-layer decode-loop diagnostic records a post-warmup full-loop RAPL window of 15.975 W package power and 9.482 W pseudo-NPU package-delta while measuring 0.173242 diagnostic loop-wall TPS. Official paper-cell pseudo-NPU power remains blocked until paper-shaped prefill/decode execution exists. |
 | 6 | Expand cautiously | Only after 1B 1k NPU correctness, timing, and pseudo-power evidence is clean should the loop expand to more 1B lengths, 4B text, or vision. |
 
 ### Blocker-resolution decision tree
@@ -748,24 +749,27 @@ Blocked evidence:
   correlations of 0.994609/0.995959/0.995720. Full staged decode layer-0
   evidence is present in `gemma3_1b_decode_full_layer_probe.json`: RMSNorm plus
   q/k/v/o/gate/up/down projection families launch on the NPU through split
-  FusedDQP column-block loops, all projection correlations are 1.000000 against
-  the quantized staged references, dense original-weight correlations are
+  FusedDQP column-block loops, RoPE launches through the Gemma half-split wrapper
+  for Q and K at identity position 0, all projection correlations are 1.000000
+  against the quantized staged references, RoPE Q/K correlations are
+  1.000000/1.000000, dense original-weight projection correlations are
   0.994609/0.995959/0.995720/0.997551/0.996684/0.996802/0.997577, and the final
   layer-output correlation is 1.000000. Layer-1 evidence is present in
   `gemma3_1b_decode_full_layer_L1_probe.json`; it uses the selected-vector
   norm argument for `model.layers.1.input_layernorm.weight` at contiguous norm
   BO offset 10240 and validates RMSNorm correlation 0.999991, all seven
   projection correlations at 1.000000, and final layer-output correlation
-  1.000000. QK-Norm, RoPE, single-token attention, residual additions, GeGLU,
+  1.000000. QK-Norm, single-token attention, residual additions, GeGLU,
   and post-norm vector stages remain explicit host-reference steps in the
   staged diagnostics, even though the model-runner manifest now has standalone
   NPU candidates for the nonlinear vector stages. The refreshed layer-0 diagnostic also records segmented NPU
-  kernel timing and RAPL: 57 `run.start()/wait2()` launch windows total
-  0.158887 s for one staged layer in reused-ELF mode, corresponding to
-  6.293770 staged layer passes/s and a clearly non-paper-comparable 26-layer
-  kernel-only extrapolation of 0.242068 decode TPS versus the paper's 41.1 TPS
-  1B/1k NPU target. The segmented package average is 21.939 W; the pseudo-NPU
-  delta is 9.005 W over a 12.933 W quiescent package sample. The layer-1
+  kernel timing and RAPL after adding staged RoPE: 59 `run.start()/wait2()`
+  launch windows total 0.141385 s for one staged layer in reused-ELF mode,
+  corresponding to 7.072881 staged layer passes/s and a clearly
+  non-paper-comparable 26-layer kernel-only extrapolation of 0.272034 decode
+  TPS versus the paper's 41.1 TPS 1B/1k NPU target. The segmented package
+  average is 25.393 W; the pseudo-NPU delta is 6.258 W over a 19.135 W
+  quiescent package sample. The layer-1
   diagnostic records 0.142578 s, 7.013715 staged layer passes/s, a 0.269758
   kernel-only extrapolated decode TPS, 17.420 W segmented package power, and a
   5.918 W pseudo-NPU package-delta over an 11.502 W quiescent sample. A new
@@ -1101,12 +1105,12 @@ Implemented evidence and blocker:
   diagnostic compile/load/run work, which is intentionally not a TTFT/TPS timing
   window. It also records a segmented kernel-only timing window that excludes
   compile, ELF load, BO allocation, BO writes/preload, argument binding, output
-  sync/readback, and host fallback compute: 57 NPU launches total 0.158887 s,
-  or 6.293770 staged layer passes/s. A 26-layer kernel-only extrapolation is
-  0.242068 decode TPS, about 169.8x below the paper's 41.1 TPS 1B/1k NPU decode
+  sync/readback, and host fallback compute: 59 NPU launches total 0.141385 s,
+  or 7.072881 staged layer passes/s. A 26-layer kernel-only extrapolation is
+  0.272034 decode TPS, about 151.1x below the paper's 41.1 TPS 1B/1k NPU decode
   target; this is an extrapolation, not a measured full-model TPS. Direct RAPL
-  under `sg power` reports 21.939 W segmented package power, 12.933 W quiescent
-  package power, and a 9.005 W pseudo-NPU package-delta. Layer 1 records
+  under `sg power` reports 25.393 W segmented package power, 19.135 W quiescent
+  package power, and a 6.258 W pseudo-NPU package-delta. Layer 1 records
   0.142578 s across 57 launches, or 7.013715 staged layer passes/s, with a
   0.269758 kernel-only extrapolated decode TPS and a 5.918 W pseudo-NPU
   package-delta. `gemma3_npu_wiring.py` and
@@ -1317,7 +1321,7 @@ The paper groups Gemma3 work into three implementation classes:
 | FlowQKV | `run-flowqkv`, `run-flowqkv-paper` | `flowqkv.py`, `flow_attention_opt.cc` | Prefill attention | Smoke and paper targets pass with supported modes. |
 | FlowKV | `run-flowkv`, `run-flowkv-paper` | `flowkv.py`, `flow_attention_opt.cc` | Decode attention | Direct small routes and 8x4 gather route pass; small gather remains diagnostic-only. |
 | Residual add | `run_residual_add_compile_only.lit` | `residual_add.py` | Attention and MLP residual paths | ELF compile-only and n=1152/tile_n=288 hardware smoke pass; model-stage launch integration still pending. |
-| RoPE | `run_rope_halfsplit_compile_only.lit` | `rope_halfsplit.py`, `../llama32_1b/kernel_builder/rope_halfsplit.cc` | Q/K rotary embedding | ELF compile-only and rows=4/head_dim=256 hardware smoke pass; model-stage launch integration still pending. |
+| RoPE | `run_rope_halfsplit_compile_only.lit` | `rope_halfsplit.py`, `../llama32_1b/kernel_builder/rope_halfsplit.cc` | Q/K rotary embedding | ELF compile-only and rows=4/head_dim=256 hardware smoke pass; layer-0 staged full-layer launch passes for Q/K identity-position RoPE. |
 
 Current public output modes are:
 

@@ -5,8 +5,9 @@
 """Gemma3 real-weight staged decode full-layer probe.
 
 This diagnostic wires one Gemma3 1B decode layer pass with real weights. The
-projection stages launch on the NPU through the FusedDQP column-block route; the
-remaining nonlinear/vector stages are explicit host fallbacks. This is full-layer
+projection stages launch on the NPU through the FusedDQP column-block route;
+RoPE launches through the Gemma half-split wrapper; the remaining
+nonlinear/vector stages are explicit host fallbacks. This is full-layer
 staged correctness evidence, not a full model loop, TTFT/TPS timing, pseudo-NPU
 power, or a paper-parity result.
 """
@@ -129,6 +130,8 @@ class Gemma3FullLayerProbeResult:
     rms_correlation: float | None
     projection_evidence: tuple[ProjectionEvidence, ...]
     attention_correlation: float | None
+    rope_q_correlation: float | None
+    rope_k_correlation: float | None
     mlp_activation_correlation: float | None
     final_output_correlation: float | None
     dense_final_output_correlation: float | None
@@ -187,6 +190,8 @@ class Gemma3FullLayerProbeResult:
             f"projection_correlations={projection_corrs} "
             f"dense_projection_correlations={dense_corrs} "
             f"attention_correlation={self._corr_text(self.attention_correlation)} "
+            f"rope_correlations=q:{self._corr_text(self.rope_q_correlation)}|"
+            f"k:{self._corr_text(self.rope_k_correlation)} "
             f"mlp_activation_correlation={self._corr_text(self.mlp_activation_correlation)} "
             f"final_output_correlation={self._corr_text(self.final_output_correlation)} "
             f"dense_final_output_correlation={self._corr_text(self.dense_final_output_correlation)} "
@@ -797,6 +802,66 @@ def _geglu(gate, up):
     return (_gelu_tanh(gate).astype("float32") * up.astype("float32")).astype(bfloat16)
 
 
+def _rope_module_helpers():
+    dataflow_dir = _repo_root() / "programming_examples/gemma3_dataflow_kernels"
+    if str(dataflow_dir) not in sys.path:
+        sys.path.insert(0, str(dataflow_dir))
+    from rope_halfsplit import build_module, compile_rope_kernel, rope_halfsplit_reference
+
+    return build_module, compile_rope_kernel, rope_halfsplit_reference
+
+
+def _identity_rope_lut(rows: int, head_dim: int, dtype):
+    import numpy as np
+
+    half = head_dim // 2
+    row = np.concatenate(
+        [
+            np.ones(half, dtype=np.float32),
+            np.zeros(half, dtype=np.float32),
+        ]
+    )
+    return np.tile(row, (rows, 1)).astype(dtype)
+
+
+def _run_rope_stage(
+    *,
+    name: str,
+    x,
+    object_file: Path,
+    runner_cache: _ReusableElfRunnerCache,
+    timed_kernel_seconds: list[float] | None = None,
+    power_meter=None,
+):
+    from ml_dtypes import bfloat16
+
+    build_module, compile_rope_kernel, rope_halfsplit_reference = _rope_module_helpers()
+    rows, head_dim = (int(dim) for dim in x.shape)
+    if not object_file.exists():
+        compile_rope_kernel(object_file)
+    herd_x = 4 if rows % 4 == 0 else 1
+    lut = _identity_rope_lut(rows, head_dim, bfloat16)
+    module = build_module(rows, head_dim, bfloat16, herd_x, str(object_file))
+    actual = runner_cache.run(
+        key=("rope_halfsplit", name, rows, head_dim, herd_x),
+        mlir_module=module,
+        backend_options=dict(
+            verbose=False,
+            omit_while_true_loop=False,
+            output_format=DEFAULT_OUTPUT_FORMAT,
+            instance_name="gemma3_rope_halfsplit",
+            runtime_loop_tiling_sizes=[4, 4],
+        ),
+        inputs=[x.astype(bfloat16), lut.reshape(-1)],
+        output_shape=tuple(x.shape),
+        output_dtype=bfloat16,
+        timed_kernel_seconds=timed_kernel_seconds,
+        power_meter=power_meter,
+    )
+    expected = rope_halfsplit_reference(x, lut)
+    return actual.astype(bfloat16), expected.astype(bfloat16)
+
+
 def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResult:
     _activate_probe_env()
     import numpy as np
@@ -853,6 +918,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         object_file = Path(__file__).with_name("build_peano") / "fused_dqp.o"
         if not object_file.exists():
             raise RuntimeError(f"missing FusedDQP object file: {object_file}")
+        rope_object_file = Path(__file__).with_name("build_peano") / "rope_halfsplit.o"
 
         rng = np.random.default_rng(0)
         x_input = rng.uniform(-0.5, 0.5, size=(1, 1152)).astype(bfloat16)
@@ -921,12 +987,36 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         k_expected = expected["k_proj"].reshape(1, 256)
         v_expected = expected["v_proj"].reshape(1, 256)
 
-        # current_pos=0 makes half-split RoPE an identity; keep the host stage explicit.
+        # current_pos=0 makes half-split RoPE an identity, but launch the
+        # validated Gemma RoPE wrapper here to prove model-stage integration.
         qn_actual = _rms_host(q_actual, norm_weights["q_norm"])
         kn_actual = _rms_host(k_actual, norm_weights["k_norm"])
         qn_expected = _rms_host(q_expected, norm_weights["q_norm"])
         kn_expected = _rms_host(k_expected, norm_weights["k_norm"])
-        _ = qn_actual, kn_actual, qn_expected, kn_expected
+        q_rope_actual, q_rope_expected = _run_rope_stage(
+            name="q",
+            x=qn_actual,
+            object_file=rope_object_file,
+            runner_cache=runner_cache,
+            timed_kernel_seconds=timed_kernel_samples,
+            power_meter=power_meter,
+        )
+        k_rope_actual, k_rope_expected = _run_rope_stage(
+            name="k",
+            x=kn_actual,
+            object_file=rope_object_file,
+            runner_cache=runner_cache,
+            timed_kernel_seconds=timed_kernel_samples,
+            power_meter=power_meter,
+        )
+        rope_q_correlation = _correlation(q_rope_actual, q_rope_expected)
+        rope_k_correlation = _correlation(k_rope_actual, k_rope_expected)
+        stdout_lines.append(f"rope q correlation: {rope_q_correlation:.6f}")
+        stdout_lines.append(f"rope k correlation: {rope_k_correlation:.6f}")
+        if rope_q_correlation < DEFAULT_THRESHOLD:
+            blockers.append("decode-rope-q-correlation-low")
+        if rope_k_correlation < DEFAULT_THRESHOLD:
+            blockers.append("decode-rope-k-correlation-low")
         attention_actual = np.tile(v_actual.reshape(1, 256), (4, 1)).reshape(1024).astype(bfloat16)
         attention_expected = np.tile(v_expected.reshape(1, 256), (4, 1)).reshape(1024).astype(bfloat16)
         attention_correlation = _correlation(attention_actual, attention_expected)
@@ -1014,6 +1104,8 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         blockers.append(f"decode-full-layer-probe-failed:{exc}")
         rms_correlation = None
         attention_correlation = None
+        rope_q_correlation = None
+        rope_k_correlation = None
         mlp_activation_correlation = None
         final_output_correlation = None
         dense_final_output_correlation = None
@@ -1045,7 +1137,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
             f"decode:L{layer_index}:pre_attention_norm",
             f"decode:L{layer_index}:qkv_projection",
             f"decode:L{layer_index}:qk_norm",
-            f"decode:L{layer_index}:rope_identity_pos0",
+            f"decode:L{layer_index}:rope_halfsplit_npu_identity_pos0",
             f"decode:L{layer_index}:single_token_attention_host",
             f"decode:L{layer_index}:output_projection",
             f"decode:L{layer_index}:post_attention_norm",
@@ -1070,11 +1162,13 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         norm_tensor_keys=norm_tensor_keys,
         projection_tensor_keys=projection_keys,
         projection_weight_layout="fused-dqp-paper-repacked-full-layer-colblock-loop",
-        host_fallbacks=("qk_norm", "rope", "single_token_attention", "post_attention_norm", "residual_add", "pre_feedforward_norm", "mlp_activation", "post_feedforward_norm"),
+        host_fallbacks=("qk_norm", "single_token_attention", "post_attention_norm", "residual_add", "pre_feedforward_norm", "mlp_activation", "post_feedforward_norm"),
         input_distribution=DEFAULT_INPUT_DISTRIBUTION,
         rms_correlation=rms_correlation,
         projection_evidence=tuple(projection_evidence),
         attention_correlation=attention_correlation,
+        rope_q_correlation=rope_q_correlation,
+        rope_k_correlation=rope_k_correlation,
         mlp_activation_correlation=mlp_activation_correlation,
         final_output_correlation=final_output_correlation,
         dense_final_output_correlation=dense_final_output_correlation,
@@ -1140,11 +1234,13 @@ def _self_test() -> None:
         norm_tensor_keys=NORM_TENSOR_KEYS,
         projection_tensor_keys={family: f"model.layers.0.fixture.{family}.weight" for family in FULL_LAYER_PROJECTION_FAMILIES},
         projection_weight_layout="fused-dqp-paper-repacked-full-layer-colblock-loop",
-        host_fallbacks=("qk_norm", "rope", "single_token_attention", "mlp_activation"),
+        host_fallbacks=("qk_norm", "single_token_attention", "mlp_activation"),
         input_distribution=DEFAULT_INPUT_DISTRIBUTION,
         rms_correlation=0.999991,
         projection_evidence=projection_evidence,
         attention_correlation=1.0,
+        rope_q_correlation=1.0,
+        rope_k_correlation=1.0,
         mlp_activation_correlation=1.0,
         final_output_correlation=0.999998,
         dense_final_output_correlation=None,

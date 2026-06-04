@@ -3,26 +3,27 @@
   "blockers": [],
   "bo_binding_mode": "runner-owned-persistent-bo",
   "command": [
-    "programming_examples/gemma3_herd_sweep/gemma3_full_layer_probe.py",
+    "/home/cj/mlir-air/programming_examples/gemma3_herd_sweep/gemma3_full_layer_probe.py",
     "--run-hardware",
-    "--power-sample",
     "--model-variant",
     "gemma3-1b",
     "--weights-dir",
     "/home/cj/models/gemma-3-1b-pt",
+    "--layer-index",
+    "0",
     "--result-json",
-    "/tmp/gemma3_1b_decode_full_layer_probe.json"
+    "/tmp/gemma3_1b_decode_full_layer_rope_probe.json",
+    "--power-sample"
   ],
   "dense_final_output_correlation": null,
-  "diagnostic_layer_passes_per_second": 6.293770075280544,
-  "dirty_worktree": false,
-  "elapsed_seconds": 7.217789134010673,
-  "estimated_26_layer_decode_tps_kernel_only": 0.24206807981848247,
+  "diagnostic_layer_passes_per_second": 7.072880991247826,
+  "dirty_worktree": true,
+  "elapsed_seconds": 8.26616641698638,
+  "estimated_26_layer_decode_tps_kernel_only": 0.2720338842787625,
   "final_output_correlation": 0.9999999999999998,
-  "git_commit": "ddc700a250d2cbeac6945ab6acc8c8c43186c0f5",
+  "git_commit": "74c98e735e8ca4f0df44dfff73ab315d3e3644a5",
   "host_fallbacks": [
     "qk_norm",
-    "rope",
     "single_token_attention",
     "post_attention_norm",
     "residual_add",
@@ -61,20 +62,20 @@
       "total": "RAPL_SYSFS_PACKAGE_SEGMENTED"
     },
     "notes": [
-      "quiescent_pkg_watts=12.933440",
+      "quiescent_pkg_watts=19.135060",
       "package watts use direct RAPL sysfs energy_uj deltas summed over NPU run.start/wait2 segments",
       "NPU rail is pseudo power: segmented package watts minus quiescent package watts before the run"
     ],
     "run_id": "gemma3_1b_decode_full_layer_probe",
     "sampling_backend": "rapl-sysfs+segmented",
     "schema_version": 1,
-    "segmented_elapsed_seconds": 0.15888727869605646,
-    "segmented_energy_delta_uj": 3485751,
+    "segmented_elapsed_seconds": 0.1413851019460708,
+    "segmented_energy_delta_uj": 3590223,
     "watts": {
       "cpu": null,
       "gpu": null,
-      "npu": 9.005075333679232,
-      "total": 21.93851533367923
+      "npu": 6.25816001104074,
+      "total": 25.39322001104074
     }
   },
   "projection_evidence": [
@@ -206,6 +207,8 @@
   ],
   "returncode": 0,
   "rms_correlation": 0.999990967713172,
+  "rope_k_correlation": 1.0,
+  "rope_q_correlation": 1.0,
   "runner_reuse_mode": "reused-elf-persistent-bo",
   "schema_version": 1,
   "sequence_kind": "decode-full-layer-staged",
@@ -213,7 +216,7 @@
     "decode:L0:pre_attention_norm",
     "decode:L0:qkv_projection",
     "decode:L0:qk_norm",
-    "decode:L0:rope_identity_pos0",
+    "decode:L0:rope_halfsplit_npu_identity_pos0",
     "decode:L0:single_token_attention_host",
     "decode:L0:output_projection",
     "decode:L0:post_attention_norm",
@@ -236,6 +239,8 @@
     "q_proj correlation: 1.000000",
     "k_proj correlation: 1.000000",
     "v_proj correlation: 1.000000",
+    "rope q correlation: 1.000000",
+    "rope k correlation: 1.000000",
     "o_proj correlation: 1.000000",
     "gate_proj correlation: 1.000000",
     "up_proj correlation: 1.000000",
@@ -243,9 +248,9 @@
     "final output correlation: 1.000000"
   ],
   "threshold": 0.99,
-  "timed_kernel_count": 57,
-  "timed_kernel_mean_seconds": 0.0027874961174746745,
-  "timed_kernel_seconds": 0.15888727869605646,
+  "timed_kernel_count": 59,
+  "timed_kernel_mean_seconds": 0.0023963576601028947,
+  "timed_kernel_seconds": 0.1413851019460708,
   "timing_notes": [
     "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls for this staged layer",
     "compile, ELF load, BO allocation, BO writes/preload, argument binding, output sync/readback, and host fallback compute are excluded",
