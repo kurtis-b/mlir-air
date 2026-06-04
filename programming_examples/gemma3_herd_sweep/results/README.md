@@ -18,8 +18,8 @@ creation/preload, xclbin/ELF load, and kernel argument setup.
 | `gemma3_1b_cpu_decode_1k_initial.json` | CPU/HF | Decode TPS | 12.400321286 | 41.9 | `EXPLAINED_DEVIATION` | 45.727 W RAPL package/total |
 | `gemma3_1b_igpu_prefill_1k_initial.json` | iGPU/HF ROCm | Prefill TTFT | 0.527177805 s | 0.51 s | `PAPER_MATCH` | 37.273 W ROCm SMI GPU rail |
 | `gemma3_1b_igpu_decode_1k_initial.json` | iGPU/HF ROCm | Decode TPS | 13.738045814 | 38.0 | `EXPLAINED_DEVIATION` | 42.871 W ROCm SMI GPU rail |
-| `gemma3_1b_npu_prefill_1k_blocked_initial.json` | NPU | Prefill TTFT | blocked | 0.95 s | `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` | pseudo-NPU RAPL delta pending |
-| `gemma3_1b_npu_decode_1k_blocked_initial.json` | NPU | Decode TPS | blocked | 41.1 | `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` | pseudo-NPU RAPL delta pending |
+| `gemma3_1b_npu_prefill_1k_blocked_initial.json` | NPU | Prefill TTFT | blocked | 0.95 s | `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` | staged diagnostic payload attached |
+| `gemma3_1b_npu_decode_1k_blocked_initial.json` | NPU | Decode TPS | blocked | 41.1 | `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` | staged diagnostic payload attached |
 
 The iGPU cells set `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` and use ROCm SMI
 for timed-window GPU rail sampling. CPU cells use direct RAPL sysfs package
@@ -29,8 +29,9 @@ loop wiring, nonlinear model-stage promotion, and fresh paper-shape hardware
 reruns. Kernel argument-layout validation is complete for the real 1B 1k/32k
 context model-runner plan: 572 NPU candidate layouts, 1,924 positional
 arguments, and zero binding blockers. Staged decode layer-0 correctness and
-segmented kernel-only timing evidence is now present, but it is not a timed
-paper-cell run.
+segmented kernel-only timing evidence is now present and attached under
+`npu_staged_diagnostic` in the blocked NPU paper-cell JSONs, but official NPU
+`local_value` remains null because this is not a timed paper-cell run.
 
 `gemma3_1b_initial_1k_results.json` bundles these six cells, and
 `gemma3_1b_initial_1k_summary.md` / `gemma3_1b_initial_1k_summary.csv` contain

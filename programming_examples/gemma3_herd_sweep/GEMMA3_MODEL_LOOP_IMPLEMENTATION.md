@@ -767,8 +767,8 @@ Blocked evidence:
   | CPU/HF | Decode 1k | 12.400321286 TPS | 41.9 TPS | 70.40% slower | `EXPLAINED_DEVIATION` | 45.727 W package/total by direct RAPL |
   | iGPU/HF ROCm | Prefill TTFT 1k | 0.527177805 s | 0.51 s | 3.37% slower | `PAPER_MATCH` | 37.273 W ROCm SMI GPU rail |
   | iGPU/HF ROCm | Decode 1k | 13.738045814 TPS | 38.0 TPS | 63.85% slower | `EXPLAINED_DEVIATION` | 42.871 W ROCm SMI GPU rail |
-  | NPU | Prefill TTFT 1k | blocked | 0.95 s | n/a | `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` | pseudo-NPU RAPL delta pending real timed NPU run |
-  | NPU | Decode 1k | blocked | 41.1 TPS | n/a | `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` | pseudo-NPU RAPL delta pending real timed NPU run |
+  | NPU | Prefill TTFT 1k | blocked | 0.95 s | n/a | `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` | official pseudo-NPU paper-cell power pending; staged diagnostic payload attached |
+  | NPU | Decode 1k | blocked | 41.1 TPS | n/a | `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` | official pseudo-NPU paper-cell power pending; staged diagnostic payload attached |
 
   iGPU runs set `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`; without that
   setting, local prefill was materially slower and did not match the iGPU 1k
@@ -777,7 +777,9 @@ Blocked evidence:
   result records remain blocked JSON cells with
   `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` because full model-runner kernel
   launch, nonlinear model-stage promotion, and fresh paper-shape hardware reruns
-  remain incomplete.
+  remain incomplete. They now include `npu_staged_diagnostic` payloads pointing
+  at the staged layer-0 kernel-only timing and segmented RAPL evidence, but
+  `local_value` remains null for official paper comparison.
   `gemma3_npu_preflight.py` records
   real projection padding and Q4NX block counts needed for NPU wiring.
   `gemma3_npu_wiring.py` maps each real-shape text layer into prefill/decode
@@ -1067,8 +1069,9 @@ Implemented evidence and blocker:
 - `gemma3_paper_compare.py --compare` accepts either a single result cell or a
   wrapper with `results`, and can emit Markdown and CSV summaries. The initial
   1B 1k CPU/iGPU measured cells plus NPU blocked cells are bundled in
-  `results/gemma3_1b_initial_1k_results.json`, with generated Markdown and CSV
-  summaries saved beside it.
+  `results/gemma3_1b_initial_1k_results.json`; the NPU blocked cells include
+  the staged diagnostic payload while keeping official local TTFT/TPS null. The
+  generated Markdown and CSV summaries are saved beside the bundle.
 - `run_model_loop_results.lit` covers blocked real-artifact result generation,
   paper comparison, Markdown/CSV summary emission, and JSON schema essentials.
 - The harness is implemented, but real `PAPER_MATCH` cells remain blocked until
