@@ -143,6 +143,9 @@ class Gemma3DecodeLoopProbeResult:
     reference_check_seconds: float | None
     attention_mode: str
     attention_cache_contract: str
+    attention_cache_build_seconds: float | None
+    attention_cache_layer_count: int | None
+    attention_cache_token_count: int | None
     attention_kv_tile: int | None
     attention_host_batch_tiles: int | None
     attention_host_batch_count: int | None
@@ -1357,6 +1360,71 @@ def _synthetic_prefill_kv_cache(
     return k_full, v_full
 
 
+def _real_hf_prefill_kv_cache(
+    *,
+    model_variant: str,
+    weights_dir: Path,
+    prompt_context_length: int,
+    layers: int,
+) -> tuple[dict[int, tuple[Any, Any]], float]:
+    import numpy as np
+    import torch
+    from gemma3_real_execution import _exact_text_inputs
+    from ml_dtypes import bfloat16
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    if model_variant != DEFAULT_MODEL:
+        raise RuntimeError("--attention-cache-mode=hf-prefill currently supports gemma3-1b only")
+    if prompt_context_length <= 0:
+        raise RuntimeError("--prompt-context-length must be positive")
+    cache_start = time.perf_counter()
+    tokenizer = AutoTokenizer.from_pretrained(weights_dir)
+    model = AutoModelForCausalLM.from_pretrained(weights_dir, dtype=torch.bfloat16).eval()
+    inputs = _exact_text_inputs(
+        tokenizer,
+        torch,
+        "Gemma3 paper reproduction prefill cache.",
+        prompt_context_length,
+    )
+    with torch.no_grad():
+        output = model(**inputs, use_cache=True)
+    past = output.past_key_values
+    extracted: dict[int, tuple[Any, Any]] = {}
+    for layer_index in range(layers):
+        if hasattr(past, "layers"):
+            layer_cache = past.layers[layer_index]
+            key_tensor = layer_cache.keys
+            value_tensor = layer_cache.values
+        else:
+            key_tensor, value_tensor = past[layer_index][:2]
+        key = key_tensor.detach().to("cpu")
+        value = value_tensor.detach().to("cpu")
+        if key.ndim != 4 or value.ndim != 4:
+            raise RuntimeError(
+                f"unexpected HF KV rank for layer {layer_index}: "
+                f"K={tuple(key.shape)} V={tuple(value.shape)}"
+            )
+        if key.shape[0] != 1 or value.shape[0] != 1:
+            raise RuntimeError(f"expected batch=1 HF KV cache for layer {layer_index}")
+        if key.shape[1] != 1 or value.shape[1] != 1:
+            raise RuntimeError(
+                f"decode-loop tiled attention currently expects one KV head; "
+                f"layer {layer_index} has K={tuple(key.shape)} V={tuple(value.shape)}"
+            )
+        if key.shape[2] <= 0 or value.shape[2] <= 0:
+            raise RuntimeError(f"empty HF KV cache for layer {layer_index}")
+        token_count = min(int(key.shape[2]), int(value.shape[2]), int(prompt_context_length))
+        k_np = key[0, 0, :token_count, :].float().numpy().astype(bfloat16)
+        v_np = value[0, 0, :token_count, :].float().numpy().astype(bfloat16)
+        if k_np.shape[1:] != (256,) or v_np.shape[1:] != (256,):
+            raise RuntimeError(
+                f"unexpected HF KV cache shape for layer {layer_index}: "
+                f"K={k_np.shape} V={v_np.shape}"
+            )
+        extracted[layer_index] = (np.asarray(k_np, dtype=bfloat16), np.asarray(v_np, dtype=bfloat16))
+    return extracted, time.perf_counter() - cache_start
+
+
 def _run_tiled_stats_attention_stage(
     *,
     layer_index: int,
@@ -1369,6 +1437,7 @@ def _run_tiled_stats_attention_stage(
     kv_tile: int,
     host_batch_tiles: int,
     attention_cache_mode: str,
+    prefill_kv_cache: dict[int, tuple[Any, Any]] | None,
     timed_kernel_seconds: list[float] | None = None,
     power_meter=None,
 ):
@@ -1384,9 +1453,6 @@ def _run_tiled_stats_attention_stage(
         raise RuntimeError("--prompt-context-length must be divisible by tiled attention kv tile")
     if host_batch_tiles <= 0:
         raise RuntimeError("--tiled-attention-host-batch-tiles must be positive")
-    tile_count = prompt_context_length // kv_tile
-    if tile_count % host_batch_tiles != 0:
-        raise RuntimeError("tiled attention tile count must be divisible by host batch tiles")
     if not object_file.exists():
         _compile_flowqkv_tiled_stats_kernel(object_file, q_chunk=4, kv_tile=kv_tile, head_dim=256)
     build_tiled_stats_module, merge_tiled_stats = _flowqkv_tiled_stats_helpers()
@@ -1400,8 +1466,33 @@ def _run_tiled_stats_attention_stage(
             layer_index=layer_index,
             prompt_context_length=prompt_context_length,
         )
+    elif attention_cache_mode == "hf-prefill":
+        if prefill_kv_cache is None or layer_index not in prefill_kv_cache:
+            raise RuntimeError(f"missing HF prefill KV cache for layer {layer_index}")
+        k_full, v_full = prefill_kv_cache[layer_index]
     else:
         raise RuntimeError(f"unsupported attention cache mode: {attention_cache_mode}")
+    if attention_cache_mode == "hf-prefill" and k_full.shape[0] < prompt_context_length:
+        k_full = np.concatenate([k_full, k.reshape(1, 256).astype(bfloat16)], axis=0)
+        v_full = np.concatenate([v_full, v.reshape(1, 256).astype(bfloat16)], axis=0)
+    if k_full.ndim != 2 or v_full.ndim != 2 or k_full.shape[1:] != (256,) or v_full.shape[1:] != (256,):
+        raise RuntimeError(
+            f"attention KV cache shape mismatch for layer {layer_index}: "
+            f"K={k_full.shape} V={v_full.shape}"
+        )
+    if k_full.shape[0] != v_full.shape[0]:
+        raise RuntimeError(
+            f"attention K/V token count mismatch for layer {layer_index}: "
+            f"K={k_full.shape} V={v_full.shape}"
+        )
+    if k_full.shape[0] % kv_tile != 0:
+        raise RuntimeError(
+            f"attention KV token count must be divisible by kv tile for layer {layer_index}: "
+            f"tokens={k_full.shape[0]} kv_tile={kv_tile}"
+        )
+    tile_count = k_full.shape[0] // kv_tile
+    if tile_count % host_batch_tiles != 0:
+        raise RuntimeError("tiled attention tile count must be divisible by host batch tiles")
     q_tiles = np.broadcast_to(q_single, (tile_count, 4, 256)).copy()
     k_tiles = k_full.reshape(tile_count, kv_tile, 256).copy()
     v_tiles = v_full.reshape(tile_count, kv_tile, 256).copy()
@@ -1461,6 +1552,7 @@ def _run_attention_stage(
     tiled_attention_kv_tile: int,
     tiled_attention_host_batch_tiles: int,
     attention_cache_mode: str,
+    prefill_kv_cache: dict[int, tuple[Any, Any]] | None,
     timed_kernel_seconds: list[float] | None = None,
     power_meter=None,
 ):
@@ -1486,6 +1578,7 @@ def _run_attention_stage(
             kv_tile=tiled_attention_kv_tile,
             host_batch_tiles=tiled_attention_host_batch_tiles,
             attention_cache_mode=attention_cache_mode,
+            prefill_kv_cache=prefill_kv_cache,
             timed_kernel_seconds=timed_kernel_seconds,
             power_meter=power_meter,
         )
@@ -2104,6 +2197,7 @@ def _run_one_layer(
     prompt_context_length: int,
     tiled_attention_kv_tile: int,
     tiled_attention_host_batch_tiles: int,
+    prefill_kv_cache: dict[int, tuple[Any, Any]] | None,
     check_references: bool = True,
 ) -> tuple[Any, LayerLoopEvidence, list[str]]:
     from ml_dtypes import bfloat16
@@ -2269,6 +2363,7 @@ def _run_one_layer(
             tiled_attention_kv_tile=tiled_attention_kv_tile,
             tiled_attention_host_batch_tiles=tiled_attention_host_batch_tiles,
             attention_cache_mode=attention_cache_mode,
+            prefill_kv_cache=prefill_kv_cache,
             timed_kernel_seconds=timed_kernel_seconds,
             power_meter=power_meter,
         )
@@ -2544,6 +2639,8 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
     static_post_feedforward_residual_bo_set_count = 0
     reference_check_layer_count = 0
     reference_check_seconds: float | None = None
+    prefill_kv_cache: dict[int, tuple[Any, Any]] | None = None
+    attention_cache_build_seconds: float | None = None
     returncode = 1
     try:
         if args.model_variant != DEFAULT_MODEL:
@@ -2568,6 +2665,13 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             raise RuntimeError("tiled-stats-1k attention mode currently requires --prompt-context-length=1024")
         weights_dir = _resolve_weights_dir(args.model_variant, args.weights_dir)
         norm_plans, projection_plans = _prepare_layer_plans(args.model_variant, weights_dir, args.layers)
+        if args.attention_mode == "tiled-stats-1k" and args.attention_cache_mode == "hf-prefill":
+            prefill_kv_cache, attention_cache_build_seconds = _real_hf_prefill_kv_cache(
+                model_variant=args.model_variant,
+                weights_dir=weights_dir,
+                prompt_context_length=args.prompt_context_length,
+                layers=args.layers,
+            )
         peano_build_dir = Path(__file__).with_name("build_peano")
         fused_dqp_object_file = peano_build_dir / "fused_dqp.o"
         rope_object_file = peano_build_dir / "rope_halfsplit.o"
@@ -2669,6 +2773,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 prompt_context_length=args.prompt_context_length,
                 tiled_attention_kv_tile=args.tiled_attention_kv_tile,
                 tiled_attention_host_batch_tiles=args.tiled_attention_host_batch_tiles,
+                prefill_kv_cache=prefill_kv_cache,
             )
             if warmup_blockers:
                 blockers.extend(f"warmup:{item}" for item in warmup_blockers)
@@ -2699,6 +2804,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 prompt_context_length=args.prompt_context_length,
                 tiled_attention_kv_tile=args.tiled_attention_kv_tile,
                 tiled_attention_host_batch_tiles=args.tiled_attention_host_batch_tiles,
+                prefill_kv_cache=prefill_kv_cache,
                 check_references=True,
             )
             layer_evidence.append(evidence)
@@ -2738,6 +2844,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                     prompt_context_length=args.prompt_context_length,
                     tiled_attention_kv_tile=args.tiled_attention_kv_tile,
                     tiled_attention_host_batch_tiles=args.tiled_attention_host_batch_tiles,
+                    prefill_kv_cache=prefill_kv_cache,
                     check_references=False,
                 )
                 blockers.extend(layer_blockers)
@@ -2795,19 +2902,30 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             (
                 "synthetic-prefill-kv-cache"
                 if args.attention_cache_mode == "synthetic-prefill"
-                else "synthetic-repeated-current-token-kv-cache"
+                else (
+                    "host-hf-prefill-kv-cache"
+                    if args.attention_cache_mode == "hf-prefill"
+                    else "synthetic-repeated-current-token-kv-cache"
+                )
             )
             if args.attention_mode == "tiled-stats-1k"
             else "single-current-token-kv"
         ),
+        attention_cache_build_seconds=attention_cache_build_seconds,
+        attention_cache_layer_count=(len(prefill_kv_cache) if prefill_kv_cache is not None else None),
+        attention_cache_token_count=(args.prompt_context_length if prefill_kv_cache is not None else None),
         attention_kv_tile=(args.tiled_attention_kv_tile if args.attention_mode == "tiled-stats-1k" else None),
         attention_host_batch_tiles=(
             args.tiled_attention_host_batch_tiles if args.attention_mode == "tiled-stats-1k" else None
         ),
         attention_host_batch_count=(
-            (args.prompt_context_length // args.tiled_attention_kv_tile) // args.tiled_attention_host_batch_tiles
-            if args.attention_mode == "tiled-stats-1k"
-            else None
+            None
+            if args.attention_mode == "tiled-stats-1k" and args.attention_cache_mode == "hf-prefill"
+            else (
+                (args.prompt_context_length // args.tiled_attention_kv_tile) // args.tiled_attention_host_batch_tiles
+                if args.attention_mode == "tiled-stats-1k"
+                else None
+            )
         ),
         attention_host_reduction=(args.attention_mode == "tiled-stats-1k"),
         host_fallbacks=(),
@@ -2863,7 +2981,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 else (
                     "attention is host-batched 1k tiled-stat FlowQKV NPU launches with host-side softmax-stat reduction over a synthetic prefill-shaped KV cache"
                     if args.attention_cache_mode == "synthetic-prefill"
-                    else "attention is host-batched 1k tiled-stat FlowQKV NPU launches with host-side softmax-stat reduction over a synthetic repeated current-token KV cache"
+                    else (
+                        "attention is host-batched 1k tiled-stat FlowQKV NPU launches with host-side softmax-stat reduction over a host HF-produced prefill KV cache; HF prefill cache construction is outside the measured loop"
+                        if args.attention_cache_mode == "hf-prefill"
+                        else "attention is host-batched 1k tiled-stat FlowQKV NPU launches with host-side softmax-stat reduction over a synthetic repeated current-token KV cache"
+                    )
                 )
             ),
             "logits and sampling are not wired, so this is a diagnostic decode-loop throughput, not an official paper decode TPS cell",
@@ -2872,7 +2994,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         segmented_kernel_power_snapshot=segment_power.snapshot(),
         layer_evidence=tuple(layer_evidence),
         remaining_paper_gaps=(
-            "prefill-kv-cache-not-constructed",
+            *(
+                ("npu-prefill-kv-cache-not-wired",)
+                if args.attention_mode == "tiled-stats-1k" and args.attention_cache_mode == "hf-prefill"
+                else ("prefill-kv-cache-not-constructed",)
+            ),
             *(
                 ("paper-1k-kv-attention-not-wired",)
                 if args.attention_mode == "single-token"
@@ -2882,7 +3008,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                         "paper-1k-kv-attention-npu-reduction-not-wired",
                     )
                     if args.attention_cache_mode == "synthetic-prefill"
-                    else ("paper-1k-kv-attention-production-cache-and-npu-reduction-not-wired",)
+                    else (
+                        ("paper-1k-kv-attention-npu-reduction-not-wired",)
+                        if args.attention_cache_mode == "hf-prefill"
+                        else ("paper-1k-kv-attention-production-cache-and-npu-reduction-not-wired",)
+                    )
                 )
             ),
             "logits-sampling-not-wired",
@@ -2970,6 +3100,9 @@ def _self_test() -> None:
         reference_check_seconds=1.0,
         attention_mode=DEFAULT_ATTENTION_MODE,
         attention_cache_contract="single-current-token-kv",
+        attention_cache_build_seconds=None,
+        attention_cache_layer_count=None,
+        attention_cache_token_count=None,
         attention_kv_tile=None,
         attention_host_batch_tiles=None,
         attention_host_batch_count=None,
@@ -3024,7 +3157,7 @@ def main() -> int:
     parser.add_argument("--ffn-geglu-down-mode", choices=["staged", "stitched"], default=DEFAULT_FFN_GEGLU_DOWN_MODE)
     parser.add_argument("--post-feedforward-mode", choices=["staged", "stitched"], default=DEFAULT_POST_FEEDFORWARD_MODE)
     parser.add_argument("--attention-mode", choices=["single-token", "tiled-stats-1k"], default=DEFAULT_ATTENTION_MODE)
-    parser.add_argument("--attention-cache-mode", choices=["repeated-current-token", "synthetic-prefill"], default=DEFAULT_ATTENTION_CACHE_MODE)
+    parser.add_argument("--attention-cache-mode", choices=["repeated-current-token", "synthetic-prefill", "hf-prefill"], default=DEFAULT_ATTENTION_CACHE_MODE)
     parser.add_argument("--tiled-attention-kv-tile", type=int, default=DEFAULT_TILED_ATTENTION_KV_TILE)
     parser.add_argument("--tiled-attention-host-batch-tiles", type=int, default=DEFAULT_TILED_ATTENTION_HOST_BATCH_TILES)
     parser.add_argument("--dynamic-static-weight-writes", action="store_true", help="diagnostic fallback: write packed projection static inputs inside each launch")
