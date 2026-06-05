@@ -2,8 +2,10 @@
 # RUN: %PYTHON %S/gemma3_padded_rms_norm.py --self-test | FileCheck %s --check-prefix=PAD
 # RUN: %PYTHON %S/gemma3_projection_qk_norm.py --self-test | FileCheck %s --check-prefix=QKNORM
 # RUN: %PYTHON %S/gemma3_stitched_decode.py --self-test | FileCheck %s --check-prefix=DECODE
+# RUN: %PYTHON %S/gemma3_stitched_decode.py --parse-attention-o | FileCheck %s --check-prefix=ATTO
 
 # STITCH: gemma3_stitching self-test status=PASS launches=2 args=3
 # PAD: gemma3_padded_rms_norm self-test status=PASS input=1x1152 output=5x256 padded_tail=128
 # QKNORM: gemma3_projection_qk_norm self-test status=PASS q_in=32x32 q_out=4x256 k_in=8x32 k_out=1x256
 # DECODE: stitched_decode_plan model=gemma3-1b status=STITCHED_DECODE_INGRESS_READY target=decode-ingress-rmsnorm-qkv-qknorm-rope implemented_slice=gemma3_decode_ingress_rms_qkv_qknorm_rope implemented_launches=8 target_launches=8 timing_policy=compile-load-bo-preload-arg-binding-outside-timed-region stages=rmsnorm_activation_alias:implemented-hardware-pass-alias|qkv_projection_core:implemented-hardware-pass-stitch|projection_qk_views:implemented-hardware-pass-bridge|qk_norm_rope:implemented-hardware-pass-stitch remaining_bridges=none
+# ATTO: stitched_attention_o status=PARSE_PASS function=gemma3_decode_attention_o_projection launches=2 args=7 output_format=elf

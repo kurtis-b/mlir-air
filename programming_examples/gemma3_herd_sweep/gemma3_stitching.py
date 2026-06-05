@@ -23,6 +23,7 @@ GEMMA3_EXTERN_FUNCS = frozenset(
         "@rope",
         "@gemma3_geglu",
         "@gemma3_residual_add",
+        "@flowqkv_chunk_bf16",
     }
 )
 

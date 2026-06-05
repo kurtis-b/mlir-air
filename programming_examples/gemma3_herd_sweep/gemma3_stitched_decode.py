@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -34,12 +35,15 @@ DEFAULT_MODEL = "gemma3-1b"
 DEFAULT_FUNCTION_NAME = "gemma3_decode_qkv_projection_core"
 DEFAULT_RMS_QKV_FUNCTION_NAME = "gemma3_decode_rms_qkv_projection_core"
 DEFAULT_INGRESS_FUNCTION_NAME = "gemma3_decode_ingress_rms_qkv_qknorm_rope"
+DEFAULT_ATTENTION_O_FUNCTION_NAME = "gemma3_decode_attention_o_projection"
 DEFAULT_OUTPUT_FORMAT = "elf"
 DEFAULT_FUSED_DQP_OBJECT = Path(__file__).with_name("build_peano") / "fused_dqp.o"
 DEFAULT_ROPE_OBJECT = Path(__file__).with_name("build_peano") / "rope_halfsplit.o"
+DEFAULT_FLOWQKV_OBJECT = Path(__file__).with_name("build_peano") / "flowqkv_single_token_q4_kv1_d256.o"
 DEFAULT_THRESHOLD = 0.99
 DEFAULT_LAYER = 0
 DEFAULT_INGRESS_RESULT_JSON = Path(__file__).with_name("results") / "gemma3_1b_stitched_decode_ingress_probe.json"
+DEFAULT_ATTENTION_O_RESULT_JSON = Path(__file__).with_name("results") / "gemma3_1b_stitched_attention_o_probe.json"
 
 PROJECTION_CORE_ARG_TYPES = (
     "memref<8x4x5x5120xi8>",  # q packed Q4NX blocks, scale, min
@@ -83,6 +87,16 @@ INGRESS_ARG_TYPES = (
     "memref<256xbf16>",  # k RoPE LUT
     "memref<4x256xbf16>",  # q RoPE output
     "memref<1x256xbf16>",  # k RoPE output
+)
+
+ATTENTION_O_ARG_TYPES = (
+    "memref<1x4x256xbf16>",  # Q for single-token FlowQKV
+    "memref<1x1x256xbf16>",  # K for single-token FlowQKV
+    "memref<1x1x256xbf16>",  # V for single-token FlowQKV
+    "memref<1x4x256xbf16>",  # attention output view
+    "memref<4x256xbf16>",  # O-projection activation alias, same BO as arg3
+    "memref<10x4x4x5120xi8>",  # O packed Q4NX blocks, scale, min
+    "memref<40x32xbf16>",  # O projection output, contiguous 1280 padded values
 )
 
 
@@ -190,6 +204,63 @@ class StitchedIngressProbeResult:
         return asdict(self)
 
 
+
+@dataclass(frozen=True)
+class StitchedAttentionOProbeResult:
+    schema_version: int
+    model_variant: str
+    status: str
+    sequence_kind: str
+    layer_index: int
+    function_name: str
+    output_format: str
+    launch_count: int
+    argument_count: int
+    output_correlations: tuple[StitchedIngressCorrelation, ...]
+    dense_o_projection_correlation: float | None
+    timed_kernel_count: int
+    timed_kernel_seconds: float | None
+    timing_window: str
+    timing_notes: tuple[str, ...]
+    threshold: float
+    remaining_model_runner_gaps: tuple[str, ...]
+    blockers: tuple[str, ...]
+    command: tuple[str, ...]
+    returncode: int | None
+    elapsed_seconds: float | None
+    git_commit: str | None
+    dirty_worktree: bool | None
+    stdout_tail: tuple[str, ...]
+    stderr_tail: tuple[str, ...]
+
+    @staticmethod
+    def _corr_text(value: float | None) -> str:
+        return "n/a" if value is None else f"{value:.6f}"
+
+    def format(self) -> str:
+        blockers = ",".join(self.blockers) if self.blockers else "none"
+        gaps = ",".join(self.remaining_model_runner_gaps) if self.remaining_model_runner_gaps else "none"
+        corr_text = "|".join(
+            f"{item.name}:{self._corr_text(item.correlation)}"
+            for item in self.output_correlations
+        )
+        return (
+            f"stitched_attention_o_probe model={self.model_variant} status={self.status} "
+            f"sequence={self.sequence_kind} layer=L{self.layer_index} "
+            f"function={self.function_name} output_format={self.output_format} "
+            f"launches={self.launch_count} args={self.argument_count} "
+            f"output_correlations={corr_text} "
+            f"dense_o_projection_correlation={self._corr_text(self.dense_o_projection_correlation)} "
+            f"timed_kernel_count={self.timed_kernel_count} "
+            f"timed_kernel_seconds={self._corr_text(self.timed_kernel_seconds)} "
+            f"timing_window={self.timing_window} threshold={self.threshold:g} "
+            f"model_runner_gaps={gaps} blockers={blockers}"
+        )
+
+    def to_json_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
 def build_decode_ingress_plan(model_variant: str = DEFAULT_MODEL) -> DecodeStitchPlan:
     stages = (
         DecodeStitchStage(
@@ -248,6 +319,16 @@ def _activate_builder_paths() -> None:
     sys.path.insert(0, weighted)
     sys.path.insert(0, dataflow)
     sys.path.insert(0, herd_sweep)
+
+
+def _dataflow_flow_module_builder():
+    module_path = _repo_root() / "programming_examples/gemma3_dataflow_kernels/flow_common.py"
+    spec = importlib.util.spec_from_file_location("gemma3_stitched_dataflow_flow_common", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load flow_common.py from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.build_flow_module
 
 
 def _projection_irs(object_file: Path) -> tuple[str, str, str]:
@@ -373,6 +454,54 @@ def build_ingress_text(
     )
 
 
+
+def build_attention_o_text(
+    *,
+    object_file: Path = DEFAULT_FUSED_DQP_OBJECT,
+    flowqkv_object_file: Path = DEFAULT_FLOWQKV_OBJECT,
+    function_name: str = DEFAULT_ATTENTION_O_FUNCTION_NAME,
+) -> str:
+    """Build stitched single-token attention plus O projection MLIR text."""
+    _activate_builder_paths()
+    from fused_dqp import build_paper_module
+
+    build_flow_module = _dataflow_flow_module_builder()
+    flow_ir = str(
+        build_flow_module(
+            4,
+            1,
+            256,
+            "flowqkv_chunk_bf16",
+            str(flowqkv_object_file),
+            "flowqkv_single_token",
+            1,
+            1,
+            1,
+        )
+    )
+    o_ir = str(
+        build_paper_module(
+            32,
+            256,
+            "fused_dqp_accum_block_opt",
+            str(object_file),
+            40,
+            4,
+            2,
+            4,
+            "l2-gather",
+        )
+    )
+    return stitch_module_text(
+        function_name=function_name,
+        arg_types=ATTENTION_O_ARG_TYPES,
+        specs=(
+            StitchSpec(flow_ir, "att", {0: 0, 1: 1, 2: 2, 3: 3}),
+            StitchSpec(o_ir, "o", {0: 5, 1: 4, 2: 6}),
+        ),
+    )
+
+
 def _parse_module(text: str):
     from air.ir import Context, Module
 
@@ -397,6 +526,15 @@ def build_ingress_module(
 ):
     """Build and parse the full stitched decode ingress MLIR module."""
     return _parse_module(build_ingress_text(object_file=object_file, rope_object_file=rope_object_file))
+
+
+def build_attention_o_module(
+    *,
+    object_file: Path = DEFAULT_FUSED_DQP_OBJECT,
+    flowqkv_object_file: Path = DEFAULT_FLOWQKV_OBJECT,
+):
+    """Build and parse the stitched attention plus O-projection MLIR module."""
+    return _parse_module(build_attention_o_text(object_file=object_file, flowqkv_object_file=flowqkv_object_file))
 
 
 def _stitched_backend_options(instance_name: str) -> dict[str, object]:
@@ -456,6 +594,20 @@ def compile_ingress(
     return _compile_module(
         build_ingress_module(object_file=object_file, rope_object_file=rope_object_file),
         instance_name=DEFAULT_INGRESS_FUNCTION_NAME,
+        output_binary_name=output_binary_name,
+    )
+
+
+def compile_attention_o(
+    *,
+    object_file: Path = DEFAULT_FUSED_DQP_OBJECT,
+    flowqkv_object_file: Path = DEFAULT_FLOWQKV_OBJECT,
+    output_binary_name: str = DEFAULT_ATTENTION_O_FUNCTION_NAME,
+):
+    """Compile the stitched attention plus O-projection slice as an ELF artifact."""
+    return _compile_module(
+        build_attention_o_module(object_file=object_file, flowqkv_object_file=flowqkv_object_file),
+        instance_name=DEFAULT_ATTENTION_O_FUNCTION_NAME,
         output_binary_name=output_binary_name,
     )
 
@@ -805,6 +957,137 @@ def _run_ingress_hardware(args: argparse.Namespace) -> StitchedIngressProbeResul
     )
 
 
+def _run_attention_o_hardware(args: argparse.Namespace) -> StitchedAttentionOProbeResult:
+    _activate_builder_paths()
+    from common import attention_reference, fused_dqp_paper_reference
+    from gemma3_artifacts import default_weights_dir
+    from gemma3_full_layer_probe import _compile_flowqkv_single_token_kernel, _projection_tensor_keys
+    from ml_dtypes import bfloat16
+    import numpy as np
+
+    repo = _repo_root()
+    git_commit, dirty = _git_info(repo)
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    blockers: list[str] = []
+    start = time.perf_counter()
+    layer_index = int(args.layer_index)
+    weights_dir = (args.weights_dir or default_weights_dir(args.model_variant)).expanduser()
+    timed_kernel_seconds: list[float] = []
+    correlations: list[StitchedIngressCorrelation] = []
+    dense_o_correlation: float | None = None
+
+    try:
+        if not args.flowqkv_object_file.exists():
+            _compile_flowqkv_single_token_kernel(args.flowqkv_object_file)
+        projection_keys = _projection_tensor_keys(args.model_variant, weights_dir, layer_index)
+        o_weight = _load_safetensor_array_np(weights_dir, projection_keys["o_proj"])
+        o_pack, o_packed, o_scale, o_min, _o_padded = _pack_projection_for_ingress(o_weight)
+
+        rng = np.random.default_rng(args.seed)
+        val_range = 0.35
+        q = rng.uniform(-val_range, val_range, (1, 4, 256)).astype(bfloat16)
+        k = rng.uniform(-val_range, val_range, (1, 1, 256)).astype(bfloat16)
+        v = rng.uniform(-val_range, val_range, (1, 1, 256)).astype(bfloat16)
+        attention_expected = attention_reference(q.reshape(4, 256), k.reshape(1, 256), v.reshape(1, 256)).reshape(1, 4, 256).astype(bfloat16)
+        o_expected = fused_dqp_paper_reference(
+            o_packed,
+            o_scale,
+            o_min,
+            attention_expected.reshape(4, 256),
+            32,
+            256,
+        ).reshape(40, 32)
+
+        attention_storage = np.zeros((1, 4, 256), dtype=bfloat16)
+        arrays = [
+            q,
+            k,
+            v,
+            attention_storage,
+            attention_storage.reshape(4, 256),
+            o_pack,
+            np.zeros((40, 32), dtype=bfloat16),
+        ]
+        actual = _run_multi_output_elf(
+            mlir_module=build_attention_o_module(
+                object_file=args.object_file,
+                flowqkv_object_file=args.flowqkv_object_file,
+            ),
+            backend_options=_stitched_backend_options(DEFAULT_ATTENTION_O_FUNCTION_NAME),
+            arrays=arrays,
+            readback={
+                "attention": (3, (1, 4, 256), bfloat16),
+                "o_proj": (6, (40, 32), bfloat16),
+            },
+            timed_kernel_seconds=timed_kernel_seconds,
+            bo_aliases={4: 3},
+        )
+        expected = {
+            "attention": attention_expected,
+            "o_proj": o_expected,
+        }
+        for name, expected_value in expected.items():
+            corr = _correlation(actual[name], expected_value)
+            correlations.append(
+                StitchedIngressCorrelation(
+                    name=name,
+                    shape=tuple(int(dim) for dim in expected_value.shape),
+                    correlation=corr,
+                )
+            )
+            stdout_lines.append(f"{name} correlation: {corr:.6f}")
+            if corr < args.threshold:
+                blockers.append(f"{name}-correlation-low")
+        dense_o_correlation = _correlation(
+            actual["o_proj"].reshape(-1)[:1152],
+            (o_weight.astype(np.float32) @ attention_expected.reshape(-1).astype(np.float32)).astype(bfloat16),
+        )
+    except Exception as exc:
+        blockers.append(type(exc).__name__)
+        stderr_lines.append(str(exc))
+
+    status = "STITCHED_ATTENTION_O_PASS" if not blockers else "STITCHED_ATTENTION_O_BLOCKED"
+    elapsed = time.perf_counter() - start
+    timed_sum = float(sum(timed_kernel_seconds)) if timed_kernel_seconds else None
+    return StitchedAttentionOProbeResult(
+        schema_version=1,
+        model_variant=args.model_variant,
+        status=status,
+        sequence_kind="decode-attention-o-stitched",
+        layer_index=layer_index,
+        function_name=DEFAULT_ATTENTION_O_FUNCTION_NAME,
+        output_format=DEFAULT_OUTPUT_FORMAT,
+        launch_count=2,
+        argument_count=len(ATTENTION_O_ARG_TYPES),
+        output_correlations=tuple(correlations),
+        dense_o_projection_correlation=dense_o_correlation,
+        timed_kernel_count=len(timed_kernel_seconds),
+        timed_kernel_seconds=timed_sum,
+        timing_window="single-stitched-elf-run-start-wait2-only-diagnostic",
+        timing_notes=(
+            "compile, ELF load, BO creation, BO writes, and argument binding occur before the timed run.start/wait2 window",
+            "attention output and O-projection activation are aliased BO views: 1x4x256 and 4x256",
+            "single attention/O diagnostic timing is not a TTFT/TPS or paper-parity result",
+        ),
+        threshold=float(args.threshold),
+        remaining_model_runner_gaps=(
+            "integrate-attention-o-stitched-slice-into-decode-loop",
+            "stitch-remaining-ffn-layer-tail",
+            "prefill-produced-kv-cache-not-wired",
+            "logits-sampling-not-wired",
+        ),
+        blockers=tuple(dict.fromkeys(blockers)),
+        command=tuple(sys.argv),
+        returncode=0 if not blockers else 1,
+        elapsed_seconds=elapsed,
+        git_commit=git_commit,
+        dirty_worktree=dirty,
+        stdout_tail=_tail(stdout_lines),
+        stderr_tail=_tail(stderr_lines),
+    )
+
+
 def _projection_core_text_self_test() -> None:
     a_ir = """module {
   func.func private @fused_dqp_accum_block_opt(memref<4xbf16>) attributes {link_with = "fused_dqp.o", llvm.emit_c_interface}
@@ -850,15 +1133,20 @@ def main() -> None:
     parser.add_argument("--print-projection-core-mlir", action="store_true")
     parser.add_argument("--print-rms-qkv-mlir", action="store_true")
     parser.add_argument("--print-ingress-mlir", action="store_true")
+    parser.add_argument("--print-attention-o-mlir", action="store_true")
     parser.add_argument("--parse-projection-core", action="store_true")
     parser.add_argument("--parse-rms-qkv", action="store_true")
     parser.add_argument("--parse-ingress", action="store_true")
+    parser.add_argument("--parse-attention-o", action="store_true")
     parser.add_argument("--compile-projection-core", action="store_true")
     parser.add_argument("--compile-rms-qkv", action="store_true")
     parser.add_argument("--compile-ingress", action="store_true")
+    parser.add_argument("--compile-attention-o", action="store_true")
     parser.add_argument("--run-ingress-hardware", action="store_true")
+    parser.add_argument("--run-attention-o-hardware", action="store_true")
     parser.add_argument("--object-file", type=Path, default=DEFAULT_FUSED_DQP_OBJECT)
     parser.add_argument("--rope-object-file", type=Path, default=DEFAULT_ROPE_OBJECT)
+    parser.add_argument("--flowqkv-object-file", type=Path, default=DEFAULT_FLOWQKV_OBJECT)
     parser.add_argument("--model-variant", default=DEFAULT_MODEL)
     parser.add_argument("--weights-dir", type=Path)
     parser.add_argument("--layer-index", type=int, default=DEFAULT_LAYER)
@@ -882,6 +1170,9 @@ def main() -> None:
     if args.print_ingress_mlir:
         print(build_ingress_text(object_file=args.object_file, rope_object_file=args.rope_object_file))
         return
+    if args.print_attention_o_mlir:
+        print(build_attention_o_text(object_file=args.object_file, flowqkv_object_file=args.flowqkv_object_file))
+        return
     if args.parse_projection_core:
         build_projection_core_module(object_file=args.object_file)
         print(
@@ -901,6 +1192,13 @@ def main() -> None:
         print(
             f"stitched_decode_ingress status=PARSE_PASS function={DEFAULT_INGRESS_FUNCTION_NAME} "
             f"launches=8 args={len(INGRESS_ARG_TYPES)} output_format={DEFAULT_OUTPUT_FORMAT}"
+        )
+        return
+    if args.parse_attention_o:
+        build_attention_o_module(object_file=args.object_file, flowqkv_object_file=args.flowqkv_object_file)
+        print(
+            f"stitched_attention_o status=PARSE_PASS function={DEFAULT_ATTENTION_O_FUNCTION_NAME} "
+            f"launches=2 args={len(ATTENTION_O_ARG_TYPES)} output_format={DEFAULT_OUTPUT_FORMAT}"
         )
         return
     if args.compile_projection_core:
@@ -924,6 +1222,13 @@ def main() -> None:
             f"output={artifact.output_binary}"
         )
         return
+    if args.compile_attention_o:
+        artifact = compile_attention_o(object_file=args.object_file, flowqkv_object_file=args.flowqkv_object_file)
+        print(
+            f"stitched_attention_o status=COMPILE_PASS function={DEFAULT_ATTENTION_O_FUNCTION_NAME} "
+            f"output={artifact.output_binary}"
+        )
+        return
     if args.run_ingress_hardware:
         result = _run_ingress_hardware(args)
         print(result.format())
@@ -932,11 +1237,21 @@ def main() -> None:
             args.result_json.write_text(json.dumps(result.to_json_dict(), indent=2, sort_keys=True) + "\n")
             print(f"GEMMA3_STITCHED_INGRESS_JSON: {args.result_json}")
         raise SystemExit(0 if result.status == "STITCHED_INGRESS_PASS" else 1)
+    if args.run_attention_o_hardware:
+        result = _run_attention_o_hardware(args)
+        print(result.format())
+        if args.result_json:
+            args.result_json.parent.mkdir(parents=True, exist_ok=True)
+            args.result_json.write_text(json.dumps(result.to_json_dict(), indent=2, sort_keys=True) + "\n")
+            print(f"GEMMA3_STITCHED_ATTENTION_O_JSON: {args.result_json}")
+        raise SystemExit(0 if result.status == "STITCHED_ATTENTION_O_PASS" else 1)
     parser.error(
         "pass --self-test, --print-plan, --print-projection-core-mlir, "
-        "--print-rms-qkv-mlir, --print-ingress-mlir, --parse-projection-core, "
-        "--parse-rms-qkv, --parse-ingress, --compile-projection-core, "
-        "--compile-rms-qkv, --compile-ingress, or --run-ingress-hardware"
+        "--print-rms-qkv-mlir, --print-ingress-mlir, --print-attention-o-mlir, "
+        "--parse-projection-core, --parse-rms-qkv, --parse-ingress, "
+        "--parse-attention-o, --compile-projection-core, --compile-rms-qkv, "
+        "--compile-ingress, --compile-attention-o, --run-ingress-hardware, "
+        "or --run-attention-o-hardware"
     )
 
 
