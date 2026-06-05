@@ -46,7 +46,7 @@
   "execution_wiring": {
     "blockers": [
       "prefill-1k-npu-not-wired",
-      "production-kv-cache-not-wired",
+      "prefill-produced-kv-cache-not-wired",
       "npu-attention-reduction-not-wired",
       "logits-sampling-not-wired",
       "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
@@ -59,12 +59,12 @@
     "status": "BLOCKED"
   },
   "explanation": null,
-  "git_commit": "9af9970825e710fbc349dd522aa2e2f4e96e0acd",
+  "git_commit": "e1101c4f0c31c38b1e938d347155f55cae12e947",
   "host_fallbacks": [
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.009524655373146137,
+      "elapsed_ms": 0.009765344051023325,
       "hardware_status": "hardware-smoke-pass-M8-N1152-N2560-elf",
       "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
       "measured": true,
@@ -78,7 +78,7 @@
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.010937335900962353,
+      "elapsed_ms": 0.008947002546240887,
       "hardware_status": "hardware-smoke-pass-M32-N256-elf",
       "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
       "measured": true,
@@ -92,7 +92,7 @@
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.008008326403796673,
+      "elapsed_ms": 0.008031997519234816,
       "hardware_status": "hardware-smoke-pass-rows4-head256-elf",
       "implementation_path": "programming_examples/gemma3_dataflow_kernels/rope_halfsplit.py",
       "measured": true,
@@ -106,7 +106,7 @@
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.011638680007308722,
+      "elapsed_ms": 0.01089067275946339,
       "hardware_status": "hardware-smoke-pass-n6912-tile288-elf",
       "implementation_path": "programming_examples/gemma3_dataflow_kernels/geglu.py",
       "measured": true,
@@ -120,7 +120,7 @@
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.003129011020064354,
+      "elapsed_ms": 0.0022406651017566523,
       "hardware_status": "hardware-smoke-pass-n1152-tile288-elf",
       "implementation_path": "programming_examples/gemma3_dataflow_kernels/residual_add.py",
       "measured": true,
@@ -138,7 +138,7 @@
   "model_runner": {
     "blockers": [
       "prefill-1k-npu-not-wired",
-      "production-kv-cache-not-wired",
+      "prefill-produced-kv-cache-not-wired",
       "npu-attention-reduction-not-wired",
       "logits-sampling-not-wired",
       "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
@@ -168,10 +168,10 @@
     "real artifact inventory is present but execution is not implemented",
     "staged NPU diagnostic available: timed_kernel_seconds=0.15427393274148926 estimated_26_layer_decode_tps_kernel_only=0.24930678681788027",
     "staged NPU decode-loop diagnostic available: measured_loop_seconds=5.412830422981642 diagnostic_decode_tps_loop_wall=0.18474622736271734 diagnostic_decode_tps_kernel_only=0.2746984021217935",
-    "tiled 1k decode-loop diagnostic available: measured_loop_seconds=35.46716246602591 diagnostic_decode_tps_loop_wall=0.02819509457397114 pseudo_npu_watts=7.673996082054266",
+    "tiled 1k decode-loop diagnostic available: measured_loop_seconds=35.81514754303498 diagnostic_decode_tps_loop_wall=0.027921147017429256 pseudo_npu_watts=0.47307117008857347",
     "standalone tiled 1k attention diagnostic available: host_batches=16 combined_attention_correlation_vs_exact=0.9999584557263573",
-    "execution wiring blockers: prefill-1k-npu-not-wired,production-kv-cache-not-wired,npu-attention-reduction-not-wired,logits-sampling-not-wired,production-contiguous-static-weight-bo-not-used-by-fused-dqp-route",
-    "model runner blockers: prefill-1k-npu-not-wired,production-kv-cache-not-wired,npu-attention-reduction-not-wired,logits-sampling-not-wired,production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
+    "execution wiring blockers: prefill-1k-npu-not-wired,prefill-produced-kv-cache-not-wired,npu-attention-reduction-not-wired,logits-sampling-not-wired,production-contiguous-static-weight-bo-not-used-by-fused-dqp-route",
+    "model runner blockers: prefill-1k-npu-not-wired,prefill-produced-kv-cache-not-wired,npu-attention-reduction-not-wired,logits-sampling-not-wired,production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
   ],
   "npu_decode_loop_diagnostic": {
     "attention_cache_contract": "single-current-token-kv",
@@ -356,7 +356,7 @@
     "tile_count": 32
   },
   "npu_tiled_decode_loop_diagnostic": {
-    "attention_cache_contract": "synthetic-repeated-current-token-kv-cache",
+    "attention_cache_contract": "synthetic-prefill-kv-cache",
     "attention_host_batch_count": 16,
     "attention_host_batch_tiles": 2,
     "attention_host_reduction": true,
@@ -364,18 +364,18 @@
     "attention_mode": "tiled-stats-1k",
     "correctness": "PASS",
     "decode_tokens": 1,
-    "diagnostic_decode_tps_kernel_only": 0.030714872064967296,
-    "diagnostic_decode_tps_loop_wall": 0.02819509457397114,
+    "diagnostic_decode_tps_kernel_only": 0.03036300545568457,
+    "diagnostic_decode_tps_loop_wall": 0.027921147017429256,
     "dirty_worktree": false,
-    "git_commit": "2729c979d7a6ba37128f14200883fca296a4ff1d",
+    "git_commit": "e1101c4f0c31c38b1e938d347155f55cae12e947",
     "host_fallbacks": [],
-    "kernel_only_delta_pct_vs_paper_decode_tps_1k": 99.92526795118012,
+    "kernel_only_delta_pct_vs_paper_decode_tps_1k": 99.92612407431707,
     "layer_count": 26,
-    "loop_wall_delta_pct_vs_paper_decode_tps_1k": 99.931398796657,
-    "measured_loop_seconds": 35.46716246602591,
+    "loop_wall_delta_pct_vs_paper_decode_tps_1k": 99.93206533572402,
+    "measured_loop_seconds": 35.81514754303498,
     "notes": [
       "diagnostic 26-layer decode-loop timing with host-batched 1k tiled-stat attention; not a measured paper TTFT/TPS cell",
-      "the KV cache is synthetic repeated current-token K/V, not a prefill-constructed production cache",
+      "the KV cache is synthetic prefill-shaped and not produced by a real prefill stage",
       "softmax-stat reduction is host-side; production NPU reduction remains unwired",
       "loop-wall TPS includes current runner BO writes and sync/readback; reference checks are excluded from the measured loop"
     ],
@@ -393,7 +393,7 @@
         "raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges",
         "xrt-smi is available, but direct NPU rail parsing reports N/A on this host",
         "NPU rail is pseudo power: average package watts during timed window minus quiescent package watts before the run",
-        "quiescent_pkg_watts=9.444400",
+        "quiescent_pkg_watts=17.103450",
         "package watts use direct RAPL sysfs energy_uj delta over the timed window"
       ],
       "run_id": "gemma3_1b_decode_loop_probe",
@@ -402,17 +402,18 @@
       "watts": {
         "cpu": null,
         "gpu": null,
-        "npu": 7.673996082054266,
-        "total": 17.118396082054264
+        "npu": 0.47307117008857347,
+        "total": 17.576521170088572
       }
     },
     "prompt_context_length": 1024,
     "reference_check_layer_count": 26,
     "reference_check_mode": "all-layers-before-timing",
-    "reference_check_seconds": 36.813874263025355,
+    "reference_check_seconds": 37.129593910998665,
     "remaining_paper_gaps": [
       "prefill-kv-cache-not-constructed",
-      "paper-1k-kv-attention-production-cache-and-npu-reduction-not-wired",
+      "prefill-produced-kv-cache-not-wired",
+      "paper-1k-kv-attention-npu-reduction-not-wired",
       "logits-sampling-not-wired",
       "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
     ],
@@ -425,34 +426,34 @@
         "total": "RAPL_SYSFS_PACKAGE_SEGMENTED"
       },
       "notes": [
-        "quiescent_pkg_watts=44.236900",
+        "quiescent_pkg_watts=40.038210",
         "package watts use direct RAPL sysfs energy_uj deltas summed over NPU run.start/wait2 segments",
         "NPU rail is pseudo power: segmented package watts minus quiescent package watts before the run"
       ],
       "run_id": "gemma3_1b_decode_loop_probe_kernel_segments",
       "sampling_backend": "rapl-sysfs+segmented",
       "schema_version": 1,
-      "segmented_elapsed_seconds": 32.55751799599966,
-      "segmented_energy_delta_uj": 519949151,
+      "segmented_elapsed_seconds": 32.934816069493536,
+      "segmented_energy_delta_uj": 542750783,
       "watts": {
         "cpu": null,
         "gpu": null,
         "npu": 0.0,
-        "total": 15.970171653253363
+        "total": 16.47954498530607
       }
     },
     "sequence_kind": "decode-loop-staged-full-1b",
     "source_result": "/home/cj/mlir-air/programming_examples/gemma3_herd_sweep/results/gemma3_1b_decode_loop_tiled_stats_probe.json",
     "status": "DECODE_LOOP_DIAGNOSTIC_PASS",
     "timed_kernel_count": 2158,
-    "timed_kernel_seconds": 32.55751799599966,
+    "timed_kernel_seconds": 32.934816069493536,
     "timing_notes": [
       "warmup layers compile/load ELF runners and allocate runner-owned BOs before measured loop timing",
       "preloaded-runner-bo-set mode allocates BO sets and writes packed projection static inputs before measured loop timing",
       "reference_check_seconds validates all layers before measured loop timing and is excluded from measured_loop_seconds",
       "measured_loop_seconds starts after warmup/reference checks and includes current implementation dynamic BO writes and output sync/readback",
       "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls and excludes compile, ELF load, BO allocation, BO writes, sync/readback, and CPU reference/correlation checks",
-      "attention is host-batched 1k tiled-stat FlowQKV NPU launches with host-side softmax-stat reduction over a synthetic repeated current-token KV cache",
+      "attention is host-batched 1k tiled-stat FlowQKV NPU launches with host-side softmax-stat reduction over a synthetic prefill-shaped KV cache",
       "logits and sampling are not wired, so this is a diagnostic decode-loop throughput, not an official paper decode TPS cell"
     ],
     "timing_window": "post-warmup-loop-wall-and-segmented-run-start-wait2"

@@ -177,7 +177,7 @@ power, or paper-parity evidence.
   single-token attention path, logits/sampling are not wired, and the production
   contiguous static-weight BO route is still not complete. A separate
   `tiled-stats-1k` decode-loop artifact below integrates host-batched 1k
-  tiled-stat attention in diagnostic mode, but it uses a synthetic repeated KV
+  tiled-stat attention in diagnostic mode, but it uses a synthetic prefill-shaped KV
   cache and host-side reduction.
 
 - `gemma3_1b_decode_loop_tiled_stats_probe.json`: compact Strix/XRT evidence
@@ -185,18 +185,19 @@ power, or paper-parity evidence.
   `attention_mode=tiled-stats-1k`. The probe keeps the same reusable ELF runner
   and preloaded projection BO-set path as the default decode-loop diagnostic,
   but replaces the single-token attention launch with 16 host-batched tiled-stat
-  attention launches per layer over a synthetic repeated current-token KV cache.
-  It validates all 26 layers with `host_fallbacks=[]`, records a 36.813874 s
+  attention launches per layer over a synthetic prefill-shaped KV cache. It
+  validates all 26 layers with `host_fallbacks=[]`, records a 37.129594 s
   untimed all-layer reference pass outside the measured window, and measures a
-  35.467162 s post-warmup loop wall window, or 0.028195 diagnostic TPS. The
-  summed NPU `run.start()/wait2()` windows total 32.557518 s across 2,158
-  launches, or 0.030715 kernel-only diagnostic TPS. Compared with the paper's
-  41.1 TPS 1B/1k NPU decode target, those diagnostics are 99.931% and 99.925%
-  low, respectively. Direct RAPL reports 17.118 W package power and a 7.674 W
-  pseudo-NPU package-delta from a 9.444 W quiescent sample. This is not a paper
-  cell because the KV cache is synthetic, the tiled softmax-stat reduction is
-  host-side, logits/sampling are not wired, and the production contiguous
-  static-weight BO route is still not complete.
+  35.815148 s post-warmup loop wall window, or 0.027921 diagnostic TPS. The
+  summed NPU `run.start()/wait2()` windows total 32.934816 s across 2,158
+  launches, or 0.030363 kernel-only diagnostic TPS. Compared with the paper's
+  41.1 TPS 1B/1k NPU decode target, those diagnostics are 99.932% and 99.926%
+  low, respectively. Direct RAPL reports 17.577 W package power and a 0.473 W
+  pseudo-NPU package-delta; the delta is low because the quiescent package
+  sample was close to the timed-window package average in this run. This is not
+  a paper cell because the KV cache is synthetic rather than prefill-produced,
+  the tiled softmax-stat reduction is host-side, logits/sampling are not wired,
+  and the production contiguous static-weight BO route is still not complete.
 
 
 ## FlowQKV Tiled Stats Evidence

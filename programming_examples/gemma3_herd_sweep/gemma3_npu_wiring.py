@@ -38,7 +38,7 @@ MODEL_FULL_QKV_SUBSTEP_BLOCKER = "model-full-qkv-substep-not-wired"
 MODEL_FULL_LAYER_BLOCKER = "model-full-layer-not-wired"
 MODEL_FULL_1B_LOOP_BLOCKER = "full-1b-loop-not-wired"
 PREFILL_1K_NPU_BLOCKER = "prefill-1k-npu-not-wired"
-PRODUCTION_KV_CACHE_BLOCKER = "production-kv-cache-not-wired"
+PREFILL_PRODUCED_KV_CACHE_BLOCKER = "prefill-produced-kv-cache-not-wired"
 NPU_ATTENTION_REDUCTION_BLOCKER = "npu-attention-reduction-not-wired"
 LOGITS_SAMPLING_BLOCKER = "logits-sampling-not-wired"
 PRODUCTION_STATIC_BO_BLOCKER = "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
@@ -294,7 +294,7 @@ def build_wiring_plan_from_preflight(
             ):
                 if role == "attention":
                     status = "runner-owned-decode-loop-tiled-stats-synthetic-cache-pass"
-                    blockers = (PRODUCTION_KV_CACHE_BLOCKER, NPU_ATTENTION_REDUCTION_BLOCKER)
+                    blockers = (PREFILL_PRODUCED_KV_CACHE_BLOCKER, NPU_ATTENTION_REDUCTION_BLOCKER)
                 else:
                     status = "runner-owned-decode-loop-staged-pass"
                     blockers = ()
@@ -358,7 +358,7 @@ def build_wiring_plan_from_preflight(
     if decode_loop_tiled_stats_validated:
         blockers = [
             PREFILL_1K_NPU_BLOCKER,
-            PRODUCTION_KV_CACHE_BLOCKER,
+            PREFILL_PRODUCED_KV_CACHE_BLOCKER,
             NPU_ATTENTION_REDUCTION_BLOCKER,
             LOGITS_SAMPLING_BLOCKER,
             PRODUCTION_STATIC_BO_BLOCKER,

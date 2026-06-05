@@ -271,6 +271,12 @@ def load_tiled_decode_loop_diagnostic(model_variant: str) -> dict[str, Any] | No
     if data.get("status") != "DECODE_LOOP_DIAGNOSTIC_PASS":
         return None
     host_fallbacks = list(data.get("host_fallbacks", []))
+    cache_contract = data.get("attention_cache_contract", "unknown-cache-contract")
+    cache_note = (
+        "the KV cache is synthetic prefill-shaped and not produced by a real prefill stage"
+        if cache_contract == "synthetic-prefill-kv-cache"
+        else "the KV cache is synthetic repeated current-token K/V, not a prefill-constructed production cache"
+    )
     return {
         "status": data.get("status"),
         "correctness": "PASS",
@@ -307,7 +313,7 @@ def load_tiled_decode_loop_diagnostic(model_variant: str) -> dict[str, Any] | No
         "source_result": str(TILED_DECODE_LOOP_EVIDENCE),
         "notes": [
             "diagnostic 26-layer decode-loop timing with host-batched 1k tiled-stat attention; not a measured paper TTFT/TPS cell",
-            "the KV cache is synthetic repeated current-token K/V, not a prefill-constructed production cache",
+            cache_note,
             "softmax-stat reduction is host-side; production NPU reduction remains unwired",
             "loop-wall TPS includes current runner BO writes and sync/readback; reference checks are excluded from the measured loop",
         ],

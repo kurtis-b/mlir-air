@@ -1,5 +1,5 @@
 {
-  "attention_cache_contract": "synthetic-repeated-current-token-kv-cache",
+  "attention_cache_contract": "synthetic-prefill-kv-cache",
   "attention_host_batch_count": 16,
   "attention_host_batch_tiles": 2,
   "attention_host_reduction": true,
@@ -17,31 +17,33 @@
     "1",
     "--attention-mode",
     "tiled-stats-1k",
+    "--attention-cache-mode",
+    "synthetic-prefill",
     "--tiled-attention-kv-tile",
     "32",
     "--tiled-attention-host-batch-tiles",
     "2",
     "--result-json",
-    "/tmp/gemma3_1b_decode_loop_tiled_stats_probe_clean.json",
+    "/tmp/gemma3_1b_decode_loop_tiled_stats_synthetic_prefill_clean.json",
     "--power-sample"
   ],
   "decode_tokens": 1,
-  "diagnostic_decode_tps_kernel_only": 0.030714872064967296,
-  "diagnostic_decode_tps_loop_wall": 0.02819509457397114,
+  "diagnostic_decode_tps_kernel_only": 0.03036300545568457,
+  "diagnostic_decode_tps_loop_wall": 0.027921147017429256,
   "dirty_worktree": false,
-  "elapsed_seconds": 90.55085247696843,
-  "git_commit": "2729c979d7a6ba37128f14200883fca296a4ff1d",
+  "elapsed_seconds": 91.03508749703178,
+  "git_commit": "e1101c4f0c31c38b1e938d347155f55cae12e947",
   "host_fallbacks": [],
   "input_distribution": "bounded-uniform-seed0",
   "input_shape": [
     1,
     1152
   ],
-  "kernel_only_delta_pct_vs_paper_decode_tps_1k": 99.92526795118012,
+  "kernel_only_delta_pct_vs_paper_decode_tps_1k": 99.92612407431707,
   "layer_count": 26,
   "layer_evidence": [
     {
-      "final_output_correlation": 0.9999812336468921,
+      "final_output_correlation": 0.9999588778483495,
       "layer_index": 0,
       "norm_tensor_key": "model.layers.0.input_layernorm.weight",
       "projection_evidence": [
@@ -149,7 +151,7 @@
             1280,
             6912
           ],
-          "projection_correlation": 0.9999999999999998,
+          "projection_correlation": 0.9999999999906584,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -165,7 +167,7 @@
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9999302089532314,
+      "final_output_correlation": 0.9998689302424699,
       "layer_index": 1,
       "norm_tensor_key": "model.layers.1.input_layernorm.weight",
       "projection_evidence": [
@@ -193,7 +195,7 @@
             256,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 8,
           "shape": [
             256,
@@ -225,7 +227,7 @@
             1280,
             1024
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999998,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -241,7 +243,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999997002149,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -257,7 +259,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999974420692,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -282,14 +284,14 @@
           "tensor_key": "model.layers.1.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999905679174129,
+      "rms_correlation": 0.9999858108208874,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 10240,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9999250144816345,
+      "final_output_correlation": 0.9997838394783185,
       "layer_index": 2,
       "norm_tensor_key": "model.layers.2.input_layernorm.weight",
       "projection_evidence": [
@@ -349,7 +351,7 @@
             1280,
             1024
           ],
-          "projection_correlation": 0.9999999999999999,
+          "projection_correlation": 1.0,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -365,7 +367,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999526346,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -381,7 +383,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999998,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -406,14 +408,14 @@
           "tensor_key": "model.layers.2.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.999981018263331,
+      "rms_correlation": 0.9999880788389816,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 122880,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9999661988271245,
+      "final_output_correlation": 0.999917497842353,
       "layer_index": 3,
       "norm_tensor_key": "model.layers.3.input_layernorm.weight",
       "projection_evidence": [
@@ -489,7 +491,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999991652937,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -505,7 +507,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999999247717,
+          "projection_correlation": 1.0,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -521,7 +523,7 @@
             1280,
             6912
           ],
-          "projection_correlation": 0.9999999999999999,
+          "projection_correlation": 1.0,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -530,14 +532,14 @@
           "tensor_key": "model.layers.3.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999866470186306,
+      "rms_correlation": 0.999989911151899,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 194560,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.999987892977626,
+      "final_output_correlation": 0.9999542636905397,
       "layer_index": 4,
       "norm_tensor_key": "model.layers.4.input_layernorm.weight",
       "projection_evidence": [
@@ -549,7 +551,7 @@
             1024,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999998,
           "row_blocks": 32,
           "shape": [
             1024,
@@ -613,7 +615,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999984105937,
+          "projection_correlation": 1.0,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -629,7 +631,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999999999999,
+          "projection_correlation": 1.0,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -654,14 +656,14 @@
           "tensor_key": "model.layers.4.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999874088527203,
+      "rms_correlation": 0.9999895636236913,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 204800,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.999979576934468,
+      "final_output_correlation": 0.9999162984943033,
       "layer_index": 5,
       "norm_tensor_key": "model.layers.5.input_layernorm.weight",
       "projection_evidence": [
@@ -673,7 +675,7 @@
             1024,
             1280
           ],
-          "projection_correlation": 0.9999999999999999,
+          "projection_correlation": 1.0,
           "row_blocks": 32,
           "shape": [
             1024,
@@ -705,7 +707,7 @@
             256,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 8,
           "shape": [
             256,
@@ -721,7 +723,7 @@
             1280,
             1024
           ],
-          "projection_correlation": 0.9999999282137043,
+          "projection_correlation": 1.0,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -753,7 +755,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.999999999815148,
+          "projection_correlation": 1.0,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -769,7 +771,7 @@
             1280,
             6912
           ],
-          "projection_correlation": 0.9999999999999998,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -778,14 +780,14 @@
           "tensor_key": "model.layers.5.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999975989021511,
+      "rms_correlation": 0.9999891195857223,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 215040,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9999932036192238,
+      "final_output_correlation": 0.9999871037938309,
       "layer_index": 6,
       "norm_tensor_key": "model.layers.6.input_layernorm.weight",
       "projection_evidence": [
@@ -813,7 +815,7 @@
             256,
             1280
           ],
-          "projection_correlation": 0.9999999999999998,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 8,
           "shape": [
             256,
@@ -829,7 +831,7 @@
             256,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 8,
           "shape": [
             256,
@@ -861,7 +863,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999974704101,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -877,7 +879,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999967742336,
+          "projection_correlation": 1.0,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -893,7 +895,7 @@
             1280,
             6912
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999998923974,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -902,14 +904,14 @@
           "tensor_key": "model.layers.6.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999952849247776,
+      "rms_correlation": 0.9999850933741125,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 225280,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9999974048864004,
+      "final_output_correlation": 0.9999916031011811,
       "layer_index": 7,
       "norm_tensor_key": "model.layers.7.input_layernorm.weight",
       "projection_evidence": [
@@ -953,7 +955,7 @@
             256,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999998,
           "row_blocks": 8,
           "shape": [
             256,
@@ -969,7 +971,7 @@
             1280,
             1024
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999998,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -1001,7 +1003,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999999999999,
+          "projection_correlation": 0.9999999948814587,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -1026,14 +1028,14 @@
           "tensor_key": "model.layers.7.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999916054668705,
+      "rms_correlation": 0.9999953236136466,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 235520,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.999999560794605,
+      "final_output_correlation": 0.9999965499303324,
       "layer_index": 8,
       "norm_tensor_key": "model.layers.8.input_layernorm.weight",
       "projection_evidence": [
@@ -1109,7 +1111,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999999999998,
+          "projection_correlation": 1.0,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -1125,7 +1127,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999997716311,
+          "projection_correlation": 1.0,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -1141,7 +1143,7 @@
             1280,
             6912
           ],
-          "projection_correlation": 0.9999999999999999,
+          "projection_correlation": 1.0,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -1150,14 +1152,14 @@
           "tensor_key": "model.layers.8.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999983832792753,
+      "rms_correlation": 0.99999001706155,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 245760,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9999989835470927,
+      "final_output_correlation": 0.9999937635720999,
       "layer_index": 9,
       "norm_tensor_key": "model.layers.9.input_layernorm.weight",
       "projection_evidence": [
@@ -1169,7 +1171,7 @@
             1024,
             1280
           ],
-          "projection_correlation": 0.9999999999999999,
+          "projection_correlation": 1.0,
           "row_blocks": 32,
           "shape": [
             1024,
@@ -1233,7 +1235,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.999999999392682,
+          "projection_correlation": 0.9999999995339909,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -1249,7 +1251,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -1265,7 +1267,7 @@
             1280,
             6912
           ],
-          "projection_correlation": 0.9999999999999999,
+          "projection_correlation": 1.0,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -1274,14 +1276,14 @@
           "tensor_key": "model.layers.9.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999976351011904,
+      "rms_correlation": 0.9999959966597876,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 256000,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9999982334272031,
+      "final_output_correlation": 0.9999820963360325,
       "layer_index": 10,
       "norm_tensor_key": "model.layers.10.input_layernorm.weight",
       "projection_evidence": [
@@ -1325,7 +1327,7 @@
             256,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 8,
           "shape": [
             256,
@@ -1341,7 +1343,7 @@
             1280,
             1024
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -1373,7 +1375,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999948352243,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -1389,7 +1391,7 @@
             1280,
             6912
           ],
-          "projection_correlation": 0.999999998587312,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -1398,14 +1400,14 @@
           "tensor_key": "model.layers.10.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.999995631246975,
+      "rms_correlation": 0.9999929177993397,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 20480,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9999973039660001,
+      "final_output_correlation": 0.9999877906869088,
       "layer_index": 11,
       "norm_tensor_key": "model.layers.11.input_layernorm.weight",
       "projection_evidence": [
@@ -1433,7 +1435,7 @@
             256,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999998,
           "row_blocks": 8,
           "shape": [
             256,
@@ -1481,7 +1483,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999974480983,
+          "projection_correlation": 1.0,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -1497,7 +1499,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -1522,14 +1524,14 @@
           "tensor_key": "model.layers.11.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.999999479838202,
+      "rms_correlation": 0.9999971475580778,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 30720,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9999935110419496,
+      "final_output_correlation": 0.9999908772083189,
       "layer_index": 12,
       "norm_tensor_key": "model.layers.12.input_layernorm.weight",
       "projection_evidence": [
@@ -1621,7 +1623,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999999999999,
+          "projection_correlation": 0.9999999997217107,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -1637,7 +1639,7 @@
             1280,
             6912
           ],
-          "projection_correlation": 0.9999999998330625,
+          "projection_correlation": 1.0,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -1646,14 +1648,14 @@
           "tensor_key": "model.layers.12.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999869699125572,
+      "rms_correlation": 0.9999876692214278,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 40960,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9999949681285456,
+      "final_output_correlation": 0.9999817535063418,
       "layer_index": 13,
       "norm_tensor_key": "model.layers.13.input_layernorm.weight",
       "projection_evidence": [
@@ -1745,7 +1747,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999941426564,
+          "projection_correlation": 1.0,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -1770,14 +1772,14 @@
           "tensor_key": "model.layers.13.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999891825260063,
+      "rms_correlation": 0.9999897067938143,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 51200,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9999862873118363,
+      "final_output_correlation": 0.9999664120582871,
       "layer_index": 14,
       "norm_tensor_key": "model.layers.14.input_layernorm.weight",
       "projection_evidence": [
@@ -1805,7 +1807,7 @@
             256,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999155407105,
           "row_blocks": 8,
           "shape": [
             256,
@@ -1853,7 +1855,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999996106002,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -1869,7 +1871,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999999999998,
+          "projection_correlation": 1.0,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -1885,7 +1887,7 @@
             1280,
             6912
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -1894,14 +1896,14 @@
           "tensor_key": "model.layers.14.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999915163982376,
+      "rms_correlation": 0.9999917850966985,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 61440,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9999864758978467,
+      "final_output_correlation": 0.999965622018921,
       "layer_index": 15,
       "norm_tensor_key": "model.layers.15.input_layernorm.weight",
       "projection_evidence": [
@@ -1913,7 +1915,7 @@
             1024,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 32,
           "shape": [
             1024,
@@ -1929,7 +1931,7 @@
             256,
             1280
           ],
-          "projection_correlation": 0.9999999999999998,
+          "projection_correlation": 1.0,
           "row_blocks": 8,
           "shape": [
             256,
@@ -1945,7 +1947,7 @@
             256,
             1280
           ],
-          "projection_correlation": 0.9999999999999999,
+          "projection_correlation": 1.0,
           "row_blocks": 8,
           "shape": [
             256,
@@ -1961,7 +1963,7 @@
             1280,
             1024
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -1977,7 +1979,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999999999999,
+          "projection_correlation": 1.0,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -2009,7 +2011,7 @@
             1280,
             6912
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.999999984333133,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -2018,14 +2020,14 @@
           "tensor_key": "model.layers.15.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999928291149109,
+      "rms_correlation": 0.9999908296449282,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 71680,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.999974482116377,
+      "final_output_correlation": 0.999925191389608,
       "layer_index": 16,
       "norm_tensor_key": "model.layers.16.input_layernorm.weight",
       "projection_evidence": [
@@ -2053,7 +2055,7 @@
             256,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 8,
           "shape": [
             256,
@@ -2142,14 +2144,14 @@
           "tensor_key": "model.layers.16.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999903427959953,
+      "rms_correlation": 0.9999894298273306,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 81920,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9999765864940658,
+      "final_output_correlation": 0.9999436571386593,
       "layer_index": 17,
       "norm_tensor_key": "model.layers.17.input_layernorm.weight",
       "projection_evidence": [
@@ -2161,7 +2163,7 @@
             1024,
             1280
           ],
-          "projection_correlation": 0.9999999999999998,
+          "projection_correlation": 1.0,
           "row_blocks": 32,
           "shape": [
             1024,
@@ -2193,7 +2195,7 @@
             256,
             1280
           ],
-          "projection_correlation": 0.9999999999999998,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 8,
           "shape": [
             256,
@@ -2209,7 +2211,7 @@
             1280,
             1024
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -2241,7 +2243,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999997979658,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -2257,7 +2259,7 @@
             1280,
             6912
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -2266,14 +2268,14 @@
           "tensor_key": "model.layers.17.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999987289540312,
+      "rms_correlation": 0.9999969506345208,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 92160,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9999707351402507,
+      "final_output_correlation": 0.9999178625436163,
       "layer_index": 18,
       "norm_tensor_key": "model.layers.18.input_layernorm.weight",
       "projection_evidence": [
@@ -2285,7 +2287,7 @@
             1024,
             1280
           ],
-          "projection_correlation": 0.9999999999999998,
+          "projection_correlation": 1.0,
           "row_blocks": 32,
           "shape": [
             1024,
@@ -2301,7 +2303,7 @@
             256,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999998,
           "row_blocks": 8,
           "shape": [
             256,
@@ -2333,7 +2335,7 @@
             1280,
             1024
           ],
-          "projection_correlation": 0.9999999999999999,
+          "projection_correlation": 0.9999999754788779,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -2349,7 +2351,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999999550963,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -2390,14 +2392,14 @@
           "tensor_key": "model.layers.18.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999903831299629,
+      "rms_correlation": 0.9999921886106077,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 102400,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9999484986238635,
+      "final_output_correlation": 0.9999175466394016,
       "layer_index": 19,
       "norm_tensor_key": "model.layers.19.input_layernorm.weight",
       "projection_evidence": [
@@ -2409,7 +2411,7 @@
             1024,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 32,
           "shape": [
             1024,
@@ -2473,7 +2475,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999999999998,
+          "projection_correlation": 0.9999999976668533,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -2489,7 +2491,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -2505,7 +2507,7 @@
             1280,
             6912
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999991241618,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -2514,14 +2516,14 @@
           "tensor_key": "model.layers.19.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999881368823746,
+      "rms_correlation": 0.9999836864256046,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 112640,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9999189702868737,
+      "final_output_correlation": 0.9999370105636622,
       "layer_index": 20,
       "norm_tensor_key": "model.layers.20.input_layernorm.weight",
       "projection_evidence": [
@@ -2597,7 +2599,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999968539395,
+          "projection_correlation": 1.0,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -2629,7 +2631,7 @@
             1280,
             6912
           ],
-          "projection_correlation": 1.0,
+          "projection_correlation": 0.9999999854548212,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -2638,14 +2640,14 @@
           "tensor_key": "model.layers.20.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999843755988498,
+      "rms_correlation": 0.9999887950382357,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 133120,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9999554459291542,
+      "final_output_correlation": 0.9998961768722432,
       "layer_index": 21,
       "norm_tensor_key": "model.layers.21.input_layernorm.weight",
       "projection_evidence": [
@@ -2689,7 +2691,7 @@
             256,
             1280
           ],
-          "projection_correlation": 0.9999999999999999,
+          "projection_correlation": 0.9999999997261363,
           "row_blocks": 8,
           "shape": [
             256,
@@ -2737,7 +2739,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999991010928,
+          "projection_correlation": 0.9999999999999999,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -2762,14 +2764,14 @@
           "tensor_key": "model.layers.21.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999853023338726,
+      "rms_correlation": 0.9999891184884312,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 143360,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9999579489995597,
+      "final_output_correlation": 0.9999152003815239,
       "layer_index": 22,
       "norm_tensor_key": "model.layers.22.input_layernorm.weight",
       "projection_evidence": [
@@ -2829,7 +2831,7 @@
             1280,
             1024
           ],
-          "projection_correlation": 0.9999999999999998,
+          "projection_correlation": 1.0,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -2877,7 +2879,7 @@
             1280,
             6912
           ],
-          "projection_correlation": 0.9999999999999998,
+          "projection_correlation": 0.999999980402948,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -2886,14 +2888,14 @@
           "tensor_key": "model.layers.22.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999881497438483,
+      "rms_correlation": 0.9999862685181572,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 153600,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9999469049258323,
+      "final_output_correlation": 0.9999137063242994,
       "layer_index": 23,
       "norm_tensor_key": "model.layers.23.input_layernorm.weight",
       "projection_evidence": [
@@ -2905,7 +2907,7 @@
             1024,
             1280
           ],
-          "projection_correlation": 0.9999999999999998,
+          "projection_correlation": 1.0,
           "row_blocks": 32,
           "shape": [
             1024,
@@ -2921,7 +2923,7 @@
             256,
             1280
           ],
-          "projection_correlation": 0.9999999999999998,
+          "projection_correlation": 1.0,
           "row_blocks": 8,
           "shape": [
             256,
@@ -2969,7 +2971,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999999999998,
+          "projection_correlation": 1.0,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -2985,7 +2987,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999999999999,
+          "projection_correlation": 1.0,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -3010,14 +3012,14 @@
           "tensor_key": "model.layers.23.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.999988606952063,
+      "rms_correlation": 0.9999860861889942,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 163840,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9999336781657109,
+      "final_output_correlation": 0.9998291906500097,
       "layer_index": 24,
       "norm_tensor_key": "model.layers.24.input_layernorm.weight",
       "projection_evidence": [
@@ -3093,7 +3095,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999999971687,
+          "projection_correlation": 1.0,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -3109,7 +3111,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999966298068,
+          "projection_correlation": 0.999999999823192,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -3134,14 +3136,14 @@
           "tensor_key": "model.layers.24.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999889205218384,
+      "rms_correlation": 0.999987859596057,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 174080,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     },
     {
-      "final_output_correlation": 0.9992285522967532,
+      "final_output_correlation": 0.999855389427823,
       "layer_index": 25,
       "norm_tensor_key": "model.layers.25.input_layernorm.weight",
       "projection_evidence": [
@@ -3153,7 +3155,7 @@
             1024,
             1280
           ],
-          "projection_correlation": 0.9999999999999998,
+          "projection_correlation": 1.0,
           "row_blocks": 32,
           "shape": [
             1024,
@@ -3233,7 +3235,7 @@
             6912,
             1280
           ],
-          "projection_correlation": 0.9999999962834387,
+          "projection_correlation": 0.9999999997126382,
           "row_blocks": 216,
           "shape": [
             6912,
@@ -3249,7 +3251,7 @@
             1280,
             6912
           ],
-          "projection_correlation": 0.9999999992340246,
+          "projection_correlation": 0.9999999980137843,
           "row_blocks": 40,
           "shape": [
             1152,
@@ -3258,15 +3260,15 @@
           "tensor_key": "model.layers.25.mlp.down_proj.weight"
         }
       ],
-      "rms_correlation": 0.9999885876964044,
+      "rms_correlation": 0.9999902376876322,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 184320,
       "timed_kernel_count": 0,
       "timed_kernel_seconds": 0.0
     }
   ],
-  "loop_wall_delta_pct_vs_paper_decode_tps_1k": 99.931398796657,
-  "measured_loop_seconds": 35.46716246602591,
+  "loop_wall_delta_pct_vs_paper_decode_tps_1k": 99.93206533572402,
+  "measured_loop_seconds": 35.81514754303498,
   "model_variant": "gemma3-1b",
   "norm_argument_mode": "selected-vector",
   "output_format": "elf",
@@ -3288,7 +3290,7 @@
       "raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges",
       "xrt-smi is available, but direct NPU rail parsing reports N/A on this host",
       "NPU rail is pseudo power: average package watts during timed window minus quiescent package watts before the run",
-      "quiescent_pkg_watts=9.444400",
+      "quiescent_pkg_watts=17.103450",
       "package watts use direct RAPL sysfs energy_uj delta over the timed window"
     ],
     "run_id": "gemma3_1b_decode_loop_probe",
@@ -3297,17 +3299,18 @@
     "watts": {
       "cpu": null,
       "gpu": null,
-      "npu": 7.673996082054266,
-      "total": 17.118396082054264
+      "npu": 0.47307117008857347,
+      "total": 17.576521170088572
     }
   },
   "prompt_context_length": 1024,
   "reference_check_layer_count": 26,
   "reference_check_mode": "all-layers-before-timing",
-  "reference_check_seconds": 36.813874263025355,
+  "reference_check_seconds": 37.129593910998665,
   "remaining_paper_gaps": [
     "prefill-kv-cache-not-constructed",
-    "paper-1k-kv-attention-production-cache-and-npu-reduction-not-wired",
+    "prefill-produced-kv-cache-not-wired",
+    "paper-1k-kv-attention-npu-reduction-not-wired",
     "logits-sampling-not-wired",
     "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
   ],
@@ -3323,20 +3326,20 @@
       "total": "RAPL_SYSFS_PACKAGE_SEGMENTED"
     },
     "notes": [
-      "quiescent_pkg_watts=44.236900",
+      "quiescent_pkg_watts=40.038210",
       "package watts use direct RAPL sysfs energy_uj deltas summed over NPU run.start/wait2 segments",
       "NPU rail is pseudo power: segmented package watts minus quiescent package watts before the run"
     ],
     "run_id": "gemma3_1b_decode_loop_probe_kernel_segments",
     "sampling_backend": "rapl-sysfs+segmented",
     "schema_version": 1,
-    "segmented_elapsed_seconds": 32.55751799599966,
-    "segmented_energy_delta_uj": 519949151,
+    "segmented_elapsed_seconds": 32.934816069493536,
+    "segmented_energy_delta_uj": 542750783,
     "watts": {
       "cpu": null,
       "gpu": null,
       "npu": 0.0,
-      "total": 15.970171653253363
+      "total": 16.47954498530607
     }
   },
   "sequence_kind": "decode-loop-staged-full-1b",
@@ -3345,18 +3348,18 @@
   "status": "DECODE_LOOP_DIAGNOSTIC_PASS",
   "stderr_tail": [],
   "stdout_tail": [
-    "decode token 0: final checksum=-38549.078125"
+    "decode token 0: final checksum=-8991.453125"
   ],
   "timed_kernel_count": 2158,
-  "timed_kernel_mean_seconds": 0.015086894344763513,
-  "timed_kernel_seconds": 32.55751799599966,
+  "timed_kernel_mean_seconds": 0.01526173126482555,
+  "timed_kernel_seconds": 32.934816069493536,
   "timing_notes": [
     "warmup layers compile/load ELF runners and allocate runner-owned BOs before measured loop timing",
     "preloaded-runner-bo-set mode allocates BO sets and writes packed projection static inputs before measured loop timing",
     "reference_check_seconds validates all layers before measured loop timing and is excluded from measured_loop_seconds",
     "measured_loop_seconds starts after warmup/reference checks and includes current implementation dynamic BO writes and output sync/readback",
     "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls and excludes compile, ELF load, BO allocation, BO writes, sync/readback, and CPU reference/correlation checks",
-    "attention is host-batched 1k tiled-stat FlowQKV NPU launches with host-side softmax-stat reduction over a synthetic repeated current-token KV cache",
+    "attention is host-batched 1k tiled-stat FlowQKV NPU launches with host-side softmax-stat reduction over a synthetic prefill-shaped KV cache",
     "logits and sampling are not wired, so this is a diagnostic decode-loop throughput, not an official paper decode TPS cell"
   ],
   "timing_window": "post-warmup-loop-wall-and-segmented-run-start-wait2"
