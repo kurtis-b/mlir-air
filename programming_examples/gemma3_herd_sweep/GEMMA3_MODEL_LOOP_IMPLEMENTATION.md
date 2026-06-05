@@ -137,14 +137,19 @@ Implemented files:
   multi-launch MLIR stitching pattern. It extracts launch bodies, prefixes SSA
   values/maps/symbols, deduplicates preserved Peano external declarations, and
   remaps launch operands into one public function.
+- `gemma3_padded_rms_norm.py`: Gemma3 decode activation bridge that computes
+  weighted RMSNorm for the real `1x1152` hidden vector and writes the padded
+  FusedDQP activation layout `5x256` with a zero-filled tail. This removes
+  host-side activation packing from the stitched decode ingress path.
 - `gemma3_stitched_decode.py`: active stitched-ELF decode track for real Gemma3
-  text inference. The first implemented slice is
-  `gemma3_decode_qkv_projection_core`, a three-launch stitched Q/K/V projection
-  core using full-column-block FusedDQP so host col-block accumulation is no
-  longer part of that slice's timed execution contract. The full ingress target
-  is `RMSNorm -> Q/K/V projections -> Q/K Norm -> RoPE`; it still needs padded
-  RMSNorm activation output and projection-output view bridges before it can be
-  compiled as one complete ingress ELF.
+  text inference. The current implemented slice is
+  `gemma3_decode_rms_qkv_projection_core`, a four-launch stitched
+  RMSNorm-padding plus Q/K/V projection core using full-column-block FusedDQP so
+  host activation packing and host col-block accumulation are no longer part of
+  that slice's timed execution contract. The full ingress target is
+  `RMSNorm -> Q/K/V projections -> Q/K Norm -> RoPE`; it still needs the
+  projection-output view bridge before Q/K norm and RoPE can be stitched into
+  one complete ingress ELF.
 - `gemma3_model_runner.py`: launch-order manifest that composes BO planning,
   static-preload planning, buffer bindings, argument layouts, and per-layer
   kernel/fallback wiring without claiming kernel execution.
@@ -162,10 +167,11 @@ The target decode ingress ELF is:
 RMSNorm -> Q/K/V projections -> Q/K Norm -> RoPE
 ```
 
-The first implemented stitched slice is the Q/K/V projection core:
+The current implemented stitched slice is RMSNorm-padding plus Q/K/V projection:
 
 ```text
-activation_padded:5x256
+layer_input:1x1152 + input_norm_weight:1152
+  -> padded RMSNorm bridge -> activation_padded:5x256
   -> q_proj full-col-block FusedDQP -> q:32x32
   -> k_proj full-col-block FusedDQP -> k:8x32
   -> v_proj full-col-block FusedDQP -> v:8x32
@@ -173,18 +179,16 @@ activation_padded:5x256
 
 This slice is intentionally shaped around the paper-style FusedDQP builder with
 `col_blocks=5`, not the older per-column-block diagnostic loop. It removes host
-accumulation from the projection slice and gives the stitched runtime one
-dispatch point for the three real Q/K/V projections. Current local evidence for
-this slice is a real generated MLIR parse pass and compile-only ELF pass for
-`gemma3_decode_qkv_projection_core` with seven public BO arguments and three
-stitched `air.launch` regions; it has not yet been run on hardware or compared
-against HF tensors.
+activation packing and host accumulation from the projection slice and gives the
+stitched runtime one dispatch point for real RMSNorm plus Q/K/V projection.
+Current local evidence is parse and compile-only ELF pass for both the standalone
+`gemma3_padded_rms_norm` bridge and the stitched
+`gemma3_decode_rms_qkv_projection_core` slice with nine public BO arguments and
+four stitched `air.launch` regions; it has not yet been run on hardware or
+compared against HF tensors.
 
 Remaining decode-ingress bridge work:
 
-- Add a padded RMSNorm activation bridge that consumes the real hidden vector
-  `1x1152` plus the layer norm vector and produces the FusedDQP activation
-  contract `5x256`, with zero padding outside the real 1152 values.
 - Add a projection-output view bridge from FusedDQP's contiguous output layouts
   `32x32` and `8x32` to Q/K norm layouts `4x256` and `1x256`.
 - Stitch Q/K norm and RoPE after the view bridge using the existing

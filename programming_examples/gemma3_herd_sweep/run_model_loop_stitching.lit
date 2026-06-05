@@ -1,5 +1,7 @@
 # RUN: %PYTHON %S/gemma3_stitching.py | FileCheck %s --check-prefix=STITCH
+# RUN: %PYTHON %S/gemma3_padded_rms_norm.py --self-test | FileCheck %s --check-prefix=PAD
 # RUN: %PYTHON %S/gemma3_stitched_decode.py --self-test | FileCheck %s --check-prefix=DECODE
 
 # STITCH: gemma3_stitching self-test status=PASS launches=2 args=3
-# DECODE: stitched_decode_plan model=gemma3-1b status=STITCHED_DECODE_TRACK_STARTED target=decode-ingress-rmsnorm-qkv-qknorm-rope implemented_slice=gemma3_decode_qkv_projection_core implemented_launches=3 target_launches=8 timing_policy=compile-load-bo-preload-arg-binding-outside-timed-region stages=rmsnorm_pad_activation:planned-bridge|qkv_projection_core:implemented-stitch-builder|projection_qk_views:planned-bridge|qk_norm_rope:planned-stitch remaining_bridges=rmsnorm-padded-activation-output,projection-output-qk-memref-view,qk-norm-rope-stitch-parse
+# PAD: gemma3_padded_rms_norm self-test status=PASS input=1x1152 output=5x256 padded_tail=128
+# DECODE: stitched_decode_plan model=gemma3-1b status=STITCHED_DECODE_TRACK_STARTED target=decode-ingress-rmsnorm-qkv-qknorm-rope implemented_slice=gemma3_decode_rms_qkv_projection_core implemented_launches=4 target_launches=8 timing_policy=compile-load-bo-preload-arg-binding-outside-timed-region stages=rmsnorm_pad_activation:implemented-compile-pass-bridge|qkv_projection_core:implemented-compile-pass-stitch|projection_qk_views:planned-bridge|qk_norm_rope:planned-stitch remaining_bridges=projection-output-qk-memref-view,qk-norm-rope-stitch-parse

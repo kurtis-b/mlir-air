@@ -5,19 +5,18 @@
 """Gemma3 stitched-ELF decode track.
 
 This file moves Gemma3 model bring-up away from one-operator diagnostic launches
-and toward Llama32-style stitched ELF subgraphs. The first implemented slice is
-the decode Q/K/V projection core: three full-column-block FusedDQP projections
-share the same padded activation input and are stitched into one public MLIR
-function with three `air.launch` regions.
+and toward Llama32-style stitched ELF subgraphs. The first implemented ingress
+slice is the decode RMSNorm-padding bridge plus Q/K/V projection core: one
+padded RMSNorm launch feeds three full-column-block FusedDQP projections in one
+public MLIR function with four `air.launch` regions.
 
 The full ingress target is:
 
   RMSNorm -> Q/K/V projections -> Q/K Norm -> RoPE
 
-That target needs two layout bridges before it can be compiled as one ELF:
+That target still needs one layout bridge before it can be compiled as one full
+ingress ELF:
 
-* RMSNorm must produce the FusedDQP activation contract `memref<5x256xbf16>`
-  from a real hidden vector `memref<1x1152xbf16>`.
 * FusedDQP projection outputs `memref<32x32xbf16>` / `memref<8x32xbf16>` must
   be viewed as Q/K norm inputs `memref<4x256xbf16>` / `memref<1x256xbf16>`.
 """
@@ -34,6 +33,7 @@ from gemma3_stitching import StitchSpec, stitch_module_text
 
 DEFAULT_MODEL = "gemma3-1b"
 DEFAULT_FUNCTION_NAME = "gemma3_decode_qkv_projection_core"
+DEFAULT_RMS_QKV_FUNCTION_NAME = "gemma3_decode_rms_qkv_projection_core"
 DEFAULT_OUTPUT_FORMAT = "elf"
 DEFAULT_FUSED_DQP_OBJECT = Path(__file__).with_name("build_peano") / "fused_dqp.o"
 
@@ -42,6 +42,18 @@ PROJECTION_CORE_ARG_TYPES = (
     "memref<2x4x5x5120xi8>",  # k packed Q4NX blocks, scale, min
     "memref<2x4x5x5120xi8>",  # v packed Q4NX blocks, scale, min
     "memref<5x256xbf16>",  # padded normalized activation
+    "memref<32x32xbf16>",  # q projection output, contiguous 1024 values
+    "memref<8x32xbf16>",  # k projection output, contiguous 256 values
+    "memref<8x32xbf16>",  # v projection output, contiguous 256 values
+)
+
+RMS_QKV_ARG_TYPES = (
+    "memref<1x1152xbf16>",  # hidden input
+    "memref<1152xbf16>",  # RMSNorm weight
+    "memref<5x256xbf16>",  # padded normalized activation
+    "memref<8x4x5x5120xi8>",  # q packed Q4NX blocks, scale, min
+    "memref<2x4x5x5120xi8>",  # k packed Q4NX blocks, scale, min
+    "memref<2x4x5x5120xi8>",  # v packed Q4NX blocks, scale, min
     "memref<32x32xbf16>",  # q projection output, contiguous 1024 values
     "memref<8x32xbf16>",  # k projection output, contiguous 256 values
     "memref<8x32xbf16>",  # v projection output, contiguous 256 values
@@ -70,7 +82,9 @@ class DecodeStitchPlan:
 
     @property
     def status(self) -> str:
-        return "STITCHED_DECODE_TRACK_STARTED" if self.remaining_bridges else "STITCHED_DECODE_INGRESS_READY"
+        if self.remaining_bridges:
+            return "STITCHED_DECODE_TRACK_STARTED"
+        return "STITCHED_DECODE_INGRESS_READY"
 
     def format(self) -> str:
         bridges = ",".join(self.remaining_bridges) if self.remaining_bridges else "none"
@@ -87,14 +101,14 @@ def build_decode_ingress_plan(model_variant: str = DEFAULT_MODEL) -> DecodeStitc
     stages = (
         DecodeStitchStage(
             "rmsnorm_pad_activation",
-            "planned-bridge",
+            "implemented-compile-pass-bridge",
             "layer_input:1x1152 + norm_weight:1152",
             "activation_padded:5x256",
-            "Needed to remove host activation padding before FusedDQP.",
+            "Padded RMSNorm bridge removes host activation packing before FusedDQP.",
         ),
         DecodeStitchStage(
             "qkv_projection_core",
-            "implemented-stitch-builder",
+            "implemented-compile-pass-stitch",
             "activation_padded:5x256 + q/k/v packed static BOs",
             "q:32x32 k:8x32 v:8x32",
             "Uses full-col-block FusedDQP so host col-block accumulation is not in the timed path.",
@@ -117,13 +131,12 @@ def build_decode_ingress_plan(model_variant: str = DEFAULT_MODEL) -> DecodeStitc
     return DecodeStitchPlan(
         model_variant=model_variant,
         target_subgraph="decode-ingress-rmsnorm-qkv-qknorm-rope",
-        implemented_slice=DEFAULT_FUNCTION_NAME,
-        implemented_launches=3,
+        implemented_slice=DEFAULT_RMS_QKV_FUNCTION_NAME,
+        implemented_launches=4,
         target_launches=8,
         timing_policy="compile-load-bo-preload-arg-binding-outside-timed-region",
         stages=stages,
         remaining_bridges=(
-            "rmsnorm-padded-activation-output",
             "projection-output-qk-memref-view",
             "qk-norm-rope-stitch-parse",
         ),
@@ -145,12 +158,7 @@ def _activate_builder_paths() -> None:
     sys.path.insert(0, herd_sweep)
 
 
-def build_projection_core_text(
-    *,
-    object_file: Path = DEFAULT_FUSED_DQP_OBJECT,
-    function_name: str = DEFAULT_FUNCTION_NAME,
-) -> str:
-    """Build combined MLIR text for the first stitched decode projection core."""
+def _projection_irs(object_file: Path) -> tuple[str, str, str]:
     _activate_builder_paths()
     from fused_dqp import build_paper_module
 
@@ -193,6 +201,16 @@ def build_projection_core_text(
             "direct",
         )
     )
+    return q_ir, k_ir, v_ir
+
+
+def build_projection_core_text(
+    *,
+    object_file: Path = DEFAULT_FUSED_DQP_OBJECT,
+    function_name: str = DEFAULT_FUNCTION_NAME,
+) -> str:
+    """Build combined MLIR text for the standalone Q/K/V projection core."""
+    q_ir, k_ir, v_ir = _projection_irs(object_file)
     return stitch_module_text(
         function_name=function_name,
         arg_types=PROJECTION_CORE_ARG_TYPES,
@@ -204,13 +222,60 @@ def build_projection_core_text(
     )
 
 
-def build_projection_core_module(*, object_file: Path = DEFAULT_FUSED_DQP_OBJECT):
-    """Build and parse the stitched Q/K/V projection-core MLIR module."""
+def build_rms_qkv_text(
+    *,
+    object_file: Path = DEFAULT_FUSED_DQP_OBJECT,
+    function_name: str = DEFAULT_RMS_QKV_FUNCTION_NAME,
+) -> str:
+    """Build combined MLIR text for RMSNorm-padding plus Q/K/V projections."""
+    _activate_builder_paths()
+    from gemma3_padded_rms_norm import build_module as build_padded_rms
+
+    rms_ir = str(build_padded_rms())
+    q_ir, k_ir, v_ir = _projection_irs(object_file)
+    return stitch_module_text(
+        function_name=function_name,
+        arg_types=RMS_QKV_ARG_TYPES,
+        specs=(
+            StitchSpec(rms_ir, "r", {0: 0, 1: 1, 2: 2}),
+            StitchSpec(q_ir, "q", {0: 3, 1: 2, 2: 6}),
+            StitchSpec(k_ir, "k", {0: 4, 1: 2, 2: 7}),
+            StitchSpec(v_ir, "v", {0: 5, 1: 2, 2: 8}),
+        ),
+    )
+
+
+def _parse_module(text: str):
     from air.ir import Context, Module
 
-    text = build_projection_core_text(object_file=object_file)
     with Context() as ctx:
         return Module.parse(text, ctx)
+
+
+def build_projection_core_module(*, object_file: Path = DEFAULT_FUSED_DQP_OBJECT):
+    """Build and parse the stitched Q/K/V projection-core MLIR module."""
+    return _parse_module(build_projection_core_text(object_file=object_file))
+
+
+def build_rms_qkv_module(*, object_file: Path = DEFAULT_FUSED_DQP_OBJECT):
+    """Build and parse the stitched RMSNorm-padding plus Q/K/V MLIR module."""
+    return _parse_module(build_rms_qkv_text(object_file=object_file))
+
+
+def _compile_module(module, *, instance_name: str, output_binary_name: str):
+    from air.backend.xrt import XRTBackend
+
+    backend = XRTBackend(
+        verbose=False,
+        omit_while_true_loop=False,
+        output_format=DEFAULT_OUTPUT_FORMAT,
+        instance_name=instance_name,
+        target_device="npu2",
+        runtime_loop_tiling_sizes=[4, 4],
+    )
+    artifact = backend.compile(module, output_binary_name=output_binary_name)
+    backend.unload()
+    return artifact
 
 
 def compile_projection_core(
@@ -219,20 +284,24 @@ def compile_projection_core(
     output_binary_name: str = DEFAULT_FUNCTION_NAME,
 ):
     """Compile the projection core as an ELF artifact. Does not run hardware."""
-    from air.backend.xrt import XRTBackend
-
-    module = build_projection_core_module(object_file=object_file)
-    backend = XRTBackend(
-        verbose=False,
-        omit_while_true_loop=False,
-        output_format=DEFAULT_OUTPUT_FORMAT,
+    return _compile_module(
+        build_projection_core_module(object_file=object_file),
         instance_name=DEFAULT_FUNCTION_NAME,
-        target_device="npu2",
-        runtime_loop_tiling_sizes=[4, 4],
+        output_binary_name=output_binary_name,
     )
-    artifact = backend.compile(module, output_binary_name=output_binary_name)
-    backend.unload()
-    return artifact
+
+
+def compile_rms_qkv(
+    *,
+    object_file: Path = DEFAULT_FUSED_DQP_OBJECT,
+    output_binary_name: str = DEFAULT_RMS_QKV_FUNCTION_NAME,
+):
+    """Compile the RMSNorm-padding plus Q/K/V stitched slice as an ELF artifact."""
+    return _compile_module(
+        build_rms_qkv_module(object_file=object_file),
+        instance_name=DEFAULT_RMS_QKV_FUNCTION_NAME,
+        output_binary_name=output_binary_name,
+    )
 
 
 def _projection_core_text_self_test() -> None:
@@ -266,10 +335,12 @@ def _projection_core_text_self_test() -> None:
 def _self_test() -> None:
     _projection_core_text_self_test()
     plan = build_decode_ingress_plan()
-    if plan.implemented_launches != 3 or plan.target_launches != 8:
+    if plan.implemented_launches != 4 or plan.target_launches != 8:
         raise AssertionError("unexpected stitched decode launch counts")
-    if "rmsnorm-padded-activation-output" not in plan.remaining_bridges:
-        raise AssertionError("missing padded RMSNorm bridge blocker")
+    if "rmsnorm-padded-activation-output" in plan.remaining_bridges:
+        raise AssertionError("padded RMSNorm bridge should be implemented")
+    if "projection-output-qk-memref-view" not in plan.remaining_bridges:
+        raise AssertionError("missing projection output view bridge blocker")
     print(plan.format())
 
 
@@ -278,8 +349,11 @@ def main() -> None:
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--print-plan", action="store_true")
     parser.add_argument("--print-projection-core-mlir", action="store_true")
+    parser.add_argument("--print-rms-qkv-mlir", action="store_true")
     parser.add_argument("--parse-projection-core", action="store_true")
+    parser.add_argument("--parse-rms-qkv", action="store_true")
     parser.add_argument("--compile-projection-core", action="store_true")
+    parser.add_argument("--compile-rms-qkv", action="store_true")
     parser.add_argument("--object-file", type=Path, default=DEFAULT_FUSED_DQP_OBJECT)
     args = parser.parse_args()
 
@@ -292,11 +366,21 @@ def main() -> None:
     if args.print_projection_core_mlir:
         print(build_projection_core_text(object_file=args.object_file))
         return
+    if args.print_rms_qkv_mlir:
+        print(build_rms_qkv_text(object_file=args.object_file))
+        return
     if args.parse_projection_core:
         build_projection_core_module(object_file=args.object_file)
         print(
             f"stitched_decode_projection_core status=PARSE_PASS function={DEFAULT_FUNCTION_NAME} "
             f"launches=3 args={len(PROJECTION_CORE_ARG_TYPES)} output_format={DEFAULT_OUTPUT_FORMAT}"
+        )
+        return
+    if args.parse_rms_qkv:
+        build_rms_qkv_module(object_file=args.object_file)
+        print(
+            f"stitched_decode_rms_qkv status=PARSE_PASS function={DEFAULT_RMS_QKV_FUNCTION_NAME} "
+            f"launches=4 args={len(RMS_QKV_ARG_TYPES)} output_format={DEFAULT_OUTPUT_FORMAT}"
         )
         return
     if args.compile_projection_core:
@@ -306,7 +390,18 @@ def main() -> None:
             f"output={artifact.output_binary}"
         )
         return
-    parser.error("pass --self-test, --print-plan, --print-projection-core-mlir, --parse-projection-core, or --compile-projection-core")
+    if args.compile_rms_qkv:
+        artifact = compile_rms_qkv(object_file=args.object_file)
+        print(
+            f"stitched_decode_rms_qkv status=COMPILE_PASS function={DEFAULT_RMS_QKV_FUNCTION_NAME} "
+            f"output={artifact.output_binary}"
+        )
+        return
+    parser.error(
+        "pass --self-test, --print-plan, --print-projection-core-mlir, "
+        "--print-rms-qkv-mlir, --parse-projection-core, --parse-rms-qkv, "
+        "--compile-projection-core, or --compile-rms-qkv"
+    )
 
 
 if __name__ == "__main__":
