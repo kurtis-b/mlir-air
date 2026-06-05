@@ -16,6 +16,9 @@ comparison. The result records exactly which timing windows are measured.
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import os
+import subprocess
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
@@ -31,7 +34,9 @@ from gemma3_full_layer_probe import (
     ProjectionEvidence,
     _ReusableElfRunnerCache,
     _SegmentedRAPLPowerMeter,
+    _aie_api_include,
     _ceil_to,
+    _dataflow_dir,
     _prepared_static_arg,
     _geglu,
     _norm_tensor_keys,
@@ -67,6 +72,9 @@ DEFAULT_LOOP_PROBE_EVIDENCE = (
     Path(__file__).with_name("results") / "gemma3_1b_decode_loop_probe.json"
 )
 PAPER_DECODE_TPS_1K = 41.1
+DEFAULT_ATTENTION_MODE = "single-token"
+DEFAULT_TILED_ATTENTION_KV_TILE = 32
+DEFAULT_TILED_ATTENTION_HOST_BATCH_TILES = 2
 
 
 @dataclass(frozen=True)
@@ -106,6 +114,12 @@ class Gemma3DecodeLoopProbeResult:
     reference_check_mode: str
     reference_check_layer_count: int
     reference_check_seconds: float | None
+    attention_mode: str
+    attention_cache_contract: str
+    attention_kv_tile: int | None
+    attention_host_batch_tiles: int | None
+    attention_host_batch_count: int | None
+    attention_host_reduction: bool
     host_fallbacks: tuple[str, ...]
     timed_kernel_count: int
     timed_kernel_seconds: float | None
@@ -146,6 +160,7 @@ class Gemma3DecodeLoopProbeResult:
             f"output_format={self.output_format} runner_reuse={self.runner_reuse_mode} "
             f"norm_arg={self.norm_argument_mode} static_projection_arg={self.static_projection_argument_mode} "
             f"static_projection_bo_sets={self.static_projection_bo_set_count} "
+            f"attention_mode={self.attention_mode} attention_cache={self.attention_cache_contract} "
             f"timed_kernel_count={self.timed_kernel_count} "
             f"timed_kernel_seconds={self._value_text(self.timed_kernel_seconds)} "
             f"measured_loop_seconds={self._value_text(self.measured_loop_seconds)} "
@@ -323,6 +338,179 @@ def _projection_output_shape(plan: _PackedProjectionPlan) -> tuple[int, int]:
     return (int(plan.row_blocks), 32)
 
 
+def _compile_flowqkv_tiled_stats_kernel(
+    object_file: Path,
+    *,
+    q_chunk: int = 4,
+    kv_tile: int = DEFAULT_TILED_ATTENTION_KV_TILE,
+    head_dim: int = 256,
+) -> None:
+    peano = os.environ.get("PEANO_INSTALL_DIR")
+    if not peano:
+        raise RuntimeError("PEANO_INSTALL_DIR is required to compile flow_attention_stats.cc")
+    clangxx = Path(peano) / "bin/clang++"
+    if not clangxx.exists():
+        raise RuntimeError(f"missing Peano clang++: {clangxx}")
+    src = _dataflow_dir() / "flow_attention_stats.cc"
+    object_file.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        str(clangxx),
+        "-O2",
+        "-std=c++20",
+        "--target=aie2p-none-unknown-elf",
+        "-Wno-parentheses",
+        "-Wno-attributes",
+        "-Wno-macro-redefined",
+        "-Wno-empty-body",
+        "-DNDEBUG",
+        "-I",
+        str(_aie_api_include()),
+        f"-DQ_CHUNK={int(q_chunk)}",
+        f"-DKV_TILE={int(kv_tile)}",
+        f"-DHEAD_DIM={int(head_dim)}",
+        "-c",
+        str(src),
+        "-o",
+        str(object_file),
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def _flowqkv_tiled_stats_helpers():
+    dataflow_dir = _dataflow_dir()
+    if str(dataflow_dir) not in sys.path:
+        sys.path.insert(0, str(dataflow_dir))
+    module_path = dataflow_dir / "flowqkv_tiled_stats.py"
+    spec = importlib.util.spec_from_file_location("gemma3_dataflow_flowqkv_tiled_stats", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load flowqkv_tiled_stats.py from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.build_tiled_stats_module, module.merge_tiled_stats
+
+
+def _run_tiled_stats_attention_stage(
+    *,
+    q,
+    k,
+    v,
+    object_file: Path,
+    runner_cache: _ReusableElfRunnerCache,
+    prompt_context_length: int,
+    kv_tile: int,
+    host_batch_tiles: int,
+    timed_kernel_seconds: list[float] | None = None,
+    power_meter=None,
+):
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    dataflow_dir = _dataflow_dir()
+    if str(dataflow_dir) not in sys.path:
+        sys.path.insert(0, str(dataflow_dir))
+    from common import attention_reference
+
+    if prompt_context_length % kv_tile != 0:
+        raise RuntimeError("--prompt-context-length must be divisible by tiled attention kv tile")
+    if host_batch_tiles <= 0:
+        raise RuntimeError("--tiled-attention-host-batch-tiles must be positive")
+    tile_count = prompt_context_length // kv_tile
+    if tile_count % host_batch_tiles != 0:
+        raise RuntimeError("tiled attention tile count must be divisible by host batch tiles")
+    if not object_file.exists():
+        _compile_flowqkv_tiled_stats_kernel(object_file, q_chunk=4, kv_tile=kv_tile, head_dim=256)
+    build_tiled_stats_module, merge_tiled_stats = _flowqkv_tiled_stats_helpers()
+
+    q_single = q.reshape(4, 256).astype(bfloat16)
+    k_full = np.broadcast_to(k.reshape(1, 256).astype(bfloat16), (prompt_context_length, 256)).copy()
+    v_full = np.broadcast_to(v.reshape(1, 256).astype(bfloat16), (prompt_context_length, 256)).copy()
+    q_tiles = np.broadcast_to(q_single, (tile_count, 4, 256)).copy()
+    k_tiles = k_full.reshape(tile_count, kv_tile, 256).copy()
+    v_tiles = v_full.reshape(tile_count, kv_tile, 256).copy()
+    module = build_tiled_stats_module(
+        4,
+        kv_tile,
+        256,
+        "flowqkv_tile_stats_bf16",
+        str(object_file),
+        host_batch_tiles,
+        1,
+        host_batch_tiles,
+        "direct",
+    )
+    stats = np.zeros((tile_count, 4, 258), dtype=np.float32)
+    for batch_start in range(0, tile_count, host_batch_tiles):
+        batch_end = batch_start + host_batch_tiles
+        batch_stats = runner_cache.run(
+            key=("flowqkv_tiled_stats", 4, kv_tile, 256, host_batch_tiles, "direct"),
+            mlir_module=module,
+            backend_options=dict(
+                verbose=False,
+                omit_pingpong=True,
+                output_format=DEFAULT_OUTPUT_FORMAT,
+                instance_name="flowqkv_tiled_stats",
+                target_device="npu2",
+                runtime_loop_tiling_sizes=[1, 1],
+            ),
+            inputs=[
+                q_tiles[batch_start:batch_end],
+                k_tiles[batch_start:batch_end],
+                v_tiles[batch_start:batch_end],
+            ],
+            output_shape=(host_batch_tiles, 4, 258),
+            output_dtype=np.float32,
+            timed_kernel_seconds=timed_kernel_seconds,
+            power_meter=power_meter,
+        )
+        stats[batch_start:batch_end] = batch_stats.reshape(host_batch_tiles, 4, 258)
+
+    actual = merge_tiled_stats(stats).reshape(1024).astype(bfloat16)
+    expected = attention_reference(q_single, k_full, v_full).reshape(1024).astype(bfloat16)
+    return actual, expected
+
+
+def _run_attention_stage(
+    *,
+    mode: str,
+    q,
+    k,
+    v,
+    single_token_object_file: Path,
+    tiled_stats_object_file: Path,
+    runner_cache: _ReusableElfRunnerCache,
+    prompt_context_length: int,
+    tiled_attention_kv_tile: int,
+    tiled_attention_host_batch_tiles: int,
+    timed_kernel_seconds: list[float] | None = None,
+    power_meter=None,
+):
+    if mode == "single-token":
+        return _run_single_token_attention_stage(
+            q=q,
+            k=k,
+            v=v,
+            object_file=single_token_object_file,
+            runner_cache=runner_cache,
+            timed_kernel_seconds=timed_kernel_seconds,
+            power_meter=power_meter,
+        )
+    if mode == "tiled-stats-1k":
+        return _run_tiled_stats_attention_stage(
+            q=q,
+            k=k,
+            v=v,
+            object_file=tiled_stats_object_file,
+            runner_cache=runner_cache,
+            prompt_context_length=prompt_context_length,
+            kv_tile=tiled_attention_kv_tile,
+            host_batch_tiles=tiled_attention_host_batch_tiles,
+            timed_kernel_seconds=timed_kernel_seconds,
+            power_meter=power_meter,
+        )
+    raise RuntimeError(f"unsupported attention mode: {mode}")
+
+
+
 def _preload_static_projection_bo_sets(
     projection_plans: dict[int, dict[str, _PackedProjectionPlan]],
     runner_cache: _ReusableElfRunnerCache,
@@ -418,6 +606,11 @@ def _run_one_layer(
     static_projection_argument_mode: str,
     rope_object_file: Path,
     flowqkv_object_file: Path,
+    tiled_stats_object_file: Path,
+    attention_mode: str,
+    prompt_context_length: int,
+    tiled_attention_kv_tile: int,
+    tiled_attention_host_batch_tiles: int,
     check_references: bool = True,
 ) -> tuple[Any, LayerLoopEvidence, list[str]]:
     from ml_dtypes import bfloat16
@@ -520,22 +713,23 @@ def _run_one_layer(
     if check_references and _correlation(k_rope_actual, k_rope_expected) < DEFAULT_THRESHOLD:
         blockers.append(f"L{layer_index}:rope-k-correlation-low")
 
-    attention_actual, attention_reference = _run_single_token_attention_stage(
+    attention_actual, attention_reference = _run_attention_stage(
+        mode=attention_mode,
         q=q_rope_actual,
         k=k_rope_actual,
         v=v_actual,
-        object_file=flowqkv_object_file,
+        single_token_object_file=flowqkv_object_file,
+        tiled_stats_object_file=tiled_stats_object_file,
         runner_cache=runner_cache,
+        prompt_context_length=prompt_context_length,
+        tiled_attention_kv_tile=tiled_attention_kv_tile,
+        tiled_attention_host_batch_tiles=tiled_attention_host_batch_tiles,
         timed_kernel_seconds=timed_kernel_seconds,
         power_meter=power_meter,
     )
-    attention_expected = (
-        np.tile(v_expected.reshape(1, 256), (4, 1)).reshape(1024).astype(bfloat16)
-        if check_references
-        else attention_actual
-    )
+    attention_expected = attention_reference if check_references else attention_actual
     if check_references and (_correlation(attention_actual, attention_reference) < DEFAULT_THRESHOLD or _correlation(attention_actual, attention_expected) < DEFAULT_THRESHOLD):
-        blockers.append(f"L{layer_index}:single-token-attention-correlation-low")
+        blockers.append(f"L{layer_index}:{attention_mode}-attention-correlation-low")
 
     o_actual, o_expected, evidence = _run_packed_projection(
         projection_plans["o_proj"], attention_actual, runner_cache, timed_kernel_seconds, power_meter, static_projection_argument_mode, check_references=check_references
@@ -704,11 +898,14 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             raise RuntimeError("decode loop probe currently supports gemma3-1b only")
         if args.layers <= 0:
             raise RuntimeError("--layers must be positive")
+        if args.attention_mode == "tiled-stats-1k" and args.prompt_context_length != 1024:
+            raise RuntimeError("tiled-stats-1k attention mode currently requires --prompt-context-length=1024")
         weights_dir = _resolve_weights_dir(args.model_variant, args.weights_dir)
         norm_plans, projection_plans = _prepare_layer_plans(args.model_variant, weights_dir, args.layers)
         peano_build_dir = Path(__file__).with_name("build_peano")
         rope_object_file = peano_build_dir / "rope_halfsplit.o"
         flowqkv_object_file = peano_build_dir / "flowqkv_single_token_q4_kv1_d256.o"
+        tiled_stats_object_file = peano_build_dir / "flowqkv_tiled_stats_q4_kv32_d256.o"
         runner_cache = _ReusableElfRunnerCache(enabled=not args.no_reuse_elf)
         runner_cache.__enter__()
         static_projection_argument_mode = (
@@ -733,6 +930,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 static_projection_argument_mode=static_projection_argument_mode,
                 rope_object_file=rope_object_file,
                 flowqkv_object_file=flowqkv_object_file,
+                tiled_stats_object_file=tiled_stats_object_file,
+                attention_mode=args.attention_mode,
+                prompt_context_length=args.prompt_context_length,
+                tiled_attention_kv_tile=args.tiled_attention_kv_tile,
+                tiled_attention_host_batch_tiles=args.tiled_attention_host_batch_tiles,
             )
             if warmup_blockers:
                 blockers.extend(f"warmup:{item}" for item in warmup_blockers)
@@ -750,6 +952,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 static_projection_argument_mode=static_projection_argument_mode,
                 rope_object_file=rope_object_file,
                 flowqkv_object_file=flowqkv_object_file,
+                tiled_stats_object_file=tiled_stats_object_file,
+                attention_mode=args.attention_mode,
+                prompt_context_length=args.prompt_context_length,
+                tiled_attention_kv_tile=args.tiled_attention_kv_tile,
+                tiled_attention_host_batch_tiles=args.tiled_attention_host_batch_tiles,
                 check_references=True,
             )
             layer_evidence.append(evidence)
@@ -776,6 +983,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                     static_projection_argument_mode=static_projection_argument_mode,
                     rope_object_file=rope_object_file,
                     flowqkv_object_file=flowqkv_object_file,
+                    tiled_stats_object_file=tiled_stats_object_file,
+                    attention_mode=args.attention_mode,
+                    prompt_context_length=args.prompt_context_length,
+                    tiled_attention_kv_tile=args.tiled_attention_kv_tile,
+                    tiled_attention_host_batch_tiles=args.tiled_attention_host_batch_tiles,
                     check_references=False,
                 )
                 blockers.extend(layer_blockers)
@@ -797,7 +1009,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
     kernel_tps = (args.decode_tokens / timed_total) if timed_total and timed_total > 0.0 else None
     status = "DECODE_LOOP_DIAGNOSTIC_PASS" if not blockers else "DECODE_LOOP_DIAGNOSTIC_BLOCKED"
     return Gemma3DecodeLoopProbeResult(
-        schema_version=1,
+        schema_version=2,
         model_variant=args.model_variant,
         status=status,
         sequence_kind=DEFAULT_SEQUENCE_KIND,
@@ -816,6 +1028,22 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         reference_check_mode="all-layers-before-timing",
         reference_check_layer_count=reference_check_layer_count,
         reference_check_seconds=reference_check_seconds,
+        attention_mode=args.attention_mode,
+        attention_cache_contract=(
+            "synthetic-repeated-current-token-kv-cache"
+            if args.attention_mode == "tiled-stats-1k"
+            else "single-current-token-kv"
+        ),
+        attention_kv_tile=(args.tiled_attention_kv_tile if args.attention_mode == "tiled-stats-1k" else None),
+        attention_host_batch_tiles=(
+            args.tiled_attention_host_batch_tiles if args.attention_mode == "tiled-stats-1k" else None
+        ),
+        attention_host_batch_count=(
+            (args.prompt_context_length // args.tiled_attention_kv_tile) // args.tiled_attention_host_batch_tiles
+            if args.attention_mode == "tiled-stats-1k"
+            else None
+        ),
+        attention_host_reduction=(args.attention_mode == "tiled-stats-1k"),
         host_fallbacks=(),
         timed_kernel_count=len(timed_kernel_samples),
         timed_kernel_seconds=timed_total,
@@ -833,7 +1061,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             "reference_check_seconds validates all layers before measured loop timing and is excluded from measured_loop_seconds",
             "measured_loop_seconds starts after warmup/reference checks and includes current implementation dynamic BO writes and output sync/readback",
             "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls and excludes compile, ELF load, BO allocation, BO writes, sync/readback, and CPU reference/correlation checks",
-            "attention is the staged single-token FlowQKV NPU path, not paper 1k KV-cache attention",
+            (
+                "attention is the staged single-token FlowQKV NPU path, not paper 1k KV-cache attention"
+                if args.attention_mode == "single-token"
+                else "attention is host-batched 1k tiled-stat FlowQKV NPU launches with host-side softmax-stat reduction over a synthetic repeated current-token KV cache"
+            ),
             "logits and sampling are not wired, so this is a diagnostic decode-loop throughput, not an official paper decode TPS cell",
         ),
         power_snapshot=power_snapshot,
@@ -841,7 +1073,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         layer_evidence=tuple(layer_evidence),
         remaining_paper_gaps=(
             "prefill-kv-cache-not-constructed",
-            "paper-1k-kv-attention-not-wired",
+            (
+                "paper-1k-kv-attention-not-wired"
+                if args.attention_mode == "single-token"
+                else "paper-1k-kv-attention-production-cache-and-npu-reduction-not-wired"
+            ),
             "logits-sampling-not-wired",
             "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route",
         ),
@@ -869,7 +1105,7 @@ def _self_test() -> None:
         timed_kernel_seconds=0.15,
     )
     result = Gemma3DecodeLoopProbeResult(
-        schema_version=1,
+        schema_version=2,
         model_variant=DEFAULT_MODEL,
         status="DECODE_LOOP_DIAGNOSTIC_PASS",
         sequence_kind=DEFAULT_SEQUENCE_KIND,
@@ -888,6 +1124,12 @@ def _self_test() -> None:
         reference_check_mode="all-layers-before-timing",
         reference_check_layer_count=26,
         reference_check_seconds=1.0,
+        attention_mode=DEFAULT_ATTENTION_MODE,
+        attention_cache_contract="single-current-token-kv",
+        attention_kv_tile=None,
+        attention_host_batch_tiles=None,
+        attention_host_batch_count=None,
+        attention_host_reduction=False,
         host_fallbacks=(),
         timed_kernel_count=1482,
         timed_kernel_seconds=3.9,
@@ -931,6 +1173,9 @@ def main() -> int:
     parser.add_argument("--warmup-layers", type=int, default=1)
     parser.add_argument("--result-json", type=Path)
     parser.add_argument("--power-sample", action="store_true")
+    parser.add_argument("--attention-mode", choices=["single-token", "tiled-stats-1k"], default=DEFAULT_ATTENTION_MODE)
+    parser.add_argument("--tiled-attention-kv-tile", type=int, default=DEFAULT_TILED_ATTENTION_KV_TILE)
+    parser.add_argument("--tiled-attention-host-batch-tiles", type=int, default=DEFAULT_TILED_ATTENTION_HOST_BATCH_TILES)
     parser.add_argument("--dynamic-static-weight-writes", action="store_true", help="diagnostic fallback: write packed projection static inputs inside each launch")
     parser.add_argument("--no-reuse-elf", action="store_true")
     args = parser.parse_args()
