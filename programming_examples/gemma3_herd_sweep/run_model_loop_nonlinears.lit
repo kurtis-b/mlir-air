@@ -8,8 +8,8 @@
 # CHECK: nonlinear rope status=standalone-npu-reuse-candidate
 # CHECK-SAME: compile_lit=programming_examples/gemma3_dataflow_kernels/run_rope_halfsplit_compile_only.lit
 # CHECK-SAME: hardware=hardware-smoke-pass-rows4-head256-elf
-# CHECK: nonlinear mlp_activation status=gemma-specific-compile-only-candidate
-# CHECK-SAME: hardware=hardware-smoke-pass-n1024-tile256-elf
+# CHECK: nonlinear mlp_activation status=standalone-npu-reuse-candidate
+# CHECK-SAME: hardware=hardware-smoke-pass-n6912-tile288-elf
 # CHECK-SAME: tolerance=rtol=1e-1 atol=5e-2 hardware-smoke
 # CHECK: nonlinear residual_add status=standalone-npu-reuse-candidate
 # CHECK-SAME: hardware=hardware-smoke-pass-n1152-tile288-elf

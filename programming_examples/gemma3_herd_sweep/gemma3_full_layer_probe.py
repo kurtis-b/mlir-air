@@ -6,10 +6,10 @@
 
 This diagnostic wires one Gemma3 1B decode layer pass with real weights. The
 projection stages launch on the NPU through the FusedDQP column-block route;
-RoPE and residual adds launch through Gemma standalone wrappers; the
-remaining nonlinear/vector stages are explicit host fallbacks. This is full-layer
-staged correctness evidence, not a full model loop, TTFT/TPS timing, pseudo-NPU
-power, or a paper-parity result.
+RMSNorm/QK-Norm, RoPE, GeGLU, and residual adds launch through Gemma standalone
+wrappers; single-token attention remains an explicit host fallback. This is
+full-layer staged correctness evidence, not a full model loop, TTFT/TPS timing,
+pseudo-NPU power, or a paper-parity result.
 """
 
 from __future__ import annotations
@@ -962,6 +962,52 @@ def _run_residual_stage(
     return actual.reshape(lhs.shape).astype(bfloat16), expected.reshape(lhs.shape).astype(bfloat16)
 
 
+def _geglu_module_helpers():
+    dataflow_dir = _dataflow_dir()
+    if str(dataflow_dir) not in sys.path:
+        sys.path.insert(0, str(dataflow_dir))
+    from geglu import build_module, geglu_reference
+
+    return build_module, geglu_reference
+
+
+def _run_geglu_stage(
+    *,
+    name: str,
+    gate,
+    up,
+    runner_cache: _ReusableElfRunnerCache,
+    timed_kernel_seconds: list[float] | None = None,
+    power_meter=None,
+):
+    from ml_dtypes import bfloat16
+
+    build_module, geglu_reference = _geglu_module_helpers()
+    gate_flat = gate.reshape(-1).astype(bfloat16)
+    up_flat = up.reshape(-1).astype(bfloat16)
+    n = int(gate_flat.size)
+    tile_n = 288 if n % (288 * 2) == 0 else max(16, n // 2)
+    module = build_module(n, tile_n, bfloat16, 16)
+    actual = runner_cache.run(
+        key=("geglu", name, n, tile_n),
+        mlir_module=module,
+        backend_options=dict(
+            verbose=False,
+            omit_while_true_loop=False,
+            output_format=DEFAULT_OUTPUT_FORMAT,
+            instance_name="gemma3_geglu",
+            runtime_loop_tiling_sizes=[4, 4],
+        ),
+        inputs=[gate_flat, up_flat],
+        output_shape=(n,),
+        output_dtype=bfloat16,
+        timed_kernel_seconds=timed_kernel_seconds,
+        power_meter=power_meter,
+    )
+    expected = geglu_reference(gate_flat, up_flat)
+    return actual.reshape(gate.shape).astype(bfloat16), expected.reshape(gate.shape).astype(bfloat16)
+
+
 def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResult:
     _activate_probe_env()
     import numpy as np
@@ -1221,9 +1267,18 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
             stdout_lines.append(f"{fam} correlation: {ev.projection_correlation:.6f}")
             if ev.projection_correlation is None or ev.projection_correlation < DEFAULT_THRESHOLD:
                 blockers.append(f"decode-{fam}-correlation-low")
-        mlp_actual = _geglu(gate_actual, up_actual)
+        mlp_actual, mlp_reference = _run_geglu_stage(
+            name="mlp_activation",
+            gate=gate_actual,
+            up=up_actual,
+            runner_cache=runner_cache,
+            timed_kernel_seconds=timed_kernel_samples,
+            power_meter=power_meter,
+        )
         mlp_expected = _geglu(gate_expected, up_expected)
         mlp_activation_correlation = _correlation(mlp_actual, mlp_expected)
+        if _correlation(mlp_actual, mlp_reference) < DEFAULT_THRESHOLD:
+            blockers.append("decode-mlp-activation-correlation-low")
 
         down_actual, down_expected, _, down_evidence = _run_projection(
             family="down_proj",
@@ -1341,7 +1396,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         norm_tensor_keys=norm_tensor_keys,
         projection_tensor_keys=projection_keys,
         projection_weight_layout="fused-dqp-paper-repacked-full-layer-colblock-loop",
-        host_fallbacks=("single_token_attention", "mlp_activation"),
+        host_fallbacks=("single_token_attention",),
         input_distribution=DEFAULT_INPUT_DISTRIBUTION,
         rms_correlation=rms_correlation,
         projection_evidence=tuple(projection_evidence),
@@ -1420,7 +1475,7 @@ def _self_test() -> None:
         norm_tensor_keys=NORM_TENSOR_KEYS,
         projection_tensor_keys={family: f"model.layers.0.fixture.{family}.weight" for family in FULL_LAYER_PROJECTION_FAMILIES},
         projection_weight_layout="fused-dqp-paper-repacked-full-layer-colblock-loop",
-        host_fallbacks=("single_token_attention", "mlp_activation"),
+        host_fallbacks=("single_token_attention",),
         input_distribution=DEFAULT_INPUT_DISTRIBUTION,
         rms_correlation=0.999991,
         projection_evidence=projection_evidence,

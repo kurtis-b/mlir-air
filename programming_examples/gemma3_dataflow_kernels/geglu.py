@@ -12,6 +12,8 @@ recorded for the target shape.
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 
 import numpy as np
 from ml_dtypes import bfloat16
@@ -160,6 +162,24 @@ def _self_test() -> None:
     print("GEMMA3_GEGLU_REFERENCE_SELF_TEST: PASS")
 
 
+def _write_result_json(args, *, status: str, returncode: int) -> None:
+    if args.result_json is None:
+        return
+    result = {
+        "schema_version": 1,
+        "kernel": "gemma3_geglu",
+        "status": status,
+        "returncode": int(returncode),
+        "n": int(args.n),
+        "tile_n": int(args.tile_n),
+        "vector_size": int(args.vector_size),
+        "compile_mode": args.compile_mode,
+        "output_format": args.output_format,
+        "tolerance": {"rtol": 0.1, "atol": 0.05},
+    }
+    args.result_json.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Gemma3 GeGLU nonlinear kernel")
     parser.add_argument("--self-test", action="store_true")
@@ -177,6 +197,7 @@ def main() -> int:
         choices=["xclbin", "elf"],
         default="elf",
     )
+    parser.add_argument("--result-json", type=Path)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -202,6 +223,7 @@ def main() -> int:
         )
         backend.compile(mlir_module)
         backend.unload()
+        _write_result_json(args, status="COMPILE_ONLY_PASS", returncode=0)
         print("GEMMA3_GEGLU_COMPILE_ONLY: PASS")
         return 0
 
@@ -219,13 +241,21 @@ def main() -> int:
         instance_name="gemma3_geglu",
         runtime_loop_tiling_sizes=[4, 4],
     )
-    return runner.run_test(
+    returncode = runner.run_test(
         mlir_module,
         inputs=[gate, up],
         stochastic_expected_outputs=[sampled_data],
         rtol=1e-1,
         atol=5e-2,
     )
+    _write_result_json(
+        args,
+        status="HARDWARE_SMOKE_PASS" if returncode == 0 else "HARDWARE_SMOKE_FAIL",
+        returncode=returncode,
+    )
+    if returncode == 0:
+        print("GEMMA3_GEGLU_HARDWARE_SMOKE: PASS")
+    return returncode
 
 
 if __name__ == "__main__":
