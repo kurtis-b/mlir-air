@@ -132,9 +132,25 @@ the generated paper-target comparison summary.
   0.999999, O-projection correlation 0.999991 against the quantized FusedDQP
   reference, and dense original-weight correlation 0.997821. The single
   diagnostic `run.start()/wait2()` window is 0.007962 s, with compile, ELF
-  load, BO creation/writes, and argument binding excluded. This is standalone
-  stitched-slice evidence only; it is not yet integrated into the repeated
-  decode loop or paper-cell timing.
+  load, BO creation/writes, and argument binding excluded. This standalone
+  slice is now also integrated in the decode-loop artifact below, but it is
+  still not paper-cell timing.
+
+
+## Stitched Post-Attention Residual Evidence
+
+- `gemma3_1b_stitched_post_attention_residual_probe.json`: clean-provenance
+  Strix/XRT evidence for the first post-attention tail stitched slice. It runs
+  `gemma3_decode_post_attention_residual`, which stitches post-attention
+  RMSNorm directly into the attention residual add. The ABI has six public BO
+  arguments and aliases the RMSNorm output as both `1x1152` for weighted
+  RMSNorm and `1152` for residual-add RHS, avoiding a norm-output layout copy.
+  With real layer-0 `post_attention_layernorm.weight`, it validates
+  post-attention RMSNorm correlation 0.999989 and attention-residual
+  correlation 0.999955. The single diagnostic `run.start()/wait2()` window is
+  0.000291 s, with compile, ELF load, BO creation/writes, and argument binding
+  excluded. This is standalone stitched-slice evidence only; it is not yet
+  integrated into the repeated decode loop or paper-cell timing.
 
 
 ## Full Layer Probe Evidence
