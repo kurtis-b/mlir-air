@@ -173,11 +173,30 @@ power, or paper-parity evidence.
   7.494 W pseudo-NPU package-delta from a 9.295 W quiescent package sample. The
   segmented kernel-only pseudo-NPU delta is not usable in this run because its
   quiescent sample was taken while preparation was already busy. This remains
-  diagnostic, not a paper cell: the production model loop still uses the
+  diagnostic, not a paper cell: the default result bundle still uses the
   single-token attention path, logits/sampling are not wired, and the production
-  contiguous static-weight BO route is still not complete. Standalone 1k
-  KV-cache tiled-stat attention evidence now exists below, but its reduction is
-  host-side and not yet integrated into the decode-loop probe.
+  contiguous static-weight BO route is still not complete. A separate
+  `tiled-stats-1k` decode-loop artifact below integrates host-batched 1k
+  tiled-stat attention in diagnostic mode, but it uses a synthetic repeated KV
+  cache and host-side reduction.
+
+- `gemma3_1b_decode_loop_tiled_stats_probe.json`: compact Strix/XRT evidence
+  for one staged Gemma3 1B decode token across all 26 real layers with
+  `attention_mode=tiled-stats-1k`. The probe keeps the same reusable ELF runner
+  and preloaded projection BO-set path as the default decode-loop diagnostic,
+  but replaces the single-token attention launch with 16 host-batched tiled-stat
+  attention launches per layer over a synthetic repeated current-token KV cache.
+  It validates all 26 layers with `host_fallbacks=[]`, records a 36.813874 s
+  untimed all-layer reference pass outside the measured window, and measures a
+  35.467162 s post-warmup loop wall window, or 0.028195 diagnostic TPS. The
+  summed NPU `run.start()/wait2()` windows total 32.557518 s across 2,158
+  launches, or 0.030715 kernel-only diagnostic TPS. Compared with the paper's
+  41.1 TPS 1B/1k NPU decode target, those diagnostics are 99.931% and 99.925%
+  low, respectively. Direct RAPL reports 17.118 W package power and a 7.674 W
+  pseudo-NPU package-delta from a 9.444 W quiescent sample. This is not a paper
+  cell because the KV cache is synthetic, the tiled softmax-stat reduction is
+  host-side, logits/sampling are not wired, and the production contiguous
+  static-weight BO route is still not complete.
 
 
 ## FlowQKV Tiled Stats Evidence
@@ -191,7 +210,9 @@ power, or paper-parity evidence.
   stats gives 0.999958 correlation against exact CPU attention and max output
   error 0.000183. This proves the full-cache L1 allocation blocker is avoidable
   for 1k attention, but it is still diagnostic because the tile-stat reduction
-  is host-side and the production model loop does not yet call this path. Full
+  is host-side. The diagnostic decode-loop probe can now call this path through
+  `--attention-mode tiled-stats-1k`, but production paper-cell execution still
+  needs a real prefill-constructed KV cache and NPU-side reduction. Full
   8x4 direct output remains a shim S2MM resource limit, and the attempted
   full-herd L2-gather route is still an AIE routing packet-id-0 blocker.
 

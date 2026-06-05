@@ -228,6 +228,10 @@ def load_decode_loop_diagnostic(model_variant: str) -> dict[str, Any] | None:
         "reference_check_mode": data.get("reference_check_mode"),
         "reference_check_layer_count": data.get("reference_check_layer_count"),
         "reference_check_seconds": data.get("reference_check_seconds"),
+        "attention_mode": data.get("attention_mode", "single-token"),
+        "attention_cache_contract": data.get("attention_cache_contract", "single-current-token-kv"),
+        "attention_host_batch_count": data.get("attention_host_batch_count"),
+        "attention_host_reduction": data.get("attention_host_reduction", False),
         "timed_kernel_count": data.get("timed_kernel_count"),
         "timed_kernel_seconds": data.get("timed_kernel_seconds"),
         "host_fallbacks": host_fallbacks,
@@ -245,9 +249,67 @@ def load_decode_loop_diagnostic(model_variant: str) -> dict[str, Any] | None:
         "source_result": str(DEFAULT_LOOP_PROBE_EVIDENCE),
         "notes": [
             "diagnostic staged 26-layer decode-loop timing; not a measured paper TTFT/TPS cell",
-            "loop-wall TPS includes current runner BO writes, sync/readback, and CPU reference/correlation checks",
+            "loop-wall TPS includes current runner BO writes and sync/readback, while CPU reference/correlation checks run before the measured loop",
             "kernel-only TPS excludes BO writes, sync/readback, and CPU reference/correlation checks",
             fallback_note,
+        ],
+    }
+
+
+TILED_DECODE_LOOP_EVIDENCE = (
+    Path(__file__).resolve().parent / "results" / "gemma3_1b_decode_loop_tiled_stats_probe.json"
+)
+
+
+def load_tiled_decode_loop_diagnostic(model_variant: str) -> dict[str, Any] | None:
+    if model_variant != "gemma3-1b" or not TILED_DECODE_LOOP_EVIDENCE.exists():
+        return None
+    try:
+        data = json.loads(TILED_DECODE_LOOP_EVIDENCE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if data.get("status") != "DECODE_LOOP_DIAGNOSTIC_PASS":
+        return None
+    host_fallbacks = list(data.get("host_fallbacks", []))
+    return {
+        "status": data.get("status"),
+        "correctness": "PASS",
+        "sequence_kind": data.get("sequence_kind"),
+        "phase": data.get("phase"),
+        "layer_count": data.get("layer_count"),
+        "decode_tokens": data.get("decode_tokens"),
+        "prompt_context_length": data.get("prompt_context_length"),
+        "attention_mode": data.get("attention_mode"),
+        "attention_cache_contract": data.get("attention_cache_contract"),
+        "attention_kv_tile": data.get("attention_kv_tile"),
+        "attention_host_batch_tiles": data.get("attention_host_batch_tiles"),
+        "attention_host_batch_count": data.get("attention_host_batch_count"),
+        "attention_host_reduction": data.get("attention_host_reduction"),
+        "reference_check_mode": data.get("reference_check_mode"),
+        "reference_check_layer_count": data.get("reference_check_layer_count"),
+        "reference_check_seconds": data.get("reference_check_seconds"),
+        "timed_kernel_count": data.get("timed_kernel_count"),
+        "timed_kernel_seconds": data.get("timed_kernel_seconds"),
+        "measured_loop_seconds": data.get("measured_loop_seconds"),
+        "diagnostic_decode_tps_loop_wall": data.get("diagnostic_decode_tps_loop_wall"),
+        "diagnostic_decode_tps_kernel_only": data.get("diagnostic_decode_tps_kernel_only"),
+        "paper_decode_tps_1k": data.get("paper_decode_tps_1k"),
+        "loop_wall_delta_pct_vs_paper_decode_tps_1k": data.get("loop_wall_delta_pct_vs_paper_decode_tps_1k"),
+        "kernel_only_delta_pct_vs_paper_decode_tps_1k": data.get("kernel_only_delta_pct_vs_paper_decode_tps_1k"),
+        "host_fallbacks": host_fallbacks,
+        "timing_window": data.get("timing_window"),
+        "timing_notes": data.get("timing_notes", []),
+        "power_snapshot": data.get("power_snapshot"),
+        "segmented_kernel_power_snapshot": data.get("segmented_kernel_power_snapshot"),
+        "remaining_paper_gaps": data.get("remaining_paper_gaps", []),
+        "git_commit": data.get("git_commit"),
+        "dirty_worktree": data.get("dirty_worktree"),
+        "source_result": str(TILED_DECODE_LOOP_EVIDENCE),
+        "notes": [
+            "diagnostic 26-layer decode-loop timing with host-batched 1k tiled-stat attention; not a measured paper TTFT/TPS cell",
+            "the KV cache is synthetic repeated current-token K/V, not a prefill-constructed production cache",
+            "softmax-stat reduction is host-side; production NPU reduction remains unwired",
+            "loop-wall TPS includes current runner BO writes and sync/readback; reference checks are excluded from the measured loop",
         ],
     }
 
@@ -475,6 +537,7 @@ def build_paper_result(
     real_benchmark: dict[str, Any] | None = None
     npu_staged_diagnostic: dict[str, Any] | None = None
     npu_decode_loop_diagnostic: dict[str, Any] | None = None
+    npu_tiled_decode_loop_diagnostic: dict[str, Any] | None = None
     npu_tiled_attention_diagnostic: dict[str, Any] | None = None
     explanation: str | None = None
     if not inventory.can_load_real_artifacts:
@@ -543,6 +606,14 @@ def build_paper_result(
                 f"measured_loop_seconds={npu_decode_loop_diagnostic.get('measured_loop_seconds')} "
                 f"diagnostic_decode_tps_loop_wall={npu_decode_loop_diagnostic.get('diagnostic_decode_tps_loop_wall')} "
                 f"diagnostic_decode_tps_kernel_only={npu_decode_loop_diagnostic.get('diagnostic_decode_tps_kernel_only')}"
+            )
+        npu_tiled_decode_loop_diagnostic = load_tiled_decode_loop_diagnostic(model_variant)
+        if npu_tiled_decode_loop_diagnostic:
+            notes.append(
+                "tiled 1k decode-loop diagnostic available: "
+                f"measured_loop_seconds={npu_tiled_decode_loop_diagnostic.get('measured_loop_seconds')} "
+                f"diagnostic_decode_tps_loop_wall={npu_tiled_decode_loop_diagnostic.get('diagnostic_decode_tps_loop_wall')} "
+                f"pseudo_npu_watts={npu_tiled_decode_loop_diagnostic.get('power_snapshot', {}).get('watts', {}).get('npu')}"
             )
         npu_tiled_attention_diagnostic = load_tiled_attention_diagnostic(model_variant)
         if npu_tiled_attention_diagnostic:
@@ -614,6 +685,7 @@ def build_paper_result(
         "real_benchmark": real_benchmark,
         "npu_staged_diagnostic": npu_staged_diagnostic,
         "npu_decode_loop_diagnostic": npu_decode_loop_diagnostic,
+        "npu_tiled_decode_loop_diagnostic": npu_tiled_decode_loop_diagnostic,
         "npu_tiled_attention_diagnostic": npu_tiled_attention_diagnostic,
         "notes": notes,
     }
