@@ -37,6 +37,7 @@ DEFAULT_RMS_QKV_FUNCTION_NAME = "gemma3_decode_rms_qkv_projection_core"
 DEFAULT_INGRESS_FUNCTION_NAME = "gemma3_decode_ingress_rms_qkv_qknorm_rope"
 DEFAULT_ATTENTION_O_FUNCTION_NAME = "gemma3_decode_attention_o_projection"
 DEFAULT_POST_ATTENTION_RESIDUAL_FUNCTION_NAME = "gemma3_decode_post_attention_residual"
+DEFAULT_FFN_GATE_UP_FUNCTION_NAME = "gemma3_decode_ffn_gate_up"
 DEFAULT_OUTPUT_FORMAT = "elf"
 DEFAULT_FUSED_DQP_OBJECT = Path(__file__).with_name("build_peano") / "fused_dqp.o"
 DEFAULT_ROPE_OBJECT = Path(__file__).with_name("build_peano") / "rope_halfsplit.o"
@@ -46,6 +47,7 @@ DEFAULT_LAYER = 0
 DEFAULT_INGRESS_RESULT_JSON = Path(__file__).with_name("results") / "gemma3_1b_stitched_decode_ingress_probe.json"
 DEFAULT_ATTENTION_O_RESULT_JSON = Path(__file__).with_name("results") / "gemma3_1b_stitched_attention_o_probe.json"
 DEFAULT_POST_ATTENTION_RESIDUAL_RESULT_JSON = Path(__file__).with_name("results") / "gemma3_1b_stitched_post_attention_residual_probe.json"
+DEFAULT_FFN_GATE_UP_RESULT_JSON = Path(__file__).with_name("results") / "gemma3_1b_stitched_ffn_gate_up_probe.json"
 
 PROJECTION_CORE_ARG_TYPES = (
     "memref<8x4x5x5120xi8>",  # q packed Q4NX blocks, scale, min
@@ -108,6 +110,17 @@ POST_ATTENTION_RESIDUAL_ARG_TYPES = (
     "memref<1152xbf16>",  # residual lhs, the original layer input
     "memref<1152xbf16>",  # residual rhs alias, same BO as arg2 at runtime
     "memref<1152xbf16>",  # attention residual output
+)
+
+FFN_GATE_UP_ARG_TYPES = (
+    "memref<1x1152xbf16>",  # attention residual entering pre-FF RMSNorm
+    "memref<1152xbf16>",  # pre-feedforward RMSNorm weight
+    "memref<1x1152xbf16>",  # pre-feedforward RMSNorm output view
+    "memref<5x256xbf16>",  # padded activation alias, same BO as arg2 at runtime
+    "memref<54x4x5x5120xi8>",  # gate packed Q4NX blocks, scale, min
+    "memref<54x4x5x5120xi8>",  # up packed Q4NX blocks, scale, min
+    "memref<216x32xbf16>",  # gate projection output, contiguous 6912 values
+    "memref<216x32xbf16>",  # up projection output, contiguous 6912 values
 )
 
 
@@ -316,6 +329,66 @@ class StitchedPostAttentionResidualProbeResult:
             f"function={self.function_name} output_format={self.output_format} "
             f"launches={self.launch_count} args={self.argument_count} "
             f"output_correlations={corr_text} "
+            f"timed_kernel_count={self.timed_kernel_count} "
+            f"timed_kernel_seconds={self._corr_text(self.timed_kernel_seconds)} "
+            f"timing_window={self.timing_window} threshold={self.threshold:g} "
+            f"model_runner_gaps={gaps} blockers={blockers}"
+        )
+
+    def to_json_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class StitchedFFNGateUpProbeResult:
+    schema_version: int
+    model_variant: str
+    status: str
+    sequence_kind: str
+    layer_index: int
+    function_name: str
+    output_format: str
+    launch_count: int
+    argument_count: int
+    output_correlations: tuple[StitchedIngressCorrelation, ...]
+    dense_projection_correlations: dict[str, float | None]
+    timed_kernel_count: int
+    timed_kernel_seconds: float | None
+    timing_window: str
+    timing_notes: tuple[str, ...]
+    threshold: float
+    remaining_model_runner_gaps: tuple[str, ...]
+    blockers: tuple[str, ...]
+    command: tuple[str, ...]
+    returncode: int | None
+    elapsed_seconds: float | None
+    git_commit: str | None
+    dirty_worktree: bool | None
+    stdout_tail: tuple[str, ...]
+    stderr_tail: tuple[str, ...]
+
+    @staticmethod
+    def _corr_text(value: float | None) -> str:
+        return "n/a" if value is None else f"{value:.6f}"
+
+    def format(self) -> str:
+        blockers = ",".join(self.blockers) if self.blockers else "none"
+        gaps = ",".join(self.remaining_model_runner_gaps) if self.remaining_model_runner_gaps else "none"
+        corr_text = "|".join(
+            f"{item.name}:{self._corr_text(item.correlation)}"
+            for item in self.output_correlations
+        )
+        dense_text = "|".join(
+            f"{name}:{self._corr_text(value)}"
+            for name, value in sorted(self.dense_projection_correlations.items())
+        )
+        return (
+            f"stitched_ffn_gate_up_probe model={self.model_variant} status={self.status} "
+            f"sequence={self.sequence_kind} layer=L{self.layer_index} "
+            f"function={self.function_name} output_format={self.output_format} "
+            f"launches={self.launch_count} args={self.argument_count} "
+            f"output_correlations={corr_text} "
+            f"dense_projection_correlations={dense_text} "
             f"timed_kernel_count={self.timed_kernel_count} "
             f"timed_kernel_seconds={self._corr_text(self.timed_kernel_seconds)} "
             f"timing_window={self.timing_window} threshold={self.threshold:g} "
@@ -567,6 +640,55 @@ def build_attention_o_text(
     )
 
 
+def build_ffn_gate_up_text(
+    *,
+    object_file: Path = DEFAULT_FUSED_DQP_OBJECT,
+    function_name: str = DEFAULT_FFN_GATE_UP_FUNCTION_NAME,
+) -> str:
+    """Build stitched pre-FF RMSNorm plus gate/up projection MLIR text."""
+    _activate_builder_paths()
+    from fused_dqp import build_paper_module
+    from ml_dtypes import bfloat16
+    from weighted_rms_norm import build_module as build_weighted_rms
+
+    rms_ir = str(build_weighted_rms(1, 1152, bfloat16, 16, herd_x=1))
+    gate_ir = str(
+        build_paper_module(
+            32,
+            256,
+            "fused_dqp_accum_block_opt",
+            str(object_file),
+            216,
+            5,
+            2,
+            4,
+            "l2-gather",
+        )
+    )
+    up_ir = str(
+        build_paper_module(
+            32,
+            256,
+            "fused_dqp_accum_block_opt",
+            str(object_file),
+            216,
+            5,
+            2,
+            4,
+            "l2-gather",
+        )
+    )
+    return stitch_module_text(
+        function_name=function_name,
+        arg_types=FFN_GATE_UP_ARG_TYPES,
+        specs=(
+            StitchSpec(rms_ir, "ffn", {0: 0, 1: 1, 2: 2}, wrap_bare_herds=True),
+            StitchSpec(gate_ir, "gate", {0: 4, 1: 3, 2: 6}),
+            StitchSpec(up_ir, "up", {0: 5, 1: 3, 2: 7}),
+        ),
+    )
+
+
 def build_post_attention_residual_text(
     *,
     function_name: str = DEFAULT_POST_ATTENTION_RESIDUAL_FUNCTION_NAME,
@@ -622,6 +744,11 @@ def build_attention_o_module(
 ):
     """Build and parse the stitched attention plus O-projection MLIR module."""
     return _parse_module(build_attention_o_text(object_file=object_file, flowqkv_object_file=flowqkv_object_file))
+
+
+def build_ffn_gate_up_module(*, object_file: Path = DEFAULT_FUSED_DQP_OBJECT):
+    """Build and parse the stitched pre-FF norm plus gate/up MLIR module."""
+    return _parse_module(build_ffn_gate_up_text(object_file=object_file))
 
 
 def build_post_attention_residual_module():
@@ -700,6 +827,19 @@ def compile_attention_o(
     return _compile_module(
         build_attention_o_module(object_file=object_file, flowqkv_object_file=flowqkv_object_file),
         instance_name=DEFAULT_ATTENTION_O_FUNCTION_NAME,
+        output_binary_name=output_binary_name,
+    )
+
+
+def compile_ffn_gate_up(
+    *,
+    object_file: Path = DEFAULT_FUSED_DQP_OBJECT,
+    output_binary_name: str = DEFAULT_FFN_GATE_UP_FUNCTION_NAME,
+):
+    """Compile the stitched pre-FF RMSNorm plus gate/up slice as an ELF."""
+    return _compile_module(
+        build_ffn_gate_up_module(object_file=object_file),
+        instance_name=DEFAULT_FFN_GATE_UP_FUNCTION_NAME,
         output_binary_name=output_binary_name,
     )
 
@@ -1301,6 +1441,155 @@ def _run_post_attention_residual_hardware(args: argparse.Namespace) -> StitchedP
     )
 
 
+def _run_ffn_gate_up_hardware(args: argparse.Namespace) -> StitchedFFNGateUpProbeResult:
+    _activate_builder_paths()
+    from common import fused_dqp_paper_reference
+    from gemma3_artifacts import default_weights_dir
+    from gemma3_full_layer_probe import _projection_tensor_keys
+    from ml_dtypes import bfloat16
+    import numpy as np
+
+    repo = _repo_root()
+    git_commit, dirty = _git_info(repo)
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    blockers: list[str] = []
+    start = time.perf_counter()
+    layer_index = int(args.layer_index)
+    weights_dir = (args.weights_dir or default_weights_dir(args.model_variant)).expanduser()
+    timed_kernel_seconds: list[float] = []
+    correlations: list[StitchedIngressCorrelation] = []
+    dense_projection_correlations: dict[str, float | None] = {}
+
+    try:
+        norm_key = f"model.layers.{layer_index}.pre_feedforward_layernorm.weight"
+        norm_weight = _load_safetensor_array_np(weights_dir, norm_key).astype(bfloat16).reshape(-1)
+        projection_keys = _projection_tensor_keys(args.model_variant, weights_dir, layer_index)
+        gate_weight = _load_safetensor_array_np(weights_dir, projection_keys["gate_proj"])
+        up_weight = _load_safetensor_array_np(weights_dir, projection_keys["up_proj"])
+        gate_pack, gate_packed, gate_scale, gate_min, _gate_padded = _pack_projection_for_ingress(gate_weight)
+        up_pack, up_packed, up_scale, up_min, _up_padded = _pack_projection_for_ingress(up_weight)
+
+        rng = np.random.default_rng(args.seed)
+        residual = rng.uniform(-0.45, 0.45, size=(1, 1152)).astype(bfloat16)
+        activation = np.zeros((5, 256), dtype=bfloat16)
+        activation_expected = _rms_host(residual, norm_weight).reshape(-1)
+        activation.reshape(-1)[:1152] = activation_expected
+
+        gate_expected = fused_dqp_paper_reference(
+            gate_packed,
+            gate_scale,
+            gate_min,
+            activation,
+            32,
+            256,
+        ).reshape(216, 32)
+        up_expected = fused_dqp_paper_reference(
+            up_packed,
+            up_scale,
+            up_min,
+            activation,
+            32,
+            256,
+        ).reshape(216, 32)
+
+        activation_storage = np.zeros((5, 256), dtype=bfloat16)
+        arrays = [
+            residual,
+            norm_weight,
+            activation_storage,
+            activation_storage,
+            gate_pack,
+            up_pack,
+            np.zeros((216, 32), dtype=bfloat16),
+            np.zeros((216, 32), dtype=bfloat16),
+        ]
+        actual = _run_multi_output_elf(
+            mlir_module=build_ffn_gate_up_module(object_file=args.object_file),
+            backend_options=_stitched_backend_options(DEFAULT_FFN_GATE_UP_FUNCTION_NAME),
+            arrays=arrays,
+            readback={
+                "pre_feedforward_norm": (2, (1, 1152), bfloat16),
+                "activation": (3, (5, 256), bfloat16),
+                "gate_proj": (6, (216, 32), bfloat16),
+                "up_proj": (7, (216, 32), bfloat16),
+            },
+            timed_kernel_seconds=timed_kernel_seconds,
+            bo_aliases={3: 2},
+        )
+        expected = {
+            "pre_feedforward_norm": activation_expected.reshape(1, 1152),
+            "activation": activation,
+            "gate_proj": gate_expected,
+            "up_proj": up_expected,
+        }
+        for name, expected_value in expected.items():
+            corr = _correlation(actual[name], expected_value)
+            correlations.append(
+                StitchedIngressCorrelation(
+                    name=name,
+                    shape=tuple(int(dim) for dim in expected_value.shape),
+                    correlation=corr,
+                )
+            )
+            stdout_lines.append(f"{name} correlation: {corr:.6f}")
+            if corr < args.threshold:
+                blockers.append(f"{name}-correlation-low")
+        dense_projection_correlations = {
+            "gate_proj": _correlation(
+                actual["gate_proj"].reshape(-1)[:6912],
+                (gate_weight.astype(np.float32) @ activation_expected.astype(np.float32)).astype(bfloat16),
+            ),
+            "up_proj": _correlation(
+                actual["up_proj"].reshape(-1)[:6912],
+                (up_weight.astype(np.float32) @ activation_expected.astype(np.float32)).astype(bfloat16),
+            ),
+        }
+    except Exception as exc:
+        blockers.append(type(exc).__name__)
+        stderr_lines.append(str(exc))
+
+    status = "STITCHED_FFN_GATE_UP_PASS" if not blockers else "STITCHED_FFN_GATE_UP_BLOCKED"
+    elapsed = time.perf_counter() - start
+    timed_sum = float(sum(timed_kernel_seconds)) if timed_kernel_seconds else None
+    return StitchedFFNGateUpProbeResult(
+        schema_version=1,
+        model_variant=args.model_variant,
+        status=status,
+        sequence_kind="decode-ffn-gate-up-stitched",
+        layer_index=layer_index,
+        function_name=DEFAULT_FFN_GATE_UP_FUNCTION_NAME,
+        output_format=DEFAULT_OUTPUT_FORMAT,
+        launch_count=3,
+        argument_count=len(FFN_GATE_UP_ARG_TYPES),
+        output_correlations=tuple(correlations),
+        dense_projection_correlations=dense_projection_correlations,
+        timed_kernel_count=len(timed_kernel_seconds),
+        timed_kernel_seconds=timed_sum,
+        timing_window="single-stitched-elf-run-start-wait2-only-diagnostic",
+        timing_notes=(
+            "compile, ELF load, BO creation, BO writes, and argument binding occur before the timed run.start/wait2 window",
+            "pre-feedforward RMSNorm output and padded gate/up activation are aliased BO views: 1x1152 and 5x256",
+            "single FFN gate/up diagnostic timing is not a TTFT/TPS or paper-parity result",
+        ),
+        threshold=float(args.threshold),
+        remaining_model_runner_gaps=(
+            "integrate-ffn-gate-up-stitched-slice-into-decode-loop",
+            "stitch-geglu-down-postff-final-residual-tail",
+            "prefill-produced-kv-cache-not-wired",
+            "logits-sampling-not-wired",
+        ),
+        blockers=tuple(dict.fromkeys(blockers)),
+        command=tuple(sys.argv),
+        returncode=0 if not blockers else 1,
+        elapsed_seconds=elapsed,
+        git_commit=git_commit,
+        dirty_worktree=dirty,
+        stdout_tail=_tail(stdout_lines),
+        stderr_tail=_tail(stderr_lines),
+    )
+
+
 def _projection_core_text_self_test() -> None:
     a_ir = """module {
   func.func private @fused_dqp_accum_block_opt(memref<4xbf16>) attributes {link_with = "fused_dqp.o", llvm.emit_c_interface}
@@ -1348,19 +1637,23 @@ def main() -> None:
     parser.add_argument("--print-ingress-mlir", action="store_true")
     parser.add_argument("--print-attention-o-mlir", action="store_true")
     parser.add_argument("--print-post-attention-residual-mlir", action="store_true")
+    parser.add_argument("--print-ffn-gate-up-mlir", action="store_true")
     parser.add_argument("--parse-projection-core", action="store_true")
     parser.add_argument("--parse-rms-qkv", action="store_true")
     parser.add_argument("--parse-ingress", action="store_true")
     parser.add_argument("--parse-attention-o", action="store_true")
     parser.add_argument("--parse-post-attention-residual", action="store_true")
+    parser.add_argument("--parse-ffn-gate-up", action="store_true")
     parser.add_argument("--compile-projection-core", action="store_true")
     parser.add_argument("--compile-rms-qkv", action="store_true")
     parser.add_argument("--compile-ingress", action="store_true")
     parser.add_argument("--compile-attention-o", action="store_true")
     parser.add_argument("--compile-post-attention-residual", action="store_true")
+    parser.add_argument("--compile-ffn-gate-up", action="store_true")
     parser.add_argument("--run-ingress-hardware", action="store_true")
     parser.add_argument("--run-attention-o-hardware", action="store_true")
     parser.add_argument("--run-post-attention-residual-hardware", action="store_true")
+    parser.add_argument("--run-ffn-gate-up-hardware", action="store_true")
     parser.add_argument("--object-file", type=Path, default=DEFAULT_FUSED_DQP_OBJECT)
     parser.add_argument("--rope-object-file", type=Path, default=DEFAULT_ROPE_OBJECT)
     parser.add_argument("--flowqkv-object-file", type=Path, default=DEFAULT_FLOWQKV_OBJECT)
@@ -1392,6 +1685,9 @@ def main() -> None:
         return
     if args.print_post_attention_residual_mlir:
         print(build_post_attention_residual_text())
+        return
+    if args.print_ffn_gate_up_mlir:
+        print(build_ffn_gate_up_text(object_file=args.object_file))
         return
     if args.parse_projection_core:
         build_projection_core_module(object_file=args.object_file)
@@ -1426,6 +1722,13 @@ def main() -> None:
         print(
             f"stitched_post_attention_residual status=PARSE_PASS function={DEFAULT_POST_ATTENTION_RESIDUAL_FUNCTION_NAME} "
             f"launches=2 args={len(POST_ATTENTION_RESIDUAL_ARG_TYPES)} output_format={DEFAULT_OUTPUT_FORMAT}"
+        )
+        return
+    if args.parse_ffn_gate_up:
+        build_ffn_gate_up_module(object_file=args.object_file)
+        print(
+            f"stitched_ffn_gate_up status=PARSE_PASS function={DEFAULT_FFN_GATE_UP_FUNCTION_NAME} "
+            f"launches=3 args={len(FFN_GATE_UP_ARG_TYPES)} output_format={DEFAULT_OUTPUT_FORMAT}"
         )
         return
     if args.compile_projection_core:
@@ -1463,6 +1766,13 @@ def main() -> None:
             f"output={artifact.output_binary}"
         )
         return
+    if args.compile_ffn_gate_up:
+        artifact = compile_ffn_gate_up(object_file=args.object_file)
+        print(
+            f"stitched_ffn_gate_up status=COMPILE_PASS function={DEFAULT_FFN_GATE_UP_FUNCTION_NAME} "
+            f"output={artifact.output_binary}"
+        )
+        return
     if args.run_ingress_hardware:
         result = _run_ingress_hardware(args)
         print(result.format())
@@ -1487,16 +1797,26 @@ def main() -> None:
             args.result_json.write_text(json.dumps(result.to_json_dict(), indent=2, sort_keys=True) + "\n")
             print(f"GEMMA3_STITCHED_POST_ATTENTION_RESIDUAL_JSON: {args.result_json}")
         raise SystemExit(0 if result.status == "STITCHED_POST_ATTENTION_RESIDUAL_PASS" else 1)
+    if args.run_ffn_gate_up_hardware:
+        result = _run_ffn_gate_up_hardware(args)
+        print(result.format())
+        if args.result_json:
+            args.result_json.parent.mkdir(parents=True, exist_ok=True)
+            args.result_json.write_text(json.dumps(result.to_json_dict(), indent=2, sort_keys=True) + "\n")
+            print(f"GEMMA3_STITCHED_FFN_GATE_UP_JSON: {args.result_json}")
+        raise SystemExit(0 if result.status == "STITCHED_FFN_GATE_UP_PASS" else 1)
     parser.error(
         "pass --self-test, --print-plan, --print-projection-core-mlir, "
         "--print-rms-qkv-mlir, --print-ingress-mlir, --print-attention-o-mlir, "
-        "--print-post-attention-residual-mlir, "
+        "--print-post-attention-residual-mlir, --print-ffn-gate-up-mlir, "
         "--parse-projection-core, --parse-rms-qkv, --parse-ingress, "
-        "--parse-attention-o, --parse-post-attention-residual, "
+        "--parse-attention-o, --parse-post-attention-residual, --parse-ffn-gate-up, "
         "--compile-projection-core, --compile-rms-qkv, "
         "--compile-ingress, --compile-attention-o, --compile-post-attention-residual, "
+        "--compile-ffn-gate-up, "
         "--run-ingress-hardware, "
-        "--run-attention-o-hardware, or --run-post-attention-residual-hardware"
+        "--run-attention-o-hardware, --run-post-attention-residual-hardware, "
+        "or --run-ffn-gate-up-hardware"
     )
 
 
