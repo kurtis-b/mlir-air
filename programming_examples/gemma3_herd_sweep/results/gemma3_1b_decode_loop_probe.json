@@ -8,18 +8,18 @@
     "/home/cj/mlir-air/programming_examples/gemma3_herd_sweep/results/gemma3_1b_decode_loop_probe.json"
   ],
   "decode_tokens": 1,
-  "diagnostic_decode_tps_kernel_only": 0.2670829332654386,
-  "diagnostic_decode_tps_loop_wall": 0.13756978329119451,
+  "diagnostic_decode_tps_kernel_only": 0.2746984021217935,
+  "diagnostic_decode_tps_loop_wall": 0.18474622736271734,
   "dirty_worktree": true,
-  "elapsed_seconds": 24.564561320992652,
-  "git_commit": "5022db0c7d76b7580c7084ad3247451090cf1ad7",
+  "elapsed_seconds": 29.347166444989853,
+  "git_commit": "783bfe4642dd10d3a4d0a3f0d444a70a163b49d4",
   "host_fallbacks": [],
   "input_distribution": "bounded-uniform-seed0",
   "input_shape": [
     1,
     1152
   ],
-  "kernel_only_delta_pct_vs_paper_decode_tps_1k": 99.35016317940281,
+  "kernel_only_delta_pct_vs_paper_decode_tps_1k": 99.33163405809783,
   "layer_count": 26,
   "layer_evidence": [
     {
@@ -143,8 +143,8 @@
       "rms_correlation": 0.9999908310898628,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 0,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.1449448088533245
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9999332535818822,
@@ -267,8 +267,8 @@
       "rms_correlation": 0.9999912020955134,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 10240,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.14547279488760978
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9999267175772427,
@@ -391,8 +391,8 @@
       "rms_correlation": 0.999981391036762,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 122880,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.14930350857321173
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9999838047873183,
@@ -515,8 +515,8 @@
       "rms_correlation": 0.9999879885131834,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 194560,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.14698490087175742
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.999973660564111,
@@ -639,8 +639,8 @@
       "rms_correlation": 0.9999889262315548,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 204800,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.1466336528537795
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9999761042299916,
@@ -763,8 +763,8 @@
       "rms_correlation": 0.9999941010632175,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 215040,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.146426462684758
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9999953120376124,
@@ -887,8 +887,8 @@
       "rms_correlation": 0.9999938000294879,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 225280,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.14332242833916098
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9999963608858903,
@@ -1011,8 +1011,8 @@
       "rms_correlation": 0.999991842312545,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 235520,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.14222745096776634
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9999995770015011,
@@ -1135,8 +1135,8 @@
       "rms_correlation": 0.9999982571049267,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 245760,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.14317712897900492
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9999989754642997,
@@ -1259,8 +1259,8 @@
       "rms_correlation": 0.9999917530593785,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 256000,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.14177105692215264
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.999998346990626,
@@ -1383,8 +1383,8 @@
       "rms_correlation": 0.9999954880314168,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 20480,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.13987132860347629
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9999962542391068,
@@ -1507,8 +1507,8 @@
       "rms_correlation": 0.9999996034714491,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 30720,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.14148668892448768
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9999951726173341,
@@ -1631,8 +1631,8 @@
       "rms_correlation": 0.9999893855165167,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 40960,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.14298598904861137
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9999946881644279,
@@ -1755,8 +1755,8 @@
       "rms_correlation": 0.9999888280651534,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 51200,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.14236923831049353
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.999986339322818,
@@ -1879,8 +1879,8 @@
       "rms_correlation": 0.9999913240331219,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 61440,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.14510856062406674
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9999849128389733,
@@ -2003,8 +2003,8 @@
       "rms_correlation": 0.999993143652132,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 71680,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.14659498917171732
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9999764347581321,
@@ -2127,8 +2127,8 @@
       "rms_correlation": 0.99999047329486,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 81920,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.1450527812121436
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.999966892529125,
@@ -2251,8 +2251,8 @@
       "rms_correlation": 0.999998839726608,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 92160,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.14331295783631504
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9999682865558561,
@@ -2375,8 +2375,8 @@
       "rms_correlation": 0.9999915929556195,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 102400,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.14570693124551326
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9999446453195505,
@@ -2499,8 +2499,8 @@
       "rms_correlation": 0.9999901787790743,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 112640,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.14831581665202975
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9999146858892153,
@@ -2623,8 +2623,8 @@
       "rms_correlation": 0.9999903248209373,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 133120,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.14295566460350528
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9999478524676642,
@@ -2747,8 +2747,8 @@
       "rms_correlation": 0.9999858742202002,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 143360,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.14045199274551123
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9999165630569926,
@@ -2871,8 +2871,8 @@
       "rms_correlation": 0.9999894215097722,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 153600,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.1434819281566888
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9999270613670935,
@@ -2995,8 +2995,8 @@
       "rms_correlation": 0.9999863013447957,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 163840,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.1448665451607667
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9999236340164757,
@@ -3119,8 +3119,8 @@
       "rms_correlation": 0.9999897782897075,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 174080,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.14177122403634712
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     },
     {
       "final_output_correlation": 0.9992372447013133,
@@ -3243,12 +3243,12 @@
       "rms_correlation": 0.9999853613448094,
       "static_norm_argument_bytes": 2304,
       "static_norm_tensor_offset_bytes": 184320,
-      "timed_kernel_count": 68,
-      "timed_kernel_seconds": 0.13955854414962232
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
     }
   ],
-  "loop_wall_delta_pct_vs_paper_decode_tps_1k": 99.66528033262485,
-  "measured_loop_seconds": 7.269038127968088,
+  "loop_wall_delta_pct_vs_paper_decode_tps_1k": 99.55049579717101,
+  "measured_loop_seconds": 5.412830422981642,
   "model_variant": "gemma3-1b",
   "norm_argument_mode": "selected-vector",
   "output_format": "elf",
@@ -3270,7 +3270,7 @@
       "raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges",
       "xrt-smi is available, but direct NPU rail parsing reports N/A on this host",
       "NPU rail is pseudo power: average package watts during timed window minus quiescent package watts before the run",
-      "quiescent_pkg_watts=11.700910",
+      "quiescent_pkg_watts=9.295170",
       "package watts use direct RAPL sysfs energy_uj delta over the timed window"
     ],
     "run_id": "gemma3_1b_decode_loop_probe",
@@ -3279,16 +3279,18 @@
     "watts": {
       "cpu": null,
       "gpu": null,
-      "npu": 6.040222145643105,
-      "total": 17.741132145643103
+      "npu": 7.494432832216459,
+      "total": 16.78960283221646
     }
   },
   "prompt_context_length": 1024,
+  "reference_check_layer_count": 26,
+  "reference_check_mode": "all-layers-before-timing",
+  "reference_check_seconds": 6.9020137340412475,
   "remaining_paper_gaps": [
     "prefill-kv-cache-not-constructed",
     "paper-1k-kv-attention-not-wired",
     "logits-sampling-not-wired",
-    "diagnostic-reference-checks-inside-loop",
     "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
   ],
   "returncode": 0,
@@ -3303,20 +3305,20 @@
       "total": "RAPL_SYSFS_PACKAGE_SEGMENTED"
     },
     "notes": [
-      "quiescent_pkg_watts=42.728810",
+      "quiescent_pkg_watts=41.163950",
       "package watts use direct RAPL sysfs energy_uj deltas summed over NPU run.start/wait2 segments",
       "NPU rail is pseudo power: segmented package watts minus quiescent package watts before the run"
     ],
     "run_id": "gemma3_1b_decode_loop_probe_kernel_segments",
     "sampling_backend": "rapl-sysfs+segmented",
     "schema_version": 1,
-    "segmented_elapsed_seconds": 3.744155374413822,
-    "segmented_energy_delta_uj": 58248130,
+    "segmented_elapsed_seconds": 3.6403560860781,
+    "segmented_energy_delta_uj": 57899336,
     "watts": {
       "cpu": null,
       "gpu": null,
       "npu": 0.0,
-      "total": 15.557081417626591
+      "total": 15.904855083112832
     }
   },
   "sequence_kind": "decode-loop-staged-full-1b",
@@ -3325,15 +3327,16 @@
   "status": "DECODE_LOOP_DIAGNOSTIC_PASS",
   "stderr_tail": [],
   "stdout_tail": [
-    "decode token 0: final checksum=-28352.281250"
+    "decode token 0: final checksum=-38658.687500"
   ],
   "timed_kernel_count": 1768,
-  "timed_kernel_mean_seconds": 0.002117734940279311,
-  "timed_kernel_seconds": 3.744155374413822,
+  "timed_kernel_mean_seconds": 0.002059024935564536,
+  "timed_kernel_seconds": 3.6403560860781,
   "timing_notes": [
     "warmup layers compile/load ELF runners and allocate runner-owned BOs before measured loop timing",
     "preloaded-runner-bo-set mode allocates BO sets and writes packed projection static inputs before measured loop timing",
-    "measured_loop_seconds starts after warmup and includes current implementation dynamic BO writes, output sync/readback, and CPU reference/correlation checks",
+    "reference_check_seconds validates all layers before measured loop timing and is excluded from measured_loop_seconds",
+    "measured_loop_seconds starts after warmup/reference checks and includes current implementation dynamic BO writes and output sync/readback",
     "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls and excludes compile, ELF load, BO allocation, BO writes, sync/readback, and CPU reference/correlation checks",
     "attention is the staged single-token FlowQKV NPU path, not paper 1k KV-cache attention",
     "logits and sampling are not wired, so this is a diagnostic decode-loop throughput, not an official paper decode TPS cell"

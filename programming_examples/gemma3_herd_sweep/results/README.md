@@ -161,19 +161,20 @@ power, or paper-parity evidence.
   final-output correlations above 0.99998 and all projection correlations at
   approximately 1.000000. The refreshed loop launches QK-Norm, RoPE,
   single-token FlowQKV attention, post/pre/post RMSNorm, GeGLU, and both
-  residual adds on the NPU for every layer and records `host_fallbacks=[]`. The
-  post-warmup loop wall window is 7.269038 s, or 0.137570 diagnostic TPS, and
-  includes dynamic BO writes, output sync/readback, and CPU reference/correlation
-  checks. The summed NPU `run.start()/wait2()` windows total 3.744155 s across
-  1,768 launches, or 0.267083 kernel-only diagnostic TPS. Compared with the
-  paper's 41.1 TPS 1B/1k NPU decode target, those diagnostics are 99.665% and
-  99.350% low, respectively. Full-window direct RAPL reports 17.741 W package
-  power and a 6.040 W pseudo-NPU package-delta from an 11.701 W quiescent
-  package sample. The segmented kernel-only pseudo-NPU delta is not usable in
-  this run because its quiescent sample was taken while preparation was already
-  busy. This remains diagnostic, not a paper cell: paper 1k KV-cache attention,
-  logits/sampling, diagnostic reference checks inside the loop, and the
-  production contiguous static-weight BO route are still not complete.
+  residual adds on the NPU for every layer and records `host_fallbacks=[]`. It
+  also runs a 6.902014 s untimed all-layer reference pass before the measured
+  loop, so loop-wall timing excludes CPU reference/correlation checks. The
+  measured post-warmup loop wall window is 5.412830 s, or 0.184746 diagnostic
+  TPS, and includes dynamic BO writes plus output sync/readback. The summed NPU
+  `run.start()/wait2()` windows total 3.640356 s across 1,768 launches, or
+  0.274698 kernel-only diagnostic TPS. Compared with the paper's 41.1 TPS 1B/1k
+  NPU decode target, those diagnostics are 99.550% and 99.332% low,
+  respectively. Full-window direct RAPL reports 16.790 W package power and a
+  7.494 W pseudo-NPU package-delta from a 9.295 W quiescent package sample. The
+  segmented kernel-only pseudo-NPU delta is not usable in this run because its
+  quiescent sample was taken while preparation was already busy. This remains
+  diagnostic, not a paper cell: paper 1k KV-cache attention, logits/sampling,
+  and the production contiguous static-weight BO route are still not complete.
 
 
 ## Static Preload Evidence

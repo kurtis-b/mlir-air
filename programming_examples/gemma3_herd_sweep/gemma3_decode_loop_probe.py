@@ -103,6 +103,9 @@ class Gemma3DecodeLoopProbeResult:
     input_shape: tuple[int, ...]
     output_shape: tuple[int, ...]
     input_distribution: str
+    reference_check_mode: str
+    reference_check_layer_count: int
+    reference_check_seconds: float | None
     host_fallbacks: tuple[str, ...]
     timed_kernel_count: int
     timed_kernel_seconds: float | None
@@ -354,6 +357,7 @@ def _run_packed_projection(
     timed_kernel_seconds: list[float] | None,
     power_meter,
     static_projection_argument_mode: str,
+    check_references: bool = True,
 ):
     import numpy as np
     from ml_dtypes import bfloat16
@@ -363,11 +367,13 @@ def _run_packed_projection(
     activation_padded = np.zeros((plan.col_blocks * 256,), dtype=bfloat16)
     activation_padded[:in_dim] = activation.reshape(-1).astype(bfloat16)
     activation_blocks = activation_padded.reshape(plan.col_blocks, 256)
-    expected = fused_dqp_paper_reference(plan.packed, plan.scale, plan.min_offset, activation_blocks, 32, 256)
     output_shape = _projection_output_shape(plan)
-    if tuple(expected.shape) != output_shape:
-        raise RuntimeError(f"projection output shape mismatch: expected {output_shape}, got {expected.shape}")
-    accum = np.zeros(expected.shape, dtype=np.float32)
+    expected = None
+    if check_references:
+        expected = fused_dqp_paper_reference(plan.packed, plan.scale, plan.min_offset, activation_blocks, 32, 256)
+        if tuple(expected.shape) != output_shape:
+            raise RuntimeError(f"projection output shape mismatch: expected {output_shape}, got {expected.shape}")
+    accum = np.zeros(output_shape, dtype=np.float32)
     for col_block in range(plan.col_blocks):
         cb_slice = slice(col_block, col_block + 1)
         static_mode = static_projection_argument_mode == "preloaded-runner-bo-set"
@@ -386,7 +392,7 @@ def _run_packed_projection(
         )
         accum += partial.astype(np.float32)
     actual = accum.astype(bfloat16).reshape(-1)[:out_dim]
-    expected_vec = expected.reshape(-1)[:out_dim].astype(bfloat16)
+    expected_vec = actual if expected is None else expected.reshape(-1)[:out_dim].astype(bfloat16)
     evidence = ProjectionEvidence(
         family=plan.family,
         tensor_key=plan.tensor_key,
@@ -394,7 +400,7 @@ def _run_packed_projection(
         padded_shape=plan.padded_shape,
         row_blocks=plan.row_blocks,
         col_blocks=plan.col_blocks,
-        projection_correlation=_correlation(actual, expected_vec),
+        projection_correlation=(None if expected is None else _correlation(actual, expected_vec)),
         dense_projection_correlation=None,
     )
     return actual, expected_vec, evidence
@@ -412,6 +418,7 @@ def _run_one_layer(
     static_projection_argument_mode: str,
     rope_object_file: Path,
     flowqkv_object_file: Path,
+    check_references: bool = True,
 ) -> tuple[Any, LayerLoopEvidence, list[str]]:
     from ml_dtypes import bfloat16
     from weighted_rms_norm import build_module as build_rms_module
@@ -421,7 +428,7 @@ def _run_one_layer(
     blockers: list[str] = []
     start_count = len(timed_kernel_seconds) if timed_kernel_seconds is not None else 0
     start_seconds = sum(timed_kernel_seconds) if timed_kernel_seconds is not None else 0.0
-    norm_expected = rms_norm_reference(x_input, norm_plan.weight)
+    norm_expected = rms_norm_reference(x_input, norm_plan.weight) if check_references else x_input
     rms_module = build_rms_module(1, 1152, bfloat16, 16, herd_x=1)
     norm_actual = runner_cache.run(
         key=("weighted_rms_norm", 1, 1152),
@@ -439,12 +446,12 @@ def _run_one_layer(
         timed_kernel_seconds=timed_kernel_seconds,
         power_meter=power_meter,
     )
-    rms_corr = _correlation(norm_actual, norm_expected)
-    if rms_corr < DEFAULT_THRESHOLD:
+    rms_corr = _correlation(norm_actual, norm_expected) if check_references else None
+    if check_references and rms_corr < DEFAULT_THRESHOLD:
         blockers.append(f"L{layer_index}:rmsnorm-correlation-low")
 
     actual: dict[str, Any] = {"input_norm": norm_actual.reshape(-1)}
-    expected: dict[str, Any] = {"input_norm": norm_expected.reshape(-1)}
+    expected: dict[str, Any] = {"input_norm": norm_expected.reshape(-1) if check_references else actual["input_norm"]}
     projection_evidence: list[ProjectionEvidence] = []
     for family in ("q_proj", "k_proj", "v_proj"):
         actual_vec, expected_vec, evidence = _run_packed_projection(
@@ -454,11 +461,12 @@ def _run_one_layer(
             timed_kernel_seconds,
             power_meter,
             static_projection_argument_mode,
+            check_references=check_references,
         )
         projection_evidence.append(evidence)
         actual[family] = actual_vec
         expected[family] = expected_vec
-        if evidence.projection_correlation is None or evidence.projection_correlation < DEFAULT_THRESHOLD:
+        if check_references and (evidence.projection_correlation is None or evidence.projection_correlation < DEFAULT_THRESHOLD):
             blockers.append(f"L{layer_index}:{family}-correlation-low")
 
     q_actual = actual["q_proj"].reshape(4, 256)
@@ -484,11 +492,11 @@ def _run_one_layer(
         timed_kernel_seconds=timed_kernel_seconds,
         power_meter=power_meter,
     )
-    qn_expected = _rms_host(q_expected, norm_plan.norm_weights["q_norm"])
-    kn_expected = _rms_host(k_expected, norm_plan.norm_weights["k_norm"])
-    if _correlation(qn_actual, qn_reference) < DEFAULT_THRESHOLD or _correlation(qn_actual, qn_expected) < DEFAULT_THRESHOLD:
+    qn_expected = _rms_host(q_expected, norm_plan.norm_weights["q_norm"]) if check_references else qn_actual
+    kn_expected = _rms_host(k_expected, norm_plan.norm_weights["k_norm"]) if check_references else kn_actual
+    if check_references and (_correlation(qn_actual, qn_reference) < DEFAULT_THRESHOLD or _correlation(qn_actual, qn_expected) < DEFAULT_THRESHOLD):
         blockers.append(f"L{layer_index}:q-norm-correlation-low")
-    if _correlation(kn_actual, kn_reference) < DEFAULT_THRESHOLD or _correlation(kn_actual, kn_expected) < DEFAULT_THRESHOLD:
+    if check_references and (_correlation(kn_actual, kn_reference) < DEFAULT_THRESHOLD or _correlation(kn_actual, kn_expected) < DEFAULT_THRESHOLD):
         blockers.append(f"L{layer_index}:k-norm-correlation-low")
 
     q_rope_actual, q_rope_expected = _run_rope_stage(
@@ -507,9 +515,9 @@ def _run_one_layer(
         timed_kernel_seconds=timed_kernel_seconds,
         power_meter=power_meter,
     )
-    if _correlation(q_rope_actual, q_rope_expected) < DEFAULT_THRESHOLD:
+    if check_references and _correlation(q_rope_actual, q_rope_expected) < DEFAULT_THRESHOLD:
         blockers.append(f"L{layer_index}:rope-q-correlation-low")
-    if _correlation(k_rope_actual, k_rope_expected) < DEFAULT_THRESHOLD:
+    if check_references and _correlation(k_rope_actual, k_rope_expected) < DEFAULT_THRESHOLD:
         blockers.append(f"L{layer_index}:rope-k-correlation-low")
 
     attention_actual, attention_reference = _run_single_token_attention_stage(
@@ -521,15 +529,19 @@ def _run_one_layer(
         timed_kernel_seconds=timed_kernel_seconds,
         power_meter=power_meter,
     )
-    attention_expected = np.tile(v_expected.reshape(1, 256), (4, 1)).reshape(1024).astype(bfloat16)
-    if _correlation(attention_actual, attention_reference) < DEFAULT_THRESHOLD or _correlation(attention_actual, attention_expected) < DEFAULT_THRESHOLD:
+    attention_expected = (
+        np.tile(v_expected.reshape(1, 256), (4, 1)).reshape(1024).astype(bfloat16)
+        if check_references
+        else attention_actual
+    )
+    if check_references and (_correlation(attention_actual, attention_reference) < DEFAULT_THRESHOLD or _correlation(attention_actual, attention_expected) < DEFAULT_THRESHOLD):
         blockers.append(f"L{layer_index}:single-token-attention-correlation-low")
 
     o_actual, o_expected, evidence = _run_packed_projection(
-        projection_plans["o_proj"], attention_actual, runner_cache, timed_kernel_seconds, power_meter, static_projection_argument_mode
+        projection_plans["o_proj"], attention_actual, runner_cache, timed_kernel_seconds, power_meter, static_projection_argument_mode, check_references=check_references
     )
     projection_evidence.append(evidence)
-    if evidence.projection_correlation is None or evidence.projection_correlation < DEFAULT_THRESHOLD:
+    if check_references and (evidence.projection_correlation is None or evidence.projection_correlation < DEFAULT_THRESHOLD):
         blockers.append(f"L{layer_index}:o_proj-correlation-low")
 
     post_attention_actual, post_attention_reference = _run_rms_stage(
@@ -540,8 +552,12 @@ def _run_one_layer(
         timed_kernel_seconds=timed_kernel_seconds,
         power_meter=power_meter,
     )
-    post_attention_expected = _rms_host(o_expected.reshape(1, 1152), norm_plan.norm_weights["post_attention_layernorm"])
-    if _correlation(post_attention_actual, post_attention_reference) < DEFAULT_THRESHOLD or _correlation(post_attention_actual, post_attention_expected) < DEFAULT_THRESHOLD:
+    post_attention_expected = (
+        _rms_host(o_expected.reshape(1, 1152), norm_plan.norm_weights["post_attention_layernorm"])
+        if check_references
+        else post_attention_actual
+    )
+    if check_references and (_correlation(post_attention_actual, post_attention_reference) < DEFAULT_THRESHOLD or _correlation(post_attention_actual, post_attention_expected) < DEFAULT_THRESHOLD):
         blockers.append(f"L{layer_index}:post-attention-norm-correlation-low")
 
     residual_actual, residual_reference = _run_residual_stage(
@@ -553,8 +569,12 @@ def _run_one_layer(
         power_meter=power_meter,
     )
     residual_actual = residual_actual.reshape(1, 1152)
-    residual_expected = (x_input.astype(np.float32) + post_attention_expected.astype(np.float32)).astype(bfloat16)
-    if _correlation(residual_actual, residual_reference.reshape(1, 1152)) < DEFAULT_THRESHOLD or _correlation(residual_actual, residual_expected) < DEFAULT_THRESHOLD:
+    residual_expected = (
+        (x_input.astype(np.float32) + post_attention_expected.astype(np.float32)).astype(bfloat16)
+        if check_references
+        else residual_actual
+    )
+    if check_references and (_correlation(residual_actual, residual_reference.reshape(1, 1152)) < DEFAULT_THRESHOLD or _correlation(residual_actual, residual_expected) < DEFAULT_THRESHOLD):
         blockers.append(f"L{layer_index}:attention-residual-correlation-low")
 
     pre_ff_actual, pre_ff_reference = _run_rms_stage(
@@ -565,19 +585,23 @@ def _run_one_layer(
         timed_kernel_seconds=timed_kernel_seconds,
         power_meter=power_meter,
     )
-    pre_ff_expected = _rms_host(residual_expected, norm_plan.norm_weights["pre_feedforward_layernorm"])
-    if _correlation(pre_ff_actual, pre_ff_reference) < DEFAULT_THRESHOLD or _correlation(pre_ff_actual, pre_ff_expected) < DEFAULT_THRESHOLD:
+    pre_ff_expected = (
+        _rms_host(residual_expected, norm_plan.norm_weights["pre_feedforward_layernorm"])
+        if check_references
+        else pre_ff_actual
+    )
+    if check_references and (_correlation(pre_ff_actual, pre_ff_reference) < DEFAULT_THRESHOLD or _correlation(pre_ff_actual, pre_ff_expected) < DEFAULT_THRESHOLD):
         blockers.append(f"L{layer_index}:pre-feedforward-norm-correlation-low")
 
     gate_actual, gate_expected, gate_evidence = _run_packed_projection(
-        projection_plans["gate_proj"], pre_ff_actual.reshape(-1), runner_cache, timed_kernel_seconds, power_meter, static_projection_argument_mode
+        projection_plans["gate_proj"], pre_ff_actual.reshape(-1), runner_cache, timed_kernel_seconds, power_meter, static_projection_argument_mode, check_references=check_references
     )
     up_actual, up_expected, up_evidence = _run_packed_projection(
-        projection_plans["up_proj"], pre_ff_actual.reshape(-1), runner_cache, timed_kernel_seconds, power_meter, static_projection_argument_mode
+        projection_plans["up_proj"], pre_ff_actual.reshape(-1), runner_cache, timed_kernel_seconds, power_meter, static_projection_argument_mode, check_references=check_references
     )
     for family, evidence in (("gate_proj", gate_evidence), ("up_proj", up_evidence)):
         projection_evidence.append(evidence)
-        if evidence.projection_correlation is None or evidence.projection_correlation < DEFAULT_THRESHOLD:
+        if check_references and (evidence.projection_correlation is None or evidence.projection_correlation < DEFAULT_THRESHOLD):
             blockers.append(f"L{layer_index}:{family}-correlation-low")
 
     mlp_actual, mlp_reference = _run_geglu_stage(
@@ -588,15 +612,15 @@ def _run_one_layer(
         timed_kernel_seconds=timed_kernel_seconds,
         power_meter=power_meter,
     )
-    mlp_expected = _geglu(gate_expected, up_expected)
-    if _correlation(mlp_actual, mlp_reference) < DEFAULT_THRESHOLD or _correlation(mlp_actual, mlp_expected) < DEFAULT_THRESHOLD:
+    mlp_expected = _geglu(gate_expected, up_expected) if check_references else mlp_actual
+    if check_references and (_correlation(mlp_actual, mlp_reference) < DEFAULT_THRESHOLD or _correlation(mlp_actual, mlp_expected) < DEFAULT_THRESHOLD):
         blockers.append(f"L{layer_index}:mlp-activation-correlation-low")
 
     down_actual, down_expected, down_evidence = _run_packed_projection(
-        projection_plans["down_proj"], mlp_actual, runner_cache, timed_kernel_seconds, power_meter, static_projection_argument_mode
+        projection_plans["down_proj"], mlp_actual, runner_cache, timed_kernel_seconds, power_meter, static_projection_argument_mode, check_references=check_references
     )
     projection_evidence.append(down_evidence)
-    if down_evidence.projection_correlation is None or down_evidence.projection_correlation < DEFAULT_THRESHOLD:
+    if check_references and (down_evidence.projection_correlation is None or down_evidence.projection_correlation < DEFAULT_THRESHOLD):
         blockers.append(f"L{layer_index}:down_proj-correlation-low")
 
     post_ff_actual, post_ff_reference = _run_rms_stage(
@@ -607,8 +631,12 @@ def _run_one_layer(
         timed_kernel_seconds=timed_kernel_seconds,
         power_meter=power_meter,
     )
-    post_ff_expected = _rms_host(down_expected.reshape(1, 1152), norm_plan.norm_weights["post_feedforward_layernorm"])
-    if _correlation(post_ff_actual, post_ff_reference) < DEFAULT_THRESHOLD or _correlation(post_ff_actual, post_ff_expected) < DEFAULT_THRESHOLD:
+    post_ff_expected = (
+        _rms_host(down_expected.reshape(1, 1152), norm_plan.norm_weights["post_feedforward_layernorm"])
+        if check_references
+        else post_ff_actual
+    )
+    if check_references and (_correlation(post_ff_actual, post_ff_reference) < DEFAULT_THRESHOLD or _correlation(post_ff_actual, post_ff_expected) < DEFAULT_THRESHOLD):
         blockers.append(f"L{layer_index}:post-feedforward-norm-correlation-low")
 
     output_actual_arr, output_reference = _run_residual_stage(
@@ -620,11 +648,15 @@ def _run_one_layer(
         power_meter=power_meter,
     )
     output_actual = output_actual_arr.reshape(1, 1152)
-    output_expected = (residual_expected.astype(np.float32) + post_ff_expected.astype(np.float32)).astype(bfloat16)
-    if _correlation(output_actual, output_reference.reshape(1, 1152)) < DEFAULT_THRESHOLD:
+    output_expected = (
+        (residual_expected.astype(np.float32) + post_ff_expected.astype(np.float32)).astype(bfloat16)
+        if check_references
+        else output_actual
+    )
+    if check_references and _correlation(output_actual, output_reference.reshape(1, 1152)) < DEFAULT_THRESHOLD:
         blockers.append(f"L{layer_index}:mlp-residual-correlation-low")
-    final_corr = _correlation(output_actual.reshape(-1), output_expected.reshape(-1))
-    if final_corr < DEFAULT_THRESHOLD:
+    final_corr = _correlation(output_actual.reshape(-1), output_expected.reshape(-1)) if check_references else None
+    if check_references and final_corr < DEFAULT_THRESHOLD:
         blockers.append(f"L{layer_index}:final-output-correlation-low")
     end_count = len(timed_kernel_seconds) if timed_kernel_seconds is not None else start_count
     end_seconds = sum(timed_kernel_seconds) if timed_kernel_seconds is not None else start_seconds
@@ -664,6 +696,8 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
     power_snapshot: dict[str, object] | None = None
     static_projection_argument_mode = "preloaded-runner-bo-set"
     static_projection_bo_set_count = 0
+    reference_check_layer_count = 0
+    reference_check_seconds: float | None = None
     returncode = 1
     try:
         if args.model_variant != DEFAULT_MODEL:
@@ -702,6 +736,26 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             )
             if warmup_blockers:
                 blockers.extend(f"warmup:{item}" for item in warmup_blockers)
+        reference_input = rng.uniform(-0.5, 0.5, size=(1, 1152)).astype(bfloat16)
+        reference_start = time.perf_counter()
+        for layer_index in range(args.layers):
+            reference_input, evidence, reference_blockers = _run_one_layer(
+                layer_index=layer_index,
+                x_input=reference_input,
+                norm_plan=norm_plans[layer_index],
+                projection_plans=projection_plans[layer_index],
+                runner_cache=runner_cache,
+                timed_kernel_seconds=None,
+                power_meter=None,
+                static_projection_argument_mode=static_projection_argument_mode,
+                rope_object_file=rope_object_file,
+                flowqkv_object_file=flowqkv_object_file,
+                check_references=True,
+            )
+            layer_evidence.append(evidence)
+            reference_check_layer_count += 1
+            blockers.extend(reference_blockers)
+        reference_check_seconds = time.perf_counter() - reference_start
         x_input = rng.uniform(-0.5, 0.5, size=(1, 1152)).astype(bfloat16)
         power_window = begin_power_window(
             sample=bool(args.power_sample),
@@ -711,7 +765,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         loop_start = time.perf_counter()
         for token_index in range(args.decode_tokens):
             for layer_index in range(args.layers):
-                x_input, evidence, layer_blockers = _run_one_layer(
+                x_input, _timing_evidence, layer_blockers = _run_one_layer(
                     layer_index=layer_index,
                     x_input=x_input,
                     norm_plan=norm_plans[layer_index],
@@ -722,8 +776,8 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                     static_projection_argument_mode=static_projection_argument_mode,
                     rope_object_file=rope_object_file,
                     flowqkv_object_file=flowqkv_object_file,
+                    check_references=False,
                 )
-                layer_evidence.append(evidence)
                 blockers.extend(layer_blockers)
             stdout_lines.append(f"decode token {token_index}: final checksum={float(x_input.astype(np.float32).sum()):.6f}")
         loop_elapsed = time.perf_counter() - loop_start
@@ -759,6 +813,9 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         input_shape=(1, 1152),
         output_shape=(1, 1152),
         input_distribution=DEFAULT_INPUT_DISTRIBUTION,
+        reference_check_mode="all-layers-before-timing",
+        reference_check_layer_count=reference_check_layer_count,
+        reference_check_seconds=reference_check_seconds,
         host_fallbacks=(),
         timed_kernel_count=len(timed_kernel_samples),
         timed_kernel_seconds=timed_total,
@@ -773,7 +830,8 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         timing_notes=(
             "warmup layers compile/load ELF runners and allocate runner-owned BOs before measured loop timing",
             "preloaded-runner-bo-set mode allocates BO sets and writes packed projection static inputs before measured loop timing",
-            "measured_loop_seconds starts after warmup and includes current implementation dynamic BO writes, output sync/readback, and CPU reference/correlation checks",
+            "reference_check_seconds validates all layers before measured loop timing and is excluded from measured_loop_seconds",
+            "measured_loop_seconds starts after warmup/reference checks and includes current implementation dynamic BO writes and output sync/readback",
             "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls and excludes compile, ELF load, BO allocation, BO writes, sync/readback, and CPU reference/correlation checks",
             "attention is the staged single-token FlowQKV NPU path, not paper 1k KV-cache attention",
             "logits and sampling are not wired, so this is a diagnostic decode-loop throughput, not an official paper decode TPS cell",
@@ -785,7 +843,6 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             "prefill-kv-cache-not-constructed",
             "paper-1k-kv-attention-not-wired",
             "logits-sampling-not-wired",
-            "diagnostic-reference-checks-inside-loop",
             "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route",
         ),
         command=tuple(sys.argv),
@@ -828,6 +885,9 @@ def _self_test() -> None:
         input_shape=(1, 1152),
         output_shape=(1, 1152),
         input_distribution=DEFAULT_INPUT_DISTRIBUTION,
+        reference_check_mode="all-layers-before-timing",
+        reference_check_layer_count=26,
+        reference_check_seconds=1.0,
         host_fallbacks=(),
         timed_kernel_count=1482,
         timed_kernel_seconds=3.9,

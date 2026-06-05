@@ -610,12 +610,12 @@
         "status": "BLOCKED"
       },
       "explanation": null,
-      "git_commit": "5022db0c7d76b7580c7084ad3247451090cf1ad7",
+      "git_commit": "783bfe4642dd10d3a4d0a3f0d444a70a163b49d4",
       "host_fallbacks": [
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.009534667090823254,
+          "elapsed_ms": 0.00932065692419807,
           "hardware_status": "hardware-smoke-pass-M8-N1152-N2560-elf",
           "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
           "measured": true,
@@ -629,7 +629,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.016914991041024525,
+          "elapsed_ms": 0.008646340575069189,
           "hardware_status": "hardware-smoke-pass-M32-N256-elf",
           "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
           "measured": true,
@@ -643,7 +643,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.007838010787963867,
+          "elapsed_ms": 0.007737680183102687,
           "hardware_status": "hardware-smoke-pass-rows4-head256-elf",
           "implementation_path": "programming_examples/gemma3_dataflow_kernels/rope_halfsplit.py",
           "measured": true,
@@ -657,7 +657,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.010346004273742437,
+          "elapsed_ms": 0.011371662064145008,
           "hardware_status": "hardware-smoke-pass-n6912-tile288-elf",
           "implementation_path": "programming_examples/gemma3_dataflow_kernels/geglu.py",
           "measured": true,
@@ -671,7 +671,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.0021373271010816097,
+          "elapsed_ms": 0.002117323068281015,
           "hardware_status": "hardware-smoke-pass-n1152-tile288-elf",
           "implementation_path": "programming_examples/gemma3_dataflow_kernels/residual_add.py",
           "measured": true,
@@ -715,7 +715,7 @@
         "standalone nonlinear NPU candidates remain outside the composed model timed window; CPU-reference microbenchmarks are recorded for fallback accounting",
         "real artifact inventory is present but execution is not implemented",
         "staged NPU diagnostic available: timed_kernel_seconds=0.15427393274148926 estimated_26_layer_decode_tps_kernel_only=0.24930678681788027",
-        "staged NPU decode-loop diagnostic available: measured_loop_seconds=7.269038127968088 diagnostic_decode_tps_loop_wall=0.13756978329119451 diagnostic_decode_tps_kernel_only=0.2670829332654386",
+        "staged NPU decode-loop diagnostic available: measured_loop_seconds=5.412830422981642 diagnostic_decode_tps_loop_wall=0.18474622736271734 diagnostic_decode_tps_kernel_only=0.2746984021217935",
         "execution wiring blockers: full-1b-loop-not-wired,paper-shape-hardware-rerun-required",
         "model runner blockers: full-1b-loop-not-wired,paper-shape-hardware-rerun-required",
         "raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges",
@@ -729,13 +729,13 @@
       "npu_decode_loop_diagnostic": {
         "correctness": "PASS",
         "decode_tokens": 1,
-        "diagnostic_decode_tps_kernel_only": 0.2670829332654386,
-        "diagnostic_decode_tps_loop_wall": 0.13756978329119451,
+        "diagnostic_decode_tps_kernel_only": 0.2746984021217935,
+        "diagnostic_decode_tps_loop_wall": 0.18474622736271734,
         "host_fallbacks": [],
-        "kernel_only_delta_pct_vs_paper_decode_tps_1k": 99.35016317940281,
+        "kernel_only_delta_pct_vs_paper_decode_tps_1k": 99.33163405809783,
         "layer_count": 26,
-        "loop_wall_delta_pct_vs_paper_decode_tps_1k": 99.66528033262485,
-        "measured_loop_seconds": 7.269038127968088,
+        "loop_wall_delta_pct_vs_paper_decode_tps_1k": 99.55049579717101,
+        "measured_loop_seconds": 5.412830422981642,
         "notes": [
           "diagnostic staged 26-layer decode-loop timing; not a measured paper TTFT/TPS cell",
           "loop-wall TPS includes current runner BO writes, sync/readback, and CPU reference/correlation checks",
@@ -756,7 +756,7 @@
             "raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges",
             "xrt-smi is available, but direct NPU rail parsing reports N/A on this host",
             "NPU rail is pseudo power: average package watts during timed window minus quiescent package watts before the run",
-            "quiescent_pkg_watts=11.700910",
+            "quiescent_pkg_watts=9.295170",
             "package watts use direct RAPL sysfs energy_uj delta over the timed window"
           ],
           "run_id": "gemma3_1b_decode_loop_probe",
@@ -765,16 +765,18 @@
           "watts": {
             "cpu": null,
             "gpu": null,
-            "npu": 6.040222145643105,
-            "total": 17.741132145643103
+            "npu": 7.494432832216459,
+            "total": 16.78960283221646
           }
         },
         "prompt_context_length": 1024,
+        "reference_check_layer_count": 26,
+        "reference_check_mode": "all-layers-before-timing",
+        "reference_check_seconds": 6.9020137340412475,
         "remaining_paper_gaps": [
           "prefill-kv-cache-not-constructed",
           "paper-1k-kv-attention-not-wired",
           "logits-sampling-not-wired",
-          "diagnostic-reference-checks-inside-loop",
           "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
         ],
         "segmented_kernel_power_snapshot": {
@@ -786,31 +788,32 @@
             "total": "RAPL_SYSFS_PACKAGE_SEGMENTED"
           },
           "notes": [
-            "quiescent_pkg_watts=42.728810",
+            "quiescent_pkg_watts=41.163950",
             "package watts use direct RAPL sysfs energy_uj deltas summed over NPU run.start/wait2 segments",
             "NPU rail is pseudo power: segmented package watts minus quiescent package watts before the run"
           ],
           "run_id": "gemma3_1b_decode_loop_probe_kernel_segments",
           "sampling_backend": "rapl-sysfs+segmented",
           "schema_version": 1,
-          "segmented_elapsed_seconds": 3.744155374413822,
-          "segmented_energy_delta_uj": 58248130,
+          "segmented_elapsed_seconds": 3.6403560860781,
+          "segmented_energy_delta_uj": 57899336,
           "watts": {
             "cpu": null,
             "gpu": null,
             "npu": 0.0,
-            "total": 15.557081417626591
+            "total": 15.904855083112832
           }
         },
         "sequence_kind": "decode-loop-staged-full-1b",
         "source_result": "/home/cj/mlir-air/programming_examples/gemma3_herd_sweep/results/gemma3_1b_decode_loop_probe.json",
         "status": "DECODE_LOOP_DIAGNOSTIC_PASS",
         "timed_kernel_count": 1768,
-        "timed_kernel_seconds": 3.744155374413822,
+        "timed_kernel_seconds": 3.6403560860781,
         "timing_notes": [
           "warmup layers compile/load ELF runners and allocate runner-owned BOs before measured loop timing",
           "preloaded-runner-bo-set mode allocates BO sets and writes packed projection static inputs before measured loop timing",
-          "measured_loop_seconds starts after warmup and includes current implementation dynamic BO writes, output sync/readback, and CPU reference/correlation checks",
+          "reference_check_seconds validates all layers before measured loop timing and is excluded from measured_loop_seconds",
+          "measured_loop_seconds starts after warmup/reference checks and includes current implementation dynamic BO writes and output sync/readback",
           "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls and excludes compile, ELF load, BO allocation, BO writes, sync/readback, and CPU reference/correlation checks",
           "attention is the staged single-token FlowQKV NPU path, not paper 1k KV-cache attention",
           "logits and sampling are not wired, so this is a diagnostic decode-loop throughput, not an official paper decode TPS cell"
@@ -959,12 +962,12 @@
         "status": "BLOCKED"
       },
       "explanation": null,
-      "git_commit": "5022db0c7d76b7580c7084ad3247451090cf1ad7",
+      "git_commit": "783bfe4642dd10d3a4d0a3f0d444a70a163b49d4",
       "host_fallbacks": [
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.010229317316164574,
+          "elapsed_ms": 0.009564663438747326,
           "hardware_status": "hardware-smoke-pass-M8-N1152-N2560-elf",
           "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
           "measured": true,
@@ -978,7 +981,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.008622999303042889,
+          "elapsed_ms": 0.008876998132715622,
           "hardware_status": "hardware-smoke-pass-M32-N256-elf",
           "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
           "measured": true,
@@ -992,7 +995,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.007724661069611709,
+          "elapsed_ms": 0.00796833774074912,
           "hardware_status": "hardware-smoke-pass-rows4-head256-elf",
           "implementation_path": "programming_examples/gemma3_dataflow_kernels/rope_halfsplit.py",
           "measured": true,
@@ -1006,7 +1009,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.010489660780876875,
+          "elapsed_ms": 0.010426330845803022,
           "hardware_status": "hardware-smoke-pass-n6912-tile288-elf",
           "implementation_path": "programming_examples/gemma3_dataflow_kernels/geglu.py",
           "measured": true,
@@ -1020,7 +1023,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.002117323068281015,
+          "elapsed_ms": 0.0022106687538325787,
           "hardware_status": "hardware-smoke-pass-n1152-tile288-elf",
           "implementation_path": "programming_examples/gemma3_dataflow_kernels/residual_add.py",
           "measured": true,
@@ -1064,7 +1067,7 @@
         "standalone nonlinear NPU candidates remain outside the composed model timed window; CPU-reference microbenchmarks are recorded for fallback accounting",
         "real artifact inventory is present but execution is not implemented",
         "staged NPU diagnostic available: timed_kernel_seconds=0.15427393274148926 estimated_26_layer_decode_tps_kernel_only=0.24930678681788027",
-        "staged NPU decode-loop diagnostic available: measured_loop_seconds=7.269038127968088 diagnostic_decode_tps_loop_wall=0.13756978329119451 diagnostic_decode_tps_kernel_only=0.2670829332654386",
+        "staged NPU decode-loop diagnostic available: measured_loop_seconds=5.412830422981642 diagnostic_decode_tps_loop_wall=0.18474622736271734 diagnostic_decode_tps_kernel_only=0.2746984021217935",
         "execution wiring blockers: full-1b-loop-not-wired,paper-shape-hardware-rerun-required",
         "model runner blockers: full-1b-loop-not-wired,paper-shape-hardware-rerun-required",
         "raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges",
@@ -1078,13 +1081,13 @@
       "npu_decode_loop_diagnostic": {
         "correctness": "PASS",
         "decode_tokens": 1,
-        "diagnostic_decode_tps_kernel_only": 0.2670829332654386,
-        "diagnostic_decode_tps_loop_wall": 0.13756978329119451,
+        "diagnostic_decode_tps_kernel_only": 0.2746984021217935,
+        "diagnostic_decode_tps_loop_wall": 0.18474622736271734,
         "host_fallbacks": [],
-        "kernel_only_delta_pct_vs_paper_decode_tps_1k": 99.35016317940281,
+        "kernel_only_delta_pct_vs_paper_decode_tps_1k": 99.33163405809783,
         "layer_count": 26,
-        "loop_wall_delta_pct_vs_paper_decode_tps_1k": 99.66528033262485,
-        "measured_loop_seconds": 7.269038127968088,
+        "loop_wall_delta_pct_vs_paper_decode_tps_1k": 99.55049579717101,
+        "measured_loop_seconds": 5.412830422981642,
         "notes": [
           "diagnostic staged 26-layer decode-loop timing; not a measured paper TTFT/TPS cell",
           "loop-wall TPS includes current runner BO writes, sync/readback, and CPU reference/correlation checks",
@@ -1105,7 +1108,7 @@
             "raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges",
             "xrt-smi is available, but direct NPU rail parsing reports N/A on this host",
             "NPU rail is pseudo power: average package watts during timed window minus quiescent package watts before the run",
-            "quiescent_pkg_watts=11.700910",
+            "quiescent_pkg_watts=9.295170",
             "package watts use direct RAPL sysfs energy_uj delta over the timed window"
           ],
           "run_id": "gemma3_1b_decode_loop_probe",
@@ -1114,16 +1117,18 @@
           "watts": {
             "cpu": null,
             "gpu": null,
-            "npu": 6.040222145643105,
-            "total": 17.741132145643103
+            "npu": 7.494432832216459,
+            "total": 16.78960283221646
           }
         },
         "prompt_context_length": 1024,
+        "reference_check_layer_count": 26,
+        "reference_check_mode": "all-layers-before-timing",
+        "reference_check_seconds": 6.9020137340412475,
         "remaining_paper_gaps": [
           "prefill-kv-cache-not-constructed",
           "paper-1k-kv-attention-not-wired",
           "logits-sampling-not-wired",
-          "diagnostic-reference-checks-inside-loop",
           "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
         ],
         "segmented_kernel_power_snapshot": {
@@ -1135,31 +1140,32 @@
             "total": "RAPL_SYSFS_PACKAGE_SEGMENTED"
           },
           "notes": [
-            "quiescent_pkg_watts=42.728810",
+            "quiescent_pkg_watts=41.163950",
             "package watts use direct RAPL sysfs energy_uj deltas summed over NPU run.start/wait2 segments",
             "NPU rail is pseudo power: segmented package watts minus quiescent package watts before the run"
           ],
           "run_id": "gemma3_1b_decode_loop_probe_kernel_segments",
           "sampling_backend": "rapl-sysfs+segmented",
           "schema_version": 1,
-          "segmented_elapsed_seconds": 3.744155374413822,
-          "segmented_energy_delta_uj": 58248130,
+          "segmented_elapsed_seconds": 3.6403560860781,
+          "segmented_energy_delta_uj": 57899336,
           "watts": {
             "cpu": null,
             "gpu": null,
             "npu": 0.0,
-            "total": 15.557081417626591
+            "total": 15.904855083112832
           }
         },
         "sequence_kind": "decode-loop-staged-full-1b",
         "source_result": "/home/cj/mlir-air/programming_examples/gemma3_herd_sweep/results/gemma3_1b_decode_loop_probe.json",
         "status": "DECODE_LOOP_DIAGNOSTIC_PASS",
         "timed_kernel_count": 1768,
-        "timed_kernel_seconds": 3.744155374413822,
+        "timed_kernel_seconds": 3.6403560860781,
         "timing_notes": [
           "warmup layers compile/load ELF runners and allocate runner-owned BOs before measured loop timing",
           "preloaded-runner-bo-set mode allocates BO sets and writes packed projection static inputs before measured loop timing",
-          "measured_loop_seconds starts after warmup and includes current implementation dynamic BO writes, output sync/readback, and CPU reference/correlation checks",
+          "reference_check_seconds validates all layers before measured loop timing and is excluded from measured_loop_seconds",
+          "measured_loop_seconds starts after warmup/reference checks and includes current implementation dynamic BO writes and output sync/readback",
           "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls and excludes compile, ELF load, BO allocation, BO writes, sync/readback, and CPU reference/correlation checks",
           "attention is the staged single-token FlowQKV NPU path, not paper 1k KV-cache attention",
           "logits and sampling are not wired, so this is a diagnostic decode-loop throughput, not an official paper decode TPS cell"
