@@ -77,6 +77,7 @@ PAPER_DECODE_TPS_1K = 41.1
 DEFAULT_INGRESS_MODE = "staged"
 DEFAULT_ATTENTION_O_MODE = "staged"
 DEFAULT_POST_ATTENTION_MODE = "staged"
+DEFAULT_FFN_GATE_UP_MODE = "staged"
 DEFAULT_ATTENTION_MODE = "single-token"
 DEFAULT_ATTENTION_CACHE_MODE = "repeated-current-token"
 DEFAULT_TILED_ATTENTION_KV_TILE = 32
@@ -84,6 +85,7 @@ DEFAULT_TILED_ATTENTION_HOST_BATCH_TILES = 2
 STITCHED_INGRESS_BO_ALIASES = {3: 2}
 STITCHED_ATTENTION_O_BO_ALIASES = {4: 3}
 STITCHED_POST_ATTENTION_RESIDUAL_BO_ALIASES = {4: 2}
+STITCHED_FFN_GATE_UP_BO_ALIASES = {3: 2}
 _INGRESS_PACK_CACHE: dict[tuple[object, ...], Any] = {}
 
 
@@ -118,12 +120,14 @@ class Gemma3DecodeLoopProbeResult:
     ingress_mode: str
     attention_o_mode: str
     post_attention_mode: str
+    ffn_gate_up_mode: str
     norm_argument_mode: str
     static_projection_argument_mode: str
     static_projection_bo_set_count: int
     static_ingress_bo_set_count: int
     static_attention_o_bo_set_count: int
     static_post_attention_residual_bo_set_count: int
+    static_ffn_gate_up_bo_set_count: int
     input_shape: tuple[int, ...]
     output_shape: tuple[int, ...]
     input_distribution: str
@@ -176,11 +180,13 @@ class Gemma3DecodeLoopProbeResult:
             f"output_format={self.output_format} runner_reuse={self.runner_reuse_mode} "
             f"ingress={self.ingress_mode} attention_o={self.attention_o_mode} "
             f"post_attention={self.post_attention_mode} "
+            f"ffn_gate_up={self.ffn_gate_up_mode} "
             f"norm_arg={self.norm_argument_mode} static_projection_arg={self.static_projection_argument_mode} "
             f"static_projection_bo_sets={self.static_projection_bo_set_count} "
             f"static_ingress_bo_sets={self.static_ingress_bo_set_count} "
             f"static_attention_o_bo_sets={self.static_attention_o_bo_set_count} "
             f"static_post_attention_residual_bo_sets={self.static_post_attention_residual_bo_set_count} "
+            f"static_ffn_gate_up_bo_sets={self.static_ffn_gate_up_bo_set_count} "
             f"attention_mode={self.attention_mode} attention_cache={self.attention_cache_contract} "
             f"timed_kernel_count={self.timed_kernel_count} "
             f"timed_kernel_seconds={self._value_text(self.timed_kernel_seconds)} "
@@ -958,6 +964,117 @@ def _preload_static_stitched_post_attention_residual_bo_sets(
         count += 1
     return count
 
+
+
+def _stitched_ffn_gate_up_bo_set_key(layer_index: int) -> tuple[object, ...]:
+    return ("stitched-ffn-gate-up", int(layer_index))
+
+
+def _stitched_ffn_gate_up_static_input_keys(
+    *,
+    layer_index: int,
+    norm_plan: _NormPlan,
+    projection_plans: dict[str, _PackedProjectionPlan],
+) -> list[object | None]:
+    keys: list[object | None] = [None] * 8
+    keys[1] = (
+        "stitched-ffn-gate-up-static",
+        f"model.layers.{int(layer_index)}.pre_feedforward_layernorm.weight",
+    )
+    keys[2] = ("stitched-ffn-gate-up-zero-output", int(layer_index), "pre_feedforward_norm")
+    keys[4] = ("stitched-ffn-gate-up-static", projection_plans["gate_proj"].tensor_key, "packed-l3-full")
+    keys[5] = ("stitched-ffn-gate-up-static", projection_plans["up_proj"].tensor_key, "packed-l3-full")
+    keys[6] = ("stitched-ffn-gate-up-zero-output", int(layer_index), "gate_proj")
+    keys[7] = ("stitched-ffn-gate-up-zero-output", int(layer_index), "up_proj")
+    return keys
+
+
+def _stitched_ffn_gate_up_arrays(*, residual_actual, norm_plan: _NormPlan, projection_plans: dict[str, _PackedProjectionPlan]):
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    activation_storage = np.zeros((5, 256), dtype=bfloat16)
+    return [
+        residual_actual.reshape(1, 1152).astype(bfloat16),
+        norm_plan.norm_weights["pre_feedforward_layernorm"].reshape(-1).astype(bfloat16),
+        activation_storage,
+        activation_storage,
+        _full_packed_l3_for_ingress(projection_plans["gate_proj"]),
+        _full_packed_l3_for_ingress(projection_plans["up_proj"]),
+        np.zeros((216, 32), dtype=bfloat16),
+        np.zeros((216, 32), dtype=bfloat16),
+    ]
+
+
+def _stitched_ffn_gate_up_readback(dtype) -> dict[str, tuple[int, tuple[int, ...], object]]:
+    return {
+        "pre_feedforward_norm": (2, (1, 1152), dtype),
+        "activation": (3, (5, 256), dtype),
+        "gate_proj": (6, (216, 32), dtype),
+        "up_proj": (7, (216, 32), dtype),
+    }
+
+
+def _stitched_ffn_gate_up_runner(
+    runner_cache: _ReusableElfRunnerCache,
+    *,
+    fused_dqp_object_file: Path,
+) -> _ReusableMultiOutputElfRunner:
+    if not runner_cache.enabled:
+        raise RuntimeError("--ffn-gate-up-mode=stitched requires reusable ELF runners")
+    from gemma3_stitched_decode import (
+        DEFAULT_FFN_GATE_UP_FUNCTION_NAME,
+        build_ffn_gate_up_module,
+        _stitched_backend_options,
+    )
+
+    key = ("stitched-ffn-gate-up-multi-output", str(fused_dqp_object_file))
+    runner = runner_cache.runners.get(key)
+    if runner is None:
+        runner = _ReusableMultiOutputElfRunner(
+            runner_cache,
+            mlir_module=build_ffn_gate_up_module(object_file=fused_dqp_object_file),
+            backend_options=_stitched_backend_options(DEFAULT_FFN_GATE_UP_FUNCTION_NAME),
+        )
+        runner_cache.runners[key] = runner
+    return runner
+
+
+def _preload_static_stitched_ffn_gate_up_bo_sets(
+    *,
+    norm_plans: dict[int, _NormPlan],
+    projection_plans: dict[int, dict[str, _PackedProjectionPlan]],
+    runner_cache: _ReusableElfRunnerCache,
+    fused_dqp_object_file: Path,
+) -> int:
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    runner = _stitched_ffn_gate_up_runner(
+        runner_cache,
+        fused_dqp_object_file=fused_dqp_object_file,
+    )
+    count = 0
+    zero_hidden = np.zeros((1, 1152), dtype=bfloat16)
+    for layer_index in sorted(projection_plans):
+        arrays = _stitched_ffn_gate_up_arrays(
+            residual_actual=zero_hidden,
+            norm_plan=norm_plans[layer_index],
+            projection_plans=projection_plans[layer_index],
+        )
+        runner.prepare(
+            arrays=arrays,
+            bo_set_key=_stitched_ffn_gate_up_bo_set_key(layer_index),
+            static_input_keys=_stitched_ffn_gate_up_static_input_keys(
+                layer_index=layer_index,
+                norm_plan=norm_plans[layer_index],
+                projection_plans=projection_plans[layer_index],
+            ),
+            bo_aliases=STITCHED_FFN_GATE_UP_BO_ALIASES,
+        )
+        count += 1
+    return count
+
 def _projection_output_shape(plan: _PackedProjectionPlan) -> tuple[int, int]:
     return (int(plan.row_blocks), 32)
 
@@ -1458,6 +1575,106 @@ def _run_stitched_post_attention_residual_stage(
     return post_attention_actual, post_attention_expected, residual_actual, residual_expected, blockers
 
 
+def _run_stitched_ffn_gate_up_stage(
+    *,
+    layer_index: int,
+    residual_actual,
+    residual_expected,
+    norm_plan: _NormPlan,
+    projection_plans: dict[str, _PackedProjectionPlan],
+    runner_cache: _ReusableElfRunnerCache,
+    timed_kernel_seconds: list[float] | None,
+    power_meter,
+    fused_dqp_object_file: Path,
+    check_references: bool,
+) -> tuple[Any, Any, Any, Any, Any, Any, list[ProjectionEvidence], list[str]]:
+    import numpy as np
+    from common import fused_dqp_paper_reference
+    from ml_dtypes import bfloat16
+
+    arrays = _stitched_ffn_gate_up_arrays(
+        residual_actual=residual_actual,
+        norm_plan=norm_plan,
+        projection_plans=projection_plans,
+    )
+    runner = _stitched_ffn_gate_up_runner(
+        runner_cache,
+        fused_dqp_object_file=fused_dqp_object_file,
+    )
+    actual = runner.run(
+        arrays=arrays,
+        readback=_stitched_ffn_gate_up_readback(bfloat16),
+        timed_kernel_seconds=timed_kernel_seconds,
+        power_meter=power_meter,
+        bo_set_key=_stitched_ffn_gate_up_bo_set_key(layer_index),
+        static_input_keys=_stitched_ffn_gate_up_static_input_keys(
+            layer_index=layer_index,
+            norm_plan=norm_plan,
+            projection_plans=projection_plans,
+        ),
+        bo_aliases=STITCHED_FFN_GATE_UP_BO_ALIASES,
+    )
+    pre_ff_actual = actual["pre_feedforward_norm"].reshape(1, 1152).astype(bfloat16)
+    gate_actual = actual["gate_proj"].reshape(-1)[:6912].astype(bfloat16)
+    up_actual = actual["up_proj"].reshape(-1)[:6912].astype(bfloat16)
+    blockers: list[str] = []
+    projection_evidence: list[ProjectionEvidence] = []
+    if check_references:
+        pre_ff_expected = _rms_host(
+            residual_expected.reshape(1, 1152),
+            norm_plan.norm_weights["pre_feedforward_layernorm"],
+        )
+        activation_blocks = np.zeros((5, 256), dtype=bfloat16)
+        activation_blocks.reshape(-1)[:1152] = pre_ff_expected.reshape(-1)
+        gate_full_expected = fused_dqp_paper_reference(
+            projection_plans["gate_proj"].packed,
+            projection_plans["gate_proj"].scale,
+            projection_plans["gate_proj"].min_offset,
+            activation_blocks,
+            32,
+            256,
+        ).reshape(216, 32)
+        up_full_expected = fused_dqp_paper_reference(
+            projection_plans["up_proj"].packed,
+            projection_plans["up_proj"].scale,
+            projection_plans["up_proj"].min_offset,
+            activation_blocks,
+            32,
+            256,
+        ).reshape(216, 32)
+        gate_expected = gate_full_expected.reshape(-1)[:6912].astype(bfloat16)
+        up_expected = up_full_expected.reshape(-1)[:6912].astype(bfloat16)
+        if _correlation(pre_ff_actual, pre_ff_expected) < DEFAULT_THRESHOLD:
+            blockers.append(f"L{layer_index}:stitched-pre-feedforward-norm-correlation-low")
+        if _correlation(actual["activation"], activation_blocks) < DEFAULT_THRESHOLD:
+            blockers.append(f"L{layer_index}:stitched-ffn-activation-correlation-low")
+    else:
+        pre_ff_expected = pre_ff_actual
+        gate_expected = gate_actual
+        up_expected = up_actual
+    for family, actual_value, expected_value in (
+        ("gate_proj", gate_actual, gate_expected),
+        ("up_proj", up_actual, up_expected),
+    ):
+        plan = projection_plans[family]
+        corr = None if not check_references else _correlation(actual_value, expected_value)
+        projection_evidence.append(
+            ProjectionEvidence(
+                family=plan.family,
+                tensor_key=plan.tensor_key,
+                shape=plan.shape,
+                padded_shape=plan.padded_shape,
+                row_blocks=plan.row_blocks,
+                col_blocks=plan.col_blocks,
+                projection_correlation=corr,
+                dense_projection_correlation=None,
+            )
+        )
+        if check_references and corr is not None and corr < DEFAULT_THRESHOLD:
+            blockers.append(f"L{layer_index}:stitched-{family}-correlation-low")
+    return pre_ff_actual, pre_ff_expected, gate_actual, gate_expected, up_actual, up_expected, projection_evidence, blockers
+
+
 def _run_packed_projection(
     plan: _PackedProjectionPlan,
     activation,
@@ -1532,6 +1749,7 @@ def _run_one_layer(
     attention_mode: str,
     attention_o_mode: str,
     post_attention_mode: str,
+    ffn_gate_up_mode: str,
     attention_cache_mode: str,
     prompt_context_length: int,
     tiled_attention_kv_tile: int,
@@ -1772,32 +1990,59 @@ def _run_one_layer(
     else:
         raise RuntimeError(f"unsupported post-attention mode: {post_attention_mode}")
 
-    pre_ff_actual, pre_ff_reference = _run_rms_stage(
-        name="pre_feedforward_norm",
-        x=residual_actual,
-        weight=norm_plan.norm_weights["pre_feedforward_layernorm"],
-        runner_cache=runner_cache,
-        timed_kernel_seconds=timed_kernel_seconds,
-        power_meter=power_meter,
-    )
-    pre_ff_expected = (
-        _rms_host(residual_expected, norm_plan.norm_weights["pre_feedforward_layernorm"])
-        if check_references
-        else pre_ff_actual
-    )
-    if check_references and (_correlation(pre_ff_actual, pre_ff_reference) < DEFAULT_THRESHOLD or _correlation(pre_ff_actual, pre_ff_expected) < DEFAULT_THRESHOLD):
-        blockers.append(f"L{layer_index}:pre-feedforward-norm-correlation-low")
+    if ffn_gate_up_mode == "stitched":
+        (
+            pre_ff_actual,
+            pre_ff_expected,
+            gate_actual,
+            gate_expected,
+            up_actual,
+            up_expected,
+            gate_up_evidence,
+            gate_up_blockers,
+        ) = _run_stitched_ffn_gate_up_stage(
+            layer_index=layer_index,
+            residual_actual=residual_actual,
+            residual_expected=residual_expected,
+            norm_plan=norm_plan,
+            projection_plans=projection_plans,
+            runner_cache=runner_cache,
+            timed_kernel_seconds=timed_kernel_seconds,
+            power_meter=power_meter,
+            fused_dqp_object_file=fused_dqp_object_file,
+            check_references=check_references,
+        )
+        projection_evidence.extend(gate_up_evidence)
+        blockers.extend(gate_up_blockers)
+    elif ffn_gate_up_mode == "staged":
+        pre_ff_actual, pre_ff_reference = _run_rms_stage(
+            name="pre_feedforward_norm",
+            x=residual_actual,
+            weight=norm_plan.norm_weights["pre_feedforward_layernorm"],
+            runner_cache=runner_cache,
+            timed_kernel_seconds=timed_kernel_seconds,
+            power_meter=power_meter,
+        )
+        pre_ff_expected = (
+            _rms_host(residual_expected, norm_plan.norm_weights["pre_feedforward_layernorm"])
+            if check_references
+            else pre_ff_actual
+        )
+        if check_references and (_correlation(pre_ff_actual, pre_ff_reference) < DEFAULT_THRESHOLD or _correlation(pre_ff_actual, pre_ff_expected) < DEFAULT_THRESHOLD):
+            blockers.append(f"L{layer_index}:pre-feedforward-norm-correlation-low")
 
-    gate_actual, gate_expected, gate_evidence = _run_packed_projection(
-        projection_plans["gate_proj"], pre_ff_actual.reshape(-1), runner_cache, timed_kernel_seconds, power_meter, static_projection_argument_mode, check_references=check_references
-    )
-    up_actual, up_expected, up_evidence = _run_packed_projection(
-        projection_plans["up_proj"], pre_ff_actual.reshape(-1), runner_cache, timed_kernel_seconds, power_meter, static_projection_argument_mode, check_references=check_references
-    )
-    for family, evidence in (("gate_proj", gate_evidence), ("up_proj", up_evidence)):
-        projection_evidence.append(evidence)
-        if check_references and (evidence.projection_correlation is None or evidence.projection_correlation < DEFAULT_THRESHOLD):
-            blockers.append(f"L{layer_index}:{family}-correlation-low")
+        gate_actual, gate_expected, gate_evidence = _run_packed_projection(
+            projection_plans["gate_proj"], pre_ff_actual.reshape(-1), runner_cache, timed_kernel_seconds, power_meter, static_projection_argument_mode, check_references=check_references
+        )
+        up_actual, up_expected, up_evidence = _run_packed_projection(
+            projection_plans["up_proj"], pre_ff_actual.reshape(-1), runner_cache, timed_kernel_seconds, power_meter, static_projection_argument_mode, check_references=check_references
+        )
+        for family, evidence in (("gate_proj", gate_evidence), ("up_proj", up_evidence)):
+            projection_evidence.append(evidence)
+            if check_references and (evidence.projection_correlation is None or evidence.projection_correlation < DEFAULT_THRESHOLD):
+                blockers.append(f"L{layer_index}:{family}-correlation-low")
+    else:
+        raise RuntimeError(f"unsupported FFN gate/up mode: {ffn_gate_up_mode}")
 
     mlp_actual, mlp_reference = _run_geglu_stage(
         name="mlp_activation",
@@ -1894,6 +2139,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
     static_ingress_bo_set_count = 0
     static_attention_o_bo_set_count = 0
     static_post_attention_residual_bo_set_count = 0
+    static_ffn_gate_up_bo_set_count = 0
     reference_check_layer_count = 0
     reference_check_seconds: float | None = None
     returncode = 1
@@ -1908,6 +2154,8 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             raise RuntimeError("--attention-o-mode=stitched requires reusable ELF runners")
         if args.post_attention_mode == "stitched" and args.no_reuse_elf:
             raise RuntimeError("--post-attention-mode=stitched requires reusable ELF runners")
+        if args.ffn_gate_up_mode == "stitched" and args.no_reuse_elf:
+            raise RuntimeError("--ffn-gate-up-mode=stitched requires reusable ELF runners")
         if args.attention_o_mode == "stitched" and args.attention_mode != "single-token":
             raise RuntimeError("--attention-o-mode=stitched currently requires --attention-mode=single-token")
         if args.attention_mode == "tiled-stats-1k" and args.prompt_context_length != 1024:
@@ -1936,6 +2184,8 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 projection_preload_family_set.difference_update({"q_proj", "k_proj", "v_proj"})
             if args.attention_o_mode == "stitched":
                 projection_preload_family_set.discard("o_proj")
+            if args.ffn_gate_up_mode == "stitched":
+                projection_preload_family_set.difference_update({"gate_proj", "up_proj"})
             projection_preload_families = (
                 None
                 if projection_preload_family_set == set(FULL_LAYER_PROJECTION_FAMILIES)
@@ -1966,6 +2216,13 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 norm_plans=norm_plans,
                 runner_cache=runner_cache,
             )
+        if args.ffn_gate_up_mode == "stitched":
+            static_ffn_gate_up_bo_set_count = _preload_static_stitched_ffn_gate_up_bo_sets(
+                norm_plans=norm_plans,
+                projection_plans=projection_plans,
+                runner_cache=runner_cache,
+                fused_dqp_object_file=fused_dqp_object_file,
+            )
         rng = np.random.default_rng(0)
         warmup_input = rng.uniform(-0.5, 0.5, size=(1, 1152)).astype(bfloat16)
         for layer_index in range(min(args.warmup_layers, args.layers)):
@@ -1986,6 +2243,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 attention_mode=args.attention_mode,
                 attention_o_mode=args.attention_o_mode,
                 post_attention_mode=args.post_attention_mode,
+                ffn_gate_up_mode=args.ffn_gate_up_mode,
                 attention_cache_mode=args.attention_cache_mode,
                 prompt_context_length=args.prompt_context_length,
                 tiled_attention_kv_tile=args.tiled_attention_kv_tile,
@@ -2013,6 +2271,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 attention_mode=args.attention_mode,
                 attention_o_mode=args.attention_o_mode,
                 post_attention_mode=args.post_attention_mode,
+                ffn_gate_up_mode=args.ffn_gate_up_mode,
                 attention_cache_mode=args.attention_cache_mode,
                 prompt_context_length=args.prompt_context_length,
                 tiled_attention_kv_tile=args.tiled_attention_kv_tile,
@@ -2049,6 +2308,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                     attention_mode=args.attention_mode,
                     attention_o_mode=args.attention_o_mode,
                     post_attention_mode=args.post_attention_mode,
+                    ffn_gate_up_mode=args.ffn_gate_up_mode,
                     attention_cache_mode=args.attention_cache_mode,
                     prompt_context_length=args.prompt_context_length,
                     tiled_attention_kv_tile=args.tiled_attention_kv_tile,
@@ -2087,12 +2347,14 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         ingress_mode=args.ingress_mode,
         attention_o_mode=args.attention_o_mode,
         post_attention_mode=args.post_attention_mode,
+        ffn_gate_up_mode=args.ffn_gate_up_mode,
         norm_argument_mode="selected-vector",
         static_projection_argument_mode=static_projection_argument_mode,
         static_projection_bo_set_count=static_projection_bo_set_count,
         static_ingress_bo_set_count=static_ingress_bo_set_count,
         static_attention_o_bo_set_count=static_attention_o_bo_set_count,
         static_post_attention_residual_bo_set_count=static_post_attention_residual_bo_set_count,
+        static_ffn_gate_up_bo_set_count=static_ffn_gate_up_bo_set_count,
         input_shape=(1, 1152),
         output_shape=(1, 1152),
         input_distribution=DEFAULT_INPUT_DISTRIBUTION,
@@ -2148,6 +2410,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 if args.post_attention_mode == "stitched"
                 else "staged post-attention mode runs post-attention RMSNorm and attention residual as separate launches"
             ),
+            (
+                "stitched FFN gate/up mode preloads one aliased RMSNorm/gate/up BO set per layer before measured loop timing"
+                if args.ffn_gate_up_mode == "stitched"
+                else "staged FFN gate/up mode runs pre-feedforward RMSNorm and gate/up projections as separate launch groups"
+            ),
             "reference_check_seconds validates all layers before measured loop timing and is excluded from measured_loop_seconds",
             "measured_loop_seconds starts after warmup/reference checks and includes current implementation dynamic BO writes and output sync/readback",
             "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls and excludes compile, ELF load, BO allocation, BO writes, sync/readback, and CPU reference/correlation checks",
@@ -2192,7 +2459,12 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             ),
             *(
                 ("decode-layer-after-stitched-post-attention-residual-still-staged",)
-                if args.post_attention_mode == "stitched"
+                if args.post_attention_mode == "stitched" and args.ffn_gate_up_mode != "stitched"
+                else ()
+            ),
+            *(
+                ("decode-layer-after-stitched-ffn-gate-up-still-staged",)
+                if args.ffn_gate_up_mode == "stitched"
                 else ()
             ),
             "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route",
@@ -2234,12 +2506,14 @@ def _self_test() -> None:
         ingress_mode=DEFAULT_INGRESS_MODE,
         attention_o_mode=DEFAULT_ATTENTION_O_MODE,
         post_attention_mode=DEFAULT_POST_ATTENTION_MODE,
+        ffn_gate_up_mode=DEFAULT_FFN_GATE_UP_MODE,
         norm_argument_mode="selected-vector",
         static_projection_argument_mode="preloaded-runner-bo-set",
         static_projection_bo_set_count=1456,
         static_ingress_bo_set_count=0,
         static_attention_o_bo_set_count=0,
         static_post_attention_residual_bo_set_count=0,
+        static_ffn_gate_up_bo_set_count=0,
         input_shape=(1, 1152),
         output_shape=(1, 1152),
         input_distribution=DEFAULT_INPUT_DISTRIBUTION,
@@ -2298,6 +2572,7 @@ def main() -> int:
     parser.add_argument("--ingress-mode", choices=["staged", "stitched"], default=DEFAULT_INGRESS_MODE)
     parser.add_argument("--attention-o-mode", choices=["staged", "stitched"], default=DEFAULT_ATTENTION_O_MODE)
     parser.add_argument("--post-attention-mode", choices=["staged", "stitched"], default=DEFAULT_POST_ATTENTION_MODE)
+    parser.add_argument("--ffn-gate-up-mode", choices=["staged", "stitched"], default=DEFAULT_FFN_GATE_UP_MODE)
     parser.add_argument("--attention-mode", choices=["single-token", "tiled-stats-1k"], default=DEFAULT_ATTENTION_MODE)
     parser.add_argument("--attention-cache-mode", choices=["repeated-current-token", "synthetic-prefill"], default=DEFAULT_ATTENTION_CACHE_MODE)
     parser.add_argument("--tiled-attention-kv-tile", type=int, default=DEFAULT_TILED_ATTENTION_KV_TILE)
