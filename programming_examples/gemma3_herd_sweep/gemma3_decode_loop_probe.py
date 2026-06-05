@@ -76,12 +76,14 @@ DEFAULT_TILED_LOOP_PROBE_EVIDENCE = (
 PAPER_DECODE_TPS_1K = 41.1
 DEFAULT_INGRESS_MODE = "staged"
 DEFAULT_ATTENTION_O_MODE = "staged"
+DEFAULT_POST_ATTENTION_MODE = "staged"
 DEFAULT_ATTENTION_MODE = "single-token"
 DEFAULT_ATTENTION_CACHE_MODE = "repeated-current-token"
 DEFAULT_TILED_ATTENTION_KV_TILE = 32
 DEFAULT_TILED_ATTENTION_HOST_BATCH_TILES = 2
 STITCHED_INGRESS_BO_ALIASES = {3: 2}
 STITCHED_ATTENTION_O_BO_ALIASES = {4: 3}
+STITCHED_POST_ATTENTION_RESIDUAL_BO_ALIASES = {4: 2}
 _INGRESS_PACK_CACHE: dict[tuple[object, ...], Any] = {}
 
 
@@ -115,11 +117,13 @@ class Gemma3DecodeLoopProbeResult:
     runner_reuse_mode: str
     ingress_mode: str
     attention_o_mode: str
+    post_attention_mode: str
     norm_argument_mode: str
     static_projection_argument_mode: str
     static_projection_bo_set_count: int
     static_ingress_bo_set_count: int
     static_attention_o_bo_set_count: int
+    static_post_attention_residual_bo_set_count: int
     input_shape: tuple[int, ...]
     output_shape: tuple[int, ...]
     input_distribution: str
@@ -171,10 +175,12 @@ class Gemma3DecodeLoopProbeResult:
             f"input={_shape_text(self.input_shape)} output={_shape_text(self.output_shape)} "
             f"output_format={self.output_format} runner_reuse={self.runner_reuse_mode} "
             f"ingress={self.ingress_mode} attention_o={self.attention_o_mode} "
+            f"post_attention={self.post_attention_mode} "
             f"norm_arg={self.norm_argument_mode} static_projection_arg={self.static_projection_argument_mode} "
             f"static_projection_bo_sets={self.static_projection_bo_set_count} "
             f"static_ingress_bo_sets={self.static_ingress_bo_set_count} "
             f"static_attention_o_bo_sets={self.static_attention_o_bo_set_count} "
+            f"static_post_attention_residual_bo_sets={self.static_post_attention_residual_bo_set_count} "
             f"attention_mode={self.attention_mode} attention_cache={self.attention_cache_contract} "
             f"timed_kernel_count={self.timed_kernel_count} "
             f"timed_kernel_seconds={self._value_text(self.timed_kernel_seconds)} "
@@ -860,6 +866,98 @@ def _preload_static_stitched_attention_o_bo_sets(
     return count
 
 
+
+def _stitched_post_attention_residual_bo_set_key(layer_index: int) -> tuple[object, ...]:
+    return ("stitched-post-attention-residual", int(layer_index))
+
+
+def _stitched_post_attention_residual_static_input_keys(
+    *,
+    layer_index: int,
+) -> list[object | None]:
+    keys: list[object | None] = [None] * 6
+    keys[1] = (
+        "stitched-post-attention-residual-static",
+        f"model.layers.{int(layer_index)}.post_attention_layernorm.weight",
+    )
+    keys[2] = ("stitched-post-attention-residual-zero-output", int(layer_index), "post_attention_norm")
+    keys[5] = ("stitched-post-attention-residual-zero-output", int(layer_index), "attention_residual")
+    return keys
+
+
+def _stitched_post_attention_residual_arrays(*, o_actual, residual_lhs, norm_plan: _NormPlan):
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    norm_storage = np.zeros((1, 1152), dtype=bfloat16)
+    return [
+        o_actual.reshape(1, 1152).astype(bfloat16),
+        norm_plan.norm_weights["post_attention_layernorm"].reshape(-1).astype(bfloat16),
+        norm_storage,
+        residual_lhs.reshape(-1).astype(bfloat16),
+        norm_storage.reshape(-1),
+        np.zeros((1152,), dtype=bfloat16),
+    ]
+
+
+def _stitched_post_attention_residual_readback(dtype) -> dict[str, tuple[int, tuple[int, ...], object]]:
+    return {
+        "post_attention_norm": (2, (1, 1152), dtype),
+        "attention_residual": (5, (1152,), dtype),
+    }
+
+
+def _stitched_post_attention_residual_runner(
+    runner_cache: _ReusableElfRunnerCache,
+) -> _ReusableMultiOutputElfRunner:
+    if not runner_cache.enabled:
+        raise RuntimeError("--post-attention-mode=stitched requires reusable ELF runners")
+    from gemma3_stitched_decode import (
+        DEFAULT_POST_ATTENTION_RESIDUAL_FUNCTION_NAME,
+        build_post_attention_residual_module,
+        _stitched_backend_options,
+    )
+
+    key = ("stitched-post-attention-residual-multi-output",)
+    runner = runner_cache.runners.get(key)
+    if runner is None:
+        runner = _ReusableMultiOutputElfRunner(
+            runner_cache,
+            mlir_module=build_post_attention_residual_module(),
+            backend_options=_stitched_backend_options(DEFAULT_POST_ATTENTION_RESIDUAL_FUNCTION_NAME),
+        )
+        runner_cache.runners[key] = runner
+    return runner
+
+
+def _preload_static_stitched_post_attention_residual_bo_sets(
+    *,
+    norm_plans: dict[int, _NormPlan],
+    runner_cache: _ReusableElfRunnerCache,
+) -> int:
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    runner = _stitched_post_attention_residual_runner(runner_cache)
+    count = 0
+    zero_hidden = np.zeros((1, 1152), dtype=bfloat16)
+    for layer_index in sorted(norm_plans):
+        arrays = _stitched_post_attention_residual_arrays(
+            o_actual=zero_hidden,
+            residual_lhs=zero_hidden,
+            norm_plan=norm_plans[layer_index],
+        )
+        runner.prepare(
+            arrays=arrays,
+            bo_set_key=_stitched_post_attention_residual_bo_set_key(layer_index),
+            static_input_keys=_stitched_post_attention_residual_static_input_keys(
+                layer_index=layer_index
+            ),
+            bo_aliases=STITCHED_POST_ATTENTION_RESIDUAL_BO_ALIASES,
+        )
+        count += 1
+    return count
+
 def _projection_output_shape(plan: _PackedProjectionPlan) -> tuple[int, int]:
     return (int(plan.row_blocks), 32)
 
@@ -1305,6 +1403,61 @@ def _run_stitched_attention_o_stage(
     return attention_actual, attention_expected, o_actual, o_expected, evidence, blockers
 
 
+def _run_stitched_post_attention_residual_stage(
+    *,
+    layer_index: int,
+    o_actual,
+    o_expected,
+    x_input,
+    norm_plan: _NormPlan,
+    runner_cache: _ReusableElfRunnerCache,
+    timed_kernel_seconds: list[float] | None,
+    power_meter,
+    check_references: bool,
+) -> tuple[Any, Any, Any, Any, list[str]]:
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    arrays = _stitched_post_attention_residual_arrays(
+        o_actual=o_actual,
+        residual_lhs=x_input,
+        norm_plan=norm_plan,
+    )
+    runner = _stitched_post_attention_residual_runner(runner_cache)
+    actual = runner.run(
+        arrays=arrays,
+        readback=_stitched_post_attention_residual_readback(bfloat16),
+        timed_kernel_seconds=timed_kernel_seconds,
+        power_meter=power_meter,
+        bo_set_key=_stitched_post_attention_residual_bo_set_key(layer_index),
+        static_input_keys=_stitched_post_attention_residual_static_input_keys(layer_index=layer_index),
+        bo_aliases=STITCHED_POST_ATTENTION_RESIDUAL_BO_ALIASES,
+    )
+    post_attention_actual = actual["post_attention_norm"].reshape(1, 1152).astype(bfloat16)
+    residual_actual = actual["attention_residual"].reshape(1, 1152).astype(bfloat16)
+    if check_references:
+        post_attention_expected = _rms_host(
+            o_expected.reshape(1, 1152),
+            norm_plan.norm_weights["post_attention_layernorm"],
+        )
+        residual_expected = (
+            x_input.astype(np.float32) + post_attention_expected.astype(np.float32)
+        ).astype(bfloat16)
+        post_corr = _correlation(post_attention_actual, post_attention_expected)
+        residual_corr = _correlation(residual_actual, residual_expected)
+    else:
+        post_attention_expected = post_attention_actual
+        residual_expected = residual_actual
+        post_corr = None
+        residual_corr = None
+    blockers: list[str] = []
+    if check_references and post_corr is not None and post_corr < DEFAULT_THRESHOLD:
+        blockers.append(f"L{layer_index}:stitched-post-attention-norm-correlation-low")
+    if check_references and residual_corr is not None and residual_corr < DEFAULT_THRESHOLD:
+        blockers.append(f"L{layer_index}:stitched-attention-residual-correlation-low")
+    return post_attention_actual, post_attention_expected, residual_actual, residual_expected, blockers
+
+
 def _run_packed_projection(
     plan: _PackedProjectionPlan,
     activation,
@@ -1378,6 +1531,7 @@ def _run_one_layer(
     tiled_stats_object_file: Path,
     attention_mode: str,
     attention_o_mode: str,
+    post_attention_mode: str,
     attention_cache_mode: str,
     prompt_context_length: int,
     tiled_attention_kv_tile: int,
@@ -1563,38 +1717,60 @@ def _run_one_layer(
     else:
         raise RuntimeError(f"unsupported attention/O mode: {attention_o_mode}")
 
-    post_attention_actual, post_attention_reference = _run_rms_stage(
-        name="post_attention_norm",
-        x=o_actual.reshape(1, 1152),
-        weight=norm_plan.norm_weights["post_attention_layernorm"],
-        runner_cache=runner_cache,
-        timed_kernel_seconds=timed_kernel_seconds,
-        power_meter=power_meter,
-    )
-    post_attention_expected = (
-        _rms_host(o_expected.reshape(1, 1152), norm_plan.norm_weights["post_attention_layernorm"])
-        if check_references
-        else post_attention_actual
-    )
-    if check_references and (_correlation(post_attention_actual, post_attention_reference) < DEFAULT_THRESHOLD or _correlation(post_attention_actual, post_attention_expected) < DEFAULT_THRESHOLD):
-        blockers.append(f"L{layer_index}:post-attention-norm-correlation-low")
+    if post_attention_mode == "stitched":
+        (
+            post_attention_actual,
+            post_attention_expected,
+            residual_actual,
+            residual_expected,
+            post_attention_blockers,
+        ) = _run_stitched_post_attention_residual_stage(
+            layer_index=layer_index,
+            o_actual=o_actual,
+            o_expected=o_expected,
+            x_input=x_input,
+            norm_plan=norm_plan,
+            runner_cache=runner_cache,
+            timed_kernel_seconds=timed_kernel_seconds,
+            power_meter=power_meter,
+            check_references=check_references,
+        )
+        blockers.extend(post_attention_blockers)
+    elif post_attention_mode == "staged":
+        post_attention_actual, post_attention_reference = _run_rms_stage(
+            name="post_attention_norm",
+            x=o_actual.reshape(1, 1152),
+            weight=norm_plan.norm_weights["post_attention_layernorm"],
+            runner_cache=runner_cache,
+            timed_kernel_seconds=timed_kernel_seconds,
+            power_meter=power_meter,
+        )
+        post_attention_expected = (
+            _rms_host(o_expected.reshape(1, 1152), norm_plan.norm_weights["post_attention_layernorm"])
+            if check_references
+            else post_attention_actual
+        )
+        if check_references and (_correlation(post_attention_actual, post_attention_reference) < DEFAULT_THRESHOLD or _correlation(post_attention_actual, post_attention_expected) < DEFAULT_THRESHOLD):
+            blockers.append(f"L{layer_index}:post-attention-norm-correlation-low")
 
-    residual_actual, residual_reference = _run_residual_stage(
-        name="attention",
-        lhs=x_input.reshape(-1),
-        rhs=post_attention_actual.reshape(-1),
-        runner_cache=runner_cache,
-        timed_kernel_seconds=timed_kernel_seconds,
-        power_meter=power_meter,
-    )
-    residual_actual = residual_actual.reshape(1, 1152)
-    residual_expected = (
-        (x_input.astype(np.float32) + post_attention_expected.astype(np.float32)).astype(bfloat16)
-        if check_references
-        else residual_actual
-    )
-    if check_references and (_correlation(residual_actual, residual_reference.reshape(1, 1152)) < DEFAULT_THRESHOLD or _correlation(residual_actual, residual_expected) < DEFAULT_THRESHOLD):
-        blockers.append(f"L{layer_index}:attention-residual-correlation-low")
+        residual_actual, residual_reference = _run_residual_stage(
+            name="attention",
+            lhs=x_input.reshape(-1),
+            rhs=post_attention_actual.reshape(-1),
+            runner_cache=runner_cache,
+            timed_kernel_seconds=timed_kernel_seconds,
+            power_meter=power_meter,
+        )
+        residual_actual = residual_actual.reshape(1, 1152)
+        residual_expected = (
+            (x_input.astype(np.float32) + post_attention_expected.astype(np.float32)).astype(bfloat16)
+            if check_references
+            else residual_actual
+        )
+        if check_references and (_correlation(residual_actual, residual_reference.reshape(1, 1152)) < DEFAULT_THRESHOLD or _correlation(residual_actual, residual_expected) < DEFAULT_THRESHOLD):
+            blockers.append(f"L{layer_index}:attention-residual-correlation-low")
+    else:
+        raise RuntimeError(f"unsupported post-attention mode: {post_attention_mode}")
 
     pre_ff_actual, pre_ff_reference = _run_rms_stage(
         name="pre_feedforward_norm",
@@ -1717,6 +1893,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
     static_projection_bo_set_count = 0
     static_ingress_bo_set_count = 0
     static_attention_o_bo_set_count = 0
+    static_post_attention_residual_bo_set_count = 0
     reference_check_layer_count = 0
     reference_check_seconds: float | None = None
     returncode = 1
@@ -1729,6 +1906,8 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             raise RuntimeError("--ingress-mode=stitched requires reusable ELF runners")
         if args.attention_o_mode == "stitched" and args.no_reuse_elf:
             raise RuntimeError("--attention-o-mode=stitched requires reusable ELF runners")
+        if args.post_attention_mode == "stitched" and args.no_reuse_elf:
+            raise RuntimeError("--post-attention-mode=stitched requires reusable ELF runners")
         if args.attention_o_mode == "stitched" and args.attention_mode != "single-token":
             raise RuntimeError("--attention-o-mode=stitched currently requires --attention-mode=single-token")
         if args.attention_mode == "tiled-stats-1k" and args.prompt_context_length != 1024:
@@ -1750,6 +1929,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         static_projection_bo_set_count = 0
         static_ingress_bo_set_count = 0
         static_attention_o_bo_set_count = 0
+        static_post_attention_residual_bo_set_count = 0
         if static_projection_argument_mode == "preloaded-runner-bo-set":
             projection_preload_family_set = set(FULL_LAYER_PROJECTION_FAMILIES)
             if args.ingress_mode == "stitched":
@@ -1781,6 +1961,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 fused_dqp_object_file=fused_dqp_object_file,
                 flowqkv_object_file=flowqkv_object_file,
             )
+        if args.post_attention_mode == "stitched":
+            static_post_attention_residual_bo_set_count = _preload_static_stitched_post_attention_residual_bo_sets(
+                norm_plans=norm_plans,
+                runner_cache=runner_cache,
+            )
         rng = np.random.default_rng(0)
         warmup_input = rng.uniform(-0.5, 0.5, size=(1, 1152)).astype(bfloat16)
         for layer_index in range(min(args.warmup_layers, args.layers)):
@@ -1800,6 +1985,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 tiled_stats_object_file=tiled_stats_object_file,
                 attention_mode=args.attention_mode,
                 attention_o_mode=args.attention_o_mode,
+                post_attention_mode=args.post_attention_mode,
                 attention_cache_mode=args.attention_cache_mode,
                 prompt_context_length=args.prompt_context_length,
                 tiled_attention_kv_tile=args.tiled_attention_kv_tile,
@@ -1826,6 +2012,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 tiled_stats_object_file=tiled_stats_object_file,
                 attention_mode=args.attention_mode,
                 attention_o_mode=args.attention_o_mode,
+                post_attention_mode=args.post_attention_mode,
                 attention_cache_mode=args.attention_cache_mode,
                 prompt_context_length=args.prompt_context_length,
                 tiled_attention_kv_tile=args.tiled_attention_kv_tile,
@@ -1861,6 +2048,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                     tiled_stats_object_file=tiled_stats_object_file,
                     attention_mode=args.attention_mode,
                     attention_o_mode=args.attention_o_mode,
+                    post_attention_mode=args.post_attention_mode,
                     attention_cache_mode=args.attention_cache_mode,
                     prompt_context_length=args.prompt_context_length,
                     tiled_attention_kv_tile=args.tiled_attention_kv_tile,
@@ -1898,11 +2086,13 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         runner_reuse_mode=("reused-elf-persistent-bo" if not args.no_reuse_elf else "per-launch-compile-load"),
         ingress_mode=args.ingress_mode,
         attention_o_mode=args.attention_o_mode,
+        post_attention_mode=args.post_attention_mode,
         norm_argument_mode="selected-vector",
         static_projection_argument_mode=static_projection_argument_mode,
         static_projection_bo_set_count=static_projection_bo_set_count,
         static_ingress_bo_set_count=static_ingress_bo_set_count,
         static_attention_o_bo_set_count=static_attention_o_bo_set_count,
+        static_post_attention_residual_bo_set_count=static_post_attention_residual_bo_set_count,
         input_shape=(1, 1152),
         output_shape=(1, 1152),
         input_distribution=DEFAULT_INPUT_DISTRIBUTION,
@@ -1953,6 +2143,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 if args.attention_o_mode == "stitched"
                 else "staged attention/O mode runs attention and O projection as separate launch groups"
             ),
+            (
+                "stitched post-attention mode preloads one aliased RMSNorm/residual BO set per layer before measured loop timing"
+                if args.post_attention_mode == "stitched"
+                else "staged post-attention mode runs post-attention RMSNorm and attention residual as separate launches"
+            ),
             "reference_check_seconds validates all layers before measured loop timing and is excluded from measured_loop_seconds",
             "measured_loop_seconds starts after warmup/reference checks and includes current implementation dynamic BO writes and output sync/readback",
             "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls and excludes compile, ELF load, BO allocation, BO writes, sync/readback, and CPU reference/correlation checks",
@@ -1992,7 +2187,12 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             ),
             *(
                 ("decode-layer-after-stitched-attention-o-still-staged",)
-                if args.attention_o_mode == "stitched"
+                if args.attention_o_mode == "stitched" and args.post_attention_mode != "stitched"
+                else ()
+            ),
+            *(
+                ("decode-layer-after-stitched-post-attention-residual-still-staged",)
+                if args.post_attention_mode == "stitched"
                 else ()
             ),
             "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route",
@@ -2033,11 +2233,13 @@ def _self_test() -> None:
         runner_reuse_mode="reused-elf-persistent-bo",
         ingress_mode=DEFAULT_INGRESS_MODE,
         attention_o_mode=DEFAULT_ATTENTION_O_MODE,
+        post_attention_mode=DEFAULT_POST_ATTENTION_MODE,
         norm_argument_mode="selected-vector",
         static_projection_argument_mode="preloaded-runner-bo-set",
         static_projection_bo_set_count=1456,
         static_ingress_bo_set_count=0,
         static_attention_o_bo_set_count=0,
+        static_post_attention_residual_bo_set_count=0,
         input_shape=(1, 1152),
         output_shape=(1, 1152),
         input_distribution=DEFAULT_INPUT_DISTRIBUTION,
@@ -2095,6 +2297,7 @@ def main() -> int:
     parser.add_argument("--power-sample", action="store_true")
     parser.add_argument("--ingress-mode", choices=["staged", "stitched"], default=DEFAULT_INGRESS_MODE)
     parser.add_argument("--attention-o-mode", choices=["staged", "stitched"], default=DEFAULT_ATTENTION_O_MODE)
+    parser.add_argument("--post-attention-mode", choices=["staged", "stitched"], default=DEFAULT_POST_ATTENTION_MODE)
     parser.add_argument("--attention-mode", choices=["single-token", "tiled-stats-1k"], default=DEFAULT_ATTENTION_MODE)
     parser.add_argument("--attention-cache-mode", choices=["repeated-current-token", "synthetic-prefill"], default=DEFAULT_ATTENTION_CACHE_MODE)
     parser.add_argument("--tiled-attention-kv-tile", type=int, default=DEFAULT_TILED_ATTENTION_KV_TILE)
