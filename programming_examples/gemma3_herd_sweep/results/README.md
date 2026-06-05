@@ -187,6 +187,26 @@ power, or paper-parity evidence.
 
 ## Decode Loop Probe Evidence
 
+- `gemma3_1b_decode_loop_stitched_ingress_attention_o_probe.json`: clean-provenance
+  Strix/XRT evidence that the stitched decode-loop route now covers both the
+  ingress and the `attention -> O projection` slice across all 26 real Gemma3
+  1B layers. The run uses `--ingress-mode stitched --attention-o-mode stitched`,
+  preloads 26 stitched-ingress BO sets, 26 stitched attention/O BO sets, and
+  962 remaining staged projection BO sets before timing, and records
+  `dirty_worktree=false` at commit
+  `885e1ad7072243e37802eaa0cc44d0dae8e5f40d`. It validates every layer with no
+  blockers; final-output correlation is 0.999975 on layer 0 and 0.999706 on
+  layer 25. The measured post-warmup loop wall window is 5.152988 s, or
+  0.194062 diagnostic TPS. The summed NPU `run.start()/wait2()` windows total
+  3.763859 s across 1,170 launches, or 0.265685 kernel-only diagnostic TPS.
+  This removes 598 launches from the staged diagnostic and improves loop-wall
+  TPS from 0.184746 to 0.194062, but kernel-only TPS remains slightly below the
+  staged 0.274698 TPS artifact. Full-window direct RAPL reports 10.656 W
+  package power and a 4.204 W pseudo-NPU package-delta. It is still not a paper
+  cell because attention is single-token, KV cache is not prefill-produced,
+  logits/sampling are absent, and residual/FFN/down-projection work remains
+  staged after O projection.
+
 - `gemma3_1b_decode_loop_stitched_ingress_probe.json`: clean-provenance
   Strix/XRT evidence that `--ingress-mode stitched` scales across one decode
   token and all 26 real Gemma3 1B layers. The run preloads 26 aliased
