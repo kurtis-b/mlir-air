@@ -36,6 +36,7 @@ DEFAULT_FUNCTION_NAME = "gemma3_decode_qkv_projection_core"
 DEFAULT_RMS_QKV_FUNCTION_NAME = "gemma3_decode_rms_qkv_projection_core"
 DEFAULT_INGRESS_FUNCTION_NAME = "gemma3_decode_ingress_rms_qkv_qknorm_rope"
 DEFAULT_ATTENTION_O_FUNCTION_NAME = "gemma3_decode_attention_o_projection"
+DEFAULT_POST_ATTENTION_RESIDUAL_FUNCTION_NAME = "gemma3_decode_post_attention_residual"
 DEFAULT_OUTPUT_FORMAT = "elf"
 DEFAULT_FUSED_DQP_OBJECT = Path(__file__).with_name("build_peano") / "fused_dqp.o"
 DEFAULT_ROPE_OBJECT = Path(__file__).with_name("build_peano") / "rope_halfsplit.o"
@@ -44,6 +45,7 @@ DEFAULT_THRESHOLD = 0.99
 DEFAULT_LAYER = 0
 DEFAULT_INGRESS_RESULT_JSON = Path(__file__).with_name("results") / "gemma3_1b_stitched_decode_ingress_probe.json"
 DEFAULT_ATTENTION_O_RESULT_JSON = Path(__file__).with_name("results") / "gemma3_1b_stitched_attention_o_probe.json"
+DEFAULT_POST_ATTENTION_RESIDUAL_RESULT_JSON = Path(__file__).with_name("results") / "gemma3_1b_stitched_post_attention_residual_probe.json"
 
 PROJECTION_CORE_ARG_TYPES = (
     "memref<8x4x5x5120xi8>",  # q packed Q4NX blocks, scale, min
@@ -97,6 +99,15 @@ ATTENTION_O_ARG_TYPES = (
     "memref<4x256xbf16>",  # O-projection activation alias, same BO as arg3
     "memref<10x4x4x5120xi8>",  # O packed Q4NX blocks, scale, min
     "memref<40x32xbf16>",  # O projection output, contiguous 1280 padded values
+)
+
+POST_ATTENTION_RESIDUAL_ARG_TYPES = (
+    "memref<1x1152xbf16>",  # O-projection output entering post-attention RMSNorm
+    "memref<1152xbf16>",  # post-attention RMSNorm weight
+    "memref<1x1152xbf16>",  # post-attention RMSNorm output
+    "memref<1152xbf16>",  # residual lhs, the original layer input
+    "memref<1152xbf16>",  # residual rhs alias, same BO as arg2 at runtime
+    "memref<1152xbf16>",  # attention residual output
 )
 
 
@@ -251,6 +262,60 @@ class StitchedAttentionOProbeResult:
             f"launches={self.launch_count} args={self.argument_count} "
             f"output_correlations={corr_text} "
             f"dense_o_projection_correlation={self._corr_text(self.dense_o_projection_correlation)} "
+            f"timed_kernel_count={self.timed_kernel_count} "
+            f"timed_kernel_seconds={self._corr_text(self.timed_kernel_seconds)} "
+            f"timing_window={self.timing_window} threshold={self.threshold:g} "
+            f"model_runner_gaps={gaps} blockers={blockers}"
+        )
+
+    def to_json_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class StitchedPostAttentionResidualProbeResult:
+    schema_version: int
+    model_variant: str
+    status: str
+    sequence_kind: str
+    layer_index: int
+    function_name: str
+    output_format: str
+    launch_count: int
+    argument_count: int
+    output_correlations: tuple[StitchedIngressCorrelation, ...]
+    timed_kernel_count: int
+    timed_kernel_seconds: float | None
+    timing_window: str
+    timing_notes: tuple[str, ...]
+    threshold: float
+    remaining_model_runner_gaps: tuple[str, ...]
+    blockers: tuple[str, ...]
+    command: tuple[str, ...]
+    returncode: int | None
+    elapsed_seconds: float | None
+    git_commit: str | None
+    dirty_worktree: bool | None
+    stdout_tail: tuple[str, ...]
+    stderr_tail: tuple[str, ...]
+
+    @staticmethod
+    def _corr_text(value: float | None) -> str:
+        return "n/a" if value is None else f"{value:.6f}"
+
+    def format(self) -> str:
+        blockers = ",".join(self.blockers) if self.blockers else "none"
+        gaps = ",".join(self.remaining_model_runner_gaps) if self.remaining_model_runner_gaps else "none"
+        corr_text = "|".join(
+            f"{item.name}:{self._corr_text(item.correlation)}"
+            for item in self.output_correlations
+        )
+        return (
+            f"stitched_post_attention_residual_probe model={self.model_variant} status={self.status} "
+            f"sequence={self.sequence_kind} layer=L{self.layer_index} "
+            f"function={self.function_name} output_format={self.output_format} "
+            f"launches={self.launch_count} args={self.argument_count} "
+            f"output_correlations={corr_text} "
             f"timed_kernel_count={self.timed_kernel_count} "
             f"timed_kernel_seconds={self._corr_text(self.timed_kernel_seconds)} "
             f"timing_window={self.timing_window} threshold={self.threshold:g} "
@@ -502,6 +567,28 @@ def build_attention_o_text(
     )
 
 
+def build_post_attention_residual_text(
+    *,
+    function_name: str = DEFAULT_POST_ATTENTION_RESIDUAL_FUNCTION_NAME,
+) -> str:
+    """Build stitched post-attention RMSNorm plus attention residual MLIR text."""
+    _activate_builder_paths()
+    from ml_dtypes import bfloat16
+    from residual_add import build_module as build_residual_add
+    from weighted_rms_norm import build_module as build_weighted_rms
+
+    rms_ir = str(build_weighted_rms(1, 1152, bfloat16, 16, herd_x=1))
+    residual_ir = str(build_residual_add(1152, 288, bfloat16, 16))
+    return stitch_module_text(
+        function_name=function_name,
+        arg_types=POST_ATTENTION_RESIDUAL_ARG_TYPES,
+        specs=(
+            StitchSpec(rms_ir, "pan", {0: 0, 1: 1, 2: 2}, wrap_bare_herds=True),
+            StitchSpec(residual_ir, "par", {0: 3, 1: 4, 2: 5}, wrap_bare_herds=True),
+        ),
+    )
+
+
 def _parse_module(text: str):
     from air.ir import Context, Module
 
@@ -535,6 +622,11 @@ def build_attention_o_module(
 ):
     """Build and parse the stitched attention plus O-projection MLIR module."""
     return _parse_module(build_attention_o_text(object_file=object_file, flowqkv_object_file=flowqkv_object_file))
+
+
+def build_post_attention_residual_module():
+    """Build and parse the stitched post-attention norm plus residual MLIR module."""
+    return _parse_module(build_post_attention_residual_text())
 
 
 def _stitched_backend_options(instance_name: str) -> dict[str, object]:
@@ -608,6 +700,18 @@ def compile_attention_o(
     return _compile_module(
         build_attention_o_module(object_file=object_file, flowqkv_object_file=flowqkv_object_file),
         instance_name=DEFAULT_ATTENTION_O_FUNCTION_NAME,
+        output_binary_name=output_binary_name,
+    )
+
+
+def compile_post_attention_residual(
+    *,
+    output_binary_name: str = DEFAULT_POST_ATTENTION_RESIDUAL_FUNCTION_NAME,
+):
+    """Compile the stitched post-attention RMSNorm plus residual slice as an ELF."""
+    return _compile_module(
+        build_post_attention_residual_module(),
+        instance_name=DEFAULT_POST_ATTENTION_RESIDUAL_FUNCTION_NAME,
         output_binary_name=output_binary_name,
     )
 
@@ -1088,6 +1192,115 @@ def _run_attention_o_hardware(args: argparse.Namespace) -> StitchedAttentionOPro
     )
 
 
+def _run_post_attention_residual_hardware(args: argparse.Namespace) -> StitchedPostAttentionResidualProbeResult:
+    _activate_builder_paths()
+    from gemma3_artifacts import default_weights_dir
+    from ml_dtypes import bfloat16
+    import numpy as np
+
+    repo = _repo_root()
+    git_commit, dirty = _git_info(repo)
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    blockers: list[str] = []
+    start = time.perf_counter()
+    layer_index = int(args.layer_index)
+    weights_dir = (args.weights_dir or default_weights_dir(args.model_variant)).expanduser()
+    timed_kernel_seconds: list[float] = []
+    correlations: list[StitchedIngressCorrelation] = []
+
+    try:
+        norm_key = f"model.layers.{layer_index}.post_attention_layernorm.weight"
+        norm_weight = _load_safetensor_array_np(weights_dir, norm_key).astype(bfloat16).reshape(-1)
+
+        rng = np.random.default_rng(args.seed)
+        o_input = rng.uniform(-0.45, 0.45, size=(1, 1152)).astype(bfloat16)
+        residual_lhs = rng.uniform(-0.55, 0.55, size=(1152,)).astype(bfloat16)
+        norm_expected = _rms_host(o_input, norm_weight)
+        residual_expected = (
+            residual_lhs.astype(np.float32) + norm_expected.reshape(-1).astype(np.float32)
+        ).astype(bfloat16)
+
+        norm_storage = np.zeros((1, 1152), dtype=bfloat16)
+        arrays = [
+            o_input,
+            norm_weight,
+            norm_storage,
+            residual_lhs,
+            norm_storage.reshape(-1),
+            np.zeros((1152,), dtype=bfloat16),
+        ]
+        actual = _run_multi_output_elf(
+            mlir_module=build_post_attention_residual_module(),
+            backend_options=_stitched_backend_options(DEFAULT_POST_ATTENTION_RESIDUAL_FUNCTION_NAME),
+            arrays=arrays,
+            readback={
+                "post_attention_norm": (2, (1, 1152), bfloat16),
+                "attention_residual": (5, (1152,), bfloat16),
+            },
+            timed_kernel_seconds=timed_kernel_seconds,
+            bo_aliases={4: 2},
+        )
+        expected = {
+            "post_attention_norm": norm_expected,
+            "attention_residual": residual_expected,
+        }
+        for name, expected_value in expected.items():
+            corr = _correlation(actual[name], expected_value)
+            correlations.append(
+                StitchedIngressCorrelation(
+                    name=name,
+                    shape=tuple(int(dim) for dim in expected_value.shape),
+                    correlation=corr,
+                )
+            )
+            stdout_lines.append(f"{name} correlation: {corr:.6f}")
+            if corr < args.threshold:
+                blockers.append(f"{name}-correlation-low")
+    except Exception as exc:
+        blockers.append(type(exc).__name__)
+        stderr_lines.append(str(exc))
+
+    status = "STITCHED_POST_ATTENTION_RESIDUAL_PASS" if not blockers else "STITCHED_POST_ATTENTION_RESIDUAL_BLOCKED"
+    elapsed = time.perf_counter() - start
+    timed_sum = float(sum(timed_kernel_seconds)) if timed_kernel_seconds else None
+    return StitchedPostAttentionResidualProbeResult(
+        schema_version=1,
+        model_variant=args.model_variant,
+        status=status,
+        sequence_kind="decode-post-attention-residual-stitched",
+        layer_index=layer_index,
+        function_name=DEFAULT_POST_ATTENTION_RESIDUAL_FUNCTION_NAME,
+        output_format=DEFAULT_OUTPUT_FORMAT,
+        launch_count=2,
+        argument_count=len(POST_ATTENTION_RESIDUAL_ARG_TYPES),
+        output_correlations=tuple(correlations),
+        timed_kernel_count=len(timed_kernel_seconds),
+        timed_kernel_seconds=timed_sum,
+        timing_window="single-stitched-elf-run-start-wait2-only-diagnostic",
+        timing_notes=(
+            "compile, ELF load, BO creation, BO writes, and argument binding occur before the timed run.start/wait2 window",
+            "post-attention RMSNorm output and residual RHS are aliased BO views: 1x1152 and 1152",
+            "single post-attention residual diagnostic timing is not a TTFT/TPS or paper-parity result",
+        ),
+        threshold=float(args.threshold),
+        remaining_model_runner_gaps=(
+            "integrate-post-attention-residual-stitched-slice-into-decode-loop",
+            "stitch-remaining-ffn-layer-tail",
+            "prefill-produced-kv-cache-not-wired",
+            "logits-sampling-not-wired",
+        ),
+        blockers=tuple(dict.fromkeys(blockers)),
+        command=tuple(sys.argv),
+        returncode=0 if not blockers else 1,
+        elapsed_seconds=elapsed,
+        git_commit=git_commit,
+        dirty_worktree=dirty,
+        stdout_tail=_tail(stdout_lines),
+        stderr_tail=_tail(stderr_lines),
+    )
+
+
 def _projection_core_text_self_test() -> None:
     a_ir = """module {
   func.func private @fused_dqp_accum_block_opt(memref<4xbf16>) attributes {link_with = "fused_dqp.o", llvm.emit_c_interface}
@@ -1134,16 +1347,20 @@ def main() -> None:
     parser.add_argument("--print-rms-qkv-mlir", action="store_true")
     parser.add_argument("--print-ingress-mlir", action="store_true")
     parser.add_argument("--print-attention-o-mlir", action="store_true")
+    parser.add_argument("--print-post-attention-residual-mlir", action="store_true")
     parser.add_argument("--parse-projection-core", action="store_true")
     parser.add_argument("--parse-rms-qkv", action="store_true")
     parser.add_argument("--parse-ingress", action="store_true")
     parser.add_argument("--parse-attention-o", action="store_true")
+    parser.add_argument("--parse-post-attention-residual", action="store_true")
     parser.add_argument("--compile-projection-core", action="store_true")
     parser.add_argument("--compile-rms-qkv", action="store_true")
     parser.add_argument("--compile-ingress", action="store_true")
     parser.add_argument("--compile-attention-o", action="store_true")
+    parser.add_argument("--compile-post-attention-residual", action="store_true")
     parser.add_argument("--run-ingress-hardware", action="store_true")
     parser.add_argument("--run-attention-o-hardware", action="store_true")
+    parser.add_argument("--run-post-attention-residual-hardware", action="store_true")
     parser.add_argument("--object-file", type=Path, default=DEFAULT_FUSED_DQP_OBJECT)
     parser.add_argument("--rope-object-file", type=Path, default=DEFAULT_ROPE_OBJECT)
     parser.add_argument("--flowqkv-object-file", type=Path, default=DEFAULT_FLOWQKV_OBJECT)
@@ -1173,6 +1390,9 @@ def main() -> None:
     if args.print_attention_o_mlir:
         print(build_attention_o_text(object_file=args.object_file, flowqkv_object_file=args.flowqkv_object_file))
         return
+    if args.print_post_attention_residual_mlir:
+        print(build_post_attention_residual_text())
+        return
     if args.parse_projection_core:
         build_projection_core_module(object_file=args.object_file)
         print(
@@ -1199,6 +1419,13 @@ def main() -> None:
         print(
             f"stitched_attention_o status=PARSE_PASS function={DEFAULT_ATTENTION_O_FUNCTION_NAME} "
             f"launches=2 args={len(ATTENTION_O_ARG_TYPES)} output_format={DEFAULT_OUTPUT_FORMAT}"
+        )
+        return
+    if args.parse_post_attention_residual:
+        build_post_attention_residual_module()
+        print(
+            f"stitched_post_attention_residual status=PARSE_PASS function={DEFAULT_POST_ATTENTION_RESIDUAL_FUNCTION_NAME} "
+            f"launches=2 args={len(POST_ATTENTION_RESIDUAL_ARG_TYPES)} output_format={DEFAULT_OUTPUT_FORMAT}"
         )
         return
     if args.compile_projection_core:
@@ -1229,6 +1456,13 @@ def main() -> None:
             f"output={artifact.output_binary}"
         )
         return
+    if args.compile_post_attention_residual:
+        artifact = compile_post_attention_residual()
+        print(
+            f"stitched_post_attention_residual status=COMPILE_PASS function={DEFAULT_POST_ATTENTION_RESIDUAL_FUNCTION_NAME} "
+            f"output={artifact.output_binary}"
+        )
+        return
     if args.run_ingress_hardware:
         result = _run_ingress_hardware(args)
         print(result.format())
@@ -1245,13 +1479,24 @@ def main() -> None:
             args.result_json.write_text(json.dumps(result.to_json_dict(), indent=2, sort_keys=True) + "\n")
             print(f"GEMMA3_STITCHED_ATTENTION_O_JSON: {args.result_json}")
         raise SystemExit(0 if result.status == "STITCHED_ATTENTION_O_PASS" else 1)
+    if args.run_post_attention_residual_hardware:
+        result = _run_post_attention_residual_hardware(args)
+        print(result.format())
+        if args.result_json:
+            args.result_json.parent.mkdir(parents=True, exist_ok=True)
+            args.result_json.write_text(json.dumps(result.to_json_dict(), indent=2, sort_keys=True) + "\n")
+            print(f"GEMMA3_STITCHED_POST_ATTENTION_RESIDUAL_JSON: {args.result_json}")
+        raise SystemExit(0 if result.status == "STITCHED_POST_ATTENTION_RESIDUAL_PASS" else 1)
     parser.error(
         "pass --self-test, --print-plan, --print-projection-core-mlir, "
         "--print-rms-qkv-mlir, --print-ingress-mlir, --print-attention-o-mlir, "
+        "--print-post-attention-residual-mlir, "
         "--parse-projection-core, --parse-rms-qkv, --parse-ingress, "
-        "--parse-attention-o, --compile-projection-core, --compile-rms-qkv, "
-        "--compile-ingress, --compile-attention-o, --run-ingress-hardware, "
-        "or --run-attention-o-hardware"
+        "--parse-attention-o, --parse-post-attention-residual, "
+        "--compile-projection-core, --compile-rms-qkv, "
+        "--compile-ingress, --compile-attention-o, --compile-post-attention-residual, "
+        "--run-ingress-hardware, "
+        "--run-attention-o-hardware, or --run-post-attention-residual-hardware"
     )
 
 
