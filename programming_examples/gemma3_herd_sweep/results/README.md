@@ -102,6 +102,24 @@ the generated paper-target comparison summary.
   pseudo-NPU power, or paper-parity evidence.
 
 
+## Stitched Decode Ingress Evidence
+
+- `gemma3_1b_stitched_decode_ingress_probe.json`: clean-provenance Strix/XRT
+  evidence for the first real Gemma3 1B stitched decode subgraph. It runs the
+  eight-launch ELF `gemma3_decode_ingress_rms_qkv_qknorm_rope` for layer 0 with
+  real norm and Q/K/V projection weights. The ABI has 18 public BO arguments and
+  binds the RMSNorm output view (`1x1152`) and padded activation view (`5x256`)
+  to the same zero-tailed BO, so no host activation packing or pad-copy launch
+  is in the stitched path. It validates correlations of 0.999991 for input
+  RMSNorm, 0.999990 for the padded activation view, 0.999969/0.999974/0.999973
+  for Q/K/V projections, 0.999957/0.999966 for Q/K norm, and
+  0.999957/0.999966 for Q/K RoPE. The single diagnostic `run.start()/wait2()`
+  window is 0.009281 s, with compile, ELF load, BO creation/writes, and argument
+  binding excluded. This is stitched-subgraph correctness evidence only; it is
+  not a full decode layer, TTFT/TPS timing, pseudo-NPU power, or paper-parity
+  evidence.
+
+
 ## Full Layer Probe Evidence
 
 - `gemma3_1b_decode_full_layer_probe.json`: compact Strix/XRT evidence for one

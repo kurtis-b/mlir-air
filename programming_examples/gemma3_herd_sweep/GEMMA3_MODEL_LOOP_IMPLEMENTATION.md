@@ -137,10 +137,10 @@ Implemented files:
   multi-launch MLIR stitching pattern. It extracts launch bodies, prefixes SSA
   values/maps/symbols, deduplicates preserved Peano external declarations, and
   remaps launch operands into one public function.
-- `gemma3_padded_rms_norm.py`: Gemma3 decode activation bridge that computes
-  weighted RMSNorm for the real `1x1152` hidden vector and writes the padded
-  FusedDQP activation layout `5x256` with a zero-filled tail. This removes
-  host-side activation packing from the stitched decode ingress path.
+- `gemma3_padded_rms_norm.py`: earlier Gemma3 decode activation bridge that
+  computes weighted RMSNorm and writes `5x256` directly. It remains
+  hardware-free compile/self-test coverage; the stitched ingress production
+  path now uses the proven weighted RMSNorm kernel with BO aliasing instead.
 - `gemma3_projection_qk_norm.py`: projection-output view bridge plus Q/K
   RMSNorm. It treats FusedDQP's contiguous `32x32` Q output as `4x256` heads
   and `8x32` K output as `1x256`, using zero-copy memref collapse/expand inside
@@ -148,11 +148,13 @@ Implemented files:
 - `gemma3_stitched_decode.py`: active stitched-ELF decode track for real Gemma3
   text inference. The current implemented slice is the full decode ingress
   `gemma3_decode_ingress_rms_qkv_qknorm_rope`, an eight-launch stitched ELF
-  compile target covering `RMSNorm -> Q/K/V projections -> Q/K Norm -> RoPE`.
-  It removes host activation packing, host col-block accumulation, and the
-  projection-output layout bridge from the timed contract for this ingress
-  slice. Hardware correctness against real HF/reference layer tensors is still
-  the next validation gate.
+  hardware-validated target covering `RMSNorm -> Q/K/V projections -> Q/K Norm -> RoPE`.
+  It uses the proven weighted RMSNorm kernel and binds the RMSNorm output and
+  padded activation view to the same zero-tailed BO, avoiding a separate pad
+  copy kernel. It removes host activation packing, host col-block accumulation,
+  and the projection-output layout bridge from the timed contract for this
+  ingress slice. Hardware correctness against real layer-0 HF/reference tensors
+  is recorded in `results/gemma3_1b_stitched_decode_ingress_probe.json`.
 - `gemma3_model_runner.py`: launch-order manifest that composes BO planning,
   static-preload planning, buffer bindings, argument layouts, and per-layer
   kernel/fallback wiring without claiming kernel execution.
@@ -174,30 +176,33 @@ The current implemented stitched slice is the full decode ingress through RoPE:
 
 ```text
 layer_input:1x1152 + input_norm_weight:1152
-  -> padded RMSNorm bridge -> activation_padded:5x256
-  -> q_proj full-col-block FusedDQP -> q:32x32
-  -> k_proj full-col-block FusedDQP -> k:8x32
-  -> v_proj full-col-block FusedDQP -> v:8x32
+  -> weighted RMSNorm -> rms_out:1x1152
+  -> rms_out/padded_activation shared zero-tailed BO alias -> activation_padded:5x256
+  -> q_proj full-col-block FusedDQP l2-gather -> q:32x32
+  -> k_proj full-col-block FusedDQP l2-gather -> k:8x32
+  -> v_proj full-col-block FusedDQP l2-gather -> v:8x32
   -> Q/K projection-output view + RMSNorm -> q_norm:4x256, k_norm:1x256
   -> Q/K half-split RoPE -> q_rope:4x256, k_rope:1x256
 ```
 
 This slice is intentionally shaped around the paper-style FusedDQP builder with
-`col_blocks=5`, not the older per-column-block diagnostic loop. It removes host
-activation packing, host col-block accumulation, and host projection-output
-layout conversion from the ingress path. Current local evidence is parse and
-compile-only ELF pass for standalone bridge pieces and the stitched
-`gemma3_decode_ingress_rms_qkv_qknorm_rope` target with 17 public BO arguments
-and eight stitched `air.launch` regions; it has not yet been run on hardware or
-compared against HF tensors.
+`col_blocks=5`, not the older per-column-block diagnostic loop. It uses explicit
+`l2-gather` projection output and a runtime BO alias for the RMSNorm output and
+padded activation view. It removes host activation packing, host col-block
+accumulation, and host projection-output layout conversion from the ingress
+path. Current local evidence is parse, compile-only ELF, and one real layer-0
+hardware run of `gemma3_decode_ingress_rms_qkv_qknorm_rope` with 18 public BO
+arguments and eight stitched `air.launch` regions. The clean-provenance result
+records `dirty_worktree=false`, one 0.009281 s diagnostic `run.start()/wait2()`
+window, and correlations at or above 0.999957 for input RMSNorm, padded
+activation, Q/K/V projection, Q/K norm, and Q/K RoPE outputs. This is still not
+a TTFT/TPS or paper-parity result.
 
 Remaining decode-ingress work:
 
-- Run the eight-launch stitched ingress ELF on hardware for one real layer and
-  compare RMSNorm, Q/K/V projection, Q/K norm, and RoPE outputs against
-  HF/reference tensors.
-- Replace the staged decode-loop ingress launches with this stitched ELF after
-  hardware correctness passes.
+- Replace the staged decode-loop ingress launches with this stitched ELF.
+- Stitch the rest of one decode layer: attention, O projection, residual, FFN
+  norms/projections, GeGLU, down projection, and residual.
 - Wire real prefill-produced KV cache before collecting paper-comparison
   TTFT/TPS/power numbers.
 
