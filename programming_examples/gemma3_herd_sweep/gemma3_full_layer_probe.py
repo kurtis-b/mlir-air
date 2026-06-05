@@ -6,15 +6,18 @@
 
 This diagnostic wires one Gemma3 1B decode layer pass with real weights. The
 projection stages launch on the NPU through the FusedDQP column-block route;
-RMSNorm/QK-Norm, RoPE, GeGLU, and residual adds launch through Gemma standalone
-wrappers; single-token attention remains an explicit host fallback. This is
-full-layer staged correctness evidence, not a full model loop, TTFT/TPS timing,
-pseudo-NPU power, or a paper-parity result.
+RMSNorm/QK-Norm, RoPE, single-token FlowQKV attention, GeGLU, and residual
+adds launch through Gemma standalone wrappers. This is full-layer staged
+correctness evidence, not a full model loop, TTFT/TPS timing, pseudo-NPU power,
+or a paper-parity result.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import os
+import subprocess
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
@@ -829,6 +832,67 @@ def _dataflow_dir() -> Path:
     return _repo_root() / "programming_examples/gemma3_dataflow_kernels"
 
 
+def _aie_api_include() -> Path:
+    candidates = []
+    mlir_aie = os.environ.get("MLIR_AIE_INSTALL_DIR")
+    if mlir_aie:
+        base = Path(mlir_aie)
+        candidates.extend([
+            base / "include",
+            base / "lib/python3.12/site-packages/mlir_aie/include",
+        ])
+    candidates.append(_repo_root() / "sandbox/lib/python3.12/site-packages/mlir_aie/include")
+    for candidate in candidates:
+        if (candidate / "aie_api").is_dir():
+            return candidate
+    raise RuntimeError("could not locate aie_api include directory")
+
+
+def _compile_flowqkv_single_token_kernel(object_file: Path) -> None:
+    peano = os.environ.get("PEANO_INSTALL_DIR")
+    if not peano:
+        raise RuntimeError("PEANO_INSTALL_DIR is required to compile flow_attention.cc")
+    clangxx = Path(peano) / "bin/clang++"
+    if not clangxx.exists():
+        raise RuntimeError(f"missing Peano clang++: {clangxx}")
+    src = _dataflow_dir() / "flow_attention.cc"
+    object_file.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        str(clangxx),
+        "-O2",
+        "-std=c++20",
+        "--target=aie2p-none-unknown-elf",
+        "-Wno-parentheses",
+        "-Wno-attributes",
+        "-Wno-macro-redefined",
+        "-Wno-empty-body",
+        "-DNDEBUG",
+        "-I",
+        str(_aie_api_include()),
+        "-DQ_CHUNK=4",
+        "-DKV_LEN=1",
+        "-DHEAD_DIM=256",
+        "-DQUERY_BASE=0",
+        "-DWINDOW_LEN=0",
+        "-DCAUSAL=1",
+        "-c",
+        str(src),
+        "-o",
+        str(object_file),
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def _flowqkv_module_helpers():
+    module_path = _dataflow_dir() / "flow_common.py"
+    spec = importlib.util.spec_from_file_location("gemma3_dataflow_flow_common", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load flow_common.py from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.build_flow_module
+
+
 def _identity_rope_lut(rows: int, head_dim: int, dtype):
     import numpy as np
 
@@ -1008,6 +1072,57 @@ def _run_geglu_stage(
     return actual.reshape(gate.shape).astype(bfloat16), expected.reshape(gate.shape).astype(bfloat16)
 
 
+def _run_single_token_attention_stage(
+    *,
+    q,
+    k,
+    v,
+    object_file: Path,
+    runner_cache: _ReusableElfRunnerCache,
+    timed_kernel_seconds: list[float] | None = None,
+    power_meter=None,
+):
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    build_flow_module = _flowqkv_module_helpers()
+    if not object_file.exists():
+        _compile_flowqkv_single_token_kernel(object_file)
+    q_in = q.reshape(1, 4, 256).astype(bfloat16)
+    k_in = k.reshape(1, 1, 256).astype(bfloat16)
+    v_in = v.reshape(1, 1, 256).astype(bfloat16)
+    module = build_flow_module(
+        4,
+        1,
+        256,
+        "flowqkv_chunk_bf16",
+        str(object_file),
+        "flowqkv_single_token",
+        1,
+        1,
+        1,
+    )
+    actual = runner_cache.run(
+        key=("flowqkv_single_token", 4, 1, 256),
+        mlir_module=module,
+        backend_options=dict(
+            verbose=False,
+            omit_pingpong=True,
+            output_format=DEFAULT_OUTPUT_FORMAT,
+            instance_name="flow_attention",
+            target_device="npu2",
+            runtime_loop_tiling_sizes=[1, 1],
+        ),
+        inputs=[q_in, k_in, v_in],
+        output_shape=(1, 4, 256),
+        output_dtype=bfloat16,
+        timed_kernel_seconds=timed_kernel_seconds,
+        power_meter=power_meter,
+    )
+    expected = np.tile(v.reshape(1, 256), (4, 1)).reshape(1, 4, 256).astype(bfloat16)
+    return actual.reshape(1024).astype(bfloat16), expected.reshape(1024).astype(bfloat16)
+
+
 def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResult:
     _activate_probe_env()
     import numpy as np
@@ -1065,6 +1180,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         if not object_file.exists():
             raise RuntimeError(f"missing FusedDQP object file: {object_file}")
         rope_object_file = Path(__file__).with_name("build_peano") / "rope_halfsplit.o"
+        flowqkv_object_file = Path(__file__).with_name("build_peano") / "flowqkv_single_token_q4_kv1_d256.o"
 
         rng = np.random.default_rng(0)
         x_input = rng.uniform(-0.5, 0.5, size=(1, 1152)).astype(bfloat16)
@@ -1183,9 +1299,19 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
             blockers.append("decode-rope-q-correlation-low")
         if rope_k_correlation < DEFAULT_THRESHOLD:
             blockers.append("decode-rope-k-correlation-low")
-        attention_actual = np.tile(v_actual.reshape(1, 256), (4, 1)).reshape(1024).astype(bfloat16)
+        attention_actual, attention_reference = _run_single_token_attention_stage(
+            q=q_rope_actual,
+            k=k_rope_actual,
+            v=v_actual,
+            object_file=flowqkv_object_file,
+            runner_cache=runner_cache,
+            timed_kernel_seconds=timed_kernel_samples,
+            power_meter=power_meter,
+        )
         attention_expected = np.tile(v_expected.reshape(1, 256), (4, 1)).reshape(1024).astype(bfloat16)
         attention_correlation = _correlation(attention_actual, attention_expected)
+        if _correlation(attention_actual, attention_reference) < DEFAULT_THRESHOLD:
+            blockers.append("decode-single-token-attention-correlation-low")
 
         o_weight = _load_safetensor_array(weights_dir, projection_keys["o_proj"])
         o_actual, o_expected, o_dense, evidence = _run_projection(
@@ -1372,7 +1498,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
             f"decode:L{layer_index}:qkv_projection",
             f"decode:L{layer_index}:qk_norm",
             f"decode:L{layer_index}:rope_halfsplit_npu_identity_pos0",
-            f"decode:L{layer_index}:single_token_attention_host",
+            f"decode:L{layer_index}:single_token_attention_flowqkv_npu",
             f"decode:L{layer_index}:output_projection",
             f"decode:L{layer_index}:post_attention_norm",
             f"decode:L{layer_index}:attention_residual",
@@ -1396,7 +1522,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3FullLayerProbeResu
         norm_tensor_keys=norm_tensor_keys,
         projection_tensor_keys=projection_keys,
         projection_weight_layout="fused-dqp-paper-repacked-full-layer-colblock-loop",
-        host_fallbacks=("single_token_attention",),
+        host_fallbacks=(),
         input_distribution=DEFAULT_INPUT_DISTRIBUTION,
         rms_correlation=rms_correlation,
         projection_evidence=tuple(projection_evidence),
@@ -1475,7 +1601,7 @@ def _self_test() -> None:
         norm_tensor_keys=NORM_TENSOR_KEYS,
         projection_tensor_keys={family: f"model.layers.0.fixture.{family}.weight" for family in FULL_LAYER_PROJECTION_FAMILIES},
         projection_weight_layout="fused-dqp-paper-repacked-full-layer-colblock-loop",
-        host_fallbacks=("single_token_attention",),
+        host_fallbacks=(),
         input_distribution=DEFAULT_INPUT_DISTRIBUTION,
         rms_correlation=0.999991,
         projection_evidence=projection_evidence,
