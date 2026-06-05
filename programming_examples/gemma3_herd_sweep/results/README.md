@@ -251,17 +251,18 @@ power, or paper-parity evidence.
   stitched --ffn-gate-up-mode stitched --ffn-geglu-down-mode stitched`, preloads
   26 stitched BO sets for each integrated slice, leaves zero staged projection
   BO sets, and records `dirty_worktree=false` at commit
-  `a94bd88b3412b73a08bf104b1c6eb5a7f2032e3f`. It validates every layer with no
-  blockers. The measured post-warmup loop wall window is 6.331318 s, or
-  0.157945 diagnostic TPS. The summed NPU `run.start()/wait2()` windows total
-  5.975497 s across 182 launches, or 0.167350 kernel-only diagnostic TPS. This
+  `fa7e10a93f02d4767fcf4e91b8b9858f64952a0e`. It validates every layer with no
+  blockers. The measured post-warmup loop wall window is 4.965462 s, or
+  0.201391 diagnostic TPS. The summed NPU `run.start()/wait2()` windows total
+  4.603050 s across 182 launches, or 0.217247 kernel-only diagnostic TPS. This
   removes another 702 timed launches versus the gate/up-only stitched loop, but
-  it is a performance regression from that artifact's 0.233325 loop-wall TPS
-  and 0.288779 kernel-only TPS because the current streamed down-projection
-  route dominates time. Full-window direct RAPL reports 11.504 W package power
-  and a 1.764 W pseudo-NPU package-delta; segmented RAPL reports 11.254 W
-  package power, with segmented pseudo-NPU delta clipped to 0.000 W because the
-  immediate quiescent segment sample was higher than segmented package watts.
+  it remains a performance regression from that artifact's 0.233325 loop-wall
+  TPS and 0.288779 kernel-only TPS because the tuned 1x3 streamed
+  down-projection route still dominates time. Full-window direct RAPL reports
+  11.176 W package power and a pseudo-NPU package-delta clipped to 0.000 W;
+  segmented RAPL reports 10.855 W package power, with segmented pseudo-NPU
+  delta clipped to 0.000 W because the immediate quiescent segment sample was
+  higher than segmented package watts.
   It is still not a paper cell because attention is single-token, KV cache is
   not prefill-produced, logits/sampling are absent, and post-FF/final-residual
   work remains staged after the down projection.

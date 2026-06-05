@@ -191,9 +191,10 @@ Implemented files:
   `results/gemma3_1b_stitched_geglu_down_probe.json`, and 26-layer loop evidence
   is recorded in
   `results/gemma3_1b_decode_loop_stitched_ingress_attention_o_post_attention_ffn_gate_up_geglu_down_probe.json`.
-  The integrated route is correctness-clean but currently performance-negative:
-  it reduces timed launch count from 884 to 182, while kernel-only TPS falls
-  from 0.288779 to 0.167350 because the streamed down-projection path dominates.
+  The integrated route is correctness-clean but still performance-negative:
+  a tuned 36-row-block, 1x3-herd layout reduces timed launch count from 884 to
+  182, while kernel-only TPS falls from 0.288779 to 0.217247 because the
+  streamed down-projection path still dominates.
 - `gemma3_model_runner.py`: launch-order manifest that composes BO planning,
   static-preload planning, buffer bindings, argument layouts, and per-layer
   kernel/fallback wiring without claiming kernel execution.
@@ -245,9 +246,10 @@ Remaining stitched decode work:
 - Tune or restructure the integrated stitched ingress plus attention/O/
   post-attention/gate-up route because it improves loop-wall timing but still
   trails the staged baseline on kernel-only TPS in some combinations.
-- Tune or restructure the integrated `GeGLU -> down projection` stitched slice;
-  it is correctness-clean and removes staged down-projection BO preloads, but
-  the current streamed down-projection route regresses 26-layer diagnostic TPS.
+- Further tune or restructure the integrated `GeGLU -> down projection` stitched
+  slice; it is correctness-clean and removes staged down-projection BO preloads,
+  but the tuned 1x3 streamed down-projection route still regresses 26-layer
+  diagnostic TPS versus the gate/up-only stitched loop.
 - Stitch post-feedforward RMSNorm and the final residual add after the
   GeGLU/down route is performance-acceptable.
 - Wire real prefill-produced KV cache before collecting paper-comparison
