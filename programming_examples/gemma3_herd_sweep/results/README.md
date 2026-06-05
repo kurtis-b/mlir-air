@@ -242,6 +242,26 @@ power, or paper-parity evidence.
 
 ## Decode Loop Probe Evidence
 
+- `gemma3_1b_decode_loop_stitched_hf_prefill_tiled_stats_probe.json`:
+  clean-provenance Strix/XRT evidence for the 26-layer diagnostic route that
+  combines stitched ingress, staged tiled-stat 1k attention plus staged O
+  projection, stitched post-attention residual, stitched FFN gate/up, stitched
+  GeGLU/down, and stitched post-feedforward residual. It uses
+  `--attention-cache-mode hf-prefill` to build a real HF-produced Gemma3 1B
+  prefill KV cache outside the measured loop, then feeds that cache into the
+  tiled-stat attention diagnostic. Local sliding-window layers consume their
+  retained HF prefill cache plus the current K/V token; global layers consume
+  the full 1k HF cache. The result records `dirty_worktree=false` at commit
+  `0964f4cc518a9423d0412103e6404a5385c65b93`,
+  `attention_cache_build_seconds=2.737617`, 26 cache layers, and no blockers.
+  The measured post-warmup loop wall window is 21.929564 s, or 0.045601
+  diagnostic TPS. The summed NPU `run.start()/wait2()` windows total
+  21.491694 s across 474 launches, or 0.046530 kernel-only diagnostic TPS. It
+  is still not a paper cell because the prefill cache is host/HF-produced rather
+  than NPU-produced, tiled-stat softmax reduction remains host-side, logits and
+  sampling are absent, and production contiguous static-weight BO routing is not
+  complete.
+
 - `gemma3_1b_decode_loop_stitched_ingress_attention_o_post_attention_ffn_gate_up_geglu_down_post_feedforward_probe.json`:
   clean-provenance Strix/XRT evidence that the stitched decode-loop route now
   covers every current single-token decode-layer stage through the final

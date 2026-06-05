@@ -73,6 +73,10 @@ DEFAULT_LOOP_PROBE_EVIDENCE = (
 DEFAULT_TILED_LOOP_PROBE_EVIDENCE = (
     Path(__file__).with_name("results") / "gemma3_1b_decode_loop_tiled_stats_probe.json"
 )
+DEFAULT_HF_PREFILL_TILED_LOOP_PROBE_EVIDENCE = (
+    Path(__file__).with_name("results")
+    / "gemma3_1b_decode_loop_stitched_hf_prefill_tiled_stats_probe.json"
+)
 PAPER_DECODE_TPS_1K = 41.1
 DEFAULT_INGRESS_MODE = "staged"
 DEFAULT_ATTENTION_O_MODE = "staged"
@@ -271,6 +275,42 @@ def has_decode_loop_tiled_stats_evidence(
         and "prefill-produced-kv-cache-not-wired" in tuple(data.get("remaining_paper_gaps", ()))
         and "paper-1k-kv-attention-npu-reduction-not-wired"
         in tuple(data.get("remaining_paper_gaps", ()))
+    )
+
+
+
+def has_decode_loop_hf_prefill_tiled_stats_evidence(
+    model_variant: str,
+    path: Path | None = None,
+) -> bool:
+    evidence_path = path or DEFAULT_HF_PREFILL_TILED_LOOP_PROBE_EVIDENCE
+    try:
+        data = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    gaps = tuple(data.get("remaining_paper_gaps", ()))
+    return (
+        data.get("schema_version") == 2
+        and data.get("model_variant") == model_variant
+        and data.get("status") == "DECODE_LOOP_DIAGNOSTIC_PASS"
+        and data.get("sequence_kind") == DEFAULT_SEQUENCE_KIND
+        and data.get("phase") == DEFAULT_PHASE
+        and data.get("layer_count") == 26
+        and data.get("decode_tokens") == 1
+        and data.get("prompt_context_length") == 1024
+        and data.get("attention_mode") == "tiled-stats-1k"
+        and data.get("attention_cache_contract") == "host-hf-prefill-kv-cache"
+        and data.get("attention_cache_layer_count") == 26
+        and data.get("attention_cache_token_count") == 1024
+        and data.get("attention_cache_build_seconds") is not None
+        and data.get("attention_host_reduction") is True
+        and data.get("output_format") == DEFAULT_OUTPUT_FORMAT
+        and data.get("runner_reuse_mode") == "reused-elf-persistent-bo"
+        and not data.get("host_fallbacks")
+        and not data.get("blockers")
+        and data.get("dirty_worktree") is False
+        and "npu-prefill-kv-cache-not-wired" in gaps
+        and "paper-1k-kv-attention-npu-reduction-not-wired" in gaps
     )
 
 def _delta_pct(local_tps: float | None) -> float | None:

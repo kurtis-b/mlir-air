@@ -17,7 +17,10 @@ import json
 from pathlib import Path
 
 from gemma3_artifacts import MODEL_SPECS
-from gemma3_decode_loop_probe import has_decode_loop_tiled_stats_evidence
+from gemma3_decode_loop_probe import (
+    has_decode_loop_hf_prefill_tiled_stats_evidence,
+    has_decode_loop_tiled_stats_evidence,
+)
 from gemma3_full_layer_probe import (
     has_decode_full_layer_evidence,
     has_decode_full_layer_without_host_fallback_evidence,
@@ -39,6 +42,7 @@ MODEL_FULL_LAYER_BLOCKER = "model-full-layer-not-wired"
 MODEL_FULL_1B_LOOP_BLOCKER = "full-1b-loop-not-wired"
 PREFILL_1K_NPU_BLOCKER = "prefill-1k-npu-not-wired"
 PREFILL_PRODUCED_KV_CACHE_BLOCKER = "prefill-produced-kv-cache-not-wired"
+NPU_PREFILL_KV_CACHE_BLOCKER = "npu-prefill-kv-cache-not-wired"
 NPU_ATTENTION_REDUCTION_BLOCKER = "npu-attention-reduction-not-wired"
 LOGITS_SAMPLING_BLOCKER = "logits-sampling-not-wired"
 PRODUCTION_STATIC_BO_BLOCKER = "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
@@ -268,6 +272,13 @@ def build_wiring_plan_from_preflight(
         use_decode_loop_tiled_stats_evidence
         and has_decode_loop_tiled_stats_evidence(preflight.model_variant)
     )
+    decode_loop_hf_prefill_tiled_stats_validated = (
+        use_decode_loop_tiled_stats_evidence
+        and has_decode_loop_hf_prefill_tiled_stats_evidence(preflight.model_variant)
+    )
+    decode_loop_attention_validated = (
+        decode_loop_tiled_stats_validated or decode_loop_hf_prefill_tiled_stats_validated
+    )
     window_len = int(preflight.sliding_window or 0)
     stages: list[Gemma3NPUStage] = []
     for layer_index in range(int(preflight.layers)):
@@ -288,13 +299,17 @@ def build_wiring_plan_from_preflight(
                 first_kernel_stage_validated=first_kernel_stage_validated,
             )
             if (
-                decode_loop_tiled_stats_validated
+                decode_loop_attention_validated
                 and phase == "decode"
                 and role != "kv_cache_append"
             ):
                 if role == "attention":
-                    status = "runner-owned-decode-loop-tiled-stats-synthetic-cache-pass"
-                    blockers = (PREFILL_PRODUCED_KV_CACHE_BLOCKER, NPU_ATTENTION_REDUCTION_BLOCKER)
+                    if decode_loop_hf_prefill_tiled_stats_validated:
+                        status = "runner-owned-decode-loop-tiled-stats-hf-prefill-cache-pass"
+                        blockers = (NPU_PREFILL_KV_CACHE_BLOCKER, NPU_ATTENTION_REDUCTION_BLOCKER)
+                    else:
+                        status = "runner-owned-decode-loop-tiled-stats-synthetic-cache-pass"
+                        blockers = (PREFILL_PRODUCED_KV_CACHE_BLOCKER, NPU_ATTENTION_REDUCTION_BLOCKER)
                 else:
                     status = "runner-owned-decode-loop-staged-pass"
                     blockers = ()
@@ -355,10 +370,14 @@ def build_wiring_plan_from_preflight(
                 )
             )
 
-    if decode_loop_tiled_stats_validated:
+    if decode_loop_attention_validated:
         blockers = [
             PREFILL_1K_NPU_BLOCKER,
-            PREFILL_PRODUCED_KV_CACHE_BLOCKER,
+            (
+                NPU_PREFILL_KV_CACHE_BLOCKER
+                if decode_loop_hf_prefill_tiled_stats_validated
+                else PREFILL_PRODUCED_KV_CACHE_BLOCKER
+            ),
             NPU_ATTENTION_REDUCTION_BLOCKER,
             LOGITS_SAMPLING_BLOCKER,
             PRODUCTION_STATIC_BO_BLOCKER,
@@ -385,7 +404,7 @@ def build_wiring_plan_from_preflight(
         blockers.append("paper-shape-bo-allocation-not-validated")
     if not decode_full_layer_without_host_fallbacks:
         blockers.append("nonlinear-model-stage-promotion-incomplete")
-    if not decode_loop_tiled_stats_validated:
+    if not decode_loop_attention_validated:
         blockers.append("paper-shape-hardware-rerun-required")
     if preflight.model_variant.endswith("vision"):
         blockers.append("vision-npu-path-not-implemented")
