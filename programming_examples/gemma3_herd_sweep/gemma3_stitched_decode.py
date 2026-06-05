@@ -130,8 +130,8 @@ GEGLU_DOWN_ARG_TYPES = (
     "memref<6912xbf16>",  # up projection vector
     "memref<6912xbf16>",  # GeGLU output
     "memref<27x256xbf16>",  # down activation alias, same BO as arg2
-    "memref<20x2x27x5120xi8>",  # down packed Q4NX blocks, scale, min
-    "memref<40x32xbf16>",  # down projection output, contiguous 1280 padded values
+    "memref<12x3x27x5120xi8>",  # down packed Q4NX blocks, scale, min
+    "memref<36x32xbf16>",  # down projection output, contiguous 1152 values
 )
 
 
@@ -774,10 +774,10 @@ def build_geglu_down_text(
             256,
             "fused_dqp_accum_block_opt",
             str(object_file),
-            40,
+            36,
             27,
             1,
-            2,
+            3,
             "l2-gather",
             stream_l1_col_blocks=True,
             l1_col_block_chunk=9,
@@ -1126,12 +1126,21 @@ def _load_safetensor_array_np(weights_dir: Path, tensor_key: str):
     raise RuntimeError(f"tensor key not found in safetensors: {tensor_key}")
 
 
-def _pack_projection_for_herd_cols(weight, *, herd_cols: int):
+def _pack_projection_for_herd_cols(weight, *, herd_cols: int, row_block_count: int | None = None):
     import numpy as np
     from fused_dqp import _pack_l3_inputs
     from gemma3_full_layer_probe import _repack_matrix_for_fused_dqp
 
     packed, scale, min_offset, padded = _repack_matrix_for_fused_dqp(weight)
+    if row_block_count is not None:
+        if row_block_count <= 0 or row_block_count > packed.shape[0]:
+            raise RuntimeError(f"invalid row_block_count={row_block_count} for packed row_blocks={packed.shape[0]}")
+        if row_block_count * 32 < weight.shape[0]:
+            raise RuntimeError(f"row_block_count={row_block_count} truncates weight rows={weight.shape[0]}")
+        packed = packed[:row_block_count]
+        scale = scale[:row_block_count]
+        min_offset = min_offset[:row_block_count]
+        padded = (row_block_count * 32, padded[1])
     params = np.empty((*scale.shape[:-1], 512), dtype=scale.dtype)
     params[..., :256] = scale
     params[..., 256:] = min_offset
@@ -1752,7 +1761,7 @@ def _run_geglu_down_hardware(args: argparse.Namespace) -> StitchedGeGLUDownProbe
     try:
         projection_keys = _projection_tensor_keys(args.model_variant, weights_dir, layer_index)
         down_weight = _load_safetensor_array_np(weights_dir, projection_keys["down_proj"])
-        down_pack, down_packed, down_scale, down_min, _down_padded = _pack_projection_for_herd_cols(down_weight, herd_cols=2)
+        down_pack, down_packed, down_scale, down_min, _down_padded = _pack_projection_for_herd_cols(down_weight, herd_cols=3, row_block_count=36)
 
         rng = np.random.default_rng(args.seed)
         gate = rng.uniform(-0.45, 0.45, size=(6912,)).astype(bfloat16)
@@ -1765,7 +1774,7 @@ def _run_geglu_down_hardware(args: argparse.Namespace) -> StitchedGeGLUDownProbe
             geglu_expected.reshape(27, 256),
             32,
             256,
-        ).reshape(40, 32)
+        ).reshape(36, 32)
 
         geglu_storage = np.zeros((6912,), dtype=bfloat16)
         arrays = [
@@ -1774,7 +1783,7 @@ def _run_geglu_down_hardware(args: argparse.Namespace) -> StitchedGeGLUDownProbe
             geglu_storage,
             geglu_storage.reshape(27, 256),
             down_pack,
-            np.zeros((40, 32), dtype=bfloat16),
+            np.zeros((36, 32), dtype=bfloat16),
         ]
         actual = _run_multi_output_elf(
             mlir_module=build_geglu_down_module(object_file=args.object_file),
@@ -1782,7 +1791,7 @@ def _run_geglu_down_hardware(args: argparse.Namespace) -> StitchedGeGLUDownProbe
             arrays=arrays,
             readback={
                 "geglu": (2, (6912,), bfloat16),
-                "down_proj": (5, (40, 32), bfloat16),
+                "down_proj": (5, (36, 32), bfloat16),
             },
             timed_kernel_seconds=timed_kernel_seconds,
             bo_aliases={3: 2},

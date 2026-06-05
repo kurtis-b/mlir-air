@@ -444,6 +444,34 @@ def _full_packed_l3_for_ingress(plan: _PackedProjectionPlan):
     return _full_packed_l3_for_herd_cols(plan, herd_cols=4)
 
 
+def _stitched_down_projection_plan(plan: _PackedProjectionPlan) -> _PackedProjectionPlan:
+    target_row_blocks = 36
+    if plan.family != "down_proj":
+        raise RuntimeError(f"expected down_proj plan, got {plan.family}")
+    if plan.shape[0] > target_row_blocks * 32:
+        raise RuntimeError(
+            f"down_proj rows={plan.shape[0]} do not fit target row blocks={target_row_blocks}"
+        )
+    if plan.row_blocks == target_row_blocks:
+        return plan
+    if plan.row_blocks < target_row_blocks:
+        raise RuntimeError(
+            f"down_proj row_blocks={plan.row_blocks} below target {target_row_blocks}"
+        )
+    return _PackedProjectionPlan(
+        family=plan.family,
+        tensor_key=plan.tensor_key,
+        shape=plan.shape,
+        padded_shape=(target_row_blocks * 32, plan.padded_shape[1]),
+        row_blocks=target_row_blocks,
+        col_blocks=plan.col_blocks,
+        packed=plan.packed[:target_row_blocks],
+        scale=plan.scale[:target_row_blocks],
+        min_offset=plan.min_offset[:target_row_blocks],
+        mlir_module=plan.mlir_module,
+    )
+
+
 def _full_packed_l3_for_herd_cols(plan: _PackedProjectionPlan, *, herd_cols: int):
     import numpy as np
     from fused_dqp import _pack_l3_inputs
@@ -1108,7 +1136,7 @@ def _stitched_ffn_geglu_down_static_input_keys(
 ) -> list[object | None]:
     keys: list[object | None] = [None] * 6
     keys[2] = ("stitched-ffn-geglu-down-zero-output", int(layer_index), "mlp_activation")
-    keys[4] = ("stitched-ffn-geglu-down-static", projection_plans["down_proj"].tensor_key, "packed-l3-full-herd2")
+    keys[4] = ("stitched-ffn-geglu-down-static", projection_plans["down_proj"].tensor_key, "packed-l3-full-herd3-row36")
     keys[5] = ("stitched-ffn-geglu-down-zero-output", int(layer_index), "down_proj")
     return keys
 
@@ -1123,15 +1151,15 @@ def _stitched_ffn_geglu_down_arrays(*, gate_actual, up_actual, projection_plans:
         up_actual.reshape(-1).astype(bfloat16),
         mlp_storage,
         mlp_storage.reshape(27, 256),
-        _full_packed_l3_for_herd_cols(projection_plans["down_proj"], herd_cols=2),
-        np.zeros((40, 32), dtype=bfloat16),
+        _full_packed_l3_for_herd_cols(_stitched_down_projection_plan(projection_plans["down_proj"]), herd_cols=3),
+        np.zeros((36, 32), dtype=bfloat16),
     ]
 
 
 def _stitched_ffn_geglu_down_readback(dtype) -> dict[str, tuple[int, tuple[int, ...], object]]:
     return {
         "mlp_activation": (2, (6912,), dtype),
-        "down_proj": (5, (40, 32), dtype),
+        "down_proj": (5, (36, 32), dtype),
     }
 
 
@@ -1835,7 +1863,7 @@ def _run_stitched_ffn_geglu_down_stage(
     )
     mlp_actual = actual["mlp_activation"].reshape(-1).astype(bfloat16)
     down_actual = actual["down_proj"].reshape(-1)[:1152].astype(bfloat16)
-    plan = projection_plans["down_proj"]
+    plan = _stitched_down_projection_plan(projection_plans["down_proj"])
     blockers: list[str] = []
     if check_references:
         mlp_expected = _geglu(gate_expected, up_expected).reshape(-1).astype(bfloat16)
@@ -1846,7 +1874,7 @@ def _run_stitched_ffn_geglu_down_stage(
             mlp_expected.reshape(27, 256),
             32,
             256,
-        ).reshape(40, 32)
+        ).reshape(36, 32)
         down_expected = down_full_expected.reshape(-1)[:1152].astype(bfloat16)
         mlp_corr = _correlation(mlp_actual, mlp_expected)
         down_corr = _correlation(down_actual, down_expected)
