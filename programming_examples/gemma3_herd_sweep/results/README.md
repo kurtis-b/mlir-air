@@ -167,9 +167,9 @@ the generated paper-target comparison summary.
   projection correlations 0.999975/0.999975 against quantized FusedDQP
   references, and dense original-weight correlations 0.996628/0.996745. The
   single diagnostic `run.start()/wait2()` window is 0.071125 s, with compile,
-  ELF load, BO creation/writes, and argument binding excluded. This is
-  standalone stitched-slice evidence only; it is not yet integrated into the
-  repeated decode loop or paper-cell timing.
+  ELF load, BO creation/writes, and argument binding excluded. This standalone
+  slice is now also integrated in the decode-loop artifact below, but it is
+  still not paper-cell timing.
 
 
 ## Full Layer Probe Evidence
@@ -221,6 +221,29 @@ power, or paper-parity evidence.
 
 
 ## Decode Loop Probe Evidence
+
+- `gemma3_1b_decode_loop_stitched_ingress_attention_o_post_attention_ffn_gate_up_probe.json`:
+  clean-provenance Strix/XRT evidence that the stitched decode-loop route now
+  covers ingress, `attention -> O projection`, `post-attention RMSNorm ->
+  residual add`, and `pre-FF RMSNorm -> gate/up projection` across all 26 real
+  Gemma3 1B layers. The run uses `--ingress-mode stitched --attention-o-mode
+  stitched --post-attention-mode stitched --ffn-gate-up-mode stitched`, preloads
+  26 stitched BO sets for each integrated slice plus 702 remaining staged
+  projection BO sets before timing, and records `dirty_worktree=false` at commit
+  `d627bf804dbbccbcfc6a616dd93ea3fd7c943145`. It validates every layer with no
+  blockers. The measured post-warmup loop wall window is 4.285861 s, or
+  0.233325 diagnostic TPS. The summed NPU `run.start()/wait2()` windows total
+  3.462861 s across 884 launches, or 0.288779 kernel-only diagnostic TPS. This
+  removes 884 launches from the staged diagnostic, improves loop-wall TPS from
+  0.184746 to 0.233325, and is the first stitched decode-loop diagnostic here
+  whose kernel-only TPS exceeds the staged 0.274698 TPS artifact. Full-window
+  direct RAPL reports 14.749 W package power and a 4.895 W pseudo-NPU
+  package-delta; segmented RAPL reports 14.830 W package power, with segmented
+  pseudo-NPU delta clipped to 0.000 W because the immediate quiescent segment
+  sample was higher than segmented package watts. It is still not a paper cell
+  because attention is single-token, KV cache is not prefill-produced,
+  logits/sampling are absent, and GeGLU/down/post-FF/final-residual work remains
+  staged after the gate/up projections.
 
 - `gemma3_1b_decode_loop_stitched_ingress_attention_o_post_attention_probe.json`:
   clean-provenance Strix/XRT evidence that the stitched decode-loop route now
