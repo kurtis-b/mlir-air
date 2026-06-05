@@ -172,6 +172,25 @@ the generated paper-target comparison summary.
   still not paper-cell timing.
 
 
+## Stitched GeGLU/Down Evidence
+
+- `gemma3_1b_stitched_geglu_down_probe.json`: clean-provenance Strix/XRT
+  evidence for the second stitched FFN slice. It runs
+  `gemma3_decode_geglu_down`, which stitches the Gemma3 GeGLU activation into
+  the down projection. The ABI has six public BO arguments and aliases the
+  GeGLU output as both a contiguous `6912` vector and a `27x256` FusedDQP
+  activation view, avoiding a host activation-layout copy. The down projection
+  uses the paper-style FusedDQP builder with a streamed L1 col-block path so
+  the full 27-column-block down weight fits L1 without emitting duplicate
+  memtile-to-core routes. With real layer-0 `down_proj.weight`, it validates
+  GeGLU correlation 0.999975, down-projection correlation 0.999945 against the
+  quantized FusedDQP reference, and dense original-weight correlation 0.996399.
+  The single diagnostic `run.start()/wait2()` window is 0.140487 s, with
+  compile, ELF load, BO creation/writes, and argument binding excluded. This
+  standalone slice is not yet integrated into the decode-loop artifact, and it
+  is still not paper-cell timing.
+
+
 ## Full Layer Probe Evidence
 
 - `gemma3_1b_decode_full_layer_probe.json`: compact Strix/XRT evidence for one

@@ -157,8 +157,9 @@ Implemented files:
 - `gemma3_stitched_decode.py`: active stitched-ELF decode track for real Gemma3
   text inference. The current integrated loop slices are the full decode ingress
   `gemma3_decode_ingress_rms_qkv_qknorm_rope`, the post-ingress
-  `gemma3_decode_attention_o_projection` slice, and the post-attention residual
-  `gemma3_decode_post_attention_residual` slice. The ingress is an eight-launch
+  `gemma3_decode_attention_o_projection` slice, the post-attention residual
+  `gemma3_decode_post_attention_residual` slice, and the FFN gate/up ingress
+  `gemma3_decode_ffn_gate_up` slice. The ingress is an eight-launch
   stitched ELF covering `RMSNorm -> Q/K/V projections -> Q/K Norm -> RoPE`; it
   aliases the RMSNorm output and padded activation view to the same zero-tailed
   BO, avoiding a separate pad-copy kernel and removing host activation packing,
@@ -177,12 +178,17 @@ Implemented files:
   `results/gemma3_1b_stitched_post_attention_residual_probe.json`, and 26-layer
   loop evidence is recorded in
   `results/gemma3_1b_decode_loop_stitched_ingress_attention_o_post_attention_probe.json`.
-  A new standalone FFN slice, `gemma3_decode_ffn_gate_up`, stitches
+  A standalone FFN slice, `gemma3_decode_ffn_gate_up`, stitches
   pre-feedforward RMSNorm into the gate/up projections with the same
   `1x1152`/`5x256` activation aliasing pattern; clean hardware evidence is
   recorded in `results/gemma3_1b_stitched_ffn_gate_up_probe.json`, and 26-layer
   loop evidence is recorded in
   `results/gemma3_1b_decode_loop_stitched_ingress_attention_o_post_attention_ffn_gate_up_probe.json`.
+  A new standalone `gemma3_decode_geglu_down` slice stitches GeGLU into the
+  down projection with an aliased `6912`/`27x256` activation BO and a streamed
+  FusedDQP L1 col-block path; clean hardware evidence is recorded in
+  `results/gemma3_1b_stitched_geglu_down_probe.json`. It is not integrated into
+  the 26-layer decode loop yet.
 - `gemma3_model_runner.py`: launch-order manifest that composes BO planning,
   static-preload planning, buffer bindings, argument layouts, and per-layer
   kernel/fallback wiring without claiming kernel execution.
@@ -234,8 +240,9 @@ Remaining stitched decode work:
 - Tune the integrated stitched ingress plus attention/O/post-attention route
   because it improves loop-wall timing but still trails the staged baseline on
   kernel-only TPS.
-- Stitch the remaining FFN tail: GeGLU, down projection, post-feedforward
-  RMSNorm, and final residual.
+- Integrate the standalone `GeGLU -> down projection` stitched slice into the
+  26-layer decode loop, then stitch post-feedforward RMSNorm and the final
+  residual add.
 - Wire real prefill-produced KV cache before collecting paper-comparison
   TTFT/TPS/power numbers.
 
