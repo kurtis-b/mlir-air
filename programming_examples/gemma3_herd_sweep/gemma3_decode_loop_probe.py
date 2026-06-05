@@ -76,6 +76,7 @@ DEFAULT_TILED_LOOP_PROBE_EVIDENCE = (
 )
 PAPER_DECODE_TPS_1K = 41.1
 DEFAULT_ATTENTION_MODE = "single-token"
+DEFAULT_ATTENTION_CACHE_MODE = "repeated-current-token"
 DEFAULT_TILED_ATTENTION_KV_TILE = 32
 DEFAULT_TILED_ATTENTION_HOST_BATCH_TILES = 2
 
@@ -222,7 +223,7 @@ def has_decode_loop_tiled_stats_evidence(
         and data.get("decode_tokens") == 1
         and data.get("prompt_context_length") == 1024
         and data.get("attention_mode") == "tiled-stats-1k"
-        and data.get("attention_cache_contract") == "synthetic-repeated-current-token-kv-cache"
+        and data.get("attention_cache_contract") == "synthetic-prefill-kv-cache"
         and data.get("attention_host_batch_count") == 16
         and data.get("attention_host_reduction") is True
         and data.get("output_format") == DEFAULT_OUTPUT_FORMAT
@@ -230,7 +231,8 @@ def has_decode_loop_tiled_stats_evidence(
         and not data.get("host_fallbacks")
         and not data.get("blockers")
         and data.get("dirty_worktree") is False
-        and "paper-1k-kv-attention-production-cache-and-npu-reduction-not-wired"
+        and "prefill-produced-kv-cache-not-wired" in tuple(data.get("remaining_paper_gaps", ()))
+        and "paper-1k-kv-attention-npu-reduction-not-wired"
         in tuple(data.get("remaining_paper_gaps", ()))
     )
 
@@ -425,8 +427,24 @@ def _flowqkv_tiled_stats_helpers():
     return module.build_tiled_stats_module, module.merge_tiled_stats
 
 
+def _synthetic_prefill_kv_cache(
+    *,
+    layer_index: int,
+    prompt_context_length: int,
+):
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    rng = np.random.default_rng(4096 + int(layer_index))
+    val_range = 0.35
+    k_full = rng.uniform(-val_range, val_range, (prompt_context_length, 256)).astype(bfloat16)
+    v_full = rng.uniform(-val_range, val_range, (prompt_context_length, 256)).astype(bfloat16)
+    return k_full, v_full
+
+
 def _run_tiled_stats_attention_stage(
     *,
+    layer_index: int,
     q,
     k,
     v,
@@ -435,6 +453,7 @@ def _run_tiled_stats_attention_stage(
     prompt_context_length: int,
     kv_tile: int,
     host_batch_tiles: int,
+    attention_cache_mode: str,
     timed_kernel_seconds: list[float] | None = None,
     power_meter=None,
 ):
@@ -458,8 +477,16 @@ def _run_tiled_stats_attention_stage(
     build_tiled_stats_module, merge_tiled_stats = _flowqkv_tiled_stats_helpers()
 
     q_single = q.reshape(4, 256).astype(bfloat16)
-    k_full = np.broadcast_to(k.reshape(1, 256).astype(bfloat16), (prompt_context_length, 256)).copy()
-    v_full = np.broadcast_to(v.reshape(1, 256).astype(bfloat16), (prompt_context_length, 256)).copy()
+    if attention_cache_mode == "repeated-current-token":
+        k_full = np.broadcast_to(k.reshape(1, 256).astype(bfloat16), (prompt_context_length, 256)).copy()
+        v_full = np.broadcast_to(v.reshape(1, 256).astype(bfloat16), (prompt_context_length, 256)).copy()
+    elif attention_cache_mode == "synthetic-prefill":
+        k_full, v_full = _synthetic_prefill_kv_cache(
+            layer_index=layer_index,
+            prompt_context_length=prompt_context_length,
+        )
+    else:
+        raise RuntimeError(f"unsupported attention cache mode: {attention_cache_mode}")
     q_tiles = np.broadcast_to(q_single, (tile_count, 4, 256)).copy()
     k_tiles = k_full.reshape(tile_count, kv_tile, 256).copy()
     v_tiles = v_full.reshape(tile_count, kv_tile, 256).copy()
@@ -508,6 +535,7 @@ def _run_tiled_stats_attention_stage(
 def _run_attention_stage(
     *,
     mode: str,
+    layer_index: int,
     q,
     k,
     v,
@@ -517,6 +545,7 @@ def _run_attention_stage(
     prompt_context_length: int,
     tiled_attention_kv_tile: int,
     tiled_attention_host_batch_tiles: int,
+    attention_cache_mode: str,
     timed_kernel_seconds: list[float] | None = None,
     power_meter=None,
 ):
@@ -532,6 +561,7 @@ def _run_attention_stage(
         )
     if mode == "tiled-stats-1k":
         return _run_tiled_stats_attention_stage(
+            layer_index=layer_index,
             q=q,
             k=k,
             v=v,
@@ -540,6 +570,7 @@ def _run_attention_stage(
             prompt_context_length=prompt_context_length,
             kv_tile=tiled_attention_kv_tile,
             host_batch_tiles=tiled_attention_host_batch_tiles,
+            attention_cache_mode=attention_cache_mode,
             timed_kernel_seconds=timed_kernel_seconds,
             power_meter=power_meter,
         )
@@ -644,6 +675,7 @@ def _run_one_layer(
     flowqkv_object_file: Path,
     tiled_stats_object_file: Path,
     attention_mode: str,
+    attention_cache_mode: str,
     prompt_context_length: int,
     tiled_attention_kv_tile: int,
     tiled_attention_host_batch_tiles: int,
@@ -751,6 +783,7 @@ def _run_one_layer(
 
     attention_actual, attention_reference = _run_attention_stage(
         mode=attention_mode,
+        layer_index=layer_index,
         q=q_rope_actual,
         k=k_rope_actual,
         v=v_actual,
@@ -760,6 +793,7 @@ def _run_one_layer(
         prompt_context_length=prompt_context_length,
         tiled_attention_kv_tile=tiled_attention_kv_tile,
         tiled_attention_host_batch_tiles=tiled_attention_host_batch_tiles,
+        attention_cache_mode=attention_cache_mode,
         timed_kernel_seconds=timed_kernel_seconds,
         power_meter=power_meter,
     )
@@ -968,6 +1002,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 flowqkv_object_file=flowqkv_object_file,
                 tiled_stats_object_file=tiled_stats_object_file,
                 attention_mode=args.attention_mode,
+                attention_cache_mode=args.attention_cache_mode,
                 prompt_context_length=args.prompt_context_length,
                 tiled_attention_kv_tile=args.tiled_attention_kv_tile,
                 tiled_attention_host_batch_tiles=args.tiled_attention_host_batch_tiles,
@@ -990,6 +1025,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 flowqkv_object_file=flowqkv_object_file,
                 tiled_stats_object_file=tiled_stats_object_file,
                 attention_mode=args.attention_mode,
+                attention_cache_mode=args.attention_cache_mode,
                 prompt_context_length=args.prompt_context_length,
                 tiled_attention_kv_tile=args.tiled_attention_kv_tile,
                 tiled_attention_host_batch_tiles=args.tiled_attention_host_batch_tiles,
@@ -1021,6 +1057,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                     flowqkv_object_file=flowqkv_object_file,
                     tiled_stats_object_file=tiled_stats_object_file,
                     attention_mode=args.attention_mode,
+                    attention_cache_mode=args.attention_cache_mode,
                     prompt_context_length=args.prompt_context_length,
                     tiled_attention_kv_tile=args.tiled_attention_kv_tile,
                     tiled_attention_host_batch_tiles=args.tiled_attention_host_batch_tiles,
@@ -1066,7 +1103,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         reference_check_seconds=reference_check_seconds,
         attention_mode=args.attention_mode,
         attention_cache_contract=(
-            "synthetic-repeated-current-token-kv-cache"
+            (
+                "synthetic-prefill-kv-cache"
+                if args.attention_cache_mode == "synthetic-prefill"
+                else "synthetic-repeated-current-token-kv-cache"
+            )
             if args.attention_mode == "tiled-stats-1k"
             else "single-current-token-kv"
         ),
@@ -1100,7 +1141,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             (
                 "attention is the staged single-token FlowQKV NPU path, not paper 1k KV-cache attention"
                 if args.attention_mode == "single-token"
-                else "attention is host-batched 1k tiled-stat FlowQKV NPU launches with host-side softmax-stat reduction over a synthetic repeated current-token KV cache"
+                else (
+                    "attention is host-batched 1k tiled-stat FlowQKV NPU launches with host-side softmax-stat reduction over a synthetic prefill-shaped KV cache"
+                    if args.attention_cache_mode == "synthetic-prefill"
+                    else "attention is host-batched 1k tiled-stat FlowQKV NPU launches with host-side softmax-stat reduction over a synthetic repeated current-token KV cache"
+                )
             ),
             "logits and sampling are not wired, so this is a diagnostic decode-loop throughput, not an official paper decode TPS cell",
         ),
@@ -1109,10 +1154,17 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         layer_evidence=tuple(layer_evidence),
         remaining_paper_gaps=(
             "prefill-kv-cache-not-constructed",
-            (
-                "paper-1k-kv-attention-not-wired"
+            *(
+                ("paper-1k-kv-attention-not-wired",)
                 if args.attention_mode == "single-token"
-                else "paper-1k-kv-attention-production-cache-and-npu-reduction-not-wired"
+                else (
+                    (
+                        "prefill-produced-kv-cache-not-wired",
+                        "paper-1k-kv-attention-npu-reduction-not-wired",
+                    )
+                    if args.attention_cache_mode == "synthetic-prefill"
+                    else ("paper-1k-kv-attention-production-cache-and-npu-reduction-not-wired",)
+                )
             ),
             "logits-sampling-not-wired",
             "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route",
@@ -1210,6 +1262,7 @@ def main() -> int:
     parser.add_argument("--result-json", type=Path)
     parser.add_argument("--power-sample", action="store_true")
     parser.add_argument("--attention-mode", choices=["single-token", "tiled-stats-1k"], default=DEFAULT_ATTENTION_MODE)
+    parser.add_argument("--attention-cache-mode", choices=["repeated-current-token", "synthetic-prefill"], default=DEFAULT_ATTENTION_CACHE_MODE)
     parser.add_argument("--tiled-attention-kv-tile", type=int, default=DEFAULT_TILED_ATTENTION_KV_TILE)
     parser.add_argument("--tiled-attention-host-batch-tiles", type=int, default=DEFAULT_TILED_ATTENTION_HOST_BATCH_TILES)
     parser.add_argument("--dynamic-static-weight-writes", action="store_true", help="diagnostic fallback: write packed projection static inputs inside each launch")
