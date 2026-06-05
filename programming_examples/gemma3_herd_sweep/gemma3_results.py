@@ -211,6 +211,12 @@ def load_decode_loop_diagnostic(model_variant: str) -> dict[str, Any] | None:
         return None
     if data.get("status") != "DECODE_LOOP_DIAGNOSTIC_PASS":
         return None
+    host_fallbacks = list(data.get("host_fallbacks", []))
+    fallback_note = (
+        "no decode-loop host fallback compute is present"
+        if not host_fallbacks
+        else "decode-loop host fallbacks remain: " + ",".join(host_fallbacks)
+    )
     return {
         "status": data.get("status"),
         "sequence_kind": data.get("sequence_kind"),
@@ -221,6 +227,7 @@ def load_decode_loop_diagnostic(model_variant: str) -> dict[str, Any] | None:
         "correctness": "PASS",
         "timed_kernel_count": data.get("timed_kernel_count"),
         "timed_kernel_seconds": data.get("timed_kernel_seconds"),
+        "host_fallbacks": host_fallbacks,
         "measured_loop_seconds": data.get("measured_loop_seconds"),
         "diagnostic_decode_tps_loop_wall": data.get("diagnostic_decode_tps_loop_wall"),
         "diagnostic_decode_tps_kernel_only": data.get("diagnostic_decode_tps_kernel_only"),
@@ -235,8 +242,9 @@ def load_decode_loop_diagnostic(model_variant: str) -> dict[str, Any] | None:
         "source_result": str(DEFAULT_LOOP_PROBE_EVIDENCE),
         "notes": [
             "diagnostic staged 26-layer decode-loop timing; not a measured paper TTFT/TPS cell",
-            "loop-wall TPS includes current runner BO writes, sync/readback, and host fallback compute",
-            "kernel-only TPS excludes BO writes, sync/readback, and host fallback compute",
+            "loop-wall TPS includes current runner BO writes, sync/readback, and CPU reference/correlation checks",
+            "kernel-only TPS excludes BO writes, sync/readback, and CPU reference/correlation checks",
+            fallback_note,
         ],
     }
 

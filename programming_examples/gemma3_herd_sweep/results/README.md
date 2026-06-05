@@ -159,17 +159,21 @@ power, or paper-parity evidence.
   measures the post-warmup loop with static projection arguments represented by
   no-allocation metadata placeholders. It validates every layer with RMSNorm and
   final-output correlations above 0.99998 and all projection correlations at
-  approximately 1.000000. The post-warmup loop wall window is 5.772287 s, or
-  0.173242 diagnostic TPS. The summed NPU `run.start()/wait2()` windows total
-  3.606827 s across 1,482 launches, or 0.277252 kernel-only diagnostic TPS.
-  Compared with the paper's 41.1 TPS 1B/1k NPU decode target, those diagnostics
-  are 99.578% and 99.325% low, respectively. Full-window direct RAPL reports
-  15.975 W package power and a 9.482 W pseudo-NPU package-delta from a 6.494 W
-  quiescent package sample. The segmented kernel-only pseudo-NPU delta is not
-  usable in this run because its quiescent sample was taken while preparation
-  was already busy. This remains diagnostic, not a paper cell: 1k KV-cache
-  attention, logits/sampling, host fallback promotion, and the production
-  contiguous static-weight BO route are still not complete.
+  approximately 1.000000. The refreshed loop launches QK-Norm, RoPE,
+  single-token FlowQKV attention, post/pre/post RMSNorm, GeGLU, and both
+  residual adds on the NPU for every layer and records `host_fallbacks=[]`. The
+  post-warmup loop wall window is 7.269038 s, or 0.137570 diagnostic TPS, and
+  includes dynamic BO writes, output sync/readback, and CPU reference/correlation
+  checks. The summed NPU `run.start()/wait2()` windows total 3.744155 s across
+  1,768 launches, or 0.267083 kernel-only diagnostic TPS. Compared with the
+  paper's 41.1 TPS 1B/1k NPU decode target, those diagnostics are 99.665% and
+  99.350% low, respectively. Full-window direct RAPL reports 17.741 W package
+  power and a 6.040 W pseudo-NPU package-delta from an 11.701 W quiescent
+  package sample. The segmented kernel-only pseudo-NPU delta is not usable in
+  this run because its quiescent sample was taken while preparation was already
+  busy. This remains diagnostic, not a paper cell: paper 1k KV-cache attention,
+  logits/sampling, diagnostic reference checks inside the loop, and the
+  production contiguous static-weight BO route are still not complete.
 
 
 ## Static Preload Evidence
