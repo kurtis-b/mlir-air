@@ -5,6 +5,7 @@
 # RUN: %PYTHON %S/gemma3_stitched_decode.py --parse-attention-o | FileCheck %s --check-prefix=ATTO
 # RUN: %PYTHON %S/gemma3_stitched_decode.py --parse-post-attention-residual | FileCheck %s --check-prefix=PARES
 # RUN: %PYTHON %S/gemma3_stitched_decode.py --parse-ffn-gate-up | FileCheck %s --check-prefix=FFNGU
+# RUN: %PYTHON %S/gemma3_stitched_decode.py --parse-geglu-down | FileCheck %s --check-prefix=GEGLUDOWN
 
 # STITCH: gemma3_stitching self-test status=PASS launches=2 args=3
 # PAD: gemma3_padded_rms_norm self-test status=PASS input=1x1152 output=5x256 padded_tail=128
@@ -13,3 +14,4 @@
 # ATTO: stitched_attention_o status=PARSE_PASS function=gemma3_decode_attention_o_projection launches=2 args=7 output_format=elf
 # PARES: stitched_post_attention_residual status=PARSE_PASS function=gemma3_decode_post_attention_residual launches=2 args=6 output_format=elf
 # FFNGU: stitched_ffn_gate_up status=PARSE_PASS function=gemma3_decode_ffn_gate_up launches=3 args=8 output_format=elf
+# GEGLUDOWN: stitched_geglu_down status=PARSE_PASS function=gemma3_decode_geglu_down launches=2 args=6 output_format=elf

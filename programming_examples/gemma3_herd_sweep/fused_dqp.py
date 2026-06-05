@@ -122,7 +122,6 @@ def build_module(
     if output_mode not in ("direct", "l2-gather"):
         raise ValueError(f"unsupported output mode: {output_mode}")
     use_l2_gather = output_mode == "l2-gather"
-
     bf16_type = type_mapper(bfloat16)
     i8_type = IntegerType.get_signless(8)
     packed_elems = rows * cols // 2
@@ -279,10 +278,18 @@ def build_paper_module(
     herd_rows=4,
     herd_cols=4,
     output_mode="l2-gather",
+    stream_l1_col_blocks=False,
+    l1_col_block_chunk=1,
 ):
     if output_mode not in ("direct", "l2-gather"):
         raise ValueError(f"unsupported output mode: {output_mode}")
     use_l2_gather = output_mode == "l2-gather"
+    if stream_l1_col_blocks and (
+        l1_col_block_chunk <= 0 or col_blocks % l1_col_block_chunk != 0
+    ):
+        raise ValueError(
+            "streaming FusedDQP expects col_blocks divisible by l1_col_block_chunk"
+        )
 
     bf16_type = type_mapper(bfloat16)
     i8_type = IntegerType.get_signless(8)
@@ -315,8 +322,14 @@ def build_paper_module(
     l1_pack_all_ty = MemRefType.get(
         [col_blocks * block_bytes], i8_type, memory_space=l1_space
     )
+    l1_pack_one_ty = MemRefType.get(
+        [l1_col_block_chunk * block_bytes], i8_type, memory_space=l1_space
+    )
     l1_act_all_ty = MemRefType.get(
         [col_blocks * cols], bf16_type, memory_space=l1_space
+    )
+    l1_act_stream_ty = MemRefType.get(
+        [l1_col_block_chunk * cols], bf16_type, memory_space=l1_space
     )
     l1_w_ty = MemRefType.get([packed_elems], i8_type, memory_space=l1_space)
     l1_param_pack_ty = MemRefType.get([param_elems], bf16_type, memory_space=l1_space)
@@ -378,8 +391,12 @@ def build_paper_module(
                 def herd_body(_tx, _ty, _sx, _sy, bbase, hpack, hact, h_out):
                     block_idx = affine_apply(block_map, [bbase, _tx, _ty])
 
-                    l1_pack_all = AllocOp(l1_pack_all_ty, [], [])
-                    l1_act_all = AllocOp(l1_act_all_ty, [], [])
+                    if stream_l1_col_blocks:
+                        l1_pack_one = AllocOp(l1_pack_one_ty, [], [])
+                        l1_act_stream = AllocOp(l1_act_stream_ty, [], [])
+                    else:
+                        l1_pack_all = AllocOp(l1_pack_all_ty, [], [])
+                        l1_act_all = AllocOp(l1_act_all_ty, [], [])
                     l1_w = AllocOp(l1_w_ty, [], [])
                     l1_s = AllocOp(l1_param_ty, [], [])
                     l1_m = AllocOp(l1_param_ty, [], [])
@@ -388,48 +405,99 @@ def build_paper_module(
                     zero = ConstantOp(bf16_type, 0.0)
                     linalg.fill(zero, outs=[l1_out])
 
-                    dma_memcpy_nd(
-                        l1_pack_all,
-                        hpack,
-                        src_offsets=[_tx, _ty, 0, 0],
-                        src_sizes=[1, 1, col_blocks, block_bytes],
-                        src_strides=[
-                            herd_cols * col_blocks * block_bytes,
-                            col_blocks * block_bytes,
-                            block_bytes,
-                            1,
-                        ],
-                    )
-                    dma_memcpy_nd(
-                        l1_act_all,
-                        hact,
-                        src_offsets=[0, 0],
-                        src_sizes=[col_blocks, cols],
-                        src_strides=[cols, 1],
-                    )
+                    if not stream_l1_col_blocks:
+                        dma_memcpy_nd(
+                            l1_pack_all,
+                            hpack,
+                            src_offsets=[_tx, _ty, 0, 0],
+                            src_sizes=[1, 1, col_blocks, block_bytes],
+                            src_strides=[
+                                herd_cols * col_blocks * block_bytes,
+                                col_blocks * block_bytes,
+                                block_bytes,
+                                1,
+                            ],
+                        )
+                        dma_memcpy_nd(
+                            l1_act_all,
+                            hact,
+                            src_offsets=[0, 0],
+                            src_sizes=[col_blocks, cols],
+                            src_strides=[cols, 1],
+                        )
 
-                    for cb in range(col_blocks):
-                        block_offset = cb * block_bytes
-                        act_offset = cb * cols
-                        l1_w_src = subview(
-                            l1_pack_all.result, [block_offset], [packed_elems], [1]
-                        )
-                        l1_p_view = view(
-                            l1_param_pack_ty,
-                            l1_pack_all.result,
-                            _index_constant(block_offset + packed_elems),
-                            [],
-                        )
-                        l1_s_src = subview(l1_p_view, [0], [cols], [1])
-                        l1_m_src = subview(l1_p_view, [cols], [cols], [1])
-                        l1_a_src = subview(
-                            l1_act_all.result, [act_offset], [cols], [1]
-                        )
-                        linalg.copy(l1_w_src, outs=[l1_w])
-                        linalg.copy(l1_s_src, outs=[l1_s])
-                        linalg.copy(l1_m_src, outs=[l1_m])
-                        linalg.copy(l1_a_src, outs=[l1_a])
-                        CallOp(dqp_func, [l1_w, l1_s, l1_m, l1_a, l1_out])
+                    if stream_l1_col_blocks:
+                        for chunk_base in range_(0, col_blocks, l1_col_block_chunk):
+                            dma_memcpy_nd(
+                                l1_pack_one,
+                                hpack,
+                                src_offsets=[_tx, _ty, chunk_base, 0],
+                                src_sizes=[1, 1, l1_col_block_chunk, block_bytes],
+                                src_strides=[
+                                    herd_cols * col_blocks * block_bytes,
+                                    col_blocks * block_bytes,
+                                    block_bytes,
+                                    1,
+                                ],
+                            )
+                            dma_memcpy_nd(
+                                l1_act_stream,
+                                hact,
+                                src_offsets=[chunk_base, 0],
+                                src_sizes=[l1_col_block_chunk, cols],
+                                src_strides=[cols, 1],
+                            )
+                            for local_cb in range(l1_col_block_chunk):
+                                block_offset = local_cb * block_bytes
+                                act_offset = local_cb * cols
+                                l1_a_src = subview(
+                                    l1_act_stream.result, [act_offset], [cols], [1]
+                                )
+                                l1_w_src = subview(
+                                    l1_pack_one.result,
+                                    [block_offset],
+                                    [packed_elems],
+                                    [1],
+                                )
+                                l1_p_view = view(
+                                    l1_param_pack_ty,
+                                    l1_pack_one.result,
+                                    _index_constant(block_offset + packed_elems),
+                                    [],
+                                )
+                                l1_s_src = subview(l1_p_view, [0], [cols], [1])
+                                l1_m_src = subview(l1_p_view, [cols], [cols], [1])
+                                linalg.copy(l1_a_src, outs=[l1_a])
+                                linalg.copy(l1_w_src, outs=[l1_w])
+                                linalg.copy(l1_s_src, outs=[l1_s])
+                                linalg.copy(l1_m_src, outs=[l1_m])
+                                CallOp(
+                                    dqp_func, [l1_w, l1_s, l1_m, l1_a, l1_out]
+                                )
+                            yield_([])
+                    else:
+                        for cb in range(col_blocks):
+                            block_offset = cb * block_bytes
+                            act_offset = cb * cols
+                            l1_a_src = subview(
+                                l1_act_all.result, [act_offset], [cols], [1]
+                            )
+                            l1_w_src = subview(
+                                l1_pack_all.result, [block_offset], [packed_elems], [1]
+                            )
+                            l1_p_view = view(
+                                l1_param_pack_ty,
+                                l1_pack_all.result,
+                                _index_constant(block_offset + packed_elems),
+                                [],
+                            )
+                            l1_s_src = subview(l1_p_view, [0], [cols], [1])
+                            l1_m_src = subview(l1_p_view, [cols], [cols], [1])
+                            linalg.copy(l1_a_src, outs=[l1_a])
+                            linalg.copy(l1_w_src, outs=[l1_w])
+                            linalg.copy(l1_s_src, outs=[l1_s])
+                            linalg.copy(l1_m_src, outs=[l1_m])
+                            CallOp(dqp_func, [l1_w, l1_s, l1_m, l1_a, l1_out])
 
                     if use_l2_gather:
                         dma_memcpy_nd(
@@ -448,8 +516,12 @@ def build_paper_module(
                             dst_strides=[rows, 1],
                         )
 
-                    DeallocOp(l1_pack_all)
-                    DeallocOp(l1_act_all)
+                    if stream_l1_col_blocks:
+                        DeallocOp(l1_pack_one)
+                        DeallocOp(l1_act_stream)
+                    else:
+                        DeallocOp(l1_pack_all)
+                        DeallocOp(l1_act_all)
                     DeallocOp(l1_w)
                     DeallocOp(l1_s)
                     DeallocOp(l1_m)

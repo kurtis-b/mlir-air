@@ -38,6 +38,7 @@ DEFAULT_INGRESS_FUNCTION_NAME = "gemma3_decode_ingress_rms_qkv_qknorm_rope"
 DEFAULT_ATTENTION_O_FUNCTION_NAME = "gemma3_decode_attention_o_projection"
 DEFAULT_POST_ATTENTION_RESIDUAL_FUNCTION_NAME = "gemma3_decode_post_attention_residual"
 DEFAULT_FFN_GATE_UP_FUNCTION_NAME = "gemma3_decode_ffn_gate_up"
+DEFAULT_GEGLU_DOWN_FUNCTION_NAME = "gemma3_decode_geglu_down"
 DEFAULT_OUTPUT_FORMAT = "elf"
 DEFAULT_FUSED_DQP_OBJECT = Path(__file__).with_name("build_peano") / "fused_dqp.o"
 DEFAULT_ROPE_OBJECT = Path(__file__).with_name("build_peano") / "rope_halfsplit.o"
@@ -48,6 +49,7 @@ DEFAULT_INGRESS_RESULT_JSON = Path(__file__).with_name("results") / "gemma3_1b_s
 DEFAULT_ATTENTION_O_RESULT_JSON = Path(__file__).with_name("results") / "gemma3_1b_stitched_attention_o_probe.json"
 DEFAULT_POST_ATTENTION_RESIDUAL_RESULT_JSON = Path(__file__).with_name("results") / "gemma3_1b_stitched_post_attention_residual_probe.json"
 DEFAULT_FFN_GATE_UP_RESULT_JSON = Path(__file__).with_name("results") / "gemma3_1b_stitched_ffn_gate_up_probe.json"
+DEFAULT_GEGLU_DOWN_RESULT_JSON = Path(__file__).with_name("results") / "gemma3_1b_stitched_geglu_down_probe.json"
 
 PROJECTION_CORE_ARG_TYPES = (
     "memref<8x4x5x5120xi8>",  # q packed Q4NX blocks, scale, min
@@ -121,6 +123,15 @@ FFN_GATE_UP_ARG_TYPES = (
     "memref<54x4x5x5120xi8>",  # up packed Q4NX blocks, scale, min
     "memref<216x32xbf16>",  # gate projection output, contiguous 6912 values
     "memref<216x32xbf16>",  # up projection output, contiguous 6912 values
+)
+
+GEGLU_DOWN_ARG_TYPES = (
+    "memref<6912xbf16>",  # gate projection vector
+    "memref<6912xbf16>",  # up projection vector
+    "memref<6912xbf16>",  # GeGLU output
+    "memref<27x256xbf16>",  # down activation alias, same BO as arg2
+    "memref<20x2x27x5120xi8>",  # down packed Q4NX blocks, scale, min
+    "memref<40x32xbf16>",  # down projection output, contiguous 1280 padded values
 )
 
 
@@ -389,6 +400,62 @@ class StitchedFFNGateUpProbeResult:
             f"launches={self.launch_count} args={self.argument_count} "
             f"output_correlations={corr_text} "
             f"dense_projection_correlations={dense_text} "
+            f"timed_kernel_count={self.timed_kernel_count} "
+            f"timed_kernel_seconds={self._corr_text(self.timed_kernel_seconds)} "
+            f"timing_window={self.timing_window} threshold={self.threshold:g} "
+            f"model_runner_gaps={gaps} blockers={blockers}"
+        )
+
+    def to_json_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class StitchedGeGLUDownProbeResult:
+    schema_version: int
+    model_variant: str
+    status: str
+    sequence_kind: str
+    layer_index: int
+    function_name: str
+    output_format: str
+    launch_count: int
+    argument_count: int
+    output_correlations: tuple[StitchedIngressCorrelation, ...]
+    dense_down_projection_correlation: float | None
+    timed_kernel_count: int
+    timed_kernel_seconds: float | None
+    timing_window: str
+    timing_notes: tuple[str, ...]
+    threshold: float
+    remaining_model_runner_gaps: tuple[str, ...]
+    blockers: tuple[str, ...]
+    command: tuple[str, ...]
+    returncode: int | None
+    elapsed_seconds: float | None
+    git_commit: str | None
+    dirty_worktree: bool | None
+    stdout_tail: tuple[str, ...]
+    stderr_tail: tuple[str, ...]
+
+    @staticmethod
+    def _corr_text(value: float | None) -> str:
+        return "n/a" if value is None else f"{value:.6f}"
+
+    def format(self) -> str:
+        blockers = ",".join(self.blockers) if self.blockers else "none"
+        gaps = ",".join(self.remaining_model_runner_gaps) if self.remaining_model_runner_gaps else "none"
+        corr_text = "|".join(
+            f"{item.name}:{self._corr_text(item.correlation)}"
+            for item in self.output_correlations
+        )
+        return (
+            f"stitched_geglu_down_probe model={self.model_variant} status={self.status} "
+            f"sequence={self.sequence_kind} layer=L{self.layer_index} "
+            f"function={self.function_name} output_format={self.output_format} "
+            f"launches={self.launch_count} args={self.argument_count} "
+            f"output_correlations={corr_text} "
+            f"dense_down_projection_correlation={self._corr_text(self.dense_down_projection_correlation)} "
             f"timed_kernel_count={self.timed_kernel_count} "
             f"timed_kernel_seconds={self._corr_text(self.timed_kernel_seconds)} "
             f"timing_window={self.timing_window} threshold={self.threshold:g} "
@@ -689,6 +756,43 @@ def build_ffn_gate_up_text(
     )
 
 
+def build_geglu_down_text(
+    *,
+    object_file: Path = DEFAULT_FUSED_DQP_OBJECT,
+    function_name: str = DEFAULT_GEGLU_DOWN_FUNCTION_NAME,
+) -> str:
+    """Build stitched GeGLU plus down projection MLIR text."""
+    _activate_builder_paths()
+    from fused_dqp import build_paper_module
+    from geglu import build_module as build_geglu
+    from ml_dtypes import bfloat16
+
+    geglu_ir = str(build_geglu(6912, 288, bfloat16, 16))
+    down_ir = str(
+        build_paper_module(
+            32,
+            256,
+            "fused_dqp_accum_block_opt",
+            str(object_file),
+            40,
+            27,
+            1,
+            2,
+            "l2-gather",
+            stream_l1_col_blocks=True,
+            l1_col_block_chunk=9,
+        )
+    )
+    return stitch_module_text(
+        function_name=function_name,
+        arg_types=GEGLU_DOWN_ARG_TYPES,
+        specs=(
+            StitchSpec(geglu_ir, "geglu", {0: 0, 1: 1, 2: 2}, wrap_bare_herds=True),
+            StitchSpec(down_ir, "down", {0: 4, 1: 3, 2: 5}),
+        ),
+    )
+
+
 def build_post_attention_residual_text(
     *,
     function_name: str = DEFAULT_POST_ATTENTION_RESIDUAL_FUNCTION_NAME,
@@ -749,6 +853,11 @@ def build_attention_o_module(
 def build_ffn_gate_up_module(*, object_file: Path = DEFAULT_FUSED_DQP_OBJECT):
     """Build and parse the stitched pre-FF norm plus gate/up MLIR module."""
     return _parse_module(build_ffn_gate_up_text(object_file=object_file))
+
+
+def build_geglu_down_module(*, object_file: Path = DEFAULT_FUSED_DQP_OBJECT):
+    """Build and parse the stitched GeGLU plus down projection MLIR module."""
+    return _parse_module(build_geglu_down_text(object_file=object_file))
 
 
 def build_post_attention_residual_module():
@@ -840,6 +949,19 @@ def compile_ffn_gate_up(
     return _compile_module(
         build_ffn_gate_up_module(object_file=object_file),
         instance_name=DEFAULT_FFN_GATE_UP_FUNCTION_NAME,
+        output_binary_name=output_binary_name,
+    )
+
+
+def compile_geglu_down(
+    *,
+    object_file: Path = DEFAULT_FUSED_DQP_OBJECT,
+    output_binary_name: str = DEFAULT_GEGLU_DOWN_FUNCTION_NAME,
+):
+    """Compile the stitched GeGLU plus down projection slice as an ELF."""
+    return _compile_module(
+        build_geglu_down_module(object_file=object_file),
+        instance_name=DEFAULT_GEGLU_DOWN_FUNCTION_NAME,
         output_binary_name=output_binary_name,
     )
 
@@ -1002,6 +1124,22 @@ def _load_safetensor_array_np(weights_dir: Path, tensor_key: str):
             if tensor_key in handle.keys():
                 return handle.get_tensor(tensor_key)
     raise RuntimeError(f"tensor key not found in safetensors: {tensor_key}")
+
+
+def _pack_projection_for_herd_cols(weight, *, herd_cols: int):
+    import numpy as np
+    from fused_dqp import _pack_l3_inputs
+    from gemma3_full_layer_probe import _repack_matrix_for_fused_dqp
+
+    packed, scale, min_offset, padded = _repack_matrix_for_fused_dqp(weight)
+    params = np.empty((*scale.shape[:-1], 512), dtype=scale.dtype)
+    params[..., :256] = scale
+    params[..., 256:] = min_offset
+    row_blocks, col_blocks = packed.shape[:2]
+    if row_blocks % herd_cols != 0:
+        raise RuntimeError(f"row_blocks={row_blocks} is not divisible by herd_cols={herd_cols}")
+    packed_l3 = _pack_l3_inputs(packed, params).reshape(row_blocks // herd_cols, herd_cols, col_blocks, -1)
+    return packed_l3, packed, scale, min_offset, padded
 
 
 def _pack_projection_for_ingress(weight):
@@ -1590,6 +1728,130 @@ def _run_ffn_gate_up_hardware(args: argparse.Namespace) -> StitchedFFNGateUpProb
     )
 
 
+def _run_geglu_down_hardware(args: argparse.Namespace) -> StitchedGeGLUDownProbeResult:
+    _activate_builder_paths()
+    from common import fused_dqp_paper_reference
+    from gemma3_artifacts import default_weights_dir
+    from gemma3_full_layer_probe import _projection_tensor_keys
+    from geglu import geglu_reference
+    from ml_dtypes import bfloat16
+    import numpy as np
+
+    repo = _repo_root()
+    git_commit, dirty = _git_info(repo)
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    blockers: list[str] = []
+    start = time.perf_counter()
+    layer_index = int(args.layer_index)
+    weights_dir = (args.weights_dir or default_weights_dir(args.model_variant)).expanduser()
+    timed_kernel_seconds: list[float] = []
+    correlations: list[StitchedIngressCorrelation] = []
+    dense_down_correlation: float | None = None
+
+    try:
+        projection_keys = _projection_tensor_keys(args.model_variant, weights_dir, layer_index)
+        down_weight = _load_safetensor_array_np(weights_dir, projection_keys["down_proj"])
+        down_pack, down_packed, down_scale, down_min, _down_padded = _pack_projection_for_herd_cols(down_weight, herd_cols=2)
+
+        rng = np.random.default_rng(args.seed)
+        gate = rng.uniform(-0.45, 0.45, size=(6912,)).astype(bfloat16)
+        up = rng.uniform(-0.45, 0.45, size=(6912,)).astype(bfloat16)
+        geglu_expected = geglu_reference(gate, up)
+        down_expected = fused_dqp_paper_reference(
+            down_packed,
+            down_scale,
+            down_min,
+            geglu_expected.reshape(27, 256),
+            32,
+            256,
+        ).reshape(40, 32)
+
+        geglu_storage = np.zeros((6912,), dtype=bfloat16)
+        arrays = [
+            gate,
+            up,
+            geglu_storage,
+            geglu_storage.reshape(27, 256),
+            down_pack,
+            np.zeros((40, 32), dtype=bfloat16),
+        ]
+        actual = _run_multi_output_elf(
+            mlir_module=build_geglu_down_module(object_file=args.object_file),
+            backend_options=_stitched_backend_options(DEFAULT_GEGLU_DOWN_FUNCTION_NAME),
+            arrays=arrays,
+            readback={
+                "geglu": (2, (6912,), bfloat16),
+                "down_proj": (5, (40, 32), bfloat16),
+            },
+            timed_kernel_seconds=timed_kernel_seconds,
+            bo_aliases={3: 2},
+        )
+        expected = {
+            "geglu": geglu_expected,
+            "down_proj": down_expected,
+        }
+        for name, expected_value in expected.items():
+            corr = _correlation(actual[name], expected_value)
+            correlations.append(
+                StitchedIngressCorrelation(
+                    name=name,
+                    shape=tuple(int(dim) for dim in expected_value.shape),
+                    correlation=corr,
+                )
+            )
+            stdout_lines.append(f"{name} correlation: {corr:.6f}")
+            if corr < args.threshold:
+                blockers.append(f"{name}-correlation-low")
+        dense_down_correlation = _correlation(
+            actual["down_proj"].reshape(-1)[:1152],
+            (down_weight.astype(np.float32) @ geglu_expected.astype(np.float32)).astype(bfloat16),
+        )
+    except Exception as exc:
+        blockers.append(type(exc).__name__)
+        stderr_lines.append(str(exc))
+
+    status = "STITCHED_GEGLU_DOWN_PASS" if not blockers else "STITCHED_GEGLU_DOWN_BLOCKED"
+    elapsed = time.perf_counter() - start
+    timed_sum = float(sum(timed_kernel_seconds)) if timed_kernel_seconds else None
+    return StitchedGeGLUDownProbeResult(
+        schema_version=1,
+        model_variant=args.model_variant,
+        status=status,
+        sequence_kind="decode-geglu-down-stitched",
+        layer_index=layer_index,
+        function_name=DEFAULT_GEGLU_DOWN_FUNCTION_NAME,
+        output_format=DEFAULT_OUTPUT_FORMAT,
+        launch_count=2,
+        argument_count=len(GEGLU_DOWN_ARG_TYPES),
+        output_correlations=tuple(correlations),
+        dense_down_projection_correlation=dense_down_correlation,
+        timed_kernel_count=len(timed_kernel_seconds),
+        timed_kernel_seconds=timed_sum,
+        timing_window="single-stitched-elf-run-start-wait2-only-diagnostic",
+        timing_notes=(
+            "compile, ELF load, BO creation, BO writes, and argument binding occur before the timed run.start/wait2 window",
+            "GeGLU output and down-projection activation are aliased BO views: 6912 and 27x256",
+            "single GeGLU/down diagnostic timing is not a TTFT/TPS or paper-parity result",
+        ),
+        threshold=float(args.threshold),
+        remaining_model_runner_gaps=(
+            "integrate-geglu-down-stitched-slice-into-decode-loop",
+            "stitch-postff-final-residual-tail",
+            "prefill-produced-kv-cache-not-wired",
+            "logits-sampling-not-wired",
+        ),
+        blockers=tuple(dict.fromkeys(blockers)),
+        command=tuple(sys.argv),
+        returncode=0 if not blockers else 1,
+        elapsed_seconds=elapsed,
+        git_commit=git_commit,
+        dirty_worktree=dirty,
+        stdout_tail=_tail(stdout_lines),
+        stderr_tail=_tail(stderr_lines),
+    )
+
+
 def _projection_core_text_self_test() -> None:
     a_ir = """module {
   func.func private @fused_dqp_accum_block_opt(memref<4xbf16>) attributes {link_with = "fused_dqp.o", llvm.emit_c_interface}
@@ -1638,22 +1900,26 @@ def main() -> None:
     parser.add_argument("--print-attention-o-mlir", action="store_true")
     parser.add_argument("--print-post-attention-residual-mlir", action="store_true")
     parser.add_argument("--print-ffn-gate-up-mlir", action="store_true")
+    parser.add_argument("--print-geglu-down-mlir", action="store_true")
     parser.add_argument("--parse-projection-core", action="store_true")
     parser.add_argument("--parse-rms-qkv", action="store_true")
     parser.add_argument("--parse-ingress", action="store_true")
     parser.add_argument("--parse-attention-o", action="store_true")
     parser.add_argument("--parse-post-attention-residual", action="store_true")
     parser.add_argument("--parse-ffn-gate-up", action="store_true")
+    parser.add_argument("--parse-geglu-down", action="store_true")
     parser.add_argument("--compile-projection-core", action="store_true")
     parser.add_argument("--compile-rms-qkv", action="store_true")
     parser.add_argument("--compile-ingress", action="store_true")
     parser.add_argument("--compile-attention-o", action="store_true")
     parser.add_argument("--compile-post-attention-residual", action="store_true")
     parser.add_argument("--compile-ffn-gate-up", action="store_true")
+    parser.add_argument("--compile-geglu-down", action="store_true")
     parser.add_argument("--run-ingress-hardware", action="store_true")
     parser.add_argument("--run-attention-o-hardware", action="store_true")
     parser.add_argument("--run-post-attention-residual-hardware", action="store_true")
     parser.add_argument("--run-ffn-gate-up-hardware", action="store_true")
+    parser.add_argument("--run-geglu-down-hardware", action="store_true")
     parser.add_argument("--object-file", type=Path, default=DEFAULT_FUSED_DQP_OBJECT)
     parser.add_argument("--rope-object-file", type=Path, default=DEFAULT_ROPE_OBJECT)
     parser.add_argument("--flowqkv-object-file", type=Path, default=DEFAULT_FLOWQKV_OBJECT)
@@ -1688,6 +1954,9 @@ def main() -> None:
         return
     if args.print_ffn_gate_up_mlir:
         print(build_ffn_gate_up_text(object_file=args.object_file))
+        return
+    if args.print_geglu_down_mlir:
+        print(build_geglu_down_text(object_file=args.object_file))
         return
     if args.parse_projection_core:
         build_projection_core_module(object_file=args.object_file)
@@ -1729,6 +1998,13 @@ def main() -> None:
         print(
             f"stitched_ffn_gate_up status=PARSE_PASS function={DEFAULT_FFN_GATE_UP_FUNCTION_NAME} "
             f"launches=3 args={len(FFN_GATE_UP_ARG_TYPES)} output_format={DEFAULT_OUTPUT_FORMAT}"
+        )
+        return
+    if args.parse_geglu_down:
+        build_geglu_down_module(object_file=args.object_file)
+        print(
+            f"stitched_geglu_down status=PARSE_PASS function={DEFAULT_GEGLU_DOWN_FUNCTION_NAME} "
+            f"launches=2 args={len(GEGLU_DOWN_ARG_TYPES)} output_format={DEFAULT_OUTPUT_FORMAT}"
         )
         return
     if args.compile_projection_core:
@@ -1773,6 +2049,13 @@ def main() -> None:
             f"output={artifact.output_binary}"
         )
         return
+    if args.compile_geglu_down:
+        artifact = compile_geglu_down(object_file=args.object_file)
+        print(
+            f"stitched_geglu_down status=COMPILE_PASS function={DEFAULT_GEGLU_DOWN_FUNCTION_NAME} "
+            f"output={artifact.output_binary}"
+        )
+        return
     if args.run_ingress_hardware:
         result = _run_ingress_hardware(args)
         print(result.format())
@@ -1805,18 +2088,28 @@ def main() -> None:
             args.result_json.write_text(json.dumps(result.to_json_dict(), indent=2, sort_keys=True) + "\n")
             print(f"GEMMA3_STITCHED_FFN_GATE_UP_JSON: {args.result_json}")
         raise SystemExit(0 if result.status == "STITCHED_FFN_GATE_UP_PASS" else 1)
+    if args.run_geglu_down_hardware:
+        result = _run_geglu_down_hardware(args)
+        print(result.format())
+        if args.result_json:
+            args.result_json.parent.mkdir(parents=True, exist_ok=True)
+            args.result_json.write_text(json.dumps(result.to_json_dict(), indent=2, sort_keys=True) + "\n")
+            print(f"GEMMA3_STITCHED_GEGLU_DOWN_JSON: {args.result_json}")
+        raise SystemExit(0 if result.status == "STITCHED_GEGLU_DOWN_PASS" else 1)
     parser.error(
         "pass --self-test, --print-plan, --print-projection-core-mlir, "
         "--print-rms-qkv-mlir, --print-ingress-mlir, --print-attention-o-mlir, "
         "--print-post-attention-residual-mlir, --print-ffn-gate-up-mlir, "
+        "--print-geglu-down-mlir, "
         "--parse-projection-core, --parse-rms-qkv, --parse-ingress, "
         "--parse-attention-o, --parse-post-attention-residual, --parse-ffn-gate-up, "
+        "--parse-geglu-down, "
         "--compile-projection-core, --compile-rms-qkv, "
         "--compile-ingress, --compile-attention-o, --compile-post-attention-residual, "
-        "--compile-ffn-gate-up, "
+        "--compile-ffn-gate-up, --compile-geglu-down, "
         "--run-ingress-hardware, "
         "--run-attention-o-hardware, --run-post-attention-residual-hardware, "
-        "or --run-ffn-gate-up-hardware"
+        "--run-ffn-gate-up-hardware, or --run-geglu-down-hardware"
     )
 
 
