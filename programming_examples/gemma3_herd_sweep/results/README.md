@@ -153,6 +153,25 @@ the generated paper-target comparison summary.
   artifact below, but it is still not paper-cell timing.
 
 
+## Stitched FFN Gate/Up Evidence
+
+- `gemma3_1b_stitched_ffn_gate_up_probe.json`: clean-provenance Strix/XRT
+  evidence for the first stitched FFN slice. It runs
+  `gemma3_decode_ffn_gate_up`, which stitches pre-feedforward RMSNorm directly
+  into full-column-block gate/up FusedDQP projections. The ABI has eight public
+  BO arguments and aliases the RMSNorm output as both `1x1152` for weighted
+  RMSNorm and `5x256` for padded FusedDQP activation, avoiding host activation
+  packing for the FFN ingress. With real layer-0 `pre_feedforward_layernorm`,
+  `gate_proj.weight`, and `up_proj.weight`, it validates pre-FF RMSNorm
+  correlation 0.999992, padded activation correlation 0.999991, gate/up
+  projection correlations 0.999975/0.999975 against quantized FusedDQP
+  references, and dense original-weight correlations 0.996628/0.996745. The
+  single diagnostic `run.start()/wait2()` window is 0.071125 s, with compile,
+  ELF load, BO creation/writes, and argument binding excluded. This is
+  standalone stitched-slice evidence only; it is not yet integrated into the
+  repeated decode loop or paper-cell timing.
+
+
 ## Full Layer Probe Evidence
 
 - `gemma3_1b_decode_full_layer_probe.json`: compact Strix/XRT evidence for one

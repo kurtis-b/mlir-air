@@ -1,0 +1,82 @@
+{
+  "argument_count": 8,
+  "blockers": [],
+  "command": [
+    "programming_examples/gemma3_herd_sweep/gemma3_stitched_decode.py",
+    "--run-ffn-gate-up-hardware",
+    "--result-json",
+    "/tmp/gemma3_1b_stitched_ffn_gate_up_probe.json"
+  ],
+  "dense_projection_correlations": {
+    "gate_proj": 0.9966279717094934,
+    "up_proj": 0.9967453955835205
+  },
+  "dirty_worktree": false,
+  "elapsed_seconds": 5.204528235999533,
+  "function_name": "gemma3_decode_ffn_gate_up",
+  "git_commit": "44d8e77805c846b2483bf962f2e2c57c287a5840",
+  "launch_count": 3,
+  "layer_index": 0,
+  "model_variant": "gemma3-1b",
+  "output_correlations": [
+    {
+      "correlation": 0.9999917202894895,
+      "name": "pre_feedforward_norm",
+      "shape": [
+        1,
+        1152
+      ]
+    },
+    {
+      "correlation": 0.9999907174173988,
+      "name": "activation",
+      "shape": [
+        5,
+        256
+      ]
+    },
+    {
+      "correlation": 0.9999748409357463,
+      "name": "gate_proj",
+      "shape": [
+        216,
+        32
+      ]
+    },
+    {
+      "correlation": 0.9999748004619476,
+      "name": "up_proj",
+      "shape": [
+        216,
+        32
+      ]
+    }
+  ],
+  "output_format": "elf",
+  "remaining_model_runner_gaps": [
+    "integrate-ffn-gate-up-stitched-slice-into-decode-loop",
+    "stitch-geglu-down-postff-final-residual-tail",
+    "prefill-produced-kv-cache-not-wired",
+    "logits-sampling-not-wired"
+  ],
+  "returncode": 0,
+  "schema_version": 1,
+  "sequence_kind": "decode-ffn-gate-up-stitched",
+  "status": "STITCHED_FFN_GATE_UP_PASS",
+  "stderr_tail": [],
+  "stdout_tail": [
+    "pre_feedforward_norm correlation: 0.999992",
+    "activation correlation: 0.999991",
+    "gate_proj correlation: 0.999975",
+    "up_proj correlation: 0.999975"
+  ],
+  "threshold": 0.99,
+  "timed_kernel_count": 1,
+  "timed_kernel_seconds": 0.07112480099931417,
+  "timing_notes": [
+    "compile, ELF load, BO creation, BO writes, and argument binding occur before the timed run.start/wait2 window",
+    "pre-feedforward RMSNorm output and padded gate/up activation are aliased BO views: 1x1152 and 5x256",
+    "single FFN gate/up diagnostic timing is not a TTFT/TPS or paper-parity result"
+  ],
+  "timing_window": "single-stitched-elf-run-start-wait2-only-diagnostic"
+}
