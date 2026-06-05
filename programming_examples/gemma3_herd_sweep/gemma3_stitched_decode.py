@@ -19,9 +19,13 @@ hardware against real layer tensors.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import json
+import os
 from pathlib import Path
 import sys
+import tempfile
+import time
 
 from gemma3_stitching import StitchSpec, stitch_module_text
 
@@ -33,6 +37,9 @@ DEFAULT_INGRESS_FUNCTION_NAME = "gemma3_decode_ingress_rms_qkv_qknorm_rope"
 DEFAULT_OUTPUT_FORMAT = "elf"
 DEFAULT_FUSED_DQP_OBJECT = Path(__file__).with_name("build_peano") / "fused_dqp.o"
 DEFAULT_ROPE_OBJECT = Path(__file__).with_name("build_peano") / "rope_halfsplit.o"
+DEFAULT_THRESHOLD = 0.99
+DEFAULT_LAYER = 0
+DEFAULT_INGRESS_RESULT_JSON = Path(__file__).with_name("results") / "gemma3_1b_stitched_decode_ingress_probe.json"
 
 PROJECTION_CORE_ARG_TYPES = (
     "memref<8x4x5x5120xi8>",  # q packed Q4NX blocks, scale, min
@@ -47,7 +54,8 @@ PROJECTION_CORE_ARG_TYPES = (
 RMS_QKV_ARG_TYPES = (
     "memref<1x1152xbf16>",  # hidden input
     "memref<1152xbf16>",  # RMSNorm weight
-    "memref<5x256xbf16>",  # padded normalized activation
+    "memref<1x1152xbf16>",  # RMSNorm output view of the padded activation BO
+    "memref<5x256xbf16>",  # padded activation alias, same BO as arg2 at runtime
     "memref<8x4x5x5120xi8>",  # q packed Q4NX blocks, scale, min
     "memref<2x4x5x5120xi8>",  # k packed Q4NX blocks, scale, min
     "memref<2x4x5x5120xi8>",  # v packed Q4NX blocks, scale, min
@@ -59,7 +67,8 @@ RMS_QKV_ARG_TYPES = (
 INGRESS_ARG_TYPES = (
     "memref<1x1152xbf16>",  # hidden input
     "memref<1152xbf16>",  # input RMSNorm weight
-    "memref<5x256xbf16>",  # padded normalized activation
+    "memref<1x1152xbf16>",  # RMSNorm output view of the padded activation BO
+    "memref<5x256xbf16>",  # padded activation alias, same BO as arg2 at runtime
     "memref<8x4x5x5120xi8>",  # q packed Q4NX blocks, scale, min
     "memref<2x4x5x5120xi8>",  # k packed Q4NX blocks, scale, min
     "memref<2x4x5x5120xi8>",  # v packed Q4NX blocks, scale, min
@@ -114,32 +123,99 @@ class DecodeStitchPlan:
         )
 
 
+@dataclass(frozen=True)
+class StitchedIngressCorrelation:
+    name: str
+    shape: tuple[int, ...]
+    correlation: float | None
+
+
+@dataclass(frozen=True)
+class StitchedIngressProbeResult:
+    schema_version: int
+    model_variant: str
+    status: str
+    sequence_kind: str
+    layer_index: int
+    function_name: str
+    output_format: str
+    launch_count: int
+    argument_count: int
+    output_correlations: tuple[StitchedIngressCorrelation, ...]
+    dense_projection_correlations: dict[str, float | None]
+    timed_kernel_count: int
+    timed_kernel_seconds: float | None
+    timing_window: str
+    timing_notes: tuple[str, ...]
+    threshold: float
+    remaining_model_runner_gaps: tuple[str, ...]
+    blockers: tuple[str, ...]
+    command: tuple[str, ...]
+    returncode: int | None
+    elapsed_seconds: float | None
+    git_commit: str | None
+    dirty_worktree: bool | None
+    stdout_tail: tuple[str, ...]
+    stderr_tail: tuple[str, ...]
+
+    @staticmethod
+    def _corr_text(value: float | None) -> str:
+        return "n/a" if value is None else f"{value:.6f}"
+
+    def format(self) -> str:
+        blockers = ",".join(self.blockers) if self.blockers else "none"
+        gaps = ",".join(self.remaining_model_runner_gaps) if self.remaining_model_runner_gaps else "none"
+        corr_text = "|".join(
+            f"{item.name}:{self._corr_text(item.correlation)}"
+            for item in self.output_correlations
+        )
+        dense_text = "|".join(
+            f"{name}:{self._corr_text(value)}"
+            for name, value in sorted(self.dense_projection_correlations.items())
+        )
+        return (
+            f"stitched_decode_ingress_probe model={self.model_variant} status={self.status} "
+            f"sequence={self.sequence_kind} layer=L{self.layer_index} "
+            f"function={self.function_name} output_format={self.output_format} "
+            f"launches={self.launch_count} args={self.argument_count} "
+            f"output_correlations={corr_text} "
+            f"dense_projection_correlations={dense_text} "
+            f"timed_kernel_count={self.timed_kernel_count} "
+            f"timed_kernel_seconds={self._corr_text(self.timed_kernel_seconds)} "
+            f"timing_window={self.timing_window} threshold={self.threshold:g} "
+            f"model_runner_gaps={gaps} blockers={blockers}"
+        )
+
+    def to_json_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
 def build_decode_ingress_plan(model_variant: str = DEFAULT_MODEL) -> DecodeStitchPlan:
     stages = (
         DecodeStitchStage(
-            "rmsnorm_pad_activation",
-            "implemented-compile-pass-bridge",
+            "rmsnorm_activation_alias",
+            "implemented-hardware-pass-alias",
             "layer_input:1x1152 + norm_weight:1152",
-            "activation_padded:5x256",
-            "Padded RMSNorm bridge removes host activation packing before FusedDQP.",
+            "rms_out:1x1152 over activation_padded:5x256 BO",
+            "Uses the proven weighted RMSNorm kernel and aliases its output BO as the padded FusedDQP activation view.",
         ),
         DecodeStitchStage(
             "qkv_projection_core",
-            "implemented-compile-pass-stitch",
+            "implemented-hardware-pass-stitch",
             "activation_padded:5x256 + q/k/v packed static BOs",
             "q:32x32 k:8x32 v:8x32",
             "Uses full-col-block FusedDQP so host col-block accumulation is not in the timed path.",
         ),
         DecodeStitchStage(
             "projection_qk_views",
-            "implemented-compile-pass-bridge",
+            "implemented-hardware-pass-bridge",
             "q:32x32 k:8x32 + q/k norm weights",
             "q_norm:4x256 k_norm:1x256",
             "Zero-copy collapse/expand view is fused into Q/K weighted RMSNorm.",
         ),
         DecodeStitchStage(
             "qk_norm_rope",
-            "implemented-compile-pass-stitch",
+            "implemented-hardware-pass-stitch",
             "q_norm:4x256 k_norm:1x256 + q/k RoPE LUTs",
             "q_rope:4x256 k_rope:1x256",
             "Uses existing Gemma half-split RoPE wrapper after Q/K norm.",
@@ -165,9 +241,11 @@ def _activate_builder_paths() -> None:
     root = _repo_root()
     dataflow = str(root / "programming_examples/gemma3_dataflow_kernels")
     herd_sweep = str(root / "programming_examples/gemma3_herd_sweep")
-    for path in (dataflow, herd_sweep):
+    weighted = str(root / "programming_examples/weighted_rms_norm")
+    for path in (dataflow, herd_sweep, weighted):
         while path in sys.path:
             sys.path.remove(path)
+    sys.path.insert(0, weighted)
     sys.path.insert(0, dataflow)
     sys.path.insert(0, herd_sweep)
 
@@ -186,7 +264,7 @@ def _projection_irs(object_file: Path) -> tuple[str, str, str]:
             5,
             2,
             4,
-            "direct",
+            "l2-gather",
         )
     )
     k_ir = str(
@@ -199,7 +277,7 @@ def _projection_irs(object_file: Path) -> tuple[str, str, str]:
             5,
             2,
             4,
-            "direct",
+            "l2-gather",
         )
     )
     v_ir = str(
@@ -212,7 +290,7 @@ def _projection_irs(object_file: Path) -> tuple[str, str, str]:
             5,
             2,
             4,
-            "direct",
+            "l2-gather",
         )
     )
     return q_ir, k_ir, v_ir
@@ -241,20 +319,21 @@ def build_rms_qkv_text(
     object_file: Path = DEFAULT_FUSED_DQP_OBJECT,
     function_name: str = DEFAULT_RMS_QKV_FUNCTION_NAME,
 ) -> str:
-    """Build combined MLIR text for RMSNorm-padding plus Q/K/V projections."""
+    """Build combined MLIR text for RMSNorm alias plus Q/K/V projections."""
     _activate_builder_paths()
-    from gemma3_padded_rms_norm import build_module as build_padded_rms
+    from ml_dtypes import bfloat16
+    from weighted_rms_norm import build_module as build_weighted_rms
 
-    rms_ir = str(build_padded_rms())
+    rms_ir = str(build_weighted_rms(1, 1152, bfloat16, 16, herd_x=1))
     q_ir, k_ir, v_ir = _projection_irs(object_file)
     return stitch_module_text(
         function_name=function_name,
         arg_types=RMS_QKV_ARG_TYPES,
         specs=(
-            StitchSpec(rms_ir, "r", {0: 0, 1: 1, 2: 2}),
-            StitchSpec(q_ir, "q", {0: 3, 1: 2, 2: 6}),
-            StitchSpec(k_ir, "k", {0: 4, 1: 2, 2: 7}),
-            StitchSpec(v_ir, "v", {0: 5, 1: 2, 2: 8}),
+            StitchSpec(rms_ir, "r", {0: 0, 1: 1, 2: 2}, wrap_bare_herds=True),
+            StitchSpec(q_ir, "q", {0: 4, 1: 3, 2: 7}),
+            StitchSpec(k_ir, "k", {0: 5, 1: 3, 2: 8}),
+            StitchSpec(v_ir, "v", {0: 6, 1: 3, 2: 9}),
         ),
     )
 
@@ -267,12 +346,12 @@ def build_ingress_text(
 ) -> str:
     """Build full decode ingress MLIR text: RMSNorm, Q/K/V, Q/K norm, RoPE."""
     _activate_builder_paths()
-    from gemma3_padded_rms_norm import build_module as build_padded_rms
     from gemma3_projection_qk_norm import build_module as build_qk_norm
     from ml_dtypes import bfloat16
     from rope_halfsplit import build_module as build_rope
+    from weighted_rms_norm import build_module as build_weighted_rms
 
-    rms_ir = str(build_padded_rms())
+    rms_ir = str(build_weighted_rms(1, 1152, bfloat16, 16, herd_x=1))
     q_ir, k_ir, v_ir = _projection_irs(object_file)
     q_norm_ir = str(build_qk_norm(32, 32, 4, 256))
     k_norm_ir = str(build_qk_norm(8, 32, 1, 256))
@@ -282,14 +361,14 @@ def build_ingress_text(
         function_name=function_name,
         arg_types=INGRESS_ARG_TYPES,
         specs=(
-            StitchSpec(rms_ir, "r", {0: 0, 1: 1, 2: 2}),
-            StitchSpec(q_ir, "q", {0: 3, 1: 2, 2: 6}),
-            StitchSpec(k_ir, "k", {0: 4, 1: 2, 2: 7}),
-            StitchSpec(v_ir, "v", {0: 5, 1: 2, 2: 8}),
-            StitchSpec(q_norm_ir, "qn", {0: 6, 1: 9, 2: 11}),
-            StitchSpec(k_norm_ir, "kn", {0: 7, 1: 10, 2: 12}),
-            StitchSpec(q_rope_ir, "rq", {0: 11, 1: 13, 2: 15}),
-            StitchSpec(k_rope_ir, "rk", {0: 12, 1: 14, 2: 16}),
+            StitchSpec(rms_ir, "r", {0: 0, 1: 1, 2: 2}, wrap_bare_herds=True),
+            StitchSpec(q_ir, "q", {0: 4, 1: 3, 2: 7}),
+            StitchSpec(k_ir, "k", {0: 5, 1: 3, 2: 8}),
+            StitchSpec(v_ir, "v", {0: 6, 1: 3, 2: 9}),
+            StitchSpec(q_norm_ir, "qn", {0: 7, 1: 10, 2: 12}),
+            StitchSpec(k_norm_ir, "kn", {0: 8, 1: 11, 2: 13}),
+            StitchSpec(q_rope_ir, "rq", {0: 12, 1: 14, 2: 16}),
+            StitchSpec(k_rope_ir, "rk", {0: 13, 1: 15, 2: 17}),
         ),
     )
 
@@ -307,7 +386,7 @@ def build_projection_core_module(*, object_file: Path = DEFAULT_FUSED_DQP_OBJECT
 
 
 def build_rms_qkv_module(*, object_file: Path = DEFAULT_FUSED_DQP_OBJECT):
-    """Build and parse the stitched RMSNorm-padding plus Q/K/V MLIR module."""
+    """Build and parse the stitched RMSNorm-alias plus Q/K/V MLIR module."""
     return _parse_module(build_rms_qkv_text(object_file=object_file))
 
 
@@ -320,17 +399,22 @@ def build_ingress_module(
     return _parse_module(build_ingress_text(object_file=object_file, rope_object_file=rope_object_file))
 
 
-def _compile_module(module, *, instance_name: str, output_binary_name: str):
-    from air.backend.xrt import XRTBackend
-
-    backend = XRTBackend(
+def _stitched_backend_options(instance_name: str) -> dict[str, object]:
+    return dict(
         verbose=False,
-        omit_while_true_loop=False,
+        omit_pingpong=True,
         output_format=DEFAULT_OUTPUT_FORMAT,
         instance_name=instance_name,
         target_device="npu2",
-        runtime_loop_tiling_sizes=[4, 4],
+        runtime_loop_tiling_sizes=[1, 1],
+        use_lock_race_condition_fix=True,
     )
+
+
+def _compile_module(module, *, instance_name: str, output_binary_name: str):
+    from air.backend.xrt import XRTBackend
+
+    backend = XRTBackend(**_stitched_backend_options(instance_name))
     artifact = backend.compile(module, output_binary_name=output_binary_name)
     backend.unload()
     return artifact
@@ -373,6 +457,351 @@ def compile_ingress(
         build_ingress_module(object_file=object_file, rope_object_file=rope_object_file),
         instance_name=DEFAULT_INGRESS_FUNCTION_NAME,
         output_binary_name=output_binary_name,
+    )
+
+
+def _tail(lines: list[str], limit: int = 20) -> tuple[str, ...]:
+    return tuple(lines[-limit:])
+
+
+def _correlation(actual, expected) -> float:
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    actual_flat = actual.reshape(-1)
+    expected_flat = expected.reshape(-1)
+    if actual.dtype == bfloat16:
+        actual_flat = actual_flat.astype(np.float64)
+    if expected.dtype == bfloat16:
+        expected_flat = expected_flat.astype(np.float64)
+    return float(np.corrcoef(actual_flat, expected_flat)[0, 1])
+
+
+def _write_bo_arg(xrt, bo, array) -> None:
+    from ml_dtypes import bfloat16
+
+    payload = array.view("int16") if array.dtype == bfloat16 else array
+    bo.write(payload, 0)
+    bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+
+
+def _git_info(repo: Path) -> tuple[str | None, bool | None]:
+    import subprocess
+
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).stdout
+    except Exception:
+        return None, None
+    return commit or None, bool(status.strip())
+
+
+def _run_multi_output_elf(
+    *,
+    mlir_module,
+    backend_options: dict[str, object],
+    arrays: list[object],
+    readback: dict[str, tuple[int, tuple[int, ...], object]],
+    timed_kernel_seconds: list[float] | None = None,
+    bo_aliases: dict[int, int] | None = None,
+) -> dict[str, object]:
+    from air.backend.xrt import XRTBackend
+    from filelock import FileLock
+
+    try:
+        import pyxrt as xrt
+    except Exception as exc:
+        raise RuntimeError("python:pyxrt is required for Gemma3 stitched ingress probe") from exc
+    if backend_options.get("output_format") != "elf":
+        raise RuntimeError("Gemma3 stitched ingress probe currently requires ELF output")
+
+    backend = XRTBackend(**backend_options)
+    artifact = backend.compile(mlir_module)
+    try:
+        with FileLock(os.path.join(tempfile.gettempdir(), "npu.lock")):
+            device = xrt.device(0)
+            elf = xrt.elf(artifact.output_binary)
+            context = xrt.hw_context(device, elf)
+            kernel = xrt.ext.kernel(context, artifact.kernel)
+            sizes = [array.size * array.itemsize for array in arrays]
+            bo_aliases = bo_aliases or {}
+            bos = []
+            for index, size in enumerate(sizes):
+                alias = bo_aliases.get(index)
+                if alias is None:
+                    bos.append(xrt.ext.bo(device, size))
+                    continue
+                if alias >= len(bos):
+                    raise RuntimeError(f"BO alias {index}->{alias} targets an unallocated argument")
+                if sizes[alias] < size:
+                    raise RuntimeError(f"BO alias {index}->{alias} target is smaller than alias view")
+                bos.append(bos[alias])
+            for index, (bo, array) in enumerate(zip(bos, arrays)):
+                if index in bo_aliases:
+                    continue
+                _write_bo_arg(xrt, bo, array)
+            run = xrt.run(kernel)
+            for index, bo in enumerate(bos):
+                run.set_arg(index, bo)
+            timed_start = time.perf_counter()
+            run.start()
+            run.wait2()
+            timed_elapsed = time.perf_counter() - timed_start
+            if timed_kernel_seconds is not None:
+                timed_kernel_seconds.append(timed_elapsed)
+            outputs = {}
+            for name, (index, shape, dtype) in readback.items():
+                bos[index].sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+                read_size = int(__import__("numpy").prod(shape)) * __import__("numpy").dtype(dtype).itemsize
+                outputs[name] = bos[index].read(read_size, 0).view(dtype).reshape(shape)
+            return outputs
+    finally:
+        backend.unload()
+
+
+def _identity_rope_lut(rows: int, head_dim: int, dtype):
+    import numpy as np
+
+    half = head_dim // 2
+    row = np.concatenate(
+        [
+            np.ones(half, dtype=np.float32),
+            np.zeros(half, dtype=np.float32),
+        ]
+    )
+    return np.tile(row, (rows, 1)).astype(dtype)
+
+
+def _rms_host(x, weight, eps: float = 1e-5):
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    xf = x.astype(np.float32)
+    wf = weight.astype(np.float32)
+    rms = np.sqrt(np.mean(xf * xf, axis=-1, keepdims=True) + eps)
+    return ((xf / rms) * wf).astype(bfloat16)
+
+
+def _load_safetensor_array_np(weights_dir: Path, tensor_key: str):
+    try:
+        from safetensors import safe_open
+    except Exception as exc:
+        raise RuntimeError("python:safetensors is required for Gemma3 stitched ingress probe") from exc
+    for path in sorted(weights_dir.glob("*.safetensors")):
+        with safe_open(str(path), framework="np") as handle:
+            if tensor_key in handle.keys():
+                return handle.get_tensor(tensor_key)
+    raise RuntimeError(f"tensor key not found in safetensors: {tensor_key}")
+
+
+def _pack_projection_for_ingress(weight):
+    import numpy as np
+    from fused_dqp import _pack_l3_inputs
+    from gemma3_full_layer_probe import _repack_matrix_for_fused_dqp
+
+    packed, scale, min_offset, padded = _repack_matrix_for_fused_dqp(weight)
+    params = np.empty((*scale.shape[:-1], 512), dtype=scale.dtype)
+    params[..., :256] = scale
+    params[..., 256:] = min_offset
+    row_blocks, col_blocks = packed.shape[:2]
+    packed_l3 = _pack_l3_inputs(packed, params).reshape(row_blocks // 4, 4, col_blocks, -1)
+    return packed_l3, packed, scale, min_offset, padded
+
+
+def _run_ingress_hardware(args: argparse.Namespace) -> StitchedIngressProbeResult:
+    _activate_builder_paths()
+    from common import fused_dqp_paper_reference
+    from gemma3_artifacts import default_weights_dir
+    from gemma3_full_layer_probe import _projection_tensor_keys
+    from ml_dtypes import bfloat16
+    import numpy as np
+
+    repo = _repo_root()
+    git_commit, dirty = _git_info(repo)
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    blockers: list[str] = []
+    start = time.perf_counter()
+    layer_index = int(args.layer_index)
+    weights_dir = (args.weights_dir or default_weights_dir(args.model_variant)).expanduser()
+    timed_kernel_seconds: list[float] = []
+
+    try:
+        norm_keys = {
+            "input": f"model.layers.{layer_index}.input_layernorm.weight",
+            "q": f"model.layers.{layer_index}.self_attn.q_norm.weight",
+            "k": f"model.layers.{layer_index}.self_attn.k_norm.weight",
+        }
+        input_norm_weight = _load_safetensor_array_np(weights_dir, norm_keys["input"]).astype(bfloat16).reshape(-1)
+        q_norm_weight = _load_safetensor_array_np(weights_dir, norm_keys["q"]).astype(bfloat16).reshape(-1)
+        k_norm_weight = _load_safetensor_array_np(weights_dir, norm_keys["k"]).astype(bfloat16).reshape(-1)
+        projection_keys = _projection_tensor_keys(args.model_variant, weights_dir, layer_index)
+        q_weight = _load_safetensor_array_np(weights_dir, projection_keys["q_proj"])
+        k_weight = _load_safetensor_array_np(weights_dir, projection_keys["k_proj"])
+        v_weight = _load_safetensor_array_np(weights_dir, projection_keys["v_proj"])
+
+        rng = np.random.default_rng(args.seed)
+        hidden = rng.uniform(-0.5, 0.5, size=(1, 1152)).astype(bfloat16)
+        activation = np.zeros((5, 256), dtype=bfloat16)
+        activation_expected = _rms_host(hidden, input_norm_weight).reshape(-1)
+        activation.reshape(-1)[:1152] = activation_expected
+
+        q_pack, q_packed, q_scale, q_min, _q_padded = _pack_projection_for_ingress(q_weight)
+        k_pack, k_packed, k_scale, k_min, _k_padded = _pack_projection_for_ingress(k_weight)
+        v_pack, v_packed, v_scale, v_min, _v_padded = _pack_projection_for_ingress(v_weight)
+
+        q_expected = fused_dqp_paper_reference(q_packed, q_scale, q_min, activation, 32, 256).reshape(32, 32)
+        k_expected = fused_dqp_paper_reference(k_packed, k_scale, k_min, activation, 32, 256).reshape(8, 32)
+        v_expected = fused_dqp_paper_reference(v_packed, v_scale, v_min, activation, 32, 256).reshape(8, 32)
+        q_norm_expected = _rms_host(q_expected.reshape(4, 256), q_norm_weight)
+        k_norm_expected = _rms_host(k_expected.reshape(1, 256), k_norm_weight)
+
+        dataflow = str(_repo_root() / "programming_examples/gemma3_dataflow_kernels")
+        if dataflow not in sys.path:
+            sys.path.insert(0, dataflow)
+        from rope_halfsplit import rope_halfsplit_reference
+
+        q_lut = _identity_rope_lut(4, 256, bfloat16)
+        k_lut = _identity_rope_lut(1, 256, bfloat16)
+        q_rope_expected = rope_halfsplit_reference(q_norm_expected, q_lut)
+        k_rope_expected = rope_halfsplit_reference(k_norm_expected, k_lut)
+
+        activation_storage = np.zeros((5, 256), dtype=bfloat16)
+        arrays = [
+            hidden,
+            input_norm_weight,
+            activation_storage,
+            activation_storage,
+            q_pack,
+            k_pack,
+            v_pack,
+            np.zeros((32, 32), dtype=bfloat16),
+            np.zeros((8, 32), dtype=bfloat16),
+            np.zeros((8, 32), dtype=bfloat16),
+            q_norm_weight,
+            k_norm_weight,
+            np.zeros((4, 256), dtype=bfloat16),
+            np.zeros((1, 256), dtype=bfloat16),
+            q_lut.reshape(-1),
+            k_lut.reshape(-1),
+            np.zeros((4, 256), dtype=bfloat16),
+            np.zeros((1, 256), dtype=bfloat16),
+        ]
+        readback = {
+            "input_norm": (2, (1, 1152), bfloat16),
+            "activation": (3, (5, 256), bfloat16),
+            "q_proj": (7, (32, 32), bfloat16),
+            "k_proj": (8, (8, 32), bfloat16),
+            "v_proj": (9, (8, 32), bfloat16),
+            "q_norm": (12, (4, 256), bfloat16),
+            "k_norm": (13, (1, 256), bfloat16),
+            "q_rope": (16, (4, 256), bfloat16),
+            "k_rope": (17, (1, 256), bfloat16),
+        }
+        actual = _run_multi_output_elf(
+            mlir_module=build_ingress_module(object_file=args.object_file, rope_object_file=args.rope_object_file),
+            backend_options=_stitched_backend_options(DEFAULT_INGRESS_FUNCTION_NAME),
+            arrays=arrays,
+            readback=readback,
+            timed_kernel_seconds=timed_kernel_seconds,
+            bo_aliases={3: 2},
+        )
+        expected = {
+            "input_norm": activation_expected.reshape(1, 1152),
+            "activation": activation,
+            "q_proj": q_expected,
+            "k_proj": k_expected,
+            "v_proj": v_expected,
+            "q_norm": q_norm_expected,
+            "k_norm": k_norm_expected,
+            "q_rope": q_rope_expected,
+            "k_rope": k_rope_expected,
+        }
+        correlations = []
+        for name, expected_value in expected.items():
+            corr = _correlation(actual[name], expected_value)
+            correlations.append(
+                StitchedIngressCorrelation(
+                    name=name,
+                    shape=tuple(int(dim) for dim in expected_value.shape),
+                    correlation=corr,
+                )
+            )
+            stdout_lines.append(f"{name} correlation: {corr:.6f}")
+            if corr < args.threshold:
+                blockers.append(f"{name}-correlation-low")
+
+        dense_projection_correlations = {
+            "q_proj": _correlation(
+                actual["q_proj"].reshape(-1),
+                (q_weight.astype(np.float32) @ activation_expected.astype(np.float32)).astype(bfloat16),
+            ),
+            "k_proj": _correlation(
+                actual["k_proj"].reshape(-1),
+                (k_weight.astype(np.float32) @ activation_expected.astype(np.float32)).astype(bfloat16),
+            ),
+            "v_proj": _correlation(
+                actual["v_proj"].reshape(-1),
+                (v_weight.astype(np.float32) @ activation_expected.astype(np.float32)).astype(bfloat16),
+            ),
+        }
+    except Exception as exc:
+        blockers.append(type(exc).__name__)
+        stderr_lines.append(str(exc))
+        correlations = ()
+        dense_projection_correlations = {}
+
+    status = "STITCHED_INGRESS_PASS" if not blockers else "STITCHED_INGRESS_BLOCKED"
+    elapsed = time.perf_counter() - start
+    timed_sum = float(sum(timed_kernel_seconds)) if timed_kernel_seconds else None
+    return StitchedIngressProbeResult(
+        schema_version=1,
+        model_variant=args.model_variant,
+        status=status,
+        sequence_kind="decode-ingress-stitched",
+        layer_index=layer_index,
+        function_name=DEFAULT_INGRESS_FUNCTION_NAME,
+        output_format=DEFAULT_OUTPUT_FORMAT,
+        launch_count=8,
+        argument_count=len(INGRESS_ARG_TYPES),
+        output_correlations=tuple(correlations),
+        dense_projection_correlations=dense_projection_correlations,
+        timed_kernel_count=len(timed_kernel_seconds),
+        timed_kernel_seconds=timed_sum,
+        timing_window="single-stitched-elf-run-start-wait2-only-diagnostic",
+        timing_notes=(
+            "compile, ELF load, BO creation, BO writes, and argument binding occur before the timed run.start/wait2 window",
+            "single-ingress diagnostic timing is not a TTFT/TPS or paper-parity result",
+        ),
+        threshold=float(args.threshold),
+        remaining_model_runner_gaps=(
+            "replace-staged-decode-ingress-with-stitched-elf",
+            "stitch-rest-of-decode-layer",
+            "prefill-produced-kv-cache-not-wired",
+            "logits-sampling-not-wired",
+        ),
+        blockers=tuple(dict.fromkeys(blockers)),
+        command=tuple(sys.argv),
+        returncode=0 if not blockers else 1,
+        elapsed_seconds=elapsed,
+        git_commit=git_commit,
+        dirty_worktree=dirty,
+        stdout_tail=_tail(stdout_lines),
+        stderr_tail=_tail(stderr_lines),
     )
 
 
@@ -427,8 +856,15 @@ def main() -> None:
     parser.add_argument("--compile-projection-core", action="store_true")
     parser.add_argument("--compile-rms-qkv", action="store_true")
     parser.add_argument("--compile-ingress", action="store_true")
+    parser.add_argument("--run-ingress-hardware", action="store_true")
     parser.add_argument("--object-file", type=Path, default=DEFAULT_FUSED_DQP_OBJECT)
     parser.add_argument("--rope-object-file", type=Path, default=DEFAULT_ROPE_OBJECT)
+    parser.add_argument("--model-variant", default=DEFAULT_MODEL)
+    parser.add_argument("--weights-dir", type=Path)
+    parser.add_argument("--layer-index", type=int, default=DEFAULT_LAYER)
+    parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--result-json", type=Path)
     args = parser.parse_args()
 
     if args.self_test:
@@ -488,11 +924,19 @@ def main() -> None:
             f"output={artifact.output_binary}"
         )
         return
+    if args.run_ingress_hardware:
+        result = _run_ingress_hardware(args)
+        print(result.format())
+        if args.result_json:
+            args.result_json.parent.mkdir(parents=True, exist_ok=True)
+            args.result_json.write_text(json.dumps(result.to_json_dict(), indent=2, sort_keys=True) + "\n")
+            print(f"GEMMA3_STITCHED_INGRESS_JSON: {args.result_json}")
+        raise SystemExit(0 if result.status == "STITCHED_INGRESS_PASS" else 1)
     parser.error(
         "pass --self-test, --print-plan, --print-projection-core-mlir, "
         "--print-rms-qkv-mlir, --print-ingress-mlir, --parse-projection-core, "
         "--parse-rms-qkv, --parse-ingress, --compile-projection-core, "
-        "--compile-rms-qkv, or --compile-ingress"
+        "--compile-rms-qkv, --compile-ingress, or --run-ingress-hardware"
     )
 
 
