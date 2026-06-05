@@ -120,6 +120,23 @@ the generated paper-target comparison summary.
   evidence.
 
 
+## Stitched Attention/O Evidence
+
+- `gemma3_1b_stitched_attention_o_probe.json`: clean-provenance Strix/XRT
+  evidence for the first post-ingress stitched decode slice. It runs
+  `gemma3_decode_attention_o_projection`, which stitches single-token FlowQKV
+  attention directly into the full-column-block O projection. The ABI has seven
+  public BO arguments and aliases the attention output as both `1x4x256` for
+  FlowQKV and `4x256` for FusedDQP, avoiding an attention-output layout copy.
+  With real layer-0 `o_proj.weight`, it validates attention correlation
+  0.999999, O-projection correlation 0.999991 against the quantized FusedDQP
+  reference, and dense original-weight correlation 0.997821. The single
+  diagnostic `run.start()/wait2()` window is 0.007962 s, with compile, ELF
+  load, BO creation/writes, and argument binding excluded. This is standalone
+  stitched-slice evidence only; it is not yet integrated into the repeated
+  decode loop or paper-cell timing.
+
+
 ## Full Layer Probe Evidence
 
 - `gemma3_1b_decode_full_layer_probe.json`: compact Strix/XRT evidence for one
