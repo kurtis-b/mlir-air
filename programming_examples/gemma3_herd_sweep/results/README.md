@@ -149,8 +149,8 @@ the generated paper-target comparison summary.
   post-attention RMSNorm correlation 0.999989 and attention-residual
   correlation 0.999955. The single diagnostic `run.start()/wait2()` window is
   0.000291 s, with compile, ELF load, BO creation/writes, and argument binding
-  excluded. This is standalone stitched-slice evidence only; it is not yet
-  integrated into the repeated decode loop or paper-cell timing.
+  excluded. This standalone slice is now also integrated in the decode-loop
+  artifact below, but it is still not paper-cell timing.
 
 
 ## Full Layer Probe Evidence
@@ -202,6 +202,27 @@ power, or paper-parity evidence.
 
 
 ## Decode Loop Probe Evidence
+
+- `gemma3_1b_decode_loop_stitched_ingress_attention_o_post_attention_probe.json`:
+  clean-provenance Strix/XRT evidence that the stitched decode-loop route now
+  covers ingress, `attention -> O projection`, and `post-attention RMSNorm ->
+  residual add` across all 26 real Gemma3 1B layers. The run uses
+  `--ingress-mode stitched --attention-o-mode stitched --post-attention-mode
+  stitched`, preloads 26 stitched-ingress BO sets, 26 stitched attention/O BO
+  sets, 26 stitched post-attention-residual BO sets, and 962 remaining staged
+  projection BO sets before timing, and records `dirty_worktree=false` at commit
+  `7d7da135846308cc1b171498b398cf492f1163c5`. It validates every layer with no
+  blockers. The measured post-warmup loop wall window is 4.869055 s, or
+  0.205379 diagnostic TPS. The summed NPU `run.start()/wait2()` windows total
+  3.706862 s across 1,144 launches, or 0.269770 kernel-only diagnostic TPS.
+  This removes 624 launches from the staged diagnostic and improves loop-wall
+  TPS from 0.184746 to 0.205379, but kernel-only TPS remains slightly below the
+  staged 0.274698 TPS artifact. Full-window direct RAPL reports 10.875 W
+  package power; the pseudo-NPU package-delta is clipped to 0.000 W because the
+  immediate quiescent package sample was higher than the timed-window package
+  watts. It is still not a paper cell because attention is single-token, KV
+  cache is not prefill-produced, logits/sampling are absent, and the FFN tail
+  remains staged after the attention residual.
 
 - `gemma3_1b_decode_loop_stitched_ingress_attention_o_probe.json`: clean-provenance
   Strix/XRT evidence that the stitched decode-loop route now covers both the
