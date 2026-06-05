@@ -19,6 +19,8 @@ AIE_API_INCLUDE ?= $(shell \
 		echo "$(MLIR_AIE_INSTALL_DIR)/include"; \
 	elif [ -n "$(MLIR_AIE_INSTALL_DIR)" ] && [ -d "$(MLIR_AIE_INSTALL_DIR)/lib/python3.12/site-packages/mlir_aie/include/aie_api" ]; then \
 		echo "$(MLIR_AIE_INSTALL_DIR)/lib/python3.12/site-packages/mlir_aie/include"; \
+	elif [ -n "$(PEANO_INSTALL_DIR)" ] && [ -d "$(dir $(PEANO_INSTALL_DIR))mlir_aie/include/aie_api" ]; then \
+		echo "$(dir $(PEANO_INSTALL_DIR))mlir_aie/include"; \
 	else \
 		echo "$(AIEOPT_DIR)/include"; \
 	fi)
@@ -94,6 +96,8 @@ OPT_FLOWKV_GROUPS ?= 1
 OPT_FLOWKV_HERD_ROWS ?= 1
 OPT_FLOWKV_HERD_COLS ?= 1
 FLOWQKV_CAUSAL_FLAG := $(if $(filter 1 true yes,$(FLOWQKV_CAUSAL)),--causal,)
+FLOWQKV_TILED_STATS_OUTPUT_MODE ?= direct
+FLOWQKV_TILED_STATS_HOST_BATCH_TILES ?= 0
 FLOWKV_CAUSAL_FLAG := $(if $(filter 1 true yes,$(FLOWKV_CAUSAL)),--causal,)
 
 all: run-q4nx run-mm run-fused-dqp run-flowqkv run-flowkv
@@ -243,6 +247,22 @@ run-flowqkv: compile-flowqkv-kernel prepare-air-project
 		--herd-rows $(FLOW_HERD_ROWS) --herd-cols $(FLOW_HERD_COLS) \
 		--query-base $(FLOWQKV_QUERY_BASE) --window-len $(WINDOW_LEN) \
 		$(FLOWQKV_CAUSAL_FLAG) --compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG)
+
+compile-flowqkv-tiled-stats-kernel: check-peano
+	mkdir -p $(BUILD_DIR)
+	$(PEANO_INSTALL_DIR)/bin/clang++ ${PEANOWRAP2P_FLAGS} \
+		-DQ_CHUNK=$(Q_CHUNK) -DKV_TILE=$(KV_CHUNK) -DHEAD_DIM=$(HEAD_DIM) \
+		-c $(srcdir)/flow_attention_stats.cc -o $(BUILD_DIR)/flowqkv_tiled_stats.o
+
+run-flowqkv-tiled-stats: compile-flowqkv-tiled-stats-kernel prepare-air-project
+	cp $(BUILD_DIR)/flowqkv_tiled_stats.o $(BUILD_DIR)/air_project/flowqkv_tiled_stats.o
+	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
+		python3 $(srcdir)/flowqkv_tiled_stats.py --q-chunk $(Q_CHUNK) \
+		--kv-len $(KV_LEN) --kv-tile $(KV_CHUNK) --head-dim $(HEAD_DIM) \
+		--herd-rows $(FLOW_HERD_ROWS) --herd-cols $(FLOW_HERD_COLS) \
+		--host-batch-tiles $(FLOWQKV_TILED_STATS_HOST_BATCH_TILES) \
+		--output-mode $(FLOWQKV_TILED_STATS_OUTPUT_MODE) \
+		--compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG)
 
 compile-flowqkv-opt-kernel: check-peano
 	mkdir -p $(BUILD_DIR)

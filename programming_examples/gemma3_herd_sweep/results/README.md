@@ -173,8 +173,27 @@ power, or paper-parity evidence.
   7.494 W pseudo-NPU package-delta from a 9.295 W quiescent package sample. The
   segmented kernel-only pseudo-NPU delta is not usable in this run because its
   quiescent sample was taken while preparation was already busy. This remains
-  diagnostic, not a paper cell: paper 1k KV-cache attention, logits/sampling,
-  and the production contiguous static-weight BO route are still not complete.
+  diagnostic, not a paper cell: the production model loop still uses the
+  single-token attention path, logits/sampling are not wired, and the production
+  contiguous static-weight BO route is still not complete. Standalone 1k
+  KV-cache tiled-stat attention evidence now exists below, but its reduction is
+  host-side and not yet integrated into the decode-loop probe.
+
+
+## FlowQKV Tiled Stats Evidence
+
+- `gemma3_flowqkv_tiled_stats_1k_smoke.json`: compact Strix/XRT evidence for a
+  diagnostic Gemma3 1B 1k decode-attention shape. The wrapper compiles a
+  two-tile direct-output ELF module (`q_chunk=4`, `kv_tile=32`, `head_dim=256`,
+  `herd=1x2`) and reuses it across 16 host batches to cover `kv_len=1024`.
+  Hardware output stats correlate 1.000000 with the tile-stat reference, with
+  0.0% mismatches and max stats error 0.0000038. Merging the real NPU tile
+  stats gives 0.999958 correlation against exact CPU attention and max output
+  error 0.000183. This proves the full-cache L1 allocation blocker is avoidable
+  for 1k attention, but it is still diagnostic because the tile-stat reduction
+  is host-side and the production model loop does not yet call this path. Full
+  8x4 direct output remains a shim S2MM resource limit, and the attempted
+  full-herd L2-gather route is still an AIE routing packet-id-0 blocker.
 
 
 ## Static Preload Evidence

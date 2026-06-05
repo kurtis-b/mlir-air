@@ -16,6 +16,10 @@ The examples include correctness-first and optimized Peano variants:
   dequantization with 32x256 matrix-vector block projections.
 - `flowqkv.py` / `flow_attention.cc` / `flow_attention_opt.cc`: chunked prefill
   attention over one or more KV groups using online softmax accumulation.
+- `flowqkv_tiled_stats.py` / `flow_attention_stats.cc`: diagnostic decode
+  attention over long KV caches by emitting per-tile softmax statistics and
+  merging them outside the kernel; this avoids staging a full 1k KV cache in
+  L1, but it is not yet the production in-model reduction route.
 - `flowkv.py` / `flow_attention.cc` / `flow_attention_opt.cc`: decode attention as
   the Q-chunk-size-1 specialization of the same grouped attention.
 - `residual_add.py`: BF16 elementwise residual add for Gemma attention and MLP
@@ -39,6 +43,9 @@ make run-flowqkv
 make run-flowkv
 python3 residual_add.py --compile-mode compile-only --output-format elf
 python3 rope_halfsplit.py --compile-mode compile-only --output-format elf
+make run-flowqkv-tiled-stats COMPILE_MODE=compile-only OUTPUT_FORMAT=elf \
+  Q_CHUNK=4 KV_LEN=1024 KV_CHUNK=32 HEAD_DIM=256 \
+  FLOW_HERD_ROWS=1 FLOW_HERD_COLS=2 FLOWQKV_TILED_STATS_HOST_BATCH_TILES=2
 ```
 
 Optimized Peano compile/run targets use the `*-opt` suffix:
@@ -92,6 +99,10 @@ Optimized defaults currently use:
 - FusedDQP: 2 logical projection row blocks mapped through a 2x1 physical herd.
 - BF16 tiled MM: the existing 256x256x256 optimized GEMM with an 8x4 herd.
 - FlowQKV: 4 KV groups mapped across a 4x1 herd.
+- FlowQKV tiled stats: a 1k x 256 decode-cache diagnostic compiles and runs by
+  reusing a 1x2 direct-output module across 16 host batches; a full 8x4 direct
+  module exceeds shim S2MM resources, while current L2-gather variants hit an
+  AIE routing packet-id-0 hazard.
 - FlowKV: 1 KV group mapped on a 1x1 herd; grouped decode currently returns
   NaNs for groups beyond 0 in this direct wrapper.
 

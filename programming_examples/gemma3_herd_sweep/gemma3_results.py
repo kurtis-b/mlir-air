@@ -252,6 +252,52 @@ def load_decode_loop_diagnostic(model_variant: str) -> dict[str, Any] | None:
     }
 
 
+TILED_ATTENTION_STATS_EVIDENCE = (
+    Path(__file__).resolve().parent / "results" / "gemma3_flowqkv_tiled_stats_1k_smoke.json"
+)
+
+
+def load_tiled_attention_diagnostic(model_variant: str) -> dict[str, Any] | None:
+    if model_variant != "gemma3-1b" or not TILED_ATTENTION_STATS_EVIDENCE.exists():
+        return None
+    try:
+        data = json.loads(TILED_ATTENTION_STATS_EVIDENCE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if data.get("status") != "HARDWARE_SMOKE_PASS":
+        return None
+    return {
+        "status": data.get("status"),
+        "correctness": "PASS",
+        "kernel": data.get("kernel"),
+        "q_chunk": data.get("q_chunk"),
+        "kv_len": data.get("kv_len"),
+        "kv_tile": data.get("kv_tile"),
+        "tile_count": data.get("tile_count"),
+        "head_dim": data.get("head_dim"),
+        "host_batch_tiles": data.get("host_batch_tiles"),
+        "host_batch_count": data.get("host_batch_count"),
+        "herd_rows": data.get("herd_rows"),
+        "herd_cols": data.get("herd_cols"),
+        "output_mode": data.get("output_mode"),
+        "stats_output_correlation": data.get("stats_output_correlation"),
+        "stats_output_mismatch_percentage": data.get("stats_output_mismatch_percentage"),
+        "stats_output_max_abs_error": data.get("stats_output_max_abs_error"),
+        "combined_attention_correlation_vs_exact": data.get(
+            "combined_attention_correlation_vs_exact"
+        ),
+        "combined_attention_max_abs_error_vs_exact": data.get(
+            "combined_attention_max_abs_error_vs_exact"
+        ),
+        "source_result": str(TILED_ATTENTION_STATS_EVIDENCE),
+        "notes": [
+            "diagnostic standalone 1k KV-cache attention-stat path; not a measured paper TTFT/TPS cell",
+            "tile-stat reduction is host-side and not yet integrated into the decode-loop probe",
+            "full-herd direct output remains a shim S2MM resource limit; full-herd L2 gather currently hits an AIE packet-id-0 routing blocker",
+        ],
+    }
+
+
 def build_model_runner_record(
     *,
     model_variant: str,
@@ -429,6 +475,7 @@ def build_paper_result(
     real_benchmark: dict[str, Any] | None = None
     npu_staged_diagnostic: dict[str, Any] | None = None
     npu_decode_loop_diagnostic: dict[str, Any] | None = None
+    npu_tiled_attention_diagnostic: dict[str, Any] | None = None
     explanation: str | None = None
     if not inventory.can_load_real_artifacts:
         classification = "MISSING_REAL_ARTIFACTS"
@@ -497,6 +544,13 @@ def build_paper_result(
                 f"diagnostic_decode_tps_loop_wall={npu_decode_loop_diagnostic.get('diagnostic_decode_tps_loop_wall')} "
                 f"diagnostic_decode_tps_kernel_only={npu_decode_loop_diagnostic.get('diagnostic_decode_tps_kernel_only')}"
             )
+        npu_tiled_attention_diagnostic = load_tiled_attention_diagnostic(model_variant)
+        if npu_tiled_attention_diagnostic:
+            notes.append(
+                "standalone tiled 1k attention diagnostic available: "
+                f"host_batches={npu_tiled_attention_diagnostic.get('host_batch_count')} "
+                f"combined_attention_correlation_vs_exact={npu_tiled_attention_diagnostic.get('combined_attention_correlation_vs_exact')}"
+            )
         if execution_wiring:
             notes.append(
                 "execution wiring blockers: "
@@ -560,6 +614,7 @@ def build_paper_result(
         "real_benchmark": real_benchmark,
         "npu_staged_diagnostic": npu_staged_diagnostic,
         "npu_decode_loop_diagnostic": npu_decode_loop_diagnostic,
+        "npu_tiled_attention_diagnostic": npu_tiled_attention_diagnostic,
         "notes": notes,
     }
 

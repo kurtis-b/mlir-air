@@ -1,0 +1,30 @@
+{
+  "combined_attention_correlation_vs_exact": 0.9999584557263573,
+  "combined_attention_max_abs_error_vs_exact": 0.00018310546875,
+  "combined_attention_mean_abs_error_vs_exact": 4.4740037992596626e-05,
+  "compile_mode": "compile-and-run",
+  "head_dim": 256,
+  "herd_cols": 2,
+  "herd_rows": 1,
+  "host_batch_count": 16,
+  "host_batch_tiles": 2,
+  "kernel": "flowqkv_tiled_stats",
+  "kv_len": 1024,
+  "kv_tile": 32,
+  "output_format": "elf",
+  "output_mode": "direct",
+  "paper_gap_status": "diagnostic-tiled-1k-kv-attention-stat-path",
+  "q_chunk": 4,
+  "returncode": 0,
+  "schema_version": 1,
+  "stats_output_correlation": 0.9999999999999944,
+  "stats_output_max_abs_error": 3.814697265625e-06,
+  "stats_output_mismatch_percentage": 0.0,
+  "status": "HARDWARE_SMOKE_PASS",
+  "tile_count": 32,
+  "tolerance": {
+    "atol": 0.1,
+    "max_mismatch_percentage": 1.0,
+    "rtol": 0.1
+  }
+}

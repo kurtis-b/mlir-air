@@ -590,7 +590,7 @@
       },
       "backend": "npu",
       "classification": "REAL_MODEL_EXECUTION_NOT_IMPLEMENTED",
-      "command": "gemma3_inference.py --paper-benchmark --model-variant gemma3-1b --backend npu --weights-dir /home/cj/models/gemma-3-1b-pt --prompt-len 1024 --decode-tokens 0 --metric prefill_ttft_seconds --warmup-iters 1 --timed-iters 3 --power-sample --compare-paper --result-json /home/cj/mlir-air/programming_examples/gemma3_herd_sweep/results/gemma3_1b_npu_prefill_1k_blocked_initial.json",
+      "command": "programming_examples/gemma3_herd_sweep/gemma3_results.py --model-variant gemma3-1b --backend npu --weights-dir /home/cj/models/gemma-3-1b-pt --prompt-len 1024 --decode-tokens 0 --metric prefill_ttft_seconds --warmup-iters 1 --timed-iters 3 --result-json programming_examples/gemma3_herd_sweep/results/gemma3_1b_npu_prefill_1k_blocked_initial.json",
       "compile_time_included": false,
       "correctness": "BLOCKED_EXECUTION_NOT_IMPLEMENTED",
       "decode_tokens": 0,
@@ -610,12 +610,12 @@
         "status": "BLOCKED"
       },
       "explanation": null,
-      "git_commit": "783bfe4642dd10d3a4d0a3f0d444a70a163b49d4",
+      "git_commit": "5df646c7505f74253023a7946d359f17b10ae489",
       "host_fallbacks": [
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.00932065692419807,
+          "elapsed_ms": 0.009821669664233923,
           "hardware_status": "hardware-smoke-pass-M8-N1152-N2560-elf",
           "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
           "measured": true,
@@ -629,7 +629,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.008646340575069189,
+          "elapsed_ms": 0.009143666829913855,
           "hardware_status": "hardware-smoke-pass-M32-N256-elf",
           "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
           "measured": true,
@@ -643,7 +643,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.007737680183102687,
+          "elapsed_ms": 0.007994996849447489,
           "hardware_status": "hardware-smoke-pass-rows4-head256-elf",
           "implementation_path": "programming_examples/gemma3_dataflow_kernels/rope_halfsplit.py",
           "measured": true,
@@ -657,7 +657,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.011371662064145008,
+          "elapsed_ms": 0.010266007545093695,
           "hardware_status": "hardware-smoke-pass-n6912-tile288-elf",
           "implementation_path": "programming_examples/gemma3_dataflow_kernels/geglu.py",
           "measured": true,
@@ -671,7 +671,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.002117323068281015,
+          "elapsed_ms": 0.002247339580208063,
           "hardware_status": "hardware-smoke-pass-n1152-tile288-elf",
           "implementation_path": "programming_examples/gemma3_dataflow_kernels/residual_add.py",
           "measured": true,
@@ -716,15 +716,9 @@
         "real artifact inventory is present but execution is not implemented",
         "staged NPU diagnostic available: timed_kernel_seconds=0.15427393274148926 estimated_26_layer_decode_tps_kernel_only=0.24930678681788027",
         "staged NPU decode-loop diagnostic available: measured_loop_seconds=5.412830422981642 diagnostic_decode_tps_loop_wall=0.18474622736271734 diagnostic_decode_tps_kernel_only=0.2746984021217935",
+        "standalone tiled 1k attention diagnostic available: host_batches=16 combined_attention_correlation_vs_exact=0.9999584557263573",
         "execution wiring blockers: full-1b-loop-not-wired,paper-shape-hardware-rerun-required",
-        "model runner blockers: full-1b-loop-not-wired,paper-shape-hardware-rerun-required",
-        "raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges",
-        "xrt-smi is available, but direct NPU rail parsing reports N/A on this host",
-        "instantaneous snapshots do not report watts; use begin_power_window/finish_power_window around timed inference",
-        "direct RAPL sysfs package counter is unavailable: permission denied reading /sys/class/powercap/intel-rapl:0/energy_uj",
-        "permission denied reading /sys/class/powercap/intel-rapl:0/energy_uj",
-        "permission denied reading /sys/class/powercap/intel-rapl:0:0/energy_uj",
-        "no readable RAPL energy counters"
+        "model runner blockers: full-1b-loop-not-wired,paper-shape-hardware-rerun-required"
       ],
       "npu_decode_loop_diagnostic": {
         "correctness": "PASS",
@@ -877,6 +871,32 @@
           "estimated_26_layer_decode_tps_kernel_only is an extrapolation from one layer and is not a measured full-model decode TPS"
         ],
         "timing_window": "segmented-run-start-wait2-only"
+      },
+      "npu_tiled_attention_diagnostic": {
+        "combined_attention_correlation_vs_exact": 0.9999584557263573,
+        "combined_attention_max_abs_error_vs_exact": 0.00018310546875,
+        "correctness": "PASS",
+        "head_dim": 256,
+        "herd_cols": 2,
+        "herd_rows": 1,
+        "host_batch_count": 16,
+        "host_batch_tiles": 2,
+        "kernel": "flowqkv_tiled_stats",
+        "kv_len": 1024,
+        "kv_tile": 32,
+        "notes": [
+          "diagnostic standalone 1k KV-cache attention-stat path; not a measured paper TTFT/TPS cell",
+          "tile-stat reduction is host-side and not yet integrated into the decode-loop probe",
+          "full-herd direct output remains a shim S2MM resource limit; full-herd L2 gather currently hits an AIE packet-id-0 routing blocker"
+        ],
+        "output_mode": "direct",
+        "q_chunk": 4,
+        "source_result": "/home/cj/mlir-air/programming_examples/gemma3_herd_sweep/results/gemma3_flowqkv_tiled_stats_1k_smoke.json",
+        "stats_output_correlation": 0.9999999999999944,
+        "stats_output_max_abs_error": 3.814697265625e-06,
+        "stats_output_mismatch_percentage": 0.0,
+        "status": "HARDWARE_SMOKE_PASS",
+        "tile_count": 32
       },
       "paper_source": "arxiv_pdf_v2",
       "paper_table": "prefill/decode text tables",
@@ -942,7 +962,7 @@
       },
       "backend": "npu",
       "classification": "REAL_MODEL_EXECUTION_NOT_IMPLEMENTED",
-      "command": "gemma3_inference.py --paper-benchmark --model-variant gemma3-1b --backend npu --weights-dir /home/cj/models/gemma-3-1b-pt --prompt-len 1024 --decode-tokens 16 --metric decode_tps --warmup-iters 1 --timed-iters 3 --power-sample --compare-paper --result-json /home/cj/mlir-air/programming_examples/gemma3_herd_sweep/results/gemma3_1b_npu_decode_1k_blocked_initial.json",
+      "command": "programming_examples/gemma3_herd_sweep/gemma3_results.py --model-variant gemma3-1b --backend npu --weights-dir /home/cj/models/gemma-3-1b-pt --prompt-len 1024 --decode-tokens 16 --metric decode_tps --warmup-iters 1 --timed-iters 3 --result-json programming_examples/gemma3_herd_sweep/results/gemma3_1b_npu_decode_1k_blocked_initial.json",
       "compile_time_included": false,
       "correctness": "BLOCKED_EXECUTION_NOT_IMPLEMENTED",
       "decode_tokens": 16,
@@ -962,12 +982,12 @@
         "status": "BLOCKED"
       },
       "explanation": null,
-      "git_commit": "783bfe4642dd10d3a4d0a3f0d444a70a163b49d4",
+      "git_commit": "5df646c7505f74253023a7946d359f17b10ae489",
       "host_fallbacks": [
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.009564663438747326,
+          "elapsed_ms": 0.009668001439422369,
           "hardware_status": "hardware-smoke-pass-M8-N1152-N2560-elf",
           "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
           "measured": true,
@@ -981,7 +1001,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.008876998132715622,
+          "elapsed_ms": 0.008953327778726816,
           "hardware_status": "hardware-smoke-pass-M32-N256-elf",
           "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
           "measured": true,
@@ -995,7 +1015,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.00796833774074912,
+          "elapsed_ms": 0.00794499646872282,
           "hardware_status": "hardware-smoke-pass-rows4-head256-elf",
           "implementation_path": "programming_examples/gemma3_dataflow_kernels/rope_halfsplit.py",
           "measured": true,
@@ -1009,7 +1029,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.010426330845803022,
+          "elapsed_ms": 0.010329337480167547,
           "hardware_status": "hardware-smoke-pass-n6912-tile288-elf",
           "implementation_path": "programming_examples/gemma3_dataflow_kernels/geglu.py",
           "measured": true,
@@ -1023,7 +1043,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.0022106687538325787,
+          "elapsed_ms": 0.002160998216519753,
           "hardware_status": "hardware-smoke-pass-n1152-tile288-elf",
           "implementation_path": "programming_examples/gemma3_dataflow_kernels/residual_add.py",
           "measured": true,
@@ -1068,15 +1088,9 @@
         "real artifact inventory is present but execution is not implemented",
         "staged NPU diagnostic available: timed_kernel_seconds=0.15427393274148926 estimated_26_layer_decode_tps_kernel_only=0.24930678681788027",
         "staged NPU decode-loop diagnostic available: measured_loop_seconds=5.412830422981642 diagnostic_decode_tps_loop_wall=0.18474622736271734 diagnostic_decode_tps_kernel_only=0.2746984021217935",
+        "standalone tiled 1k attention diagnostic available: host_batches=16 combined_attention_correlation_vs_exact=0.9999584557263573",
         "execution wiring blockers: full-1b-loop-not-wired,paper-shape-hardware-rerun-required",
-        "model runner blockers: full-1b-loop-not-wired,paper-shape-hardware-rerun-required",
-        "raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges",
-        "xrt-smi is available, but direct NPU rail parsing reports N/A on this host",
-        "instantaneous snapshots do not report watts; use begin_power_window/finish_power_window around timed inference",
-        "direct RAPL sysfs package counter is unavailable: permission denied reading /sys/class/powercap/intel-rapl:0/energy_uj",
-        "permission denied reading /sys/class/powercap/intel-rapl:0/energy_uj",
-        "permission denied reading /sys/class/powercap/intel-rapl:0:0/energy_uj",
-        "no readable RAPL energy counters"
+        "model runner blockers: full-1b-loop-not-wired,paper-shape-hardware-rerun-required"
       ],
       "npu_decode_loop_diagnostic": {
         "correctness": "PASS",
@@ -1229,6 +1243,32 @@
           "estimated_26_layer_decode_tps_kernel_only is an extrapolation from one layer and is not a measured full-model decode TPS"
         ],
         "timing_window": "segmented-run-start-wait2-only"
+      },
+      "npu_tiled_attention_diagnostic": {
+        "combined_attention_correlation_vs_exact": 0.9999584557263573,
+        "combined_attention_max_abs_error_vs_exact": 0.00018310546875,
+        "correctness": "PASS",
+        "head_dim": 256,
+        "herd_cols": 2,
+        "herd_rows": 1,
+        "host_batch_count": 16,
+        "host_batch_tiles": 2,
+        "kernel": "flowqkv_tiled_stats",
+        "kv_len": 1024,
+        "kv_tile": 32,
+        "notes": [
+          "diagnostic standalone 1k KV-cache attention-stat path; not a measured paper TTFT/TPS cell",
+          "tile-stat reduction is host-side and not yet integrated into the decode-loop probe",
+          "full-herd direct output remains a shim S2MM resource limit; full-herd L2 gather currently hits an AIE packet-id-0 routing blocker"
+        ],
+        "output_mode": "direct",
+        "q_chunk": 4,
+        "source_result": "/home/cj/mlir-air/programming_examples/gemma3_herd_sweep/results/gemma3_flowqkv_tiled_stats_1k_smoke.json",
+        "stats_output_correlation": 0.9999999999999944,
+        "stats_output_max_abs_error": 3.814697265625e-06,
+        "stats_output_mismatch_percentage": 0.0,
+        "status": "HARDWARE_SMOKE_PASS",
+        "tile_count": 32
       },
       "paper_source": "arxiv_pdf_v2",
       "paper_table": "prefill/decode text tables",
