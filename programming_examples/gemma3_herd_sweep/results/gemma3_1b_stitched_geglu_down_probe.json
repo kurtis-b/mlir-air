@@ -9,9 +9,9 @@
   ],
   "dense_down_projection_correlation": 0.9963990378956511,
   "dirty_worktree": false,
-  "elapsed_seconds": 2.526264154999808,
+  "elapsed_seconds": 2.4539375909998853,
   "function_name": "gemma3_decode_geglu_down",
-  "git_commit": "ad7fbba234b5c7d0dac452e8dc842c3f64387f58",
+  "git_commit": "408c4214fd756ec071da7425c47fa86ae67f55e2",
   "launch_count": 2,
   "layer_index": 0,
   "model_variant": "gemma3-1b",
@@ -24,10 +24,10 @@
       ]
     },
     {
-      "correlation": 0.9999445812071405,
+      "correlation": 0.9999445723522494,
       "name": "down_proj",
       "shape": [
-        40,
+        36,
         32
       ]
     }
@@ -50,7 +50,7 @@
   ],
   "threshold": 0.99,
   "timed_kernel_count": 1,
-  "timed_kernel_seconds": 0.14048740700036433,
+  "timed_kernel_seconds": 0.08795982199990249,
   "timing_notes": [
     "compile, ELF load, BO creation, BO writes, and argument binding occur before the timed run.start/wait2 window",
     "GeGLU output and down-projection activation are aliased BO views: 6912 and 27x256",

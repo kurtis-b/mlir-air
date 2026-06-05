@@ -180,12 +180,13 @@ the generated paper-target comparison summary.
   the down projection. The ABI has six public BO arguments and aliases the
   GeGLU output as both a contiguous `6912` vector and a `27x256` FusedDQP
   activation view, avoiding a host activation-layout copy. The down projection
-  uses the paper-style FusedDQP builder with a streamed L1 col-block path so
-  the full 27-column-block down weight fits L1 without emitting duplicate
+  uses the paper-style FusedDQP builder with a trimmed 36-row-block,
+  1x3-herd down-projection layout plus a streamed L1 col-block path, so the
+  full 27-column-block down weight fits L1 without emitting duplicate
   memtile-to-core routes. With real layer-0 `down_proj.weight`, it validates
   GeGLU correlation 0.999975, down-projection correlation 0.999945 against the
   quantized FusedDQP reference, and dense original-weight correlation 0.996399.
-  The single diagnostic `run.start()/wait2()` window is 0.140487 s, with
+  The single diagnostic `run.start()/wait2()` window is 0.087960 s, with
   compile, ELF load, BO creation/writes, and argument binding excluded. This
   standalone slice is not yet integrated into the decode-loop artifact, and it
   is still not paper-cell timing.
