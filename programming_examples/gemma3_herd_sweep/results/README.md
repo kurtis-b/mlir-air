@@ -170,6 +170,25 @@ power, or paper-parity evidence.
 
 ## Decode Loop Probe Evidence
 
+- `gemma3_1b_decode_loop_stitched_ingress_probe.json`: clean-provenance
+  Strix/XRT evidence that `--ingress-mode stitched` scales across one decode
+  token and all 26 real Gemma3 1B layers. The run preloads 26 aliased
+  stitched-ingress BO sets and 1,066 remaining staged projection BO sets before
+  timing, validates every layer with no blockers, and records
+  `dirty_worktree=false` at commit
+  `671f213ba3c9c6e4d7bfe16e6bd8b46fad2be0f3`. The measured post-warmup loop
+  wall window is 5.385961 s, or 0.185668 diagnostic TPS. The summed NPU
+  `run.start()/wait2()` windows total 3.791450 s across 1,274 launches, or
+  0.263751 kernel-only diagnostic TPS. This removes 494 launches from the
+  staged 26-layer single-token diagnostic, but kernel-only TPS is still slightly
+  worse than the staged 0.274698 TPS artifact, so the remaining performance work
+  is post-ingress stitching and/or tuning the stitched ingress route rather than
+  claiming paper parity. Full-window direct RAPL reports 10.912 W package power
+  and a 3.826 W pseudo-NPU package-delta. The result is not a paper cell because
+  attention remains single-token, KV cache is not prefill-produced, logits and
+  sampling are absent, and the rest of the decode layer remains staged after
+  ingress.
+
 - `gemma3_1b_decode_loop_stitched_ingress_L1_probe.json`: clean-provenance
   Strix/XRT evidence that the staged decode-loop probe can now replace the
   RMSNorm/Q/K/V/QK-Norm/RoPE ingress launches with the stitched ELF
