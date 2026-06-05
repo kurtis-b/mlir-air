@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 
 from gemma3_artifacts import MODEL_SPECS
+from gemma3_decode_loop_probe import has_decode_loop_tiled_stats_evidence
 from gemma3_full_layer_probe import (
     has_decode_full_layer_evidence,
     has_decode_full_layer_without_host_fallback_evidence,
@@ -36,6 +37,11 @@ MODEL_SUBSTEP_SEQUENCE_BLOCKER = "model-substep-sequence-not-wired"
 MODEL_FULL_QKV_SUBSTEP_BLOCKER = "model-full-qkv-substep-not-wired"
 MODEL_FULL_LAYER_BLOCKER = "model-full-layer-not-wired"
 MODEL_FULL_1B_LOOP_BLOCKER = "full-1b-loop-not-wired"
+PREFILL_1K_NPU_BLOCKER = "prefill-1k-npu-not-wired"
+PRODUCTION_KV_CACHE_BLOCKER = "production-kv-cache-not-wired"
+NPU_ATTENTION_REDUCTION_BLOCKER = "npu-attention-reduction-not-wired"
+LOGITS_SAMPLING_BLOCKER = "logits-sampling-not-wired"
+PRODUCTION_STATIC_BO_BLOCKER = "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
 
 
 TEXT_STAGE_TEMPLATE = (
@@ -232,6 +238,7 @@ def build_wiring_plan_from_preflight(
     use_decode_q_projection_substep_evidence: bool = False,
     use_decode_qkv_substep_evidence: bool = False,
     use_decode_full_layer_evidence: bool = False,
+    use_decode_loop_tiled_stats_evidence: bool = False,
 ) -> Gemma3NPUWiringPlan:
     if preflight.layers is None or preflight.hidden_size is None or preflight.head_dim is None:
         raise ValueError("preflight plan must include layer count, hidden size, and head dim")
@@ -257,6 +264,10 @@ def build_wiring_plan_from_preflight(
         use_decode_full_layer_evidence
         and has_decode_full_layer_without_host_fallback_evidence(preflight.model_variant)
     )
+    decode_loop_tiled_stats_validated = (
+        use_decode_loop_tiled_stats_evidence
+        and has_decode_loop_tiled_stats_evidence(preflight.model_variant)
+    )
     window_len = int(preflight.sliding_window or 0)
     stages: list[Gemma3NPUStage] = []
     for layer_index in range(int(preflight.layers)):
@@ -277,6 +288,17 @@ def build_wiring_plan_from_preflight(
                 first_kernel_stage_validated=first_kernel_stage_validated,
             )
             if (
+                decode_loop_tiled_stats_validated
+                and phase == "decode"
+                and role != "kv_cache_append"
+            ):
+                if role == "attention":
+                    status = "runner-owned-decode-loop-tiled-stats-synthetic-cache-pass"
+                    blockers = (PRODUCTION_KV_CACHE_BLOCKER, NPU_ATTENTION_REDUCTION_BLOCKER)
+                else:
+                    status = "runner-owned-decode-loop-staged-pass"
+                    blockers = ()
+            elif (
                 decode_full_layer_validated
                 and phase == "decode"
                 and layer_index == 0
@@ -333,7 +355,15 @@ def build_wiring_plan_from_preflight(
                 )
             )
 
-    if decode_full_layer_validated:
+    if decode_loop_tiled_stats_validated:
+        blockers = [
+            PREFILL_1K_NPU_BLOCKER,
+            PRODUCTION_KV_CACHE_BLOCKER,
+            NPU_ATTENTION_REDUCTION_BLOCKER,
+            LOGITS_SAMPLING_BLOCKER,
+            PRODUCTION_STATIC_BO_BLOCKER,
+        ]
+    elif decode_full_layer_validated:
         blockers = [MODEL_FULL_1B_LOOP_BLOCKER]
     elif decode_qkv_substep_validated:
         blockers = [MODEL_FULL_LAYER_BLOCKER]
@@ -355,7 +385,8 @@ def build_wiring_plan_from_preflight(
         blockers.append("paper-shape-bo-allocation-not-validated")
     if not decode_full_layer_without_host_fallbacks:
         blockers.append("nonlinear-model-stage-promotion-incomplete")
-    blockers.append("paper-shape-hardware-rerun-required")
+    if not decode_loop_tiled_stats_validated:
+        blockers.append("paper-shape-hardware-rerun-required")
     if preflight.model_variant.endswith("vision"):
         blockers.append("vision-npu-path-not-implemented")
 
@@ -388,6 +419,7 @@ def build_wiring_plan(
         use_decode_q_projection_substep_evidence=True,
         use_decode_qkv_substep_evidence=True,
         use_decode_full_layer_evidence=True,
+        use_decode_loop_tiled_stats_evidence=True,
     )
 
 

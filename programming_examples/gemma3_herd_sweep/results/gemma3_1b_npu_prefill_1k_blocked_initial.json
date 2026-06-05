@@ -45,8 +45,11 @@
   "environment_comparable": true,
   "execution_wiring": {
     "blockers": [
-      "full-1b-loop-not-wired",
-      "paper-shape-hardware-rerun-required"
+      "prefill-1k-npu-not-wired",
+      "production-kv-cache-not-wired",
+      "npu-attention-reduction-not-wired",
+      "logits-sampling-not-wired",
+      "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
     ],
     "host_fallback_count": 0,
     "host_runtime_count": 52,
@@ -56,12 +59,12 @@
     "status": "BLOCKED"
   },
   "explanation": null,
-  "git_commit": "2729c979d7a6ba37128f14200883fca296a4ff1d",
+  "git_commit": "9af9970825e710fbc349dd522aa2e2f4e96e0acd",
   "host_fallbacks": [
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.009438003568599621,
+      "elapsed_ms": 0.009524655373146137,
       "hardware_status": "hardware-smoke-pass-M8-N1152-N2560-elf",
       "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
       "measured": true,
@@ -75,7 +78,7 @@
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.008750008419156075,
+      "elapsed_ms": 0.010937335900962353,
       "hardware_status": "hardware-smoke-pass-M32-N256-elf",
       "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
       "measured": true,
@@ -89,7 +92,7 @@
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.007838321228822073,
+      "elapsed_ms": 0.008008326403796673,
       "hardware_status": "hardware-smoke-pass-rows4-head256-elf",
       "implementation_path": "programming_examples/gemma3_dataflow_kernels/rope_halfsplit.py",
       "measured": true,
@@ -103,7 +106,7 @@
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.010389660019427538,
+      "elapsed_ms": 0.011638680007308722,
       "hardware_status": "hardware-smoke-pass-n6912-tile288-elf",
       "implementation_path": "programming_examples/gemma3_dataflow_kernels/geglu.py",
       "measured": true,
@@ -117,7 +120,7 @@
     {
       "backend": "cpu-reference",
       "contributes_to_timing": true,
-      "elapsed_ms": 0.0021673234490056834,
+      "elapsed_ms": 0.003129011020064354,
       "hardware_status": "hardware-smoke-pass-n1152-tile288-elf",
       "implementation_path": "programming_examples/gemma3_dataflow_kernels/residual_add.py",
       "measured": true,
@@ -134,8 +137,11 @@
   "missing_environment_fields": [],
   "model_runner": {
     "blockers": [
-      "full-1b-loop-not-wired",
-      "paper-shape-hardware-rerun-required"
+      "prefill-1k-npu-not-wired",
+      "production-kv-cache-not-wired",
+      "npu-attention-reduction-not-wired",
+      "logits-sampling-not-wired",
+      "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
     ],
     "bo_allocated_bytes": 67108864,
     "bo_allocation_count": 40,
@@ -164,8 +170,8 @@
     "staged NPU decode-loop diagnostic available: measured_loop_seconds=5.412830422981642 diagnostic_decode_tps_loop_wall=0.18474622736271734 diagnostic_decode_tps_kernel_only=0.2746984021217935",
     "tiled 1k decode-loop diagnostic available: measured_loop_seconds=35.46716246602591 diagnostic_decode_tps_loop_wall=0.02819509457397114 pseudo_npu_watts=7.673996082054266",
     "standalone tiled 1k attention diagnostic available: host_batches=16 combined_attention_correlation_vs_exact=0.9999584557263573",
-    "execution wiring blockers: full-1b-loop-not-wired,paper-shape-hardware-rerun-required",
-    "model runner blockers: full-1b-loop-not-wired,paper-shape-hardware-rerun-required"
+    "execution wiring blockers: prefill-1k-npu-not-wired,production-kv-cache-not-wired,npu-attention-reduction-not-wired,logits-sampling-not-wired,production-contiguous-static-weight-bo-not-used-by-fused-dqp-route",
+    "model runner blockers: prefill-1k-npu-not-wired,production-kv-cache-not-wired,npu-attention-reduction-not-wired,logits-sampling-not-wired,production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
   ],
   "npu_decode_loop_diagnostic": {
     "attention_cache_contract": "single-current-token-kv",

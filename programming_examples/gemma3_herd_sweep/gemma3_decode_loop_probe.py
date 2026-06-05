@@ -71,6 +71,9 @@ DEFAULT_SEQUENCE_KIND = "decode-loop-staged-full-1b"
 DEFAULT_LOOP_PROBE_EVIDENCE = (
     Path(__file__).with_name("results") / "gemma3_1b_decode_loop_probe.json"
 )
+DEFAULT_TILED_LOOP_PROBE_EVIDENCE = (
+    Path(__file__).with_name("results") / "gemma3_1b_decode_loop_tiled_stats_probe.json"
+)
 PAPER_DECODE_TPS_1K = 41.1
 DEFAULT_ATTENTION_MODE = "single-token"
 DEFAULT_TILED_ATTENTION_KV_TILE = 32
@@ -197,6 +200,39 @@ class _PackedProjectionPlan:
     min_offset: Any
     mlir_module: Any
 
+
+
+
+def has_decode_loop_tiled_stats_evidence(
+    model_variant: str,
+    path: Path | None = None,
+) -> bool:
+    evidence_path = path or DEFAULT_TILED_LOOP_PROBE_EVIDENCE
+    try:
+        data = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return (
+        data.get("schema_version") == 2
+        and data.get("model_variant") == model_variant
+        and data.get("status") == "DECODE_LOOP_DIAGNOSTIC_PASS"
+        and data.get("sequence_kind") == DEFAULT_SEQUENCE_KIND
+        and data.get("phase") == DEFAULT_PHASE
+        and data.get("layer_count") == 26
+        and data.get("decode_tokens") == 1
+        and data.get("prompt_context_length") == 1024
+        and data.get("attention_mode") == "tiled-stats-1k"
+        and data.get("attention_cache_contract") == "synthetic-repeated-current-token-kv-cache"
+        and data.get("attention_host_batch_count") == 16
+        and data.get("attention_host_reduction") is True
+        and data.get("output_format") == DEFAULT_OUTPUT_FORMAT
+        and data.get("runner_reuse_mode") == "reused-elf-persistent-bo"
+        and not data.get("host_fallbacks")
+        and not data.get("blockers")
+        and data.get("dirty_worktree") is False
+        and "paper-1k-kv-attention-production-cache-and-npu-reduction-not-wired"
+        in tuple(data.get("remaining_paper_gaps", ()))
+    )
 
 def _delta_pct(local_tps: float | None) -> float | None:
     if local_tps is None:

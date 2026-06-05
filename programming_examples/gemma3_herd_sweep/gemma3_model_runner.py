@@ -23,11 +23,16 @@ from gemma3_argument_binding import Gemma3KernelArgumentBindingPlan, build_argum
 from gemma3_buffer_binding import Gemma3BufferBindingPlan, build_buffer_binding_plan_from_components
 from gemma3_npu_preflight import Gemma3NPUPreflightPlan, ProjectionPlan, build_preflight_plan
 from gemma3_npu_wiring import (
+    LOGITS_SAMPLING_BLOCKER,
     MODEL_FULL_1B_LOOP_BLOCKER,
     MODEL_FULL_LAYER_BLOCKER,
     MODEL_FULL_QKV_SUBSTEP_BLOCKER,
     MODEL_KERNEL_LAUNCH_BLOCKER,
     MODEL_SUBSTEP_SEQUENCE_BLOCKER,
+    NPU_ATTENTION_REDUCTION_BLOCKER,
+    PREFILL_1K_NPU_BLOCKER,
+    PRODUCTION_KV_CACHE_BLOCKER,
+    PRODUCTION_STATIC_BO_BLOCKER,
     Gemma3NPUWiringPlan,
     build_wiring_plan_from_preflight,
 )
@@ -53,6 +58,13 @@ MODEL_RUNNER_BLOCKERS = (
     "paper-shape-bo-allocation-not-validated",
     "nonlinear-model-stage-promotion-incomplete",
     "paper-shape-hardware-rerun-required",
+)
+MODEL_RUNNER_SPECIFIC_WIRING_BLOCKERS = (
+    PREFILL_1K_NPU_BLOCKER,
+    PRODUCTION_KV_CACHE_BLOCKER,
+    NPU_ATTENTION_REDUCTION_BLOCKER,
+    LOGITS_SAMPLING_BLOCKER,
+    PRODUCTION_STATIC_BO_BLOCKER,
 )
 
 
@@ -249,7 +261,19 @@ def build_model_runner_plan_from_components(
         for index, step in enumerate(steps)
     ]
     blockers = list(MODEL_RUNNER_BLOCKERS)
-    if MODEL_FULL_1B_LOOP_BLOCKER in wiring.blockers:
+    specific_wiring_blockers = [
+        blocker for blocker in MODEL_RUNNER_SPECIFIC_WIRING_BLOCKERS if blocker in wiring.blockers
+    ]
+    if specific_wiring_blockers:
+        blockers = [
+            *specific_wiring_blockers,
+            *(
+                blocker
+                for blocker in blockers
+                if blocker not in (MODEL_KERNEL_LAUNCH_BLOCKER, "paper-shape-hardware-rerun-required")
+            ),
+        ]
+    elif MODEL_FULL_1B_LOOP_BLOCKER in wiring.blockers:
         blockers = [
             MODEL_FULL_1B_LOOP_BLOCKER
             if blocker == MODEL_KERNEL_LAUNCH_BLOCKER
@@ -363,6 +387,7 @@ def build_model_runner_plan(
         use_decode_q_projection_substep_evidence=True,
         use_decode_qkv_substep_evidence=True,
         use_decode_full_layer_evidence=True,
+        use_decode_loop_tiled_stats_evidence=True,
     )
     buffer_binding_plan = build_buffer_binding_plan_from_components(
         model_variant=model_variant,
