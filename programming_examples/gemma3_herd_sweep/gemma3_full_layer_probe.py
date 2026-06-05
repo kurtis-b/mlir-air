@@ -257,6 +257,27 @@ def has_decode_full_layer_evidence(
     return _is_decode_full_layer_evidence(data, model_variant=model_variant)
 
 
+def decode_full_layer_host_fallbacks(
+    model_variant: str,
+    path: Path | None = None,
+) -> tuple[str, ...] | None:
+    evidence_path = path or DEFAULT_FULL_LAYER_PROBE_EVIDENCE
+    try:
+        data = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not _is_decode_full_layer_evidence(data, model_variant=model_variant):
+        return None
+    return tuple(str(item) for item in data.get("host_fallbacks", ()))
+
+
+def has_decode_full_layer_without_host_fallback_evidence(
+    model_variant: str,
+    path: Path | None = None,
+) -> bool:
+    return decode_full_layer_host_fallbacks(model_variant, path=path) == ()
+
+
 def _ceil_to(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
 

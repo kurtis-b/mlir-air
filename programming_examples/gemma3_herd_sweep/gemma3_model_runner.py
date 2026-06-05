@@ -289,6 +289,12 @@ def build_model_runner_plan_from_components(
             for blocker in blockers
             if blocker != "paper-shape-bo-allocation-not-validated"
         ]
+    if "nonlinear-model-stage-promotion-incomplete" not in wiring.blockers:
+        blockers = [
+            blocker
+            for blocker in blockers
+            if blocker != "nonlinear-model-stage-promotion-incomplete"
+        ]
     if argument_binding_plan.blockers:
         blockers.extend(argument_binding_plan.blockers)
     if model_variant.endswith("vision"):

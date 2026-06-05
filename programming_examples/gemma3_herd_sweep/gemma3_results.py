@@ -162,11 +162,17 @@ def load_staged_npu_diagnostic(model_variant: str) -> dict[str, Any] | None:
     except Exception:
         return None
     timed = data.get("timed_kernel_seconds")
+    host_fallbacks = list(data.get("host_fallbacks", []))
     estimated_tps = data.get("estimated_26_layer_decode_tps_kernel_only")
     paper_decode_tps = 41.1
     delta_pct = None
     if estimated_tps is not None:
         delta_pct = abs(float(estimated_tps) - paper_decode_tps) / paper_decode_tps * 100.0
+    fallback_note = (
+        "no staged layer-0 host fallback compute is present"
+        if not host_fallbacks
+        else "staged layer-0 host fallbacks remain: " + ",".join(host_fallbacks)
+    )
     return {
         "status": data.get("status"),
         "sequence_kind": data.get("sequence_kind"),
@@ -175,6 +181,7 @@ def load_staged_npu_diagnostic(model_variant: str) -> dict[str, Any] | None:
         "correctness": "PASS" if data.get("status") == "FULL_LAYER_SEQUENCE_PASS" else "BLOCKED",
         "timed_kernel_count": data.get("timed_kernel_count"),
         "timed_kernel_seconds": timed,
+        "host_fallbacks": host_fallbacks,
         "timed_kernel_mean_seconds": data.get("timed_kernel_mean_seconds"),
         "diagnostic_layer_passes_per_second": data.get("diagnostic_layer_passes_per_second"),
         "estimated_26_layer_decode_tps_kernel_only": estimated_tps,
@@ -187,7 +194,8 @@ def load_staged_npu_diagnostic(model_variant: str) -> dict[str, Any] | None:
         "source_result": str(DEFAULT_FULL_LAYER_PROBE_EVIDENCE),
         "notes": [
             "diagnostic staged layer-0 kernel-only timing; not a measured paper TTFT/TPS cell",
-            "26-layer decode TPS is extrapolated from one staged layer and excludes host fallback compute",
+            "26-layer decode TPS is extrapolated from one staged layer and excludes compile/setup, BO transfers, full-loop scheduling, logits, and sampling",
+            fallback_note,
         ],
     }
 

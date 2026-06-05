@@ -24,10 +24,13 @@ creation/preload, xclbin/ELF load, and kernel argument setup.
 The iGPU cells set `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` and use ROCm SMI
 for timed-window GPU rail sampling. CPU cells use direct RAPL sysfs package
 energy through the `power` group. iGPU CPU/total rails remain
-`MISSING_POWER_FIELD`; NPU timing and pseudo-NPU power remain blocked by full 1B
-loop wiring, nonlinear model-stage promotion, and fresh paper-shape hardware
-reruns. Kernel argument-layout validation is complete for the real 1B 1k/32k
-context model-runner plan: 728 NPU candidate layouts, 2,236 positional
+`MISSING_POWER_FIELD`; official NPU timing and pseudo-NPU paper-cell power remain
+blocked by full 1B loop wiring and fresh paper-shape hardware reruns. The prior
+1B staged nonlinear blocker is retired for the current full-layer diagnostic
+because it records `host_fallbacks=[]`; 4B and vision still need equivalent
+composed evidence before that blocker can be narrowed. Kernel argument-layout
+validation is complete for the real 1B 1k/32k context model-runner plan: 728
+NPU candidate layouts, 2,236 positional
 arguments, and zero binding blockers. Staged decode layer-0 correctness and
 segmented kernel-only timing evidence is now present and attached under
 `npu_staged_diagnostic` in the blocked NPU paper-cell JSONs, but official NPU
@@ -126,7 +129,10 @@ the generated paper-target comparison summary.
   and not a measured full-model decode TPS. Direct RAPL under `sg power`
   reports 19.027 W segmented package power and a 4.598 W pseudo-NPU
   package-delta from a 14.429 W quiescent package sample. The JSON records
-  `full-1b-loop-not-wired` as the remaining model runner gap.
+  `full-1b-loop-not-wired` as the remaining model runner gap and
+  `host_fallbacks=[]`; the wiring, model-runner, and reproduction-blocker
+  manifests consume that evidence to drop the stale 1B nonlinear promotion
+  blocker.
 
 - `gemma3_1b_decode_full_layer_L1_probe.json`: compact Strix/XRT evidence that
   the same staged route works for layer 1 after fixing the nonzero-layer norm

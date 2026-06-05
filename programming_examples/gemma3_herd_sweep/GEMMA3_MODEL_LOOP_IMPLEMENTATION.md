@@ -302,10 +302,10 @@ typographical error, or a derived value from the figure.
 | Tokenizer and prompts | Synthetic token IDs plus real tokenizer execution for initial 1B CPU/iGPU 1k baseline cells | Real tokenizer, deterministic prompts, and sequence lengths 1k-32k for 1B and 1k-128k decode for 4B |
 | Text runtime | Host-driven synthetic loop with CPU references, manifests, real-shape preflight, and per-layer NPU wiring metadata | End-to-end NPU execution for all validated model substeps, with host fallbacks removed or measured separately |
 | Vision runtime | Disabled contract plus synthetic CPU non-causal vision prefill and visual context token handoff contract | 4B vision prefill path with non-causal attention validated on NPU and timed against paper |
-| Nonlinear operations | CPU fallbacks plus standalone GeGLU candidate; host fallback microbenchmarks are recorded in result JSON | RMSNorm, QK-Norm, RoPE, residual add, activation, logits, and sampling either validated on NPU or explicitly accounted for in timing |
+| Nonlinear operations | RMSNorm, QK-Norm, RoPE, residual add, and GeGLU have standalone NPU evidence and layer-0 staged 1B launch evidence with `host_fallbacks=[]`; host fallback microbenchmarks remain recorded in result JSON | Full-loop/paper-shape 1B coverage, 4B/vision coverage, logits, and sampling either validated on NPU or explicitly accounted for in timing |
 | Baselines | Initial 1B 1k CPU/HF and iGPU/HF ROCm cells are measured; iGPU prefill matches the paper 1k iGPU target, CPU and decode cells are explained deviations | CPU and iGPU runs for every paper model variant, prompt length, output count, tokenizer, and measurement window |
-| Timing | Initial 1B 1k CPU/iGPU TTFT and decode TPS exclude load/setup; NPU timing is still blocked before launch | TTFT and decode TPS with warmup, timed iterations, and compile/setup excluded |
-| Power | CPU cells use direct RAPL package energy; iGPU cells use ROCm SMI GPU rail; pseudo-NPU RAPL package delta awaits real timed NPU execution | CPU/GPU/NPU/total watt readings aligned with benchmark windows and TPS/W calculations |
+| Timing | Initial 1B 1k CPU/iGPU TTFT and decode TPS exclude load/setup; NPU has staged layer and decode-loop diagnostics but no official paper-cell local value yet | TTFT and decode TPS with warmup, timed iterations, correctness, and compile/setup excluded |
+| Power | CPU cells use direct RAPL package energy; iGPU cells use ROCm SMI GPU rail; staged NPU diagnostics record pseudo-NPU RAPL package deltas, but official NPU paper-cell power is still pending | CPU/GPU/NPU/total watt readings aligned with benchmark windows and TPS/W calculations |
 | Accuracy | Synthetic checksums only | Model-output agreement against CPU reference and paper-compatible prompts, plus tolerance policy for quantized outputs |
 | Result comparison | Paper target ledger, initial 1B 1k result bundle, and Markdown/CSV summaries exist | Machine-readable paper/local comparison for every paper cell with percent deltas and pass/deviation labels |
 
@@ -340,7 +340,7 @@ The next implementation loops should stay on 1B 1k NPU text before expanding to
 | ---: | --- | --- |
 | 1 | Complete: resolve `model-kernel-argument-binding-not-validated` | `gemma3_argument_binding.py --self-test` validates 56 fixture NPU candidate layouts with 172 positional args and no missing storage; the real 1B 1k/32k-context plan validates 728 NPU candidate layouts with 2,236 positional args and zero argument-binding blockers. |
 | 2 | Partially complete: resolve `model-kernel-launch-not-wired` | The first promoted Gemma3 1B pre-attention RMSNorm shape (`1024x1152`, ELF) launches on the NPU with correlation 0.999983 using the validated first-stage positional layout (`layer_input`, `static_norm_weights`, `prefill_L0_pre_attention_norm`), a full contiguous static norm payload whose layer-0 vector is at byte offset 0, and runner-owned pyxrt BO allocation/binding. The decode RMSNorm-to-`q_proj` substep passes with RMSNorm correlation 0.999991, q-projection correlation 1.000000, and dense original-weight correlation 0.994609. The decode RMSNorm-to-Q/K/V substep passes with Q/K/V projection correlations all 1.000000 and dense original-weight correlations 0.994609/0.995959/0.995720. The staged decode layer-0 probe now launches pre-attention RMSNorm, Q/K RMSNorm, post-attention RMSNorm, pre/post-feedforward RMSNorm, q/k/v/o/gate/up/down projection families, RoPE, single-token FlowQKV attention, GeGLU/MLP activation, and both residual adds on the NPU; no operation remains as a host-reference stage in that layer-0 probe. Layer 1 exposed and fixed the missing static-norm offset/sub-BO path by using a preselected BF16 norm-vector argument (`model.layers.1.input_layernorm.weight` at byte offset 10240 in the contiguous norm BO, passed as a 2304-byte argument). The staged 26-layer decode-loop diagnostic now measures one post-warmup token across all 26 real layers, preloads packed projection inputs into 1,456 runner-owned BO sets before timing, and uses no-allocation static metadata placeholders in the timed projection path, but it remains diagnostic because 1k KV-cache attention, logits/sampling, host fallback promotion, and the production contiguous static-weight BO route are not complete. For 1B, committed evidence now narrows the real-artifact blocker to `full-1b-loop-not-wired`; the remaining launch work is paper-shaped prefill/decode loop integration and timed paper-cell measurement, not first-kernel, single-layer, or diagnostic repeated-layer correctness. |
-| 3 | Reduce `nonlinear-model-stage-promotion-incomplete` | Standalone NPU evidence now covers RMSNorm, QK-Norm, RoPE, GeGLU, and residual add; RMSNorm/QK-Norm, RoPE, GeGLU, and residual add also have layer-0 staged model-launch evidence. The remaining work is full-context/paper-shape attention launch validation, logits/sampling treatment, and timed paper-cell execution. |
+| 3 | Complete for 1B staged layer: retire `nonlinear-model-stage-promotion-incomplete` from real 1B blocker reports | Standalone NPU evidence covers RMSNorm, QK-Norm, RoPE, GeGLU, and residual add, and the layer-0 staged full-layer probe now records `host_fallbacks=[]`. `gemma3_npu_wiring.py`, `gemma3_model_runner.py`, and `gemma3_reproduction_blockers.py` now report only `full-1b-loop-not-wired,paper-shape-hardware-rerun-required` for the real 1B plan. 4B text and 4B vision keep `nonlinear-model-stage-promotion-incomplete` until equivalent composed evidence exists. Remaining 1B paper-cell work is full-context KV-cache attention, logits/sampling treatment, production static-BO routing, and timed prefill/decode loop execution. |
 | 4 | Re-run 1B 1k NPU paper cells | Prefill and decode result JSONs contain real local NPU TTFT/TPS or a narrower, artifact-backed failure classification. |
 | 5 | Partially complete: capture pseudo-NPU power | Direct RAPL is readable when the run is launched under `sg power`. The refreshed layer-0 staged full-layer diagnostic records segmented package-energy deltas over only NPU `run.start()/wait2()` windows: 0.154274 s across 68 kernel launches after adding staged single-token FlowQKV attention on top of Q/K and post/pre/post RMSNorm launches, RoPE, GeGLU, and residual adds, 19.027 W segmented package power, and 4.598 W pseudo-NPU package-delta from a 14.429 W quiescent sample. The layer-1 diagnostic records 0.142578 s across 57 launch windows, 17.420 W segmented package power, and 5.918 W pseudo-NPU package-delta from an 11.502 W quiescent sample. The staged 26-layer decode-loop diagnostic records a post-warmup full-loop RAPL window of 15.975 W package power and 9.482 W pseudo-NPU package-delta while measuring 0.173242 diagnostic loop-wall TPS. Official paper-cell pseudo-NPU power remains blocked until paper-shaped prefill/decode execution exists. |
 | 6 | Expand cautiously | Only after 1B 1k NPU correctness, timing, and pseudo-power evidence is clean should the loop expand to more 1B lengths, 4B text, or vision. |
@@ -697,9 +697,13 @@ Implemented evidence and blocker:
   correlation for 4B RMSNorm. This is a model-runner argument and launch-intent
   contract; it is not yet a validated
   model-timed norm-kernel launch.
-- Remaining work for full Phase E completion is composed model launch
-  validation for the promoted nonlinear paths, plus logits/sampling promotion
-  or measured timing treatment in end-to-end execution.
+- For the real 1B staged decode layer, composed model launch validation for
+  promoted RMSNorm/QK-Norm, RoPE, GeGLU, and residual-add paths is present and
+  records `host_fallbacks=[]`; blocker reports consume that evidence and no
+  longer list `nonlinear-model-stage-promotion-incomplete` for the real 1B
+  plan. Remaining Phase E work is equivalent full-loop/paper-shape coverage,
+  equivalent 4B/vision coverage, plus logits/sampling promotion or measured
+  timing treatment in end-to-end execution.
 
 ### Phase F: end-to-end 1B text reproduction
 
@@ -724,8 +728,10 @@ Acceptance:
 Blocked evidence:
 
 - `gemma3_reproduction_blockers.py` reports Phase F as `BLOCKED` because
-  local 1B artifacts are available but model-kernel launch, nonlinear
-  model-stage promotion, and fresh paper-shape hardware reruns are not complete.
+  local 1B artifacts are available but full 1B prefill/decode loop wiring and
+  fresh paper-shape hardware reruns are not complete. The prior 1B nonlinear
+  model-stage blocker is retired for the staged full-layer evidence because the
+  current layer-0 diagnostic records `host_fallbacks=[]`.
   Kernel argument-layout validation is complete for the real 1B 1k/32k-context
   plan: 728 NPU candidate layouts and 2,236 positional arguments validate with
   no missing storage, shape, dtype, direction, or KV-buffer identity blockers.
@@ -828,10 +834,10 @@ Blocked evidence:
   paper cell. The decode helper constructs the 1k KV cache before the timed
   window and times only 16 token-by-token decode steps. The matching 1k NPU
   result records remain blocked JSON cells with
-  `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` because full model-runner kernel
-  launch, nonlinear model-stage promotion, and fresh paper-shape hardware reruns
-  remain incomplete. They now include `npu_staged_diagnostic` payloads pointing
-  at the staged layer-0 kernel-only timing and segmented RAPL evidence, but
+  `REAL_MODEL_EXECUTION_NOT_IMPLEMENTED` because full 1B prefill/decode loop
+  wiring and fresh paper-shape hardware reruns remain incomplete. They now
+  include `npu_staged_diagnostic` payloads pointing at the staged layer-0
+  kernel-only timing and segmented RAPL evidence, but
   `local_value` remains null for official paper comparison.
   `gemma3_npu_preflight.py` records
   real projection padding and Q4NX block counts needed for NPU wiring.
@@ -1124,15 +1130,19 @@ Implemented evidence and blocker:
   0.269758 kernel-only extrapolated decode TPS and a 5.918 W pseudo-NPU
   package-delta. `gemma3_npu_wiring.py` and
   `gemma3_model_runner.py` consume the first-kernel, q-only, Q/K/V, and
-  full-layer evidence to report `full-1b-loop-not-wired` for the real 1B plan
-  instead of the stale first-kernel, substep-sequence, or full-layer blocker.
+  full-layer evidence to report
+  `full-1b-loop-not-wired,paper-shape-hardware-rerun-required` for the real 1B
+  plan instead of the stale first-kernel, substep-sequence, full-layer, or nonlinear
+  model-stage blocker.
   This is not a repeated model-runner loop, TTFT/TPS timing, pseudo-NPU paper
   power, or a paper cell.
 - `gemma3_paper_compare.py --compare` accepts either a single result cell or a
   wrapper with `results`, and can emit Markdown and CSV summaries. The initial
   1B 1k CPU/iGPU measured cells plus NPU blocked cells are bundled in
   `results/gemma3_1b_initial_1k_results.json`; the NPU blocked cells include
-  the staged diagnostic payload while keeping official local TTFT/TPS null. The
+  the staged diagnostic payload, `host_fallbacks=[]` for the staged layer-0
+  diagnostic, and narrowed 1B blockers while keeping official local TTFT/TPS
+  null. The
   generated Markdown and CSV summaries are saved beside the bundle.
 - `run_model_loop_results.lit` covers blocked real-artifact result generation,
   paper comparison, Markdown/CSV summary emission, and JSON schema essentials.

@@ -50,7 +50,6 @@
       "git_commit": "6b3b8b1fb51295e94f083ec2f31de3dae4f36559",
       "host_fallbacks": [],
       "local_value": 1.430773033023191,
-      "log_path": "programming_examples/gemma3_herd_sweep/results/gemma3_1b_cpu_prefill_1k_initial.json",
       "metric": "prefill_ttft_seconds",
       "missing_environment_fields": [],
       "model_runner": null,
@@ -191,7 +190,6 @@
       "git_commit": "6b3b8b1fb51295e94f083ec2f31de3dae4f36559",
       "host_fallbacks": [],
       "local_value": 12.400321286446324,
-      "log_path": "programming_examples/gemma3_herd_sweep/results/gemma3_1b_cpu_decode_1k_initial.json",
       "metric": "decode_tps",
       "missing_environment_fields": [],
       "model_runner": null,
@@ -328,7 +326,6 @@
       "git_commit": "6b3b8b1fb51295e94f083ec2f31de3dae4f36559",
       "host_fallbacks": [],
       "local_value": 0.5271778049839971,
-      "log_path": "programming_examples/gemma3_herd_sweep/results/gemma3_1b_igpu_prefill_1k_initial.json",
       "metric": "prefill_ttft_seconds",
       "missing_environment_fields": [],
       "model_runner": null,
@@ -469,7 +466,6 @@
       "git_commit": "6b3b8b1fb51295e94f083ec2f31de3dae4f36559",
       "host_fallbacks": [],
       "local_value": 13.738045813682556,
-      "log_path": "programming_examples/gemma3_herd_sweep/results/gemma3_1b_igpu_decode_1k_initial.json",
       "metric": "decode_tps",
       "missing_environment_fields": [],
       "model_runner": null,
@@ -604,7 +600,6 @@
       "execution_wiring": {
         "blockers": [
           "full-1b-loop-not-wired",
-          "nonlinear-model-stage-promotion-incomplete",
           "paper-shape-hardware-rerun-required"
         ],
         "host_fallback_count": 0,
@@ -615,12 +610,12 @@
         "status": "BLOCKED"
       },
       "explanation": null,
-      "git_commit": "fdfe68669dd51e19170c415d2798e01e831c1459",
+      "git_commit": "78b310457dccb668cea97cb5c4f30ebb7cff6970",
       "host_fallbacks": [
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.009668001439422369,
+          "elapsed_ms": 0.009661326960970959,
           "hardware_status": "hardware-smoke-pass-M8-N1152-N2560-elf",
           "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
           "measured": true,
@@ -634,7 +629,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.00908365473151207,
+          "elapsed_ms": 0.008816326347490152,
           "hardware_status": "hardware-smoke-pass-M32-N256-elf",
           "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
           "measured": true,
@@ -648,7 +643,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.007907995798935493,
+          "elapsed_ms": 0.008091679774224758,
           "hardware_status": "hardware-smoke-pass-rows4-head256-elf",
           "implementation_path": "programming_examples/gemma3_dataflow_kernels/rope_halfsplit.py",
           "measured": true,
@@ -662,7 +657,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.010269325381765762,
+          "elapsed_ms": 0.010523013770580292,
           "hardware_status": "hardware-smoke-pass-n6912-tile288-elf",
           "implementation_path": "programming_examples/gemma3_dataflow_kernels/geglu.py",
           "measured": true,
@@ -676,7 +671,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.0021873274818062782,
+          "elapsed_ms": 0.0021839902425805726,
           "hardware_status": "hardware-smoke-pass-n1152-tile288-elf",
           "implementation_path": "programming_examples/gemma3_dataflow_kernels/residual_add.py",
           "measured": true,
@@ -689,13 +684,11 @@
         }
       ],
       "local_value": null,
-      "log_path": "programming_examples/gemma3_herd_sweep/results/gemma3_1b_npu_prefill_1k_blocked_initial.json",
       "metric": "prefill_ttft_seconds",
       "missing_environment_fields": [],
       "model_runner": {
         "blockers": [
           "full-1b-loop-not-wired",
-          "nonlinear-model-stage-promotion-incomplete",
           "paper-shape-hardware-rerun-required"
         ],
         "bo_allocated_bytes": 67108864,
@@ -723,12 +716,15 @@
         "real artifact inventory is present but execution is not implemented",
         "staged NPU diagnostic available: timed_kernel_seconds=0.15427393274148926 estimated_26_layer_decode_tps_kernel_only=0.24930678681788027",
         "staged NPU decode-loop diagnostic available: measured_loop_seconds=5.772286672028713 diagnostic_decode_tps_loop_wall=0.17324156903810575 diagnostic_decode_tps_kernel_only=0.27725198489572966",
-        "execution wiring blockers: full-1b-loop-not-wired,nonlinear-model-stage-promotion-incomplete,paper-shape-hardware-rerun-required",
-        "model runner blockers: full-1b-loop-not-wired,nonlinear-model-stage-promotion-incomplete,paper-shape-hardware-rerun-required",
+        "execution wiring blockers: full-1b-loop-not-wired,paper-shape-hardware-rerun-required",
+        "model runner blockers: full-1b-loop-not-wired,paper-shape-hardware-rerun-required",
         "raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges",
         "xrt-smi is available, but direct NPU rail parsing reports N/A on this host",
         "instantaneous snapshots do not report watts; use begin_power_window/finish_power_window around timed inference",
-        "direct RAPL sysfs package counter is readable; timed-window integration will use energy_uj deltas"
+        "direct RAPL sysfs package counter is unavailable: permission denied reading /sys/class/powercap/intel-rapl:0/energy_uj",
+        "permission denied reading /sys/class/powercap/intel-rapl:0/energy_uj",
+        "permission denied reading /sys/class/powercap/intel-rapl:0:0/energy_uj",
+        "no readable RAPL energy counters"
       ],
       "npu_decode_loop_diagnostic": {
         "correctness": "PASS",
@@ -825,10 +821,12 @@
         "delta_pct_vs_paper_decode_tps_1k": 99.39341414399541,
         "diagnostic_layer_passes_per_second": 6.481976457264887,
         "estimated_26_layer_decode_tps_kernel_only": 0.24930678681788027,
+        "host_fallbacks": [],
         "layer_index": 0,
         "notes": [
           "diagnostic staged layer-0 kernel-only timing; not a measured paper TTFT/TPS cell",
-          "26-layer decode TPS is extrapolated from one staged layer and excludes host fallback compute"
+          "26-layer decode TPS is extrapolated from one staged layer and excludes compile/setup, BO transfers, full-loop scheduling, logits, and sampling",
+          "no staged layer-0 host fallback compute is present"
         ],
         "paper_decode_tps_1k": 41.1,
         "phase": "decode",
@@ -899,7 +897,7 @@
       "timed_iters": 3,
       "unit": "seconds",
       "warmup_iters": 1,
-      "xrt_version": "Version              : 2.21.75"
+      "xrt_version": "Version              : 2.21.0"
     },
     {
       "artifact_format": "elf",
@@ -949,7 +947,6 @@
       "execution_wiring": {
         "blockers": [
           "full-1b-loop-not-wired",
-          "nonlinear-model-stage-promotion-incomplete",
           "paper-shape-hardware-rerun-required"
         ],
         "host_fallback_count": 0,
@@ -960,12 +957,12 @@
         "status": "BLOCKED"
       },
       "explanation": null,
-      "git_commit": "fdfe68669dd51e19170c415d2798e01e831c1459",
+      "git_commit": "78b310457dccb668cea97cb5c4f30ebb7cff6970",
       "host_fallbacks": [
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.009677993754545847,
+          "elapsed_ms": 0.009547666801760593,
           "hardware_status": "hardware-smoke-pass-M8-N1152-N2560-elf",
           "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
           "measured": true,
@@ -979,7 +976,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.008956665017952522,
+          "elapsed_ms": 0.008816326347490152,
           "hardware_status": "hardware-smoke-pass-M32-N256-elf",
           "implementation_path": "programming_examples/weighted_rms_norm/weighted_rms_norm.py",
           "measured": true,
@@ -993,7 +990,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.007934674310187498,
+          "elapsed_ms": 0.007907995798935493,
           "hardware_status": "hardware-smoke-pass-rows4-head256-elf",
           "implementation_path": "programming_examples/gemma3_dataflow_kernels/rope_halfsplit.py",
           "measured": true,
@@ -1007,7 +1004,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.010091986041516066,
+          "elapsed_ms": 0.009935329823444286,
           "hardware_status": "hardware-smoke-pass-n6912-tile288-elf",
           "implementation_path": "programming_examples/gemma3_dataflow_kernels/geglu.py",
           "measured": true,
@@ -1021,7 +1018,7 @@
         {
           "backend": "cpu-reference",
           "contributes_to_timing": true,
-          "elapsed_ms": 0.002094001198808352,
+          "elapsed_ms": 0.0021640056123336158,
           "hardware_status": "hardware-smoke-pass-n1152-tile288-elf",
           "implementation_path": "programming_examples/gemma3_dataflow_kernels/residual_add.py",
           "measured": true,
@@ -1034,13 +1031,11 @@
         }
       ],
       "local_value": null,
-      "log_path": "programming_examples/gemma3_herd_sweep/results/gemma3_1b_npu_decode_1k_blocked_initial.json",
       "metric": "decode_tps",
       "missing_environment_fields": [],
       "model_runner": {
         "blockers": [
           "full-1b-loop-not-wired",
-          "nonlinear-model-stage-promotion-incomplete",
           "paper-shape-hardware-rerun-required"
         ],
         "bo_allocated_bytes": 67108864,
@@ -1068,12 +1063,15 @@
         "real artifact inventory is present but execution is not implemented",
         "staged NPU diagnostic available: timed_kernel_seconds=0.15427393274148926 estimated_26_layer_decode_tps_kernel_only=0.24930678681788027",
         "staged NPU decode-loop diagnostic available: measured_loop_seconds=5.772286672028713 diagnostic_decode_tps_loop_wall=0.17324156903810575 diagnostic_decode_tps_kernel_only=0.27725198489572966",
-        "execution wiring blockers: full-1b-loop-not-wired,nonlinear-model-stage-promotion-incomplete,paper-shape-hardware-rerun-required",
-        "model runner blockers: full-1b-loop-not-wired,nonlinear-model-stage-promotion-incomplete,paper-shape-hardware-rerun-required",
+        "execution wiring blockers: full-1b-loop-not-wired,paper-shape-hardware-rerun-required",
+        "model runner blockers: full-1b-loop-not-wired,paper-shape-hardware-rerun-required",
         "raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges",
         "xrt-smi is available, but direct NPU rail parsing reports N/A on this host",
         "instantaneous snapshots do not report watts; use begin_power_window/finish_power_window around timed inference",
-        "direct RAPL sysfs package counter is readable; timed-window integration will use energy_uj deltas"
+        "direct RAPL sysfs package counter is unavailable: permission denied reading /sys/class/powercap/intel-rapl:0/energy_uj",
+        "permission denied reading /sys/class/powercap/intel-rapl:0/energy_uj",
+        "permission denied reading /sys/class/powercap/intel-rapl:0:0/energy_uj",
+        "no readable RAPL energy counters"
       ],
       "npu_decode_loop_diagnostic": {
         "correctness": "PASS",
@@ -1170,10 +1168,12 @@
         "delta_pct_vs_paper_decode_tps_1k": 99.39341414399541,
         "diagnostic_layer_passes_per_second": 6.481976457264887,
         "estimated_26_layer_decode_tps_kernel_only": 0.24930678681788027,
+        "host_fallbacks": [],
         "layer_index": 0,
         "notes": [
           "diagnostic staged layer-0 kernel-only timing; not a measured paper TTFT/TPS cell",
-          "26-layer decode TPS is extrapolated from one staged layer and excludes host fallback compute"
+          "26-layer decode TPS is extrapolated from one staged layer and excludes compile/setup, BO transfers, full-loop scheduling, logits, and sampling",
+          "no staged layer-0 host fallback compute is present"
         ],
         "paper_decode_tps_1k": 41.1,
         "phase": "decode",
@@ -1244,7 +1244,7 @@
       "timed_iters": 3,
       "unit": "tokens_per_second",
       "warmup_iters": 1,
-      "xrt_version": "Version              : 2.21.75"
+      "xrt_version": "Version              : 2.21.0"
     }
   ]
 }

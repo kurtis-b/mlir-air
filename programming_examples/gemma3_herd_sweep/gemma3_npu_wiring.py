@@ -17,7 +17,10 @@ import json
 from pathlib import Path
 
 from gemma3_artifacts import MODEL_SPECS
-from gemma3_full_layer_probe import has_decode_full_layer_evidence
+from gemma3_full_layer_probe import (
+    has_decode_full_layer_evidence,
+    has_decode_full_layer_without_host_fallback_evidence,
+)
 from gemma3_kernel_parity import kernel_parity_targets
 from gemma3_launch_probe import has_runner_owned_first_kernel_launch_evidence
 from gemma3_nonlinears import nonlinear_registry
@@ -250,6 +253,10 @@ def build_wiring_plan_from_preflight(
         use_decode_full_layer_evidence
         and has_decode_full_layer_evidence(preflight.model_variant)
     )
+    decode_full_layer_without_host_fallbacks = (
+        use_decode_full_layer_evidence
+        and has_decode_full_layer_without_host_fallback_evidence(preflight.model_variant)
+    )
     window_len = int(preflight.sliding_window or 0)
     stages: list[Gemma3NPUStage] = []
     for layer_index in range(int(preflight.layers)):
@@ -346,12 +353,9 @@ def build_wiring_plan_from_preflight(
         and has_paper_shape_bo_allocation_evidence(preflight.model_variant)
     ):
         blockers.append("paper-shape-bo-allocation-not-validated")
-    blockers.extend(
-        [
-            "nonlinear-model-stage-promotion-incomplete",
-            "paper-shape-hardware-rerun-required",
-        ]
-    )
+    if not decode_full_layer_without_host_fallbacks:
+        blockers.append("nonlinear-model-stage-promotion-incomplete")
+    blockers.append("paper-shape-hardware-rerun-required")
     if preflight.model_variant.endswith("vision"):
         blockers.append("vision-npu-path-not-implemented")
 
