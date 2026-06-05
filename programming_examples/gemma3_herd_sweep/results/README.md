@@ -241,6 +241,30 @@ power, or paper-parity evidence.
 
 ## Decode Loop Probe Evidence
 
+- `gemma3_1b_decode_loop_stitched_ingress_attention_o_post_attention_ffn_gate_up_geglu_down_probe.json`:
+  clean-provenance Strix/XRT evidence that the stitched decode-loop route now
+  covers ingress, `attention -> O projection`, `post-attention RMSNorm ->
+  residual add`, `pre-FF RMSNorm -> gate/up projection`, and `GeGLU -> down
+  projection` across all 26 real Gemma3 1B layers. The run uses
+  `--ingress-mode stitched --attention-o-mode stitched --post-attention-mode
+  stitched --ffn-gate-up-mode stitched --ffn-geglu-down-mode stitched`, preloads
+  26 stitched BO sets for each integrated slice, leaves zero staged projection
+  BO sets, and records `dirty_worktree=false` at commit
+  `a94bd88b3412b73a08bf104b1c6eb5a7f2032e3f`. It validates every layer with no
+  blockers. The measured post-warmup loop wall window is 6.331318 s, or
+  0.157945 diagnostic TPS. The summed NPU `run.start()/wait2()` windows total
+  5.975497 s across 182 launches, or 0.167350 kernel-only diagnostic TPS. This
+  removes another 702 timed launches versus the gate/up-only stitched loop, but
+  it is a performance regression from that artifact's 0.233325 loop-wall TPS
+  and 0.288779 kernel-only TPS because the current streamed down-projection
+  route dominates time. Full-window direct RAPL reports 11.504 W package power
+  and a 1.764 W pseudo-NPU package-delta; segmented RAPL reports 11.254 W
+  package power, with segmented pseudo-NPU delta clipped to 0.000 W because the
+  immediate quiescent segment sample was higher than segmented package watts.
+  It is still not a paper cell because attention is single-token, KV cache is
+  not prefill-produced, logits/sampling are absent, and post-FF/final-residual
+  work remains staged after the down projection.
+
 - `gemma3_1b_decode_loop_stitched_ingress_attention_o_post_attention_ffn_gate_up_probe.json`:
   clean-provenance Strix/XRT evidence that the stitched decode-loop route now
   covers ingress, `attention -> O projection`, `post-attention RMSNorm ->

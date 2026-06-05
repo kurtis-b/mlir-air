@@ -158,8 +158,9 @@ Implemented files:
   text inference. The current integrated loop slices are the full decode ingress
   `gemma3_decode_ingress_rms_qkv_qknorm_rope`, the post-ingress
   `gemma3_decode_attention_o_projection` slice, the post-attention residual
-  `gemma3_decode_post_attention_residual` slice, and the FFN gate/up ingress
-  `gemma3_decode_ffn_gate_up` slice. The ingress is an eight-launch
+  `gemma3_decode_post_attention_residual` slice, the FFN gate/up ingress
+  `gemma3_decode_ffn_gate_up` slice, and the FFN GeGLU/down slice
+  `gemma3_decode_geglu_down`. The ingress is an eight-launch
   stitched ELF covering `RMSNorm -> Q/K/V projections -> Q/K Norm -> RoPE`; it
   aliases the RMSNorm output and padded activation view to the same zero-tailed
   BO, avoiding a separate pad-copy kernel and removing host activation packing,
@@ -184,11 +185,15 @@ Implemented files:
   recorded in `results/gemma3_1b_stitched_ffn_gate_up_probe.json`, and 26-layer
   loop evidence is recorded in
   `results/gemma3_1b_decode_loop_stitched_ingress_attention_o_post_attention_ffn_gate_up_probe.json`.
-  A new standalone `gemma3_decode_geglu_down` slice stitches GeGLU into the
-  down projection with an aliased `6912`/`27x256` activation BO and a streamed
-  FusedDQP L1 col-block path; clean hardware evidence is recorded in
-  `results/gemma3_1b_stitched_geglu_down_probe.json`. It is not integrated into
-  the 26-layer decode loop yet.
+  A standalone `gemma3_decode_geglu_down` slice stitches GeGLU into the down
+  projection with an aliased `6912`/`27x256` activation BO and a streamed
+  FusedDQP L1 col-block path; clean standalone hardware evidence is recorded in
+  `results/gemma3_1b_stitched_geglu_down_probe.json`, and 26-layer loop evidence
+  is recorded in
+  `results/gemma3_1b_decode_loop_stitched_ingress_attention_o_post_attention_ffn_gate_up_geglu_down_probe.json`.
+  The integrated route is correctness-clean but currently performance-negative:
+  it reduces timed launch count from 884 to 182, while kernel-only TPS falls
+  from 0.288779 to 0.167350 because the streamed down-projection path dominates.
 - `gemma3_model_runner.py`: launch-order manifest that composes BO planning,
   static-preload planning, buffer bindings, argument layouts, and per-layer
   kernel/fallback wiring without claiming kernel execution.
@@ -237,12 +242,14 @@ Remaining stitched decode work:
 - Tune or restructure the stitched ingress route because the 26-layer diagnostic
   reduces launch count but does not yet improve kernel-only TPS over the staged
   baseline.
-- Tune the integrated stitched ingress plus attention/O/post-attention route
-  because it improves loop-wall timing but still trails the staged baseline on
-  kernel-only TPS.
-- Integrate the standalone `GeGLU -> down projection` stitched slice into the
-  26-layer decode loop, then stitch post-feedforward RMSNorm and the final
-  residual add.
+- Tune or restructure the integrated stitched ingress plus attention/O/
+  post-attention/gate-up route because it improves loop-wall timing but still
+  trails the staged baseline on kernel-only TPS in some combinations.
+- Tune or restructure the integrated `GeGLU -> down projection` stitched slice;
+  it is correctness-clean and removes staged down-projection BO preloads, but
+  the current streamed down-projection route regresses 26-layer diagnostic TPS.
+- Stitch post-feedforward RMSNorm and the final residual add after the
+  GeGLU/down route is performance-acceptable.
 - Wire real prefill-produced KV cache before collecting paper-comparison
   TTFT/TPS/power numbers.
 
