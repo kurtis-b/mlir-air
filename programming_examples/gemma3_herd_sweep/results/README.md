@@ -170,6 +170,25 @@ power, or paper-parity evidence.
 
 ## Decode Loop Probe Evidence
 
+- `gemma3_1b_decode_loop_stitched_ingress_L1_probe.json`: clean-provenance
+  Strix/XRT evidence that the staged decode-loop probe can now replace the
+  RMSNorm/Q/K/V/QK-Norm/RoPE ingress launches with the stitched ELF
+  `gemma3_decode_ingress_rms_qkv_qknorm_rope`. The run covers one real Gemma3
+  1B layer and one decode token with `--ingress-mode stitched`, preloads one
+  aliased stitched-ingress BO set plus 41 remaining staged projection BO sets
+  before timing, and records `dirty_worktree=false` at commit
+  `8dfc8524cc0ed0705c6123f4bc7b614ba3120572`. It validates stitched-ingress
+  RMSNorm correlation 0.999991, Q/K/V projection correlations
+  0.999971/0.999977/0.999978, and final layer-output correlation 0.999967.
+  The measured post-warmup loop wall window is 0.213629 s, or 4.681005
+  diagnostic layer-token/s, and the summed NPU `run.start()/wait2()` windows
+  total 0.146627 s across 49 launches, or 6.820013 kernel-only
+  layer-token/s. Full-window direct RAPL reports 10.792 W package power and a
+  3.896 W pseudo-NPU package-delta. This is not a paper cell: it covers one
+  layer rather than all 26 layers, still uses single-token attention, and leaves
+  attention, O projection, residual, FFN, logits/sampling, and prefill-produced
+  KV-cache work outside the stitched production path.
+
 - `gemma3_1b_decode_loop_probe.json`: compact Strix/XRT evidence for one staged
   Gemma3 1B decode token across all 26 real layers. The probe preloads packed
   projection inputs into 1,456 runner-owned BO sets before timing, warms one
