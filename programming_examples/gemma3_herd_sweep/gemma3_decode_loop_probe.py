@@ -6,8 +6,9 @@
 
 This diagnostic runs the existing staged full-layer decode route repeatedly
 across Gemma3 1B layers with one reusable ELF runner cache. It is not a paper
-TTFT/TPS result: attention is still the single-token staged NPU path, logits and
-sampling are absent, and CPU reference checks remain inside the diagnostic loop.
+TTFT/TPS result: attention may still be diagnostic, optional host logits and
+sampling are excluded from NPU timing, and CPU reference checks remain outside
+the measured loop.
 The default diagnostic preloads packed projection inputs into runner-owned BO
 sets before timing; dynamic mode can still rewrite them per launch for
 comparison. The result records exactly which timing windows are measured.
@@ -141,6 +142,9 @@ class Gemma3DecodeLoopProbeResult:
     static_post_feedforward_residual_bo_set_count: int
     input_shape: tuple[int, ...]
     output_shape: tuple[int, ...]
+    decode_input_mode: str
+    decode_input_token_id: int | None
+    decode_input_token_text: str | None
     input_distribution: str
     reference_check_mode: str
     reference_check_layer_count: int
@@ -154,6 +158,7 @@ class Gemma3DecodeLoopProbeResult:
     attention_host_batch_tiles: int | None
     attention_host_batch_count: int | None
     attention_host_reduction: bool
+    logits_evidence: dict[str, object] | None
     host_fallbacks: tuple[str, ...]
     timed_kernel_count: int
     timed_kernel_seconds: float | None
@@ -205,7 +210,9 @@ class Gemma3DecodeLoopProbeResult:
             f"static_ffn_gate_up_bo_sets={self.static_ffn_gate_up_bo_set_count} "
             f"static_ffn_geglu_down_bo_sets={self.static_ffn_geglu_down_bo_set_count} "
             f"static_post_feedforward_residual_bo_sets={self.static_post_feedforward_residual_bo_set_count} "
+            f"decode_input_mode={self.decode_input_mode} "
             f"attention_mode={self.attention_mode} attention_cache={self.attention_cache_contract} "
+            f"logits_mode={(self.logits_evidence or {}).get('mode', 'none')} "
             f"timed_kernel_count={self.timed_kernel_count} "
             f"timed_kernel_seconds={self._value_text(self.timed_kernel_seconds)} "
             f"measured_loop_seconds={self._value_text(self.measured_loop_seconds)} "
@@ -242,6 +249,18 @@ class _PackedProjectionPlan:
     min_offset: Any
     mlir_module: Any
 
+
+@dataclass(frozen=True)
+class _HFPrefillContext:
+    kv_cache: dict[int, tuple[Any, Any]]
+    build_seconds: float
+    decode_input_token_id: int
+    decode_input_token_text: str
+    decode_input_embedding: Any
+    hf_prefill_sampled_token_id: int
+    hf_prefill_sampled_token_text: str
+    hf_decode_sampled_token_id: int | None
+    hf_decode_sampled_token_text: str | None
 
 
 
@@ -312,6 +331,28 @@ def has_decode_loop_hf_prefill_tiled_stats_evidence(
         and "npu-prefill-kv-cache-not-wired" in gaps
         and "paper-1k-kv-attention-npu-reduction-not-wired" in gaps
     )
+
+
+def has_decode_loop_hf_prefill_tiled_stats_host_logits_evidence(
+    model_variant: str,
+    path: Path | None = None,
+) -> bool:
+    evidence_path = path or DEFAULT_HF_PREFILL_TILED_LOOP_PROBE_EVIDENCE
+    try:
+        data = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    logits = data.get("logits_evidence") or {}
+    gaps = tuple(data.get("remaining_paper_gaps", ()))
+    return (
+        has_decode_loop_hf_prefill_tiled_stats_evidence(model_variant, path=evidence_path)
+        and data.get("decode_input_mode") == "hf-prefill-next-token"
+        and logits.get("mode") == "host-tied-embedding"
+        and logits.get("timing_window") == "post-loop-excluded-from-npu-timing"
+        and isinstance(logits.get("sampled_token_id"), int)
+        and "logits-sampling-host-diagnostic-only" in gaps
+    )
+
 
 def _delta_pct(local_tps: float | None) -> float | None:
     if local_tps is None:
@@ -1400,13 +1441,13 @@ def _synthetic_prefill_kv_cache(
     return k_full, v_full
 
 
-def _real_hf_prefill_kv_cache(
+def _real_hf_prefill_context(
     *,
     model_variant: str,
     weights_dir: Path,
     prompt_context_length: int,
     layers: int,
-) -> tuple[dict[int, tuple[Any, Any]], float]:
+) -> _HFPrefillContext:
     import numpy as np
     import torch
     from gemma3_real_execution import _exact_text_inputs
@@ -1429,6 +1470,18 @@ def _real_hf_prefill_kv_cache(
     with torch.no_grad():
         output = model(**inputs, use_cache=True)
     past = output.past_key_values
+    next_token = output.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    next_token_id = int(next_token.item())
+    next_token_text = tokenizer.decode([next_token_id])
+    decode_input_embedding = (
+        model.get_input_embeddings()(next_token)
+        .detach()
+        .to("cpu")
+        .float()
+        .numpy()
+        .astype(bfloat16)
+        .reshape(1, 1152)
+    )
     extracted: dict[int, tuple[Any, Any]] = {}
     for layer_index in range(layers):
         if hasattr(past, "layers"):
@@ -1462,7 +1515,138 @@ def _real_hf_prefill_kv_cache(
                 f"K={k_np.shape} V={v_np.shape}"
             )
         extracted[layer_index] = (np.asarray(k_np, dtype=bfloat16), np.asarray(v_np, dtype=bfloat16))
-    return extracted, time.perf_counter() - cache_start
+    cache_seconds = time.perf_counter() - cache_start
+    hf_decode_sampled_token_id = None
+    hf_decode_sampled_token_text = None
+    try:
+        with torch.no_grad():
+            decode_output = model(input_ids=next_token, past_key_values=past, use_cache=True)
+        hf_decode_sampled_token_id = int(decode_output.logits[:, -1, :].argmax(dim=-1).item())
+        hf_decode_sampled_token_text = tokenizer.decode([hf_decode_sampled_token_id])
+    except Exception:
+        hf_decode_sampled_token_id = None
+        hf_decode_sampled_token_text = None
+    return _HFPrefillContext(
+        kv_cache=extracted,
+        build_seconds=cache_seconds,
+        decode_input_token_id=next_token_id,
+        decode_input_token_text=next_token_text,
+        decode_input_embedding=decode_input_embedding,
+        hf_prefill_sampled_token_id=next_token_id,
+        hf_prefill_sampled_token_text=next_token_text,
+        hf_decode_sampled_token_id=hf_decode_sampled_token_id,
+        hf_decode_sampled_token_text=hf_decode_sampled_token_text,
+    )
+
+
+def _real_hf_prefill_kv_cache(
+    *,
+    model_variant: str,
+    weights_dir: Path,
+    prompt_context_length: int,
+    layers: int,
+) -> tuple[dict[int, tuple[Any, Any]], float]:
+    context = _real_hf_prefill_context(
+        model_variant=model_variant,
+        weights_dir=weights_dir,
+        prompt_context_length=prompt_context_length,
+        layers=layers,
+    )
+    return context.kv_cache, context.build_seconds
+
+
+def _safetensor_path_for_key(weights_dir: Path, tensor_key: str) -> Path:
+    try:
+        from safetensors import safe_open
+    except Exception as exc:
+        raise RuntimeError("python:safetensors is required for Gemma3 logits diagnostic") from exc
+    for path in sorted(weights_dir.glob("*.safetensors")):
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            if tensor_key in handle.keys():
+                return path
+    raise RuntimeError(f"tensor key not found in {weights_dir}: {tensor_key}")
+
+
+def _host_tied_embedding_logits(
+    *,
+    hidden,
+    weights_dir: Path,
+    chunk_rows: int,
+    hf_prefill_context: _HFPrefillContext | None,
+) -> dict[str, object]:
+    import torch
+    from safetensors import safe_open
+
+    if chunk_rows <= 0:
+        raise RuntimeError("--logits-chunk-rows must be positive")
+    final_norm_key = "model.norm.weight"
+    embedding_key = "model.embed_tokens.weight"
+    norm_path = _safetensor_path_for_key(weights_dir, final_norm_key)
+    embedding_path = _safetensor_path_for_key(weights_dir, embedding_key)
+    start = time.perf_counter()
+    with safe_open(str(norm_path), framework="pt", device="cpu") as handle:
+        norm_weight = handle.get_tensor(final_norm_key).float()
+    x = torch.as_tensor(hidden.astype("float32").reshape(-1), dtype=torch.float32)
+    rms = torch.sqrt(torch.mean(x * x) + 1.0e-5)
+    normed = (x / rms) * norm_weight
+    best_token_id = -1
+    best_logit = float("-inf")
+    vocab_size = 0
+    hidden_size = int(normed.numel())
+    with safe_open(str(embedding_path), framework="pt", device="cpu") as handle:
+        embedding_slice = handle.get_slice(embedding_key)
+        shape = tuple(int(dim) for dim in embedding_slice.get_shape())
+        vocab_size, embedding_hidden_size = shape
+        if embedding_hidden_size != hidden_size:
+            raise RuntimeError(
+                f"LM head hidden size mismatch: normed={hidden_size} embedding={embedding_hidden_size}"
+            )
+        for row_start in range(0, vocab_size, chunk_rows):
+            row_end = min(row_start + chunk_rows, vocab_size)
+            chunk = embedding_slice[row_start:row_end].float()
+            logits = torch.mv(chunk, normed)
+            chunk_logit, chunk_index = torch.max(logits, dim=0)
+            value = float(chunk_logit.item())
+            if value > best_logit:
+                best_logit = value
+                best_token_id = row_start + int(chunk_index.item())
+    sampled_token_text = None
+    try:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(weights_dir)
+        sampled_token_text = tokenizer.decode([best_token_id])
+    except Exception:
+        sampled_token_text = None
+    elapsed = time.perf_counter() - start
+    hf_decode_id = None if hf_prefill_context is None else hf_prefill_context.hf_decode_sampled_token_id
+    return {
+        "mode": "host-tied-embedding",
+        "backend": "torch-cpu-safetensors-chunked",
+        "timing_window": "post-loop-excluded-from-npu-timing",
+        "seconds": elapsed,
+        "chunk_rows": int(chunk_rows),
+        "vocab_size": int(vocab_size),
+        "hidden_size": int(hidden_size),
+        "final_norm_key": final_norm_key,
+        "embedding_key": embedding_key,
+        "sampled_token_id": int(best_token_id),
+        "sampled_token_text": sampled_token_text,
+        "sampled_token_logit": float(best_logit),
+        "hf_prefill_input_token_id": (
+            None if hf_prefill_context is None else int(hf_prefill_context.decode_input_token_id)
+        ),
+        "hf_prefill_input_token_text": (
+            None if hf_prefill_context is None else hf_prefill_context.decode_input_token_text
+        ),
+        "hf_decode_sampled_token_id": hf_decode_id,
+        "hf_decode_sampled_token_text": (
+            None if hf_prefill_context is None else hf_prefill_context.hf_decode_sampled_token_text
+        ),
+        "hf_decode_top1_match": (
+            None if hf_decode_id is None else bool(int(best_token_id) == int(hf_decode_id))
+        ),
+    }
 
 
 def _run_tiled_stats_attention_stage(
@@ -2681,6 +2865,8 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
     reference_check_seconds: float | None = None
     prefill_kv_cache: dict[int, tuple[Any, Any]] | None = None
     attention_cache_build_seconds: float | None = None
+    hf_prefill_context: _HFPrefillContext | None = None
+    logits_evidence: dict[str, object] | None = None
     returncode = 1
     try:
         if args.model_variant != DEFAULT_MODEL:
@@ -2703,15 +2889,22 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             raise RuntimeError("--attention-o-mode=stitched currently requires --attention-mode=single-token")
         if args.attention_mode == "tiled-stats-1k" and args.prompt_context_length != 1024:
             raise RuntimeError("tiled-stats-1k attention mode currently requires --prompt-context-length=1024")
+        if args.decode_input_mode == "hf-prefill-next-token":
+            if args.attention_mode != "tiled-stats-1k" or args.attention_cache_mode != "hf-prefill":
+                raise RuntimeError("--decode-input-mode=hf-prefill-next-token requires tiled-stats-1k attention with hf-prefill cache")
+            if args.decode_tokens != 1:
+                raise RuntimeError("--decode-input-mode=hf-prefill-next-token currently supports --decode-tokens=1")
         weights_dir = _resolve_weights_dir(args.model_variant, args.weights_dir)
         norm_plans, projection_plans = _prepare_layer_plans(args.model_variant, weights_dir, args.layers)
         if args.attention_mode == "tiled-stats-1k" and args.attention_cache_mode == "hf-prefill":
-            prefill_kv_cache, attention_cache_build_seconds = _real_hf_prefill_kv_cache(
+            hf_prefill_context = _real_hf_prefill_context(
                 model_variant=args.model_variant,
                 weights_dir=weights_dir,
                 prompt_context_length=args.prompt_context_length,
                 layers=args.layers,
             )
+            prefill_kv_cache = hf_prefill_context.kv_cache
+            attention_cache_build_seconds = hf_prefill_context.build_seconds
         peano_build_dir = Path(__file__).with_name("build_peano")
         fused_dqp_object_file = peano_build_dir / "fused_dqp.o"
         rope_object_file = peano_build_dir / "rope_halfsplit.o"
@@ -2787,6 +2980,14 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 runner_cache=runner_cache,
             )
         rng = np.random.default_rng(0)
+
+        def _initial_decode_input():
+            if args.decode_input_mode == "hf-prefill-next-token":
+                if hf_prefill_context is None:
+                    raise RuntimeError("missing HF prefill context for decode input embedding")
+                return np.array(hf_prefill_context.decode_input_embedding, dtype=bfloat16, copy=True).reshape(1, 1152)
+            return rng.uniform(-0.5, 0.5, size=(1, 1152)).astype(bfloat16)
+
         warmup_input = rng.uniform(-0.5, 0.5, size=(1, 1152)).astype(bfloat16)
         for layer_index in range(min(args.warmup_layers, args.layers)):
             warmup_input, _evidence, warmup_blockers = _run_one_layer(
@@ -2817,7 +3018,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             )
             if warmup_blockers:
                 blockers.extend(f"warmup:{item}" for item in warmup_blockers)
-        reference_input = rng.uniform(-0.5, 0.5, size=(1, 1152)).astype(bfloat16)
+        reference_input = _initial_decode_input()
         reference_start = time.perf_counter()
         for layer_index in range(args.layers):
             reference_input, evidence, reference_blockers = _run_one_layer(
@@ -2851,7 +3052,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             reference_check_layer_count += 1
             blockers.extend(reference_blockers)
         reference_check_seconds = time.perf_counter() - reference_start
-        x_input = rng.uniform(-0.5, 0.5, size=(1, 1152)).astype(bfloat16)
+        x_input = _initial_decode_input()
         power_window = begin_power_window(
             sample=bool(args.power_sample),
             run_id="gemma3_1b_decode_loop_probe",
@@ -2891,6 +3092,17 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             stdout_lines.append(f"decode token {token_index}: final checksum={float(x_input.astype(np.float32).sum()):.6f}")
         loop_elapsed = time.perf_counter() - loop_start
         power_snapshot = finish_power_window(power_window, elapsed_seconds=loop_elapsed).to_json_dict()
+        if args.logits_mode == "host-tied-embedding" and not blockers:
+            logits_evidence = _host_tied_embedding_logits(
+                hidden=x_input,
+                weights_dir=weights_dir,
+                chunk_rows=args.logits_chunk_rows,
+                hf_prefill_context=hf_prefill_context,
+            )
+            stdout_lines.append(
+                "host logits sample: token_id="
+                f"{logits_evidence['sampled_token_id']} text={logits_evidence.get('sampled_token_text')!r}"
+            )
         returncode = 0 if not blockers else 1
     except Exception as exc:
         blockers.append(f"decode-loop-probe-failed:{exc}")
@@ -2933,7 +3145,18 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         static_post_feedforward_residual_bo_set_count=static_post_feedforward_residual_bo_set_count,
         input_shape=(1, 1152),
         output_shape=(1, 1152),
-        input_distribution=DEFAULT_INPUT_DISTRIBUTION,
+        decode_input_mode=args.decode_input_mode,
+        decode_input_token_id=(
+            None if hf_prefill_context is None else int(hf_prefill_context.decode_input_token_id)
+        ),
+        decode_input_token_text=(
+            None if hf_prefill_context is None else hf_prefill_context.decode_input_token_text
+        ),
+        input_distribution=(
+            "hf-prefill-greedy-token-embedding"
+            if args.decode_input_mode == "hf-prefill-next-token"
+            else DEFAULT_INPUT_DISTRIBUTION
+        ),
         reference_check_mode="all-layers-before-timing",
         reference_check_layer_count=reference_check_layer_count,
         reference_check_seconds=reference_check_seconds,
@@ -2968,6 +3191,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             )
         ),
         attention_host_reduction=(args.attention_mode == "tiled-stats-1k"),
+        logits_evidence=logits_evidence,
         host_fallbacks=(),
         timed_kernel_count=len(timed_kernel_samples),
         timed_kernel_seconds=timed_total,
@@ -3028,7 +3252,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                     )
                 )
             ),
-            "logits and sampling are not wired, so this is a diagnostic decode-loop throughput, not an official paper decode TPS cell",
+            (
+                "host final-norm/tied-embedding argmax is recorded in logits_evidence after measured loop timing and is excluded from measured_loop_seconds and timed_kernel_seconds"
+                if args.logits_mode == "host-tied-embedding"
+                else "logits and sampling are not wired, so this is a diagnostic decode-loop throughput, not an official paper decode TPS cell"
+            ),
         ),
         power_snapshot=power_snapshot,
         segmented_kernel_power_snapshot=segment_power.snapshot(),
@@ -3055,7 +3283,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                     )
                 )
             ),
-            "logits-sampling-not-wired",
+            *(
+                ("logits-sampling-host-diagnostic-only",)
+                if args.logits_mode == "host-tied-embedding"
+                else ("logits-sampling-not-wired",)
+            ),
             *(
                 ("decode-layer-after-stitched-ingress-still-staged",)
                 if args.ingress_mode == "stitched"
@@ -3134,6 +3366,9 @@ def _self_test() -> None:
         static_post_feedforward_residual_bo_set_count=0,
         input_shape=(1, 1152),
         output_shape=(1, 1152),
+        decode_input_mode="random",
+        decode_input_token_id=None,
+        decode_input_token_text=None,
         input_distribution=DEFAULT_INPUT_DISTRIBUTION,
         reference_check_mode="all-layers-before-timing",
         reference_check_layer_count=26,
@@ -3147,6 +3382,7 @@ def _self_test() -> None:
         attention_host_batch_tiles=None,
         attention_host_batch_count=None,
         attention_host_reduction=False,
+        logits_evidence=None,
         host_fallbacks=(),
         timed_kernel_count=1482,
         timed_kernel_seconds=3.9,
@@ -3174,6 +3410,38 @@ def _self_test() -> None:
     )
     if result.status != "DECODE_LOOP_DIAGNOSTIC_PASS":
         raise AssertionError(result)
+    import tempfile
+
+    host_logits_data = result.to_json_dict()
+    host_logits_data.update(
+        {
+            "attention_mode": "tiled-stats-1k",
+            "attention_cache_contract": "host-hf-prefill-kv-cache",
+            "attention_cache_build_seconds": 2.0,
+            "attention_cache_layer_count": 26,
+            "attention_cache_token_count": 1024,
+            "attention_host_reduction": True,
+            "decode_input_mode": "hf-prefill-next-token",
+            "logits_evidence": {
+                "mode": "host-tied-embedding",
+                "timing_window": "post-loop-excluded-from-npu-timing",
+                "sampled_token_id": 42,
+            },
+            "remaining_paper_gaps": (
+                "npu-prefill-kv-cache-not-wired",
+                "paper-1k-kv-attention-npu-reduction-not-wired",
+                "logits-sampling-host-diagnostic-only",
+            ),
+        }
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+        json.dump(host_logits_data, handle)
+        fixture_path = Path(handle.name)
+    try:
+        if not has_decode_loop_hf_prefill_tiled_stats_host_logits_evidence(DEFAULT_MODEL, fixture_path):
+            raise AssertionError("host logits evidence recognizer failed")
+    finally:
+        fixture_path.unlink(missing_ok=True)
     print(result.format())
     print("GEMMA3_DECODE_LOOP_PROBE_SELF_TEST: PASS")
 
@@ -3187,6 +3455,7 @@ def main() -> int:
     parser.add_argument("--layers", type=int, default=26)
     parser.add_argument("--decode-tokens", type=int, default=1)
     parser.add_argument("--prompt-context-length", type=int, default=1024)
+    parser.add_argument("--decode-input-mode", choices=["random", "hf-prefill-next-token"], default="random")
     parser.add_argument("--warmup-layers", type=int, default=1)
     parser.add_argument("--result-json", type=Path)
     parser.add_argument("--power-sample", action="store_true")
@@ -3200,6 +3469,8 @@ def main() -> int:
     parser.add_argument("--attention-cache-mode", choices=["repeated-current-token", "synthetic-prefill", "hf-prefill"], default=DEFAULT_ATTENTION_CACHE_MODE)
     parser.add_argument("--tiled-attention-kv-tile", type=int, default=DEFAULT_TILED_ATTENTION_KV_TILE)
     parser.add_argument("--tiled-attention-host-batch-tiles", type=int, default=DEFAULT_TILED_ATTENTION_HOST_BATCH_TILES)
+    parser.add_argument("--logits-mode", choices=["none", "host-tied-embedding"], default="none")
+    parser.add_argument("--logits-chunk-rows", type=int, default=8192)
     parser.add_argument("--dynamic-static-weight-writes", action="store_true", help="diagnostic fallback: write packed projection static inputs inside each launch")
     parser.add_argument("--no-reuse-elf", action="store_true")
     args = parser.parse_args()

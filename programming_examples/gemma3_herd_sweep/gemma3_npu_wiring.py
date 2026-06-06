@@ -19,6 +19,7 @@ from pathlib import Path
 from gemma3_artifacts import MODEL_SPECS
 from gemma3_decode_loop_probe import (
     has_decode_loop_hf_prefill_tiled_stats_evidence,
+    has_decode_loop_hf_prefill_tiled_stats_host_logits_evidence,
     has_decode_loop_tiled_stats_evidence,
 )
 from gemma3_full_layer_probe import (
@@ -45,6 +46,7 @@ PREFILL_PRODUCED_KV_CACHE_BLOCKER = "prefill-produced-kv-cache-not-wired"
 NPU_PREFILL_KV_CACHE_BLOCKER = "npu-prefill-kv-cache-not-wired"
 NPU_ATTENTION_REDUCTION_BLOCKER = "npu-attention-reduction-not-wired"
 LOGITS_SAMPLING_BLOCKER = "logits-sampling-not-wired"
+LOGITS_SAMPLING_HOST_DIAGNOSTIC_BLOCKER = "logits-sampling-host-diagnostic-only"
 PRODUCTION_STATIC_BO_BLOCKER = "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
 
 
@@ -279,6 +281,10 @@ def build_wiring_plan_from_preflight(
     decode_loop_attention_validated = (
         decode_loop_tiled_stats_validated or decode_loop_hf_prefill_tiled_stats_validated
     )
+    decode_loop_host_logits_validated = (
+        use_decode_loop_tiled_stats_evidence
+        and has_decode_loop_hf_prefill_tiled_stats_host_logits_evidence(preflight.model_variant)
+    )
     window_len = int(preflight.sliding_window or 0)
     stages: list[Gemma3NPUStage] = []
     for layer_index in range(int(preflight.layers)):
@@ -379,7 +385,11 @@ def build_wiring_plan_from_preflight(
                 else PREFILL_PRODUCED_KV_CACHE_BLOCKER
             ),
             NPU_ATTENTION_REDUCTION_BLOCKER,
-            LOGITS_SAMPLING_BLOCKER,
+            (
+                LOGITS_SAMPLING_HOST_DIAGNOSTIC_BLOCKER
+                if decode_loop_host_logits_validated
+                else LOGITS_SAMPLING_BLOCKER
+            ),
             PRODUCTION_STATIC_BO_BLOCKER,
         ]
     elif decode_full_layer_validated:

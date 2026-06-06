@@ -24,6 +24,7 @@ from gemma3_buffer_binding import Gemma3BufferBindingPlan, build_buffer_binding_
 from gemma3_npu_preflight import Gemma3NPUPreflightPlan, ProjectionPlan, build_preflight_plan
 from gemma3_npu_wiring import (
     LOGITS_SAMPLING_BLOCKER,
+    LOGITS_SAMPLING_HOST_DIAGNOSTIC_BLOCKER,
     MODEL_FULL_1B_LOOP_BLOCKER,
     MODEL_FULL_LAYER_BLOCKER,
     MODEL_FULL_QKV_SUBSTEP_BLOCKER,
@@ -64,6 +65,7 @@ MODEL_RUNNER_SPECIFIC_WIRING_BLOCKERS = (
     PREFILL_PRODUCED_KV_CACHE_BLOCKER,
     NPU_ATTENTION_REDUCTION_BLOCKER,
     LOGITS_SAMPLING_BLOCKER,
+    LOGITS_SAMPLING_HOST_DIAGNOSTIC_BLOCKER,
     PRODUCTION_STATIC_BO_BLOCKER,
 )
 
