@@ -248,19 +248,25 @@ power, or paper-parity evidence.
   projection, stitched post-attention residual, stitched FFN gate/up, stitched
   GeGLU/down, and stitched post-feedforward residual. It uses
   `--attention-cache-mode hf-prefill` to build a real HF-produced Gemma3 1B
-  prefill KV cache outside the measured loop, then feeds that cache into the
-  tiled-stat attention diagnostic. Local sliding-window layers consume their
-  retained HF prefill cache plus the current K/V token; global layers consume
-  the full 1k HF cache. The result records `dirty_worktree=false` at commit
-  `0964f4cc518a9423d0412103e6404a5385c65b93`,
-  `attention_cache_build_seconds=2.737617`, 26 cache layers, and no blockers.
-  The measured post-warmup loop wall window is 21.929564 s, or 0.045601
+  prefill KV cache outside the measured loop and
+  `--decode-input-mode hf-prefill-next-token` to seed layer 0 from the HF
+  prefill greedy token embedding (`fill`, token id 6910). Local sliding-window
+  layers consume their retained HF prefill cache plus the current K/V token;
+  global layers consume the full 1k HF cache. The result records
+  `dirty_worktree=false` at commit
+  `f84b2ca1a550c649552513ad432cfba68b700f28`,
+  `attention_cache_build_seconds=2.711829`, 26 cache layers, and no blockers.
+  The measured post-warmup loop wall window is 21.582786 s, or 0.046333
   diagnostic TPS. The summed NPU `run.start()/wait2()` windows total
-  21.491694 s across 474 launches, or 0.046530 kernel-only diagnostic TPS. It
-  is still not a paper cell because the prefill cache is host/HF-produced rather
-  than NPU-produced, tiled-stat softmax reduction remains host-side, logits and
-  sampling are absent, and production contiguous static-weight BO routing is not
-  complete.
+  21.141922 s across 474 launches, or 0.047299 kernel-only diagnostic TPS.
+  `--logits-mode host-tied-embedding` runs after the timed NPU window and is
+  recorded separately: final RMSNorm plus tied embedding argmax takes
+  1.053632 s on the host, samples token id 236761 (`.`), and does not match
+  the dense HF one-token decode top-1 token id 15612 (` cache`). It is still
+  not a paper cell because the prefill cache is host/HF-produced rather than
+  NPU-produced, tiled-stat softmax reduction remains host-side, logits/sampling
+  are host-diagnostic-only and excluded from timing, and production contiguous
+  static-weight BO routing is not complete.
 
 - `gemma3_1b_decode_loop_stitched_ingress_attention_o_post_attention_ffn_gate_up_geglu_down_post_feedforward_probe.json`:
   clean-provenance Strix/XRT evidence that the stitched decode-loop route now
