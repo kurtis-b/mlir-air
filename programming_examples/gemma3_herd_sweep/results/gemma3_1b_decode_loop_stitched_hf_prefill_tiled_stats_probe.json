@@ -1,5 +1,5 @@
 {
-  "attention_cache_build_seconds": 2.71182922799926,
+  "attention_cache_build_seconds": 2.717121481999129,
   "attention_cache_contract": "host-hf-prefill-kv-cache",
   "attention_cache_layer_count": 26,
   "attention_cache_token_count": 1024,
@@ -37,6 +37,8 @@
     "stitched",
     "--logits-mode",
     "host-tied-embedding",
+    "--logits-timing",
+    "included",
     "--logits-chunk-rows",
     "32768",
     "--result-json",
@@ -46,13 +48,13 @@
   "decode_input_token_id": 6910,
   "decode_input_token_text": "fill",
   "decode_tokens": 1,
-  "diagnostic_decode_tps_kernel_only": 0.047299390249271364,
-  "diagnostic_decode_tps_loop_wall": 0.04633322133824576,
+  "diagnostic_decode_tps_kernel_only": 0.047288541646772174,
+  "diagnostic_decode_tps_loop_wall": 0.04404184858919484,
   "dirty_worktree": false,
-  "elapsed_seconds": 71.19922578599835,
+  "elapsed_seconds": 71.31945545500093,
   "ffn_gate_up_mode": "stitched",
   "ffn_geglu_down_mode": "stitched",
-  "git_commit": "f84b2ca1a550c649552513ad432cfba68b700f28",
+  "git_commit": "df9d2907f266354df4202185899887ed4c6bde84",
   "host_fallbacks": [],
   "ingress_mode": "stitched",
   "input_distribution": "hf-prefill-greedy-token-embedding",
@@ -60,7 +62,7 @@
     1,
     1152
   ],
-  "kernel_only_delta_pct_vs_paper_decode_tps_1k": 99.88491632542757,
+  "kernel_only_delta_pct_vs_paper_decode_tps_1k": 99.88494272105409,
   "layer_count": 26,
   "layer_evidence": [
     {
@@ -3303,12 +3305,12 @@
     "sampled_token_id": 236761,
     "sampled_token_logit": 41.573486328125,
     "sampled_token_text": ".",
-    "seconds": 1.0536319309994724,
-    "timing_window": "post-loop-excluded-from-npu-timing",
+    "seconds": 1.049499366999953,
+    "timing_window": "included-in-measured-loop-wall",
     "vocab_size": 262144
   },
-  "loop_wall_delta_pct_vs_paper_decode_tps_1k": 99.8872671013668,
-  "measured_loop_seconds": 21.582785982000132,
+  "loop_wall_delta_pct_vs_paper_decode_tps_1k": 99.89284221754454,
+  "measured_loop_seconds": 22.705677259998993,
   "model_variant": "gemma3-1b",
   "norm_argument_mode": "selected-vector",
   "output_format": "elf",
@@ -3344,11 +3346,11 @@
   "prompt_context_length": 1024,
   "reference_check_layer_count": 26,
   "reference_check_mode": "all-layers-before-timing",
-  "reference_check_seconds": 24.12859393600047,
+  "reference_check_seconds": 24.061019873999612,
   "remaining_paper_gaps": [
     "npu-prefill-kv-cache-not-wired",
     "paper-1k-kv-attention-npu-reduction-not-wired",
-    "logits-sampling-host-diagnostic-only",
+    "logits-sampling-host-timed-accounted",
     "decode-layer-after-stitched-ingress-still-staged",
     "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
   ],
@@ -3372,8 +3374,8 @@
     "host logits sample: token_id=236761 text='.'"
   ],
   "timed_kernel_count": 474,
-  "timed_kernel_mean_seconds": 0.044603210109726746,
-  "timed_kernel_seconds": 21.141921592010476,
+  "timed_kernel_mean_seconds": 0.044613442662472455,
+  "timed_kernel_seconds": 21.146771822011942,
   "timing_notes": [
     "warmup layers compile/load ELF runners and allocate runner-owned BOs before measured loop timing",
     "preloaded-runner-bo-set mode allocates BO sets and writes packed projection static inputs before measured loop timing",
@@ -3387,7 +3389,7 @@
     "measured_loop_seconds starts after warmup/reference checks and includes current implementation dynamic BO writes and output sync/readback",
     "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls and excludes compile, ELF load, BO allocation, BO writes, sync/readback, and CPU reference/correlation checks",
     "attention is host-batched 1k tiled-stat FlowQKV NPU launches with host-side softmax-stat reduction over a host HF-produced prefill KV cache; HF prefill cache construction is outside the measured loop",
-    "host final-norm/tied-embedding argmax is recorded in logits_evidence after measured loop timing and is excluded from measured_loop_seconds and timed_kernel_seconds"
+    "host final-norm/tied-embedding argmax is recorded in logits_evidence inside measured_loop_seconds and the full-window power sample, while timed_kernel_seconds remains NPU run.start()/wait2() only"
   ],
   "timing_window": "post-warmup-loop-wall-and-segmented-run-start-wait2"
 }
