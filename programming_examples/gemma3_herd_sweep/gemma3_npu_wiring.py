@@ -20,6 +20,7 @@ from gemma3_artifacts import MODEL_SPECS
 from gemma3_decode_loop_probe import (
     has_decode_loop_hf_prefill_tiled_stats_evidence,
     has_decode_loop_hf_prefill_tiled_stats_host_logits_evidence,
+    has_decode_loop_hf_prefill_tiled_stats_timed_host_logits_evidence,
     has_decode_loop_tiled_stats_evidence,
 )
 from gemma3_full_layer_probe import (
@@ -285,6 +286,10 @@ def build_wiring_plan_from_preflight(
         use_decode_loop_tiled_stats_evidence
         and has_decode_loop_hf_prefill_tiled_stats_host_logits_evidence(preflight.model_variant)
     )
+    decode_loop_timed_host_logits_validated = (
+        use_decode_loop_tiled_stats_evidence
+        and has_decode_loop_hf_prefill_tiled_stats_timed_host_logits_evidence(preflight.model_variant)
+    )
     window_len = int(preflight.sliding_window or 0)
     stages: list[Gemma3NPUStage] = []
     for layer_index in range(int(preflight.layers)):
@@ -385,13 +390,15 @@ def build_wiring_plan_from_preflight(
                 else PREFILL_PRODUCED_KV_CACHE_BLOCKER
             ),
             NPU_ATTENTION_REDUCTION_BLOCKER,
-            (
-                LOGITS_SAMPLING_HOST_DIAGNOSTIC_BLOCKER
-                if decode_loop_host_logits_validated
-                else LOGITS_SAMPLING_BLOCKER
-            ),
             PRODUCTION_STATIC_BO_BLOCKER,
         ]
+        if not decode_loop_timed_host_logits_validated:
+            blockers.insert(
+                3,
+                LOGITS_SAMPLING_HOST_DIAGNOSTIC_BLOCKER
+                if decode_loop_host_logits_validated
+                else LOGITS_SAMPLING_BLOCKER,
+            )
     elif decode_full_layer_validated:
         blockers = [MODEL_FULL_1B_LOOP_BLOCKER]
     elif decode_qkv_substep_validated:

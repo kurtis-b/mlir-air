@@ -354,6 +354,27 @@ def has_decode_loop_hf_prefill_tiled_stats_host_logits_evidence(
     )
 
 
+def has_decode_loop_hf_prefill_tiled_stats_timed_host_logits_evidence(
+    model_variant: str,
+    path: Path | None = None,
+) -> bool:
+    evidence_path = path or DEFAULT_HF_PREFILL_TILED_LOOP_PROBE_EVIDENCE
+    try:
+        data = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    logits = data.get("logits_evidence") or {}
+    gaps = tuple(data.get("remaining_paper_gaps", ()))
+    return (
+        has_decode_loop_hf_prefill_tiled_stats_evidence(model_variant, path=evidence_path)
+        and data.get("decode_input_mode") == "hf-prefill-next-token"
+        and logits.get("mode") == "host-tied-embedding"
+        and logits.get("timing_window") == "included-in-measured-loop-wall"
+        and isinstance(logits.get("sampled_token_id"), int)
+        and "logits-sampling-host-timed-accounted" in gaps
+    )
+
+
 def _delta_pct(local_tps: float | None) -> float | None:
     if local_tps is None:
         return None
@@ -1573,6 +1594,7 @@ def _host_tied_embedding_logits(
     weights_dir: Path,
     chunk_rows: int,
     hf_prefill_context: _HFPrefillContext | None,
+    timing_window: str,
 ) -> dict[str, object]:
     import torch
     from safetensors import safe_open
@@ -1623,7 +1645,7 @@ def _host_tied_embedding_logits(
     return {
         "mode": "host-tied-embedding",
         "backend": "torch-cpu-safetensors-chunked",
-        "timing_window": "post-loop-excluded-from-npu-timing",
+        "timing_window": timing_window,
         "seconds": elapsed,
         "chunk_rows": int(chunk_rows),
         "vocab_size": int(vocab_size),
@@ -2894,6 +2916,8 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 raise RuntimeError("--decode-input-mode=hf-prefill-next-token requires tiled-stats-1k attention with hf-prefill cache")
             if args.decode_tokens != 1:
                 raise RuntimeError("--decode-input-mode=hf-prefill-next-token currently supports --decode-tokens=1")
+        if args.logits_timing != "excluded" and args.logits_mode != "host-tied-embedding":
+            raise RuntimeError("--logits-timing=included requires --logits-mode=host-tied-embedding")
         weights_dir = _resolve_weights_dir(args.model_variant, args.weights_dir)
         norm_plans, projection_plans = _prepare_layer_plans(args.model_variant, weights_dir, args.layers)
         if args.attention_mode == "tiled-stats-1k" and args.attention_cache_mode == "hf-prefill":
@@ -3059,6 +3083,20 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             target_backend="npu",
         )
         loop_start = time.perf_counter()
+        def _record_host_logits(timing_window: str) -> None:
+            nonlocal logits_evidence
+            logits_evidence = _host_tied_embedding_logits(
+                hidden=x_input,
+                weights_dir=weights_dir,
+                chunk_rows=args.logits_chunk_rows,
+                hf_prefill_context=hf_prefill_context,
+                timing_window=timing_window,
+            )
+            stdout_lines.append(
+                "host logits sample: token_id="
+                f"{logits_evidence['sampled_token_id']} text={logits_evidence.get('sampled_token_text')!r}"
+            )
+
         for token_index in range(args.decode_tokens):
             for layer_index in range(args.layers):
                 x_input, _timing_evidence, layer_blockers = _run_one_layer(
@@ -3090,19 +3128,12 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 )
                 blockers.extend(layer_blockers)
             stdout_lines.append(f"decode token {token_index}: final checksum={float(x_input.astype(np.float32).sum()):.6f}")
+        if args.logits_mode == "host-tied-embedding" and args.logits_timing == "included" and not blockers:
+            _record_host_logits("included-in-measured-loop-wall")
         loop_elapsed = time.perf_counter() - loop_start
         power_snapshot = finish_power_window(power_window, elapsed_seconds=loop_elapsed).to_json_dict()
-        if args.logits_mode == "host-tied-embedding" and not blockers:
-            logits_evidence = _host_tied_embedding_logits(
-                hidden=x_input,
-                weights_dir=weights_dir,
-                chunk_rows=args.logits_chunk_rows,
-                hf_prefill_context=hf_prefill_context,
-            )
-            stdout_lines.append(
-                "host logits sample: token_id="
-                f"{logits_evidence['sampled_token_id']} text={logits_evidence.get('sampled_token_text')!r}"
-            )
+        if args.logits_mode == "host-tied-embedding" and args.logits_timing == "excluded" and not blockers:
+            _record_host_logits("post-loop-excluded-from-npu-timing")
         returncode = 0 if not blockers else 1
     except Exception as exc:
         blockers.append(f"decode-loop-probe-failed:{exc}")
@@ -3253,7 +3284,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 )
             ),
             (
-                "host final-norm/tied-embedding argmax is recorded in logits_evidence after measured loop timing and is excluded from measured_loop_seconds and timed_kernel_seconds"
+                (
+                    "host final-norm/tied-embedding argmax is recorded in logits_evidence inside measured_loop_seconds and the full-window power sample, while timed_kernel_seconds remains NPU run.start()/wait2() only"
+                    if args.logits_timing == "included"
+                    else "host final-norm/tied-embedding argmax is recorded in logits_evidence after measured loop timing and is excluded from measured_loop_seconds and timed_kernel_seconds"
+                )
                 if args.logits_mode == "host-tied-embedding"
                 else "logits and sampling are not wired, so this is a diagnostic decode-loop throughput, not an official paper decode TPS cell"
             ),
@@ -3284,7 +3319,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 )
             ),
             *(
-                ("logits-sampling-host-diagnostic-only",)
+                (
+                    ("logits-sampling-host-timed-accounted",)
+                    if args.logits_timing == "included"
+                    else ("logits-sampling-host-diagnostic-only",)
+                )
                 if args.logits_mode == "host-tied-embedding"
                 else ("logits-sampling-not-wired",)
             ),
@@ -3442,6 +3481,22 @@ def _self_test() -> None:
             raise AssertionError("host logits evidence recognizer failed")
     finally:
         fixture_path.unlink(missing_ok=True)
+    timed_host_logits_data = dict(host_logits_data)
+    timed_host_logits_data["logits_evidence"] = dict(host_logits_data["logits_evidence"])
+    timed_host_logits_data["logits_evidence"]["timing_window"] = "included-in-measured-loop-wall"
+    timed_host_logits_data["remaining_paper_gaps"] = (
+        "npu-prefill-kv-cache-not-wired",
+        "paper-1k-kv-attention-npu-reduction-not-wired",
+        "logits-sampling-host-timed-accounted",
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+        json.dump(timed_host_logits_data, handle)
+        timed_fixture_path = Path(handle.name)
+    try:
+        if not has_decode_loop_hf_prefill_tiled_stats_timed_host_logits_evidence(DEFAULT_MODEL, timed_fixture_path):
+            raise AssertionError("timed host logits evidence recognizer failed")
+    finally:
+        timed_fixture_path.unlink(missing_ok=True)
     print(result.format())
     print("GEMMA3_DECODE_LOOP_PROBE_SELF_TEST: PASS")
 
@@ -3470,6 +3525,7 @@ def main() -> int:
     parser.add_argument("--tiled-attention-kv-tile", type=int, default=DEFAULT_TILED_ATTENTION_KV_TILE)
     parser.add_argument("--tiled-attention-host-batch-tiles", type=int, default=DEFAULT_TILED_ATTENTION_HOST_BATCH_TILES)
     parser.add_argument("--logits-mode", choices=["none", "host-tied-embedding"], default="none")
+    parser.add_argument("--logits-timing", choices=["excluded", "included"], default="excluded")
     parser.add_argument("--logits-chunk-rows", type=int, default=8192)
     parser.add_argument("--dynamic-static-weight-writes", action="store_true", help="diagnostic fallback: write packed projection static inputs inside each launch")
     parser.add_argument("--no-reuse-elf", action="store_true")
