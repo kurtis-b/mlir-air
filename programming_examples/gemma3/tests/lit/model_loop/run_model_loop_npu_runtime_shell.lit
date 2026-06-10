@@ -7,7 +7,8 @@
 # SELF-SAME: argument_binding_blockers=0
 # SELF: ownership name=planned_layer_kernels phase=prefill+decode owner=npu
 # SELF: ownership name=logits_sampling phase=decode owner=host-fallback
-# SELF: runtime_result entrypoint=run_npu_prefill model=gemma3-1b status=BLOCKED
+# SELF: runtime_result entrypoint=run_npu_prefill model=gemma3-1b status=PREFILL_KV_CACHE_BLOCKED
+# SELF-SAME: prefill_kv_cache_status=PREFILL_KV_CACHE_NOT_PRODUCED
 # SELF: runtime_result entrypoint=generate model=gemma3-1b status=BLOCKED
 # SELF: GEMMA3_NPU_RUNTIME_SELF_TEST: PASS
 # CLI: runtime model=gemma3-1b status=BLOCKED_REAL_ARTIFACTS

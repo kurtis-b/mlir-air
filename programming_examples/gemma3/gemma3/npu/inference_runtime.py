@@ -51,6 +51,79 @@ from gemma3.npu.xrt_runner import dry_run_allocation_plan, has_paper_shape_bo_al
 
 
 RUNTIME_SETUP_VERSION = 1
+PREFILL_KV_CACHE_LAYOUT = "per-layer-key-value"
+PREFILL_KV_CACHE_NOT_PRODUCED_STATUS = "PREFILL_KV_CACHE_NOT_PRODUCED"
+PREFILL_KV_CACHE_NOT_PRODUCED_SOURCE = "none"
+PREFILL_KV_CACHE_UNAVAILABLE_STATUS = "PREFILL_KV_CACHE_UNAVAILABLE"
+
+
+@dataclass(frozen=True)
+class Gemma3PrefillStageOwnershipRecord:
+    phase: str
+    layer_index: int
+    stage_index: int
+    stage: str
+    owner: str
+    timed_window: bool
+    status: str
+    kernel: str
+    route: str
+    attention_kind: str
+    window_len: int
+    blockers: tuple[str, ...]
+
+    def format(self) -> str:
+        blockers = ",".join(self.blockers) if self.blockers else "none"
+        timed = "timed" if self.timed_window else "setup"
+        return (
+            f"prefill_stage phase={self.phase} layer=L{self.layer_index} "
+            f"stage_index={self.stage_index} stage={self.stage} owner={self.owner} "
+            f"window={timed} status={self.status} kernel={self.kernel} "
+            f"route={self.route} attention={self.attention_kind} "
+            f"attention_window={self.window_len} blockers={blockers}"
+        )
+
+
+@dataclass(frozen=True)
+class Gemma3PrefillKVLayerDescriptor:
+    layer_index: int
+    attention_kind: str
+    key_buffer: str
+    value_buffer: str
+    key_shape: tuple[int, ...]
+    value_shape: tuple[int, ...]
+    dtype: str
+    prompt_token_count: int
+    retained_token_count: int
+    read_window_token_count: int
+    retention_policy: str
+    source: str
+    owner: str
+    status: str
+    blockers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Gemma3PrefillKVCacheDescriptor:
+    schema_version: int
+    model_variant: str
+    status: str
+    source: str
+    owner: str
+    layout: str
+    dtype: str
+    layer_count: int
+    prompt_token_count: int
+    decode_context: int
+    kv_head_count: int
+    head_dim: int
+    blockers: tuple[str, ...]
+    layers: tuple[Gemma3PrefillKVLayerDescriptor, ...]
+
+    def to_json_dict(self) -> dict[str, object]:
+        data = asdict(self)
+        data["layers"] = [asdict(layer) for layer in self.layers]
+        return data
 
 
 @dataclass(frozen=True)
@@ -110,6 +183,14 @@ class Gemma3RuntimeSetupRecord:
     model_runner_step_count: int
     blockers: tuple[str, ...]
     operation_ownership: tuple[Gemma3RuntimeOwnershipRecord, ...]
+    prefill_kv_cache_status: str | None
+    prefill_kv_cache_source: str | None
+    prefill_kernel_launch_count: int
+    prefill_host_fallback_count: int
+    kv_cache_layer_count: int
+    kv_cache_token_count: int
+    prefill_kv_cache: Gemma3PrefillKVCacheDescriptor | None
+    prefill_stage_ownership: tuple[Gemma3PrefillStageOwnershipRecord, ...]
     elapsed_setup_seconds: float
     error: str | None = None
 
@@ -139,12 +220,19 @@ class Gemma3RuntimeSetupRecord:
             f"argument_bindings={self.argument_binding_count} args={self.argument_count} "
             f"argument_binding_blockers={self.argument_binding_blocker_count} "
             f"kernel_launches={self.kernel_launch_count} host_fallbacks={self.host_fallback_count} "
-            f"host_runtime={self.host_runtime_count} blockers={blockers}"
+            f"host_runtime={self.host_runtime_count} "
+            f"prefill_kv_cache_status={self.prefill_kv_cache_status} "
+            f"prefill_kv_cache_source={self.prefill_kv_cache_source} "
+            f"prefill_kernel_launches={self.prefill_kernel_launch_count} "
+            f"prefill_host_fallbacks={self.prefill_host_fallback_count} "
+            f"kv_cache_layers={self.kv_cache_layer_count} "
+            f"kv_cache_tokens={self.kv_cache_token_count} blockers={blockers}"
         ]
         if self.error:
             lines.append(f"runtime_error {self.error}")
         if include_ownership:
             lines.extend(record.format() for record in self.operation_ownership)
+            lines.extend(record.format() for record in self.prefill_stage_ownership)
         return "\n".join(lines)
 
     def to_json_dict(self) -> dict[str, object]:
@@ -152,6 +240,14 @@ class Gemma3RuntimeSetupRecord:
         data["operation_ownership"] = [
             asdict(record) for record in self.operation_ownership
         ]
+        data["prefill_stage_ownership"] = [
+            asdict(record) for record in self.prefill_stage_ownership
+        ]
+        data["prefill_kv_cache"] = (
+            None
+            if self.prefill_kv_cache is None
+            else self.prefill_kv_cache.to_json_dict()
+        )
         data["ready_for_entrypoints"] = self.ready_for_entrypoints
         return data
 
@@ -183,6 +279,14 @@ class Gemma3RuntimeExecutionResult:
     kernel_launch_count: int = 0
     host_fallback_count: int = 0
     host_runtime_count: int = 0
+    prefill_kv_cache_status: str | None = None
+    prefill_kv_cache_source: str | None = None
+    prefill_kernel_launch_count: int = 0
+    prefill_host_fallback_count: int = 0
+    kv_cache_layer_count: int = 0
+    kv_cache_token_count: int = 0
+    prefill_kv_cache: Gemma3PrefillKVCacheDescriptor | None = None
+    prefill_stage_ownership: tuple[Gemma3PrefillStageOwnershipRecord, ...] = ()
     npu_decode_loop: dict[str, object] | None = None
     error: str | None = None
 
@@ -196,13 +300,21 @@ class Gemma3RuntimeExecutionResult:
             f"decode_context={self.decode_context} decode_tokens={self.decode_tokens} "
             f"local={self.local_value} unit={self.unit} "
             f"kernel_launches={self.kernel_launch_count} host_fallbacks={self.host_fallback_count} "
-            f"host_runtime={self.host_runtime_count} decode_loop_status={loop_status} "
+            f"host_runtime={self.host_runtime_count} "
+            f"prefill_kv_cache_status={self.prefill_kv_cache_status} "
+            f"prefill_kv_cache_source={self.prefill_kv_cache_source} "
+            f"prefill_kernel_launches={self.prefill_kernel_launch_count} "
+            f"prefill_host_fallbacks={self.prefill_host_fallback_count} "
+            f"kv_cache_layers={self.kv_cache_layer_count} "
+            f"kv_cache_tokens={self.kv_cache_token_count} "
+            f"decode_loop_status={loop_status} "
             f"blockers={blockers}"
         ]
         if self.error:
             lines.append(f"runtime_error {self.error}")
         if include_ownership:
             lines.extend(record.format() for record in self.operation_ownership)
+            lines.extend(record.format() for record in self.prefill_stage_ownership)
         return "\n".join(lines)
 
     def to_json_dict(self) -> dict[str, object]:
@@ -210,6 +322,14 @@ class Gemma3RuntimeExecutionResult:
         data["operation_ownership"] = [
             asdict(record) for record in self.operation_ownership
         ]
+        data["prefill_stage_ownership"] = [
+            asdict(record) for record in self.prefill_stage_ownership
+        ]
+        data["prefill_kv_cache"] = (
+            None
+            if self.prefill_kv_cache is None
+            else self.prefill_kv_cache.to_json_dict()
+        )
         return data
 
 
@@ -305,6 +425,189 @@ def _ownership_or_ready(
     )
 
 
+def _prefill_kv_blockers(blockers: Iterable[str]) -> tuple[str, ...]:
+    selected = [
+        blocker
+        for blocker in blockers
+        if blocker
+        in (
+            PREFILL_1K_NPU_BLOCKER,
+            PREFILL_PRODUCED_KV_CACHE_BLOCKER,
+            NPU_PREFILL_KV_CACHE_BLOCKER,
+            "prefill-runtime-launch-not-implemented",
+        )
+    ]
+    if selected:
+        return _dedupe(selected)
+    return (PREFILL_PRODUCED_KV_CACHE_BLOCKER, NPU_PREFILL_KV_CACHE_BLOCKER)
+
+
+def _layer_attention_kind(layer_index: int) -> str:
+    return "global_full" if layer_index % 6 == 5 else "local_swa"
+
+
+def _record_shape_by_name(bo_plan: Gemma3BOPlan | None) -> dict[str, tuple[int, ...]]:
+    if bo_plan is None:
+        return {}
+    return {record.name: tuple(record.shape) for record in bo_plan.records}
+
+
+def _layer_kv_shape(
+    shapes: dict[str, tuple[int, ...]],
+    *,
+    layer_index: int,
+    tensor: str,
+    prompt_len: int,
+    kv_heads: int,
+    head_dim: int,
+) -> tuple[str, tuple[int, ...]]:
+    name = f"kv_cache_{tensor}_L{layer_index}"
+    if name in shapes:
+        return name, shapes[name]
+    monolithic = f"kv_cache_{tensor}"
+    if monolithic in shapes and len(shapes[monolithic]) == 4:
+        return monolithic, shapes[monolithic][1:]
+    return name, (prompt_len, kv_heads, head_dim)
+
+
+def _retention_policy(attention_kind: str, read_window_tokens: int) -> str:
+    if attention_kind == "global_full":
+        return "global-full-prompt"
+    return f"local-sliding-window-{read_window_tokens}-tokens"
+
+
+def _prefill_kv_cache_descriptor(
+    *,
+    model_variant: str,
+    prompt_len: int,
+    decode_context: int,
+    preflight: Gemma3NPUPreflightPlan | None,
+    bo_plan: Gemma3BOPlan | None,
+    blockers: Iterable[str],
+) -> Gemma3PrefillKVCacheDescriptor | None:
+    if preflight is None:
+        return None
+    layers = int(preflight.layers or 0)
+    kv_heads = int(preflight.num_key_value_heads or 0)
+    head_dim = int(preflight.head_dim or 0)
+    shapes = _record_shape_by_name(bo_plan)
+    cache_blockers = _prefill_kv_blockers(blockers)
+    layer_descriptors: list[Gemma3PrefillKVLayerDescriptor] = []
+    for layer_index in range(layers):
+        attention_kind = _layer_attention_kind(layer_index)
+        key_buffer, key_shape = _layer_kv_shape(
+            shapes,
+            layer_index=layer_index,
+            tensor="k",
+            prompt_len=prompt_len,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+        )
+        value_buffer, value_shape = _layer_kv_shape(
+            shapes,
+            layer_index=layer_index,
+            tensor="v",
+            prompt_len=prompt_len,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+        )
+        retained_tokens = int(key_shape[0]) if key_shape else prompt_len
+        if attention_kind == "global_full":
+            read_window_tokens = prompt_len
+        else:
+            read_window_tokens = min(prompt_len, retained_tokens)
+        layer_descriptors.append(
+            Gemma3PrefillKVLayerDescriptor(
+                layer_index=layer_index,
+                attention_kind=attention_kind,
+                key_buffer=key_buffer,
+                value_buffer=value_buffer,
+                key_shape=key_shape,
+                value_shape=value_shape,
+                dtype="bf16",
+                prompt_token_count=prompt_len,
+                retained_token_count=retained_tokens,
+                read_window_token_count=read_window_tokens,
+                retention_policy=_retention_policy(attention_kind, read_window_tokens),
+                source=PREFILL_KV_CACHE_NOT_PRODUCED_SOURCE,
+                owner="missing",
+                status=PREFILL_KV_CACHE_NOT_PRODUCED_STATUS,
+                blockers=cache_blockers,
+            )
+        )
+    return Gemma3PrefillKVCacheDescriptor(
+        schema_version=RUNTIME_SETUP_VERSION,
+        model_variant=model_variant,
+        status=PREFILL_KV_CACHE_NOT_PRODUCED_STATUS,
+        source=PREFILL_KV_CACHE_NOT_PRODUCED_SOURCE,
+        owner="missing",
+        layout=PREFILL_KV_CACHE_LAYOUT,
+        dtype="bf16",
+        layer_count=layers,
+        prompt_token_count=prompt_len,
+        decode_context=decode_context,
+        kv_head_count=kv_heads,
+        head_dim=head_dim,
+        blockers=cache_blockers,
+        layers=tuple(layer_descriptors),
+    )
+
+
+def _prefill_stage_owner(stage: Any) -> str:
+    if (
+        str(getattr(stage, "status", "")).startswith("runner-owned")
+        and not getattr(stage, "blockers", ())
+    ):
+        return "npu"
+    if getattr(stage, "backend", "") in ("host-fallback", "host-runtime"):
+        return "host-fallback"
+    return "missing"
+
+
+def _prefill_stage_ownership(
+    wiring: Gemma3NPUWiringPlan | None,
+) -> tuple[Gemma3PrefillStageOwnershipRecord, ...]:
+    if wiring is None:
+        return ()
+    records: list[Gemma3PrefillStageOwnershipRecord] = []
+    for stage in wiring.stages:
+        if stage.phase != "prefill":
+            continue
+        owner = _prefill_stage_owner(stage)
+        blockers = tuple(stage.blockers)
+        if owner == "missing" and not blockers:
+            blockers = ("prefill-stage-not-launched",)
+        records.append(
+            Gemma3PrefillStageOwnershipRecord(
+                phase=stage.phase,
+                layer_index=stage.layer_index,
+                stage_index=stage.stage_index,
+                stage=stage.role,
+                owner=owner,
+                timed_window=True,
+                status=stage.status,
+                kernel=stage.kernel,
+                route=stage.route,
+                attention_kind=stage.attention_kind,
+                window_len=stage.window_len,
+                blockers=_dedupe(blockers),
+            )
+        )
+    return tuple(records)
+
+
+def _prefill_kernel_launch_count(
+    records: Iterable[Gemma3PrefillStageOwnershipRecord],
+) -> int:
+    return sum(1 for record in records if record.owner == "npu" and record.timed_window)
+
+
+def _prefill_host_fallback_count(
+    records: Iterable[Gemma3PrefillStageOwnershipRecord],
+) -> int:
+    return sum(1 for record in records if record.owner == "host-fallback" and record.timed_window)
+
+
 def _operation_ownership(plan: Gemma3ModelRunnerPlan | None) -> tuple[Gemma3RuntimeOwnershipRecord, ...]:
     if plan is None:
         return (
@@ -363,15 +666,7 @@ def _operation_ownership(plan: Gemma3ModelRunnerPlan | None) -> tuple[Gemma3Runt
         _ownership_or_ready(
             name="prefill_kv_producer",
             phase="prefill",
-            blockers=(
-                blocker
-                for blocker in (
-                    PREFILL_1K_NPU_BLOCKER,
-                    PREFILL_PRODUCED_KV_CACHE_BLOCKER,
-                    NPU_PREFILL_KV_CACHE_BLOCKER,
-                )
-                if blocker in blockers
-            ),
+            blockers=_prefill_kv_blockers(blockers),
         ),
         _ownership_or_ready(
             name="attention_stat_reduction",
@@ -414,6 +709,7 @@ def _setup_record_from_components(
     weight_plan: Gemma3StaticWeightPlan | None,
     norm_weight_plan: Gemma3NormWeightPlan | None,
     bo_plan: Gemma3BOPlan | None,
+    wiring: Gemma3NPUWiringPlan | None,
     buffer_binding_plan: Gemma3BufferBindingPlan | None,
     argument_binding_plan: Gemma3KernelArgumentBindingPlan | None,
     model_runner_plan: Gemma3ModelRunnerPlan | None,
@@ -436,6 +732,15 @@ def _setup_record_from_components(
         argument_binding_plan.missing_argument_count
         if argument_binding_plan is not None
         else 0
+    )
+    prefill_stage_ownership = _prefill_stage_ownership(wiring)
+    prefill_kv_cache = _prefill_kv_cache_descriptor(
+        model_variant=model_variant,
+        prompt_len=prompt_len,
+        decode_context=decode_context,
+        preflight=preflight,
+        bo_plan=bo_plan,
+        blockers=all_blockers,
     )
     if artifact_status != "READY":
         status = "BLOCKED_REAL_ARTIFACTS"
@@ -487,6 +792,24 @@ def _setup_record_from_components(
         model_runner_step_count=model_runner_plan.step_count if model_runner_plan is not None else 0,
         blockers=all_blockers,
         operation_ownership=_operation_ownership(model_runner_plan),
+        prefill_kv_cache_status=(
+            prefill_kv_cache.status
+            if prefill_kv_cache is not None
+            else PREFILL_KV_CACHE_UNAVAILABLE_STATUS
+        ),
+        prefill_kv_cache_source=(
+            prefill_kv_cache.source
+            if prefill_kv_cache is not None
+            else PREFILL_KV_CACHE_NOT_PRODUCED_SOURCE
+        ),
+        prefill_kernel_launch_count=_prefill_kernel_launch_count(prefill_stage_ownership),
+        prefill_host_fallback_count=_prefill_host_fallback_count(prefill_stage_ownership),
+        kv_cache_layer_count=(prefill_kv_cache.layer_count if prefill_kv_cache is not None else 0),
+        kv_cache_token_count=(
+            prefill_kv_cache.prompt_token_count if prefill_kv_cache is not None else prompt_len
+        ),
+        prefill_kv_cache=prefill_kv_cache,
+        prefill_stage_ownership=prefill_stage_ownership,
         elapsed_setup_seconds=elapsed_setup_seconds,
         error=error,
     )
@@ -539,6 +862,7 @@ def prepare_runtime(
             weight_plan=None,
             norm_weight_plan=None,
             bo_plan=None,
+            wiring=None,
             buffer_binding_plan=None,
             argument_binding_plan=None,
             model_runner_plan=None,
@@ -638,6 +962,7 @@ def prepare_runtime(
             weight_plan=None,
             norm_weight_plan=None,
             bo_plan=None,
+            wiring=None,
             buffer_binding_plan=None,
             argument_binding_plan=None,
             model_runner_plan=None,
@@ -663,6 +988,7 @@ def prepare_runtime(
         weight_plan=weight_plan,
         norm_weight_plan=norm_weight_plan,
         bo_plan=bo_plan,
+        wiring=wiring,
         buffer_binding_plan=buffer_binding_plan,
         argument_binding_plan=argument_binding_plan,
         model_runner_plan=model_runner_plan,
@@ -694,6 +1020,14 @@ def _execution_setup_fields(session: Gemma3RuntimeSession) -> dict[str, object]:
         "argument_binding_status": setup.argument_binding_status,
         "argument_binding_count": setup.argument_binding_count,
         "argument_binding_blocker_count": setup.argument_binding_blocker_count,
+        "prefill_kv_cache_status": setup.prefill_kv_cache_status,
+        "prefill_kv_cache_source": setup.prefill_kv_cache_source,
+        "prefill_kernel_launch_count": setup.prefill_kernel_launch_count,
+        "prefill_host_fallback_count": setup.prefill_host_fallback_count,
+        "kv_cache_layer_count": setup.kv_cache_layer_count,
+        "kv_cache_token_count": setup.kv_cache_token_count,
+        "prefill_kv_cache": setup.prefill_kv_cache,
+        "prefill_stage_ownership": setup.prefill_stage_ownership,
     }
 
 
@@ -845,12 +1179,20 @@ def _blocked_execution_result(
     operation_ownership: tuple[Gemma3RuntimeOwnershipRecord, ...] | None = None,
     unit: str | None = None,
     error: str | None = None,
+    status: str = "BLOCKED",
+    prefill_kernel_launch_count: int | None = None,
+    prefill_host_fallback_count: int | None = None,
 ) -> Gemma3RuntimeExecutionResult:
+    setup_fields = _execution_setup_fields(session)
+    if prefill_kernel_launch_count is not None:
+        setup_fields["prefill_kernel_launch_count"] = prefill_kernel_launch_count
+    if prefill_host_fallback_count is not None:
+        setup_fields["prefill_host_fallback_count"] = prefill_host_fallback_count
     return Gemma3RuntimeExecutionResult(
         schema_version=RUNTIME_SETUP_VERSION,
         entrypoint=entrypoint,
         model_variant=session.setup.model_variant,
-        status="BLOCKED",
+        status=status,
         prompt_len=session.setup.prompt_len,
         decode_context=session.setup.decode_context,
         decode_tokens=decode_tokens,
@@ -868,7 +1210,7 @@ def _blocked_execution_result(
         host_fallback_count=0,
         host_runtime_count=0,
         error=error,
-        **_execution_setup_fields(session),
+        **setup_fields,
     )
 
 
@@ -880,20 +1222,13 @@ def run_npu_prefill(
         raise ValueError(
             f"token_ids length {len(token_ids)} does not match prompt_len {session.setup.prompt_len}"
         )
-    blockers = tuple(
-        blocker
-        for blocker in session.setup.blockers
-        if blocker
-        in (
-            PREFILL_1K_NPU_BLOCKER,
-            PREFILL_PRODUCED_KV_CACHE_BLOCKER,
-            NPU_PREFILL_KV_CACHE_BLOCKER,
-            "model-kernel-launch-not-wired",
-            "full-static-weight-bo-preload-not-validated",
+    blockers = _prefill_kv_blockers(
+        (
+            session.setup.prefill_kv_cache.blockers
+            if session.setup.prefill_kv_cache is not None
+            else session.setup.blockers
         )
     )
-    if not blockers:
-        blockers = ("prefill-runtime-launch-not-implemented",)
     ownership = tuple(
         record
         for record in session.setup.operation_ownership
@@ -906,6 +1241,9 @@ def run_npu_prefill(
         blockers=blockers,
         operation_ownership=ownership,
         unit="seconds",
+        status="PREFILL_KV_CACHE_BLOCKED",
+        prefill_kernel_launch_count=0,
+        prefill_host_fallback_count=0,
     )
 
 
@@ -1101,6 +1439,7 @@ def _fixture_session() -> Gemma3RuntimeSession:
         weight_plan=weight_plan,
         norm_weight_plan=norm_weight_plan,
         bo_plan=bo_plan,
+        wiring=wiring,
         buffer_binding_plan=buffer_binding_plan,
         argument_binding_plan=argument_binding_plan,
         model_runner_plan=model_runner_plan,
@@ -1133,10 +1472,26 @@ def _self_test() -> None:
         raise AssertionError(setup.argument_binding_count)
     if "static_projection_weights" not in setup.static_input_keys:
         raise AssertionError(setup.static_input_keys)
+    if setup.prefill_kv_cache_status != PREFILL_KV_CACHE_NOT_PRODUCED_STATUS:
+        raise AssertionError(setup.prefill_kv_cache_status)
+    if setup.prefill_kv_cache_source != PREFILL_KV_CACHE_NOT_PRODUCED_SOURCE:
+        raise AssertionError(setup.prefill_kv_cache_source)
+    if setup.kv_cache_layer_count != 2 or setup.kv_cache_token_count != setup.prompt_len:
+        raise AssertionError(setup.prefill_kv_cache)
+    if setup.prefill_kv_cache is None or len(setup.prefill_kv_cache.layers) != 2:
+        raise AssertionError(setup.prefill_kv_cache)
+    if not setup.prefill_stage_ownership:
+        raise AssertionError(setup.prefill_stage_ownership)
+    if not any(record.owner == "missing" for record in setup.prefill_stage_ownership):
+        raise AssertionError(setup.prefill_stage_ownership)
     if not any(record.owner == "host-fallback" for record in setup.operation_ownership):
         raise AssertionError(setup.operation_ownership)
     prefill = run_npu_prefill(session, [1] * setup.prompt_len)
-    if prefill.status != "BLOCKED" or not prefill.blockers:
+    if prefill.status != "PREFILL_KV_CACHE_BLOCKED" or not prefill.blockers:
+        raise AssertionError(prefill)
+    if PREFILL_PRODUCED_KV_CACHE_BLOCKER not in prefill.blockers:
+        raise AssertionError(prefill.blockers)
+    if prefill.prefill_kernel_launch_count != 0 or prefill.prefill_host_fallback_count != 0:
         raise AssertionError(prefill)
     generated = generate(session, [1] * setup.prompt_len, decode_tokens=1, run_hardware=False)
     if generated.status != "BLOCKED" or generated.generated_token_ids:
