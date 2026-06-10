@@ -1,0 +1,22 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// REQUIRES: peano
+//
+// RUN: mkdir -p test_gemma3_sweep
+// RUN: cd test_gemma3_sweep
+// RUN: make -f %S/../../../Makefile clean PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR
+// RUN: make -f %S/../../../Makefile sweep PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR COMPILE_MODE=compile-only OUTPUT_FORMAT=elf
+// RUN: make -f %S/../../../Makefile sweep PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR COMPILE_MODE=compile-only OUTPUT_FORMAT=elf SWEEP_OUTPUT_MODES="direct l2-gather"
+// RUN: make -f %S/../../../Makefile run-fused-dqp-paper PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR COMPILE_MODE=compile-only OUTPUT_FORMAT=elf PAPER_FUSED_DQP_COL_BLOCKS=2
+// RUN: make -f %S/../../../Makefile run-flowqkv-paper PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR COMPILE_MODE=compile-only OUTPUT_FORMAT=elf PAPER_KV_LEN=32 PAPER_HEAD_DIM=64
+// RUN: make -f %S/../../../Makefile run-flowkv-paper PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR COMPILE_MODE=compile-only OUTPUT_FORMAT=elf PAPER_KV_LEN=32 PAPER_HEAD_DIM=64
+// RUN: not env PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.kernels.q4nx --herd-shape 8x4 --output-mode direct --print-module-only 2>&1 | FileCheck %s --check-prefix=UNSUPPORTED-Q4NX
+// RUN: not env PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.kernels.fused_dqp --herd-shape 8x4 --output-mode direct --print-module-only 2>&1 | FileCheck %s --check-prefix=UNSUPPORTED-FUSED
+// RUN: not env PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.kernels.q4nx --herd-shape 8x4 --output-mode packet-direct --print-module-only 2>&1 | FileCheck %s --check-prefix=UNSUPPORTED-PACKET
+// RUN: not env PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.kernels.flowkv --herd-shape 2x4 --output-mode l2-gather --print-module-only 2>&1 | FileCheck %s --check-prefix=UNSUPPORTED-FLOWKV
+
+// UNSUPPORTED-Q4NX: output mode {{.*}}direct{{.*}} is not supported for q4nx 8x4 (direct output from the full 8x4 herd exceeds the shim S2MM DMA channel budget; use l2-gather); supported modes: l2-gather
+// UNSUPPORTED-FUSED: output mode {{.*}}direct{{.*}} is not supported for fused_dqp 8x4 (direct output from the full 8x4 herd exceeds the shim S2MM DMA channel budget; use l2-gather); supported modes: l2-gather
+// UNSUPPORTED-PACKET: output mode {{.*}}packet-direct{{.*}} is not supported for q4nx 8x4 (packet-direct is diagnostic-only: shared shim S2MM packet output currently corrupts hardware validation; use l2-gather); supported modes: l2-gather
+// UNSUPPORTED-FLOWKV: output mode {{.*}}l2-gather{{.*}} is not supported for flowkv 2x4 (FlowKV small-shape L2 gather is diagnostic-only: channel-staged compile passes, but hardware validation is not clean; use direct); supported modes: direct

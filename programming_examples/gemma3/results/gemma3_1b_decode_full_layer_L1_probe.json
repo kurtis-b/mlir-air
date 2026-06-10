@@ -1,0 +1,259 @@
+{
+  "attention_correlation": 1.0,
+  "blockers": [],
+  "bo_binding_mode": "runner-owned-persistent-bo",
+  "command": [
+    "programming_examples/gemma3/gemma3/probes/full_layer.py",
+    "--run-hardware",
+    "--power-sample",
+    "--layer-index",
+    "1",
+    "--model-variant",
+    "gemma3-1b",
+    "--weights-dir",
+    "/home/cj/models/gemma-3-1b-pt",
+    "--result-json",
+    "/tmp/gemma3_1b_decode_full_layer_L1_probe.json"
+  ],
+  "dense_final_output_correlation": null,
+  "diagnostic_layer_passes_per_second": 7.013714899726135,
+  "dirty_worktree": false,
+  "elapsed_seconds": 7.226329127035569,
+  "estimated_26_layer_decode_tps_kernel_only": 0.2697582653740821,
+  "final_output_correlation": 1.0,
+  "git_commit": "ddc700a250d2cbeac6945ab6acc8c8c43186c0f5",
+  "host_fallbacks": [
+    "qk_norm",
+    "rope",
+    "single_token_attention",
+    "post_attention_norm",
+    "residual_add",
+    "pre_feedforward_norm",
+    "mlp_activation",
+    "post_feedforward_norm"
+  ],
+  "input_distribution": "bounded-uniform-seed0",
+  "input_shape": [
+    1,
+    1152
+  ],
+  "layer_index": 1,
+  "mlp_activation_correlation": 0.9999999999999998,
+  "model_variant": "gemma3-1b",
+  "norm_tensor_key": "model.layers.1.input_layernorm.weight",
+  "norm_tensor_keys": {
+    "input_layernorm": "model.layers.1.input_layernorm.weight",
+    "k_norm": "model.layers.1.self_attn.k_norm.weight",
+    "post_attention_layernorm": "model.layers.1.post_attention_layernorm.weight",
+    "post_feedforward_layernorm": "model.layers.1.post_feedforward_layernorm.weight",
+    "pre_feedforward_layernorm": "model.layers.1.pre_feedforward_layernorm.weight",
+    "q_norm": "model.layers.1.self_attn.q_norm.weight"
+  },
+  "output_format": "elf",
+  "output_shape": [
+    1152
+  ],
+  "phase": "decode",
+  "power_snapshot": {
+    "aligned_with_timed_window": true,
+    "field_status": {
+      "cpu": "MISSING_POWER_FIELD",
+      "gpu": "MISSING_POWER_FIELD",
+      "npu": "PSEUDO_RAPL_SYSFS_DELTA_SEGMENTED",
+      "total": "RAPL_SYSFS_PACKAGE_SEGMENTED"
+    },
+    "notes": [
+      "quiescent_pkg_watts=11.501940",
+      "package watts use direct RAPL sysfs energy_uj deltas summed over NPU run.start/wait2 segments",
+      "NPU rail is pseudo power: segmented package watts minus quiescent package watts before the run"
+    ],
+    "run_id": "gemma3_1b_decode_full_layer_probe",
+    "sampling_backend": "rapl-sysfs+segmented",
+    "schema_version": 1,
+    "segmented_elapsed_seconds": 0.1425777942640707,
+    "segmented_energy_delta_uj": 2483639,
+    "watts": {
+      "cpu": null,
+      "gpu": null,
+      "npu": 5.917595859840917,
+      "total": 17.419535859840916
+    }
+  },
+  "projection_evidence": [
+    {
+      "col_blocks": 5,
+      "dense_projection_correlation": 0.9968317132957708,
+      "family": "q_proj",
+      "padded_shape": [
+        1024,
+        1280
+      ],
+      "projection_correlation": 0.9999999999999999,
+      "row_blocks": 32,
+      "shape": [
+        1024,
+        1152
+      ],
+      "tensor_key": "model.layers.1.self_attn.q_proj.weight"
+    },
+    {
+      "col_blocks": 5,
+      "dense_projection_correlation": 0.9970236120993475,
+      "family": "k_proj",
+      "padded_shape": [
+        256,
+        1280
+      ],
+      "projection_correlation": 1.0,
+      "row_blocks": 8,
+      "shape": [
+        256,
+        1152
+      ],
+      "tensor_key": "model.layers.1.self_attn.k_proj.weight"
+    },
+    {
+      "col_blocks": 5,
+      "dense_projection_correlation": 0.9961784669012668,
+      "family": "v_proj",
+      "padded_shape": [
+        256,
+        1280
+      ],
+      "projection_correlation": 0.9999999999999998,
+      "row_blocks": 8,
+      "shape": [
+        256,
+        1152
+      ],
+      "tensor_key": "model.layers.1.self_attn.v_proj.weight"
+    },
+    {
+      "col_blocks": 4,
+      "dense_projection_correlation": 0.9971126916178046,
+      "family": "o_proj",
+      "padded_shape": [
+        1280,
+        1024
+      ],
+      "projection_correlation": 1.0,
+      "row_blocks": 40,
+      "shape": [
+        1152,
+        1024
+      ],
+      "tensor_key": "model.layers.1.self_attn.o_proj.weight"
+    },
+    {
+      "col_blocks": 5,
+      "dense_projection_correlation": 0.9969507074977185,
+      "family": "gate_proj",
+      "padded_shape": [
+        6912,
+        1280
+      ],
+      "projection_correlation": 1.0,
+      "row_blocks": 216,
+      "shape": [
+        6912,
+        1152
+      ],
+      "tensor_key": "model.layers.1.mlp.gate_proj.weight"
+    },
+    {
+      "col_blocks": 5,
+      "dense_projection_correlation": 0.9964440601089496,
+      "family": "up_proj",
+      "padded_shape": [
+        6912,
+        1280
+      ],
+      "projection_correlation": 1.0,
+      "row_blocks": 216,
+      "shape": [
+        6912,
+        1152
+      ],
+      "tensor_key": "model.layers.1.mlp.up_proj.weight"
+    },
+    {
+      "col_blocks": 27,
+      "dense_projection_correlation": 0.9968333952173587,
+      "family": "down_proj",
+      "padded_shape": [
+        1280,
+        6912
+      ],
+      "projection_correlation": 1.0,
+      "row_blocks": 40,
+      "shape": [
+        1152,
+        6912
+      ],
+      "tensor_key": "model.layers.1.mlp.down_proj.weight"
+    }
+  ],
+  "projection_tensor_keys": {
+    "down_proj": "model.layers.1.mlp.down_proj.weight",
+    "gate_proj": "model.layers.1.mlp.gate_proj.weight",
+    "k_proj": "model.layers.1.self_attn.k_proj.weight",
+    "o_proj": "model.layers.1.self_attn.o_proj.weight",
+    "q_proj": "model.layers.1.self_attn.q_proj.weight",
+    "up_proj": "model.layers.1.mlp.up_proj.weight",
+    "v_proj": "model.layers.1.self_attn.v_proj.weight"
+  },
+  "projection_weight_layout": "fused-dqp-paper-repacked-full-layer-colblock-loop",
+  "remaining_model_runner_gaps": [
+    "full-1b-loop-not-wired"
+  ],
+  "returncode": 0,
+  "rms_correlation": 0.9999906345335828,
+  "runner_reuse_mode": "reused-elf-persistent-bo",
+  "schema_version": 1,
+  "sequence_kind": "decode-full-layer-staged",
+  "stages": [
+    "decode:L1:pre_attention_norm",
+    "decode:L1:qkv_projection",
+    "decode:L1:qk_norm",
+    "decode:L1:rope_identity_pos0",
+    "decode:L1:single_token_attention_host",
+    "decode:L1:output_projection",
+    "decode:L1:post_attention_norm",
+    "decode:L1:attention_residual",
+    "decode:L1:pre_feedforward_norm",
+    "decode:L1:mlp_gate_up_projection",
+    "decode:L1:mlp_activation",
+    "decode:L1:mlp_down_projection",
+    "decode:L1:post_feedforward_norm",
+    "decode:L1:mlp_residual"
+  ],
+  "static_norm_argument_bytes": 2304,
+  "static_norm_argument_mode": "selected-vector",
+  "static_norm_bo_bytes": 266240,
+  "static_norm_tensor_offset_bytes": 10240,
+  "status": "FULL_LAYER_SEQUENCE_PASS",
+  "stderr_tail": [],
+  "stdout_tail": [
+    "RMSNorm correlation: 0.999991",
+    "q_proj correlation: 1.000000",
+    "k_proj correlation: 1.000000",
+    "v_proj correlation: 1.000000",
+    "o_proj correlation: 1.000000",
+    "gate_proj correlation: 1.000000",
+    "up_proj correlation: 1.000000",
+    "down_proj correlation: 1.000000",
+    "final output correlation: 1.000000"
+  ],
+  "threshold": 0.99,
+  "timed_kernel_count": 57,
+  "timed_kernel_mean_seconds": 0.002501364811650363,
+  "timed_kernel_seconds": 0.1425777942640707,
+  "timing_notes": [
+    "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls for this staged layer",
+    "compile, ELF load, BO allocation, BO writes/preload, argument binding, output sync/readback, and host fallback compute are excluded",
+    "reused ELF mode compiles, loads, allocates BOs, and binds kernel arguments before the timed launch segments",
+    "RMSNorm uses a preselected BF16 norm-vector argument because the current two-argument RMSNorm ABI has no static-norm BO offset parameter",
+    "estimated_26_layer_decode_tps_kernel_only is an extrapolation from one layer and is not a measured full-model decode TPS"
+  ],
+  "timing_window": "segmented-run-start-wait2-only"
+}

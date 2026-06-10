@@ -1,0 +1,14 @@
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.model.prefill | FileCheck %s --check-prefix=PREFILL
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.model.decode | FileCheck %s --check-prefix=DECODE
+#
+# PREFILL: prefill:L0:flowqkv status=npu
+# PREFILL-SAME: kv_read=4:8
+# PREFILL: prefill:L1:flowqkv status=npu
+# PREFILL-SAME: kv_read=0:8
+# PREFILL: GEMMA3_PREFILL_ORCHESTRATION_SELF_TEST: PASS
+#
+# DECODE: decode:L0:flowkv status=npu
+# DECODE-SAME: kv_read=6:10
+# DECODE: decode:L1:flowkv status=npu
+# DECODE-SAME: kv_read=0:10
+# DECODE: GEMMA3_DECODE_ORCHESTRATION_SELF_TEST: PASS

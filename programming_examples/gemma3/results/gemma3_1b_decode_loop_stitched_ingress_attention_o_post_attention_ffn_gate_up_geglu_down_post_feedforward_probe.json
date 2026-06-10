@@ -1,0 +1,3388 @@
+{
+  "attention_cache_contract": "single-current-token-kv",
+  "attention_host_batch_count": null,
+  "attention_host_batch_tiles": null,
+  "attention_host_reduction": false,
+  "attention_kv_tile": null,
+  "attention_mode": "single-token",
+  "attention_o_mode": "stitched",
+  "blockers": [],
+  "command": [
+    "programming_examples/gemma3/gemma3/probes/decode_loop.py",
+    "--run-hardware",
+    "--layers",
+    "26",
+    "--warmup-layers",
+    "1",
+    "--decode-tokens",
+    "1",
+    "--ingress-mode",
+    "stitched",
+    "--attention-o-mode",
+    "stitched",
+    "--post-attention-mode",
+    "stitched",
+    "--ffn-gate-up-mode",
+    "stitched",
+    "--ffn-geglu-down-mode",
+    "stitched",
+    "--post-feedforward-mode",
+    "stitched",
+    "--power-sample",
+    "--result-json",
+    "programming_examples/gemma3/results/gemma3_1b_decode_loop_stitched_ingress_attention_o_post_attention_ffn_gate_up_geglu_down_post_feedforward_probe.json"
+  ],
+  "decode_tokens": 1,
+  "diagnostic_decode_tps_kernel_only": 0.21528336518677996,
+  "diagnostic_decode_tps_loop_wall": 0.20998464373481665,
+  "dirty_worktree": false,
+  "elapsed_seconds": 30.28032985400023,
+  "ffn_gate_up_mode": "stitched",
+  "ffn_geglu_down_mode": "stitched",
+  "git_commit": "0a8eb288065c97980ccf0485020b8a1044f3df1a",
+  "host_fallbacks": [],
+  "ingress_mode": "stitched",
+  "input_distribution": "bounded-uniform-seed0",
+  "input_shape": [
+    1,
+    1152
+  ],
+  "kernel_only_delta_pct_vs_paper_decode_tps_1k": 99.47619619175967,
+  "layer_count": 26,
+  "layer_evidence": [
+    {
+      "final_output_correlation": 0.9997791925772481,
+      "layer_index": 0,
+      "norm_tensor_key": "model.layers.0.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999714420140488,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.0.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999773571021656,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.0.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999779718608028,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.0.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999906284853377,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.0.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9998345029482522,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.0.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9998401026630452,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.0.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9995171096911902,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.0.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999908310898628,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 0,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9999120294444548,
+      "layer_index": 1,
+      "norm_tensor_key": "model.layers.1.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999846949154549,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.1.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999747861716868,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.1.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.999979667149848,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.1.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999926593988853,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.1.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9997345341308879,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.1.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9997789740982941,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.1.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9994199080483502,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.1.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999908736038676,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 10240,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9998983577001271,
+      "layer_index": 2,
+      "norm_tensor_key": "model.layers.2.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999634734726591,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.2.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999707913589317,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.2.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999727261356466,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.2.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.999989896022707,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.2.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9998012012757119,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.2.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9998040004797855,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.2.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.999482490165909,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.2.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999789854130926,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 122880,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9999562958380066,
+      "layer_index": 3,
+      "norm_tensor_key": "model.layers.3.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.999975471155227,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.3.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999698255424657,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.3.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999742434282536,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.3.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999907478691961,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.3.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9998475254705238,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.3.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9998365634203589,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.3.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9996714544837846,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.3.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999902591720631,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 194560,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9999663256483244,
+      "layer_index": 4,
+      "norm_tensor_key": "model.layers.4.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999768434820543,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.4.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999778241452953,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.4.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999765292992067,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.4.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999925741048492,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.4.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999040406195554,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.4.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.999902901318281,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.4.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9997175160452659,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.4.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999890231087366,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 204800,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9999693856734885,
+      "layer_index": 5,
+      "norm_tensor_key": "model.layers.5.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999829232444166,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.5.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999914357947435,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.5.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999874326908821,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.5.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999789141759019,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.5.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999571774690211,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.5.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999517001295086,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.5.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9998005521982437,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.5.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999952662420768,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 215040,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9999837539985355,
+      "layer_index": 6,
+      "norm_tensor_key": "model.layers.6.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999816251652315,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.6.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999845188784992,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.6.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999794510961549,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.6.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.999988778834279,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.6.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999284414358656,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.6.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999180133474226,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.6.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9994320135634781,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.6.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999898643252099,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 225280,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9999862468435425,
+      "layer_index": 7,
+      "norm_tensor_key": "model.layers.7.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999755315881795,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.7.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999912123931348,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.7.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999829016938415,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.7.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999921089243172,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.7.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9998952396446299,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.7.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9998858636454656,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.7.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.999136499048265,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.7.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999875156812054,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 235520,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9999994222569613,
+      "layer_index": 8,
+      "norm_tensor_key": "model.layers.8.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999911984035924,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.8.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999956832053697,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.8.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999756986984338,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.8.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999842046751646,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.8.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999214156039697,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.8.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999076088960478,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.8.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9996772229384563,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.8.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999979725067919,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 245760,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9999969140646764,
+      "layer_index": 9,
+      "norm_tensor_key": "model.layers.9.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999850044993784,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.9.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999800238947851,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.9.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999789002871099,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.9.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999794521252193,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.9.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999257609730142,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.9.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999102432207246,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.9.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9993102689237426,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.9.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999933162414888,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 256000,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9999985135106113,
+      "layer_index": 10,
+      "norm_tensor_key": "model.layers.10.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999827071932457,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.10.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999911192956688,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.10.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999739053013489,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.10.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999918889648005,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.10.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999170188302768,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.10.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999164545955029,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.10.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9996893129916254,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.10.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999978488125484,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 20480,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.999995182954436,
+      "layer_index": 11,
+      "norm_tensor_key": "model.layers.11.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999933813707446,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.11.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999950311564259,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.11.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999800564995545,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.11.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999812253765679,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.11.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9998402455335612,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.11.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9998533193636866,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.11.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9994796413132935,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.11.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999995387013062,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 30720,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9999927266159616,
+      "layer_index": 12,
+      "norm_tensor_key": "model.layers.12.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999732409258709,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.12.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999838766131538,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.12.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999709905306264,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.12.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999884898020595,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.12.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999226063604577,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.12.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999265848638512,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.12.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9997484957647946,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.12.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999867785019423,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 40960,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9999934155551854,
+      "layer_index": 13,
+      "norm_tensor_key": "model.layers.13.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999735423726537,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.13.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999812007706672,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.13.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999718820426376,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.13.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999819509758952,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.13.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999450326077177,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.13.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999466441338579,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.13.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9998157929950743,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.13.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999894313448611,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 51200,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9999841445465205,
+      "layer_index": 14,
+      "norm_tensor_key": "model.layers.14.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999770797467946,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.14.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999804085713284,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.14.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999682751415826,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.14.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999873893409367,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.14.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9998875210499799,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.14.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9998906638111219,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.14.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9996272802606823,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.14.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999909475841453,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 61440,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.999980812748058,
+      "layer_index": 15,
+      "norm_tensor_key": "model.layers.15.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999698522709349,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.15.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999863738102813,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.15.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999719793672767,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.15.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999923325745493,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.15.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999221164077774,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.15.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999221873965027,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.15.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9996371196825535,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.15.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999931405714932,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 71680,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9999569496772421,
+      "layer_index": 16,
+      "norm_tensor_key": "model.layers.16.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999781292191627,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.16.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999798131546999,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.16.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999789732156475,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.16.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999859333426508,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.16.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999042282291772,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.16.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999080023519785,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.16.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9996494679439965,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.16.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999901742569419,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 81920,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9999581739631261,
+      "layer_index": 17,
+      "norm_tensor_key": "model.layers.17.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999860300369569,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.17.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999942054816084,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.17.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999770458296128,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.17.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999887586432658,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.17.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9998926174668291,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.17.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.999874767096206,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.17.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9995581754780042,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.17.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999984249563725,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 92160,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9999664452790609,
+      "layer_index": 18,
+      "norm_tensor_key": "model.layers.18.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.999979924955707,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.18.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999809330964456,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.18.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999710399970676,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.18.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.99998466665133,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.18.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.99996054890241,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.18.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999562113277016,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.18.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9997097824519557,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.18.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999921252562511,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 102400,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9999451398505518,
+      "layer_index": 19,
+      "norm_tensor_key": "model.layers.19.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999809503087357,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.19.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999764176097572,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.19.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999732039982342,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.19.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999890715124123,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.19.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9998922613151465,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.19.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9998839625383753,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.19.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9993948618279941,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.19.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999889624501791,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 112640,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9999070842352292,
+      "layer_index": 20,
+      "norm_tensor_key": "model.layers.20.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999792765452042,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.20.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999785978228443,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.20.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999739752841311,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.20.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.999990214336334,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.20.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999298489705352,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.20.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999313815848845,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.20.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9995880995958488,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.20.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999914208895357,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 133120,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9999475960745344,
+      "layer_index": 21,
+      "norm_tensor_key": "model.layers.21.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999771456120721,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.21.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999723751006548,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.21.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999737206884688,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.21.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999897459808876,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.21.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.999924238927396,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.21.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999264534192506,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.21.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9996828871644187,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.21.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999889196618093,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 143360,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9999252340335694,
+      "layer_index": 22,
+      "norm_tensor_key": "model.layers.22.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999733390014736,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.22.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999766704082981,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.22.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999683470683461,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.22.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999870286417013,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.22.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999210664246664,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.22.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999175000818271,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.22.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9996014591715874,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.22.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999862611549082,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 153600,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9998997730880123,
+      "layer_index": 23,
+      "norm_tensor_key": "model.layers.23.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999800778821079,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.23.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999640525923417,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.23.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.999967194774868,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.23.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999839312058572,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.23.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999272520946451,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.23.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999280332278798,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.23.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9995314645137544,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.23.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999895334493543,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 163840,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9998997135323877,
+      "layer_index": 24,
+      "norm_tensor_key": "model.layers.24.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999722570275974,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.24.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999729787025053,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.24.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999700225297191,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.24.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999657506948477,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.24.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999427427871265,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.24.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999364220739487,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.24.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.9996541518517842,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.24.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999896428344789,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 174080,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    },
+    {
+      "final_output_correlation": 0.9988857502167078,
+      "layer_index": 25,
+      "norm_tensor_key": "model.layers.25.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999740184815297,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.25.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999764121387632,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.25.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999656437775494,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.25.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 0.9999882056488707,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.25.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999644014656168,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.25.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999621739782621,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.25.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1152,
+            6912
+          ],
+          "projection_correlation": 0.999124998566509,
+          "row_blocks": 36,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.25.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999894663662637,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 184320,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    }
+  ],
+  "loop_wall_delta_pct_vs_paper_decode_tps_1k": 99.48908845806615,
+  "measured_loop_seconds": 4.762253001999852,
+  "model_variant": "gemma3-1b",
+  "norm_argument_mode": "selected-vector",
+  "output_format": "elf",
+  "output_shape": [
+    1,
+    1152
+  ],
+  "paper_decode_tps_1k": 41.1,
+  "phase": "decode",
+  "post_attention_mode": "stitched",
+  "post_feedforward_mode": "stitched",
+  "power_snapshot": {
+    "aligned_with_timed_window": true,
+    "field_status": {
+      "cpu": "MISSING_POWER_FIELD",
+      "gpu": "MISSING_POWER_FIELD",
+      "npu": "PSEUDO_RAPL_SYSFS_DELTA",
+      "total": "RAPL_SYSFS_PACKAGE"
+    },
+    "notes": [
+      "raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges",
+      "xrt-smi is available, but direct NPU rail parsing reports N/A on this host",
+      "NPU rail is pseudo power: average package watts during timed window minus quiescent package watts before the run",
+      "quiescent_pkg_watts=6.644100",
+      "package watts use direct RAPL sysfs energy_uj delta over the timed window"
+    ],
+    "run_id": "gemma3_1b_decode_loop_probe",
+    "sampling_backend": "rapl-sysfs+turbostat+rocm-smi",
+    "schema_version": 1,
+    "watts": {
+      "cpu": null,
+      "gpu": null,
+      "npu": 2.0647048414445175,
+      "total": 8.708804841444516
+    }
+  },
+  "prompt_context_length": 1024,
+  "reference_check_layer_count": 26,
+  "reference_check_mode": "all-layers-before-timing",
+  "reference_check_seconds": 6.377147672000319,
+  "remaining_paper_gaps": [
+    "prefill-kv-cache-not-constructed",
+    "paper-1k-kv-attention-not-wired",
+    "logits-sampling-not-wired",
+    "decode-layer-after-stitched-ingress-still-staged",
+    "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
+  ],
+  "returncode": 0,
+  "runner_reuse_mode": "reused-elf-persistent-bo",
+  "schema_version": 2,
+  "segmented_kernel_power_snapshot": {
+    "aligned_with_timed_window": true,
+    "field_status": {
+      "cpu": "MISSING_POWER_FIELD",
+      "gpu": "MISSING_POWER_FIELD",
+      "npu": "PSEUDO_RAPL_SYSFS_DELTA_SEGMENTED",
+      "total": "RAPL_SYSFS_PACKAGE_SEGMENTED"
+    },
+    "notes": [
+      "quiescent_pkg_watts=46.619290",
+      "package watts use direct RAPL sysfs energy_uj deltas summed over NPU run.start/wait2 segments",
+      "NPU rail is pseudo power: segmented package watts minus quiescent package watts before the run"
+    ],
+    "run_id": "gemma3_1b_decode_loop_probe_kernel_segments",
+    "sampling_backend": "rapl-sysfs+segmented",
+    "schema_version": 1,
+    "segmented_elapsed_seconds": 4.645040731003064,
+    "segmented_energy_delta_uj": 40830825,
+    "watts": {
+      "cpu": null,
+      "gpu": null,
+      "npu": 0.0,
+      "total": 8.790197409352505
+    }
+  },
+  "sequence_kind": "decode-loop-staged-full-1b",
+  "static_attention_o_bo_set_count": 26,
+  "static_ffn_gate_up_bo_set_count": 26,
+  "static_ffn_geglu_down_bo_set_count": 26,
+  "static_ingress_bo_set_count": 26,
+  "static_post_attention_residual_bo_set_count": 26,
+  "static_post_feedforward_residual_bo_set_count": 26,
+  "static_projection_argument_mode": "preloaded-runner-bo-set",
+  "static_projection_bo_set_count": 0,
+  "status": "DECODE_LOOP_DIAGNOSTIC_PASS",
+  "stderr_tail": [],
+  "stdout_tail": [
+    "decode token 0: final checksum=-38224.218750"
+  ],
+  "timed_kernel_count": 156,
+  "timed_kernel_mean_seconds": 0.029775902121814513,
+  "timed_kernel_seconds": 4.645040731003064,
+  "timing_notes": [
+    "warmup layers compile/load ELF runners and allocate runner-owned BOs before measured loop timing",
+    "preloaded-runner-bo-set mode allocates BO sets and writes packed projection static inputs before measured loop timing",
+    "stitched ingress mode preloads one aliased RMSNorm/QKV/QK-norm/RoPE BO set per layer before measured loop timing",
+    "stitched attention/O mode preloads one aliased FlowQKV/O-projection BO set per layer before measured loop timing",
+    "stitched post-attention mode preloads one aliased RMSNorm/residual BO set per layer before measured loop timing",
+    "stitched FFN gate/up mode preloads one aliased RMSNorm/gate/up BO set per layer before measured loop timing",
+    "stitched FFN GeGLU/down mode preloads one aliased GeGLU/down-projection BO set per layer before measured loop timing",
+    "stitched post-feedforward mode preloads one aliased RMSNorm/final-residual BO set per layer before measured loop timing",
+    "reference_check_seconds validates all layers before measured loop timing and is excluded from measured_loop_seconds",
+    "measured_loop_seconds starts after warmup/reference checks and includes current implementation dynamic BO writes and output sync/readback",
+    "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls and excludes compile, ELF load, BO allocation, BO writes, sync/readback, and CPU reference/correlation checks",
+    "attention is the staged single-token FlowQKV NPU path, not paper 1k KV-cache attention",
+    "logits and sampling are not wired, so this is a diagnostic decode-loop throughput, not an official paper decode TPS cell"
+  ],
+  "timing_window": "post-warmup-loop-wall-and-segmented-run-start-wait2"
+}

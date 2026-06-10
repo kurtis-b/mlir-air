@@ -1,0 +1,136 @@
+{
+  "artifact_format": "elf",
+  "artifact_inventory": {
+    "can_load_real_artifacts": true,
+    "config_exists": true,
+    "config_path": "/home/cj/models/gemma-3-1b-pt/config.json",
+    "default_weights_dir": "/home/cj/models/gemma-3-1b-pt",
+    "default_weights_dir_used": true,
+    "has_vision": false,
+    "has_weight_files": true,
+    "model_variant": "gemma3-1b",
+    "optional_packages": {
+      "safetensors": true,
+      "sentencepiece": true,
+      "tokenizers": true,
+      "transformers": true
+    },
+    "processor_exists": false,
+    "processor_path": null,
+    "q4nx_contract": {
+      "cols": 256,
+      "logical_formula": "w_bf16[row, col] = scale[col] * q4[row, col] + min[col]",
+      "matrix_order": "projection weights are stored as out_dim x in_dim blocks",
+      "min_offset_dtype": "bfloat16",
+      "packed_nibble_order": "low_nibble_first",
+      "rows": 32,
+      "scale_dtype": "bfloat16"
+    },
+    "safetensors": [
+      "/home/cj/models/gemma-3-1b-pt/model.safetensors"
+    ],
+    "source_repo": "google/gemma-3-1b-pt",
+    "tokenizer_exists": true,
+    "tokenizer_path": "/home/cj/models/gemma-3-1b-pt/tokenizer.json",
+    "weights_dir": "/home/cj/models/gemma-3-1b-pt"
+  },
+  "backend": "igpu",
+  "classification": "EXPLAINED_DEVIATION",
+  "command": "PYTHONPATH=programming_examples/gemma3 python -m gemma3.model.inference --paper-benchmark --model-variant gemma3-1b --backend igpu --prompt-len 1024 --decode-tokens 16 --metric decode_tps --warmup-iters 1 --timed-iters 3 --power-sample --compare-paper --result-json /tmp/gemma3_1b_igpu_decode_1k_clean.json",
+  "compile_time_included": false,
+  "correctness": "PASS",
+  "decode_tokens": 16,
+  "delta_pct": 63.847247858730114,
+  "dirty_worktree": false,
+  "environment_comparable": true,
+  "execution_wiring": null,
+  "explanation": "local iGPU/HF ROCm measurement uses this Strix host and Transformers runtime; it is a baseline cell, not validated NPU paper parity",
+  "git_commit": "6b3b8b1fb51295e94f083ec2f31de3dae4f36559",
+  "host_fallbacks": [],
+  "local_value": 13.738045813682556,
+  "metric": "decode_tps",
+  "missing_environment_fields": [],
+  "model_runner": null,
+  "model_variant": "gemma3-1b",
+  "notes": [
+    "real igpu-hf-rocm measurement for the requested sequence length",
+    "decode_tps excludes prefill by constructing the KV cache before the timed decode loop",
+    "model load, device placement, tokenizer work, and input construction are outside the timed region",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1",
+    "iGPU/HF ROCm baseline uses local Transformers execution; it is not an NPU paper-parity claim",
+    "nearest_paper_value=38",
+    "raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges",
+    "xrt-smi is available, but direct NPU rail parsing reports N/A on this host",
+    "iGPU rail uses ROCm SMI socket graphics package power sampled during the timed window"
+  ],
+  "npu_power_mode": "Power Mode             : Default",
+  "paper_source": "arxiv_pdf_v2",
+  "paper_table": "prefill/decode text tables",
+  "paper_value": 38.0,
+  "power_aligned_with_timed_window": true,
+  "power_sampling_backend": "rapl-sysfs+turbostat+rocm-smi",
+  "power_status": {
+    "cpu": "MISSING_POWER_FIELD",
+    "gpu": "ROCM_SMI_SOCKET_GRAPHICS",
+    "npu": "MISSING_POWER_FIELD",
+    "total": "MISSING_POWER_FIELD"
+  },
+  "power_watts": {
+    "cpu": null,
+    "gpu": 42.87109090909091,
+    "npu": null,
+    "total": null
+  },
+  "real_benchmark": {
+    "backend": "igpu-hf-rocm",
+    "decode_tokens": 16,
+    "load_seconds": 2.4050240959622897,
+    "local_value": 13.738045813682556,
+    "logits_shape": [],
+    "mean_seconds": 1.1646489039994776,
+    "metric": "decode_tps",
+    "model_variant": "gemma3-1b",
+    "notes": [
+      "real igpu-hf-rocm measurement for the requested sequence length",
+      "decode_tps excludes prefill by constructing the KV cache before the timed decode loop",
+      "model load, device placement, tokenizer work, and input construction are outside the timed region",
+      "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1"
+    ],
+    "power_snapshot": {
+      "aligned_with_timed_window": true,
+      "field_status": {
+        "cpu": "MISSING_POWER_FIELD",
+        "gpu": "ROCM_SMI_SOCKET_GRAPHICS",
+        "npu": "MISSING_POWER_FIELD",
+        "total": "MISSING_POWER_FIELD"
+      },
+      "notes": [
+        "raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges",
+        "xrt-smi is available, but direct NPU rail parsing reports N/A on this host",
+        "iGPU rail uses ROCm SMI socket graphics package power sampled during the timed window"
+      ],
+      "run_id": "decode_tps_gemma3_1b_igpu_1024",
+      "sampling_backend": "rapl-sysfs+turbostat+rocm-smi",
+      "schema_version": 1,
+      "watts": {
+        "cpu": null,
+        "gpu": 42.87109090909091,
+        "npu": null,
+        "total": null
+      }
+    },
+    "prompt_token_count": 1024,
+    "status": "PASS",
+    "timed_iters": 3,
+    "unit": "tokens_per_second",
+    "warmup_iters": 1,
+    "weights_dir": "/home/cj/models/gemma-3-1b-pt"
+  },
+  "schema_version": 1,
+  "sequence_length": 1024,
+  "target_id": "decode_tps_gemma3_1b_igpu_1024",
+  "timed_iters": 3,
+  "unit": "tokens_per_second",
+  "warmup_iters": 1,
+  "xrt_version": "Version              : 2.21.75"
+}

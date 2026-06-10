@@ -1,0 +1,127 @@
+{
+  "argument_count": 18,
+  "blockers": [],
+  "command": [
+    "programming_examples/gemma3/gemma3/probes/stitched_decode.py",
+    "--run-ingress-hardware",
+    "--result-json",
+    "/tmp/gemma3_1b_stitched_decode_ingress_probe.json"
+  ],
+  "dense_projection_correlations": {
+    "k_proj": 0.9959222787224842,
+    "q_proj": 0.9945787697806695,
+    "v_proj": 0.995735778757087
+  },
+  "dirty_worktree": false,
+  "elapsed_seconds": 5.654307635035366,
+  "function_name": "gemma3_decode_ingress_rms_qkv_qknorm_rope",
+  "git_commit": "9c398ea35a52b4cc69c693b2cd24117fd8ac326c",
+  "launch_count": 8,
+  "layer_index": 0,
+  "model_variant": "gemma3-1b",
+  "output_correlations": [
+    {
+      "correlation": 0.999990967713172,
+      "name": "input_norm",
+      "shape": [
+        1,
+        1152
+      ]
+    },
+    {
+      "correlation": 0.9999900521980337,
+      "name": "activation",
+      "shape": [
+        5,
+        256
+      ]
+    },
+    {
+      "correlation": 0.9999687831098085,
+      "name": "q_proj",
+      "shape": [
+        32,
+        32
+      ]
+    },
+    {
+      "correlation": 0.999974032614375,
+      "name": "k_proj",
+      "shape": [
+        8,
+        32
+      ]
+    },
+    {
+      "correlation": 0.9999734023616154,
+      "name": "v_proj",
+      "shape": [
+        8,
+        32
+      ]
+    },
+    {
+      "correlation": 0.9999574892308033,
+      "name": "q_norm",
+      "shape": [
+        4,
+        256
+      ]
+    },
+    {
+      "correlation": 0.9999658620989771,
+      "name": "k_norm",
+      "shape": [
+        1,
+        256
+      ]
+    },
+    {
+      "correlation": 0.9999574892308033,
+      "name": "q_rope",
+      "shape": [
+        4,
+        256
+      ]
+    },
+    {
+      "correlation": 0.9999658620989771,
+      "name": "k_rope",
+      "shape": [
+        1,
+        256
+      ]
+    }
+  ],
+  "output_format": "elf",
+  "remaining_model_runner_gaps": [
+    "replace-staged-decode-ingress-with-stitched-elf",
+    "stitch-rest-of-decode-layer",
+    "prefill-produced-kv-cache-not-wired",
+    "logits-sampling-not-wired"
+  ],
+  "returncode": 0,
+  "schema_version": 1,
+  "sequence_kind": "decode-ingress-stitched",
+  "status": "STITCHED_INGRESS_PASS",
+  "stderr_tail": [],
+  "stdout_tail": [
+    "input_norm correlation: 0.999991",
+    "activation correlation: 0.999990",
+    "q_proj correlation: 0.999969",
+    "k_proj correlation: 0.999974",
+    "v_proj correlation: 0.999973",
+    "q_norm correlation: 0.999957",
+    "k_norm correlation: 0.999966",
+    "q_rope correlation: 0.999957",
+    "k_rope correlation: 0.999966"
+  ],
+  "threshold": 0.99,
+  "timed_kernel_count": 1,
+  "timed_kernel_seconds": 0.009280723985284567,
+  "timing_notes": [
+    "compile, ELF load, BO creation, BO writes, and argument binding occur before the timed run.start/wait2 window",
+    "single-ingress diagnostic timing is not a TTFT/TPS or paper-parity result"
+  ],
+  "timing_window": "single-stitched-elf-run-start-wait2-only-diagnostic"
+}

@@ -1,8 +1,0 @@
-# RUN: %PYTHON %S/gemma3_scaling.py | FileCheck %s
-# CHECK: scale:2x4 q4nx=l2-gather fused_dqp=direct flowqkv=direct flowkv=direct
-# CHECK: scale:4x4 q4nx=l2-gather fused_dqp=direct flowqkv=direct flowkv=direct
-# CHECK: scale:8x4 q4nx=l2-gather fused_dqp=l2-gather flowqkv=l2-gather flowkv=l2-gather
-# CHECK: unsupported:8x4:direct:q4nx class=hardware-resource-limit
-# CHECK: unsupported:8x4:packet-direct:q4nx class=packet-s2mm-backend-limitation
-# CHECK: unsupported:2x4:l2-gather:flowkv class=channel-runtime-scheduling-bug
-# CHECK: GEMMA3_SCALING_POLICY_SELF_TEST: PASS

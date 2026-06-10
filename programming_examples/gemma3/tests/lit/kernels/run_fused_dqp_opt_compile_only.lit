@@ -1,0 +1,9 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// REQUIRES: peano
+//
+// RUN: mkdir -p test_fused_dqp_opt_compile
+// RUN: cd test_fused_dqp_opt_compile
+// RUN: make -f %S/../../../Makefile clean PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR
+// RUN: make -f %S/../../../Makefile run-fused-dqp-opt PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR COMPILE_MODE=compile-only OUTPUT_FORMAT=elf

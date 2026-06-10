@@ -230,8 +230,8 @@ EXAMPLES = [
     },
     {
         "category": "LLM Kernels",
-        "name": "Gemma3 Dataflow Kernels",
-        "path": "gemma3_dataflow_kernels",
+        "name": "Gemma3",
+        "path": "gemma3",
         "datatypes": "int4, bf16",
     },
     {

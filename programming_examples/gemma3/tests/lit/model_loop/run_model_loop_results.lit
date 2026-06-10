@@ -1,0 +1,17 @@
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.evidence.results --self-test | FileCheck %s --check-prefix=SELF
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.model.inference --paper-benchmark --model-variant gemma3-1b --backend npu --weights-dir %t.missing --prompt-len 1024 --decode-tokens 128 --result-json %t.result.json --compare-paper | FileCheck %s --check-prefix=BENCH
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.evidence.paper_compare --compare %t.result.json --summary-md %t.summary.md --summary-csv %t.summary.csv | FileCheck %s --check-prefix=SUMMARY
+# RUN: %PYTHON -c "import json, pathlib; data=json.loads(pathlib.Path('%t.result.json').read_text()); assert data['target_id'] == 'decode_tps_gemma3_1b_npu_1024'; assert data['classification'] == 'MISSING_REAL_ARTIFACTS'; assert data['power_watts']['npu'] is None; assert data['execution_wiring'] is None; assert data['model_runner'] is None; assert data['host_fallbacks']; assert all(item['status'] == 'measured-host-fallback' for item in data['host_fallbacks']); assert all(item['measured'] for item in data['host_fallbacks']); assert all(item['elapsed_ms'] is not None for item in data['host_fallbacks']); print('RESULT_JSON_SCHEMA_OK')" | FileCheck %s --check-prefix=JSON
+# SELF: GEMMA3_PAPER_RESULT target=decode_tps_gemma3_1b_npu_1024 class=MISSING_REAL_ARTIFACTS
+# SELF: GEMMA3_EXECUTION_WIRING_RECORD: status=BLOCKED stages=52 blockers=model-kernel-launch-not-wired
+# SELF: GEMMA3_RESULT_JSON_SELF_TEST: PASS
+# BENCH: GEMMA3_PAPER_RESULT target=decode_tps_gemma3_1b_npu_1024 class=MISSING_REAL_ARTIFACTS correctness=BLOCKED_REAL_ARTIFACTS
+# BENCH: GEMMA3_PAPER_BENCHMARK_BLOCKED: missing_real_artifacts
+# BENCH: GEMMA3_RESULT_JSON:
+# BENCH: compare decode_tps_gemma3_1b_npu_1024
+# BENCH-SAME: class=LOCAL_FAIL
+# SUMMARY: compare decode_tps_gemma3_1b_npu_1024
+# SUMMARY-SAME: class=LOCAL_FAIL
+# SUMMARY: GEMMA3_COMPARE_SUMMARY_MD:
+# SUMMARY: GEMMA3_COMPARE_SUMMARY_CSV:
+# JSON: RESULT_JSON_SCHEMA_OK

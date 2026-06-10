@@ -1,0 +1,12 @@
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.npu.bo_plan --self-test | FileCheck %s
+# CHECK: bo_plan model=gemma3-1b status=READY_FOR_BO_ALLOCATION layers=2 prompt_len=1024 decode_context=2048
+# CHECK-SAME: kv_strategy=benchmark-cell
+# CHECK-SAME: kv_records=4
+# CHECK-SAME: static_bytes=36024320
+# CHECK-SAME: blockers=xrt-bo-allocation-not-wired
+# CHECK: bo name=static_projection_weights scope=model dtype=q4nx shape=36003840
+# CHECK-SAME: class=static
+# CHECK: bo name=static_norm_weights scope=model dtype=bf16 shape=10240 bytes=20480 class=static
+# CHECK: bo name=mlp_gate scope=layer dtype=bf16 shape=1024x6912
+# CHECK: bo name=kv_cache_k_L0 scope=layer dtype=bf16 shape=512x1x256
+# CHECK: GEMMA3_BO_PLAN_SELF_TEST: PASS

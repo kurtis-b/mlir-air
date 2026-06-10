@@ -1,0 +1,9 @@
+// RUN: rm -rf test_flowqkv_tiled_stats_compile
+// RUN: mkdir -p test_flowqkv_tiled_stats_compile
+// RUN: cd test_flowqkv_tiled_stats_compile
+// RUN: env PATH=%S/../../../../../build-xrt/bin:%S/../../../../../sandbox/bin:$PATH \
+// RUN:   PYTHONPATH=%S/../../..:%S/../../../../../build-xrt/python:%S/../../../../../sandbox/lib/python3.12/site-packages:%S/../../../../../sandbox/lib/python3.12/site-packages/mlir_aie/python:$PYTHONPATH \
+// RUN:   make -f %S/../../../Makefile run-flowqkv-tiled-stats PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR \
+// RUN:   COMPILE_MODE=compile-only OUTPUT_FORMAT=elf Q_CHUNK=4 KV_LEN=1024 KV_CHUNK=32 HEAD_DIM=256 FLOW_HERD_ROWS=1 FLOW_HERD_COLS=2 FLOWQKV_TILED_STATS_HOST_BATCH_TILES=2 | FileCheck %s
+
+// CHECK: GEMMA3_FLOWQKV_TILED_STATS_COMPILE_ONLY: PASS

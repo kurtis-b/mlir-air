@@ -1,0 +1,9 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// REQUIRES: peano
+//
+// RUN: mkdir -p test_gemma3_mm_compile
+// RUN: cd test_gemma3_mm_compile
+// RUN: make -f %S/../../../Makefile clean PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR
+// RUN: make -f %S/../../../Makefile run-mm PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR COMPILE_MODE=compile-only OUTPUT_FORMAT=elf MM_M=128 MM_K=256 MM_N=256

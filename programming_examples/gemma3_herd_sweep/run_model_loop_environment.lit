@@ -1,7 +1,0 @@
-# RUN: %PYTHON %S/gemma3_environment.py --self-test | FileCheck %s --check-prefix=SELF
-# RUN: %PYTHON %S/gemma3_environment.py | FileCheck %s --check-prefix=SUMMARY
-# RUN: %PYTHON %S/gemma3_environment.py --json | FileCheck %s --check-prefix=JSON
-# SELF: GEMMA3_ENV_CAPTURE_SELF_TEST: comparable=True missing=0
-# SUMMARY: GEMMA3_ENV_CAPTURE: comparable=True missing=0
-# JSON: "missing_paper_fields": []
-# JSON: "source": "{{PATH|repo-local}}"

@@ -1,0 +1,11 @@
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.evidence.report --self-test | FileCheck %s --check-prefix=SELF
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.model.inference --paper-benchmark --model-variant gemma3-1b --backend npu --weights-dir %t.missing --prompt-len 1024 --decode-tokens 128 --result-json %t.result.json | FileCheck %s --check-prefix=RESULT
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.evidence.report --result %t.result.json --output-md %t.report.md | FileCheck %s --check-prefix=REPORT
+# RUN: %PYTHON -c "import pathlib; text=pathlib.Path('%t.report.md').read_text(); assert 'Overall status: `DOES_NOT_MATCH_PAPER`' in text; assert 'decode_tps_gemma3_1b_npu_1024' in text; assert 'Source Conflicts' in text; assert 'Unsupported And Diagnostic Modes' in text; print('REPORT_MD_SCHEMA_OK')" | FileCheck %s --check-prefix=MD
+# SELF: GEMMA3_REPORT_STATUS: DOES_NOT_MATCH_PAPER
+# SELF: GEMMA3_REPORT_MISSING_LOCAL_RESULT: present
+# SELF: GEMMA3_REPORT_SELF_TEST: PASS
+# RESULT: GEMMA3_RESULT_JSON:
+# REPORT: GEMMA3_REPORT_MD:
+# REPORT: GEMMA3_REPORT_STATUS: DOES_NOT_MATCH_PAPER
+# MD: REPORT_MD_SCHEMA_OK

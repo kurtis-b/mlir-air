@@ -1,0 +1,87 @@
+{
+  "argument_binding": {
+    "argument_count": 3,
+    "argument_directions": [
+      "input",
+      "static",
+      "output"
+    ],
+    "argument_keys": [
+      "layer_input",
+      "static_norm_weights",
+      "prefill_L0_pre_attention_norm"
+    ],
+    "argument_shapes": [
+      "1024x1152",
+      "133120",
+      "1024x1152"
+    ],
+    "argument_storage": [
+      "persistent-bo",
+      "persistent-bo",
+      "virtual-buffer"
+    ],
+    "blockers": [],
+    "static_norm_bo_bytes": 266240,
+    "static_norm_tensor_bytes": 2304,
+    "static_norm_tensor_key": "model.layers.0.input_layernorm.weight",
+    "static_norm_tensor_offset_bytes": 0,
+    "status": "ARGUMENT_BINDING_VALIDATED"
+  },
+  "blockers": [],
+  "bo_binding_mode": "runner-owned-persistent-bo",
+  "command": [
+    "/home/cj/iron/ironenv/bin/python3",
+    "/home/cj/mlir-air/programming_examples/gemma3/gemma3/probes/launch.py",
+    "--_model-rmsnorm-worker",
+    "--model-variant",
+    "gemma3-1b",
+    "--weights-dir",
+    "/home/cj/models/gemma-3-1b-pt",
+    "--m",
+    "1024",
+    "--n",
+    "1152",
+    "--herd-x",
+    "1",
+    "--output-format",
+    "elf",
+    "--tensor-key",
+    "model.layers.0.input_layernorm.weight",
+    "--use-full-static-norm-bo",
+    "--use-runner-owned-bos"
+  ],
+  "correlation": 0.999983,
+  "dirty_worktree": false,
+  "elapsed_seconds": 2.2334101190208457,
+  "git_commit": "717e428af989f8f4bb76f999cdd82a09936026ac",
+  "herd_x": 1,
+  "input_distribution": "bounded-uniform-seed0",
+  "kernel": "rms_norm",
+  "layer_index": 0,
+  "model_variant": "gemma3-1b",
+  "output_format": "elf",
+  "phase": "prefill",
+  "probe_kind": "model-rmsnorm",
+  "remaining_model_runner_gaps": [
+    "substep-sequence-not-wired",
+    "full-layer-not-wired"
+  ],
+  "returncode": 0,
+  "role": "pre_attention_norm",
+  "route": "weighted_rms_norm/standalone-elf-smoke",
+  "schema_version": 1,
+  "shape": [
+    1024,
+    1152
+  ],
+  "status": "FIRST_KERNEL_LAUNCH_PASS",
+  "stderr_tail": [],
+  "stdout_tail": [
+    "XRTBackend: llvm-aie package detected via PEANO_INSTALL_DIR: /home/cj/mlir-air/sandbox/lib/python3.12/site-packages/llvm-aie",
+    "Output 0 correlation: 0.999983 (threshold: 0.99)",
+    "PASS!"
+  ],
+  "tensor_key": "model.layers.0.input_layernorm.weight",
+  "threshold": 0.99
+}

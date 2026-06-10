@@ -1,0 +1,19 @@
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.evidence.nonlinears | FileCheck %s
+# CHECK: nonlinear rms_norm status=standalone-npu-reuse-candidate
+# CHECK-SAME: cpu_ref=gemma3_reference.rms_norm
+# CHECK-SAME: hardware=hardware-smoke-pass-M8-N1152-N2560-elf
+# CHECK: nonlinear qk_norm status=standalone-npu-reuse-candidate
+# CHECK-SAME: cpu_ref=gemma3_reference.qk_norm
+# CHECK-SAME: hardware=hardware-smoke-pass-M32-N256-elf
+# CHECK: nonlinear rope status=standalone-npu-reuse-candidate
+# CHECK-SAME: compile_lit=programming_examples/gemma3/tests/lit/kernels/run_rope_halfsplit_compile_only.lit
+# CHECK-SAME: hardware=hardware-smoke-pass-rows4-head256-elf
+# CHECK: nonlinear mlp_activation status=standalone-npu-reuse-candidate
+# CHECK-SAME: hardware=hardware-smoke-pass-n6912-tile288-elf
+# CHECK-SAME: tolerance=rtol=1e-1 atol=5e-2 hardware-smoke
+# CHECK: nonlinear residual_add status=standalone-npu-reuse-candidate
+# CHECK-SAME: hardware=hardware-smoke-pass-n1152-tile288-elf
+# CHECK-SAME: timed_window=unmeasured-host-fallback
+# CHECK: nonlinear_paper_gate=PAPER_MATCH_BLOCKED unresolved=5
+# CHECK: nonlinear_blocker operation=rms_norm timed_window=unmeasured-host-fallback
+# CHECK: GEMMA3_NONLINEAR_REGISTRY_SELF_TEST: PASS

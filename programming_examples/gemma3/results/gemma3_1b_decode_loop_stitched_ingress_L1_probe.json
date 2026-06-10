@@ -1,0 +1,267 @@
+{
+  "attention_cache_contract": "single-current-token-kv",
+  "attention_host_batch_count": null,
+  "attention_host_batch_tiles": null,
+  "attention_host_reduction": false,
+  "attention_kv_tile": null,
+  "attention_mode": "single-token",
+  "blockers": [],
+  "command": [
+    "programming_examples/gemma3/gemma3/probes/decode_loop.py",
+    "--run-hardware",
+    "--weights-dir",
+    "/home/cj/models/gemma-3-1b-pt",
+    "--layers",
+    "1",
+    "--decode-tokens",
+    "1",
+    "--warmup-layers",
+    "1",
+    "--ingress-mode",
+    "stitched",
+    "--attention-mode",
+    "single-token",
+    "--power-sample",
+    "--result-json",
+    "programming_examples/gemma3/results/gemma3_1b_decode_loop_stitched_ingress_L1_probe.json"
+  ],
+  "decode_tokens": 1,
+  "diagnostic_decode_tps_kernel_only": 6.820013115680942,
+  "diagnostic_decode_tps_loop_wall": 4.681005244190259,
+  "dirty_worktree": false,
+  "elapsed_seconds": 12.033679832999951,
+  "git_commit": "8dfc8524cc0ed0705c6123f4bc7b614ba3120572",
+  "host_fallbacks": [],
+  "ingress_mode": "stitched",
+  "input_distribution": "bounded-uniform-seed0",
+  "input_shape": [
+    1,
+    1152
+  ],
+  "kernel_only_delta_pct_vs_paper_decode_tps_1k": 83.4062941224308,
+  "layer_count": 1,
+  "layer_evidence": [
+    {
+      "final_output_correlation": 0.9999670337466902,
+      "layer_index": 0,
+      "norm_tensor_key": "model.layers.0.input_layernorm.weight",
+      "projection_evidence": [
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "q_proj",
+          "padded_shape": [
+            1024,
+            1280
+          ],
+          "projection_correlation": 0.9999714420140488,
+          "row_blocks": 32,
+          "shape": [
+            1024,
+            1152
+          ],
+          "tensor_key": "model.layers.0.self_attn.q_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "k_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999773571021656,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.0.self_attn.k_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "v_proj",
+          "padded_shape": [
+            256,
+            1280
+          ],
+          "projection_correlation": 0.9999779718608028,
+          "row_blocks": 8,
+          "shape": [
+            256,
+            1152
+          ],
+          "tensor_key": "model.layers.0.self_attn.v_proj.weight"
+        },
+        {
+          "col_blocks": 4,
+          "dense_projection_correlation": null,
+          "family": "o_proj",
+          "padded_shape": [
+            1280,
+            1024
+          ],
+          "projection_correlation": 1.0,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            1024
+          ],
+          "tensor_key": "model.layers.0.self_attn.o_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "gate_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999999999999999,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.0.mlp.gate_proj.weight"
+        },
+        {
+          "col_blocks": 5,
+          "dense_projection_correlation": null,
+          "family": "up_proj",
+          "padded_shape": [
+            6912,
+            1280
+          ],
+          "projection_correlation": 0.9999999975248935,
+          "row_blocks": 216,
+          "shape": [
+            6912,
+            1152
+          ],
+          "tensor_key": "model.layers.0.mlp.up_proj.weight"
+        },
+        {
+          "col_blocks": 27,
+          "dense_projection_correlation": null,
+          "family": "down_proj",
+          "padded_shape": [
+            1280,
+            6912
+          ],
+          "projection_correlation": 1.0,
+          "row_blocks": 40,
+          "shape": [
+            1152,
+            6912
+          ],
+          "tensor_key": "model.layers.0.mlp.down_proj.weight"
+        }
+      ],
+      "rms_correlation": 0.9999908310898628,
+      "static_norm_argument_bytes": 2304,
+      "static_norm_tensor_offset_bytes": 0,
+      "timed_kernel_count": 0,
+      "timed_kernel_seconds": 0.0
+    }
+  ],
+  "loop_wall_delta_pct_vs_paper_decode_tps_1k": 88.61069283652004,
+  "measured_loop_seconds": 0.21362932700003512,
+  "model_variant": "gemma3-1b",
+  "norm_argument_mode": "selected-vector",
+  "output_format": "elf",
+  "output_shape": [
+    1,
+    1152
+  ],
+  "paper_decode_tps_1k": 41.1,
+  "phase": "decode",
+  "power_snapshot": {
+    "aligned_with_timed_window": true,
+    "field_status": {
+      "cpu": "MISSING_POWER_FIELD",
+      "gpu": "MISSING_POWER_FIELD",
+      "npu": "PSEUDO_RAPL_SYSFS_DELTA",
+      "total": "RAPL_SYSFS_PACKAGE"
+    },
+    "notes": [
+      "raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges",
+      "xrt-smi is available, but direct NPU rail parsing reports N/A on this host",
+      "NPU rail is pseudo power: average package watts during timed window minus quiescent package watts before the run",
+      "quiescent_pkg_watts=6.896460",
+      "package watts use direct RAPL sysfs energy_uj delta over the timed window"
+    ],
+    "run_id": "gemma3_1b_decode_loop_probe",
+    "sampling_backend": "rapl-sysfs+turbostat+rocm-smi",
+    "schema_version": 1,
+    "watts": {
+      "cpu": null,
+      "gpu": null,
+      "npu": 3.8955226943967336,
+      "total": 10.791982694396733
+    }
+  },
+  "prompt_context_length": 1024,
+  "reference_check_layer_count": 1,
+  "reference_check_mode": "all-layers-before-timing",
+  "reference_check_seconds": 0.2795314539998799,
+  "remaining_paper_gaps": [
+    "prefill-kv-cache-not-constructed",
+    "paper-1k-kv-attention-not-wired",
+    "logits-sampling-not-wired",
+    "decode-layer-after-stitched-ingress-still-staged",
+    "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
+  ],
+  "returncode": 0,
+  "runner_reuse_mode": "reused-elf-persistent-bo",
+  "schema_version": 2,
+  "segmented_kernel_power_snapshot": {
+    "aligned_with_timed_window": true,
+    "field_status": {
+      "cpu": "MISSING_POWER_FIELD",
+      "gpu": "MISSING_POWER_FIELD",
+      "npu": "PSEUDO_RAPL_SYSFS_DELTA_SEGMENTED",
+      "total": "RAPL_SYSFS_PACKAGE_SEGMENTED"
+    },
+    "notes": [
+      "quiescent_pkg_watts=32.778000",
+      "package watts use direct RAPL sysfs energy_uj deltas summed over NPU run.start/wait2 segments",
+      "NPU rail is pseudo power: segmented package watts minus quiescent package watts before the run"
+    ],
+    "run_id": "gemma3_1b_decode_loop_probe_kernel_segments",
+    "sampling_backend": "rapl-sysfs+segmented",
+    "schema_version": 1,
+    "segmented_elapsed_seconds": 0.14662728400048763,
+    "segmented_energy_delta_uj": 1526167,
+    "watts": {
+      "cpu": null,
+      "gpu": null,
+      "npu": 0.0,
+      "total": 10.408478956719437
+    }
+  },
+  "sequence_kind": "decode-loop-staged-full-1b",
+  "static_ingress_bo_set_count": 1,
+  "static_projection_argument_mode": "preloaded-runner-bo-set",
+  "static_projection_bo_set_count": 41,
+  "status": "DECODE_LOOP_DIAGNOSTIC_PASS",
+  "stderr_tail": [],
+  "stdout_tail": [
+    "decode token 0: final checksum=-382.682861"
+  ],
+  "timed_kernel_count": 49,
+  "timed_kernel_mean_seconds": 0.0029923935510303597,
+  "timed_kernel_seconds": 0.14662728400048763,
+  "timing_notes": [
+    "warmup layers compile/load ELF runners and allocate runner-owned BOs before measured loop timing",
+    "preloaded-runner-bo-set mode allocates BO sets and writes packed projection static inputs before measured loop timing",
+    "stitched ingress mode preloads one aliased RMSNorm/QKV/QK-norm/RoPE BO set per layer before measured loop timing",
+    "reference_check_seconds validates all layers before measured loop timing and is excluded from measured_loop_seconds",
+    "measured_loop_seconds starts after warmup/reference checks and includes current implementation dynamic BO writes and output sync/readback",
+    "timed_kernel_seconds sums only pyxrt run.start()/wait2() calls and excludes compile, ELF load, BO allocation, BO writes, sync/readback, and CPU reference/correlation checks",
+    "attention is the staged single-token FlowQKV NPU path, not paper 1k KV-cache attention",
+    "logits and sampling are not wired, so this is a diagnostic decode-loop throughput, not an official paper decode TPS cell"
+  ],
+  "timing_window": "post-warmup-loop-wall-and-segmented-run-start-wait2"
+}

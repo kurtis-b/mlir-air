@@ -1,0 +1,8 @@
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.evidence.power --self-test | FileCheck %s --check-prefix=SELF
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.evidence.power --sample --json | FileCheck %s --check-prefix=JSON
+# SELF: GEMMA3_POWER_SNAPSHOT backend=
+# SELF-SAME: cpu=MISSING_POWER_FIELD,gpu=MISSING_POWER_FIELD,npu=MISSING_POWER_FIELD,total=MISSING_POWER_FIELD
+# SELF: GEMMA3_POWER_CONTRACT_SELF_TEST: PASS
+# JSON: "cpu": "MISSING_POWER_FIELD"
+# JSON: "npu": "MISSING_POWER_FIELD"
+# JSON: "total": null

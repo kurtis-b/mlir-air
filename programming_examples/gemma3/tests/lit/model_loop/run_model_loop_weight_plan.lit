@@ -1,0 +1,10 @@
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.npu.weight_plan --self-test | FileCheck %s
+# CHECK: weight_plan model=gemma3-1b scope=text status=READY_FOR_STATIC_BO_PRELOAD layers=2 tensors=14
+# CHECK-SAME: blockers=none
+# CHECK: weight_family q_proj tensors=2
+# CHECK-SAME: padded_tensors=2
+# CHECK: weight_family down_proj tensors=2
+# CHECK-SAME: padded_tensors=0
+# CHECK: weight L0 family=q_proj shape=1024x1152 padded=1024x1280
+# CHECK-SAME: padding=True
+# CHECK: GEMMA3_WEIGHT_PLAN_SELF_TEST: PASS

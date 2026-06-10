@@ -1,0 +1,7 @@
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.evidence.environment --self-test | FileCheck %s --check-prefix=SELF
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.evidence.environment | FileCheck %s --check-prefix=SUMMARY
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.evidence.environment --json | FileCheck %s --check-prefix=JSON
+# SELF: GEMMA3_ENV_CAPTURE_SELF_TEST: comparable=True missing=0
+# SUMMARY: GEMMA3_ENV_CAPTURE: comparable=True missing=0
+# JSON: "missing_paper_fields": []
+# JSON: "source": "{{PATH|repo-local}}"

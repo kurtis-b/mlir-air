@@ -1,6 +1,0 @@
-# RUN: %PYTHON %S/gemma3_norm_weight_plan.py --self-test | FileCheck %s
-# CHECK: norm_weight_plan model=gemma3-1b status=READY_FOR_NORM_WEIGHT_PRELOAD layers=2 tensors=12 bo_bytes=20480 blockers=none
-# CHECK: norm_weight_family input_layernorm tensors=2 bo_bytes=4608
-# CHECK: norm_weight_family q_norm tensors=2 bo_bytes=1024
-# CHECK: norm_weight L0 family=q_norm shape=256 bo_bytes=512
-# CHECK: GEMMA3_NORM_WEIGHT_PLAN_SELF_TEST: PASS

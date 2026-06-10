@@ -1,0 +1,11 @@
+// (c) Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// REQUIRES: peano
+//
+// RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.kernels.rope_halfsplit --self-test | FileCheck %s --check-prefix=SELF
+// RUN: mkdir -p test_rope_halfsplit_compile
+// RUN: cd test_rope_halfsplit_compile
+// RUN: env PATH=%S/../../../../../build-xrt/bin:%S/../../../../../sandbox/bin:$PATH PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.kernels.rope_halfsplit --compile-mode compile-only --output-format elf --rows 4 --head-dim 256 --herd-x 4 | FileCheck %s --check-prefix=COMPILE
+// SELF: GEMMA3_ROPE_HALFSPLIT_REFERENCE_SELF_TEST: PASS
+// COMPILE: GEMMA3_ROPE_HALFSPLIT_COMPILE_ONLY: PASS

@@ -1,0 +1,32 @@
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.core.artifacts --self-test | FileCheck %s --check-prefix=SELF
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.core.artifacts --q4nx-roundtrip-self-test | FileCheck %s --check-prefix=Q4NX
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.core.artifacts --model-variant gemma3-4b --prompt-len 131072 | FileCheck %s --check-prefix=PROMPT
+# RUN: env GEMMA3_MODEL_ROOT=%t.no_models PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.core.artifacts --model-variant gemma3-1b --discover | FileCheck %s --check-prefix=DISCOVER
+# RUN: env GEMMA3_MODEL_ROOT=%t.no_models PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.core.artifacts --model-variant gemma3-1b --manifest | FileCheck %s --check-prefix=MANIFEST
+# RUN: env GEMMA3_MODEL_ROOT=%t.no_models PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.core.artifacts --model-variant gemma3-4b-vision --manifest | FileCheck %s --check-prefix=VISION-MANIFEST
+# RUN: rm -rf %t.gemma3_fake
+# RUN: mkdir -p %t.gemma3_fake
+# RUN: touch %t.gemma3_fake/model.safetensors %t.gemma3_fake/config.json %t.gemma3_fake/tokenizer.json
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.core.artifacts --model-variant gemma3-1b --weights-dir %t.gemma3_fake --manifest | FileCheck %s --check-prefix=FAKE
+# RUN: %PYTHON -c "import json, pathlib; pathlib.Path('%t.gemma3_fake/config.json').write_text(json.dumps({'model_type':'gemma3_text','hidden_size':1152,'num_hidden_layers':26,'vocab_size':262144}))"
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.core.artifacts --model-variant gemma3-1b --weights-dir %t.gemma3_fake --config-summary | FileCheck %s --check-prefix=CONFIG
+# RUN: not env PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.core.artifacts --model-variant gemma3-1b --weights-dir %t.missing --strict-load | FileCheck %s --check-prefix=BLOCKED
+# SELF: model gemma3-1b vision=False
+# SELF: model gemma3-4b vision=False
+# SELF: model gemma3-4b-vision vision=True
+# SELF: GEMMA3_ARTIFACT_CONTRACT_SELF_TEST: PASS
+# Q4NX: q4nx_roundtrip_self_test sample=32x256
+# Q4NX: GEMMA3_Q4NX_ROUNDTRIP_SELF_TEST: PASS
+# PROMPT: GEMMA3_PROMPT_IDS: model=gemma3-4b len=131072
+# DISCOVER: "source_repo": "google/gemma-3-1b-pt"
+# DISCOVER: "tokenizer_exists": false
+# MANIFEST: "source_repo": "google/gemma-3-1b-pt"
+# MANIFEST: "validation_status": "BLOCKED"
+# VISION-MANIFEST: "missing-processor"
+# VISION-MANIFEST: "has_vision": true
+# FAKE: "config_path":
+# FAKE: "safetensors":
+# FAKE: "tokenizer_path":
+# CONFIG: "hidden_size": 1152
+# CONFIG: "num_hidden_layers": 26
+# BLOCKED: GEMMA3_ARTIFACT_LOAD_BLOCKED: real Gemma3 artifact loading is blocked

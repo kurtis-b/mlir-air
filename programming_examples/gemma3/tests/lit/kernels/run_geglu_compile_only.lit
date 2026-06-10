@@ -1,0 +1,11 @@
+// (c) Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// REQUIRES: peano
+//
+// RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.kernels.geglu --self-test | FileCheck %s --check-prefix=SELF
+// RUN: mkdir -p test_geglu_compile
+// RUN: cd test_geglu_compile
+// RUN: env PATH=%S/../../../../../build-xrt/bin:%S/../../../../../sandbox/bin:$PATH PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.kernels.geglu --compile-mode compile-only --output-format elf --n 1024 --tile-n 256 | FileCheck %s --check-prefix=COMPILE
+// SELF: GEMMA3_GEGLU_REFERENCE_SELF_TEST: PASS
+// COMPILE: GEMMA3_GEGLU_COMPILE_ONLY: PASS

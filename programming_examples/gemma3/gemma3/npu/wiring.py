@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026, Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+"""Gemma3 real-model NPU execution wiring manifest.
+
+This module does not execute kernels. It turns the real-shape preflight data
+into an explicit per-layer stage contract so the model runner can be wired
+incrementally without hiding host fallbacks or paper-parity blockers.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, dataclass
+import json
+from pathlib import Path
+
+from gemma3.core.artifacts import MODEL_SPECS
+from gemma3.probes.decode_loop import (
+    has_decode_loop_hf_prefill_tiled_stats_evidence,
+    has_decode_loop_hf_prefill_tiled_stats_host_logits_evidence,
+    has_decode_loop_hf_prefill_tiled_stats_timed_host_logits_evidence,
+    has_decode_loop_tiled_stats_evidence,
+)
+from gemma3.probes.full_layer import (
+    has_decode_full_layer_evidence,
+    has_decode_full_layer_without_host_fallback_evidence,
+)
+from gemma3.probes.kernel_parity import kernel_parity_targets
+from gemma3.probes.launch import has_runner_owned_first_kernel_launch_evidence
+from gemma3.evidence.nonlinears import nonlinear_registry
+from gemma3.npu.preflight import Gemma3NPUPreflightPlan, ProjectionPlan, build_preflight_plan
+from gemma3.probes.qkv_substep import has_decode_qkv_substep_evidence
+from gemma3.npu.static_preload import has_full_xrt_preload_evidence
+from gemma3.probes.substep import has_decode_q_projection_substep_evidence
+from gemma3.npu.xrt_runner import has_paper_shape_bo_allocation_evidence
+
+
+MODEL_KERNEL_LAUNCH_BLOCKER = "model-kernel-launch-not-wired"
+MODEL_SUBSTEP_SEQUENCE_BLOCKER = "model-substep-sequence-not-wired"
+MODEL_FULL_QKV_SUBSTEP_BLOCKER = "model-full-qkv-substep-not-wired"
+MODEL_FULL_LAYER_BLOCKER = "model-full-layer-not-wired"
+MODEL_FULL_1B_LOOP_BLOCKER = "full-1b-loop-not-wired"
+PREFILL_1K_NPU_BLOCKER = "prefill-1k-npu-not-wired"
+PREFILL_PRODUCED_KV_CACHE_BLOCKER = "prefill-produced-kv-cache-not-wired"
+NPU_PREFILL_KV_CACHE_BLOCKER = "npu-prefill-kv-cache-not-wired"
+NPU_ATTENTION_REDUCTION_BLOCKER = "npu-attention-reduction-not-wired"
+LOGITS_SAMPLING_BLOCKER = "logits-sampling-not-wired"
+LOGITS_SAMPLING_HOST_DIAGNOSTIC_BLOCKER = "logits-sampling-host-diagnostic-only"
+PRODUCTION_STATIC_BO_BLOCKER = "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
+
+
+TEXT_STAGE_TEMPLATE = (
+    ("prefill", "pre_attention_norm", "host-fallback", "rms_norm", "input_layernorm before self-attention"),
+    ("prefill", "qkv_projection", "npu-candidate", "q4nx+bf16_mm", "Q4NX dequant plus BF16 MM"),
+    ("prefill", "rope", "host-fallback", "rope", "Gemma half-split RoPE standalone smoke candidate"),
+    ("prefill", "qk_norm", "host-fallback", "qk_norm", "weighted_rms_norm per-head candidate"),
+    ("prefill", "kv_cache_append", "host-runtime", "host", "append K/V tensors after projection"),
+    ("prefill", "attention", "npu-candidate", "flowqkv", "causal local/global FlowQKV"),
+    ("prefill", "output_projection", "npu-candidate", "q4nx+bf16_mm", "Q4NX dequant plus BF16 MM"),
+    ("prefill", "post_attention_norm", "host-fallback", "rms_norm", "post_attention_layernorm before attention residual"),
+    ("prefill", "attention_residual", "host-fallback", "residual_add", "residual add after attention"),
+    ("prefill", "pre_feedforward_norm", "host-fallback", "rms_norm", "pre_feedforward_layernorm before MLP"),
+    ("prefill", "mlp_gate_up_projection", "npu-candidate", "q4nx+bf16_mm", "Q4NX dequant plus BF16 MM"),
+    ("prefill", "mlp_activation", "host-fallback", "mlp_activation", "standalone GeGLU hardware-smoke candidate"),
+    ("prefill", "mlp_down_projection", "npu-candidate", "q4nx+bf16_mm", "Q4NX dequant plus BF16 MM"),
+    ("prefill", "post_feedforward_norm", "host-fallback", "rms_norm", "post_feedforward_layernorm before MLP residual"),
+    ("prefill", "mlp_residual", "host-fallback", "residual_add", "residual add after MLP"),
+    ("decode", "pre_attention_norm", "host-fallback", "rms_norm", "input_layernorm before self-attention"),
+    ("decode", "qkv_projection", "npu-candidate", "fused_dqp", "FusedDQP decode projection"),
+    ("decode", "rope", "host-fallback", "rope", "Gemma half-split RoPE standalone smoke candidate"),
+    ("decode", "qk_norm", "host-fallback", "qk_norm", "weighted_rms_norm per-head candidate"),
+    ("decode", "kv_cache_append", "host-runtime", "host", "append one K/V entry"),
+    ("decode", "attention", "npu-candidate", "flowkv", "Q_CHUNK=1 FlowKV"),
+    ("decode", "output_projection", "npu-candidate", "fused_dqp", "FusedDQP decode projection"),
+    ("decode", "post_attention_norm", "host-fallback", "rms_norm", "post_attention_layernorm before attention residual"),
+    ("decode", "attention_residual", "host-fallback", "residual_add", "residual add after attention"),
+    ("decode", "pre_feedforward_norm", "host-fallback", "rms_norm", "pre_feedforward_layernorm before MLP"),
+    ("decode", "mlp_gate_up_projection", "npu-candidate", "fused_dqp", "FusedDQP decode projection"),
+    ("decode", "mlp_activation", "host-fallback", "mlp_activation", "standalone GeGLU hardware-smoke candidate"),
+    ("decode", "mlp_down_projection", "npu-candidate", "fused_dqp", "FusedDQP decode projection"),
+    ("decode", "post_feedforward_norm", "host-fallback", "rms_norm", "post_feedforward_layernorm before MLP residual"),
+    ("decode", "mlp_residual", "host-fallback", "residual_add", "residual add after MLP"),
+)
+
+
+@dataclass(frozen=True)
+class Gemma3NPUStage:
+    phase: str
+    layer_index: int
+    stage_index: int
+    role: str
+    backend: str
+    kernel: str
+    route: str
+    attention_kind: str
+    window_len: int
+    tensor_contract: str
+    status: str
+    blockers: tuple[str, ...]
+
+    def format(self) -> str:
+        blockers = ",".join(self.blockers) if self.blockers else "none"
+        return (
+            f"stage {self.phase}:L{self.layer_index}:{self.stage_index}:{self.role} "
+            f"backend={self.backend} kernel={self.kernel} route={self.route} "
+            f"attention={self.attention_kind} window={self.window_len} "
+            f"status={self.status} blockers={blockers}"
+        )
+
+
+@dataclass(frozen=True)
+class Gemma3NPUWiringPlan:
+    model_variant: str
+    status: str
+    layers: int
+    hidden_size: int
+    head_dim: int
+    attention_pattern: str
+    stage_count: int
+    npu_candidate_count: int
+    host_fallback_count: int
+    host_runtime_count: int
+    blockers: tuple[str, ...]
+    stages: tuple[Gemma3NPUStage, ...]
+
+    def format(self, *, include_stages: bool = False) -> str:
+        blockers = ",".join(self.blockers) if self.blockers else "none"
+        lines = [
+            f"npu_wiring model={self.model_variant} status={self.status} "
+            f"layers={self.layers} hidden={self.hidden_size} head_dim={self.head_dim} "
+            f"stages={self.stage_count} npu_candidates={self.npu_candidate_count} "
+            f"host_fallbacks={self.host_fallback_count} host_runtime={self.host_runtime_count} "
+            f"pattern={self.attention_pattern} blockers={blockers}"
+        ]
+        if include_stages:
+            lines.extend(stage.format() for stage in self.stages)
+        return "\n".join(lines)
+
+    def to_json_dict(self) -> dict[str, object]:
+        data = asdict(self)
+        data["stages"] = [asdict(stage) for stage in self.stages]
+        return data
+
+
+def _kernel_route_lookup() -> dict[str, str]:
+    route = {}
+    preferred = {
+        "q4nx": "q4nx_smoke_8x4",
+        "bf16_mm": "bf16_mm_8x4",
+        "flowqkv": "flowqkv_paper",
+        "flowkv": "flowkv_paper",
+        "fused_dqp": "fused_dqp_paper",
+    }
+    for target in kernel_parity_targets():
+        for kernel, name in preferred.items():
+            if target.name == name:
+                route[kernel] = f"{target.herd_shape}/{target.output_mode}/{target.schedule_mode}"
+    return route
+
+
+def _nonlinear_status_lookup() -> dict[str, str]:
+    return {spec.operation: spec.hardware_status for spec in nonlinear_registry()}
+
+
+def _attention_kind(layer_index: int) -> str:
+    return "global_full" if layer_index % 6 == 5 else "local_swa"
+
+
+def _stage_route(kernel: str, routes: dict[str, str]) -> str:
+    if "+" in kernel:
+        pieces = [_stage_route(piece, routes) for piece in kernel.split("+")]
+        return "+".join(pieces)
+    if kernel == "mlp_activation":
+        return "geglu/standalone-elf-smoke"
+    if kernel in ("rms_norm", "qk_norm"):
+        return "weighted_rms_norm/standalone-elf-smoke"
+    if kernel == "rope":
+        return "rope_halfsplit/standalone-elf-smoke"
+    if kernel == "residual_add":
+        return "residual_add/standalone-elf-smoke"
+    return routes.get(kernel, "host")
+
+
+def _stage_backend(
+    backend: str,
+    kernel: str,
+    nonlinear_status: dict[str, str],
+    preflight: Gemma3NPUPreflightPlan,
+) -> str:
+    if backend != "host-fallback":
+        return backend
+    if kernel == "mlp_activation" and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass"):
+        return "npu-candidate"
+    if kernel == "qk_norm" and int(preflight.head_dim or 0) == 256 and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass"):
+        return "npu-candidate"
+    if kernel == "rope" and int(preflight.head_dim or 0) == 256 and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass"):
+        return "npu-candidate"
+    if (
+        kernel == "rms_norm"
+        and int(preflight.hidden_size or 0) in (1152, 2560)
+        and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass")
+    ):
+        return "npu-candidate"
+    if (
+        kernel == "residual_add"
+        and int(preflight.hidden_size or 0) in (1152, 2560)
+        and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass")
+    ):
+        return "npu-candidate"
+    return backend
+
+
+def _stage_status(
+    backend: str,
+    kernel: str,
+    nonlinear_status: dict[str, str],
+    *,
+    first_kernel_stage_validated: bool = False,
+) -> tuple[str, tuple[str, ...]]:
+    launch_blockers = (MODEL_KERNEL_LAUNCH_BLOCKER, "paper-shape-hardware-rerun-required")
+    if backend == "npu-candidate":
+        if first_kernel_stage_validated:
+            return "runner-owned-first-kernel-launch-pass", ()
+        if (
+            kernel in ("mlp_activation", "rms_norm", "qk_norm", "rope", "residual_add")
+            and nonlinear_status.get(kernel, "").startswith("hardware-smoke-pass")
+        ):
+            return "standalone-hardware-smoke-model-candidate", launch_blockers
+        return "candidate-only", launch_blockers
+    if backend == "host-runtime":
+        return "host-runtime-contract", ()
+    if kernel in nonlinear_status and nonlinear_status[kernel].startswith("hardware-smoke-pass"):
+        return "standalone-hardware-smoke-host-fallback", ("model-stage-not-promoted",)
+    return "host-fallback", ("model-stage-not-promoted",)
+
+
+def build_wiring_plan_from_preflight(
+    preflight: Gemma3NPUPreflightPlan,
+    *,
+    use_static_preload_evidence: bool = False,
+    use_bo_allocation_evidence: bool = False,
+    use_first_kernel_launch_evidence: bool = False,
+    use_decode_q_projection_substep_evidence: bool = False,
+    use_decode_qkv_substep_evidence: bool = False,
+    use_decode_full_layer_evidence: bool = False,
+    use_decode_loop_tiled_stats_evidence: bool = False,
+) -> Gemma3NPUWiringPlan:
+    if preflight.layers is None or preflight.hidden_size is None or preflight.head_dim is None:
+        raise ValueError("preflight plan must include layer count, hidden size, and head dim")
+    routes = _kernel_route_lookup()
+    nonlinear_status = _nonlinear_status_lookup()
+    first_kernel_launch_validated = (
+        use_first_kernel_launch_evidence
+        and has_runner_owned_first_kernel_launch_evidence(preflight.model_variant)
+    )
+    decode_q_projection_substep_validated = (
+        use_decode_q_projection_substep_evidence
+        and has_decode_q_projection_substep_evidence(preflight.model_variant)
+    )
+    decode_qkv_substep_validated = (
+        use_decode_qkv_substep_evidence
+        and has_decode_qkv_substep_evidence(preflight.model_variant)
+    )
+    decode_full_layer_validated = (
+        use_decode_full_layer_evidence
+        and has_decode_full_layer_evidence(preflight.model_variant)
+    )
+    decode_full_layer_without_host_fallbacks = (
+        use_decode_full_layer_evidence
+        and has_decode_full_layer_without_host_fallback_evidence(preflight.model_variant)
+    )
+    decode_loop_tiled_stats_validated = (
+        use_decode_loop_tiled_stats_evidence
+        and has_decode_loop_tiled_stats_evidence(preflight.model_variant)
+    )
+    decode_loop_hf_prefill_tiled_stats_validated = (
+        use_decode_loop_tiled_stats_evidence
+        and has_decode_loop_hf_prefill_tiled_stats_evidence(preflight.model_variant)
+    )
+    decode_loop_attention_validated = (
+        decode_loop_tiled_stats_validated or decode_loop_hf_prefill_tiled_stats_validated
+    )
+    decode_loop_host_logits_validated = (
+        use_decode_loop_tiled_stats_evidence
+        and has_decode_loop_hf_prefill_tiled_stats_host_logits_evidence(preflight.model_variant)
+    )
+    decode_loop_timed_host_logits_validated = (
+        use_decode_loop_tiled_stats_evidence
+        and has_decode_loop_hf_prefill_tiled_stats_timed_host_logits_evidence(preflight.model_variant)
+    )
+    window_len = int(preflight.sliding_window or 0)
+    stages: list[Gemma3NPUStage] = []
+    for layer_index in range(int(preflight.layers)):
+        attention_kind = _attention_kind(layer_index)
+        layer_window = 0 if attention_kind == "global_full" else window_len
+        for stage_index, (phase, role, backend, kernel, contract) in enumerate(TEXT_STAGE_TEMPLATE):
+            stage_backend = _stage_backend(backend, kernel, nonlinear_status, preflight)
+            first_kernel_stage_validated = (
+                first_kernel_launch_validated
+                and phase == "prefill"
+                and layer_index == 0
+                and role == "pre_attention_norm"
+            )
+            status, blockers = _stage_status(
+                stage_backend,
+                kernel,
+                nonlinear_status,
+                first_kernel_stage_validated=first_kernel_stage_validated,
+            )
+            if (
+                decode_loop_attention_validated
+                and phase == "decode"
+                and role != "kv_cache_append"
+            ):
+                if role == "attention":
+                    if decode_loop_hf_prefill_tiled_stats_validated:
+                        status = "runner-owned-decode-loop-tiled-stats-hf-prefill-cache-pass"
+                        blockers = (NPU_PREFILL_KV_CACHE_BLOCKER, NPU_ATTENTION_REDUCTION_BLOCKER)
+                    else:
+                        status = "runner-owned-decode-loop-tiled-stats-synthetic-cache-pass"
+                        blockers = (PREFILL_PRODUCED_KV_CACHE_BLOCKER, NPU_ATTENTION_REDUCTION_BLOCKER)
+                else:
+                    status = "runner-owned-decode-loop-staged-pass"
+                    blockers = ()
+            elif (
+                decode_full_layer_validated
+                and phase == "decode"
+                and layer_index == 0
+                and role
+                in (
+                    "pre_attention_norm",
+                    "qkv_projection",
+                    "qk_norm",
+                    "rope",
+                    "attention",
+                    "output_projection",
+                    "post_attention_norm",
+                    "attention_residual",
+                    "pre_feedforward_norm",
+                    "mlp_gate_up_projection",
+                    "mlp_activation",
+                    "mlp_down_projection",
+                    "post_feedforward_norm",
+                    "mlp_residual",
+                )
+            ):
+                status = "runner-owned-decode-full-layer-staged-pass"
+                blockers = ()
+            elif (
+                decode_qkv_substep_validated
+                and phase == "decode"
+                and layer_index == 0
+                and role == "qkv_projection"
+            ):
+                status = "runner-owned-decode-qkv-substep-pass"
+                blockers = ()
+            elif (
+                decode_q_projection_substep_validated
+                and phase == "decode"
+                and layer_index == 0
+                and role == "qkv_projection"
+            ):
+                status = "runner-owned-decode-q-projection-substep-pass"
+                blockers = (MODEL_FULL_QKV_SUBSTEP_BLOCKER,)
+            stages.append(
+                Gemma3NPUStage(
+                    phase=phase,
+                    layer_index=layer_index,
+                    stage_index=stage_index,
+                    role=role,
+                    backend=stage_backend,
+                    kernel=kernel,
+                    route=_stage_route(kernel, routes) if stage_backend != "host-fallback" else "host",
+                    attention_kind=attention_kind,
+                    window_len=layer_window,
+                    tensor_contract=contract,
+                    status=status,
+                    blockers=blockers,
+                )
+            )
+
+    if decode_loop_attention_validated:
+        blockers = [
+            PREFILL_1K_NPU_BLOCKER,
+            (
+                NPU_PREFILL_KV_CACHE_BLOCKER
+                if decode_loop_hf_prefill_tiled_stats_validated
+                else PREFILL_PRODUCED_KV_CACHE_BLOCKER
+            ),
+            NPU_ATTENTION_REDUCTION_BLOCKER,
+            PRODUCTION_STATIC_BO_BLOCKER,
+        ]
+        if not decode_loop_timed_host_logits_validated:
+            blockers.insert(
+                3,
+                LOGITS_SAMPLING_HOST_DIAGNOSTIC_BLOCKER
+                if decode_loop_host_logits_validated
+                else LOGITS_SAMPLING_BLOCKER,
+            )
+    elif decode_full_layer_validated:
+        blockers = [MODEL_FULL_1B_LOOP_BLOCKER]
+    elif decode_qkv_substep_validated:
+        blockers = [MODEL_FULL_LAYER_BLOCKER]
+    elif decode_q_projection_substep_validated:
+        blockers = [MODEL_FULL_QKV_SUBSTEP_BLOCKER]
+    elif first_kernel_launch_validated:
+        blockers = [MODEL_SUBSTEP_SEQUENCE_BLOCKER]
+    else:
+        blockers = [MODEL_KERNEL_LAUNCH_BLOCKER]
+    if not (
+        use_static_preload_evidence
+        and has_full_xrt_preload_evidence(preflight.model_variant)
+    ):
+        blockers.append("full-static-weight-bo-preload-not-validated")
+    if not (
+        use_bo_allocation_evidence
+        and has_paper_shape_bo_allocation_evidence(preflight.model_variant)
+    ):
+        blockers.append("paper-shape-bo-allocation-not-validated")
+    if not decode_full_layer_without_host_fallbacks:
+        blockers.append("nonlinear-model-stage-promotion-incomplete")
+    if not decode_loop_attention_validated:
+        blockers.append("paper-shape-hardware-rerun-required")
+    if preflight.model_variant.endswith("vision"):
+        blockers.append("vision-npu-path-not-implemented")
+
+    return Gemma3NPUWiringPlan(
+        model_variant=preflight.model_variant,
+        status="BLOCKED",
+        layers=int(preflight.layers),
+        hidden_size=int(preflight.hidden_size),
+        head_dim=int(preflight.head_dim),
+        attention_pattern=preflight.attention_pattern,
+        stage_count=len(stages),
+        npu_candidate_count=sum(stage.backend == "npu-candidate" for stage in stages),
+        host_fallback_count=sum(stage.backend == "host-fallback" for stage in stages),
+        host_runtime_count=sum(stage.backend == "host-runtime" for stage in stages),
+        blockers=tuple(dict.fromkeys(blockers)),
+        stages=tuple(stages),
+    )
+
+
+def build_wiring_plan(
+    model_variant: str,
+    *,
+    weights_dir: Path | None = None,
+) -> Gemma3NPUWiringPlan:
+    return build_wiring_plan_from_preflight(
+        build_preflight_plan(model_variant, weights_dir=weights_dir),
+        use_static_preload_evidence=True,
+        use_bo_allocation_evidence=True,
+        use_first_kernel_launch_evidence=True,
+        use_decode_q_projection_substep_evidence=True,
+        use_decode_qkv_substep_evidence=True,
+        use_decode_full_layer_evidence=True,
+        use_decode_loop_tiled_stats_evidence=True,
+    )
+
+
+def _fake_preflight() -> Gemma3NPUPreflightPlan:
+    projection = ProjectionPlan(
+        family="q_proj",
+        shape=(1024, 1152),
+        padded_shape=(1024, 1280),
+        row_blocks=32,
+        col_blocks=5,
+        requires_padding=True,
+        max_abs_error=0.1,
+        mean_abs_error=0.01,
+    )
+    return Gemma3NPUPreflightPlan(
+        model_variant="gemma3-1b",
+        status="READY_FOR_NPU_WIRING",
+        blocker="npu-model-execution-not-implemented",
+        layers=6,
+        hidden_size=1152,
+        intermediate_size=6912,
+        head_dim=256,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        sliding_window=512,
+        attention_pattern="5-local-1-global",
+        projections=(projection,),
+    )
+
+
+def _self_test() -> None:
+    plan = build_wiring_plan_from_preflight(_fake_preflight())
+    if plan.stage_count != 6 * len(TEXT_STAGE_TEMPLATE):
+        raise AssertionError(plan.stage_count)
+    if plan.npu_candidate_count != 6 * 28:
+        raise AssertionError(plan.npu_candidate_count)
+    if plan.host_fallback_count != 0:
+        raise AssertionError(plan.host_fallback_count)
+    global_attention = [stage for stage in plan.stages if stage.layer_index == 5 and stage.role == "attention"]
+    if not global_attention or any(stage.attention_kind != "global_full" or stage.window_len != 0 for stage in global_attention):
+        raise AssertionError(global_attention)
+    print(plan.format())
+    for stage in plan.stages[:8]:
+        print(stage.format())
+    for stage in [stage for stage in plan.stages if stage.role == "rope"][:2]:
+        print(stage.format())
+    for stage in [stage for stage in plan.stages if stage.role == "mlp_activation"][:2]:
+        print(stage.format())
+    for stage in [stage for stage in plan.stages if stage.kernel == "residual_add"][:2]:
+        print(stage.format())
+    for stage in global_attention:
+        print(stage.format())
+    print("GEMMA3_NPU_WIRING_SELF_TEST: PASS")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Gemma3 NPU model execution wiring manifest")
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--model-variant", choices=sorted(MODEL_SPECS), default="gemma3-1b")
+    parser.add_argument("--weights-dir", type=Path)
+    parser.add_argument("--include-stages", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    if args.self_test:
+        _self_test()
+        return 0
+    plan = build_wiring_plan(args.model_variant, weights_dir=args.weights_dir)
+    if args.json:
+        print(json.dumps(plan.to_json_dict(), indent=2, sort_keys=True))
+    else:
+        print(plan.format(include_stages=args.include_stages))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

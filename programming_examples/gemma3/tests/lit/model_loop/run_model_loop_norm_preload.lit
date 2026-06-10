@@ -1,0 +1,6 @@
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.npu.norm_preload --self-test | FileCheck %s
+# CHECK: norm_preload model=gemma3-1b status=SERIALIZED full_model=False planned_tensors=1 allocation_mode=serialized-only tensors=1 requested=16 serialized=16 xrt_written=0
+# CHECK-SAME: blockers=full-norm-weight-bo-preload-not-validated
+# CHECK: norm_preload L0 family=q_norm requested=16 serialized=16 xrt_written=0 offset=0 status=SERIALIZED
+# CHECK: GEMMA3_NORM_PRELOAD_EVIDENCE_SELF_TEST: PASS
+# CHECK: GEMMA3_NORM_PRELOAD_SELF_TEST: PASS

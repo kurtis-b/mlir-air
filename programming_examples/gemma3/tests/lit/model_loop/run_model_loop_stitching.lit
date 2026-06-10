@@ -1,0 +1,17 @@
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.npu.stitching | FileCheck %s --check-prefix=STITCH
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.kernels.padded_rms_norm --self-test | FileCheck %s --check-prefix=PAD
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.kernels.projection_qk_norm --self-test | FileCheck %s --check-prefix=QKNORM
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.probes.stitched_decode --self-test | FileCheck %s --check-prefix=DECODE
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.probes.stitched_decode --parse-attention-o | FileCheck %s --check-prefix=ATTO
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.probes.stitched_decode --parse-post-attention-residual | FileCheck %s --check-prefix=PARES
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.probes.stitched_decode --parse-ffn-gate-up | FileCheck %s --check-prefix=FFNGU
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.probes.stitched_decode --parse-geglu-down | FileCheck %s --check-prefix=GEGLUDOWN
+
+# STITCH: gemma3_stitching self-test status=PASS launches=2 args=3
+# PAD: gemma3_padded_rms_norm self-test status=PASS input=1x1152 output=5x256 padded_tail=128
+# QKNORM: gemma3_projection_qk_norm self-test status=PASS q_in=32x32 q_out=4x256 k_in=8x32 k_out=1x256
+# DECODE: stitched_decode_plan model=gemma3-1b status=STITCHED_DECODE_INGRESS_READY target=decode-ingress-rmsnorm-qkv-qknorm-rope implemented_slice=gemma3_decode_ingress_rms_qkv_qknorm_rope implemented_launches=8 target_launches=8 timing_policy=compile-load-bo-preload-arg-binding-outside-timed-region stages=rmsnorm_activation_alias:implemented-hardware-pass-alias|qkv_projection_core:implemented-hardware-pass-stitch|projection_qk_views:implemented-hardware-pass-bridge|qk_norm_rope:implemented-hardware-pass-stitch remaining_bridges=none
+# ATTO: stitched_attention_o status=PARSE_PASS function=gemma3_decode_attention_o_projection launches=2 args=5 output_format=elf
+# PARES: stitched_post_attention_residual status=PARSE_PASS function=gemma3_decode_post_attention_residual launches=2 args=6 output_format=elf
+# FFNGU: stitched_ffn_gate_up status=PARSE_PASS function=gemma3_decode_ffn_gate_up launches=3 args=8 output_format=elf
+# GEGLUDOWN: stitched_geglu_down status=PARSE_PASS function=gemma3_decode_geglu_down launches=2 args=6 output_format=elf

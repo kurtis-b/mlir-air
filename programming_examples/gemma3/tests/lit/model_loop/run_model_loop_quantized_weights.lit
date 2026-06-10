@@ -1,0 +1,7 @@
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.core.quantized_weights --self-test | FileCheck %s
+# CHECK: quantized_weights model=gemma3-1b status=READY
+# CHECK-SAME: projection_weight_source=q4nx
+# CHECK: GEMMA3_Q4NX_CACHE_REUSE_SELF_TEST: PASS
+# CHECK: GEMMA3_Q4NX_CACHE_INVALIDATION_SELF_TEST: PASS
+# CHECK: GEMMA3_Q4NX_CPU_PROJECTION_SELF_TEST: PASS
+# CHECK: GEMMA3_Q4NX_QUANTIZED_WEIGHTS_SELF_TEST: PASS

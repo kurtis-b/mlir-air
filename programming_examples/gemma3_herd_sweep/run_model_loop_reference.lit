@@ -1,9 +1,0 @@
-// Copyright (C) 2026, Advanced Micro Devices, Inc.
-// SPDX-License-Identifier: MIT
-//
-// RUN: python3 %S/gemma3_reference.py --self-test | FileCheck %s
-
-// CHECK: prefill:L0:q4nx mode=l2-gather status=npu
-// CHECK: prefill:L0:rms_norm mode=n/a status=host-fallback fallback=weighted_rms_norm candidate
-// CHECK: decode:L1:flowkv mode=direct status=npu
-// CHECK: GEMMA3_CPU_REFERENCE_SELF_TEST: PASS

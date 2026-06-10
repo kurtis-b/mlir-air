@@ -1,3 +1,0 @@
-# RUN: %PYTHON %S/gemma3_launch_probe.py --self-test | FileCheck %s
-# CHECK: launch_probe model=gemma3-1b status=FIRST_KERNEL_LAUNCH_PASS probe=model-rmsnorm phase=prefill layer=L0 role=pre_attention_norm kernel=rms_norm route=weighted_rms_norm/standalone-elf-smoke shape=1024x1152 output_format=elf herd_x=1 tensor=model.layers.0.input_layernorm.weight input=bounded-uniform-seed0 correlation=0.999984 threshold=0.99 arg_binding=ARGUMENT_BINDING_VALIDATED arg_count=3 arg_keys=layer_input|static_norm_weights|prefill_L0_pre_attention_norm static_norm=model.layers.0.input_layernorm.weight@0+2304/bo=266240 bo_binding=runner-owned-persistent-bo model_runner_gaps=substep-sequence-not-wired,full-layer-not-wired blockers=none
-# CHECK: GEMMA3_LAUNCH_PROBE_SELF_TEST: PASS

@@ -1,0 +1,19 @@
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.npu.buffer_binding --self-test | FileCheck %s
+# CHECK: buffer_plan model=gemma3-1b status=READY_FOR_MODEL_RUNNER layers=2 bindings=60
+# CHECK-SAME: persistent_bos=21
+# CHECK-SAME: static_weight_families=13
+# CHECK-SAME: missing_bos=none blockers=none
+# CHECK: buffer_binding prefill:L0:pre_attention_norm backend=npu-candidate inputs=layer_input
+# CHECK-SAME: outputs=prefill_L0_pre_attention_norm
+# CHECK-SAME: weights=input_layernorm weight_bos=static_norm_weights
+# CHECK-SAME: status=BUFFER_BINDING_READY_FOR_ARGUMENT_LAYOUT blockers=none
+# CHECK: buffer_binding prefill:L0:qkv_projection backend=npu-candidate inputs=prefill_L0_pre_attention_norm outputs=prefill_q,prefill_k,prefill_v weights=q_proj,k_proj,v_proj
+# CHECK-SAME: weight_bos=static_projection_weights
+# CHECK-SAME: status=BUFFER_BINDING_READY_FOR_ARGUMENT_LAYOUT blockers=none
+# CHECK: buffer_binding prefill:L0:kv_cache_append backend=host-runtime inputs=prefill_k,prefill_v outputs=kv_cache_k_L0,kv_cache_v_L0
+# CHECK-SAME: weight_bos=none
+# CHECK-SAME: mutable=kv_cache_k_L0,kv_cache_v_L0
+# CHECK-SAME: status=BUFFER_BINDING_PLANNED blockers=none
+# CHECK: buffer_binding decode:L0:attention backend=npu-candidate inputs=decode_q,kv_cache_k_L0,kv_cache_v_L0 outputs=decode_attention_out
+# CHECK-SAME: weight_bos=none
+# CHECK: GEMMA3_BUFFER_BINDING_SELF_TEST: PASS
