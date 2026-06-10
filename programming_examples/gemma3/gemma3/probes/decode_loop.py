@@ -3416,6 +3416,65 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
     )
 
 
+def build_runtime_decode_loop_args(
+    *,
+    model_variant: str = DEFAULT_MODEL,
+    weights_dir: Path | None = None,
+    layers: int = 26,
+    decode_tokens: int = 1,
+    prompt_context_length: int = 1024,
+    warmup_layers: int = 1,
+    stitched: bool = True,
+    attention_mode: str = DEFAULT_ATTENTION_MODE,
+    attention_cache_mode: str = DEFAULT_ATTENTION_CACHE_MODE,
+    decode_input_mode: str = "random",
+    logits_mode: str = "none",
+    logits_timing: str = "excluded",
+    logits_chunk_rows: int = 8192,
+    quantized_weights_dir: Path | None = None,
+    force_quantized_weights: bool = False,
+    power_sample: bool = False,
+) -> argparse.Namespace:
+    """Build the decode-loop runner namespace used by production runtime code."""
+    attention_o_mode = "stitched" if stitched and attention_mode == "single-token" else "staged"
+    stitched_mode = "stitched" if stitched else "staged"
+    return argparse.Namespace(
+        self_test=False,
+        run_hardware=True,
+        model_variant=model_variant,
+        weights_dir=weights_dir,
+        layers=layers,
+        decode_tokens=decode_tokens,
+        prompt_context_length=prompt_context_length,
+        decode_input_mode=decode_input_mode,
+        warmup_layers=warmup_layers,
+        result_json=None,
+        power_sample=power_sample,
+        ingress_mode=stitched_mode,
+        attention_o_mode=attention_o_mode,
+        post_attention_mode=stitched_mode,
+        ffn_gate_up_mode=stitched_mode,
+        ffn_geglu_down_mode=stitched_mode,
+        post_feedforward_mode=stitched_mode,
+        attention_mode=attention_mode,
+        attention_cache_mode=attention_cache_mode,
+        tiled_attention_kv_tile=DEFAULT_TILED_ATTENTION_KV_TILE,
+        tiled_attention_host_batch_tiles=DEFAULT_TILED_ATTENTION_HOST_BATCH_TILES,
+        logits_mode=logits_mode,
+        logits_timing=logits_timing,
+        logits_chunk_rows=logits_chunk_rows,
+        dynamic_static_weight_writes=False,
+        quantized_weights_dir=quantized_weights_dir,
+        force_quantized_weights=force_quantized_weights,
+        no_reuse_elf=False,
+    )
+
+
+def run_decode_loop_runtime(**kwargs: Any) -> Gemma3DecodeLoopProbeResult:
+    """Run the reusable ELF decode loop through the runtime-facing entrypoint."""
+    return _run_hardware_sequence(build_runtime_decode_loop_args(**kwargs))
+
+
 def _self_test() -> None:
     evidence = LayerLoopEvidence(
         layer_index=0,
@@ -3500,6 +3559,11 @@ def _self_test() -> None:
     )
     if result.status != "DECODE_LOOP_DIAGNOSTIC_PASS":
         raise AssertionError(result)
+    runtime_args = build_runtime_decode_loop_args(layers=26, decode_tokens=1)
+    if runtime_args.ingress_mode != "stitched" or runtime_args.attention_o_mode != "stitched":
+        raise AssertionError(runtime_args)
+    if runtime_args.no_reuse_elf or runtime_args.dynamic_static_weight_writes:
+        raise AssertionError(runtime_args)
     import tempfile
 
     host_logits_data = result.to_json_dict()

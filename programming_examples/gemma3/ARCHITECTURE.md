@@ -335,7 +335,7 @@ headline timing.
 
 ### Target NPU Runtime
 
-`gemma3.npu.inference_runtime` now owns the production-shaped runtime shell. Its current implementation prepares real 1B/1k setup state, validates kernel argument bindings, records static-input/readback policy, and returns blocked `run_npu_prefill()` / `generate()` results until production launches are promoted out of probes.
+`gemma3.npu.inference_runtime` now owns the production-shaped runtime shell. It prepares real 1B/1k setup state, validates kernel argument bindings, records static-input/readback policy, and promotes the stitched 26-layer decode-loop execution into `generate()`. The current runtime decode evidence is `results/gemma3_1b_npu_runtime_decode_loop.json`: it launches 156 timed NPU kernels for one token and reports `DECODE_RUNTIME_PASS_WITH_BLOCKERS`, with single-token diagnostic attention, missing prefill-produced 1k K/V cache, missing logits/sampling, and the static FusedDQP BO-routing blocker still explicit.
 
 The target runtime shape is:
 
@@ -732,8 +732,8 @@ rg -n "^#{1,4} " programming_examples/gemma3/ARCHITECTURE.md
 The next engineering change should not broaden scope. It should take one item
 from this list:
 
-- Convert the current stitched decode diagnostic runner into a cached-runtime
-  path with production static BO ownership.
+- Route decode projections through the manifest-backed contiguous static Q4NX BO
+  instead of runner-owned FusedDQP BO sets.
 - Wire 1B NPU prefill far enough to produce K/V cache rows for decode.
 - Replace host tiled-stat reduction with an NPU-owned reduction path.
 - Normalize CPU and iGPU result generation through one shared backend harness.

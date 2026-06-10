@@ -33,8 +33,12 @@ validation is complete for the real 1B 1k/32k context model-runner plan: 728
 NPU candidate layouts, 2,236 positional
 arguments, and zero binding blockers. The `gemma3.npu.inference_runtime` shell
 now reports this setup through `prepare_runtime()` and attaches the same
-blockers under `npu_runtime` in NPU paper-benchmark JSONs. Staged decode
-layer-0 correctness and
+blockers under `npu_runtime` in NPU paper-benchmark JSONs. The runtime
+`generate()` path now promotes the stitched 26-layer decode loop and records
+`gemma3_1b_npu_runtime_decode_loop.json` with 156 timed NPU kernel launches,
+`DECODE_LOOP_DIAGNOSTIC_PASS`, and explicit blockers for missing prefill-produced
+1k K/V cache, 1k attention/reduction, logits/sampling, and production static
+FusedDQP BO routing. Staged decode layer-0 correctness and
 segmented kernel-only timing evidence is now present and attached under
 `npu_staged_diagnostic` in the blocked NPU paper-cell JSONs, but official NPU
 `local_value` remains null because this is not a timed paper-cell run.

@@ -4,11 +4,11 @@
 
 """Production-shaped Gemma3 NPU inference runtime shell.
 
-This module owns the public Gemma3 NPU runtime entrypoints.  The first
-iteration intentionally stops at setup and contract validation: it loads the
-real model metadata, Q4NX manifest, static-weight plans, BO plans, wiring, and
-kernel argument bindings, then reports the exact execution blockers before any
-timed model inference is attempted.
+This module owns the public Gemma3 NPU runtime entrypoints. It prepares real
+model metadata, Q4NX manifests, static-weight plans, BO plans, wiring, and
+kernel argument bindings before timed model inference. Runtime entrypoints then
+report measured NPU work together with the remaining paper blockers instead of
+hiding diagnostic cache or host-fallback paths.
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ from gemma3.npu.wiring import (
     NPU_PREFILL_KV_CACHE_BLOCKER,
     PREFILL_1K_NPU_BLOCKER,
     PREFILL_PRODUCED_KV_CACHE_BLOCKER,
+    PRODUCTION_STATIC_BO_BLOCKER,
     Gemma3NPUWiringPlan,
     build_wiring_plan_from_preflight,
 )
@@ -170,15 +171,36 @@ class Gemma3RuntimeExecutionResult:
     blockers: tuple[str, ...]
     operation_ownership: tuple[Gemma3RuntimeOwnershipRecord, ...]
     elapsed_seconds: float | None = None
+    setup_status: str | None = None
+    q4nx_manifest: str | None = None
+    q4nx_manifest_sha256: str | None = None
+    static_input_keys: tuple[str, ...] = ()
+    persistent_output_keys: tuple[str, ...] = ()
+    readback_policy: str | None = None
+    argument_binding_status: str | None = None
+    argument_binding_count: int = 0
+    argument_binding_blocker_count: int = 0
+    kernel_launch_count: int = 0
+    host_fallback_count: int = 0
+    host_runtime_count: int = 0
+    npu_decode_loop: dict[str, object] | None = None
+    error: str | None = None
 
     def format(self, *, include_ownership: bool = False) -> str:
         blockers = ",".join(self.blockers) if self.blockers else "none"
+        loop = self.npu_decode_loop or {}
+        loop_status = loop.get("status", "none")
         lines = [
             f"runtime_result entrypoint={self.entrypoint} model={self.model_variant} "
             f"status={self.status} prompt_len={self.prompt_len} "
             f"decode_context={self.decode_context} decode_tokens={self.decode_tokens} "
-            f"local={self.local_value} unit={self.unit} blockers={blockers}"
+            f"local={self.local_value} unit={self.unit} "
+            f"kernel_launches={self.kernel_launch_count} host_fallbacks={self.host_fallback_count} "
+            f"host_runtime={self.host_runtime_count} decode_loop_status={loop_status} "
+            f"blockers={blockers}"
         ]
+        if self.error:
+            lines.append(f"runtime_error {self.error}")
         if include_ownership:
             lines.extend(record.format() for record in self.operation_ownership)
         return "\n".join(lines)
@@ -660,6 +682,193 @@ def prepare_runtime(
     )
 
 
+def _execution_setup_fields(session: Gemma3RuntimeSession) -> dict[str, object]:
+    setup = session.setup
+    return {
+        "setup_status": setup.status,
+        "q4nx_manifest": setup.q4nx_manifest,
+        "q4nx_manifest_sha256": setup.q4nx_manifest_sha256,
+        "static_input_keys": setup.static_input_keys,
+        "persistent_output_keys": setup.persistent_output_keys,
+        "readback_policy": setup.readback_policy,
+        "argument_binding_status": setup.argument_binding_status,
+        "argument_binding_count": setup.argument_binding_count,
+        "argument_binding_blocker_count": setup.argument_binding_blocker_count,
+    }
+
+
+def _setup_ownership(session: Gemma3RuntimeSession) -> tuple[Gemma3RuntimeOwnershipRecord, ...]:
+    return tuple(record for record in session.setup.operation_ownership if not record.timed_window)
+
+
+def _decode_probe_blockers(session: Gemma3RuntimeSession, probe: Any) -> tuple[str, ...]:
+    blockers: list[str] = list(session.setup.blockers)
+    blockers.extend(getattr(probe, "blockers", ()))
+    gap_map = {
+        "prefill-kv-cache-not-constructed": NPU_PREFILL_KV_CACHE_BLOCKER,
+        "prefill-produced-kv-cache-not-wired": PREFILL_PRODUCED_KV_CACHE_BLOCKER,
+        "npu-prefill-kv-cache-not-wired": NPU_PREFILL_KV_CACHE_BLOCKER,
+        "paper-1k-kv-attention-not-wired": "paper-1k-kv-attention-not-wired",
+        "paper-1k-kv-attention-npu-reduction-not-wired": NPU_ATTENTION_REDUCTION_BLOCKER,
+        "paper-1k-kv-attention-production-cache-and-npu-reduction-not-wired": NPU_ATTENTION_REDUCTION_BLOCKER,
+        "logits-sampling-not-wired": LOGITS_SAMPLING_BLOCKER,
+        "logits-sampling-host-diagnostic-only": LOGITS_SAMPLING_HOST_DIAGNOSTIC_BLOCKER,
+        "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route": PRODUCTION_STATIC_BO_BLOCKER,
+    }
+    for gap in getattr(probe, "remaining_paper_gaps", ()):  # keep unrecognized gaps visible.
+        blockers.append(gap_map.get(gap, gap))
+    return _dedupe(blockers)
+
+
+def _probe_host_fallback_count(probe: Any) -> int:
+    count = len(getattr(probe, "host_fallbacks", ()) or ())
+    if getattr(probe, "attention_host_reduction", False):
+        count += 1
+    logits = getattr(probe, "logits_evidence", None)
+    if isinstance(logits, dict) and str(logits.get("backend", "")).startswith("torch-cpu"):
+        count += 1
+    return count
+
+
+def _decode_probe_ownership(
+    session: Gemma3RuntimeSession,
+    probe: Any,
+) -> tuple[Gemma3RuntimeOwnershipRecord, ...]:
+    records: list[Gemma3RuntimeOwnershipRecord] = list(_setup_ownership(session))
+    probe_blockers = _dedupe(getattr(probe, "blockers", ()))
+    records.append(
+        Gemma3RuntimeOwnershipRecord(
+            name="decode_layer_loop",
+            phase="decode",
+            owner="npu",
+            timed_window=True,
+            status="launched-pass" if not probe_blockers else "blocked",
+            blockers=probe_blockers,
+        )
+    )
+    cache_contract = str(getattr(probe, "attention_cache_contract", ""))
+    if cache_contract == "single-current-token-kv":
+        records.append(
+            Gemma3RuntimeOwnershipRecord(
+                name="decode_prefill_kv_cache",
+                phase="decode",
+                owner="missing",
+                timed_window=True,
+                status="single-token-diagnostic-cache",
+                blockers=(NPU_PREFILL_KV_CACHE_BLOCKER, "paper-1k-kv-attention-not-wired"),
+            )
+        )
+        records.append(
+            Gemma3RuntimeOwnershipRecord(
+                name="attention_stat_reduction",
+                phase="decode",
+                owner="missing",
+                timed_window=True,
+                status="not-run-for-single-token-attention",
+                blockers=(NPU_ATTENTION_REDUCTION_BLOCKER,),
+            )
+        )
+    else:
+        if cache_contract == "synthetic-prefill-kv-cache":
+            cache_owner = "host-fallback"
+            cache_status = "diagnostic-synthetic-cache"
+            cache_blockers = (PREFILL_PRODUCED_KV_CACHE_BLOCKER,)
+        elif cache_contract == "host-hf-prefill-kv-cache":
+            cache_owner = "host-fallback"
+            cache_status = "diagnostic-host-hf-cache"
+            cache_blockers = (NPU_PREFILL_KV_CACHE_BLOCKER,)
+        else:
+            cache_owner = "npu"
+            cache_status = "provided"
+            cache_blockers = ()
+        records.append(
+            Gemma3RuntimeOwnershipRecord(
+                name="decode_prefill_kv_cache",
+                phase="decode",
+                owner=cache_owner,
+                timed_window=False,
+                status=cache_status,
+                blockers=cache_blockers,
+            )
+        )
+        reduction_host = bool(getattr(probe, "attention_host_reduction", False))
+        records.append(
+            Gemma3RuntimeOwnershipRecord(
+                name="attention_stat_reduction",
+                phase="decode",
+                owner="host-fallback" if reduction_host else "npu",
+                timed_window=True,
+                status="timed-host-reduction" if reduction_host else "not-required-or-npu",
+                blockers=(NPU_ATTENTION_REDUCTION_BLOCKER,) if reduction_host else (),
+            )
+        )
+    logits = getattr(probe, "logits_evidence", None)
+    if isinstance(logits, dict):
+        timing = str(logits.get("timing_window", "host"))
+        records.append(
+            Gemma3RuntimeOwnershipRecord(
+                name="logits_sampling",
+                phase="decode",
+                owner="host-fallback",
+                timed_window=timing == "included-in-measured-loop-wall",
+                status=timing,
+                blockers=(
+                    ()
+                    if timing == "included-in-measured-loop-wall"
+                    else (LOGITS_SAMPLING_HOST_DIAGNOSTIC_BLOCKER,)
+                ),
+            )
+        )
+    else:
+        records.append(
+            Gemma3RuntimeOwnershipRecord(
+                name="logits_sampling",
+                phase="decode",
+                owner="missing",
+                timed_window=True,
+                status="not-wired",
+                blockers=(LOGITS_SAMPLING_BLOCKER,),
+            )
+        )
+    return tuple(records)
+
+
+def _blocked_execution_result(
+    session: Gemma3RuntimeSession,
+    *,
+    entrypoint: str,
+    decode_tokens: int,
+    blockers: Iterable[str],
+    operation_ownership: tuple[Gemma3RuntimeOwnershipRecord, ...] | None = None,
+    unit: str | None = None,
+    error: str | None = None,
+) -> Gemma3RuntimeExecutionResult:
+    return Gemma3RuntimeExecutionResult(
+        schema_version=RUNTIME_SETUP_VERSION,
+        entrypoint=entrypoint,
+        model_variant=session.setup.model_variant,
+        status="BLOCKED",
+        prompt_len=session.setup.prompt_len,
+        decode_context=session.setup.decode_context,
+        decode_tokens=decode_tokens,
+        generated_token_ids=(),
+        local_value=None,
+        unit=unit,
+        blockers=_dedupe(blockers),
+        operation_ownership=(
+            operation_ownership
+            if operation_ownership is not None
+            else session.setup.operation_ownership
+        ),
+        elapsed_seconds=None,
+        kernel_launch_count=0,
+        host_fallback_count=0,
+        host_runtime_count=0,
+        error=error,
+        **_execution_setup_fields(session),
+    )
+
+
 def run_npu_prefill(
     session: Gemma3RuntimeSession,
     token_ids: Sequence[int],
@@ -687,20 +896,13 @@ def run_npu_prefill(
         for record in session.setup.operation_ownership
         if record.phase in ("setup", "prefill", "prefill+decode")
     )
-    return Gemma3RuntimeExecutionResult(
-        schema_version=RUNTIME_SETUP_VERSION,
+    return _blocked_execution_result(
+        session,
         entrypoint="run_npu_prefill",
-        model_variant=session.setup.model_variant,
-        status="BLOCKED",
-        prompt_len=session.setup.prompt_len,
-        decode_context=session.setup.decode_context,
         decode_tokens=0,
-        generated_token_ids=(),
-        local_value=None,
-        unit="seconds",
-        blockers=_dedupe(blockers),
+        blockers=blockers,
         operation_ownership=ownership,
-        elapsed_seconds=None,
+        unit="seconds",
     )
 
 
@@ -709,6 +911,7 @@ def generate(
     prompt_or_token_ids: str | Sequence[int],
     *,
     decode_tokens: int,
+    run_hardware: bool = True,
 ) -> Gemma3RuntimeExecutionResult:
     if decode_tokens < 0:
         raise ValueError("decode_tokens must be non-negative")
@@ -720,21 +923,120 @@ def generate(
         raise ValueError(
             f"prompt length {prompt_len} does not match session prompt_len {session.setup.prompt_len}"
         )
-    blockers = session.setup.blockers or ("generate-runtime-launch-not-implemented",)
+    unit = "tokens_per_second" if decode_tokens else "seconds"
+    if not session.setup.ready_for_entrypoints:
+        return _blocked_execution_result(
+            session,
+            entrypoint="generate",
+            decode_tokens=decode_tokens,
+            blockers=session.setup.blockers or ("generate-runtime-setup-blocked",),
+            unit=unit,
+        )
+    if decode_tokens == 0:
+        return Gemma3RuntimeExecutionResult(
+            schema_version=RUNTIME_SETUP_VERSION,
+            entrypoint="generate",
+            model_variant=session.setup.model_variant,
+            status="READY_NO_DECODE_TOKENS",
+            prompt_len=session.setup.prompt_len,
+            decode_context=session.setup.decode_context,
+            decode_tokens=0,
+            generated_token_ids=(),
+            local_value=None,
+            unit=unit,
+            blockers=session.setup.blockers,
+            operation_ownership=session.setup.operation_ownership,
+            elapsed_seconds=0.0,
+            kernel_launch_count=0,
+            host_fallback_count=0,
+            host_runtime_count=0,
+            **_execution_setup_fields(session),
+        )
+    if session.setup.model_variant != "gemma3-1b":
+        return _blocked_execution_result(
+            session,
+            entrypoint="generate",
+            decode_tokens=decode_tokens,
+            blockers=("decode-runtime-gemma3-1b-only", *session.setup.blockers),
+            unit=unit,
+        )
+    if not run_hardware:
+        return _blocked_execution_result(
+            session,
+            entrypoint="generate",
+            decode_tokens=decode_tokens,
+            blockers=("generate-runtime-launch-not-run", *session.setup.blockers),
+            unit=unit,
+        )
+
+    start = perf_counter()
+    try:
+        from gemma3.probes.decode_loop import run_decode_loop_runtime
+
+        quantized_weights_dir = (
+            Path(session.setup.q4nx_manifest).parent
+            if session.setup.q4nx_manifest is not None
+            else None
+        )
+        probe = run_decode_loop_runtime(
+            model_variant=session.setup.model_variant,
+            weights_dir=(Path(session.setup.weights_dir) if session.setup.weights_dir else None),
+            layers=int(session.setup.layers or 26),
+            decode_tokens=decode_tokens,
+            prompt_context_length=session.setup.decode_context,
+            warmup_layers=1,
+            stitched=True,
+            attention_mode="single-token",
+            attention_cache_mode="repeated-current-token",
+            logits_mode="none",
+            logits_timing="excluded",
+            quantized_weights_dir=quantized_weights_dir,
+            force_quantized_weights=False,
+            power_sample=False,
+        )
+    except Exception as exc:
+        return _blocked_execution_result(
+            session,
+            entrypoint="generate",
+            decode_tokens=decode_tokens,
+            blockers=("decode-runtime-launch-failed", *session.setup.blockers),
+            unit=unit,
+            error=str(exc),
+        )
+
+    blockers = _decode_probe_blockers(session, probe)
+    ownership = _decode_probe_ownership(session, probe)
+    status = (
+        "DECODE_RUNTIME_PASS_WITH_BLOCKERS"
+        if getattr(probe, "status", "") == "DECODE_LOOP_DIAGNOSTIC_PASS"
+        else "DECODE_RUNTIME_BLOCKED"
+    )
+    logits = getattr(probe, "logits_evidence", None)
+    generated_token_ids = (
+        (int(logits["sampled_token_id"]),)
+        if isinstance(logits, dict) and "sampled_token_id" in logits
+        else ()
+    )
+    elapsed = getattr(probe, "elapsed_seconds", None) or (perf_counter() - start)
     return Gemma3RuntimeExecutionResult(
         schema_version=RUNTIME_SETUP_VERSION,
         entrypoint="generate",
         model_variant=session.setup.model_variant,
-        status="BLOCKED",
+        status=status,
         prompt_len=session.setup.prompt_len,
         decode_context=session.setup.decode_context,
         decode_tokens=decode_tokens,
-        generated_token_ids=(),
-        local_value=None,
-        unit="tokens_per_second" if decode_tokens else "seconds",
+        generated_token_ids=generated_token_ids,
+        local_value=getattr(probe, "diagnostic_decode_tps_loop_wall", None),
+        unit=unit,
         blockers=blockers,
-        operation_ownership=session.setup.operation_ownership,
-        elapsed_seconds=None,
+        operation_ownership=ownership,
+        elapsed_seconds=elapsed,
+        kernel_launch_count=int(getattr(probe, "timed_kernel_count", 0) or 0),
+        host_fallback_count=_probe_host_fallback_count(probe),
+        host_runtime_count=0,
+        npu_decode_loop=probe.to_json_dict(),
+        **_execution_setup_fields(session),
     )
 
 
@@ -833,8 +1135,10 @@ def _self_test() -> None:
     prefill = run_npu_prefill(session, [1] * setup.prompt_len)
     if prefill.status != "BLOCKED" or not prefill.blockers:
         raise AssertionError(prefill)
-    generated = generate(session, [1] * setup.prompt_len, decode_tokens=1)
+    generated = generate(session, [1] * setup.prompt_len, decode_tokens=1, run_hardware=False)
     if generated.status != "BLOCKED" or generated.generated_token_ids:
+        raise AssertionError(generated)
+    if generated.kernel_launch_count != 0 or generated.setup_status != setup.status:
         raise AssertionError(generated)
     print(setup.format(include_ownership=True))
     print(prefill.format(include_ownership=True))
@@ -863,6 +1167,7 @@ def main() -> int:
     parser.add_argument("--quantized-weights-dir", type=Path)
     parser.add_argument("--force-quantized-weights", action="store_true")
     parser.add_argument("--include-ownership", action="store_true")
+    parser.add_argument("--no-run-hardware", action="store_true", help="prepare and format a blocked runtime result without launching NPU kernels")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--result-json", type=Path)
     args = parser.parse_args()
@@ -889,7 +1194,12 @@ def main() -> int:
     if args.run_npu_prefill:
         result = run_npu_prefill(session, [1] * args.prompt_len)
     elif args.generate:
-        result = generate(session, [1] * args.prompt_len, decode_tokens=args.decode_tokens)
+        result = generate(
+            session,
+            [1] * args.prompt_len,
+            decode_tokens=args.decode_tokens,
+            run_hardware=not args.no_run_hardware,
+        )
     else:
         result = session.setup
 
