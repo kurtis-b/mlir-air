@@ -249,7 +249,102 @@ class _PackedProjectionPlan:
     min_offset: Any
     mlir_module: Any
     static_bo_offset: int | None = None
+    static_bo_bytes: int | None = None
     payload_sha256: str | None = None
+    q4nx_payload: bytes | None = None
+
+
+@dataclass(frozen=True)
+class _StaticBOSliceArg:
+    bo: Any
+    nbytes: int
+    shape: tuple[int, ...]
+    dtype: Any
+    key: tuple[object, ...]
+
+
+class _StaticProjectionBOStore:
+    def __init__(self, *, xrt: Any, bo: Any, slice_args: dict[str, _StaticBOSliceArg]) -> None:
+        self.xrt = xrt
+        self.bo = bo
+        self.slice_args = slice_args
+
+    @property
+    def slice_count(self) -> int:
+        return len(self.slice_args)
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        runner_cache: _ReusableElfRunnerCache,
+        projection_plans: dict[int, dict[str, _PackedProjectionPlan]],
+        static_bo_bytes: int,
+    ) -> "_StaticProjectionBOStore":
+        import numpy as np
+
+        if runner_cache.xrt is None or runner_cache.device is None:
+            raise RuntimeError("static projection BO store requires an entered reusable runner cache")
+        xrt = runner_cache.xrt
+        static_bo = xrt.bo(runner_cache.device, int(static_bo_bytes), xrt.bo.host_only, 0)
+        seen: dict[str, _PackedProjectionPlan] = {}
+        for layer_plans in projection_plans.values():
+            for plan in layer_plans.values():
+                if plan.tensor_key in seen:
+                    continue
+                if plan.q4nx_payload is None or plan.static_bo_offset is None or plan.static_bo_bytes is None:
+                    raise RuntimeError(f"missing Q4NX static BO metadata for {plan.tensor_key}")
+                if len(plan.q4nx_payload) != int(plan.static_bo_bytes):
+                    raise RuntimeError(
+                        f"Q4NX payload size mismatch for {plan.tensor_key}: "
+                        f"got {len(plan.q4nx_payload)}, expected {plan.static_bo_bytes}"
+                    )
+                static_bo.write(plan.q4nx_payload, int(plan.static_bo_offset))
+                seen[plan.tensor_key] = plan
+        static_bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+
+        slice_args: dict[str, _StaticBOSliceArg] = {}
+        for tensor_key, plan in seen.items():
+            block_bytes = int(plan.packed.shape[-1]) + 512 * np.dtype(plan.scale.dtype).itemsize
+            expected_bytes = int(plan.row_blocks) * int(plan.col_blocks) * block_bytes
+            if plan.static_bo_bytes != expected_bytes:
+                raise RuntimeError(
+                    f"static BO payload for {tensor_key} does not match FusedDQP ABI: "
+                    f"manifest={plan.static_bo_bytes} expected={expected_bytes}"
+                )
+            sub_bo = xrt.bo(static_bo, int(plan.static_bo_bytes), int(plan.static_bo_offset))
+            slice_args[tensor_key] = _StaticBOSliceArg(
+                bo=sub_bo,
+                nbytes=int(plan.static_bo_bytes),
+                shape=(int(plan.row_blocks), int(plan.col_blocks), block_bytes),
+                dtype=np.dtype(np.int8),
+                key=(
+                    "manifest-contiguous-static-q4nx",
+                    tensor_key,
+                    int(plan.static_bo_offset),
+                    int(plan.static_bo_bytes),
+                    plan.payload_sha256,
+                ),
+            )
+        return cls(xrt=xrt, bo=static_bo, slice_args=slice_args)
+
+    def slice_arg(self, plan: _PackedProjectionPlan, *, herd_cols: int) -> _StaticBOSliceArg:
+        if plan.row_blocks % herd_cols != 0:
+            raise RuntimeError(
+                f"row_blocks={plan.row_blocks} is not divisible by herd_cols={herd_cols}"
+            )
+        arg = self.slice_args.get(plan.tensor_key)
+        if arg is None:
+            raise RuntimeError(f"static projection BO slice not preloaded for {plan.tensor_key}")
+        block_bytes = arg.shape[-1]
+        expected_shape = (int(plan.row_blocks) // int(herd_cols), int(herd_cols), int(plan.col_blocks), int(block_bytes))
+        return _StaticBOSliceArg(
+            bo=arg.bo,
+            nbytes=arg.nbytes,
+            shape=expected_shape,
+            dtype=arg.dtype,
+            key=(*arg.key, "herd-cols", int(herd_cols), "shape", expected_shape),
+        )
 
 
 @dataclass(frozen=True)
@@ -463,6 +558,7 @@ def _prepare_layer_plans(
     *,
     quantized_weights_dir: Path | None = None,
     force_quantized_weights: bool = False,
+    production_static_projection_bo: bool = False,
 ):
     import numpy as np
     from gemma3.kernels.fused_dqp import build_paper_module
@@ -512,7 +608,7 @@ def _prepare_layer_plans(
             row_blocks = int(packed.shape[0])
             padded_shape = tuple(int(dim) for dim in q4nx_record.padded_shape)
             diagnostic_row_blocks = _ceil_to(row_blocks, 8)
-            if diagnostic_row_blocks > row_blocks:
+            if not production_static_projection_bo and diagnostic_row_blocks > row_blocks:
                 extra = diagnostic_row_blocks - row_blocks
                 packed = np.concatenate(
                     [
@@ -561,10 +657,12 @@ def _prepare_layer_plans(
                 min_offset=min_offset,
                 mlir_module=module_cache[row_blocks],
                 static_bo_offset=int(q4nx_record.static_bo_offset),
+                static_bo_bytes=int(q4nx_record.payload_bytes),
                 payload_sha256=q4nx_record.payload_sha256,
+                q4nx_payload=payload,
             )
         projection_plans[layer_index] = layer_projection_plans
-    return norm_plans, projection_plans
+    return norm_plans, projection_plans, int(manifest.static_bo_bytes)
 
 
 def _projection_bo_set_key(plan: _PackedProjectionPlan, col_block: int) -> tuple[object, ...]:
@@ -602,6 +700,17 @@ def _packed_l3_static_placeholder(plan: _PackedProjectionPlan):
 
 def _full_packed_l3_for_ingress(plan: _PackedProjectionPlan):
     return _full_packed_l3_for_herd_cols(plan, herd_cols=4)
+
+
+def _projection_full_arg(
+    plan: _PackedProjectionPlan,
+    *,
+    herd_cols: int,
+    static_projection_bo_store: _StaticProjectionBOStore | None,
+):
+    if static_projection_bo_store is None:
+        return _full_packed_l3_for_herd_cols(plan, herd_cols=herd_cols)
+    return static_projection_bo_store.slice_arg(plan, herd_cols=herd_cols)
 
 
 def _stitched_down_projection_plan(plan: _PackedProjectionPlan) -> _PackedProjectionPlan:
@@ -702,6 +811,7 @@ def _stitched_ingress_arrays(
     x_input,
     norm_plan: _NormPlan,
     projection_plans: dict[str, _PackedProjectionPlan],
+    static_projection_bo_store: _StaticProjectionBOStore | None = None,
 ):
     import numpy as np
     from gemma3.probes.stitched_decode import _identity_rope_lut
@@ -713,9 +823,9 @@ def _stitched_ingress_arrays(
         norm_plan.weight.reshape(-1).astype(bfloat16),
         activation_storage,
         activation_storage,
-        _full_packed_l3_for_ingress(projection_plans["q_proj"]),
-        _full_packed_l3_for_ingress(projection_plans["k_proj"]),
-        _full_packed_l3_for_ingress(projection_plans["v_proj"]),
+        _projection_full_arg(projection_plans["q_proj"], herd_cols=4, static_projection_bo_store=static_projection_bo_store),
+        _projection_full_arg(projection_plans["k_proj"], herd_cols=4, static_projection_bo_store=static_projection_bo_store),
+        _projection_full_arg(projection_plans["v_proj"], herd_cols=4, static_projection_bo_store=static_projection_bo_store),
         np.zeros((32, 32), dtype=bfloat16),
         np.zeros((8, 32), dtype=bfloat16),
         np.zeros((8, 32), dtype=bfloat16),
@@ -767,12 +877,15 @@ class _ReusableMultiOutputElfRunner:
             return int(array.size * array.itemsize)
         raise RuntimeError(f"unsupported argument placeholder: {type(array)!r}")
 
-    def _allocate_bos(self, sizes: list[int], bo_aliases: dict[int, int]):
+    def _allocate_bos(self, arrays: list[object], sizes: list[int], bo_aliases: dict[int, int]):
         bos = []
-        for index, size in enumerate(sizes):
+        for index, (array, size) in enumerate(zip(arrays, sizes)):
             alias = bo_aliases.get(index)
             if alias is None:
-                bos.append(self.cache.xrt.ext.bo(self.cache.device, size))
+                if isinstance(array, _StaticBOSliceArg):
+                    bos.append(array.bo)
+                else:
+                    bos.append(self.cache.xrt.ext.bo(self.cache.device, size))
                 continue
             if alias >= len(bos):
                 raise RuntimeError(f"BO alias {index}->{alias} targets an unallocated argument")
@@ -790,15 +903,21 @@ class _ReusableMultiOutputElfRunner:
     ):
         sizes = [self._array_nbytes(array) for array in arrays]
         alias_key = dict(bo_aliases)
+        static_arg_keys = [array.key if isinstance(array, _StaticBOSliceArg) else None for array in arrays]
         if bo_set_key is None:
             if self.state is None:
                 self.state = {
                     "sizes": sizes,
                     "static_keys": [None] * len(arrays),
+                    "static_arg_keys": static_arg_keys,
                     "bo_aliases": alias_key,
-                    "bos": self._allocate_bos(sizes, bo_aliases),
+                    "bos": self._allocate_bos(arrays, sizes, bo_aliases),
                 }
-            elif self.state["sizes"] != sizes or self.state["bo_aliases"] != alias_key:
+            elif (
+                self.state["sizes"] != sizes
+                or self.state["bo_aliases"] != alias_key
+                or self.state["static_arg_keys"] != static_arg_keys
+            ):
                 raise RuntimeError("reused multi-output ELF runner argument layout changed")
             return self.state["bos"], self.state["static_keys"]
 
@@ -807,11 +926,16 @@ class _ReusableMultiOutputElfRunner:
             state = {
                 "sizes": sizes,
                 "static_keys": [None] * len(arrays),
+                "static_arg_keys": static_arg_keys,
                 "bo_aliases": alias_key,
-                "bos": self._allocate_bos(sizes, bo_aliases),
+                "bos": self._allocate_bos(arrays, sizes, bo_aliases),
             }
             self.bo_sets[bo_set_key] = state
-        elif state["sizes"] != sizes or state["bo_aliases"] != alias_key:
+        elif (
+            state["sizes"] != sizes
+            or state["bo_aliases"] != alias_key
+            or state["static_arg_keys"] != static_arg_keys
+        ):
             raise RuntimeError(
                 f"reused multi-output ELF runner BO-set layout mismatch for {bo_set_key}"
             )
@@ -834,6 +958,11 @@ class _ReusableMultiOutputElfRunner:
             if requested_key is None and not write_dynamic:
                 continue
             if requested_key is not None and static_keys[index] == requested_key:
+                continue
+            if isinstance(array, _StaticBOSliceArg):
+                if requested_key is None:
+                    raise RuntimeError("static BO slice arguments require a static input key")
+                static_keys[index] = requested_key
                 continue
             if not hasattr(array, "dtype"):
                 raise RuntimeError(
@@ -951,6 +1080,7 @@ def _preload_static_stitched_ingress_bo_sets(
     runner_cache: _ReusableElfRunnerCache,
     fused_dqp_object_file: Path,
     rope_object_file: Path,
+    static_projection_bo_store: _StaticProjectionBOStore | None = None,
 ) -> int:
     import numpy as np
     from ml_dtypes import bfloat16
@@ -967,6 +1097,7 @@ def _preload_static_stitched_ingress_bo_sets(
             x_input=zero_hidden,
             norm_plan=norm_plans[layer_index],
             projection_plans=projection_plans[layer_index],
+            static_projection_bo_store=static_projection_bo_store,
         )
         runner.prepare(
             arrays=arrays,
@@ -999,7 +1130,14 @@ def _stitched_attention_o_static_input_keys(
     return keys
 
 
-def _stitched_attention_o_arrays(*, q, k, v, projection_plans: dict[str, _PackedProjectionPlan]):
+def _stitched_attention_o_arrays(
+    *,
+    q,
+    k,
+    v,
+    projection_plans: dict[str, _PackedProjectionPlan],
+    static_projection_bo_store: _StaticProjectionBOStore | None = None,
+):
     import numpy as np
     from ml_dtypes import bfloat16
 
@@ -1012,15 +1150,15 @@ def _stitched_attention_o_arrays(*, q, k, v, projection_plans: dict[str, _Packed
         qkv_storage,
         attention_storage,
         attention_storage.reshape(4, 256),
-        _full_packed_l3_for_ingress(projection_plans["o_proj"]),
-        np.zeros((40, 32), dtype=bfloat16),
+        _projection_full_arg(projection_plans["o_proj"], herd_cols=4, static_projection_bo_store=static_projection_bo_store),
+        np.zeros((36, 32), dtype=bfloat16),
     ]
 
 
 def _stitched_attention_o_readback(dtype) -> dict[str, tuple[int, tuple[int, ...], object]]:
     return {
         "attention": (1, (1, 4, 256), dtype),
-        "o_proj": (4, (40, 32), dtype),
+        "o_proj": (4, (36, 32), dtype),
     }
 
 
@@ -1055,6 +1193,7 @@ def _preload_static_stitched_attention_o_bo_sets(
     runner_cache: _ReusableElfRunnerCache,
     fused_dqp_object_file: Path,
     flowqkv_object_file: Path,
+    static_projection_bo_store: _StaticProjectionBOStore | None = None,
 ) -> int:
     import numpy as np
     from ml_dtypes import bfloat16
@@ -1069,7 +1208,13 @@ def _preload_static_stitched_attention_o_bo_sets(
     k = np.zeros((1, 1, 256), dtype=bfloat16)
     v = np.zeros((1, 1, 256), dtype=bfloat16)
     for layer_index in sorted(projection_plans):
-        arrays = _stitched_attention_o_arrays(q=q, k=k, v=v, projection_plans=projection_plans[layer_index])
+        arrays = _stitched_attention_o_arrays(
+            q=q,
+            k=k,
+            v=v,
+            projection_plans=projection_plans[layer_index],
+            static_projection_bo_store=static_projection_bo_store,
+        )
         runner.prepare(
             arrays=arrays,
             bo_set_key=_stitched_attention_o_bo_set_key(layer_index),
@@ -1260,7 +1405,13 @@ def _stitched_ffn_gate_up_static_input_keys(
     return keys
 
 
-def _stitched_ffn_gate_up_arrays(*, residual_actual, norm_plan: _NormPlan, projection_plans: dict[str, _PackedProjectionPlan]):
+def _stitched_ffn_gate_up_arrays(
+    *,
+    residual_actual,
+    norm_plan: _NormPlan,
+    projection_plans: dict[str, _PackedProjectionPlan],
+    static_projection_bo_store: _StaticProjectionBOStore | None = None,
+):
     import numpy as np
     from ml_dtypes import bfloat16
 
@@ -1270,8 +1421,8 @@ def _stitched_ffn_gate_up_arrays(*, residual_actual, norm_plan: _NormPlan, proje
         norm_plan.norm_weights["pre_feedforward_layernorm"].reshape(-1).astype(bfloat16),
         activation_storage,
         activation_storage,
-        _full_packed_l3_for_ingress(projection_plans["gate_proj"]),
-        _full_packed_l3_for_ingress(projection_plans["up_proj"]),
+        _projection_full_arg(projection_plans["gate_proj"], herd_cols=4, static_projection_bo_store=static_projection_bo_store),
+        _projection_full_arg(projection_plans["up_proj"], herd_cols=4, static_projection_bo_store=static_projection_bo_store),
         np.zeros((216, 32), dtype=bfloat16),
         np.zeros((216, 32), dtype=bfloat16),
     ]
@@ -1317,6 +1468,7 @@ def _preload_static_stitched_ffn_gate_up_bo_sets(
     projection_plans: dict[int, dict[str, _PackedProjectionPlan]],
     runner_cache: _ReusableElfRunnerCache,
     fused_dqp_object_file: Path,
+    static_projection_bo_store: _StaticProjectionBOStore | None = None,
 ) -> int:
     import numpy as np
     from ml_dtypes import bfloat16
@@ -1332,6 +1484,7 @@ def _preload_static_stitched_ffn_gate_up_bo_sets(
             residual_actual=zero_hidden,
             norm_plan=norm_plans[layer_index],
             projection_plans=projection_plans[layer_index],
+            static_projection_bo_store=static_projection_bo_store,
         )
         runner.prepare(
             arrays=arrays,
@@ -1363,7 +1516,13 @@ def _stitched_ffn_geglu_down_static_input_keys(
     return keys
 
 
-def _stitched_ffn_geglu_down_arrays(*, gate_actual, up_actual, projection_plans: dict[str, _PackedProjectionPlan]):
+def _stitched_ffn_geglu_down_arrays(
+    *,
+    gate_actual,
+    up_actual,
+    projection_plans: dict[str, _PackedProjectionPlan],
+    static_projection_bo_store: _StaticProjectionBOStore | None = None,
+):
     import numpy as np
     from ml_dtypes import bfloat16
 
@@ -1373,7 +1532,11 @@ def _stitched_ffn_geglu_down_arrays(*, gate_actual, up_actual, projection_plans:
         up_actual.reshape(-1).astype(bfloat16),
         mlp_storage,
         mlp_storage.reshape(27, 256),
-        _full_packed_l3_for_herd_cols(_stitched_down_projection_plan(projection_plans["down_proj"]), herd_cols=3),
+        _projection_full_arg(
+            _stitched_down_projection_plan(projection_plans["down_proj"]),
+            herd_cols=3,
+            static_projection_bo_store=static_projection_bo_store,
+        ),
         np.zeros((36, 32), dtype=bfloat16),
     ]
 
@@ -1415,6 +1578,7 @@ def _preload_static_stitched_ffn_geglu_down_bo_sets(
     projection_plans: dict[int, dict[str, _PackedProjectionPlan]],
     runner_cache: _ReusableElfRunnerCache,
     fused_dqp_object_file: Path,
+    static_projection_bo_store: _StaticProjectionBOStore | None = None,
 ) -> int:
     import numpy as np
     from ml_dtypes import bfloat16
@@ -1430,6 +1594,7 @@ def _preload_static_stitched_ffn_geglu_down_bo_sets(
             gate_actual=zero_ffn,
             up_actual=zero_ffn,
             projection_plans=projection_plans[layer_index],
+            static_projection_bo_store=static_projection_bo_store,
         )
         runner.prepare(
             arrays=arrays,
@@ -1921,6 +2086,7 @@ def _run_stitched_ingress_stage(
     fused_dqp_object_file: Path,
     rope_object_file: Path,
     check_references: bool,
+    static_projection_bo_store: _StaticProjectionBOStore | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], list[ProjectionEvidence], list[str], float | None]:
     import numpy as np
     from gemma3.core.common import fused_dqp_paper_reference
@@ -1935,6 +2101,7 @@ def _run_stitched_ingress_stage(
         x_input=x_input,
         norm_plan=norm_plan,
         projection_plans=projection_plans,
+        static_projection_bo_store=static_projection_bo_store,
     )
     runner = _stitched_ingress_runner(
         runner_cache,
@@ -2050,12 +2217,19 @@ def _run_stitched_attention_o_stage(
     fused_dqp_object_file: Path,
     flowqkv_object_file: Path,
     check_references: bool,
+    static_projection_bo_store: _StaticProjectionBOStore | None = None,
 ) -> tuple[Any, Any, Any, Any, ProjectionEvidence, list[str]]:
     import numpy as np
     from gemma3.core.common import attention_reference, fused_dqp_paper_reference
     from ml_dtypes import bfloat16
 
-    arrays = _stitched_attention_o_arrays(q=q, k=k, v=v, projection_plans=projection_plans)
+    arrays = _stitched_attention_o_arrays(
+        q=q,
+        k=k,
+        v=v,
+        projection_plans=projection_plans,
+        static_projection_bo_store=static_projection_bo_store,
+    )
     runner = _stitched_attention_o_runner(
         runner_cache,
         fused_dqp_object_file=fused_dqp_object_file,
@@ -2089,7 +2263,7 @@ def _run_stitched_attention_o_stage(
             attention_expected.reshape(4, 256),
             32,
             256,
-        ).reshape(40, 32)
+        ).reshape(plan.row_blocks, 32)
         o_expected = o_expected_full.reshape(-1)[: plan.shape[0]].astype(bfloat16)
         attention_corr = _correlation(attention_actual, attention_expected)
         o_corr = _correlation(o_actual, o_expected)
@@ -2242,6 +2416,7 @@ def _run_stitched_ffn_gate_up_stage(
     power_meter,
     fused_dqp_object_file: Path,
     check_references: bool,
+    static_projection_bo_store: _StaticProjectionBOStore | None = None,
 ) -> tuple[Any, Any, Any, Any, Any, Any, list[ProjectionEvidence], list[str]]:
     import numpy as np
     from gemma3.core.common import fused_dqp_paper_reference
@@ -2251,6 +2426,7 @@ def _run_stitched_ffn_gate_up_stage(
         residual_actual=residual_actual,
         norm_plan=norm_plan,
         projection_plans=projection_plans,
+        static_projection_bo_store=static_projection_bo_store,
     )
     runner = _stitched_ffn_gate_up_runner(
         runner_cache,
@@ -2343,6 +2519,7 @@ def _run_stitched_ffn_geglu_down_stage(
     power_meter,
     fused_dqp_object_file: Path,
     check_references: bool,
+    static_projection_bo_store: _StaticProjectionBOStore | None = None,
 ) -> tuple[Any, Any, Any, Any, ProjectionEvidence, list[str]]:
     import numpy as np
     from gemma3.core.common import fused_dqp_paper_reference
@@ -2352,6 +2529,7 @@ def _run_stitched_ffn_geglu_down_stage(
         gate_actual=gate_actual,
         up_actual=up_actual,
         projection_plans=projection_plans,
+        static_projection_bo_store=static_projection_bo_store,
     )
     runner = _stitched_ffn_geglu_down_runner(
         runner_cache,
@@ -2489,6 +2667,7 @@ def _run_one_layer(
     tiled_attention_kv_tile: int,
     tiled_attention_host_batch_tiles: int,
     prefill_kv_cache: dict[int, tuple[Any, Any]] | None,
+    static_projection_bo_store: _StaticProjectionBOStore | None = None,
     check_references: bool = True,
 ) -> tuple[Any, LayerLoopEvidence, list[str]]:
     from ml_dtypes import bfloat16
@@ -2512,6 +2691,7 @@ def _run_one_layer(
             fused_dqp_object_file=fused_dqp_object_file,
             rope_object_file=rope_object_file,
             check_references=check_references,
+            static_projection_bo_store=static_projection_bo_store,
         )
         blockers.extend(ingress_blockers)
     elif ingress_mode == "staged":
@@ -2637,6 +2817,7 @@ def _run_one_layer(
             fused_dqp_object_file=fused_dqp_object_file,
             flowqkv_object_file=flowqkv_object_file,
             check_references=check_references,
+            static_projection_bo_store=static_projection_bo_store,
         )
         projection_evidence.append(evidence)
         blockers.extend(attention_o_blockers)
@@ -2747,6 +2928,7 @@ def _run_one_layer(
             power_meter=power_meter,
             fused_dqp_object_file=fused_dqp_object_file,
             check_references=check_references,
+            static_projection_bo_store=static_projection_bo_store,
         )
         projection_evidence.extend(gate_up_evidence)
         blockers.extend(gate_up_blockers)
@@ -2800,6 +2982,7 @@ def _run_one_layer(
             power_meter=power_meter,
             fused_dqp_object_file=fused_dqp_object_file,
             check_references=check_references,
+            static_projection_bo_store=static_projection_bo_store,
         )
         projection_evidence.append(down_evidence)
         blockers.extend(geglu_down_blockers)
@@ -2913,6 +3096,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
     layer_evidence: list[LayerLoopEvidence] = []
     timed_kernel_samples: list[float] = []
     runner_cache: _ReusableElfRunnerCache | None = None
+    static_projection_bo_store: _StaticProjectionBOStore | None = None
     segment_power = _SegmentedRAPLPowerMeter(
         sample=bool(args.power_sample),
         run_id="gemma3_1b_decode_loop_probe_kernel_segments",
@@ -2964,12 +3148,13 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         if args.logits_timing != "excluded" and args.logits_mode != "host-tied-embedding":
             raise RuntimeError("--logits-timing=included requires --logits-mode=host-tied-embedding")
         weights_dir = _resolve_weights_dir(args.model_variant, args.weights_dir)
-        norm_plans, projection_plans = _prepare_layer_plans(
+        norm_plans, projection_plans, projection_static_bo_bytes = _prepare_layer_plans(
             args.model_variant,
             weights_dir,
             args.layers,
             quantized_weights_dir=args.quantized_weights_dir,
             force_quantized_weights=args.force_quantized_weights,
+            production_static_projection_bo=bool(args.production_static_projection_bo),
         )
         if args.attention_mode == "tiled-stats-1k" and args.attention_cache_mode == "hf-prefill":
             hf_prefill_context = _real_hf_prefill_context(
@@ -2987,16 +3172,40 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         tiled_stats_object_file = peano_build_dir / "flowqkv_tiled_stats_q4_kv32_d256.o"
         runner_cache = _ReusableElfRunnerCache(enabled=not args.no_reuse_elf)
         runner_cache.__enter__()
-        static_projection_argument_mode = (
-            "per-launch-write"
-            if args.dynamic_static_weight_writes or args.no_reuse_elf
-            else "preloaded-runner-bo-set"
-        )
+        if args.production_static_projection_bo:
+            required_modes = (
+                args.ingress_mode,
+                args.attention_o_mode,
+                args.post_attention_mode,
+                args.ffn_gate_up_mode,
+                args.ffn_geglu_down_mode,
+                args.post_feedforward_mode,
+            )
+            if args.no_reuse_elf or args.dynamic_static_weight_writes or any(mode != "stitched" for mode in required_modes):
+                raise RuntimeError(
+                    "production static projection BO requires reusable all-stitched decode stages"
+                )
+            static_projection_bo_store = _StaticProjectionBOStore.create(
+                runner_cache=runner_cache,
+                projection_plans=projection_plans,
+                static_bo_bytes=projection_static_bo_bytes,
+            )
+            static_projection_argument_mode = "manifest-contiguous-static-bo"
+        else:
+            static_projection_argument_mode = (
+                "per-launch-write"
+                if args.dynamic_static_weight_writes or args.no_reuse_elf
+                else "preloaded-runner-bo-set"
+            )
         static_projection_bo_set_count = 0
         static_ingress_bo_set_count = 0
         static_attention_o_bo_set_count = 0
         static_post_attention_residual_bo_set_count = 0
-        if static_projection_argument_mode == "preloaded-runner-bo-set":
+        if static_projection_argument_mode == "manifest-contiguous-static-bo":
+            static_projection_bo_set_count = (
+                0 if static_projection_bo_store is None else static_projection_bo_store.slice_count
+            )
+        elif static_projection_argument_mode == "preloaded-runner-bo-set":
             projection_preload_family_set = set(FULL_LAYER_PROJECTION_FAMILIES)
             if args.ingress_mode == "stitched":
                 projection_preload_family_set.difference_update({"q_proj", "k_proj", "v_proj"})
@@ -3023,6 +3232,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 runner_cache=runner_cache,
                 fused_dqp_object_file=fused_dqp_object_file,
                 rope_object_file=rope_object_file,
+                static_projection_bo_store=static_projection_bo_store,
             )
         if args.attention_o_mode == "stitched":
             static_attention_o_bo_set_count = _preload_static_stitched_attention_o_bo_sets(
@@ -3030,6 +3240,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 runner_cache=runner_cache,
                 fused_dqp_object_file=fused_dqp_object_file,
                 flowqkv_object_file=flowqkv_object_file,
+                static_projection_bo_store=static_projection_bo_store,
             )
         if args.post_attention_mode == "stitched":
             static_post_attention_residual_bo_set_count = _preload_static_stitched_post_attention_residual_bo_sets(
@@ -3042,12 +3253,14 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 projection_plans=projection_plans,
                 runner_cache=runner_cache,
                 fused_dqp_object_file=fused_dqp_object_file,
+                static_projection_bo_store=static_projection_bo_store,
             )
         if args.ffn_geglu_down_mode == "stitched":
             static_ffn_geglu_down_bo_set_count = _preload_static_stitched_ffn_geglu_down_bo_sets(
                 projection_plans=projection_plans,
                 runner_cache=runner_cache,
                 fused_dqp_object_file=fused_dqp_object_file,
+                static_projection_bo_store=static_projection_bo_store,
             )
         if args.post_feedforward_mode == "stitched":
             static_post_feedforward_residual_bo_set_count = _preload_static_stitched_post_feedforward_residual_bo_sets(
@@ -3090,6 +3303,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 tiled_attention_kv_tile=args.tiled_attention_kv_tile,
                 tiled_attention_host_batch_tiles=args.tiled_attention_host_batch_tiles,
                 prefill_kv_cache=prefill_kv_cache,
+                static_projection_bo_store=static_projection_bo_store,
             )
             if warmup_blockers:
                 blockers.extend(f"warmup:{item}" for item in warmup_blockers)
@@ -3121,6 +3335,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 tiled_attention_kv_tile=args.tiled_attention_kv_tile,
                 tiled_attention_host_batch_tiles=args.tiled_attention_host_batch_tiles,
                 prefill_kv_cache=prefill_kv_cache,
+                static_projection_bo_store=static_projection_bo_store,
                 check_references=True,
             )
             layer_evidence.append(evidence)
@@ -3175,6 +3390,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                     tiled_attention_kv_tile=args.tiled_attention_kv_tile,
                     tiled_attention_host_batch_tiles=args.tiled_attention_host_batch_tiles,
                     prefill_kv_cache=prefill_kv_cache,
+                    static_projection_bo_store=static_projection_bo_store,
                     check_references=False,
                 )
                 blockers.extend(layer_blockers)
@@ -3287,7 +3503,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         timing_window="post-warmup-loop-wall-and-segmented-run-start-wait2",
         timing_notes=(
             "warmup layers compile/load ELF runners and allocate runner-owned BOs before measured loop timing",
-            "preloaded-runner-bo-set mode allocates BO sets and writes packed projection static inputs before measured loop timing",
+            (
+                "manifest-contiguous-static-bo mode writes the Q4NX manifest payloads into one static BO and binds tensor sub-buffers before measured loop timing"
+                if static_projection_argument_mode == "manifest-contiguous-static-bo"
+                else "preloaded-runner-bo-set mode allocates BO sets and writes packed projection static inputs before measured loop timing"
+            ),
             (
                 "stitched ingress mode preloads one aliased RMSNorm/QKV/QK-norm/RoPE BO set per layer before measured loop timing"
                 if args.ingress_mode == "stitched"
@@ -3403,7 +3623,11 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 if args.ffn_geglu_down_mode == "stitched" and args.post_feedforward_mode != "stitched"
                 else ()
             ),
-            "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route",
+            *(
+                ()
+                if static_projection_argument_mode == "manifest-contiguous-static-bo"
+                else ("production-contiguous-static-weight-bo-not-used-by-fused-dqp-route",)
+            ),
         ),
         command=tuple(sys.argv),
         returncode=returncode,
@@ -3466,6 +3690,7 @@ def build_runtime_decode_loop_args(
         dynamic_static_weight_writes=False,
         quantized_weights_dir=quantized_weights_dir,
         force_quantized_weights=force_quantized_weights,
+        production_static_projection_bo=True,
         no_reuse_elf=False,
     )
 
@@ -3564,6 +3789,8 @@ def _self_test() -> None:
         raise AssertionError(runtime_args)
     if runtime_args.no_reuse_elf or runtime_args.dynamic_static_weight_writes:
         raise AssertionError(runtime_args)
+    if not runtime_args.production_static_projection_bo:
+        raise AssertionError(runtime_args)
     import tempfile
 
     host_logits_data = result.to_json_dict()
@@ -3643,6 +3870,7 @@ def main() -> int:
     parser.add_argument("--logits-timing", choices=["excluded", "included"], default="excluded")
     parser.add_argument("--logits-chunk-rows", type=int, default=8192)
     parser.add_argument("--dynamic-static-weight-writes", action="store_true", help="diagnostic fallback: write packed projection static inputs inside each launch")
+    parser.add_argument("--production-static-projection-bo", action="store_true", help="bind stitched FusedDQP projection inputs as sub-buffers of one manifest-backed Q4NX static BO")
     parser.add_argument("--quantized-weights-dir", type=Path)
     parser.add_argument("--force-quantized-weights", action="store_true")
     parser.add_argument("--no-reuse-elf", action="store_true")

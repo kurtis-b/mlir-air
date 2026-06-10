@@ -100,8 +100,8 @@ ATTENTION_O_ARG_TYPES = (
     "memref<1x1x6x256xbf16>",  # packed Q/K/V for single-token FlowQKV
     "memref<1x4x256xbf16>",  # attention output view
     "memref<4x256xbf16>",  # O-projection activation alias, same BO as arg1
-    "memref<10x4x4x5120xi8>",  # O packed Q4NX blocks, scale, min
-    "memref<40x32xbf16>",  # O projection output, contiguous 1280 padded values
+    "memref<9x4x4x5120xi8>",  # O packed Q4NX blocks, scale, min
+    "memref<36x32xbf16>",  # O projection output, contiguous 1152 values
 )
 
 POST_ATTENTION_RESIDUAL_ARG_TYPES = (
@@ -682,9 +682,9 @@ def build_attention_o_text(
             256,
             "fused_dqp_accum_block_opt",
             str(object_file),
-            40,
+            36,
             4,
-            2,
+            1,
             4,
             "l2-gather",
         )
@@ -1377,7 +1377,7 @@ def _run_attention_o_hardware(args: argparse.Namespace) -> StitchedAttentionOPro
             attention_expected.reshape(4, 256),
             32,
             256,
-        ).reshape(40, 32)
+        ).reshape(36, 32)
 
         qkv_storage = np.zeros((1, 1, 6, 256), dtype=bfloat16)
         qkv_storage[0, 0, 0:4, :] = q.reshape(4, 256)
@@ -1389,7 +1389,7 @@ def _run_attention_o_hardware(args: argparse.Namespace) -> StitchedAttentionOPro
             attention_storage,
             attention_storage.reshape(4, 256),
             o_pack,
-            np.zeros((40, 32), dtype=bfloat16),
+            np.zeros((36, 32), dtype=bfloat16),
         ]
         actual = _run_multi_output_elf(
             mlir_module=build_attention_o_module(
@@ -1400,7 +1400,7 @@ def _run_attention_o_hardware(args: argparse.Namespace) -> StitchedAttentionOPro
             arrays=arrays,
             readback={
                 "attention": (1, (1, 4, 256), bfloat16),
-                "o_proj": (4, (40, 32), bfloat16),
+                "o_proj": (4, (36, 32), bfloat16),
             },
             timed_kernel_seconds=timed_kernel_seconds,
             bo_aliases={2: 1},

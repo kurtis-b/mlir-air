@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import json
 from pathlib import Path
 
 from gemma3.core.artifacts import discover_model_artifacts
@@ -16,6 +17,11 @@ from gemma3.evidence.environment import capture_environment
 from gemma3.evidence.paper_compare import unmeasured_host_fallbacks
 from gemma3.evidence.results import fallback_records
 from gemma3.model.vision import Gemma3VisionConfig, run_vision_prefill_or_disabled
+from gemma3.paths import RESULTS_DIR
+
+
+PRODUCTION_STATIC_BO_BLOCKER = "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
+NPU_RUNTIME_DECODE_LOOP_EVIDENCE = RESULTS_DIR / "gemma3_1b_npu_runtime_decode_loop.json"
 
 
 @dataclass(frozen=True)
@@ -53,13 +59,35 @@ def _artifact_blockers(model_variant: str, weights_dir: Path | None = None) -> l
 
 
 
+def _has_runtime_static_projection_bo_evidence(model_variant: str) -> bool:
+    if model_variant != "gemma3-1b":
+        return False
+    try:
+        data = json.loads(NPU_RUNTIME_DECODE_LOOP_EVIDENCE.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    loop = data.get("npu_decode_loop")
+    if not isinstance(loop, dict):
+        return False
+    return (
+        data.get("status") == "DECODE_RUNTIME_PASS_WITH_BLOCKERS"
+        and loop.get("status") == "DECODE_LOOP_DIAGNOSTIC_PASS"
+        and loop.get("static_projection_argument_mode") == "manifest-contiguous-static-bo"
+        and int(loop.get("static_projection_bo_set_count", 0) or 0) > 0
+        and PRODUCTION_STATIC_BO_BLOCKER not in loop.get("remaining_paper_gaps", [])
+    )
+
+
 def _execution_blockers(model_variant: str, weights_dir: Path | None = None) -> list[str]:
     try:
         from gemma3.npu.wiring import build_wiring_plan
 
-        return list(build_wiring_plan(model_variant, weights_dir=weights_dir).blockers)
+        blockers = list(build_wiring_plan(model_variant, weights_dir=weights_dir).blockers)
     except Exception:
         return ["npu-model-execution-not-implemented"]
+    if _has_runtime_static_projection_bo_evidence(model_variant):
+        blockers = [blocker for blocker in blockers if blocker != PRODUCTION_STATIC_BO_BLOCKER]
+    return blockers
 
 
 def _vision_blockers() -> list[str]:

@@ -702,7 +702,10 @@ def _setup_ownership(session: Gemma3RuntimeSession) -> tuple[Gemma3RuntimeOwners
 
 
 def _decode_probe_blockers(session: Gemma3RuntimeSession, probe: Any) -> tuple[str, ...]:
-    blockers: list[str] = list(session.setup.blockers)
+    setup_blockers = list(session.setup.blockers)
+    if getattr(probe, "static_projection_argument_mode", None) == "manifest-contiguous-static-bo":
+        setup_blockers = [blocker for blocker in setup_blockers if blocker != PRODUCTION_STATIC_BO_BLOCKER]
+    blockers: list[str] = setup_blockers
     blockers.extend(getattr(probe, "blockers", ()))
     gap_map = {
         "prefill-kv-cache-not-constructed": NPU_PREFILL_KV_CACHE_BLOCKER,

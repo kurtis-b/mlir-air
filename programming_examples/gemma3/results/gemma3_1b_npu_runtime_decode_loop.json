@@ -6,21 +6,20 @@
     "prefill-1k-npu-not-wired",
     "npu-prefill-kv-cache-not-wired",
     "npu-attention-reduction-not-wired",
-    "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route",
     "paper-1k-kv-attention-not-wired",
     "logits-sampling-not-wired",
     "decode-layer-after-stitched-ingress-still-staged"
   ],
   "decode_context": 1024,
   "decode_tokens": 1,
-  "elapsed_seconds": 27.761536421006895,
+  "elapsed_seconds": 27.149061856005574,
   "entrypoint": "generate",
   "error": null,
   "generated_token_ids": [],
   "host_fallback_count": 0,
   "host_runtime_count": 0,
   "kernel_launch_count": 156,
-  "local_value": 0.21410856891513058,
+  "local_value": 0.20885690578928925,
   "model_variant": "gemma3-1b",
   "npu_decode_loop": {
     "attention_cache_build_seconds": null,
@@ -52,13 +51,13 @@
     "decode_input_token_id": null,
     "decode_input_token_text": null,
     "decode_tokens": 1,
-    "diagnostic_decode_tps_kernel_only": 0.21633890628766272,
-    "diagnostic_decode_tps_loop_wall": 0.21410856891513058,
+    "diagnostic_decode_tps_kernel_only": 0.21104905083113976,
+    "diagnostic_decode_tps_loop_wall": 0.20885690578928925,
     "dirty_worktree": true,
-    "elapsed_seconds": 27.761536421006895,
+    "elapsed_seconds": 27.149061856005574,
     "ffn_gate_up_mode": "stitched",
     "ffn_geglu_down_mode": "stitched",
-    "git_commit": "2ea3787b41e5528ec25e4355024be34612273dda",
+    "git_commit": "085ea177ca49a9a66002a139f2a827f8d526658a",
     "host_fallbacks": [],
     "ingress_mode": "stitched",
     "input_distribution": "bounded-uniform-seed0",
@@ -66,7 +65,7 @@
       1,
       1152
     ],
-    "kernel_only_delta_pct_vs_paper_decode_tps_1k": 99.47362796523683,
+    "kernel_only_delta_pct_vs_paper_decode_tps_1k": 99.48649865977825,
     "layer_count": 26,
     "layer_evidence": [
       {
@@ -127,11 +126,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999906284853377,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -251,11 +250,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999926593988853,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -375,11 +374,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.999989896022707,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -499,11 +498,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999907478691961,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -623,11 +622,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999925741048492,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -747,11 +746,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999789141759019,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -871,11 +870,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.999988778834279,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -995,11 +994,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999921089243172,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -1119,11 +1118,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999842046751646,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -1243,11 +1242,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999794521252193,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -1367,11 +1366,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999918889648005,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -1491,11 +1490,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999812253765679,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -1615,11 +1614,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999884898020595,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -1739,11 +1738,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999819509758952,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -1863,11 +1862,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999873893409367,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -1987,11 +1986,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999923325745493,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -2111,11 +2110,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999859333426508,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -2235,11 +2234,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999887586432658,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -2359,11 +2358,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.99998466665133,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -2483,11 +2482,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999890715124123,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -2607,11 +2606,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.999990214336334,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -2731,11 +2730,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999897459808876,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -2855,11 +2854,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999870286417013,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -2979,11 +2978,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999839312058572,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -3103,11 +3102,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999657506948477,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -3227,11 +3226,11 @@
             "dense_projection_correlation": null,
             "family": "o_proj",
             "padded_shape": [
-              1280,
+              1152,
               1024
             ],
             "projection_correlation": 0.9999882056488707,
-            "row_blocks": 40,
+            "row_blocks": 36,
             "shape": [
               1152,
               1024
@@ -3295,8 +3294,8 @@
       }
     ],
     "logits_evidence": null,
-    "loop_wall_delta_pct_vs_paper_decode_tps_1k": 99.47905457684884,
-    "measured_loop_seconds": 4.67052769100701,
+    "loop_wall_delta_pct_vs_paper_decode_tps_1k": 99.49183234601145,
+    "measured_loop_seconds": 4.787967130992911,
     "model_variant": "gemma3-1b",
     "norm_argument_mode": "selected-vector",
     "output_format": "elf",
@@ -3332,13 +3331,12 @@
     "prompt_context_length": 1024,
     "reference_check_layer_count": 26,
     "reference_check_mode": "all-layers-before-timing",
-    "reference_check_seconds": 6.379238477995386,
+    "reference_check_seconds": 6.580174888993497,
     "remaining_paper_gaps": [
       "prefill-kv-cache-not-constructed",
       "paper-1k-kv-attention-not-wired",
       "logits-sampling-not-wired",
-      "decode-layer-after-stitched-ingress-still-staged",
-      "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
+      "decode-layer-after-stitched-ingress-still-staged"
     ],
     "returncode": 0,
     "runner_reuse_mode": "reused-elf-persistent-bo",
@@ -3351,19 +3349,19 @@
     "static_ingress_bo_set_count": 26,
     "static_post_attention_residual_bo_set_count": 26,
     "static_post_feedforward_residual_bo_set_count": 26,
-    "static_projection_argument_mode": "preloaded-runner-bo-set",
-    "static_projection_bo_set_count": 0,
+    "static_projection_argument_mode": "manifest-contiguous-static-bo",
+    "static_projection_bo_set_count": 182,
     "status": "DECODE_LOOP_DIAGNOSTIC_PASS",
     "stderr_tail": [],
     "stdout_tail": [
       "decode token 0: final checksum=-38224.218750"
     ],
     "timed_kernel_count": 156,
-    "timed_kernel_mean_seconds": 0.029630622250316756,
-    "timed_kernel_seconds": 4.622377071049414,
+    "timed_kernel_mean_seconds": 0.030373301301341808,
+    "timed_kernel_seconds": 4.738235003009322,
     "timing_notes": [
       "warmup layers compile/load ELF runners and allocate runner-owned BOs before measured loop timing",
-      "preloaded-runner-bo-set mode allocates BO sets and writes packed projection static inputs before measured loop timing",
+      "manifest-contiguous-static-bo mode writes the Q4NX manifest payloads into one static BO and binds tensor sub-buffers before measured loop timing",
       "stitched ingress mode preloads one aliased RMSNorm/QKV/QK-norm/RoPE BO set per layer before measured loop timing",
       "stitched attention/O mode preloads one aliased FlowQKV/O-projection BO set per layer before measured loop timing",
       "stitched post-attention mode preloads one aliased RMSNorm/residual BO set per layer before measured loop timing",
