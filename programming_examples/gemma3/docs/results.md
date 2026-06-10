@@ -31,7 +31,10 @@ because it records `host_fallbacks=[]`; 4B and vision still need equivalent
 composed evidence before that blocker can be narrowed. Kernel argument-layout
 validation is complete for the real 1B 1k/32k context model-runner plan: 728
 NPU candidate layouts, 2,236 positional
-arguments, and zero binding blockers. Staged decode layer-0 correctness and
+arguments, and zero binding blockers. The `gemma3.npu.inference_runtime` shell
+now reports this setup through `prepare_runtime()` and attaches the same
+blockers under `npu_runtime` in NPU paper-benchmark JSONs. Staged decode
+layer-0 correctness and
 segmented kernel-only timing evidence is now present and attached under
 `npu_staged_diagnostic` in the blocked NPU paper-cell JSONs, but official NPU
 `local_value` remains null because this is not a timed paper-cell run.

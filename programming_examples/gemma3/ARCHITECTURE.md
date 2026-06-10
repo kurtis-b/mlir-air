@@ -326,6 +326,7 @@ Model-level NPU planning assets:
 | Buffer binding plan | `gemma3.npu.buffer_binding` |
 | Kernel argument binding plan | `gemma3.npu.argument_binding` |
 | Launch-order manifest | `gemma3.npu.model_runner` |
+| Runtime shell | `gemma3.npu.inference_runtime` |
 | Stitched decode MLIR | `gemma3.probes.stitched_decode`, `gemma3.npu.stitching` |
 
 Diagnostic/probe files should remain support artifacts. New paper-parity work
@@ -333,6 +334,8 @@ should promote behavior into a Llama-style NPU runtime path before using it for
 headline timing.
 
 ### Target NPU Runtime
+
+`gemma3.npu.inference_runtime` now owns the production-shaped runtime shell. Its current implementation prepares real 1B/1k setup state, validates kernel argument bindings, records static-input/readback policy, and returns blocked `run_npu_prefill()` / `generate()` results until production launches are promoted out of probes.
 
 The target runtime shape is:
 
@@ -729,8 +732,6 @@ rg -n "^#{1,4} " programming_examples/gemma3/ARCHITECTURE.md
 The next engineering change should not broaden scope. It should take one item
 from this list:
 
-- Add or promote a Gemma NPU runtime shell matching the Llama
-  `prepare_runtime()` / `run_npu_prefill()` / `generate()` structure.
 - Convert the current stitched decode diagnostic runner into a cached-runtime
   path with production static BO ownership.
 - Wire 1B NPU prefill far enough to produce K/V cache rows for decode.

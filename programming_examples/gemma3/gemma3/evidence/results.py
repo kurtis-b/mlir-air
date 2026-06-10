@@ -483,6 +483,52 @@ def build_model_runner_record(
         }
 
 
+def build_npu_runtime_record(
+    *,
+    model_variant: str,
+    backend: str,
+    weights_dir: Path | None,
+    tokenizer: Path | None,
+    artifacts_ready: bool,
+    prompt_len: int,
+    quantized_weights: str = "required",
+    quantized_weights_dir: Path | None = None,
+    force_quantized_weights: bool = False,
+) -> dict[str, Any] | None:
+    if backend != "npu" or not artifacts_ready:
+        return None
+    try:
+        from gemma3.npu.inference_runtime import prepare_runtime
+
+        session = prepare_runtime(
+            model_variant=model_variant,
+            prompt_len=prompt_len,
+            decode_context=prompt_len,
+            weights_dir=weights_dir,
+            tokenizer=tokenizer,
+            quantized_weights=quantized_weights,
+            quantized_weights_dir=quantized_weights_dir,
+            force_quantized_weights=force_quantized_weights,
+        )
+        return session.setup.to_json_dict()
+    except Exception as exc:
+        return {
+            "schema_version": 1,
+            "model_variant": model_variant,
+            "status": "NPU_RUNTIME_SETUP_FAILED",
+            "prompt_len": prompt_len,
+            "decode_context": prompt_len,
+            "argument_binding_status": None,
+            "argument_binding_count": 0,
+            "argument_binding_blocker_count": None,
+            "kernel_launch_count": 0,
+            "host_fallback_count": None,
+            "host_runtime_count": None,
+            "blockers": ["npu-runtime-setup-failed"],
+            "error": str(exc),
+        }
+
+
 def _paper_delta_pct(target: dict[str, Any], local_value: float) -> tuple[float | None, float | None]:
     if "paper_min" in target and "paper_max" in target:
         low = float(target["paper_min"])
@@ -591,6 +637,17 @@ def build_paper_result(
         model_variant=model_variant,
         backend=backend,
         weights_dir=weights_dir,
+        artifacts_ready=inventory.can_load_real_artifacts,
+        prompt_len=prompt_len,
+        quantized_weights=quantized_weights,
+        quantized_weights_dir=quantized_weights_dir,
+        force_quantized_weights=force_quantized_weights,
+    )
+    npu_runtime = build_npu_runtime_record(
+        model_variant=model_variant,
+        backend=backend,
+        weights_dir=weights_dir,
+        tokenizer=tokenizer,
         artifacts_ready=inventory.can_load_real_artifacts,
         prompt_len=prompt_len,
         quantized_weights=quantized_weights,
@@ -742,6 +799,11 @@ def build_paper_result(
                 "model runner blockers: "
                 + ",".join(model_runner.get("blockers", []))
             )
+        if npu_runtime:
+            notes.append(
+                "runtime shell blockers: "
+                + ",".join(npu_runtime.get("blockers", []))
+            )
     if env.get("missing_paper_fields"):
         notes.append("environment is not paper-comparable: " + ",".join(env["missing_paper_fields"]))
     if power_sample:
@@ -796,6 +858,7 @@ def build_paper_result(
         "projection_weight_source": quantized_weights_status.get("projection_weight_source"),
         "execution_wiring": execution_wiring,
         "model_runner": model_runner,
+        "npu_runtime": npu_runtime,
         "real_benchmark": real_benchmark,
         "npu_staged_diagnostic": npu_staged_diagnostic,
         "npu_decode_loop_diagnostic": npu_decode_loop_diagnostic,

@@ -19,7 +19,7 @@ from gemma3.core.config import describe_kernel_sequence, synthetic_text_config
 from gemma3.model.model_loop import Gemma3SyntheticSession
 from gemma3.evidence.paper_compare import compare_results, load_targets
 from gemma3.evidence.results import build_paper_result, format_result, write_result_json
-from gemma3.core.runtime import format_manifest, prepare_runtime
+from gemma3.core.runtime import format_manifest, prepare_runtime as prepare_synthetic_runtime
 
 
 def main() -> int:
@@ -29,10 +29,12 @@ def main() -> int:
     mode.add_argument("--run-only", action="store_true")
     mode.add_argument("--print-sequence", action="store_true")
     mode.add_argument("--paper-benchmark", action="store_true")
+    mode.add_argument("--prepare-runtime", action="store_true")
     parser.add_argument("--cache-dir", type=Path, default=Path("gemma3_kernel_cache"))
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--include-stages", action="store_true")
+    parser.add_argument("--include-ownership", action="store_true")
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--local-window-len", type=int, default=None)
     parser.add_argument("--prefill-chunks", type=int, default=2)
@@ -42,6 +44,7 @@ def main() -> int:
     parser.add_argument("--tokenizer", type=Path)
     parser.add_argument("--backend", choices=["cpu", "igpu", "npu"], default="npu")
     parser.add_argument("--prompt-len", type=int, default=1024)
+    parser.add_argument("--decode-context", type=int)
     parser.add_argument("--metric", choices=["prefill_ttft_seconds", "decode_tps", "vision_ttft_seconds"])
     parser.add_argument("--warmup-iters", type=int, default=3)
     parser.add_argument("--timed-iters", type=int, default=10)
@@ -56,6 +59,30 @@ def main() -> int:
     parser.add_argument("--quantized-weights-dir", type=Path)
     parser.add_argument("--force-quantized-weights", action="store_true")
     args = parser.parse_args()
+
+    if args.prepare_runtime:
+        from gemma3.npu.inference_runtime import prepare_runtime as prepare_npu_runtime
+
+        session = prepare_npu_runtime(
+            model_variant=args.model_variant,
+            prompt_len=args.prompt_len,
+            decode_context=args.decode_context or args.prompt_len,
+            weights_dir=args.weights_dir,
+            tokenizer=args.tokenizer,
+            quantized_weights=args.quantized_weights,
+            quantized_weights_dir=args.quantized_weights_dir,
+            force_quantized_weights=args.force_quantized_weights,
+        )
+        print(session.setup.format(include_ownership=args.include_ownership))
+        if args.result_json:
+            write_result_json(session.setup.to_json_dict(), args.result_json)
+            print(f"GEMMA3_NPU_RUNTIME_JSON: {args.result_json}")
+        print(
+            "GEMMA3_NPU_RUNTIME_PREPARE: ready"
+            if session.setup.ready_for_entrypoints
+            else "GEMMA3_NPU_RUNTIME_PREPARE: blocked"
+        )
+        return 0
 
     if args.paper_benchmark:
         result = build_paper_result(
@@ -103,12 +130,12 @@ def main() -> int:
         return 0
 
     if args.compile_only:
-        manifest = prepare_runtime(config, cache_dir=args.cache_dir, compile_only=True)
+        manifest = prepare_synthetic_runtime(config, cache_dir=args.cache_dir, compile_only=True)
         print(format_manifest(manifest))
         print(f"GEMMA3_RUNTIME_COMPILE_ONLY: wrote {args.cache_dir}")
         return 0
 
-    manifest = prepare_runtime(config, cache_dir=args.cache_dir, run_only=True)
+    manifest = prepare_synthetic_runtime(config, cache_dir=args.cache_dir, run_only=True)
     print(format_manifest(manifest))
     print("GEMMA3_RUNTIME_RUN_ONLY: manifest loaded")
     if args.verify:

@@ -1,0 +1,18 @@
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.npu.inference_runtime --self-test | FileCheck %s --check-prefix=SELF
+# RUN: env GEMMA3_MODEL_ROOT=%t.no_models PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.model.inference --prepare-runtime --model-variant gemma3-1b --weights-dir %t.missing --prompt-len 1024 --decode-context 1024 --result-json %t.runtime.json | FileCheck %s --check-prefix=CLI
+# RUN: %PYTHON -c "import json, pathlib; data=json.loads(pathlib.Path('%t.runtime.json').read_text()); assert data['status'] == 'BLOCKED_REAL_ARTIFACTS'; assert data['argument_binding_count'] == 0; assert 'missing-safetensors' in data['blockers']; print('RUNTIME_JSON_SCHEMA_OK')" | FileCheck %s --check-prefix=JSON
+
+# SELF: runtime model=gemma3-1b status=SETUP_READY_EXECUTION_BLOCKED layers=2 prompt_len=16 decode_context=16 artifacts=READY
+# SELF-SAME: argument_binding_status=READY_FOR_KERNEL_LAUNCH argument_bindings=56
+# SELF-SAME: argument_binding_blockers=0
+# SELF: ownership name=planned_layer_kernels phase=prefill+decode owner=npu
+# SELF: ownership name=logits_sampling phase=decode owner=host-fallback
+# SELF: runtime_result entrypoint=run_npu_prefill model=gemma3-1b status=BLOCKED
+# SELF: runtime_result entrypoint=generate model=gemma3-1b status=BLOCKED
+# SELF: GEMMA3_NPU_RUNTIME_SELF_TEST: PASS
+# CLI: runtime model=gemma3-1b status=BLOCKED_REAL_ARTIFACTS
+# CLI-SAME: artifacts=BLOCKED
+# CLI-SAME: blockers=missing-safetensors,missing-config-json,missing-tokenizer
+# CLI: GEMMA3_NPU_RUNTIME_JSON:
+# CLI: GEMMA3_NPU_RUNTIME_PREPARE: blocked
+# JSON: RUNTIME_JSON_SCHEMA_OK
