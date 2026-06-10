@@ -305,9 +305,28 @@ def run_torch_benchmark(
     power_sample: bool = False,
     run_id: str | None = None,
     torch_backend: str = "cpu",
+    quantized_weights: str = "off",
+    quantized_weights_dir: Path | None = None,
+    force_quantized_weights: bool = False,
 ) -> Gemma3RealBenchmarkReport:
     if metric not in ("prefill_ttft_seconds", "decode_tps", "vision_ttft_seconds"):
         raise ValueError("metric must be prefill_ttft_seconds, decode_tps, or vision_ttft_seconds")
+    if quantized_weights not in ("required", "off"):
+        raise ValueError("quantized_weights must be required or off")
+    if quantized_weights == "required":
+        from gemma3_quantized_weights import ensure_q4nx_cache, manifest_path_for
+
+        manifest = ensure_q4nx_cache(
+            model_variant,
+            weights_dir=weights_dir,
+            quantized_weights_dir=quantized_weights_dir,
+            force=force_quantized_weights,
+        )
+        raise Gemma3ExecutionError(
+            "native Q4NX projection benchmark path is not implemented for the "
+            f"{torch_backend} Torch/HF backend; q4nx_manifest="
+            f"{manifest_path_for(Path(manifest.quantized_weights_dir))}"
+        )
     if timed_iters <= 0 or warmup_iters < 0:
         raise ValueError("timed_iters must be positive and warmup_iters must be non-negative")
     if metric == "decode_tps" and decode_tokens <= 0:
@@ -456,6 +475,9 @@ def run_cpu_benchmark(
     vision_smoke: bool = False,
     power_sample: bool = False,
     run_id: str | None = None,
+    quantized_weights: str = "off",
+    quantized_weights_dir: Path | None = None,
+    force_quantized_weights: bool = False,
 ) -> Gemma3RealBenchmarkReport:
     return run_torch_benchmark(
         model_variant=model_variant,
@@ -470,6 +492,9 @@ def run_cpu_benchmark(
         power_sample=power_sample,
         run_id=run_id,
         torch_backend="cpu",
+        quantized_weights=quantized_weights,
+        quantized_weights_dir=quantized_weights_dir,
+        force_quantized_weights=force_quantized_weights,
     )
 
 
@@ -540,6 +565,9 @@ def main() -> int:
     parser.add_argument("--vision-smoke", action="store_true")
     parser.add_argument("--power-sample", action="store_true")
     parser.add_argument("--run-id")
+    parser.add_argument("--quantized-weights", choices=["required", "off"], default="off")
+    parser.add_argument("--quantized-weights-dir", type=Path)
+    parser.add_argument("--force-quantized-weights", action="store_true")
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
 
@@ -578,6 +606,9 @@ def main() -> int:
                 power_sample=args.power_sample,
                 run_id=args.run_id,
                 torch_backend=args.torch_backend,
+                quantized_weights=args.quantized_weights,
+                quantized_weights_dir=args.quantized_weights_dir,
+                force_quantized_weights=args.force_quantized_weights,
             )
         except (Gemma3ExecutionError, ValueError) as exc:
             print(f"GEMMA3_REAL_BENCHMARK_BLOCKED: {exc}")

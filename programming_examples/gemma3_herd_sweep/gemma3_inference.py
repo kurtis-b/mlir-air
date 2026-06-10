@@ -52,6 +52,9 @@ def main() -> int:
     parser.add_argument("--debug-ir", action="store_true")
     parser.add_argument("--skip-host-fallback-measurement", action="store_true")
     parser.add_argument("--fallback-timed-iters", type=int, default=3)
+    parser.add_argument("--quantized-weights", choices=["required", "off"], default="required")
+    parser.add_argument("--quantized-weights-dir", type=Path)
+    parser.add_argument("--force-quantized-weights", action="store_true")
     args = parser.parse_args()
 
     if args.paper_benchmark:
@@ -73,6 +76,9 @@ def main() -> int:
             debug_ir=args.debug_ir,
             measure_host_fallbacks=not args.skip_host_fallback_measurement,
             fallback_timed_iters=args.fallback_timed_iters,
+            quantized_weights=args.quantized_weights,
+            quantized_weights_dir=args.quantized_weights_dir,
+            force_quantized_weights=args.force_quantized_weights,
         )
         print(format_result(result))
         if result["classification"] == "MISSING_REAL_ARTIFACTS":

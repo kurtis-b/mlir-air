@@ -19,6 +19,7 @@ from gemma3_environment import capture_environment
 from gemma3_nonlinears import measure_cpu_contracts, paper_match_blockers
 from gemma3_paper_compare import load_targets, target_by_id
 from gemma3_power import capture_power_snapshot
+from gemma3_quantized_weights import ensure_q4nx_cache, manifest_path_for, manifest_sha256
 from gemma3_real_execution import Gemma3ExecutionError, run_torch_benchmark
 
 DEFAULT_POWER_WATTS = {"cpu": None, "gpu": None, "npu": None, "total": None}
@@ -108,6 +109,10 @@ def model_runner_record_from_plan(plan: Any) -> dict[str, Any]:
         "bo_allocated_bytes": plan.bo_allocated_bytes,
         "bo_allocation_count": plan.bo_allocation_count,
         "bo_skipped_count": plan.bo_skipped_count,
+        "quantized_weights_status": getattr(plan, "quantized_weights_status", None),
+        "q4nx_manifest": getattr(plan, "q4nx_manifest", None),
+        "q4nx_manifest_sha256": getattr(plan, "q4nx_manifest_sha256", None),
+        "projection_weight_source": getattr(plan, "projection_weight_source", None),
         "static_preload_tensor_count": plan.static_preload_tensor_count,
         "buffer_binding_status": plan.buffer_binding_status,
         "buffer_binding_count": plan.buffer_binding_count,
@@ -366,6 +371,66 @@ def load_tiled_attention_diagnostic(model_variant: str) -> dict[str, Any] | None
     }
 
 
+def build_quantized_weights_record(
+    *,
+    model_variant: str,
+    weights_dir: Path | None,
+    artifacts_ready: bool,
+    quantized_weights: str,
+    quantized_weights_dir: Path | None,
+    force_quantized_weights: bool,
+) -> dict[str, Any]:
+    if quantized_weights not in ("required", "off"):
+        raise ValueError("quantized_weights must be required or off")
+    if quantized_weights == "off":
+        return {
+            "policy": "off",
+            "status": "OFF",
+            "q4nx_manifest": None,
+            "q4nx_manifest_sha256": None,
+            "projection_weight_source": "bf16-safetensors",
+            "blockers": [],
+        }
+    if not artifacts_ready:
+        return {
+            "policy": "required",
+            "status": "BLOCKED",
+            "q4nx_manifest": None,
+            "q4nx_manifest_sha256": None,
+            "projection_weight_source": "q4nx",
+            "blockers": ["missing-real-artifacts-for-q4nx-cache"],
+        }
+    try:
+        manifest = ensure_q4nx_cache(
+            model_variant,
+            weights_dir=weights_dir,
+            quantized_weights_dir=quantized_weights_dir,
+            force=force_quantized_weights,
+        )
+    except Exception as exc:
+        return {
+            "policy": "required",
+            "status": "BLOCKED",
+            "q4nx_manifest": None,
+            "q4nx_manifest_sha256": None,
+            "projection_weight_source": "q4nx",
+            "blockers": ["q4nx-cache-unavailable"],
+            "error": str(exc),
+        }
+    manifest_path = manifest_path_for(Path(manifest.quantized_weights_dir))
+    return {
+        "policy": "required",
+        "status": manifest.status,
+        "q4nx_manifest": str(manifest_path),
+        "q4nx_manifest_sha256": manifest_sha256(manifest_path),
+        "projection_weight_source": "q4nx",
+        "tensor_count": manifest.tensor_count,
+        "payload_bytes": manifest.payload_bytes,
+        "static_bo_bytes": manifest.static_bo_bytes,
+        "blockers": [],
+    }
+
+
 def build_model_runner_record(
     *,
     model_variant: str,
@@ -373,6 +438,9 @@ def build_model_runner_record(
     weights_dir: Path | None,
     artifacts_ready: bool,
     prompt_len: int,
+    quantized_weights: str = "required",
+    quantized_weights_dir: Path | None = None,
+    force_quantized_weights: bool = False,
 ) -> dict[str, Any] | None:
     if backend != "npu" or not artifacts_ready:
         return None
@@ -384,6 +452,9 @@ def build_model_runner_record(
                 model_variant,
                 weights_dir=weights_dir,
                 prompt_len=prompt_len,
+                quantized_weights=quantized_weights,
+                quantized_weights_dir=quantized_weights_dir,
+                force_quantized_weights=force_quantized_weights,
             )
         )
     except Exception as exc:
@@ -487,6 +558,9 @@ def build_paper_result(
     debug_ir: bool = False,
     measure_host_fallbacks: bool = True,
     fallback_timed_iters: int = 3,
+    quantized_weights: str = "required",
+    quantized_weights_dir: Path | None = None,
+    force_quantized_weights: bool = False,
 ) -> dict[str, Any]:
     metric = infer_metric(model_variant, decode_tokens, metric)
     phase = "decode" if metric == "decode_tps" else "prefill"
@@ -518,9 +592,24 @@ def build_paper_result(
         weights_dir=weights_dir,
         artifacts_ready=inventory.can_load_real_artifacts,
         prompt_len=prompt_len,
+        quantized_weights=quantized_weights,
+        quantized_weights_dir=quantized_weights_dir,
+        force_quantized_weights=force_quantized_weights,
+    )
+    quantized_weights_status = build_quantized_weights_record(
+        model_variant=model_variant,
+        weights_dir=weights_dir,
+        artifacts_ready=inventory.can_load_real_artifacts,
+        quantized_weights=quantized_weights,
+        quantized_weights_dir=quantized_weights_dir,
+        force_quantized_weights=force_quantized_weights,
     )
 
     notes = missing_artifact_notes(inventory)
+    if quantized_weights_status.get("blockers"):
+        notes.append("quantized weights blocked: " + ",".join(quantized_weights_status.get("blockers", [])))
+    elif quantized_weights_status.get("status") == "READY":
+        notes.append("projection weights are sourced from the shared Q4NX manifest")
     host_fallbacks = (
         fallback_records(
             measure_host_fallbacks=measure_host_fallbacks,
@@ -549,51 +638,65 @@ def build_paper_result(
     if not inventory.can_load_real_artifacts:
         classification = "MISSING_REAL_ARTIFACTS"
         correctness = "BLOCKED_REAL_ARTIFACTS"
+    elif quantized_weights == "required" and quantized_weights_status.get("status") != "READY":
+        classification = "QUANTIZED_WEIGHTS_UNAVAILABLE"
+        correctness = "BLOCKED_QUANTIZED_WEIGHTS"
+        explanation = "paper-comparison path requires a valid shared Q4NX projection-weight cache"
     elif backend in ("cpu", "igpu"):
         torch_backend_name = "CPU/HF" if backend == "cpu" else "iGPU/HF ROCm"
-        try:
-            benchmark = run_torch_benchmark(
-                model_variant=model_variant,
-                weights_dir=weights_dir,
-                max_prompt_tokens=prompt_len,
-                metric=metric,
-                decode_tokens=decode_tokens,
-                warmup_iters=warmup_iters,
-                timed_iters=timed_iters,
-                power_sample=power_sample,
-                run_id=target["id"],
-                torch_backend=backend,
+        if quantized_weights == "required":
+            classification = "NATIVE_Q4NX_PROJECTION_NOT_IMPLEMENTED"
+            correctness = "BLOCKED_QUANTIZED_WEIGHTS"
+            explanation = (
+                f"{torch_backend_name} paper-comparison path requires native packed-Q4NX "
+                "projection operators; the Torch/HF BF16 projection path is available only with --quantized-weights=off"
             )
-        except (Gemma3ExecutionError, ValueError) as exc:
-            classification = "REAL_MODEL_EXECUTION_FAILED"
-            correctness = "LOCAL_FAIL"
-            notes.append(f"real {torch_backend_name} execution failed: {exc}")
+            notes.append("native packed-Q4NX CPU/iGPU model benchmark path is not implemented")
         else:
-            local_value = float(benchmark.local_value)
-            delta_pct, nearest_paper_value = _paper_delta_pct(target, local_value)
-            classification = _classification_for_delta(delta_pct)
-            correctness = "PASS"
-            if classification == "EXPLAINED_DEVIATION":
-                explanation = (
-                    f"local {torch_backend_name} measurement uses this Strix host and Transformers runtime; "
-                    "it is a baseline cell, not validated NPU paper parity"
+            try:
+                benchmark = run_torch_benchmark(
+                    model_variant=model_variant,
+                    weights_dir=weights_dir,
+                    max_prompt_tokens=prompt_len,
+                    metric=metric,
+                    decode_tokens=decode_tokens,
+                    warmup_iters=warmup_iters,
+                    timed_iters=timed_iters,
+                    power_sample=power_sample,
+                    run_id=target["id"],
+                    torch_backend=backend,
+                    quantized_weights="off",
                 )
-            real_benchmark = benchmark.to_json_dict()
-            notes.extend(benchmark.notes)
-            notes.append(
-                f"{torch_backend_name} baseline uses local Transformers execution; it is not an NPU paper-parity claim"
-            )
-            if nearest_paper_value is not None:
-                notes.append(f"nearest_paper_value={nearest_paper_value:g}")
-            if benchmark.power_snapshot:
-                power_data = benchmark.power_snapshot
-                power = SimpleNamespace(
-                    watts=power_data.get("watts", DEFAULT_POWER_WATTS),
-                    field_status=power_data.get("field_status", {}),
-                    sampling_backend=power_data.get("sampling_backend"),
-                    aligned_with_timed_window=power_data.get("aligned_with_timed_window", False),
-                    notes=tuple(power_data.get("notes", ())),
+            except (Gemma3ExecutionError, ValueError) as exc:
+                classification = "REAL_MODEL_EXECUTION_FAILED"
+                correctness = "LOCAL_FAIL"
+                notes.append(f"real {torch_backend_name} execution failed: {exc}")
+            else:
+                local_value = float(benchmark.local_value)
+                delta_pct, nearest_paper_value = _paper_delta_pct(target, local_value)
+                classification = _classification_for_delta(delta_pct)
+                correctness = "PASS"
+                if classification == "EXPLAINED_DEVIATION":
+                    explanation = (
+                        f"local {torch_backend_name} measurement uses this Strix host and Transformers runtime; "
+                        "it is a baseline cell, not validated NPU paper parity"
+                    )
+                real_benchmark = benchmark.to_json_dict()
+                notes.extend(benchmark.notes)
+                notes.append(
+                    f"{torch_backend_name} baseline uses local Transformers execution; it is not an NPU paper-parity claim"
                 )
+                if nearest_paper_value is not None:
+                    notes.append(f"nearest_paper_value={nearest_paper_value:g}")
+                if benchmark.power_snapshot:
+                    power_data = benchmark.power_snapshot
+                    power = SimpleNamespace(
+                        watts=power_data.get("watts", DEFAULT_POWER_WATTS),
+                        field_status=power_data.get("field_status", {}),
+                        sampling_backend=power_data.get("sampling_backend"),
+                        aligned_with_timed_window=power_data.get("aligned_with_timed_window", False),
+                        notes=tuple(power_data.get("notes", ())),
+                    )
     else:
         classification = "REAL_MODEL_EXECUTION_NOT_IMPLEMENTED"
         correctness = "BLOCKED_EXECUTION_NOT_IMPLEMENTED"
@@ -686,6 +789,10 @@ def build_paper_result(
         "environment_comparable": env.get("paper_comparable"),
         "missing_environment_fields": env.get("missing_paper_fields", []),
         "artifact_inventory": inventory.to_json_dict(),
+        "quantized_weights_status": quantized_weights_status,
+        "q4nx_manifest": quantized_weights_status.get("q4nx_manifest"),
+        "q4nx_manifest_sha256": quantized_weights_status.get("q4nx_manifest_sha256"),
+        "projection_weight_source": quantized_weights_status.get("projection_weight_source"),
         "execution_wiring": execution_wiring,
         "model_runner": model_runner,
         "real_benchmark": real_benchmark,
@@ -775,6 +882,9 @@ def main() -> int:
     parser.add_argument("--debug-ir", action="store_true")
     parser.add_argument("--skip-host-fallback-measurement", action="store_true")
     parser.add_argument("--fallback-timed-iters", type=int, default=3)
+    parser.add_argument("--quantized-weights", choices=["required", "off"], default="required")
+    parser.add_argument("--quantized-weights-dir", type=Path)
+    parser.add_argument("--force-quantized-weights", action="store_true")
     parser.add_argument("--result-json", type=Path)
     args = parser.parse_args()
 
@@ -799,6 +909,9 @@ def main() -> int:
         debug_ir=args.debug_ir,
         measure_host_fallbacks=not args.skip_host_fallback_measurement,
         fallback_timed_iters=args.fallback_timed_iters,
+        quantized_weights=args.quantized_weights,
+        quantized_weights_dir=args.quantized_weights_dir,
+        force_quantized_weights=args.force_quantized_weights,
         command=sys.argv,
     )
     print(format_result(result))

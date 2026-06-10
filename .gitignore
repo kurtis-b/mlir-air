@@ -46,3 +46,7 @@ CLAUDE.md
 
 # documents
 *.pdf
+# local Gemma3 derived quantized-weight caches
+q4nx/
+*.q4nx
+q4nx_manifest.json

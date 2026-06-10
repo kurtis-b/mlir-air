@@ -21,10 +21,16 @@ from time import perf_counter
 from typing import Iterable
 
 import numpy as np
-from ml_dtypes import bfloat16
 
-from common import Q4NX_COLS, Q4NX_ROWS, pack_int4_low_first
+from common import Q4NX_COLS, Q4NX_ROWS
 from gemma3_artifacts import MODEL_SPECS, load_real_model_artifacts
+from gemma3_quantized_weights import (
+    ensure_q4nx_cache,
+    load_q4nx_payload_for_tensor,
+    manifest_path_for,
+    manifest_sha256,
+    serialize_q4nx_matrix,
+)
 from gemma3_weight_plan import Gemma3ProjectionWeightRecord, build_weight_plan
 
 
@@ -96,6 +102,10 @@ class Gemma3StaticPreloadReport:
     full_model: bool
     planned_tensor_count: int
     allocation_mode: str
+    quantized_weights_status: str
+    q4nx_manifest: str | None
+    q4nx_manifest_sha256: str | None
+    projection_weight_source: str
     tensor_count: int
     requested_bytes: int
     serialized_bytes: int
@@ -110,6 +120,8 @@ class Gemma3StaticPreloadReport:
             f"static_preload model={self.model_variant} status={self.status} "
             f"full_model={self.full_model} planned_tensors={self.planned_tensor_count} "
             f"allocation_mode={self.allocation_mode} "
+            f"quantized_weights={self.quantized_weights_status} "
+            f"projection_weight_source={self.projection_weight_source} "
             f"tensors={self.tensor_count} requested={self.requested_bytes} "
             f"serialized={self.serialized_bytes} xrt_written={self.xrt_written_bytes} "
             f"blockers={blockers}"
@@ -122,32 +134,6 @@ class Gemma3StaticPreloadReport:
         data = asdict(self)
         data["records"] = [asdict(record) for record in self.records]
         return data
-
-
-def _ceil_to(value: int, multiple: int) -> int:
-    return ((value + multiple - 1) // multiple) * multiple
-
-
-def serialize_q4nx_matrix(matrix: np.ndarray) -> bytes:
-    source = np.asarray(matrix, dtype=np.float32)
-    padded_rows = _ceil_to(source.shape[0], Q4NX_ROWS)
-    padded_cols = _ceil_to(source.shape[1], Q4NX_COLS)
-    padded = np.zeros((padded_rows, padded_cols), dtype=np.float32)
-    padded[: source.shape[0], : source.shape[1]] = source
-
-    chunks: list[bytes] = []
-    for row_base in range(0, padded_rows, Q4NX_ROWS):
-        block = padded[row_base : row_base + Q4NX_ROWS, :]
-        col_min = block.min(axis=0)
-        col_max = block.max(axis=0)
-        scale = (col_max - col_min) / 15.0
-        scale = np.where(scale == 0.0, 1.0, scale)
-        q = np.rint((block - col_min[None, :]) / scale[None, :])
-        q = np.clip(q, 0, 15).astype(np.uint8)
-        chunks.append(pack_int4_low_first(q).tobytes())
-        chunks.append(scale.astype(bfloat16).tobytes())
-        chunks.append(col_min.astype(bfloat16).tobytes())
-    return b"".join(chunks)
 
 
 def _load_matrix(paths: Iterable[str], key: str) -> np.ndarray:
@@ -196,12 +182,23 @@ def build_static_preload_report(
     contiguous_bo: bool = False,
     xrt_smoke: bool = False,
     device_index: int = 0,
+    quantized_weights_dir: Path | None = None,
+    force_quantized_weights: bool = False,
 ) -> Gemma3StaticPreloadReport:
     if max_tensors <= 0:
         raise ValueError("max_tensors must be positive")
     start = perf_counter()
     inventory = load_real_model_artifacts(model_variant, weights_dir=weights_dir, strict=True)
     plan = build_weight_plan(model_variant, weights_dir=weights_dir)
+    manifest = ensure_q4nx_cache(
+        model_variant,
+        weights_dir=weights_dir,
+        quantized_weights_dir=quantized_weights_dir,
+        force=force_quantized_weights,
+    )
+    manifest_dir = Path(manifest.quantized_weights_dir)
+    manifest_path = manifest_path_for(manifest_dir)
+    manifest_hash = manifest_sha256(manifest_path)
     if full_model:
         layer_index = None
         family = None
@@ -224,10 +221,9 @@ def build_static_preload_report(
     if xrt_smoke and contiguous_bo:
         contiguous_static_bo = xrt.bo(device, plan.static_bo_bytes, xrt.bo.host_only, 0)
 
-    offset = 0
     records: list[Gemma3StaticPreloadRecord] = []
     for record in selected:
-        payload = serialize_q4nx_matrix(_load_matrix(inventory.safetensors, record.tensor_key))
+        q4nx_record, payload = load_q4nx_payload_for_tensor(manifest, record.tensor_key)
         if len(payload) != record.static_bo_bytes:
             raise RuntimeError(
                 f"serialized size mismatch for {record.tensor_key}: "
@@ -235,7 +231,7 @@ def build_static_preload_report(
             )
         written = 0
         status = "SERIALIZED"
-        bo_offset = offset
+        bo_offset = int(q4nx_record.static_bo_offset)
         if xrt_smoke and contiguous_static_bo is not None:
             contiguous_static_bo.write(payload, bo_offset)
             written = len(payload)
@@ -255,11 +251,10 @@ def build_static_preload_report(
                 serialized_bytes=len(payload),
                 xrt_written_bytes=written,
                 bo_offset=bo_offset,
-                checksum=hashlib.sha256(payload).hexdigest(),
+                checksum=q4nx_record.payload_sha256,
                 status=status,
             )
         )
-        offset += len(payload)
     if contiguous_static_bo is not None:
         contiguous_static_bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
 
@@ -289,6 +284,10 @@ def build_static_preload_report(
         full_model=full_model,
         planned_tensor_count=plan.tensor_count,
         allocation_mode=allocation_mode,
+        quantized_weights_status=manifest.status,
+        q4nx_manifest=str(manifest_path),
+        q4nx_manifest_sha256=manifest_hash,
+        projection_weight_source="q4nx",
         tensor_count=len(records),
         requested_bytes=sum(record.requested_bytes for record in records),
         serialized_bytes=sum(record.serialized_bytes for record in records),
@@ -313,6 +312,10 @@ def _self_test() -> None:
         False,
         1,
         "serialized-only",
+        "READY",
+        "fixture",
+        "fixture",
+        "q4nx",
         1,
         expected,
         len(payload),
@@ -329,6 +332,10 @@ def _self_test() -> None:
         True,
         1,
         "contiguous-static-bo",
+        "READY",
+        "fixture",
+        "fixture",
+        "q4nx",
         1,
         expected,
         expected,
@@ -358,6 +365,8 @@ def main() -> int:
     parser.add_argument("--contiguous-bo", action="store_true")
     parser.add_argument("--xrt-smoke", action="store_true")
     parser.add_argument("--device-index", type=int, default=0)
+    parser.add_argument("--quantized-weights-dir", type=Path)
+    parser.add_argument("--force-quantized-weights", action="store_true")
     parser.add_argument("--include-records", action="store_true")
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
@@ -375,6 +384,8 @@ def main() -> int:
         contiguous_bo=args.contiguous_bo,
         xrt_smoke=args.xrt_smoke,
         device_index=args.device_index,
+        quantized_weights_dir=args.quantized_weights_dir,
+        force_quantized_weights=args.force_quantized_weights,
     )
     print(report.format(include_records=args.include_records))
     if args.json:

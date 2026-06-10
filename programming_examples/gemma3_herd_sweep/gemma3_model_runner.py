@@ -39,6 +39,7 @@ from gemma3_npu_wiring import (
     build_wiring_plan_from_preflight,
 )
 from gemma3_norm_weight_plan import Gemma3NormWeightPlan, build_norm_weight_plan
+from gemma3_quantized_weights import ensure_q4nx_cache, manifest_path_for, manifest_sha256
 from gemma3_weight_plan import (
     Gemma3ProjectionWeightRecord,
     Gemma3StaticWeightPlan,
@@ -104,6 +105,10 @@ class Gemma3ModelRunnerPlan:
     layers: int
     prompt_len: int
     decode_context: int
+    quantized_weights_status: str
+    q4nx_manifest: str | None
+    q4nx_manifest_sha256: str | None
+    projection_weight_source: str
     step_count: int
     bo_allocation_status: str
     bo_requested_bytes: int
@@ -128,7 +133,8 @@ class Gemma3ModelRunnerPlan:
         lines = [
             f"model_runner model={self.model_variant} status={self.status} "
             f"layers={self.layers} prompt_len={self.prompt_len} "
-            f"decode_context={self.decode_context} steps={self.step_count} "
+            f"decode_context={self.decode_context} quantized_weights={self.quantized_weights_status} "
+            f"projection_weight_source={self.projection_weight_source} steps={self.step_count} "
             f"bo_status={self.bo_allocation_status} bo_requested={self.bo_requested_bytes} "
             f"bo_allocated={self.bo_allocated_bytes} bo_allocations={self.bo_allocation_count} "
             f"bo_skipped={self.bo_skipped_count} static_preload_tensors={self.static_preload_tensor_count} "
@@ -240,6 +246,10 @@ def build_model_runner_plan_from_components(
     max_static_tensors: int = 4,
     static_preload_validated: bool = False,
     bo_allocation_validated: bool = False,
+    quantized_weights_status: str = "not-checked",
+    q4nx_manifest: str | None = None,
+    q4nx_manifest_sha256: str | None = None,
+    projection_weight_source: str = "q4nx",
 ) -> Gemma3ModelRunnerPlan:
     if max_static_tensors <= 0:
         raise ValueError("max_static_tensors must be positive")
@@ -333,6 +343,10 @@ def build_model_runner_plan_from_components(
         layers=wiring.layers,
         prompt_len=bo_plan.prompt_len,
         decode_context=bo_plan.decode_context,
+        quantized_weights_status=quantized_weights_status,
+        q4nx_manifest=q4nx_manifest,
+        q4nx_manifest_sha256=q4nx_manifest_sha256,
+        projection_weight_source=projection_weight_source,
         step_count=len(numbered_steps),
         bo_allocation_status=bo_report.status,
         bo_requested_bytes=bo_report.requested_bytes,
@@ -366,12 +380,33 @@ def build_model_runner_plan(
     max_bo_bytes: int = 8 * 1024 * 1024,
     allocate_bo_smoke: bool = False,
     device_index: int = 0,
+    quantized_weights: str = "required",
+    quantized_weights_dir: Path | None = None,
+    force_quantized_weights: bool = False,
 ) -> Gemma3ModelRunnerPlan:
     spec = model_spec(model_variant)
     prompt_len = prompt_len or spec.prefill_lengths[0]
     decode_context = decode_context or spec.max_decode_context
     preflight = build_preflight_plan(model_variant, weights_dir=weights_dir)
     weight_plan = build_weight_plan(model_variant, weights_dir=weights_dir)
+    if quantized_weights not in ("required", "off"):
+        raise ValueError("quantized_weights must be required or off")
+    q4nx_manifest = None
+    q4nx_manifest_hash = None
+    quantized_weights_status = "off"
+    projection_weight_source = "bf16-safetensors"
+    if quantized_weights == "required":
+        manifest = ensure_q4nx_cache(
+            model_variant,
+            weights_dir=weights_dir,
+            quantized_weights_dir=quantized_weights_dir,
+            force=force_quantized_weights,
+        )
+        q4nx_manifest_path = manifest_path_for(Path(manifest.quantized_weights_dir))
+        q4nx_manifest = str(q4nx_manifest_path)
+        q4nx_manifest_hash = manifest_sha256(q4nx_manifest_path)
+        quantized_weights_status = manifest.status
+        projection_weight_source = "q4nx"
     norm_weight_plan = build_norm_weight_plan(model_variant, weights_dir=weights_dir)
     bo_plan = build_bo_plan_from_preflight(
         preflight,
@@ -432,6 +467,10 @@ def build_model_runner_plan(
         max_static_tensors=max_static_tensors,
         static_preload_validated=static_preload_validated,
         bo_allocation_validated=bo_allocation_validated,
+        quantized_weights_status=quantized_weights_status,
+        q4nx_manifest=q4nx_manifest,
+        q4nx_manifest_sha256=q4nx_manifest_hash,
+        projection_weight_source=projection_weight_source,
     )
 
 
@@ -576,6 +615,9 @@ def main() -> int:
     parser.add_argument("--max-bo-bytes", type=int, default=8 * 1024 * 1024)
     parser.add_argument("--allocate-bo-smoke", action="store_true")
     parser.add_argument("--device-index", type=int, default=0)
+    parser.add_argument("--quantized-weights", choices=["required", "off"], default="required")
+    parser.add_argument("--quantized-weights-dir", type=Path)
+    parser.add_argument("--force-quantized-weights", action="store_true")
     parser.add_argument("--include-steps", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
@@ -594,6 +636,9 @@ def main() -> int:
         max_bo_bytes=args.max_bo_bytes,
         allocate_bo_smoke=args.allocate_bo_smoke,
         device_index=args.device_index,
+        quantized_weights=args.quantized_weights,
+        quantized_weights_dir=args.quantized_weights_dir,
+        force_quantized_weights=args.force_quantized_weights,
     )
     if args.json:
         print(json.dumps(plan.to_json_dict(), indent=2, sort_keys=True))

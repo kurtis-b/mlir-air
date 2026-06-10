@@ -248,6 +248,8 @@ class _PackedProjectionPlan:
     scale: Any
     min_offset: Any
     mlir_module: Any
+    static_bo_offset: int | None = None
+    payload_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -454,13 +456,32 @@ def _repack_projection(weight, *, row_block_multiple: int = 8):
     return packed, scale, min_offset, (padded_rows, padded_cols)
 
 
-def _prepare_layer_plans(model_variant: str, weights_dir: Path, layers: int):
+def _prepare_layer_plans(
+    model_variant: str,
+    weights_dir: Path,
+    layers: int,
+    *,
+    quantized_weights_dir: Path | None = None,
+    force_quantized_weights: bool = False,
+):
+    import numpy as np
     from fused_dqp import build_paper_module
     from ml_dtypes import bfloat16
+    from gemma3_quantized_weights import (
+        decode_q4nx_payload,
+        ensure_q4nx_cache,
+        load_q4nx_payload_for_tensor,
+    )
 
     object_file = Path(__file__).with_name("build_peano") / "fused_dqp.o"
     if not object_file.exists():
         raise RuntimeError(f"missing FusedDQP object file: {object_file}")
+    manifest = ensure_q4nx_cache(
+        model_variant,
+        weights_dir=weights_dir,
+        quantized_weights_dir=quantized_weights_dir,
+        force=force_quantized_weights,
+    )
     norm_plans: dict[int, _NormPlan] = {}
     projection_plans: dict[int, dict[str, _PackedProjectionPlan]] = {}
     module_cache: dict[int, Any] = {}
@@ -483,12 +504,39 @@ def _prepare_layer_plans(model_variant: str, weights_dir: Path, layers: int):
         keys = _projection_tensor_keys(model_variant, weights_dir, layer_index)
         layer_projection_plans: dict[str, _PackedProjectionPlan] = {}
         for family in FULL_LAYER_PROJECTION_FAMILIES:
-            weight = _load_weight_array(weights_dir, keys[family])
+            q4nx_record, payload = load_q4nx_payload_for_tensor(manifest, keys[family])
             expected_shape = PROJECTION_SHAPES[family]
-            if tuple(weight.shape) != expected_shape:
-                raise RuntimeError(f"expected {family} shape {expected_shape}, got {weight.shape}")
-            packed, scale, min_offset, padded_shape = _repack_projection(weight)
+            if tuple(q4nx_record.shape) != expected_shape:
+                raise RuntimeError(f"expected {family} shape {expected_shape}, got {q4nx_record.shape}")
+            packed, scale, min_offset = decode_q4nx_payload(payload, q4nx_record)
             row_blocks = int(packed.shape[0])
+            padded_shape = tuple(int(dim) for dim in q4nx_record.padded_shape)
+            diagnostic_row_blocks = _ceil_to(row_blocks, 8)
+            if diagnostic_row_blocks > row_blocks:
+                extra = diagnostic_row_blocks - row_blocks
+                packed = np.concatenate(
+                    [
+                        packed,
+                        np.zeros((extra, packed.shape[1], packed.shape[2]), dtype=packed.dtype),
+                    ],
+                    axis=0,
+                )
+                scale = np.concatenate(
+                    [
+                        scale,
+                        np.ones((extra, scale.shape[1], scale.shape[2]), dtype=bfloat16),
+                    ],
+                    axis=0,
+                )
+                min_offset = np.concatenate(
+                    [
+                        min_offset,
+                        np.zeros((extra, min_offset.shape[1], min_offset.shape[2]), dtype=bfloat16),
+                    ],
+                    axis=0,
+                )
+                row_blocks = diagnostic_row_blocks
+                padded_shape = (row_blocks * 32, padded_shape[1])
             if row_blocks not in module_cache:
                 module_cache[row_blocks] = build_paper_module(
                     32,
@@ -505,13 +553,15 @@ def _prepare_layer_plans(model_variant: str, weights_dir: Path, layers: int):
                 family=family,
                 tensor_key=keys[family],
                 shape=expected_shape,
-                padded_shape=tuple(int(dim) for dim in padded_shape),
+                padded_shape=padded_shape,
                 row_blocks=row_blocks,
                 col_blocks=int(packed.shape[1]),
                 packed=packed,
                 scale=scale,
                 min_offset=min_offset,
                 mlir_module=module_cache[row_blocks],
+                static_bo_offset=int(q4nx_record.static_bo_offset),
+                payload_sha256=q4nx_record.payload_sha256,
             )
         projection_plans[layer_index] = layer_projection_plans
     return norm_plans, projection_plans
@@ -2919,7 +2969,13 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         if args.logits_timing != "excluded" and args.logits_mode != "host-tied-embedding":
             raise RuntimeError("--logits-timing=included requires --logits-mode=host-tied-embedding")
         weights_dir = _resolve_weights_dir(args.model_variant, args.weights_dir)
-        norm_plans, projection_plans = _prepare_layer_plans(args.model_variant, weights_dir, args.layers)
+        norm_plans, projection_plans = _prepare_layer_plans(
+            args.model_variant,
+            weights_dir,
+            args.layers,
+            quantized_weights_dir=args.quantized_weights_dir,
+            force_quantized_weights=args.force_quantized_weights,
+        )
         if args.attention_mode == "tiled-stats-1k" and args.attention_cache_mode == "hf-prefill":
             hf_prefill_context = _real_hf_prefill_context(
                 model_variant=args.model_variant,
@@ -3528,6 +3584,8 @@ def main() -> int:
     parser.add_argument("--logits-timing", choices=["excluded", "included"], default="excluded")
     parser.add_argument("--logits-chunk-rows", type=int, default=8192)
     parser.add_argument("--dynamic-static-weight-writes", action="store_true", help="diagnostic fallback: write packed projection static inputs inside each launch")
+    parser.add_argument("--quantized-weights-dir", type=Path)
+    parser.add_argument("--force-quantized-weights", action="store_true")
     parser.add_argument("--no-reuse-elf", action="store_true")
     args = parser.parse_args()
 
