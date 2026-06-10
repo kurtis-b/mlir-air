@@ -55,6 +55,10 @@ PREFILL_KV_CACHE_LAYOUT = "per-layer-key-value"
 PREFILL_KV_CACHE_NOT_PRODUCED_STATUS = "PREFILL_KV_CACHE_NOT_PRODUCED"
 PREFILL_KV_CACHE_NOT_PRODUCED_SOURCE = "none"
 PREFILL_KV_CACHE_UNAVAILABLE_STATUS = "PREFILL_KV_CACHE_UNAVAILABLE"
+PREFILL_KV_CACHE_READY_STATUS = "PREFILL_KV_CACHE_READY"
+PREFILL_KV_CACHE_PRODUCTION_SOURCE = "production-npu-prefill-kv-cache"
+GENERATE_PREFILL_KV_CACHE_BLOCKER = "generate-prefill-kv-cache-blocked"
+GENERATE_TOKENIZATION_BLOCKER = "generate-tokenization-not-wired"
 
 
 @dataclass(frozen=True)
@@ -1170,6 +1174,43 @@ def _decode_probe_ownership(
     return tuple(records)
 
 
+def _prefill_result_has_production_cache(result: Gemma3RuntimeExecutionResult) -> bool:
+    cache = result.prefill_kv_cache
+    return (
+        result.status == PREFILL_KV_CACHE_READY_STATUS
+        and cache is not None
+        and cache.status == PREFILL_KV_CACHE_READY_STATUS
+        and cache.source == PREFILL_KV_CACHE_PRODUCTION_SOURCE
+        and cache.owner == "npu"
+        and not cache.blockers
+    )
+
+
+def _generate_prefill_blocked_ownership(
+    prefill: Gemma3RuntimeExecutionResult,
+) -> tuple[Gemma3RuntimeOwnershipRecord, ...]:
+    blockers = _dedupe(prefill.blockers or (NPU_PREFILL_KV_CACHE_BLOCKER,))
+    return (
+        *prefill.operation_ownership,
+        Gemma3RuntimeOwnershipRecord(
+            name="decode_prefill_kv_cache",
+            phase="decode",
+            owner="missing",
+            timed_window=False,
+            status="requires-production-npu-prefill-kv-cache",
+            blockers=blockers,
+        ),
+        Gemma3RuntimeOwnershipRecord(
+            name="decode_layer_loop",
+            phase="decode",
+            owner="missing",
+            timed_window=True,
+            status="blocked-on-prefill-kv-cache",
+            blockers=blockers,
+        ),
+    )
+
+
 def _blocked_execution_result(
     session: Gemma3RuntimeSession,
     *,
@@ -1308,6 +1349,48 @@ def generate(
             decode_tokens=decode_tokens,
             blockers=("generate-runtime-launch-not-run", *session.setup.blockers),
             unit=unit,
+        )
+
+    if isinstance(prompt_or_token_ids, str):
+        return _blocked_execution_result(
+            session,
+            entrypoint="generate",
+            decode_tokens=decode_tokens,
+            blockers=(
+                GENERATE_TOKENIZATION_BLOCKER,
+                GENERATE_PREFILL_KV_CACHE_BLOCKER,
+                NPU_PREFILL_KV_CACHE_BLOCKER,
+                *session.setup.blockers,
+            ),
+            operation_ownership=(
+                *session.setup.operation_ownership,
+                Gemma3RuntimeOwnershipRecord(
+                    name="decode_prefill_kv_cache",
+                    phase="decode",
+                    owner="missing",
+                    timed_window=False,
+                    status="prompt-tokenization-required",
+                    blockers=(GENERATE_TOKENIZATION_BLOCKER, NPU_PREFILL_KV_CACHE_BLOCKER),
+                ),
+            ),
+            unit=unit,
+        )
+
+    prefill = run_npu_prefill(session, prompt_or_token_ids)
+    if not _prefill_result_has_production_cache(prefill):
+        return _blocked_execution_result(
+            session,
+            entrypoint="generate",
+            decode_tokens=decode_tokens,
+            blockers=(
+                GENERATE_PREFILL_KV_CACHE_BLOCKER,
+                *prefill.blockers,
+                *session.setup.blockers,
+            ),
+            operation_ownership=_generate_prefill_blocked_ownership(prefill),
+            unit=unit,
+            prefill_kernel_launch_count=prefill.prefill_kernel_launch_count,
+            prefill_host_fallback_count=prefill.prefill_host_fallback_count,
         )
 
     start = perf_counter()
@@ -1498,6 +1581,15 @@ def _self_test() -> None:
         raise AssertionError(generated)
     if generated.kernel_launch_count != 0 or generated.setup_status != setup.status:
         raise AssertionError(generated)
+    generated = generate(session, [1] * setup.prompt_len, decode_tokens=1, run_hardware=True)
+    if generated.status != "BLOCKED" or generated.generated_token_ids:
+        raise AssertionError(generated)
+    if GENERATE_PREFILL_KV_CACHE_BLOCKER not in generated.blockers:
+        raise AssertionError(generated.blockers)
+    if generated.npu_decode_loop is not None:
+        raise AssertionError(generated.npu_decode_loop)
+    if not any(record.name == "decode_prefill_kv_cache" for record in generated.operation_ownership):
+        raise AssertionError(generated.operation_ownership)
     print(setup.format(include_ownership=True))
     print(prefill.format(include_ownership=True))
     print(generated.format(include_ownership=True))
