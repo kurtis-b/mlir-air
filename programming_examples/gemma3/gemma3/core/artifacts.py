@@ -588,15 +588,10 @@ def _load_safetensor_matrix(paths: Iterable[str], key: str) -> np.ndarray:
         from safetensors import safe_open
     except Exception as exc:
         raise Gemma3ArtifactError("python:safetensors is required for Q4NX round-trip") from exc
-    try:
-        import torch  # noqa: F401
-    except Exception as exc:
-        raise Gemma3ArtifactError("python:torch is required for BF16 safetensor loading") from exc
     for filename in paths:
-        with safe_open(filename, framework="pt", device="cpu") as handle:
+        with safe_open(filename, framework="np") as handle:
             if key in handle.keys():
-                tensor = handle.get_tensor(key)
-                return tensor.float().cpu().numpy()
+                return np.asarray(handle.get_tensor(key), dtype=np.float32)
     raise Gemma3ArtifactError(f"tensor key not found in safetensors: {key}")
 
 
@@ -618,7 +613,7 @@ def q4nx_roundtrip_report(
         raise Gemma3ArtifactError("python:safetensors is required for Q4NX round-trip") from exc
     keys: list[str] = []
     for filename in inventory.safetensors:
-        with safe_open(filename, framework="pt", device="cpu") as handle:
+        with safe_open(filename, framework="np") as handle:
             keys.extend(handle.keys())
     records: list[dict[str, Any]] = []
     for family in Q4NX_PROJECTION_FAMILIES:

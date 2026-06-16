@@ -2,8 +2,10 @@
   "argument_binding_blocker_count": 0,
   "argument_binding_count": 728,
   "argument_binding_status": "READY_FOR_KERNEL_LAUNCH",
+  "artifact_manifest_path": "/home/cj/mlir-air/programming_examples/gemma3/build_peano/runtime_cache/gemma3-1b/gemma3_npu_kernel_manifest.json",
+  "attention_reduction_mode": "not-required",
   "blockers": [
-    "production-prefill-runtime-artifacts-not-cached",
+    "production-prefill-runtime-arguments-not-bound",
     "prefill-1k-npu-not-wired",
     "prefill-produced-kv-cache-not-wired",
     "npu-prefill-kv-cache-not-wired"
@@ -12,7 +14,7 @@
   "decode_tokens": 0,
   "elapsed_seconds": null,
   "entrypoint": "run_npu_prefill",
-  "error": "missing production prefill runtime artifacts: gemma3_prefill_kv_L0, gemma3_prefill_kv_L1, gemma3_prefill_kv_L2, gemma3_prefill_kv_L3, ... (+22 more)",
+  "error": "production prefill artifacts are cached, but runtime argument materialization is not wired",
   "generated_token_ids": [],
   "host_fallback_count": 0,
   "host_runtime_count": 0,
@@ -20,6 +22,7 @@
   "kv_cache_layer_count": 26,
   "kv_cache_token_count": 1024,
   "local_value": null,
+  "logits_sampling_mode": "not-applicable",
   "model_variant": "gemma3-1b",
   "npu_decode_loop": null,
   "operation_ownership": [
@@ -51,7 +54,7 @@
     },
     {
       "blockers": [
-        "production-prefill-runtime-artifacts-not-cached",
+        "production-prefill-runtime-arguments-not-bound",
         "prefill-1k-npu-not-wired",
         "prefill-produced-kv-cache-not-wired",
         "npu-prefill-kv-cache-not-wired"
@@ -130,11 +133,12 @@
     "prefill_q",
     "prefill_v"
   ],
+  "power_snapshot": null,
   "prefill_host_fallback_count": 0,
   "prefill_kernel_launch_count": 0,
   "prefill_kv_cache": {
     "blockers": [
-      "production-prefill-runtime-artifacts-not-cached",
+      "production-prefill-runtime-arguments-not-bound",
       "prefill-1k-npu-not-wired",
       "prefill-produced-kv-cache-not-wired",
       "npu-prefill-kv-cache-not-wired"
@@ -148,7 +152,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -178,7 +182,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -208,7 +212,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -238,7 +242,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -268,7 +272,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -298,7 +302,7 @@
       {
         "attention_kind": "global_full",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -328,7 +332,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -358,7 +362,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -388,7 +392,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -418,7 +422,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -448,7 +452,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -478,7 +482,7 @@
       {
         "attention_kind": "global_full",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -508,7 +512,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -538,7 +542,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -568,7 +572,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -598,7 +602,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -628,7 +632,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -658,7 +662,7 @@
       {
         "attention_kind": "global_full",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -688,7 +692,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -718,7 +722,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -748,7 +752,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -778,7 +782,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -808,7 +812,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -838,7 +842,7 @@
       {
         "attention_kind": "global_full",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -868,7 +872,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -898,7 +902,7 @@
       {
         "attention_kind": "local_swa",
         "blockers": [
-          "production-prefill-runtime-artifacts-not-cached",
+          "production-prefill-runtime-arguments-not-bound",
           "prefill-1k-npu-not-wired",
           "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
@@ -7491,6 +7495,8 @@
   "q4nx_manifest": "/home/cj/models/gemma-3-1b-pt/q4nx/q4nx_manifest.json",
   "q4nx_manifest_sha256": "b33d057ee900531f257186739ff63bc2ca77ebe428c45333d80607c909dfeec6",
   "readback_policy": "explicit-output-readback-only",
+  "runtime_contract_version": "gemma3-npu-runtime-contract-v1",
+  "sampling_policy": "none",
   "schema_version": 1,
   "setup_status": "SETUP_READY_EXECUTION_BLOCKED",
   "static_input_keys": [
@@ -7498,5 +7504,6 @@
     "static_projection_weights"
   ],
   "status": "PREFILL_KV_CACHE_BLOCKED",
+  "timed_window_policy": "compile-load-bo-preload-excluded;prefill-entrypoint-timed",
   "unit": "seconds"
 }

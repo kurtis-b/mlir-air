@@ -7,11 +7,17 @@ repo_root := $(realpath $(srcdir)/../..)
 PYTHON ?= python3
 PYTHON_VERSION := $(shell $(PYTHON) -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 PYTHON_SITE_PACKAGES ?= $(repo_root)/sandbox/lib/python$(PYTHON_VERSION)/site-packages
+DEFAULT_PEANO_INSTALL_DIR := $(PYTHON_SITE_PACKAGES)/llvm-aie
+ifneq ($(wildcard $(DEFAULT_PEANO_INSTALL_DIR)/bin/clang++),)
+  PEANO_INSTALL_DIR ?= $(DEFAULT_PEANO_INSTALL_DIR)
+endif
+MLIR_AIR_BIN ?= $(repo_root)/install-xrt/bin
 MLIR_AIR_PYTHON ?= $(repo_root)/build-xrt/python
 MLIR_AIE_PYTHON_ROOT ?= $(PYTHON_SITE_PACKAGES)/mlir_aie
+MLIR_AIE_BIN ?= $(MLIR_AIE_PYTHON_ROOT)/bin
 MLIR_AIE_PYTHON ?= $(MLIR_AIE_PYTHON_ROOT)/python
 GEMMA3_PYTHONPATH = $(srcdir):$(MLIR_AIR_PYTHON):$(PYTHON_SITE_PACKAGES):$(MLIR_AIE_PYTHON):$${PYTHONPATH}
-RUN_PYTHON = PYTHONPATH=$(GEMMA3_PYTHONPATH) $(PYTHON)
+RUN_PYTHON = PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) PATH=$(MLIR_AIR_BIN):$(MLIR_AIE_BIN):$(PEANO_INSTALL_DIR)/bin:$${PATH} PYTHONPATH=$(GEMMA3_PYTHONPATH) $(PYTHON)
 
 ifdef PEANO_INSTALL_DIR
   BUILD_DIR := build_peano
@@ -114,6 +120,7 @@ PROMPT_LEN ?= 1024
 DECODE_CONTEXT ?= 1024
 DECODE_TOKENS ?= 1
 QUANTIZED_WEIGHTS ?= required
+RUNTIME_OUTPUT_FORMAT ?= $(OUTPUT_FORMAT)
 RUNTIME_CACHE_DIR ?= $(BUILD_DIR)/runtime_cache/$(MODEL_VARIANT)
 RESULTS_DIR ?= $(srcdir)/results
 PREFILL_RESULT ?= $(RESULTS_DIR)/gemma3_1b_npu_prefill_runtime.json
@@ -308,7 +315,9 @@ model-prepare:
 		--prompt-len $(PROMPT_LEN) \
 		--decode-context $(DECODE_CONTEXT) \
 		--quantized-weights $(QUANTIZED_WEIGHTS) \
-		--runtime-cache-dir $(RUNTIME_CACHE_DIR)
+		--runtime-cache-dir $(RUNTIME_CACHE_DIR) \
+		--prepare-prefill-artifacts \
+		--runtime-output-format $(RUNTIME_OUTPUT_FORMAT)
 
 model-prefill:
 	mkdir -p $(RESULTS_DIR)

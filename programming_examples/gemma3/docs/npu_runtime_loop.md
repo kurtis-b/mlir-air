@@ -17,13 +17,17 @@ Current entrypoints:
 
 - `prepare_runtime()`: discovers artifacts, prepares model shape state, builds
   preflight, weight, BO, buffer, argument-binding, and launch-order plans, and
-  creates the optional `Gemma3KernelCache`.
+  creates the optional `Gemma3KernelCache`. With
+  `--prepare-prefill-artifacts`, it compiles and registers all per-layer
+  production prefill K/V artifacts in the runtime cache manifest.
 - `run_npu_prefill()`: enters `gemma3.npu.prefill_runner`, which now checks
   the Gemma-owned runtime cache for per-layer production prefill artifacts
-  (`gemma3_prefill_kv_L*`) and reports a concrete artifact blocker when it
-  cannot launch. Explicit JSON evidence is accepted only when passed by path
-  for validation or self-test fixtures. HF, synthetic, and probe cache evidence
-  cannot satisfy the production path.
+  (`gemma3_prefill_kv_L*`). Once those artifacts are cached, the production
+  path advances to `production-prefill-runtime-arguments-not-bound` until the
+  executable prefill arguments and K/V materialization launch are wired.
+  Explicit JSON evidence is accepted only when passed by path for validation
+  or self-test fixtures. HF, synthetic, and probe cache evidence cannot satisfy
+  the production path.
 - `generate()`: requires production NPU prefill K/V before decode can launch as
   a production handoff.
 - `gemma3.npu.runtime_cache`: owns cached XRT artifacts, persistent BO sets,
@@ -116,10 +120,14 @@ The ordering is intentional. For example, decode timing over HF or synthetic
 K/V is still diagnostic even if later decode stages are NPU-owned.
 
 
-Current first unresolved runtime sub-blocker: `production-prefill-runtime-artifacts-not-cached`.
-`run_npu_prefill()` currently finds no cached `gemma3_prefill_kv_L*` production
-artifacts, records zero prefill launches, and keeps `prefill-1k-npu-not-wired`
-and `npu-prefill-kv-cache-not-wired` active.
+Current first unresolved runtime sub-blocker:
+`production-prefill-runtime-arguments-not-bound`. The runtime cache manifest now
+names `gemma3_prefill_kv_L0` through `gemma3_prefill_kv_L25`, and the
+`production_prefill_artifacts` contract passes. `run_npu_prefill()` still
+records zero prefill launches because production runtime argument materialization
+and K/V production are not wired, so `prefill-1k-npu-not-wired`,
+`prefill-produced-kv-cache-not-wired`, and `npu-prefill-kv-cache-not-wired`
+remain active.
 
 ## Milestones
 
@@ -148,6 +156,10 @@ Production prefill artifacts must satisfy all of these fields before
   when present.
 - `run_npu_prefill()` no longer reports
   `production-prefill-runtime-artifacts-not-cached`.
+
+The current 1B/1k evidence satisfies this artifact-only gate. The next required
+runtime boundary is production prefill argument materialization and NPU-produced
+K/V cache evidence.
 
 Production prefill K/V evidence must satisfy all of these fields before it can
 clear `npu-prefill-kv-cache-not-wired`:

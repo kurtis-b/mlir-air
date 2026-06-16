@@ -41,7 +41,7 @@ from gemma3.npu.prefill_runner import (
     run_prefill_kv_cache,
 )
 from gemma3.npu.preflight import Gemma3NPUPreflightPlan, build_preflight_plan
-from gemma3.npu.runtime_cache import Gemma3KernelCache
+from gemma3.npu.runtime_cache import Gemma3KernelCache, ensure_prefill_kv_artifacts
 from gemma3.npu.static_preload import has_full_xrt_preload_evidence
 from gemma3.npu.weight_plan import Gemma3StaticWeightPlan, build_weight_plan
 from gemma3.npu.wiring import (
@@ -855,6 +855,8 @@ def prepare_runtime(
     force_quantized_weights: bool = False,
     runtime_cache_dir: Path | None = None,
     prefill_evidence_path: Path | None = None,
+    prepare_prefill_artifacts: bool = False,
+    runtime_output_format: str = "elf",
 ) -> Gemma3RuntimeSession:
     """Prepare Gemma3 NPU runtime state without timed model inference."""
     if kv_strategy not in KV_STRATEGIES:
@@ -1031,6 +1033,12 @@ def prepare_runtime(
         # Missing or stale cached binaries should not hide setup metadata;
         # the executor/evidence path remains responsible for launch readiness.
         pass
+    if prepare_prefill_artifacts and setup.prefill_kv_cache is not None:
+        ensure_prefill_kv_artifacts(
+            runtime_cache,
+            setup.prefill_kv_cache.layers,
+            output_format=runtime_output_format,
+        )
     return Gemma3RuntimeSession(
         setup=setup,
         preflight=preflight,
@@ -2048,6 +2056,8 @@ def main() -> int:
     parser.add_argument("--quantized-weights-dir", type=Path)
     parser.add_argument("--force-quantized-weights", action="store_true")
     parser.add_argument("--runtime-cache-dir", type=Path)
+    parser.add_argument("--prepare-prefill-artifacts", action="store_true")
+    parser.add_argument("--runtime-output-format", choices=["elf", "xclbin"], default="elf")
     parser.add_argument("--prefill-evidence-json", type=Path)
     parser.add_argument("--include-ownership", action="store_true")
     parser.add_argument("--no-run-hardware", action="store_true", help="prepare and format a blocked runtime result without launching NPU kernels")
@@ -2074,6 +2084,8 @@ def main() -> int:
         force_quantized_weights=args.force_quantized_weights,
         runtime_cache_dir=args.runtime_cache_dir,
         prefill_evidence_path=args.prefill_evidence_json,
+        prepare_prefill_artifacts=args.prepare_prefill_artifacts and args.prepare_runtime,
+        runtime_output_format=args.runtime_output_format,
     )
     result: Gemma3RuntimeSetupRecord | Gemma3RuntimeExecutionResult
     if args.run_npu_prefill:

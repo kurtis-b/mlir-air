@@ -14,7 +14,7 @@
 
 # CURRENT: contract production_prefill_artifacts status=BLOCKED blockers=production-prefill-runtime-artifacts-not-cached
 # CURRENT: contract production_kv status=BLOCKED
-# CURRENT-SAME: production-prefill-runtime-artifacts-not-cached
+# CURRENT-SAME: production-prefill-runtime-arguments-not-bound
 # CURRENT: contract decode_handoff status=BLOCKED
 # CURRENT-SAME: generate-prefill-kv-cache-blocked
 # CURRENT: contract attention_reduction status=BLOCKED blockers=npu-attention-reduction-not-wired

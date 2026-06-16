@@ -25,6 +25,7 @@ from ml_dtypes import bfloat16
 
 
 MANIFEST_FILE = "gemma3_npu_kernel_manifest.json"
+PREFILL_ARTIFACT_TEMPLATE = "gemma3_prefill_kv_L{layer_index}"
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,197 @@ def default_cache_dir(model_variant: str = "gemma3-1b") -> Path:
     return example_root / "build_peano" / "runtime_cache" / model_variant
 
 
+def build_prefill_kv_copy_module(
+    token_count: int,
+    *,
+    kv_heads: int,
+    head_dim: int,
+    tile_elements: int = 1024,
+) -> Any:
+    """Build the cached K/V materialization artifact used by the prefill boundary."""
+    from air.ir import (
+        AffineConstantExpr,
+        AffineExpr,
+        AffineMap,
+        AffineSymbolExpr,
+        IntegerAttr,
+        MemRefType,
+    )
+    from air.dialects.affine import apply as affine_apply
+    from air.dialects.air import MemorySpace, T, dma_memcpy_nd, herd, module_builder
+    from air.dialects.func import FuncOp
+    from air.dialects.memref import AllocOp, DeallocOp
+    from air.dialects.scf import for_, yield_
+    from air.backend.xrt_runner import type_mapper
+
+    element_count = int(token_count) * int(kv_heads) * int(head_dim)
+    if element_count <= 0:
+        raise ValueError("prefill K/V artifact element count must be positive")
+    if element_count % tile_elements != 0:
+        raise ValueError(
+            f"prefill K/V element count {element_count} must be divisible by "
+            f"tile_elements={tile_elements}"
+        )
+    num_tiles = 2
+    if element_count % (tile_elements * num_tiles) != 0:
+        raise ValueError(
+            f"prefill K/V element count {element_count} must be divisible by "
+            f"{tile_elements * num_tiles}"
+        )
+
+    @module_builder
+    def module():
+        bf16_type = type_mapper(bfloat16)
+        l3_ty = MemRefType.get([element_count], bf16_type)
+        l1_ty = MemRefType.get(
+            [tile_elements],
+            bf16_type,
+            memory_space=IntegerAttr.get(T.i32(), MemorySpace.L1),
+        )
+
+        @FuncOp.from_py_func(l3_ty, l3_ty, l3_ty, l3_ty)
+        def gemma3_prefill_kv(arg_k, arg_v, arg_out_k, arg_out_v):
+            @herd(
+                name="gemma3_prefill_kv_herd",
+                sizes=[1, num_tiles],
+                operands=[arg_k, arg_v, arg_out_k, arg_out_v],
+            )
+            def herd_body(_tx, _ty, _sx, _sy, l3_k, l3_v, l3_out_k, l3_out_v):
+                offset_map = AffineMap.get(
+                    0,
+                    2,
+                    [
+                        AffineExpr.get_add(
+                            AffineExpr.get_mul(
+                                AffineSymbolExpr.get(0),
+                                AffineConstantExpr.get(tile_elements * num_tiles),
+                            ),
+                            AffineExpr.get_mul(
+                                AffineSymbolExpr.get(1),
+                                AffineConstantExpr.get(tile_elements),
+                            ),
+                        )
+                    ],
+                )
+                for tile_base in for_(
+                    0,
+                    element_count // (tile_elements * num_tiles),
+                    1,
+                ):
+                    offset = affine_apply(offset_map, [tile_base, _ty])
+                    l1_k = AllocOp(l1_ty, [], [])
+                    l1_v = AllocOp(l1_ty, [], [])
+                    dma_memcpy_nd(
+                        l1_k,
+                        l3_k,
+                        src_offsets=[offset],
+                        src_sizes=[tile_elements],
+                        src_strides=[1],
+                    )
+                    dma_memcpy_nd(
+                        l1_v,
+                        l3_v,
+                        src_offsets=[offset],
+                        src_sizes=[tile_elements],
+                        src_strides=[1],
+                    )
+                    dma_memcpy_nd(
+                        l3_out_k,
+                        l1_k,
+                        dst_offsets=[offset],
+                        dst_sizes=[tile_elements],
+                        dst_strides=[1],
+                    )
+                    dma_memcpy_nd(
+                        l3_out_v,
+                        l1_v,
+                        dst_offsets=[offset],
+                        dst_sizes=[tile_elements],
+                        dst_strides=[1],
+                    )
+                    DeallocOp(l1_k)
+                    DeallocOp(l1_v)
+                    yield_([])
+
+    return module()
+
+
+def ensure_prefill_kv_artifacts(
+    cache: "Gemma3KernelCache",
+    layers: Iterable[Any],
+    *,
+    output_format: str = "elf",
+) -> tuple[str, ...]:
+    """Compile/register all per-layer production prefill K/V cache artifacts."""
+    layer_tuple = tuple(layers)
+    expected = tuple(
+        PREFILL_ARTIFACT_TEMPLATE.format(layer_index=int(layer.layer_index))
+        for layer in layer_tuple
+    )
+    if expected and all(name in cache.artifacts for name in expected):
+        cache.save_manifest()
+        return expected
+
+    from air.backend.xrt import XRTBackend, XRTCompileArtifact
+
+    compiled_by_shape: dict[tuple[int, int, int], tuple[Path, Path | None, str]] = {}
+    for layer in layer_tuple:
+        name = PREFILL_ARTIFACT_TEMPLATE.format(layer_index=int(layer.layer_index))
+        if name in cache.artifacts:
+            continue
+        key_shape = tuple(int(dim) for dim in layer.key_shape)
+        if len(key_shape) != 3:
+            raise ValueError(
+                f"prefill K/V layer L{layer.layer_index} has unsupported "
+                f"key shape: {key_shape}"
+            )
+        shape_key = key_shape
+        if shape_key not in compiled_by_shape:
+            token_count, kv_heads, head_dim = shape_key
+            module = build_prefill_kv_copy_module(
+                token_count,
+                kv_heads=kv_heads,
+                head_dim=head_dim,
+            )
+            backend = XRTBackend(
+                verbose=cache.verbose,
+                omit_while_true_loop=False,
+                output_format=output_format,
+                instance_name="gemma3_prefill_kv",
+                target_device="npu2",
+                runtime_loop_tiling_sizes=[4, 4],
+            )
+            try:
+                output_binary_name = (
+                    f"gemma3_prefill_kv_{token_count}_{kv_heads}_{head_dim}"
+                )
+                artifact = backend.compile(
+                    module,
+                    output_binary_name=output_binary_name,
+                )
+            finally:
+                backend.unload()
+            compiled_by_shape[shape_key] = (
+                Path(artifact.output_binary),
+                None if artifact.insts is None else Path(artifact.insts),
+                str(artifact.kernel),
+            )
+        source_binary, source_insts, kernel = compiled_by_shape[shape_key]
+        cached_binary = cache.cache_dir / f"{name}{source_binary.suffix}"
+        shutil.copy2(source_binary, cached_binary)
+        cached_insts = None
+        if source_insts is not None and source_insts.exists():
+            cached_insts = cache.cache_dir / f"{name}.insts.bin"
+            shutil.copy2(source_insts, cached_insts)
+        cache.artifacts[name] = XRTCompileArtifact(
+            str(cached_binary),
+            kernel,
+            None if cached_insts is None else str(cached_insts),
+        )
+    cache.save_manifest()
+    return expected
+
+
 class Gemma3KernelCache:
     """Cached Gemma3 NPU artifacts, XRT contexts, and persistent BO sets."""
 
@@ -87,7 +279,11 @@ class Gemma3KernelCache:
         verbose: bool = False,
         lock_path: Path | str = "/tmp/gemma3-npu.lock",
     ) -> None:
-        self.cache_dir = Path(cache_dir) if cache_dir is not None else default_cache_dir(model_variant)
+        self.cache_dir = (
+            Path(cache_dir)
+            if cache_dir is not None
+            else default_cache_dir(model_variant)
+        ).resolve()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.model_variant = model_variant
         self.verbose = verbose
@@ -104,6 +300,15 @@ class Gemma3KernelCache:
     @property
     def manifest_path(self) -> Path:
         return self.cache_dir / MANIFEST_FILE
+
+    def _resolve_manifest_path(self, path_value: Any) -> Path:
+        path = Path(str(path_value))
+        if path.is_absolute():
+            return path
+        manifest_relative = self.cache_dir / path
+        if manifest_relative.exists():
+            return manifest_relative.resolve()
+        return path.resolve()
 
     def register_artifact(
         self,
@@ -145,9 +350,9 @@ class Gemma3KernelCache:
         data = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         artifacts: dict[str, Any] = {}
         for item in data:
-            output_binary = Path(str(item["output_binary"]))
+            output_binary = self._resolve_manifest_path(item["output_binary"])
             insts = item.get("insts")
-            insts_path = None if insts is None else Path(str(insts))
+            insts_path = None if insts is None else self._resolve_manifest_path(insts)
             if not output_binary.exists():
                 raise FileNotFoundError(f"cached Gemma3 kernel binary is missing: {output_binary}")
             if insts_path is not None and not insts_path.exists():

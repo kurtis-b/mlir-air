@@ -35,9 +35,11 @@ arguments, and zero binding blockers. The `gemma3.npu.inference_runtime` shell
 now reports this setup through `prepare_runtime()` and attaches the same
 blockers under `npu_runtime` in NPU paper-benchmark JSONs. The runtime
 `generate()` path is now gated on production NPU prefill K/V and records
-`gemma3_1b_npu_runtime_decode_loop.json` as `BLOCKED` before decode launches
-when the runtime cache has no `gemma3_prefill_kv_L*` production prefill
-artifacts. The previous stitched 26-layer decode-loop evidence remains
+`gemma3_1b_npu_runtime_decode_loop.json` as `BLOCKED` before decode launches.
+The runtime cache now contains `gemma3_prefill_kv_L0` through
+`gemma3_prefill_kv_L25`; the current blocker is production prefill runtime
+argument materialization and K/V production, not missing cached artifacts. The
+previous stitched 26-layer decode-loop evidence remains
 diagnostic: it validated `DECODE_LOOP_DIAGNOSTIC_PASS`,
 `manifest-contiguous-static-bo`, and 182 manifest-backed Q4NX static BO slices
 through the stitched FusedDQP projection arguments, but it cannot satisfy the
