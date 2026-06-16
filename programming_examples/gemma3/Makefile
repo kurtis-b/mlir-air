@@ -109,6 +109,18 @@ ROPE_HERD_X ?= 4
 FLOWQKV_TILED_STATS_OUTPUT_MODE ?= direct
 FLOWQKV_TILED_STATS_HOST_BATCH_TILES ?= 0
 
+MODEL_VARIANT ?= gemma3-1b
+PROMPT_LEN ?= 1024
+DECODE_CONTEXT ?= 1024
+DECODE_TOKENS ?= 1
+QUANTIZED_WEIGHTS ?= required
+RUNTIME_CACHE_DIR ?= $(BUILD_DIR)/runtime_cache/$(MODEL_VARIANT)
+RESULTS_DIR ?= $(srcdir)/results
+PREFILL_RESULT ?= $(RESULTS_DIR)/gemma3_1b_npu_prefill_runtime.json
+DECODE_RESULT ?= $(RESULTS_DIR)/gemma3_1b_npu_runtime_decode_loop.json
+
+.PHONY: model-blockers model-prepare model-prefill model-generate model-validate model-loop
+
 all: run-q4nx run-mm run-fused-dqp run-flowqkv run-flowkv
 all-opt: run-q4nx-opt run-mm-opt run-fused-dqp-opt run-flowqkv-opt run-flowkv-opt
 sweep:
@@ -285,6 +297,55 @@ run-flowqkv-tiled-stats: compile-flowqkv-tiled-stats-kernel prepare-air-project
 		--host-batch-tiles $(FLOWQKV_TILED_STATS_HOST_BATCH_TILES) --kernel-name flowqkv_tile_stats_bf16 \
 		--object-file flowqkv_tiled_stats.o --compile-mode $(COMPILE_MODE) $(OUTPUT_FORMAT_FLAG) \
 		--output-mode $(FLOWQKV_TILED_STATS_OUTPUT_MODE)
+
+model-blockers:
+	$(RUN_PYTHON) -m gemma3.evidence.reproduction_blockers
+
+model-prepare:
+	$(RUN_PYTHON) -m gemma3.npu.inference_runtime \
+		--prepare-runtime \
+		--model-variant $(MODEL_VARIANT) \
+		--prompt-len $(PROMPT_LEN) \
+		--decode-context $(DECODE_CONTEXT) \
+		--quantized-weights $(QUANTIZED_WEIGHTS) \
+		--runtime-cache-dir $(RUNTIME_CACHE_DIR)
+
+model-prefill:
+	mkdir -p $(RESULTS_DIR)
+	$(RUN_PYTHON) -m gemma3.npu.inference_runtime \
+		--run-npu-prefill \
+		--model-variant $(MODEL_VARIANT) \
+		--prompt-len $(PROMPT_LEN) \
+		--decode-context $(DECODE_CONTEXT) \
+		--quantized-weights $(QUANTIZED_WEIGHTS) \
+		--runtime-cache-dir $(RUNTIME_CACHE_DIR) \
+		--json \
+		--result-json $(PREFILL_RESULT)
+
+model-generate:
+	mkdir -p $(RESULTS_DIR)
+	$(RUN_PYTHON) -m gemma3.npu.inference_runtime \
+		--generate \
+		--model-variant $(MODEL_VARIANT) \
+		--prompt-len $(PROMPT_LEN) \
+		--decode-context $(DECODE_CONTEXT) \
+		--decode-tokens $(DECODE_TOKENS) \
+		--quantized-weights $(QUANTIZED_WEIGHTS) \
+		--runtime-cache-dir $(RUNTIME_CACHE_DIR) \
+		--json \
+		--result-json $(DECODE_RESULT)
+
+model-validate:
+	$(RUN_PYTHON) -m gemma3.evidence.npu_runtime_contracts \
+		--model-variant $(MODEL_VARIANT) \
+		--prompt-len $(PROMPT_LEN) \
+		--decode-context $(DECODE_CONTEXT) \
+		--runtime-cache-dir $(RUNTIME_CACHE_DIR) \
+		--prefill-result $(PREFILL_RESULT) \
+		--decode-result $(DECODE_RESULT) \
+		--allow-blocked
+
+model-loop: model-blockers model-prepare model-prefill model-generate model-validate
 
 profile-paper: run-fused-dqp-paper run-flowqkv-paper run-flowkv-paper
 

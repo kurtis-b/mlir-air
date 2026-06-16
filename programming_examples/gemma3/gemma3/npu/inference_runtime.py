@@ -59,6 +59,7 @@ from gemma3.npu.xrt_runner import dry_run_allocation_plan, has_paper_shape_bo_al
 
 
 RUNTIME_SETUP_VERSION = 1
+RUNTIME_CONTRACT_VERSION = "gemma3-npu-runtime-contract-v1"
 PREFILL_KV_CACHE_LAYOUT = "per-layer-key-value"
 PREFILL_KV_CACHE_NOT_PRODUCED_STATUS = "PREFILL_KV_CACHE_NOT_PRODUCED"
 PREFILL_KV_CACHE_NOT_PRODUCED_SOURCE = "none"
@@ -278,6 +279,13 @@ class Gemma3RuntimeExecutionResult:
     unit: str | None
     blockers: tuple[str, ...]
     operation_ownership: tuple[Gemma3RuntimeOwnershipRecord, ...]
+    runtime_contract_version: str | None = None
+    artifact_manifest_path: str | None = None
+    timed_window_policy: str | None = None
+    attention_reduction_mode: str | None = None
+    logits_sampling_mode: str | None = None
+    sampling_policy: str | None = None
+    power_snapshot: dict[str, object] | None = None
     elapsed_seconds: float | None = None
     setup_status: str | None = None
     q4nx_manifest: str | None = None
@@ -1061,6 +1069,65 @@ def _execution_setup_fields(session: Gemma3RuntimeSession) -> dict[str, object]:
     }
 
 
+def _runtime_contract_fields(
+    session: Gemma3RuntimeSession,
+    *,
+    entrypoint: str,
+    attention_reduction_mode: str | None = None,
+    logits_sampling_mode: str | None = None,
+    sampling_policy: str | None = None,
+    power_snapshot: dict[str, object] | None = None,
+) -> dict[str, object]:
+    manifest_path = None
+    if session.runtime_cache is not None:
+        manifest_path = str(session.runtime_cache.manifest_path)
+    if entrypoint == "run_npu_prefill":
+        timed_window_policy = "compile-load-bo-preload-excluded;prefill-entrypoint-timed"
+    elif entrypoint == "generate":
+        timed_window_policy = "compile-load-bo-preload-prefill-excluded;decode-token-loop-timed"
+    else:
+        timed_window_policy = "entrypoint-timed-window-unspecified"
+    return {
+        "runtime_contract_version": RUNTIME_CONTRACT_VERSION,
+        "artifact_manifest_path": manifest_path,
+        "timed_window_policy": timed_window_policy,
+        "attention_reduction_mode": attention_reduction_mode,
+        "logits_sampling_mode": logits_sampling_mode,
+        "sampling_policy": sampling_policy,
+        "power_snapshot": power_snapshot,
+    }
+
+
+def _decode_attention_reduction_mode(
+    probe: Any,
+    blockers: Iterable[str],
+) -> str:
+    if getattr(probe, "attention_host_reduction", False):
+        return "host"
+    blocker_set = set(blockers)
+    if NPU_ATTENTION_REDUCTION_BLOCKER in blocker_set:
+        return "missing"
+    cache_contract = str(getattr(probe, "attention_cache_contract", ""))
+    if cache_contract == "single-current-token-kv":
+        return "missing"
+    return "npu"
+
+
+def _decode_logits_sampling_fields(probe: Any) -> tuple[str, str | None]:
+    logits = getattr(probe, "logits_evidence", None)
+    if not isinstance(logits, dict):
+        return "not-wired", None
+    timing = str(logits.get("timing_window", ""))
+    mode = "host-timed" if timing == "included-in-measured-loop-wall" else "host-diagnostic"
+    policy = "argmax" if "sampled_token_id" in logits else None
+    return mode, policy
+
+
+def _probe_power_snapshot(probe: Any) -> dict[str, object] | None:
+    snapshot = getattr(probe, "power_snapshot", None)
+    return snapshot if isinstance(snapshot, dict) else None
+
+
 def _setup_ownership(session: Gemma3RuntimeSession) -> tuple[Gemma3RuntimeOwnershipRecord, ...]:
     return tuple(record for record in session.setup.operation_ownership if not record.timed_window)
 
@@ -1291,6 +1358,7 @@ def _blocked_execution_result(
         host_fallback_count=0,
         host_runtime_count=0,
         error=error,
+        **_runtime_contract_fields(session, entrypoint=entrypoint),
         **setup_fields,
     )
 
@@ -1554,6 +1622,13 @@ def run_npu_prefill(
         host_fallback_count=production.host_fallback_count,
         host_runtime_count=production.host_runtime_count,
         error=production.error,
+        **_runtime_contract_fields(
+            session,
+            entrypoint="run_npu_prefill",
+            attention_reduction_mode="not-required",
+            logits_sampling_mode="not-applicable",
+            sampling_policy="none",
+        ),
         **setup_fields,
     )
 
@@ -1601,6 +1676,13 @@ def generate(
             kernel_launch_count=0,
             host_fallback_count=0,
             host_runtime_count=0,
+            **_runtime_contract_fields(
+                session,
+                entrypoint="generate",
+                attention_reduction_mode="not-required",
+                logits_sampling_mode="not-required",
+                sampling_policy="none",
+            ),
             **_execution_setup_fields(session),
         )
     if session.setup.model_variant != "gemma3-1b":
@@ -1698,6 +1780,7 @@ def generate(
 
     blockers = _decode_probe_blockers(session, probe)
     ownership = _decode_probe_ownership(session, probe)
+    logits_sampling_mode, sampling_policy = _decode_logits_sampling_fields(probe)
     status = (
         "DECODE_RUNTIME_PASS_WITH_BLOCKERS"
         if getattr(probe, "status", "") == "DECODE_LOOP_DIAGNOSTIC_PASS"
@@ -1728,6 +1811,14 @@ def generate(
         host_fallback_count=_probe_host_fallback_count(probe),
         host_runtime_count=0,
         npu_decode_loop=probe.to_json_dict(),
+        **_runtime_contract_fields(
+            session,
+            entrypoint="generate",
+            attention_reduction_mode=_decode_attention_reduction_mode(probe, blockers),
+            logits_sampling_mode=logits_sampling_mode,
+            sampling_policy=sampling_policy,
+            power_snapshot=_probe_power_snapshot(probe),
+        ),
         **_execution_setup_fields(session),
     )
 

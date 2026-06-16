@@ -339,7 +339,12 @@ headline timing.
 
 Use `docs/npu_runtime_loop.md` as the operational runbook for choosing the next
 1B text NPU runtime blocker, running the exact commands, and deciding whether
-production evidence is sufficient.
+production evidence is sufficient. The Makefile `model-loop` target mirrors the
+Llama-style organization (`compile/cache -> prepare_runtime -> run_npu_prefill
+-> generate -> profile/verify`) for Gemma3, and
+`gemma3.evidence.npu_runtime_contracts` is the pass/fail boundary for accepted
+Gemma3 evidence. Llama remains a control-plane reference only; it is not a
+source of accepted Gemma3 measurements.
 
 The target runtime shape is:
 

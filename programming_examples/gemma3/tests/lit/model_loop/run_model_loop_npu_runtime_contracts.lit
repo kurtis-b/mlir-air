@@ -1,0 +1,22 @@
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.evidence.npu_runtime_contracts --self-test | FileCheck %s --check-prefix=SELF
+# RUN: mkdir -p %t.cache
+# RUN: PYTHONPATH=%S/../../..:%S/../../../../../sandbox/lib/python3.12/site-packages:$PYTHONPATH %PYTHON -m gemma3.evidence.npu_runtime_contracts --model-variant gemma3-1b --prompt-len 1024 --decode-context 1024 --runtime-cache-dir %t.cache --prefill-result %S/../../../results/gemma3_1b_npu_prefill_runtime.json --decode-result %S/../../../results/gemma3_1b_npu_runtime_decode_loop.json --allow-blocked | FileCheck %s --check-prefix=CURRENT
+
+# SELF: contract production_prefill_artifacts status=PASS blockers=none
+# SELF: contract production_kv status=PASS blockers=none
+# SELF: contract decode_handoff status=PASS blockers=none
+# SELF: contract attention_reduction status=PASS blockers=none
+# SELF: contract static_bo_route status=PASS blockers=none
+# SELF: contract logits_sampling status=PASS blockers=none
+# SELF: contract paper_cell status=PASS blockers=none
+# SELF: contract production_prefill_artifacts status=BLOCKED blockers=production-prefill-runtime-artifacts-not-cached
+# SELF: GEMMA3_NPU_RUNTIME_CONTRACTS_SELF_TEST: PASS
+
+# CURRENT: contract production_prefill_artifacts status=BLOCKED blockers=production-prefill-runtime-artifacts-not-cached
+# CURRENT: contract production_kv status=BLOCKED
+# CURRENT-SAME: production-prefill-runtime-artifacts-not-cached
+# CURRENT: contract decode_handoff status=BLOCKED
+# CURRENT-SAME: generate-prefill-kv-cache-blocked
+# CURRENT: contract attention_reduction status=BLOCKED blockers=npu-attention-reduction-not-wired
+# CURRENT: contract static_bo_route status=BLOCKED blockers=production-contiguous-static-weight-bo-not-used-by-fused-dqp-route
+# CURRENT: contract logits_sampling status=BLOCKED blockers=logits-sampling-not-wired

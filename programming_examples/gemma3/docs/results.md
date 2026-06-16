@@ -57,10 +57,13 @@ Existing probe, HF, and synthetic evidence remains useful for debugging kernel
 contracts, host/runtime plumbing, and paper-target deltas. It cannot satisfy
 production prefill, production decode handoff, or paper-cell readiness.
 
-For NPU 1B/1k production milestones, use `docs/npu_runtime_loop.md` as the
-accepted evidence contract. Future target CLI or result contracts may be
-documented here when they are clearly labeled as target behavior rather than
-accepted evidence.
+For NPU 1B/1k production milestones, use `docs/npu_runtime_loop.md` and
+`gemma3.evidence.npu_runtime_contracts` as the accepted evidence contract. The
+Llama 3.2 1B example is only the runtime-organization reference; Llama results,
+HF K/V, synthetic K/V, and repeated-current-token decode paths are diagnostics,
+not accepted Gemma3 production evidence. `make model-validate` intentionally
+passes `--allow-blocked` for current-state inspection; blocker clearance uses
+the same validator without that flag.
 
 ## Nonlinear Kernel Evidence
 

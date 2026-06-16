@@ -52,6 +52,29 @@ For hardware runs, source the MLIR-AIR environment first and XRT setup after it 
 `DEBUG_IR=1` on the Make target to retain XRTBackend lowering artifacts for
 routing/debug inspection.
 
+
+## Model Runtime Loop
+
+The model-level Gemma3 1B/1k NPU loop is scaffolded separately from the
+standalone kernel targets. Use the Llama 3.2 1B example as the reference pattern
+for runtime organization only: cached artifacts, per-layer BO reuse, static
+input skipping, K/V handoff, and profile/verify separation. Llama output is not
+accepted Gemma3 evidence.
+
+```bash
+make model-blockers
+make model-prepare
+make model-prefill
+make model-generate
+make model-validate
+make model-loop
+```
+
+`model-validate` runs `gemma3.evidence.npu_runtime_contracts --allow-blocked`
+against the current result files so the present blocked state is inspectable.
+To clear a blocker, run the same validator without `--allow-blocked`; the
+runtime contract is documented in `docs/npu_runtime_loop.md`.
+
 ## Herd Shapes
 
 `HERD_SHAPE` controls both the physical herd dimensions and the default logical
