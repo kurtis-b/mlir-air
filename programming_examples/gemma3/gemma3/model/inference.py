@@ -58,6 +58,8 @@ def main() -> int:
     parser.add_argument("--quantized-weights", choices=["required", "off"], default="required")
     parser.add_argument("--quantized-weights-dir", type=Path)
     parser.add_argument("--force-quantized-weights", action="store_true")
+    parser.add_argument("--runtime-cache-dir", type=Path)
+    parser.add_argument("--prefill-evidence-json", type=Path)
     args = parser.parse_args()
 
     if args.prepare_runtime:
@@ -72,6 +74,8 @@ def main() -> int:
             quantized_weights=args.quantized_weights,
             quantized_weights_dir=args.quantized_weights_dir,
             force_quantized_weights=args.force_quantized_weights,
+            runtime_cache_dir=args.runtime_cache_dir,
+            prefill_evidence_path=args.prefill_evidence_json,
         )
         print(session.setup.format(include_ownership=args.include_ownership))
         if args.result_json:

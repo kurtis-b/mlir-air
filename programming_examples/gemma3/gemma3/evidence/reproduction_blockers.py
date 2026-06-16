@@ -21,6 +21,8 @@ from gemma3.paths import RESULTS_DIR
 
 
 PRODUCTION_STATIC_BO_BLOCKER = "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route"
+NPU_PREFILL_KV_CACHE_BLOCKER = "npu-prefill-kv-cache-not-wired"
+PREFILL_PRODUCED_KV_CACHE_BLOCKER = "prefill-produced-kv-cache-not-wired"
 NPU_RUNTIME_DECODE_LOOP_EVIDENCE = RESULTS_DIR / "gemma3_1b_npu_runtime_decode_loop.json"
 
 
@@ -80,13 +82,29 @@ def _has_runtime_static_projection_bo_evidence(model_variant: str) -> bool:
 
 def _execution_blockers(model_variant: str, weights_dir: Path | None = None) -> list[str]:
     try:
+        from gemma3.npu.prefill_runner import has_all_layer_production_prefill_evidence
         from gemma3.npu.wiring import build_wiring_plan
 
-        blockers = list(build_wiring_plan(model_variant, weights_dir=weights_dir).blockers)
+        wiring = build_wiring_plan(model_variant, weights_dir=weights_dir)
+        blockers = list(wiring.blockers)
     except Exception:
         return ["npu-model-execution-not-implemented"]
     if _has_runtime_static_projection_bo_evidence(model_variant):
         blockers = [blocker for blocker in blockers if blocker != PRODUCTION_STATIC_BO_BLOCKER]
+    if has_all_layer_production_prefill_evidence(
+        model_variant,
+        prompt_len=1024,
+        decode_context=1024,
+        layers=int(getattr(wiring, "layers", 0) or 0),
+    ):
+        blockers = [
+            blocker
+            for blocker in blockers
+            if blocker not in (
+                NPU_PREFILL_KV_CACHE_BLOCKER,
+                PREFILL_PRODUCED_KV_CACHE_BLOCKER,
+            )
+        ]
     return blockers
 
 

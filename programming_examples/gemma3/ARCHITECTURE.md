@@ -337,6 +337,10 @@ headline timing.
 
 `gemma3.npu.inference_runtime` now owns the production-shaped runtime shell. It prepares real 1B/1k setup state, validates kernel argument bindings, records static-input/readback policy, and promotes the stitched 26-layer decode-loop execution into `generate()`. The current runtime decode evidence is `results/gemma3_1b_npu_runtime_decode_loop.json`: it launches 156 timed NPU kernels for one token, binds 182 manifest-backed Q4NX static BO slices through the stitched FusedDQP projection arguments, and reports `DECODE_RUNTIME_PASS_WITH_BLOCKERS`. Remaining blockers are single-token diagnostic attention instead of 1k KV attention, missing NPU-produced prefill K/V cache, missing attention reduction, missing logits/sampling, and the still-diagnostic staged layer boundary.
 
+Use `docs/npu_runtime_loop.md` as the operational runbook for choosing the next
+1B text NPU runtime blocker, running the exact commands, and deciding whether
+production evidence is sufficient.
+
 The target runtime shape is:
 
 ```text
@@ -564,6 +568,9 @@ Projection-weight policy for paper comparisons:
 
 Use `gemma3.evidence.reproduction_blockers` as the machine-readable blocker ledger.
 
+Use `docs/npu_runtime_loop.md` for the required blocker resolution order and
+the evidence gates for clearing production NPU blockers.
+
 Current 1B text blockers:
 
 | Blocker | Meaning |
@@ -736,6 +743,10 @@ from this list:
 - Wire 1B NPU prefill far enough to produce K/V cache rows for decode.
 - Replace host tiled-stat reduction with an NPU-owned reduction path.
 - Normalize CPU and iGPU result generation through one shared backend harness.
+
+For 1B text NPU work, use `docs/npu_runtime_loop.md` to select exactly one
+production blocker, record the evidence contract, and stop after the accepted
+hardware result.
 
 Stop after one item, update result evidence, and rerun the blocker ledger before
 starting the next increment.

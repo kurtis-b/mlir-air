@@ -4,6 +4,7 @@
   "argument_binding_status": "READY_FOR_KERNEL_LAUNCH",
   "blockers": [
     "prefill-1k-npu-not-wired",
+    "prefill-produced-kv-cache-not-wired",
     "npu-prefill-kv-cache-not-wired"
   ],
   "decode_context": 1024,
@@ -50,6 +51,7 @@
     {
       "blockers": [
         "prefill-1k-npu-not-wired",
+        "prefill-produced-kv-cache-not-wired",
         "npu-prefill-kv-cache-not-wired"
       ],
       "name": "prefill_kv_producer",
@@ -131,6 +133,7 @@
   "prefill_kv_cache": {
     "blockers": [
       "prefill-1k-npu-not-wired",
+      "prefill-produced-kv-cache-not-wired",
       "npu-prefill-kv-cache-not-wired"
     ],
     "decode_context": 1024,
@@ -143,6 +146,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -171,6 +175,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -199,6 +204,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -227,6 +233,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -255,6 +262,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -283,6 +291,7 @@
         "attention_kind": "global_full",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -311,6 +320,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -339,6 +349,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -367,6 +378,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -395,6 +407,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -423,6 +436,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -451,6 +465,7 @@
         "attention_kind": "global_full",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -479,6 +494,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -507,6 +523,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -535,6 +552,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -563,6 +581,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -591,6 +610,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -619,6 +639,7 @@
         "attention_kind": "global_full",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -647,6 +668,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -675,6 +697,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -703,6 +726,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -731,6 +755,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -759,6 +784,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -787,6 +813,7 @@
         "attention_kind": "global_full",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -815,6 +842,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",
@@ -843,6 +871,7 @@
         "attention_kind": "local_swa",
         "blockers": [
           "prefill-1k-npu-not-wired",
+          "prefill-produced-kv-cache-not-wired",
           "npu-prefill-kv-cache-not-wired"
         ],
         "dtype": "bf16",

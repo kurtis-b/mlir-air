@@ -50,6 +50,16 @@ segmented kernel-only timing evidence is now present and attached under
 the generated paper-target comparison summary.
 
 
+## Production Evidence vs Diagnostics
+
+Existing probe, HF, and synthetic evidence remains useful for debugging kernel
+contracts, host/runtime plumbing, and paper-target deltas. It cannot satisfy
+production prefill, production decode handoff, or paper-cell readiness.
+
+For NPU 1B/1k production milestones, use `docs/npu_runtime_loop.md` as the
+accepted evidence contract. Future target CLI or result contracts may be
+documented here when they are clearly labeled as target behavior rather than
+accepted evidence.
 
 ## Nonlinear Kernel Evidence
 
