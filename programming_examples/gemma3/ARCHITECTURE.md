@@ -335,7 +335,7 @@ headline timing.
 
 ### Target NPU Runtime
 
-`gemma3.npu.inference_runtime` now owns the production-shaped runtime shell. It prepares real 1B/1k setup state, validates kernel argument bindings, records static-input/readback policy, and promotes the stitched 26-layer decode-loop execution into `generate()`. The current runtime decode evidence is `results/gemma3_1b_npu_runtime_decode_loop.json`: it launches 156 timed NPU kernels for one token, binds 182 manifest-backed Q4NX static BO slices through the stitched FusedDQP projection arguments, and reports `DECODE_RUNTIME_PASS_WITH_BLOCKERS`. Remaining blockers are single-token diagnostic attention instead of 1k KV attention, missing NPU-produced prefill K/V cache, missing attention reduction, missing logits/sampling, and the still-diagnostic staged layer boundary.
+`gemma3.npu.inference_runtime` now owns the production-shaped runtime shell. It prepares real 1B/1k setup state, validates kernel argument bindings, records static-input/readback policy, and gates `generate()` on production NPU prefill K/V before any decode launch. The current runtime decode evidence is `results/gemma3_1b_npu_runtime_decode_loop.json`: it is blocked before decode with `generate-prefill-kv-cache-blocked` and `production-prefill-runtime-artifacts-not-cached`, records zero decode launches, and preserves the NPU-prefill K/V blockers. The stitched 26-layer decode loop remains diagnostic evidence until `run_npu_prefill()` produces a Gemma-owned K/V cache.
 
 Use `docs/npu_runtime_loop.md` as the operational runbook for choosing the next
 1B text NPU runtime blocker, running the exact commands, and deciding whether
@@ -575,6 +575,7 @@ Current 1B text blockers:
 
 | Blocker | Meaning |
 | --- | --- |
+| `production-prefill-runtime-artifacts-not-cached` | The runtime cache has no per-layer `gemma3_prefill_kv_L*` artifacts for launching production prefill K/V. |
 | `prefill-1k-npu-not-wired` | No official 1024-token NPU prefill paper cell runs through the full NPU path. |
 | `npu-prefill-kv-cache-not-wired` | Decode diagnostics use synthetic or HF/CPU-produced prefill cache, not an NPU-produced cache. |
 | `npu-attention-reduction-not-wired` | Tiled-stat attention can use NPU tile work, but cross-tile softmax/stat reduction is still host-side in the diagnostic path. |

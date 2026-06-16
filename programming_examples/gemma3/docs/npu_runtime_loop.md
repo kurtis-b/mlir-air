@@ -18,16 +18,20 @@ Current entrypoints:
 - `prepare_runtime()`: discovers artifacts, prepares model shape state, builds
   preflight, weight, BO, buffer, argument-binding, and launch-order plans, and
   creates the optional `Gemma3KernelCache`.
-- `run_npu_prefill()`: validates or consumes Gemma3-owned production prefill
-  K/V evidence through `gemma3.npu.prefill_runner`; it does not accept HF,
-  synthetic, or probe cache evidence as production.
+- `run_npu_prefill()`: enters `gemma3.npu.prefill_runner`, which now checks
+  the Gemma-owned runtime cache for per-layer production prefill artifacts
+  (`gemma3_prefill_kv_L*`) and reports a concrete artifact blocker when it
+  cannot launch. Explicit JSON evidence is accepted only when passed by path
+  for validation or self-test fixtures. HF, synthetic, and probe cache evidence
+  cannot satisfy the production path.
 - `generate()`: requires production NPU prefill K/V before decode can launch as
   a production handoff.
 - `gemma3.npu.runtime_cache`: owns cached XRT artifacts, persistent BO sets,
   static/intermediate write policy, launch timing, readback accounting, and
   cache statistics.
-- `gemma3.npu.prefill_runner`: owns the production prefill K/V result contract
-  and the all-layer validation helper used by the blocker ledger.
+- `gemma3.npu.prefill_runner`: owns the production prefill K/V executor
+  boundary, result contract, and all-layer validation helper used by the
+  blocker ledger.
 
 Accepted milestones are NPU-only. Diagnostics can guide implementation, but a
 diagnostic result must stay labeled diagnostic until it satisfies the evidence
@@ -61,6 +65,12 @@ Resolve blockers in this order:
 
 The ordering is intentional. For example, decode timing over HF or synthetic
 K/V is still diagnostic even if later decode stages are NPU-owned.
+
+
+Current first unresolved runtime sub-blocker: `production-prefill-runtime-artifacts-not-cached`.
+`run_npu_prefill()` currently finds no cached `gemma3_prefill_kv_L*` production
+artifacts, records zero prefill launches, and keeps `prefill-1k-npu-not-wired`
+and `npu-prefill-kv-cache-not-wired` active.
 
 ## Milestones
 
@@ -162,8 +172,9 @@ python3 -m gemma3.npu.inference_runtime \
 
 ### 4. Run Production Prefill Boundary
 
-Use this command when the implementation should produce or consume production
-prefill K/V evidence:
+Use this command when the implementation should produce production prefill
+K/V through the runtime executor. Do not pass `--prefill-evidence-json` unless
+you are deliberately validating an already-recorded production fixture:
 
 ```bash
 PYTHONPATH=programming_examples/gemma3:sandbox/lib/python3.12/site-packages \
@@ -173,7 +184,6 @@ python3 -m gemma3.npu.inference_runtime \
   --prompt-len 1024 \
   --decode-context 1024 \
   --quantized-weights required \
-  --prefill-evidence-json programming_examples/gemma3/results/gemma3_1b_production_prefill_kv_cache.json \
   --json \
   --result-json programming_examples/gemma3/results/gemma3_1b_npu_prefill_runtime.json
 ```
@@ -201,7 +211,6 @@ python3 -m gemma3.npu.inference_runtime \
   --decode-context 1024 \
   --decode-tokens 1 \
   --quantized-weights required \
-  --prefill-evidence-json programming_examples/gemma3/results/gemma3_1b_production_prefill_kv_cache.json \
   --json \
   --result-json programming_examples/gemma3/results/gemma3_1b_npu_runtime_decode_loop.json
 ```

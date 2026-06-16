@@ -34,13 +34,14 @@ NPU candidate layouts, 2,236 positional
 arguments, and zero binding blockers. The `gemma3.npu.inference_runtime` shell
 now reports this setup through `prepare_runtime()` and attaches the same
 blockers under `npu_runtime` in NPU paper-benchmark JSONs. The runtime
-`generate()` path now promotes the stitched 26-layer decode loop and records
-`gemma3_1b_npu_runtime_decode_loop.json` with 156 timed NPU kernel launches,
-`DECODE_LOOP_DIAGNOSTIC_PASS`, `manifest-contiguous-static-bo`, and 182
-manifest-backed Q4NX static BO slices bound through the stitched FusedDQP
-projection arguments. Its explicit blockers are now missing prefill-produced 1k
-K/V cache, 1k attention/reduction, logits/sampling, and the remaining diagnostic
-staged layer boundary. Staged decode layer-0 correctness and
+`generate()` path is now gated on production NPU prefill K/V and records
+`gemma3_1b_npu_runtime_decode_loop.json` as `BLOCKED` before decode launches
+when the runtime cache has no `gemma3_prefill_kv_L*` production prefill
+artifacts. The previous stitched 26-layer decode-loop evidence remains
+diagnostic: it validated `DECODE_LOOP_DIAGNOSTIC_PASS`,
+`manifest-contiguous-static-bo`, and 182 manifest-backed Q4NX static BO slices
+through the stitched FusedDQP projection arguments, but it cannot satisfy the
+production prefill handoff. Staged decode layer-0 correctness and
 segmented kernel-only timing evidence is now present and attached under
 `npu_staged_diagnostic` in the blocked NPU paper-cell JSONs, but official NPU
 `local_value` remains null because this is not a timed paper-cell run.

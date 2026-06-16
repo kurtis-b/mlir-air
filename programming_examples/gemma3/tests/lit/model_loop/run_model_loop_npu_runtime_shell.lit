@@ -9,10 +9,11 @@
 # SELF: ownership name=logits_sampling phase=decode owner=host-fallback
 # SELF: runtime_result entrypoint=run_npu_prefill model=gemma3-1b status=PREFILL_KV_CACHE_BLOCKED
 # SELF-SAME: prefill_kv_cache_status=PREFILL_KV_CACHE_NOT_PRODUCED
+# SELF-SAME: blockers=production-prefill-runtime-artifacts-not-cached,prefill-1k-npu-not-wired,prefill-produced-kv-cache-not-wired,npu-prefill-kv-cache-not-wired
 # SELF: runtime_result entrypoint=run_npu_prefill model=gemma3-1b status=PREFILL_KV_CACHE_READY
 # SELF-SAME: prefill_kv_cache_source=production-npu-prefill-kv-cache
 # SELF: runtime_result entrypoint=generate model=gemma3-1b status=BLOCKED
-# SELF-SAME: blockers=generate-prefill-kv-cache-blocked,prefill-1k-npu-not-wired,prefill-produced-kv-cache-not-wired,npu-prefill-kv-cache-not-wired
+# SELF-SAME: blockers=generate-prefill-kv-cache-blocked,production-prefill-runtime-artifacts-not-cached,prefill-1k-npu-not-wired,prefill-produced-kv-cache-not-wired,npu-prefill-kv-cache-not-wired
 # SELF: ownership name=decode_prefill_kv_cache phase=decode owner=missing
 # SELF-SAME: status=requires-production-npu-prefill-kv-cache
 # SELF: GEMMA3_NPU_RUNTIME_SELF_TEST: PASS

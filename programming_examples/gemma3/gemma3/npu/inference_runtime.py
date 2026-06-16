@@ -36,6 +36,8 @@ from gemma3.npu.norm_weight_plan import Gemma3NormWeightPlan, build_norm_weight_
 from gemma3.npu.prefill_runner import (
     Gemma3ProductionPrefillResult,
     PREFILL_KV_CACHE_PARTIAL_STATUS,
+    PRODUCTION_PREFILL_ARGUMENTS_BLOCKER,
+    PRODUCTION_PREFILL_ARTIFACTS_BLOCKER,
     run_prefill_kv_cache,
 )
 from gemma3.npu.preflight import Gemma3NPUPreflightPlan, build_preflight_plan
@@ -447,6 +449,8 @@ def _prefill_kv_blockers(blockers: Iterable[str]) -> tuple[str, ...]:
             PREFILL_PRODUCED_KV_CACHE_BLOCKER,
             NPU_PREFILL_KV_CACHE_BLOCKER,
             "prefill-runtime-launch-not-implemented",
+            PRODUCTION_PREFILL_ARTIFACTS_BLOCKER,
+            PRODUCTION_PREFILL_ARGUMENTS_BLOCKER,
         )
     ]
     if selected:
@@ -1245,8 +1249,22 @@ def _blocked_execution_result(
     status: str = "BLOCKED",
     prefill_kernel_launch_count: int | None = None,
     prefill_host_fallback_count: int | None = None,
+    prefill_result: Gemma3RuntimeExecutionResult | None = None,
 ) -> Gemma3RuntimeExecutionResult:
     setup_fields = _execution_setup_fields(session)
+    if prefill_result is not None:
+        setup_fields.update(
+            {
+                "prefill_kv_cache_status": prefill_result.prefill_kv_cache_status,
+                "prefill_kv_cache_source": prefill_result.prefill_kv_cache_source,
+                "prefill_kernel_launch_count": prefill_result.prefill_kernel_launch_count,
+                "prefill_host_fallback_count": prefill_result.prefill_host_fallback_count,
+                "kv_cache_layer_count": prefill_result.kv_cache_layer_count,
+                "kv_cache_token_count": prefill_result.kv_cache_token_count,
+                "prefill_kv_cache": prefill_result.prefill_kv_cache,
+                "prefill_stage_ownership": prefill_result.prefill_stage_ownership,
+            }
+        )
     if prefill_kernel_launch_count is not None:
         setup_fields["prefill_kernel_launch_count"] = prefill_kernel_launch_count
     if prefill_host_fallback_count is not None:
@@ -1640,8 +1658,7 @@ def generate(
             ),
             operation_ownership=_generate_prefill_blocked_ownership(prefill),
             unit=unit,
-            prefill_kernel_launch_count=prefill.prefill_kernel_launch_count,
-            prefill_host_fallback_count=prefill.prefill_host_fallback_count,
+            prefill_result=prefill,
         )
 
     start = perf_counter()

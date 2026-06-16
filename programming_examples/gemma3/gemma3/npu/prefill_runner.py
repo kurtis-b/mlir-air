@@ -5,10 +5,9 @@
 """Gemma3 production prefill K/V cache runner contract.
 
 This module owns the Gemma3 prefill-KV runtime boundary. Probe/HF/synthetic
-cache paths are intentionally not imported here. Today the module validates
-production-prefill evidence and maps it onto the runtime session; when the full
-prefill executor is wired, the launch path should report the same layer/result
-records from the real Gemma-owned runtime cache.
+cache paths are intentionally not imported here. The default path is the
+Gemma-owned runtime executor; explicit JSON evidence is accepted only when a
+caller passes an evidence path for validation or self-test fixtures.
 """
 
 from __future__ import annotations
@@ -32,8 +31,11 @@ PREFILL_KV_CACHE_NOT_PRODUCED_SOURCE = "none"
 PREFILL_1K_NPU_BLOCKER = "prefill-1k-npu-not-wired"
 PREFILL_PRODUCED_KV_CACHE_BLOCKER = "prefill-produced-kv-cache-not-wired"
 NPU_PREFILL_KV_CACHE_BLOCKER = "npu-prefill-kv-cache-not-wired"
+PRODUCTION_PREFILL_ARTIFACTS_BLOCKER = "production-prefill-runtime-artifacts-not-cached"
+PRODUCTION_PREFILL_ARGUMENTS_BLOCKER = "production-prefill-runtime-arguments-not-bound"
 PRODUCTION_PREFILL_EVIDENCE_NAME = "gemma3_1b_production_prefill_kv_cache.json"
 RUNTIME_PREFILL_RESULT_NAME = "gemma3_1b_npu_prefill_runtime.json"
+PRODUCTION_PREFILL_ARTIFACT_TEMPLATE = "gemma3_prefill_kv_L{layer_index}"
 
 
 @dataclass(frozen=True)
@@ -122,6 +124,8 @@ def _relevant_prefill_blockers(blockers: Iterable[str]) -> tuple[str, ...]:
             PREFILL_PRODUCED_KV_CACHE_BLOCKER,
             NPU_PREFILL_KV_CACHE_BLOCKER,
             "prefill-runtime-launch-not-implemented",
+            PRODUCTION_PREFILL_ARTIFACTS_BLOCKER,
+            PRODUCTION_PREFILL_ARGUMENTS_BLOCKER,
         )
     ]
     return _dedupe(selected or (PREFILL_PRODUCED_KV_CACHE_BLOCKER, NPU_PREFILL_KV_CACHE_BLOCKER))
@@ -379,6 +383,102 @@ def _blocked_result(
     )
 
 
+def _runtime_cache_stats(runtime_cache: Any) -> dict[str, object] | None:
+    if runtime_cache is None:
+        return None
+    stats = getattr(runtime_cache, "stats", None)
+    if stats is None:
+        return None
+    return stats().to_json_dict()
+
+
+def _runtime_cache_artifacts(runtime_cache: Any) -> Mapping[str, Any]:
+    artifacts = getattr(runtime_cache, "artifacts", None)
+    if not isinstance(artifacts, Mapping):
+        return {}
+    return artifacts
+
+
+def _expected_prefill_artifact_names(session: Any) -> tuple[str, ...]:
+    return tuple(
+        PRODUCTION_PREFILL_ARTIFACT_TEMPLATE.format(layer_index=int(layer.layer_index))
+        for layer in _setup_cache_layers(session)
+    )
+
+
+def _missing_artifact_error(missing: Sequence[str]) -> str:
+    sample = ", ".join(missing[:4])
+    if len(missing) > 4:
+        sample = f"{sample}, ... (+{len(missing) - 4} more)"
+    return f"missing production prefill runtime artifacts: {sample}"
+
+
+def _run_runtime_prefill_executor(
+    session: Any,
+    token_ids: Sequence[int],
+    *,
+    runtime_cache: Any,
+) -> Gemma3ProductionPrefillResult:
+    """Run the production prefill executor, or report why it cannot launch."""
+    if runtime_cache is None:
+        return _blocked_result(
+            session=session,
+            blockers=(
+                PRODUCTION_PREFILL_ARTIFACTS_BLOCKER,
+                PREFILL_1K_NPU_BLOCKER,
+                PREFILL_PRODUCED_KV_CACHE_BLOCKER,
+                NPU_PREFILL_KV_CACHE_BLOCKER,
+            ),
+            runtime_cache_stats=None,
+            error="production prefill runtime cache is not available",
+        )
+    expected_artifacts = _expected_prefill_artifact_names(session)
+    if not expected_artifacts:
+        return _blocked_result(
+            session=session,
+            blockers=(
+                PRODUCTION_PREFILL_ARTIFACTS_BLOCKER,
+                PREFILL_1K_NPU_BLOCKER,
+                PREFILL_PRODUCED_KV_CACHE_BLOCKER,
+                NPU_PREFILL_KV_CACHE_BLOCKER,
+            ),
+            runtime_cache_stats=_runtime_cache_stats(runtime_cache),
+            error="production prefill K/V cache descriptor is unavailable",
+        )
+    artifacts = _runtime_cache_artifacts(runtime_cache)
+    missing_artifacts = tuple(name for name in expected_artifacts if name not in artifacts)
+    if missing_artifacts:
+        return _blocked_result(
+            session=session,
+            blockers=(
+                PRODUCTION_PREFILL_ARTIFACTS_BLOCKER,
+                PREFILL_1K_NPU_BLOCKER,
+                PREFILL_PRODUCED_KV_CACHE_BLOCKER,
+                NPU_PREFILL_KV_CACHE_BLOCKER,
+            ),
+            runtime_cache_stats=_runtime_cache_stats(runtime_cache),
+            error=_missing_artifact_error(missing_artifacts),
+        )
+
+    # Cached binaries alone are insufficient: the production executor also
+    # needs a materialized argument plan for token embeddings, static BO slices,
+    # and per-layer K/V output BOs before it can safely launch.
+    return _blocked_result(
+        session=session,
+        blockers=(
+            PRODUCTION_PREFILL_ARGUMENTS_BLOCKER,
+            PREFILL_1K_NPU_BLOCKER,
+            PREFILL_PRODUCED_KV_CACHE_BLOCKER,
+            NPU_PREFILL_KV_CACHE_BLOCKER,
+        ),
+        runtime_cache_stats=_runtime_cache_stats(runtime_cache),
+        error=(
+            "production prefill artifacts are cached, but runtime argument "
+            "materialization is not wired"
+        ),
+    )
+
+
 def run_prefill_kv_cache(
     session: Any,
     token_ids: Sequence[int],
@@ -388,17 +488,13 @@ def run_prefill_kv_cache(
 ) -> Gemma3ProductionPrefillResult:
     """Return production-prefill K/V cache status for a prepared session.
 
-    The runtime executor is deliberately evidence-gated until the all-layer
-    prefill launch path exists. This prevents HF/synthetic probe caches from
-    satisfying the production cache handoff.
+    Explicit evidence can validate an already-recorded production result. The
+    default path does not scan result JSON, because the runtime entrypoint must
+    launch or explicitly report the missing production executor boundary.
     """
     start = perf_counter()
     setup = session.setup
-    runtime_cache_stats = (
-        None
-        if runtime_cache is None
-        else runtime_cache.stats().to_json_dict()
-    )
+    runtime_cache_stats = _runtime_cache_stats(runtime_cache)
     if len(token_ids) != setup.prompt_len:
         raise ValueError(f"token_ids length {len(token_ids)} does not match prompt_len {setup.prompt_len}")
     if not setup.ready_for_entrypoints:
@@ -408,24 +504,17 @@ def run_prefill_kv_cache(
             runtime_cache_stats=runtime_cache_stats,
         )
 
-    last_error: str | None = None
-    for path in candidate_evidence_paths(setup.model_variant, explicit=evidence_path):
-        if not path.exists():
-            continue
+    if evidence_path is not None:
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(evidence_path.read_text(encoding="utf-8"))
             if not isinstance(data, Mapping):
                 raise ValueError("prefill evidence root must be a JSON object")
             result = _result_from_evidence(
                 session=session,
                 data=data,
-                evidence_path=path,
+                evidence_path=evidence_path,
                 runtime_cache_stats=runtime_cache_stats,
             )
-            if result.status == PREFILL_KV_CACHE_BLOCKED_STATUS and result.error:
-                if evidence_path is not None and path == evidence_path:
-                    return result
-                continue
             if result.elapsed_seconds is None:
                 return Gemma3ProductionPrefillResult(
                     status=result.status,
@@ -443,19 +532,22 @@ def run_prefill_kv_cache(
                 )
             return result
         except Exception as exc:
-            if evidence_path is not None and path == evidence_path:
-                last_error = str(exc)
+            return _blocked_result(
+                session=session,
+                blockers=(
+                    PREFILL_1K_NPU_BLOCKER,
+                    PREFILL_PRODUCED_KV_CACHE_BLOCKER,
+                    NPU_PREFILL_KV_CACHE_BLOCKER,
+                    *getattr(setup, "blockers", ()),
+                ),
+                runtime_cache_stats=runtime_cache_stats,
+                error=str(exc),
+            )
 
-    return _blocked_result(
+    return _run_runtime_prefill_executor(
         session=session,
-        blockers=(
-            PREFILL_1K_NPU_BLOCKER,
-            PREFILL_PRODUCED_KV_CACHE_BLOCKER,
-            NPU_PREFILL_KV_CACHE_BLOCKER,
-            *getattr(setup, "blockers", ()),
-        ),
-        runtime_cache_stats=runtime_cache_stats,
-        error=last_error,
+        token_ids=token_ids,
+        runtime_cache=runtime_cache,
     )
 
 
