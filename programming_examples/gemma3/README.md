@@ -56,10 +56,12 @@ routing/debug inspection.
 ## Model Runtime Loop
 
 The model-level Gemma3 1B/1k NPU loop is scaffolded separately from the
-standalone kernel targets. Use the Llama 3.2 1B example as the reference pattern
-for runtime organization only: cached artifacts, per-layer BO reuse, static
-input skipping, K/V handoff, and profile/verify separation. Llama output is not
-accepted Gemma3 evidence.
+standalone kernel targets. Use the Llama 3.2 1B example as the reference for
+runtime and stitching mechanics only: cached artifacts, multi-launch
+organization, BO reuse, static input skipping, shape aliasing, K/V handoff, and
+profile/verify separation. Gemma-specific math comes from the local Gemma3
+MLIR-AIR kernels and the Gemma3 paper semantics. Llama output is not accepted
+Gemma3 evidence.
 
 ```bash
 make model-blockers
@@ -74,6 +76,14 @@ make model-loop
 against the current result files so the present blocked state is inspectable.
 To clear a blocker, run the same validator without `--allow-blocked`; the
 runtime contract is documented in `docs/npu_runtime_loop.md`.
+
+The accepted 1B/1k decode target is `--decode-execution-mode
+runlist-full-token`. That mode submits one XRT runlist per decoded token:
+26 full-layer entries using two reusable layer ELF variants (`local_swa` and
+`global_full`) plus one NPU final-norm/tied-embedding argmax entry. The planned
+runlist cache artifact manifest is `gemma3_decode_full_token_runlist.json`,
+with 26 layer artifacts and one logits/sampling artifact. The staging mode
+`--decode-execution-mode staged` remains a diagnostic path.
 
 ## Herd Shapes
 
@@ -156,7 +166,9 @@ then splits the payload in L1 before the Peano call. Paper mode keeps the Q4NX
 weight block plus scale/min pack per row/column block, stages the activation
 vector once per column block, and accumulates across `COL_BLOCKS` using the
 `fused_dqp_accum_block_opt` entry point. The optimized kernel processes the
-paper's 16x8 row/column sub-blocks internally. FusedDQP `pipeline` mode is a
+paper's 16x8 row/column sub-blocks internally. Production decode uses the
+manifest-backed Q4NX contiguous static BO for FusedDQP projection weights, not
+runner-owned per-layer static BO sets. FusedDQP `pipeline` mode is a
 diagnostic two-herd dequant/project mapping that streams dequantized `16x8`
 row/column tiles over an AIR channel. It is compile-legal with debug IR, but
 current hardware execution still times out with no active context left after
@@ -183,6 +195,10 @@ chunked online-softmax state (`m`, `l`, and `Y`) instead of a full score buffer.
 The split FlowKV and FlowQKV pipelines now chunk the CT boundary; FlowQKV still
 keeps full K in the score stage for correct softmax normalization and copies V
 through L1 chunk buffers in the apply stage to avoid duplicate AIE DMA routes.
+For the 1B/1k production decode path, attention is paper-style FlowKV or
+FlowKV-SWA with Q chunk size 1 and KV chunks covering the 1024-token context.
+Softmax state and reduction remain NPU-owned, and the attention result feeds
+the Q4NX FusedDQP O projection.
 
 These examples are meant to be readable, sweepable AIR mappings. They do not use
 binary disassembly, generated instruction traces, or model-runtime integration.

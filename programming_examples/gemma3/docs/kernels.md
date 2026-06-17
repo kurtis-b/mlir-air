@@ -19,7 +19,8 @@ The examples include correctness-first and optimized Peano variants:
 - `flowqkv_tiled_stats.py` / `flow_attention_stats.cc`: diagnostic decode
   attention over long KV caches by emitting per-tile softmax statistics and
   merging them outside the kernel; this avoids staging a full 1k KV cache in
-  L1, but it is not yet the production in-model reduction route.
+  L1, but it is diagnostic evidence only and is not the production in-model
+  decode-attention route.
 - `flowkv.py` / `flow_attention.cc` / `flow_attention_opt.cc`: decode attention as
   the Q-chunk-size-1 specialization of the same grouped attention.
 - `residual_add.py`: BF16 elementwise residual add for Gemma attention and MLP
@@ -114,6 +115,14 @@ The optimized Q4NX and FusedDQP microkernels expand packed int4 values in
 optimized FlowQKV/FlowKV microkernels vectorize BF16 dot products and value
 accumulation while preserving the same online-softmax semantics.
 
-The optimized attention kernels are still one group per CT. They are not yet
-the full paper multi-CT, KV-partitioned schedule with explicit inter-CT
-reductions and stream overlap; that remains the next integration step.
+The production 1B/1k decode target uses paper-style FlowKV or FlowKV-SWA:
+Q chunk size 1, KV chunks over the 1024-token context, online softmax state kept
+on the NPU, and NPU-owned reduction before the attention result is consumed by
+the O projection. `flowqkv_tiled_stats` remains useful for proving long-cache
+tiling and merge numerics, but it is not a production paper-cell path because
+its diagnostic merge is outside the kernel route.
+
+Production FusedDQP decode projections read the manifest-backed Q4NX contiguous
+static BO and bind projection slices by manifest offset. Runner-owned per-layer
+static BO sets are diagnostic plumbing and must not be described as the
+accepted paper-cell static-weight route.

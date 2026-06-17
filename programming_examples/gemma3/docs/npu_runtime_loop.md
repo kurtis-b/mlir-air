@@ -29,7 +29,8 @@ Current entrypoints:
   or self-test fixtures. HF, synthetic, and probe cache evidence cannot satisfy
   the production path.
 - `generate()`: requires production NPU prefill K/V before decode can launch as
-  a production handoff.
+  a production handoff. Accepted decode evidence uses
+  `--decode-execution-mode runlist-full-token`; `staged` remains diagnostic.
 - `gemma3.npu.runtime_cache`: owns cached XRT artifacts, persistent BO sets,
   static/intermediate write policy, launch timing, readback accounting, and
   cache statistics.
@@ -43,9 +44,10 @@ contract below.
 
 ## Llama-Derived Runtime Map
 
-Use `programming_examples/llama32_1b` as the runtime-organization reference,
-not as imported code and not as accepted Gemma3 evidence. The Gemma3 loop maps
-onto the same control-plane shape:
+Use `programming_examples/llama32_1b` as the runtime-organization,
+multi-launch stitching, BO reuse, and shape-aliasing reference only. Do not use
+it as imported Gemma math and do not treat Llama results as accepted Gemma3
+evidence. The Gemma3 loop maps onto the same control-plane shape:
 
 ```text
 compile/cache artifacts -> prepare_runtime -> run_npu_prefill -> generate -> profile/verify
@@ -59,6 +61,43 @@ compile/cache artifacts -> prepare_runtime -> run_npu_prefill -> generate -> pro
 | `intermediate_indices` | Gemma3 virtual/intermediate buffers | Intermediate outputs are not treated as accepted readback evidence unless the contract names them. |
 | K/V handoff from prefill to decode | `run_npu_prefill()` result consumed by `generate()` | Decode cannot clear with HF, synthetic, repeated-current-token, or host-replaced K/V. |
 | Profile/verify split | `gemma3.evidence.npu_runtime_contracts` plus paper comparison | Contract validation decides blocker state; paper comparison only compares accepted result cells. |
+
+## Accepted Decode Target
+
+The accepted Gemma3 1B/1k decode target is `runlist-full-token`, exposed by:
+
+```text
+--decode-execution-mode {staged,runlist-full-token}
+```
+
+`runlist-full-token` is the production/paper-cell mode. For each decoded token
+it submits exactly one XRT runlist and waits once for that runlist. The planned
+runlist has 27 entries:
+
+- 26 full-layer entries over the Gemma3 text stack.
+- 1 NPU final-norm/tied-embedding argmax entry with
+  `logits_sampling_mode=npu` and `sampling_policy=argmax`.
+
+The 26 layer entries use two reusable full-layer ELF variants: `local_swa` and
+`global_full`. The layer cadence is the Gemma3 5-local/1-global pattern across
+the 26 text layers. For the 1B/1k cell, both local and global layer variants
+read the 1024-token K/V context; global layers keep `window_len=0` metadata.
+Production decode attention is FlowKV or FlowKV-SWA with Q chunk size 1 and KV
+chunks over the 1024-token context. Softmax state and reduction stay on the NPU,
+and the attention result feeds the Q4NX FusedDQP O projection.
+
+The planned runlist cache artifact manifest is
+`gemma3_decode_full_token_runlist.json`. It should name the 26 layer artifacts
+and the final logits/sampling artifact. `flowqkv_tiled_stats` evidence is
+diagnostic only; it must not be described as the production decode-attention
+path for this target.
+
+Accepted decode result JSON must include `decode_execution_mode`,
+`runlist_entry_count`, `runlist_execute_count`, `runlist_wait_count`,
+`runlist_seconds`, `runlist_mean_seconds`, `runlist_static_bo_mode`,
+`intermediate_readback_count`, `dynamic_static_write_count`,
+`attention_reduction_mode`, `logits_sampling_mode`, `sampling_policy`, and
+timed-window power metadata aligned with the runlist execution window.
 
 The exact runtime-contract validator for all pre-paper gates is:
 
@@ -84,9 +123,10 @@ clear a blocker.
 | Prefill artifacts | `Gemma3KernelCache.load_manifest()` plus `run_npu_prefill()` | Runtime cache manifest and `results/gemma3_1b_npu_prefill_runtime.json` | `PYTHONPATH=programming_examples/gemma3:sandbox/lib/python3.12/site-packages python3 -m gemma3.evidence.npu_runtime_contracts --model-variant gemma3-1b --prompt-len 1024 --decode-context 1024 --runtime-cache-dir programming_examples/gemma3/build_peano/runtime_cache/gemma3-1b --prefill-result programming_examples/gemma3/results/gemma3_1b_npu_prefill_runtime.json --decode-result programming_examples/gemma3/results/gemma3_1b_npu_runtime_decode_loop.json` | `production-prefill-runtime-artifacts-not-cached` | `production-prefill-runtime-arguments-not-bound` or production K/V readiness |
 | Production K/V | `run_npu_prefill()` production executor | `results/gemma3_1b_npu_prefill_runtime.json` | `PYTHONPATH=programming_examples/gemma3:sandbox/lib/python3.12/site-packages python3 -m gemma3.evidence.npu_runtime_contracts --model-variant gemma3-1b --prompt-len 1024 --decode-context 1024 --runtime-cache-dir programming_examples/gemma3/build_peano/runtime_cache/gemma3-1b --prefill-result programming_examples/gemma3/results/gemma3_1b_npu_prefill_runtime.json --decode-result programming_examples/gemma3/results/gemma3_1b_npu_runtime_decode_loop.json` | `npu-prefill-kv-cache-not-wired`, then `prefill-1k-npu-not-wired` when timed | Decode handoff |
 | Decode handoff | `generate()` consumes the same NPU-produced K/V descriptor | `results/gemma3_1b_npu_runtime_decode_loop.json` | `PYTHONPATH=programming_examples/gemma3:sandbox/lib/python3.12/site-packages python3 -m gemma3.evidence.npu_runtime_contracts --model-variant gemma3-1b --prompt-len 1024 --decode-context 1024 --runtime-cache-dir programming_examples/gemma3/build_peano/runtime_cache/gemma3-1b --prefill-result programming_examples/gemma3/results/gemma3_1b_npu_prefill_runtime.json --decode-result programming_examples/gemma3/results/gemma3_1b_npu_runtime_decode_loop.json` | `generate-prefill-kv-cache-blocked` and `prefill-produced-kv-cache-not-wired` | Attention reduction |
-| Attention reduction | Decode attention reduction is NPU-owned or proven unnecessary | Decode runtime JSON with `attention_reduction_mode=npu` or `not-required` | `PYTHONPATH=programming_examples/gemma3:sandbox/lib/python3.12/site-packages python3 -m gemma3.evidence.npu_runtime_contracts --model-variant gemma3-1b --prompt-len 1024 --decode-context 1024 --runtime-cache-dir programming_examples/gemma3/build_peano/runtime_cache/gemma3-1b --prefill-result programming_examples/gemma3/results/gemma3_1b_npu_prefill_runtime.json --decode-result programming_examples/gemma3/results/gemma3_1b_npu_runtime_decode_loop.json` | `npu-attention-reduction-not-wired` | Static BO route |
-| Static BO route | FusedDQP decode projections use manifest-backed contiguous static BOs | Decode runtime JSON with `static_projection_argument_mode=manifest-contiguous-static-bo` and nonzero BO sets | `PYTHONPATH=programming_examples/gemma3:sandbox/lib/python3.12/site-packages python3 -m gemma3.evidence.npu_runtime_contracts --model-variant gemma3-1b --prompt-len 1024 --decode-context 1024 --runtime-cache-dir programming_examples/gemma3/build_peano/runtime_cache/gemma3-1b --prefill-result programming_examples/gemma3/results/gemma3_1b_npu_prefill_runtime.json --decode-result programming_examples/gemma3/results/gemma3_1b_npu_runtime_decode_loop.json` | `production-contiguous-static-weight-bo-not-used-by-fused-dqp-route` | Logits/sampling |
-| Logits/sampling | Final norm/logits/sampling are NPU-owned or timed/accounted host work | Decode runtime JSON with `logits_sampling_mode`, `sampling_policy`, and ownership records | `PYTHONPATH=programming_examples/gemma3:sandbox/lib/python3.12/site-packages python3 -m gemma3.evidence.npu_runtime_contracts --model-variant gemma3-1b --prompt-len 1024 --decode-context 1024 --runtime-cache-dir programming_examples/gemma3/build_peano/runtime_cache/gemma3-1b --prefill-result programming_examples/gemma3/results/gemma3_1b_npu_prefill_runtime.json --decode-result programming_examples/gemma3/results/gemma3_1b_npu_runtime_decode_loop.json` | `logits-sampling-not-wired` or `logits-sampling-host-diagnostic-only` | Paper cell |
+| Attention reduction | FlowKV/FlowKV-SWA decode attention keeps softmax state and reduction on NPU | Decode runtime JSON with `attention_reduction_mode=npu` | `PYTHONPATH=programming_examples/gemma3:sandbox/lib/python3.12/site-packages python3 -m gemma3.evidence.npu_runtime_contracts --model-variant gemma3-1b --prompt-len 1024 --decode-context 1024 --runtime-cache-dir programming_examples/gemma3/build_peano/runtime_cache/gemma3-1b --prefill-result programming_examples/gemma3/results/gemma3_1b_npu_prefill_runtime.json --decode-result programming_examples/gemma3/results/gemma3_1b_npu_runtime_decode_loop.json` | `npu-attention-reduction-not-wired` | Static BO route |
+| Static BO route | FusedDQP decode projections use manifest-backed Q4NX contiguous static BOs | Decode runtime JSON with `runlist_static_bo_mode=manifest-contiguous-static-bo`, `static_projection_argument_mode=manifest-contiguous-static-bo`, and nonzero BO sets | `PYTHONPATH=programming_examples/gemma3:sandbox/lib/python3.12/site-packages python3 -m gemma3.evidence.npu_runtime_contracts --model-variant gemma3-1b --prompt-len 1024 --decode-context 1024 --runtime-cache-dir programming_examples/gemma3/build_peano/runtime_cache/gemma3-1b --prefill-result programming_examples/gemma3/results/gemma3_1b_npu_prefill_runtime.json --decode-result programming_examples/gemma3/results/gemma3_1b_npu_runtime_decode_loop.json` | `production-contiguous-static-weight-bo-not-used-by-fused-dqp-route` | Full-token runlist |
+| Full-token runlist | One XRT runlist submission per decoded token | Decode runtime JSON with `decode_execution_mode=runlist-full-token`, `runlist_entry_count=27`, `runlist_execute_count=decode_tokens`, `runlist_wait_count=decode_tokens`, `runlist_seconds`, `runlist_mean_seconds`, `runlist_static_bo_mode=manifest-contiguous-static-bo`, `intermediate_readback_count=0`, and `dynamic_static_write_count=0` | `PYTHONPATH=programming_examples/gemma3:sandbox/lib/python3.12/site-packages python3 -m gemma3.evidence.npu_runtime_contracts --model-variant gemma3-1b --prompt-len 1024 --decode-context 1024 --runtime-cache-dir programming_examples/gemma3/build_peano/runtime_cache/gemma3-1b --prefill-result programming_examples/gemma3/results/gemma3_1b_npu_prefill_runtime.json --decode-result programming_examples/gemma3/results/gemma3_1b_npu_runtime_decode_loop.json` | Decode runlist count, timing, static-BO, and readback blockers | Logits/sampling |
+| Logits/sampling | Final norm/tied-embedding argmax is NPU-owned inside the runlist | Decode runtime JSON with `logits_sampling_mode=npu`, `sampling_policy=argmax`, and NPU ownership records | `PYTHONPATH=programming_examples/gemma3:sandbox/lib/python3.12/site-packages python3 -m gemma3.evidence.npu_runtime_contracts --model-variant gemma3-1b --prompt-len 1024 --decode-context 1024 --runtime-cache-dir programming_examples/gemma3/build_peano/runtime_cache/gemma3-1b --prefill-result programming_examples/gemma3/results/gemma3_1b_npu_prefill_runtime.json --decode-result programming_examples/gemma3/results/gemma3_1b_npu_runtime_decode_loop.json` | `logits-sampling-not-wired` or `logits-sampling-host-diagnostic-only` | Paper cell |
 | Paper cell | Blocker-free TTFT/TPS/power result | Paper result JSON passed with `--paper-result` | `PYTHONPATH=programming_examples/gemma3:sandbox/lib/python3.12/site-packages python3 -m gemma3.evidence.npu_runtime_contracts --model-variant gemma3-1b --prompt-len 1024 --decode-context 1024 --runtime-cache-dir programming_examples/gemma3/build_peano/runtime_cache/gemma3-1b --prefill-result programming_examples/gemma3/results/gemma3_1b_npu_prefill_runtime.json --decode-result programming_examples/gemma3/results/gemma3_1b_npu_runtime_decode_loop.json --paper-result <paper-cell.json>` | Paper-comparable 1B/1k NPU cell | Broaden only after the 1B/1k cell is stable |
 
 
@@ -113,7 +153,7 @@ Resolve blockers in this order:
 2. Decode handoff from NPU-produced prefill K/V.
 3. NPU-owned attention reduction.
 4. Production contiguous static BO route.
-5. Final norm, logits, and sampling policy.
+5. Full-token runlist with NPU final norm, logits, and argmax sampling.
 6. 1B/1k paper-cell timing and power.
 
 The ordering is intentional. For example, decode timing over HF or synthetic
@@ -181,19 +221,34 @@ NPU-produced K/V descriptor. HF K/V, synthetic K/V, repeated-current-token K/V,
 single-current-token diagnostic K/V, and host-replaced K/V never clear this
 gate.
 
-Attention reduction evidence must state `attention_reduction_mode=npu` or
-`attention_reduction_mode=not-required`. Host reduction, missing mode metadata,
-or `npu-attention-reduction-not-wired` keeps the gate blocked.
+Attention reduction evidence for the accepted 1B/1k decode path must state
+`attention_reduction_mode=npu`. Host reduction, missing mode metadata,
+`attention_reduction_mode=not-required`, or
+`npu-attention-reduction-not-wired` keeps the paper-cell gate blocked.
 
 Static BO route evidence must state
+`runlist_static_bo_mode=manifest-contiguous-static-bo` and
 `static_projection_argument_mode=manifest-contiguous-static-bo`, must report a
 nonzero static projection BO-set count, and must not carry
 `production-contiguous-static-weight-bo-not-used-by-fused-dqp-route`.
 
-Logits/sampling evidence must state `logits_sampling_mode` and
-`sampling_policy`. The work must be NPU-owned, or it must be explicitly timed
-and accounted as host work in `operation_ownership`; diagnostic host logits do
-not clear the gate.
+Runlist decode evidence must satisfy all of these fields before it can be used
+for accepted decode or paper-cell comparison:
+
+- `decode_execution_mode=runlist-full-token`.
+- `runlist_entry_count=27`.
+- `runlist_execute_count == decode_tokens`.
+- `runlist_wait_count == decode_tokens`.
+- `runlist_seconds` and `runlist_mean_seconds` are present.
+- `runlist_static_bo_mode=manifest-contiguous-static-bo`.
+- `intermediate_readback_count=0`.
+- `dynamic_static_write_count=0`.
+- Timed-window power metadata is present and aligned with the runlist window.
+
+Logits/sampling evidence must state `logits_sampling_mode=npu` and
+`sampling_policy=argmax`. The final norm/tied-embedding argmax work must be the
+27th NPU-owned runlist entry. Host logits, host argmax, missing policy, or
+diagnostic host accounting do not clear the accepted decode gate.
 
 Paper-cell evidence must include prompt/decode shape, warmup and timed
 iterations, timed-window policy, aligned power snapshot, launch counts, host
@@ -214,9 +269,19 @@ passes.
 prefill contract runs through `run_npu_prefill` with nonzero launch accounting
 and no production prefill blockers.
 
-`npu-attention-reduction-not-wired` clears only when tiled attention reduction
-is NPU-owned, or when the production attention route proves no cross-tile
-host-side reduction is required for the paper-cell shape.
+`npu-attention-reduction-not-wired` clears only when FlowKV/FlowKV-SWA decode
+attention keeps softmax state and reduction on the NPU for the 1024-token
+context.
+
+Full-token runlist decode clears only when `decode_execution_mode` is
+`runlist-full-token`, `runlist_entry_count=27`, `runlist_execute_count` and
+`runlist_wait_count` both equal `decode_tokens`, the static BO mode is
+`manifest-contiguous-static-bo`, there are zero intermediate readbacks, and
+there are zero dynamic static writes.
+
+`logits-sampling-not-wired` clears only when final norm, tied embedding, and
+argmax sampling are NPU-owned inside the runlist and the result records
+`logits_sampling_mode=npu` and `sampling_policy=argmax`.
 
 The 1B/1k paper cell is ready only when NPU-only TTFT, TPS, and power evidence
 exists with exact model, prompt length, decode-token count, layer count,
@@ -321,6 +386,7 @@ python3 -m gemma3.npu.inference_runtime \
   --prompt-len 1024 \
   --decode-context 1024 \
   --decode-tokens 1 \
+  --decode-execution-mode runlist-full-token \
   --quantized-weights required \
   --json \
   --result-json programming_examples/gemma3/results/gemma3_1b_npu_runtime_decode_loop.json
@@ -412,6 +478,17 @@ all layers source=production-npu-prefill-kv-cache:
 all layers owner=npu:
 layer blockers empty:
 HF/synthetic/probe cache absent:
+decode_execution_mode=runlist-full-token:
+runlist_entry_count=27:
+runlist_execute_count == decode_tokens:
+runlist_wait_count == decode_tokens:
+runlist_static_bo_mode=manifest-contiguous-static-bo:
+intermediate_readback_count=0:
+dynamic_static_write_count=0:
+attention_reduction_mode=npu:
+logits_sampling_mode=npu:
+sampling_policy=argmax:
+power aligned with timed window:
 ```
 
 ### Final Verification Summary

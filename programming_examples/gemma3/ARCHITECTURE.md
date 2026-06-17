@@ -7,7 +7,8 @@ backend-oriented architecture:
 - shared model, artifact, reference, result, and measurement contracts,
 - CPU implementation,
 - GPU/iGPU implementation,
-- NPU implementation modeled after the Llama 3.2 1B example.
+- NPU implementation built from local MLIR-AIR Gemma3 sources, using the
+  Llama 3.2 1B example only for runtime and stitching mechanics.
 
 It is scoped to source-level work in this repository. It is not a claim that
 the repository reproduces FastFlowLM, the Gemma3 paper, or an end-to-end
@@ -17,7 +18,7 @@ Primary local sources:
 
 - Canonical Gemma3 example: `programming_examples/gemma3`.
 - Kernel wrappers: `programming_examples/gemma3/gemma3/kernels`; Peano sources: `programming_examples/gemma3/aie_kernels`.
-- NPU model-runtime reference: `programming_examples/llama32_1b`.
+- NPU control-plane and stitching reference: `programming_examples/llama32_1b`.
 - Paper target ledger: `programming_examples/gemma3/data/paper_targets.json`.
 
 Primary paper source:
@@ -38,8 +39,8 @@ Implemented today:
 - Kernel-level NPU mappings for Q4NX, BF16 tiled MM, FusedDQP, FlowQKV,
   FlowKV, RoPE, residual add, RMSNorm wrappers, Q/K normalization bridges, and
   GeGLU/down diagnostic slices.
-- A stitched-ELF decode track for Gemma3 1B that follows the Llama-style
-  multi-launch pattern for several decode subgraphs.
+- A stitched-ELF decode track for Gemma3 1B that uses local Gemma3 kernels and
+  follows the Llama-style multi-launch mechanics for several decode subgraphs.
 - Real-shape planning for NPU preflight, weights, BOs, buffer bindings, kernel
   argument bindings, and model-runner launch order.
 
@@ -51,10 +52,11 @@ Do not report the current Gemma3 code as:
 - a complete text-plus-vision VLM,
 - or a validated model-accuracy result.
 
-The near-term goal is to make each backend explicit and make the NPU path look
-like the Llama 3.2 1B example: cached kernels, preloaded static weights,
-per-layer BO ownership, explicit prefill/decode entrypoints, and clear host
-fallback accounting.
+The near-term goal is to make each backend explicit and make the NPU control
+plane use the proven Llama 3.2 1B mechanics: cached kernels, preloaded static
+weights, per-layer BO ownership, explicit prefill/decode entrypoints, and clear
+host fallback accounting. The math, layer schedule, K/V semantics, and
+projection layouts remain Gemma3-specific.
 
 ## Architecture Overview
 
@@ -132,6 +134,14 @@ causal = true for text, false for vision_nca
 
 Do not encode local/global behavior as scattered command-line conditionals.
 Backends should read a layer metadata table.
+
+For the accepted Gemma3 1B/1k text decode cell, the 26 text layers use the
+Gemma3 5-local/1-global cadence across the layer stack: `local_swa` layers
+between every `global_full` layer, with the final partial group still treated as
+local layers. The production runlist uses two reusable full-layer ELF variants:
+`local_swa` and `global_full`. Both variants read the 1024-token K/V context in
+the 1B/1k cell; global layers keep `window_len=0` metadata, while local layers
+retain `local_swa` metadata for FlowKV-SWA semantics.
 
 ### KV-Cache Contract
 
@@ -248,8 +258,9 @@ iGPU backend rules:
 
 ## NPU Backend
 
-The NPU backend is the MLIR-AIR/XRT implementation track. It should converge on
-the Llama 3.2 1B organization rather than remain a set of independent probes.
+The NPU backend is the local MLIR-AIR/XRT Gemma3 implementation track. It should
+converge on Llama-style runtime organization rather than remain a set of
+independent probes.
 
 Target device:
 
@@ -261,10 +272,11 @@ Target device:
 Production routes should prefer explicit L3-to-L2-to-L1 staging for
 full-physical paths when direct shim DMA would over-allocate resources.
 
-### Llama 3.2 1B Pattern To Copy
+### Llama 3.2 1B Mechanics To Reuse
 
-Llama 3.2 1B is the control-plane and runtime reference, not the source for
-Gemma-specific math.
+Llama 3.2 1B is the control-plane, runtime, BO-reuse, shape-aliasing, and
+multi-launch stitching reference. It is not the source for Gemma-specific math,
+layer semantics, K/V behavior, or accepted measurements.
 
 | Llama component | Gemma3 target |
 | --- | --- |
@@ -292,11 +304,13 @@ Gemma-specific differences:
 - Projection weights are Q4NX/int4 where the paper kernels require them.
 - Prefill projections use Q4NX dequantization plus BF16 tiled MM.
 - Decode projections use FusedDQP where supported.
-- Attention uses FlowQKV for prefill and FlowKV or tiled-stat attention for
-  decode.
+- Attention uses FlowQKV for prefill and paper-style FlowKV or FlowKV-SWA for
+  production decode.
 - QK-Norm is required and must not be assumed equivalent to Llama.
 - Text layers mix local sliding-window and global attention.
 - Vision is a later non-causal prefill-like path.
+- `flowqkv_tiled_stats` is diagnostic long-cache evidence only, not the
+  production decode-attention path.
 
 ### Current NPU Assets
 
@@ -335,7 +349,22 @@ headline timing.
 
 ### Target NPU Runtime
 
-`gemma3.npu.inference_runtime` now owns the production-shaped runtime shell. It prepares real 1B/1k setup state, validates kernel argument bindings, records static-input/readback policy, and gates `generate()` on production NPU prefill K/V before any decode launch. The current runtime decode evidence is `results/gemma3_1b_npu_runtime_decode_loop.json`: it is blocked before decode with `generate-prefill-kv-cache-blocked` and `production-prefill-runtime-arguments-not-bound`, records zero decode launches, and preserves the NPU-prefill K/V blockers after finding the cached prefill artifact manifest. The stitched 26-layer decode loop remains diagnostic evidence until `run_npu_prefill()` produces a Gemma-owned K/V cache.
+`gemma3.npu.inference_runtime` now owns the production-shaped runtime shell. It
+prepares real 1B/1k setup state, validates kernel argument bindings, records
+static-input/readback policy, and gates `generate()` on production NPU prefill
+K/V before any decode launch. The accepted decode execution mode is
+`runlist-full-token`, exposed through `--decode-execution-mode
+{staged,runlist-full-token}`. `runlist-full-token` submits one XRT runlist per
+decoded token: 26 full-layer entries plus one NPU final-norm/tied-embedding
+argmax entry. The runlist cache manifest is planned as
+`gemma3_decode_full_token_runlist.json` and names 26 layer artifacts plus one
+logits/sampling artifact. The current runtime decode evidence is
+`results/gemma3_1b_npu_runtime_decode_loop.json`: it is blocked before decode
+with `generate-prefill-kv-cache-blocked` and
+`production-prefill-runtime-arguments-not-bound`, records zero decode launches,
+and preserves the NPU-prefill K/V blockers after finding the cached prefill
+artifact manifest. The stitched 26-layer decode loop remains diagnostic evidence
+until `run_npu_prefill()` produces a Gemma-owned K/V cache.
 
 Use `docs/npu_runtime_loop.md` as the operational runbook for choosing the next
 1B text NPU runtime blocker, running the exact commands, and deciding whether
@@ -364,10 +393,11 @@ run_npu_prefill()
 
 generate()
   - for each decode token:
-      - run every layer through cached stitched ELFs
+      - submit one `runlist-full-token` XRT runlist
+      - execute 26 full-layer entries using `local_swa` and `global_full` ELFs
       - append one K/V entry per layer
       - run attention over NPU-produced cache
-      - run final norm/logits/sampling or explicitly account host fallback
+      - execute one NPU final-norm/tied-embedding argmax entry
 ```
 
 Compile, ELF load, BO creation, static preload, and argument validation stay
@@ -414,7 +444,7 @@ single_token_state
   -> QK-Norm
   -> RoPE
   -> append one K/V entry to cache
-  -> FlowKV or tiled-stat attention over current cache
+  -> FlowKV or FlowKV-SWA attention over current cache
   -> FusedDQP output projection
   -> residual update
   -> FusedDQP gate/up projections
@@ -434,9 +464,12 @@ Current stitched decode slices already cover much of this route for 1B:
 - post-feedforward residual diagnostic integration.
 
 The clean 26-layer diagnostic is correctness-clean but still not a paper cell:
-prefill K/V is not NPU-produced, tiled-stat reduction can be host-side, logits
-and sampling are not NPU-promoted, and production contiguous static-weight BOs
-are not yet used by the FusedDQP route.
+prefill K/V is not NPU-produced, diagnostic long-cache attention can use
+host-side tile-stat reduction, logits and sampling are not NPU-promoted, and
+production contiguous static-weight BOs are not yet used by every FusedDQP
+route. Production decode attention is FlowKV or FlowKV-SWA with Q chunk size 1,
+KV chunks covering the 1024-token context, NPU-owned online-softmax state and
+reduction, and a direct handoff into the Q4NX FusedDQP O projection.
 
 ### NPU Output Modes
 
@@ -583,7 +616,7 @@ Current 1B text blockers:
 | `production-prefill-runtime-arguments-not-bound` | Per-layer `gemma3_prefill_kv_L*` artifacts are cached, but production prefill runtime arguments are not materialized or launched. |
 | `prefill-1k-npu-not-wired` | No official 1024-token NPU prefill paper cell runs through the full NPU path. |
 | `npu-prefill-kv-cache-not-wired` | Decode diagnostics use synthetic or HF/CPU-produced prefill cache, not an NPU-produced cache. |
-| `npu-attention-reduction-not-wired` | Tiled-stat attention can use NPU tile work, but cross-tile softmax/stat reduction is still host-side in the diagnostic path. |
+| `npu-attention-reduction-not-wired` | Diagnostic long-cache attention can use NPU tile work, but the accepted FlowKV/FlowKV-SWA decode path must keep softmax state and reduction on the NPU. |
 
 Current 4B text blockers:
 
@@ -601,10 +634,11 @@ Blocker resolution order:
 
 1. Keep focus on 1B 1k text NPU.
 2. Promote NPU prefill to produce the decode KV cache.
-3. Move tiled attention-stat reduction onto the NPU or explicitly classify it
-   outside paper parity.
+3. Move FlowKV/FlowKV-SWA decode attention reduction onto the NPU and keep
+   `flowqkv_tiled_stats` classified outside paper parity.
 4. Route FusedDQP through production contiguous static-weight BOs.
-5. Wire final norm/logits/sampling policy into timed result records.
+5. Wire full-token runlist final norm/tied-embedding argmax into timed result
+   records.
 6. Only then expand to longer 1B contexts, 4B text, and vision.
 
 ## Implementation Roadmap
@@ -673,10 +707,10 @@ Done when:
 Done when:
 
 - The 26-layer 1B decode loop consumes NPU-produced prefill cache.
-- Attention reduction is NPU-owned or explicitly classified as a host fallback
-  outside paper parity.
+- FlowKV/FlowKV-SWA attention reduction is NPU-owned.
 - Static projection weights use production contiguous BO routing.
-- Final norm/logits/sampling are NPU-promoted or timed/accounted as host work.
+- Final norm/logits/sampling are NPU-promoted in the runlist with
+  `sampling_policy=argmax`.
 - The 1B 1k decode paper target has a local result or a precise blocker.
 
 ### Phase 7: Expansion
@@ -747,7 +781,8 @@ from this list:
 - Route decode projections through the manifest-backed contiguous static Q4NX BO
   instead of runner-owned FusedDQP BO sets.
 - Wire 1B NPU prefill far enough to produce K/V cache rows for decode.
-- Replace host tiled-stat reduction with an NPU-owned reduction path.
+- Implement the NPU-owned FlowKV/FlowKV-SWA reduction path for full-token
+  runlisted decode.
 - Normalize CPU and iGPU result generation through one shared backend harness.
 
 For 1B text NPU work, use `docs/npu_runtime_loop.md` to select exactly one
