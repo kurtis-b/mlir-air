@@ -14,6 +14,7 @@ evidence.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -26,6 +27,8 @@ from ml_dtypes import bfloat16
 
 MANIFEST_FILE = "gemma3_npu_kernel_manifest.json"
 PREFILL_ARTIFACT_TEMPLATE = "gemma3_prefill_kv_L{layer_index}"
+PREFILL_ARTIFACT_ABI_FILE = "gemma3_prefill_kv_abi.txt"
+PREFILL_ARTIFACT_ABI_VERSION = "launch-segment-l1-copy-loop-v1"
 
 
 @dataclass(frozen=True)
@@ -94,9 +97,9 @@ def build_prefill_kv_copy_module(
         MemRefType,
     )
     from air.dialects.affine import apply as affine_apply
-    from air.dialects.air import MemorySpace, T, dma_memcpy_nd, herd, module_builder
+    from air.dialects.air import MemorySpace, T, dma_memcpy_nd, herd, launch, module_builder, segment
     from air.dialects.func import FuncOp
-    from air.dialects.memref import AllocOp, DeallocOp
+    from air.dialects.memref import AllocOp, DeallocOp, load, store
     from air.dialects.scf import for_, yield_
     from air.backend.xrt_runner import type_mapper
 
@@ -127,70 +130,86 @@ def build_prefill_kv_copy_module(
 
         @FuncOp.from_py_func(l3_ty, l3_ty, l3_ty, l3_ty)
         def gemma3_prefill_kv(arg_k, arg_v, arg_out_k, arg_out_v):
-            @herd(
-                name="gemma3_prefill_kv_herd",
-                sizes=[1, num_tiles],
-                operands=[arg_k, arg_v, arg_out_k, arg_out_v],
-            )
-            def herd_body(_tx, _ty, _sx, _sy, l3_k, l3_v, l3_out_k, l3_out_v):
-                offset_map = AffineMap.get(
-                    0,
-                    2,
-                    [
-                        AffineExpr.get_add(
-                            AffineExpr.get_mul(
-                                AffineSymbolExpr.get(0),
-                                AffineConstantExpr.get(tile_elements * num_tiles),
-                            ),
-                            AffineExpr.get_mul(
-                                AffineSymbolExpr.get(1),
-                                AffineConstantExpr.get(tile_elements),
-                            ),
-                        )
-                    ],
+            @launch(operands=[arg_k, arg_v, arg_out_k, arg_out_v])
+            def launch_body(launch_k, launch_v, launch_out_k, launch_out_v):
+                @segment(
+                    name="gemma3_prefill_kv_segment",
+                    operands=[launch_k, launch_v, launch_out_k, launch_out_v],
                 )
-                for tile_base in for_(
-                    0,
-                    element_count // (tile_elements * num_tiles),
-                    1,
-                ):
-                    offset = affine_apply(offset_map, [tile_base, _ty])
-                    l1_k = AllocOp(l1_ty, [], [])
-                    l1_v = AllocOp(l1_ty, [], [])
-                    dma_memcpy_nd(
-                        l1_k,
-                        l3_k,
-                        src_offsets=[offset],
-                        src_sizes=[tile_elements],
-                        src_strides=[1],
+                def segment_body(seg_k, seg_v, seg_out_k, seg_out_v):
+                    @herd(
+                        name="gemma3_prefill_kv_herd",
+                        sizes=[1, num_tiles],
+                        operands=[seg_k, seg_v, seg_out_k, seg_out_v],
                     )
-                    dma_memcpy_nd(
-                        l1_v,
-                        l3_v,
-                        src_offsets=[offset],
-                        src_sizes=[tile_elements],
-                        src_strides=[1],
-                    )
-                    dma_memcpy_nd(
-                        l3_out_k,
-                        l1_k,
-                        dst_offsets=[offset],
-                        dst_sizes=[tile_elements],
-                        dst_strides=[1],
-                    )
-                    dma_memcpy_nd(
-                        l3_out_v,
-                        l1_v,
-                        dst_offsets=[offset],
-                        dst_sizes=[tile_elements],
-                        dst_strides=[1],
-                    )
-                    DeallocOp(l1_k)
-                    DeallocOp(l1_v)
-                    yield_([])
+                    def herd_body(_tx, _ty, _sx, _sy, l3_k, l3_v, l3_out_k, l3_out_v):
+                        offset_map = AffineMap.get(
+                            0,
+                            2,
+                            [
+                                AffineExpr.get_add(
+                                    AffineExpr.get_mul(
+                                        AffineSymbolExpr.get(0),
+                                        AffineConstantExpr.get(tile_elements * num_tiles),
+                                    ),
+                                    AffineExpr.get_mul(
+                                        AffineSymbolExpr.get(1),
+                                        AffineConstantExpr.get(tile_elements),
+                                    ),
+                                )
+                            ],
+                        )
+                        for tile_base in for_(
+                            0,
+                            element_count // (tile_elements * num_tiles),
+                            1,
+                        ):
+                            offset = affine_apply(offset_map, [tile_base, _ty])
+                            l1_k = AllocOp(l1_ty, [], [])
+                            l1_v = AllocOp(l1_ty, [], [])
+                            l1_out_k = AllocOp(l1_ty, [], [])
+                            l1_out_v = AllocOp(l1_ty, [], [])
+                            dma_memcpy_nd(
+                                l1_k,
+                                l3_k,
+                                src_offsets=[offset],
+                                src_sizes=[tile_elements],
+                                src_strides=[1],
+                            )
+                            dma_memcpy_nd(
+                                l1_v,
+                                l3_v,
+                                src_offsets=[offset],
+                                src_sizes=[tile_elements],
+                                src_strides=[1],
+                            )
+                            for element in for_(0, tile_elements, 1):
+                                k_value = load(l1_k, [element])
+                                v_value = load(l1_v, [element])
+                                store(k_value, l1_out_k, [element])
+                                store(v_value, l1_out_v, [element])
+                                yield_([])
+                            dma_memcpy_nd(
+                                l3_out_k,
+                                l1_out_k,
+                                dst_offsets=[offset],
+                                dst_sizes=[tile_elements],
+                                dst_strides=[1],
+                            )
+                            dma_memcpy_nd(
+                                l3_out_v,
+                                l1_out_v,
+                                dst_offsets=[offset],
+                                dst_sizes=[tile_elements],
+                                dst_strides=[1],
+                            )
+                            DeallocOp(l1_k)
+                            DeallocOp(l1_v)
+                            DeallocOp(l1_out_k)
+                            DeallocOp(l1_out_v)
+                            yield_([])
 
     return module()
-
 
 def ensure_prefill_kv_artifacts(
     cache: "Gemma3KernelCache",
@@ -204,16 +223,24 @@ def ensure_prefill_kv_artifacts(
         PREFILL_ARTIFACT_TEMPLATE.format(layer_index=int(layer.layer_index))
         for layer in layer_tuple
     )
-    if expected and all(name in cache.artifacts for name in expected):
+    abi_path = cache.cache_dir / PREFILL_ARTIFACT_ABI_FILE
+    try:
+        abi_valid = abi_path.read_text(encoding="utf-8").strip() == PREFILL_ARTIFACT_ABI_VERSION
+    except OSError:
+        abi_valid = False
+    if expected and abi_valid and all(name in cache.artifacts for name in expected):
         cache.save_manifest()
         return expected
+    if expected and not abi_valid:
+        for name in expected:
+            cache.artifacts.pop(name, None)
 
     from air.backend.xrt import XRTBackend, XRTCompileArtifact
 
     compiled_by_shape: dict[tuple[int, int, int], tuple[Path, Path | None, str]] = {}
     for layer in layer_tuple:
         name = PREFILL_ARTIFACT_TEMPLATE.format(layer_index=int(layer.layer_index))
-        if name in cache.artifacts:
+        if abi_valid and name in cache.artifacts:
             continue
         key_shape = tuple(int(dim) for dim in layer.key_shape)
         if len(key_shape) != 3:
@@ -265,6 +292,7 @@ def ensure_prefill_kv_artifacts(
             None if cached_insts is None else str(cached_insts),
         )
     cache.save_manifest()
+    abi_path.write_text(PREFILL_ARTIFACT_ABI_VERSION + "\n", encoding="utf-8")
     return expected
 
 
@@ -366,6 +394,19 @@ class Gemma3KernelCache:
         self._log(f"loaded manifest with {len(artifacts)} artifacts")
         return True
 
+    def _load_key_for_artifact(self, name: str, artifact: Any) -> str:
+        """Return the key used to keep one loaded XRT context per binary payload."""
+        output_binary = Path(str(artifact.output_binary))
+        kernel = str(artifact.kernel)
+        insts = None if artifact.insts is None else str(artifact.insts)
+        if output_binary.suffix == ".elf":
+            try:
+                digest = hashlib.sha256(output_binary.read_bytes()).hexdigest()
+            except OSError:
+                return f"elf-path:{name}:{output_binary}:{kernel}:{insts}"
+            return f"elf-sha256:{kernel}:{digest}"
+        return f"path:{output_binary}:{kernel}:{insts}"
+
     def compile_and_cache(
         self,
         name: str,
@@ -418,16 +459,16 @@ class Gemma3KernelCache:
             available = ", ".join(sorted(self.artifacts))
             raise RuntimeError(f"Gemma3 kernel '{name}' is not cached; available: {available}")
 
-        if name not in self._loaded:
-            artifact = self.artifacts[name]
+        artifact = self.artifacts[name]
+        load_key = self._load_key_for_artifact(name, artifact)
+        if load_key not in self._loaded:
             backend = XRTBackend(**backend_kwargs)
             with filelock.FileLock(self.lock_path):
                 invoker = backend.load(artifact)
-            self._loaded[name] = (backend, invoker)
-            self._log(f"loaded {name}")
+            self._loaded[load_key] = (backend, invoker)
+            self._log(f"loaded {name} as {load_key}")
 
-        backend, _invoker = self._loaded[name]
-        artifact = self.artifacts[name]
+        backend, _invoker = self._loaded[load_key]
         is_elf = str(artifact.output_binary).endswith(".elf")
         cache_key = bo_key or name
         static_indices = set(static_input_indices or ())

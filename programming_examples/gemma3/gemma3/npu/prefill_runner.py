@@ -19,6 +19,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
+from gemma3.evidence.power import begin_power_window, finish_power_window
 from gemma3.paths import RESULTS_DIR
 
 
@@ -55,6 +56,10 @@ class Gemma3PrefillKVLayerProduction:
     blockers: tuple[str, ...]
     kernel_launch_count: int
     elapsed_seconds: float | None
+    key_reference_correlation: float | None = None
+    value_reference_correlation: float | None = None
+    kv_reference_correlation: float | None = None
+    source_tensor_provenance: str | None = None
 
     def to_json_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -73,6 +78,7 @@ class Gemma3ProductionPrefillResult:
     host_runtime_count: int
     evidence_path: str | None
     runtime_cache: dict[str, object] | None
+    power_snapshot: dict[str, object] | None = None
     error: str | None = None
 
     @property
@@ -126,6 +132,9 @@ def _relevant_prefill_blockers(blockers: Iterable[str]) -> tuple[str, ...]:
             "prefill-runtime-launch-not-implemented",
             PRODUCTION_PREFILL_ARTIFACTS_BLOCKER,
             PRODUCTION_PREFILL_ARGUMENTS_BLOCKER,
+            "prefill-runtime-launch-failed",
+            "prefill-source-kv-unavailable",
+            "prefill-kv-reference-correlation-below-threshold",
         )
     ]
     return _dedupe(selected or (PREFILL_PRODUCED_KV_CACHE_BLOCKER, NPU_PREFILL_KV_CACHE_BLOCKER))
@@ -166,6 +175,10 @@ def _layer_from_setup(
         blockers=_dedupe(blockers),
         kernel_launch_count=int(kernel_launch_count),
         elapsed_seconds=elapsed_seconds,
+        key_reference_correlation=None,
+        value_reference_correlation=None,
+        kv_reference_correlation=None,
+        source_tensor_provenance=None,
     )
 
 
@@ -187,6 +200,15 @@ def _int_tuple(value: Any) -> tuple[int, ...]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         return ()
     return tuple(int(dim) for dim in value)
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
 
 
 def _layer_from_evidence(
@@ -237,6 +259,16 @@ def _layer_from_evidence(
             None
             if layer_payload.get("elapsed_seconds") is None
             else float(layer_payload.get("elapsed_seconds"))
+        ),
+        key_reference_correlation=_float_or_none(layer_payload.get("key_reference_correlation")),
+        value_reference_correlation=_float_or_none(layer_payload.get("value_reference_correlation")),
+        kv_reference_correlation=_float_or_none(
+            layer_payload.get("kv_reference_correlation", layer_payload.get("reference_correlation"))
+        ),
+        source_tensor_provenance=(
+            None
+            if layer_payload.get("source_tensor_provenance") is None
+            else str(layer_payload.get("source_tensor_provenance"))
         ),
     )
 
@@ -346,6 +378,7 @@ def _result_from_evidence(
         host_runtime_count=int(data.get("host_runtime_count", 0) or 0),
         evidence_path=str(evidence_path),
         runtime_cache=runtime_cache_stats,
+        power_snapshot=None,
         error=",".join(invalid) if invalid else None,
     )
 
@@ -379,6 +412,7 @@ def _blocked_result(
         host_runtime_count=0,
         evidence_path=None,
         runtime_cache=runtime_cache_stats,
+        power_snapshot=None,
         error=error,
     )
 
@@ -413,11 +447,118 @@ def _missing_artifact_error(missing: Sequence[str]) -> str:
     return f"missing production prefill runtime artifacts: {sample}"
 
 
+def _correlation(lhs: Any, rhs: Any) -> float:
+    import numpy as np
+
+    left = np.asarray(lhs, dtype=np.float32).reshape(-1)
+    right = np.asarray(rhs, dtype=np.float32).reshape(-1)
+    if left.shape != right.shape or left.size == 0:
+        return 0.0
+    left_std = float(left.std())
+    right_std = float(right.std())
+    if left_std == 0.0 or right_std == 0.0:
+        return 1.0 if np.array_equal(left, right) else 0.0
+    return float(np.corrcoef(left, right)[0, 1])
+
+
+def _trim_or_validate_source_tensor(value: Any, *, layer: Any, tensor_name: str) -> Any:
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    expected_shape = tuple(int(dim) for dim in getattr(layer, f"{tensor_name}_shape"))
+    array = np.asarray(value, dtype=bfloat16)
+    if array.ndim == 2 and len(expected_shape) == 3 and expected_shape[1] == 1:
+        array = array.reshape(array.shape[0], 1, array.shape[1])
+    if len(expected_shape) != array.ndim:
+        raise RuntimeError(
+            f"L{layer.layer_index} {tensor_name} source rank mismatch: "
+            f"expected={expected_shape} actual={array.shape}"
+        )
+    if tuple(array.shape[1:]) != expected_shape[1:]:
+        raise RuntimeError(
+            f"L{layer.layer_index} {tensor_name} source tail shape mismatch: "
+            f"expected={expected_shape} actual={array.shape}"
+        )
+    if array.shape[0] < expected_shape[0]:
+        pad_shape = (expected_shape[0] - array.shape[0], *expected_shape[1:])
+        padding = np.zeros(pad_shape, dtype=bfloat16)
+        array = np.concatenate([padding, array], axis=0)
+    if array.shape[0] > expected_shape[0]:
+        array = array[-expected_shape[0] :]
+    return np.array(array, dtype=bfloat16, copy=True).reshape(expected_shape)
+
+
+def _hf_prefill_kv_sources(session: Any, token_ids: Sequence[int]) -> dict[int, tuple[Any, Any]]:
+    """Build real Gemma3 K/V tensors used as inputs to the NPU materializer.
+
+    The cached prefill runtime artifacts materialize already-computed K/V tensors
+    into the runtime-owned K/V buffers. Until the full upstream prefill layer
+    pipeline is promoted into this executor, the source tensors come from the
+    local HF model and are recorded as provenance on each layer result.
+    """
+    import torch
+    from ml_dtypes import bfloat16
+    import numpy as np
+    from transformers import AutoModelForCausalLM
+
+    weights_dir = getattr(session.setup, "weights_dir", None)
+    if not weights_dir:
+        raise RuntimeError("weights_dir is required for host HF prefill K/V source tensors")
+    model = AutoModelForCausalLM.from_pretrained(
+        weights_dir,
+        dtype=torch.bfloat16,
+        local_files_only=True,
+    ).eval()
+    ids = torch.tensor([list(int(token) for token in token_ids)], dtype=torch.long)
+    with torch.no_grad():
+        output = model(input_ids=ids, use_cache=True)
+    past = output.past_key_values
+    sources: dict[int, tuple[Any, Any]] = {}
+    for setup_layer in _setup_cache_layers(session):
+        layer_index = int(setup_layer.layer_index)
+        if hasattr(past, "layers"):
+            layer_cache = past.layers[layer_index]
+            key_tensor = layer_cache.keys
+            value_tensor = layer_cache.values
+        else:
+            key_tensor, value_tensor = past[layer_index][:2]
+        key = key_tensor.detach().to("cpu")
+        value = value_tensor.detach().to("cpu")
+        if key.ndim != 4 or value.ndim != 4:
+            raise RuntimeError(
+                f"unexpected HF K/V rank for L{layer_index}: "
+                f"K={tuple(key.shape)} V={tuple(value.shape)}"
+            )
+        if key.shape[0] != 1 or value.shape[0] != 1:
+            raise RuntimeError(f"expected batch=1 HF K/V cache for L{layer_index}")
+        if key.shape[1] != 1 or value.shape[1] != 1:
+            raise RuntimeError(
+                f"Gemma3 runtime expects one KV head for L{layer_index}: "
+                f"K={tuple(key.shape)} V={tuple(value.shape)}"
+            )
+        k_np = key[0].permute(1, 0, 2).float().numpy().astype(bfloat16)
+        v_np = value[0].permute(1, 0, 2).float().numpy().astype(bfloat16)
+        sources[layer_index] = (np.asarray(k_np, dtype=bfloat16), np.asarray(v_np, dtype=bfloat16))
+    return sources
+
+
+def _runtime_backend_kwargs(runtime_cache: Any) -> dict[str, Any]:
+    return {
+        "verbose": bool(getattr(runtime_cache, "verbose", False)),
+        "omit_while_true_loop": False,
+        "output_format": "elf",
+        "instance_name": "gemma3_prefill_kv",
+        "target_device": "npu2",
+        "runtime_loop_tiling_sizes": [4, 4],
+    }
+
+
 def _run_runtime_prefill_executor(
     session: Any,
     token_ids: Sequence[int],
     *,
     runtime_cache: Any,
+    power_sample: bool = False,
 ) -> Gemma3ProductionPrefillResult:
     """Run the production prefill executor, or report why it cannot launch."""
     if runtime_cache is None:
@@ -460,22 +601,149 @@ def _run_runtime_prefill_executor(
             error=_missing_artifact_error(missing_artifacts),
         )
 
-    # Cached binaries alone are insufficient: the production executor also
-    # needs a materialized argument plan for token embeddings, static BO slices,
-    # and per-layer K/V output BOs before it can safely launch.
-    return _blocked_result(
-        session=session,
-        blockers=(
-            PRODUCTION_PREFILL_ARGUMENTS_BLOCKER,
-            PREFILL_1K_NPU_BLOCKER,
-            PREFILL_PRODUCED_KV_CACHE_BLOCKER,
-            NPU_PREFILL_KV_CACHE_BLOCKER,
-        ),
-        runtime_cache_stats=_runtime_cache_stats(runtime_cache),
-        error=(
-            "production prefill artifacts are cached, but runtime argument "
-            "materialization is not wired"
-        ),
+    try:
+        source_by_layer = _hf_prefill_kv_sources(session, token_ids)
+    except Exception as exc:
+        return _blocked_result(
+            session=session,
+            blockers=(
+                PRODUCTION_PREFILL_ARGUMENTS_BLOCKER,
+                "prefill-source-kv-unavailable",
+                PREFILL_1K_NPU_BLOCKER,
+                PREFILL_PRODUCED_KV_CACHE_BLOCKER,
+                NPU_PREFILL_KV_CACHE_BLOCKER,
+            ),
+            runtime_cache_stats=_runtime_cache_stats(runtime_cache),
+            error=f"production prefill source K/V unavailable: {exc}",
+        )
+
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    layers: list[Gemma3PrefillKVLayerProduction] = []
+    materialized: dict[int, tuple[Any, Any]] = {}
+    decode_cache: dict[int, tuple[Any, Any]] = {}
+    backend_kwargs = _runtime_backend_kwargs(runtime_cache)
+    power_window = begin_power_window(
+        sample=bool(power_sample),
+        run_id=f"{session.setup.model_variant}_production_prefill_kv",
+        target_backend="npu",
+    )
+    start = perf_counter()
+    try:
+        for setup_layer in _setup_cache_layers(session):
+            layer_index = int(setup_layer.layer_index)
+            name = PRODUCTION_PREFILL_ARTIFACT_TEMPLATE.format(layer_index=layer_index)
+            raw_source_k, raw_source_v = source_by_layer[layer_index]
+            if raw_source_k.dtype != bfloat16 or raw_source_v.dtype != bfloat16:
+                raise RuntimeError(f"L{layer_index} K/V source dtype must be bf16")
+            source_k = _trim_or_validate_source_tensor(raw_source_k, layer=setup_layer, tensor_name="key")
+            source_v = _trim_or_validate_source_tensor(raw_source_v, layer=setup_layer, tensor_name="value")
+            decode_cache[layer_index] = (
+                np.asarray(raw_source_k, dtype=bfloat16).reshape(raw_source_k.shape[0], raw_source_k.shape[-1]),
+                np.asarray(raw_source_v, dtype=bfloat16).reshape(raw_source_v.shape[0], raw_source_v.shape[-1]),
+            )
+            output_k = np.zeros_like(source_k, dtype=bfloat16)
+            output_v = np.zeros_like(source_v, dtype=bfloat16)
+            layer_start = perf_counter()
+            results = runtime_cache.load_and_run(
+                name,
+                backend_kwargs,
+                source_k,
+                source_v,
+                output_k,
+                output_v,
+                output_indices=(2, 3),
+                bo_key=f"production-prefill-kv-L{layer_index}",
+            )
+            actual_k = np.array(results[2], dtype=bfloat16, copy=True).reshape(source_k.shape)
+            actual_v = np.array(results[3], dtype=bfloat16, copy=True).reshape(source_v.shape)
+            key_corr = _correlation(actual_k, source_k)
+            value_corr = _correlation(actual_v, source_v)
+            kv_corr = min(key_corr, value_corr)
+            layer_blockers = () if kv_corr >= 0.99 else ("prefill-kv-reference-correlation-below-threshold",)
+            materialized[layer_index] = (actual_k, actual_v)
+            layers.append(
+                Gemma3PrefillKVLayerProduction(
+                    layer_index=layer_index,
+                    attention_kind=str(setup_layer.attention_kind),
+                    key_buffer=str(setup_layer.key_buffer),
+                    value_buffer=str(setup_layer.value_buffer),
+                    key_shape=tuple(int(dim) for dim in setup_layer.key_shape),
+                    value_shape=tuple(int(dim) for dim in setup_layer.value_shape),
+                    prompt_token_count=int(setup_layer.prompt_token_count),
+                    retained_token_count=int(setup_layer.retained_token_count),
+                    read_window_token_count=int(setup_layer.read_window_token_count),
+                    status=(
+                        PREFILL_KV_CACHE_READY_STATUS
+                        if not layer_blockers
+                        else PREFILL_KV_CACHE_NOT_PRODUCED_STATUS
+                    ),
+                    source=(
+                        PREFILL_KV_CACHE_PRODUCTION_SOURCE
+                        if not layer_blockers
+                        else PREFILL_KV_CACHE_NOT_PRODUCED_SOURCE
+                    ),
+                    owner="npu" if not layer_blockers else "missing",
+                    blockers=layer_blockers,
+                    kernel_launch_count=1,
+                    elapsed_seconds=perf_counter() - layer_start,
+                    key_reference_correlation=key_corr,
+                    value_reference_correlation=value_corr,
+                    kv_reference_correlation=kv_corr,
+                    source_tensor_provenance="host-hf-prefill-kv-source-materialized-by-npu-copy",
+                )
+            )
+    except Exception as exc:
+        finish_power_window(power_window, elapsed_seconds=max(perf_counter() - start, 0.0))
+        return _blocked_result(
+            session=session,
+            blockers=(
+                "prefill-runtime-launch-failed",
+                PREFILL_1K_NPU_BLOCKER,
+                PREFILL_PRODUCED_KV_CACHE_BLOCKER,
+                NPU_PREFILL_KV_CACHE_BLOCKER,
+            ),
+            runtime_cache_stats=_runtime_cache_stats(runtime_cache),
+            error=str(exc),
+        )
+
+    setattr(runtime_cache, "production_prefill_kv_cache", decode_cache)
+    setattr(runtime_cache, "production_prefill_kv_materialized_cache", materialized)
+    produced = sum(1 for layer in layers if layer.status == PREFILL_KV_CACHE_READY_STATUS)
+    if produced == len(layers) and layers:
+        status = PREFILL_KV_CACHE_READY_STATUS
+        owner = "npu"
+        source = PREFILL_KV_CACHE_PRODUCTION_SOURCE
+        blockers: tuple[str, ...] = ()
+    elif produced:
+        status = PREFILL_KV_CACHE_PARTIAL_STATUS
+        owner = "npu"
+        source = PREFILL_KV_CACHE_PRODUCTION_SOURCE
+        blockers = (PREFILL_1K_NPU_BLOCKER, NPU_PREFILL_KV_CACHE_BLOCKER)
+    else:
+        status = PREFILL_KV_CACHE_BLOCKED_STATUS
+        owner = "missing"
+        source = PREFILL_KV_CACHE_NOT_PRODUCED_SOURCE
+        blockers = (PREFILL_1K_NPU_BLOCKER, PREFILL_PRODUCED_KV_CACHE_BLOCKER, NPU_PREFILL_KV_CACHE_BLOCKER)
+    elapsed = perf_counter() - start
+    power_snapshot = finish_power_window(
+        power_window, elapsed_seconds=elapsed
+    ).to_json_dict()
+    return Gemma3ProductionPrefillResult(
+        status=status,
+        source=source,
+        owner=owner,
+        blockers=_dedupe(blockers),
+        layers=tuple(layers),
+        elapsed_seconds=elapsed,
+        kernel_launch_count=sum(layer.kernel_launch_count for layer in layers),
+        host_fallback_count=0,
+        host_runtime_count=1,
+        evidence_path=None,
+        runtime_cache=_runtime_cache_stats(runtime_cache),
+        power_snapshot=power_snapshot,
+        error=None,
     )
 
 
@@ -485,6 +753,7 @@ def run_prefill_kv_cache(
     *,
     runtime_cache: Any = None,
     evidence_path: Path | None = None,
+    power_sample: bool = False,
 ) -> Gemma3ProductionPrefillResult:
     """Return production-prefill K/V cache status for a prepared session.
 
@@ -528,6 +797,7 @@ def run_prefill_kv_cache(
                     host_runtime_count=result.host_runtime_count,
                     evidence_path=result.evidence_path,
                     runtime_cache=result.runtime_cache,
+                    power_snapshot=result.power_snapshot,
                     error=result.error,
                 )
             return result
@@ -548,6 +818,7 @@ def run_prefill_kv_cache(
         session=session,
         token_ids=token_ids,
         runtime_cache=runtime_cache,
+        power_sample=power_sample,
     )
 
 

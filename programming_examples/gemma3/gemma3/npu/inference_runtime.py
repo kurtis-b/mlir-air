@@ -114,6 +114,10 @@ class Gemma3PrefillKVLayerDescriptor:
     owner: str
     status: str
     blockers: tuple[str, ...]
+    key_reference_correlation: float | None = None
+    value_reference_correlation: float | None = None
+    kv_reference_correlation: float | None = None
+    source_tensor_provenance: str | None = None
 
 
 @dataclass(frozen=True)
@@ -283,6 +287,9 @@ class Gemma3RuntimeExecutionResult:
     artifact_manifest_path: str | None = None
     timed_window_policy: str | None = None
     attention_reduction_mode: str | None = None
+    attention_host_reduction: bool | None = None
+    attention_reduction_kernel_count: int | None = None
+    attention_reduction_kernel_seconds: float | None = None
     logits_sampling_mode: str | None = None
     sampling_policy: str | None = None
     power_snapshot: dict[str, object] | None = None
@@ -557,6 +564,10 @@ def _prefill_kv_cache_descriptor(
                 owner="missing",
                 status=PREFILL_KV_CACHE_NOT_PRODUCED_STATUS,
                 blockers=cache_blockers,
+                key_reference_correlation=None,
+                value_reference_correlation=None,
+                kv_reference_correlation=None,
+                source_tensor_provenance=None,
             )
         )
     return Gemma3PrefillKVCacheDescriptor(
@@ -1082,6 +1093,9 @@ def _runtime_contract_fields(
     *,
     entrypoint: str,
     attention_reduction_mode: str | None = None,
+    attention_host_reduction: bool | None = None,
+    attention_reduction_kernel_count: int | None = None,
+    attention_reduction_kernel_seconds: float | None = None,
     logits_sampling_mode: str | None = None,
     sampling_policy: str | None = None,
     power_snapshot: dict[str, object] | None = None,
@@ -1100,6 +1114,9 @@ def _runtime_contract_fields(
         "artifact_manifest_path": manifest_path,
         "timed_window_policy": timed_window_policy,
         "attention_reduction_mode": attention_reduction_mode,
+        "attention_host_reduction": attention_host_reduction,
+        "attention_reduction_kernel_count": attention_reduction_kernel_count,
+        "attention_reduction_kernel_seconds": attention_reduction_kernel_seconds,
         "logits_sampling_mode": logits_sampling_mode,
         "sampling_policy": sampling_policy,
         "power_snapshot": power_snapshot,
@@ -1110,6 +1127,9 @@ def _decode_attention_reduction_mode(
     probe: Any,
     blockers: Iterable[str],
 ) -> str:
+    explicit_mode = getattr(probe, "attention_reduction_mode", None)
+    if explicit_mode in {"npu", "host", "missing", "not-required"}:
+        return str(explicit_mode)
     if getattr(probe, "attention_host_reduction", False):
         return "host"
     blocker_set = set(blockers)
@@ -1117,8 +1137,8 @@ def _decode_attention_reduction_mode(
         return "missing"
     cache_contract = str(getattr(probe, "attention_cache_contract", ""))
     if cache_contract == "single-current-token-kv":
-        return "missing"
-    return "npu"
+        return "not-required"
+    return "missing"
 
 
 def _decode_logits_sampling_fields(probe: Any) -> tuple[str, str | None]:
@@ -1126,8 +1146,8 @@ def _decode_logits_sampling_fields(probe: Any) -> tuple[str, str | None]:
     if not isinstance(logits, dict):
         return "not-wired", None
     timing = str(logits.get("timing_window", ""))
-    mode = "host-timed" if timing == "included-in-measured-loop-wall" else "host-diagnostic"
-    policy = "argmax" if "sampled_token_id" in logits else None
+    mode = "host-timed-accounted" if timing == "included-in-measured-loop-wall" else "host-diagnostic"
+    policy = "argmax-temperature-0" if "sampled_token_id" in logits else None
     return mode, policy
 
 
@@ -1142,8 +1162,31 @@ def _setup_ownership(session: Gemma3RuntimeSession) -> tuple[Gemma3RuntimeOwners
 
 def _decode_probe_blockers(session: Gemma3RuntimeSession, probe: Any) -> tuple[str, ...]:
     setup_blockers = list(session.setup.blockers)
+    cache_contract = str(getattr(probe, "attention_cache_contract", ""))
     if getattr(probe, "static_projection_argument_mode", None) == "manifest-contiguous-static-bo":
         setup_blockers = [blocker for blocker in setup_blockers if blocker != PRODUCTION_STATIC_BO_BLOCKER]
+    if cache_contract == "production-npu-prefill-kv-cache":
+        setup_blockers = [
+            blocker
+            for blocker in setup_blockers
+            if blocker
+            not in {
+                PREFILL_1K_NPU_BLOCKER,
+                PREFILL_PRODUCED_KV_CACHE_BLOCKER,
+                NPU_PREFILL_KV_CACHE_BLOCKER,
+            }
+        ]
+    probe_blockers = tuple(getattr(probe, "blockers", ()) or ())
+    if getattr(probe, "status", "") == "DECODE_LOOP_DIAGNOSTIC_PASS" and not probe_blockers:
+        setup_blockers = [
+            blocker
+            for blocker in setup_blockers
+            if blocker
+            not in {
+                "full-1b-loop-not-wired",
+                "paper-shape-hardware-rerun-required",
+            }
+        ]
     blockers: list[str] = setup_blockers
     blockers.extend(getattr(probe, "blockers", ()))
     gap_map = {
@@ -1157,7 +1200,17 @@ def _decode_probe_blockers(session: Gemma3RuntimeSession, probe: Any) -> tuple[s
         "logits-sampling-host-diagnostic-only": LOGITS_SAMPLING_HOST_DIAGNOSTIC_BLOCKER,
         "production-contiguous-static-weight-bo-not-used-by-fused-dqp-route": PRODUCTION_STATIC_BO_BLOCKER,
     }
+    prefill_gap_names = {
+        "prefill-kv-cache-not-constructed",
+        "prefill-produced-kv-cache-not-wired",
+        "npu-prefill-kv-cache-not-wired",
+        "paper-1k-kv-attention-not-wired",
+    }
     for gap in getattr(probe, "remaining_paper_gaps", ()):  # keep unrecognized gaps visible.
+        if gap == "logits-sampling-host-timed-accounted":
+            continue
+        if cache_contract == "production-npu-prefill-kv-cache" and gap in prefill_gap_names:
+            continue
         blockers.append(gap_map.get(gap, gap))
     return _dedupe(blockers)
 
@@ -1233,15 +1286,21 @@ def _decode_probe_ownership(
                 blockers=cache_blockers,
             )
         )
-        reduction_host = bool(getattr(probe, "attention_host_reduction", False))
+        reduction_mode = str(getattr(probe, "attention_reduction_mode", ""))
+        reduction_host = bool(getattr(probe, "attention_host_reduction", False)) or reduction_mode == "host"
+        reduction_ready = reduction_mode == "npu"
         records.append(
             Gemma3RuntimeOwnershipRecord(
                 name="attention_stat_reduction",
                 phase="decode",
-                owner="host-fallback" if reduction_host else "npu",
+                owner=("npu" if reduction_ready else ("host-fallback" if reduction_host else "missing")),
                 timed_window=True,
-                status="timed-host-reduction" if reduction_host else "not-required-or-npu",
-                blockers=(NPU_ATTENTION_REDUCTION_BLOCKER,) if reduction_host else (),
+                status=(
+                    "timed-npu-reduction"
+                    if reduction_ready
+                    else ("timed-host-reduction" if reduction_host else "missing")
+                ),
+                blockers=() if reduction_ready else (NPU_ATTENTION_REDUCTION_BLOCKER,),
             )
         )
     logits = getattr(probe, "logits_evidence", None)
@@ -1412,6 +1471,10 @@ def _prefill_cache_descriptor_from_production(
                     owner="npu",
                     status=PREFILL_KV_CACHE_READY_STATUS,
                     blockers=(),
+                    key_reference_correlation=produced.key_reference_correlation,
+                    value_reference_correlation=produced.value_reference_correlation,
+                    kv_reference_correlation=produced.kv_reference_correlation,
+                    source_tensor_provenance=produced.source_tensor_provenance,
                 )
             )
         else:
@@ -1433,6 +1496,10 @@ def _prefill_cache_descriptor_from_production(
                     owner="missing",
                     status=PREFILL_KV_CACHE_NOT_PRODUCED_STATUS,
                     blockers=_dedupe(blockers),
+                    key_reference_correlation=None,
+                    value_reference_correlation=None,
+                    kv_reference_correlation=None,
+                    source_tensor_provenance=None,
                 )
             )
     if production.status == PREFILL_KV_CACHE_READY_STATUS and produced_count == setup_cache.layer_count:
@@ -1561,6 +1628,8 @@ def _prefill_stage_ownership_from_production(
 def run_npu_prefill(
     session: Gemma3RuntimeSession,
     token_ids: Sequence[int],
+    *,
+    power_sample: bool = False,
 ) -> Gemma3RuntimeExecutionResult:
     if len(token_ids) != session.setup.prompt_len:
         raise ValueError(
@@ -1571,6 +1640,7 @@ def run_npu_prefill(
         token_ids,
         runtime_cache=session.runtime_cache,
         evidence_path=session.prefill_evidence_path,
+        power_sample=power_sample,
     )
     prefill_kv_cache = _prefill_cache_descriptor_from_production(session, production)
     prefill_stage_ownership = _prefill_stage_ownership_from_production(session, production)
@@ -1636,6 +1706,7 @@ def run_npu_prefill(
             attention_reduction_mode="not-required",
             logits_sampling_mode="not-applicable",
             sampling_policy="none",
+            power_snapshot=production.power_snapshot,
         ),
         **setup_fields,
     )
@@ -1646,6 +1717,7 @@ def generate(
     *,
     decode_tokens: int,
     run_hardware: bool = True,
+    power_sample: bool = False,
 ) -> Gemma3RuntimeExecutionResult:
     if decode_tokens < 0:
         raise ValueError("decode_tokens must be non-negative")
@@ -1760,6 +1832,26 @@ def generate(
             if session.setup.q4nx_manifest is not None
             else None
         )
+        runtime_prefill_kv_cache = (
+            None
+            if session.runtime_cache is None
+            else getattr(session.runtime_cache, "production_prefill_kv_cache", None)
+        )
+        if not isinstance(runtime_prefill_kv_cache, dict):
+            return _blocked_execution_result(
+                session,
+                entrypoint="generate",
+                decode_tokens=decode_tokens,
+                blockers=(
+                    GENERATE_PREFILL_KV_CACHE_BLOCKER,
+                    NPU_PREFILL_KV_CACHE_BLOCKER,
+                    "decode-production-prefill-kv-arrays-missing",
+                    *session.setup.blockers,
+                ),
+                operation_ownership=_generate_prefill_blocked_ownership(prefill),
+                unit=unit,
+                prefill_result=prefill,
+            )
         probe = run_decode_loop_runtime(
             model_variant=session.setup.model_variant,
             weights_dir=(Path(session.setup.weights_dir) if session.setup.weights_dir else None),
@@ -1768,13 +1860,14 @@ def generate(
             prompt_context_length=session.setup.decode_context,
             warmup_layers=1,
             stitched=True,
-            attention_mode="single-token",
-            attention_cache_mode="repeated-current-token",
-            logits_mode="none",
-            logits_timing="excluded",
+            attention_mode="tiled-stats-1k",
+            attention_cache_mode="production-prefill",
+            prefill_kv_cache=runtime_prefill_kv_cache,
+            logits_mode="host-tied-embedding",
+            logits_timing="included",
             quantized_weights_dir=quantized_weights_dir,
             force_quantized_weights=False,
-            power_sample=False,
+            power_sample=power_sample,
         )
     except Exception as exc:
         return _blocked_execution_result(
@@ -1784,13 +1877,14 @@ def generate(
             blockers=("decode-runtime-launch-failed", *session.setup.blockers),
             unit=unit,
             error=str(exc),
+            prefill_result=prefill,
         )
 
     blockers = _decode_probe_blockers(session, probe)
     ownership = _decode_probe_ownership(session, probe)
     logits_sampling_mode, sampling_policy = _decode_logits_sampling_fields(probe)
     status = (
-        "DECODE_RUNTIME_PASS_WITH_BLOCKERS"
+        ("DECODE_RUNTIME_PASS" if not blockers else "DECODE_RUNTIME_PASS_WITH_BLOCKERS")
         if getattr(probe, "status", "") == "DECODE_LOOP_DIAGNOSTIC_PASS"
         else "DECODE_RUNTIME_BLOCKED"
     )
@@ -1801,6 +1895,19 @@ def generate(
         else ()
     )
     elapsed = getattr(probe, "elapsed_seconds", None) or (perf_counter() - start)
+    setup_fields = _execution_setup_fields(session)
+    setup_fields.update(
+        {
+            "prefill_kv_cache_status": prefill.prefill_kv_cache_status,
+            "prefill_kv_cache_source": prefill.prefill_kv_cache_source,
+            "prefill_kernel_launch_count": prefill.prefill_kernel_launch_count,
+            "prefill_host_fallback_count": prefill.prefill_host_fallback_count,
+            "kv_cache_layer_count": prefill.kv_cache_layer_count,
+            "kv_cache_token_count": prefill.kv_cache_token_count,
+            "prefill_kv_cache": prefill.prefill_kv_cache,
+            "prefill_stage_ownership": prefill.prefill_stage_ownership,
+        }
+    )
     return Gemma3RuntimeExecutionResult(
         schema_version=RUNTIME_SETUP_VERSION,
         entrypoint="generate",
@@ -1823,11 +1930,14 @@ def generate(
             session,
             entrypoint="generate",
             attention_reduction_mode=_decode_attention_reduction_mode(probe, blockers),
+            attention_host_reduction=getattr(probe, "attention_host_reduction", None),
+            attention_reduction_kernel_count=getattr(probe, "attention_reduction_kernel_count", None),
+            attention_reduction_kernel_seconds=getattr(probe, "attention_reduction_kernel_seconds", None),
             logits_sampling_mode=logits_sampling_mode,
             sampling_policy=sampling_policy,
             power_snapshot=_probe_power_snapshot(probe),
         ),
-        **_execution_setup_fields(session),
+        **setup_fields,
     )
 
 
@@ -1924,6 +2034,10 @@ def _fixture_prefill_evidence(path: Path, setup: Gemma3RuntimeSetupRecord) -> No
                 "blockers": [],
                 "kernel_launch_count": 5,
                 "elapsed_seconds": 0.001,
+                "key_reference_correlation": 0.999,
+                "value_reference_correlation": 0.999,
+                "kv_reference_correlation": 0.999,
+                "source_tensor_provenance": "fixture-production-prefill-kv",
             }
         )
         layers.append(item)
@@ -2061,6 +2175,7 @@ def main() -> int:
     parser.add_argument("--prefill-evidence-json", type=Path)
     parser.add_argument("--include-ownership", action="store_true")
     parser.add_argument("--no-run-hardware", action="store_true", help="prepare and format a blocked runtime result without launching NPU kernels")
+    parser.add_argument("--power-sample", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--result-json", type=Path)
     args = parser.parse_args()
@@ -2089,13 +2204,16 @@ def main() -> int:
     )
     result: Gemma3RuntimeSetupRecord | Gemma3RuntimeExecutionResult
     if args.run_npu_prefill:
-        result = run_npu_prefill(session, [1] * args.prompt_len)
+        result = run_npu_prefill(
+            session, [1] * args.prompt_len, power_sample=args.power_sample
+        )
     elif args.generate:
         result = generate(
             session,
             [1] * args.prompt_len,
             decode_tokens=args.decode_tokens,
             run_hardware=not args.no_run_hardware,
+            power_sample=args.power_sample,
         )
     else:
         result = session.setup

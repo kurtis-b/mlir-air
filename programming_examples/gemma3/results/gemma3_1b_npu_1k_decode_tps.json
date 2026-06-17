@@ -1,0 +1,137 @@
+{
+  "artifact_manifest_path": "/home/cj/mlir-air/programming_examples/gemma3/build_peano/runtime_cache/gemma3-1b/gemma3_npu_kernel_manifest.json",
+  "attention_host_reduction": false,
+  "attention_reduction_kernel_count": 26,
+  "attention_reduction_kernel_seconds": 0.13631038504536264,
+  "attention_reduction_mode": "npu",
+  "backend": "npu",
+  "blockers": [],
+  "classification": "EXPLAINED_DEVIATION",
+  "command": "/home/cj/mlir-air/programming_examples/gemma3/gemma3/evidence/npu_paper_cells.py --prefill-result /home/cj/mlir-air/programming_examples/gemma3/results/gemma3_1b_npu_prefill_runtime.json --decode-result /home/cj/mlir-air/programming_examples/gemma3/results/gemma3_1b_npu_runtime_decode_loop.json --prefill-output /home/cj/mlir-air/programming_examples/gemma3/results/gemma3_1b_npu_1k_prefill_ttft.json --decode-output /home/cj/mlir-air/programming_examples/gemma3/results/gemma3_1b_npu_1k_decode_tps.json",
+  "correctness": "PASS",
+  "decode_context": 1024,
+  "decode_tokens": 1,
+  "delta_pct": 99.89733810511179,
+  "dirty_worktree": null,
+  "explanation": "local Strix NPU production runtime measurement is reported honestly; this run is not forced to match the paper value",
+  "git_commit": null,
+  "host_fallback_count": 1,
+  "host_fallbacks": [
+    {
+      "contributes_to_timing": true,
+      "measured": true,
+      "measurement_source": "production-decode-loop-wall",
+      "name": "logits_sampling",
+      "owner": "host-fallback",
+      "phase": "decode",
+      "runtime_status": "included-in-measured-loop-wall",
+      "status": "accounted",
+      "timed_window": true
+    }
+  ],
+  "kernel_launch_count": 500,
+  "local_value": 0.042194038799054985,
+  "logits_sampling_mode": "host-timed-accounted",
+  "measured_loop_seconds": 23.700030346997664,
+  "metric": "decode_tps",
+  "model_variant": "gemma3-1b",
+  "operation_ownership": [
+    {
+      "blockers": [],
+      "name": "static_projection_preload",
+      "owner": "host-fallback",
+      "phase": "setup",
+      "status": "planned-outside-timed-window",
+      "timed_window": false
+    },
+    {
+      "blockers": [],
+      "name": "argument_binding_validation",
+      "owner": "host-fallback",
+      "phase": "setup",
+      "status": "validated",
+      "timed_window": false
+    },
+    {
+      "blockers": [],
+      "name": "decode_layer_loop",
+      "owner": "npu",
+      "phase": "decode",
+      "status": "launched-pass",
+      "timed_window": true
+    },
+    {
+      "blockers": [],
+      "name": "decode_prefill_kv_cache",
+      "owner": "npu",
+      "phase": "decode",
+      "status": "provided",
+      "timed_window": false
+    },
+    {
+      "blockers": [],
+      "name": "attention_stat_reduction",
+      "owner": "npu",
+      "phase": "decode",
+      "status": "timed-npu-reduction",
+      "timed_window": true
+    },
+    {
+      "blockers": [],
+      "name": "logits_sampling",
+      "owner": "host-fallback",
+      "phase": "decode",
+      "status": "included-in-measured-loop-wall",
+      "timed_window": true
+    }
+  ],
+  "paper_source": "arxiv_pdf_v2",
+  "paper_table": "data/paper_targets.json",
+  "paper_value": 41.1,
+  "power_snapshot": {
+    "aligned_with_timed_window": true,
+    "field_status": {
+      "cpu": "MISSING_POWER_FIELD",
+      "gpu": "MISSING_POWER_FIELD",
+      "npu": "PSEUDO_RAPL_SYSFS_DELTA",
+      "total": "RAPL_SYSFS_PACKAGE"
+    },
+    "notes": [
+      "raw turbostat is available as a package-watt fallback, but may require matching linux-tools and privileges",
+      "xrt-smi is available, but direct NPU rail parsing reports N/A on this host",
+      "NPU rail is pseudo power: average package watts during timed window minus quiescent package watts before the run",
+      "quiescent_pkg_watts=7.286910",
+      "package watts use direct RAPL sysfs energy_uj delta over the timed window"
+    ],
+    "run_id": "gemma3_1b_decode_loop_probe",
+    "sampling_backend": "rapl-sysfs+turbostat+rocm-smi",
+    "schema_version": 1,
+    "watts": {
+      "cpu": null,
+      "gpu": null,
+      "npu": 10.139447095459154,
+      "total": 17.426357095459153
+    }
+  },
+  "power_watts": {
+    "cpu": null,
+    "gpu": null,
+    "npu": 10.139447095459154,
+    "total": 17.426357095459153
+  },
+  "prefill_kernel_launch_count": 26,
+  "prompt_len": 1024,
+  "runtime_contract_version": "gemma3-npu-runtime-contract-v1",
+  "sampling_policy": "argmax-temperature-0",
+  "schema_version": 1,
+  "sequence_length": 1024,
+  "source_runtime_result": "/home/cj/mlir-air/programming_examples/gemma3/results/gemma3_1b_npu_runtime_decode_loop.json",
+  "status": "PASS",
+  "target_id": "decode_tps_gemma3_1b_npu_1024",
+  "timed_iters": 1,
+  "timed_kernel_seconds": 21.346808523201616,
+  "timed_window_policy": "compile-load-bo-preload-prefill-excluded;decode-token-loop-timed",
+  "timing_window": "post-warmup-loop-wall-and-segmented-run-start-wait2",
+  "unit": "tokens_per_second",
+  "warmup_iters": 1
+}

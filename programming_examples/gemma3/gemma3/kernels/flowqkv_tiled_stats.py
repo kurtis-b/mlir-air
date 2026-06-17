@@ -31,7 +31,11 @@ from air.backend.xrt import XRTBackend
 from air.backend.xrt_runner import type_mapper
 
 from gemma3.core.common import attention_reference
-from gemma3.kernels.flow_common import _affine_linear_tile, _affine_mul
+from gemma3.kernels.flow_common import (
+    _affine_linear_local,
+    _affine_linear_tile,
+    _affine_mul,
+)
 
 
 def _fast_exp_approx(x: np.ndarray) -> np.ndarray:
@@ -73,6 +77,81 @@ def merge_tiled_stats(stats: np.ndarray) -> np.ndarray:
     global_denoms = np.sum(denoms * scale, axis=0)
     global_nums = np.sum(numerators * scale[:, :, None], axis=0)
     return (global_nums / global_denoms[:, None]).astype(bfloat16)
+
+
+@module_builder
+def build_tiled_stats_merge_module(
+    q_chunk,
+    tile_count,
+    head_dim,
+    kernel_func,
+    object_file,
+    herd_rows=1,
+    herd_cols=4,
+):
+    if herd_rows * herd_cols != q_chunk:
+        raise ValueError("merge herd rows*cols must equal q_chunk")
+
+    bf16_type = type_mapper(bfloat16)
+    f32_type = type_mapper(np.float32)
+    stats_width = head_dim + 2
+
+    stats_l3_ty = MemRefType.get([tile_count, q_chunk, stats_width], f32_type)
+    out_l3_ty = MemRefType.get([q_chunk, head_dim], bf16_type)
+
+    l1_space = IntegerAttr.get(T.i32(), MemorySpace.L1)
+    stats_l1_ty = MemRefType.get(
+        [tile_count, 1, stats_width], f32_type, memory_space=l1_space
+    )
+    out_l1_ty = MemRefType.get([1, head_dim], bf16_type, memory_space=l1_space)
+
+    merge_func = FuncOp(
+        kernel_func,
+        ([stats_l1_ty, out_l1_ty], []),
+        visibility="private",
+    )
+    merge_func.attributes["link_with"] = StringAttr.get(object_file)
+    merge_func.attributes["llvm.emit_c_interface"] = UnitAttr.get()
+
+    q_index_map = _affine_linear_local(herd_cols)
+
+    @FuncOp.from_py_func(stats_l3_ty, out_l3_ty)
+    def flowqkv_tiled_stats_merge(arg_stats, arg_out):
+        @launch(operands=[arg_stats, arg_out])
+        def launch_body(lstats, lout):
+            @segment(
+                name="flowqkv_tiled_stats_merge_seg",
+                operands=[lstats, lout],
+            )
+            def segment_body(sstats, sout):
+                @herd(
+                    name="flowqkv_tiled_stats_merge_herd",
+                    sizes=[herd_rows, herd_cols],
+                    operands=[sstats, sout],
+                    link_with=object_file,
+                )
+                def herd_body(_tx, _ty, _sx, _sy, hstats, hout):
+                    query_idx = affine_apply(q_index_map, [_tx, _ty])
+
+                    l1_stats = AllocOp(stats_l1_ty, [], [])
+                    l1_out = AllocOp(out_l1_ty, [], [])
+                    dma_memcpy_nd(
+                        l1_stats,
+                        hstats,
+                        src_offsets=[0, query_idx, 0],
+                        src_sizes=[tile_count, 1, stats_width],
+                        src_strides=[q_chunk * stats_width, stats_width, 1],
+                    )
+                    CallOp(merge_func, [l1_stats, l1_out])
+                    dma_memcpy_nd(
+                        hout,
+                        l1_out,
+                        dst_offsets=[query_idx, 0],
+                        dst_sizes=[1, head_dim],
+                        dst_strides=[head_dim, 1],
+                    )
+                    DeallocOp(l1_stats)
+                    DeallocOp(l1_out)
 
 
 @module_builder

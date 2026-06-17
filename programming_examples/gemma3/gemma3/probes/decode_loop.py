@@ -105,12 +105,41 @@ class LayerLoopEvidence:
     static_norm_argument_bytes: int
     rms_correlation: float | None
     final_output_correlation: float | None
+    stage_correlations: dict[str, float | None]
+    first_failing_stage: str | None
     projection_evidence: tuple[ProjectionEvidence, ...]
     timed_kernel_count: int
     timed_kernel_seconds: float | None
 
     def to_json_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+STAGE_CORRELATION_ORDER = (
+    "attention",
+    "o_proj",
+    "post_attention_norm",
+    "attention_residual",
+    "pre_feedforward_norm",
+    "gate_proj",
+    "up_proj",
+    "mlp_activation",
+    "down_proj",
+    "post_feedforward_norm",
+    "final_residual",
+)
+
+
+def _stage_correlation(actual: Any, expected: Any, *, check_references: bool) -> float | None:
+    return _correlation(actual, expected) if check_references else None
+
+
+def _first_failing_stage(stage_correlations: dict[str, float | None]) -> str | None:
+    for name in STAGE_CORRELATION_ORDER:
+        value = stage_correlations.get(name)
+        if value is not None and value < DEFAULT_THRESHOLD:
+            return name
+    return None
 
 
 @dataclass(frozen=True)
@@ -158,6 +187,9 @@ class Gemma3DecodeLoopProbeResult:
     attention_host_batch_tiles: int | None
     attention_host_batch_count: int | None
     attention_host_reduction: bool
+    attention_reduction_mode: str | None
+    attention_reduction_kernel_count: int
+    attention_reduction_kernel_seconds: float | None
     logits_evidence: dict[str, object] | None
     host_fallbacks: tuple[str, ...]
     timed_kernel_count: int
@@ -370,6 +402,7 @@ def has_decode_loop_tiled_stats_evidence(
         data = json.loads(evidence_path.read_text(encoding="utf-8"))
     except Exception:
         return False
+    gaps = tuple(data.get("remaining_paper_gaps", ()))
     return (
         data.get("schema_version") == 2
         and data.get("model_variant") == model_variant
@@ -382,15 +415,16 @@ def has_decode_loop_tiled_stats_evidence(
         and data.get("attention_mode") == "tiled-stats-1k"
         and data.get("attention_cache_contract") == "synthetic-prefill-kv-cache"
         and data.get("attention_host_batch_count") == 16
-        and data.get("attention_host_reduction") is True
+        and data.get("attention_host_reduction") is False
+        and data.get("attention_reduction_mode") == "npu"
+        and int(data.get("attention_reduction_kernel_count") or 0) > 0
         and data.get("output_format") == DEFAULT_OUTPUT_FORMAT
         and data.get("runner_reuse_mode") == "reused-elf-persistent-bo"
         and not data.get("host_fallbacks")
         and not data.get("blockers")
         and data.get("dirty_worktree") is False
-        and "prefill-produced-kv-cache-not-wired" in tuple(data.get("remaining_paper_gaps", ()))
-        and "paper-1k-kv-attention-npu-reduction-not-wired"
-        in tuple(data.get("remaining_paper_gaps", ()))
+        and "prefill-produced-kv-cache-not-wired" in gaps
+        and "paper-1k-kv-attention-npu-reduction-not-wired" not in gaps
     )
 
 
@@ -419,14 +453,16 @@ def has_decode_loop_hf_prefill_tiled_stats_evidence(
         and data.get("attention_cache_layer_count") == 26
         and data.get("attention_cache_token_count") == 1024
         and data.get("attention_cache_build_seconds") is not None
-        and data.get("attention_host_reduction") is True
+        and data.get("attention_host_reduction") is False
+        and data.get("attention_reduction_mode") == "npu"
+        and int(data.get("attention_reduction_kernel_count") or 0) > 0
         and data.get("output_format") == DEFAULT_OUTPUT_FORMAT
         and data.get("runner_reuse_mode") == "reused-elf-persistent-bo"
         and not data.get("host_fallbacks")
         and not data.get("blockers")
         and data.get("dirty_worktree") is False
         and "npu-prefill-kv-cache-not-wired" in gaps
-        and "paper-1k-kv-attention-npu-reduction-not-wired" in gaps
+        and "paper-1k-kv-attention-npu-reduction-not-wired" not in gaps
     )
 
 
@@ -468,7 +504,8 @@ def has_decode_loop_hf_prefill_tiled_stats_timed_host_logits_evidence(
         and logits.get("mode") == "host-tied-embedding"
         and logits.get("timing_window") == "included-in-measured-loop-wall"
         and isinstance(logits.get("sampled_token_id"), int)
-        and "logits-sampling-host-timed-accounted" in gaps
+        and "logits-sampling-host-diagnostic-only" not in gaps
+        and "logits-sampling-not-wired" not in gaps
     )
 
 
@@ -1609,6 +1646,62 @@ def _preload_static_stitched_ffn_geglu_down_bo_sets(
     return count
 
 
+def _staged_projection_kernel_plan(plan: _PackedProjectionPlan) -> _PackedProjectionPlan:
+    if plan.row_blocks % 8 == 0:
+        return plan
+
+    import numpy as np
+    from ml_dtypes import bfloat16
+    from gemma3.kernels.fused_dqp import build_paper_module
+
+    target_row_blocks = _ceil_to(int(plan.row_blocks), 8)
+    extra = target_row_blocks - int(plan.row_blocks)
+    packed = np.concatenate(
+        [
+            plan.packed,
+            np.zeros((extra, plan.packed.shape[1], plan.packed.shape[2]), dtype=plan.packed.dtype),
+        ],
+        axis=0,
+    )
+    scale = np.concatenate(
+        [
+            plan.scale,
+            np.ones((extra, plan.scale.shape[1], plan.scale.shape[2]), dtype=bfloat16),
+        ],
+        axis=0,
+    )
+    min_offset = np.concatenate(
+        [
+            plan.min_offset,
+            np.zeros((extra, plan.min_offset.shape[1], plan.min_offset.shape[2]), dtype=bfloat16),
+        ],
+        axis=0,
+    )
+    object_file = EXAMPLE_ROOT / "build_peano" / "fused_dqp.o"
+    return _PackedProjectionPlan(
+        family=plan.family,
+        tensor_key=plan.tensor_key,
+        shape=plan.shape,
+        padded_shape=(target_row_blocks * 32, plan.padded_shape[1]),
+        row_blocks=target_row_blocks,
+        col_blocks=plan.col_blocks,
+        packed=packed,
+        scale=scale,
+        min_offset=min_offset,
+        mlir_module=build_paper_module(
+            32,
+            256,
+            "fused_dqp_accum_block_opt",
+            str(object_file),
+            target_row_blocks,
+            1,
+            2,
+            4,
+            "direct",
+        ),
+    )
+
+
 def _projection_output_shape(plan: _PackedProjectionPlan) -> tuple[int, int]:
     return (int(plan.row_blocks), 32)
 
@@ -1651,10 +1744,50 @@ def _compile_flowqkv_tiled_stats_kernel(
     subprocess.run(cmd, check=True)
 
 
-def _flowqkv_tiled_stats_helpers():
-    from gemma3.kernels.flowqkv_tiled_stats import build_tiled_stats_module, merge_tiled_stats
+def _compile_flowqkv_tiled_stats_merge_kernel(
+    object_file: Path,
+    *,
+    tile_count: int,
+    head_dim: int = 256,
+) -> None:
+    peano = os.environ.get("PEANO_INSTALL_DIR")
+    if not peano:
+        raise RuntimeError("PEANO_INSTALL_DIR is required to compile flow_attention_stats_merge.cc")
+    clangxx = Path(peano) / "bin/clang++"
+    if not clangxx.exists():
+        raise RuntimeError(f"missing Peano clang++: {clangxx}")
+    src = _dataflow_dir() / "flow_attention_stats_merge.cc"
+    object_file.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        str(clangxx),
+        "-O2",
+        "-std=c++20",
+        "--target=aie2p-none-unknown-elf",
+        "-Wno-parentheses",
+        "-Wno-attributes",
+        "-Wno-macro-redefined",
+        "-Wno-empty-body",
+        "-DNDEBUG",
+        "-I",
+        str(_aie_api_include()),
+        f"-DTILE_COUNT={int(tile_count)}",
+        f"-DHEAD_DIM={int(head_dim)}",
+        "-c",
+        str(src),
+        "-o",
+        str(object_file),
+    ]
+    subprocess.run(cmd, check=True)
 
-    return build_tiled_stats_module, merge_tiled_stats
+
+def _flowqkv_tiled_stats_helpers():
+    from gemma3.kernels.flowqkv_tiled_stats import (
+        build_tiled_stats_merge_module,
+        build_tiled_stats_module,
+        merge_tiled_stats,
+    )
+
+    return build_tiled_stats_module, build_tiled_stats_merge_module, merge_tiled_stats
 
 
 def _synthetic_prefill_kv_cache(
@@ -1888,12 +2021,14 @@ def _run_tiled_stats_attention_stage(
     k,
     v,
     object_file: Path,
+    merge_object_file: Path,
     runner_cache: _ReusableElfRunnerCache,
     prompt_context_length: int,
     kv_tile: int,
     host_batch_tiles: int,
     attention_cache_mode: str,
     prefill_kv_cache: dict[int, tuple[Any, Any]] | None,
+    attention_reduction_kernel_seconds: list[float] | None = None,
     timed_kernel_seconds: list[float] | None = None,
     power_meter=None,
 ):
@@ -1911,7 +2046,7 @@ def _run_tiled_stats_attention_stage(
         raise RuntimeError("--tiled-attention-host-batch-tiles must be positive")
     if not object_file.exists():
         _compile_flowqkv_tiled_stats_kernel(object_file, q_chunk=4, kv_tile=kv_tile, head_dim=256)
-    build_tiled_stats_module, merge_tiled_stats = _flowqkv_tiled_stats_helpers()
+    build_tiled_stats_module, build_tiled_stats_merge_module, _merge_tiled_stats = _flowqkv_tiled_stats_helpers()
 
     q_single = q.reshape(4, 256).astype(bfloat16)
     if attention_cache_mode == "repeated-current-token":
@@ -1922,13 +2057,14 @@ def _run_tiled_stats_attention_stage(
             layer_index=layer_index,
             prompt_context_length=prompt_context_length,
         )
-    elif attention_cache_mode == "hf-prefill":
+    elif attention_cache_mode in ("hf-prefill", "production-prefill"):
         if prefill_kv_cache is None or layer_index not in prefill_kv_cache:
-            raise RuntimeError(f"missing HF prefill KV cache for layer {layer_index}")
+            label = "production" if attention_cache_mode == "production-prefill" else "HF"
+            raise RuntimeError(f"missing {label} prefill KV cache for layer {layer_index}")
         k_full, v_full = prefill_kv_cache[layer_index]
     else:
         raise RuntimeError(f"unsupported attention cache mode: {attention_cache_mode}")
-    if attention_cache_mode == "hf-prefill" and k_full.shape[0] < prompt_context_length:
+    if attention_cache_mode in ("hf-prefill", "production-prefill") and k_full.shape[0] < prompt_context_length:
         k_full = np.concatenate([k_full, k.reshape(1, 256).astype(bfloat16)], axis=0)
         v_full = np.concatenate([v_full, v.reshape(1, 256).astype(bfloat16)], axis=0)
     if k_full.ndim != 2 or v_full.ndim != 2 or k_full.shape[1:] != (256,) or v_full.shape[1:] != (256,):
@@ -1989,7 +2125,55 @@ def _run_tiled_stats_attention_stage(
         )
         stats[batch_start:batch_end] = batch_stats.reshape(host_batch_tiles, 4, 258)
 
-    actual = merge_tiled_stats(stats).reshape(1024).astype(bfloat16)
+    merge_object_file = merge_object_file.with_name(
+        f"flowqkv_tiled_stats_merge_t{tile_count}_d256.o"
+    )
+    merge_source = _dataflow_dir() / "flow_attention_stats_merge.cc"
+    if (
+        not merge_object_file.exists()
+        or merge_object_file.stat().st_mtime < merge_source.stat().st_mtime
+    ):
+        _compile_flowqkv_tiled_stats_merge_kernel(
+            merge_object_file,
+            tile_count=tile_count,
+            head_dim=256,
+        )
+    merge_module = build_tiled_stats_merge_module(
+        4,
+        tile_count,
+        256,
+        "flowqkv_tiled_stats_merge_bf16",
+        str(merge_object_file),
+        1,
+        4,
+    )
+    merge_samples: list[float] | None = (
+        []
+        if timed_kernel_seconds is not None or attention_reduction_kernel_seconds is not None
+        else None
+    )
+    actual = runner_cache.run(
+        key=("flowqkv_tiled_stats_merge", 4, tile_count, 256),
+        mlir_module=merge_module,
+        backend_options=dict(
+            verbose=False,
+            omit_pingpong=True,
+            output_format=DEFAULT_OUTPUT_FORMAT,
+            instance_name="flowqkv_tiled_stats_merge",
+            target_device="npu2",
+            runtime_loop_tiling_sizes=[1, 1],
+        ),
+        inputs=[stats],
+        output_shape=(4, 256),
+        output_dtype=bfloat16,
+        timed_kernel_seconds=merge_samples,
+        power_meter=power_meter,
+    ).reshape(1024).astype(bfloat16)
+    if merge_samples is not None:
+        if timed_kernel_seconds is not None:
+            timed_kernel_seconds.extend(merge_samples)
+        if attention_reduction_kernel_seconds is not None:
+            attention_reduction_kernel_seconds.extend(merge_samples)
     expected = attention_reference(q_single, k_full, v_full).reshape(1024).astype(bfloat16)
     return actual, expected
 
@@ -2003,12 +2187,14 @@ def _run_attention_stage(
     v,
     single_token_object_file: Path,
     tiled_stats_object_file: Path,
+    tiled_stats_merge_object_file: Path,
     runner_cache: _ReusableElfRunnerCache,
     prompt_context_length: int,
     tiled_attention_kv_tile: int,
     tiled_attention_host_batch_tiles: int,
     attention_cache_mode: str,
     prefill_kv_cache: dict[int, tuple[Any, Any]] | None,
+    attention_reduction_kernel_seconds: list[float] | None = None,
     timed_kernel_seconds: list[float] | None = None,
     power_meter=None,
 ):
@@ -2029,12 +2215,14 @@ def _run_attention_stage(
             k=k,
             v=v,
             object_file=tiled_stats_object_file,
+            merge_object_file=tiled_stats_merge_object_file,
             runner_cache=runner_cache,
             prompt_context_length=prompt_context_length,
             kv_tile=tiled_attention_kv_tile,
             host_batch_tiles=tiled_attention_host_batch_tiles,
             attention_cache_mode=attention_cache_mode,
             prefill_kv_cache=prefill_kv_cache,
+            attention_reduction_kernel_seconds=attention_reduction_kernel_seconds,
             timed_kernel_seconds=timed_kernel_seconds,
             power_meter=power_meter,
         )
@@ -2598,6 +2786,7 @@ def _run_packed_projection(
     from ml_dtypes import bfloat16
     from gemma3.core.common import fused_dqp_paper_reference
 
+    plan = _staged_projection_kernel_plan(plan)
     out_dim, in_dim = plan.shape
     activation_padded = np.zeros((plan.col_blocks * 256,), dtype=bfloat16)
     activation_padded[:in_dim] = activation.reshape(-1).astype(bfloat16)
@@ -2656,6 +2845,7 @@ def _run_one_layer(
     rope_object_file: Path,
     flowqkv_object_file: Path,
     tiled_stats_object_file: Path,
+    tiled_stats_merge_object_file: Path,
     attention_mode: str,
     attention_o_mode: str,
     post_attention_mode: str,
@@ -2667,6 +2857,7 @@ def _run_one_layer(
     tiled_attention_kv_tile: int,
     tiled_attention_host_batch_tiles: int,
     prefill_kv_cache: dict[int, tuple[Any, Any]] | None,
+    attention_reduction_kernel_seconds: list[float] | None = None,
     static_projection_bo_store: _StaticProjectionBOStore | None = None,
     check_references: bool = True,
 ) -> tuple[Any, LayerLoopEvidence, list[str]]:
@@ -2674,6 +2865,7 @@ def _run_one_layer(
     import numpy as np
 
     blockers: list[str] = []
+    stage_correlations: dict[str, float | None] = {}
     start_count = len(timed_kernel_seconds) if timed_kernel_seconds is not None else 0
     start_seconds = sum(timed_kernel_seconds) if timed_kernel_seconds is not None else 0.0
     actual: dict[str, Any]
@@ -2830,12 +3022,14 @@ def _run_one_layer(
             v=v_actual,
             single_token_object_file=flowqkv_object_file,
             tiled_stats_object_file=tiled_stats_object_file,
+            tiled_stats_merge_object_file=tiled_stats_merge_object_file,
             runner_cache=runner_cache,
             prompt_context_length=prompt_context_length,
             tiled_attention_kv_tile=tiled_attention_kv_tile,
             tiled_attention_host_batch_tiles=tiled_attention_host_batch_tiles,
             attention_cache_mode=attention_cache_mode,
             prefill_kv_cache=prefill_kv_cache,
+            attention_reduction_kernel_seconds=attention_reduction_kernel_seconds,
             timed_kernel_seconds=timed_kernel_seconds,
             power_meter=power_meter,
         )
@@ -2851,6 +3045,16 @@ def _run_one_layer(
             blockers.append(f"L{layer_index}:o_proj-correlation-low")
     else:
         raise RuntimeError(f"unsupported attention/O mode: {attention_o_mode}")
+    stage_correlations["attention"] = _stage_correlation(
+        attention_actual,
+        attention_expected,
+        check_references=check_references,
+    )
+    stage_correlations["o_proj"] = _stage_correlation(
+        o_actual,
+        o_expected,
+        check_references=check_references,
+    )
 
     if post_attention_mode == "stitched":
         (
@@ -2906,6 +3110,16 @@ def _run_one_layer(
             blockers.append(f"L{layer_index}:attention-residual-correlation-low")
     else:
         raise RuntimeError(f"unsupported post-attention mode: {post_attention_mode}")
+    stage_correlations["post_attention_norm"] = _stage_correlation(
+        post_attention_actual,
+        post_attention_expected,
+        check_references=check_references,
+    )
+    stage_correlations["attention_residual"] = _stage_correlation(
+        residual_actual,
+        residual_expected,
+        check_references=check_references,
+    )
 
     if ffn_gate_up_mode == "stitched":
         (
@@ -2961,6 +3175,21 @@ def _run_one_layer(
                 blockers.append(f"L{layer_index}:{family}-correlation-low")
     else:
         raise RuntimeError(f"unsupported FFN gate/up mode: {ffn_gate_up_mode}")
+    stage_correlations["pre_feedforward_norm"] = _stage_correlation(
+        pre_ff_actual,
+        pre_ff_expected,
+        check_references=check_references,
+    )
+    stage_correlations["gate_proj"] = _stage_correlation(
+        gate_actual,
+        gate_expected,
+        check_references=check_references,
+    )
+    stage_correlations["up_proj"] = _stage_correlation(
+        up_actual,
+        up_expected,
+        check_references=check_references,
+    )
 
     if ffn_geglu_down_mode == "stitched":
         (
@@ -3007,6 +3236,16 @@ def _run_one_layer(
             blockers.append(f"L{layer_index}:down_proj-correlation-low")
     else:
         raise RuntimeError(f"unsupported FFN GeGLU/down mode: {ffn_geglu_down_mode}")
+    stage_correlations["mlp_activation"] = _stage_correlation(
+        mlp_actual,
+        mlp_expected,
+        check_references=check_references,
+    )
+    stage_correlations["down_proj"] = _stage_correlation(
+        down_actual,
+        down_expected,
+        check_references=check_references,
+    )
 
     if post_feedforward_mode == "stitched":
         (
@@ -3067,6 +3306,16 @@ def _run_one_layer(
             blockers.append(f"L{layer_index}:final-output-correlation-low")
     else:
         raise RuntimeError(f"unsupported post-feedforward mode: {post_feedforward_mode}")
+    stage_correlations["post_feedforward_norm"] = _stage_correlation(
+        post_ff_actual,
+        post_ff_expected,
+        check_references=check_references,
+    )
+    stage_correlations["final_residual"] = _stage_correlation(
+        output_actual,
+        output_expected,
+        check_references=check_references,
+    )
     end_count = len(timed_kernel_seconds) if timed_kernel_seconds is not None else start_count
     end_seconds = sum(timed_kernel_seconds) if timed_kernel_seconds is not None else start_seconds
     evidence = LayerLoopEvidence(
@@ -3076,11 +3325,61 @@ def _run_one_layer(
         static_norm_argument_bytes=norm_plan.argument_bytes,
         rms_correlation=rms_corr,
         final_output_correlation=final_corr,
+        stage_correlations=stage_correlations,
+        first_failing_stage=_first_failing_stage(stage_correlations),
         projection_evidence=tuple(projection_evidence),
         timed_kernel_count=end_count - start_count,
         timed_kernel_seconds=end_seconds - start_seconds,
     )
     return output_actual.reshape(1, 1152), evidence, blockers
+
+
+def _attention_cache_contract_for_args(args: argparse.Namespace) -> str:
+    if args.attention_mode != "tiled-stats-1k":
+        return "single-current-token-kv"
+    if args.attention_cache_mode == "synthetic-prefill":
+        return "synthetic-prefill-kv-cache"
+    if args.attention_cache_mode == "hf-prefill":
+        return "host-hf-prefill-kv-cache"
+    if args.attention_cache_mode == "production-prefill":
+        return "production-npu-prefill-kv-cache"
+    return "synthetic-repeated-current-token-kv-cache"
+
+
+def _remaining_paper_gaps_for_args(
+    args: argparse.Namespace,
+    *,
+    static_projection_argument_mode: str,
+    attention_reduction_mode: str | None = None,
+) -> tuple[str, ...]:
+    gaps: list[str] = []
+    if args.attention_mode == "single-token":
+        gaps.append("paper-1k-kv-attention-not-wired")
+    elif args.attention_cache_mode == "synthetic-prefill":
+        gaps.append("prefill-produced-kv-cache-not-wired")
+    elif args.attention_cache_mode == "hf-prefill":
+        gaps.append("npu-prefill-kv-cache-not-wired")
+    elif args.attention_cache_mode != "production-prefill":
+        gaps.append("paper-1k-kv-attention-production-cache-not-wired")
+    if args.attention_mode == "tiled-stats-1k" and attention_reduction_mode != "npu":
+        gaps.append("paper-1k-kv-attention-npu-reduction-not-wired")
+
+    if args.logits_mode == "host-tied-embedding" and args.logits_timing != "included":
+        gaps.append("logits-sampling-host-diagnostic-only")
+    elif args.logits_mode != "host-tied-embedding":
+        gaps.append("logits-sampling-not-wired")
+
+    if args.attention_o_mode == "stitched" and args.post_attention_mode != "stitched":
+        gaps.append("decode-layer-after-stitched-attention-o-still-staged")
+    if args.post_attention_mode == "stitched" and args.ffn_gate_up_mode != "stitched":
+        gaps.append("decode-layer-after-stitched-post-attention-residual-still-staged")
+    if args.ffn_gate_up_mode == "stitched" and args.ffn_geglu_down_mode != "stitched":
+        gaps.append("decode-layer-after-stitched-ffn-gate-up-still-staged")
+    if args.ffn_geglu_down_mode == "stitched" and args.post_feedforward_mode != "stitched":
+        gaps.append("decode-layer-after-stitched-ffn-geglu-down-still-staged")
+    if static_projection_argument_mode != "manifest-contiguous-static-bo":
+        gaps.append("production-contiguous-static-weight-bo-not-used-by-fused-dqp-route")
+    return tuple(dict.fromkeys(gaps))
 
 
 def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeResult:
@@ -3095,6 +3394,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
     blockers: list[str] = []
     layer_evidence: list[LayerLoopEvidence] = []
     timed_kernel_samples: list[float] = []
+    attention_reduction_samples: list[float] = []
     runner_cache: _ReusableElfRunnerCache | None = None
     static_projection_bo_store: _StaticProjectionBOStore | None = None
     segment_power = _SegmentedRAPLPowerMeter(
@@ -3165,17 +3465,26 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             )
             prefill_kv_cache = hf_prefill_context.kv_cache
             attention_cache_build_seconds = hf_prefill_context.build_seconds
+        elif args.attention_mode == "tiled-stats-1k" and args.attention_cache_mode == "production-prefill":
+            prefill_kv_cache = getattr(args, "prefill_kv_cache", None)
+            if not isinstance(prefill_kv_cache, dict):
+                raise RuntimeError("--attention-cache-mode=production-prefill requires runtime-produced K/V cache")
+            missing_layers = [layer for layer in range(args.layers) if layer not in prefill_kv_cache]
+            if missing_layers:
+                raise RuntimeError(f"production prefill KV cache missing layers: {missing_layers[:4]}")
+            attention_cache_build_seconds = 0.0
         peano_build_dir = EXAMPLE_ROOT / "build_peano"
         fused_dqp_object_file = peano_build_dir / "fused_dqp.o"
         rope_object_file = peano_build_dir / "rope_halfsplit.o"
         flowqkv_object_file = peano_build_dir / "flowqkv_single_token_q4_kv1_d256.o"
         tiled_stats_object_file = peano_build_dir / "flowqkv_tiled_stats_q4_kv32_d256.o"
+        tiled_stats_merge_object_file = peano_build_dir / "flowqkv_tiled_stats_merge_t32_d256.o"
         runner_cache = _ReusableElfRunnerCache(enabled=not args.no_reuse_elf)
         runner_cache.__enter__()
         if args.production_static_projection_bo:
             required_modes = (
                 args.ingress_mode,
-                args.attention_o_mode,
+                *(((args.attention_o_mode,) if args.attention_mode == "single-token" else ())),
                 args.post_attention_mode,
                 args.ffn_gate_up_mode,
                 args.ffn_geglu_down_mode,
@@ -3183,7 +3492,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             )
             if args.no_reuse_elf or args.dynamic_static_weight_writes or any(mode != "stitched" for mode in required_modes):
                 raise RuntimeError(
-                    "production static projection BO requires reusable all-stitched decode stages"
+                    "production static projection BO requires reusable stitched projection stages"
                 )
             static_projection_bo_store = _StaticProjectionBOStore.create(
                 runner_cache=runner_cache,
@@ -3292,6 +3601,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 rope_object_file=rope_object_file,
                 flowqkv_object_file=flowqkv_object_file,
                 tiled_stats_object_file=tiled_stats_object_file,
+                tiled_stats_merge_object_file=tiled_stats_merge_object_file,
                 attention_mode=args.attention_mode,
                 attention_o_mode=args.attention_o_mode,
                 post_attention_mode=args.post_attention_mode,
@@ -3324,6 +3634,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                 rope_object_file=rope_object_file,
                 flowqkv_object_file=flowqkv_object_file,
                 tiled_stats_object_file=tiled_stats_object_file,
+                tiled_stats_merge_object_file=tiled_stats_merge_object_file,
                 attention_mode=args.attention_mode,
                 attention_o_mode=args.attention_o_mode,
                 post_attention_mode=args.post_attention_mode,
@@ -3379,6 +3690,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                     rope_object_file=rope_object_file,
                     flowqkv_object_file=flowqkv_object_file,
                     tiled_stats_object_file=tiled_stats_object_file,
+                    tiled_stats_merge_object_file=tiled_stats_merge_object_file,
                     attention_mode=args.attention_mode,
                     attention_o_mode=args.attention_o_mode,
                     post_attention_mode=args.post_attention_mode,
@@ -3390,16 +3702,17 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
                     tiled_attention_kv_tile=args.tiled_attention_kv_tile,
                     tiled_attention_host_batch_tiles=args.tiled_attention_host_batch_tiles,
                     prefill_kv_cache=prefill_kv_cache,
+                    attention_reduction_kernel_seconds=attention_reduction_samples,
                     static_projection_bo_store=static_projection_bo_store,
                     check_references=False,
                 )
                 blockers.extend(layer_blockers)
             stdout_lines.append(f"decode token {token_index}: final checksum={float(x_input.astype(np.float32).sum()):.6f}")
-        if args.logits_mode == "host-tied-embedding" and args.logits_timing == "included" and not blockers:
+        if args.logits_mode == "host-tied-embedding" and args.logits_timing == "included":
             _record_host_logits("included-in-measured-loop-wall")
         loop_elapsed = time.perf_counter() - loop_start
         power_snapshot = finish_power_window(power_window, elapsed_seconds=loop_elapsed).to_json_dict()
-        if args.logits_mode == "host-tied-embedding" and args.logits_timing == "excluded" and not blockers:
+        if args.logits_mode == "host-tied-embedding" and args.logits_timing == "excluded":
             _record_host_logits("post-loop-excluded-from-npu-timing")
         returncode = 0 if not blockers else 1
     except Exception as exc:
@@ -3412,6 +3725,12 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
     elapsed = time.perf_counter() - start
     timed_total = sum(timed_kernel_samples) if timed_kernel_samples else None
     timed_mean = (timed_total / len(timed_kernel_samples)) if timed_total is not None and timed_kernel_samples else None
+    attention_reduction_total = sum(attention_reduction_samples) if attention_reduction_samples else None
+    attention_reduction_mode = (
+        "not-required"
+        if args.attention_mode == "single-token"
+        else ("npu" if attention_reduction_samples else "missing")
+    )
     loop_tps = (args.decode_tokens / loop_elapsed) if loop_elapsed and loop_elapsed > 0.0 else None
     kernel_tps = (args.decode_tokens / timed_total) if timed_total and timed_total > 0.0 else None
     status = "DECODE_LOOP_DIAGNOSTIC_PASS" if not blockers else "DECODE_LOOP_DIAGNOSTIC_BLOCKED"
@@ -3459,19 +3778,7 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         reference_check_layer_count=reference_check_layer_count,
         reference_check_seconds=reference_check_seconds,
         attention_mode=args.attention_mode,
-        attention_cache_contract=(
-            (
-                "synthetic-prefill-kv-cache"
-                if args.attention_cache_mode == "synthetic-prefill"
-                else (
-                    "host-hf-prefill-kv-cache"
-                    if args.attention_cache_mode == "hf-prefill"
-                    else "synthetic-repeated-current-token-kv-cache"
-                )
-            )
-            if args.attention_mode == "tiled-stats-1k"
-            else "single-current-token-kv"
-        ),
+        attention_cache_contract=_attention_cache_contract_for_args(args),
         attention_cache_build_seconds=attention_cache_build_seconds,
         attention_cache_layer_count=(len(prefill_kv_cache) if prefill_kv_cache is not None else None),
         attention_cache_token_count=(args.prompt_context_length if prefill_kv_cache is not None else None),
@@ -3480,15 +3787,14 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
             args.tiled_attention_host_batch_tiles if args.attention_mode == "tiled-stats-1k" else None
         ),
         attention_host_batch_count=(
-            None
-            if args.attention_mode == "tiled-stats-1k" and args.attention_cache_mode == "hf-prefill"
-            else (
-                (args.prompt_context_length // args.tiled_attention_kv_tile) // args.tiled_attention_host_batch_tiles
-                if args.attention_mode == "tiled-stats-1k"
-                else None
-            )
+            (args.prompt_context_length // args.tiled_attention_kv_tile) // args.tiled_attention_host_batch_tiles
+            if args.attention_mode == "tiled-stats-1k"
+            else None
         ),
-        attention_host_reduction=(args.attention_mode == "tiled-stats-1k"),
+        attention_host_reduction=False,
+        attention_reduction_mode=attention_reduction_mode,
+        attention_reduction_kernel_count=len(attention_reduction_samples),
+        attention_reduction_kernel_seconds=attention_reduction_total,
         logits_evidence=logits_evidence,
         host_fallbacks=(),
         timed_kernel_count=len(timed_kernel_samples),
@@ -3567,67 +3873,10 @@ def _run_hardware_sequence(args: argparse.Namespace) -> Gemma3DecodeLoopProbeRes
         power_snapshot=power_snapshot,
         segmented_kernel_power_snapshot=segment_power.snapshot(),
         layer_evidence=tuple(layer_evidence),
-        remaining_paper_gaps=(
-            *(
-                ("npu-prefill-kv-cache-not-wired",)
-                if args.attention_mode == "tiled-stats-1k" and args.attention_cache_mode == "hf-prefill"
-                else ("prefill-kv-cache-not-constructed",)
-            ),
-            *(
-                ("paper-1k-kv-attention-not-wired",)
-                if args.attention_mode == "single-token"
-                else (
-                    (
-                        "prefill-produced-kv-cache-not-wired",
-                        "paper-1k-kv-attention-npu-reduction-not-wired",
-                    )
-                    if args.attention_cache_mode == "synthetic-prefill"
-                    else (
-                        ("paper-1k-kv-attention-npu-reduction-not-wired",)
-                        if args.attention_cache_mode == "hf-prefill"
-                        else ("paper-1k-kv-attention-production-cache-and-npu-reduction-not-wired",)
-                    )
-                )
-            ),
-            *(
-                (
-                    ("logits-sampling-host-timed-accounted",)
-                    if args.logits_timing == "included"
-                    else ("logits-sampling-host-diagnostic-only",)
-                )
-                if args.logits_mode == "host-tied-embedding"
-                else ("logits-sampling-not-wired",)
-            ),
-            *(
-                ("decode-layer-after-stitched-ingress-still-staged",)
-                if args.ingress_mode == "stitched"
-                else ()
-            ),
-            *(
-                ("decode-layer-after-stitched-attention-o-still-staged",)
-                if args.attention_o_mode == "stitched" and args.post_attention_mode != "stitched"
-                else ()
-            ),
-            *(
-                ("decode-layer-after-stitched-post-attention-residual-still-staged",)
-                if args.post_attention_mode == "stitched" and args.ffn_gate_up_mode != "stitched"
-                else ()
-            ),
-            *(
-                ("decode-layer-after-stitched-ffn-gate-up-still-staged",)
-                if args.ffn_gate_up_mode == "stitched" and args.ffn_geglu_down_mode != "stitched"
-                else ()
-            ),
-            *(
-                ("decode-layer-after-stitched-ffn-geglu-down-still-staged",)
-                if args.ffn_geglu_down_mode == "stitched" and args.post_feedforward_mode != "stitched"
-                else ()
-            ),
-            *(
-                ()
-                if static_projection_argument_mode == "manifest-contiguous-static-bo"
-                else ("production-contiguous-static-weight-bo-not-used-by-fused-dqp-route",)
-            ),
+        remaining_paper_gaps=_remaining_paper_gaps_for_args(
+            args,
+            static_projection_argument_mode=static_projection_argument_mode,
+            attention_reduction_mode=attention_reduction_mode,
         ),
         command=tuple(sys.argv),
         returncode=returncode,
@@ -3658,6 +3907,7 @@ def build_runtime_decode_loop_args(
     quantized_weights_dir: Path | None = None,
     force_quantized_weights: bool = False,
     power_sample: bool = False,
+    prefill_kv_cache: dict[int, tuple[Any, Any]] | None = None,
 ) -> argparse.Namespace:
     """Build the decode-loop runner namespace used by production runtime code."""
     attention_o_mode = "stitched" if stitched and attention_mode == "single-token" else "staged"
@@ -3682,6 +3932,7 @@ def build_runtime_decode_loop_args(
         post_feedforward_mode=stitched_mode,
         attention_mode=attention_mode,
         attention_cache_mode=attention_cache_mode,
+        prefill_kv_cache=prefill_kv_cache,
         tiled_attention_kv_tile=DEFAULT_TILED_ATTENTION_KV_TILE,
         tiled_attention_host_batch_tiles=DEFAULT_TILED_ATTENTION_HOST_BATCH_TILES,
         logits_mode=logits_mode,
@@ -3708,6 +3959,20 @@ def _self_test() -> None:
         static_norm_argument_bytes=2304,
         rms_correlation=0.999991,
         final_output_correlation=1.0,
+        stage_correlations={
+            "attention": 1.0,
+            "o_proj": 1.0,
+            "post_attention_norm": 1.0,
+            "attention_residual": 1.0,
+            "pre_feedforward_norm": 1.0,
+            "gate_proj": 1.0,
+            "up_proj": 1.0,
+            "mlp_activation": 1.0,
+            "down_proj": 1.0,
+            "post_feedforward_norm": 1.0,
+            "final_residual": 1.0,
+        },
+        first_failing_stage=None,
         projection_evidence=(),
         timed_kernel_count=57,
         timed_kernel_seconds=0.15,
@@ -3756,6 +4021,9 @@ def _self_test() -> None:
         attention_host_batch_tiles=None,
         attention_host_batch_count=None,
         attention_host_reduction=False,
+        attention_reduction_mode="not-required",
+        attention_reduction_kernel_count=0,
+        attention_reduction_kernel_seconds=None,
         logits_evidence=None,
         host_fallbacks=(),
         timed_kernel_count=1482,
@@ -3801,7 +4069,10 @@ def _self_test() -> None:
             "attention_cache_build_seconds": 2.0,
             "attention_cache_layer_count": 26,
             "attention_cache_token_count": 1024,
-            "attention_host_reduction": True,
+            "attention_host_reduction": False,
+            "attention_reduction_mode": "npu",
+            "attention_reduction_kernel_count": 26,
+            "attention_reduction_kernel_seconds": 0.026,
             "decode_input_mode": "hf-prefill-next-token",
             "logits_evidence": {
                 "mode": "host-tied-embedding",
@@ -3810,7 +4081,6 @@ def _self_test() -> None:
             },
             "remaining_paper_gaps": (
                 "npu-prefill-kv-cache-not-wired",
-                "paper-1k-kv-attention-npu-reduction-not-wired",
                 "logits-sampling-host-diagnostic-only",
             ),
         }
@@ -3828,8 +4098,6 @@ def _self_test() -> None:
     timed_host_logits_data["logits_evidence"]["timing_window"] = "included-in-measured-loop-wall"
     timed_host_logits_data["remaining_paper_gaps"] = (
         "npu-prefill-kv-cache-not-wired",
-        "paper-1k-kv-attention-npu-reduction-not-wired",
-        "logits-sampling-host-timed-accounted",
     )
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
         json.dump(timed_host_logits_data, handle)
@@ -3863,7 +4131,7 @@ def main() -> int:
     parser.add_argument("--ffn-geglu-down-mode", choices=["staged", "stitched"], default=DEFAULT_FFN_GEGLU_DOWN_MODE)
     parser.add_argument("--post-feedforward-mode", choices=["staged", "stitched"], default=DEFAULT_POST_FEEDFORWARD_MODE)
     parser.add_argument("--attention-mode", choices=["single-token", "tiled-stats-1k"], default=DEFAULT_ATTENTION_MODE)
-    parser.add_argument("--attention-cache-mode", choices=["repeated-current-token", "synthetic-prefill", "hf-prefill"], default=DEFAULT_ATTENTION_CACHE_MODE)
+    parser.add_argument("--attention-cache-mode", choices=["repeated-current-token", "synthetic-prefill", "hf-prefill", "production-prefill"], default=DEFAULT_ATTENTION_CACHE_MODE)
     parser.add_argument("--tiled-attention-kv-tile", type=int, default=DEFAULT_TILED_ATTENTION_KV_TILE)
     parser.add_argument("--tiled-attention-host-batch-tiles", type=int, default=DEFAULT_TILED_ATTENTION_HOST_BATCH_TILES)
     parser.add_argument("--logits-mode", choices=["none", "host-tied-embedding"], default="none")

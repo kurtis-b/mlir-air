@@ -42,6 +42,15 @@ DIAGNOSTIC_KV_CONTRACTS = {
     "single-current-token-kv",
     "repeated-current-token",
 }
+CONTRACT_ORDER = (
+    "production_prefill_artifacts",
+    "production_kv",
+    "decode_handoff",
+    "attention_reduction",
+    "static_bo_route",
+    "logits_sampling",
+    "paper_cell",
+)
 
 
 @dataclass(frozen=True)
@@ -463,6 +472,7 @@ def evaluate_contracts(
     prefill_result_path: Path,
     decode_result_path: Path,
     paper_result_path: Path | None = None,
+    through: str | None = None,
 ) -> tuple[ContractResult, ...]:
     prefill_result, prefill_load_blockers = _load_json_or_blocker(prefill_result_path, NPU_PREFILL_BLOCKER)
     decode_result, decode_load_blockers = _load_json_or_blocker(decode_result_path, GENERATE_PREFILL_BLOCKER)
@@ -519,6 +529,11 @@ def evaluate_contracts(
                 _dedupe((*paper_contract.blockers, *paper_load_blockers)),
             )
         results.append(paper_contract)
+    if through is not None:
+        names = [result.name for result in results]
+        if through not in names:
+            raise ValueError(f"--through={through} was requested but that contract was not evaluated")
+        results = results[: names.index(through) + 1]
     return tuple(results)
 
 
@@ -715,6 +730,7 @@ def main() -> int:
     parser.add_argument("--prefill-result", type=Path)
     parser.add_argument("--decode-result", type=Path)
     parser.add_argument("--paper-result", type=Path)
+    parser.add_argument("--through", choices=CONTRACT_ORDER, help="evaluate contracts through this gate and skip later gates")
     parser.add_argument("--allow-blocked", action="store_true")
     args = parser.parse_args()
 
@@ -742,6 +758,7 @@ def main() -> int:
         prefill_result_path=args.prefill_result,
         decode_result_path=args.decode_result,
         paper_result_path=args.paper_result,
+        through=args.through,
     )
     for result in results:
         print(result.format())

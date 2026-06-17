@@ -89,6 +89,7 @@ FLOWQKV_SCHEDULE_MODE ?= smoke
 FLOWKV_SCHEDULE_MODE ?= smoke
 FLOWQKV_KV_STAGING ?= pipeline
 FLOWKV_KV_STAGING ?= pipeline
+FLOWQKV_TILED_STATS_TILE_COUNT ?= 32
 FUSED_DQP_COL_BLOCKS ?= 1
 FUSED_DQP_COL_CHUNK ?= 32
 FUSED_DQP_PIPE_ROW_CHUNK ?= 16
@@ -125,8 +126,12 @@ RUNTIME_CACHE_DIR ?= $(BUILD_DIR)/runtime_cache/$(MODEL_VARIANT)
 RESULTS_DIR ?= $(srcdir)/results
 PREFILL_RESULT ?= $(RESULTS_DIR)/gemma3_1b_npu_prefill_runtime.json
 DECODE_RESULT ?= $(RESULTS_DIR)/gemma3_1b_npu_runtime_decode_loop.json
+PAPER_PREFILL_RESULT ?= $(RESULTS_DIR)/gemma3_1b_npu_1k_prefill_ttft.json
+PAPER_DECODE_RESULT ?= $(RESULTS_DIR)/gemma3_1b_npu_1k_decode_tps.json
+POWER_SAMPLE ?= 0
+POWER_SAMPLE_FLAG := $(if $(filter 1 true yes,$(POWER_SAMPLE)),--power-sample,)
 
-.PHONY: model-blockers model-prepare model-prefill model-generate model-validate model-loop
+.PHONY: model-blockers model-prepare model-prefill model-generate model-validate model-validate-production-kv model-validate-decode model-paper-cells model-loop
 
 all: run-q4nx run-mm run-fused-dqp run-flowqkv run-flowkv
 all-opt: run-q4nx-opt run-mm-opt run-fused-dqp-opt run-flowqkv-opt run-flowkv-opt
@@ -295,6 +300,13 @@ compile-flowqkv-tiled-stats-kernel: check-peano
 		-DQ_CHUNK=$(Q_CHUNK) -DKV_TILE=$(KV_CHUNK) -DHEAD_DIM=$(HEAD_DIM) \
 		-c $(srcdir)/aie_kernels/flow_attention_stats.cc -o $(BUILD_DIR)/flowqkv_tiled_stats.o
 
+compile-flowqkv-tiled-stats-merge-kernel: check-peano
+	mkdir -p $(BUILD_DIR)
+	$(PEANO_INSTALL_DIR)/bin/clang++ ${PEANOWRAP2P_FLAGS} \
+		-DTILE_COUNT=$(FLOWQKV_TILED_STATS_TILE_COUNT) -DHEAD_DIM=$(HEAD_DIM) \
+		-c $(srcdir)/aie_kernels/flow_attention_stats_merge.cc \
+		-o $(BUILD_DIR)/flowqkv_tiled_stats_merge_t$(FLOWQKV_TILED_STATS_TILE_COUNT)_d$(HEAD_DIM).o
+
 run-flowqkv-tiled-stats: compile-flowqkv-tiled-stats-kernel prepare-air-project
 	cp $(BUILD_DIR)/flowqkv_tiled_stats.o $(BUILD_DIR)/air_project/flowqkv_tiled_stats.o
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
@@ -329,6 +341,7 @@ model-prefill:
 		--quantized-weights $(QUANTIZED_WEIGHTS) \
 		--runtime-cache-dir $(RUNTIME_CACHE_DIR) \
 		--json \
+		$(POWER_SAMPLE_FLAG) \
 		--result-json $(PREFILL_RESULT)
 
 model-generate:
@@ -342,6 +355,7 @@ model-generate:
 		--quantized-weights $(QUANTIZED_WEIGHTS) \
 		--runtime-cache-dir $(RUNTIME_CACHE_DIR) \
 		--json \
+		$(POWER_SAMPLE_FLAG) \
 		--result-json $(DECODE_RESULT)
 
 model-validate:
@@ -353,6 +367,60 @@ model-validate:
 		--prefill-result $(PREFILL_RESULT) \
 		--decode-result $(DECODE_RESULT) \
 		--allow-blocked
+
+
+model-validate-production-kv:
+	$(RUN_PYTHON) -m gemma3.evidence.npu_runtime_contracts \
+		--model-variant $(MODEL_VARIANT) \
+		--prompt-len $(PROMPT_LEN) \
+		--decode-context $(DECODE_CONTEXT) \
+		--runtime-cache-dir $(RUNTIME_CACHE_DIR) \
+		--prefill-result $(PREFILL_RESULT) \
+		--decode-result $(DECODE_RESULT) \
+		--through production_kv
+
+model-validate-decode:
+	$(RUN_PYTHON) -m gemma3.evidence.npu_runtime_contracts \
+		--model-variant $(MODEL_VARIANT) \
+		--prompt-len $(PROMPT_LEN) \
+		--decode-context $(DECODE_CONTEXT) \
+		--runtime-cache-dir $(RUNTIME_CACHE_DIR) \
+		--prefill-result $(PREFILL_RESULT) \
+		--decode-result $(DECODE_RESULT) \
+		--through logits_sampling
+
+model-paper-cells:
+	$(RUN_PYTHON) -m gemma3.evidence.npu_runtime_contracts \
+		--model-variant $(MODEL_VARIANT) \
+		--prompt-len $(PROMPT_LEN) \
+		--decode-context $(DECODE_CONTEXT) \
+		--runtime-cache-dir $(RUNTIME_CACHE_DIR) \
+		--prefill-result $(PREFILL_RESULT) \
+		--decode-result $(DECODE_RESULT) \
+		--through logits_sampling
+	$(RUN_PYTHON) -m gemma3.evidence.npu_paper_cells \
+		--prefill-result $(PREFILL_RESULT) \
+		--decode-result $(DECODE_RESULT) \
+		--prefill-output $(PAPER_PREFILL_RESULT) \
+		--decode-output $(PAPER_DECODE_RESULT)
+	$(RUN_PYTHON) -m gemma3.evidence.npu_runtime_contracts \
+		--model-variant $(MODEL_VARIANT) \
+		--prompt-len $(PROMPT_LEN) \
+		--decode-context $(DECODE_CONTEXT) \
+		--runtime-cache-dir $(RUNTIME_CACHE_DIR) \
+		--prefill-result $(PREFILL_RESULT) \
+		--decode-result $(DECODE_RESULT) \
+		--paper-result $(PAPER_PREFILL_RESULT) \
+		--through paper_cell
+	$(RUN_PYTHON) -m gemma3.evidence.npu_runtime_contracts \
+		--model-variant $(MODEL_VARIANT) \
+		--prompt-len $(PROMPT_LEN) \
+		--decode-context $(DECODE_CONTEXT) \
+		--runtime-cache-dir $(RUNTIME_CACHE_DIR) \
+		--prefill-result $(PREFILL_RESULT) \
+		--decode-result $(DECODE_RESULT) \
+		--paper-result $(PAPER_DECODE_RESULT) \
+		--through paper_cell
 
 model-loop: model-blockers model-prepare model-prefill model-generate model-validate
 

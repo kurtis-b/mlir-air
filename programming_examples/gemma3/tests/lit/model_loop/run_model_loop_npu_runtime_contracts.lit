@@ -13,10 +13,8 @@
 # SELF: GEMMA3_NPU_RUNTIME_CONTRACTS_SELF_TEST: PASS
 
 # CURRENT: contract production_prefill_artifacts status=BLOCKED blockers=production-prefill-runtime-artifacts-not-cached
-# CURRENT: contract production_kv status=BLOCKED
-# CURRENT-SAME: production-prefill-runtime-arguments-not-bound
-# CURRENT: contract decode_handoff status=BLOCKED
-# CURRENT-SAME: generate-prefill-kv-cache-blocked
-# CURRENT: contract attention_reduction status=BLOCKED blockers=npu-attention-reduction-not-wired
-# CURRENT: contract static_bo_route status=BLOCKED blockers=production-contiguous-static-weight-bo-not-used-by-fused-dqp-route
-# CURRENT: contract logits_sampling status=BLOCKED blockers=logits-sampling-not-wired
+# CURRENT: contract production_kv status=PASS blockers=none
+# CURRENT: contract decode_handoff status=PASS blockers=none
+# CURRENT: contract attention_reduction status=PASS blockers=none
+# CURRENT: contract static_bo_route status=PASS blockers=none
+# CURRENT: contract logits_sampling status=PASS blockers=none

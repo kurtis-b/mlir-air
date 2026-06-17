@@ -199,15 +199,19 @@ def _resolve_weights_dir(model_variant: str, weights_dir: Path | None) -> Path:
 
 def _correlation(actual, expected) -> float:
     import numpy as np
-    from ml_dtypes import bfloat16
 
-    actual_flat = actual.reshape(-1)
-    expected_flat = expected.reshape(-1)
-    if actual.dtype == bfloat16:
-        actual_flat = actual_flat.astype(np.float64)
-    if expected.dtype == bfloat16:
-        expected_flat = expected_flat.astype(np.float64)
-    return float(np.corrcoef(actual_flat, expected_flat)[0, 1])
+    actual_flat = np.asarray(actual).reshape(-1).astype(np.float64)
+    expected_flat = np.asarray(expected).reshape(-1).astype(np.float64)
+    if actual_flat.shape != expected_flat.shape or actual_flat.size == 0:
+        return 0.0
+    if not np.all(np.isfinite(actual_flat)) or not np.all(np.isfinite(expected_flat)):
+        return 0.0
+    actual_std = float(actual_flat.std())
+    expected_std = float(expected_flat.std())
+    if actual_std == 0.0 or expected_std == 0.0:
+        return 1.0 if np.allclose(actual_flat, expected_flat) else 0.0
+    corr = float(np.corrcoef(actual_flat, expected_flat)[0, 1])
+    return corr if np.isfinite(corr) else 0.0
 
 
 def _is_decode_q_projection_substep_evidence(data: object, *, model_variant: str) -> bool:
