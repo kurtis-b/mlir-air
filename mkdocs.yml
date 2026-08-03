@@ -32,6 +32,8 @@ exclude_docs: |
   /vck190_microblaze_firmware.md
   /running.md
   /testing.md
+  # In-progress work plans: kept in the repo, off the published site.
+  /plans/
 
 # Source links (to repo files) and generated pages are handled at build time;
 # don't fail the build on links MkDocs can't resolve statically.
