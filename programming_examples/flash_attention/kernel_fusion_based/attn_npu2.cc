@@ -700,4 +700,78 @@ void apply_causal_mask(bfloat16 *g, int32_t q_block_idx, int32_t kv_block_idx) {
   }
 }
 
+#ifdef CAUSAL_ROW_HELPERS
+
+// ---------------------------------------------------------------------------
+// Causal-mask row helpers (opt-in, -DCAUSAL_ROW_HELPERS).
+//
+// apply_causal_mask above operates on the QK score tile G. These three operate
+// on the O accumulator and on individual rows, and exist for the case
+// apply_causal_mask's early return leaves unhandled: a KV block entirely above
+// the diagonal contributes nothing, so no matmul runs and the O tile is never
+// stored to. The downstream DMA still waits on a write, so the tile has to be
+// touched anyway.
+//
+// FOOTGUN: copy_O_tile_rows is numerically a no-op -- it reads every element
+// and writes it straight back. That is the point, not an oversight. Deleting
+// it as dead code hangs the design (ERT_CMD_STATE_TIMEOUT) because the
+// consuming DMA never sees its BD complete.
+//
+// copy_O_tile_rows assumes O carries the same column-major 8x8 tiled layout as
+// G (see apply_causal_mask): block(col_blk, row_blk) at
+// col_blk * (rows * 8) + row_blk * 64. store_row_value and copy_row_values, by
+// contrast, are plain contiguous-row operations with a scalar tail, so they are
+// safe on an untiled row of any length.
+// ---------------------------------------------------------------------------
+
+// Read-modify-write every element of a `rows` x dv O tile so the consuming DMA
+// observes a completed write even when the block contributed nothing.
+void copy_O_tile_rows(bfloat16 *out, const int32_t rows) {
+  SET_ROUNDING();
+  constexpr int BlkDim = 8;
+  constexpr int col_blocks = dv / BlkDim;
+
+  for (int32_t row_blk = 0; row_blk < rows / BlkDim; row_blk++) {
+    for (int32_t row_in = 0; row_in < BlkDim; row_in++) {
+      for (int32_t col_blk = 0; col_blk < col_blocks; col_blk++) {
+        const int32_t off = col_blk * (rows * BlkDim) +
+                            row_blk * (BlkDim * BlkDim) + row_in * BlkDim;
+        aie::vector<bfloat16, BlkDim> v = aie::load_v<BlkDim>(out + off);
+        aie::store_v(out + off, v);
+      }
+    }
+  }
+}
+
+// Fill `cols` contiguous elements with `value`. Used to push a fully masked
+// row to -inf before the softmax pass.
+void store_row_value(bfloat16 *row, const int32_t cols, const bfloat16 value) {
+  SET_ROUNDING();
+  constexpr int VecLen = 32;
+  aie::vector<bfloat16, VecLen> fill_vec =
+      aie::broadcast<bfloat16, VecLen>(value);
+  int32_t j = 0;
+  for (; j + VecLen <= cols; j += VecLen) {
+    aie::store_v(row + j, fill_vec);
+  }
+  for (; j < cols; ++j) {
+    row[j] = value;
+  }
+}
+
+// Copy `cols` contiguous elements. src and dst must not partially overlap.
+void copy_row_values(const bfloat16 *src, bfloat16 *dst, const int32_t cols) {
+  SET_ROUNDING();
+  constexpr int VecLen = 32;
+  int32_t j = 0;
+  for (; j + VecLen <= cols; j += VecLen) {
+    aie::store_v(dst + j, aie::load_v<VecLen>(src + j));
+  }
+  for (; j < cols; ++j) {
+    dst[j] = src[j];
+  }
+}
+
+#endif // CAUSAL_ROW_HELPERS
+
 } // extern "C"

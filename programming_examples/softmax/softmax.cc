@@ -127,7 +127,191 @@ bfloat16 __attribute__((always_inline)) compute_inv_as_bf16(float x) {
   return *inv_x;
 }
 
+#ifdef SOFTMAX_STREAMING
+
+// ---------------------------------------------------------------------------
+// Two-pass streaming softmax (opt-in, -DSOFTMAX_STREAMING).
+//
+// softmax_bf16 above is single-shot: one row, LUT-based exp, normalized in
+// place. The streaming family below instead splits softmax across repeated
+// calls over successive K blocks, carrying running max/sum state in a
+// caller-owned `scale_buffer` -- the FlashAttention online-softmax recurrence,
+// exposed as separate device entry points so a host-side K loop can drive it.
+//
+// SCALE BUFFER LAYOUT -- this is the footgun. `scale_buffer` is one bf16 array
+// of 4 * num_rows elements, read as four bands of num_rows:
+//
+//   band 0  [0*num_rows + row]  m_prev   running row max, previous block
+//   band 1  [1*num_rows + row]  m_cur    running row max, including this block
+//   band 2  [2*num_rows + row]  l        running denominator sum
+//   band 3  [3*num_rows + row]  scratch  per-row exp sum on the way IN to
+//                                        partial_softmax_rows_bf16; on the way
+//                                        OUT, the rescale factor
+//                                        exp2(m_prev - m_cur) that the caller
+//                                        must apply to the running O
+//                                        accumulator before adding this
+//                                        block's PV product
+//
+// Band 3 changing meaning inside a single call is deliberate (it saves a
+// buffer) and is the easiest thing to get wrong. Call order per K block is
+// fixed: init_softmax_scale_buffer once before the K loop, then
+// partial_softmax_rows_bf16 per block, then normalize_softmax_rows_bf16 once
+// after the loop. Calling normalize before the loop finishes divides by a
+// partial denominator.
+//
+// All exponentials are base-2 (log2e is folded into the scale), so this family
+// does NOT share the LUT tables that softmax_bf16 uses.
+// ---------------------------------------------------------------------------
+
+#ifndef SM_VEC_LEN
+#define SM_VEC_LEN 64
+#endif
+
+#ifndef SM_LOG2E
+#define SM_LOG2E 1.4453125f // bf16-representable 1.44269504089
+#endif
+
+// One K block of one row: rescale by `scale`, track the running max in
+// scale_buffer bands 0/1, write exp2(scaled - max) to `output` and this block's
+// exp sum to band 3. Does not normalize.
+static void partial_softmax_alias_bf16(
+    const bfloat16 *__restrict input_vector, bfloat16 *__restrict output_vector,
+    bfloat16 *__restrict scale_buffer, const int32_t vector_size,
+    const int32_t row_idx, const int32_t num_rows, const bfloat16 scale) {
+  event0();
+  ::aie::set_rounding(aie::rounding_mode::conv_even);
+
+  auto it_max_in = aie::cbegin_restrict_vector<SM_VEC_LEN>(input_vector);
+  auto it_exp_in = aie::cbegin_restrict_vector<SM_VEC_LEN>(input_vector);
+  auto it_exp_out = aie::begin_restrict_vector<SM_VEC_LEN>(output_vector);
+
+  aie::vector<bfloat16, SM_VEC_LEN> exp_val, input_bf16, scale_vec, max_val_vec;
+  aie::accum<accfloat, SM_VEC_LEN> exp_val_accum, scaled_accum, exp_in_accum;
+
+  float max_val = std::numeric_limits<float>::lowest();
+  const int elem_iters = vector_size / SM_VEC_LEN;
+
+  exp_val_accum = aie::zeros<accfloat, SM_VEC_LEN>();
+  scale_vec = aie::broadcast<bfloat16, SM_VEC_LEN>(scale);
+
+  for (int i = 0; i < elem_iters; i++) {
+    input_bf16 = *it_max_in++;
+    scaled_accum = aie::mul(input_bf16, scale_vec);
+    float running_max = aie::reduce_max(scaled_accum.to_vector<bfloat16>());
+    if (running_max > max_val) {
+      max_val = running_max;
+    }
+  }
+
+  // Band 1 becomes max(previous running max, this block's max); a block whose
+  // max does not beat the running one reuses the running value so the
+  // exponentials stay on the same reference.
+  if (max_val > (float)scale_buffer[row_idx]) {
+    scale_buffer[num_rows + row_idx] = (bfloat16)max_val;
+  } else {
+    scale_buffer[num_rows + row_idx] = scale_buffer[row_idx];
+    max_val = (float)scale_buffer[row_idx];
+  }
+
+  max_val_vec = aie::broadcast<bfloat16, SM_VEC_LEN>((bfloat16)max_val);
+
+  for (int i = 0; i < elem_iters; i++) {
+    input_bf16 = *it_exp_in++;
+    scaled_accum = aie::mul(input_bf16, scale_vec);
+    exp_in_accum = aie::sub(scaled_accum, max_val_vec);
+    exp_val = aie::exp2<bfloat16>(exp_in_accum.to_vector<float>());
+    exp_val_accum = aie::add(exp_val_accum, exp_val);
+    *it_exp_out++ = exp_val;
+  }
+
+  aie::vector<float, SM_VEC_LEN> reduce = exp_val_accum.to_vector<float>();
+  scale_buffer[3 * num_rows + row_idx] = (bfloat16)aie::reduce_add(reduce);
+
+  event1();
+}
+
+#endif // SOFTMAX_STREAMING
+
 extern "C" {
+
+#ifdef SOFTMAX_STREAMING
+
+// Reset the running softmax state: max to -inf, everything else to zero. Must
+// be called once before the first partial_softmax_rows_bf16 of a K loop.
+void init_softmax_scale_buffer(bfloat16 *scale_buffer, const int32_t num_rows) {
+  for (int32_t row = 0; row < num_rows; ++row) {
+    scale_buffer[row] = std::numeric_limits<bfloat16>::lowest();
+    scale_buffer[num_rows + row] = (bfloat16)0.0f;
+    scale_buffer[2 * num_rows + row] = (bfloat16)0.0f;
+    scale_buffer[3 * num_rows + row] = (bfloat16)0.0f;
+  }
+}
+
+// Straight bf16 copy. Exists so the host can snapshot or relocate the scale
+// buffer between launches without a round trip through L3.
+void copy_softmax_scale_bf16(const bfloat16 *__restrict input,
+                             bfloat16 *__restrict output,
+                             const int32_t num_elements) {
+  for (int32_t idx = 0; idx < num_elements; ++idx) {
+    output[idx] = input[idx];
+  }
+}
+
+// One K block of `num_rows` rows. Writes exp2(scaled - m_cur) to `output`,
+// folds this block into the running denominator (band 2), and leaves the O
+// rescale factor exp2(m_prev - m_cur) in band 3.
+void partial_softmax_rows_bf16(const bfloat16 *__restrict input,
+                               bfloat16 *__restrict output,
+                               bfloat16 *__restrict scale_buffer,
+                               const int32_t row_width,
+                               const int32_t num_rows) {
+  for (int32_t row = 0; row < num_rows; ++row) {
+    partial_softmax_alias_bf16(input + row * row_width,
+                               output + row * row_width, scale_buffer,
+                               row_width, row, num_rows, (bfloat16)SM_LOG2E);
+  }
+
+  for (int32_t row = 0; row < num_rows; ++row) {
+    const float m_prev = (float)scale_buffer[row];
+    const float m_cur = (float)scale_buffer[num_rows + row];
+    const float l_prev = (float)scale_buffer[2 * num_rows + row];
+    const float block_sum = (float)scale_buffer[3 * num_rows + row];
+    // reduce_max over a broadcast vector is a scalar exp2 -- aie::exp2 has no
+    // scalar overload, so the value is broadcast, exponentiated and reduced.
+    const bfloat16 max_diff_exp = aie::reduce_max(
+        aie::exp2<bfloat16>(aie::broadcast<float, SM_VEC_LEN>(m_prev - m_cur)));
+    scale_buffer[3 * num_rows + row] = max_diff_exp;
+    scale_buffer[2 * num_rows + row] =
+        (bfloat16)((float)max_diff_exp * l_prev + block_sum);
+    scale_buffer[row] = scale_buffer[num_rows + row];
+  }
+}
+
+// Divide each row by its accumulated denominator (band 2). Call once, after
+// the last partial_softmax_rows_bf16 of the K loop.
+void normalize_softmax_rows_bf16(const bfloat16 *__restrict input,
+                                 const bfloat16 *__restrict scale_buffer,
+                                 bfloat16 *__restrict output,
+                                 const int32_t row_width,
+                                 const int32_t num_rows) {
+  for (int32_t row = 0; row < num_rows; ++row) {
+    const bfloat16 inv_sum =
+        (bfloat16)aie::inv((float)scale_buffer[2 * num_rows + row]);
+    auto it_in =
+        aie::cbegin_restrict_vector<SM_VEC_LEN>(input + row * row_width);
+    auto it_out =
+        aie::begin_restrict_vector<SM_VEC_LEN>(output + row * row_width);
+    const int32_t elem_iters = row_width / SM_VEC_LEN;
+    for (int32_t i = 0; i < elem_iters; ++i) {
+      aie::vector<bfloat16, SM_VEC_LEN> in_vec = *it_in++;
+      auto out_acc =
+          aie::mul(in_vec, aie::broadcast<bfloat16, SM_VEC_LEN>(inv_sum));
+      *it_out++ = out_acc.to_vector<bfloat16>();
+    }
+  }
+}
+
+#endif // SOFTMAX_STREAMING
 
 void softmax_bf16(const bfloat16 *__restrict in, const int pos,
                   bfloat16 *__restrict out) {
