@@ -1,0 +1,27 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["work_completed", "work_not_completed", "blockers", "gate_files_touched"],
+  "properties": {
+    "work_completed": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "What you actually finished and verified. Do not list intentions."
+    },
+    "work_not_completed": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Work the phase document asked for that you did not finish. Be honest; the driver checks."
+    },
+    "blockers": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Anything that stopped you and needs a human decision."
+    },
+    "gate_files_touched": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Any test, .lit, Makefile, CMakeLists or registry JSON you created or modified, with a one-line reason for each. The driver fingerprints these independently; omitting one is detected."
+    }
+  }
+}

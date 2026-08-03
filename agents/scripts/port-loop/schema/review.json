@@ -1,0 +1,64 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "blocking", "non_blocking", "weakened_gates"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["pass", "fail"],
+      "description": "pass only if there are zero blocking findings AND zero weakened gates."
+    },
+    "summary": {
+      "type": "string",
+      "description": "Two sentences maximum: what this diff does, and whether it is sound."
+    },
+    "blocking": {
+      "type": "array",
+      "description": "Defects that must be fixed before this phase can advance. Empty if none.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "line", "summary", "why_it_breaks"],
+        "properties": {
+          "file": { "type": "string" },
+          "line": {
+            "type": ["integer", "null"],
+            "description": "1-indexed line, or null when the finding is file-level."
+          },
+          "summary": { "type": "string" },
+          "why_it_breaks": {
+            "type": "string",
+            "description": "Concrete failure: what input or condition produces what wrong result."
+          }
+        }
+      }
+    },
+    "non_blocking": {
+      "type": "array",
+      "description": "Improvements worth making that do not block advancing.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "line", "summary"],
+        "properties": {
+          "file": { "type": "string" },
+          "line": { "type": ["integer", "null"] },
+          "summary": { "type": "string" }
+        }
+      }
+    },
+    "weakened_gates": {
+      "type": "array",
+      "description": "ANY test, gate, tolerance, assertion or check that this diff weakened, deleted, narrowed, skipped or stubbed. A non-empty list halts the run unconditionally. Report suspicion here rather than staying silent.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "what_was_weakened"],
+        "properties": {
+          "file": { "type": "string" },
+          "what_was_weakened": { "type": "string" }
+        }
+      }
+    }
+  }
+}
