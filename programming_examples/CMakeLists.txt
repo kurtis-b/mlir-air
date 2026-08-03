@@ -162,4 +162,17 @@ add_lit_testsuite(check-programming-examples-llms-profile
 )
 set_target_properties(check-programming-examples-llms-profile PROPERTIES FOLDER "Tests")
 
+# Transformer-layer device-kernel suite: Peano object builds plus a symbol
+# check, no NPU dispatch and no HF download. Safe as a PR gate on any runner
+# that has Peano, which is why it is a target of its own rather than being
+# folded into the llms suites (those need an NPU and, for verify, a token).
+# Matched by path so the .lit filename does not have to encode anything.
+add_lit_testsuite(check-programming-examples-transformer-layer
+  "Running transformer-layer device kernel compile tests"
+  ${CMAKE_CURRENT_BINARY_DIR}
+  DEPENDS ${TEST_DEPENDS}
+  ARGS ${AIR_TEST_LIT_ARGS} --filter "transformer_layer/"
+)
+set_target_properties(check-programming-examples-transformer-layer PROPERTIES FOLDER "Tests")
+
 add_dependencies(check-all check-programming-examples)

@@ -131,7 +131,13 @@ def compile_silu_and_mul():
 
 
 def compile_gemm_mm(
-    tile_m=64, tile_n=128, tile_k_l1=32, sym_suffix="", out_name="mm.o"
+    tile_m=64,
+    tile_n=128,
+    tile_k_l1=32,
+    sym_suffix="",
+    out_name="mm.o",
+    gen_init=False,
+    gen_with_acc=False,
 ):
     """Compile mm.o from matrix_multiplication/bf16_in_fp32_out/mm_aie2p.cc.
 
@@ -146,6 +152,23 @@ def compile_gemm_mm(
     sym_suffix="_m64" (-> @op_has_no_registered_library_name_m64 etc.) and a
     distinct out_name="mm_m64.o". Default empty suffix / "mm.o" keeps the original
     names for single-variant ELFs (back-compat).
+
+    gen_init / gen_with_acc: emit the two opt-in kernel families used by the
+    staged transformer-layer pipelines. Both default OFF, and with both off the
+    object is byte-identical to what this function produced before they existed
+    -- that is deliberate, because ten shipped LLM deployments link this source.
+
+      gen_init      -> matmul_init_<in>_<out>(A, B, C)
+                       Zero-then-multiply: C is overwritten, not accumulated
+                       into, so it replaces the zero_* call before the first
+                       K-tile. Calling it for a later K-tile silently discards
+                       the partial sums.
+      gen_with_acc  -> matmul_with_acc_<in>_<out>(A, B, Acc, C)
+                       Partials read from an explicit Acc buffer, result written
+                       to a distinct C. Acc and C must share the tile layout and
+                       element type.
+
+    Both respect sym_suffix.
     """
     src = _PROJ_ROOT / "matrix_multiplication" / "bf16_in_fp32_out" / "mm_aie2p.cc"
     extra = [
@@ -161,6 +184,10 @@ def compile_gemm_mm(
     ]
     if sym_suffix:
         extra.append(f"-DSYM_SUFFIX={sym_suffix}")
+    if gen_init:
+        extra.append("-DGENERATE_MATMUL_INIT_KERNELS")
+    if gen_with_acc:
+        extra.append("-DGENERATE_MATMUL_WITH_ACC_KERNELS")
     _compile_kernel(src, out_name, extra_flags=extra, force=True)
 
 
@@ -176,7 +203,9 @@ def compile_rope():
     _compile_kernel(src, "rope.o")
 
 
-def compile_attn_npu2(head_dim=64, lkp=None, lqp_tile=None, force=False):
+def compile_attn_npu2(
+    head_dim=64, lkp=None, lqp_tile=None, force=False, causal_row_helpers=False
+):
     """Compile attn_npu2.o (FlashAttention kernel) from source.
 
     The attn_npu2.cc defines are PER-TILE, not per-launch (see the canonical
@@ -200,28 +229,31 @@ def compile_attn_npu2(head_dim=64, lkp=None, lqp_tile=None, force=False):
         lqp_tile: Q tile size (tile_size_q). Defaults to lkp.
         force: recompile even if attn_npu2.o exists (needed when the same CWD
             previously built a different-shaped .o, e.g. hd=64 then hd=128).
+        causal_row_helpers: also emit copy_O_tile_rows / store_row_value /
+            copy_row_values. Off by default. copy_O_tile_rows is numerically a
+            no-op by design -- it exists so a KV block entirely above the causal
+            diagonal, which runs no matmul, still completes the O tile's DMA
+            write. Without it that design hangs on ERT_CMD_STATE_TIMEOUT.
     """
     if lkp is None:
         lkp = head_dim
     if lqp_tile is None:
         lqp_tile = lkp
     src = _PROJ_ROOT / "flash_attention" / "kernel_fusion_based" / "attn_npu2.cc"
-    _compile_kernel(
-        src,
-        "attn_npu2.o",
-        extra_flags=[
-            "-DBIT_WIDTH=8",
-            f"-Dlqp={lqp_tile}",
-            f"-Dlkp={lkp}",
-            f"-Ddk={lkp}",
-            f"-Ddk_full={head_dim}",
-            f"-Ddv={lkp}",
-            f"-Ddv_full={head_dim}",
-            "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
-            "-DROUND_CONV_EVEN",
-        ],
-        force=force,
-    )
+    extra = [
+        "-DBIT_WIDTH=8",
+        f"-Dlqp={lqp_tile}",
+        f"-Dlkp={lkp}",
+        f"-Ddk={lkp}",
+        f"-Ddk_full={head_dim}",
+        f"-Ddv={lkp}",
+        f"-Ddv_full={head_dim}",
+        "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
+        "-DROUND_CONV_EVEN",
+    ]
+    if causal_row_helpers:
+        extra.append("-DCAUSAL_ROW_HELPERS")
+    _compile_kernel(src, "attn_npu2.o", extra_flags=extra, force=force)
     # Also create attn.o copy (some link_with attributes use "attn.o").
     # Refresh whenever attn_npu2.o exists so a force-rebuild (different tile
     # shape) doesn't leave a stale attn.o behind.
@@ -277,6 +309,149 @@ def compile_attn_decode_npu2(head_dim=64):
             f"-DHEAD_SIZE={head_dim}",
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
         ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Transformer-layer execution-study kernels
+#
+# These four live behind opt-in -D flags and are not built by
+# compile_all_external_kernels(); the transformer_layer example drives them
+# explicitly. Keeping them opt-in is what lets the shared LLM path keep
+# compiling byte-identical objects.
+# ---------------------------------------------------------------------------
+
+_TL_KERNELS = _PROJ_ROOT / "transformer_layer" / "kernels"
+
+# encoder.cc and addnorm_ffn.cc do `#include "zero.cc"`, which resolves against
+# this directory. They deliberately reuse the GEMM example's zero.cc rather than
+# carrying a fourth copy of it.
+_ZERO_CC_DIR = _PROJ_ROOT / "matrix_multiplication" / "bf16_in_fp32_out"
+
+
+def _tl_dim_flags(tile_m, tile_k, tile_n):
+    return [f"-DDIM_M={tile_m}", f"-DDIM_K={tile_k}", f"-DDIM_N={tile_n}"]
+
+
+def compile_encoder(
+    tile_m=64,
+    tile_k=64,
+    tile_n=64,
+    build_ffn=True,
+    build_addnorm=True,
+    out_name="encoder.o",
+):
+    """Compile encoder.o from transformer_layer/kernels/encoder.cc.
+
+    The encoder-block kernels backing the `ffn` and `addnorm` operators.
+
+    build_ffn / build_addnorm select which half of the file is emitted. They are
+    independent, and BOTH DEFAULT TO TRUE here even though the source emits
+    nothing when neither is defined -- an object with no symbols links silently
+    and fails much later at dispatch, so this wrapper refuses to produce one.
+
+    tile_m / tile_k / tile_n bake in the FFN matmul shape. The source
+    static_asserts DIM_M % 16, DIM_N % 16 and DIM_K % 8 under build_ffn; the
+    addnorm entry points ignore them entirely and take cols/rows at runtime.
+
+    FOOTGUN: encoder.o and addnorm_ffn.o both define ffn_gelu_bf16 and
+    ffn_eltwise_add_bf16_vector, so they cannot be linked into one ELF as-is.
+    """
+    if not build_ffn and not build_addnorm:
+        raise ValueError(
+            "compile_encoder: at least one of build_ffn / build_addnorm must be "
+            "set, otherwise encoder.o exports no symbols"
+        )
+    extra = _tl_dim_flags(tile_m, tile_k, tile_n) + [
+        f"-I{_ZERO_CC_DIR}",
+        "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
+    ]
+    if build_ffn:
+        extra.append("-DBUILD_FFN")
+    if build_addnorm:
+        extra.append("-DBUILD_ADDNORM")
+    _compile_kernel(_TL_KERNELS / "encoder.cc", out_name, extra_flags=extra, force=True)
+
+
+def compile_addnorm_ffn(
+    tile_m=64,
+    tile_k=64,
+    tile_n=64,
+    build_ffn=True,
+    build_addnorm=True,
+    pre_add=False,
+    out_name="addnorm_ffn.o",
+):
+    """Compile addnorm_ffn.o from transformer_layer/kernels/addnorm_ffn.cc.
+
+    One source covering what iron carried as two near-identical files
+    (addnorm_ffn.cc and addnorm_ffn_addnorm.cc), selected by `pre_add`:
+
+      pre_add=False (default)  statistics over `input`;
+                               out = gamma * norm(input) + residual
+      pre_add=True             statistics over `input + residual`;
+                               out1 = gamma * norm(input + residual), and the
+                               2-output form's out2 carries the raw pre-add sum
+                               forward as the next block's residual stream
+
+    Getting this backwards produces a plausible-looking activation that is
+    wrong by one residual add, which survives a shape check and shows up only as
+    drift in a per-layer cosine comparison.
+
+    tile_m / tile_k / tile_n bake in the FFN matmul shape. The static_asserts
+    here are tighter than encoder.cc's: up_proj needs DIM_N % 32 and down_proj
+    needs DIM_K % 32.
+    """
+    if not build_ffn and not build_addnorm:
+        raise ValueError(
+            "compile_addnorm_ffn: at least one of build_ffn / build_addnorm "
+            "must be set, otherwise addnorm_ffn.o exports no symbols"
+        )
+    extra = _tl_dim_flags(tile_m, tile_k, tile_n) + [
+        f"-I{_ZERO_CC_DIR}",
+        "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
+    ]
+    if build_ffn:
+        extra.append("-DBUILD_FFN")
+    if build_addnorm:
+        extra.append("-DBUILD_ADDNORM")
+    if pre_add:
+        extra.append("-DADDNORM_PRE_ADD")
+    _compile_kernel(
+        _TL_KERNELS / "addnorm_ffn.cc", out_name, extra_flags=extra, force=True
+    )
+
+
+def compile_layer_norm(vec_len=16, out_name="layer_norm.o"):
+    """Compile layer_norm.o from programming_examples/layer_norm/layer_norm.cc.
+
+    Exposes layer_norm, layer_norm_rows and add_layer_norm_rows -- the
+    multi-row forms the layer_norm example's direct-codegen builder does not
+    cover. `cols` must be a multiple of vec_len; there is no scalar tail, so a
+    non-multiple silently drops the remainder.
+    """
+    src = _PROJ_ROOT / "layer_norm" / "layer_norm.cc"
+    _compile_kernel(src, out_name, extra_flags=[f"-DLN_VEC_LEN={vec_len}"], force=True)
+
+
+def compile_softmax_streaming(vec_len=64, out_name="softmax_streaming.o"):
+    """Compile softmax_streaming.o from programming_examples/softmax/softmax.cc.
+
+    Emits the two-pass streaming family (init_softmax_scale_buffer,
+    partial_softmax_rows_bf16, normalize_softmax_rows_bf16,
+    copy_softmax_scale_bf16) alongside the file's existing single-shot
+    softmax_bf16. `vec_len` must divide the row width.
+
+    Written to a distinct out_name rather than softmax.o so a design that links
+    both the single-shot and the streaming object does not pick up two
+    definitions of softmax_bf16.
+    """
+    src = _PROJ_ROOT / "softmax" / "softmax.cc"
+    _compile_kernel(
+        src,
+        out_name,
+        extra_flags=["-DSOFTMAX_STREAMING", f"-DSM_VEC_LEN={vec_len}"],
+        force=True,
     )
 
 

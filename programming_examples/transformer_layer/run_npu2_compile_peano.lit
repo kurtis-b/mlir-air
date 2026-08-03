@@ -1,0 +1,24 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Transformer-layer device kernels: compile-only gate.
+//
+// Builds every AIE2P kernel that Phase A of the transformer-layer execution
+// studies ports, and checks each object is non-trivial and exports the entry
+// points its builder will call. Compiling is not the whole gate -- Peano emits
+// a valid, empty object when encoder.cc / addnorm_ffn.cc are built without
+// -DBUILD_FFN / -DBUILD_ADDNORM, so compile_kernels.py also enforces a size
+// floor and a per-object symbol list.
+//
+// No NPU is touched: these are Peano object files, not ELFs, and nothing is
+// dispatched. That is what makes this suite safe as a PR gate, and it is why
+// this test requires only `peano` and not `ryzen_ai_npu2` -- unlike the
+// flash_attention and llms lits, which do dispatch.
+//
+// REQUIRES: peano
+//
+// RUN: mkdir -p test_npu2_compile_peano
+// RUN: cd test_npu2_compile_peano
+// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile compile PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+// CHECK: Compilation passed.
