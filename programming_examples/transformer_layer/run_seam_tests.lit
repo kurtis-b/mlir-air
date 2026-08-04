@@ -1,0 +1,25 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase B runtime seam: host-only rules tests.
+//
+// Covers the BO liveness allocator (live ranges, slot sharing, the content-keyed
+// static pool, the dirty-bit discipline) and runlist aggregation (submission
+// grouping, the ELF-vs-xclbin argument ABI, the dispatch vector). The rules they
+// check are written down in
+// docs/plans/transformer-layer-execution-studies/05b-phase-b-buffer-rules.md.
+//
+// No NPU and no XRT: BoPool takes its allocator as a callable and the ABI
+// binding is tested against a fake run object, so this sits alongside the
+// compile-only kernel gate and requires neither `ryzen_ai_npu2` nor `peano`.
+// The hardware half of Phase B is `make runlist-gate`, which is not a lit test
+// because it needs a device and takes minutes.
+//
+// The test files carry no framework dependency -- pytest is not installed in the
+// sandbox venv -- so they run as plain scripts and print a pass count.
+//
+// RUN: python3 %S/../llms/shared/infra/test_bo_pool.py | FileCheck %s --check-prefix=POOL
+// POOL: 20/20 passed
+//
+// RUN: python3 %S/../llms/shared/infra/test_dispatch.py | FileCheck %s --check-prefix=DISPATCH
+// DISPATCH: 15/15 passed
