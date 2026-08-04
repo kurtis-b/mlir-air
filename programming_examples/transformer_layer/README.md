@@ -90,6 +90,9 @@ memory bank) all produce plausible wrong numbers rather than errors.
 | `builders/qkv_proj.py` | One GEMM over the fused `[K, 3K]` weight with C split three ways on the device, plus its FP32 reference |
 | `builders/gelu.py` | The FFN activation stage over `ffn_gelu_bf16`, plus its FP32 tanh-approximation reference |
 | `builders/ffn.py` | Staged up-projection / GeLU / down-projection composition, plus its FP32 reference |
+| `builders/mha_attention.py` | Attention staging: the seq-first FlashAttention design point, its kernel `-D` flags, and the chunked FP32 oracle |
+| `builders/o_proj.py` | O-projection staging: the registry lookup, the GEMM sub-kernel, and its FP32 oracle |
+| `builders/mha_out_proj.py` | The entry layer that composes the two into one ELF, plus the composed FP32 reference |
 | `run_npu2_<op>_peano.lit` | One per operator: that operator's numerical gate on a real NPU |
 | `run_npu2_fault_control_peano.lit` | Phase C's negative control: the injected run must FAIL |
 
@@ -222,6 +225,35 @@ disabling ping-pong, or by either lock-race-condition fix. Three L3→L1 streams
 per tile against a column's two shim MM2S channels is what distinguishes it from
 the two-stream builders next door, which loop fine. The symptom is
 partly-correct values, so it reads as a tolerance problem.
+
+**`copy_O_tile_rows` is numerically a no-op, and deleting it hangs the design.**
+It reads every element of a FlashAttention O tile and writes it straight back.
+That is the point: a KV block entirely above the causal diagonal runs no matmul,
+so without it the consuming DMA never sees its buffer descriptor complete and
+the run ends in `ERT_CMD_STATE_TIMEOUT`. It lives behind `-DCAUSAL_ROW_HELPERS`
+in `flash_attention/kernel_fusion_based/attn_npu2.cc` alongside
+`store_row_value` and `copy_row_values`; `mha_out_proj` links all three into
+every causal variant. It does not *call* them, because the masking path it
+composes (`apply_causal_mask`) fills a wholly-masked score tile with `-inf` and
+lets the matmul run anyway — they are the entry points a block-skipping variant
+needs, and keeping them linked is what lets one be added without re-deriving the
+flag set.
+
+**FlashAttention's `-D` flags are per *tile*, and a mismatch hangs rather than
+fails.** `-Dlqp` is the Q tile size (`parallel_seq / num_q_tiles`), not the Q
+chunk per launch; `-Ddk` / `-Ddv` are the `lkp`-sized tile while `-Ddk_full` /
+`-Ddv_full` are the full head dimension. They instantiate the matmul
+microkernels, so they must match the L1 buffer shapes the Python builder emits.
+`builders/mha_attention.py` derives both from one config dict so they cannot
+drift, and rebuilds with `force=True` because a shared working directory may
+hold an `attn_npu2.o` built for another shape.
+
+**`abs_err_max` is not the margin on an `atol`.** For an operator whose outputs
+span a wide dynamic range — causal attention, where the first rows attend to a
+handful of keys — the largest absolute error sits on a large-magnitude element
+that `rtol` already covers. `opcheck.py` records `atol_required`, the smallest
+`atol` the run would have passed at (`max(|a-e| - rtol*|e|)`), and that is the
+number an `atol` should be quoted against.
 
 **`-DDEBUG_AIE_KERNELS` needs a value.** The sources test
 `#if DEBUG_AIE_KERNELS == 0` / `== 1`; a bare `-DDEBUG_AIE_KERNELS` expands to

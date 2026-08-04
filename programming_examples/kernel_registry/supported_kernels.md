@@ -13,11 +13,11 @@ This is **documentation, not executable code** — it records results produced b
 
 **Status legend**: ✅ verified on real NPU2, accuracy in line with the bf16 standard · ⚠️ verified on real NPU2 but with a documented precision/coverage caveat · ❌ broken/missing
 
-> **Scope**: currently **GEMM**, **GEMV**, **RMSNorm**, **FlashAttention**, **Element-wise Add**, **SiLU-and-Mul**, **RoPE**, **LayerNorm**, **AddNorm**, **QKV Projection** and **FFN** — the registry is built up one verified kernel at a time. The core LLM leaf kernels are now covered; see [`README.md`](README.md) for the roadmap.
+> **Scope**: currently **GEMM**, **GEMV**, **RMSNorm**, **FlashAttention**, **Element-wise Add**, **SiLU-and-Mul**, **RoPE**, **LayerNorm**, **AddNorm**, **QKV Projection**, **FFN** and **MHA + Output Projection** — the registry is built up one verified kernel at a time. The core LLM leaf kernels are now covered; see [`README.md`](README.md) for the roadmap.
 >
-> The last four arrive with the encoder-style transformer block of the execution studies and are **correctness-only entries so far**: their throughput columns read `—` because Phase C gates numerics and nothing else. An entry here never carries an estimated number.
+> The last five arrive with the transformer block of the execution studies and are **correctness-only entries so far**: their throughput columns read `—` because Phase C gates numerics and nothing else. An entry here never carries an estimated number.
 >
-> QKV Projection and FFN are **composite** entries — they are built from the GEMM rows above rather than from a kernel of their own, and what they add is the launch structure between those GEMMs. Their `mean_rel_L1` is quoted next to the GEMM's for exactly that reason: it is how much the composition costs.
+> QKV Projection, FFN and MHA + Output Projection are **composite** entries — they are built from the rows above rather than from a kernel of their own, and what they add is the launch structure between them. Their `mean_rel_L1` is quoted next to the constituent kernel's for exactly that reason: it is how much the composition costs.
 
 ---
 
@@ -37,6 +37,7 @@ This is **documentation, not executable code** — it records results produced b
 | AddNorm (BF16) | [`details/AddNorm_bf16.md`](details/AddNorm_bf16.md) | — (correctness only; see the scope note) | ✅ |
 | QKV Projection (BF16, fused weight) | [`details/QKVProj_bf16.md`](details/QKVProj_bf16.md) | — (correctness only; see the scope note) | ✅ |
 | FFN, GeLU (BF16, staged) | [`details/FFN_bf16.md`](details/FFN_bf16.md) | — (correctness only; see the scope note) | ✅ |
+| MHA + Output Projection (BF16, fused) | [`details/MHAOutProj_bf16.md`](details/MHAOutProj_bf16.md) | — (correctness only; see the scope note) | ✅ |
 
 ---
 
@@ -246,6 +247,24 @@ This is **documentation, not executable code** — it records results produced b
 > **`mean_rel_L1 = 1.6e-2` is ~1.6× a single GEMM's**, and that gap is what the composition costs: the device stages the up-projection output in bf16 and the activation kernel carries bf16 intermediates, while the reference is FP32 end to end. Reproducing either in the oracle would hide exactly the error it introduces.
 >
 > **One of seven resolvable shapes.** A shape needs a high-precision registry entry for *both* directions, `(M, K, F)` and `(M, F, K)`; seven expansions satisfy that today (`2048×1024×2048`, `2048×1024×3072`, `2048×2048×6144`, `2048×2048×8192`, `2048×2560×4096`, `2048×2560×9728` and `2048×3072×8192`) and only the row above has been run on hardware. The other six are a coverage gap, not a known failure. The case matrix's remaining FFN shapes lack a high-precision entry on one side and the builder raises on them rather than guessing.
+
+---
+
+## MHA + Output Projection — tested shapes
+
+`y = softmax(Q Kᵀ / √d [+ causal mask]) V @ W_o`, the attention sublayer end to end in one ELF; shapes written `S×S, Hq/Hkv, d` with model width `E = Hq·d` and projection `S×E×E`. **Seq-first throughout**: the FlashAttention half writes `[S, E]`, which *is* the projection's `A` operand, so the fusion needs no transpose and no host step — only one dispatch instead of two. The attention half is `attn_npu2_seqfirst.py` and `attn_npu2.o` unmodified; what this entry adds is the launch structure. iron's `o_proj_acc_depth` is the projection's registry `tile_k_l2`. Full datapath in [`details/MHAOutProj_bf16.md`](details/MHAOutProj_bf16.md).
+
+| S×S | Hq/Hkv | d | causal | O GEMM | tile (m/kl2/kl1/n) | mean_rel_L1 | abs_err max | atol_required | mismatches | Used by | Status |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 512×512 | 8/8 | 64 | ✗ | drain | 32/256/32/128 | 4.64e-2 | 1.95e-2 | 1.85e-2 | 0 / 262144 | transformer-layer studies, attention sublayer | ✅ |
+| 512×512 | 8/8 | 64 | ✓ | drain | 32/256/32/128 | 3.58e-2 | 5.86e-2 | 4.88e-2 | 0 / 262144 | transformer-layer studies, decoder attention sublayer | ✅ |
+| 2048×2048 | 16/16 | 64 | ✓ | drain | 32/256/32/128 | 4.11e-2 | 5.08e-2 | 4.81e-2 | 0 / 2097152 | transformer-layer studies, prefill-sized attention sublayer | ✅ |
+
+> **`mean_rel_L1` sits in FlashAttention's band, not a GEMM's**, and that is the expected answer: the attention half *is* that kernel, and a projection whose own relative error is 4× smaller cannot pull the total down. The composition costs nothing measurable in relative terms.
+>
+> **`atol_required` — `max(|out−ref| − rtol·|ref|)`, the smallest `atol` the run would have passed at — is the column to read, not `abs_err max`.** Under causal masking the largest absolute error lands on a large-magnitude element `rtol` already covers: the first rows attend to a handful of keys, so `|y|` runs to 4.1 instead of 0.35 while the relative error is if anything lower. The causal rows carry `atol = 8e-2`, a 1.6× margin — below the registry's usual 2–3× and deliberately so, since `1e-1` is a hard ceiling and this datapath's honest error gets within a factor of two of it.
+>
+> **`head_dim = 64` throughout, on purpose**: `head_dim = 128` FlashAttention has been flaky (hang or NaN) on some NPU2 setups, and the builder rejects it rather than letting a mis-shaped call find that out on hardware. **No `fused-cast` projection has been run in this composition** — that method wants `runtime_loop_tiling_sizes=[2,2]` and this operator runs at `[1,1]` because the attention half needs it, so the combination is untested rather than known-good. Both are coverage gaps, not known failures.
 
 ---
 
