@@ -23,21 +23,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-
-@contextmanager
-def raises(exc_type, match=None):
-    """Minimal stand-in for `pytest.raises`, so the file needs no framework."""
-    try:
-        yield
-    except exc_type as exc:
-        if match is not None and match not in str(exc):
-            raise AssertionError(
-                f"{exc_type.__name__} raised but {match!r} not in {str(exc)!r}"
-            ) from exc
-        return
-    raise AssertionError(f"expected {exc_type.__name__}, nothing was raised")
-
-
 from shared.infra.bo_pool import (  # noqa: E402
     BoPool,
     BufferSpec,
@@ -46,6 +31,7 @@ from shared.infra.bo_pool import (  # noqa: E402
     compute_live_ranges,
     content_key,
     plan_pool,
+    plan_signature,
 )
 
 
@@ -242,6 +228,24 @@ def test_bin_size_rounds_up_to_a_page():
 # --- static / content-keyed pool ------------------------------------------
 
 
+def test_content_key_accepts_a_bfloat16_array():
+    """The dtype every static weight in this stack actually has.
+
+    `memoryview` refuses ml_dtypes' bfloat16 ('E' has no buffer-protocol format
+    code), so a content key computed the obvious way raises on exactly the arrays
+    it exists for. The key is over bytes, so the same bytes viewed as int16 key
+    identically.
+    """
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    arr = np.arange(64, dtype=np.float32).reshape(8, 8).astype(bfloat16)
+    key = content_key(arr)
+    assert key.startswith("sha256:")
+    assert key == content_key(arr.view(np.int16))
+    assert key != content_key(np.zeros((8, 8), dtype=bfloat16))
+
+
 def test_identical_static_content_shares_one_bo():
     """S1."""
     key = content_key(b"\x01" * 4096)
@@ -257,6 +261,88 @@ def test_identical_static_content_shares_one_bo():
     }
     plan = plan_pool(steps, specs, elf_abi=True)
     assert plan.slot_of["w_q"] == plan.slot_of["w_k"]
+
+
+def test_identical_static_content_at_different_xclbin_positions_does_not_share():
+    """S5: content keying is subordinate to the bank rule (C2).
+
+    Under the xclbin ABI the memory group comes from (kernel, arg index). Two
+    identical weights bound at different positions must get different BOs, or
+    the allocator banks one BO for whichever position it saw first and the other
+    kernel reads its weights through the wrong group — no error, wrong numbers.
+    """
+    key = content_key(b"\x03" * 4096)
+    steps = [
+        DispatchStep("k1", ("w_q", "x"), writes=(1,)),
+        DispatchStep("k2", ("y", "w_k"), writes=(0,)),
+    ]
+    specs = {
+        "w_q": spec("w_q", static=True, content_key=key),
+        "w_k": spec("w_k", static=True, content_key=key),
+        "x": spec("x"),
+        "y": spec("y"),
+    }
+    assert plan_pool(steps, specs, elf_abi=True).slot_of["w_q"] == (
+        plan_pool(steps, specs, elf_abi=True).slot_of["w_k"]
+    )
+    xcl = plan_pool(steps, specs, elf_abi=False)
+    assert xcl.slot_of["w_q"] != xcl.slot_of["w_k"]
+
+
+def test_identical_static_content_at_one_xclbin_position_still_shares():
+    """S1 survives S5: dedup is only given up where the bank differs."""
+    key = content_key(b"\x04" * 4096)
+    steps = [
+        DispatchStep("k", ("w_q", "x"), writes=(1,)),
+        DispatchStep("k", ("w_k", "y"), writes=(1,)),
+    ]
+    specs = {
+        "w_q": spec("w_q", static=True, content_key=key),
+        "w_k": spec("w_k", static=True, content_key=key),
+        "x": spec("x"),
+        "y": spec("y"),
+    }
+    plan = plan_pool(steps, specs, elf_abi=False)
+    assert plan.slot_of["w_q"] == plan.slot_of["w_k"]
+
+
+def test_each_static_slot_is_synced_even_at_one_content_key():
+    """S2 is per BO, not per content key.
+
+    The complement of the test above: once the bank rule has split one content
+    key across two slots, both BOs still have to be written. Tracking "already
+    synced" by content key would leave the second one holding whatever the
+    allocator gave it.
+    """
+    key = content_key(b"\x05" * 4096)
+    steps = [
+        DispatchStep("k1", ("w_q", "x"), writes=(1,)),
+        DispatchStep("k2", ("y", "w_k"), writes=(0,)),
+    ]
+    specs = {
+        "w_q": spec("w_q", static=True, content_key=key),
+        "w_k": spec("w_k", static=True, content_key=key),
+        "x": spec("x"),
+        "y": spec("y"),
+    }
+    plan = plan_pool(steps, specs, elf_abi=False)
+    pool, _ = make_pool()
+    assert pool.sync_to_device_if_needed("w_q", plan, specs) is True
+    assert pool.sync_to_device_if_needed("w_k", plan, specs) is True
+    assert pool.bo_for("w_q", plan).to_device == 1
+    assert pool.bo_for("w_k", plan).to_device == 1
+
+
+def test_a_slot_records_every_position_it_is_bound_at():
+    """C2: the allocator reads `slot_positions` rather than guessing from the
+    first use, so it can refuse a slot whose positions disagree on the bank."""
+    steps = [
+        DispatchStep("k1", ("in", "t"), writes=(1,)),
+        DispatchStep("k2", ("t", "out"), writes=(1,)),
+    ]
+    specs = {n: spec(n) for n in ("in", "t", "out")}
+    plan = plan_pool(steps, specs, elf_abi=False)
+    assert plan.slot_positions[plan.slot_of["t"]] == (("k1", 1), ("k2", 0))
 
 
 def test_writing_a_static_buffer_is_rejected():
@@ -344,6 +430,85 @@ def test_pool_footprint_is_smaller_than_one_bo_per_buffer():
     specs["t8"] = spec("t8", 1 << 20, host_output=True)
     plan = plan_pool(steps, specs, elf_abi=True)
     assert plan.footprint_bytes() < 9 * (1 << 20)
+
+
+# --- pool identity (O5) ----------------------------------------------------
+
+
+def _sig_steps():
+    return [
+        DispatchStep("k", ("in", "t0"), writes=(1,)),
+        DispatchStep("k", ("t0", "out"), writes=(1,)),
+    ]
+
+
+def _sig_specs():
+    s = {n: spec(n) for n in ("in", "t0", "out")}
+    s["out"] = spec("out", host_output=True)
+    return s
+
+
+def test_the_same_sequence_has_the_same_plan_signature():
+    """O5: this is what a pool is keyed on, so a re-run reuses its BOs.
+
+    `id(plan)` would not: every dispatch builds a fresh plan, so an id key
+    allocates a new pool and re-uploads every static weight on each call — and
+    CPython recycles the freed plan's id, which can hand that pool to an
+    unrelated sequence whose slots are sized and banked for other buffers.
+    """
+    first = plan_pool(_sig_steps(), _sig_specs(), elf_abi=True).signature
+    second = plan_pool(_sig_steps(), _sig_specs(), elf_abi=True).signature
+    assert first == second
+    assert hash(first) == hash(second)
+
+
+def test_the_plan_signature_separates_sequences_that_must_not_share_a_pool():
+    base = plan_pool(_sig_steps(), _sig_specs(), elf_abi=True).signature
+
+    resized = _sig_specs()
+    resized["t0"] = spec("t0", 1 << 20)
+    assert plan_pool(_sig_steps(), resized, elf_abi=True).signature != base
+
+    other_abi = plan_pool(_sig_steps(), _sig_specs(), elf_abi=False).signature
+    assert other_abi != base
+
+    reordered = list(reversed(_sig_steps()))
+    assert plan_pool(reordered, _sig_specs(), elf_abi=True).signature != base
+
+    rekeyed = _sig_specs()
+    rekeyed["in"] = spec("in", static=True, content_key="sha256:ff")
+    assert plan_pool(_sig_steps(), rekeyed, elf_abi=True).signature != base
+
+
+def test_a_spec_no_step_names_is_not_part_of_the_plan():
+    """`specs` may carry more than the sequence dispatches — a caller reusing one
+    spec table across sequences. Those entries get no slot: they have no position,
+    hence no memory group. The signature ignores them for the same reason, so two
+    such callers still share a pool.
+    """
+    extra = _sig_specs()
+    extra["unused"] = spec("unused", 1 << 20)
+    extra["unused_weight"] = spec("unused_weight", static=True, content_key="sha256:ab")
+    plan = plan_pool(_sig_steps(), extra, elf_abi=False)
+    assert "unused" not in plan.slot_of
+    assert "unused_weight" not in plan.slot_of
+    assert set(plan.slot_positions) == set(plan.bins)
+    assert plan_signature(_sig_steps(), extra, True) == plan_signature(
+        _sig_steps(), _sig_specs(), True
+    )
+
+
+def test_a_reused_pool_does_not_resync_a_resident_static():
+    """S2 across dispatches: the second run of a sequence skips the weight upload."""
+    key = content_key(b"\x06" * 4096)
+    steps = [DispatchStep("k", ("w", "x"), writes=(1,))]
+    specs = {"w": spec("w", static=True, content_key=key), "x": spec("x")}
+    pool, _ = make_pool()
+    for _ in range(3):
+        plan = plan_pool(steps, specs, elf_abi=True)  # a fresh plan each dispatch
+        pool.sync_to_device_if_needed("w", plan, specs)
+        assert pool.is_static_resident("w", plan) is True
+    assert pool.bo_for("w", plan_pool(steps, specs, elf_abi=True)).to_device == 1
 
 
 def test_slot_assignment_is_deterministic():

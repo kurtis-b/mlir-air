@@ -1,15 +1,24 @@
-# 05a — Phase B spike result: the multi-ELF runlist does not work on NPU2
+# 05a — Phase B spike result: the multi-ELF runlist works, but not the way 05-phase-b proposed
 
 [05-phase-b-runtime-seam.md](05-phase-b-runtime-seam.md) calls this the plan's load-bearing
-assumption and asks for it to be spiked before anything else starts. It was. **It fails.**
+assumption and asks for it to be spiked before anything else starts. It was, twice.
 
-This document records what was measured, so the finding is citable and nobody re-derives it.
+**The mechanism 05-phase-b proposed does not work. The capability it wanted does.** Several
+separately-compiled AIR ELFs cannot be bound into one `hw_context` — XRT rejects that three
+different ways, recorded in §§1–3 below. They do not need to be. `xrt::runlist` dispatches each
+entry against the context its *kernel* came from, so N ELFs means N `hw_context`s and still one
+runlist, and that is bit-identical to sequential dispatch and measurably faster (§5).
+
+The first pass of this spike tested only the shape 05-phase-b wrote down — everything into one
+context — found that every route to it fails, and concluded the multi-ELF runlist was impossible.
+That inference was wrong: it assumed runlist entries must share a context, which XRT does not
+require. §5 is the correction and `make runlist-gate` leg A is the standing measurement.
 
 | | |
 |---|---|
 | Measured on | NPU2 (`amdxdna` 2.21.0_20260514, firmware 1.1.2.64) |
 | XRT | 2.21.0, hash `4eb1f4392a012b4e6eca759762389c612537f7c7` |
-| Artifacts | Two separately-compiled AIR GEMM ELFs from `shared/builders/gemm_builder.py`, registry tiles |
+| Artifacts | Separately-compiled AIR GEMM ELFs from `shared/builders/gemm_builder.py`, registry tiles |
 | Reproduce | `make runlist-gate` in `programming_examples/transformer_layer/` |
 
 ## The claim that was tested
@@ -25,9 +34,9 @@ rl   = pyxrt.runlist(ctx); rl.add(pyxrt.run(kern)); ...
 ```
 
 The phase document already flagged this as "API-shape evidence, not hardware evidence". The
-overload signatures are real; the combination is not legal.
+overload signatures are real; the combination is not legal. §§1–3 are why.
 
-## What actually happens
+## What does not work: one context, several ELFs
 
 ### 1. A full ELF cannot be rebound into another context
 
@@ -44,10 +53,11 @@ overload to move.
 | `ext::kernel(ctx, module, name)` | ctx from **XCLBIN**, module **not** from a full ELF |
 | `ext::kernel(ctx, name)` | ctx from a **full ELF** |
 
-Passing a full-ELF module to the 3-arg form fails with *"xrt::module passed is created using
-full ELF"*; passing an xclbin context to the 2-arg form fails with *"xrt::hw_context passed is
-not created using full ELF"*. There is no combination that puts a second full ELF's kernel into
-an existing context.
+Passing a full-ELF context to the 3-arg form fails with *"xrt::hw_context passed is not created
+using XCLBIN"*; passing an xclbin context to the 2-arg form fails with *"xrt::hw_context passed is
+not created using full ELF"*. Asking a full-ELF context for another ELF's kernel by name fails
+with *"Unable to find group idx for given kernel"*. There is no combination that puts a second
+full ELF's kernel into an existing context.
 
 ### 3. `hw_context::add_config()` accepts exactly one ELF
 
@@ -63,7 +73,7 @@ The rejection is not a name collision. It was retested with every user-visible s
 distinct — entry function, AIR segment, and the generated `_Z4main...` arity (3-arg drain GEMM
 vs 4-arg fused-cast GEMM) — and with the identical ELF. One config ELF per context is the limit.
 
-### 4. Sharing one xclbin context across artifacts runs, and is silently wrong
+### 4. Sharing one *xclbin* context across artifacts runs, and is silently wrong
 
 The xclbin ABI *does* let one `hw_context` submit a runlist of runs carrying different
 instruction BOs. It executes without error. But the array configuration comes from the xclbin,
@@ -74,24 +84,54 @@ xgemm_512x512x512  : runlist == sequential -> True
 xgemm_1024x1024x1024: runlist == sequential -> False
 ```
 
-This is the dangerous failure mode: no exception, no timeout, wrong numbers. Any aggregation
-implementation must refuse to build such a runlist rather than emit it.
+This is the dangerous failure mode: no exception, no timeout, wrong numbers. It is why
+`plan_submissions` still splits at every artifact change **under the xclbin ABI** and raises
+`RunlistSplitError` rather than emitting such a runlist. §5 does not apply to the xclbin path and
+does not weaken this rule: there, the configuration lives in the xclbin behind the context, so
+the entry cannot bring its own.
 
-### 5. What does work: aggregation inside one artifact's context
+## 5. What does work: N contexts, one runlist
 
-A runlist over several runs of one artifact's kernel is bit-identical to sequential dispatch and
-measurably faster. The saving is one host submission — a fixed cost of order 100 µs — so it is
-large relative to small kernels and small relative to large ones:
+A `runlist` is constructed *against* a context, but it is not restricted *to* it. Each entry is
+an `xrt::run` over a kernel that already carries its own context, and XRT dispatches it there:
 
-| Pair | sequential (2 submissions) | runlist (1 submission) | |
-|---|---|---|---|
-| 512×512×512 GEMM ×2 | 0.888 ms | 0.774 ms | 1.15× |
-| 2048×2048×8192 GEMM ×2 (gate + up) | 19.37 ms | 19.04 ms | 1.02× |
+```python
+ctx_a = pyxrt.hw_context(dev, pyxrt.elf(elf_a))   # one context per ELF
+ctx_b = pyxrt.hw_context(dev, pyxrt.elf(elf_b))
+kern_a, kern_b = pyxrt.ext.kernel(ctx_a, name_a), pyxrt.ext.kernel(ctx_b, name_b)
 
-That ratio *is* the axis the study wants to measure: submission cost matters exactly to the
-degree that the work per submission is small. It also means a latency comparison on large
-kernels needs interleaved medians rather than two back-to-back blocks — thermal drift over a
-20 ms×15 benchmark is larger than a 300 µs effect. `runlist_gate.py` does that.
+rl = pyxrt.runlist(ctx_a)                          # any one of the contexts
+rl.add(run_of(kern_a)); rl.add(run_of(kern_b))     # entries from both
+rl.execute(); rl.wait()
+```
+
+Measured on the study's own artifacts — three separately-compiled fused-cast GEMM ELFs at the
+Llama-3.2-1B seq_len-2048 projection shapes (2048×2048×2048, 2048×2048×8192, 2048×8192×2048):
+
+- **Bit-identical to sequential dispatch**, for every entry, with the output BOs filled with
+  `0xA5` first so a skipped entry cannot pass by leaving the baseline's bytes in place.
+- **Independent of ordering**: `ABC`, `CBA` and `BAC` all match.
+- **Independent of which context hosts the runlist**: building it on A's, B's or C's context all
+  match, including a context whose ELF is not among the entries' first.
+- **Repeatable**: one runlist object executed four times, correct each time.
+- Three full-ELF `hw_context`s live simultaneously on one device is fine. The study's `runlist`
+  mode wants 29; that number has not been probed and is the remaining scaling question.
+
+Latency, interleaved medians (alternating sequential and aggregated, because the effect is
+smaller than thermal drift across two back-to-back blocks):
+
+| Entries | sequential | runlist | | runlist wins |
+|---|---|---|---|---|
+| 3 distinct ELFs (q, gate, down), 25 pairs | 20.826 ms | 19.949 ms | 1.044× | 25/25 |
+| 3 distinct ELFs, gate run, 15 pairs | 20.236 ms | 19.770 ms | 1.024× | 15/15 |
+| 2 entries on one ELF (gate + up), 15 pairs | 19.591 ms | 19.056 ms | 1.028× | 14/15 |
+| 512×512×512 GEMM ×2, one ELF | 0.888 ms | 0.774 ms | 1.15× | |
+
+The saving is one host submission — a fixed cost of order 100 µs — so it is large relative to
+small kernels and small relative to large ones. That ratio *is* the axis the study wants to
+measure: submission cost matters exactly to the degree that the work per submission is small.
+The win count is reported alongside the median because at these sizes a median that moved by less
+than the sample spread would not be a measurement.
 
 ### 6. Unrelated defect found en route: the standalone drain GEMM ELF is single-shot
 
@@ -126,47 +166,56 @@ them; they are not optional.
 ## Consequences for the plan
 
 Per 05-phase-b: *"If this fails, `runlist` and `coarse` collapse into `offload` and the study
-loses its central axis."*
-
-Concretely:
+loses its central axis."* It does not fail. Concretely:
 
 - **`runlist` (29 kernels, 42 entries) and `coarse` (5–6 kernels, 12 entries) as specified in
-  [01-port-inventory.md](01-port-inventory.md) cannot be built from separately-compiled ELFs.**
-  Their entries span artifacts, and artifacts cannot share a context.
-- `offload` and `fused_elf` are unaffected — both are already single-artifact-per-submission.
-- The taxonomy in [03-measurement-model.md](03-measurement-model.md) still has four distinct
-  points, but the middle two must be reached differently.
+  [01-port-inventory.md](01-port-inventory.md) can be built from separately-compiled ELFs**, one
+  `hw_context` per artifact. The taxonomy in [03-measurement-model.md](03-measurement-model.md)
+  keeps four distinct points, reached as originally intended.
+- The open question is **how many concurrent `hw_context`s NPU2 grants**. Three is measured; 29
+  is not. If the device runs out it says so — `xrt.hw_context` raises at load time — so the
+  failure would be an exception during `ensure_loaded`, not a quietly wrong number. Reaching 29
+  would then need the sequence broken into groups, and the dispatch vector would report the
+  resulting submission count honestly.
+- One xclbin merge (iron's `aiecc --xclbin-input`) is still a non-goal, and is now also
+  unnecessary. Route 2 below is still the only way to reconfigure *within* one context.
 
-### The three remaining routes, and why none is a Phase B change
+### Routes that remain relevant
 
 1. **One xclbin containing every design** — iron's `aiecc --xclbin-input` incremental merge.
-   Explicitly a non-goal in [00-context-and-goals.md](00-context-and-goals.md) and dropped in
-   the port inventory.
+   Explicitly a non-goal in [00-context-and-goals.md](00-context-and-goals.md), dropped in the
+   port inventory, and no longer needed for aggregation.
 2. **Control-packet reconfiguration between entries.** `test/xrt/24_ctrlpkt_config_2gemms_4x4`
    proves the mechanism on this repository: one base xclbin, one kernel, and alternating
-   *(reconfigure, run)* pairs in a single runlist. aiecc exposes the parts
-   (`--generate-ctrl-pkt-overlay`, `--ctrlpkt-elf-name`, `--load-pdi-to-ctrl-pkt`), but
-   `XRTBackend` exposes none of them and `aircc` does not drive them. This is a new compilation
-   path, not a runtime seam.
-3. **One ELF holding several `aie.device`s switched by `load_pdi`.** aiecc's `--elf-name` takes a
-   `{0}` multi-device template and `--expand-load-pdis` exists to avoid full PDI reloads. This is
-   a single `aircc` invocation, so the artifacts are not separately compiled — it is the
-   `fused_elf` point of the taxonomy reached from a different direction.
+   *(reconfigure, run)* pairs in a single runlist. Still the only route that puts several designs
+   through *one* context, which matters if the concurrent-context limit turns out to bind. aiecc
+   exposes the parts (`--generate-ctrl-pkt-overlay`, `--ctrlpkt-elf-name`,
+   `--load-pdi-to-ctrl-pkt`), but `XRTBackend` exposes none of them and `aircc` does not drive
+   them. A new compilation path, not a runtime seam.
+3. **One ELF holding several `aie.device`s switched by `load_pdi`.** A single `aircc` invocation,
+   so the artifacts are not separately compiled — the `fused_elf` point of the taxonomy reached
+   from a different direction.
 
-Route 2 is the one that preserves the study's axis. It needs a decision and a phase of its own.
+## What Phase B shipped
 
-## What Phase B shipped instead
-
-The runtime seam was built to the constraint rather than around it:
-
-- `shared/infra/dispatch.py` aggregates a dispatch sequence into runlists, submits one runlist
-  per artifact context, and **raises** `RunlistSplitError` rather than emitting a runlist whose
-  entries span configurations (failure mode 4 above).
+- `shared/infra/dispatch.py` aggregates a dispatch sequence into runlists. Under the ELF ABI the
+  whole sequence is one submission whatever artifacts it spans; under the xclbin ABI it splits at
+  every artifact change and **raises** `RunlistSplitError` rather than emitting the runlist §4
+  measured to be silently wrong.
+- Each entry's run is built from *its own* artifact's kernel. Taking the submission's first
+  kernel for every entry would execute the wrong program with the right buffers.
 - The dispatch vector records the *true* `host_submissions_per_layer`, so a sequence that had to
   be split reports the split honestly instead of claiming one submission.
-- BO pooling, dirty-bit sync and the dispatch vector are independent of this blocker and are
-  complete.
+- BO pooling, dirty-bit sync and the dispatch vector are independent of all of this and are
+  complete. The buffer rules are in [05b-phase-b-buffer-rules.md](05b-phase-b-buffer-rules.md).
+  Measured on the same five-GEMM layer, with the B operands declared static as a real layer's
+  weights are: 18 declared buffers land on 15 pool slots, the whole layer runs as **one**
+  submission, and the second dispatch of the same sequence is bit-identical to the first while
+  moving **117 MB less** — 10 sync boundaries instead of 15, because the weights are already
+  resident. That reuse depends on pools being keyed by sequence value rather than by plan object
+  identity (O5); keyed the other way the second pass re-uploads all 117 MB and nothing fails
+  loudly enough to notice.
 
-The gate's numerical-identity and lower-latency requirements are met for aggregation within an
-artifact and are **not** met across artifacts. `make runlist-gate` reports both, and fails on
-the cross-artifact leg rather than reporting a pass.
+`make runlist-gate` measures every claim above on every run: leg A the cross-artifact runlist,
+leg A2 the xclbin refusal, leg B within-artifact aggregation, leg C the whole layer through
+`KernelCache.run_sequence` in one submission, leg D the drain defect.

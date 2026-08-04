@@ -108,4 +108,9 @@ measurement model needs revisiting before Phase F consumes it.
   the others within 0.6%. This is a property of host-mediated dispatch, not a bug. The
   comparator's wider tolerances for it must be preserved.
 - If Phase B's multi-ELF runlist assumption failed, `runlist` and `coarse` cannot be built as
-  specified and this phase must be rescoped.
+  specified and this phase must be rescoped. **It did not** — one `hw_context` per ELF and one
+  runlist across them is bit-identical to sequential dispatch and measurably faster
+  ([05a §5](05a-phase-b-runlist-spike-result.md)). What is still unmeasured is how many
+  concurrent `hw_context`s NPU2 grants: three is confirmed, `runlist` wants 29. If that binds it
+  binds loudly — `xrt.hw_context` raises at load time rather than returning wrong numbers — so
+  the rescope would be forced by an exception, not discovered in the results.

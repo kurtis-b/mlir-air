@@ -329,7 +329,7 @@ class KernelCache:
         self.launch_counts = {}  # name -> {"air_launches":.., "herd_launches":..}
         self._loaded = {}  # name -> (backend, invoker) for XRT context reuse
         self._cached_bos = {}  # name -> list of xrt.bo for BO reuse
-        self._pools = {}  # id(plan) -> BoPool, for run_sequence
+        self._pools = {}  # PoolPlan.signature -> BoPool, for run_sequence
         self._instr_synced = set()  # artifact names whose instruction BO is resident
         # Pool of BOs shared across bo_keys (see shared_nonstatic in
         # load_and_run). Keyed by (name, arg_index, size_bytes) so every
@@ -467,13 +467,20 @@ class KernelCache:
     def pool_for(self, plan, alloc, sync_to_device, sync_from_device):
         """The `BoPool` backing one `PoolPlan`, created on first use.
 
-        Keyed by plan identity, so a caller that re-runs the same sequence keeps
-        its slots — which is the point: the pool is what makes the second and
-        subsequent invocations cheap.
+        Keyed by `plan.signature` — the sequence's *value* identity — so a caller
+        that re-runs the same sequence keeps its slots and its resident static
+        weights. That is the point of the pool: the second and subsequent
+        invocations skip both the allocation and the weight upload.
+
+        Not keyed by `id(plan)`. Every `run_sequence` builds a fresh plan, so an
+        id key would allocate a new pool and re-upload every weight on each call,
+        and — because CPython recycles the id of the plan it just freed — could
+        instead hand a stale pool to an unrelated sequence, whose slots are sized
+        and banked for buffers that are no longer there.
         """
         from shared.infra.bo_pool import BoPool
 
-        key = id(plan)
+        key = plan.signature
         if key not in self._pools:
             self._pools[key] = BoPool(alloc, sync_to_device, sync_from_device)
         return self._pools[key]

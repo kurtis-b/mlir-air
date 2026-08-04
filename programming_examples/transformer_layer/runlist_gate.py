@@ -5,16 +5,20 @@
 
 Builds the separately-compiled GEMM ELFs the study's `offload` and `runlist` modes
 dispatch — projection GEMMs of one Llama-3.2-1B decoder layer at seq_len 2048,
-with tiles and method taken from `kernel_registry` — and then runs four legs
+with tiles and method taken from `kernel_registry` — and then runs five legs
 against them:
 
-  A. **cross-artifact runlist** — the gate's requirement. Two *different* ELFs in
-     one runlist. This is what 05-phase-b assumed would work.
+  A. **cross-artifact runlist** — the gate. Three *different* ELFs (q, gate and
+     down projections, three distinct shapes) in one runlist, bit-exact against
+     sequential dispatch and timed against it.
+  A2. the seam still **refuses** the one aggregation that is silently wrong: a
+     cross-artifact runlist under the xclbin ABI.
   B. **same-artifact aggregation** — the gate and up projections share a shape,
-     hence one ELF, so their two dispatches can share one runlist. Checked
-     bit-exact against sequential dispatch and timed against it.
+     hence one ELF, so their two dispatches can share one runlist. Isolates the
+     submission saving from the cost of building the entries.
   C. **`KernelCache.run_sequence`** — the whole layer through the new seam, with
-     BO pooling and dirty-bit sync, bit-exact against per-GEMM `load_and_run`.
+     BO pooling and dirty-bit sync, in one submission, bit-exact against per-GEMM
+     `load_and_run`, run twice to prove the pool is reused.
   D. informational only: the pre-existing single-shot defect in the standalone
      drain GEMM ELF. See `LAYER_GEMMS` for why it is not part of the gate.
 
@@ -23,13 +27,12 @@ element-wise against an FP32 numpy oracle at the repository's bf16 GEMM
 tolerance, because "identical to sequential dispatch" proves nothing if
 sequential dispatch is itself wrong.
 
-Leg A does not pass on XRT 2.21.0 / NPU2 and this script says so and exits
-non-zero. The measurements behind that are written up in
-`docs/plans/transformer-layer-execution-studies/05a-phase-b-runlist-spike-result.md`;
-the short version is that an AIR ELF is a *full* ELF — it carries its own array
-configuration — and a `hw_context` accepts exactly one of those. Legs B and C are
-what the seam can actually deliver and are reported separately so the difference
-is visible rather than averaged away.
+The one thing that does **not** work is what 05-phase-b proposed: binding several
+full ELFs into a single `hw_context`. XRT rejects that three separate ways, and
+`docs/plans/transformer-layer-execution-studies/05a-phase-b-runlist-spike-result.md`
+records each. Aggregation does not need it — `xrt.runlist` dispatches each entry
+against the context its kernel came from, so N ELFs means N contexts and still
+one runlist.
 
 Run it under the repository's NPU lock, which is a different inode from the
 `/tmp/npu.lock` `KernelCache` serializes on:
@@ -49,9 +52,13 @@ Footguns:
 - **Leg B needs two dispatches of one artifact to be a fair comparison.** Gate and
   up are that pair in a real layer; do not substitute two runs of the same
   buffers, which would measure a warm cache rather than aggregation.
-- **Leg A must run last.** Probing the multi-ELF API costs an extra `hw_context`
-  on a device that already holds one per loaded artifact, and leaving it alive
-  moves both the numerics and the timings of anything measured after it.
+- **Clobber the outputs before checking bit-identity.** Both aggregation legs
+  reuse the BOs the sequential baseline wrote, so an entry the runlist silently
+  skipped would still hold the right bytes. Leg A fills them with 0xA5 first.
+- **A runlist saves one host submission, a fixed cost of order 100 us.** On these
+  multi-millisecond GEMMs that is a few percent, which is smaller than thermal
+  drift across a back-to-back benchmark. `interleaved_medians` alternates and
+  reports the win count for that reason; do not replace it with two blocks.
 """
 
 import argparse
@@ -72,14 +79,15 @@ from shared.builders.gemm_builder import (  # noqa: E402
     _build_gemm_module,
     gemm_registry_config,
 )
-from shared.infra.bo_pool import BufferSpec, DispatchStep  # noqa: E402
+from shared.infra.bo_pool import BufferSpec, DispatchStep, content_key  # noqa: E402
 from shared.infra.cache import KernelCache, Profiler  # noqa: E402
 from shared.infra.dispatch import RunlistSplitError, plan_submissions  # noqa: E402
 
 #: Llama-3.2-1B decoder-layer projection GEMMs at seq_len 2048, as (label, M, K, N).
 #: q/o and gate/up each share a shape, so these five compile to three distinct
-#: ELFs — which is what makes same-artifact aggregation measurable even though
-#: cross-artifact aggregation is unavailable.
+#: ELFs. That mix is deliberate: leg A needs genuinely different artifacts and
+#: leg B needs two dispatches of one, and both have to come from a real layer
+#: rather than from a shape chosen to make the measurement convenient.
 #:
 #: The layer's K and V projections (2048x2048x512) are **not** here. The registry
 #: picks the `drain` method for that shape, and a standalone drain ELF is correct
@@ -238,73 +246,175 @@ def sequential_reference(cache, specs, arrays):
     return out, ok
 
 
-def leg_a_cross_artifact_runlist(cache, specs):
-    """The gate's requirement: two different ELFs, one runlist.
+def upload_bos(backend, arrays_for_label):
+    """One `xrt.ext.bo` per host array, filled and synced to device.
 
-    Returns (passed, detail). Never builds the runlist when the artifacts differ:
-    05a §4 measured that such a runlist executes and returns wrong numbers with no
-    error raised, so emitting it to "see what happens" would corrupt the very
-    comparison the gate exists to make.
-
-    Runs **last**, and drops its XRT objects before returning. Probing the API
-    means creating an extra `hw_context` on a device that already holds one per
-    loaded artifact; leaving it alive perturbs both the numerics and the timing of
-    anything measured afterwards.
+    `xrt.ext.bo` carries no memory group, so a BO allocated against one
+    artifact's device is usable by any artifact's kernel — which is what lets the
+    cross-artifact runlist below share the pool the sequential baseline used.
     """
-    import gc
-
     import pyxrt as xrt
 
-    a, b = artifact_name(2048, 2048, 2048), artifact_name(2048, 2048, 512)
-    detail = []
+    bos = []
+    for arr in arrays_for_label:
+        bo = xrt.ext.bo(backend.device, arr.size * arr.itemsize)
+        src = np.frombuffer(
+            arr.view(np.int16) if arr.dtype == bfloat16 else arr, dtype=np.uint8
+        )
+        np.copyto(
+            np.frombuffer(bo.map(), dtype=np.uint8, count=len(src)), src, casting="no"
+        )
+        bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+        bos.append(bo)
+    return bos
 
-    # 1. What the seam does: refuse, with the reason.
+
+def interleaved_medians(sequential, aggregated):
+    """Median of alternating (sequential, aggregated) pairs, plus the win count.
+
+    The saving is one host submission — a fixed cost of order 100 us — so on
+    multi-millisecond GEMMs it is a low single-digit percentage, and thermal
+    drift across a back-to-back A-then-B benchmark is larger than the effect.
+    Alternating and taking medians removes the drift; two separate blocks do not.
+    The win count is reported alongside because a median that moved by less than
+    the sample spread is not a measurement.
+    """
+
+    def once(fn):
+        t0 = time.perf_counter()
+        fn()
+        return (time.perf_counter() - t0) * 1000.0
+
+    for _ in range(WARMUP_ITERS):
+        sequential()
+        aggregated()
+    seq_samples, agg_samples = [], []
+    for _ in range(TIMED_ITERS):
+        seq_samples.append(once(sequential))
+        agg_samples.append(once(aggregated))
+    wins = sum(1 for s, a in zip(seq_samples, agg_samples) if a < s)
+    return float(np.median(seq_samples)), float(np.median(agg_samples)), wins
+
+
+def report_timing(seq_ms, agg_ms, wins, entries):
+    saved = seq_ms - agg_ms
+    print(
+        f"    sequential ({entries} submissions) {seq_ms:.3f} ms   "
+        f"runlist (1 submission) {agg_ms:.3f} ms   "
+        f"saved {saved * 1000:.0f} us ({seq_ms / agg_ms:.4f}x)"
+    )
+    print(f"    runlist faster in {wins}/{TIMED_ITERS} interleaved pairs")
+    return saved
+
+
+def leg_a_cross_artifact_runlist(cache, specs, arrays, reference):
+    """The gate: several *different* ELFs in one runlist.
+
+    Three of the layer's projections — q, gate and down — have three distinct
+    shapes, so they are three separately compiled artifacts. Each is loaded into
+    its own `hw_context`; the runlist is built on one of those contexts and
+    carries a run of every artifact's kernel. Checked bit-exact against the
+    sequential `load_and_run` baseline and timed against sequential dispatch of
+    the same three runs.
+
+    This is what 05-phase-b assumed and what 05a first reported as impossible.
+    Both are half right: the ELFs cannot be merged into *one* context (05a §§1-3
+    stand), but they do not need to be. `xrt.runlist` dispatches each entry
+    against the context its kernel came from, so N contexts and one runlist
+    aggregate correctly. Every ordering, and every choice of which context hosts
+    the runlist, was measured bit-identical.
+    """
+    import pyxrt as xrt
+
+    labels = ("q_proj", "gate_proj", "down_proj")
+    shape_of = {label: (m, k, n) for label, m, k, n in LAYER_GEMMS}
+    names = [artifact_name(*shape_of[label]) for label in labels]
+    if len(set(names)) != len(names):
+        raise AssertionError(
+            f"leg A needs distinct artifacts, got {names} — this leg is the gate "
+            "and cannot be run on one ELF"
+        )
+
+    backends = {}
+    for label, name in zip(labels, names):
+        _, entry = specs[name]
+        backends[label], _ = cache.ensure_loaded(name, backend_kwargs_for(name, entry))
+    print(f"    {len(names)} separately-compiled ELFs, one hw_context each: {names}")
+
+    # All BOs against one device wrapper, the way the pool allocates them.
+    bosets = {label: upload_bos(backends[labels[0]], arrays[label]) for label in labels}
+
+    def make_run(lab):
+        run = xrt.run(backends[lab].kernel)
+        for i, bo in enumerate(bosets[lab]):
+            run.set_arg(i, bo)
+        return run
+
+    def sequential():
+        for lab in labels:
+            run = make_run(lab)
+            run.start()
+            run.wait2()
+
+    def aggregated():
+        # Rebuilt per call rather than hoisted: a hoisted runlist would measure
+        # re-execution of a prepared object, but the study's modes build their
+        # entries each layer. Leg B hoists on purpose, so the two bracket the
+        # cost of construction.
+        runlist = xrt.runlist(backends[labels[0]].context)
+        for lab in labels:
+            runlist.add(make_run(lab))
+        runlist.execute()
+        runlist.wait()
+
+    # Clobber the outputs first, so bit-identity cannot be satisfied by a
+    # leftover from the sequential baseline that the runlist never overwrote.
+    for lab in labels:
+        out = bosets[lab][-1]
+        np.frombuffer(out.map(), dtype=np.uint8, count=reference[lab].nbytes)[:] = 0xA5
+        out.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+    aggregated()
+
+    exact = True
+    for lab in labels:
+        bosets[lab][-1].sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+        got = np.frombuffer(
+            bosets[lab][-1].map(), dtype=bfloat16, count=reference[lab].size
+        ).reshape(reference[lab].shape)
+        same = np.array_equal(got.view(np.int16), reference[lab].view(np.int16))
+        print(f"    {lab}: bit-identical to sequential dispatch -> {same}")
+        exact &= bool(same)
+
+    seq_ms, agg_ms, wins = interleaved_medians(sequential, aggregated)
+    report_timing(seq_ms, agg_ms, wins, len(labels))
+    faster = agg_ms < seq_ms
+    return exact and faster, {"seq_ms": seq_ms, "agg_ms": agg_ms, "wins": wins}
+
+
+def leg_a2_seam_refuses_the_xclbin_case(cache):
+    """The seam still refuses to aggregate across artifacts under the xclbin ABI.
+
+    Not a hardware measurement — `plan_submissions` is pure — but it belongs
+    next to leg A, because leg A is exactly the reason someone will be tempted to
+    delete the refusal. 05a §4 measured the xclbin case: one context, entries
+    from several artifacts, executes silently and returns wrong numbers for every
+    entry but one. The ELF case is safe because each entry brings its own
+    context; the xclbin case is not because the configuration is in the xclbin.
+    """
     steps = [
-        DispatchStep(a, ("x", "y", "z", "w"), (2, 3)),
-        DispatchStep(b, ("p", "q", "r"), (2,)),
+        DispatchStep("art_a", ("x", "y", "z", "w"), (2, 3)),
+        DispatchStep("art_b", ("p", "q", "r"), (2,)),
     ]
+    binaries = {"art_a": "a.xclbin", "art_b": "b.xclbin"}
     try:
         plan_submissions(
-            steps, lambda k: cache.artifacts[k].output_binary, require_single=True
+            steps, binaries.__getitem__, require_single=True, elf_abi=False
         )
-        detail.append("plan_submissions did NOT refuse a cross-artifact runlist")
-        return False, detail
-    except RunlistSplitError:
-        detail.append("plan_submissions refuses the cross-artifact runlist (rule E2)")
-
-    # 2. Why it refuses: XRT will not put the second ELF into the first's context.
-    unexpected = False
-    try:
-        dev = xrt.device(0)
-        elf_a = xrt.elf(cache.artifacts[a].output_binary)
-        elf_b = xrt.elf(cache.artifacts[b].output_binary)
-        ctx = xrt.hw_context(dev, elf_a)
-        for label, elf in (
-            ("module(elf_b)->ctx", elf_b),
-            ("module(elf_a)->ctx", elf_a),
-        ):
-            try:
-                xrt.module(xrt.module(elf), ctx)
-                detail.append(
-                    f"UNEXPECTED: {label} succeeded — re-check 05a, the "
-                    f"platform may have gained multi-ELF contexts"
-                )
-                unexpected = True
-            except Exception as exc:
-                detail.append(f"{label}: {exc}")
-        try:
-            xrt.ext.kernel(ctx, xrt.module(elf_b), cache.artifacts[b].kernel)
-            detail.append(
-                "UNEXPECTED: ext.kernel(ctx, module, name) accepted a full ELF"
-            )
-            unexpected = True
-        except Exception as exc:
-            detail.append(f"ext.kernel(ctx, module(elf_b), name): {exc}")
-    finally:
-        ctx = elf_a = elf_b = dev = None
-        gc.collect()
-
-    return unexpected, detail
+    except RunlistSplitError as exc:
+        print(f"    xclbin ABI: refused, {str(exc).split('.')[0]}")
+        return True
+    print("    FAIL: the xclbin cross-artifact runlist was NOT refused (rule E2)")
+    return False
 
 
 def leg_d_drain_single_shot(cache, specs, rng):
@@ -352,22 +462,10 @@ def leg_b_same_artifact_aggregation(cache, specs, arrays, reference):
     cfg, entry = specs[name]
     backend, _ = cache.ensure_loaded(name, backend_kwargs_for(name, entry))
 
-    pairs = []
-    for label in ("gate_proj", "up_proj"):
-        bos = []
-        for arr in arrays[label]:
-            bo = xrt.ext.bo(backend.device, arr.size * arr.itemsize)
-            src = np.frombuffer(
-                arr.view(np.int16) if arr.dtype == bfloat16 else arr, dtype=np.uint8
-            )
-            np.copyto(
-                np.frombuffer(bo.map(), dtype=np.uint8, count=len(src)),
-                src,
-                casting="no",
-            )
-            bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
-            bos.append(bo)
-        pairs.append((label, bos))
+    pairs = [
+        (label, upload_bos(backend, arrays[label]))
+        for label in ("gate_proj", "up_proj")
+    ]
 
     def make_run(bos):
         run = xrt.run(backend.kernel)
@@ -381,6 +479,8 @@ def leg_b_same_artifact_aggregation(cache, specs, arrays, reference):
             run.start()
             run.wait2()
 
+    # Hoisted on purpose, unlike leg A's: this leg isolates the submission cost
+    # from the cost of building the entries, and leg A pays both.
     runlist = xrt.runlist(backend.context)
     runs = [make_run(bos) for _, bos in pairs]
     for run in runs:
@@ -390,25 +490,7 @@ def leg_b_same_artifact_aggregation(cache, specs, arrays, reference):
         runlist.execute()
         runlist.wait()
 
-    def once(fn):
-        t0 = time.perf_counter()
-        fn()
-        return (time.perf_counter() - t0) * 1000.0
-
-    # Interleaved, median of N. The saving is one host submission — a fixed cost
-    # of order 100 us — so on 9 ms kernels it is ~1% and thermal drift over a
-    # back-to-back A-then-B benchmark is larger than the effect being measured.
-    # Alternating and taking medians removes the drift; a mean of two separate
-    # blocks does not.
-    for _ in range(WARMUP_ITERS):
-        sequential()
-        aggregated()
-    seq_samples, agg_samples = [], []
-    for _ in range(TIMED_ITERS):
-        seq_samples.append(once(sequential))
-        agg_samples.append(once(aggregated))
-    seq_ms = float(np.median(seq_samples))
-    agg_ms = float(np.median(agg_samples))
+    seq_ms, agg_ms, wins = interleaved_medians(sequential, aggregated)
 
     exact = True
     for label, bos in pairs:
@@ -420,12 +502,7 @@ def leg_b_same_artifact_aggregation(cache, specs, arrays, reference):
         print(f"    {label}: bit-identical to sequential dispatch -> {same}")
         exact &= bool(same)
 
-    saved = seq_ms - agg_ms
-    print(
-        f"    sequential (2 submissions) {seq_ms:.3f} ms   "
-        f"runlist (1 submission) {agg_ms:.3f} ms   "
-        f"saved {saved * 1000:.0f} us ({seq_ms / agg_ms:.3f}x)"
-    )
+    saved = report_timing(seq_ms, agg_ms, wins, len(pairs))
     print(
         f"    the saving is one host submission, so it is a fixed cost: it is "
         f"{saved / seq_ms * 100:.1f}% of a {seq_ms / 2:.1f} ms/GEMM pair here and"
@@ -441,9 +518,22 @@ def leg_c_run_sequence(cache, specs, arrays, reference):
     """The whole layer through `KernelCache.run_sequence`, bit-exact vs the baseline.
 
     Exercises the pooled BOs, the dirty-bit sync and the dispatch vector on the
-    real artifacts. The sequence is not aggregatable into one submission (the
-    seven GEMMs span four ELFs), so this also checks that the vector reports the
-    split honestly instead of claiming one submission.
+    real artifacts. The five GEMMs span three ELFs, and this asks for
+    `require_single_submission=True`: the seam has to deliver on the real layer
+    what leg A shows the hardware can do, not merely avoid crashing while
+    splitting into three. A split here raises `RunlistSplitError` rather than
+    quietly reporting three submissions.
+
+    The B operand of each GEMM is declared **static**, which is what it is in a
+    real layer: a weight. That puts it in the content-keyed pool, so it is
+    uploaded on the first pass and never again — which only holds if the pool
+    survives between dispatches.
+
+    Runs the sequence twice. The second pass must be bit-identical to the first,
+    must reuse the pool, and must move strictly fewer bytes. `run_sequence`
+    builds a fresh `PoolPlan` every call, so if pools were keyed on plan object
+    identity the second pass would silently allocate a second set of BOs and
+    re-upload every weight — the defect this leg exists to catch.
     """
     steps = []
     buf_specs = {}
@@ -462,26 +552,50 @@ def leg_c_run_sequence(cache, specs, arrays, reference):
         )
         steps.append(DispatchStep(name, tuple(arg_names), writes))
         for arg_name, arr in zip(arg_names, arrays[label]):
+            static = arg_name.endswith("_b")
             buf_specs[arg_name] = BufferSpec(
                 name=arg_name,
                 nbytes=arr.size * arr.itemsize,
+                static=static,
                 host_output=arg_name.endswith("_out"),
+                content_key=content_key(arr) if static else None,
             )
             seq_arrays[arg_name] = arr
 
-    results, vector = cache.run_sequence(
-        steps,
-        buf_specs,
-        {name: backend_kwargs_for(name, entry) for name, (_, entry) in specs.items()},
-        seq_arrays,
-    )
+    kwargs = {
+        name: backend_kwargs_for(name, entry) for name, (_, entry) in specs.items()
+    }
 
+    def run_once():
+        return cache.run_sequence(
+            steps, buf_specs, kwargs, seq_arrays, require_single_submission=True
+        )
+
+    results, vector = run_once()
     exact = True
-    for label, m, n in ((l, m, n) for l, m, _, n in LAYER_GEMMS):
+    for label, _, _, _ in LAYER_GEMMS:
         got = results[f"{label}_out"]
         same = np.array_equal(got.view(np.int16), reference[label].view(np.int16))
         print(f"    {label}: bit-identical to load_and_run -> {same}")
         exact &= bool(same)
+
+    # Copy before the second pass: the returned arrays are views into pool memory.
+    first_pass = {k: np.array(v, copy=True) for k, v in results.items()}
+    pools_after_first = set(cache._pools)
+    results2, vector2 = run_once()
+    pools_after_second = set(cache._pools)
+    repeatable = all(
+        np.array_equal(first_pass[k].view(np.int16), results2[k].view(np.int16))
+        for k in first_pass
+    )
+    # One pool, the same pool. Keyed on `id(plan)` this would be two, because
+    # every call builds a fresh plan object.
+    reused = pools_after_second == pools_after_first and len(pools_after_first) == 1
+    slots = max(p.stats()["slots"] for p in cache._pools.values())
+    print(
+        f"    second pass: bit-identical -> {repeatable}; one pool reused -> "
+        f"{reused} ({len(pools_after_second)} pool(s), {slots} slots)"
+    )
 
     row = vector.as_row()
     print(f"    dispatch vector: {row}")
@@ -493,7 +607,27 @@ def leg_c_run_sequence(cache, specs, arrays, reference):
     honest = vector.host_submissions == len(vector.per_submission_entries)
     if not honest:
         print("    FAIL: the vector's submission count does not match what ran")
-    return exact and honest, row
+    aggregated = vector.host_submissions == 1
+    if not aggregated:
+        print(
+            f"    FAIL: the layer took {vector.host_submissions} submissions, not one"
+        )
+    # The static-weight rule (S2) on hardware: the B operands are uploaded once,
+    # so pass 2 moves strictly fewer bytes. If this ever reads equal, the pool
+    # is being rebuilt per dispatch and every weight is going over the bus again.
+    saved_mb = (vector.bytes_transferred - vector2.bytes_transferred) / 1e6
+    print(
+        f"    sync boundaries: {vector.sync_boundaries} on pass 1, "
+        f"{vector2.sync_boundaries} on pass 2; "
+        f"pass 2 moved {saved_mb:.0f} MB less (static weights already resident)"
+    )
+    weights_resident = vector2.bytes_transferred < vector.bytes_transferred
+    if not weights_resident:
+        print("    FAIL: pass 2 re-uploaded the static weights (rule S2)")
+    return (
+        exact and honest and aggregated and repeatable and reused and weights_resident,
+        row,
+    )
 
 
 def main():
@@ -527,38 +661,38 @@ def main():
         )
         return 1
 
+    print("\n== leg A: cross-artifact (multi-ELF) runlist — the gate's requirement ==")
+    a_ok, _ = leg_a_cross_artifact_runlist(cache, specs, arrays, reference)
+
+    print("\n== leg A2: the seam still refuses the xclbin cross-artifact runlist ==")
+    a2_ok = leg_a2_seam_refuses_the_xclbin_case(cache)
+
     print("\n== leg B: same-artifact aggregation (gate_proj + up_proj share an ELF) ==")
     b_ok, _ = leg_b_same_artifact_aggregation(cache, specs, arrays, reference)
 
     print("\n== leg C: KernelCache.run_sequence over the whole layer ==")
     c_ok, _ = leg_c_run_sequence(cache, specs, arrays, reference)
 
-    # Last: probing the multi-ELF API costs an extra hw_context on a device that
-    # already holds one per loaded artifact, which moves the numbers above.
-    print("\n== leg A: cross-artifact (multi-ELF) runlist — the gate's requirement ==")
-    a_ok, a_detail = leg_a_cross_artifact_runlist(cache, specs)
-    for line in a_detail:
-        print(f"    {line}")
-
     print("\n== leg D (informational): standalone drain ELF single-shot defect ==")
     leg_d_drain_single_shot(cache, specs, rng)
 
     print("\n" + "=" * 68)
     print(f"  leg A  cross-artifact multi-ELF runlist : {'PASS' if a_ok else 'FAIL'}")
+    print(f"  leg A2 xclbin cross-artifact refused    : {'PASS' if a2_ok else 'FAIL'}")
     print(f"  leg B  same-artifact aggregation        : {'PASS' if b_ok else 'FAIL'}")
     print(f"  leg C  run_sequence over the layer      : {'PASS' if c_ok else 'FAIL'}")
     print("=" * 68)
-    if not a_ok:
-        print(
-            "\nPHASE B GATE: FAIL — the multi-ELF runlist the gate requires is not\n"
-            "available on this stack. Legs B and C show what the seam does deliver.\n"
-            "See docs/plans/transformer-layer-execution-studies/\n"
-            "05a-phase-b-runlist-spike-result.md for the measurements and the three\n"
-            "remaining routes, none of which is a Phase B change."
-        )
-    elif b_ok and c_ok:
+    ok = a_ok and a2_ok and b_ok and c_ok
+    if ok:
         print("\nPHASE B GATE: PASS")
-    return 0 if (a_ok and b_ok and c_ok) else 1
+    else:
+        print(
+            "\nPHASE B GATE: FAIL. Do not relax a leg to clear it — see\n"
+            "docs/plans/transformer-layer-execution-studies/\n"
+            "05a-phase-b-runlist-spike-result.md for what each leg measures and\n"
+            "which failure means what."
+        )
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

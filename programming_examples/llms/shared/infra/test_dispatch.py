@@ -65,38 +65,61 @@ def test_one_artifact_aggregates_into_one_submission():
     assert len(subs[0]) == 3
 
 
-def test_context_change_splits_the_sequence():
-    """05a: separately-compiled artifacts cannot share a hw_context."""
+def test_elf_abi_aggregates_across_artifacts():
+    """05a §5: N full ELFs means N hw_contexts and still one runlist.
+
+    Each entry's run carries its own artifact's configuration, so one submission
+    covers all three. This is the gate's requirement and the study's `runlist`
+    axis; if it ever regresses to three submissions, `runlist` collapses into
+    `offload` and the comparison stops meaning anything.
+    """
     steps = [step("qkv", "x", "y"), step("attn", "y", "z"), step("ffn", "z", "w")]
-    subs = plan_submissions(steps, artifact_of)
-    assert [s.artifact for s in subs] == ["a.elf", "b.elf", "c.elf"]
+    subs = plan_submissions(steps, artifact_of, elf_abi=True)
+    assert len(subs) == 1
+    assert len(subs[0]) == 3
+    assert subs[0].artifacts == ("a.elf", "b.elf", "c.elf")
+    assert subs[0].context_artifact == "a.elf"
+
+
+def test_xclbin_abi_splits_at_every_artifact_change():
+    """05a §4: under the xclbin ABI the configuration is in the xclbin, not the
+    run, so entries from another artifact execute against the wrong one."""
+    steps = [step("qkv", "x", "y"), step("attn", "y", "z"), step("ffn", "z", "w")]
+    subs = plan_submissions(steps, artifact_of, elf_abi=False)
+    assert [s.context_artifact for s in subs] == ["a.elf", "b.elf", "c.elf"]
     assert [len(s) for s in subs] == [1, 1, 1]
 
 
 def test_two_kernel_names_on_one_artifact_share_a_submission():
     """Grouping is by artifact identity, not by cache key."""
     steps = [step("qkv", "x", "y"), step("qkv2", "y", "z")]
-    subs = plan_submissions(steps, artifact_of)
+    subs = plan_submissions(steps, artifact_of, elf_abi=False)
     assert len(subs) == 1
+    assert subs[0].artifacts == ("a.elf",)
 
 
-def test_split_is_contiguous_not_global():
+def test_xclbin_split_is_contiguous_not_global():
     """A->B->A is three submissions; entries may not be reordered to merge them."""
     steps = [step("qkv", "x", "y"), step("attn", "y", "z"), step("qkv", "z", "w")]
-    subs = plan_submissions(steps, artifact_of)
+    subs = plan_submissions(steps, artifact_of, elf_abi=False)
     assert len(subs) == 3
     assert subs[0].first_index == 0 and subs[2].first_index == 2
 
 
-def test_require_single_refuses_rather_than_splitting():
-    """Rule E2: the cross-configuration runlist is never emitted."""
+def test_require_single_refuses_the_xclbin_cross_artifact_runlist():
+    """Rule E2: the one runlist that executes and returns wrong numbers."""
     steps = [step("qkv", "x", "y"), step("attn", "y", "z")]
     with raises(RunlistSplitError, match="hardware configurations"):
-        plan_submissions(steps, artifact_of, require_single=True)
+        plan_submissions(steps, artifact_of, require_single=True, elf_abi=False)
 
 
 def test_require_single_passes_when_the_sequence_is_aggregatable():
     steps = [step("qkv", "x", "y"), step("qkv", "y", "z")]
+    assert len(plan_submissions(steps, artifact_of, require_single=True)) == 1
+
+
+def test_require_single_is_satisfied_by_elf_cross_artifact_aggregation():
+    steps = [step("qkv", "x", "y"), step("attn", "y", "z")]
     assert len(plan_submissions(steps, artifact_of, require_single=True)) == 1
 
 

@@ -21,18 +21,26 @@ flock -x -w 1800 /tmp/mlir-air-npu.lock make runlist-gate   # NEEDS AN NPU
 
 `runlist_gate.py` is
 [Phase B](../../docs/plans/transformer-layer-execution-studies/05-phase-b-runtime-seam.md)'s
-gate. **It currently fails, on purpose.** The plan's load-bearing assumption — that several
-separately-compiled ELFs can be bound into one XRT `hw_context` and submitted as one runlist —
-does not hold on XRT 2.21.0 / NPU2. An AIR ELF is a *full* ELF: it carries its own array
-configuration, and a `hw_context` accepts exactly one of those.
-[05a](../../docs/plans/transformer-layer-execution-studies/05a-phase-b-runlist-spike-result.md)
-records every route that was tried and the three that remain, none of which is a Phase B change.
+gate: three separately-compiled ELFs in one runlist, bit-identical to sequential dispatch and
+measurably faster, plus the whole layer through the seam in one submission.
 
-What the seam does deliver, and what legs B–D of the gate measure:
+The plan's proposed *mechanism* — binding several ELFs into one XRT `hw_context` — does not work
+on XRT 2.21.0 / NPU2, and does not need to. An AIR ELF is a *full* ELF carrying its own array
+configuration and a `hw_context` accepts exactly one of those, but a runlist is constructed
+*against* a context rather than restricted *to* it: each entry is dispatched on the context its
+kernel came from, so N ELFs means N contexts and still one runlist.
+[05a](../../docs/plans/transformer-layer-execution-studies/05a-phase-b-runlist-spike-result.md)
+records both halves and every measurement.
+
+The one aggregation that is silently wrong is the *xclbin* cross-artifact runlist — there the
+configuration is in the xclbin, not the run, so it executes and returns wrong numbers with no
+error. The seam refuses to build it and leg A2 of the gate keeps that refusal honest.
+
+What the seam delivers, and what the gate measures:
 
 | | |
 |---|---|
-| `llms/shared/infra/dispatch.py` | Groups a dispatch sequence into the submissions the hardware allows, and owns the six-field dispatch vector. Refuses to build a runlist spanning configurations — one of those *executes* and returns wrong numbers with no error, so refusing is the only safe behaviour. |
+| `llms/shared/infra/dispatch.py` | Groups a dispatch sequence into the submissions the hardware allows — one, spanning artifacts, under the ELF ABI — and owns the six-field dispatch vector. Under the xclbin ABI it splits at every artifact change and refuses `require_single`, because that runlist *executes* and returns wrong numbers with no error. |
 | `llms/shared/infra/bo_pool.py` | Live ranges over the sequence, 4 KiB-binned slot sharing, a content-keyed static-weight pool, and a dirty bit per BO so only written buffers sync to device and only declared outputs come back. |
 
 The rules both modules implement are written down in

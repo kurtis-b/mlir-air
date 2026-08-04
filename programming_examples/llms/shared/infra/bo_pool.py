@@ -40,6 +40,16 @@ Footguns, in the order they will bite you:
   Two operators passing identical weight bytes share one BO, written once. Writing
   through a static slot would corrupt every other operator sharing that content, so
   a static buffer may not be a step's output (A3).
+
+- **Content keying is subordinate to the bank rule** (S5). Under the xclbin ABI two
+  identical weights sitting at different `(kernel, argument index)` positions get
+  *different* BOs, because the position is what picks the memory group. Deduping
+  them would hand the second kernel a buffer banked for the first.
+
+- **A pool is reused by sequence identity, never by object identity** (O5).
+  `PoolPlan.signature` is that identity. `id(plan)` is not: every dispatch builds a
+  fresh plan, so keying on it both defeats reuse and lets CPython hand a recycled
+  id's pool to an unrelated plan.
 """
 
 import hashlib
@@ -101,12 +111,24 @@ class PoolPlan:
     `slot_of` maps buffer name -> slot key. `live` maps buffer name ->
     (start, end) for inspection and tests. `bins` maps slot key -> allocation
     size in bytes. `static_of` maps static buffer name -> content key.
+
+    `slot_positions` maps slot key -> the `(kernel, arg_index)` positions its
+    buffers are bound at, in first-use order. Under the xclbin ABI that is what
+    picks the memory group, so the allocator reads it rather than guessing from
+    the first use (C2).
+
+    `signature` is the plan's *value* identity: two plans built from the same
+    steps, specs and ABI compare equal. `KernelCache` keys its pools on it so a
+    repeated sequence reuses its BOs and its already-synced static weights
+    (O5). Never key a pool on `id(plan)`; see the module docstring.
     """
 
     slot_of: dict = field(default_factory=dict)
     live: dict = field(default_factory=dict)
     bins: dict = field(default_factory=dict)
     static_of: dict = field(default_factory=dict)
+    slot_positions: dict = field(default_factory=dict)
+    signature: tuple = ()
 
     def n_slots(self):
         return len(self.bins)
@@ -148,6 +170,52 @@ def _overlaps(a, b):
     return not (a[1] < b[0] or b[1] < a[0])
 
 
+def _positions(steps):
+    """Every `(kernel, arg_index)` each buffer is bound at, in first-use order.
+
+    Under the xclbin ABI this is the memory group (C2); under the ELF ABI it is
+    only bookkeeping. A buffer with more than one entry here cannot be pooled at
+    a single position, and — if it is static — cannot be content-deduped with a
+    buffer at a different one (S5).
+    """
+    out = {}
+    for step in steps:
+        for i, name in enumerate(step.args):
+            seen = out.setdefault(name, [])
+            if (step.kernel, i) not in seen:
+                seen.append((step.kernel, i))
+    return {name: tuple(v) for name, v in out.items()}
+
+
+def plan_signature(steps, specs, elf_abi):
+    """Value identity of the plan `plan_pool` would build from these inputs (O5).
+
+    Two sequences with this signature produce the same slot assignment, the same
+    bin sizes and the same bank choices, so one `BoPool` may serve both — which
+    is what makes a repeated sequence cheap: its BOs are already allocated and
+    its static weights already resident.
+
+    Everything the assignment depends on is in here. `content_key` is included
+    because it keys the static pool: a caller that changes a weight's bytes and
+    its key gets a fresh pool rather than a silently stale BO (S2).
+    """
+    names = sorted({a for s in steps for a in s.args})
+    return (
+        "elf" if elf_abi else "xclbin",
+        tuple((s.kernel, tuple(s.args), tuple(s.writes)) for s in steps),
+        tuple(
+            (
+                n,
+                specs[n].nbytes,
+                specs[n].static,
+                specs[n].host_output,
+                specs[n].content_key,
+            )
+            for n in names
+        ),
+    )
+
+
 def plan_pool(steps, specs, elf_abi):
     """Assign pool slots to the sequence's buffers.
 
@@ -180,30 +248,46 @@ def plan_pool(steps, specs, elf_abi):
                     "static buffers are content-keyed and shared (rule A3)"
                 )
 
-    plan = PoolPlan()
-
-    # Static buffers: content-keyed, outside the liveness analysis (S1, S3).
-    for name, spec in specs.items():
-        if not spec.static:
-            continue
-        key = spec.content_key or f"anon:{name}"
-        slot = ("static", key, _bin_size(spec.nbytes))
-        plan.slot_of[name] = slot
-        plan.static_of[name] = key
-        plan.bins.setdefault(slot, _bin_size(spec.nbytes))
-
-    plan.live = compute_live_ranges(steps, specs)
+    plan = PoolPlan(signature=plan_signature(steps, specs, elf_abi))
+    positions = _positions(steps)
 
     # Under the xclbin ABI a buffer is only poolable at one (kernel, arg index),
     # so a buffer used at two positions is not poolable at all (C2).
-    position_of = {}
     unpoolable = set()
     if not elf_abi:
-        for step in steps:
-            for i, name in enumerate(step.args):
-                pos = (step.kernel, i)
-                if position_of.setdefault(name, pos) != pos:
-                    unpoolable.add(name)
+        unpoolable = {n for n, pos in positions.items() if len(pos) > 1}
+    position_of = {n: pos[0] for n, pos in positions.items()}
+
+    # Static buffers: content-keyed, outside the liveness analysis (S1, S3).
+    #
+    # Content keying is subordinate to the bank rule (S5). Under the xclbin ABI
+    # the memory group comes from the (kernel, arg index) the buffer is bound
+    # at, so two identical weights at different positions must NOT collapse onto
+    # one BO: `_alloc` would bank it for whichever position it saw first and the
+    # other kernel would read it through the wrong group. Putting the position
+    # in the slot key is what keeps dedup inside one bank. A static buffer bound
+    # at several positions has to be one BO whatever its content, so it is
+    # pinned to its own slot and the group agreement is checked at allocation.
+    for name, spec in specs.items():
+        # A spec no step names has nothing to bind to: no position, hence no
+        # bank, hence no slot. `specs` is allowed to carry more than the
+        # sequence uses, and those entries are simply not part of the plan.
+        if not spec.static or name not in positions:
+            continue
+        key = spec.content_key or f"anon:{name}"
+        binsz = _bin_size(spec.nbytes)
+        pos = positions[name]
+        if elf_abi:
+            slot = ("static", key, binsz)
+        elif len(pos) > 1:
+            slot = ("static-pinned", name, binsz)
+        else:
+            slot = ("static", key, pos[0], binsz)
+        plan.slot_of[name] = slot
+        plan.static_of[name] = key
+        plan.bins.setdefault(slot, binsz)
+
+    plan.live = compute_live_ranges(steps, specs)
 
     # Buffers appearing together in one step conflict regardless of live-range
     # arithmetic, so two distinct tensors never land on one BO (A1).
@@ -245,6 +329,17 @@ def plan_pool(steps, specs, elf_abi):
         plan.slot_of[name] = chosen
         plan.bins[chosen] = binsz
 
+    # Every position each slot is bound at, for the allocator's bank check (C2).
+    # A slot with more than one position under the xclbin ABI is a buffer the
+    # sequence forces to be shared; the allocator confirms the groups agree
+    # rather than silently taking the first.
+    for name, slot in plan.slot_of.items():
+        for pos in positions.get(name, ()):
+            bound = plan.slot_positions.setdefault(slot, [])
+            if pos not in bound:
+                bound.append(pos)
+    plan.slot_positions = {k: tuple(v) for k, v in plan.slot_positions.items()}
+
     return plan
 
 
@@ -264,7 +359,10 @@ class BoPool:
         self._slots = {}  # slot key -> bo
         self._occupant = {}  # slot key -> buffer name currently in it
         self._dirty = {}  # buffer name -> needs host->device sync
-        self._static_written = set()  # content keys already synced (S2)
+        # Static slots already synced (S2). Keyed by *slot*, not by content key:
+        # under the xclbin ABI one content key can span several slots, one per
+        # memory group (S5), and each of those BOs needs its own write.
+        self._static_written = set()
 
     def bo_for(self, name, plan):
         """The BO backing `name`, allocating its slot on first use.
@@ -295,15 +393,24 @@ class BoPool:
     def is_dirty(self, name):
         return self._dirty.get(name, False)
 
+    def is_static_resident(self, name, plan):
+        """True once this static buffer's BO holds its bytes (S2).
+
+        Callers skip the host-side copy as well as the sync: with pools reused
+        across dispatches (O5) a static weight is written on the first sequence
+        and must not be re-copied on every one after it.
+        """
+        return plan.slot_of[name] in self._static_written
+
     def sync_to_device_if_needed(self, name, plan, specs):
         """Rule D2, plus S2 for static buffers. Returns True if a sync ran."""
         spec = specs[name]
         if spec.static:
-            key = plan.static_of[name]
-            if key in self._static_written:
+            slot = plan.slot_of[name]
+            if slot in self._static_written:
                 return False
             self._to_device(self.bo_for(name, plan))
-            self._static_written.add(key)
+            self._static_written.add(slot)
             return True
         if not self._dirty.get(name, False):
             return False
@@ -326,11 +433,26 @@ class BoPool:
 def content_key(buf):
     """Content key for a static buffer (rule S1).
 
-    `buf` is anything `memoryview` accepts — a numpy array's buffer, bytes, or a
-    mapped BO. Hashing reads the whole buffer, which is why it is opt-in per
-    buffer rather than automatic (S4).
+    `buf` is a numpy array, `bytes`, a mapped BO — anything exposing either the
+    buffer protocol or `tobytes()`. Hashing reads the whole buffer, which is why
+    it is opt-in per buffer rather than automatic (S4).
+
+    The key is over **bytes**, never over the dtype or shape: the BO holds bytes,
+    so two arrays that would upload identically must key identically. A caller
+    that needs two same-byte tensors kept apart gives them distinct names, not a
+    distinct dtype.
+
+    `memoryview` refuses ml_dtypes' `bfloat16` outright — it is a numpy extension
+    dtype whose format code ('E') has no buffer-protocol meaning — and bf16 weight
+    tensors are precisely what this is called on, so that fallback is the common
+    path here rather than an edge case.
     """
-    mv = memoryview(buf)
+    try:
+        mv = memoryview(buf)
+    except (TypeError, ValueError):
+        if not hasattr(buf, "tobytes"):
+            raise
+        mv = memoryview(buf.tobytes())
     if not mv.c_contiguous:
         mv = memoryview(bytes(mv))
     return "sha256:" + hashlib.sha256(mv.cast("B")).hexdigest()

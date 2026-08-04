@@ -5,13 +5,15 @@ Two host-side additions: runlist aggregation, and buffer-object liveness pooling
 **This phase contains the plan's load-bearing assumption. Spike it before committing to
 anything else.**
 
-> **The spike was run and the assumption does not hold.** §"The resolution" below is
-> API-shape reasoning that XRT 2.21.0 / NPU2 rejects: an AIR ELF is a *full* ELF carrying its
-> own array configuration, and a `hw_context` accepts exactly one of those. Read
+> **The spike was run. The assumption holds; the mechanism §"The resolution" proposes does
+> not.** An AIR ELF is a *full* ELF carrying its own array configuration, and a `hw_context`
+> accepts exactly one of those — so the `pyxrt.module(mod, ctx)` rebinding below is rejected by
+> XRT 2.21.0 / NPU2, three different ways. It is also unnecessary: a runlist is constructed
+> *against* a context but is not restricted *to* it, so N ELFs become N `hw_context`s and still
+> one runlist, bit-identical to sequential dispatch and measurably faster. Read
 > [05a-phase-b-runlist-spike-result.md](05a-phase-b-runlist-spike-result.md) before acting on
-> anything in §1 — it records what was measured, what was shipped instead, and the three
-> remaining routes to a multi-artifact runlist. The buffer rules asked for in work item 2 are in
-> [05b-phase-b-buffer-rules.md](05b-phase-b-buffer-rules.md).
+> anything in §1 — it records both halves and the measurements. The buffer rules asked for in
+> work item 2 are in [05b-phase-b-buffer-rules.md](05b-phase-b-buffer-rules.md).
 
 ## 1. Runlist aggregation
 

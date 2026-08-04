@@ -28,6 +28,14 @@ pool bytes and is the single easiest way to produce plausible garbage.
 sequence always produces the same assignment. Reproducibility matters more here than packing
 quality: a measurement that changes because the allocator changed its mind is not a measurement.
 
+**O5 — a pool is reused by sequence identity, never by object identity.** `PoolPlan.signature`
+is the value identity of (steps, buffer specs, ABI); `KernelCache` keys its pools on it. Every
+dispatch builds a fresh `PoolPlan`, so keying on `id(plan)` would allocate a new pool and
+re-upload every static weight on each call — and CPython recycles the freed plan's id, so it
+could instead hand an old pool to an unrelated sequence whose slots are sized and banked for
+buffers that are no longer there. Reuse is the point: the second and later runs of a sequence
+skip both the allocation and the weight upload.
+
 ---
 
 ## 2. Compatibility — when two buffers may share a slot
@@ -43,6 +51,11 @@ argument index)*. Therefore an xclbin-ABI slot is keyed by `(kernel_name, arg_in
 only be reused at that same position. Cross-kernel pooling is legal **only** on the ELF ABI,
 where `xrt.ext.bo` carries no group id. This is the rule that a naive size-bin allocator breaks.
 
+C2 binds the static pool as well as the transient one — see S5. Where a sequence *forces* one BO
+across several positions (a buffer one kernel writes and another reads), the plan records every
+position the slot is bound at and the allocator confirms they resolve to the same group, raising
+if they do not rather than banking for whichever it saw first.
+
 **C3 — same size bin.** Bins are `ceil(size / 4096) * 4096`. Buffers in different bins never
 share, even when one would fit in the other — a larger slot holding a smaller buffer makes O3's
 logical-size bookkeeping load-bearing in more places than is worth it.
@@ -50,9 +63,11 @@ logical-size bookkeeping load-bearing in more places than is worth it.
 **C4 — disjoint live ranges.** See §3.
 
 **C5 — same context reachability.** A slot may back steps in different artifacts' contexts only
-under the ELF ABI, where `xrt.ext.bo` is device-scoped rather than context-scoped. The hardware
-test `test_runlist_gate.py::cross_artifact_buffer` is what keeps this rule honest; if it ever
-fails, C5 tightens to "same context" and cross-artifact pooling is off.
+under the ELF ABI, where `xrt.ext.bo` is device-scoped rather than context-scoped. Every BO in a
+pool is allocated against one device wrapper (O2), not against whichever artifact's backend
+happened to name the buffer first. `runlist_gate.py` legs A and C are what keep this rule honest:
+leg A shares one BO set across three artifacts' kernels in one runlist, leg C does it through the
+pool. If either ever fails, C5 tightens to "same context" and cross-artifact pooling is off.
 
 **C6 — neither is static.** Static buffers live in their own pool (§5) and are never shared with
 transient buffers, in either direction.
@@ -102,7 +117,17 @@ would corrupt every other operator sharing that content.
 `(sha256(bytes), nbytes)`. Two operators passing identical weight bytes get one BO.
 
 **S2.** A static BO is written and synced host→device exactly once, on first use, and is never
-re-synced. Its dirty bit is cleared at that point and never set again.
+re-synced — including across dispatches, since pools outlive a sequence (O5). "Once" is counted
+per **BO**, not per content key: S5 can split one content key across several BOs, and each of
+those still has to be written. Its dirty bit is cleared at that point and never set again.
+
+**S5 — content keying is subordinate to the bank rule.** Under the xclbin ABI the static slot key
+carries the `(kernel, arg_index)` position as well as the content key, so two identical weights
+bound at different positions get different BOs. Deduping them would give the pair one BO, banked
+from whichever position the allocator saw first, and the other kernel would read its weights
+through the wrong memory group — no error, wrong numbers. Under the ELF ABI there is no group id
+and S1's dedup applies unrestricted. A static buffer bound at several positions gets a pinned
+slot of its own and is checked for group agreement at allocation (C2).
 
 **S3.** Static BOs are pinned for the lifetime of the `KernelCache`. They are not part of the
 liveness analysis and never enter the transient pool (C6).
@@ -181,10 +206,18 @@ declared sequence instead of from caller-supplied index sets.
 one aggregate state. On failure the batch polls every `xrt.run.state()` and raises naming the
 **first** non-`ERT_CMD_STATE_COMPLETED` entry, with its index, kernel name and artifact.
 
-**E2.** A runlist whose entries would span artifact configurations is never submitted. It raises
-`RunlistSplitError` at build time. Rationale: 05a §4 measured that such a runlist *executes* and
-returns wrong numbers, with no exception and no timeout. A build-time refusal is the only safe
-behaviour.
+**E2.** A runlist whose entries would span artifact configurations **under the xclbin ABI** is
+never submitted. It raises `RunlistSplitError` at build time. Rationale: 05a §4 measured that such
+a runlist *executes* and returns wrong numbers, with no exception and no timeout, because the
+array configuration comes from the xclbin behind the context rather than from the run. A
+build-time refusal is the only safe behaviour.
+
+E2 does not apply to the ELF ABI. There every artifact is loaded into its own `hw_context` from
+its own full ELF, so each entry brings its own configuration; 05a §5 measures that a runlist
+spanning three separately-compiled ELFs is bit-identical to sequential dispatch in every ordering.
+Aggregating those is the *point* of the seam, and `runlist_gate.py` leg A2 exists to keep the
+xclbin refusal in place while leg A exercises the ELF path — the two are one edit apart and only
+one of them is safe.
 
 ---
 

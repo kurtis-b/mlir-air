@@ -17,16 +17,24 @@ implement are in
 
 Footguns:
 
-- **Runs may only share a runlist when they share a hardware configuration.** On
-  XRT 2.21.0 / NPU2 that means one artifact: a full ELF cannot be rebound into
-  another artifact's `hw_context`, and `hw_context::add_config` takes exactly one
-  config ELF. `plan_submissions` therefore splits the sequence at every artifact
-  change. See `05a-phase-b-runlist-spike-result.md` for the measurements.
+- **Runs may only share a runlist when each one carries its own configuration.**
+  Under the ELF ABI they do: every artifact gets its own `hw_context` from its own
+  full ELF, and a runlist built on any one of those contexts executes runs drawn
+  from all of them, correctly. Under the xclbin ABI they do not — the array
+  configuration comes from the xclbin behind the context, not from the run — so
+  entries there may only share a runlist when they share an artifact.
+  `plan_submissions` splits on exactly that distinction. See
+  `05a-phase-b-runlist-spike-result.md` for both measurements.
 
-- **Never build a cross-configuration runlist "to see what happens".** It executes,
-  raises nothing, times out on nothing, and returns wrong numbers for every entry
-  except the one that supplied the context (05a §4). `RunlistSplitError` exists so
-  that failure mode is unreachable rather than merely discouraged.
+- **Never build a cross-artifact runlist under the xclbin ABI "to see what
+  happens".** It executes, raises nothing, times out on nothing, and returns wrong
+  numbers for every entry except the one that supplied the context (05a §4).
+  `RunlistSplitError` exists so that failure mode is unreachable rather than
+  merely discouraged.
+
+- **Do not try to put two full ELFs into one `hw_context`.** That is what
+  05-phase-b originally proposed and XRT rejects it three different ways (05a §§1-3).
+  Aggregation does not need it: one context per ELF, one runlist across them.
 
 - **The two ABIs number their arguments differently.** Under the ELF ABI buffers
   start at index 0 and the instruction stream is inside the ELF. Under the xclbin
@@ -66,7 +74,9 @@ N_XCLBIN_PREFIX_ARGS = 3
 class RunlistSplitError(RuntimeError):
     """A single runlist was required but the sequence spans hardware configurations.
 
-    Raised at build time, never worked around: see the module docstring and
+    Only reachable under the xclbin ABI, where the configuration comes from the
+    xclbin behind the context rather than from the run. Raised at build time,
+    never worked around: see the module docstring and
     `05a-phase-b-runlist-spike-result.md` §4 for why emitting the runlist anyway
     is worse than failing.
     """
@@ -144,31 +154,56 @@ class DispatchVector:
 
 @dataclass
 class Submission:
-    """One contiguous run of steps sharing an artifact, hence a hw_context."""
+    """One runlist: a contiguous run of steps that may share a submission.
 
-    artifact: str
+    `artifacts` holds the distinct artifacts its entries span, in first-use
+    order. Under the ELF ABI that is often more than one — each entry's run comes
+    from its own artifact's `hw_context` and carries its own configuration. Under
+    the xclbin ABI it is always exactly one.
+    """
+
+    artifacts: tuple = ()
     steps: tuple = ()
     first_index: int = 0
 
     def __len__(self):
         return len(self.steps)
 
+    @property
+    def context_artifact(self):
+        """The artifact whose `hw_context` the runlist object is built on.
 
-def plan_submissions(steps, artifact_of, require_single=False):
+        Any of the spanned contexts works — measured over every ordering and
+        every choice of context in 05a §5 — so the first entry's is used, which
+        makes the choice deterministic and the timing reproducible.
+        """
+        return self.artifacts[0]
+
+
+def plan_submissions(steps, artifact_of, require_single=False, elf_abi=True):
     """Group a dispatch sequence into the submissions the hardware allows.
 
-    Consecutive steps whose artifacts share a hardware configuration go into one
-    submission. On this stack that means an identical artifact name: two
-    separately-compiled artifacts cannot share a `hw_context`, measured in
-    `05a-phase-b-runlist-spike-result.md`.
+    Under the **ELF ABI** every step is aggregatable: each artifact is loaded
+    into its own `hw_context` from its own full ELF, and one `xrt.runlist` built
+    on any one of those contexts executes runs drawn from all of them. The whole
+    sequence becomes one submission. 05a §5 measures that this is bit-identical
+    to sequential dispatch in every ordering and measurably faster.
+
+    Under the **xclbin ABI** it is not: the array configuration comes from the
+    xclbin behind the context, so entries from another artifact execute against
+    the wrong configuration and return wrong numbers with no error raised
+    (05a §4). The sequence is therefore split at every artifact change.
 
     Args:
         steps: ordered list of `DispatchStep`.
-        artifact_of: callable step-kernel-name -> artifact identity. Two steps
-            whose artifacts compare equal may share a runlist.
+        artifact_of: callable step-kernel-name -> artifact identity. Under the
+            xclbin ABI two steps may share a runlist only if these compare equal.
         require_single: raise `RunlistSplitError` instead of splitting. Callers
             that are measuring a "one submission per layer" mode pass True so a
             silent split cannot be recorded as an aggregated dispatch.
+        elf_abi: True when the artifacts are ELFs. Defaults True because that is
+            the path the study's artifacts take; pass it explicitly rather than
+            relying on the default when the ABI is not statically known.
 
     Returns:
         list of `Submission`.
@@ -179,21 +214,28 @@ def plan_submissions(steps, artifact_of, require_single=False):
     subs = []
     for idx, step in enumerate(steps):
         art = artifact_of(step.kernel)
-        if subs and subs[-1].artifact == art:
-            subs[-1].steps = subs[-1].steps + (step,)
+        mergeable = subs and (elf_abi or subs[-1].artifacts == (art,))
+        if mergeable:
+            sub = subs[-1]
+            sub.steps = sub.steps + (step,)
+            if art not in sub.artifacts:
+                sub.artifacts = sub.artifacts + (art,)
         else:
-            subs.append(Submission(artifact=art, steps=(step,), first_index=idx))
+            subs.append(Submission(artifacts=(art,), steps=(step,), first_index=idx))
 
     if require_single and len(subs) > 1:
-        spanned = [s.artifact for s in subs]
+        spanned = [s.context_artifact for s in subs]
         raise RunlistSplitError(
             f"a single runlist was required but the sequence spans "
             f"{len(set(spanned))} hardware configurations across {len(subs)} "
-            f"submissions: {spanned}. Separately-compiled artifacts cannot share "
-            f"an XRT hw_context on this stack — see "
-            f"docs/plans/transformer-layer-execution-studies/"
-            f"05a-phase-b-runlist-spike-result.md. Building the runlist anyway "
-            f"executes without error and returns wrong numbers."
+            f"submissions: {spanned}. Under the xclbin ABI the array "
+            f"configuration comes from the xclbin behind the hw_context, not "
+            f"from the run, so entries from another artifact execute against "
+            f"the wrong configuration — see docs/plans/"
+            f"transformer-layer-execution-studies/"
+            f"05a-phase-b-runlist-spike-result.md §4. Building the runlist "
+            f"anyway executes without error and returns wrong numbers. Compile "
+            f"these artifacts to ELF to aggregate them."
         )
     return subs
 
@@ -380,30 +422,46 @@ def run_sequence(
 
     plan = plan_pool(steps, specs, elf_abi)
 
-    # A slot needs a representative (kernel, arg index) to pick its memory group
-    # under the xclbin ABI (rule C2). Take it from the first step that names a
-    # buffer assigned to that slot.
-    slot_position = {}
-    for step in steps:
-        for i, bufname in enumerate(step.args):
-            slot_position.setdefault(plan.slot_of[bufname], (step.kernel, i))
-
     produced = {n for s in steps for n in s.written_names()}
+    # Only buffers the sequence actually dispatches. `specs` may carry more —
+    # a caller reusing one spec table across several sequences — and a buffer no
+    # step names has no slot in the plan (bo_pool: no position, hence no bank).
+    dispatched = {n for s in steps for n in s.args}
     if host_writes is None:
-        host_writes = {n for n in specs if n not in produced or specs[n].static}
+        host_writes = {n for n in dispatched if n not in produced or specs[n].static}
     else:
         host_writes = set(host_writes)
 
+    # One device for the whole pool (rule O2). Each XRTBackend.load() builds its
+    # own `xrt.device(0)` wrapper, so without this a buffer shared between two
+    # artifacts would be allocated against whichever wrapper happened to be seen
+    # first. They all refer to one physical device, but pinning the choice is
+    # what makes the pool's ownership statement true rather than incidental.
+    pool_device = cache._loaded[steps[0].kernel][0].device
+
     def _alloc(nbytes, slot):
-        backend, _ = cache._loaded[slot_position[slot][0]]
         if elf_abi:
-            return xrt.ext.bo(backend.device, nbytes)
-        arg_index = slot_position[slot][1]
+            return xrt.ext.bo(pool_device, nbytes)
+        # Under the xclbin ABI the memory group is a function of (kernel, arg
+        # index) (rule C2), and `plan.slot_positions` holds every position this
+        # slot is bound at. They normally agree; when the sequence forces one BO
+        # across positions that disagree, refuse rather than bank it for the
+        # first one and hand the rest a buffer in the wrong group.
+        groups = {}
+        for kernel_name, arg_index in plan.slot_positions[slot]:
+            backend, _ = cache._loaded[kernel_name]
+            groups[(kernel_name, arg_index)] = backend.kernel.group_id(
+                arg_index + N_XCLBIN_PREFIX_ARGS
+            )
+        if len(set(groups.values())) > 1:
+            raise ValueError(
+                f"slot {slot} is bound at positions in different memory groups "
+                f"({groups}); one BO cannot satisfy both. Give the buffer a "
+                f"distinct identity per position, or compile to ELF where "
+                f"`xrt.ext.bo` carries no group id (rule C2)."
+            )
         return xrt.bo(
-            backend.device,
-            nbytes,
-            xrt.bo.host_only,
-            backend.kernel.group_id(arg_index + N_XCLBIN_PREFIX_ARGS),
+            pool_device, nbytes, xrt.bo.host_only, next(iter(groups.values()))
         )
 
     vector = DispatchVector(runlist_entries=len(steps))
@@ -415,14 +473,25 @@ def run_sequence(
     def _from_device(bo):
         bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
 
-    pool = cache.pool_for(plan, _alloc, _to_device, _from_device)
+    # Before `pool_for`, so a sequence refused by `require_single_submission`
+    # does not leave an empty pool behind under its signature.
     subs = plan_submissions(
-        steps, lambda k: cache.artifacts[k].output_binary, require_single_submission
+        steps,
+        lambda k: cache.artifacts[k].output_binary,
+        require_single_submission,
+        elf_abi=elf_abi,
     )
+    pool = cache.pool_for(plan, _alloc, _to_device, _from_device)
 
     with filelock.FileLock("/tmp/npu.lock"):
         t_sync = time.perf_counter()
         for name in sorted(host_writes):
+            # A static weight is written to its BO once and never again (S2).
+            # Pools outlive a sequence, so on the second and later dispatches
+            # this skips the copy as well as the sync — which is most of what
+            # makes a repeated sequence cheap.
+            if specs[name].static and pool.is_static_resident(name, plan):
+                continue
             src_arr = arrays[name]
             src = np.frombuffer(
                 src_arr.view(np.int16) if src_arr.dtype == bfloat16 else src_arr,
@@ -452,9 +521,13 @@ def run_sequence(
                     vector.sync_boundaries += 1
 
         for sub_idx, sub in enumerate(subs):
-            backend, _ = cache._loaded[sub.steps[0].kernel]
             runs = []
             for step in sub.steps:
+                # Per step, not per submission: a submission may span artifacts
+                # under the ELF ABI, and each entry has to be a run of *its own*
+                # artifact's kernel. Taking the first step's kernel for all of
+                # them would execute the wrong program with the right buffers.
+                backend, _ = cache._loaded[step.kernel]
                 bos = [pool.bo_for(n, plan) for n in step.args]
                 run = xrt.run(backend.kernel)
                 _bind_args(
@@ -473,7 +546,8 @@ def run_sequence(
                     vector.air_launches += counts.get("air_launches", 0)
                     vector.herd_launches += counts.get("herd_launches", 0)
 
-            elapsed = submit(xrt, backend.context, runs, sub.steps, sub_idx)
+            ctx_backend, _ = cache._loaded[sub.steps[0].kernel]
+            elapsed = submit(xrt, ctx_backend.context, runs, sub.steps, sub_idx)
             vector.submission_ms += elapsed * 1000.0
             vector.host_submissions += 1
             counted[sub_idx] = len(sub.steps)
@@ -483,7 +557,8 @@ def run_sequence(
 
         t_sync = time.perf_counter()
         results = {}
-        for name, spec in specs.items():
+        for name in sorted(dispatched):
+            spec = specs[name]
             if not spec.host_output:
                 continue
             pool.sync_from_device(name, plan)
