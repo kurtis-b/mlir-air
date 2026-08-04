@@ -110,7 +110,17 @@ measurement model needs revisiting before Phase F consumes it.
 - If Phase B's multi-ELF runlist assumption failed, `runlist` and `coarse` cannot be built as
   specified and this phase must be rescoped. **It did not** — one `hw_context` per ELF and one
   runlist across them is bit-identical to sequential dispatch and measurably faster
-  ([05a §5](05a-phase-b-runlist-spike-result.md)). What is still unmeasured is how many
-  concurrent `hw_context`s NPU2 grants: three is confirmed, `runlist` wants 29. If that binds it
-  binds loudly — `xrt.hw_context` raises at load time rather than returning wrong numbers — so
-  the rescope would be forced by an exception, not discovered in the results.
+  ([05a §5](05a-phase-b-runlist-spike-result.md)).
+- **The `hw_context` ceiling is 32 on this device — measured, not assumed.** `runlist` wants 29,
+  so it fits with three to spare. Probed by opening contexts while holding every prior one until
+  XRT refused: contexts 1-32 succeeded, 33 failed with
+  `RuntimeError: DRM_IOCTL_AMDXDNA_CREATE_HWCTX IOCTL failed (err=-2)`. That confirms the failure
+  is loud and at load time, so a future overrun surfaces as an exception rather than as wrong
+  numbers.
+
+  Two caveats on the margin. The probe cycled **4 distinct ELFs** to reach 32 contexts, so what
+  is demonstrated is a limit on concurrent *contexts*, not on 29 *distinct* ELFs; if the ceiling
+  turns out to depend on per-ELF resources rather than context count alone, 29 distinct designs
+  could bind sooner. And three spare is thin — anything else holding a context on the device
+  concurrently (another example, a stray process, a future mode wanting one more kernel) eats the
+  margin. Re-probe with the real 29 artifacts before relying on it.
