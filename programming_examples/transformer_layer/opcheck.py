@@ -69,9 +69,16 @@ FOOTGUNS
     - External kernel objects are written to the CURRENT WORKING DIRECTORY,
       because that is where aiecc's ``link_with`` search looks. Results, by
       contrast, always land next to this file. Run from a scratch directory.
-    - ``encoder.o`` is built with the addnorm half only. Building both halves
-      collides with ``addnorm_ffn.o`` on ``ffn_gelu_bf16`` and
-      ``ffn_eltwise_add_bf16_vector``.
+    - encoder.cc is built TWICE here, to two objects, each with one half:
+      ``encoder.o`` (addnorm half, for ``addnorm``) and ``encoder_ffn.o`` (FFN
+      half, for ``ffn``). Building both halves into one object collides with
+      ``addnorm_ffn.o`` on ``ffn_gelu_bf16`` and
+      ``ffn_eltwise_add_bf16_vector``, and neither operator needs the other's
+      half. ``compile_kernels.py`` checks that the split actually happened.
+    - The GEMM-backed operators need extra backend settings that the C1
+      operators do not -- BD-ID recycling and ELF output. They are declared per
+      spec, so adding an operator that forgets them fails to place rather than
+      quietly inheriting the wrong ones. See ``_GEMM_RUNNER_KWARGS``.
     - This dispatches to the NPU. Serialize it on ``/tmp/mlir-air-npu.lock``
       -- a DIFFERENT inode from the ``/tmp/npu.lock`` ``XRTRunner`` takes
       internally, since both are BSD ``flock(2)`` and one inode self-deadlocks.
@@ -100,9 +107,20 @@ from builders.elementwise_add import (  # noqa: E402
     causal_mask_bias,
     elementwise_add_reference,
 )
+from builders.ffn import (  # noqa: E402
+    build_ffn_module,
+    ffn_device_inputs,
+    ffn_gemm_specs,
+    ffn_reference,
+)
 from builders.layer_norm import (  # noqa: E402
     build_layer_norm_module,
     layer_norm_reference,
+)
+from builders.qkv_proj import (  # noqa: E402
+    build_qkv_proj_module,
+    qkv_gemm_spec,
+    qkv_proj_reference,
 )
 
 # Held fixed across every kernel in the registry; `atol` is what moves, sized to
@@ -243,9 +261,164 @@ def _prepare_addnorm(shape, seed=3):
     }
 
 
-# Every (operator, shape) C1 claims. `atol` is the measured worst-case absolute
-# error rounded up, per the kernel_registry methodology; `rtol` is fixed at RTOL
-# for all of them.
+# ---------------------------------------------------------------------------
+# GEMM-backed operators (C2)
+#
+# HOW THEIR DATA IS SCALED, AND WHY IT IS NOT A FREE CHOICE
+#     The external GEMM's error is dominated by its bfp16 MMUL emulation, not by
+#     the bf16 output rounding: the registry records mean_rel_L1 = 9.3e-3 for it
+#     and these runs measure 9.7e-3, i.e. roughly 1% of the OUTPUT's own
+#     magnitude. So the absolute error a run reports is proportional to how big
+#     the output is, and quoting an `atol` only means something alongside the
+#     scale it was measured at.
+#
+#     The scale used here is the one the registry's own GEMM sweep uses
+#     (matrix_multiplication/bf16_in_bf16_out/run.py): operands ~ N(0, 1/sqrt(K))
+#     for a reduction of depth K, which puts the product at 1/sqrt(K). Every
+#     `atol` below is then the MEASURED worst-case absolute error at that scale
+#     rounded up, ~2-3x, exactly as the registry's GEMM rows are sized -- and it
+#     makes the mean_rel_L1 recorded here directly comparable with them.
+#
+#     The one departure is the FFN's up-projection, which is scaled to put its
+#     output at unit variance instead. GeLU is only interesting on |x| ~ 1-3;
+#     at 1/sqrt(K) the whole tensor would sit inside +/-0.15 where the
+#     activation is indistinguishable from 0.5x, and the operator's own stage
+#     would go untested.
+#
+# WHY THEIR RUNS NEED EXTRA BACKEND SETTINGS
+#     `runtime_loop_tiling_sizes=[2,2]` for BD-ID recycling, and ELF output for
+#     multi-segment designs. Both are placement/packaging concerns; neither
+#     touches the comparison. See _GEMM_RUNNER_KWARGS.
+# ---------------------------------------------------------------------------
+
+# Backend settings both GEMM-backed operators need.
+#   runtime_loop_tiling_sizes: BD-ID recycling. A fused-cast GEMM herd runs out
+#     of buffer descriptors without it, which surfaces as a placement failure.
+#   output_format "elf": these designs are MULTI-SEGMENT -- one aie.device per
+#     air.launch, driven by an aiex.configure/aiex.run runtime sequence. The
+#     xclbin path names a single instruction blob on the aircc command line, so
+#     a second segment collides on it and aiecc stops with "produced duplicate
+#     output path". ELF is the format the shipped multi-launch llama builders
+#     use for exactly this reason, and it is not a relaxation of anything: the
+#     comparison downstream is identical.
+_GEMM_RUNNER_KWARGS = {
+    "runtime_loop_tiling_sizes": [2, 2],
+    "output_format": "elf",
+}
+
+
+def _registry_gemm_scale(k):
+    """Operand scale the registry's GEMM sweep uses for a depth-``k`` reduction.
+
+    Both operands at ``1/sqrt(k)`` put the product at ``1/sqrt(k)`` too. Copied
+    from ``matrix_multiplication/bf16_in_bf16_out/run.py`` so the error figures
+    recorded here sit on the same axis as the registry's GEMM rows.
+    """
+    return 1.0 / np.sqrt(k)
+
+
+def _unit_output_scale(k):
+    """Operand scale that puts a depth-``k`` product at unit variance.
+
+    Both operands at ``k^-0.25``: the reduction multiplies the two scales ``k``
+    times. Used only where a downstream stage needs activation-sized inputs --
+    the FFN's GeLU.
+    """
+    return k**-0.25
+
+
+# E[gelu(x)^2] for x ~ N(0, 1). Used to size the down-projection weight so its
+# output lands where the registry's GEMM sweep would put a depth-`ffn_dim`
+# reduction, rather than sqrt(1/0.42) ~ 1.5x above it.
+_GELU_SECOND_MOMENT = 0.42
+
+
+def _prepare_qkv_proj(shape, seed=4):
+    seq_len, emb_dim = shape["seq_len"], shape["emb_dim"]
+    n_total = 3 * emb_dim
+    spec, source = qkv_gemm_spec(seq_len, emb_dim)
+    ek.compile_gemm_mm(
+        tile_m=spec["tile_m"],
+        tile_n=spec["tile_n"],
+        tile_k_l1=spec["tile_k_l1"],
+        sym_suffix=spec["sym_suffix"],
+        out_name=spec["obj"],
+    )
+    rng = np.random.default_rng(seed)
+    scale = _registry_gemm_scale(emb_dim)
+    x = (rng.standard_normal((seq_len, emb_dim)) * scale).astype(bfloat16)
+    w = (rng.standard_normal((emb_dim, n_total)) * scale).astype(bfloat16)
+    return {
+        "module": build_qkv_proj_module(seq_len, emb_dim),
+        # arg2 is the f32 C scratch: an input slot the device writes, not an
+        # output. See builders/qkv_proj.py on why it precedes q/k/v.
+        "inputs": [x, w, np.zeros((seq_len, n_total), dtype=np.float32)],
+        "expected": list(qkv_proj_reference(x, w)),
+        "inject": (0, (seq_len - 1, 0)),
+        "runner_kwargs": _GEMM_RUNNER_KWARGS,
+        "record_extra": {"gemm_spec_source": source, "gemm_spec": _spec_digest(spec)},
+    }
+
+
+def _prepare_ffn(shape, seed=5):
+    seq_len, emb_dim = shape["seq_len"], shape["emb_dim"]
+    ffn_dim = shape["ffn_dim"]
+    up_spec, down_spec, source = ffn_gemm_specs(seq_len, emb_dim, ffn_dim)
+    for spec in (up_spec, down_spec):
+        ek.compile_gemm_mm(
+            tile_m=spec["tile_m"],
+            tile_n=spec["tile_n"],
+            tile_k_l1=spec["tile_k_l1"],
+            sym_suffix=spec["sym_suffix"],
+            out_name=spec["obj"],
+        )
+    # encoder.cc's FFN half only. Building the addnorm half too would collide
+    # with addnorm_ffn.o on ffn_gelu_bf16, and this ELF needs neither.
+    ek.compile_encoder(build_ffn=True, build_addnorm=False, out_name="encoder_ffn.o")
+
+    rng = np.random.default_rng(seed)
+    # Up-projection at unit output variance so GeLU is exercised where it is
+    # nonlinear; down-projection weight sized to land y where the registry's
+    # sweep puts a depth-ffn_dim reduction. See the section header above.
+    up_scale = _unit_output_scale(emb_dim)
+    down_scale = _registry_gemm_scale(ffn_dim) / np.sqrt(ffn_dim * _GELU_SECOND_MOMENT)
+    x = (rng.standard_normal((seq_len, emb_dim)) * up_scale).astype(bfloat16)
+    w_up = (rng.standard_normal((emb_dim, ffn_dim)) * up_scale).astype(bfloat16)
+    w_down = (rng.standard_normal((ffn_dim, emb_dim)) * down_scale).astype(bfloat16)
+    return {
+        "module": build_ffn_module(seq_len, emb_dim, ffn_dim),
+        "inputs": ffn_device_inputs(x, w_up, w_down, up_spec, down_spec),
+        "expected": [ffn_reference(x, w_up, w_down)],
+        "inject": (0, (seq_len - 1, 0)),
+        "runner_kwargs": _GEMM_RUNNER_KWARGS,
+        "record_extra": {
+            "gemm_spec_source": source,
+            "gemm_spec_up": _spec_digest(up_spec),
+            "gemm_spec_down": _spec_digest(down_spec),
+        },
+    }
+
+
+def _spec_digest(spec):
+    """The part of a GEMM spec worth recording: method and the four tiles.
+
+    Written into the results artifact so a spec that came from ``gemm_spec_fn``
+    rather than the registry is VISIBLE there. The phase allows that injection
+    hook for an unmeasured shape precisely on the condition that the guess is
+    not silent.
+    """
+    return {
+        "method": spec["method"],
+        "tile_m": spec["tile_m"],
+        "tile_k_l2": spec["tile_k_l2"],
+        "tile_k_l1": spec["tile_k_l1"],
+        "tile_n": spec["tile_n"],
+    }
+
+
+# Every (operator, shape) C1 and C2 claim. `atol` is the measured worst-case
+# absolute error rounded up, per the kernel_registry methodology; `rtol` is fixed
+# at RTOL for all of them.
 SPECS = [
     {
         "operator": "elementwise_add",
@@ -277,6 +450,31 @@ SPECS = [
         "atol": 5e-2,
         "prepare": _prepare_addnorm,
     },
+    {
+        # The only registered projection shapes are (M, K, 3K) for K in
+        # {1024, 2048}; 2048x1024x3072 is the smaller of the two. See the
+        # structured report for the case-matrix shapes C4 still has to measure.
+        "operator": "qkv_proj",
+        "shape_key": "2048x1024",
+        "shape": {"seq_len": 2048, "emb_dim": 1024},
+        # Measured abs_err max 1.95e-3 over 6.3M elements at the registry GEMM
+        # scale, mean_rel_L1 9.9e-3 -- which is the registry's own 9.3e-3 for
+        # this GEMM, so the split-cast launches add nothing measurable. atol is
+        # that worst case rounded up, 2.6x.
+        "atol": 5e-3,
+        "prepare": _prepare_qkv_proj,
+    },
+    {
+        "operator": "ffn",
+        "shape_key": "2048x1024x3072",
+        "shape": {"seq_len": 2048, "emb_dim": 1024, "ffn_dim": 3072},
+        # Measured abs_err max 1.59e-3 over 2.1M elements, mean_rel_L1 1.6e-2 --
+        # roughly 1.6x the single GEMM's, which is where the bf16 staging of h
+        # and the activation's bf16 intermediates show up against an FP32
+        # reference. atol is that worst case rounded up, 3.1x.
+        "atol": 5e-3,
+        "prepare": _prepare_ffn,
+    },
 ]
 
 
@@ -298,7 +496,7 @@ def _inject(inputs, where, delta=FAULT_DELTA):
     return perturbed
 
 
-def _write_result(spec, stats, passed, fault_inject):
+def _write_result(spec, stats, passed, fault_inject, extra=None):
     directory = FAULT_RESULTS_DIR if fault_inject else RESULTS_DIR
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{spec['operator']}__{spec['shape_key']}.json"
@@ -320,6 +518,11 @@ def _write_result(spec, stats, passed, fault_inject):
         "passed": passed,
         "fault_injected": fault_inject,
     }
+    # Operator-specific provenance (e.g. which GEMM method and tiles were
+    # resolved, and whether they came from the registry). Merged after the
+    # fixed fields so an operator cannot overwrite the verdict it is reporting.
+    for key, value in (extra or {}).items():
+        record.setdefault(key, value)
     path.write_text(json.dumps(record, indent=2) + "\n")
     print(f"[opcheck] wrote {path}")
     return record
@@ -344,13 +547,19 @@ def run_spec(spec, fault_inject=None, verbose=False):
     elif fault_inject is not None:
         raise ValueError(f"unknown fault-inject mode {fault_inject!r}")
 
-    runner = _RecordingRunner(
-        verbose=verbose,
-        omit_while_true_loop=False,
-        output_format="xclbin",
-        instance_name=spec["operator"],
-        report_precision=True,
-    )
+    runner_kwargs = {
+        "verbose": verbose,
+        "omit_while_true_loop": False,
+        "output_format": "xclbin",
+        "instance_name": spec["operator"],
+        "report_precision": True,
+    }
+    # Per-operator backend settings, e.g. the BD-ID recycling and the ELF output
+    # format a multi-segment design needs. Nothing here can reach the
+    # comparison: run_test takes the tolerances separately and _check_outputs is
+    # _RecordingRunner's.
+    runner_kwargs.update(prepared.get("runner_kwargs", {}))
+    runner = _RecordingRunner(**runner_kwargs)
     return_code = runner.run_test(
         prepared["module"],
         inputs=inputs,
@@ -359,7 +568,9 @@ def run_spec(spec, fault_inject=None, verbose=False):
         atol=spec["atol"],
     )
     passed = return_code == 0
-    record = _write_result(spec, runner.stats, passed, fault_inject)
+    record = _write_result(
+        spec, runner.stats, passed, fault_inject, extra=prepared.get("record_extra")
+    )
 
     verdict = "PASS" if passed else "FAIL"
     print(f"[opcheck] {label}: {verdict}")

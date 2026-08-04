@@ -1,0 +1,48 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase C2 operator gate: qkv_proj.
+//
+// One GEMM over the full 3*emb_dim fused weight, with C split three ways by
+// three cast launches so Q, K and V land in separate DDR buffers without a
+// host-side slice. Tiles and method come from kernel_registry, which raises
+// rather than guessing on an unmeasured shape -- so a shape that is not in the
+// registry fails here loudly instead of running with a hand-copied tiling.
+//
+// Runs opcheck.py on real NPU2 against an FP32 reference: np.isclose over the
+// full output at rtol=1.6e-2, zero permitted mismatches, across all three
+// outputs. Not cosine similarity -- kernel_registry/README.md is explicit that
+// a correlation gate is blind to a systematic per-element scale error.
+//
+// The three precision lines below are checked individually and in order. A
+// build that wired all three split-cast launches at the same column offset
+// would still emit three outputs and still pass a check that only looked at
+// the verdict; requiring three distinct precision reports and then the named
+// operator makes the shape of the evidence part of the gate.
+//
+// NPU serialization lives one layer down, not in the recipe below. Device
+// access is locked on /tmp/npu.lock, which XRTRunner.run_test holds across
+// binary load and dispatch (python/air/backend/xrt_runner.py:292) -- the same
+// inode lit.cfg.py's NPU substitution and KernelCache take, so this interlocks
+// with every other NPU job in the repository while the peano compiles still
+// overlap. Taking the outer /tmp/mlir-air-npu.lock here instead would DEADLOCK:
+// the gate command that invokes this suite already holds that inode, and BSD
+// flock(2) treats a second open() of the same file as a foreign lock, so the
+// nested acquire would block against its own parent until the timeout expires.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming
+// one in prose -- even inside a comment -- registers as a second directive and
+// leaves the test UNRESOLVED. Describe them, never spell them out.
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_npu2_qkv_proj_peano
+// RUN: cd test_npu2_qkv_proj_peano
+// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile check-qkv-proj PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+//
+// CHECK: [precision] Output 0
+// CHECK: [precision] Output 1
+// CHECK: [precision] Output 2
+// CHECK: PASS!
+// CHECK: [opcheck] qkv_proj [2048x1024]: PASS

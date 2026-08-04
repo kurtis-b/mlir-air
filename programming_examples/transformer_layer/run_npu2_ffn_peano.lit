@@ -1,0 +1,47 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase C2 operator gate: ffn.
+//
+// Staged up-projection, GeLU, down-projection as five launches in one ELF.
+// Both GEMMs take their method and tiles from kernel_registry per shape,
+// including the memory-tile accumulation depth iron calls down_proj_depth; the
+// activation is the ported ffn_gelu_bf16, linked from encoder.cc's FFN half.
+//
+// Runs opcheck.py on real NPU2 against an FP32 reference: np.isclose over the
+// full output at rtol=1.6e-2, zero permitted mismatches. The reference uses the
+// TANH approximation, matching the kernel and HuggingFace's gelu_pytorch_tanh
+// -- iron's oracle calls torch's erf-form default, whose difference hides at
+// iron's 4e-2 tolerance and does not hide at this one.
+//
+// The reference is FP32 end to end and reproduces neither the bf16 staging of
+// the up-projection output nor the activation kernel's bf16 intermediates. That
+// is deliberate, and it is why this operator's absolute error is above a single
+// GEMM's; the tolerance is sized to the measured worst case, not to the gap.
+//
+// NPU serialization lives one layer down, not in the recipe below. Device
+// access is locked on /tmp/npu.lock, which XRTRunner.run_test holds across
+// binary load and dispatch (python/air/backend/xrt_runner.py:292) -- the same
+// inode lit.cfg.py's NPU substitution and KernelCache take, so this interlocks
+// with every other NPU job in the repository while the peano compiles still
+// overlap. Taking the outer /tmp/mlir-air-npu.lock here instead would DEADLOCK:
+// the gate command that invokes this suite already holds that inode, and BSD
+// flock(2) treats a second open() of the same file as a foreign lock, so the
+// nested acquire would block against its own parent until the timeout expires.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming
+// one in prose -- even inside a comment -- registers as a second directive and
+// leaves the test UNRESOLVED. Describe them, never spell them out.
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_npu2_ffn_peano
+// RUN: cd test_npu2_ffn_peano
+// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile check-ffn PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+//
+// Both lines, not just the verdict: the first is XRTRunner's own, the second
+// names the operator and shape, so a test wired to the wrong operator fails
+// here rather than passing quietly.
+// CHECK: PASS!
+// CHECK: [opcheck] ffn [2048x1024x3072]: PASS

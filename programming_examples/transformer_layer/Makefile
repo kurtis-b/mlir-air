@@ -17,7 +17,7 @@ OPCHECK_ARGS ?=
 
 .PHONY: help compile runlist-gate seam-tests clean opcheck-list \
         check-elementwise-add check-causal-mask check-layer-norm check-addnorm \
-        check-fault-control
+        check-qkv-proj check-ffn check-fault-control
 
 help:
 	@echo "Transformer-layer AIE2P device kernels, the Phase B runtime seam, and"
@@ -32,8 +32,11 @@ help:
 	@echo "  make runlist-gate   Phase B hardware gate. NEEDS AN NPU. Wrap it:"
 	@echo "                        flock -x -w 1800 /tmp/mlir-air-npu.lock make runlist-gate"
 	@echo "  make check-elementwise-add | check-causal-mask | check-layer-norm |"
-	@echo "       check-addnorm  One operator's numerical check against its FP32"
+	@echo "       check-addnorm | check-qkv-proj | check-ffn"
+	@echo "                      One operator's numerical check against its FP32"
 	@echo "                      reference. NEEDS AN NPU; wrap it the same way."
+	@echo "                      qkv-proj and ffn take their GEMM tiles from"
+	@echo "                      kernel_registry and take minutes to compile."
 	@echo "  make clean          Remove $(BUILD_DIR)."
 	@echo ""
 	@echo "Variables: TILE_M=$(TILE_M) TILE_K=$(TILE_K) TILE_N=$(TILE_N)"
@@ -83,6 +86,15 @@ check-layer-norm:
 
 check-addnorm:
 	$(call opcheck,addnorm)
+
+# The two GEMM-backed operators. Their tile sizes and method come from
+# kernel_registry per shape, so there is nothing to set here; the registry
+# raises rather than guessing if the shape was never swept.
+check-qkv-proj:
+	$(call opcheck,qkv_proj)
+
+check-ffn:
+	$(call opcheck,ffn)
 
 # The negative control: it succeeds only when the injected run is REJECTED BY
 # THE COMPARISON. A check that ignored --fault-inject, or one whose tolerance

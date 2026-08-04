@@ -35,6 +35,10 @@ FOOTGUNS
     - ``encoder.o`` and ``addnorm_ffn.o`` both define ``ffn_gelu_bf16`` and
       ``ffn_eltwise_add_bf16_vector``. They are built here as separate objects
       and are NOT linkable into a single ELF without renaming one set.
+      ``encoder_ffn.o`` is the narrow way out: encoder.cc's FFN half only, which
+      the ``ffn`` operator links for ``ffn_gelu_bf16`` alone. It still collides
+      with ``addnorm_ffn.o``; it does not collide with the addnorm half, which
+      is the collision the ``addnorm`` operator's own ELF has to avoid.
     - The two ``addnorm_ffn`` variants differ only in whether the residual is
       folded in before the normalization statistics. Both are built here, to
       distinct object names, precisely because they are easy to confuse.
@@ -221,6 +225,35 @@ def build_plan(tile_m, tile_k, tile_n):
             ],
         ),
         (
+            # The FFN half on its own, which is what the `ffn` operator links.
+            # It needs ffn_gelu_bf16 next to the registry's mm_*.o, and the
+            # addnorm half would drag in symbols addnorm_ffn.o also defines.
+            # Built here rather than only inside opcheck.py so a build that
+            # loses -DBUILD_FFN is caught by the compile-only gate: without it
+            # encoder.cc emits an empty-but-valid object that links fine and
+            # fails at dispatch.
+            "Encoder block, FFN half only",
+            lambda: ek.compile_encoder(
+                tile_m=tile_m,
+                tile_k=tile_k,
+                tile_n=tile_n,
+                build_ffn=True,
+                build_addnorm=False,
+                out_name="encoder_ffn.o",
+            ),
+            "encoder_ffn.o",
+            [
+                "ffn_zero_bf16_up_proj",
+                "ffn_zero_bf16_down_proj",
+                "ffn_matmul_init_bf16_bf16_up_proj",
+                "ffn_matmul_bf16_bf16_up_proj",
+                "ffn_matmul_init_bf16_bf16_down_proj",
+                "ffn_matmul_with_acc_bf16_bf16_down_proj",
+                "ffn_gelu_bf16",
+                "ffn_eltwise_add_bf16_vector",
+            ],
+        ),
+        (
             "AddNorm+FFN, post-add residual",
             lambda: ek.compile_addnorm_ffn(
                 tile_m=tile_m,
@@ -295,6 +328,41 @@ def check_pre_add_variants_differ():
     print("  addnorm_ffn pre-add / post-add variants differ, as expected")
 
 
+# encoder.cc's addnorm half, i.e. the symbols encoder_ffn.o must NOT carry.
+_ADDNORM_ONLY_SYMBOLS = [
+    "fused_add_layer_norm_1outs",
+    "fused_add_layer_norm_2outs",
+    "fused_layer_norm_1outs",
+    "ln_mul_weights_1outs",
+    "ln_calc_sum_sumsq",
+]
+
+
+def check_ffn_half_excludes_addnorm():
+    """encoder_ffn.o must be the FFN half ONLY.
+
+    ``check_object`` proves the symbols a builder calls are present; nothing
+    there proves the ones it must not carry are absent. That matters for this
+    object specifically: its whole reason to exist is that the `ffn` operator
+    can link it beside another object without a duplicate-symbol collision. If
+    ``build_addnorm=False`` ever stopped reaching encoder.cc, this object would
+    silently become a second full encoder.o -- still passing every presence
+    check, and breaking only at link time in whichever design happened to
+    combine them.
+    """
+    present = defined_symbols(Path("encoder_ffn.o"))
+    leaked = sorted(set(_ADDNORM_ONLY_SYMBOLS) & present)
+    if leaked:
+        raise RuntimeError(
+            f"encoder_ffn.o defines addnorm-half symbols {leaked}: "
+            "build_addnorm=False is not reaching encoder.cc"
+        )
+    print(
+        f"  encoder_ffn.o carries none of the {len(_ADDNORM_ONLY_SYMBOLS)} "
+        "addnorm-half symbols, as expected"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     ffn_tile_help = (
@@ -314,6 +382,7 @@ def main():
         check_object(obj_name, symbols)
 
     check_pre_add_variants_differ()
+    check_ffn_half_excludes_addnorm()
 
     print(f"Built and checked {len(plan)} kernel objects.")
     print("Compilation passed.")
