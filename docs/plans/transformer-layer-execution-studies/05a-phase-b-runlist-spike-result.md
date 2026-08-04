@@ -80,16 +80,48 @@ implementation must refuse to build such a runlist rather than emit it.
 ### 5. What does work: aggregation inside one artifact's context
 
 A runlist over several runs of one artifact's kernel is bit-identical to sequential dispatch and
-measurably faster. Two 512×512×512 GEMM dispatches:
+measurably faster. The saving is one host submission — a fixed cost of order 100 µs — so it is
+large relative to small kernels and small relative to large ones:
 
-| | ms/iter |
-|---|---|
-| sequential (2 submissions) | 0.888 |
-| runlist (2 runs, 1 submission) | 0.774 |
+| Pair | sequential (2 submissions) | runlist (1 submission) | |
+|---|---|---|---|
+| 512×512×512 GEMM ×2 | 0.888 ms | 0.774 ms | 1.15× |
+| 2048×2048×8192 GEMM ×2 (gate + up) | 19.37 ms | 19.04 ms | 1.02× |
 
-1.15× on a workload where the kernels themselves dominate. The saving is per *submission*, so it
-grows with entry count and shrinks with kernel size — which is exactly the axis the study wants
-to measure.
+That ratio *is* the axis the study wants to measure: submission cost matters exactly to the
+degree that the work per submission is small. It also means a latency comparison on large
+kernels needs interleaved medians rather than two back-to-back blocks — thermal drift over a
+20 ms×15 benchmark is larger than a 300 µs effect. `runlist_gate.py` does that.
+
+### 6. Unrelated defect found en route: the standalone drain GEMM ELF is single-shot
+
+Not caused by this port and not a Phase B change, but it was found by anchoring the gate's
+baseline against an FP32 oracle, and it will mislead anyone who compiles a GEMM the way the
+study's `offload` mode does.
+
+A `drain`-method GEMM compiled to its own ELF (registry shape 2048×2048×512) is correct on the
+**first** invocation after load and wrong on every one after it:
+
+```
+same bo_key, call 0: 100.00% of elements within rtol=1.6e-2 atol=1.5e-3
+same bo_key, call 1:  10.63%
+same bo_key, call 2:  10.52%
+new bo_key  k0:       10.68%
+```
+
+It is not a buffer-reuse problem: a fresh BO set is equally wrong. The `fused-cast` method at
+the same seq_len is correct across arbitrarily many calls and BO sets, which is why the shipped
+deployments do not hit this — they reach drain GEMMs only inside fused multi-launch ELFs, never
+as a standalone artifact.
+
+Two things follow. The study's `offload` mode cannot use standalone drain ELFs until this is
+fixed, and the registry's `best.high = drain` shapes are the ones affected. `runlist_gate.py`
+leg D re-measures it on every run so the finding cannot go stale.
+
+Separately: omitting `runtime_loop_tiling_sizes=[2, 2]` and `stack_size=2048` from a standalone
+GEMM ELF's backend kwargs produces an artifact that compiles, loads, runs, and returns different
+numbers on every call. Both the example's own runner and the shipped `O_FFN_BACKEND` preset set
+them; they are not optional.
 
 ## Consequences for the plan
 

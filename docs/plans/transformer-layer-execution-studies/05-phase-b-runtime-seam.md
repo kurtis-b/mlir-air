@@ -5,6 +5,14 @@ Two host-side additions: runlist aggregation, and buffer-object liveness pooling
 **This phase contains the plan's load-bearing assumption. Spike it before committing to
 anything else.**
 
+> **The spike was run and the assumption does not hold.** §"The resolution" below is
+> API-shape reasoning that XRT 2.21.0 / NPU2 rejects: an AIR ELF is a *full* ELF carrying its
+> own array configuration, and a `hw_context` accepts exactly one of those. Read
+> [05a-phase-b-runlist-spike-result.md](05a-phase-b-runlist-spike-result.md) before acting on
+> anything in §1 — it records what was measured, what was shipped instead, and the three
+> remaining routes to a multi-artifact runlist. The buffer rules asked for in work item 2 are in
+> [05b-phase-b-buffer-rules.md](05b-phase-b-buffer-rules.md).
+
 ## 1. Runlist aggregation
 
 ### The problem

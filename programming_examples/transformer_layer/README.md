@@ -5,14 +5,42 @@ studies](../../docs/plans/transformer-layer-execution-studies/04-phase-a-kernels
 the C++ device kernels a full encoder/decoder block needs, compiled with Peano
 for AIE2P.
 
-This example builds device kernels; it does not dispatch them. There is no
-`run` target and no NPU is required, which is what makes the suite safe as a PR
-gate.
+It also holds Phase B's runtime-seam gate. The kernel half needs no NPU, which is
+what keeps it safe as a PR gate; the seam half is split the same way — host-only
+unit tests, plus one hardware gate.
 
 ```bash
-make compile                 # build every object and check its symbols
+make compile                 # build every object and check its symbols (no NPU)
+make seam-tests              # BO pooling + runlist aggregation rules (no NPU)
 ninja -C build-xrt check-programming-examples-transformer-layer
+
+flock -x -w 1800 /tmp/mlir-air-npu.lock make runlist-gate   # NEEDS AN NPU
 ```
+
+## The Phase B runtime seam
+
+`runlist_gate.py` is
+[Phase B](../../docs/plans/transformer-layer-execution-studies/05-phase-b-runtime-seam.md)'s
+gate. **It currently fails, on purpose.** The plan's load-bearing assumption — that several
+separately-compiled ELFs can be bound into one XRT `hw_context` and submitted as one runlist —
+does not hold on XRT 2.21.0 / NPU2. An AIR ELF is a *full* ELF: it carries its own array
+configuration, and a `hw_context` accepts exactly one of those.
+[05a](../../docs/plans/transformer-layer-execution-studies/05a-phase-b-runlist-spike-result.md)
+records every route that was tried and the three that remain, none of which is a Phase B change.
+
+What the seam does deliver, and what legs B–D of the gate measure:
+
+| | |
+|---|---|
+| `llms/shared/infra/dispatch.py` | Groups a dispatch sequence into the submissions the hardware allows, and owns the six-field dispatch vector. Refuses to build a runlist spanning configurations — one of those *executes* and returns wrong numbers with no error, so refusing is the only safe behaviour. |
+| `llms/shared/infra/bo_pool.py` | Live ranges over the sequence, 4 KiB-binned slot sharing, a content-keyed static-weight pool, and a dirty bit per BO so only written buffers sync to device and only declared outputs come back. |
+
+The rules both modules implement are written down in
+[05b](../../docs/plans/transformer-layer-execution-studies/05b-phase-b-buffer-rules.md) *before*
+the code, and the module docstrings name its sections. Read it before changing either module —
+the failure modes here (a pooled BO is larger than its buffer, returned arrays are zero-copy
+views into pool memory, an xclbin-ABI slot is keyed by argument index because that picks the
+memory bank) all produce plausible wrong numbers rather than errors.
 
 ## What lives here
 
