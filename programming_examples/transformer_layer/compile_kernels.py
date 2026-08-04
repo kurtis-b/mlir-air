@@ -15,6 +15,19 @@ WHY THE SYMBOL CHECK EXISTS
     So "it compiled" is not the gate -- "it compiled, is larger than
     MIN_OBJECT_BYTES, and defines these named symbols" is.
 
+WHERE THE TILE SIZES COME FROM
+    The GEMM microkernel bakes DIM_M/DIM_N/DIM_K in at compile time, and those
+    must match the tiles the GEMM module builder uses or the object is simply
+    the wrong kernel. The builder reads them from ``kernel_registry``, so this
+    gate does too (``_gemm_microkernel_tile``) rather than hand-copying them --
+    hand-copying is what porting convention 9 exists to stop.
+
+    The FFN / addnorm tiles are different: ``kernel_registry`` has measured JSON
+    for GEMM only, and ``registry_lookup`` deliberately raises instead of
+    guessing at a shape nobody swept. So those stay CLI arguments with the
+    shapes the ported kernels' static_asserts accept, and they move into the
+    registry when a sweep for them lands, not before.
+
 FOOTGUNS
     - Objects land in the current working directory, matching
       ``external_kernels``' convention (aiecc finds them via its link_with
@@ -38,12 +51,42 @@ from pathlib import Path
 
 _PROJ_ROOT = Path(__file__).resolve().parent.parent  # programming_examples/
 sys.path.insert(0, str(_PROJ_ROOT / "llms" / "shared" / "infra"))
+sys.path.insert(0, str(_PROJ_ROOT))
 
 import external_kernels as ek  # noqa: E402
+from kernel_registry.registry_lookup import gemm_config  # noqa: E402
 
 # An object holding real code is several KB. The empty-but-valid objects this
 # check exists to catch are a few hundred bytes.
 MIN_OBJECT_BYTES = 1024
+
+# Which registry entry the GEMM microkernel's compile-time tiling is taken from.
+# A transformer-layer projection is a large bf16-in/f32-out GEMM, and every large
+# f32 shape in the registry lands on the same tiling; only the 512-cube entry
+# differs (tile_m=32, for a shape too small to be representative here). Naming the
+# square 2048 entry says which measurement this gate builds against, where a bare
+# 64/128/32 in the call below would drift from the registry unnoticed.
+GEMM_REGISTRY_SHAPE = (2048, 2048, 2048)
+GEMM_REGISTRY_DTYPE = "f32"
+GEMM_REGISTRY_PRECISION = "high"
+
+
+def _gemm_microkernel_tile():
+    """The mm_aie2p tiling for this gate, straight from kernel_registry.
+
+    Returns the registry's named tile dict {tile_m, tile_k_l2, tile_k_l1,
+    tile_n}. Only tile_m / tile_k_l1 / tile_n reach the microkernel -- tile_k_l2
+    is an L2 blocking factor the host-side builder consumes, not a -D flag.
+
+    Raises (via ``gemm_config``) rather than falling back if the shape is not in
+    the registry, which is the point: a gate that compiles a guessed tiling
+    proves the wrong kernel builds.
+    """
+    return gemm_config(
+        *GEMM_REGISTRY_SHAPE,
+        output_dtype=GEMM_REGISTRY_DTYPE,
+        precision=GEMM_REGISTRY_PRECISION,
+    )["tile"]
 
 
 def _llvm_nm():
@@ -101,13 +144,14 @@ def check_object(obj_name, expected_symbols):
 
 # Each entry: (label, build callable, object name, symbols that must be present)
 def build_plan(tile_m, tile_k, tile_n):
+    gemm_tile = _gemm_microkernel_tile()
     return [
         (
             "GEMM microkernel, init + with_acc families",
             lambda: ek.compile_gemm_mm(
-                tile_m=64,
-                tile_n=128,
-                tile_k_l1=32,
+                tile_m=gemm_tile["tile_m"],
+                tile_n=gemm_tile["tile_n"],
+                tile_k_l1=gemm_tile["tile_k_l1"],
                 out_name="mm_transformer.o",
                 gen_init=True,
                 gen_with_acc=True,
@@ -253,9 +297,14 @@ def check_pre_add_variants_differ():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tile-m", type=int, default=64)
-    parser.add_argument("--tile-k", type=int, default=64)
-    parser.add_argument("--tile-n", type=int, default=64)
+    ffn_tile_help = (
+        "FFN / addnorm matmul tiling. Not registry-sourced: kernel_registry has "
+        "measured JSON for GEMM only. The GEMM microkernel's own tiling is not a "
+        "flag here for that reason -- it comes from the registry."
+    )
+    parser.add_argument("--tile-m", type=int, default=64, help=ffn_tile_help)
+    parser.add_argument("--tile-k", type=int, default=64, help=ffn_tile_help)
+    parser.add_argument("--tile-n", type=int, default=64, help=ffn_tile_help)
     args = parser.parse_args()
 
     plan = build_plan(args.tile_m, args.tile_k, args.tile_n)

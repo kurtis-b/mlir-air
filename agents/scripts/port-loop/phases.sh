@@ -115,10 +115,34 @@ phase_a_objective_check() {
   fi
 
 
+  # The objects under inspection are aie2p ELFs ("unknown arch 0x108" to a host toolchain).
+  # Reading them with whatever `nm` happens to be on PATH is a bet on host binutils being
+  # lenient about an architecture it does not know; a host nm that rejects the format prints
+  # nothing, every symbol reads as missing, and a perfectly good phase fails. Peano ships the
+  # llvm-nm that actually targets these objects, so prefer it — the same choice
+  # compile_kernels.py::_llvm_nm() already makes.
+  local nm_tool=""
+  local c
+  for c in "${PEANO_INSTALL_DIR:+${PEANO_INSTALL_DIR}/bin/llvm-nm}" \
+           "${PL_ROOT}/sandbox/lib/python3.12/site-packages/llvm-aie/bin/llvm-nm"; do
+    if [ -n "${c}" ] && [ -x "${c}" ]; then
+      nm_tool="${c}"
+      break
+    fi
+  done
+  [ -n "${nm_tool}" ] || nm_tool="$(command -v llvm-nm 2>/dev/null || true)"
+  [ -n "${nm_tool}" ] || nm_tool="$(command -v nm 2>/dev/null || true)"
+  if [ -z "${nm_tool}" ]; then
+    log_error "objective check: no llvm-nm or nm available to read the aie2p objects"
+    return 1
+  fi
+  log_info "objective check: reading symbols with ${nm_tool}"
+
   # Every extern "C" symbol declared in every kernel source must be defined by some object.
   # The expectation is derived from the SOURCES, independently of compile_kernels.py, so a
   # weakened test script cannot narrow what is demanded here.
-  PL_KDIR="${kdir}" PL_OBJ_ROOTS="${existing[*]}" PL_GATE_STAMP="${_GATE_STARTED_AT:-}" python3 -c '
+  PL_KDIR="${kdir}" PL_OBJ_ROOTS="${existing[*]}" PL_GATE_STAMP="${_GATE_STARTED_AT:-}" \
+  PL_NM="${nm_tool}" python3 -c '
 import os, re, pathlib, subprocess, sys
 
 kdir = pathlib.Path(os.environ["PL_KDIR"])
@@ -172,12 +196,22 @@ if not objs:
     sys.exit(1)
 print("  considering %d object(s) rebuilt by this gate (%d stale ignored)" % (len(objs), stale))
 
+nm = os.environ["PL_NM"]
+
+# Fail closed on an unreadable object. A symbol reader that errors out still returns an
+# empty stdout, which is indistinguishable from "this object defines nothing" -- and that
+# is exactly the shape of a false failure that invites someone to relax the check.
 defined = set()
 for o in objs:
     try:
-        out = subprocess.run(["nm", "--defined-only", o], capture_output=True, text=True).stdout
-    except FileNotFoundError:
-        print("objective check: nm unavailable", file=sys.stderr); sys.exit(1)
+        p = subprocess.run([nm, "--defined-only", o], capture_output=True, text=True)
+    except OSError as e:
+        print("objective check: cannot run %s: %s" % (nm, e), file=sys.stderr); sys.exit(1)
+    if p.returncode != 0:
+        print("objective check: %s could not read %s (rc=%d): %s"
+              % (nm, o, p.returncode, p.stderr.strip()), file=sys.stderr)
+        sys.exit(1)
+    out = p.stdout
     for line in out.splitlines():
         parts = line.split()
         if len(parts) >= 3 and parts[1] in ("T", "t", "W", "w"):
