@@ -391,6 +391,8 @@ def run_sequence(
     produced = {n for s in steps for n in s.written_names()}
     if host_writes is None:
         host_writes = {n for n in specs if n not in produced or specs[n].static}
+    else:
+        host_writes = set(host_writes)
 
     def _alloc(nbytes, slot):
         backend, _ = cache._loaded[slot_position[slot][0]]
