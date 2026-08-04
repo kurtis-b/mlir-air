@@ -465,6 +465,14 @@ SPECS = [
         "prepare": _prepare_qkv_proj,
     },
     {
+        # The larger of the two registered (M, K, 3K) triples.
+        "operator": "qkv_proj",
+        "shape_key": "2048x2048",
+        "shape": {"seq_len": 2048, "emb_dim": 2048},
+        "atol": 5e-3,
+        "prepare": _prepare_qkv_proj,
+    },
+    {
         "operator": "ffn",
         "shape_key": "2048x1024x3072",
         "shape": {"seq_len": 2048, "emb_dim": 1024, "ffn_dim": 3072},

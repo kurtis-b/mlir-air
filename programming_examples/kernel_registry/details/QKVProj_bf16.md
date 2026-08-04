@@ -112,8 +112,11 @@ Element-wise over the **full output**: every element of every projection must pa
 | (M×K) | GEMM (M×K×3K) | method | tile (m/kl2/kl1/n) | mean_rel_L1 | abs_err max | mismatches | Used by | Status |
 |---|---|---|---|---|---|---|---|---|
 | 2048×1024 | 2048×1024×3072 | fused-cast | 64/256/32/128 | 9.9e-3 | 1.95e-3 | 0 / 6291456 | transformer-layer execution studies, attention projections | ✅ |
+| 2048×2048 | 2048×2048×6144 | fused-cast | 64/256/32/128 | 9.7e-3 | 1.22e-3 | 0 / 12582912 | transformer-layer execution studies, attention projections | ✅ |
 
-> **Only two `M×K×3K` triples are in the GEMM registry at all** — `2048×1024×3072` and `2048×2048×6144` — of the 108 projection-GEMM shapes the execution-studies case matrix asks for. That gap is Phase C4's sweep, not a defect here: the builder raises on the other 106 rather than guessing a tiling for them.
+> **Both `M×K×3K` triples the GEMM registry holds are validated here**, and they are the only two of the 108 projection-GEMM shapes the execution-studies case matrix asks for. That gap is a sweep that has not been run, not a defect here: the builder raises on the other 106 rather than guessing a tiling for them.
+>
+> The two agree to within measurement noise (9.9e-3 / 9.7e-3), and the larger shape's `abs_err max` is *lower* — 1.22e-3 against 1.95e-3 — because its operand scale `1/√K` is smaller at K=2048. That is the reason the scale is quoted with the tolerance rather than left implicit.
 
 **Performance is not measured here.** Phase C gates numerics only; latency and throughput are deliberately absent rather than estimated. The underlying GEMM's throughput is on [`GEMM_bf16_in_bf16_out.md`](GEMM_bf16_in_bf16_out.md).
 

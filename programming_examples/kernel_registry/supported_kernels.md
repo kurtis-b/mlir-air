@@ -225,12 +225,13 @@ This is **documentation, not executable code** — it records results produced b
 | (M×K) | GEMM (M×K×3K) | method | tile (m/kl2/kl1/n) | mean_rel_L1 | abs_err max | mismatches | Used by | Status |
 |---|---|---|---|---|---|---|---|---|
 | 2048×1024 | 2048×1024×3072 | fused-cast | 64/256/32/128 | 9.9e-3 | 1.95e-3 | 0 / 6291456 | transformer-layer studies, attention projections | ✅ |
+| 2048×2048 | 2048×2048×6144 | fused-cast | 64/256/32/128 | 9.7e-3 | 1.22e-3 | 0 / 12582912 | transformer-layer studies, attention projections | ✅ |
 
 > **`mean_rel_L1 = 9.9e-3` is the GEMM's own number** (the bf16-out page records 9.4e-3 for this shape), so the three split-cast launches add nothing measurable — which is the point of folding the split into a cast the datapath already owed.
 >
 > **This resolves the ⚠️ on `2048×1024×3072` fused-cast above.** That row's note diagnoses it as a harness tolerance edge: the datapath computes the in-tier result and the gate tripped on a single near-zero-reference element at `abs_err ≈ 1.7e-3` against `atol = 1.5e-3`. Measured here at `atol = 5e-3` over 3× as many elements: `abs_err max = 1.95e-3`, **zero** mismatches. That is the remedy the note itself proposed — relax the high-precision `atol` to match the other tiers, leave the GPU-standard `rtol` alone.
 >
-> Only **two** `M×K×3K` triples are in the GEMM registry at all (`2048×1024×3072`, `2048×2048×6144`) out of the 108 projection-GEMM shapes the execution-studies case matrix asks for. That gap is a sweep that has not been run, not a defect: the builder raises on the other 106 rather than guessing a tiling.
+> **Both** `M×K×3K` triples the GEMM registry holds are validated here — and they are the only two, out of the 108 projection-GEMM shapes the execution-studies case matrix asks for. That gap is a sweep that has not been run, not a defect: the builder raises on the other 106 rather than guessing a tiling.
 
 ---
 

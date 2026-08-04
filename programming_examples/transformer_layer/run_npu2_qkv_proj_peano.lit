@@ -14,11 +14,12 @@
 // outputs. Not cosine similarity -- kernel_registry/README.md is explicit that
 // a correlation gate is blind to a systematic per-element scale error.
 //
-// The three precision lines below are checked individually and in order. A
-// build that wired all three split-cast launches at the same column offset
-// would still emit three outputs and still pass a check that only looked at
-// the verdict; requiring three distinct precision reports and then the named
-// operator makes the shape of the evidence part of the gate.
+// Both registered shapes run, and both are checked. The three precision lines
+// per shape are checked individually and in order: a build that wired all three
+// split-cast launches at the same column offset would still emit three outputs
+// and still pass a check that only looked at the verdict, so requiring three
+// distinct precision reports and then the named operator and shape makes the
+// shape of the evidence part of the gate.
 //
 // NPU serialization lives one layer down, not in the recipe below. Device
 // access is locked on /tmp/npu.lock, which XRTRunner.run_test holds across
@@ -46,3 +47,8 @@
 // CHECK: [precision] Output 2
 // CHECK: PASS!
 // CHECK: [opcheck] qkv_proj [2048x1024]: PASS
+// CHECK: [precision] Output 0
+// CHECK: [precision] Output 1
+// CHECK: [precision] Output 2
+// CHECK: PASS!
+// CHECK: [opcheck] qkv_proj [2048x2048]: PASS

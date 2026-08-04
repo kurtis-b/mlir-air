@@ -9,6 +9,8 @@ build_peano/
 *.o
 air.mlir
 air.elf
+air.insts.bin
+air.xclbin
 air_project/
 
 # opcheck.py writes its machine-readable verdicts here on every run. They are
