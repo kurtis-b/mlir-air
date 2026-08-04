@@ -425,7 +425,11 @@ cmd_run_one() {
   case "${step}" in
     preflight)       pl_preflight "$(phase_needs_hardware "${phase}")" && log_info "preflight OK" ;;
     gate)            run_gate "${phase}" "${pdir}/gate.log" ;;
-    objective-check) phase_objective_check "${phase}" ;;
+    objective-check)
+      # run_gate sets this in-process; for a standalone run-one invocation, point at the
+      # stamp the last gate left behind so freshness can still be proven.
+      _GATE_STARTED_AT="${pdir}/.gate-started"
+      phase_objective_check "${phase}" ;;
     tamper-check)
       guard_fingerprint "${pdir}/gates.before" "${_START_SHA}"
       guard_check_tamper "${pdir}/gates.before" "$(phase_gate_allowlist "${phase}")" ;;

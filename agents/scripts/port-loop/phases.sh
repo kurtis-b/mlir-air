@@ -114,19 +114,11 @@ phase_a_objective_check() {
     return 1
   fi
 
-  # Reject stale artifacts: at least one object must postdate the gate run.
-  if [ -n "${_GATE_STARTED_AT:-}" ] && [ -f "${_GATE_STARTED_AT}" ]; then
-    if [ -z "$(find "${existing[@]}" -name '*.o' -size +4k -newer "${_GATE_STARTED_AT}" 2>/dev/null | head -1)" ]; then
-      log_error "objective check: object files exist but none is newer than the gate run"
-      log_error "  the gate reported success without rebuilding anything — treating as vacuous"
-      return 1
-    fi
-  fi
 
   # Every extern "C" symbol declared in every kernel source must be defined by some object.
   # The expectation is derived from the SOURCES, independently of compile_kernels.py, so a
   # weakened test script cannot narrow what is demanded here.
-  PL_KDIR="${kdir}" PL_OBJ_ROOTS="${existing[*]}" python3 -c '
+  PL_KDIR="${kdir}" PL_OBJ_ROOTS="${existing[*]}" PL_GATE_STAMP="${_GATE_STARTED_AT:-}" python3 -c '
 import os, re, pathlib, subprocess, sys
 
 kdir = pathlib.Path(os.environ["PL_KDIR"])
@@ -151,13 +143,34 @@ if not expected:
     print("objective check: no extern \"C\" symbols found in kernel sources", file=sys.stderr)
     sys.exit(1)
 
-objs = []
+# Only objects the gate itself rebuilt count. Collecting symbols globally would let a stale
+# object from an earlier run supply a symbol whose kernel the current gate never built, while a
+# single freshly rebuilt object satisfied a per-run freshness test. Symbols must come from
+# artifacts this gate produced, or the check proves nothing.
+stamp = os.environ.get("PL_GATE_STAMP") or ""
+cutoff = os.path.getmtime(stamp) if stamp and os.path.exists(stamp) else None
+
+objs, stale = [], 0
 for r in roots:
     for dp, _, fns in os.walk(r):
-        objs += [os.path.join(dp, fn) for fn in fns if fn.endswith(".o")]
-if not objs:
-    print("objective check: no object files found under %s" % roots, file=sys.stderr)
+        for fn in fns:
+            if not fn.endswith(".o"):
+                continue
+            path = os.path.join(dp, fn)
+            if cutoff is not None and os.path.getmtime(path) < cutoff:
+                stale += 1
+                continue
+            objs.append(path)
+
+if cutoff is None:
+    print("objective check: no gate timestamp available; cannot prove objects are fresh",
+          file=sys.stderr)
     sys.exit(1)
+if not objs:
+    print("objective check: the gate rebuilt no object files (%d stale ignored)" % stale,
+          file=sys.stderr)
+    sys.exit(1)
+print("  considering %d object(s) rebuilt by this gate (%d stale ignored)" % (len(objs), stale))
 
 defined = set()
 for o in objs:
@@ -175,7 +188,7 @@ for srcname, syms in expected.items():
     missing = [s for s in syms if s not in defined]
     if missing:
         print("objective check: %s declares %d extern \"C\" symbols; %d missing from every "
-              "built object: %s" % (srcname, len(syms), len(missing), ", ".join(missing[:6])),
+              "object this gate rebuilt: %s" % (srcname, len(syms), len(missing), ", ".join(missing[:6])),
               file=sys.stderr)
         rc = 1
     else:
