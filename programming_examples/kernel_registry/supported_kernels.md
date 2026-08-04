@@ -13,9 +13,11 @@ This is **documentation, not executable code** — it records results produced b
 
 **Status legend**: ✅ verified on real NPU2, accuracy in line with the bf16 standard · ⚠️ verified on real NPU2 but with a documented precision/coverage caveat · ❌ broken/missing
 
-> **Scope**: currently **GEMM**, **GEMV**, **RMSNorm**, **FlashAttention**, **Element-wise Add**, **SiLU-and-Mul**, **RoPE**, **LayerNorm** and **AddNorm** — the registry is built up one verified kernel at a time. The core LLM leaf kernels are now covered; see [`README.md`](README.md) for the roadmap.
+> **Scope**: currently **GEMM**, **GEMV**, **RMSNorm**, **FlashAttention**, **Element-wise Add**, **SiLU-and-Mul**, **RoPE**, **LayerNorm**, **AddNorm**, **QKV Projection** and **FFN** — the registry is built up one verified kernel at a time. The core LLM leaf kernels are now covered; see [`README.md`](README.md) for the roadmap.
 >
-> The last two arrive with the encoder-style transformer block of the execution studies and are **correctness-only entries so far**: their throughput columns read `—` because Phase C1 gates numerics and nothing else. An entry here never carries an estimated number.
+> The last four arrive with the encoder-style transformer block of the execution studies and are **correctness-only entries so far**: their throughput columns read `—` because Phase C gates numerics and nothing else. An entry here never carries an estimated number.
+>
+> QKV Projection and FFN are **composite** entries — they are built from the GEMM rows above rather than from a kernel of their own, and what they add is the launch structure between those GEMMs. Their `mean_rel_L1` is quoted next to the GEMM's for exactly that reason: it is how much the composition costs.
 
 ---
 
@@ -33,6 +35,8 @@ This is **documentation, not executable code** — it records results produced b
 | RoPE (BF16, half-split) | [`details/RoPE_bf16.md`](details/RoPE_bf16.md) | **56.6 GB/s** (memory-bound, 49152×128, herd 8×1) | ✅ |
 | LayerNorm (BF16, multi-row) | [`details/LayerNorm_bf16.md`](details/LayerNorm_bf16.md) | — (correctness only; see the scope note) | ✅ |
 | AddNorm (BF16) | [`details/AddNorm_bf16.md`](details/AddNorm_bf16.md) | — (correctness only; see the scope note) | ✅ |
+| QKV Projection (BF16, fused weight) | [`details/QKVProj_bf16.md`](details/QKVProj_bf16.md) | — (correctness only; see the scope note) | ✅ |
+| FFN, GeLU (BF16, staged) | [`details/FFN_bf16.md`](details/FFN_bf16.md) | — (correctness only; see the scope note) | ✅ |
 
 ---
 
@@ -211,6 +215,36 @@ This is **documentation, not executable code** — it records results produced b
 | 64×512 | 8/1 | 8 | 1.9e-3 | 3.1e-2 | 0 / 32768 | transformer-layer studies, encoder sublayer boundary (hidden = 512) | ✅ |
 
 > `M = 64` is a **hard cap, not a sample**: the builder requires exactly one kernel call per tile, because two or more trips through the herd loop miscompile (0 of 512 elements outside tolerance at one trip, 491 of 512 at two, at `[8,64]`/`herd_x=1`). The distinguishing feature is three L3→L1 streams per tile against a column's two shim MM2S channels; the two-stream norms and adds beside it loop correctly. The builder raises rather than emitting the broken form. Lifting the cap needs the weight staged through L2, or the residual folded into `x`'s L3 buffer — neither is done yet.
+
+---
+
+## QKV Projection — tested shapes
+
+`x[M,K] @ w_qkv[K,3K]` → `q`, `k`, `v`, each `[M,K]`; shapes written `M×K`. **One** GEMM over the fused weight, with C split three ways **on the device**: the registry's `fused-cast` method already owes a separate cast launch over every element of C, so the split rides it — three cast launches, each with a column offset on its read and its own bf16 destination. No host-side slice. Method and tiles come from `gemm_registry_config`, which raises on an unmeasured shape. Full datapath in [`details/QKVProj_bf16.md`](details/QKVProj_bf16.md).
+
+| (M×K) | GEMM (M×K×3K) | method | tile (m/kl2/kl1/n) | mean_rel_L1 | abs_err max | mismatches | Used by | Status |
+|---|---|---|---|---|---|---|---|---|
+| 2048×1024 | 2048×1024×3072 | fused-cast | 64/256/32/128 | 9.9e-3 | 1.95e-3 | 0 / 6291456 | transformer-layer studies, attention projections | ✅ |
+
+> **`mean_rel_L1 = 9.9e-3` is the GEMM's own number** (the bf16-out page records 9.4e-3 for this shape), so the three split-cast launches add nothing measurable — which is the point of folding the split into a cast the datapath already owed.
+>
+> **This resolves the ⚠️ on `2048×1024×3072` fused-cast above.** That row's note diagnoses it as a harness tolerance edge: the datapath computes the in-tier result and the gate tripped on a single near-zero-reference element at `abs_err ≈ 1.7e-3` against `atol = 1.5e-3`. Measured here at `atol = 5e-3` over 3× as many elements: `abs_err max = 1.95e-3`, **zero** mismatches. That is the remedy the note itself proposed — relax the high-precision `atol` to match the other tiers, leave the GPU-standard `rtol` alone.
+>
+> Only **two** `M×K×3K` triples are in the GEMM registry at all (`2048×1024×3072`, `2048×2048×6144`) out of the 108 projection-GEMM shapes the execution-studies case matrix asks for. That gap is a sweep that has not been run, not a defect: the builder raises on the other 106 rather than guessing a tiling.
+
+---
+
+## FFN (GeLU) — tested shapes
+
+`y = gelu(x[M,K] @ w_up[K,F]) @ w_down[F,K]`; shapes written `M×K×F`. Five launches in one ELF — up-projection, its cast, the activation, down-projection, its cast. The activation is the **tanh approximation** (`gelu_pytorch_tanh`), not erf; iron's oracle uses torch's erf default, whose difference hides at iron's 4e-2 tolerance and does not hide at this one. iron's `down_proj_depth` is the down-projection's registry `tile_k_l2` and is read from the registry, not passed in. Full datapath in [`details/FFN_bf16.md`](details/FFN_bf16.md).
+
+| (M×K×F) | up GEMM | down GEMM | tile (m/kl2/kl1/n) | mean_rel_L1 | abs_err max | mismatches | Used by | Status |
+|---|---|---|---|---|---|---|---|---|
+| 2048×1024×3072 | fused-cast | fused-cast | 64/256/32/128 (both) | 1.6e-2 | 1.59e-3 | 0 / 2097152 | transformer-layer studies, encoder FFN sublayer | ✅ |
+
+> **`mean_rel_L1 = 1.6e-2` is ~1.6× a single GEMM's**, and that gap is what the composition costs: the device stages the up-projection output in bf16 and the activation kernel carries bf16 intermediates, while the reference is FP32 end to end. Reproducing either in the oracle would hide exactly the error it introduces.
+>
+> The shape is set by what the registry resolves for **both** projections — `2048×1024×3072` and `2048×3072×1024` are the one such pair present today.
 
 ---
 

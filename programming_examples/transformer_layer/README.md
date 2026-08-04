@@ -72,6 +72,7 @@ memory bank) all produce plausible wrong numbers rather than errors.
 | File | Contents |
 |---|---|
 | `kernels/encoder.cc` | Encoder-block kernels: staged FFN (`-DBUILD_FFN`) and weighted add-norm (`-DBUILD_ADDNORM`). Holds the contract docs and the `extern "C"` entry points |
+| | Built to **two** objects: `encoder.o` (addnorm half, for `addnorm`) and `encoder_ffn.o` (FFN half, for `ffn`) |
 | `kernels/encoder_matmul.cc` | The encoder's 2x2-expanded `aie::mmul` microkernels, included by `encoder.cc` |
 | `kernels/encoder_layer_norm.cc` | The encoder's LayerNorm reductions, fused and staged, included by `encoder.cc` |
 | `kernels/addnorm_ffn.cc` | Fused add-norm + FFN staging, both residual orderings behind `-DADDNORM_PRE_ADD`. Holds the contract docs and the `extern "C"` entry points |
@@ -86,6 +87,9 @@ memory bank) all produce plausible wrong numbers rather than errors.
 | `builders/elementwise_add.py` | 2-D element-wise add and the `causal_mask=` keyword over it, plus their FP32 reference |
 | `builders/layer_norm.py` | Multi-row LayerNorm over `layer_norm_rows`, plus its two-pass FP32 reference |
 | `builders/addnorm.py` | Weighted LayerNorm + residual over `fused_add_layer_norm_2outs`, weight as a runtime argument, plus its FP32 reference |
+| `builders/qkv_proj.py` | One GEMM over the fused `[K, 3K]` weight with C split three ways on the device, plus its FP32 reference |
+| `builders/gelu.py` | The FFN activation stage over `ffn_gelu_bf16`, plus its FP32 tanh-approximation reference |
+| `builders/ffn.py` | Staged up-projection / GeLU / down-projection composition, plus its FP32 reference |
 | `run_npu2_<op>_peano.lit` | One per operator: that operator's numerical gate on a real NPU |
 | `run_npu2_fault_control_peano.lit` | Phase C's negative control: the injected run must FAIL |
 
@@ -171,7 +175,31 @@ explicit per-object symbol list for exactly this reason, and
 
 **`encoder.o` and `addnorm_ffn.o` cannot share an ELF.** Both define
 `ffn_gelu_bf16` and `ffn_eltwise_add_bf16_vector`. Linking them together is a
-duplicate-symbol error. Rename one set, or pick one kernel per ELF.
+duplicate-symbol error. Rename one set, or pick one kernel per ELF. That is
+why `encoder.cc` is built twice, to two objects with one half each: `addnorm`
+links the addnorm half and `ffn` links `encoder_ffn.o`, so neither drags in the
+symbols the other's ELF would collide on. `compile_kernels.py` checks both that
+`encoder_ffn.o`'s FFN symbols are present and that its addnorm symbols are
+absent — a presence check alone would not notice `build_addnorm=False` silently
+ceasing to work, and the result would break only at link time in whichever
+design happened to combine them.
+
+**Multi-segment designs cannot use the xclbin output path.** Every `air.launch`
+lowers to its own `aie.device` under an `aiex.configure` / `aiex.run` runtime
+sequence, and the xclbin path names a single instruction blob on the aircc
+command line, so a second segment collides on it: `edge 'air.insts.bin'
+produced duplicate output path`. Build multi-launch designs with
+`output_format="elf"`, as the shipped multi-launch llama builders do. Packaging
+only — nothing downstream of it changes.
+
+**The GEMM's error is ~1% of the output's own magnitude, not of one bf16 ULP.**
+`-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16` puts the multiply in block
+floating point, and `mean_rel_L1` lands at 9.3e-3 (registry) / 9.9e-3
+(measured here) rather than the ~2e-3 a single epilogue rounding would give.
+So a GEMM-backed operator's absolute error scales with how large you make its
+output, and an `atol` is meaningless without the operand scale it was measured
+at. `opcheck.py` uses the scale the registry's own GEMM sweep uses, and says
+so.
 
 **`-DADDNORM_PRE_ADD` changes numerics, not shapes.** Without it, statistics run
 over `input` and the residual is added after normalization. With it, statistics
