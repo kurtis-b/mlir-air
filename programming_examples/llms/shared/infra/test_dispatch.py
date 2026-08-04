@@ -19,6 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from shared.infra.bo_pool import BufferSpec  # noqa: E402
 from shared.infra.dispatch import (  # noqa: E402
     N_XCLBIN_PREFIX_ARGS,
     OPCODE_DPU,
@@ -27,6 +28,8 @@ from shared.infra.dispatch import (  # noqa: E402
     LaunchCounts,
     RunlistSplitError,
     _bind_args,
+    default_host_writes,
+    launch_totals,
     plan_submissions,
 )
 
@@ -198,6 +201,56 @@ def test_row_carries_all_six_fields():
         "sync_boundaries",
         "bytes_transferred",
     }
+
+
+def test_air_launches_are_counted_once_per_elf():
+    """03-measurement-model.md defines `air_launches_per_elf` as the launches in
+    the compiled module, so an artifact two steps invoke — the gate/up projection
+    pair of a real layer — contributes its count once. `herd_launches` is defined
+    as launches *executed*, so that one does double.
+    """
+    steps = [step("qkv", "x", "y"), step("qkv2", "y", "z"), step("attn", "z", "w")]
+    counts = {
+        "qkv": {"air_launches": 6, "herd_launches": 2},
+        "qkv2": {"air_launches": 6, "herd_launches": 2},  # same ELF as qkv
+        "attn": {"air_launches": 1, "herd_launches": 1},
+    }
+    assert launch_totals(steps, artifact_of, counts.get) == (7, 5)
+
+
+def test_launch_totals_survive_an_artifact_with_no_recorded_counts():
+    """A manifest written before the dispatch vector landed costs the counts, not
+    the run."""
+    steps = [step("qkv", "x", "y")]
+    assert launch_totals(steps, artifact_of, {}.get) == (0, 0)
+
+
+# --- default host writes ---------------------------------------------------
+
+
+def test_default_host_writes_covers_inputs_and_weights_but_not_outputs():
+    """D7: the host supplies what it is read for, and every weight."""
+    steps = [
+        DispatchStep("gemm", ("x", "w", "mid"), writes=(2,)),
+        DispatchStep("gemm", ("mid", "w2", "out"), writes=(2,)),
+    ]
+    specs = {
+        "x": BufferSpec("x", 4096),
+        "w": BufferSpec("w", 4096, static=True, content_key="sha256:aa"),
+        "w2": BufferSpec("w2", 4096, static=True, content_key="sha256:bb"),
+        "mid": BufferSpec("mid", 4096),
+        "out": BufferSpec("out", 4096, host_output=True),
+    }
+    assert default_host_writes(steps, specs) == {"x", "w", "w2"}
+
+
+def test_default_host_writes_includes_an_in_place_buffer():
+    """D7: A2's in-place form is read before it is written, so its bytes come
+    from the host. Classified as produced it gets no upload at all, and the
+    kernel reads whatever the pool slot held before it."""
+    steps = [DispatchStep("k", ("acc", "acc"), writes=(1,))]
+    specs = {"acc": BufferSpec("acc", 4096, host_output=True)}
+    assert default_host_writes(steps, specs) == {"acc"}
 
 
 def test_launch_counts_come_from_the_mlir_module():

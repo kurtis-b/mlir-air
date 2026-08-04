@@ -41,6 +41,13 @@ Footguns, in the order they will bite you:
   through a static slot would corrupt every other operator sharing that content, so
   a static buffer may not be a step's output (A3).
 
+- **A buffer a step writes is not necessarily one the device produces** (D7). An
+  in-place buffer is read *and* written, so its bytes come from the host and it is
+  live from before the sequence — `start = -1`, not the index of the step that
+  writes it. Treating it as produced both skips its upload and lets an
+  earlier-dying buffer take its slot. `host_supplied_names` draws that line, and
+  states the one case the declaration cannot decide.
+
 - **Content keying is subordinate to the bank rule** (S5). Under the xclbin ABI two
   identical weights sitting at different `(kernel, argument index)` positions get
   *different* BOs, because the position is what picks the memory group. Deduping
@@ -137,15 +144,71 @@ class PoolPlan:
         return sum(self.bins.values())
 
 
-def compute_live_ranges(steps, specs):
+def host_supplied_names(steps):
+    """Buffers whose bytes come from the host rather than from a step (rule D7).
+
+    A buffer is host-supplied when some step reads it before any step has
+    written it: its first appearance at an argument position *not* in that
+    step's `writes` is at or before the first step that writes it. That covers a
+    plain input, which no step writes at all, and it covers the in-place buffer
+    A2 asks for — one identity at a read position and a write position of the
+    same step, where the read sees whatever the host left there.
+
+    The case the declaration cannot decide: a buffer appearing **only** at
+    written positions. `writes` records that the kernel writes an argument;
+    nothing says whether it reads it first, so a single-position
+    read-modify-write is indistinguishable from a plain output, and the plain
+    output is much the commoner of the two. Those are reported as produced. A
+    caller updating a buffer in place at a single argument position declares it
+    either A2's way — pass the identity at a read position as well — or by
+    naming it in `run_sequence`'s `host_writes`.
+    """
+    first_read = {}
+    first_write = {}
+    for idx, step in enumerate(steps):
+        for i, name in enumerate(step.args):
+            table = first_write if i in step.writes else first_read
+            table.setdefault(name, idx)
+    return {
+        name
+        for name, read_idx in first_read.items()
+        if name not in first_write or read_idx <= first_write[name]
+    }
+
+
+def _host_supplied_set(steps, specs, host_supplied):
+    """Canonical host-supplied set for a plan: derived when not given.
+
+    Restricted to the non-static buffers the steps actually name, because those
+    are the only ones it can move: statics are outside the liveness analysis
+    (S3) and a name no step names has no slot. Canonicalizing here keeps
+    `plan_signature` from separating two identical plans over an entry that
+    could not have changed the assignment.
+    """
+    if host_supplied is None:
+        host_supplied = host_supplied_names(steps)
+    named = {n for s in steps for n in s.args}
+    return frozenset(n for n in host_supplied if n in named and not specs[n].static)
+
+
+def compute_live_ranges(steps, specs, host_supplied=None):
     """Live range per non-static buffer, as (start, end) step indices.
 
-    start = index of the first step that writes the buffer, or -1 when no step
-    writes it (a host-supplied input, live from before the sequence) — L1.
+    start = -1 for a host-supplied buffer — one whose bytes the host writes
+    before the sequence, so it is live from before it begins — and otherwise the
+    index of the first step that writes it, its producer (L1). Note that being
+    written by a step does not make a buffer produced: an in-place buffer is
+    both read and written, and starting it at its writing step would let an
+    earlier-dying buffer take a slot whose host bytes are still needed. Which
+    buffers those are is `host_supplied_names`' decision (D7); pass
+    `host_supplied` to override it, as `run_sequence` does when the caller
+    declares `host_writes` by hand.
+
     end   = index of the last step naming it as any argument — L2 — raised to
     len(steps) for declared host outputs so the host read cannot race a slot
     reuse — L3.
     """
+    supplied = _host_supplied_set(steps, specs, host_supplied)
     first_write = {}
     last_use = {}
     for idx, step in enumerate(steps):
@@ -159,7 +222,7 @@ def compute_live_ranges(steps, specs):
         spec = specs[name]
         if spec.static:
             continue
-        start = first_write.get(name, -1)
+        start = -1 if name in supplied else first_write.get(name, -1)
         end = len(steps) if spec.host_output else use_idx
         live[name] = (start, end)
     return live
@@ -187,7 +250,7 @@ def _positions(steps):
     return {name: tuple(v) for name, v in out.items()}
 
 
-def plan_signature(steps, specs, elf_abi):
+def plan_signature(steps, specs, elf_abi, host_supplied=None):
     """Value identity of the plan `plan_pool` would build from these inputs (O5).
 
     Two sequences with this signature produce the same slot assignment, the same
@@ -197,7 +260,10 @@ def plan_signature(steps, specs, elf_abi):
 
     Everything the assignment depends on is in here. `content_key` is included
     because it keys the static pool: a caller that changes a weight's bytes and
-    its key gets a fresh pool rather than a silently stale BO (S2).
+    its key gets a fresh pool rather than a silently stale BO (S2). The
+    host-supplied set is included because it sets each buffer's live-range start
+    (D7/L1): two sequences that differ only in which buffers the host writes
+    have different slot assignments and must not share a pool.
     """
     names = sorted({a for s in steps for a in s.args})
     return (
@@ -213,10 +279,11 @@ def plan_signature(steps, specs, elf_abi):
             )
             for n in names
         ),
+        tuple(sorted(_host_supplied_set(steps, specs, host_supplied))),
     )
 
 
-def plan_pool(steps, specs, elf_abi):
+def plan_pool(steps, specs, elf_abi, host_supplied=None):
     """Assign pool slots to the sequence's buffers.
 
     Args:
@@ -225,6 +292,11 @@ def plan_pool(steps, specs, elf_abi):
         elf_abi: True for the ELF ABI (`xrt.ext.bo`, no group id, so a slot may
             back different kernels), False for the xclbin ABI (slot keyed by
             (kernel, arg index) because `group_id` picks the bank) — rule C2.
+        host_supplied: buffers the host writes before the sequence, which are
+            live from before it (D7/L1). Defaults to what
+            `host_supplied_names` derives from the steps; pass the caller's own
+            set when it declares one, or an in-place buffer the derivation
+            cannot see will lose its slot to an earlier-dying buffer.
 
     Returns:
         `PoolPlan`.
@@ -248,7 +320,8 @@ def plan_pool(steps, specs, elf_abi):
                     "static buffers are content-keyed and shared (rule A3)"
                 )
 
-    plan = PoolPlan(signature=plan_signature(steps, specs, elf_abi))
+    supplied = _host_supplied_set(steps, specs, host_supplied)
+    plan = PoolPlan(signature=plan_signature(steps, specs, elf_abi, supplied))
     positions = _positions(steps)
 
     # Under the xclbin ABI a buffer is only poolable at one (kernel, arg index),
@@ -287,7 +360,7 @@ def plan_pool(steps, specs, elf_abi):
         plan.static_of[name] = key
         plan.bins.setdefault(slot, binsz)
 
-    plan.live = compute_live_ranges(steps, specs)
+    plan.live = compute_live_ranges(steps, specs, supplied)
 
     # Buffers appearing together in one step conflict regardless of live-range
     # arithmetic, so two distinct tensors never land on one BO (A1).

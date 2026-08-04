@@ -30,6 +30,7 @@ from shared.infra.bo_pool import (  # noqa: E402
     _bin_size,
     compute_live_ranges,
     content_key,
+    host_supplied_names,
     plan_pool,
     plan_signature,
 )
@@ -112,6 +113,67 @@ def test_static_buffers_are_outside_the_liveness_analysis():
     steps = [DispatchStep("k", ("w", "x"), writes=(1,))]
     specs = {"w": spec("w", static=True, content_key="sha256:aa"), "x": spec("x")}
     assert "w" not in compute_live_ranges(steps, specs)
+
+
+def _in_place_steps(acc_args, acc_writes):
+    """Two chained steps, then one that writes `acc`. `tmp` dies at step 1."""
+    return [
+        DispatchStep("k", ("in", "tmp"), writes=(1,)),
+        DispatchStep("k", ("tmp", "sink"), writes=(1,)),
+        DispatchStep("k", acc_args, writes=acc_writes),
+    ]
+
+
+def _slot_mates(plan, name):
+    """Every other buffer assigned the same slot as `name`.
+
+    A host-supplied buffer is live from -1, so it overlaps every buffer in the
+    sequence and this is empty for one. Non-empty means something else writes
+    the slot its host bytes are in before the kernel that reads them runs.
+    """
+    return sorted(
+        n for n, s in plan.slot_of.items() if s == plan.slot_of[name] and n != name
+    )
+
+
+def test_an_in_place_buffer_is_live_from_before_the_sequence():
+    """L1/D7: a buffer a step reads and writes is host-supplied, not produced.
+
+    Declared A2's way: one identity at a read position and a write position of
+    the same step. Started at the step that writes it instead, its live range
+    begins after `in` and `sink` have died, they are handed the slot holding its
+    host bytes, and the kernel reads what they left there instead.
+    """
+    steps = _in_place_steps(("acc", "acc"), (1,))
+    specs = {n: spec(n) for n in ("in", "tmp", "sink", "acc")}
+    assert host_supplied_names(steps) == {"in", "acc"}
+    live = compute_live_ranges(steps, specs)
+    assert live["acc"] == (-1, 2)
+    assert live["tmp"] == (0, 1)
+    assert _slot_mates(plan_pool(steps, specs, elf_abi=True), "acc") == []
+
+
+def test_a_single_position_in_place_buffer_is_declared_by_the_caller():
+    """D7's undecidable case, and the escape hatch for it.
+
+    `DispatchStep("k", ("acc",), writes=(0,))` cannot say whether the kernel
+    reads `acc` before writing it, and a plain output is much the commoner
+    reading, so the derivation calls it produced. A caller that means in-place
+    passes the buffer in `host_supplied` — `run_sequence`'s `host_writes` — and
+    the plan then holds its slot from before the sequence.
+    """
+    steps = _in_place_steps(("acc",), (0,))
+    specs = {n: spec(n) for n in ("in", "tmp", "sink", "acc")}
+    assert "acc" not in host_supplied_names(steps)
+    derived = plan_pool(steps, specs, elf_abi=True)
+    assert derived.live["acc"] == (2, 2)
+    assert _slot_mates(derived, "acc") == ["in", "sink"]
+
+    declared = plan_pool(steps, specs, elf_abi=True, host_supplied={"in", "acc"})
+    assert declared.live["acc"] == (-1, 2)
+    assert _slot_mates(declared, "acc") == []
+    # O5: the two assignments differ, so they must not share a pool.
+    assert declared.signature != derived.signature
 
 
 # --- overlapping live ranges ----------------------------------------------
@@ -496,6 +558,24 @@ def test_a_spec_no_step_names_is_not_part_of_the_plan():
     assert plan_signature(_sig_steps(), extra, True) == plan_signature(
         _sig_steps(), _sig_specs(), True
     )
+
+
+def test_declaring_a_static_host_write_does_not_split_the_pool():
+    """S3/O5: a static is outside the liveness analysis, so naming one in the
+    host-supplied set cannot change the assignment — and must not change the
+    signature either, or a caller that lists its weights in `host_writes` keys a
+    second pool on the same sequence and re-uploads every one of them.
+    """
+    key = content_key(b"\x07" * 4096)
+    steps = [DispatchStep("k", ("w", "x", "y"), writes=(2,))]
+    specs = {
+        "w": spec("w", static=True, content_key=key),
+        "x": spec("x"),
+        "y": spec("y"),
+    }
+    base = plan_pool(steps, specs, elf_abi=True).signature
+    declared = plan_pool(steps, specs, elf_abi=True, host_supplied={"w", "x"})
+    assert declared.signature == base
 
 
 def test_a_reused_pool_does_not_resync_a_resident_static():

@@ -76,9 +76,11 @@ transient buffers, in either direction.
 
 ## 3. Live ranges
 
-**L1.** For buffer `b`, `start(b)` is the index of the first step that writes `b` (its producer).
-If no step writes it — a host-supplied input — `start(b) = -1`, so it is live from before the
-sequence begins.
+**L1.** For buffer `b`, `start(b) = -1` if `b` is host-supplied (D7), so it is live from before
+the sequence begins; otherwise `start(b)` is the index of the first step that writes `b`, its
+producer. Being written by a step is not what decides this — an in-place buffer is written *and*
+host-supplied, and starting it at its writing step would let a buffer that dies earlier take the
+slot its host bytes are sitting in.
 
 **L2.** `end(b)` is the index of the last step that names `b` as any argument.
 
@@ -91,8 +93,9 @@ zero-copy return views in `cache.py` safe; see §6.
 
 **L5.** A buffer that a step both reads and writes (an in-place argument, or the same buffer
 passed at two argument positions) contributes to that step exactly as any other appearance:
-`start` may be that step, `end` at least that step. No special case is needed, but the aliasing
-must be *declared* — see §4.
+`end` is at least that step, and `start` is `-1` because its incoming bytes come from the host
+(L1/D7) rather than from a producer. No special case is needed in the allocator, but the aliasing
+must be *declared* — see §4 and D7.
 
 ---
 
@@ -161,6 +164,24 @@ that sync is how a pooling allocator produces stale reads.
 **D6.** Instruction BOs (xclbin ABI only) sync once per BO identity, tracked by `id()`, never per
 call.
 
+**D7 — which buffers the host supplies.** A buffer is host-supplied iff some step reads it before
+any step has written it: its first appearance at an argument position *not* in that step's
+`writes` is at or before the first step that writes it. Those are the buffers D1 uploads and L1
+starts at `-1`. A buffer only the device writes gets no upload: it has no host bytes, and pushing
+its slot to the device before its producer runs would send the previous occupant's bytes to a
+kernel that is about to overwrite them.
+
+The classification is exact for a plain input and for A2's in-place form — one identity at a read
+position and a write position of the same step. It **cannot** decide a buffer that appears only at
+a written position: `writes` says the kernel writes that argument and nothing says whether it
+reads it first, so a single-position read-modify-write is indistinguishable from a plain output,
+which is much the commoner case. Those count as produced, and a caller doing such an update
+declares it — either A2's way, or by naming the buffer in `run_sequence`'s `host_writes`, which
+uploads it and pins it live from before the sequence. Deriving it wrong in either direction is
+silent: too few uploads means the kernel reads the pool's previous occupant, too many means the
+dirty-bit discipline stops reducing `sync_boundaries` and the latency numbers stop being
+comparable to iron's.
+
 ---
 
 ## 7. Host-view lifetime — the footgun
@@ -191,7 +212,7 @@ being deleted when the allocator subsumed it.
 | Existing flag | Expressed as |
 |---|---|
 | `static_input_indices` | buffers marked static (§5) |
-| `intermediate_indices` | buffers with a producer inside the sequence, so `start > -1` and no host write (D1 never sets their dirty bit) |
+| `intermediate_indices` | buffers a producer inside the sequence writes and no step reads first (D7), so `start > -1` and no host write (D1 never sets their dirty bit) |
 | `shared_nonstatic` | one pool, all non-static buffers eligible for slot sharing, with L3 pinning declared outputs |
 
 The flags stay on `load_and_run` as the single-step API, and keep their current semantics and

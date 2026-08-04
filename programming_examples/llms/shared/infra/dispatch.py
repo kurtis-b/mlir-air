@@ -46,19 +46,30 @@ Footguns:
   claims one submission for work that took several — that would collapse `runlist`
   into `offload` in the results, which is exactly the distinction the study exists
   to measure.
+
+- **An in-place buffer at one argument position must be declared.**
+  `default_host_writes` uploads every buffer a step reads before any step writes
+  it, which covers a plain input and the two-position in-place form rule A2 asks
+  for. It cannot cover a buffer that appears only at a written position: nothing
+  in `DispatchStep` distinguishes a read-modify-write there from a plain output.
+  Name such a buffer in `host_writes` and its host bytes are uploaded and its
+  slot pinned from before the sequence.
 """
 
 import time
 from dataclasses import dataclass, field
 
-from shared.infra.bo_pool import DispatchStep  # re-exported for callers
+from shared.infra.bo_pool import DispatchStep, host_supplied_names
 
 __all__ = [
-    "DispatchStep",
+    "DispatchStep",  # re-exported for callers
     "DispatchVector",
+    "LaunchCounts",
     "RunlistSplitError",
     "RunlistExecutionError",
     "Submission",
+    "default_host_writes",
+    "launch_totals",
     "plan_submissions",
     "OPCODE_DPU",
     "N_XCLBIN_PREFIX_ARGS",
@@ -115,9 +126,16 @@ class DispatchVector:
         Equals the number of dispatch steps. `entries_per_submission` derives the
         per-submission figure the CSV wants.
     air_launches: `air.launch` operations in the compiled modules the sequence
-        touched, summed per step. Recorded at compile time from the MLIR module,
-        because the runtime artifact does not carry it.
-    herd_launches: `air.herd` operations, same accounting.
+        touched, counted once per distinct ELF — 03-measurement-model.md defines
+        the field as the launches *in the compiled module*, so an artifact two
+        steps invoke contributes its count once, not twice. Recorded at compile
+        time from the MLIR module, because the runtime artifact does not carry
+        it.
+    herd_launches: `air.herd` operations *executed*, which 03 defines as a count
+        of launches rather than a property of a module, so this one does
+        accumulate per step: two invocations of a two-herd artifact are four.
+        The asymmetry with `air_launches` is 03's; `launch_totals` is the one
+        place either is computed.
     sync_boundaries: `bo.sync()` calls issued for the sequence, both directions.
         This is the number the dirty-bit discipline reduces, and the number that
         makes `offload` and `fused_elf` differ even at equal submission counts.
@@ -351,6 +369,59 @@ class LaunchCounts:
         return {"air_launches": self.air_launches, "herd_launches": self.herd_launches}
 
 
+def launch_totals(steps, binary_of, counts_of):
+    """(air_launches, herd_launches) for a sequence, per 03-measurement-model.md.
+
+    The two are counted differently and that is deliberate.
+    `air_launches_per_elf` is defined as the `air.launch` operations *in the
+    compiled module*, so every distinct ELF the sequence touches contributes its
+    count once however many entries invoke it — a real layer dispatches its gate
+    and up projections through one artifact, and counting per entry would report
+    a module with N launches as having 2N. `herd_launches` is defined as launches
+    executed, so it accumulates per step.
+
+    Both live here rather than in the dispatch loop so that the asymmetry is
+    visible in one place and a later edit cannot quietly make them agree.
+
+    Args:
+        steps: ordered `DispatchStep`s.
+        binary_of: kernel name -> compiled artifact path. Two cache entries may
+            resolve to one ELF; that is one compiled module.
+        counts_of: kernel name -> `LaunchCounts.as_dict()`, or None for an
+            artifact loaded from a manifest written before the counts existed.
+    """
+    air = 0
+    herd = 0
+    seen = set()
+    for step in steps:
+        counts = counts_of(step.kernel) or {}
+        herd += counts.get("herd_launches", 0)
+        binary = binary_of(step.kernel)
+        if binary not in seen:
+            seen.add(binary)
+            air += counts.get("air_launches", 0)
+    return air, herd
+
+
+def default_host_writes(steps, specs):
+    """The buffers `run_sequence` writes from the host when not told which (D7).
+
+    Every buffer some step reads before any step writes it — `host_supplied_names`
+    decides that, and its docstring records the one case a `DispatchStep` cannot
+    express — plus every static weight. A3 makes a static read-only, so it already
+    qualifies; naming statics anyway keeps a missed weight upload, which is silent
+    garbage rather than an error, from resting on a rule enforced elsewhere.
+
+    A buffer whose only appearance is at a written position is **not** in here.
+    That is a plain output in the overwhelming majority of cases, and a caller
+    doing a single-position in-place update declares it by naming the buffer in
+    `host_writes`.
+    """
+    return host_supplied_names(steps) | {
+        n for s in steps for n in s.args if specs[n].static
+    }
+
+
 def run_sequence(
     cache,
     steps,
@@ -366,7 +437,8 @@ def run_sequence(
     what that method's `static_input_indices` / `intermediate_indices` /
     `shared_nonstatic` flags say by hand from the declared sequence instead:
     static buffers come from `BufferSpec.static`, intermediates are the buffers a
-    step produces, and slot sharing falls out of the liveness analysis.
+    step produces that no step reads first (D7), and slot sharing falls out of
+    the liveness analysis.
 
     Args:
         cache: the owning `KernelCache`.
@@ -378,7 +450,11 @@ def run_sequence(
             writes and the dtype/element count for readback views — never
             `bo.size()`, which is the 4 KiB-rounded slot (rule O3).
         host_writes: buffer names the host writes before the sequence. Defaults
-            to every buffer no step produces, plus every static buffer.
+            to `default_host_writes`: every buffer read before it is written,
+            plus every static buffer. Declaring one by hand is how a caller
+            expresses a single-position in-place buffer, which the step
+            declaration cannot; a name no step dispatches is an error rather
+            than a silent no-op, since it has no BO to be written into.
         require_single_submission: raise `RunlistSplitError` rather than split.
 
     Returns:
@@ -420,17 +496,34 @@ def run_sequence(
         )
     elf_abi = abis.pop()
 
-    plan = plan_pool(steps, specs, elf_abi)
-
-    produced = {n for s in steps for n in s.written_names()}
     # Only buffers the sequence actually dispatches. `specs` may carry more —
     # a caller reusing one spec table across several sequences — and a buffer no
     # step names has no slot in the plan (bo_pool: no position, hence no bank).
     dispatched = {n for s in steps for n in s.args}
-    if host_writes is None:
-        host_writes = {n for n in dispatched if n not in produced or specs[n].static}
-    else:
+
+    # Materialized before `plan_pool`, which may be handed it: `host_writes` is
+    # any iterable, and a generator consumed there would read as empty here.
+    if host_writes is not None:
         host_writes = set(host_writes)
+
+    # The host-supplied set decides each buffer's live-range start (D7/L1), so
+    # the plan has to know it: an in-place buffer treated as produced starts at
+    # the step that writes it, and an earlier-dying buffer takes the slot its
+    # host bytes are sitting in.
+    plan = plan_pool(steps, specs, elf_abi, host_supplied=host_writes)
+
+    # After `plan_pool`, which is what reports a step naming a buffer with no
+    # spec — deriving the default first would turn that into a bare KeyError.
+    if host_writes is None:
+        host_writes = default_host_writes(steps, specs)
+    else:
+        undispatched = sorted(host_writes - dispatched)
+        if undispatched:
+            raise ValueError(
+                f"host_writes names {undispatched}, which no step dispatches, so "
+                f"they have no pool slot to be written into. Declare them on a "
+                f"step or drop them from host_writes."
+            )
 
     # One device for the whole pool (rule O2). Each XRTBackend.load() builds its
     # own `xrt.device(0)` wrapper, so without this a buffer shared between two
@@ -465,6 +558,11 @@ def run_sequence(
         )
 
     vector = DispatchVector(runlist_entries=len(steps))
+    vector.air_launches, vector.herd_launches = launch_totals(
+        steps,
+        lambda k: cache.artifacts[k].output_binary,
+        cache.launch_counts.get,
+    )
     counted = {}
 
     def _to_device(bo):
@@ -485,12 +583,18 @@ def run_sequence(
 
     with filelock.FileLock("/tmp/npu.lock"):
         t_sync = time.perf_counter()
+        # Host writes are the only host->device traffic there can be: a buffer a
+        # step produces has no host bytes to send, and uploading its slot before
+        # its producer runs would push the previous occupant's bytes at a kernel
+        # that is about to overwrite them anyway. D5's dirty bit on such a buffer
+        # is cleared by the device write (D4), not paid for with a sync.
         for name in sorted(host_writes):
+            spec = specs[name]
             # A static weight is written to its BO once and never again (S2).
             # Pools outlive a sequence, so on the second and later dispatches
             # this skips the copy as well as the sync — which is most of what
             # makes a repeated sequence cheap.
-            if specs[name].static and pool.is_static_resident(name, plan):
+            if spec.static and pool.is_static_resident(name, plan):
                 continue
             src_arr = arrays[name]
             src = np.frombuffer(
@@ -504,10 +608,9 @@ def run_sequence(
                 casting="no",
             )
             pool.mark_written_by_host(name)
-        for name in sorted(set(specs) & (host_writes | produced)):
             if pool.sync_to_device_if_needed(name, plan, specs):
                 vector.sync_boundaries += 1
-                vector.bytes_transferred += specs[name].nbytes
+                vector.bytes_transferred += spec.nbytes
         vector.sync_ms += (time.perf_counter() - t_sync) * 1000.0
 
         # Instruction BOs sync once per identity, not per call (rule D6).
@@ -541,10 +644,6 @@ def run_sequence(
                     ),
                 )
                 runs.append(run)
-                counts = cache.launch_counts.get(step.kernel)
-                if counts is not None:
-                    vector.air_launches += counts.get("air_launches", 0)
-                    vector.herd_launches += counts.get("herd_launches", 0)
 
             ctx_backend, _ = cache._loaded[sub.steps[0].kernel]
             elapsed = submit(xrt, ctx_backend.context, runs, sub.steps, sub_idx)
