@@ -27,6 +27,8 @@ how to use MLIR-AIR.
 | [11-goal-sota-sliding-window.md](11-goal-sota-sliding-window.md) | Goal 1 — sliding-window / local-global attention |
 | [12-goal-quantized-inference.md](12-goal-quantized-inference.md) | Goal 2 — quantized inference |
 | [13-verification-and-acceptance.md](13-verification-and-acceptance.md) | Every gate, in one place |
+| [14-the-port-loop-harness.md](14-the-port-loop-harness.md) | The automated driver: how it works, how to run a phase, what it learned the hard way |
+| [15-environment-notes.md](15-environment-notes.md) | Toolchain state and the setup traps that silently hollow out hardware gates |
 
 ## Status board
 
@@ -35,9 +37,9 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 
 | Phase | Gate | Status |
 |---|---|---|
-| A — AIE2P kernels | Every kernel compiles to `.o` with Peano; compile-only lit passes | not started |
-| B — runtime seam | Multi-ELF runlist on hardware: numerically identical to sequential, lower latency | not started |
-| C — operators | Each operator passes `np.isclose` at registry tolerance; registry rows written; shape coverage resolved | not started |
+| A — AIE2P kernels | Every kernel compiles to `.o` with Peano; compile-only lit passes | **done** 2026-08-04 (18 min) |
+| B — runtime seam | Multi-ELF runlist on hardware: numerically identical to sequential, lower latency | **done** 2026-08-04 (362 min) |
+| C — operators | Each operator passes `np.isclose` at registry tolerance; registry rows written; shape coverage resolved | not started — **next** |
 | D — block integration | One full transformer layer matches the torch reference on hardware | not started |
 | E — execution strategies | All four modes agree with the reference; dispatch vectors differ as predicted | not started |
 | F — study harness | `execution-smoke-test` yields ≥1 `run_status=passed` row per measurement CSV | not started |
@@ -45,17 +47,39 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | Goal 1 — sliding window | `make verify` passes with window-crossing prompts | not started |
 | Goal 2 — quantization | Second quantized model passes a gate that exercises the quantized path | not started |
 
-## The one thing to check first
+Phases A and B were executed by the automated driver — see
+[14-the-port-loop-harness.md](14-the-port-loop-harness.md). Both passed their gate, objective
+check and tamper check. All ten shipped LLM deployments still pass `make verify` after Phase B's
+changes to `llms/shared/infra/cache.py`.
 
-Phase B rests on an unproven assumption: that separately-compiled ELF artifacts can share a
-single `pyxrt.hw_context` and be submitted as one runlist on NPU2. The `pyxrt` module API
-supports it in principle, but the repository's only existing runlist usage
-(`test/xrt/24_ctrlpkt_config_2gemms_4x4/test.cpp`) shares one context and one kernel, which
-does not demonstrate the multi-artifact case.
+## Picking this up in a new session
 
-If that assumption fails, three of the four execution modes collapse into one and the study
-loses its central axis. **Spike it before committing to any other phase.** See
-[05-phase-b-runtime-seam.md](05-phase-b-runtime-seam.md).
+Read [00-context-and-goals.md](00-context-and-goals.md) and
+[02-porting-conventions.md](02-porting-conventions.md) first — the conventions document is a hard
+requirement, not advice, and ported code is rewritten to MLIR-AIR style rather than transplanted.
+
+Then, before touching anything:
+
+- [15-environment-notes.md](15-environment-notes.md) — the toolchain was four layers stale on
+  2026-08-03 and had to be upgraded end to end. Two CMake flags are lost on any clean rebuild and
+  silently hollow out every hardware gate if missing. Read this before running a gate.
+- [05a-phase-b-runlist-spike-result.md](05a-phase-b-runlist-spike-result.md) — the plan's
+  load-bearing assumption, answered. **Do not act on §"The resolution" in
+  [05-phase-b-runtime-seam.md](05-phase-b-runtime-seam.md); the mechanism it proposes is wrong.**
+- [14-the-port-loop-harness.md](14-the-port-loop-harness.md) — how the automated driver works and
+  how to run the next phase through it.
+
+**The next phase is C (operators).** Its largest open question is shape coverage: the kernel
+registry holds 40 measured GEMM shapes and the case matrix needs several hundred. That decision
+is described in [06-phase-c-operators.md](06-phase-c-operators.md) and should be settled before
+Phase D depends on it.
+
+## Load-bearing questions already answered
+
+| Question | Answer | Where |
+|---|---|---|
+| Can separately-compiled ELFs share one runlist? | Yes — N ELFs, N `hw_context`s, one runlist. Bit-identical to sequential, 1.02–1.15× faster. **Not** by sharing one context; XRT rejects that three ways. | [05a](05a-phase-b-runlist-spike-result.md) |
+| How many concurrent `hw_context`s does NPU2 grant? | 32 (33 fails with `DRM_IOCTL_AMDXDNA_CREATE_HWCTX err=-2`). Phase E's `runlist` mode wants 29 — fits, with three to spare. Caveats on the margin recorded. | [08 §Risks](08-phase-e-execution-strategies.md) |
 
 ## Provenance
 
