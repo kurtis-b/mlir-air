@@ -10,3 +10,10 @@ build_peano/
 air.mlir
 air.elf
 air_project/
+
+# opcheck.py writes its machine-readable verdicts here on every run. They are
+# measurements, not sources: the gate regenerates them, and the durable record
+# of what was measured lives in kernel_registry/. results/fault/ holds the
+# negative-control runs, kept in a subdirectory so an injected run can never be
+# mistaken for -- or overwrite -- a clean one.
+results/
