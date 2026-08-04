@@ -75,7 +75,8 @@ pl_codex_review() {
   verdict="$(jq -r '.verdict' "${out_json}")"
   nblock="$(jq -r '.blocking | length' "${out_json}")"
   nweak="$(jq -r '.weakened_gates | length' "${out_json}")"
-  log_info "review verdict=${verdict} blocking=${nblock} weakened_gates=${nweak}"
+  local nlim; nlim="$(jq -r '(.gate_limitations // []) | length' "${out_json}" 2>/dev/null || echo 0)"
+  log_info "EVENT: review-done verdict=${verdict} blocking=${nblock} weakened=${nweak} limitations=${nlim}"
   jq -r '"  summary: \(.summary)"' "${out_json}" >&2 2>/dev/null || true
   return 0
 }

@@ -23,12 +23,24 @@ The port is a re-expression, never a file copy.
 
 ## What to examine, in priority order
 
-**1. Weakened gates — report these in `weakened_gates`, and be suspicious.** This diff was
-written by an autonomous agent that was told to make a gate pass. Did it weaken, delete, narrow,
-skip, stub or `XFAIL` any test, assertion, tolerance, or check? Is any new test trivial — passing
-without actually exercising the code it claims to cover? Phase A is especially exposed because it
-creates the very lit suite that gates it: confirm the test genuinely compiles the ported kernels
-rather than merely succeeding. Prefer a false positive here to silence.
+**1. Weakened gates vs. gate limitations — keep these strictly separate.**
+
+`weakened_gates` is ONLY for checks **this diff made weaker than they were at the base commit**.
+Compare against the base and say what the check used to be. Deleting an assertion, narrowing a
+symbol list, loosening a tolerance, adding `XFAIL`, or replacing a real test with a stub all
+belong here. A non-empty list halts the run outright, so put something here only when the diff
+itself caused the regression.
+
+`gate_limitations` is for what the gate **cannot prove in principle**, where the diff did not
+make it worse. A compile-only gate cannot prove numerical correctness. Inspecting object files
+cannot prove provenance. A build can in principle be spoofed by a determined author. These are
+real and worth recording, but they are properties of the phase's design — Phase A is a
+compile gate by intent, and semantic correctness is gated later in Phases C and D. Reporting
+them here informs; reporting them as weakened gates halts a run for something no fix would
+resolve.
+
+Ask yourself: *did this diff make the check weaker, or was the check always this strong?* Only
+the first is a weakened gate.
 
 **2. Correctness.** Concrete defects, with a specific failing input or condition. For kernel
 work: wrong ABI, wrong symbol names, wrong tile or shape assumptions, wrong compile-time `-D`

@@ -197,7 +197,7 @@ run_phase() {
   local needs_hw; needs_hw="$(phase_needs_hardware "${phase}")"
   _PHASE_DOC="$(phase_doc "${phase}")"
 
-  log_info "=== Phase ${phase}: $(phase_name "${phase}") ==="
+  log_info "EVENT: phase-start ${phase} — $(phase_name "${phase}")"
   state_set --arg p "${phase}" '.step = "preflight" | .round = 0'
   state_log "phase_start" "$(phase_name "${phase}")"
 
@@ -322,6 +322,7 @@ run_phase() {
     return 1
   fi
 
+  log_info "EVENT: phase-complete ${phase} — gate, objective and tamper checks all passed"
   state_log "phase_complete" "phase ${phase} passed gate, objective and tamper checks"
   timing_end "${phase}" "passed" "${phase_epoch}"
   log_info "=== Phase ${phase} COMPLETE ==="

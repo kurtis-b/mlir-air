@@ -74,12 +74,13 @@ state_halt() {
   local reason="$1"
   state_set --arg r "${reason}" '.status = "halted" | .halt_reason = $r'
   state_log "halt" "${reason}"
-  log_error "HALTED: ${reason}"
+  log_error "EVENT: halted — ${reason}"
 }
 
 state_done() {
   state_set '.status = "done" | .halt_reason = null'
   state_log "done" "all phases in scope complete"
+  log_info "EVENT: run-done all phases in scope complete"
 }
 
 # Count an agent invocation and enforce the caps. Returns 1 when a cap is hit.

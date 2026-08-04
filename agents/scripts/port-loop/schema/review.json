@@ -1,11 +1,21 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["verdict", "summary", "blocking", "non_blocking", "weakened_gates"],
+  "required": [
+    "verdict",
+    "summary",
+    "blocking",
+    "non_blocking",
+    "weakened_gates",
+    "gate_limitations"
+  ],
   "properties": {
     "verdict": {
       "type": "string",
-      "enum": ["pass", "fail"],
+      "enum": [
+        "pass",
+        "fail"
+      ],
       "description": "pass only if there are zero blocking findings AND zero weakened gates."
     },
     "summary": {
@@ -18,14 +28,26 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["file", "line", "summary", "why_it_breaks"],
+        "required": [
+          "file",
+          "line",
+          "summary",
+          "why_it_breaks"
+        ],
         "properties": {
-          "file": { "type": "string" },
+          "file": {
+            "type": "string"
+          },
           "line": {
-            "type": ["integer", "null"],
+            "type": [
+              "integer",
+              "null"
+            ],
             "description": "1-indexed line, or null when the finding is file-level."
           },
-          "summary": { "type": "string" },
+          "summary": {
+            "type": "string"
+          },
           "why_it_breaks": {
             "type": "string",
             "description": "Concrete failure: what input or condition produces what wrong result."
@@ -39,24 +61,69 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["file", "line", "summary"],
+        "required": [
+          "file",
+          "line",
+          "summary"
+        ],
         "properties": {
-          "file": { "type": "string" },
-          "line": { "type": ["integer", "null"] },
-          "summary": { "type": "string" }
+          "file": {
+            "type": "string"
+          },
+          "line": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "summary": {
+            "type": "string"
+          }
         }
       }
     },
     "weakened_gates": {
       "type": "array",
-      "description": "ANY test, gate, tolerance, assertion or check that this diff weakened, deleted, narrowed, skipped or stubbed. A non-empty list halts the run unconditionally. Report suspicion here rather than staying silent.",
+      "description": "ONLY changes THIS DIFF made that weaken an existing check: a test, gate, tolerance, assertion or CHECK line that this diff deleted, narrowed, skipped, stubbed or made easier to satisfy than it was at the base commit. Compare against the base commit and cite what it used to be. A non-empty list halts the run. If a gate is merely limited in what it can prove, and this diff did not make it weaker, it belongs in gate_limitations instead.",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["file", "what_was_weakened"],
+        "required": [
+          "file",
+          "what_was_weakened"
+        ],
         "properties": {
-          "file": { "type": "string" },
-          "what_was_weakened": { "type": "string" }
+          "file": {
+            "type": "string"
+          },
+          "what_was_weakened": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "gate_limitations": {
+      "type": "array",
+      "description": "Inherent limits of what the phase's gate can prove, which this diff did NOT introduce. Example: a compile-only gate cannot prove numerical correctness, and an artifact inspection cannot prove provenance. These are recorded and reported but do NOT halt the run, because they are properties of the phase's design rather than defects in the diff.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "file",
+          "limitation",
+          "why_not_a_regression"
+        ],
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "limitation": {
+            "type": "string"
+          },
+          "why_not_a_regression": {
+            "type": "string",
+            "description": "Why this is pre-existing rather than something the diff caused."
+          }
         }
       }
     }

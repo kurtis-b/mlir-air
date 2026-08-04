@@ -100,13 +100,25 @@ guard_check_destructive() {
   return 0
 }
 
-# A review verdict halts the run outright when it reports weakened gates, regardless of verdict.
+# A review halts the run when the diff WEAKENED a gate. Inherent limits of what a gate can prove
+# are recorded and surfaced but never halt: they describe the phase's design, not a regression,
+# and no fix inside the phase would clear them. Conflating the two halted three of four early
+# runs on observations like "a compile-only gate cannot prove numerical correctness" -- true, and
+# exactly why Phases C and D exist.
 guard_check_weakened() {
   local review_json="$1"
+
+  local lim
+  lim="$(jq -r '(.gate_limitations // []) | length' "${review_json}" 2>/dev/null || echo 0)"
+  if [ "${lim:-0}" -gt 0 ]; then
+    log_warn "${lim} gate limitation(s) recorded (informational, not halting):"
+    jq -r '.gate_limitations[] | "  \(.file): \(.limitation)"' "${review_json}" >&2
+  fi
+
   local n
   n="$(jq -r '(.weakened_gates // []) | length' "${review_json}" 2>/dev/null || echo 0)"
   if [ "${n:-0}" -gt 0 ]; then
-    log_error "Codex reported ${n} weakened gate(s):"
+    log_error "Codex reported ${n} gate(s) WEAKENED BY THIS DIFF:"
     jq -r '.weakened_gates[] | "  \(.file): \(.what_was_weakened)"' "${review_json}" >&2
     return 1
   fi
