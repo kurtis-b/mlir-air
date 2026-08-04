@@ -204,14 +204,22 @@ def _fmt_gflops(row, method):
     if record is None:
         return "❌" if row["failed"].get(method) else "—"
     value = int(round(record["gflops"]))
-    is_best = row["best"].get(record["tier"]) == method
+    # Bold marks the faster of the two HIGH-precision methods, which is what
+    # `best.high` records and what the existing index table bolds. `direct` is
+    # the only low-tier method, so bolding it would mark nothing.
+    is_best = record["tier"] == "high" and row["best"].get("high") == method
     return f"**{value}**" if is_best else str(value)
+
+
+def _fmt_exp(value):
+    """`9.4e-3`, not python's `9.4e-03` -- every existing registry row's style."""
+    return f"{value:.1e}".replace("e-0", "e-").replace("e+0", "e+")
 
 
 def _fmt_tier_rel(row, tier):
     for method, record in row["methods"].items():
         if record["tier"] == tier and row["best"].get(tier) == method:
-            return f"{record['mean_rel_L1']:.1e}"
+            return _fmt_exp(record["mean_rel_L1"])
     return "—"
 
 
@@ -263,9 +271,8 @@ def _family_body(family, rows, heading_level, preamble):
     parts.append(preamble)
     parts.append("")
     for role, role_rows in by_role.items():
-        parts.append(
-            f"**`{role}`** — `{role_rows[0].shape.K}` → `{role_rows[0].shape.N}`"
-        )
+        head = role_rows[0]["shape"]
+        parts.append(f"**`{role}`** — `K = {head.K}` → `N = {head.N}`")
         parts.append("")
         parts.append(_role_table(role_rows))
         parts.append("")

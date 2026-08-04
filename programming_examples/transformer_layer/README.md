@@ -95,6 +95,11 @@ memory bank) all produce plausible wrong numbers rather than errors.
 | `builders/mha_out_proj.py` | The entry layer that composes the two into one ELF, plus the composed FP32 reference |
 | `run_npu2_<op>_peano.lit` | One per operator: that operator's numerical gate on a real NPU |
 | `run_npu2_fault_control_peano.lit` | Phase C's negative control: the injected run must FAIL |
+| `sweep/sweep_families.py` | Which shapes the case matrix needs, and which tilings are worth trying for each |
+| `sweep/sweep_measure.py` | One candidate end to end — build, numerical check, timing. The process the sweep forks |
+| `sweep/registry_writer.py` | The append-only write into the registry JSON and both markdown pages |
+| `sweep/registry_sweep.py` | Orchestration: turbo gate, resume, checkpointing, winner selection, the CLI |
+| `sweep/run_npu2_registry_resolution.lit` | Every `baseline_768` shape resolves through the registry. No NPU |
 
 There are two compiled objects, not six: `encoder.cc` and `addnorm_ffn.cc` are
 the only translation units, and each `#include`s its two siblings the way
@@ -166,6 +171,48 @@ and rejected the perturbed run — rather than inverting the exit status, which
 would read a missing `PEANO_INSTALL_DIR`, a kernel link error or an absent NPU
 as a caught fault. Injected runs write into `results/fault/` so they can never
 overwrite a clean verdict.
+
+## The registry sweep
+
+The three GEMM-backed operators above take their tile sizes and method from
+`kernel_registry`, which **raises** on a shape nobody measured rather than
+guessing — hand-copied tile configs previously caused drift and stale-config
+bugs. `sweep/` is the tool that makes a shape resolvable.
+
+```bash
+make registry-plan                # every (shape, candidate) it would measure. No NPU.
+make registry-resolution          # every shape resolves. No NPU; this is the lit test.
+flock -x -w 1800 /tmp/mlir-air-npu.lock make registry-sweep
+make registry-write               # fold the results into the registry. No NPU.
+```
+
+Per `(shape, candidate)` it builds the configuration, checks it through the same
+`opcheck.py` comparison every operator here is gated on, times it, and keeps the
+fastest that passes. `FAMILY=` selects which width of the case matrix to sweep;
+`baseline_768` is the one Phase D needs and the one currently registered, and the
+other two families are the same tool over a different id.
+
+**The sweep never modifies a registered shape.** The rows already in the registry
+are what the ten shipped LLM deployments resolve against, and re-measuring one
+into a different winner would change their behaviour without anyone asking. The
+writer refuses, the orchestrator skips, and the JSON is edited as text rather
+than re-serialized so every pre-existing byte is identical by construction.
+
+Two things about these rows differ from the model-deployment rows next to them,
+both forced by the sequence ladder starting at 64 and both written up on the
+registry's detail page:
+
+- **`herd` is per-row.** `M % (tile_m × herd_m) == 0` cannot hold at `M = 64`
+  with the full 8 rows for either high-precision method's forced `tile_m`, so the
+  short-sequence rows carry a per-method `herd` overriding the file-level `8×4`.
+- **The high-precision `atol` is carried forward at constant strictness rather
+  than held constant.** The GEMM harness scales its inputs by `1/sqrt(K)`, so the
+  output magnitude — and the absolute error of a fixed-relative-precision
+  datapath with it — goes as `K^-1/2`. The published `1.5e-3` is the registry's
+  "≈2.5× the measured worst case" rule evaluated at `K = 8192`; at this family's
+  `K = 768` the same constant is a 3.3× *tightening*. `sweep_measure.py`'s module
+  docstring has the three-point hardware calibration and why the low tier, whose
+  error comes from a different mechanism, is left unscaled.
 
 ## Things that will bite you
 
