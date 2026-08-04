@@ -12,6 +12,16 @@
 // -- kernel_registry/README.md is explicit that a correlation gate is blind to
 // a systematic per-element scale error.
 //
+// NPU serialization lives one layer down, not in the recipe below. Device
+// access is locked on /tmp/npu.lock, which XRTRunner.run_test holds across
+// xclbin load and dispatch (python/air/backend/xrt_runner.py:292) -- the same
+// inode lit.cfg.py's NPU substitution and KernelCache take, so this interlocks
+// with every other NPU job in the repository while the peano compiles still
+// overlap. Taking the outer /tmp/mlir-air-npu.lock here instead would DEADLOCK:
+// the gate command that invokes this suite already holds that inode, and BSD
+// flock(2) treats a second open() of the same file as a foreign lock, so the
+// nested acquire would block against its own parent until the timeout expires.
+//
 // Editing this header: lit scans the WHOLE file for its directives, so naming
 // one in prose -- even inside a comment -- registers as a second directive and
 // leaves the test UNRESOLVED. Describe them, never spell them out.

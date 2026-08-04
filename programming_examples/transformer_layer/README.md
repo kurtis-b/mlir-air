@@ -23,6 +23,17 @@ suite held only the compile-only and host-only tests, so Phase B's hardware clai
 nothing the driver ran. `make compile` and `make seam-tests` remain individually NPU-free, which
 is what keeps them usable as a PR check.
 
+**The two NPU locks are different inodes, and they must not nest.**
+`/tmp/mlir-air-npu.lock` above is the *invocation* lock: a human, or the port-loop driver, takes
+it once around the whole suite. Device access itself is locked one layer down on `/tmp/npu.lock`,
+which `XRTRunner.run_test` and `KernelCache` hold across xclbin load and dispatch, and which
+`programming_examples/lit.cfg.py`'s NPU substitution uses for every other hardware test in the
+tree. That is why no `.lit` recipe here wraps its own commands in the outer lock: the caller
+already holds that inode, and BSD `flock(2)` treats a second `open()` of the same file as a
+foreign lock, so a nested acquire would block against its own parent until the timeout expired.
+Keeping the layers separate is also what lets the Peano compiles overlap while the dispatches
+serialize against every other NPU job in the repository.
+
 ## The Phase B runtime seam
 
 `runlist_gate.py` is
