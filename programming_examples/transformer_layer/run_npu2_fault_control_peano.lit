@@ -5,8 +5,10 @@
 //
 // Runs opcheck.py with a fault injected into one element of one DEVICE input,
 // after the FP32 reference has been computed from the clean one, and requires
-// the check to FAIL. The make target inverts the exit status, so this test
-// passes exactly when the injected run does not.
+// the check to FAIL. opcheck.py's --expect-failure reports the control's own
+// verdict, so this test passes exactly when the comparison ran and rejected the
+// perturbed run -- not merely when the process exited non-zero, which a missing
+// toolchain or an absent NPU would also do without comparing anything.
 //
 // This is the layer a laxer test cannot satisfy, and it is why it is in the
 // suite rather than only in the driver. A reference compared against itself, a

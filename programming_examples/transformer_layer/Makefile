@@ -16,7 +16,8 @@ TILE_N ?= 64
 OPCHECK_ARGS ?=
 
 .PHONY: help compile runlist-gate seam-tests clean opcheck-list \
-        check-elementwise-add check-causal-mask check-layer-norm check-addnorm
+        check-elementwise-add check-causal-mask check-layer-norm check-addnorm \
+        check-fault-control
 
 help:
 	@echo "Transformer-layer AIE2P device kernels, the Phase B runtime seam, and"
@@ -83,23 +84,25 @@ check-layer-norm:
 check-addnorm:
 	$(call opcheck,addnorm)
 
-# The negative control, with its exit status DELIBERATELY INVERTED: it succeeds
-# only when the injected run fails. A check that ignored --fault-inject, or one
-# whose tolerance were wide enough to swallow a perturbed input, would still
-# report PASS here -- and this target would then fail, which is the point.
+# The negative control: it succeeds only when the injected run is REJECTED BY
+# THE COMPARISON. A check that ignored --fault-inject, or one whose tolerance
+# were wide enough to swallow a perturbed input, would report PASS under
+# injection -- and this target would then fail, which is the point.
+#
+# --expect-failure does the inversion inside opcheck.py rather than around it
+# here. Inverting the exit status in this recipe would take EVERY non-zero exit
+# as a caught fault, including a missing PEANO_INSTALL_DIR, a kernel that fails
+# to compile or link, and an NPU that never came up -- none of which compare
+# anything, all of which would print a passing negative control, and any of
+# which would let the operator gate advance on a check that never ran.
+#
 # One operator, because the injection machinery is shared by all four and the
 # driver runs it against each of them directly.
 check-fault-control:
 	mkdir -p $(BUILD_DIR)
-	if cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
-	       python3 $(srcdir)/opcheck.py --operator elementwise_add \
-	           --fault-inject input; then \
-	    echo "NEGATIVE CONTROL: FAIL (injected run passed, so the check is not"; \
-	    echo "  reading the buffer the device was actually given)"; \
-	    exit 1; \
-	else \
-	    echo "NEGATIVE CONTROL: PASS (injected run failed, as required)"; \
-	fi
+	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
+	    python3 $(srcdir)/opcheck.py --operator elementwise_add \
+	        --fault-inject input --expect-failure
 
 clean:
 	rm -rf $(BUILD_DIR) __pycache__ runlist_gate_cache

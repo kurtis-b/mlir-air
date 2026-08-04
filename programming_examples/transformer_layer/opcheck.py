@@ -25,6 +25,22 @@ CONTRACT (the driver calls this directly, not through the Makefile)
     Omitting --shape-key runs every shape the operator claims, and the exit
     status is the conjunction.
 
+    --expect-failure inverts the status of a --fault-inject run for callers that
+    want the control's own verdict rather than the run's: exit 0 if and only if
+    the comparison ran and rejected the perturbed run. It is additive; the three
+    invocations above behave identically with or without it.
+
+WHY --expect-failure LIVES HERE AND NOT IN THE CALLER
+    "The process exited non-zero" is not evidence that the fault was detected. A
+    missing PEANO_INSTALL_DIR, a kernel that fails to compile or link, and an NPU
+    that never comes up all exit non-zero without ever comparing anything, so a
+    caller that simply inverted the exit status would report a passing negative
+    control for every one of them and let the operator gate advance on a check
+    that was never exercised. The inversion belongs where the evidence is: this
+    module holds the completed comparison's statistics, and only reports the
+    control satisfied when those statistics show the comparison itself doing the
+    rejecting.
+
 WHY THE COMPARISON IS NOT WRITTEN HERE
     ``XRTRunner.run_test`` already is the gate this phase requires: ``np.isclose``
     over the FULL output, ``max_mismatch_percentage`` defaulting to zero, bf16
@@ -310,7 +326,14 @@ def _write_result(spec, stats, passed, fault_inject):
 
 
 def run_spec(spec, fault_inject=None, verbose=False):
-    """Run one (operator, shape) on hardware. Returns True if it passed."""
+    """Run one (operator, shape) on hardware. Returns the results record written.
+
+    Returning at all means the comparison ran: ``_write_result`` reads
+    ``runner.stats``, which nothing but ``_RecordingRunner._check_outputs`` sets,
+    so a run that dies before comparing raises rather than returning a verdict.
+    That is what makes the record safe to reason about in
+    ``_negative_control_verdict``.
+    """
     label = f"{spec['operator']} [{spec['shape_key']}]"
     print(f"[opcheck] {label}: preparing")
     prepared = spec["prepare"](spec["shape"])
@@ -336,7 +359,7 @@ def run_spec(spec, fault_inject=None, verbose=False):
         atol=spec["atol"],
     )
     passed = return_code == 0
-    _write_result(spec, runner.stats, passed, fault_inject)
+    record = _write_result(spec, runner.stats, passed, fault_inject)
 
     verdict = "PASS" if passed else "FAIL"
     print(f"[opcheck] {label}: {verdict}")
@@ -347,7 +370,48 @@ def run_spec(spec, fault_inject=None, verbose=False):
         print(
             f"[opcheck] {label}: fault-inject {fault_inject} -> {verdict} ({control})"
         )
-    return passed
+    return record
+
+
+def _negative_control_verdict(records, fault_inject):
+    """Exit status for --expect-failure. 0 only on evidence the fault was caught.
+
+    Every record here came from a completed comparison (see ``run_spec``), so
+    reaching this function already rules out the setup failures that an
+    exit-status inversion would misread as a passing control. What remains to
+    check is that the comparison is what rejected the run: it must have been
+    given the injected inputs, it must have returned FAIL, and it must have
+    counted mismatching elements to do so. A FAIL with ``n_mismatch == 0`` would
+    mean the verdict came from somewhere other than the tolerance check, which
+    proves nothing about whether the check discriminates.
+    """
+    problems = []
+    for record in records:
+        label = f"{record['operator']} [{record['shape_key']}]"
+        if record["fault_injected"] != fault_inject:
+            problems.append(
+                f"{label}: recorded fault_injected={record['fault_injected']!r}, "
+                f"not {fault_inject!r} -- the injection did not reach the run"
+            )
+        if record["passed"]:
+            problems.append(
+                f"{label}: PASSED under injection, so the check is not reading "
+                f"the buffer the device was actually given"
+            )
+        elif record["n_mismatch"] <= 0:
+            problems.append(
+                f"{label}: FAILED with n_mismatch={record['n_mismatch']}, so the "
+                f"tolerance check is not what rejected it"
+            )
+
+    if problems:
+        print("NEGATIVE CONTROL: FAIL")
+        for problem in problems:
+            print(f"  {problem}")
+        return 1
+
+    print("NEGATIVE CONTROL: PASS (injected run failed the comparison, as required)")
+    return 0
 
 
 def main():
@@ -368,6 +432,13 @@ def main():
         help="negative control: perturb one device input after the reference "
         "is computed. The run MUST then fail.",
     )
+    parser.add_argument(
+        "--expect-failure",
+        action="store_true",
+        help="report the negative control's verdict instead of the run's: exit "
+        "0 only if the comparison ran and rejected the injected run. Requires "
+        "--fault-inject.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -385,6 +456,9 @@ def main():
     if not args.operator:
         parser.error("one of --list or --operator is required")
 
+    if args.expect_failure and not args.fault_inject:
+        parser.error("--expect-failure is only meaningful with --fault-inject")
+
     selected = [s for s in SPECS if s["operator"] == args.operator]
     if args.shape_key:
         selected = [s for s in selected if s["shape_key"] == args.shape_key]
@@ -393,10 +467,14 @@ def main():
             f"no such (operator, shape_key): {args.operator} / {args.shape_key}"
         )
 
-    ok = True
-    for spec in selected:
-        ok = run_spec(spec, fault_inject=args.fault_inject, verbose=args.verbose) and ok
-    return 0 if ok else 1
+    records = [
+        run_spec(spec, fault_inject=args.fault_inject, verbose=args.verbose)
+        for spec in selected
+    ]
+
+    if args.expect_failure:
+        return _negative_control_verdict(records, args.fault_inject)
+    return 0 if all(r["passed"] for r in records) else 1
 
 
 if __name__ == "__main__":

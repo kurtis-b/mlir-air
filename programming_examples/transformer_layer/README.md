@@ -142,9 +142,12 @@ array handed to the **device**, after the reference has been computed from the
 clean one, and the run must then FAIL. This is the layer a laxer test cannot
 satisfy: a reference compared against itself, a tolerance wide enough to swallow
 anything, and an ignored flag all still report PASS under injection.
-`check-fault-control` inverts the exit status so the suite gates on it, and
-injected runs write into `results/fault/` so they can never overwrite a clean
-verdict.
+`check-fault-control` runs it with `--expect-failure` so the suite gates on it.
+That flag reports the control's own verdict — exit 0 only if the comparison ran
+and rejected the perturbed run — rather than inverting the exit status, which
+would read a missing `PEANO_INSTALL_DIR`, a kernel link error or an absent NPU
+as a caught fault. Injected runs write into `results/fault/` so they can never
+overwrite a clean verdict.
 
 ## Things that will bite you
 
