@@ -363,6 +363,30 @@ def sweep(
     return all_records
 
 
+def _failure_summary(method_records):
+    """Why a method has no row, in the terms a later reader needs.
+
+    "failed_precision" alone is not enough to act on. A candidate that missed the
+    bound by 15% is a tolerance edge; one that needed 140x it computed something
+    else entirely, and the two want opposite responses from whoever reads the row
+    next. So the closest ``atol_required`` any candidate reached is quoted
+    alongside the bound it was checked at.
+    """
+    statuses = sorted({r["status"] for r in method_records})
+    needed = [
+        r["atol_required"]
+        for r in method_records
+        if r["status"] == "failed_precision" and r.get("atol_required") is not None
+    ]
+    if not needed:
+        return ", ".join(statuses)
+    atol = min(r["atol"] for r in method_records if r["status"] == "failed_precision")
+    return (
+        f"{', '.join(statuses)}; closest needed atol {min(needed):.2e} "
+        f"vs {atol:.2e}"
+    )
+
+
 def select_winners(shape, records, candidates):
     """Fastest passing candidate per method, and the best method per tier.
 
@@ -387,7 +411,7 @@ def select_winners(shape, records, candidates):
             r for r in method_records if r["status"] == "passed" and r.get("gflops")
         ]
         if not passing:
-            failed[method] = sorted({r["status"] for r in method_records})
+            failed[method] = _failure_summary(method_records)
             continue
         methods[method] = min(passing, key=rank)
 
@@ -415,8 +439,8 @@ def select_winners(shape, records, candidates):
             )
             + " (per-method `herd` overrides the file-level 8x4)."
         )
-    for method, statuses in sorted(failed.items()):
-        notes.append(f"{method}: no candidate passed ({', '.join(statuses)}).")
+    for method, summary in sorted(failed.items()):
+        notes.append(f"{method}: no candidate passed ({summary}).")
 
     return {
         "shape": shape,
