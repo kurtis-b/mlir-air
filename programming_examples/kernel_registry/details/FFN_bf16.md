@@ -128,7 +128,7 @@ Element-wise over the **full output**: every element must pass `|out−ref| ≤ 
 |---|---|---|---|---|---|---|---|---|
 | 2048×1024×3072 | fused-cast | fused-cast | 64/256/32/128 (both) | 1.6e-2 | 1.59e-3 | 0 / 2097152 | transformer-layer execution studies, encoder FFN sublayer | ✅ |
 
-> The shape is set by what the GEMM registry can resolve for **both** projections: `2048×1024×3072` and `2048×3072×1024` are the one such pair present today. The builder raises on any other rather than guessing a tiling; filling that in is Phase C4's sweep.
+> **One of seven resolvable shapes, not the only one.** The constraint is that the registry must hold a high-precision entry for *both* directions, `(M, K, F)` and `(M, F, K)`. Seven expansions satisfy that today — `2048×1024×2048`, `2048×1024×3072`, `2048×2048×6144`, `2048×2048×8192`, `2048×2560×4096`, `2048×2560×9728` and `2048×3072×8192` — and only `2048×1024×3072` has been run on hardware. The other six are unmeasured here, which is a coverage gap rather than a known failure; nothing suggests they would not place. Beyond those, the case matrix's remaining FFN shapes have no high-precision entry on at least one side (e.g. `2048×896×4864` and `2048×1536×8960` are low-precision-only), and the builder raises on them rather than guessing a tiling. The builder raises on any other rather than guessing a tiling; filling that in is Phase C4's sweep.
 
 **Performance is not measured here.** Phase C gates numerics only; latency and throughput are deliberately absent rather than estimated.
 

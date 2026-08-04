@@ -245,7 +245,7 @@ This is **documentation, not executable code** — it records results produced b
 
 > **`mean_rel_L1 = 1.6e-2` is ~1.6× a single GEMM's**, and that gap is what the composition costs: the device stages the up-projection output in bf16 and the activation kernel carries bf16 intermediates, while the reference is FP32 end to end. Reproducing either in the oracle would hide exactly the error it introduces.
 >
-> The shape is set by what the registry resolves for **both** projections — `2048×1024×3072` and `2048×3072×1024` are the one such pair present today.
+> **One of seven resolvable shapes.** A shape needs a high-precision registry entry for *both* directions, `(M, K, F)` and `(M, F, K)`; seven expansions satisfy that today (`2048×1024×2048`, `2048×1024×3072`, `2048×2048×6144`, `2048×2048×8192`, `2048×2560×4096`, `2048×2560×9728` and `2048×3072×8192`) and only the row above has been run on hardware. The other six are a coverage gap, not a known failure. The case matrix's remaining FFN shapes lack a high-precision entry on one side and the builder raises on them rather than guessing.
 
 ---
 
