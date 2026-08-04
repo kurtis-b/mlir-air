@@ -84,11 +84,13 @@ Same GEMM knobs as the [f32-out page](GEMM_bf16_in_fp32_out.md#tunable-parameter
 | `tile_k_l2` | 256–512 | `K % tile_k_l2 == 0` | also reduces direct-bf16 truncation count |
 | `tile_k_l1` | 32 | `tile_k_l2 % tile_k_l1 == 0` | inner-accumulation chunk |
 | `tile_n` | **128** | **`N % (tile_n × herd_n) == 0`** ⚠️ | **dominant perf knob** — 128 beats 64 by ~1.3–1.4× |
-| `herd_m` | 8 | `M ≥ tile_m × herd_m` | row-parallel; 8 = full chip rows |
+| `herd_m` | 8 | `M ≥ tile_m × herd_m` | row-parallel; 8 = full chip rows. Per-row override, see below |
 | `herd_n` | 4 | `N ≥ tile_n × herd_n` | col-parallel; 4 = full chip cols → 8×4 = 32-tile herd |
 | `--cast-tile-n` (fused only) | shape-dependent | `N % cast_tile_n == 0` | the cast launch's tile; ~10% spread, near-optimal at default |
 
 ⚠️ **Silent-corruption trap**: `N % (tile_n × herd_n) != 0` is **not asserted** — verify before running.
+
+**The herd is per-row, not a global 8×4.** Most rows use the full chip, so the JSON carries `herd: [8, 4]` at the top level and says nothing per shape. A row whose `M` cannot hold 8 of its method's `tile_m` — every short-sequence row of the transformer-layer study sweep below, starting at `M = 64` — carries its own `herd` inside the method entry, which overrides the file-level one. `registry_lookup.gemm_config()` returns the effective pair alongside the tile; **build with it.** Assuming 8×4 at one of those shapes trips `M % (tile_m × herd_m) == 0` before anything compiles.
 
 ---
 

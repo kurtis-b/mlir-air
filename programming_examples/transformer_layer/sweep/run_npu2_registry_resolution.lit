@@ -28,12 +28,19 @@
 // every model that read it. Requiring one of the two buildable names turns that
 // into a failure here instead of a failure three phases downstream.
 //
+// So is the HERD. The ladder starts at 64, which cannot hold 8 rows of either
+// method's forced tile_m, so those rows carry a herd of their own and the
+// lookup has to hand it back -- a builder that assumed the file-level 8x4 there
+// trips the example's own divisibility assert before it compiles anything.
+// Pinning the herd in the resolved line is what keeps that value wired through
+// the lookup rather than dropped on the floor as an unread JSON key.
+//
 // Editing this header: lit scans the WHOLE file for its directives, so naming
 // one in prose -- even inside a comment -- registers as a second directive and
 // leaves the test UNRESOLVED. Describe them, never spell them out.
 //
 // RUN: python3 %S/registry_sweep.py --family baseline_768 --verify-resolution | FileCheck %s
 //
-// CHECK-COUNT-36: [resolve] {{[0-9]+x[0-9]+x[0-9]+}} ({{.*}}) -> {{fused-cast|drain}} {{[0-9]+/[0-9]+/[0-9]+/[0-9]+}}
+// CHECK-COUNT-36: [resolve] {{[0-9]+x[0-9]+x[0-9]+}} ({{.*}}) -> {{fused-cast|drain}} {{[0-9]+/[0-9]+/[0-9]+/[0-9]+}} herd {{[0-9]+x[0-9]+}}
 // CHECK-NOT: [resolve]
 // CHECK: PASS: all 36 baseline_768 shapes resolve

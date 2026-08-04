@@ -483,7 +483,17 @@ def load_all_results(shapes, results_dir, perf_iters, candidate_kwargs=None):
 
 
 def verify_resolution(shapes):
-    """Assert every shape resolves through the registry. Returns the failures."""
+    """Assert every shape resolves through the registry INTO A BUILDABLE config.
+
+    Returns the failures. Resolving is only half the claim: a row also has to
+    carry a herd that tiles its own shape, because the example builders assert
+    ``M % (tile_m * herd_m) == 0`` and ``N % (tile_n * herd_n) == 0``
+    (``bf16_in_bf16_out/run.py:62,65``) before they compile anything. The
+    ladder starts at ``M = 64``, where neither method's forced ``tile_m`` fits
+    the file-level 8x4, so those rows carry their own herd -- and a row that
+    resolves without one would raise here rather than three phases downstream
+    inside whatever tried to build it.
+    """
     from kernel_registry.registry_lookup import gemm_config
 
     failures = []
@@ -495,10 +505,21 @@ def verify_resolution(shapes):
             # per failure and drowns the list of what actually failed.
             failures.append((shape, str(exc).split(". Measured shapes")[0]))
             continue
+        tile, (herd_m, herd_n) = cfg["tile"], cfg["herd"]
+        if shape.M % (tile["tile_m"] * herd_m) or shape.N % (tile["tile_n"] * herd_n):
+            failures.append(
+                (
+                    shape,
+                    f"resolves to {cfg['method']} tile_m={tile['tile_m']} "
+                    f"tile_n={tile['tile_n']} at herd {herd_m}x{herd_n}, which "
+                    f"does not tile {shape.M}x{shape.N}",
+                )
+            )
+            continue
         print(
             f"[resolve] {shape.label} ({shape.role}, seq={shape.seq}) -> "
-            f"{cfg['method']} {cfg['tile']['tile_m']}/{cfg['tile']['tile_k_l2']}"
-            f"/{cfg['tile']['tile_k_l1']}/{cfg['tile']['tile_n']} "
+            f"{cfg['method']} {tile['tile_m']}/{tile['tile_k_l2']}"
+            f"/{tile['tile_k_l1']}/{tile['tile_n']} herd {herd_m}x{herd_n} "
             f"{cfg['gflops']} GFLOP/s"
         )
     return failures

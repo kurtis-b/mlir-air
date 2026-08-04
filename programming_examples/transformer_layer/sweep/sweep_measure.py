@@ -28,6 +28,33 @@ WHAT "CHECK IT NUMERICALLY" MEANS HERE
     kernel's the moment two different checks produce them. The alternative to
     this import is exactly that second check.
 
+WHERE THE TIMING COMES FROM, AND WHY IT IS NOT ``Profiler``
+    ``XRTRunner``'s own ``n_perf_iters`` / ``perf_flops`` / ``last_latency_us``
+    (``python/air/backend/xrt_runner.py``), which times ``run.start()`` +
+    ``wait2()`` over N iterations after a warmup, inside the backend. That is
+    not a second measurement mechanism standing beside the repository's -- it
+    IS the repository's per-kernel one, and specifically it is the one every
+    row already in this registry was measured with: the reproduction command
+    the detail page publishes for those rows is
+    ``make run ... PERF_ITERS=20``, which reaches the same code path through
+    ``bf16_in_bf16_out/run.py:1251``.
+
+    Porting convention 10 points measurement at ``Profiler`` and
+    ``llms/bench/extract_perf.py``. Neither fits here, and using them would
+    cost the property that matters. ``Profiler`` accumulates per-kernel and
+    per-layer times across a multi-kernel inference run inside ``KernelCache``;
+    this sweep dispatches one kernel per process through ``run_test``, which is
+    also what performs the numerical check the verdict depends on.
+    ``extract_perf.py`` scrapes whole-model metrics -- TTFT, tok/s, prompt_len
+    -- for ``append_history.py`` and the published per-model charts; it has no
+    field for a per-shape GEMM latency and nothing downstream of it would know
+    what to do with 432 of them.
+
+    The rule those two exist to enforce is that a ported measurement must not
+    invent its own timing. This one does not: it uses the same timer, over the
+    same iteration count, on the same inputs, at the same enforced power mode
+    as the numbers it will be ranked against.
+
 THE ACCEPTANCE TOLERANCE, AND WHY IT IS NOT A CONSTANT
     ``rtol`` is the canonical bf16 1.6e-2 at every shape and every tier, held
     fixed across the whole registry.

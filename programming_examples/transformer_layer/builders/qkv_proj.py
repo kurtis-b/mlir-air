@@ -35,8 +35,8 @@ WHY THE SPLIT RIDES THE CAST
     path from the one the registry measured.
 
 TILES COME FROM THE REGISTRY, NEVER FROM A CONSTANT
-    ``gemm_registry_config(m, k, n)`` is the only source of tile sizes and
-    method. It RAISES on an unmeasured shape, deliberately -- hand-copied tile
+    ``resolve_gemm_spec(m, k, n)`` is the only source of tile sizes, method and
+    herd. It RAISES on an unmeasured shape, deliberately -- hand-copied tile
     configs previously caused drift bugs (``registry_lookup.py`` docstring).
     ``gemm_spec_fn`` is the one escape hatch, the same one
     ``rms_qkv_qknorm_rope_multi.py`` already ships for ``qwen3_4b``; an injected
@@ -85,8 +85,9 @@ from air.dialects.func import FuncOp  # noqa: E402
 from air.dialects.scf import for_, yield_  # noqa: E402
 from air.backend.xrt_runner import type_mapper  # noqa: E402
 
-from shared.builders.gemm_builder import gemm_registry_config  # noqa: E402
 from shared.infra.stitching import FuncArg, KernelSlice, stitch_elf  # noqa: E402
+
+from builders.gemm_spec import resolve_gemm_spec, spec_herd  # noqa: E402
 
 range_ = for_
 
@@ -104,7 +105,7 @@ def qkv_gemm_spec(seq_len, emb_dim, gemm_spec_fn=None):
     n_total = 3 * emb_dim
     if gemm_spec_fn is not None:
         return gemm_spec_fn(seq_len, emb_dim, n_total), "injected"
-    return gemm_registry_config(seq_len, emb_dim, n_total, "bf16", "high"), "registry"
+    return resolve_gemm_spec(seq_len, emb_dim, n_total, "bf16", "high"), "registry"
 
 
 @module_builder
@@ -238,8 +239,8 @@ def _build_split_cast_module(
 def build_qkv_proj_module(
     seq_len,
     emb_dim,
-    herd_m=8,
-    herd_n=4,
+    herd_m=None,
+    herd_n=None,
     split_herd_x=8,
     gemm_spec_fn=None,
 ):
@@ -250,7 +251,11 @@ def build_qkv_proj_module(
             is ``[emb_dim, 3*emb_dim]``. The triple ``(seq_len, emb_dim,
             3*emb_dim)`` must be in the GEMM registry, or ``gemm_spec_fn`` must
             supply a spec for it.
-        herd_m, herd_n: GEMM herd, as the registry tiles assume.
+        herd_m, herd_n: GEMM herd. ``None`` (the normal setting) uses the herd
+            the resolved row's tiles were measured at, which is 8x4 for every
+            shape long enough to hold it and smaller at the short end of the
+            sequence ladder. A value here is an explicit override and
+            invalidates the tiling without invalidating the lookup.
         split_herd_x: AIE columns for each split-cast launch. Must divide
             ``seq_len``; must stay at ``herd_y == 1`` (see the module footguns).
         gemm_spec_fn: ``(m, k, n) -> spec`` escape hatch for a shape the
@@ -273,11 +278,12 @@ def build_qkv_proj_module(
 
     from matrix_multiplication.bf16_in_bf16_out.run import build_module as build_gemm
 
+    herd_m, herd_n = spec_herd(spec, herd_m, herd_n)
     print(
         f"  [1/4] QKV GEMM {seq_len}x{emb_dim}x{n_total} "
         f"({spec['method']}, {source}, tile_m={spec['tile_m']} "
         f"tile_k_l2={spec['tile_k_l2']} tile_k_l1={spec['tile_k_l1']} "
-        f"tile_n={spec['tile_n']})..."
+        f"tile_n={spec['tile_n']} herd={herd_m}x{herd_n})..."
     )
     gemm_ir = str(
         build_gemm(

@@ -205,6 +205,11 @@ registry's detail page:
 - **`herd` is per-row.** `M % (tile_m × herd_m) == 0` cannot hold at `M = 64`
   with the full 8 rows for either high-precision method's forced `tile_m`, so the
   short-sequence rows carry a per-method `herd` overriding the file-level `8×4`.
+  `gemm_config()` hands that herd back next to the tile and `builders/gemm_spec.py`
+  merges it into the build recipe, so the operator builders here take their herd
+  from the row rather than defaulting to `8×4`. **Passing an explicit `herd_m` /
+  `herd_n` to a builder overrides the row and will fail to build at the short end
+  of the ladder** — leave them `None` unless you are deliberately experimenting.
 - **The high-precision `atol` is carried forward at constant strictness rather
   than held constant.** The GEMM harness scales its inputs by `1/sqrt(K)`, so the
   output magnitude — and the absolute error of a fixed-relative-precision
@@ -233,6 +238,22 @@ symbols the other's ELF would collide on. `compile_kernels.py` checks both that
 absent — a presence check alone would not notice `build_addnorm=False` silently
 ceasing to work, and the result would break only at link time in whichever
 design happened to combine them.
+
+**Two GEMMs of the same method but different `tile_n` cannot share an ELF.**
+`mm_m32.o` / `mm_m64.o` are compiled with one `-DDIM_N`, and the symbols they
+export are typed by it, so a stitched module holding two same-method GEMMs whose
+registry rows chose different `tile_n` declares `f32_to_bf16_mn_<suffix>` twice
+with different memref types: `redefinition of symbol named ...` out of
+`stitch_elf`'s parse. Every shipped model shape lands on `tile_n = 128`, which
+is why nothing hit this before; the study's FFN does not, because `N = 768`
+cannot use `tile_n = 128` at `herd_n = 4` (`768 % 512 != 0`) and settles on 96
+against the up-projection's 128. **`build_ffn_module` therefore does not build
+at any `baseline_768` point except `seq = 4096`**, where the two happen to
+resolve to different methods and so to different objects. Fixing it means a
+second object per `(method, tile_n)` — the `sym_suffix` / `link_with_name`
+mechanism already supports it, `gemm_method_spec` in `llms/shared/` is where the
+suffix is minted, and that file is off limits to this study. Phase D needs this
+resolved before it can run the FFN leg.
 
 **Multi-segment designs cannot use the xclbin output path.** Every `air.launch`
 lowers to its own `aie.device` under an `aiex.configure` / `aiex.run` runtime

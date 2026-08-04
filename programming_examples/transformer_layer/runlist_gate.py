@@ -75,13 +75,29 @@ for _p in (_EXAMPLES, _EXAMPLES / "llms", _EXAMPLES / "llms" / "shared"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from shared.builders.gemm_builder import (  # noqa: E402
-    _build_gemm_module,
-    gemm_registry_config,
-)
+# _HERE has to end up in FRONT of llms/shared/, which holds a `builders/`
+# package of its own: whichever lands first is the one a bare `import builders`
+# finds, and this file wants the transformer-layer one. Nothing here depends on
+# losing that race -- everything taken from shared arrives via `shared.builders.*`.
+#
+# MOVED, not inserted-if-absent. The Ryzen setup scripts leave a trailing colon
+# on PYTHONPATH, whose empty component Python resolves to the ABSOLUTE cwd -- and
+# the Makefile runs this from srcdir, so this very directory is already on the
+# path, behind the three inserts above. A guarded insert is then a silent no-op
+# and shared's `builders/` keeps winning, surfacing as a bare "No module named
+# 'builders.gemm_spec'" that reads like a missing file rather than a shadowed
+# package.
+_here = str(_HERE)
+if _here in sys.path:
+    sys.path.remove(_here)
+sys.path.insert(0, _here)
+
+from shared.builders.gemm_builder import _build_gemm_module  # noqa: E402
 from shared.infra.bo_pool import BufferSpec, DispatchStep, content_key  # noqa: E402
 from shared.infra.cache import KernelCache, Profiler  # noqa: E402
 from shared.infra.dispatch import RunlistSplitError, plan_submissions  # noqa: E402
+
+from builders.gemm_spec import resolve_gemm_spec, spec_herd  # noqa: E402
 
 #: Llama-3.2-1B decoder-layer projection GEMMs at seq_len 2048, as (label, M, K, N).
 #: q/o and gate/up each share a shape, so these five compile to three distinct
@@ -148,7 +164,7 @@ def build_artifacts(cache, run_only=False):
 
     specs = {}
     for name, (m, k, n) in shapes.items():
-        cfg = gemm_registry_config(m, k, n)
+        cfg = resolve_gemm_spec(m, k, n)
         entry = "gemm_cast_bf16" if cfg["needs_f32_scratch"] else "matmul_bf16"
         specs[name] = (cfg, entry)
 
@@ -179,6 +195,7 @@ def build_artifacts(cache, run_only=False):
             cfg["tile_k_l2"],
             cfg["tile_k_l1"],
             cfg["tile_n"],
+            *spec_herd(cfg),
             **cfg["build_kwargs"],
         )
         cache.compile_and_cache(name, module, backend_kwargs_for(name, entry))

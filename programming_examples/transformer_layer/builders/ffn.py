@@ -70,10 +70,7 @@ for _p in (_PROJ_ROOT, os.path.join(_PROJ_ROOT, "llms")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from shared.builders.gemm_builder import (  # noqa: E402
-    _build_gemm_module,
-    gemm_registry_config,
-)
+from shared.builders.gemm_builder import _build_gemm_module  # noqa: E402
 from shared.infra.stitching import FuncArg, KernelSlice, stitch_elf  # noqa: E402
 
 from builders.gelu import (  # noqa: E402
@@ -81,6 +78,7 @@ from builders.gelu import (  # noqa: E402
     build_gelu_module,
     gelu_tanh_reference,
 )
+from builders.gemm_spec import resolve_gemm_spec, spec_herd  # noqa: E402
 
 
 def ffn_gemm_specs(seq_len, emb_dim, ffn_dim, gemm_spec_fn=None):
@@ -97,8 +95,8 @@ def ffn_gemm_specs(seq_len, emb_dim, ffn_dim, gemm_spec_fn=None):
             "injected",
         )
     return (
-        gemm_registry_config(seq_len, emb_dim, ffn_dim, "bf16", "high"),
-        gemm_registry_config(seq_len, ffn_dim, emb_dim, "bf16", "high"),
+        resolve_gemm_spec(seq_len, emb_dim, ffn_dim, "bf16", "high"),
+        resolve_gemm_spec(seq_len, ffn_dim, emb_dim, "bf16", "high"),
         "registry",
     )
 
@@ -179,8 +177,8 @@ def build_ffn_module(
     seq_len,
     emb_dim,
     ffn_dim,
-    herd_m=8,
-    herd_n=4,
+    herd_m=None,
+    herd_n=None,
     gelu_herd_x=8,
     gelu_tile_n=None,
     gemm_spec_fn=None,
@@ -191,7 +189,12 @@ def build_ffn_module(
         seq_len, emb_dim, ffn_dim: activation and weight shapes. Both
             ``(seq_len, emb_dim, ffn_dim)`` and ``(seq_len, ffn_dim, emb_dim)``
             must be in the GEMM registry, or ``gemm_spec_fn`` must supply them.
-        herd_m, herd_n: GEMM herd, as the registry tiles assume.
+        herd_m, herd_n: GEMM herd for BOTH projections. ``None`` (the normal
+            setting) gives each the herd its own registry row was measured at,
+            which is what lets the two differ -- at ``seq_len = 256`` the
+            up-projection's winner tiles 8 rows deep and a fused-cast winner
+            could only tile 4. A value here overrides both and invalidates the
+            tilings without invalidating the lookups.
         gelu_herd_x: AIE columns for the activation launch.
         gelu_tile_n: elements per ``ffn_gelu_bf16`` call; defaults to one row.
         gemm_spec_fn: ``(m, k, n) -> spec`` escape hatch for an unmeasured
@@ -207,14 +210,20 @@ def build_ffn_module(
 
     args, idx = ffn_arg_layout(seq_len, emb_dim, ffn_dim, up_spec, down_spec)
 
-    def _describe(label, spec, m, k, n):
+    # Per projection, not shared: the two GEMMs may resolve to different
+    # methods, and a method's forced tile_m is what caps its herd.
+    up_herd = spec_herd(up_spec, herd_m, herd_n)
+    down_herd = spec_herd(down_spec, herd_m, herd_n)
+
+    def _describe(label, spec, m, k, n, herd):
         print(
             f"  {label} {m}x{k}x{n} ({spec['method']}, {source}, "
             f"tile_m={spec['tile_m']} tile_k_l2={spec['tile_k_l2']} "
-            f"tile_k_l1={spec['tile_k_l1']} tile_n={spec['tile_n']})..."
+            f"tile_k_l1={spec['tile_k_l1']} tile_n={spec['tile_n']} "
+            f"herd={herd[0]}x{herd[1]})..."
         )
 
-    _describe("[1/3] up-projection", up_spec, seq_len, emb_dim, ffn_dim)
+    _describe("[1/3] up-projection", up_spec, seq_len, emb_dim, ffn_dim, up_herd)
     up_ir = str(
         _build_gemm_module(
             seq_len,
@@ -224,8 +233,7 @@ def build_ffn_module(
             up_spec["tile_k_l2"],
             up_spec["tile_k_l1"],
             up_spec["tile_n"],
-            herd_m,
-            herd_n,
+            *up_herd,
             **up_spec["build_kwargs"],
         )
     )
@@ -238,7 +246,7 @@ def build_ffn_module(
     )
 
     # The memory-tile accumulation depth iron calls down_proj_depth.
-    _describe("[3/3] down-projection", down_spec, seq_len, ffn_dim, emb_dim)
+    _describe("[3/3] down-projection", down_spec, seq_len, ffn_dim, emb_dim, down_herd)
     down_ir = str(
         _build_gemm_module(
             seq_len,
@@ -248,8 +256,7 @@ def build_ffn_module(
             down_spec["tile_k_l2"],
             down_spec["tile_k_l1"],
             down_spec["tile_n"],
-            herd_m,
-            herd_n,
+            *down_herd,
             **down_spec["build_kwargs"],
         )
     )

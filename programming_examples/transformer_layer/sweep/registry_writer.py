@@ -40,11 +40,18 @@ WHAT ``herd`` IS DOING IN THE METHOD ENTRIES
     per-method ``herd`` that overrides the file-level default, and a ``_note``
     saying so.
 
-    ``registry_lookup.gemm_config`` copies out ``method``/``tile``/``gflops``/
-    ``mean_rel_L1`` and ignores everything else, so the extra key is invisible to
-    every existing consumer. It is recorded anyway because without it the row
-    cannot be reproduced -- and a consumer that assumed 8x4 at M=64 would hit the
-    example's own divisibility assert, which fails loudly rather than quietly.
+    ``registry_lookup.gemm_config`` hands that herd back to callers alongside
+    ``tile``, and the study's builders pass it to the GEMM builder through
+    ``builders/gemm_spec.py``. It has to: a builder that assumed 8x4 at M=64
+    trips the example's own divisibility assert
+    (``bf16_in_bf16_out/run.py:62``) before it compiles anything, so a written
+    row that nobody could build is not a row.
+
+    ``llms/shared``'s ``gemm_registry_config`` still drops it, and this
+    sub-phase may not edit ``llms/shared``. That is safe only because every
+    model-registered shape is ``M = 2048`` at the file-level 8x4; wiring the
+    herd through that path belongs with the next change that is allowed to
+    touch it.
 """
 
 import json

@@ -45,10 +45,11 @@ FOOTGUNS
     - The resolved method's ``mm_*.o`` (``mm_m32.o`` for drain, ``mm_m64.o``
       for fused-cast) must be in the working directory when aiecc links.
       ``compile_o_proj_kernel`` builds it there.
-    - ``herd_m`` / ``herd_n`` default to the 8x4 the registry tiles were
-      measured against. Changing them invalidates the tiling without
-      invalidating the lookup, so leave them alone unless the registry entry
-      moves too.
+    - ``herd_m`` / ``herd_n`` default to the herd the registry tiles were
+      measured against -- 8x4 for most rows, smaller for a row whose ``M`` is
+      too short to hold 8 of its method's ``tile_m``. Changing them invalidates
+      the tiling without invalidating the lookup, so leave them alone unless
+      the registry entry moves too.
 """
 
 import os
@@ -73,13 +74,13 @@ def o_proj_gemm_spec(seq_len, emb_dim, o_proj_acc_depth=None, gemm_spec_fn=None)
     replaced). Split out from the builder so the caller can record what was
     actually used without building the module twice.
     """
-    from shared.builders.gemm_builder import gemm_registry_config
+    from builders.gemm_spec import resolve_gemm_spec
 
     if gemm_spec_fn is not None:
         spec = dict(gemm_spec_fn(seq_len, emb_dim, emb_dim))
         source = "injected"
     else:
-        spec = dict(gemm_registry_config(seq_len, emb_dim, emb_dim, "bf16", "high"))
+        spec = dict(resolve_gemm_spec(seq_len, emb_dim, emb_dim, "bf16", "high"))
         source = "registry"
 
     if o_proj_acc_depth is not None and o_proj_acc_depth != spec["tile_k_l2"]:
@@ -119,19 +120,21 @@ def compile_o_proj_kernel(spec):
     )
 
 
-def describe_o_proj_spec(seq_len, emb_dim, spec, source):
+def describe_o_proj_spec(seq_len, emb_dim, spec, source, herd_m=None, herd_n=None):
     """One-line summary of a resolved spec, for the run log."""
+    from builders.gemm_spec import describe_herd
+
     depth = f"tile_k_l2={spec['tile_k_l2']}"
     if "registry_tile_k_l2" in spec:
         depth += f" (registry {spec['registry_tile_k_l2']})"
     return (
         f"{seq_len}x{emb_dim}x{emb_dim} ({spec['method']}, {source}, "
         f"tile_m={spec['tile_m']} {depth} tile_k_l1={spec['tile_k_l1']} "
-        f"tile_n={spec['tile_n']})"
+        f"tile_n={spec['tile_n']} herd={describe_herd(spec, herd_m, herd_n)})"
     )
 
 
-def build_o_proj_ir(seq_len, emb_dim, spec, herd_m=8, herd_n=4):
+def build_o_proj_ir(seq_len, emb_dim, spec, herd_m=None, herd_n=None):
     """The O-projection GEMM's sub-kernel MLIR text.
 
     Launch operands, in order: ``A [seq_len, emb_dim]``,
@@ -139,8 +142,14 @@ def build_o_proj_ir(seq_len, emb_dim, spec, herd_m=8, herd_n=4):
     (fused-cast, two launches) or ``C-bf16-out`` (drain, one launch). The
     composition reads ``spec["needs_f32_scratch"]`` to wire them; it is the same
     branch ``ffn.py::_gemm_slice`` takes.
+
+    ``herd_m`` / ``herd_n`` of ``None`` take the herd the resolved row was
+    measured at, which is the only setting that builds at every point on the
+    sequence ladder.
     """
     from shared.builders.gemm_builder import _build_gemm_module
+
+    from builders.gemm_spec import spec_herd
 
     return str(
         _build_gemm_module(
@@ -151,8 +160,7 @@ def build_o_proj_ir(seq_len, emb_dim, spec, herd_m=8, herd_n=4):
             spec["tile_k_l2"],
             spec["tile_k_l1"],
             spec["tile_n"],
-            herd_m,
-            herd_n,
+            *spec_herd(spec, herd_m, herd_n),
             **spec["build_kwargs"],
         )
     )

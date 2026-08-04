@@ -243,8 +243,8 @@ def build_mha_out_proj_module(
     cascade_stages=4,
     num_q_tiles=None,
     o_proj_acc_depth=None,
-    o_herd_m=8,
-    o_herd_n=4,
+    o_herd_m=None,
+    o_herd_n=None,
     gemm_spec_fn=None,
 ):
     """Build the fused attention + output-projection ELF.
@@ -266,7 +266,9 @@ def build_mha_out_proj_module(
             accumulation depth, i.e. the GEMM's ``tile_k_l2``. ``None`` (the
             default, and the normal setting) reads it from ``kernel_registry``.
             A value here is an explicit override, printed and recorded.
-        o_herd_m, o_herd_n: projection GEMM herd, as the registry tiles assume.
+        o_herd_m, o_herd_n: projection GEMM herd. ``None`` (the normal setting)
+            uses the herd the resolved row's tiles were measured at; a value
+            here is an explicit override.
         gemm_spec_fn: ``(m, k, n) -> spec`` escape hatch for a shape the
             registry has not measured, the same hook
             ``rms_qkv_qknorm_rope_multi.py`` ships. Leave ``None`` in normal
@@ -298,7 +300,7 @@ def build_mha_out_proj_module(
 
     print(
         f"  [2/2] O-projection GEMM "
-        f"{describe_o_proj_spec(seq_len, emb_dim, gemm_spec, gemm_source)}..."
+        f"{describe_o_proj_spec(seq_len, emb_dim, gemm_spec, gemm_source, o_herd_m, o_herd_n)}..."
     )
     o_ir = build_o_proj_ir(seq_len, emb_dim, gemm_spec, o_herd_m, o_herd_n)
 
