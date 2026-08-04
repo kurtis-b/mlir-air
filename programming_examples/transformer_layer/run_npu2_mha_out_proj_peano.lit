@@ -1,0 +1,64 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase C3 operator gate: mha_out_proj.
+//
+// Fused multi-head attention plus output projection in one ELF: the seq-first
+// FlashAttention design's launches followed by the O-projection GEMM's, with
+// the attention output staged in a DDR buffer both halves address. No host step
+// and no repack between them -- seq-first FlashAttention writes exactly the
+// [seq_len, emb_dim] the GEMM reads.
+//
+// Runs opcheck.py on real NPU2 against an FP32 reference: np.isclose over the
+// full output at rtol=1.6e-2, zero permitted mismatches. The reference is
+// CHUNKED FP32 attention at every sequence length. iron's oracle computes bf16
+// SDPA below seq_len 16384 and switches to FP32 chunked attention at and above
+// it, so its own precision changes across the ladder; that branch is dropped
+// here on purpose, and restoring it would make a tolerance calibrated at one
+// end mean something different at the other.
+//
+// The reference is FP32 end to end and does not reproduce the bf16 staging of
+// the attention output between the two halves. That gap is measured rather than
+// defined away, and it is part of what atol is sized against.
+//
+// Three shapes, checked individually and in order. Causal and non-causal are
+// SEPARATE shape keys because masking is a distinct device path and changes the
+// arithmetic -- early rows attend to a handful of keys, so the output's dynamic
+// range widens by an order of magnitude and the two rows carry different
+// tolerances for the same relative error.
+//
+// NPU serialization lives one layer down, not in the recipe below. Device
+// access is locked on /tmp/npu.lock, which XRTRunner.run_test holds across
+// binary load and dispatch (python/air/backend/xrt_runner.py:292) -- the same
+// inode lit.cfg.py's NPU substitution and KernelCache take, so this interlocks
+// with every other NPU job in the repository while the peano compiles still
+// overlap. Taking the outer /tmp/mlir-air-npu.lock here instead would DEADLOCK:
+// the gate command that invokes this suite already holds that inode, and BSD
+// flock(2) treats a second open() of the same file as a foreign lock, so the
+// nested acquire would block against its own parent until the timeout expires.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming
+// one in prose -- even inside a comment -- registers as a second directive and
+// leaves the test UNRESOLVED. Describe them, never spell them out.
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_npu2_mha_out_proj_peano
+// RUN: cd test_npu2_mha_out_proj_peano
+// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile check-mha-out-proj PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+//
+// The resolved configuration line before each verdict, not just the verdict:
+// the design's knobs and the projection's registry-resolved method are what a
+// silently mis-shaped run would get wrong, and a test that only read PASS would
+// not see it. The causal flag is checked per shape for the same reason -- a
+// build that dropped the mask would still emit a correctly-shaped output.
+// CHECK: causal=False
+// CHECK: PASS!
+// CHECK: [opcheck] mha_out_proj [512x512x8h]: PASS
+// CHECK: causal=True
+// CHECK: PASS!
+// CHECK: [opcheck] mha_out_proj [512x512x8h_causal]: PASS
+// CHECK: causal=True
+// CHECK: PASS!
+// CHECK: [opcheck] mha_out_proj [2048x1024x16h_causal]: PASS

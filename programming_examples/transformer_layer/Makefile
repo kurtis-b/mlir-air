@@ -17,7 +17,7 @@ OPCHECK_ARGS ?=
 
 .PHONY: help compile runlist-gate seam-tests clean opcheck-list \
         check-elementwise-add check-causal-mask check-layer-norm check-addnorm \
-        check-qkv-proj check-ffn check-fault-control
+        check-qkv-proj check-ffn check-mha-out-proj check-fault-control
 
 help:
 	@echo "Transformer-layer AIE2P device kernels, the Phase B runtime seam, and"
@@ -32,12 +32,13 @@ help:
 	@echo "  make runlist-gate   Phase B hardware gate. NEEDS AN NPU. Wrap it:"
 	@echo "                        flock -x -w 1800 /tmp/mlir-air-npu.lock make runlist-gate"
 	@echo "  make check-elementwise-add | check-causal-mask | check-layer-norm |"
-	@echo "       check-addnorm | check-qkv-proj | check-ffn"
+	@echo "       check-addnorm | check-qkv-proj | check-ffn | check-mha-out-proj"
 	@echo "                      One operator's numerical check against its FP32"
 	@echo "                      reference. NEEDS AN NPU; wrap it the same way."
-	@echo "                      qkv-proj and ffn take their GEMM tiles and"
-	@echo "                      method from kernel_registry, which RAISES on a"
-	@echo "                      shape nobody swept rather than guessing."
+	@echo "                      qkv-proj, ffn and mha-out-proj take their GEMM"
+	@echo "                      tiles and method from kernel_registry, which"
+	@echo "                      RAISES on a shape nobody swept rather than"
+	@echo "                      guessing."
 	@echo "  make clean          Remove $(BUILD_DIR)."
 	@echo ""
 	@echo "Variables: TILE_M=$(TILE_M) TILE_K=$(TILE_K) TILE_N=$(TILE_N)"
@@ -96,6 +97,14 @@ check-qkv-proj:
 
 check-ffn:
 	$(call opcheck,ffn)
+
+# Fused attention + output projection. Both external objects are built into the
+# working directory by opcheck.py: attn_npu2.o with the causal row helpers and
+# the tile-shape -D flags this design implies, and the mm_*.o the registry's
+# resolved method names. The attention half's -D flags are derived from the same
+# config the builder uses -- a mismatch there does not fail to link, it HANGS.
+check-mha-out-proj:
+	$(call opcheck,mha_out_proj)
 
 # The negative control: it succeeds only when the injected run is REJECTED BY
 # THE COMPARISON. A check that ignored --fault-inject, or one whose tolerance
