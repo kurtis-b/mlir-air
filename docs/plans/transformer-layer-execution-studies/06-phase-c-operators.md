@@ -118,6 +118,36 @@ Each sub-phase additionally faces a driver-side **negative control**: the driver
 operator with a fault injected into its input and requires the check to FAIL. See
 [06a](06a-phase-c1-gate-and-small-operators.md) for the mechanism, which C2–C4 reuse.
 
+## Three L3 input streams per tile miscompile in a multi-trip herd loop
+
+`[Recorded by C1, 2026-08-04]` Every remaining operator in this phase takes at least three
+inputs, so this is load-bearing for C2 and C3 rather than an `addnorm` curiosity.
+
+A herd whose body streams **three distinct L3 buffers into L1** and loops more than once produces
+wrong numbers. Measured on NPU2 with `fused_add_layer_norm_2outs` at `[8, 64]`, `herd_x = 1`: one
+trip through the loop is exact (0 of 512 elements outside `rtol = 1.6e-2, atol = 5e-2`), two trips
+give 491 of 512. It is unchanged by fetching the loop-invariant input inside the loop or hoisting
+it out, by draining or discarding the unused second output, by `omit_pingpong="L1"` or `"all"`, and
+by either `use_lock_race_condition_fix`. An AIE2P column has two shim MM2S channels; the
+two-stream builders beside it — multi-row `layer_norm` here, and `_build_add_2d_to_2d` in
+`llms/shared/builders/o_ffn_multi.py` — loop correctly for as many trips as you like.
+
+`build_addnorm_module` raises rather than emitting the broken form, because the symptom is
+partly-correct values and reads as a tolerance problem. The workaround C1 took is a row cap:
+`rows == herd_x * rows_per_call`, one call per tile, which at `cols = 512` over the full herd is
+64 rows.
+
+That cap does not scale to C2/C3's shapes. The two candidate fixes, neither attempted:
+
+- **Stage the loop-invariant operand through L2.** L3→L2 once at segment scope, then L2→L1 inside
+  the herd, which costs a memtile channel rather than a shim one. This is how the GEMM builders
+  already feed 32 tiles from three L3 operands.
+- **Fold two operands into one L3 buffer** so a single strided DMA fetches both, and hand the
+  kernel subviews. Cheaper to write, but it needs an extern call to accept an offset memref, which
+  nothing in this repository does yet.
+
+Budget for one of them before assuming a C2/C3 operator will simply loop.
+
 ## Risks
 
 - `mha_out_proj` is the largest single rewrite in the port and depends on FlashAttention

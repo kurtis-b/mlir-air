@@ -39,8 +39,8 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 |---|---|---|
 | A — AIE2P kernels | Every kernel compiles to `.o` with Peano; compile-only lit passes | **done** 2026-08-04 (18 min) |
 | B — runtime seam | Multi-ELF runlist on hardware: numerically identical to sequential, lower latency | **done** 2026-08-04 (362 min) |
-| C1 — gate mechanism + small operators | `opcheck.py` and its fault-injection negative control; `causal_mask`, `addnorm`, `layer_norm`, `elementwise_add` pass on hardware | not started — **next** |
-| C2 — `qkv_proj`, `ffn` | Both pass full-output `np.isclose` at registry tolerance vs an FP32 reference | not started |
+| C1 — gate mechanism + small operators | `opcheck.py` and its fault-injection negative control; `causal_mask`, `addnorm`, `layer_norm`, `elementwise_add` pass on hardware | landed 2026-08-04, **awaiting driver confirmation** — suite 8/8 and the objective check replayed in-session, but a session's own say-so is not the gate |
+| C2 — `qkv_proj`, `ffn` | Both pass full-output `np.isclose` at registry tolerance vs an FP32 reference | not started — **next** |
 | C3 — `mha_out_proj` | Passes at the registry's FlashAttention tolerance, causal and non-causal | not started |
 | C4 — coverage sweep | The 36 `baseline_768` shapes resolve through `gemm_config()`; registry rows written; ten shipped models still pass `make verify` | not started |
 | D — block integration | One full transformer layer matches the torch reference on hardware | not started |
