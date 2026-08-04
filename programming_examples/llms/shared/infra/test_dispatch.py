@@ -127,7 +127,9 @@ def test_elf_abi_binds_buffers_from_index_zero():
 
 def test_xclbin_abi_reserves_the_opcode_and_instruction_prefix():
     run = FakeRun()
-    _bind_args(FakeXrt(), run, ["A", "B", "C"], elf_abi=False, instr_bo="I", instr_len=7)
+    _bind_args(
+        FakeXrt(), run, ["A", "B", "C"], elf_abi=False, instr_bo="I", instr_len=7
+    )
     assert run.args[0] == OPCODE_DPU
     assert run.args[1] == "I"
     assert run.args[2] == 7
