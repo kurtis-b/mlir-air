@@ -326,8 +326,11 @@ class KernelCache:
         self.verbose = verbose
         self.profiler = profiler or Profiler()
         self.artifacts = {}  # name -> XRTCompileArtifact
+        self.launch_counts = {}  # name -> {"air_launches":.., "herd_launches":..}
         self._loaded = {}  # name -> (backend, invoker) for XRT context reuse
         self._cached_bos = {}  # name -> list of xrt.bo for BO reuse
+        self._pools = {}  # id(plan) -> BoPool, for run_sequence
+        self._instr_synced = set()  # artifact names whose instruction BO is resident
         # Pool of BOs shared across bo_keys (see shared_nonstatic in
         # load_and_run). Keyed by (name, arg_index, size_bytes) so every
         # per-layer bo_key of a kernel reuses ONE transient buffer instead of
@@ -347,6 +350,10 @@ class KernelCache:
                 "output_binary": str(art.output_binary),
                 "kernel": art.kernel,
                 "insts": str(art.insts) if art.insts else None,
+                # air.launch / air.herd counts for the dispatch vector. They come
+                # from the MLIR module, which --run-only does not have, so they
+                # are persisted here rather than recomputed.
+                "launches": self.launch_counts.get(name),
             }
         manifest_path = self.cache_dir / self.MANIFEST_FILE
         with open(manifest_path, "w") as f:
@@ -375,6 +382,10 @@ class KernelCache:
             self.artifacts[name] = XRTCompileArtifact(
                 binary_path, info["kernel"], info["insts"]
             )
+            # Absent in manifests written before the dispatch vector landed; a
+            # missing entry costs the launch counts, not the run.
+            if info.get("launches"):
+                self.launch_counts[name] = info["launches"]
 
         self._log(f"Loaded manifest with {len(self.artifacts)} entries")
         return True
@@ -391,7 +402,9 @@ class KernelCache:
             output_binary_name: Base name for output binary
         """
         from air.backend.xrt import XRTBackend
+        from shared.infra.dispatch import LaunchCounts
 
+        self.launch_counts[name] = LaunchCounts.from_module(mlir_module).as_dict()
         self._log(f"Compiling {name}...")
         # Int4 ELFs need the AWQ GEMV micro-kernel staged alongside the bf16
         # objects. Detect from kernel name so existing call sites don't need
@@ -425,6 +438,80 @@ class KernelCache:
         backend.unload()
 
         print(f"  Compiled {name}: {compile_time:.1f}s -> {cached_binary.name}")
+
+    def ensure_loaded(self, name, backend_kwargs):
+        """Load an artifact's XRT context once and cache it.
+
+        Lock path note: `/tmp/npu.lock` is intentionally a different inode from
+        the `/tmp/mlir-air-npu.lock` file the project's outer `flock` convention
+        uses. Both layers use BSD flock(2), so sharing one inode would make this
+        inner lock self-deadlock against an outer
+        `flock /tmp/mlir-air-npu.lock make run`. Keep them separate.
+        """
+        import filelock
+        from air.backend.xrt import XRTBackend
+
+        if name not in self.artifacts:
+            raise RuntimeError(
+                f"Kernel '{name}' not found in cache. "
+                f"Available: {list(self.artifacts.keys())}"
+            )
+        if name not in self._loaded:
+            backend = XRTBackend(**backend_kwargs)
+            with filelock.FileLock("/tmp/npu.lock"):
+                invoker = backend.load(self.artifacts[name])
+            self._loaded[name] = (backend, invoker)
+            self._log(f"Loaded {name} (XRT context cached)")
+        return self._loaded[name]
+
+    def pool_for(self, plan, alloc, sync_to_device, sync_from_device):
+        """The `BoPool` backing one `PoolPlan`, created on first use.
+
+        Keyed by plan identity, so a caller that re-runs the same sequence keeps
+        its slots — which is the point: the pool is what makes the second and
+        subsequent invocations cheap.
+        """
+        from shared.infra.bo_pool import BoPool
+
+        key = id(plan)
+        if key not in self._pools:
+            self._pools[key] = BoPool(alloc, sync_to_device, sync_from_device)
+        return self._pools[key]
+
+    def _mark_instr_synced(self, name):
+        """True the first time an artifact's instruction BO needs syncing (D6)."""
+        if name in self._instr_synced:
+            return False
+        self._instr_synced.add(name)
+        return True
+
+    def run_sequence(
+        self,
+        steps,
+        specs,
+        backend_kwargs,
+        arrays,
+        host_writes=None,
+        require_single_submission=False,
+    ):
+        """Run a multi-step dispatch sequence as runlists, with BO pooling.
+
+        Thin delegation to `shared.infra.dispatch.run_sequence`, which owns the
+        aggregation rules and their footguns. Returns
+        `(results, DispatchVector)`; the results are zero-copy views into pool
+        memory and are overwritten by the next sequence.
+        """
+        from shared.infra.dispatch import run_sequence as _run_sequence
+
+        return _run_sequence(
+            self,
+            steps,
+            specs,
+            backend_kwargs,
+            arrays,
+            host_writes=host_writes,
+            require_single_submission=require_single_submission,
+        )
 
     def load_and_run(
         self,
@@ -485,30 +572,11 @@ class KernelCache:
         """
         import filelock
         import pyxrt as xrt
-        from air.backend.xrt import XRTBackend
 
-        if name not in self.artifacts:
-            raise RuntimeError(
-                f"Kernel '{name}' not found in cache. "
-                f"Available: {list(self.artifacts.keys())}"
-            )
-
-        # Level 1: Load backend on first call (XRT context reuse)
-        # Lock path note: this is intentionally distinct from the
-        # /tmp/mlir-air-npu.lock file used by the project's outer `flock`
-        # convention. Both layers use BSD flock(2), so on the same inode
-        # the inner Python lock would self-deadlock against an outer
-        # `flock /tmp/mlir-air-npu.lock make run`. Keep them on separate
-        # files so the layers compose cleanly.
-        if name not in self._loaded:
-            artifact = self.artifacts[name]
-            backend = XRTBackend(**backend_kwargs)
-            with filelock.FileLock("/tmp/npu.lock"):
-                invoker = backend.load(artifact)
-            self._loaded[name] = (backend, invoker)
-            self._log(f"Loaded {name} (XRT context cached)")
-
-        backend, _ = self._loaded[name]
+        # Level 1: Load backend on first call (XRT context reuse). See
+        # ensure_loaded for why /tmp/npu.lock is a different inode from the
+        # project's outer /tmp/mlir-air-npu.lock flock convention.
+        backend, _ = self.ensure_loaded(name, backend_kwargs)
 
         # Level 2: Allocate BOs on first call, reuse on subsequent calls
         # bo_key allows separate BO sets for the same kernel (e.g., per-layer weights)
