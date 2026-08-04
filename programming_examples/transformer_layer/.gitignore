@@ -1,1 +1,12 @@
 runlist_gate_cache/
+build_peano/
+
+# `make runlist-gate` runs with this directory as its working directory, so every
+# artifact aircc and KernelCache produce lands here rather than in a build tree.
+# Eleven of them were committed by mistake in bf69ed69 -- the nine .o files were
+# the only tracked object files in the repository, and air.mlir/air.elf are
+# aircc intermediates that nothing reads and that are rewritten on every run.
+*.o
+air.mlir
+air.elf
+air_project/

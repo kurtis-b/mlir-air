@@ -29,9 +29,19 @@ PL_CODEX_EFFORT=medium systemd-inhibit --what=handle-lid-switch:sleep:idle \
   > agents/.state/port-loop/driver.log 2>&1 &
 ```
 
-Phases in scope are set by `PL_PHASES_IN_SCOPE` in `agents/scripts/port-loop/phases.sh`. Adding
-Phase C means adding its doc, gate command, hardware flag, gate allowlist and objective check
-there.
+Phases in scope are set by `PL_PHASES_IN_SCOPE` in `agents/scripts/port-loop/phases.sh` — a hard
+assignment, not `${VAR:-default}`, so it is edited rather than overridden from the environment.
+Adding a phase means adding a `case` arm to each of the seven dispatchers there (name, doc,
+hardware flag, gate description, gate allowlist, gate command, objective check).
+
+Two of those arms fail **open** if forgotten: `phase_gate_description` has no `*)` arm, so a
+missing one silently renders an empty gate block into the session's prompt, and
+`phase_objective_check` defaults to `return 0`, so a missing one passes vacuously. The other
+defaults fail closed. Check a new phase with `run-one <phase> objective-check` before trusting it.
+
+`cmd_loop` reads `.phases` from `state.json`, not from `PL_PHASES_IN_SCOPE`, and `resume-at`
+resolves an unknown phase id to `index // 0` — i.e. **phase 0**, re-running the first phase. After
+changing scope, launch with `start`, which re-inits state.
 
 ### Watching it
 
@@ -99,6 +109,25 @@ Two lessons worth carrying:
 - **Test the negative path.** Each fix above was only trusted after confirming it *fails* when it
   should: a planted symbol no object defines, and a run where 7 objects were backdated and one
   rebuilt.
+
+### A fourth failure, found later: the gate that ran no hardware
+
+`[2026-08-04]` Phase B's `phase_gate_description` describes a hardware test. Its `phase_gate_cmd`
+was `flock … ninja -C build-xrt check-programming-examples-transformer-layer`, and at the time that
+suite contained exactly two tests: a compile-only one (peano, no NPU) and a host-only one. The gate
+log records 2 tests, 329 excluded, **16 seconds**. The phase's central hardware claim — the
+multi-ELF runlist the whole taxonomy rests on — was produced by `make runlist-gate`, which the
+session ran and reported itself.
+
+Nothing caught it. The three anti-reward-hacking layers all police *what the diff did to the
+gate*; none asks whether the gate exercises what its description claims. `run_npu2_runlist_gate.lit`
+now puts the hardware legs inside the suite, and re-running it confirms all four pass — but the
+result stood on a self-report for a day.
+
+The generalizable lesson is narrower than "check the gate": **a phase whose `needs_hardware` is
+`yes` should have to prove its gate executed at least one hardware test.** That is a driver-side
+assertion of the same kind as the objective check, and it is cheap — lit reports its own
+pass/exclude counts.
 
 ## Gates are run by the driver, never self-reported
 

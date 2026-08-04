@@ -6,8 +6,8 @@
 # each in a FRESH claude -p session, gating each with three sequential Codex review->fix rounds,
 # and running every gate itself rather than trusting a session's self-report.
 #
-# Scope is Phase A then Phase B, then halt. See the plan for why B is the stopping point: its
-# spike can legitimately fail in a way that invalidates later phases as specified.
+# Scope is whatever PL_PHASES_IN_SCOPE in port-loop/phases.sh lists, then halt. Phases A and B are
+# done; the current scope is Phase C's four sub-phases C1-C4.
 #
 # Usage:
 #   agents/scripts/port-loop.sh help
@@ -392,7 +392,10 @@ cmd_loop() {
     state_set '.phase_index += 1 | .step = "preflight" | .round = 0'
   done
 
-  log_info "Scope was Phase A then Phase B. Review the work before extending scope."
+  local scope_list
+  scope_list="$(printf '%s' "${PL_PHASES_IN_SCOPE}" | jq -r 'join(", ")' 2>/dev/null)"
+  [ -n "${scope_list}" ] || scope_list="${PL_PHASES_IN_SCOPE}"
+  log_info "Scope was ${scope_list}. Review the work before extending scope."
   return 0
 }
 
@@ -453,8 +456,10 @@ cmd_dry_run() {
   PL_DRY_RUN=yes
   log_info "DRY RUN — no sessions, reviews, gates or commits will actually execute"
   require_deps || return 1
+  # Read the scope rather than hardcoding it: a phase added to phases.sh but missing here is
+  # invisible to dry-run, which is precisely the run meant to catch a mis-declared phase.
   local phase
-  for phase in A B; do
+  for phase in $(printf '%s' "${PL_PHASES_IN_SCOPE}" | jq -r '.[]'); do
     echo
     echo "Phase ${phase}: $(phase_name "${phase}")"
     echo "  doc:       $(phase_doc "${phase}")"

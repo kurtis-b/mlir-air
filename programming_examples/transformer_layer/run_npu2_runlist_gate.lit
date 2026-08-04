@@ -1,0 +1,38 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase B runtime seam: the hardware gate.
+//
+// Runs the multi-ELF runlist legs in runlist_gate.py on a real NPU -- the
+// measurement docs/plans/transformer-layer-execution-studies/05a-phase-b-runlist-spike-result.md
+// records, and the load-bearing assumption Phases E and F are built on.
+//
+// This test exists because the driver-run gate for Phase B was
+// `ninja check-programming-examples-transformer-layer`, and that suite held only
+// the compile-only test (peano, no NPU) and the seam unit tests (host-only).
+// Neither touches the NPU, so the phase's central hardware claim reached the
+// status board on the session's own say-so. Putting the gate into the suite is
+// what makes it driver-verifiable, per
+// docs/plans/transformer-layer-execution-studies/14-the-port-loop-harness.md
+// ("gates are run by the driver, never self-reported").
+//
+// Slower than its siblings: four distinct GEMM ELFs are compiled at seq_len 2048
+// on a cold cache. `make runlist-gate GATE_ARGS=--run-only` reuses them.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming one
+// in prose -- even inside a comment -- registers as a second directive and leaves
+// the test UNRESOLVED. Describe them, never spell them out.
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_npu2_runlist_gate
+// RUN: cd test_npu2_runlist_gate
+// RUN: make -f %S/Makefile runlist-gate PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+//
+// All four legs, not just the summary line: a leg that never ran prints nothing,
+// and a bare check on the final verdict would not notice.
+// CHECK: leg A  cross-artifact multi-ELF runlist : PASS
+// CHECK: leg A2 xclbin cross-artifact refused    : PASS
+// CHECK: leg B  same-artifact aggregation        : PASS
+// CHECK: leg C  run_sequence over the layer      : PASS
+// CHECK: PHASE B GATE: PASS

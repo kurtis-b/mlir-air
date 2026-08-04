@@ -12,10 +12,16 @@ unit tests, plus one hardware gate.
 ```bash
 make compile                 # build every object and check its symbols (no NPU)
 make seam-tests              # BO pooling + runlist aggregation rules (no NPU)
-ninja -C build-xrt check-programming-examples-transformer-layer
 
 flock -x -w 1800 /tmp/mlir-air-npu.lock make runlist-gate   # NEEDS AN NPU
+flock -x -w 1800 /tmp/mlir-air-npu.lock \
+  ninja -C build-xrt check-programming-examples-transformer-layer   # all three, NEEDS AN NPU
 ```
+
+The lit suite needs an NPU because `run_npu2_runlist_gate.lit` dispatches. It did not always: the
+suite held only the compile-only and host-only tests, so Phase B's hardware claim was gated by
+nothing the driver ran. `make compile` and `make seam-tests` remain individually NPU-free, which
+is what keeps them usable as a PR check.
 
 ## The Phase B runtime seam
 
@@ -62,6 +68,9 @@ memory bank) all produce plausible wrong numbers rather than errors.
 | `kernels/addnorm_ffn_norm.cc` | The fused add-norm templates and tile passthroughs, included by `addnorm_ffn.cc`. The only file `-DADDNORM_PRE_ADD` reaches |
 | `kernels/elementwise.cc` | `eltwise_vadd` and `gelu_tanh_approx_bf16`, textually included by both kernels |
 | `compile_kernels.py` | The compile-and-check driver the lit test runs |
+| `run_npu2_compile_peano.lit` | Phase A's compile-only gate. Peano, no NPU |
+| `run_seam_tests.lit` | Phase B's host-only rules tests. No NPU, no XRT |
+| `run_npu2_runlist_gate.lit` | Phase B's hardware gate: the four runlist legs on a real NPU |
 
 There are two compiled objects, not six: `encoder.cc` and `addnorm_ffn.cc` are
 the only translation units, and each `#include`s its two siblings the way
