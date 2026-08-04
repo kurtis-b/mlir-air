@@ -20,7 +20,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from shared.infra.bo_pool import BufferSpec  # noqa: E402
+from shared.infra.cache import KernelCache  # noqa: E402
 from shared.infra.dispatch import (  # noqa: E402
+    INSTR_WORD_BYTES,
     N_XCLBIN_PREFIX_ARGS,
     OPCODE_DPU,
     DispatchStep,
@@ -29,8 +31,10 @@ from shared.infra.dispatch import (  # noqa: E402
     RunlistSplitError,
     _bind_args,
     default_host_writes,
+    instr_bo_nbytes,
     launch_totals,
     plan_submissions,
+    sync_instruction_bos,
 )
 
 
@@ -251,6 +255,82 @@ def test_default_host_writes_includes_an_in_place_buffer():
     steps = [DispatchStep("k", ("acc", "acc"), writes=(1,))]
     specs = {"acc": BufferSpec("acc", 4096, host_output=True)}
     assert default_host_writes(steps, specs) == {"acc"}
+
+
+# --- instruction-stream accounting -----------------------------------------
+
+
+class FakeBackend:
+    """The three `XRTBackend` attributes the instruction sync path reads.
+
+    `bo_instr=None` with `instr_v=None` is how the backend represents an ELF
+    artifact, whose instruction stream is inside the ELF.
+    """
+
+    def __init__(self, n_words):
+        self.bo_instr = None if n_words is None else object()
+        self.instr_v = None if n_words is None else [0] * n_words
+
+
+class FakeCache:
+    """A `KernelCache` reduced to what `sync_instruction_bos` touches.
+
+    `_mark_instr_synced` is the real method, not a stand-in: the once-per-
+    identity rule it implements is half of what these tests are checking.
+    """
+
+    _mark_instr_synced = KernelCache._mark_instr_synced
+
+    def __init__(self, backends):
+        self._loaded = {name: (b, None) for name, b in backends.items()}
+        self._instr_synced = set()
+
+
+def test_instr_bo_nbytes_is_four_bytes_per_instruction_word():
+    assert instr_bo_nbytes(FakeBackend(128)) == 128 * INSTR_WORD_BYTES
+
+
+def test_an_elf_backend_has_no_instruction_bytes():
+    assert instr_bo_nbytes(FakeBackend(None)) == 0
+
+
+def test_instruction_bytes_are_counted_at_the_sync_that_moves_them():
+    """The uploaded instruction stream is host->device traffic like any other.
+
+    Raising `sync_boundaries` without raising `bytes_transferred` would report
+    an xclbin-backed row as moving fewer bytes than crossed the bus — by the
+    size of its instruction streams, which for a small kernel exceeds its
+    activations.
+    """
+    cache = FakeCache({"qkv": FakeBackend(128), "attn": FakeBackend(64)})
+    synced = []
+    vector = DispatchVector()
+    sync_instruction_bos(cache, ["qkv", "attn"], synced.append, vector)
+    assert len(synced) == 2
+    assert vector.sync_boundaries == 2
+    assert vector.bytes_transferred == (128 + 64) * INSTR_WORD_BYTES
+
+
+def test_instructions_upload_once_per_identity_in_bytes_as_well_as_count():
+    """Rule D6 applies to both halves of the record, or the second dispatch of a
+    repeated sequence bills instruction bytes it never sent."""
+    cache = FakeCache({"qkv": FakeBackend(128)})
+    first, second = DispatchVector(), DispatchVector()
+    sync_instruction_bos(cache, ["qkv"], lambda bo: None, first)
+    sync_instruction_bos(cache, ["qkv"], lambda bo: None, second)
+    assert first.bytes_transferred == 128 * INSTR_WORD_BYTES
+    assert (second.sync_boundaries, second.bytes_transferred) == (0, 0)
+
+
+def test_an_elf_artifact_syncs_no_instruction_bo_at_all():
+    """Belt and braces: `run_sequence` skips this path entirely under the ELF
+    ABI, and a backend with no instruction BO is a no-op if it ever does not."""
+    cache = FakeCache({"qkv": FakeBackend(None)})
+    synced = []
+    vector = DispatchVector()
+    sync_instruction_bos(cache, ["qkv"], synced.append, vector)
+    assert synced == []
+    assert (vector.sync_boundaries, vector.bytes_transferred) == (0, 0)
 
 
 def test_launch_counts_come_from_the_mlir_module():

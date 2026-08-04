@@ -69,10 +69,13 @@ __all__ = [
     "RunlistExecutionError",
     "Submission",
     "default_host_writes",
+    "instr_bo_nbytes",
     "launch_totals",
     "plan_submissions",
+    "sync_instruction_bos",
     "OPCODE_DPU",
     "N_XCLBIN_PREFIX_ARGS",
+    "INSTR_WORD_BYTES",
 ]
 
 #: `ert_start_npu` opcode used by the xclbin ABI's generic MLIR_AIE kernel.
@@ -80,6 +83,9 @@ OPCODE_DPU = 3
 
 #: opcode, instruction BO, instruction length — the xclbin ABI's fixed prefix.
 N_XCLBIN_PREFIX_ARGS = 3
+
+#: `XRTBackend` holds the instruction stream as `uint32` words.
+INSTR_WORD_BYTES = 4
 
 
 class RunlistSplitError(RuntimeError):
@@ -139,7 +145,12 @@ class DispatchVector:
     sync_boundaries: `bo.sync()` calls issued for the sequence, both directions.
         This is the number the dirty-bit discipline reduces, and the number that
         makes `offload` and `fused_elf` differ even at equal submission counts.
-    bytes_transferred: bytes moved by those syncs.
+    bytes_transferred: bytes moved by those syncs, instruction streams included.
+        Under the xclbin ABI an artifact's instructions are a BO the host
+        uploads, so they cross the boundary exactly as a weight's bytes do and
+        are counted the same way; under the ELF ABI they are inside the ELF and
+        cross nothing. Every sync that raises `sync_boundaries` adds its bytes
+        here, so the two fields always describe the same set of transfers.
     """
 
     host_submissions: int = 0
@@ -277,6 +288,48 @@ def _bind_args(xrt, run, bos, elf_abi, instr_bo=None, instr_len=0):
     run.set_arg(2, instr_len)
     for i, bo in enumerate(bos):
         run.set_arg(i + N_XCLBIN_PREFIX_ARGS, bo)
+
+
+def instr_bo_nbytes(backend):
+    """Bytes an artifact's instruction BO moves when it is synced to device.
+
+    `XRTBackend` reads the instruction stream as a `uint32` array and sizes the
+    BO at `len(instr_v) * 4` (`python/air/backend/xrt.py:647`), so that product —
+    not `bo.size()`, which is the rounded allocation — is what actually crosses
+    the boundary. Returns 0 under the ELF ABI, where there is no instruction BO
+    because the stream is inside the ELF.
+    """
+    if backend.bo_instr is None or backend.instr_v is None:
+        return 0
+    return len(backend.instr_v) * INSTR_WORD_BYTES
+
+
+def sync_instruction_bos(cache, kernels, sync, vector):
+    """Upload each artifact's instruction stream once per identity (rule D6).
+
+    xclbin ABI only; the caller skips this entirely under the ELF ABI. A
+    sequence that invokes one artifact eight times uploads its instructions
+    once, which is what `KernelCache._mark_instr_synced` is for.
+
+    Both halves of the record are updated together. Counting the boundary but
+    not the bytes under-reports every xclbin-backed row by the size of its
+    instruction streams — for a small kernel that is larger than its
+    activations, so the omission is not a rounding error in the study's transfer
+    numbers.
+
+    Args:
+        cache: the owning `KernelCache`, for `_mark_instr_synced` and `_loaded`.
+        kernels: kernel names the sequence dispatches, in first-use order.
+        sync: callable bo -> None performing the host->device sync.
+        vector: `DispatchVector` the boundaries and bytes are recorded on.
+    """
+    for name in kernels:
+        backend, _ = cache._loaded[name]
+        if backend.bo_instr is None or not cache._mark_instr_synced(name):
+            continue
+        sync(backend.bo_instr)
+        vector.sync_boundaries += 1
+        vector.bytes_transferred += instr_bo_nbytes(backend)
 
 
 def _completed(xrt, state):
@@ -583,11 +636,12 @@ def run_sequence(
 
     with filelock.FileLock("/tmp/npu.lock"):
         t_sync = time.perf_counter()
-        # Host writes are the only host->device traffic there can be: a buffer a
-        # step produces has no host bytes to send, and uploading its slot before
-        # its producer runs would push the previous occupant's bytes at a kernel
-        # that is about to overwrite them anyway. D5's dirty bit on such a buffer
-        # is cleared by the device write (D4), not paid for with a sync.
+        # Host writes are the only host->device traffic the pool can have: a
+        # buffer a step produces has no host bytes to send, and uploading its
+        # slot before its producer runs would push the previous occupant's bytes
+        # at a kernel that is about to overwrite them anyway. D5's dirty bit on
+        # such a buffer is cleared by the device write (D4), not paid for with a
+        # sync.
         for name in sorted(host_writes):
             spec = specs[name]
             # A static weight is written to its BO once and never again (S2).
@@ -613,15 +667,13 @@ def run_sequence(
                 vector.bytes_transferred += spec.nbytes
         vector.sync_ms += (time.perf_counter() - t_sync) * 1000.0
 
-        # Instruction BOs sync once per identity, not per call (rule D6).
+        # Instruction BOs sync once per identity, not per call (rule D6). Timed
+        # into `sync_ms` like every other host->device sync: it is one, and the
+        # first dispatch of a sequence is where its cost lands.
         if not elf_abi:
-            for name in kernels:
-                backend, _ = cache._loaded[name]
-                if backend.bo_instr is not None and cache._mark_instr_synced(name):
-                    backend.bo_instr.sync(
-                        xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
-                    )
-                    vector.sync_boundaries += 1
+            t_sync = time.perf_counter()
+            sync_instruction_bos(cache, kernels, _to_device, vector)
+            vector.sync_ms += (time.perf_counter() - t_sync) * 1000.0
 
         for sub_idx, sub in enumerate(subs):
             runs = []

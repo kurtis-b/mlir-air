@@ -22,4 +22,4 @@
 // POOL: 32/32 passed
 //
 // RUN: python3 %S/../llms/shared/infra/test_dispatch.py | FileCheck %s --check-prefix=DISPATCH
-// DISPATCH: 21/21 passed
+// DISPATCH: 26/26 passed
