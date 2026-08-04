@@ -15,9 +15,17 @@ TILE_N ?= 64
 # Extra flags for opcheck.py, e.g. OPCHECK_ARGS="--fault-inject input".
 OPCHECK_ARGS ?=
 
+# Which width of the case matrix `make registry-sweep` measures. baseline_768 is
+# the family Phase D needs; the other two are the same tool over a different id.
+FAMILY ?= baseline_768
+
+# Extra flags for registry_sweep.py, e.g. SWEEP_ARGS="--role o_proj --seq 64".
+SWEEP_ARGS ?=
+
 .PHONY: help compile runlist-gate seam-tests clean opcheck-list \
         check-elementwise-add check-causal-mask check-layer-norm check-addnorm \
-        check-qkv-proj check-ffn check-mha-out-proj check-fault-control
+        check-qkv-proj check-ffn check-mha-out-proj check-fault-control \
+        registry-resolution registry-sweep registry-write registry-plan
 
 help:
 	@echo "Transformer-layer AIE2P device kernels, the Phase B runtime seam, and"
@@ -39,11 +47,24 @@ help:
 	@echo "                      tiles and method from kernel_registry, which"
 	@echo "                      RAISES on a shape nobody swept rather than"
 	@echo "                      guessing."
+	@echo "  make registry-plan  Every (shape, candidate) the sweep would measure."
+	@echo "                      No NPU required."
+	@echo "  make registry-resolution"
+	@echo "                      Assert every $(FAMILY) shape resolves through"
+	@echo "                      kernel_registry. No NPU required; this is what"
+	@echo "                      the lit test runs."
+	@echo "  make registry-sweep Measure the tile configs for $(FAMILY) and"
+	@echo "                      checkpoint them. NEEDS AN NPU, takes about an"
+	@echo "                      hour, resumable. Wrap it:"
+	@echo "                        flock -x -w 1800 /tmp/mlir-air-npu.lock make registry-sweep"
+	@echo "  make registry-write Fold the swept results into the registry JSON and"
+	@echo "                      both markdown pages. Append-only. No NPU required."
 	@echo "  make clean          Remove $(BUILD_DIR)."
 	@echo ""
 	@echo "Variables: TILE_M=$(TILE_M) TILE_K=$(TILE_K) TILE_N=$(TILE_N)"
 	@echo "           GATE_ARGS (e.g. --run-only to reuse cached ELFs)"
 	@echo "           OPCHECK_ARGS (e.g. --fault-inject input, which must FAIL)"
+	@echo "           FAMILY=$(FAMILY), SWEEP_ARGS (e.g. --role o_proj --seq 64)"
 
 compile:
 	mkdir -p $(BUILD_DIR)
@@ -125,6 +146,25 @@ check-fault-control:
 	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
 	    python3 $(srcdir)/opcheck.py --operator elementwise_add \
 	        --fault-inject input --expect-failure
+
+# The Phase C4 registry sweep. Three of the four targets touch no hardware; only
+# registry-sweep does, and it is the one that takes an hour.
+#
+# None of them takes a lock. registry_sweep.py runs each candidate in its own
+# subprocess and XRTRunner holds /tmp/npu.lock across every dispatch, so the
+# repository lock belongs OUTSIDE this recipe -- taking it here as well would
+# deadlock against the wrapper that is supposed to be there.
+registry-plan:
+	python3 $(srcdir)/sweep/registry_sweep.py --family $(FAMILY) --plan $(SWEEP_ARGS)
+
+registry-resolution:
+	python3 $(srcdir)/sweep/registry_sweep.py --family $(FAMILY) --verify-resolution $(SWEEP_ARGS)
+
+registry-sweep:
+	python3 $(srcdir)/sweep/registry_sweep.py --family $(FAMILY) $(SWEEP_ARGS)
+
+registry-write:
+	python3 $(srcdir)/sweep/registry_sweep.py --family $(FAMILY) --write-registry $(SWEEP_ARGS)
 
 clean:
 	rm -rf $(BUILD_DIR) __pycache__ runlist_gate_cache

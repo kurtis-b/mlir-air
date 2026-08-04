@@ -19,3 +19,10 @@ air_project/
 # negative-control runs, kept in a subdirectory so an injected run can never be
 # mistaken for -- or overwrite -- a clean one.
 results/
+
+# The registry sweep's per-candidate scratch: aircc builds each candidate in its
+# own directory under here and the directory is removed as soon as the verdict is
+# checkpointed, so anything left is the debris of a killed run. sweep/results/ is
+# already covered by the results/ rule above -- those are the checkpoints, and
+# the durable record of what they decided is the kernel_registry rows.
+sweep/work/

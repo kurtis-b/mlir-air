@@ -1,0 +1,39 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase C4: every baseline_768 shape resolves through kernel_registry.
+//
+// The sub-phase's whole point is that `registry_lookup.gemm_config()` stops
+// raising for the 36 projection GEMMs the case matrix's baseline_768 family
+// needs. This is the regression test for that, and it is deliberately the cheap
+// half: it re-reads the rows the sweep wrote and resolves each one. It does not
+// re-measure anything. The sweep that produced the rows takes an hour on real
+// hardware and is `make registry-sweep`, not a lit test.
+//
+// npu2 in the filename is the TARGET THE ROWS DESCRIBE -- kernel_registry is an
+// NPU2-only registry (`"target": "npu2"` in the JSON) and every tile config in
+// it was measured on AIE2P. The check itself dispatches nothing and needs
+// neither a device nor Peano, which is exactly why it is cheap enough to gate
+// on. Adding a hardware requirement here would only stop the regression from
+// surfacing on a compile-only runner.
+//
+// The count is part of the gate. A registry write that dropped half the family
+// would still let the surviving shapes resolve, and a check that only looked for
+// a final PASS would report success on it -- so the number of resolutions is
+// pinned, and nothing may resolve after the last one.
+//
+// So is the METHOD. `gemm_builder.gemm_method_spec` knows only `fused-cast` and
+// `drain`; a row whose high-precision winner was recorded as `direct` would
+// resolve here perfectly happily and then raise `unknown gemm method` inside
+// every model that read it. Requiring one of the two buildable names turns that
+// into a failure here instead of a failure three phases downstream.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming
+// one in prose -- even inside a comment -- registers as a second directive and
+// leaves the test UNRESOLVED. Describe them, never spell them out.
+//
+// RUN: python3 %S/registry_sweep.py --family baseline_768 --verify-resolution | FileCheck %s
+//
+// CHECK-COUNT-36: [resolve] {{[0-9]+x[0-9]+x[0-9]+}} ({{.*}}) -> {{fused-cast|drain}} {{[0-9]+/[0-9]+/[0-9]+/[0-9]+}}
+// CHECK-NOT: [resolve]
+// CHECK: PASS: all 36 baseline_768 shapes resolve
