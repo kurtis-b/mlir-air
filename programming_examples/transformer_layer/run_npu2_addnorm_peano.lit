@@ -1,0 +1,32 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase C1 operator gate: addnorm.
+//
+// Weighted LayerNorm plus residual, with the weight as a runtime memref
+// argument rather than baked into the MLIR. 64 rows, not 512: the builder
+// requires one kernel call per tile, and that caps rows at what L1 holds
+// across the 8-column herd. builders/addnorm.py records the measurement
+// behind that constraint.
+//
+// Runs opcheck.py on real NPU2 against an FP32 reference: np.isclose over the
+// full output at rtol=1.6e-2, zero permitted mismatches. Not cosine similarity
+// -- kernel_registry/README.md is explicit that a correlation gate is blind to
+// a systematic per-element scale error.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming
+// one in prose -- even inside a comment -- registers as a second directive and
+// leaves the test UNRESOLVED. Describe them, never spell them out.
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_npu2_addnorm_peano
+// RUN: cd test_npu2_addnorm_peano
+// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile check-addnorm PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+//
+// Both lines, not just the verdict: the first is XRTRunner's own, the second
+// names the operator and shape, so a test wired to the wrong operator fails
+// here rather than passing quietly.
+// CHECK: PASS!
+// CHECK: [opcheck] addnorm [64x512]: PASS

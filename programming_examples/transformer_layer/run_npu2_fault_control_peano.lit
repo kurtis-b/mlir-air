@@ -1,0 +1,38 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase C1: the negative control for the operator gate.
+//
+// Runs opcheck.py with a fault injected into one element of one DEVICE input,
+// after the FP32 reference has been computed from the clean one, and requires
+// the check to FAIL. The make target inverts the exit status, so this test
+// passes exactly when the injected run does not.
+//
+// This is the layer a laxer test cannot satisfy, and it is why it is in the
+// suite rather than only in the driver. A reference compared against itself, a
+// tolerance wide enough to swallow anything, and an ignored --fault-inject flag
+// all still report PASS under injection -- and all three fail here. The
+// harness's own lesson from Phase A, in
+// docs/plans/transformer-layer-execution-studies/14-the-port-loop-harness.md:
+// a fix is only trusted after confirming it fails when it should.
+//
+// One operator, because the injection machinery in opcheck.py is shared by all
+// four and the driver runs the same injection against each of them.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming
+// one in prose -- even inside a comment -- registers as a second directive and
+// leaves the test UNRESOLVED. Describe them, never spell them out.
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_npu2_fault_control_peano
+// RUN: cd test_npu2_fault_control_peano
+// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile check-fault-control PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+//
+// The injection line first: it names the element and both values, so an
+// injection that silently perturbed nothing is visible here rather than being
+// inferred from the verdict.
+// CHECK: [fault-inject] input 0 at (511, 0)
+// CHECK: [opcheck] elementwise_add [512x512]: FAIL
+// CHECK: NEGATIVE CONTROL: PASS
