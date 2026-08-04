@@ -210,10 +210,24 @@ def build_plan(tile_m, tile_k, tile_n):
                 out_name="addnorm_ffn_pre_add.o",
             ),
             "addnorm_ffn_pre_add.o",
+            # Must match addnorm_ffn.o's list exactly. The two objects are the same
+            # translation unit built with and without -DADDNORM_PRE_ADD, so they define
+            # the same entry points; only the residual ordering differs. Checking a
+            # shorter list here let the pre-add variant silently lose down-projection or
+            # passthrough entry points while still passing, because the byte-difference
+            # assertion below compares whole objects and says nothing about symbols.
             [
-                "matmul_bf16_bf16_up_proj_half_inps",
+                "ffn_eltwise_add_bf16_vector",
+                "ffn_gelu_bf16",
+                "ffn_passThroughTile_out",
                 "fused_add_layer_norm_1outs",
                 "fused_add_layer_norm_2outs",
+                "ln_passThroughTile_in",
+                "ln_passThroughTile_out",
+                "matmul_bf16_bf16_up_proj_half_inps",
+                "matmul_with_acc_bf16_bf16_down_proj",
+                "zero_bf16_down_proj",
+                "zero_bf16_up_proj",
             ],
         ),
     ]

@@ -102,13 +102,6 @@ phase_a_objective_check() {
     return 1
   fi
 
-  local srcs found=0
-  srcs="$(find "${kdir}" -name '*.cc' 2>/dev/null | sort)"
-  if [ -z "${srcs}" ]; then
-    log_error "objective check: no .cc kernel sources under ${kdir}"
-    return 1
-  fi
-
   local search_roots=(
     "${PL_ROOT}/programming_examples/transformer_layer"
     "${PL_ROOT}/build-xrt/test/transformer_layer"
@@ -121,46 +114,76 @@ phase_a_objective_check() {
     return 1
   fi
 
-  local objs
-  objs="$(find "${existing[@]}" -name '*.o' -size +4k 2>/dev/null | sort)"
-  if [ -z "${objs}" ]; then
-    log_error "objective check: no compiled object files (>4k) found for the ported kernels"
-    log_error "  searched: ${existing[*]}"
-    log_error "  a lit test can pass without compiling anything; this check is why that is caught"
-    return 1
-  fi
-
   # Reject stale artifacts: at least one object must postdate the gate run.
   if [ -n "${_GATE_STARTED_AT:-}" ] && [ -f "${_GATE_STARTED_AT}" ]; then
-    local fresh
-    fresh="$(find "${existing[@]}" -name '*.o' -size +4k -newer "${_GATE_STARTED_AT}" 2>/dev/null | head -1)"
-    if [ -z "${fresh}" ]; then
+    if [ -z "$(find "${existing[@]}" -name '*.o' -size +4k -newer "${_GATE_STARTED_AT}" 2>/dev/null | head -1)" ]; then
       log_error "objective check: object files exist but none is newer than the gate run"
       log_error "  the gate reported success without rebuilding anything — treating as vacuous"
       return 1
     fi
   fi
 
-  local o
-  while read -r o; do
-    [ -z "${o}" ] && continue
-    if command -v nm >/dev/null 2>&1; then
-      if nm --defined-only "${o}" 2>/dev/null | grep -q ' [TtWw] '; then
-        found=$((found + 1))
-      else
-        log_warn "objective check: ${o} defines no text symbols"
-      fi
-    else
-      found=$((found + 1))
-    fi
-  done <<< "${objs}"
+  # Every extern "C" symbol declared in every kernel source must be defined by some object.
+  # The expectation is derived from the SOURCES, independently of compile_kernels.py, so a
+  # weakened test script cannot narrow what is demanded here.
+  PL_KDIR="${kdir}" PL_OBJ_ROOTS="${existing[*]}" python3 -c '
+import os, re, pathlib, subprocess, sys
 
-  if [ "${found}" -eq 0 ]; then
-    log_error "objective check: no object file exports any defined symbol"
-    return 1
-  fi
+kdir = pathlib.Path(os.environ["PL_KDIR"])
+roots = os.environ["PL_OBJ_ROOTS"].split()
 
-  log_info "objective check passed: ${found} object file(s) with defined symbols"
+expected = {}
+for f in sorted(kdir.glob("*.cc")):
+    src = f.read_text()
+    names = []
+    for m in re.finditer(r"extern\s+\"C\"\s*\{", src):
+        i = m.end(); depth = 1; j = i
+        while j < len(src) and depth:
+            if src[j] == "{": depth += 1
+            elif src[j] == "}": depth -= 1
+            j += 1
+        names += re.findall(r"^\s*(?:void|int|float)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+                            src[i:j-1], re.M)
+    if names:
+        expected[f.name] = sorted(set(names))
+
+if not expected:
+    print("objective check: no extern \"C\" symbols found in kernel sources", file=sys.stderr)
+    sys.exit(1)
+
+objs = []
+for r in roots:
+    for dp, _, fns in os.walk(r):
+        objs += [os.path.join(dp, fn) for fn in fns if fn.endswith(".o")]
+if not objs:
+    print("objective check: no object files found under %s" % roots, file=sys.stderr)
+    sys.exit(1)
+
+defined = set()
+for o in objs:
+    try:
+        out = subprocess.run(["nm", "--defined-only", o], capture_output=True, text=True).stdout
+    except FileNotFoundError:
+        print("objective check: nm unavailable", file=sys.stderr); sys.exit(1)
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] in ("T", "t", "W", "w"):
+            defined.add(parts[2])
+
+rc = 0
+for srcname, syms in expected.items():
+    missing = [s for s in syms if s not in defined]
+    if missing:
+        print("objective check: %s declares %d extern \"C\" symbols; %d missing from every "
+              "built object: %s" % (srcname, len(syms), len(missing), ", ".join(missing[:6])),
+              file=sys.stderr)
+        rc = 1
+    else:
+        print("  %s: all %d extern \"C\" symbols present" % (srcname, len(syms)))
+sys.exit(rc)
+' || { log_error "objective check FAILED: kernel sources declare symbols no object defines"; return 1; }
+
+  log_info "objective check passed: every extern \"C\" symbol in every kernel source is defined"
   return 0
 }
 

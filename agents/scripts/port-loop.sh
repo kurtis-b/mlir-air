@@ -225,7 +225,10 @@ run_phase() {
   fi
   log_info "phase base commit: $(git -C "${PL_ROOT}" rev-parse --short "${_START_SHA}")"
 
-  [ -f "${pdir}/gates.before" ] || guard_fingerprint "${pdir}/gates.before"
+  # Always re-derive the baseline from the phase's BASE COMMIT, never the working tree and never
+  # a cached file. Reusing a stale or working-tree baseline is exactly how a weakened gate
+  # becomes the reference it is checked against.
+  guard_fingerprint "${pdir}/gates.before" "${_START_SHA}"
 
   # --- implement ---
   if [ "${resume_from}" -le "$(stage_ordinal implement 0)" ]; then
@@ -424,9 +427,9 @@ cmd_run_one() {
     gate)            run_gate "${phase}" "${pdir}/gate.log" ;;
     objective-check) phase_objective_check "${phase}" ;;
     tamper-check)
-      [ -f "${pdir}/gates.before" ] || guard_fingerprint "${pdir}/gates.before"
+      guard_fingerprint "${pdir}/gates.before" "${_START_SHA}"
       guard_check_tamper "${pdir}/gates.before" "$(phase_gate_allowlist "${phase}")" ;;
-    fingerprint)     guard_fingerprint "${pdir}/gates.before" && log_info "wrote ${pdir}/gates.before" ;;
+    fingerprint)     guard_fingerprint "${pdir}/gates.before" "${_START_SHA}" && log_info "wrote ${pdir}/gates.before (base ${_START_SHA})" ;;
     implement)
       render_prompt "${PL_LIB}/prompts/implement.md" "${pdir}/implement.prompt" "${phase}"
       pl_claude_run "${pdir}/implement.prompt" "${PL_LIB}/schema/session.json" "${pdir}" "implement" ;;

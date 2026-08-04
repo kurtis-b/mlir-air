@@ -28,13 +28,32 @@ guard_gate_files() {
   } 2>/dev/null | sort -u
 }
 
+# guard_fingerprint <out> [ref]
+#
+# With a git ref, hashes each gate file's content AT THAT COMMIT rather than in the working
+# tree. This matters more than it looks: taking the baseline from the working tree means any
+# weakening that already landed becomes the baseline and is invisible forever after.
+#
+# That is not hypothetical — it happened. Resume support introduced a
+# `[ -f gates.before ] || guard_fingerprint` guard, and combined with a wiped state directory the
+# baseline was captured ten hours after the phase's last commit, with the phase's own gate edits
+# already in it. The tamper check for that run was vacuous. Codex caught it; timestamps confirmed
+# it. Always pass the phase's base commit.
 guard_fingerprint() {
-  local out="$1"
+  local out="$1" ref="${2:-}"
   mkdir -p "$(dirname "${out}")"
-  local f
+  local f h
   guard_gate_files | while read -r f; do
-    [ -f "${PL_ROOT}/${f}" ] || continue
-    printf '%s  %s\n' "$(sha256sum "${PL_ROOT}/${f}" | cut -d' ' -f1)" "${f}"
+    if [ -n "${ref}" ]; then
+      h="$(git -C "${PL_ROOT}" show "${ref}:${f}" 2>/dev/null | sha256sum | cut -d' ' -f1)"
+      # A file absent at the base commit is new in this phase; record it as such so its later
+      # appearance is attributable rather than silently accepted.
+      git -C "${PL_ROOT}" cat-file -e "${ref}:${f}" 2>/dev/null || h="ABSENT_AT_BASE"
+    else
+      [ -f "${PL_ROOT}/${f}" ] || continue
+      h="$(sha256sum "${PL_ROOT}/${f}" | cut -d' ' -f1)"
+    fi
+    printf '%s  %s\n' "${h}" "${f}"
   done > "${out}"
 }
 
