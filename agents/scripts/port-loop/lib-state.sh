@@ -48,7 +48,7 @@ state_init() {
   state_render
 }
 
-state_get() { jq -r "$1" "${STATE_JSON}"; }
+state_get() { jq -r "$@" "${STATE_JSON}"; }
 
 # state_set [jq-options...] <jq-assignment-expression>
 # All arguments are forwarded to jq verbatim, so callers may pass --arg/--argjson before the

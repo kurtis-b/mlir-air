@@ -15,6 +15,7 @@
 #   agents/scripts/port-loop.sh dry-run
 #   agents/scripts/port-loop.sh start
 #   agents/scripts/port-loop.sh resume
+#   agents/scripts/port-loop.sh resume-at <phase> <step> [round] [base-sha]
 #   agents/scripts/port-loop.sh stop
 #   agents/scripts/port-loop.sh run-one <phase> <step>
 #
@@ -85,6 +86,19 @@ require_deps() {
     return 1
   fi
   return 0
+}
+
+# Ordinal of each stage within a phase, used only for resume. implement=0, then review/fix pairs,
+# then the gate. A resumed phase skips every stage with a lower ordinal than where it stopped.
+stage_ordinal() {
+  local step="$1" round="${2:-0}"
+  case "${step}" in
+    preflight|implement) echo 0 ;;
+    review)              echo $(( 1 + (round - 1) * 2 )) ;;
+    fix)                 echo $(( 2 + (round - 1) * 2 )) ;;
+    gate|objective-check|tamper-check) echo 7 ;;
+    *)                   echo 0 ;;
+  esac
 }
 
 phase_dir() { echo "${PL_STATE_DIR}/phase-$1"; }
@@ -192,25 +206,49 @@ run_phase() {
 
   pl_preflight "${needs_hw}" || { state_halt "preflight failed for phase ${phase}"; return 1; }
 
-  _START_SHA="$(git -C "${PL_ROOT}" rev-parse HEAD)"
-  state_set --arg s "${_START_SHA}" '.phase_start_sha = $s'
-  log_info "phase base commit: $(git -C "${PL_ROOT}" rev-parse --short HEAD)"
+  # Resume support. Without this a resumed run re-executes `implement`, throwing away work that
+  # is already committed and burning a full session to do it. _RESUME_FROM is the ordinal of the
+  # first stage still to run; stages before it are skipped.
+  local resume_from=0
+  if [ "$(state_get '.resume_phase // ""')" = "${phase}" ]; then
+    resume_from="$(stage_ordinal "$(state_get '.resume_step // "implement"')" "$(state_get '.resume_round // 1')")"
+    state_set '.resume_phase = null | .resume_step = null | .resume_round = null'
+    log_info "resuming phase ${phase} at stage ordinal ${resume_from}"
+  fi
 
-  guard_fingerprint "${pdir}/gates.before"
+  if [ "${resume_from}" -eq 0 ]; then
+    _START_SHA="$(git -C "${PL_ROOT}" rev-parse HEAD)"
+    state_set --arg s "${_START_SHA}" '.phase_start_sha = $s'
+  else
+    _START_SHA="$(state_start_sha)"
+    [ -n "${_START_SHA}" ] || _START_SHA="$(git -C "${PL_ROOT}" rev-parse HEAD)"
+  fi
+  log_info "phase base commit: $(git -C "${PL_ROOT}" rev-parse --short "${_START_SHA}")"
+
+  [ -f "${pdir}/gates.before" ] || guard_fingerprint "${pdir}/gates.before"
 
   # --- implement ---
-  state_set '.step = "implement"'
-  render_prompt "${PL_LIB}/prompts/implement.md" "${pdir}/implement.prompt" "${phase}"
-  if ! pl_claude_run "${pdir}/implement.prompt" "${PL_LIB}/schema/session.json" "${pdir}" "implement"; then
-    state_halt "implement session failed in phase ${phase}"
-    timing_end "${phase}" "halted-implement" "${phase_epoch}"
-    return 1
+  if [ "${resume_from}" -le "$(stage_ordinal implement 0)" ]; then
+    state_set '.step = "implement"'
+    render_prompt "${PL_LIB}/prompts/implement.md" "${pdir}/implement.prompt" "${phase}"
+    if ! pl_claude_run "${pdir}/implement.prompt" "${PL_LIB}/schema/session.json" "${pdir}" "implement"; then
+      state_halt "implement session failed in phase ${phase}"
+      timing_end "${phase}" "halted-implement" "${phase_epoch}"
+      return 1
+    fi
+    commit_step "${phase}" "implement" || { state_halt "commit failed"; return 1; }
+  else
+    log_info "skipping implement (already done; resuming later in the phase)"
   fi
-  commit_step "${phase}" "implement" || { state_halt "commit failed"; return 1; }
 
   # --- three sequential review -> fix rounds ---
   local round
   for round in $(seq 1 "${PL_REVIEW_ROUNDS}"); do
+    if [ "${resume_from}" -gt "$(stage_ordinal review "${round}")" ] \
+       && [ "${resume_from}" -gt "$(stage_ordinal fix "${round}")" ]; then
+      log_info "skipping review/fix round ${round} (already done)"
+      continue
+    fi
     state_set --argjson r "${round}" '.step = "review" | .round = $r'
     local rdir="${pdir}/round-${round}"
     mkdir -p "${rdir}"
@@ -298,6 +336,24 @@ cmd_start() {
   local deadline=$(( $(date +%s) + PL_MAX_HOURS * 3600 ))
   state_init "${PL_PHASES_IN_SCOPE}" "${deadline}"
   cmd_loop
+}
+
+# Position the state machine at a specific phase/step without running anything, so an operator
+# can resume a phase whose earlier stages were completed by hand.
+cmd_resume_at() {
+  local phase="${1:-}" step="${2:-}" round="${3:-1}" base="${4:-}"
+  [ -n "${phase}" ] && [ -n "${step}" ] || { usage; return 2; }
+  state_exists || state_init "${PL_PHASES_IN_SCOPE}" "$(( $(date +%s) + PL_MAX_HOURS * 3600 ))"
+  local idx
+  idx="$(state_get --arg p "${phase}" '.phases | index($p) // 0' 2>/dev/null || echo 0)"
+  [ -n "${base}" ] || base="$(state_start_sha)"
+  [ -n "${base}" ] || base="$(git -C "${PL_ROOT}" rev-parse HEAD)"
+  state_set --argjson i "${idx}" --arg p "${phase}" --arg s "${step}" \
+            --argjson r "${round}" --arg b "${base}" \
+    '.phase_index = $i | .resume_phase = $p | .resume_step = $s | .resume_round = $r
+     | .phase_start_sha = $b | .status = "ready" | .halt_reason = null'
+  log_info "state positioned at phase ${phase}, step ${step}, round ${round}, base $(git -C "${PL_ROOT}" rev-parse --short "${base}")"
+  log_info "run 'resume' to continue from here"
 }
 
 cmd_resume() {
@@ -410,6 +466,7 @@ main() {
   case "${1:-help}" in
     start)    shift; cmd_start "$@" ;;
     resume)   shift; cmd_resume "$@" ;;
+    resume-at) shift; cmd_resume_at "$@" ;;
     stop)     shift; cmd_stop "$@" ;;
     status)   shift; cmd_status "$@" ;;
     dry-run)  shift; cmd_dry_run "$@" ;;
