@@ -18,10 +18,18 @@ ninja -C build-xrt check-programming-examples-transformer-layer
 
 | File | Contents |
 |---|---|
-| `kernels/encoder.cc` | Encoder-block kernels: staged FFN (`-DBUILD_FFN`) and weighted add-norm (`-DBUILD_ADDNORM`) |
-| `kernels/addnorm_ffn.cc` | Fused add-norm + FFN staging, both residual orderings behind `-DADDNORM_PRE_ADD` |
-| `kernels/elementwise.cc` | `eltwise_vadd` and `gelu_tanh_approx_bf16`, textually included by the two above |
+| `kernels/encoder.cc` | Encoder-block kernels: staged FFN (`-DBUILD_FFN`) and weighted add-norm (`-DBUILD_ADDNORM`). Holds the contract docs and the `extern "C"` entry points |
+| `kernels/encoder_matmul.cc` | The encoder's 2x2-expanded `aie::mmul` microkernels, included by `encoder.cc` |
+| `kernels/encoder_layer_norm.cc` | The encoder's LayerNorm reductions, fused and staged, included by `encoder.cc` |
+| `kernels/addnorm_ffn.cc` | Fused add-norm + FFN staging, both residual orderings behind `-DADDNORM_PRE_ADD`. Holds the contract docs and the `extern "C"` entry points |
+| `kernels/addnorm_ffn_matmul.cc` | The FFN's 1x4-expanded `aie::mmul` microkernels, included by `addnorm_ffn.cc` |
+| `kernels/addnorm_ffn_norm.cc` | The fused add-norm templates and tile passthroughs, included by `addnorm_ffn.cc`. The only file `-DADDNORM_PRE_ADD` reaches |
+| `kernels/elementwise.cc` | `eltwise_vadd` and `gelu_tanh_approx_bf16`, textually included by both kernels |
 | `compile_kernels.py` | The compile-and-check driver the lit test runs |
+
+There are two compiled objects, not six: `encoder.cc` and `addnorm_ffn.cc` are
+the only translation units, and each `#include`s its two siblings the way
+`matrix_multiplication/bf16_in_fp32_out/mm_aie2p.cc` includes `zero.cc`.
 
 Kernels that already had an MLIR-AIR home were extended in place rather than
 copied here:
@@ -37,18 +45,26 @@ Every flag defaults off, and the default-build objects for the three
 pre-existing sources were verified byte-identical to their pre-port versions.
 The ten shipped LLM deployments that link them are unaffected.
 
-## On the size of the two kernel sources
+## Why the two kernels are each three files
 
-`encoder.cc` and `addnorm_ffn.cc` both run past the ~800-line module guideline
-in
+As first landed, `encoder.cc` (973 lines) and `addnorm_ffn.cc` (1116) both ran
+past the ~800-line module guideline in
 [02-porting-conventions.md](../../docs/plans/transformer-layer-execution-studies/02-porting-conventions.md).
-They are kept whole rather than split, for two reasons. Each already carries the
-seam the guideline asks for — `-DBUILD_FFN` and `-DBUILD_ADDNORM` select two
-disjoint halves that share no code, so a build takes only the half it needs. And
-the phase document names these two artifacts explicitly, so splitting them would
-make the port harder to check against the plan, not easier. Splitting along the
-existing `#ifdef` boundary remains a clean follow-up if the guideline is meant
-to bind C++ sources as strictly as it binds Python modules.
+Each is now split along the seam it already had internally — **matmul
+microkernels · normalization templates · `extern "C"` entry points** — leaving
+every source between 245 and 493 lines.
+
+The seam is by *role*, not by the `-DBUILD_FFN` / `-DBUILD_ADDNORM` build flags.
+Those flags gate only the entry-point layer, so cutting there would have left the
+matmul and LayerNorm template bodies in one oversized file regardless. The role
+seam also puts each footgun next to the code it applies to: `-DADDNORM_PRE_ADD`
+is read entirely inside `addnorm_ffn_norm.cc`, and the variance clamp that keeps
+`aie::invsqrt` off a negative operand is documented in the two normalization
+files rather than in a header 700 lines away.
+
+Splitting changed no code and no object: the sources are included textually, so
+`encoder.o` and `addnorm_ffn.o` are still built from one translation unit each,
+with the same flags and the same symbols the compile gate checks.
 
 ## Things that will bite you
 

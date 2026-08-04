@@ -11,6 +11,9 @@
 // rows of an L1 tile in a single call, which is what a transformer block needs
 // when a whole activation tile is resident.
 //
+// They are NOT bit-equivalent to layer_norm.py -- see the variance FOOTGUN
+// below. Do not use one as the numerical oracle for the other.
+//
 // CONTRACT
 //   - Element type is bf16; statistics accumulate in the same vector type,
 //     with the sum-of-squares in f32. This matches the AIR bf16 kernel
@@ -24,11 +27,21 @@
 //   - No gamma/beta. These are the unweighted forms; the weighted variant
 //     lives in weighted_rms_norm/ and in the transformer_layer kernels.
 //
-// FOOTGUN: variance is computed as E[x^2] - E[x]^2, which cancels
-// catastrophically when the row mean is large relative to its spread. That is
-// the same formulation the direct-codegen builder uses, so the two agree, but
-// it is less accurate than a two-pass mean-then-variance for inputs with a
-// large DC offset.
+// FOOTGUN: variance is computed one-pass as E[x^2] - E[x]^2, so the row is read
+// once for statistics rather than twice. layer_norm.py computes it two-pass, as
+// sum((x - mean)^2) / N. The two forms are algebraically equal and numerically
+// are not: the one-pass form cancels catastrophically when a row's mean is
+// large relative to its spread, and on such a row these kernels and
+// layer_norm.py will disagree by far more than bf16 rounding. Pick the two-pass
+// form -- the builder, or a host reference -- when you need the accurate
+// answer.
+//
+// The cancellation can also round the variance below zero, which is why every
+// site here clamps it at zero before invsqrt. aie::invsqrt of a negative
+// operand returns NaN, so without the clamp an affected row emits NaN for every
+// element instead of a merely inaccurate value. The clamp removes the NaN only;
+// it does not recover the lost precision, and it is not a substitute for using
+// the two-pass form when accuracy matters.
 //
 //===----------------------------------------------------------------------===//
 
@@ -66,7 +79,13 @@ void layer_norm_rows_impl(const T *__restrict input, T *__restrict output,
     const float sum_of_sq_vals = ::aie::reduce_add(sum_sq_acc);
 
     const float mean = sum_of_vals / float(cols);
-    const float variance = (sum_of_sq_vals / float(cols)) - mean * mean;
+    float variance = (sum_of_sq_vals / float(cols)) - mean * mean;
+    // E[x^2] - E[x]^2 can round below zero for a row whose spread is small
+    // relative to its mean; invsqrt of a negative operand returns NaN, so the
+    // true-zero-variance case has to be clamped rather than propagated.
+    if (variance < 0.0f) {
+      variance = 0.0f;
+    }
     const float inv_std = ::aie::invsqrt(variance + kEpsilon);
 
     ::aie::vector<T, N> mean_v = ::aie::broadcast<T, N>(mean);
@@ -112,7 +131,12 @@ void add_layer_norm_rows_impl(const T *__restrict input1,
     const float sum_of_sq_vals = ::aie::reduce_add(sum_sq_acc);
 
     const float mean = sum_of_vals / float(cols);
-    const float variance = (sum_of_sq_vals / float(cols)) - mean * mean;
+    float variance = (sum_of_sq_vals / float(cols)) - mean * mean;
+    // See layer_norm_rows_impl: the cancellation can round the variance
+    // negative, and invsqrt would then return NaN.
+    if (variance < 0.0f) {
+      variance = 0.0f;
+    }
     const float inv_std = ::aie::invsqrt(variance + kEpsilon);
 
     ::aie::vector<T, N> mean_v = ::aie::broadcast<T, N>(mean);
@@ -140,7 +164,9 @@ void add_layer_norm_rows_impl(const T *__restrict input1,
 
 extern "C" {
 
-// Single row. Same result as the direct-codegen builder in layer_norm.py.
+// Single row -- the same function the direct-codegen builder in layer_norm.py
+// computes, but by the one-pass variance formula, so not the same bits. See the
+// variance FOOTGUN at the top of this file.
 void layer_norm(bfloat16 *input, bfloat16 *output, int32_t cols) {
   ::aie::set_rounding(aie::rounding_mode::conv_even);
   layer_norm_rows_impl<bfloat16, LN_VEC_LEN>(input, output, cols, 1);
