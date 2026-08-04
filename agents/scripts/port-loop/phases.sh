@@ -86,6 +86,15 @@ phase_gate_cmd() {
 
 # Phase A: the ported kernels must have produced real object files with the expected symbols.
 # Deliberately independent of lit, Makefiles, and anything the session authored.
+#
+# Footgun that bit during bring-up: lit does NOT build in the source tree. Its working directory
+# is under the CMake build tree, so objects land in
+#   build-xrt/test/transformer_layer/<lit-workdir>/build_peano/*.o
+# Searching only programming_examples/ finds nothing and fails a perfectly good phase.
+#
+# Freshness matters as much as existence: a stale object from an earlier run would otherwise
+# satisfy this check even if the gate had just compiled nothing. run_gate() stamps
+# _GATE_STARTED_AT, and objects must be newer than it.
 phase_a_objective_check() {
   local kdir="${PL_ROOT}/programming_examples/transformer_layer/kernels"
   if [ ! -d "${kdir}" ]; then
@@ -100,12 +109,36 @@ phase_a_objective_check() {
     return 1
   fi
 
+  local search_roots=(
+    "${PL_ROOT}/programming_examples/transformer_layer"
+    "${PL_ROOT}/build-xrt/test/transformer_layer"
+    "${PL_ROOT}/build/test/transformer_layer"
+  )
+  local existing=() r
+  for r in "${search_roots[@]}"; do [ -d "${r}" ] && existing+=("${r}"); done
+  if [ ${#existing[@]} -eq 0 ]; then
+    log_error "objective check: no build output directory for transformer_layer kernels"
+    return 1
+  fi
+
   local objs
-  objs="$(find "${PL_ROOT}/programming_examples/transformer_layer" -name '*.o' -size +4k 2>/dev/null | sort)"
+  objs="$(find "${existing[@]}" -name '*.o' -size +4k 2>/dev/null | sort)"
   if [ -z "${objs}" ]; then
     log_error "objective check: no compiled object files (>4k) found for the ported kernels"
+    log_error "  searched: ${existing[*]}"
     log_error "  a lit test can pass without compiling anything; this check is why that is caught"
     return 1
+  fi
+
+  # Reject stale artifacts: at least one object must postdate the gate run.
+  if [ -n "${_GATE_STARTED_AT:-}" ] && [ -f "${_GATE_STARTED_AT}" ]; then
+    local fresh
+    fresh="$(find "${existing[@]}" -name '*.o' -size +4k -newer "${_GATE_STARTED_AT}" 2>/dev/null | head -1)"
+    if [ -z "${fresh}" ]; then
+      log_error "objective check: object files exist but none is newer than the gate run"
+      log_error "  the gate reported success without rebuilding anything — treating as vacuous"
+      return 1
+    fi
   fi
 
   local o

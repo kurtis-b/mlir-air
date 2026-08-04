@@ -161,6 +161,9 @@ run_gate() {
     log_info "DRY RUN: would run gate"
     return 0
   fi
+  # Timestamp reference so the objective check can reject artifacts the gate did not rebuild.
+  _GATE_STARTED_AT="$(dirname "${log}")/.gate-started"
+  : > "${_GATE_STARTED_AT}"
   if ( cd "${PL_ROOT}" && eval "${cmd}" ) > "${log}" 2>&1; then
     log_info "gate PASSED"
     return 0

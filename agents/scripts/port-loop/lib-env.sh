@@ -98,6 +98,7 @@ pl_preflight() {
       log_error "no NPU at /dev/accel/accel0"
       return 1
     fi
+    pl_assert_lit_sees_npu || return 1
   fi
 
   local free_gb
@@ -107,6 +108,40 @@ pl_preflight() {
     return 1
   fi
 
+  return 0
+}
+
+# A hardware gate that runs zero hardware tests is worse than a gate that fails: it reports
+# success. lit decides whether the NPU exists by running `${config.xrt_bin_dir}/xrt-smi`, and
+# that path is baked into the GENERATED lit.site.cfg.py at configure time. It goes stale: on this
+# machine it was left pointing at /usr/lib/bin (which does not exist) while xrt-smi lives in
+# /usr/bin, so the ryzen_ai_npu2 feature was never set and 100% of NPU tests reported UNSUPPORTED
+# while the suite still exited 0.
+#
+# Refuse to start a hardware phase in that state. Fix by reconfiguring so the site config
+# regenerates with a correct XRT path, e.g.
+#   cmake -S . -B build-xrt -DXRT_DIR=/opt/xilinx/xrt
+# then re-check with: lit -sv --show-unsupported build-xrt/programming_examples/flash_attention
+pl_assert_lit_sees_npu() {
+  local site="${PL_ROOT}/build-xrt/programming_examples/lit.site.cfg.py"
+  if [ ! -f "${site}" ]; then
+    log_error "lit site config not found at ${site}"
+    return 1
+  fi
+  local bindir
+  bindir="$(sed -n 's/^config\.xrt_bin_dir = "\(.*\)"$/\1/p' "${site}" | head -1)"
+  if [ -z "${bindir}" ]; then
+    log_error "could not read config.xrt_bin_dir from ${site}"
+    return 1
+  fi
+  if [ ! -x "${bindir}/xrt-smi" ]; then
+    log_error "lit will not detect the NPU: config.xrt_bin_dir='${bindir}' has no xrt-smi"
+    log_error "  actual xrt-smi: $(command -v xrt-smi || echo 'not on PATH')"
+    log_error "  every NPU-gated test would report UNSUPPORTED and the suite would still exit 0"
+    log_error "  fix: cmake -S ${PL_ROOT} -B ${PL_ROOT}/build-xrt -DXRT_DIR=/opt/xilinx/xrt"
+    return 1
+  fi
+  log_info "lit NPU detection OK (xrt_bin_dir=${bindir})"
   return 0
 }
 
