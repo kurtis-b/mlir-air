@@ -193,6 +193,92 @@ Shapes cover LLM weight-projection shapes (the four 2048-row entries) and a squa
 
 ---
 
+<!-- BEGIN transformer-layer-sweep baseline_768 -->
+### Transformer-layer execution study — `baseline_768` sweep
+
+Written by `programming_examples/transformer_layer/sweep/registry_sweep.py`, which
+measures every candidate tiling for a shape and keeps the fastest that passes. **Bold**
+= the winner recorded in `best` for that tier. `—` = no legal candidate for that method
+at this shape; `❌` = every candidate for it failed.
+
+Two things differ from the model-deployment rows above, both forced by the sequence
+ladder starting at 64:
+
+- **`herd` is per-row.** `M % (tile_m × herd_m) == 0` cannot hold at `M = 64` with
+  `herd_m = 8` for either method's forced `tile_m`, so short-sequence rows carry a
+  per-method `herd` in the JSON that overrides the file-level `8×4`. The herd used is in
+  the table's tile column.
+- **The high-precision `atol` is carried forward at constant strictness, not held
+  constant.** The harness scales its inputs by `1/sqrt(K)`, so the output magnitude —
+  and the absolute error of a fixed-relative-precision datapath with it — goes as
+  `K^-1/2`. The published `atol = 1.5e-3` is that rule evaluated at `K = 8192`; at this
+  family's `K = 768` it is a 3.3× *tightening*, which is exactly the "harness tolerance
+  edge, not a datapath failure" already recorded for Qwen3-0.6B Gate/Up and
+  Qwen2.5-0.5B Gate/Up above. The sweep therefore checks the high tier at
+  `1.5e-3 × sqrt(8192 / K)`, which reproduces the registry's own ~2.5× design margin at
+  every K (measured: 2.5× at K=8192, 2.9× at K=3072, 2.8× at K=768). `rtol` is the
+  canonical `1.6e-2` unchanged, the low tier's `4e-3` is unchanged, and every run must
+  additionally land inside its tier's `mean_rel_L1` band — a scale-free check the
+  example harness does not make at all.
+
+**`qkv_proj`** — `K = 768` → `N = 2304`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 64 | 64×768×2304 | ❌ | **945** | 568 | 32/128/32/96 (2×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 128 | 128×768×2304 | 952 | **1785** | 1150 | 32/256/32/96 (4×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 256 | 256×768×2304 | 1511 | **3043** | 2242 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 512 | 512×768×2304 | 2146 | **3981** | 4003 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 1024 | 1024×768×2304 | 3124 | **4209** | 4896 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 2048 | 2048×768×2304 | 3875 | **4132** | 4580 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 4096 | 4096×768×2304 | **4226** | 4123 | 5027 | 64/256/32/96 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+| 8192 | 8192×768×2304 | **4694** | 4477 | 5122 | 64/256/32/96 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+| 16384 | 16384×768×2304 | **4867** | 4436 | 5180 | 64/256/32/96 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+
+**`ffn_up`** — `K = 768` → `N = 3072`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 64 | 64×768×3072 | 478 | **1015** | 582 | 32/128/32/128 (2×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 128 | 128×768×3072 | 1093 | **1953** | 1201 | 32/128/32/128 (4×4) | 9.5e-3 / 1.1e-2 | ✅ |
+| 256 | 256×768×3072 | 1818 | **3463** | 2334 | 32/256/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 512 | 512×768×3072 | 2548 | **4280** | 4339 | 32/256/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 1024 | 1024×768×3072 | 3327 | **4516** | 4867 | 32/256/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 2048 | 2048×768×3072 | 4431 | **4513** | 5056 | 32/256/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 4096 | 4096×768×3072 | 4479 | **4689** | 5030 | 32/256/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 8192 | 8192×768×3072 | **5164** | 4743 | 5110 | 64/128/32/128 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+| 16384 | 16384×768×3072 | **5362** | 4702 | 5211 | 64/128/32/128 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+
+**`ffn_down`** — `K = 3072` → `N = 768`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 64 | 64×3072×768 | 544 | **1462** | 648 | 32/256/32/96 (2×4) | 9.5e-3 / 1.4e-2 | ✅ |
+| 128 | 128×3072×768 | 1263 | **2752** | 1320 | 32/256/32/96 (4×4) | 9.5e-3 / 1.4e-2 | ✅ |
+| 256 | 256×3072×768 | 2099 | **4812** | 2587 | 32/512/32/96 (8×4) | 9.5e-3 / 1.4e-2 | ✅ |
+| 512 | 512×3072×768 | 3272 | **5754** | 4957 | 32/512/32/96 (8×4) | 9.4e-3 / 1.4e-2 | ✅ |
+| 1024 | 1024×3072×768 | 4730 | **6088** | 5234 | 32/512/32/96 (8×4) | 9.4e-3 / 1.4e-2 | ✅ |
+| 2048 | 2048×3072×768 | 5948 | **6000** | 5485 | 32/512/32/96 (8×4) | 9.4e-3 / 1.4e-2 | ✅ |
+| 4096 | 4096×3072×768 | **6927** | 6226 | 5604 | 64/512/32/96 (8×4) | 9.9e-3 / 1.4e-2 | ✅ |
+| 8192 | 8192×3072×768 | **7510** | 6399 | 5532 | 64/512/32/96 (8×4) | 9.9e-3 / 1.4e-2 | ✅ |
+| 16384 | 16384×3072×768 | **7842** | 6268 | 5707 | 64/512/32/96 (8×4) | 9.9e-3 / 1.4e-2 | ✅ |
+
+**`o_proj`** — `K = 768` → `N = 768`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 64 | 64×768×768 | 261 | **708** | 477 | 32/128/32/96 (2×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 128 | 128×768×768 | 492 | **1403** | 969 | 32/128/32/96 (4×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 256 | 256×768×768 | 780 | **2539** | 1900 | 32/128/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 512 | 512×768×768 | 1065 | **3505** | 3450 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 1024 | 1024×768×768 | 1789 | **4015** | 4384 | 32/256/32/96 (8×4) | 9.5e-3 / 1.1e-2 | ✅ |
+| 2048 | 2048×768×768 | 2700 | **4277** | 4610 | 32/256/32/96 (8×4) | 9.5e-3 / 1.1e-2 | ✅ |
+| 4096 | 4096×768×768 | 3622 | **4529** | 5047 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 8192 | 8192×768×768 | 4189 | **4499** | 4827 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 16384 | 16384×768×768 | **4799** | 4610 | 5254 | 64/256/32/96 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+
+<!-- END transformer-layer-sweep baseline_768 -->
+
 ## How to reproduce (correctness + performance, one command)
 
 `make run` drives `run.py --compile-mode compile-and-run` (correctness + `--perf-iters` timing in one invocation). Example: the 2048×8192×2048 (Down) row.

@@ -112,6 +112,72 @@ This is **documentation, not executable code** — it records results produced b
 > GFLOPS, all PASS. **Bold** = faster high-precision method (what `auto` picks); the `M*K*N ≥ 4e9` threshold matches the bold winner for all 7 shapes.
 > Qwen3-0.6B rows: only the `auto`-selected high-precision method was swept (`—` = the other method not measured for that shape); all `auto` picks PASS at 9.4–9.9e-3. **2048×1024×3072 (Gate/Up) ⚠️**: both high-precision methods compute the in-tier result (mean_rel_L1 = 9.4e-3) but the harness element-wise gate trips on a single near-zero-reference output element (abs_err ≈ 1.7e-3 > the high-precision `atol = 1.5e-3`, `rtol·|ref|≈0`); the shape PASSES on the low-precision `direct` path (`atol = 4e-3`, 1.1e-2). Harness tolerance edge, not a datapath failure — see [`details/GEMM_bf16_in_bf16_out.md`](details/GEMM_bf16_in_bf16_out.md). fused-cast is tile_m=64, drain is tile_m=32. The high-precision tier preserves f32-out accuracy (9.3–9.9e-3) via a single cast; low-precision direct degrades with the L2-tile count (`K / tile_k_l2`). See [`details/GEMM_bf16_in_bf16_out.md`](details/GEMM_bf16_in_bf16_out.md).
 
+<!-- BEGIN transformer-layer-sweep baseline_768 -->
+### Transformer-layer execution study — `baseline_768` sweep
+
+The projection GEMMs the transformer-layer execution study's case matrix needs, swept
+across the full 9-point sequence ladder. Full per-candidate detail, and why the
+high-precision `atol` is K-scaled here, in
+[`details/GEMM_bf16_in_bf16_out.md`](details/GEMM_bf16_in_bf16_out.md).
+
+**`qkv_proj`** — `K = 768` → `N = 2304`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 64 | 64×768×2304 | ❌ | **945** | 568 | 32/128/32/96 (2×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 128 | 128×768×2304 | 952 | **1785** | 1150 | 32/256/32/96 (4×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 256 | 256×768×2304 | 1511 | **3043** | 2242 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 512 | 512×768×2304 | 2146 | **3981** | 4003 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 1024 | 1024×768×2304 | 3124 | **4209** | 4896 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 2048 | 2048×768×2304 | 3875 | **4132** | 4580 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 4096 | 4096×768×2304 | **4226** | 4123 | 5027 | 64/256/32/96 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+| 8192 | 8192×768×2304 | **4694** | 4477 | 5122 | 64/256/32/96 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+| 16384 | 16384×768×2304 | **4867** | 4436 | 5180 | 64/256/32/96 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+
+**`ffn_up`** — `K = 768` → `N = 3072`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 64 | 64×768×3072 | 478 | **1015** | 582 | 32/128/32/128 (2×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 128 | 128×768×3072 | 1093 | **1953** | 1201 | 32/128/32/128 (4×4) | 9.5e-3 / 1.1e-2 | ✅ |
+| 256 | 256×768×3072 | 1818 | **3463** | 2334 | 32/256/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 512 | 512×768×3072 | 2548 | **4280** | 4339 | 32/256/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 1024 | 1024×768×3072 | 3327 | **4516** | 4867 | 32/256/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 2048 | 2048×768×3072 | 4431 | **4513** | 5056 | 32/256/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 4096 | 4096×768×3072 | 4479 | **4689** | 5030 | 32/256/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 8192 | 8192×768×3072 | **5164** | 4743 | 5110 | 64/128/32/128 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+| 16384 | 16384×768×3072 | **5362** | 4702 | 5211 | 64/128/32/128 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+
+**`ffn_down`** — `K = 3072` → `N = 768`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 64 | 64×3072×768 | 544 | **1462** | 648 | 32/256/32/96 (2×4) | 9.5e-3 / 1.4e-2 | ✅ |
+| 128 | 128×3072×768 | 1263 | **2752** | 1320 | 32/256/32/96 (4×4) | 9.5e-3 / 1.4e-2 | ✅ |
+| 256 | 256×3072×768 | 2099 | **4812** | 2587 | 32/512/32/96 (8×4) | 9.5e-3 / 1.4e-2 | ✅ |
+| 512 | 512×3072×768 | 3272 | **5754** | 4957 | 32/512/32/96 (8×4) | 9.4e-3 / 1.4e-2 | ✅ |
+| 1024 | 1024×3072×768 | 4730 | **6088** | 5234 | 32/512/32/96 (8×4) | 9.4e-3 / 1.4e-2 | ✅ |
+| 2048 | 2048×3072×768 | 5948 | **6000** | 5485 | 32/512/32/96 (8×4) | 9.4e-3 / 1.4e-2 | ✅ |
+| 4096 | 4096×3072×768 | **6927** | 6226 | 5604 | 64/512/32/96 (8×4) | 9.9e-3 / 1.4e-2 | ✅ |
+| 8192 | 8192×3072×768 | **7510** | 6399 | 5532 | 64/512/32/96 (8×4) | 9.9e-3 / 1.4e-2 | ✅ |
+| 16384 | 16384×3072×768 | **7842** | 6268 | 5707 | 64/512/32/96 (8×4) | 9.9e-3 / 1.4e-2 | ✅ |
+
+**`o_proj`** — `K = 768` → `N = 768`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 64 | 64×768×768 | 261 | **708** | 477 | 32/128/32/96 (2×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 128 | 128×768×768 | 492 | **1403** | 969 | 32/128/32/96 (4×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 256 | 256×768×768 | 780 | **2539** | 1900 | 32/128/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 512 | 512×768×768 | 1065 | **3505** | 3450 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 1024 | 1024×768×768 | 1789 | **4015** | 4384 | 32/256/32/96 (8×4) | 9.5e-3 / 1.1e-2 | ✅ |
+| 2048 | 2048×768×768 | 2700 | **4277** | 4610 | 32/256/32/96 (8×4) | 9.5e-3 / 1.1e-2 | ✅ |
+| 4096 | 4096×768×768 | 3622 | **4529** | 5047 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 8192 | 8192×768×768 | 4189 | **4499** | 4827 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 16384 | 16384×768×768 | **4799** | 4610 | 5254 | 64/256/32/96 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+
+<!-- END transformer-layer-sweep baseline_768 -->
+
 ---
 
 ## GEMV — tested shapes
@@ -232,7 +298,7 @@ This is **documentation, not executable code** — it records results produced b
 >
 > **This resolves the ⚠️ on `2048×1024×3072` fused-cast above.** That row's note diagnoses it as a harness tolerance edge: the datapath computes the in-tier result and the gate tripped on a single near-zero-reference element at `abs_err ≈ 1.7e-3` against `atol = 1.5e-3`. Measured here at `atol = 5e-3` over 3× as many elements: `abs_err max = 1.95e-3`, **zero** mismatches. That is the remedy the note itself proposed — relax the high-precision `atol` to match the other tiers, leave the GPU-standard `rtol` alone.
 >
-> **Both** `M×K×3K` triples the GEMM registry holds are validated here — and they are the only two, out of the 108 projection-GEMM shapes the execution-studies case matrix asks for. That gap is a sweep that has not been run, not a defect: the builder raises on the other 106 rather than guessing a tiling.
+> **Both** `M×K×3K` triples that were in the GEMM registry when this operator was validated are validated here. The registry now holds **11** such triples: the Phase C4 sweep added the nine `baseline_768` `qkv_proj` shapes (`seq×768×2304`, the full sequence ladder), so the builder resolves those too — but resolving a tiling and having run this operator's numerical check at that shape are different claims, and only the two rows above are the second. Of the 108 projection-GEMM shapes the execution-studies case matrix asks for, **41 are now registered** (the whole `baseline_768` family plus five incidental model shapes); the remaining 67 are `baseline_512` and `baseline_1024`, which are the same sweep tool over a different `--family` and are deliberately left as a later machine-time run. The builder still raises on those rather than guessing a tiling.
 
 ---
 

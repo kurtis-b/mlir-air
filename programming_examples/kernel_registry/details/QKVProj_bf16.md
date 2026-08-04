@@ -114,7 +114,7 @@ Element-wise over the **full output**: every element of every projection must pa
 | 2048×1024 | 2048×1024×3072 | fused-cast | 64/256/32/128 | 9.9e-3 | 1.95e-3 | 0 / 6291456 | transformer-layer execution studies, attention projections | ✅ |
 | 2048×2048 | 2048×2048×6144 | fused-cast | 64/256/32/128 | 9.7e-3 | 1.22e-3 | 0 / 12582912 | transformer-layer execution studies, attention projections | ✅ |
 
-> **Both `M×K×3K` triples the GEMM registry holds are validated here**, and they are the only two of the 108 projection-GEMM shapes the execution-studies case matrix asks for. That gap is a sweep that has not been run, not a defect here: the builder raises on the other 106 rather than guessing a tiling for them.
+> **Both `M×K×3K` triples that the GEMM registry held when this operator was validated are validated here.** The registry now holds **11**: Phase C4's sweep added the nine `baseline_768` `qkv_proj` shapes (`seq×768×2304` across the full sequence ladder). Those nine resolve, but they have not been through this operator's own numerical check — a registered tiling and a validated operator shape are different claims. Of the 108 projection-GEMM shapes the case matrix asks for, **41 are registered**; the remaining 67 (`baseline_512` and `baseline_1024`) are the same sweep tool over a different `--family`, and the builder raises on them rather than guessing a tiling.
 >
 > The two agree to within measurement noise (9.9e-3 / 9.7e-3), and the larger shape's `abs_err max` is *lower* — 1.22e-3 against 1.95e-3 — because its operand scale `1/√K` is smaller at K=2048. That is the reason the scale is quoted with the tolerance rather than left implicit.
 
