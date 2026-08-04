@@ -71,6 +71,12 @@ memory bank) all produce plausible wrong numbers rather than errors.
 | `run_npu2_compile_peano.lit` | Phase A's compile-only gate. Peano, no NPU |
 | `run_seam_tests.lit` | Phase B's host-only rules tests. No NPU, no XRT |
 | `run_npu2_runlist_gate.lit` | Phase B's hardware gate: the four runlist legs on a real NPU |
+| `opcheck.py` | Phase C's numerical check: the CLI, the results artifact, and the fault-injection negative control |
+| `builders/elementwise_add.py` | 2-D element-wise add and the `causal_mask=` keyword over it, plus their FP32 reference |
+| `builders/layer_norm.py` | Multi-row LayerNorm over `layer_norm_rows`, plus its two-pass FP32 reference |
+| `builders/addnorm.py` | Weighted LayerNorm + residual over `fused_add_layer_norm_2outs`, weight as a runtime argument, plus its FP32 reference |
+| `run_npu2_<op>_peano.lit` | One per operator: that operator's numerical gate on a real NPU |
+| `run_npu2_fault_control_peano.lit` | Phase C's negative control: the injected run must FAIL |
 
 There are two compiled objects, not six: `encoder.cc` and `addnorm_ffn.cc` are
 the only translation units, and each `#include`s its two siblings the way
@@ -111,6 +117,35 @@ Splitting changed no code and no object: the sources are included textually, so
 `encoder.o` and `addnorm_ffn.o` are still built from one translation unit each,
 with the same flags and the same symbols the compile gate checks.
 
+## The Phase C operator checks
+
+`opcheck.py` is the single numerical entry point for every operator this port
+lands, and `builders/` holds the operators themselves — one
+`build_<name>_module()` function per operator with its FP32 reference beside it,
+no operator class and no `op.py`/`design.py` pair.
+
+```bash
+make opcheck-list                 # every (operator, shape) claimed, as JSON. No NPU.
+flock -x -w 1800 /tmp/mlir-air-npu.lock make check-layer-norm PEANO_INSTALL_DIR=$PEANO_INSTALL_DIR
+flock -x -w 1800 /tmp/mlir-air-npu.lock make check-fault-control PEANO_INSTALL_DIR=$PEANO_INSTALL_DIR
+```
+
+The verdict is `XRTRunner.run_test`'s, not a comparison written here:
+`np.isclose` over the full output at `rtol = 1.6e-2` with zero permitted
+mismatches, against a reference computed in float32 from bf16-rounded inputs.
+`opcheck.py` subclasses the runner only to copy out the error statistics on the
+way past. Each run writes `results/<operator>__<shape>.json`; the registry rows
+in `programming_examples/kernel_registry/` are the durable record.
+
+`--fault-inject input` is the negative control. It perturbs one element of the
+array handed to the **device**, after the reference has been computed from the
+clean one, and the run must then FAIL. This is the layer a laxer test cannot
+satisfy: a reference compared against itself, a tolerance wide enough to swallow
+anything, and an ignored flag all still report PASS under injection.
+`check-fault-control` inverts the exit status so the suite gates on it, and
+injected runs write into `results/fault/` so they can never overwrite a clean
+verdict.
+
 ## Things that will bite you
 
 **An object with no symbols still links.** `encoder.cc` and `addnorm_ffn.cc`
@@ -134,6 +169,17 @@ activations. The compile driver asserts the two objects differ.
 **`-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16` must be a `-D`.** It has to be
 visible before `<aie_api/aie.hpp>` to change `aie::mmul` behaviour, so a source
 `#define` is too late. Both kernels `static_assert` on it under `BUILD_FFN`.
+
+**`addnorm` breaks if a tile calls the kernel twice.** `build_addnorm_module`
+requires `rows == herd_x * rows_per_call`, so the herd loop runs a single trip,
+and it raises rather than emitting anything else. Two trips miscompile: at
+`[8, 64]` with `herd_x=1`, one trip is exact (0 of 512 elements outside
+tolerance) and two trips give 491 of 512, unchanged by fetching the weight
+inside the loop or hoisting it out, by draining or discarding `output2`, by
+disabling ping-pong, or by either lock-race-condition fix. Three L3→L1 streams
+per tile against a column's two shim MM2S channels is what distinguishes it from
+the two-stream builders next door, which loop fine. The symptom is
+partly-correct values, so it reads as a tolerance problem.
 
 **`-DDEBUG_AIE_KERNELS` needs a value.** The sources test
 `#if DEBUG_AIE_KERNELS == 0` / `== 1`; a bare `-DDEBUG_AIE_KERNELS` expands to

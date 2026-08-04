@@ -13,7 +13,9 @@ This is **documentation, not executable code** — it records results produced b
 
 **Status legend**: ✅ verified on real NPU2, accuracy in line with the bf16 standard · ⚠️ verified on real NPU2 but with a documented precision/coverage caveat · ❌ broken/missing
 
-> **Scope**: currently **GEMM**, **GEMV**, **RMSNorm**, **FlashAttention**, **Element-wise Add**, **SiLU-and-Mul**, and **RoPE** — the registry is built up one verified kernel at a time. The core LLM leaf kernels are now covered; see [`README.md`](README.md) for the roadmap.
+> **Scope**: currently **GEMM**, **GEMV**, **RMSNorm**, **FlashAttention**, **Element-wise Add**, **SiLU-and-Mul**, **RoPE**, **LayerNorm** and **AddNorm** — the registry is built up one verified kernel at a time. The core LLM leaf kernels are now covered; see [`README.md`](README.md) for the roadmap.
+>
+> The last two arrive with the encoder-style transformer block of the execution studies and are **correctness-only entries so far**: their throughput columns read `—` because Phase C1 gates numerics and nothing else. An entry here never carries an estimated number.
 
 ---
 
@@ -29,6 +31,8 @@ This is **documentation, not executable code** — it records results produced b
 | Element-wise Add (BF16) | [`details/EltwiseAdd_bf16.md`](details/EltwiseAdd_bf16.md) | **57.7 GB/s** (memory-bound, N=4194304, herd 8×1) | ✅ |
 | SiLU-and-Mul (BF16) | [`details/SiLU_Mul_bf16.md`](details/SiLU_Mul_bf16.md) | **25.1 GB/s** (memory-bound, N=16777216, herd 8×1) | ✅ |
 | RoPE (BF16, half-split) | [`details/RoPE_bf16.md`](details/RoPE_bf16.md) | **56.6 GB/s** (memory-bound, 49152×128, herd 8×1) | ✅ |
+| LayerNorm (BF16, multi-row) | [`details/LayerNorm_bf16.md`](details/LayerNorm_bf16.md) | — (correctness only; see the scope note) | ✅ |
+| AddNorm (BF16) | [`details/AddNorm_bf16.md`](details/AddNorm_bf16.md) | — (correctness only; see the scope note) | ✅ |
 
 ---
 
@@ -186,6 +190,30 @@ This is **documentation, not executable code** — it records results produced b
 
 ---
 
+## LayerNorm — tested shapes
+
+`y = (x − mean(x)) · rsqrt(var(x) + eps)`, per row, **several rows per kernel call**; shapes written `M×N` (M = rows / seq, N = emb_dim = normalization axis). The encoder-block norm of the transformer-layer execution studies, over the ported `layer_norm_rows` kernel — **not** the direct-codegen `programming_examples/layer_norm/` example, which accumulates its statistics in bf16 and gates an order of magnitude looser. Variance is one-pass `E[x²] − E[x]²`; the oracle is the two-pass FP32 form, so the measurement includes that gap rather than cancelling it. Full datapath, constraints, and reproduce commands in [`details/LayerNorm_bf16.md`](details/LayerNorm_bf16.md).
+
+| (M×N) | herd (hx/hy) | rows_per_call | mean_rel_L1 | abs_err max | mismatches | Used by | Status |
+|---|---|---|---|---|---|---|---|
+| 512×512 | 8/1 | 8 | 2.0e-3 | 3.1e-2 | 0 / 262144 | transformer-layer studies, encoder block norm (hidden = 512) | ✅ |
+
+> `mean_rel_L1 = 2.0e-3` sits beside Element-wise Add (1.9e-3) and below RMSNorm (4.2e-3): the output is O(1) by construction, so the bf16 epilogue roundings do not compound. `rel_err max = 6.3e+1` is expected rather than a defect — a zero-mean output puts some element arbitrarily close to zero, where relative error is unbounded and absolute error is still one ULP. That is what `atol = 5e-2` is for, and why the methodology fixes `rtol` and sizes `atol`. Throughput is not recorded: Phase C1 gates numerics only.
+
+---
+
+## AddNorm — tested shapes
+
+`out = LayerNorm(x) · weight + residual`, per row, fused into one kernel call; shapes written `M×N`. The sublayer boundary of the encoder block, over `fused_add_layer_norm_2outs`. **The weight is a runtime memref argument**, not baked into the MLIR as iron does — one compiled ELF serves every weight vector of that shape. The statistics come from `x` alone (post-add form). Full datapath and the one-call-per-tile constraint in [`details/AddNorm_bf16.md`](details/AddNorm_bf16.md).
+
+| (M×N) | herd (hx/hy) | rows_per_call | mean_rel_L1 | abs_err max | mismatches | Used by | Status |
+|---|---|---|---|---|---|---|---|
+| 64×512 | 8/1 | 8 | 1.9e-3 | 3.1e-2 | 0 / 32768 | transformer-layer studies, encoder sublayer boundary (hidden = 512) | ✅ |
+
+> `M = 64` is a **hard cap, not a sample**: the builder requires exactly one kernel call per tile, because two or more trips through the herd loop miscompile (0 of 512 elements outside tolerance at one trip, 491 of 512 at two, at `[8,64]`/`herd_x=1`). The distinguishing feature is three L3→L1 streams per tile against a column's two shim MM2S channels; the two-stream norms and adds beside it loop correctly. The builder raises rather than emitting the broken form. Lifting the cap needs the weight staged through L2, or the residual folded into `x`'s L3 buffer — neither is done yet.
+
+---
+
 ## FlashAttention — tested shapes
 
 Fused scaled-dot-product attention (online-softmax FlashAttention) with grouped-query attention and optional causal masking. **Compute-bound** (two matmuls Q@Kᵀ and P@V), so throughput is GFLOP/s. Kernel = `attn_npu2.o`, driven by the **heads-first** harness `attn_npu2.py`; verified on NPU2 across head dim 64/128, MHA & GQA, short & long sequences, causal & non-causal. (A **seq-first** variant `attn_npu2_seqfirst.py` drives the same `.o` for llama-3.2-1B prefill — bit-identical.) **All rows use the one near-unique full-chip config** `lqp=256, num_q_tiles=4, num_heads_per_unroll=2, num_cascade_stages=4` (FA's tile config is determined by the constraints, not tuned — see detail page). Full datapath, tunables, and reproduce commands in [`details/FlashAttention_bf16.md`](details/FlashAttention_bf16.md).
@@ -231,6 +259,10 @@ Fused scaled-dot-product attention (online-softmax FlashAttention) with grouped-
 | 3145728 (2048×1536) | 8/1/2048 | 364 µs | 51.9 GB/s | 1.9e-3 | ✅ (Qwen2.5-1.5B residual, seq·emb) |
 | 5242880 (2048×2560) | 8/1/2048 | 516 µs | 61.0 GB/s | 1.9e-3 | ✅ (Qwen3-4B residual, seq·emb) |
 | 6291456 (2048×3072) | 8/1/2048 | 614 µs | 61.4 GB/s | 1.9e-3 | ✅ (Llama-3.2-3B residual, seq·emb) |
+| 262144 (512×512, 2-D) | 8/1/512 | — | — | 1.9e-3 | ✅ (transformer-layer studies, encoder residual) |
+| 262144 (512×512, 2-D + causal mask) | 8/1/512 | — | — | 3.2e-3 | ✅ (transformer-layer studies, attention-score masking) |
+
+> The last two rows are the **2-D-in / 2-D-out** variant (`_build_add_2d_to_2d`, the same builder llama's fused `o_ffn` prefill residual uses), reached through `transformer_layer/builders/elementwise_add.py`. Same arithmetic, same 1.9e-3; only the L3 layout differs, and keeping the output 2-D is what lets a downstream launch read it without an `expand_shape`. The **causal-mask** row is that builder with `causal_mask=True` and a torch-precomputed `-10000.0` triangular mask bound as the second operand — there is no device design of its own, which is exactly why it is a builder keyword rather than a sixth operator. Its higher `mean_rel_L1` (3.2e-3) and `abs_err max` (6.4e+1) come from the masked half of the tensor: bf16 spacing at |value| ≈ 10⁴ is 64, so a single ULP there is 6.4e+1, and `np.isclose` passes it on `rtol` (`1.6e-2 · 10⁴ = 160`). The unmasked half is a plain add of the same `randn` scores and carries a plain add's error. `-10000.0` rather than `-inf` because `-inf` in bf16 propagates NaN through the add. Throughput is not recorded for either: Phase C1 gates numerics only.
 
 > `mean_rel_L1 = 1.9e-3` is the lowest in the registry — `c=a+b` rounds each output once (matching `torch.add` bf16: f32 sum, single round, no accumulation), bit-identical across all configs and `N`. Best config `herd_x=8, herd_y=1` for every shape: the 3-DMA-per-tile shim-channel limit caps the herd at one 8-column row (**cannot fill 32 tiles** — `herd_y>1` fails to place), but within that `herd_x` scales near-linearly (9→57.7 GB/s as herd_x 1→8). Highest bandwidth in the registry (pure streaming). See [`details/EltwiseAdd_bf16.md`](details/EltwiseAdd_bf16.md).
 
