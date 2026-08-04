@@ -234,8 +234,14 @@ def submit(xrt, context, runs, steps, submission_index):
 
     Raises:
         RunlistExecutionError: attributed to the first entry that did not
-            complete (rule E1). `pyxrt.runlist` reports one aggregate state, so
-            attribution comes from polling each `xrt.run.state()` afterwards.
+            complete (rule E1).
+
+    Note: `runlist.wait()` succeeding is the only success signal available.
+    A run submitted through a runlist is owned by it, and `xrt.run.state()` on
+    such a run still reports `ERT_CMD_STATE_NEW` after a *successful* wait — the
+    runlist does not write the per-run state back. So the per-run states are read
+    only on the failure path, to say which entry to blame, and never as a
+    post-success check. Treating `NEW` as a failure fails every healthy runlist.
     """
     runlist = xrt.runlist(context)
     for run in runs:
@@ -245,9 +251,8 @@ def submit(xrt, context, runs, steps, submission_index):
     try:
         runlist.execute()
         runlist.wait()
-        elapsed = time.perf_counter() - t0
+        return time.perf_counter() - t0
     except Exception as exc:  # attribute before re-raising
-        elapsed = time.perf_counter() - t0
         idx, state = _first_failed(xrt, runs)
         raise RunlistExecutionError(
             f"runlist submission {submission_index} failed at entry {idx} "
@@ -258,24 +263,16 @@ def submit(xrt, context, runs, steps, submission_index):
             state,
         ) from exc
 
-    idx, state = _first_failed(xrt, runs)
-    if idx is not None:
-        raise RunlistExecutionError(
-            f"runlist submission {submission_index} entry {idx} "
-            f"(kernel {steps[idx].kernel!r}) did not complete: {state}",
-            submission_index,
-            idx,
-            steps[idx],
-            state,
-        )
-    return elapsed
-
 
 def _first_failed(xrt, runs):
-    """(index, state) of the first entry that is not COMPLETED, else (None, None).
+    """(index, state) of the first entry to blame for a failed submission.
 
-    Falls back to entry 0 when `state()` is unavailable, so a failure is always
-    attributable to *some* entry rather than to the sequence as a whole.
+    Only meaningful after `runlist.wait()` has raised. `ERT_CMD_STATE_NEW` means
+    the entry never started, which after a failure points at the first entry that
+    did not run — usually the one after the entry that actually faulted, so both
+    `NEW` and any other non-`COMPLETED` state count. Falls back to entry 0 when
+    `state()` is unavailable, so a failure is always attributable to *some* entry
+    rather than to the sequence as a whole.
     """
     for i, run in enumerate(runs):
         try:
@@ -284,7 +281,7 @@ def _first_failed(xrt, runs):
             return 0, None
         if not _completed(xrt, state):
             return i, state
-    return None, None
+    return 0, None
 
 
 @dataclass
