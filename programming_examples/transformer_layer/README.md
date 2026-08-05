@@ -104,8 +104,9 @@ memory bank) all produce plausible wrong numbers rather than errors.
 | `pattern/test_reference.py` | Host-only: that the golden model is the layer it claims to be |
 | `run_npu2_<op>_peano.lit` | One per operator: that operator's numerical gate on a real NPU |
 | `run_npu2_fault_control_peano.lit` | Phase C's negative control: the injected run must FAIL |
-| `run_npu2_block_peano.lit` | Phase D2's gate: the whole layer on a real NPU, every boundary checked |
+| `run_npu2_block_peano.lit` | Phase D2's gate: the whole layer on a real NPU, every boundary checked, then the same layer under injection which must FAIL |
 | `run_block_cache_tests.lit` | Phase D2's host-only cache-reuse tests. No NPU, no XRT |
+| `run_reference_tests.lit` | Phase D2's host-only golden-model checks: the composition, and the three substitutions no tolerance would catch. No NPU, no XRT |
 | `sweep/sweep_families.py` | Which shapes the case matrix needs, and which tilings are worth trying for each |
 | `sweep/sweep_measure.py` | One candidate end to end — build, numerical check, timing. The process the sweep forks |
 | `sweep/registry_writer.py` | The append-only write into the registry JSON and both markdown pages |

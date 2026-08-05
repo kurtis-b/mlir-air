@@ -1,0 +1,52 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase D2 golden model: host-only checks that it is the layer it claims to be.
+//
+// pattern/reference.py computes each boundary by calling the same operator
+// oracle opcheck.py validated that operator against on hardware. That removes
+// one failure mode -- two implementations of the same arithmetic drifting apart
+// -- and introduces another: nothing in a composition says the operators were
+// composed in the right ORDER, with the right tensor in each slot. A layer wired
+// with the post-add addnorm, with q and k swapped in the fused weight, or with
+// the erf GeLU is a well-typed composition of individually validated pieces that
+// is not this layer.
+//
+// Which is why these run in the suite and not only under a Make target. The
+// hardware half of D2, run_npu2_block_peano.lit, can only show that the device
+// agrees with the oracle; being compared against a wrong oracle is a way for it
+// to pass. Nothing in it can pin the oracle. This is the other half, and it
+// costs two seconds and no device.
+//
+// The activation check is the one to read first, because it is the substitution
+// this port was most likely to make AND the one no numerical gate would report.
+// iron's reference calls torch's erf GeLU; the device kernel is the tanh
+// approximation. Swapping them moves the ffn_gelu boundary by 4.7e-4 and the
+// layer output by 6.1e-4, against a smallest-anywhere tolerance of 1e-3 in the
+// hardware gate. It is pinned below by identity against gelu_tanh_reference,
+// not by tolerance, for exactly that reason.
+//
+// No NPU, no XRT and no MLIR: numpy and torch on the host, so this sits beside
+// the Phase B seam tests and the block cache tests and requires neither
+// `ryzen_ai_npu2` nor `peano`.
+//
+// The test file carries no framework dependency -- pytest is not installed in
+// the sandbox venv -- so it runs as a plain script and prints a pass count. The
+// three substitution checks are named individually and the total is matched
+// exactly, so a test that stops being collected fails here instead of passing
+// quietly.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming
+// one in prose -- even inside a comment -- registers as a second directive and
+// leaves the test UNRESOLVED. Describe them, never spell them out.
+//
+// RUN: python3 %S/pattern/test_reference.py | FileCheck %s
+//
+// The composition is iron's encoder_bert, transcribed straight through in torch
+// with no reference to the golden model's internals, then the three
+// substitutions that would survive that comparison because they are small.
+// CHECK: PASS  test_composition_matches_a_straight_line_transcription
+// CHECK: PASS  test_the_fused_qkv_weight_is_in_q_k_v_column_order
+// CHECK: PASS  test_the_gelu_is_the_tanh_approximation
+// CHECK: PASS  test_the_residual_ordering_is_pre_add
+// CHECK: reference tests: 7/7 passed

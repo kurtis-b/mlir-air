@@ -12,6 +12,11 @@
 // workload variants) computed in FP32 from bf16-rounded inputs rather than in
 // iron's bf16 throughout.
 //
+// Two recipes, not one: the clean layer, then the same layer with one weight
+// perturbed, which must be REJECTED. See the negative control's own section
+// below the clean checks for what it injects into and why that target was
+// measured rather than chosen.
+//
 // Every operator here already passed at this width in Phase D1, so a failure
 // is an INTEGRATION failure: an argument map, a layout transition, an
 // external-kernel collision across a multi-operator sequence, or BO reuse under
@@ -31,8 +36,9 @@
 // the other side of that: swapping the device's tanh GeLU for the erf form
 // moves the ffn_gelu boundary by 4.7e-4 absolute and the layer output by
 // 6.1e-4, so NO tolerance in this example would see it. That oracle is pinned
-// by identity in the host-only tests instead. Ten boundary numbers localize a
-// defect the end-to-end number only reports; neither pins a wrong reference.
+// by identity in run_reference_tests.lit, which is in this same suite and needs
+// no hardware. Ten boundary numbers localize a defect the end-to-end number
+// only reports; neither pins a wrong reference.
 //
 // NPU serialization lives one layer down, not in the recipe below. Device
 // access is locked on /tmp/npu.lock, which KernelCache.ensure_loaded holds
@@ -96,3 +102,63 @@
 // passing quietly.
 // CHECK: PASS!
 // CHECK: [opcheck] block [4096x768_encoder_bert]: PASS
+//
+// THE NEGATIVE CONTROL, AND WHY IT IS IN THIS FILE
+// Everything above is a positive result, and a positive result from a check
+// that cannot fail is worth nothing. The recipe below runs the same layer again
+// with one element of ln1_weight perturbed AFTER the golden model was computed
+// from the clean value, and requires the comparison to reject it. A block check
+// that ignored the injection flag, a reference compared against itself, and a
+// tolerance wide enough to swallow a perturbed weight all still report PASS
+// above; all three fail here. opcheck.py's expect-failure mode reports the
+// control's own verdict rather than inverting an exit status, so a missing
+// toolchain, a kernel that fails to link, or an NPU that never came up cannot
+// print a passing control -- none of those compared anything.
+//
+// It shares this file, and therefore this working directory, because the four
+// ELFs are cached under it by FINGERPRINT over the built MLIR, the resolved
+// registry specs, the device kernel sources and the backend kwargs
+// (builders/block_cache.py). Compilation depends on the shape and not on the
+// data, so the injected run reuses all four and costs one dispatch instead of a
+// second compile of the whole layer. A separate test file would get a separate
+// working directory and pay four ELFs to perturb one weight.
+//
+// WHY ln1_weight AND NOT AN ATTENTION WEIGHT
+// Measured, not assumed. At the golden model's val_range 0.05 the attention
+// scores land around 5e-3, so the softmax is nearly uniform and attn_out comes
+// out around 1e-3 against a residual x around 5e-2 -- the attention half
+// contributes a few percent of what the first LayerNorm sees. Perturbing w_o or
+// the fused QKV weight therefore moves the output by 3.1e-2 and puts ZERO
+// elements outside the band: a control injected there would PASS under
+// injection and prove nothing. ln1_weight scales one column of `hidden`, which
+// is BOTH the FFN's input and the second addnorm's residual, so it reaches 9%
+// of the output through two independent paths. The full table over every
+// candidate input is in the block section of opcheck_specs.py.
+//
+// RUN: make -f %S/Makefile check-block-fault PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s --check-prefix=FAULT
+//
+// The injected element first, so an injection that silently perturbed nothing
+// is visible here rather than being read backwards from the verdict. Index 3 is
+// ln1_weight in BLOCK_INPUT_NAMES, and it is a vector, hence the one-element
+// position.
+// FAULT: [fault-inject] input 3 at (0,)
+//
+// Then the stage list under injection, which is the part an end-to-end verdict
+// cannot give. Nothing upstream of the first addnorm reads ln1_weight, so q, k,
+// v, attn_context and attn_out must still be exact while `hidden` and
+// everything after it must move -- and that split is what says the stage
+// comparisons are reading THIS run's device buffers rather than replaying the
+// clean run's. A stage list computed from the reference, or from stale pool
+// memory, comes back 10/10 clean right here.
+// FAULT: [stage] q {{.*}} mismatch       0
+// FAULT: [stage] attn_out {{.*}} mismatch       0
+// FAULT: [stage] hidden {{.*}} mismatch {{[1-9][0-9]*}}
+// FAULT: [block] stages: 5/10 clean
+//
+// And the verdict in the three forms opcheck.py reports it: the comparison's
+// own, the control's reading of it, and the exit-status summary. The middle
+// line is the one that distinguishes "the run failed" from "the comparison
+// rejected the run", and the last is what the recipe's status comes from.
+// FAULT: [opcheck] block [4096x768_encoder_bert]: FAIL
+// FAULT: [opcheck] block [4096x768_encoder_bert]: fault-inject input -> FAIL (as required)
+// FAULT: NEGATIVE CONTROL: PASS
