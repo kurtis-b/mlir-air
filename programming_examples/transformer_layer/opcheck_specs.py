@@ -622,16 +622,18 @@ SPECS = [
     },
     {
         # PHASE E4: the same layer, measured as the `runlist` execution
-        # strategy — the fine-grained point of the taxonomy. Thirteen
-        # single-operator entries over two runlists (q/k/v; then output_proj,
-        # residual add, LayerNorm, gamma multiply, up_proj, GeLU, down_proj,
-        # residual add, LayerNorm, gamma multiply), host torch attention
-        # between them through the SAME blocked implementation offload uses.
-        # The driver-summed vector is 2 submissions over 13 entries — BELOW
-        # coarse's 131, because 128 of coarse's entries are addnorm's row
-        # blocking while every operator this mode decomposes to streams its
-        # rows in one launch. pattern/runlist/README.md records why that is
-        # the honest number and what it means for the entries-order clause.
+        # strategy — the fine-grained point of the taxonomy. coarse's
+        # dispatch schedule held fixed and every unit refined into
+        # single-operator kernels: q/k/v; host torch attention through the
+        # SAME blocked implementation offload uses; output_proj; each
+        # normalization point as 64 bands of add + LayerNorm + gamma multiply
+        # at coarse's own row granularity (builders.block.norm_rows,
+        # imported); up_proj, GeLU, down_proj. The driver-summed vector is 5
+        # submissions over 391 entries — above coarse's 131 BY CONSTRUCTION,
+        # since every coarse unit maps onto one or more finer entries, which
+        # is the ordinal clause this mode owns. pattern/runlist/README.md
+        # records the refinement, its measured restage cost, and why the
+        # first structure tried (13 streaming entries) was rejected.
         "operator": "runlist",
         "shape_key": "4096x768_encoder_bert",
         "shape": {

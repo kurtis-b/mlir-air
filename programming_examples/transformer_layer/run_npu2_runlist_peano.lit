@@ -5,16 +5,19 @@
 // execution-strategy taxonomy.
 //
 // Same golden model and same per-boundary comparisons as the block, coarse and
-// offload gates, behind a different execution boundary: thirteen
-// single-operator entries over two runlists -- q/k/v projections; host torch
-// blocked attention (the implementation offload shares, unchanged); then
-// output_proj, residual add, LayerNorm, gamma multiply, up_proj, GeLU,
-// down_proj, residual add, LayerNorm, gamma multiply -- each runlist forced to
-// one submission. Intermediates inside a runlist stay device-resident. No GEMM
-// ELF executes twice: the four projections are one module compiled to four
-// artifacts, because re-execution in one hw_context corrupts INSIDE a single
-// runlist exactly as it does across submissions (pattern/runlist/README.md has
-// the measurement).
+// offload gates, behind a different execution boundary: coarse's dispatch
+// schedule held fixed and every one of its dispatch units refined into
+// single-operator kernels, 391 entries over five runlists -- q/k/v
+// projections; host torch blocked attention (the implementation offload
+// shares, unchanged); the output projection; each normalization point as 64
+// bands of residual add, LayerNorm and gamma multiply at coarse's own 64-row
+// granularity (builders.block.norm_rows, imported); and up_proj, GeLU,
+// down_proj -- each runlist forced to one submission. Intermediates inside a
+// runlist stay device-resident. No GEMM ELF executes twice: the four
+// projections are one module compiled to four artifacts, because re-execution
+// in one hw_context corrupts INSIDE a single runlist exactly as it does
+// across submissions; the band add/ln/mul ELFs re-execute 128 times each and
+// that is measured clean (pattern/runlist/README.md has both measurements).
 //
 // Two recipes in one file, deliberately: they share a working directory and
 // therefore the ELF cache, so the injected run reuses the ten ELFs the clean
@@ -38,12 +41,13 @@
 // RUN: make -f %S/Makefile check-runlist PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
 //
 // The configuration first -- the forced gate configuration, each GEMM resolved
-// through the registry, and the mode's own statement of its decomposition and
-// its host attention boundary. A registry change that moved a method fails
-// here with its cause on screen.
-// CHECK: runlist 4096x768 ffn 3072 12h x 64 (encoder_bert, non-causal, 13 fine-grained entries over 2 runlists, attention in host torch)
+// through the registry, the mode's own statement of its decomposition, its
+// host attention boundary, and the band granularity imported from coarse. A
+// registry change that moved a method fails here with its cause on screen.
+// CHECK: runlist 4096x768 ffn 3072 12h x 64 (encoder_bert, non-causal, 391 fine-grained entries over 5 runlists, attention in host torch)
 // CHECK: proj 4096x768x768 drain (registry), up 4096x768x3072 drain (registry), down 4096x3072x768 fused-cast (registry)
 // CHECK: attention host torch fp32, query block 4096 x1 block(s)
+// CHECK: norm chains banded at 64 rows x64
 //
 // Every boundary, in execution order, each with zero mismatching elements.
 // Named individually rather than counted, so a stage list that dropped or
@@ -61,26 +65,27 @@
 // CHECK: [stage] output {{.*}} mismatch       0
 // CHECK: [runlist] stages: 10/10 clean
 //
-// The mode's own instrumentation: one DispatchVector row per runlist. Two --
-// a wrapper that split a runlist per operator (offload's shape), or stopped
+// The mode's own instrumentation: one DispatchVector row per runlist. Five --
+// a wrapper that merged the norm chains into their neighbours, or stopped
 // recording per-sequence rows, fails here before the driver's totals
 // comparison sees it.
-// CHECK: [runlist] recorded 2 dispatch vectors
+// CHECK: [runlist] recorded 5 dispatch vectors
 //
 // The vectors' CONTENTS, not only their count: the six driver-summed totals.
-// Two submissions over thirteen entries is the mode's decomposition made
-// checkable. Air is 11 (one launch per drain ELF -- q/k/v in runlist 1, then
-// o/add/ln/mul/up/gelu in runlist 2 -- plus two for the fused-cast down
-// projection, each ELF counted once per sequence it appears in); herd counts
-// accumulate per entry; sync is 21 (runlist 1: x + three weights up, q/k/v
-// back; runlist 2: ctx, x, five statics and the down projection's f32 scratch
-// up, six declared boundaries back); and the bytes are those twenty-one
-// transfers exactly. The totals line prints only after every row passes the
-// as_row() schema validation, so a malformed row aborts the run and a run
-// whose totals drift fails right here. NOTE the 13 entries land BELOW
-// coarse's 131 -- the honest fine-grained count, measured, with the finding
-// recorded in pattern/runlist/README.md.
-// CHECK: [runlist] dispatch totals: submissions 2 entries 13 air 11 herd 26 sync 21 bytes 152567808
+// Five submissions over 391 entries is the refinement made checkable --
+// 3 + 1 + 192 + 3 + 192, every coarse dispatch unit mapped onto one or more
+// single-operator entries, which is why the total strictly exceeds coarse's
+// 131. Air is 14: one launch per drain ELF (q/k/v; o; up) plus two for the
+// fused-cast down projection, one per band ELF per chain it appears in
+// (add/ln/mul in runlists 3 and 5), and one for gelu. Herd counts accumulate
+// per entry -- 384 of the 404 are the two chains' band launches. Sync and
+// bytes carry the banding's restage cost: 403 boundaries and ~165 MB against
+// the streaming structure's 21 and ~153 MB, the measured price of holding
+// coarse's schedule (and still under coarse's 202,902,528 bytes). The totals
+// line prints only after every row passes the as_row() schema validation, so
+// a malformed row aborts the run and a run whose totals drift fails right
+// here.
+// CHECK: [runlist] dispatch totals: submissions 5 entries 391 air 14 herd 404 sync 403 bytes 165347328
 //
 // Then the layer output itself over all 4096 x 768 elements, and the label
 // naming the MODE's operator.
@@ -105,9 +110,9 @@
 // attention half must still be exact while `hidden` and everything after it
 // moves -- which is what says the stage comparisons are reading THIS run's
 // buffers rather than replaying the clean run's. In this mode the perturbed
-// weight reaches the device as a re-materialized static broadcast, so a
-// content-keyed cache that failed to re-upload it would show up here as a
-// clean `hidden`.
+// weight reaches the device as a re-materialized static band broadcast shared
+// by all 64 multiplies, so a content-keyed cache that failed to re-upload it
+// would show up here as a clean `hidden`.
 // FAULT: [stage] q {{.*}} mismatch       0
 // FAULT: [stage] attn_out {{.*}} mismatch       0
 // FAULT: [stage] hidden {{.*}} mismatch {{[1-9][0-9]*}}
@@ -117,8 +122,8 @@
 // the clean run totals: the six literals below are the same six the clean
 // half pins above, which is the suite's own statement of the equality the
 // driver re-derives from the two artifacts.
-// FAULT: [runlist] recorded 2 dispatch vectors
-// FAULT: [runlist] dispatch totals: submissions 2 entries 13 air 11 herd 26 sync 21 bytes 152567808
+// FAULT: [runlist] recorded 5 dispatch vectors
+// FAULT: [runlist] dispatch totals: submissions 5 entries 391 air 14 herd 404 sync 403 bytes 165347328
 //
 // And the verdict in the three forms opcheck.py reports it: the comparison's
 // own, the control's reading of it, and the exit-status summary.

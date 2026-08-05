@@ -1,39 +1,70 @@
 # `runlist` — the fine-grained point of the execution-strategy taxonomy
 
-The D2 `encoder_bert` layer decomposed into single-operator kernels, aggregated
-into runlists: iron's `pattern/runlist` re-expressed over `KernelCache` and the
-Phase B dispatch model. `prepare_runlist` is the mode's entry in the `SPECS`
-catalogue; `make check-runlist` / `check-runlist-fault` run it.
+The D2 `encoder_bert` layer with `coarse`'s dispatch schedule held fixed and
+every one of its dispatch units refined into single-operator kernels,
+aggregated into runlists: iron's `pattern/runlist` re-expressed over
+`KernelCache` and the Phase B dispatch model. `prepare_runlist` is the mode's
+entry in the `SPECS` catalogue; `make check-runlist` / `check-runlist-fault`
+run it.
 
-## The decomposition, and where each piece comes from
+## The decomposition: a strict refinement of `coarse`'s schedule
 
-Thirteen entries over two runlists, each entry one operator kernel:
+391 entries over five runlists, each entry one operator kernel. The left
+column is `coarse`'s measured dispatch schedule (4 submissions, 131 entries);
+the right is this mode, every unit split into its constituent operators **at
+the same granularity**:
 
-| # | entry | kernel | ELF |
+| `coarse`'s unit | entries | this mode's refinement | entries |
 |---|---|---|---|
-| 1 | q_proj | registry GEMM 4096x768x768 | `rl_gemm_q_proj_4096x768x768` |
-| 2 | k_proj | same module, OWN ELF (see below) | `rl_gemm_k_proj_4096x768x768` |
-| 3 | v_proj | same module, OWN ELF | `rl_gemm_v_proj_4096x768x768` |
-| — | attention | **host torch** (`pattern/blocked_attention.py`, shared with `offload`) | — |
-| 4 | output_proj | same module, OWN ELF | `rl_gemm_o_proj_4096x768x768` |
-| 5 | residual add | `builders/elementwise_add.py` | `rl_add_4096x768` |
-| 6 | LayerNorm | `builders/layer_norm.py` (unweighted) | `rl_ln_4096x768` |
-| 7 | gamma multiply | `builders/elementwise_mul.py` | `rl_mul_4096x768` |
-| 8 | up_proj | registry GEMM 4096x768x3072 | `rl_gemm_up_4096x768x3072` |
-| 9 | GeLU | `builders/gelu.py` | `rl_gelu_4096x3072` |
-| 10 | down_proj | registry GEMM 4096x3072x768 | `rl_gemm_down_4096x3072x768` |
-| 11 | residual add | same ELF as 5 | `rl_add_4096x768` |
-| 12 | LayerNorm | same ELF as 6 | `rl_ln_4096x768` |
-| 13 | gamma multiply | same ELF as 7 | `rl_mul_4096x768` |
+| `qkv_proj` (fused GEMM) | 1 | runlist 1: `q_proj`, `k_proj`, `v_proj` (registry GEMM 4096x768x768, one module compiled to three OWN ELFs — see footguns) | 3 |
+| `mha_out_proj` (fused) | 1 | **host torch** blocked attention (`pattern/blocked_attention.py`, shared with `offload`), then runlist 2: `output_proj` (OWN ELF of the same proj module) | 1 |
+| 64 × `addnorm` ln1 (pre-add, row-banded) | 64 | runlist 3: 64 × (residual add → LayerNorm → gamma multiply), `builders/elementwise_add.py` + `layer_norm.py` + `elementwise_mul.py` at `[64, 768]` | 192 |
+| `ffn` (fused up+gelu+down) | 1 | runlist 4: `up_proj` (4096x768x3072), GeLU (`builders/gelu.py`), `down_proj` (4096x3072x768) | 3 |
+| 64 × `addnorm` ln2 (pre-add, row-banded) | 64 | runlist 5: 64 × (residual add → LayerNorm → gamma multiply) | 192 |
 
-Intermediates between entries in one runlist stay device-resident: `attn_out`
-feeds the residual add without touching the host, `hidden` feeds both the
-up-projection and the second residual add. That cross-artifact chaining under
-the Phase B allocator is what the mode measures.
+Every coarse dispatch unit maps onto one or more finer units, so
+`runlist_entries > coarse` — the one ordinal clause this mode owns — holds
+**by construction**: 391 against 131. The band size is IMPORTED from
+`builders.block.norm_rows` (the L1 cap `coarse`'s fused `addnorm` measured:
+64 rows at width 768), never re-derived or tuned here, so the two modes share
+one schedule as a matter of code rather than coincidence.
 
-iron's encoder runlist is 16 entries at this sequence length. The three missing
-here are its on-device attention interior — `k_transpose`, `attn_scores`,
-`attn_scale`/`attn_softmax`/`attn_output` — see the next section.
+Intermediates inside a runlist stay device-resident: q/k/v never touch the
+host before the attention readback, each band's residual sum feeds its
+LayerNorm and gamma multiply on device, and `ffn_up`/`ffn_gelu` chain into
+the down projection. That cross-artifact chaining under the Phase B allocator
+is what the mode measures; the five submission seams are the same whole-BO
+restage seams `coarse`'s four are, plus one more for host attention (below).
+
+## Why the norm chains are banded when the decomposed kernels could stream
+
+The decomposed `add`/`ln`/`mul` kernels have no L1 cap forcing 64-row
+dispatches — each can walk all 4096 rows in one launch, and the first
+structure this mode tried did exactly that: 13 entries over two runlists.
+That landed BELOW `coarse`'s 131 and failed the ordinal clause, and the
+failure was diagnostic, not incidental: the streaming structure changed TWO
+variables at once — operator granularity AND the dispatch schedule — and at
+the normalization points it was 64× *coarser*-grained than `coarse` itself
+(one streaming launch where `coarse` dispatches 64 bands), so its entry count
+measured the schedule change, not the decomposition. A "fine-grained" mode
+whose dispatch units are the largest the kernels allow is not a point on the
+granularity axis the taxonomy orders.
+
+Holding the schedule at `coarse`'s own and splitting each fused `addnorm`
+band call into its three constituent operators makes the comparison
+controlled: the two modes differ in exactly one variable, operator
+granularity, and the entry count measures it. The measured cost of that
+control is carried in the vector (next section) rather than hidden: banding
+restages the norm-chain operands through the host, so sync boundaries rise
+from the streaming structure's 21 to 403 and bytes from ~153 MB to ~165 MB —
+still below `coarse`'s 402-sync/203-MB shape on bytes, one above it on sync.
+
+iron's encoder runlist is 16 entries at this sequence length; the three
+missing here are its on-device attention interior — `k_transpose`,
+`attn_scores`, `attn_scale`/`attn_softmax`/`attn_output` — see the next
+section. Its count is not carried across for the same reason `coarse`'s 131
+is not iron's 12: entry counts are re-derived at `baseline_768` under this
+hardware's dispatch caps (08d §Do not carry iron's entry count across).
 
 ## Why attention is host torch, and what that removes
 
@@ -42,87 +73,46 @@ The two attention GEMMs are `4096 x 64 x 4096` and `4096 x 4096 x 64`; no
 cannot stage one (08c has the derivation). So attention runs on the host
 through `blocked_attention` — the SAME implementation and query blocking
 `offload` uses (08d work item 4), making the two modes' attention boundaries
-identical by construction.
+identical by construction. This is the one submission seam a whole-BO
+argument does not explain, and it is why "one runlist" — the mode's premise
+when attention is on device, as it is in iron's 29-kernel decomposition — is
+not reachable on this hardware: a host stage between the projections and the
+output projection forces at least two submissions before banding adds its
+restage seams.
 
 That decision removes iron's attention-interior entries, including
 `k_transpose`. A device transpose whose only consumer is a host `torch`
 matmul that re-layouts its operands anyway would add an entry while measuring
-nothing, so it is not dispatched; the `transpose` operator (new in this phase,
-`builders/transpose.py`) is validated standalone through `opcheck.py` instead,
-ready for any future mode whose scores GEMM is on device.
+nothing, so it is not dispatched; the `transpose` operator (new in this
+phase, `builders/transpose.py`) is validated standalone through `opcheck.py`
+instead, ready for any future mode whose scores GEMM is on device.
 
-## The measured dispatch vector, and the finding it carries
+## The measured dispatch vector
 
 Driver-summed totals for one layer (clean and fault-injected runs identical;
 the six literals are pinned in `run_npu2_runlist_peano.lit`, both halves):
 
 ```
-host submissions   2      runlist entries   13     air launches     11
-herd launches     26      sync boundaries   21     bytes    152,567,808
+host submissions   5      runlist entries  391     air launches     14
+herd launches    404      sync boundaries  403     bytes    165,347,328
 ```
+
+Against `coarse`'s 4 / 131 / 12 / 146 / 402 / 202,902,528: more entries (the
+ordinal clause, by construction), more submissions (the attention seam plus
+the banding restages), 2.8× the herd launches (384 of the 404 are the two
+chains' band launches), one more sync boundary, and fewer bytes — the
+streaming q/k/v/attention path is leaner than `coarse`'s fused mha even with
+the norm chains restaged, and the gamma broadcasts shrink from `[4096, 768]`
+to one shared `[64, 768]` band per norm point.
 
 All ten stage boundaries clean; layer output mean_rel_L1 1.755e-2 at
 atol_required 7.011e-2 — a 1.43x margin under the 1e-1 ceiling, between
 `offload`'s 1.82x (host norms) and the block's 1.35x (device fused norms),
-which is where device norms + host f32 attention should land.
-
-**13 entries lands BELOW `coarse`'s 131**, and that is the honest number, not
-an under-decomposition: this mode dispatches ten distinct operator kernels
-where `coarse` dispatches five. `coarse`'s count is dominated by one
-operator's hardware cap — 128 of its 131 entries are `addnorm`'s row blocking
-(one kernel call per tile, ≤64 rows per dispatch at width 768) — while every
-operator this mode decomposes to (`elementwise_add`, `layer_norm`,
-`elementwise_mul`, `gelu`) streams all 4096 rows inside a single launch, so
-each normalization point is 3 entries here against 64 there.
-
-08d anticipates exactly this outcome and prescribes reporting the number
-rather than inflating the decomposition (row-blocking operators that stream,
-or splitting GEMMs). The consequence is that the driver's
-`runlist_entries > coarse` ordinal clause — the one E4 owns — FAILS on this
-hardware: `runlist_entries` does not order the taxonomy's fine-vs-coarse axis
-at `baseline_768`, because it measures dispatch-cap artifacts, not
-granularity. Per 08 §Gate that is a finding about the measurement model, to
-be resolved before Phase F consumes these numbers (a field that does order
-the axis here: distinct operator kernels per layer — 10 vs 5 — or entries
-net of row-blocking).
-
-The number stands on more than the first decomposition tried. Every
-restructuring that would raise it was checked, and each is excluded by a
-measured constraint rather than by preference:
-
-- **Row-banding the streaming operators to `coarse`'s 64-row granularity.**
-  A dispatch argument is a whole BO — `run.set_arg` takes a buffer, never a
-  buffer and an offset (`builders/block.py` §WHY THE LAYER IS FOUR DISPATCH
-  SEQUENCES) — so bands must be cut and re-concatenated on the HOST at every
-  GEMM boundary, and each cut is a new submission. Banding `add`/`ln`/`mul`/
-  `gelu` uniformly makes 7 submissions and ~450 entries; 7 submissions
-  breaks the E5 ordering clause that `offload`'s 6 exceed every other
-  mode's. Variants that stay under 6 exist (band the norm chains, stream
-  `gelu`: 5 submissions, ~390 entries) but their per-operator granularity is
-  chosen FROM the inequalities, which is the "mode tuned until an inequality
-  holds" the Phase E gate text forbids — and every banded variant trades the
-  device-resident chaining this mode exists to measure for restage traffic,
-  raising its sync and byte counts above `coarse`'s. Fine-grained by entry
-  count, more host-mediated than the coarse mode by every other field, is
-  not a point on the taxonomy's axis.
-- **Banding the GEMMs.** A runtime-tiled GEMM ELF corrupts from its second
-  execution in one `hw_context` (measured, first footgun below), so 64 bands
-  across the six GEMM positions would need ~384 distinct ELFs against the
-  32-context ceiling.
-- **Dispatching iron's attention interior on device** (`k_transpose`,
-  scale, softmax). The two attention GEMMs resolve in no registry and the
-  sweep cannot stage them (previous section), so their neighbours' operands
-  stay host-side either way, and each device entry between them ships the
-  ~400 MB bf16 score tensor across the host boundary in both directions.
-  The reachable count tops out near iron's 16 — still nowhere near 131, at
-  a multiple of the transfer cost.
-
-So no faithful decomposition of this layer on this hardware exceeds
-`coarse`'s count: 128 of those 131 entries come from `addnorm`'s
-three-input-stream L1 cap (one kernel call per tile), a constraint none of
-the two-stream operators this mode decomposes to shares. The 08d premise
-that "several" of the decomposed operators would row-block the same way is
-what the measurement refutes.
+which is where device norms + host f32 attention should land. The banded
+chains produce bit-identical boundary tensors to the streaming structure
+(row-wise and element-wise operators do not see the banding), so these
+figures match the first structure's exactly — the restructuring moved
+dispatch structure, not arithmetic.
 
 ## Footguns (each cost time; read before editing)
 
@@ -136,30 +126,36 @@ what the measurement refutes.
   artifact share its `hw_context` by construction. So the four projections
   are ONE module compiled to FOUR artifacts (`rl_gemm_{q,k,v,o}_proj_…`),
   each with its own context, and no GEMM ELF ever executes twice. Four
-  compiles of one module per clean cache is the cost of thirteen entries
-  over two submissions; do not "deduplicate" them back.
-- **The `add`/`ln`/`mul` ELFs execute twice inside runlist 2, and that is
-  measured clean.** No runtime loop tiling, same class as the block's 64-fold
-  re-executed `addnorm` ELF — and in the corrupted bring-up run their second
-  executions still produced stage errors at the expected levels, so the
-  GEMM-class failure does not extend to them.
-- **The gamma multiply's second operand is a materialized broadcast.**
-  `elementwise_mul` takes two full `[4096, 768]` tensors (its docstring
-  records why there is no broadcast form), so each LayerNorm weight is tiled
-  to 6 MB on the host (`broadcast_row_weight`) and declared static +
-  content-keyed — uploaded once, like iron's materialized causal mask. Under
-  fault injection the content key changes and the perturbed weight is
-  re-uploaded; nothing special-cases the injected path.
+  compiles of one module per clean cache is the cost; do not "deduplicate"
+  them back.
+- **The band `add`/`ln`/`mul` ELFs execute 64 times per chain and 128 times
+  per layer in one context each, and that is measured clean.** No runtime
+  loop tiling, same class as the block's 64-fold re-executed `addnorm` ELF —
+  every stage boundary downstream of them is exact at the same tolerances the
+  streaming structure met. The GEMM-class failure does not extend to them.
+- **The gamma multiply's second operand is a materialized broadcast, shared
+  across bands.** `elementwise_mul` takes two full `[64, 768]` tensors (its
+  docstring records why there is no broadcast form), so each LayerNorm weight
+  is tiled to ONE `[64, 768]` band on the host (`broadcast_row_weight`) and
+  declared static + content-keyed — every band multiplies by the same rows,
+  so one 96 KB buffer serves all 64 multiplies, where the streaming structure
+  materialized 6 MB per norm point. Under fault injection the content key
+  changes and the perturbed weight is re-uploaded; nothing special-cases the
+  injected path.
+- **Band inputs are contiguous copies, never views.** A `BufferSpec` is sized
+  from the array and the host write reads it flat, so a non-contiguous slice
+  would upload the wrong bytes without complaining — the same rule
+  `builders/block.py::_sequence_norm` records.
 - **`hw_context` demand is 10 concurrent, measured against a ceiling of 32.**
-  By the time runlist 2 executes, the three projection contexts from runlist 1
-  are still loaded and seven more join them (o_proj, up, down, add, ln, mul,
-  gelu): ten DISTINCT designs resident simultaneously, demonstrated by the
-  mode running rather than by a synthetic probe. The 32 ceiling was probed
+  By the time runlist 5 executes, the three projection contexts from runlist 1
+  are still loaded and seven more have joined them (o_proj, add, ln, mul, up,
+  gelu, down): ten DISTINCT designs resident simultaneously, demonstrated by
+  the mode running rather than by a synthetic probe. The 32 ceiling was probed
   with 4 cycled ELFs (08 §Risks), so this is also the first data point with
   ten distinct designs — comfortably inside, and the margin no longer rests
   on the cycled-ELF assumption alone. iron's 29-context appetite does not
-  arise here because attention is host and the streaming operators share
-  ELFs across their two entries.
+  arise here because attention is host and the band operators share their
+  ELFs across all 128 band entries.
 - **`RUNLIST_CACHE_DIR` is this mode's own**, in `transformer_layer/.gitignore`
   and the Makefile `clean` target. Modes never share a cache directory:
   `KernelCache` picks it by name, and two modes pointed at one can trade

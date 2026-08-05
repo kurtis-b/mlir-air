@@ -1,55 +1,50 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""``runlist`` — the layer decomposed into small operators over two runlists.
+"""``runlist`` — the layer decomposed into single-operator entries over five runlists.
 
 CONTRACT
     ``prepare_runlist(shape, seed=...)`` is this mode's entry in the ``SPECS``
     catalogue: the D2 layer prepared for ``opcheck.py``'s ``dispatch`` seam.
-    The layer is decomposed into THIRTEEN single-operator dispatch steps over
-    two ``KernelCache.run_sequence`` calls, each forced to one runlist with
+    The mode holds ``coarse``'s dispatch schedule FIXED and refines every one
+    of its dispatch units into single-operator kernels, each
+    ``KernelCache.run_sequence`` call forced to one runlist with
     ``require_single_submission=True``::
 
-        runlist 1 (3 entries)   q_proj  k_proj  v_proj
-        -- host --              blocked attention (shared with offload)
-        runlist 2 (10 entries)  output_proj  add  layer_norm  mul(gamma)
-                                up_proj  gelu  down_proj  add  layer_norm
-                                mul(gamma)
+        coarse's unit                        this mode's refinement
+        ------------------------------       --------------------------------
+        qkv_proj (fused)              ->     runlist 1: q_proj  k_proj  v_proj
+        mha_out_proj (fused)          ->     host blocked attention (shared
+                                             with offload), then
+                                             runlist 2: output_proj
+        64 x addnorm ln1 (pre-add)    ->     runlist 3: 64 x (add  ln  mul)
+        ffn (fused up+gelu+down)      ->     runlist 4: up_proj  gelu  down_proj
+        64 x addnorm ln2 (pre-add)    ->     runlist 5: 64 x (add  ln  mul)
 
-    Two recorded ``DispatchVector`` rows; the driver-summed totals are 2
-    submissions over 13 runlist entries. Intermediates between device steps
-    inside a runlist stay DEVICE-RESIDENT (``attn_out`` feeds the residual add
-    without touching the host; ``hidden`` feeds both the up-projection and the
-    second residual add) — that chaining is what this mode exists to measure.
+    Five recorded ``DispatchVector`` rows; the driver-summed totals are 5
+    submissions over ``7 + 6 * norm_blocks`` runlist entries — 391 at the gate
+    configuration, against ``coarse``'s 131. Every coarse dispatch unit maps
+    onto one or more finer units, so ``runlist_entries > coarse`` holds BY
+    CONSTRUCTION, which is what the mode's ordinal claim ("the fine-grained
+    point of the taxonomy") means. Intermediates inside a runlist stay
+    DEVICE-RESIDENT: q/k/v never touch the host before attention reads them
+    back, each band's residual sum feeds its LayerNorm and gamma multiply on
+    device, and ``ffn_up``/``ffn_gelu`` chain into the down projection.
 
-WHY TWO RUNLISTS AND NOT ONE
-    Attention. Its two GEMMs (``4096 x 64 x 4096`` and ``4096 x 4096 x 64``)
-    resolve in no registry and cannot be swept (08c has the derivation), so
-    attention is host torch through ``pattern/blocked_attention.py`` — the SAME
-    implementation and query blocking ``offload`` uses, per 08d work item 4.
-    Everything before it and everything after it is one runlist each; the host
-    boundary in the middle is a measurement, not a shortcut, and it is why
-    iron's ``k_transpose`` entry has no counterpart here: its consumer (the
-    on-device scores GEMM) is the thing this hardware cannot dispatch, and a
-    device transpose feeding a host ``@`` that re-layouts anyway would measure
-    nothing. The ``transpose`` operator is validated standalone instead.
-
-THE ENTRY COUNT IS A MEASUREMENT, AND IT LANDS *BELOW* ``coarse``'S
-    13 entries against ``coarse``'s 131. Not because this mode is coarser —
-    it dispatches ten distinct operator kernels where ``coarse`` dispatches
-    five — but because 128 of ``coarse``'s 131 entries are ``addnorm``'s row
-    blocking (one kernel call per tile caps it at 64 rows per dispatch at
-    width 768), while every operator THIS mode decomposes to streams its rows
-    inside one launch: ``elementwise_add``, ``layer_norm``, ``elementwise_mul``
-    and ``gelu`` all walk 4096 rows in a single entry. The fine-grained
-    decomposition therefore has FEWER runlist entries than the coarse one at
-    ``baseline_768`` — 08d anticipates exactly this ("a decomposition that
-    folds normalization back into a fused kernel can easily come out below
-    it") and prescribes reporting the number rather than inflating the
-    decomposition, e.g. by row-blocking operators that do not need it. The
-    ``runlist_entries > coarse`` ordinal clause fails on this hardware and
-    that is a finding about the measurement model, recorded in this mode's
-    README.
+WHY THE NORM CHAINS ARE ROW-BANDED WHEN THE KERNELS COULD STREAM
+    The decomposed ``elementwise_add``/``layer_norm``/``elementwise_mul``
+    kernels have no L1 cap forcing 64-row dispatches — each can walk all 4096
+    rows in one launch, and the first structure tried did exactly that: 13
+    entries over 2 runlists, which landed BELOW coarse's 131 and failed the
+    one ordinal clause this mode owns. That structure changed TWO variables at
+    once — operator granularity AND the dispatch schedule — and at the
+    normalization points it was 64x COARSER-grained than ``coarse`` itself
+    (one streaming launch against 64 banded dispatches), so its entry count
+    measured the schedule change, not the decomposition. This structure holds
+    the schedule fixed at coarse's own — the band size is IMPORTED from
+    ``builders.block.norm_rows``, the L1-derived cap coarse measured, never
+    re-derived or tuned here — so the two modes differ in exactly one
+    variable, operator granularity, and the entry comparison measures it.
 
 FOOTGUNS
     - ``RUNLIST_CACHE_DIR`` is this mode's OWN ELF cache, in
@@ -66,17 +61,16 @@ FOOTGUNS
       holds INSIDE a single runlist too, and context eviction (offload's fix)
       is unavailable there: entries of one artifact share its context by
       construction. Four compiles of one module per clean cache is the cost.
-      The ``add``/``layer_norm``/``mul`` ELFs DO execute twice inside runlist
-      2: no runtime loop tiling, same class as the block's 64-fold re-executed
-      ``addnorm`` ELF, and the same first bring-up measured their second
-      executions clean (the ffn/output stages sat at their expected error
-      levels while k/v were corrupt).
-    - The LayerNorm gamma is applied by ``elementwise_mul`` against a
-      HOST-MATERIALIZED ``[seq, emb]`` broadcast of the ``[emb]`` weight
-      (``broadcast_row_weight``), declared static and content-keyed. 6 MB per
-      norm point instead of 1.5 KB is the honest cost of decomposing to a
-      two-tensor multiply; the builder's docstring records why there is no
-      broadcast form.
+      The band ``add``/``ln``/``mul`` ELFs execute 64 times per chain and 128
+      times per layer in one context each: no runtime loop tiling, the same
+      class as the block's 64-fold re-executed ``addnorm`` ELF, measured clean
+      at every stage boundary.
+    - The LayerNorm gamma is applied by ``elementwise_mul`` against ONE
+      host-materialized ``[norm_rows, emb]`` broadcast of the ``[emb]`` weight
+      (``broadcast_row_weight``), declared static and content-keyed, shared by
+      all 64 band multiplies — every band multiplies by the same rows. Under
+      fault injection the content key changes and the perturbed broadcast is
+      re-uploaded; nothing special-cases the injected path.
     - The mode computes; the oracle checks. Attention is torch
       (``blocked_attention``), every device operator is its own kernel; the
       per-boundary references come from the numpy oracles behind
@@ -86,6 +80,9 @@ FOOTGUNS
     - The dispatch vectors are recorded on the fault-injected path too. The
       driver requires the fault artifact's summed totals to EQUAL the clean
       run's; anything conditional on the injected flag fails that.
+    - Band inputs are CONTIGUOUS COPIES, never views: a ``BufferSpec`` is
+      sized from the array and the host write reads it flat, so a
+      non-contiguous slice would upload the wrong bytes without complaining.
     - ``execution_mode`` comes from ``pattern.EXECUTION_MODE_CSV``. Do not
       inline the string.
 """
@@ -106,6 +103,7 @@ for _p in (_PROJ_ROOT, os.path.join(_PROJ_ROOT, "llms"), _EXAMPLE_ROOT):
 import shared.infra.external_kernels as ek  # noqa: E402
 from shared.infra.bo_pool import BufferSpec, DispatchStep, content_key  # noqa: E402
 
+from builders.block import norm_rows  # noqa: E402
 from builders.block_cache import (  # noqa: E402
     block_artifact_fingerprint,
     load_fingerprints,
@@ -152,7 +150,13 @@ RUNLIST_INPUT_NAMES = (
 )
 
 #: Recorded in the artifact: the attention boundary is host torch f32 through
-#: the shared query-blocked implementation, NOT a device dispatch.
+#: the shared query-blocked implementation, NOT a device dispatch. Its two
+#: GEMMs (``4096 x 64 x 4096`` and ``4096 x 4096 x 64``) resolve in no
+#: registry and the C4 sweep cannot stage them (08c has the derivation), so
+#: this seam — the one submission boundary a whole-BO argument does not
+#: explain — is forced, and it is why iron's ``k_transpose`` entry has no
+#: counterpart here: its consumer is the GEMM this hardware cannot dispatch.
+#: The ``transpose`` operator is validated standalone instead.
 ATTENTION_PATH = "host_torch_fp32_blocked"
 
 #: The single func.func each GEMM method's module emits — what instance_name
@@ -167,8 +171,8 @@ _GEMM_BACKEND = {
     "omit_while_true_loop": False,
 }
 
-#: The streaming single-launch operators need none of the GEMM settings, but
-#: they do need the ELF ABI to share a runlist with the GEMMs.
+#: The single-launch operators need none of the GEMM settings, but they do
+#: need the ELF ABI to share a runlist with the GEMMs.
 _SMALL_BACKEND = {
     "output_format": "elf",
     "omit_while_true_loop": False,
@@ -187,22 +191,25 @@ _SMALL_FUNC = {
 def runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
     """Resolve every operator's configuration without building anything.
 
-    Three GEMM shapes serve six of the thirteen entries, but the four
+    Three GEMM shapes serve six of the entries, but the four
     ``[seq, emb] @ [emb, emb]`` projections each get their OWN compiled ELF of
     the same module: a runtime-tiled GEMM ELF returns wrong numbers from its
     second execution in one ``hw_context`` onward, and this mode MEASURED that
     the corruption holds inside a single runlist too (see the module
-    footguns), so no GEMM ELF may appear twice in the dispatch. Four compiles
-    of one module is the price of thirteen entries over two submissions; the
-    streaming operators are re-execution clean and keyed by their L3 shape.
-    Raises (via the registry) on an unmeasured GEMM shape, and on
-    ``num_heads * head_dim != emb_dim``.
+    footguns), so no GEMM ELF may appear twice in the dispatch. The band
+    ``add``/``ln``/``mul`` operators are re-execution clean and built at
+    ``coarse``'s row granularity — ``builders.block.norm_rows``, the L1 cap
+    the fused ``addnorm`` measured, imported so the two modes share one
+    schedule by construction. Raises (via the registry) on an unmeasured GEMM
+    shape, on ``num_heads * head_dim != emb_dim``, and (via the builders) on
+    a band shape the small operators cannot tile.
     """
     if num_heads * head_dim != emb_dim:
         raise ValueError(
             f"num_heads * head_dim ({num_heads} * {head_dim}) must equal emb_dim "
             f"({emb_dim}); the head reshape around host attention assumes it"
         )
+    rows = norm_rows(seq_len, emb_dim)
 
     specs = {
         "proj": (
@@ -233,9 +240,9 @@ def runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
         artifacts[gemm_key] = f"rl_gemm_{gemm_key}_{m}x{k}x{n}"
     artifacts.update(
         {
-            "add": f"rl_add_{seq_len}x{emb_dim}",
-            "ln": f"rl_ln_{seq_len}x{emb_dim}",
-            "mul": f"rl_mul_{seq_len}x{emb_dim}",
+            "add": f"rl_add_{rows}x{emb_dim}",
+            "ln": f"rl_ln_{rows}x{emb_dim}",
+            "mul": f"rl_mul_{rows}x{emb_dim}",
             "gelu": f"rl_gelu_{seq_len}x{ffn_dim}",
         }
     )
@@ -257,6 +264,8 @@ def runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
         "ffn_dim": ffn_dim,
         "num_heads": num_heads,
         "head_dim": head_dim,
+        "norm_rows": rows,
+        "norm_blocks": seq_len // rows,
         "specs": specs,
         "gemms": gemms,
         "artifacts": artifacts,
@@ -265,12 +274,20 @@ def runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
     }
 
 
+def runlist_entry_count(cfg):
+    """Total runlist entries the decomposition dispatches, derived not counted:
+    q/k/v (3) + output_proj (1) + up/gelu/down (3) + two norm chains of
+    ``3 * norm_blocks`` band entries each."""
+    return 7 + 6 * cfg["norm_blocks"]
+
+
 def describe_runlist(cfg):
     """One line per resolved decision, for the run log and the lit gate."""
     print(
         f"  runlist {cfg['seq_len']}x{cfg['emb_dim']} ffn {cfg['ffn_dim']} "
         f"{cfg['num_heads']}h x {cfg['head_dim']} (encoder_bert, non-causal, "
-        f"13 fine-grained entries over 2 runlists, attention in host torch)"
+        f"{runlist_entry_count(cfg)} fine-grained entries over 5 runlists, "
+        f"attention in host torch)"
     )
     parts = []
     for key in ("proj", "up", "down"):
@@ -282,12 +299,16 @@ def describe_runlist(cfg):
         f"    attention host torch fp32, query block {cfg['query_block_size']} "
         f"x{blocks} block(s)"
     )
+    print(
+        f"    norm chains banded at {cfg['norm_rows']} rows x"
+        f"{cfg['norm_blocks']} (builders.block.norm_rows — coarse's schedule)"
+    )
 
 
 def _build_runlist_module(cfg, key):
-    """One artifact's module: a registry GEMM or a streaming operator."""
-    seq_len, emb_dim = cfg["seq_len"], cfg["emb_dim"]
-    ffn_dim = cfg["ffn_dim"]
+    """One artifact's module: a registry GEMM, a band operator, or gelu."""
+    emb_dim, ffn_dim = cfg["emb_dim"], cfg["ffn_dim"]
+    rows = cfg["norm_rows"]
     if key in cfg["gemms"]:
         from shared.builders.gemm_builder import _build_gemm_module
 
@@ -304,13 +325,13 @@ def _build_runlist_module(cfg, key):
             **spec["build_kwargs"],
         )
     if key == "add":
-        return build_elementwise_add_module(seq_len, emb_dim, bfloat16)
+        return build_elementwise_add_module(rows, emb_dim, bfloat16)
     if key == "ln":
-        return build_layer_norm_module(seq_len, emb_dim, bfloat16)
+        return build_layer_norm_module(rows, emb_dim, bfloat16)
     if key == "mul":
-        return build_elementwise_mul_module(seq_len, emb_dim, bfloat16)
+        return build_elementwise_mul_module(rows, emb_dim, bfloat16)
     if key == "gelu":
-        return build_gelu_module(seq_len, ffn_dim, bfloat16)
+        return build_gelu_module(cfg["seq_len"], ffn_dim, bfloat16)
     raise KeyError(f"unknown runlist artifact key {key!r}")
 
 
@@ -416,8 +437,8 @@ def prepare_runlist(shape, seed=42):
     same injection target (``ln1_weight`` — the measured choice; here it feeds
     the first gamma multiply, scaling one column of ``hidden`` and cascading
     through both residual paths exactly as in the block). What differs is the
-    execution boundary: thirteen single-operator entries over two runlists,
-    with host torch attention between them.
+    execution boundary: coarse's schedule refined into single-operator
+    entries, five runlists with host torch attention after the first.
     """
     seq_len, emb_dim = shape["seq_len"], shape["emb_dim"]
     ffn_dim, num_heads = shape["ffn_dim"], shape["num_heads"]
@@ -490,67 +511,116 @@ def prepare_runlist(shape, seed=42):
         out = {n: np.array(results[n], copy=True) for n in outputs}
         return out, vector
 
-    def _run_post_attention(ctx, x, w_o, gamma1, w_up, w_down, gamma2):
-        """Runlist 2: output_proj through the second gamma, ten entries."""
-        act = lambda: np.zeros((seq_len, emb_dim), dtype=bfloat16)  # noqa: E731
-        wide = lambda: np.zeros((seq_len, ffn_dim), dtype=bfloat16)  # noqa: E731
-        arrays = {
-            "ctx": ctx,
-            "x": x,
-            "w_o": w_o,
-            "gamma1": gamma1,
-            "w_up": w_up,
-            "w_down": w_down,
-            "gamma2": gamma2,
-            "attn_out": act(),
-            "add1": act(),
-            "ln1n": act(),
-            "hidden": act(),
-            "ffn_up": wide(),
-            "ffn_gelu": wide(),
-            "ffn_out": act(),
-            "add2": act(),
-            "ln2n": act(),
-            "output": act(),
-        }
-        steps = []
-        scratches = set()
-
-        def gemm(key, a, b, out):
-            step, scratch = _gemm_step(cfg, key, a, b, out, arrays)
-            steps.append(step)
-            if scratch:
-                scratches.add(scratch)
-
-        gemm("o_proj", "ctx", "w_o", "attn_out")
-        steps.append(DispatchStep(names["add"], ("attn_out", "x", "add1"), writes=(2,)))
-        steps.append(DispatchStep(names["ln"], ("add1", "ln1n"), writes=(1,)))
-        steps.append(
-            DispatchStep(names["mul"], ("ln1n", "gamma1", "hidden"), writes=(2,))
-        )
-        gemm("up", "hidden", "w_up", "ffn_up")
-        steps.append(DispatchStep(names["gelu"], ("ffn_up", "ffn_gelu"), writes=(1,)))
-        gemm("down", "ffn_gelu", "w_down", "ffn_out")
-        steps.append(
-            DispatchStep(names["add"], ("ffn_out", "hidden", "add2"), writes=(2,))
-        )
-        steps.append(DispatchStep(names["ln"], ("add2", "ln2n"), writes=(1,)))
-        steps.append(
-            DispatchStep(names["mul"], ("ln2n", "gamma2", "output"), writes=(2,))
-        )
-
-        # The boundaries the artifact compares; the decomposition's own
-        # interiors (add1, ln1n, add2, ln2n) stay device-resident and are
-        # covered collectively by `hidden` and `output`.
-        outputs = ("attn_out", "hidden", "ffn_up", "ffn_gelu", "ffn_out", "output")
-        statics = {"w_o", "gamma1", "w_up", "w_down", "gamma2"}
+    def _run_o_proj(ctx, w_o):
+        """Runlist 2: the output projection, one entry."""
+        arrays = {"ctx": ctx, "w_o": w_o}
+        arrays["attn_out"] = np.zeros((seq_len, emb_dim), dtype=bfloat16)
+        step, scratch = _gemm_step(cfg, "o_proj", "ctx", "w_o", "attn_out", arrays)
         specs = {
             name: _spec_buf(
-                name, arr, static=name in statics, host_output=name in outputs
+                name, arr, static=name == "w_o", host_output=name == "attn_out"
             )
             for name, arr in arrays.items()
         }
-        host_writes = {"ctx", "x"} | statics | scratches
+        host_writes = {"ctx", "w_o"} | ({scratch} if scratch else set())
+        results, vector = cache.run_sequence(
+            [step],
+            specs,
+            cfg["backend_kwargs"],
+            arrays,
+            host_writes=host_writes,
+            require_single_submission=True,
+        )
+        return np.array(results["attn_out"], copy=True), vector
+
+    def _run_norm_chain(label, x_full, residual_full, gamma_band):
+        """Runlists 3 and 5: one normalization point as ``norm_blocks`` bands
+        of add -> LayerNorm -> gamma multiply, ``3 * norm_blocks`` entries in
+        one submission.
+
+        ``x_full`` and ``residual_full`` are whole ``[seq_len, emb_dim]``
+        tensors cut into bands here, because a dispatch argument is a whole
+        BO. Within a band the residual sum and the normalized rows stay
+        device-resident; ``gamma_band`` is ONE static buffer shared by every
+        band's multiply.
+        """
+        rows, blocks = cfg["norm_rows"], cfg["norm_blocks"]
+        gamma_name = f"{label}_gamma"
+        arrays = {gamma_name: gamma_band}
+        steps = []
+        out_names = []
+        for i in range(blocks):
+            lo, hi = i * rows, (i + 1) * rows
+            x_name, r_name = f"{label}_x{i}", f"{label}_r{i}"
+            s_name, n_name = f"{label}_sum{i}", f"{label}_norm{i}"
+            o_name = f"{label}_out{i}"
+            # Contiguous copies, not views — see the module footguns.
+            arrays[x_name] = np.ascontiguousarray(x_full[lo:hi])
+            arrays[r_name] = np.ascontiguousarray(residual_full[lo:hi])
+            arrays[s_name] = np.zeros((rows, emb_dim), dtype=bfloat16)
+            arrays[n_name] = np.zeros((rows, emb_dim), dtype=bfloat16)
+            arrays[o_name] = np.zeros((rows, emb_dim), dtype=bfloat16)
+            steps.append(
+                DispatchStep(names["add"], (x_name, r_name, s_name), writes=(2,))
+            )
+            steps.append(DispatchStep(names["ln"], (s_name, n_name), writes=(1,)))
+            steps.append(
+                DispatchStep(names["mul"], (n_name, gamma_name, o_name), writes=(2,))
+            )
+            out_names.append(o_name)
+        specs = {
+            name: _spec_buf(
+                name, arr, static=name == gamma_name, host_output=name in out_names
+            )
+            for name, arr in arrays.items()
+        }
+        host_writes = {gamma_name}
+        for i in range(blocks):
+            host_writes |= {f"{label}_x{i}", f"{label}_r{i}"}
+        results, vector = cache.run_sequence(
+            steps,
+            specs,
+            cfg["backend_kwargs"],
+            arrays,
+            host_writes=host_writes,
+            require_single_submission=True,
+        )
+        out = np.concatenate([np.array(results[n], copy=True) for n in out_names])
+        return out, vector
+
+    def _run_ffn(hidden, w_up, w_down):
+        """Runlist 4: up_proj, GeLU, down_proj — three entries, the
+        interiors device-resident."""
+        arrays = {
+            "hidden": hidden,
+            "w_up": w_up,
+            "w_down": w_down,
+            "ffn_up": np.zeros((seq_len, ffn_dim), dtype=bfloat16),
+            "ffn_gelu": np.zeros((seq_len, ffn_dim), dtype=bfloat16),
+            "ffn_out": np.zeros((seq_len, emb_dim), dtype=bfloat16),
+        }
+        steps = []
+        scratches = set()
+        step, scratch = _gemm_step(cfg, "up", "hidden", "w_up", "ffn_up", arrays)
+        steps.append(step)
+        if scratch:
+            scratches.add(scratch)
+        steps.append(DispatchStep(names["gelu"], ("ffn_up", "ffn_gelu"), writes=(1,)))
+        step, scratch = _gemm_step(cfg, "down", "ffn_gelu", "w_down", "ffn_out", arrays)
+        steps.append(step)
+        if scratch:
+            scratches.add(scratch)
+        outputs = ("ffn_up", "ffn_gelu", "ffn_out")
+        specs = {
+            name: _spec_buf(
+                name,
+                arr,
+                static=name in ("w_up", "w_down"),
+                host_output=name in outputs,
+            )
+            for name, arr in arrays.items()
+        }
+        host_writes = {"hidden", "w_up", "w_down"} | scratches
         results, vector = cache.run_sequence(
             steps,
             specs,
@@ -564,9 +634,10 @@ def prepare_runlist(shape, seed=42):
 
     def dispatch(device_inputs, stage_stats):
         x, w_q, w_k, w_v, w_o, ln1_weight, w_up, w_down, ln2_weight = device_inputs
+        blocks = cfg["norm_blocks"]
 
-        print("  [runlist 1/2] q_proj + k_proj + v_proj (3 entries, one submission)")
-        proj, vec_a = _run_projections(x, w_q, w_k, w_v)
+        print("  [runlist 1/5] q_proj + k_proj + v_proj (3 entries, one submission)")
+        proj, vec_1 = _run_projections(x, w_q, w_k, w_v)
 
         print(f"  [host] blocked attention, query block {cfg['query_block_size']}")
         attn_context = blocked_attention(
@@ -578,25 +649,34 @@ def prepare_runlist(shape, seed=42):
             query_block_size=cfg["query_block_size"],
         )
 
-        print(
-            "  [runlist 2/2] output_proj + add + layer_norm + mul + up_proj + "
-            "gelu + down_proj + add + layer_norm + mul (10 entries, one submission)"
-        )
-        post, vec_b = _run_post_attention(
-            round_bf16(attn_context),
-            x,
-            w_o,
-            round_bf16(broadcast_row_weight(ln1_weight, seq_len)),
-            w_up,
-            w_down,
-            round_bf16(broadcast_row_weight(ln2_weight, seq_len)),
-        )
+        print("  [runlist 2/5] output_proj (1 entry, one submission)")
+        attn_out, vec_2 = _run_o_proj(round_bf16(attn_context), w_o)
 
-        boundaries = dict(post)
+        print(
+            f"  [runlist 3/5] {blocks} x (add + layer_norm + mul) ln1 "
+            f"({3 * blocks} entries, one submission)"
+        )
+        gamma1 = round_bf16(broadcast_row_weight(ln1_weight, cfg["norm_rows"]))
+        hidden, vec_3 = _run_norm_chain("ln1", attn_out, x, gamma1)
+
+        print("  [runlist 4/5] up_proj + gelu + down_proj (3 entries, one submission)")
+        ffn, vec_4 = _run_ffn(hidden, w_up, w_down)
+
+        print(
+            f"  [runlist 5/5] {blocks} x (add + layer_norm + mul) ln2 "
+            f"({3 * blocks} entries, one submission)"
+        )
+        gamma2 = round_bf16(broadcast_row_weight(ln2_weight, cfg["norm_rows"]))
+        output, vec_5 = _run_norm_chain("ln2", ffn["ffn_out"], hidden, gamma2)
+
+        boundaries = dict(ffn)
         boundaries.update({"q": proj["q"], "k": proj["k"], "v": proj["v"]})
         boundaries["attn_context"] = attn_context
+        boundaries["attn_out"] = attn_out
+        boundaries["hidden"] = hidden
+        boundaries["output"] = output
 
-        vector_rows = [vec_a.as_row(), vec_b.as_row()]
+        vector_rows = [v.as_row() for v in (vec_1, vec_2, vec_3, vec_4, vec_5)]
         stages = []
         for name in ENCODER_BOUNDARIES:
             atol = BLOCK_STAGE_ATOL[name]
@@ -626,6 +706,8 @@ def prepare_runlist(shape, seed=42):
         "execution_mode": EXECUTION_MODE_CSV["runlist"],
         "attention_path": ATTENTION_PATH,
         "query_block_size": cfg["query_block_size"],
+        "norm_rows": cfg["norm_rows"],
+        "norm_blocks": cfg["norm_blocks"],
         "gemm_spec_source": "registry",
         "gemm_spec_proj": _spec_digest(cfg["specs"]["proj"][0]),
         "gemm_spec_ffn_up": _spec_digest(cfg["specs"]["up"][0]),

@@ -417,7 +417,7 @@ porting convention 7, with the old name surviving only as the CSV
 `execution_mode` value. **The mode is not a second block.** `builders/block.py`
 stays exactly where it is, with its lit, opcheck and coverage enrolments
 untouched; `pattern/coarse/coarse.py` is the mode layer only — the shared
-full-layer preparer (`opcheck_prepare.prepare_layer_dispatch`) pointed at the
+full-layer preparer (`opcheck_layer.prepare_layer_dispatch`) pointed at the
 mode's own ELF cache, its own operator name in the `SPECS` catalogue, and its
 `execution_mode` value from the one mapping in
 `pattern/__init__.py::EXECUTION_MODE_CSV`. `pattern/coarse/README.md` has the
@@ -453,7 +453,7 @@ perturbs one input element after the reference exists and never touches the
 dispatch path. The instrumentation is therefore unconditional in the shared
 preparer's dispatch closure, which also validates every recorded row against
 the `as_row()` schema and prints the six driver-style summed totals
-(`opcheck_prepare.dispatch_vector_totals`); the lit recipes pin that totals
+(`opcheck_layer.dispatch_vector_totals`); the lit recipes pin that totals
 line to one set of literals in *both* halves, so a conditional shortcut, a
 malformed row, or a fault run whose totals drift all fail in the suite before
 the driver's independent totals comparison sees them.
@@ -515,17 +515,21 @@ mapping lives.
 
 ## The `runlist` execution strategy (Phase E4)
 
-`pattern/runlist/` is the fine-grained point of the taxonomy: the layer
-decomposed into **thirteen single-operator entries over two runlists** —
-q/k/v projections; host blocked attention (the same implementation `offload`
-uses, unchanged); then output_proj, residual add, LayerNorm, gamma multiply,
-up_proj, GeLU, down_proj, residual add, LayerNorm, gamma multiply — each
-runlist forced single-submission with `require_single_submission=True`.
-Intermediates inside a runlist stay device-resident (`attn_out` feeds the
-residual add without touching the host; `hidden` feeds both the up-projection
-and the second residual add), which is the cross-artifact chaining the mode
-exists to measure. `pattern/runlist/README.md` has the full story; the parts
-that cost time to learn:
+`pattern/runlist/` is the fine-grained point of the taxonomy: `coarse`'s
+dispatch schedule held fixed and every one of its dispatch units refined into
+single-operator kernels — **391 single-operator entries over five runlists**.
+The fused qkv becomes q/k/v (3 entries); the fused mha+out becomes host
+blocked attention (the same implementation `offload` uses, unchanged) plus an
+output_proj entry; each of the two normalization points stays at `coarse`'s
+own 64-row banding (`builders.block.norm_rows`, imported — never re-derived
+here) with each fused `addnorm` band call split into residual add, LayerNorm
+and gamma multiply (2 × 64 × 3 = 384 entries); the fused ffn becomes up_proj,
+GeLU, down_proj (3 entries). Each runlist is forced single-submission with
+`require_single_submission=True`, and intermediates inside a runlist stay
+device-resident (q/k/v chain to nothing but the readback; each band's
+residual sum feeds its LayerNorm and multiply on device; `ffn_up`/`ffn_gelu`
+chain into the down projection). `pattern/runlist/README.md` has the full
+story; the parts that cost time to learn:
 
 **The two operators that did not exist.** `builders/transpose.py` (iron's
 `k_transpose`, re-expressed over `data_transfer_transpose/dma_bf16/`'s
@@ -539,14 +543,19 @@ vector unit does not legalize f32 vector element-wise multiply** —
 precedent that this form legalizes). Both hold the full opcheck contract;
 transpose's check is BIT-exactness, and its lit recipe pins the zeros.
 
-**Why 13 entries is the honest count, and that it lands BELOW `coarse`'s
-131.** 128 of `coarse`'s entries are `addnorm`'s row blocking (≤64 rows per
-dispatch at width 768); every operator this mode decomposes to streams all
-4096 rows inside one launch, so each normalization point is 3 entries here
-against 64 there. The consequence — the driver's `runlist_entries > coarse`
-ordinal clause fails on this hardware — is a finding about the measurement
-model, recorded with the measured table in `pattern/runlist/README.md`;
-inflating the decomposition to pass it is exactly what 08d forbids.
+**Why the norm chains are banded when the decomposed kernels could stream.**
+The `add`/`ln`/`mul` kernels have no L1 cap forcing 64-row dispatches, and
+the first structure tried let them stream all 4096 rows per launch: 13
+entries over two runlists, which landed BELOW `coarse`'s 131 and failed the
+one ordinal clause the mode owns. That structure changed two variables at
+once — operator granularity AND the dispatch schedule — and at the
+normalization points it was 64× *coarser*-grained than `coarse` itself, so
+its entry count measured the schedule change, not the decomposition. The
+banded structure holds the schedule at `coarse`'s own (the band size is
+imported from `builders.block.norm_rows`), so the two modes differ in exactly
+one variable and `runlist_entries > coarse` holds by construction — every
+coarse dispatch unit maps onto one or more finer units.
+`pattern/runlist/README.md` records both structures and the measured tables.
 
 **No GEMM ELF executes twice — measured, the hard way.** The first bring-up
 shared one `4096x768x768` ELF for q/k/v inside one runlist; executions two and
@@ -556,16 +565,19 @@ offload's measured mode is 3.56e-1). So the reused-context failure holds
 INSIDE a single runlist too — and there `offload`'s fix (context eviction) is
 structurally unavailable, since entries of one artifact share its context by
 construction. The four projections are therefore one module compiled to FOUR
-artifacts, each with its own `hw_context`; the streaming `add`/`ln`/`mul`
-ELFs (no runtime loop tiling) measured clean on their second executions in
-the same run, consistent with the block's 64-fold re-executed `addnorm`.
+artifacts, each with its own `hw_context`; the band `add`/`ln`/`mul` ELFs (no
+runtime loop tiling) execute 64 times per chain and 128 times per layer in
+one context each, measured clean at every stage boundary — the same class as
+the block's 64-fold re-executed `addnorm`.
 
 **The gamma multiply's second operand is a materialized broadcast.**
-`elementwise_mul` takes two full tensors, so each LayerNorm weight is tiled to
-`[4096, 768]` on the host (`broadcast_row_weight`) and declared static +
-content-keyed. Under fault injection the content key changes and the perturbed
-weight re-uploads — nothing special-cases the injected path, which is what the
-driver's clean-equals-fault totals clause checks.
+`elementwise_mul` takes two full tensors, so each LayerNorm weight is tiled
+to one `[64, 768]` band on the host (`broadcast_row_weight`) and declared
+static + content-keyed — every band multiplies by the same rows, so one
+buffer serves all 64 multiplies. Under fault injection the content key
+changes and the perturbed weight re-uploads — nothing special-cases the
+injected path, which is what the driver's clean-equals-fault totals clause
+checks.
 
 **Transpose is validated standalone, not dispatched by the mode.** Its
 consumer in iron's decomposition — the on-device attention scores GEMM — is

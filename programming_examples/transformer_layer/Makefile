@@ -87,9 +87,10 @@ help:
 	@echo "                      The two Phase E4 operators, same opcheck"
 	@echo "                      contract as every other operator. NEED AN NPU."
 	@echo "  make check-runlist  The same layer as the Phase E 'runlist'"
-	@echo "                      strategy: thirteen single-operator entries over"
-	@echo "                      two runlists, host torch attention between"
-	@echo "                      them, through its own ELF cache. NEEDS AN NPU."
+	@echo "                      strategy: coarse's schedule refined into 391"
+	@echo "                      single-operator entries over five runlists,"
+	@echo "                      host torch attention after the first, through"
+	@echo "                      its own ELF cache. NEEDS AN NPU."
 	@echo "  make check-runlist-fault"
 	@echo "                      That mode's negative control; must FAIL under"
 	@echo "                      injection, with the vectors still recorded."
@@ -288,10 +289,12 @@ check-elementwise-mul:
 	$(call opcheck,elementwise_mul)
 
 # Phase E4: the same layer, measured as the `runlist` execution strategy — the
-# fine-grained point of the taxonomy. Thirteen single-operator entries over two
-# runlists (host torch attention between them, shared with offload), each
-# runlist forced single-submission. Its own ELF cache (./runlist_cache under
-# $(BUILD_DIR)) for the same reason as the other modes'.
+# fine-grained point of the taxonomy. coarse's dispatch schedule refined into
+# 391 single-operator entries over five runlists (host torch attention after
+# the first, shared with offload; the norm chains banded at coarse's own
+# 64-row granularity), each runlist forced single-submission. Its own ELF
+# cache (./runlist_cache under $(BUILD_DIR)) for the same reason as the other
+# modes'.
 check-runlist:
 	$(call opcheck,runlist)
 
