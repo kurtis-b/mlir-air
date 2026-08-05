@@ -44,7 +44,7 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | C3 — `mha_out_proj` | Passes at the registry's FlashAttention tolerance, causal and non-causal | **done** 2026-08-04 (68 min) |
 | C4 — coverage sweep | The 36 `baseline_768` shapes resolve through `gemm_config()`; registry rows written; ten shipped models still pass `make verify` | **done** 2026-08-04 (504 min + 66 min re-run) |
 | D1 — operators at `baseline_768` | Every operator passes `opcheck` at the `baseline_768` widths, including the pre-add `addnorm` | **done** 2026-08-05 (11 min) |
-| D2 — block integration | One full transformer layer matches the torch reference on hardware | not started |
+| D2 — block integration | One full transformer layer matches the torch reference on hardware | **done** 2026-08-05 (156 min) |
 | E — execution strategies | All four modes agree with the reference; dispatch vectors differ as predicted | not started |
 | F — study harness | `execution-smoke-test` yields ≥1 `run_status=passed` row per measurement CSV | not started |
 | G — unattended runner + CI | Full profile run completes with a complete `results_manifest.json` | not started |
