@@ -177,9 +177,26 @@ a system prompt plus post-hoc `git status` checks, not a sandbox.
 
 ## Measured cost
 
-Phases A and B: **11 of 40 invocations**, 18 min and 362 min wall clock. Phase B's six hours were
-dominated by the hardware runlist spike and by ten `make verify` runs across every shipped model —
-the cross-deployment regression rule being honoured rather than skipped.
+| Phase | Invocations | Wall clock |
+|---|---|---|
+| A | — | 18 min |
+| B | — | 362 min |
+| A + B together | 11 of 40 | 380 min |
+| C1 | — | 61 min |
+| C2 | — | 45 min |
+| C3 | — | 68 min |
+| C4 | — | 504 min, then 66 min to re-run the gate after the objective-check bug |
+| C1–C4 together | 10 of 40 | ~12 h |
+
+Phase B's six hours were dominated by the hardware runlist spike and by ten `make verify` runs
+across every shipped model — the cross-deployment regression rule being honoured rather than
+skipped. C4's eight hours were the registry sweep plus the same ten-model check, which its gate
+runs directly (`gate-c4.sh`) rather than describing and leaving to the session.
+
+**Splitting a large phase paid for itself.** Phase C's source material was 8,160 lines against
+Phase B's 3,725, and it cost the same order of invocations while every sub-phase gate passed first
+time. C1–C3 averaged 58 minutes each. The cost is concentrated entirely in whichever sub-phase
+owns the hardware sweep.
 
 Codex spend was dominated by **four aborted Phase A restarts**, every one halting on a harness
 bug rather than on the code under review. The per-phase steady-state cost is three reviews.

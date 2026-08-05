@@ -76,10 +76,39 @@ the July MLIR moved `IRCore.cpp` from `MLIRPythonExtension.Core` into
 `air._mlir_libs._mlir` was missing `OnExplicitAction`. That one genuinely needs `rm -rf build-xrt`
 and a fresh configure — then re-apply the two flags above.
 
+## The transformer-layer suite now needs an NPU
+
+`[2026-08-04]` `check-programming-examples-transformer-layer` was NPU-free through Phases A and B
+— which is how Phase B's hardware claim came to be gated by nothing the driver ran. It is not
+NPU-free any more: it carries the Phase B runlist gate and every Phase C operator gate, 13 tests
+as of C4.
+
+If you want the PR-safe subset, the individual make targets are still hardware-free:
+
+```bash
+cd programming_examples/transformer_layer
+make compile        # Peano objects and their symbol lists
+make seam-tests     # BO pooling and runlist aggregation rules
+make registry-plan  # what the sweep would measure
+make registry-writer-tests
+```
+
+Everything else in that directory dispatches, and every dispatching command belongs inside
+`flock -x -w 1800 /tmp/mlir-air-npu.lock`.
+
+## Generated artifacts land in the source directory
+
+`make runlist-gate` and the sweep run with `programming_examples/transformer_layer/` as their
+working directory, so `aircc` and `KernelCache` write their objects, `air.mlir`, `air.elf` and
+`air_project/` straight into the source tree. Eleven of those were committed by mistake in
+`bf69ed69`; the nine `.o` files were the only tracked object files in the whole repository. They
+are untracked and `.gitignore`d now, but the *cause* is unchanged — anything new that runs from
+that directory will leak artifacts there too, so check `git status` before committing.
+
 ## Known-stale, not yet fixed
 
 - **mlir-aie 1.4.0 ships `aiecc`, not `aiecc.py`**, and lit still probes for `aiecc.py`
-  (`Did not find aiecc.py in ...`). It did not block `flash_attention` or Phases A/B, but it may
+  (`Did not find aiecc.py in ...`). It did not block `flash_attention` or Phases A–C, but it may
   bite examples relying on that substitution.
 - **Six pre-existing `check-programming-examples-peano` failures**, NPU1-only:
   `matrix_multiplication/{bf16,i16,i8}` pass `-mllvm -aie-disable-fold-imm`, which the installed

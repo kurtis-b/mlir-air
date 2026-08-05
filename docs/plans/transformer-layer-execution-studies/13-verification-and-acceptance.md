@@ -32,8 +32,9 @@ then the narrowest useful test.
 | Conventions | `black --check .`, clang-format / clang-tidy, plus the [02](02-porting-conventions.md) checklist at review | No iron-shaped code lands: no `AIE*` operator classes, no `op.py`/`design.py` pairs, no `REUSE.toml`, no module materially over ~800 lines |
 | Kernels compile | `ninja check-programming-examples-transformer-layer` | Phase A — compile-only lit, no NPU needed, PR-gate-safe |
 | Runlist spike | Hardware test with the real separately-compiled artifacts | Phase B — the taxonomy's load-bearing assumption |
-| Operator numerics | `make run` in each operator directory | Phase C — `np.isclose` at registry `rtol`/`atol` vs an FP32 reference |
-| Registry coverage | Rows present in `supported_kernels.md` + `details/<Kernel>_bf16.md` | Phase C — every case-matrix shape registered or provably dynamic |
+| Operator numerics | `transformer_layer/opcheck.py --operator <op>`, one `run_npu2_<op>_peano.lit` per operator | Phase C — full-output `np.isclose` at registry `rtol`/`atol` vs an FP32 reference, zero mismatches |
+| Check discriminates | `opcheck.py --operator <op> --fault-inject input`, which must **fail** | Phase C — a vacuous check passes under injection; the driver fails the phase for it |
+| Registry coverage | Rows present in `supported_kernels.md` + `details/<Kernel>_bf16.md`, and `gemm_config()` resolving | Phase C — every case-matrix shape registered or provably dynamic |
 | Single block | Block integration test on NPU | Phase D — launch maps, layouts, external linking, BO reuse |
 | Strategy equivalence | `pytest programming_examples/transformer_layer/pattern/` | Phase E — all four modes vs the torch reference |
 | Strategy distinguishability | Dispatch vector per mode | Phase E — the vectors separate the modes as predicted |

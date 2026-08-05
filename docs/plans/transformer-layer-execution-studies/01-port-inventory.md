@@ -46,7 +46,7 @@ are PORT. Detail in [06-phase-c-operators.md](06-phase-c-operators.md).
 | `addnorm` | 382 | 213 | REWRITE | Weighted LayerNorm + residual. iron bakes weights into MLIR via `np.load()` at generation time and hashes them into artifact names — pass them as runtime memref args instead. |
 | `ffn` | 1096 | 462 | REWRITE | Staged up-proj → fused GeLU → down-proj with memtile accumulation depth. |
 | `mha_out_proj` | 1350 | 293 | REWRITE | Largest. Fused attention + output projection with optional causal masking. |
-| `dynamic_gemm` | 1009 | 430 | REWRITE | Runtime M/N tail handling. The structural blocker — see Phase C. |
+| `dynamic_gemm` | 1009 | 430 | **DROP** `[2026-08-04]` | Runtime M/N tail handling was one of three candidate answers to shape coverage. The C4 registry sweep is the answer taken, so this is not ported. Revisit only if a later phase needs a shape ladder a sweep cannot cover. |
 
 Also modified in the source commit and needing the same treatment where used:
 `gemm/design_batched.py` (988, REWRITE), `layer_norm/design_weighted.py` (298, REWRITE),

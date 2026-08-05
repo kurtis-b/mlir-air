@@ -95,14 +95,27 @@ Then, before touching anything:
 - [14-the-port-loop-harness.md](14-the-port-loop-harness.md) — how the automated driver works and
   how to run the next phase through it.
 
-**The next phase is C (operators), split into four sub-phases C1–C4.** Start from
-[06-phase-c-operators.md](06-phase-c-operators.md), which is the overview; each sub-phase has its
-own specification ([06a](06a-phase-c1-gate-and-small-operators.md),
-[06b](06b-phase-c2-qkv-proj-and-ffn.md), [06c](06c-phase-c3-mha-out-proj.md),
-[06d](06d-phase-c4-coverage-sweep.md)) because the driver injects one document as a session's
-entire task list.
+**The next phase is D (single-block integration).** Its specification is
+[07-phase-d-block-integration.md](07-phase-d-block-integration.md), and it was rewritten on
+2026-08-04 against what Phase C actually produced. Three things in it decide how the phase starts,
+so read it before planning anything:
 
-Two decisions taken on 2026-08-04 that amend what those documents used to say:
+- **The family is forced.** `baseline_768` is the only one whose projection GEMMs resolve (36 of
+  36, against 2 and 3 for the other two families). `gemm_config()` raises on anything else.
+- **The operators are not all validated at that family.** Phase C validated each operator at
+  whatever width was cheapest to bring up; only `qkv_proj` has a point at `hidden = 768`.
+  Extending each operator's `opcheck` shape set to the `baseline_768` widths is Phase D's first
+  work item, not an optional extra.
+- **`pattern/reference.py` must not be ported verbatim**, for the same reason Phase C's oracles
+  were not — it builds every tensor in bf16, and chained over eight GEMMs that is worse than it
+  was per-operator.
+
+Phase D needs a harness entry of its own before it can run unattended: a `D)` arm in each of the
+seven dispatchers in `agents/scripts/port-loop/phases.sh`, an objective check, and
+`PL_PHASES_IN_SCOPE='["D"]'`. The C1–C4 arms are the model. Its objective check should reuse
+`phase_c_operator_check`, which is already parameterized by operator name.
+
+Two decisions taken on 2026-08-04, now reflected throughout these documents:
 
 - **The reference oracles are re-expressed, not ported verbatim.** iron computes them in bf16 at
   `rtol=4e-2` with a 0.5% element mismatch budget; this port uses an FP32 reference, the registry's
@@ -110,7 +123,7 @@ Two decisions taken on 2026-08-04 that amend what those documents used to say:
   MHA oracle's precision switch at `seq_len 16384`) are in
   [06 §The numerics standard](06-phase-c-operators.md#the-numerics-standard--do-not-port-irons).
 - **Shape coverage is a sweep, not a redesign.** The case matrix needs 108 distinct
-  projection-GEMM shapes, not the "several hundred" previously estimated — 5 are registered and
+  projection-GEMM shapes, not the "several hundred" previously estimated — 5 were registered and
   103 are missing. C4 builds the sweep tool and registers the 36 `baseline_768` shapes Phase D
   needs; the other two families are a later machine-time run.
 

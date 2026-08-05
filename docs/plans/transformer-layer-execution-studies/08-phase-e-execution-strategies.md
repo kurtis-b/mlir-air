@@ -21,7 +21,10 @@ Per convention rule 7, the directory is `coarse`; only the CSV value is `hybrid`
 
 ## The shared reference
 
-`pattern/reference.py` (172 lines, pure torch) ports verbatim. It provides `encoder_bert` and
+`pattern/reference.py` (172 lines, pure torch) ports by **structure, not verbatim** — it defaults
+to bf16 and builds every tensor at that dtype, and the correction is Phase D's work item 2, for
+the reasons in [07](07-phase-d-block-integration.md#the-golden-model-needs-the-same-correction-phase-c-made).
+Take the FP32 version Phase D produced. It provides `encoder_bert` and
 `decoder_gpt2` variants and an `include_output=False` escape hatch so the 16384-token ladder
 stays tractable. It is the correctness anchor for all four modes, and was already used as the
 Phase D gate.
@@ -79,7 +82,7 @@ meaningless.
 
 ## Work items
 
-1. Port `pattern/reference.py` verbatim (already done as part of Phase D).
+1. Reuse the FP32 `pattern/reference.py` Phase D produced. Do not re-port iron's bf16 original.
 2. `offload/` — host-torch layer with 8 GEMM dispatches, shared query blocking.
 3. `runlist/` — fine-grained operator sequence over the Phase B aggregation.
 4. `coarse/` — fused-kernel sequence over the same.
