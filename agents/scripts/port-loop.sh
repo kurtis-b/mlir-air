@@ -529,6 +529,12 @@ cmd_run_one() {
       # run_gate sets this in-process; for a standalone run-one invocation, point at the
       # stamp the last gate left behind so freshness can still be proven.
       _GATE_STARTED_AT="${pdir}/.gate-started"
+      # An objective check may import from the repository -- Phase E's resolves GEMM specs through
+      # shared.builders.gemm_builder to prove the symbol names separate. In a real run pl_preflight
+      # has already sourced the venv; standalone it has not, and the import then fails for an
+      # environment reason while the check reports a substantive one. Source it here so a manual
+      # invocation behaves like the real thing.
+      pl_env_ensure || return 1
       phase_objective_check "${phase}" ;;
     hardware-check)
       # Standalone so the assertion can be exercised against a gate log in both directions before

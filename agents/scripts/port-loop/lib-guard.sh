@@ -17,6 +17,17 @@
 # of path prefixes they may touch; anything outside it halts the run.
 
 # Files whose content defines whether a gate is meaningful.
+#
+# `[2026-08-05]` THE DRIVER'S OWN SCRIPTS ARE IN THIS SET, and were not until Phase E. Every layer
+# described above polices what a diff did to a *gate*; not one of them watched the thing that runs
+# the gates. A session runs under --permission-mode bypassPermissions, so nothing but this stops it
+# editing phases.sh to soften an objective check, or gate-e1.sh to drop a leg -- and such an edit
+# would sit in its own commits, inside the phase diff, reviewed only by a Codex round that is
+# looking at the phase's subject matter.
+#
+# No phase's allowlist covers these paths, deliberately: the driver never modifies them during a
+# run, so any change at all halts. If the harness itself needs to change, that is an operator
+# editing it between runs, not a phase editing it during one.
 guard_gate_files() {
   {
     git -C "${PL_ROOT}" ls-files 'programming_examples/**/*.lit'
@@ -25,6 +36,8 @@ guard_gate_files() {
     git -C "${PL_ROOT}" ls-files 'programming_examples/kernel_registry/details/*.json'
     git -C "${PL_ROOT}" ls-files 'programming_examples/llms/verify/*.py'
     git -C "${PL_ROOT}" ls-files 'test/**/*.lit'
+    git -C "${PL_ROOT}" ls-files 'agents/scripts/port-loop.sh'
+    git -C "${PL_ROOT}" ls-files 'agents/scripts/port-loop/'
   } 2>/dev/null | sort -u
 }
 

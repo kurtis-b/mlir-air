@@ -17,7 +17,7 @@
 # change. Anything outside it trips the tamper check and halts the run. Widen it deliberately,
 # never reflexively.
 
-PL_PHASES_IN_SCOPE='["D1","D2"]'
+PL_PHASES_IN_SCOPE='["E1","E2","E3","E4","E5"]'
 
 phase_name() {
   case "$1" in
@@ -29,6 +29,11 @@ phase_name() {
     C4) echo "Operators: registry coverage sweep" ;;
     D1) echo "Block integration: operators at baseline_768" ;;
     D2) echo "Block integration: the encoder_bert layer gate" ;;
+    E1) echo "Execution strategies: unblock the sequence ladder" ;;
+    E2) echo "Execution strategies: coarse + the shared dispatch instrumentation" ;;
+    E3) echo "Execution strategies: offload" ;;
+    E4) echo "Execution strategies: runlist" ;;
+    E5) echo "Execution strategies: fused + the distinguishability gate" ;;
     *) echo "unknown" ;;
   esac
 }
@@ -43,6 +48,11 @@ phase_doc() {
     C4) echo "docs/plans/transformer-layer-execution-studies/06d-phase-c4-coverage-sweep.md" ;;
     D1) echo "docs/plans/transformer-layer-execution-studies/07a-phase-d1-operators-at-baseline-768.md" ;;
     D2) echo "docs/plans/transformer-layer-execution-studies/07b-phase-d2-block-integration.md" ;;
+    E1) echo "docs/plans/transformer-layer-execution-studies/08a-phase-e1-unblock-the-ladder.md" ;;
+    E2) echo "docs/plans/transformer-layer-execution-studies/08b-phase-e2-coarse-and-instrumentation.md" ;;
+    E3) echo "docs/plans/transformer-layer-execution-studies/08c-phase-e3-offload.md" ;;
+    E4) echo "docs/plans/transformer-layer-execution-studies/08d-phase-e4-runlist.md" ;;
+    E5) echo "docs/plans/transformer-layer-execution-studies/08e-phase-e5-fused-and-distinguishability.md" ;;
     *) echo "" ;;
   esac
 }
@@ -57,6 +67,13 @@ phase_doc() {
 # three hours, and the single-phase form asked one session for hardware bring-up on six operators
 # AND novel multi-launch integration. Splitting also means a D2 failure does not re-run D1's
 # hardware time.
+#
+# Phase E splits five ways, for the same reason and one that is specific to it: E1 changes SHARED
+# infrastructure (llms/shared/builders/gemm_builder.py) and therefore carries the ten-model
+# cross-deployment regression check, which cost C4's gate hours. Folding that into a sub-phase that
+# also builds an execution strategy would re-run it on every failure of either. E5 is last because
+# its objective check is the only cross-mode one: the four modes' dispatch vectors either separate
+# as the taxonomy predicts or they do not, and that cannot be asked until all four exist.
 
 phase_needs_hardware() {
   case "$1" in
@@ -64,6 +81,7 @@ phase_needs_hardware() {
     B) echo "yes" ;;
     C1|C2|C3|C4) echo "yes" ;;
     D1|D2) echo "yes" ;;
+    E1|E2|E3|E4|E5) echo "yes" ;;
     *) echo "no" ;;
   esac
 }
@@ -189,6 +207,99 @@ resolving from the registry and still producing a plausibly-shaped output. A lay
 LayerNorm can absorb a lot of upstream damage before an end-to-end comparison trips.
 EOF
 ;;
+    E1) cat <<'EOF'
+flock -x -w 1800 /tmp/mlir-air-npu.lock  agents/scripts/port-loop/gate-e1.sh
+
+Two legs. The transformer-layer lit suite on real hardware, then the cross-deployment regression
+check -- `make verify` in each of the ten shipped programming_examples/llms/<model>/ directories --
+because this sub-phase changes llms/shared/builders/gemm_builder.py, which all ten resolve through.
+
+The driver then checks, independently of anything you write:
+
+  - THE NAMES SEPARATE. It resolves two same-method, different-tile_n GEMMs through
+    gemm_registry_config -- the FFN up-projection (4096x768x3072, drain, tile_n 128) and the
+    o-projection (4096x768x768, drain, tile_n 96) -- and requires sym_suffix AND obj to differ.
+    Today both mint '_m32' and 'mm_m32.o', which is the collision. If the registry ever puts those
+    two shapes on different methods the check FAILS LOUDLY rather than passing vacuously, because
+    then it would no longer be testing anything.
+
+  - THE LADDER MOVED. `ffn` must carry a fresh, declared, contract-satisfying result at a
+    baseline_768 shape whose seq_len is NOT 4096, read from the recorded `shape` dict rather than
+    from the shape_key string. Before this sub-phase build_ffn_module cannot build at any other
+    ladder point at all, so this is not something a more permissive test can produce. seq 64 is the
+    cheapest such point and its two registry rows both resolve to `drain`, which is exactly the
+    collision.
+
+  - THAT POINT GETS ITS OWN FAULT INJECTION. The driver re-runs opcheck.py against that exact
+    shape with --fault-inject input and REQUIRES it to fail. The generic per-operator control
+    injects only an operator's FIRST declared shape, so without this the one new point here would
+    be the only one never injected. That is D1's recorded lesson, repeated deliberately.
+
+  - NOTHING REGRESSED. The full D1 baseline_768 coverage clause and the D2 `block` verdict are
+    re-derived from their artifacts, and `block` is re-run under injection. Changing how every
+    external GEMM's symbol and object are named is exactly the change that could break them
+    quietly.
+EOF
+;;
+    E2|E3|E4|E5) cat <<'EOF'
+flock -x -w 1800 /tmp/mlir-air-npu.lock \
+  ninja -C build-xrt check-programming-examples-transformer-layer
+
+Every test in the suite passes on real hardware, including the ones earlier sub-phases added. A new
+.lit anywhere under programming_examples/transformer_layer/ joins the suite automatically --
+enrolment is path-based (--filter "transformer_layer/") -- so no CMake change is needed, and there
+is no CMakeLists.txt in the example.
+
+The driver then runs the same three-layer check Phases C and D used over your mode -- results newer
+than the gate stamp, verdicts re-derived from n_mismatch / ref_dtype / rtol / atol rather than read
+from your `passed` flag, and the mode re-run with --fault-inject input and REQUIRED to fail -- plus
+the clauses Phase E adds, all in agents/scripts/port-loop/phase_e_checks.py:
+
+  - FULL-LAYER SCOPE, exactly the standard D2's block was held to. Exactly ONE fresh, declared
+    result at the forced configuration (seq_len 4096, emb_dim 768, ffn_dim 3072, 12 heads,
+    head_dim 64), n_elements equal to the whole 4096 x 768 layer output, and a `stages` list of at
+    least eight per-boundary comparisons with DISTINCT names, each at n_mismatch 0 and no smaller
+    than one 4096 x 768 boundary tensor. Two conforming results is an error, not a convenience: the
+    driver will not guess which one your dispatch vector describes.
+
+  - THE DISPATCH VECTOR CONTRACT. A non-empty `dispatch_vectors` list of DispatchVector.as_row()
+    dicts -- record the shared implementation's output, do not hand-build one. Every value finite
+    and non-negative, the five count fields whole numbers, at least one submission per recorded
+    vector, and some bytes actually moved. Note runlist_entries_per_submission is a derived MEAN,
+    so the driver totals entries as sum(round(mean * submissions)); a value whose product is not a
+    whole number of runlist entries is rejected.
+
+  - VECTOR PROVENANCE. results/ is gitignored, so a hand-written dispatch vector is invisible to
+    the fingerprint, the tamper check and every review diff. So the driver compares your recorded
+    totals against the run IT initiates: the fault-injected artifact's six summed totals must EQUAL
+    the clean run's. Injection perturbs one input element after the reference exists and does not
+    touch the dispatch path, so on an honest run they are identical -- D2's block clean and fault
+    artifacts both total 4 / 131 / 12 / 146 / 402 / 202,902,528. Emit the vectors on the injected
+    path too; do not add a "skip instrumentation when injecting" shortcut.
+
+Each sub-phase adds one clause of its own:
+
+  E2  coarse   -- nothing further. It sets the contract the other three are measured against.
+  E3  offload  -- it must aggregate NOTHING: summed runlist entries equal to summed host
+                  submissions, and at least six of each. Batching them into a runlist would make
+                  this mode `coarse`.
+  E4  runlist  -- summed runlist entries strictly greater than `coarse`'s. This is the one ordinal
+                  claim the mode owns, and the reason coarse had to be measured first. coarse
+                  already measures 131, 128 of them one operator's row blocking, so a decomposition
+                  that folds normalization back into a fused kernel can land BELOW it. If that
+                  happens, report the number; do not inflate the decomposition.
+  E5  fused    -- the DISTINGUISHABILITY gate over all four modes, which is what Phase E exists to
+                  establish. Four clauses, ordinal over driver-summed totals and never absolute
+                  thresholds: no two modes share a vector; offload's host submissions exceed every
+                  other mode's and it aggregates nothing; runlist has more entries than coarse; and
+                  fused crosses fewer sync boundaries than coarse. Two further predictions -- fused
+                  entries below coarse, fused air launches at or above coarse -- are printed with a
+                  verdict but do NOT halt, because both depend on how a faithful stitch decomposes.
+                  If the gating clauses fail, that is a finding about the measurement model and it
+                  halts the run by design. Report the measured table; never tune a mode until an
+                  inequality holds.
+EOF
+;;
     *) cat <<'EOF'
 ERROR: no gate description is declared for this phase in agents/scripts/port-loop/phases.sh.
 This is a harness bug, not a task. Stop and report it as a blocker.
@@ -213,6 +324,17 @@ phase_gate_allowlist() {
     # C4 measured and must not write new ones, and it is not permitted to touch llms/shared/ --
     # the gemm_builder.py sym_suffix fix that would unlock the rest of the ladder is Phase E's.
     D1|D2) echo '^programming_examples/transformer_layer/' ;;
+    # Phase E stays inside the example too, and 14-the-port-loop-harness.md was WRONG to predict
+    # this had to widen. guard_gate_files() fingerprints .lit files, example Makefiles,
+    # programming_examples/CMakeLists.txt, kernel_registry/details/*.json and llms/verify/*.py.
+    # E1's llms/shared/builders/gemm_builder.py is in none of those sets, and its second gate leg
+    # RUNS the ten shipped models rather than editing them. Keeping the tight prefix is what stops
+    # E1 quietly touching a shipped model's Makefile to make its own regression leg pass.
+    #
+    # Note also what is now fingerprinted and is in NO allowlist: the driver's own scripts under
+    # agents/scripts/port-loop/. A session that edits an objective check or a gate script halts the
+    # run, which is the point.
+    E1|E2|E3|E4|E5) echo '^programming_examples/transformer_layer/' ;;
     *) echo '' ;;
   esac
 }
@@ -224,6 +346,9 @@ phase_gate_cmd() {
     C1|C2|C3) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
     C4) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-c4.sh" ;;
     D1|D2) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
+    # E1 alone changes shared infrastructure, so E1 alone carries the ten-model leg.
+    E1) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-e1.sh" ;;
+    E2|E3|E4|E5) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
     *) echo "false" ;;
   esac
 }
@@ -1013,6 +1138,154 @@ sys.exit(0)
   return 0
 }
 
+# --- Phase E -----------------------------------------------------------------------------------
+#
+# E reuses phase_c_operator_check for every mode -- freshness, re-derived verdict, fault-injection
+# negative control -- because a mode is just another opcheck operator to it. What E adds is in
+# phase_e_checks.py rather than inline here, for two reasons. It is far more than the forty lines
+# the other phases' embedded python runs to, and putting it in a module makes it runnable in BOTH
+# DIRECTIONS without hardware:
+#
+#     python3 agents/scripts/port-loop/phase_e_checks.py selftest
+#
+# That is the harness's own twice-learned lesson. C4 halted on an objective check no honest run
+# could pass because only its failure direction had been tried; Phase B passed a hardware gate that
+# never touched the NPU. The selftest builds conforming and violating artifact sets in a temp
+# directory and asserts the verdict flips for every clause. Run it after touching either file.
+#
+# The pass direction is also demonstrated against real data: D2's block artifact pair satisfies the
+# full-layer scope, the vector contract and the provenance clause unmodified.
+
+PL_E_CHECKS="${PL_LIB:-}/phase_e_checks.py"
+
+# The example's results directory. PL_E_RESULTS exists so these checks can be aimed at a synthetic
+# artifact set; the default is the real path, and a run never sets it.
+phase_e_results_dir() {
+  echo "${PL_E_RESULTS:-${PL_ROOT}/programming_examples/transformer_layer/results}"
+}
+
+phase_e_stamp() {
+  local s="${PL_E_STAMP:-${_GATE_STARTED_AT:-}}"
+  if [ -z "${s}" ] || [ ! -e "${s}" ]; then
+    log_error "objective check: no gate timestamp; cannot prove artifacts are fresh"
+    return 1
+  fi
+  printf '%s' "${s}"
+}
+
+# `opcheck.py --list`, to a file the python checks read. Only a DECLARED (operator, shape_key)
+# counts as evidence: results/ is gitignored, so an artifact for an undeclared shape is validated
+# by nothing at all -- not the fingerprint, not the tamper check, not any review diff.
+phase_e_write_listing() {
+  local out="$1"
+  local opcheck="${PL_ROOT}/programming_examples/transformer_layer/opcheck.py"
+  if [ ! -f "${opcheck}" ]; then
+    log_error "objective check: ${opcheck} does not exist"
+    return 1
+  fi
+  if ! ( cd "${PL_ROOT}/programming_examples/transformer_layer" \
+           && python3 "${opcheck}" --list ) > "${out}" 2>/dev/null; then
+    log_error "objective check: 'opcheck.py --list' failed"
+    return 1
+  fi
+  if [ ! -s "${out}" ]; then
+    log_error "objective check: 'opcheck.py --list' declared nothing"
+    return 1
+  fi
+  return 0
+}
+
+# phase_e_run <subcommand> [extra args...]
+phase_e_run() {
+  local sub="$1"; shift
+  local stamp listing
+  stamp="$(phase_e_stamp)" || return 1
+  listing="${PL_STATE_DIR}/e-listing.json"
+  phase_e_write_listing "${listing}" || return 1
+  python3 "${PL_E_CHECKS}" "${sub}" \
+    --results "$(phase_e_results_dir)" \
+    --stamp "${stamp}" \
+    --listing "${listing}" \
+    "$@"
+}
+
+# phase_e_mode_objective_check <mode> [extra args for the `mode` subcommand]
+phase_e_mode_objective_check() {
+  local mode="$1"; shift
+  phase_c_operator_check "${mode}" || return 1
+  phase_e_run mode --operator "${mode}" "$@" || {
+    log_error "objective check FAILED: ${mode}'s artifact does not prove a full-layer,"
+    log_error "  per-boundary comparison behind a dispatch vector the driver's own fault run agrees with"
+    return 1
+  }
+  log_info "objective check passed: ${mode} matches at full scope with a measured dispatch vector"
+  return 0
+}
+
+phase_e1_objective_check() {
+  # 1. The naming fix itself, resolved through the real registry rather than read off the source.
+  # The message deliberately does not assert WHY this failed. The check distinguishes a live
+  # collision from an unimportable module from a registry that no longer puts those two shapes on
+  # the same method, and says which on its own stderr; restating one of them here would send a
+  # reader chasing the wrong thing when it was one of the others.
+  if ! python3 "${PL_E_CHECKS}" naming --repo "${PL_ROOT}"; then
+    log_error "objective check FAILED: the GEMM naming clause did not pass; see the line above."
+    log_error "  Until same-method GEMMs at different tile_n mint distinct symbol suffixes and"
+    log_error "  object names, the sequence ladder stays pinned to seq 4096."
+    return 1
+  fi
+
+  # 2. The ladder actually moved, with its OWN negative control on the new point. Reusing
+  #    phase_d_negative_control here is deliberate: it is the mechanism D1 built precisely because
+  #    phase_c_operator_check injects only an operator's FIRST declared shape.
+  local pairs="${PL_STATE_DIR}/e1-ladder-points.txt"
+  : > "${pairs}"
+  if ! phase_e_run ladder --pairs-out "${pairs}"; then
+    log_error "objective check FAILED: no ffn result at a second point on the sequence ladder"
+    return 1
+  fi
+  phase_d_negative_control "${pairs}" || return 1
+
+  # 3. Nothing regressed. Changing how every external GEMM is named is exactly the change that
+  #    could quietly break the operators and the block that already pass.
+  phase_c_operator_check block || return 1
+  phase_d_baseline_768_coverage || return 1
+
+  log_info "objective check passed: the ladder is unblocked and D1/D2 still hold"
+  return 0
+}
+
+phase_e2_objective_check() { phase_e_mode_objective_check coarse; }
+
+# offload aggregates nothing -- checkable from its own artifact, without the other three modes.
+# Six because attention stays in host torch (08c), so it is six projection GEMMs rather than the
+# eight the plan originally predicted.
+phase_e3_objective_check() {
+  phase_e_mode_objective_check offload --expect-no-aggregation --min-submissions 6
+}
+
+phase_e4_objective_check() {
+  phase_e_mode_objective_check runlist || return 1
+  if ! phase_e_run compare --left runlist --right coarse \
+                           --field runlist_entries --relation gt; then
+    log_error "objective check FAILED: the fine-grained mode is not finer than the coarse one"
+    return 1
+  fi
+  return 0
+}
+
+phase_e5_objective_check() {
+  phase_e_mode_objective_check fused || return 1
+  if ! phase_e_run distinguish; then
+    log_error "objective check FAILED: the four modes' dispatch vectors do not separate."
+    log_error "  Per 08 this means the measurement model is not measuring what it claims, and it"
+    log_error "  must be resolved BEFORE Phase F consumes these numbers. The table is above."
+    return 1
+  fi
+  log_info "objective check passed: all four modes agree with the oracle AND separate"
+  return 0
+}
+
 phase_objective_check() {
   case "$1" in
     A) phase_a_objective_check ;;
@@ -1023,6 +1296,11 @@ phase_objective_check() {
     C4) phase_c4_objective_check ;;
     D1) phase_d1_objective_check ;;
     D2) phase_d2_objective_check ;;
+    E1) phase_e1_objective_check ;;
+    E2) phase_e2_objective_check ;;
+    E3) phase_e3_objective_check ;;
+    E4) phase_e4_objective_check ;;
+    E5) phase_e5_objective_check ;;
     *) return 0 ;;
   esac
 }

@@ -57,6 +57,19 @@ These are what actually distinguish the modes. `offload` has 8 submissions and 8
 boundaries; `runlist` has 1 submission with ~29 entries; `coarse` has 1 submission with ~6
 entries; `fused_elf` has few submissions with many AIR launches and near-zero intermediate sync.
 
+> **`[2026-08-05]` `offload` is six submissions, not eight.** Two of its eight GEMMs —
+> `attn_scores` (`4096x64x4096`) and `attn_output` (`4096x4096x64`) — resolve in no registry, and
+> the C4 sweep **cannot be made to produce them**: `sweep_families.py` derives K and N from
+> `FAMILY_HIDDEN × ROLE_KN_MULTIPLES` with a minimum hidden of 512, so no family stages a 64 in the
+> K or N position. Phase E therefore keeps `offload`'s attention in host torch and dispatches the
+> six projection GEMMs, which makes it a hybrid boundary rather than a pure per-GEMM device mode.
+> Recorded as `attention_path` in every `offload` artifact. See
+> [08 §Build order](08-phase-e-execution-strategies.md) and [08c](08c-phase-e3-offload.md).
+>
+> The consequence for this section is that **no absolute submission count is load-bearing**. The
+> distinguishability gate asks for an ordering — `offload` above every other mode, and aggregating
+> nothing — rather than for the number eight.
+
 > **`[2026-08-05]` Those numbers were predictions, and the first one measured is wrong.** Phase D
 > built the `coarse` layer and recorded its vector: **4 submissions, 131 runlist entries, 12 AIR
 > launches, 146 herd launches, 402 sync boundaries**, not "1 submission with ~6 entries". The
@@ -70,6 +83,14 @@ entries; `fused_elf` has few submissions with many AIR launches and near-zero in
 > may be between a number and itself. **Decide which fields actually discriminate, and re-derive
 > the expected values at `baseline_768`, before building the modes** — 08 §Gate says a failure to
 > separate means the measurement model needs revisiting, and that condition has already fired once.
+>
+> **`[2026-08-05]` Decided, before the modes were built**, and implemented in
+> `agents/scripts/port-loop/phase_e_checks.py`: the criterion is ordinal over driver-summed totals,
+> never an absolute threshold. Four gating clauses and two recorded-but-not-halting predictions,
+> listed in [08 §Gate](08-phase-e-execution-strategies.md). One arithmetic note that belongs here
+> rather than there: `as_row()` emits `runlist_entries_per_submission` as a derived **mean**
+> (`dispatch.py:166`), so a mode's total entry count is `Σ round(mean × submissions)` and not the
+> sum of the means. The two agree for the block only because each of its submissions is 1.
 
 Each field must have a written definition in the schema module, tied to the Phase B dispatch
 model, and a single implementation that all four modes call. A per-mode reimplementation of

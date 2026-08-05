@@ -45,7 +45,11 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | C4 — coverage sweep | The 36 `baseline_768` shapes resolve through `gemm_config()`; registry rows written; ten shipped models still pass `make verify` | **done** 2026-08-04 (504 min + 66 min re-run) |
 | D1 — operators at `baseline_768` | Every operator passes `opcheck` at the `baseline_768` widths, including the pre-add `addnorm` | **done** 2026-08-05 (11 min) |
 | D2 — block integration | One full transformer layer matches the torch reference on hardware | **done** 2026-08-05 (156 min) |
-| E — execution strategies | All four modes agree with the reference; dispatch vectors differ as predicted | not started — **next**. Unblocks the sequence ladder first; see [08](08-phase-e-execution-strategies.md) |
+| E1 — unblock the ladder | `(method, tile_n)` names separate; `ffn` passes at a second ladder point; ten shipped models still verify | not started — **next**. See [08a](08a-phase-e1-unblock-the-ladder.md) |
+| E2 — `coarse` + instrumentation | `coarse` matches at full scope behind a measured dispatch vector | not started. See [08b](08b-phase-e2-coarse-and-instrumentation.md) |
+| E3 — `offload` | `offload` matches, and aggregates nothing | not started. See [08c](08c-phase-e3-offload.md) |
+| E4 — `runlist` | `runlist` matches, with more runlist entries than `coarse` | not started. See [08d](08d-phase-e4-runlist.md) |
+| E5 — `fused` + distinguishability | `fused` matches, and all four modes' dispatch vectors separate as the taxonomy predicts | not started. See [08e](08e-phase-e5-fused-and-distinguishability.md) |
 | F — study harness | `execution-smoke-test` yields ≥1 `run_status=passed` row per measurement CSV | not started |
 | G — unattended runner + CI | Full profile run completes with a complete `results_manifest.json` | not started |
 | Goal 1 — sliding window | `make verify` passes with window-crossing prompts | not started |
@@ -161,7 +165,29 @@ each**, not one launch, because `build_addnorm_module` caps rows per call. `coar
 numbers are therefore dominated by `addnorm`, not by the GEMMs — which is a real result about
 where the cost sits, and one the taxonomy should be able to explain.
 
-### Two things Phase E must decide first
+### Four decisions Phase E had to take before writing code, and did
+
+`[2026-08-05]` All four are recorded in [08](08-phase-e-execution-strategies.md) and enforced by
+the harness rather than left to a session:
+
+- **`coarse` wraps `builders/block.py`; it does not re-home it.** The block is enrolled in
+  `run_npu2_block_peano.lit`, in `opcheck --operator block` and in the D1/D2 coverage clauses E1
+  re-runs. Moving it churns gate files for nothing.
+- **The layout is `pattern/<mode>/`**, per 08's own tree, with **a separate `KernelCache` directory
+  per mode**. That last part is not style: a cached ELF is keyed by fingerprint but the cache
+  *directory* is chosen by name (`BLOCK_CACHE_DIR`), so two modes sharing one can trade artifacts
+  and produce valid numbers attributed to the wrong execution boundary.
+- **Distinguishability is ordinal, never threshold.** `coarse` already measures 131 entries, 128 of
+  them `addnorm`'s row blocking, so any absolute number would be measuring L1 capacity rather than
+  the taxonomy. Four gating clauses; two further predictions recorded but not halting.
+- **`offload`'s attention stays in host torch**, so it dispatches six projection GEMMs rather than
+  eight. Its two attention GEMMs (`4096x64x4096`, `4096x4096x64`) resolve in no registry, and
+  **the sweep cannot be made to produce them**: `sweep_families.py` derives K and N from
+  `FAMILY_HIDDEN × ROLE_KN_MULTIPLES` with a minimum hidden of 512, so no `--family` stages a 64 in
+  the K or N position. 08 offered "sweep them in" as one of two options; it is not available. This
+  makes `offload` a hybrid boundary, which its README must say.
+
+### Two things Phase E had to decide first
 
 - **`[2026-08-05]` The ladder is still blocked at one point, and there are now two reasons.**
   Everything runs at `seq = 4096` only. `build_ffn_module`'s up- and down-projections collide on
@@ -180,17 +206,43 @@ where the cost sits, and one the taxonomy should be able to explain.
   arithmetic four different ways against the same oracle. If a mode needs more than that, the
   answer is a recorded finding, not a wider tolerance — the driver rejects anything above `1e-1`.
 
-### The harness needs an E entry
+### The harness has an E entry
 
-There is none yet: `PL_PHASES_IN_SCOPE` still reads `'["D1","D2"]'` and no dispatcher has an `E`
-arm. The `D1`/`D2` arms are the model, and [14](14-the-port-loop-harness.md) is how the driver
-works. Two notes specific to Phase E:
+`[2026-08-05]` Built. `PL_PHASES_IN_SCOPE` reads `'["E1","E2","E3","E4","E5"]'` and all seven
+dispatchers carry arms for each. What it consists of:
 
-- **Consider splitting it.** `PL_STEP_TIMEOUT` caps an implement session at three hours, and E is
-  four strategies plus shared instrumentation. Splitting paid for itself in both C and D.
-- **Its gate will need the cross-deployment regression check** if it makes the `gemm_builder.py`
-  change above, because ten shipped LLM deployments resolve against it. `gate-c4.sh` is the model
-  for a gate that runs the lit suite and then `make verify` over all ten.
+| Piece | Where |
+|---|---|
+| Five sub-phase specs, one per session | [08a](08a-phase-e1-unblock-the-ladder.md) · [08b](08b-phase-e2-coarse-and-instrumentation.md) · [08c](08c-phase-e3-offload.md) · [08d](08d-phase-e4-runlist.md) · [08e](08e-phase-e5-fused-and-distinguishability.md) |
+| E1's two-leg gate | `agents/scripts/port-loop/gate-e1.sh` — lit suite, then `make verify` over the ten shipped models |
+| The objective checks | `agents/scripts/port-loop/phase_e_checks.py`, with its fixtures in `phase_e_selftest.py` |
+| Their both-directions test | `python3 agents/scripts/port-loop/phase_e_checks.py selftest` — 27 clauses, no hardware |
+
+Three things about it worth knowing before touching it:
+
+- **The checks are a module, not a heredoc.** Every other phase embeds its objective check in
+  `phases.sh`; Phase E's are far larger and, more to the point, a module can be run in both
+  directions. `selftest` builds conforming and violating artifact sets in a temp directory and
+  asserts the verdict flips for each clause. The pass direction is also demonstrated against real
+  data: D2's `block` artifact pair satisfies the full-layer scope, the vector contract and the
+  provenance clause unmodified.
+- **The dispatch vectors have a negative control now.** `results/` is gitignored, so a fabricated
+  `dispatch_vectors` block is invisible to `guard_fingerprint`, `guard_check_tamper` and every
+  Codex diff — freshness alone never stopped it, and no phase before E noticed. The driver already
+  re-runs each operator under `--fault-inject input`; Phase E additionally requires that run's
+  summed vector totals to **equal** the clean run's. A session cannot know those six numbers
+  without dispatching.
+- **The driver's own scripts are fingerprinted**, as of this phase, and are in no allowlist. Every
+  anti-reward-hacking layer policed what a diff did to a *gate*; none watched the thing that runs
+  the gates, while sessions run under `--permission-mode bypassPermissions`. Any edit under
+  `agents/scripts/port-loop/` now halts the run.
+
+**The allowlist did not need to widen**, contrary to what [14](14-the-port-loop-harness.md)
+predicted. `guard_gate_files()` covers `.lit` files, example `Makefile`s,
+`programming_examples/CMakeLists.txt`, `kernel_registry/details/*.json` and `llms/verify/*.py`;
+`gemm_builder.py` is in none of them, and E1's second gate leg *runs* the ten shipped models rather
+than editing them. Keeping `^programming_examples/transformer_layer/` is what stops E1 quietly
+touching a shipped model's `Makefile` to make its own regression leg pass.
 
 Two decisions taken on 2026-08-04, now reflected throughout these documents:
 

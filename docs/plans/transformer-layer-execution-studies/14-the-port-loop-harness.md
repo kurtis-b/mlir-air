@@ -46,21 +46,83 @@ single-phase form asked one session for hardware bring-up on six operators *and*
 integration. Their objective checks layer a `baseline_768` coverage clause (D1) and full-layer
 scope plus per-boundary stage assertions (D2) on top of `phase_c_operator_check`.
 
-**Phase E has no entry yet.** `PL_PHASES_IN_SCOPE` still reads `'["D1","D2"]'` and no dispatcher
-has an `E` arm. Three things to settle when adding one:
+`[2026-08-05]` **Phase E is entered as five sub-phases, `E1`–`E5`**, for the reasons C and D split
+and one more: E1 changes shared infrastructure and therefore carries the ten-model regression
+check, which cost C4's gate hours. Folding that into a sub-phase that also builds an execution
+strategy would re-run it on every failure of either. E5 is last because its objective check is the
+only cross-mode one — the four dispatch vectors either separate or they do not, and that cannot be
+asked until all four exist.
 
-- **Split it.** Four strategies plus shared instrumentation does not fit one three-hour session.
-  Both prior splits paid for themselves.
-- **Its gate probably needs `make verify` over the ten shipped models**, because Phase E is the
-  phase that has to change `llms/shared/builders/gemm_builder.py` to unblock the sequence ladder.
-  `gate-c4.sh` is the model for a two-leg gate, and the allowlist has to widen past
-  `^programming_examples/transformer_layer/` to match.
-- **Its objective check has a natural shape already.** `phase_c_operator_check` is parameterized by
-  operator name and the block is just another operator to it; what E adds is *distinguishability*,
-  which is a driver-side assertion over the recorded dispatch vectors — that the four modes'
-  vectors differ from each other in the directions the taxonomy predicts. That is checkable from
-  the artifacts without trusting a word the session writes, which is exactly the property the
-  objective check is for.
+Of the three things this document said to settle when adding the entry, one was right, one was
+wrong, and one grew:
+
+- **"Split it" was right.** Five ways.
+- **"The allowlist has to widen past `^programming_examples/transformer_layer/`" was wrong.**
+  `guard_gate_files()` fingerprints `.lit` files, example `Makefile`s,
+  `programming_examples/CMakeLists.txt`, `kernel_registry/details/*.json` and `llms/verify/*.py`.
+  `gemm_builder.py` is in none of those sets, and `gate-e1.sh`'s second leg *runs* the ten shipped
+  models rather than editing them. All five sub-phases keep the tight prefix — which is also what
+  stops E1 quietly editing a shipped model's `Makefile` to make its own regression leg pass.
+- **The objective check's "natural shape" was right and needed one thing more.** It is
+  `phase_c_operator_check` per mode plus a driver-side cross-mode assertion, as predicted. What was
+  missing is that **the dispatch vectors themselves had no negative control**. `results/` is
+  gitignored, so a fabricated `dispatch_vectors` block is invisible to `guard_fingerprint`,
+  `guard_check_tamper`, `guard_check_destructive` and every Codex diff — freshness was the only
+  barrier, and it does not stop a number that was typed rather than measured. The fix reuses what
+  is already there: the driver re-runs every operator under `--fault-inject input`, so the fault
+  artifact's summed vector totals must **equal** the clean run's. Injection perturbs one input
+  element after the reference exists and does not touch the dispatch path, so on an honest run they
+  are identical — D2's block pair both total 4 / 131 / 12 / 146 / 402 / 202,902,528 — and a session
+  cannot produce those six numbers without dispatching.
+
+### The E checks are a module, and they run in both directions without hardware
+
+`agents/scripts/port-loop/phase_e_checks.py`, with its fixtures in `phase_e_selftest.py`. Every
+other phase embeds its objective check in `phases.sh` and at forty lines that is right; Phase E's
+are an order of magnitude larger, and a module can be *tested*:
+
+```bash
+python3 agents/scripts/port-loop/phase_e_checks.py selftest    # 27 clauses, no hardware, no repo writes
+```
+
+Each case builds a conforming four-mode artifact set in a temp directory, applies exactly one
+mutation, and asserts the verdict flips. That is this document's own twice-learned lesson made
+routine — C4 halted on a check no honest run could pass because only its failure direction had been
+tried, and Phase B passed a hardware gate that ran no hardware. The pass direction is additionally
+demonstrated against real data: D2's `block` artifact pair satisfies the full-layer scope, the
+vector contract and the provenance clause unmodified.
+
+Writing the selftest immediately repaid itself: the first version shared its fixture vectors by
+reference, so one case's mutation leaked into every later case and several clauses were "failing as
+expected" for the *previous* case's reason. A green selftest that proves nothing is the same defect
+as a green gate that runs nothing.
+
+### The driver now watches itself
+
+`guard_gate_files()` includes `agents/scripts/port-loop.sh` and everything under
+`agents/scripts/port-loop/`, and **no phase's allowlist covers them**, so any session edit halts the
+run.
+
+This was a gap from Phase A onward. All three anti-reward-hacking layers police what a diff did to
+a *gate*; not one watched the thing that runs the gates, while sessions execute under
+`--permission-mode bypassPermissions`. And the review would not have caught it either: `run_phase`
+sets the review base from `HEAD` at phase entry, so the driver's own commits sit *before* the base
+and are outside every phase's review diff — the same blind spot that made D1's round-3 reviewer
+raise a finding about fault injection that the driver was already doing.
+
+### A convention violation this phase found and did not fix
+
+`phases.sh` is **1306 lines** against the ~800 cap that [00](00-context-and-goals.md),
+[02](02-porting-conventions.md) and [13](13-verification-and-acceptance.md) gate on. It was 1028
+before Phase E and no document had recorded it — the same oversight as `opcheck_specs.py` at 1043
+and `sweep/registry_sweep.py` at 866, which E1 is splitting.
+
+It is recorded rather than fixed because the obvious two-way split does not help: roughly 1050 of
+those lines are objective checks, so a `phases.sh` / `phase-checks.sh` split leaves the second file
+over the cap too. The real seam is per-phase-family — the table, then C/D's checks, then E's — and
+that is a deliberate refactor, not something to do to the driver in the hour before a
+multi-day run. Phase E's own checks are already outside the file, which is why it only grew by
+~280 lines rather than ~700.
 
 ### A sixth lesson: a coverage clause is not a correctness clause
 
@@ -155,6 +217,12 @@ preflight → implement → commit
   → [ review₁ → fix₁ → commit ] × 3
   → confirm → gate → hardware-check → objective-check → tamper-check → advance | halt
 ```
+
+`[2026-08-05]` `run-one <phase> objective-check` now sources the venv via `pl_env_ensure` before
+dispatching. In a real run `pl_preflight` has already done it; standalone it had not, so Phase E's
+naming clause — which resolves GEMM specs through `shared.builders.gemm_builder` — failed on
+`No module named 'ml_dtypes'` while the driver reported it as a live symbol collision. A check that
+reports the wrong cause is the failure mode this whole section exists to avoid.
 
 Three rounds always run; a clean round's fix step is a no-op. State lives in
 `agents/.state/port-loop/state.json` (gitignored), and phases resume mid-phase via

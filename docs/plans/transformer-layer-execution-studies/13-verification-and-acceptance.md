@@ -38,8 +38,10 @@ then the narrowest useful test.
 | Operators at the block's width | `opcheck.py` at the `baseline_768` widths, one `run_npu2_<op>_peano.lit` each | Phase D1 — every operator right at the width the block runs, including the pre-add `addnorm` |
 | Single block | `opcheck.py --operator block`, `run_npu2_block_peano.lit` | Phase D2 — launch maps, layouts, external linking, BO reuse. Full `seq × hidden` output, zero mismatches, plus a clean per-boundary intermediate at each of ten stages |
 | The golden model's composition | `make reference-tests`, `run_reference_tests.lit` | Phase D2 — host-only, pins erf vs tanh GeLU, post-add vs pre-add residual, and QKV column order, which a numerical comparison would survive |
-| Strategy equivalence | `opcheck.py` through its `dispatch` seam, one `run_npu2_<mode>_peano.lit` per mode | Phase E — all four modes vs the shared FP32 reference. **`[2026-08-05]` Not bare `pytest pattern/`**: that path now holds D2's own `test_reference.py`, and [09](09-phase-f-study-harness.md) requires lit to stay the single entry point. `make reference-tests` / `run_reference_tests.lit` is the pattern D2 established |
-| Strategy distinguishability | Dispatch vector per mode | Phase E — the vectors separate the modes as predicted |
+| The sequence ladder | `gate-e1.sh` — lit suite **and** `make verify` over the ten shipped models | Phase E1 — same-method GEMMs at different `tile_n` mint distinct symbol suffixes and object names, `ffn` passes at a second ladder point with its own fault injection, and D1/D2 still hold |
+| Strategy equivalence | `opcheck.py` through its `dispatch` seam, one `run_npu2_<mode>_peano.lit` per mode | Phases E2–E5 — all four modes vs the shared FP32 reference, each at the full 4096×768 layer output with ≥8 distinctly-named clean per-boundary stages. **`[2026-08-05]` Not bare `pytest pattern/`**: that path now holds D2's own `test_reference.py`, and [09](09-phase-f-study-harness.md) requires lit to stay the single entry point. `make reference-tests` / `run_reference_tests.lit` is the pattern D2 established |
+| Dispatch-vector provenance | The fault-injected run's summed totals equal the clean run's | Phases E2–E5 — `results/` is gitignored, so freshness alone never stopped a fabricated vector. The driver initiates the injected run, so its numbers cannot be written ahead of time |
+| Strategy distinguishability | Dispatch vector per mode, summed by the driver | Phase E5 — the vectors separate the modes as predicted. Ordinal, never threshold: four gating clauses plus two recorded-but-not-halting predictions, in [08 §Gate](08-phase-e-execution-strategies.md) |
 | Harness plumbing | `unattended_reboot smoke-test` | Phase F — plot/regeneration path only, measures nothing |
 | End-to-end setup | `unattended_reboot execution-smoke-test` | Phase F — **≥1 row with `run_status=passed` per measurement CSV** |
 | Full suite | `unattended_reboot start --suite-profile <profile>` | Phase G — complete manifest, counts derived from the profile |
@@ -66,13 +68,14 @@ Phase B modifies `programming_examples/llms/shared/infra/cache.py`. Phase C may 
 `shared/builders/`. Phase A may extend `matrix_multiplication/bf16_in_fp32_out/mm_aie2p.cc`.
 Goal 2 hoists builders into `shared/`.
 
-`[2026-08-05]` **Phase E almost certainly joins them.** Phases C and D were both forbidden from
-touching `llms/shared/builders/gemm_builder.py`, and both hit the same consequence: its symbol and
-object names are minted from the GEMM method alone, ignoring `tile_n`, so two same-method GEMMs at
-different `tile_n` collide — at the symbol level in `stitch_elf`, and at the object level in
-`compile_gemm_mm`, which is the same bug reached twice. It confines the whole study to
-`seq = 4096`. Phase E needs the sequence ladder, so it is the phase that has to make the change,
-and its gate has to carry this rule.
+`[2026-08-05]` **Phase E1 joins them, and it is the only Phase E sub-phase that does.** Phases C and
+D were both forbidden from touching `llms/shared/builders/gemm_builder.py`, and both hit the same
+consequence: its symbol and object names are minted from the GEMM method alone, ignoring `tile_n`,
+so two same-method GEMMs at different `tile_n` collide — at the symbol level in `stitch_elf`
+(`llms/shared/infra/stitching.py:318`), and at the object level in `compile_gemm_mm`
+(`llms/shared/infra/external_kernels.py:133`), which is the same bug reached twice. It confines the
+whole study to `seq = 4096`. E1 makes the change and its gate carries this rule, as
+`agents/scripts/port-loop/gate-e1.sh`. E2–E5 stay inside the example, so they do not.
 
 All of these touch shared infrastructure that the ten shipped LLM deployments depend on. The rule
 from `deploy-new-llm` applies: **after any shared-infrastructure change, re-run `make verify` on

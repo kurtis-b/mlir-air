@@ -6,6 +6,44 @@ Build the four points of the taxonomy defined in
 `[2026-08-05]` Re-anchored against what Phase D actually produced. Four things below decide how
 this phase starts; read them before planning anything.
 
+## This document is the overview; the work is five sub-phases
+
+`[2026-08-05]` Split, for the reason C and D were and one more: `PL_STEP_TIMEOUT` caps an implement
+session at three hours, and E1 carries the ten-model regression check that cost C4's gate hours.
+**Each sub-phase has its own document, and that document is its session's entire task list** — the
+implement prompt injects it whole, so five sessions sharing this one would each try to do
+everything.
+
+| Sub-phase | Document | What it lands |
+|---|---|---|
+| E1 | [08a](08a-phase-e1-unblock-the-ladder.md) | The `(method, tile_n)` naming fix, a second ladder point, the two over-cap module splits |
+| E2 | [08b](08b-phase-e2-coarse-and-instrumentation.md) | `coarse` as a strategy directory, and the artifact contract the other three are measured against |
+| E3 | [08c](08c-phase-e3-offload.md) | `offload` |
+| E4 | [08d](08d-phase-e4-runlist.md) | `runlist`, plus the two operators that do not exist yet |
+| E5 | [08e](08e-phase-e5-fused-and-distinguishability.md) | `fused`, and the four-mode distinguishability gate |
+
+### Four decisions taken before any code, because the harness enforces them
+
+1. **`coarse` wraps `builders/block.py`**, it does not re-home it. See [08b](08b-phase-e2-coarse-and-instrumentation.md).
+2. **`pattern/<mode>/`**, with a separate `KernelCache` directory per mode — a shared one lets two
+   modes trade fingerprint-matching ELFs and misattribute a dispatch vector.
+3. **Distinguishability is ordinal over driver-summed totals, never absolute thresholds.** Four
+   gating clauses, two predictions recorded but not halting. See §Gate.
+4. **`offload`'s attention stays in host torch**, six GEMM dispatches rather than eight. See
+   §Build order — the option this document previously offered is not available.
+
+### Two claims this document made that the code does not support
+
+- **`stitch_elf` and `compile_gemm_mm` are not in `gemm_builder.py`.** They are
+  `llms/shared/infra/stitching.py:318` and `llms/shared/infra/external_kernels.py:133`. The fix
+  still lands in `gemm_builder.py` — it holds the suffix/object table and `gemm_method_spec()` is
+  its only selector — and the blast radius is *smaller* than feared: `gemm_method_spec` has no
+  external callers, and the one file importing it by name
+  (`llms/qwen25_0_5b/qwen25_0_5b_prefill.py:61`) never calls it.
+- **A `transpose` example does exist**, in three variants under `data_transfer_transpose/`
+  (`dma/`, `channel/`, `dma_bf16/`, the last with a `transpose.cc`). What does not exist is a
+  builder or a registry row. `elementwise_mul` genuinely does not exist in any form.
+
 ## What Phase D left you, and what it did not
 
 Phase D built one `encoder_bert` layer at `baseline_768`, `seq = 4096`, matching an FP32 torch
@@ -164,15 +202,34 @@ attn_output   4096 x 4096 x   64   ->  gemm_config() raises
 ```
 
 Neither shape is in `kernel_registry` — there is no `K = 64` or `N = 64` bf16-out row anywhere in
-it. [06](06-phase-c-operators.md) says "the attention GEMMs go through FlashAttention rather than
-`gemm_builder` and need no GEMM registry row", which is true for `coarse` and `fused`, where
-attention is inside `mha_out_proj`. It is **false for `offload`**, the one mode whose whole
-premise is dispatching them as standalone GEMMs.
+it (minimum K is 512, minimum N is 128 across all 69 shapes). [06](06-phase-c-operators.md) says
+"the attention GEMMs go through FlashAttention rather than `gemm_builder` and need no GEMM registry
+row", which is true for `coarse` and `fused`, where attention is inside `mha_out_proj`. It is
+**false for `offload`**, the one mode whose whole premise is dispatching them as standalone GEMMs.
 
-Decide which before building it: sweep those two shapes into the registry (the C4 tool does it, at
-the cost of machine time), or route `offload`'s attention through FlashAttention too and say so —
-in which case `offload` is no longer eight GEMM dispatches and its dispatch vector changes shape.
-Either is defensible; leaving it undecided means discovering it from a `KeyError` mid-phase.
+**`[2026-08-05]` Decided: attention stays in host torch, and `offload` dispatches six GEMMs.**
+
+```
+q_proj  k_proj  v_proj  output_proj  up_proj  down_proj
+```
+
+This document previously offered two options — sweep the two shapes into the registry, or route
+attention through FlashAttention. **The first is not available.** `sweep/sweep_families.py` derives
+K and N from `FAMILY_HIDDEN × ROLE_KN_MULTIPLES`, with a minimum hidden of 512, and M from
+`SEQ_LADDER`; no `--family` can stage a 64 in the K or N position. `attn_scores` would additionally
+need `K = 64` against a minimum `tile_k_l2` of 256, which does not tile.
+
+Host torch is chosen over a FlashAttention dispatch because it is what this document already
+prescribes for everything between the GEMMs, and because it is numerically the safest of the three
+against an `atol` with no headroom — host FP32 attention lands closer to the FP32 oracle than the
+device path does. The cost is honest and must be recorded: `offload` becomes a *hybrid* boundary
+rather than a pure per-GEMM device implementation. The artifact carries `attention_path` and the
+mode's README says so, and the distinguishability gate asks for an ordering rather than the number
+eight. See [08c](08c-phase-e3-offload.md).
+
+One rule that decision makes load-bearing: **the mode computes and the oracle checks, and they may
+not share arithmetic.** `offload` does more host math than any other mode, and calling
+`pattern/reference.py`'s per-boundary helpers to do it would compare a value against itself.
 
 Everything between them — reshapes, softmax, scaling, masking, normalization, residuals — stays
 in torch on the host. Port `_blocked_attention` and `_resolve_query_block_size`: above a scratch
@@ -285,12 +342,45 @@ measurement model needs revisiting before Phase F consumes it.
 counts: 4 submissions and 131 runlist entries for the layer, because the two normalization points
 are 64 dispatches each. If `runlist` is expected to have "many" entries and `coarse` "few", those
 words have to survive `coarse` already having 131 — otherwise the predicted separation is between
-a number and itself. Decide what the vector's discriminating fields actually are before building
-the modes, because that decision is the gate.
+a number and itself.
+
+`[2026-08-05]` **Decided, and implemented in `agents/scripts/port-loop/phase_e_checks.py` before
+any mode is built.** The criterion is **ordinal over driver-summed totals**, never an absolute
+threshold — a threshold here would be measuring `build_addnorm_module`'s L1 capacity rather than
+the taxonomy. The driver sums each mode's recorded vectors itself and prints the full four-by-six
+table whether it passes or fails.
+
+Four clauses gate, each following from the definition of the boundary rather than a guess at an
+implementation:
+
+1. **Distinctness.** No two modes' six-field totals are equal. If two modes share a vector, the
+   vector is not measuring the boundary.
+2. **`offload` is the host-mediated extreme:** its `host_submissions` strictly exceeds every other
+   mode's, and `runlist_entries == host_submissions` — it aggregates nothing.
+3. **`runlist` is finer than `coarse`:** `runlist.runlist_entries > coarse.runlist_entries`.
+4. **`fused` removes intermediate host sync**, which is what MLIR-level fusion *is*:
+   `fused.sync_boundaries < coarse.sync_boundaries`.
+
+Two further predictions are **recorded with a verdict but do not halt**:
+`fused.runlist_entries < coarse.runlist_entries`, and `fused.air_launches >= coarse.air_launches`.
+Both assume a particular fused decomposition — a faithful whole-layer stitch may still row-block
+its normalization, and `air_launches` is counted once per distinct ELF while `herd_launches`
+accumulates per step ([03](03-measurement-model.md), and `dispatch.py:122-153`), which makes the
+second weaker than it looks. If either is false, that is a finding for the mode's README.
 
 This is also the natural shape for the driver's objective check: the four modes' recorded vectors
 either differ in the predicted directions or they do not, and that is checkable from the artifacts
 without trusting anything the session writes.
+
+`[2026-08-05]` **And the vectors themselves now have a negative control.** `results/` is gitignored,
+so a fabricated `dispatch_vectors` block is invisible to `guard_fingerprint`, `guard_check_tamper`
+and every Codex diff; freshness was the only barrier, and no phase before E noticed. The driver
+already re-runs each operator under `--fault-inject input` and requires failure — Phase E
+additionally requires that run's summed totals to **equal** the clean run's. Injection perturbs one
+input element after the reference exists and does not touch the dispatch path, so on an honest run
+they are identical; D2's block clean and fault artifacts both total
+4 / 131 / 12 / 146 / 402 / 202,902,528. A session cannot produce those six numbers without
+dispatching.
 
 ## Risks
 
