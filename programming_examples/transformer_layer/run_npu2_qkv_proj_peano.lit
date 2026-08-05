@@ -14,12 +14,22 @@
 // outputs. Not cosine similarity -- kernel_registry/README.md is explicit that
 // a correlation gate is blind to a systematic per-element scale error.
 //
-// Both registered shapes run, and both are checked. The three precision lines
-// per shape are checked individually and in order: a build that wired all three
-// split-cast launches at the same column offset would still emit three outputs
-// and still pass a check that only looked at the verdict, so requiring three
-// distinct precision reports and then the named operator and shape makes the
-// shape of the evidence part of the gate.
+// All three registered shapes run, and all three are checked. The three
+// precision lines per shape are checked individually and in order: a build that
+// wired all three split-cast launches at the same column offset would still emit
+// three outputs and still pass a check that only looked at the verdict, so
+// requiring three distinct precision reports and then the named operator and
+// shape makes the shape of the evidence part of the gate.
+//
+// The third shape is the study's 64x768x2304, and it is here because a registry
+// resolution check cannot show that a row computes the right thing. That shape
+// was registered with `drain` and `direct` only while this builder pins
+// fused-cast, so the operator raised on it; the fused-cast configuration the
+// sweep later found for it replaced one that returned zeros for two of the nine
+// sub-tiles of each cast worker. It is also the only point here whose herd is
+// not the file-level 8x4, M = 64 being too short to hold 8 rows of fused-cast's
+// forced tile_m -- so it is the one shape that fails if the per-row herd stops
+// being wired through the lookup.
 //
 // NPU serialization lives one layer down, not in the recipe below. Device
 // access is locked on /tmp/npu.lock, which XRTRunner.run_test holds across
@@ -52,3 +62,9 @@
 // CHECK: [precision] Output 2
 // CHECK: PASS!
 // CHECK: [opcheck] qkv_proj [2048x2048]: PASS
+// CHECK: QKV GEMM 64x768x2304 (fused-cast, registry{{.*}}herd=1x4)
+// CHECK: [precision] Output 0
+// CHECK: [precision] Output 1
+// CHECK: [precision] Output 2
+// CHECK: PASS!
+// CHECK: [opcheck] qkv_proj [64x768]: PASS

@@ -29,17 +29,31 @@ CONTRACT
         ``write_family_markdown``).
 
     python3 registry_sweep.py --family baseline_768 --verify-resolution
-        Assert every shape in the family resolves through
-        ``registry_lookup.gemm_config()``. No hardware; this is what the lit
+        Assert every shape in the family resolves THROUGH THE OPERATOR BUILDER
+        THAT OWNS IT -- not through the generic lookup, which answers a weaker
+        question (see ``verify_resolution``). No hardware; this is what the lit
         test runs.
 
     ``--role`` / ``--seq`` / ``--shape`` narrow any of the above.
+    ``--remeasure-registered`` measures a shape that is already registered,
+    which is how a registered shape's MISSING METHOD gets a candidate; the
+    write stays append-only either way.
 
 APPEND ONLY
     The shapes already in the registry are what the ten shipped LLM deployments
     resolve against. Re-measuring one into a different winner would change their
     behaviour without anyone asking. ``registry_writer`` refuses, and this tool
-    skips an already-registered shape rather than queueing it.
+    skips an already-registered shape rather than queueing it unless
+    ``--remeasure-registered`` says otherwise -- and even then, measuring only
+    fills the results directory; the write is where the rule is enforced.
+
+    The one edit permitted to an existing entry is ADDING A METHOD it has no row
+    for, through ``registry_writer.add_missing_methods``, and only to an entry
+    whose ``used_by`` says this sweep wrote it. A shape can be registered and
+    still unbuildable by the operator that needs it -- ``64x768x2304`` was
+    registered with ``drain`` and ``direct`` only, and ``qkv_proj`` pins
+    ``fused-cast`` -- so "the shape is present" is not the same claim as "the
+    operator resolves". ``--verify-resolution`` is what tells the two apart.
 
 LOCKING -- READ THIS BEFORE ADDING A flock ANYWHERE
     This tool takes NO lock. Wrap the whole invocation instead:
@@ -113,7 +127,10 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 _EXAMPLE_DIR = _HERE.parent
 _PROJ_ROOT = _EXAMPLE_DIR.parent
-for _p in (str(_PROJ_ROOT), str(_HERE)):
+# _EXAMPLE_DIR ahead of _PROJ_ROOT so `builders` is this example's package.
+# PYTHONPATH here ends in a colon, which puts the CWD on sys.path, so the name
+# is resolvable to whatever `builders/` the caller happened to stand in.
+for _p in (str(_PROJ_ROOT), str(_EXAMPLE_DIR), str(_HERE)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -486,45 +503,110 @@ def load_all_results(shapes, results_dir, perf_iters, candidate_kwargs=None):
     return all_records
 
 
-def verify_resolution(shapes):
-    """Assert every shape resolves through the registry INTO A BUILDABLE config.
+#: Which operator builder owns each role. Named rather than derived, because
+#: this is the mapping the check is ABOUT -- a role whose builder moves must
+#: move here too, and an unknown role raises rather than resolving generically.
+ROLE_BUILDERS = {
+    "qkv_proj": "build_qkv_proj_module",
+    "ffn_up": "build_ffn_module",
+    "ffn_down": "build_ffn_module",
+    "o_proj": "build_mha_out_proj_module",
+}
 
-    Returns the failures. Resolving is only half the claim: a row also has to
-    carry a herd that tiles its own shape, because the example builders assert
-    ``M % (tile_m * herd_m) == 0`` and ``N % (tile_n * herd_n) == 0``
-    (``bf16_in_bf16_out/run.py:62,65``) before they compile anything. The
-    ladder starts at ``M = 64``, where neither method's forced ``tile_m`` fits
-    the file-level 8x4, so those rows carry their own herd -- and a row that
-    resolves without one would raise here rather than three phases downstream
-    inside whatever tried to build it.
+
+def builder_gemm_spec(shape):
+    """``(builder, spec)`` the operator that owns this shape resolves for it.
+
+    Calls the PRODUCTION resolver -- ``qkv_proj.qkv_gemm_spec``,
+    ``ffn.ffn_gemm_specs``, ``o_proj.o_proj_gemm_spec`` -- rather than
+    re-deriving what each builder wants. Those three functions were split out of
+    their builders precisely so a caller can learn what a build would resolve
+    without building it, and reusing them is what keeps this check from drifting
+    away from the code it is checking.
+
+    The distinction that matters: ``gemm_config`` answers "what is this row's
+    fastest high-precision method", and for the QKV shapes that is usually
+    ``drain``. ``qkv_proj`` cannot build ``drain`` -- its three-way C split rides
+    ``fused-cast``'s separate cast launch -- so it asks for ``fused-cast`` BY
+    NAME, and a row with no ``fused-cast`` entry raises for it while resolving
+    perfectly happily for the generic lookup. Checking the generic lookup
+    therefore proves nothing about whether the operator can be built.
     """
-    from kernel_registry.registry_lookup import gemm_config
+    from builders.ffn import ffn_gemm_specs
+    from builders.o_proj import o_proj_gemm_spec
+    from builders.qkv_proj import qkv_gemm_spec
 
+    if shape.role not in ROLE_BUILDERS:
+        raise KeyError(
+            f"no operator builder is recorded for role {shape.role!r}; add it "
+            f"to ROLE_BUILDERS with the resolver it calls rather than letting "
+            f"this shape be checked against the generic lookup"
+        )
+    builder = ROLE_BUILDERS[shape.role]
+    if shape.role == "qkv_proj":
+        # emb_dim is K; the builder derives N = 3 * emb_dim itself.
+        return builder, qkv_gemm_spec(shape.M, shape.K)[0]
+    if shape.role == "ffn_up":
+        return builder, ffn_gemm_specs(shape.M, shape.K, shape.N)[0]
+    if shape.role == "ffn_down":
+        # The down projection is (seq, ffn_dim, emb_dim), so K and N swap
+        # relative to the builder's (emb_dim, ffn_dim) argument order.
+        return builder, ffn_gemm_specs(shape.M, shape.N, shape.K)[1]
+    return builder, o_proj_gemm_spec(shape.M, shape.K)[0]
+
+
+def verify_resolution(shapes):
+    """Assert every shape resolves THROUGH ITS PRODUCTION BUILDER, buildably.
+
+    Returns the failures. Three claims, and the first is the one that a check
+    against ``gemm_config`` alone silently misses:
+
+    - The operator that owns the shape can resolve it. Each role goes through
+      its own builder's spec resolver, so a builder that pins a method gets its
+      pinned method looked up. ``64x768x2304`` passed a generic-lookup check
+      while ``qkv_proj`` raised ``KeyError`` on it, because the row's winner was
+      ``drain`` and the row carried no ``fused-cast`` entry at all.
+    - The resolved row carries a herd that tiles its own shape. The example
+      builders assert ``M % (tile_m * herd_m) == 0`` and
+      ``N % (tile_n * herd_n) == 0`` (``bf16_in_bf16_out/run.py:62,65``) before
+      they compile anything, and the ladder starts at ``M = 64`` where neither
+      method's forced ``tile_m`` fits the file-level 8x4. ``resolve_gemm_spec``
+      already refuses such a row; this re-checks it against the shape the sweep
+      asked about rather than the one the spec was resolved for.
+    - The method is one a builder can emit. That falls out of going through the
+      builders: ``_spec_with_tiles`` raises on a method ``gemm_builder`` does not
+      know, so a row whose high-precision winner was recorded as ``direct``
+      fails here instead of inside every model that later read it.
+
+    What it does NOT do is compile anything. Building all 36 modules costs an
+    aircc run apiece; resolution is the failure this sub-phase introduces and the
+    one a registry write can regress.
+    """
     failures = []
     for shape in shapes:
         try:
-            cfg = gemm_config(shape.M, shape.K, shape.N)
+            builder, spec = builder_gemm_spec(shape)
         except (KeyError, ValueError) as exc:
             # The lookup's message inlines every measured shape, which is 2 kB
             # per failure and drowns the list of what actually failed.
             failures.append((shape, str(exc).split(". Measured shapes")[0]))
             continue
-        tile, (herd_m, herd_n) = cfg["tile"], cfg["herd"]
-        if shape.M % (tile["tile_m"] * herd_m) or shape.N % (tile["tile_n"] * herd_n):
+        herd_m, herd_n = spec["herd_m"], spec["herd_n"]
+        if shape.M % (spec["tile_m"] * herd_m) or shape.N % (spec["tile_n"] * herd_n):
             failures.append(
                 (
                     shape,
-                    f"resolves to {cfg['method']} tile_m={tile['tile_m']} "
-                    f"tile_n={tile['tile_n']} at herd {herd_m}x{herd_n}, which "
-                    f"does not tile {shape.M}x{shape.N}",
+                    f"{builder} resolves it to {spec['method']} "
+                    f"tile_m={spec['tile_m']} tile_n={spec['tile_n']} at herd "
+                    f"{herd_m}x{herd_n}, which does not tile "
+                    f"{shape.M}x{shape.N}",
                 )
             )
             continue
         print(
             f"[resolve] {shape.label} ({shape.role}, seq={shape.seq}) -> "
-            f"{cfg['method']} {tile['tile_m']}/{tile['tile_k_l2']}"
-            f"/{tile['tile_k_l1']}/{tile['tile_n']} herd {herd_m}x{herd_n} "
-            f"{cfg['gflops']} GFLOP/s"
+            f"{builder} {spec['method']} {spec['tile_m']}/{spec['tile_k_l2']}"
+            f"/{spec['tile_k_l1']}/{spec['tile_n']} herd {herd_m}x{herd_n}"
         )
     return failures
 
@@ -633,6 +715,13 @@ def main():
     parser.add_argument("--verify-resolution", action="store_true")
     parser.add_argument("--tile-n-options", type=int, default=None)
     parser.add_argument("--tile-k-l2-options", type=int, default=None)
+    parser.add_argument("--cast-tile-n-options", type=int, default=None)
+    parser.add_argument(
+        "--remeasure-registered",
+        action="store_true",
+        help="measure shapes that are already registered (measuring writes "
+        "only to --results; the registry write stays append-only)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -644,6 +733,8 @@ def main():
         candidate_kwargs["tile_n_options"] = args.tile_n_options
     if args.tile_k_l2_options is not None:
         candidate_kwargs["tile_k_l2_options"] = args.tile_k_l2_options
+    if args.cast_tile_n_options is not None:
+        candidate_kwargs["cast_tile_n_options"] = args.cast_tile_n_options
 
     if args.list:
         print(
@@ -700,11 +791,24 @@ def main():
         if unusable:
             print(f"WARNING: no passing candidate for {len(unusable)}: {unusable}")
         fresh = [r for r in rows if r["shape"].key not in already]
-        skipped = [r["shape"].label for r in rows if r["shape"].key in already]
-        if skipped:
-            print(f"already registered, left untouched: {skipped}")
         written = registry_writer.append_shapes(fresh)
         print(f"appended {len(written)} shapes to {registry_writer.GEMM_JSON.name}")
+        # A shape this sweep already wrote can still be missing a METHOD, if the
+        # grid of the day had no passing candidate for it. Adding one is the
+        # single edit `registry_writer` permits to an existing entry, and it is
+        # guarded there; everything else about the entry stays byte-identical.
+        report = registry_writer.add_missing_methods(
+            [r for r in rows if r["shape"].key in already]
+        )
+        for key, methods in report["added"]:
+            print(f"added {methods} to the existing {key} entry")
+        if report["not_owned"]:
+            print(
+                f"already registered by someone else, left untouched: "
+                f"{report['not_owned']}"
+            )
+        if report["unchanged"]:
+            print(f"already complete, left untouched: {report['unchanged']}")
         # Deliberately not `rows`: the markdown section is replaced whole, so it
         # is rebuilt from the whole family however the append was narrowed.
         mirrored = write_family_markdown(
@@ -717,12 +821,23 @@ def main():
         return 0
 
     already = registry_writer.registered_shape_keys()
-    queued = [s for s in shapes if s.key not in already]
-    if len(queued) != len(shapes):
-        print(
-            f"skipping {len(shapes) - len(queued)} already-registered shapes "
-            f"(this sweep is append-only)"
-        )
+    if args.remeasure_registered:
+        queued = list(shapes)
+        registered = [s.label for s in shapes if s.key in already]
+        if registered:
+            print(
+                f"measuring {len(registered)} already-registered shapes on "
+                f"request: {registered}. Measuring writes only to the results "
+                f"directory; what the registry accepts back is still "
+                f"append-only, plus a method an owned entry is missing."
+            )
+    else:
+        queued = [s for s in shapes if s.key not in already]
+        if len(queued) != len(shapes):
+            print(
+                f"skipping {len(shapes) - len(queued)} already-registered shapes "
+                f"(this sweep is append-only)"
+            )
     try:
         all_records = sweep(
             queued,

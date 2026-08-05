@@ -99,7 +99,9 @@ memory bank) all produce plausible wrong numbers rather than errors.
 | `sweep/sweep_measure.py` | One candidate end to end — build, numerical check, timing. The process the sweep forks |
 | `sweep/registry_writer.py` | The append-only write into the registry JSON and both markdown pages |
 | `sweep/registry_sweep.py` | Orchestration: turbo gate, resume, checkpointing, winner selection, the CLI |
-| `sweep/run_npu2_registry_resolution.lit` | Every `baseline_768` shape resolves through the registry. No NPU |
+| `sweep/test_registry_writer.py` | What the writer will and will not do to an existing shape, against a temporary registry |
+| `sweep/run_npu2_registry_resolution.lit` | Every `baseline_768` shape resolves through the builder that owns it. No NPU |
+| `sweep/run_sweep_writer_tests.lit` | The writer's append-only guards. No NPU |
 
 There are two compiled objects, not six: `encoder.cc` and `addnorm_ffn.cc` are
 the only translation units, and each `#include`s its two siblings the way
@@ -182,6 +184,7 @@ bugs. `sweep/` is the tool that makes a shape resolvable.
 ```bash
 make registry-plan                # every (shape, candidate) it would measure. No NPU.
 make registry-resolution          # every shape resolves. No NPU; this is the lit test.
+make registry-writer-tests        # the writer's append-only guards. No NPU.
 flock -x -w 1800 /tmp/mlir-air-npu.lock make registry-sweep
 make registry-write               # fold the results into the registry. No NPU.
 ```
@@ -192,11 +195,21 @@ fastest that passes. `FAMILY=` selects which width of the case matrix to sweep;
 `baseline_768` is the one Phase D needs and the one currently registered, and the
 other two families are the same tool over a different id.
 
-**The sweep never modifies a registered shape.** The rows already in the registry
-are what the ten shipped LLM deployments resolve against, and re-measuring one
-into a different winner would change their behaviour without anyone asking. The
-writer refuses, the orchestrator skips, and the JSON is edited as text rather
-than re-serialized so every pre-existing byte is identical by construction.
+**The sweep never re-measures a registered shape.** The rows already in the
+registry are what the ten shipped LLM deployments resolve against, and
+re-measuring one into a different winner would change their behaviour without
+anyone asking. The writer refuses, the orchestrator skips, and the JSON is edited
+as text rather than re-serialized so every pre-existing byte is identical by
+construction.
+
+The one edit an existing entry accepts is **adding a method it has no row for**,
+and only to an entry whose `used_by` says this sweep wrote it — a row a shipped
+model owns is unreachable through that path, and a re-render that would change
+any method already present raises instead of writing. It exists because a shape
+can be registered and still unbuildable by the operator that needs it, which is
+what `64×768×2304` was; see the `best.high` note below. Measuring such a shape
+again needs `SWEEP_ARGS="--remeasure-registered"`, since measuring writes only to
+the results directory and it is the write that is append-only.
 
 Two things about these rows differ from the model-deployment rows next to them,
 both forced by the sequence ladder starting at 64 and both written up on the
@@ -265,13 +278,27 @@ therefore asks for `fused-cast` by name (`resolve_gemm_spec(..., method=...)`),
 which is still fully registry-driven — the tiles and the herd are that method's
 own measured row at that exact shape — and the run log says when the pinned
 method is not the shape's fastest. The other two GEMM builders wire either
-method and read `best.high` unchanged. **The one shape this does not rescue is
-`64×768×2304`**: no `fused-cast` candidate passed there (`mean_rel_L1 ≈ 0.46`
-across all four, ~30% of elements wrong — a datapath failure, not a tolerance
-edge), so its entry has only `drain` and `direct` and `qkv_proj` at `seq = 64`
-raises. Every other `baseline_768` QKV point builds. The row's `_note` records
-the failure; fixing it means finding a `fused-cast` configuration that is
-numerically correct at that shape, not widening the builder.
+method and read `best.high` unchanged.
+
+So **"the shape is in the registry" and "the operator can build it" are
+different claims**, and `make registry-resolution` checks the second one: each
+role goes through its own builder's spec resolver rather than through
+`gemm_config()`. `64×768×2304` is why. It was first registered with `drain` and
+`direct` only — every `fused-cast` candidate in the grid of the day failed
+(`mean_rel_L1 ≈ 0.46`, ~30% of elements wrong) — so it resolved for the generic
+lookup and `qkv_proj` at `seq = 64` raised `KeyError`. A generic-lookup check
+called that a pass.
+
+**A legal `cast_tile_n` is not necessarily a correct one**, which is what that
+row's failure turned out to be. `fused-cast`'s separate cast launch collapses
+`M×N` to 1-D, hands each of 8 workers a contiguous chunk, and walks it in
+`cast_tile_n` steps. At `64×768×2304` the chunk is 18432 and the harness default
+of 2048 divides it exactly — and two of the nine sub-tiles come back **zero**.
+The same candidate at `cast_tile_n = 1024` passes at 446 GFLOP/s. Nothing about
+the shape predicts which values are safe, so `cast_tile_n` is a swept knob
+(`CAST_TILE_N_PREFERENCE`, fused-cast only) rather than a derived one, and the
+numerical check decides. `drain` still wins the tier here at 945; the
+`fused-cast` row exists so `qkv_proj` has something to build.
 
 **Multi-segment designs cannot use the xclbin output path.** Every `air.launch`
 lowers to its own `aie.device` under an `aiex.configure` / `aiex.run` runtime

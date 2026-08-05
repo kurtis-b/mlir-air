@@ -1,0 +1,33 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase C4 registry writer: host-only tests for the append-only rule.
+//
+// The rule: the sweep may APPEND a shape, may add a METHOD to a shape it wrote
+// itself, and may do nothing else. The rows already in kernel_registry are what
+// the ten shipped LLM deployments resolve against, so a writer that quietly
+// re-measured one would change their behaviour without anyone asking.
+//
+// This is the only thing that checks the rule before the fact. The driver's
+// objective check compares the registry against its base commit, which catches
+// the breach after the file has already been overwritten and says nothing about
+// which guard failed. These provoke each guard directly, against a temporary
+// copy of a synthetic registry -- the module's own GEMM_JSON path is repointed
+// for the duration, so no test here can reach the real file.
+//
+// No NPU, no XRT, no Peano: the writer is text manipulation over JSON. It sits
+// beside the compile-only kernel gate for the same reason the Phase B seam tests
+// do, and it is cheap enough to keep in a PR check.
+//
+// The test file carries no framework dependency -- pytest is not installed in
+// the sandbox venv -- so it runs as a plain script and prints a pass count. The
+// count is part of the gate: a file that silently stopped defining a test would
+// still print a final line saying everything passed.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming
+// one in prose -- even inside a comment -- registers as a second directive and
+// leaves the test UNRESOLVED. Describe them, never spell them out.
+//
+// RUN: python3 %S/test_registry_writer.py | FileCheck %s
+//
+// CHECK: 8/8 passed

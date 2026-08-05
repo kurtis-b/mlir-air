@@ -954,8 +954,23 @@
       "K": 768,
       "N": 2304,
       "used_by": "transformer-layer study baseline_768 qkv_proj (seq=64)",
-      "_note": "M=64 is smaller than tile_m x 8, so the herd shrinks: direct 1x4, drain 2x4 (per-method `herd` overrides the file-level 8x4). fused-cast: no candidate passed (failed_build, failed_precision; closest needed atol 2.14e-01 vs 4.90e-03).",
+      "_note": "M=64 is smaller than tile_m x 8, so the herd shrinks: direct 1x4, drain 2x4, fused-cast 1x4 (per-method `herd` overrides the file-level 8x4).",
       "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 128,
+            "tile_k_l1": 32,
+            "tile_n": 96
+          },
+          "gflops": 446,
+          "mean_rel_L1": 0.0099,
+          "tier": "high",
+          "herd": [
+            1,
+            4
+          ]
+        },
         "drain": {
           "tile": {
             "tile_m": 32,

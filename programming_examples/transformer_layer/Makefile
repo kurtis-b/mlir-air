@@ -25,7 +25,8 @@ SWEEP_ARGS ?=
 .PHONY: help compile runlist-gate seam-tests clean opcheck-list \
         check-elementwise-add check-causal-mask check-layer-norm check-addnorm \
         check-qkv-proj check-ffn check-mha-out-proj check-fault-control \
-        registry-resolution registry-sweep registry-write registry-plan
+        registry-resolution registry-sweep registry-write registry-plan \
+        registry-writer-tests
 
 help:
 	@echo "Transformer-layer AIE2P device kernels, the Phase B runtime seam, and"
@@ -50,15 +51,20 @@ help:
 	@echo "  make registry-plan  Every (shape, candidate) the sweep would measure."
 	@echo "                      No NPU required."
 	@echo "  make registry-resolution"
-	@echo "                      Assert every $(FAMILY) shape resolves through"
-	@echo "                      kernel_registry. No NPU required; this is what"
-	@echo "                      the lit test runs."
+	@echo "                      Assert every $(FAMILY) shape resolves through the"
+	@echo "                      operator builder that owns it, not just through"
+	@echo "                      the registry -- a builder that pins a method needs"
+	@echo "                      that method's row, not the row's winner. No NPU"
+	@echo "                      required; this is what the lit test runs."
 	@echo "  make registry-sweep Measure the tile configs for $(FAMILY) and"
 	@echo "                      checkpoint them. NEEDS AN NPU, takes about an"
 	@echo "                      hour, resumable. Wrap it:"
 	@echo "                        flock -x -w 1800 /tmp/mlir-air-npu.lock make registry-sweep"
 	@echo "  make registry-write Fold the swept results into the registry JSON and"
 	@echo "                      both markdown pages. Append-only. No NPU required."
+	@echo "  make registry-writer-tests"
+	@echo "                      Host-only tests for what the writer will and will"
+	@echo "                      not do to an existing shape. No NPU required."
 	@echo "  make clean          Remove $(BUILD_DIR)."
 	@echo ""
 	@echo "Variables: TILE_M=$(TILE_M) TILE_K=$(TILE_K) TILE_N=$(TILE_N)"
@@ -165,6 +171,9 @@ registry-sweep:
 
 registry-write:
 	python3 $(srcdir)/sweep/registry_sweep.py --family $(FAMILY) --write-registry $(SWEEP_ARGS)
+
+registry-writer-tests:
+	python3 $(srcdir)/sweep/test_registry_writer.py
 
 clean:
 	rm -rf $(BUILD_DIR) __pycache__ runlist_gate_cache

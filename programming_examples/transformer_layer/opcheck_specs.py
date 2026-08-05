@@ -451,9 +451,10 @@ SPECS = [
         "prepare": _prepare_addnorm,
     },
     {
-        # The only registered projection shapes are (M, K, 3K) for K in
-        # {1024, 2048}; 2048x1024x3072 is the smaller of the two. See the
-        # structured report for the case-matrix shapes C4 still has to measure.
+        # The two model-registered projection shapes are (M, K, 3K) for K in
+        # {1024, 2048}; 2048x1024x3072 is the smaller of the two. The C4 sweep
+        # added the study's own (seq, 768, 2304) ladder beside them, and its
+        # shortest point runs below.
         "operator": "qkv_proj",
         "shape_key": "2048x1024",
         "shape": {"seq_len": 2048, "emb_dim": 1024},
@@ -469,6 +470,33 @@ SPECS = [
         "operator": "qkv_proj",
         "shape_key": "2048x2048",
         "shape": {"seq_len": 2048, "emb_dim": 2048},
+        "atol": 5e-3,
+        "prepare": _prepare_qkv_proj,
+    },
+    {
+        # The shortest point of the study's own ladder, and the one shape this
+        # operator could not build at all until the C4 sweep found a fused-cast
+        # configuration for it: 64x768x2304 was registered with `drain` and
+        # `direct` only, and this builder pins fused-cast. It is here because a
+        # resolution check alone cannot show that the row it found actually
+        # computes the right thing -- the row it replaced was numerically wrong
+        # (two of nine cast sub-tiles returned zeros), not absent.
+        #
+        # It is also the only entry here at herd 1x4 rather than 8x4: M = 64
+        # cannot hold 8 rows of fused-cast's forced tile_m = 64, so the herd
+        # comes from the registry row rather than the file-level default.
+        #
+        # Measured over the 147k elements of q, k and v together:
+        # mean_rel_L1 9.9e-3 -- the registry's own value for this GEMM, so the
+        # three split-cast launches add nothing measurable -- and atol_required
+        # 1.32e-3. atol stays the 5e-3 the two shapes above use, which is a 3.8x
+        # margin here and is also, to 2%, the K-scaled high-tier bound the sweep
+        # itself checks at K = 768 (1.5e-3 * sqrt(8192/768) = 4.9e-3; see
+        # sweep/sweep_measure.py on why that constant does not transfer across
+        # K unscaled).
+        "operator": "qkv_proj",
+        "shape_key": "64x768",
+        "shape": {"seq_len": 64, "emb_dim": 768},
         "atol": 5e-3,
         "prepare": _prepare_qkv_proj,
     },

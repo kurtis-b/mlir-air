@@ -56,10 +56,22 @@ FOOTGUNS
       but then FAILED AT RUNTIME (``details/GEMM_bf16_in_bf16_out.json``, the
       2048x896x896 ``_note``) -- the fused-cast and drain paths assume the 8x4
       array. Narrowing ``tile_n`` is the supported way to divide an awkward N.
+    - ``cast_tile_n`` IS A MEASURED KNOB, not a derived one, and the largest
+      legal value is not always correct. At ``64x768x2304`` every fused-cast
+      candidate at the harness default of 2048 returns ZEROS for two of the
+      nine 2048-element sub-tiles each cast worker owns -- 30% of the output
+      wrong, ``mean_rel_L1`` 0.46 -- while the identical candidate at 1024
+      passes. Nothing about the shape says which values are safe, so the grid
+      tries more than one and lets the numerical check decide. That row is why
+      ``qkv_proj`` at ``seq = 64`` could not be built at all: it pins
+      fused-cast, and a shape whose only fused-cast candidates fail has no row
+      for it.
     - The order of ``candidates_for_shape`` is the tie-break order the
       orchestrator inherits, so it must be deterministic. It is: methods in
       ``METHODS`` order, then tile_n descending, then tile_k_l2 in preference
-      order.
+      order, then cast_tile_n descending. cast_tile_n is LAST so that widening
+      it leaves every pre-existing candidate's relative order -- and so every
+      already-measured shape's tie-breaks -- unchanged.
 """
 
 from dataclasses import dataclass
@@ -119,11 +131,19 @@ TILE_K_L2_PREFERENCE = (256, 512, 128, 64)
 HERD_M_PREFERENCE = (8, 4, 2, 1)
 HERD_N_PREFERENCE = (4, 2, 1)
 
-# How many options of each knob to keep per method. Two apiece gives four
-# candidates per method and twelve per shape, which is the grid this sub-phase
-# ran. Raising it is a machine-time decision, not a correctness one.
+# L1 tile for fused-cast's separate cast launch, descending. Only the cast
+# launch reads it, so it is generated for fused-cast alone; drain and direct
+# carry the first legal value unused, which is what keeps their resume
+# signatures stable across a change to this list.
+CAST_TILE_N_PREFERENCE = (2048, 1024, 512, 256, 128, 64, 32, 16, 8)
+
+# How many options of each knob to keep per method. Two apiece for the tile
+# knobs gives four candidates per method and twelve per shape; the second
+# cast_tile_n adds four more for fused-cast alone. Raising any of them is a
+# machine-time decision, not a correctness one.
 DEFAULT_TILE_N_OPTIONS = 2
 DEFAULT_TILE_K_L2_OPTIONS = 2
+DEFAULT_CAST_TILE_N_OPTIONS = 2
 
 
 @dataclass(frozen=True)
@@ -183,9 +203,13 @@ class Candidate:
 
     @property
     def label(self):
+        # cast_tile_n only for the method that has a cast launch: on the other
+        # two it is a carried-along constant, and printing it would suggest the
+        # sweep varied something it did not.
+        cast = f"/ctn{self.cast_tile_n}" if self.method == "fused-cast" else ""
         return (
             f"{self.method}/tm{self.tile_m}/tk2{self.tile_k_l2}"
-            f"/tn{self.tile_n}/herd{self.herd_m}x{self.herd_n}"
+            f"/tn{self.tile_n}/herd{self.herd_m}x{self.herd_n}{cast}"
         )
 
     def as_dict(self):
@@ -266,20 +290,22 @@ def _tile_k_l2_options(k, limit):
     return options[:limit]
 
 
-def _cast_tile_n(m, n, herd_x=8):
-    """L1 tile for fused-cast's separate cast launch.
+def _cast_tile_n_options(m, n, limit, herd_x=8):
+    """L1 tiles worth trying for fused-cast's separate cast launch, best first.
 
     ``_build_cast_module`` collapses the M x N output to 1D, gives each of
     ``herd_x`` tiles a contiguous chunk, and asserts the chunk is a whole number
-    of ``cast_tile_n`` (``bf16_in_bf16_out/run.py:734-736``). The harness default
-    of 2048 divides every chunk in the case matrix, but deriving it keeps a
-    future family from tripping the assert after a full compile.
+    of ``cast_tile_n`` (``bf16_in_bf16_out/run.py:734-736``), so only divisors of
+    the chunk are generated -- otherwise the assert fires after a full compile.
+
+    Divisibility is necessary and NOT sufficient: see the ``cast_tile_n``
+    footgun above for the shape where the largest legal value silently drops two
+    of its nine sub-tiles. That is why this returns a list to measure rather than
+    the single largest value.
     """
     chunk = (m * n) // herd_x
-    for tile in (2048, 1024, 512, 256, 128, 64, 32, 16, 8):
-        if chunk % tile == 0:
-            return tile
-    return 8
+    options = [tile for tile in CAST_TILE_N_PREFERENCE if chunk % tile == 0]
+    return options[:limit] or [8]
 
 
 def candidates_for_shape(
@@ -287,6 +313,7 @@ def candidates_for_shape(
     methods=tuple(METHODS),
     tile_n_options=DEFAULT_TILE_N_OPTIONS,
     tile_k_l2_options=DEFAULT_TILE_K_L2_OPTIONS,
+    cast_tile_n_options=DEFAULT_CAST_TILE_N_OPTIONS,
 ):
     """Every configuration worth building for one shape, best-guess first.
 
@@ -295,7 +322,7 @@ def candidates_for_shape(
     """
     tn_options = _tile_n_options(shape.N, tile_n_options)
     tk2_options = _tile_k_l2_options(shape.K, tile_k_l2_options)
-    cast_tile_n = _cast_tile_n(shape.M, shape.N)
+    ctn_options = _cast_tile_n_options(shape.M, shape.N, cast_tile_n_options)
 
     candidates = []
     for method in methods:
@@ -306,18 +333,23 @@ def candidates_for_shape(
             # other method's smaller tile_m may still fit.
             continue
         herd_m = herd_m_options[0]
+        # Only fused-cast has a cast launch. The other two record the first
+        # legal value and never read it, so widening the list cannot change
+        # their signatures and cannot cost a re-measurement.
+        method_ctn = ctn_options if method == "fused-cast" else ctn_options[:1]
         for tile_n, herd_n in tn_options:
             for tile_k_l2 in tk2_options:
-                candidates.append(
-                    Candidate(
-                        method=method,
-                        tile_m=tile_m,
-                        tile_k_l2=tile_k_l2,
-                        tile_k_l1=TILE_K_L1,
-                        tile_n=tile_n,
-                        herd_m=herd_m,
-                        herd_n=herd_n,
-                        cast_tile_n=cast_tile_n,
+                for cast_tile_n in method_ctn:
+                    candidates.append(
+                        Candidate(
+                            method=method,
+                            tile_m=tile_m,
+                            tile_k_l2=tile_k_l2,
+                            tile_k_l1=TILE_K_L1,
+                            tile_n=tile_n,
+                            herd_m=herd_m,
+                            herd_n=herd_n,
+                            cast_tile_n=cast_tile_n,
+                        )
                     )
-                )
     return candidates

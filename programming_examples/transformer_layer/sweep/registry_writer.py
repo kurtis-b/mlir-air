@@ -6,6 +6,8 @@
 CONTRACT
     ``append_shapes(rows)`` adds shapes that are NOT already in
     ``details/GEMM_bf16_in_bf16_out.json`` and raises on any that are.
+    ``add_missing_methods(rows)`` adds a METHOD to a shape this sweep already
+    wrote, and can do nothing else to it.
     ``write_markdown(family, rows)`` mirrors the same rows into
     ``details/GEMM_bf16_in_bf16_out.md`` and ``supported_kernels.md``.
 
@@ -18,6 +20,26 @@ APPEND ONLY -- THE FOOTGUN THIS MODULE EXISTS TO PREVENT
     behaviour without anyone asking, so this module will not do it: a shape whose
     ``(M, K, N)`` is already present raises ``ShapeAlreadyRegistered`` and nothing
     is written.
+
+    ``add_missing_methods`` is the ONE narrow exception, and it is narrow in
+    three independent ways. It touches an entry only if that entry's ``used_by``
+    is the string THIS family's sweep would write for that shape, so a row a
+    shipped deployment owns is unreachable through it -- a shape the sweep and a
+    model share is reported and skipped, never edited. It re-renders the entry
+    and refuses unless every method already present comes back unchanged, so it
+    can add a method and cannot re-measure one. And it replaces the entry's exact
+    text block, so every other entry in the file is untouched by construction. ``best`` and ``_note`` are allowed to move because both are
+    DERIVED from the method set -- ``best`` is "fastest measured per tier", and a
+    ``_note`` saying a method never passed is false once it does.
+
+    The case it exists for: ``64x768x2304`` was first registered with no
+    ``fused-cast`` row, because every fused-cast candidate in the grid of the day
+    failed numerically. ``qkv_proj`` pins fused-cast -- its three-way C split
+    rides that method's separate cast launch -- so the shape resolved for the
+    generic lookup and could not be built by the operator that needs it. A wider
+    ``cast_tile_n`` grid found a passing configuration; without this function the
+    only way to record it would be a hand edit of the registry JSON, which is the
+    drift bug the whole registry exists to prevent.
 
     The JSON is edited as TEXT, not re-serialized. Splicing new entries in before
     the closing bracket makes every pre-existing byte identical by construction,
@@ -132,6 +154,12 @@ def build_entry(row):
     return entry
 
 
+def _entry_block(entry):
+    """One entry rendered exactly as it sits inside the ``shapes`` array."""
+    body = json.dumps(entry, indent=2)
+    return "\n".join(_ENTRY_INDENT + line for line in body.splitlines())
+
+
 def _verify_append(before_shapes, new_keys):
     """Re-read the file and prove the append did only what it claimed."""
     after = load_registry()
@@ -178,16 +206,108 @@ def append_shapes(rows):
     if not entries:
         return []
 
-    blocks = []
-    for entry in entries:
-        body = json.dumps(entry, indent=2)
-        blocks.append(
-            ",\n" + "\n".join(_ENTRY_INDENT + line for line in body.splitlines())
-        )
+    blocks = [",\n" + _entry_block(entry) for entry in entries]
 
     GEMM_JSON.write_text(text[: -len(_JSON_TAIL)] + "".join(blocks) + _JSON_TAIL)
     _verify_append(before_shapes, keys)
     return keys
+
+
+def add_missing_methods(rows):
+    """Add measured methods to entries THIS sweep owns. Returns a report.
+
+    ``{"added": [(key, [method, ...]), ...], "not_owned": [key, ...],
+    "unchanged": [key, ...]}``.
+
+    Read the append-only section of the module docstring before touching this.
+    A row is edited only when all three hold: the entry exists, its ``used_by``
+    is exactly what this sweep writes for that shape, and re-rendering it leaves
+    every method already present byte-identical. Anything else raises, except a
+    shape somebody else owns -- that is reported and skipped, because a family
+    legitimately shares shapes with a shipped model (``baseline_1024``'s
+    ``o_proj`` at ``seq = 2048`` is Qwen3-0.6B's K/V projection) and that is not
+    an error, it is a shape the sweep may not touch.
+    """
+    report = {"added": [], "not_owned": [], "unchanged": []}
+    if not rows:
+        return report
+
+    before = load_registry()
+    before_shapes = [dict(s) for s in before["shapes"]]
+    by_key = {(s["M"], s["K"], s["N"]): s for s in before_shapes}
+    text = GEMM_JSON.read_text()
+
+    for row in rows:
+        key = row["shape"].key
+        existing = by_key.get(key)
+        if existing is None:
+            raise KeyError(f"{key} is not in the registry; append it instead")
+        if existing.get("used_by") != row["shape"].used_by:
+            report["not_owned"].append(key)
+            continue
+
+        updated = build_entry(row)
+        for method, entry in existing["methods"].items():
+            if updated["methods"].get(method) != entry:
+                raise ShapeAlreadyRegistered(
+                    f"{key} already records {method!r} and this write would "
+                    f"change it ({entry} -> {updated['methods'].get(method)}). "
+                    f"This path may only ADD a method; re-measuring one is what "
+                    f"the append-only rule forbids. Re-run with the candidate "
+                    f"grid the row was measured at."
+                )
+        added = sorted(set(updated["methods"]) - set(existing["methods"]))
+        if not added:
+            report["unchanged"].append(key)
+            continue
+
+        old_block = _entry_block(existing)
+        if text.count(old_block) != 1:
+            raise RuntimeError(
+                f"the {key} entry does not appear exactly once in "
+                f"{GEMM_JSON.name} as this module renders it "
+                f"({text.count(old_block)} matches). Refusing to splice into a "
+                f"file whose layout is not the one that wrote it."
+            )
+        text = text.replace(old_block, _entry_block(updated), 1)
+        by_key[key] = updated
+        report["added"].append((key, added))
+
+    if not report["added"]:
+        return report
+
+    GEMM_JSON.write_text(text)
+    _verify_add(before_shapes, dict(report["added"]), by_key)
+    return report
+
+
+def _verify_add(before_shapes, added_by_key, expected_by_key):
+    """Re-read the file and prove the edit added methods and did nothing else."""
+    after = load_registry()
+    after_by_key = {(s["M"], s["K"], s["N"]): s for s in after["shapes"]}
+    if len(after["shapes"]) != len(before_shapes):
+        raise RuntimeError(
+            f"the method add changed the shape count "
+            f"({len(before_shapes)} -> {len(after['shapes'])}); the registry "
+            f"file has been left in a state that must be reverted by hand"
+        )
+    for shape in before_shapes:
+        key = (shape["M"], shape["K"], shape["N"])
+        if key in added_by_key:
+            if after_by_key.get(key) != expected_by_key[key]:
+                raise RuntimeError(f"the {key} entry is not what was written")
+            was = set(shape["methods"])
+            now = set(after_by_key[key]["methods"])
+            if not was < now or sorted(now - was) != added_by_key[key]:
+                raise RuntimeError(
+                    f"the {key} entry's method set moved by something other "
+                    f"than the additions claimed: {sorted(was)} -> {sorted(now)}"
+                )
+        elif after_by_key.get(key) != shape:
+            raise RuntimeError(
+                f"the method add corrupted the untouched shape {key}; the "
+                f"registry file must be reverted by hand"
+            )
 
 
 def _delimited(name, body):
