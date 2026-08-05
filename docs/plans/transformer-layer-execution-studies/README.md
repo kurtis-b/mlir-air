@@ -45,7 +45,7 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | C4 — coverage sweep | The 36 `baseline_768` shapes resolve through `gemm_config()`; registry rows written; ten shipped models still pass `make verify` | **done** 2026-08-04 (504 min + 66 min re-run) |
 | D1 — operators at `baseline_768` | Every operator passes `opcheck` at the `baseline_768` widths, including the pre-add `addnorm` | **done** 2026-08-05 (11 min) |
 | D2 — block integration | One full transformer layer matches the torch reference on hardware | **done** 2026-08-05 (156 min) |
-| E1 — unblock the ladder | `(method, tile_n)` names separate; `ffn` passes at a second ladder point; ten shipped models still verify | not started — **next**. See [08a](08a-phase-e1-unblock-the-ladder.md) |
+| E1 — unblock the ladder | `(method, tile_n)` names separate; `ffn` passes at a second ladder point; ten shipped models still verify | **done** 2026-08-05 (79 min) |
 | E2 — `coarse` + instrumentation | `coarse` matches at full scope behind a measured dispatch vector | not started. See [08b](08b-phase-e2-coarse-and-instrumentation.md) |
 | E3 — `offload` | `offload` matches, and aggregates nothing | not started. See [08c](08c-phase-e3-offload.md) |
 | E4 — `runlist` | `runlist` matches, with more runlist entries than `coarse` | not started. See [08d](08d-phase-e4-runlist.md) |
