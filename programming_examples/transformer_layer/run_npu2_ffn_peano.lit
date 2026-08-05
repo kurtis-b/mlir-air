@@ -1,7 +1,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 //
-// Phase C2 + D1 operator gate: ffn.
+// Phase C2 + D1 + E1 operator gate: ffn.
 //
 // Staged up-projection, GeLU, down-projection as five launches in one ELF.
 // Both GEMMs take their method and tiles from kernel_registry per shape,
@@ -46,16 +46,63 @@
 // CHECK: PASS!
 // CHECK: [opcheck] ffn [2048x1024x3072]: PASS
 //
-// The second shape is Phase D1's baseline_768 point, and it is THE ONLY POINT
-// ON THE SEQUENCE LADDER WHERE THIS OPERATOR BUILDS AT hidden 768. Both
-// projections take a different tile_n (128 up, 96 down) at every point, and two
-// same-method GEMMs with different tile_n declare f32_to_bf16_mn_<suffix> twice
-// with different memref types, which stitch_elf rejects. seq 4096 is the one
-// place the registry puts them on different methods. The two method names are
-// checked, in order, so a registry change that put both projections back on one
-// method fails here with its cause on screen rather than as a redefinition
-// error several frames inside the stitcher.
+// The second shape is Phase D1's baseline_768 point, and it is the only MIXED-
+// METHOD pairing in this operator's ladder: seq 4096 is where the registry puts
+// the up-projection on drain and the down-projection on fused-cast. The two
+// method names are checked, in order, so a registry change that moved either
+// projection fails here with its cause on screen rather than several frames
+// inside the stitcher.
+//
+// Until Phase E1 it was the ONLY point on the ladder where this operator built
+// at hidden 768 at all. Both projections take a different tile_n (128 up, 96
+// down) everywhere, and two same-method GEMMs at different tile_n declared
+// f32_to_bf16_mn_<suffix> twice with different memref types, which stitch_elf
+// rejects; 4096 escaped only because the two methods differ there and so the
+// suffixes did. E1 made the suffix and the mm.o name functions of
+// (method, tile_n) in llms/shared/builders/gemm_builder.py, and the third shape
+// below is the consequence.
 // CHECK: up-projection 4096x768x3072 (drain, registry
 // CHECK: down-projection 4096x3072x768 (fused-cast, registry
 // CHECK: PASS!
 // CHECK: [opcheck] ffn [4096x768x3072]: PASS
+//
+// PHASE E1's SECOND LADDER POINT, and the one that could not exist before it.
+// Both of seq 64's registry rows resolve to drain -- tile_n 128 for the
+// up-projection, 96 for the down -- so this is precisely the same-method,
+// different-tile_n pairing that used to fail to parse. Both method names AND
+// both tile_n are checked, because "it built" is only evidence that the
+// collision is gone if the two really are the same method at different tile_n;
+// a registry re-sweep that split them onto two methods would make this shape
+// pass for the 4096 row's reason instead, and the pairing under test would have
+// silently stopped being tested.
+//
+// It also runs both GEMMs at herd 2x4 rather than the file-level 8x4: at M = 64
+// drain's forced tile_m = 32 admits at most herd_m = 2, and the herd is read off
+// the registry row. That is checked too -- it is the shortest M in the file and
+// the only place a wrong herd default would surface.
+// CHECK: up-projection 64x768x3072 (drain, registry, tile_m=32
+// CHECK-SAME: tile_n=128 herd=2x4
+// CHECK: down-projection 64x3072x768 (drain, registry, tile_m=32
+// CHECK-SAME: tile_n=96 herd=2x4
+// CHECK: PASS!
+// CHECK: [opcheck] ffn [64x768x3072]: PASS
+//
+// RUN: make -f %S/Makefile check-ffn-ladder-fault PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s --check-prefix=FAULT
+//
+// The seq-64 point's OWN negative control, and it is here rather than only in
+// the driver because of what the shared one does not cover: the generic
+// per-operator injection perturbs an operator's FIRST declared shape, which for
+// ffn is the Phase C 2048x1024x3072 row. Without this clause the newest point in
+// the file would be the only shape anywhere in it that is never injected -- and
+// a newly added row is exactly the one whose PASS is least earned, because
+// nothing yet shows the comparison can reject it. That gap is what D1 recorded
+// for the baseline_768 rows; this is it not being repeated.
+//
+// The injection line first, so an injection that silently perturbed nothing is
+// visible here rather than inferred from the verdict. Then the FAIL, then the
+// control's own verdict -- which opcheck.py reports from the completed
+// comparison's statistics, not from the exit status, so a missing toolchain or
+// an absent NPU cannot masquerade as a caught fault.
+// FAULT: [fault-inject] input 0 at (63, 0)
+// FAULT: [opcheck] ffn [64x768x3072]: FAIL
+// FAULT: NEGATIVE CONTROL: PASS

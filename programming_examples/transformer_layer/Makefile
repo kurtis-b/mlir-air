@@ -65,6 +65,12 @@ help:
 	@echo "                      That layer's negative control. It must FAIL"
 	@echo "                      under injection, and this target succeeds"
 	@echo "                      exactly when it does."
+	@echo "  make check-ffn-ladder-fault"
+	@echo "                      The seq-64 ladder point's own negative control."
+	@echo "                      The shared one injects an operator's FIRST"
+	@echo "                      shape, which for ffn is a Phase C row, so"
+	@echo "                      without this the newest point is the only one"
+	@echo "                      never injected. NEEDS AN NPU."
 	@echo "  make registry-plan  Every (shape, candidate) the sweep would measure."
 	@echo "                      No NPU required."
 	@echo "  make registry-resolution"
@@ -141,6 +147,27 @@ check-qkv-proj:
 
 check-ffn:
 	$(call opcheck,ffn)
+
+# The Phase E1 ladder point's OWN negative control, and it needs its own target
+# rather than riding on check-fault-control.
+#
+# check-fault-control injects into one operator, because the injection machinery
+# is shared; the driver injects into each operator's FIRST declared shape. For
+# `ffn` that first shape is a Phase C row (2048x1024x3072), so neither of them
+# ever perturbs 64x768x3072 -- the one point on the sequence ladder this
+# sub-phase added, and the only one whose two GEMMs are both `drain`. It would be
+# the single shape in the file with no injection of its own. D1 recorded that
+# exact gap for the baseline_768 rows; this is it not being repeated.
+#
+# Cheap enough to be worth doing here rather than only in the driver: seq 64 is
+# the shortest point on the ladder, so the extra ELF compile and dispatch are
+# seconds, and the coverage then lives in the suite where it survives a driver
+# change.
+check-ffn-ladder-fault:
+	mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
+	    python3 $(srcdir)/opcheck.py --operator ffn --shape-key 64x768x3072 \
+	        --fault-inject input --expect-failure
 
 # Fused attention + output projection. Both external objects are built into the
 # working directory by opcheck.py: attn_npu2.o with the causal row helpers and

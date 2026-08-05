@@ -867,17 +867,22 @@ SPECS = [
         "prepare": _prepare_ffn,
     },
     {
-        # baseline_768, and THE ONLY POINT ON THE LADDER WHERE THIS OPERATOR
-        # BUILDS AT hidden 768. The up-projection (N = 3072) takes tile_n 128
-        # and the down-projection (N = 768) takes tile_n 96 everywhere; two
-        # same-method GEMMs with different tile_n declare
+        # baseline_768, and until Phase E1 THE ONLY POINT ON THE LADDER WHERE
+        # THIS OPERATOR BUILT AT hidden 768. The up-projection (N = 3072) takes
+        # tile_n 128 and the down-projection (N = 768) takes tile_n 96
+        # everywhere; two same-method GEMMs with different tile_n declared
         # `f32_to_bf16_mn_<suffix>` twice with different memref types and
-        # stitch_elf rejects the redefinition. seq 4096 is where the registry
+        # stitch_elf rejected the redefinition. seq 4096 is where the registry
         # happens to put them on different methods -- drain for the up,
-        # fused-cast for the down -- so the pair co-links. 64..2048 are all
-        # drain/drain and 8192/16384 are all fused-cast/fused-cast, and both
-        # collide. See the README; the real fix is a per-(method, tile_n)
-        # symbol suffix in llms/shared, which is off limits to this study.
+        # fused-cast for the down -- so the pair co-linked while 64..2048
+        # (drain/drain) and 8192/16384 (fused-cast/fused-cast) did not.
+        #
+        # E1 made the symbol suffix and object name functions of
+        # (method, tile_n) in `llms/shared/builders/gemm_builder.py`, so the
+        # same-method pairs co-link too and the row below is the second point.
+        # This one is KEPT AS IT IS: it is the only mixed-method pairing in the
+        # file (drain up, fused-cast down), which is a different device path
+        # from two drains, and it is the shape the D2 block runs.
         "operator": "ffn",
         "shape_key": "4096x768x3072",
         "shape": {"seq_len": 4096, "emb_dim": 768, "ffn_dim": 3072},
@@ -886,6 +891,39 @@ SPECS = [
         # activation's intermediates dominate here too and the mixed-method
         # pairing (drain up, fused-cast down) costs nothing -- abs_err_max
         # 1.709e-3 and atol_required 1.472e-3. atol stays 5e-3, a 3.4x margin.
+        "atol": 5e-3,
+        "prepare": _prepare_ffn,
+    },
+    {
+        # PHASE E1: THE SECOND POINT ON THE SEQUENCE LADDER, and the reason this
+        # sub-phase exists. Both registry rows here -- 64x768x3072 and
+        # 64x3072x768 -- resolve to `drain`, at tile_n 128 and 96 respectively,
+        # which is EXACTLY the pairing that could not be built before E1 made the
+        # symbol suffix and mm.o name functions of (method, tile_n). No laxer test
+        # could have produced this row: the module did not parse.
+        #
+        # seq 64 rather than 128..2048 because it is the cheapest such point and
+        # every one of them is drain/drain, so the collision is equally exercised
+        # and the hardware time is not. It is also the shortest M the registry
+        # measured, so both GEMMs run at herd 2x4 rather than the file-level 8x4:
+        # drain's forced tile_m = 32 admits at most herd_m = 2 at M = 64, and
+        # `resolve_gemm_spec` reads that herd off the row rather than defaulting.
+        # E2-E5 each need more than one sequence length; this is the row that
+        # proves there is more than one.
+        "operator": "ffn",
+        "shape_key": "64x768x3072",
+        "shape": {"seq_len": 64, "emb_dim": 768, "ffn_dim": 3072},
+        # Measured over 49152 elements: mean_rel_L1 1.561e-2 -- within 0.6% of
+        # the 4096-row point's 1.569e-2 and 2.6% of the 2048x1024x3072 row's
+        # 1.602e-2, so this operator's relative error is set by the bf16 staging
+        # of `h` and the activation's intermediates and not by the sequence
+        # length, and two drains cost no more than a drain paired with a
+        # fused-cast -- abs_err_max 1.465e-3 and atol_required 1.150e-3.
+        #
+        # atol stays the 5e-3 the operator's other two rows use, a 4.3x margin
+        # here. It is the most headroom of the three, which is what 64x fewer
+        # rows of the same arithmetic should give: the same per-element error
+        # distribution sampled 64 times less often reaches a lower maximum.
         "atol": 5e-3,
         "prepare": _prepare_ffn,
     },
