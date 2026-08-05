@@ -25,7 +25,7 @@ SWEEP_ARGS ?=
 .PHONY: help compile runlist-gate seam-tests clean opcheck-list \
         check-elementwise-add check-causal-mask check-layer-norm check-addnorm \
         check-qkv-proj check-ffn check-mha-out-proj check-fault-control \
-        check-block check-block-fault reference-tests \
+        check-block check-block-fault reference-tests block-cache-tests \
         registry-resolution registry-sweep registry-write registry-plan \
         registry-writer-tests
 
@@ -40,6 +40,10 @@ help:
 	@echo "  make reference-tests"
 	@echo "                      Host-only checks that the transformer-layer"
 	@echo "                      golden model is the layer it claims to be."
+	@echo "                      No NPU required."
+	@echo "  make block-cache-tests"
+	@echo "                      Host-only checks on which cached block ELFs"
+	@echo "                      check-block will reuse and which it rebuilds."
 	@echo "                      No NPU required."
 	@echo "  make opcheck-list   Every (operator, shape) Phase C claims, as JSON."
 	@echo "                      No NPU required."
@@ -172,6 +176,13 @@ check-block-fault:
 # Host-only: the golden model is the layer it claims to be. No NPU, no MLIR.
 reference-tests:
 	python3 $(srcdir)/pattern/test_reference.py
+
+# Host-only: what check-block's ELF cache will and will not reuse. Builds the
+# four MLIR modules and stubs everything past them, so it needs no NPU and
+# writes nothing outside a temporary directory -- which is why it can run from
+# $(srcdir) rather than from $(BUILD_DIR) like the checks above.
+block-cache-tests:
+	python3 $(srcdir)/builders/test_block_cache.py
 
 # The negative control: it succeeds only when the injected run is REJECTED BY
 # THE COMPARISON. A check that ignored --fault-inject, or one whose tolerance

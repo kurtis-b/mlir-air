@@ -540,6 +540,13 @@ BLOCK_STAGE_ATOL = {
 # fault-injected run of the same shape share it: compilation depends on the
 # shape and not on the data, and rebuilding four ELFs to perturb one weight
 # would double the gate's hardware time for nothing.
+#
+# What makes that sharing safe is that reuse is keyed by FINGERPRINT and not by
+# name -- the resolved registry specs, the built MLIR, the device kernel sources
+# and the backend kwargs, per `builders/block_cache.py`.
+# The two runs of a gate agree on all of them; a registry re-sweep or a builder
+# edit does not, and recompiles rather than running the old ELF against the new
+# recorded specs.
 BLOCK_CACHE_DIR = "block_cache"
 
 

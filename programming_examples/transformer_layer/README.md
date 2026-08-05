@@ -98,11 +98,14 @@ memory bank) all produce plausible wrong numbers rather than errors.
 | `builders/o_proj.py` | O-projection staging: the registry lookup, the GEMM sub-kernel, and its FP32 oracle |
 | `builders/mha_out_proj.py` | The entry layer that composes the two into one ELF, plus the composed FP32 reference |
 | `builders/block.py` | Phase D2: the five operator launches assembled into four `KernelCache.run_sequence` calls, and every boundary read back |
+| `builders/block_cache.py` | When a cached block ELF is the ELF the current source would build: the artifact fingerprint and its persistence |
+| `builders/test_block_cache.py` | Host-only: which cached block ELFs `check-block` reuses, and which it rebuilds |
 | `pattern/reference.py` | The shared golden model — iron's draw order and structure, this repository's FP32-from-bf16 numerics, both workload variants, every boundary. Phase E's strategy directories import this one copy |
 | `pattern/test_reference.py` | Host-only: that the golden model is the layer it claims to be |
 | `run_npu2_<op>_peano.lit` | One per operator: that operator's numerical gate on a real NPU |
 | `run_npu2_fault_control_peano.lit` | Phase C's negative control: the injected run must FAIL |
 | `run_npu2_block_peano.lit` | Phase D2's gate: the whole layer on a real NPU, every boundary checked |
+| `run_block_cache_tests.lit` | Phase D2's host-only cache-reuse tests. No NPU, no XRT |
 | `sweep/sweep_families.py` | Which shapes the case matrix needs, and which tilings are worth trying for each |
 | `sweep/sweep_measure.py` | One candidate end to end — build, numerical check, timing. The process the sweep forks |
 | `sweep/registry_writer.py` | The append-only write into the registry JSON and both markdown pages |
@@ -226,6 +229,7 @@ forces: `seq_len 4096`, hidden 768, ffn 3072, 12 heads × head_dim 64, non-causa
 
 ```bash
 make reference-tests                                        # the golden model, no NPU
+make block-cache-tests                                      # what the ELF cache reuses, no NPU
 flock -x -w 1800 /tmp/mlir-air-npu.lock make check-block       PEANO_INSTALL_DIR=$PEANO_INSTALL_DIR
 flock -x -w 1800 /tmp/mlir-air-npu.lock make check-block-fault PEANO_INSTALL_DIR=$PEANO_INSTALL_DIR
 ```
@@ -330,6 +334,36 @@ by one artifact and consumed by the next without touching the host). A single
 sequence would be preferable and is not available; raising `rows` past the cap is
 not the way to get one, because the builder raises precisely because the two-trip
 form miscompiles rather than failing.
+
+### The ELF cache is keyed by fingerprint, not by name
+
+`check-block` and `check-block-fault` share four cached ELFs under
+`block_cache/`, because compilation depends on the shape and not on the data and
+rebuilding the layer to perturb one weight would double the gate's hardware time
+for nothing. What makes that sharing safe is *what counts as the same artifact*.
+
+An artifact name carries the shape and nothing else. The tiles and the method
+come from `kernel_registry` and the IR comes from the builders in this
+directory, so "four binaries whose names match the shape" is also satisfied by
+four binaries built from a registry row that has since been re-swept, or from a
+builder that has since been fixed. Running those while the results artifact
+records the freshly resolved specs would be a **passing gate for an
+implementation that never reached the device** — the one failure this whole
+example exists to prevent.
+
+So `compile_block_artifacts` builds all four MLIR modules on every call (about
+0.1s against the minutes of compilation they gate) and reuses a cached ELF only
+where a recorded fingerprint over its built MLIR, its resolved configuration,
+every device kernel source and its backend kwargs still matches
+(`builders/block_cache.py`). A miss recompiles that artifact and only that one.
+The configuration is fingerprinted alongside the MLIR rather than being treated
+as redundant with it because a registry row's `tile_k_l1` reaches the ELF
+through `compile_gemm_mm`'s `-D` flags, which the IR does not carry.
+
+What it cannot see is the toolchain — peano, mlir-aie, aircc and the AIE API
+headers are version state shared with the rest of the repository. After a
+toolchain bump the cache is stale and nothing here will say so; `make clean` is
+what invalidates it. `make block-cache-tests` pins both directions of the rule.
 
 ## The registry sweep
 

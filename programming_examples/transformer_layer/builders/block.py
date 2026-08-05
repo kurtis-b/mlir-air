@@ -100,6 +100,11 @@ FOOTGUNS
       land in the content-keyed pool and are uploaded once. ``x`` is NOT static:
       it is an activation, and the row bands of it that sequence B reads are
       distinct buffers with distinct contents.
+    - A cached ELF is reused only when its FINGERPRINT matches. An artifact name
+      carries the shape and nothing else; it does not carry the registry row the
+      tiles came from or the builder that emitted the IR, and reusing a binary
+      on the strength of its name alone runs the gate against code that is no
+      longer here. ``builders/block_cache.py`` owns that decision.
 """
 
 import os
@@ -122,6 +127,11 @@ from builders.addnorm import (  # noqa: E402
     addnorm_max_rows,
     build_addnorm_module,
     compile_addnorm_kernel,
+)
+from builders.block_cache import (  # noqa: E402
+    block_artifact_fingerprint,
+    load_fingerprints,
+    save_fingerprints,
 )
 from builders.ffn import (  # noqa: E402
     build_ffn_module,
@@ -361,7 +371,7 @@ _ARTIFACT_BUILD = {
 
 
 def compile_block_artifacts(cache, cfg, run_only=False):
-    """Compile the four ELFs into ``cache``, or reuse a matching manifest.
+    """Compile the four ELFs into ``cache``, reusing only exact matches.
 
     EACH ARTIFACT'S EXTERNAL OBJECTS ARE BUILT IMMEDIATELY BEFORE ITS OWN ELF,
     and this is a correctness requirement rather than a tidiness one.
@@ -389,25 +399,34 @@ def compile_block_artifacts(cache, cfg, run_only=False):
     ``tile_n``-aware object name in ``llms/shared``, which this study may not
     edit.
 
-    ``run_only`` reuses previously cached binaries when the manifest holds every
-    artifact this configuration names. The artifact names carry the shape, so a
-    manifest written for a different configuration is a cache MISS rather than a
-    silently-wrong reuse.
+    ``run_only`` REUSES A CACHED ELF ONLY WHERE ITS FINGERPRINT STILL MATCHES,
+    and the name is not the fingerprint -- ``builders/block_cache.py`` has the
+    argument for why, and what the digest covers. So every artifact's module is
+    built on every call and hashed before the decision is taken. Building all
+    four costs about 0.1s against the minutes of ELF compilation the answer
+    gates. A miss recompiles that artifact and only that one: the four are
+    independently linked, and the interleaving above holds per artifact.
     """
     names = cfg["artifacts"]
-    if run_only and cache.load_manifest():
-        missing = [n for n in names.values() if n not in cache.artifacts]
-        if not missing:
-            print(f"  reusing {len(names)} cached block artifacts")
-            return
-        print(f"  cache miss for {missing}; compiling")
+    have_manifest = bool(run_only and cache.load_manifest())
+    recorded = load_fingerprints(cache) if have_manifest else {}
 
+    fingerprints = {}
+    reused = []
     for key, (compile_kernels, build_module) in _ARTIFACT_BUILD.items():
         name = names[key]
-        print(f"== building {name} ==")
+        module = build_module(cfg)
+        fingerprints[name] = block_artifact_fingerprint(cfg, key, module)
+        if name in cache.artifacts and recorded.get(name) == fingerprints[name]:
+            reused.append(name)
+            continue
+        print(f"== compiling {name} ==")
         compile_kernels(cfg)
-        cache.compile_and_cache(name, build_module(cfg), cfg["backend_kwargs"][name])
+        cache.compile_and_cache(name, module, cfg["backend_kwargs"][name])
+    if reused:
+        print(f"  reusing {len(reused)} cached block artifacts: {', '.join(reused)}")
     cache._save_manifest()
+    save_fingerprints(cache, fingerprints)
 
 
 def _spec(name, array, static=False, host_output=False):

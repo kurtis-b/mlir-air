@@ -1,0 +1,34 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase D2 block artifact cache: host-only checks on what the gate will reuse.
+//
+// The block gate caches its four ELFs so that the clean run and the
+// fault-injected run of the same shape do not compile the layer twice. That
+// saving is only sound if a cached ELF is reused when it is the binary the
+// current source would produce and never otherwise -- and an artifact name,
+// which carries the shape and nothing else, cannot answer that. The tiles and
+// the method come from kernel_registry and the IR comes from builders this
+// study edits, so four binaries whose names match the shape can still be four
+// binaries nobody would build today. Running those while the results artifact
+// records the freshly resolved specs is a PASS for an implementation that was
+// never on the device, which is the failure this pins shut.
+//
+// builders/block_cache.py answers it with a fingerprint over the built MLIR, the
+// resolved configuration, every device kernel source and the backend kwargs.
+// The checks below hold both directions of that rule: an unchanged
+// configuration reuses all four, and each thing that can change an ELF without
+// changing its name forces a recompile.
+//
+// No NPU, no XRT and no compilation: KernelCache and the external-object builds
+// are both stubbed, so this sits alongside the compile-only kernel gate and the
+// Phase B seam tests and requires neither `ryzen_ai_npu2` nor `peano`. The
+// hardware half of D2 is run_npu2_block_peano.lit.
+//
+// The test file carries no framework dependency -- pytest is not installed in
+// the sandbox venv -- so it runs as a plain script and prints a pass count. The
+// count is named rather than matched loosely, so a test that stops being
+// collected fails here instead of passing quietly.
+//
+// RUN: python3 %S/builders/test_block_cache.py | FileCheck %s
+// CHECK: block cache tests: 9/9 passed
