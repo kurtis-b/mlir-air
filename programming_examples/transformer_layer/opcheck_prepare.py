@@ -69,6 +69,7 @@ FOOTGUNS
       place rather than quietly inheriting the wrong ones.
 """
 
+import math
 import os
 import sys
 
@@ -563,6 +564,95 @@ BLOCK_STAGE_ATOL = {
 # recorded specs.
 BLOCK_CACHE_DIR = "block_cache"
 
+# `DispatchVector.as_row()` (llms/shared/infra/dispatch.py): five counts and
+# one derived MEAN. The driver checks the same contract with its own copy
+# (agents/scripts/port-loop/phase_e_checks.py::vector_totals), deliberately --
+# neither side trusts the other's arithmetic.
+_VECTOR_COUNT_KEYS = (
+    "host_submissions_per_layer",
+    "air_launches_per_elf",
+    "herd_launches",
+    "sync_boundaries",
+    "bytes_transferred",
+)
+_VECTOR_MEAN_KEY = "runlist_entries_per_submission"
+_VECTOR_KEYS = _VECTOR_COUNT_KEYS + (_VECTOR_MEAN_KEY,)
+
+
+def dispatch_vector_totals(rows):
+    """Validate recorded dispatch vectors and sum them the way the driver does.
+
+    Every row must be ``DispatchVector.as_row()`` verbatim: all six keys,
+    finite non-negative values, whole-number counts, at least one submission
+    per row, some bytes moved overall. ``runlist_entries_per_submission`` is a
+    derived MEAN (``dispatch.py``), so total entries are
+    ``sum(round(mean * submissions))`` -- never a naive sum of the means --
+    and a product that is not a whole number of entries is rejected, because
+    that is the shape a fabricated number takes.
+
+    Raises ``ValueError`` on any violation, failing the opcheck run and its
+    lit gate before the driver's independent arithmetic sees the artifact.
+    The lit recipes pin the returned totals to one set of literals in BOTH
+    halves, clean and fault-injected, so wrong contents or a fault run whose
+    totals drift from the clean run's fail in the suite too.
+    """
+    if not rows:
+        raise ValueError("no dispatch vectors were recorded")
+    totals = {
+        "host_submissions": 0,
+        "runlist_entries": 0,
+        "air_launches": 0,
+        "herd_launches": 0,
+        "sync_boundaries": 0,
+        "bytes_transferred": 0,
+    }
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"dispatch_vectors[{i}] is not a dict")
+        missing = [k for k in _VECTOR_KEYS if k not in row]
+        if missing:
+            raise ValueError(
+                f"dispatch_vectors[{i}] is missing {', '.join(missing)}; "
+                "record DispatchVector.as_row(), never a hand-built dict"
+            )
+        for key in _VECTOR_KEYS:
+            value = row[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(
+                    f"dispatch_vectors[{i}][{key!r}]={value!r} is not a number"
+                )
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(
+                    f"dispatch_vectors[{i}][{key!r}]={value!r} is negative/non-finite"
+                )
+        for key in _VECTOR_COUNT_KEYS:
+            if float(row[key]) != int(row[key]):
+                raise ValueError(
+                    f"dispatch_vectors[{i}][{key!r}]={row[key]!r} is a fractional count"
+                )
+        subs = int(row["host_submissions_per_layer"])
+        if subs < 1:
+            raise ValueError(
+                f"dispatch_vectors[{i}] records {subs} host submissions; "
+                "every recorded sequence submitted at least once"
+            )
+        product = float(row[_VECTOR_MEAN_KEY]) * subs
+        if abs(product - round(product)) > 1e-9:
+            raise ValueError(
+                f"dispatch_vectors[{i}]: {row[_VECTOR_MEAN_KEY]!r} entries "
+                f"per submission over {subs} submission(s) is not a whole "
+                "number of runlist entries"
+            )
+        totals["host_submissions"] += subs
+        totals["runlist_entries"] += int(round(product))
+        totals["air_launches"] += int(row["air_launches_per_elf"])
+        totals["herd_launches"] += int(row["herd_launches"])
+        totals["sync_boundaries"] += int(row["sync_boundaries"])
+        totals["bytes_transferred"] += int(row["bytes_transferred"])
+    if totals["bytes_transferred"] <= 0:
+        raise ValueError("every recorded dispatch vector moved zero bytes")
+    return totals
+
 
 def prepare_block(shape, seed=42):
     """One whole ``encoder_bert`` layer against the golden model.
@@ -600,9 +690,11 @@ def prepare_layer_dispatch(
             ``pattern/__init__.py``.
 
     The vectors are recorded UNCONDITIONALLY, on the fault-injected path as
-    well as the clean one. The driver compares the two runs' summed totals and
-    requires them EQUAL; a "skip instrumentation when injecting" shortcut would
-    fail that check, not dodge it.
+    well as the clean one, then validated and summed by
+    ``dispatch_vector_totals``. The driver requires the two runs' summed
+    totals EQUAL, and the lit gate pins the printed totals to one set of
+    literals in both halves; a "skip instrumentation when injecting" shortcut
+    fails both, not dodges them.
     """
     seq_len, emb_dim = shape["seq_len"], shape["emb_dim"]
     ffn_dim, num_heads = shape["ffn_dim"], shape["num_heads"]
@@ -649,10 +741,22 @@ def prepare_layer_dispatch(
             )
         clean = sum(1 for s in stages if s["n_mismatch"] == 0)
         print(f"[{label}] stages: {clean}/{len(stages)} clean")
-        # On the fault path too -- the lit recipes' FAULT half matches this
-        # line, so an instrumentation made conditional on the injected flag
-        # fails in the suite before the driver's totals comparison sees it.
+        # On the fault path too -- the FAULT half of the lit recipes matches
+        # both lines below against the SAME literals as the clean half, so
+        # instrumentation conditional on the injected flag, a malformed row
+        # (`dispatch_vector_totals` raises, failing the run), or drifted
+        # totals fail in the suite before the driver's comparison sees them.
         print(f"[{label}] recorded {len(vector_rows)} dispatch vectors")
+        totals = dispatch_vector_totals(vector_rows)
+        print(
+            f"[{label}] dispatch totals: "
+            f"submissions {totals['host_submissions']} "
+            f"entries {totals['runlist_entries']} "
+            f"air {totals['air_launches']} "
+            f"herd {totals['herd_launches']} "
+            f"sync {totals['sync_boundaries']} "
+            f"bytes {totals['bytes_transferred']}"
+        )
         return [boundaries["output"]], {
             "stages": stages,
             "stages_passed": clean == len(stages),

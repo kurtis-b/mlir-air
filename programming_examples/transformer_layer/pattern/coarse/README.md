@@ -1,9 +1,9 @@
 # `coarse` — few fused kernels, one runlist per sequence
 
-The coarse-runlist point of the Phase E execution-strategy taxonomy — iron's
-`hybrid`; per porting convention 7 the directory and the operator are `coarse`
-and only the CSV `execution_mode` value keeps the old name, mapped in one place
-(`pattern/__init__.py::EXECUTION_MODE_CSV`).
+The coarse-runlist point of the Phase E execution-strategy taxonomy. Per
+porting convention 7 the directory, the operator and the prose all say
+`coarse`; only the CSV `execution_mode` value keeps iron's old name for this
+mode, mapped in one place (`pattern/__init__.py::EXECUTION_MODE_CSV`).
 
 The mode **is** `builders/block.py`: the D2 layer, five operator launches over
 four separately compiled ELFs dispatched through `KernelCache.run_sequence`.

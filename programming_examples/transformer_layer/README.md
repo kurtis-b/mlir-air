@@ -412,7 +412,7 @@ interleaving existed to protect.
 ## The `coarse` execution strategy (Phase E2)
 
 `pattern/coarse/` is the first of Phase E's four execution-strategy modes: few
-fused kernels over one runlist per sequence — iron's `hybrid`, renamed per
+fused kernels over one runlist per sequence — renamed from iron's mode per
 porting convention 7, with the old name surviving only as the CSV
 `execution_mode` value. **The mode is not a second block.** `builders/block.py`
 stays exactly where it is, with its lit, opcheck and coverage enrolments
@@ -451,9 +451,12 @@ mode with `--fault-inject input`, requires that run to *fail*, and requires
 the fault artifact's six summed totals to *equal* the clean run's — injection
 perturbs one input element after the reference exists and never touches the
 dispatch path. The instrumentation is therefore unconditional in the shared
-preparer's dispatch closure, and the lit recipes' fault half matches the
-"recorded 4 dispatch vectors" line so a conditional shortcut fails in the
-suite before the driver's totals comparison sees it.
+preparer's dispatch closure, which also validates every recorded row against
+the `as_row()` schema and prints the six driver-style summed totals
+(`opcheck_prepare.dispatch_vector_totals`); the lit recipes pin that totals
+line to one set of literals in *both* halves, so a conditional shortcut, a
+malformed row, or a fault run whose totals drift all fail in the suite before
+the driver's independent totals comparison sees them.
 
 The cost worth stating: the suite now runs **two** full-layer tests — `block`
 and `coarse` — and each lit test starts with `make clean` in its own working

@@ -503,8 +503,9 @@ SPECS = [
     {
         # PHASE E2: the same layer as `block`, measured as the `coarse`
         # execution strategy -- few fused kernels over one runlist per
-        # sequence, iron's `hybrid` (the CSV value it records; convention rule
-        # 7 confines that name to pattern/__init__.py::EXECUTION_MODE_CSV).
+        # sequence. The CSV value it records is iron's old name for the mode,
+        # confined by convention rule 7 to
+        # pattern/__init__.py::EXECUTION_MODE_CSV.
         # The device path IS builders/block.py, through pattern/coarse's own
         # ELF cache; what this row adds is the mode's artifact -- operator
         # name, execution_mode, and the four per-sequence dispatch vectors the

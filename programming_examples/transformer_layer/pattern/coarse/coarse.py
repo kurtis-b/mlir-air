@@ -1,7 +1,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""``coarse`` — few fused kernels over one runlist per sequence (iron's ``hybrid``).
+"""``coarse`` — few fused kernels over one runlist per sequence.
 
 CONTRACT
     ``prepare_coarse(shape, seed=...)`` is this mode's entry in the ``SPECS``
@@ -32,9 +32,10 @@ FOOTGUNS
       ``clean`` target: the driver's negative control runs ``opcheck.py`` from
       the SOURCE directory, so the cache lands in the source tree exactly the
       way D2's ``block_cache/`` leak did.
-    - ``execution_mode`` is read from ``pattern.EXECUTION_MODE_CSV`` — the CSV
-      value is ``hybrid`` (convention rule 7) and this import is the one place
-      that mapping is applied for this mode. Do not inline the string.
+    - ``execution_mode`` is read from ``pattern.EXECUTION_MODE_CSV`` — the one
+      place convention rule 7 lets iron's old mode name survive, as the CSV
+      value — and this import is the one place that mapping is applied for
+      this mode. Do not inline the string.
     - The dispatch vectors are recorded by ``run_block`` on the fault-injected
       path too. The driver requires the fault artifact's summed totals to EQUAL
       the clean run's; anything conditional on the injected flag fails that.

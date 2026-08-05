@@ -69,6 +69,17 @@
 // driver's totals comparison sees it.
 // CHECK: [coarse] recorded 4 dispatch vectors
 //
+// The vectors' CONTENTS, not only their count: the six driver-summed totals,
+// pinned to the calibration numbers this mode exists to establish (the
+// per-sequence table is in pattern/coarse/README.md). The totals line is
+// printed only after every recorded row passes the as_row() schema in
+// opcheck_prepare.dispatch_vector_totals -- finite, non-negative,
+// whole-number counts, at least one submission, and a mean x submissions
+// product that is a whole number of runlist entries -- so a malformed row
+// aborts the run and a run whose totals drift fails right here, before the
+// driver's independent arithmetic over the artifact.
+// CHECK: [coarse] dispatch totals: submissions 4 entries 131 air 12 herd 146 sync 402 bytes 202902528
+//
 // Then the layer output itself over all 4096 x 768 elements, and the label
 // naming the MODE's operator -- a test wired to the block's artifact by
 // mistake fails here rather than passing quietly.
@@ -80,8 +91,8 @@
 // the one stake that is this mode's own: the dispatch vectors must be recorded
 // on the injected path too, because the driver requires the fault artifact's
 // summed totals to EQUAL the clean run's. A "skip instrumentation when
-// injecting" shortcut fails below at the recorded-vectors line, before the
-// driver ever runs.
+// injecting" shortcut fails below at the recorded-vectors and totals lines,
+// before the driver ever runs.
 //
 // RUN: make -f %S/Makefile check-coarse-fault PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s --check-prefix=FAULT
 //
@@ -99,8 +110,15 @@
 // FAULT: [stage] hidden {{.*}} mismatch {{[1-9][0-9]*}}
 // FAULT: [coarse] stages: 5/10 clean
 //
-// The vectors, still recorded under injection.
+// The vectors, still recorded under injection -- and totaling EXACTLY what
+// the clean run totals: the six literals below are the same six the clean
+// half pins above, which is the suite's own statement of the equality the
+// driver re-derives from the two artifacts. Injection perturbs one input
+// element after the reference exists and never touches the dispatch path, so
+// a fault run that totals anything else is instrumentation conditional on the
+// injected flag, or a vector that was not measured.
 // FAULT: [coarse] recorded 4 dispatch vectors
+// FAULT: [coarse] dispatch totals: submissions 4 entries 131 air 12 herd 146 sync 402 bytes 202902528
 //
 // And the verdict in the three forms opcheck.py reports it: the comparison's
 // own, the control's reading of it, and the exit-status summary.
