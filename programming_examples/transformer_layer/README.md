@@ -255,6 +255,24 @@ mechanism already supports it, `gemm_method_spec` in `llms/shared/` is where the
 suffix is minted, and that file is off limits to this study. Phase D needs this
 resolved before it can run the FFN leg.
 
+**`best.high` is the fastest method, not the one every builder can use.**
+`build_qkv_proj_module` folds its three-way C split into `fused-cast`'s separate
+cast launch, so it can only build that method — `drain` casts inside the GEMM and
+exposes no f32 scratch to slice. `drain`'s `tile_m = 32` beats `fused-cast`'s 64
+on short sequences, so `best.high` is `drain` for most of the ladder even though
+a measured `fused-cast` row sits beside it in the same entry. The QKV lookup
+therefore asks for `fused-cast` by name (`resolve_gemm_spec(..., method=...)`),
+which is still fully registry-driven — the tiles and the herd are that method's
+own measured row at that exact shape — and the run log says when the pinned
+method is not the shape's fastest. The other two GEMM builders wire either
+method and read `best.high` unchanged. **The one shape this does not rescue is
+`64×768×2304`**: no `fused-cast` candidate passed there (`mean_rel_L1 ≈ 0.46`
+across all four, ~30% of elements wrong — a datapath failure, not a tolerance
+edge), so its entry has only `drain` and `direct` and `qkv_proj` at `seq = 64`
+raises. Every other `baseline_768` QKV point builds. The row's `_note` records
+the failure; fixing it means finding a `fused-cast` configuration that is
+numerically correct at that shape, not widening the builder.
+
 **Multi-segment designs cannot use the xclbin output path.** Every `air.launch`
 lowers to its own `aie.device` under an `aiex.configure` / `aiex.run` runtime
 sequence, and the xclbin path names a single instruction blob on the aircc

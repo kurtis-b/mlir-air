@@ -10,9 +10,30 @@ CONTRACT
     with the HERD those tiles were measured at merged in as ``herd_m`` /
     ``herd_n``, and checks the pair actually tiles this shape.
 
+    ``resolve_gemm_spec(..., method="fused-cast")`` returns that method's
+    measured row instead of the shape's fastest one, for a builder whose
+    STRUCTURE fixes the method (see below).
+
     ``spec_herd(spec, herd_m, herd_n)`` is what a builder calls to decide the
     herd for one GEMM: an explicit caller override first, the spec's own herd
     second. Pass it straight to ``_build_gemm_module``.
+
+WHY A BUILDER MAY PIN THE METHOD
+    A registry row's ``best.high`` is the fastest high-precision method for that
+    shape and nothing else. The two high-precision methods are not
+    interchangeable at the module level: ``fused-cast`` accumulates into an f32
+    C scratch and casts in a SECOND launch, ``drain`` casts inside the one GEMM
+    launch and exposes no scratch at all. ``qkv_proj.py`` folds its three-way C
+    split into that second launch, so it can only build ``fused-cast`` -- and
+    the sequence ladder is full of shapes where ``drain`` is the faster method
+    and therefore the row's winner.
+
+    Pinning the method here keeps that builder registry-driven: the tiles and
+    the herd still come from what was MEASURED for ``fused-cast`` at this exact
+    shape. It is not a fallback and it guesses nothing --
+    a shape with no ``fused-cast`` row raises, exactly as an unmeasured shape
+    does. The alternative, taking ``best.high`` and rejecting it afterwards,
+    fails on a shape the registry can in fact serve.
 
 WHY THIS WRAPPER EXISTS
     ``gemm_registry_config`` copies out the method spec and the four tile sizes
@@ -46,6 +67,11 @@ FOOTGUNS
       its own shape. That is a corrupt row, not a caller error; the alternative
       is ``run.py``'s bare ``assert (64, 32, 8)`` several frames deeper, which
       names neither the shape nor the file to fix.
+    - A pinned ``method`` skips the row's tier check, because it names the
+      method directly rather than asking for a tier's winner. Pin only a
+      high-precision method (``fused-cast`` / ``drain``); pinning ``direct``
+      would silently drop a caller that asked for ``precision="high"`` onto the
+      low tier.
 """
 
 import os
@@ -83,19 +109,43 @@ def _check_gemm_herd(m, n, spec, herd_m, herd_n):
         )
 
 
-def resolve_gemm_spec(m, k, n, output_dtype="bf16", precision="high"):
+def resolve_gemm_spec(m, k, n, output_dtype="bf16", precision="high", method=None):
     """The registry's full build recipe for one GEMM, herd included.
 
-    Raises (via ``gemm_config``) on an unmeasured shape rather than guessing --
-    that is the whole point of the registry, see ``registry_lookup.py``.
-    """
-    from kernel_registry.registry_lookup import gemm_config
-    from shared.builders.gemm_builder import gemm_registry_config
+    ``method=None`` takes the tier's winner, which is what a builder that can
+    wire either method wants. Naming a method takes that method's measured row
+    instead -- for a builder whose module structure fixes it, see the docstring
+    above.
 
-    spec = dict(gemm_registry_config(m, k, n, output_dtype, precision))
-    spec["herd_m"], spec["herd_n"] = gemm_config(m, k, n, output_dtype, precision)[
-        "herd"
-    ]
+    Raises (via the lookup) on an unmeasured shape, or on a shape with no row
+    for the named method, rather than guessing -- that is the whole point of the
+    registry, see ``registry_lookup.py``.
+    """
+    from kernel_registry.registry_lookup import gemm_config, gemm_config_method
+
+    # `_spec_with_tiles` is the same merge `gemm_registry_config` performs one
+    # line further in, including its tile_m-agrees-with-the-method assert. It is
+    # reached directly only because `gemm_registry_config` hardcodes the tier
+    # winner as the method, and `llms/shared/` is off limits to this study.
+    from shared.builders.gemm_builder import _spec_with_tiles, gemm_registry_config
+
+    if method is None:
+        spec = dict(gemm_registry_config(m, k, n, output_dtype, precision))
+        cfg = gemm_config(m, k, n, output_dtype, precision)
+    else:
+        cfg = gemm_config_method(m, k, n, output_dtype, method, precision)
+        spec = dict(_spec_with_tiles(cfg["method"], cfg["tile"]))
+        # What the row would have chosen on its own. Recorded so a pinning
+        # builder's run log can say it is not using the fastest method measured
+        # for this shape, rather than leaving that cost invisible. Reporting
+        # only, so a row with no winner for the tier leaves it unset instead of
+        # turning a successful resolution into a failed one.
+        try:
+            winner = gemm_config(m, k, n, output_dtype, precision)["method"]
+        except KeyError:
+            winner = None
+        spec["tier_winner"] = winner
+    spec["herd_m"], spec["herd_n"] = cfg["herd"]
     _check_gemm_herd(m, n, spec, spec["herd_m"], spec["herd_n"])
     return spec
 

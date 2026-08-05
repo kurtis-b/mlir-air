@@ -23,6 +23,10 @@ CONTRACT
     python3 registry_sweep.py --family baseline_768 --write-registry
         Fold the measured results into the registry JSON and both markdown
         pages. Append-only; raises on a shape already registered. No hardware.
+        A ``--role`` / ``--seq`` filter narrows what is APPENDED to the JSON.
+        It does not narrow the markdown: that section is replaced whole, so it
+        is always rebuilt from every shape of the family (see
+        ``write_family_markdown``).
 
     python3 registry_sweep.py --family baseline_768 --verify-resolution
         Assert every shape in the family resolves through
@@ -525,6 +529,74 @@ def verify_resolution(shapes):
     return failures
 
 
+def write_family_markdown(family, results_dir, perf_iters, candidate_kwargs=None):
+    """Re-render a family's markdown section from EVERY shape the family has.
+
+    ``registry_writer.write_markdown`` replaces its whole delimited section, so
+    handing it a ``--role`` / ``--seq`` subset would delete the other roles' and
+    sequences' rows from two pages -- and the registry's tamper check
+    fingerprints only the JSON, so nothing else would notice. The JSON append
+    honours the filter; the markdown is always rebuilt from the full family.
+
+    Fail-closed twice, because the markdown MIRRORS the JSON and a page that
+    quietly stops matching it is the one failure nothing else here would catch:
+
+    - A shape this family's sweep registered in the JSON but that has no
+      checkpoint left to re-derive a row from. Rendering without it deletes the
+      row while the JSON goes on claiming the shape.
+    - A shape whose row would render differently from the entry the JSON already
+      holds -- what a re-run with a narrower ``--tile-n-options`` /
+      ``--tile-k-l2-options`` grid produces, since a smaller candidate set can
+      elect a different winner from the same checkpoints.
+
+    Restoring the results directory, or re-running with the grid the rows were
+    measured at, is the fix in both cases. Neither is repaired by writing.
+    """
+    shapes = shapes_for_family(family)
+    all_records = load_all_results(shapes, results_dir, perf_iters, candidate_kwargs)
+    rows = collect_rows(shapes, all_records, candidate_kwargs)
+    rendered = {row["shape"].key: row for row in rows}
+
+    # Only the entries this family's own sweep wrote: a shape some model
+    # registered first is not this section's to mirror, and this sweep skips it
+    # rather than measuring it.
+    registered = {
+        (s["M"], s["K"], s["N"]): s for s in registry_writer.load_registry()["shapes"]
+    }
+    owned = {
+        s.key: registered[s.key]
+        for s in shapes
+        if s.key in registered and registered[s.key].get("used_by") == s.used_by
+    }
+
+    orphaned = [s.label for s in shapes if s.key in owned and s.key not in rendered]
+    if orphaned:
+        raise RuntimeError(
+            f"{len(orphaned)} {family} shapes are recorded in "
+            f"{registry_writer.GEMM_JSON.name} but have no measurement under "
+            f"{results_dir}: {orphaned}. Writing the markdown section now would "
+            f"drop their rows from the two pages while the JSON keeps claiming "
+            f"them. Restore the checkpoints, or re-sweep those shapes, first."
+        )
+
+    drifted = [
+        rendered[key]["shape"].label
+        for key in owned
+        if key in rendered and registry_writer.build_entry(rendered[key]) != owned[key]
+    ]
+    if drifted:
+        raise RuntimeError(
+            f"{len(drifted)} {family} rows would render differently from the "
+            f"entry {registry_writer.GEMM_JSON.name} already holds: {drifted}. "
+            f"The two pages mirror that JSON, and the JSON is append-only, so "
+            f"the disagreement cannot be resolved by writing. Re-run with the "
+            f"candidate grid these rows were measured at, or re-sweep them."
+        )
+
+    registry_writer.write_markdown(family, rows)
+    return rows
+
+
 def _select_shapes(args):
     shapes = shapes_for_family(args.family)
     if args.role:
@@ -633,8 +705,15 @@ def main():
             print(f"already registered, left untouched: {skipped}")
         written = registry_writer.append_shapes(fresh)
         print(f"appended {len(written)} shapes to {registry_writer.GEMM_JSON.name}")
-        registry_writer.write_markdown(args.family, rows)
-        print("mirrored into GEMM_bf16_in_bf16_out.md and supported_kernels.md")
+        # Deliberately not `rows`: the markdown section is replaced whole, so it
+        # is rebuilt from the whole family however the append was narrowed.
+        mirrored = write_family_markdown(
+            args.family, results_dir, args.perf_iters, candidate_kwargs
+        )
+        print(
+            f"mirrored {len(mirrored)} {args.family} rows into "
+            f"GEMM_bf16_in_bf16_out.md and supported_kernels.md"
+        )
         return 0
 
     already = registry_writer.registered_shape_keys()

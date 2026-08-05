@@ -30,7 +30,11 @@ APPEND ONLY -- THE FOOTGUN THIS MODULE EXISTS TO PREVENT
     markdown pages, so nothing but this module's own care keeps them honest.
     Every markdown write is delimited by a named HTML comment and replaces what
     is between the delimiters, so re-running the sweep updates its own section
-    and cannot touch a hand-written one.
+    and cannot touch a hand-written one. It replaces the section WHOLESALE,
+    which is the other half of that bargain: ``write_markdown`` has to be given
+    every row of the family, or it deletes the ones it was not given. Assembling
+    that full set is ``registry_sweep.write_family_markdown``'s job, because it
+    is the layer that knows what a ``--role`` / ``--seq`` filter left out.
 
 WHAT ``herd`` IS DOING IN THE METHOD ENTRIES
     The JSON's top-level ``herd`` records 8x4 because every shape registered
@@ -322,7 +326,20 @@ high-precision `atol` is K-scaled here, in
 
 
 def write_markdown(family, rows):
-    """Mirror the family's rows into both markdown pages."""
+    """Mirror the family's rows into both markdown pages.
+
+    ``rows`` MUST be every row the family has, not the subset a run happened to
+    measure or append. The delimited section is REPLACED, not merged, so a
+    partial ``rows`` silently deletes the rows it omits -- from the one pair of
+    pages the registry's tamper check does not fingerprint.
+    ``registry_sweep.write_family_markdown`` is what assembles the full set;
+    call that rather than this.
+    """
+    if not rows:
+        raise ValueError(
+            f"refusing to write an empty {family} section: this replaces the "
+            f"whole delimited block, so it would delete every row already there"
+        )
     name = f"transformer-layer-sweep {family}"
     _splice_markdown(
         GEMM_MD,

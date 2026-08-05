@@ -28,17 +28,27 @@ WHY THE SPLIT RIDES THE CAST
     cast that was already going to happen, and it happens in the DMA descriptors
     of the runtime sequence rather than in host code.
 
-    Consequence: this builder REQUIRES a method with an f32 scratch. A shape
-    whose registry entry selects ``drain`` (in-GEMM cast, one launch, no
-    scratch) raises instead of silently falling back, because splitting a
-    bf16 C would mean three extra full-tensor copies and a different numeric
-    path from the one the registry measured.
+    Consequence: this builder's METHOD IS FIXED BY ITS STRUCTURE. It builds
+    ``fused-cast`` and only ``fused-cast``, because ``drain`` (in-GEMM cast, one
+    launch, no scratch) has no second launch to fold the split into, and
+    splitting a bf16 C would mean three extra full-tensor copies and a different
+    numeric path from the one the registry measured.
+
+    So the lookup asks the registry for the shape's MEASURED ``fused-cast`` row
+    rather than for its fastest high-precision row. Those differ constantly:
+    ``drain``'s ``tile_m = 32`` beats ``fused-cast``'s 64 on every short
+    sequence, so ``best.high`` is ``drain`` for most of the sequence ladder even
+    though a ``fused-cast`` row sits right beside it in the same entry. Reading
+    ``best.high`` and then rejecting it would refuse shapes the registry can
+    serve. A shape with no ``fused-cast`` row at all still raises -- there is
+    nothing measured to build.
 
 TILES COME FROM THE REGISTRY, NEVER FROM A CONSTANT
-    ``resolve_gemm_spec(m, k, n)`` is the only source of tile sizes, method and
-    herd. It RAISES on an unmeasured shape, deliberately -- hand-copied tile
+    ``resolve_gemm_spec(m, k, n, method=...)`` is the only source of tile sizes
+    and herd. It RAISES on an unmeasured shape, deliberately -- hand-copied tile
     configs previously caused drift bugs (``registry_lookup.py`` docstring).
-    ``gemm_spec_fn`` is the one escape hatch, the same one
+    Pinning the method narrows WHICH row of a measured shape is read; it never
+    invents one. ``gemm_spec_fn`` is the one escape hatch, the same one
     ``rms_qkv_qknorm_rope_multi.py`` already ships for ``qwen3_4b``; an injected
     spec is recorded in the results artifact so the guess is visible rather than
     silent. Do not add a fallback that guesses tiles.
@@ -94,9 +104,13 @@ range_ = for_
 # The three projections, in the column order the fused weight packs them.
 QKV_NAMES = ("q", "k", "v")
 
+# The only high-precision method that exposes the f32 C scratch the three-way
+# split rides. Not a preference -- see the module docstring.
+SCRATCH_METHOD = "fused-cast"
+
 
 def qkv_gemm_spec(seq_len, emb_dim, gemm_spec_fn=None):
-    """Resolve the fused-QKV GEMM's method and tiles, registry-first.
+    """Resolve the fused-QKV GEMM's tiles, registry-first, for ``SCRATCH_METHOD``.
 
     Returns ``(spec, source)`` where ``source`` is ``"registry"`` or
     ``"injected"``. Split out from the builder so ``opcheck.py`` can record the
@@ -105,7 +119,21 @@ def qkv_gemm_spec(seq_len, emb_dim, gemm_spec_fn=None):
     n_total = 3 * emb_dim
     if gemm_spec_fn is not None:
         return gemm_spec_fn(seq_len, emb_dim, n_total), "injected"
-    return resolve_gemm_spec(seq_len, emb_dim, n_total, "bf16", "high"), "registry"
+    try:
+        spec = resolve_gemm_spec(
+            seq_len, emb_dim, n_total, "bf16", "high", method=SCRATCH_METHOD
+        )
+    except KeyError as exc:
+        raise KeyError(
+            f"qkv_proj at {seq_len}x{emb_dim}x{n_total} cannot be built: the "
+            f"registry has no {SCRATCH_METHOD!r} row for this shape, and the "
+            f"three-way C split rides that method's separate cast launch. "
+            f"Sweep the shape until {SCRATCH_METHOD} passes "
+            f"(`sweep/registry_sweep.py --family <family> --shape "
+            f"{seq_len}x{emb_dim}x{n_total}`) rather than widening this builder "
+            f"to a scratch-free method. Lookup said: {exc}"
+        ) from exc
+    return spec, "registry"
 
 
 @module_builder
@@ -267,21 +295,32 @@ def build_qkv_proj_module(
     n_total = 3 * emb_dim
     spec, source = qkv_gemm_spec(seq_len, emb_dim, gemm_spec_fn)
     if not spec["needs_f32_scratch"]:
+        # Only an injected spec reaches here: the registry path pins
+        # SCRATCH_METHOD, so it either resolves to a scratch-bearing row or
+        # raises in qkv_gemm_spec.
         raise ValueError(
-            f"qkv_proj at {seq_len}x{emb_dim}x{n_total} resolves to method "
+            f"qkv_proj at {seq_len}x{emb_dim}x{n_total} was given method "
             f"{spec['method']!r}, which casts inside the GEMM and exposes no f32 "
             f"scratch. The three-way C split rides the separate cast launch, so "
-            f"this builder needs a scratch-bearing method (fused-cast). Measure "
-            f"and register a fused-cast entry for this shape rather than "
-            f"widening this check."
+            f"an injected spec for this builder has to name {SCRATCH_METHOD!r} "
+            f"(and carry its tile_m). Widening this check would silently change "
+            f"the numeric path."
         )
 
     from matrix_multiplication.bf16_in_bf16_out.run import build_module as build_gemm
 
     herd_m, herd_n = spec_herd(spec, herd_m, herd_n)
+    # The pinned method is often not the row's fastest -- say so, so nobody
+    # reads a slow QKV number as this shape's registry best.
+    winner = spec.get("tier_winner")
+    aside = (
+        f", not this shape's fastest high method {winner}"
+        if winner and winner != spec["method"]
+        else ""
+    )
     print(
         f"  [1/4] QKV GEMM {seq_len}x{emb_dim}x{n_total} "
-        f"({spec['method']}, {source}, tile_m={spec['tile_m']} "
+        f"({spec['method']}, {source}{aside}, tile_m={spec['tile_m']} "
         f"tile_k_l2={spec['tile_k_l2']} tile_k_l1={spec['tile_k_l1']} "
         f"tile_n={spec['tile_n']} herd={herd_m}x{herd_n})..."
     )
