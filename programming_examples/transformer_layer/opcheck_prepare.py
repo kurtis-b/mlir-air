@@ -571,6 +571,39 @@ def prepare_block(shape, seed=42):
     rather than here, so the injection -- which ``opcheck.py`` applies to
     ``inputs`` after this function has returned -- reaches the device buffers.
     """
+    return prepare_layer_dispatch(shape, seed=seed)
+
+
+def prepare_layer_dispatch(
+    shape, seed=42, cache_dir=BLOCK_CACHE_DIR, label="block", extra=None
+):
+    """The full-layer preparation ``prepare_block`` and the Phase E modes share.
+
+    One implementation, parameterized rather than copied, because everything in
+    it IS the artifact contract the modes are measured against: the golden
+    model's draws, the injection target, the per-boundary comparisons at
+    ``BLOCK_STAGE_ATOL``, and the ``dispatch_vectors`` recorded straight from
+    ``run_block``. A mode that re-implemented this glue could drift from the
+    contract in exactly the ways the driver's cross-mode comparison cannot see.
+
+    Args:
+        cache_dir: the mode's OWN ELF cache directory. Never share one between
+            modes: the directory is chosen by NAME, so two modes pointed at one
+            can trade ELFs whose fingerprints happen to agree, and the result is
+            numerically valid output attributed to the wrong execution boundary
+            -- a failure no equivalence check would surface. See
+            08b-phase-e2-coarse-and-instrumentation.md.
+        label: prefix for the stage-summary prints, and nothing else. The lit
+            recipes match on it, so it is the mode's own name.
+        extra: merged into ``record_extra`` -- a mode adds its
+            ``execution_mode`` CSV value here, from the one mapping in
+            ``pattern/__init__.py``.
+
+    The vectors are recorded UNCONDITIONALLY, on the fault-injected path as
+    well as the clean one. The driver compares the two runs' summed totals and
+    requires them EQUAL; a "skip instrumentation when injecting" shortcut would
+    fail that check, not dodge it.
+    """
     seq_len, emb_dim = shape["seq_len"], shape["emb_dim"]
     ffn_dim, num_heads = shape["ffn_dim"], shape["num_heads"]
     head_dim = shape["head_dim"]
@@ -597,7 +630,7 @@ def prepare_block(shape, seed=42):
     from shared.infra.cache import KernelCache, Profiler
 
     cache = KernelCache(
-        cache_dir=BLOCK_CACHE_DIR, verbose=False, profiler=Profiler(enabled=False)
+        cache_dir=cache_dir, verbose=False, profiler=Profiler(enabled=False)
     )
     compile_block_artifacts(cache, cfg, run_only=True)
 
@@ -615,13 +648,42 @@ def prepare_block(shape, seed=42):
                 f"atol_required {stats['atol_required']:.3e} (atol {atol:.1e})"
             )
         clean = sum(1 for s in stages if s["n_mismatch"] == 0)
-        print(f"[block] stages: {clean}/{len(stages)} clean")
+        print(f"[{label}] stages: {clean}/{len(stages)} clean")
+        # On the fault path too -- the lit recipes' FAULT half matches this
+        # line, so an instrumentation made conditional on the injected flag
+        # fails in the suite before the driver's totals comparison sees it.
+        print(f"[{label}] recorded {len(vector_rows)} dispatch vectors")
         return [boundaries["output"]], {
             "stages": stages,
             "stages_passed": clean == len(stages),
             "dispatch_vectors": vector_rows,
         }
 
+    record_extra = {
+        "variant": "encoder_bert",
+        "causal": False,
+        "golden_seed": seed,
+        "gemm_spec_source": cfg["qkv_source"],
+        "gemm_spec_qkv": _spec_digest(cfg["qkv_spec"]),
+        "gemm_spec_ffn_up": _spec_digest(cfg["ffn_up_spec"]),
+        "gemm_spec_ffn_down": _spec_digest(cfg["ffn_down_spec"]),
+        "gemm_spec_o_proj": _spec_digest(cfg["o_proj_spec"]),
+        "addnorm_rows": cfg["norm_rows"],
+        "addnorm_dispatches": cfg["norm_blocks"],
+        "attention_config": {
+            key: cfg["attn_cfg"][key]
+            for key in (
+                "parallel_seq",
+                "parallel_heads",
+                "kv_seq_tile",
+                "q_seq_tile",
+                "num_q_tiles",
+                "cascade_stages",
+                "gqa_group_size",
+            )
+        },
+    }
+    record_extra.update(extra or {})
     return {
         "inputs": inputs,
         "expected": [reference["output"]],
@@ -629,28 +691,5 @@ def prepare_block(shape, seed=42):
         # rules out every attention-side target.
         "inject": (BLOCK_INPUT_NAMES.index("ln1_weight"), (0,)),
         "dispatch": dispatch,
-        "record_extra": {
-            "variant": "encoder_bert",
-            "causal": False,
-            "golden_seed": seed,
-            "gemm_spec_source": cfg["qkv_source"],
-            "gemm_spec_qkv": _spec_digest(cfg["qkv_spec"]),
-            "gemm_spec_ffn_up": _spec_digest(cfg["ffn_up_spec"]),
-            "gemm_spec_ffn_down": _spec_digest(cfg["ffn_down_spec"]),
-            "gemm_spec_o_proj": _spec_digest(cfg["o_proj_spec"]),
-            "addnorm_rows": cfg["norm_rows"],
-            "addnorm_dispatches": cfg["norm_blocks"],
-            "attention_config": {
-                key: cfg["attn_cfg"][key]
-                for key in (
-                    "parallel_seq",
-                    "parallel_heads",
-                    "kv_seq_tile",
-                    "q_seq_tile",
-                    "num_q_tiles",
-                    "cascade_stages",
-                    "gqa_group_size",
-                )
-            },
-        },
+        "record_extra": record_extra,
     }
