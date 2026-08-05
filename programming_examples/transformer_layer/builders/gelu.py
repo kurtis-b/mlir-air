@@ -24,10 +24,13 @@ IT IS THE TANH APPROXIMATION, NOT ERF GeLU
         0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 
     what HuggingFace calls ``gelu_new`` / ``gelu_pytorch_tanh``. iron's oracle
-    calls ``torch.nn.functional.gelu``, whose DEFAULT is the exact erf form; at
-    iron's 4e-2 tolerance the difference hides, at ``rtol = 1.6e-2`` it does not.
+    calls ``torch.nn.functional.gelu``, whose DEFAULT is the exact erf form.
     ``gelu_tanh_reference`` below is therefore the tanh form deliberately. Do
-    not "fix" it back to erf.
+    not "fix" it back to erf -- and do not expect any tolerance in this example
+    to notice if you do: the two forms differ by at most 4.7e-4 absolute, which
+    is inside every ``atol`` here and inside ``rtol`` alone almost everywhere.
+    See that function's docstring for the measurement and for what pins it
+    instead.
 
 FOOTGUNS
     - The device kernel carries its intermediates in bf16 -- ``x^2``, ``x^3``,
@@ -187,9 +190,23 @@ def gelu_tanh_reference(x):
     """FP32 tanh-approximation GeLU, rounded once to the input dtype.
 
     The TANH approximation, matching ``gelu_tanh_approx_bf16`` and HuggingFace's
-    ``gelu_pytorch_tanh`` -- not ``torch.nn.functional.gelu``'s default erf
-    form, which differs by up to ~1e-3 absolute around |x| = 2 and would not
-    survive ``rtol = 1.6e-2`` on its own.
+    ``gelu_pytorch_tanh`` -- not ``torch.nn.functional.gelu``'s default erf form.
+
+    AND NO TOLERANCE CHECK WILL TELL YOU IF YOU PICK THE WRONG ONE. An earlier
+    version of this docstring said the erf form "differs by up to ~1e-3 absolute
+    around |x| = 2 and would not survive rtol = 1.6e-2 on its own". Measured over
+    ``x`` in [-6, 6]: the worst absolute difference is 4.7e-4, at ``x = 2.70``,
+    and the smallest ``atol`` that would pass the substitution over the whole
+    range is 3.6e-4 -- inside every ``atol`` in this example, and inside ``rtol``
+    alone wherever ``|gelu(x)| > 0.03``. In Phase D2's whole layer the swap moves
+    the FFN's activation boundary by at most 4.7e-4 absolute and the LAYER OUTPUT
+    by 6.1e-4 -- the substitution would need an ``atol`` below 3.7e-4 to be seen
+    at either, and the loosest ``atol`` anywhere in this example is 1e-3.
+
+    So this function is pinned by IDENTITY, not by tolerance:
+    ``pattern/test_reference.py`` asserts the golden model's activation boundary
+    equals this function to 1e-6 and differs from the erf form. Reasoning that
+    "the numerical check would have caught it" is exactly the mistake.
 
     FP32 throughout, so the bf16 intermediates the device carries show up as
     error rather than being cancelled out. See the module footgun note.

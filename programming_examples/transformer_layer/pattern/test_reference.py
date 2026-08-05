@@ -139,20 +139,27 @@ def test_composition_matches_a_straight_line_transcription():
 
 
 def test_the_gelu_is_the_tanh_approximation():
-    """The activation is tanh, checked AT ITS OWN BOUNDARY and not at the output.
+    """The activation is tanh, pinned by IDENTITY because no tolerance can pin it.
 
     iron's reference calls ``torch.nn.functional.gelu``'s erf default while the
-    device kernel is the tanh approximation. Substituting one for the other moves
-    the ``ffn_gelu`` boundary by 3.6e-3 relative -- well outside ``rtol`` -- and
-    moves the LAYER OUTPUT by 1.8e-4, which is two orders of magnitude INSIDE it.
+    device kernel is the tanh approximation, and this is the substitution the
+    port was most likely to make. It is also one that NO numerical check in this
+    repository would have caught. Measured at these widths:
 
-    That measurement is the whole argument for the per-boundary stage list, made
-    on the cheapest possible example: a demonstrably wrong oracle, in the exact
-    place the port was most likely to get it wrong, that an end-to-end comparison
-    at this repository's own tolerance cannot see. The two LayerNorms and the
-    down-projection's 3072-deep reduction absorb it. Anything further upstream --
-    C4's GEMM returning zeros for two of nine cast sub-tiles, say -- is absorbed
-    the same way.
+        boundary       max |erf - tanh|    atol the substitution needs
+        ffn_gelu           4.73e-4                  3.65e-4
+        layer output       6.06e-4                  2.89e-4
+
+    Every ``atol`` this example uses is at least 1e-3, and most are 100x that,
+    so a wrong activation would sail through the stage list AND the end-to-end
+    comparison. "The numerical check would have caught it" is exactly the wrong
+    conclusion to draw from a passing gate.
+
+    So the assertions below are equality against ``gelu_tanh_reference``'s own
+    output and inequality against the erf form -- identity, not tolerance. The
+    lower bound on the substitution size is there only to notice if a future
+    SHAPE drifts onto a part of the curve where the two forms coincide, which
+    would make the inequality vacuous.
     """
     import torch
 
@@ -160,16 +167,18 @@ def test_the_gelu_is_the_tanh_approximation():
     up = torch.from_numpy(golden["boundaries"]["ffn_up"])
     tanh_form = torch.nn.functional.gelu(up, approximate="tanh").numpy()
     erf_form = torch.nn.functional.gelu(up).numpy()
-    actual = golden["boundaries"]["ffn_gelu"]
+    actual = np.asarray(golden["boundaries"]["ffn_gelu"], dtype=np.float64)
 
-    substitution = _rel(erf_form, tanh_form)
-    assert substitution > 1e-3, (
-        f"erf and tanh GeLU differ by only {substitution:.3e} at this shape, so "
-        f"this check can no longer tell the two oracles apart -- the widths in "
-        f"SHAPE have drifted off the part of the curve where they disagree"
+    separation = float(np.abs(erf_form.astype(np.float64) - tanh_form).max())
+    assert separation > 1e-4, (
+        f"erf and tanh GeLU differ by only {separation:.3e} at this shape, so "
+        f"the inequality below proves nothing -- the widths in SHAPE have "
+        f"drifted off the part of the curve where the two forms disagree"
     )
     assert _rel(actual, tanh_form) < 1e-6, "the composition is not using tanh GeLU"
-    assert _rel(actual, erf_form) > 1e-3, "the composition matches the erf form"
+    assert (
+        float(np.abs(actual - erf_form.astype(np.float64)).max()) > 1e-4
+    ), "the composition matches the erf form"
 
 
 def test_the_residual_ordering_is_pre_add():

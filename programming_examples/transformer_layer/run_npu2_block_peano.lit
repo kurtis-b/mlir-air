@@ -25,11 +25,14 @@
 // A layer that ends in a LayerNorm absorbs an enormous amount of upstream
 // damage. The 25% of the up-projection that came back zero reached the layer
 // output as a 54% mismatch, which says only "something is wrong"; the stage
-// list said "ffn_up, and everything before it is exact". The same measurement
-// in the other direction is in pattern/test_reference.py: swapping the tanh
-// GeLU for the erf form moves the ffn_gelu boundary by 3.6e-3 relative and the
-// layer output by 1.8e-4, two orders of magnitude INSIDE this repository's own
-// rtol. A single end-to-end number cannot see that; ten boundary numbers can.
+// list said "ffn_up, and everything before it is exact".
+//
+// The stages are not sufficient either, and pattern/test_reference.py measures
+// the other side of that: swapping the device's tanh GeLU for the erf form
+// moves the ffn_gelu boundary by 4.7e-4 absolute and the layer output by
+// 6.1e-4, so NO tolerance in this example would see it. That oracle is pinned
+// by identity in the host-only tests instead. Ten boundary numbers localize a
+// defect the end-to-end number only reports; neither pins a wrong reference.
 //
 // NPU serialization lives one layer down, not in the recipe below. Device
 // access is locked on /tmp/npu.lock, which KernelCache.ensure_loaded holds

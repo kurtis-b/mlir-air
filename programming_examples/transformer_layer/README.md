@@ -304,9 +304,10 @@ comparison is a work item:
   and prove nothing. The block's control goes into `ln1_weight`, which reaches
   8% of the output through two paths (the FFN's input *and* the second addnorm's
   residual); `opcheck_specs.py` records the measurement for all seven candidates.
-- Swapping the tanh GeLU for the erf form moves `ffn_gelu` by 3.6e-3 relative and
-  the layer output by 1.8e-4 — two orders of magnitude *inside* `rtol`.
-  `pattern/test_reference.py` measures both.
+- Swapping the tanh GeLU for the erf form moves `ffn_gelu` by at most 4.7e-4
+  absolute and the layer output by 6.1e-4, so *no* tolerance in this example
+  would see it — the stage list does not help here either. That oracle is pinned
+  by identity in `pattern/test_reference.py` instead.
 - The 25% of `ffn_up` that came back zero during bring-up (below) reached the
   layer output as "54% of elements wrong", which says only that something is
   broken. The stage list said `ffn_up`, and that everything before it was exact.
@@ -485,10 +486,11 @@ difference is **4.7e-4**, at `x = 2.70`, and the `atol_required` for the
 substitution over the whole range is **3.6e-4** — comfortably inside any `atol`
 in this example. Using the tanh form is still correct, because it is what the
 kernel computes; what is wrong is the claim that a tolerance check would catch
-the substitution. `pattern/test_reference.py` pins the activation by identity
-against `gelu_tanh_reference` instead, and records the layer-level number:
-swapping the forms moves `ffn_gelu` by 3.6e-3 relative and the layer output by
-1.8e-4.
+the substitution. In the whole D2 layer the swap moves `ffn_gelu` by at most
+4.7e-4 absolute and the layer output by 6.1e-4, against a loosest `atol` of
+1e-3 — invisible at the boundary *and* at the output.
+`pattern/test_reference.py` pins the activation by identity against
+`gelu_tanh_reference` instead.
 
 **`best.high` is the fastest method, not the one every builder can use.**
 `build_qkv_proj_module` folds its three-way C split into `fused-cast`'s separate
