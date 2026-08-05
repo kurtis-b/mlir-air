@@ -11,13 +11,26 @@ Every PORT and ADAPT item is still subject to
 [02-porting-conventions.md](02-porting-conventions.md); "ports by structure" is not "ports
 unchanged".
 
+> **`[2026-08-05]` This is a triage, not a to-do list — much of it is done.** Phases A–D have
+> landed: every `aie_kernels/aie2p/` row (A), the BO allocator and dirty-bit sync rows (B), all six
+> operator rows (C1–C3), and `pattern/reference.py` (D2). Individual rows are annotated where the
+> disposition itself turned out wrong. The status board in [README](README.md) is authoritative for
+> what is complete; this file is authoritative for what each artifact *becomes*.
+>
+> **What is still open, and whose it is.** Phase E owns `offload/op.py`, `runlist/op.py` and
+> `hybrid/op.py` (the last largely delivered already — see its row). Note that
+> `iron/operators/{transpose,elementwise_mul}/design.py` appear below with no phase assigned, and
+> `runlist` needs both: there is no `transpose` or `elementwise_mul` builder or example anywhere in
+> `programming_examples/`, so they are **new device work**, not re-expression — the only new device
+> work left in this plan. Everything else outstanding is Phase F's study tier.
+
 ## Summary
 
 | Disposition | Approx. lines | Where it lands |
 |---|---|---|
 | PORT | ~19,000 | Phase F (study infrastructure tier) |
-| ADAPT | ~6,500 | Phases B, F |
-| REWRITE | ~9,000 | Phases C, E |
+| ADAPT | ~6,500 | Phases B *(done)*, F |
+| REWRITE | ~9,000 | Phases C *(done)*, E |
 | DROP | ~1,500 | — |
 
 ## `iron/common/` — runtime layer

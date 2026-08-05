@@ -168,12 +168,18 @@ them; they are not optional.
 Per 05-phase-b: *"If this fails, `runlist` and `coarse` collapse into `offload` and the study
 loses its central axis."* It does not fail. Concretely:
 
-- **`runlist` (29 kernels, 42 entries) and `coarse` (5–6 kernels, 12 entries) as specified in
-  [01-port-inventory.md](01-port-inventory.md) can be built from separately-compiled ELFs**, one
-  `hw_context` per artifact. The taxonomy in [03-measurement-model.md](03-measurement-model.md)
+- **`runlist` and `coarse` as specified in [01-port-inventory.md](01-port-inventory.md) can be
+  built from separately-compiled ELFs**, one `hw_context` per artifact. (`[2026-08-05]` The
+  entry counts quoted here — 42 and 12 — are iron's, and `coarse`'s is now measured at **131**,
+  because each of the layer's two normalization points is 64 dispatches. The conclusion is
+  unaffected; the numbers should not be reused. See
+  [03](03-measurement-model.md).) The taxonomy in [03-measurement-model.md](03-measurement-model.md)
   keeps four distinct points, reached as originally intended.
-- The open question is **how many concurrent `hw_context`s NPU2 grants**. Three is measured; 29
-  is not. If the device runs out it says so — `xrt.hw_context` raises at load time — so the
+- ~~The open question is **how many concurrent `hw_context`s NPU2 grants**. Three is measured; 29
+  is not.~~ **`[2026-08-05]` Answered: 32.** Probed by holding every context open until XRT
+  refused; 33 fails with `DRM_IOCTL_AMDXDNA_CREATE_HWCTX err=-2`. Caveats on the margin are in
+  [08 §Risks](08-phase-e-execution-strategies.md). The original text follows because its reasoning
+  about the failure mode still holds: three is measured; 29 If the device runs out it says so — `xrt.hw_context` raises at load time — so the
   failure would be an exception during `ensure_loaded`, not a quietly wrong number. Reaching 29
   would then need the sequence broken into groups, and the dispatch vector would report the
   resulting submission count honestly.

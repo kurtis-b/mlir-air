@@ -57,6 +57,20 @@ These are what actually distinguish the modes. `offload` has 8 submissions and 8
 boundaries; `runlist` has 1 submission with ~29 entries; `coarse` has 1 submission with ~6
 entries; `fused_elf` has few submissions with many AIR launches and near-zero intermediate sync.
 
+> **`[2026-08-05]` Those numbers were predictions, and the first one measured is wrong.** Phase D
+> built the `coarse` layer and recorded its vector: **4 submissions, 131 runlist entries, 12 AIR
+> launches, 146 herd launches, 402 sync boundaries**, not "1 submission with ~6 entries". The
+> cause is not the taxonomy — it is that `build_addnorm_module` caps rows per call, so each of the
+> two normalization points is 64 dispatches, and 128 of those 131 entries are that one operator's
+> row blocking.
+>
+> This matters more than a corrected constant. [08](08-phase-e-execution-strategies.md)'s
+> distinguishability gate says `runlist` should have "many" entries and `coarse` "few"; on these
+> numbers `coarse` already has 131 before any fine-grained mode exists, so the predicted separation
+> may be between a number and itself. **Decide which fields actually discriminate, and re-derive
+> the expected values at `baseline_768`, before building the modes** — 08 §Gate says a failure to
+> separate means the measurement model needs revisiting, and that condition has already fired once.
+
 Each field must have a written definition in the schema module, tied to the Phase B dispatch
 model, and a single implementation that all four modes call. A per-mode reimplementation of
 "what counts as a submission" would make the comparison meaningless.

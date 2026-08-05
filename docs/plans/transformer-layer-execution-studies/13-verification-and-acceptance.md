@@ -30,7 +30,7 @@ then the narrowest useful test.
 | Level | Command | Gates on |
 |---|---|---|
 | Conventions | `black --check .`, clang-format / clang-tidy, plus the [02](02-porting-conventions.md) checklist at review | No iron-shaped code lands: no `AIE*` operator classes, no `op.py`/`design.py` pairs, no `REUSE.toml`, no module materially over ~800 lines |
-| Kernels compile | `ninja check-programming-examples-transformer-layer` | Phase A — compile-only lit, no NPU needed, PR-gate-safe |
+| Kernels compile | `make compile` in `transformer_layer/` | Phase A — Peano objects and their symbol lists. **`[2026-08-05]` The PR-safe subset is the individual `make` targets, not the ninja target**: `check-programming-examples-transformer-layer` has needed an NPU since C1 and is 16 tests, ten of them `REQUIRES: ryzen_ai_npu2`. See [15](15-environment-notes.md#the-transformer-layer-suite-now-needs-an-npu) |
 | Runlist spike | Hardware test with the real separately-compiled artifacts | Phase B — the taxonomy's load-bearing assumption |
 | Operator numerics | `transformer_layer/opcheck.py --operator <op>`, one `run_npu2_<op>_peano.lit` per operator | Phase C — full-output `np.isclose` at registry `rtol`/`atol` vs an FP32 reference, zero mismatches |
 | Check discriminates | `opcheck.py --operator <op> --fault-inject input`, which must **fail** | Phase C — a vacuous check passes under injection; the driver fails the phase for it |
@@ -38,7 +38,7 @@ then the narrowest useful test.
 | Operators at the block's width | `opcheck.py` at the `baseline_768` widths, one `run_npu2_<op>_peano.lit` each | Phase D1 — every operator right at the width the block runs, including the pre-add `addnorm` |
 | Single block | `opcheck.py --operator block`, `run_npu2_block_peano.lit` | Phase D2 — launch maps, layouts, external linking, BO reuse. Full `seq × hidden` output, zero mismatches, plus a clean per-boundary intermediate at each of ten stages |
 | The golden model's composition | `make reference-tests`, `run_reference_tests.lit` | Phase D2 — host-only, pins erf vs tanh GeLU, post-add vs pre-add residual, and QKV column order, which a numerical comparison would survive |
-| Strategy equivalence | `pytest programming_examples/transformer_layer/pattern/` | Phase E — all four modes vs the shared FP32 reference |
+| Strategy equivalence | `opcheck.py` through its `dispatch` seam, one `run_npu2_<mode>_peano.lit` per mode | Phase E — all four modes vs the shared FP32 reference. **`[2026-08-05]` Not bare `pytest pattern/`**: that path now holds D2's own `test_reference.py`, and [09](09-phase-f-study-harness.md) requires lit to stay the single entry point. `make reference-tests` / `run_reference_tests.lit` is the pattern D2 established |
 | Strategy distinguishability | Dispatch vector per mode | Phase E — the vectors separate the modes as predicted |
 | Harness plumbing | `unattended_reboot smoke-test` | Phase F — plot/regeneration path only, measures nothing |
 | End-to-end setup | `unattended_reboot execution-smoke-test` | Phase F — **≥1 row with `run_status=passed` per measurement CSV** |

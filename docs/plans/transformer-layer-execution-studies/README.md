@@ -139,9 +139,11 @@ Do not rebuild any of it. The example's own
 | Operators at `baseline_768` | every one, including the pre-add `addnorm` variant D1 had to build because nothing had ever dispatched it |
 
 **`coarse` is most of the way built already.** `builders/block.py` is a fused-operator sequence
-over one runlist — which is what [08](08-phase-e-execution-strategies.md) calls `coarse`. Phase E's
-job there is to give it a strategy directory and route it through the shared instrumentation, not
-to write it again.
+over **four** runlists — one per `run_sequence` call, because a dispatch argument is a whole BO —
+which is what [08](08-phase-e-execution-strategies.md) calls `coarse`. Phase E's job there is to
+give it a strategy directory and route it through the shared instrumentation, not to write it
+again. The instrumentation exists too: `DispatchVector` in `llms/shared/infra/dispatch.py`, built
+in Phase B.
 
 **The dispatch vector already exists and is already recorded.** The block writes one per sequence
 into its results artifact. The four it measured, in order (qkv+mha, norm 1, ffn, norm 2):
@@ -211,7 +213,7 @@ Two decisions taken on 2026-08-04, now reflected throughout these documents:
 | Can separately-compiled ELFs share one runlist? | Yes — N ELFs, N `hw_context`s, one runlist. Bit-identical to sequential, 1.02–1.15× faster. **Not** by sharing one context; XRT rejects that three ways. | [05a](05a-phase-b-runlist-spike-result.md) |
 | How many concurrent `hw_context`s does NPU2 grant? | 32 (33 fails with `DRM_IOCTL_AMDXDNA_CREATE_HWCTX err=-2`). Phase E's `runlist` mode wants 29 — fits, with three to spare. Caveats on the margin recorded. | [08 §Risks](08-phase-e-execution-strategies.md) |
 | Does a full layer survive the real runtime path? | Yes. One `encoder_bert` layer at `baseline_768`, `seq 4096`, matches an FP32 torch oracle over its whole 4096×768 output with zero mismatches, and localizes to any of ten per-boundary intermediates. | [07b](07b-phase-d2-block-integration.md) |
-| Can the whole sequence ladder be built? | **Not yet.** `seq = 4096` is the only point where the FFN's two projections do not collide, at the symbol level *and* the object level. One `(method, tile_n)` naming fix in `llms/shared/builders/gemm_builder.py` closes both; nothing before Phase E was permitted to make it. | [08 §The ladder](08-phase-e-execution-strategies.md) |
+| Can the whole sequence ladder be built? | **Not yet.** `seq = 4096` is the only point where the FFN's two projections do not collide, at the symbol level *and* the object level. One `(method, tile_n)` naming fix in `llms/shared/builders/gemm_builder.py` closes both; nothing before Phase E was permitted to make it. It also blocks the `fused` mode outright at any sequence length. | [08](08-phase-e-execution-strategies.md) |
 | Is there tolerance headroom for four modes? | Thin. The layer needs `atol` `1e-1` — the hard ceiling — at 1.35× its measured requirement. Driven by output scale, not by error. | [07b](07b-phase-d2-block-integration.md) |
 
 ## Provenance

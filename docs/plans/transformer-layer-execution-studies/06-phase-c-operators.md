@@ -86,7 +86,8 @@ fixed and size `atol` to the kernel's measured worst-case absolute error.
 
 `registry_lookup.gemm_config()` **raises** on an unmeasured `(M, K, N)` rather than guessing —
 deliberately, because hand-copied tile configs previously caused drift bugs. The two registry
-JSONs hold 40 measured shapes (33 bf16-out + 7 f32-out).
+JSONs held 40 measured shapes (33 bf16-out + 7 f32-out) when this was written; `[2026-08-05]` after
+C4's sweep they hold **76** (69 bf16-out + 7 f32-out).
 
 `[Amended 2026-08-04]` This document previously estimated iron's matrix at "6 families × 9
 sequence lengths × ~8 GEMM roles — several hundred distinct shapes … an order of magnitude more
@@ -102,8 +103,15 @@ than the registry has ever held". Measured against
   `removed_cases.csv`.
 
 Enumerating the distinct projection-GEMM triples gives **108** — `qkv_proj`, `ffn_up`, `ffn_down`
-and `o_proj`, 27 each — of which **5 are already registered and 103 are missing**. The attention
-GEMMs go through FlashAttention rather than `gemm_builder` and need no GEMM registry row.
+and `o_proj`, 27 each — of which 5 were registered when this was written and 103 were missing.
+`[2026-08-05]` C4 registered the 36 `baseline_768` shapes; the other two families remain, and are
+the same tool against a different `--family`.
+
+The attention GEMMs go through FlashAttention rather than `gemm_builder` and need no GEMM registry
+row. **`[2026-08-05]` That is true for every mode except `offload`**, whose whole premise is
+dispatching `attn_scores` and `attn_output` as standalone GEMMs — and neither
+`4096x64x4096` nor `4096x4096x64` is registered, so `gemm_config()` raises on both. See
+[08 §Build order](08-phase-e-execution-strategies.md).
 
 So coverage is a ~3× registry expansion over an enumerable set. C4 builds the sweep that produces
 it; see [06d](06d-phase-c4-coverage-sweep.md) for what is staged and what is deferred.
@@ -154,6 +162,19 @@ That cap does not scale to C2/C3's shapes. The two candidate fixes, neither atte
   nothing in this repository does yet.
 
 Budget for one of them before assuming a C2/C3 operator will simply loop.
+
+`[2026-08-05]` **Still neither attempted, and it is now Phase E's dominant measurement artifact.**
+D1 derived the real caps rather than carrying C1's 64 across — `addnorm_max_rows()` gives 120 at
+`cols = 512`, 104 pre-add at 768, 80 post-add at 768 — and D2 showed what the cap costs at layer
+scale. Of the block's 131 runlist entries, **128 are the two normalization points**, at 64
+dispatches each; of its 402 sync boundaries, 386 are. So `coarse`'s dispatch vector measures
+`addnorm` row blocking, not GEMM cost.
+
+That makes this a Phase E decision rather than a Phase C leftover: either fix the cap by one of
+the two routes above, or state plainly that the vector is dominated by it, because the
+`coarse`-versus-`runlist` comparison is otherwise reporting a property of one operator's L1 budget
+as if it were a property of the execution boundary. See
+[03](03-measurement-model.md) and [08](08-phase-e-execution-strategies.md).
 
 ## Risks
 

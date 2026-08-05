@@ -15,8 +15,13 @@ deliberately, because hand-copied tile configs previously caused drift and stale
 sweep and add the shape.
 
 The case matrix needs **108** distinct projection-GEMM triples (`qkv_proj`, `ffn_up`, `ffn_down`,
-`o_proj`, 27 each, from hidden ∈ {512, 768, 1024} × the 9-point sequence ladder). **5** are
-registered today. The other 103 raise.
+`o_proj`, 27 each, from hidden ∈ {512, 768, 1024} × the 9-point sequence ladder). **5** were
+registered when this sub-phase was written; the other 103 raised.
+
+`[2026-08-05]` This sub-phase registered the 36 `baseline_768` shapes, taking the bf16-out registry
+from 33 rows to 69. Phases D and E run on those. The remaining two families are the same tool
+against a different `--family` — no code change, only machine time — and **Phase F's case matrix
+needs them**, so budget that run before F rather than inside it.
 
 Three resolutions were considered ([06](06-phase-c-operators.md)); this is the one taken. iron's
 `block/run.py` already sweeps per-operator candidates and records a winner per `(operator, shape)`,

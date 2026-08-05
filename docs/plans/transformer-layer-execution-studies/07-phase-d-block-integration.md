@@ -61,7 +61,7 @@ inventory.
 
 | Piece | Where |
 |---|---|
-| Operator builders | `transformer_layer/builders/` — `elementwise_add` (with the `causal_mask=` keyword), `layer_norm`, `addnorm`, `qkv_proj`, `gelu`, `ffn`, `mha_attention`, `o_proj`, `mha_out_proj`, plus `gemm_spec.py` |
+| Operator builders | `transformer_layer/builders/` — `elementwise_add` (with the `causal_mask=` keyword), `layer_norm`, `addnorm` (with the `pre_add=` keyword, D1), `qkv_proj`, `gelu`, `ffn`, `mha_attention`, `o_proj`, `mha_out_proj`, plus `gemm_spec.py`. `[2026-08-05]` D2 added `block.py` and `block_cache.py`, and the `pattern/` package beside them |
 | Numerical check | `transformer_layer/opcheck.py` — the CLI, the results artifact, and the fault-injection negative control |
 | Registry sweep | `transformer_layer/sweep/` — `registry_sweep.py`, `registry_writer.py`, and their host-only tests |
 | Per-operator gates | one `run_npu2_<op>_peano.lit` each, plus `run_npu2_fault_control_peano.lit` |

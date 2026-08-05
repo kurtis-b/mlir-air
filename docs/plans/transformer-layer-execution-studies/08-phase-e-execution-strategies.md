@@ -66,8 +66,18 @@ all ten shipped LLM deployments, serialized under `flock`. See
 [13](13-verification-and-acceptance.md#the-cross-deployment-regression-rule). `gate-c4.sh` is the
 model for a gate with that second leg.
 
-Do this **first**. Every mode below wants more than one sequence length, and until it lands there
-is exactly one point on the ladder to measure.
+**It also blocks `fused` outright, not just the ladder.** A whole-layer `stitch_elf` has to
+co-link the layer's four projection GEMMs, and the block's own resolved specs are:
+
+```
+qkv       fused-cast  tile_n = 96        ffn_down  fused-cast  tile_n = 96
+ffn_up    drain       tile_n = 128       o_proj    drain       tile_n = 96
+```
+
+Two `drain` GEMMs at different `tile_n` in one module is exactly the redefinition `stitch_elf`
+rejects. So mode 4 cannot be built at `seq = 4096` either — at any sequence length — until the
+naming fix lands. Do this **first**: it is a hard prerequisite for one of the four modes and for
+every mode's second data point.
 
 ## The tolerance has no headroom
 
@@ -96,6 +106,21 @@ Each strategy directory holds its builder module, a `README.md`, and tests. Per 
 
 Per convention rule 7, the directory is `coarse`; only the CSV value is `hybrid`.
 
+`[2026-08-05]` **What Phase D actually built does not match that tree**, and the difference is a
+decision this phase has to take rather than drift into. `pattern/` holds `__init__.py`,
+`reference.py` and `test_reference.py` — the oracle and its own tests, no strategy code. The
+assembled layer is `builders/block.py` with `builders/block_cache.py` beside it, its tests are
+enrolled as `.lit` files at the example root, and there is one example-level `README.md` rather
+than one per strategy. Decide whether `coarse/` re-homes `builders/block.py` or wraps it, and
+whether four per-strategy READMEs are worth it against the example README the sessions have been
+maintaining. Say which in the phase's own document before writing code.
+
+Note also that D2's split — oracle in `pattern/`, builder in `builders/` — is a deliberate
+departure from [convention rule 4](02-porting-conventions.md) ("the reference oracle lives in the
+same file as the builder"), because one oracle is shared by four modes. That exception is recorded
+in the example's README but not in rule 4, so a reviewer applying the checklist to Phase E's code
+will flag it. Expect that, and answer it rather than restructuring around it.
+
 ## The shared reference
 
 `[2026-08-05]` **It exists. Import it, do not port it.**
@@ -120,11 +145,34 @@ regression check. Everything below wants more than one sequence length.
 and it produces the first real CSV row, which exercises the whole measurement path end to end
 before the harder modes land.
 
+`[2026-08-05]` **Two corrections to that ordering.** After Phase D, `coarse` has the least new
+machinery — it is built and gated on hardware, and `offload` is not. And `offload` has a
+prerequisite nothing else does, below.
+
 The eight offloaded GEMMs:
 
 ```
 q_proj  k_proj  v_proj  attn_scores  attn_output  output_proj  up_proj  down_proj
 ```
+
+`[2026-08-05]` **Two of those eight do not resolve, and this is `offload`'s alone.** At
+`baseline_768`, `seq = 4096`:
+
+```
+attn_scores   4096 x   64 x 4096   ->  gemm_config() raises
+attn_output   4096 x 4096 x   64   ->  gemm_config() raises
+```
+
+Neither shape is in `kernel_registry` — there is no `K = 64` or `N = 64` bf16-out row anywhere in
+it. [06](06-phase-c-operators.md) says "the attention GEMMs go through FlashAttention rather than
+`gemm_builder` and need no GEMM registry row", which is true for `coarse` and `fused`, where
+attention is inside `mha_out_proj`. It is **false for `offload`**, the one mode whose whole
+premise is dispatching them as standalone GEMMs.
+
+Decide which before building it: sweep those two shapes into the registry (the C4 tool does it, at
+the cost of machine time), or route `offload`'s attention through FlashAttention too and say so —
+in which case `offload` is no longer eight GEMM dispatches and its dispatch vector changes shape.
+Either is defensible; leaving it undecided means discovering it from a `KeyError` mid-phase.
 
 Everything between them — reshapes, softmax, scaling, masking, normalization, residuals — stays
 in torch on the host. Port `_blocked_attention` and `_resolve_query_block_size`: above a scratch
@@ -139,7 +187,13 @@ block attention identically.
 
 - `runlist` — iron uses 29 kernels and 42 runlist entries over fine-grained operators (GEMM,
   transpose, softmax, elementwise-mul, causal-mask, GeLU, LayerNorm, add-and-norm,
-  elementwise-add).
+  elementwise-add). **`[2026-08-05]` Two of those operators do not exist in MLIR-AIR at all**:
+  there is no `transpose` or `elementwise_mul` builder or example anywhere in
+  `programming_examples/`. [01](01-port-inventory.md) lists `transpose/design.py` and
+  `elementwise_mul/design.py` among the iron files needing the same treatment as the rest, but
+  assigns them to no phase. They are `runlist`'s, and they are new device work rather than
+  re-expression — the only new device work left in this phase. Budget for it, and re-derive the
+  entry count at `baseline_768` rather than carrying iron's 42 across.
 - `coarse` — iron uses 12 runlist entries over 5–6 fused kernels (`qkv_proj`, `mha_out_proj`,
   `ffn`, `addnorm`, `layer_norm`, `elementwise_add`). **`[2026-08-05]` This one is already built**
   as `builders/block.py`; it needs a directory and the shared instrumentation, not a rewrite. Its
@@ -169,6 +223,20 @@ Critically, there must be **one implementation** of each field that all four mod
 per-mode reimplementation of "what counts as a submission" would make the comparison
 meaningless.
 
+`[2026-08-05]` **That implementation already exists.** Phase B built
+`DispatchVector` in `programming_examples/llms/shared/infra/dispatch.py`, with the per-field
+semantics written down there; `KernelCache.run_sequence` returns one, and `builders/block.py`
+already emits four into the block's results artifact. So this work item is *wiring four modes into
+an existing implementation* — and the rule above becomes a prohibition rather than a design task:
+no mode gets its own counting.
+
+The block's measured totals, as a calibration point for the gate below — four sequences summed:
+
+```
+host submissions  4     runlist entries  131     air launches   12
+herd launches   146     sync boundaries  402     bytes  ~203 MB
+```
+
 ## Work items
 
 0. **`[2026-08-05]` Unblock the ladder**: `(method, tile_n)`-aware symbol *and* object naming in
@@ -187,7 +255,18 @@ meaningless.
    invention.
 7. Per-strategy `README.md` explaining what boundary it isolates and what it costs.
 8. Equivalence tests across all four against the shared reference, at the pinned `rtol = 1.6e-2`
-   and an `atol` no greater than `1e-1`.
+   and an `atol` no greater than `1e-1`. Route them through `opcheck.py`'s `dispatch` seam, which
+   D2 added for operators that are several ELFs rather than one module: such an operator's verdict
+   is the **conjunction** of its end-to-end and per-boundary comparisons, and it is what the
+   driver's objective check reads.
+9. **`[2026-08-05]` Split `opcheck_specs.py` before adding to it.** It is **1043 lines** against
+   the ~800 cap that [00](00-context-and-goals.md), [02](02-porting-conventions.md),
+   [06a](06a-phase-c1-gate-and-small-operators.md) and [13](13-verification-and-acceptance.md) all
+   gate on — a live violation no document recorded until now. D1 predicted it and named the seam:
+   per-operator `_prepare_*` functions in one module, the `SPECS` catalogue in another, the same
+   mechanism-versus-catalogue split `opcheck.py`/`opcheck_specs.py` and
+   `registry_sweep.py`/`sweep_families.py` already draw. Phase E adds four modes' specs to that
+   file, so it gets worse before it gets better. `sweep/registry_sweep.py` is also over, at 866.
 
 ## Gate
 

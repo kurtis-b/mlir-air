@@ -107,6 +107,12 @@ Two mechanical traps that will cost you a day each if you meet them from a faili
   `backend_kwargs_for` records that dropping them "compiles and loads fine and then produces
   results that are wrong on the first call and *different* on every call after it."
 
+  `[2026-08-05]` **And there is no single set that covers the layer.** `builders/block.py` records
+  two: the GEMM-backed operators want `runtime_loop_tiling_sizes=[2, 2]`, while `mha_out_proj`
+  wants FlashAttention's `omit_pingpong="all"` with `[1, 1]`. Swapping them is "a placement failure
+  at best and wrong numbers at worst". Phase E composes these same operators four more ways, so
+  read `_GEMM_BACKEND` and `_ADDNORM_BACKEND` in `builders/block.py` before assuming one preset.
+
 `run_sequence` returns results that are **zero-copy views into pool memory**. Copy them before a
 second pass, or the per-boundary comparison below will read whatever the next launch wrote.
 

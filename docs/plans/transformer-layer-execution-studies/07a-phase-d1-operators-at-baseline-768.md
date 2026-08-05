@@ -76,6 +76,12 @@ Three constraints on the row counts, none of which is a free knob:
   trip. At `cols = 768` less fits in L1 than at 512, so `rows_per_call` — and therefore the legal
   row count — may fall below the 64 the existing `64x512` row uses. Derive it; do not assume 64
   transfers.
+
+  `[2026-08-05]` **It did not fall below 64.** D1 derived and exposed the arithmetic as
+  `addnorm_max_rows()`: 120 at `cols = 512`, and at 768 **104 pre-add / 80 post-add**. The warning
+  was right to say "derive it" and wrong about the direction. The number that matters downstream is
+  104: it is what makes each of the layer's normalization points 64 dispatches, and therefore what
+  dominates `coarse`'s dispatch vector — see [08](08-phase-e-execution-strategies.md).
 - `mha_out_proj` at 4096 positions is four times the sequence of the largest Phase C point at
   three quarters of its heads. Budget compile and run time accordingly; it is the expensive row
   here.
