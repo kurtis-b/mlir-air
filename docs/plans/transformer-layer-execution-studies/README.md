@@ -20,7 +20,7 @@ how to use MLIR-AIR.
 | [04-phase-a-kernels.md](04-phase-a-kernels.md) | AIE2P device kernels |
 | [05-phase-b-runtime-seam.md](05-phase-b-runtime-seam.md) | Runlist aggregation + BO liveness pooling |
 | [06-phase-c-operators.md](06-phase-c-operators.md) | The six new operators as AIR builders — **overview**; the four sub-phase specs are [06a](06a-phase-c1-gate-and-small-operators.md) · [06b](06b-phase-c2-qkv-proj-and-ffn.md) · [06c](06c-phase-c3-mha-out-proj.md) · [06d](06d-phase-c4-coverage-sweep.md) |
-| [07-phase-d-block-integration.md](07-phase-d-block-integration.md) | Single-block integration gate |
+| [07-phase-d-block-integration.md](07-phase-d-block-integration.md) | Single-block integration gate — **overview**; the two sub-phase specs are [07a](07a-phase-d1-operators-at-baseline-768.md) · [07b](07b-phase-d2-block-integration.md) |
 | [08-phase-e-execution-strategies.md](08-phase-e-execution-strategies.md) | The four execution strategies |
 | [09-phase-f-study-harness.md](09-phase-f-study-harness.md) | The seven measurement studies |
 | [10-phase-g-unattended-runner-and-ci.md](10-phase-g-unattended-runner-and-ci.md) | Unattended suite runner, CI wiring |
@@ -43,7 +43,8 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | C2 — `qkv_proj`, `ffn` | Both pass full-output `np.isclose` at registry tolerance vs an FP32 reference | **done** 2026-08-04 (45 min) |
 | C3 — `mha_out_proj` | Passes at the registry's FlashAttention tolerance, causal and non-causal | **done** 2026-08-04 (68 min) |
 | C4 — coverage sweep | The 36 `baseline_768` shapes resolve through `gemm_config()`; registry rows written; ten shipped models still pass `make verify` | **done** 2026-08-04 (504 min + 66 min re-run) |
-| D — block integration | One full transformer layer matches the torch reference on hardware | not started — **next** |
+| D1 — operators at `baseline_768` | Every operator passes `opcheck` at the `baseline_768` widths, including the pre-add `addnorm` | not started — **next** |
+| D2 — block integration | One full transformer layer matches the torch reference on hardware | not started |
 | E — execution strategies | All four modes agree with the reference; dispatch vectors differ as predicted | not started |
 | F — study harness | `execution-smoke-test` yields ≥1 `run_status=passed` row per measurement CSV | not started |
 | G — unattended runner + CI | Full profile run completes with a complete `results_manifest.json` | not started |
@@ -69,14 +70,15 @@ the objective check demanded a registry mtime no honest run could produce — re
 [14](14-the-port-loop-harness.md). The registry grew from 33 to 69 bf16-out GEMM shapes with every
 pre-existing row byte-identical, and all ten shipped LLM deployments still pass `make verify`.
 
-**One loose end for Phase D.** The three review rounds are the whole review budget, so a finding
-raised in round 3 is fixed by round 3's fix session and then *nothing re-reviews it*. C4's round-3
-review raised two blocking findings — the `64x768x2304` QKV shape lacked the `fused-cast` row its
-builder pins, and the resolution gate checked only each row's winner rather than the method a
-builder actually requires. Both were fixed (that shape now carries all three methods, and the
-sweep's fused-cast configuration for it replaced one returning zeros for two of nine cast
-sub-tiles), and both fixes were verified by hand afterwards — but by the loop's structure, not by
-a fourth Codex round.
+**A loose end that C4 exposed, closed on 2026-08-05.** The three review rounds were the whole
+review budget, so a finding raised in round 3 was fixed by round 3's fix session and then *nothing
+re-reviewed it*. C4's round-3 review raised two blocking findings — the `64x768x2304` QKV shape
+lacked the `fused-cast` row its builder pins, and the resolution gate checked only each row's
+winner rather than the method a builder actually requires. Both were fixed (that shape now carries
+all three methods, and the sweep's fused-cast configuration for it replaced one returning zeros for
+two of nine cast sub-tiles), and both fixes were verified by hand afterwards — but by the loop's
+structure, not by a fourth Codex round. The driver now runs a narrow **confirm review** over the
+final round's fix diff before the gate; see [14](14-the-port-loop-harness.md).
 
 ## Picking this up in a new session
 
@@ -95,25 +97,33 @@ Then, before touching anything:
 - [14-the-port-loop-harness.md](14-the-port-loop-harness.md) — how the automated driver works and
   how to run the next phase through it.
 
-**The next phase is D (single-block integration).** Its specification is
-[07-phase-d-block-integration.md](07-phase-d-block-integration.md), and it was rewritten on
-2026-08-04 against what Phase C actually produced. Three things in it decide how the phase starts,
-so read it before planning anything:
+**The next phase is D (single-block integration), and it runs as D1 then D2.**
+[07](07-phase-d-block-integration.md) is the overview;
+[07a](07a-phase-d1-operators-at-baseline-768.md) and [07b](07b-phase-d2-block-integration.md) are
+the specs the two sessions are pointed at. Four things decide how the phase starts, so read them
+before planning anything:
 
 - **The family is forced.** `baseline_768` is the only one whose projection GEMMs resolve (36 of
   36, against 2 and 3 for the other two families). `gemm_config()` raises on anything else.
-- **The operators are not all validated at that family.** Phase C validated each operator at
-  whatever width was cheapest to bring up; only `qkv_proj` has a point at `hidden = 768`.
-  Extending each operator's `opcheck` shape set to the `baseline_768` widths is Phase D's first
-  work item, not an optional extra.
+- **`[2026-08-05]` So is the sequence length: 4096.** `build_ffn_module` stitches the up- and
+  down-projection GEMMs into one ELF, and two same-method GEMMs with different `tile_n` collide on
+  `f32_to_bf16_mn_<suffix>`. At `hidden = 768` the two take 128 and 96 at every point on the
+  ladder, so they only survive together at 4096, where the registry puts them on different methods.
+  Fixing it properly means minting the symbol suffix per `(method, tile_n)` in
+  `llms/shared/builders/gemm_builder.py` — off limits to this study, and Phase E's cost to carry.
+- **The operators are not all validated at that family**, and **`[2026-08-05]` one of them is the
+  wrong operator.** Only `qkv_proj` has a point at `hidden = 768`. Worse, the validated `addnorm`
+  computes `LayerNorm(x) * weight + residual` while `encoder_bert` needs
+  `LayerNorm(x + residual) * weight`; the kernel supports both behind `-DADDNORM_PRE_ADD` and
+  Phase A already compiles the pre-add object, but no builder exposes it and it has never been
+  dispatched. That is what D1 is for.
 - **`pattern/reference.py` must not be ported verbatim**, for the same reason Phase C's oracles
   were not — it builds every tensor in bf16, and chained over eight GEMMs that is worse than it
-  was per-operator.
+  was per-operator. Its RNG draw order is load-bearing and must survive the re-expression.
 
-Phase D needs a harness entry of its own before it can run unattended: a `D)` arm in each of the
-seven dispatchers in `agents/scripts/port-loop/phases.sh`, an objective check, and
-`PL_PHASES_IN_SCOPE='["D"]'`. The C1–C4 arms are the model. Its objective check should reuse
-`phase_c_operator_check`, which is already parameterized by operator name.
+`[2026-08-05]` The harness entry now exists: `D1` and `D2` arms in all seven dispatchers in
+`agents/scripts/port-loop/phases.sh`, both objective checks layered on `phase_c_operator_check`,
+and `PL_PHASES_IN_SCOPE='["D1","D2"]'`.
 
 Two decisions taken on 2026-08-04, now reflected throughout these documents:
 

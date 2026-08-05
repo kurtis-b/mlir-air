@@ -37,6 +37,11 @@ build_*
 build-xrt
 install
 install-xrt
+# Out-of-tree toolchain trees checked out beside the build dirs. 25 GB between them, and
+# untracked-but-not-ignored is the dangerous state: one `git add -A` stages the lot.
+# Anchored, so a future programming_examples/*/llvm/ is not silently swallowed too.
+/llvm/
+/my_install/
 platform_repo
 myproj
 sw_comp

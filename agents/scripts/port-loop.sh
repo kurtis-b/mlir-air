@@ -6,8 +6,8 @@
 # each in a FRESH claude -p session, gating each with three sequential Codex review->fix rounds,
 # and running every gate itself rather than trusting a session's self-report.
 #
-# Scope is whatever PL_PHASES_IN_SCOPE in port-loop/phases.sh lists, then halt. Phases A and B are
-# done; the current scope is Phase C's four sub-phases C1-C4.
+# Scope is whatever PL_PHASES_IN_SCOPE in port-loop/phases.sh lists, then halt. Phases A, B and
+# C1-C4 are done; the current scope is Phase D's two sub-phases D1 and D2.
 #
 # Usage:
 #   agents/scripts/port-loop.sh help
@@ -17,7 +17,13 @@
 #   agents/scripts/port-loop.sh resume
 #   agents/scripts/port-loop.sh resume-at <phase> <step> [round] [base-sha]
 #   agents/scripts/port-loop.sh stop
-#   agents/scripts/port-loop.sh run-one <phase> <step>
+#   agents/scripts/port-loop.sh run-one <phase> <step> [arg]
+#
+# run-one steps: preflight | implement | review | gate | objective-check | hardware-check |
+#                tamper-check | fingerprint | prompt
+# hardware-check takes an optional gate-log path, so the assertion can be exercised against a
+# known-good and a known-bad log before a run depends on it. The confirm review has no run-one
+# arm: it needs the pre-fix SHA, which only run_phase knows.
 #
 # Options are environment variables, matching doctor.sh's style:
 #   PL_STEP_TIMEOUT     seconds per claude session          (default 10800 = 3h)
@@ -75,7 +81,9 @@ log_error() { printf '[%s] ERROR: %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
 . "${PL_LIB}/phases.sh"
 
 usage() {
-  sed -n '3,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  # Range ends at the "Exit codes" line. Extending the header without moving this silently
+  # truncates --help, which is how PL_MODEL and PL_DRY_RUN once vanished from it.
+  sed -n '3,39p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 require_deps() {
@@ -98,7 +106,10 @@ stage_ordinal() {
     preflight|implement) echo 0 ;;
     review)              echo $(( 1 + (round - 1) * 2 )) ;;
     fix)                 echo $(( 2 + (round - 1) * 2 )) ;;
-    gate|objective-check|tamper-check) echo 7 ;;
+    # confirm sits after the last fix and before the gate. It shares the gate's ordinal because
+    # resuming at either means every review/fix round is behind you; the confirm review itself is
+    # skipped on a resume, since _FIX_BASE_SHA cannot be reconstructed after the fact.
+    confirm|gate|objective-check|tamper-check) echo 7 ;;
     *)                   echo 0 ;;
   esac
 }
@@ -127,6 +138,7 @@ render_prompt() {
   PL_T_GATE="$(phase_gate_description "${phase}")" \
   PL_T_BLOCKING="${blocking}" \
   PL_T_NONBLOCKING="${nonblocking}" \
+  PL_T_FIX_BASE="${_FIX_BASE_SHA:-}" \
   python3 -c '
 import os, pathlib, sys
 tpl = pathlib.Path(sys.argv[1]).read_text()
@@ -140,6 +152,7 @@ for token, var in (
     ("__GATE_DESCRIPTION__",  "PL_T_GATE"),
     ("__BLOCKING_JSON__",     "PL_T_BLOCKING"),
     ("__NON_BLOCKING_JSON__", "PL_T_NONBLOCKING"),
+    ("__FIX_BASE_SHA__",      "PL_T_FIX_BASE"),
 ):
     tpl = tpl.replace(token, os.environ.get(var, ""))
 if sys.argv[2] == "-":
@@ -198,6 +211,12 @@ run_phase() {
 
   local needs_hw; needs_hw="$(phase_needs_hardware "${phase}")"
   _PHASE_DOC="$(phase_doc "${phase}")"
+
+  # Per-phase, not per-run: a stale value from the previous phase would point the confirm review
+  # at that phase's diff. A mid-phase resume leaves these empty and the confirm review is skipped,
+  # which is logged rather than silent.
+  _FIX_BASE_SHA=""
+  _FIX_BASE_ROUND=""
 
   log_info "EVENT: phase-start ${phase} — $(phase_name "${phase}")"
   state_set --arg p "${phase}" '.step = "preflight" | .round = 0'
@@ -282,6 +301,9 @@ run_phase() {
 
     state_set --argjson r "${round}" '.step = "fix" | .round = $r'
     render_prompt "${PL_LIB}/prompts/fix.md" "${rdir}/fix.prompt" "${phase}" "${round}" "${rdir}/review.json"
+    # Remember where this fix started. The last one to run is the diff nothing else will look at.
+    _FIX_BASE_SHA="$(git -C "${PL_ROOT}" rev-parse HEAD)"
+    _FIX_BASE_ROUND="${round}"
     if ! pl_claude_run "${rdir}/fix.prompt" "${PL_LIB}/schema/session.json" "${rdir}" "fix"; then
       state_halt "fix session round ${round} failed in phase ${phase}"
       timing_end "${phase}" "halted-fix${round}" "${phase_epoch}"
@@ -296,11 +318,74 @@ run_phase() {
     log_warn "blocking findings remained after round ${PL_REVIEW_ROUNDS}; the gate now decides"
   fi
 
+  # --- confirm review: the one diff nothing else reviews -------------------------------------
+  #
+  # The rounds are review -> fix, so the LAST fix to run is never itself reviewed. C4 hit exactly
+  # this: its round-3 review raised two blocking findings, both were fixed, and the only thing that
+  # checked those fixes was a human afterwards. This closes that, narrowly -- it reviews the final
+  # fix's diff alone and asks only whether the fix is correct and complete.
+  #
+  # It halts on blocking findings, and does so BEFORE the gate, which is the cheapest place in the
+  # phase to stop: no hardware time has been spent yet. The prompt is deliberately scoped to keep
+  # that rare -- style and scope observations are non-blocking by instruction.
+  # Only the FINAL round's fix is unreviewed. If the last fix ran in round 1 or 2, a later review
+  # round already covered that diff and a confirm review would be a wasted codex invocation
+  # against PL_MAX_INVOCATIONS.
+  if [ -n "${_FIX_BASE_SHA:-}" ] \
+     && [ "${_FIX_BASE_ROUND:-0}" = "${PL_REVIEW_ROUNDS}" ] \
+     && [ "$(git -C "${PL_ROOT}" rev-parse HEAD)" != "${_FIX_BASE_SHA}" ]; then
+    state_set '.step = "confirm"'
+    local cdir="${pdir}/confirm"
+    mkdir -p "${cdir}"
+    log_info "confirm review over round ${_FIX_BASE_ROUND}'s fix (${_FIX_BASE_SHA}..HEAD)"
+    render_prompt "${PL_LIB}/prompts/confirm.md" "${cdir}/confirm.prompt" "${phase}" \
+                  "${_FIX_BASE_ROUND}" "${pdir}/round-${_FIX_BASE_ROUND}/review.json"
+    if ! pl_codex_review "${_FIX_BASE_SHA}" "${cdir}/confirm.prompt" \
+                         "${cdir}/review.json" "${cdir}/codex.log"; then
+      state_halt "confirm review failed in phase ${phase}"
+      timing_end "${phase}" "halted-confirm" "${phase_epoch}"
+      return 1
+    fi
+    if ! guard_check_weakened "${cdir}/review.json"; then
+      state_halt "phase ${phase} confirm review: the final fix weakened a gate"
+      timing_end "${phase}" "halted-weakened-gate" "${phase_epoch}"
+      return 1
+    fi
+    local cblock; cblock="$(pl_codex_blocking_count "${cdir}/review.json")"
+    state_log "confirm" "confirm review of round ${_FIX_BASE_ROUND} fix: verdict=$(pl_codex_verdict "${cdir}/review.json") blocking=${cblock}"
+    if [ "${cblock}" -gt 0 ]; then
+      log_error "confirm review found ${cblock} blocking finding(s) in the final fix — the diff no"
+      log_error "  other round would have seen. Halting before the gate; see ${cdir}/review.json"
+      jq -r '.blocking[] | "  \(.file // "?"): \(.title // .summary // .finding // "?")"' \
+        "${cdir}/review.json" >&2 2>/dev/null || true
+      state_halt "phase ${phase} confirm review found blocking findings in the final fix"
+      timing_end "${phase}" "halted-confirm-blocking" "${phase_epoch}"
+      return 1
+    fi
+    log_info "confirm review clean: the final fix holds up"
+  elif [ "${resume_from}" -gt 0 ] && [ -z "${_FIX_BASE_SHA:-}" ]; then
+    # Do not claim no fix ran. On a mid-phase resume the rounds were skipped, so the pre-fix SHA
+    # was never captured and the confirm review cannot be reconstructed -- which is a gap in the
+    # resumed run, not a clean bill of health.
+    log_warn "resumed mid-phase: the final fix's diff cannot be reconstructed, so the confirm"
+    log_warn "  review is SKIPPED. Review round ${PL_REVIEW_ROUNDS}'s fix by hand before trusting this phase."
+  else
+    log_info "no fix ran in the final round; confirm review not needed"
+  fi
+
   # --- gate ---
   state_set '.step = "gate"'
   if ! run_gate "${phase}" "${pdir}/gate.log"; then
     state_halt "phase ${phase} gate failed"
     timing_end "${phase}" "halted-gate" "${phase_epoch}"
+    return 1
+  fi
+
+  # A green gate is not the same claim as a gate that ran what it says it runs. Phase B's passed
+  # in 16 seconds without touching the NPU; see pl_assert_gate_ran_hardware.
+  if ! pl_assert_gate_ran_hardware "${phase}" "${pdir}/gate.log"; then
+    state_halt "phase ${phase} passed a gate that never exercised the hardware it claims"
+    timing_end "${phase}" "halted-no-hardware" "${phase_epoch}"
     return 1
   fi
 
@@ -442,6 +527,10 @@ cmd_run_one() {
       # stamp the last gate left behind so freshness can still be proven.
       _GATE_STARTED_AT="${pdir}/.gate-started"
       phase_objective_check "${phase}" ;;
+    hardware-check)
+      # Standalone so the assertion can be exercised against a gate log in both directions before
+      # a run depends on it -- the lesson from the objective check that no honest run could pass.
+      pl_assert_gate_ran_hardware "${phase}" "${3:-${pdir}/gate.log}" ;;
     tamper-check)
       guard_fingerprint "${pdir}/gates.before" "${_START_SHA}"
       guard_check_tamper "${pdir}/gates.before" "$(phase_gate_allowlist "${phase}")" ;;
@@ -476,8 +565,10 @@ cmd_dry_run() {
     echo "  allowlist: $(phase_gate_allowlist "${phase}")"
     echo "  steps:     preflight -> implement -> commit"
     local r
-    for r in 1 2 3; do echo "             -> review${r} -> fix${r} -> commit"; done
-    echo "             -> gate -> objective-check -> tamper-check"
+    for r in $(seq 1 "${PL_REVIEW_ROUNDS}"); do echo "             -> review${r} -> fix${r} -> commit"; done
+    echo "             -> confirm (only if a fix ran)"
+    echo "             -> gate$([ "$(phase_needs_hardware "${phase}")" = "yes" ] && echo " -> hardware-check")"
+    echo "             -> objective-check -> tamper-check"
   done
   echo
   echo "Caps: ${PL_MAX_INVOCATIONS} invocations, ${PL_MAX_HOURS}h deadline, \$${PL_STEP_BUDGET}/session."

@@ -34,10 +34,41 @@ assignment, not `${VAR:-default}`, so it is edited rather than overridden from t
 Adding a phase means adding a `case` arm to each of the seven dispatchers there (name, doc,
 hardware flag, gate description, gate allowlist, gate command, objective check).
 
-Two of those arms fail **open** if forgotten: `phase_gate_description` has no `*)` arm, so a
-missing one silently renders an empty gate block into the session's prompt, and
-`phase_objective_check` defaults to `return 0`, so a missing one passes vacuously. The other
-defaults fail closed. Check a new phase with `run-one <phase> objective-check` before trusting it.
+One of those arms fails **open** if forgotten: `phase_objective_check` defaults to `return 0`, so a
+missing one passes vacuously. `phase_gate_description`'s `*)` arm now renders an explicit "this is
+a harness bug" block rather than an empty one; `phase_gate_cmd` defaults to `false` and
+`phase_gate_allowlist` to the empty string, which makes every changed gate file unauthorized. Those
+three fail closed. Check a new phase with `run-one <phase> objective-check` before trusting it.
+
+`[2026-08-05]` Phase D is entered as **two** sub-phases, `D1` and `D2`, for the reason Phase C was
+split and one more: `PL_STEP_TIMEOUT` caps an implement session at three hours, and the
+single-phase form asked one session for hardware bring-up on six operators *and* novel multi-launch
+integration. Their objective checks layer a `baseline_768` coverage clause (D1) and full-layer
+scope plus per-boundary stage assertions (D2) on top of `phase_c_operator_check`.
+
+### A sixth lesson: a coverage clause is not a correctness clause
+
+Writing D's checks reproduced the harness's own recurring mistake in a new place, and an
+independent review caught it before the run started. Three defects, all in the first draft:
+
+- **It read `results/*.json` off the filesystem and trusted the `passed` flag.** Six hand-written
+  files containing three keys each — no `n_mismatch`, no `rtol`, no `ref_dtype` — passed it. And
+  `results/` is **gitignored**, so such a file is invisible to `guard_fingerprint`,
+  `guard_check_tamper`, `guard_check_destructive` and every Codex diff: freshness was the only
+  barrier, and the session's own lit recipe runs inside the gate window. The fix intersects with
+  `opcheck.py --list` and re-derives the contract per record.
+- **It ignored `seq_len`.** `qkv_proj`'s clause was `emb_dim == 768`, which the Phase C row already
+  on disk satisfies — D1 could have passed it having added nothing at all.
+- **It put the negative control on the wrong shape.** `phase_c_operator_check` injects one shape
+  per operator *name*, taking the first declared key, which for `addnorm` is the `64x512` post-add
+  row. The pre-add variant — the one function in D1 that has never run on hardware, and the one
+  whose reference is likeliest to agree with the device by construction — would never have been
+  injected at all.
+
+The generalizable form: **the layer that proves an operator is correct and the layer that proves it
+was exercised at the right shape are different layers, and re-using the first for the second gets
+you neither.** A coverage clause needs its own freshness, its own verdict re-derivation, and its
+own negative control.
 
 `cmd_loop` reads `.phases` from `state.json`, not from `PL_PHASES_IN_SCOPE`, and `resume-at`
 resolves an unknown phase id to `index // 0` — i.e. **phase 0**, re-running the first phase. After
@@ -62,12 +93,14 @@ tail — an `until` loop on `jq -r .status state.json != "running"`, backgrounde
 ```
 preflight → implement → commit
   → [ review₁ → fix₁ → commit ] × 3
-  → gate → objective-check → tamper-check → advance | halt
+  → confirm → gate → hardware-check → objective-check → tamper-check → advance | halt
 ```
 
 Three rounds always run; a clean round's fix step is a no-op. State lives in
 `agents/.state/port-loop/state.json` (gitignored), and phases resume mid-phase via
 `resume_phase`/`resume_step`/`resume_round`.
+
+`confirm` and `hardware-check` were added on 2026-08-05; both are described below.
 
 ## Why three rounds
 
@@ -80,6 +113,27 @@ clear. So the rounds do converge when there is something to converge on.
 
 Both argue for keeping three. At `medium` effort a review is 2–5 minutes and a clean round costs
 no fix session, so the marginal cost is small and the variance reduction is real.
+
+### The fix nothing reviewed, and the `confirm` step
+
+`[2026-08-05]` The loop is review → fix, repeated, which means **the last fix to run is never
+reviewed by anything**. The round that requested it has already finished and there is no round
+after it. C4 hit this squarely: its round-3 review raised two blocking findings, both were fixed,
+and the only thing that ever checked those fixes was a human reading them afterwards.
+
+A fourth round is not the answer — the rounds are repeated samples, so round 4's own fix would be
+just as unreviewed, and the regress does not terminate. What terminates is a step that reviews
+*only* the final fix's diff and asks only whether that fix is correct: `prompts/confirm.md`, run
+over `<sha-before-the-last-fix>..HEAD` through the same `pl_codex_review`. It is skipped entirely
+when no fix ran, which is the common case for a clean phase.
+
+It halts on blocking findings, and it runs **before** the gate — the cheapest place in a phase to
+stop, since no hardware time has been spent yet. To keep that halt rare the prompt is calibrated
+explicitly: style, structure, coverage and anything outside the fix diff are non-blocking by
+instruction, and a session's reasoned refusal to apply a finding it believes is wrong counts as a
+correct outcome rather than a defect.
+
+Cost is one codex invocation per phase, and only when a fix actually ran.
 
 ## Effort level
 
@@ -128,6 +182,31 @@ The generalizable lesson is narrower than "check the gate": **a phase whose `nee
 `yes` should have to prove its gate executed at least one hardware test.** That is a driver-side
 assertion of the same kind as the objective check, and it is cheap — lit reports its own
 pass/exclude counts.
+
+`[2026-08-05]` Now implemented, as `pl_assert_gate_ran_hardware` in `lib-guard.sh`, called from
+`run_phase` immediately after the gate passes. For a `needs_hardware=yes` phase it requires the
+suite to contain at least one `.lit` whose `REQUIRES` names `ryzen_ai_npu2` — counted by reading
+the files, not their names, because `run_npu2_compile_peano.lit` is named `npu2` and requires only
+Peano — and then, from the last lit summary in the gate log, that **`Passed` and `Excluded` are the
+only nonzero outcome categories** and that `Passed` reaches the tracked `.lit` file count.
+
+The second clause is stated that way for two reasons. It covers the `XRT_COREUTIL` /
+`ENABLE_RUN_XRT_TESTS` regression in [15](15-environment-notes.md), where lit cannot find
+`xrt-smi`, marks every NPU test UNSUPPORTED, and the suite still exits 0. And it needs no list of
+lit's category names, so it stays correct as lit adds them.
+
+**The count must have no slack.** The first version required `Passed >= npu_tests` — 9 NPU-gated
+of 13 files — which left four tests of headroom. Marking one NPU test `XFAIL` is a one-line edit
+*inside* D1/D2's own allowlist; lit then counts it as "Expectedly Failed", neither Passed nor
+Unsupported, and exits 0, and the assertion passed. Since lit runs succinct here there are no
+per-test `PASS:` lines to correlate against, so the exact correspondence available is the total:
+this gate runs every `.lit` under `transformer_layer/` and they must all pass.
+
+Tested in both directions before anything depended on it: `phase-B/gate.log` (2 passed) fails, a
+synthetic `Unsupported: 9` log fails, an `Expectedly Failed: 1` log fails, a log with no summary at
+all fails, a tree with no NPU-gated test fails — which is Phase B's original defect exactly — and a
+full `Passed: 13` log passes. `run-one <phase> hardware-check [gate-log]` exists so any of those
+can be re-run against any log.
 
 ### A fifth: a driver-side check no honest run could pass
 
