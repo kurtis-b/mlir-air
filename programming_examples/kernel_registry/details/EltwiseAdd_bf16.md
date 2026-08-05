@@ -105,14 +105,17 @@ Shapes verified on NPU2 (bf16). **Best config is `herd_x=8, herd_y=1, tile_n=204
 | 6291456 | 2048×3072 | 8/1/2048 | 614 µs | **61.4 GB/s** | 1.9e-3 | 3.1e-2 | ✅ Llama-3.2-3B residual (seq·emb=3072) |
 | 262144 | 512×512 (2-D) | 8/1/512 | — | — | 1.9e-3 | 3.1e-2 | ✅ transformer-layer studies, encoder residual |
 | 262144 | 512×512 (2-D + causal mask) | 8/1/512 | — | — | 3.2e-3 | 6.4e+1 | ✅ transformer-layer studies, attention-score masking |
+| 3145728 | 4096×768 (2-D) | 8/1/768 | — | — | 1.9e-3 | 3.1e-2 | ✅ transformer-layer studies, `baseline_768` block residual |
 
-> **The 2-D variant and the causal mask.** The last two rows do not use `eltwise_add.py`; they go through `programming_examples/transformer_layer/builders/elementwise_add.py`, which calls `_build_add_2d_to_2d` — the same 2-D-in / 2-D-out builder llama's fused `o_ffn` prefill residual uses (see [Builder](#builder)). Same arithmetic and the same 1.9e-3; only the L3 layout differs, and keeping the output 2-D is what lets a downstream launch read it without an `expand_shape`.
+> **The 2-D variant and the causal mask.** The last three rows do not use `eltwise_add.py`; they go through `programming_examples/transformer_layer/builders/elementwise_add.py`, which calls `_build_add_2d_to_2d` — the same 2-D-in / 2-D-out builder llama's fused `o_ffn` prefill residual uses (see [Builder](#builder)). Same arithmetic and the same 1.9e-3; only the L3 layout differs, and keeping the output 2-D is what lets a downstream launch read it without an `expand_shape`.
 >
 > The **causal-mask** row is that builder with `causal_mask=True`: the second operand is a torch-precomputed `[seq, seq]` triangular tensor, zero on and below the diagonal and `-10000.0` above it. There is no device design of its own — it is this kernel with a static second input — which is why the port makes it a builder keyword rather than a sixth operator.
 >
 > Its numbers look worse and are not. `abs_err max = 6.4e+1` is **one bf16 ULP at |value| ≈ 10⁴**: bf16 spacing at that magnitude is 64, and every masked element sits there. `np.isclose` passes it on `rtol` (`1.6e-2 · 10⁴ = 160`). The unmasked half — the half a softmax actually reads — is a plain add of the same `randn` scores and carries a plain add's error; `mean_rel_L1 = 3.2e-3` is the blend of the two halves, and only that blend was measured. The fill is `-10000.0` rather than `-inf` because the mask is *added* to the scores and `-inf` in bf16 propagates to NaN through that add; `-10000.0` underflows the softmax to zero just as effectively and stays finite.
 >
-> Throughput is not recorded for either row. They were landed by Phase C1 of the transformer-layer execution studies, which gates numerics and nothing else, and this registry does not carry estimated numbers.
+> The **`4096×768`** row is Phase D1's `baseline_768` point — the encoder block's own activation shape. Its `atol_required` is **0.0**: a single bf16 rounding of an f32 sum is always within `rtol` of the f32 value, so `rtol` alone accounts for every element of a 3.1M-element output and `atol` is doing no work for this kernel at all. That is unique to it in the registry, and it is why its `atol` stays at the tier's 5e-2 rather than being driven to some arbitrarily small number, which would measure nothing.
+>
+> Throughput is not recorded for any of the three. They were landed by Phases C1 and D1 of the transformer-layer execution studies, which gate numerics and nothing else, and this registry does not carry estimated numbers.
 
 **Reproduce the 2-D rows** (not `make run` — a different example directory):
 

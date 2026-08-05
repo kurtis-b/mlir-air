@@ -94,8 +94,11 @@ Element-wise over the **full output**: every element must pass `|y−ref| ≤ at
 | (M×N) | herd (hx/hy) | rows_per_call | mean_rel_L1 | abs_err max | mismatches | Used by | Status |
 |---|---|---|---|---|---|---|---|
 | 512×512 | 8/1 | 8 | 2.0e-3 | 3.1e-2 | 0 / 262144 | transformer-layer execution studies, encoder block norm (hidden = 512) | ✅ |
+| 4096×768 | 8/1 | 8 | 2.0e-3 | 3.1e-2 | 0 / 3145728 | transformer-layer execution studies, `baseline_768` block norm at the block's own sequence length | ✅ |
 
-> One shape, deliberately. Phase C1 of the transformer-layer port lands the check mechanism and the small operators; the shape sweep across the three encoder families (hidden ∈ {512, 768, 1024}) is Phase C4's job, and a row appears here only once it has been run on hardware.
+> The `baseline_768` row is Phase D1's, added so a block failure localizes to the integration rather than to an operator nobody had run at that width. `mean_rel_L1` is unchanged across a 12× larger output and a 1.5× wider normalization axis, which is what a per-row reduction should do. Only the `baseline_512` and `baseline_1024` families remain unrun here; a row appears only once it has been run on hardware.
+>
+> **The two rows carry different `atol`** — 5e-2 and 5e-3. The 512-row's was the tier's default, chosen before `atol_required` was recorded; the 768-row's is its own measured `atol_required` of 1.4e-3 rounded up 3.5×. `abs_err max` is 22× that, all of it sitting on large-magnitude elements `rtol` already covers, which is the whole reason `abs_err max` is not the number to size an `atol` against.
 
 **Performance is not measured here.** C1 gates numerics only, so the latency / bandwidth columns the other kernels in this registry carry are deliberately absent rather than estimated. LayerNorm is memory-bound in the same way RMSNorm is (it streams the whole matrix for an O(N) op), so its bandwidth should land in the same band; that is an expectation, not a measurement, and it is not recorded as one.
 

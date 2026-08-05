@@ -143,6 +143,11 @@ Element-wise over the **full output**: every element must pass `|out−ref| ≤ 
 | 512×512 | 8/8 | 64 | ✗ | drain | 32/256/32/128 | 4.64e-2 | 1.95e-2 | 1.85e-2 | 0 / 262144 | transformer-layer execution studies, attention sublayer | ✅ |
 | 512×512 | 8/8 | 64 | ✓ | drain | 32/256/32/128 | 3.58e-2 | 5.86e-2 | 4.88e-2 | 0 / 262144 | transformer-layer execution studies, decoder attention sublayer | ✅ |
 | 2048×2048 | 16/16 | 64 | ✓ | drain | 32/256/32/128 | 4.11e-2 | 5.08e-2 | 4.81e-2 | 0 / 2097152 | transformer-layer execution studies, prefill-sized attention sublayer | ✅ |
+| 4096×4096 | 12/12 | 64 | ✗ | drain | 32/256/32/96 | 5.33e-2 | 9.03e-3 | 8.71e-3 | 0 / 3145728 | transformer-layer execution studies, `baseline_768` attention sublayer | ✅ |
+
+> **The `4096×4096` row has the loosest relative error and the tightest `atol_required` of the four, which is one effect seen twice.** Softmax over 4096 keys averages `V` eight times harder than over 512, so `|y|` shrinks by roughly `√8` and the same relative error lands closer to zero: `atol_required` falls to 8.7e-3 while `mean_rel_L1` rises to 5.33e-2. Its `atol` is 2.5e-2, a 2.9× margin and 4× below the hard `1e-1` ceiling — so the row the encoder block actually runs has the most headroom of the four, not the least.
+>
+> It is **non-causal** because `encoder_bert` is bidirectional: its golden reference builds an all-ones attention mask, and the `tril` one belongs to `decoder_gpt2`. The causal rows above are a different device path and are not `baseline_768` evidence however large they are.
 
 > **The error is set by the datapath, not by the shape.** The 2048 row's output is 8× the 512 causal row's and its `mean_rel_L1` and `atol_required` land in the same band — the same property the FlashAttention rows record across their own ladder.
 >

@@ -113,6 +113,10 @@ Element-wise over the **full output**: every element of every projection must pa
 |---|---|---|---|---|---|---|---|---|
 | 2048×1024 | 2048×1024×3072 | fused-cast | 64/256/32/128 | 9.9e-3 | 1.95e-3 | 0 / 6291456 | transformer-layer execution studies, attention projections | ✅ |
 | 2048×2048 | 2048×2048×6144 | fused-cast | 64/256/32/128 | 9.7e-3 | 1.22e-3 | 0 / 12582912 | transformer-layer execution studies, attention projections | ✅ |
+| 64×768 | 64×768×2304 | fused-cast | 64/128/32/96 | 9.9e-3 | 1.95e-3 | 0 / 147456 | transformer-layer execution studies, shortest point of the `baseline_768` ladder | ✅ |
+| 4096×768 | 4096×768×2304 | fused-cast | 64/256/32/96 | 9.9e-3 | 1.95e-3 | 0 / 9437184 | transformer-layer execution studies, `baseline_768` block projections | ✅ |
+
+> **The two `baseline_768` rows are the ends of the sequence ladder, and they are the pair that exercises the per-row herd.** `64×768` builds at herd `1×4` — `M = 64` cannot hold eight rows of `fused-cast`'s forced `tile_m = 64` — while `4096×768` builds at the file-level `8×4`. A builder that stopped reading the herd from the registry row would fail on the first and still pass the second, so both are here rather than one. `64×768` is also the shape whose original `fused-cast` row returned **zeros for two of nine cast sub-tiles**: it resolved and it was wrong, which is why a resolution check is not a correctness check.
 
 > **Both `M×K×3K` triples that the GEMM registry held when this operator was validated are validated here.** The registry now holds **11**: Phase C4's sweep added the nine `baseline_768` `qkv_proj` shapes (`seq×768×2304` across the full sequence ladder). Those nine resolve, but they have not been through this operator's own numerical check — a registered tiling and a validated operator shape are different claims. Of the 108 projection-GEMM shapes the case matrix asks for, **41 are registered**; the remaining 67 (`baseline_512` and `baseline_1024`) are the same sweep tool over a different `--family`, and the builder raises on them rather than guessing a tiling.
 >

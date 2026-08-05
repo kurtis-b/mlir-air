@@ -127,6 +127,17 @@ Element-wise over the **full output**: every element must pass `|out−ref| ≤ 
 | (M×K×F) | up GEMM | down GEMM | tile (m/kl2/kl1/n) | mean_rel_L1 | abs_err max | mismatches | Used by | Status |
 |---|---|---|---|---|---|---|---|---|
 | 2048×1024×3072 | fused-cast | fused-cast | 64/256/32/128 (both) | 1.6e-2 | 1.59e-3 | 0 / 2097152 | transformer-layer execution studies, encoder FFN sublayer | ✅ |
+| 4096×768×3072 | drain | fused-cast | 32/256/32/128 up, 64/512/32/96 down | 1.6e-2 | 1.71e-3 | 0 / 3145728 | transformer-layer execution studies, `baseline_768` FFN sublayer | ✅ |
+
+> **The `baseline_768` row is the only point on the sequence ladder where this operator builds at hidden 768, and the reason is in the two method columns.** At `K = 768` the up-projection takes `tile_n = 128` and the down-projection `tile_n = 96` at *every* sequence length — `N = 768` cannot use `tile_n = 128` at `herd_n = 4`, since `768 % 512 ≠ 0`. Two **same-method** GEMMs with different `tile_n` declare `f32_to_bf16_mn_<suffix>` twice with different memref types, and `stitch_elf` rejects the redefinition. `seq = 4096` is the one point the registry happens to put them on different methods, and therefore on different objects:
+>
+> | seq | up-proj | down-proj | |
+> |---|---|---|---|
+> | 64 … 2048 | `drain` t_n=128 | `drain` t_n=96 | collide |
+> | **4096** | **`drain` t_n=128** | **`fused-cast` t_n=96** | builds |
+> | 8192, 16384 | `fused-cast` t_n=128 | `fused-cast` t_n=96 | collide |
+>
+> So buildability here is a property of the registry's winners, not of the shape: a re-sweep that moved either projection onto the other's method would take the operator from *builds* to *does not build* with no source change. The fix is a symbol suffix minted per `(method, tile_n)` rather than per method, in `llms/shared/builders/gemm_builder.py`. Mixing the two methods costs nothing measurable — `mean_rel_L1` is within 2% of the all-`fused-cast` row above.
 
 > **One of seven resolvable shapes, not the only one.** The constraint is that the registry must hold a high-precision entry for *both* directions, `(M, K, F)` and `(M, F, K)`. Seven expansions satisfy that today — `2048×1024×2048`, `2048×1024×3072`, `2048×2048×6144`, `2048×2048×8192`, `2048×2560×4096`, `2048×2560×9728` and `2048×3072×8192` — and only `2048×1024×3072` has been run on hardware. The other six are unmeasured here, which is a coverage gap rather than a known failure; nothing suggests they would not place. Beyond those, the case matrix's remaining FFN shapes have no high-precision entry on at least one side (e.g. `2048×896×4864` and `2048×1536×8960` are low-precision-only), and the builder raises on them rather than guessing a tiling. The builder raises on any other rather than guessing a tiling; filling that in is Phase C4's sweep.
 
