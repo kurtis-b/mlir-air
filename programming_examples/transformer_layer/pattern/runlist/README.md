@@ -86,6 +86,44 @@ be resolved before Phase F consumes these numbers (a field that does order
 the axis here: distinct operator kernels per layer — 10 vs 5 — or entries
 net of row-blocking).
 
+The number stands on more than the first decomposition tried. Every
+restructuring that would raise it was checked, and each is excluded by a
+measured constraint rather than by preference:
+
+- **Row-banding the streaming operators to `coarse`'s 64-row granularity.**
+  A dispatch argument is a whole BO — `run.set_arg` takes a buffer, never a
+  buffer and an offset (`builders/block.py` §WHY THE LAYER IS FOUR DISPATCH
+  SEQUENCES) — so bands must be cut and re-concatenated on the HOST at every
+  GEMM boundary, and each cut is a new submission. Banding `add`/`ln`/`mul`/
+  `gelu` uniformly makes 7 submissions and ~450 entries; 7 submissions
+  breaks the E5 ordering clause that `offload`'s 6 exceed every other
+  mode's. Variants that stay under 6 exist (band the norm chains, stream
+  `gelu`: 5 submissions, ~390 entries) but their per-operator granularity is
+  chosen FROM the inequalities, which is the "mode tuned until an inequality
+  holds" the Phase E gate text forbids — and every banded variant trades the
+  device-resident chaining this mode exists to measure for restage traffic,
+  raising its sync and byte counts above `coarse`'s. Fine-grained by entry
+  count, more host-mediated than the coarse mode by every other field, is
+  not a point on the taxonomy's axis.
+- **Banding the GEMMs.** A runtime-tiled GEMM ELF corrupts from its second
+  execution in one `hw_context` (measured, first footgun below), so 64 bands
+  across the six GEMM positions would need ~384 distinct ELFs against the
+  32-context ceiling.
+- **Dispatching iron's attention interior on device** (`k_transpose`,
+  scale, softmax). The two attention GEMMs resolve in no registry and the
+  sweep cannot stage them (previous section), so their neighbours' operands
+  stay host-side either way, and each device entry between them ships the
+  ~400 MB bf16 score tensor across the host boundary in both directions.
+  The reachable count tops out near iron's 16 — still nowhere near 131, at
+  a multiple of the transfer cost.
+
+So no faithful decomposition of this layer on this hardware exceeds
+`coarse`'s count: 128 of those 131 entries come from `addnorm`'s
+three-input-stream L1 cap (one kernel call per tile), a constraint none of
+the two-stream operators this mode decomposes to shares. The 08d premise
+that "several" of the decomposed operators would row-block the same way is
+what the measurement refutes.
+
 ## Footguns (each cost time; read before editing)
 
 - **A runtime-tiled GEMM ELF corrupts on re-execution INSIDE a single
