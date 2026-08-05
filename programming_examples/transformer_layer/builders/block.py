@@ -84,12 +84,18 @@ FOOTGUNS
       ``runtime_loop_tiling_sizes=[1, 1]``); the GEMM-backed pair needs
       ``[2, 2]`` for BD-ID recycling. Swapping them is a placement failure at
       best and wrong numbers at worst.
-    - Every external kernel object is built BEFORE the first
-      ``compile_and_cache``. ``KernelCache`` calls ``prepare_air_project`` on
-      every compile, which runs ``compile_all_external_kernels`` -- that skips an
-      object that already exists, so building ``attn_npu2.o`` first with THIS
-      design's tile flags is what stops the generic ``head_dim=64`` defaults from
-      taking its place. Reverse the order and the attention kernel hangs.
+    - Each artifact's external objects are built IMMEDIATELY BEFORE ITS OWN ELF,
+      never all up front. ``compile_gemm_mm`` names its output from the method
+      alone while baking ``tile_n`` into it, so two operators of the same method
+      at different ``tile_n`` overwrite each other's object and aiecc links
+      whichever was written last. That cost this phase a run: see
+      ``compile_block_artifacts``, which has the measurement.
+    - ``attn_npu2.o`` survives that ordering only because
+      ``compile_attention_kernel`` forces a rebuild. ``KernelCache`` runs
+      ``compile_all_external_kernels`` on EVERY compile, which builds a generic
+      ``head_dim=64`` attention object if none exists and skips one that does;
+      the forced rebuild in ``compile_mha_kernels`` is what puts this design's
+      tile flags back. Drop the force and the attention kernel hangs.
     - The weights are declared ``static=True`` with a ``content_key``, so they
       land in the content-keyed pool and are uploaded once. ``x`` is NOT static:
       it is an activation, and the row bands of it that sequence B reads are
@@ -285,31 +291,103 @@ def block_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
     }
 
 
-def compile_block_kernels(cfg):
-    """Every external object the four ELFs link, into the CWD.
+def _compile_gemm_object(spec):
+    """One GEMM micro-kernel object, at the tile shape its spec names."""
+    ek.compile_gemm_mm(
+        tile_m=spec["tile_m"],
+        tile_n=spec["tile_n"],
+        tile_k_l1=spec["tile_k_l1"],
+        sym_suffix=spec["sym_suffix"],
+        out_name=spec["obj"],
+    )
 
-    Called before the first ``compile_and_cache``, never after: see the module
-    footgun about ``prepare_air_project`` re-running
-    ``compile_all_external_kernels`` on every compile.
+
+def compile_qkv_proj_kernels(cfg):
+    """External objects the QKV projection ELF links."""
+    _compile_gemm_object(cfg["qkv_spec"])
+
+
+def compile_ffn_kernels(cfg):
+    """External objects the FFN ELF links.
+
+    Both projections' micro-kernels and encoder.cc's FFN half. The addnorm half
+    is deliberately not built into this object: it would collide with
+    addnorm_ffn.o on ``ffn_gelu_bf16``, and this ELF needs neither.
     """
-    for spec in (cfg["qkv_spec"], cfg["ffn_up_spec"], cfg["ffn_down_spec"]):
-        ek.compile_gemm_mm(
-            tile_m=spec["tile_m"],
-            tile_n=spec["tile_n"],
-            tile_k_l1=spec["tile_k_l1"],
-            sym_suffix=spec["sym_suffix"],
-            out_name=spec["obj"],
-        )
-    # encoder.cc's FFN half only. The addnorm half would collide with
-    # addnorm_ffn.o on ffn_gelu_bf16, and this ELF needs neither.
+    _compile_gemm_object(cfg["ffn_up_spec"])
+    _compile_gemm_object(cfg["ffn_down_spec"])
     ek.compile_encoder(build_ffn=True, build_addnorm=False, out_name="encoder_ffn.o")
-    # attn_npu2.o with THIS design's tile flags, plus the o-projection's mm.o.
-    compile_mha_out_proj_kernels(cfg["attn_cfg"], cfg["o_proj_spec"])
+
+
+def compile_addnorm_kernels(cfg):
+    """External object the addnorm ELF links: the pre-add half only."""
     compile_addnorm_kernel(pre_add=True)
+
+
+def compile_mha_kernels(cfg):
+    """External objects the fused attention + projection ELF links.
+
+    ``attn_npu2.o`` at THIS design's tile shapes -- the flags are derived from
+    the same config the builder uses, and a mismatch does not fail to link, it
+    HANGS -- plus the o-projection's micro-kernel.
+    """
+    compile_mha_out_proj_kernels(cfg["attn_cfg"], cfg["o_proj_spec"])
+
+
+#: Per-artifact (external objects, module builder). The ORDER of the pairs does
+#: not matter; the PAIRING does. See ``compile_block_artifacts``.
+_ARTIFACT_BUILD = {
+    "qkv_proj": (
+        compile_qkv_proj_kernels,
+        lambda cfg: build_qkv_proj_module(cfg["seq_len"], cfg["emb_dim"]),
+    ),
+    "mha_out_proj": (
+        compile_mha_kernels,
+        lambda cfg: build_mha_out_proj_module(
+            cfg["seq_len"], cfg["head_dim"], cfg["num_heads"], causal=False
+        ),
+    ),
+    "ffn": (
+        compile_ffn_kernels,
+        lambda cfg: build_ffn_module(cfg["seq_len"], cfg["emb_dim"], cfg["ffn_dim"]),
+    ),
+    "addnorm": (
+        compile_addnorm_kernels,
+        lambda cfg: build_addnorm_module(
+            cfg["norm_rows"], cfg["emb_dim"], bfloat16, herd_x=NORM_HERD_X, pre_add=True
+        ),
+    ),
+}
 
 
 def compile_block_artifacts(cache, cfg, run_only=False):
     """Compile the four ELFs into ``cache``, or reuse a matching manifest.
+
+    EACH ARTIFACT'S EXTERNAL OBJECTS ARE BUILT IMMEDIATELY BEFORE ITS OWN ELF,
+    and this is a correctness requirement rather than a tidiness one.
+    ``compile_gemm_mm`` names its output from the METHOD ALONE -- ``mm_m32.o``
+    for drain, ``mm_m64.o`` for fused-cast (``llms/shared/builders/
+    gemm_builder.py``) -- while its ``DIM_N`` is baked in from ``tile_n``. Two
+    operators of the same method at different ``tile_n`` therefore write the
+    SAME FILE with different contents, and aiecc links whichever was written
+    last.
+
+    In this block that is not hypothetical: the FFN's up-projection is drain at
+    ``tile_n = 128`` and the o-projection is drain at ``tile_n = 96``. Building
+    every object up front and then every ELF gave the FFN a 96-wide
+    micro-kernel for its 128-wide tile, and it did not fail -- it returned
+    exactly zero for 32 of every 128 output columns, 25% of the up-projection,
+    which the GeLU then passed through and the down-projection's 3072-deep
+    reduction smeared over every element of the FFN output. The per-boundary
+    stage list is what localized it to ``ffn_up``; the layer output alone said
+    only that 54% of the layer was wrong.
+
+    D1 never met this because each operator ran in its own ``opcheck.py``
+    invocation and no single operator holds two same-method GEMMs at different
+    ``tile_n``. Any caller that builds several of these operators together does
+    meet it. Interleaving is the fix available here; the real one is a
+    ``tile_n``-aware object name in ``llms/shared``, which this study may not
+    edit.
 
     ``run_only`` reuses previously cached binaries when the manifest holds every
     artifact this configuration names. The artifact names carry the shape, so a
@@ -324,23 +402,11 @@ def compile_block_artifacts(cache, cfg, run_only=False):
             return
         print(f"  cache miss for {missing}; compiling")
 
-    compile_block_kernels(cfg)
-
-    seq_len = cfg["seq_len"]
-    emb_dim = cfg["emb_dim"]
-    modules = {
-        names["qkv_proj"]: lambda: build_qkv_proj_module(seq_len, emb_dim),
-        names["mha_out_proj"]: lambda: build_mha_out_proj_module(
-            seq_len, cfg["head_dim"], cfg["num_heads"], causal=False
-        ),
-        names["ffn"]: lambda: build_ffn_module(seq_len, emb_dim, cfg["ffn_dim"]),
-        names["addnorm"]: lambda: build_addnorm_module(
-            cfg["norm_rows"], emb_dim, bfloat16, herd_x=NORM_HERD_X, pre_add=True
-        ),
-    }
-    for name, build in modules.items():
+    for key, (compile_kernels, build_module) in _ARTIFACT_BUILD.items():
+        name = names[key]
         print(f"== building {name} ==")
-        cache.compile_and_cache(name, build(), cfg["backend_kwargs"][name])
+        compile_kernels(cfg)
+        cache.compile_and_cache(name, build_module(cfg), cfg["backend_kwargs"][name])
     cache._save_manifest()
 
 

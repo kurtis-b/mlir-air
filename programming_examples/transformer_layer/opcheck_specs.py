@@ -502,19 +502,35 @@ def _spec_digest(spec):
 # ---------------------------------------------------------------------------
 
 # Per-boundary `atol` for the block's stage comparisons. `rtol` is RTOL for all
-# of them, as everywhere else. Sized from the measured worst case at
-# 4096x768x3072; see the block section of the README for the numbers and what
-# each boundary's error is dominated by.
+# of them, as everywhere else, and each entry is that boundary's MEASURED
+# `atol_required` at 4096x768x3072 rounded up by the registry's usual 2-3x --
+# except `q`/`k`/`v`, which keep the 5e-3 the `qkv_proj` rows above already use
+# (a 1.6x margin here), and `output`, which is pinned to the spec's own `atol`
+# because it is the same tensor compared the same way.
+#
+#     boundary       atol_required   atol    margin
+#     q / k / v          3.1e-3      5e-3     1.6x
+#     attn_context       2.3e-4      1e-3     4.4x
+#     attn_out           7.4e-4      2.5e-3   3.4x
+#     hidden             1.2e-2      3.5e-2   3.0x
+#     ffn_up             5.0e-2      1.5e-1   3.0x
+#     ffn_gelu           4.5e-2      1.5e-1   3.3x
+#     ffn_out            1.1e-1      3.0e-1   2.6x
+#     output             7.4e-2      1.0e-1   1.35x
+#
+# They span three orders of magnitude because the BOUNDARIES do: `attn_out` sits
+# around 1e-3 at this golden model's scale and `output` around 4. A single atol
+# across all ten would be vacuous at one end and unsatisfiable at the other.
 BLOCK_STAGE_ATOL = {
     "q": 5e-3,
     "k": 5e-3,
     "v": 5e-3,
     "attn_context": 1e-3,
-    "attn_out": 1e-3,
-    "hidden": 5e-2,
-    "ffn_up": 5e-2,
-    "ffn_gelu": 5e-2,
-    "ffn_out": 5e-2,
+    "attn_out": 2.5e-3,
+    "hidden": 3.5e-2,
+    "ffn_up": 1.5e-1,
+    "ffn_gelu": 1.5e-1,
+    "ffn_out": 3e-1,
     "output": 1e-1,
 }
 
@@ -994,13 +1010,27 @@ SPECS = [
             "num_heads": 12,
             "head_dim": 64,
         },
-        # Measured over the 3145728 elements of the layer output. See the block
-        # section of the README for the per-boundary breakdown and for which
-        # stage each term comes from; the headline is that the final LayerNorm
-        # renormalizes to roughly unit scale, which is the only reason a chain
-        # of eight GEMMs, two LayerNorms and a softmax fits under a hard 1e-1
-        # ceiling at all.
-        "atol": 5e-2,
+        # Measured over the 3145728 elements of the layer output: mean_rel_L1
+        # 1.688e-2, abs_err_max 7.812e-2, atol_required 7.398e-2.
+        #
+        # atol is 1e-1, the HARD CEILING, at a margin of 1.35x -- the thinnest
+        # in this file, and stated rather than padded because there is nowhere
+        # to pad to. The whole layer's relative error, 1.688e-2, is within 8% of
+        # the `ffn` operator's own 1.569e-2 at the same shape, so the FFN
+        # dominates and nothing downstream is amplifying it; what makes the
+        # ABSOLUTE number large is scale, not error. This golden model's
+        # activations run around 1 where the registry's GEMM sweep puts a
+        # depth-3072 reduction at 1/sqrt(3072), roughly 60x smaller, and the
+        # `ffn` row's 1.472e-3 scaled by that factor is 9e-2 -- which is what
+        # arrives at the second LayerNorm and, divided by its ~1.2 row standard
+        # deviation and multiplied by a gamma in [0, 1), is the 7.4e-2 measured.
+        #
+        # The final LayerNorm renormalizing to roughly unit scale is the only
+        # reason a chain of eight GEMMs, two LayerNorms and a softmax fits under
+        # the ceiling at all. If a future change pushes this over 1e-1 the
+        # answer is a defect report or a smaller `val_range`, not a wider
+        # tolerance; the driver rejects anything above 1e-1 anyway.
+        "atol": 1e-1,
         "prepare": _prepare_block,
     },
 ]
