@@ -68,3 +68,13 @@
 // CHECK: [precision] Output 2
 // CHECK: PASS!
 // CHECK: [opcheck] qkv_proj [64x768]: PASS
+// The fourth is Phase D1's: the same 768 width at the sequence length the block
+// runs, 4096. The herd is back to the file-level 8x4 here -- M = 4096 holds 8
+// rows of fused-cast's tile_m -- so this shape and the 64-row one above are the
+// two ends of the per-row herd wiring and both are checked.
+// CHECK: QKV GEMM 4096x768x2304 (fused-cast, registry{{.*}}herd=8x4)
+// CHECK: [precision] Output 0
+// CHECK: [precision] Output 1
+// CHECK: [precision] Output 2
+// CHECK: PASS!
+// CHECK: [opcheck] qkv_proj [4096x768]: PASS

@@ -7,8 +7,8 @@
 
 # AddNorm (BF16) — Kernel Detail
 
-> Weighted layer normalization with a residual added after it, fused into one kernel call:
-> `out = LayerNorm(x) · weight + residual`, per row. The sublayer boundary of an encoder-style transformer block. BF16 in/out, one-pass variance, **weight as a runtime memref argument**.
+> Weighted layer normalization and a residual, fused into one kernel call, in either order:
+> `out = LayerNorm(x) · weight + residual` (post-add, the default) or `out = LayerNorm(x + residual) · weight` (pre-add, `pre_add=True`), per row. The sublayer boundary of an encoder-style transformer block; a post-norm encoder such as `encoder_bert` wants the **pre-add** form. BF16 in/out, one-pass variance, **weight as a runtime memref argument**.
 > Shapes are written **`M×N`**: `x[M, N]`, `residual[M, N]`, `weight[N]` → `out[M, N]` (M = rows / seq, N = embedding dim, the normalization axis).
 >
 > Companion: [`../supported_kernels.md`](../supported_kernels.md) · [`../README.md`](../README.md) · [`LayerNorm_bf16.md`](LayerNorm_bf16.md) (the unweighted, no-residual form)
@@ -20,11 +20,28 @@
 
 ```
 programming_examples/transformer_layer/builders/addnorm.py
-  build_addnorm_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_call=None)
-  addnorm_reference(x, residual, weight, eps=1e-5)     # the FP32 two-pass oracle
+  build_addnorm_module(rows, cols, np_dtype=bfloat16, herd_x=8,
+                       rows_per_call=None, pre_add=False)
+  compile_addnorm_kernel(pre_add=False)                # puts the right object in the CWD
+  addnorm_max_rows(cols, np_dtype, herd_x, pre_add)    # the L1 row cap at this width
+  addnorm_reference(x, residual, weight, eps=1e-5)          # post-add FP32 oracle
+  addnorm_pre_add_reference(x, residual, weight, eps=1e-5)  # pre-add FP32 oracle
 ```
 
-Driven by `transformer_layer/opcheck.py --operator addnorm`; `make check-addnorm` is the same thing behind the lit test. The builder links `encoder.o` — built with the **addnorm half only** (`compile_encoder(build_ffn=False)`), because the FFN half also defines `ffn_gelu_bf16` and `ffn_eltwise_add_bf16_vector` and would collide with `addnorm_ffn.o` — and calls `fused_add_layer_norm_2outs(input, residual, weights, output1, output2, cols, rows_to_process)`.
+Driven by `transformer_layer/opcheck.py --operator addnorm`; `make check-addnorm` is the same thing behind the lit test.
+
+**`pre_add=` selects the object, the entry point and the L1 budget together** — it is not a flag on one kernel, because the two forms are in different translation units:
+
+| `pre_add` | computes | object | source | entry point | L1 tile buffers |
+|---|---|---|---|---|---|
+| `False` | `LayerNorm(x) · weight + residual` | `encoder.o` | `encoder.cc` | `fused_add_layer_norm_2outs` | 4 |
+| `True` | `LayerNorm(x + residual) · weight` | `addnorm_pre_add.o` | `addnorm_ffn.cc` + `-DADDNORM_PRE_ADD` | `fused_add_layer_norm_1outs` | 3 |
+
+Both are built with the **addnorm half only** (`build_ffn=False`), because the FFN half also defines `ffn_gelu_bf16` and `ffn_eltwise_add_bf16_vector` and the two sources collide on them. `addnorm_pre_add.o` is deliberately **not** the compile gate's `addnorm_ffn_pre_add.o`, which is the full 11-symbol build — linking that would drag every FFN matmul microkernel into a core that never calls one.
+
+**Pre-add is what a post-norm encoder needs.** `encoder_bert` normalizes after the residual add at both of its sublayer boundaries. The post-add form was the one iron's operator carried and the one validated first; they are different functions, and a block wired to the wrong one produces a plausible activation that is wrong by one residual add. Each has its own reference above — a single reference with an ordering branch is exactly as easy to read backwards as the kernel it checks.
+
+**The two-output entry point is not needed for pre-add.** Under `-DADDNORM_PRE_ADD` its `output2` carries the raw `x + residual` sum forward as the *next* block's residual stream. `encoder_bert`'s second residual is `hidden`, the normalized output of the first norm, not that sum — so the one-output form carries everything the block needs and costs one fewer L1 tile buffer.
 
 **The weight is a runtime argument.** iron's `addnorm` bakes its weights into the MLIR via `np.load()` at generation time and hashes them into the artifact name, so every weight change forces a recompile. Here `weight` is a plain memref argument and one compiled ELF serves every weight vector of that shape.
 
@@ -41,7 +58,7 @@ x bf16 → Σx  (bf16 vector accumulate, 32 lanes) ─┐
    → ((x − bf16(mean)) · bf16(inv_std)) · weight + residual   (bf16 vector) → bf16
 ```
 
-- **Statistics come from `x` alone.** The residual never enters the mean or the variance; it is added after the weighted normalization. This is the **post-add** form. (`addnorm_ffn.cc` has a pre-add variant behind `-DADDNORM_PRE_ADD`, which folds the residual in *before* the statistics; that is a different operator and is not what this entry measures.)
+- The diagram is the **post-add** form: statistics come from `x` alone, the residual never enters the mean or the variance, and it is added after the weighted normalization. The **pre-add** form (`-DADDNORM_PRE_ADD`) folds `x + residual` in bf16 *before* Σx and Σx², normalizes that sum, and does **not** add the residual again — so its epilogue has three bf16 roundings rather than four, and none of them is a cancelling add. Both are measured in this entry.
 - **Variance is one-pass**, `E[x²] − E[x]²`, clamped at zero before `invsqrt` — same formula, same cancellation caveat and same NaN-avoidance clamp as [`LayerNorm_bf16.md`](LayerNorm_bf16.md).
 - **Four bf16 roundings in the epilogue**: `sub`, `mul` by `inv_std`, `mul` by `weight`, `add` of the residual. The residual add is where an output can land near zero through cancellation, which is what sets `rel_err max`.
 
@@ -51,16 +68,18 @@ x bf16 → Σx  (bf16 vector accumulate, 32 lanes) ─┐
 
 Verified element-wise over the full output against the **two-pass FP32** reference:
 
-| Metric (M×N = 64×512, `randn` x/residual, `uniform(0.5, 1.5)` weight, seed 3) | Measured |
-|---|---|
-| `mean_rel_L1 = mean｜out−ref｜ / mean｜ref｜` | **1.9e-3** |
-| `rel_err max` | 6.8e+1 |
-| `abs_err max` | 3.1e-2 |
-| mismatches at `rtol=1.6e-2, atol=5e-2` | **0 / 32768** |
+| Metric (`randn` x/residual, `uniform(0.5, 1.5)` weight, seed 3) | 64×512 post-add | 64×768 pre-add |
+|---|---|---|
+| `mean_rel_L1 = mean｜out−ref｜ / mean｜ref｜` | **1.9e-3** | **2.7e-3** |
+| `rel_err max` | 6.8e+1 | 1.1e+2 |
+| `abs_err max` | 3.1e-2 | 6.3e-2 |
+| `atol_required = max(｜out−ref｜ − rtol·｜ref｜)` | 1.75e-2 | **6.65e-4** |
+| mismatches at `rtol=1.6e-2` and the row's `atol` | **0 / 32768** (`atol=5e-2`) | **0 / 49152** (`atol=2e-3`) |
 
 - **`mean_rel_L1 = 1.9e-3`**, level with Element-wise Add and below LayerNorm's 2.0e-3 — the residual add raises the typical output magnitude, so the same absolute rounding is a smaller fraction of it.
 - **`rel_err max = 6.8e+1` is expected.** `LayerNorm(x)·weight` and `residual` are independent and comparable in magnitude, so their sum lands arbitrarily close to zero somewhere in a 32768-element output; the relative error there is unbounded while the absolute error stays at one bf16 ULP. `atol` is what covers it.
 - **`abs_err max = 3.1e-2`**, one bf16 ULP at the largest outputs, inside `atol = 5e-2`.
+- **The pre-add column's `atol_required` is 26× smaller** even though its relative error is higher and its `abs_err max` is twice as large. `atol_required` is the number that matters, and the ordering is the whole reason: post-add's trailing `+ residual` puts an absolute error the size of the *residual* onto elements whose own value has cancelled to near zero, which is precisely where `rtol` contributes nothing. Pre-add's errors are all proportional to the output carrying them, so `rtol` absorbs almost all of them and `abs_err max = 6.3e-2` — a bf16 ULP at the largest outputs, as above — needs no `atol` at all.
 - The weight is drawn `uniform(0.5, 1.5)` rather than all-ones: a trained LayerNorm gamma sits near 1, and an all-ones weight would let a dropped weight multiply pass unnoticed.
 
 ---
@@ -73,8 +92,8 @@ Verified element-wise over the full output against the **two-pass FP32** referen
 | `herd_y` | 1 (fixed) | each tile already drives three L3→L1 streams; see below |
 | `rows_per_call` | **must be `rows // herd_x`** | one kernel call per tile — a correctness constraint, not a tuning knob |
 | `cols` | multiple of **32** | the kernel's `N`. A non-multiple is silently truncated by `vector_chunks = cols / N` |
-| L1 | `4·rows_per_call·cols·2 + cols·2 + 1024` ≤ 64 KiB | four activation tiles (x, residual, out1, out2), the weight, and the stack |
-| `eps` | 1e-5 | `epsilon` in `fused_add_layer_norm_2`; must match the reference |
+| L1 | `T·rows_per_call·cols·2 + cols·2 + 1024` ≤ 64 KiB, `T` = 4 post-add / 3 pre-add | the activation tiles (x, residual, out1, and out2 only in the post-add form), the weight, and the stack. `addnorm_max_rows()` inverts this; it counts allocations, not aircc's ping-pong copies, so it is an upper bound |
+| `eps` | 1e-5 | `epsilon` in `fused_add_layer_norm_2`; the same constant in both variants, and must match the reference |
 
 ### One kernel call per tile
 
@@ -90,22 +109,28 @@ The consequence is a row cap: at `cols = 512` over the full 8-column herd, **64 
 
 Element-wise over the **full output**: every element must pass `|out−ref| ≤ atol + rtol·|ref|`, with zero permitted mismatches.
 
-| Output dtype | rtol | atol |
-|---|---|---|
-| bf16 | 1.6e-2 | 5e-2 |
+| Output dtype | ordering | rtol | atol |
+|---|---|---|---|
+| bf16 | post-add | 1.6e-2 | 5e-2 |
+| bf16 | pre-add | 1.6e-2 | 2e-3 |
 
-- **Reference** = CPU FP32 **two-pass** LayerNorm, multiplied by the f32 weight and added to the f32 residual, cast once to bf16. Two-pass on purpose: the device's one-pass variance is exactly the error the check should be able to see, so reproducing it in the oracle would hide it.
-- `rtol = 1.6e-2` is held fixed across the registry; `atol = 5e-2` covers the worst-case single-element bf16 output rounding (`abs_err max ≈ 3.1e-2`).
+- **Reference** — one per ordering, not one with a branch. Post-add: CPU FP32 **two-pass** LayerNorm of `x`, multiplied by the f32 weight, plus the f32 residual. Pre-add: the f32 sum `x + residual` normalized the same way and multiplied by the weight, with **no** second residual add. Both cast once to bf16 at the end. Two-pass on purpose: the device's one-pass variance is exactly the error the check should be able to see, so reproducing it in the oracle would hide it. The pre-add oracle likewise sums in f32 while the kernel sums in bf16, for the same reason.
+- `rtol = 1.6e-2` is held fixed across the registry; each `atol` is that row's measured `atol_required` rounded up ~3×, per the registry methodology. Post-add's is set by its trailing residual add, not by the normalization.
 
 ---
 
 ## Tested shapes
 
-| (M×N) | herd (hx/hy) | rows_per_call | mean_rel_L1 | abs_err max | mismatches | Used by | Status |
-|---|---|---|---|---|---|---|---|
-| 64×512 | 8/1 | 8 | 1.9e-3 | 3.1e-2 | 0 / 32768 | transformer-layer execution studies, encoder sublayer boundary (hidden = 512) | ✅ |
+| (M×N) | ordering | herd (hx/hy) | rows_per_call | mean_rel_L1 | abs_err max | atol_required | atol | mismatches | Used by | Status |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 64×512 | post-add | 8/1 | 8 | 1.9e-3 | 3.1e-2 | 1.75e-2 | 5e-2 | 0 / 32768 | transformer-layer execution studies, encoder sublayer boundary (hidden = 512) | ✅ |
+| 64×768 | **pre-add** | 8/1 | 8 | 2.7e-3 | 6.3e-2 | 6.65e-4 | 2e-3 | 0 / 49152 | transformer-layer execution studies, `baseline_768` encoder sublayer boundary | ✅ |
 
-> `M = 64`, not 512, because of the one-call-per-tile cap above — 8 columns × 8 rows of L1-resident activation at `cols = 512`. It is a real 64-token chunk, not a toy: the operator is row-independent, so a longer sequence is the same arithmetic issued more times. What is *not* yet demonstrated is issuing it more times from one ELF, and that is stated rather than implied.
+> `M = 64`, not 512, because of the one-call-per-tile cap above — 8 columns × 8 rows of L1-resident activation. It is a real 64-token chunk, not a toy: the operator is row-independent, so a longer sequence is the same arithmetic issued more times. What is *not* yet demonstrated is issuing it more times from one ELF, and that is stated rather than implied.
+>
+> **The cap moves with `cols`, and it is derived rather than carried over.** `addnorm_max_rows(cols, ...)` returns `herd_x ×` the largest `rows_per_call` that fits L1: 120 at `cols = 512`, 80 post-add and 104 pre-add at `cols = 768` (pre-add allocates one fewer tile buffer, having only one output). Those count *allocations*; aircc ping-pongs the DMA-fed buffers on top, so the cap is an upper bound and not a target. Both rows run 64, well under, which also keeps the two measurements comparable.
+>
+> **The pre-add row needs 26× less `atol` at a higher relative error.** Post-add's trailing `+ residual` in bf16 puts an absolute error set by the residual's magnitude onto elements whose own value has cancelled to near zero, and `rtol` covers none of that. Pre-add has no trailing add, so every error is proportional to the output carrying it. Same kernel, cancellation removed — not a better datapath.
 
 **Performance is not measured here.** C1 gates numerics only; latency and bandwidth are deliberately absent rather than estimated.
 

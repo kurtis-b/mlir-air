@@ -8,6 +8,13 @@
 // the two are not bit-equivalent by construction; that gap is what the
 // tolerance is sized against.
 //
+// Two shapes: the 512x512 C1 point, and Phase D1's 4096x768 -- the block's own
+// activation shape in the baseline_768 family. Rows are free for this operator
+// (its builder derives the per-tile row count), so the second point is the full
+// sequence. It also runs at a ten times tighter atol than the first, sized from
+// its own measured atol_required rather than inheriting the tier's default; see
+// opcheck_specs.py.
+//
 // Runs opcheck.py on real NPU2 against an FP32 reference: np.isclose over the
 // full output at rtol=1.6e-2, zero permitted mismatches. Not cosine similarity
 // -- kernel_registry/README.md is explicit that a correlation gate is blind to
@@ -39,3 +46,5 @@
 // here rather than passing quietly.
 // CHECK: PASS!
 // CHECK: [opcheck] layer_norm [512x512]: PASS
+// CHECK: PASS!
+// CHECK: [opcheck] layer_norm [4096x768]: PASS

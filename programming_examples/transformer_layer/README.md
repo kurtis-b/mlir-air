@@ -86,7 +86,7 @@ memory bank) all produce plausible wrong numbers rather than errors.
 | `opcheck.py` | Phase C's numerical check: the CLI, the results artifact, and the fault-injection negative control |
 | `builders/elementwise_add.py` | 2-D element-wise add and the `causal_mask=` keyword over it, plus their FP32 reference |
 | `builders/layer_norm.py` | Multi-row LayerNorm over `layer_norm_rows`, plus its two-pass FP32 reference |
-| `builders/addnorm.py` | Weighted LayerNorm + residual over `fused_add_layer_norm_2outs`, weight as a runtime argument, plus its FP32 reference |
+| `builders/addnorm.py` | Weighted LayerNorm and a residual in **either order** (`pre_add=`), weight as a runtime argument, plus one FP32 reference per ordering |
 | `builders/qkv_proj.py` | One GEMM over the fused `[K, 3K]` weight with C split three ways on the device, plus its FP32 reference |
 | `builders/gelu.py` | The FFN activation stage over `ffn_gelu_bf16`, plus its FP32 tanh-approximation reference |
 | `builders/ffn.py` | Staged up-projection / GeLU / down-projection composition, plus its FP32 reference |
@@ -142,7 +142,7 @@ Splitting changed no code and no object: the sources are included textually, so
 `encoder.o` and `addnorm_ffn.o` are still built from one translation unit each,
 with the same flags and the same symbols the compile gate checks.
 
-## The Phase C operator checks
+## The operator checks
 
 `opcheck.py` is the single numerical entry point for every operator this port
 lands, and `builders/` holds the operators themselves — one
@@ -173,6 +173,42 @@ and rejected the perturbed run — rather than inverting the exit status, which
 would read a missing `PEANO_INSTALL_DIR`, a kernel link error or an absent NPU
 as a caught fault. Injected runs write into `results/fault/` so they can never
 overwrite a clean verdict.
+
+**A shape that is not in `opcheck.py --list` is validated by nothing.**
+`results/` is gitignored, so a results file for an undeclared shape is invisible
+to the fingerprint, to the tamper check and to every review diff. Adding a shape
+means adding it to `SPECS` in `opcheck_specs.py` *and* adding its `CHECK` line to
+that operator's `.lit`; a results file on its own is not evidence.
+
+### The `baseline_768` set (Phase D1)
+
+Phase C brought each operator up at whatever width was cheapest. The block runs
+at `baseline_768` — hidden 768, ffn 3072, 12 heads × head_dim 64,
+`encoder_bert` — and almost none of those points were there. Each operator now
+carries one, so that a block failure localizes to the integration rather than to
+an operator nobody had run at that width:
+
+| operator | `shape_key` | measured `mean_rel_L1` | `atol_required` | `atol` | margin |
+|---|---|---|---|---|---|
+| `elementwise_add` | `4096x768` | 1.879e-3 | 0.0 | 5e-2 | `rtol` alone covers it |
+| `layer_norm` | `4096x768` | 1.969e-3 | 1.419e-3 | 5e-3 | 3.5× |
+| `addnorm` | `64x768_pre_add` | 2.687e-3 | 6.646e-4 | 2e-3 | 3.0× |
+| `qkv_proj` | `4096x768` | 9.863e-3 | 1.773e-3 | 5e-3 | 2.8× |
+| `ffn` | `4096x768x3072` | 1.569e-2 | 1.472e-3 | 5e-3 | 3.4× |
+| `mha_out_proj` | `4096x768x12h` | 5.335e-2 | 8.706e-3 | 2.5e-2 | 2.9× |
+
+`rtol` is `1.6e-2` for all of them, as everywhere in the registry, and every
+`atol` is inside the hard `1e-1` ceiling. The three GEMM-backed rows are pinned
+to `seq_len = 4096` because that is where the block runs — and for `ffn` because
+it is [the only point that builds at all](#things-that-will-bite-you) at hidden
+768. The three row-parallel ones are not pinned, because their builders derive
+the legal row count; they run at 4096 rows anyway, except `addnorm`, whose L1
+budget caps it (see below).
+
+`causal_mask` has no `baseline_768` row and that is not an oversight. Its shape
+is `seq × seq`, so the family's *width* does not name a shape for it, and
+`encoder_bert` never builds one — the golden reference uses an all-ones attention
+mask for the encoder variant and a `tril` one only for `decoder_gpt2`.
 
 ## The registry sweep
 
@@ -261,12 +297,24 @@ with different memref types: `redefinition of symbol named ...` out of
 is why nothing hit this before; the study's FFN does not, because `N = 768`
 cannot use `tile_n = 128` at `herd_n = 4` (`768 % 512 != 0`) and settles on 96
 against the up-projection's 128. **`build_ffn_module` therefore does not build
-at any `baseline_768` point except `seq = 4096`**, where the two happen to
-resolve to different methods and so to different objects. Fixing it means a
-second object per `(method, tile_n)` — the `sym_suffix` / `link_with_name`
+at any `baseline_768` point except `seq = 4096`**, where the registry happens to
+put them on different methods (`drain` up, `fused-cast` down) and so on different
+objects:
+
+| seq | up-proj | down-proj | |
+|---|---|---|---|
+| 64 … 2048 | `drain` t_n=128 | `drain` t_n=96 | collide |
+| **4096** | **`drain` t_n=128** | **`fused-cast` t_n=96** | builds |
+| 8192, 16384 | `fused-cast` t_n=128 | `fused-cast` t_n=96 | collide |
+
+That single row is why Phase D1's FFN point is at `seq = 4096` and why the block
+runs there. It is a coincidence of the registry, not a property of the shape: a
+re-sweep that moved either projection onto the other's method would take the
+operator from *builds* to *does not build* with no source change. Fixing it means
+a second object per `(method, tile_n)` — the `sym_suffix` / `link_with_name`
 mechanism already supports it, `gemm_method_spec` in `llms/shared/` is where the
-suffix is minted, and that file is off limits to this study. Phase D needs this
-resolved before it can run the FFN leg.
+suffix is minted, and that file is off limits to this study. Phase E has to clear
+this before it can walk the full ladder.
 
 **`best.high` is the fastest method, not the one every builder can use.**
 `build_qkv_proj_module` folds its three-way C split into `fused-cast`'s separate
@@ -323,6 +371,40 @@ and normalization both run over `input + residual`, and the two-output form
 exports the raw pre-add sum through `output2` as the next block's residual
 stream. Getting this backwards produces correctly-shaped, subtly wrong
 activations. The compile driver asserts the two objects differ.
+
+**And `pre_add=` is a builder keyword, not a flag flip, because the two forms
+are in different translation units.** `build_addnorm_module(pre_add=True)`
+changes three things together: it links `addnorm_pre_add.o` built from
+`addnorm_ffn.cc` rather than `encoder.o` built from `encoder.cc` (which has no
+pre-add path at all), it calls `fused_add_layer_norm_1outs` rather than
+`fused_add_layer_norm_2outs`, and it allocates three L1 tile buffers rather than
+four. Call `compile_addnorm_kernel(pre_add=...)` to put the right object in the
+working directory — the objects have different names, so getting it wrong is a
+link error rather than a wrong answer, which is the one part of this that is
+safe. What is *not* safe is the reference: `addnorm_reference` and
+`addnorm_pre_add_reference` are separate functions on purpose, and checking one
+form against the other's oracle is the mistake this whole variant exists to make
+impossible to overlook. `addnorm_pre_add.o` is deliberately **not** the compile
+gate's `addnorm_ffn_pre_add.o`: that one is the full 11-symbol build, and linking
+it would drag every FFN matmul microkernel into a core that never calls one.
+
+**`addnorm`'s row cap moves with `cols`, and the derived cap is not a target.**
+`addnorm_max_rows(cols, ...)` returns `herd_x ×` the largest `rows_per_call` that
+fits L1 — at `cols = 768` that is 80 post-add and 104 pre-add, against 120 at
+`cols = 512`. It counts *allocations*; aircc ping-pongs the DMA-fed buffers on
+top, so a shape sitting at the cap can still fail to place. Both `opcheck` rows
+run 64 rows, comfortably under, which also makes the 512-wide and 768-wide
+measurements directly comparable.
+
+**Pre-add measures ~26× tighter than post-add at a *higher* relative error, and
+that is the ordering, not the kernel.** `atol_required` is 6.6e-4 for
+`64x768_pre_add` against 1.7e-2 for `64x512`, while `mean_rel_L1` goes the other
+way (2.7e-3 against 1.9e-3). Post-add finishes with `+ residual` in bf16, so an
+element where `norm × weight` nearly cancels the residual carries an absolute
+error set by the *residual's* magnitude while its own value sits near zero — and
+`rtol` covers none of that. Pre-add has no trailing add, so every error is
+proportional to the output carrying it. Do not read the tighter number as the
+better datapath.
 
 **`-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16` must be a `-D`.** It has to be
 visible before `<aie_api/aie.hpp>` to change `aie::mmul` behaviour, so a source

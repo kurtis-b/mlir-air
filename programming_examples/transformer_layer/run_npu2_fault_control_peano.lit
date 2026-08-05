@@ -19,7 +19,10 @@
 // a fix is only trusted after confirming it fails when it should.
 //
 // One operator, because the injection machinery in opcheck.py is shared by all
-// four and the driver runs the same injection against each of them.
+// of them and the driver runs the same injection against each of them. Both of
+// that operator's shapes run, since omitting a shape key selects them all, and
+// both are checked below -- a test that dispatched an injection it did not read
+// the verdict of would be spending hardware time for nothing.
 //
 // NPU serialization lives one layer down, not in the recipe below. Device
 // access is locked on /tmp/npu.lock, which XRTRunner.run_test holds across
@@ -47,4 +50,6 @@
 // inferred from the verdict.
 // CHECK: [fault-inject] input 0 at (511, 0)
 // CHECK: [opcheck] elementwise_add [512x512]: FAIL
+// CHECK: [fault-inject] input 0 at (4095, 0)
+// CHECK: [opcheck] elementwise_add [4096x768]: FAIL
 // CHECK: NEGATIVE CONTROL: PASS

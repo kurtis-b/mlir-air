@@ -1,13 +1,27 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 //
-// Phase C1 operator gate: addnorm.
+// Phase C1 + D1 operator gate: addnorm, in both residual orderings.
 //
-// Weighted LayerNorm plus residual, with the weight as a runtime memref
+// Weighted LayerNorm and a residual, with the weight as a runtime memref
 // argument rather than baked into the MLIR. 64 rows, not 512: the builder
 // requires one kernel call per tile, and that caps rows at what L1 holds
 // across the 8-column herd. builders/addnorm.py records the measurement
 // behind that constraint.
+//
+// TWO DIFFERENT FUNCTIONS, NOT TWO SHAPES OF ONE.
+//   64x512          post-add, LayerNorm(x) * weight + residual
+//   64x768_pre_add  pre-add,  LayerNorm(x + residual) * weight
+//
+// The second is what encoder_bert computes at both of its normalization points
+// and it had never been dispatched before Phase D1: the kernel supported it
+// from Phase A behind -DADDNORM_PRE_ADD, but no builder exposed the variant.
+// It links a different object built from a different source (encoder.cc has no
+// pre-add path at all), calls a different entry point, and is checked against
+// its own reference. Both lines below must appear, in this order, because a
+// pre-add build checked against the post-add oracle -- or the reverse -- is
+// exactly the failure this pair exists to catch, and it is a failure that
+// leaves the output the right shape.
 //
 // Runs opcheck.py on real NPU2 against an FP32 reference: np.isclose over the
 // full output at rtol=1.6e-2, zero permitted mismatches. Not cosine similarity
@@ -40,3 +54,8 @@
 // here rather than passing quietly.
 // CHECK: PASS!
 // CHECK: [opcheck] addnorm [64x512]: PASS
+// The pre-add variant's own object is named in the log, so a run that silently
+// fell back to encoder.o fails here rather than at the verdict.
+// CHECK: Compiling addnorm_pre_add.o from addnorm_ffn.cc
+// CHECK: PASS!
+// CHECK: [opcheck] addnorm [64x768_pre_add]: PASS

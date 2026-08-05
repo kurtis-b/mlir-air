@@ -1,7 +1,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 //
-// Phase C3 operator gate: mha_out_proj.
+// Phase C3 + D1 operator gate: mha_out_proj.
 //
 // Fused multi-head attention plus output projection in one ELF: the seq-first
 // FlashAttention design's launches followed by the O-projection GEMM's, with
@@ -21,11 +21,19 @@
 // the attention output between the two halves. That gap is measured rather than
 // defined away, and it is part of what atol is sized against.
 //
-// Three shapes, checked individually and in order. Causal and non-causal are
+// Four shapes, checked individually and in order. Causal and non-causal are
 // SEPARATE shape keys because masking is a distinct device path and changes the
 // arithmetic -- early rows attend to a handful of keys, so the output's dynamic
 // range widens by an order of magnitude and the two rows carry different
 // tolerances for the same relative error.
+//
+// The fourth is Phase D1's baseline_768 point: 4096 positions, 12 heads,
+// NON-CAUSAL. encoder_bert is bidirectional, so the causal rows are not this
+// operator's baseline_768 evidence however large they are. It is the expensive
+// row -- four times the sequence of the largest C3 point with none of the score
+// matrix masked away -- and the causal=False line is checked immediately before
+// its verdict so a run that quietly masked it is a failure here rather than a
+// number nobody re-derives.
 //
 // NPU serialization lives one layer down, not in the recipe below. Device
 // access is locked on /tmp/npu.lock, which XRTRunner.run_test holds across
@@ -62,3 +70,6 @@
 // CHECK: causal=True
 // CHECK: PASS!
 // CHECK: [opcheck] mha_out_proj [2048x1024x16h_causal]: PASS
+// CHECK: FlashAttention 4096x4096 head_dim=64 heads=12q/12kv causal=False
+// CHECK: PASS!
+// CHECK: [opcheck] mha_out_proj [4096x768x12h]: PASS

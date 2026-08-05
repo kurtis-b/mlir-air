@@ -1,7 +1,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 //
-// Phase C2 operator gate: ffn.
+// Phase C2 + D1 operator gate: ffn.
 //
 // Staged up-projection, GeLU, down-projection as five launches in one ELF.
 // Both GEMMs take their method and tiles from kernel_registry per shape,
@@ -45,3 +45,17 @@
 // here rather than passing quietly.
 // CHECK: PASS!
 // CHECK: [opcheck] ffn [2048x1024x3072]: PASS
+//
+// The second shape is Phase D1's baseline_768 point, and it is THE ONLY POINT
+// ON THE SEQUENCE LADDER WHERE THIS OPERATOR BUILDS AT hidden 768. Both
+// projections take a different tile_n (128 up, 96 down) at every point, and two
+// same-method GEMMs with different tile_n declare f32_to_bf16_mn_<suffix> twice
+// with different memref types, which stitch_elf rejects. seq 4096 is the one
+// place the registry puts them on different methods. The two method names are
+// checked, in order, so a registry change that put both projections back on one
+// method fails here with its cause on screen rather than as a redefinition
+// error several frames inside the stitcher.
+// CHECK: up-projection 4096x768x3072 (drain, registry
+// CHECK: down-projection 4096x3072x768 (fused-cast, registry
+// CHECK: PASS!
+// CHECK: [opcheck] ffn [4096x768x3072]: PASS

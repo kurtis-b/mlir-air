@@ -268,6 +268,9 @@ high-precision `atol` is K-scaled here, in
 | (M×N) | herd (hx/hy) | rows_per_call | mean_rel_L1 | abs_err max | mismatches | Used by | Status |
 |---|---|---|---|---|---|---|---|
 | 512×512 | 8/1 | 8 | 2.0e-3 | 3.1e-2 | 0 / 262144 | transformer-layer studies, encoder block norm (hidden = 512) | ✅ |
+| 4096×768 | 8/1 | 8 | 2.0e-3 | 3.1e-2 | 0 / 3145728 | transformer-layer studies, `baseline_768` block norm at the block's own sequence length | ✅ |
+
+> The `4096×768` row is Phase D1's: the same kernel at the width and sequence length the encoder block runs. `mean_rel_L1` is unchanged across a 12× larger output and a 1.5× wider normalization axis, which is what a per-row reduction should do. It carries `atol = 5e-3` against the 512-row's `5e-2`, sized from its own measured `atol_required` of 1.4e-3 rather than inherited from the tier — `abs_err max` is 22× that, all of it on large-magnitude elements `rtol` already covers.
 
 > `mean_rel_L1 = 2.0e-3` sits beside Element-wise Add (1.9e-3) and below RMSNorm (4.2e-3): the output is O(1) by construction, so the bf16 epilogue roundings do not compound. `rel_err max = 6.3e+1` is expected rather than a defect — a zero-mean output puts some element arbitrarily close to zero, where relative error is unbounded and absolute error is still one ULP. That is what `atol = 5e-2` is for, and why the methodology fixes `rtol` and sizes `atol`. Throughput is not recorded: Phase C1 gates numerics only.
 
@@ -275,11 +278,23 @@ high-precision `atol` is K-scaled here, in
 
 ## AddNorm — tested shapes
 
-`out = LayerNorm(x) · weight + residual`, per row, fused into one kernel call; shapes written `M×N`. The sublayer boundary of the encoder block, over `fused_add_layer_norm_2outs`. **The weight is a runtime memref argument**, not baked into the MLIR as iron does — one compiled ELF serves every weight vector of that shape. The statistics come from `x` alone (post-add form). Full datapath and the one-call-per-tile constraint in [`details/AddNorm_bf16.md`](details/AddNorm_bf16.md).
+Weighted layer normalization and a residual, per row, fused into one kernel call; shapes written `M×N`. The sublayer boundary of the encoder block. **The weight is a runtime memref argument**, not baked into the MLIR as iron does — one compiled ELF serves every weight vector of that shape. **Two orderings, which are two different functions**, selected by `build_addnorm_module(pre_add=...)`:
 
-| (M×N) | herd (hx/hy) | rows_per_call | mean_rel_L1 | abs_err max | mismatches | Used by | Status |
-|---|---|---|---|---|---|---|---|
-| 64×512 | 8/1 | 8 | 1.9e-3 | 3.1e-2 | 0 / 32768 | transformer-layer studies, encoder sublayer boundary (hidden = 512) | ✅ |
+| ordering | computes | statistics over | kernel | entry point |
+|---|---|---|---|---|
+| post-add (default) | `LayerNorm(x) · weight + residual` | `x` | `encoder.o` | `fused_add_layer_norm_2outs` |
+| pre-add | `LayerNorm(x + residual) · weight` | `x + residual` | `addnorm_pre_add.o` | `fused_add_layer_norm_1outs` |
+
+Pre-add is what a post-norm encoder (`encoder_bert`) computes at both of its normalization points. Full datapath and the one-call-per-tile constraint in [`details/AddNorm_bf16.md`](details/AddNorm_bf16.md).
+
+| (M×N) | ordering | herd (hx/hy) | rows_per_call | mean_rel_L1 | abs_err max | atol_required | mismatches | Used by | Status |
+|---|---|---|---|---|---|---|---|---|---|
+| 64×512 | post-add | 8/1 | 8 | 1.9e-3 | 3.1e-2 | 1.75e-2 | 0 / 32768 | transformer-layer studies, encoder sublayer boundary (hidden = 512) | ✅ |
+| 64×768 | pre-add | 8/1 | 8 | 2.7e-3 | 6.3e-2 | 6.65e-4 | 0 / 49152 | transformer-layer studies, `baseline_768` encoder sublayer boundary | ✅ |
+
+> **The pre-add row needs 26× less `atol` than the post-add one at a higher relative error, and the ordering is why.** Post-add finishes with `+ residual` in bf16, so an element where `norm · weight` nearly cancels the residual carries an absolute error set by the *residual's* magnitude while its own value sits near zero — `rtol` covers none of that, and `atol_required` jumps to 1.75e-2. Pre-add has no trailing add, so every error is proportional to the output carrying it. It is the same kernel with the cancellation removed, not a better datapath.
+>
+> The two rows differ in width as well as ordering, so they are not a controlled comparison of the ordering alone. Both were sized by the same rule: `atol` is `atol_required` rounded up ~3× (`5e-2` and `2e-3` respectively).
 
 > `M = 64` is a **hard cap, not a sample**: the builder requires exactly one kernel call per tile, because two or more trips through the herd loop miscompile (0 of 512 elements outside tolerance at one trip, 491 of 512 at two, at `[8,64]`/`herd_x=1`). The distinguishing feature is three L3→L1 streams per tile against a column's two shim MM2S channels; the two-stream norms and adds beside it loop correctly. The builder raises rather than emitting the broken form. Lifting the cap needs the weight staged through L2, or the residual folded into `x`'s L3 buffer — neither is done yet.
 
@@ -293,12 +308,16 @@ high-precision `atol` is K-scaled here, in
 |---|---|---|---|---|---|---|---|---|
 | 2048×1024 | 2048×1024×3072 | fused-cast | 64/256/32/128 | 9.9e-3 | 1.95e-3 | 0 / 6291456 | transformer-layer studies, attention projections | ✅ |
 | 2048×2048 | 2048×2048×6144 | fused-cast | 64/256/32/128 | 9.7e-3 | 1.22e-3 | 0 / 12582912 | transformer-layer studies, attention projections | ✅ |
+| 64×768 | 64×768×2304 | fused-cast | 64/128/32/96 | 9.9e-3 | 1.95e-3 | 0 / 147456 | transformer-layer studies, shortest point of the `baseline_768` ladder | ✅ |
+| 4096×768 | 4096×768×2304 | fused-cast | 64/256/32/96 | 9.9e-3 | 1.95e-3 | 0 / 9437184 | transformer-layer studies, `baseline_768` block projections | ✅ |
 
 > **`mean_rel_L1 = 9.9e-3` is the GEMM's own number** (the bf16-out page records 9.4e-3 for this shape), so the three split-cast launches add nothing measurable — which is the point of folding the split into a cast the datapath already owed.
 >
 > **This resolves the ⚠️ on `2048×1024×3072` fused-cast above.** That row's note diagnoses it as a harness tolerance edge: the datapath computes the in-tier result and the gate tripped on a single near-zero-reference element at `abs_err ≈ 1.7e-3` against `atol = 1.5e-3`. Measured here at `atol = 5e-3` over 3× as many elements: `abs_err max = 1.95e-3`, **zero** mismatches. That is the remedy the note itself proposed — relax the high-precision `atol` to match the other tiers, leave the GPU-standard `rtol` alone.
 >
-> **Both** `M×K×3K` triples that were in the GEMM registry when this operator was validated are validated here. The registry now holds **11** such triples: the Phase C4 sweep added the nine `baseline_768` `qkv_proj` shapes (`seq×768×2304`, the full sequence ladder), so the builder resolves those too — but resolving a tiling and having run this operator's numerical check at that shape are different claims, and only the two rows above are the second. Of the 108 projection-GEMM shapes the execution-studies case matrix asks for, **41 are now registered** (the whole `baseline_768` family plus five incidental model shapes); the remaining 67 are `baseline_512` and `baseline_1024`, which are the same sweep tool over a different `--family` and are deliberately left as a later machine-time run. The builder still raises on those rather than guessing a tiling.
+> **The two `baseline_768` rows are the ends of the sequence ladder**, and they are the two that exercise the per-row herd. `64×768` runs at herd `1×4` — `M = 64` cannot hold eight rows of `fused-cast`'s forced `tile_m = 64` — and `4096×768` at the file-level `8×4`; a builder that stopped reading the herd from the registry row would fail to build the first and still pass the second. `64×768` is also the shape whose original `fused-cast` row returned **zeros for two of nine cast sub-tiles**, which is why a resolution check is not a correctness check.
+>
+> **All four `M×K×3K` triples above are validated on hardware.** The registry holds **11** such triples: the Phase C4 sweep added the nine `baseline_768` `qkv_proj` shapes (`seq×768×2304`, the full sequence ladder), so the builder resolves all of those — but resolving a tiling and having run this operator's numerical check at that shape are different claims, and only the four rows above are the second. Of the 108 projection-GEMM shapes the execution-studies case matrix asks for, **41 are now registered** (the whole `baseline_768` family plus five incidental model shapes); the remaining 67 are `baseline_512` and `baseline_1024`, which are the same sweep tool over a different `--family` and are deliberately left as a later machine-time run. The builder still raises on those rather than guessing a tiling.
 
 ---
 
@@ -309,6 +328,11 @@ high-precision `atol` is K-scaled here, in
 | (M×K×F) | up GEMM | down GEMM | tile (m/kl2/kl1/n) | mean_rel_L1 | abs_err max | mismatches | Used by | Status |
 |---|---|---|---|---|---|---|---|---|
 | 2048×1024×3072 | fused-cast | fused-cast | 64/256/32/128 (both) | 1.6e-2 | 1.59e-3 | 0 / 2097152 | transformer-layer studies, encoder FFN sublayer | ✅ |
+| 4096×768×3072 | drain | fused-cast | 32/256/32/128 up, 64/512/32/96 down | 1.6e-2 | 1.71e-3 | 0 / 3145728 | transformer-layer studies, `baseline_768` FFN sublayer | ✅ |
+
+> **The `baseline_768` row is the only point on the sequence ladder where this operator builds at hidden 768**, and the reason is in the two method columns rather than in the numbers. At `K = 768` the up-projection takes `tile_n = 128` and the down-projection `tile_n = 96` at *every* sequence length, and two **same-method** GEMMs with different `tile_n` declare `f32_to_bf16_mn_<suffix>` twice with different memref types, which `stitch_elf` rejects. `seq = 4096` is the one point the registry puts them on different methods, and therefore on different objects. `64…2048` are `drain`/`drain` and `8192`/`16384` are `fused-cast`/`fused-cast`; both collide. That makes buildability here a property of the registry's winners rather than of the shape — a re-sweep that moved either projection onto the other's method would take the operator from *builds* to *does not build* with no source change. The fix is a symbol suffix minted per `(method, tile_n)` in `llms/shared/builders/gemm_builder.py`.
+>
+> Mixing the methods costs nothing measurable: `mean_rel_L1` is within 2% of the all-`fused-cast` row above.
 
 > **`mean_rel_L1 = 1.6e-2` is ~1.6× a single GEMM's**, and that gap is what the composition costs: the device stages the up-projection output in bf16 and the activation kernel carries bf16 intermediates, while the reference is FP32 end to end. Reproducing either in the oracle would hide exactly the error it introduces.
 >
@@ -325,10 +349,13 @@ high-precision `atol` is K-scaled here, in
 | 512×512 | 8/8 | 64 | ✗ | drain | 32/256/32/128 | 4.64e-2 | 1.95e-2 | 1.85e-2 | 0 / 262144 | transformer-layer studies, attention sublayer | ✅ |
 | 512×512 | 8/8 | 64 | ✓ | drain | 32/256/32/128 | 3.58e-2 | 5.86e-2 | 4.88e-2 | 0 / 262144 | transformer-layer studies, decoder attention sublayer | ✅ |
 | 2048×2048 | 16/16 | 64 | ✓ | drain | 32/256/32/128 | 4.11e-2 | 5.08e-2 | 4.81e-2 | 0 / 2097152 | transformer-layer studies, prefill-sized attention sublayer | ✅ |
+| 4096×4096 | 12/12 | 64 | ✗ | drain | 32/256/32/96 | 5.33e-2 | 9.03e-3 | 8.71e-3 | 0 / 3145728 | transformer-layer studies, `baseline_768` attention sublayer | ✅ |
 
 > **`mean_rel_L1` sits in FlashAttention's band, not a GEMM's**, and that is the expected answer: the attention half *is* that kernel, and a projection whose own relative error is 4× smaller cannot pull the total down. The composition costs nothing measurable in relative terms.
 >
 > **`atol_required` — `max(|out−ref| − rtol·|ref|)`, the smallest `atol` the run would have passed at — is the column to read, not `abs_err max`.** Under causal masking the largest absolute error lands on a large-magnitude element `rtol` already covers: the first rows attend to a handful of keys, so `|y|` runs to 4.1 instead of 0.35 while the relative error is if anything lower. The causal rows carry `atol = 8e-2`, a 1.6× margin — below the registry's usual 2–3× and deliberately so, since `1e-1` is a hard ceiling and this datapath's honest error gets within a factor of two of it.
+>
+> **The `4096×4096` row has the loosest relative error and the tightest `atol`, which is the same effect running the other way.** Softmax over 4096 keys averages `V` eight times harder than over 512, so `|y|` shrinks by roughly `√8` and the same relative error lands closer to zero: `atol_required` falls to 8.7e-3 while `mean_rel_L1` rises to 5.33e-2. Its `atol` is 2.5e-2, a 2.9× margin and 4× below the ceiling — so the row the encoder block actually runs has the most headroom of the four, not the least. It is **non-causal** because `encoder_bert` is bidirectional; the causal rows above are a different device path and are not `baseline_768` evidence however large they are.
 >
 > **`head_dim = 64` throughout, on purpose**: `head_dim = 128` FlashAttention has been flaky (hang or NaN) on some NPU2 setups, and the builder rejects it rather than letting a mis-shaped call find that out on hardware. **No `fused-cast` projection has been run in this composition** — that method wants `runtime_loop_tiling_sizes=[2,2]` and this operator runs at `[1,1]` because the attention half needs it, so the combination is untested rather than known-good. Both are coverage gaps, not known failures.
 
@@ -381,8 +408,9 @@ Fused scaled-dot-product attention (online-softmax FlashAttention) with grouped-
 | 6291456 (2048×3072) | 8/1/2048 | 614 µs | 61.4 GB/s | 1.9e-3 | ✅ (Llama-3.2-3B residual, seq·emb) |
 | 262144 (512×512, 2-D) | 8/1/512 | — | — | 1.9e-3 | ✅ (transformer-layer studies, encoder residual) |
 | 262144 (512×512, 2-D + causal mask) | 8/1/512 | — | — | 3.2e-3 | ✅ (transformer-layer studies, attention-score masking) |
+| 3145728 (4096×768, 2-D) | 8/1/768 | — | — | 1.9e-3 | ✅ (transformer-layer studies, `baseline_768` block residual) |
 
-> The last two rows are the **2-D-in / 2-D-out** variant (`_build_add_2d_to_2d`, the same builder llama's fused `o_ffn` prefill residual uses), reached through `transformer_layer/builders/elementwise_add.py`. Same arithmetic, same 1.9e-3; only the L3 layout differs, and keeping the output 2-D is what lets a downstream launch read it without an `expand_shape`. The **causal-mask** row is that builder with `causal_mask=True` and a torch-precomputed `-10000.0` triangular mask bound as the second operand — there is no device design of its own, which is exactly why it is a builder keyword rather than a sixth operator. Its higher `mean_rel_L1` (3.2e-3) and `abs_err max` (6.4e+1) come from the masked half of the tensor: bf16 spacing at |value| ≈ 10⁴ is 64, so a single ULP there is 6.4e+1, and `np.isclose` passes it on `rtol` (`1.6e-2 · 10⁴ = 160`). The unmasked half is a plain add of the same `randn` scores and carries a plain add's error. `-10000.0` rather than `-inf` because `-inf` in bf16 propagates NaN through the add. Throughput is not recorded for either: Phase C1 gates numerics only.
+> The last three rows are the **2-D-in / 2-D-out** variant (`_build_add_2d_to_2d`, the same builder llama's fused `o_ffn` prefill residual uses), reached through `transformer_layer/builders/elementwise_add.py`. Same arithmetic, same 1.9e-3; only the L3 layout differs, and keeping the output 2-D is what lets a downstream launch read it without an `expand_shape`. The **causal-mask** row is that builder with `causal_mask=True` and a torch-precomputed `-10000.0` triangular mask bound as the second operand — there is no device design of its own, which is exactly why it is a builder keyword rather than a sixth operator. Its higher `mean_rel_L1` (3.2e-3) and `abs_err max` (6.4e+1) come from the masked half of the tensor: bf16 spacing at |value| ≈ 10⁴ is 64, so a single ULP there is 6.4e+1, and `np.isclose` passes it on `rtol` (`1.6e-2 · 10⁴ = 160`). The unmasked half is a plain add of the same `randn` scores and carries a plain add's error. `-10000.0` rather than `-inf` because `-inf` in bf16 propagates NaN through the add. The `4096×768` row is Phase D1's `baseline_768` point, at the block's own activation shape; its `atol_required` is **0.0**, meaning `rtol` alone accounts for every element — a single bf16 rounding of an f32 sum is always within `rtol` of the f32 value, so `atol` is doing no work for this kernel at all. Throughput is not recorded for any of the three: these rows gate numerics only.
 
 > `mean_rel_L1 = 1.9e-3` is the lowest in the registry — `c=a+b` rounds each output once (matching `torch.add` bf16: f32 sum, single round, no accumulation), bit-identical across all configs and `N`. Best config `herd_x=8, herd_y=1` for every shape: the 3-DMA-per-tile shim-channel limit caps the herd at one 8-column row (**cannot fill 32 tiles** — `herd_y>1` fails to place), but within that `herd_x` scales near-linearly (9→57.7 GB/s as herd_x 1→8). Highest bandwidth in the registry (pure streaming). See [`details/EltwiseAdd_bf16.md`](details/EltwiseAdd_bf16.md).
 

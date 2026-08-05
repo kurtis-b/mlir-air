@@ -7,6 +7,11 @@
 // Reuses llms/shared/builders/o_ffn_multi.py's _build_add_2d_to_2d, so this
 // also guards the shared builder against drift from outside its own suite.
 //
+// Two shapes: the 512x512 C1 point, and Phase D1's 4096x768 -- the block's own
+// activation shape in the baseline_768 family. Rows are free for this operator
+// (its L1 tile is one row wide), so the second point is the full sequence
+// rather than a cheaper stand-in for it.
+//
 // Runs opcheck.py on real NPU2 against an FP32 reference: np.isclose over the
 // full output at rtol=1.6e-2, zero permitted mismatches. Not cosine similarity
 // -- kernel_registry/README.md is explicit that a correlation gate is blind to
@@ -38,3 +43,5 @@
 // here rather than passing quietly.
 // CHECK: PASS!
 // CHECK: [opcheck] elementwise_add [512x512]: PASS
+// CHECK: PASS!
+// CHECK: [opcheck] elementwise_add [4096x768]: PASS
