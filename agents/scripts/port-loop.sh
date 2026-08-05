@@ -233,19 +233,42 @@ run_phase() {
   # Resume support. Without this a resumed run re-executes `implement`, throwing away work that
   # is already committed and burning a full session to do it. _RESUME_FROM is the ordinal of the
   # first stage still to run; stages before it are skipped.
-  local resume_from=0
+  local resume_from=0 resuming=no
   if [ "$(state_get '.resume_phase // ""')" = "${phase}" ]; then
+    resuming=yes
     resume_from="$(stage_ordinal "$(state_get '.resume_step // "implement"')" "$(state_get '.resume_round // 1')")"
     state_set '.resume_phase = null | .resume_step = null | .resume_round = null'
     log_info "resuming phase ${phase} at stage ordinal ${resume_from}"
   fi
 
-  if [ "${resume_from}" -eq 0 ]; then
+  # A FRESH phase takes its base from HEAD. A RESUMED one keeps the base already recorded, at every
+  # ordinal including zero.
+  #
+  # `[2026-08-05]` The `-eq 0` test alone was not enough, and Phase E1 hit it. stage_ordinal maps
+  # both `preflight` and `implement` to 0, so a halt DURING implement -- E1's session exhausted
+  # PL_STEP_BUDGET after committing six commits -- is indistinguishable from a phase that never
+  # started. Re-deriving the base from HEAD then takes it from a tree that already contains the
+  # halted attempt's work, and three things go wrong at once: the three Codex reviews diff an empty
+  # range, guard_fingerprint's baseline already includes the phase's own gate-file edits so the
+  # tamper check is vacuous, and the implement session re-runs over committed work. That is the
+  # same defect as the working-tree fingerprint baseline, reached by a third road.
+  if [ "${resume_from}" -eq 0 ] && [ "${resuming}" = "no" ]; then
     _START_SHA="$(git -C "${PL_ROOT}" rev-parse HEAD)"
     state_set --arg s "${_START_SHA}" '.phase_start_sha = $s'
   else
     _START_SHA="$(state_start_sha)"
     [ -n "${_START_SHA}" ] || _START_SHA="$(git -C "${PL_ROOT}" rev-parse HEAD)"
+  fi
+
+  # Re-running implement over committed work is wasteful but not unsafe -- the session sees its own
+  # commits and can continue. Say so, and name the cheaper route, because the operator is reading
+  # this after a halt and `resume` is what the halt message told them to run.
+  if [ "${resuming}" = "yes" ] && [ "${resume_from}" -eq 0 ] \
+     && [ "$(git -C "${PL_ROOT}" rev-parse HEAD)" != "$(git -C "${PL_ROOT}" rev-parse "${_START_SHA}")" ]; then
+    log_warn "resuming at implement, but commits already exist since the phase base."
+    log_warn "  The implement session will RE-RUN over them. If its work items are already done,"
+    log_warn "  stop and skip to the reviews instead:"
+    log_warn "    ./agents/scripts/port-loop.sh resume-at ${phase} review 1 $(git -C "${PL_ROOT}" rev-parse --short "${_START_SHA}")"
   fi
   log_info "phase base commit: $(git -C "${PL_ROOT}" rev-parse --short "${_START_SHA}")"
 

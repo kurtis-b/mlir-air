@@ -218,6 +218,21 @@ preflight → implement → commit
   → confirm → gate → hardware-check → objective-check → tamper-check → advance | halt
 ```
 
+`[2026-08-05]` **A halt during `implement` used to poison the phase's base commit, and Phase E1 hit
+it.** `stage_ordinal` maps both `preflight` and `implement` to ordinal 0, so a halt *during*
+implement — E1's session exhausted `PL_STEP_BUDGET` after committing six commits — was
+indistinguishable from a phase that never started, and `run_phase` re-derived `_START_SHA` from
+current HEAD. Three things then went wrong at once: the three Codex reviews would diff an empty
+range, `guard_fingerprint`'s baseline already contained the phase's own gate-file edits so the
+tamper check was vacuous, and the implement session re-ran over committed work. Same defect as the
+working-tree fingerprint baseline, reached by a third road — and the seventh lesson above claimed
+this class was closed, which was true only for halts *after* implement.
+
+`run_phase` now keys on *whether it is resuming at all*, not on the ordinal, so a resumed phase
+keeps its recorded base at every ordinal including zero. It also warns, when resuming at implement
+with commits already present, and prints the `resume-at <phase> review 1 <base>` line that skips the
+redundant session. E1 was recovered by hand that way before the fix existed.
+
 `[2026-08-05]` `run-one <phase> objective-check` now sources the venv via `pl_env_ensure` before
 dispatching. In a real run `pl_preflight` has already done it; standalone it had not, so Phase E's
 naming clause — which resolves GEMM specs through `shared.builders.gemm_builder` — failed on

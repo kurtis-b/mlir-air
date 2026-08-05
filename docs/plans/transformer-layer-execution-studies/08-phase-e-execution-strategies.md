@@ -6,6 +6,74 @@ Build the four points of the taxonomy defined in
 `[2026-08-05]` Re-anchored against what Phase D actually produced. Four things below decide how
 this phase starts; read them before planning anything.
 
+## `[2026-08-05]` Outcome: the four modes, measured
+
+All five sub-phases passed gate, objective and tamper checks — 24 of 60 invocations, ~8.5 hours.
+The layer computes identically in all four modes (full 4096×768 output, zero mismatches, ten clean
+per-boundary stages each) and the dispatch vectors are:
+
+| mode | submissions | entries | air launches | herd launches | sync boundaries | bytes |
+|---|---|---|---|---|---|---|
+| `offload` | 6 | 6 | 7 | 19 | 19 | 139,984,896 |
+| `runlist` | 5 | 391 | 14 | 404 | 403 | 165,347,328 |
+| `coarse` | 4 | 131 | 12 | 146 | 402 | 202,902,528 |
+| `fused` | 1 | 3 | 16 | 24 | 19 | 184,025,088 |
+
+`fused` is the clearest result in the table: it collapses `coarse`'s 402 sync boundaries to 19 and
+its 131 runlist entries to 3, while carrying *more* AIR launches (16 against 12). That is precisely
+the signature the taxonomy predicts for MLIR-level fusion — the work moves below the runlist, into
+the ELF — and it is the one mode whose numbers were not predicted in advance by anything.
+
+Both non-gating predictions also held (`fused` entries below `coarse`, `fused` AIR launches at or
+above it).
+
+### Three of this plan's four predicted vectors were wrong
+
+[03](03-measurement-model.md) predicted `offload` at 8 submissions and 8 sync boundaries,
+`runlist` at 1 submission with ~29 entries, and `coarse` at 1 submission with ~6 entries. Measured:
+6/19, 5/391, and 4/131. The causes are all recorded and all real — attention leaving the device for
+`offload`, a whole-BO dispatch argument forcing multiple submissions, and `build_addnorm_module`'s
+64-row L1 cap dominating everything. **Phase F consumes these numbers; take them from this table,
+not from 03's prose.**
+
+### One gating clause stopped being a test, and that is a finding
+
+**`runlist.runlist_entries > coarse.runlist_entries` is now true by construction, not by
+measurement**, and `pattern/runlist/README.md` says so in as many words.
+
+The sequence matters. E4's first structure measured 13 entries over 2 runlists — below `coarse` —
+and the session's first response was the one [08d](08d-phase-e4-runlist.md) asks for: a commit
+documenting why no faithful decomposition exceeds 131. Review round 2 then raised a blocking
+finding titled *"The implementation knowingly fails the mandatory E4 ordinal gate"* — citing the
+gate criteria rather than a defect — and the fix restructured the mode to 391.
+
+The restructuring is defensible on its merits, and arguably better science: the streaming structure
+varied operator granularity *and* dispatch schedule at once, and at the normalization points it was
+64× **coarser** than `coarse`. Holding the schedule fixed (band size imported from
+`builders.block.norm_rows`, never tuned) and subdividing each unit isolates granularity, which is
+the variable being compared. The arithmetic is unchanged.
+
+But once `runlist` is *defined* as "`coarse`'s schedule, subdivided", the inequality cannot fail.
+Two lessons:
+
+- **A gate criterion stated in the gate description is visible to the reviewer, and a reviewer will
+  optimize for it.** `phase_gate_description` for E2–E5 spells out the ordinal thresholds *and*
+  says "report the number; do not inflate the decomposition". The reviewer acted on the threshold
+  and ignored the caveat. Either withhold the numeric criterion from the description, or make the
+  caveat a blocking instruction to the reviewer rather than advice to the session.
+- **Clause 3 should be replaced** for Phase F's purposes. `entries` ratio at a *fixed* schedule is
+  a definition; what would actually discriminate is a field neither mode controls by construction —
+  `herd_launches` (404 against 146) is the candidate, since it counts executed work rather than
+  dispatch packaging.
+
+### `runlist` cannot be one runlist on this hardware
+
+Its premise — "1 submission over many entries" — is not reachable. It measured **5 submissions**,
+because a host stage between the projections and the output projection forces at least two before
+banding restages add more, and because re-executing one GEMM ELF inside a single runlist corrupts,
+which forces per-projection ELFs against the 32-context ceiling. Recorded in
+`pattern/runlist/README.md`.
+
 ## This document is the overview; the work is five sub-phases
 
 `[2026-08-05]` Split, for the reason C and D were and one more: `PL_STEP_TIMEOUT` caps an implement
