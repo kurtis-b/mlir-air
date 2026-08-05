@@ -1,0 +1,41 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase E4 operator gate: transpose.
+//
+// The bf16 matrix transpose iron's runlist dispatches as k_transpose,
+// re-expressed over data_transfer_transpose/dma_bf16/'s movement pattern
+// (contiguous tiles + a scalar tile kernel -- a DMA-stride transpose is not
+// legal for sub-32-bit types) and tiled over an 8x1 herd. Validated at
+// 4096x768, the k^T shape the gate configuration implies; the runlist mode's
+// README records why the mode itself does not dispatch it (its consumer, the
+// attention scores GEMM, is host torch on this device).
+//
+// Runs opcheck.py on real NPU2 against the exact transposed input: np.isclose
+// over the full output at rtol=1.6e-2 with zero permitted mismatches, which
+// for pure data movement means BIT-exact -- and it measures exactly that:
+// every error statistic is 0.0. A nonzero anything here is a moved byte.
+//
+// NPU serialization lives one layer down, not in the recipe below. Device
+// access is locked on /tmp/npu.lock, which XRTRunner.run_test holds across
+// xclbin load and dispatch -- the same inode lit.cfg.py's NPU substitution and
+// KernelCache take. Taking the outer /tmp/mlir-air-npu.lock here instead would
+// DEADLOCK against the gate command that already holds it -- BSD flock(2)
+// treats a second open() of the same file as a foreign lock.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming
+// one in prose -- even inside a comment -- registers as a second directive and
+// leaves the test UNRESOLVED. Describe them, never spell them out.
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_npu2_transpose_peano
+// RUN: cd test_npu2_transpose_peano
+// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile check-transpose PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+//
+// The exactness first -- every statistic zero, which no arithmetic operator in
+// this example prints -- then the verdict naming the operator and shape.
+// CHECK: [precision] Output 0 (3145728 elements): mean_rel_L1=0.000e+00 | rel_err max=0.000e+00 | abs_err max=0.000e+00
+// CHECK: PASS!
+// CHECK: [opcheck] transpose [4096x768]: PASS
