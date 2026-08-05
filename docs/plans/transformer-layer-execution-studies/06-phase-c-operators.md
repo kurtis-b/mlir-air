@@ -65,9 +65,16 @@ direction, and at `K=4096` the accumulated error is not small. Two further traps
 files:
 
 - iron's FFN oracle uses `torch.nn.functional.gelu`, the **exact erf** form, while the ported
-  kernel is `gelu_tanh_approx_bf16` (`transformer_layer/kernels/elementwise.cc`). At iron's
-  tolerances the difference is invisible; at the registry's it is not. The reference must use the
-  tanh approximation.
+  kernel is `gelu_tanh_approx_bf16` (`transformer_layer/kernels/elementwise.cc`). The reference
+  must use the tanh approximation.
+
+  `[2026-08-05]` **But not because a tolerance would catch it.** This document, and
+  `builders/gelu.py`'s docstring, both claimed the difference was visible at the registry's
+  tolerances. D2 measured it over `x` in `[-6, 6]`: the worst absolute difference is **4.7e-4**, at
+  `x = 2.70` — well inside `rtol = 1.6e-2`, and at the layer output smaller still. So no gate in
+  this example would notice the wrong form, which makes it *more* dangerous, not less. The thing
+  that actually pins it is `pattern/test_reference.py`, a host-only identity test, and that is why
+  the test exists.
 - iron's MHA oracle computes bf16 SDPA below `seq_len 16384` and FP32 chunked attention at and
   above it, so the reference's own precision changes across the ladder. Compute chunked FP32 at
   every length.

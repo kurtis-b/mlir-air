@@ -72,13 +72,20 @@ its four strategy directories beside it and imports this one shared copy.
 
 Five operator launches, in order:
 
-| # | operator | in → out |
-|---|---|---|
-| 1 | `qkv_proj` | `x` → `q, k, v` |
-| 2 | `mha_out_proj` | `q, k, v, Wo` → `attn_out` (fused attention + output projection, non-causal) |
-| 3 | `addnorm` **pre-add** | `attn_out, x, ln1_weight` → `hidden` |
-| 4 | `ffn` | `hidden, W_up, W_down` → `ffn_out` |
-| 5 | `addnorm` **pre-add** | `ffn_out, hidden, ln2_weight` → `output` |
+| # | operator | in → out | dispatches |
+|---|---|---|---|
+| 1 | `qkv_proj` | `x` → `q, k, v` | 1 |
+| 2 | `mha_out_proj` | `q, k, v, Wo` → `attn_out` (fused attention + output projection, non-causal) | 1 |
+| 3 | `addnorm` **pre-add** | `attn_out, x, ln1_weight` → `hidden` | **64** |
+| 4 | `ffn` | `hidden, W_up, W_down` → `ffn_out` | 1 |
+| 5 | `addnorm` **pre-add** | `ffn_out, hidden, ln2_weight` → `output` | **64** |
+
+> **`[2026-08-05]` The dispatch column was added after the fact.** Written without it, this table
+> reads as one launch per row, and the normalization points are not: `build_addnorm_module`
+> requires `rows == herd_x * rows_per_call`, which at `cols = 768` caps a call well below the
+> layer's 4096 rows, so each normalization point is 64 dispatches. The operators are right; the
+> count was not. It matters for Phase E, because it means `coarse`'s dispatch vector is dominated
+> by `addnorm` rather than by the GEMMs.
 
 Note what is *not* in that list: `layer_norm` and `elementwise_add` are not on the `encoder_bert`
 path — the residual add lives inside the pre-add `addnorm` — and `causal_mask` is decoder-only.
@@ -131,7 +138,16 @@ The driver's objective check requires at least eight stages, each with `n_elemen
 FP32 reference, registry `rtol`/`atol`, zero mismatches, a machine-readable verdict per
 `(operator, shape)`, and `--fault-inject input` which must fail. Add a `block` entry to
 `opcheck_specs.py` — a `_prepare_block(shape, seed=...)` and a `SPECS` row — exactly as every
-operator before it did. `opcheck.py` itself should not need to change.
+operator before it did.
+
+> **`[2026-08-05]` This document said `opcheck.py` itself should not need to change. That was
+> wrong, and the work falsified it.** The claim assumed the block is one `air.ir.Module` that
+> `XRTRunner.run_test` can run. It cannot be: `build_addnorm_module` caps rows per call, so each
+> normalization point is many dispatches and the layer is several ELFs rather than one module.
+> `opcheck.py` gained an additive `dispatch` seam for operators of that shape, plus `stage_stats`
+> so the per-boundary evidence is produced by the same `_RecordingRunner._check_outputs` that
+> decides the verdict — such an operator's verdict is the conjunction of its end-to-end and
+> per-boundary comparisons.
 
 Two footguns in it worth knowing before you start:
 

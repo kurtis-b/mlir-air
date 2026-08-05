@@ -45,7 +45,7 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | C4 — coverage sweep | The 36 `baseline_768` shapes resolve through `gemm_config()`; registry rows written; ten shipped models still pass `make verify` | **done** 2026-08-04 (504 min + 66 min re-run) |
 | D1 — operators at `baseline_768` | Every operator passes `opcheck` at the `baseline_768` widths, including the pre-add `addnorm` | **done** 2026-08-05 (11 min) |
 | D2 — block integration | One full transformer layer matches the torch reference on hardware | **done** 2026-08-05 (156 min) |
-| E — execution strategies | All four modes agree with the reference; dispatch vectors differ as predicted | not started |
+| E — execution strategies | All four modes agree with the reference; dispatch vectors differ as predicted | not started — **next**. Unblocks the sequence ladder first; see [08](08-phase-e-execution-strategies.md) |
 | F — study harness | `execution-smoke-test` yields ≥1 `run_status=passed` row per measurement CSV | not started |
 | G — unattended runner + CI | Full profile run completes with a complete `results_manifest.json` | not started |
 | Goal 1 — sliding window | `make verify` passes with window-crossing prompts | not started |
@@ -121,33 +121,74 @@ Then, before touching anything:
 - [14-the-port-loop-harness.md](14-the-port-loop-harness.md) — how the automated driver works and
   how to run the next phase through it.
 
-**The next phase is D (single-block integration), and it runs as D1 then D2.**
-[07](07-phase-d-block-integration.md) is the overview;
-[07a](07a-phase-d1-operators-at-baseline-768.md) and [07b](07b-phase-d2-block-integration.md) are
-the specs the two sessions are pointed at. Four things decide how the phase starts, so read them
-before planning anything:
+**The next phase is E (the four execution strategies).** Its specification is
+[08-phase-e-execution-strategies.md](08-phase-e-execution-strategies.md), rewritten on 2026-08-05
+against what Phase D actually produced.
 
-- **The family is forced.** `baseline_768` is the only one whose projection GEMMs resolve (36 of
-  36, against 2 and 3 for the other two families). `gemm_config()` raises on anything else.
-- **`[2026-08-05]` So is the sequence length: 4096.** `build_ffn_module` stitches the up- and
-  down-projection GEMMs into one ELF, and two same-method GEMMs with different `tile_n` collide on
-  `f32_to_bf16_mn_<suffix>`. At `hidden = 768` the two take 128 and 96 at every point on the
-  ladder, so they only survive together at 4096, where the registry puts them on different methods.
-  Fixing it properly means minting the symbol suffix per `(method, tile_n)` in
-  `llms/shared/builders/gemm_builder.py` — off limits to this study, and Phase E's cost to carry.
-- **The operators are not all validated at that family**, and **`[2026-08-05]` one of them is the
-  wrong operator.** Only `qkv_proj` has a point at `hidden = 768`. Worse, the validated `addnorm`
-  computes `LayerNorm(x) * weight + residual` while `encoder_bert` needs
-  `LayerNorm(x + residual) * weight`; the kernel supports both behind `-DADDNORM_PRE_ADD` and
-  Phase A already compiles the pre-add object, but no builder exposes it and it has never been
-  dispatched. That is what D1 is for.
-- **`pattern/reference.py` must not be ported verbatim**, for the same reason Phase C's oracles
-  were not — it builds every tensor in bf16, and chained over eight GEMMs that is worse than it
-  was per-operator. Its RNG draw order is load-bearing and must survive the re-expression.
+### What Phase D left you
 
-`[2026-08-05]` The harness entry now exists: `D1` and `D2` arms in all seven dispatchers in
-`agents/scripts/port-loop/phases.sh`, both objective checks layered on `phase_c_operator_check`,
-and `PL_PHASES_IN_SCOPE='["D1","D2"]'`.
+Do not rebuild any of it. The example's own
+`programming_examples/transformer_layer/README.md` is the authoritative file-by-file inventory.
+
+| Piece | Where |
+|---|---|
+| The FP32 golden model | `pattern/reference.py` — `generate_golden_reference()` for both `encoder_bert` and `decoder_gpt2`, `fuse_qkv_weight()`, per-boundary helpers, and the load-bearing `WEIGHT_DRAW_ORDER`. **Use it; do not re-port iron's bf16 original.** |
+| Its independence check | `pattern/test_reference.py` — seven host-only tests pinning the composition against a straight-line transcription, including the three substitutions a numerical comparison would survive (erf vs tanh GeLU, post-add vs pre-add residual, QKV column order) |
+| One assembled layer | `builders/block.py` — `block_config()`, `run_block()`, `describe_block()`, `BLOCK_BOUNDARIES`, over four `KernelCache.run_sequence` calls |
+| Its gate | `run_npu2_block_peano.lit`, `run_reference_tests.lit`, `run_block_cache_tests.lit`, plus `opcheck.py --operator block` and its fault-injected twin |
+| Operators at `baseline_768` | every one, including the pre-add `addnorm` variant D1 had to build because nothing had ever dispatched it |
+
+**`coarse` is most of the way built already.** `builders/block.py` is a fused-operator sequence
+over one runlist — which is what [08](08-phase-e-execution-strategies.md) calls `coarse`. Phase E's
+job there is to give it a strategy directory and route it through the shared instrumentation, not
+to write it again.
+
+**The dispatch vector already exists and is already recorded.** The block writes one per sequence
+into its results artifact. The four it measured, in order (qkv+mha, norm 1, ffn, norm 2):
+
+```
+host_submissions  runlist_entries  air_launches  herd_launches  sync_boundaries      bytes
+       1                2               6             10              9          80,216,064
+       1               64               1             64            193          18,875,904
+       1                1               4              8              7          84,934,656
+       1               64               1             64            193          18,875,904
+```
+
+Read the two 64-entry rows before designing anything: the normalization points are **64 dispatches
+each**, not one launch, because `build_addnorm_module` caps rows per call. `coarse`'s dispatch
+numbers are therefore dominated by `addnorm`, not by the GEMMs — which is a real result about
+where the cost sits, and one the taxonomy should be able to explain.
+
+### Two things Phase E must decide first
+
+- **`[2026-08-05]` The ladder is still blocked at one point, and there are now two reasons.**
+  Everything runs at `seq = 4096` only. `build_ffn_module`'s up- and down-projections collide on
+  `f32_to_bf16_mn_<suffix>` at every other point on the ladder, and D2 found a second instance one
+  layer down: `compile_gemm_mm` names its object from the GEMM method alone (`mm_m32.o` /
+  `mm_m64.o`) while baking `tile_n` in as `-DDIM_N`, so the FFN's up-projection and the
+  o-projection write the same file and one silently gets the other's micro-kernel. D2 works around
+  the second by interleaving inside `builders/block.py`; **any caller that builds several of these
+  operators together without interleaving hits it again, silently.** One fix closes both: a
+  `(method, tile_n)`-aware symbol and object name in `llms/shared/builders/gemm_builder.py`. That
+  file was off limits to Phases C and D. Phase E needs the ladder, so it is Phase E's to make —
+  and doing so puts `make verify` over the ten shipped models inside its gate.
+- **The layer's tolerance has no headroom.** `atol` sits at the hard `1e-1` ceiling with a 1.35x
+  margin over a measured `atol_required` of 7.4e-2. The cause is output scale, not error
+  (`mean_rel_L1` is 1.7e-2, in line with the per-operator rows), but Phase E chains the same
+  arithmetic four different ways against the same oracle. If a mode needs more than that, the
+  answer is a recorded finding, not a wider tolerance — the driver rejects anything above `1e-1`.
+
+### The harness needs an E entry
+
+There is none yet: `PL_PHASES_IN_SCOPE` still reads `'["D1","D2"]'` and no dispatcher has an `E`
+arm. The `D1`/`D2` arms are the model, and [14](14-the-port-loop-harness.md) is how the driver
+works. Two notes specific to Phase E:
+
+- **Consider splitting it.** `PL_STEP_TIMEOUT` caps an implement session at three hours, and E is
+  four strategies plus shared instrumentation. Splitting paid for itself in both C and D.
+- **Its gate will need the cross-deployment regression check** if it makes the `gemm_builder.py`
+  change above, because ten shipped LLM deployments resolve against it. `gate-c4.sh` is the model
+  for a gate that runs the lit suite and then `make verify` over all ten.
 
 Two decisions taken on 2026-08-04, now reflected throughout these documents:
 
@@ -157,9 +198,11 @@ Two decisions taken on 2026-08-04, now reflected throughout these documents:
   MHA oracle's precision switch at `seq_len 16384`) are in
   [06 §The numerics standard](06-phase-c-operators.md#the-numerics-standard--do-not-port-irons).
 - **Shape coverage is a sweep, not a redesign.** The case matrix needs 108 distinct
-  projection-GEMM shapes, not the "several hundred" previously estimated — 5 were registered and
-  103 are missing. C4 builds the sweep tool and registers the 36 `baseline_768` shapes Phase D
-  needs; the other two families are a later machine-time run.
+  projection-GEMM shapes, not the "several hundred" previously estimated. C4 built the sweep tool
+  and registered the 36 `baseline_768` shapes, which is what Phases D and E run on. The other two
+  families are a later machine-time run of the same tool against a different `--family`: no code
+  change, just hardware hours. **Phase F's case matrix needs them**, so budget that run before F
+  rather than inside it.
 
 ## Load-bearing questions already answered
 
@@ -167,6 +210,9 @@ Two decisions taken on 2026-08-04, now reflected throughout these documents:
 |---|---|---|
 | Can separately-compiled ELFs share one runlist? | Yes — N ELFs, N `hw_context`s, one runlist. Bit-identical to sequential, 1.02–1.15× faster. **Not** by sharing one context; XRT rejects that three ways. | [05a](05a-phase-b-runlist-spike-result.md) |
 | How many concurrent `hw_context`s does NPU2 grant? | 32 (33 fails with `DRM_IOCTL_AMDXDNA_CREATE_HWCTX err=-2`). Phase E's `runlist` mode wants 29 — fits, with three to spare. Caveats on the margin recorded. | [08 §Risks](08-phase-e-execution-strategies.md) |
+| Does a full layer survive the real runtime path? | Yes. One `encoder_bert` layer at `baseline_768`, `seq 4096`, matches an FP32 torch oracle over its whole 4096×768 output with zero mismatches, and localizes to any of ten per-boundary intermediates. | [07b](07b-phase-d2-block-integration.md) |
+| Can the whole sequence ladder be built? | **Not yet.** `seq = 4096` is the only point where the FFN's two projections do not collide, at the symbol level *and* the object level. One `(method, tile_n)` naming fix in `llms/shared/builders/gemm_builder.py` closes both; nothing before Phase E was permitted to make it. | [08 §The ladder](08-phase-e-execution-strategies.md) |
+| Is there tolerance headroom for four modes? | Thin. The layer needs `atol` `1e-1` — the hard ceiling — at 1.35× its measured requirement. Driven by output scale, not by error. | [07b](07b-phase-d2-block-integration.md) |
 
 ## Provenance
 

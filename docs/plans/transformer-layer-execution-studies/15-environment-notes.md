@@ -80,17 +80,26 @@ and a fresh configure — then re-apply the two flags above.
 
 `[2026-08-04]` `check-programming-examples-transformer-layer` was NPU-free through Phases A and B
 — which is how Phase B's hardware claim came to be gated by nothing the driver ran. It is not
-NPU-free any more: it carries the Phase B runlist gate and every Phase C operator gate, 13 tests
-as of C4.
+NPU-free any more: it carries the Phase B runlist gate and every Phase C operator gate.
+
+`[2026-08-05]` **16 tests as of D2**, ten of them `REQUIRES: ryzen_ai_npu2`. D1 added no files but
+new shapes to six existing tests; D2 added `run_npu2_block_peano.lit`, `run_reference_tests.lit`
+and `run_block_cache_tests.lit`. The driver now refuses to accept a `needs_hardware` phase whose
+gate log does not show all of them passing with nothing unsupported or xfailed — see
+[14](14-the-port-loop-harness.md). Enrolment is path-based (`--filter "transformer_layer/"`), so a
+new `.lit` anywhere under the example joins the suite with no CMake change, and the driver's count
+follows automatically.
 
 If you want the PR-safe subset, the individual make targets are still hardware-free:
 
 ```bash
 cd programming_examples/transformer_layer
-make compile        # Peano objects and their symbol lists
-make seam-tests     # BO pooling and runlist aggregation rules
-make registry-plan  # what the sweep would measure
+make compile          # Peano objects and their symbol lists
+make seam-tests       # BO pooling and runlist aggregation rules
+make registry-plan    # what the sweep would measure
 make registry-writer-tests
+make reference-tests  # the golden model's composition, host-only  [2026-08-05]
+make block-cache-tests
 ```
 
 Everything else in that directory dispatches, and every dispatching command belongs inside
@@ -104,6 +113,12 @@ working directory, so `aircc` and `KernelCache` write their objects, `air.mlir`,
 `bf69ed69`; the nine `.o` files were the only tracked object files in the whole repository. They
 are untracked and `.gitignore`d now, but the *cause* is unchanged — anything new that runs from
 that directory will leak artifacts there too, so check `git status` before committing.
+
+`[2026-08-05]` It happened again, exactly as predicted: D2's block gate left a 6.3 MB
+`block_cache/` of ELFs and `insts.bin` in the source tree, ignored by nothing and cleaned by
+nothing. Both are fixed (`transformer_layer/.gitignore` and the `clean` target), but **a new
+artifact directory is the default outcome of adding a `KernelCache`-backed gate, not an
+exception.** If Phase E adds a cache per strategy, add each one to both places in the same commit.
 
 ## Known-stale, not yet fixed
 

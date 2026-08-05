@@ -35,8 +35,10 @@ then the narrowest useful test.
 | Operator numerics | `transformer_layer/opcheck.py --operator <op>`, one `run_npu2_<op>_peano.lit` per operator | Phase C — full-output `np.isclose` at registry `rtol`/`atol` vs an FP32 reference, zero mismatches |
 | Check discriminates | `opcheck.py --operator <op> --fault-inject input`, which must **fail** | Phase C — a vacuous check passes under injection; the driver fails the phase for it |
 | Registry coverage | Rows present in `supported_kernels.md` + `details/<Kernel>_bf16.md`, and `gemm_config()` resolving | Phase C — every case-matrix shape registered or provably dynamic |
-| Single block | Block integration test on NPU | Phase D — launch maps, layouts, external linking, BO reuse |
-| Strategy equivalence | `pytest programming_examples/transformer_layer/pattern/` | Phase E — all four modes vs the torch reference |
+| Operators at the block's width | `opcheck.py` at the `baseline_768` widths, one `run_npu2_<op>_peano.lit` each | Phase D1 — every operator right at the width the block runs, including the pre-add `addnorm` |
+| Single block | `opcheck.py --operator block`, `run_npu2_block_peano.lit` | Phase D2 — launch maps, layouts, external linking, BO reuse. Full `seq × hidden` output, zero mismatches, plus a clean per-boundary intermediate at each of ten stages |
+| The golden model's composition | `make reference-tests`, `run_reference_tests.lit` | Phase D2 — host-only, pins erf vs tanh GeLU, post-add vs pre-add residual, and QKV column order, which a numerical comparison would survive |
+| Strategy equivalence | `pytest programming_examples/transformer_layer/pattern/` | Phase E — all four modes vs the shared FP32 reference |
 | Strategy distinguishability | Dispatch vector per mode | Phase E — the vectors separate the modes as predicted |
 | Harness plumbing | `unattended_reboot smoke-test` | Phase F — plot/regeneration path only, measures nothing |
 | End-to-end setup | `unattended_reboot execution-smoke-test` | Phase F — **≥1 row with `run_status=passed` per measurement CSV** |
@@ -64,7 +66,15 @@ Phase B modifies `programming_examples/llms/shared/infra/cache.py`. Phase C may 
 `shared/builders/`. Phase A may extend `matrix_multiplication/bf16_in_fp32_out/mm_aie2p.cc`.
 Goal 2 hoists builders into `shared/`.
 
-All four touch shared infrastructure that the ten shipped LLM deployments depend on. The rule
+`[2026-08-05]` **Phase E almost certainly joins them.** Phases C and D were both forbidden from
+touching `llms/shared/builders/gemm_builder.py`, and both hit the same consequence: its symbol and
+object names are minted from the GEMM method alone, ignoring `tile_n`, so two same-method GEMMs at
+different `tile_n` collide — at the symbol level in `stitch_elf`, and at the object level in
+`compile_gemm_mm`, which is the same bug reached twice. It confines the whole study to
+`seq = 4096`. Phase E needs the sequence ladder, so it is the phase that has to make the change,
+and its gate has to carry this rule.
+
+All of these touch shared infrastructure that the ten shipped LLM deployments depend on. The rule
 from `deploy-new-llm` applies: **after any shared-infrastructure change, re-run `make verify` on
 every sibling model**, serialized under `flock`.
 

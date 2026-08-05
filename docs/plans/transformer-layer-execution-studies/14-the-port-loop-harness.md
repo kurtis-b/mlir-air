@@ -46,6 +46,22 @@ single-phase form asked one session for hardware bring-up on six operators *and*
 integration. Their objective checks layer a `baseline_768` coverage clause (D1) and full-layer
 scope plus per-boundary stage assertions (D2) on top of `phase_c_operator_check`.
 
+**Phase E has no entry yet.** `PL_PHASES_IN_SCOPE` still reads `'["D1","D2"]'` and no dispatcher
+has an `E` arm. Three things to settle when adding one:
+
+- **Split it.** Four strategies plus shared instrumentation does not fit one three-hour session.
+  Both prior splits paid for themselves.
+- **Its gate probably needs `make verify` over the ten shipped models**, because Phase E is the
+  phase that has to change `llms/shared/builders/gemm_builder.py` to unblock the sequence ladder.
+  `gate-c4.sh` is the model for a two-leg gate, and the allowlist has to widen past
+  `^programming_examples/transformer_layer/` to match.
+- **Its objective check has a natural shape already.** `phase_c_operator_check` is parameterized by
+  operator name and the block is just another operator to it; what E adds is *distinguishability*,
+  which is a driver-side assertion over the recorded dispatch vectors — that the four modes'
+  vectors differ from each other in the directions the taxonomy predicts. That is checkable from
+  the artifacts without trusting a word the session writes, which is exactly the property the
+  objective check is for.
+
 ### A sixth lesson: a coverage clause is not a correctness clause
 
 Writing D's checks reproduced the harness's own recurring mistake in a new place, and an

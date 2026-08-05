@@ -3,6 +3,24 @@
 A short phase with one purpose: prove that one complete transformer layer works through the real
 runtime path before four execution strategies are built on top of it.
 
+> **`[2026-08-05]` Done.** D1 in 11 minutes, D2 in 156, 21 of 40 invocations. One `encoder_bert`
+> layer at `baseline_768`, `seq = 4096`, matches an FP32 torch oracle over its whole 4096×768
+> output with zero mismatches and localizes to any of ten per-boundary intermediates.
+>
+> What it changed for the phases after it, in one place:
+>
+> - **The pre-add `addnorm` existed only as a kernel object.** No builder exposed it and nothing had
+>   dispatched it; D1 built it. Below, this document says the validated operator computes the wrong
+>   function for `encoder_bert` — that was correct, and it is now fixed.
+> - **The `tile_n` collision has a second instance**, in `compile_gemm_mm`'s object naming rather
+>   than `stitch_elf`'s symbols. One `(method, tile_n)` fix in `llms/shared/builders/gemm_builder.py`
+>   closes both and unblocks the sequence ladder. See [08](08-phase-e-execution-strategies.md).
+> - **Two claims in [07b](07b-phase-d2-block-integration.md) were falsified by the work** and are
+>   corrected there: `opcheck.py` did need to change, and each normalization point is 64 dispatches
+>   rather than one launch.
+> - **The layer's `atol` is at the `1e-1` ceiling** with 1.35× margin. Phase E chains the same
+>   arithmetic four ways against the same oracle.
+
 **This document is the overview. It is not any session's specification.** Phase D runs as two
 sub-phases, each with its own spec, gate and objective check:
 
