@@ -39,6 +39,19 @@ re-sourcing anything — `utils/env_setup.sh` is not idempotent and re-sourcing 
 Work through your phase document's work items. Commit as you go with clear messages; the driver
 snapshots around you and a granular history is what makes your work reviewable and revertable.
 
+Document what you build **in the example's own `README.md`**, next to the code, as you go: what
+each new module is for, and every footgun you hit that the next reader would otherwise hit too.
+Write down the things that cost you time — a flag that must be a `-D` rather than a `#define`, a
+kernel whose objects cannot co-link, a reference that is not a valid oracle for the kernel it
+looks like it matches. Those are the parts nobody can reconstruct from the diff.
+
+Do **not** update the plan's status board in
+`docs/plans/transformer-layer-execution-studies/README.md`. The driver writes that row itself from
+what it measured, and it cannot be known while you are running: your wall time and your outcome
+are decided by three review rounds, the gate and the objective check, all of which happen after
+you finish. If you find a plan document that is now *wrong* — a claim your work falsified, not a
+status — say so in `work_not_completed` rather than quietly editing around it.
+
 When you are done — or blocked — return the structured report. Be accurate about
 `work_not_completed`; the driver cross-checks it against the gate result, and an honest partial
 report is far more useful than an optimistic one.

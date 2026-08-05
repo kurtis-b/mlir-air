@@ -69,6 +69,8 @@ log_error() { printf '[%s] ERROR: %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
 . "${PL_LIB}/lib-claude.sh"
 # shellcheck source=agents/scripts/port-loop/lib-codex.sh
 . "${PL_LIB}/lib-codex.sh"
+# shellcheck source=agents/scripts/port-loop/lib-docs.sh
+. "${PL_LIB}/lib-docs.sh"
 # shellcheck source=agents/scripts/port-loop/phases.sh
 . "${PL_LIB}/phases.sh"
 
@@ -325,6 +327,12 @@ run_phase() {
   log_info "EVENT: phase-complete ${phase} — gate, objective and tamper checks all passed"
   state_log "phase_complete" "phase ${phase} passed gate, objective and tamper checks"
   timing_end "${phase}" "passed" "${phase_epoch}"
+
+  # The status board, from what the driver measured. Deliberately after the tamper and destructive
+  # checks (so the driver's own edit is never in the diff they inspect) and committed immediately
+  # (pl_preflight refuses to start the next phase on a dirty tracked worktree).
+  docs_update_status_board "${phase}" "$(( ($(date +%s) - phase_epoch) / 60 ))" "passed"
+  docs_commit_status_board "${phase}"
   log_info "=== Phase ${phase} COMPLETE ==="
   return 0
 }
