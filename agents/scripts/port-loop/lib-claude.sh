@@ -29,8 +29,12 @@
 # The discriminator is that the session did NOTHING. `total_cost_usd == 0` means no tokens were
 # billed, so nothing can have been written. Any session that spent budget produced a real outcome
 # -- success or failure -- and is reported as one.
-PL_API_RETRIES="${PL_API_RETRIES:-5}"
+# Patience is sized for a provider INCIDENT, not a blip. On 2026-08-05 a 529 outage outlasted six
+# attempts over 33 minutes; 10 retries with the backoff capped at 10 minutes rides out about 90
+# minutes, and the wall-clock deadline bounds it beyond that.
+PL_API_RETRIES="${PL_API_RETRIES:-10}"
 PL_API_RETRY_DELAY="${PL_API_RETRY_DELAY:-60}"
+PL_API_RETRY_MAX_DELAY="${PL_API_RETRY_MAX_DELAY:-600}"
 
 pl_result_is_transient() {
   local out="$1" cost result
@@ -59,11 +63,19 @@ pl_claude_run() {
     return 0
   fi
 
-  local attempt=1 rc=0
+  local attempt=1 rc=0 counted=no
   while : ; do
-    # Counted per attempt, so a retry storm still runs into the invocation cap and the deadline
-    # rather than spinning quietly.
-    state_count_invocation || return 1
+    # The invocation is counted ONCE, not per attempt. An attempt that never reached the model
+    # did no agent work, and charging it against the cap means a provider incident can exhaust a
+    # run's budget while it stands still -- which is exactly what happened on 2026-08-05, nine
+    # attempts and zero tokens. The deadline is the right bound on waiting and is checked every
+    # time round.
+    if [ "${counted}" = "no" ]; then
+      state_count_invocation || return 1
+      counted=yes
+    else
+      state_check_deadline || return 1
+    fi
 
     log_info "claude session '${label}' (timeout ${PL_STEP_TIMEOUT}s, budget \$${PL_STEP_BUDGET}, attempt ${attempt})"
 
@@ -94,6 +106,7 @@ pl_claude_run() {
        && [ "$(jq -r '.is_error // false' "${out}" 2>/dev/null || echo true)" = "true" ] \
        && pl_result_is_transient "${out}"; then
       local delay=$(( PL_API_RETRY_DELAY * attempt ))
+      [ "${delay}" -gt "${PL_API_RETRY_MAX_DELAY}" ] && delay="${PL_API_RETRY_MAX_DELAY}"
       log_warn "transient API failure on '${label}', attempt ${attempt}/${PL_API_RETRIES}:"
       log_warn "  $(jq -r '.result // ""' "${out}" 2>/dev/null | head -1)"
       log_warn "  no budget was spent, so no work was done; retrying in ${delay}s"

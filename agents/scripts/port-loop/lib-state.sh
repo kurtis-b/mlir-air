@@ -70,9 +70,27 @@ state_log() {
     '.history += [{ts: $t, phase: (.phases[.phase_index] // "none"), step: .step, round: .round, event: $e, detail: $d}]'
 }
 
+# A halt records WHERE it halted, so `resume` picks up there.
+#
+# It did not, and the consequence was severe enough to be worth spelling out: with .resume_phase
+# null, run_phase computes resume_from = 0 and re-runs the phase from its implement session --
+# throwing away completed, committed work and burning a fresh 3-hour session to redo it. Worse, at
+# resume_from = 0 it also re-derives _START_SHA from the CURRENT HEAD, so the review diff and the
+# gate-file fingerprint baseline are both taken from a tree that already contains the halted
+# attempt's commits. The reviews would see an empty diff and the tamper check would be vacuous --
+# the same class of defect as the working-tree fingerprint baseline in lib-guard.sh.
+#
+# The halt message tells the operator to run `resume`, so that instruction has to be the correct
+# one. D1 halted at round 3 during a provider outage on 2026-08-05 and would have restarted from
+# nothing.
 state_halt() {
   local reason="$1"
-  state_set --arg r "${reason}" '.status = "halted" | .halt_reason = $r'
+  state_set --arg r "${reason}" '
+      .status = "halted"
+    | .halt_reason = $r
+    | .resume_phase = (.phases[.phase_index] // null)
+    | .resume_step  = .step
+    | .resume_round = (if (.round // 0) < 1 then 1 else .round end)'
   state_log "halt" "${reason}"
   log_error "EVENT: halted — ${reason}"
 }
@@ -86,13 +104,24 @@ state_done() {
 # Count an agent invocation and enforce the caps. Returns 1 when a cap is hit.
 state_count_invocation() {
   state_set '.invocations += 1'
-  local n max now deadline
+  local n max
   n="$(state_get '.invocations')"
   max="$(state_get '.max_invocations')"
   if [ "${n}" -gt "${max}" ]; then
     state_halt "invocation cap reached (${n} > ${max})"
     return 1
   fi
+  state_check_deadline
+}
+
+# The wall-clock half of state_count_invocation, separately callable.
+#
+# A retry that never reached the model did no agent work, so it must not spend the invocation
+# budget -- during a provider incident on 2026-08-05 nine attempts were burned against the cap
+# without a single token being billed, which is a run running out of budget while standing still.
+# The deadline is the right bound on waiting, and it still applies to every attempt.
+state_check_deadline() {
+  local now deadline
   now="$(date +%s)"
   deadline="$(state_get '.deadline_epoch')"
   if [ "${now}" -gt "${deadline}" ]; then
