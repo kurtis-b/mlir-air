@@ -98,10 +98,22 @@ from builders.mha_out_proj import (  # noqa: E402
     mha_out_proj_device_inputs,
     mha_out_proj_reference,
 )
+from builders.block import (  # noqa: E402
+    BLOCK_BOUNDARIES,
+    BLOCK_INPUT_NAMES,
+    block_config,
+    compile_block_artifacts,
+    describe_block,
+    run_block,
+)
 from builders.qkv_proj import (  # noqa: E402
     build_qkv_proj_module,
     qkv_gemm_spec,
     qkv_proj_reference,
+)
+from pattern.reference import (  # noqa: E402
+    fuse_qkv_weight,
+    generate_golden_reference,
 )
 
 # ---------------------------------------------------------------------------
@@ -428,6 +440,182 @@ def _spec_digest(spec):
         "tile_k_l2": spec["tile_k_l2"],
         "tile_k_l1": spec["tile_k_l1"],
         "tile_n": spec["tile_n"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# The whole encoder_bert layer (D2)
+#
+# WHY THIS ONE OWNS ITS OWN DISPATCH
+#     Four ELFs over four `KernelCache.run_sequence` calls, not one module: see
+#     `builders/block.py` on why the layer cannot be a single sequence, and
+#     `opcheck.py`'s module docstring on what the `dispatch` seam does and does
+#     not change. Everything that makes this a check -- reference from the clean
+#     inputs, injection after it, `_RecordingRunner`'s verdict at RTOL and this
+#     spec's `atol`, zero permitted mismatches -- is untouched.
+#
+# THE DATA IS THE GOLDEN MODEL'S, NOT A SCALE CHOSEN HERE
+#     Every other operator above scales its operands to where the registry's
+#     GEMM sweep measured them, because a standalone operator has no other
+#     defensible scale. A whole layer does: `pattern/reference.py` draws exactly
+#     what iron's `generate_golden_reference` draws, in the same order, at
+#     `val_range = 0.05`. That is a much SMALLER scale than the registry's, and
+#     it has a consequence worth knowing before reading the stage errors:
+#     attention scores land around 5e-3, so the softmax is nearly uniform, the
+#     attention output is an average of V, and `attn_out` comes out around 1e-3
+#     against a residual `x` around 5e-2. The attention half therefore
+#     contributes a few percent of what the first LayerNorm sees.
+#
+# WHY THE FAULT GOES INTO ln1_weight, MEASURED AND NOT ASSUMED
+#     The consequence above is exactly the trap the phase document warns about,
+#     and it is worse than "damped": measured on this golden model at
+#     512x768x3072, 12 heads, with the shared FAULT_DELTA of 2.0, perturbing one
+#     element of `w_o` or of the fused QKV weight moves the layer output by
+#     3.1e-2 and puts ZERO elements outside the tolerance band. A negative
+#     control injected there would PASS under injection and prove nothing.
+#
+#     The same measurement over every candidate input:
+#
+#         w_o[0,0]        max|d| 3.1e-2      0 elements outside the band
+#         w_qkv[0,0]      max|d| 3.1e-2      0
+#         w_up[0,0]       max|d| 1.6e-1     49
+#         w_down[0,0]     max|d| 1.3e+0    213
+#         x[0,0]          max|d| 3.1e+0    491
+#         ln2_weight[0]   max|d| 5.9e+0    488
+#         ln1_weight[0]   max|d| 1.5e+0  36855
+#
+#     `ln1_weight` wins on the axis that matters, which is not the largest
+#     single deviation but how much of the output moves: it scales one column of
+#     `hidden`, and `hidden` is BOTH the FFN's input and the second addnorm's
+#     residual, so the perturbation reaches 9% of the output through two
+#     independent paths. Nothing averages the weight itself -- the normalization
+#     that would is upstream of the multiply. `ln2_weight` is the same shape of
+#     argument one stage later and moves 1.3% of the output; it is the fallback
+#     if this one ever stops discriminating.
+#
+# THE STAGE TOLERANCES ARE PER BOUNDARY AND MEASURED
+#     A single `atol` across ten boundaries would mean nothing: they span three
+#     orders of magnitude, from `attn_out` at 1e-3 to `output` at 4. Each entry
+#     in BLOCK_STAGE_ATOL is that boundary's measured `atol_required` rounded up,
+#     the same methodology `kernel_registry` uses, and each is recorded in the
+#     results artifact beside the statistics it was checked at.
+# ---------------------------------------------------------------------------
+
+# Per-boundary `atol` for the block's stage comparisons. `rtol` is RTOL for all
+# of them, as everywhere else. Sized from the measured worst case at
+# 4096x768x3072; see the block section of the README for the numbers and what
+# each boundary's error is dominated by.
+BLOCK_STAGE_ATOL = {
+    "q": 5e-3,
+    "k": 5e-3,
+    "v": 5e-3,
+    "attn_context": 1e-3,
+    "attn_out": 1e-3,
+    "hidden": 5e-2,
+    "ffn_up": 5e-2,
+    "ffn_gelu": 5e-2,
+    "ffn_out": 5e-2,
+    "output": 1e-1,
+}
+
+# Where the four block ELFs are cached, relative to the working directory. It
+# sits under the working directory rather than beside opcheck.py so `make
+# clean` takes it with the rest of the build, and so a clean and a
+# fault-injected run of the same shape share it: compilation depends on the
+# shape and not on the data, and rebuilding four ELFs to perturb one weight
+# would double the gate's hardware time for nothing.
+BLOCK_CACHE_DIR = "block_cache"
+
+
+def _prepare_block(shape, seed=42):
+    """One whole ``encoder_bert`` layer against the golden model.
+
+    Compiles and dispatches inside the returned ``dispatch`` callable's closure
+    rather than here, so the injection -- which ``opcheck.py`` applies to
+    ``inputs`` after this function has returned -- reaches the device buffers.
+    """
+    seq_len, emb_dim = shape["seq_len"], shape["emb_dim"]
+    ffn_dim, num_heads = shape["ffn_dim"], shape["num_heads"]
+    head_dim = shape["head_dim"]
+
+    cfg = block_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim)
+    describe_block(cfg)
+
+    golden = generate_golden_reference(
+        seq_len, emb_dim, ffn_dim, num_heads, seed=seed, workload_variant="encoder_bert"
+    )
+    weights = golden["weights"]
+    reference = golden["boundaries"]
+    # The order is BLOCK_INPUT_NAMES; `inject` below indexes into it.
+    inputs = [
+        golden["input"],
+        fuse_qkv_weight(weights),
+        weights["attn_output_weight"],
+        weights["ln1_weight"],
+        weights["ffn_up_weight"],
+        weights["ffn_down_weight"],
+        weights["ln2_weight"],
+    ]
+
+    from shared.infra.cache import KernelCache, Profiler
+
+    cache = KernelCache(
+        cache_dir=BLOCK_CACHE_DIR, verbose=False, profiler=Profiler(enabled=False)
+    )
+    compile_block_artifacts(cache, cfg, run_only=True)
+
+    def dispatch(device_inputs, stage_stats):
+        boundaries, vector_rows = run_block(cache, cfg, device_inputs)
+        stages = []
+        for name in BLOCK_BOUNDARIES:
+            atol = BLOCK_STAGE_ATOL[name]
+            stats = stage_stats(boundaries[name], reference[name], atol=atol)
+            stages.append(dict(stats, name=name, atol=atol))
+            print(
+                f"  [stage] {name:13s} {stats['n_elements']:>9d} elements  "
+                f"mismatch {stats['n_mismatch']:>7d}  "
+                f"mean_rel_L1 {stats['mean_rel_L1']:.3e}  "
+                f"atol_required {stats['atol_required']:.3e} (atol {atol:.1e})"
+            )
+        clean = sum(1 for s in stages if s["n_mismatch"] == 0)
+        print(f"[block] stages: {clean}/{len(stages)} clean")
+        return [boundaries["output"]], {
+            "stages": stages,
+            "stages_passed": clean == len(stages),
+            "dispatch_vectors": vector_rows,
+        }
+
+    return {
+        "inputs": inputs,
+        "expected": [reference["output"]],
+        # ln1_weight, index 3. See the section header for the measurement that
+        # rules out every attention-side target.
+        "inject": (BLOCK_INPUT_NAMES.index("ln1_weight"), (0,)),
+        "dispatch": dispatch,
+        "record_extra": {
+            "variant": "encoder_bert",
+            "causal": False,
+            "golden_seed": seed,
+            "gemm_spec_source": cfg["qkv_source"],
+            "gemm_spec_qkv": _spec_digest(cfg["qkv_spec"]),
+            "gemm_spec_ffn_up": _spec_digest(cfg["ffn_up_spec"]),
+            "gemm_spec_ffn_down": _spec_digest(cfg["ffn_down_spec"]),
+            "gemm_spec_o_proj": _spec_digest(cfg["o_proj_spec"]),
+            "addnorm_rows": cfg["norm_rows"],
+            "addnorm_dispatches": cfg["norm_blocks"],
+            "attention_config": {
+                key: cfg["attn_cfg"][key]
+                for key in (
+                    "parallel_seq",
+                    "parallel_heads",
+                    "kv_seq_tile",
+                    "q_seq_tile",
+                    "num_q_tiles",
+                    "cascade_stages",
+                    "gqa_group_size",
+                )
+            },
+        },
     }
 
 
@@ -783,5 +971,36 @@ SPECS = [
         # least.
         "atol": 2.5e-2,
         "prepare": _prepare_mha_out_proj,
+    },
+    {
+        # PHASE D2: the whole encoder_bert layer, at the one configuration the
+        # phase forces. `seq_len 4096` because that is the only point on the
+        # ladder where `build_ffn_module` builds at hidden 768 (see the ffn row
+        # above); `baseline_768` because it is the only family whose GEMMs
+        # resolve; non-causal because encoder_bert is bidirectional.
+        #
+        # This shape is not a wider version of the rows above -- it is the first
+        # thing here that runs several operators against EACH OTHER, with q, k
+        # and v produced by one artifact and consumed by the next without
+        # touching the host. What it can catch that D1 could not is a layout
+        # transition, an argument map, an external-kernel collision across a
+        # multi-operator sequence, or BO reuse under the Phase B allocator.
+        "operator": "block",
+        "shape_key": "4096x768_encoder_bert",
+        "shape": {
+            "seq_len": 4096,
+            "emb_dim": 768,
+            "ffn_dim": 3072,
+            "num_heads": 12,
+            "head_dim": 64,
+        },
+        # Measured over the 3145728 elements of the layer output. See the block
+        # section of the README for the per-boundary breakdown and for which
+        # stage each term comes from; the headline is that the final LayerNorm
+        # renormalizes to roughly unit scale, which is the only reason a chain
+        # of eight GEMMs, two LayerNorms and a softmax fits under a hard 1e-1
+        # ceiling at all.
+        "atol": 5e-2,
+        "prepare": _prepare_block,
     },
 ]

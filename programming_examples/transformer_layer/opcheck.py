@@ -50,6 +50,31 @@ WHY THE COMPARISON IS NOT WRITTEN HERE
     comparison written here would be a second thing to get wrong, and the
     registry's numbers would stop being comparable with every other kernel's.
 
+THE ONE OPERATOR THAT OWNS ITS OWN DISPATCH
+    ``run_test`` takes ONE ``air.ir.Module`` and runs it as one artifact, which
+    is every operator in Phase C. The Phase D2 ``block`` is not: it is four ELFs
+    dispatched as four ``KernelCache.run_sequence`` calls, because ``addnorm``
+    caps at 104 rows at width 768 (three L3->L1 streams against two shim MM2S
+    channels; see ``builders/addnorm.py``) and the layer's two normalization
+    points therefore have to be row-blocked into 64 dispatches each. There is no
+    single module to hand ``run_test``.
+
+    So a spec may return a ``dispatch`` callable instead of a ``module``:
+
+        dispatch(inputs, stage_stats) -> (actual_outputs, record_extra)
+
+    Everything that makes this a check rather than a self-report is UNCHANGED by
+    that seam. The reference is still computed in the catalogue from the clean
+    inputs before any injection; the injection still perturbs the list handed to
+    ``dispatch``, after the reference exists; the verdict is still
+    ``_RecordingRunner._check_outputs`` at the same ``RTOL`` and the spec's
+    ``atol`` with zero permitted mismatches; the results artifact is still
+    written by ``_write_result``. What the seam replaces is only WHO CALLS THE
+    HARDWARE. ``stage_stats`` is handed in rather than imported so a
+    multi-artifact operator's per-boundary comparison is the same code as its
+    verdict -- passing it as an argument is also what keeps the catalogue from
+    importing this module and closing a cycle.
+
 WHY THE NEGATIVE CONTROL EXISTS
     Every value in a results file is produced by code in this repository, so a
     driver that trusted ``passed`` would be trusting the thing under test. Fault
@@ -179,6 +204,42 @@ class _RecordingRunner(XRTRunner):
         )
 
 
+def stage_stats(actual, expected, rtol=RTOL, atol=0.0):
+    """The verdict's own comparison, applied to one intermediate boundary.
+
+    Handed to a spec's ``dispatch`` callable so that a multi-artifact operator's
+    per-boundary evidence is produced by the SAME code as its verdict --
+    ``_RecordingRunner._check_outputs``, hence ``np.isclose`` at the same
+    ``rtol``, hence an ``n_mismatch`` that agrees with ``passed`` by construction
+    rather than by assertion. A second comparison written for the intermediates
+    could disagree with the one that decides the run, and the whole point of
+    capturing them is to localize a disagreement.
+
+    Returns the statistics dict ``_RecordingRunner`` records, plus ``passed``.
+
+    A boundary whose reference is deliberately f32 (an operator's INTERIOR
+    staging, which the reference does not round) is upcast rather than
+    downcast: ``np.isclose`` on a bf16 actual against an f32 expected leaves the
+    common type to numpy, and rounding the reference down to meet the device
+    would hide exactly the staging error the check exists to measure.
+    """
+    expected = np.asarray(expected)
+    actual = np.asarray(actual)
+    if expected.dtype == np.float32 and actual.dtype != np.float32:
+        actual = actual.astype(np.float32)
+    runner = _RecordingRunner()
+    passed = bool(
+        runner._check_outputs(
+            actual_outputs=[actual],
+            expected_outputs=[expected],
+            rtol=rtol,
+            atol=atol,
+            max_mismatch_percentage=0,
+        )
+    )
+    return dict(runner.stats, passed=passed)
+
+
 def _inject(inputs, where, delta=FAULT_DELTA):
     """Perturb one element of one DEVICE input, in place on a copy.
 
@@ -264,17 +325,47 @@ def run_spec(spec, fault_inject=None, verbose=False):
     # _RecordingRunner's.
     runner_kwargs.update(prepared.get("runner_kwargs", {}))
     runner = _RecordingRunner(**runner_kwargs)
-    return_code = runner.run_test(
-        prepared["module"],
-        inputs=inputs,
-        expected_outputs=prepared["expected"],
-        rtol=RTOL,
-        atol=spec["atol"],
-    )
-    passed = return_code == 0
-    record = _write_result(
-        spec, runner.stats, passed, fault_inject, extra=prepared.get("record_extra")
-    )
+    extra = dict(prepared.get("record_extra") or {})
+
+    dispatch = prepared.get("dispatch")
+    if dispatch is not None:
+        # A multi-artifact operator: it calls the hardware itself and hands back
+        # the outputs to compare. See the module docstring on what this seam
+        # does and does not change.
+        actual_outputs, dispatch_extra = dispatch(inputs, stage_stats)
+        extra.update(dispatch_extra or {})
+        passed = bool(
+            runner._check_outputs(
+                actual_outputs=actual_outputs,
+                expected_outputs=prepared["expected"],
+                rtol=RTOL,
+                atol=spec["atol"],
+                max_mismatch_percentage=0,
+            )
+        )
+        print("PASS!" if passed else "failed.")
+        # A multi-boundary operator's verdict is the CONJUNCTION of its
+        # end-to-end comparison and every boundary comparison it recorded. This
+        # can only make the verdict stricter: `stages_passed` is absent for
+        # every operator that records no stages, and an operator that records
+        # them has already had each one checked by `stage_stats`, at the same
+        # rtol and with zero permitted mismatches. Without it a layer that ends
+        # in a LayerNorm could report `passed` while carrying a stage the
+        # comparison rejected -- which is the exact failure the stages exist to
+        # surface.
+        if not extra.get("stages_passed", True):
+            print("failed: a per-boundary comparison rejected the run.")
+            passed = False
+    else:
+        return_code = runner.run_test(
+            prepared["module"],
+            inputs=inputs,
+            expected_outputs=prepared["expected"],
+            rtol=RTOL,
+            atol=spec["atol"],
+        )
+        passed = return_code == 0
+    record = _write_result(spec, runner.stats, passed, fault_inject, extra=extra)
 
     verdict = "PASS" if passed else "FAIL"
     print(f"[opcheck] {label}: {verdict}")
