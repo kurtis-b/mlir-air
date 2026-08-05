@@ -87,7 +87,9 @@ memory bank) all produce plausible wrong numbers rather than errors.
 | `run_npu2_compile_peano.lit` | Phase A's compile-only gate. Peano, no NPU |
 | `run_seam_tests.lit` | Phase B's host-only rules tests. No NPU, no XRT |
 | `run_npu2_runlist_gate.lit` | Phase B's hardware gate: the four runlist legs on a real NPU |
-| `opcheck.py` | Phase C's numerical check: the CLI, the results artifact, and the fault-injection negative control |
+| `opcheck.py` | Phase C's numerical check: the CLI, the results artifact, and the fault-injection negative control. What counts as EVIDENCE |
+| `opcheck_prepare.py` | HOW each operator is built and fed: one `prepare_<operator>` each, plus every per-operator footgun |
+| `opcheck_specs.py` | WHICH `(operator, shape)` the port claims and at what `atol`, with the measurement behind every tolerance |
 | `builders/elementwise_add.py` | 2-D element-wise add and the `causal_mask=` keyword over it, plus their FP32 reference |
 | `builders/layer_norm.py` | Multi-row LayerNorm over `layer_norm_rows`, plus its two-pass FP32 reference |
 | `builders/addnorm.py` | Weighted LayerNorm and a residual in **either order** (`pre_add=`), weight as a runtime argument, plus one FP32 reference per ordering |
@@ -111,9 +113,12 @@ memory bank) all produce plausible wrong numbers rather than errors.
 | `sweep/sweep_measure.py` | One candidate end to end — build, numerical check, timing. The process the sweep forks |
 | `sweep/registry_writer.py` | The append-only write into the registry JSON and both markdown pages |
 | `sweep/registry_sweep.py` | Orchestration: turbo gate, resume, checkpointing, winner selection, the CLI |
+| `sweep/sweep_report.py` | Downstream of a finished sweep: the resolution assertion and the family markdown |
 | `sweep/test_registry_writer.py` | What the writer will and will not do to an existing shape, against a temporary registry |
+| `sweep/test_sweep_families.py` | That the sweep's duplicated method table still agrees with `gemm_builder`'s, and that no two `tile_n` it may plan share an object |
 | `sweep/run_npu2_registry_resolution.lit` | Every `baseline_768` shape resolves through the builder that owns it. No NPU |
 | `sweep/run_sweep_writer_tests.lit` | The writer's append-only guards. No NPU |
+| `sweep/run_sweep_families_tests.lit` | The duplicated method table and the per-`tile_n` object naming. No NPU |
 
 There are two compiled objects, not six: `encoder.cc` and `addnorm_ffn.cc` are
 the only translation units, and each `#include`s its two siblings the way
@@ -161,6 +166,19 @@ lands, and `builders/` holds the operators themselves — one
 `build_<name>_module()` function per operator with its FP32 reference beside it,
 no operator class and no `op.py`/`design.py` pair.
 
+The check is three modules, each knowing one thing, because together they passed
+porting convention 5's ~800-line cap twice:
+
+| module | knows |
+|---|---|
+| `opcheck.py` | what counts as EVIDENCE — the recording runner, the injection, the results artifact, the negative-control verdict, the CLI |
+| `opcheck_prepare.py` | HOW each operator is built and fed — one `prepare_<operator>` each |
+| `opcheck_specs.py` | WHICH `(operator, shape)` is claimed, and at what `atol` |
+
+Adding a shape touches only the catalogue. Adding an operator touches the
+catalogue and the preparers. Changing what counts as evidence touches only
+`opcheck.py`.
+
 ```bash
 make opcheck-list                 # every (operator, shape) claimed, as JSON. No NPU.
 flock -x -w 1800 /tmp/mlir-air-npu.lock make check-layer-norm PEANO_INSTALL_DIR=$PEANO_INSTALL_DIR
@@ -192,6 +210,13 @@ to the fingerprint, to the tamper check and to every review diff. Adding a shape
 means adding it to `SPECS` in `opcheck_specs.py` *and* adding its `CHECK` line to
 that operator's `.lit`; a results file on its own is not evidence.
 
+**And a newly added shape usually needs an injection of its own.** The shared
+`check-fault-control` injects one operator, because the machinery is shared; the
+driver injects each operator's *first* declared shape. Neither reaches a row
+appended later, so the newest row in the file — the one whose PASS is least
+earned, since nothing yet shows the comparison can reject it — is the one nobody
+perturbs. `check-ffn-ladder-fault` is the seq-64 point's, and the pattern to copy.
+
 ### The `baseline_768` set (Phase D1)
 
 Phase C brought each operator up at whatever width was cheapest. The block runs
@@ -211,9 +236,16 @@ an operator nobody had run at that width:
 
 `rtol` is `1.6e-2` for all of them, as everywhere in the registry, and every
 `atol` is inside the hard `1e-1` ceiling. The three GEMM-backed rows are pinned
-to `seq_len = 4096` because that is where the block runs — and for `ffn` because
-it is [the only point that builds at all](#things-that-will-bite-you) at hidden
-768. The three row-parallel ones are not pinned, because their builders derive
+to `seq_len = 4096` because that is where the block runs. For `ffn` there was
+also no choice until Phase E1: 4096 was
+[the only point that built at all](#things-that-will-bite-you) at hidden 768.
+`ffn` now carries a second ladder point at `seq = 64` — `mean_rel_L1` 1.561e-2,
+`atol_required` 1.150e-3, the same 5e-3 `atol` at a 4.3× margin — where both
+projections resolve to `drain` at `tile_n` 128 and 96, the pairing that used to
+fail to parse. It runs both GEMMs at herd 2×4 rather than the file-level 8×4,
+because at `M = 64` drain's forced `tile_m = 32` admits at most `herd_m = 2` and
+`resolve_gemm_spec` reads the herd off the registry row.
+The three row-parallel ones are not pinned, because their builders derive
 the legal row count; they run at 4096 rows anyway, except `addnorm`, whose L1
 budget caps it (see below).
 
@@ -366,6 +398,15 @@ headers are version state shared with the rest of the repository. After a
 toolchain bump the cache is stale and nothing here will say so; `make clean` is
 what invalidates it. `make block-cache-tests` pins both directions of the rule.
 
+It also cannot see a change in the ORDER things are compiled in, which is not a
+gap in the digest so much as a consequence of covering the right things: E1 moved
+the external-object compiles from interleaved-per-artifact to all-then-all, and
+every input to the fingerprint was unchanged, so all four ELFs would have been
+reused and the run would have proved nothing. Deleting `block_cache/` is what
+makes an ordering change testable, and the evidence is that every stage figure
+comes back byte-identical — `ffn_up` above all, since that is the boundary the
+interleaving existed to protect.
+
 ## The registry sweep
 
 The three GEMM-backed operators above take their tile sizes and method from
@@ -377,9 +418,19 @@ bugs. `sweep/` is the tool that makes a shape resolvable.
 make registry-plan                # every (shape, candidate) it would measure. No NPU.
 make registry-resolution          # every shape resolves. No NPU; this is the lit test.
 make registry-writer-tests        # the writer's append-only guards. No NPU.
+make sweep-families-tests         # the duplicated method table has not drifted. No NPU.
 flock -x -w 1800 /tmp/mlir-air-npu.lock make registry-sweep
 make registry-write               # fold the results into the registry. No NPU.
 ```
+
+`sweep/` is five modules for the same ~800-line reason `opcheck` is three:
+`sweep_families.py` says which shapes and candidates exist, `sweep_measure.py` is
+one candidate end to end (the process the orchestrator forks), `registry_sweep.py`
+is the orchestrator and the CLI, `sweep_report.py` is everything downstream of a
+finished sweep — the resolution assertion and the family markdown — and
+`registry_writer.py` owns the append-only JSON write. `sweep_report` imports two
+functions from `registry_sweep`, so `registry_sweep` imports it inside `main()`;
+the dependency has a direction and the CLI is the only place that needs both.
 
 Per `(shape, candidate)` it builds the configuration, checks it through the same
 `opcheck.py` comparison every operator here is gated on, times it, and keeps the
@@ -444,43 +495,47 @@ absent — a presence check alone would not notice `build_addnorm=False` silentl
 ceasing to work, and the result would break only at link time in whichever
 design happened to combine them.
 
-**Two GEMMs of the same method but different `tile_n` cannot share an ELF.**
-`mm_m32.o` / `mm_m64.o` are compiled with one `-DDIM_N`, and the symbols they
-export are typed by it, so a stitched module holding two same-method GEMMs whose
-registry rows chose different `tile_n` declares `f32_to_bf16_mn_<suffix>` twice
-with different memref types: `redefinition of symbol named ...` out of
-`stitch_elf`'s parse. Every shipped model shape lands on `tile_n = 128`, which
-is why nothing hit this before; the study's FFN does not, because `N = 768`
-cannot use `tile_n = 128` at `herd_n = 4` (`768 % 512 != 0`) and settles on 96
-against the up-projection's 128. **`build_ffn_module` therefore does not build
-at any `baseline_768` point except `seq = 4096`**, where the registry happens to
-put them on different methods (`drain` up, `fused-cast` down) and so on different
-objects:
+**Two GEMMs of the same method but different `tile_n` used to be unable to share
+an ELF, and the same mismatch across *separate* ELFs returned zeros instead of
+failing.** Both are fixed as of Phase E1, and the history is here because the
+silent half cost a gate cycle to localize and the fix is easy to undo by accident.
 
-| seq | up-proj | down-proj | |
-|---|---|---|---|
-| 64 … 2048 | `drain` t_n=128 | `drain` t_n=96 | collide |
-| **4096** | **`drain` t_n=128** | **`fused-cast` t_n=96** | builds |
-| 8192, 16384 | `fused-cast` t_n=128 | `fused-cast` t_n=96 | collide |
+The root cause was one line of naming. `llms/shared/builders/gemm_builder.py`
+minted both the MLIR symbol suffix and the `mm_*.o` filename from the GEMM
+**method alone** — `_m32` / `mm_m32.o` for `drain`, `_m64` / `mm_m64.o` for
+`fused-cast` — while `tile_n` arrived separately as a tile parameter and was baked
+into the object as `-DDIM_N`. The two never met. But `mm_aie2p.cc` is compiled per
+`(tile_m, tile_n)` and the private FuncOps the GEMM builder declares
+(`f32_to_bf16_mn<suffix>`, `zero_f32_mn<suffix>`,
+`op_has_no_registered_library_name<suffix>`) carry operand memref types that are
+functions of `tile_n`, so **two GEMMs of one method at two `tile_n` are two
+different micro-kernels with two different signatures.**
+
+*Loudly, in one ELF:* `stitch_elf` collects each slice's private declarations into
+one `set()` and re-parses, so the same symbol at two memref types is
+`redefinition of symbol named ...`. Every shipped model shape lands on
+`tile_n = 128`, which is why nothing hit this before; the study's FFN does not,
+because `N = 768` cannot use `tile_n = 128` at `herd_n = 4` (`768 % 512 != 0`) and
+settles on 96 against the up-projection's 128. So `build_ffn_module` **did not
+build at any `baseline_768` point except `seq = 4096`**:
+
+| seq | up-proj | down-proj | before E1 | after E1 |
+|---|---|---|---|---|
+| 64 … 2048 | `drain` t_n=128 | `drain` t_n=96 | collide | builds |
+| **4096** | **`drain` t_n=128** | **`fused-cast` t_n=96** | builds | builds |
+| 8192, 16384 | `fused-cast` t_n=128 | `fused-cast` t_n=96 | collide | builds |
 
 That single row is why Phase D1's FFN point is at `seq = 4096` and why the block
-runs there. It is a coincidence of the registry, not a property of the shape: a
-re-sweep that moved either projection onto the other's method would take the
-operator from *builds* to *does not build* with no source change. Fixing it means
-a second object per `(method, tile_n)` — the `sym_suffix` / `link_with_name`
-mechanism already supports it, `gemm_method_spec` in `llms/shared/` is where the
-suffix is minted, and that file is off limits to this study. Phase E has to clear
-this before it can walk the full ladder.
+runs there — a coincidence of the registry, not a property of the shape. It is
+also why E1 comes before every execution strategy: E2–E5 each need more than one
+sequence length, and one of them could not have been built at all.
 
-**The same `tile_n` mismatch bites across *separate* ELFs too, and there it does
-not fail — it returns zeros.** `compile_gemm_mm` names its object from the
-**method alone**: `mm_m32.o` for `drain`, `mm_m64.o` for `fused-cast`. `tile_n`
-is baked in as `-DDIM_N` and does not reach the name. So two operators of the
-same method at different `tile_n` write the same file with different contents,
-and each ELF links whichever was written last. Phase D2 has exactly that pair —
-the FFN's up-projection is `drain` at `tile_n = 128`, the o-projection is `drain`
-at `tile_n = 96` — and building every object up front and then every ELF gave the
-FFN a 96-wide micro-kernel for its 128-wide tile.
+*Silently, across separate ELFs:* `compile_gemm_mm` wrote its object named from
+the method, so two operators of one method at different `tile_n` wrote the **same
+file** with different contents and each ELF linked whichever landed last. Phase D2
+has exactly that pair — the FFN's up-projection is `drain` at `tile_n = 128`, the
+o-projection is `drain` at `tile_n = 96` — and building every object up front and
+then every ELF gave the FFN a 96-wide micro-kernel for its 128-wide tile.
 
 Nothing failed. The ELF built, loaded, dispatched, and returned **exactly zero
 for 32 of every 128 up-projection columns** — 25% of `ffn_up`, uniformly across
@@ -492,12 +547,57 @@ shape of defect C4 found — a plausibly-shaped output that resolves cleanly fro
 the registry and does not compute — and the per-boundary stage list is what
 localized it to `ffn_up` in one run.
 
-D1 never met this because each operator ran in its own `opcheck.py` invocation
-and no single operator holds two same-method GEMMs at different `tile_n`. Any
-caller that builds several of these operators together does meet it.
-`compile_block_artifacts` builds each artifact's objects immediately before its
-own ELF, which is the fix available inside this example; the real one is the same
-`(method, tile_n)` object name the section above needs.
+D1 never met it because each operator ran in its own `opcheck.py` invocation and
+no single operator holds two same-method GEMMs at different `tile_n`. Any caller
+that builds several of these operators together did.
+
+### What E1 changed, and the four ways to reintroduce it
+
+`gemm_builder.gemm_variant_names(tile_m, tile_n)` is now the **single authority**
+for both names: `(32, 128) -> ("_m32n128", "mm_m32n128.o")`. `tile_n` is a
+required argument of `gemm_method_spec`, `with_tile_n` re-mints a resolved spec's
+names, and `external_kernels.compile_gemm_mm_variant` derives the compile side
+from the same function. `compile_block_artifacts` no longer interleaves — it
+builds every object, then every ELF — and its docstring keeps the history above
+and marks it historical.
+
+Four things that will bite whoever touches this next:
+
+1. **Never spell `sym_suffix=` and `out_name=` by hand.** Call
+   `compile_gemm_mm_variant(tile_m, tile_n, tile_k_l1)`. A hand-written pair that
+   disagrees with what the module asks for is either an unresolved symbol at link
+   time or — the worse one — an object at the wrong `-DDIM_N` that links cleanly.
+2. **Never write `spec["tile_n"] = N`.** Use
+   `gemm_builder.with_tile_n(spec, N)`. Several callers retile after resolving,
+   because the registry's `tile_n` for a narrow `N` can be numerically broken and
+   the builder pads `N` out to admit a wider one. Before E1 the bare assignment
+   was harmless; now it leaves the module asking for an object nobody compiles.
+   `qwen25_0_5b` was doing exactly that and was **correct only by accident** — it
+   asked for `mm_m32.o`, which happened to be compiled at `DIM_N=128`, the value
+   it had overridden to. E1 turned that into a visible link failure.
+3. **`cache.prepare_air_project` globs `mm_m*.o`; do not turn it back into a
+   list.** `tile_n` takes four values across the registry, so there are up to
+   eight of these objects and which ones exist depends on which shapes the caller
+   resolved. An object that never reached `air_project/` fails inside aiecc,
+   several frames from the list that omitted it.
+4. **A module fingerprint does not notice a change in compile ORDER.** Verifying
+   the interleaving removal meant deleting `build_peano/block_cache` first —
+   `block_artifact_fingerprint` covers the resolved specs, the emitted MLIR, the
+   kernel sources and the backend kwargs, all of which were unchanged, so all four
+   ELFs would have been reused and the run would have proved nothing. The check
+   that mattered was that every stage figure came back byte-identical, `ffn_up`
+   included.
+
+**Audit a shared-naming change before you spend hardware on it.** The E1 gate's
+second leg is `make verify` in all ten shipped model directories and takes hours,
+which is the worst possible place to discover a link mismatch. What found
+`qwen25_0_5b` in about a minute instead: run each model's `compile_all_kernels`
+with `external_kernels._compile_kernel` replaced by a recorder and
+`KernelCache.compile_and_cache` replaced by one that only scrapes `link_with = "…"`
+out of the module text, then compare the objects each module *references* against
+the `-DDIM_N` each object was *built at*. Every module still builds (about a
+second each) and no aiecc runs. Nine models agreed and one did not.
+
 
 **`addnorm` caps at 104 rows at width 768, so the layer is row-blocked.** Three
 L3→L1 streams per tile (x, residual, weight) against a column's two shim MM2S
