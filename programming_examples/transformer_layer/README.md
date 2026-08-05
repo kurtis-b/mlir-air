@@ -465,6 +465,54 @@ first's cache. Real minutes on every gate, and the price of keeping D2's gate
 provable against its own artifact set while the modes stay unable to trade
 ELFs.
 
+## The `offload` execution strategy (Phase E3)
+
+`pattern/offload/` is the host-mediated extreme of the taxonomy: the host owns
+the layer, holds every intermediate, and dispatches **six** registry GEMMs one
+at a time — `q_proj k_proj v_proj output_proj up_proj down_proj` — each as a
+**one-step `run_sequence` call**, so the driver-summed vector is six
+submissions over six runlist entries and the mode aggregates *nothing*. That
+non-aggregation is the mode's own clause in the Phase E distinguishability
+gate, and it is why the six dispatches are six separate calls: under the ELF
+ABI `run_sequence` merges every step it is given into one submission, so
+handing it all six steps at once would record `coarse`'s shape, not this
+mode's. Everything between the GEMMs — attention, softmax, both norms, the
+GeLU — is host torch. `pattern/offload/README.md` has the full story; the
+parts that cost time to learn:
+
+**It is six GEMMs, not iron's eight, and the artifact says so.** The two
+attention GEMMs (`4096x64x4096`, `4096x4096x64`) resolve in no registry —
+there is no `K = 64` or `N = 64` bf16-out row and the sweep cannot stage one —
+so attention stays in host torch through `pattern/blocked_attention.py`
+(shared with `runlist`, which is why it lives in `pattern/` and not in the
+mode directory). The artifact records `attention_path:
+"host_torch_fp32_blocked"`: the mode is a *hybrid* boundary, stated in its own
+record rather than discovered from the code.
+
+**The mode computes; the oracle checks; they may not share arithmetic.** This
+mode does more host math than any other, so every host stage is torch
+(`F.layer_norm`, `F.gelu(approximate="tanh")`, torch softmax) while the
+oracle's boundaries come from the numpy operator references. A stage whose
+"actual" and "expected" are the same function call compares a value against
+itself. `run_blocked_attention_tests.lit` pins the two attention
+implementations against each other on identical inputs — the comparison the
+hardware gate cannot perform, because its attention inputs already carry
+device GEMM error.
+
+**One ELF serves four dispatches, and that is not aggregation.**
+q/k/v/output_proj are the same `4096x768x768` module, so they share one
+compiled drain ELF (three ELF compiles per gate instead of six); each dispatch
+is still its own submission with its own recorded vector. The weights are
+deliberately *not* static and `x` is re-uploaded for each of q/k/v — six
+weight BOs per layer is the mode being itself; do not optimize it.
+
+**A plain GEMM ELF's `instance_name` is the method's func name.** The drain
+module emits `matmul_bf16` and the fused-cast module `gemm_cast_bf16`, and
+`instance_name` must equal the emitted `func.func` name — a mismatch does not
+fail to load, it times out with `ERT_CMD_STATE_TIMEOUT` a long way from the
+cause. `pattern/offload/offload.py::_METHOD_FUNC` is the one place that
+mapping lives.
+
 ## The registry sweep
 
 The three GEMM-backed operators above take their tile sizes and method from

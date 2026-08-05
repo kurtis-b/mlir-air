@@ -1,0 +1,118 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase E3 offload-mode gate: the D2 layer at the host-mediated extreme of the
+// execution-strategy taxonomy.
+//
+// Same golden model and same per-boundary comparisons as the block and coarse
+// gates, behind a different execution boundary: the host owns the layer and
+// dispatches six registry GEMMs one at a time -- q/k/v/output_proj over one
+// shared 4096x768x768 drain ELF, up (drain) and down (fused-cast) over their
+// own -- each as a one-step run_sequence call in a FRESH hw_context (a reused
+// context returns wrong numbers from an ELF's second execution onward; the
+// measurement is in pattern/offload/offload.py). Attention, softmax, both
+// norms and the GeLU are host torch, written independently of the numpy
+// oracle; the artifact records the hybrid boundary as attention_path.
+//
+// Two recipes in one file, deliberately: they share a working directory and
+// therefore the ELF cache, so the injected run reuses the three ELFs the clean
+// run compiled -- compilation depends on the shape, not the data.
+//
+// NPU serialization lives one layer down, not in the recipes below: device
+// access is locked on /tmp/npu.lock inside KernelCache, the same inode
+// lit.cfg.py's NPU substitution takes. Taking the outer /tmp/mlir-air-npu.lock
+// here would DEADLOCK against the gate command that already holds it -- BSD
+// flock(2) treats a second open() of the same file as a foreign lock.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming
+// one in prose -- even inside a comment -- registers as a second directive and
+// leaves the test UNRESOLVED. Describe them, never spell them out.
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_npu2_offload_peano
+// RUN: cd test_npu2_offload_peano
+// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile check-offload PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+//
+// The configuration first -- the forced gate configuration, each GEMM resolved
+// through the registry, and the mode's own statement that it is a hybrid
+// boundary with attention on the host. A registry change that moved a method
+// fails here with its cause on screen.
+// CHECK: offload 4096x768 ffn 3072 12h x 64 (encoder_bert, non-causal, hybrid boundary: 6 device GEMMs, attention in host torch)
+// CHECK: proj 4096x768x768 drain (registry), up 4096x768x3072 drain (registry), down 4096x3072x768 fused-cast (registry)
+// CHECK: attention host torch fp32, query block 4096 x1 block(s)
+//
+// Every boundary, in execution order, each with zero mismatching elements.
+// Named individually rather than counted, so a stage list that dropped or
+// repeated an entry fails here -- the driver requires at least eight DISTINCT
+// names, and this is where the suite enforces the same thing.
+// CHECK: [stage] q {{.*}} mismatch       0
+// CHECK: [stage] k {{.*}} mismatch       0
+// CHECK: [stage] v {{.*}} mismatch       0
+// CHECK: [stage] attn_context {{.*}} mismatch       0
+// CHECK: [stage] attn_out {{.*}} mismatch       0
+// CHECK: [stage] hidden {{.*}} mismatch       0
+// CHECK: [stage] ffn_up {{.*}} mismatch       0
+// CHECK: [stage] ffn_gelu {{.*}} mismatch       0
+// CHECK: [stage] ffn_out {{.*}} mismatch       0
+// CHECK: [stage] output {{.*}} mismatch       0
+// CHECK: [offload] stages: 10/10 clean
+//
+// The mode's own instrumentation: one DispatchVector row per GEMM dispatch.
+// Six, one each for q/k/v/output_proj/up_proj/down_proj -- a wrapper that
+// batched them into one runlist, or stopped recording per-dispatch rows,
+// fails here before the driver's totals comparison sees it.
+// CHECK: [offload] recorded 6 dispatch vectors
+//
+// The vectors' CONTENTS, not only their count: the six driver-summed totals.
+// Six submissions over six entries is the mode's defining non-aggregation
+// clause. Air is 7 (one launch per drain dispatch, two for the fused-cast
+// down projection); herd counts accumulate per dispatch; sync is 19 (three
+// per drain dispatch -- A and B up, C back -- plus four for the fused-cast
+// one, whose zero-filled f32 scratch also crosses); and the bytes are those
+// nineteen transfers exactly. The totals line prints only after every row
+// passes the as_row() schema in opcheck_prepare.dispatch_vector_totals, so a
+// malformed row aborts the run and a run whose totals drift fails right here.
+// CHECK: [offload] dispatch totals: submissions 6 entries 6 air 7 herd 19 sync 19 bytes 139984896
+//
+// Then the layer output itself over all 4096 x 768 elements, and the label
+// naming the MODE's operator.
+// CHECK: PASS!
+// CHECK: [opcheck] offload [4096x768_encoder_bert]: PASS
+//
+// THE NEGATIVE CONTROL. Identical reasoning to the block gate's -- ln1_weight,
+// chosen by measurement, perturbed AFTER the golden model was computed -- plus
+// the one stake that is this mode's own: the dispatch vectors must be recorded
+// on the injected path too, because the driver requires the fault artifact's
+// summed totals to EQUAL the clean run's.
+//
+// RUN: make -f %S/Makefile check-offload-fault PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s --check-prefix=FAULT
+//
+// The injected element first, so an injection that silently perturbed nothing
+// is visible here rather than read backwards from the verdict. Index 5 is
+// ln1_weight in OFFLOAD_INPUT_NAMES -- the q/k/v weights are separate in this
+// mode, so the index differs from the block's.
+// FAULT: [fault-inject] input 5 at (0,)
+//
+// Nothing upstream of the first norm reads ln1_weight, so the attention half
+// must still be exact while `hidden` and everything after it moves -- which is
+// what says the stage comparisons are reading THIS run's buffers rather than
+// replaying the clean run's.
+// FAULT: [stage] q {{.*}} mismatch       0
+// FAULT: [stage] attn_out {{.*}} mismatch       0
+// FAULT: [stage] hidden {{.*}} mismatch {{[1-9][0-9]*}}
+// FAULT: [offload] stages: 5/10 clean
+//
+// The vectors, still recorded under injection -- and totaling EXACTLY what
+// the clean run totals: the six literals below are the same six the clean
+// half pins above, which is the suite's own statement of the equality the
+// driver re-derives from the two artifacts.
+// FAULT: [offload] recorded 6 dispatch vectors
+// FAULT: [offload] dispatch totals: submissions 6 entries 6 air 7 herd 19 sync 19 bytes 139984896
+//
+// And the verdict in the three forms opcheck.py reports it: the comparison's
+// own, the control's reading of it, and the exit-status summary.
+// FAULT: [opcheck] offload [4096x768_encoder_bert]: FAIL
+// FAULT: [opcheck] offload [4096x768_encoder_bert]: fault-inject input -> FAIL (as required)
+// FAULT: NEGATIVE CONTROL: PASS

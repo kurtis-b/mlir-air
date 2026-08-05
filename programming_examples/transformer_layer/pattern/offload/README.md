@@ -69,7 +69,43 @@ boundary names from the reference and none of its arithmetic. A stage whose
 "actual" and "expected" are the same function call compares a value against
 itself and passes no matter what is wrong with it.
 
+## A reused `hw_context` corrupts an ELF's second execution — measured
+
+The first bring-up run of this mode failed with a signature worth recording:
+`q` (the first execution of the shared proj ELF) clean at the GEMM's own
+9.6e-3 relative error, `k` and `v` (its second and third executions) wrong at
+3.56e-1 — uniformly across rows and columns, roughly one third of the
+reduction lost. A controlled experiment on the same cached ELFs pinned it
+down:
+
+- second execution, **same inputs**: wrong (3.56e-1) — so not a data issue;
+- the wrong output matches neither the previous weights' product (1.42) nor
+  the previous result (1.42) — so not a stale-B or stale-C readback;
+- second execution in a **fresh `hw_context`**: clean (9.6e-3), every time.
+
+So re-executing one of these runtime-tiled GEMM ELFs in a reused context
+returns wrong numbers from the second execution onward; the corruption is
+device-side state the ELF leaves behind. Nothing else in the example ever
+re-executes a GEMM ELF across submissions — the block's GEMM ELFs each run
+once per process, and its re-executed addnorm ELF (no runtime loop tiling)
+re-runs clean — which is why this mode is where the failure surfaced.
+`_evict_context` in `offload.py` therefore reloads the context (and drops
+the BO pools, whose buffers were allocated against the evicted backend's
+device wrapper) before every dispatch. That cost is charged to latency, not
+to the dispatch vector: nothing is static, so the sync and byte counts are
+identical either way. **If E4's `runlist` re-executes a GEMM ELF inside a
+single runlist, measure before assuming either behaviour.**
+
 ## What the numbers look like, and why
+
+The measured stage table at the gate configuration (clean run): every
+boundary at `n_mismatch 0`, end-to-end `mean_rel_L1 1.396e-2` with
+`atol_required 5.489e-2` against the 1e-1 ceiling — a 1.82x margin, against
+the all-device block's 1.35x (1.688e-2 / 7.398e-2). Host FP32 attention and
+host norms land closer to the FP32 oracle than the device path does, as 08c
+predicted: `attn_context` needs only 3.5e-5 of absolute tolerance here where
+the fused device attention needs 2.3e-4, and `hidden` 1.3e-3 where the
+device addnorm needs 1.2e-2.
 
 Six recorded `DispatchVector` rows, one per GEMM, in dispatch order:
 

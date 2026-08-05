@@ -551,11 +551,14 @@ SPECS = [
         },
         # Same tensor as the block row, compared the same way at the same
         # golden seed, so the 1e-1 HARD CEILING carries over — and this mode
-        # sits FURTHER from it than the block does: host FP32 attention and
-        # host norms land closer to the FP32 oracle than the device path, so
-        # of the four modes this one has the most headroom, not the least.
-        # See the block entry for why exceeding the ceiling is a defect
-        # report, never a wider tolerance.
+        # sits FURTHER from it than the block does. Measured over 3145728
+        # elements: mean_rel_L1 1.396e-2, atol_required 5.489e-2, a 1.82x
+        # margin against the block's 1.35x (mean_rel_L1 1.688e-2,
+        # atol_required 7.398e-2): host FP32 attention and host norms land
+        # closer to the FP32 oracle than the device path, so of the four
+        # modes this one has the most headroom, not the least. See the block
+        # entry for why exceeding the ceiling is a defect report, never a
+        # wider tolerance.
         "atol": 1e-1,
         "prepare": prepare_offload,
     },

@@ -58,6 +58,13 @@ FOOTGUNS
       compiling three ELFs instead of six is real minutes on every gate.
     - Weights are NOT declared static. Six weight uploads per layer is the
       mode being itself; do not optimize it.
+    - EVERY DISPATCH RUNS IN A FRESH ``hw_context``. Re-executing one of
+      these GEMM ELFs in a reused context returns wrong numbers from the
+      second execution onward — measured, with the stale-input and
+      stale-output explanations ruled out; see ``_evict_context``. Nothing
+      else in the example re-executes a GEMM ELF across submissions, so this
+      mode is where the failure was found. If a later mode re-executes one
+      inside a single runlist, measure before assuming either behaviour.
     - The dispatch vectors are recorded on the fault-injected path too. The
       driver requires the fault artifact's summed totals to EQUAL the clean
       run's; anything conditional on the injected flag fails that.
@@ -295,6 +302,34 @@ def compile_offload_artifacts(cache, cfg, run_only=False):
     save_fingerprints(cache, fingerprints)
 
 
+def _evict_context(cache, artifact):
+    """Drop ``artifact``'s cached ``hw_context`` (and every pool) before a dispatch.
+
+    MEASURED, NOT DEFENSIVE: re-executing one of these runtime-tiled GEMM
+    ELFs in a reused ``hw_context`` returns wrong numbers from the SECOND
+    execution onward — mean_rel_L1 3.56e-1 against the same run's own 9.6e-3
+    on a fresh context, with the same inputs, uniformly across rows and
+    columns, at roughly one third of the reduction lost. Stale-input and
+    stale-output hypotheses were ruled out directly (the wrong output matches
+    neither the previous weights' product nor the previous result); the
+    corruption is device-side state the ELF leaves behind. The block gate
+    never sees this because each of its GEMM ELFs executes exactly once per
+    process, and its re-executed addnorm ELF (no runtime loop tiling) re-runs
+    clean.
+
+    So this mode reloads the context per dispatch. The pools go with it: their
+    BOs were allocated against the evicted backend's device wrapper, and a
+    fresh per-dispatch pool keeps every buffer's provenance one dispatch wide
+    — which is also this mode's semantics, since nothing may stay device
+    resident between GEMMs. The dispatch-vector counts are unchanged (nothing
+    is static, so every call already uploads all of its inputs).
+    """
+    loaded = cache._loaded.pop(artifact, None)
+    if loaded is not None:
+        loaded[0].unload()
+    cache._pools.clear()
+
+
 def _dispatch_gemm(cache, cfg, op_name, a, b):
     """One GEMM on the device, as ONE one-step ``run_sequence`` call.
 
@@ -302,11 +337,14 @@ def _dispatch_gemm(cache, cfg, op_name, a, b):
     (``run_sequence`` returns zero-copy views into pool memory, and the next
     dispatch reuses the slot) and ``vector_row`` is the call's
     ``DispatchVector.as_row()`` — one submission, one entry, recorded by the
-    shared implementation and never hand-built here.
+    shared implementation and never hand-built here. Each dispatch runs in a
+    FRESH ``hw_context`` — see ``_evict_context`` for the measurement that
+    forces that.
     """
     key = cfg["gemms"][op_name]
     spec, (m, k, n) = cfg["specs"][key]
     artifact = cfg["artifacts"][key]
+    _evict_context(cache, artifact)
 
     arrays = {
         "a": np.ascontiguousarray(a),
