@@ -67,7 +67,13 @@ for _p in (_PROJ_ROOT, os.path.join(_PROJ_ROOT, "llms"), _HERE):
         sys.path.insert(0, _p)
 
 import shared.infra.external_kernels as ek  # noqa: E402
-from builders.addnorm import addnorm_reference, build_addnorm_module  # noqa: E402
+from builders.addnorm import (  # noqa: E402
+    addnorm_max_rows,
+    addnorm_pre_add_reference,
+    addnorm_reference,
+    build_addnorm_module,
+    compile_addnorm_kernel,
+)
 from builders.elementwise_add import (  # noqa: E402
     build_elementwise_add_module,
     causal_mask_bias,
@@ -151,19 +157,28 @@ def _prepare_layer_norm(shape, seed=2):
 
 
 def _prepare_addnorm(shape, seed=3):
+    """Both residual orderings. ``shape["pre_add"]`` picks which.
+
+    The variant selects the kernel OBJECT, the entry point and the reference
+    together -- see ``builders/addnorm.py``. Taking the reference from the same
+    flag that built the module is what stops the two from drifting apart into a
+    check that passes against the wrong function.
+    """
     rows, cols = shape["rows"], shape["cols"]
-    # addnorm half only -- the FFN half collides with addnorm_ffn.o.
-    ek.compile_encoder(build_ffn=False, build_addnorm=True)
+    pre_add = shape.get("pre_add", False)
+    # addnorm half only -- the FFN half collides on ffn_gelu_bf16.
+    compile_addnorm_kernel(pre_add=pre_add)
     rng = np.random.default_rng(seed)
     x = rng.standard_normal((rows, cols)).astype(bfloat16)
     residual = rng.standard_normal((rows, cols)).astype(bfloat16)
     # A trained LayerNorm gamma sits near 1; uniform(0.5, 1.5) is that range
     # without being exactly 1, which would hide a dropped weight multiply.
     weight = rng.uniform(0.5, 1.5, size=cols).astype(bfloat16)
+    reference = addnorm_pre_add_reference if pre_add else addnorm_reference
     return {
-        "module": build_addnorm_module(rows, cols, bfloat16),
+        "module": build_addnorm_module(rows, cols, bfloat16, pre_add=pre_add),
         "inputs": [x, residual, weight],
-        "expected": [addnorm_reference(x, residual, weight)],
+        "expected": [reference(x, residual, weight)],
         "inject": (0, (rows - 1, 0)),
     }
 
@@ -416,14 +431,75 @@ def _spec_digest(spec):
     }
 
 
-# Every (operator, shape) C1 and C2 claim. `atol` is the measured worst-case
-# absolute error rounded up, per the kernel_registry methodology; `rtol` is fixed
-# at RTOL for all of them.
+# ---------------------------------------------------------------------------
+# THE baseline_768 SET (D1)
+#
+# Phase C validated each operator at whatever width was cheapest to bring it up.
+# The block runs at `baseline_768` -- hidden 768, ffn 3072, 12 heads x head_dim
+# 64, encoder_bert -- and almost none of those points were there. The rows
+# tagged "baseline_768" below close that gap so that a Phase D2 block failure
+# localizes to the integration rather than to an operator nobody had run at that
+# width.
+#
+# WHY THE THREE GEMM-BACKED ROWS ARE PINNED TO seq_len 4096 AND THE OTHER THREE
+# ARE NOT
+#     4096 is the only sequence length at which `build_ffn_module` builds at
+#     hidden 768: the up-projection takes tile_n 128 and the down-projection
+#     tile_n 96 at every point on the ladder, and two SAME-METHOD GEMMs with
+#     different tile_n declare `f32_to_bf16_mn_<suffix>` twice with different
+#     memref types, which `stitch_elf` rejects. Only at 4096 does the registry
+#     put them on different methods (drain up, fused-cast down). qkv_proj and
+#     mha_out_proj are pinned to 4096 too, because localizing D2 is the point.
+#
+#     layer_norm, elementwise_add and addnorm are row-parallel: their builders
+#     DERIVE the legal row count from L1 rather than accepting one, so only
+#     `cols` is part of the family for them.
+#
+# WHY THERE IS NO baseline_768 causal_mask ROW
+#     Its shape is seq x seq, not seq x hidden, so "the 768 width" does not name
+#     a shape for it -- and `encoder_bert` never builds one: the golden
+#     reference uses an all-ones attention mask for the encoder variant and a
+#     `tril` one only for `decoder_gpt2`. A 4096x4096 point would cost real
+#     hardware time to prove something the block does not exercise.
+#
+# ORDERING MATTERS HERE. The driver's per-operator negative control takes each
+# operator's FIRST declared shape, so each new row is appended AFTER its
+# operator's existing ones: the cheap Phase C shape keeps the standing control
+# and every baseline_768 point gets an injection of its own. That is deliberate
+# for `addnorm` above all -- its pre-add variant is the one function in this
+# file that had never run on hardware, and it is the one whose reference is
+# most likely to agree with the device by construction, since both were written
+# here.
+# ---------------------------------------------------------------------------
+
+# Every (operator, shape) C1, C2, C3 and D1 claim. `atol` is the measured
+# worst-case absolute error rounded up, per the kernel_registry methodology;
+# `rtol` is fixed at RTOL for all of them.
 SPECS = [
     {
         "operator": "elementwise_add",
         "shape_key": "512x512",
         "shape": {"rows": 512, "cols": 512},
+        "atol": 5e-2,
+        "prepare": _prepare_elementwise_add,
+    },
+    {
+        # baseline_768. Rows are free for this operator, so they are the
+        # block's own 4096 rather than a cheaper number -- the tile shape is
+        # `cols` wide and the row count only sets the herd loop's trip count,
+        # so the full sequence costs almost nothing extra to check.
+        "operator": "elementwise_add",
+        "shape_key": "4096x768",
+        "shape": {"rows": 4096, "cols": 768},
+        # Measured over 3145728 elements: mean_rel_L1 1.879e-3 -- the same
+        # 1.9e-3 the registry records for this kernel, so widening the row
+        # count and the width changes nothing -- abs_err_max 3.125e-2, and
+        # atol_required 0.0. Zero is not a rounding: a single bf16 rounding of
+        # an f32 sum is always within rtol of the f32 value, so `rtol` alone
+        # accounts for every element and `atol` is doing no work here. It stays
+        # at the 5e-2 of the operator's other row rather than being driven to
+        # something arbitrarily small, which would only measure how close two
+        # unconstrained numbers happened to land.
         "atol": 5e-2,
         "prepare": _prepare_elementwise_add,
     },
@@ -442,12 +518,61 @@ SPECS = [
         "prepare": _prepare_layer_norm,
     },
     {
+        # baseline_768, at the block's own row count for the same reason as
+        # elementwise_add above.
+        "operator": "layer_norm",
+        "shape_key": "4096x768",
+        "shape": {"rows": 4096, "cols": 768},
+        # Measured over 3145728 elements: mean_rel_L1 1.969e-3, abs_err_max
+        # 3.125e-2, atol_required 1.419e-3. atol is that rounded up, 3.5x --
+        # ten times tighter than the 512x512 row above, which was sized before
+        # `atol_required` was recorded and left the tier's default. abs_err_max
+        # is 22x atol_required here, which is exactly the case the docstring on
+        # _RecordingRunner describes: the worst absolute error sits on a
+        # large-magnitude element that rtol already covers.
+        "atol": 5e-3,
+        "prepare": _prepare_layer_norm,
+    },
+    {
         # 64 rows, not 512: addnorm needs one kernel call per tile, which caps
         # rows at herd_x * (what fits L1). See builders/addnorm.py.
         "operator": "addnorm",
         "shape_key": "64x512",
         "shape": {"rows": 64, "cols": 512},
         "atol": 5e-2,
+        "prepare": _prepare_addnorm,
+    },
+    {
+        # baseline_768, PRE-ADD -- LayerNorm(x + residual) * weight, which is
+        # what encoder_bert computes at both of its normalization points and
+        # which nothing had ever dispatched. The row above is the post-add form
+        # iron's operator carried; they are DIFFERENT FUNCTIONS, so this is
+        # separate evidence and not a wider shape of the same evidence.
+        #
+        # Rows are 64 because that is what fits, DERIVED not carried over: at
+        # cols 768 the pre-add path's three L1 tile buffers (x, residual, one
+        # output -- the post-add entry point needs a fourth) cap
+        # `addnorm_max_rows` at 104, and the post-add form at the same width at
+        # 80. Both are ALLOCATION bounds that ignore aircc's ping-pong of the
+        # DMA-fed buffers, so sitting at the cap risks a placement failure for
+        # nothing; 64 keeps the same row count as the 512-wide row, which makes
+        # the two directly comparable.
+        "operator": "addnorm",
+        "shape_key": "64x768_pre_add",
+        "shape": {"rows": 64, "cols": 768, "pre_add": True},
+        # Measured over 49152 elements: mean_rel_L1 2.687e-3, abs_err_max
+        # 6.25e-2, atol_required 6.646e-4. atol is that rounded up, 3.0x.
+        #
+        # 26x tighter than the post-add row above (atol_required 1.747e-2) at a
+        # HIGHER relative error, and the ordering is the whole reason. Post-add
+        # finishes with `+ residual` in bf16, so a cancelling element -- one
+        # where `norm * weight` nearly negates the residual -- carries an
+        # absolute error set by the residual's magnitude while its own value is
+        # near zero, and rtol covers none of it. Pre-add has no trailing add:
+        # every error is proportional to the output that carries it. Do not
+        # read the tighter number as the pre-add path being a better kernel; it
+        # is the same kernel with the cancellation removed.
+        "atol": 2e-3,
         "prepare": _prepare_addnorm,
     },
     {
@@ -501,6 +626,25 @@ SPECS = [
         "prepare": _prepare_qkv_proj,
     },
     {
+        # baseline_768, at the block's sequence length. The GEMM is
+        # 4096x768x2304 and the registry resolves fused-cast for it at the
+        # file-level 8x4 herd, unlike the 64-row point above. `64x768` does NOT
+        # substitute for this: the driver reads `seq_len` from the shape dict
+        # and requires 4096, because a 64-row projection exercises one herd
+        # iteration and the block's exercises sixty-four.
+        "operator": "qkv_proj",
+        "shape_key": "4096x768",
+        "shape": {"seq_len": 4096, "emb_dim": 768},
+        # Measured over the 9437184 elements of q, k and v together:
+        # mean_rel_L1 9.863e-3 -- the registry's own 9.3e-3 for this GEMM, so
+        # the three split-cast launches still add nothing measurable at 64x the
+        # rows of the 64x768 point -- abs_err_max 1.953e-3 and atol_required
+        # 1.773e-3. atol stays the 5e-3 the operator's other three rows use,
+        # which is a 2.8x margin here.
+        "atol": 5e-3,
+        "prepare": _prepare_qkv_proj,
+    },
+    {
         "operator": "ffn",
         "shape_key": "2048x1024x3072",
         "shape": {"seq_len": 2048, "emb_dim": 1024, "ffn_dim": 3072},
@@ -508,6 +652,29 @@ SPECS = [
         # roughly 1.6x the single GEMM's, which is where the bf16 staging of h
         # and the activation's bf16 intermediates show up against an FP32
         # reference. atol is that worst case rounded up, 3.1x.
+        "atol": 5e-3,
+        "prepare": _prepare_ffn,
+    },
+    {
+        # baseline_768, and THE ONLY POINT ON THE LADDER WHERE THIS OPERATOR
+        # BUILDS AT hidden 768. The up-projection (N = 3072) takes tile_n 128
+        # and the down-projection (N = 768) takes tile_n 96 everywhere; two
+        # same-method GEMMs with different tile_n declare
+        # `f32_to_bf16_mn_<suffix>` twice with different memref types and
+        # stitch_elf rejects the redefinition. seq 4096 is where the registry
+        # happens to put them on different methods -- drain for the up,
+        # fused-cast for the down -- so the pair co-links. 64..2048 are all
+        # drain/drain and 8192/16384 are all fused-cast/fused-cast, and both
+        # collide. See the README; the real fix is a per-(method, tile_n)
+        # symbol suffix in llms/shared, which is off limits to this study.
+        "operator": "ffn",
+        "shape_key": "4096x768x3072",
+        "shape": {"seq_len": 4096, "emb_dim": 768, "ffn_dim": 3072},
+        # Measured over 3145728 elements: mean_rel_L1 1.569e-2 -- within 2% of
+        # the 2048x1024x3072 row's 1.602e-2, so the bf16 staging of `h` and the
+        # activation's intermediates dominate here too and the mixed-method
+        # pairing (drain up, fused-cast down) costs nothing -- abs_err_max
+        # 1.709e-3 and atol_required 1.472e-3. atol stays 5e-3, a 3.4x margin.
         "atol": 5e-3,
         "prepare": _prepare_ffn,
     },
@@ -581,6 +748,40 @@ SPECS = [
         # the registry's FlashAttention rows record. Same 8e-2 for the same
         # reason; here the margin is 1.66x.
         "atol": 8e-2,
+        "prepare": _prepare_mha_out_proj,
+    },
+    {
+        # baseline_768: 4096 positions, 12 heads x head_dim 64 = emb_dim 768,
+        # NON-CAUSAL. encoder_bert is bidirectional -- `generate_golden_
+        # reference` builds an all-ones attention mask for it and a `tril` one
+        # only for decoder_gpt2 -- so the causal rows above are not this
+        # operator's baseline_768 evidence, they are a different device path.
+        # The projection is 4096x768x768, which the registry resolves to drain.
+        #
+        # The expensive row here: four times the sequence of the largest Phase
+        # C point at three quarters of its heads, and non-causal, so every one
+        # of the 16.8M score entries is computed rather than half of them.
+        "operator": "mha_out_proj",
+        "shape_key": "4096x768x12h",
+        "shape": {
+            "seq_len": 4096,
+            "head_dim": 64,
+            "num_heads": 12,
+            "causal": False,
+        },
+        # Measured over 3145728 elements: mean_rel_L1 5.335e-2, abs_err_max
+        # 9.033e-3, atol_required 8.706e-3. atol is that rounded up, 2.9x.
+        #
+        # The tightest atol of this operator's four rows and its LOOSEST
+        # relative error, which is not a contradiction: softmax over 4096 keys
+        # averages V eight times harder than over 512, so |y| shrinks by
+        # roughly sqrt(8) and the same relative error lands closer to zero. The
+        # relative error rising from 4.6e-2 to 5.3e-2 over that 8x reduction
+        # depth is the FlashAttention tier behaving as its registry rows
+        # record. atol is 4x below the 1e-1 ceiling, so this row -- the one the
+        # block actually runs -- has the most headroom of the four, not the
+        # least.
+        "atol": 2.5e-2,
         "prepare": _prepare_mha_out_proj,
     },
 ]

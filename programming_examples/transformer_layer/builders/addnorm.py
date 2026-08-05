@@ -1,17 +1,57 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""AddNorm: weighted LayerNorm plus a residual, over ``fused_add_layer_norm_2outs``.
+"""AddNorm: weighted LayerNorm and a residual, in either order.
 
 CONTRACT
     ``build_addnorm_module(rows, cols, ...)`` returns an ``air.ir.Module``
     whose single function takes ``x[rows, cols]``, ``residual[rows, cols]``,
     ``weight[cols]`` and ``out[rows, cols]``, all bf16, and computes per row
 
-        out[r, :] = LayerNorm(x[r, :]) * weight + residual[r, :]
+        pre_add=False (default)   out[r, :] = LayerNorm(x[r, :]) * weight
+                                             + residual[r, :]
+        pre_add=True              out[r, :] = LayerNorm(x[r, :] + residual[r, :])
+                                             * weight
 
-    The residual is added AFTER the normalization -- this is the post-add form.
-    The statistics come from ``x`` alone; ``residual`` never enters them.
+    The signature is identical either way; only the arithmetic differs. Each
+    form has its OWN reference below -- ``addnorm_reference`` and
+    ``addnorm_pre_add_reference`` -- rather than one function with an ordering
+    flag, because a branch inside a reference is exactly as easy to read
+    backwards as the kernel it is supposed to check.
+
+    Call ``compile_addnorm_kernel(pre_add=...)`` before building: the two forms
+    link DIFFERENT objects (see below), and getting that wrong does not fail to
+    link, it computes the other function.
+
+WHICH FORM A TRANSFORMER BLOCK WANTS
+    ``encoder_bert`` is post-norm, and both of its normalization points are
+    ``LayerNorm(attn_out + input) * weight`` -- the PRE-ADD form. The post-add
+    form is what iron's ``addnorm`` operator carried and what Phase C validated;
+    the two are different functions and a block wired to the wrong one produces
+    a plausible activation that is wrong by one residual add.
+
+WHY pre_add IS NOT ONE OBJECT WITH A FLAG
+    The post-add form comes from ``encoder.cc`` (``encoder.o``), which has no
+    pre-add path at all. The pre-add form lives in a different translation unit,
+    ``addnorm_ffn.cc``, behind ``-DADDNORM_PRE_ADD``, and exports its one-output
+    entry point as ``fused_add_layer_norm_1outs``. So selecting the variant
+    selects the object AND the symbol AND the L1 budget (one output buffer
+    rather than two), which is why it is a builder keyword rather than a flag
+    flip. ``compile_kernels.py::check_pre_add_variants_differ`` asserts at build
+    time that ``-DADDNORM_PRE_ADD`` still reaches the templates.
+
+    The pre-add object built here is ADDNORM-ONLY and named
+    ``addnorm_pre_add.o``, distinct from the full 11-symbol
+    ``addnorm_ffn_pre_add.o`` the compile gate checks. Linking the full object
+    would drag every FFN matmul microkernel into a core that never calls one.
+
+WHY THE ONE-OUTPUT ENTRY POINT IS ENOUGH FOR PRE-ADD
+    ``fused_add_layer_norm_2outs`` under ``-DADDNORM_PRE_ADD`` additionally
+    exports the raw ``x + residual`` sum through ``output2``, for a block whose
+    next residual stream is that sum. ``encoder_bert``'s is not: its second
+    residual is ``hidden``, the NORMALIZED output of the first norm. So the
+    one-output form carries everything the block needs, and it costs one fewer
+    L1 tile buffer than the post-add path.
 
 THE WEIGHT IS A RUNTIME ARGUMENT
     iron's ``addnorm`` bakes its weights into the MLIR through ``np.load()`` at
@@ -20,11 +60,13 @@ THE WEIGHT IS A RUNTIME ARGUMENT
     a plain memref argument, uploaded like any other buffer, and one compiled
     ELF serves every weight vector of that shape.
 
-TWO OUTPUTS, ONE DRAINED
-    The kernel writes its result to two buffers because the fused encoder block
-    feeds it to both the FFN and the next residual. Only ``output1`` is drained
-    to L3 here: a second L3 output would need a second shim S2MM channel per
-    column for a byte-identical copy. ``output2`` stays in L1 and is discarded.
+TWO OUTPUTS, ONE DRAINED (POST-ADD ONLY)
+    ``encoder.o``'s entry point writes its result to two buffers because the
+    fused encoder block feeds it to both the FFN and the next residual. Only
+    ``output1`` is drained to L3 here: a second L3 output would need a second
+    shim S2MM channel per column for a byte-identical copy. ``output2`` stays in
+    L1 and is discarded. The pre-add path calls the one-output entry point
+    instead and allocates no ``output2`` at all.
 
 ONE KERNEL CALL PER TILE -- THIS IS A CORRECTNESS CONSTRAINT, NOT A TUNING KNOB
     ``rows`` must equal ``herd_x * rows_per_call``, so every tile issues exactly
@@ -58,20 +100,34 @@ FOOTGUNS
       up as a small uniform shift of a row, not as an outlier.
     - ``cols`` must be a multiple of 32 (the kernel's ``N``). A non-multiple is
       silently truncated by ``vector_chunks = cols / N``, not diagnosed.
-    - ``encoder.o`` is compiled here with ONLY the addnorm half
+    - Both objects are compiled with ONLY the addnorm half
       (``build_ffn=False``). The FFN half also defines ``ffn_gelu_bf16`` and
-      ``ffn_eltwise_add_bf16_vector``, which collide with ``addnorm_ffn.o``;
+      ``ffn_eltwise_add_bf16_vector``, which collide across the two sources;
       building the halves separately is what keeps one kernel object per ELF.
-    - ``encoder.o`` must exist in the working directory when aiecc links.
-      ``opcheck.py`` compiles it there.
-    - L1 is 64 KiB per core, and the four tile buffers (x, residual, output1,
-      output2) plus the weight and the 1 KiB stack have to fit. aiecc reports
-      an overflow against the ``aie.tile``, not against the builder, so
-      ``_l1_bytes`` below checks it up front instead.
+    - The object must exist in the working directory when aiecc links.
+      ``compile_addnorm_kernel`` puts it there; ``opcheck.py`` calls it.
+    - L1 is 64 KiB per core, and the tile buffers (x, residual, output, and
+      ``output2`` in the post-add form) plus the weight and the 1 KiB stack have
+      to fit. aiecc reports an overflow against the ``aie.tile``, not against
+      the builder, so ``_l1_bytes`` below checks it up front instead.
+      ``addnorm_max_rows`` exposes the same arithmetic so a caller can derive a
+      legal row count rather than guessing one. It counts ALLOCATIONS, not
+      aircc's ping-pong copies of the DMA-fed buffers, so it is an upper bound
+      and not a target: a shape at the cap may still fail to place.
 """
+
+import os
+import sys
 
 import numpy as np
 from ml_dtypes import bfloat16
+
+_PROJ_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+for _p in (_PROJ_ROOT, os.path.join(_PROJ_ROOT, "llms")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from air.ir import *
 from air.dialects.affine import apply as affine_apply
@@ -92,32 +148,106 @@ EPS = 1e-5
 # be a multiple of it.
 ADDNORM_VEC_LEN = 32
 
-KERNEL_OBJ = "encoder.o"
+# encoder.cc's addnorm half, two outputs, residual added AFTER the norm.
+POST_ADD_KERNEL_OBJ = "encoder.o"
+POST_ADD_SYMBOL = "fused_add_layer_norm_2outs"
+
+# addnorm_ffn.cc's addnorm half built with -DADDNORM_PRE_ADD, one output,
+# residual folded in BEFORE the statistics. Deliberately not the compile gate's
+# `addnorm_ffn_pre_add.o`, which is the full 11-symbol build; see the module
+# docstring.
+PRE_ADD_KERNEL_OBJ = "addnorm_pre_add.o"
+PRE_ADD_SYMBOL = "fused_add_layer_norm_1outs"
 
 # AIE2P core-local memory, and the stack aircc reserves inside it.
 L1_BYTES = 64 * 1024
 L1_STACK_BYTES = 1024
 
 
-def _l1_bytes(rows_per_call, cols, itemsize):
-    """L1 a single tile needs: four activation tiles plus the weight vector."""
-    return 4 * rows_per_call * cols * itemsize + cols * itemsize + L1_STACK_BYTES
+def _tile_buffers(pre_add):
+    """L1 activation tiles the selected entry point needs.
+
+    Post-add allocates x, residual, output1 and output2 -- the kernel writes
+    both outputs whether or not the second is drained. Pre-add's one-output
+    entry point needs no output2.
+    """
+    return 3 if pre_add else 4
+
+
+def _l1_bytes(rows_per_call, cols, itemsize, pre_add=False):
+    """L1 a single tile needs: its activation tiles plus the weight vector."""
+    return (
+        _tile_buffers(pre_add) * rows_per_call * cols * itemsize
+        + cols * itemsize
+        + L1_STACK_BYTES
+    )
+
+
+def addnorm_max_rows(cols, np_dtype=bfloat16, herd_x=8, pre_add=False):
+    """Largest ``rows`` this builder accepts at ``cols``, from the L1 budget.
+
+    ``rows == herd_x * rows_per_call`` (one kernel call per tile), so the cap is
+    ``herd_x`` times the largest ``rows_per_call`` that fits. Provided so a
+    caller derives the legal row count for a new width instead of carrying over
+    one that happened to fit at a narrower one.
+
+    UPPER BOUND, NOT A TARGET. This counts allocations only; aircc ping-pongs
+    the DMA-fed buffers, so a shape sitting at the cap can still fail to place.
+    """
+    itemsize = np.dtype(np_dtype).itemsize
+    budget = L1_BYTES - L1_STACK_BYTES - cols * itemsize
+    rows_per_call = budget // (_tile_buffers(pre_add) * cols * itemsize)
+    return herd_x * rows_per_call
+
+
+def addnorm_kernel_object(pre_add=False):
+    """Name of the object the selected variant links against."""
+    return PRE_ADD_KERNEL_OBJ if pre_add else POST_ADD_KERNEL_OBJ
+
+
+def compile_addnorm_kernel(pre_add=False):
+    """Build the selected variant's object into the CWD, where aiecc looks.
+
+    Both are addnorm-half-only builds. Which SOURCE is compiled is part of the
+    variant, not just which flag: ``encoder.cc`` has no pre-add path.
+    """
+    import shared.infra.external_kernels as ek
+
+    if pre_add:
+        ek.compile_addnorm_ffn(
+            build_ffn=False,
+            build_addnorm=True,
+            pre_add=True,
+            out_name=PRE_ADD_KERNEL_OBJ,
+        )
+    else:
+        ek.compile_encoder(
+            build_ffn=False, build_addnorm=True, out_name=POST_ADD_KERNEL_OBJ
+        )
 
 
 @module_builder
-def build_addnorm_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_call=None):
-    """Build weighted-LayerNorm-plus-residual over an ``herd_x x 1`` herd.
+def build_addnorm_module(
+    rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_call=None, pre_add=False
+):
+    """Build weighted LayerNorm and a residual over an ``herd_x x 1`` herd.
 
     Args:
         rows, cols: L3 activation shape. ``cols`` must be a multiple of
             ``ADDNORM_VEC_LEN``; ``rows`` must equal ``herd_x * rows_per_call``
             -- see the one-call-per-tile constraint in the module docstring.
+            ``addnorm_max_rows`` gives the L1 cap at this width.
         np_dtype: element type; bf16, matching the kernel's C linkage.
         herd_x: AIE columns. Each tile drives three L3->L1 streams (x,
             residual, weight) and one L1->L3 stream.
         rows_per_call: rows resident in L1 per kernel invocation. Defaults to
             ``rows // herd_x``, the only value that keeps the herd loop to one
             trip.
+        pre_add: select ``LayerNorm(x + residual) * weight`` instead of the
+            default ``LayerNorm(x) * weight + residual``. Different object,
+            different symbol, different L1 budget -- see the module docstring,
+            and check against ``addnorm_pre_add_reference``, not
+            ``addnorm_reference``.
 
     Returns:
         air.ir.Module with one function ``addnorm(x, residual, weight, out)``.
@@ -140,15 +270,18 @@ def build_addnorm_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_call=
             "correctness constraint, not a performance one."
         )
 
-    need = _l1_bytes(rows_per_call, cols, np.dtype(np_dtype).itemsize)
+    need = _l1_bytes(rows_per_call, cols, np.dtype(np_dtype).itemsize, pre_add)
     if need > L1_BYTES:
         raise ValueError(
             f"[{rows}, {cols}] over an {herd_x}-column herd needs {need} bytes "
             f"of L1 per tile, over the {L1_BYTES}-byte budget. Raise herd_x or "
-            "lower rows; aiecc would otherwise report this against the "
-            "aie.tile, far from the cause."
+            f"lower rows -- at most "
+            f"{addnorm_max_rows(cols, np_dtype, herd_x, pre_add)} at this width; "
+            "aiecc would otherwise report this against the aie.tile, far from "
+            "the cause."
         )
 
+    kernel_obj = addnorm_kernel_object(pre_add)
     xrt_dtype = type_mapper(np_dtype)
     l3_act_ty = MemRefType.get([rows, cols], xrt_dtype)
     l3_w_ty = MemRefType.get([cols], xrt_dtype)
@@ -157,15 +290,20 @@ def build_addnorm_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_call=
     l1_tile_ty = MemRefType.get([rows_per_call, cols], xrt_dtype, memory_space=l1_space)
     l1_w_ty = MemRefType.get([cols], xrt_dtype, memory_space=l1_space)
 
+    # The two entry points differ by one memref: post-add takes output1 AND
+    # output2, pre-add takes one output. Everything else about the signature,
+    # including the trailing (cols, rows) pair, is shared.
+    kernel_symbol = PRE_ADD_SYMBOL if pre_add else POST_ADD_SYMBOL
+    out_tile_tys = [l1_tile_ty] if pre_add else [l1_tile_ty, l1_tile_ty]
     addnorm_func = FuncOp(
-        "fused_add_layer_norm_2outs",
+        kernel_symbol,
         (
-            [l1_tile_ty, l1_tile_ty, l1_w_ty, l1_tile_ty, l1_tile_ty, T.i32(), T.i32()],
+            [l1_tile_ty, l1_tile_ty, l1_w_ty] + out_tile_tys + [T.i32(), T.i32()],
             [],
         ),
         visibility="private",
     )
-    addnorm_func.attributes["link_with"] = StringAttr.get(KERNEL_OBJ)
+    addnorm_func.attributes["link_with"] = StringAttr.get(kernel_obj)
     addnorm_func.attributes["llvm.emit_c_interface"] = UnitAttr.get()
 
     row_map = AffineMap.get(
@@ -200,7 +338,11 @@ def build_addnorm_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_call=
                     l1_res = AllocOp(l1_tile_ty, [], [])
                     l1_w = AllocOp(l1_w_ty, [], [])
                     l1_out1 = AllocOp(l1_tile_ty, [], [])
-                    l1_out2 = AllocOp(l1_tile_ty, [], [])
+                    # Post-add only. The kernel writes output2 unconditionally
+                    # in that form, so the buffer has to exist even though
+                    # nothing drains it; the pre-add entry point has no such
+                    # argument. See _tile_buffers, which sizes L1 to match.
+                    l1_out2 = None if pre_add else AllocOp(l1_tile_ty, [], [])
                     cols_i32 = ConstantOp(T.i32(), cols)
                     nrows_i32 = ConstantOp(T.i32(), rows_per_call)
 
@@ -239,17 +381,10 @@ def build_addnorm_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_call=
                             src_sizes=[rows_per_call, cols],
                             src_strides=[cols, 1],
                         )
+                        out_operands = [l1_out1] if pre_add else [l1_out1, l1_out2]
                         CallOp(
                             addnorm_func,
-                            [
-                                l1_x,
-                                l1_res,
-                                l1_w,
-                                l1_out1,
-                                l1_out2,
-                                cols_i32,
-                                nrows_i32,
-                            ],
+                            [l1_x, l1_res, l1_w] + out_operands + [cols_i32, nrows_i32],
                         )
                         dma_memcpy_nd(
                             h_out,
@@ -264,21 +399,53 @@ def build_addnorm_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_call=
                     DeallocOp(l1_res)
                     DeallocOp(l1_w)
                     DeallocOp(l1_out1)
-                    DeallocOp(l1_out2)
+                    if l1_out2 is not None:
+                        DeallocOp(l1_out2)
 
-                addnorm_body.attributes["link_with"] = StringAttr.get(KERNEL_OBJ)
+                addnorm_body.attributes["link_with"] = StringAttr.get(kernel_obj)
+
+
+def _layer_norm_f32(x_f32, eps):
+    """Two-pass LayerNorm of an f32 array's rows. No weight, no residual.
+
+    Shared by the two references below so that the ONLY difference between them
+    is which tensor is normalized and where the residual lands -- the ordering
+    is then visible at the call site rather than buried in a branch.
+    """
+    mean = x_f32.mean(axis=-1, keepdims=True)
+    var = ((x_f32 - mean) ** 2).mean(axis=-1, keepdims=True)
+    return (x_f32 - mean) / np.sqrt(var + eps)
 
 
 def addnorm_reference(x, residual, weight, eps=EPS):
-    """FP32 reference for ``LayerNorm(x) * weight + residual``.
+    """FP32 reference for POST-ADD: ``LayerNorm(x) * weight + residual``.
+
+    Normalize, THEN add. The statistics never see ``residual``. This is the
+    oracle for ``build_addnorm_module(..., pre_add=False)`` and for nothing
+    else -- see ``addnorm_pre_add_reference`` for the other ordering.
 
     Two-pass variance in f32, one rounding to bf16 at the end. Not the kernel's
     one-pass form and not its bf16 intermediate roundings -- the point of the
     check is to measure that gap, not to reproduce it.
     """
-    x_f32 = x.astype(np.float32)
-    mean = x_f32.mean(axis=-1, keepdims=True)
-    var = ((x_f32 - mean) ** 2).mean(axis=-1, keepdims=True)
-    normed = (x_f32 - mean) / np.sqrt(var + eps)
+    normed = _layer_norm_f32(x.astype(np.float32), eps)
     out = normed * weight.astype(np.float32) + residual.astype(np.float32)
+    return out.astype(x.dtype)
+
+
+def addnorm_pre_add_reference(x, residual, weight, eps=EPS):
+    """FP32 reference for PRE-ADD: ``LayerNorm(x + residual) * weight``.
+
+    Add, THEN normalize. The statistics are those of the SUM, and the residual
+    is not added again afterwards. This is the oracle for
+    ``build_addnorm_module(..., pre_add=True)``, which is the form
+    ``encoder_bert`` uses at both of its normalization points.
+
+    Same f32 discipline as the post-add reference, and one extra gap it does
+    not reproduce: the kernel forms ``x + residual`` in bf16 before taking the
+    statistics, and this sums in f32. Rounding the sum here would make the
+    check agree with the device for the wrong reason.
+    """
+    summed = x.astype(np.float32) + residual.astype(np.float32)
+    out = _layer_norm_f32(summed, eps) * weight.astype(np.float32)
     return out.astype(x.dtype)
