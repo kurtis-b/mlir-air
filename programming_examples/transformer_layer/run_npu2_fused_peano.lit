@@ -1,0 +1,134 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase E5 fused-mode gate: the D2 layer as MLIR-level fusion via stitch_elf.
+//
+// Three ELFs in ONE runlist submission: the D2 qkv_proj and mha_out_proj
+// modules unchanged, then fused_tail -- a NEW ten-launch stitched module
+// holding residual add + LayerNorm + gamma multiply (ln1), the whole staged
+// FFN, and add + LayerNorm + gamma multiply (ln2) over whole [4096, 768]
+// tensors. Whole tensors are the point: coarse pays 386 of its 402 sync
+// boundaries restaging 64-row addnorm bands through the host, and fusing the
+// norms into one module removes all of it, which is the gating clause this
+// mode owns in the Phase E distinguishability check. One ELF for the whole
+// layer is NOT available -- attention's backend settings cannot co-compile
+// with the GEMMs' and one ELF is one aircc invocation; pattern/fused/fused.py
+// has the derivation. The mode runs through its OWN ELF cache (fused_cache,
+// never shared -- cache reuse is keyed by directory name, and two modes
+// pointed at one directory can trade ELFs, attributing valid numbers to the
+// wrong execution boundary).
+//
+// Two recipes in one file, deliberately: they share a working directory and
+// therefore the ELF cache, so the injected run reuses the three ELFs the
+// clean run compiled -- compilation depends on the shape, not the data -- and
+// costs one dispatch instead of a second full-layer compile.
+//
+// NPU serialization lives one layer down, not in the recipes below: device
+// access is locked on /tmp/npu.lock inside KernelCache, the same inode
+// lit.cfg.py's NPU substitution takes. Taking the outer /tmp/mlir-air-npu.lock
+// here would DEADLOCK against the gate command that already holds it -- BSD
+// flock(2) treats a second open() of the same file as a foreign lock.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming
+// one in prose -- even inside a comment -- registers as a second directive and
+// leaves the test UNRESOLVED. Describe them, never spell them out.
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_npu2_fused_peano
+// RUN: cd test_npu2_fused_peano
+// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile check-fused PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+//
+// The configuration first -- the forced gate configuration, resolved through
+// the registry, plus the mode's own structure line. A registry change that
+// moved any operator's method fails here with its cause on screen.
+// CHECK: fused 4096x768 ffn 3072 12h x 64 (encoder_bert, non-causal, 3 entries over 3 ELFs in one submission)
+// CHECK: qkv_proj  fused-cast (registry), ffn up drain / down fused-cast (registry), o_proj drain (registry)
+// CHECK: fused_tail: add+ln+mul / ffn / add+ln+mul stitched over 16 whole-tensor args (streamed norms, no row banding)
+//
+// The layer executes as one submission -- a runlist split would print more
+// than one dispatch line and fail the totals below, since
+// require_single_submission raises rather than splitting.
+// CHECK: [fused 1/1] qkv_proj + mha_out_proj + fused_tail (one submission)
+//
+// Every boundary, in execution order, each with zero mismatching elements.
+// Named individually rather than counted, so a stage list that dropped or
+// repeated an entry fails here -- the driver requires at least eight DISTINCT
+// names, and this is where the suite enforces the same thing.
+// CHECK: [stage] q {{.*}} mismatch       0
+// CHECK: [stage] k {{.*}} mismatch       0
+// CHECK: [stage] v {{.*}} mismatch       0
+// CHECK: [stage] attn_context {{.*}} mismatch       0
+// CHECK: [stage] attn_out {{.*}} mismatch       0
+// CHECK: [stage] hidden {{.*}} mismatch       0
+// CHECK: [stage] ffn_up {{.*}} mismatch       0
+// CHECK: [stage] ffn_gelu {{.*}} mismatch       0
+// CHECK: [stage] ffn_out {{.*}} mismatch       0
+// CHECK: [stage] output {{.*}} mismatch       0
+// CHECK: [fused] stages: 10/10 clean
+//
+// The mode's own instrumentation: ONE DispatchVector row, because the whole
+// layer is one run_sequence call -- the count is the mode's shape, against
+// coarse's four rows and offload's six.
+// CHECK: [fused] recorded 1 dispatch vectors
+//
+// The vector's CONTENTS, not only its count: the six driver-summed totals,
+// pinned to the measured numbers (the reading of each against coarse's
+// 4 / 131 / 12 / 146 / 402 / 202,902,528 is in pattern/fused/README.md --
+// sync 19 against 402 is the mode's gating clause; air 16 on 3 artifacts
+// against 12 on 4 is the fused-many-launches-into-one-ELF signature 08e
+// predicts). The totals line is printed only after every recorded row passes
+// the as_row() schema in opcheck_layer.dispatch_vector_totals, so a
+// malformed row aborts the run and a run whose totals drift fails right
+// here, before the driver's independent arithmetic over the artifact.
+// CHECK: [fused] dispatch totals: submissions 1 entries 3 air 16 herd 24 sync 19 bytes 184025088
+//
+// Then the layer output itself over all 4096 x 768 elements, and the label
+// naming the MODE's operator -- a test wired to another mode's artifact by
+// mistake fails here rather than passing quietly.
+// CHECK: PASS!
+// CHECK: [opcheck] fused [4096x768_encoder_bert]: PASS
+//
+// THE NEGATIVE CONTROL. Identical reasoning to the block gate's -- ln1_weight,
+// chosen by measurement, perturbed AFTER the golden model was computed -- plus
+// the one stake that is this mode's own: the dispatch vector must be recorded
+// on the injected path too, because the driver requires the fault artifact's
+// summed totals to EQUAL the clean run's. A "skip instrumentation when
+// injecting" shortcut fails below at the recorded-vectors and totals lines,
+// before the driver ever runs.
+//
+// RUN: make -f %S/Makefile check-fused-fault PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s --check-prefix=FAULT
+//
+// The injected element first, so an injection that silently perturbed nothing
+// is visible here rather than read backwards from the verdict. Index 3 is
+// ln1_weight in FUSED_INPUT_NAMES.
+// FAULT: [fault-inject] input 3 at (0,)
+//
+// Nothing upstream of the first gamma multiply reads ln1_weight, so the
+// attention half must still be exact while `hidden` and everything after it
+// moves -- which is what says the stage comparisons are reading THIS run's
+// device buffers rather than replaying the clean run's. Here that carries an
+// extra fact: the injection reaches the device through the content-keyed
+// static broadcast, so a perturbed weight that failed to re-upload would show
+// as ten clean stages, not five.
+// FAULT: [stage] q {{.*}} mismatch       0
+// FAULT: [stage] attn_out {{.*}} mismatch       0
+// FAULT: [stage] hidden {{.*}} mismatch {{[1-9][0-9]*}}
+// FAULT: [fused] stages: 5/10 clean
+//
+// The vector, still recorded under injection -- and totaling EXACTLY what
+// the clean run totals: the six literals below are the same six the clean
+// half pins above, which is the suite's own statement of the equality the
+// driver re-derives from the two artifacts. Injection perturbs one input
+// element after the reference exists and never touches the dispatch path, so
+// a fault run that totals anything else is instrumentation conditional on the
+// injected flag, or a vector that was not measured.
+// FAULT: [fused] recorded 1 dispatch vectors
+// FAULT: [fused] dispatch totals: submissions 1 entries 3 air 16 herd 24 sync 19 bytes 184025088
+//
+// And the verdict in the three forms opcheck.py reports it: the comparison's
+// own, the control's reading of it, and the exit-status summary.
+// FAULT: [opcheck] fused [4096x768_encoder_bert]: FAIL
+// FAULT: [opcheck] fused [4096x768_encoder_bert]: fault-inject input -> FAIL (as required)
+// FAULT: NEGATIVE CONTROL: PASS

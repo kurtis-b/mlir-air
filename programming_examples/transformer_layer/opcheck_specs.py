@@ -58,6 +58,7 @@ from opcheck_prepare import (  # noqa: E402
     prepare_transpose,
 )
 from pattern.coarse import prepare_coarse  # noqa: E402
+from pattern.fused import prepare_fused  # noqa: E402
 from pattern.offload import prepare_offload  # noqa: E402
 from pattern.runlist import prepare_runlist  # noqa: E402
 
@@ -653,5 +654,45 @@ SPECS = [
         # wider tolerance.
         "atol": 1e-1,
         "prepare": prepare_runlist,
+    },
+    {
+        # PHASE E5: the same layer, measured as the `fused` execution
+        # strategy — MLIR-level fusion via stitch_elf, the most fused point
+        # of the taxonomy and the CSV value `fused_elf`. Three ELFs in ONE
+        # runlist submission: the D2 qkv_proj and mha_out_proj modules
+        # unchanged, then a stitched ln1+ffn+ln2 module over whole
+        # [4096, 768] tensors — streamed norms, no row banding — which is
+        # what removes the 386 sync boundaries coarse pays restaging its 64
+        # addnorm bands per normalization point through the host. One ELF for
+        # the whole layer is NOT available: attention requires backend
+        # settings (omit_pingpong, runtime_loop_tiling [1,1]) the 4096-row
+        # GEMMs cannot compile under, and one ELF is one aircc invocation —
+        # pattern/fused/fused.py has the derivation. The driver-summed vector
+        # is 1 submission over 3 entries, against coarse's 4 over 131; the
+        # sync-boundary drop is the mode's gating clause in the Phase E
+        # distinguishability check.
+        "operator": "fused",
+        "shape_key": "4096x768_encoder_bert",
+        "shape": {
+            "seq_len": 4096,
+            "emb_dim": 768,
+            "ffn_dim": 3072,
+            "num_heads": 12,
+            "head_dim": 64,
+        },
+        # Same tensor as the block row, compared the same way at the same
+        # golden seed, so the 1e-1 HARD CEILING carries over. Measured over
+        # 3145728 elements: mean_rel_L1 1.806e-2, atol_required 7.572e-2, a
+        # 1.32x margin — the thinnest of the four modes, and the composition
+        # says why: device attention (the block's own modules, whose error the
+        # host-attention modes avoid) PLUS the decomposed norm tail (which
+        # stages bf16 between add, LayerNorm and gamma-mul where the fused
+        # addnorm does not — runlist, the same decomposition banded, measures
+        # 1.755e-2). The two effects stack: block 1.688e-2 / runlist 1.755e-2
+        # / fused 1.806e-2, every boundary still n_mismatch 0. See the block
+        # entry for why exceeding the ceiling is a defect report, never a
+        # wider tolerance.
+        "atol": 1e-1,
+        "prepare": prepare_fused,
     },
 ]
