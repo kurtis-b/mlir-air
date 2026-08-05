@@ -1,0 +1,95 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase D2 block integration gate: one whole encoder_bert transformer layer.
+//
+// Five operator launches -- qkv_proj, the fused attention + output projection,
+// pre-add addnorm, the staged FFN, pre-add addnorm again -- over four
+// separately compiled ELFs, dispatched through KernelCache.run_sequence, at
+// seq_len 4096 / hidden 768 / ffn 3072 / 12 heads x head_dim 64, non-causal.
+// Compared element-wise against pattern/reference.py, which is iron's golden
+// model's STRUCTURE (its load-bearing draw order, its zeros biases, both
+// workload variants) computed in FP32 from bf16-rounded inputs rather than in
+// iron's bf16 throughout.
+//
+// Every operator here already passed at this width in Phase D1, so a failure
+// is an INTEGRATION failure: an argument map, a layout transition, an
+// external-kernel collision across a multi-operator sequence, or BO reuse under
+// the Phase B allocator. The first of those it caught was the third: the FFN's
+// up-projection and the o-projection are both the drain GEMM method at
+// DIFFERENT tile_n, compile_gemm_mm names its object from the method alone, and
+// the ELF that linked second silently got a 96-wide micro-kernel for its
+// 128-wide tile -- exactly zero in 32 of every 128 output columns.
+//
+// WHY THE PER-BOUNDARY STAGES ARE CHECKED HERE AND NOT ONLY IN THE ARTIFACT
+// A layer that ends in a LayerNorm absorbs an enormous amount of upstream
+// damage. The 25% of the up-projection that came back zero reached the layer
+// output as a 54% mismatch, which says only "something is wrong"; the stage
+// list said "ffn_up, and everything before it is exact". The same measurement
+// in the other direction is in pattern/test_reference.py: swapping the tanh
+// GeLU for the erf form moves the ffn_gelu boundary by 3.6e-3 relative and the
+// layer output by 1.8e-4, two orders of magnitude INSIDE this repository's own
+// rtol. A single end-to-end number cannot see that; ten boundary numbers can.
+//
+// NPU serialization lives one layer down, not in the recipe below. Device
+// access is locked on /tmp/npu.lock, which KernelCache.ensure_loaded holds
+// across binary load and which XRTRunner.run_test holds across load and
+// dispatch (python/air/backend/xrt_runner.py:292) -- the same inode
+// lit.cfg.py's NPU substitution takes, so this interlocks with every other NPU
+// job in the repository while the peano compiles still overlap. Taking the
+// outer /tmp/mlir-air-npu.lock here instead would DEADLOCK: the gate command
+// that invokes this suite already holds that inode, and BSD flock(2) treats a
+// second open() of the same file as a foreign lock, so the nested acquire would
+// block against its own parent until the timeout expires.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming
+// one in prose -- even inside a comment -- registers as a second directive and
+// leaves the test UNRESOLVED. Describe them, never spell them out.
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_npu2_block_peano
+// RUN: cd test_npu2_block_peano
+// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile check-block PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+//
+// The configuration first. None of it is a choice: baseline_768 is the only
+// family whose GEMMs resolve, and seq 4096 is the only point on the ladder
+// where the FFN builds at hidden 768 (its two projections take a different
+// tile_n at every point, and only here does the registry put them on different
+// METHODS, which is what lets them co-link). A registry change that moved
+// either fails here with its cause on screen.
+// CHECK: block 4096x768 ffn 3072 12h x 64 (encoder_bert, non-causal)
+// CHECK: qkv_proj  fused-cast (registry), ffn up drain / down fused-cast (registry), o_proj drain (registry)
+//
+// The row-blocking, because it is the one structural concession in the layer
+// and it is easy to regress silently. addnorm drives three L3->L1 streams per
+// tile against a column's two shim MM2S channels, so it takes exactly one
+// kernel call per tile and L1 caps it at 104 rows at this width; the layer's
+// 4096 rows go through it as 64 dispatches of the 64x768 pre-add shape D1
+// measured. A change that dispatched a WIDER addnorm than was ever validated
+// would show up right here.
+// CHECK: addnorm pre-add 64x768 x64 dispatches (L1 cap 104)
+//
+// Every boundary, in execution order, each with zero mismatching elements
+// against the golden model at rtol 1.6e-2 and that boundary's own measured
+// atol. Named individually rather than counted, so a stage list that dropped an
+// entry or repeated one fails here.
+// CHECK: [stage] q {{.*}} mismatch       0
+// CHECK: [stage] k {{.*}} mismatch       0
+// CHECK: [stage] v {{.*}} mismatch       0
+// CHECK: [stage] attn_context {{.*}} mismatch       0
+// CHECK: [stage] attn_out {{.*}} mismatch       0
+// CHECK: [stage] hidden {{.*}} mismatch       0
+// CHECK: [stage] ffn_up {{.*}} mismatch       0
+// CHECK: [stage] ffn_gelu {{.*}} mismatch       0
+// CHECK: [stage] ffn_out {{.*}} mismatch       0
+// CHECK: [stage] output {{.*}} mismatch       0
+// CHECK: [block] stages: 10/10 clean
+//
+// Then the layer output itself over all 4096 x 768 elements. Both lines, not
+// just the verdict: the first is the comparison's own, the second names the
+// operator and shape, so a test wired to the wrong one fails here rather than
+// passing quietly.
+// CHECK: PASS!
+// CHECK: [opcheck] block [4096x768_encoder_bert]: PASS

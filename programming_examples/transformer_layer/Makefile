@@ -25,6 +25,7 @@ SWEEP_ARGS ?=
 .PHONY: help compile runlist-gate seam-tests clean opcheck-list \
         check-elementwise-add check-causal-mask check-layer-norm check-addnorm \
         check-qkv-proj check-ffn check-mha-out-proj check-fault-control \
+        check-block check-block-fault reference-tests \
         registry-resolution registry-sweep registry-write registry-plan \
         registry-writer-tests
 
@@ -36,6 +37,10 @@ help:
 	@echo "                      No NPU required; this is the PR-safe target."
 	@echo "  make seam-tests     Host-only tests for BO pooling and runlist"
 	@echo "                      aggregation. No NPU required."
+	@echo "  make reference-tests"
+	@echo "                      Host-only checks that the transformer-layer"
+	@echo "                      golden model is the layer it claims to be."
+	@echo "                      No NPU required."
 	@echo "  make opcheck-list   Every (operator, shape) Phase C claims, as JSON."
 	@echo "                      No NPU required."
 	@echo "  make runlist-gate   Phase B hardware gate. NEEDS AN NPU. Wrap it:"
@@ -48,6 +53,14 @@ help:
 	@echo "                      tiles and method from kernel_registry, which"
 	@echo "                      RAISES on a shape nobody swept rather than"
 	@echo "                      guessing."
+	@echo "  make check-block    The whole encoder_bert layer: five operator"
+	@echo "                      launches over four ELFs, against the golden"
+	@echo "                      model, with every boundary compared. NEEDS AN"
+	@echo "                      NPU; wrap it the same way."
+	@echo "  make check-block-fault"
+	@echo "                      That layer's negative control. It must FAIL"
+	@echo "                      under injection, and this target succeeds"
+	@echo "                      exactly when it does."
 	@echo "  make registry-plan  Every (shape, candidate) the sweep would measure."
 	@echo "                      No NPU required."
 	@echo "  make registry-resolution"
@@ -132,6 +145,33 @@ check-ffn:
 # config the builder uses -- a mismatch there does not fail to link, it HANGS.
 check-mha-out-proj:
 	$(call opcheck,mha_out_proj)
+
+# Phase D2: the whole encoder_bert layer, five operator launches over four
+# separately compiled ELFs dispatched through KernelCache.run_sequence, against
+# pattern/reference.py. Same lock, same working directory, and for one extra
+# reason here: the four ELFs are cached in ./block_cache under $(BUILD_DIR), so
+# a clean run and the fault-injected run below share them. Compilation depends
+# on the shape and not on the data, and rebuilding four ELFs to perturb one
+# weight would double this target's hardware time for nothing.
+check-block:
+	$(call opcheck,block)
+
+# The block's negative control, kept beside it rather than folded into
+# check-fault-control: that target is the shared injection machinery's control
+# and runs a cheap 512x512 operator, while this one is a whole layer and costs
+# real hardware time. It injects into ln1_weight, which was chosen by
+# MEASUREMENT -- perturbing the attention weights instead puts zero elements
+# outside the tolerance band, because the layer's two LayerNorms absorb them
+# entirely. See the block section of opcheck_specs.py for the numbers.
+check-block-fault:
+	mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
+	    python3 $(srcdir)/opcheck.py --operator block \
+	        --fault-inject input --expect-failure
+
+# Host-only: the golden model is the layer it claims to be. No NPU, no MLIR.
+reference-tests:
+	python3 $(srcdir)/pattern/test_reference.py
 
 # The negative control: it succeeds only when the injected run is REJECTED BY
 # THE COMPARISON. A check that ignored --fault-inject, or one whose tolerance

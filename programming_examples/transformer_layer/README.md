@@ -6,7 +6,9 @@ the C++ device kernels a full encoder/decoder block needs, compiled with Peano
 for AIE2P.
 
 It also holds Phase B's runtime-seam gate, the Phase C/D1 operator builders and
-their numerical checks, and the Phase C4 registry sweep. The kernel half needs no
+their numerical checks, the Phase C4 registry sweep, and Phase D2's block
+integration gate — one whole `encoder_bert` layer assembled from those operators
+and compared against a shared golden model at every boundary it passes. The kernel half needs no
 NPU, which is what keeps it safe as a PR gate; the seam half is split the same
 way — host-only unit tests, plus one hardware gate. The operator checks all need
 one.
@@ -95,8 +97,12 @@ memory bank) all produce plausible wrong numbers rather than errors.
 | `builders/mha_attention.py` | Attention staging: the seq-first FlashAttention design point, its kernel `-D` flags, and the chunked FP32 oracle |
 | `builders/o_proj.py` | O-projection staging: the registry lookup, the GEMM sub-kernel, and its FP32 oracle |
 | `builders/mha_out_proj.py` | The entry layer that composes the two into one ELF, plus the composed FP32 reference |
+| `builders/block.py` | Phase D2: the five operator launches assembled into four `KernelCache.run_sequence` calls, and every boundary read back |
+| `pattern/reference.py` | The shared golden model — iron's draw order and structure, this repository's FP32-from-bf16 numerics, both workload variants, every boundary. Phase E's strategy directories import this one copy |
+| `pattern/test_reference.py` | Host-only: that the golden model is the layer it claims to be |
 | `run_npu2_<op>_peano.lit` | One per operator: that operator's numerical gate on a real NPU |
 | `run_npu2_fault_control_peano.lit` | Phase C's negative control: the injected run must FAIL |
+| `run_npu2_block_peano.lit` | Phase D2's gate: the whole layer on a real NPU, every boundary checked |
 | `sweep/sweep_families.py` | Which shapes the case matrix needs, and which tilings are worth trying for each |
 | `sweep/sweep_measure.py` | One candidate end to end — build, numerical check, timing. The process the sweep forks |
 | `sweep/registry_writer.py` | The append-only write into the registry JSON and both markdown pages |
@@ -212,6 +218,118 @@ is `seq × seq`, so the family's *width* does not name a shape for it, and
 `encoder_bert` never builds one — the golden reference uses an all-ones attention
 mask for the encoder variant and a `tril` one only for `decoder_gpt2`.
 
+## The block integration gate (Phase D2)
+
+One whole `encoder_bert` layer, at the configuration
+[07b](../../docs/plans/transformer-layer-execution-studies/07b-phase-d2-block-integration.md)
+forces: `seq_len 4096`, hidden 768, ffn 3072, 12 heads × head_dim 64, non-causal.
+
+```bash
+make reference-tests                                        # the golden model, no NPU
+flock -x -w 1800 /tmp/mlir-air-npu.lock make check-block       PEANO_INSTALL_DIR=$PEANO_INSTALL_DIR
+flock -x -w 1800 /tmp/mlir-air-npu.lock make check-block-fault PEANO_INSTALL_DIR=$PEANO_INSTALL_DIR
+```
+
+Five operator launches over four separately compiled ELFs:
+
+| # | operator | in → out |
+|---|---|---|
+| 1 | `qkv_proj` | `x` → `q, k, v` |
+| 2 | `mha_out_proj` | `q, k, v, w_o` → `attn_context, attn_out` |
+| 3 | `addnorm` **pre-add** ×64 | `attn_out, x, ln1_weight` → `hidden` |
+| 4 | `ffn` | `hidden, w_up, w_down` → `ffn_up, ffn_gelu, ffn_out` |
+| 5 | `addnorm` **pre-add** ×64 | `ffn_out, hidden, ln2_weight` → `output` |
+
+`layer_norm`, `elementwise_add` and `causal_mask` are not on this path — the
+residual add lives inside the pre-add `addnorm` and `encoder_bert` is
+bidirectional.
+
+### The golden model
+
+`pattern/reference.py` ports the **structure** of iron's
+`generate_golden_reference` and not its numerics. The draw order is load-bearing
+and is preserved exactly (`input`, then `q/k/v/attn_output` weights, then
+`ln1_weight`, `ffn_up`, `ffn_down`, `ln2_weight`; `ln*` is `rand`, not `randn`;
+the biases are `zeros` and consume no RNG, so they are not in the order). What
+is dropped is `dtype="bf16"` throughout: this chain is eight GEMMs, two
+LayerNorms and a softmax, and a bf16 oracle accumulates error in the same
+direction as the device the whole way down. Draws are f32 rounded once to bf16 —
+what the device is actually given — and the arithmetic is f32.
+
+Each boundary is computed by calling the operator oracle `opcheck.py` already
+validated that operator against in D1, so there is one implementation of each
+piece of arithmetic rather than two that can drift.
+`pattern/test_reference.py` pins that composition against a straight-line torch
+transcription of iron's structure, because a composition can be well-typed and
+still be the wrong layer.
+
+### The ten boundaries, and why they are not a nicety
+
+| boundary | elements | `mean_rel_L1` | `atol_required` | `atol` | margin |
+|---|---|---|---|---|---|
+| `q` / `k` / `v` | 3145728 each | 9.7e-3 | 3.1e-3 | 5e-3 | 1.6× |
+| `attn_context` | 3145728 | 1.774e-1 | 2.288e-4 | 1e-3 | 4.4× |
+| `attn_out` | 3145728 | 1.406e-1 | 7.371e-4 | 2.5e-3 | 3.4× |
+| `hidden` | 3145728 | 5.181e-3 | 1.176e-2 | 3.5e-2 | 3.0× |
+| `ffn_up` | 12582912 | 1.154e-2 | 4.977e-2 | 1.5e-1 | 3.0× |
+| `ffn_gelu` | 12582912 | 1.660e-2 | 4.519e-2 | 1.5e-1 | 3.3× |
+| `ffn_out` | 3145728 | 1.783e-2 | 1.144e-1 | 3.0e-1 | 2.6× |
+| `output` | 3145728 | 1.688e-2 | 7.398e-2 | 1e-1 | 1.35× |
+
+The layer's own relative error, 1.688e-2, is within 8% of the `ffn` operator's
+1.569e-2 at the same shape: the FFN dominates and nothing downstream amplifies
+it. What makes the *absolute* number large is scale. The golden model's
+activations run around 1 where the registry's GEMM sweep puts a depth-3072
+reduction at `1/sqrt(3072)`, roughly 60× smaller; the `ffn` row's 1.472e-3
+scaled by that is 9e-2, which is what reaches the second LayerNorm and, divided
+by its ~1.2 row standard deviation and multiplied by a gamma in [0, 1), is the
+measured 7.4e-2. **`atol` is 1e-1, the hard ceiling, at a 1.35× margin** — the
+thinnest in this example, stated rather than padded because there is nowhere to
+pad to. The final LayerNorm renormalizing to roughly unit scale is the only
+reason the layer fits under the ceiling at all.
+
+`attn_context` and `attn_out` have a *relative* error above 14% and an
+`atol_required` three orders of magnitude below everything else, which is one
+fact and not two. iron's `val_range = 0.05` puts attention scores around 5e-3, so
+the softmax is nearly uniform, the attention output is an average of 4096 V rows,
+and `attn_out` lands around 1e-3 against a residual `x` around 5e-2. A near-uniform
+average is a small difference of similar numbers, so its relative error is large
+and its absolute error is tiny — and the attention half contributes a few percent
+of what the first LayerNorm sees. That last part is why the per-boundary
+comparison is a work item:
+
+- Perturbing one element of `w_o`, or of the fused QKV weight, by the shared
+  `FAULT_DELTA` of 2.0 puts **zero** elements of the layer output outside the
+  tolerance band. A negative control injected there would pass under injection
+  and prove nothing. The block's control goes into `ln1_weight`, which reaches
+  8% of the output through two paths (the FFN's input *and* the second addnorm's
+  residual); `opcheck_specs.py` records the measurement for all seven candidates.
+- Swapping the tanh GeLU for the erf form moves `ffn_gelu` by 3.6e-3 relative and
+  the layer output by 1.8e-4 — two orders of magnitude *inside* `rtol`.
+  `pattern/test_reference.py` measures both.
+- The 25% of `ffn_up` that came back zero during bring-up (below) reached the
+  layer output as "54% of elements wrong", which says only that something is
+  broken. The stage list said `ffn_up`, and that everything before it was exact.
+
+### Four dispatch sequences, not one
+
+`addnorm` cannot be dispatched over 4096 rows. Its kernel drives three L3→L1
+streams per tile against a column's two shim MM2S channels, so it takes exactly
+one kernel call per tile and L1 caps it at `addnorm_max_rows(768, pre_add=True)`
+= 104 rows. The layer's two normalization points are therefore **row-blocked
+into 64 dispatches each of the 64×768 pre-add shape D1 measured** — the strongest
+form the constraint allows, since the block then runs the operator that was
+validated rather than a wider one that was not.
+
+The consequence is a host restage between operators, because a dispatch argument
+is a whole BO: `run.set_arg` takes a buffer, never a buffer and an offset. So the
+layer is four `run_sequence` calls — `qkv_proj + mha_out_proj`, ln1, `ffn`, ln2 —
+of which only the first is fully device-resident (`q`, `k` and `v` are produced
+by one artifact and consumed by the next without touching the host). A single
+sequence would be preferable and is not available; raising `rows` past the cap is
+not the way to get one, because the builder raises precisely because the two-trip
+form miscompiles rather than failing.
+
 ## The registry sweep
 
 The three GEMM-backed operators above take their tile sizes and method from
@@ -317,6 +435,60 @@ a second object per `(method, tile_n)` — the `sym_suffix` / `link_with_name`
 mechanism already supports it, `gemm_method_spec` in `llms/shared/` is where the
 suffix is minted, and that file is off limits to this study. Phase E has to clear
 this before it can walk the full ladder.
+
+**The same `tile_n` mismatch bites across *separate* ELFs too, and there it does
+not fail — it returns zeros.** `compile_gemm_mm` names its object from the
+**method alone**: `mm_m32.o` for `drain`, `mm_m64.o` for `fused-cast`. `tile_n`
+is baked in as `-DDIM_N` and does not reach the name. So two operators of the
+same method at different `tile_n` write the same file with different contents,
+and each ELF links whichever was written last. Phase D2 has exactly that pair —
+the FFN's up-projection is `drain` at `tile_n = 128`, the o-projection is `drain`
+at `tile_n = 96` — and building every object up front and then every ELF gave the
+FFN a 96-wide micro-kernel for its 128-wide tile.
+
+Nothing failed. The ELF built, loaded, dispatched, and returned **exactly zero
+for 32 of every 128 up-projection columns** — 25% of `ffn_up`, uniformly across
+every row block and every column tile, with the other 75% correct to
+`mean_rel_L1 = 1.2e-2`. The GeLU passed the zeros through and the
+down-projection's 3072-deep reduction smeared them over every element of the FFN
+output, which reached the layer output as "54% of elements wrong". It is the same
+shape of defect C4 found — a plausibly-shaped output that resolves cleanly from
+the registry and does not compute — and the per-boundary stage list is what
+localized it to `ffn_up` in one run.
+
+D1 never met this because each operator ran in its own `opcheck.py` invocation
+and no single operator holds two same-method GEMMs at different `tile_n`. Any
+caller that builds several of these operators together does meet it.
+`compile_block_artifacts` builds each artifact's objects immediately before its
+own ELF, which is the fix available inside this example; the real one is the same
+`(method, tile_n)` object name the section above needs.
+
+**`addnorm` caps at 104 rows at width 768, so the layer is row-blocked.** Three
+L3→L1 streams per tile (x, residual, weight) against a column's two shim MM2S
+channels means exactly one kernel call per tile, and L1 then caps `rows` at
+`herd_x × (what fits)`. The block's 4096 rows go through as 64 dispatches of the
+64×768 shape D1 measured. That is not a tuning choice and raising it is not
+available: `build_addnorm_module` raises above the cap, and it raises because the
+two-trip form *miscompiles* rather than failing.
+
+**A dispatch argument is a whole BO.** `run.set_arg` takes a buffer, never a
+buffer and an offset, and `bo_pool` allocates per named buffer. An operator that
+consumes one 4096-row tensor in 64 row bands therefore needs 64 buffers, and the
+tensor has to be cut into them on the host — which is why the block is four
+`run_sequence` calls rather than one, and why only the first of them
+(`qkv_proj` → `mha_out_proj`) is fully device-resident.
+
+**`builders/gelu.py`'s docstring overstates the erf/tanh gap.** It says the two
+forms "differ by up to ~1e-3 absolute around |x| = 2 and would not survive
+`rtol = 1.6e-2` on its own". Measured over `x ∈ [-6, 6]`: the worst absolute
+difference is **4.7e-4**, at `x = 2.70`, and the `atol_required` for the
+substitution over the whole range is **3.6e-4** — comfortably inside any `atol`
+in this example. Using the tanh form is still correct, because it is what the
+kernel computes; what is wrong is the claim that a tolerance check would catch
+the substitution. `pattern/test_reference.py` pins the activation by identity
+against `gelu_tanh_reference` instead, and records the layer-level number:
+swapping the forms moves `ffn_gelu` by 3.6e-3 relative and the layer output by
+1.8e-4.
 
 **`best.high` is the fastest method, not the one every builder can use.**
 `build_qkv_proj_module` folds its three-way C split into `fused-cast`'s separate
