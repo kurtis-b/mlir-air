@@ -1,0 +1,35 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase E3: host-only checks on the query-blocked attention that offload and
+// runlist share (pattern/blocked_attention.py).
+//
+// The module is the mode-side implementation of the one boundary the offload
+// and runlist strategies keep on the host, written to be arithmetically
+// independent of the numpy oracle the golden model uses. These checks pin the
+// two implementations against each other on identical bf16 inputs -- the
+// comparison no hardware gate performs, because the hardware gate's attention
+// inputs already carry device GEMM error -- plus the blocking invariance, the
+// scratch-cap thresholds at the two documented ladder rungs, and the scale
+// convention against a direct math.exp computation.
+//
+// No NPU, no XRT and no MLIR: numpy and torch on the host, so this sits beside
+// the reference tests and requires neither `ryzen_ai_npu2` nor `peano`.
+//
+// The test file carries no framework dependency -- pytest is not installed in
+// the sandbox venv -- so it runs as a plain script and prints a pass count,
+// matched exactly so a test that stops being collected fails here instead of
+// passing quietly.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming
+// one in prose -- even inside a comment -- registers as a second directive and
+// leaves the test UNRESOLVED. Describe them, never spell them out.
+//
+// RUN: python3 %S/pattern/test_blocked_attention.py | FileCheck %s
+//
+// CHECK: PASS  test_agrees_with_the_independent_oracle
+// CHECK: PASS  test_blocking_does_not_change_the_arithmetic
+// CHECK: PASS  test_causal_first_row_attends_only_to_itself
+// CHECK: PASS  test_query_block_size_thresholds
+// CHECK: PASS  test_scale_is_rsqrt_head_dim
+// CHECK: blocked attention tests: 5/5 passed
