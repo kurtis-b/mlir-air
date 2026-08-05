@@ -45,18 +45,21 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+from opcheck_layer import prepare_block  # noqa: E402
 from opcheck_prepare import (  # noqa: E402
     prepare_addnorm,
-    prepare_block,
     prepare_causal_mask,
     prepare_elementwise_add,
+    prepare_elementwise_mul,
     prepare_ffn,
     prepare_layer_norm,
     prepare_mha_out_proj,
     prepare_qkv_proj,
+    prepare_transpose,
 )
 from pattern.coarse import prepare_coarse  # noqa: E402
 from pattern.offload import prepare_offload  # noqa: E402
+from pattern.runlist import prepare_runlist  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # THE baseline_768 SET (D1)
@@ -136,6 +139,54 @@ SPECS = [
         # unconstrained numbers happened to land.
         "atol": 5e-2,
         "prepare": prepare_elementwise_add,
+    },
+    {
+        # PHASE E4: the operator built from nothing. 512x512 first for the
+        # cheap standing negative control (the driver injects an operator's
+        # FIRST declared shape); `b` is uniform(0.5, 1.5) so the injected
+        # delta cannot be swallowed by a near-zero multiplicand -- see
+        # prepare_elementwise_mul.
+        "operator": "elementwise_mul",
+        "shape_key": "512x512",
+        "shape": {"rows": 512, "cols": 512},
+        # MEASUREMENT PENDING FIRST HARDWARE RUN. Expected to match
+        # elementwise_add's profile -- a single bf16 rounding of an
+        # exact-in-f32 product is always within rtol alone, so atol_required
+        # should measure 0.0 and atol stays at the tier's 5e-2 rather than
+        # being driven arbitrarily small.
+        "atol": 5e-2,
+        "prepare": prepare_elementwise_mul,
+    },
+    {
+        # baseline_768, the exact shape the runlist mode's two gamma
+        # multiplies dispatch. Rows are free for this operator (the row count
+        # only sets each tile's streaming trip count), so they are the block's
+        # own 4096, same as elementwise_add's row above.
+        "operator": "elementwise_mul",
+        "shape_key": "4096x768",
+        "shape": {"rows": 4096, "cols": 768},
+        # MEASUREMENT PENDING FIRST HARDWARE RUN. Same expectation, and same
+        # 5e-2, as the 512x512 row above.
+        "atol": 5e-2,
+        "prepare": prepare_elementwise_mul,
+    },
+    {
+        # PHASE E4: pure data movement -- the transpose iron's runlist
+        # dispatches as k_transpose. Validated standalone at the k^T shape the
+        # gate configuration would give it; the runlist mode's README records
+        # why it is not on that mode's dataflow (its consumer, the scores
+        # GEMM, is host torch on this device). Every output element must be
+        # BIT-identical to its input element, so n_mismatch 0 here is
+        # exactness, not tolerance.
+        "operator": "transpose",
+        "shape_key": "4096x768",
+        "shape": {"rows": 4096, "cols": 768},
+        # MEASUREMENT PENDING FIRST HARDWARE RUN. Data movement must be
+        # bit-exact (every error statistic 0.0). atol keeps the tier's 5e-2
+        # because there is nothing to size it against; any nonzero error here
+        # is a moved byte, and n_mismatch catches it at any tolerance.
+        "atol": 5e-2,
+        "prepare": prepare_transpose,
     },
     {
         "operator": "causal_mask",
@@ -561,5 +612,36 @@ SPECS = [
         # wider tolerance.
         "atol": 1e-1,
         "prepare": prepare_offload,
+    },
+    {
+        # PHASE E4: the same layer, measured as the `runlist` execution
+        # strategy — the fine-grained point of the taxonomy. Thirteen
+        # single-operator entries over two runlists (q/k/v; then output_proj,
+        # residual add, LayerNorm, gamma multiply, up_proj, GeLU, down_proj,
+        # residual add, LayerNorm, gamma multiply), host torch attention
+        # between them through the SAME blocked implementation offload uses.
+        # The driver-summed vector is 2 submissions over 13 entries — BELOW
+        # coarse's 131, because 128 of coarse's entries are addnorm's row
+        # blocking while every operator this mode decomposes to streams its
+        # rows in one launch. pattern/runlist/README.md records why that is
+        # the honest number and what it means for the entries-order clause.
+        "operator": "runlist",
+        "shape_key": "4096x768_encoder_bert",
+        "shape": {
+            "seq_len": 4096,
+            "emb_dim": 768,
+            "ffn_dim": 3072,
+            "num_heads": 12,
+            "head_dim": 64,
+        },
+        # Same tensor as the block row, compared the same way at the same
+        # golden seed, so the 1e-1 HARD CEILING carries over. MEASUREMENT
+        # PENDING FIRST HARDWARE RUN; expected between offload's (host norms,
+        # 1.82x margin) and the block's (device fused norms, 1.35x margin),
+        # since this mode's norms are device kernels but its attention is
+        # host f32. See the block entry for why exceeding the ceiling is a
+        # defect report, never a wider tolerance.
+        "atol": 1e-1,
+        "prepare": prepare_runlist,
     },
 ]

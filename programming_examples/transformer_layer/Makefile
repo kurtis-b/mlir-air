@@ -26,7 +26,8 @@ SWEEP_ARGS ?=
         check-elementwise-add check-causal-mask check-layer-norm check-addnorm \
         check-qkv-proj check-ffn check-mha-out-proj check-fault-control \
         check-block check-block-fault check-coarse check-coarse-fault \
-        check-offload check-offload-fault \
+        check-offload check-offload-fault check-runlist check-runlist-fault \
+        check-transpose check-elementwise-mul \
         reference-tests block-cache-tests blocked-attention-tests \
         registry-resolution registry-sweep registry-write registry-plan \
         registry-writer-tests
@@ -80,6 +81,16 @@ help:
 	@echo "                      submission, through its own ELF cache. NEEDS AN"
 	@echo "                      NPU."
 	@echo "  make check-offload-fault"
+	@echo "                      That mode's negative control; must FAIL under"
+	@echo "                      injection, with the vectors still recorded."
+	@echo "  make check-transpose | check-elementwise-mul"
+	@echo "                      The two Phase E4 operators, same opcheck"
+	@echo "                      contract as every other operator. NEED AN NPU."
+	@echo "  make check-runlist  The same layer as the Phase E 'runlist'"
+	@echo "                      strategy: thirteen single-operator entries over"
+	@echo "                      two runlists, host torch attention between"
+	@echo "                      them, through its own ELF cache. NEEDS AN NPU."
+	@echo "  make check-runlist-fault"
 	@echo "                      That mode's negative control; must FAIL under"
 	@echo "                      injection, with the vectors still recorded."
 	@echo "  make blocked-attention-tests"
@@ -266,6 +277,34 @@ check-offload-fault:
 	    python3 $(srcdir)/opcheck.py --operator offload \
 	        --fault-inject input --expect-failure
 
+# Phase E4's two new operators. transpose is pure data movement (its check is
+# exactness); elementwise_mul is the gamma multiply the runlist mode's
+# decomposed normalization needs. Both go through the same opcheck contract as
+# every other operator.
+check-transpose:
+	$(call opcheck,transpose)
+
+check-elementwise-mul:
+	$(call opcheck,elementwise_mul)
+
+# Phase E4: the same layer, measured as the `runlist` execution strategy — the
+# fine-grained point of the taxonomy. Thirteen single-operator entries over two
+# runlists (host torch attention between them, shared with offload), each
+# runlist forced single-submission. Its own ELF cache (./runlist_cache under
+# $(BUILD_DIR)) for the same reason as the other modes'.
+check-runlist:
+	$(call opcheck,runlist)
+
+# The mode's negative control. Same reasoning as check-coarse-fault, including
+# the mode-specific stake: the dispatch vectors must be recorded on the
+# injected path too, since the driver requires the fault artifact's summed
+# totals to equal the clean run's.
+check-runlist-fault:
+	mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
+	    python3 $(srcdir)/opcheck.py --operator runlist \
+	        --fault-inject input --expect-failure
+
 # Host-only: the query-blocked attention offload and runlist share. No NPU.
 blocked-attention-tests:
 	python3 $(srcdir)/pattern/test_blocked_attention.py
@@ -328,4 +367,4 @@ registry-writer-tests:
 
 clean:
 	rm -rf $(BUILD_DIR) __pycache__ runlist_gate_cache block_cache coarse_cache \
-	    offload_cache
+	    offload_cache runlist_cache

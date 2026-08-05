@@ -51,7 +51,7 @@ for _p in (_PROJ_ROOT, os.path.join(_PROJ_ROOT, "llms"), _EXAMPLE_ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from opcheck_prepare import prepare_layer_dispatch  # noqa: E402
+from opcheck_layer import prepare_layer_dispatch  # noqa: E402
 
 from pattern import EXECUTION_MODE_CSV  # noqa: E402
 

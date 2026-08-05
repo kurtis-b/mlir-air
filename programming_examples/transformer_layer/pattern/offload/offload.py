@@ -95,11 +95,11 @@ from builders.block_cache import (  # noqa: E402
     save_fingerprints,
 )
 from builders.gemm_spec import resolve_gemm_spec, spec_herd  # noqa: E402
-from opcheck_prepare import (  # noqa: E402
+from opcheck_layer import (  # noqa: E402
     BLOCK_STAGE_ATOL,
-    _spec_digest,
-    dispatch_vector_totals,
+    print_dispatch_totals,
 )
+from opcheck_prepare import _spec_digest  # noqa: E402
 from pattern import EXECUTION_MODE_CSV  # noqa: E402
 from pattern.blocked_attention import (  # noqa: E402
     blocked_attention,
@@ -535,21 +535,11 @@ def prepare_offload(shape, seed=42):
         clean = sum(1 for s in stages if s["n_mismatch"] == 0)
         print(f"[offload] stages: {clean}/{len(stages)} clean")
         # On the fault path too — the FAULT half of the lit recipe matches the
-        # two lines below against the SAME literals as the clean half, so
+        # two printed lines against the SAME literals as the clean half, so
         # instrumentation conditional on the injected flag, a malformed row
-        # (`dispatch_vector_totals` raises, failing the run) or drifted totals
+        # (the shared validation raises, failing the run) or drifted totals
         # fail in the suite before the driver's comparison sees them.
-        print(f"[offload] recorded {len(vector_rows)} dispatch vectors")
-        totals = dispatch_vector_totals(vector_rows)
-        print(
-            f"[offload] dispatch totals: "
-            f"submissions {totals['host_submissions']} "
-            f"entries {totals['runlist_entries']} "
-            f"air {totals['air_launches']} "
-            f"herd {totals['herd_launches']} "
-            f"sync {totals['sync_boundaries']} "
-            f"bytes {totals['bytes_transferred']}"
-        )
+        print_dispatch_totals("offload", vector_rows)
         return [boundaries["output"]], {
             "stages": stages,
             "stages_passed": clean == len(stages),
