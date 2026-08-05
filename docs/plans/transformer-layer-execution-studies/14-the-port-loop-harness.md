@@ -70,6 +70,50 @@ was exercised at the right shape are different layers, and re-using the first fo
 you neither.** A coverage clause needs its own freshness, its own verdict re-derivation, and its
 own negative control.
 
+### A seventh: what a provider outage found that nothing else had
+
+`[2026-08-05]` A sustained `529 Overloaded` incident during D1 halted the run twice. The retries
+were the least interesting part; recovering from them exposed two defects in paths that only
+execute after something has already gone wrong, which is why nine phases had never reached them.
+
+**`state_halt` did not record where it halted.** With `.resume_phase` null, `run_phase` computes
+`resume_from = 0` and re-runs the phase from its implement session — throwing away completed,
+committed work. Worse, at `resume_from = 0` it also re-derives `_START_SHA` from the *current*
+HEAD, so the review diff and the gate-file fingerprint baseline both come from a tree that already
+contains the halted attempt's commits: the reviews would have seen an empty diff and the tamper
+check would have been vacuous. That is the same defect as the working-tree fingerprint baseline in
+[the table above](#anti-reward-hacking-and-how-it-failed-first), reached by a different road. The
+halt message instructs the operator to run `resume`, so that instruction has to be correct.
+
+**Retries were charged against `PL_MAX_INVOCATIONS`.** Nine attempts were spent without a single
+token billed — a run exhausting its budget while standing still. The cap bounds agent work and an
+attempt that never reached the model did none; the wall-clock deadline is the right bound on
+waiting.
+
+The lesson is not about outages. It is that **the recovery paths are the least-tested code in the
+harness, and they are the ones that run when you are least able to supervise them.** Both defects
+were latent from the first phase and neither could surface until a halt happened somewhere other
+than the implement step.
+
+### The confirm review, exercised
+
+`[2026-08-05]` D2 round 3 raised two blocking findings — the block lit gate never invoked
+`check-block-fault`, and the golden-model identity tests were enrolled in no lit test at all. The
+fix session addressed both, and the confirm review then read that fix diff alone
+(`64e946d7..HEAD`) and returned clean, naming each finding and what resolved it. That is C4's exact
+situation, and it is now reviewed rather than verified by hand afterwards.
+
+It also stayed quiet when it should: D2's round-2 fix was covered by round 3's review, so no
+confirm ran for it. Cost was one codex invocation, about two minutes.
+
+One caveat found the same night. D1's round-3 review raised a blocking finding — that the new
+`baseline_768` shapes were never fault-injected — which was **wrong**, because the driver injects
+every one of them. The reviewer could not see that: the driver's own commits sat *before* the phase
+base, so they were outside the review diff. Re-running the round with those commits inside the diff
+cleared it immediately. This is the same lesson as "review the harness alongside the phase", in the
+opposite direction: excluding the driver hid a check that *exists*, and cost a fix round to
+rediscover.
+
 `cmd_loop` reads `.phases` from `state.json`, not from `PL_PHASES_IN_SCOPE`, and `resume-at`
 resolves an unknown phase id to `index // 0` — i.e. **phase 0**, re-running the first phase. After
 changing scope, launch with `start`, which re-inits state.
@@ -266,6 +310,11 @@ a system prompt plus post-hoc `git status` checks, not a sandbox.
 | C3 | — | 68 min |
 | C4 | — | 504 min, then 66 min to re-run the gate after the objective-check bug |
 | C1–C4 together | 10 of 40 | ~12 h |
+| D1 | — | 11 min of work, inside a ~2 h window dominated by a provider outage |
+| D2 | — | 156 min |
+| D1 + D2 together | 21 of 40 | ~4.5 h wall clock, of which ~1 h was the outage |
+
+D1's eleven minutes are real: its implement session did the work in one pass, all three review rounds were clean on the code, and the gate plus the thirteen fault injections ran in four. The wall-clock window around it was three times that, entirely because of the 529 incident below. **Splitting Phase D paid for itself the same way splitting C did** — D2 needed 156 minutes and two rounds of substantive fixes, and none of that re-ran D1's hardware time.
 
 Phase B's six hours were dominated by the hardware runlist spike and by ten `make verify` runs
 across every shipped model — the cross-deployment regression rule being honoured rather than

@@ -227,4 +227,4 @@ registry-writer-tests:
 	python3 $(srcdir)/sweep/test_registry_writer.py
 
 clean:
-	rm -rf $(BUILD_DIR) __pycache__ runlist_gate_cache
+	rm -rf $(BUILD_DIR) __pycache__ runlist_gate_cache block_cache

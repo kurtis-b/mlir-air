@@ -70,6 +70,30 @@ the objective check demanded a registry mtime no honest run could produce — re
 [14](14-the-port-loop-harness.md). The registry grew from 33 to 69 bf16-out GEMM shapes with every
 pre-existing row byte-identical, and all ten shipped LLM deployments still pass `make verify`.
 
+Phase D ran as D1 and D2 on 2026-08-05, 21 of 40 invocations, ~4.5 hours wall clock (of which
+about an hour was a provider outage). Both passed gate, objective and tamper checks. One full
+`encoder_bert` layer at `baseline_768`, `seq = 4096`, now matches an FP32 torch golden model on
+real hardware over its whole 4096x768 output with zero mismatches, and localizes to any of ten
+per-boundary intermediates.
+
+Three things Phase D established that were not known when it was specified:
+
+- **The pre-add `addnorm` was missing.** The operator Phase C validated computes
+  `LayerNorm(x) * weight + residual`; `encoder_bert` needs `LayerNorm(x + residual) * weight`. The
+  kernel supported both behind `-DADDNORM_PRE_ADD` and Phase A already built the object, but no
+  builder exposed it and nothing had ever dispatched it. It is now built, validated, and its
+  negative control demonstrated.
+- **`compile_gemm_mm`'s object name is a second instance of the `tile_n` collision.** It names its
+  object from the GEMM method alone while baking `tile_n` in as `-DDIM_N`, so the FFN's
+  up-projection and the o-projection write the same file and one silently gets the other's
+  micro-kernel. D2 works around it by interleaving; the real fix is the same `(method, tile_n)`
+  naming in `llms/shared/builders/gemm_builder.py` that the ladder needs. **Phase E now has two
+  reasons to make that change.**
+- **The layer's tolerance has no headroom.** `atol` sits at the hard `1e-1` ceiling with a 1.35x
+  margin over the measured `atol_required` of 7.4e-2. The cause is output scale, not error --
+  `mean_rel_L1` is 1.7e-2, in line with the per-operator rows -- but Phase E chains this same
+  arithmetic four ways, and there is nowhere for a mode to drift.
+
 **A loose end that C4 exposed, closed on 2026-08-05.** The three review rounds were the whole
 review budget, so a finding raised in round 3 was fixed by round 3's fix session and then *nothing
 re-reviewed it*. C4's round-3 review raised two blocking findings — the `64x768x2304` QKV shape
