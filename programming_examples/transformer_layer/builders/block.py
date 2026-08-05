@@ -373,39 +373,50 @@ _ARTIFACT_BUILD = {
 def compile_block_artifacts(cache, cfg, run_only=False):
     """Compile the four ELFs into ``cache``, reusing only exact matches.
 
-    EACH ARTIFACT'S EXTERNAL OBJECTS ARE BUILT IMMEDIATELY BEFORE ITS OWN ELF,
-    and this is a correctness requirement rather than a tidiness one.
-    ``compile_gemm_mm`` names its output from the METHOD ALONE -- ``mm_m32.o``
-    for drain, ``mm_m64.o`` for fused-cast (``llms/shared/builders/
-    gemm_builder.py``) -- while its ``DIM_N`` is baked in from ``tile_n``. Two
-    operators of the same method at different ``tile_n`` therefore write the
-    SAME FILE with different contents, and aiecc links whichever was written
-    last.
+    EVERY EXTERNAL OBJECT FIRST, THEN EVERY ELF. The order used to be the other
+    way round -- each artifact's objects built immediately before its own ELF --
+    and that interleaving was a correctness requirement, not tidiness. It is
+    HISTORICAL now, and the history is worth keeping because the failure it
+    worked around was silent:
 
-    In this block that is not hypothetical: the FFN's up-projection is drain at
-    ``tile_n = 128`` and the o-projection is drain at ``tile_n = 96``. Building
-    every object up front and then every ELF gave the FFN a 96-wide
-    micro-kernel for its 128-wide tile, and it did not fail -- it returned
-    exactly zero for 32 of every 128 output columns, 25% of the up-projection,
-    which the GeLU then passed through and the down-projection's 3072-deep
-    reduction smeared over every element of the FFN output. The per-boundary
-    stage list is what localized it to ``ffn_up``; the layer output alone said
-    only that 54% of the layer was wrong.
+        ``compile_gemm_mm`` named its output from the GEMM METHOD ALONE
+        (``mm_m32.o`` for drain, ``mm_m64.o`` for fused-cast) while its
+        ``DIM_N`` was baked in from ``tile_n``. Two operators of the same method
+        at different ``tile_n`` therefore wrote the SAME FILE with different
+        contents, and aiecc linked whichever was written last.
 
-    D1 never met this because each operator ran in its own ``opcheck.py``
-    invocation and no single operator holds two same-method GEMMs at different
-    ``tile_n``. Any caller that builds several of these operators together does
-    meet it. Interleaving is the fix available here; the real one is a
-    ``tile_n``-aware object name in ``llms/shared``, which this study may not
-    edit.
+        In this block that was not hypothetical: the FFN's up-projection is
+        drain at ``tile_n = 128`` and the o-projection is drain at
+        ``tile_n = 96``. Building every object up front and then every ELF gave
+        the FFN a 96-wide micro-kernel for its 128-wide tile, and it did not
+        fail -- it returned exactly zero for 32 of every 128 output columns, 25%
+        of the up-projection, which the GeLU then passed through and the
+        down-projection's 3072-deep reduction smeared over every element of the
+        FFN output. The per-boundary stage list is what localized it to
+        ``ffn_up``; the layer output alone said only that 54% of the layer was
+        wrong.
+
+        D1 never met this because each operator ran in its own ``opcheck.py``
+        invocation and no single operator holds two same-method GEMMs at
+        different ``tile_n``. Any caller that built several of these operators
+        together did.
+
+    Phase E1 fixed the root cause instead: ``gemm_builder.gemm_variant_names``
+    mints both the object name and the symbol suffix per ``(tile_m, tile_n)``, so
+    those two GEMMs are now ``mm_m32n128.o`` and ``mm_m32n96.o`` and cannot
+    overwrite each other. The interleaving is therefore removed -- but note what
+    still holds and what does not. It is safe to build all the objects first
+    because the NAMES are distinct; it would not be safe again if any caller went
+    back to naming an object by anything coarser than its full tile shape. That
+    is the invariant, not the ordering.
 
     ``run_only`` REUSES A CACHED ELF ONLY WHERE ITS FINGERPRINT STILL MATCHES,
     and the name is not the fingerprint -- ``builders/block_cache.py`` has the
     argument for why, and what the digest covers. So every artifact's module is
     built on every call and hashed before the decision is taken. Building all
     four costs about 0.1s against the minutes of ELF compilation the answer
-    gates. A miss recompiles that artifact and only that one: the four are
-    independently linked, and the interleaving above holds per artifact.
+    gates. A miss recompiles that artifact and only that one, and only a miss
+    rebuilds its external objects.
     """
     names = cfg["artifacts"]
     have_manifest = bool(run_only and cache.load_manifest())
@@ -413,16 +424,25 @@ def compile_block_artifacts(cache, cfg, run_only=False):
 
     fingerprints = {}
     reused = []
-    for key, (compile_kernels, build_module) in _ARTIFACT_BUILD.items():
+    modules = {}
+    stale = []
+    for key, (_, build_module) in _ARTIFACT_BUILD.items():
         name = names[key]
         module = build_module(cfg)
         fingerprints[name] = block_artifact_fingerprint(cfg, key, module)
         if name in cache.artifacts and recorded.get(name) == fingerprints[name]:
             reused.append(name)
             continue
+        modules[key] = module
+        stale.append(key)
+
+    for key in stale:
+        print(f"== external objects for {names[key]} ==")
+        _ARTIFACT_BUILD[key][0](cfg)
+    for key in stale:
+        name = names[key]
         print(f"== compiling {name} ==")
-        compile_kernels(cfg)
-        cache.compile_and_cache(name, module, cfg["backend_kwargs"][name])
+        cache.compile_and_cache(name, modules[key], cfg["backend_kwargs"][name])
     if reused:
         print(f"  reusing {len(reused)} cached block artifacts: {', '.join(reused)}")
     cache._save_manifest()

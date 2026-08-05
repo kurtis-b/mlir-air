@@ -133,10 +133,16 @@ def _run(cache, cfg, run_only=True):
     cache.objects = []
     with _stub_kernel_objects(cache.objects), redirect_stdout(io.StringIO()):
         compile_block_artifacts(cache, cfg, run_only=run_only)
-    # The external objects are built for exactly the artifacts that are
-    # compiled and no others -- a reused ELF already has its objects linked in,
-    # and building one for it would overwrite an object a LATER artifact in the
-    # same pass is relying on. See compile_block_artifacts on the interleaving.
+    # The external objects are built for exactly the artifacts that are compiled
+    # and no others: a reused ELF already has its objects linked in, so building
+    # one for it is a peano compile spent on nothing.
+    #
+    # Until Phase E1 it was worse than wasteful -- object names were minted from
+    # the GEMM method alone, so building an object for a reused artifact could
+    # OVERWRITE the one a later artifact in the same pass was relying on. That
+    # hazard is gone (names are per (tile_m, tile_n) now) and this assertion
+    # stays, because the wasted-compile reason is reason enough and because it is
+    # what pins the pairing in _ARTIFACT_BUILD.
     assert sorted(cfg["artifacts"][key] for key in cache.objects) == sorted(
         cache.compiled
     )
