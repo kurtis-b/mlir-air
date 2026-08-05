@@ -87,14 +87,26 @@ WHY THE NEGATIVE CONTROL EXISTS
     purpose.
 
 WHERE THE OPERATORS THEMSELVES LIVE
-    ``opcheck_specs.py``. This module is the check MECHANISM and knows nothing
-    about what an operator is; that one is the catalogue and knows nothing about
-    how a verdict is reached. The seam went in when the two together passed
-    porting convention 5's ~800-line cap. Adding an operator touches only the
-    catalogue; changing what counts as evidence touches only this file. Every
-    per-operator footgun -- which element a fault may be injected into, which
-    external objects a shape builds, which backend settings each needs -- is
-    documented there, next to the code it applies to.
+    Two modules, not one, and this file is a third. Porting convention 5 caps a
+    module at ~800 lines and the split has happened twice as the port grew:
+
+        opcheck.py          what counts as evidence -- this file. The recording
+                            runner, the injection, the results artifact, the
+                            negative-control verdict, the CLI. Knows nothing
+                            about what an operator is.
+        opcheck_prepare.py  HOW each operator is built and fed. One
+                            ``prepare_<operator>`` each. Every per-operator
+                            footgun -- which element a fault may be injected
+                            into, which external objects a shape builds, which
+                            backend settings each needs -- is documented there,
+                            next to the code it applies to.
+        opcheck_specs.py    WHICH ``(operator, shape)`` the port claims, and at
+                            what ``atol``. ``SPECS``, and the measurement behind
+                            every tolerance in it.
+
+    Adding a shape touches only the catalogue. Adding an operator touches the
+    catalogue and the preparers. Changing what counts as evidence touches only
+    this file. ``SPECS`` is still imported from one place, below.
 
 FOOTGUNS
     - Results always land next to THIS file, wherever the process was started

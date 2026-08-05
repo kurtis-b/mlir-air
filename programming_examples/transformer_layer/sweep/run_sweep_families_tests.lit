@@ -1,0 +1,41 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase E1: the sweep plans configurations the builders can actually build.
+//
+// sweep_families.METHODS duplicates two things it does not own: the tile_m each
+// GEMM method forces, and how a configuration's micro-kernel object is named. It
+// duplicates them so the sweep can plan without importing the builders, and
+// because it also knows `direct`, which gemm_method_spec deliberately raises on.
+//
+// A duplicate is only safe while something checks it, and the failure mode of a
+// drift is expensive rather than obvious: _spec_with_tiles asserts the registry's
+// tile_m equals the method's, so a drifted row does not mis-tune a model, it
+// aborts one at build time -- hours into a gate, several frames inside aircc.
+// This is the cheap place for that to fail instead.
+//
+// It also pins the Phase E1 property at the PLANNING end: no two tile_n the sweep
+// may elect for one method share an object name. mm_aie2p.cc bakes tile_n in as a
+// -D flag, so two configurations of one method at different tile_n are two
+// different micro-kernels; naming them the same means one silently overwrites the
+// other and aiecc links whichever landed last. sweep_families may plan seven
+// tile_n values for one method, so it is not hypothetical -- and the hardware
+// half of it, Phase D2's zeroed 32-of-128 output columns, cost a whole gate cycle
+// to localize.
+//
+// No NPU, no XRT, no Peano: two Python tables and a naming function. It sits
+// beside the registry-writer tests for the same reason those do, and it is cheap
+// enough to keep in a PR check.
+//
+// The test file carries no framework dependency -- pytest is not installed in
+// the sandbox venv -- so it runs as a plain script and prints a pass count. The
+// count is part of the gate: a file that silently stopped defining a test would
+// still print a final line saying everything passed.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming
+// one in prose -- even inside a comment -- registers as a second directive and
+// leaves the test UNRESOLVED. Describe them, never spell them out.
+//
+// RUN: python3 %S/test_sweep_families.py | FileCheck %s
+//
+// CHECK: sweep families tests: 6/6 passed

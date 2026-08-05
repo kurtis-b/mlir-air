@@ -88,6 +88,11 @@ help:
 	@echo "  make registry-writer-tests"
 	@echo "                      Host-only tests for what the writer will and will"
 	@echo "                      not do to an existing shape. No NPU required."
+	@echo "  make sweep-families-tests"
+	@echo "                      Host-only tests that the sweep's duplicated"
+	@echo "                      method table still agrees with gemm_builder's,"
+	@echo "                      and that no two tile_n it may plan share a"
+	@echo "                      micro-kernel object. No NPU required."
 	@echo "  make clean          Remove $(BUILD_DIR)."
 	@echo ""
 	@echo "Variables: TILE_M=$(TILE_M) TILE_K=$(TILE_K) TILE_N=$(TILE_N)"
@@ -249,6 +254,9 @@ registry-sweep:
 
 registry-write:
 	python3 $(srcdir)/sweep/registry_sweep.py --family $(FAMILY) --write-registry $(SWEEP_ARGS)
+
+sweep-families-tests:
+	python3 $(srcdir)/sweep/test_sweep_families.py
 
 registry-writer-tests:
 	python3 $(srcdir)/sweep/test_registry_writer.py
