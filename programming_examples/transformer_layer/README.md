@@ -598,6 +598,12 @@ out of the module text, then compare the objects each module *references* agains
 the `-DDIM_N` each object was *built at*. Every module still builds (about a
 second each) and no aiecc runs. Nine models agreed and one did not.
 
+It is a script, so the next shared-naming change is one command:
+
+```bash
+python3 agents/scripts/audit-gemm-object-links.py    # all ten. No NPU, no lock.
+```
+
 
 **`addnorm` caps at 104 rows at width 768, so the layer is row-blocked.** Three
 L3→L1 streams per tile (x, residual, weight) against a column's two shim MM2S
