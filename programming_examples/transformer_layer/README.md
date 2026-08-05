@@ -513,6 +513,66 @@ fail to load, it times out with `ERT_CMD_STATE_TIMEOUT` a long way from the
 cause. `pattern/offload/offload.py::_METHOD_FUNC` is the one place that
 mapping lives.
 
+## The `runlist` execution strategy (Phase E4)
+
+`pattern/runlist/` is the fine-grained point of the taxonomy: the layer
+decomposed into **thirteen single-operator entries over two runlists** —
+q/k/v projections; host blocked attention (the same implementation `offload`
+uses, unchanged); then output_proj, residual add, LayerNorm, gamma multiply,
+up_proj, GeLU, down_proj, residual add, LayerNorm, gamma multiply — each
+runlist forced single-submission with `require_single_submission=True`.
+Intermediates inside a runlist stay device-resident (`attn_out` feeds the
+residual add without touching the host; `hidden` feeds both the up-projection
+and the second residual add), which is the cross-artifact chaining the mode
+exists to measure. `pattern/runlist/README.md` has the full story; the parts
+that cost time to learn:
+
+**The two operators that did not exist.** `builders/transpose.py` (iron's
+`k_transpose`, re-expressed over `data_transfer_transpose/dma_bf16/`'s
+movement — contiguous tiles plus a scalar tile kernel, because a bf16
+DMA-stride transpose is illegal; the tile shape is baked into the OBJECT NAME,
+`transpose_m64n96.o`, so shapes cannot overwrite each other) and
+`builders/elementwise_mul.py` (built from nothing: `eltwise_add`'s streaming
+2-D shape with `vector_mul`'s `arith.mulf`, **bf16 end to end because the AIE
+vector unit does not legalize f32 vector element-wise multiply** —
+`weighted_rms_norm.py` records the constraint and its bf16 epilogue is the
+precedent that this form legalizes). Both hold the full opcheck contract;
+transpose's check is BIT-exactness, and its lit recipe pins the zeros.
+
+**Why 13 entries is the honest count, and that it lands BELOW `coarse`'s
+131.** 128 of `coarse`'s entries are `addnorm`'s row blocking (≤64 rows per
+dispatch at width 768); every operator this mode decomposes to streams all
+4096 rows inside one launch, so each normalization point is 3 entries here
+against 64 there. The consequence — the driver's `runlist_entries > coarse`
+ordinal clause fails on this hardware — is a finding about the measurement
+model, recorded with the measured table in `pattern/runlist/README.md`;
+inflating the decomposition to pass it is exactly what 08d forbids.
+
+**No GEMM ELF executes twice — measured, the hard way.** The first bring-up
+shared one `4096x768x768` ELF for q/k/v inside one runlist; executions two and
+three returned the exact corruption signature `offload` measured across
+submissions (k 3.539e-1, v 3.561e-1 mean_rel_L1 against q's clean 9.3e-3;
+offload's measured mode is 3.56e-1). So the reused-context failure holds
+INSIDE a single runlist too — and there `offload`'s fix (context eviction) is
+structurally unavailable, since entries of one artifact share its context by
+construction. The four projections are therefore one module compiled to FOUR
+artifacts, each with its own `hw_context`; the streaming `add`/`ln`/`mul`
+ELFs (no runtime loop tiling) measured clean on their second executions in
+the same run, consistent with the block's 64-fold re-executed `addnorm`.
+
+**The gamma multiply's second operand is a materialized broadcast.**
+`elementwise_mul` takes two full tensors, so each LayerNorm weight is tiled to
+`[4096, 768]` on the host (`broadcast_row_weight`) and declared static +
+content-keyed. Under fault injection the content key changes and the perturbed
+weight re-uploads — nothing special-cases the injected path, which is what the
+driver's clean-equals-fault totals clause checks.
+
+**Transpose is validated standalone, not dispatched by the mode.** Its
+consumer in iron's decomposition — the on-device attention scores GEMM — is
+the thing this hardware cannot dispatch (no `K = 64` registry row), and a
+device transpose feeding a host `torch` matmul that re-layouts its operands
+anyway would add an entry while measuring nothing.
+
 ## The registry sweep
 
 The three GEMM-backed operators above take their tile sizes and method from

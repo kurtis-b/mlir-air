@@ -11,17 +11,17 @@ Thirteen entries over two runlists, each entry one operator kernel:
 
 | # | entry | kernel | ELF |
 |---|---|---|---|
-| 1 | q_proj | registry GEMM 4096x768x768 | `rl_gemm_4096x768x768` |
-| 2 | k_proj | same module, same ELF | " |
-| 3 | v_proj | same module, same ELF | " |
+| 1 | q_proj | registry GEMM 4096x768x768 | `rl_gemm_q_proj_4096x768x768` |
+| 2 | k_proj | same module, OWN ELF (see below) | `rl_gemm_k_proj_4096x768x768` |
+| 3 | v_proj | same module, OWN ELF | `rl_gemm_v_proj_4096x768x768` |
 | — | attention | **host torch** (`pattern/blocked_attention.py`, shared with `offload`) | — |
-| 4 | output_proj | registry GEMM 4096x768x768 | `rl_gemm_4096x768x768` (fresh `hw_context`) |
+| 4 | output_proj | same module, OWN ELF | `rl_gemm_o_proj_4096x768x768` |
 | 5 | residual add | `builders/elementwise_add.py` | `rl_add_4096x768` |
 | 6 | LayerNorm | `builders/layer_norm.py` (unweighted) | `rl_ln_4096x768` |
 | 7 | gamma multiply | `builders/elementwise_mul.py` | `rl_mul_4096x768` |
-| 8 | up_proj | registry GEMM 4096x768x3072 | `rl_gemm_4096x768x3072` |
+| 8 | up_proj | registry GEMM 4096x768x3072 | `rl_gemm_up_4096x768x3072` |
 | 9 | GeLU | `builders/gelu.py` | `rl_gelu_4096x3072` |
-| 10 | down_proj | registry GEMM 4096x3072x768 | `rl_gemm_4096x3072x768` |
+| 10 | down_proj | registry GEMM 4096x3072x768 | `rl_gemm_down_4096x3072x768` |
 | 11 | residual add | same ELF as 5 | `rl_add_4096x768` |
 | 12 | LayerNorm | same ELF as 6 | `rl_ln_4096x768` |
 | 13 | gamma multiply | same ELF as 7 | `rl_mul_4096x768` |
@@ -57,9 +57,14 @@ Driver-summed totals for one layer (clean and fault-injected runs identical;
 the six literals are pinned in `run_npu2_runlist_peano.lit`, both halves):
 
 ```
-host submissions 2, runlist entries 13 — see the lit recipe for the full
-measured vector (air/herd/sync/bytes), which is hardware truth, not a target.
+host submissions   2      runlist entries   13     air launches     11
+herd launches     26      sync boundaries   21     bytes    152,567,808
 ```
+
+All ten stage boundaries clean; layer output mean_rel_L1 1.755e-2 at
+atol_required 7.011e-2 — a 1.43x margin under the 1e-1 ceiling, between
+`offload`'s 1.82x (host norms) and the block's 1.35x (device fused norms),
+which is where device norms + host f32 attention should land.
 
 **13 entries lands BELOW `coarse`'s 131**, and that is the honest number, not
 an under-decomposition: this mode dispatches ten distinct operator kernels
@@ -83,18 +88,23 @@ net of row-blocking).
 
 ## Footguns (each cost time; read before editing)
 
-- **The proj ELF re-executes, and the two failure regimes differ.** Across
-  submissions in a reused `hw_context`, a runtime-tiled GEMM ELF returns
-  wrong numbers from its second execution onward (`offload` measured it), so
-  `output_proj` gets a fresh context — `_evict_context` between the runlists.
-  Inside ONE runlist (q/k/v: three executions, one context, by construction)
-  the same ELF re-executes CLEANLY — measured here, by the q/k/v stage
-  comparisons at `atol 5e-3`, which the corruption mode (3.6e-1 mean_rel_L1)
-  cannot pass. Do not fold the two cases into one rule; they are different
-  mechanisms.
-- **The `add`/`ln`/`mul` ELFs execute twice inside runlist 2.** No runtime
-  loop tiling, same class as the block's 64-fold re-executed `addnorm` ELF;
-  clean, verified by the `output` stage.
+- **A runtime-tiled GEMM ELF corrupts on re-execution INSIDE a single
+  runlist too — measured here, the new result this mode adds to `offload`'s.**
+  The first bring-up shared one proj ELF for q/k/v in runlist 1: execution 1
+  (q) came back clean at 9.3e-3 mean_rel_L1, executions 2 and 3 (k, v) at
+  3.539e-1 and 3.561e-1 — the exact signature `offload` measured across
+  submissions (3.56e-1). `offload`'s fix, evicting the context between
+  dispatches, is structurally unavailable inside one runlist: entries of one
+  artifact share its `hw_context` by construction. So the four projections
+  are ONE module compiled to FOUR artifacts (`rl_gemm_{q,k,v,o}_proj_…`),
+  each with its own context, and no GEMM ELF ever executes twice. Four
+  compiles of one module per clean cache is the cost of thirteen entries
+  over two submissions; do not "deduplicate" them back.
+- **The `add`/`ln`/`mul` ELFs execute twice inside runlist 2, and that is
+  measured clean.** No runtime loop tiling, same class as the block's 64-fold
+  re-executed `addnorm` ELF — and in the corrupted bring-up run their second
+  executions still produced stage errors at the expected levels, so the
+  GEMM-class failure does not extend to them.
 - **The gamma multiply's second operand is a materialized broadcast.**
   `elementwise_mul` takes two full `[4096, 768]` tensors (its docstring
   records why there is no broadcast form), so each LayerNorm weight is tiled
@@ -102,12 +112,16 @@ net of row-blocking).
   content-keyed — uploaded once, like iron's materialized causal mask. Under
   fault injection the content key changes and the perturbed weight is
   re-uploaded; nothing special-cases the injected path.
-- **`hw_context` demand is 7 concurrent, measured against a ceiling of 32.**
-  Runlist 2 holds contexts for all seven distinct ELFs at once (proj, up,
-  down, add, ln, mul, gelu). The 32 ceiling was probed with 4 cycled ELFs
-  (08 §Risks); this mode's own run demonstrates 7 DISTINCT designs resident
-  simultaneously, comfortably inside it. iron's 29-context appetite does not
-  arise here because attention is host and repeated operators share ELFs.
+- **`hw_context` demand is 10 concurrent, measured against a ceiling of 32.**
+  By the time runlist 2 executes, the three projection contexts from runlist 1
+  are still loaded and seven more join them (o_proj, up, down, add, ln, mul,
+  gelu): ten DISTINCT designs resident simultaneously, demonstrated by the
+  mode running rather than by a synthetic probe. The 32 ceiling was probed
+  with 4 cycled ELFs (08 §Risks), so this is also the first data point with
+  ten distinct designs — comfortably inside, and the margin no longer rests
+  on the cycled-ELF assumption alone. iron's 29-context appetite does not
+  arise here because attention is host and the streaming operators share
+  ELFs across their two entries.
 - **`RUNLIST_CACHE_DIR` is this mode's own**, in `transformer_layer/.gitignore`
   and the Makefile `clean` target. Modes never share a cache directory:
   `KernelCache` picks it by name, and two modes pointed at one can trade

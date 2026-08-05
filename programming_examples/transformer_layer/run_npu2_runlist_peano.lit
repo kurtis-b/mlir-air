@@ -1,0 +1,127 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase E4 runlist-mode gate: the D2 layer at the fine-grained point of the
+// execution-strategy taxonomy.
+//
+// Same golden model and same per-boundary comparisons as the block, coarse and
+// offload gates, behind a different execution boundary: thirteen
+// single-operator entries over two runlists -- q/k/v projections; host torch
+// blocked attention (the implementation offload shares, unchanged); then
+// output_proj, residual add, LayerNorm, gamma multiply, up_proj, GeLU,
+// down_proj, residual add, LayerNorm, gamma multiply -- each runlist forced to
+// one submission. Intermediates inside a runlist stay device-resident. No GEMM
+// ELF executes twice: the four projections are one module compiled to four
+// artifacts, because re-execution in one hw_context corrupts INSIDE a single
+// runlist exactly as it does across submissions (pattern/runlist/README.md has
+// the measurement).
+//
+// Two recipes in one file, deliberately: they share a working directory and
+// therefore the ELF cache, so the injected run reuses the ten ELFs the clean
+// run compiled -- compilation depends on the shape, not the data.
+//
+// NPU serialization lives one layer down, not in the recipes below: device
+// access is locked on /tmp/npu.lock inside KernelCache, the same inode
+// lit.cfg.py's NPU substitution takes. Taking the outer /tmp/mlir-air-npu.lock
+// here would DEADLOCK against the gate command that already holds it -- BSD
+// flock(2) treats a second open() of the same file as a foreign lock.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming
+// one in prose -- even inside a comment -- registers as a second directive and
+// leaves the test UNRESOLVED. Describe them, never spell them out.
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_npu2_runlist_peano
+// RUN: cd test_npu2_runlist_peano
+// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile check-runlist PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+//
+// The configuration first -- the forced gate configuration, each GEMM resolved
+// through the registry, and the mode's own statement of its decomposition and
+// its host attention boundary. A registry change that moved a method fails
+// here with its cause on screen.
+// CHECK: runlist 4096x768 ffn 3072 12h x 64 (encoder_bert, non-causal, 13 fine-grained entries over 2 runlists, attention in host torch)
+// CHECK: proj 4096x768x768 drain (registry), up 4096x768x3072 drain (registry), down 4096x3072x768 fused-cast (registry)
+// CHECK: attention host torch fp32, query block 4096 x1 block(s)
+//
+// Every boundary, in execution order, each with zero mismatching elements.
+// Named individually rather than counted, so a stage list that dropped or
+// repeated an entry fails here -- the driver requires at least eight DISTINCT
+// names, and this is where the suite enforces the same thing.
+// CHECK: [stage] q {{.*}} mismatch       0
+// CHECK: [stage] k {{.*}} mismatch       0
+// CHECK: [stage] v {{.*}} mismatch       0
+// CHECK: [stage] attn_context {{.*}} mismatch       0
+// CHECK: [stage] attn_out {{.*}} mismatch       0
+// CHECK: [stage] hidden {{.*}} mismatch       0
+// CHECK: [stage] ffn_up {{.*}} mismatch       0
+// CHECK: [stage] ffn_gelu {{.*}} mismatch       0
+// CHECK: [stage] ffn_out {{.*}} mismatch       0
+// CHECK: [stage] output {{.*}} mismatch       0
+// CHECK: [runlist] stages: 10/10 clean
+//
+// The mode's own instrumentation: one DispatchVector row per runlist. Two --
+// a wrapper that split a runlist per operator (offload's shape), or stopped
+// recording per-sequence rows, fails here before the driver's totals
+// comparison sees it.
+// CHECK: [runlist] recorded 2 dispatch vectors
+//
+// The vectors' CONTENTS, not only their count: the six driver-summed totals.
+// Two submissions over thirteen entries is the mode's decomposition made
+// checkable. Air is 11 (one launch per drain ELF -- q/k/v in runlist 1, then
+// o/add/ln/mul/up/gelu in runlist 2 -- plus two for the fused-cast down
+// projection, each ELF counted once per sequence it appears in); herd counts
+// accumulate per entry; sync is 21 (runlist 1: x + three weights up, q/k/v
+// back; runlist 2: ctx, x, five statics and the down projection's f32 scratch
+// up, six declared boundaries back); and the bytes are those twenty-one
+// transfers exactly. The totals line prints only after every row passes the
+// as_row() schema validation, so a malformed row aborts the run and a run
+// whose totals drift fails right here. NOTE the 13 entries land BELOW
+// coarse's 131 -- the honest fine-grained count, measured, with the finding
+// recorded in pattern/runlist/README.md.
+// CHECK: [runlist] dispatch totals: submissions 2 entries 13 air 11 herd 26 sync 21 bytes 152567808
+//
+// Then the layer output itself over all 4096 x 768 elements, and the label
+// naming the MODE's operator.
+// CHECK: PASS!
+// CHECK: [opcheck] runlist [4096x768_encoder_bert]: PASS
+//
+// THE NEGATIVE CONTROL. Identical reasoning to the offload gate's --
+// ln1_weight, chosen by measurement, perturbed AFTER the golden model was
+// computed -- plus the stake every Phase E mode carries: the dispatch vectors
+// must be recorded on the injected path too, because the driver requires the
+// fault artifact's summed totals to EQUAL the clean run's.
+//
+// RUN: make -f %S/Makefile check-runlist-fault PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s --check-prefix=FAULT
+//
+// The injected element first, so an injection that silently perturbed nothing
+// is visible here rather than read backwards from the verdict. Index 5 is
+// ln1_weight in RUNLIST_INPUT_NAMES -- the q/k/v weights are separate in this
+// mode, so the index matches offload's and differs from the block's.
+// FAULT: [fault-inject] input 5 at (0,)
+//
+// Nothing upstream of the first gamma multiply reads ln1_weight, so the whole
+// attention half must still be exact while `hidden` and everything after it
+// moves -- which is what says the stage comparisons are reading THIS run's
+// buffers rather than replaying the clean run's. In this mode the perturbed
+// weight reaches the device as a re-materialized static broadcast, so a
+// content-keyed cache that failed to re-upload it would show up here as a
+// clean `hidden`.
+// FAULT: [stage] q {{.*}} mismatch       0
+// FAULT: [stage] attn_out {{.*}} mismatch       0
+// FAULT: [stage] hidden {{.*}} mismatch {{[1-9][0-9]*}}
+// FAULT: [runlist] stages: 5/10 clean
+//
+// The vectors, still recorded under injection -- and totaling EXACTLY what
+// the clean run totals: the six literals below are the same six the clean
+// half pins above, which is the suite's own statement of the equality the
+// driver re-derives from the two artifacts.
+// FAULT: [runlist] recorded 2 dispatch vectors
+// FAULT: [runlist] dispatch totals: submissions 2 entries 13 air 11 herd 26 sync 21 bytes 152567808
+//
+// And the verdict in the three forms opcheck.py reports it: the comparison's
+// own, the control's reading of it, and the exit-status summary.
+// FAULT: [opcheck] runlist [4096x768_encoder_bert]: FAIL
+// FAULT: [opcheck] runlist [4096x768_encoder_bert]: fault-inject input -> FAIL (as required)
+// FAULT: NEGATIVE CONTROL: PASS

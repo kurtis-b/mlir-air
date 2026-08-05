@@ -56,18 +56,21 @@ FOOTGUNS
       ``transformer_layer/.gitignore`` AND the Makefile ``clean`` target.
       ``KernelCache`` picks the directory by NAME, so two modes sharing one
       can trade ELFs whose fingerprints happen to agree.
-    - q/k/v/output_proj share ONE compiled ELF (they are the same
-      ``4096x768x768`` module), and its ``hw_context`` is EVICTED between the
-      two runlists: re-executing a runtime-tiled GEMM ELF in a reused context
-      returns wrong numbers from the second execution onward — ``offload``
-      measured it (see ``_evict_context`` there). What that measurement did
-      NOT cover is re-execution inside a single runlist, which q/k/v do; 08c
-      says measure rather than assume, and the q/k/v stage comparisons at
-      ``atol 5e-3`` are that measurement — the corruption mode is 3.6e-1
-      mean_rel_L1, unmissable there. The ``add``/``layer_norm``/``mul`` ELFs
-      also execute twice inside runlist 2; they have no runtime loop tiling,
-      and the block's 64-fold re-executed ``addnorm`` ELF is the precedent
-      that that class re-runs clean — verified by the ``output`` stage.
+    - NO GEMM ELF EXECUTES TWICE, and that is a measurement, not caution.
+      q/k/v/output_proj are one module compiled FOUR times to four artifacts,
+      each with its own ``hw_context``. The first bring-up shared one ELF for
+      q/k/v inside one runlist, and executions two and three returned the
+      exact corruption signature ``offload`` measured across submissions —
+      k at 3.539e-1 and v at 3.561e-1 mean_rel_L1 against q's clean 9.3e-3,
+      offload's measured mode being 3.56e-1 — so the reused-context failure
+      holds INSIDE a single runlist too, and context eviction (offload's fix)
+      is unavailable there: entries of one artifact share its context by
+      construction. Four compiles of one module per clean cache is the cost.
+      The ``add``/``layer_norm``/``mul`` ELFs DO execute twice inside runlist
+      2: no runtime loop tiling, same class as the block's 64-fold re-executed
+      ``addnorm`` ELF, and the same first bring-up measured their second
+      executions clean (the ffn/output stages sat at their expected error
+      levels while k/v were corrupt).
     - The LayerNorm gamma is applied by ``elementwise_mul`` against a
       HOST-MATERIALIZED ``[seq, emb]`` broadcast of the ``[emb]`` weight
       (``broadcast_row_weight``), declared static and content-keyed. 6 MB per
@@ -184,9 +187,14 @@ _SMALL_FUNC = {
 def runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
     """Resolve every operator's configuration without building anything.
 
-    Three GEMM shapes serve six of the thirteen entries: q/k/v/output_proj are
-    all ``[seq, emb] @ [emb, emb]`` and share one compiled module; up and down
-    get their own. The four streaming operators are keyed by their L3 shape.
+    Three GEMM shapes serve six of the thirteen entries, but the four
+    ``[seq, emb] @ [emb, emb]`` projections each get their OWN compiled ELF of
+    the same module: a runtime-tiled GEMM ELF returns wrong numbers from its
+    second execution in one ``hw_context`` onward, and this mode MEASURED that
+    the corruption holds inside a single runlist too (see the module
+    footguns), so no GEMM ELF may appear twice in the dispatch. Four compiles
+    of one module is the price of thirteen entries over two submissions; the
+    streaming operators are re-execution clean and keyed by their L3 shape.
     Raises (via the registry) on an unmeasured GEMM shape, and on
     ``num_heads * head_dim != emb_dim``.
     """
@@ -210,7 +218,19 @@ def runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
             (seq_len, ffn_dim, emb_dim),
         ),
     }
-    artifacts = {key: f"rl_gemm_{m}x{k}x{n}" for key, (_, (m, k, n)) in specs.items()}
+    # GEMM entry -> spec key. Four distinct proj ELFs on purpose; see above.
+    gemms = {
+        "q_proj": "proj",
+        "k_proj": "proj",
+        "v_proj": "proj",
+        "o_proj": "proj",
+        "up": "up",
+        "down": "down",
+    }
+    artifacts = {}
+    for gemm_key, spec_key in gemms.items():
+        _, (m, k, n) = specs[spec_key]
+        artifacts[gemm_key] = f"rl_gemm_{gemm_key}_{m}x{k}x{n}"
     artifacts.update(
         {
             "add": f"rl_add_{seq_len}x{emb_dim}",
@@ -220,8 +240,10 @@ def runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
         }
     )
     backend_kwargs = {
-        artifacts[key]: dict(_GEMM_BACKEND, instance_name=_METHOD_FUNC[spec["method"]])
-        for key, (spec, _) in specs.items()
+        artifacts[gemm_key]: dict(
+            _GEMM_BACKEND, instance_name=_METHOD_FUNC[specs[spec_key][0]["method"]]
+        )
+        for gemm_key, spec_key in gemms.items()
     }
     backend_kwargs.update(
         {
@@ -236,6 +258,7 @@ def runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
         "num_heads": num_heads,
         "head_dim": head_dim,
         "specs": specs,
+        "gemms": gemms,
         "artifacts": artifacts,
         "backend_kwargs": backend_kwargs,
         "query_block_size": resolve_query_block_size(seq_len, num_heads),
@@ -265,10 +288,10 @@ def _build_runlist_module(cfg, key):
     """One artifact's module: a registry GEMM or a streaming operator."""
     seq_len, emb_dim = cfg["seq_len"], cfg["emb_dim"]
     ffn_dim = cfg["ffn_dim"]
-    if key in cfg["specs"]:
+    if key in cfg["gemms"]:
         from shared.builders.gemm_builder import _build_gemm_module
 
-        spec, (m, k, n) = cfg["specs"][key]
+        spec, (m, k, n) = cfg["specs"][cfg["gemms"][key]]
         return _build_gemm_module(
             m,
             k,
@@ -292,7 +315,7 @@ def _build_runlist_module(cfg, key):
 
 
 def compile_runlist_artifacts(cache, cfg, run_only=False):
-    """Compile the seven ELFs into ``cache``, reusing only exact matches.
+    """Compile the ten ELFs into ``cache``, reusing only exact matches.
 
     Same shape as ``compile_block_artifacts`` and reusing its fingerprint
     machinery verbatim: every module is built and hashed on every call, a
@@ -325,8 +348,8 @@ def compile_runlist_artifacts(cache, cfg, run_only=False):
 
     for key in stale:
         print(f"== external objects for {names[key]} ==")
-        if key in cfg["specs"]:
-            spec, _ = cfg["specs"][key]
+        if key in cfg["gemms"]:
+            spec, _ = cfg["specs"][cfg["gemms"][key]]
             ek.compile_gemm_mm(
                 tile_m=spec["tile_m"],
                 tile_n=spec["tile_n"],
@@ -353,30 +376,6 @@ def compile_runlist_artifacts(cache, cfg, run_only=False):
     save_fingerprints(cache, fingerprints)
 
 
-def _evict_context(cache, artifact):
-    """Drop ``artifact``'s cached ``hw_context`` (and every pool).
-
-    The proj ELF executes three times in runlist 1 (q, k, v) and once in
-    runlist 2 (output_proj). Re-executing a runtime-tiled GEMM ELF in a REUSED
-    context returns wrong numbers from the second execution onward — measured
-    by ``offload`` (see its ``_evict_context`` for the numbers and the
-    ruled-out hypotheses) — so the context is reloaded between the two
-    runlists. The pools go with it: their BOs were allocated against the
-    evicted backend's device wrapper, and nothing needs to stay device
-    resident across the host attention boundary anyway.
-
-    What eviction cannot help with is q/k/v INSIDE one runlist — three
-    executions, one context, by construction. offload's measurement does not
-    cover that case; the q/k/v stage comparisons at atol 5e-3 are the
-    measurement here, and the corruption mode (3.6e-1 mean_rel_L1) cannot
-    hide from them.
-    """
-    loaded = cache._loaded.pop(artifact, None)
-    if loaded is not None:
-        loaded[0].unload()
-    cache._pools.clear()
-
-
 def _spec_buf(name, array, static=False, host_output=False):
     """One ``BufferSpec``, sized and keyed from the array that backs it."""
     return BufferSpec(
@@ -394,9 +393,11 @@ def _gemm_step(cfg, key, a_name, b_name, out_name, arrays):
 
     Returns ``(step, scratch_name_or_None)``. The scratch appears only at a
     written position, so the CALLER must name it in ``host_writes`` — exactly
-    the fused-cast contract every D1 run used.
+    the fused-cast contract every D1 run used. ``key`` is a GEMM entry key
+    (``cfg["gemms"]``), so the four projections resolve one shared spec but
+    four distinct artifacts — the no-re-execution rule.
     """
-    spec, (m, k, n) = cfg["specs"][key]
+    spec, (m, k, n) = cfg["specs"][cfg["gemms"][key]]
     artifact = cfg["artifacts"][key]
     if spec["needs_f32_scratch"]:
         scratch = f"{out_name}_f32"
@@ -457,9 +458,13 @@ def prepare_runlist(shape, seed=42):
         arrays = {"x": x, "w_q": w_q, "w_k": w_k, "w_v": w_v}
         steps = []
         scratches = set()
-        for out_name, w_name in (("q", "w_q"), ("k", "w_k"), ("v", "w_v")):
+        for gemm_key, out_name, w_name in (
+            ("q_proj", "q", "w_q"),
+            ("k_proj", "k", "w_k"),
+            ("v_proj", "v", "w_v"),
+        ):
             arrays[out_name] = np.zeros((seq_len, emb_dim), dtype=bfloat16)
-            step, scratch = _gemm_step(cfg, "proj", "x", w_name, out_name, arrays)
+            step, scratch = _gemm_step(cfg, gemm_key, "x", w_name, out_name, arrays)
             steps.append(step)
             if scratch:
                 scratches.add(scratch)
@@ -517,7 +522,7 @@ def prepare_runlist(shape, seed=42):
             if scratch:
                 scratches.add(scratch)
 
-        gemm("proj", "ctx", "w_o", "attn_out")
+        gemm("o_proj", "ctx", "w_o", "attn_out")
         steps.append(DispatchStep(names["add"], ("attn_out", "x", "add1"), writes=(2,)))
         steps.append(DispatchStep(names["ln"], ("add1", "ln1n"), writes=(1,)))
         steps.append(
@@ -572,10 +577,6 @@ def prepare_runlist(shape, seed=42):
             causal=False,
             query_block_size=cfg["query_block_size"],
         )
-
-        # Fresh context for output_proj: its ELF already ran three times in
-        # runlist 1. See _evict_context.
-        _evict_context(cache, names["proj"])
 
         print(
             "  [runlist 2/2] output_proj + add + layer_norm + mul + up_proj + "
