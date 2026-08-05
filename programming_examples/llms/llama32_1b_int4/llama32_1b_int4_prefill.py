@@ -1158,26 +1158,14 @@ def main():
             )
 
             # The stock bf16 rms_gemms_rope/o_ffn stitchers link the external
-            # GEMM microkernels mm_m32.o (K/V drain) + mm_m64.o (fused-cast).
+            # GEMM microkernels mm_m32n128.o (K/V drain) + mm_m64n128.o (fused-cast).
             # Build them before caching so prepare_air_project stages them into
             # air_project/ (mirrors llama32_1b_prefill.compile_all_kernels); the
             # int4/bfp16 branches use their own kernels and don't need these.
-            from shared.infra.external_kernels import compile_gemm_mm
+            from shared.infra.external_kernels import compile_gemm_mm_variant
 
-            compile_gemm_mm(
-                tile_m=32,
-                tile_n=128,
-                tile_k_l1=32,
-                sym_suffix="_m32",
-                out_name="mm_m32.o",
-            )
-            compile_gemm_mm(
-                tile_m=64,
-                tile_n=128,
-                tile_k_l1=32,
-                sym_suffix="_m64",
-                out_name="mm_m64.o",
-            )
+            compile_gemm_mm_variant(tile_m=32, tile_n=128, tile_k_l1=32)
+            compile_gemm_mm_variant(tile_m=64, tile_n=128, tile_k_l1=32)
 
             if _need("rms_gemms_rope"):
                 print("\nCompiling rms_gemms_rope (bf16)...")

@@ -147,11 +147,15 @@ def compile_gemm_mm(
     tile_k_l1 passed to the GEMM module builder. Exposes op_has_no_registered_library_name
     (f32-C matmul), zero_f32_mn, f32_to_bf16_mn.
 
-    sym_suffix / out_name: to link TWO mm.o variants (e.g. tile_m=32 drain +
-    tile_m=64 fused-cast) into ONE ELF, the symbols must not collide. Pass
-    sym_suffix="_m64" (-> @op_has_no_registered_library_name_m64 etc.) and a
-    distinct out_name="mm_m64.o". Default empty suffix / "mm.o" keeps the original
-    names for single-variant ELFs (back-compat).
+    sym_suffix / out_name: to link SEVERAL mm.o variants into ONE ELF, the symbols
+    must not collide -- and two GEMMs at the same tile_m but different tile_n are
+    two different micro-kernels, because DIM_N is baked in here. PREFER
+    `compile_gemm_mm_variant` below, which derives both names from (tile_m, tile_n)
+    via the one authority for them, `gemm_builder.gemm_variant_names`
+    (-> sym_suffix "_m64n128", out_name "mm_m64n128.o"). Spelling them by hand is
+    how an object gets built at the wrong DIM_N and still links: see Phase D2 in
+    `transformer_layer/README.md` for what that returns. Default empty suffix /
+    "mm.o" keeps the original names for single-variant ELFs (back-compat).
 
     gen_init / gen_with_acc: emit the two opt-in kernel families used by the
     staged transformer-layer pipelines. Both default OFF, and with both off the
@@ -189,6 +193,33 @@ def compile_gemm_mm(
     if gen_with_acc:
         extra.append("-DGENERATE_MATMUL_WITH_ACC_KERNELS")
     _compile_kernel(src, out_name, extra_flags=extra, force=True)
+
+
+def compile_gemm_mm_variant(tile_m, tile_n, tile_k_l1=32, **kwargs):
+    """`compile_gemm_mm` with the symbol suffix and object name DERIVED, not given.
+
+    The names come from `shared.builders.gemm_builder.gemm_variant_names`, which
+    is also where every GEMM module's `sym_suffix` / `link_with_name` come from.
+    Call this rather than spelling `sym_suffix=` and `out_name=` yourself: the
+    two must agree per (tile_m, tile_n), and when they do not, the failure is
+    either an unresolved symbol at link time or -- worse, and what Phase D2
+    actually measured -- an object built at the wrong `-DDIM_N` that links
+    cleanly and returns zeros for part of every output tile.
+
+    Any remaining keyword (`gen_init`, `gen_with_acc`, ...) is passed straight
+    through.
+    """
+    from shared.builders.gemm_builder import gemm_variant_names
+
+    sym_suffix, out_name = gemm_variant_names(tile_m, tile_n)
+    compile_gemm_mm(
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k_l1=tile_k_l1,
+        sym_suffix=sym_suffix,
+        out_name=out_name,
+        **kwargs,
+    )
 
 
 def compile_rope():

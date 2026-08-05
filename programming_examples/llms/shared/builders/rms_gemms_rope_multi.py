@@ -224,9 +224,11 @@ def build_rms_gemms_rope_module(
 
     # Per-GEMM config from the kernel_registry JSON (single source of truth): method
     # (fused-cast vs drain) AND all tiles are looked up per shape, never hardcoded.
-    # Q (large) resolves to fused-cast (_m64), K/V (small) to drain (_m32); both
-    # co-link in one ELF (distinct symbols + mm_*.o; each air.launch reconfigures
-    # L1/L2 so launch buffers don't accumulate). Adapts automatically to other models.
+    # Q (large) resolves to fused-cast, K/V (small) to drain, and both co-link in
+    # one ELF because each carries its own per-(tile_m, tile_n) symbol suffix and
+    # mm_*.o -- e.g. _m64n128 and _m32n128 for llama32_1b. Each air.launch
+    # reconfigures L1/L2 so launch buffers don't accumulate. Adapts automatically
+    # to other models: the names follow the tiles the registry picks.
     q_spec = gemm_registry_config(seq_len, emb_dim, emb_dim, "bf16", "high")
     k_spec = gemm_registry_config(seq_len, emb_dim, kv_dim, "bf16", "high")
     v_spec = gemm_registry_config(seq_len, emb_dim, kv_dim, "bf16", "high")
@@ -360,8 +362,9 @@ def build_rms_gemms_rope_module(
             return {0: in_idx, 1: w_idx, 2: sc, 3: out_idx}
         return {0: in_idx, 1: w_idx, 2: out_idx}  # drain: {0:in, 1:w, 2:bf16-out}
 
-    # Per-GEMM externs: each fused/drain GEMM uses suffixed mm.o symbols
-    # (_m64 / _m32) so both variants co-link in one ELF.
+    # Per-GEMM externs: each fused/drain GEMM uses suffixed mm.o symbols, minted
+    # per (tile_m, tile_n) by gemm_builder.gemm_variant_names, so any mix of
+    # methods AND tile_n co-links in one ELF.
     def _gemm_externs(spec):
         sfx = spec["sym_suffix"]
         return {

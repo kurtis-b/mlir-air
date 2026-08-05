@@ -59,8 +59,8 @@ from shared.infra.backend_presets import (
 
 # Prefill GEMM is always the external high-precision path, registry-driven: every
 # GEMM's method (fused-cast vs drain) + tile sizes come from the kernel_registry JSON
-# per shape (gemm_registry_config). o_ffn = 4 fused-cast GEMMs (mm_m64.o); rms =
-# Q fused-cast (mm_m64.o) + K/V drain (mm_m32.o), mixed in one ELF. All GPU-standard
+# per shape (gemm_registry_config). o_ffn = 4 fused-cast GEMMs (mm_m64n128.o); rms =
+# Q fused-cast (mm_m64n128.o) + K/V drain (mm_m32n128.o), mixed in one ELF. All GPU-standard
 # 9.3e-3 precision. The external GEMM herds need BD-ID-recycling tiling [2,2].
 
 
@@ -132,16 +132,12 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
     # External-GEMM mm.o variants — compile FIRST (before any compile_and_cache, so
     # prepare_air_project copies them into air_project/ for every ELF that links
     # them). The per-GEMM-method builders reference SUFFIXED symbols + filenames so
-    # drain (_m32 / mm_m32.o, tile_m=32) and fused-cast (_m64 / mm_m64.o, tile_m=64)
+    # drain (_m32 / mm_m32n128.o, tile_m=32) and fused-cast (_m64 / mm_m64n128.o, tile_m=64)
     # can co-link in ONE ELF (rms mixes them; o_ffn is all-fused).
-    from shared.infra.external_kernels import compile_gemm_mm
+    from shared.infra.external_kernels import compile_gemm_mm_variant
 
-    compile_gemm_mm(
-        tile_m=32, tile_n=128, tile_k_l1=32, sym_suffix="_m32", out_name="mm_m32.o"
-    )
-    compile_gemm_mm(
-        tile_m=64, tile_n=128, tile_k_l1=32, sym_suffix="_m64", out_name="mm_m64.o"
-    )
+    compile_gemm_mm_variant(tile_m=32, tile_n=128, tile_k_l1=32)
+    compile_gemm_mm_variant(tile_m=64, tile_n=128, tile_k_l1=32)
 
     # 1. RMSNorm + QKV GEMMs + RoPE Q+K: one ELF (registry-driven per-GEMM method).
     from shared.builders.rms_gemms_rope_multi import (

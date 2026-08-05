@@ -156,7 +156,7 @@ def build_artifacts(cache, run_only=False):
 
     Returns dict artifact name -> (config, entry function name).
     """
-    from shared.infra.external_kernels import compile_gemm_mm
+    from shared.infra.external_kernels import compile_gemm_mm_variant
 
     shapes = {}
     for _, m, k, n in LAYER_GEMMS + [DRAIN_SHAPE]:
@@ -178,12 +178,8 @@ def build_artifacts(cache, run_only=False):
     # The suffixed mm.o variants must exist before any compile_and_cache, so
     # prepare_air_project stages them into air_project/ for every ELF that links
     # them: drain links _m32, fused-cast links _m64.
-    compile_gemm_mm(
-        tile_m=32, tile_n=128, tile_k_l1=32, sym_suffix="_m32", out_name="mm_m32.o"
-    )
-    compile_gemm_mm(
-        tile_m=64, tile_n=128, tile_k_l1=32, sym_suffix="_m64", out_name="mm_m64.o"
-    )
+    compile_gemm_mm_variant(tile_m=32, tile_n=128, tile_k_l1=32)
+    compile_gemm_mm_variant(tile_m=64, tile_n=128, tile_k_l1=32)
 
     for name, (m, k, n) in shapes.items():
         cfg, entry = specs[name]

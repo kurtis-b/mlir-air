@@ -63,7 +63,7 @@ FOOTGUNS
     - The split-cast herd is ``herd_x x 1``. Two shim DMAs per tile is already
       the whole per-column budget once the herd spans all 8 columns; ``herd_y >
       1`` fails to place with "out of channels".
-    - ``mm_m64.o`` (or whichever object the registry method names) must exist in
+    - ``mm_m64n128.o`` (or whichever object the registry method names) must exist in
       the working directory when aiecc links. ``opcheck.py`` compiles it there.
     - The reference below computes in FP32 and rounds ONCE, matching the
       device's f32-accumulate-then-single-epilogue-cast. It is not iron's bf16

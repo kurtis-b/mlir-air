@@ -28,7 +28,7 @@ The two Qwen3 deltas vs LLAMA-3.2 (handled exactly as in qwen3_0_6b):
 ALIGNMENT + the O+FFN un-merge (REGISTRY-DRIVEN):
 Every GEMM N and K is divisible by 512 (emb=2560=512x5, q_dim=4096=512x8,
 kv_dim=1024, hidden=9728=512x19). All five GEMM shapes now resolve in the
-kernel registry to high-precision fused-cast (mm_m64.o, tile_m=64, tn=128):
+kernel registry to high-precision fused-cast (mm_m64n128.o, tile_m=64, tn=128):
     Q/K/V/O/Down            -> fused-cast tk_l2=256
     Gate/Up (2048x2560x9728) -> fused-cast tk_l2=64
 The Gate/Up tk_l2=64 (NOT 256) keeps the f32-out B-tile DMA stride within the
@@ -75,8 +75,8 @@ from qwen3_4b_cpu_helpers import attention_reference
 # exactly like the qwen3_0_6b / qwen3_1_7b siblings, so the example tracks the
 # tuned registry instead of a hardcoded table. The registry now has emb=2560
 # entries (Phase-1 GEMM sweep was promoted into it):
-#     Q/K/V/O/Down (512-aligned)  -> fused-cast tk_l2=256 tn=128 (mm_m64.o)
-#     Gate/Up (2048x2560x9728)    -> fused-cast tk_l2=64  tn=128 (mm_m64.o)
+#     Q/K/V/O/Down (512-aligned)  -> fused-cast tk_l2=256 tn=128 (mm_m64n128.o)
+#     Gate/Up (2048x2560x9728)    -> fused-cast tk_l2=64  tn=128 (mm_m64n128.o)
 # The Gate/Up tk_l2=64 (vs 256) keeps the f32-out B-tile DMA stride within the
 # AIE [1:1048576] range at N=9728, so the high-precision fused-cast path now
 # compiles AND is more accurate (mean_rel_L1 9.8e-3 vs the old direct-codegen
@@ -102,7 +102,7 @@ def _build_gemm_ir(m, k, n, spec, herd_m=8, herd_n=4):
     """Build lowered IR for one GEMM by its method spec.
 
     direct -> fully-lowered example builder (no external mm.o); fused-cast ->
-    the shared _build_gemm_module (links mm_m64.o)."""
+    the shared _build_gemm_module (links mm_m64n128.o)."""
     tm, k2, k1, tn = (
         spec["tile_m"],
         spec["tile_k_l2"],
@@ -384,7 +384,7 @@ def _build_single_gemm_elf(name, sym, seq_len, k_dim, n_dim, herd_m=8, herd_n=4)
     """Build a standalone single-GEMM ELF (Gate or Up), registry-driven.
 
     The registry resolves these (2048x2560x9728) to fused-cast high-prec, which
-    needs an f32 C-scratch func arg + the external mm_m64.o symbols. Returns
+    needs an f32 C-scratch func arg + the external mm_m64n128.o symbols. Returns
     (module, scratch_for_index) where scratch_for_index is the f32-scratch combined
     arg index (or None for a direct/drain method that needs no scratch)."""
     from shared.infra.stitching import (
@@ -790,16 +790,12 @@ def compile_all_kernels(cache, config, seq_len, verbose=False, cpu_attn=False):
         f"\n{'='*60}\nCompiling Qwen3-4B prefill kernels (seq_len={seq_len})...\n{'='*60}\n"
     )
 
-    from shared.infra.external_kernels import compile_gemm_mm, compile_rope
+    from shared.infra.external_kernels import compile_gemm_mm_variant, compile_rope
 
     # mm.o variants for the external (fused-cast) GEMMs; Gate/Up direct-codegen
     # needs NO external .o. rope.o for head_dim=128.
-    compile_gemm_mm(
-        tile_m=32, tile_n=128, tile_k_l1=32, sym_suffix="_m32", out_name="mm_m32.o"
-    )
-    compile_gemm_mm(
-        tile_m=64, tile_n=128, tile_k_l1=32, sym_suffix="_m64", out_name="mm_m64.o"
-    )
+    compile_gemm_mm_variant(tile_m=32, tile_n=128, tile_k_l1=32)
+    compile_gemm_mm_variant(tile_m=64, tile_n=128, tile_k_l1=32)
     compile_rope()
     from shared.infra.external_kernels import compile_silu_and_mul
 

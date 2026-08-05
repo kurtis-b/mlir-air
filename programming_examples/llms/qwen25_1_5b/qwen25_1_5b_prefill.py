@@ -31,10 +31,10 @@ every GEMM straight from gemm_registry_config (the Qwen3 pattern), with the
 0.5B Down-launch-0 split layered on top.
 
 Registry-selected methods (seq=2048):
-    Q/O    (1536x1536)  -> fused-cast (mm_m64.o, tile_n=128) — needs f32 scratch
-    K/V    (1536x256)   -> drain      (mm_m32.o, tile_n=64)
+    Q/O    (1536x1536)  -> fused-cast (mm_m64n128.o, tile_n=128) — needs f32 scratch
+    K/V    (1536x256)   -> drain      (mm_m32n64.o, tile_n=64)
     Gate/Up(1536x8960)  -> direct (low-precision, no external .o, tile_n=64)
-    Down   (8960x1536)  -> fused-cast (mm_m64.o, tile_n=128, launch 0)
+    Down   (8960x1536)  -> fused-cast (mm_m64n128.o, tile_n=128, launch 0)
 
 Attention runs head-first NPU FlashAttention by default (cpu_attn=False builds
 the flash_attn ELF, head_dim=128); CPU attention is an optional fallback
@@ -771,18 +771,14 @@ def compile_all_kernels(cache, config, seq_len, verbose=False, cpu_attn=False):
         f"\n{'='*60}\nCompiling Qwen2.5-1.5B prefill kernels (seq_len={seq_len})...\n{'='*60}\n"
     )
 
-    from shared.infra.external_kernels import compile_gemm_mm, compile_rope
+    from shared.infra.external_kernels import compile_gemm_mm_variant, compile_rope
 
     # mm.o variants for the external GEMMs:
-    #   _m32 drain    tile_n=64  (K/V projections)
-    #   _m64 fused    tile_n=128 (Q, O, Down projections)
+    #   _m32n64  drain  (K/V projections)
+    #   _m64n128 fused (Q, O, Down projections)
     # Gate/Up direct-codegen needs NO external .o. rope.o for head_dim=128.
-    compile_gemm_mm(
-        tile_m=32, tile_n=64, tile_k_l1=32, sym_suffix="_m32", out_name="mm_m32.o"
-    )
-    compile_gemm_mm(
-        tile_m=64, tile_n=128, tile_k_l1=32, sym_suffix="_m64", out_name="mm_m64.o"
-    )
+    compile_gemm_mm_variant(tile_m=32, tile_n=64, tile_k_l1=32)
+    compile_gemm_mm_variant(tile_m=64, tile_n=128, tile_k_l1=32)
     compile_rope()
     from shared.infra.external_kernels import compile_silu_and_mul
 

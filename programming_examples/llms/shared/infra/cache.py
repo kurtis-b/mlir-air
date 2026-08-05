@@ -51,15 +51,23 @@ def prepare_air_project(quant: str = "bf16"):
         "mv.o",
         "mv_bf16.o",
         "attn_decode_npu2.o",
-        # external GEMM microkernel variants (prefill o_ffn / rms_gemms_rope):
-        # bare mm.o (legacy f32-out / single-variant) + suffixed _m32 (drain,
-        # tile_m=32) / _m64 (fused-cast, tile_m=64) so mixed-method ELFs link.
+        # bare mm.o: legacy f32-out / single-variant ELFs that name their own
+        # object. The SUFFIXED variants are globbed below rather than listed.
         "mm.o",
-        "mm_m32.o",
-        "mm_m64.o",
     ]
     if quant == "awq":
         obj_names.append("mv_int4_bf16.o")
+
+    # External GEMM microkernel variants (prefill o_ffn / rms_gemms_rope), named
+    # per (tile_m, tile_n) by `gemm_builder.gemm_variant_names` -- `mm_m32n128.o`,
+    # `mm_m64n96.o`, and so on. GLOBBED, not enumerated: tile_n takes four values
+    # across the registry, so there are up to eight of these and which ones exist
+    # depends on which shapes the caller resolved. A fixed list was correct while
+    # the name came from the method alone (two objects) and is a silent
+    # link-failure waiting to happen now that it does not -- an ELF whose object
+    # never reached air_project/ fails inside aiecc, several frames from the list
+    # that omitted it.
+    obj_names.extend(sorted(p.name for p in Path(".").glob("mm_m*.o")))
     for obj_name in obj_names:
         src = Path(obj_name)
         if src.exists():

@@ -42,10 +42,21 @@ WHY THE CANDIDATE GRID IS SHAPE-DERIVED AND NOT A CONSTANT TABLE
 
 FOOTGUNS
     - ``tile_m`` IS NOT A FREE KNOB for the two high-precision methods. drain is
-      32 and fused-cast is 64 (``llms/shared/builders/gemm_builder.py:21-26``),
-      and ``_spec_with_tiles`` asserts the registry agrees. Emitting a row whose
+      32 and fused-cast is 64, and ``gemm_builder._METHOD_TILE_M`` is the
+      AUTHORITATIVE copy of that mapping -- ``METHODS`` below duplicates it
+      because the sweep must plan without importing the builders, and
+      ``_spec_with_tiles`` asserts the registry agrees. Emitting a row whose
       ``tile_m`` disagrees with its method would not mis-tune a model, it would
-      abort it at build time. ``METHODS`` is the single place that mapping lives.
+      abort it at build time. If the two tables ever drift, the sweep plans
+      configurations the builders cannot build; ``test_sweep_families.py`` checks
+      them against each other so drift fails a test rather than a gate.
+    - ``tile_n`` IS PART OF A GEMM'S IDENTITY, not just its tuning. Since Phase E1
+      the micro-kernel object and MLIR symbol suffix are minted per
+      ``(tile_m, tile_n)`` (``gemm_builder.gemm_variant_names``), so a row that
+      changes ``tile_n`` changes which ``mm_*.o`` gets compiled and linked. This is
+      why the sweep may plan several ``tile_n`` for one method without the
+      resulting configurations colliding in a shared ELF, which before E1 they
+      did -- silently, by overwriting each other's object file.
     - ``TILE_N_MAX`` is a MEASURED ceiling, not a derived one. ``tile_n = 192``
       satisfies every divisibility rule at ``N = 768`` and ``N = 2304`` and still
       fails to place ("Bank-aware allocation failed" then an L1 over-allocation).
@@ -104,6 +115,13 @@ ROLES = ("qkv_proj", "ffn_up", "ffn_down", "o_proj")
 #
 # `high_precision` and `method_arg` are what the example harness's CLI/builders
 # want; the sweep never re-derives them.
+#
+# `llms/shared/builders/gemm_builder.py::_METHOD_TILE_M` IS AUTHORITATIVE for the
+# `tile_m` column. This table duplicates it -- the sweep plans configurations
+# without importing the builders, and it also knows `direct`, which
+# `gemm_method_spec` deliberately does not -- and `test_sweep_families.py` asserts
+# the two agree so a drift fails a test rather than producing a plan the builders
+# reject at aircc time.
 METHODS = {
     "fused-cast": {"tile_m": 64, "tier": "high", "high_precision": True},
     "drain": {"tile_m": 32, "tier": "high", "high_precision": True},

@@ -42,7 +42,7 @@ FOOTGUNS
       reproduce that rounding, deliberately -- the same stance ``ffn.py`` takes
       for its ``h``. The gap is measured rather than defined away, and it is
       part of what ``atol`` is sized against.
-    - The resolved method's ``mm_*.o`` (``mm_m32.o`` for drain, ``mm_m64.o``
+    - The resolved method's ``mm_*.o`` (``mm_m32n128.o`` for drain, ``mm_m64n128.o``
       for fused-cast) must be in the working directory when aiecc links.
       ``compile_o_proj_kernel`` builds it there.
     - ``herd_m`` / ``herd_n`` default to the herd the registry tiles were

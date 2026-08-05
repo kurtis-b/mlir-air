@@ -221,7 +221,7 @@ def _build_o_ffn(
     JSON per shape (gemm_registry_config, "bf16"/"high"). All 4 are large so they
     resolve to fused-cast (external mm.o GEMM with an f32 C scratch + a separate
     on-chip cast launch each = @gemm_cast_bf16, 2 launches/GEMM). The 4 f32 scratch
-    buffers are func args 15..18. GPU-standard 9.3e-3 precision. Needs mm_m64.o +
+    buffers are func args 15..18. GPU-standard 9.3e-3 precision. Needs mm_m64n128.o +
     runtime_loop_tiling_sizes=[2,2] (BD-ID recycling).
     """
     from shared.builders.gemm_builder import (
@@ -467,7 +467,7 @@ def _build_o_ffn(
 
     # ---- Stitch (declarative via stitch_elf) ----
     # o_ffn is unconditionally all-fused-cast: all 4 GEMMs (O/Gate/Up/Down) share
-    # one method (_m64), each a 2-launch @gemm_cast_bf16 (A, W, C-f32-scratch,
+    # one method (_m64n128), each a 2-launch @gemm_cast_bf16 (A, W, C-f32-scratch,
     # D-bf16-out). The 4 f32 scratches are fixed func args 15..18; non-GEMM kernels
     # keep bf16 arg_maps. The mm.o symbols (suffix from o_spec) must not be renamed.
     _gemm_sym = o_spec["sym_suffix"]
@@ -570,14 +570,12 @@ if __name__ == "__main__":
 
     from shared.infra.external_kernels import (
         compile_silu_and_mul,
-        compile_gemm_mm,
+        compile_gemm_mm_variant,
     )
 
-    # The 4 GEMMs are fused-cast (tile_m=64) per the registry → mm_m64.o.
-    print("Compiling external kernels (mm_m64.o, silu_and_mul.o)...")
-    compile_gemm_mm(
-        tile_m=64, tile_n=128, tile_k_l1=32, sym_suffix="_m64", out_name="mm_m64.o"
-    )
+    # The 4 GEMMs are fused-cast (tile_m=64) per the registry → mm_m64n128.o.
+    print("Compiling external kernels (mm_m64n128.o, silu_and_mul.o)...")
+    compile_gemm_mm_variant(tile_m=64, tile_n=128, tile_k_l1=32)
     compile_silu_and_mul()
 
     print(f"O+FFN Multi-Launch: seq={SEQ_LEN}, emb={EMB_DIM}, hidden={HIDDEN_DIM}")

@@ -18,14 +18,14 @@ Qwen2.5 diverges from LLAMA-3.2 in two ways:
         emb=896, q_dim=896 (14 heads x 64), kv_dim=128 (2 heads x 64),
         hidden=4864.  o_proj is SQUARE (q_dim==emb_dim==896), unlike Qwen3.
      Registry-selected methods for these shapes (seq=2048):
-        Q/K/V  (896x{896,128})  -> drain      (_m32)
-        O      (896x896)        -> drain      (_m32)
+        Q/K/V  (896x{896,128})  -> drain      (_m32n128)
+        O      (896x896)        -> drain      (_m32n128)
         Gate/Up(896x4864)       -> DIRECT (low-precision) — high-prec tier RAISES
                                    (near-zero-ref atol artifact); direct is in
                                    the bf16 tier at mean_rel_L1=1.11e-2.
-        Down   (4864x896)       -> fused-cast (_m64)
+        Down   (4864x896)       -> fused-cast (_m64n128)
      The o_ffn ELF therefore mixes THREE GEMM methods in one stitched module:
-     drain (mm_m32.o), direct (no external .o), and fused-cast (mm_m64.o).
+     drain (mm_m32n128.o), direct (no external .o), and fused-cast (mm_m64n128.o).
 
 Attention uses the CPU fallback (cpu_attn=True), matching llama/qwen3 prefill.
 head_dim=64 → no FA hang risk.
@@ -56,9 +56,22 @@ from qwen25_0_5b_cpu_helpers import attention_reference
 # ---------------------------------------------------------------------------
 
 
+def _retile_n(spec, tile_n):
+    """`gemm_builder.with_tile_n`, with the import kept local like `_gemm_spec`.
+
+    Retiling N re-mints the variant's `sym_suffix` / `obj` / `build_kwargs`,
+    because both names are functions of (tile_m, tile_n) since Phase E1. Assigning
+    `spec["tile_n"]` directly does not, and leaves the GEMM linking an object
+    nobody compiles.
+    """
+    from shared.builders.gemm_builder import with_tile_n
+
+    return with_tile_n(spec, tile_n)
+
+
 def _gemm_spec(m, k, n, precision):
     """Registry config for one GEMM. precision: 'high' or 'low'."""
-    from shared.builders.gemm_builder import gemm_registry_config, gemm_method_spec
+    from shared.builders.gemm_builder import gemm_registry_config
 
     if precision == "low":
         # 'low' best is 'direct' for the Gate/Up shape; synthesize a spec since
@@ -147,7 +160,7 @@ def _padded_qkv_dims(q_dim, kv_dim):
     tile_n=32 (the registry config for N=896/128) is numerically broken for the
     drain f32-accumulate path (mean_rel_L1 ~0.2). tile_n=128 is the only correct
     tile_n but needs a 128*herd_n-aligned N. Q (896) and K/V (128) are BOTH padded
-    to the SAME width 1024 so their drain `_m32` private decls (whose 6D strides
+    to the SAME width 1024 so their drain `_m32n128` private decls (whose 6D strides
     depend on N) are byte-identical and dedup in one stitched ELF — distinct N
     would force distinct mm.o suffix copies. Host zero-pads weight columns and
     slices the GEMM output back to the real width. (Cost: K/V do extra work, but
@@ -473,8 +486,11 @@ def build_o_ffn_head_module(
     # (seq, n_pad); the residual add reads only the first emb columns.
     n_pad = _padded_n_for_down(emb_dim)
     o_spec = _gemm_spec(seq_len, emb_dim, emb_dim, "high")  # method=drain
-    o_spec = dict(o_spec)
-    o_spec["tile_n"] = 128
+    # `with_tile_n`, not `o_spec["tile_n"] = 128`: since Phase E1 the object name
+    # and symbol suffix are minted per (tile_m, tile_n), so retiling re-mints
+    # them. A bare assignment leaves this module linking `mm_m32n32.o` -- the
+    # registry's broken narrow tile -- which nothing compiles.
+    o_spec = _retile_n(o_spec, 128)
     g_spec = _gemm_spec(seq_len, emb_dim, hidden_dim, "low")
     print(f"  [head] GEMM methods: O={o_spec['method']} Gate/Up={g_spec['method']}")
 
@@ -732,8 +748,7 @@ def build_down_add_module(seq_len, emb_dim, hidden_dim, down_herd_m=8, down_herd
     # 1024/(128*4)=2. Use the fused-cast method spec at the registry tiles for
     # the 1024-N shape (proven correct); force tile_n=128.
     d_spec = _gemm_spec(seq_len, hidden_dim, emb_dim, "high")  # method=fused-cast
-    d_spec = dict(d_spec)
-    d_spec["tile_n"] = 128
+    d_spec = _retile_n(d_spec, 128)  # re-mints obj/sym_suffix; see the O GEMM
     print(
         f"  [down_add] Down GEMM ({d_spec['method']}) {seq_len}x{hidden_dim}x{n_pad} "
         f"(N padded from {emb_dim}, tile_n=128)..."
@@ -896,16 +911,12 @@ def compile_all_kernels(cache, config, seq_len, verbose=False, cpu_attn=True):
         f"\n{'='*60}\nCompiling Qwen2.5 prefill kernels (seq_len={seq_len})...\n{'='*60}\n"
     )
 
-    from shared.infra.external_kernels import compile_gemm_mm, compile_rope
+    from shared.infra.external_kernels import compile_gemm_mm_variant, compile_rope
 
     # mm.o variants for the external GEMMs (drain _m32, fused-cast _m64).
     # Gate/Up direct-codegen needs NO external .o. rope.o for head_dim=64.
-    compile_gemm_mm(
-        tile_m=32, tile_n=128, tile_k_l1=32, sym_suffix="_m32", out_name="mm_m32.o"
-    )
-    compile_gemm_mm(
-        tile_m=64, tile_n=128, tile_k_l1=32, sym_suffix="_m64", out_name="mm_m64.o"
-    )
+    compile_gemm_mm_variant(tile_m=32, tile_n=128, tile_k_l1=32)
+    compile_gemm_mm_variant(tile_m=64, tile_n=128, tile_k_l1=32)
     compile_rope()
 
     print("\n--- rms_qkv_bias_rope (FUSED: RMSNorm+QKV+bias+RoPE, 9 launches) ---")
