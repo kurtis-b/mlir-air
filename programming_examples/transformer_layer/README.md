@@ -5,9 +5,11 @@ studies](../../docs/plans/transformer-layer-execution-studies/04-phase-a-kernels
 the C++ device kernels a full encoder/decoder block needs, compiled with Peano
 for AIE2P.
 
-It also holds Phase B's runtime-seam gate. The kernel half needs no NPU, which is
-what keeps it safe as a PR gate; the seam half is split the same way — host-only
-unit tests, plus one hardware gate.
+It also holds Phase B's runtime-seam gate, the Phase C/D1 operator builders and
+their numerical checks, and the Phase C4 registry sweep. The kernel half needs no
+NPU, which is what keeps it safe as a PR gate; the seam half is split the same
+way — host-only unit tests, plus one hardware gate. The operator checks all need
+one.
 
 ```bash
 make compile                 # build every object and check its symbols (no NPU)
