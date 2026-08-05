@@ -39,11 +39,11 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 |---|---|---|
 | A — AIE2P kernels | Every kernel compiles to `.o` with Peano; compile-only lit passes | **done** 2026-08-04 (18 min) |
 | B — runtime seam | Multi-ELF runlist on hardware: numerically identical to sequential, lower latency | **done** 2026-08-04 (362 min) |
-| C1 — gate mechanism + small operators | `opcheck.py` and its fault-injection negative control; `causal_mask`, `addnorm`, `layer_norm`, `elementwise_add` pass on hardware | landed 2026-08-04, **awaiting driver confirmation** — suite 8/8 and the objective check replayed in-session, but a session's own say-so is not the gate |
-| C2 — `qkv_proj`, `ffn` | Both pass full-output `np.isclose` at registry tolerance vs an FP32 reference | not started — **next** |
-| C3 — `mha_out_proj` | Passes at the registry's FlashAttention tolerance, causal and non-causal | not started |
-| C4 — coverage sweep | The 36 `baseline_768` shapes resolve through `gemm_config()`; registry rows written; ten shipped models still pass `make verify` | not started |
-| D — block integration | One full transformer layer matches the torch reference on hardware | not started |
+| C1 — gate mechanism + small operators | `opcheck.py` and its fault-injection negative control; `causal_mask`, `addnorm`, `layer_norm`, `elementwise_add` pass on hardware | **done** 2026-08-04 (61 min) |
+| C2 — `qkv_proj`, `ffn` | Both pass full-output `np.isclose` at registry tolerance vs an FP32 reference | **done** 2026-08-04 (45 min) |
+| C3 — `mha_out_proj` | Passes at the registry's FlashAttention tolerance, causal and non-causal | **done** 2026-08-04 (68 min) |
+| C4 — coverage sweep | The 36 `baseline_768` shapes resolve through `gemm_config()`; registry rows written; ten shipped models still pass `make verify` | **done** 2026-08-04 (504 min + 66 min re-run) |
+| D — block integration | One full transformer layer matches the torch reference on hardware | not started — **next** |
 | E — execution strategies | All four modes agree with the reference; dispatch vectors differ as predicted | not started |
 | F — study harness | `execution-smoke-test` yields ≥1 `run_status=passed` row per measurement CSV | not started |
 | G — unattended runner + CI | Full profile run completes with a complete `results_manifest.json` | not started |
@@ -62,6 +62,21 @@ a compile-only test and a host-only test — 2 tests, 16 seconds, per
 [05a](05a-phase-b-runlist-spike-result.md) was produced by `make runlist-gate`, which the session
 ran and self-reported. `run_npu2_runlist_gate.lit` now puts that gate in the suite; it has been
 re-run and all four legs pass, so the claim stands — but it stood on a self-report until then.
+
+Phase C ran as C1–C4 on 2026-08-04, 21 of 40 invocations, ~12 hours wall clock. All four passed
+gate, objective and tamper checks. C4 halted once on a driver bug rather than on its own work —
+the objective check demanded a registry mtime no honest run could produce — recorded in
+[14](14-the-port-loop-harness.md). The registry grew from 33 to 69 bf16-out GEMM shapes with every
+pre-existing row byte-identical, and all ten shipped LLM deployments still pass `make verify`.
+
+**One loose end for Phase D.** The three review rounds are the whole review budget, so a finding
+raised in round 3 is fixed by round 3's fix session and then *nothing re-reviews it*. C4's round-3
+review raised two blocking findings — the `64x768x2304` QKV shape lacked the `fused-cast` row its
+builder pins, and the resolution gate checked only each row's winner rather than the method a
+builder actually requires. Both were fixed (that shape now carries all three methods, and the
+sweep's fused-cast configuration for it replaced one returning zeros for two of nine cast
+sub-tiles), and both fixes were verified by hand afterwards — but by the loop's structure, not by
+a fourth Codex round.
 
 ## Picking this up in a new session
 
