@@ -1,0 +1,109 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase E2 coarse-mode gate: the D2 layer, measured as an execution strategy.
+//
+// Same five operator launches over four ELFs as run_npu2_block_peano.lit, same
+// golden model, same per-boundary comparisons -- by construction, since
+// pattern/coarse/coarse.py calls the shared preparer over builders/block.py
+// rather than reimplementing any of it. What is under test HERE is the mode
+// contract the other three strategies will be measured against: the mode runs
+// through its OWN ELF cache (coarse_cache, never shared with block's -- cache
+// reuse is keyed by directory name, and two modes pointed at one directory can
+// trade ELFs, attributing valid numbers to the wrong execution boundary), and
+// its artifact records execution_mode plus one DispatchVector row per
+// dispatched sequence, on the fault-injected path exactly as on the clean one.
+//
+// Two recipes in one file, deliberately: they share a working directory and
+// therefore the ELF cache, so the injected run reuses the four ELFs the clean
+// run compiled -- compilation depends on the shape, not the data -- and costs
+// one dispatch instead of a second full-layer compile. A separate test file
+// would get a separate working directory and pay four ELFs to perturb one
+// weight.
+//
+// NPU serialization lives one layer down, not in the recipes below: device
+// access is locked on /tmp/npu.lock inside KernelCache, the same inode
+// lit.cfg.py's NPU substitution takes. Taking the outer /tmp/mlir-air-npu.lock
+// here would DEADLOCK against the gate command that already holds it -- BSD
+// flock(2) treats a second open() of the same file as a foreign lock.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming
+// one in prose -- even inside a comment -- registers as a second directive and
+// leaves the test UNRESOLVED. Describe them, never spell them out.
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_npu2_coarse_peano
+// RUN: cd test_npu2_coarse_peano
+// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile check-coarse PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+//
+// The configuration first -- the forced gate configuration, resolved through
+// the registry. A registry change that moved any operator's method fails here
+// with its cause on screen, exactly as in the block gate.
+// CHECK: block 4096x768 ffn 3072 12h x 64 (encoder_bert, non-causal)
+// CHECK: qkv_proj  fused-cast (registry), ffn up drain / down fused-cast (registry), o_proj drain (registry)
+// CHECK: addnorm pre-add 64x768 x64 dispatches (L1 cap 104)
+//
+// Every boundary, in execution order, each with zero mismatching elements.
+// Named individually rather than counted, so a stage list that dropped or
+// repeated an entry fails here -- the driver requires at least eight DISTINCT
+// names, and this is where the suite enforces the same thing.
+// CHECK: [stage] q {{.*}} mismatch       0
+// CHECK: [stage] k {{.*}} mismatch       0
+// CHECK: [stage] v {{.*}} mismatch       0
+// CHECK: [stage] attn_context {{.*}} mismatch       0
+// CHECK: [stage] attn_out {{.*}} mismatch       0
+// CHECK: [stage] hidden {{.*}} mismatch       0
+// CHECK: [stage] ffn_up {{.*}} mismatch       0
+// CHECK: [stage] ffn_gelu {{.*}} mismatch       0
+// CHECK: [stage] ffn_out {{.*}} mismatch       0
+// CHECK: [stage] output {{.*}} mismatch       0
+// CHECK: [coarse] stages: 10/10 clean
+//
+// The mode's own instrumentation: one DispatchVector row per dispatched
+// sequence -- qkv+mha, norm 1, ffn, norm 2. Four, not one, because a dispatch
+// argument is a whole BO and the row-blocked normalization points cannot share
+// a runlist with the tensors they consume; the count is the mode's shape, so a
+// wrapper that stopped recording per-sequence rows fails here before the
+// driver's totals comparison sees it.
+// CHECK: [coarse] recorded 4 dispatch vectors
+//
+// Then the layer output itself over all 4096 x 768 elements, and the label
+// naming the MODE's operator -- a test wired to the block's artifact by
+// mistake fails here rather than passing quietly.
+// CHECK: PASS!
+// CHECK: [opcheck] coarse [4096x768_encoder_bert]: PASS
+//
+// THE NEGATIVE CONTROL. Identical reasoning to the block gate's -- ln1_weight,
+// chosen by measurement, perturbed AFTER the golden model was computed -- plus
+// the one stake that is this mode's own: the dispatch vectors must be recorded
+// on the injected path too, because the driver requires the fault artifact's
+// summed totals to EQUAL the clean run's. A "skip instrumentation when
+// injecting" shortcut fails below at the recorded-vectors line, before the
+// driver ever runs.
+//
+// RUN: make -f %S/Makefile check-coarse-fault PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s --check-prefix=FAULT
+//
+// The injected element first, so an injection that silently perturbed nothing
+// is visible here rather than read backwards from the verdict. Index 3 is
+// ln1_weight in BLOCK_INPUT_NAMES.
+// FAULT: [fault-inject] input 3 at (0,)
+//
+// Nothing upstream of the first addnorm reads ln1_weight, so the attention
+// half must still be exact while `hidden` and everything after it moves --
+// which is what says the stage comparisons are reading THIS run's device
+// buffers rather than replaying the clean run's.
+// FAULT: [stage] q {{.*}} mismatch       0
+// FAULT: [stage] attn_out {{.*}} mismatch       0
+// FAULT: [stage] hidden {{.*}} mismatch {{[1-9][0-9]*}}
+// FAULT: [coarse] stages: 5/10 clean
+//
+// The vectors, still recorded under injection.
+// FAULT: [coarse] recorded 4 dispatch vectors
+//
+// And the verdict in the three forms opcheck.py reports it: the comparison's
+// own, the control's reading of it, and the exit-status summary.
+// FAULT: [opcheck] coarse [4096x768_encoder_bert]: FAIL
+// FAULT: [opcheck] coarse [4096x768_encoder_bert]: fault-inject input -> FAIL (as required)
+// FAULT: NEGATIVE CONTROL: PASS

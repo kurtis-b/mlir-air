@@ -6,9 +6,11 @@ the C++ device kernels a full encoder/decoder block needs, compiled with Peano
 for AIE2P.
 
 It also holds Phase B's runtime-seam gate, the Phase C/D1 operator builders and
-their numerical checks, the Phase C4 registry sweep, and Phase D2's block
+their numerical checks, the Phase C4 registry sweep, Phase D2's block
 integration gate — one whole `encoder_bert` layer assembled from those operators
-and compared against a shared golden model at every boundary it passes. The kernel half needs no
+and compared against a shared golden model at every boundary it passes — and,
+under `pattern/`, Phase E's execution strategies, of which `coarse` is the
+first. The kernel half needs no
 NPU, which is what keeps it safe as a PR gate; the seam half is split the same
 way — host-only unit tests, plus one hardware gate. The operator checks all need
 one.
@@ -406,6 +408,59 @@ reused and the run would have proved nothing. Deleting `block_cache/` is what
 makes an ordering change testable, and the evidence is that every stage figure
 comes back byte-identical — `ffn_up` above all, since that is the boundary the
 interleaving existed to protect.
+
+## The `coarse` execution strategy (Phase E2)
+
+`pattern/coarse/` is the first of Phase E's four execution-strategy modes: few
+fused kernels over one runlist per sequence — iron's `hybrid`, renamed per
+porting convention 7, with the old name surviving only as the CSV
+`execution_mode` value. **The mode is not a second block.** `builders/block.py`
+stays exactly where it is, with its lit, opcheck and coverage enrolments
+untouched; `pattern/coarse/coarse.py` is the mode layer only — the shared
+full-layer preparer (`opcheck_prepare.prepare_layer_dispatch`) pointed at the
+mode's own ELF cache, its own operator name in the `SPECS` catalogue, and its
+`execution_mode` value from the one mapping in
+`pattern/__init__.py::EXECUTION_MODE_CSV`. `pattern/coarse/README.md` has the
+mode's measured dispatch vectors and what they calibrate.
+
+Three parts of the E2 contract are easy to get wrong, and each is enforced
+somewhere that will catch it:
+
+**Each mode gets its own `KernelCache` directory, and it is not a style
+choice.** The fingerprint that gates ELF reuse is sound, but the cache
+*directory* is chosen by name (`KernelCache(cache_dir=...)`), so two modes
+pointed at one directory can trade ELFs whose fingerprints happen to agree —
+numerically valid output attributed to the wrong execution boundary, a failure
+no equivalence check would surface. `coarse` uses `coarse_cache/`, gitignored
+and in `make clean` in the same commit that created it, because the driver's
+negative control runs `opcheck.py` from the source tree and the cache lands
+there — the leak `block_cache/` already had once.
+
+**The dispatch vectors are recorded, never counted by hand.** Every row in a
+mode's `dispatch_vectors` is `DispatchVector.as_row()` straight out of
+`KernelCache.run_sequence` (`llms/shared/infra/dispatch.py`), one per
+sequence. Two things about the six keys bite if assumed otherwise:
+`runlist_entries_per_submission` is a derived **mean**, so total entries are
+`Σ round(mean × submissions)` — never a naive sum of the means, which only
+agrees while every submission count is 1 — and the driver rejects any row
+whose product is not a whole number of entries, because that is the shape a
+fabricated number takes.
+
+**The fault-injected run carries the vectors too.** The driver re-runs the
+mode with `--fault-inject input`, requires that run to *fail*, and requires
+the fault artifact's six summed totals to *equal* the clean run's — injection
+perturbs one input element after the reference exists and never touches the
+dispatch path. The instrumentation is therefore unconditional in the shared
+preparer's dispatch closure, and the lit recipes' fault half matches the
+"recorded 4 dispatch vectors" line so a conditional shortcut fails in the
+suite before the driver's totals comparison sees it.
+
+The cost worth stating: the suite now runs **two** full-layer tests — `block`
+and `coarse` — and each lit test starts with `make clean` in its own working
+directory, so the second compiles its four ELFs rather than inheriting the
+first's cache. Real minutes on every gate, and the price of keeping D2's gate
+provable against its own artifact set while the modes stay unable to trade
+ELFs.
 
 ## The registry sweep
 
