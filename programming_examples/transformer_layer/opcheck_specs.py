@@ -55,6 +55,7 @@ from opcheck_prepare import (  # noqa: E402
     prepare_mha_out_proj,
     prepare_qkv_proj,
 )
+from pattern.coarse import prepare_coarse  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # THE baseline_768 SET (D1)
@@ -498,5 +499,33 @@ SPECS = [
         # tolerance; the driver rejects anything above 1e-1 anyway.
         "atol": 1e-1,
         "prepare": prepare_block,
+    },
+    {
+        # PHASE E2: the same layer as `block`, measured as the `coarse`
+        # execution strategy -- few fused kernels over one runlist per
+        # sequence, iron's `hybrid` (the CSV value it records; convention rule
+        # 7 confines that name to pattern/__init__.py::EXECUTION_MODE_CSV).
+        # The device path IS builders/block.py, through pattern/coarse's own
+        # ELF cache; what this row adds is the mode's artifact -- operator
+        # name, execution_mode, and the four per-sequence dispatch vectors the
+        # Phase E distinguishability gate calibrates against (4 submissions /
+        # 131 runlist entries, 128 of them addnorm's row blocking).
+        "operator": "coarse",
+        "shape_key": "4096x768_encoder_bert",
+        "shape": {
+            "seq_len": 4096,
+            "emb_dim": 768,
+            "ffn_dim": 3072,
+            "num_heads": 12,
+            "head_dim": 64,
+        },
+        # Same tensor as the block row, compared the same way at the same
+        # golden seed, so the measurement is the block's: mean_rel_L1
+        # 1.688e-2, atol_required 7.398e-2 over 3145728 elements, and atol is
+        # the 1e-1 HARD CEILING at that row's 1.35x margin. See the block
+        # entry above for why there is nowhere to pad to and why exceeding the
+        # ceiling is a defect report, never a wider tolerance.
+        "atol": 1e-1,
+        "prepare": prepare_coarse,
     },
 ]

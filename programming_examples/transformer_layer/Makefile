@@ -25,7 +25,8 @@ SWEEP_ARGS ?=
 .PHONY: help compile runlist-gate seam-tests clean opcheck-list \
         check-elementwise-add check-causal-mask check-layer-norm check-addnorm \
         check-qkv-proj check-ffn check-mha-out-proj check-fault-control \
-        check-block check-block-fault reference-tests block-cache-tests \
+        check-block check-block-fault check-coarse check-coarse-fault \
+        reference-tests block-cache-tests \
         registry-resolution registry-sweep registry-write registry-plan \
         registry-writer-tests
 
@@ -65,6 +66,13 @@ help:
 	@echo "                      That layer's negative control. It must FAIL"
 	@echo "                      under injection, and this target succeeds"
 	@echo "                      exactly when it does."
+	@echo "  make check-coarse   The same layer measured as the Phase E 'coarse'"
+	@echo "                      execution strategy: builders/block.py through"
+	@echo "                      its own ELF cache, with the dispatch vectors"
+	@echo "                      recorded as the mode's artifact. NEEDS AN NPU."
+	@echo "  make check-coarse-fault"
+	@echo "                      That mode's negative control; must FAIL under"
+	@echo "                      injection, with the vectors still recorded."
 	@echo "  make check-ffn-ladder-fault"
 	@echo "                      The seq-64 ladder point's own negative control."
 	@echo "                      The shared one injects an operator's FIRST"
@@ -205,6 +213,26 @@ check-block-fault:
 	    python3 $(srcdir)/opcheck.py --operator block \
 	        --fault-inject input --expect-failure
 
+# Phase E2: the same layer as check-block, measured as the `coarse` execution
+# strategy. Identical device path (builders/block.py), but its own operator
+# name, results artifact and ELF cache (./coarse_cache under $(BUILD_DIR)) —
+# modes must never share a cache directory, because reuse there is keyed by
+# name and two modes pointed at one directory can trade ELFs. The artifact
+# additionally records execution_mode and the four per-sequence dispatch
+# vectors the Phase E distinguishability gate consumes.
+check-coarse:
+	$(call opcheck,coarse)
+
+# The mode's negative control. Same reasoning as check-block-fault, plus one
+# mode-specific stake: the dispatch vectors must be recorded on the injected
+# path too, since the driver requires the fault artifact's summed totals to
+# equal the clean run's.
+check-coarse-fault:
+	mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
+	    python3 $(srcdir)/opcheck.py --operator coarse \
+	        --fault-inject input --expect-failure
+
 # Host-only: the golden model is the layer it claims to be. No NPU, no MLIR.
 reference-tests:
 	python3 $(srcdir)/pattern/test_reference.py
@@ -262,4 +290,4 @@ registry-writer-tests:
 	python3 $(srcdir)/sweep/test_registry_writer.py
 
 clean:
-	rm -rf $(BUILD_DIR) __pycache__ runlist_gate_cache block_cache
+	rm -rf $(BUILD_DIR) __pycache__ runlist_gate_cache block_cache coarse_cache
