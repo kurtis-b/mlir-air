@@ -45,6 +45,19 @@ FOOTGUNS
       config JSON are both stable across processes -- if that ever stops being
       true the cache silently stops hitting, which costs compile time rather
       than correctness, and ``test_block_cache.py`` is where it would show.
+    - ``matrix_multiplication/bf16_in_bf16_out`` is absent from the source
+      dirs ON PURPOSE. Its ``run.py`` builds the drain / fused-cast GEMM
+      modules -- covered by the IR hash -- but its ``.cc`` files are never
+      compiled into any artifact here: every linked GEMM object comes from
+      ``bf16_in_fp32_out/mm_aie2p.cc`` (``compile_gemm_mm``), a strict
+      superset of the bf16_out copy, and that source IS hashed. An edit to
+      the bf16_out copy alone therefore changes neither the binaries nor the
+      fingerprint, and listing the directory anyway would turn such an edit
+      into a rebuild that produces the identical ELF -- false assurance that
+      the gate tracked a change it cannot see. What an edit like that CAN
+      invalidate is the registry: the C4 sweep measured its rows against the
+      bf16_out copy, so if the two copies drift, re-sweep -- new rows reach
+      this fingerprint through the config and the IR.
     - It fingerprints the INPUTS to a compile, not the bytes it produced.
       ``KernelCache.load_manifest`` checks that each cached binary still exists;
       neither of them checks that it is still the binary that compile wrote. A
@@ -78,6 +91,10 @@ FINGERPRINT_FILE = "block_fingerprint.json"
 #: accepted. Hashing the directories goes wrong the other way: editing
 #: ``encoder.cc`` also rebuilds the addnorm ELF, which costs a compile and never
 #: costs a wrong result.
+#:
+#: ``bf16_in_fp32_out``, not ``bf16_in_bf16_out``: the objects every GEMM
+#: method links -- drain included -- compile from the fp32_out copy of
+#: ``mm_aie2p.cc``. See the module footguns before "fixing" this.
 _KERNEL_SOURCE_DIRS = (
     os.path.join(_PROJ_ROOT, "transformer_layer", "kernels"),
     os.path.join(_PROJ_ROOT, "matrix_multiplication", "bf16_in_fp32_out"),
