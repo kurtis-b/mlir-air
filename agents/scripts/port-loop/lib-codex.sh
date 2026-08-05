@@ -43,26 +43,45 @@ pl_codex_review() {
   [ -n "${PL_CODEX_MODEL}" ]  && extra+=(-m "${PL_CODEX_MODEL}")
   [ -n "${PL_CODEX_EFFORT}" ] && extra+=(-c "model_reasoning_effort=\"${PL_CODEX_EFFORT}\"")
 
-  local rc=0
-  ( cd "${PL_ROOT}" && timeout --signal=TERM "${PL_REVIEW_TIMEOUT}" \
-      codex exec \
-        --sandbox read-only \
-        --output-schema "${PL_LIB}/schema/review.json" \
-        --output-last-message "${out_json}" \
-        --skip-git-repo-check \
-        "${extra[@]}" \
-        - < "${prompt_file}" > /dev/null 2> "${log_file}" ) || rc=$?
+  # Same exposure as pl_claude_run: a provider-side 5xx overnight would otherwise halt a run that
+  # has hours of hardware time behind it. A review is read-only and writes nothing but its verdict
+  # file, so re-running one is always safe -- there is no partial-work hazard to discriminate
+  # against here, only the need to bound the loop.
+  local rc=0 attempt=1
+  while : ; do
+    rc=0
+    : > "${out_json}"
+    ( cd "${PL_ROOT}" && timeout --signal=TERM "${PL_REVIEW_TIMEOUT}" \
+        codex exec \
+          --sandbox read-only \
+          --output-schema "${PL_LIB}/schema/review.json" \
+          --output-last-message "${out_json}" \
+          --skip-git-repo-check \
+          "${extra[@]}" \
+          - < "${prompt_file}" > /dev/null 2> "${log_file}" ) || rc=$?
 
-  if [ "${rc}" -eq 124 ] || [ "${rc}" -eq 143 ]; then
-    log_error "codex review timed out after ${PL_REVIEW_TIMEOUT}s"
-    return 1
-  fi
+    if [ "${rc}" -eq 124 ] || [ "${rc}" -eq 143 ]; then
+      log_error "codex review timed out after ${PL_REVIEW_TIMEOUT}s"
+      return 1
+    fi
 
-  if [ ! -s "${out_json}" ]; then
+    [ -s "${out_json}" ] && break
+
+    if [ "${attempt}" -le "${PL_API_RETRIES:-5}" ] \
+       && grep -qiE 'stream error|5[0-9][0-9]|overloaded|rate.?limit|temporarily unavailable|service unavailable|connection (error|reset|refused)|timed out' \
+               "${log_file}" 2>/dev/null; then
+      local delay=$(( ${PL_API_RETRY_DELAY:-60} * attempt ))
+      log_warn "transient codex failure, attempt ${attempt}/${PL_API_RETRIES:-5}; retrying in ${delay}s"
+      tail -3 "${log_file}" >&2 2>/dev/null || true
+      sleep "${delay}"
+      attempt=$(( attempt + 1 ))
+      continue
+    fi
+
     log_error "codex review produced no verdict file (exit ${rc}); see ${log_file}"
     tail -20 "${log_file}" >&2 2>/dev/null || true
     return 1
-  fi
+  done
 
   if ! jq -e '.verdict and (.blocking | type == "array") and (.weakened_gates | type == "array")' \
         "${out_json}" >/dev/null 2>&1; then

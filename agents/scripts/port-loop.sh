@@ -36,6 +36,8 @@
 #   PL_CODEX_MODEL      codex model            (default: from ~/.codex/config.toml)
 #   PL_CODEX_EFFORT     codex reasoning effort (default: from ~/.codex/config.toml)
 #   PL_DRY_RUN          yes|no                              (default no)
+#   PL_API_RETRIES      retries on a transient API failure  (default 5)
+#   PL_API_RETRY_DELAY  seconds, multiplied by attempt no.  (default 60)
 #
 # Exit codes: 0 success, 1 operational failure, 2 usage error.
 #
@@ -83,7 +85,7 @@ log_error() { printf '[%s] ERROR: %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
 usage() {
   # Range ends at the "Exit codes" line. Extending the header without moving this silently
   # truncates --help, which is how PL_MODEL and PL_DRY_RUN once vanished from it.
-  sed -n '3,39p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '3,41p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 require_deps() {

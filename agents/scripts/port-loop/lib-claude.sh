@@ -19,6 +19,29 @@
 #     instead of passing "default".
 #   - Session persistence is deliberately left ON so transcripts remain inspectable afterward.
 
+# A transient API failure is not a phase failure.
+#
+# D1's implement session died three minutes in on `API Error: 529 Overloaded` -- one turn, zero
+# cost, no work attempted -- and halted a run scheduled to go unattended for 36 hours. Retrying is
+# obviously right there, and obviously wrong for a session that actually ran: re-running one that
+# already edited files and committed would duplicate its work against a moving base.
+#
+# The discriminator is that the session did NOTHING. `total_cost_usd == 0` means no tokens were
+# billed, so nothing can have been written. Any session that spent budget produced a real outcome
+# -- success or failure -- and is reported as one.
+PL_API_RETRIES="${PL_API_RETRIES:-5}"
+PL_API_RETRY_DELAY="${PL_API_RETRY_DELAY:-60}"
+
+pl_result_is_transient() {
+  local out="$1" cost result
+  cost="$(jq -r '.total_cost_usd // 0' "${out}" 2>/dev/null || echo 0)"
+  # Never re-run anything that spent budget, whatever the error text says.
+  awk -v c="${cost}" 'BEGIN { exit !(c + 0 == 0) }' || return 1
+  result="$(jq -r '.result // ""' "${out}" 2>/dev/null || echo "")"
+  printf '%s' "${result}" | grep -qiE \
+    'API Error: (429|5[0-9][0-9])|overloaded|rate.?limit|temporarily unavailable|service unavailable|connection (error|reset|refused)|upstream'
+}
+
 # pl_claude_run <prompt-file> <schema-file> <log-dir> <label>
 # Writes: <log-dir>/<label>.json (full result), <label>.report.json (structured output),
 #         <label>.stderr
@@ -30,37 +53,56 @@ pl_claude_run() {
   local report="${log_dir}/${label}.report.json"
   local errlog="${log_dir}/${label}.stderr"
 
-  state_count_invocation || return 1
-
-  log_info "claude session '${label}' (timeout ${PL_STEP_TIMEOUT}s, budget \$${PL_STEP_BUDGET})"
-
   if [ "${PL_DRY_RUN}" = "yes" ]; then
+    state_count_invocation || return 1
     log_info "DRY RUN: would run claude -p with prompt ${prompt_file}"
     return 0
   fi
 
-  local rc=0
-  ( cd "${PL_ROOT}" && timeout --signal=TERM "${PL_STEP_TIMEOUT}" \
-      claude -p \
-        --permission-mode bypassPermissions \
-        --model "${PL_MODEL}" \
-        --max-budget-usd "${PL_STEP_BUDGET}" \
-        --max-turns "${PL_MAX_TURNS}" \
-        --output-format json \
-        --json-schema "$(cat "${schema_file}")" \
-        --append-system-prompt "$(cat "${PL_LIB}/prompts/guardrails.md")" \
-        --add-dir "${PL_ROOT}" \
-        < "${prompt_file}" > "${out}" 2> "${errlog}" ) || rc=$?
+  local attempt=1 rc=0
+  while : ; do
+    # Counted per attempt, so a retry storm still runs into the invocation cap and the deadline
+    # rather than spinning quietly.
+    state_count_invocation || return 1
 
-  if [ "${rc}" -eq 124 ] || [ "${rc}" -eq 143 ]; then
-    log_error "claude session '${label}' timed out after ${PL_STEP_TIMEOUT}s"
-    return 1
-  fi
+    log_info "claude session '${label}' (timeout ${PL_STEP_TIMEOUT}s, budget \$${PL_STEP_BUDGET}, attempt ${attempt})"
 
-  if [ ! -s "${out}" ]; then
-    log_error "claude session '${label}' produced no output (exit ${rc}); see ${errlog}"
-    return 1
-  fi
+    rc=0
+    ( cd "${PL_ROOT}" && timeout --signal=TERM "${PL_STEP_TIMEOUT}" \
+        claude -p \
+          --permission-mode bypassPermissions \
+          --model "${PL_MODEL}" \
+          --max-budget-usd "${PL_STEP_BUDGET}" \
+          --max-turns "${PL_MAX_TURNS}" \
+          --output-format json \
+          --json-schema "$(cat "${schema_file}")" \
+          --append-system-prompt "$(cat "${PL_LIB}/prompts/guardrails.md")" \
+          --add-dir "${PL_ROOT}" \
+          < "${prompt_file}" > "${out}" 2> "${errlog}" ) || rc=$?
+
+    if [ "${rc}" -eq 124 ] || [ "${rc}" -eq 143 ]; then
+      log_error "claude session '${label}' timed out after ${PL_STEP_TIMEOUT}s"
+      return 1
+    fi
+
+    if [ ! -s "${out}" ]; then
+      log_error "claude session '${label}' produced no output (exit ${rc}); see ${errlog}"
+      return 1
+    fi
+
+    if [ "${attempt}" -le "${PL_API_RETRIES}" ] \
+       && [ "$(jq -r '.is_error // false' "${out}" 2>/dev/null || echo true)" = "true" ] \
+       && pl_result_is_transient "${out}"; then
+      local delay=$(( PL_API_RETRY_DELAY * attempt ))
+      log_warn "transient API failure on '${label}', attempt ${attempt}/${PL_API_RETRIES}:"
+      log_warn "  $(jq -r '.result // ""' "${out}" 2>/dev/null | head -1)"
+      log_warn "  no budget was spent, so no work was done; retrying in ${delay}s"
+      sleep "${delay}"
+      attempt=$(( attempt + 1 ))
+      continue
+    fi
+    break
+  done
 
   # Exit code is not authoritative — inspect the result envelope.
   local is_error subtype cost
