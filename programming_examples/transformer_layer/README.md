@@ -585,6 +585,87 @@ the thing this hardware cannot dispatch (no `K = 64` registry row), and a
 device transpose feeding a host `torch` matmul that re-layouts its operands
 anyway would add an entry while measuring nothing.
 
+## The `fused` execution strategy (Phase E5)
+
+`pattern/fused/` is the most fused point of the taxonomy: MLIR-level fusion
+before compilation, via `stitch_elf` — MLIR-AIR's own production mechanism,
+which is what makes this port additive rather than a duplicate of iron. The
+layer executes as **one runlist submission of three entries over three
+ELFs**: the D2 `qkv_proj` and `mha_out_proj` modules unchanged, then
+`fused_tail` — a new ten-launch stitched module holding residual add,
+LayerNorm and gamma multiply (ln1), the whole staged FFN, and add, LayerNorm,
+gamma multiply (ln2), all over whole `[4096, 768]` tensors. Whole tensors are
+the point: `coarse` pays 386 of its 402 sync boundaries restaging 64-row
+`addnorm` bands through the host, and fusing the norms into one module
+removes all of it. `pattern/fused/README.md` has the full story; the parts
+that cost time to learn:
+
+**One ELF for the whole layer is not available, and the reason is backend
+settings, not symbols.** E1's `(method, tile_n)` naming fix removed the
+symbol collisions — `fused_tail` co-links the FFN's drain (tile_n 128) and
+fused-cast (tile_n 96) GEMMs beside six more launches without a
+redefinition. What cannot be crossed is that one ELF is one aircc
+invocation: FlashAttention requires `omit_pingpong="all"` +
+`runtime_loop_tiling_sizes=[1, 1]` (it does not place otherwise) while the
+4096-row GEMMs require `[2, 2]` for BD-ID recycling, and
+`builders/mha_out_proj.py` records the settings as non-interchangeable. So
+attention keeps its own ELF — exactly as every shipped LLM pipeline keeps
+FlashAttention out of its stitched GEMM modules — and the ELF ABI aggregates
+the three entries into one submission anyway.
+
+**The normalization is streamed, not row-blocked, because a band cannot be
+aliased.** Reusing coarse's `addnorm` inside one module would need 64
+launches per normalization point, each reading a 64-row band of a whole
+tensor — and a band at a nonzero row offset cannot be routed into a slice's
+args clause (`memref.cast` cannot cast an offset subview back to the
+identity layout; the row-0 trick in `o_gemv_ffn_multi.py` works only at
+offset 0). The decomposed `add`/`ln`/`mul` builders walk all 4096 rows in
+one launch each and are validated standalone at exactly 4096×768, so the
+tail streams them — the same decomposition `runlist` measured clean, at
+streaming rather than banded granularity.
+
+**The fusion has a measured numerical cost.** Device attention (block
+1.688e-2 `mean_rel_L1`) plus the decomposed norm tail (runlist 1.755e-2)
+stack to 1.806e-2 at `atol_required` 7.572e-2 — a 1.32x margin under the
+1e-1 ceiling, the thinnest of the four modes, every boundary still
+`n_mismatch` 0.
+
+## The four-mode dispatch-vector table (Phase E's headline result)
+
+Driver-summed totals over each mode's recorded `DispatchVector` rows, at the
+forced configuration (seq 4096, emb 768, ffn 3072, 12 heads × 64), clean and
+fault-injected runs totaling identically:
+
+| mode | host submissions | runlist entries | air launches | herd launches | sync boundaries | bytes |
+|---|---|---|---|---|---|---|
+| `offload` | 6 | 6 | 7 | 19 | 19 | 139,984,896 |
+| `runlist` | 5 | 391 | 14 | 404 | 403 | 165,347,328 |
+| `coarse` | 4 | 131 | 12 | 146 | 402 | 202,902,528 |
+| `fused` | 1 | 3 | 16 | 24 | 19 | 184,025,088 |
+
+All four gating clauses of the distinguishability check hold on these
+numbers: no two vectors are equal; `offload`'s 6 submissions exceed every
+other mode's and it aggregates nothing (entries = submissions); `runlist`'s
+391 entries exceed `coarse`'s 131; `fused`'s 19 sync boundaries are below
+`coarse`'s 402. Both recorded-but-not-gating predictions also hold: `fused`
+has fewer entries than `coarse` (3 < 131 — the faithful stitch did *not*
+row-block its normalization into entries) and at least as many air launches
+(16 ≥ 12 — ten launches fused into one ELF, counted once per artifact, which
+is the signature 08e predicts for this mode).
+
+Reading the columns: submissions order the modes by host mediation
+(offload 6 → fused 1); entries order them by dispatch granularity (runlist
+391 → fused 3); `coarse` and `runlist` sit within one sync boundary of each
+other (402 vs 403) because both restage the same norm bands through the
+host, while `offload` and `fused` both land at 19 for opposite reasons —
+offload holds every intermediate on the host *between* single-GEMM
+dispatches (its syncs are all argument traffic), fused holds every
+intermediate on the device and syncs only the layer's true inputs and the
+ten read-back boundaries. The `air`/`herd` asymmetry (16/24 for fused
+against 12/146 for coarse) is the deliberate one from
+03-measurement-model.md: `air_launches` counts launches in the compiled
+module once per distinct ELF, `herd_launches` accumulates per dispatch step.
+
 ## The registry sweep
 
 The three GEMM-backed operators above take their tile sizes and method from
