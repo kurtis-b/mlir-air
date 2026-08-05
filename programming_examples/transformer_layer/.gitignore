@@ -1,6 +1,7 @@
 runlist_gate_cache/
 block_cache/
 coarse_cache/
+offload_cache/
 build_peano/
 
 # `make runlist-gate` runs with this directory as its working directory, so every

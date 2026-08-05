@@ -26,7 +26,8 @@ SWEEP_ARGS ?=
         check-elementwise-add check-causal-mask check-layer-norm check-addnorm \
         check-qkv-proj check-ffn check-mha-out-proj check-fault-control \
         check-block check-block-fault check-coarse check-coarse-fault \
-        reference-tests block-cache-tests \
+        check-offload check-offload-fault \
+        reference-tests block-cache-tests blocked-attention-tests \
         registry-resolution registry-sweep registry-write registry-plan \
         registry-writer-tests
 
@@ -73,6 +74,17 @@ help:
 	@echo "  make check-coarse-fault"
 	@echo "                      That mode's negative control; must FAIL under"
 	@echo "                      injection, with the vectors still recorded."
+	@echo "  make check-offload  The same layer as the Phase E 'offload' strategy:"
+	@echo "                      host torch owns the layer and dispatches six"
+	@echo "                      registry GEMMs one at a time, each its own"
+	@echo "                      submission, through its own ELF cache. NEEDS AN"
+	@echo "                      NPU."
+	@echo "  make check-offload-fault"
+	@echo "                      That mode's negative control; must FAIL under"
+	@echo "                      injection, with the vectors still recorded."
+	@echo "  make blocked-attention-tests"
+	@echo "                      Host-only checks on the query-blocked attention"
+	@echo "                      offload and runlist share. No NPU required."
 	@echo "  make check-ffn-ladder-fault"
 	@echo "                      The seq-64 ladder point's own negative control."
 	@echo "                      The shared one injects an operator's FIRST"
@@ -233,6 +245,31 @@ check-coarse-fault:
 	    python3 $(srcdir)/opcheck.py --operator coarse \
 	        --fault-inject input --expect-failure
 
+# Phase E3: the same layer, measured as the `offload` execution strategy. The
+# host owns every intermediate and dispatches six registry GEMMs one at a
+# time — each a one-step run_sequence call, so the driver-summed vector is six
+# submissions over six entries: the mode aggregates nothing, which is its
+# clause in the distinguishability gate. Attention stays in host torch (its
+# two GEMMs resolve in no registry — see pattern/offload/README.md), so the
+# artifact records the hybrid boundary as attention_path. Its own ELF cache
+# (./offload_cache under $(BUILD_DIR)) for the same reason as coarse's.
+check-offload:
+	$(call opcheck,offload)
+
+# The mode's negative control. Same reasoning as check-coarse-fault, including
+# the mode-specific stake: the dispatch vectors must be recorded on the
+# injected path too, since the driver requires the fault artifact's summed
+# totals to equal the clean run's.
+check-offload-fault:
+	mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
+	    python3 $(srcdir)/opcheck.py --operator offload \
+	        --fault-inject input --expect-failure
+
+# Host-only: the query-blocked attention offload and runlist share. No NPU.
+blocked-attention-tests:
+	python3 $(srcdir)/pattern/test_blocked_attention.py
+
 # Host-only: the golden model is the layer it claims to be. No NPU, no MLIR.
 reference-tests:
 	python3 $(srcdir)/pattern/test_reference.py
@@ -290,4 +327,5 @@ registry-writer-tests:
 	python3 $(srcdir)/sweep/test_registry_writer.py
 
 clean:
-	rm -rf $(BUILD_DIR) __pycache__ runlist_gate_cache block_cache coarse_cache
+	rm -rf $(BUILD_DIR) __pycache__ runlist_gate_cache block_cache coarse_cache \
+	    offload_cache

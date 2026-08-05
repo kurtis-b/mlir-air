@@ -56,6 +56,7 @@ from opcheck_prepare import (  # noqa: E402
     prepare_qkv_proj,
 )
 from pattern.coarse import prepare_coarse  # noqa: E402
+from pattern.offload import prepare_offload  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # THE baseline_768 SET (D1)
@@ -528,5 +529,34 @@ SPECS = [
         # ceiling is a defect report, never a wider tolerance.
         "atol": 1e-1,
         "prepare": prepare_coarse,
+    },
+    {
+        # PHASE E3: the same layer, measured as the `offload` execution
+        # strategy — the host owns every intermediate and dispatches six
+        # registry GEMMs one at a time, each its own one-step run_sequence
+        # call, so the driver-summed vector is six submissions over six
+        # entries: the mode aggregates NOTHING, which is its clause in the
+        # distinguishability gate. Attention stays in host torch (its two
+        # GEMMs resolve in no registry — pattern/offload/README.md has the
+        # derivation), recorded as `attention_path` in the artifact: this is
+        # a hybrid boundary, stated rather than discovered from the code.
+        "operator": "offload",
+        "shape_key": "4096x768_encoder_bert",
+        "shape": {
+            "seq_len": 4096,
+            "emb_dim": 768,
+            "ffn_dim": 3072,
+            "num_heads": 12,
+            "head_dim": 64,
+        },
+        # Same tensor as the block row, compared the same way at the same
+        # golden seed, so the 1e-1 HARD CEILING carries over — and this mode
+        # sits FURTHER from it than the block does: host FP32 attention and
+        # host norms land closer to the FP32 oracle than the device path, so
+        # of the four modes this one has the most headroom, not the least.
+        # See the block entry for why exceeding the ceiling is a defect
+        # report, never a wider tolerance.
+        "atol": 1e-1,
+        "prepare": prepare_offload,
     },
 ]
