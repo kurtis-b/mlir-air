@@ -129,6 +129,28 @@ The generalizable lesson is narrower than "check the gate": **a phase whose `nee
 assertion of the same kind as the objective check, and it is cheap — lit reports its own
 pass/exclude counts.
 
+### A fifth: a driver-side check no honest run could pass
+
+`[2026-08-04]` Phase C4 passed its gate — lit suite green, all ten shipped models still verifying —
+and then halted on the objective check, which demanded the registry JSON be newer than the gate's
+start stamp.
+
+That requirement was unsatisfiable. It was written by analogy with Phase A, where the freshness
+test works because the gate itself *rebuilds* the objects it inspects, so they are necessarily
+newer than the stamp. C4's sweep runs in the implement session, hours before the gate, and
+`gate-c4.sh` deliberately does not re-sweep. The JSON is therefore always older than the stamp.
+
+Two things are worth keeping from it. First, the C4 session diagnosed the contradiction in review
+and reported it, explicitly noting it had not touched the file to get past the check — which is
+exactly the behaviour the guardrails ask for, and it is what made the bug legible instead of
+invisible. Second, mtime was a weak proof anyway: one `touch` forges it. The replacement takes the
+proof from **git** — the staged shapes must have been absent at the phase base commit and present
+now — which is unforgeable by a filesystem timestamp and is what the requirement was reaching for.
+
+The generalizable lesson pairs with the one above. A driver-side check must be tested in both
+directions before a run depends on it: that it *fails* when it should, and that a correct run can
+actually *pass* it. Only the first was tested here.
+
 ## Gates are run by the driver, never self-reported
 
 Sessions return a structured self-report (`work_completed`, `work_not_completed`, `blockers`,

@@ -489,15 +489,19 @@ phase_c4_objective_check() {
     log_error "objective check: ${json} does not exist"
     return 1
   fi
-  if [ -z "${_GATE_STARTED_AT:-}" ] || [ ! -e "${_GATE_STARTED_AT}" ]; then
-    log_error "objective check: no gate timestamp; cannot prove the registry was rewritten by this run"
-    return 1
-  fi
-  if [ "$(stat -c %Y "${json}")" -lt "$(stat -c %Y "${_GATE_STARTED_AT}")" ]; then
-    log_error "objective check: the registry JSON predates the gate — this run swept nothing"
-    return 1
-  fi
-
+  # Proof of work is taken from GIT, not from mtime.
+  #
+  # This check originally required the registry JSON to be newer than the gate's start stamp, by
+  # analogy with Phase A. That analogy is wrong and the requirement was unsatisfiable. Phase A's
+  # gate REBUILDS the objects it inspects, so they are necessarily newer than the stamp. C4's
+  # sweep runs in the implement session, hours before the gate, and gate-c4.sh deliberately does
+  # not re-sweep -- so the JSON is always older than the stamp, and no honest run could pass.
+  #
+  # The C4 session diagnosed this in review and said so rather than running `touch` to get past
+  # it, which is the behaviour the harness is built to elicit. Note that mtime was a weak proof
+  # anyway: one `touch` forges it. "The staged shapes were absent at the phase base commit and are
+  # present now" is checkable from git, unforgeable by a filesystem timestamp, and is what the
+  # requirement was actually reaching for.
   local base="${_START_SHA:-$(state_start_sha)}"
   if [ -z "${base}" ]; then
     log_error "objective check: no phase base commit; cannot prove the sweep was append-only"
@@ -534,13 +538,24 @@ if rc:
     sys.exit(rc)
 print("  %d pre-existing shape(s) unchanged; %d added" % (len(before), len(after) - len(before)))
 
-# Coverage: the staged baseline_768 family must resolve for real, through the same entry point
-# the builders use.
-from kernel_registry.registry_lookup import gemm_config
-
 LADDER = (64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
 ROLES = {"qkv_proj": (768, 2304), "ffn_up": (768, 3072),
          "ffn_down": (3072, 768), "o_proj": (768, 768)}
+STAGED = {(m, k, n) for (k, n) in ROLES.values() for m in LADDER}
+
+# Proof of work, from git: this phase must have ADDED staged shapes. A run that inherited an
+# already-swept registry and did nothing would satisfy every other clause here.
+gained = STAGED - set(before)
+if not gained:
+    print("objective check: all %d staged shapes were already registered at the base commit — "
+          "this phase swept nothing" % len(STAGED), file=sys.stderr)
+    sys.exit(1)
+print("  %d of %d staged shapes were absent at the base commit and are present now"
+      % (len(gained), len(STAGED)))
+
+# Coverage: the staged baseline_768 family must resolve for real, through the same entry point
+# the builders use.
+from kernel_registry.registry_lookup import gemm_config
 
 missing = []
 for role, (k, n) in ROLES.items():
