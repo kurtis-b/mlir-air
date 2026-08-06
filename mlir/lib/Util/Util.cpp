@@ -1183,6 +1183,32 @@ char air::checkOpOperandReadOrWrite(mlir::OpOperand &op_operand) {
       return 'u';
     }
   }
+  // If used in a call to an external kernel. A func.call registers no memory
+  // effects, so without this branch the compute step of every
+  // external-kernel design is invisible to dependency construction -- the
+  // exact gap that let ping-pong rotate a buffer while the kernel was still
+  // reading it. Only callees carrying `llvm.emit_c_interface` (the marker
+  // every AIR external kernel declaration carries) are classified; other
+  // calls stay 'u'. Per-operand refinement comes from the callee's argument
+  // attributes; an unannotated memref operand is conservatively 'b' (may
+  // read AND may write). Callers that cannot act on 'b' treat it exactly as
+  // they treated 'u', so this widens no existing decision by accident.
+  else if (auto call = dyn_cast_if_present<func::CallOp>(owner)) {
+    if (!llvm::isa<BaseMemRefType>(op_operand.get().getType()))
+      return 'u';
+    auto callee = mlir::SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+        call, call.getCalleeAttr());
+    if (!callee || !callee->hasAttr("llvm.emit_c_interface"))
+      return 'u';
+    unsigned argIdx = op_operand.getOperandNumber();
+    if (argIdx >= callee.getNumArguments())
+      return 'u';
+    if (callee.getArgAttr(argIdx, "llvm.readonly"))
+      return 'r';
+    if (callee.getArgAttr(argIdx, "llvm.writeonly"))
+      return 'w';
+    return 'b';
+  }
   // If used in a linalg op
   else if (auto linalgop = mlir::dyn_cast_if_present<linalg::LinalgOp>(owner)) {
     if (op_operand.getOperandNumber() <

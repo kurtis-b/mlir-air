@@ -1139,9 +1139,15 @@ struct ConstructPingPongDependencyPattern
           }
         }
       });
-      // Check if producer or consumer
+      // Check if producer or consumer. 'b' (an external kernel call operand
+      // that may read AND write) lands the op in BOTH sets: as producer it
+      // orders the call behind the buffer rotation, as consumer it gives the
+      // next fill the reuse edge that waits until the call has finished
+      // reading. Dropping either half recreates the silent 481/512-wrong
+      // multi-trip miscompile the fixture measures.
       for (auto candidate_op : candidate_ops) {
-        if (checkOpOperandReadOrWrite(buffer_memref, candidate_op) == 'w') {
+        char rw = checkOpOperandReadOrWrite(buffer_memref, candidate_op);
+        if (rw == 'w' || rw == 'b') {
           if (auto candidate_for_op =
                   getOutermostForOpInForOpNest(candidate_op, for_op)) {
             push_back_if_unique<Operation *>(producer_ops,
@@ -1161,8 +1167,8 @@ struct ConstructPingPongDependencyPattern
           } else {
             push_back_if_unique<Operation *>(producer_ops, candidate_op);
           }
-        } else if (checkOpOperandReadOrWrite(buffer_memref, candidate_op) ==
-                   'r') {
+        }
+        if (rw == 'r' || rw == 'b') {
           if (auto candidate_for_op =
                   getOutermostForOpInForOpNest(candidate_op, for_op)) {
             push_back_if_unique<Operation *>(consumer_ops,
@@ -1186,6 +1192,62 @@ struct ConstructPingPongDependencyPattern
       std::pair<SmallVector<Operation *>, SmallVector<Operation *>> vec_pair =
           std::make_pair(producer_ops, consumer_ops);
       all_buffers_user_ops.push_back(vec_pair);
+    }
+
+    // H1: never paper over an empty producer or consumer set. An empty set
+    // means a use the classification cannot see, and the dependency-free
+    // placeholder token this pattern used to emit for it is exactly how a
+    // missing edge became silent wrong data (481-497/512 measured). All
+    // checks run BEFORE any mutation -- a greedy pattern must not modify the
+    // IR and then fail. The label pass proves these conditions up front, so
+    // firing here means a labeled loop slipped past that proof.
+    if (alloc_execs.size() < 2) {
+      for_op->emitWarning("ping-pong transform skipped: fewer than two "
+                          "duplicated buffer halves were found");
+      return failure();
+    }
+    for (auto &pair : all_buffers_user_ops) {
+      if (pair.first.empty() || pair.second.empty()) {
+        for_op->emitWarning(
+            "ping-pong transform skipped: a buffer it would rotate has no "
+            "recognized producer or consumer, so the reuse edge protecting "
+            "it cannot be built; leaving the loop untransformed");
+        return failure();
+      }
+    }
+    // Predict the loop-carried yield tokens the same way classifyOp derives
+    // them below, so a null can be refused before mutation instead of being
+    // replaced by an empty air.wait_all.
+    auto pingPongIdOf = [](Operation *op) -> std::optional<uint64_t> {
+      if (op->hasAttr("unrolled_iteration"))
+        return op->getAttrOfType<IntegerAttr>("unrolled_iteration").getInt();
+      std::optional<uint64_t> id;
+      Operation *parent = op->getParentOp();
+      while (isa_and_present<affine::AffineIfOp>(parent)) {
+        if (parent->hasAttr("unrolled_iteration"))
+          id = parent->getAttrOfType<IntegerAttr>("unrolled_iteration")
+                   .getInt();
+        parent = parent->getParentOp();
+      }
+      return id;
+    };
+    bool pingConsumerBack = false, pongConsumerBack = false,
+         pongProducerBack = false;
+    for (auto &pair : all_buffers_user_ops) {
+      for (auto *p : pair.first)
+        if (auto id = pingPongIdOf(p); id && *id == 1)
+          pongProducerBack = true;
+      for (auto *c : pair.second)
+        if (auto id = pingPongIdOf(c); id && c->hasAttr("async_back")) {
+          (*id == 0 ? pingConsumerBack : pongConsumerBack) = true;
+        }
+    }
+    if (!pingConsumerBack || !pongConsumerBack || !pongProducerBack) {
+      for_op->emitWarning(
+          "ping-pong transform skipped: a producer or consumer back token "
+          "would be empty, so the loop-carried reuse edge cannot be built; "
+          "leaving the loop untransformed");
+      return failure();
     }
 
     // Annotate ping and pong
@@ -1329,13 +1391,15 @@ struct ConstructPingPongDependencyPattern
         getJointTokenFromOps(rewriter, pong_producer_backs)};
     for (unsigned i = 0; i < yield_operands.size(); i++) {
       if (!yield_operands[i]) {
-        // Create a placeholder wait_all if yield operand is null (e.g.,
-        // when consumer/producer backs are empty after isolation).
-        yield_operands[i] = air::WaitAllOp::create(
-                                rewriter, new_loop_op.getLoc(),
-                                air::AsyncTokenType::get(rewriter.getContext()),
-                                SmallVector<Value>{})
-                                .getAsyncToken();
+        // Guarded by the pre-mutation checks above. A dependency-free
+        // placeholder here is how a missing reuse edge used to become
+        // silent wrong data, so a null token is a hard error, never
+        // patched over.
+        for_op->emitOpError(
+            "ping-pong transform produced an empty dependency set for a "
+            "loop-carried token; this loop should have been refused by "
+            "air-label-scf-for-to-ping-pong");
+        return failure();
       }
     }
     // Erase any existing yield and create a new one with the correct operands.
@@ -1740,6 +1804,134 @@ struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
     return true;
   }
 
+  // Deepest-wins suppression, shared by the labeling pattern and the safety
+  // pre-scan in the pass so the two agree on which loop the transform will
+  // actually act on.
+  static bool hasLabelableNestedFor(scf::ForOp for_op,
+                                    StringRef omitMemorySpace) {
+    bool found = false;
+    for_op.getBody()->walk<WalkOrder::PreOrder>(
+        [&](Operation *op) -> WalkResult {
+          if (isa<air::HerdOp, air::SegmentOp, air::LaunchOp>(op))
+            return WalkResult::skip();
+          auto innerFor = dyn_cast<scf::ForOp>(op);
+          if (!innerFor)
+            return WalkResult::advance();
+          if (innerFor->hasAttr("unroll") ||
+              isPingPongCandidate(innerFor, omitMemorySpace,
+                                  /*allocsOut=*/nullptr)) {
+            found = true;
+            return WalkResult::interrupt();
+          }
+          return WalkResult::advance();
+        });
+    return found;
+  }
+
+  // H1: prove the ping-pong transform safe for a candidate loop, or say
+  // precisely why it cannot be. The transform duplicates the loop's candidate
+  // allocs and REBUILDS the loop-carried dependency graph from what this
+  // classification sees; any use it cannot see is silently dropped from that
+  // graph, which is how a missing edge becomes wrong data rather than an
+  // error. Hence the rules:
+  //   - every memref use in the loop must classify ('u' refuses);
+  //   - a 'b' use (an external kernel call operand with no refining argument
+  //     attribute) is only provable on this loop's own candidate allocs --
+  //     the transform builds producer AND consumer edges for those. On any
+  //     other memref a may-write cannot be ordered against the rotation, so
+  //     it refuses. A classified 'w' on a loop-external memref (e.g. a
+  //     linalg accumulator) stays legal: the dependency machinery sees it.
+  //   - every candidate alloc needs a producer that runs on every iteration
+  //     (unconditional, or an affine.if broadcast ladder with >= 2 arms) and
+  //     at least one recognized consumer.
+  static LogicalResult provePingPongSafety(scf::ForOp forOp,
+                                           ArrayRef<Operation *> allocs,
+                                           std::string &reason) {
+    llvm::raw_string_ostream os(reason);
+    llvm::DenseMap<Value, Operation *> aliasToAlloc;
+    for (auto *a : allocs) {
+      aliasToAlloc[a->getResult(0)] = a;
+      if (auto exec = a->getParentOfType<air::ExecuteOp>();
+          exec && exec->getNumResults() >= 2)
+        aliasToAlloc[exec->getResult(1)] = a;
+    }
+    llvm::DenseMap<Operation *, int> unconditionalProducers,
+        conditionalProducers, consumers;
+    // An op fills the buffer on every iteration if no affine.if/scf.if sits
+    // between it and the loop body. air.execute wrappers are transparent.
+    auto isUnconditional = [&](Operation *op) {
+      for (Operation *p = op->getParentOp(); p && p != forOp.getOperation();
+           p = p->getParentOp())
+        if (isa<affine::AffineIfOp, scf::IfOp>(p))
+          return false;
+      return true;
+    };
+    WalkResult wr = forOp.getBody()->walk<WalkOrder::PreOrder>(
+        [&](Operation *op) -> WalkResult {
+          if (isa<air::HerdOp, air::SegmentOp, air::LaunchOp>(op))
+            return WalkResult::skip();
+          // Terminators that merely forward a value out of a region
+          // (air.execute yielding its alloc, scf.yield) are plumbing, not
+          // memory accesses.
+          if (isa<air::ExecuteTerminatorOp, scf::YieldOp>(op))
+            return WalkResult::advance();
+          for (OpOperand &operand : op->getOpOperands()) {
+            if (!llvm::isa<BaseMemRefType>(operand.get().getType()))
+              continue;
+            auto it = aliasToAlloc.find(operand.get());
+            bool isCandidateAlloc = it != aliasToAlloc.end();
+            // Deallocs of candidate allocs are rebuilt by the transform.
+            if (isa<memref::DeallocOp>(op) && isCandidateAlloc)
+              continue;
+            char rw = checkOpOperandReadOrWrite(operand);
+            if (rw == 'u') {
+              os << "an operand of '" << op->getName().getStringRef()
+                 << "' cannot be classified as a read or a write, so the "
+                    "rebuilt dependency graph would silently drop it";
+              return WalkResult::interrupt();
+            }
+            if (rw == 'b' && !isCandidateAlloc) {
+              os << "'" << op->getName().getStringRef()
+                 << "' may write to a memref that is not privatized by this "
+                    "loop's ping-pong rotation (defined outside the loop or "
+                    "not filled per iteration), and no argument attribute "
+                    "proves it read-only";
+              return WalkResult::interrupt();
+            }
+            if (!isCandidateAlloc)
+              continue;
+            if (rw == 'w' || rw == 'b') {
+              if (isUnconditional(op))
+                unconditionalProducers[it->second]++;
+              else
+                conditionalProducers[it->second]++;
+            }
+            if (rw == 'r' || rw == 'b')
+              consumers[it->second]++;
+          }
+          return WalkResult::advance();
+        });
+    if (wr.wasInterrupted())
+      return failure();
+    for (auto *a : allocs) {
+      // A broadcast ladder (air-specialize-dma-broadcast) fills the buffer
+      // through mutually exclusive affine.if arms; isPingPongCandidate has
+      // already vetted their exclusivity, and >= 2 arms means every branch
+      // path fills. A SINGLE conditional producer proves nothing.
+      if (unconditionalProducers[a] == 0 && conditionalProducers[a] < 2) {
+        os << "a buffer it would duplicate has no producer that provably "
+              "fills it on every iteration";
+        return failure();
+      }
+      if (consumers[a] == 0) {
+        os << "a buffer it would duplicate has no recognized consumer, so "
+              "nothing would protect it from being refilled early";
+        return failure();
+      }
+    }
+    return success();
+  }
+
   LogicalResult matchAndRewrite(scf::ForOp for_op,
                                 PatternRewriter &rewriter) const override {
 
@@ -1757,23 +1949,7 @@ struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
     // at the same depth are labeled independently. Nested loops inside an
     // air.herd / air.segment / air.launch are in a different scope and do not
     // count, so the walk stops at those boundaries.
-    bool hasLabelableNestedFor = false;
-    for_op.getBody()->walk<WalkOrder::PreOrder>(
-        [&](Operation *op) -> WalkResult {
-          if (isa<air::HerdOp, air::SegmentOp, air::LaunchOp>(op))
-            return WalkResult::skip();
-          auto innerFor = dyn_cast<scf::ForOp>(op);
-          if (!innerFor)
-            return WalkResult::advance();
-          if (innerFor->hasAttr("unroll") ||
-              isPingPongCandidate(innerFor, omitMemorySpace,
-                                  /*allocsOut=*/nullptr)) {
-            hasLabelableNestedFor = true;
-            return WalkResult::interrupt();
-          }
-          return WalkResult::advance();
-        });
-    if (hasLabelableNestedFor)
+    if (hasLabelableNestedFor(for_op, omitMemorySpace))
       return failure();
 
     // Label the scf.for loop and all its child memref.allocs
@@ -3896,6 +4072,40 @@ public:
 
   void runOnOperation() override {
     auto module = getOperation();
+    // H1: refuse, loudly, any loop this pass is about to hand to the
+    // ping-pong transform that cannot be PROVEN safe. Labeling it anyway
+    // reproduces a measured silent miscompile (481-497 of 512 elements wrong
+    // at two trips); skipping it silently would hide a defect the user can
+    // fix at the source. Every comparable compiler (memref::multiBuffer,
+    // Triton, TVM) refuses rather than guesses here. Opting out explicitly
+    // -- air.disable_ping_pong on the loop, or aircc
+    // --omit-ping-pong-transform -- remains available and is honored before
+    // this check.
+    bool anyRefusal = false;
+    module.walk([&](scf::ForOp forOp) {
+      SmallVector<Operation *> allocs;
+      if (!LabelScfForLoopForPingPongPattern::isPingPongCandidate(
+              forOp, clOmitMemorySpace, &allocs))
+        return;
+      if (LabelScfForLoopForPingPongPattern::hasLabelableNestedFor(
+              forOp, clOmitMemorySpace))
+        return;
+      std::string reason;
+      if (failed(LabelScfForLoopForPingPongPattern::provePingPongSafety(
+              forOp, allocs, reason))) {
+        forOp->emitOpError("is a ping-pong candidate that cannot be proven "
+                           "safe to transform: ")
+            << reason
+            << ". Refusing to compile rather than risk silent wrong data; "
+               "annotate the loop with air.disable_ping_pong or compile with "
+               "--omit-ping-pong-transform to skip ping-pong buffering here.";
+        anyRefusal = true;
+      }
+    });
+    if (anyRefusal) {
+      signalPassFailure();
+      return;
+    }
     SmallVector<func::FuncOp, 4> funcOps;
     module.walk([&](func::FuncOp op) { funcOps.push_back(op); });
     for (auto f : funcOps)

@@ -197,7 +197,11 @@ struct LinalgTransforms {
   static const StringLiteral kLinalgTransformMarker;
 };
 
-// Check if an operand of an operation is read or write access
+// Classify an operand's access: 'r' read, 'w' write, 'b' may-read-and-write
+// (an external kernel func.call operand with no refining argument attribute),
+// 'u' unknown, 'e' not an operand of the op. Callers must treat 'b' as BOTH a
+// read and a write; treating it as neither reproduces the silent missing-edge
+// miscompile this code exists to prevent.
 char checkOpOperandReadOrWrite(mlir::OpOperand &op_operand);
 char checkOpOperandReadOrWrite(Value op_operand, Operation *owner);
 
