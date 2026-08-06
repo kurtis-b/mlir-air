@@ -114,12 +114,13 @@ mechanical and has no open questions.
 Then re-run `gate-h.sh` to clear leg 4 (`make verify` over the ten shipped models), which is the
 only leg that has never passed.
 
-**Two things the resume must not carry forward.** `phases.sh:37` still describes H as "ping-pong
-bail-out, call classifier, attribute verifier" — the first third of that is the falsified spec. And
-`agents/scripts/port-loop/fixtures/addnorm_multitrip.py`'s docstring still explains the corruption
-as a missing dependency edge. Both files are fingerprinted by `guard_gate_files()` with an empty
-allowlist, so **only the driver may change them, and not while a phase is mid-run** — editing them
-now would trip the tamper check on resume. They are the driver's to fix between phases.
+**`[2026-08-06]` H1b and H1c are done, and the work now runs as phase `H1s`, not as a resume.**
+See [18](18-phase-h1s-skip-not-refuse.md). The driver made its own edits between phases: the
+fixture's docstring is rewritten around the packet feed order and it now carries **four** variants
+rather than two, `phases.sh:37`'s falsified description is fixed, the objective check asserts
+compiles + exact + the per-buffer labeling decision, `guard_gate_files()` fingerprints
+`mlir/test/**/*.mlir`, and `gate-h.sh` has a fifth leg comparing decode throughput to a recorded
+floor. **H1a — the refuse → skip edit itself — is what remains**, plus one in-tree lit test.
 
 ### Not started
 

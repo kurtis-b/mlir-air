@@ -31,6 +31,7 @@ how to use MLIR-AIR.
 | [15-environment-notes.md](15-environment-notes.md) | Toolchain state and the setup traps that silently hollow out hardware gates |
 | [16-compiler-work-and-remaining-essence.md](16-compiler-work-and-remaining-essence.md) | **Start here for what remains.** Tranche H (compiler) and tranche J (the study), the corrected root cause, and what AIR automates versus what iron writes by hand |
 | [17-phase-h-compiler-hardening.md](17-phase-h-compiler-hardening.md) | Phase H spec plus its attempt-by-attempt record — including two of its own claims that measurement falsified |
+| [18-phase-h1s-skip-not-refuse.md](18-phase-h1s-skip-not-refuse.md) | **The next phase.** H's correction run fresh rather than resumed: the safety proof declines to *transform*, never to compile |
 
 ## Status board
 
@@ -52,7 +53,8 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | E3 — `offload` | `offload` matches, and aggregates nothing | **done** 2026-08-05 (55 min) |
 | E4 — `runlist` | `runlist` matches, with more runlist entries than `coarse` | **done** 2026-08-05 (91 min) |
 | E5 — `fused` + distinguishability | `fused` matches, and all four modes' dispatch vectors separate as the taxonomy predicts | **done** 2026-08-05 (62 min) |
-| H — compiler hardening | `gate-h.sh` four legs: build + install, `check-air-mlir`, transformer-layer suite, `make verify` × 10 | **halted** 2026-08-06 at `confirm/3`. Legs 1–3 green; leg 4 never passed. Three bounded items left — see [17](17-phase-h-compiler-hardening.md#what-the-next-session-does) |
+| H — compiler hardening | `gate-h.sh` four legs: build + install, `check-air-mlir`, transformer-layer suite, `make verify` × 10 | **halted** 2026-08-06 at `confirm/3`, and **superseded by H1s** rather than resumed — its spec was corrected after the halt, so its fingerprint baseline no longer describes what is being gated |
+| H1s — skip, do not refuse | `gate-h.sh` **five** legs: build + install, `check-air-mlir`, transformer-layer suite, **decode throughput vs a recorded floor**, `make verify` × 10 | not started — spec at [18](18-phase-h1s-skip-not-refuse.md), wired into `phases.sh`, `PL_PHASES_IN_SCOPE='["H1s"]'` |
 | F — study harness | `execution-smoke-test` yields ≥1 `run_status=passed` row per measurement CSV | not started |
 | G — unattended runner + CI | Full profile run completes with a complete `results_manifest.json` | not started |
 | Goal 1 — sliding window | `make verify` passes with window-crossing prompts | not started |

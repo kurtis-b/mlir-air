@@ -1,43 +1,91 @@
 #!/usr/bin/env python3
-"""Driver-owned fixture for Phase H's objective check. NOT part of the example.
+"""Driver-owned fixture for the ping-pong safety proof. NOT part of the example.
 
 This file lives under agents/scripts/port-loop/, which `guard_gate_files()` fingerprints and no
 phase allowlist covers -- so a session that edits it to make the check easier halts the run. That
-is the point: Phase H's claim is about the COMPILER, and the evidence for it must not come from
-code the phase authored.
+is the point: the claim is about the COMPILER, and the evidence for it must not come from code the
+phase authored.
 
-WHAT IT PROVES
+WHAT WENT WRONG, AND WHAT ACTUALLY FIXED IT
+`[2026-08-06] This section replaces one that was wrong.` It blamed a missing dependency edge --
+`checkOpOperandReadOrWrite` returning 'u' for an external `func.call`, an empty producer set
+becoming a dependency-free `air.wait_all`, and the ping/pong halves losing their reuse edge.
+Measurement disproved it: compiling the `inside` variant with `--omit-ping-pong-transform=all`
+reproduced the IDENTICAL 481/512 corruption. A cause you can disable without changing the result is
+not the cause.
 
-`builders/addnorm.py` forbids more than one trip of its row loop. The cause is a missing dependency
-edge, not ping-pong per se: `checkOpOperandReadOrWrite` (mlir/lib/Util/Util.cpp) classifies a memref
-use by memory effects, ChannelPut, ChannelGet or linalg and returns 'u' otherwise, so an external
-kernel `func.call` -- which registers no memory effects -- is invisible. Unknown uses are dropped,
-and an empty producer/consumer set becomes a `WaitAllOp` with no operands instead of a rejection.
-The ping/pong halves therefore get no reuse edge protecting a buffer until the kernel has read it.
+The real defect was the shim feed order under packet multiplexing:
 
-Two variants, run at TWO trips, which is what the shipped builder refuses:
+  1. `air-dma-to-channel` hoists each L3-side DMA into its OWN launch-scope loop, so a herd that
+     fills N buffers per iteration produces N sibling per-channel put loops.
+  2. Packet-multiplexed onto one shim MM2S queue (`channel_type = "npu_dma_packet"`), that queue
+     serializes in task order -- whole channel after whole channel.
+  3. The consuming tile's BD ring is built from the herd's per-iteration get order, so it expects
+     the streams INTERLEAVED per iteration. At one trip the two orders coincide. At two or more,
+     every packet after the first iteration lands in the wrong buffer.
 
-  inside   the weight DMA is inside the loop, so every L1 buffer is refilled each iteration.
-           This is a LEGITIMATE program. Today it miscompiles (481-497 of 512 elements wrong).
-           After H2 teaches the classifier about external calls, it must produce ZERO mismatches.
+Fixed by `air-fuse-packet-put-loops` (commit bfb647d9), which fuses sibling per-channel put loops
+that share a block, share static bounds and all target packet-typed channels into one loop doing
+the puts in program order -- plus modelling packet-typed channels as one shared stream resource in
+`CanonicalizeAsyncOpDeps` so the token chain survives pruning.
 
-  hoisted  the weight DMA is lifted out of the loop, so `l1_w` carries data across iterations and
-           rotating it is genuinely unsound. builders/addnorm.py documents this corrupting. After
-           H1, the compiler must REFUSE it with a diagnostic rather than emit wrong numbers.
+The classifier defect was real but separate, and H2 fixed it: a callee carrying
+`llvm.emit_c_interface` now classifies its memref operands from `llvm.readonly` / `llvm.writeonly`
+argument attributes, and an unannotated operand stays unknown rather than being guessed at.
 
-So `inside` proves the fix works and `hoisted` proves it still discriminates. A pass that simply
-disabled ping-pong everywhere would satisfy `inside` and fail nothing -- which is why `hoisted`
-exists, and why it demands a diagnostic rather than merely "not the right answer".
+WHAT THE FOUR VARIANTS PROVE
+
+All four run at TWO trips of the row loop -- the count `builders/addnorm.py` forbids -- at
+cols=64, rows=8, rows_per_call=4, the exact shape it measured the miscompile at. They differ in two
+independent bits: whether the callee's memref arguments are annotated (so the rotation can be
+PROVEN safe), and whether the weight DMA sits inside the loop (so the weight buffer is refilled
+every iteration) or is hoisted out of it (so it carries data across iterations).
+
+  variant             callee        weight DMA   compiles   exact   labeled   weight rotated
+  ------------------  ------------  -----------  ---------  ------  --------  --------------
+  inside              unannotated   in loop      yes        yes     no        --
+  hoisted             unannotated   hoisted      yes        yes     no        --
+  annotated           annotated     in loop      yes        yes     YES       YES
+  annotated_hoisted   annotated     hoisted      yes        yes     YES       NO
+
+Each row kills a different way of passing without doing the work:
+
+  - Every variant must COMPILE. `[2026-08-06]` H1 was originally specified as "hard-fails
+    compilation with a diagnostic", and that was wrong: the prior art it cited
+    (`memref::multiBuffer`, IREE, Triton, TVM) all decline the TRANSFORM and leave the code alone.
+    Refusing broke three shipped models -- llama32_1b_int4, qwen3_0_6b, qwen3_1_7b -- that were
+    always correct. A refusal reintroduced here fails all four rows.
+  - Every variant must be NUMERICALLY EXACT. This is what a miscompile fails.
+  - `annotated` must be LABELED. Without this clause the proof can be narrowed until it never
+    fires -- which passes every correctness check ever written and silently costs the optimization.
+    That is not hypothetical: dropping ping-pong regressed a shipped model 12.4 -> 7.8 tok/s
+    (llms/shared/infra/backend_presets.py). gate-h.sh leg 4 watches the same risk from the
+    throughput side; this watches it structurally.
+  - `annotated_hoisted` must be labeled AND must leave the weight buffer OUT of the rotation set.
+    This is the safety clause. The weight is loop-invariant there, so rotating it would hand later
+    iterations the wrong half; the compiler is correct today precisely because it excludes it
+    (measured: three `hoist_alloc` tile buffers, and the `memref<64xbf16, 2>` weight not among
+    them). If a change ever adds it, this row fails structurally AND numerically.
+  - `inside` and `hoisted` must NOT be labeled. An unannotated external call leaves the direction
+    of its memref operands unknowable, and the compiler must decline rather than guess. These two
+    also record something worth not forgetting: `inside` is correct because of the packet-loop
+    fusion, NOT because of ping-pong -- it is single-buffered.
 
 Usage:
-    python3 addnorm_multitrip.py --variant inside      # exit 0 iff zero mismatches
-    python3 addnorm_multitrip.py --variant hoisted     # exit 0 iff compilation is REFUSED
+    python3 addnorm_multitrip.py --variant inside
+    python3 addnorm_multitrip.py --variant hoisted
+    python3 addnorm_multitrip.py --variant annotated
+    python3 addnorm_multitrip.py --variant annotated_hoisted
+
+Exit 0 iff every clause for that variant holds.
 
 Run under: flock -x -w 1800 /tmp/mlir-air-npu.lock
 """
 
 import argparse
+import glob
 import os
+import re
 import shutil  # noqa: F401
 import sys
 import tempfile
@@ -72,9 +120,22 @@ range_ = for_
 ROWS, COLS, HERD_X, ROWS_PER_CALL = 8, 64, 1, 4
 RTOL, ATOL = 1.6e-2, 1e-1
 
+# What the weight buffer's alloc looks like in the labeled IR, as distinct from the three
+# [rows_per_call, cols] activation tiles. Used to decide whether the rotation privatized it.
+WEIGHT_ALLOC_TYPE = f"memref<{COLS}xbf16, 2 : i32>"
+
+#                      callee annotated,  weight DMA hoisted, must be labeled, weight rotated
+VARIANTS = {
+    "inside":            (False, False, False, None),
+    "hoisted":           (False, True,  False, None),
+    "annotated":         (True,  False, True,  True),
+    "annotated_hoisted": (True,  True,  True,  False),
+}
+
 
 @module_builder
-def build(rows, cols, herd_x, rows_per_call, hoist_weight, np_dtype=bfloat16):
+def build(rows, cols, herd_x, rows_per_call, hoist_weight, annotate_callee,
+          np_dtype=bfloat16):
     rows_per_tile = rows // herd_x
     xrt_dtype = type_mapper(np_dtype)
     l3_act_ty = MemRefType.get([rows, cols], xrt_dtype)
@@ -91,6 +152,19 @@ def build(rows, cols, herd_x, rows_per_call, hoist_weight, np_dtype=bfloat16):
     )
     fn.attributes["link_with"] = StringAttr.get(kernel_obj)
     fn.attributes["llvm.emit_c_interface"] = UnitAttr.get()
+    if annotate_callee:
+        # x, residual and weight are read; the output is written. These are the attributes H2's
+        # classifier reads; without them every memref operand of this call stays unclassifiable and
+        # the proof declines the loop. The kernel really does have these directions -- the point of
+        # the unannotated variants is that the COMPILER cannot know that.
+        fn.arg_attrs = ArrayAttr.get([
+            DictAttr.get({"llvm.readonly": UnitAttr.get()}),
+            DictAttr.get({"llvm.readonly": UnitAttr.get()}),
+            DictAttr.get({"llvm.readonly": UnitAttr.get()}),
+            DictAttr.get({"llvm.writeonly": UnitAttr.get()}),
+            DictAttr.get({}),
+            DictAttr.get({}),
+        ])
 
     row_map = AffineMap.get(
         0, 2,
@@ -118,7 +192,7 @@ def build(rows, cols, herd_x, rows_per_call, hoist_weight, np_dtype=bfloat16):
                     c_cols = ConstantOp(T.i32(), cols)
                     c_rows = ConstantOp(T.i32(), rows_per_call)
 
-                    # The whole difference between the two variants.
+                    # The whole difference between the hoisted and non-hoisted variants.
                     if hoist_weight:
                         dma_memcpy_nd(l1_w, h_w, src_offsets=[0], src_sizes=[cols],
                                       src_strides=[1])
@@ -145,11 +219,68 @@ def build(rows, cols, herd_x, rows_per_call, hoist_weight, np_dtype=bfloat16):
     return addnorm
 
 
+def read_labeled_ir():
+    """The IR as `air-label-scf-for-to-ping-pong` left it, from aircc's --debug-ir dump.
+
+    Returns (text, path) or (None, reason). aircc writes one file per pass into
+    <tmpdir>/debug_ir/, and tmpdir defaults to `air_project` relative to the CWD -- which this
+    fixture owns, having chdir'd into a temp directory of its own.
+
+    Reading the labeled IR rather than matching diagnostic text is deliberate: the label IS the
+    decision. A warning can be emitted or suppressed independently of what the pass actually did,
+    and the pair of clauses this fixture cares about ("was it labeled" and "was the weight buffer
+    in the rotation set") are both only answerable from the IR.
+    """
+    hits = sorted(glob.glob("air_project/debug_ir/*label-scf-for-to-ping-pong*.mlir"))
+    if not hits:
+        return None, ("no labeled-IR dump under air_project/debug_ir/ -- either --debug-ir did "
+                      "not reach aircc, or the pass was removed from the pipeline")
+    if len(hits) > 1:
+        return None, (f"expected one labeled-IR dump, found {len(hits)}: "
+                      f"{[os.path.basename(h) for h in hits]}. The pipeline now runs the labeling "
+                      "pass more than once and this check no longer knows which decision it is "
+                      "reading.")
+    return open(hits[0]).read(), hits[0]
+
+
+def check_labeling(text, want_labeled, want_weight_rotated):
+    """Clauses about what the pass DID. Returns a list of failure strings (empty means pass)."""
+    fails = []
+    labeled = re.search(r"\bunroll\s*=", text) is not None
+    if labeled != want_labeled:
+        fails.append(
+            f"expected the loop to be {'LABELED' if want_labeled else 'left alone'}, "
+            f"but `unroll` is {'present' if labeled else 'absent'} in the labeled IR"
+        )
+
+    if want_weight_rotated is None:
+        return fails
+
+    rotated = [
+        ln for ln in text.splitlines()
+        if "hoist_alloc" in ln and WEIGHT_ALLOC_TYPE in ln
+    ]
+    weight_rotated = bool(rotated)
+    if weight_rotated != want_weight_rotated:
+        if want_weight_rotated:
+            fails.append(
+                f"expected the weight buffer ({WEIGHT_ALLOC_TYPE}) to be in the rotation set -- it "
+                "is refilled every iteration, so rotating it is both safe and the point"
+            )
+        else:
+            fails.append(
+                f"the weight buffer ({WEIGHT_ALLOC_TYPE}) was put IN the rotation set, but it is "
+                "filled once before the loop and read by every iteration. Rotating it hands later "
+                "iterations the wrong half. This is the hazard the proof exists to exclude."
+            )
+    return fails
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--variant", required=True, choices=("inside", "hoisted"))
+    ap.add_argument("--variant", required=True, choices=sorted(VARIANTS))
     args = ap.parse_args()
-    hoisted = args.variant == "hoisted"
+    annotate, hoisted, want_labeled, want_weight_rotated = VARIANTS[args.variant]
 
     # RUN IN A TEMP DIRECTORY, ALWAYS.
     #
@@ -170,7 +301,9 @@ def main():
     compile_addnorm_kernel(pre_add=True)
     trips = (ROWS // HERD_X) // ROWS_PER_CALL
     print(f"fixture: variant={args.variant} rows={ROWS} cols={COLS} herd_x={HERD_X} "
-          f"rows_per_call={ROWS_PER_CALL} -> {trips} trips")
+          f"rows_per_call={ROWS_PER_CALL} -> {trips} trips; "
+          f"callee={'annotated' if annotate else 'unannotated'}, "
+          f"weight DMA {'hoisted out of' if hoisted else 'inside'} the loop")
 
     rng = np.random.default_rng(7)
     x = (rng.standard_normal((ROWS, COLS)) * 0.5).astype(bfloat16)
@@ -179,34 +312,49 @@ def main():
     expected = addnorm_pre_add_reference(x, res, w)
 
     try:
-        module = build(ROWS, COLS, HERD_X, ROWS_PER_CALL, hoisted)
+        module = build(ROWS, COLS, HERD_X, ROWS_PER_CALL, hoisted, annotate)
         runner = XRTRunner(verbose=False, omit_while_true_loop=False,
-                           output_format="elf", instance_name="addnorm")
+                           output_format="elf", instance_name="addnorm",
+                           debug_ir=True)
         rc = runner.run_test(module, inputs=[x, res, w], expected_outputs=[expected],
                              rtol=RTOL, atol=ATOL)
         compiled, correct = True, (rc == 0)
-    except Exception as exc:  # noqa: BLE001 - a refusal to compile IS the expected result for one arm
+    except Exception as exc:  # noqa: BLE001
         print(f"  compilation/run raised {type(exc).__name__}: "
               f"{str(exc).splitlines()[0][:200]}")
         compiled, correct = False, False
 
-    if hoisted:
-        # The weight buffer carries data across iterations, so rotating it is unsound. The compiler
-        # must say so. Silently producing ANY answer -- right or wrong -- is the failure here.
-        if not compiled:
-            print("  -> PASS: the compiler refused the unsound program, as it must")
-            return 0
-        print("  -> FAIL: the compiler accepted a program it cannot prove safe "
-              f"({'and got the right answer by luck' if correct else 'and miscompiled it'}). "
-              "A bail-out is the minimum; silence is what this phase exists to remove.")
+    fails = []
+    if not compiled:
+        # Every variant here is a correct program. Declining to TRANSFORM one is the intended
+        # behaviour; declining to COMPILE one is the spec error that broke three shipped models.
+        fails.append("the compiler did not produce a binary. Every variant of this fixture is a "
+                     "correct program: when the rotation cannot be proven safe the pass must SKIP "
+                     "-- leave the loop single-buffered and warn -- not abort the build.")
+    elif not correct:
+        fails.append("the program compiled but the output is outside tolerance")
+
+    if compiled:
+        text, where = read_labeled_ir()
+        if text is None:
+            fails.append(where)
+        else:
+            print(f"  labeled IR: {where}")
+            fails.extend(check_labeling(text, want_labeled, want_weight_rotated))
+
+    if fails:
+        print(f"  -> FAIL ({args.variant}):")
+        for f in fails:
+            print(f"       - {f}")
         return 1
 
-    if correct:
-        print("  -> PASS: a legitimate multi-trip loop is now correct")
-        return 0
-    print("  -> FAIL: the legitimate multi-trip loop is still wrong "
-          f"({'refused to compile' if not compiled else 'compiled but mismatched'})")
-    return 1
+    shape = "labeled" if want_labeled else "left single-buffered"
+    extra = ""
+    if want_weight_rotated is not None:
+        extra = (", weight buffer rotated" if want_weight_rotated
+                 else ", weight buffer correctly excluded from the rotation")
+    print(f"  -> PASS ({args.variant}): compiles, numerically exact, {shape}{extra}")
+    return 0
 
 
 if __name__ == "__main__":

@@ -17,7 +17,12 @@
 # change. Anything outside it trips the tamper check and halts the run. Widen it deliberately,
 # never reflexively.
 
-PL_PHASES_IN_SCOPE='["H"]'
+# `[2026-08-06]` H1s, not H. The halted H run's spec was corrected after the fact (skip the
+# transform, do not refuse the build), and the driver's fixture and objective check were rewritten
+# to match. Resuming H would have re-used a fingerprint baseline captured against the old
+# specification, so the tamper check would have been measuring the wrong thing. A fresh phase costs
+# one arm in this table and buys an honest baseline.
+PL_PHASES_IN_SCOPE='["H1s"]'
 
 phase_name() {
   case "$1" in
@@ -34,7 +39,8 @@ phase_name() {
     E3) echo "Execution strategies: offload" ;;
     E4) echo "Execution strategies: runlist" ;;
     E5) echo "Execution strategies: fused + the distinguishability gate" ;;
-    H) echo "Compiler hardening: ping-pong bail-out, call classifier, attribute verifier" ;;
+    H) echo "Compiler hardening: ping-pong safety proof, call classifier, attribute verifier" ;;
+    H1s) echo "Compiler hardening: the safety proof declines to TRANSFORM, never to compile" ;;
     *) echo "unknown" ;;
   esac
 }
@@ -55,6 +61,7 @@ phase_doc() {
     E4) echo "docs/plans/transformer-layer-execution-studies/08d-phase-e4-runlist.md" ;;
     E5) echo "docs/plans/transformer-layer-execution-studies/08e-phase-e5-fused-and-distinguishability.md" ;;
     H) echo "docs/plans/transformer-layer-execution-studies/17-phase-h-compiler-hardening.md" ;;
+    H1s) echo "docs/plans/transformer-layer-execution-studies/18-phase-h1s-skip-not-refuse.md" ;;
     *) echo "" ;;
   esac
 }
@@ -84,7 +91,7 @@ phase_needs_hardware() {
     C1|C2|C3|C4) echo "yes" ;;
     D1|D2) echo "yes" ;;
     E1|E2|E3|E4|E5) echo "yes" ;;
-    H) echo "yes" ;;
+    H|H1s) echo "yes" ;;
     *) echo "no" ;;
   esac
 }
@@ -304,6 +311,10 @@ Each sub-phase adds one clause of its own:
 EOF
 ;;
     H) cat <<'EOF'
+SUPERSEDED by phase H1s -- this text describes the `--variant hoisted` clause as demanding a
+REFUSAL, which measurement falsified. Kept only so a re-read of the halted H run makes sense.
+See the H1s arm below for the corrected gate.
+
 flock -x -w 1800 /tmp/mlir-air-npu.lock  agents/scripts/port-loop/gate-h.sh
 
 FOUR LEGS, cheapest first, so a cheap failure stops before an expensive one:
@@ -346,6 +357,74 @@ Any change to one of those is unauthorized and halts the run. The same applies t
 agents/scripts/port-loop/ -- including the fixture and this gate script.
 EOF
 ;;
+    H1s) cat <<'EOF'
+flock -x -w 1800 /tmp/mlir-air-npu.lock  agents/scripts/port-loop/gate-h.sh
+
+FIVE LEGS, cheapest first, so a cheap failure stops before an expensive one:
+
+  1. ninja -C build-xrt, then ninja -C build-xrt install. The install is not optional and it is
+     the easy thing to get wrong: the examples resolve aircc and air-opt from install-xrt (see
+     utils/env_setup.sh and lib-env.sh), so a pass you edit and merely BUILD leaves every later
+     leg testing the previous compiler while the gate goes green.
+  2. check-air-mlir -- the compiler's own lit suite. A broken pass shows up here in seconds
+     rather than an hour into leg 5. Run it yourself before you think you are done; its baseline
+     is 486 of 500 passing, with 7 pre-existing UNSUPPORTED and 7 pre-existing XFAIL.
+  3. The transformer-layer suite on real hardware.
+  4. Decode throughput against a recorded floor. This leg is here because every other one is
+     correctness-only, and the failure mode this phase risks is invisible to all of them: a
+     safety predicate that declines to transform MORE loops than it should costs throughput
+     while every number stays exact. Dropping ping-pong regressed a shipped model 12.4 -> 7.8
+     tok/s. The floor lives in agents/scripts/port-loop/throughput-baseline.json, which is
+     fingerprinted and in no allowlist -- it is not yours to move.
+  5. make verify across the ten shipped LLM deployments. A change to mlir/ reaches every one of
+     them through aircc; this is the widest gate in the plan, and BOTH of the halted H run's
+     substantive spec errors surfaced here rather than in legs 1-3. Budget for it.
+
+The driver then runs FOUR clauses from a fixture it owns --
+agents/scripts/port-loop/fixtures/addnorm_multitrip.py -- which guard_gate_files() fingerprints
+and no allowlist covers, so a session that edits it to make the check easier halts the run. All
+four run at cols=64, rows=8, rows_per_call=4: the exact point builders/addnorm.py measured the
+miscompile at, two trips of the row loop. They vary two independent bits -- whether the callee's
+memref arguments carry llvm.readonly/llvm.writeonly, and whether the weight DMA sits inside the
+loop or is hoisted out of it.
+
+  inside             unannotated callee, weight refilled each iteration.
+                     Must compile, be numerically exact, and be left SINGLE-BUFFERED.
+  hoisted            unannotated callee, weight hoisted out.
+                     Must compile, be numerically exact, and be left SINGLE-BUFFERED.
+  annotated          annotated callee, weight refilled each iteration.
+                     Must compile, be exact, be LABELED, and rotate the weight buffer too.
+  annotated_hoisted  annotated callee, weight hoisted out.
+                     Must compile, be exact, be LABELED, and leave the weight buffer OUT of the
+                     rotation set -- it is loop-invariant, so rotating it would hand later
+                     iterations the wrong half.
+
+EVERY VARIANT MUST COMPILE. That is the correction this phase exists to make. H1 was originally
+specified as "hard-fails compilation with a diagnostic", and the prior art it cited does no such
+thing: upstream memref::multiBuffer returns failure(), which means DECLINE THE TRANSFORM and
+leave the code alone. IREE, Triton and TVM all bail out of the transformation, not out of
+compilation. Gate leg 5 caught the consequence -- llama32_1b_int4, qwen3_0_6b and qwen3_1_7b
+failing to build on programs that were always correct.
+
+`annotated` and `annotated_hoisted` are the opposed pair, and no blunt change satisfies both:
+one demands the transform FIRE, the other demands it leave one specific buffer alone. Narrowing
+the predicate until it never fires passes every correctness check ever written -- and fails
+`annotated` here, and leg 4 on throughput.
+
+Your gate-file allowlist names THREE files and nothing else, all under
+mlir/test/Transform/AIRDependencyScheduleOpt/: label_ping_pong_alias_escape_proof.mlir and
+label_ping_pong_external_call_proof.mlir, whose `expected-error` lines assert the severity this
+phase is changing, and label_ping_pong_loop_invariant_not_rotated.mlir, the new test you add.
+Any other gate file -- including any other .mlir under mlir/test/, which is now fingerprinted --
+halts the run.
+
+THE RULE FOR THE TWO EXISTING TESTS, and it is not negotiable by a session: keep the INPUT
+exactly as it is and change only the CHECK lines, to assert the new intended outcome. If the
+transformed path also needs coverage, add a NEW case. Annotating an input to preserve the old
+outcome deletes the evidence that behaviour changed at all -- three halts in the previous run
+were spent relearning that.
+EOF
+;;
     *) cat <<'EOF'
 ERROR: no gate description is declared for this phase in agents/scripts/port-loop/phases.sh.
 This is a harness bug, not a task. Stop and report it as a blocker.
@@ -386,6 +465,20 @@ phase_gate_allowlist() {
     # registry JSON or verify module at all. An empty allowlist means every gate-file change is
     # unauthorized, which is the correct posture for a phase whose subject is the compiler.
     H) echo '' ;;
+    # H1s changes the SEVERITY of an existing verdict, and three of the compiler's own lit tests
+    # currently assert the old severity with `expected-error`. Those edits are legitimate and
+    # foreseen, so they are named here one file at a time -- not by directory. A directory prefix
+    # would have permitted every weakened-gate edit Phase H actually halted on: all three were in
+    # this same directory (label_ping_pong_loops.mlir and label_ping_pong_multifill_alloc.mlir got
+    # consumers added to dodge a refusal; the ping_pong_shared_resident_ring*.mlir trio got their
+    # callee annotated, which is precisely the path H2 changes).
+    #
+    # `[2026-08-06]` This allowlist exists at all only because guard_gate_files() now fingerprints
+    # mlir/test/**/*.mlir. Before that it saw none of this and the tamper check was blind here.
+    #
+    # The third file is the NEW test this phase adds. It is named in advance deliberately: an
+    # allowlist that says "and whatever else you decide to create" is not an allowlist.
+    H1s) echo '^mlir/test/Transform/AIRDependencyScheduleOpt/(label_ping_pong_alias_escape_proof|label_ping_pong_external_call_proof|label_ping_pong_loop_invariant_not_rotated)\.mlir$' ;;
     *) echo '' ;;
   esac
 }
@@ -399,7 +492,7 @@ phase_gate_cmd() {
     D1|D2) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
     # E1 alone changes shared infrastructure, so E1 alone carries the ten-model leg.
     E1) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-e1.sh" ;;
-    H) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-h.sh" ;;
+    H|H1s) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-h.sh" ;;
     E2|E3|E4|E5) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
     *) echo "false" ;;
   esac
@@ -1338,20 +1431,44 @@ phase_e5_objective_check() {
   return 0
 }
 
-# --- Phase H -----------------------------------------------------------------------------------
+# --- Phase H / H1s -------------------------------------------------------------------------------
 #
-# H's claim is about the COMPILER, so its evidence must not come from code the phase authored. Both
-# clauses run a fixture the DRIVER owns -- agents/scripts/port-loop/fixtures/addnorm_multitrip.py,
-# which guard_gate_files() fingerprints and no allowlist covers, so editing it halts the run.
+# The claim is about the COMPILER, so its evidence must not come from code the phase authored.
+# Every clause runs a fixture the DRIVER owns -- agents/scripts/port-loop/fixtures/
+# addnorm_multitrip.py, which guard_gate_files() fingerprints and no allowlist covers, so editing it
+# halts the run.
 #
-# The two clauses are deliberately opposed, and a fix that satisfies only one is not a fix:
+# `[2026-08-06]` REWRITTEN, because the previous pair of clauses asserted something measurement then
+# falsified. It demanded that `--variant hoisted` be REFUSED. Measured against the current build:
+# that program compiles, is numerically exact, and the labeler leaves its loop alone -- there is no
+# hazard to refuse, because the rotation already excludes the loop-invariant buffer. The clause was
+# asserting the wrong thing, and the spec behind it ("hard-fail compilation") was wrong too: the
+# prior art it cited (memref::multiBuffer, IREE, Triton, TVM) declines the TRANSFORM, not the build.
+# Refusing broke three shipped models that were always correct.
 #
-#   inside   a legitimate two-trip loop must now be CORRECT. Proves the classifier learned to see
-#            the external kernel call (H2). Today this silently produces 481-497/512 wrong.
-#   hoisted  a loop whose weight buffer carries data across iterations must be REFUSED with a
-#            diagnostic. Proves the pass still discriminates (H1). Producing any answer here --
-#            right or wrong -- fails the phase, which is what stops "disable ping-pong globally"
-#            from passing: that would make `inside` correct and `hoisted` silently correct too.
+# The four clauses now run the same shape through both independent bits -- whether the callee's
+# memref arguments are annotated, and whether the weight DMA is hoisted -- and assert what the pass
+# DID, read from aircc's --debug-ir dump of the labeled IR rather than from diagnostic text:
+#
+#   inside             unannotated callee, weight refilled per iteration.
+#                      compiles + exact + NOT labeled. Proves the two-trip loop is correct (which
+#                      air-fuse-packet-put-loops, not ping-pong, is what fixed) and that an
+#                      unannotated external call is never guessed at.
+#   hoisted            unannotated callee, weight hoisted.
+#                      compiles + exact + NOT labeled. Regression guard against reintroducing a
+#                      refusal.
+#   annotated          annotated callee, weight refilled per iteration.
+#                      compiles + exact + LABELED + weight IN the rotation set. This is the clause
+#                      that cannot be satisfied by narrowing the proof until it never fires, or by
+#                      disabling ping-pong globally -- the shortcut every correctness-only check
+#                      accepts, and which cost a shipped model 12.4 -> 7.8 tok/s.
+#   annotated_hoisted  annotated callee, weight hoisted.
+#                      compiles + exact + LABELED + weight NOT in the rotation set. The safety
+#                      clause: that buffer is loop-invariant, so rotating it hands later iterations
+#                      the wrong half. Correct today only because the rotation excludes it.
+#
+# `annotated` and `annotated_hoisted` are the opposed pair -- one demands the transform fire, the
+# other demands it leave a specific buffer alone -- and no single blunt change satisfies both.
 phase_h_objective_check() {
   local fixture="${PL_LIB}/fixtures/addnorm_multitrip.py"
   if [ ! -f "${fixture}" ]; then
@@ -1359,31 +1476,36 @@ phase_h_objective_check() {
     return 1
   fi
 
-  log_info "objective check: a legitimate two-trip loop must be correct"
-  if ! ( cd "${PL_ROOT}/programming_examples/transformer_layer" \
-         && flock -x -w 1800 /tmp/mlir-air-npu.lock \
-              python3 "${fixture}" --variant inside ); then
-    log_error "objective check FAILED: the legitimate multi-trip loop is still not correct."
-    log_error "  H2 (teaching checkOpOperandReadOrWrite about llvm.emit_c_interface callees) is"
-    log_error "  what makes this pass; without it the one-trip rule stands and coarse keeps its"
-    log_error "  64 dispatches per normalization point."
-    return 1
-  fi
-  log_info "  correct: the multi-trip loop the shipped builder forbids now computes cleanly"
+  local variant
+  for variant in inside hoisted annotated annotated_hoisted; do
+    log_info "objective check: fixture variant '${variant}'"
+    if ! ( cd "${PL_ROOT}/programming_examples/transformer_layer" \
+           && flock -x -w 1800 /tmp/mlir-air-npu.lock \
+                python3 "${fixture}" --variant "${variant}" ); then
+      log_error "objective check FAILED on variant '${variant}'."
+      case "${variant}" in
+        inside|hoisted)
+          log_error "  These two are correct programs with an UNANNOTATED external callee. They"
+          log_error "  must compile, be exact, and be left single-buffered. A failure here is"
+          log_error "  either a miscompile, or a refusal to compile that the corrected spec"
+          log_error "  forbids: when the rotation cannot be proven safe the pass SKIPS." ;;
+        annotated)
+          log_error "  This is the clause that proves the optimization still happens. A safety"
+          log_error "  predicate narrowed until it never fires passes every correctness check ever"
+          log_error "  written and silently costs throughput -- 12.4 -> 7.8 tok/s, measured."
+          log_error "  If it failed on numerics instead, the rotation itself is broken." ;;
+        annotated_hoisted)
+          log_error "  This is the safety clause. The weight buffer is filled once before the loop"
+          log_error "  and read by every iteration, so it must stay OUT of the rotation set."
+          log_error "  Putting it in hands later iterations the wrong half -- silent wrong data,"
+          log_error "  which is the whole defect class this proof exists to close." ;;
+      esac
+      return 1
+    fi
+  done
 
-  log_info "objective check: an unprovable loop must be REFUSED, not answered"
-  if ( cd "${PL_ROOT}/programming_examples/transformer_layer" \
-       && flock -x -w 1800 /tmp/mlir-air-npu.lock \
-            python3 "${fixture}" --variant hoisted ); then
-    log_info "  refused: the compiler declined a program it cannot prove safe"
-  else
-    log_error "objective check FAILED: the compiler accepted a loop whose buffer carries data"
-    log_error "  across iterations. A bail-out with a diagnostic is the minimum this phase owes;"
-    log_error "  silence is exactly the defect it exists to remove."
-    return 1
-  fi
-
-  log_info "objective check passed: multi-trip is correct AND unprovable cases are refused"
+  log_info "objective check passed: all four arrangements compile and are exact; the transform"
+  log_info "  fires where it is provable and declines where it is not, per buffer"
   return 0
 }
 
@@ -1402,7 +1524,7 @@ phase_objective_check() {
     E3) phase_e3_objective_check ;;
     E4) phase_e4_objective_check ;;
     E5) phase_e5_objective_check ;;
-    H) phase_h_objective_check ;;
+    H|H1s) phase_h_objective_check ;;
     *) return 0 ;;
   esac
 }

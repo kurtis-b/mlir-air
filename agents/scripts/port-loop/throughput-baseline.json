@@ -1,0 +1,18 @@
+{
+  "models": {
+    "llama32_1b": {
+      "decode_tokens_per_sec": 11.1,
+      "ttft_ms": 1340.0,
+      "context_len": 2048,
+      "recorded_utc": "2026-08-06T18:24:05Z",
+      "recorded_at_sha": "d72a2ccf"
+    }
+  },
+  "_comment": "gate-h.sh leg 4 floor. Driver-owned: fingerprinted by guard_gate_files() and covered by no phase allowlist, so a session cannot move it. Re-seed with agents/scripts/port-loop/seed-throughput-baseline.sh, and only when the measurement is legitimately supposed to change -- never because the gate failed. Each model carries the SHA it was measured at: a floor recorded after a change cannot gate that change.",
+  "run_params": {
+    "n_tokens": 32,
+    "prompt": "What is the capital of France?"
+  },
+  "floor_fraction": 0.85,
+  "last_seeded_utc": "2026-08-06T18:24:05Z"
+}

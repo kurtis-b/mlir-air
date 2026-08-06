@@ -28,6 +28,20 @@
 # No phase's allowlist covers these paths, deliberately: the driver never modifies them during a
 # run, so any change at all halts. If the harness itself needs to change, that is an operator
 # editing it between runs, not a phase editing it during one.
+#
+# `[2026-08-06]` THE COMPILER'S OWN LIT INPUTS ARE IN THIS SET, and were not until Phase H spent
+# three halts proving they had to be. Every weakened gate in that phase was an `mlir/test/**/*.mlir`
+# edited to accommodate new pass behaviour -- a test input annotated so it stops exercising the path
+# the phase changed, or a consumer added so it dodges a new refusal. This function covered `.lit`
+# files and not `.mlir` inputs, so the tamper check saw NONE of them; only the Codex `weakened_gates`
+# layer did, three times running. A `.mlir` file under a lit tree IS the gate: the RUN line and the
+# CHECK lines are what the suite asserts. `lit.cfg.py` is here for the same reason one layer up --
+# it decides which features are available and therefore which tests run at all.
+#
+# The rule a compiler phase follows when its change alters an existing test's outcome: keep the
+# INPUT exactly as it is and update the CHECK lines to assert the new, intended outcome. If the
+# transformed path also needs coverage, add a NEW case -- do not convert the old one. Annotating the
+# input to preserve the old outcome deletes the evidence that behaviour changed at all.
 guard_gate_files() {
   {
     git -C "${PL_ROOT}" ls-files 'programming_examples/**/*.lit'
@@ -36,6 +50,8 @@ guard_gate_files() {
     git -C "${PL_ROOT}" ls-files 'programming_examples/kernel_registry/details/*.json'
     git -C "${PL_ROOT}" ls-files 'programming_examples/llms/verify/*.py'
     git -C "${PL_ROOT}" ls-files 'test/**/*.lit'
+    git -C "${PL_ROOT}" ls-files 'mlir/test/**/*.mlir'
+    git -C "${PL_ROOT}" ls-files 'mlir/test/lit.cfg.py'
     git -C "${PL_ROOT}" ls-files 'agents/scripts/port-loop.sh'
     git -C "${PL_ROOT}" ls-files 'agents/scripts/port-loop/'
   } 2>/dev/null | sort -u

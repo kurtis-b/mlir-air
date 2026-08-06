@@ -357,6 +357,27 @@ Committed on the branch, gated by four review rounds and three of the four gate 
 
 ## What the next session does
 
+> ### `[2026-08-06]` Superseded by [18](18-phase-h1s-skip-not-refuse.md)
+>
+> This work now runs as a **fresh phase `H1s`**, not as a resume of H. The spec was corrected after
+> the halt and the driver's fixture and objective check were rewritten to match, so resuming would
+> have carried a fingerprint baseline taken against a specification that no longer holds.
+>
+> Items 2 and 3 below are **done**, by the driver, between phases:
+>
+> - The fixture is re-specified — and it grew from two variants to **four**, over two independent
+>   bits (callee annotated or not × weight DMA in-loop or hoisted). It reads the labeling decision
+>   out of aircc's `--debug-ir` dump rather than matching diagnostic text, so clause 3 is
+>   driver-owned rather than deferred to a lit test the phase would write. All four pass on
+>   hardware against the pre-change build, which means the check is a regression guard on the
+>   labeling decisions, not a failing test the phase turns green.
+> - `guard_gate_files()` now fingerprints `mlir/test/**/*.mlir`, `gate-h.sh` has a fifth
+>   throughput leg, and `phases.sh` carries the H1s arms with an allowlist naming exactly three
+>   test files.
+>
+> Item 1 (refuse → skip) and the in-tree lit test are what the session does. Read
+> [18](18-phase-h1s-skip-not-refuse.md) instead of this section.
+
 The phase halted at `confirm/3` with the corrected spec already established. There are no open
 questions left in it — three mechanical items and a gate re-run.
 
