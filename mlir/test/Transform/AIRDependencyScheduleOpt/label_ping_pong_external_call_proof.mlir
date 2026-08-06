@@ -22,8 +22,11 @@
 // transformer-layer hardware tests, and refusing on unprivatized memrefs
 // whose data carries across iterations failed 3 of 10 shipped LLM
 // deployments. Silence on an unprovable DUPLICATED buffer was a measured
-// 481/512-wrong miscompile; that is what Skip (and Refuse, for a read
-// with no per-iteration producer) still guards.
+// 481/512-wrong miscompile; that is what Skip still guards -- including
+// for a read with no per-iteration producer, which used to be a hard
+// compile error until it broke shipped models that were always correct.
+// The prior art the proof cites (upstream memref::multiBuffer, IREE,
+// Triton, TVM) declines the transform, never the build.
 
 // RUN: air-opt %s -air-label-scf-for-to-ping-pong -split-input-file -verify-diagnostics | FileCheck %s
 
@@ -506,8 +509,12 @@ module {
 // queried before Read), so the proof counted the accumulator as its own
 // producer, saw no reader, and declared the buffer vacuously safe --
 // labeling a loop whose rotation splits the accumulation across two
-// halves. It must REFUSE: the buffer is read but nothing refills it each
-// iteration.
+// halves. The buffer is read but nothing refills it each iteration, so
+// the loop must be SKIPPED with a warning: left on its correct
+// single-buffered schedule, never labeled.
+// CHECK-LABEL: func.func @rmw_accumulator
+// CHECK-NOT: hoist_alloc
+// CHECK-NOT: unroll
 module {
   air.channel @cdrain [1, 1]
   func.func @rmw_accumulator() {
@@ -519,7 +526,7 @@ module {
       %ci = arith.constant 0 : index
       %cst = arith.constant 1.0 : f32
       %t0 = air.wait_all async
-      // expected-error@+1 {{is a ping-pong candidate that cannot be proven safe to transform}}
+      // expected-warning@+1 {{is a ping-pong candidate that cannot be proven safe to transform}}
       %1 = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %t0) -> (!air.async.token) {
         %tb, %bb = air.execute -> (memref<64xf32, 2>) {
           %a = memref.alloc() : memref<64xf32, 2>
@@ -588,8 +595,12 @@ module {
 // refill protecting the call's own read. Classifying only the first operand
 // position ('w') let the proof record the call as both producer and
 // consumer -- vouching for itself -- and label a loop whose rotation hands
-// the readonly formal a stale half. It must REFUSE: the buffer is read but
-// nothing else refills it each iteration.
+// the readonly formal a stale half. The buffer is read but nothing else
+// refills it each iteration, so the loop must be SKIPPED with a warning:
+// left on its correct single-buffered schedule, never labeled.
+// CHECK-LABEL: func.func @same_buffer_two_formals(
+// CHECK-NOT: hoist_alloc
+// CHECK-NOT: unroll
 module {
   air.channel @cdrain2 [1, 1]
   func.func private @knl_wr(memref<64xf32, 2> {llvm.writeonly},
@@ -603,7 +614,7 @@ module {
       %c8 = arith.constant 8 : index
       %c64_i32 = arith.constant 64 : i32
       %t0 = air.wait_all async
-      // expected-error@+1 {{is a ping-pong candidate that cannot be proven safe to transform}}
+      // expected-warning@+1 {{is a ping-pong candidate that cannot be proven safe to transform}}
       %1 = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %t0) -> (!air.async.token) {
         %tb, %bb = air.execute -> (memref<64xf32, 2>) {
           %a = memref.alloc() : memref<64xf32, 2>

@@ -66,7 +66,14 @@ module {
 // loop was labeled as vacuously safe -- the exact laundering that lets
 // ping-pong rebuild the dependency graph without the kernel's read and
 // overwrite a buffer half still in use. With the consumer visible and no
-// per-iteration producer, it must REFUSE.
+// per-iteration producer, the loop is unprovable: SKIPPED with a warning,
+// left on its correct single-buffered schedule, never labeled. (This used
+// to be a hard compile error; the prior art the proof cites -- upstream
+// memref::multiBuffer, IREE, Triton, TVM -- declines the transform, not
+// the build.)
+// CHECK-LABEL: func.func @select_alias_reader_no_refill
+// CHECK-NOT: hoist_alloc
+// CHECK-NOT: unroll
 module {
   func.func private @knl_ro2(memref<64xbf16, 2> {llvm.readonly})
       attributes {llvm.emit_c_interface}
@@ -77,7 +84,7 @@ module {
       %c4 = arith.constant 4 : index
       %c8 = arith.constant 8 : index
       %t0 = air.wait_all async
-      // expected-error@+1 {{is a ping-pong candidate that cannot be proven safe to transform}}
+      // expected-warning@+1 {{is a ping-pong candidate that cannot be proven safe to transform}}
       %1 = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %t0) -> (!air.async.token) {
         %tb, %bb = air.execute -> (memref<64xbf16, 2>) {
           %a = memref.alloc() : memref<64xbf16, 2>
