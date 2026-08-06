@@ -12,10 +12,12 @@
 // buffers; SKIPPED with a warning when an operand is unannotated
 // (read-versus-write is not established, so the loop keeps its correct
 // untransformed schedule); and REFUSED with a hard pass failure when the
-// call may access a buffer that receives a classified WRITE outside the
+// call may access a buffer that receives a classified WRITE before the
 // loop within the loop's own scope (its data carries into iterations, and
 // the only edge ordering that fill against the invisible use is the one
-// the transform rebuilds). The refusal is scoped to exactly that: a call touching any
+// the transform rebuilds). A classified write sequenced AFTER the loop
+// waits on the loop's result token, which the rebuild preserves, and must
+// not trigger the refusal. The refusal is scoped to exactly that: a call touching any
 // other unprivatized memref -- a herd-argument or call-zero-filled
 // accumulator, untouched scratch -- must NOT block the transform; the
 // unscoped version of this refusal broke 8 of 24 shipped hardware designs.
@@ -268,6 +270,179 @@ module {
       }
       %p = air.channel.put async [%1] @cacc[%tx, %ty] (%bacc[] [] []) : (memref<4x64xf32, 2>)
       %td = air.execute [%p] { memref.dealloc %bacc : memref<4x64xf32, 2> }
+    }
+    return
+  }
+}
+
+// -----
+
+// The refusal must also be scoped in TIME. Here the call accumulates into
+// an external buffer through an UNANNOTATED operand, and the only
+// classified WRITE to that buffer is a channel.get sequenced AFTER the
+// loop, refilling it for a later phase. That write waits on the loop's
+// result token, which the rebuild preserves; it cannot feed data into the
+// loop's iterations, so there is no edge to sever and it must not block
+// the transform. The loop's own candidates are annotated and refilled per
+// iteration, so the loop must be LABELED. An earlier draft counted any
+// out-of-loop write regardless of its position and hard-refused this
+// working shape.
+// CHECK-LABEL: func.func @write_after_loop
+// CHECK: scf.for
+// CHECK: hoist_alloc
+// CHECK: } {unroll = 2 : i32}
+module {
+  air.channel @ca2 [1, 1]
+  air.channel @cb2 [1, 1]
+  air.channel @cnext [1, 1]
+  func.func private @mm_knl2(memref<4x64xbf16, 2> {llvm.readonly},
+                             memref<4x64xbf16, 2> {llvm.readonly},
+                             memref<4x64xf32, 2>, i32)
+      attributes {llvm.emit_c_interface}
+  func.func @write_after_loop() {
+    %c1 = arith.constant 1 : index
+    %0 = air.herd @h async tile (%tx, %ty) in (%sx=%c1, %sy=%c1) {
+      %c0 = arith.constant 0 : index
+      %c4 = arith.constant 4 : index
+      %c16 = arith.constant 16 : index
+      %c64_i32 = arith.constant 64 : i32
+      %tacc, %bacc = air.execute -> (memref<4x64xf32, 2>) {
+        %a = memref.alloc() : memref<4x64xf32, 2>
+        air.execute_terminator %a : memref<4x64xf32, 2>
+      }
+      %1 = scf.for %i = %c0 to %c16 step %c4 iter_args(%t = %tacc) -> (!air.async.token) {
+        %ta, %ba = air.execute -> (memref<4x64xbf16, 2>) {
+          %a = memref.alloc() : memref<4x64xbf16, 2>
+          air.execute_terminator %a : memref<4x64xbf16, 2>
+        }
+        %tb, %bb = air.execute -> (memref<4x64xbf16, 2>) {
+          %a = memref.alloc() : memref<4x64xbf16, 2>
+          air.execute_terminator %a : memref<4x64xbf16, 2>
+        }
+        %ga = air.channel.get async [%ta, %t] @ca2[%tx, %ty] (%ba[] [] []) : (memref<4x64xbf16, 2>)
+        %gb = air.channel.get async [%tb, %t] @cb2[%tx, %ty] (%bb[] [] []) : (memref<4x64xbf16, 2>)
+        %tc = air.execute [%ga, %gb] {
+          func.call @mm_knl2(%ba, %bb, %bacc, %c64_i32) : (memref<4x64xbf16, 2>, memref<4x64xbf16, 2>, memref<4x64xf32, 2>, i32) -> ()
+        }
+        %da = air.execute [%tc] { memref.dealloc %ba : memref<4x64xbf16, 2> }
+        %db = air.execute [%tc] { memref.dealloc %bb : memref<4x64xbf16, 2> }
+        %w = air.wait_all async [%da, %db]
+        scf.yield %w : !air.async.token
+      }
+      %g = air.channel.get async [%1] @cnext[%tx, %ty] (%bacc[] [] []) : (memref<4x64xf32, 2>)
+      %td = air.execute [%g] { memref.dealloc %bacc : memref<4x64xf32, 2> }
+    }
+    return
+  }
+}
+
+// -----
+
+// The same time-scoping with UNANNOTATED candidates: identical to
+// accumulator_outside_loop except the accumulator is also refilled by a
+// channel.get AFTER the loop (buffer reuse for the next phase). The
+// after-loop write still cannot carry data INTO the loop, so the verdict
+// must stay Skip -- a warning because the loop's own candidates are
+// unannotated -- and must not escalate to a hard refusal.
+// CHECK-LABEL: func.func @write_after_loop_unannotated
+// CHECK-NOT: hoist_alloc
+// CHECK-NOT: unroll
+module {
+  air.channel @ca3 [1, 1]
+  air.channel @cb3 [1, 1]
+  air.channel @cnext3 [1, 1]
+  func.func private @zero_acc3(memref<4x64xf32, 2>) attributes {llvm.emit_c_interface}
+  func.func private @mm_knl3(memref<4x64xbf16, 2>, memref<4x64xbf16, 2>, memref<4x64xf32, 2>, i32)
+      attributes {llvm.emit_c_interface}
+  func.func @write_after_loop_unannotated() {
+    %c1 = arith.constant 1 : index
+    %0 = air.herd @h async tile (%tx, %ty) in (%sx=%c1, %sy=%c1) {
+      %c0 = arith.constant 0 : index
+      %c4 = arith.constant 4 : index
+      %c16 = arith.constant 16 : index
+      %c64_i32 = arith.constant 64 : i32
+      %tacc, %bacc = air.execute -> (memref<4x64xf32, 2>) {
+        %a = memref.alloc() : memref<4x64xf32, 2>
+        air.execute_terminator %a : memref<4x64xf32, 2>
+      }
+      %tz = air.execute [%tacc] {
+        func.call @zero_acc3(%bacc) : (memref<4x64xf32, 2>) -> ()
+      }
+      // expected-warning@+1 {{is a ping-pong candidate that cannot be proven safe to transform}}
+      %1 = scf.for %i = %c0 to %c16 step %c4 iter_args(%t = %tz) -> (!air.async.token) {
+        %ta, %ba = air.execute -> (memref<4x64xbf16, 2>) {
+          %a = memref.alloc() : memref<4x64xbf16, 2>
+          air.execute_terminator %a : memref<4x64xbf16, 2>
+        }
+        %tb, %bb = air.execute -> (memref<4x64xbf16, 2>) {
+          %a = memref.alloc() : memref<4x64xbf16, 2>
+          air.execute_terminator %a : memref<4x64xbf16, 2>
+        }
+        %ga = air.channel.get async [%ta, %t] @ca3[%tx, %ty] (%ba[] [] []) : (memref<4x64xbf16, 2>)
+        %gb = air.channel.get async [%tb, %t] @cb3[%tx, %ty] (%bb[] [] []) : (memref<4x64xbf16, 2>)
+        %tc = air.execute [%ga, %gb] {
+          func.call @mm_knl3(%ba, %bb, %bacc, %c64_i32) : (memref<4x64xbf16, 2>, memref<4x64xbf16, 2>, memref<4x64xf32, 2>, i32) -> ()
+        }
+        %da = air.execute [%tc] { memref.dealloc %ba : memref<4x64xbf16, 2> }
+        %db = air.execute [%tc] { memref.dealloc %bb : memref<4x64xbf16, 2> }
+        %w = air.wait_all async [%da, %db]
+        scf.yield %w : !air.async.token
+      }
+      %g = air.channel.get async [%1] @cnext3[%tx, %ty] (%bacc[] [] []) : (memref<4x64xf32, 2>)
+      %td = air.execute [%g] { memref.dealloc %bacc : memref<4x64xf32, 2> }
+    }
+    return
+  }
+}
+
+// -----
+
+// The one shape where an "after the loop" write still carries data INTO
+// the loop: an enclosing loop re-executes both the candidate loop and the
+// write without re-allocating the buffer, so outer-iteration k's refill is
+// dynamically BEFORE outer-iteration k+1's unclassified in-loop read. The
+// weight buffer lives at herd level, the call reads it through an
+// unannotated operand, and the ONLY classified write to it is the
+// channel.get refill after the candidate loop but inside the outer loop:
+// the pass must still REFUSE. Without the recirculation check this labels
+// cleanly (no fill precedes the loop anywhere), so this case guards the
+// after-loop escape from being widened into exactly the hoisted-weight
+// hole it coexists with.
+module {
+  air.channel @cx4 [1, 1]
+  air.channel @cw4 [1, 1]
+  func.func private @knl4(memref<4x64xbf16, 2> {llvm.readonly},
+                          memref<64xbf16, 2>, i32)
+      attributes {llvm.emit_c_interface}
+  func.func @write_after_loop_recirculated() {
+    %c1 = arith.constant 1 : index
+    %0 = air.herd @h async tile (%tx, %ty) in (%sx=%c1, %sy=%c1) {
+      %c0 = arith.constant 0 : index
+      %c4 = arith.constant 4 : index
+      %c8 = arith.constant 8 : index
+      %c64_i32 = arith.constant 64 : i32
+      %tw, %bw = air.execute -> (memref<64xbf16, 2>) {
+        %a = memref.alloc() : memref<64xbf16, 2>
+        air.execute_terminator %a : memref<64xbf16, 2>
+      }
+      %2 = scf.for %k = %c0 to %c8 step %c4 iter_args(%tk = %tw) -> (!air.async.token) {
+        // expected-error@+1 {{is a ping-pong candidate that cannot be proven safe to transform}}
+        %1 = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %tk) -> (!air.async.token) {
+          %tx2, %bx = air.execute -> (memref<4x64xbf16, 2>) {
+            %a = memref.alloc() : memref<4x64xbf16, 2>
+            air.execute_terminator %a : memref<4x64xbf16, 2>
+          }
+          %gx = air.channel.get async [%tx2, %t] @cx4[%tx, %ty] (%bx[] [] []) : (memref<4x64xbf16, 2>)
+          %tc = air.execute [%gx] {
+            func.call @knl4(%bx, %bw, %c64_i32) : (memref<4x64xbf16, 2>, memref<64xbf16, 2>, i32) -> ()
+          }
+          %dx = air.execute [%tc] { memref.dealloc %bx : memref<4x64xbf16, 2> }
+          scf.yield %dx : !air.async.token
+        }
+        %gw = air.channel.get async [%1] @cw4[%tx, %ty] (%bw[] [] []) : (memref<64xbf16, 2>)
+        scf.yield %gw : !air.async.token
+      }
+      %td = air.execute [%2] { memref.dealloc %bw : memref<64xbf16, 2> }
     }
     return
   }
