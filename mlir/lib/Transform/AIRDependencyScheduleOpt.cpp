@@ -1730,14 +1730,14 @@ private:
 //     untouched scratch) must NOT block: attempt 1 refused those and
 //     broke 8 of 24 shipped hardware designs (see
 //     memrefCarriesDataAcrossIterations).
-//   - a duplicated buffer with NO recognized consumer: the reuse edge
-//     ordering the next fill behind its readers cannot be built, and the
-//     empty set used to become a dependency-free placeholder token -- the
-//     exact mechanism by which a missing edge was silent wrong data.
 //   - a duplicated buffer that is read but has no producer that provably
 //     refills it on EVERY iteration (a non-exhaustive conditional, a
 //     zero-trip or dynamic nested loop): an iteration would read a
-//     rotated stale half.
+//     rotated stale half. A buffer with NO recognized consumer is the
+//     opposite case and is vacuously safe: the reuse edge exists to hold
+//     the next fill behind the buffer's readers, and once every use is
+//     classified an empty consumer set means provably no reader --
+//     alloc-only scratch and fill-only staging rotate harmlessly.
 //
 //   Skip -- the loop cannot be PROVEN safe to transform, but leaving it
 //   untransformed is correct. Warn and do not label:
@@ -1969,18 +1969,21 @@ static PingPongSafety provePingPongSafety(scf::ForOp forOp,
   if (skip)
     return PingPongSafety::Skip;
   for (auto *a : allocs) {
-    // H1 requires at least one recognized consumer for every buffer the
-    // transform would duplicate: with an empty consumer set the reuse
-    // edge ordering the next fill behind the buffer's readers cannot be
-    // built, and the empty set is what used to be papered over with a
-    // dependency-free placeholder token -- the mechanism that turned a
-    // missing edge into silent wrong data.
-    if (consumers[a] == 0) {
-      os << "a buffer it would duplicate has no recognized consumer, so "
-            "the reuse edge protecting the buffer until its readers have "
-            "finished cannot be built";
-      return PingPongSafety::Refuse;
-    }
+    // A buffer that is never READ inside the loop is vacuously safe to
+    // rotate: the reuse edge exists to hold the next fill behind the
+    // buffer's readers, and with no recognized consumer there is no
+    // reader to protect -- each iteration's write lands in its own half
+    // and nothing observes the other. This keeps alloc-only scratch and
+    // fill-only staging buffers labelable, which the compiler's own
+    // pre-existing tests (bare alloc/dealloc loops, single-fill loops
+    // ending in dealloc) require: refusing them rejects loops that were
+    // always safe, trading silent wrong data for a worse failure mode.
+    // Note every use is already proven classified by this point -- an
+    // unclassified use of a candidate alloc returned Skip above -- so an
+    // empty consumer set means "provably no reader", not "reader we
+    // could not see".
+    if (consumers[a] == 0)
+      continue;
     // A read of a buffer requires a producer that refills it on EVERY
     // iteration, or the data carries across iterations and rotation hands
     // the reader the wrong half. Control flow through the loop body

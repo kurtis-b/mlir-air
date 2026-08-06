@@ -9,20 +9,13 @@
 // RUN: air-opt %s -air-label-scf-for-to-ping-pong='omit-memory-space=L1' | FileCheck %s --check-prefix=OMIT_L1
 // RUN: air-opt %s -air-label-scf-for-to-ping-pong='omit-memory-space=L2' | FileCheck %s --check-prefix=OMIT_L2
 
-// Test ping-pong labeling with memory space filtering. Each buffer is filled
-// by a channel.get and drained by a channel.put every iteration: the labeling
-// pass now refuses to duplicate a buffer with no recognized consumer, so a
-// bare alloc/dealloc loop would be a pass failure, not a labeling subject.
+// Test ping-pong labeling with memory space filtering.
 
 // DEFAULT-LABEL: func.func @test
 // OMIT_L1-LABEL: func.func @test
 // OMIT_L2-LABEL: func.func @test
 
 module {
-  air.channel @fillL2 [1]
-  air.channel @drainL2 [1]
-  air.channel @fillL1 [1]
-  air.channel @drainL1 [1]
   func.func @test(%arg0: memref<256x1024xbf16>, %arg1: memref<1024x1024xbf16>, %arg2: memref<1024x1024xbf16>, %arg3: memref<1024x1024xbf16>) {
     %c1 = arith.constant 1 : index
     %0 = air.launch async (%arg4, %arg5) in (%arg6=%c1, %arg7=%c1) args(%arg8=%arg0, %arg9=%arg1) : memref<256x1024xbf16>, memref<1024x1024xbf16> attributes {id = 7 : i32} {
@@ -48,9 +41,7 @@ module {
             %alloc = memref.alloc() : memref<64x64xbf16, 1>
             air.execute_terminator %alloc : memref<64x64xbf16, 1>
           }
-          %fill_seg = air.channel.get async [%async_token_6] @fillL2[] (%results_7[] [] []) : (memref<64x64xbf16, 1>)
-          %drain_seg = air.channel.put async [%fill_seg] @drainL2[] (%results_7[] [] []) : (memref<64x64xbf16, 1>)
-          %async_token_8 = air.execute [%drain_seg] {
+          %async_token_8 = air.execute [%async_token_6] {
             memref.dealloc %results_7 : memref<64x64xbf16, 1>
           }
           scf.yield %async_token_8 : !air.async.token
@@ -76,9 +67,7 @@ module {
               %alloc = memref.alloc() : memref<32x32xbf16, 2>
               air.execute_terminator %alloc : memref<32x32xbf16, 2>
             }
-            %fill_h = air.channel.get async [%async_token_3] @fillL1[] (%results_4[] [] []) : (memref<32x32xbf16, 2>)
-            %drain_h = air.channel.put async [%fill_h] @drainL1[] (%results_4[] [] []) : (memref<32x32xbf16, 2>)
-            %async_token_5 = air.execute [%drain_h] {
+            %async_token_5 = air.execute [%async_token_3] {
               memref.dealloc %results_4 : memref<32x32xbf16, 2>
             }
             scf.yield %async_token_5 : !air.async.token
@@ -125,8 +114,6 @@ module {
 // OMIT_L1-NOT: unroll
 
 module {
-  air.channel @fillN [1]
-  air.channel @drainN [1]
   func.func @test_nested(%arg0: memref<256x1024xbf16>) {
     %c1 = arith.constant 1 : index
     %0 = air.launch async (%arg4) in (%arg6=%c1) attributes {id = 7 : i32} {
@@ -151,9 +138,7 @@ module {
                 %alloc_a = memref.alloc() : memref<32x32xbf16, 2>
                 air.execute_terminator %alloc_a : memref<32x32xbf16, 2>
               }
-              %fill_i = air.channel.get async [%async_token_inner] @fillN[] (%results_inner[] [] []) : (memref<32x32xbf16, 2>)
-              %drain_i = air.channel.put async [%fill_i] @drainN[] (%results_inner[] [] []) : (memref<32x32xbf16, 2>)
-              %async_token_d = air.execute [%drain_i] {
+              %async_token_d = air.execute [%async_token_inner] {
                 memref.dealloc %results_inner : memref<32x32xbf16, 2>
               }
               scf.yield %async_token_d : !air.async.token

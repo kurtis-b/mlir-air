@@ -84,7 +84,6 @@ module {
 
 module {
   air.channel @single_chan [1]
-  air.channel @single_drain [1]
   func.func @singlefill_outer_loop(%arg0: memref<256x1024xbf16>) {
     %c1 = arith.constant 1 : index
     %0 = air.launch async (%arg4) in (%arg6=%c1) attributes {id = 1 : i32} {
@@ -100,11 +99,9 @@ module {
               %alloc_a = memref.alloc() : memref<32x32xbf16, 2>
               air.execute_terminator %alloc_a : memref<32x32xbf16, 2>
             }
-            // Exactly one channel.get per outer iter -- ping-pong-safe --
-            // and a put draining it, so the buffer has a recognized consumer.
+            // Exactly one channel.get per outer iter -- ping-pong-safe.
             %g = air.channel.get async [%async_token_a] @single_chan[] (%results_a[] [] []) {id = 1 : i32} : (memref<32x32xbf16, 2>)
-            %p = air.channel.put async [%g] @single_drain[] (%results_a[] [] []) {id = 2 : i32} : (memref<32x32xbf16, 2>)
-            %async_token_d = air.execute [%p] {
+            %async_token_d = air.execute [%g] {
               memref.dealloc %results_a : memref<32x32xbf16, 2>
             }
             scf.yield %async_token_d : !air.async.token
@@ -195,7 +192,6 @@ module {
   air.channel @chB [1, 1] {broadcast_shape = [1, 4]}
   air.channel @chC [1, 1] {broadcast_shape = [1, 4]}
   air.channel @chD [1, 1] {broadcast_shape = [1, 4]}
-  air.channel @bcast_drain [1, 1]
 
   func.func @affine_if_broadcast_branches_eligible(%arg0: memref<256x1024xbf16>) {
     %c1 = arith.constant 1 : index
@@ -235,8 +231,7 @@ module {
               }
               affine.yield %gb : !air.async.token
             }
-            %p = air.channel.put async [%g] @bcast_drain[] (%results_a[] [] []) {id = 5 : i32} : (memref<32x32xbf16, 2>)
-            %async_token_d = air.execute [%p] {
+            %async_token_d = air.execute [%g] {
               memref.dealloc %results_a : memref<32x32xbf16, 2>
             }
             scf.yield %async_token_d : !air.async.token

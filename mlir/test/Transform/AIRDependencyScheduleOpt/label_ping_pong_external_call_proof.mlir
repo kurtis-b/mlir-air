@@ -15,8 +15,7 @@
 // call may access a buffer that receives a classified WRITE outside the
 // loop within the loop's own scope (its data carries into iterations, and
 // the only edge ordering that fill against the invisible use is the one
-// the transform rebuilds) or when a duplicated buffer has no recognized
-// consumer. The refusal is scoped to exactly that: a call touching any
+// the transform rebuilds). The refusal is scoped to exactly that: a call touching any
 // other unprivatized memref -- a herd-argument or call-zero-filled
 // accumulator, untouched scratch -- must NOT block the transform; the
 // unscoped version of this refusal broke 8 of 24 shipped hardware designs.
@@ -276,10 +275,17 @@ module {
 
 // -----
 
-// A duplicated buffer with NO recognized consumer: the buffer is filled each
-// iteration but nothing ever reads it, so the reuse edge protecting it until
-// its readers finish cannot be built. H1 requires at least one recognized
-// consumer for every duplicated buffer; the pass must refuse, not label.
+// A duplicated buffer with NO recognized consumer is vacuously safe: the
+// buffer is filled each iteration but provably nothing reads it (every use
+// is classified), so there is no reader for a reuse edge to protect and
+// each iteration's fill lands in its own half unobserved. The pass must
+// LABEL this loop. An earlier draft of the proof refused it, which rejected
+// bare alloc/dealloc and fill-only loops the compiler's pre-existing tests
+// have always accepted; this case is the regression guard against that
+// refusal coming back.
+// CHECK-LABEL: func.func @no_consumer
+// CHECK: hoist_alloc
+// CHECK: } {unroll = 2 : i32}
 module {
   air.channel @cn [1, 1]
   func.func @no_consumer() {
@@ -289,7 +295,6 @@ module {
       %c4 = arith.constant 4 : index
       %c8 = arith.constant 8 : index
       %t0 = air.wait_all async
-      // expected-error@+1 {{is a ping-pong candidate that cannot be proven safe to transform}}
       %1 = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %t0) -> (!air.async.token) {
         %tb, %bb = air.execute -> (memref<64xbf16, 2>) {
           %a = memref.alloc() : memref<64xbf16, 2>
