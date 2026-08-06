@@ -269,37 +269,43 @@ Do not resolve this by annotating the three models' callees, by adding `air.disa
 their builders, or by dropping the `hoisted` clause. The first two hide the question, the third
 removes the only thing proving the transform still discriminates.
 
-## `[2026-08-06]` STOPPED HERE: the fixture and the shipped models cannot both be right
+## `[2026-08-06]` RESOLVED: H1's spec was wrong — "decline to transform", not "refuse to compile"
 
-Attempt 5 reached the confirm review, which found: *"The mandated hoisted-weight fixture remains
-accepted rather than refused."* Round 3's fix narrowed the refusal far enough to compile the three
-shipped models, and at that width `--variant hoisted` is no longer refused. The two clauses of the
-objective check are now in direct opposition, and every further attempt will oscillate between them.
+The measurement settles it, and against me.
 
-**This is a specification question and no session can settle it.** The loop is stopped at 29 of 60
-invocations rather than spending the rest rediscovering the same fork.
+Run today against the current build: the `hoisted` fixture **compiles and produces numerically
+correct output** (`XRTRunner: PASS!`), and `air-label-scf-for-to-ping-pong` does not label its loop
+at all — no `unroll`, no `hoist_alloc` on any of its four allocs. The loop is *Skipped* to
+single-buffered, and single-buffered is correct.
 
-The fork, stated so it can be decided:
+So the hoisted shape is safe precisely because the rotation leaves the buffer alone. That is also
+why `llama32_1b_int4`, `qwen3_0_6b` and `qwen3_1_7b` are correct today. **The fixture was asserting
+the wrong thing**, exactly as this document allowed for.
 
-**(a) The fixture is right — that shape really is unsafe.** Then `llama32_1b_int4`, `qwen3_0_6b`
-and `qwen3_1_7b` are relying on a program the compiler cannot prove safe, and the fix is to make
-those three express the invariant — annotate the callee (`llvm.readonly` on the loop-invariant
-operand is the honest form, and it is *information*, not a workaround), or hoist the buffer so the
-rotation does not cover it. That is per-design work across three shipped models, and it must be
-measured for throughput, not just correctness.
+**The root error is in H1's specification, which is mine.** It says "hard-fails compilation with a
+diagnostic". But the prior art it cites does no such thing: upstream `memref::multiBuffer` returns
+`failure()`, which means *decline to transform* and leave the code alone — not *abort the build*.
+IREE, Triton and TVM all bail out of the transformation, not out of compilation. I conflated
+"refuse to transform" with "refuse to compile", and gate leg 4 caught the consequence: three shipped
+models failing to build on programs that were always correct.
 
-**(b) The fixture is wrong — refusal is the wrong instrument for that shape.** A loop-invariant
-buffer read through an external call is safe *provided the rotation does not duplicate it*. If the
-rotation already leaves it alone, there was never a hazard, and `builders/addnorm.py`'s documented
-corruption on a hoisted weight DMA has a different cause — which would need its own investigation
-before the `hoisted` clause is dropped. Do not drop it on the strength of this alone: it is the only
-thing proving the transform still discriminates.
+**The corrected rule:**
 
-**What is needed to choose.** One measurement: for the `hoisted` fixture and for one of the three
-failing models, does the ping-pong rotation actually duplicate the buffer in question — is it in the
-`hoist_alloc` set? If the fixture's is and the models' are not, (b) is correct and the rule is
-simply "refuse only for rotated buffers". If both are rotated, (a) is correct. That is a
-`-print-ir-after` on `air-label-scf-for-to-ping-pong` away, and it decides the phase.
+- When the pass cannot prove the rotation safe, it **skips** — leaves the loop single-buffered,
+  emits a *warning* naming the loop, and compilation proceeds. Correctness is preserved; only the
+  optimization is lost.
+- Compilation aborts only for IR that is genuinely malformed, which is not this case.
+- The dependency-free `WaitAllOp` placeholder is still forbidden: skipping means not transforming at
+  all, not transforming with an empty edge set. That was always the real defect.
+
+**What still needs proving, and how the fixture must change.** With refusal gone, `--variant
+hoisted` can no longer discriminate by demanding an error. It should assert that the program
+compiles, is numerically correct, **and was not ping-pong transformed** — the third clause is what
+keeps it a discriminating test rather than a second copy of `inside`. Asserting non-transformation
+from the Python runner is not straightforward; a lit test over the labeled IR (`CHECK-NOT: unroll`)
+is the natural home for it, alongside the two the phase already added.
+
+## What landed, and is worth keeping regardless
 
 ## What did land, and is worth keeping regardless
 
