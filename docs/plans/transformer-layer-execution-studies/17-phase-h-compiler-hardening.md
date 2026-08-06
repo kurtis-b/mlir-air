@@ -233,6 +233,42 @@ Note again that `guard_gate_files()` fingerprints `.lit` files and not `mlir/tes
 tamper check cannot see any of this. Only the Codex `weakened_gates` layer can, which is why it has
 been the halting layer three times running, and why widening the fingerprint set is on the list.
 
+## `[2026-08-06]` Attempt 4: leg 3 fixed, and leg 4 found the real tension
+
+**Leg 3 now passes 24/24** — the over-refusal that failed 8 of 24 on attempt 1 is gone, and all
+three `weakened_gates` halts are resolved (the reverted tests stayed reverted, and the CHECK-line
+rule above held). Reviews 1–3 all cleared, round 3 clean with no fix needed.
+
+**Leg 4 then ran for the first time and caught three regressions**: `llama32_1b_int4`,
+`qwen3_0_6b`, `qwen3_1_7b`. Seven models pass. All three fail the same way — `aircc` refusing to
+compile:
+
+> `'scf.for' op is a ping-pong candidate that cannot be proven safe to transform: 'func.call' may
+> access a memref that this loop's ping-pong rotation does not privatize and whose data carries
+> across iterations (it is filled before the loop, within the loop's own scope)`
+
+**That is the same shape `--variant hoisted` asserts must be refused** — a buffer filled before the
+loop and read inside it through an external call. And these three models produce correct output
+today. So the fixture's premise and the shipped models disagree, and one of them has to give.
+
+**The resolution, for the next attempt.** The hazard is not "data carries across iterations". It is
+"a buffer *the rotation duplicates* is not refilled for both halves". If the rotation leaves a
+loop-invariant buffer alone — one physical buffer, read by every iteration — there is no hazard and
+refusing is wrong. So:
+
+- Refuse **only** when the unprovable buffer is one this loop's ping-pong rotation actually
+  privatizes (i.e. it is in the `hoist_alloc` set being duplicated). A loop-carried buffer the
+  rotation does not touch is not this transform's problem.
+- Verify the `hoisted` fixture still refuses under that rule. If its `l1_w` *is* rotated, it will,
+  and both the fixture and the three models are satisfied. **If it is not rotated, then the fixture
+  is asserting the wrong thing** — say so in `work_not_completed` rather than bending the rule to
+  keep it green. `builders/addnorm.py` documents that hoisting its weight DMA corrupts, so there is
+  a real hazard somewhere in that shape; the question is whether refusal is the right instrument.
+
+Do not resolve this by annotating the three models' callees, by adding `air.disable_ping_pong` to
+their builders, or by dropping the `hoisted` clause. The first two hide the question, the third
+removes the only thing proving the transform still discriminates.
+
 ## Risks
 
 - **The gate is the widest in the plan.** A compiler regression surfaces as ten `make verify` runs
