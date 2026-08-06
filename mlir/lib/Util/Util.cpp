@@ -1160,10 +1160,20 @@ char air::checkOpOperandReadOrWrite(mlir::OpOperand &op_operand) {
   // MemReadAt<src> + MemWriteAt<dst>, so it answers here without an
   // explicit dialect branch. air.channel.put/get do not yet declare
   // effects (channel-resource modeling is a separate followup) and
-  // continue to use the dialect-specific branches below.
-  if (mlir::hasEffect<mlir::MemoryEffects::Write>(owner, op_operand.get()))
+  // continue to use the dialect-specific branches below. An op declaring
+  // BOTH effects on the same operand (memref.atomic_rmw, a linalg op whose
+  // payload reads its init) is 'b', not 'w': answering only 'w' hides the
+  // read, and a caller that then treats the operand as write-only drops
+  // the dependence edge protecting that read.
+  bool hasWriteEffect =
+      mlir::hasEffect<mlir::MemoryEffects::Write>(owner, op_operand.get());
+  bool hasReadEffect =
+      mlir::hasEffect<mlir::MemoryEffects::Read>(owner, op_operand.get());
+  if (hasWriteEffect && hasReadEffect)
+    return 'b';
+  if (hasWriteEffect)
     return 'w';
-  if (mlir::hasEffect<mlir::MemoryEffects::Read>(owner, op_operand.get()))
+  if (hasReadEffect)
     return 'r';
   // If used in Channel Put Op
   if (auto channel_put =

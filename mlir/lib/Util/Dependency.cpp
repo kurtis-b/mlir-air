@@ -3209,6 +3209,11 @@ char dependencyTracer::checkOperandReadOrWrite(mlir::Value operand) {
       foundWriteAccess = true;
     else if (rw_code == 'r')
       foundReadAccess = true;
+    // A read-modify-write ('b') is both accesses at once
+    else if (rw_code == 'b') {
+      foundWriteAccess = true;
+      foundReadAccess = true;
+    }
     // If unknown op, then assume write access for safety
     else if (rw_code == 'u')
       foundWriteAccess = true;

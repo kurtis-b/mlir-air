@@ -197,8 +197,13 @@ struct LinalgTransforms {
   static const StringLiteral kLinalgTransformMarker;
 };
 
-// Classify an operand's access: 'r' read, 'w' write, 'u' unknown, 'e' not an
-// operand of the op. A func.call to an `llvm.emit_c_interface` callee
+// Classify an operand's access: 'r' read, 'w' write, 'b' both (a
+// read-modify-write such as memref.atomic_rmw or a linalg op whose payload
+// reads its init), 'u' unknown, 'e' not an operand of the op. 'b' is
+// deliberately distinct from 'w': a read-modify-write's write depends on the
+// buffer's prior contents, so a caller ordering accesses must protect the
+// read as well -- collapsing 'b' into 'w' is how a reader silently loses its
+// dependence edge. A func.call to an `llvm.emit_c_interface` callee
 // classifies memref operands from the callee's argument attributes
 // (`llvm.readonly` -> 'r', `llvm.writeonly` -> 'w'); an unannotated memref
 // operand stays 'u' -- read-versus-write is not established, and callers must

@@ -496,3 +496,85 @@ module {
     return
   }
 }
+
+// -----
+
+// A read-modify-write of a duplicated buffer (memref.atomic_rmw declares
+// BOTH memory effects on its memref operand) is a READER whose write
+// depends on the buffer's prior contents -- the loop-carried dependence
+// rotation breaks. The classifier used to answer 'w' for it (Write was
+// queried before Read), so the proof counted the accumulator as its own
+// producer, saw no reader, and declared the buffer vacuously safe --
+// labeling a loop whose rotation splits the accumulation across two
+// halves. It must REFUSE: the buffer is read but nothing refills it each
+// iteration.
+module {
+  air.channel @cdrain [1, 1]
+  func.func @rmw_accumulator() {
+    %c1 = arith.constant 1 : index
+    %0 = air.herd @h async tile (%tx, %ty) in (%sx=%c1, %sy=%c1) {
+      %c0 = arith.constant 0 : index
+      %c4 = arith.constant 4 : index
+      %c8 = arith.constant 8 : index
+      %ci = arith.constant 0 : index
+      %cst = arith.constant 1.0 : f32
+      %t0 = air.wait_all async
+      // expected-error@+1 {{is a ping-pong candidate that cannot be proven safe to transform}}
+      %1 = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %t0) -> (!air.async.token) {
+        %tb, %bb = air.execute -> (memref<64xf32, 2>) {
+          %a = memref.alloc() : memref<64xf32, 2>
+          air.execute_terminator %a : memref<64xf32, 2>
+        }
+        %tc = air.execute [%tb, %t] {
+          %old = memref.atomic_rmw addf %cst, %bb[%ci] : (f32, memref<64xf32, 2>) -> f32
+        }
+        %p = air.channel.put async [%tc] @cdrain[%tx, %ty] (%bb[] [] []) : (memref<64xf32, 2>)
+        %d = air.execute [%p] { memref.dealloc %bb : memref<64xf32, 2> }
+        scf.yield %d : !air.async.token
+      }
+    }
+    return
+  }
+}
+
+// -----
+
+// The same read-modify-write, but the buffer is refilled by a channel.get
+// on EVERY iteration before the accumulation touches it: each iteration's
+// read observes that iteration's own fill, so rotation is provably safe
+// and the loop must still LABEL. This is the guard against the 'b'
+// classification over-refusing -- a read-modify-write is only unsafe when
+// the data it reads carries across iterations.
+// CHECK-LABEL: func.func @rmw_with_refill
+// CHECK: scf.for
+// CHECK: hoist_alloc
+// CHECK: } {unroll = 2 : i32}
+module {
+  air.channel @cfill [1, 1]
+  air.channel @cdrain [1, 1]
+  func.func @rmw_with_refill() {
+    %c1 = arith.constant 1 : index
+    %0 = air.herd @h async tile (%tx, %ty) in (%sx=%c1, %sy=%c1) {
+      %c0 = arith.constant 0 : index
+      %c4 = arith.constant 4 : index
+      %c8 = arith.constant 8 : index
+      %ci = arith.constant 0 : index
+      %cst = arith.constant 1.0 : f32
+      %t0 = air.wait_all async
+      %1 = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %t0) -> (!air.async.token) {
+        %tb, %bb = air.execute -> (memref<64xf32, 2>) {
+          %a = memref.alloc() : memref<64xf32, 2>
+          air.execute_terminator %a : memref<64xf32, 2>
+        }
+        %g = air.channel.get async [%tb, %t] @cfill[%tx, %ty] (%bb[] [] []) : (memref<64xf32, 2>)
+        %tc = air.execute [%g] {
+          %old = memref.atomic_rmw addf %cst, %bb[%ci] : (f32, memref<64xf32, 2>) -> f32
+        }
+        %p = air.channel.put async [%tc] @cdrain[%tx, %ty] (%bb[] [] []) : (memref<64xf32, 2>)
+        %d = air.execute [%p] { memref.dealloc %bb : memref<64xf32, 2> }
+        scf.yield %d : !air.async.token
+      }
+    }
+    return
+  }
+}

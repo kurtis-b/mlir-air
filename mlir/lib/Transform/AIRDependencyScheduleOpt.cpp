@@ -1158,7 +1158,14 @@ struct ConstructPingPongDependencyPattern
       // see never reaches this pattern: the labeling pass proves every use of
       // every duplicated buffer classifies as a read or a write before it
       // labels the loop, precisely so this rebuild cannot silently drop an
-      // edge (the measured 481/512-wrong multi-trip miscompile).
+      // edge (the measured 481/512-wrong multi-trip miscompile). A
+      // read-modify-write ('b') is bucketed as a CONSUMER: the reuse edge is
+      // what holds the next iteration's fill behind this half's readers, and
+      // the 'b' op's read is such a reader; its write is already ordered
+      // within the iteration by the async token graph air-dependency built.
+      // Bucketing it as a producer instead would present its write as the
+      // refill and leave its read on the far side of the very edge that
+      // exists to protect it.
       for (auto candidate_op : candidate_ops) {
         char rw = checkOpOperandReadOrWrite(buffer_memref, candidate_op);
         if (rw == 'w') {
@@ -1181,7 +1188,7 @@ struct ConstructPingPongDependencyPattern
           } else {
             push_back_if_unique<Operation *>(producer_ops, candidate_op);
           }
-        } else if (rw == 'r') {
+        } else if (rw == 'r' || rw == 'b') {
           if (auto candidate_for_op =
                   getOutermostForOpInForOpNest(candidate_op, for_op)) {
             push_back_if_unique<Operation *>(consumer_ops,
@@ -1738,7 +1745,10 @@ private:
 //   safe: the reuse edge exists to hold the next fill behind the buffer's
 //   readers, and once every use is classified an empty consumer set means
 //   provably no reader -- alloc-only scratch and fill-only staging rotate
-//   harmlessly.
+//   harmlessly. A read-modify-write use ('b': memref.atomic_rmw, a linalg
+//   op whose payload reads its init) counts as a read for this purpose and
+//   NOT as a refill -- its write depends on the buffer's prior contents,
+//   which is precisely the loop-carried dependence rotation breaks.
 //
 //   Skip -- the loop cannot be PROVEN safe to transform, but leaving it
 //   untransformed is correct. Warn and do not label:
@@ -1857,7 +1867,14 @@ static PingPongSafety provePingPongSafety(scf::ForOp forOp,
             continue;
           if (rw == 'w')
             producerOps[it->second].insert(op);
-          else if (rw == 'r')
+          // A read-modify-write ('b': memref.atomic_rmw, a linalg op whose
+          // payload reads its init) is a READER of the candidate buffer,
+          // and only a reader here: its write depends on the buffer's prior
+          // contents, so it proves no per-iteration refill -- counting it
+          // as a producer would let an accumulator vouch for itself and
+          // pass the buffer off as vacuously safe below, the exact bypass
+          // that hands a rotated stale half to the next iteration's read.
+          else if (rw == 'r' || rw == 'b')
             consumers[it->second]++;
         }
         return WalkResult::advance();
