@@ -1094,6 +1094,17 @@ struct HoistAIRHerdsToSharedRegionPattern
 private:
 };
 
+// H1 safety proof for the ping-pong transform, enforced at BOTH ends: the
+// labeling pattern proves it before labeling a loop, and
+// ConstructPingPongDependencyPattern re-proves it before mutating, so a loop
+// that arrives pre-labeled -- never having passed through
+// air-label-scf-for-to-ping-pong and its proof -- is held to the same
+// standard. Defined with the labeling pattern below.
+enum class PingPongSafety { Safe, Skip, Refuse };
+static PingPongSafety provePingPongSafety(scf::ForOp forOp,
+                                          ArrayRef<Operation *> allocs,
+                                          std::string &reason);
+
 struct ConstructPingPongDependencyPattern
     : public OpRewritePattern<scf::ForOp> {
   using OpRewritePattern<scf::ForOp>::OpRewritePattern;
@@ -1215,6 +1226,31 @@ struct ConstructPingPongDependencyPattern
             "ping-pong transform skipped: a buffer it would rotate is "
             "consumed but has no recognized producer, so the reuse edge "
             "protecting it cannot be built; leaving the loop untransformed");
+        return failure();
+      }
+    }
+    // The structural sets above are alias-blind and silently drop any use
+    // the classification cannot see, so on their own they still accept a
+    // recognized producer paired with an unclassified consumer (e.g. an
+    // unannotated func.call reading the duplicated buffer) -- the transform
+    // would then drop that reader from the rebuilt graph and overwrite the
+    // buffer half while it is still being read. Re-run the full alias-aware
+    // safety proof here, so a loop that arrives pre-labeled -- bypassing
+    // air-label-scf-for-to-ping-pong and its proof -- is held to the same
+    // standard: every use of every duplicated buffer classified, at least
+    // one recognized consumer, and a producer that provably refills each
+    // buffer every iteration.
+    {
+      SmallVector<Operation *> alloc_ops;
+      for (auto *exec : alloc_execs)
+        exec->walk([&](memref::AllocOp alloc) {
+          alloc_ops.push_back(alloc.getOperation());
+        });
+      std::string reason;
+      if (provePingPongSafety(for_op, alloc_ops, reason) !=
+          PingPongSafety::Safe) {
+        for_op->emitWarning("ping-pong transform skipped: ")
+            << reason << "; leaving the loop untransformed";
         return failure();
       }
     }
@@ -1674,6 +1710,225 @@ struct HoistOpsNotUsingPingPongPattern : public OpRewritePattern<scf::ForOp> {
 private:
 };
 
+// H1: prove the ping-pong transform safe for a candidate loop, or say
+// precisely why it cannot be. The transform duplicates the loop's candidate
+// allocs and REBUILDS the loop-carried dependency graph from what this
+// classification sees; any use it cannot see is silently dropped from that
+// graph, which is how a missing edge becomes wrong data rather than an
+// error. Two failure severities, because the two failure modes differ:
+//
+//   Refuse -- compiling would risk wrong data or the transform's rebuilt
+//   graph is provably missing an edge. Hard pass failure:
+//   - an unclassified ('u') use, by an op that may touch memory, of a
+//     memref the rotation does NOT privatize (defined outside the loop or
+//     not refilled per iteration): the access cannot be ordered against
+//     the rotation, and the data it sees carries across iterations. This
+//     is the hoisted-weight-DMA shape that measurably corrupts.
+//   - a duplicated buffer with NO recognized consumer: the reuse edge
+//     ordering the next fill behind its readers cannot be built, and the
+//     empty set used to become a dependency-free placeholder token -- the
+//     exact mechanism by which a missing edge was silent wrong data.
+//   - a duplicated buffer that is read but has no producer that provably
+//     refills it on EVERY iteration (a non-exhaustive conditional, a
+//     zero-trip or dynamic nested loop): an iteration would read a
+//     rotated stale half.
+//
+//   Skip -- the loop cannot be PROVEN safe to transform, but leaving it
+//   untransformed is correct. Warn and do not label:
+//   - an unclassified ('u') use of a candidate alloc itself, e.g. an
+//     external kernel call operand with no `llvm.readonly` /
+//     `llvm.writeonly` argument attribute. Read-versus-write is not
+//     established, so no dependency direction may be guessed; the loop
+//     simply keeps its original (correct) single-buffered schedule.
+//
+// A classified 'w' on a loop-external memref (e.g. a linalg accumulator)
+// stays legal -- the dependency machinery sees it -- and so does an
+// unclassified use by an op that provably touches no memory (memref.dim,
+// memref.cast: metadata only) -- it has no edge to lose.
+static PingPongSafety provePingPongSafety(scf::ForOp forOp,
+                                          ArrayRef<Operation *> allocs,
+                                          std::string &reason) {
+  llvm::raw_string_ostream os(reason);
+  llvm::DenseMap<Value, Operation *> aliasToAlloc;
+  for (auto *a : allocs) {
+    aliasToAlloc[a->getResult(0)] = a;
+    if (auto exec = a->getParentOfType<air::ExecuteOp>();
+        exec && exec->getNumResults() >= 2)
+      aliasToAlloc[exec->getResult(1)] = a;
+  }
+  // Extend the alias map through view-like ops and air.execute yields:
+  // compute routinely reads and writes a duplicated buffer through a
+  // memref.subview (the elementwise / causal-mask designs do exactly
+  // this), and without the alias those accesses are invisible, making a
+  // shipped, working loop look like it has no producer or consumer.
+  // Iterate to a fixpoint so a view of a view (or a view yielded out of
+  // an air.execute) resolves regardless of nesting order.
+  bool aliasChanged = true;
+  while (aliasChanged) {
+    aliasChanged = false;
+    auto addAlias = [&](Value from, Value to) {
+      auto it = aliasToAlloc.find(from);
+      if (it != aliasToAlloc.end() && !aliasToAlloc.count(to)) {
+        aliasToAlloc[to] = it->second;
+        aliasChanged = true;
+      }
+    };
+    forOp.getBody()->walk<WalkOrder::PreOrder>(
+        [&](Operation *op) -> WalkResult {
+          if (isa<air::HerdOp, air::SegmentOp, air::LaunchOp>(op))
+            return WalkResult::skip();
+          if (auto view = dyn_cast<ViewLikeOpInterface>(op))
+            addAlias(view.getViewSource(), view->getResult(0));
+          else if (auto exec = dyn_cast<air::ExecuteOp>(op)) {
+            Operation *term = exec.getRegion().front().getTerminator();
+            for (auto [idx, v] : llvm::enumerate(term->getOperands()))
+              if (idx + 1 < exec->getNumResults())
+                addAlias(v, exec->getResult(idx + 1));
+          }
+          return WalkResult::advance();
+        });
+  }
+  llvm::DenseMap<Operation *, int> consumers;
+  llvm::DenseMap<Operation *, llvm::SmallPtrSet<Operation *, 4>> producerOps;
+  // An unprovable candidate-alloc use downgrades the verdict to Skip, but
+  // the walk must keep going: a later operand of the same op may be a
+  // may-access to an UNPRIVATIZED memref, which is a hard Refuse and must
+  // win over the skip.
+  bool skip = false;
+  WalkResult wr = forOp.getBody()->walk<WalkOrder::PreOrder>(
+      [&](Operation *op) -> WalkResult {
+        if (isa<air::HerdOp, air::SegmentOp, air::LaunchOp>(op))
+          return WalkResult::skip();
+        // Terminators that merely forward a value out of a region
+        // (air.execute yielding its alloc, scf.yield) are plumbing, not
+        // memory accesses.
+        if (isa<air::ExecuteTerminatorOp, scf::YieldOp>(op))
+          return WalkResult::advance();
+        for (OpOperand &operand : op->getOpOperands()) {
+          if (!llvm::isa<BaseMemRefType>(operand.get().getType()))
+            continue;
+          auto it = aliasToAlloc.find(operand.get());
+          bool isCandidateAlloc = it != aliasToAlloc.end();
+          // Deallocs of candidate allocs are rebuilt by the transform, and a
+          // dealloc of a memref defined inside the body frees
+          // per-iteration-private memory -- neither can interact with this
+          // loop's rotation. The latter arises when this proof re-runs at
+          // transform time on an outer loop whose body holds an inner,
+          // already-transformed ping-pong loop: the inner loop's buffers are
+          // body-local here, not candidates.
+          if (isa<memref::DeallocOp>(op)) {
+            if (isCandidateAlloc)
+              continue;
+            Operation *def = operand.get().getDefiningOp();
+            if (def && forOp->isProperAncestor(def))
+              continue;
+          }
+          char rw = checkOpOperandReadOrWrite(operand);
+          if (rw == 'u') {
+            // A provably memory-effect-free use (memref.dim, memref.cast:
+            // metadata only) has no access to drop from the rebuilt
+            // graph, wherever its memref lives.
+            if (mlir::isMemoryEffectFree(op))
+              continue;
+            if (isCandidateAlloc) {
+              // Unprovable use of a buffer this loop would duplicate:
+              // refuse to LABEL, and leave the (correct) untransformed
+              // loop alone.
+              if (!skip)
+                os << "an operand of '" << op->getName().getStringRef()
+                   << "' cannot be classified as a read or a write of a "
+                      "buffer the transform would duplicate, so the "
+                      "rebuilt dependency graph would silently drop it";
+              skip = true;
+              continue;
+            }
+            reason.clear(); // a Refuse reason replaces any Skip reason
+            os << "'" << op->getName().getStringRef()
+               << "' may access a memref that is not privatized by this "
+                  "loop's ping-pong rotation (defined outside the loop or "
+                  "not refilled per iteration), and no callee argument "
+                  "attribute establishes the access as a read or a write";
+            return WalkResult::interrupt();
+          }
+          if (!isCandidateAlloc)
+            continue;
+          if (rw == 'w')
+            producerOps[it->second].insert(op);
+          else if (rw == 'r')
+            consumers[it->second]++;
+        }
+        return WalkResult::advance();
+      });
+  if (wr.wasInterrupted())
+    return PingPongSafety::Refuse;
+  // With an unclassified candidate use the producer/consumer sets below
+  // are incomplete, so the per-buffer requirements are unknowable; the
+  // skip verdict already covers the loop.
+  if (skip)
+    return PingPongSafety::Skip;
+  for (auto *a : allocs) {
+    // H1 requires at least one recognized consumer for every buffer the
+    // transform would duplicate: with an empty consumer set the reuse
+    // edge ordering the next fill behind the buffer's readers cannot be
+    // built, and the empty set is what used to be papered over with a
+    // dependency-free placeholder token -- the mechanism that turned a
+    // missing edge into silent wrong data.
+    if (consumers[a] == 0) {
+      os << "a buffer it would duplicate has no recognized consumer, so "
+            "the reuse edge protecting the buffer until its readers have "
+            "finished cannot be built";
+      return PingPongSafety::Refuse;
+    }
+    // A read of a buffer requires a producer that refills it on EVERY
+    // iteration, or the data carries across iterations and rotation hands
+    // the reader the wrong half. Control flow through the loop body
+    // definitely reaches a producer iff one sits directly in the body
+    // (air.execute wrappers are transparent), or BOTH branches of an
+    // affine.if/scf.if reach one -- then and else are exhaustive by
+    // construction, which is what proves the exhaustive
+    // air-specialize-dma-broadcast ladder; counting arms proved nothing,
+    // since two writes in one arm never cover the other arm -- or a
+    // nested loop with static trip count >= 1 reaches one. A zero-trip
+    // or dynamic-bound loop may never execute its body, so it proves
+    // nothing.
+    auto &prods = producerOps[a];
+    std::function<bool(Block &)> definitelyProduces = [&](Block &blk) -> bool {
+      for (Operation &o : blk) {
+        if (prods.contains(&o))
+          return true;
+        if (auto exec = dyn_cast<air::ExecuteOp>(&o)) {
+          if (definitelyProduces(exec.getRegion().front()))
+            return true;
+        } else if (auto aif = dyn_cast<affine::AffineIfOp>(&o)) {
+          if (aif.hasElse() && definitelyProduces(*aif.getThenBlock()) &&
+              definitelyProduces(*aif.getElseBlock()))
+            return true;
+        } else if (auto sif = dyn_cast<scf::IfOp>(&o)) {
+          if (sif.elseBlock() && definitelyProduces(*sif.thenBlock()) &&
+              definitelyProduces(*sif.elseBlock()))
+            return true;
+        } else if (auto sfo = dyn_cast<scf::ForOp>(&o)) {
+          auto tc = air::getStaticScfForTripCountAsInt(sfo);
+          if (tc && *tc >= 1 && definitelyProduces(*sfo.getBody()))
+            return true;
+        } else if (auto afo = dyn_cast<affine::AffineForOp>(&o)) {
+          auto tc = air::getStaticAffineForTripCountAsInt(afo);
+          if (tc && *tc >= 1 && definitelyProduces(*afo.getBody()))
+            return true;
+        }
+      }
+      return false;
+    };
+    if (!definitelyProduces(*forOp.getBody())) {
+      os << "a buffer it would duplicate is read but has no producer that "
+            "provably refills it on every iteration, so its data carries "
+            "across iterations and rotation would corrupt it";
+      return PingPongSafety::Refuse;
+    }
+  }
+  return PingPongSafety::Safe;
+}
+
 struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
   using OpRewritePattern<scf::ForOp>::OpRewritePattern;
 
@@ -1837,216 +2092,6 @@ struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
     return found;
   }
 
-  // H1: prove the ping-pong transform safe for a candidate loop, or say
-  // precisely why it cannot be. The transform duplicates the loop's candidate
-  // allocs and REBUILDS the loop-carried dependency graph from what this
-  // classification sees; any use it cannot see is silently dropped from that
-  // graph, which is how a missing edge becomes wrong data rather than an
-  // error. Two failure severities, because the two failure modes differ:
-  //
-  //   Refuse -- compiling would risk wrong data or the transform's rebuilt
-  //   graph is provably missing an edge. Hard pass failure:
-  //   - an unclassified ('u') use, by an op that may touch memory, of a
-  //     memref the rotation does NOT privatize (defined outside the loop or
-  //     not refilled per iteration): the access cannot be ordered against
-  //     the rotation, and the data it sees carries across iterations. This
-  //     is the hoisted-weight-DMA shape that measurably corrupts.
-  //   - a duplicated buffer with NO recognized consumer: the reuse edge
-  //     ordering the next fill behind its readers cannot be built, and the
-  //     empty set used to become a dependency-free placeholder token -- the
-  //     exact mechanism by which a missing edge was silent wrong data.
-  //   - a duplicated buffer that is read but has no producer that provably
-  //     refills it on EVERY iteration (a non-exhaustive conditional, a
-  //     zero-trip or dynamic nested loop): an iteration would read a
-  //     rotated stale half.
-  //
-  //   Skip -- the loop cannot be PROVEN safe to transform, but leaving it
-  //   untransformed is correct. Warn and do not label:
-  //   - an unclassified ('u') use of a candidate alloc itself, e.g. an
-  //     external kernel call operand with no `llvm.readonly` /
-  //     `llvm.writeonly` argument attribute. Read-versus-write is not
-  //     established, so no dependency direction may be guessed; the loop
-  //     simply keeps its original (correct) single-buffered schedule.
-  //
-  // A classified 'w' on a loop-external memref (e.g. a linalg accumulator)
-  // stays legal -- the dependency machinery sees it -- and so does an
-  // unclassified use by an op that provably touches no memory (memref.dim,
-  // memref.cast: metadata only) -- it has no edge to lose.
-  enum class Safety { Safe, Skip, Refuse };
-  static Safety provePingPongSafety(scf::ForOp forOp,
-                                    ArrayRef<Operation *> allocs,
-                                    std::string &reason) {
-    llvm::raw_string_ostream os(reason);
-    llvm::DenseMap<Value, Operation *> aliasToAlloc;
-    for (auto *a : allocs) {
-      aliasToAlloc[a->getResult(0)] = a;
-      if (auto exec = a->getParentOfType<air::ExecuteOp>();
-          exec && exec->getNumResults() >= 2)
-        aliasToAlloc[exec->getResult(1)] = a;
-    }
-    // Extend the alias map through view-like ops and air.execute yields:
-    // compute routinely reads and writes a duplicated buffer through a
-    // memref.subview (the elementwise / causal-mask designs do exactly
-    // this), and without the alias those accesses are invisible, making a
-    // shipped, working loop look like it has no producer or consumer.
-    // Iterate to a fixpoint so a view of a view (or a view yielded out of
-    // an air.execute) resolves regardless of nesting order.
-    bool aliasChanged = true;
-    while (aliasChanged) {
-      aliasChanged = false;
-      auto addAlias = [&](Value from, Value to) {
-        auto it = aliasToAlloc.find(from);
-        if (it != aliasToAlloc.end() && !aliasToAlloc.count(to)) {
-          aliasToAlloc[to] = it->second;
-          aliasChanged = true;
-        }
-      };
-      forOp.getBody()->walk<WalkOrder::PreOrder>(
-          [&](Operation *op) -> WalkResult {
-            if (isa<air::HerdOp, air::SegmentOp, air::LaunchOp>(op))
-              return WalkResult::skip();
-            if (auto view = dyn_cast<ViewLikeOpInterface>(op))
-              addAlias(view.getViewSource(), view->getResult(0));
-            else if (auto exec = dyn_cast<air::ExecuteOp>(op)) {
-              Operation *term = exec.getRegion().front().getTerminator();
-              for (auto [idx, v] : llvm::enumerate(term->getOperands()))
-                if (idx + 1 < exec->getNumResults())
-                  addAlias(v, exec->getResult(idx + 1));
-            }
-            return WalkResult::advance();
-          });
-    }
-    llvm::DenseMap<Operation *, int> consumers;
-    llvm::DenseMap<Operation *, llvm::SmallPtrSet<Operation *, 4>> producerOps;
-    // An unprovable candidate-alloc use downgrades the verdict to Skip, but
-    // the walk must keep going: a later operand of the same op may be a
-    // may-access to an UNPRIVATIZED memref, which is a hard Refuse and must
-    // win over the skip.
-    bool skip = false;
-    WalkResult wr = forOp.getBody()->walk<WalkOrder::PreOrder>(
-        [&](Operation *op) -> WalkResult {
-          if (isa<air::HerdOp, air::SegmentOp, air::LaunchOp>(op))
-            return WalkResult::skip();
-          // Terminators that merely forward a value out of a region
-          // (air.execute yielding its alloc, scf.yield) are plumbing, not
-          // memory accesses.
-          if (isa<air::ExecuteTerminatorOp, scf::YieldOp>(op))
-            return WalkResult::advance();
-          for (OpOperand &operand : op->getOpOperands()) {
-            if (!llvm::isa<BaseMemRefType>(operand.get().getType()))
-              continue;
-            auto it = aliasToAlloc.find(operand.get());
-            bool isCandidateAlloc = it != aliasToAlloc.end();
-            // Deallocs of candidate allocs are rebuilt by the transform.
-            if (isa<memref::DeallocOp>(op) && isCandidateAlloc)
-              continue;
-            char rw = checkOpOperandReadOrWrite(operand);
-            if (rw == 'u') {
-              // A provably memory-effect-free use (memref.dim, memref.cast:
-              // metadata only) has no access to drop from the rebuilt
-              // graph, wherever its memref lives.
-              if (mlir::isMemoryEffectFree(op))
-                continue;
-              if (isCandidateAlloc) {
-                // Unprovable use of a buffer this loop would duplicate:
-                // refuse to LABEL, and leave the (correct) untransformed
-                // loop alone.
-                if (!skip)
-                  os << "an operand of '" << op->getName().getStringRef()
-                     << "' cannot be classified as a read or a write of a "
-                        "buffer the transform would duplicate, so the "
-                        "rebuilt dependency graph would silently drop it";
-                skip = true;
-                continue;
-              }
-              reason.clear(); // a Refuse reason replaces any Skip reason
-              os << "'" << op->getName().getStringRef()
-                 << "' may access a memref that is not privatized by this "
-                    "loop's ping-pong rotation (defined outside the loop or "
-                    "not refilled per iteration), and no callee argument "
-                    "attribute establishes the access as a read or a write";
-              return WalkResult::interrupt();
-            }
-            if (!isCandidateAlloc)
-              continue;
-            if (rw == 'w')
-              producerOps[it->second].insert(op);
-            else if (rw == 'r')
-              consumers[it->second]++;
-          }
-          return WalkResult::advance();
-        });
-    if (wr.wasInterrupted())
-      return Safety::Refuse;
-    // With an unclassified candidate use the producer/consumer sets below
-    // are incomplete, so the per-buffer requirements are unknowable; the
-    // skip verdict already covers the loop.
-    if (skip)
-      return Safety::Skip;
-    for (auto *a : allocs) {
-      // H1 requires at least one recognized consumer for every buffer the
-      // transform would duplicate: with an empty consumer set the reuse
-      // edge ordering the next fill behind the buffer's readers cannot be
-      // built, and the empty set is what used to be papered over with a
-      // dependency-free placeholder token -- the mechanism that turned a
-      // missing edge into silent wrong data.
-      if (consumers[a] == 0) {
-        os << "a buffer it would duplicate has no recognized consumer, so "
-              "the reuse edge protecting the buffer until its readers have "
-              "finished cannot be built";
-        return Safety::Refuse;
-      }
-      // A read of a buffer requires a producer that refills it on EVERY
-      // iteration, or the data carries across iterations and rotation hands
-      // the reader the wrong half. Control flow through the loop body
-      // definitely reaches a producer iff one sits directly in the body
-      // (air.execute wrappers are transparent), or BOTH branches of an
-      // affine.if/scf.if reach one -- then and else are exhaustive by
-      // construction, which is what proves the exhaustive
-      // air-specialize-dma-broadcast ladder; counting arms proved nothing,
-      // since two writes in one arm never cover the other arm -- or a
-      // nested loop with static trip count >= 1 reaches one. A zero-trip
-      // or dynamic-bound loop may never execute its body, so it proves
-      // nothing.
-      auto &prods = producerOps[a];
-      std::function<bool(Block &)> definitelyProduces =
-          [&](Block &blk) -> bool {
-        for (Operation &o : blk) {
-          if (prods.contains(&o))
-            return true;
-          if (auto exec = dyn_cast<air::ExecuteOp>(&o)) {
-            if (definitelyProduces(exec.getRegion().front()))
-              return true;
-          } else if (auto aif = dyn_cast<affine::AffineIfOp>(&o)) {
-            if (aif.hasElse() && definitelyProduces(*aif.getThenBlock()) &&
-                definitelyProduces(*aif.getElseBlock()))
-              return true;
-          } else if (auto sif = dyn_cast<scf::IfOp>(&o)) {
-            if (sif.elseBlock() && definitelyProduces(*sif.thenBlock()) &&
-                definitelyProduces(*sif.elseBlock()))
-              return true;
-          } else if (auto sfo = dyn_cast<scf::ForOp>(&o)) {
-            auto tc = air::getStaticScfForTripCountAsInt(sfo);
-            if (tc && *tc >= 1 && definitelyProduces(*sfo.getBody()))
-              return true;
-          } else if (auto afo = dyn_cast<affine::AffineForOp>(&o)) {
-            auto tc = air::getStaticAffineForTripCountAsInt(afo);
-            if (tc && *tc >= 1 && definitelyProduces(*afo.getBody()))
-              return true;
-          }
-        }
-        return false;
-      };
-      if (!definitelyProduces(*forOp.getBody())) {
-        os << "a buffer it would duplicate is read but has no producer that "
-              "provably refills it on every iteration, so its data carries "
-              "across iterations and rotation would corrupt it";
-        return Safety::Refuse;
-      }
-    }
-    return Safety::Safe;
-  }
-
   LogicalResult matchAndRewrite(scf::ForOp for_op,
                                 PatternRewriter &rewriter) const override {
 
@@ -2071,7 +2116,7 @@ struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
     // Refuse, warning on Skip) are emitted once by the pass's pre-scan, which
     // runs the same proof; this pattern only has to agree with it silently.
     std::string reason;
-    if (provePingPongSafety(for_op, alloc_ops, reason) != Safety::Safe)
+    if (provePingPongSafety(for_op, alloc_ops, reason) != PingPongSafety::Safe)
       return failure();
 
     // Label the scf.for loop and all its child memref.allocs
@@ -4217,11 +4262,10 @@ public:
               forOp, clOmitMemorySpace))
         return;
       std::string reason;
-      switch (LabelScfForLoopForPingPongPattern::provePingPongSafety(
-          forOp, allocs, reason)) {
-      case LabelScfForLoopForPingPongPattern::Safety::Safe:
+      switch (provePingPongSafety(forOp, allocs, reason)) {
+      case PingPongSafety::Safe:
         break;
-      case LabelScfForLoopForPingPongPattern::Safety::Skip:
+      case PingPongSafety::Skip:
         forOp->emitWarning("is a ping-pong candidate that cannot be proven "
                            "safe to transform: ")
             << reason
@@ -4230,7 +4274,7 @@ public:
                "llvm.writeonly to enable it, or attach air.disable_ping_pong "
                "to the loop to silence this warning.";
         break;
-      case LabelScfForLoopForPingPongPattern::Safety::Refuse:
+      case PingPongSafety::Refuse:
         forOp->emitOpError("is a ping-pong candidate that cannot be proven "
                            "safe to transform: ")
             << reason
@@ -4566,6 +4610,14 @@ public:
         return false;
     }
     if (!put || !put.getAsyncToken())
+      return false;
+    // The put must chain from the loop's iter token. Fusion threads the
+    // per-iteration order by remapping each source loop's iter arg to the
+    // previous put's token; a put that does not consume the iter arg would
+    // clone in unchained, keeping the whole-channel packet order this pass
+    // exists to prevent.
+    if (!llvm::is_contained(put.getAsyncDependencies(),
+                            forOp.getRegionIterArgs()[0]))
       return false;
     auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
     if (yield.getNumOperands() != 1 ||

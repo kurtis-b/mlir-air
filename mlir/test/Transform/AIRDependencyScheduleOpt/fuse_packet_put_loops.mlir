@@ -171,3 +171,42 @@ module {
     return
   }
 }
+
+// -----
+
+// A put that does not chain from the loop's iter token cannot be
+// order-threaded by fusion: remapping the (unused) iter arg to the previous
+// put's token would add nothing, leaving the fused puts unchained and the
+// packet order whole-channel. Such a loop is not the shape
+// air-dma-to-channel emits and is not a candidate: nothing fuses.
+// CHECK-LABEL: @unchained_put_not_fused
+// CHECK: scf.for
+// CHECK: @pk6
+// CHECK: scf.for
+// CHECK: @pk7
+module {
+  air.channel @pk6 [1, 1] {channel_type = "npu_dma_packet"}
+  air.channel @pk7 [1, 1] {channel_type = "npu_dma_packet"}
+  func.func @unchained_put_not_fused(%arg0: memref<8x64xbf16>, %arg1: memref<8x64xbf16>) {
+    %c1 = arith.constant 1 : index
+    %0 = air.launch async (%lx) in (%sx=%c1) args(%a=%arg0, %b=%arg1) : memref<8x64xbf16>, memref<8x64xbf16> {
+      %c0 = arith.constant 0 : index
+      %c1_l = arith.constant 1 : index
+      %c4 = arith.constant 4 : index
+      %c8 = arith.constant 8 : index
+      %c64 = arith.constant 64 : index
+      %t0 = air.wait_all async
+      %l0 = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %t0) -> (!air.async.token) {
+        %p = air.channel.put async [%t] @pk6[] (%a[%i, %c0] [%c4, %c64] [%c64, %c1_l]) : (memref<8x64xbf16>)
+        scf.yield %p : !air.async.token
+      }
+      %t1 = air.wait_all async
+      %l1 = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %t1) -> (!air.async.token) {
+        %p = air.channel.put async [%t1] @pk7[] (%b[%i, %c0] [%c4, %c64] [%c64, %c1_l]) : (memref<8x64xbf16>)
+        scf.yield %p : !air.async.token
+      }
+      %done = air.wait_all async [%l0, %l1]
+    }
+    return
+  }
+}
