@@ -1101,7 +1101,7 @@ private:
 // that arrives pre-labeled -- never having passed through
 // air-label-scf-for-to-ping-pong and its proof -- is held to the same
 // standard. Defined with the labeling pattern below.
-enum class PingPongSafety { Safe, Skip, Refuse };
+enum class PingPongSafety { Safe, Skip };
 static PingPongSafety provePingPongSafety(scf::ForOp forOp,
                                           ArrayRef<Operation *> allocs,
                                           std::string &reason);
@@ -1734,29 +1734,41 @@ private:
 // hardware tests, and refusing on unprivatized memrefs whose data carries
 // across iterations failed 3 of 10 shipped LLM deployments (llama32_1b_int4,
 // qwen3_0_6b, qwen3_1_7b) that read a loop-invariant buffer through an
-// external call. Two failure severities remain, because the two failure
-// modes differ:
+// external call. A third draft drew the SEVERITY wrong: it aborted
+// compilation when the proof failed, which the prior art it cites never
+// does -- upstream memref::multiBuffer returns failure() to DECLINE THE
+// TRANSFORM and leave the code alone, and IREE, Triton and TVM likewise
+// bail out of the transformation, not the build. Refusing to compile broke
+// the same three shipped deployments on programs that were always correct.
+// So short of Safe there is exactly one verdict:
 //
-//   Refuse -- compiling would risk wrong data: a duplicated buffer is read
-//   but has no producer that provably refills it on EVERY iteration (a
-//   non-exhaustive conditional, a zero-trip or dynamic nested loop), so an
-//   iteration would read a rotated stale half. Hard pass failure. A buffer
-//   with NO recognized consumer is the opposite case and is vacuously
-//   safe: the reuse edge exists to hold the next fill behind the buffer's
-//   readers, and once every use is classified an empty consumer set means
-//   provably no reader -- alloc-only scratch and fill-only staging rotate
-//   harmlessly. A read-modify-write use ('b': memref.atomic_rmw, a linalg
-//   op whose payload reads its init) counts as a read for this purpose and
-//   NOT as a refill -- its write depends on the buffer's prior contents,
-//   which is precisely the loop-carried dependence rotation breaks.
-//
-//   Skip -- the loop cannot be PROVEN safe to transform, but leaving it
-//   untransformed is correct. Warn and do not label:
+//   Skip -- the loop cannot be PROVEN safe to transform, and leaving it
+//   untransformed is correct: it keeps its original single-buffered
+//   schedule and only the optimization is lost. Warn and do not label.
+//   Two reasons produce it:
 //   - an unclassified ('u') use of a candidate alloc itself, e.g. an
 //     external kernel call operand with no `llvm.readonly` /
 //     `llvm.writeonly` argument attribute. Read-versus-write is not
-//     established, so no dependency direction may be guessed; the loop
-//     simply keeps its original (correct) single-buffered schedule.
+//     established, so no dependency direction may be guessed.
+//   - a candidate alloc that is read but has no producer that provably
+//     refills it on EVERY iteration (a non-exhaustive conditional, a
+//     zero-trip or dynamic nested loop): its data carries across
+//     iterations, so rotation would hand a reader a stale half. A
+//     read-modify-write use ('b': memref.atomic_rmw, a linalg op whose
+//     payload reads its init) counts as a read for this purpose and NOT
+//     as a refill -- its write depends on the buffer's prior contents,
+//     which is precisely the loop-carried dependence rotation breaks.
+//
+//   A buffer with NO recognized consumer is vacuously safe: the reuse
+//   edge exists to hold the next fill behind the buffer's readers, and
+//   once every use is classified an empty consumer set means provably no
+//   reader -- alloc-only scratch and fill-only staging rotate harmlessly.
+//
+// Skipping means NOT TRANSFORMING AT ALL. The dependency-free WaitAllOp
+// placeholder for an empty edge set stays forbidden: transforming around
+// a missing edge is the measured 481/512-wrong miscompile this proof
+// exists to prevent, and it -- not the diagnostic's severity -- was
+// always the real defect.
 //
 // A classified 'w' on a loop-external memref (e.g. a linalg accumulator)
 // stays legal -- the dependency machinery sees it -- and so does an
@@ -1855,7 +1867,7 @@ static PingPongSafety provePingPongSafety(scf::ForOp forOp,
     // recirculating the buffer through iter_args, a call returning a
     // memref) makes every access through the derived value unattributable
     // -- a reader would silently vanish and the buffer be declared
-    // vacuously safe below. Refuse to label such loops.
+    // vacuously safe below. Such loops are skipped, never labeled.
     if (!isa<ViewLikeOpInterface, air::ExecuteOp>(op)) {
       bool forwardsCandidate =
           llvm::any_of(op->getOperands(),
@@ -1924,9 +1936,9 @@ static PingPongSafety provePingPongSafety(scf::ForOp forOp,
         // see the proof's header comment.
         if (!isCandidateAlloc)
           continue;
-        // Unprovable use of a buffer this loop would duplicate:
-        // refuse to LABEL, and leave the (correct) untransformed
-        // loop alone.
+        // Unprovable use of a buffer this loop would duplicate: do
+        // not label, and leave the (correct) untransformed loop
+        // alone.
         if (!skip)
           os << "an operand of '" << op->getName().getStringRef()
              << "' cannot be classified as a read or a write of a "
@@ -2028,7 +2040,7 @@ static PingPongSafety provePingPongSafety(scf::ForOp forOp,
       os << "a buffer it would duplicate is read but has no producer that "
             "provably refills it on every iteration, so its data carries "
             "across iterations and rotation would corrupt it";
-      return PingPongSafety::Refuse;
+      return PingPongSafety::Skip;
     }
   }
   return PingPongSafety::Safe;
@@ -2217,9 +2229,9 @@ struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
     if (hasLabelableNestedFor(for_op, omitMemorySpace))
       return failure();
 
-    // Only PROVEN-safe loops are labeled. The diagnostics (hard error on
-    // Refuse, warning on Skip) are emitted once by the pass's pre-scan, which
-    // runs the same proof; this pattern only has to agree with it silently.
+    // Only PROVEN-safe loops are labeled. The warning naming an unprovable
+    // loop is emitted once by the pass's pre-scan, which runs the same
+    // proof; this pattern only has to agree with it silently.
     std::string reason;
     if (provePingPongSafety(for_op, alloc_ops, reason) != PingPongSafety::Safe)
       return failure();
@@ -4347,18 +4359,15 @@ public:
     // H1: never hand the ping-pong transform a loop that cannot be PROVEN
     // safe. Labeling it anyway reproduces a measured silent miscompile
     // (481-497 of 512 elements wrong at two trips); every comparable
-    // compiler (memref::multiBuffer, Triton, TVM) bails rather than guesses
-    // here. Two severities, decided by the proof, both scoped to the
-    // buffers the rotation would actually duplicate: Refuse means compiling
-    // would risk wrong data (a duplicated buffer is read but cannot be
-    // proven refilled every iteration) and is a hard pass failure; Skip
-    // means the loop is correct as written but unprovable (e.g. an external
-    // call with unannotated memref operands), so it is left untransformed
-    // with a warning saying why. Opting out explicitly --
+    // compiler (memref::multiBuffer, IREE, Triton, TVM) declines the
+    // TRANSFORM here -- none aborts the build, and neither does this pass:
+    // an unprovable loop keeps its original single-buffered schedule, which
+    // is correct, and only the optimization is lost. The proof is scoped to
+    // the buffers the rotation would actually duplicate, and its warning
+    // names the loop and says why it was skipped. Opting out explicitly --
     // air.disable_ping_pong on the loop, or aircc
     // --omit-ping-pong-transform -- remains available and is honored before
     // this check.
-    bool anyRefusal = false;
     module.walk([&](scf::ForOp forOp) {
       SmallVector<Operation *> allocs;
       if (!LabelScfForLoopForPingPongPattern::isPingPongCandidate(
@@ -4368,10 +4377,7 @@ public:
               forOp, clOmitMemorySpace))
         return;
       std::string reason;
-      switch (provePingPongSafety(forOp, allocs, reason)) {
-      case PingPongSafety::Safe:
-        break;
-      case PingPongSafety::Skip:
+      if (provePingPongSafety(forOp, allocs, reason) != PingPongSafety::Safe) {
         forOp->emitWarning("is a ping-pong candidate that cannot be proven "
                            "safe to transform: ")
             << reason
@@ -4379,22 +4385,8 @@ public:
                "external callee's memref arguments with llvm.readonly or "
                "llvm.writeonly to enable it, or attach air.disable_ping_pong "
                "to the loop to silence this warning.";
-        break;
-      case PingPongSafety::Refuse:
-        forOp->emitOpError("is a ping-pong candidate that cannot be proven "
-                           "safe to transform: ")
-            << reason
-            << ". Refusing to compile rather than risk silent wrong data; "
-               "annotate the loop with air.disable_ping_pong or compile with "
-               "--omit-ping-pong-transform to skip ping-pong buffering here.";
-        anyRefusal = true;
-        break;
       }
     });
-    if (anyRefusal) {
-      signalPassFailure();
-      return;
-    }
     SmallVector<func::FuncOp, 4> funcOps;
     module.walk([&](func::FuncOp op) { funcOps.push_back(op); });
     for (auto f : funcOps)
