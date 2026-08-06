@@ -114,6 +114,58 @@ The driver then runs two hardware checks you cannot influence, from a fixture it
 Both fixtures run at `cols=64, rows=8, rows_per_call=4` — the exact point
 `builders/addnorm.py` measured the miscompile at.
 
+## `[2026-08-06]` Attempt 1: the root cause was different, and the refusal is too strong
+
+Two things came out of the first attempt. Both are recorded here rather than left in a session log,
+because the second is what the next attempt has to fix.
+
+**The root cause in [16](16-compiler-work-and-remaining-essence.md) and above is wrong.** Measured
+on hardware: compiling the fixture's `inside` variant with `--omit-ping-pong-transform=all`
+produces the **identical 481/512 corruption**. Ping-pong is therefore not the cause. The actual
+defect is launch-side per-channel put-loop grouping against the tile ring's per-iteration order
+under packet multiplexing, fixed by a new `air-fuse-packet-put-loops` pass plus modelling
+packet-typed channels as one shared stream resource so the token chain survives pruning. H1 and H2
+as specified were **necessary for the `hoisted` refusal but insufficient for `inside` correctness**.
+The session reported this rather than quietly editing the plan, which is the behaviour asked for.
+
+**And H1's refusal is far too strong.** Gate leg 3 failed with **8 of 24 tests failing** — every
+GEMM-bearing operator and all four execution modes:
+
+```
+run_npu2_qkv_proj_peano   run_npu2_ffn_peano      run_npu2_block_peano    run_npu2_coarse_peano
+run_npu2_offload_peano    run_npu2_runlist_peano  run_npu2_fused_peano    run_npu2_runlist_gate
+```
+
+each on the same diagnostic:
+
+> `'scf.for' op is a ping-pong candidate that cannot be proven safe to transform: 'func.call' may
+> access a memref that is not privatized by this loop's ping-pong rotation (defined outside the loop
+> or not refilled per iteration), and no callee argument attribute establishes the access as a read
+> or a write.`
+
+These are designs that **work today**. Codex review round 1 raised exactly this ("the proof
+hard-fails on unclassifiable uses of unrelated memrefs") and the fix rounds did not close it.
+`check-air-mlir` stayed green, so AIR's own tests do not cover the case — only the real examples do.
+
+**What the next attempt must change.** The refusal has to be scoped to the memrefs the rotation
+actually endangers:
+
+- Refuse only when an unclassifiable (`'u'`) or may-read-write (`'b'`) use lands on **a memref this
+  loop's rotation privatizes** — one of the duplicated allocs. A call touching any *other* memref,
+  including one defined outside the loop, is none of this transform's business and must not block it.
+- A `'b'` use on a rotated buffer is only unsafe if the buffer is *read* without a per-iteration
+  producer. Write-only and alloc-only buffers stay vacuously safe, as attempt 1 already had it.
+- Keep the diagnostic's shape — naming the loop and pointing at `air.disable_ping_pong` and
+  `--omit-ping-pong-transform` is good. It is the trigger that is wrong, not the message.
+
+The whole point of H1 is to stop *silent wrong data*. Refusing to compile programs that are already
+correct trades one failure mode for a worse one, and the ten-model leg — which never ran — would
+have been the more expensive place to discover it.
+
+**Do not** satisfy this by weakening the fixture, by adding `air.disable_ping_pong` to the example
+builders, or by narrowing the refusal until it never fires. `--variant hoisted` must still be
+refused; that clause is what proves the transform still discriminates.
+
 ## Risks
 
 - **The gate is the widest in the plan.** A compiler regression surfaces as ten `make verify` runs
