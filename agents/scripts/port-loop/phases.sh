@@ -17,7 +17,7 @@
 # change. Anything outside it trips the tamper check and halts the run. Widen it deliberately,
 # never reflexively.
 
-PL_PHASES_IN_SCOPE='["E1","E2","E3","E4","E5"]'
+PL_PHASES_IN_SCOPE='["H"]'
 
 phase_name() {
   case "$1" in
@@ -34,6 +34,7 @@ phase_name() {
     E3) echo "Execution strategies: offload" ;;
     E4) echo "Execution strategies: runlist" ;;
     E5) echo "Execution strategies: fused + the distinguishability gate" ;;
+    H) echo "Compiler hardening: ping-pong bail-out, call classifier, attribute verifier" ;;
     *) echo "unknown" ;;
   esac
 }
@@ -53,6 +54,7 @@ phase_doc() {
     E3) echo "docs/plans/transformer-layer-execution-studies/08c-phase-e3-offload.md" ;;
     E4) echo "docs/plans/transformer-layer-execution-studies/08d-phase-e4-runlist.md" ;;
     E5) echo "docs/plans/transformer-layer-execution-studies/08e-phase-e5-fused-and-distinguishability.md" ;;
+    H) echo "docs/plans/transformer-layer-execution-studies/17-phase-h-compiler-hardening.md" ;;
     *) echo "" ;;
   esac
 }
@@ -82,6 +84,7 @@ phase_needs_hardware() {
     C1|C2|C3|C4) echo "yes" ;;
     D1|D2) echo "yes" ;;
     E1|E2|E3|E4|E5) echo "yes" ;;
+    H) echo "yes" ;;
     *) echo "no" ;;
   esac
 }
@@ -335,6 +338,11 @@ phase_gate_allowlist() {
     # agents/scripts/port-loop/. A session that edits an objective check or a gate script halts the
     # run, which is the point.
     E1|E2|E3|E4|E5) echo '^programming_examples/transformer_layer/' ;;
+    # H changes mlir/ -- the compiler. NONE of that is a gate file, so the allowlist stays
+    # empty-but-for-nothing: H is not expected to touch any .lit, Makefile, CMakeLists,
+    # registry JSON or verify module at all. An empty allowlist means every gate-file change is
+    # unauthorized, which is the correct posture for a phase whose subject is the compiler.
+    H) echo '' ;;
     *) echo '' ;;
   esac
 }
@@ -348,6 +356,7 @@ phase_gate_cmd() {
     D1|D2) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
     # E1 alone changes shared infrastructure, so E1 alone carries the ten-model leg.
     E1) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-e1.sh" ;;
+    H) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-h.sh" ;;
     E2|E3|E4|E5) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
     *) echo "false" ;;
   esac
@@ -1286,6 +1295,55 @@ phase_e5_objective_check() {
   return 0
 }
 
+# --- Phase H -----------------------------------------------------------------------------------
+#
+# H's claim is about the COMPILER, so its evidence must not come from code the phase authored. Both
+# clauses run a fixture the DRIVER owns -- agents/scripts/port-loop/fixtures/addnorm_multitrip.py,
+# which guard_gate_files() fingerprints and no allowlist covers, so editing it halts the run.
+#
+# The two clauses are deliberately opposed, and a fix that satisfies only one is not a fix:
+#
+#   inside   a legitimate two-trip loop must now be CORRECT. Proves the classifier learned to see
+#            the external kernel call (H2). Today this silently produces 481-497/512 wrong.
+#   hoisted  a loop whose weight buffer carries data across iterations must be REFUSED with a
+#            diagnostic. Proves the pass still discriminates (H1). Producing any answer here --
+#            right or wrong -- fails the phase, which is what stops "disable ping-pong globally"
+#            from passing: that would make `inside` correct and `hoisted` silently correct too.
+phase_h_objective_check() {
+  local fixture="${PL_LIB}/fixtures/addnorm_multitrip.py"
+  if [ ! -f "${fixture}" ]; then
+    log_error "objective check: ${fixture} is missing — this is a harness bug, not a task"
+    return 1
+  fi
+
+  log_info "objective check: a legitimate two-trip loop must be correct"
+  if ! ( cd "${PL_ROOT}/programming_examples/transformer_layer" \
+         && flock -x -w 1800 /tmp/mlir-air-npu.lock \
+              python3 "${fixture}" --variant inside ); then
+    log_error "objective check FAILED: the legitimate multi-trip loop is still not correct."
+    log_error "  H2 (teaching checkOpOperandReadOrWrite about llvm.emit_c_interface callees) is"
+    log_error "  what makes this pass; without it the one-trip rule stands and coarse keeps its"
+    log_error "  64 dispatches per normalization point."
+    return 1
+  fi
+  log_info "  correct: the multi-trip loop the shipped builder forbids now computes cleanly"
+
+  log_info "objective check: an unprovable loop must be REFUSED, not answered"
+  if ( cd "${PL_ROOT}/programming_examples/transformer_layer" \
+       && flock -x -w 1800 /tmp/mlir-air-npu.lock \
+            python3 "${fixture}" --variant hoisted ); then
+    log_info "  refused: the compiler declined a program it cannot prove safe"
+  else
+    log_error "objective check FAILED: the compiler accepted a loop whose buffer carries data"
+    log_error "  across iterations. A bail-out with a diagnostic is the minimum this phase owes;"
+    log_error "  silence is exactly the defect it exists to remove."
+    return 1
+  fi
+
+  log_info "objective check passed: multi-trip is correct AND unprovable cases are refused"
+  return 0
+}
+
 phase_objective_check() {
   case "$1" in
     A) phase_a_objective_check ;;
@@ -1301,6 +1359,7 @@ phase_objective_check() {
     E3) phase_e3_objective_check ;;
     E4) phase_e4_objective_check ;;
     E5) phase_e5_objective_check ;;
+    H) phase_h_objective_check ;;
     *) return 0 ;;
   esac
 }

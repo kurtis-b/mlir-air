@@ -558,6 +558,13 @@ cmd_run_one() {
       # environment reason while the check reports a substantive one. Source it here so a manual
       # invocation behaves like the real thing.
       pl_env_ensure || return 1
+      # And XRT, for the same reason one step further out. Phase H's objective check DISPATCHES --
+      # it runs a fixture on the NPU -- and without this it fails with "XRT runtime (pyxrt) is not
+      # available" while the driver reports the substantive failure it was looking for. In a real
+      # run pl_preflight sources XRT for any needs_hardware phase; standalone it does not.
+      if [ "$(phase_needs_hardware "${phase}")" = "yes" ]; then
+        pl_env_ensure_xrt || return 1
+      fi
       phase_objective_check "${phase}" ;;
     hardware-check)
       # Standalone so the assertion can be exercised against a gate log in both directions before
