@@ -303,6 +303,49 @@ Each sub-phase adds one clause of its own:
                   inequality holds.
 EOF
 ;;
+    H) cat <<'EOF'
+flock -x -w 1800 /tmp/mlir-air-npu.lock  agents/scripts/port-loop/gate-h.sh
+
+FOUR LEGS, cheapest first, so a cheap failure stops before an expensive one:
+
+  1. ninja -C build-xrt, then ninja -C build-xrt INSTALL. The install is not optional and it is
+     the easy thing to get wrong: the examples resolve aircc and air-opt from install-xrt (see
+     utils/env_setup.sh and lib-env.sh), so a pass you edit and merely BUILD leaves every later
+     leg testing the previous compiler while the gate goes green.
+  2. check-air-mlir -- the compiler's own lit suite. A broken pass shows up here in seconds
+     rather than an hour into leg 4. Run it yourself before you think you are done.
+  3. The transformer-layer suite on real hardware.
+  4. make verify across the ten shipped LLM deployments. A change to mlir/ reaches every one of
+     them through aircc; this is the widest gate in the plan and the one that catches what matters.
+
+The driver then runs two OPPOSED clauses from a fixture it owns --
+agents/scripts/port-loop/fixtures/addnorm_multitrip.py -- which guard_gate_files() fingerprints
+and no allowlist covers, so a session that edits it to make the check easier halts the run. Both
+run at cols=64, rows=8, rows_per_call=4: the exact point builders/addnorm.py measured the
+miscompile at, two trips of the row loop.
+
+  --variant inside    A LEGITIMATE two-trip loop: every L1 buffer is refilled each iteration.
+                      It must compile and produce ZERO mismatches. Today it silently produces
+                      481 of 512 elements wrong. This is H2's proof -- the classifier learning
+                      to see the external kernel func.call.
+
+  --variant hoisted   The weight DMA lifted OUT of the loop, so l1_w carries data across
+                      iterations and rotating it is genuinely unsound. The compiler must REFUSE
+                      it with a diagnostic. Producing any answer -- right or wrong -- fails the
+                      phase. This is H1's proof.
+
+Why both: satisfying only the first is exactly what "disable ping-pong globally" would achieve,
+and that would make the second silently correct too. Requiring a REFUSAL rather than a right
+answer is what makes that shortcut fail. And disabling ping-pong globally is measurably wrong
+anyway -- it regressed a shipped model 12.4 -> 7.8 tok/s, recorded in
+llms/shared/infra/backend_presets.py.
+
+Your gate-file allowlist is EMPTY, deliberately. This phase's subject is the compiler; it is not
+expected to touch any .lit, Makefile, CMakeLists.txt, kernel_registry JSON or llms/verify module.
+Any change to one of those is unauthorized and halts the run. The same applies to anything under
+agents/scripts/port-loop/ -- including the fixture and this gate script.
+EOF
+;;
     *) cat <<'EOF'
 ERROR: no gate description is declared for this phase in agents/scripts/port-loop/phases.sh.
 This is a harness bug, not a task. Stop and report it as a blocker.

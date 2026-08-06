@@ -602,6 +602,21 @@ cmd_dry_run() {
     echo "  hardware:  $(phase_needs_hardware "${phase}")"
     echo "  gate:      $(phase_gate_cmd "${phase}")"
     echo "  allowlist: $(phase_gate_allowlist "${phase}")"
+    # Every OTHER mis-declared arm is visible above. The gate DESCRIPTION was not, and Phase H
+    # proved it matters: six of the seven dispatchers had an H arm, phase_gate_description did
+    # not, and dry-run rendered a clean-looking phase. The session then burned an invocation
+    # correctly reporting the ERROR default as a blocker -- which is the fail-closed design
+    # working, but a minute of dry-run should have caught it first.
+    local _desc; _desc="$(phase_gate_description "${phase}" | head -1)"
+    if printf '%s' "${_desc}" | grep -q '^ERROR:'; then
+      echo "  gate-desc: *** MISSING — phase_gate_description has no ${phase} arm ***"
+      echo "             A session would be told its gate is a harness bug and would halt."
+    else
+      echo "  gate-desc: ${_desc}"
+    fi
+    local _name; _name="$(phase_name "${phase}")"
+    [ "${_name}" = "unknown" ] && echo "  *** phase_name has no ${phase} arm ***"
+    [ -n "$(phase_doc "${phase}")" ] || echo "  *** phase_doc has no ${phase} arm ***"
     echo "  steps:     preflight -> implement -> commit"
     local r
     for r in $(seq 1 "${PL_REVIEW_ROUNDS}"); do echo "             -> review${r} -> fix${r} -> commit"; done
