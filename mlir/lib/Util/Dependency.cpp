@@ -3209,12 +3209,6 @@ char dependencyTracer::checkOperandReadOrWrite(mlir::Value operand) {
       foundWriteAccess = true;
     else if (rw_code == 'r')
       foundReadAccess = true;
-    // May-read-and-write (external kernel call operand with no refining
-    // argument attribute).
-    else if (rw_code == 'b') {
-      foundWriteAccess = true;
-      foundReadAccess = true;
-    }
     // If unknown op, then assume write access for safety
     else if (rw_code == 'u')
       foundWriteAccess = true;

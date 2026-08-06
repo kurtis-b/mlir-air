@@ -197,11 +197,12 @@ struct LinalgTransforms {
   static const StringLiteral kLinalgTransformMarker;
 };
 
-// Classify an operand's access: 'r' read, 'w' write, 'b' may-read-and-write
-// (an external kernel func.call operand with no refining argument attribute),
-// 'u' unknown, 'e' not an operand of the op. Callers must treat 'b' as BOTH a
-// read and a write; treating it as neither reproduces the silent missing-edge
-// miscompile this code exists to prevent.
+// Classify an operand's access: 'r' read, 'w' write, 'u' unknown, 'e' not an
+// operand of the op. A func.call to an `llvm.emit_c_interface` callee
+// classifies memref operands from the callee's argument attributes
+// (`llvm.readonly` -> 'r', `llvm.writeonly` -> 'w'); an unannotated memref
+// operand stays 'u' -- read-versus-write is not established, and callers must
+// treat the access as one they cannot order rather than guess a direction.
 char checkOpOperandReadOrWrite(mlir::OpOperand &op_operand);
 char checkOpOperandReadOrWrite(Value op_operand, Operation *owner);
 

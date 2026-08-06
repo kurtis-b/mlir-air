@@ -1057,14 +1057,20 @@ Phase H hardened the compiler against the miscompile behind
   `CanonicalizeAsyncOpDeps` models packet channels as one shared stream
   resource so the ordering chain survives pruning.
 - **`func.call` is now visible to dependency analysis.** A callee with
-  `llvm.emit_c_interface` classifies operands from its argument attributes
-  (`llvm.readonly`/`llvm.writeonly`); an unannotated memref operand is 'b'
-  (may read AND write). Builders can attach arg attrs for precise edges.
-- **Unprovable ping-pong candidates now REFUSE to compile** (e.g. an external
-  call reading a buffer not refilled per iteration -- weight DMA hoisted out
-  of the loop). Opt-outs: `air.disable_ping_pong` on the loop, or
-  `--omit-ping-pong-transform`. Both attributes are now validated by the AIR
-  dialect verifier after every pass.
+  `llvm.emit_c_interface` classifies memref operands from its argument
+  attributes (`llvm.readonly`/`llvm.writeonly`). An unannotated memref
+  operand stays unknown: read-versus-write is not established, and the
+  compiler never guesses a direction. Builders that want ping-pong across an
+  external call must annotate the callee's arguments.
+- **Unprovable ping-pong candidates are never transformed.** A candidate
+  whose own per-iteration buffers have an unclassifiable use (e.g. an
+  unannotated external call) is left untransformed with a warning: correct,
+  just single-buffered. A candidate the transform would provably corrupt
+  REFUSES to compile: an external call that may access a buffer NOT refilled
+  per iteration (weight DMA hoisted out of the loop), or a duplicated buffer
+  with no recognized consumer or no per-iteration producer. Opt-outs:
+  `air.disable_ping_pong` on the loop, or `--omit-ping-pong-transform`. Both
+  attributes are now validated by the AIR dialect verifier after every pass.
 
 Footgun: the two-trip fixture shape fully UNROLLS under ping-pong labeling
 (trip count == unroll factor), so `air-ping-pong-transform`'s dependency

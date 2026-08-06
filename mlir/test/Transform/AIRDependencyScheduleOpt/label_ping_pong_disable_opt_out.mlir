@@ -28,6 +28,7 @@
 
 module {
   air.channel @load_chan [1]
+  air.channel @drain_chan [1]
   func.func @opt_out_rejects(%arg0: memref<256x1024xbf16>) {
     %c1 = arith.constant 1 : index
     %0 = air.launch async (%arg4) in (%arg6=%c1) attributes {id = 1 : i32} {
@@ -85,7 +86,8 @@ module {
               air.execute_terminator %alloc_a : memref<32x32xbf16, 2>
             }
             %fill = air.channel.get async [%async_token_a] @load_chan[] (%results_a[] [] []) : (memref<32x32xbf16, 2>)
-            %async_token_d = air.execute [%fill] {
+            %drain = air.channel.put async [%fill] @drain_chan[] (%results_a[] [] []) : (memref<32x32xbf16, 2>)
+            %async_token_d = air.execute [%drain] {
               memref.dealloc %results_a : memref<32x32xbf16, 2>
             }
             scf.yield %async_token_d : !air.async.token

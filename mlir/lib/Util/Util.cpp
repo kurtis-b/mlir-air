@@ -1190,9 +1190,11 @@ char air::checkOpOperandReadOrWrite(mlir::OpOperand &op_operand) {
   // reading it. Only callees carrying `llvm.emit_c_interface` (the marker
   // every AIR external kernel declaration carries) are classified; other
   // calls stay 'u'. Per-operand refinement comes from the callee's argument
-  // attributes; an unannotated memref operand is conservatively 'b' (may
-  // read AND may write). Callers that cannot act on 'b' treat it exactly as
-  // they treated 'u', so this widens no existing decision by accident.
+  // attributes (`llvm.readonly` / `llvm.writeonly`); for an unannotated
+  // memref operand read-versus-write is NOT established and the answer is
+  // 'u', never a guess -- the ping-pong safety proof then refuses to
+  // transform the loop rather than rebuild a dependency graph around an
+  // access it cannot see.
   else if (auto call = dyn_cast_if_present<func::CallOp>(owner)) {
     if (!llvm::isa<BaseMemRefType>(op_operand.get().getType()))
       return 'u';
@@ -1207,7 +1209,7 @@ char air::checkOpOperandReadOrWrite(mlir::OpOperand &op_operand) {
       return 'r';
     if (callee.getArgAttr(argIdx, "llvm.writeonly"))
       return 'w';
-    return 'b';
+    return 'u';
   }
   // If used in a linalg op
   else if (auto linalgop = mlir::dyn_cast_if_present<linalg::LinalgOp>(owner)) {

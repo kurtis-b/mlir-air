@@ -1,0 +1,173 @@
+//===- fuse_packet_put_loops.mlir ------------------------------*- MLIR -*-===//
+//
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: MIT
+//
+//===----------------------------------------------------------------------===//
+
+// air-fuse-packet-put-loops: sibling launch-scope put loops feeding
+// packet-multiplexed channels fuse into ONE loop whose body performs the puts
+// in original program order, chained by async tokens. The consuming tile
+// ring expects the streams interleaved per iteration; the per-channel loops
+// air-dma-to-channel hoists deliver them whole-channel-after-whole-channel
+// instead, which misdelivers every packet after the first trip (measured on
+// NPU2: 481/512 elements wrong at two trips). Also locks the contract that
+// the interleaving chain SURVIVES -canonicalize: CanonicalizeAsyncOpDeps
+// models packet-typed channels as one shared stream resource, so the edge
+// between puts on two different packet channels is never pruned as
+// "no shared resource".
+
+// RUN: air-opt %s -air-fuse-packet-put-loops -split-input-file | FileCheck %s
+// RUN: air-opt %s -air-fuse-packet-put-loops -canonicalize -split-input-file | FileCheck %s --check-prefix=CANON
+
+// Two sibling packet put loops, same static bounds: fused into one loop, puts
+// token-chained in program order (@pk0 before @pk1, the herd's per-iteration
+// get order). The fused loop's incoming token joins both source inits.
+// CHECK-LABEL: @two_packet_loops
+// CHECK: %[[JOIN:.*]] = air.wait_all async [%{{.*}}, %{{.*}}]
+// CHECK: scf.for {{.*}} iter_args(%[[T:.*]] = %[[JOIN]])
+// CHECK: %[[P0:.*]] = air.channel.put async [%[[T]]] @pk0
+// CHECK: %[[P1:.*]] = air.channel.put async [%[[P0]]] @pk1
+// CHECK: scf.yield %[[P1]]
+// CHECK-NOT: scf.for
+
+// The chain survives canonicalization: @pk1's put still waits on @pk0's.
+// CANON-LABEL: @two_packet_loops
+// CANON: %[[P0:.*]] = air.channel.put async {{.*}} @pk0
+// CANON: air.channel.put async [%[[P0]]] @pk1
+module {
+  air.channel @pk0 [1, 1] {channel_type = "npu_dma_packet"}
+  air.channel @pk1 [1, 1] {channel_type = "npu_dma_packet"}
+  func.func @two_packet_loops(%arg0: memref<8x64xbf16>, %arg1: memref<8x64xbf16>) {
+    %c1 = arith.constant 1 : index
+    %0 = air.launch async (%lx) in (%sx=%c1) args(%a=%arg0, %b=%arg1) : memref<8x64xbf16>, memref<8x64xbf16> {
+      %c0 = arith.constant 0 : index
+      %c1_l = arith.constant 1 : index
+      %c4 = arith.constant 4 : index
+      %c8 = arith.constant 8 : index
+      %c64 = arith.constant 64 : index
+      %t0 = air.wait_all async
+      %l0 = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %t0) -> (!air.async.token) {
+        %p = air.channel.put async [%t] @pk0[] (%a[%i, %c0] [%c4, %c64] [%c64, %c1_l]) : (memref<8x64xbf16>)
+        scf.yield %p : !air.async.token
+      }
+      %t1 = air.wait_all async
+      %l1 = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %t1) -> (!air.async.token) {
+        %p = air.channel.put async [%t] @pk1[] (%b[%i, %c0] [%c4, %c64] [%c64, %c1_l]) : (memref<8x64xbf16>)
+        scf.yield %p : !air.async.token
+      }
+      %done = air.wait_all async [%l0, %l1]
+    }
+    return
+  }
+}
+
+// -----
+
+// Different static bounds land in different groups: nothing fuses.
+// CHECK-LABEL: @different_bounds_not_fused
+// CHECK: scf.for
+// CHECK: @pk2
+// CHECK: scf.for
+// CHECK: @pk3
+module {
+  air.channel @pk2 [1, 1] {channel_type = "npu_dma_packet"}
+  air.channel @pk3 [1, 1] {channel_type = "npu_dma_packet"}
+  func.func @different_bounds_not_fused(%arg0: memref<8x64xbf16>, %arg1: memref<8x64xbf16>) {
+    %c1 = arith.constant 1 : index
+    %0 = air.launch async (%lx) in (%sx=%c1) args(%a=%arg0, %b=%arg1) : memref<8x64xbf16>, memref<8x64xbf16> {
+      %c0 = arith.constant 0 : index
+      %c1_l = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %c4 = arith.constant 4 : index
+      %c8 = arith.constant 8 : index
+      %c64 = arith.constant 64 : index
+      %t0 = air.wait_all async
+      %l0 = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %t0) -> (!air.async.token) {
+        %p = air.channel.put async [%t] @pk2[] (%a[%i, %c0] [%c4, %c64] [%c64, %c1_l]) : (memref<8x64xbf16>)
+        scf.yield %p : !air.async.token
+      }
+      %t1 = air.wait_all async
+      %l1 = scf.for %i = %c0 to %c8 step %c2 iter_args(%t = %t1) -> (!air.async.token) {
+        %p = air.channel.put async [%t] @pk3[] (%b[%i, %c0] [%c2, %c64] [%c64, %c1_l]) : (memref<8x64xbf16>)
+        scf.yield %p : !air.async.token
+      }
+      %done = air.wait_all async [%l0, %l1]
+    }
+    return
+  }
+}
+
+// -----
+
+// Circuit-routed (non-packet) channels do not share a shim queue, so their
+// loops are not candidates: nothing fuses.
+// CHECK-LABEL: @non_packet_not_fused
+// CHECK: scf.for
+// CHECK: @cir0
+// CHECK: scf.for
+// CHECK: @cir1
+module {
+  air.channel @cir0 [1, 1]
+  air.channel @cir1 [1, 1]
+  func.func @non_packet_not_fused(%arg0: memref<8x64xbf16>, %arg1: memref<8x64xbf16>) {
+    %c1 = arith.constant 1 : index
+    %0 = air.launch async (%lx) in (%sx=%c1) args(%a=%arg0, %b=%arg1) : memref<8x64xbf16>, memref<8x64xbf16> {
+      %c0 = arith.constant 0 : index
+      %c1_l = arith.constant 1 : index
+      %c4 = arith.constant 4 : index
+      %c8 = arith.constant 8 : index
+      %c64 = arith.constant 64 : index
+      %t0 = air.wait_all async
+      %l0 = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %t0) -> (!air.async.token) {
+        %p = air.channel.put async [%t] @cir0[] (%a[%i, %c0] [%c4, %c64] [%c64, %c1_l]) : (memref<8x64xbf16>)
+        scf.yield %p : !air.async.token
+      }
+      %t1 = air.wait_all async
+      %l1 = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %t1) -> (!air.async.token) {
+        %p = air.channel.put async [%t] @cir1[] (%b[%i, %c0] [%c4, %c64] [%c64, %c1_l]) : (memref<8x64xbf16>)
+        scf.yield %p : !air.async.token
+      }
+      %done = air.wait_all async [%l0, %l1]
+    }
+    return
+  }
+}
+
+// -----
+
+// Dominance: the first loop's result is consumed BEFORE the last group
+// member, so building the fused loop at the last member's position would
+// break dominance for that user. The group must be left alone.
+// CHECK-LABEL: @early_user_blocks_fusion
+// CHECK: scf.for
+// CHECK: @pk4
+// CHECK: air.wait_all async
+// CHECK: scf.for
+// CHECK: @pk5
+module {
+  air.channel @pk4 [1, 1] {channel_type = "npu_dma_packet"}
+  air.channel @pk5 [1, 1] {channel_type = "npu_dma_packet"}
+  func.func @early_user_blocks_fusion(%arg0: memref<8x64xbf16>, %arg1: memref<8x64xbf16>) {
+    %c1 = arith.constant 1 : index
+    %0 = air.launch async (%lx) in (%sx=%c1) args(%a=%arg0, %b=%arg1) : memref<8x64xbf16>, memref<8x64xbf16> {
+      %c0 = arith.constant 0 : index
+      %c1_l = arith.constant 1 : index
+      %c4 = arith.constant 4 : index
+      %c8 = arith.constant 8 : index
+      %c64 = arith.constant 64 : index
+      %t0 = air.wait_all async
+      %l0 = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %t0) -> (!air.async.token) {
+        %p = air.channel.put async [%t] @pk4[] (%a[%i, %c0] [%c4, %c64] [%c64, %c1_l]) : (memref<8x64xbf16>)
+        scf.yield %p : !air.async.token
+      }
+      %early = air.wait_all async [%l0]
+      %l1 = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %early) -> (!air.async.token) {
+        %p = air.channel.put async [%t] @pk5[] (%b[%i, %c0] [%c4, %c64] [%c64, %c1_l]) : (memref<8x64xbf16>)
+        scf.yield %p : !air.async.token
+      }
+      %done = air.wait_all async [%l1]
+    }
+    return
+  }
+}
