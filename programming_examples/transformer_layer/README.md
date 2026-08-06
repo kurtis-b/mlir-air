@@ -1066,14 +1066,10 @@ Phase H hardened the compiler against the miscompile behind
   whose own per-iteration buffers have an unclassifiable use (e.g. an
   unannotated external call) is left untransformed with a warning: correct,
   just single-buffered. A candidate the transform would provably corrupt
-  REFUSES to compile: an external call that may access a buffer filled by a
-  classified WRITE (DMA/channel) outside the loop but inside the loop's own
-  scope (the hoisted-weight-DMA shape — the data carries into iterations and
-  the only edge ordering fill against use is the one the transform
-  rebuilds), or a duplicated buffer that is READ with no producer provably
-  refilling it every iteration. Opt-outs: `air.disable_ping_pong` on the
-  loop, or `--omit-ping-pong-transform`. Both attributes are now validated
-  by the AIR dialect verifier after every pass.
+  REFUSES to compile: a duplicated buffer that is READ with no producer
+  provably refilling it every iteration. Opt-outs: `air.disable_ping_pong`
+  on the loop, or `--omit-ping-pong-transform`. Both attributes are now
+  validated by the AIR dialect verifier after every pass.
 - **A never-read buffer is vacuously safe to rotate** (attempt 3). The reuse
   edge exists to hold the next fill behind the buffer's readers; once every
   use is classified, an empty consumer set means provably NO reader, so
@@ -1086,18 +1082,21 @@ Phase H hardened the compiler against the miscompile behind
   content and the `no_consumer` case in
   `label_ping_pong_external_call_proof.mlir` now guards against the refusal
   returning.
-- **The refusal is scoped to what the rotation endangers** (attempt 2). A
-  call touching a memref the loop does NOT privatize is only refused in the
-  classified-write-outside-the-loop shape above. Attempt 1 refused ANY
-  unclassifiable use of an unprivatized memref, and that broke 8 of 24
-  hardware tests — every GEMM-bearing operator — because a GEMM's
-  accumulator legitimately carries data across K-loop iterations: it lives
-  outside the loop (as a herd argument, or privatized into the herd by
-  `air-shrink-memref-sizes-by-access`), is zero-filled by another
-  unclassified kernel call, and is DRAINED (read) after the loop. A
-  post-loop read waits on the loop's result token, which survives the
-  rebuild; only a pre-existing classified FILL has an ordering edge the
-  rebuild can sever.
+- **The proof's subject is exactly the buffers the rotation duplicates**
+  (attempt 5, after two mis-drawn lines). Attempt 1 refused ANY
+  unclassifiable use of an unprivatized memref, and broke 8 of 24 hardware
+  tests — every GEMM-bearing operator — because a GEMM's accumulator
+  legitimately carries data across K-loop iterations. Attempt 4 narrowed
+  that to unprivatized memrefs whose data provably carries INTO the loop
+  through a classified pre-loop fill (the hoisted-weight shape), and that
+  still broke 3 of 10 shipped LLM deployments (`llama32_1b_int4`,
+  `qwen3_0_6b`, `qwen3_1_7b`): each reads a loop-invariant weight or scale
+  buffer, filled once before the loop, through an unannotated external
+  call — and produces correct output, because one physical buffer read by
+  every iteration has no rotation hazard. The rule that survives: a memref
+  the rotation does not privatize (not in the loop's `hoist_alloc` set) is
+  none of the transform's business, whatever its fill pattern; the Skip and
+  Refuse verdicts apply only to the loop's own duplicated buffers.
 - **When H1/H2 change a lit test's outcome, the input stays and the CHECKs
   move** (attempt 4). The three `ping_pong_shared_resident_ring*.mlir` tests
   had their unannotated `@acc` callee annotated with `llvm.emit_c_interface`
@@ -1109,6 +1108,19 @@ Phase H hardened the compiler against the miscompile behind
   labeled). The transformed-path coverage each one used to carry lives in a
   new `*_annotated.mlir` companion, identical but for the callee argument
   attributes.
+- **The hoisted-weight shape needs no refusal, measured** (attempt 5). At
+  the miscompile's own shape (`cols=64, rows=8, rows_per_call=4`, two
+  trips), hoisting the weight DMA out of the loop compiles under the scoped
+  rule — the loop's own buffers are unprovable so it stays single-buffered,
+  and `l1_w` is one physical buffer the rotation never touches — and the
+  hardware output is exact, zero mismatches. That matches what
+  `builders/addnorm.py` recorded all along: the two-trip corruption was
+  identical whether the weight was hoisted or not *and with ping-pong
+  disabled*, i.e. it was the shim feed order (fixed by
+  `air-fuse-packet-put-loops`), never a rotation hazard. A refusal keyed on
+  "data carries across iterations" was aimed at a hazard that does not
+  exist when the rotation leaves the buffer alone — which is why it could
+  only be satisfied by also refusing the three shipped models above.
 
 Footgun: the two-trip fixture shape fully UNROLLS under ping-pong labeling
 (trip count == unroll factor), so `air-ping-pong-transform`'s dependency
