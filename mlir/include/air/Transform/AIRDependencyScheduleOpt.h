@@ -52,6 +52,7 @@ std::unique_ptr<OperationPass<ModuleOp>>
 createAIRFuseChannels(const AIRFuseChannelsOptions &);
 
 std::unique_ptr<mlir::Pass> createAIREnforceChannelFifoOrder();
+std::unique_ptr<mlir::Pass> createAIRFusePacketPutLoops();
 
 std::unique_ptr<mlir::Pass> createAIRIsolateAsyncDmaLoopNests();
 

@@ -4177,6 +4177,147 @@ public:
   }
 };
 
+// Fuse sibling launch-scope put loops feeding packet-multiplexed channels into
+// one loop with the puts token-chained in program order. A packet-multiplexed
+// shim queue serializes traffic in task order -- whole channel after whole
+// channel -- while the consuming tile ring, built from the herd's
+// per-iteration get order, expects the streams interleaved per iteration. At
+// one trip the orders coincide; at two or more trips packets land in the
+// wrong buffers. This pass restores the per-iteration order that
+// air-dma-to-channel's per-DMA loop hoisting discarded; the chain survives
+// canonicalization because CanonicalizeAsyncOpDeps models packet-typed
+// channels as one shared stream resource.
+class AIRFusePacketPutLoops
+    : public xilinx::air::impl::AIRFusePacketPutLoopsBase<
+          AIRFusePacketPutLoops> {
+public:
+  AIRFusePacketPutLoops() = default;
+
+  // A candidate is the exact shape air-dma-to-channel emits: a static-bound
+  // scf.for with one async-token iter arg whose body is one packet-typed
+  // channel.put (plus pure index arithmetic) yielding the put's token.
+  static bool isCandidate(scf::ForOp forOp, SmallVector<int64_t, 3> &key) {
+    auto lb = getConstantIntValue(forOp.getLowerBound());
+    auto ub = getConstantIntValue(forOp.getUpperBound());
+    auto step = getConstantIntValue(forOp.getStep());
+    if (!lb || !ub || !step)
+      return false;
+    if (forOp.getNumResults() != 1 ||
+        !llvm::isa<air::AsyncTokenType>(forOp.getResult(0).getType()))
+      return false;
+    air::ChannelPutOp put = nullptr;
+    for (auto &op : forOp.getBody()->without_terminator()) {
+      if (auto p = dyn_cast<air::ChannelPutOp>(&op)) {
+        if (put)
+          return false;
+        put = p;
+        continue;
+      }
+      if (!isMemoryEffectFree(&op) || op.getNumRegions())
+        return false;
+    }
+    if (!put || !put.getAsyncToken())
+      return false;
+    auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+    if (yield.getNumOperands() != 1 ||
+        yield.getOperand(0) != put.getAsyncToken())
+      return false;
+    auto decl = air::getChannelDeclarationThroughSymbol(
+        cast<air::ChannelInterface>(put.getOperation()));
+    if (!decl)
+      return false;
+    auto ty = decl->getAttrOfType<StringAttr>("channel_type");
+    if (!ty || ty.getValue() != "npu_dma_packet")
+      return false;
+    key = {*lb, *ub, *step};
+    return true;
+  }
+
+  void runOnBlock(Block *blk, OpBuilder &builder) {
+    // Group candidates by loop bounds, preserving program order. Program
+    // order of the hoisted loops matches the original per-iteration DMA
+    // order in the herd, which is what the consumer ring was built from.
+    SmallVector<std::pair<SmallVector<int64_t, 3>, SmallVector<scf::ForOp>>>
+        groups;
+    for (auto &op : *blk) {
+      auto forOp = dyn_cast<scf::ForOp>(&op);
+      if (!forOp)
+        continue;
+      SmallVector<int64_t, 3> key;
+      if (!isCandidate(forOp, key))
+        continue;
+      auto *grp =
+          llvm::find_if(groups, [&](auto &g) { return g.first == key; });
+      if (grp == groups.end())
+        groups.push_back({key, {forOp}});
+      else
+        grp->second.push_back(forOp);
+    }
+    for (auto &[key, loops] : groups) {
+      if (loops.size() < 2)
+        continue;
+      // The fused loop is built at the LAST member's position so that every
+      // member's init token (defined just before its own loop) dominates it.
+      // That in turn requires every member's result to be consumed only
+      // after the last member; otherwise fusing would break dominance, so
+      // the group is left alone.
+      scf::ForOp last = loops.back();
+      bool usesOk = llvm::all_of(loops, [&](scf::ForOp l) {
+        return llvm::all_of(l.getResult(0).getUsers(), [&](Operation *user) {
+          Operation *anc = blk->findAncestorOpInBlock(*user);
+          return anc && last->isBeforeInBlock(anc);
+        });
+      });
+      if (!usesOk)
+        continue;
+      builder.setInsertionPoint(last);
+      auto loc = last.getLoc();
+      // The fused loop's incoming token gathers every source loop's init, so
+      // no upstream ordering is lost.
+      SmallVector<Value> inits;
+      for (auto l : loops)
+        inits.push_back(l.getInitArgs()[0]);
+      auto joined = air::WaitAllOp::create(
+          builder, loc, air::AsyncTokenType::get(builder.getContext()), inits);
+      auto fused = scf::ForOp::create(
+          builder, loc, last.getLowerBound(), last.getUpperBound(),
+          last.getStep(), SmallVector<Value>{joined.getAsyncToken()});
+      if (!fused.getBody()->empty() &&
+          fused.getBody()->back().hasTrait<OpTrait::IsTerminator>())
+        fused.getBody()->back().erase();
+      builder.setInsertionPointToEnd(fused.getBody());
+      Value chain = fused.getRegionIterArgs()[0];
+      for (auto l : loops) {
+        IRMapping remap;
+        remap.map(l.getInductionVar(), fused.getInductionVar());
+        remap.map(l.getRegionIterArgs()[0], chain);
+        for (auto &bodyOp : l.getBody()->without_terminator()) {
+          auto *cloned = builder.clone(bodyOp, remap);
+          if (auto p = dyn_cast<air::ChannelPutOp>(cloned))
+            chain = p.getAsyncToken();
+        }
+      }
+      scf::YieldOp::create(builder, loc, SmallVector<Value>{chain});
+      for (auto l : loops)
+        l.getResult(0).replaceAllUsesWith(fused.getResult(0));
+      for (auto l : loops)
+        l.erase();
+    }
+  }
+
+  void runOnOperation() override {
+    auto module = getOperation();
+    OpBuilder builder(module.getContext());
+    SmallVector<Block *> blocks;
+    module.walk([&](air::LaunchOp l) {
+      for (auto &b : l.getBody())
+        blocks.push_back(&b);
+    });
+    for (auto *b : blocks)
+      runOnBlock(b, builder);
+  }
+};
+
 // A pass which transform multiple channel ops into one, where the data movement
 // is time-multiplexed.
 class AIRFuseChannels
@@ -7953,6 +8094,10 @@ std::unique_ptr<Pass> createAIRUnrollChannelByFactorPattern() {
 
 std::unique_ptr<Pass> createAIREnforceChannelFifoOrder() {
   return std::make_unique<AIREnforceChannelFifoOrder>();
+}
+
+std::unique_ptr<Pass> createAIRFusePacketPutLoops() {
+  return std::make_unique<AIRFusePacketPutLoops>();
 }
 
 std::unique_ptr<Pass> createAIRFuseChannels() {

@@ -1056,6 +1056,31 @@ def AIRAnnotateRefeedPass: Pass<"air-annotate-refeed", "ModuleOp"> {
   }];
 }
 
+def AIRFusePacketPutLoops: Pass<"air-fuse-packet-put-loops", "ModuleOp"> {
+  let summary = "Interleave launch-scope put loops feeding packet-multiplexed "
+                "channels";
+  let constructor = "xilinx::air::createAIRFusePacketPutLoops()";
+  let description = [{
+    air-dma-to-channel hoists each L3-side DMA into its OWN launch-scope loop,
+    so a herd that fills N buffers per iteration produces N sibling per-channel
+    put loops. When those channels are later packet-multiplexed onto one shim
+    DMA queue (channel_type = "npu_dma_packet"), the queue serializes traffic
+    in task order: whole channel after whole channel. The consuming tile ring,
+    built from the herd's per-iteration get order, expects the streams
+    interleaved per iteration. At one trip the two orders coincide; at two or
+    more trips every packet after the first iteration lands in the wrong
+    buffer (measured on NPU2 at [8x64]/2 trips: 481 of 512 elements wrong).
+
+    This pass fuses sibling per-channel put loops that (a) sit in the same
+    launch-scope block, (b) share identical static bounds, and (c) all target
+    packet-typed channels, into ONE loop whose body performs the puts in
+    original program order, chained by async tokens. The chain survives
+    canonicalization because CanonicalizeAsyncOpDeps models packet-typed
+    channels as one shared stream resource, and airrt-to-npu unrolls the fused
+    loop into per-iteration interleaved shim tasks, matching the ring order.
+  }];
+}
+
 def AIREnforceChannelFifoOrder: Pass<"air-enforce-channel-fifo-order", "ModuleOp"> {
   let summary = "Serialize same-channel async ops to preserve FIFO order";
   let constructor = "xilinx::air::createAIREnforceChannelFifoOrder()";

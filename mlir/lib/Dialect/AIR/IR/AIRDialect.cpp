@@ -441,11 +441,39 @@ static LogicalResult CanonicalizeAsyncOpDeps(OpT op,
         }
         return result;
       };
+  // Packet-multiplexed channels ("npu_dma_packet") share one physical stream
+  // per shim queue: their traffic interleaves on a single ordered wire, so the
+  // RELATIVE ORDER of ops on two DIFFERENT packet channels is load-bearing
+  // even though the channel symbols differ. Model that by remapping every
+  // packet-typed channel symbol to one shared sentinel resource, so an edge
+  // between two packet-channel ops is never pruned as "no shared resource".
+  // Without this, the interleaved put chains built by
+  // air-fuse-packet-put-loops are stripped here, the shim feed degenerates to
+  // per-channel grouping, and any multi-trip consumer ring reads misdelivered
+  // packets (measured on NPU2: 481/512 elements wrong at two trips).
+  auto remapPacketStreamResources = [&](llvm::SetVector<SymbolRefAttr> refs) {
+    llvm::SetVector<SymbolRefAttr> result;
+    for (SymbolRefAttr r : refs) {
+      Operation *decl =
+          mlir::SymbolTable::lookupNearestSymbolFrom(op.getOperation(), r);
+      if (auto chan = dyn_cast_if_present<xilinx::air::ChannelOp>(decl)) {
+        auto ty = chan->getAttrOfType<StringAttr>("channel_type");
+        if (ty && ty.getValue() == "npu_dma_packet") {
+          result.insert(SymbolRefAttr::get(
+              op->getContext(), "__air_shared_npu_dma_packet_stream__"));
+          continue;
+        }
+      }
+      result.insert(r);
+    }
+    return result;
+  };
   auto memrefsReadBySinkOp = getAllMemrefsAccessedByOp(
       op.getOperation(), /*walkConsumers=*/true, getAllReadAccess);
   auto memrefsWrittenBySinkOp = getAllMemrefsAccessedByOp(
       op.getOperation(), /*walkConsumers=*/true, getAllWriteAccess);
-  auto resourcesUsedBySinkOp = getSymbolRefsUsedByOp(op.getOperation());
+  auto resourcesUsedBySinkOp =
+      remapPacketStreamResources(getSymbolRefsUsedByOp(op.getOperation()));
   // make a list of new async token operands. Flatten transitive WaitAllOp
   // chains down to their non-WaitAll leaf tokens. A visited-set is required:
   // the WaitAll async-dependency graph can be a DAG with shared ancestors
@@ -479,7 +507,8 @@ static LogicalResult CanonicalizeAsyncOpDeps(OpT op,
           v.getDefiningOp(), /*walkConsumers=*/false, getAllReadAccess);
       auto memrefsWrittenBySourceOp = getAllMemrefsAccessedByOp(
           v.getDefiningOp(), /*walkConsumers=*/false, getAllWriteAccess);
-      auto resourcesUsedBySourceOp = getSymbolRefsUsedByOp(v.getDefiningOp());
+      auto resourcesUsedBySourceOp =
+          remapPacketStreamResources(getSymbolRefsUsedByOp(v.getDefiningOp()));
       bool sourceOpTouchesMemref =
           llvm::range_size(llvm::concat<Value>(memrefsReadBySourceOp,
                                                memrefsWrittenBySourceOp)) != 0;

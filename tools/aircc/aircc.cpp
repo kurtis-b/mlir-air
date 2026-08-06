@@ -874,6 +874,11 @@ static std::string buildOptimizationPipeline(int resolvedNumCols) {
     os << ",air-isolate-async-dma-loop-nests{scope=launch},canonicalize,cse";
   }
 
+  // Restore per-iteration interleave for packet-multiplexed shim feeds. Must
+  // run AFTER the last air-isolate-async-dma-loop-nests (which would re-split
+  // the fused loop into per-channel loops) and before ping-pong labeling.
+  os << ",air-fuse-packet-put-loops";
+
   // Loop fusion or alloc/dealloc optimization
   if (airLoopFusion) {
     os << ",func.func(air-loop-fusion)";
