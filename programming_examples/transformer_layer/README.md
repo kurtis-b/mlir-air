@@ -1039,3 +1039,33 @@ under `kernels/` carry Apache-2.0 with AMD copyright: their numeric bodies are
 substantially carried over from the source they were ported from, and
 attribution is preserved even though this project is MIT. Both projects are
 AMD-copyright, so Apache-2.0 files live here without conflict.
+
+## Phase H findings: the multi-trip miscompile was the shim feed order
+
+Phase H hardened the compiler against the miscompile behind
+`builders/addnorm.py`'s one-trip guard. What the diff cannot show:
+
+- **The root cause was NOT the ping-pong transform.** Compiling the two-trip
+  addnorm shape with `--omit-ping-pong-transform=all` produced the identical
+  481/512-wrong result. The real defect: `air-dma-to-channel` hoists each L3
+  DMA into its own launch-scope loop, and when the input channels are
+  packet-multiplexed onto one shim MM2S queue ("npu_dma_packet"), the host
+  pushes whole channel after whole channel while the tile's BD ring expects
+  the streams interleaved per iteration. One trip coincides; two or more
+  trips misdeliver every packet after the first iteration. The new
+  `air-fuse-packet-put-loops` pass restores the interleave, and
+  `CanonicalizeAsyncOpDeps` models packet channels as one shared stream
+  resource so the ordering chain survives pruning.
+- **`func.call` is now visible to dependency analysis.** A callee with
+  `llvm.emit_c_interface` classifies operands from its argument attributes
+  (`llvm.readonly`/`llvm.writeonly`); an unannotated memref operand is 'b'
+  (may read AND write). Builders can attach arg attrs for precise edges.
+- **Unprovable ping-pong candidates now REFUSE to compile** (e.g. an external
+  call reading a buffer not refilled per iteration -- weight DMA hoisted out
+  of the loop). Opt-outs: `air.disable_ping_pong` on the loop, or
+  `--omit-ping-pong-transform`. Both attributes are now validated by the AIR
+  dialect verifier after every pass.
+
+Footgun: the two-trip fixture shape fully UNROLLS under ping-pong labeling
+(trip count == unroll factor), so `air-ping-pong-transform`'s dependency
+rebuild never runs on it; a fix living only there is untestable at 2 trips.
