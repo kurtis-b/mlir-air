@@ -4739,25 +4739,58 @@ public:
     return true;
   }
 
+  // A channel op on a packet-typed channel occupies a slot in the shared
+  // stream order. An unresolvable declaration is treated as packet-typed:
+  // when the stream membership of an op is unknown, reordering across it
+  // cannot be proven safe.
+  static bool isPacketChannelOp(Operation *op) {
+    auto chan = dyn_cast<air::ChannelInterface>(op);
+    if (!chan)
+      return false;
+    auto decl = air::getChannelDeclarationThroughSymbol(chan);
+    if (!decl)
+      return true;
+    auto ty = decl->getAttrOfType<StringAttr>("channel_type");
+    return ty && ty.getValue() == "npu_dma_packet";
+  }
+
+  static bool touchesPacketStream(Operation *op) {
+    return op
+        ->walk([&](Operation *nested) {
+          return isPacketChannelOp(nested) ? WalkResult::interrupt()
+                                           : WalkResult::advance();
+        })
+        .wasInterrupted();
+  }
+
   void runOnBlock(Block *blk, OpBuilder &builder) {
     // Group candidates by loop bounds, preserving program order. Program
     // order of the hoisted loops matches the original per-iteration DMA
     // order in the herd, which is what the consumer ring was built from.
+    // A group must be a CONSECUTIVE run of same-bounds candidates: fusion
+    // rebuilds the group at its last member's position, so any intervening
+    // op that itself occupies the packet stream (a candidate with different
+    // bounds, a bare packet put, a nest containing packet channel ops) would
+    // see earlier members' packets moved after its own, reordering the
+    // shared stream. Such an op seals every open group; only groups.back()
+    // is ever open, since a new candidate run seals its predecessor too.
     SmallVector<std::pair<SmallVector<int64_t, 3>, SmallVector<scf::ForOp>>>
         groups;
+    bool open = false;
     for (auto &op : *blk) {
-      auto forOp = dyn_cast<scf::ForOp>(&op);
-      if (!forOp)
-        continue;
       SmallVector<int64_t, 3> key;
-      if (!isCandidate(forOp, key))
+      auto forOp = dyn_cast<scf::ForOp>(&op);
+      if (forOp && isCandidate(forOp, key)) {
+        if (open && groups.back().first == key)
+          groups.back().second.push_back(forOp);
+        else {
+          groups.push_back({key, {forOp}});
+          open = true;
+        }
         continue;
-      auto *grp =
-          llvm::find_if(groups, [&](auto &g) { return g.first == key; });
-      if (grp == groups.end())
-        groups.push_back({key, {forOp}});
-      else
-        grp->second.push_back(forOp);
+      }
+      if (open && touchesPacketStream(&op))
+        open = false;
     }
     for (auto &[key, loops] : groups) {
       if (loops.size() < 2)
