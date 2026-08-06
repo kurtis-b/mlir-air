@@ -208,6 +208,31 @@ from the guard, trading a loud failure for silence, which is the exact anti-patt
 exists to prevent. The `chdir` already prevents the leak; the guard must stay able to catch any
 future one from code that does not go through this fixture. The `.gitignore` is removed.
 
+## `[2026-08-06]` The rule for existing tests, after three weakened-gate halts
+
+Every halt in this phase so far has been a lit test edited to accommodate the new behaviour, and
+each was flagged correctly. The three `ping_pong_shared_resident_ring*.mlir` tests are the clearest
+case, and I initially judged them benign — wrongly. Adding `llvm.emit_c_interface` and
+`llvm.readonly` to their `@acc` declaration is not "making the test realistic": at the phase base
+those tests covered the **unannotated callee** path, which is precisely the path H2 changes. After
+annotation they no longer exercise it. That is removed coverage, whatever the intent.
+
+**The rule for this phase, and it is not negotiable by a session:**
+
+When H1 or H2 changes the outcome for an existing test's input, **keep the input exactly as it is
+and update the CHECK lines to assert the new, intended outcome.** For an unannotated external call
+that is now single-buffered rather than ping-ponged, the test should assert the Skip. If the
+transformed path also needs coverage, add a **new** case with the annotated callee — do not convert
+the old one.
+
+Annotating the input to preserve the old outcome deletes the evidence that the behaviour changed at
+all, which is the one thing this phase most needs recorded. Three halts have now been spent
+relearning it.
+
+Note again that `guard_gate_files()` fingerprints `.lit` files and not `mlir/test/**/*.mlir`, so the
+tamper check cannot see any of this. Only the Codex `weakened_gates` layer can, which is why it has
+been the halting layer three times running, and why widening the fingerprint set is on the list.
+
 ## Risks
 
 - **The gate is the widest in the plan.** A compiler regression surfaces as ten `make verify` runs
