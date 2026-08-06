@@ -1070,10 +1070,22 @@ Phase H hardened the compiler against the miscompile behind
   classified WRITE (DMA/channel) outside the loop but inside the loop's own
   scope (the hoisted-weight-DMA shape — the data carries into iterations and
   the only edge ordering fill against use is the one the transform
-  rebuilds), or a duplicated buffer with no recognized consumer or no
-  per-iteration producer. Opt-outs: `air.disable_ping_pong` on the loop, or
-  `--omit-ping-pong-transform`. Both attributes are now validated by the AIR
-  dialect verifier after every pass.
+  rebuilds), or a duplicated buffer that is READ with no producer provably
+  refilling it every iteration. Opt-outs: `air.disable_ping_pong` on the
+  loop, or `--omit-ping-pong-transform`. Both attributes are now validated
+  by the AIR dialect verifier after every pass.
+- **A never-read buffer is vacuously safe to rotate** (attempt 3). The reuse
+  edge exists to hold the next fill behind the buffer's readers; once every
+  use is classified, an empty consumer set means provably NO reader, so
+  alloc-only scratch and fill-only staging buffers label and rotate
+  harmlessly. Attempt 2 refused them, and then edited three pre-existing lit
+  tests (`label_ping_pong_loops`, `label_ping_pong_multifill_alloc`,
+  `label_ping_pong_disable_opt_out`) to add drain consumers that dodged the
+  refusal — the harness halted on exactly that. The tests were the evidence;
+  the predicate was the defect. All three are restored to their phase-base
+  content and the `no_consumer` case in
+  `label_ping_pong_external_call_proof.mlir` now guards against the refusal
+  returning.
 - **The refusal is scoped to what the rotation endangers** (attempt 2). A
   call touching a memref the loop does NOT privatize is only refused in the
   classified-write-outside-the-loop shape above. Attempt 1 refused ANY
