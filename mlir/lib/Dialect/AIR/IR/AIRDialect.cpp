@@ -52,6 +52,49 @@ void air::airDialect::initialize() {
       >();
 }
 
+// Validate air.* discardable attributes: their type AND the op they may sit
+// on, the way GPUDialect::verifyOperationAttribute validates
+// gpu.container_module. The verifier hands every dialect-prefixed attribute
+// to this hook on every op after every pass, so a misplaced or mistyped
+// attribute is caught at the pass that broke it rather than at the consumer.
+// Unknown air.* attributes are accepted -- many passes use ad-hoc markers --
+// so this validates the documented user-facing ones.
+LogicalResult
+air::airDialect::verifyOperationAttribute(Operation *op, NamedAttribute attr) {
+  StringRef name = attr.getName().strref();
+  if (name == "air.disable_ping_pong") {
+    if (!llvm::isa<UnitAttr>(attr.getValue()))
+      return op->emitError("air.disable_ping_pong must be a unit attribute");
+    // scf.parallel is legal too: air-dependency lowers it to the scf.for the
+    // labeling pass reads, preserving the attribute.
+    if (!isa<scf::ForOp, scf::ParallelOp>(op))
+      return op->emitError("air.disable_ping_pong may only be attached to an "
+                           "scf.for or scf.parallel loop");
+    return success();
+  }
+  if (name == "air.shim_dma_tile_sizes") {
+    if (!isa<air::LaunchOp>(op))
+      return op->emitError(
+          "air.shim_dma_tile_sizes may only be attached to an air.launch");
+    auto sizes = llvm::dyn_cast<DenseI64ArrayAttr>(attr.getValue());
+    if (!sizes)
+      return op->emitError(
+          "air.shim_dma_tile_sizes must be a dense i64 array attribute");
+    ArrayRef<int64_t> vals = sizes.asArrayRef();
+    if (vals.empty())
+      return op->emitError("air.shim_dma_tile_sizes must not be empty");
+    bool isSkipSentinel = vals.size() == 1 && vals[0] == 0;
+    if (!isSkipSentinel)
+      for (int64_t v : vals)
+        if (v <= 0)
+          return op->emitError(
+              "air.shim_dma_tile_sizes values must be > 0 (use "
+              "single-value [0] for the skip-tile sentinel)");
+    return success();
+  }
+  return success();
+}
+
 Type air::airDialect::parseType(DialectAsmParser &parser) const {
   // Parse the main keyword for the type.
   StringRef keyword;
