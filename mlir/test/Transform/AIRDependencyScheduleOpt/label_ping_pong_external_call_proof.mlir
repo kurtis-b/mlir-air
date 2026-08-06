@@ -7,21 +7,23 @@
 
 // H1+H2: a ping-pong candidate whose compute is an external kernel call
 // (llvm.emit_c_interface) is PROVEN safe when the callee's argument
-// attributes (llvm.readonly / llvm.writeonly) classify every memref the call
-// touches and each such memref is one of the loop's own per-iteration
-// buffers; SKIPPED with a warning when an operand is unannotated
-// (read-versus-write is not established, so the loop keeps its correct
-// untransformed schedule); and REFUSED with a hard pass failure when the
-// call may access a buffer that receives a classified WRITE before the
-// loop within the loop's own scope (its data carries into iterations, and
-// the only edge ordering that fill against the invisible use is the one
-// the transform rebuilds). A classified write sequenced AFTER the loop
-// waits on the loop's result token, which the rebuild preserves, and must
-// not trigger the refusal. The refusal is scoped to exactly that: a call touching any
-// other unprivatized memref -- a herd-argument or call-zero-filled
-// accumulator, untouched scratch -- must NOT block the transform; the
-// unscoped version of this refusal broke 8 of 24 shipped hardware designs.
-// Silence here was a measured 481/512-wrong miscompile.
+// attributes (llvm.readonly / llvm.writeonly) classify every use of every
+// buffer the rotation would duplicate, each duplicated buffer that is read
+// has a per-iteration producer, and is SKIPPED with a warning when a
+// duplicated buffer's use is unannotated (read-versus-write is not
+// established, so the loop keeps its correct untransformed schedule). The
+// proof's subject is EXACTLY the buffers the rotation privatizes: a call
+// touching any other memref -- a herd-argument or call-zero-filled
+// accumulator, a weight buffer alloc'd and filled outside the loop,
+// untouched scratch -- must NOT block the transform, because that buffer
+// stays one physical buffer and every edge ordering it survives the
+// rebuild. Two prior drafts drew that line wider and both broke shipped
+// designs: refusing on any unclassifiable use failed 8 of 24
+// transformer-layer hardware tests, and refusing on unprivatized memrefs
+// whose data carries across iterations failed 3 of 10 shipped LLM
+// deployments. Silence on an unprovable DUPLICATED buffer was a measured
+// 481/512-wrong miscompile; that is what Skip (and Refuse, for a read
+// with no per-iteration producer) still guards.
 
 // RUN: air-opt %s -air-label-scf-for-to-ping-pong -split-input-file -verify-diagnostics | FileCheck %s
 
@@ -71,8 +73,16 @@ module {
 // -----
 
 // The weight buffer is filled ONCE outside the loop and read by the call
-// inside it. No argument attribute proves the call read-only on it, so the
-// candidate cannot be proven safe and the pass must refuse, not guess.
+// inside it. The rotation does not privatize that buffer -- it is not one
+// of the loop's own per-iteration allocs -- so its unclassified use must
+// not, by itself, block anything: single-buffered execution of this loop
+// is correct, and an earlier draft that hard-refused this shape also
+// refused three shipped LLM deployments that read a loop-invariant buffer
+// the same way. The loop IS skipped (warning), because its own candidate
+// alloc %bx is read by the same unannotated call.
+// CHECK-LABEL: func.func @hoisted
+// CHECK-NOT: hoist_alloc
+// CHECK-NOT: unroll
 module {
   air.channel @cw2 [1, 1]
   air.channel @cx2 [1, 1]
@@ -90,7 +100,7 @@ module {
         air.execute_terminator %a : memref<64xbf16, 2>
       }
       %gw = air.channel.get async [%tw] @cw2[%tx, %ty] (%bw[] [] []) : (memref<64xbf16, 2>)
-      // expected-error@+1 {{is a ping-pong candidate that cannot be proven safe to transform}}
+      // expected-warning@+1 {{is a ping-pong candidate that cannot be proven safe to transform}}
       %1 = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %gw) -> (!air.async.token) {
         %tx2, %bx = air.execute -> (memref<4x64xbf16, 2>) {
           %a = memref.alloc() : memref<4x64xbf16, 2>
@@ -397,17 +407,21 @@ module {
 
 // -----
 
-// The one shape where an "after the loop" write still carries data INTO
-// the loop: an enclosing loop re-executes both the candidate loop and the
-// write without re-allocating the buffer, so outer-iteration k's refill is
-// dynamically BEFORE outer-iteration k+1's unclassified in-loop read. The
-// weight buffer lives at herd level, the call reads it through an
-// unannotated operand, and the ONLY classified write to it is the
-// channel.get refill after the candidate loop but inside the outer loop:
-// the pass must still REFUSE. Without the recirculation check this labels
-// cleanly (no fill precedes the loop anywhere), so this case guards the
-// after-loop escape from being widened into exactly the hoisted-weight
-// hole it coexists with.
+// A herd-level buffer refilled by an enclosing loop, read inside the
+// candidate loop through an unannotated operand. The rotation does not
+// privatize %bw -- the only buffer it duplicates is %bx, whose use is
+// annotated read-only and whose channel.get refills it every iteration --
+// so the loop must be LABELED: %bw stays one physical buffer, the calls
+// reach it through edges chained from the loop's init token, and the
+// outer loop's refill waits on the loop's result token, all of which the
+// rebuild preserves. An earlier draft treated the outer loop's
+// recirculation of the refill as data carried INTO the loop and
+// hard-refused this shape; that same trigger refused three shipped LLM
+// deployments reading a loop-invariant buffer through an external call.
+// CHECK-LABEL: func.func @write_after_loop_recirculated
+// CHECK: scf.for
+// CHECK: hoist_alloc
+// CHECK: } {unroll = 2 : i32}
 module {
   air.channel @cx4 [1, 1]
   air.channel @cw4 [1, 1]
@@ -426,7 +440,6 @@ module {
         air.execute_terminator %a : memref<64xbf16, 2>
       }
       %2 = scf.for %k = %c0 to %c8 step %c4 iter_args(%tk = %tw) -> (!air.async.token) {
-        // expected-error@+1 {{is a ping-pong candidate that cannot be proven safe to transform}}
         %1 = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %tk) -> (!air.async.token) {
           %tx2, %bx = air.execute -> (memref<4x64xbf16, 2>) {
             %a = memref.alloc() : memref<4x64xbf16, 2>

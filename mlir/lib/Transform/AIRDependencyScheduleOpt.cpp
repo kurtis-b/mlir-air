@@ -1716,29 +1716,29 @@ private:
 // allocs and REBUILDS the loop-carried dependency graph from what this
 // classification sees; any use it cannot see is silently dropped from that
 // graph, which is how a missing edge becomes wrong data rather than an
-// error. Two failure severities, because the two failure modes differ:
+// error. The proof's subject is EXACTLY the set of buffers the rotation
+// privatizes -- the candidate allocs the transform would duplicate. A
+// memref the rotation leaves alone (a herd argument, an accumulator or
+// weight buffer alloc'd outside the loop, scratch nothing else touches) is
+// one physical buffer before and after the transform, so no use of it --
+// classified or not -- is this transform's business. Two prior drafts drew
+// that line wrong, and both broke shipped, working designs: refusing on
+// any unclassifiable use of any memref failed 8 of 24 transformer-layer
+// hardware tests, and refusing on unprivatized memrefs whose data carries
+// across iterations failed 3 of 10 shipped LLM deployments (llama32_1b_int4,
+// qwen3_0_6b, qwen3_1_7b) that read a loop-invariant buffer through an
+// external call. Two failure severities remain, because the two failure
+// modes differ:
 //
-//   Refuse -- compiling would risk wrong data or the transform's rebuilt
-//   graph is provably missing an edge. Hard pass failure:
-//   - an unclassified ('u') use, by an op that may touch memory, of a
-//     memref the rotation does NOT privatize whose data provably carries
-//     across iterations through the loop's own token graph: the buffer
-//     receives a classified WRITE before the loop, inside the loop's
-//     scope, so the only edge ordering that fill against the invisible
-//     in-loop use is the one the rebuild replaces. This is the
-//     hoisted-weight-DMA shape that measurably corrupts. Any other
-//     unprivatized memref (herd-argument or call-zero-filled accumulator,
-//     untouched scratch) must NOT block: attempt 1 refused those and
-//     broke 8 of 24 shipped hardware designs (see
-//     memrefCarriesDataAcrossIterations).
-//   - a duplicated buffer that is read but has no producer that provably
-//     refills it on EVERY iteration (a non-exhaustive conditional, a
-//     zero-trip or dynamic nested loop): an iteration would read a
-//     rotated stale half. A buffer with NO recognized consumer is the
-//     opposite case and is vacuously safe: the reuse edge exists to hold
-//     the next fill behind the buffer's readers, and once every use is
-//     classified an empty consumer set means provably no reader --
-//     alloc-only scratch and fill-only staging rotate harmlessly.
+//   Refuse -- compiling would risk wrong data: a duplicated buffer is read
+//   but has no producer that provably refills it on EVERY iteration (a
+//   non-exhaustive conditional, a zero-trip or dynamic nested loop), so an
+//   iteration would read a rotated stale half. Hard pass failure. A buffer
+//   with NO recognized consumer is the opposite case and is vacuously
+//   safe: the reuse edge exists to hold the next fill behind the buffer's
+//   readers, and once every use is classified an empty consumer set means
+//   provably no reader -- alloc-only scratch and fill-only staging rotate
+//   harmlessly.
 //
 //   Skip -- the loop cannot be PROVEN safe to transform, but leaving it
 //   untransformed is correct. Warn and do not label:
@@ -1752,119 +1752,6 @@ private:
 // stays legal -- the dependency machinery sees it -- and so does an
 // unclassified use by an op that provably touches no memory (memref.dim,
 // memref.cast: metadata only) -- it has no edge to lose.
-// Does the buffer behind `v` provably carry data INTO iterations of
-// `forOp` through the loop's own token graph -- the thing the ping-pong
-// transform rebuilds? True exactly when the buffer's root definition is an
-// op in the loop's scope but outside the loop, and some alias of it
-// receives a classified WRITE before the loop as well: the unclassified
-// in-loop use may then be reading data that write produced, and the only
-// edge ordering the two threads through the loop's init/iter-arg tokens,
-// which the rebuild replaces. This is the hoisted-weight-DMA shape that
-// measurably corrupts (481/512 wrong).
-//
-// Everything else returns false, deliberately:
-// - a BLOCK ARGUMENT (herd/segment argument): its ordering against the
-//   outside world is carried by hierarchy-level tokens the rebuild never
-//   touches. Attempt 1 refused these and broke 8 of 24 shipped hardware
-//   designs.
-// - a buffer DEFINED INSIDE the loop: per-iteration private, nothing
-//   carries.
-// - a scope-local buffer with no classified WRITE sequenced before the
-//   loop: an accumulator zero-filled by another unclassified kernel call
-//   and DRAINED (read) after the loop, scratch memory nothing else
-//   touches, or a buffer WRITTEN only after the loop (a channel.get
-//   refilling it for a later phase). Every op after the loop waits on the
-//   loop's result token, which survives the rebuild; there is no producer
-//   edge into the loop to sever -- unless an ancestor loop brings the
-//   "after" write back around to a later execution of this loop, which
-//   the check below counts conservatively. memref.dealloc is lifetime,
-//   not data, and does not count either.
-static bool memrefCarriesDataAcrossIterations(Value v, scf::ForOp forOp) {
-  // Resolve to the root definition through view-like ops and air.execute
-  // yields.
-  Value root = v;
-  while (Operation *def = root.getDefiningOp()) {
-    if (auto view = dyn_cast<ViewLikeOpInterface>(def)) {
-      root = view.getViewSource();
-      continue;
-    }
-    if (auto exec = dyn_cast<air::ExecuteOp>(def)) {
-      unsigned idx = llvm::cast<OpResult>(root).getResultNumber();
-      Operation *term = exec.getRegion().front().getTerminator();
-      if (idx >= 1 && idx - 1 < term->getNumOperands()) {
-        root = term->getOperand(idx - 1);
-        continue;
-      }
-    }
-    break;
-  }
-  Operation *rootDef = root.getDefiningOp();
-  if (!rootDef)
-    return false; // block argument: ordered by hierarchy-level tokens
-  if (forOp->isProperAncestor(rootDef))
-    return false; // defined inside the loop: per-iteration private
-  // Forward alias closure: the root, the air.execute result yielding it,
-  // and every transitive view of either.
-  llvm::SmallPtrSet<Value, 8> aliases;
-  SmallVector<Value, 8> worklist{root};
-  while (!worklist.empty()) {
-    Value cur = worklist.pop_back_val();
-    if (!aliases.insert(cur).second)
-      continue;
-    for (Operation *user : cur.getUsers()) {
-      if (auto view = dyn_cast<ViewLikeOpInterface>(user)) {
-        if (view.getViewSource() == cur)
-          worklist.push_back(user->getResult(0));
-      } else if (isa<air::ExecuteTerminatorOp>(user)) {
-        auto exec = user->getParentOfType<air::ExecuteOp>();
-        if (!exec)
-          continue;
-        for (auto [idx, opnd] : llvm::enumerate(user->getOperands()))
-          if (opnd == cur && idx + 1 < exec->getNumResults())
-            worklist.push_back(exec->getResult(idx + 1));
-      }
-    }
-  }
-  for (Value a : aliases) {
-    for (OpOperand &use : a.getUses()) {
-      Operation *owner = use.getOwner();
-      if (owner == forOp.getOperation() || forOp->isProperAncestor(owner))
-        continue; // in-loop uses are the proof's own subject
-      if (isa<memref::DeallocOp>(owner))
-        continue; // lifetime, not data
-      if (checkOpOperandReadOrWrite(use) != 'w')
-        continue;
-      // Only a write sequenced BEFORE the loop can feed data into its
-      // iterations. A write after the loop -- a channel.get refilling the
-      // buffer for a later phase, a DMA landing results back into it --
-      // waits on the loop's result token, which survives the rebuild;
-      // there is no edge into the loop to sever, so it must not trigger a
-      // refusal. Two conservative escapes keep the refusal sound: a write
-      // whose order against the loop cannot be established from the
-      // loop's own block stays counted, and so does a textually-after
-      // write when an ancestor loop re-executes both without re-defining
-      // the buffer -- iteration k's write is then dynamically BEFORE
-      // iteration k+1's read. An ancestor loop enclosing the buffer's
-      // definition re-allocates it each trip, so nothing persists across
-      // its iterations and the walk stops there.
-      Operation *atLoopBlock = forOp->getBlock()->findAncestorOpInBlock(*owner);
-      if (atLoopBlock && forOp->isBeforeInBlock(atLoopBlock)) {
-        bool recirculates = false;
-        for (Operation *anc = forOp->getParentOp();
-             anc && !anc->isProperAncestor(rootDef); anc = anc->getParentOp())
-          if (isa<LoopLikeOpInterface>(anc)) {
-            recirculates = true;
-            break;
-          }
-        if (!recirculates)
-          continue; // provably after every execution of the loop
-      }
-      return true;
-    }
-  }
-  return false;
-}
-
 static PingPongSafety provePingPongSafety(scf::ForOp forOp,
                                           ArrayRef<Operation *> allocs,
                                           std::string &reason) {
@@ -1910,12 +1797,8 @@ static PingPongSafety provePingPongSafety(scf::ForOp forOp,
   }
   llvm::DenseMap<Operation *, int> consumers;
   llvm::DenseMap<Operation *, llvm::SmallPtrSet<Operation *, 4>> producerOps;
-  // An unprovable candidate-alloc use downgrades the verdict to Skip, but
-  // the walk must keep going: a later operand of the same op may be a
-  // may-access to an UNPRIVATIZED memref, which is a hard Refuse and must
-  // win over the skip.
   bool skip = false;
-  WalkResult wr = forOp.getBody()->walk<WalkOrder::PreOrder>(
+  forOp.getBody()->walk<WalkOrder::PreOrder>(
       [&](Operation *op) -> WalkResult {
         if (isa<air::HerdOp, air::SegmentOp, air::LaunchOp>(op))
           return WalkResult::skip();
@@ -1950,38 +1833,25 @@ static PingPongSafety provePingPongSafety(scf::ForOp forOp,
             // graph, wherever its memref lives.
             if (mlir::isMemoryEffectFree(op))
               continue;
-            if (isCandidateAlloc) {
-              // Unprovable use of a buffer this loop would duplicate:
-              // refuse to LABEL, and leave the (correct) untransformed
-              // loop alone.
-              if (!skip)
-                os << "an operand of '" << op->getName().getStringRef()
-                   << "' cannot be classified as a read or a write of a "
-                      "buffer the transform would duplicate, so the "
-                      "rebuilt dependency graph would silently drop it";
-              skip = true;
-              continue;
-            }
             // An unclassifiable use of a memref the rotation does NOT
-            // privatize. The transform never duplicates that buffer, so
-            // this only becomes its business when the loop's own token
-            // graph -- the thing the transform rebuilds -- is what orders
-            // this use against the buffer's other accesses. Any other
-            // unprivatized memref (a herd-argument accumulator, a scratch
-            // buffer nothing else touches) must not block the transform:
-            // refusing designs that work today trades silent wrong data
-            // for a worse failure mode (attempt 1 measured 8 of 24
-            // transformer-layer hardware tests refused by exactly that).
-            if (!memrefCarriesDataAcrossIterations(operand.get(), forOp))
+            // privatize is none of this transform's business: that buffer
+            // stays one physical buffer, untouched, and every edge
+            // ordering it against the outside world (hierarchy tokens,
+            // the loop's init and result tokens) survives the rebuild.
+            // Blocking on it refused shipped, working designs twice --
+            // see the proof's header comment.
+            if (!isCandidateAlloc)
               continue;
-            reason.clear(); // a Refuse reason replaces any Skip reason
-            os << "'" << op->getName().getStringRef()
-               << "' may access a memref that this loop's ping-pong "
-                  "rotation does not privatize and whose data carries "
-                  "across iterations (it is filled before the loop, "
-                  "within the loop's own scope), and no callee argument "
-                  "attribute establishes the access as a read or a write";
-            return WalkResult::interrupt();
+            // Unprovable use of a buffer this loop would duplicate:
+            // refuse to LABEL, and leave the (correct) untransformed
+            // loop alone.
+            if (!skip)
+              os << "an operand of '" << op->getName().getStringRef()
+                 << "' cannot be classified as a read or a write of a "
+                    "buffer the transform would duplicate, so the "
+                    "rebuilt dependency graph would silently drop it";
+            skip = true;
+            continue;
           }
           if (!isCandidateAlloc)
             continue;
@@ -1992,8 +1862,6 @@ static PingPongSafety provePingPongSafety(scf::ForOp forOp,
         }
         return WalkResult::advance();
       });
-  if (wr.wasInterrupted())
-    return PingPongSafety::Refuse;
   // With an unclassified candidate use the producer/consumer sets below
   // are incomplete, so the per-buffer requirements are unknowable; the
   // skip verdict already covers the loop.
@@ -4379,13 +4247,14 @@ public:
     // safe. Labeling it anyway reproduces a measured silent miscompile
     // (481-497 of 512 elements wrong at two trips); every comparable
     // compiler (memref::multiBuffer, Triton, TVM) bails rather than guesses
-    // here. Two severities, decided by the proof: Refuse means compiling
-    // would risk wrong data (a may-access to memory the rotation does not
-    // privatize, or a duplicated buffer whose reuse edges cannot be built)
-    // and is a hard pass failure; Skip means the loop is correct as written
-    // but unprovable (e.g. an external call with unannotated memref
-    // operands), so it is left untransformed with a warning saying why.
-    // Opting out explicitly -- air.disable_ping_pong on the loop, or aircc
+    // here. Two severities, decided by the proof, both scoped to the
+    // buffers the rotation would actually duplicate: Refuse means compiling
+    // would risk wrong data (a duplicated buffer is read but cannot be
+    // proven refilled every iteration) and is a hard pass failure; Skip
+    // means the loop is correct as written but unprovable (e.g. an external
+    // call with unannotated memref operands), so it is left untransformed
+    // with a warning saying why. Opting out explicitly --
+    // air.disable_ping_pong on the loop, or aircc
     // --omit-ping-pong-transform -- remains available and is honored before
     // this check.
     bool anyRefusal = false;
