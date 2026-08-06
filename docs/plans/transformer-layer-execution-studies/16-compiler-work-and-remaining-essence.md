@@ -85,6 +85,63 @@ automatic mechanism twice; detect drops instead, as LLVM's `WarnMissedTransforma
 | J5 | **Wire `decoder_gpt2`.** The oracle implements and tests it; no mode dispatches it. | It is the causal, LLM-shaped workload. Encoder-only makes this a study of a BERT layer, not of executing LLMs. | — |
 | J6 | **Phase F cost metrics.** Latency, power, resource usage, GFLOPs — the seven studies in [09](09-phase-f-study-harness.md). | The dispatch vector is a proxy for cost, not cost. Until this lands there are no tradeoffs, only structure. | J2, J3 |
 
+### J7 — pipelined `mha_out_proj` and `ffn` with on-chip partial-sum staging
+
+**`[2026-08-06]` Missing from the first draft of this document.** It is neither compiler work nor
+covered by J1–J6, and it is the largest remaining structural difference between this port and iron.
+
+**What iron does.** Its FFN down-projection and o-projection accumulate through an **L2
+memtile-resident ring**: `matmul_with_acc_*` reads `of_o_acc_in` and writes `of_o_acc_out`, and the
+memtile forwards the result back as the next call's accumulation input. Nothing in that reduction
+tree leaves the chip. Its `mha_out_proj` is a four-stage **spatial pipeline down a column** — QK on
+row 2, softmax on row 3, PV on row 4, o-projection on row 5 — with the FlashAttention O accumulator
+held **resident in L1** across every KV block, rescaled in place by α and written to L2 only once
+fully normalized.
+
+**What this port does instead.** `drain` keeps an f32 accumulator in L1 with an in-GEMM drain-herd
+cast — close to iron's spirit and numerically better. But `fused-cast` stages partials in a
+**full-size f32 scratch in L3** (`qkv_f32`, `ffn_up_f32`, `ffn_out_f32` are whole `[seq, ffn]`
+launch arguments), which is numerically better than iron and worse on movement: it round-trips a
+full tensor through DDR where iron never leaves the memtile. And there is no pipeline anywhere —
+the array is used as a data-parallel grid throughout.
+
+**The pieces are already here and unused.**
+
+- Three accumulate-into-C kernels are ported, compiled and exported —
+  `matmul_with_acc_vectorized_2x2_mmul`, `matmul_with_acc_vectorized_1x4_mmul`,
+  `matmul_with_acc_bf16_bf16_down_proj` — and `grep matmul_with_acc` across every builder and mode
+  returns **nothing**. They have never been dispatched.
+- `programming_examples/bottleneck/` is a working multi-herd spatial pipeline: heterogeneous named
+  herds inside one segment, joined by `Channel("L1ToL1_...", broadcast_shape=...)` with
+  `ChannelPut`/`ChannelGet` between stages, plus `L3ToL2_*`/`L2ToL1_*` channels doing the job of
+  iron's `.split()`/`.forward()`/`.join()`.
+- `channel_examples/worker_to_self/` is the feedback ring — a channel from a herd back to itself,
+  with explicit `MemorySpace.L1` and `MemorySpace.L2` — which is the shape iron's accumulator ring
+  needs.
+
+So this is **unbuilt, not blocked**. The transformer-layer port reached for AIR's data-parallel grid
+throughout and never used its dataflow constructs, even though both are demonstrated in-tree.
+
+**Why it is worth doing, in order of confidence.**
+
+1. **It recovers `fused`'s lost precision.** That mode measures `mean_rel_L1` 1.806e-2 against the
+   block's 1.688e-2, and the cause is named in its own README: the tail decomposes `addnorm` into
+   `elementwise_add` → `layer_norm` → `elementwise_mul` and **stages bf16 through L3 between them**.
+   A two- or three-stage herd pipeline with L1→L1 channels keeps those intermediates resident — which
+   is exactly iron's `AIEAddAndNorm`, a two-worker pipeline. Precision recovered without giving up
+   the fusion.
+2. **It is the honest comparison.** Today a `coarse`-versus-`hybrid` latency number measures
+   persistent-worker streaming against launch-grid dispatch at least as much as the execution
+   boundary. Building the pipelined form makes the two comparable on their own terms.
+3. **Dispatch count.** A pipeline is one launch where the decomposition is several.
+
+**Sequencing.** Independent of H and of J1–J6, and it does not need the `addnorm` one-trip rule
+lifted. It is builder work in `transformer_layer/builders/` plus a mode variant, gated exactly as
+every operator here is: full-output `np.isclose` against the FP32 oracle at `rtol` 1.6e-2, zero
+mismatches, with a fault-injection control. Start with the **norm tail** — it is the smallest piece,
+it has a measured precision target to beat (1.806e-2 → 1.688e-2), and it proves the L1→L1 channel
+path on this example before the harder `mha_out_proj` pipeline.
+
 ## The finish line
 
 Not "it feels done". [13](13-verification-and-acceptance.md) already defines it:
