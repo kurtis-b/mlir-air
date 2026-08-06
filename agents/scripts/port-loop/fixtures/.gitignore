@@ -1,0 +1,6 @@
+# Artifacts. Anything run from this directory writes aircc output here, and this
+# directory is fingerprinted by guard_gate_files() and covered by no allowlist -- a
+# leaked artifact halts the run. The fixtures also chdir to a tempdir; this is belt.
+*
+!.gitignore
+!*.py

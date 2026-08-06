@@ -38,7 +38,9 @@ Run under: flock -x -w 1800 /tmp/mlir-air-npu.lock
 
 import argparse
 import os
+import shutil  # noqa: F401
 import sys
+import tempfile
 
 import numpy as np
 from ml_dtypes import bfloat16
@@ -148,6 +150,22 @@ def main():
     ap.add_argument("--variant", required=True, choices=("inside", "hoisted"))
     args = ap.parse_args()
     hoisted = args.variant == "hoisted"
+
+    # RUN IN A TEMP DIRECTORY, ALWAYS.
+    #
+    # compile_addnorm_kernel writes its .o to the CWD and aircc writes air.mlir / air.elf /
+    # air_project/ there too. This file lives under agents/scripts/port-loop/, which
+    # guard_gate_files() fingerprints and no phase allowlist covers -- so when a session ran it
+    # from this directory, commit_step's `git add -A` committed air.mlir and addnorm_pre_add.o
+    # into the driver's own tree, and the tamper check would have halted the run for it.
+    #
+    # 15-environment-notes.md predicted exactly this ("anything new that runs from that directory
+    # will leak artifacts there too") and it was still missed when this fixture was written. A
+    # caller-supplied CWD is not a fix, because the leak depends on where the caller happened to
+    # stand; owning the working directory here is.
+    workdir = tempfile.mkdtemp(prefix="pl-addnorm-fixture-")
+    os.chdir(workdir)
+    print(f"fixture workdir: {workdir}")
 
     compile_addnorm_kernel(pre_add=True)
     trips = (ROWS // HERD_X) // ROWS_PER_CALL

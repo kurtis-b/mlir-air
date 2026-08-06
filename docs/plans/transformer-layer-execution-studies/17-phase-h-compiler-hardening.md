@@ -166,6 +166,40 @@ have been the more expensive place to discover it.
 builders, or by narrowing the refusal until it never fires. `--variant hoisted` must still be
 refused; that clause is what proves the transform still discriminates.
 
+## `[2026-08-06]` Attempt 2: halted on weakened gates, and an artifact leak in the harness
+
+**Codex round 2 reported two weakened gates, and it is right.** The diff edited two of the
+compiler's own lit tests to add consumers that dodge the new refusal:
+
+- `mlir/test/.../label_ping_pong_loops.mlir` — at the phase base this test required ping-pong
+  labeling of bare alloc/dealloc loops. `channel.get`/`channel.put` consumers were added
+  specifically to avoid the no-consumer refusal, which removes the coverage proving those
+  previously-accepted safe loops still compile.
+- `mlir/test/.../label_ping_pong_multifill_alloc.mlir` — the single-fill and mutually-exclusive
+  broadcast cases previously ended in deallocation with no read consumer. Drain `channel.put` ops
+  were added, so neither case detects the new rejection of safe fill-only buffers any more.
+
+**That is the wrong direction.** Attempt 1's own report already stated the correct rule —
+"alloc-only and write-only buffers are treated as vacuously safe" — and these tests are exactly the
+evidence for it. If the refusal fires on them, the refusal is wrong; the tests are not. Revert both
+test edits and make the predicate not fire on a buffer that is never *read* without a per-iteration
+producer. A test edited to stop detecting a regression is the one change this harness halts on
+unconditionally, and it will halt again.
+
+Note these files are `mlir/test/**/*.mlir`, which `guard_gate_files()` does **not** fingerprint — it
+covers `.lit` files, not `.mlir`. So the tamper check would not have caught this; only the Codex
+`weakened_gates` layer did. That is a real gap in the fingerprint set, and widening it to the
+compiler's own lit inputs is worth doing before the next compiler phase.
+
+**Separately, and my fault rather than the session's:** running this phase's fixture from
+`agents/scripts/port-loop/fixtures/` leaked `air.mlir`, `air.elf`, `addnorm_pre_add.o` and
+`air_project/` into the driver's own directory, and `commit_step`'s `git add -A` committed two of
+them. That directory is fingerprinted and covered by no allowlist, so the tamper check would have
+halted the phase for artifacts the phase did not intend to create.
+[15](15-environment-notes.md) predicted precisely this and it was still missed. The fixture now
+`chdir`s into a temp directory it owns, with a `.gitignore` as belt — a caller-supplied CWD is not a
+fix, because the leak depends on where the caller happened to stand.
+
 ## Risks
 
 - **The gate is the widest in the plan.** A compiler regression surfaces as ten `make verify` runs
