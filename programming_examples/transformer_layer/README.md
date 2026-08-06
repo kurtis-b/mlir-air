@@ -1098,6 +1098,17 @@ Phase H hardened the compiler against the miscompile behind
   post-loop read waits on the loop's result token, which survives the
   rebuild; only a pre-existing classified FILL has an ordering edge the
   rebuild can sever.
+- **When H1/H2 change a lit test's outcome, the input stays and the CHECKs
+  move** (attempt 4). The three `ping_pong_shared_resident_ring*.mlir` tests
+  had their unannotated `@acc` callee annotated with `llvm.emit_c_interface`
+  + `llvm.readonly` to preserve their old transformed outcome — which
+  deleted the coverage of exactly the path H2 changes. All three inputs are
+  restored to their phase-base IR and now assert the new outcome: both
+  get-loops SKIPPED with a warning (`-verify-diagnostics` catches the
+  diagnostic; `--implicit-check-not=hoist_alloc/unroll` proves nothing was
+  labeled). The transformed-path coverage each one used to carry lives in a
+  new `*_annotated.mlir` companion, identical but for the callee argument
+  attributes.
 
 Footgun: the two-trip fixture shape fully UNROLLS under ping-pong labeling
 (trip count == unroll factor), so `air-ping-pong-transform`'s dependency

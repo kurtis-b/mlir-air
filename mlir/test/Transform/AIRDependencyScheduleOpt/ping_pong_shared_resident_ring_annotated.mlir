@@ -1,37 +1,36 @@
-//===- ping_pong_shared_resident_ring.mlir ---------------------*- MLIR -*-===//
+//===- ping_pong_shared_resident_ring_annotated.mlir -----------*- MLIR -*-===//
 //
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: MIT
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: air-opt %s -air-label-scf-for-to-ping-pong -air-ping-pong-transform -verify-diagnostics | FileCheck %s --implicit-check-not=hoist_alloc --implicit-check-not=unroll
+// RUN: air-opt %s -air-label-scf-for-to-ping-pong -air-ping-pong-transform | FileCheck %s
 
 // Shared-resident-ring ping-pong mode (opt-in via `air.shared_resident_ring` on
-// the channel decl): two sibling get-loops re-reading the same resident input
-// stream share ONE 2-deep ring. But here the consuming compute step is a call
-// to an UNANNOTATED external callee: no memory effects, no
-// llvm.readonly/llvm.writeonly argument attributes, so the read of each
-// per-iteration buffer cannot be classified and the H1 safety proof cannot
-// build the reuse edge that would protect the rotation. Both get-loops must be
-// SKIPPED with a warning -- never labeled, never rotated, the ring opt-in
-// notwithstanding -- and keep their correct single-buffered schedule. The
-// merged-ring coverage this input carried before H2 changed the
-// unannotated-callee outcome lives in
-// ping_pong_shared_resident_ring_annotated.mlir, identical but for the callee
-// argument attributes that make the same loops provable.
+// the channel decl). Two sibling get-loops in one block re-read the SAME
+// resident input stream (one consume pass each). Without the attribute each loop
+// gets its own 2-deep ring (4 buffers total); air-to-aie would then fuse them
+// into a 4-deep ring whose halves interleave coverage -- numerically wrong. With
+// the attribute the second loop is merged onto the first's ring: ONE 2-deep ring
+// (here 2 buffers per get x 2 gets = 4 buffers TOTAL, shared by both loops), the
+// rotation chained through the first loop's iter-arg results.
+//
+// The consuming compute step is an external kernel call whose callee carries
+// llvm.emit_c_interface and per-argument llvm.readonly attributes, so the H1
+// safety proof classifies every use of every duplicated buffer and the loops
+// are provably safe to rotate. This is the annotated-callee companion of
+// ping_pong_shared_resident_ring.mlir, which keeps the same input with an
+// UNANNOTATED callee and asserts the Skip.
 
-// SKIP: the loops stay untransformed -- every alloc remains inside its own
-// loop (2 + 2, not one hoisted 4-buffer ring), and each loop keeps its
-// original single async-token iter arg instead of gaining ring rotation
-// state. The implicit check-nots prove no loop and no alloc was labeled.
+// SHARED: the merged form allocates the ring exactly ONCE (4 allocs: x/w ping +
+// x/w pong) -- not 8 -- and the second loop chains its iter args from the first
+// loop's results.
 // CHECK-LABEL: shared_ring
-// CHECK: scf.for {{.*}} -> (!air.async.token) {
-// CHECK: scf.for {{.*}} -> (!air.async.token) {
-// CHECK-COUNT-2: memref.alloc()
-// CHECK: scf.for {{.*}} -> (!air.async.token) {
-// CHECK-COUNT-2: memref.alloc()
+// CHECK-COUNT-4: memref.alloc()
 // CHECK-NOT: memref.alloc()
+// CHECK: %[[L0:.*]]:4 = scf.for {{.*}} iter_args
+// CHECK: %[[L1:.*]]:4 = scf.for {{.*}} iter_args(%{{.*}} = %[[L0]]#0, %{{.*}} = %[[L0]]#1, %{{.*}} = %[[L0]]#2, %{{.*}} = %[[L0]]#3)
 
 module {
   air.channel @inX [1] {air.shared_resident_ring}
@@ -46,7 +45,6 @@ module {
         %c1s = arith.constant 1 : index
         %2 = air.wait_all async
         %3 = scf.for %v1 = %c0 to %c4 step %c1s iter_args(%t = %2) -> (!air.async.token) {
-          // expected-warning@+1 {{is a ping-pong candidate that cannot be proven safe to transform}}
           %g0 = scf.for %j = %c0 to %c8 step %c1s iter_args(%tt = %t) -> (!air.async.token) {
             %tx, %bx = air.execute [%tt] -> (memref<256xi8, 2>) {
               %al = memref.alloc() : memref<256xi8, 2>
@@ -66,7 +64,6 @@ module {
             %w = air.wait_all async [%dx, %dw]
             scf.yield %w : !air.async.token
           }
-          // expected-warning@+1 {{is a ping-pong candidate that cannot be proven safe to transform}}
           %g1 = scf.for %j = %c0 to %c8 step %c1s iter_args(%tt = %g0) -> (!air.async.token) {
             %tx, %bx = air.execute [%tt] -> (memref<256xi8, 2>) {
               %al = memref.alloc() : memref<256xi8, 2>
@@ -92,5 +89,5 @@ module {
     }
     return
   }
-  func.func private @acc(%a: memref<256xi8, 2>, %b: memref<2560xi8, 2>)
+  func.func private @acc(%a: memref<256xi8, 2> {llvm.readonly}, %b: memref<2560xi8, 2> {llvm.readonly}) attributes {llvm.emit_c_interface}
 }
