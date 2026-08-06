@@ -578,3 +578,89 @@ module {
     return
   }
 }
+
+// -----
+
+// One duplicated buffer passed to TWO formals of the same call -- one
+// llvm.writeonly, one llvm.readonly. At op level that is a read-modify-write
+// of the buffer, exactly like memref.atomic_rmw: the callee's internal order
+// of the two accesses is unknowable, so the write must not count as the
+// refill protecting the call's own read. Classifying only the first operand
+// position ('w') let the proof record the call as both producer and
+// consumer -- vouching for itself -- and label a loop whose rotation hands
+// the readonly formal a stale half. It must REFUSE: the buffer is read but
+// nothing else refills it each iteration.
+module {
+  air.channel @cdrain2 [1, 1]
+  func.func private @knl_wr(memref<64xf32, 2> {llvm.writeonly},
+                            memref<64xf32, 2> {llvm.readonly}, i32)
+      attributes {llvm.emit_c_interface}
+  func.func @same_buffer_two_formals() {
+    %c1 = arith.constant 1 : index
+    %0 = air.herd @h async tile (%tx, %ty) in (%sx=%c1, %sy=%c1) {
+      %c0 = arith.constant 0 : index
+      %c4 = arith.constant 4 : index
+      %c8 = arith.constant 8 : index
+      %c64_i32 = arith.constant 64 : i32
+      %t0 = air.wait_all async
+      // expected-error@+1 {{is a ping-pong candidate that cannot be proven safe to transform}}
+      %1 = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %t0) -> (!air.async.token) {
+        %tb, %bb = air.execute -> (memref<64xf32, 2>) {
+          %a = memref.alloc() : memref<64xf32, 2>
+          air.execute_terminator %a : memref<64xf32, 2>
+        }
+        %tc = air.execute [%tb, %t] {
+          func.call @knl_wr(%bb, %bb, %c64_i32) : (memref<64xf32, 2>, memref<64xf32, 2>, i32) -> ()
+        }
+        %p = air.channel.put async [%tc] @cdrain2[%tx, %ty] (%bb[] [] []) : (memref<64xf32, 2>)
+        %d = air.execute [%p] { memref.dealloc %bb : memref<64xf32, 2> }
+        scf.yield %d : !air.async.token
+      }
+    }
+    return
+  }
+}
+
+// -----
+
+// The same two-formal read-modify-write, but the buffer is refilled by a
+// channel.get on EVERY iteration before the call touches it: each
+// iteration's read observes that iteration's own fill, so rotation is
+// provably safe and the loop must still LABEL. Guard against the op-level
+// aggregation over-refusing -- a call that reads and writes the same buffer
+// is only unsafe when the data it reads carries across iterations.
+// CHECK-LABEL: func.func @same_buffer_two_formals_with_refill
+// CHECK: scf.for
+// CHECK: hoist_alloc
+// CHECK: } {unroll = 2 : i32}
+module {
+  air.channel @cfill3 [1, 1]
+  air.channel @cdrain3 [1, 1]
+  func.func private @knl_wr2(memref<64xf32, 2> {llvm.writeonly},
+                             memref<64xf32, 2> {llvm.readonly}, i32)
+      attributes {llvm.emit_c_interface}
+  func.func @same_buffer_two_formals_with_refill() {
+    %c1 = arith.constant 1 : index
+    %0 = air.herd @h async tile (%tx, %ty) in (%sx=%c1, %sy=%c1) {
+      %c0 = arith.constant 0 : index
+      %c4 = arith.constant 4 : index
+      %c8 = arith.constant 8 : index
+      %c64_i32 = arith.constant 64 : i32
+      %t0 = air.wait_all async
+      %1 = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %t0) -> (!air.async.token) {
+        %tb, %bb = air.execute -> (memref<64xf32, 2>) {
+          %a = memref.alloc() : memref<64xf32, 2>
+          air.execute_terminator %a : memref<64xf32, 2>
+        }
+        %g = air.channel.get async [%tb, %t] @cfill3[%tx, %ty] (%bb[] [] []) : (memref<64xf32, 2>)
+        %tc = air.execute [%g] {
+          func.call @knl_wr2(%bb, %bb, %c64_i32) : (memref<64xf32, 2>, memref<64xf32, 2>, i32) -> ()
+        }
+        %p = air.channel.put async [%tc] @cdrain3[%tx, %ty] (%bb[] [] []) : (memref<64xf32, 2>)
+        %d = air.execute [%p] { memref.dealloc %bb : memref<64xf32, 2> }
+        scf.yield %d : !air.async.token
+      }
+    }
+    return
+  }
+}

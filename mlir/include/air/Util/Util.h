@@ -208,6 +208,11 @@ struct LinalgTransforms {
 // (`llvm.readonly` -> 'r', `llvm.writeonly` -> 'w'); an unannotated memref
 // operand stays 'u' -- read-versus-write is not established, and callers must
 // treat the access as one they cannot order rather than guess a direction.
+// The (Value, Operation*) overload aggregates over EVERY operand position
+// the value occupies: one memref passed to a writeonly formal and a readonly
+// formal of the same call is 'b' at op level, and any unclassifiable
+// occurrence makes the whole answer 'u' -- returning only the first
+// occurrence is how a same-buffer second operand's read silently vanished.
 char checkOpOperandReadOrWrite(mlir::OpOperand &op_operand);
 char checkOpOperandReadOrWrite(Value op_operand, Operation *owner);
 

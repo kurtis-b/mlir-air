@@ -1144,15 +1144,45 @@ int air::evaluateSymbolEqualityInSet(AffineExpr c, MLIRContext *ctx) {
   return (result >= 0) ? (result) : (-result);
 }
 
-// Check if an operand of an operation is read or write access
+// Classify a value's access by an operation, aggregated over EVERY operand
+// position the value occupies. One memref passed to two formals -- e.g.
+// call @kernel(%buf, %buf) where the callee marks the first llvm.writeonly
+// and the second llvm.readonly -- is both written and read by the op, and
+// answering with the first occurrence alone ('w') hides the read: a caller
+// bucketing the op as a pure producer then drops the dependence edge
+// protecting the read, the same silent-lost-reader failure 'b' exists to
+// prevent. Mixed read+write aggregates to 'b'; any unclassifiable
+// occurrence makes the whole answer 'u', because a direction established
+// for one operand proves nothing about the access the other operand hides.
 char air::checkOpOperandReadOrWrite(Value v, Operation *owner) {
+  bool matched = false, read = false, write = false, unknown = false;
   for (auto &op_operand : owner->getOpOperands()) {
-    if (op_operand.is(v)) {
-      return checkOpOperandReadOrWrite(op_operand);
+    if (!op_operand.is(v))
+      continue;
+    matched = true;
+    switch (checkOpOperandReadOrWrite(op_operand)) {
+    case 'r':
+      read = true;
+      break;
+    case 'w':
+      write = true;
+      break;
+    case 'b':
+      read = write = true;
+      break;
+    default:
+      unknown = true;
+      break;
     }
   }
   // Value is not an opoperand of the operation
-  return 'e';
+  if (!matched)
+    return 'e';
+  if (unknown)
+    return 'u';
+  if (read && write)
+    return 'b';
+  return write ? 'w' : 'r';
 }
 char air::checkOpOperandReadOrWrite(mlir::OpOperand &op_operand) {
   auto owner = op_operand.getOwner();

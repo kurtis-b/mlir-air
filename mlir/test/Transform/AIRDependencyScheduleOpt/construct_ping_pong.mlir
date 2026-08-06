@@ -751,3 +751,70 @@ func.func @unclassified_consumer() {
   }
   return
 }
+
+// H2 regression: one duplicated buffer passed to TWO formals of the same
+// call -- one llvm.writeonly, one llvm.readonly. Classifying only the first
+// operand position answered 'w', so the rebuild recorded the call as a pure
+// PRODUCER and dropped its read: the ring then had no reuse edge holding the
+// next iteration's fill behind the kernel's read of the previous one. At op
+// level the call is a read-modify-write ('b'), i.e. a consumer: assert the
+// call executes carry `consumer` attrs and each half's next-iteration
+// channel.get waits on that half's call-back token through the yield.
+// CHECK-LABEL: two_formal_consumer
+// CHECK: %[[FOR:.*]]:4 = scf.for {{.*}} iter_args(%[[PINGCB:.*]] = {{.*}} %[[PONGCB:.*]] = {{.*}} %[[T2:.*]] = {{.*}} %[[T3:.*]] = {{.*}})
+// CHECK: %[[GET0:.*]] = air.channel.get async [%[[T3]], %[[PINGCB]]{{.*}}] @channel_tf
+// CHECK: %[[CALL0:.*]] = air.execute [%[[T2]], %[[GET0]]]
+// CHECK-NEXT: func.call @acc_wr
+// CHECK: } {consumer = 0
+// CHECK: %[[BACK0:.*]] = air.wait_all async [%[[CALL0]]]
+// CHECK: %[[GET1:.*]] = air.channel.get async [%[[GET0]], %[[PONGCB]], %[[BACK0]]{{.*}}] @channel_tf
+// CHECK: %[[CALL1:.*]] = air.execute [%[[BACK0]], %[[GET1]]]
+// CHECK-NEXT: func.call @acc_wr
+// CHECK: } {consumer = 1
+// CHECK: %[[BACK1:.*]] = air.wait_all async [%[[CALL1]]]
+// CHECK: scf.yield %[[BACK0]], %[[BACK1]], %[[BACK1]], %[[GET1]] : !air.async.token, !air.async.token, !air.async.token, !air.async.token
+
+air.channel @channel_tf [1, 1]
+func.func private @acc_wr(memref<32x32xbf16, 2> {llvm.writeonly}, memref<32x32xbf16, 2> {llvm.readonly}) attributes {llvm.emit_c_interface}
+func.func @two_formal_consumer() {
+  %c1 = arith.constant 1 : index
+  %0 = air.launch async (%arg4, %arg5) in (%arg6=%c1, %arg7=%c1) attributes {id = 7 : i32} {
+    %1 = air.segment async {
+      %c1_0 = arith.constant 1 : index
+      %3 = air.herd @herd_0 async  tile (%arg16, %arg17) in (%arg18=%c1_0, %arg19=%c1_0) {
+        %c128 = arith.constant 128 : index
+        %c0_2 = arith.constant 0 : index
+        %c512_3 = arith.constant 512 : index
+        %5 = air.wait_all async
+        %async_token_4, %results_5 = air.execute [%5] -> (memref<32x32xbf16, 2>) {
+          %alloc = memref.alloc() : memref<32x32xbf16, 2>
+          air.execute_terminator %alloc : memref<32x32xbf16, 2>
+        } {unrolled_iteration = 1 : i32}
+        %async_token_6, %results_7 = air.execute [%async_token_4] -> (memref<32x32xbf16, 2>) {
+          %alloc = memref.alloc() : memref<32x32xbf16, 2>
+          air.execute_terminator %alloc : memref<32x32xbf16, 2>
+        } {unrolled_iteration = 0 : i32}
+        %6 = scf.for %arg20 = %c0_2 to %c512_3 step %c128 iter_args(%arg21 = %async_token_6) -> (!air.async.token) {
+          %7 = air.channel.get async [%arg21]  @channel_tf[] (%results_7[] [] []) {async_front = true, unrolled_iteration = 0 : i32} : (memref<32x32xbf16, 2>)
+          %async_token_c0 = air.execute [%7] {
+            func.call @acc_wr(%results_7, %results_7) : (memref<32x32xbf16, 2>, memref<32x32xbf16, 2>) -> ()
+          } {unrolled_iteration = 0 : i32}
+          %8 = air.wait_all async [%async_token_c0]  {async_back = true, unrolled_iteration = 0 : i32}
+          %9 = air.channel.get async [%8]  @channel_tf[] (%results_5[] [] []) {async_front = true, unrolled_iteration = 1 : i32} : (memref<32x32xbf16, 2>)
+          %async_token_c1 = air.execute [%9] {
+            func.call @acc_wr(%results_5, %results_5) : (memref<32x32xbf16, 2>, memref<32x32xbf16, 2>) -> ()
+          } {unrolled_iteration = 1 : i32}
+          %10 = air.wait_all async [%async_token_c1]  {async_back = true, unrolled_iteration = 1 : i32}
+          scf.yield %10 : !air.async.token
+        } {unroll = 2 : i32}
+        %async_token_8 = air.execute [%6] {
+          memref.dealloc %results_7 : memref<32x32xbf16, 2>
+        } {unrolled_iteration = 0 : i32}
+        %async_token_9 = air.execute [%6] {
+          memref.dealloc %results_5 : memref<32x32xbf16, 2>
+        } {unrolled_iteration = 1 : i32}
+      }
+    }
+  }
+  return
+}

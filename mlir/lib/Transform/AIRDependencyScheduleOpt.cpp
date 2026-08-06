@@ -1275,8 +1275,8 @@ struct ConstructPingPongDependencyPattern
       Operation *parent = op->getParentOp();
       while (isa_and_present<affine::AffineIfOp>(parent)) {
         if (parent->hasAttr("unrolled_iteration"))
-          id = parent->getAttrOfType<IntegerAttr>("unrolled_iteration")
-                   .getInt();
+          id =
+              parent->getAttrOfType<IntegerAttr>("unrolled_iteration").getInt();
         parent = parent->getParentOp();
       }
       return id;
@@ -1808,77 +1808,99 @@ static PingPongSafety provePingPongSafety(scf::ForOp forOp,
   llvm::DenseMap<Operation *, int> consumers;
   llvm::DenseMap<Operation *, llvm::SmallPtrSet<Operation *, 4>> producerOps;
   bool skip = false;
-  forOp.getBody()->walk<WalkOrder::PreOrder>(
-      [&](Operation *op) -> WalkResult {
-        if (isa<air::HerdOp, air::SegmentOp, air::LaunchOp>(op))
-          return WalkResult::skip();
-        // Terminators that merely forward a value out of a region
-        // (air.execute yielding its alloc, scf.yield) are plumbing, not
-        // memory accesses.
-        if (isa<air::ExecuteTerminatorOp, scf::YieldOp>(op))
-          return WalkResult::advance();
-        for (OpOperand &operand : op->getOpOperands()) {
-          if (!llvm::isa<BaseMemRefType>(operand.get().getType()))
-            continue;
-          auto it = aliasToAlloc.find(operand.get());
-          bool isCandidateAlloc = it != aliasToAlloc.end();
-          // Deallocs of candidate allocs are rebuilt by the transform, and a
-          // dealloc of a memref defined inside the body frees
-          // per-iteration-private memory -- neither can interact with this
-          // loop's rotation. The latter arises when this proof re-runs at
-          // transform time on an outer loop whose body holds an inner,
-          // already-transformed ping-pong loop: the inner loop's buffers are
-          // body-local here, not candidates.
-          if (isa<memref::DeallocOp>(op)) {
-            if (isCandidateAlloc)
-              continue;
-            Operation *def = operand.get().getDefiningOp();
-            if (def && forOp->isProperAncestor(def))
-              continue;
-          }
-          char rw = checkOpOperandReadOrWrite(operand);
-          if (rw == 'u') {
-            // A provably memory-effect-free use (memref.dim, memref.cast:
-            // metadata only) has no access to drop from the rebuilt
-            // graph, wherever its memref lives.
-            if (mlir::isMemoryEffectFree(op))
-              continue;
-            // An unclassifiable use of a memref the rotation does NOT
-            // privatize is none of this transform's business: that buffer
-            // stays one physical buffer, untouched, and every edge
-            // ordering it against the outside world (hierarchy tokens,
-            // the loop's init and result tokens) survives the rebuild.
-            // Blocking on it refused shipped, working designs twice --
-            // see the proof's header comment.
-            if (!isCandidateAlloc)
-              continue;
-            // Unprovable use of a buffer this loop would duplicate:
-            // refuse to LABEL, and leave the (correct) untransformed
-            // loop alone.
-            if (!skip)
-              os << "an operand of '" << op->getName().getStringRef()
-                 << "' cannot be classified as a read or a write of a "
-                    "buffer the transform would duplicate, so the "
-                    "rebuilt dependency graph would silently drop it";
-            skip = true;
-            continue;
-          }
-          if (!isCandidateAlloc)
-            continue;
-          if (rw == 'w')
-            producerOps[it->second].insert(op);
-          // A read-modify-write ('b': memref.atomic_rmw, a linalg op whose
-          // payload reads its init) is a READER of the candidate buffer,
-          // and only a reader here: its write depends on the buffer's prior
-          // contents, so it proves no per-iteration refill -- counting it
-          // as a producer would let an accumulator vouch for itself and
-          // pass the buffer off as vacuously safe below, the exact bypass
-          // that hands a rotated stale half to the next iteration's read.
-          else if (rw == 'r' || rw == 'b')
-            consumers[it->second]++;
-        }
-        return WalkResult::advance();
-      });
+  forOp.getBody()->walk<WalkOrder::PreOrder>([&](Operation *op) -> WalkResult {
+    if (isa<air::HerdOp, air::SegmentOp, air::LaunchOp>(op))
+      return WalkResult::skip();
+    // Terminators that merely forward a value out of a region
+    // (air.execute yielding its alloc, scf.yield) are plumbing, not
+    // memory accesses.
+    if (isa<air::ExecuteTerminatorOp, scf::YieldOp>(op))
+      return WalkResult::advance();
+    // Per-buffer access flags for THIS op, committed only after every
+    // operand is seen: one memref passed to several operands of one op
+    // (e.g. a call whose callee marks one formal llvm.writeonly and
+    // another llvm.readonly) is a read-modify-write of that buffer at
+    // op level, exactly like a single 'b' operand -- the callee's
+    // internal order of the two accesses is unknowable, so the write
+    // must not count as the refill protecting the op's own read.
+    // Committing per operand instead would record the op as both
+    // producer and consumer, letting it vouch for itself.
+    llvm::SmallDenseMap<Operation *, std::pair<bool, bool>, 2>
+        opAccess; // alloc -> (reads, writes)
+    for (OpOperand &operand : op->getOpOperands()) {
+      if (!llvm::isa<BaseMemRefType>(operand.get().getType()))
+        continue;
+      auto it = aliasToAlloc.find(operand.get());
+      bool isCandidateAlloc = it != aliasToAlloc.end();
+      // Deallocs of candidate allocs are rebuilt by the transform, and a
+      // dealloc of a memref defined inside the body frees
+      // per-iteration-private memory -- neither can interact with this
+      // loop's rotation. The latter arises when this proof re-runs at
+      // transform time on an outer loop whose body holds an inner,
+      // already-transformed ping-pong loop: the inner loop's buffers are
+      // body-local here, not candidates.
+      if (isa<memref::DeallocOp>(op)) {
+        if (isCandidateAlloc)
+          continue;
+        Operation *def = operand.get().getDefiningOp();
+        if (def && forOp->isProperAncestor(def))
+          continue;
+      }
+      char rw = checkOpOperandReadOrWrite(operand);
+      if (rw == 'u') {
+        // A provably memory-effect-free use (memref.dim, memref.cast:
+        // metadata only) has no access to drop from the rebuilt
+        // graph, wherever its memref lives.
+        if (mlir::isMemoryEffectFree(op))
+          continue;
+        // An unclassifiable use of a memref the rotation does NOT
+        // privatize is none of this transform's business: that buffer
+        // stays one physical buffer, untouched, and every edge
+        // ordering it against the outside world (hierarchy tokens,
+        // the loop's init and result tokens) survives the rebuild.
+        // Blocking on it refused shipped, working designs twice --
+        // see the proof's header comment.
+        if (!isCandidateAlloc)
+          continue;
+        // Unprovable use of a buffer this loop would duplicate:
+        // refuse to LABEL, and leave the (correct) untransformed
+        // loop alone.
+        if (!skip)
+          os << "an operand of '" << op->getName().getStringRef()
+             << "' cannot be classified as a read or a write of a "
+                "buffer the transform would duplicate, so the "
+                "rebuilt dependency graph would silently drop it";
+        skip = true;
+        continue;
+      }
+      if (!isCandidateAlloc)
+        continue;
+      auto &acc = opAccess[it->second];
+      if (rw == 'w')
+        acc.second = true;
+      else if (rw == 'r')
+        acc.first = true;
+      else if (rw == 'b')
+        acc.first = acc.second = true;
+    }
+    // Commit the aggregated accesses. A read-modify-write of a buffer
+    // ('b' on one operand -- memref.atomic_rmw, a linalg op whose
+    // payload reads its init -- or read and write established through
+    // separate operands of the same op) is a READER of the candidate
+    // buffer, and only a reader here: its write depends on (or is
+    // unordered against) the buffer's prior contents, so it proves no
+    // per-iteration refill -- counting it as a producer would let an
+    // accumulator vouch for itself and pass the buffer off as
+    // vacuously safe below, the exact bypass that hands a rotated
+    // stale half to the next iteration's read.
+    for (auto &[allocOp, acc] : opAccess) {
+      if (acc.second && !acc.first)
+        producerOps[allocOp].insert(op);
+      if (acc.first)
+        consumers[allocOp]++;
+    }
+    return WalkResult::advance();
+  });
   // With an unclassified candidate use the producer/consumer sets below
   // are incomplete, so the per-buffer requirements are unknowable; the
   // skip verdict already covers the loop.
