@@ -29,6 +29,8 @@ how to use MLIR-AIR.
 | [13-verification-and-acceptance.md](13-verification-and-acceptance.md) | Every gate, in one place |
 | [14-the-port-loop-harness.md](14-the-port-loop-harness.md) | The automated driver: how it works, how to run a phase, what it learned the hard way |
 | [15-environment-notes.md](15-environment-notes.md) | Toolchain state and the setup traps that silently hollow out hardware gates |
+| [16-compiler-work-and-remaining-essence.md](16-compiler-work-and-remaining-essence.md) | **Start here for what remains.** Tranche H (compiler) and tranche J (the study), the corrected root cause, and what AIR automates versus what iron writes by hand |
+| [17-phase-h-compiler-hardening.md](17-phase-h-compiler-hardening.md) | Phase H spec plus its attempt-by-attempt record — including two of its own claims that measurement falsified |
 
 ## Status board
 
@@ -50,10 +52,30 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | E3 — `offload` | `offload` matches, and aggregates nothing | **done** 2026-08-05 (55 min) |
 | E4 — `runlist` | `runlist` matches, with more runlist entries than `coarse` | **done** 2026-08-05 (91 min) |
 | E5 — `fused` + distinguishability | `fused` matches, and all four modes' dispatch vectors separate as the taxonomy predicts | **done** 2026-08-05 (62 min) |
+| H — compiler hardening | `gate-h.sh` four legs: build + install, `check-air-mlir`, transformer-layer suite, `make verify` × 10 | **halted** 2026-08-06 at `confirm/3`. Legs 1–3 green; leg 4 never passed. Three bounded items left — see [17](17-phase-h-compiler-hardening.md#what-the-next-session-does) |
 | F — study harness | `execution-smoke-test` yields ≥1 `run_status=passed` row per measurement CSV | not started |
 | G — unattended runner + CI | Full profile run completes with a complete `results_manifest.json` | not started |
 | Goal 1 — sliding window | `make verify` passes with window-crossing prompts | not started |
 | Goal 2 — quantization | Second quantized model passes a gate that exercises the quantized path | not started |
+
+## `[2026-08-06]` Where things stand, for a session picking this up cold
+
+Read [16](16-compiler-work-and-remaining-essence.md) first — it is the map of everything unfinished.
+Three live threads, and they are independent of each other:
+
+1. **J1 is unblocked and is the highest-value item.** Lift `builders/addnorm.py`'s one-trip guard
+   and re-measure `coarse`; expect 131 runlist entries → ~5, the largest structural gap between this
+   port and iron. It was believed to be blocked on Phase H. It never was: the blocker was the shim
+   packet feed order, fixed in `bfb647d9`, and the two-trip case is now **measured correct on
+   hardware**. Nothing stands in front of this.
+2. **Phase H has three bounded items left** — refuse→skip, re-specify the fixture's `hoisted`
+   clause, add a `CHECK-NOT: unroll` lit test — then a `gate-h.sh` re-run for leg 4. No open
+   questions. [17 §What the next session does](17-phase-h-compiler-hardening.md#what-the-next-session-does).
+   Resume with `resume-at`, never plain `resume`.
+3. **J7 is unbuilt, not blocked**: pipelined `mha_out_proj` and FFN with on-chip partial-sum
+   staging. Start with the norm tail — smallest piece, and it has a measured precision target to
+   beat (1.806e-2 → 1.688e-2). Read [16 §What AIR automates today](16-compiler-work-and-remaining-essence.md#what-air-automates-today-and-what-it-does-not)
+   before designing it; half of what looks like work is already done by the compiler.
 
 Phases A and B were executed by the automated driver — see
 [14-the-port-loop-harness.md](14-the-port-loop-harness.md). Both passed their gate, objective

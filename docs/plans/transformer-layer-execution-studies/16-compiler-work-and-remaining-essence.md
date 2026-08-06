@@ -6,79 +6,156 @@ dispatch vector. This document is what stands between that and the study the por
 
 Two tranches. **H** is compiler work in `mlir/` — it has the largest blast radius in the plan, since
 every shipped model compiles through it. **J** is the study itself. They are separated because their
-gates are different, not because they are independent: three of J's items are blocked on H.
+gates are different.
+
+**`[2026-08-06]` J is no longer blocked on H.** The first draft of this document said three of J's
+items were, on the strength of a root-cause analysis that Phase H then disproved by measurement. The
+real blocker was a different defect, it is fixed, and the fix is verified on hardware. Every J item
+can start today; H's remaining work is worth doing on its own merits, not as a prerequisite.
 
 Everything below was measured or read on 2026-08-05/06. Nothing here is speculative.
 
-## The root cause, established
+## The root cause — corrected `[2026-08-06]`, and the guard is now liftable
+
+> **This section replaces an earlier one that was wrong.** It blamed ping-pong buffering and a
+> missing dependency edge, and Phase H's first attempt disproved it by measurement. The wrong
+> version is not preserved here; [17](17-phase-h-compiler-hardening.md) records how it fell.
 
 `builders/addnorm.py` forbids more than one trip of its row loop. That single rule turns 4096 rows
 into **64 host dispatches**, which is 128 of `coarse`'s 131 runlist entries — the largest structural
-gap between this port and iron's `hybrid` (5 entries). The builder's docstring blamed ping-pong
-buffering. The real cause is narrower and worse:
+gap between this port and iron's `hybrid` (5 entries).
 
-1. `air-dma-to-channel` splits an L3→L1 `dma_memcpy_nd` into an internal `air.channel.get` (writes
-   L1) and an external `air.channel.put` marked `hoist`. **The channel bundle is indexed by spatial
-   IDs only** — herd and `scf.parallel` — so the temporal `scf.for` IV is not part of channel
-   identity (`AIRDmaToChannel.cpp`).
-2. `air-label-scf-for-to-ping-pong` marks the loop `unroll = 2` and every candidate alloc
-   `hoist_alloc`, having checked only that no alloc is filled by more than one non-exclusive
-   `channel.get` per iteration. It does **not** require exactly one producer, a producer for *both*
-   duplicated halves, a recognized consumer, or order-preserving correspondence with the hoisted
-   external endpoint (`AIRDependencyScheduleOpt.cpp::isPingPongCandidate`).
-3. `checkOpOperandReadOrWrite` (`mlir/lib/Util/Util.cpp`) classifies a use via memory effects,
-   `ChannelPutOp`, `ChannelGetOp` or linalg, and returns `'u'` otherwise. **An external kernel
-   `func.call` has no registered memory effects, so the compute step is invisible.**
-4. Unknown uses are silently omitted from dependency construction, and an empty producer or consumer
-   set becomes `air::WaitAllOp::create(..., SmallVector<Value>{})` — a dependency-free placeholder
-   rather than a rejection.
+**The cause was the shim feed order under packet multiplexing, not ping-pong.**
 
-Net: the ping/pong halves get **no reuse edge** protecting a buffer until the kernel has finished
-reading it. One trip is safe because nothing is reused; two trips corrupt. Measured at
-`cols=64, rows=8, rows_per_call=4`: 481–497 of 512 elements wrong.
+1. `air-dma-to-channel` hoists each L3-side DMA into its **own** launch-scope loop, so a herd that
+   fills N buffers per iteration produces N sibling per-channel put loops.
+2. When those channels are packet-multiplexed onto one shim MM2S queue (`channel_type =
+   "npu_dma_packet"`), the queue serializes in task order — **whole channel after whole channel**.
+3. The consuming tile's BD ring is built from the herd's per-iteration get order, so it expects the
+   streams **interleaved per iteration**. At one trip the two orders coincide. At two or more, every
+   packet after the first iteration lands in the wrong buffer.
 
-Two independent confirmations. Rewriting the same computation with `air.channel` passes at two trips
-with zero mismatches and a one-trip control — because `ChannelGet`/`ChannelPut` *are* in the
-classifier. And hoisting the weight DMA out of the loop corrupts, which the builder already
-documents, for the same missing-edge reason.
+Measured at `cols=64, rows=8, rows_per_call=4`: 481 of 512 elements wrong.
 
-**The channel form is not the fix, though.** At the block's own configuration it fails in
-`air-to-aie` with `'aie.lock' op lock assigned invalid id (maximum is 15)` — the 64-band unroll
-needs far more locks than a tile has. It is a diagnostic that isolates the cause, not a route to
-one dispatch. Fixing the dependency analysis (H1 + H2) is what makes the DMA path work multi-trip;
-H5 is what would make the channel path viable at scale.
+**How ping-pong was ruled out:** compiling the same shape with `--omit-ping-pong-transform=all`
+reproduces the **identical** 481/512 corruption. A cause you can disable without changing the result
+is not the cause. The `air.channel` rewrite that "confirmed" the old hypothesis was passing for a
+different reason — channel form does not produce the sibling put-loop grouping in the first place.
 
-**Every comparable compiler refuses to transform when it cannot establish the invariant.** Upstream
-`memref::multiBuffer` returns `failure()` unless it can point at a user that provably clobbers the
-whole buffer each iteration — and its `overrideBuffer()` only recognizes `memref.copy`, so a custom
-DMA op would not qualify. IREE calls it with `skipOverrideAnalysis=false` and never forces it.
-Triton gates entry on an explicit precondition list. TVM `ICHECK`-aborts. Silently emitting wrong
-numbers is the outlier behaviour here, and fixing *that* is worth more than the optimization.
+**Fixed by `air-fuse-packet-put-loops`** (commit `bfb647d9`), which fuses sibling per-channel put
+loops that share a block, share static bounds and all target packet-typed channels into one loop
+performing the puts in program order, plus modelling packet-typed channels as one shared stream
+resource in `CanonicalizeAsyncOpDeps` so the token chain survives pruning.
+
+**The guard is liftable, and this is measured, not inferred.** The driver-owned fixture's
+`--variant inside` — a legitimate two-trip loop at exactly the shape `addnorm.py` measured the
+miscompile at — now runs on hardware with **zero mismatches**. That is the evidence J1 was waiting
+for, and it means J1 is no longer blocked on anything.
+
+### The second defect, real but not that one
+
+`checkOpOperandReadOrWrite` (`mlir/lib/Util/Util.cpp`) classified a memref use via memory effects,
+`ChannelPutOp`, `ChannelGetOp` or linalg and returned `'u'` otherwise — so **an external kernel
+`func.call`, which registers no memory effects, was invisible to dependency construction**. Unknown
+uses were silently omitted, and an empty producer or consumer set became
+`air::WaitAllOp::create(..., SmallVector<Value>{})`: a dependency-free placeholder rather than a
+rejection.
+
+This did not cause the addnorm corruption. It is still worth fixing and **H2 fixed it**, because it
+is the blocker under every dataflow analysis over external-kernel programs — including the
+promotion pass in H8 below. A callee carrying `llvm.emit_c_interface` now classifies its memref
+operands from `llvm.readonly` / `llvm.writeonly` argument attributes; an unannotated operand stays
+unknown and the compiler never guesses a direction.
+
+### What "bail out" turned out to mean
+
+H1 was specified as "hard-fails compilation with a diagnostic", citing upstream `memref::multiBuffer`
+as prior art. **That reading was wrong and the error is mine.** `memref::multiBuffer` returns
+`failure()`, which means *decline to transform and leave the code alone* — not *abort the build*.
+IREE (`skipOverrideAnalysis=false`), Triton's precondition list and TVM's `ICHECK` all bail out of
+the transformation. Gate leg 4 caught the consequence: three shipped models (`llama32_1b_int4`,
+`qwen3_0_6b`, `qwen3_1_7b`) failing to build on programs that were always correct.
+
+The corrected rule: when the pass cannot prove the rotation safe it **skips** — leaves the loop
+single-buffered, warns naming the loop, and compilation proceeds. Compilation aborts only for IR
+that is genuinely malformed. The dependency-free `WaitAllOp` placeholder stays forbidden: skipping
+means not transforming, not transforming with an empty edge set. That was always the real defect.
 
 ## Tranche H — compiler
 
 Gate for every H item: mlir-air's own lit suite, the transformer-layer suite, **and** `make verify`
-over the ten shipped models. `gate-e1.sh` is the model; H needs a build step in front of it.
+over the ten shipped models. `gate-e1.sh` is the model; H needs a build step in front of it —
+`gate-h.sh` has it, as four legs.
+
+### Landed `[2026-08-06]`
+
+Committed on the branch, green through gate legs 1–3 (build + install, `check-air-mlir` at
+486/500 with 7 pre-existing UNSUPPORTED and 7 pre-existing XFAIL, transformer-layer suite 24/24).
+Phase H is still halted — see "In flight" below — but these are done and should not be re-derived:
+
+| # | Item | State |
+|---|---|---|
+| — | **`air-fuse-packet-put-loops`** and packet-typed channels as one shared stream resource. The actual fix for the two-trip miscompile. | landed `bfb647d9` |
+| H2 | **The classifier sees external kernel calls.** `llvm.emit_c_interface` callees classify memref operands from `llvm.readonly` / `llvm.writeonly`; unannotated operands stay `'u'` and no direction is guessed. | landed |
+| H3 | **`AIRDialect::verifyOperationAttribute`** (`hasOperationAttrVerify = 1`), validating each `air.*` attribute's type and the op type it may sit on, as `GPUDialect` does. Starts with `air.disable_ping_pong` and `air.shim_dma_tile_sizes`. | landed `3428238b` |
+| — | 522 lines of new compiler test coverage. | landed |
+
+### In flight — H1, three bounded items
+
+The spec was corrected mid-phase (see above): **skip and warn, do not abort.** What remains is
+mechanical and has no open questions.
 
 | # | Item | Why | Size |
 |---|---|---|---|
-| H1 | **Bail out instead of miscompiling.** Reject ping-pong candidacy unless every alloc has a recognized producer for *both* halves and at least one recognized consumer, and no relevant use classifies `'u'`. Emit a diagnostic naming the loop. | Converts a silent 481/512 wrong answer into a compile error. It is what `builders/addnorm.py`'s Python guard is standing in for. | small |
-| H2 | **Teach the classifier about external kernel calls.** A `func.call` whose callee carries `llvm.emit_c_interface` should classify its memref operands from the callee's argument attributes rather than falling through to `'u'`. | This is the actual missing edge. With it, H1's bail-out stops firing on the legitimate case and multi-trip becomes correct. | small–medium |
-| H3 | **`AIRDialect::verifyOperationAttribute`** (`hasOperationAttrVerify = 1`). Validate every `air.*` discardable attribute and the op type it may sit on, as `GPUDialect` does. | Absent entirely today. Runs on every op after every pass under `-verify-each`, so a misplaced or mistyped attribute is caught at the pass that broke it. | small |
+| H1a | **Implement refuse → skip.** When the rotation cannot be proven safe for a buffer it privatizes, leave the loop single-buffered and emit a warning naming the loop. Refuse to *compile* only for genuinely malformed IR. | Three shipped models fail to build under the refusal spec. Correctness is preserved by skipping; only the optimization is lost. | small |
+| H1b | **Re-specify the `hoisted` fixture clause.** With refusal gone it can no longer discriminate by demanding an error. It must assert: compiles, numerically correct, **and was not ping-pong transformed**. | Without the third clause it is a second copy of `inside` and proves nothing. | small |
+| H1c | **Add the `CHECK-NOT: unroll` lit test** over the labeled IR, which is the natural home for H1b's third clause — asserting non-transformation from the Python runner is not straightforward. | The fixture proves numerics; the lit test proves the pass declined. | small |
+
+Then re-run `gate-h.sh` to clear leg 4 (`make verify` over the ten shipped models), which is the
+only leg that has never passed.
+
+**Two things the resume must not carry forward.** `phases.sh:37` still describes H as "ping-pong
+bail-out, call classifier, attribute verifier" — the first third of that is the falsified spec. And
+`agents/scripts/port-loop/fixtures/addnorm_multitrip.py`'s docstring still explains the corruption
+as a missing dependency edge. Both files are fingerprinted by `guard_gate_files()` with an empty
+allowlist, so **only the driver may change them, and not while a phase is mid-run** — editing them
+now would trip the tamper check on resume. They are the driver's to fix between phases.
+
+### Not started
+
+| # | Item | Why | Size |
+|---|---|---|---|
 | H4 | **Resolve the `air.disable_ping_pong` discrepancy.** `isPingPongCandidate` checks it, yet setting it on the row loop changed nothing — both arms produced byte-identical 481/512. Determine whether it is dropped, attached to the wrong op after rewrites, or read too late. If dropped, promote it from discardable to an **inherent** ODS attribute. | A documented opt-out that does not work is worse than none. Discardable attributes may legitimately be dropped by any pass that does not know them; PR #1664 already hand-patched four such sites. | small |
 | H5 | **Dynamic channel indices.** Split `air.channel`'s `indices` into a static dimension (selects flow/tile, must stay compile-time) and a dynamic one resolved by a runtime counter modulo depth. | `air.channel` indices are compile-time today, so a 64-band loop fully unrolls. **`[2026-08-06]` That unroll does not merely cost compile time — it exhausts the hardware.** The block configuration (4096x768, 8 cores, 64 bands) failed with `error: 'aie.lock' op lock assigned invalid id (maximum is 15)` in `air-to-aie`: 64 bands x 4 channels is far past the 16 locks a tile has. So the channel workaround is correct at 2 trips (measured, zero mismatches) but **cannot reach the block's band count at all**, which makes this item a prerequisite for that path rather than an optimization of it. **mlir-aie already solved this one layer down**: `-aie-objectFifo-stateful-transform`'s `dynamic-objFifos` uses a per-core counter plus `scf.index_switch`, and it is now the default, with static LCM unrolling as the legacy fallback. | medium |
 | H6 | **Per-region `omit_pingpong`.** Teach `air-label-scf-for-to-ping-pong` to read a per-herd/per-segment attribute layered over its module-wide option. | FlashAttention needs `omit_pingpong="all"` + `runtime_loop_tiling_sizes=[1,1]`; the 4096-row GEMMs need `[2,2]`. One ELF is one aircc invocation, so `fused` is 3 ELFs instead of 1. It also costs codegen *inside* existing ELFs — one K=8192 launch forces every sibling in `o_ffn` to give up ping-pong. **The transform pass needs no change**: the flow is already label→transform and already does `removeAttr` on consume. Prototype with `transform.apply_registered_pass` first — AIR has `air-transform` and `AIRTransformOps.td` today, so this needs no C++ to validate. | medium |
 | H7 | **Re-localize the offset-subview blocker.** A `memref.subview` at a nonzero offset cannot reach a launch argument. **`air.launch` is not the blocker** — its ODS is `Variadic<AnyType>`. The two `isIdentity()` gates found so far are narrow (cascade channels, `#air.symmetric_heap`), so the real wall is elsewhere, likely the Python builder's signature. Find it before scoping. | Blocks reusing a row-banded operator inside a fused module, and iron-style banded addressing with the offset baked into the instruction stream. | unknown |
+| H8 | **Automatic on-chip staging between pipeline stages** — see [the survey below](#what-air-automates-today-and-what-it-does-not). A pass that finds a memref written by exactly one hierarchy op, read by exactly one, with no host aliasing and dead afterwards, replaces it with a channel and demotes its memory space (L2, falling back to L3 on capacity). Plus launch fusion, so adjacent stages are co-resident to begin with. | Today memory space is an **input** to the AIR pipeline, never an output: no pass looks at a DDR buffer and decides it should not be there. This is the one piece of iron's dataflow that AIR cannot currently derive. | large, **and needs H2** — the analysis is unsound without the external-call classifier |
 
 Prefer **inherent** over discardable for anything that must reach the backend. Erase on consume, as
 the ping-pong labels already do. Do not attempt blind attribute propagation — upstream declined an
 automatic mechanism twice; detect drops instead, as LLVM's `WarnMissedTransformationsPass` does.
 
+### Harness gaps this tranche exposed
+
+Not compiler work, but Phase H halted on all three and the next compiler phase will hit them again.
+
+- **`guard_gate_files()` does not fingerprint `mlir/test/**/*.mlir`.** It covers `.lit` files, not
+  `.mlir` inputs. Three separate weakened-gate halts in Phase H were lit tests edited to accommodate
+  new behaviour, and the tamper check could see **none** of them — only the Codex `weakened_gates`
+  layer caught them, three times running. Widen the set before the next `mlir/` phase.
+- **`gate-h.sh` has no throughput leg.** Dropping ping-pong regressed a shipped model 12.4 → 7.8
+  tok/s (recorded in `llms/shared/infra/backend_presets.py`), and nothing in the four legs would
+  notice. A correctness-only gate cannot catch H1a skipping more than it should.
+- **Leg 4 is where the expensive surprises live.** Both of Phase H's substantive spec errors
+  surfaced there, an hour into ten `make verify` runs, after legs 1–3 were green. Run
+  `check-air-mlir` yourself first — it takes seconds — but do not treat it as predictive: it stayed
+  green through both.
+
 ## Tranche J — the study's essence
 
 | # | Item | Why | Blocked on |
 |---|---|---|---|
-| J1 | **Collapse the norm dispatches.** With H1+H2, lift `builders/addnorm.py`'s one-trip guard and re-measure `coarse`. Expect 131 entries → ~5. | The single biggest structural divergence from iron. | H1, H2 |
+| J1 | **Collapse the norm dispatches.** Lift `builders/addnorm.py`'s one-trip guard and re-measure `coarse`. Expect 131 entries → ~5. | The single biggest structural divergence from iron. | **`[2026-08-06]` nothing — unblocked.** The blocker was never H1/H2; it was the packet feed order, fixed in `bfb647d9`. The fixture's `--variant inside` now runs two trips on hardware with zero mismatches at the exact shape the guard was written for. This is the highest-value item in the tranche and it is ready. |
 | J2 | **Attention on device for `offload` and `runlist`.** `attn_scores` (4096×64×4096) already **passes on hardware** with hand-chosen tiles, zero mismatches — the registry was never a buildability constraint. `attn_output` (4096×4096×64) timed out on the one configuration tried, out of 828 legal ones; search the rest. | Today two modes run attention on the host and two on the device, so a mode-versus-mode comparison varies attention placement *and* dispatch boundary. Attention dominates the layer, so the confound is not small. | — |
 | J3 | **Walk the `baseline_768` sequence ladder** for all four modes. E1 unblocked it; nothing has used it. | A tradeoff analysis at a single shape has no curves and therefore no crossover — which is the result the study exists to produce. | — |
 | J4 | **Replace distinguishability clause 3.** `runlist entries > coarse entries` is now true by construction. Use `herd_launches` (404 vs 146), which counts executed work rather than dispatch packaging and which neither mode fixes by construction. | A gate that cannot fail measures nothing. | J1 re-measures both |
@@ -141,6 +218,50 @@ every operator here is: full-output `np.isclose` against the FP32 oracle at `rto
 mismatches, with a fault-injection control. Start with the **norm tail** — it is the smallest piece,
 it has a measured precision target to beat (1.806e-2 → 1.688e-2), and it proves the L1→L1 channel
 path on this example before the harder `mha_out_proj` pipeline.
+
+### What AIR automates today, and what it does not
+
+`[2026-08-06]` Read before designing J7. The question is whether these mappings must be written by
+hand the way iron writes them. The answer splits, and the split decides how much of J7 is work.
+
+**The accumulator half is already automatic.** `air-hoist-dma-in-accum-pattern` runs
+**unconditionally, second in the pipeline** (`tools/aircc/aircc.cpp:837`). It matches an incoming and
+an outgoing DMA on the same memref with mirrored offsets/sizes/strides
+(`AIRDependencyScheduleOpt.cpp:322`), both loop-invariant, and hoists both out of the loop —
+leaving the buffer L1-resident across the whole reduction. That is iron's `of_o_acc_in` /
+`of_o_acc_out` ring, derived rather than declared.
+
+Critically it is **purely syntactic on the DMA ops** and never asks what the kernel does, so an
+opaque external `func.call` between the fetch and the store does not block it. Write a KV-block loop
+that fetches C, calls `matmul_with_acc_vectorized_2x2_mmul`, stores C — and the round-trip collapses
+on its own. **J7 does not need to hand-build the accumulator ring.**
+
+**The inter-stage half is not automatic, and cannot be today.** Memory space is an input to the AIR
+pipeline. There is no producer-consumer forwarding pass and no launch fusion —
+`air-fuse-parallel-launch` is about `scf.parallel` around a herd (`AIRMiscPasses.cpp:900`), not about
+merging two `air.launch`s. `air-override-memref-memory-space` is flagged experimental and only
+rewrites allocs *inside* a region; `qkv_f32` and friends are launch arguments, and `block.py:550`
+lists them in `host_writes` — host-visible ABI the compiler is not permitted to touch.
+
+So the DDR round-trip is not a missed optimization. **Our builders declared it**, and the mode
+boundary (one op per launch in `offload` / `runlist` / `coarse`) forces it structurally. `fused` is
+the only mode that need not, and it still does.
+
+**What is less manual than iron either way.** Declaring the edge is the whole of what J7 writes; the
+compiler decides the rest, where iron makes you spell each one out:
+
+| decision | iron | AIR |
+|---|---|---|
+| tile placement | `placement=Tile(col,row)` | `air-place-herds` |
+| buffer depth | `depth=2` | `air-label-scf-for-to-ping-pong` + `air-ping-pong-transform` |
+| memtile assignment and sharding | by hand | `air-split-l2-memref`, capped by the real shim budget (`aircc.cpp:869`) |
+| DMA BDs, wrap-and-stride | by hand | `air-opt-shim-dma-bds`, `air-opt-memtile-dma-bds` |
+| broadcast fan-out | `of.cons(n)` | `air-broadcast-detection` + `air-specialize-dma-broadcast` |
+| sharing one physical channel across flows | no equivalent | `air-fuse-channels{aggressive-mode=L1,L2,L3}` |
+
+**Consequence for sequencing.** Do J7 by hand first, and do not wait on H8. Declaring three channels
+is a builder edit; the promotion pass is large, needs H2 underneath it to be sound at all, and wants
+a hand-written reference dataflow to validate against — which is precisely what J7 produces.
 
 ## The finish line
 

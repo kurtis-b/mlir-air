@@ -1,13 +1,27 @@
 # 17 — Phase H: Compiler hardening (H1–H3)
 
 The first phase in this plan to change `mlir/` — the AIR compiler itself. Read
-[16](16-compiler-work-and-remaining-essence.md) first; it holds the root cause and the evidence.
+[16](16-compiler-work-and-remaining-essence.md) first; it holds the corrected root cause and the
+evidence.
 
-Three items. They are one phase because H1 without H2 turns a live miscompile into a build failure
-for a program that ought to work, and H2 without H1 fixes one unsound case while leaving the pass
-willing to transform others it cannot prove.
+> ### `[2026-08-06]` Status: halted at `confirm/3`, 29 of 60 invocations
+>
+> **Two sections of this document state a defect and a remedy that measurement has since
+> falsified.** They are kept because the phase log below is the record of how they fell, and
+> deleting them would delete the reason the corrections exist. Read them as history, not as spec:
+>
+> - **"The defect, precisely"** blames ping-pong and a missing dependency edge. It is wrong.
+>   `--omit-ping-pong-transform=all` reproduces the identical corruption. The cause was the shim
+>   feed order under packet multiplexing.
+> - **"H1 — refuse what cannot be proven safe"** says hard-fail. It should say *skip and warn*.
+>   Refusing broke three shipped models that were always correct.
+> - **The gate's `--variant hoisted` clause** demands a refusal that correct behaviour no longer
+>   produces. It has to be re-specified before the objective check can pass.
+>
+> The corrected account is in [16](16-compiler-work-and-remaining-essence.md#the-root-cause--corrected-2026-08-06-and-the-guard-is-now-liftable);
+> what remains to do is at [the end of this document](#what-the-next-session-does).
 
-## The defect, precisely
+## The defect, precisely — *superseded, see the banner above*
 
 `air-label-scf-for-to-ping-pong` marks a loop `unroll = 2` and its allocs `hoist_alloc`, then
 `air-ping-pong-transform` duplicates the buffers and rebuilds the dependency graph. Eligibility
@@ -40,7 +54,7 @@ it. One trip is safe because nothing is reused; two trips corrupt 481–497 of 5
 
 ## Work items
 
-### H1 — refuse what cannot be proven safe
+### H1 — refuse what cannot be proven safe — *superseded: skip, do not refuse*
 
 Strengthen `isPingPongCandidate` to bail unless, for every alloc it would duplicate:
 
@@ -106,10 +120,13 @@ The driver then runs two hardware checks you cannot influence, from a fixture it
 
 - **`--variant inside`** — a legitimate two-trip loop, every L1 buffer refilled each iteration. It
   must compile and produce **zero mismatches**. This is H2's proof.
-- **`--variant hoisted`** — the weight DMA lifted out of the loop, so the buffer carries data across
-  iterations and rotating it is genuinely unsound. The compiler must **refuse it with a
-  diagnostic**. Producing any answer, right or wrong, fails the phase. This is H1's proof, and it is
-  what stops "disable ping-pong everywhere" from passing.
+- **`--variant hoisted`** — ~~the weight DMA lifted out of the loop, so the buffer carries data
+  across iterations and rotating it is genuinely unsound. The compiler must **refuse it with a
+  diagnostic**.~~ ***Superseded.*** Measured: the labeler never labels this loop, so the rotation
+  never privatizes `l1_w`, and the program compiles single-buffered and is numerically exact. There
+  is no hazard to refuse. The clause must be re-specified as **compiles + correct + not
+  transformed** — the third part is what keeps it discriminating rather than a second copy of
+  `inside`, and it belongs in a lit test (`CHECK-NOT: unroll`) rather than the Python runner.
 
 Both fixtures run at `cols=64, rows=8, rows_per_call=4` — the exact point
 `builders/addnorm.py` measured the miscompile at.
@@ -305,8 +322,6 @@ keeps it a discriminating test rather than a second copy of `inside`. Asserting 
 from the Python runner is not straightforward; a lit test over the labeled IR (`CHECK-NOT: unroll`)
 is the natural home for it, alongside the two the phase already added.
 
-## What landed, and is worth keeping regardless
-
 ## What did land, and is worth keeping regardless
 
 Committed on the branch, gated by four review rounds and three of the four gate legs:
@@ -316,8 +331,14 @@ Committed on the branch, gated by four review rounds and three of the four gate 
   per-iteration order under packet multiplexing, **not** ping-pong. Compiling with
   `--omit-ping-pong-transform=all` reproduces the identical 481/512 corruption.
 - `air-fuse-packet-put-loops`, plus packet-typed channels modelled as one shared stream resource.
+- **`--variant inside` passes on hardware: zero mismatches at two trips**, at exactly the
+  `cols=64, rows=8, rows_per_call=4` shape `builders/addnorm.py` measured the miscompile at. This is
+  the phase's most consequential measurement and it is easy to lose among the halts: **it means the
+  one-trip guard is liftable and J1 is unblocked.** It is not visible in `gate.log`, which never got
+  past leg 4 — it is in `agents/.state/port-loop/phase-H/implement.report.json`.
 - H2's external-call classifier and H3's `AIRDialect::verifyOperationAttribute`, both green through
-  `check-air-mlir` (480+ passing).
+  `check-air-mlir` (486 of 500 passing; 7 pre-existing UNSUPPORTED, 7 pre-existing XFAIL, zero
+  failures).
 - 522 lines of new compiler test coverage.
 - Gate legs 1–3 green: build, install, `check-air-mlir`, and the transformer-layer suite at **24/24**.
 
@@ -333,3 +354,53 @@ Committed on the branch, gated by four review rounds and three of the four gate 
   dropped by any pass that does not know them; PR #1664 already hand-patched four such sites. If H3
   surfaces the reason, say so; if it turns out to need promoting to an inherent ODS attribute, that
   is H4 and it is not this phase's job.
+
+## What the next session does
+
+The phase halted at `confirm/3` with the corrected spec already established. There are no open
+questions left in it — three mechanical items and a gate re-run.
+
+**1. Refuse → skip** (`AIRDependencyScheduleOpt.cpp`, `provePingPongSafety`). When the rotation
+cannot be proven safe for a buffer it privatizes, leave the loop single-buffered and emit a
+*warning* naming the loop; do not abort compilation. Keep the diagnostic's shape — naming the loop
+and pointing at `air.disable_ping_pong` and `--omit-ping-pong-transform` is right; it is the
+severity that is wrong. The dependency-free `WaitAllOp` placeholder stays forbidden: skipping means
+not transforming, not transforming with an empty edge set.
+
+**2. Re-specify the fixture's `hoisted` clause**
+(`agents/scripts/port-loop/fixtures/addnorm_multitrip.py`). It must assert **compiles + numerically
+correct + not ping-pong transformed**. Its docstring also still explains the corruption as a missing
+dependency edge and must be rewritten around the packet feed order. The file is fingerprinted with
+an empty allowlist, so this is the driver's edit to make **between phases** — a session cannot make
+it, and making it while the phase is mid-run trips the tamper check on resume.
+
+**3. Add the `CHECK-NOT: unroll` lit test** over the labeled IR, alongside the two the phase already
+added. That is the natural home for clause 3; asserting non-transformation from the Python runner is
+not straightforward, and without it `hoisted` is a second copy of `inside`.
+
+**4. Re-run `gate-h.sh`.** Leg 4 — `make verify` over the ten shipped models — is the only leg that
+has never passed, and both of this phase's substantive spec errors surfaced there rather than in
+legs 1–3. Budget for it.
+
+**Resume with `resume-at`, not `resume`.** A plain `resume` re-runs the implement step, which
+silently redoes the work, empties the review diff, and makes the tamper check vacuous.
+
+**Also worth doing before the next `mlir/` phase, and not part of H:** widen `guard_gate_files()` to
+cover `mlir/test/**/*.mlir`. Three weakened-gate halts in this phase were lit tests edited to
+accommodate new behaviour and the tamper check saw **none** of them — only the Codex
+`weakened_gates` layer did, three times running.
+
+## Where the value went
+
+Worth stating plainly, because the halt count reads worse than the outcome. Phase H spent five
+attempts and four review rounds, and its two most valuable products were both **refutations of its
+own spec**:
+
+- The root cause was not what [16](16-compiler-work-and-remaining-essence.md) claimed, and the
+  session found that by measuring instead of implementing the plan as written.
+- "Bail out" did not mean what the spec's own prior art meant by it, and gate leg 4 proved it on
+  three shipped models rather than in argument.
+
+Neither would have surfaced from a phase that passed on the first attempt. The gate legs and the
+`weakened_gates` layer are what converted a wrong plan into a corrected one instead of into shipped
+wrong behaviour — which is the whole reason the harness costs what it costs.
