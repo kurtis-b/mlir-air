@@ -1066,12 +1066,39 @@ Phase H hardened the compiler against the miscompile behind
   whose own per-iteration buffers have an unclassifiable use (e.g. an
   unannotated external call) is left untransformed with a warning: correct,
   just single-buffered. A candidate the transform would provably corrupt
-  REFUSES to compile: an external call that may access a buffer NOT refilled
-  per iteration (weight DMA hoisted out of the loop), or a duplicated buffer
-  with no recognized consumer or no per-iteration producer. Opt-outs:
-  `air.disable_ping_pong` on the loop, or `--omit-ping-pong-transform`. Both
-  attributes are now validated by the AIR dialect verifier after every pass.
+  REFUSES to compile: an external call that may access a buffer filled by a
+  classified WRITE (DMA/channel) outside the loop but inside the loop's own
+  scope (the hoisted-weight-DMA shape — the data carries into iterations and
+  the only edge ordering fill against use is the one the transform
+  rebuilds), or a duplicated buffer with no recognized consumer or no
+  per-iteration producer. Opt-outs: `air.disable_ping_pong` on the loop, or
+  `--omit-ping-pong-transform`. Both attributes are now validated by the AIR
+  dialect verifier after every pass.
+- **The refusal is scoped to what the rotation endangers** (attempt 2). A
+  call touching a memref the loop does NOT privatize is only refused in the
+  classified-write-outside-the-loop shape above. Attempt 1 refused ANY
+  unclassifiable use of an unprivatized memref, and that broke 8 of 24
+  hardware tests — every GEMM-bearing operator — because a GEMM's
+  accumulator legitimately carries data across K-loop iterations: it lives
+  outside the loop (as a herd argument, or privatized into the herd by
+  `air-shrink-memref-sizes-by-access`), is zero-filled by another
+  unclassified kernel call, and is DRAINED (read) after the loop. A
+  post-loop read waits on the loop's result token, which survives the
+  rebuild; only a pre-existing classified FILL has an ordering edge the
+  rebuild can sever.
 
 Footgun: the two-trip fixture shape fully UNROLLS under ping-pong labeling
 (trip count == unroll factor), so `air-ping-pong-transform`'s dependency
 rebuild never runs on it; a fix living only there is untestable at 2 trips.
+
+Footgun: skipping unprovable candidates means every unannotated
+external-call loop that used to be ping-ponged silently drops to single
+buffering — including the decode GEMV inner loop the shipped models use
+(`backend_presets.py` records dropping ping-pong there cost 12.4 → 7.8
+tok/s end-to-end, though that number measured a global disable, not this
+per-loop skip). `make verify` gates correctness, not tok/s, so this shows
+up in no gate. The recovery is per-design and deliberate: annotate the
+callee's memref arguments (`llvm.readonly`/`llvm.writeonly`) so the proof
+passes — input tiles are safe to mark readonly; an accumulator that is both
+read and written by the kernel must stay unannotated, which is fine
+whenever it is not one of the loop's own per-iteration buffers.
