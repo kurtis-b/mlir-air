@@ -1206,19 +1206,24 @@ struct ConstructPingPongDependencyPattern
                           "duplicated buffer halves were found");
       return failure();
     }
+    // A buffer that is READ but has no recognized producer carries data
+    // across iterations; rotating it hands the reader the wrong half.
     for (auto &pair : all_buffers_user_ops) {
-      if (pair.first.empty() || pair.second.empty()) {
+      if (pair.first.empty() && !pair.second.empty()) {
         for_op->emitWarning(
-            "ping-pong transform skipped: a buffer it would rotate has no "
-            "recognized producer or consumer, so the reuse edge protecting "
-            "it cannot be built; leaving the loop untransformed");
+            "ping-pong transform skipped: a buffer it would rotate is "
+            "consumed but has no recognized producer, so the reuse edge "
+            "protecting it cannot be built; leaving the loop untransformed");
         return failure();
       }
     }
     // Predict the loop-carried yield tokens the same way classifyOp derives
-    // them below, so a null can be refused before mutation instead of being
-    // replaced by an empty air.wait_all.
+    // them below (async_back may sit on ANY annotated op, e.g. a barrier
+    // wait_all, not only on buffer users), so a null can be refused before
+    // mutation instead of being papered over with an empty air.wait_all.
     auto pingPongIdOf = [](Operation *op) -> std::optional<uint64_t> {
+      if (op->hasAttr("ping_pong"))
+        return op->getAttrOfType<IntegerAttr>("ping_pong").getUInt();
       if (op->hasAttr("unrolled_iteration"))
         return op->getAttrOfType<IntegerAttr>("unrolled_iteration").getInt();
       std::optional<uint64_t> id;
@@ -1233,15 +1238,18 @@ struct ConstructPingPongDependencyPattern
     };
     bool pingConsumerBack = false, pongConsumerBack = false,
          pongProducerBack = false;
-    for (auto &pair : all_buffers_user_ops) {
+    for_op.getBody()->walk<WalkOrder::PreOrder>(
+        [&](Operation *op) -> WalkResult {
+          if (auto id = pingPongIdOf(op); id && op->hasAttr("async_back"))
+            (*id == 0 ? pingConsumerBack : pongConsumerBack) = true;
+          if (isa<scf::ForOp>(op))
+            return WalkResult::skip();
+          return WalkResult::advance();
+        });
+    for (auto &pair : all_buffers_user_ops)
       for (auto *p : pair.first)
         if (auto id = pingPongIdOf(p); id && *id == 1)
           pongProducerBack = true;
-      for (auto *c : pair.second)
-        if (auto id = pingPongIdOf(c); id && c->hasAttr("async_back")) {
-          (*id == 0 ? pingConsumerBack : pongConsumerBack) = true;
-        }
-    }
     if (!pingConsumerBack || !pongConsumerBack || !pongProducerBack) {
       for_op->emitWarning(
           "ping-pong transform skipped: a producer or consumer back token "
@@ -1856,7 +1864,7 @@ struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
         aliasToAlloc[exec->getResult(1)] = a;
     }
     llvm::DenseMap<Operation *, int> unconditionalProducers,
-        conditionalProducers, consumers;
+        conditionalProducers, consumers, users;
     // An op fills the buffer on every iteration if no affine.if/scf.if sits
     // between it and the loop body. air.execute wrappers are transparent.
     auto isUnconditional = [&](Operation *op) {
@@ -1900,6 +1908,7 @@ struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
             }
             if (!isCandidateAlloc)
               continue;
+            users[it->second]++;
             if (rw == 'w' || rw == 'b') {
               if (isUnconditional(op))
                 unconditionalProducers[it->second]++;
@@ -1914,18 +1923,22 @@ struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
     if (wr.wasInterrupted())
       return failure();
     for (auto *a : allocs) {
-      // A broadcast ladder (air-specialize-dma-broadcast) fills the buffer
-      // through mutually exclusive affine.if arms; isPingPongCandidate has
-      // already vetted their exclusivity, and >= 2 arms means every branch
-      // path fills. A SINGLE conditional producer proves nothing.
-      if (unconditionalProducers[a] == 0 && conditionalProducers[a] < 2) {
-        os << "a buffer it would duplicate has no producer that provably "
-              "fills it on every iteration";
-        return failure();
-      }
-      if (consumers[a] == 0) {
-        os << "a buffer it would duplicate has no recognized consumer, so "
-              "nothing would protect it from being refilled early";
+      // A buffer with no accesses at all (alloc/dealloc-only loops exist
+      // after compute has been hoisted elsewhere) is vacuously safe to
+      // rotate: there is no edge to build and no stale data to read.
+      if (users[a] == 0)
+        continue;
+      // A read of a buffer with no in-loop producer means the data carries
+      // across iterations, and rotation would hand the reader the wrong
+      // half. A broadcast ladder (air-specialize-dma-broadcast) fills the
+      // buffer through mutually exclusive affine.if arms; isPingPongCandidate
+      // has already vetted their exclusivity, and >= 2 arms means every
+      // branch path fills. A SINGLE conditional producer proves nothing.
+      if (consumers[a] > 0 && unconditionalProducers[a] == 0 &&
+          conditionalProducers[a] < 2) {
+        os << "a buffer it would duplicate is read but has no producer that "
+              "provably refills it on every iteration, so its data carries "
+              "across iterations and rotation would corrupt it";
         return failure();
       }
     }

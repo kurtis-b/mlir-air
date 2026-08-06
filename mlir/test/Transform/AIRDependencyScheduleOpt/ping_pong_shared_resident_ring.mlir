@@ -82,5 +82,5 @@ module {
     }
     return
   }
-  func.func private @acc(%a: memref<256xi8, 2>, %b: memref<2560xi8, 2>)
+  func.func private @acc(%a: memref<256xi8, 2>, %b: memref<2560xi8, 2>) attributes {llvm.emit_c_interface}
 }
