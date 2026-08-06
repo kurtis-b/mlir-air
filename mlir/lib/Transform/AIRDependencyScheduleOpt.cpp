@@ -1779,7 +1779,16 @@ static PingPongSafety provePingPongSafety(scf::ForOp forOp,
   // this), and without the alias those accesses are invisible, making a
   // shipped, working loop look like it has no producer or consumer.
   // Iterate to a fixpoint so a view of a view (or a view yielded out of
-  // an air.execute) resolves regardless of nesting order.
+  // an air.execute) resolves regardless of nesting order. Any other
+  // memory-effect-free, region-free op that forwards a tracked buffer
+  // into a new memref value (an arith.select whose arms are the same
+  // buffer, an unregistered cast) is followed too, but only when the
+  // result provably aliases exactly one candidate: every memref operand
+  // tracked and all resolving to the same alloc. Anything short of that
+  // (arms aliasing different allocs, one arm untracked) cannot be
+  // attributed to a single buffer, and the classification walk below
+  // skips the loop when it meets the untracked result rather than let
+  // accesses through it vanish from the rebuilt graph.
   bool aliasChanged = true;
   while (aliasChanged) {
     aliasChanged = false;
@@ -1801,6 +1810,30 @@ static PingPongSafety provePingPongSafety(scf::ForOp forOp,
             for (auto [idx, v] : llvm::enumerate(term->getOperands()))
               if (idx + 1 < exec->getNumResults())
                 addAlias(v, exec->getResult(idx + 1));
+          } else if (op->getNumRegions() == 0 && mlir::isMemoryEffectFree(op)) {
+            // A pure region-free op cannot allocate, so a memref result
+            // must forward one of its memref operands. Propagate only the
+            // unambiguous case; a result left untracked here is caught by
+            // the classification walk below.
+            Operation *src = nullptr;
+            bool allTrackedAndUnique = true;
+            for (Value opd : op->getOperands()) {
+              if (!llvm::isa<BaseMemRefType>(opd.getType()))
+                continue;
+              auto it = aliasToAlloc.find(opd);
+              if (it == aliasToAlloc.end() || (src && src != it->second)) {
+                allTrackedAndUnique = false;
+                break;
+              }
+              src = it->second;
+            }
+            if (src && allTrackedAndUnique)
+              for (Value res : op->getResults())
+                if (llvm::isa<BaseMemRefType>(res.getType()) &&
+                    !aliasToAlloc.count(res)) {
+                  aliasToAlloc[res] = src;
+                  aliasChanged = true;
+                }
           }
           return WalkResult::advance();
         });
@@ -1816,6 +1849,35 @@ static PingPongSafety provePingPongSafety(scf::ForOp forOp,
     // memory accesses.
     if (isa<air::ExecuteTerminatorOp, scf::YieldOp>(op))
       return WalkResult::advance();
+    // An op that derives a memref value the alias fixpoint above could
+    // NOT track from a buffer the transform would duplicate (an
+    // arith.select whose arms alias different buffers, a loop-like op
+    // recirculating the buffer through iter_args, a call returning a
+    // memref) makes every access through the derived value unattributable
+    // -- a reader would silently vanish and the buffer be declared
+    // vacuously safe below. Refuse to label such loops.
+    if (!isa<ViewLikeOpInterface, air::ExecuteOp>(op)) {
+      bool forwardsCandidate =
+          llvm::any_of(op->getOperands(),
+                       [&](Value v) {
+                         return llvm::isa<BaseMemRefType>(v.getType()) &&
+                                aliasToAlloc.count(v);
+                       }) &&
+          llvm::any_of(op->getResults(), [&](Value v) {
+            return llvm::isa<BaseMemRefType>(v.getType()) &&
+                   !aliasToAlloc.count(v);
+          });
+      if (forwardsCandidate) {
+        if (!skip)
+          os << "'" << op->getName().getStringRef()
+             << "' derives a new memref value from a buffer the transform "
+                "would duplicate, and accesses made through that value "
+                "cannot be attributed to the buffer, so the rebuilt "
+                "dependency graph would silently drop them";
+        skip = true;
+        return WalkResult::advance();
+      }
+    }
     // Per-buffer access flags for THIS op, committed only after every
     // operand is seen: one memref passed to several operands of one op
     // (e.g. a call whose callee marks one formal llvm.writeonly and
