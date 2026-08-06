@@ -42,6 +42,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
 
 #include "llvm/Support/Debug.h"
@@ -49,6 +50,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <numeric>
 #include <string>
@@ -1842,16 +1844,21 @@ struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
   // classification sees; any use it cannot see is silently dropped from that
   // graph, which is how a missing edge becomes wrong data rather than an
   // error. Hence the rules:
-  //   - every memref use in the loop must classify ('u' refuses);
+  //   - every use of a candidate alloc must classify ('u' refuses);
   //   - a 'b' use (an external kernel call operand with no refining argument
   //     attribute) is only provable on this loop's own candidate allocs --
   //     the transform builds producer AND consumer edges for those. On any
   //     other memref a may-write cannot be ordered against the rotation, so
   //     it refuses. A classified 'w' on a loop-external memref (e.g. a
-  //     linalg accumulator) stays legal: the dependency machinery sees it.
-  //   - every candidate alloc needs a producer that runs on every iteration
-  //     (unconditional, or an affine.if broadcast ladder with >= 2 arms) and
-  //     at least one recognized consumer.
+  //     linalg accumulator) stays legal -- the dependency machinery sees it
+  //     -- and so does an unclassified use by an op that provably touches
+  //     no memory (memref.dim, memref.cast: metadata only) -- it has no
+  //     edge to lose. An unclassified use by an op WITH memory effects
+  //     refuses.
+  //   - every candidate alloc that is read needs a producer that provably
+  //     executes on EVERY iteration of this loop; a producer that may be
+  //     skipped (a non-exhaustive conditional, a zero-trip or dynamic
+  //     nested loop) leaves an iteration reading a rotated stale half.
   static LogicalResult provePingPongSafety(scf::ForOp forOp,
                                            ArrayRef<Operation *> allocs,
                                            std::string &reason) {
@@ -1863,17 +1870,8 @@ struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
           exec && exec->getNumResults() >= 2)
         aliasToAlloc[exec->getResult(1)] = a;
     }
-    llvm::DenseMap<Operation *, int> unconditionalProducers,
-        conditionalProducers, consumers, users;
-    // An op fills the buffer on every iteration if no affine.if/scf.if sits
-    // between it and the loop body. air.execute wrappers are transparent.
-    auto isUnconditional = [&](Operation *op) {
-      for (Operation *p = op->getParentOp(); p && p != forOp.getOperation();
-           p = p->getParentOp())
-        if (isa<affine::AffineIfOp, scf::IfOp>(p))
-          return false;
-      return true;
-    };
+    llvm::DenseMap<Operation *, int> consumers;
+    llvm::DenseMap<Operation *, llvm::SmallPtrSet<Operation *, 4>> producerOps;
     WalkResult wr = forOp.getBody()->walk<WalkOrder::PreOrder>(
         [&](Operation *op) -> WalkResult {
           if (isa<air::HerdOp, air::SegmentOp, air::LaunchOp>(op))
@@ -1893,6 +1891,14 @@ struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
               continue;
             char rw = checkOpOperandReadOrWrite(operand);
             if (rw == 'u') {
+              // A memref the rotation does not privatize loses nothing when
+              // a provably memory-effect-free use of it (memref.dim,
+              // memref.cast: metadata only, no access to drop) vanishes
+              // from the rebuilt graph. Every other unclassified use --
+              // any use of a candidate alloc, or an op with memory effects
+              // on any memref -- refuses.
+              if (!isCandidateAlloc && mlir::isMemoryEffectFree(op))
+                continue;
               os << "an operand of '" << op->getName().getStringRef()
                  << "' cannot be classified as a read or a write, so the "
                     "rebuilt dependency graph would silently drop it";
@@ -1908,13 +1914,8 @@ struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
             }
             if (!isCandidateAlloc)
               continue;
-            users[it->second]++;
-            if (rw == 'w' || rw == 'b') {
-              if (isUnconditional(op))
-                unconditionalProducers[it->second]++;
-              else
-                conditionalProducers[it->second]++;
-            }
+            if (rw == 'w' || rw == 'b')
+              producerOps[it->second].insert(op);
             if (rw == 'r' || rw == 'b')
               consumers[it->second]++;
           }
@@ -1923,19 +1924,54 @@ struct LabelScfForLoopForPingPongPattern : public OpRewritePattern<scf::ForOp> {
     if (wr.wasInterrupted())
       return failure();
     for (auto *a : allocs) {
-      // A buffer with no accesses at all (alloc/dealloc-only loops exist
-      // after compute has been hoisted elsewhere) is vacuously safe to
-      // rotate: there is no edge to build and no stale data to read.
-      if (users[a] == 0)
+      // A buffer that is never read (alloc/dealloc-only loops exist after
+      // compute has been hoisted elsewhere, and write-only buffers drain
+      // through channels) is vacuously safe to rotate: no reader can see a
+      // stale half.
+      if (consumers[a] == 0)
         continue;
-      // A read of a buffer with no in-loop producer means the data carries
-      // across iterations, and rotation would hand the reader the wrong
-      // half. A broadcast ladder (air-specialize-dma-broadcast) fills the
-      // buffer through mutually exclusive affine.if arms; isPingPongCandidate
-      // has already vetted their exclusivity, and >= 2 arms means every
-      // branch path fills. A SINGLE conditional producer proves nothing.
-      if (consumers[a] > 0 && unconditionalProducers[a] == 0 &&
-          conditionalProducers[a] < 2) {
+      // A read of a buffer requires a producer that refills it on EVERY
+      // iteration, or the data carries across iterations and rotation hands
+      // the reader the wrong half. Control flow through the loop body
+      // definitely reaches a producer iff one sits directly in the body
+      // (air.execute wrappers are transparent), or BOTH branches of an
+      // affine.if/scf.if reach one -- then and else are exhaustive by
+      // construction, which is what proves the exhaustive
+      // air-specialize-dma-broadcast ladder; counting arms proved nothing,
+      // since two writes in one arm never cover the other arm -- or a
+      // nested loop with static trip count >= 1 reaches one. A zero-trip
+      // or dynamic-bound loop may never execute its body, so it proves
+      // nothing.
+      auto &prods = producerOps[a];
+      std::function<bool(Block &)> definitelyProduces =
+          [&](Block &blk) -> bool {
+        for (Operation &o : blk) {
+          if (prods.contains(&o))
+            return true;
+          if (auto exec = dyn_cast<air::ExecuteOp>(&o)) {
+            if (definitelyProduces(exec.getRegion().front()))
+              return true;
+          } else if (auto aif = dyn_cast<affine::AffineIfOp>(&o)) {
+            if (aif.hasElse() && definitelyProduces(*aif.getThenBlock()) &&
+                definitelyProduces(*aif.getElseBlock()))
+              return true;
+          } else if (auto sif = dyn_cast<scf::IfOp>(&o)) {
+            if (sif.elseBlock() && definitelyProduces(*sif.thenBlock()) &&
+                definitelyProduces(*sif.elseBlock()))
+              return true;
+          } else if (auto sfo = dyn_cast<scf::ForOp>(&o)) {
+            auto tc = air::getStaticScfForTripCountAsInt(sfo);
+            if (tc && *tc >= 1 && definitelyProduces(*sfo.getBody()))
+              return true;
+          } else if (auto afo = dyn_cast<affine::AffineForOp>(&o)) {
+            auto tc = air::getStaticAffineForTripCountAsInt(afo);
+            if (tc && *tc >= 1 && definitelyProduces(*afo.getBody()))
+              return true;
+          }
+        }
+        return false;
+      };
+      if (!definitelyProduces(*forOp.getBody())) {
         os << "a buffer it would duplicate is read but has no producer that "
               "provably refills it on every iteration, so its data carries "
               "across iterations and rotation would corrupt it";
