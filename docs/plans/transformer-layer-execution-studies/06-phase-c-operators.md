@@ -60,6 +60,13 @@ divergences, each of which makes the gate laxer while looking compliant:
 | Tolerance | `REL_TOL=4e-2`, `ABS_TOL=1.5e-1` (`block/run.py:66-72`) | the registry's `rtol` / `atol` |
 | Mismatch budget | `ERROR_THRESHOLD=0.005` — 0.5% of elements may exceed tolerance | none; zero mismatches |
 
+`[2026-08-05]` **That table is iron's per-operator gate, and its end-to-end gate is looser again.**
+The whole-mode comparison in `study/end_to_end/modes.py:511-566` uses `FINAL_REL_TOL=0.1`,
+`FINAL_ABS_TOL=0.5` and a **5%** mismatch budget against a torch **bf16** reference — and runs only
+at `seq_len <= 512` (`REFERENCE_VALIDATION_MAX_SEQ_LEN=512`); above that `_validate_output` checks
+only that the output is finite. So iron never numerically validates an execution mode at the
+sequence length this port gates all four of them at.
+
 A bf16 reference "agrees" with a bf16 device result partly because both are wrong in the same
 direction, and at `K=4096` the accumulated error is not small. Two further traps in the same
 files:

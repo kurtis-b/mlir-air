@@ -150,7 +150,7 @@ at 64 of the layer's 4096 rows (`builders/block.py::norm_rows` derives it; do no
 across widths). So `coarse`'s dispatch numbers are dominated by `addnorm`, not by the GEMMs.
 
 That is a real result about where the cost sits, and the taxonomy has to be able to explain it. It
-also means the `coarse`-versus-`runlist` distinction is far narrower than iron's "12 entries versus
+also means the `coarse`-versus-`runlist` distinction is far narrower than iron's real 5 versus 16 (not the "12 versus
 42" suggests: **128 of `coarse`'s 131 entries — 98% — are one operator's row blocking**, before any
 fine-grained mode is built at all.
 
@@ -310,7 +310,7 @@ block attention identically.
 
 **`runlist` and `coarse` next.** Both depend on Phase B's runlist aggregation.
 
-- `runlist` — iron uses 29 kernels and 42 runlist entries over fine-grained operators (GEMM,
+- `runlist` — **`[2026-08-05]` iron uses 12 kernels and 16 runlist entries** (encoder; 13/17 decoder), not the 29/42 earlier drafts of this document claimed. The operator families are right (GEMM,
   transpose, softmax, elementwise-mul, causal-mask, GeLU, LayerNorm, add-and-norm,
   elementwise-add). **`[2026-08-05]` Two of those operators do not exist in MLIR-AIR at all**:
   there is no `transpose` or `elementwise_mul` builder or example anywhere in
@@ -319,7 +319,7 @@ block attention identically.
   assigns them to no phase. They are `runlist`'s, and they are new device work rather than
   re-expression — the only new device work left in this phase. Budget for it, and re-derive the
   entry count at `baseline_768` rather than carrying iron's 42 across.
-- `coarse` — iron uses 12 runlist entries over 5–6 fused kernels (`qkv_proj`, `mha_out_proj`,
+- `coarse` — **`[2026-08-05]` iron uses 5 runlist entries over 5 fused kernels** (encoder; 7 over 6 decoder). The "12" is both variants summed (`qkv_proj`, `mha_out_proj`,
   `ffn`, `addnorm`, `layer_norm`, `elementwise_add`). **`[2026-08-05]` This one is already built**
   as `builders/block.py`; it needs a directory and the shared instrumentation, not a rewrite. Its
   measured shape is 4 sequences and 131 runlist entries, not 12, because each of the two

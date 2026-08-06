@@ -49,7 +49,8 @@ the fine-grained mode.
 
 ## Do not carry iron's entry count across
 
-iron reports 29 kernels and 42 runlist entries. **Re-derive both at `baseline_768`.** The reason is
+iron reports **12 kernels and 16 runlist entries** (encoder; 13/17 decoder) -- not the 29/42 this plan
+repeated for weeks and told you to expect. **Re-derive both at `baseline_768` regardless.** The reason is
 the same one that makes `coarse` measure 131 rather than 12: `build_addnorm_module` requires
 `rows == herd_x * rows_per_call`, which at `cols = 768` caps a call at 64 of the layer's 4096 rows,
 so each normalization point is 64 dispatches. Any row-parallel operator you decompose to may have the

@@ -121,7 +121,8 @@ dispatch numbers are dominated by `addnorm` rather than by the GEMMs.
 
 There are four submissions rather than one because a dispatch argument is a whole BO, so the
 sequence cannot be expressed as a single runlist. Both facts belong in `coarse/README.md`. They are
-the calibration point the distinguishability gate is defined against, and iron's "12 entries" is not.
+the calibration point the distinguishability gate is defined against, and iron's count is not -- which is **5 entries over 5 kernels** for the encoder, not the "12" this
+plan long quoted (that figure sums both workload variants).
 
 ## Work items
 

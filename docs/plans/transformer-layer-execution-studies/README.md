@@ -246,9 +246,13 @@ touching a shipped model's `Makefile` to make its own regression leg pass.
 
 Two decisions taken on 2026-08-04, now reflected throughout these documents:
 
-- **The reference oracles are re-expressed, not ported verbatim.** iron computes them in bf16 at
-  `rtol=4e-2` with a 0.5% element mismatch budget; this port uses an FP32 reference, the registry's
-  `rtol`/`atol`, and zero mismatches. Details and the two further traps (erf vs tanh GeLU, the
+- **The reference oracles are re-expressed, not ported verbatim.** `[2026-08-05]` The figure this
+  plan long quoted -- bf16 at `rtol=4e-2` with a 0.5% mismatch budget -- is iron's **per-operator**
+  gate (`BLOCK_*` in `study/end_to_end/modes.py:110-125`). Its **end-to-end mode** gate is looser
+  still: `FINAL_REL_TOL=0.1`, `FINAL_ABS_TOL=0.5`, a **5%** mismatch budget, and it only runs at
+  `seq_len <= 512` (`REFERENCE_VALIDATION_MAX_SEQ_LEN`) -- above that it degrades to a
+  finite-output check, with separate spot checks at 512/2048/8192. This port uses an FP32
+  reference, the registry's `rtol`/`atol`, and zero mismatches, at the full `seq 4096`. Details and the two further traps (erf vs tanh GeLU, the
   MHA oracle's precision switch at `seq_len 16384`) are in
   [06 §The numerics standard](06-phase-c-operators.md#the-numerics-standard--do-not-port-irons).
 - **Shape coverage is a sweep, not a redesign.** The case matrix needs 108 distinct
