@@ -197,8 +197,16 @@ compiler's own lit inputs is worth doing before the next compiler phase.
 them. That directory is fingerprinted and covered by no allowlist, so the tamper check would have
 halted the phase for artifacts the phase did not intend to create.
 [15](15-environment-notes.md) predicted precisely this and it was still missed. The fixture now
-`chdir`s into a temp directory it owns, with a `.gitignore` as belt — a caller-supplied CWD is not a
-fix, because the leak depends on where the caller happened to stand.
+`chdir`s into a temp directory it owns — a caller-supplied CWD is not a fix, because the leak
+depends on where the caller happened to stand.
+
+**And the `.gitignore` I added alongside it was itself a weakened gate**, which Codex caught on the
+next round. A leaked artifact in this directory gets tracked by `commit_step`'s `git add -A`, and
+`guard_gate_files()` then flags it as an unauthorized addition to a fingerprinted path with an empty
+allowlist — a halt. That is *detection*. A catch-all `*` rule hides the leak from git and therefore
+from the guard, trading a loud failure for silence, which is the exact anti-pattern this harness
+exists to prevent. The `chdir` already prevents the leak; the guard must stay able to catch any
+future one from code that does not go through this fixture. The `.gitignore` is removed.
 
 ## Risks
 
