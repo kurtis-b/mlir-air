@@ -13,12 +13,12 @@ module {
           %alloc_3 = memref.alloc() : memref<4x64xbf16, 2 : i32>
           %c64_i32 = arith.constant 64 : i32
           %c4_i32 = arith.constant 4 : i32
-          air.dma_memcpy_nd (%alloc_2[] [] [], %arg18[0] [64] [1]) : (memref<64xbf16, 2 : i32>, memref<64xbf16>)
           %c0 = arith.constant 0 : index
           %c8 = arith.constant 8 : index
           %c4 = arith.constant 4 : index
           scf.for %arg20 = %c0 to %c8 step %c4 {
             %0 = affine.apply #map()[%arg20, %arg12]
+            air.dma_memcpy_nd (%alloc_2[] [] [], %arg18[0] [64] [1]) : (memref<64xbf16, 2 : i32>, memref<64xbf16>)
             air.dma_memcpy_nd (%alloc[] [] [], %arg16[%0, 0] [4, 64] [64, 1]) : (memref<4x64xbf16, 2 : i32>, memref<8x64xbf16>)
             air.dma_memcpy_nd (%alloc_1[] [] [], %arg17[%0, 0] [4, 64] [64, 1]) : (memref<4x64xbf16, 2 : i32>, memref<8x64xbf16>)
             func.call @fused_add_layer_norm_1outs(%alloc, %alloc_1, %alloc_2, %alloc_3, %c64_i32, %c4_i32) : (memref<4x64xbf16, 2 : i32>, memref<4x64xbf16, 2 : i32>, memref<64xbf16, 2 : i32>, memref<4x64xbf16, 2 : i32>, i32, i32) -> ()
