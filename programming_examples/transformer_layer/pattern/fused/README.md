@@ -40,9 +40,20 @@ module over whole tensors removes all of that.
 ## Why three ELFs and not one — the mode's own finding
 
 A whole-layer single-module stitch is **not** blocked by symbol collisions:
-E1's `(method, tile_n)` naming fix removed those, and `fused_tail` is the
-proof — it co-links the FFN's `drain` (tile_n 128) and `fused-cast` (tile_n
-96) GEMMs beside six more launches without a redefinition.
+E1's `(method, tile_n)` naming fix removed those, and `fused_tail` co-links
+the FFN's `drain` (tile_n 128) and `fused-cast` (tile_n 96) GEMMs beside six
+more launches without a redefinition.
+
+**That co-link is not, however, evidence for the E1 fix**, and an earlier
+draft of this file called it "the proof", which it is not. Those two GEMMs
+are on *different methods*, so their symbols differed before E1 as well
+(`_m32` against `_m64`) — nothing here would have collided either way. The
+collision E1 removed is same-method-different-`tile_n`, and at `seq = 4096`
+the registry happens to place the FFN's two projections on different methods,
+which is exactly why 4096 was the one ladder point that built at all. The
+real evidence for the fix is the `seq = 64` `ffn` point E1 added, where both
+projections resolve to `drain` at `tile_n` 128 and 96 and the pre-E1 names
+would have been identical.
 
 What blocks it is **backend settings**. One ELF is one aircc invocation, and
 FlashAttention requires `omit_pingpong="all"` +

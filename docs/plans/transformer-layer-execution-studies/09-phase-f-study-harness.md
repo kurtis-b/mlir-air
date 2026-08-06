@@ -17,6 +17,68 @@ most of the convention refactoring lands.
 
 Run `block` before `memory_tile_staging` — the latter reads the former's CSV.
 
+## `[2026-08-05]` Carried in from Phase E: `fused`'s norm tail loses partial-sum staging
+
+Phase E measured all four modes correct, but one of them pays a numerical cost that this phase
+should treat as a measurement subject rather than a footnote.
+
+**The GEMMs are staged correctly in every mode.** `matrix_multiplication/bf16_in_bf16_out/run.py:69`
+keeps an f32 accumulator across the whole K loop with a single epilogue cast, and
+`pattern/fused/fused.py` derives each GEMM's f32 scratch argument from its spec's
+`needs_f32_scratch` rather than hardcoding it, so a registry method change adds or drops the scratch
+automatically. Measured `q`/`k`/`v` at `mean_rel_L1` 9.7e-3 against the registry's 9.3e-3 standard.
+
+**`fused`'s normalization tail is not staged.** `fused_tail` decomposes the fused `addnorm` into
+`elementwise_add` → `layer_norm` → `elementwise_mul` and **rounds to bf16 between each launch**,
+where the fused operator keeps those intermediates in higher precision inside one kernel. The cost
+stacks across the modes and is measured, not estimated:
+
+```
+block   1.688e-2      runlist 1.755e-2      fused 1.806e-2      (mean_rel_L1, whole layer)
+```
+
+`fused` lands at `atol_required` 7.572e-2 against the hard `1e-1` ceiling — a 1.32x margin, the
+thinnest of the four modes.
+
+The cause is a layout limitation rather than a shortcut. `build_addnorm_module` caps a launch at 104
+rows of 768, and a band at a nonzero row offset cannot be routed into a launch's args clause:
+`memref.cast` will not cast an offset subview back to the identity layout the signature declares.
+So the stitched module cannot reuse the banded fused operator, and streaming the decomposed
+builders is the only form available today.
+
+### And the larger one: the four modes do not all run attention in the same place
+
+| mode | attention | normalization |
+|---|---|---|
+| `offload` | **host torch**, blocked (`pattern/blocked_attention.py`) | host torch |
+| `runlist` | **host torch**, blocked — the same module, shared | decomposed, banded at 64 rows |
+| `coarse` | **device** FlashAttention (`mha_out_proj`) | fused `addnorm`, banded |
+| `fused` | **device** FlashAttention (`mha_out_proj`) | decomposed, streamed |
+
+Both host-attention choices are forced by the same constraint that reshaped `offload`: the attention
+interior needs `4096x64x4096` and `4096x4096x64`, which no registry row holds and no `--family` can
+sweep. And `08d` deliberately had `runlist` share `offload`'s blocking so the two would block
+attention identically. So neither is a defect.
+
+But it means **a mode-versus-mode comparison varies more than the dispatch boundary it claims to
+isolate.** `offload` against `coarse` differs in dispatch granularity *and* in whether attention ran
+on the NPU; so does `runlist` against `coarse`. That is the same confound that made E4's first
+`runlist` structure uninterpretable — two variables moving at once — and it is load-bearing here
+because attention is the dominant cost in the layer.
+
+Three things for this phase:
+
+- **Do not let the case matrix compare modes on latency alone.** A row reporting only time is
+  comparing different arithmetic *and* different hardware utilization. The schema already carries
+  per-boundary data and `attention_path`; surface both next to any mode-versus-mode number.
+- **Consider a fifth measured point**: `coarse` or `fused` with host attention, or the reverse, to
+  separate "attention on device" from "dispatch boundary". One extra column in the case matrix buys
+  the ability to attribute a difference to the thing the taxonomy names.
+- **The norm fix, if it is worth one, is an offset-subview path** for launch arguments, which would
+  let a stitched module reuse the fused `addnorm` at a nonzero row offset. That is a compiler change
+  in the launch-args legalization, not a study change, so it is scoped here only as a recorded
+  dependency — see [08 §Outcome](08-phase-e-execution-strategies.md).
+
 ## The port tier that carries over
 
 ~19,000 lines have **zero** `iron` imports: `run_lock.py`, `plot_families.py`,
