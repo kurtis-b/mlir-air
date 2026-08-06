@@ -269,6 +269,52 @@ Do not resolve this by annotating the three models' callees, by adding `air.disa
 their builders, or by dropping the `hoisted` clause. The first two hide the question, the third
 removes the only thing proving the transform still discriminates.
 
+## `[2026-08-06]` STOPPED HERE: the fixture and the shipped models cannot both be right
+
+Attempt 5 reached the confirm review, which found: *"The mandated hoisted-weight fixture remains
+accepted rather than refused."* Round 3's fix narrowed the refusal far enough to compile the three
+shipped models, and at that width `--variant hoisted` is no longer refused. The two clauses of the
+objective check are now in direct opposition, and every further attempt will oscillate between them.
+
+**This is a specification question and no session can settle it.** The loop is stopped at 29 of 60
+invocations rather than spending the rest rediscovering the same fork.
+
+The fork, stated so it can be decided:
+
+**(a) The fixture is right — that shape really is unsafe.** Then `llama32_1b_int4`, `qwen3_0_6b`
+and `qwen3_1_7b` are relying on a program the compiler cannot prove safe, and the fix is to make
+those three express the invariant — annotate the callee (`llvm.readonly` on the loop-invariant
+operand is the honest form, and it is *information*, not a workaround), or hoist the buffer so the
+rotation does not cover it. That is per-design work across three shipped models, and it must be
+measured for throughput, not just correctness.
+
+**(b) The fixture is wrong — refusal is the wrong instrument for that shape.** A loop-invariant
+buffer read through an external call is safe *provided the rotation does not duplicate it*. If the
+rotation already leaves it alone, there was never a hazard, and `builders/addnorm.py`'s documented
+corruption on a hoisted weight DMA has a different cause — which would need its own investigation
+before the `hoisted` clause is dropped. Do not drop it on the strength of this alone: it is the only
+thing proving the transform still discriminates.
+
+**What is needed to choose.** One measurement: for the `hoisted` fixture and for one of the three
+failing models, does the ping-pong rotation actually duplicate the buffer in question — is it in the
+`hoist_alloc` set? If the fixture's is and the models' are not, (b) is correct and the rule is
+simply "refuse only for rotated buffers". If both are rotated, (a) is correct. That is a
+`-print-ir-after` on `air-label-scf-for-to-ping-pong` away, and it decides the phase.
+
+## What did land, and is worth keeping regardless
+
+Committed on the branch, gated by four review rounds and three of the four gate legs:
+
+- The **real root cause**, found by measurement and contradicting this document's original claim:
+  the two-trip corruption is launch-side per-channel put-loop grouping against the tile ring's
+  per-iteration order under packet multiplexing, **not** ping-pong. Compiling with
+  `--omit-ping-pong-transform=all` reproduces the identical 481/512 corruption.
+- `air-fuse-packet-put-loops`, plus packet-typed channels modelled as one shared stream resource.
+- H2's external-call classifier and H3's `AIRDialect::verifyOperationAttribute`, both green through
+  `check-air-mlir` (480+ passing).
+- 522 lines of new compiler test coverage.
+- Gate legs 1–3 green: build, install, `check-air-mlir`, and the transformer-layer suite at **24/24**.
+
 ## Risks
 
 - **The gate is the widest in the plan.** A compiler regression surfaces as ten `make verify` runs
