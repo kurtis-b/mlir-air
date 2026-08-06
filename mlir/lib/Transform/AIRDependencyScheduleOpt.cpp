@@ -7623,28 +7623,12 @@ public:
       if (!optTileSizes.empty()) {
         perLoopTileSizes = optTileSizes;
       } else if (launchAttr) {
-        // Validate: empty rejected; single [0] is the skip-tile sentinel;
-        // any other value must be > 0 (multi-value 0 would later reach
-        // findLargestFactor(_, 0); negative would wrap when cast to unsigned).
+        // Value constraints (non-empty; single [0] is the skip-tile
+        // sentinel; anything else must be > 0) are enforced by
+        // airDialect::verifyOperationAttribute, so they hold even when this
+        // consuming pass never runs.
         ArrayRef<int64_t> attrSizes = launchAttr.asArrayRef();
-        if (attrSizes.empty()) {
-          enclosingLaunch->emitOpError(
-              "air.shim_dma_tile_sizes must not be empty");
-          signalPassFailure();
-          return;
-        }
         bool isSkipSentinel = attrSizes.size() == 1 && attrSizes[0] == 0;
-        if (!isSkipSentinel) {
-          for (int64_t v : attrSizes) {
-            if (v <= 0) {
-              enclosingLaunch->emitOpError(
-                  "air.shim_dma_tile_sizes values must be > 0 (use "
-                  "single-value [0] for the skip-tile sentinel)");
-              signalPassFailure();
-              return;
-            }
-          }
-        }
         if (isSkipSentinel)
           continue;
         if (attrSizes.size() == 1) {
