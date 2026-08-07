@@ -312,7 +312,7 @@ SPECS = [
         "atol": 5e-2,
         # The phase's actual claim, enforced as an aggregate ceiling: the
         # resident pipeline must beat the 1.688e-2 the block measures at this
-        # width (the decomposed tail it replaces measures 1.806e-2). A
+        # width (the decomposed tail it replaces measures 1.784e-2). A
         # pipeline that is element-wise correct but round-trips its
         # intermediates through L3 passes np.isclose and fails here. Measured
         # 3.590e-3, a 4.7x margin.
@@ -751,12 +751,15 @@ SPECS = [
         },
         # Same tensor as the block row, compared the same way at the same
         # golden seed, so the 1e-1 HARD CEILING carries over. Measured over
-        # 3145728 elements: mean_rel_L1 1.755e-2, atol_required 7.011e-2, a
-        # 1.43x margin — between offload's 1.82x (host norms and attention)
+        # 3145728 elements: mean_rel_L1 1.732e-2, atol_required 7.077e-2, a
+        # 1.41x margin — between offload's 1.82x (host norms and attention)
         # and the block's 1.35x (device fused norms), exactly where a mode
         # with device norms but host f32 attention should land. See the block
         # entry for why exceeding the ceiling is a defect report, never a
-        # wider tolerance.
+        # wider tolerance. (`[2026-08-07]` was 1.755e-2 / 7.011e-2 / 1.43x;
+        # J7a's move of layer_norm_rows to f32 two-pass statistics is the
+        # change. The mean improved and the margin TIGHTENED slightly —
+        # atol_required is a worst-element statistic and moves independently.)
         "atol": 1e-1,
         "prepare": prepare_runlist,
     },
@@ -787,16 +790,19 @@ SPECS = [
         },
         # Same tensor as the block row, compared the same way at the same
         # golden seed, so the 1e-1 HARD CEILING carries over. Measured over
-        # 3145728 elements: mean_rel_L1 1.806e-2, atol_required 7.572e-2, a
-        # 1.32x margin — the thinnest of the four modes, and the composition
+        # 3145728 elements: mean_rel_L1 1.784e-2, atol_required 7.896e-2, a
+        # 1.27x margin — the thinnest of the four modes, and the composition
         # says why: device attention (the block's own modules, whose error the
         # host-attention modes avoid) PLUS the decomposed norm tail (which
         # stages bf16 between add, LayerNorm and gamma-mul where the fused
         # addnorm does not — runlist, the same decomposition banded, measures
-        # 1.755e-2). The two effects stack: block 1.688e-2 / runlist 1.755e-2
-        # / fused 1.806e-2, every boundary still n_mismatch 0. See the block
+        # 1.732e-2). The two effects stack: block 1.688e-2 / runlist 1.732e-2
+        # / fused 1.784e-2, every boundary still n_mismatch 0. See the block
         # entry for why exceeding the ceiling is a defect report, never a
-        # wider tolerance.
+        # wider tolerance. (`[2026-08-07]` was 1.806e-2 / 7.572e-2 / 1.32x;
+        # J7a's f32 two-pass layer_norm statistics is the change. Note the
+        # mean improved while the MARGIN TIGHTENED, 1.32x -> 1.27x: the two
+        # move independently, atol_required being a worst-element statistic.)
         "atol": 1e-1,
         "prepare": prepare_fused,
     },

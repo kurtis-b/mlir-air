@@ -125,15 +125,21 @@ boundaries reproduce the block's error band. The streamed add/ln/mul tail is
 the same per-row arithmetic `runlist` measured clean at banded granularity —
 LayerNorm's loop walks 512 rows per tile instead of 8, but every row's
 arithmetic is independent. The whole-layer comparison measures `mean_rel_L1`
-1.806e-2 at `atol_required` 7.572e-2 — a 1.32x margin under the 1e-1
+1.784e-2 at `atol_required` 7.896e-2 — a 1.27x margin under the 1e-1
 ceiling, the thinnest of the four modes, and the composition says why:
 device attention (whose error the host-attention modes avoid; block measures
 1.688e-2) **plus** the decomposed norm tail (which stages bf16 between add,
 LayerNorm and gamma multiply where the fused `addnorm` does not; `runlist`,
-the same decomposition banded, measures 1.755e-2). The two effects stack —
-block 1.688e-2 / runlist 1.755e-2 / fused 1.806e-2 — with every boundary
+the same decomposition banded, measures 1.732e-2). The two effects stack —
+block 1.688e-2 / runlist 1.732e-2 / fused 1.784e-2 — with every boundary
 still at `n_mismatch` 0. That is a real, small numerical cost of this
 fusion's norm decomposition, measured rather than defined away.
+
+`[2026-08-07]` Refreshed after J7a moved `layer_norm_rows` to f32 two-pass
+statistics: was 1.806e-2 at `atol_required` 7.572e-2, a 1.32x margin. Worth
+noting that the mean improved while the margin **tightened** — `mean_rel_L1`
+is an average and `atol_required` is a worst-element statistic, so they move
+independently, and this mode has the least room of the four either way.
 
 ## What it costs
 

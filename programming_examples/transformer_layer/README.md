@@ -625,10 +625,12 @@ tail streams them — the same decomposition `runlist` measured clean, at
 streaming rather than banded granularity.
 
 **The fusion has a measured numerical cost.** Device attention (block
-1.688e-2 `mean_rel_L1`) plus the decomposed norm tail (runlist 1.755e-2)
-stack to 1.806e-2 at `atol_required` 7.572e-2 — a 1.32x margin under the
+1.688e-2 `mean_rel_L1`) plus the decomposed norm tail (runlist 1.732e-2)
+stack to 1.784e-2 at `atol_required` 7.896e-2 — a 1.27x margin under the
 1e-1 ceiling, the thinnest of the four modes, every boundary still
-`n_mismatch` 0.
+`n_mismatch` 0. (`[2026-08-07]` refreshed after J7a moved `layer_norm_rows`
+to f32 two-pass statistics; was 1.806e-2 at 7.572e-2, a 1.32x margin. The
+mean improved and the margin tightened — they are different statistics.)
 
 ## The four-mode dispatch-vector table (Phase E's headline result)
 

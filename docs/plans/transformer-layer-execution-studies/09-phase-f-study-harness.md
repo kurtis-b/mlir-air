@@ -34,11 +34,18 @@ where the fused operator keeps those intermediates in higher precision inside on
 stacks across the modes and is measured, not estimated:
 
 ```
-block   1.688e-2      runlist 1.755e-2      fused 1.806e-2      (mean_rel_L1, whole layer)
+block   1.688e-2      runlist 1.732e-2      fused 1.784e-2      (mean_rel_L1, whole layer)
 ```
 
-`fused` lands at `atol_required` 7.572e-2 against the hard `1e-1` ceiling — a 1.32x margin, the
+`fused` lands at `atol_required` 7.896e-2 against the hard `1e-1` ceiling — a 1.27x margin, the
 thinnest of the four modes.
+
+`[2026-08-07]` Refreshed from the J7b gate run, after J7a moved `layer_norm_rows` to f32 two-pass
+statistics. Previously `runlist` 1.755e-2 and `fused` 1.806e-2 at `atol_required` 7.572e-2 (1.32x).
+`block` is unchanged — it dispatches the fused `addnorm`, which deliberately keeps one-pass
+statistics, not `build_layer_norm_module`. Note the mean improved while `fused`'s margin tightened,
+1.32x → 1.27x: an average and a worst-element statistic move independently, and this mode has the
+least headroom either way.
 
 The cause is a layout limitation rather than a shortcut. `build_addnorm_module` caps a launch at 104
 rows of 768, and a band at a nonzero row offset cannot be routed into a launch's args clause:

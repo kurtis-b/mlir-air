@@ -105,8 +105,8 @@ streaming q/k/v/attention path is leaner than `coarse`'s fused mha even with
 the norm chains restaged, and the gamma broadcasts shrink from `[4096, 768]`
 to one shared `[64, 768]` band per norm point.
 
-All ten stage boundaries clean; layer output mean_rel_L1 1.755e-2 at
-atol_required 7.011e-2 — a 1.43x margin under the 1e-1 ceiling, between
+All ten stage boundaries clean; layer output mean_rel_L1 1.732e-2 at
+atol_required 7.077e-2 — a 1.41x margin under the 1e-1 ceiling, between
 `offload`'s 1.82x (host norms) and the block's 1.35x (device fused norms),
 which is where device norms + host f32 attention should land. The banded
 chains produce bit-identical boundary tensors to the streaming structure
