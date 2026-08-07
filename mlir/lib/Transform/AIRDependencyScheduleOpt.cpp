@@ -4875,12 +4875,17 @@ public:
   // Eligibility is deliberately the exact wrapper shape air-dma-to-channel
   // emits, nothing wider:
   //   - all bounds static (the iteration count is a herd dimension);
-  //   - one async-token result with NO uses. The result is dead in practice
-  //     (air-dependency-canonicalize prunes the terminal joins); if it ever
-  //     is live, joining the per-iteration tokens at the parallel's position
-  //     would place a user of every member's result before the fusion point,
-  //     and runOnBlock's dominance check would then (correctly) refuse to
-  //     fuse -- so expanding would churn the IR for nothing;
+  //   - one async-token result. A dead result (the common case:
+  //     air-dependency-canonicalize prunes the terminal joins) needs no
+  //     replacement. A live one is replaced with an air.wait_all joining
+  //     everything the reduction combined -- the init values plus each
+  //     iteration's reduce operand -- inserted immediately before the
+  //     result's earliest user, so the join lands after any later wrapper's
+  //     clones and runOnBlock's dominance check still admits groups spanning
+  //     the wrappers. Declining live results instead would make this fix
+  //     conditional on a cleanup pass having run: a token that survived
+  //     pruning would silently bring back the very feed-order miscompile
+  //     the pass exists to prevent;
   //   - every body op is a candidate put loop, an air.wait_all (the token
   //     plumbing the wrapper carries), or region-free and memory-effect-free
   //     (index arithmetic); at least one candidate. Anything else -- a bare
@@ -4906,8 +4911,7 @@ public:
       steps.push_back(*stc);
     }
     if (par.getNumResults() != 1 ||
-        !llvm::isa<air::AsyncTokenType>(par.getResult(0).getType()) ||
-        !par.getResult(0).use_empty())
+        !llvm::isa<air::AsyncTokenType>(par.getResult(0).getType()))
       return false;
     Block *body = par.getBody();
     bool hasCandidate = false;
@@ -4927,8 +4931,40 @@ public:
     }
     if (!hasCandidate)
       return false;
+    // A live result is rebuilt from what the reduction combined: its
+    // combiner joins async tokens (createSCFReduceForAsyncSCFParallel), so
+    // the result is an air.wait_all over the init values and every
+    // iteration's reduce operand. The join is a user of every member's
+    // result, so WHERE it lands decides whether runOnBlock can still fuse
+    // groups spanning LATER wrappers: at this parallel's position it would
+    // sit before their clones and (correctly) veto the very fusion this
+    // expansion exists to enable. Place it as late as dominance allows --
+    // immediately before the result's earliest user. A user outside this
+    // block (no ancestor here) keeps the join at the parallel's own
+    // position instead: always dominance-safe, possibly fusion-inhibiting,
+    // never wrong.
+    bool resultLive = !par.getResult(0).use_empty();
+    Value redVal;
+    Operation *joinAnchor = nullptr;
+    if (resultLive) {
+      auto reduce = dyn_cast<scf::ReduceOp>(body->getTerminator());
+      if (!reduce || reduce.getNumOperands() != 1)
+        return false;
+      redVal = reduce.getOperand(0);
+      for (Operation *user : par.getResult(0).getUsers()) {
+        Operation *anc = par->getBlock()->findAncestorOpInBlock(*user);
+        if (!anc) {
+          joinAnchor = nullptr;
+          break;
+        }
+        if (!joinAnchor || anc->isBeforeInBlock(joinAnchor))
+          joinAnchor = anc;
+      }
+    }
     builder.setInsertionPoint(par);
     auto loc = par.getLoc();
+    SmallVector<Value> joinOperands(par.getInitVals().begin(),
+                                    par.getInitVals().end());
     // Odometer over the (possibly multi-dimensional) index space, ascending,
     // outermost dimension slowest -- the same order airrt-to-npu unrolls
     // launch-scope parallels in, so the shim task order this materializes is
@@ -4943,6 +4979,8 @@ public:
         remap.map(iv, arith::ConstantIndexOp::create(builder, loc, cst));
       for (auto &op : body->without_terminator())
         builder.clone(op, remap);
+      if (resultLive)
+        joinOperands.push_back(remap.lookupOrDefault(redVal));
       int d = ivs.size() - 1;
       for (; d >= 0; d--) {
         ivs[d] += steps[d];
@@ -4952,6 +4990,14 @@ public:
       }
       if (d < 0)
         break;
+    }
+    if (resultLive) {
+      if (joinAnchor)
+        builder.setInsertionPoint(joinAnchor);
+      auto join = air::WaitAllOp::create(
+          builder, loc, air::AsyncTokenType::get(builder.getContext()),
+          joinOperands);
+      par.getResult(0).replaceAllUsesWith(join.getAsyncToken());
     }
     par.erase();
     return true;

@@ -1088,6 +1088,10 @@ def AIRFusePacketPutLoops: Pass<"air-fuse-packet-put-loops", "ModuleOp"> {
     the wrapper target per-column shim queues, so interleaving puts across
     former iterations reorders nothing on any shared stream; the per-column
     order each queue does depend on is exactly what the fusion restores.
+    A wrapper whose async result token is still live is expanded too: the
+    result is replaced by a join of the init values and every iteration's
+    reduce operand, placed immediately before its earliest user so the
+    cross-wrapper fusion is not blocked by the replacement itself.
   }];
 }
 

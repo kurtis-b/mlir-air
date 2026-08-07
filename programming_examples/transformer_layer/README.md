@@ -1239,14 +1239,23 @@ herd 8 is exact 3/3. What the diff cannot show:
   `air-isolate-async-dma-loop-nests`, which re-splits fused loops — and that
   pass necessarily runs after `air-dma-to-channel` creates the wrappers. There
   is no pipeline point where the loops exist fused-fusable and unwrapped.
-- **Wrappers with a live result token are declined, deliberately.** Joining
-  the unrolled iterations' tokens at the wrapper's position would place a
-  user of every member's result before the fusion point, and the fusion's
-  dominance check would then (correctly) refuse the whole group — expansion
-  would churn IR for nothing. In practice the wrapper results are dead
-  (`air-dependency-canonicalize` prunes the terminal joins) and the shipped
-  designs are untouched either way: single-trip put loops canonicalize into
-  bare puts before the pass runs, so their wrappers hold no candidates.
+- **Wrappers with a live result token are expanded too** (fixed in review:
+  the first cut declined them). Declining looked harmless because the
+  wrapper results are dead in practice (`air-dependency-canonicalize` prunes
+  the terminal joins) — but that made the correctness fix conditional on a
+  cleanup pass having run, and a token that survived pruning would have
+  silently brought the whole-channel feed order back. The pass now replaces
+  a live result with an `air.wait_all` over the init values and every
+  iteration's reduce operand — semantically what the `scf.reduce` combiner
+  (itself a token join) computed — inserted immediately before the result's
+  earliest user. That placement is the load-bearing part: at the wrapper's
+  own position the join would be a user of every member's result sitting
+  before the fusion point, and the fusion's dominance check would
+  (correctly) refuse the group; before the earliest user it lands after
+  every later wrapper's clones, the fusion fires, and downstream consumers
+  end up waiting on the fused loop itself. Shipped single-trip designs are
+  untouched either way: their one-trip put loops canonicalize into bare
+  puts before the pass runs, so their wrappers hold no candidates.
 - **The shim 16-BD wall now binds multicolumn, loudly.** Each fused put still
   lowers to its own simultaneously-active `aiex.dma_configure_task`, so
   column 0's shim carries `3 × trips` tasks (weight + x + res) and refuses at
