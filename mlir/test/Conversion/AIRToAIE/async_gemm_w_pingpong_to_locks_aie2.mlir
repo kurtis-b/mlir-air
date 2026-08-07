@@ -5,7 +5,16 @@
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: air-opt -air-fuse-channels="aggressive-mode=L1,L2,L3" -air-to-aie="emit-while-loop=false use-objectfifo=false row-offset=3 col-offset=5 device=xcve2802" %s | FileCheck %s
+// -air-opt-memtile-dma-bds is REQUIRED here and must not be dropped as noise.
+// See async_gemm_to_locks_aie2.mlir for the full reasoning. This test makes the
+// old failure starkest: its feed loops run FOUR trips and its buffers are
+// asymmetric, so pre-fix the A feed (64x128xi32) emitted {0, 4096} where it
+// needed eight offsets, and the B feed (128x64xi32) emitted {0, 32} where it
+// needed {0,2048,4096,6144} interleaved with {32,2080,4128,6176}. The CHECK
+// lines pin no BD offset, so none of that was visible. This pass folds the walk
+// into BD wrap/stride dims; air-to-aie now refuses the unfolded form outright
+// (phase H10).
+// RUN: air-opt -air-fuse-channels="aggressive-mode=L1,L2,L3" -air-opt-memtile-dma-bds="device=xcve2802" -air-to-aie="emit-while-loop=false use-objectfifo=false row-offset=3 col-offset=5 device=xcve2802" %s | FileCheck %s
 
 // CHECK-LABEL:   aie.device(xcve2802) @segment_0 {
 // CHECK-DAG:   %[[VAL_4:.*]] = aie.tile(5, 3)
