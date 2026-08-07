@@ -42,6 +42,25 @@ WHAT IT IS FOR
     locks, which at least fails loudly at compile time. Here it declines to
     unroll and silently emits a chain that repeats a stale offset forever.
 
+ROOT CAUSE, located after this probe was written
+    `mlir/lib/Conversion/AIRToAIESchedulingUtils.cpp`, `air::get1DOffset`:
+
+        auto offset = mlir::getConstantIntValue(memcpy_offsets[i]);
+        one_d_offset += *offset;        // no has_value() check
+
+    `getConstantIntValue` returns nullopt exactly when the value is NOT a
+    compile-time constant -- an induction variable, here. Dereferencing that is
+    UB; the observed result is a silent 0. The BD-dim-layout construction at
+    ~462 has the same unchecked deref, while the same file checks correctly at
+    527 and 945. The only caller is AIRToAIEPass.cpp:6527.
+
+    Confirmed in the pre-air-to-aie dump: the put reads `%arg4[%7]` where
+    `%7 = affine.apply #map()[%arg6]` over the K loop's IV, while the
+    accumulator fetch beside it is all literals -- which is why the C BDs were
+    right and the A BD was not.
+
+    Specced as phase H10, docs/plans/.../24-phase-h10-non-constant-bd-offsets.md.
+
 NOT a test. Nothing runs it in CI.
 """
 

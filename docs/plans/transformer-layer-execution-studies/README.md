@@ -37,6 +37,7 @@ how to use MLIR-AIR.
 | [21-phase-j7a-norm-tail-pipeline.md](21-phase-j7a-norm-tail-pipeline.md) | J7a — the norm-tail pipeline. **The first working piece of the dataflow goal** |
 | [22-phase-j7b-accumulator-ring.md](22-phase-j7b-accumulator-ring.md) | **The next phase, staged and not started.** Partial sums that never leave the chip, with the compiler forming the ring |
 | [23-rules-and-open-items.md](23-rules-and-open-items.md) | **Start here.** The rules that govern later work, and the open items nobody has claimed |
+| [24-phase-h10-non-constant-bd-offsets.md](24-phase-h10-non-constant-bd-offsets.md) | **The next phase, specced and not started.** The silent miscompile J7b lost a session to, located: an unchecked `std::optional` deref in `air-to-aie` |
 
 ## Status board
 
@@ -64,6 +65,7 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | H9 — fuse packet put loops through `scf.parallel` | `gate-h.sh` five legs, plus a driver fixture variant at `herd_x=8` that must go from corrupt to exact | **done** 2026-08-07 (184 min) — `multicolumn` 3747+/4096 wrong → exact; 10/10 models; three review rounds each found a real defect in the combiner/token handling that the gate could not reach |
 | J7a — norm-tail pipeline | transformer-layer suite; `mean_rel_L1` ≤ block's 1.688e-2; zero packet-typed channels | **done** 2026-08-07 (87 min) — 3.620e-3 at 4096×768, 4.7× under the bound; compiler-derived placement and depth; `layer_norm` itself improved ~25× as a side effect |
 | J7b — accumulator ring | transformer-layer suite; the in-place accumulator dispatched; C DMAs hoisted out of the K loop | **done** 2026-08-07 (58 min) |
+| H10 — non-constant BD offsets | `gate-h.sh` five legs, plus the pre-fix J7b construction at 4 K steps must be REFUSED by name | **specced, not started** — spec at [24](24-phase-h10-non-constant-bd-offsets.md); root cause located, `PL_PHASES_IN_SCOPE` not yet set |
 | F — study harness | `execution-smoke-test` yields ≥1 `run_status=passed` row per measurement CSV | not started |
 | G — unattended runner + CI | Full profile run completes with a complete `results_manifest.json` | not started |
 | Goal 1 — sliding window | `make verify` passes with window-crossing prompts | not started |

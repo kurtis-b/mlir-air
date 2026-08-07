@@ -203,15 +203,33 @@ phase's allowlist covers them, so a phase cannot fix its own checker — which i
 not a gap. It does mean a bug in a checker costs a whole run unless someone runs the check by hand
 first, which is worth doing for any newly-written objective check.
 
-**5b. The static-BD-offset defect has no compiler-side fix and no diagnostic.** `[2026-08-07]`
-J7b routed around it (advance on L3, never on the L2 read) and its builder documents the wall,
-but the compiler still accepts the losing construction silently. Two bounded items, unclaimed:
-a **diagnostic** — when a channel put's offset depends on a loop IV and the loop will not be
-fully unrolled, that offset cannot be honoured, and the pass knows both facts; and the **fix**,
-which is H5's dynamic-index work (mlir-aie already solved it one layer down with
-`dynamic-objFifos`: a per-core counter plus `scf.index_switch`). The diagnostic is worth doing
-even if the fix never is — this cost J7b its implement session, and the failure presents as a
-hardware hang with no compile-time signal at all.
+**5b. The static-BD-offset defect, LOCATED `[2026-08-07]` — it is an unchecked `std::optional`
+dereference, and it is specced as [24](24-phase-h10-non-constant-bd-offsets.md).** J7b routed
+around it (advance on L3, never on the L2 read), but the compiler still accepts the losing
+construction silently. Root cause, in
+`mlir/lib/Conversion/AIRToAIESchedulingUtils.cpp`:
+
+```cpp
+auto offset = mlir::getConstantIntValue(memcpy_offsets[i]);   // nullopt when NOT constant
+one_d_offset += *offset;                                      // dereferenced unchecked
+```
+
+`get1DOffset` (206, 210) and the BD-dim-layout construction (462–464) both do this; **the same
+file checks correctly at 527 and 945**, so the idiom is known and inconsistently applied. The only
+caller is `AIRToAIEPass.cpp:6527`, and the line directly above it checks. Dereferencing a
+disengaged optional is UB; what was observed is a silent `0`, which is how every BD in the cycle
+ends up addressing the same block.
+
+Confirmed against the real IR — the pre-`air-to-aie` dump carries
+`air.channel.put ... (%arg4[%7] ...)` with `%7 = affine.apply #map()[%arg6]` over the K loop's IV,
+while the accumulator fetch beside it is all literals, which is exactly why the C BDs were right
+and the A BD was not.
+
+So this is not "add a diagnostic to a pass that cannot know" — the pass has the information and
+throws it away. Doc [24](24-phase-h10-non-constant-bd-offsets.md) specs the fix: return an optional,
+refuse with a message that says what to do instead. **Refuse, not skip** — unlike ping-pong
+labelling there is no correct fallback, since a BD cannot express a per-iteration offset. The
+dynamic-index lowering that would make it expressible is H5 and is much larger.
 
 **5. ~~`norm_tail_structure.py` checks at `air-dma-to-channel` altitude.~~ CLOSED `[2026-08-07]`.**
 It now compiles through `XRTBackend(debug_ir=True)` — the production aircc binary — and asserts on
