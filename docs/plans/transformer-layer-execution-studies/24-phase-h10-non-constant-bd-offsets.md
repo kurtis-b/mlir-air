@@ -74,11 +74,48 @@ Measured on J7b's pre-fix builder at 4 K steps (`agents/probes/probe_ffn_accum_b
 4. **Nothing warns, at any stage.** The structural checks are green: 4 → 2 hoist, zero packet-typed
    channels, full compile.
 
-## The scope, which is narrower than it first looks — and why nothing shipped breaks
+## The scope — and a correction this spec got wrong
 
-`get1DOffset`'s only caller sits inside `generateDmaBd(..., AIE::TileLike tile, ...)`: the
-**tile-side** (core and memtile) BD path. L3-side transfers are programmed by the runtime sequence
-(`AIRRtToNpuPass`), which materializes offsets per task and can express one that advances.
+> **`[2026-08-07]` CORRECTED. The paragraph below claimed the refusal cannot reach L3 transfers
+> because `get1DOffset`'s caller takes an `AIE::TileLike tile`. That inference was wrong, and it
+> cost the implement session a round.** `TileLike` is an *interface*, which shim tiles implement
+> too, and `generateDmaBdProgram` is instantiated **twice**:
+>
+> ```
+> generateDmaBdProgram<air::TileDMAAllocator, AIE::BufferOp,         AIE::MemOp>      // core/memtile
+> generateDmaBdProgram<air::ShimDMAAllocator, AIE::ExternalBufferOp, AIE::ShimDMAOp>  // SHIM
+> ```
+>
+> Both reach `generateDmaBd` → `get1DOffset`, so a refusal placed there fires on **shim** BDs as
+> well, where a moving offset is legitimate. Scope the refusal to the `TileDMAAllocator`
+> instantiation.
+>
+> **That is a real correction, but it is NOT why the three existing lit tests fail.** Measured:
+> `async_gemm_to_locks_aie2.mlir` and the two `async_gemm_w_pingpong_*` contain **four L2
+> (`memref<64x64xi32, 1>`) channel ops whose offsets are `scf.for` induction variables, in the
+> input as written** — before any pass runs. They encode the losing construction on the tile side,
+> so the refusal fires on them **correctly**.
+>
+> Which makes them category (a) from the allowlist note: *designs relying on the undefined
+> behaviour, a finding to report rather than tests to edit*. Their CHECK lines assert AIE
+> structure — tiles, locks, flows — and never a `dma_bd` offset, so a frozen offset was invisible
+> to them. **They have been passing over a construction whose BD offsets are silently zero.**
+> Deciding what those tests should assert instead is the human call the allowlist exists to force.
+>
+> Two wrong diagnoses to not repeat, both corrected by measurement:
+> - The implement session reported that the tests skip `-air-specialize-channel-wrap-and-stride`,
+>   which "the production aircc pipeline runs". **That pass is not in aircc's pipeline at all** —
+>   it is `air-dependency, air-hoist-dma-in-accum-pattern, [broadcast], air-dma-to-channel, …,
+>   air-to-aie`, and no dump for it appears in J7b's real compile. Do not normalize the tests on
+>   that basis.
+> - This document first claimed the tests were all-L3 and the refusal was simply too broad. That
+>   came from grepping for `memref<…, 1 : i32>`; these tests use the short form
+>   `memref<…, 1>`, so the L2 operands did not match. A false negative from a pattern, not from
+>   the IR.
+
+`get1DOffset`'s callers sit inside `generateDmaBd`, reached from **both** the tile-side and the
+shim-side BD programs (see the correction above). L3-side transfers are programmed by the runtime
+sequence (`AIRRtToNpuPass`), which materializes offsets per task and can express one that advances.
 
 The IR bears this out exactly. In J7b's failing module, three channel puts carry an offset:
 
@@ -177,10 +214,19 @@ Everything above is measured except one thing, and it is the first thing to chec
 2. The IR carries a non-constant offset at that point — **confirmed** from the pre-`air-to-aie`
    dump. ✅
 3. The BD offset comes out frozen and the design hangs — **measured on hardware.** ✅
-4. The refusal fires only on tile-side BDs, so an IV-dependent **L3** offset is untouched —
-   **read from the caller and confirmed against the IR** (the table above). ✅
+4. ~~The refusal fires only on tile-side BDs, so an IV-dependent **L3** offset is untouched —
+   read from the caller and confirmed against the IR.~~ **FALSE, corrected `[2026-08-07]`.** This
+   was inferred from the caller's `AIE::TileLike` parameter without checking its instantiations;
+   `generateDmaBdProgram` is instantiated for `ShimDMAAllocator` as well, so a refusal in
+   `generateDmaBd` reaches shim BDs. **Scope it to the `TileDMAAllocator` instantiation.** The IR
+   table above is still correct — it is the *conclusion drawn from it* that was wrong. ❌
 5. **That no shipped model relies on the losing construction — NOT established by a build.** A
    static survey of every non-literal channel offset in `programming_examples/` found none on an
    L2/L1 operand, so the expectation is that nothing breaks; leg 5 is what actually answers it. If
    a model does break, stop and report — it has been computing on a frozen BD offset, and the
    finding is much larger than this phase.
+
+   **`[2026-08-07]` The compiler's OWN tests do rely on it**: three `mlir/test/Conversion/AIRToAIE`
+   tests carry four L2 channel ops with induction-variable offsets. That is a stronger version of
+   the same warning — the construction was reachable enough to be written into the regression
+   suite — and it means leg 2 (`check-air-mlir`) answers this question before leg 5 does.
