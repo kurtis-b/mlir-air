@@ -242,6 +242,15 @@ FFN_ACCUM_EMB_DIM = 768
 # One feed sub-channel per core, each a memtile MM2S port; a memtile has 6.
 MAX_FEED_CHANNELS = 6
 
+# The two MEASURED ceilings, named separately from the production geometry above
+# because "what we ship" and "what works" are different claims that happen to
+# coincide here. Both were documented in prose while the builder still accepted
+# them, so the knowledge did not reach a caller until aiecc or aie-place-tiles
+# failed minutes later; build_ffn_accum_module now refuses them with the
+# measurement in the message.
+MAX_PLACEABLE_HERD_X = 4
+MAX_L1_TILE_K = 32
+
 # A memtile's memory, the ceiling on the staged operands. Both stages hold ONE
 # K step now, so this is roomy -- it was the binding constraint when A was
 # staged whole (480 KB of 512 KB at the spec shape).
@@ -446,6 +455,27 @@ def build_ffn_accum_module(
         raise ValueError(
             f"ffn_dim ({ffn_dim}) must divide by tile_k ({tile_k}), itself a "
             f"multiple of {MICRO}: the K loop and the feed slices step by it"
+        )
+    # Two settings this file DOCUMENTS as measured-not-to-work were still
+    # accepted, so the knowledge lived only in prose and the failure arrived as
+    # an aiecc or placement error several minutes later. Refuse them here, and
+    # say what was measured -- if a later toolchain lifts either, deleting the
+    # check is a deliberate act with a reason attached.
+    if herd_x > MAX_PLACEABLE_HERD_X:
+        raise ValueError(
+            f"herd_x {herd_x} is above the {MAX_PLACEABLE_HERD_X} that places. "
+            "Measured at 6 columns: aie-place-tiles refuses the accumulator "
+            "pair's shim slots -- \"no ShimNOCTile has sufficient DMA capacity "
+            'for 1 input/1 output channels near centroid column 3" -- with all '
+            "16 slots demonstrably free, a windowed-search artifact of that "
+            "pass. 5 was never measured; it is refused as unproven, not as known bad."
+        )
+    if tile_k > MAX_L1_TILE_K:
+        raise ValueError(
+            f"tile_k {tile_k} is above the {MAX_L1_TILE_K} that fits L1. Measured "
+            "at 64: the ping-ponged A and B tiles plus the resident accumulator "
+            "land just over the 64 KiB tile. Intermediate values are refused as "
+            "unproven rather than known bad."
         )
     itemsize = np.dtype(np_dtype).itemsize
     a_elems = seq_len * ffn_dim
