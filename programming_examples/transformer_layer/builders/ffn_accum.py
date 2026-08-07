@@ -10,9 +10,12 @@ CONTRACT
 
         y = a @ w        a: [seq_len, ffn_dim]  w: [ffn_dim, emb_dim]  bf16
 
-    -- the FFN's down-projection GEMM, written as the NAIVE K loop: with C
-    entering zeroed, per K step fetch C from DDR, call the in-place accumulating kernel,
-    store C back to DDR. The builder deliberately ships that DDR round trip
+    -- the FFN's down-projection GEMM, written as the NAIVE K loop: per K
+    step fetch C from DDR, call the in-place accumulating kernel, store C
+    back to DDR -- the first iteration zeroing the fetched tile in L1 before
+    it accumulates (a guarded ``ffn_zero_bf16_up_proj`` call), so ``y``'s
+    initial DDR contents never reach the result and a reused, un-cleared
+    output BO is safe. The builder deliberately ships that DDR round trip
     per K step; ``air-hoist-dma-in-accum-pattern`` (second in the aircc
     pipeline, unconditional) recognizes the mirrored C pair and lifts it out
     of the loop, so the accumulator that actually runs is L1-resident across
@@ -128,22 +131,34 @@ WHY THE OPERANDS ARRIVE PRE-TILED
     [rows/8, cols/8, 8, 8] against strides [8*ld, 8, ld, 1]), because the
     hoisted pair rides shim DMAs which handle 4-D.
 
-WHY C IS ZEROED BY THE HOST, NOT BY ``ffn_zero_bf16_up_proj`` -- MEASURED
-    The kernel's contract requires C zeroed or holding a valid partial sum,
-    and the phase spec's construction zeroes it ON DEVICE before the loop
-    (each core running the zero kernel on a scratch tile and storing it to
-    its slice of ``y``). That store is a SECOND shim S2MM stream per column,
+WHY THE ZERO IS A GUARDED CALL INSIDE THE K LOOP, NOT A PRE-LOOP STORE --
+MEASURED
+    The kernel's contract requires C zeroed or holding a valid partial sum.
+    The phase spec's construction zeroes ``y`` in DDR before the loop (each
+    core running the zero kernel on a scratch tile and STORING it to its
+    slice of ``y``). That store is a SECOND shim S2MM stream per column,
     next to the accumulator store -- and ``aie-place-tiles`` refuses it:
     ``no ShimNOCTile has sufficient DMA capacity for 0 input/2 output
     channels near centroid column 2``. The J7a column budget, on the output
-    side this time. So ``y`` MUST ENTER ZEROED: ``XRTRunner.run_test`` builds
-    every output placeholder with ``np.zeros`` (that is the harness this
-    operator runs under), and any other caller must memset the BO before
-    dispatch. Both the pre-hoist semantics (first fetch reads y) and the
-    hoisted form read those zeros, so the requirement is identical whether
-    or not the ring formed. Consequently ``ffn_zero_bf16_up_proj`` is NOT
-    dispatched by this design -- one output stream per column is all there
-    is room for.
+    side this time.
+
+    What fits the budget is zeroing the L1 TILE, not the DDR buffer: a
+    ``ffn_zero_bf16_up_proj`` call inside the K loop, guarded by ``k == 0``,
+    between the accumulator fetch and the accumulate call. No DMA is
+    involved, so the column budget never sees it, and the module is correct
+    in BOTH forms it can take -- naive, iteration 0 fetches whatever ``y``
+    holds and zeroes over it; hoisted, the single pre-loop fetch's stale
+    read is overwritten before the first accumulate. Either way ``y``'s
+    initial contents never reach the result, so a raw XRT caller reusing an
+    un-cleared BO gets ``a @ w`` and not ``y_old + a @ w`` (review round 2's
+    finding: ``XRTRunner.run_test`` zero-fills its output placeholders, so
+    the numeric arm could never see a reliance on ``y`` entering zeroed).
+
+    The guard is ``scf.if``, not ``affine.if``: the hoist pattern matches
+    ``scf.for`` only, and an ``scf.for`` induction variable is not a valid
+    affine operand. The pass scans the loop's DIRECT dma ops and does not
+    look inside the conditional, so the ring forms exactly as before
+    (measured: still 4 -> 2, zero packet-typed channels).
 
 FOOTGUNS
     - The L1/L2 memref types are identity-layout and the DMAs fill them in
@@ -152,15 +167,20 @@ FOOTGUNS
       a layout claim. Do not "fix" the types to strided forms.
     - ``compile_ffn_accum_kernel`` must have run in the CWD before aiecc
       links: the object bakes DIM_M/DIM_K/DIM_N in as -D flags, so it is a
-      DIFFERENT object from encoder_ffn.o (tile_n 128 vs 64) and is built to
-      its own name. Linking encoder_ffn.o instead silently computes with the
-      wrong microkernel shape.
+      DIFFERENT object from encoder_ffn.o (tile_n 192 vs 64 at the defaults)
+      and is built to its own name. Linking encoder_ffn.o instead silently
+      computes with the wrong microkernel shape -- and so does compiling the
+      object at a tile_n other than the module's ``emb_dim // herd_x``,
+      which is why the helper's default is DERIVED from the module's default
+      shape rather than stated as its own number.
     - ``herd_x * herd_y`` is capped at 6: every core's feed is its own
       memtile MM2S channel and a memtile has six. This -- not the AIE array
       -- is what stops herd_x=8 here.
-    - ``y`` MUST ENTER ZEROED (see above). Under ``XRTRunner.run_test`` that
-      is automatic; a raw XRT caller that reuses a BO must clear it, or the
-      run accumulates onto stale output -- plausible numbers, wrong answer.
+    - The guarded zero sits AFTER the accumulator fetch, on purpose. Put it
+      before the fetch and the fetch overwrites the zeros with ``y``'s stale
+      contents -- on every first-K-step in the naive form, once in the
+      hoisted form, which is enough to ship ``y_old + a @ w``. The body
+      order fetch-zero-accumulate is what makes both forms correct.
     - The feed loop is emitted AFTER the herd in the segment body, on
       purpose: the driver's structural check counts data movement inside the
       FIRST ``scf.for`` of the dump, which must be the herd's K loop, not the
@@ -182,9 +202,10 @@ from ml_dtypes import bfloat16
 from air.ir import *
 from air.dialects.affine import apply as affine_apply
 from air.dialects.air import *
+from air.dialects.arith import CmpIOp, CmpIPredicate, ConstantOp
 from air.dialects.func import CallOp, FuncOp
 from air.dialects.memref import AllocOp, DeallocOp
-from air.dialects.scf import for_, yield_
+from air.dialects.scf import IfOp, for_, yield_
 from air.backend.xrt_runner import type_mapper
 
 range_ = for_
@@ -209,6 +230,15 @@ TILE_M = 64
 FFN_ACCUM_HERD_X = 4
 FFN_ACCUM_TILE_K = 32
 
+# The catalogue's one claimed width (opcheck_specs 64x3072x768), which is also
+# what the driver's no-argument objective-check build gets. It exists so that
+# compile_ffn_accum_kernel's default tile_n is DERIVED from the same numbers
+# build_ffn_accum_module defaults to (emb_dim / herd_x): the object bakes its
+# tiles in as -D flags, so two no-argument calls that disagree link a
+# microkernel whose blocked ABI does not match the module's transfers --
+# corrupt output, no link error (review round 2).
+FFN_ACCUM_EMB_DIM = 768
+
 # One feed sub-channel per core, each a memtile MM2S port; a memtile has 6.
 MAX_FEED_CHANNELS = 6
 
@@ -219,8 +249,15 @@ L2_BYTES = 512 * 1024
 
 # The in-place accumulating entry point -- the ABI string aircc binds the
 # CallOp to. See the module docstring for why the down-projection dispatches
-# the `up_proj`-named kernel, and why no zero kernel is dispatched.
+# the `up_proj`-named kernel.
 FFN_ACCUM_MM_SYMBOL = "ffn_matmul_bf16_bf16_up_proj"
+
+# The device-side zero for the accumulator tile: called on the K loop's FIRST
+# iteration only, between the accumulator fetch and the accumulate call, so
+# y's initial DDR contents never reach the result. Same object, same -DDIM_*
+# set as the matmul. See the module docstring for why the zero is this guarded
+# in-L1 call and not the spec's pre-loop store.
+FFN_ACCUM_ZERO_SYMBOL = "ffn_zero_bf16_up_proj"
 
 # Distinct from encoder_ffn.o: same translation unit, different -DDIM_* set.
 FFN_ACCUM_KERNEL_OBJ = "ffn_accum_mm.o"
@@ -230,9 +267,17 @@ FFN_ACCUM_KERNEL_OBJ = "ffn_accum_mm.o"
 CHANNEL_FEED = "ffn_accum_feed"
 
 
-def compile_ffn_accum_kernel(tile_k=FFN_ACCUM_TILE_K, tile_n=128):
+def compile_ffn_accum_kernel(
+    tile_k=FFN_ACCUM_TILE_K, tile_n=FFN_ACCUM_EMB_DIM // FFN_ACCUM_HERD_X
+):
     """Build ffn_accum_mm.o (encoder.cc's FFN half at THIS builder's tiles)
-    into the CWD, where aiecc's link_with looks."""
+    into the CWD, where aiecc's link_with looks.
+
+    The tile_n default is derived from the module's own default shape (emb_dim
+    768 over herd_x columns), NOT chosen independently: the two no-argument
+    calls must describe the same kernel object. Callers at a real shape pass
+    ``emb_dim // herd_x`` explicitly, as opcheck_prepare does.
+    """
     import shared.infra.external_kernels as ek
 
     ek.compile_encoder(
@@ -340,7 +385,7 @@ def _floordiv_map(divisor):
 def build_ffn_accum_module(
     seq_len=64,
     ffn_dim=3072,
-    emb_dim=768,
+    emb_dim=FFN_ACCUM_EMB_DIM,
     np_dtype=bfloat16,
     herd_x=FFN_ACCUM_HERD_X,
     tile_k=FFN_ACCUM_TILE_K,
@@ -439,6 +484,10 @@ def build_ffn_accum_module(
     mm_func.attributes["link_with"] = StringAttr.get(FFN_ACCUM_KERNEL_OBJ)
     mm_func.attributes["llvm.emit_c_interface"] = UnitAttr.get()
 
+    zero_func = FuncOp(FFN_ACCUM_ZERO_SYMBOL, ([l1_c_ty], []), visibility="private")
+    zero_func.attributes["link_with"] = StringAttr.get(FFN_ACCUM_KERNEL_OBJ)
+    zero_func.attributes["llvm.emit_c_interface"] = UnitAttr.get()
+
     Channel(CHANNEL_FEED, size=[herd_x, herd_y])
 
     @FuncOp.from_py_func(l3_a_ty, l3_w_ty, l3_y_ty)
@@ -468,9 +517,7 @@ def build_ffn_accum_module(
                     # the factors bake in the runtime-constant tile geometry.
                     n_micro = affine_apply(_mul_add_map(tile_n // MICRO), [tx])
                     m_micro = affine_apply(_mul_add_map(TILE_M // MICRO), [ty])
-                    # No device-side zero: y enters zeroed (see the module
-                    # docstring for the measured shim S2MM wall behind that),
-                    # and the first C fetch reads those zeros.
+                    k_first = ConstantOp.create_index(0)
 
                     # The naive accumulator loop. Every buffer is allocated
                     # INSIDE the loop and the C round trip is written per K
@@ -492,6 +539,19 @@ def build_ffn_accum_module(
                             src_sizes=[TILE_M // MICRO, tile_n // MICRO, MICRO, MICRO],
                             src_strides=[MICRO * emb_dim, MICRO, emb_dim, 1],
                         )
+                        # First iteration only: zero the fetched tile IN L1,
+                        # so y's initial DDR contents never reach the result
+                        # -- in the naive form AND the hoisted one (the
+                        # hoisted fetch's stale read is overwritten here
+                        # before the first accumulate). scf.if, not
+                        # affine.if: the hoist pattern matches scf.for only,
+                        # whose IV is not a valid affine operand. AFTER the
+                        # fetch, on purpose; see the FOOTGUNS.
+                        is_first = CmpIOp(CmpIPredicate.eq, _k, k_first)
+                        if_first = IfOp(is_first.result)
+                        with InsertionPoint(if_first.then_block):
+                            CallOp(zero_func, [l1_c])
+                            yield_([])
                         CallOp(mm_func, [l1_a, l1_b, l1_c])
                         dma_memcpy_nd(
                             h_y,

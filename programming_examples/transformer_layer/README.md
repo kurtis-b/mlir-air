@@ -1361,10 +1361,15 @@ docstring, in short:
    packet-upgraded, and packets share ports.) Resolution: A and B share ONE
    memtile feed channel — two gets per K step, host-pre-tiled so every
    transfer is contiguous — leaving one core port for the hoisted C fetch.
-3. The spec's device-side zero (`ffn_zero_bf16_up_proj` + store) is a second
-   shim S2MM stream per column and `aie-place-tiles` refuses placement; `y`
-   must instead ENTER zeroed (XRTRunner zero-fills output placeholders).
-   The zero kernel is consequently not dispatched. Same pass also refuses
+3. The spec's pre-loop zero-and-STORE (`ffn_zero_bf16_up_proj` on a scratch
+   tile, stored to `y`) is a second shim S2MM stream per column and
+   `aie-place-tiles` refuses placement. The zero that fits the budget works
+   on the L1 tile instead: the same kernel called inside the K loop under a
+   `k == 0` guard, between the accumulator fetch and the accumulate — no
+   DMA, so the column budget never sees it, and `y`'s initial DDR contents
+   never reach the result whether or not the ring formed (review round 2;
+   before that, `y` had to enter zeroed, which XRTRunner's zero-filled
+   output placeholders both satisfied and concealed). Same pass also refuses
    the C pair's slots at herd_x=6 with free capacity — herd_x=4 places.
 
 4. **A per-iteration L2 read offset is silently dropped past the unroll

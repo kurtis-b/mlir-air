@@ -509,9 +509,13 @@ def prepare_ffn_accum(shape, seed=11):
     ``delta * w[0, :]`` ~ 2/sqrt(3072) ~ 3.6e-2 per element, an order above
     the tolerance band at this scale.
 
-    ``y`` must enter zeroed (the in-place kernel accumulates onto it);
-    ``XRTRunner.run_test`` zero-fills output placeholders, which is the
-    contract this operator documents in its builder.
+    ``y`` need not enter zeroed: the builder zeroes the accumulator tile on
+    device (a guarded ``ffn_zero_bf16_up_proj`` call on the K loop's first
+    iteration), so a stale output BO cannot leak into the result.
+    ``XRTRunner.run_test`` zero-fills its output placeholders regardless --
+    which is exactly why this numeric arm could never have detected a
+    reliance on that, and why the structural arm checks the zero is
+    dispatched (review round 2).
     """
     seq_len, ffn_dim = shape["seq_len"], shape["ffn_dim"]
     emb_dim = shape["emb_dim"]
@@ -521,8 +525,11 @@ def prepare_ffn_accum(shape, seed=11):
     # here). The kernel object bakes DIM_M/DIM_K/DIM_N in as -D flags, so
     # compiling it at a different tile_n from the one the module declares
     # links the wrong microkernel and produces garbage that no import error
-    # announces -- compile_ffn_accum_kernel()'s tile_n default (128) is NOT
-    # emb_dim // herd_x for every shape, and is not for this one (192).
+    # announces -- so tile_n is passed explicitly, derived from THIS row's
+    # emb_dim, rather than trusting compile_ffn_accum_kernel's default to
+    # track the shape (the default is derived from the module's DEFAULT
+    # shape, which happens to coincide here; explicit is what stays right
+    # when a second catalogue row lands at another width).
     herd_x, tile_k = FFN_ACCUM_HERD_X, FFN_ACCUM_TILE_K
     tile_n = emb_dim // herd_x
     compile_ffn_accum_kernel(tile_k=tile_k, tile_n=tile_n)

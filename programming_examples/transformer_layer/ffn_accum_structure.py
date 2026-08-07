@@ -28,13 +28,18 @@ CONTRACT
        that K loop. Three accumulate-into-C kernels have been exported
        since phase A and never dispatched; a numerically equivalent
        replacement would pass clause 1 and every numeric check while
-       violating the phase.
+       violating the phase. The K loop must ALSO dispatch the device-side
+       zero ``ffn_zero_bf16_up_proj`` under an ``scf.if`` (the first-K-step
+       guard): that call is what makes a stale, reused output BO safe, and
+       no numeric arm can see it missing because ``XRTRunner.run_test``
+       zero-fills output placeholders (review round 2).
     3. PERSISTENCE. In the LAST dump still carrying the herd (the end of
        the AIR-dialect pipeline, just before air-to-aie) the K loop must
-       still hold exactly the two feed gets plus the accumulate call, with
-       one accumulator get and one put hoisted outside it. A pass running
-       after the hoist that re-sinks or reintroduces the C round trip
-       fails HERE even though clause 1 still reads 4 -> 2.
+       still hold exactly the two feed gets plus the accumulate call and
+       the guarded zero, with one accumulator get and one put hoisted
+       outside it. A pass running after the hoist that re-sinks or
+       reintroduces the C round trip -- or drops the zero -- fails HERE
+       even though clause 1 still reads 4 -> 2.
     4. ZERO PACKET-TYPED CHANNELS in EVERY dump, J7a's column rule. Three
        per-core input streams packet-multiplex EVERY input (measured; see
        the builder), and the packet path is silently wrong past one trip
@@ -87,6 +92,12 @@ from opcheck_specs import SPECS  # noqa: E402
 # what "the in-place kernel" means; the cross-check against the builder's
 # exported constant catches the drift at its source.
 REQUIRED_MM_SYMBOL = "ffn_matmul_bf16_bf16_up_proj"
+
+# The device-side zero, guarded to the K loop's first iteration. Stated
+# literally for the same reason as the symbol above: a builder that stops
+# dispatching it reverts to relying on y entering zeroed, which every numeric
+# arm conceals (XRTRunner zero-fills output placeholders).
+REQUIRED_ZERO_SYMBOL = "ffn_zero_bf16_up_proj"
 
 # The herd op as the dumps print it; brace-matched to scope clause 3.
 _HERD_MARKER = "air.herd @ffn_accum_herd"
@@ -212,6 +223,15 @@ def check_shape(shape_key, seq_len, ffn_dim, emb_dim):
             "not what the loop dispatches, so the hoist count above measures "
             "some other computation"
         )
+    zero_marker = f"call @{REQUIRED_ZERO_SYMBOL}("
+    if zero_marker not in (after_loop or "") or "scf.if" not in (after_loop or ""):
+        problems.append(
+            f"{label}: no guarded call @{REQUIRED_ZERO_SYMBOL} inside the K "
+            f"loop of {names[hoist_idx]} -- without the first-iteration "
+            "device-side zero the design relies on y entering zeroed, which "
+            "XRTRunner's zero-filled placeholders conceal: a reused stale BO "
+            "returns y_old + a @ w and every numeric arm still passes"
+        )
 
     last_air = next(
         ((name, text) for name, text in reversed(dumps) if _HERD_MARKER in text),
@@ -240,14 +260,16 @@ def check_shape(shape_key, seq_len, ffn_dim, emb_dim):
             or out_gets != 1
             or out_puts != 1
             or call_marker not in (loop_body or "")
+            or zero_marker not in (loop_body or "")
         ):
             problems.append(
                 f"{label}: at {last_air[0]} (the AIR pipeline's last herd "
                 f"dump) the K loop holds {in_loop} data-movement ops "
                 f"({feed_gets} feed gets) with {out_gets} get / {out_puts} "
                 "put hoisted outside; need exactly 2 feed gets plus the "
-                "accumulate call inside and 1 get + 1 put outside -- a pass "
-                "after the hoist re-sank or reintroduced accumulator traffic"
+                "accumulate call and the guarded zero inside and 1 get + 1 "
+                "put outside -- a pass after the hoist re-sank or "
+                "reintroduced accumulator traffic, or dropped the zero"
             )
 
     channel_dump = next(
