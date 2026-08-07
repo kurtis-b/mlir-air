@@ -1274,7 +1274,7 @@ column i to column i). x and residual travel in ONE packed L3 buffer fetched by 
 segment holds exactly two shim MM2S streams per column (packed in, gamma in) and the lowered IR
 carries **zero packet-typed channels** — the sum and the normalized tensor never leave the array.
 Measured on NPU2: `128x768` and `4096x768` both PASS at rtol 1.6e-2 / atol 5e-2 with zero
-mismatches, `mean_rel_L1` 4.354e-3 / 4.478e-3, negative control failing as required. No herd
+mismatches, `mean_rel_L1` 3.590e-3 / 3.620e-3, negative control failing as required. No herd
 carries a placement attribute and no buffer a depth; `air-place-herds` seats all three herds and
 the ping-pong labelling picks depth.
 
@@ -1322,5 +1322,19 @@ Footguns that cost time, in the order they fired:
   normal and residual `normal(0.75, 1.5)`; keep it that way.
 - **The pipeline's honest numerical cost vs the fused addnorm kernel is one extra bf16
   rounding** (the normalized tensor materialized between stage_norm and stage_scale):
-  mean_rel_L1 4.5e-3 against the fused kernel's 2.7e-3 at the same width. Both are far under the
+  mean_rel_L1 3.6e-3 against the fused kernel's 2.7e-3 at the same width. Both are far under the
   whole-layer 1.688e-2 figure the driver's clause bounds this by.
+- **The norm stage's statistics were the round-3 review finding, and the fix is in the C
+  kernel, not the pipeline.** `layer_norm_rows` shipped with a bf16 row sum and one-pass
+  variance (`E[x²] − E[x]²`); on a row whose mean is large next to its spread — mean 8, σ 0.25,
+  a valid input under the builder's contract — the cancellation drives the variance below zero,
+  the NaN-clamp floors it at exactly zero, and the row normalizes by `1/sqrt(eps)`: ~700 of
+  every 768 elements land outside tolerance while zero-mean activations pass untouched.
+  `layer_norm.cc` now keeps f32 statistics, computes the variance two-pass (deviations exact in
+  f32 at any common offset), and rounds once at the store. The `128x768_offset` opcheck row
+  pins the regime — residual identically zero so the bf16 sum is exact and the row isolates the
+  statistics — and every design linking `layer_norm.o` improved for free: the `layer_norm`
+  operator's own rows went from mean_rel_L1 2.0e-3 to 8.1e-5 (rtol now covers every element),
+  and the pipeline's from 4.4e-3 to 3.6e-3. The fused addnorm kernels (`encoder.cc`,
+  `addnorm_ffn_norm.cc`) still carry the one-pass form; their file-header footgun notes say so
+  and their gates measure it.

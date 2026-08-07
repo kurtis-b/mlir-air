@@ -259,12 +259,28 @@ def prepare_norm_tail(shape, seed=9):
     position ``(rows-1, 0, 0)`` of its ``[rows, 2, cols]`` layout), last row:
     the whole row's statistics shift and the perturbed element lands far
     outside the band, same reasoning as ``prepare_layer_norm``'s.
+
+    A shape carrying ``offset_regime`` draws x at a COMMON OFFSET large next
+    to its spread (mean 8, sigma 0.25 -- mean/sigma 32) with residual
+    identically zero. This is the regime where the one-pass variance
+    (``E[x^2] - E[x]^2``) the norm kernel first shipped loses the variance
+    entirely -- it cancels below zero, clamps, and normalizes by
+    ``1/sqrt(eps)``, putting ~700 of every 768 elements outside tolerance --
+    and where ``layer_norm_rows``'s two-pass f32 statistics must not. The
+    zero residual is deliberate and is NOT the asymmetric-input discipline
+    above: adding zero is exact in bf16, so the row isolates the norm stage's
+    statistics from stage_add's own sum rounding. Plane addressing keeps its
+    guard from the asymmetric rows, which still run.
     """
     rows, cols = shape["rows"], shape["cols"]
     compile_norm_tail_kernels()
     rng = np.random.default_rng(seed)
-    x = rng.standard_normal((rows, cols)).astype(bfloat16)
-    residual = (0.75 + 1.5 * rng.standard_normal((rows, cols))).astype(bfloat16)
+    if shape.get("offset_regime"):
+        x = (8.0 + 0.25 * rng.standard_normal((rows, cols))).astype(bfloat16)
+        residual = np.zeros((rows, cols), dtype=bfloat16)
+    else:
+        x = rng.standard_normal((rows, cols)).astype(bfloat16)
+        residual = (0.75 + 1.5 * rng.standard_normal((rows, cols))).astype(bfloat16)
     # Gamma-shaped: a trained LayerNorm weight sits near 1, and uniform(0.5,
     # 1.5) is bounded away from zero so no element's gamma can swallow a fault.
     gamma = rng.uniform(0.5, 1.5, size=cols).astype(bfloat16)

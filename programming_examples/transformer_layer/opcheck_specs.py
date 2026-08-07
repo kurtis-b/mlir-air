@@ -229,13 +229,15 @@ SPECS = [
         "operator": "layer_norm",
         "shape_key": "4096x768",
         "shape": {"rows": 4096, "cols": 768},
-        # Measured over 3145728 elements: mean_rel_L1 1.969e-3, abs_err_max
-        # 3.125e-2, atol_required 1.419e-3. atol is that rounded up, 3.5x --
-        # ten times tighter than the 512x512 row above, which was sized before
-        # `atol_required` was recorded and left the tier's default. abs_err_max
-        # is 22x atol_required here, which is exactly the case the docstring on
-        # _RecordingRunner describes: the worst absolute error sits on a
-        # large-magnitude element that rtol already covers.
+        # Measured over 3145728 elements: mean_rel_L1 7.117e-5, abs_err_max
+        # 1.563e-2, rel_err_max 7.813e-3 and atol_required 0.0 -- rtol alone
+        # covers every element since J7a's round-3 review moved
+        # layer_norm_rows to f32 two-pass statistics with one rounding at the
+        # store (the run that sized this atol, on the one-pass kernel,
+        # measured mean_rel_L1 1.969e-3 and atol_required 1.419e-3). atol
+        # stays that run's 5e-3 -- ten times tighter than the 512x512 row
+        # above, which was sized before `atol_required` was recorded --
+        # rather than being driven to something arbitrarily small.
         "atol": 5e-3,
         "prepare": prepare_layer_norm,
     },
@@ -298,19 +300,21 @@ SPECS = [
         "operator": "norm_tail",
         "shape_key": "128x768",
         "shape": {"rows": 128, "cols": 768},
-        # Measured over 98304 elements: mean_rel_L1 4.354e-3, abs_err_max
-        # 6.25e-2, atol_required 7.875e-3. atol is the tier's 5e-2, a 6.3x
-        # margin. The relative error is ~1.6x the fused addnorm pre-add row's
+        # Measured over 98304 elements: mean_rel_L1 3.590e-3, abs_err_max
+        # 6.25e-2, atol_required 2.637e-3. atol is the tier's 5e-2, a 19x
+        # margin. The relative error is ~1.3x the fused addnorm pre-add row's
         # 2.687e-3, which is the pipeline's one extra bf16 rounding (the
         # normalized tensor is materialized between stage_norm and
-        # stage_scale) behaving as expected.
+        # stage_scale) behaving as expected. (First shipped at 4.354e-3;
+        # the round-3 move of layer_norm_rows to f32 two-pass statistics
+        # took the norm stage's share of the error down.)
         "atol": 5e-2,
         # The phase's actual claim, enforced as an aggregate ceiling: the
         # resident pipeline must beat the 1.688e-2 the block measures at this
         # width (the decomposed tail it replaces measures 1.806e-2). A
         # pipeline that is element-wise correct but round-trips its
         # intermediates through L3 passes np.isclose and fails here. Measured
-        # 4.354e-3, a 3.9x margin.
+        # 3.590e-3, a 4.7x margin.
         "mean_rel_L1_max": 1.688e-2,
         "prepare": prepare_norm_tail,
     },
@@ -322,18 +326,50 @@ SPECS = [
         "operator": "norm_tail",
         "shape_key": "4096x768",
         "shape": {"rows": 4096, "cols": 768},
-        # Measured over 3145728 elements: mean_rel_L1 4.478e-3 -- within 3% of
+        # Measured over 3145728 elements: mean_rel_L1 3.620e-3 -- within 1% of
         # the 128-row point over 32x the elements, so the error is set by the
         # datapath and not the trip count, and comfortably under the driver's
         # 1.688e-2 clause (the whole-layer figure the resident pipeline must
-        # beat) -- abs_err_max 9.375e-2, atol_required 2.425e-2. atol stays
-        # the tier's 5e-2, a 2.06x margin here, inside the registry's usual
-        # 2-3x and well under the 1e-1 ceiling.
+        # beat) -- abs_err_max 6.25e-2, atol_required 4.375e-3. atol stays
+        # the tier's 5e-2, an 11x margin, well under the 1e-1 ceiling.
+        # (First shipped at 4.478e-3 / atol_required 2.425e-2; the round-3
+        # move of layer_norm_rows to f32 two-pass statistics is the change.)
         "atol": 5e-2,
         # The driver's 1.688e-2 clause, enforced by the run itself at the
         # shape the phase's precision claim is measured at: see the 128x768
-        # row above. Measured 4.478e-3, a 3.8x margin.
+        # row above. Measured 3.620e-3, a 4.7x margin.
         "mean_rel_L1_max": 1.688e-2,
+        "prepare": prepare_norm_tail,
+    },
+    {
+        # J7A REVIEW ROUND 3: the norm stage on rows with a COMMON OFFSET
+        # large next to their spread (x at mean 8, sigma 0.25; residual
+        # identically zero so the bf16 sum is exact and the row isolates the
+        # statistics -- see prepare_norm_tail). The one-pass variance
+        # (E[x^2] - E[x]^2, bf16 row sum) layer_norm_rows first shipped loses
+        # this row's variance ENTIRELY: it cancels below zero, clamps, and
+        # normalizes by 1/sqrt(eps), putting ~700 of every 768 elements
+        # outside tolerance while the two claimed shapes above -- zero-mean-
+        # ish activations -- pass untouched. The kernel now keeps f32
+        # statistics and computes variance two-pass; this row is what keeps
+        # it that way.
+        #
+        # No mean_rel_L1_max: that ceiling is the phase's RESIDENCY claim,
+        # measured at the block's activation distribution. This row's claim
+        # is the LayerNorm contract itself, and conflating the two would let
+        # a distribution change masquerade as a residency regression.
+        "operator": "norm_tail",
+        "shape_key": "128x768_offset",
+        "shape": {"rows": 128, "cols": 768, "offset_regime": True},
+        # Measured over 98304 elements: mean_rel_L1 2.799e-3, abs_err_max
+        # 3.125e-2, rel_err_max 1.29e-2 and atol_required 0.0 -- rtol ALONE
+        # covers every element, because residual-zero makes the bf16 sum
+        # exact and the f32 statistics make the deviations exact at any
+        # common offset, so what remains is per-element bf16 rounding on
+        # O(1) normalized outputs, which is proportional by construction.
+        # atol stays the tier's 5e-2 rather than being driven to something
+        # arbitrarily small, same reasoning as elementwise_add's zero.
+        "atol": 5e-2,
         "prepare": prepare_norm_tail,
     },
     {

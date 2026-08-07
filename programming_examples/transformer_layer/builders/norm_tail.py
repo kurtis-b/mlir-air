@@ -115,10 +115,16 @@ FOOTGUNS
     - The packing helper's plane ORDER is x then residual. The add is
       symmetric so a swap is invisible here, but callers that later feed the
       raw sum forward must not rely on plane order they did not check.
-    - ``layer_norm_rows``'s variance is ONE-PASS (``E[x^2] - E[x]^2``) and its
-      row sum accumulates in bf16; the reference is the stable TWO-PASS f32
-      form. See ``builders/layer_norm.py``'s note -- the shapes checked here
-      are zero-mean-ish activations, where the cancellation does not bite.
+    - ``layer_norm_rows`` keeps its statistics in f32 and computes variance
+      TWO-PASS (``E[(x - mean)^2]``), so rows at a large common offset
+      normalize correctly. The one-pass ``E[x^2] - E[x]^2`` form with a bf16
+      row sum that this pipeline FIRST shipped loses such a row's variance
+      entirely (cancels below zero, clamps, normalizes by ``1/sqrt(eps)``) --
+      do not reintroduce it; the ``128x768_offset`` opcheck row exists to
+      catch exactly that. What still rounds in bf16 on an offset row is
+      stage_add's SUM: the reference adds in f32, so a nonzero residual at a
+      large common sum costs half an ulp OF THE SUM per element, amplified
+      by ``1/sigma``.
     - Against the fused addnorm kernel this pipeline carries ONE extra bf16
       rounding: the normalized tensor is materialized in bf16 between
       stage_norm and stage_scale, where ``fused_add_layer_norm_1outs`` folds

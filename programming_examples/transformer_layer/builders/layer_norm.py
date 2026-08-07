@@ -19,18 +19,17 @@ CONTRACT
 WHY THIS IS NOT THE layer_norm/ EXAMPLE
     That example accumulates its statistics in bf16 and gates at
     ``rtol=5e-2, atol=5e-1``, which is not a tolerance the registry would
-    accept. This builder links the ported ``layer_norm.cc``, whose
-    sum-of-squares accumulates in f32, and gates at the registry's
-    ``rtol=1.6e-2``.
+    accept. This builder links the ported ``layer_norm.cc``, whose statistics
+    accumulate in f32, and gates at the registry's ``rtol=1.6e-2``.
 
 FOOTGUNS
-    - The kernel computes variance ONE-PASS as ``E[x^2] - E[x]^2``. The
-      reference below is the numerically stable TWO-PASS form in f32. The two
-      are algebraically equal and numerically are not: on a row whose mean is
-      large next to its spread the one-pass form cancels catastrophically and
-      the two will disagree by far more than bf16 rounding. Do not use one as
-      the oracle for the other on such data; the shapes checked here are
-      zero-mean activations, where the cancellation does not bite.
+    - The kernel computes variance TWO-PASS -- mean first, then
+      ``E[(x - mean)^2]`` -- with f32 statistics, the same form as the
+      reference below, so rows at a large common offset normalize correctly.
+      It shipped ONE-PASS (``E[x^2] - E[x]^2``, bf16 row sum) until J7a's
+      review showed that form losing the variance entirely past mean/sigma
+      ~30; do not reintroduce it. norm_tail's ``128x768_offset`` opcheck row
+      pins the regime for every design that links ``layer_norm.o``.
     - ``cols`` must be a multiple of 16 (``LN_VEC_LEN``). There is no scalar
       tail -- a non-multiple silently drops the remainder instead of failing.
     - Rows must be contiguous and exactly ``cols`` apart. A padded tile has to

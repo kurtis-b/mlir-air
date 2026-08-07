@@ -21,14 +21,18 @@
 //    correct at one trip, silently wrong past it -- while the numerical arm
 //    still passed.
 // 2. NUMBERS, on real NPU2: opcheck.py against an FP32 reference, np.isclose
-//    over the full output at rtol=1.6e-2, zero permitted mismatches, both
-//    shapes -- 128x768 (two trips per tile) and the block's own 4096x768
-//    (128 trips, where the precision claim is measured). The spec rows also
-//    carry mean_rel_L1_max 1.688e-2, the whole-layer figure the resident
-//    pipeline must beat, enforced by the same run (measured 4.354e-3 /
-//    4.478e-3 -- see opcheck_specs.py). The inputs are drawn asymmetrically
-//    (x and residual from different distributions) so a plane-addressing bug
-//    in the packed fetch cannot hide behind LayerNorm's scale invariance.
+//    over the full output at rtol=1.6e-2, zero permitted mismatches, all
+//    three claimed shapes -- 128x768 (two trips per tile), the block's own
+//    4096x768 (128 trips, where the precision claim is measured), and
+//    128x768_offset (rows at a common offset large next to their spread,
+//    the regime where the one-pass variance the norm kernel first shipped
+//    lost the variance entirely; the row keeps layer_norm_rows on f32
+//    two-pass statistics). The first two rows also carry mean_rel_L1_max
+//    1.688e-2, the whole-layer figure the resident pipeline must beat,
+//    enforced by the same run (measured 3.590e-3 / 3.620e-3 -- see
+//    opcheck_specs.py). Their inputs are drawn asymmetrically (x and
+//    residual from different distributions) so a plane-addressing bug in
+//    the packed fetch cannot hide behind LayerNorm's scale invariance.
 // 3. The NEGATIVE CONTROL, on the cheap two-trip shape: one element of the
 //    packed device buffer perturbed after the reference is computed, and the
 //    comparison itself must reject the run. Its verdict comes from
@@ -62,6 +66,7 @@
 // requires no unlowered DMAs and both named L1-to-L1 channels present.
 // STRUCT: [norm-tail-structure] norm_tail [128x768]: PASS (0 packet-typed
 // STRUCT: [norm-tail-structure] norm_tail [4096x768]: PASS (0 packet-typed
+// STRUCT: [norm-tail-structure] norm_tail [128x768_offset]: PASS (0 packet-typed
 // STRUCT: [norm-tail-structure] PASS
 //
 // Both lines per shape, not just the verdict: the first is XRTRunner's own,
@@ -71,6 +76,8 @@
 // CHECK: [opcheck] norm_tail [128x768]: PASS
 // CHECK: PASS!
 // CHECK: [opcheck] norm_tail [4096x768]: PASS
+// CHECK: PASS!
+// CHECK: [opcheck] norm_tail [128x768_offset]: PASS
 //
 // The injection line first: it names the element and both values, so an
 // injection that silently perturbed nothing is visible here rather than being

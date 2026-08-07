@@ -59,7 +59,7 @@ x bf16 → Σx  (bf16 vector accumulate, 32 lanes) ─┐
 ```
 
 - The diagram is the **post-add** form: statistics come from `x` alone, the residual never enters the mean or the variance, and it is added after the weighted normalization. The **pre-add** form (`-DADDNORM_PRE_ADD`) folds `x + residual` in bf16 *before* Σx and Σx², normalizes that sum, and does **not** add the residual again — so its epilogue has three bf16 roundings rather than four, and none of them is a cancelling add. Both are measured in this entry.
-- **Variance is one-pass**, `E[x²] − E[x]²`, clamped at zero before `invsqrt` — same formula, same cancellation caveat and same NaN-avoidance clamp as [`LayerNorm_bf16.md`](LayerNorm_bf16.md).
+- **Variance is one-pass**, `E[x²] − E[x]²`, clamped at zero before `invsqrt` — it cancels catastrophically on a row whose mean is large next to its spread, and the clamp avoids the NaN `aie::invsqrt` returns on a negative operand. This is the formula the multi-row `layer_norm_rows` kernel also carried until J7a's round-3 review moved that kernel to two-pass f32 statistics ([`LayerNorm_bf16.md`](LayerNorm_bf16.md) documents the offset-row regime that forced it); the fused kernels here still measure and gate the one-pass form, on zero-mean-ish activations where the cancellation does not bite.
 - **Four bf16 roundings in the epilogue**: `sub`, `mul` by `inv_std`, `mul` by `weight`, `add` of the residual. The residual add is where an output can land near zero through cancellation, which is what sets `rel_err max`.
 
 ---

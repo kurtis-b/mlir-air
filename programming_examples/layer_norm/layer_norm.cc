@@ -11,13 +11,26 @@
 // rows of an L1 tile in a single call, which is what a transformer block needs
 // when a whole activation tile is resident.
 //
-// They are NOT bit-equivalent to layer_norm.py -- see the variance FOOTGUN
-// below. Do not use one as the numerical oracle for the other.
+// They are NOT bit-equivalent to layer_norm.py -- that builder keeps its
+// statistics in bf16, these kernels keep them in f32 (below). Do not use one
+// as the numerical oracle for the other.
 //
 // CONTRACT
-//   - Element type is bf16; statistics accumulate in the same vector type,
-//     with the sum-of-squares in f32. This matches the AIR bf16 kernel
-//     standard and is NOT the f32-statistics variant.
+//   - Element type is bf16; statistics accumulate in f32, and the variance is
+//     TWO-PASS: mean first, then E[(x - mean)^2]. The one-pass
+//     E[x^2] - E[x]^2 form this file used to ship cancels catastrophically on
+//     a row whose mean is large next to its spread -- at mean/sigma ~ 30 it
+//     loses the variance entirely, clamps at zero and normalizes by
+//     1/sqrt(eps) -- and a bf16 sum accumulator loses the addends' low bits
+//     once the running sum outgrows them, so the mean itself was wrong on
+//     exactly those rows. Offset rows are valid inputs under every builder
+//     that links this object; the statistics have to be exact enough for
+//     them, not just for zero-mean activations.
+//   - The normalization applies (x - mean) * inv_std in f32 and rounds ONCE,
+//     at the store. The per-element error against an f32 reference is a
+//     single bf16 rounding plus ~2^-9 relative on inv_std (the squared
+//     deviations round to bf16 before accumulating; the deviations themselves
+//     are exact, since every bf16 value is exact in f32).
 //   - `cols` must be a multiple of the vector width (16). There is no scalar
 //     tail: a `cols` that is not a multiple of 16 silently drops the
 //     remainder, because vector_chunks truncates.
@@ -27,21 +40,10 @@
 //   - No gamma/beta. These are the unweighted forms; the weighted variant
 //     lives in weighted_rms_norm/ and in the transformer_layer kernels.
 //
-// FOOTGUN: variance is computed one-pass as E[x^2] - E[x]^2, so the row is read
-// once for statistics rather than twice. layer_norm.py computes it two-pass, as
-// sum((x - mean)^2) / N. The two forms are algebraically equal and numerically
-// are not: the one-pass form cancels catastrophically when a row's mean is
-// large relative to its spread, and on such a row these kernels and
-// layer_norm.py will disagree by far more than bf16 rounding. Pick the two-pass
-// form -- the builder, or a host reference -- when you need the accurate
-// answer.
-//
-// The cancellation can also round the variance below zero, which is why every
-// site here clamps it at zero before invsqrt. aie::invsqrt of a negative
-// operand returns NaN, so without the clamp an affected row emits NaN for every
-// element instead of a merely inaccurate value. The clamp removes the NaN only;
-// it does not recover the lost precision, and it is not a substitute for using
-// the two-pass form when accuracy matters.
+// The two-pass variance is non-negative by construction, but the clamp before
+// invsqrt stays: aie::invsqrt of a negative operand returns NaN and would
+// poison the whole row, and the clamp is one compare against that class of
+// surprise.
 //
 //===----------------------------------------------------------------------===//
 
@@ -55,7 +57,8 @@ namespace {
 constexpr float kEpsilon = 1e-5f;
 
 // Normalize `rows_to_process` rows of `cols` elements each, in place across
-// separate input/output buffers.
+// separate input/output buffers. Statistics in f32, variance two-pass; see the
+// file header for why neither is optional.
 template <typename T, int N>
 void layer_norm_rows_impl(const T *__restrict input, T *__restrict output,
                           int32_t cols, int32_t rows_to_process) {
@@ -63,39 +66,53 @@ void layer_norm_rows_impl(const T *__restrict input, T *__restrict output,
 
   const int vector_chunks = cols / N;
   for (int row = 0; row < rows_to_process; row++) {
-    ::aie::vector<T, N> sum_acc = ::aie::zeros<T, N>();
-    ::aie::vector<float, N> sum_sq_acc = ::aie::zeros<float, N>();
     int input_index = row * cols;
+
+    // Pass 1: the row sum, widened to f32 lane-by-lane before accumulating.
+    ::aie::vector<float, N> sum_acc = ::aie::zeros<float, N>();
     for (int i = 0; i < vector_chunks; i++) {
       ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input + input_index);
-      sum_acc = ::aie::add(sum_acc, reg_a);
-      ::aie::vector<float, N> sq_acc = ::aie::mul(reg_a, reg_a);
-      sum_sq_acc = ::aie::add(sum_sq_acc, sq_acc);
+      ::aie::accum<accfloat, N> a_acc;
+      a_acc.from_vector(reg_a);
+      sum_acc = ::aie::add(sum_acc, a_acc.template to_vector<float>());
       input_index += N;
     }
     input_index -= cols;
+    const float mean = ::aie::reduce_add(sum_acc) / float(cols);
 
-    const float sum_of_vals = ::aie::reduce_add(sum_acc);
-    const float sum_of_sq_vals = ::aie::reduce_add(sum_sq_acc);
-
-    const float mean = sum_of_vals / float(cols);
-    float variance = (sum_of_sq_vals / float(cols)) - mean * mean;
-    // E[x^2] - E[x]^2 can round below zero for a row whose spread is small
-    // relative to its mean; invsqrt of a negative operand returns NaN, so the
-    // true-zero-variance case has to be clamped rather than propagated.
+    // Pass 2: E[(x - mean)^2]. The deviation is exact in f32 and rounds to
+    // bf16 only for the squaring, so the variance carries ~2^-9 relative
+    // error at any mean -- where the one-pass form's error grows with
+    // (mean/sigma)^2 and swallows the variance whole on offset rows.
+    ::aie::vector<float, N> sum_sq_acc = ::aie::zeros<float, N>();
+    for (int i = 0; i < vector_chunks; i++) {
+      ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input + input_index);
+      ::aie::accum<accfloat, N> a_acc;
+      a_acc.from_vector(reg_a);
+      ::aie::accum<accfloat, N> diff_acc = ::aie::sub(a_acc, mean);
+      ::aie::vector<T, N> diff_v = diff_acc.template to_vector<T>();
+      ::aie::vector<float, N> sq_v = ::aie::mul(diff_v, diff_v);
+      sum_sq_acc = ::aie::add(sum_sq_acc, sq_v);
+      input_index += N;
+    }
+    input_index -= cols;
+    float variance = ::aie::reduce_add(sum_sq_acc) / float(cols);
+    // Non-negative by construction; kept because invsqrt of a negative
+    // operand returns NaN and would poison the whole row.
     if (variance < 0.0f) {
       variance = 0.0f;
     }
     const float inv_std = ::aie::invsqrt(variance + kEpsilon);
 
-    ::aie::vector<T, N> mean_v = ::aie::broadcast<T, N>(mean);
-    ::aie::vector<T, N> inv_std_v = ::aie::broadcast<T, N>(inv_std);
-
+    // Pass 3: (x - mean) * inv_std in f32, one rounding to bf16 at the store.
     for (int i = 0; i < vector_chunks; i++) {
       ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input + input_index);
-      ::aie::vector<T, N> diff_v = ::aie::sub(reg_a, mean_v);
-      ::aie::vector<T, N> norm_v = ::aie::mul(diff_v, inv_std_v);
-      ::aie::store_v(output + input_index, norm_v);
+      ::aie::accum<accfloat, N> a_acc;
+      a_acc.from_vector(reg_a);
+      ::aie::accum<accfloat, N> diff_acc = ::aie::sub(a_acc, mean);
+      ::aie::accum<accfloat, N> norm_acc =
+          ::aie::mul(diff_acc.template to_vector<float>(), inv_std);
+      ::aie::store_v(output + input_index, norm_acc.template to_vector<T>());
       input_index += N;
     }
   }
@@ -103,8 +120,11 @@ void layer_norm_rows_impl(const T *__restrict input, T *__restrict output,
   event1();
 }
 
-// Residual add fused into the same pass: statistics and normalization both run
-// over (input1 + input2), so the sum is read twice rather than materialized.
+// Residual add fused into the same passes: statistics and normalization both
+// run over (input1 + input2), recomputed per pass rather than materialized.
+// The elementwise sum itself is bf16 -- the same single rounding a caller that
+// materializes the sum (norm_tail's stage_add) pays -- and everything after it
+// follows layer_norm_rows_impl.
 template <typename T, int N>
 void add_layer_norm_rows_impl(const T *__restrict input1,
                               const T *__restrict input2, T *__restrict output,
@@ -113,42 +133,55 @@ void add_layer_norm_rows_impl(const T *__restrict input1,
 
   const int vector_chunks = cols / N;
   for (int row = 0; row < rows_to_process; row++) {
-    ::aie::vector<T, N> sum_acc = ::aie::zeros<T, N>();
-    ::aie::vector<float, N> sum_sq_acc = ::aie::zeros<float, N>();
     int input_index = row * cols;
+
+    // Pass 1: the row sum of (input1 + input2), widened to f32.
+    ::aie::vector<float, N> sum_acc = ::aie::zeros<float, N>();
     for (int i = 0; i < vector_chunks; i++) {
       ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input1 + input_index);
       ::aie::vector<T, N> reg_b = ::aie::load_v<N>(input2 + input_index);
       ::aie::vector<T, N> reg_sum = ::aie::add(reg_a, reg_b);
-      sum_acc = ::aie::add(sum_acc, reg_sum);
-      ::aie::vector<float, N> sq_acc = ::aie::mul(reg_sum, reg_sum);
-      sum_sq_acc = ::aie::add(sum_sq_acc, sq_acc);
+      ::aie::accum<accfloat, N> s_acc;
+      s_acc.from_vector(reg_sum);
+      sum_acc = ::aie::add(sum_acc, s_acc.template to_vector<float>());
       input_index += N;
     }
     input_index -= cols;
+    const float mean = ::aie::reduce_add(sum_acc) / float(cols);
 
-    const float sum_of_vals = ::aie::reduce_add(sum_acc);
-    const float sum_of_sq_vals = ::aie::reduce_add(sum_sq_acc);
-
-    const float mean = sum_of_vals / float(cols);
-    float variance = (sum_of_sq_vals / float(cols)) - mean * mean;
-    // See layer_norm_rows_impl: the cancellation can round the variance
-    // negative, and invsqrt would then return NaN.
+    // Pass 2: E[(sum - mean)^2]; see layer_norm_rows_impl.
+    ::aie::vector<float, N> sum_sq_acc = ::aie::zeros<float, N>();
+    for (int i = 0; i < vector_chunks; i++) {
+      ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input1 + input_index);
+      ::aie::vector<T, N> reg_b = ::aie::load_v<N>(input2 + input_index);
+      ::aie::vector<T, N> reg_sum = ::aie::add(reg_a, reg_b);
+      ::aie::accum<accfloat, N> s_acc;
+      s_acc.from_vector(reg_sum);
+      ::aie::accum<accfloat, N> diff_acc = ::aie::sub(s_acc, mean);
+      ::aie::vector<T, N> diff_v = diff_acc.template to_vector<T>();
+      ::aie::vector<float, N> sq_v = ::aie::mul(diff_v, diff_v);
+      sum_sq_acc = ::aie::add(sum_sq_acc, sq_v);
+      input_index += N;
+    }
+    input_index -= cols;
+    float variance = ::aie::reduce_add(sum_sq_acc) / float(cols);
+    // Same clamp as layer_norm_rows_impl, for the same NaN reason.
     if (variance < 0.0f) {
       variance = 0.0f;
     }
     const float inv_std = ::aie::invsqrt(variance + kEpsilon);
 
-    ::aie::vector<T, N> mean_v = ::aie::broadcast<T, N>(mean);
-    ::aie::vector<T, N> inv_std_v = ::aie::broadcast<T, N>(inv_std);
-
+    // Pass 3: (sum - mean) * inv_std in f32, one rounding at the store.
     for (int i = 0; i < vector_chunks; i++) {
       ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input1 + input_index);
       ::aie::vector<T, N> reg_b = ::aie::load_v<N>(input2 + input_index);
       ::aie::vector<T, N> reg_sum = ::aie::add(reg_a, reg_b);
-      ::aie::vector<T, N> diff_v = ::aie::sub(reg_sum, mean_v);
-      ::aie::vector<T, N> norm_v = ::aie::mul(diff_v, inv_std_v);
-      ::aie::store_v(output + input_index, norm_v);
+      ::aie::accum<accfloat, N> s_acc;
+      s_acc.from_vector(reg_sum);
+      ::aie::accum<accfloat, N> diff_acc = ::aie::sub(s_acc, mean);
+      ::aie::accum<accfloat, N> norm_acc =
+          ::aie::mul(diff_acc.template to_vector<float>(), inv_std);
+      ::aie::store_v(output + input_index, norm_acc.template to_vector<T>());
       input_index += N;
     }
   }
@@ -165,8 +198,8 @@ void add_layer_norm_rows_impl(const T *__restrict input1,
 extern "C" {
 
 // Single row -- the same function the direct-codegen builder in layer_norm.py
-// computes, but by the one-pass variance formula, so not the same bits. See the
-// variance FOOTGUN at the top of this file.
+// computes, with f32 statistics where that builder keeps bf16 ones, so not the
+// same bits. See the note at the top of this file.
 void layer_norm(bfloat16 *input, bfloat16 *output, int32_t cols) {
   ::aie::set_rounding(aie::rounding_mode::conv_even);
   layer_norm_rows_impl<bfloat16, LN_VEC_LEN>(input, output, cols, 1);

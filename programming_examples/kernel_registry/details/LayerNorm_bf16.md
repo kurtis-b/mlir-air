@@ -7,7 +7,7 @@
 
 # Multi-row LayerNorm (BF16) — Kernel Detail
 
-> Unweighted layer normalization `y = (x − mean(x)) · rsqrt(var(x) + eps)`, per row, over **several rows per kernel call** — the form an encoder-style transformer block wants when a whole activation tile is resident in L1. BF16 in/out; the sum of squares accumulates in **FP32**, the row sum in bf16.
+> Unweighted layer normalization `y = (x − mean(x)) · rsqrt(var(x) + eps)`, per row, over **several rows per kernel call** — the form an encoder-style transformer block wants when a whole activation tile is resident in L1. BF16 in/out; the statistics accumulate in **FP32** and the variance is **two-pass**, so rows at a large common offset normalize correctly.
 > Shapes are written **`M×N`**: input `x[M, N]`, output `y[M, N]` (M = rows / seq, N = embedding dim, the normalization axis).
 >
 > Companion: [`../supported_kernels.md`](../supported_kernels.md) · [`../README.md`](../README.md) · [`AddNorm_bf16.md`](AddNorm_bf16.md) (the weighted, residual-adding form)
@@ -32,32 +32,33 @@ Driven by `transformer_layer/opcheck.py --operator layer_norm`; `make check-laye
 ## Numerical datapath (what "BF16 multi-row LayerNorm" means here)
 
 ```
-x bf16 → Σx  (bf16 vector accumulate, 16 lanes) ─┐
-      → Σx²  (f32 vector accumulate)             ├→ mean, var = E[x²] − E[x]²  (f32, clamped ≥ 0)
-                                                  └→ inv_std = aie::invsqrt(var + 1e-5)  (f32)
-        → (x − bf16(mean)) · bf16(inv_std)  (bf16 vector) → bf16
+pass 1  x bf16 → widen to f32 → Σx (f32 vector accumulate) → mean  (f32)
+pass 2  d = x − mean (exact in f32) → bf16(d)² (f32 accumulate)
+                                    → var = E[(x−mean)²]  (f32, clamped ≥ 0)
+                                    → inv_std = aie::invsqrt(var + 1e-5)  (f32)
+pass 3  (x − mean) · inv_std  (f32, one rounding to bf16 at the store)
 ```
 
-- **Variance is one-pass**, `E[x²] − E[x]²`, so the row is read once for statistics rather than twice. It is algebraically equal to the two-pass form and numerically is not: it cancels catastrophically on a row whose mean is large next to its spread, and can round below zero — which is why the kernel clamps at zero before `invsqrt` (a negative operand there returns NaN and would poison the whole row).
-- **The sum of squares accumulates in f32; the row sum does not.** `Σx` runs in a bf16 vector accumulator, so `mean` carries more error than an FP32 reduction would. On zero-mean activations `mean ≈ 0` and the resulting shift is negligible; on a large-mean row it is not, and neither is the cancellation above.
-- **The epilogue is bf16.** `mean` and `inv_std` are computed in f32 and then broadcast as bf16, so the per-element normalization is three bf16 roundings deep (`sub`, `mul`, store).
+- **Variance is two-pass**, `E[(x − mean)²]`, and **every statistic accumulates in f32**. The kernel shipped one-pass (`E[x²] − E[x]²`, bf16 row sum) until J7a's round-3 review showed that form losing the variance entirely on a row whose mean is large next to its spread — it cancels below zero, clamps, and normalizes by `1/sqrt(eps)`, ~700 of every 768 elements outside tolerance at mean/σ = 32 — while the bf16 row sum put the mean itself off by whole ulps of the *sum*. Offset rows are valid inputs; do not reintroduce either. The zero-clamp before `invsqrt` stays (a negative operand returns NaN and would poison the row), though the two-pass form is non-negative by construction.
+- **The deviations are exact.** Every bf16 value is exact in f32, so `x − mean` in f32 carries only f32 rounding; the deviation rounds to bf16 only for the squaring, ~2⁻⁹ relative on the variance at any mean.
+- **The epilogue rounds once.** `(x − mean) · inv_std` is computed in f32 and rounds to bf16 at the store — one rounding where the one-pass kernel took three.
 
 ---
 
 ## Numerical accuracy
 
-Verified element-wise over the full output against the **two-pass FP32** reference — deliberately not the kernel's own one-pass formula, so the measurement includes the error the one-pass form introduces rather than cancelling it out:
+Verified element-wise over the full output against the **two-pass FP32** reference (the same form the kernel now computes, in the same order, at f32 precision — the measurement is the bf16 rounding, not a formula gap):
 
 | Metric (M×N = 512×512, `randn` inputs, seed 2) | Measured |
 |---|---|
-| `mean_rel_L1 = mean｜y−ref｜ / mean｜ref｜` | **2.0e-3** |
-| `rel_err max` | 6.3e+1 |
-| `abs_err max` | 3.1e-2 |
+| `mean_rel_L1 = mean｜y−ref｜ / mean｜ref｜` | **8.1e-5** |
+| `rel_err max` | 7.8e-3 |
+| `abs_err max` | 1.6e-2 |
 | mismatches at `rtol=1.6e-2, atol=5e-2` | **0 / 262144** |
 
-- **`mean_rel_L1 = 2.0e-3`** sits in the cleanest tier of the registry, beside Element-wise Add (1.9e-3) and below RMSNorm (4.2e-3). A normalized output is O(1) by construction, so the bf16 epilogue roundings do not compound.
-- **`rel_err max = 6.3e+1` is expected and is not a defect.** LayerNorm output is zero-mean, so some element of some row lands arbitrarily close to zero; its *relative* error is then unbounded while its *absolute* error stays at one bf16 ULP. This is exactly the case `atol` exists for, and it is why the registry's methodology fixes `rtol` and sizes `atol` rather than the reverse.
-- **`abs_err max = 3.1e-2`** is one bf16 ULP at the largest-magnitude outputs (|y| ≈ 4 σ), covered by `atol = 5e-2`.
+- **`mean_rel_L1 = 8.1e-5`** is the cleanest reduction in the registry — a single bf16 rounding of an f32-exact value, which is the floor for a bf16-out kernel. The one-pass kernel this replaced measured 2.0e-3 on the same inputs; the 25× gap was its bf16 row sum and three-rounding epilogue.
+- **`rel_err max = 7.8e-3 < rtol`**: every element is covered by `rtol` alone (`atol_required` measures 0.0). One rounding of an f32 value is always within 2⁻⁹ relative, so near-zero outputs no longer carry the whole neighborhood's absolute error the old epilogue gave them.
+- **`abs_err max = 1.6e-2`** is one bf16 ULP at the largest-magnitude outputs (|y| ≈ 4 σ), covered by `atol = 5e-2`.
 
 ---
 
@@ -84,8 +85,8 @@ Element-wise over the **full output**: every element must pass `|y−ref| ≤ at
 | bf16 | 1.6e-2 | 5e-2 |
 
 - **Reference** = CPU FP32 **two-pass** LayerNorm (`mean`, then `mean((x−mean)²)`, then `(x−mean)/sqrt(var+eps)`), from bf16-rounded `randn` inputs, cast once to bf16. Not a bf16 reference: a bf16 oracle agrees with a bf16 device partly by being wrong in the same direction.
-- `rtol = 1.6e-2` is PyTorch / vLLM's canonical bf16 tolerance and is held fixed across the registry. `atol = 5e-2` covers the worst-case single-element bf16 output rounding (`abs_err max ≈ 3.1e-2`).
-- **Matches the GPU op in structure, not in bit pattern.** `torch.nn.LayerNorm` on bf16 upcasts to f32 for the statistics and rounds once; this kernel keeps `Σx²` in f32 but `Σx` in bf16 and rounds three times in the epilogue. The measured 2.0e-3 is the size of that gap.
+- `rtol = 1.6e-2` is PyTorch / vLLM's canonical bf16 tolerance and is held fixed across the registry. `atol = 5e-2` covers the worst-case single-element bf16 output rounding (`abs_err max ≈ 1.6e-2`).
+- **Matches the GPU op in structure.** `torch.nn.LayerNorm` on bf16 upcasts to f32 for the statistics and rounds once; this kernel now does the same (f32 statistics, two-pass variance, one rounding at the store). The measured 8.1e-5 is the size of the remaining gap — the bf16 rounding of the squared deviations.
 
 ---
 
@@ -93,12 +94,14 @@ Element-wise over the **full output**: every element must pass `|y−ref| ≤ at
 
 | (M×N) | herd (hx/hy) | rows_per_call | mean_rel_L1 | abs_err max | mismatches | Used by | Status |
 |---|---|---|---|---|---|---|---|
-| 512×512 | 8/1 | 8 | 2.0e-3 | 3.1e-2 | 0 / 262144 | transformer-layer execution studies, encoder block norm (hidden = 512) | ✅ |
-| 4096×768 | 8/1 | 8 | 2.0e-3 | 3.1e-2 | 0 / 3145728 | transformer-layer execution studies, `baseline_768` block norm at the block's own sequence length | ✅ |
+| 512×512 | 8/1 | 8 | 8.1e-5 | 1.6e-2 | 0 / 262144 | transformer-layer execution studies, encoder block norm (hidden = 512) | ✅ |
+| 4096×768 | 8/1 | 8 | 7.1e-5 | 1.6e-2 | 0 / 3145728 | transformer-layer execution studies, `baseline_768` block norm at the block's own sequence length | ✅ |
 
-> The `baseline_768` row is Phase D1's, added so a block failure localizes to the integration rather than to an operator nobody had run at that width. `mean_rel_L1` is unchanged across a 12× larger output and a 1.5× wider normalization axis, which is what a per-row reduction should do. Only the `baseline_512` and `baseline_1024` families remain unrun here; a row appears only once it has been run on hardware.
+> The `baseline_768` row is Phase D1's, added so a block failure localizes to the integration rather than to an operator nobody had run at that width. `mean_rel_L1` is unchanged across a 12× larger output and a 1.5× wider normalization axis, which is what a per-row reduction should do. Only the `baseline_512` and `baseline_1024` families remain unrun here; a row appears only once it has been run on hardware. (Both rows re-measured August 2026 on the two-pass f32-statistics kernel; the one-pass kernel measured 2.0e-3 / 3.1e-2 on the same seeds.)
 >
-> **The two rows carry different `atol`** — 5e-2 and 5e-3. The 512-row's was the tier's default, chosen before `atol_required` was recorded; the 768-row's is its own measured `atol_required` of 1.4e-3 rounded up 3.5×. `abs_err max` is 22× that, all of it sitting on large-magnitude elements `rtol` already covers, which is the whole reason `abs_err max` is not the number to size an `atol` against.
+> **The two rows carry different `atol`** — 5e-2 and 5e-3. The 512-row's was the tier's default, chosen before `atol_required` was recorded; the 768-row's was sized from the one-pass kernel's measured `atol_required` of 1.4e-3 rounded up 3.5×, and stands although the two-pass kernel's `atol_required` measures 0.0 — a bound `rtol` alone now meets is not a reason to loosen or to chase an arbitrarily small number.
+>
+> The offset-row regime (mean large next to spread, where the one-pass form lost the variance entirely) is pinned by norm_tail's `128x768_offset` opcheck row, which exercises this same `layer_norm_rows` entry point through the J7a pipeline.
 
 **Performance is not measured here.** C1 gates numerics only, so the latency / bandwidth columns the other kernels in this registry carry are deliberately absent rather than estimated. LayerNorm is memory-bound in the same way RMSNorm is (it streams the whole matrix for an O(N) op), so its bandwidth should land in the same band; that is an expectation, not a measurement, and it is not recorded as one.
 

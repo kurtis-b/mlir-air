@@ -263,16 +263,16 @@ high-precision `atol` is K-scaled here, in
 
 ## LayerNorm — tested shapes
 
-`y = (x − mean(x)) · rsqrt(var(x) + eps)`, per row, **several rows per kernel call**; shapes written `M×N` (M = rows / seq, N = emb_dim = normalization axis). The encoder-block norm of the transformer-layer execution studies, over the ported `layer_norm_rows` kernel — **not** the direct-codegen `programming_examples/layer_norm/` example, which accumulates its statistics in bf16 and gates an order of magnitude looser. Variance is one-pass `E[x²] − E[x]²`; the oracle is the two-pass FP32 form, so the measurement includes that gap rather than cancelling it. Full datapath, constraints, and reproduce commands in [`details/LayerNorm_bf16.md`](details/LayerNorm_bf16.md).
+`y = (x − mean(x)) · rsqrt(var(x) + eps)`, per row, **several rows per kernel call**; shapes written `M×N` (M = rows / seq, N = emb_dim = normalization axis). The encoder-block norm of the transformer-layer execution studies, over the ported `layer_norm_rows` kernel — **not** the direct-codegen `programming_examples/layer_norm/` example, which accumulates its statistics in bf16 and gates an order of magnitude looser. Statistics accumulate in **FP32** and the variance is **two-pass** `E[(x − mean)²]`, the same form as the FP32 oracle, so rows at a large common offset normalize correctly — the one-pass `E[x²] − E[x]²` form the kernel first shipped lost such rows' variance entirely, and J7a's `128x768_offset` opcheck row pins the regime. Full datapath, constraints, and reproduce commands in [`details/LayerNorm_bf16.md`](details/LayerNorm_bf16.md).
 
 | (M×N) | herd (hx/hy) | rows_per_call | mean_rel_L1 | abs_err max | mismatches | Used by | Status |
 |---|---|---|---|---|---|---|---|
-| 512×512 | 8/1 | 8 | 2.0e-3 | 3.1e-2 | 0 / 262144 | transformer-layer studies, encoder block norm (hidden = 512) | ✅ |
-| 4096×768 | 8/1 | 8 | 2.0e-3 | 3.1e-2 | 0 / 3145728 | transformer-layer studies, `baseline_768` block norm at the block's own sequence length | ✅ |
+| 512×512 | 8/1 | 8 | 8.1e-5 | 1.6e-2 | 0 / 262144 | transformer-layer studies, encoder block norm (hidden = 512) | ✅ |
+| 4096×768 | 8/1 | 8 | 7.1e-5 | 1.6e-2 | 0 / 3145728 | transformer-layer studies, `baseline_768` block norm at the block's own sequence length | ✅ |
 
-> The `4096×768` row is Phase D1's: the same kernel at the width and sequence length the encoder block runs. `mean_rel_L1` is unchanged across a 12× larger output and a 1.5× wider normalization axis, which is what a per-row reduction should do. It carries `atol = 5e-3` against the 512-row's `5e-2`, sized from its own measured `atol_required` of 1.4e-3 rather than inherited from the tier — `abs_err max` is 22× that, all of it on large-magnitude elements `rtol` already covers.
+> The `4096×768` row is Phase D1's: the same kernel at the width and sequence length the encoder block runs. `mean_rel_L1` is unchanged across a 12× larger output and a 1.5× wider normalization axis, which is what a per-row reduction should do. It carries `atol = 5e-3` against the 512-row's `5e-2`, sized from the one-pass kernel's measured `atol_required` of 1.4e-3; the two-pass kernel's `atol_required` measures 0.0 and the 5e-3 stands rather than chasing an arbitrarily small number.
 
-> `mean_rel_L1 = 2.0e-3` sits beside Element-wise Add (1.9e-3) and below RMSNorm (4.2e-3): the output is O(1) by construction, so the bf16 epilogue roundings do not compound. `rel_err max = 6.3e+1` is expected rather than a defect — a zero-mean output puts some element arbitrarily close to zero, where relative error is unbounded and absolute error is still one ULP. That is what `atol = 5e-2` is for, and why the methodology fixes `rtol` and sizes `atol`. Throughput is not recorded: Phase C1 gates numerics only.
+> `mean_rel_L1 = 8.1e-5` is the cleanest reduction in the registry — one bf16 rounding of an f32-exact value, the floor for a bf16-out kernel (the one-pass kernel measured 2.0e-3 on the same seeds). `rel_err max = 7.8e-3` sits under `rtol`, so every element is covered by `rtol` alone. Throughput is not recorded: Phase C1 gates numerics only.
 
 ---
 
