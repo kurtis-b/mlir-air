@@ -172,7 +172,6 @@ def check_shape(shape_key, rows, cols):
         ]
 
     problems = []
-    names = [n for n, _ in dumps]
 
     # 1. No packet-typed channel anywhere in the pipeline.
     packet_dumps = [n for n, text in dumps if "npu_dma_packet" in text]
