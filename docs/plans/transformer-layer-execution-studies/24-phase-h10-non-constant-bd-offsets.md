@@ -143,12 +143,23 @@ relies on it stops building**. That is the point, but it must be looked at rathe
 if a shipped model does hit it, that model has been computing on a frozen BD offset and the finding
 is much larger than this phase.
 
-An objective check with two clauses:
+The objective check is wired (`phase_h10_objective_check`) and has **three** clauses, because one
+alone would be satisfied by refusing everything:
 
-1. The diagnostic fires on the minimal shape (an IV-dependent channel-put offset), by message.
-2. **The pre-fix J7b construction is rejected.** Build `e6cdd138`'s `ffn_accum` builder at 4 K
-   steps and require a compile failure naming the offset. This is the phase's real claim: the exact
-   program that hung now refuses.
+1. **The phase.** An IV-dependent channel-put offset on an **L2** operand is refused, by a message
+   naming a non-constant/static offset — not by the generic core-ELF link failure every one of
+   these compiles ends with.
+2. **Not unconditional.** The same shape with a **constant** offset still gets past the MLIR
+   pipeline.
+3. **Correctly scoped.** An IV-dependent offset on an **L3** operand still compiles. This is the
+   clause that keeps the fix from being worse than the defect: every shipped design that walks a
+   buffer does it this way, and a refusal that caught them would break the fleet to fix a bug none
+   of them have.
+
+**Verified failing before the phase starts**, which is the discipline H9's `multicolumn` clause
+exists for. On today's compiler, clause 1 fails — the construction compiles clean through the MLIR
+pipeline and dies only at the link, with nothing said about the offset — while 2 and 3 pass
+trivially because nothing is refused yet. They become load-bearing the moment the diagnostic lands.
 
 ## What this phase must not do
 

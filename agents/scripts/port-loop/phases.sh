@@ -22,7 +22,7 @@
 # to match. Resuming H would have re-used a fingerprint baseline captured against the old
 # specification, so the tamper check would have been measuring the wrong thing. A fresh phase costs
 # one arm in this table and buys an honest baseline.
-PL_PHASES_IN_SCOPE='["J7b"]'
+PL_PHASES_IN_SCOPE='["H10"]'
 
 phase_name() {
   case "$1" in
@@ -45,6 +45,7 @@ phase_name() {
     H9) echo "Compiler: fuse packet put loops through scf.parallel, so multi-column multi-trip is correct" ;;
     J7a) echo "The norm-tail pipeline: three herds, L1->L1 channels, intermediates off L3" ;;
     J7b) echo "The accumulator ring, derived: FFN down-projection partial sums stay on chip" ;;
+    H10) echo "Compiler: refuse a non-constant BD offset instead of dereferencing it" ;;
     *) echo "unknown" ;;
   esac
 }
@@ -70,6 +71,7 @@ phase_doc() {
     H9) echo "docs/plans/transformer-layer-execution-studies/20-phase-h9-fuse-through-parallel.md" ;;
     J7a) echo "docs/plans/transformer-layer-execution-studies/21-phase-j7a-norm-tail-pipeline.md" ;;
     J7b) echo "docs/plans/transformer-layer-execution-studies/22-phase-j7b-accumulator-ring.md" ;;
+    H10) echo "docs/plans/transformer-layer-execution-studies/24-phase-h10-non-constant-bd-offsets.md" ;;
     *) echo "" ;;
   esac
 }
@@ -100,7 +102,7 @@ phase_needs_hardware() {
     D1|D2) echo "yes" ;;
     E1|E2|E3|E4|E5) echo "yes" ;;
     H|H1s) echo "yes" ;;
-    J1|H9|J7a|J7b) echo "yes" ;;
+    J1|H9|J7a|J7b|H10) echo "yes" ;;
     *) echo "no" ;;
   esac
 }
@@ -464,6 +466,45 @@ allowlist deliberately between phases. Do not touch builders/addnorm.py: its gua
 measured boundary and widening it is J1's job, after this lands.
 EOF
 ;;
+    H10) cat <<'EOF'
+flock -x -w 1800 /tmp/mlir-air-npu.lock  agents/scripts/port-loop/gate-h.sh
+
+FIVE LEGS, cheapest first: build + install (the install is not optional -- the examples resolve
+aircc from install-xrt, so a pass you edit and merely BUILD leaves every later leg testing the
+previous compiler); check-air-mlir; the transformer-layer suite on hardware; decode throughput
+against a recorded floor; then make verify over the ten shipped models. Budget ~2h.
+
+WHAT YOU ARE FIXING is not a missing feature. air::get1DOffset
+(mlir/lib/Conversion/AIRToAIESchedulingUtils.cpp, ~199-215) calls mlir::getConstantIntValue and
+dereferences the result WITHOUT checking it. That function returns nullopt exactly when the value
+is not a compile-time constant -- a loop induction variable, which is how anyone walks a staged
+buffer. Dereferencing a disengaged std::optional is UB; the observed result is a silent 0, so
+every BD in the chain addresses the same block forever. The BD-dim-layout construction at ~462 has
+the same unchecked deref for wraps and strides. The SAME FILE checks correctly at 527 and 945, so
+the idiom is known and inconsistently applied; the only caller of get1DOffset is
+AIRToAIEPass.cpp:6527, whose immediately preceding line checks its optional.
+
+REFUSE, DO NOT SKIP. H1s settled skip-and-warn for the ping-pong labeler because declining there
+leaves a correct single-buffered loop. Here there is no correct fallback: an aie.dma_bd offset is
+static and cannot advance per iteration, so continuing emits a chain that addresses the wrong
+memory. Same shape as air-fuse-packet-put-loops. The diagnostic must say what to do instead --
+stage the operand per iteration from L3, whose runtime sequence CAN materialize a moving offset --
+because this defect's entire cost was that the failure gave no hint and presented as a hang.
+
+SCOPE. get1DOffset is reached only from the tile-side (core and memtile) BD path, so an
+IV-dependent offset on an L3 operand is untouched and must stay untouched: that is the form every
+shipped design uses and it is correct. Read doc 24's table before you widen anything.
+
+Your allowlist authorizes exactly ONE new file:
+mlir/test/Conversion/AIRToAIE/non_constant_bd_offset.mlir. NO EXISTING mlir/test file may change.
+If one starts failing, that is either a design relying on the UB -- a finding for
+work_not_completed, not a test to edit -- or your refusal firing too broadly, which is a bug in
+this phase. Both halt, and both should.
+
+DO NOT implement dynamic BD indexing. That is H5, it is much larger, and mlir-aie already solved
+it one layer down with dynamic-objFifos. Refusing correctly is this phase.
+EOF
+;;
     J7b) cat <<'EOF'
 flock -x -w 1800 /tmp/mlir-air-npu.lock \
   ninja -C build-xrt check-programming-examples-transformer-layer
@@ -657,6 +698,17 @@ phase_gate_allowlist() {
     # The third file is the NEW test this phase adds. It is named in advance deliberately: an
     # allowlist that says "and whatever else you decide to create" is not an allowlist.
     H1s) echo '^mlir/test/Transform/AIRDependencyScheduleOpt/(label_ping_pong_alias_escape_proof|label_ping_pong_external_call_proof|label_ping_pong_loop_invariant_not_rotated)\.mlir$' ;;
+    # H10 turns a silent miscompile into a refusal, so it adds ONE new lit test: a channel put
+    # whose offset depends on a loop induction variable, which must now produce a diagnostic.
+    # Named in advance for the reason the H1s block gives -- an allowlist that says "and whatever
+    # else you decide to create" is not an allowlist.
+    #
+    # Nothing else is authorized. In particular NO EXISTING mlir/test file may change: this phase
+    # only refuses a construction that previously produced undefined behaviour, so any existing
+    # test that starts failing is either (a) a design relying on that UB, which is a finding to
+    # report and not a test to edit, or (b) the refusal firing too broadly, which is a bug in the
+    # phase. Both halt, and both should.
+    H10) echo '^mlir/test/Conversion/AIRToAIE/non_constant_bd_offset\.mlir$' ;;
     *) echo '' ;;
   esac
 }
@@ -670,7 +722,7 @@ phase_gate_cmd() {
     D1|D2) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
     # E1 alone changes shared infrastructure, so E1 alone carries the ten-model leg.
     E1) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-e1.sh" ;;
-    H|H1s|H9) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-h.sh" ;;
+    H|H1s|H9|H10) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-h.sh" ;;
     E2|E3|E4|E5|J1|J7a|J7b) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
     *) echo "false" ;;
   esac
@@ -1580,6 +1632,174 @@ phase_e1_objective_check() {
 
 phase_e2_objective_check() { phase_e_mode_objective_check coarse; }
 
+# --- Phase H10 ------------------------------------------------------------------------------------
+#
+# The claim is that a construction which previously compiled, routed and HUNG now refuses at
+# compile time with a message that says what to do instead. Three clauses, and the third is the
+# one that keeps the fix from being worse than the defect.
+#
+# Clause 1 alone would be satisfied by refusing everything. Clause 2 (a constant offset still
+# compiles) and clause 3 (an IV-dependent offset on an L3 operand still compiles) are what pin the
+# refusal to the case that is actually inexpressible. Clause 3 is not hypothetical: every shipped
+# design that takes a moving offset does so on an L3 operand -- attention_decode's bL3ToL2 puts
+# walk a genuine scf.for induction variable over six trips -- and those go through the runtime
+# sequence, which CAN materialize a moving offset. A refusal that caught them would break the
+# shipped fleet to fix a bug none of them have.
+
+phase_h10_objective_check() {
+  PL_H10_ROOT="${PL_ROOT}" python3 -c '
+import os, sys, tempfile
+
+root = os.environ["PL_H10_ROOT"]
+pe = os.path.join(root, "programming_examples")
+for p in (pe, os.path.join(pe, "llms"), os.path.join(pe, "transformer_layer")):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+from ml_dtypes import bfloat16
+from air.ir import *
+from air.dialects.affine import apply as affine_apply
+from air.dialects.air import *
+from air.dialects.func import FuncOp
+from air.dialects.memref import AllocOp, DeallocOp
+from air.dialects.scf import for_, yield_
+from air.backend.xrt import XRTBackend
+from air.backend.xrt_runner import type_mapper
+
+range_ = for_
+ROWS, COLS, TRIPS = 64, 32, 4
+BLOCK = ROWS * COLS
+
+
+def build(where, moving):
+    """A put walking a staged buffer. `where` is "L2" or "L3"; `moving` picks an
+    IV-dependent offset over a constant one. Four trips, so the loop does not
+    fully unroll -- at two it does, and every offset is a literal either way."""
+
+    @module_builder
+    def _b():
+        xrt = type_mapper(bfloat16)
+        total = BLOCK * TRIPS
+        l3 = MemRefType.get([total], xrt)
+        l2_space = IntegerAttr.get(T.i32(), MemorySpace.L2)
+        l1_space = IntegerAttr.get(T.i32(), MemorySpace.L1)
+        l2_ty = MemRefType.get([total], xrt, memory_space=l2_space)
+        l1_ty = MemRefType.get([ROWS, COLS], xrt, memory_space=l1_space)
+
+        sink = FuncOp("sink", ([l1_ty], []), visibility="private")
+        sink.attributes["link_with"] = StringAttr.get("sink.o")
+        sink.attributes["llvm.emit_c_interface"] = UnitAttr.get()
+        Channel("h10_feed", size=[1, 1])
+
+        @FuncOp.from_py_func(l3)
+        def probe(a0):
+            @launch(operands=[a0])
+            def lau(la):
+                @segment(name="s", operands=[la])
+                def seg(sa):
+                    stage = AllocOp(l2_ty, [], []) if where == "L2" else None
+                    if stage is not None:
+                        dma_memcpy_nd(stage, sa, src_offsets=[0],
+                                      src_sizes=[total], src_strides=[1])
+
+                    @herd(name="h", sizes=[1, 1], operands=[])
+                    def hb(tx, ty, sx, sy):
+                        for _k in range_(0, TRIPS):
+                            tile = AllocOp(l1_ty, [], [])
+                            ChannelGet("h10_feed", tile, indices=[tx, ty])
+                            DeallocOp(tile)
+                            yield_([])
+
+                    hb.attributes["link_with"] = StringAttr.get("sink.o")
+
+                    src = stage if stage is not None else sa
+                    off_map = AffineMap.get(
+                        0, 1,
+                        [AffineExpr.get_mul(AffineSymbolExpr.get(0),
+                                            AffineConstantExpr.get(BLOCK))],
+                    )
+                    for k in range_(0, TRIPS):
+                        off = affine_apply(off_map, [k]) if moving else 0
+                        ChannelPut("h10_feed", src, offsets=[off],
+                                   sizes=[BLOCK], strides=[1], indices=[0, 0])
+                        yield_([])
+                    if stage is not None:
+                        DeallocOp(stage)
+
+    return _b()
+
+
+def compile_err(module):
+    """Compile in a scratch dir; return the error text, or None if it got past
+    the MLIR pipeline (the core-ELF link fails for want of sink.o either way)."""
+    prev = os.getcwd()
+    with tempfile.TemporaryDirectory(prefix="h10-") as work:
+        os.chdir(work)
+        try:
+            be = XRTBackend(omit_while_true_loop=False, output_format="xclbin",
+                            instance_name="h10", target_device="npu2")
+            try:
+                be.compile(module)
+                return None
+            except Exception as exc:
+                return f"{type(exc).__name__}: {exc}"
+            finally:
+                try: be.unload()
+                except Exception: pass
+        finally:
+            os.chdir(prev)
+
+
+def mentions_diagnostic(text):
+    if not text:
+        return False
+    low = text.lower()
+    return ("constant" in low or "static" in low) and "offset" in low
+
+
+problems = []
+
+# 1. THE PHASE. An IV-dependent offset on an L2 operand must be refused, by a message that names
+#    the problem -- not by the generic link failure every one of these compiles ends with.
+err = compile_err(build("L2", moving=True))
+if not mentions_diagnostic(err):
+    problems.append(
+        "clause 1 FAILED: an L2 channel-put offset derived from a loop induction variable was "
+        "NOT refused with a diagnostic about a non-constant/static offset. This is the "
+        "construction that compiles, routes and hangs; refusing it is the phase.  |  got: "
+        + (err or "compile reported success")[:400]
+    )
+
+# 2. NOT UNCONDITIONAL. The same shape with a constant offset must get past the MLIR pipeline.
+err = compile_err(build("L2", moving=False))
+if mentions_diagnostic(err):
+    problems.append(
+        "clause 2 FAILED: a CONSTANT L2 channel-put offset was refused by the new diagnostic. "
+        "The refusal must fire on non-constant offsets only, or it rejects working designs.  |  got: " + err[:400]
+    )
+
+# 3. SCOPE. An IV-dependent offset on an L3 operand must still compile: the runtime sequence
+#    materializes it per task, and every shipped design that walks a buffer does it this way.
+err = compile_err(build("L3", moving=True))
+if mentions_diagnostic(err):
+    problems.append(
+        "clause 3 FAILED: an IV-dependent offset on an L3 operand was refused. That form is "
+        "correct -- AIRRtToNpuPass materializes a moving offset per task -- and is what "
+        "attention_decode and the other shipped designs use. This refusal would break them.  |  got: " + err[:400]
+    )
+
+if problems:
+    for p in problems:
+        print("objective check: " + p, file=sys.stderr)
+    sys.exit(1)
+print("  non-constant BD offsets refused; constant and L3-side offsets still compile")
+' || return 1
+
+  log_info "objective check passed: a non-constant tile-side BD offset is refused with a"
+  log_info "  diagnostic, and neither a constant offset nor an L3-side moving offset is"
+  return 0
+}
+
 # --- Phase J7b ------------------------------------------------------------------------------------
 #
 # The claim is that partial sums stop round-tripping through DDR, and NOTHING NUMERICAL CAN SEE
@@ -1964,6 +2184,7 @@ phase_objective_check() {
     J1) phase_j1_objective_check ;;
     J7a) phase_j7a_objective_check ;;
     J7b) phase_j7b_objective_check ;;
+    H10) phase_h10_objective_check ;;
     *) return 0 ;;
   esac
 }
