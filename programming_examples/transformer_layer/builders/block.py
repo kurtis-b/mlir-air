@@ -37,10 +37,18 @@ CONTRACT
 
 WHY THE LAYER IS FOUR DISPATCH SEQUENCES AND NOT ONE
     Because ``addnorm`` cannot be dispatched over 4096 rows, and that is a
-    property of the operator, not of this file. Its kernel drives THREE L3->L1
-    streams per tile (x, residual, weight) against a column's two shim MM2S
-    channels, so ``builders/addnorm.py`` requires exactly one kernel call per
-    tile and the row count is capped by what fits L1:
+    property of the compiler's packet-DMA lowering, not of this file. Three
+    L3->L1 streams per tile force packet multiplexing on the shim, and on a
+    multi-column herd the multiplexed put loops cannot be fused into feed
+    order (``air-fuse-packet-put-loops`` only matches sibling ``scf.for``
+    loops, not the ``scf.parallel``-wrapped form a herd produces), so any
+    multi-trip row loop miscompiles -- phase J1 measured the candidate
+    collapse, 64 trips at 4096x768 over 8 columns, at 3.13M of 3.15M elements
+    wrong, and every builder-side alternative (one-column herd, hoisted
+    weight, weight staged through L2) hit a measured wall of its own; see
+    ``builders/addnorm.py``'s multi-trip section for the full matrix. So
+    ``builders/addnorm.py`` requires one kernel call per tile on multi-column
+    herds and the row count is capped by what fits L1:
     ``addnorm_max_rows(768, pre_add=True)`` is 104. The layer's 4096 rows are
     therefore ROW-BLOCKED into ``seq_len // norm_rows`` dispatches of the very
     shape D1 validated (64 x 768, pre-add), which is the strongest form the

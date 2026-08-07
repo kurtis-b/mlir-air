@@ -1137,3 +1137,60 @@ callee's memref arguments (`llvm.readonly`/`llvm.writeonly`) so the proof
 passes — input tiles are safe to mark readonly; an accumulator that is both
 read and written by the kernel must stay unannotated, which is fine
 whenever it is not one of the loop's own per-iteration buffers.
+
+## Phase J1 findings: the norm-dispatch collapse is compiler-blocked, measured
+
+J1's plan was to lift `builders/addnorm.py`'s one-trip guard — Phase H having
+fixed the shim feed-order miscompile behind it — and collapse the layer's two
+row-blocked normalization points (64 dispatches each, 128 of `coarse`'s 131
+runlist entries) into one launch each: 4096×768 over the 8-column herd, 64
+trips of 8 rows per tile. **That does not work, and the reason is measured,
+not argued.** `air-fuse-packet-put-loops` fixed exactly the shape its fixture
+pins — sibling `scf.for` put loops in one block, i.e. a ONE-column herd — and
+no shape the block needs reaches it. The walk (pre-add, unannotated callee,
+rtol 1.6e-2 / atol 2e-3, zero permitted mismatches, all on NPU2):
+
+| shape (trips × rows_per_call, cols, herd_x)      | result |
+|---|---|
+| 2×4, 64, herd 1 (the fixture's shape)            | exact |
+| 2×8, 768, herd 1                                 | exact |
+| 8×8, 768, herd 1                                 | refuses to compile: shim BD exhaustion (16-BD cap, `aiex.dma_configure_task`) |
+| 2×4, 64, herd 8                                  | 4070/4096 mismatched |
+| 2×4, 64, herd 8, weight DMA hoisted              | 4039/4096 mismatched |
+| 2×8, 768, herd 8                                 | 97,726/98,304 mismatched |
+| 64×8, 768, herd 8 — **the J1 target shape**      | compiles; 3,130,958/3,145,728 mismatched |
+| weight staged through L2, herd 8                 | placement failure: `no ShimNOCTile has sufficient DMA capacity` for the weight put |
+| weight via L2 (broadcast OR per-column replica), herd 4 | routing failure: `'aie.connect' op … targets same dst as another connect op` on the first core tile |
+
+Three distinct walls, none reachable from the builder:
+
+1. **The fusion pass does not fire on multi-column herds.** With `herd_x >= 2`,
+   `air-dma-to-channel` wraps each per-tile put loop in `scf.parallel` and
+   leaves the broadcast weight's put loop beside them;
+   `air-fuse-packet-put-loops` matches only sibling `scf.for` loops sharing a
+   block, so its output IR is byte-identical to its input (checked in the
+   `--debug-ir` dumps, pass 026 vs 027) and the packet feed-order corruption
+   returns from the second trip on. Hoisting the weight does not help: x and
+   residual still share a packet queue in the wrong order.
+2. **Where fusion does fire (`herd_x == 1`), packet puts do not scale.** Each
+   put in the fused loop lowers to its own simultaneously-active
+   `aiex.dma_configure_task`; a shim tile has 16 BDs, so the trip count caps
+   near 4–5 and 8 trips already refuse to compile. The refusal is loud, which
+   is why the builder still permits multi-trip at `herd_x=1` only.
+3. **Freeing the shim by staging the weight through L2 trips two further
+   defects**: at herd 8 there is no MM2S channel left anywhere for the
+   L3→L2 weight put (x/residual fill all sixteen), and at herd 4 the
+   L2→L1 weight path — broadcast or per-column-replicated via a zero-stride
+   put — makes `air-to-aie` emit conflicting stream-switch routes.
+
+Consequences, encoded in the code rather than left in prose:
+`build_addnorm_module` now permits multi-trip only at `herd_x == 1` and its
+raise names the real mechanism (the old guard's "three streams against two
+MM2S channels" was the trigger for packet multiplexing, not the fault
+itself); `builders/block.py` keeps its row-blocked normalization sequences,
+and `coarse` keeps its measured 131-entry vector. The collapse needs compiler
+work first: packet put-loop fusion through `scf.parallel`, or loop-shaped
+packet BD programs on the shim — either lands in `mlir/`, which a porting
+phase does not touch. Every failing shape above reproduces from a plain
+`XRTRunner.run_test` of `build_addnorm_module` (or the driver fixture's
+`build` for the hoisted row) at the listed configuration.
