@@ -165,6 +165,15 @@ Not compiler work, but Phase H halted on all three and the next compiler phase w
 
 ### J7 — pipelined `mha_out_proj` and `ffn` with on-chip partial-sum staging
 
+> **`[2026-08-07]` J7a is built and gated** — see [21](21-phase-j7a-norm-tail-pipeline.md). The
+> norm tail is three herds joined by L1→L1 channels with placement and buffer depth derived by the
+> compiler, measuring `mean_rel_L1` 3.620e-3 against the 1.688e-2 target this section set. **J7b is
+> staged** ([22](22-phase-j7b-accumulator-ring.md)), scoped to the FFN down-projection.
+>
+> Read [23](23-rules-and-open-items.md) before designing J7c: the per-column shim stream budget is
+> what decides whether a stage is buildable, and the accumulator paragraph below names the one
+> kernel whose ring the compiler cannot derive.
+
 **`[2026-08-06]` Missing from the first draft of this document.** It is neither compiler work nor
 covered by J1–J6, and it is the largest remaining structural difference between this port and iron.
 

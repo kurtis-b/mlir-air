@@ -31,7 +31,12 @@ how to use MLIR-AIR.
 | [15-environment-notes.md](15-environment-notes.md) | Toolchain state and the setup traps that silently hollow out hardware gates |
 | [16-compiler-work-and-remaining-essence.md](16-compiler-work-and-remaining-essence.md) | **Start here for what remains.** Tranche H (compiler) and tranche J (the study), the corrected root cause, and what AIR automates versus what iron writes by hand |
 | [17-phase-h-compiler-hardening.md](17-phase-h-compiler-hardening.md) | Phase H spec plus its attempt-by-attempt record — including two of its own claims that measurement falsified |
-| [18-phase-h1s-skip-not-refuse.md](18-phase-h1s-skip-not-refuse.md) | **The next phase.** H's correction run fresh rather than resumed: the safety proof declines to *transform*, never to compile |
+| [18-phase-h1s-skip-not-refuse.md](18-phase-h1s-skip-not-refuse.md) | H's correction, run fresh rather than resumed: the safety proof declines to *transform*, never to compile |
+| [19-phase-j1-collapse-norm-dispatches.md](19-phase-j1-collapse-norm-dispatches.md) | J1 — blocked, with both walls it hit measured and recorded |
+| [20-phase-h9-fuse-through-parallel.md](20-phase-h9-fuse-through-parallel.md) | H9 — the packet fusion that only ever worked on one column, and what it took to fix |
+| [21-phase-j7a-norm-tail-pipeline.md](21-phase-j7a-norm-tail-pipeline.md) | J7a — the norm-tail pipeline. **The first working piece of the dataflow goal** |
+| [22-phase-j7b-accumulator-ring.md](22-phase-j7b-accumulator-ring.md) | **The next phase, staged and not started.** Partial sums that never leave the chip, with the compiler forming the ring |
+| [23-rules-and-open-items.md](23-rules-and-open-items.md) | **Start here.** The rules that govern later work, and the open items nobody has claimed |
 
 ## Status board
 
@@ -57,29 +62,55 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | H1s — skip, do not refuse | `gate-h.sh` **five** legs: build + install, `check-air-mlir`, transformer-layer suite, **decode throughput vs a recorded floor**, `make verify` × 10 | **done** 2026-08-06 (109 min) |
 | J1 — collapse the norm dispatches | transformer-layer suite, then `coarse` `runlist_entries` ≤ 10 | **blocked** 2026-08-06, stopped by operator at `fix/1`. The collapse does not happen and cannot yet: multi-column multi-trip `addnorm` **silently miscompiles** (measured 4070/4096 at `herd_x=8`, 2 trips). Phase H's packet fix works only at `herd_x=1`, which is the only width its fixture ever ran. The guard is refined to the measured boundary instead of lifted (`52b57c8f`, `ef5e1cf1`); `coarse` stays at 131 entries. **[2026-08-07]** H9 fixed the miscompile; J1 is still blocked, now on shim **BD exhaustion at 6 trips** against a 64-trip target — it refuses loudly instead of corrupting silently. The route to the same collapse is J7a, which never enters the packet path |
 | H9 — fuse packet put loops through `scf.parallel` | `gate-h.sh` five legs, plus a driver fixture variant at `herd_x=8` that must go from corrupt to exact | **done** 2026-08-07 (184 min) — `multicolumn` 3747+/4096 wrong → exact; 10/10 models; three review rounds each found a real defect in the combiner/token handling that the gate could not reach |
+| J7a — norm-tail pipeline | transformer-layer suite; `mean_rel_L1` ≤ block's 1.688e-2; zero packet-typed channels | **done** 2026-08-07 (87 min) — 3.620e-3 at 4096×768, 4.7× under the bound; compiler-derived placement and depth; `layer_norm` itself improved ~25× as a side effect |
+| J7b — accumulator ring | transformer-layer suite; the in-place accumulator dispatched; C DMAs hoisted out of the K loop | **staged, not started** — spec at [22](22-phase-j7b-accumulator-ring.md), `PL_PHASES_IN_SCOPE` already set |
 | F — study harness | `execution-smoke-test` yields ≥1 `run_status=passed` row per measurement CSV | not started |
 | G — unattended runner + CI | Full profile run completes with a complete `results_manifest.json` | not started |
 | Goal 1 — sliding window | `make verify` passes with window-crossing prompts | not started |
 | Goal 2 — quantization | Second quantized model passes a gate that exercises the quantized path | not started |
 
-## `[2026-08-06]` Where things stand, for a session picking this up cold
+## `[2026-08-07]` Where things stand, for a session picking this up cold
 
-Read [16](16-compiler-work-and-remaining-essence.md) first — it is the map of everything unfinished.
-Three live threads, and they are independent of each other:
+Read **[23](23-rules-and-open-items.md)** first — it holds the two rules that govern everything
+downstream and the five open items nobody has claimed. Then [16](16-compiler-work-and-remaining-essence.md)
+for the tranche map.
 
-1. **J1 is unblocked and is the highest-value item.** Lift `builders/addnorm.py`'s one-trip guard
-   and re-measure `coarse`; expect 131 runlist entries → ~5, the largest structural gap between this
-   port and iron. It was believed to be blocked on Phase H. It never was: the blocker was the shim
-   packet feed order, fixed in `bfb647d9`, and the two-trip case is now **measured correct on
-   hardware**. Nothing stands in front of this.
-2. **Phase H has three bounded items left** — refuse→skip, re-specify the fixture's `hoisted`
-   clause, add a `CHECK-NOT: unroll` lit test — then a `gate-h.sh` re-run for leg 4. No open
-   questions. [17 §What the next session does](17-phase-h-compiler-hardening.md#what-the-next-session-does).
-   Resume with `resume-at`, never plain `resume`.
-3. **J7 is unbuilt, not blocked**: pipelined `mha_out_proj` and FFN with on-chip partial-sum
-   staging. Start with the norm tail — smallest piece, and it has a measured precision target to
-   beat (1.806e-2 → 1.688e-2). Read [16 §What AIR automates today](16-compiler-work-and-remaining-essence.md#what-air-automates-today-and-what-it-does-not)
-   before designing it; half of what looks like work is already done by the compiler.
+**The one rule to know before designing anything.** A column has **two shim MM2S channels**, and
+the budget is per column **across the whole segment** — three stacked 8-wide herds put one tile of
+each into every column, so their L3 demands add. Exceed two and AIR packet-multiplexes onto one
+queue. Keep every column at two or fewer L3-facing streams; put the rest on L1→L1 channels, and
+pack co-indexed L3 operands into one strided fetch. This single fact explains why `fused`'s
+decomposed tail always ran 64 trips on 8 columns correctly, why `addnorm` needed its one-trip
+guard, why J1's L2-staged weight failed, and why J7a works.
+
+**Where the four live threads stand:**
+
+1. **J7b is staged and not started.** `PL_PHASES_IN_SCOPE` is already `["J7b"]`; the spec, the
+   objective check and the phases.sh arms are committed. Start it with
+   `agents/scripts/port-loop.sh start` — see [22](22-phase-j7b-accumulator-ring.md). Scope is one
+   GEMM, the FFN down-projection.
+2. **J7a landed** ([21](21-phase-j7a-norm-tail-pipeline.md)) — the first piece of iron's dataflow
+   form on this port. Three herds, L1→L1 channels, **placement and buffer depth derived by the
+   compiler**, `mean_rel_L1` 3.620e-3 against a 1.688e-2 target. Its round-3 fix also made
+   `layer_norm` itself ~25× more accurate for free.
+3. **J1 is blocked, and precisely.** Not on correctness any more — H9 fixed the miscompile — but on
+   shim **BD exhaustion at six trips** against a 64-trip target. It now refuses loudly instead of
+   corrupting silently. **Not on the goal path**: J7a reaches the same dispatch collapse without
+   the packet queue.
+4. **H8 is untouched** and is the largest remaining item: the pass that *derives* on-chip staging
+   rather than having the builder declare it. It wanted J7 as a hand-written reference to validate
+   against, and J7a is now that reference.
+
+**Two things that cost this run time, so they do not cost the next one:**
+
+- **Match a probe's altitude to its claim.** `air-opt` with a hand-built pass list answers "does
+  this pass fire", not "does this compile". A construction measured as lowering cleanly through
+  `air-opt` never compiled under `aircc`, because `air-to-aie` rewrites callee signatures
+  afterwards. Use `aircc` / `XRTBackend.compile(debug_ir=True)` for anything downstream of it.
+- **A fixture proves only the shape it runs.** Phase H's four fixture variants were green for a
+  whole phase while a silent miscompile lived one column wider — every one of them ran at
+  `herd_x=1`. H9's `multicolumn` clause exists for that reason, and it was verified FAILING before
+  the fix landed.
 
 Phases A and B were executed by the automated driver — see
 [14-the-port-loop-harness.md](14-the-port-loop-harness.md). Both passed their gate, objective
