@@ -20,6 +20,9 @@ Measured through `air-dma-to-channel`:
 | `elementwise_add` (a, b) | 2 | 0 |
 | `layer_norm` (in) | 1 | 0 |
 
+Reproduce with `python3 agents/probes/probe_packet_streams.py`; the probes and what each one
+establishes are indexed in [`agents/probes/README.md`](../../../agents/probes/README.md).
+
 This one fact explains a chain of things that looked unrelated:
 
 - why **`fused`'s decomposed tail already ran 64 trips on 8 columns correctly** while the fused

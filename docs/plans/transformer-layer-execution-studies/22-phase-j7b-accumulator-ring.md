@@ -24,7 +24,7 @@ DMAs lifted out of the K loop, leaving only the A and B fetches. (The compile fa
 no kernel object; irrelevant, since the hoist pass runs sixth and its dump is written regardless.)
 
 So the design below rests on an `aircc`-level measurement, not a pass-list one. Reproduce with
-`probe_accum_aircc.py`. Keep the gate clause reading aircc's dump anyway — what is confirmed is
+`agents/probes/probe_accum_aircc.py`. Keep the gate clause reading aircc's dump anyway — what is confirmed is
 that the ring *forms*, not that a future builder will keep it.
 
 ## The two conditions, measured
@@ -88,7 +88,7 @@ driver-owned objective check with **three** clauses:
    dispatched.** It never has been.
 3. **Structural: the C DMAs are no longer inside the K loop.** Read aircc's `--debug-ir` dump for
    `air-hoist-dma-in-accum-pattern` and count data-movement ops in the loop body, exactly as
-   `probe_accum_hoist.py` does.
+   `agents/probes/probe_accum_hoist.py` does.
 
 **Clause 3 is the phase.** The numbers are identical whether the ring formed or not — a DDR
 round-trip per K step is invisible to `np.isclose`. Two of the four cells in the table above would
@@ -101,4 +101,6 @@ ship as working code and pass every numerical gate.
 - Do not declare a memory space for the accumulator. The point is that the compiler decides.
 - Do not touch `mlir/`.
 
-Reproduce the table with `probe_accum_hoist.py --shape {inplace,twobuf,inloop,inloop_twobuf}`.
+Reproduce the table with
+`python3 agents/probes/probe_accum_hoist.py --shape {inplace,twobuf,inloop,inloop_twobuf}`,
+and the aircc-altitude confirmation with `python3 agents/probes/probe_accum_aircc.py`.

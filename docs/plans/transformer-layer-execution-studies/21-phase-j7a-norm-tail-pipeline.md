@@ -152,4 +152,4 @@ Measured before this spec was written:
 3. **Numerically exact on hardware** — **not measured.** Compile-time checks cannot establish it,
    and this is where a design that passes both can still be wrong. It is the first thing to run.
 
-Reproduce 1 and 2 with `probe_j7a_pipeline.py --packed`.
+Reproduce 1 and 2 with `python3 agents/probes/probe_j7a_pipeline.py --packed`.
