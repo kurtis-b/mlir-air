@@ -17,6 +17,7 @@ reports whether the C DMAs are still inside the loop.
 
 Compile-only, no NPU, no kernel object, no linking.
 """
+
 import argparse
 import os
 import re
@@ -54,8 +55,11 @@ def build(two_buffer):
     l1_b_ty = MemRefType.get([TILE_K, N], xrt, memory_space=l1)
     l1_c_ty = MemRefType.get([M, N], xrt, memory_space=l1)
 
-    sig = ([l1_a_ty, l1_b_ty, l1_c_ty, l1_c_ty] if two_buffer
-           else [l1_a_ty, l1_b_ty, l1_c_ty])
+    sig = (
+        [l1_a_ty, l1_b_ty, l1_c_ty, l1_c_ty]
+        if two_buffer
+        else [l1_a_ty, l1_b_ty, l1_c_ty]
+    )
     mm = FuncOp("mm", (sig, []), visibility="private")
     mm.attributes["link_with"] = StringAttr.get("mm.o")
     mm.attributes["llvm.emit_c_interface"] = UnitAttr.get()
@@ -77,19 +81,42 @@ def build(two_buffer):
                     l1_acc = AllocOp(l1_c_ty, [], []) if two_buffer else None
 
                     for k in range_(0, K, TILE_K):
-                        dma_memcpy_nd(l1_a, h_a, src_offsets=[0, k],
-                                      src_sizes=[M, TILE_K], src_strides=[K, 1])
-                        dma_memcpy_nd(l1_b, h_b, src_offsets=[k, 0],
-                                      src_sizes=[TILE_K, N], src_strides=[N, 1])
+                        dma_memcpy_nd(
+                            l1_a,
+                            h_a,
+                            src_offsets=[0, k],
+                            src_sizes=[M, TILE_K],
+                            src_strides=[K, 1],
+                        )
+                        dma_memcpy_nd(
+                            l1_b,
+                            h_b,
+                            src_offsets=[k, 0],
+                            src_sizes=[TILE_K, N],
+                            src_strides=[N, 1],
+                        )
                         # The accumulator fetch. Mirrored by the store below.
                         acc_in = l1_acc if two_buffer else l1_c
-                        dma_memcpy_nd(acc_in, h_c, src_offsets=[0, 0],
-                                      src_sizes=[M, N], src_strides=[N, 1])
-                        operands = ([l1_a, l1_b, l1_acc, l1_c] if two_buffer
-                                    else [l1_a, l1_b, l1_c])
+                        dma_memcpy_nd(
+                            acc_in,
+                            h_c,
+                            src_offsets=[0, 0],
+                            src_sizes=[M, N],
+                            src_strides=[N, 1],
+                        )
+                        operands = (
+                            [l1_a, l1_b, l1_acc, l1_c]
+                            if two_buffer
+                            else [l1_a, l1_b, l1_c]
+                        )
                         CallOp(mm, operands)
-                        dma_memcpy_nd(h_c, l1_c, dst_offsets=[0, 0],
-                                      dst_sizes=[M, N], dst_strides=[N, 1])
+                        dma_memcpy_nd(
+                            h_c,
+                            l1_c,
+                            dst_offsets=[0, 0],
+                            dst_sizes=[M, N],
+                            dst_strides=[N, 1],
+                        )
                         yield_([])
 
                     DeallocOp(l1_a)
@@ -112,8 +139,11 @@ def build_inloop(two_buffer=False):
     l1_b_ty = MemRefType.get([TILE_K, N], xrt, memory_space=l1)
     l1_c_ty = MemRefType.get([M, N], xrt, memory_space=l1)
 
-    sig = ([l1_a_ty, l1_b_ty, l1_c_ty, l1_c_ty] if two_buffer
-           else [l1_a_ty, l1_b_ty, l1_c_ty])
+    sig = (
+        [l1_a_ty, l1_b_ty, l1_c_ty, l1_c_ty]
+        if two_buffer
+        else [l1_a_ty, l1_b_ty, l1_c_ty]
+    )
     mm = FuncOp("mm", (sig, []), visibility="private")
     mm.attributes["link_with"] = StringAttr.get("mm.o")
     mm.attributes["llvm.emit_c_interface"] = UnitAttr.get()
@@ -134,17 +164,43 @@ def build_inloop(two_buffer=False):
                         l1_b = AllocOp(l1_b_ty, [], [])
                         l1_c = AllocOp(l1_c_ty, [], [])
                         l1_acc = AllocOp(l1_c_ty, [], []) if two_buffer else None
-                        dma_memcpy_nd(l1_a, h_a, src_offsets=[0, k],
-                                      src_sizes=[M, TILE_K], src_strides=[K, 1])
-                        dma_memcpy_nd(l1_b, h_b, src_offsets=[k, 0],
-                                      src_sizes=[TILE_K, N], src_strides=[N, 1])
+                        dma_memcpy_nd(
+                            l1_a,
+                            h_a,
+                            src_offsets=[0, k],
+                            src_sizes=[M, TILE_K],
+                            src_strides=[K, 1],
+                        )
+                        dma_memcpy_nd(
+                            l1_b,
+                            h_b,
+                            src_offsets=[k, 0],
+                            src_sizes=[TILE_K, N],
+                            src_strides=[N, 1],
+                        )
                         acc_in = l1_acc if two_buffer else l1_c
-                        dma_memcpy_nd(acc_in, h_c, src_offsets=[0, 0],
-                                      src_sizes=[M, N], src_strides=[N, 1])
-                        CallOp(mm, ([l1_a, l1_b, l1_acc, l1_c] if two_buffer
-                                    else [l1_a, l1_b, l1_c]))
-                        dma_memcpy_nd(h_c, l1_c, dst_offsets=[0, 0],
-                                      dst_sizes=[M, N], dst_strides=[N, 1])
+                        dma_memcpy_nd(
+                            acc_in,
+                            h_c,
+                            src_offsets=[0, 0],
+                            src_sizes=[M, N],
+                            src_strides=[N, 1],
+                        )
+                        CallOp(
+                            mm,
+                            (
+                                [l1_a, l1_b, l1_acc, l1_c]
+                                if two_buffer
+                                else [l1_a, l1_b, l1_c]
+                            ),
+                        )
+                        dma_memcpy_nd(
+                            h_c,
+                            l1_c,
+                            dst_offsets=[0, 0],
+                            dst_sizes=[M, N],
+                            dst_strides=[N, 1],
+                        )
                         DeallocOp(l1_a)
                         DeallocOp(l1_b)
                         DeallocOp(l1_c)
@@ -171,7 +227,11 @@ def dmas_inside_loop(mlir_text):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--shape", required=True, choices=("inplace", "twobuf", "inloop", "inloop_twobuf"))
+    ap.add_argument(
+        "--shape",
+        required=True,
+        choices=("inplace", "twobuf", "inloop", "inloop_twobuf"),
+    )
     args = ap.parse_args()
 
     work = tempfile.mkdtemp(prefix="probe-accum-")
@@ -186,16 +246,21 @@ def main():
     open(src, "w").write(str(mod))
 
     def run(passes, out):
-        r = subprocess.run(["air-opt", src, f"--pass-pipeline=builtin.module({passes})",
-                            "-o", out], capture_output=True, text=True)
+        r = subprocess.run(
+            ["air-opt", src, f"--pass-pipeline=builtin.module({passes})", "-o", out],
+            capture_output=True,
+            text=True,
+        )
         if r.returncode != 0:
             print("air-opt failed:\n" + r.stderr[:800])
             sys.exit(2)
         return open(out).read()
 
     before = run("air-dependency", os.path.join(work, "dep.mlir"))
-    after = run("air-dependency,air-hoist-dma-in-accum-pattern",
-                os.path.join(work, "hoisted.mlir"))
+    after = run(
+        "air-dependency,air-hoist-dma-in-accum-pattern",
+        os.path.join(work, "hoisted.mlir"),
+    )
 
     nb, _ = dmas_inside_loop(before)
     na, _ = dmas_inside_loop(after)
