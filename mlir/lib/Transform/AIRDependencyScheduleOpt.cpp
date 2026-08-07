@@ -4678,6 +4678,35 @@ public:
 // air-dma-to-channel's per-DMA loop hoisting discarded; the chain survives
 // canonicalization because CanonicalizeAsyncOpDeps models packet-typed
 // channels as one shared stream resource.
+//
+// At herd width >= 2, air-dma-to-channel wraps each hoisted per-tile put loop
+// in its own launch-scope scf.parallel over the herd columns, so the loops
+// that must interleave are not block siblings: each sits alone inside a
+// different scf.parallel (and a broadcast channel's loop sits beside them,
+// unwrapped). Fusing inside one parallel body is therefore vacuous -- every
+// body holds a single loop -- and the groups that matter SPAN the parallels.
+// The pass handles this by sequentializing each eligible wrapper parallel
+// (static bounds, async-token shape, body of nothing but candidate put loops
+// and pure plumbing) into its per-iteration clones, in ascending induction
+// order, and then running the ordinary single-block fusion over the flattened
+// siblings. Sequentialization is legal unconditionally -- scf.parallel
+// permits any interleaving, and airrt-to-npu unrolls launch-scope parallels
+// into exactly this ascending sequential task order anyway -- so the only
+// change is WHEN the order is materialized: early enough for fusion to see
+// it. Running the fusion before the parallel wrapper is introduced instead
+// was rejected: the hoisted put loops only reach their final shape after the
+// last air-isolate-async-dma-loop-nests, which would re-split a fused loop,
+// and that pass runs after air-dma-to-channel creates the wrappers.
+//
+// Correctness of fusing across former parallel iterations rests on the shim
+// queue map: every non-broadcast packet channel's per-column endpoints
+// allocate to that column's own shim queue, so iteration i's puts and
+// iteration j's puts (i != j) never share a queue, and reordering between
+// them is unobservable on any shared stream. The one cross-column resident
+// is a broadcast channel's put (one op, feeding all columns from one queue);
+// it shares a queue only with its own column's puts, and the fused
+// program-order interleave gives that queue exactly the per-trip order the
+// consumer rings were built from.
 class AIRFusePacketPutLoops
     : public xilinx::air::impl::AIRFusePacketPutLoopsBase<
           AIRFusePacketPutLoops> {
@@ -4837,6 +4866,97 @@ public:
     }
   }
 
+  // Sequentialize a launch-scope scf.parallel that is nothing but a wrapper
+  // around packet put-loop candidates: clone its body once per iteration, in
+  // ascending induction order, at the parallel's position, so the loops
+  // become block siblings the grouping above can see. Returns true iff the
+  // parallel was expanded (and erased).
+  //
+  // Eligibility is deliberately the exact wrapper shape air-dma-to-channel
+  // emits, nothing wider:
+  //   - all bounds static (the iteration count is a herd dimension);
+  //   - one async-token result with NO uses. The result is dead in practice
+  //     (air-dependency-canonicalize prunes the terminal joins); if it ever
+  //     is live, joining the per-iteration tokens at the parallel's position
+  //     would place a user of every member's result before the fusion point,
+  //     and runOnBlock's dominance check would then (correctly) refuse to
+  //     fuse -- so expanding would churn the IR for nothing;
+  //   - every body op is a candidate put loop, an air.wait_all (the token
+  //     plumbing the wrapper carries), or region-free and memory-effect-free
+  //     (index arithmetic); at least one candidate. Anything else -- a bare
+  //     packet put, a get loop, control flow -- declines, and the parallel
+  //     keeps sealing groups via touchesPacketStream as before.
+  //
+  // Note what this admits: single-trip designs canonicalize their one-trip
+  // put loops into bare puts before this pass runs, so their wrapper
+  // parallels contain no candidate loops and are left byte-identical. Only
+  // multi-trip put loops -- the shape whose feed order is actually broken --
+  // reach the expansion.
+  bool expandParallelOfPacketPutLoops(scf::ParallelOp par, OpBuilder &builder) {
+    SmallVector<int64_t> lbs, ubs, steps;
+    for (auto [lb, ub, st] :
+         llvm::zip(par.getLowerBound(), par.getUpperBound(), par.getStep())) {
+      auto lbc = getConstantIntValue(lb);
+      auto ubc = getConstantIntValue(ub);
+      auto stc = getConstantIntValue(st);
+      if (!lbc || !ubc || !stc || *stc <= 0)
+        return false;
+      lbs.push_back(*lbc);
+      ubs.push_back(*ubc);
+      steps.push_back(*stc);
+    }
+    if (par.getNumResults() != 1 ||
+        !llvm::isa<air::AsyncTokenType>(par.getResult(0).getType()) ||
+        !par.getResult(0).use_empty())
+      return false;
+    Block *body = par.getBody();
+    bool hasCandidate = false;
+    for (auto &op : body->without_terminator()) {
+      if (auto forOp = dyn_cast<scf::ForOp>(&op)) {
+        SmallVector<int64_t, 3> key;
+        if (!isCandidate(forOp, key))
+          return false;
+        hasCandidate = true;
+        continue;
+      }
+      if (isa<air::WaitAllOp>(&op))
+        continue;
+      if (!isMemoryEffectFree(&op) || op.getNumRegions() ||
+          touchesPacketStream(&op))
+        return false;
+    }
+    if (!hasCandidate)
+      return false;
+    builder.setInsertionPoint(par);
+    auto loc = par.getLoc();
+    // Odometer over the (possibly multi-dimensional) index space, ascending,
+    // outermost dimension slowest -- the same order airrt-to-npu unrolls
+    // launch-scope parallels in, so the shim task order this materializes is
+    // the one the runtime produced all along.
+    SmallVector<int64_t> ivs(lbs);
+    bool empty = false;
+    for (unsigned d = 0; d < ivs.size(); d++)
+      empty |= lbs[d] >= ubs[d];
+    while (!empty) {
+      IRMapping remap;
+      for (auto [iv, cst] : llvm::zip(par.getInductionVars(), ivs))
+        remap.map(iv, arith::ConstantIndexOp::create(builder, loc, cst));
+      for (auto &op : body->without_terminator())
+        builder.clone(op, remap);
+      int d = ivs.size() - 1;
+      for (; d >= 0; d--) {
+        ivs[d] += steps[d];
+        if (ivs[d] < ubs[d])
+          break;
+        ivs[d] = lbs[d];
+      }
+      if (d < 0)
+        break;
+    }
+    par.erase();
+    return true;
+  }
+
   void runOnOperation() override {
     auto module = getOperation();
     OpBuilder builder(module.getContext());
@@ -4845,8 +4965,15 @@ public:
       for (auto &b : l.getBody())
         blocks.push_back(&b);
     });
-    for (auto *b : blocks)
+    for (auto *b : blocks) {
+      SmallVector<scf::ParallelOp> wrappers;
+      for (auto &op : *b)
+        if (auto par = dyn_cast<scf::ParallelOp>(&op))
+          wrappers.push_back(par);
+      for (auto par : wrappers)
+        (void)expandParallelOfPacketPutLoops(par, builder);
       runOnBlock(b, builder);
+    }
   }
 };
 

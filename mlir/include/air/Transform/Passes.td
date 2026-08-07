@@ -1078,6 +1078,16 @@ def AIRFusePacketPutLoops: Pass<"air-fuse-packet-put-loops", "ModuleOp"> {
     canonicalization because CanonicalizeAsyncOpDeps models packet-typed
     channels as one shared stream resource, and airrt-to-npu unrolls the fused
     loop into per-iteration interleaved shim tasks, matching the ring order.
+
+    At herd width >= 2 the hoisted put loops are not block siblings:
+    air-dma-to-channel wraps each in its own launch-scope scf.parallel over
+    the herd columns. The pass first sequentializes each such wrapper whose
+    body is nothing but candidate put loops and pure plumbing -- cloning the
+    body per iteration in the same ascending order airrt-to-npu would unroll
+    it in anyway -- and then fuses over the flattened siblings. Iterations of
+    the wrapper target per-column shim queues, so interleaving puts across
+    former iterations reorders nothing on any shared stream; the per-column
+    order each queue does depend on is exactly what the fusion restores.
   }];
 }
 
