@@ -97,7 +97,27 @@ fi
 # --run-only, which calls load_manifest() and dispatches whatever ELFs already sit in the model's
 # cache directory -- compiled by the compiler this phase just replaced. That is leg 1's install
 # trap wearing a different hat: the gate would go green having measured the previous build.
-# KernelCache.compile() has no fingerprint-based skip, so `make compile` genuinely rebuilds.
+# KernelCache.compile_and_cache() has no fingerprint-based skip, so it genuinely rebuilds.
+#
+# AND WHERE THAT PREMISE FAILS. `[2026-08-06]` The skip lives one level UP, in the model's own
+# driver script, and it is existence-based rather than fingerprint-based:
+#
+#   llama32_1b_int4_prefill.py:1058
+#     def _need(name, kernel_sym=None):
+#         elf = Path(args.cache_dir) / f"{name}.elf"
+#         if elf.exists():
+#             print(f"  using cached {name}.elf (...)")
+#
+# So for llama32_1b_int4 the second and every later `make compile` skips every kernel already
+# built, whatever compiler produced it -- leg 1's install trap a THIRD time. That model also
+# builds prefill only from `make compile` (three dtypes); its decode ELFs come from
+# `make compile-inference` / `make compile-decode` and live in a different cache dir, which is
+# what `make profile` actually dispatches.
+#
+# llama32_1b -- the only model with a floor today -- has no such skip and does rebuild, so this
+# leg is sound as it currently runs. Before adding llama32_1b_int4: clear its cache dirs and use
+# `make compile-inference`, then check the leg's log for "using cached". If that string appears,
+# the leg measured the previous compiler and proves nothing.
 #
 # WHY THE FLOOR LIVES IN A DRIVER-OWNED FILE. throughput-baseline.json sits under
 # agents/scripts/port-loop/, which guard_gate_files() fingerprints and which no phase's allowlist
@@ -144,11 +164,19 @@ tp_regressions=()
 # Gate the models that HAVE a recorded floor, and say out loud which declared ones do not.
 #
 # The alternative -- failing on every declared-but-unseeded model -- produces a gate that cannot
-# pass until someone seeds it, and a gate that cannot pass gets worked around. `[2026-08-06]`
-# That is not hypothetical: llama32_1b_int4 is declared here and cannot be seeded yet, because
-# H1's refusal spec stops it compiling on the build that is installed. So the intersection is
-# computed, the difference is reported as NOT GATED, and adding a model to the gate is exactly one
-# action -- seed it -- with no edit to this file.
+# pass until someone seeds it, and a gate that cannot pass gets worked around. So the intersection
+# is computed, the difference is reported as NOT GATED, and adding a model to the gate is exactly
+# one action -- seed it -- with no edit to this file.
+#
+# `[2026-08-06]` An earlier version of this comment said llama32_1b_int4 "cannot be seeded yet,
+# because H1's refusal spec stops it compiling on the build that is installed". That was already
+# false when it was written: the refusal was narrowed in 1514e553 and the model has compiled ever
+# since -- measured pre-H1s with a full `make verify` that recompiled every prefill AND decode
+# kernel from scratch. The claim came from doc 17's leg-4 record, which describes attempt FOUR.
+# int4 is unseeded because nobody had measured it, not because it could not be measured.
+#
+# Before seeding it, read the caching note on `make compile` below -- for that model the compile
+# step can be vacuous, and a floor recorded from stale ELFs gates nothing.
 #
 # Still fail-closed where it counts: a model that HAS a floor and stops reporting throughput fails,
 # and an empty intersection fails rather than passing a leg that measured nothing.

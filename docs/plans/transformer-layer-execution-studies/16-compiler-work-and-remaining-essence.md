@@ -126,10 +126,10 @@ floor. **H1a — the refuse → skip edit itself — is what remains**, plus one
 
 | # | Item | Why | Size |
 |---|---|---|---|
-| H4 | **Resolve the `air.disable_ping_pong` discrepancy.** `isPingPongCandidate` checks it, yet setting it on the row loop changed nothing — both arms produced byte-identical 481/512. Determine whether it is dropped, attached to the wrong op after rewrites, or read too late. If dropped, promote it from discardable to an **inherent** ODS attribute. | A documented opt-out that does not work is worse than none. Discardable attributes may legitimately be dropped by any pass that does not know them; PR #1664 already hand-patched four such sites. | small |
+| ~~H4~~ | ~~**Resolve the `air.disable_ping_pong` discrepancy.**~~ **`[2026-08-06]` STRUCK — measured working.** Set on a loop that IS otherwise labeled, `unroll` and `hoist_alloc` both go to zero and the buffers are not rotated; the attribute is present in every `--debug-ir` dump through the labeling pass, so the four hand-patched propagation sites are doing their job. The original "setting it changed nothing" was taken on a shape whose callee is unannotated and is therefore never labeled at all — it disabled something that was not happening, the same confound that made `--omit-ping-pong-transform=all` look exculpatory. Nothing to fix; do not promote it to an inherent attribute. | — | — |
 | H5 | **Dynamic channel indices.** Split `air.channel`'s `indices` into a static dimension (selects flow/tile, must stay compile-time) and a dynamic one resolved by a runtime counter modulo depth. | `air.channel` indices are compile-time today, so a 64-band loop fully unrolls. **`[2026-08-06]` That unroll does not merely cost compile time — it exhausts the hardware.** The block configuration (4096x768, 8 cores, 64 bands) failed with `error: 'aie.lock' op lock assigned invalid id (maximum is 15)` in `air-to-aie`: 64 bands x 4 channels is far past the 16 locks a tile has. So the channel workaround is correct at 2 trips (measured, zero mismatches) but **cannot reach the block's band count at all**, which makes this item a prerequisite for that path rather than an optimization of it. **mlir-aie already solved this one layer down**: `-aie-objectFifo-stateful-transform`'s `dynamic-objFifos` uses a per-core counter plus `scf.index_switch`, and it is now the default, with static LCM unrolling as the legacy fallback. | medium |
-| H6 | **Per-region `omit_pingpong`.** Teach `air-label-scf-for-to-ping-pong` to read a per-herd/per-segment attribute layered over its module-wide option. | FlashAttention needs `omit_pingpong="all"` + `runtime_loop_tiling_sizes=[1,1]`; the 4096-row GEMMs need `[2,2]`. One ELF is one aircc invocation, so `fused` is 3 ELFs instead of 1. It also costs codegen *inside* existing ELFs — one K=8192 launch forces every sibling in `o_ffn` to give up ping-pong. **The transform pass needs no change**: the flow is already label→transform and already does `removeAttr` on consume. Prototype with `transform.apply_registered_pass` first — AIR has `air-transform` and `AIRTransformOps.td` today, so this needs no C++ to validate. | medium |
-| H7 | **Re-localize the offset-subview blocker.** A `memref.subview` at a nonzero offset cannot reach a launch argument. **`air.launch` is not the blocker** — its ODS is `Variadic<AnyType>`. The two `isIdentity()` gates found so far are narrow (cascade channels, `#air.symmetric_heap`), so the real wall is elsewhere, likely the Python builder's signature. Find it before scoping. | Blocks reusing a row-banded operator inside a fused module, and iron-style banded addressing with the offset baked into the instruction stream. | unknown |
+| H6 | **Per-region `omit_pingpong`.** `[2026-08-06]` **Re-scoped: try zero compiler change first.** The tiling half already has a per-launch override — `air.shim_dma_tile_sizes`, consumed at `AIRDependencyScheduleOpt.cpp:7868`, with the CLI merely outranking it — so a builder that OMITS `runtime_loop_tiling_sizes` and annotates each `air.launch` gets per-region tiling today. The ping-pong half works at loop granularity (see the struck H4). What is genuinely missing is only herd/segment granularity: `AIRDialect.cpp:71` restricts `air.disable_ping_pong` to `scf.for`/`scf.parallel`. **Step 1 is a measurement**, not C++: build the mixed FlashAttention + 4096-row-GEMM ELF with no tiling kwarg, per-launch attributes, and the opt-out on the attention herd's loops. | Still the gate on a single-ELF attention column pipeline (J7c): FlashAttention needs `omit_pingpong="all"` + `[1,1]` or it does not place, the GEMMs need `[2,2]`, and one ELF is one aircc invocation. | small |
+| H7 | **Re-localize the offset-subview blocker.** `[2026-08-06]` **No longer unknown — two walls, and they are the same boundary from both sides.** (1) mlir-aie's `traceSubviewToBlockArgument` (`lib/Dialect/AIEX/Utils/AIEUtils.cpp:19`) already accumulates a nonzero byte offset and the caller adds it, but bails unless the subview is **rank-1 → rank-1**. (2) Upstream of it, `memref.cast` cannot erase a nonzero offset back to the identity layout a launch signature declares. The row-0 trick in `o_gemv_ffn_multi.py:142` works only because an offset-0 subview+cast is a no-op that folds away before either wall applies. **A third route needs neither change**: pass the band index as a launch operand and let the existing `dma_memcpy_nd(..., src_offsets=[row, 0], ...)` address it — which is what every banded builder here already does. Run the one small compile named in the note before scoping. | Blocks reusing a row-banded operator inside a fused module, and is doc 09's named fix for `fused`'s streamed norm tail. | bounded |
 | H8 | **Automatic on-chip staging between pipeline stages** — see [the survey below](#what-air-automates-today-and-what-it-does-not). A pass that finds a memref written by exactly one hierarchy op, read by exactly one, with no host aliasing and dead afterwards, replaces it with a channel and demotes its memory space (L2, falling back to L3 on capacity). Plus launch fusion, so adjacent stages are co-resident to begin with. | Today memory space is an **input** to the AIR pipeline, never an output: no pass looks at a DDR buffer and decides it should not be there. This is the one piece of iron's dataflow that AIR cannot currently derive. | large, **and needs H2** — the analysis is unsound without the external-call classifier |
 
 Prefer **inherent** over discardable for anything that must reach the backend. Erase on consume, as
@@ -233,9 +233,44 @@ leaving the buffer L1-resident across the whole reduction. That is iron's `of_o_
 `of_o_acc_out` ring, derived rather than declared.
 
 Critically it is **purely syntactic on the DMA ops** and never asks what the kernel does, so an
-opaque external `func.call` between the fetch and the store does not block it. Write a KV-block loop
-that fetches C, calls `matmul_with_acc_vectorized_2x2_mmul`, stores C — and the round-trip collapses
-on its own. **J7 does not need to hand-build the accumulator ring.**
+opaque external `func.call` between the fetch and the store does not block it. **J7 does not need to
+hand-build the accumulator ring.**
+
+> ### `[2026-08-06]` But under two conditions this paragraph originally left out
+>
+> It used to end "write a KV-block loop that fetches C, calls `matmul_with_acc_vectorized_2x2_mmul`,
+> stores C — and the round-trip collapses on its own." The conclusion is right; **both specifics were
+> wrong**, and either one alone silently costs you the ring. Measured with
+> `air-opt --air-dependency,--air-hoist-dma-in-accum-pattern`, counting data-movement ops left inside
+> the K loop (A and B fetches must stay; the accumulator's two should lift):
+>
+> | accumulator kernel | L1 buffers allocated | before → after | ring? |
+> |---|---|---|---|
+> | in-place — one `C`, read-add-write | outside the loop (herd scope) | 4 → 4 | **no** |
+> | in-place — one `C`, read-add-write | **inside the loop** | **4 → 2** | **yes** |
+> | two-buffer — `pAcc` in, `C` out | outside the loop | 4 → 4 | no |
+> | two-buffer — `pAcc` in, `C` out | inside the loop | 4 → 4 | no |
+>
+> **Condition 1 — it must be the in-place kernel.** `areSymmetricDmaOps` requires the incoming DMA's
+> destination and the outgoing DMA's source to be the *same* memref. `ffn_matmul_bf16_bf16_up_proj(A,
+> B, C)` reads C, adds, writes C — one memref, matches.
+> `ffn_matmul_with_acc_bf16_bf16_down_proj(A, B, pAcc, C)` uses two, both `__restrict` so they may not
+> alias, and **never matches at any alloc site**. That is the kernel this paragraph used to name, and
+> it is a faithful match for iron's `of_o_acc_in`/`of_o_acc_out` pair — which is precisely why it
+> needs a hand-built ring and the in-place form does not. `encoder_matmul.cc:26` flags the
+> distinction as a footgun in its own words.
+>
+> **Condition 2 — the accumulator must be allocated *inside* the loop.** Counter-intuitive: you write
+> "allocate per iteration" to get "resident across iterations". `isIncomingDmaOp` requires the DMA to
+> depend on both the loop's first iter-arg **and** an `air.execute` holding a `memref.alloc`;
+> `isOutgoingDmaOp` requires its token's users to include both an `air.wait_all` **and** an
+> `air.execute` holding a `memref.dealloc`. Allocate at herd scope — the natural way — and neither
+> predicate holds. The pass hoists the alloc and the mirrored DMA pair *together*.
+>
+> **Consequence for J7b's gate:** assert from the `--debug-ir` dump that the C DMAs left the K loop.
+> The numbers are identical whether the ring formed or not, so a DDR round-trip per K step is
+> invisible to `np.isclose` — and it is the entire thing J7b exists to remove. Two of the four cells
+> above would have shipped as working code.
 
 **The inter-stage half is not automatic, and cannot be today.** Memory space is an input to the AIR
 pipeline. There is no producer-consumer forwarding pass and no launch fusion —

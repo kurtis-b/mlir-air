@@ -52,12 +52,22 @@ fi
 # go and resolve.
 #
 # Seeding is INCREMENTAL and per-model: pass model names as arguments to record just those, and
-# they are merged into whatever the baseline already holds. That is not a convenience -- it is
-# forced by history. `[2026-08-06]` H1's refusal spec stops llama32_1b_int4, qwen3_0_6b and
-# qwen3_1_7b compiling at all, so the int4 model has no measurable throughput on the build that is
-# installed today and its floor cannot be recorded until H1s restores compilation. Each model
-# therefore carries the SHA it was measured at, so a floor recorded later is attributable rather
-# than silently equal in standing to one that spans the change.
+# they are merged into whatever the baseline already holds. Each model carries the SHA it was
+# measured at, so a floor recorded later is attributable rather than silently equal in standing to
+# one that spans the change it is supposed to gate.
+#
+# `[2026-08-06]` An earlier version of this comment justified that with "H1's refusal spec stops
+# llama32_1b_int4, qwen3_0_6b and qwen3_1_7b compiling at all". That was already false when it was
+# written -- the refusal was narrowed in 1514e553 and all three have compiled since, measured
+# pre-H1s by a full `make verify` that recompiled every prefill and decode kernel. The claim came
+# from doc 17's leg-4 record, which describes attempt FOUR, not the installed build. The
+# per-model SHA is worth keeping on its own merits; the reason given for it was wrong.
+#
+# Before seeding llama32_1b_int4 specifically: its prefill script skips any kernel whose .elf
+# already exists (llama32_1b_int4_prefill.py:1058), so `make compile` is vacuous on a warm cache
+# and would record a floor from the PREVIOUS compiler's ELFs. Clear its cache dirs first and use
+# `make compile-inference`, which is also the only target that builds the decode kernels
+# `make profile` dispatches.
 MODELS=(llama32_1b llama32_1b_int4)
 if [ "$#" -gt 0 ]; then
   MODELS=("$@")

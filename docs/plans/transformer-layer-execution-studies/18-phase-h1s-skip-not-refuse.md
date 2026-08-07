@@ -156,15 +156,31 @@ verdict" is that the labeling changes as a side effect. These four rows pin the 
 per buffer, so that side effect cannot pass silently. The evidence that the phase achieved
 something is gate leg 5 and the answer to the open question below.
 
-## Open question worth answering while you are here
+## `[2026-08-06]` RESOLVED, and the phase PASSED
 
-`[2026-08-06]` The over-refusal that failed leg 5 on three shipped models was measured against
-attempt 4. Attempt 5 (`1514e553`, "refuse only what the rotation actually privatizes") landed
-afterwards and **is** in the installed build, and none of the four fixture arrangements can reach
-the `Refuse` verdict any more. So it is genuinely unclear whether `Refuse` is still reachable on
-real input at all.
+**The open question is answered: `Refuse` was already unreachable on real input.** The session ran
+`make verify` on `llama32_1b_int4` against the *pre-change* installed (attempt-5) compiler and it
+passed, with genuine fresh `aircc` compiles of every prefill and decode kernel — no cache hits.
+Attempt 5 (`1514e553`, "refuse only what the rotation actually privatizes") had already narrowed
+the verdict past everything real; the leg-5 failure recorded in [17](17-phase-h-compiler-hardening.md)
+is attempt **four**'s behaviour.
 
-If leg 5 passes before your change, say so plainly: this phase is then removing a latent hazard
-rather than fixing a live one, which is still worth doing — a verdict that aborts the build has no
-place in a transform whose prior art all declines instead — but it is a smaller claim, and the
-record should say which one it is.
+**So this phase removed a LATENT hazard, not a live one**, and that is the claim the record should
+carry. It is still worth having done — a verdict that aborts the build has no place in a transform
+whose prior art (`memref::multiBuffer`, IREE, Triton, TVM) all declines the transform instead — and
+the two new tests pin the labeling decision per buffer, which nothing did before. But leg 5 passed
+10/10 at the phase base as well, and saying otherwise would overstate it.
+
+**Outcome**, 109 minutes, 4 agent invocations, three Codex rounds all `verdict=pass blocking=0
+weakened=0`:
+
+| leg | result |
+|---|---|
+| 1 build + install | pass |
+| 2 `check-air-mlir` | pass — 488 passed, 7 UNSUPPORTED, 7 XFAIL, 0 failures |
+| 3 transformer-layer suite on hardware | pass |
+| 4 decode throughput | `llama32_1b` 11.01 tok/s against a 9.43 floor — pass; `llama32_1b_int4` `NOT GATED` |
+| 5 ten shipped models | 10/10 pass |
+
+Objective check green on all four fixture variants. Commits: `cb7be1ab` (the verdict),
+`610fadc2` (the two existing tests), `5a380615` (the new loop-invariant test).
