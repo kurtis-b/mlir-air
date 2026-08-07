@@ -168,6 +168,24 @@ buffer (32·64 = 2048). It does **not** freeze. That is the same boundary J7b me
 other side: **at 2 trips the loop unrolls and every offset resolves to its own literal; at 4+ it
 does not unroll and the chain repeats a stale offset.**
 
+**The arithmetic, because this has now been misdiagnosed three times.** The buffer is
+`memref<64x64xi32, 1>` — **4096 elements**. The access is a 32×32 tile at `[r, c]` with strides
+`[64, 1]`, and `#map1 = (s0) -> (s0 * 32)` applied to a 2×2 herd's indices gives `r, c ∈ {0, 32}`.
+So the complete, correct set of linear offsets is
+
+```
+r*64 + c  over  r,c ∈ {0,32}   =   {0, 32, 2048, 2080}        max touched = 2080+31*64+31 = 4079 < 4096 ✓
+```
+
+which is **exactly what the pre-phase compiler emits** — four distinct offsets, one per herd tile,
+covering the 2×2 partition. Nothing is frozen.
+
+> A round-2 report claimed the correct walk is `{0, 2048, 4096, 6144}` and that the compiler froze
+> it to `{0, 32}`. **That set cannot belong to this test**: 4096 and 6144 are past the end of a
+> 4096-element buffer. It is J7b's A-feed sequence (8192-element L2 buffer, 2048-element blocks,
+> 4 K steps) transplanted onto a different design. Check an expected offset set against the
+> buffer's own size before concluding a compiler froze it.
+
 So an IV-dependent offset is not by itself unlowerable. It is unlowerable exactly when the loop
 carrying it **does not unroll**, because only then does one static `aie.dma_bd` have to stand for
 several different offsets.
