@@ -108,7 +108,7 @@ Caveats that apply across this tier:
 |---|---|---|
 | `end_to_end/run.py` | 1048 | Imports nothing from `iron`; delegates device work to `modes.py`. Arg parsing, resume-row matching, `mark_best_rows`, lock/CSV writing are all generic. |
 | `host_comparison/run.py` | 1784 | Only imports the torch reference; NPU numbers come from the end-to-end CSV. Swap the reference and the join columns. |
-| `resource_usage/analysis.py` | 299 | Regex-parses `aie.core` / `aie.buffer` / `aie.*dma_allocation` from iron's `input_physical.mlir`. AIR lowers to the same dialect, but the equivalent post-`aircc` artifact is **unidentified** — open issue, resolve before Phase F. |
+| `resource_usage/analysis.py` | 299 | Regex-parses `aie.core` / `aie.buffer` / `aie.*dma_allocation` from iron's `input_physical.mlir`. ~~The equivalent post-`aircc` artifact is **unidentified** — open issue, resolve before Phase F.~~ **`[2026-08-07]` Resolved: `air_project/aie.air.mlir`, and all three regexes match it unmodified** (24 cores / 88 buffers / 17 allocations on a real compile). Only the artifact path changes, so the parsing half is effectively PORT; the ADAPT work is locating the artifact per run. See [09 §Open issue](09-phase-f-study-harness.md) and `study/aircc_artifacts.py`. |
 | `resource_usage/run.py` | 1623 | Locates build artifacts. |
 | `unattended_reboot.py` | 2494 | Job plan is a data table of `(module, argv)` dicts; retargeting is confined to `build_job_plan()`. Convention rule 5 requires splitting this module. |
 | `test_unattended_reboot.py` | 1790 | Splits alongside it. |

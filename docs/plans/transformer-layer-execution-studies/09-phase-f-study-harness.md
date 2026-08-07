@@ -134,6 +134,28 @@ equivalent artifact under `aircc`**. Identify the concrete post-`aircc` artifact
 path before this phase starts. If none is stable, emit one deliberately rather than parsing an
 incidental intermediate.
 
+> **`[2026-08-07]` RESOLVED, and nothing needs emitting: it is `air_project/aie.air.mlir`.**
+> A stable named artifact written by every compile — not a `debug_ir/pass_*.mlir` dump, which
+> exists only under `debug_ir=True` and is numbered by pass ordinal so its name moves whenever
+> the pipeline changes. Measured on the J7a norm-tail pipeline at `herd_x=8`: 40 `aie.tile`,
+> 24 `aie.core`, 88 `aie.buffer`, 112 `aie.lock`, 40 `aie.flow`, 17 `shim_dma_allocation`.
+>
+> **iron's three regexes match it unmodified** — `_CORE_RE` finds 24 cores as `%tile_r_c`,
+> `_DMA_ALLOCATION_RE` finds 17 and parses kind/tile/direction/channel correctly
+> (`shim_dma_allocation`, `%shim_noc_tile_3_0`, `S2MM`, `0`), buffers appear as
+> `aie.buffer(%tile_7_4) … : memref<768xbf16, 2 : i32>`. So the port changes the artifact's
+> *location*, not the parsing, which moves `analysis.py`'s parsing half from ADAPT toward PORT.
+> The three normalization constants carry over unchanged — they are AIE2P properties, not
+> toolchain ones.
+>
+> One property worth knowing: **a compile that fails at the core-ELF link still writes it**,
+> because aircc runs the whole MLIR pipeline before building ELFs. Resource usage is therefore
+> readable without Peano and without a kernel object. A *missing* file means the compile died
+> before lowering completed — a real failure, not a reason to fall back to a debug dump.
+>
+> Pinned in `study/aircc_artifacts.py`; re-derive with
+> `python3 study/test_aircc_artifacts.py --project <an air_project dir>`.
+
 ## Where the convention refactoring lands
 
 Rules 5, 7, 8, 10 and 11 all apply here. Budget for it — "ports by structure" is not "ports
