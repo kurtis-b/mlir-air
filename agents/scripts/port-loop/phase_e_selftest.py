@@ -143,6 +143,12 @@ def _run_set(mutate=None, cmd=None):
 
 
 _OFFLOAD_CMD = ["mode", "--operator", "offload", "--expect-no-aggregation", "--min-submissions", "6"]
+# J1's clause: coarse's runlist entries must COLLAPSE. The fixture's coarse row is D2's real
+# measurement (131 entries, 128 of them addnorm's row blocking), so the same bound must reject it
+# before the change and accept it after -- which is what makes the clause evidence rather than
+# decoration. The mode agreeing with the oracle proves nothing here: it agreed at 131 too.
+_COLLAPSE_CMD = ["mode", "--operator", "coarse",
+                 "--max-field", "runlist_entries", "--max-value", "10"]
 _COMPARE_CMD = ["compare", "--left", "runlist", "--right", "coarse",
                 "--field", "runlist_entries", "--relation", "gt"]
 
@@ -198,6 +204,25 @@ def selftest():
         cases.append((name, mutate, want_pass, cmd))
 
     case("a conforming four-mode set", None, True)
+
+    # --- J1's collapse clause, both directions -------------------------------------------------
+    case("coarse at 131 entries against J1's bound of 10", None, False, _COLLAPSE_CMD)
+
+    def collapse_norms(d, f, l, r, fr):
+        """What lifting addnorm's one-trip guard should do: the two 64-entry row-blocked
+        normalization points become one launch each, leaving the GEMM boundaries untouched."""
+        for artifacts in (d, f):
+            for v in artifacts["coarse"]["dispatch_vectors"]:
+                if v[MEAN_KEY] == 64.0:
+                    v[MEAN_KEY] = 1.0
+    case("coarse with the norm dispatches collapsed", collapse_norms, True, _COLLAPSE_CMD)
+
+    def collapse_but_break_numerics(d, f, l, r, fr):
+        collapse_norms(d, f, l, r, fr)
+        d["coarse"]["stages"][2]["n_mismatch"] = 7
+        d["coarse"]["stages"][2]["passed"] = False
+    case("collapsed entries but a boundary that mismatches",
+         collapse_but_break_numerics, False, _COLLAPSE_CMD)
 
     def drop_stages(d, f, l, r, fr):
         d["coarse"]["stages"] = d["coarse"]["stages"][:3]

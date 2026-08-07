@@ -637,6 +637,13 @@ def main(argv=None):
             # cross-mode ordering waits for E5, when all four exist.
             p.add_argument("--expect-no-aggregation", action="store_true")
             p.add_argument("--min-submissions", type=int, default=0)
+            # An upper bound on one vector field, for a phase whose claim is that a number
+            # COLLAPSED. J1 uses it: lifting addnorm's one-trip guard must take coarse's
+            # runlist entries from 131 to a handful, and "the mode still agrees with the
+            # oracle" is true either way -- the collapse is the whole result, so it has to be
+            # asserted separately or the phase can pass having changed nothing.
+            p.add_argument("--max-field", choices=TOTAL_KEYS)
+            p.add_argument("--max-value", type=int)
         if name == "ladder":
             p.add_argument("--pairs-out")
         if name == "compare":
@@ -683,6 +690,17 @@ def main(argv=None):
                     f"{args.operator} records {totals['host_submissions']} host submission(s), "
                     f"fewer than the {args.min_submissions} its decomposition requires"
                 )
+            if args.max_field is not None:
+                if args.max_value is None:
+                    raise CheckError("--max-field requires --max-value")
+                got = totals[args.max_field]
+                if got > args.max_value:
+                    raise CheckError(
+                        f"{args.operator} {args.max_field} is {got:,}, above the {args.max_value:,} "
+                        "this phase claims to have collapsed it to. The mode agreeing with the "
+                        "oracle does not establish that: it agreed before the change too."
+                    )
+                print(f"  {args.operator} {args.max_field} {got:,} <= {args.max_value:,}")
             return 0
         if args.cmd == "ladder":
             check_ladder(results, cutoff, listing, args.pairs_out)

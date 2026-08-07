@@ -22,7 +22,7 @@
 # to match. Resuming H would have re-used a fingerprint baseline captured against the old
 # specification, so the tamper check would have been measuring the wrong thing. A fresh phase costs
 # one arm in this table and buys an honest baseline.
-PL_PHASES_IN_SCOPE='["H1s"]'
+PL_PHASES_IN_SCOPE='["J1"]'
 
 phase_name() {
   case "$1" in
@@ -41,6 +41,7 @@ phase_name() {
     E5) echo "Execution strategies: fused + the distinguishability gate" ;;
     H) echo "Compiler hardening: ping-pong safety proof, call classifier, attribute verifier" ;;
     H1s) echo "Compiler hardening: the safety proof declines to TRANSFORM, never to compile" ;;
+    J1) echo "Collapse the norm dispatches: lift addnorm's one-trip guard, re-measure coarse" ;;
     *) echo "unknown" ;;
   esac
 }
@@ -62,6 +63,7 @@ phase_doc() {
     E5) echo "docs/plans/transformer-layer-execution-studies/08e-phase-e5-fused-and-distinguishability.md" ;;
     H) echo "docs/plans/transformer-layer-execution-studies/17-phase-h-compiler-hardening.md" ;;
     H1s) echo "docs/plans/transformer-layer-execution-studies/18-phase-h1s-skip-not-refuse.md" ;;
+    J1) echo "docs/plans/transformer-layer-execution-studies/19-phase-j1-collapse-norm-dispatches.md" ;;
     *) echo "" ;;
   esac
 }
@@ -92,6 +94,7 @@ phase_needs_hardware() {
     D1|D2) echo "yes" ;;
     E1|E2|E3|E4|E5) echo "yes" ;;
     H|H1s) echo "yes" ;;
+    J1) echo "yes" ;;
     *) echo "no" ;;
   esac
 }
@@ -425,6 +428,48 @@ outcome deletes the evidence that behaviour changed at all -- three halts in the
 were spent relearning that.
 EOF
 ;;
+    J1) cat <<'EOF'
+flock -x -w 1800 /tmp/mlir-air-npu.lock \
+  ninja -C build-xrt check-programming-examples-transformer-layer
+
+The whole transformer-layer suite on real hardware: every operator, every execution mode, the
+block, and the D1/D2 coverage clauses. Lifting a constraint inside addnorm reaches all of them.
+
+The driver then runs an objective check you cannot influence by editing a test. It reads the
+machine-readable artifact `coarse` writes and asserts FOUR things:
+
+  - every per-boundary n_mismatch is 0, over the full 4096x768 layer;
+  - eight distinct clean stage boundaries, so the artifact describes the whole layer and not a
+    slice of it;
+  - the FAULT-INJECTED twin's summed dispatch totals EQUAL the clean run's. results/ is
+    gitignored, so a fabricated vector block is invisible to the tamper check and to every Codex
+    diff; freshness alone never stopped it. You cannot know those six numbers without dispatching.
+  - coarse's runlist_entries <= 10, down from the 131 it measures today.
+
+THE LAST CLAUSE IS THE PHASE. The first three were all true before your change -- coarse agreed
+with the oracle at 131 entries too -- so a phase that changed nothing passes everything except
+that bound. The collapse is the result; it is asserted on its own for that reason.
+
+WHAT THE NUMBERS ARE, so you are not surprised by them. addnorm_max_rows(768, herd_x=8,
+pre_add=True) is 104 rows per launch, and block.py bands the layer's 4096 rows at 64, giving 64
+dispatches per normalization point and 128 of coarse's 131 entries. Lifted, that becomes ONE
+launch whose row loop runs rows_per_tile / rows_per_call trips per tile. rows_per_call must
+DIVIDE rows_per_tile = 512 -- a non-divisor makes the last trip run past the band -- and the L1
+budget caps it at 13, so the largest legal value is 8 and the trip count is 64.
+
+The only multi-trip result anyone has measured is TWO trips at cols=64, from the driver's own
+fixture. Sixty-four trips at cols=768 is a 32x extrapolation. Walk it -- 2, then 8, then 64 -- and
+if one of them fails, report which and what the output looked like. A partial result is a finding
+worth having: the failure mode this guard was written against looks numerical (partly-correct
+values) rather than structural, which is exactly why it was mistaken for a tolerance problem once
+already.
+
+Do NOT widen a tolerance (the layer is at the hard 1e-1 ceiling and the driver rejects more), do
+NOT disable ping-pong to make a trip count work (measurably 12.4 -> 7.8 tok/s on a shipped model,
+and not the mechanism here), and do NOT edit mlir/. If the collapse exposes a compiler defect,
+that is a finding for work_not_completed with the shape that shows it.
+EOF
+;;
     *) cat <<'EOF'
 ERROR: no gate description is declared for this phase in agents/scripts/port-loop/phases.sh.
 This is a harness bug, not a task. Stop and report it as a blocker.
@@ -460,6 +505,10 @@ phase_gate_allowlist() {
     # agents/scripts/port-loop/. A session that edits an objective check or a gate script halts the
     # run, which is the point.
     E1|E2|E3|E4|E5) echo '^programming_examples/transformer_layer/' ;;
+    # J1 changes two builders and re-measures a mode, all inside the example. It does NOT
+    # touch mlir/ -- if the collapse exposes a compiler defect that is a finding, not this
+    # phase's to fix -- and mlir/test/**/*.mlir is now fingerprinted, so an attempt would halt.
+    J1) echo '^programming_examples/transformer_layer/' ;;
     # H changes mlir/ -- the compiler. NONE of that is a gate file, so the allowlist stays
     # empty-but-for-nothing: H is not expected to touch any .lit, Makefile, CMakeLists,
     # registry JSON or verify module at all. An empty allowlist means every gate-file change is
@@ -493,7 +542,7 @@ phase_gate_cmd() {
     # E1 alone changes shared infrastructure, so E1 alone carries the ten-model leg.
     E1) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-e1.sh" ;;
     H|H1s) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-h.sh" ;;
-    E2|E3|E4|E5) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
+    E2|E3|E4|E5|J1) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
     *) echo "false" ;;
   esac
 }
@@ -1402,6 +1451,22 @@ phase_e1_objective_check() {
 
 phase_e2_objective_check() { phase_e_mode_objective_check coarse; }
 
+# --- Phase J1 ------------------------------------------------------------------------------------
+#
+# Same coarse artifact E2 checked -- full-layer scope, zero mismatches at every boundary, and the
+# fault-injected twin's summed totals EQUAL the clean run's, which a session cannot know without
+# dispatching -- plus the one clause that is this phase's whole claim: the entries collapsed.
+#
+# The bound is asserted separately because agreeing with the oracle proves nothing here. coarse
+# agreed with it at 131 entries too; a phase that changed nothing would pass every other clause.
+# 10 is chosen against the expected ~5 (two GEMM boundaries plus the two collapsed norms) with room
+# for a decomposition that lands a little differently -- and against the 131 it must reject, which
+# it does by a wide margin. Both directions are covered by
+# `python3 agents/scripts/port-loop/phase_e_checks.py selftest`.
+phase_j1_objective_check() {
+  phase_e_mode_objective_check coarse --max-field runlist_entries --max-value 10
+}
+
 # offload aggregates nothing -- checkable from its own artifact, without the other three modes.
 # Six because attention stays in host torch (08c), so it is six projection GEMMs rather than the
 # eight the plan originally predicted.
@@ -1525,6 +1590,7 @@ phase_objective_check() {
     E4) phase_e4_objective_check ;;
     E5) phase_e5_objective_check ;;
     H|H1s) phase_h_objective_check ;;
+    J1) phase_j1_objective_check ;;
     *) return 0 ;;
   esac
 }
