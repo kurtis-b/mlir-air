@@ -33,20 +33,23 @@ The classifier defect was real but separate, and H2 fixed it: a callee carrying
 `llvm.emit_c_interface` now classifies its memref operands from `llvm.readonly` / `llvm.writeonly`
 argument attributes, and an unannotated operand stays unknown rather than being guessed at.
 
-WHAT THE FOUR VARIANTS PROVE
+WHAT THE FIVE VARIANTS PROVE
 
-All four run at TWO trips of the row loop -- the count `builders/addnorm.py` forbids -- at
-cols=64, rows=8, rows_per_call=4, the exact shape it measured the miscompile at. They differ in two
-independent bits: whether the callee's memref arguments are annotated (so the rotation can be
-PROVEN safe), and whether the weight DMA sits inside the loop (so the weight buffer is refilled
-every iteration) or is hoisted out of it (so it carries data across iterations).
+All five run at TWO trips of the row loop -- the count `builders/addnorm.py` forbids. The first
+four sit on ONE column, at cols=64, rows=8, rows_per_call=4, the exact shape the miscompile was
+measured at; they differ in two independent bits: whether the callee's memref arguments are
+annotated (so the rotation can be PROVEN safe), and whether the weight DMA sits inside the loop
+(refilled every iteration) or is hoisted out of it (carrying data across iterations).
 
-  variant             callee        weight DMA   compiles   exact   labeled   weight rotated
-  ------------------  ------------  -----------  ---------  ------  --------  --------------
-  inside              unannotated   in loop      yes        yes     no        --
-  hoisted             unannotated   hoisted      yes        yes     no        --
-  annotated           annotated     in loop      yes        yes     YES       YES
-  annotated_hoisted   annotated     hoisted      yes        yes     YES       NO
+The fifth varies the thing none of the other four do: the herd WIDTH.
+
+  variant             columns  callee        weight DMA   compiles   exact   labeled   wt rotated
+  ------------------  -------  ------------  -----------  ---------  ------  --------  ----------
+  inside                    1  unannotated   in loop      yes        yes     no        --
+  hoisted                   1  unannotated   hoisted      yes        yes     no        --
+  annotated                 1  annotated     in loop      yes        yes     YES       YES
+  annotated_hoisted         1  annotated     hoisted      yes        yes     YES       NO
+  multicolumn               8  unannotated   in loop      yes        yes     no        --
 
 Each row kills a different way of passing without doing the work:
 
@@ -66,6 +69,11 @@ Each row kills a different way of passing without doing the work:
     iterations the wrong half; the compiler is correct today precisely because it excludes it
     (measured: three `hoist_alloc` tile buffers, and the `memref<64xbf16, 2>` weight not among
     them). If a change ever adds it, this row fails structurally AND numerically.
+  - `multicolumn` must be EXACT, and today it is not: 3747+ of 4096 elements wrong. Phase H's
+    packet put-loop fusion walks only air.LaunchOp's immediate body blocks, and at herd_x >= 2 the
+    per-tile put loops are wrapped in an scf.parallel the pass never visits, so the shim
+    feed-order corruption returns from the second trip on. Four green single-column variants
+    coexisted with that for a whole phase; this row is what stops the next one repeating it.
   - `inside` and `hoisted` must NOT be labeled. An unannotated external call leaves the direction
     of its memref operands unknowable, and the compiler must decline rather than guess. These two
     also record something worth not forgetting: `inside` is correct because of the packet-loop
@@ -76,6 +84,7 @@ Usage:
     python3 addnorm_multitrip.py --variant hoisted
     python3 addnorm_multitrip.py --variant annotated
     python3 addnorm_multitrip.py --variant annotated_hoisted
+    python3 addnorm_multitrip.py --variant multicolumn
 
 Exit 0 iff every clause for that variant holds.
 
@@ -117,19 +126,38 @@ from builders.addnorm import (  # noqa: E402
 range_ = for_
 
 # The shape builders/addnorm.py measured the miscompile at: 2 trips of 4 rows on one column.
-ROWS, COLS, HERD_X, ROWS_PER_CALL = 8, 64, 1, 4
+# Every variant runs at cols=64 so the weight buffer's alloc type is one constant below.
+COLS = 64
 RTOL, ATOL = 1.6e-2, 1e-1
 
 # What the weight buffer's alloc looks like in the labeled IR, as distinct from the three
 # [rows_per_call, cols] activation tiles. Used to decide whether the rotation privatized it.
 WEIGHT_ALLOC_TYPE = f"memref<{COLS}xbf16, 2 : i32>"
 
-#                      callee annotated,  weight DMA hoisted, must be labeled, weight rotated
+# (rows, cols, herd_x, rows_per_call). Trips per tile = (rows // herd_x) // rows_per_call.
+_ONE_COLUMN = (8, 64, 1, 4)    # 2 trips on a single column -- the shape H1s ran
+_EIGHT_COLUMN = (64, 64, 8, 4)  # 2 trips on each of 8 columns
+
+#            shape,        callee annotated, weight hoisted, must be labeled, weight rotated
 VARIANTS = {
-    "inside":            (False, False, False, None),
-    "hoisted":           (False, True,  False, None),
-    "annotated":         (True,  False, True,  True),
-    "annotated_hoisted": (True,  True,  True,  False),
+    "inside":            (_ONE_COLUMN,   False, False, False, None),
+    "hoisted":           (_ONE_COLUMN,   False, True,  False, None),
+    "annotated":         (_ONE_COLUMN,   True,  False, True,  True),
+    "annotated_hoisted": (_ONE_COLUMN,   True,  True,  True,  False),
+    # `[2026-08-06]` The width every other variant does not cover, and the reason J1 is blocked.
+    #
+    # air-fuse-packet-put-loops -- Phase H's fix for the two-trip miscompile -- walks only
+    # air.LaunchOp's IMMEDIATE body blocks (AIRDependencyScheduleOpt.cpp:4840). At herd_x >= 2,
+    # air-dma-to-channel wraps the per-tile put loops in an scf.parallel, so they sit in a block
+    # the pass never visits and its output IR is byte-identical to its input. The shim feed-order
+    # corruption H1s believed fixed therefore returns from the second trip on, silently:
+    # measured 4070 of 4096 elements wrong at exactly this shape.
+    #
+    # Every clause above runs at herd_x=1, which is the only width H1s's fixture ever ran -- so
+    # four green variants coexisted with a live silent miscompile one column wider. That is the
+    # gap this row closes, and it is why it must be the DRIVER's fixture rather than a session's
+    # recorded measurement: J1's own Codex review flagged the wall as supported only by prose.
+    "multicolumn":       (_EIGHT_COLUMN, False, False, False, None),
 }
 
 
@@ -280,7 +308,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--variant", required=True, choices=sorted(VARIANTS))
     args = ap.parse_args()
-    annotate, hoisted, want_labeled, want_weight_rotated = VARIANTS[args.variant]
+    shape, annotate, hoisted, want_labeled, want_weight_rotated = VARIANTS[args.variant]
+    rows, cols, herd_x, rows_per_call = shape
 
     # RUN IN A TEMP DIRECTORY, ALWAYS.
     #
@@ -299,20 +328,20 @@ def main():
     print(f"fixture workdir: {workdir}")
 
     compile_addnorm_kernel(pre_add=True)
-    trips = (ROWS // HERD_X) // ROWS_PER_CALL
-    print(f"fixture: variant={args.variant} rows={ROWS} cols={COLS} herd_x={HERD_X} "
-          f"rows_per_call={ROWS_PER_CALL} -> {trips} trips; "
+    trips = (rows // herd_x) // rows_per_call
+    print(f"fixture: variant={args.variant} rows={rows} cols={cols} herd_x={herd_x} "
+          f"rows_per_call={rows_per_call} -> {trips} trips on {herd_x} column(s); "
           f"callee={'annotated' if annotate else 'unannotated'}, "
           f"weight DMA {'hoisted out of' if hoisted else 'inside'} the loop")
 
     rng = np.random.default_rng(7)
-    x = (rng.standard_normal((ROWS, COLS)) * 0.5).astype(bfloat16)
-    res = (rng.standard_normal((ROWS, COLS)) * 0.5).astype(bfloat16)
-    w = (rng.random((COLS,)) + 0.5).astype(bfloat16)
+    x = (rng.standard_normal((rows, cols)) * 0.5).astype(bfloat16)
+    res = (rng.standard_normal((rows, cols)) * 0.5).astype(bfloat16)
+    w = (rng.random((cols,)) + 0.5).astype(bfloat16)
     expected = addnorm_pre_add_reference(x, res, w)
 
     try:
-        module = build(ROWS, COLS, HERD_X, ROWS_PER_CALL, hoisted, annotate)
+        module = build(rows, cols, herd_x, rows_per_call, hoisted, annotate)
         runner = XRTRunner(verbose=False, omit_while_true_loop=False,
                            output_format="elf", instance_name="addnorm",
                            debug_ir=True)

@@ -22,7 +22,7 @@
 # to match. Resuming H would have re-used a fingerprint baseline captured against the old
 # specification, so the tamper check would have been measuring the wrong thing. A fresh phase costs
 # one arm in this table and buys an honest baseline.
-PL_PHASES_IN_SCOPE='["J1"]'
+PL_PHASES_IN_SCOPE='["H9"]'
 
 phase_name() {
   case "$1" in
@@ -42,6 +42,7 @@ phase_name() {
     H) echo "Compiler hardening: ping-pong safety proof, call classifier, attribute verifier" ;;
     H1s) echo "Compiler hardening: the safety proof declines to TRANSFORM, never to compile" ;;
     J1) echo "Collapse the norm dispatches: lift addnorm's one-trip guard, re-measure coarse" ;;
+    H9) echo "Compiler: fuse packet put loops through scf.parallel, so multi-column multi-trip is correct" ;;
     *) echo "unknown" ;;
   esac
 }
@@ -64,6 +65,7 @@ phase_doc() {
     H) echo "docs/plans/transformer-layer-execution-studies/17-phase-h-compiler-hardening.md" ;;
     H1s) echo "docs/plans/transformer-layer-execution-studies/18-phase-h1s-skip-not-refuse.md" ;;
     J1) echo "docs/plans/transformer-layer-execution-studies/19-phase-j1-collapse-norm-dispatches.md" ;;
+    H9) echo "docs/plans/transformer-layer-execution-studies/20-phase-h9-fuse-through-parallel.md" ;;
     *) echo "" ;;
   esac
 }
@@ -94,7 +96,7 @@ phase_needs_hardware() {
     D1|D2) echo "yes" ;;
     E1|E2|E3|E4|E5) echo "yes" ;;
     H|H1s) echo "yes" ;;
-    J1) echo "yes" ;;
+    J1|H9) echo "yes" ;;
     *) echo "no" ;;
   esac
 }
@@ -428,6 +430,36 @@ outcome deletes the evidence that behaviour changed at all -- three halts in the
 were spent relearning that.
 EOF
 ;;
+    H9) cat <<'EOF'
+flock -x -w 1800 /tmp/mlir-air-npu.lock  agents/scripts/port-loop/gate-h.sh
+
+FIVE LEGS, cheapest first: build + install (the install is not optional -- the examples resolve
+aircc from install-xrt, so a pass you edit and merely BUILD leaves every later leg testing the
+previous compiler); check-air-mlir, whose baseline is 488 passed / 7 UNSUPPORTED / 7 XFAIL / 0
+failures; the transformer-layer suite on hardware; decode throughput against a recorded floor;
+then make verify over the ten shipped models. Budget ~2h. Leg 5 is where the previous compiler
+phase's spec errors surfaced, an hour in, after everything cheaper was green.
+
+The driver then runs FIVE clauses from a fixture it owns
+(agents/scripts/port-loop/fixtures/addnorm_multitrip.py), fingerprinted and in no allowlist. Four
+sit on ONE column and must STAY green -- they pin that the corrected pass still declines what it
+must and still transforms what it may. The fifth is this phase's whole subject:
+
+  multicolumn   herd_x=8, 2 trips, cols=64, unannotated callee.
+                Must compile and be NUMERICALLY EXACT.
+                It is 3747+ of 4096 elements WRONG today. Verified failing before you started.
+
+THAT IS THE POINT OF THE PHASE. A clause that passes on the unchanged compiler proves nothing,
+which is exactly what the other four turned out to be for this defect: they all run at herd_x=1,
+the width the original miscompile happened to be measured at, and four green variants coexisted
+with a live silent miscompile one column wider for an entire phase.
+
+Your gate-file allowlist is EMPTY. mlir/test/**/*.mlir is fingerprinted, so adding a lit test
+halts the run -- if you need one, say so in work_not_completed and the operator widens the
+allowlist deliberately between phases. Do not touch builders/addnorm.py: its guard now sits at the
+measured boundary and widening it is J1's job, after this lands.
+EOF
+;;
     J1) cat <<'EOF'
 flock -x -w 1800 /tmp/mlir-air-npu.lock \
   ninja -C build-xrt check-programming-examples-transformer-layer
@@ -513,7 +545,7 @@ phase_gate_allowlist() {
     # empty-but-for-nothing: H is not expected to touch any .lit, Makefile, CMakeLists,
     # registry JSON or verify module at all. An empty allowlist means every gate-file change is
     # unauthorized, which is the correct posture for a phase whose subject is the compiler.
-    H) echo '' ;;
+    H|H9) echo '' ;;
     # H1s changes the SEVERITY of an existing verdict, and three of the compiler's own lit tests
     # currently assert the old severity with `expected-error`. Those edits are legitimate and
     # foreseen, so they are named here one file at a time -- not by directory. A directory prefix
@@ -541,7 +573,7 @@ phase_gate_cmd() {
     D1|D2) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
     # E1 alone changes shared infrastructure, so E1 alone carries the ten-model leg.
     E1) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-e1.sh" ;;
-    H|H1s) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-h.sh" ;;
+    H|H1s|H9) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-h.sh" ;;
     E2|E3|E4|E5|J1) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
     *) echo "false" ;;
   esac
@@ -1542,7 +1574,7 @@ phase_h_objective_check() {
   fi
 
   local variant
-  for variant in inside hoisted annotated annotated_hoisted; do
+  for variant in inside hoisted annotated annotated_hoisted multicolumn; do
     log_info "objective check: fixture variant '${variant}'"
     if ! ( cd "${PL_ROOT}/programming_examples/transformer_layer" \
            && flock -x -w 1800 /tmp/mlir-air-npu.lock \
@@ -1564,6 +1596,14 @@ phase_h_objective_check() {
           log_error "  and read by every iteration, so it must stay OUT of the rotation set."
           log_error "  Putting it in hands later iterations the wrong half -- silent wrong data,"
           log_error "  which is the whole defect class this proof exists to close." ;;
+        multicolumn)
+          log_error "  This is the WIDTH clause, and the only one that runs on more than one"
+          log_error "  column. air-fuse-packet-put-loops walks only air.LaunchOp's immediate body"
+          log_error "  blocks; at herd_x >= 2 the per-tile put loops are wrapped in an scf.parallel"
+          log_error "  it never visits, so the shim feed-order corruption returns silently from the"
+          log_error "  second trip on. Four green single-column variants coexisted with that for a"
+          log_error "  whole phase, and J1 lost a night to it. If this fails, multi-column"
+          log_error "  multi-trip addnorm is still miscompiling and J1 stays blocked." ;;
       esac
       return 1
     fi
@@ -1589,7 +1629,7 @@ phase_objective_check() {
     E3) phase_e3_objective_check ;;
     E4) phase_e4_objective_check ;;
     E5) phase_e5_objective_check ;;
-    H|H1s) phase_h_objective_check ;;
+    H|H1s|H9) phase_h_objective_check ;;
     J1) phase_j1_objective_check ;;
     *) return 0 ;;
   esac
