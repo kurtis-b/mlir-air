@@ -22,7 +22,7 @@
 # to match. Resuming H would have re-used a fingerprint baseline captured against the old
 # specification, so the tamper check would have been measuring the wrong thing. A fresh phase costs
 # one arm in this table and buys an honest baseline.
-PL_PHASES_IN_SCOPE='["H9"]'
+PL_PHASES_IN_SCOPE='["J7a"]'
 
 phase_name() {
   case "$1" in
@@ -43,6 +43,7 @@ phase_name() {
     H1s) echo "Compiler hardening: the safety proof declines to TRANSFORM, never to compile" ;;
     J1) echo "Collapse the norm dispatches: lift addnorm's one-trip guard, re-measure coarse" ;;
     H9) echo "Compiler: fuse packet put loops through scf.parallel, so multi-column multi-trip is correct" ;;
+    J7a) echo "The norm-tail pipeline: three herds, L1->L1 channels, intermediates off L3" ;;
     *) echo "unknown" ;;
   esac
 }
@@ -66,6 +67,7 @@ phase_doc() {
     H1s) echo "docs/plans/transformer-layer-execution-studies/18-phase-h1s-skip-not-refuse.md" ;;
     J1) echo "docs/plans/transformer-layer-execution-studies/19-phase-j1-collapse-norm-dispatches.md" ;;
     H9) echo "docs/plans/transformer-layer-execution-studies/20-phase-h9-fuse-through-parallel.md" ;;
+    J7a) echo "docs/plans/transformer-layer-execution-studies/21-phase-j7a-norm-tail-pipeline.md" ;;
     *) echo "" ;;
   esac
 }
@@ -96,7 +98,7 @@ phase_needs_hardware() {
     D1|D2) echo "yes" ;;
     E1|E2|E3|E4|E5) echo "yes" ;;
     H|H1s) echo "yes" ;;
-    J1|H9) echo "yes" ;;
+    J1|H9|J7a) echo "yes" ;;
     *) echo "no" ;;
   esac
 }
@@ -460,6 +462,52 @@ allowlist deliberately between phases. Do not touch builders/addnorm.py: its gua
 measured boundary and widening it is J1's job, after this lands.
 EOF
 ;;
+    J7a) cat <<'EOF'
+flock -x -w 1800 /tmp/mlir-air-npu.lock \
+  ninja -C build-xrt check-programming-examples-transformer-layer
+
+The whole transformer-layer suite on hardware. Allowlist ^programming_examples/transformer_layer/.
+
+The driver then runs THREE objective clauses. The first is the contract every operator here meets
+-- full-output np.isclose at registry tolerance, zero mismatches, and the fault-injected twin
+failing. The other two exist because numbers alone cannot see what this phase claims:
+
+  mean_rel_L1 <= 1.688e-2   The decomposed tail this replaces measures 1.806e-2; the block, which
+                            keeps the intermediates resident inside one fused kernel, measures
+                            1.688e-2. A pipeline that is built and correct but still round-trips
+                            its intermediates through L3 passes every numeric and is a pipeline in
+                            name only. This is the phase's actual claim.
+
+  zero packet channels      Structural, read from the lowered IR. A column has two shim MM2S
+                            channels and the budget is PER COLUMN across the segment; a third
+                            L3-facing stream puts every channel on the packet queue. That is
+                            correct at one trip and silently wrong past it -- the defect J1 lost a
+                            night to and H9 spent three review rounds fixing.
+
+THE PACKING IS THE DESIGN, and it is measured, not suggested. Pack x and residual as PLANES --
+L3 [2, rows, cols], one 3-D dma with strides [rows*cols, cols, 1] -> L1 [2, rpc, cols] -- so each
+plane is a contiguous [rpc, cols] tile the existing kernels already accept. The `wide`
+[rows, 2*cols] alternative also collapses to one channel but interleaves x and residual WITHIN
+each row, which no existing kernel reads.
+
+Then the subview into plane 1 produces memref<...xbf16, strided<[cols, 1], offset: rpc*cols>>,
+which will NOT cast to the identity layout a kernel signature normally declares -- H7's
+offset-subview wall, one level down, inside a herd. Declare the STRIDED types on the callee
+instead. Measured: the module then lowers with one input channel, one output channel and zero
+packet-typed channels.
+
+WHAT IS NOT ESTABLISHED, and it is the first thing to run: whether the AIE lowering hands the C
+kernel a base pointer that INCLUDES the subview offset. If it passes plane 0's base for both
+operands, the residual tile silently reads x -- plausible numbers, wrong answer. Test it with
+deliberately ASYMMETRIC x and residual so that failure cannot hide. If the offset is not honoured,
+the fallback is a packed-layout variant of the add kernel taking one [2, rpc, cols] operand; that
+is a small C change, but it is a change -- report it rather than working around it.
+
+Declare NO placement and NO buffer depth. air-place-herds places the three herds (measured: it
+does, at herd_x=8, 24 tiles of NPU2's 32); ping-pong labelling chooses depth. If you find yourself
+writing a tile coordinate, stop -- deriving them is the whole point of the phase.
+EOF
+;;
     J1) cat <<'EOF'
 flock -x -w 1800 /tmp/mlir-air-npu.lock \
   ninja -C build-xrt check-programming-examples-transformer-layer
@@ -541,6 +589,9 @@ phase_gate_allowlist() {
     # touch mlir/ -- if the collapse exposes a compiler defect that is a finding, not this
     # phase's to fix -- and mlir/test/**/*.mlir is now fingerprinted, so an attempt would halt.
     J1) echo '^programming_examples/transformer_layer/' ;;
+    # J7a adds a builder, an opcheck arm and a lit test, all inside the example. It does NOT
+    # touch mlir/ -- the packing route exists precisely so it needs no compiler change.
+    J7a) echo '^programming_examples/transformer_layer/' ;;
     # H changes mlir/ -- the compiler. NONE of that is a gate file, so the allowlist stays
     # empty-but-for-nothing: H is not expected to touch any .lit, Makefile, CMakeLists,
     # registry JSON or verify module at all. An empty allowlist means every gate-file change is
@@ -574,7 +625,7 @@ phase_gate_cmd() {
     # E1 alone changes shared infrastructure, so E1 alone carries the ten-model leg.
     E1) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-e1.sh" ;;
     H|H1s|H9) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-h.sh" ;;
-    E2|E3|E4|E5|J1) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
+    E2|E3|E4|E5|J1|J7a) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
     *) echo "false" ;;
   esac
 }
@@ -1483,6 +1534,131 @@ phase_e1_objective_check() {
 
 phase_e2_objective_check() { phase_e_mode_objective_check coarse; }
 
+# --- Phase J7a ------------------------------------------------------------------------------------
+#
+# The pipelined norm tail replaces `fused`'s decomposed one, which stages bf16 through L3 between
+# elementwise_add, layer_norm and elementwise_mul. Two things could go wrong that the standard
+# operator contract cannot see, and each gets its own clause:
+#
+#   1. The pipeline could be built and be correct while the intermediates still round-trip through
+#      L3 -- i.e. three launches wearing a pipeline's name. mean_rel_L1 is what separates them: the
+#      decomposed tail measures 1.806e-2 and the block (which keeps them resident inside one fused
+#      kernel) measures 1.688e-2. If the pipelined form does not reach the block's figure, the
+#      intermediates are not staying in L1 and the phase has not done its job -- even though every
+#      numeric passes.
+#
+#   2. The design could drift back onto the packet path. A column has two shim MM2S channels and
+#      the budget is per column across the segment; a third L3-facing stream puts every channel on
+#      the packet queue, which is where the H9 defect lived. That is invisible at one trip and
+#      silently wrong past it -- exactly how J1 lost a night. The structural clause reads the
+#      lowered IR and requires zero packet-typed channels, so a later edit cannot re-enter it
+#      quietly.
+#
+# Clause 2 is deliberately structural rather than numerical. Numbers cannot see it: at the trip
+# counts a quick check would use, the packet path is still correct.
+
+PL_J7A_MEAN_REL_L1_MAX="${PL_J7A_MEAN_REL_L1_MAX:-1.688e-2}"
+
+phase_j7a_objective_check() {
+  # The shared contract: full-output np.isclose at registry tolerance, zero mismatches, and the
+  # fault-injected twin failing. Same bar as every operator in this example.
+  phase_c_operator_check norm_tail || return 1
+
+  # Clause 1 -- the precision claim, which is the point of the phase.
+  PL_J7A_RESULTS="${PL_ROOT}/programming_examples/transformer_layer/results" \
+  PL_J7A_STAMP="${_GATE_STARTED_AT}" \
+  PL_J7A_MAX="${PL_J7A_MEAN_REL_L1_MAX}" \
+  python3 -c '
+import json, os, pathlib, sys
+
+results = pathlib.Path(os.environ["PL_J7A_RESULTS"])
+cutoff = os.path.getmtime(os.environ["PL_J7A_STAMP"])
+want = float(os.environ["PL_J7A_MAX"])
+
+fresh = [f for f in sorted(results.glob("norm_tail__*.json"))
+         if f.stat().st_mtime >= cutoff]
+if not fresh:
+    print("objective check: no fresh results/norm_tail__*.json", file=sys.stderr)
+    sys.exit(1)
+
+# The clean run, not the fault-injected twin.
+clean = []
+for f in fresh:
+    d = json.loads(f.read_text())
+    if d.get("fault_injected") is None:
+        clean.append((f.name, d))
+if not clean:
+    print("objective check: only fault-injected norm_tail artifacts are fresh", file=sys.stderr)
+    sys.exit(1)
+
+worst = max(clean, key=lambda kv: kv[1].get("mean_rel_L1", 1.0))
+name, d = worst
+got = d.get("mean_rel_L1")
+if got is None:
+    print(f"objective check: {name} carries no mean_rel_L1", file=sys.stderr)
+    sys.exit(1)
+if got > want:
+    print(f"objective check FAILED: {name} mean_rel_L1 {got:.3e} exceeds {want:.3e}.",
+          file=sys.stderr)
+    print("  The decomposed tail this replaces measures 1.806e-2 and the block, which keeps the",
+          file=sys.stderr)
+    print("  intermediates resident, measures 1.688e-2. Not reaching the block figure means the",
+          file=sys.stderr)
+    print("  intermediates are still round-tripping through L3 -- a pipeline in name only.",
+          file=sys.stderr)
+    sys.exit(1)
+print(f"  {name}: mean_rel_L1 {got:.3e} <= {want:.3e} (decomposed tail is 1.806e-2)")
+' || return 1
+
+  # Clause 2 -- structural. Lower the builder's own module and require no packet-typed channel.
+  # Driver-owned: it imports the builder but asserts on the COMPILER's output, so a session cannot
+  # satisfy it by changing what the check reads.
+  PL_J7A_EXAMPLE="${PL_ROOT}/programming_examples/transformer_layer" \
+  python3 -c '
+import os, subprocess, sys, tempfile
+sys.path.insert(0, os.environ["PL_J7A_EXAMPLE"])
+sys.path.insert(0, os.path.join(os.path.dirname(os.environ["PL_J7A_EXAMPLE"]), "llms"))
+try:
+    from builders.norm_tail import build_norm_tail_module
+except Exception as e:
+    print(f"objective check: cannot import builders.norm_tail: {e}", file=sys.stderr)
+    sys.exit(1)
+
+work = tempfile.mkdtemp(prefix="pl-j7a-struct-")
+os.chdir(work)
+mod = build_norm_tail_module(4096, 768, herd_x=8)
+src = os.path.join(work, "in.mlir")
+open(src, "w").write(str(mod))
+pipeline = ("air-dependency,air-dma-to-channel,canonicalize,cse,"
+            "air-dependency-canonicalize,canonicalize,cse")
+out = os.path.join(work, "out.mlir")
+r = subprocess.run(["air-opt", src, f"--pass-pipeline=builtin.module({pipeline})", "-o", out],
+                   capture_output=True, text=True)
+if r.returncode != 0:
+    print("objective check: lowering the norm tail failed:\n" + r.stderr[:600], file=sys.stderr)
+    sys.exit(1)
+n = open(out).read().count("\"npu_dma_packet\"")
+if n:
+    print(f"objective check FAILED: {n} packet-typed channel(s) in the lowered norm tail.",
+          file=sys.stderr)
+    print("  A column has two shim MM2S channels and the budget is per column across the segment;",
+          file=sys.stderr)
+    print("  a third L3-facing stream puts the design on the packet queue. That is correct at one",
+          file=sys.stderr)
+    print("  trip and silently wrong past it -- the defect J1 lost a night to. Pack co-indexed L3",
+          file=sys.stderr)
+    print("  operands into one strided fetch, or move a stream onto an L1->L1 channel.",
+          file=sys.stderr)
+    sys.exit(1)
+print("  lowered norm tail: 0 packet-typed channels -- stays off the shim packet queue")
+' || return 1
+
+  log_info "objective check passed: the pipelined tail is exact, beats the decomposed tail's"
+  log_info "  precision, and stays off the packet path"
+  return 0
+}
+
+
 # --- Phase J1 ------------------------------------------------------------------------------------
 #
 # Same coarse artifact E2 checked -- full-layer scope, zero mismatches at every boundary, and the
@@ -1631,6 +1807,7 @@ phase_objective_check() {
     E5) phase_e5_objective_check ;;
     H|H1s|H9) phase_h_objective_check ;;
     J1) phase_j1_objective_check ;;
+    J7a) phase_j7a_objective_check ;;
     *) return 0 ;;
   esac
 }
