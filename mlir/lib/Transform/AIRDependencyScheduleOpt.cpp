@@ -4879,13 +4879,16 @@ public:
   //     air-dependency-canonicalize prunes the terminal joins) needs no
   //     replacement. A live one is replaced with an air.wait_all joining
   //     everything the reduction combined -- the init values plus each
-  //     iteration's reduce operand -- inserted immediately before the
-  //     result's earliest user, so the join lands after any later wrapper's
+  //     iteration's reduce operand -- but only after verifying the reduce
+  //     combiner is the wait_all join air-dma-to-channel emits, so the
+  //     replacement is equivalent rather than stronger; any other combiner
+  //     declines the wrapper. The join is inserted immediately before the
+  //     result's earliest user, so it lands after any later wrapper's
   //     clones and runOnBlock's dominance check still admits groups spanning
-  //     the wrappers. Declining live results instead would make this fix
-  //     conditional on a cleanup pass having run: a token that survived
-  //     pruning would silently bring back the very feed-order miscompile
-  //     the pass exists to prevent;
+  //     the wrappers. Declining live results outright instead would make
+  //     this fix conditional on a cleanup pass having run: a token that
+  //     survived pruning would silently bring back the very feed-order
+  //     miscompile the pass exists to prevent;
   //   - every body op is a candidate put loop, an air.wait_all (the token
   //     plumbing the wrapper carries), or region-free and memory-effect-free
   //     (index arithmetic); at least one candidate. Anything else -- a bare
@@ -4931,9 +4934,10 @@ public:
     }
     if (!hasCandidate)
       return false;
-    // A live result is rebuilt from what the reduction combined: its
-    // combiner joins async tokens (createSCFReduceForAsyncSCFParallel), so
-    // the result is an air.wait_all over the init values and every
+    // A live result is rebuilt from what the reduction combined: once the
+    // combiner is verified below to be the wait_all join emitted by
+    // createSCFReduceForAsyncSCFParallel, the result is an air.wait_all
+    // over the init values and every
     // iteration's reduce operand. The join is a user of every member's
     // result, so WHERE it lands decides whether runOnBlock can still fuse
     // groups spanning LATER wrappers: at this parallel's position it would
@@ -4949,6 +4953,31 @@ public:
     if (resultLive) {
       auto reduce = dyn_cast<scf::ReduceOp>(body->getTerminator());
       if (!reduce || reduce.getNumOperands() != 1)
+        return false;
+      // The rebuilt join is only equivalent if the combiner really is the
+      // wait_all join createSCFReduceForAsyncSCFParallel emits: an
+      // air.wait_all over exactly the two block arguments, returned
+      // directly. Under that combiner the fold over init values and
+      // iteration operands is a plain join of all of them, independent of
+      // reduction order. Any other combiner -- one that drops an argument,
+      // returns a ready token, or computes anything else -- makes the
+      // rebuilt token stronger than the original result, which can deadlock
+      // a consumer that the puts need to complete; decline such wrappers.
+      Block &combiner = reduce.getRegion(0).front();
+      if (combiner.getNumArguments() != 2)
+        return false;
+      auto combJoin = dyn_cast<air::WaitAllOp>(&combiner.front());
+      auto combRet = dyn_cast<scf::ReduceReturnOp>(combiner.getTerminator());
+      if (!combJoin || !combRet || combJoin->getNextNode() != combRet ||
+          combJoin->getNumResults() != 1 ||
+          combRet->getOperand(0) != combJoin.getAsyncToken() ||
+          combJoin->getNumOperands() != 2)
+        return false;
+      Value combA = combiner.getArgument(0), combB = combiner.getArgument(1);
+      if (!((combJoin->getOperand(0) == combA &&
+             combJoin->getOperand(1) == combB) ||
+            (combJoin->getOperand(0) == combB &&
+             combJoin->getOperand(1) == combA)))
         return false;
       redVal = reduce.getOperand(0);
       for (Operation *user : par.getResult(0).getUsers()) {
