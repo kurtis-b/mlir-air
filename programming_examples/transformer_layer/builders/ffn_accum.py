@@ -197,6 +197,18 @@ MICRO = 8
 # count from it. 64 is the shape every encoder.cc port was validated at.
 TILE_M = 64
 
+# The production geometry: herd_x column-parallel cores, K advanced tile_k per
+# call. Set by measured walls, not a performance sweep -- aie-place-tiles
+# refuses the accumulator pair's shim slots past 4 columns, and tile_k 64 puts
+# the worst-case L1 just over the 64 KiB tile (see build_ffn_accum_module's
+# docstring) -- which is why these live here and not in kernel_registry: the
+# registry records swept best-measured tile configs and raises on unmeasured
+# shapes, and no such sweep exists for this wall-bounded design. Import these
+# rather than hand-copying the numbers; opcheck_prepare and
+# ffn_accum_structure both do.
+FFN_ACCUM_HERD_X = 4
+FFN_ACCUM_TILE_K = 32
+
 # One feed sub-channel per core, each a memtile MM2S port; a memtile has 6.
 MAX_FEED_CHANNELS = 6
 
@@ -218,7 +230,7 @@ FFN_ACCUM_KERNEL_OBJ = "ffn_accum_mm.o"
 CHANNEL_FEED = "ffn_accum_feed"
 
 
-def compile_ffn_accum_kernel(tile_k=32, tile_n=128):
+def compile_ffn_accum_kernel(tile_k=FFN_ACCUM_TILE_K, tile_n=128):
     """Build ffn_accum_mm.o (encoder.cc's FFN half at THIS builder's tiles)
     into the CWD, where aiecc's link_with looks."""
     import shared.infra.external_kernels as ek
@@ -233,7 +245,7 @@ def compile_ffn_accum_kernel(tile_k=32, tile_n=128):
     )
 
 
-def ffn_accum_pack_a(a, tile_k=32):
+def ffn_accum_pack_a(a, tile_k=FFN_ACCUM_TILE_K):
     """Pre-tile ``a``: flat, (m-tile, K-step)-major, blocked microtiles.
 
     Element ``a[m, k]`` lands in block ``(m // TILE_M, k // tile_k)``; within
@@ -256,7 +268,7 @@ def ffn_accum_pack_a(a, tile_k=32):
     )
 
 
-def ffn_accum_pack_w(w, herd_x=4, tile_k=32):
+def ffn_accum_pack_w(w, herd_x=FFN_ACCUM_HERD_X, tile_k=FFN_ACCUM_TILE_K):
     """Pre-tile ``w``: flat, (K-step, n-tile)-major, blocked microtiles.
 
     Element ``w[k, n]`` lands in block ``(k // tile_k, n // tile_n)`` with
@@ -281,7 +293,7 @@ def ffn_accum_pack_w(w, herd_x=4, tile_k=32):
     )
 
 
-def ffn_accum_device_inputs(a, w, herd_x=4, tile_k=32):
+def ffn_accum_device_inputs(a, w, herd_x=FFN_ACCUM_HERD_X, tile_k=FFN_ACCUM_TILE_K):
     """Every argument the host fills, in signature order (``y`` excluded).
 
     The packing parameters MUST match the ``build_ffn_accum_module`` call;
@@ -326,7 +338,12 @@ def _floordiv_map(divisor):
 
 @module_builder
 def build_ffn_accum_module(
-    seq_len=64, ffn_dim=3072, emb_dim=768, np_dtype=bfloat16, herd_x=4, tile_k=32
+    seq_len=64,
+    ffn_dim=3072,
+    emb_dim=768,
+    np_dtype=bfloat16,
+    herd_x=FFN_ACCUM_HERD_X,
+    tile_k=FFN_ACCUM_TILE_K,
 ):
     """Build the down-projection accumulator module.
 

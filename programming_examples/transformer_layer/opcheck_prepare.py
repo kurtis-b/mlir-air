@@ -102,6 +102,8 @@ from builders.elementwise_add import (  # noqa: E402
     elementwise_add_reference,
 )
 from builders.ffn_accum import (  # noqa: E402
+    FFN_ACCUM_HERD_X,
+    FFN_ACCUM_TILE_K,
     build_ffn_accum_module,
     compile_ffn_accum_kernel,
     ffn_accum_device_inputs,
@@ -513,13 +515,15 @@ def prepare_ffn_accum(shape, seed=11):
     """
     seq_len, ffn_dim = shape["seq_len"], shape["ffn_dim"]
     emb_dim = shape["emb_dim"]
-    # ONE source of truth for the tile geometry. The kernel object bakes
-    # DIM_M/DIM_K/DIM_N in as -D flags, so compiling it at a different tile_n
-    # from the one the module declares links the wrong microkernel and produces
-    # garbage that no import error announces -- compile_ffn_accum_kernel()'s
-    # tile_n default (128) is NOT emb_dim // herd_x for every shape, and is not
-    # for this one (192).
-    herd_x, tile_k = 4, 32
+    # ONE source of truth for the tile geometry: the builder's own constants
+    # (set by measured walls, not a registry sweep -- their definition in
+    # builders/ffn_accum.py records why kernel_registry is not the source
+    # here). The kernel object bakes DIM_M/DIM_K/DIM_N in as -D flags, so
+    # compiling it at a different tile_n from the one the module declares
+    # links the wrong microkernel and produces garbage that no import error
+    # announces -- compile_ffn_accum_kernel()'s tile_n default (128) is NOT
+    # emb_dim // herd_x for every shape, and is not for this one (192).
+    herd_x, tile_k = FFN_ACCUM_HERD_X, FFN_ACCUM_TILE_K
     tile_n = emb_dim // herd_x
     compile_ffn_accum_kernel(tile_k=tile_k, tile_n=tile_n)
     rng = np.random.default_rng(seed)

@@ -358,10 +358,14 @@ check-ffn-accum-fault:
 	    python3 $(srcdir)/opcheck.py --operator ffn_accum \
 	        --fault-inject input --expect-failure
 
-# The ring's structural check, host-only: the K loop's data movement must drop
-# 4 -> 2 under the hoist pass (the C pair leaves; A and B stay) and the
-# channel-lowered module must carry ZERO npu_dma_packet. The numerical check
-# cannot see either; this is where the phase's actual claim lives. No NPU.
+# The ring's structural check, host-only: compiles through the real aircc
+# (--debug-ir) and reads its per-pass dumps. The K loop's data movement must
+# drop 4 -> 2 across air-hoist-dma-in-accum-pattern (the C pair leaves; A and
+# B stay), the in-place accumulating kernel must be dispatched inside that
+# loop, the hoisted pair must survive to the AIR pipeline's last dump, and
+# every dump must carry ZERO npu_dma_packet. The numerical check cannot see
+# any of this; this is where the phase's actual claim lives. No NPU (the
+# compile stops at the core-ELF link, deliberately).
 check-ffn-accum-structure:
 	python3 $(srcdir)/ffn_accum_structure.py
 

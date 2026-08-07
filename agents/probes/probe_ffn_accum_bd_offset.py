@@ -44,6 +44,7 @@ WHAT IT IS FOR
 
 NOT a test. Nothing runs it in CI.
 """
+
 import argparse, glob, os, re, sys, tempfile
 
 _PE = "/home/cj/mlir-air/programming_examples"
@@ -78,22 +79,32 @@ def main():
     args = ap.parse_args()
 
     tile_n = args.emb // args.herd_x
-    print(f"seq={args.seq} emb={args.emb} herd_x={args.herd_x} "
-          f"tile_n={tile_n} tile_k={args.tile_k}"
-          + (f"  omit_pingpong={args.omit_pingpong}" if args.omit_pingpong else ""))
-    print("A feed block = TILE_M*tile_k = 64*%d = %d elements\n"
-          % (args.tile_k, 64 * args.tile_k))
+    print(
+        f"seq={args.seq} emb={args.emb} herd_x={args.herd_x} "
+        f"tile_n={tile_n} tile_k={args.tile_k}"
+        + (f"  omit_pingpong={args.omit_pingpong}" if args.omit_pingpong else "")
+    )
+    print(
+        "A feed block = TILE_M*tile_k = 64*%d = %d elements\n"
+        % (args.tile_k, 64 * args.tile_k)
+    )
 
     for ksteps in args.ksteps:
         ffn_dim = ksteps * args.tile_k
         work = tempfile.mkdtemp(prefix=f"bdoff-k{ksteps}-")
         os.chdir(work)
         compile_ffn_accum_kernel(tile_k=args.tile_k, tile_n=tile_n)
-        mod = build_ffn_accum_module(args.seq, ffn_dim, args.emb,
-                                     herd_x=args.herd_x, tile_k=args.tile_k)
-        be = XRTBackend(verbose=False, omit_while_true_loop=False,
-                        output_format="xclbin", instance_name="bdoff",
-                        debug_ir=True, omit_pingpong=args.omit_pingpong)
+        mod = build_ffn_accum_module(
+            args.seq, ffn_dim, args.emb, herd_x=args.herd_x, tile_k=args.tile_k
+        )
+        be = XRTBackend(
+            verbose=False,
+            omit_while_true_loop=False,
+            output_format="xclbin",
+            instance_name="bdoff",
+            debug_ir=True,
+            omit_pingpong=args.omit_pingpong,
+        )
         try:
             be.compile(mod)
         except Exception as e:
@@ -106,11 +117,15 @@ def main():
         offs = memtile_bd_offsets(work)
         print(f"ksteps={ksteps:3d} (ffn_dim={ffn_dim:5d})  memtile BD offsets: {offs}")
         if offs and len(set(offs)) == 1 and offs[0] == 0:
-            print("            all zero -- correct for the CURRENT builder: both "
-                  "operands advance on the L3 side")
+            print(
+                "            all zero -- correct for the CURRENT builder: both "
+                "operands advance on the L3 side"
+            )
         else:
-            print("            offsets vary -- some BD is being read at a moving "
-                  "offset; check it walks for EVERY trip, not just the unrolled ones")
+            print(
+                "            offsets vary -- some BD is being read at a moving "
+                "offset; check it walks for EVERY trip, not just the unrolled ones"
+            )
         print()
 
 
