@@ -219,7 +219,21 @@ A completed results root is ~2.4 GB.
 3. Port the ~19k-line infrastructure tier, applying the convention rules.
 4. Retarget the five device-touching modules.
 5. Wire the pytest suite into CMake/lit.
-6. Pin the missing dependencies; document the ROCm wheel conflict.
+6. ~~Pin the missing dependencies; document the ROCm wheel conflict.~~ **Pinned `[2026-08-07]`**
+   in `study/requirements.txt`, scoped to this tier rather than pushed into
+   `utils/requirements.txt` — a core dependency only one example tier uses is a cost paid by
+   everyone who builds the project. Measured in this sandbox: `numpy` 2.5.1, `torch` 2.12.0+cpu,
+   `ml_dtypes`, `psutil`, `pyxrt`, `filelock` are **present**; **`matplotlib`, `pandas`, `seaborn`
+   and `pytest` are all absent**, so the plotting and analysis half of the port cannot run until
+   they land. The schema, adapter and artifact modules deliberately need none of them.
+
+   The install hazard is stated there and is worth repeating: this torch is a `+cpu` build and
+   numpy is recent, so a careless `pip install` that resolves a new numpy or a differently-built
+   torch moves the floor out from under the ten shipped deployments — and `make verify` over those
+   ten *is* a gate leg. Install between driver phases, never while a gate runs. **`pytest` is
+   listed for discovery convenience only and must not become a hard dependency**: the tests here
+   are plain `test_*` functions with a `main()` runner (convention 11), so they run under bare
+   `python3` and pytest finds them anyway.
 7. Update `.gitignore`.
 8. Write the iron-results adapter.
 

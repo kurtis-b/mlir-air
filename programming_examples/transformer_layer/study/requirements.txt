@@ -1,0 +1,36 @@
+# Phase F study tier — dependencies beyond mlir-air's own utils/requirements.txt.
+#
+# Doc 01: matplotlib, seaborn and pandas are used by ~40 modules of iron's study
+# tier and are declared in NO iron requirements file. Declared here instead of in
+# utils/requirements.txt because they are needed by this study's analysis and
+# plotting, not by mlir-air's runtime — a core dependency that only one example
+# tier uses is a cost paid by everyone who builds the project.
+#
+# MEASURED 2026-08-07 in this sandbox (python3.12):
+#
+#     present   numpy 2.5.1, torch 2.12.0+cpu, ml_dtypes 0.5.4,
+#               psutil 7.2.2, pyxrt, filelock 3.13.1
+#     MISSING   matplotlib, pandas, seaborn, pytest
+#
+# So the plotting and analysis half of the port cannot run until these land. The
+# schema, adapter and artifact modules deliberately need none of them.
+#
+# INSTALL HAZARD, and it is not hypothetical: this sandbox's torch is a +cpu
+# build and numpy is 2.5.1, which is recent. A careless `pip install` that
+# resolves a new numpy or pulls a differently-built torch moves the floor out
+# from under the ten shipped LLM deployments — and `make verify` over those ten
+# is a gate leg (gate-e1.sh leg 2, gate-h.sh leg 5). Install with
+# `--no-deps` where possible, re-run `make verify` on one model afterwards, and
+# do it BETWEEN driver phases, never while a gate is running.
+#
+# pytest is listed for discovery convenience only. Nothing in this tier requires
+# it: the tests are plain `test_*` functions with a `main()` runner, matching
+# pattern/test_reference.py, so they run under bare python3 and pytest finds them
+# too (porting convention 11). Do not make it a hard dependency.
+
+matplotlib>=3.8
+pandas>=2.2
+seaborn>=0.13
+
+# optional, for discovery only — see above
+pytest>=8.0
