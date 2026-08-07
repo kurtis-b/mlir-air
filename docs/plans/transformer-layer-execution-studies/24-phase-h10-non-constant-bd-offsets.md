@@ -90,19 +90,13 @@ Measured on J7b's pre-fix builder at 4 K steps (`agents/probes/probe_ffn_accum_b
 > well, where a moving offset is legitimate. Scope the refusal to the `TileDMAAllocator`
 > instantiation.
 >
-> **That is a real correction, but it is NOT why the three existing lit tests fail.** Measured:
-> `async_gemm_to_locks_aie2.mlir` and the two `async_gemm_w_pingpong_*` contain **four L2
-> (`memref<64x64xi32, 1>`) channel ops whose offsets are `scf.for` induction variables, in the
-> input as written** — before any pass runs. They encode the losing construction on the tile side,
-> so the refusal fires on them **correctly**.
+> **That is a real correction, but it is NOT why the three existing lit tests fail.** They do
+> contain four L2 (`memref<64x64xi32, 1>`) channel ops whose offsets are `scf.for` induction
+> variables — but at **2 trips**, where the loop unrolls and the pre-phase compiler lowers them to
+> correct distinct offsets (0, 32, 2048, 2080). They are correct programs; the refusal is
+> premature. See §DECIDED below, which is the operative instruction.
 >
-> Which makes them category (a) from the allowlist note: *designs relying on the undefined
-> behaviour, a finding to report rather than tests to edit*. Their CHECK lines assert AIE
-> structure — tiles, locks, flows — and never a `dma_bd` offset, so a frozen offset was invisible
-> to them. **They have been passing over a construction whose BD offsets are silently zero.**
-> Deciding what those tests should assert instead is the human call the allowlist exists to force.
->
-> Two wrong diagnoses to not repeat, both corrected by measurement:
+> Three wrong diagnoses to not repeat, all corrected by measurement:
 > - The implement session reported that the tests skip `-air-specialize-channel-wrap-and-stride`,
 >   which "the production aircc pipeline runs". **That pass is not in aircc's pipeline at all** —
 >   it is `air-dependency, air-hoist-dma-in-accum-pattern, [broadcast], air-dma-to-channel, …,
@@ -112,6 +106,11 @@ Measured on J7b's pre-fix builder at 4 K steps (`agents/probes/probe_ffn_accum_b
 >   came from grepping for `memref<…, 1 : i32>`; these tests use the short form
 >   `memref<…, 1>`, so the L2 operands did not match. A false negative from a pattern, not from
 >   the IR.
+> - Then this document and review round 1 both concluded the opposite — that the tests encode the
+>   losing construction and had been miscompiling. Also wrong: **running the pre-phase compiler on
+>   them shows correct, distinct BD offsets.** The lesson each time was the same one, and it is
+>   cheap: run the old compiler on the failing input and look at what it actually emits, before
+>   deciding whether a refusal is right.
 
 `get1DOffset`'s callers sit inside `generateDmaBd`, reached from **both** the tile-side and the
 shim-side BD programs (see the correction above). L3-side transfers are programmed by the runtime
@@ -153,6 +152,42 @@ mlir-aie already solved one layer down with `dynamic-objFifos`: a per-core count
 `scf.index_switch`).
 
 **Scope this phase to refusing well.** The dynamic-index lowering is H5 and is much larger.
+
+## `[2026-08-07]` DECIDED: the refusal is in the wrong PLACE, and that is the whole fix
+
+The three `check-air-mlir` failures are **not** designs relying on the UB, and the tests must not
+be reworked. Measured against the pre-phase compiler, the very op H10 refuses —
+
+```
+air.channel.put ... (%results_19[%results_28, %arg16] [%c32,%c32] [%c64,%c1]) : (memref<64x64xi32, 1>)
+                                              ^^^^^^ IV of  scf.for %arg16 = 0 to 64 step 32   (2 trips)
+```
+
+— lowers today to BDs at offsets **0, 32, 2048, 2080**: the correct 2×2 tiling of a 64×64 L2
+buffer (32·64 = 2048). It does **not** freeze. That is the same boundary J7b measured from the
+other side: **at 2 trips the loop unrolls and every offset resolves to its own literal; at 4+ it
+does not unroll and the chain repeats a stale offset.**
+
+So an IV-dependent offset is not by itself unlowerable. It is unlowerable exactly when the loop
+carrying it **does not unroll**, because only then does one static `aie.dma_bd` have to stand for
+several different offsets.
+
+**Refuse where the freeze happens — when the BD chain is emitted for a loop that did not unroll —
+not on the `air.channel` op up front.** Rejecting every IV-dependent offset at the channel op, as
+the current implementation does, rejects programs the compiler already lowers correctly, which is
+why three green tests went red.
+
+Two things explicitly ruled out, so no later round re-litigates them:
+
+- **Do NOT rework the three `async_gemm*` tests.** They are correct; the old compiler gives them
+  correct distinct offsets. Editing them would be changing right tests to accommodate a wrong
+  refusal.
+- **Do NOT implement IV-walk specialization into BD wrap/stride dimensions.** It is a real and
+  attractive capability — it would let J7b stage A whole in L2 — but it is much larger, overlaps
+  H5, and is not needed here: these tests already lower correctly.
+
+The objective check is unchanged and still the arbiter. Clause 1 (an unresolvable tile-side offset
+is refused) must hold at a trip count that does not unroll; clauses 2 and 3 must stay green.
 
 ## What to build
 
