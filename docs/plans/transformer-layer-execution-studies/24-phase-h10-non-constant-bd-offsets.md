@@ -82,13 +82,20 @@ Measured on J7b's pre-fix builder at 4 K steps (`agents/probes/probe_ffn_accum_b
 > too, and `generateDmaBdProgram` is instantiated **twice**:
 >
 > ```
-> generateDmaBdProgram<air::TileDMAAllocator, AIE::BufferOp,         AIE::MemOp>      // core/memtile
-> generateDmaBdProgram<air::ShimDMAAllocator, AIE::ExternalBufferOp, AIE::ShimDMAOp>  // SHIM
+> 7512  generateDmaBdProgram<air::TileDMAAllocator,    AIE::BufferOp,         AIE::MemOp>         // core tile
+> 7616  generateDmaBdProgram<air::ShimDMAAllocator,    AIE::ExternalBufferOp, AIE::ShimDMAOp>     // SHIM
+> 7664  generateDmaBdProgram<air::MemTileDMAAllocator, AIE::BufferOp,         AIE::MemTileDMAOp>  // MEMTILE
 > ```
 >
-> Both reach `generateDmaBd` → `get1DOffset`, so a refusal placed there fires on **shim** BDs as
-> well, where a moving offset is legitimate. Scope the refusal to the `TileDMAAllocator`
-> instantiation.
+> All three reach `generateDmaBd` → `get1DOffset`, so a refusal placed there fires on **shim** BDs
+> too, where a moving offset is legitimate.
+>
+> **Cover BOTH tile-side allocators — `TileDMAAllocator` AND `MemTileDMAAllocator` — and exclude
+> only `ShimDMAAllocator`.** An earlier revision of this document said "scope it to
+> `TileDMAAllocator`", naming two instantiations because it was read from a truncated grep. That
+> instruction is **wrong and dangerous**: J7b's frozen chain was an `aie.memtile_dma`, so
+> exempting the memtile path would restore the exact miscompile this phase exists to remove.
+> Caught by review round 3.
 >
 > **That is a real correction, but it is NOT why the three existing lit tests fail.** They do
 > contain four L2 (`memref<64x64xi32, 1>`) channel ops whose offsets are `scf.for` induction
@@ -269,10 +276,10 @@ Everything above is measured except one thing, and it is the first thing to chec
 3. The BD offset comes out frozen and the design hangs — **measured on hardware.** ✅
 4. ~~The refusal fires only on tile-side BDs, so an IV-dependent **L3** offset is untouched —
    read from the caller and confirmed against the IR.~~ **FALSE, corrected `[2026-08-07]`.** This
-   was inferred from the caller's `AIE::TileLike` parameter without checking its instantiations;
-   `generateDmaBdProgram` is instantiated for `ShimDMAAllocator` as well, so a refusal in
-   `generateDmaBd` reaches shim BDs. **Scope it to the `TileDMAAllocator` instantiation.** The IR
-   table above is still correct — it is the *conclusion drawn from it* that was wrong. ❌
+   was inferred from the caller's `AIE::TileLike` parameter without checking its instantiations.
+   There are **three**: `TileDMAAllocator` (core), `MemTileDMAAllocator` (memtile) and
+   `ShimDMAAllocator` (shim). **Refuse on the first two; exempt only the third.** The IR table
+   above is still correct — it is the *conclusion drawn from it* that was wrong. ❌
 5. **That no shipped model relies on the losing construction — NOT established by a build.** A
    static survey of every non-literal channel offset in `programming_examples/` found none on an
    L2/L1 operand, so the expectation is that nothing breaks; leg 5 is what actually answers it. If
