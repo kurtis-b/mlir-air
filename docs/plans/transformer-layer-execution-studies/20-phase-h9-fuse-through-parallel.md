@@ -47,6 +47,27 @@ miscompile one column wider for an entire phase. The fixture now has a fifth, `m
 
 ## What to do
 
+> ### `[2026-08-07]` DONE, and this section's framing was wrong
+>
+> It said "the mechanical part is choosing which blocks to walk", with `runOnBlock` reusable per
+> nested block. **Measured false.** `air-dma-to-channel` emits **one `scf.parallel` wrapper per
+> hoisted put loop**, not one wrapper containing them all — so every nested block holds a single
+> loop and walking them fuses nothing. The groups that matter *span* the wrappers.
+>
+> What landed instead: **sequentialize** each eligible wrapper into per-iteration clones in
+> ascending order — the order `airrt-to-npu` unrolls launch-scope parallels anyway — and then run
+> the existing single-block grouping over the result. Upstream placement was rejected with a
+> recorded reason: the put loops only reach their final shape after the last
+> `air-isolate-async-dma-loop-nests`, which would re-split a fused loop.
+>
+> Eligibility is narrower than first implemented, after three review rounds each finding a real
+> defect: **the `scf.reduce` combiner must be exactly the wait-all join `air-dma-to-channel`
+> emits, verified whether or not the result has users** — it executes once per iteration either
+> way and the expansion deletes it, so a combiner with memory effects (e.g. `memref.atomic_rmw`)
+> must decline the wrapper. Live result tokens are expanded rather than declined, because
+> declining them would leave the miscompile in place for any launch whose per-channel parallels
+> feed a later async op.
+
 Make the pass see put-loop groups nested inside region-holding ops within the launch — at minimum
 `scf.parallel`, which is what `air-dma-to-channel` actually emits. `runOnBlock`'s grouping, its
 `touchesPacketStream` sealing and its dominance checks are written against a single block and

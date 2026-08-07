@@ -8,6 +8,29 @@ iron's `hybrid` total of 5.
 Lift the guard, re-measure `coarse`, and replace the one distinguishability clause that lifting it
 makes vacuous.
 
+> ### `[2026-08-07]` This phase ran, did not collapse anything, and found two walls
+>
+> **Wall 1 — the packet fix only ever worked on one column.** Multi-column multi-trip `addnorm`
+> silently miscompiled: 4070/4096 wrong at `herd_x=8`, 2 trips; 3,130,958/3,145,728 at this
+> document's own 64-trip target. The fixture that "proved" it safe ran at `herd_x=1`, the only
+> width it ever ran. **Fixed by H9** ([20](20-phase-h9-fuse-through-parallel.md)), and the fixture
+> now carries a `multicolumn` clause that went from 3747+/4096 wrong to exact.
+>
+> **Wall 2 — shim BD exhaustion, and it still blocks this phase.** With H9 landed, `herd_x=8`
+> multi-trip now refuses to compile at **six trips**: column 0 carries weight + x + residual, three
+> packet tasks per trip, and 6 × 3 = 18 > the shim's 16 BDs. Five trips compile. **This document's
+> target is 64.**
+>
+> So J1 moves from *compiles-silently-wrong* to *refuses-loudly* — a real improvement and still not
+> a working J1. The guard in `builders/addnorm.py` is refined to the measured boundary (multi-trip
+> only at `herd_x=1`) rather than lifted, and `coarse` stays at 131 entries.
+>
+> **The arithmetic below is therefore still unreachable**, and the route to the same dispatch
+> collapse is J7a, which never enters the packet path at all: pack x and residual into one strided
+> fetch so no column needs a third L3-facing stream. Re-running J1 needs the BD ceiling raised
+> first — the candidate is loop-shaped packet BD programs on the shim rather than one
+> `aiex.dma_configure_task` per iteration.
+
 ## Why it is safe now, and why that is measured rather than argued
 
 The guard's docstring blames three L3→L1 streams per tile against a column's two shim MM2S

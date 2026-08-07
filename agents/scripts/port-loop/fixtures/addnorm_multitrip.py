@@ -146,12 +146,16 @@ VARIANTS = {
     "annotated_hoisted": (_ONE_COLUMN,   True,  True,  True,  False),
     # `[2026-08-06]` The width every other variant does not cover, and the reason J1 is blocked.
     #
-    # air-fuse-packet-put-loops -- Phase H's fix for the two-trip miscompile -- walks only
-    # air.LaunchOp's IMMEDIATE body blocks (AIRDependencyScheduleOpt.cpp:4840). At herd_x >= 2,
-    # air-dma-to-channel wraps the per-tile put loops in an scf.parallel, so they sit in a block
-    # the pass never visits and its output IR is byte-identical to its input. The shim feed-order
-    # corruption H1s believed fixed therefore returns from the second trip on, silently:
-    # measured 4070 of 4096 elements wrong at exactly this shape.
+    # Phase H's fix for the two-trip miscompile worked only on ONE column. air-dma-to-channel
+    # emits one scf.parallel wrapper PER hoisted put loop, and air-fuse-packet-put-loops walked
+    # only air.LaunchOp's immediate body blocks -- so at herd_x >= 2 its output IR was
+    # byte-identical to its input and the shim feed-order corruption returned from the second trip
+    # on, silently: measured 4070 of 4096 elements wrong at exactly this shape.
+    #
+    # `[2026-08-07]` H9 fixed it by SEQUENTIALIZING each eligible wrapper into per-iteration
+    # clones before grouping -- walking nested blocks alone would have fused nothing, since each
+    # holds a single loop and the groups that matter span the wrappers. This clause is what proves
+    # it: it went from 3747+/4096 wrong to numerically exact.
     #
     # Every clause above runs at herd_x=1, which is the only width H1s's fixture ever ran -- so
     # four green variants coexisted with a live silent miscompile one column wider. That is the

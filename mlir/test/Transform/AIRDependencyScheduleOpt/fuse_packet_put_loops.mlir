@@ -341,3 +341,116 @@ module {
     return
   }
 }
+
+// -----
+
+// air-dma-to-channel emits ONE scf.parallel wrapper PER hoisted put loop, not
+// one wrapper containing them all -- so walking nested blocks fuses nothing:
+// each nested block holds a single loop, and the groups that matter SPAN the
+// wrappers. Eligible wrappers are sequentialized into per-iteration clones in
+// ascending order (the order airrt-to-npu unrolls launch-scope parallels
+// anyway), and the existing single-block grouping then fuses across them.
+//
+// Both wrappers' results feed a trailing barrier here, so use_empty() is
+// false. Declining such wrappers would leave the feed-order miscompile in
+// place for any launch whose per-channel parallels feed a later async op --
+// and the hardware fixture cannot detect that, because its own wrappers have
+// dead tokens.
+// CHECK-LABEL: @live_token_wrappers
+// CHECK-NOT: scf.parallel
+// CHECK: %[[FUSED:.*]] = scf.for
+// CHECK: %[[P0:.*]] = air.channel.put async {{.*}} @pk0[%c0
+// CHECK: %[[P1:.*]] = air.channel.put async [%[[P0]]] @pk0[%c1
+// CHECK: %[[P2:.*]] = air.channel.put async [%[[P1]]] @pk1[%c0
+// CHECK: air.channel.put async [%[[P2]]] @pk1[%c1
+module {
+  air.channel @pk0 [2, 1] {channel_type = "npu_dma_packet"}
+  air.channel @pk1 [2, 1] {channel_type = "npu_dma_packet"}
+  func.func @live_token_wrappers(%arg0: memref<8x64xbf16>, %arg1: memref<8x64xbf16>) {
+    %c1 = arith.constant 1 : index
+    %0 = air.launch async (%lx) in (%sx=%c1) args(%a=%arg0, %b=%arg1) : memref<8x64xbf16>, memref<8x64xbf16> {
+      %c0 = arith.constant 0 : index
+      %c1_l = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %c4 = arith.constant 4 : index
+      %c8 = arith.constant 8 : index
+      %c64 = arith.constant 64 : index
+      %t0 = air.wait_all async
+      %p0 = scf.parallel (%col) = (%c0) to (%c2) step (%c1_l) init (%t0) -> !air.async.token {
+        %ta = air.wait_all async
+        %l = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %ta) -> (!air.async.token) {
+          %pt = air.channel.put async [%t] @pk0[%col, %c0] (%a[%i, %c0] [%c4, %c64] [%c64, %c1_l]) : (memref<8x64xbf16>)
+          scf.yield %pt : !air.async.token
+        }
+        scf.reduce(%l : !air.async.token) {
+        ^bb0(%x: !air.async.token, %y: !air.async.token):
+          %j = air.wait_all async [%x, %y]
+          scf.reduce.return %j : !air.async.token
+        }
+      }
+      %t1 = air.wait_all async
+      %p1 = scf.parallel (%col) = (%c0) to (%c2) step (%c1_l) init (%t1) -> !air.async.token {
+        %ta = air.wait_all async
+        %l = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %ta) -> (!air.async.token) {
+          %pt = air.channel.put async [%t] @pk1[%col, %c0] (%b[%i, %c0] [%c4, %c64] [%c64, %c1_l]) : (memref<8x64xbf16>)
+          scf.yield %pt : !air.async.token
+        }
+        scf.reduce(%l : !air.async.token) {
+        ^bb0(%x: !air.async.token, %y: !air.async.token):
+          %j = air.wait_all async [%x, %y]
+          scf.reduce.return %j : !air.async.token
+        }
+      }
+      %done = air.wait_all async [%p0, %p1]
+    }
+    return
+  }
+
+  air.channel @pk2 [2, 1] {channel_type = "npu_dma_packet"}
+  air.channel @pk3 [2, 1] {channel_type = "npu_dma_packet"}
+}
+
+// -----
+
+// A wrapper whose scf.reduce combiner is NOT the wait_all join
+// air-dma-to-channel emits must be declined, and this holds whether or not the
+// parallel's result has users: the combiner executes once per iteration
+// either way, and the expansion deletes the whole reduce region with it.
+//
+// Here the result is DEAD and the combiner increments a counter. Expanding it
+// would silently drop the atomic -- measured: the transformed IR contained no
+// atomic at all, leaving the counter unchanged.
+// CHECK-LABEL: @side_effecting_combiner
+// CHECK: scf.parallel
+// CHECK: memref.atomic_rmw
+module {
+  air.channel @pk0 [2, 1] {channel_type = "npu_dma_packet"}
+  func.func @side_effecting_combiner(%arg0: memref<8x64xbf16>, %ctr: memref<i32>) {
+    %c1 = arith.constant 1 : index
+    %0 = air.launch async (%lx) in (%sx=%c1) args(%a=%arg0, %c=%ctr) : memref<8x64xbf16>, memref<i32> {
+      %c0 = arith.constant 0 : index
+      %c1_l = arith.constant 1 : index
+      %c2 = arith.constant 2 : index
+      %c4 = arith.constant 4 : index
+      %c8 = arith.constant 8 : index
+      %c64 = arith.constant 64 : index
+      %one = arith.constant 1 : i32
+      %t0 = air.wait_all async
+      %p0 = scf.parallel (%col) = (%c0) to (%c2) step (%c1_l) init (%t0) -> !air.async.token {
+        %ta = air.wait_all async
+        %l = scf.for %i = %c0 to %c8 step %c4 iter_args(%t = %ta) -> (!air.async.token) {
+          %pt = air.channel.put async [%t] @pk0[%col, %c0] (%a[%i, %c0] [%c4, %c64] [%c64, %c1_l]) : (memref<8x64xbf16>)
+          scf.yield %pt : !air.async.token
+        }
+        scf.reduce(%l : !air.async.token) {
+        ^bb0(%x: !air.async.token, %y: !air.async.token):
+          %old = memref.atomic_rmw addi %one, %c[] : (i32, memref<i32>) -> i32
+          %j = air.wait_all async [%x, %y]
+          scf.reduce.return %j : !air.async.token
+        }
+      }
+      air.launch_terminator
+    }
+    return
+  }
+}
