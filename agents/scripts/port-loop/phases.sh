@@ -22,7 +22,7 @@
 # to match. Resuming H would have re-used a fingerprint baseline captured against the old
 # specification, so the tamper check would have been measuring the wrong thing. A fresh phase costs
 # one arm in this table and buys an honest baseline.
-PL_PHASES_IN_SCOPE='["J7a"]'
+PL_PHASES_IN_SCOPE='["J7b"]'
 
 phase_name() {
   case "$1" in
@@ -44,6 +44,7 @@ phase_name() {
     J1) echo "Collapse the norm dispatches: lift addnorm's one-trip guard, re-measure coarse" ;;
     H9) echo "Compiler: fuse packet put loops through scf.parallel, so multi-column multi-trip is correct" ;;
     J7a) echo "The norm-tail pipeline: three herds, L1->L1 channels, intermediates off L3" ;;
+    J7b) echo "The accumulator ring, derived: FFN down-projection partial sums stay on chip" ;;
     *) echo "unknown" ;;
   esac
 }
@@ -68,6 +69,7 @@ phase_doc() {
     J1) echo "docs/plans/transformer-layer-execution-studies/19-phase-j1-collapse-norm-dispatches.md" ;;
     H9) echo "docs/plans/transformer-layer-execution-studies/20-phase-h9-fuse-through-parallel.md" ;;
     J7a) echo "docs/plans/transformer-layer-execution-studies/21-phase-j7a-norm-tail-pipeline.md" ;;
+    J7b) echo "docs/plans/transformer-layer-execution-studies/22-phase-j7b-accumulator-ring.md" ;;
     *) echo "" ;;
   esac
 }
@@ -98,7 +100,7 @@ phase_needs_hardware() {
     D1|D2) echo "yes" ;;
     E1|E2|E3|E4|E5) echo "yes" ;;
     H|H1s) echo "yes" ;;
-    J1|H9|J7a) echo "yes" ;;
+    J1|H9|J7a|J7b) echo "yes" ;;
     *) echo "no" ;;
   esac
 }
@@ -462,6 +464,49 @@ allowlist deliberately between phases. Do not touch builders/addnorm.py: its gua
 measured boundary and widening it is J1's job, after this lands.
 EOF
 ;;
+    J7b) cat <<'EOF'
+flock -x -w 1800 /tmp/mlir-air-npu.lock \
+  ninja -C build-xrt check-programming-examples-transformer-layer
+
+The whole transformer-layer suite on hardware. Allowlist ^programming_examples/transformer_layer/.
+
+SCOPE IS ONE GEMM: the FFN down-projection. The o-projection is the same construction and is a
+follow-on phase. One accumulator ring that provably forms beats two started.
+
+Build builders/ffn_accum.py exporting build_ffn_accum_module(...) and register the operator as
+`ffn_accum` in opcheck_specs.py. Those names are FIXED -- the driver's objective check imports
+them, and a different name fails the phase for the wrong reason.
+
+The driver then runs three clauses:
+
+  1. the standard operator contract: full-output np.isclose at the registry's GEMM tolerance, zero
+     mismatches, fault-injected twin failing;
+  2. the in-place accumulating entry point ffn_matmul_bf16_bf16_up_proj is ACTUALLY DISPATCHED.
+     Three accumulate-into-C kernels have been exported since Phase A and none has ever been
+     called; a builder that quietly keeps using the non-accumulating matmul passes every numeric;
+  3. STRUCTURAL: the C DMAs are no longer inside the K loop, read from aircc's --debug-ir dump of
+     air-hoist-dma-in-accum-pattern.
+
+CLAUSE 3 IS THE PHASE. A K-loop that fetches C, accumulates and stores C every step gives exactly
+the same answer as one whose C stays L1-resident -- the difference is a DDR round-trip per K step,
+invisible to np.isclose. Two of the four arrangements in the spec's table would ship as working
+code and pass every numerical gate.
+
+THE TWO CONDITIONS ARE MEASURED, NOT GUESSED, and both are easy to get wrong:
+  - use the IN-PLACE kernel ffn_matmul_bf16_bf16_up_proj(A, B, C). The two-buffer
+    ..._with_acc_...(A, B, pAcc, C) uses two memrefs, both __restrict, and areSymmetricDmaOps
+    needs ONE memref on both sides -- it never matches, at any alloc site.
+  - allocate the accumulator INSIDE the K loop. Counter-intuitive: you write "allocate per
+    iteration" to get "resident across iterations", because the pass hoists the alloc and the
+    mirrored DMA pair together. Allocate at herd scope -- the natural way -- and
+    isIncomingDmaOp/isOutgoingDmaOp are both unsatisfied and nothing hoists.
+
+Carry J7a's column rule: TWO OR FEWER L3-facing streams per column, counted across the whole
+segment. A GEMM stage fetching A, B and C per column is already three and lands on the packet
+queue. Check the lowered IR for npu_dma_packet before assuming otherwise, and pack co-indexed
+operands into one strided fetch if needed -- that is how J7a stayed off it.
+EOF
+;;
     J7a) cat <<'EOF'
 flock -x -w 1800 /tmp/mlir-air-npu.lock \
   ninja -C build-xrt check-programming-examples-transformer-layer
@@ -592,6 +637,7 @@ phase_gate_allowlist() {
     # J7a adds a builder, an opcheck arm and a lit test, all inside the example. It does NOT
     # touch mlir/ -- the packing route exists precisely so it needs no compiler change.
     J7a) echo '^programming_examples/transformer_layer/' ;;
+    J7b) echo '^programming_examples/transformer_layer/' ;;
     # H changes mlir/ -- the compiler. NONE of that is a gate file, so the allowlist stays
     # empty-but-for-nothing: H is not expected to touch any .lit, Makefile, CMakeLists,
     # registry JSON or verify module at all. An empty allowlist means every gate-file change is
@@ -625,7 +671,7 @@ phase_gate_cmd() {
     # E1 alone changes shared infrastructure, so E1 alone carries the ten-model leg.
     E1) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-e1.sh" ;;
     H|H1s|H9) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-h.sh" ;;
-    E2|E3|E4|E5|J1|J7a) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
+    E2|E3|E4|E5|J1|J7a|J7b) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
     *) echo "false" ;;
   esac
 }
@@ -1534,6 +1580,115 @@ phase_e1_objective_check() {
 
 phase_e2_objective_check() { phase_e_mode_objective_check coarse; }
 
+# --- Phase J7b ------------------------------------------------------------------------------------
+#
+# The claim is that partial sums stop round-tripping through DDR, and NOTHING NUMERICAL CAN SEE
+# THAT. A K-loop that fetches C, accumulates and stores C every step produces exactly the same
+# answer as one whose C stays L1-resident; the difference is a DDR round-trip per K step. So the
+# structural clause is the phase, and it reads aircc's own --debug-ir dump rather than re-deriving
+# anything.
+#
+# `[2026-08-07]` It reads the AIRCC dump, deliberately, not an air-opt pass list. J7a's spec was
+# falsified on exactly that distinction: a construction that lowered cleanly through air-opt never
+# compiles under aircc, because air-to-aie normalizes external callee signatures afterwards. A
+# pass-list result is evidence about a pass, not about the toolchain. (The ring itself was
+# re-confirmed at aircc altitude before this check was written: pass_006 shows 4 -> 2.)
+
+phase_j7b_objective_check() {
+  # The shared contract: full-output np.isclose at the registry's GEMM tolerance, zero mismatches,
+  # and the fault-injected twin failing.
+  phase_c_operator_check ffn_accum || return 1
+
+  # Clause 2 + 3, in one compile: dispatch the in-place accumulator, and prove the ring formed.
+  PL_J7B_EXAMPLE="${PL_ROOT}/programming_examples/transformer_layer" \
+  python3 -c '
+import glob, os, re, sys, tempfile
+
+sys.path.insert(0, os.environ["PL_J7B_EXAMPLE"])
+sys.path.insert(0, os.path.join(os.path.dirname(os.environ["PL_J7B_EXAMPLE"]), "llms"))
+try:
+    from builders.ffn_accum import build_ffn_accum_module
+except Exception as e:
+    print(f"objective check: cannot import builders.ffn_accum: {e}", file=sys.stderr)
+    sys.exit(1)
+
+work = tempfile.mkdtemp(prefix="pl-j7b-")
+os.chdir(work)
+mod = build_ffn_accum_module()
+text = str(mod)
+
+# Clause 2: the in-place accumulating entry point is actually called. Three accumulate-into-C
+# kernels have been ported, compiled and exported since Phase A and NONE has ever been dispatched;
+# a pipeline that quietly keeps using the non-accumulating matmul would pass every numeric.
+if "ffn_matmul_bf16_bf16_up_proj" not in text:
+    print("objective check FAILED: the module does not call the in-place accumulating entry "
+          "point (ffn_matmul_bf16_bf16_up_proj).", file=sys.stderr)
+    print("  The two-buffer ..._with_acc_... kernel cannot form the ring at all -- "
+          "areSymmetricDmaOps needs ONE memref on both sides of the loop.", file=sys.stderr)
+    sys.exit(1)
+
+# Clause 3: compile through aircc with --debug-ir and read the hoist pass output. Linking may fail
+# for want of a kernel object in this directory; irrelevant, the pass runs sixth and dumps either
+# way. What must NOT happen is the dump being absent.
+from air.backend.xrt import XRTBackend
+be = XRTBackend(verbose=False, omit_while_true_loop=False, output_format="elf",
+                instance_name="ffn_accum", debug_ir=True)
+try:
+    be.compile(mod)
+except Exception:
+    pass
+finally:
+    try: be.unload()
+    except Exception: pass
+
+dumps = sorted(glob.glob("air_project/debug_ir/*hoist-dma-in-accum*.mlir"))
+if not dumps:
+    print("objective check FAILED: no air-hoist-dma-in-accum-pattern dump under "
+          "air_project/debug_ir/. Either --debug-ir did not reach aircc or the pass left the "
+          "pipeline.", file=sys.stderr)
+    sys.exit(1)
+
+allf = sorted(glob.glob("air_project/debug_ir/*.mlir"))
+after = open(dumps[-1]).read()
+idx = allf.index(dumps[-1])
+before = open(allf[idx - 1]).read() if idx else None
+
+def moves_in_loop(t):
+    lines = t.splitlines()
+    i = next((j for j, l in enumerate(lines) if "scf.for" in l), None)
+    if i is None:
+        return None
+    depth, body = 0, []
+    for l in lines[i:]:
+        body.append(l)
+        depth += l.count("{") - l.count("}")
+        if depth <= 0 and len(body) > 1:
+            break
+    return len(re.findall(r"air\.dma_memcpy_nd|air\.channel\.(put|get)", "\n".join(body)))
+
+nb = moves_in_loop(before) if before else None
+na = moves_in_loop(after)
+if na is None:
+    print("objective check FAILED: no scf.for survived to the hoist dump; cannot tell whether the "
+          "accumulator ring formed.", file=sys.stderr)
+    sys.exit(1)
+if nb is None or na >= nb:
+    print(f"objective check FAILED: data-movement ops inside the K loop {nb} -> {na}; the "
+          "accumulator round-trip was NOT hoisted.", file=sys.stderr)
+    print("  The ring forms only when the accumulator is allocated INSIDE the loop and the kernel "
+          "is the in-place one. Allocating at herd scope -- the natural way to write it -- leaves "
+          "isIncomingDmaOp/isOutgoingDmaOp unsatisfied and the DDR round-trip in place, once per "
+          "K step, invisible to every numerical check.", file=sys.stderr)
+    sys.exit(1)
+print(f"  accumulator ring formed: data-movement ops inside the K loop {nb} -> {na}")
+' || return 1
+
+  log_info "objective check passed: the in-place accumulator is dispatched and its ring is"
+  log_info "  derived by the compiler -- the partial sums stay on chip"
+  return 0
+}
+
+
 # --- Phase J7a ------------------------------------------------------------------------------------
 #
 # The pipelined norm tail replaces `fused`'s decomposed one, which stages bf16 through L3 between
@@ -1808,6 +1963,7 @@ phase_objective_check() {
     H|H1s|H9) phase_h_objective_check ;;
     J1) phase_j1_objective_check ;;
     J7a) phase_j7a_objective_check ;;
+    J7b) phase_j7b_objective_check ;;
     *) return 0 ;;
   esac
 }
