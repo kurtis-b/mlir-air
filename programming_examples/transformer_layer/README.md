@@ -1278,6 +1278,15 @@ mismatches, `mean_rel_L1` 4.354e-3 / 4.478e-3, negative control failing as requi
 carries a placement attribute and no buffer a depth; `air-place-herds` seats all three herds and
 the ping-pong labelling picks depth.
 
+The operator's lit gate runs three arms, because each sees a failure the others cannot:
+`check-norm-tail-structure` (host-only — both claimed shapes lowered through the aircc pipeline
+prefix ending at `air-dma-to-channel` must count zero `npu_dma_packet`, so a third L3-facing
+stream fails at compile time rather than past trip one on hardware), `check-norm-tail` (the
+numerical check, whose spec rows also enforce `mean_rel_L1_max` 1.688e-2 — the whole-layer figure
+the resident pipeline must beat, so a pipeline that is element-wise correct but round-trips its
+intermediates through L3 fails even though every element sits inside rtol/atol), and
+`check-norm-tail-fault` (the negative control, which must fail under injection).
+
 Two things the phase spec proposed were falsified by FULL compilation — both of its probes had
 stopped at `air-opt`, and both walls live further down, in aiecc:
 

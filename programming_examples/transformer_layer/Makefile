@@ -29,7 +29,7 @@ SWEEP_ARGS ?=
         check-offload check-offload-fault check-runlist check-runlist-fault \
         check-fused check-fused-fault \
         check-transpose check-elementwise-mul check-norm-tail \
-        check-norm-tail-fault \
+        check-norm-tail-fault check-norm-tail-structure \
         reference-tests block-cache-tests blocked-attention-tests \
         registry-resolution registry-sweep registry-write registry-plan \
         registry-writer-tests
@@ -96,6 +96,11 @@ help:
 	@echo "  make check-norm-tail-fault"
 	@echo "                      The pipeline's negative control; must FAIL"
 	@echo "                      under injection."
+	@echo "  make check-norm-tail-structure"
+	@echo "                      The pipeline's structural check: both claimed"
+	@echo "                      shapes lowered through air-dma-to-channel must"
+	@echo "                      carry ZERO packet-typed channels. No NPU"
+	@echo "                      required."
 	@echo "  make check-runlist  The same layer as the Phase E 'runlist'"
 	@echo "                      strategy: coarse's schedule refined into 391"
 	@echo "                      single-operator entries over five runlists,"
@@ -325,6 +330,15 @@ check-norm-tail-fault:
 	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
 	    python3 $(srcdir)/opcheck.py --operator norm_tail --shape-key 128x768 \
 	        --fault-inject input --expect-failure
+
+# The pipeline's structural check, host-only: every claimed shape lowered
+# through the aircc pipeline prefix ending at air-dma-to-channel -- the pass
+# that decides packet typing -- must carry ZERO npu_dma_packet channels. The
+# numerical check cannot see this: a third L3-facing stream packet-multiplexes
+# every input channel onto one queue, which is correct at one trip and
+# silently wrong past it, so the regression only shows here. No NPU, no lock.
+check-norm-tail-structure:
+	python3 $(srcdir)/norm_tail_structure.py
 
 # Phase E4: the same layer, measured as the `runlist` execution strategy — the
 # fine-grained point of the taxonomy. coarse's dispatch schedule refined into

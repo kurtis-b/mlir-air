@@ -13,6 +13,18 @@ CONTRACT
         atol        the measured worst-case absolute error rounded up
         prepare     the ``prepare_*`` callable from ``opcheck_prepare.py``
 
+    A row may also carry, optionally:
+
+        mean_rel_L1_max
+                    a ceiling on the run's AGGREGATE mean relative L1 error,
+                    enforced by ``opcheck.py`` on top of the element-wise
+                    verdict (conjoined, so it can only make the verdict
+                    stricter). For an operator whose claim is an aggregate --
+                    norm_tail's is that keeping intermediates resident beats a
+                    stated whole-layer figure -- the element-wise check alone
+                    can pass while the claim fails; this key is how the row
+                    states the claim where the run can check it.
+
     ``rtol`` is not here: it is fixed at ``opcheck.RTOL`` for every kernel in the
     registry and ``atol`` is what moves. See ``kernel_registry/README.md``.
 
@@ -293,6 +305,13 @@ SPECS = [
         # normalized tensor is materialized between stage_norm and
         # stage_scale) behaving as expected.
         "atol": 5e-2,
+        # The phase's actual claim, enforced as an aggregate ceiling: the
+        # resident pipeline must beat the 1.688e-2 the block measures at this
+        # width (the decomposed tail it replaces measures 1.806e-2). A
+        # pipeline that is element-wise correct but round-trips its
+        # intermediates through L3 passes np.isclose and fails here. Measured
+        # 4.354e-3, a 3.9x margin.
+        "mean_rel_L1_max": 1.688e-2,
         "prepare": prepare_norm_tail,
     },
     {
@@ -311,6 +330,10 @@ SPECS = [
         # the tier's 5e-2, a 2.06x margin here, inside the registry's usual
         # 2-3x and well under the 1e-1 ceiling.
         "atol": 5e-2,
+        # The driver's 1.688e-2 clause, enforced by the run itself at the
+        # shape the phase's precision claim is measured at: see the 128x768
+        # row above. Measured 4.478e-3, a 3.8x margin.
+        "mean_rel_L1_max": 1.688e-2,
         "prepare": prepare_norm_tail,
     },
     {

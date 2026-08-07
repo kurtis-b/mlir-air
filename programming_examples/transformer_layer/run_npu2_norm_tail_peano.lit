@@ -11,17 +11,30 @@
 // and the normalized tensor stay resident in L1 instead of round-tripping
 // through L3 the way pattern/fused's decomposed tail does.
 //
-// Two shapes: 128x768, two trips per tile, cheap enough to carry the standing
-// negative control; and the block's own 4096x768, 128 trips per tile, where
-// the phase's precision claim is measured (mean_rel_L1 4.478e-3 against the
-// decomposed tail's whole-layer 1.806e-2 -- see opcheck_specs.py for the
-// measurements behind the tolerance).
+// Three arms, because the phase's claim has three parts that no single check
+// can see at once:
 //
-// Runs opcheck.py on real NPU2 against an FP32 reference: np.isclose over the
-// full output at rtol=1.6e-2, zero permitted mismatches. The inputs are drawn
-// asymmetrically (x and residual from different distributions) so that a
-// plane-addressing bug in the packed fetch cannot hide behind LayerNorm's
-// scale invariance.
+// 1. STRUCTURE, first because it is host-only and fails fast: both claimed
+//    shapes lowered through the aircc pipeline prefix ending at
+//    air-dma-to-channel must carry ZERO packet-typed channels. A third
+//    L3-facing stream would put every input channel on the packet queue --
+//    correct at one trip, silently wrong past it -- while the numerical arm
+//    still passed.
+// 2. NUMBERS, on real NPU2: opcheck.py against an FP32 reference, np.isclose
+//    over the full output at rtol=1.6e-2, zero permitted mismatches, both
+//    shapes -- 128x768 (two trips per tile) and the block's own 4096x768
+//    (128 trips, where the precision claim is measured). The spec rows also
+//    carry mean_rel_L1_max 1.688e-2, the whole-layer figure the resident
+//    pipeline must beat, enforced by the same run (measured 4.354e-3 /
+//    4.478e-3 -- see opcheck_specs.py). The inputs are drawn asymmetrically
+//    (x and residual from different distributions) so a plane-addressing bug
+//    in the packed fetch cannot hide behind LayerNorm's scale invariance.
+// 3. The NEGATIVE CONTROL, on the cheap two-trip shape: one element of the
+//    packed device buffer perturbed after the reference is computed, and the
+//    comparison itself must reject the run. Its verdict comes from
+//    opcheck.py's own inversion, which only reports the control satisfied
+//    when the completed comparison did the rejecting -- a missing toolchain
+//    or an absent NPU exits non-zero without comparing anything.
 //
 // NPU serialization lives one layer down, not in the recipe below. Device
 // access is locked on /tmp/npu.lock, which XRTRunner.run_test holds across
@@ -39,7 +52,17 @@
 // RUN: mkdir -p test_npu2_norm_tail_peano
 // RUN: cd test_npu2_norm_tail_peano
 // RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile check-norm-tail-structure | FileCheck %s --check-prefix=STRUCT
 // RUN: make -f %S/Makefile check-norm-tail PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+// RUN: make -f %S/Makefile check-norm-tail-fault PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s --check-prefix=FAULT
+//
+// The packet count is stated inside the per-shape verdict line, so a lowering
+// that found packet channels cannot match here -- and a lowering that never
+// ran and counted a vacuous zero is failed by the script itself, which also
+// requires no unlowered DMAs and both named L1-to-L1 channels present.
+// STRUCT: [norm-tail-structure] norm_tail [128x768]: PASS (0 packet-typed
+// STRUCT: [norm-tail-structure] norm_tail [4096x768]: PASS (0 packet-typed
+// STRUCT: [norm-tail-structure] PASS
 //
 // Both lines per shape, not just the verdict: the first is XRTRunner's own,
 // the second names the operator and shape, so a test wired to the wrong
@@ -48,3 +71,11 @@
 // CHECK: [opcheck] norm_tail [128x768]: PASS
 // CHECK: PASS!
 // CHECK: [opcheck] norm_tail [4096x768]: PASS
+//
+// The injection line first: it names the element and both values, so an
+// injection that silently perturbed nothing is visible here rather than being
+// inferred from the verdict. (127, 0, 0) is the last row's x plane in the
+// [rows, 2, cols] packing -- see prepare_norm_tail on why the x half.
+// FAULT: [fault-inject] input 0 at (127, 0, 0)
+// FAULT: [opcheck] norm_tail [128x768]: FAIL
+// FAULT: NEGATIVE CONTROL: PASS

@@ -377,6 +377,26 @@ def run_spec(spec, fault_inject=None, verbose=False):
             atol=spec["atol"],
         )
         passed = return_code == 0
+
+    # A spec may bound the run's AGGREGATE error on top of the element-wise
+    # verdict: `mean_rel_L1_max`, conjoined here so it can only make the
+    # verdict stricter. The element-wise check cannot enforce an aggregate
+    # claim -- every element can sit inside rtol/atol while the mean relative
+    # L1 error exceeds the figure the operator exists to beat (norm_tail's
+    # resident-pipeline claim is exactly that shape of claim), so a spec that
+    # states a ceiling has it checked by the same run that produced the
+    # statistic, not by a reader of the results file.
+    mean_rel_l1_max = spec.get("mean_rel_L1_max")
+    if mean_rel_l1_max is not None:
+        extra["mean_rel_L1_max"] = mean_rel_l1_max
+        if runner.stats["mean_rel_L1"] > mean_rel_l1_max:
+            print(
+                f"failed: mean_rel_L1 {runner.stats['mean_rel_L1']:.3e} exceeds "
+                f"the spec's ceiling {mean_rel_l1_max:.3e} -- the aggregate "
+                "claim fails even where every element is inside rtol/atol"
+            )
+            passed = False
+
     record = _write_result(spec, runner.stats, passed, fault_inject, extra=extra)
 
     verdict = "PASS" if passed else "FAIL"
