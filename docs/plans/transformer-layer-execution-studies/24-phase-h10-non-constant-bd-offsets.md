@@ -74,6 +74,35 @@ Measured on J7b's pre-fix builder at 4 K steps (`agents/probes/probe_ffn_accum_b
 4. **Nothing warns, at any stage.** The structural checks are green: 4 → 2 hoist, zero packet-typed
    channels, full compile.
 
+## The scope, which is narrower than it first looks — and why nothing shipped breaks
+
+`get1DOffset`'s only caller sits inside `generateDmaBd(..., AIE::TileLike tile, ...)`: the
+**tile-side** (core and memtile) BD path. L3-side transfers are programmed by the runtime sequence
+(`AIRRtToNpuPass`), which materializes offsets per task and can express one that advances.
+
+The IR bears this out exactly. In J7b's failing module, three channel puts carry an offset:
+
+| put | operand | offset | outcome |
+|---|---|---|---|
+| W chunk refill | `%arg4` — launch arg, **no memory space (L3)** | `%7`, IV-dependent | **fine** |
+| A feed | `%results` — `memref<8192xbf16, 1 : i32>`, **L2** | `%13`, IV-dependent | **silently wrong** |
+| B feed | `%results_4` — `memref<2048xbf16, 1 : i32>`, L2 | none (whole buffer) | fine |
+
+So the rule the J7b builder arrived at empirically — *advance on the L3 side, never on the L2 read*
+— is exactly the mechanism: **an IV-dependent offset is materializable on an L3 operand and
+inexpressible on an L2/L1 one.**
+
+**A survey of every `ChannelPut`/`ChannelGet` with a non-literal offset in `programming_examples/`
+found no other case on an L2/L1 operand.** The nearest miss is
+`attention_decode/attn_decode_npu2.py:347`, which puts `offsets=[tx_i, mm_iter, 0, ...]` with
+`mm_iter` a genuine `scf.for` IV over 6 trips — but from `l3_b_data`, an **L3** buffer, so it goes
+through the runtime sequence and is safe. `herd_dataflow/run.py` uses an `affine.apply` offset
+inside an `scf.forall`, which AIR specializes per index.
+
+That is a static survey, not a build of all ten shipped models, so premise 4 below still stands —
+but it means the expected outcome of leg 5 is "nothing breaks", and a leg-5 failure is a signal to
+investigate rather than to relax the refusal.
+
 ## Why this is refuse, not skip
 
 H1s settled *skip and warn, never refuse* for `air-label-scf-for-to-ping-pong`, and that was right
@@ -137,5 +166,10 @@ Everything above is measured except one thing, and it is the first thing to chec
 2. The IR carries a non-constant offset at that point — **confirmed** from the pre-`air-to-aie`
    dump. ✅
 3. The BD offset comes out frozen and the design hangs — **measured on hardware.** ✅
-4. **That no shipped model relies on the losing construction — NOT established.** Leg 5 answers it.
-   If one does, stop and report rather than relaxing the refusal.
+4. The refusal fires only on tile-side BDs, so an IV-dependent **L3** offset is untouched —
+   **read from the caller and confirmed against the IR** (the table above). ✅
+5. **That no shipped model relies on the losing construction — NOT established by a build.** A
+   static survey of every non-literal channel offset in `programming_examples/` found none on an
+   L2/L1 operand, so the expectation is that nothing breaks; leg 5 is what actually answers it. If
+   a model does break, stop and report — it has been computing on a frozen BD offset, and the
+   finding is much larger than this phase.

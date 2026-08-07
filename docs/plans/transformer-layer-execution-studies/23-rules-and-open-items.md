@@ -61,6 +61,13 @@ small per-step staging buffer and put it from a *static* offset. The shim stream
 so no BD needs a moving offset. This is why J7b's B operand always worked and its A operand did
 not — B was staged per step from the start, A was staged whole "because it is the small operand".
 
+**`[2026-08-07]` And that is not a heuristic — it is the mechanism.** L3-side transfers are
+programmed by the runtime sequence, which materializes an offset per task; tile-side (L2/L1) BDs
+are static and cannot. The failing module shows all three cases side by side: an IV-dependent
+offset on a **launch argument (L3)** is fine, the same thing on a `memref<..., 1 : i32>` (**L2**)
+is silently wrong, and a whole-buffer put with no offset is fine. Survey: no other design in
+`programming_examples/` takes a non-literal offset on an L2/L1 operand.
+
 Reproduce with `python3 agents/probes/probe_ffn_accum_bd_offset.py`; the docstring says how to
 point it at the pre-fix builder (`e6cdd138`) to see the frozen chain.
 
