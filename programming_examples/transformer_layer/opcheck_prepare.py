@@ -513,14 +513,24 @@ def prepare_ffn_accum(shape, seed=11):
     """
     seq_len, ffn_dim = shape["seq_len"], shape["ffn_dim"]
     emb_dim = shape["emb_dim"]
-    compile_ffn_accum_kernel()
+    # ONE source of truth for the tile geometry. The kernel object bakes
+    # DIM_M/DIM_K/DIM_N in as -D flags, so compiling it at a different tile_n
+    # from the one the module declares links the wrong microkernel and produces
+    # garbage that no import error announces -- compile_ffn_accum_kernel()'s
+    # tile_n default (128) is NOT emb_dim // herd_x for every shape, and is not
+    # for this one (192).
+    herd_x, tile_k = 4, 32
+    tile_n = emb_dim // herd_x
+    compile_ffn_accum_kernel(tile_k=tile_k, tile_n=tile_n)
     rng = np.random.default_rng(seed)
     scale = _registry_gemm_scale(ffn_dim)
     a = (rng.standard_normal((seq_len, ffn_dim)) * scale).astype(bfloat16)
     w = (rng.standard_normal((ffn_dim, emb_dim)) * scale).astype(bfloat16)
     return {
-        "module": build_ffn_accum_module(seq_len, ffn_dim, emb_dim),
-        "inputs": ffn_accum_device_inputs(a, w),
+        "module": build_ffn_accum_module(
+            seq_len, ffn_dim, emb_dim, herd_x=herd_x, tile_k=tile_k
+        ),
+        "inputs": ffn_accum_device_inputs(a, w, herd_x=herd_x, tile_k=tile_k),
         "expected": [ffn_accum_reference(a, w)],
         "inject": (0, (0,)),
         "runner_kwargs": _GEMM_RUNNER_KWARGS,

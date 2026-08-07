@@ -1339,7 +1339,7 @@ Footguns that cost time, in the order they fired:
   `addnorm_ffn_norm.cc`) still carry the one-pass form; their file-header footgun notes say so
   and their gates measure it.
 
-## Phase J7b: `ffn_accum` — the compiler-formed accumulator ring (IN PROGRESS)
+## Phase J7b: `ffn_accum` — the compiler-formed accumulator ring
 
 `builders/ffn_accum.py` writes the FFN down-projection as the NAIVE K loop —
 fetch C, call the in-place `ffn_matmul_bf16_bf16_up_proj`, store C, every K
@@ -1348,7 +1348,7 @@ sums stay L1-resident. Measured at aircc altitude on the real module: K-loop
 data movement 4 → 2, zero packet-typed channels, full aiecc compile.
 `ffn_accum_structure.py` gates both counts host-only.
 
-Three walls were measured getting there; each is documented in the builder's
+Four walls were measured getting there; each is documented in the builder's
 docstring, in short:
 
 1. The naive form's three per-core input streams (A, B, C fetch) exceed the
@@ -1367,10 +1367,26 @@ docstring, in short:
    The zero kernel is consequently not dispatched. Same pass also refuses
    the C pair's slots at herd_x=6 with free capacity — herd_x=4 places.
 
-**Open blocker:** the fully-compiled design times out on hardware
-(`ERT_CMD_STATE_TIMEOUT` at first dispatch). Structure and compile clauses
-hold; the numerical clause does not run. Suspects, in order: the feed
-channel's put/get handshake deadlocking (two differently-sized gets per
-sub-channel per K step), and the segment-level feed loop's interaction with
-`runtime_loop_tiling_sizes=[2,2]`. `make check-ffn-accum-structure` is green;
-`make check-ffn-accum` reproduces the hang.
+4. **A per-iteration L2 read offset is silently dropped past the unroll
+   limit** — the wall that cost this phase its first session. Staging A whole
+   in the memtile and putting each K step's slice from an advancing offset
+   compiles, places, keeps zero packet-typed channels and hoists 4 → 2, and
+   is wrong past two K steps: `aie.dma_bd` offsets are static, so at 2 trips
+   the loop unrolls and each BD carries its own literal offset, while at 4+
+   the chain cycles with every offset frozen at 0. The core then stalls, the
+   accumulator store never fires, and `y` comes back byte-identical to what
+   the host wrote (seed it with 1.0 and 4096/4096 elements return 1.0); at
+   the spec shape it does not return at all — `ERT_CMD_STATE_TIMEOUT`, which
+   is how this was first met. Not ping-pong (`omit_pingpong="all"` is
+   identical). Resolution: **both operands advance on the L3 side**, each
+   staged in a small per-K-step buffer put from a static offset, so no BD
+   ever needs a moving offset. This is why B always worked and A did not.
+   Reproduce with `agents/probes/probe_ffn_accum_bd_offset.py`.
+
+Measured at `64x3072x768` (herd 4×1, `tile_n` 192, `tile_k` 32, 96 K steps):
+`mean_rel_L1` 1.417e-2, `abs_err_max` 1.831e-3, `atol_required` 1.383e-3, zero
+mismatches over 49152 elements at the GEMM tier's 5e-3 — a 3.6× margin. The
+relative error is an order above the other GEMM rows and that is the ring's
+honest cost, not a defect: the in-place kernel's C is bf16, so the running sum
+rounds to bf16 once per K step (96 times here) where a drain-to-f32 GEMM rounds
+once.

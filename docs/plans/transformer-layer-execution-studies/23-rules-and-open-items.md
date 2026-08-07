@@ -40,6 +40,35 @@ Note the budget is per column *across stacked herds*: three 8-wide herds put one
 every column, so their demands add. Getting this wrong per-herd instead of per-column is the first
 mistake this run made.
 
+## Never read a staged buffer at a per-iteration offset — advance on the L3 side
+
+`[2026-08-07]` **`aie.dma_bd` offsets are static, and nothing rewrites a BD chain into a form
+that can walk.** Stage a buffer in L2 and put slice `k` of it from an offset that advances with
+the induction variable, and:
+
+| trips | what the memtile MM2S chain does |
+|---|---|
+| 2 | the K loop fully unrolls; each BD carries its own literal offset — **correct** |
+| ≥ 4 | the chain becomes a cycle covering two steps with **every offset frozen at 0** |
+
+Past the unroll limit the core stalls, the design's output DMA never fires, and the output
+buffer is returned **byte-identical to what the host wrote** — seed it with 1.0 and every
+element comes back 1.0. At J7b's spec shape (4 columns × 96 steps) it stops returning at all:
+`ERT_CMD_STATE_TIMEOUT`. Not ping-pong; `omit_pingpong="all"` reproduces it identically.
+
+**The rule: advance on the L3 side, never on the L2 read.** Stream each operand from L3 into a
+small per-step staging buffer and put it from a *static* offset. The shim streams contiguously,
+so no BD needs a moving offset. This is why J7b's B operand always worked and its A operand did
+not — B was staged per step from the start, A was staged whole "because it is the small operand".
+
+Reproduce with `python3 agents/probes/probe_ffn_accum_bd_offset.py`; the docstring says how to
+point it at the pre-fix builder (`e6cdd138`) to see the frozen chain.
+
+**This is H5, and H5 understates it.** Doc 16 records H5 as "channel indices are compile-time, so
+a 64-band loop fully unrolls" and exhausts locks — a loud compile-time failure. The same root
+limitation also produces this: a loop that declines to unroll and silently emits a chain
+repeating a stale offset. H5's entry should be widened to say so before anyone scopes it.
+
 ## Match a probe's altitude to its claim
 
 `air-opt` with a hand-built pass list answers *"does this pass fire"*. It does **not** answer
@@ -100,6 +129,16 @@ refuses at six trips (column 0 carries weight + x + residual, three packet tasks
 against a 64-trip target. The candidate fix is loop-shaped packet BD programs on the shim rather
 than one `aiex.dma_configure_task` per iteration. **Not on the goal path** — J7a reaches the same
 dispatch collapse without the packet queue.
+
+**5b. The static-BD-offset defect has no compiler-side fix and no diagnostic.** `[2026-08-07]`
+J7b routed around it (advance on L3, never on the L2 read) and its builder documents the wall,
+but the compiler still accepts the losing construction silently. Two bounded items, unclaimed:
+a **diagnostic** — when a channel put's offset depends on a loop IV and the loop will not be
+fully unrolled, that offset cannot be honoured, and the pass knows both facts; and the **fix**,
+which is H5's dynamic-index work (mlir-aie already solved it one layer down with
+`dynamic-objFifos`: a per-core counter plus `scf.index_switch`). The diagnostic is worth doing
+even if the fix never is — this cost J7b its implement session, and the failure presents as a
+hardware hang with no compile-time signal at all.
 
 **5. `norm_tail_structure.py` checks at `air-dma-to-channel` altitude.** Sound for what it claims
 (packet typing is decided there), but it cannot prove final routing or live L1-backed endpoints.

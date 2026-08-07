@@ -44,9 +44,10 @@ THE TWO CONDITIONS THE HOIST NEEDS (both measured, phase J7b)
       the mirrored DMA pair together. Allocate at herd scope -- the natural
       way -- and nothing hoists (measured: 4 -> 4).
 
-WHY A AND B SHARE ONE MEMTILE FEED -- TWO WALLS, BOTH MEASURED HERE
+WHY A AND B SHARE ONE MEMTILE FEED -- THREE WALLS, ALL MEASURED HERE
     The naive form gives every core three inbound streams: A, B and the
-    accumulator fetch. That number hits two independent ceilings:
+    accumulator fetch. That number hits two independent ceilings (and the
+    fix for them hits a third, below):
 
     1. SHIM (the J7a column rule). ``air-dma-to-channel`` estimates
        per-column shim MM2S pressure as one slot per L3->L1 input channel
@@ -73,11 +74,42 @@ WHY A AND B SHARE ONE MEMTILE FEED -- TWO WALLS, BOTH MEASURED HERE
     channel, and the core issues two gets into two separate L1 buffers. One
     core S2MM port for A+B, one for the hoisted C fetch: exactly the budget.
     Both operands stage through the memtile to make that possible (a channel
-    has one physical source): A whole -- it is the small operand -- and B in
-    per-K-step chunks. The L3->L2 copies have no herd-side endpoint, so they
-    are allocated globally across shim columns: per-column shim usage is the
-    C fetch plus at most one global copy. Input pressure 2, output pressure
-    1 (the accumulator store), zero packet-typed channels -- measured.
+    has one physical source), and BOTH stage the same way: a small buffer
+    holding ONE K step, refilled from L3 each step. The L3->L2 copies have no
+    herd-side endpoint, so they are allocated globally across shim columns:
+    per-column shim usage is the C fetch plus at most one global copy. Input
+    pressure 2, output pressure 1 (the accumulator store), zero packet-typed
+    channels -- measured.
+
+    3. STATIC BD OFFSETS -- the wall that decides how A is staged.
+       The obvious economy is to stage A WHOLE in the memtile (it is the
+       small operand, and one contiguous L3 copy serves every K step) and
+       put each step's slice from an advancing offset. That construction
+       COMPILES, places, keeps zero packet-typed channels, and hoists 4 -> 2
+       exactly like this one -- and it is WRONG past two K steps.
+
+       Measured: the memtile MM2S program is a static ``aie.dma_bd`` chain,
+       and at 2 trips the K loop fully unrolls so each put carries its own
+       literal offset (0, then 2048) and the chain IS the whole computation.
+       At 4 trips and beyond the loop no longer unrolls, the chain is a
+       4-BD cycle covering two steps, and both A BDs read the L2 buffer at
+       offset 0 -- the per-iteration offset is simply dropped. The core then
+       stalls, the accumulator store never fires, and ``y`` is returned
+       byte-identical to what the host supplied (measured: seed y with 1.0
+       and 4096/4096 elements come back 1.0). At 4 columns x 96 steps it
+       stops returning at all: ERT_CMD_STATE_TIMEOUT.
+
+       This is doc 16's H5 -- compile-time-only channel/BD indexing -- with a
+       worse failure mode than H5 records: H5 says such a loop fully unrolls
+       and exhausts locks, which at least fails loudly at compile time. Here
+       it declines to unroll and silently emits a chain that repeats a stale
+       offset forever. Not ping-pong: ``omit_pingpong="all"`` reproduces it
+       identically.
+
+       So NEITHER operand is read at a per-iteration L2 offset. Both advance
+       on the L3 side, where the shim streams contiguously and no BD needs a
+       moving offset -- which is why B always worked and A did not. Reproduce
+       with ``agents/probes/probe_ffn_accum_bd_offset.py``.
 
     THE ACCUMULATOR PATH IS UNTOUCHED BY ALL OF THIS. The C fetch and store
     stay the naive in-loop ``dma_memcpy_nd`` pair on the DDR buffer; only
@@ -86,9 +118,11 @@ WHY A AND B SHARE ONE MEMTILE FEED -- TWO WALLS, BOTH MEASURED HERE
 WHY THE OPERANDS ARRIVE PRE-TILED
     The kernels consume blocked operands -- row-major grids of row-major 8x8
     microtiles (r=s=t=8; kernels/encoder.cc). Retiling in flight would put a
-    4-D pattern on every memtile feed put, and the whole-A L3->L2 copy would
-    need 5-D; pre-tiling on the host (``ffn_accum_pack_a`` / ``_pack_w``)
-    makes every A/B transfer in the design CONTIGUOUS 1-D. C is NOT
+    4-D pattern on every memtile feed put; pre-tiling on the host
+    (``ffn_accum_pack_a`` / ``_pack_w``) makes every A/B transfer in the
+    design CONTIGUOUS 1-D -- which is also what lets each operand's L3->L2
+    refill be a plain contiguous run per K step (herd_y > 1 gathers herd_y of
+    them with one stride). C is NOT
     pre-tiled: y stays a plain row-major [seq, emb] tensor, and the C
     fetch/store retile it with the standard 4-D shim idiom (sizes
     [rows/8, cols/8, 8, 8] against strides [8*ld, 8, ld, 1]), because the
@@ -166,8 +200,9 @@ TILE_M = 64
 # One feed sub-channel per core, each a memtile MM2S port; a memtile has 6.
 MAX_FEED_CHANNELS = 6
 
-# A memtile's memory, the ceiling on the staged operands (whole A + one B
-# chunk; aircc may ping-pong the chunk).
+# A memtile's memory, the ceiling on the staged operands. Both stages hold ONE
+# K step now, so this is roomy -- it was the binding constraint when A was
+# staged whole (480 KB of 512 KB at the spec shape).
 L2_BYTES = 512 * 1024
 
 # The in-place accumulating entry point -- the ABI string aircc binds the
@@ -341,16 +376,19 @@ def build_ffn_accum_module(
     itemsize = np.dtype(np_dtype).itemsize
     a_elems = seq_len * ffn_dim
     chunk_elems = tile_k * emb_dim  # one K step of packed w
-    if (a_elems + 2 * chunk_elems) * itemsize > L2_BYTES:
-        raise ValueError(
-            f"staged A ({a_elems * itemsize} B) plus a ping-ponged W chunk "
-            f"({2 * chunk_elems * itemsize} B) exceeds the {L2_BYTES}-byte "
-            "memtile. A K-chunked A stage is a follow-on, not a parameter."
-        )
-
     a_block_elems = TILE_M * tile_k  # one (m-tile, K-step) A feed slice
     b_block_elems = tile_k * tile_n  # one (K-step, n-tile) B feed slice
+    # One K step of A for every core row -- NOT the whole tensor. See the
+    # module docstring: staging A whole and reading it at a per-iteration
+    # offset is the shape that miscompiles past two trips.
+    a_stage_elems = herd_y * a_block_elems
     w_elems = ffn_dim * emb_dim
+    if (2 * a_stage_elems + 2 * chunk_elems) * itemsize > L2_BYTES:
+        raise ValueError(
+            f"the A stage ({a_stage_elems * itemsize} B) and W chunk "
+            f"({chunk_elems * itemsize} B), each possibly ping-ponged, exceed "
+            f"the {L2_BYTES}-byte memtile"
+        )
 
     xrt_dtype = type_mapper(np_dtype)
     l3_a_ty = MemRefType.get([a_elems], xrt_dtype)
@@ -358,7 +396,7 @@ def build_ffn_accum_module(
     l3_y_ty = MemRefType.get([seq_len, emb_dim], xrt_dtype)
 
     l2_space = IntegerAttr.get(T.i32(), MemorySpace.L2)
-    l2_a_ty = MemRefType.get([a_elems], xrt_dtype, memory_space=l2_space)
+    l2_a_ty = MemRefType.get([a_stage_elems], xrt_dtype, memory_space=l2_space)
     l2_b_ty = MemRefType.get([chunk_elems], xrt_dtype, memory_space=l2_space)
 
     l1_space = IntegerAttr.get(T.i32(), MemorySpace.L1)
@@ -382,16 +420,13 @@ def build_ffn_accum_module(
 
             @segment(name="ffn_accum_seg", operands=[l_a, l_w, l_y])
             def fa_seg(s_a, s_w, s_y):
-                # Whole A into the memtile, one contiguous copy. No herd-side
-                # endpoint, so this channel is allocated globally across shim
-                # columns -- no per-column MM2S pressure.
+                # A and B stage IDENTICALLY: a small buffer refilled from L3
+                # once per K step, put to the cores at a STATIC offset. Neither
+                # is read at a per-iteration offset -- see the module docstring
+                # for the miscompile that shape produces past two trips.
+                # Neither copy has a herd-side endpoint, so both are allocated
+                # globally across shim columns: no per-column MM2S pressure.
                 l2_a = AllocOp(l2_a_ty, [], [])
-                dma_memcpy_nd(
-                    l2_a, s_a, src_offsets=[0], src_sizes=[a_elems], src_strides=[1]
-                )
-                # B chunk staging buffer, refilled per K step below. A single
-                # buffer, not a hand-built ping-pong: correctness first, and
-                # air-dependency serializes refill against the feed puts.
                 l2_b = AllocOp(l2_b_ty, [], [])
 
                 @herd(
@@ -449,13 +484,30 @@ def build_ffn_accum_module(
                 # Emitted AFTER the herd so the herd's K loop is the first
                 # scf.for in the IR (the structural check reads it); the
                 # dataflow is unchanged by textual order.
-                a_feed_maps = [
-                    # block (ty, k/tile_k): ty*ffn*TILE_M + k*TILE_M elements
-                    _mul_add_map(TILE_M, m_tile * ffn_dim * TILE_M)
-                    for m_tile in range(herd_y)
-                ]
+                a_chunk_map = _mul_add_map(TILE_M)  # k -> k*TILE_M elements
                 w_chunk_map = _mul_add_map(emb_dim)  # k -> k*emb_dim elements
                 for k in range_(0, ffn_dim, tile_k):
+                    # This K step's A block for every core row. Row m_tile's
+                    # blocks are contiguous in k (the packing lays each row
+                    # band out K-major), so herd_y=1 is one contiguous run and
+                    # the general case is one strided gather.
+                    a_off = affine_apply(a_chunk_map, [k])
+                    if herd_y == 1:
+                        dma_memcpy_nd(
+                            l2_a,
+                            s_a,
+                            src_offsets=[a_off],
+                            src_sizes=[a_block_elems],
+                            src_strides=[1],
+                        )
+                    else:
+                        dma_memcpy_nd(
+                            l2_a,
+                            s_a,
+                            src_offsets=[a_off],
+                            src_sizes=[herd_y, a_block_elems],
+                            src_strides=[ffn_dim * TILE_M, 1],
+                        )
                     w_off = affine_apply(w_chunk_map, [k])
                     dma_memcpy_nd(
                         l2_b,
@@ -466,11 +518,10 @@ def build_ffn_accum_module(
                     )
                     for tx_const in range(herd_x):
                         for ty_const in range(herd_y):
-                            a_off = affine_apply(a_feed_maps[ty_const], [k])
                             ChannelPut(
                                 CHANNEL_FEED,
                                 l2_a,
-                                offsets=[a_off],
+                                offsets=[ty_const * a_block_elems],
                                 sizes=[a_block_elems],
                                 strides=[1],
                                 indices=[tx_const, ty_const],

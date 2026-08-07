@@ -805,7 +805,7 @@ SPECS = [
         # ring -- the naive K loop (fetch C, in-place accumulate, store C per
         # step) that air-hoist-dma-in-accum-pattern collapses so C stays
         # L1-resident across K. First (and only) shape: the ladder's shortest
-        # point's down half, 48 K steps at tile_k 32 over 4 columns. The
+        # point's down half, 96 K steps at tile_k 32 over 4 columns. The
         # numbers are identical whether the ring formed or not, which is why
         # this operator also has a structural arm (ffn_accum_structure.py and
         # the driver's own --debug-ir clause), and why this row's evidence is
@@ -813,9 +813,13 @@ SPECS = [
         "operator": "ffn_accum",
         "shape_key": "64x3072x768",
         "shape": {"seq_len": 64, "ffn_dim": 3072, "emb_dim": 768},
-        # Measured over 49152 elements: mean_rel_L1 PENDING, abs_err_max
-        # PENDING, atol_required PENDING. Placeholder at the GEMM tier's 5e-3
-        # until the first hardware run sizes it.
+        # Measured over 49152 elements: mean_rel_L1 1.417e-2, abs_err_max
+        # 1.831e-3, atol_required 1.383e-3 -- atol stays the GEMM tier's 5e-3,
+        # a 3.6x margin. The relative error is an order above the other GEMM
+        # rows and that is the ring's honest cost, not a defect: the in-place
+        # kernel's C is bf16, so the running sum is rounded to bf16 once per K
+        # step, 96 times here, where a drain-to-f32 GEMM rounds once. The
+        # FP32 reference deliberately reproduces none of it.
         "atol": 5e-3,
         "prepare": prepare_ffn_accum,
     },

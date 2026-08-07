@@ -3,6 +3,19 @@
 Partial sums that never leave the chip, with the **compiler** forming the ring rather than the
 builder declaring it. This is the piece the goal names most directly.
 
+> **`[2026-08-07]` Built, and its three clauses measured green.** `builders/ffn_accum.py`, with
+> `check-ffn-accum` (0 mismatches / 49152, `mean_rel_L1` 1.417e-2, `atol_required` 1.383e-3
+> against atol 5e-3), its fault-injected control, and `check-ffn-accum-structure` (K loop
+> **4 → 2**, zero packet-typed channels). Awaiting the driver's review rounds and gate.
+>
+> **Three walls decided the design, not two.** The spec below anticipated the shim column budget;
+> the phase also met a core S2MM ceiling and — the expensive one — **a per-iteration L2 read
+> offset that the compiler silently drops past the unroll limit**, which presents as
+> `ERT_CMD_STATE_TIMEOUT` with no compile-time signal. See
+> [23 §Never read a staged buffer at a per-iteration offset](23-rules-and-open-items.md).
+> The construction that fails is the *obvious* one, and it passes every compile-time check this
+> phase declares — including the 4 → 2 structural clause.
+
 ## What exists, and what has never been dispatched
 
 Three accumulate-into-C kernels are ported, compiled and exported, and `grep matmul_with_acc` across
