@@ -54,6 +54,7 @@ from opcheck_prepare import (  # noqa: E402
     prepare_ffn,
     prepare_layer_norm,
     prepare_mha_out_proj,
+    prepare_norm_tail,
     prepare_qkv_proj,
     prepare_transpose,
 )
@@ -267,6 +268,50 @@ SPECS = [
         # is the same kernel with the cancellation removed.
         "atol": 2e-3,
         "prepare": prepare_addnorm,
+    },
+    {
+        # PHASE J7A: the norm tail as a three-herd pipeline -- add, norm and
+        # gamma-scale in one segment joined by L1->L1 channels, x|residual
+        # packed as planes into ONE strided L3 fetch. Same function as the
+        # addnorm pre-add row above (LayerNorm(x + residual) * gamma), computed
+        # by a different dataflow; the evidence it adds is the dataflow's.
+        #
+        # 128x768 FIRST for the standing negative control (the driver injects
+        # an operator's first declared shape): two trips per tile, so the
+        # channel feed order past trip one -- the class of defect J1 lost a
+        # night to -- is exercised at a fraction of the 4096-row cost. The
+        # inputs are deliberately asymmetric; see prepare_norm_tail on why a
+        # symmetric draw would soften the pipeline's one unproven premise (the
+        # plane-1 subview offset reaching the add kernel's base pointer).
+        "operator": "norm_tail",
+        "shape_key": "128x768",
+        "shape": {"rows": 128, "cols": 768},
+        # Measured over 98304 elements: mean_rel_L1 4.354e-3, abs_err_max
+        # 6.25e-2, atol_required 7.875e-3. atol is the tier's 5e-2, a 6.3x
+        # margin. The relative error is ~1.6x the fused addnorm pre-add row's
+        # 2.687e-3, which is the pipeline's one extra bf16 rounding (the
+        # normalized tensor is materialized between stage_norm and
+        # stage_scale) behaving as expected.
+        "atol": 5e-2,
+        "prepare": prepare_norm_tail,
+    },
+    {
+        # baseline_768, the block's own activation shape and the shape the
+        # phase's precision claim is measured at: 128 trips per tile at
+        # herd_x=8 (rows_per_call 4 -- 8 overflows L1 once aircc ping-pongs
+        # both of stage_add's tiles; see builders/norm_tail.py).
+        "operator": "norm_tail",
+        "shape_key": "4096x768",
+        "shape": {"rows": 4096, "cols": 768},
+        # Measured over 3145728 elements: mean_rel_L1 4.478e-3 -- within 3% of
+        # the 128-row point over 32x the elements, so the error is set by the
+        # datapath and not the trip count, and comfortably under the driver's
+        # 1.688e-2 clause (the whole-layer figure the resident pipeline must
+        # beat) -- abs_err_max 9.375e-2, atol_required 2.425e-2. atol stays
+        # the tier's 5e-2, a 2.06x margin here, inside the registry's usual
+        # 2-3x and well under the 1e-1 ceiling.
+        "atol": 5e-2,
+        "prepare": prepare_norm_tail,
     },
     {
         # The two model-registered projection shapes are (M, K, 3K) for K in

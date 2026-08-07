@@ -115,6 +115,12 @@ from builders.layer_norm import (  # noqa: E402
     build_layer_norm_module,
     layer_norm_reference,
 )
+from builders.norm_tail import (  # noqa: E402
+    build_norm_tail_module,
+    compile_norm_tail_kernels,
+    norm_tail_device_inputs,
+    norm_tail_reference,
+)
 from builders.mha_out_proj import (  # noqa: E402
     MHA_OUT_PROJ_RUNNER_KWARGS,
     build_mha_out_proj_module,
@@ -233,6 +239,40 @@ def prepare_elementwise_mul(shape, seed=7):
         "inputs": [a, b],
         "expected": [elementwise_mul_reference(a, b)],
         "inject": (0, (rows - 1, 0)),
+    }
+
+
+def prepare_norm_tail(shape, seed=9):
+    """The J7a three-herd pipeline: ``LayerNorm(x + residual) * gamma``.
+
+    x and residual are drawn from deliberately DIFFERENT distributions --
+    x standard normal, residual ``normal(0.75, 1.5)`` -- because the pipeline's
+    one unproven premise is whether the AIE lowering hands the add kernel a
+    base pointer that includes the plane-1 subview offset. If it passed the
+    plane-0 base for both operands the device would compute
+    ``LayerNorm(x + x) * gamma``, and LayerNorm is scale-invariant --
+    ``LN(x + x) == LN(x)`` -- so the failure survives every check that a
+    symmetric draw would soften. Distinct distributions make the wrong read
+    disagree at nearly every element.
+
+    The injection perturbs the x half of the PACKED buffer (input 0,
+    position ``(rows-1, 0, 0)`` of its ``[rows, 2, cols]`` layout), last row:
+    the whole row's statistics shift and the perturbed element lands far
+    outside the band, same reasoning as ``prepare_layer_norm``'s.
+    """
+    rows, cols = shape["rows"], shape["cols"]
+    compile_norm_tail_kernels()
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((rows, cols)).astype(bfloat16)
+    residual = (0.75 + 1.5 * rng.standard_normal((rows, cols))).astype(bfloat16)
+    # Gamma-shaped: a trained LayerNorm weight sits near 1, and uniform(0.5,
+    # 1.5) is bounded away from zero so no element's gamma can swallow a fault.
+    gamma = rng.uniform(0.5, 1.5, size=cols).astype(bfloat16)
+    return {
+        "module": build_norm_tail_module(rows, cols, bfloat16),
+        "inputs": norm_tail_device_inputs(x, residual) + [gamma],
+        "expected": [norm_tail_reference(x, residual, gamma)],
+        "inject": (0, (rows - 1, 0, 0)),
     }
 
 
