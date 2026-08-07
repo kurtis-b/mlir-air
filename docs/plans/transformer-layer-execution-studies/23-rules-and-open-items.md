@@ -213,9 +213,40 @@ which is H5's dynamic-index work (mlir-aie already solved it one layer down with
 even if the fix never is — this cost J7b its implement session, and the failure presents as a
 hardware hang with no compile-time signal at all.
 
-**5. `norm_tail_structure.py` checks at `air-dma-to-channel` altitude.** Sound for what it claims
-(packet typing is decided there), but it cannot prove final routing or live L1-backed endpoints.
-Strengthening it to assert on late IR would close the gap its own review recorded.
+**5. ~~`norm_tail_structure.py` checks at `air-dma-to-channel` altitude.~~ CLOSED `[2026-08-07]`.**
+It now compiles through `XRTBackend(debug_ir=True)` — the production aircc binary — and asserts on
+the routed design. The same weakness J7b's round-1 review found in `ffn_accum_structure.py`; this
+applies the pattern that review settled on. Two of the five checks are new and could not be made at
+the old altitude:
+
+- **The stage edges are L1→L1**, measured on the final IR: exactly `2 × herd_x` = **16 `aie.flow`
+  ops running core tile → core tile**. Keeping the intermediates off L3 *is* the phase, and an edge
+  that silently round-tripped through L3 or a memtile would still show zero packet-typed channels
+  and still pass every numeric arm.
+- **The column budget, counted directly** — at most 2 shim-facing inbound flows per column
+  (measured: 16 over 8 columns, exactly 2 each). The old check inferred this from packet typing,
+  which is the compiler's *reaction* to exceeding the budget; this counts the thing the rule is
+  about.
+
+Plus: three herd rows of `herd_x` cores (the placement `air-place-herds` derived, which the builder
+declares nowhere), zero packet-typed channels in **every** dump rather than one, and liveness at
+both ends so no count passes vacuously.
+
+**Verified in the failing direction**, which is the point of it: routing the same pipeline 4 columns
+wide is rejected — `air-place-herds` collapses it to `{row 2: 8, row 3: 4}` and only 8 core→core
+flows survive, so both new checks fire.
+
+**Still no NPU and no Peano, and all three shapes take 3 s.** Reading the routed design sounds like
+it needs a full build; it does not. **aiecc writes every MLIR pass dump before it compiles core
+ELFs**, so the compile failing for want of a kernel object costs nothing — all 59 dumps land, the
+last fully routed. Worth knowing generally: a structural check can sit at the very bottom of the
+pipeline and stay hermetic. (The first version *did* build the kernels, which added a Peano
+dependency to an arm whose Makefile target and lit RUN line deliberately pass none — it failed the
+suite, not the script.)
+
+**And a lesson that cost two suite runs: verifying such a script standalone is not verifying its
+gate.** These checks pass on their own while the lit arm FileChecks the verdict line, so making the
+verdict richer broke the suite with every check green. Run the lit arm, not the script.
 
 ## Struck from the plan
 

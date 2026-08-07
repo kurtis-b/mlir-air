@@ -115,6 +115,15 @@ Objective check, driver-owned, three clauses:
    third L3 stream and silently re-enter the miscompiling path — the numbers would still pass at
    one trip.
 
+   > **`[2026-08-07]` Strengthened past what this clause asked for.**
+   > `norm_tail_structure.py` now compiles through `XRTBackend(debug_ir=True)` and asserts on the
+   > **routed** design: 16 core-tile→core-tile `aie.flow` ops (the stage edges really are L1→L1),
+   > at most 2 shim-facing inbound flows per column (the budget counted directly rather than
+   > inferred from packet typing), and three herd rows of 8. The clause as written could not see
+   > an edge that round-tripped through L3 — which is the phase's whole claim. See
+   > [23 §5](23-rules-and-open-items.md); verified in the failing direction against a 4-wide
+   > placement.
+
 ## What this phase must not do
 
 - **Do not widen a tolerance.** The layer sits at the hard `1e-1` ceiling.

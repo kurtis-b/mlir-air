@@ -60,13 +60,22 @@
 // RUN: make -f %S/Makefile check-norm-tail PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
 // RUN: make -f %S/Makefile check-norm-tail-fault PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s --check-prefix=FAULT
 //
-// The packet count is stated inside the per-shape verdict line, so a lowering
-// that found packet channels cannot match here -- and a lowering that never
-// ran and counted a vacuous zero is failed by the script itself, which also
-// requires no unlowered DMAs and both named L1-to-L1 channels present.
-// STRUCT: [norm-tail-structure] norm_tail [128x768]: PASS (0 packet-typed
-// STRUCT: [norm-tail-structure] norm_tail [4096x768]: PASS (0 packet-typed
-// STRUCT: [norm-tail-structure] norm_tail [128x768_offset]: PASS (0 packet-typed
+// Every load-bearing count is stated inside the per-shape verdict line, so a
+// lowering that lost one cannot match here -- and a lowering that never ran and
+// counted vacuous zeros is failed by the script itself, which also requires no
+// unlowered DMAs, both named L1-to-L1 channels present at the channel pass, and
+// no air.channel left at the end.
+//
+// `[2026-08-07]` These assert MORE than they did. The check moved from a
+// hand-built air-opt pass list to the production aircc binary and now reads the
+// ROUTED design, so the verdict carries the three-herd placement, the count of
+// core-tile-to-core-tile flows (the stage edges really staying on chip -- the
+// phase's actual claim, which the old altitude could not see) and the per-column
+// shim budget counted directly rather than inferred from packet typing. The
+// inputs are untouched; only what is asserted about them grew.
+// STRUCT: [norm-tail-structure] norm_tail [128x768]: PASS (3 herd rows x 8, 16 L1->L1 flows, max 2 shim inbound per column, 0 packet-typed channels)
+// STRUCT: [norm-tail-structure] norm_tail [4096x768]: PASS (3 herd rows x 8, 16 L1->L1 flows, max 2 shim inbound per column, 0 packet-typed channels)
+// STRUCT: [norm-tail-structure] norm_tail [128x768_offset]: PASS (3 herd rows x 8, 16 L1->L1 flows, max 2 shim inbound per column, 0 packet-typed channels)
 // STRUCT: [norm-tail-structure] PASS
 //
 // Both lines per shape, not just the verdict: the first is XRTRunner's own,

@@ -1281,9 +1281,12 @@ carries a placement attribute and no buffer a depth; `air-place-herds` seats all
 the ping-pong labelling picks depth.
 
 The operator's lit gate runs three arms, because each sees a failure the others cannot:
-`check-norm-tail-structure` (host-only — both claimed shapes lowered through the aircc pipeline
-prefix ending at `air-dma-to-channel` must count zero `npu_dma_packet`, so a third L3-facing
-stream fails at compile time rather than past trip one on hardware), `check-norm-tail` (the
+`check-norm-tail-structure` (host-only, but through the REAL aircc binary — every claimed shape
+must route as three herds of 8 on 16 core-tile-to-core-tile flows, take at most 2 shim-facing
+inbound streams per column, and count zero `npu_dma_packet` in every dump; so a third L3-facing
+stream fails at compile time rather than past trip one on hardware, **and** a stage edge that
+silently round-tripped through L3 fails too — which the earlier `air-dma-to-channel`-only version
+could not see, `[2026-08-07]`), `check-norm-tail` (the
 numerical check, whose spec rows also enforce `mean_rel_L1_max` 1.688e-2 — the whole-layer figure
 the resident pipeline must beat, so a pipeline that is element-wise correct but round-trips its
 intermediates through L3 fails even though every element sits inside rtol/atol), and
