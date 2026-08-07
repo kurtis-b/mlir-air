@@ -1194,3 +1194,65 @@ packet BD programs on the shim — either lands in `mlir/`, which a porting
 phase does not touch. Every failing shape above reproduces from a plain
 `XRTRunner.run_test` of `build_addnorm_module` (or the driver fixture's
 `build` for the hoisted row) at the listed configuration.
+
+## Phase H9 findings: packet put-loop fusion now reaches multi-column herds
+
+H9 removed J1's wall #1: `air-fuse-packet-put-loops` fires at `herd_x >= 2`.
+The multicolumn shape that was 4070/4096 wrong (2 trips × 4 rows, cols 64,
+herd 8) is numerically exact, measured 4/4 repeat runs on NPU2, and 4 trips ×
+herd 8 is exact 3/3. What the diff cannot show:
+
+- **"Walk the scf.parallel body" — the obvious fix — is vacuous.** At
+  `herd_x >= 2`, `air-dma-to-channel` wraps each hoisted per-tile put loop in
+  its **own** launch-scope `scf.parallel` (one loop per wrapper), with the
+  broadcast weight's loop beside them, unwrapped. No parallel body ever holds
+  two loops, so per-body fusion finds nothing: the groups that matter span
+  the wrappers. The pass instead *sequentializes* each eligible wrapper —
+  cloning its body per iteration, ascending, at the wrapper's position — and
+  then runs the ordinary sibling fusion over the flattened block. That is not
+  a new lowering decision: `airrt-to-npu` unrolls launch-scope parallels into
+  exactly that ascending sequential task order anyway (compare the
+  `dma_configure_task_for` order in any `--debug-ir` pass_058 dump); the fix
+  merely materializes the order early enough for the fusion to see it.
+- **Why fusing across former iterations is safe here.** Each non-broadcast
+  packet channel's per-column endpoint allocates to that column's own shim
+  MM2S queue (`aie.shim_dma_allocation` in the placed IR: `channel_1_c` and
+  `channel_2_c` both sit on column c's queue 0). Different iterations of the
+  wrapper therefore never share a queue, and reordering between them is
+  unobservable on any shared stream; the order each queue *does* depend on —
+  that column's own per-trip interleave — is exactly what fusion restores.
+  On column 0 the weight broadcast shares the queue with `x0`/`res0`, and the
+  fused program order gives that queue the ring's exact expectation
+  (`w, x0, r0` per trip) where today it got `w, w, x0(all), r0(all)`.
+- **The residual ordering the argument does NOT close.** Tiles 1..7 receive
+  the weight from column 0's queue but x/res from their own column's queue;
+  their relative arrival is enforced by nothing stronger than task-issue
+  order and transfer timing. This is not new: every shipped single-trip
+  multi-column design (including this example's `block.py` normalization
+  dispatches) already stands on the same discipline at trip 0. H9 extends it
+  to trip boundaries and measured it stable (7/7 exact across 2- and 4-trip
+  probes), but it is a timing discipline, not a proven order. If a
+  multi-column multi-trip shape ever fails intermittently with corruption
+  confined to the weight-adjacent buffers, start here.
+- **Running the fusion upstream of the wrapper was rejected.** The hoisted
+  put loops only reach their final shape after the last
+  `air-isolate-async-dma-loop-nests`, which re-splits fused loops — and that
+  pass necessarily runs after `air-dma-to-channel` creates the wrappers. There
+  is no pipeline point where the loops exist fused-fusable and unwrapped.
+- **Wrappers with a live result token are declined, deliberately.** Joining
+  the unrolled iterations' tokens at the wrapper's position would place a
+  user of every member's result before the fusion point, and the fusion's
+  dominance check would then (correctly) refuse the whole group — expansion
+  would churn IR for nothing. In practice the wrapper results are dead
+  (`air-dependency-canonicalize` prunes the terminal joins) and the shipped
+  designs are untouched either way: single-trip put loops canonicalize into
+  bare puts before the pass runs, so their wrappers hold no candidates.
+- **The shim 16-BD wall now binds multicolumn, loudly.** Each fused put still
+  lowers to its own simultaneously-active `aiex.dma_configure_task`, so
+  column 0's shim carries `3 × trips` tasks (weight + x + res) and refuses at
+  6 trips (18 > 16) with the BD-exhaustion diagnostic; 5 trips is the deepest
+  compilable width-8 depth today (measured at cols 64, `rows_per_call` 4:
+  rows 160 compiles, rows 192 refuses). J1's 64-trip target therefore moves
+  from *compiles silently wrong* to *refuses loudly* — the correct failure
+  mode, and the next compiler phase's subject (loop-shaped packet BD programs
+  on the shim rather than one task per iteration).
