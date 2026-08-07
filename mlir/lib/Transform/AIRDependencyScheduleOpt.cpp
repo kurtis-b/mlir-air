@@ -4875,20 +4875,23 @@ public:
   // Eligibility is deliberately the exact wrapper shape air-dma-to-channel
   // emits, nothing wider:
   //   - all bounds static (the iteration count is a herd dimension);
-  //   - one async-token result. A dead result (the common case:
-  //     air-dependency-canonicalize prunes the terminal joins) needs no
-  //     replacement. A live one is replaced with an air.wait_all joining
-  //     everything the reduction combined -- the init values plus each
-  //     iteration's reduce operand -- but only after verifying the reduce
-  //     combiner is the wait_all join air-dma-to-channel emits, so the
-  //     replacement is equivalent rather than stronger; any other combiner
-  //     declines the wrapper. The join is inserted immediately before the
-  //     result's earliest user, so it lands after any later wrapper's
-  //     clones and runOnBlock's dominance check still admits groups spanning
-  //     the wrappers. Declining live results outright instead would make
-  //     this fix conditional on a cleanup pass having run: a token that
-  //     survived pruning would silently bring back the very feed-order
-  //     miscompile the pass exists to prevent;
+  //   - one async-token result whose reduce combiner is the wait_all join
+  //     air-dma-to-channel emits. The combiner is verified whether or not
+  //     the result has users: it executes once per iteration regardless,
+  //     and the expansion deletes it, so any other combiner -- in
+  //     particular one with memory effects -- declines the wrapper. A dead
+  //     result (the common case: air-dependency-canonicalize prunes the
+  //     terminal joins) then needs no replacement. A live one is replaced
+  //     with an air.wait_all joining everything the reduction combined --
+  //     the init values plus each iteration's reduce operand -- which under
+  //     the verified combiner is equivalent rather than stronger. The join
+  //     is inserted immediately before the result's earliest user, so it
+  //     lands after any later wrapper's clones and runOnBlock's dominance
+  //     check still admits groups spanning the wrappers. Declining live
+  //     results outright instead would make this fix conditional on a
+  //     cleanup pass having run: a token that survived pruning would
+  //     silently bring back the very feed-order miscompile the pass exists
+  //     to prevent;
   //   - every body op is a candidate put loop, an air.wait_all (the token
   //     plumbing the wrapper carries), or region-free and memory-effect-free
   //     (index arithmetic); at least one candidate. Anything else -- a bare
@@ -4934,52 +4937,56 @@ public:
     }
     if (!hasCandidate)
       return false;
-    // A live result is rebuilt from what the reduction combined: once the
-    // combiner is verified below to be the wait_all join emitted by
-    // createSCFReduceForAsyncSCFParallel, the result is an air.wait_all
-    // over the init values and every
-    // iteration's reduce operand. The join is a user of every member's
-    // result, so WHERE it lands decides whether runOnBlock can still fuse
-    // groups spanning LATER wrappers: at this parallel's position it would
-    // sit before their clones and (correctly) veto the very fusion this
-    // expansion exists to enable. Place it as late as dominance allows --
-    // immediately before the result's earliest user. A user outside this
-    // block (no ancestor here) keeps the join at the parallel's own
-    // position instead: always dominance-safe, possibly fusion-inhibiting,
-    // never wrong.
+    // The scf.reduce combiner executes once per iteration whether or not
+    // the parallel's result has users, and the expansion below clones only
+    // the body's non-terminator ops -- the combiner region is deleted
+    // outright. Deleting it is only sound when it is the effect-free
+    // wait_all join createSCFReduceForAsyncSCFParallel emits: an
+    // air.wait_all over exactly the two block arguments, returned directly.
+    // Verify that shape unconditionally, not just when the result is live
+    // -- a dead-result wrapper whose combiner carries side effects (say a
+    // memref.atomic_rmw) would otherwise be expanded with those effects
+    // silently dropped. The same check is what makes the live-result
+    // rebuild below equivalent rather than stronger: under this combiner
+    // the fold over init values and iteration operands is a plain join of
+    // all of them, independent of reduction order, whereas any other
+    // combiner -- one that drops an argument, returns a ready token, or
+    // computes anything else -- would yield a rebuilt token stronger than
+    // the original result, which can deadlock a consumer that the puts
+    // need to complete. Either way, decline such wrappers.
+    auto reduce = dyn_cast<scf::ReduceOp>(body->getTerminator());
+    if (!reduce || reduce.getNumOperands() != 1)
+      return false;
+    Block &combiner = reduce.getRegion(0).front();
+    if (combiner.getNumArguments() != 2)
+      return false;
+    auto combJoin = dyn_cast<air::WaitAllOp>(&combiner.front());
+    auto combRet = dyn_cast<scf::ReduceReturnOp>(combiner.getTerminator());
+    if (!combJoin || !combRet || combJoin->getNextNode() != combRet ||
+        combJoin->getNumResults() != 1 ||
+        combRet->getOperand(0) != combJoin.getAsyncToken() ||
+        combJoin->getNumOperands() != 2)
+      return false;
+    Value combA = combiner.getArgument(0), combB = combiner.getArgument(1);
+    if (!((combJoin->getOperand(0) == combA &&
+           combJoin->getOperand(1) == combB) ||
+          (combJoin->getOperand(0) == combB &&
+           combJoin->getOperand(1) == combA)))
+      return false;
+    // A live result is rebuilt as an air.wait_all over the init values and
+    // every iteration's reduce operand. The join is a user of every
+    // member's result, so WHERE it lands decides whether runOnBlock can
+    // still fuse groups spanning LATER wrappers: at this parallel's
+    // position it would sit before their clones and (correctly) veto the
+    // very fusion this expansion exists to enable. Place it as late as
+    // dominance allows -- immediately before the result's earliest user. A
+    // user outside this block (no ancestor here) keeps the join at the
+    // parallel's own position instead: always dominance-safe, possibly
+    // fusion-inhibiting, never wrong.
     bool resultLive = !par.getResult(0).use_empty();
-    Value redVal;
+    Value redVal = reduce.getOperand(0);
     Operation *joinAnchor = nullptr;
     if (resultLive) {
-      auto reduce = dyn_cast<scf::ReduceOp>(body->getTerminator());
-      if (!reduce || reduce.getNumOperands() != 1)
-        return false;
-      // The rebuilt join is only equivalent if the combiner really is the
-      // wait_all join createSCFReduceForAsyncSCFParallel emits: an
-      // air.wait_all over exactly the two block arguments, returned
-      // directly. Under that combiner the fold over init values and
-      // iteration operands is a plain join of all of them, independent of
-      // reduction order. Any other combiner -- one that drops an argument,
-      // returns a ready token, or computes anything else -- makes the
-      // rebuilt token stronger than the original result, which can deadlock
-      // a consumer that the puts need to complete; decline such wrappers.
-      Block &combiner = reduce.getRegion(0).front();
-      if (combiner.getNumArguments() != 2)
-        return false;
-      auto combJoin = dyn_cast<air::WaitAllOp>(&combiner.front());
-      auto combRet = dyn_cast<scf::ReduceReturnOp>(combiner.getTerminator());
-      if (!combJoin || !combRet || combJoin->getNextNode() != combRet ||
-          combJoin->getNumResults() != 1 ||
-          combRet->getOperand(0) != combJoin.getAsyncToken() ||
-          combJoin->getNumOperands() != 2)
-        return false;
-      Value combA = combiner.getArgument(0), combB = combiner.getArgument(1);
-      if (!((combJoin->getOperand(0) == combA &&
-             combJoin->getOperand(1) == combB) ||
-            (combJoin->getOperand(0) == combB &&
-             combJoin->getOperand(1) == combA)))
-        return false;
-      redVal = reduce.getOperand(0);
       for (Operation *user : par.getResult(0).getUsers()) {
         Operation *anc = par->getBlock()->findAncestorOpInBlock(*user);
         if (!anc) {
