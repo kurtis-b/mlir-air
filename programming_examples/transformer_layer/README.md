@@ -1338,3 +1338,39 @@ Footguns that cost time, in the order they fired:
   and the pipeline's from 4.4e-3 to 3.6e-3. The fused addnorm kernels (`encoder.cc`,
   `addnorm_ffn_norm.cc`) still carry the one-pass form; their file-header footgun notes say so
   and their gates measure it.
+
+## Phase J7b: `ffn_accum` — the compiler-formed accumulator ring (IN PROGRESS)
+
+`builders/ffn_accum.py` writes the FFN down-projection as the NAIVE K loop —
+fetch C, call the in-place `ffn_matmul_bf16_bf16_up_proj`, store C, every K
+step — and `air-hoist-dma-in-accum-pattern` lifts the C pair so the partial
+sums stay L1-resident. Measured at aircc altitude on the real module: K-loop
+data movement 4 → 2, zero packet-typed channels, full aiecc compile.
+`ffn_accum_structure.py` gates both counts host-only.
+
+Three walls were measured getting there; each is documented in the builder's
+docstring, in short:
+
+1. The naive form's three per-core input streams (A, B, C fetch) exceed the
+   2-per-column shim MM2S budget and `air-dma-to-channel` packet-multiplexes
+   every input, at any herd width — A auto-broadcasts and still counts 1.
+2. Staging one operand through L2 fixes the shim and exposes the CORE: an
+   AIE2P core tile has two S2MM DMA channels, and feed + direct fetch +
+   hoisted C fetch is three. `aiecc` refuses the circuit route. (The phase's
+   original 1×1 aircc probe never saw this: its streams had been silently
+   packet-upgraded, and packets share ports.) Resolution: A and B share ONE
+   memtile feed channel — two gets per K step, host-pre-tiled so every
+   transfer is contiguous — leaving one core port for the hoisted C fetch.
+3. The spec's device-side zero (`ffn_zero_bf16_up_proj` + store) is a second
+   shim S2MM stream per column and `aie-place-tiles` refuses placement; `y`
+   must instead ENTER zeroed (XRTRunner zero-fills output placeholders).
+   The zero kernel is consequently not dispatched. Same pass also refuses
+   the C pair's slots at herd_x=6 with free capacity — herd_x=4 places.
+
+**Open blocker:** the fully-compiled design times out on hardware
+(`ERT_CMD_STATE_TIMEOUT` at first dispatch). Structure and compile clauses
+hold; the numerical clause does not run. Suspects, in order: the feed
+channel's put/get handshake deadlocking (two differently-sized gets per
+sub-channel per K step), and the segment-level feed loop's interaction with
+`runtime_loop_tiling_sizes=[2,2]`. `make check-ffn-accum-structure` is green;
+`make check-ffn-accum` reproduces the hang.

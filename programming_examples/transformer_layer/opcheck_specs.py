@@ -60,6 +60,7 @@ if _HERE not in sys.path:
 from opcheck_layer import prepare_block  # noqa: E402
 from opcheck_prepare import (  # noqa: E402
     prepare_addnorm,
+    prepare_ffn_accum,
     prepare_causal_mask,
     prepare_elementwise_add,
     prepare_elementwise_mul,
@@ -798,5 +799,24 @@ SPECS = [
         # wider tolerance.
         "atol": 1e-1,
         "prepare": prepare_fused,
+    },
+    {
+        # PHASE J7B: the FFN down-projection as a COMPILER-FORMED accumulator
+        # ring -- the naive K loop (fetch C, in-place accumulate, store C per
+        # step) that air-hoist-dma-in-accum-pattern collapses so C stays
+        # L1-resident across K. First (and only) shape: the ladder's shortest
+        # point's down half, 48 K steps at tile_k 32 over 4 columns. The
+        # numbers are identical whether the ring formed or not, which is why
+        # this operator also has a structural arm (ffn_accum_structure.py and
+        # the driver's own --debug-ir clause), and why this row's evidence is
+        # only clause one of three.
+        "operator": "ffn_accum",
+        "shape_key": "64x3072x768",
+        "shape": {"seq_len": 64, "ffn_dim": 3072, "emb_dim": 768},
+        # Measured over 49152 elements: mean_rel_L1 PENDING, abs_err_max
+        # PENDING, atol_required PENDING. Placeholder at the GEMM tier's 5e-3
+        # until the first hardware run sizes it.
+        "atol": 5e-3,
+        "prepare": prepare_ffn_accum,
     },
 ]

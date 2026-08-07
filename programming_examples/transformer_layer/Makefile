@@ -30,6 +30,7 @@ SWEEP_ARGS ?=
         check-fused check-fused-fault \
         check-transpose check-elementwise-mul check-norm-tail \
         check-norm-tail-fault check-norm-tail-structure \
+        check-ffn-accum check-ffn-accum-fault check-ffn-accum-structure \
         reference-tests block-cache-tests blocked-attention-tests \
         registry-resolution registry-sweep registry-write registry-plan \
         registry-writer-tests
@@ -339,6 +340,30 @@ check-norm-tail-fault:
 # silently wrong past it, so the regression only shows here. No NPU, no lock.
 check-norm-tail-structure:
 	python3 $(srcdir)/norm_tail_structure.py
+
+# Phase J7b: the FFN down-projection as a COMPILER-FORMED accumulator ring.
+# The builder ships the naive per-K-step C round trip and
+# air-hoist-dma-in-accum-pattern lifts it, so the partial sums stay L1-resident
+# across K. The numerical check is clause one only: the numbers are identical
+# whether the ring formed or not.
+check-ffn-accum:
+	$(call opcheck,ffn_accum)
+
+# The ring's negative control. Injects into the packed a at flat index 0 --
+# element (0, 0) under any packing -- which moves y[0, :] by delta * w[0, :],
+# an order of magnitude above the band at the registry GEMM scale.
+check-ffn-accum-fault:
+	mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
+	    python3 $(srcdir)/opcheck.py --operator ffn_accum \
+	        --fault-inject input --expect-failure
+
+# The ring's structural check, host-only: the K loop's data movement must drop
+# 4 -> 2 under the hoist pass (the C pair leaves; A and B stay) and the
+# channel-lowered module must carry ZERO npu_dma_packet. The numerical check
+# cannot see either; this is where the phase's actual claim lives. No NPU.
+check-ffn-accum-structure:
+	python3 $(srcdir)/ffn_accum_structure.py
 
 # Phase E4: the same layer, measured as the `runlist` execution strategy — the
 # fine-grained point of the taxonomy. coarse's dispatch schedule refined into

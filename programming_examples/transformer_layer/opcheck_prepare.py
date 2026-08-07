@@ -101,6 +101,12 @@ from builders.elementwise_add import (  # noqa: E402
     causal_mask_bias,
     elementwise_add_reference,
 )
+from builders.ffn_accum import (  # noqa: E402
+    build_ffn_accum_module,
+    compile_ffn_accum_kernel,
+    ffn_accum_device_inputs,
+    ffn_accum_reference,
+)
 from builders.ffn import (  # noqa: E402
     build_ffn_module,
     ffn_device_inputs,
@@ -481,6 +487,44 @@ def prepare_ffn(shape, seed=5):
 #     from the clean one, which is what makes it a control rather than a
 #     rescaling of the reference.
 # ---------------------------------------------------------------------------
+
+
+def prepare_ffn_accum(shape, seed=11):
+    """The J7b accumulator-ring down-projection: ``y = a @ w``, bf16.
+
+    Operands at the registry GEMM sweep's scale (both ``1/sqrt(K)`` for the
+    depth-``ffn_dim`` reduction) so the recorded error sits on the same axis
+    as the registry's GEMM rows -- this operator's accumulator rounds the
+    running sum to bf16 every K step, and that cost is only comparable to
+    the registry tier at the tier's own scale.
+
+    The inputs are handed over PRE-TILED by ``ffn_accum_device_inputs`` (the
+    device's blocked layouts; see builders/ffn_accum.py), so the injection
+    position indexes the packed FLAT a. Index 0 is element (0, 0) of ``a``
+    in every layout this packing can produce -- block (0,0), microtile
+    (0,0), element (0,0) -- so the control does not depend on the packing
+    arithmetic it is guarding. A delta there moves ``y[0, :]`` by
+    ``delta * w[0, :]`` ~ 2/sqrt(3072) ~ 3.6e-2 per element, an order above
+    the tolerance band at this scale.
+
+    ``y`` must enter zeroed (the in-place kernel accumulates onto it);
+    ``XRTRunner.run_test`` zero-fills output placeholders, which is the
+    contract this operator documents in its builder.
+    """
+    seq_len, ffn_dim = shape["seq_len"], shape["ffn_dim"]
+    emb_dim = shape["emb_dim"]
+    compile_ffn_accum_kernel()
+    rng = np.random.default_rng(seed)
+    scale = _registry_gemm_scale(ffn_dim)
+    a = (rng.standard_normal((seq_len, ffn_dim)) * scale).astype(bfloat16)
+    w = (rng.standard_normal((ffn_dim, emb_dim)) * scale).astype(bfloat16)
+    return {
+        "module": build_ffn_accum_module(seq_len, ffn_dim, emb_dim),
+        "inputs": ffn_accum_device_inputs(a, w),
+        "expected": [ffn_accum_reference(a, w)],
+        "inject": (0, (0,)),
+        "runner_kwargs": _GEMM_RUNNER_KWARGS,
+    }
 
 
 def prepare_mha_out_proj(shape, seed=6):
