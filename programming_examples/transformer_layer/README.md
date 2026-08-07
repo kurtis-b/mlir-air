@@ -1265,3 +1265,53 @@ herd 8 is exact 3/3. What the diff cannot show:
   from *compiles silently wrong* to *refuses loudly* — the correct failure
   mode, and the next compiler phase's subject (loop-shaped packet BD programs
   on the shim rather than one task per iteration).
+
+## Phase J7a findings: the norm-tail pipeline, and the two spec premises full compilation falsified
+
+`builders/norm_tail.py` is the norm tail — add, LayerNorm, gamma scale — as three herds in one
+segment joined by L1→L1 channels (`norm_tail_a2b`, `norm_tail_b2c`, both `[herd_x, 1]` bundles,
+column i to column i). x and residual travel in ONE packed L3 buffer fetched by one DMA, so the
+segment holds exactly two shim MM2S streams per column (packed in, gamma in) and the lowered IR
+carries **zero packet-typed channels** — the sum and the normalized tensor never leave the array.
+Measured on NPU2: `128x768` and `4096x768` both PASS at rtol 1.6e-2 / atol 5e-2 with zero
+mismatches, `mean_rel_L1` 4.354e-3 / 4.478e-3, negative control failing as required. No herd
+carries a placement attribute and no buffer a depth; `air-place-herds` seats all three herds and
+the ping-pong labelling picks depth.
+
+Two things the phase spec proposed were falsified by FULL compilation — both of its probes had
+stopped at `air-opt`, and both walls live further down, in aiecc:
+
+- **The strided-callee route does not reach hardware.** The spec's plan for stage_add was the
+  existing C add on two plane subviews of the packed L1 tile, with the callee DECLARING the
+  strided types (`strided<[cols, 1], offset: rpc*cols>`). That module lowers cleanly through
+  `air-dma-to-channel` — and dies in `air-to-aie`, which normalizes every external callee
+  signature to the identity layout (deliberately: bare-pointer C ABI;
+  `mlir/lib/Conversion/AIRToAIEPass.cpp`, the `normalizedInputs` block) and then finds
+  `memref.cast` refuses strided-with-offset → identity. So the spec's open question — whether the
+  lowered call passes a base pointer including the subview offset — is MOOT: no strided operand
+  reaches an external kernel today, at any offset. The pipeline's add is instead
+  `elementwise_add`'s own direct-codegen stage body (bf16 `vector<16>` addf on 1-D subviews of
+  the packed tile held flat), which changes no C and no compiler.
+- **Plane-major packing cannot be programmed at the block's shape.** `[2, rows, cols]` with its
+  one 3-D fetch (`strides [rows*cols, cols, 1]`) hits the shim `aie.dma_bd` stride cap of 2^20:
+  at 4096×768 the plane stride is 3,145,728 and aiecc refuses ("Stride 2 exceeds the
+  [1:1048576] range"). At 128 rows it compiles and is numerically exact, so the failure is purely
+  BD addressing. The shipped packing is per-row pairs — `[rows, 2, cols]`,
+  `np.stack(axis=1)` — whose band fetch is contiguous (max stride `2*cols`) at any row count.
+  Only stage_add's codegen ever reads the packed layout; the one C kernel in the design
+  (`layer_norm_rows`) sees the contiguous sum tile.
+
+Footguns that cost time, in the order they fired:
+
+- **aircc ping-pongs BOTH of stage_add's tiles** — the DMA-fed packed tile and the channel-put
+  sum tile. At `rows_per_call=8`, cols 768, that is 24+24+12+12 KiB on one tile and aiecc's
+  allocator refuses. The builder's default is `rows_per_call=4` and its L1 check carries the
+  measured ×2.
+- **The asymmetric-input discipline is load-bearing, not decorative.** LayerNorm is
+  scale-invariant, so if stage_add ever read the same operand twice (`LN(x+x) == LN(x)`), inputs
+  drawn from one distribution would soften the failure. `prepare_norm_tail` draws x standard
+  normal and residual `normal(0.75, 1.5)`; keep it that way.
+- **The pipeline's honest numerical cost vs the fused addnorm kernel is one extra bf16
+  rounding** (the normalized tensor materialized between stage_norm and stage_scale):
+  mean_rel_L1 4.5e-3 against the fused kernel's 2.7e-3 at the same width. Both are far under the
+  whole-layer 1.688e-2 figure the driver's clause bounds this by.

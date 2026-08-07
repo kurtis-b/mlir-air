@@ -28,7 +28,8 @@ SWEEP_ARGS ?=
         check-block check-block-fault check-coarse check-coarse-fault \
         check-offload check-offload-fault check-runlist check-runlist-fault \
         check-fused check-fused-fault \
-        check-transpose check-elementwise-mul \
+        check-transpose check-elementwise-mul check-norm-tail \
+        check-norm-tail-fault \
         reference-tests block-cache-tests blocked-attention-tests \
         registry-resolution registry-sweep registry-write registry-plan \
         registry-writer-tests
@@ -87,6 +88,14 @@ help:
 	@echo "  make check-transpose | check-elementwise-mul"
 	@echo "                      The two Phase E4 operators, same opcheck"
 	@echo "                      contract as every other operator. NEED AN NPU."
+	@echo "  make check-norm-tail"
+	@echo "                      Phase J7a: the norm tail as a three-herd"
+	@echo "                      pipeline joined by L1->L1 channels, both"
+	@echo "                      claimed shapes. NEEDS AN NPU; wrap it the"
+	@echo "                      same way."
+	@echo "  make check-norm-tail-fault"
+	@echo "                      The pipeline's negative control; must FAIL"
+	@echo "                      under injection."
 	@echo "  make check-runlist  The same layer as the Phase E 'runlist'"
 	@echo "                      strategy: coarse's schedule refined into 391"
 	@echo "                      single-operator entries over five runlists,"
@@ -297,6 +306,25 @@ check-transpose:
 
 check-elementwise-mul:
 	$(call opcheck,elementwise_mul)
+
+# Phase J7a: the norm tail as a three-herd pipeline -- add, norm and gamma
+# scale joined by L1->L1 channels, x|residual packed into ONE L3 fetch so the
+# segment stays at two shim MM2S streams per column and off the packet path.
+# Same function as addnorm pre-add, checked against the same oracle; the
+# evidence this adds is the dataflow's. Both shapes: 128x768 (two trips per
+# tile) and the block's 4096x768 (128 trips).
+check-norm-tail:
+	$(call opcheck,norm_tail)
+
+# The pipeline's negative control, on the cheap two-trip shape. Injects into
+# the x half of the packed buffer; prepare_norm_tail draws x and residual from
+# different distributions so a plane-addressing bug in stage_add cannot hide
+# behind LayerNorm's scale invariance (LN(x + x) == LN(x)).
+check-norm-tail-fault:
+	mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
+	    python3 $(srcdir)/opcheck.py --operator norm_tail --shape-key 128x768 \
+	        --fault-inject input --expect-failure
 
 # Phase E4: the same layer, measured as the `runlist` execution strategy — the
 # fine-grained point of the taxonomy. coarse's dispatch schedule refined into
