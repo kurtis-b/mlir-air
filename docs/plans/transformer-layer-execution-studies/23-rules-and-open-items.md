@@ -130,6 +130,18 @@ against a 64-trip target. The candidate fix is loop-shaped packet BD programs on
 than one `aiex.dma_configure_task` per iteration. **Not on the goal path** — J7a reaches the same
 dispatch collapse without the packet queue.
 
+**5a. `phases.sh`'s J7b objective check calls its builder with no shape.** `[2026-08-07]`
+`phase_j7b_objective_check` does `build_ffn_accum_module()`, while J7a's sibling passes one
+(`build_norm_tail_module(4096, 768, herd_x=8)`) and no builder here defaults its shape. Written
+before the builder existed, it would have raised `TypeError` at the objective-check step —
+failing the phase, after three review rounds and the gate, for a reason with nothing to do with
+accumulator rings. Worked around by defaulting `build_ffn_accum_module`'s shape to the operator's
+one claimed catalogue row. **The check should be corrected to pass the shape, and the default then
+dropped.** That is an operator edit *between* runs: the driver's scripts are fingerprinted and no
+phase's allowlist covers them, so a phase cannot fix its own checker — which is the design working,
+not a gap. It does mean a bug in a checker costs a whole run unless someone runs the check by hand
+first, which is worth doing for any newly-written objective check.
+
 **5b. The static-BD-offset defect has no compiler-side fix and no diagnostic.** `[2026-08-07]`
 J7b routed around it (advance on L3, never on the L2 read) and its builder documents the wall,
 but the compiler still accepts the losing construction silently. Two bounded items, unclaimed:

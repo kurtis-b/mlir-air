@@ -326,9 +326,21 @@ def _floordiv_map(divisor):
 
 @module_builder
 def build_ffn_accum_module(
-    seq_len, ffn_dim, emb_dim, np_dtype=bfloat16, herd_x=4, tile_k=32
+    seq_len=64, ffn_dim=3072, emb_dim=768, np_dtype=bfloat16, herd_x=4, tile_k=32
 ):
     """Build the down-projection accumulator module.
+
+    The shape arguments default to the operator's ONE claimed catalogue shape
+    (``64x3072x768``) because the driver's objective check calls this builder
+    with no arguments (``phases.sh``). That is out of step with every sibling
+    here -- ``build_norm_tail_module``/``build_layer_norm_module`` take their
+    shape positionally, and J7a's own objective check passes one
+    (``build_norm_tail_module(4096, 768, herd_x=8)``). The defaults exist so a
+    harness inconsistency cannot fail this phase for a reason that has nothing
+    to do with accumulator rings; the check itself should be corrected to pass
+    the shape, which is an operator edit BETWEEN runs (the driver's scripts are
+    fingerprinted, and no phase's allowlist covers them -- deliberately).
+    Callers with a real shape should keep passing one: ``opcheck_prepare`` does.
 
     Args:
         seq_len, ffn_dim, emb_dim: GEMM shape, ``y[seq, emb] = a[seq, ffn] @
