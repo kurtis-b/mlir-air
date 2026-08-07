@@ -79,7 +79,7 @@ Measured on J7b's pre-fix builder at 4 K steps (`agents/probes/probe_ffn_accum_b
 > **`[2026-08-07]` CORRECTED. The paragraph below claimed the refusal cannot reach L3 transfers
 > because `get1DOffset`'s caller takes an `AIE::TileLike tile`. That inference was wrong, and it
 > cost the implement session a round.** `TileLike` is an *interface*, which shim tiles implement
-> too, and `generateDmaBdProgram` is instantiated **twice**:
+> too, and `generateDmaBdProgram` is instantiated **three times**:
 >
 > ```
 > 7512  generateDmaBdProgram<air::TileDMAAllocator,    AIE::BufferOp,         AIE::MemOp>         // core tile
@@ -97,11 +97,13 @@ Measured on J7b's pre-fix builder at 4 K steps (`agents/probes/probe_ffn_accum_b
 > exempting the memtile path would restore the exact miscompile this phase exists to remove.
 > Caught by review round 3.
 >
-> **That is a real correction, but it is NOT why the three existing lit tests fail.** They do
-> contain four L2 (`memref<64x64xi32, 1>`) channel ops whose offsets are `scf.for` induction
-> variables — but at **2 trips**, where the loop unrolls and the pre-phase compiler lowers them to
-> correct distinct offsets (0, 32, 2048, 2080). They are correct programs; the refusal is
-> premature. See §DECIDED below, which is the operative instruction.
+> **That is a real correction, and the three existing lit tests fail because they rely on the
+> freeze.** A revision of this document concluded the opposite — that at 2 trips the loop unrolls
+> and the tests lower to correct distinct offsets {0, 32, 2048, 2080} — from a measurement that
+> attributed those BDs to the wrong put. Per-buffer re-measurement (round 3) shows the four
+> distinct offsets belong to the ONE feed whose offsets are both herd-derived and carry no loop
+> IV; both IV-carrying feeds freeze. See §RE-MEASURED below, which supersedes §DECIDED and is the
+> operative instruction.
 >
 > Three wrong diagnoses to not repeat, all corrected by measurement:
 > - The implement session reported that the tests skip `-air-specialize-channel-wrap-and-stride`,
@@ -113,11 +115,13 @@ Measured on J7b's pre-fix builder at 4 K steps (`agents/probes/probe_ffn_accum_b
 >   came from grepping for `memref<…, 1 : i32>`; these tests use the short form
 >   `memref<…, 1>`, so the L2 operands did not match. A false negative from a pattern, not from
 >   the IR.
-> - Then this document and review round 1 both concluded the opposite — that the tests encode the
->   losing construction and had been miscompiling. Also wrong: **running the pre-phase compiler on
->   them shows correct, distinct BD offsets.** The lesson each time was the same one, and it is
->   cheap: run the old compiler on the failing input and look at what it actually emits, before
->   deciding whether a refusal is right.
+> - Then this document and review round 1 both concluded the tests encode the losing construction
+>   and had been miscompiling. **That conclusion was RIGHT** — but a later revision of this
+>   document (§DECIDED) overturned it by running the pre-phase compiler and seeing distinct BD
+>   offsets, without attributing each BD chain to its feed. The distinct offsets belong to the
+>   no-IV feed; the IV feeds freeze (§RE-MEASURED has the per-buffer sets). The lesson, third
+>   time: run the old compiler on the failing input AND attribute what it emits op by op —
+>   an aggregate glance at the right numbers can still confirm the wrong hypothesis.
 
 `get1DOffset`'s callers sit inside `generateDmaBd`, reached from **both** the tile-side and the
 shim-side BD programs (see the correction above). L3-side transfers are programmed by the runtime
@@ -160,59 +164,83 @@ mlir-aie already solved one layer down with `dynamic-objFifos`: a per-core count
 
 **Scope this phase to refusing well.** The dynamic-index lowering is H5 and is much larger.
 
-## `[2026-08-07]` DECIDED: the refusal is in the wrong PLACE, and that is the whole fix
+## `[2026-08-07]` DECIDED — RETRACTED the same day; superseded by §RE-MEASURED below
 
-The three `check-air-mlir` failures are **not** designs relying on the UB, and the tests must not
-be reworked. Measured against the pre-phase compiler, the very op H10 refuses —
+This section concluded the three failing tests were correct programs, that "at 2 trips the loop
+unrolls", and that the refusal had to move to where the BD chain is emitted. Its measurement was
+real but misattributed: the four distinct offsets {0, 32, 2048, 2080} it observed belong to the
+one feed whose offsets carry **no** loop IV. The section's text is replaced rather than kept,
+because review round 3 demonstrated that a wrong operative instruction left standing gets
+followed. Its one surviving observation: check an expected offset set against the buffer's own
+size — applied correctly, i.e. against the buffer the claim is actually about (see below).
 
-```
-air.channel.put ... (%results_19[%results_28, %arg16] [%c32,%c32] [%c64,%c1]) : (memref<64x64xi32, 1>)
-                                              ^^^^^^ IV of  scf.for %arg16 = 0 to 64 step 32   (2 trips)
-```
+## `[2026-08-07]` RE-MEASURED (round 3): the tests DO freeze; the "correct offsets" belong to a different put
 
-— lowers today to BDs at offsets **0, 32, 2048, 2080**: the correct 2×2 tiling of a 64×64 L2
-buffer (32·64 = 2048). It does **not** freeze. That is the same boundary J7b measured from the
-other side: **at 2 trips the loop unrolls and every offset resolves to its own literal; at 4+ it
-does not unroll and the chain repeats a stale offset.**
+Method: check out the pre-phase compiler (`bb017619`), build `air-opt`, run each test's own RUN
+line, and attribute every `aie.memtile_dma` BD to its L2 buffer. The decisive property of
+`async_gemm_to_locks_aie2.mlir`: its three L2 buffers are all `memref<64x64xi32, 1>` accessed as
+32×32 tiles with strides [64, 1], so **all three feeds share the identical correct BD offset set**
+{0, 32, 2048, 2080} — the four tile corners. That symmetry is what made the misattribution easy:
+seeing that set *somewhere* proves nothing about the IV-carrying puts. Per buffer, pre-phase:
 
-**The arithmetic, because this has now been misdiagnosed three times.** The buffer is
-`memref<64x64xi32, 1>` — **4096 elements**. The access is a 32×32 tile at `[r, c]` with strides
-`[64, 1]`, and `#map1 = (s0) -> (s0 * 32)` applied to a 2×2 herd's indices gives `r, c ∈ {0, 32}`.
-So the complete, correct set of linear offsets is
+| buffer | feed's offsets in the IR | measured MM2S BDs | verdict |
+|---|---|---|---|
+| C | `[%results_28, %results_30]` — both herd-derived, **no IV** | {0, 32, 2048, 2080} | correct |
+| A | `[%results_28, %arg16]` — column is the k-loop IV | **{0, 0, 2048, 2048}** | frozen at k=0 |
+| B | `[%arg16, %results_28]` — row is the k-loop IV | **{0, 32, 0, 32}** | frozen at k=0 |
 
-```
-r*64 + c  over  r,c ∈ {0,32}   =   {0, 32, 2048, 2080}        max touched = 2080+31*64+31 = 4079 < 4096 ✓
-```
+The A and B feeds never emit offsets 32/2080 resp. 2048/2080 — the second loop iteration reads
+the first iteration's block again. The §DECIDED measurement saw the C feed and credited the A
+feed's `air.channel.put` (the very op the diagnostic names) with it.
 
-which is **exactly what the pre-phase compiler emits** — four distinct offsets, one per herd tile,
-covering the 2×2 partition. Nothing is frozen.
+The mechanism, confirmed at the pass's own stage dump (`air-to-aie{test-patterns=to-aie-mlir,
+after-clone-memcpys}`): in the cloned device region the A-feed put's IV offset operand is already
+`arith.constant 0` — the pre-phase zero-substitution in `cloneL2AndL3MemcpysToDeviceOp` replaced
+it — and **nothing in these tests' RUN-line pipeline unrolls the loop, at 2 trips or any other
+count**. The unroll capability exists (`AIRUnrollScfForIntoBDChain`), but it lives in
+`applyAIRSpecializeChannelWrapAndStridePattern` — reached via `-air-specialize-channel-wrap-and-
+stride`, `-air-opt-shim-dma-bds` and `-air-opt-memtile-dma-bds` — none of which appear in these
+RUN lines. "At 2 trips the loop unrolls / at 4+ it does not" was J7b's boundary in J7b's own
+pipeline; it does not transfer to these tests, where no trip count unrolls.
 
-> A round-2 report claimed the correct walk is `{0, 2048, 4096, 6144}` and that the compiler froze
-> it to `{0, 32}`. **That set cannot belong to this test**: 4096 and 6144 are past the end of a
-> 4096-element buffer. It is J7b's A-feed sequence (8192-element L2 buffer, 2048-element blocks,
-> 4 K steps) transplanted onto a different design. Check an expected offset set against the
-> buffer's own size before concluding a compiler froze it.
+`async_gemm_w_pingpong_to_locks_aie2.mlir` makes the freeze unmistakable, because its feed loops
+have **4 trips** (`scf.for %arg15 = 0 to 128 step 32`) and its buffers are asymmetric:
 
-So an IV-dependent offset is not by itself unlowerable. It is unlowerable exactly when the loop
-carrying it **does not unroll**, because only then does one static `aie.dma_bd` have to stand for
-several different offsets.
+| buffer | shape | correct per-buffer walk | measured MM2S BDs | verdict |
+|---|---|---|---|---|
+| A ping/pong | `64x128xi32` | {0,32,64,96} ∪ {4096,4128,4160,4192} | **{0, 4096}** | frozen at k=0 |
+| B ping/pong | `128x64xi32` | {0,2048,4096,6144} ∪ {32,2080,4128,6176} | **{0, 32}** | frozen at k=0 |
+| C | `64x64xi32` | {0, 32, 2048, 2080} | {0, 32, 2048, 2080} | correct |
 
-**Refuse where the freeze happens — when the BD chain is emitted for a loop that did not unroll —
-not on the `air.channel` op up front.** Rejecting every IV-dependent offset at the channel op, as
-the current implementation does, rejects programs the compiler already lowers correctly, which is
-why three green tests went red.
+The round-2 report's claim — "the {0, 2048, 4096, 6144} row walk comes out as offsets 0/32" — was
+**correct**: it is this test's B feed, whose `128x64xi32` buffer holds 8192 elements, so 4096 and
+6144 are in range. §DECIDED dismissed it by checking those offsets against the *other* test's
+4096-element buffer. (`async_gemm_w_pingpong_to_locks_npu.mlir` carries the same segment code;
+same conclusion.)
 
-Two things explicitly ruled out, so no later round re-litigates them:
+So the pre-phase green on these three tests was structural only — their CHECK lines pin no BD
+offsets — over data movement that re-reads block 0 forever. They are the "designs relying on the
+UB" this document's gate section anticipates, found in the compiler's own suite. What follows is
+operative, so no later round re-litigates it:
 
-- **Do NOT rework the three `async_gemm*` tests.** They are correct; the old compiler gives them
-  correct distinct offsets. Editing them would be changing right tests to accommodate a wrong
-  refusal.
-- **Do NOT implement IV-walk specialization into BD wrap/stride dimensions.** It is a real and
-  attractive capability — it would let J7b stage A whole in L2 — but it is much larger, overlaps
-  H5, and is not needed here: these tests already lower correctly.
+- **The refusal is in the RIGHT place.** `generateDmaBd` *is* where the final BD chain is
+  emitted; there is no later point, and no earlier op-level refusal exists in the shipped
+  implementation. An offset still non-constant there has, as a matter of measured fact, no
+  correct lowering in this pipeline.
+- **The three red `async_gemm*` tests are the designed halt state, not a regression.** They are
+  outside this phase's allowlist and must not be edited by a port-loop session; reworking them
+  (e.g. hoisting the k-walk to L3 staging, or pre-unrolling their feed loops) needs human
+  authorization.
+- **Do NOT green them by adding loop unrolling to `air-to-aie`.** Unrolling the feed loops into
+  BD chains would be a *correct* lowering these tests never actually had, but it is new
+  capability — lock-cadence and BD-count implications included — overlapping H5's territory, not
+  a review fix. Refusing correctly is this phase.
+- **Do NOT implement IV-walk specialization into BD wrap/stride dimensions.** Same reason, same
+  destination (H5).
 
-The objective check is unchanged and still the arbiter. Clause 1 (an unresolvable tile-side offset
-is refused) must hold at a trip count that does not unroll; clauses 2 and 3 must stay green.
+The objective check is unchanged and still the arbiter: clause 1 (an unresolvable tile-side
+offset is refused) now demonstrably holds at 2 trips as well as 4+; clauses 2 and 3 must stay
+green.
 
 ## What to build
 
