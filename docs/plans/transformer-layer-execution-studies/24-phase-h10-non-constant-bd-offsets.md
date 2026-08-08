@@ -281,10 +281,39 @@ alone would be satisfied by refusing everything:
    buffer does it this way, and a refusal that caught them would break the fleet to fix a bug none
    of them have.
 
-**Verified failing before the phase starts**, which is the discipline H9's `multicolumn` clause
+> **`[2026-08-07 18:25]` CLAUSE 1 IS WRONG, and the phase is halted on it.** The gate passed all
+> five legs — build+install, `check-air-mlir` 489/489, the hardware suite, decode throughput
+> (10.66 tok/s vs a 9.43 floor), and `make verify` over the ten shipped models — and then the
+> objective check failed clause 1.
+>
+> **The compiler is not at fault; the probe is.** Clause 1 builds an L2 buffer and puts four
+> contiguous per-step slices of it. Those four slices tile the buffer exactly, so
+> `air-opt-memtile-dma-bds` coalesces them into **one whole-buffer BD** (`offset = 0 len = 8192`,
+> measured). That is a correct lowering, so nothing is refused — and the clause demands a refusal
+> for a program that does not need one. The refusal text appears **zero** times in the whole
+> objective-check run.
+>
+> **And "verified failing before the fix" was misleading.** Clause 1 did fail on the pre-fix
+> compiler, which I took as proof it discriminates. It failed because *nothing at all* was refused
+> then, not because it had caught the construction. A clause that fails for the wrong reason looks
+> exactly like a clause that works. **Check that a failing clause fails for the reason intended.**
+>
+> **The right probe is the one this section originally specified**, before it was replaced with a
+> synthetic one: J7b's actual construction — `e6cdd138`'s `ffn_accum` builder at 4 K steps, whose
+> A-feed slices interleave with B across four cores and therefore cannot coalesce. That is a
+> construction with no correct lowering; the synthetic 1-D one has a perfectly good one.
+>
+> **Not fixed here, deliberately.** Editing a failing objective check to make it pass is the exact
+> move the harness exists to prevent, and this is the fifth misjudgement on this question in one
+> session. The correct repair — swap clause 1's probe for the J7b construction, then verify it
+> fails on a compiler rebuilt at `bb017619` *with the refusal diagnostic named* — needs a fresh
+> pass, not a tired one.
+
+~~**Verified failing before the phase starts**~~, which is the discipline H9's `multicolumn` clause
 exists for. On today's compiler, clause 1 fails — the construction compiles clean through the MLIR
 pipeline and dies only at the link, with nothing said about the offset — while 2 and 3 pass
-trivially because nothing is refused yet. They become load-bearing the moment the diagnostic lands.
+trivially because nothing is refused yet. (See the correction above: it fails, but not for this
+reason.)
 
 ## What this phase must not do
 
