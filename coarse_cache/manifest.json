@@ -1,0 +1,38 @@
+{
+  "blk_qkv_proj_512x768": {
+    "output_binary": "coarse_cache/blk_qkv_proj_512x768.elf",
+    "kernel": "main:qkv_proj",
+    "insts": null,
+    "launches": {
+      "air_launches": 4,
+      "herd_launches": 6
+    }
+  },
+  "blk_mha_out_proj_512x768x12h": {
+    "output_binary": "coarse_cache/blk_mha_out_proj_512x768x12h.elf",
+    "kernel": "main:mha_out_proj",
+    "insts": null,
+    "launches": {
+      "air_launches": 2,
+      "herd_launches": 4
+    }
+  },
+  "blk_ffn_512x768x3072": {
+    "output_binary": "coarse_cache/blk_ffn_512x768x3072.elf",
+    "kernel": "main:ffn",
+    "insts": null,
+    "launches": {
+      "air_launches": 3,
+      "herd_launches": 7
+    }
+  },
+  "blk_addnorm_64x768_pre_add": {
+    "output_binary": "coarse_cache/blk_addnorm_64x768_pre_add.elf",
+    "kernel": "main:addnorm",
+    "insts": null,
+    "launches": {
+      "air_launches": 1,
+      "herd_launches": 1
+    }
+  }
+}

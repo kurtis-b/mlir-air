@@ -192,14 +192,74 @@ A completed results root is ~2.4 GB.
 
 ## Work items
 
-1. Define and implement the versioned study schema (prerequisite).
-2. Resolve the resource-usage artifact question (prerequisite).
-3. Port the ~19k-line infrastructure tier, applying the convention rules.
+1. ~~Define and implement the versioned study schema~~ **done** — `study/schema.py`.
+2. ~~Resolve the resource-usage artifact question~~ **done** — `study/aircc_artifacts.py`.
+3. Port the ~19k-line infrastructure tier, applying the convention rules. **Partly blocked, and
+   the split is measured** — see below. `matplotlib`, `pandas` and `seaborn` are absent, and
+   installing them into the sandbox venv while a gate or a measurement run is live is the hazard
+   item 6 records.
 4. Retarget the five device-touching modules.
-5. Wire the pytest suite into CMake/lit.
-6. Pin the missing dependencies; document the ROCm wheel conflict.
-7. Update `.gitignore`.
-8. Write the iron-results adapter.
+5. ~~Wire the pytest suite into CMake/lit~~ **done** `[2026-08-08]` — `run_study_host_tests.lit`
+   + `study/run_host_tests.py`, **without pytest**, which is the one departure from this item as
+   written. See below.
+6. ~~Pin the missing dependencies; document the ROCm wheel conflict~~ **done** —
+   `study/requirements.txt`.
+7. ~~Update `.gitignore`~~ **done** `[2026-08-08]`, **scoped to result trees, not to `*.csv`**.
+   See below.
+8. ~~Write the iron-results adapter~~ **done** — `study/iron_adapter.py`.
+
+### `[2026-08-08]` Item 3 is not uniformly blocked: 22,729 of 36,138 lines are portable today
+
+Measured over the 50 modules of iron's `study/` tree, taking the **transitive** closure over
+in-tree imports — a module that imports a plotting module is blocked at import time even if it
+draws nothing itself:
+
+| | modules | lines |
+|---|---|---|
+| Needs `matplotlib`/`pandas`/`seaborn` directly | 13 | 9,518 |
+| Blocked transitively (the above plus importers) | 18 | 13,409 |
+| **Portable with the dependencies as they are** | **32** | **22,729** |
+
+Of the port-tier modules this document names, only three are blocked: `results_manifest.py` (380
+— and **already superseded** by `study/manifest.py`, whose completeness rule departs from it
+deliberately), `regenerate_plots.py` (271, plotting by definition) and `roofline/run.py` (1,773).
+Everything else is clear, including **`end_to_end/power.py` (409), which is what J6's power metric
+needs**, and `plot_families.py` (133), whose name is misleading — it holds family definitions, not
+drawing code.
+
+So the blocked set is genuinely the plotting and analysis tier, and the sequencing that follows is:
+port the portable 22.7k under the convention rules now, defer plotting until the dependency
+install can be done between device runs, and treat text-only reporting as the interim output —
+`study/ladder_report.py` is that, and it needs nothing that is missing.
+
+### `[2026-08-08]` Item 5 landed without pytest, and item 7 without `*.csv`
+
+Both are deliberate departures from this document as first written, and both are narrower than
+what it asked for.
+
+**Item 5 — no pytest.** This section's plan was to add `pytest`/`pytest-xdist` to
+`utils/requirements_dev.txt` and port iron's `conftest.py` machinery. What shipped is a `.lit`
+wrapper running plain scripts, which is the idiom `run_block_cache_tests.lit` already established
+here for the same reason: pytest is not in the sandbox venv, and installing it is the same class
+of hazard as item 6's. The modules are written as `test_*` functions with plain `assert`, so
+pytest collects them unchanged if it ever lands — the wiring is deferred, not designed out. The
+`--iterations`/`--csv-output`/`metrics`-marker machinery is still unported and still wanted; it
+serves *measurement* tests, and the suite today is host logic only, so nothing needs it yet.
+**When it is ported, port its unbracketed-node-ID fix with it.**
+
+The wrapper pins the test and module counts exactly (`61/61 passed in 6 modules`). Discovery by
+glob satisfies convention rule 11, but glob alone cannot notice a test that stops being *defined* —
+a deleted test function leaves a smaller suite passing. Verified in all three directions: matches
+as-is, a shrunken 60/60 suite fails the `CHECK`, an injected failure exits nonzero.
+
+**Item 7 — result trees, not the extension.** The rules above proposed a blanket `*.csv`. That
+silently ignores any CSV a future test wants to track as a fixture, and the failure mode is a file
+that appears to commit and does not. iron's own rule set carries two negations
+(`!**/removed_cases.csv`, `!**/*_candidates.json`) clawing specific files back out from under it,
+which is evidence they hit exactly this. So what landed is `results/` and
+`results_unattended_*/` and no extension rule: a measurement belongs in a result tree, and a CSV
+being written outside one is the thing to fix. Checked every tracked file in the repository
+against the new rules — zero become ignored.
 
 ## Gate
 
