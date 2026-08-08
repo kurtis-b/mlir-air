@@ -365,6 +365,89 @@ ladder starting at 64:
 
 <!-- END transformer-layer-sweep baseline_512 -->
 
+<!-- BEGIN transformer-layer-sweep baseline_1024 -->
+### Transformer-layer execution study — `baseline_1024` sweep
+
+Written by `programming_examples/transformer_layer/sweep/registry_sweep.py`, which
+measures every candidate tiling for a shape and keeps the fastest that passes. **Bold**
+= the winner recorded in `best` for that tier. `—` = no legal candidate for that method
+at this shape; `❌` = every candidate for it failed.
+
+Two things differ from the model-deployment rows above, both forced by the sequence
+ladder starting at 64:
+
+- **`herd` is per-row.** `M % (tile_m × herd_m) == 0` cannot hold at `M = 64` with
+  `herd_m = 8` for either method's forced `tile_m`, so short-sequence rows carry a
+  per-method `herd` in the JSON that overrides the file-level `8×4`. The herd used is in
+  the table's tile column.
+- **The high-precision `atol` is carried forward at constant strictness, not held
+  constant.** The harness scales its inputs by `1/sqrt(K)`, so the output magnitude —
+  and the absolute error of a fixed-relative-precision datapath with it — goes as
+  `K^-1/2`. The published `atol = 1.5e-3` is that rule evaluated at `K = 8192`; at this
+  family's `K = 768` it is a 3.3× *tightening*, which is exactly the "harness tolerance
+  edge, not a datapath failure" already recorded for Qwen3-0.6B Gate/Up and
+  Qwen2.5-0.5B Gate/Up above. The sweep therefore checks the high tier at
+  `1.5e-3 × sqrt(8192 / K)`, which reproduces the registry's own ~2.5× design margin at
+  every K (measured: 2.5× at K=8192, 2.9× at K=3072, 2.8× at K=768). `rtol` is the
+  canonical `1.6e-2` unchanged, the low tier's `4e-3` is unchanged, and every run must
+  additionally land inside its tier's `mean_rel_L1` band — a scale-free check the
+  example harness does not make at all.
+
+**`qkv_proj`** — `K = 1024` → `N = 3072`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 64 | 64×1024×3072 | 508 | **927** | 520 | 32/256/32/128 (2×4) | 9.5e-3 / 1.1e-2 | ✅ |
+| 128 | 128×1024×3072 | 1073 | **1796** | 1234 | 32/256/32/128 (4×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 256 | 256×1024×3072 | 1852 | **3200** | 2403 | 32/512/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 512 | 512×1024×3072 | 2754 | **3952** | 4506 | 32/256/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 1024 | 1024×1024×3072 | 3739 | **3977** | 4878 | 32/256/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 4096 | 4096×1024×3072 | **4709** | 4153 | 4967 | 64/256/32/128 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+| 8192 | 8192×1024×3072 | **4784** | 4142 | 5194 | 64/256/32/96 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+| 16384 | 16384×1024×3072 | **5042** | 4180 | 5286 | 64/256/32/128 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+
+**`ffn_up`** — `K = 1024` → `N = 4096`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 64 | 64×1024×4096 | 538 | **943** | 527 | 32/256/32/128 (2×4) | 9.5e-3 / 1.1e-2 | ✅ |
+| 128 | 128×1024×4096 | 1154 | **1847** | 1246 | 32/256/32/128 (4×4) | 9.5e-3 / 1.1e-2 | ✅ |
+| 256 | 256×1024×4096 | 1995 | **3411** | 2359 | 32/256/32/128 (8×4) | 9.5e-3 / 1.1e-2 | ✅ |
+| 512 | 512×1024×4096 | 3110 | **3992** | 4533 | 32/256/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 1024 | 1024×1024×4096 | **4003** | 3488 | 4459 | 64/256/32/128 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+| 2048 | 2048×1024×4096 | **4292** | 3932 | 5118 | 64/512/32/128 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+| 4096 | 4096×1024×4096 | **4800** | 4126 | 4910 | 64/256/32/128 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+| 8192 | 8192×1024×4096 | **4966** | 4065 | 5264 | 64/256/32/128 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+| 16384 | 16384×1024×4096 | **5053** | 4180 | 5222 | 64/256/32/128 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+
+**`ffn_down`** — `K = 4096` → `N = 1024`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 64 | 64×4096×1024 | 648 | **1239** | 584 | 32/256/32/128 (2×4) | 9.4e-3 / 1.5e-2 | ✅ |
+| 128 | 128×4096×1024 | 1318 | **2454** | 1364 | 32/256/32/128 (4×4) | 9.5e-3 / 1.5e-2 | ✅ |
+| 256 | 256×4096×1024 | 2439 | **4656** | 2674 | 32/512/32/128 (8×4) | 9.4e-3 / 1.5e-2 | ✅ |
+| 512 | 512×4096×1024 | 4081 | **5266** | 5122 | 32/256/32/128 (8×4) | 9.4e-3 / 1.5e-2 | ✅ |
+| 1024 | 1024×4096×1024 | 5125 | **5243** | 5553 | 32/256/32/128 (8×4) | 9.4e-3 / 1.5e-2 | ✅ |
+| 2048 | 2048×4096×1024 | **5835** | 5433 | 5551 | 64/512/32/128 (8×4) | 9.9e-3 / 1.5e-2 | ✅ |
+| 4096 | 4096×4096×1024 | **6379** | 5433 | 5676 | 64/256/32/128 (8×4) | 9.9e-3 / 1.5e-2 | ✅ |
+| 8192 | 8192×4096×1024 | **6655** | 5528 | 5735 | 64/256/32/128 (8×4) | 9.9e-3 / 1.5e-2 | ✅ |
+| 16384 | 16384×4096×1024 | **6780** | 5563 | 5762 | 64/256/32/128 (8×4) | 9.9e-3 / 1.5e-2 | ✅ |
+
+**`o_proj`** — `K = 1024` → `N = 1024`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 64 | 64×1024×1024 | 365 | **745** | 468 | 32/256/32/128 (2×4) | 9.6e-3 / 1.1e-2 | ✅ |
+| 128 | 128×1024×1024 | 679 | **1512** | 1101 | 32/256/32/128 (4×4) | 9.5e-3 / 1.1e-2 | ✅ |
+| 256 | 256×1024×1024 | 1103 | **2886** | 2130 | 32/256/32/128 (8×4) | 9.5e-3 / 1.1e-2 | ✅ |
+| 512 | 512×1024×1024 | 1543 | **3493** | 4058 | 32/512/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 4096 | 4096×1024×1024 | **4082** | 3766 | 5006 | 64/256/32/128 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+| 8192 | 8192×1024×1024 | **4570** | 3985 | 5153 | 64/256/32/128 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+| 16384 | 16384×1024×1024 | **4897** | 4183 | 4911 | 64/256/32/128 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+
+<!-- END transformer-layer-sweep baseline_1024 -->
+
 ## How to reproduce (correctness + performance, one command)
 
 `make run` drives `run.py --compile-mode compile-and-run` (correctness + `--perf-iters` timing in one invocation). Example: the 2048×8192×2048 (Down) row.

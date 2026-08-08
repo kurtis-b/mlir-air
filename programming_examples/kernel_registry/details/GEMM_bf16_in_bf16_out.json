@@ -4378,6 +4378,1631 @@
         "high": "fused-cast",
         "low": "direct"
       }
+    },
+    {
+      "M": 64,
+      "K": 1024,
+      "N": 3072,
+      "used_by": "transformer-layer study baseline_1024 qkv_proj (seq=64)",
+      "_note": "M=64 is smaller than tile_m x 8, so the herd shrinks: direct 1x4, drain 2x4, fused-cast 1x4 (per-method `herd` overrides the file-level 8x4).",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 508,
+          "mean_rel_L1": 0.0099,
+          "tier": "high",
+          "herd": [
+            1,
+            4
+          ]
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 927,
+          "mean_rel_L1": 0.0095,
+          "tier": "high",
+          "herd": [
+            2,
+            4
+          ]
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 520,
+          "mean_rel_L1": 0.011,
+          "tier": "low",
+          "herd": [
+            1,
+            4
+          ]
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 128,
+      "K": 1024,
+      "N": 3072,
+      "used_by": "transformer-layer study baseline_1024 qkv_proj (seq=128)",
+      "_note": "M=128 is smaller than tile_m x 8, so the herd shrinks: direct 2x4, drain 4x4, fused-cast 2x4 (per-method `herd` overrides the file-level 8x4).",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 1073,
+          "mean_rel_L1": 0.0099,
+          "tier": "high",
+          "herd": [
+            2,
+            4
+          ]
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 1796,
+          "mean_rel_L1": 0.0094,
+          "tier": "high",
+          "herd": [
+            4,
+            4
+          ]
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 96
+          },
+          "gflops": 1234,
+          "mean_rel_L1": 0.011,
+          "tier": "low",
+          "herd": [
+            2,
+            4
+          ]
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 256,
+      "K": 1024,
+      "N": 3072,
+      "used_by": "transformer-layer study baseline_1024 qkv_proj (seq=256)",
+      "_note": "M=256 is smaller than tile_m x 8, so the herd shrinks: direct 4x4, fused-cast 4x4 (per-method `herd` overrides the file-level 8x4).",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 1852,
+          "mean_rel_L1": 0.0099,
+          "tier": "high",
+          "herd": [
+            4,
+            4
+          ]
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 512,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 3200,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 2403,
+          "mean_rel_L1": 0.011,
+          "tier": "low",
+          "herd": [
+            4,
+            4
+          ]
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 512,
+      "K": 1024,
+      "N": 3072,
+      "used_by": "transformer-layer study baseline_1024 qkv_proj (seq=512)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 96
+          },
+          "gflops": 2754,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 3952,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4506,
+          "mean_rel_L1": 0.011,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 1024,
+      "K": 1024,
+      "N": 3072,
+      "used_by": "transformer-layer study baseline_1024 qkv_proj (seq=1024)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 3739,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 3977,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 512,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4878,
+          "mean_rel_L1": 0.011,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 4096,
+      "K": 1024,
+      "N": 3072,
+      "used_by": "transformer-layer study baseline_1024 qkv_proj (seq=4096)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4709,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4153,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 96
+          },
+          "gflops": 4967,
+          "mean_rel_L1": 0.011,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "fused-cast",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 8192,
+      "K": 1024,
+      "N": 3072,
+      "used_by": "transformer-layer study baseline_1024 qkv_proj (seq=8192)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 96
+          },
+          "gflops": 4784,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4142,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5194,
+          "mean_rel_L1": 0.011,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "fused-cast",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 16384,
+      "K": 1024,
+      "N": 3072,
+      "used_by": "transformer-layer study baseline_1024 qkv_proj (seq=16384)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5042,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4180,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5286,
+          "mean_rel_L1": 0.011,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "fused-cast",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 64,
+      "K": 1024,
+      "N": 4096,
+      "used_by": "transformer-layer study baseline_1024 ffn_up (seq=64)",
+      "_note": "M=64 is smaller than tile_m x 8, so the herd shrinks: direct 1x4, drain 2x4, fused-cast 1x4 (per-method `herd` overrides the file-level 8x4).",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 538,
+          "mean_rel_L1": 0.0099,
+          "tier": "high",
+          "herd": [
+            1,
+            4
+          ]
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 943,
+          "mean_rel_L1": 0.0095,
+          "tier": "high",
+          "herd": [
+            2,
+            4
+          ]
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 527,
+          "mean_rel_L1": 0.011,
+          "tier": "low",
+          "herd": [
+            1,
+            4
+          ]
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 128,
+      "K": 1024,
+      "N": 4096,
+      "used_by": "transformer-layer study baseline_1024 ffn_up (seq=128)",
+      "_note": "M=128 is smaller than tile_m x 8, so the herd shrinks: direct 2x4, drain 4x4, fused-cast 2x4 (per-method `herd` overrides the file-level 8x4).",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 1154,
+          "mean_rel_L1": 0.0099,
+          "tier": "high",
+          "herd": [
+            2,
+            4
+          ]
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 1847,
+          "mean_rel_L1": 0.0095,
+          "tier": "high",
+          "herd": [
+            4,
+            4
+          ]
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 1246,
+          "mean_rel_L1": 0.011,
+          "tier": "low",
+          "herd": [
+            2,
+            4
+          ]
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 256,
+      "K": 1024,
+      "N": 4096,
+      "used_by": "transformer-layer study baseline_1024 ffn_up (seq=256)",
+      "_note": "M=256 is smaller than tile_m x 8, so the herd shrinks: direct 4x4, fused-cast 4x4 (per-method `herd` overrides the file-level 8x4).",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 1995,
+          "mean_rel_L1": 0.0099,
+          "tier": "high",
+          "herd": [
+            4,
+            4
+          ]
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 3411,
+          "mean_rel_L1": 0.0095,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 2359,
+          "mean_rel_L1": 0.011,
+          "tier": "low",
+          "herd": [
+            4,
+            4
+          ]
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 512,
+      "K": 1024,
+      "N": 4096,
+      "used_by": "transformer-layer study baseline_1024 ffn_up (seq=512)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 3110,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 3992,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4533,
+          "mean_rel_L1": 0.011,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 1024,
+      "K": 1024,
+      "N": 4096,
+      "used_by": "transformer-layer study baseline_1024 ffn_up (seq=1024)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4003,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 64
+          },
+          "gflops": 3488,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 512,
+            "tile_k_l1": 32,
+            "tile_n": 64
+          },
+          "gflops": 4459,
+          "mean_rel_L1": 0.011,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "fused-cast",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 2048,
+      "K": 1024,
+      "N": 4096,
+      "used_by": "transformer-layer study baseline_1024 ffn_up (seq=2048)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 512,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4292,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 512,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 3932,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5118,
+          "mean_rel_L1": 0.011,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "fused-cast",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 4096,
+      "K": 1024,
+      "N": 4096,
+      "used_by": "transformer-layer study baseline_1024 ffn_up (seq=4096)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4800,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4126,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4910,
+          "mean_rel_L1": 0.011,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "fused-cast",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 8192,
+      "K": 1024,
+      "N": 4096,
+      "used_by": "transformer-layer study baseline_1024 ffn_up (seq=8192)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4966,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4065,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5264,
+          "mean_rel_L1": 0.011,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "fused-cast",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 16384,
+      "K": 1024,
+      "N": 4096,
+      "used_by": "transformer-layer study baseline_1024 ffn_up (seq=16384)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5053,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4180,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5222,
+          "mean_rel_L1": 0.011,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "fused-cast",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 64,
+      "K": 4096,
+      "N": 1024,
+      "used_by": "transformer-layer study baseline_1024 ffn_down (seq=64)",
+      "_note": "M=64 is smaller than tile_m x 8, so the herd shrinks: direct 1x4, drain 2x4, fused-cast 1x4 (per-method `herd` overrides the file-level 8x4).",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 648,
+          "mean_rel_L1": 0.0099,
+          "tier": "high",
+          "herd": [
+            1,
+            4
+          ]
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 1239,
+          "mean_rel_L1": 0.0094,
+          "tier": "high",
+          "herd": [
+            2,
+            4
+          ]
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 584,
+          "mean_rel_L1": 0.015,
+          "tier": "low",
+          "herd": [
+            1,
+            4
+          ]
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 128,
+      "K": 4096,
+      "N": 1024,
+      "used_by": "transformer-layer study baseline_1024 ffn_down (seq=128)",
+      "_note": "M=128 is smaller than tile_m x 8, so the herd shrinks: direct 2x4, drain 4x4, fused-cast 2x4 (per-method `herd` overrides the file-level 8x4).",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 512,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 1318,
+          "mean_rel_L1": 0.0099,
+          "tier": "high",
+          "herd": [
+            2,
+            4
+          ]
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 2454,
+          "mean_rel_L1": 0.0095,
+          "tier": "high",
+          "herd": [
+            4,
+            4
+          ]
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 1364,
+          "mean_rel_L1": 0.015,
+          "tier": "low",
+          "herd": [
+            2,
+            4
+          ]
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 256,
+      "K": 4096,
+      "N": 1024,
+      "used_by": "transformer-layer study baseline_1024 ffn_down (seq=256)",
+      "_note": "M=256 is smaller than tile_m x 8, so the herd shrinks: direct 4x4, fused-cast 4x4 (per-method `herd` overrides the file-level 8x4).",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 2439,
+          "mean_rel_L1": 0.0099,
+          "tier": "high",
+          "herd": [
+            4,
+            4
+          ]
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 512,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4656,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 512,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 2674,
+          "mean_rel_L1": 0.015,
+          "tier": "low",
+          "herd": [
+            4,
+            4
+          ]
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 512,
+      "K": 4096,
+      "N": 1024,
+      "used_by": "transformer-layer study baseline_1024 ffn_down (seq=512)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4081,
+          "mean_rel_L1": 0.0098,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5266,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 64
+          },
+          "gflops": 5122,
+          "mean_rel_L1": 0.015,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 1024,
+      "K": 4096,
+      "N": 1024,
+      "used_by": "transformer-layer study baseline_1024 ffn_down (seq=1024)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5125,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5243,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 512,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5553,
+          "mean_rel_L1": 0.015,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 2048,
+      "K": 4096,
+      "N": 1024,
+      "used_by": "transformer-layer study baseline_1024 ffn_down (seq=2048)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 512,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5835,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 512,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5433,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 512,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5551,
+          "mean_rel_L1": 0.015,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "fused-cast",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 4096,
+      "K": 4096,
+      "N": 1024,
+      "used_by": "transformer-layer study baseline_1024 ffn_down (seq=4096)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 6379,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 512,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5433,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5676,
+          "mean_rel_L1": 0.015,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "fused-cast",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 8192,
+      "K": 4096,
+      "N": 1024,
+      "used_by": "transformer-layer study baseline_1024 ffn_down (seq=8192)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 6655,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5528,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5735,
+          "mean_rel_L1": 0.015,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "fused-cast",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 16384,
+      "K": 4096,
+      "N": 1024,
+      "used_by": "transformer-layer study baseline_1024 ffn_down (seq=16384)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 6780,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5563,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5762,
+          "mean_rel_L1": 0.015,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "fused-cast",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 64,
+      "K": 1024,
+      "N": 1024,
+      "used_by": "transformer-layer study baseline_1024 o_proj (seq=64)",
+      "_note": "M=64 is smaller than tile_m x 8, so the herd shrinks: direct 1x4, drain 2x4, fused-cast 1x4 (per-method `herd` overrides the file-level 8x4).",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 365,
+          "mean_rel_L1": 0.01,
+          "tier": "high",
+          "herd": [
+            1,
+            4
+          ]
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 745,
+          "mean_rel_L1": 0.0096,
+          "tier": "high",
+          "herd": [
+            2,
+            4
+          ]
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 468,
+          "mean_rel_L1": 0.011,
+          "tier": "low",
+          "herd": [
+            1,
+            4
+          ]
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 128,
+      "K": 1024,
+      "N": 1024,
+      "used_by": "transformer-layer study baseline_1024 o_proj (seq=128)",
+      "_note": "M=128 is smaller than tile_m x 8, so the herd shrinks: direct 2x4, drain 4x4, fused-cast 2x4 (per-method `herd` overrides the file-level 8x4).",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 679,
+          "mean_rel_L1": 0.0099,
+          "tier": "high",
+          "herd": [
+            2,
+            4
+          ]
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 1512,
+          "mean_rel_L1": 0.0095,
+          "tier": "high",
+          "herd": [
+            4,
+            4
+          ]
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 1101,
+          "mean_rel_L1": 0.011,
+          "tier": "low",
+          "herd": [
+            2,
+            4
+          ]
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 256,
+      "K": 1024,
+      "N": 1024,
+      "used_by": "transformer-layer study baseline_1024 o_proj (seq=256)",
+      "_note": "M=256 is smaller than tile_m x 8, so the herd shrinks: direct 4x4, fused-cast 4x4 (per-method `herd` overrides the file-level 8x4).",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 1103,
+          "mean_rel_L1": 0.0099,
+          "tier": "high",
+          "herd": [
+            4,
+            4
+          ]
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 2886,
+          "mean_rel_L1": 0.0095,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 2130,
+          "mean_rel_L1": 0.011,
+          "tier": "low",
+          "herd": [
+            4,
+            4
+          ]
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 512,
+      "K": 1024,
+      "N": 1024,
+      "used_by": "transformer-layer study baseline_1024 o_proj (seq=512)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 1543,
+          "mean_rel_L1": 0.0098,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 512,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 3493,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4058,
+          "mean_rel_L1": 0.011,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 4096,
+      "K": 1024,
+      "N": 1024,
+      "used_by": "transformer-layer study baseline_1024 o_proj (seq=4096)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4082,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 64
+          },
+          "gflops": 3766,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5006,
+          "mean_rel_L1": 0.011,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "fused-cast",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 8192,
+      "K": 1024,
+      "N": 1024,
+      "used_by": "transformer-layer study baseline_1024 o_proj (seq=8192)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4570,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 512,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 3985,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5153,
+          "mean_rel_L1": 0.011,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "fused-cast",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 16384,
+      "K": 1024,
+      "N": 1024,
+      "used_by": "transformer-layer study baseline_1024 o_proj (seq=16384)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4897,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4183,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 512,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4911,
+          "mean_rel_L1": 0.011,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "fused-cast",
+        "low": "direct"
+      }
     }
   ]
 }
