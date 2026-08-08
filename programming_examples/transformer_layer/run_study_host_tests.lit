@@ -1,0 +1,32 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase F study harness: the host-only test suite, behind the one entry point.
+//
+// This is doc 09 work item 5 -- "define how it is installed, discovered and
+// invoked from CMake/lit -- a single .lit wrapper so `ninja check-...` remains
+// the one entry point". lit discovers *.lit by glob, so this file needs no
+// registration; the suite it runs discovers test_*.py by glob for the same
+// reason.
+//
+// No NPU, no XRT, no compilation and no framework. The study tier's schema,
+// results I/O, smoke gate, manifest, iron adapter and ladder shape override are
+// all pure host logic, so they gate here rather than waiting for a device.
+// pytest is not installed in the sandbox venv and installing it while a gate or
+// a measurement run is live is the hazard doc 09 records, so these modules run
+// as plain scripts -- written to be collectible by pytest unchanged if it ever
+// lands, but depending on none of it. Same choice, and the same reasoning, as
+// run_block_cache_tests.lit.
+//
+// THE COUNT IS PINNED ON PURPOSE. Discovery alone cannot catch a test that
+// stops being *defined*: delete a test function and a globbing runner happily
+// reports a smaller suite passing. Convention rule 11 exists because iron's
+// pytest.ini collected none of its own study/test_*.py by directory, and that
+// hid real bugs. So the module count and the test count are both matched
+// exactly, and a suite that quietly shrinks fails here instead of passing.
+//
+// Update the numbers below when you add tests. That edit is the point, not
+// friction to route around with a looser pattern.
+//
+// RUN: python3 %S/study/run_host_tests.py | FileCheck %s
+// CHECK: study host tests: 61/61 passed in 6 modules
