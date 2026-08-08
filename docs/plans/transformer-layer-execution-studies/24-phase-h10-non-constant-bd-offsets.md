@@ -7,6 +7,37 @@ design compiles, places, routes, and hangs on hardware.
 
 J7b lost its implement session to this. The rest of that session's work was correct.
 
+## `[2026-08-08]` Outcome: substance verified, tamper baseline not clean
+
+**`H GATE: PASS`, all five legs** — build + install, `check-air-mlir` 489/489, the transformer-layer
+suite on hardware, decode throughput **11.44 tok/s** against a 9.43 floor (above the 11.10 baseline,
+so an earlier 10.66 reading was contention rather than regression), and `make verify` over the ten
+shipped models. **The objective check passed**, including the new self-discriminating clause 1.
+
+**Then the tamper check halted**, and it was right to. Five gate-defining files changed inside the
+phase's window, none of them by a port-loop session:
+
+| file | provenance |
+|---|---|
+| `agents/scripts/port-loop/phases.sh` | operator repair of *this phase's own* clause 1 |
+| `mlir/test/…/async_gemm_to_locks_aie2.mlir` + the two `async_gemm_w_pingpong_*` | explicitly human-authorized; see the note below |
+| `programming_examples/kernel_registry/details/GEMM_bf16_in_bf16_out.json` | the `baseline_512` and `baseline_1024` registry sweeps — unrelated to H10 |
+
+Every one is legitimate and documented, and the tamper check cannot know that — which is exactly
+what it is for. **What is NOT true is that this phase has a clean baseline.** Its fingerprint was
+captured at `bb017619`, and the window that followed contained a human-authorized test rework, an
+operator repair of its own checker, and two registry sweeps that had nothing to do with it.
+
+**Do not resolve this by re-fingerprinting.** That is the move that made an earlier run's tamper
+check vacuous (`lib-guard.sh` records it). The honest options are to accept the halt as the audit
+record — which is what this section is — or to re-run the phase from a baseline that already
+contains the authorized changes, at the cost of a review pass over an empty diff.
+
+**The lesson for the next phase, and it cost nothing to learn here:** a driver phase's window is not
+just its own work. Doing unrelated operator work on gate files — a registry sweep, a checker fix —
+while a phase is open makes that phase's tamper check unable to distinguish its diff from yours. Run
+the sweeps between phases, or expect to explain them afterwards.
+
 ## The defect, located
 
 Two unchecked dereferences in `mlir/lib/Conversion/AIRToAIESchedulingUtils.cpp`:
