@@ -40,10 +40,13 @@ FOOTGUNS
       every measurement had failed.
     - **``fused_elf`` is an execution_mode VALUE, not a column** (doc 03). Adding
       a mode must not add a column, or every existing row becomes unreadable.
-    - **``hybrid`` is iron's name for what this port calls ``coarse``.** Porting
-      convention 7 keeps ``hybrid`` only as a CSV value for diffing against iron
-      result trees, and confines the mapping to this module. It is
-      ``IRON_EXECUTION_MODE_ALIASES`` below and appears nowhere else.
+    - **The CSV value for ``coarse`` is ``hybrid``, and that is not a mistake.**
+      Porting convention 7 renames iron's ``hybrid`` module to ``coarse`` in
+      code, directories and prose, and keeps ``hybrid`` as the CSV *value* so
+      results stay diffable against iron's trees. So ``EXECUTION_MODES`` below
+      lists ``hybrid``, not ``coarse`` -- getting this backwards makes the
+      schema reject every row the shipped modes actually write, which is how it
+      was caught.
     - **The quantization fields are here NOW and empty for bf16 rows** (doc 03).
       Bolting them on later renumbers the schema and invalidates every row
       already written; a ``dtype`` column alone cannot describe a quantized run.
@@ -342,13 +345,31 @@ DISPATCH_VECTOR_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _DISPATCH)
 POWER_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _POWER)
 QUANT_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _QUANT)
 
-#: Taxonomy points. ``fused_elf`` is a VALUE here, never a column.
-EXECUTION_MODES: tuple[str, ...] = ("offload", "runlist", "coarse", "fused_elf")
+#: The CSV values ``execution_mode`` may take -- taxonomy points as they appear
+#: in a results file. ``fused_elf`` is a VALUE here, never a column.
+#:
+#: NOTE the direction, which is easy to get backwards: the code name is
+#: ``coarse`` and the CSV value is ``hybrid``. Porting convention 7 renames
+#: iron's ``hybrid`` module to ``coarse`` "in code, directories and prose" and
+#: keeps ``hybrid`` only as the CSV value, so results stay diffable against
+#: iron's trees. Verified against the shipped artifacts: the recorded
+#: ``coarse`` run carries ``execution_mode='hybrid'``.
+EXECUTION_MODES: tuple[str, ...] = ("offload", "runlist", "hybrid", "fused_elf")
 
-#: iron calls ``coarse`` "hybrid". Porting convention 7: the port names it
-#: ``coarse`` everywhere, and this mapping -- needed only when diffing against
-#: iron result trees -- lives here and nowhere else.
-IRON_EXECUTION_MODE_ALIASES: dict[str, str] = {"hybrid": "coarse"}
+#: mode name in this repository -> its ``execution_mode`` CSV value.
+#:
+#: Convention 7 says to "confine that mapping to one place in the schema
+#: module", and this is that module. It is currently DUPLICATED in
+#: ``pattern/__init__.py::EXECUTION_MODE_CSV``, which predates this file and
+#: which the shipped modes read from; the two agree, and closing the duplication
+#: means pointing that one here rather than adding a third. Asserted equal by
+#: ``test_schema.py`` so they cannot drift in the meantime.
+EXECUTION_MODE_CSV: dict[str, str] = {
+    "coarse": "hybrid",
+    "offload": "offload",
+    "runlist": "runlist",
+    "fused": "fused_elf",
+}
 
 #: Where attention ran. See the ``attention_path`` field on why this is not
 #: derivable from ``execution_mode``.
@@ -419,10 +440,10 @@ def validate_row(row: dict[str, object], table: str = "results") -> None:
             raise ValueError(
                 f"{name}={value!r} is not one of {list(domain)}"
                 + (
-                    f"; iron's {value!r} maps to "
-                    f"{IRON_EXECUTION_MODE_ALIASES[value]!r} -- read it through "
-                    "the adapter rather than writing it here"
-                    if name == "execution_mode" and value in IRON_EXECUTION_MODE_ALIASES
+                    f"; {value!r} is a mode's CODE name -- its CSV value is "
+                    f"{EXECUTION_MODE_CSV[value]!r} (convention 7 keeps the two "
+                    "different so results stay diffable against iron's)"
+                    if name == "execution_mode" and value in EXECUTION_MODE_CSV
                     else ""
                 )
             )

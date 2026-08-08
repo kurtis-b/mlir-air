@@ -85,9 +85,10 @@ def test_adapted_row_is_valid_against_the_schema():
     schema.validate_row(out, "results")  # must not raise
 
 
-def test_hybrid_becomes_coarse():
+def test_hybrid_crosses_unchanged():
+    """It is this study's CSV value too (convention 7), so nothing to translate."""
     out = iron_adapter.adapt_iron_row(IRON_ROW)
-    assert out["execution_mode"] == "coarse"
+    assert out["execution_mode"] == "hybrid"
 
 
 def test_shape_and_identity_cross():

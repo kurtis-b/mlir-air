@@ -21,8 +21,9 @@ WHAT THESE ARE FOR
     precisely the defect this module exists to prevent.
 
     They also pin two conventions that are easy to undo by accident:
-    ``fused_elf`` staying a VALUE rather than becoming a column, and the
-    ``hybrid`` alias living here and nowhere else (porting convention 7).
+    ``fused_elf`` staying a VALUE rather than becoming a column, and the CSV
+    value for ``coarse`` being ``hybrid`` (porting convention 7) -- which this
+    module originally had backwards.
 """
 
 import os
@@ -87,10 +88,35 @@ def test_fused_elf_is_a_value_not_a_column():
     assert not any("fused" in name for name in schema.RESULTS_FIELDNAMES)
 
 
-def test_hybrid_alias_is_confined_to_the_schema():
-    """Porting convention 7: the port says `coarse`; `hybrid` is a CSV value."""
-    assert schema.IRON_EXECUTION_MODE_ALIASES["hybrid"] == "coarse"
-    assert "hybrid" not in schema.EXECUTION_MODES
+def test_csv_value_for_coarse_is_hybrid():
+    """Convention 7: code name `coarse`, CSV value `hybrid`, on purpose.
+
+    Getting this backwards makes the schema reject every row the shipped modes
+    write -- their recorded artifacts carry execution_mode='hybrid'.
+    """
+    assert schema.EXECUTION_MODE_CSV["coarse"] == "hybrid"
+    assert "hybrid" in schema.EXECUTION_MODES
+    assert "coarse" not in schema.EXECUTION_MODES
+
+
+def test_mode_mapping_agrees_with_the_pattern_package():
+    """The mapping is duplicated in pattern/__init__.py; pin them equal.
+
+    Convention 7 wants it in the schema module; that one predates this file and
+    the shipped modes read from it. Until the duplication is closed by pointing
+    that one here, drift between them is the failure to catch.
+    """
+    import os, sys
+
+    example = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if example not in sys.path:
+        sys.path.insert(0, example)
+    from pattern import EXECUTION_MODE_CSV as shipped
+
+    assert shipped == schema.EXECUTION_MODE_CSV, (
+        f"mode->CSV mapping drifted: pattern/__init__.py has {shipped}, "
+        f"schema.py has {schema.EXECUTION_MODE_CSV}"
+    )
 
 
 def test_quant_fields_present_from_v1():
@@ -116,7 +142,7 @@ def test_empty_row_is_complete_and_versioned():
 def test_a_failed_measurement_is_still_a_valid_row():
     """The Phase F gate's premise: a failed run writes a complete, valid row."""
     row = schema.empty_row()
-    row["execution_mode"] = "coarse"
+    row["execution_mode"] = "hybrid"
     row["run_status"] = "failed"
     row["failure_message"] = "ERT_CMD_STATE_TIMEOUT"
     schema.validate_row(row)  # must not raise despite every metric being None
@@ -140,11 +166,11 @@ def test_validate_rejects_a_foreign_schema_version():
     _raises(ValueError, "use the adapter", schema.validate_row, row)
 
 
-def test_validate_points_at_the_adapter_for_irons_mode_name():
-    """Writing iron's `hybrid` here is a mistake with a specific remedy."""
+def test_validate_names_the_csv_value_when_given_a_code_name():
+    """Writing the CODE name `coarse` is the mistake; say what to write."""
     row = schema.empty_row()
-    row["execution_mode"] = "hybrid"
-    _raises(ValueError, "adapter", schema.validate_row, row)
+    row["execution_mode"] = "coarse"
+    _raises(ValueError, "its CSV value is 'hybrid'", schema.validate_row, row)
 
 
 def test_validate_rejects_an_unknown_run_status():

@@ -28,7 +28,7 @@ import schema  # noqa: E402
 import smoke_gate  # noqa: E402
 
 
-def _row(status, msg=None, mode="coarse"):
+def _row(status, msg=None, mode="hybrid"):
     row = schema.empty_row("results")
     row["execution_mode"] = mode
     row["run_status"] = status

@@ -172,9 +172,11 @@ def adapt_iron_row(
         if iron_name in row:
             out[ours] = row[iron_name]
 
-    mode = out.get("execution_mode")
-    if mode in schema.IRON_EXECUTION_MODE_ALIASES:
-        out["execution_mode"] = schema.IRON_EXECUTION_MODE_ALIASES[mode]
+    # execution_mode needs NO translation. Convention 7 keeps `hybrid` as this
+    # study's CSV value for coarse precisely so iron's trees stay diffable, so
+    # the value crosses unchanged. An earlier revision rewrote `hybrid` to
+    # `coarse` here, which turned a valid CSV value into one the schema rejects
+    # -- the code name and the CSV value are different on purpose.
 
     # iron rows carry no attention_path; leaving it None is honest, and
     # validate_row permits it. Inferring one from execution_mode would be a
