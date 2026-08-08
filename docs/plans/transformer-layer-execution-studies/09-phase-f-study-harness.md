@@ -211,6 +211,30 @@ and it reported 21/21 passed on an environment where every measurement had faile
 environment still writes complete, well-formed CSVs full of failed rows. The gate must also
 report the first `failure_message` verbatim, which is usually enough to identify the cause.
 
+### `[2026-08-08]` The gate passes on hardware, over all four modes
+
+Measured through the harness's own `run_mode.py` at `baseline_768` seq 4096, `--warmup 1
+--samples 2`, one mode at a time under `/tmp/mlir-air-npu.lock`. **`smoke_gate`: PASS (4 CSVs,
+each with a passed row). `manifest`: `complete: True`.** Artifacts in the gitignored
+`programming_examples/transformer_layer/results/phasef_smoke/`.
+
+| mode | subs | entries | air | herd | sync | bytes | avg ms |
+|---|---|---|---|---|---|---|---|
+| `coarse` | 4 | 131 | 12 | 146 | 396 | 188,743,680 | 731.6 |
+| `offload` | 6 | 6 | 7 | 19 | 19 | 139,984,896 | 606.5 |
+| `runlist` | 5 | 391 | 14 | 404 | 395 | 150,994,944 | 787.7 |
+| `fused` | 1 | 3 | 16 | 24 | 13 | 157,286,400 | 537.1 |
+
+**All four distinguishability clauses hold on this data**, including J4's replacement — so the
+clause is now verified against a measurement rather than only against a fixture. The two
+recorded-but-not-gating predictions (`fused entries < coarse`, `fused air_launches >= coarse`)
+also hold.
+
+**Do not read the latency column as a study result.** Attention placement still varies across
+these modes (see the confound above), `--samples 2` is not a distribution, and `fused` is fastest
+here partly *because* it runs attention on the host. The numbers that mean something today are the
+structural ones — the six-field vectors — which is exactly what the gate checks.
+
 ## Risks
 
 - The schema and resource-artifact questions are both prerequisites; starting the bulk port
