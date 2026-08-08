@@ -150,7 +150,7 @@ _OFFLOAD_CMD = ["mode", "--operator", "offload", "--expect-no-aggregation", "--m
 _COLLAPSE_CMD = ["mode", "--operator", "coarse",
                  "--max-field", "runlist_entries", "--max-value", "10"]
 _COMPARE_CMD = ["compare", "--left", "runlist", "--right", "coarse",
-                "--field", "runlist_entries", "--relation", "gt"]
+                "--field", "herd_launches", "--relation", "gt"]
 
 
 def _ladder_case(seq_lens, want_pass):
@@ -301,10 +301,14 @@ def selftest():
     case("offload aggregating into a runlist", offload_aggregates, False)
 
     def runlist_not_finer(d, f, l, r, fr):
-        v = [_vec(1, 10, 20, 160, 420, 210000000)]
+        # herd 140 < coarse's 146 (its four fixture rows sum to 10+64+8+64, D2's real
+        # measurement). Entries stay HIGH at 150 on purpose: the case must violate the
+        # herd_launches clause specifically, and would silently pass if it were violating the
+        # retired entries clause instead. `[2026-08-08]` J4.
+        v = [_vec(1, 150, 20, 140, 420, 210000000)]
         d["runlist"]["dispatch_vectors"] = v
         f["runlist"]["dispatch_vectors"] = v
-    case("runlist no finer than coarse", runlist_not_finer, False)
+    case("runlist executes no more than coarse", runlist_not_finer, False)
 
     def fused_syncs_as_much(d, f, l, r, fr):
         v = [_vec(1, 3, 30, 150, 500, 190000000)]
@@ -324,8 +328,8 @@ def selftest():
     case("offload below its submission floor", offload_not_extreme, False, _OFFLOAD_CMD)
 
     # E4's clause: the one ordinal comparison that sub-phase owns.
-    case("runlist finer than coarse (E4's own clause)", None, True, _COMPARE_CMD)
-    case("runlist no finer than coarse, compared directly", runlist_not_finer, False, _COMPARE_CMD)
+    case("runlist executes more than coarse (E4's own clause)", None, True, _COMPARE_CMD)
+    case("runlist executes no more than coarse, compared directly", runlist_not_finer, False, _COMPARE_CMD)
 
     failures = 0
     for name, mutate, want_pass, cmd in cases:

@@ -438,11 +438,18 @@ def distinguish(totals_by_mode):
             "submissions, but the mode dispatches one GEMM per submission"
         )
 
-    # 3. runlist is finer than coarse. The one ordinal claim that mode owns.
-    if not r["runlist_entries"] > c["runlist_entries"]:
+    # 3. runlist EXECUTES more than coarse. The one ordinal claim that mode owns.
+    #
+    #    `[2026-08-08]` This asserted `runlist_entries > coarse entries` and could not fail:
+    #    `runlist` IS `coarse`'s schedule decomposed into single-operator entries, so more entries
+    #    is true by construction, and a gate that cannot fail measures nothing (J4). Measured
+    #    through Phase F's runner at baseline_768 seq 4096: entries 391 vs 131 -- guaranteed --
+    #    against herd_launches 404 vs 146, which counts executed work rather than dispatch
+    #    packaging and which neither mode fixes by construction.
+    if not r["herd_launches"] > c["herd_launches"]:
         failures.append(
-            f"runlist runlist_entries {r['runlist_entries']} does not exceed coarse's "
-            f"{c['runlist_entries']}"
+            f"runlist herd_launches {r['herd_launches']} does not exceed coarse's "
+            f"{c['herd_launches']}"
         )
 
     # 4. fused removes intermediate host sync, which is what MLIR-level fusion IS.
