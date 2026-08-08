@@ -23,6 +23,37 @@ duplicative.
 Per convention rule 7, code and directories say `coarse`; only the CSV value says `hybrid`, and
 that mapping lives in one place in the schema module.
 
+## `[2026-08-08]` The taxonomy above is WRONG, per the study's author
+
+The table describes the modes by *who sequences the work*. That is not what the four points are
+supposed to isolate. Corrected, from the author:
+
+| Mode | What it isolates | The mechanism it must use |
+|---|---|---|
+| `runlist` | **Reconfiguration overhead.** Every operator in the encoder layer executed **individually, on the device** | one kernel per operator, dispatched back to back; nothing on the host |
+| `offload` | **Reconfiguration MINIMIZED by dynamic partitioning** — only the matmul **loop bounds** are partially reconfigured between shapes | one configured matmul reused across the layer's GEMMs |
+| `coarse` | **Reconfiguration AND sync overhead minimized together**, by *mixing* `runlist` and `fused` per workload | per-operator choice between an individually dispatched kernel and a fused region |
+| `fused` | **DRAM movement eliminated.** The whole encoder layer placed on the array, so nothing but the layer input and output crosses DRAM | **one xclbin**, whole layer resident |
+
+So the spectrum is **reconfiguration cost against DRAM traffic**, and `coarse` is explicitly the
+blend of the two extremes rather than a point of its own.
+
+### What is implemented instead, and the size of each gap
+
+| Mode | Implemented today | Gap |
+|---|---|---|
+| `runlist` | every operator individually on device **except attention, which is host torch** | **attention must move to the device.** This is J2, and it is a search: `attn_scores` already passes on hardware, `attn_output` timed out on 1 of 828 legal configurations. Measured at 1024: 24.15 ms of host attention, 47.8% of the mode's total — so today the mode prices host torch, not reconfiguration |
+| `offload` | six registry GEMMs dispatched one at a time, **everything else host torch** | the mode is currently the *most* host-mediated rather than the reconfiguration-minimizing one. Needs runtime loop-bound reconfiguration, and whether the stack can do that without a full reconfigure is **unestablished** — `runtime_loop_tiling_sizes` is a compile-time backend kwarg today |
+| `coarse` | the D2 block: five coarse fused kernels, four submissions | not a blend of anything. It cannot become one until `runlist` and `fused` mean what they should |
+| `fused` | **three ELFs**, and every operator boundary inside the tail still round-trips through DRAM | two gaps, and the second is the larger. One xclbin is blocked by a **backend-settings conflict** this mode already documents: FlashAttention needs `omit_pingpong="all"` + `runtime_loop_tiling_sizes=[1,1]`, the wide GEMMs need `[2,2]`, and one ELF is one aircc invocation. "No DRAM between operators" needs the whole layer L1/L2-resident — `norm_tail` (J7a) does that for the two norm points, `ffn_accum` (J7b) for the down-projection K loop, and nothing does it for the rest |
+
+**The measurement consequence.** Every result recorded before this correction — including the
+sequence ladder in [25](25-first-study-result-sequence-ladder.md) and its crossover — ranks four
+modes that are not the four modes the study means. The device/host split now recorded per mode
+(`device_ms`, `sync_ms`, `host_cpu_ms`) is what makes the difference visible: `offload` has the
+second-lowest **device** time of the four and the highest total, because 61.6% of it is host torch
+it is not supposed to be running at all.
+
 ## Why a single dispatch count does not work
 
 `[Codex]` iron records `npu_dispatch_count`. That metric does not exist in MLIR-AIR, and
