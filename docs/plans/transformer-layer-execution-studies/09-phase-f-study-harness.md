@@ -176,6 +176,37 @@ breaking a convention.
   that conflicts with the CPU-only index the root requirements pin. Document the force-reinstall.
 - `fcntl` and `pwd` make this tier POSIX-only. State that.
 
+### `[2026-08-08]` Power: iron's backend cannot run here, and no NPU counter exists
+
+Measured on this host, because J6 lists power among the cost metrics and `end_to_end/power.py`
+(409 lines) is in the portable set — so it would have been ported before anyone checked whether it
+can take a sample.
+
+| path | result |
+|---|---|
+| `sudo -n turbostat --show PkgWatt` — **iron's actual invocation** | **unavailable.** `sudo -n` fails: a password is required. Iron's backend cannot run unattended here at all |
+| `turbostat --no-msr` unprivileged | installed (2026.02.14), exits 0, and emits **no samples** — `PkgWatt` needs MSR access |
+| `/sys/class/powercap/intel-rapl:0/energy_uj` (`package-0`) | **readable unprivileged.** Differencing it gave 19.96 W over 2.00 s. The `intel-rapl:0:0` (`core`) sub-zone is *not* readable |
+| `/sys/class/hwmon/hwmon10/power1_average`, label `PPT` (`amdgpu`) | **readable unprivileged**, 22.05 W |
+| `amdxdna` driver sysfs (the NPU) | exposes `power_state` only — a PM state, **no energy or power counter** |
+
+Two conclusions, and the second is the load-bearing one.
+
+**A root-free backend exists, and it is not turbostat.** Difference the RAPL `package-0` counter, or
+read `amdgpu`'s `PPT`. Either keeps Phase G's unattended runner from needing root, which iron's
+design does not. Port `power.py`'s *statistics* — the outlier detection, the percentile summary, the
+probe-completeness policy — and replace its sampling backend rather than porting the `sudo` call.
+
+**No sensor on this platform measures the NPU.** RAPL `package-0` is CPU package energy and
+`amdgpu`'s `PPT` is the GPU/SoC rail. On an APU the NPU shares that SoC power envelope, so neither
+number isolates it. That is not a wiring problem to solve later: it means a power comparison
+*between execution modes* partly measures **host CPU work**, and the modes differ in exactly that —
+some run attention on the host. So the confound this document already records for latency applies
+to power with more force, since the host contribution is not merely a share of the number, it is
+most of what the available sensors can see. **Decide what a power study claims before porting the
+plumbing for it**; "watts per token on the NPU" is not measurable here, while "SoC watts while
+executing this mode" is.
+
 ## Housekeeping
 
 MLIR-AIR's `.gitignore` has no rules for result trees. Add:

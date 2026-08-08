@@ -90,6 +90,38 @@ downstream of `air-to-aie`.** `air-opt` remains right for pass-level questions, 
 correctly several times in the same run. J7b's accumulator-ring claim was re-checked at `aircc`
 altitude for this reason and holds (`pass_006`, 4 → 2 data-movement ops in the K loop).
 
+## One process per device measurement — a loop over shapes is not a loop
+
+`[2026-08-08]` A sequence-ladder runner that called the measurement function in a loop produced a
+result that looked like a finding and was an artefact of its own structure. `coarse` and `offload`
+walked 512/1024/2048/4096. `runlist` passed 512 and 1024, then failed 2048 **and** 4096 — two
+different ELFs, both reporting "Failed to load ELF kernel for XRT ... contains a kernel symbol
+matching the provided name" for a symbol that `llvm-nm` shows is present. Then `fused` failed its
+**first** rung, 512, which had run clean an hour before.
+
+The pattern is not shape and not mode; it is **cumulative loads in one process**. `runlist` loads
+about ten kernels per rung against `coarse`'s four, and `fused` came thirteenth. XRT kernel and
+context handles accumulate until the next load fails, so the failure lands on whichever rung is
+unlucky.
+
+Written up in process, that reads *"runlist cannot run at 2048"* — a false limit, attributed to a
+mode, in the exact voice a study uses for a real result. Nothing about the message suggests the
+harness. The tell was that the same mode and shape had passed alone minutes earlier, which is only
+visible if a single-shape path exists to compare against.
+
+**So every device measurement runs in a child process that exits before the next begins**, and the
+ladder invokes the single-shape CLI rather than importing it — which also makes a ladder row and a
+single-shape row identical in provenance. This is what iron's `end_to_end/modes.py` subprocess
+isolation is for; it reads like defensive scaffolding until a run walks far enough to need it, and
+it was on the list of iron scaffolding to consider dropping.
+
+**Corollary — measurement conditions are part of the measurement.** The same `coarse` at 4096 read
+488 ms as a later rung of a shared process and 731 ms alone in a fresh one earlier the same
+morning, a 1.5× spread on identical code. Host CPU load is the other half of it: compilation sits
+outside the clock, but host-side dispatch does not, so anything CPU-heavy running alongside inflates
+whichever rung it overlaps. Re-measure a whole comparison under one set of conditions rather than
+assembling it from runs taken under several.
+
 ## Silence is the wrong default for `air-fuse-packet-put-loops`
 
 H1s settled "skip and warn, never refuse to compile" for `air-label-scf-for-to-ping-pong`, and that
