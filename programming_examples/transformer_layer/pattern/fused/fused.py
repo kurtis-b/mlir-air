@@ -730,6 +730,15 @@ def prepare_fused(shape, seed=42):
             "stages": stages,
             "stages_passed": clean == len(stages),
             "dispatch_vectors": vector_rows,
+            # The same decomposition the host-mediated modes report. This mode
+            # runs NO host compute, so host_cpu_ms is empty BY CONSTRUCTION --
+            # which is the comparison: offload's attention is host time, this
+            # mode's is device time, and until now both landed in one number.
+            "device_ms": sum(
+                float(r.get("device_submission_ms", 0.0)) for r in vector_rows
+            ),
+            "sync_ms": sum(float(r.get("host_sync_ms", 0.0)) for r in vector_rows),
+            "host_cpu_ms": {},
         }
 
     record_extra = {

@@ -196,8 +196,18 @@ def test_empty_vector_does_not_divide_by_zero():
 
 
 def test_row_carries_all_six_fields():
+    """The six schema fields, plus the two timings that are NOT schema fields.
+
+    `[2026-08-08]` device_submission_ms and host_sync_ms were measured from the
+    first dispatch vector and thrown away. They are surfaced here so a mode can
+    report how much of its latency is the NPU, but they are deliberately not
+    study-schema columns -- adding one of those is a version bump, and the
+    study reads these out of the dispatch extra instead. This test pins both
+    halves: the six must all be present, and the timings must not be mistaken
+    for schema fields.
+    """
     row = DispatchVector().as_row()
-    assert set(row) == {
+    schema_fields = {
         "host_submissions_per_layer",
         "runlist_entries_per_submission",
         "air_launches_per_elf",
@@ -205,6 +215,9 @@ def test_row_carries_all_six_fields():
         "sync_boundaries",
         "bytes_transferred",
     }
+    timings = {"device_submission_ms", "host_sync_ms"}
+    assert schema_fields <= set(row)
+    assert set(row) == schema_fields | timings
 
 
 def test_air_launches_are_counted_once_per_elf():

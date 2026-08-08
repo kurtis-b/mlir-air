@@ -178,6 +178,13 @@ class DispatchVector:
             "herd_launches": self.herd_launches,
             "sync_boundaries": self.sync_boundaries,
             "bytes_transferred": self.bytes_transferred,
+            # Measured here since the first dispatch vector and never surfaced:
+            # device_submission_ms is execute+wait (rule T1), host_sync_ms is
+            # the BO traffic around it. Not schema columns -- the study reads
+            # them out of the dispatch extra -- so adding them here is not a
+            # schema version bump.
+            "device_submission_ms": self.submission_ms,
+            "host_sync_ms": self.sync_ms,
         }
 
 
