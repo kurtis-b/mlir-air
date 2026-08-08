@@ -176,6 +176,30 @@ breaking a convention.
   that conflicts with the CPU-only index the root requirements pin. Document the force-reinstall.
 - `fcntl` and `pwd` make this tier POSIX-only. State that.
 
+### `[2026-08-08]` The latency confound has a cheaper fix than J2, and convention 10 already names it
+
+The recorded plan for the attention-placement confound is J2: move attention onto the device for
+`offload` and `runlist` so all four modes place it identically. That is right for the *design*
+question. It is not the cheapest fix for the *measurement* question, and the measurement fix is
+additive rather than a search over 828 configurations.
+
+`Profiler` (`programming_examples/llms/shared/infra/cache.py`, which convention 10 already requires
+this tier to route through) separates `record_kernel` — an `xrt.run()` — from `record_cpu`, whose
+docstring names "CPU attention fallback" as the case it exists for, and reports the two in separate
+sections. That is exactly the split the confound needs: a mode running attention on the host and a
+mode running it on the device become comparable on their NPU time, with the host contribution
+reported beside it instead of folded in.
+
+**What it costs:** `pattern/` contains no timing at all today — `grep -rn perf_counter pattern/`
+returns nothing — so the whole latency number is the single `perf_counter` that `study/run_mode.py`
+wraps around the dispatch. Adding per-stage `record_kernel`/`record_cpu` calls to the four pattern
+modules is new instrumentation on an untimed seam, not a rewrite of an existing one, and it lands in
+Lane 1 files shared with `main`.
+
+**Until it lands, latency comparisons across modes stay confounded**, and
+`study/ladder_report.py`'s output says so in its own docstring rather than relying on a reader
+remembering this section.
+
 ### `[2026-08-08]` Power: iron's backend cannot run here, and no NPU counter exists
 
 Measured on this host, because J6 lists power among the cost metrics and `end_to_end/power.py`
