@@ -159,9 +159,41 @@ Not compiler work, but Phase H halted on all three and the next compiler phase w
 | J1 | **Collapse the norm dispatches.** Lift `builders/addnorm.py`'s one-trip guard and re-measure `coarse`. Expect 131 entries → ~5. | The single biggest structural divergence from iron. | **`[2026-08-06]` nothing — unblocked.** The blocker was never H1/H2; it was the packet feed order, fixed in `bfb647d9`. The fixture's `--variant inside` now runs two trips on hardware with zero mismatches at the exact shape the guard was written for. This is the highest-value item in the tranche and it is ready. |
 | J2 | **Attention on device for `offload` and `runlist`.** `attn_scores` (4096×64×4096) already **passes on hardware** with hand-chosen tiles, zero mismatches — the registry was never a buildability constraint. `attn_output` (4096×4096×64) timed out on the one configuration tried, out of 828 legal ones; search the rest. | Today two modes run attention on the host and two on the device, so a mode-versus-mode comparison varies attention placement *and* dispatch boundary. Attention dominates the layer, so the confound is not small. | — |
 | J3 | **Walk the `baseline_768` sequence ladder** for all four modes. E1 unblocked it; nothing has used it. | A tradeoff analysis at a single shape has no curves and therefore no crossover — which is the result the study exists to produce. | — |
-| J4 | **Replace distinguishability clause 3.** `runlist entries > coarse entries` is now true by construction. Use `herd_launches` (404 vs 146), which counts executed work rather than dispatch packaging and which neither mode fixes by construction. | A gate that cannot fail measures nothing. | J1 re-measures both |
+| J4 | **Replace distinguishability clause 3.** `runlist entries > coarse entries` is now true by construction. Use `herd_launches` (404 vs 146), which counts executed work rather than dispatch packaging and which neither mode fixes by construction. **`[2026-08-08]` The proposed metric is now MEASURED and the predicted numbers hold exactly** — see below. Ready to implement in `phase_e_checks.py`. | A gate that cannot fail measures nothing. | ~~J1 re-measures both~~ — not needed; measured directly through Phase F's runner |
 | J5 | **Wire `decoder_gpt2`.** The oracle implements and tests it; no mode dispatches it. | It is the causal, LLM-shaped workload. Encoder-only makes this a study of a BERT layer, not of executing LLMs. | — |
 | J6 | **Phase F cost metrics.** Latency, power, resource usage, GFLOPs — the seven studies in [09](09-phase-f-study-harness.md). | The dispatch vector is a proxy for cost, not cost. Until this lands there are no tradeoffs, only structure. | J2, J3 |
+
+### `[2026-08-08]` J4's replacement metric, measured
+
+Three modes run through Phase F's runner at `baseline_768`, `seq 4096`, one row each:
+
+| mode | submissions | entries/submission | air launches | herd launches | sync | avg ms |
+|---|---|---|---|---|---|---|
+| `coarse` | 4 | 32.75 | 12 | **146** | 396 | 455 |
+| `offload` | 6 | **1.00** | 7 | 19 | 19 | 767 |
+| `runlist` | 5 | 78.20 | 14 | **404** | 395 | 788 |
+
+**`herd_launches` 404 vs 146 is exactly what J4 predicted**, so the replacement is ready to
+implement in `phase_e_checks.py` rather than still being a proposal.
+
+Why the current clause cannot fail, in the same numbers: `runlist` totals 78.20 × 5 = 391 entries
+against `coarse`'s 32.75 × 4 = 131, and `runlist` is *defined* as the decomposition of `coarse`'s
+schedule, so "more entries" is true by construction. `herd_launches` counts executed work rather
+than dispatch packaging, and neither mode fixes it by construction.
+
+`offload` at exactly **1.00 entries per submission** is its own clause satisfied on the nose: it
+aggregates nothing.
+
+Two things to be careful with before reading anything else into this:
+
+- **The latencies are two samples each and not a result.** `coarse` 455 ms < `offload` 767 <
+  `runlist` 788 is a first data point, not a curve — J3's ladder is what produces a crossover.
+- **`entries/submission` is a mean.** A mode's total is `Σ round(mean × submissions)`, not the sum
+  of the means; the two agree only when every submission carries one entry, which is exactly why
+  `offload`'s 1.00 is readable directly and the others are not.
+
+`fused` is not here: its run was stopped part-way to protect a concurrent compiler gate's
+throughput leg, which is a timing measurement and cannot share the device.
 
 ### J7 — pipelined `mha_out_proj` and `ffn` with on-chip partial-sum staging
 
