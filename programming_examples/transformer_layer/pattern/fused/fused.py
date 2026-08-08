@@ -19,10 +19,22 @@ CONTRACT
     launches this mode first shipped. That deletes four whole [seq, emb]
     intermediates from L3 -- ln1_sum, ln1_norm, ln2_sum, ln2_norm -- and drops
     both gammas from a host-materialized [seq, emb] broadcast to the [emb]
-    weight itself. Measured at 1024: 100.2 ms against the decomposed tail's
-    106.5, a 5.9% improvement against this mode's own 1.3% run-to-run spread at
-    that rung; at 512 and 256 the change is inside the spread. BOUNDED TO
-    256..1024 -- see the packing and floor notes below.
+    weight itself.
+
+    IT BUYS NO MEASURABLE LATENCY, and the first write-up of this claimed it
+    did. At 1024 the pipeline measures 98.5/99.2/100.2 ms against the
+    decomposed tail's 97.7/99.0/106.5 -- overlapping ranges, +1.0% on means
+    once the decomposed tail's own high outlier is dropped. The -5.9% first
+    reported here came from comparing three fresh runs against that single
+    outlier, which is the same mistake, on the same day, as the 731 ms entry
+    doc 09 carries a correction for. Compare distributions, not a run against
+    a number.
+
+    What it does buy is verified correctness (10/10 boundaries clean at 256,
+    512 and 1024) and a structurally shorter tail. Whether that is worth
+    anything is not yet measurable here: see the bytes_transferred footgun --
+    the traffic this removes is device-resident and nothing in the port
+    records it. BOUNDED TO 256..1024; see the packing and floor notes below.
 
     THREE THINGS THIS COST, all of them recorded because none is obvious:
       - ``packed1``/``packed2`` are PLANE-MAJOR, so plane 0 is contiguous at
