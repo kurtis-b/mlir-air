@@ -58,6 +58,25 @@ for _p in (_PE, os.path.join(_PE, "llms"), _EXAMPLE, _HERE):
 import results_io  # noqa: E402
 import schema  # noqa: E402
 
+# Which modes run attention on the host. Derived from a fact the code states:
+# `offload` and `runlist` import `blocked_attention` from `pattern/blocked_attention.py`
+# and call it; `coarse` and `fused` import at most `round_bf16` from that module
+# and dispatch attention to the device. `test_attention_path.py` re-derives this
+# from the pattern modules' imports and fails if the map drifts, because the map
+# is a claim about other files.
+#
+# It is recorded per row because it is the single covariate that decides how a
+# latency curve reads -- the sequence ladder's host-attention modes fit a
+# log-log slope of 1.25 against the device-attention modes' 1.03 and 1.15 -- and
+# it was None in every row of the first ladder, which is how the schema had a
+# field for it and the data did not.
+ATTENTION_PATH_BY_MODE = {
+    "coarse": "device",
+    "fused": "device",
+    "offload": "host_torch",
+    "runlist": "host_torch",
+}
+
 
 def _spec_for(mode: str) -> dict:
     """The catalogue row for ``mode``, so shapes are not restated here."""
@@ -116,6 +135,7 @@ def run(
     row["execution_mode"] = schema.EXECUTION_MODE_CSV.get(mode, mode)
     row["backend"] = "xrt"
     row["workload_variant"] = "encoder_bert"
+    row["attention_path"] = ATTENTION_PATH_BY_MODE.get(mode)
     row["batch_size"] = 1
     row["dtype"] = "bf16"
     row["warmup_runs"] = warmup
