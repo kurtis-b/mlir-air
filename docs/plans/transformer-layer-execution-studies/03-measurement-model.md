@@ -73,6 +73,12 @@ entries; `fused_elf` has few submissions with many AIR launches and near-zero in
 > **`[2026-08-05]` Those numbers were predictions, and the first one measured is wrong.** Phase D
 > built the `coarse` layer and recorded its vector: **4 submissions, 131 runlist entries, 12 AIR
 > launches, 146 herd launches, 402 sync boundaries**, not "1 submission with ~6 entries". The
+>
+> > **`[2026-08-08]` Re-measured through Phase F's runner: 4 / 131 / 12 / 146 / **396** / 188743680.**
+> > Five of the six match D2 exactly; `sync_boundaries` is 396 rather than 402. Small, and not
+> > investigated — recorded here so the next reader does not treat 402 as still-current or spend
+> > time rediscovering the gap. The distinguishability gate is ordinal over these totals, so a
+> > six-count drift changes no verdict.
 > cause is not the taxonomy — it is that `build_addnorm_module` caps rows per call, so each of the
 > two normalization points is 64 dispatches, and 128 of those 131 entries are that one operator's
 > row blocking.
