@@ -345,10 +345,27 @@ clause is now verified against a measurement rather than only against a fixture.
 recorded-but-not-gating predictions (`fused entries < coarse`, `fused air_launches >= coarse`)
 also hold.
 
-**Do not read the latency column as a study result.** Attention placement still varies across
-these modes (see the confound above), `--samples 2` is not a distribution, and `fused` is fastest
-here partly *because* it runs attention on the host. The numbers that mean something today are the
-structural ones — the six-field vectors — which is exactly what the gate checks.
+> **`[2026-08-08]` The latency column above is contaminated and superseded. The structural columns
+> stand.** These four runs were taken while host work ran alongside them — builds, a formatter, the
+> test suite. Compilation sits outside the clock; host-side dispatch does not. Measured immediately
+> afterwards, `coarse` at this same 4096 reads **466.9 ms** and **476.9 ms** in two fresh processes
+> on a quiet host, against the **731.6 ms** above: a **1.55× inflation**, larger than any gap this
+> table was being read for.
+>
+> `subs`, `entries`, `air`, `herd`, `sync` and `bytes` are counts, not durations, and are unaffected
+> — so the distinguishability verification, which reads only those, stands. The authoritative
+> latencies are the sequence ladder's, one process per rung on a quiet host.
+>
+> The correction is not "I mis-typed a number": every latency in this table was measured under
+> conditions the runner's own docstring warns against, by me, while I edited files in the same
+> minutes. That is the failure mode, and it is why measurement conditions now appear as a rule in
+> [23](23-rules-and-open-items.md) rather than as advice in a docstring.
+
+**Do not read the latency column as a study result** even once re-measured. Attention placement
+still varies across these modes (see the confound above), `--samples 2` is not a distribution, and
+`fused` is fastest here partly *because* it runs attention on the host. The numbers that mean
+something today are the structural ones — the six-field vectors — which is exactly what the gate
+checks.
 
 ## Risks
 

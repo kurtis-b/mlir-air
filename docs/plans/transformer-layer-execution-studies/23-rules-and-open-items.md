@@ -99,10 +99,22 @@ different ELFs, both reporting "Failed to load ELF kernel for XRT ... contains a
 matching the provided name" for a symbol that `llvm-nm` shows is present. Then `fused` failed its
 **first** rung, 512, which had run clean an hour before.
 
-The pattern is not shape and not mode; it is **cumulative loads in one process**. `runlist` loads
-about ten kernels per rung against `coarse`'s four, and `fused` came thirteenth. XRT kernel and
-context handles accumulate until the next load fails, so the failure lands on whichever rung is
-unlucky.
+The pattern is not shape and not mode; it is **process state**. `runlist` loads about ten kernels
+per rung against `coarse`'s four, and `fused` came thirteenth, so pressure on XRT kernel and context
+handles is what the failing rungs have in common.
+
+**It is not a monotonic ceiling, and the record should not read as one.** `fused` failed 512,
+**passed 1024** (66.3 ms), then failed 2048 and 4096. A handle count that only rises cannot do
+that, so release is happening too — nondeterministically, on whatever schedule the previous rung's
+objects are collected. The rung that fails is therefore the unlucky one rather than every rung past
+a threshold, which is worse for diagnosis: a re-run moves the failures around and each individual
+failure keeps looking like a property of its own shape.
+
+The claim this rule rests on is narrower than a mechanism: **the same mode and shape behaves
+differently depending on what ran in the process before it.** That is enough to invalidate
+in-process laddering, and it is established by `fused` at 512 and by `runlist` at 4096, each of
+which passed alone. The discriminating test is the isolated re-run; if a rung still fails with one
+process per rung, that failure is real and belongs to its shape.
 
 Written up in process, that reads *"runlist cannot run at 2048"* — a false limit, attributed to a
 mode, in the exact voice a study uses for a real result. Nothing about the message suggests the
