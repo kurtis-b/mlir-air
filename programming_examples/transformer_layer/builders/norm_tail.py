@@ -52,6 +52,26 @@ WHY x AND residual ARE PACKED IN ONE BUFFER, AND WHY PER-ROW PLANE PAIRS
     ``rows_per_call`` rows fully CONTIGUOUS in L3 (max stride ``2*cols``), at
     any row count.
 
+    `[2026-08-08]` PLANE-MAJOR IS BACK AS AN OPTION, for a reason the original
+    choice did not weigh: WHO WRITES THE PACKED BUFFER. Row-interleaving is
+    free when the host packs, and the wrong shape entirely when the producer is
+    a device kernel -- which is the case in ``pattern/fused``, the mode this
+    pipeline exists to fix. There ``x``'s partner is ``attn_out``, written by a
+    GEMM in a previous ELF, and the second point's is ``ffn_out``. Interleaving
+    those means teaching the SHARED GEMM builder (used by every LLM model and
+    the whole kernel registry) to write strided, and packing them on the host
+    means a round trip through the host -- the exact sync ``fused`` exists to
+    remove.
+
+    Plane-major has neither problem, because plane 0 is a contiguous
+    ``[rows, cols]`` block AT OFFSET 0: an ordinary contiguous producer writes
+    it with no change at all, and the host fills plane 1. It is bounded by
+    ``rows * cols <= SHIM_BD_STRIDE_MAX``, so at ``cols=768`` it serves
+    ``rows <= 1365`` -- the 64…1024 rungs of the sequence ladder and not 2048
+    and up. That is a real limit and it is stated rather than worked around:
+    the measurement it buys is what should decide whether the strided-GEMM work
+    is worth doing for the longer shapes.
+
     The cost of row-pairing is that x is no longer plane-contiguous inside the
     L1 tile -- and that costs nothing HERE, because the only consumer of the
     packed layout is stage_add's direct codegen (see the next section), which
@@ -197,8 +217,19 @@ def compile_norm_tail_kernels():
     ek.compile_layer_norm()
 
 
+SHIM_BD_STRIDE_MAX = 1 << 20
+
+
 @module_builder
-def build_norm_tail_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_call=4):
+def build_norm_tail_module(
+    rows,
+    cols,
+    np_dtype=bfloat16,
+    herd_x=8,
+    rows_per_call=4,
+    plane_major=False,
+    mirror_out=False,
+):
     """Build the three-herd norm-tail pipeline.
 
     Args:
@@ -228,6 +259,19 @@ def build_norm_tail_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_cal
             f"({herd_x * rows_per_call}): the trip loop advances in "
             "rows_per_call-row bands per column"
         )
+    if plane_major and rows * cols > SHIM_BD_STRIDE_MAX:
+        raise ValueError(
+            f"plane_major packing needs a plane stride of rows*cols "
+            f"({rows}*{cols} = {rows * cols}), over the shim aie.dma_bd cap of "
+            f"{SHIM_BD_STRIDE_MAX}. aircc reports this as \"'aie.dma_bd' op "
+            f'Stride 2 exceeds the [1:{SHIM_BD_STRIDE_MAX}] range", against a '
+            "tile, far from the cause. Use the default row-interleaved packing "
+            "-- whose strides are at most 2*cols at any row count -- and note "
+            "that it requires the PRODUCER to write interleaved, which is why "
+            "plane_major exists at all: at rows*cols within the cap, plane 0 is "
+            "a contiguous [rows, cols] block at offset 0, so an ordinary "
+            "contiguous producer writes it with no change."
+        )
     itemsize = np.dtype(np_dtype).itemsize
     need = _stage_l1_bytes(rows_per_call, cols, itemsize)
     if need > L1_BYTES:
@@ -241,9 +285,14 @@ def build_norm_tail_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_cal
     tile_elems = rows_per_call * cols
 
     xrt_dtype = type_mapper(np_dtype)
-    l3_pk_ty = MemRefType.get([rows, 2, cols], xrt_dtype)
+    l3_pk_ty = MemRefType.get(
+        [2, rows, cols] if plane_major else [rows, 2, cols], xrt_dtype
+    )
     l3_g_ty = MemRefType.get([cols], xrt_dtype)
     l3_out_ty = MemRefType.get([rows, cols], xrt_dtype)
+    # The mirrored output, when the result must ALSO land in a plane of a
+    # downstream packed buffer -- see MIRRORED OUTPUT in the module docstring.
+    l3_out2_ty = MemRefType.get([2, rows, cols], xrt_dtype)
 
     l1_space = IntegerAttr.get(T.i32(), MemorySpace.L1)
     # Flat: rows_per_call pairs of (x row, residual row), 2*cols apart. Flat
@@ -274,15 +323,19 @@ def build_norm_tail_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_cal
             )
         ],
     )
-    # row r's x vector j inside the flat packed tile = r * 2*cols + j; its
-    # residual sits one row-width further, at + cols.
+    # Where row r's x vector j and its residual sit inside the flat L1 tile,
+    # which mirrors whatever the DMA wrote:
+    #   row-interleaved  x at r*2*cols + j,  residual one row-width further
+    #   plane-major      x at r*cols + j,    residual a whole plane further
+    _row_stride = cols if plane_major else 2 * cols
+    _residual_gap = tile_elems if plane_major else cols
     pk_x_map = AffineMap.get(
         0,
         2,
         [
             AffineExpr.get_add(
                 AffineExpr.get_mul(
-                    AffineSymbolExpr.get(0), AffineConstantExpr.get(2 * cols)
+                    AffineSymbolExpr.get(0), AffineConstantExpr.get(_row_stride)
                 ),
                 AffineSymbolExpr.get(1),
             )
@@ -295,11 +348,11 @@ def build_norm_tail_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_cal
             AffineExpr.get_add(
                 AffineExpr.get_add(
                     AffineExpr.get_mul(
-                        AffineSymbolExpr.get(0), AffineConstantExpr.get(2 * cols)
+                        AffineSymbolExpr.get(0), AffineConstantExpr.get(_row_stride)
                     ),
                     AffineSymbolExpr.get(1),
                 ),
-                AffineConstantExpr.get(cols),
+                AffineConstantExpr.get(_residual_gap),
             )
         ],
     )
@@ -323,14 +376,20 @@ def build_norm_tail_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_cal
     Channel(CHANNEL_A2B, size=[herd_x, 1])
     Channel(CHANNEL_B2C, size=[herd_x, 1])
 
-    @FuncOp.from_py_func(l3_pk_ty, l3_g_ty, l3_out_ty)
-    def norm_tail(arg0, arg1, arg2):
+    _sig = [l3_pk_ty, l3_g_ty, l3_out_ty] + ([l3_out2_ty] if mirror_out else [])
 
-        @launch(operands=[arg0, arg1, arg2])
-        def nt_launch(l_pk, l_g, l_out):
+    @FuncOp.from_py_func(*_sig)
+    def norm_tail(*args):
+        _ops = list(args)
 
-            @segment(name="norm_tail_seg", operands=[l_pk, l_g, l_out])
-            def nt_seg(s_pk, s_g, s_out):
+        @launch(operands=_ops)
+        def nt_launch(*l_args):
+            _l = list(l_args)
+
+            @segment(name="norm_tail_seg", operands=_l)
+            def nt_seg(*s_args):
+                s_pk, s_g, s_out = s_args[0], s_args[1], s_args[2]
+                s_out2 = s_args[3] if mirror_out else None
 
                 @herd(name="stage_add", sizes=[herd_x, 1], operands=[s_pk])
                 def stage_add(_tx, _ty, _sx, _sy, h_pk):
@@ -341,18 +400,32 @@ def build_norm_tail_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_cal
 
                     for loop_iv in range_(0, rows_per_tile, rows_per_call):
                         row = affine_apply(row_map, [loop_iv, _tx])
-                        # Both operands in ONE DMA: a band of rows_per_call
-                        # (x row, residual row) pairs is CONTIGUOUS in the
-                        # [rows, 2, cols] packing, so every stride here is at
-                        # most 2*cols -- inside the shim BD's 2^20 range,
-                        # which the plane-major packing exceeds at 4096 rows.
-                        dma_memcpy_nd(
-                            l1_pk,
-                            h_pk,
-                            src_offsets=[row, 0, 0],
-                            src_sizes=[rows_per_call, 2, cols],
-                            src_strides=[2 * cols, cols, 1],
-                        )
+                        # Both operands in ONE DMA either way -- one L3-facing
+                        # stream is what leaves room for gamma inside the
+                        # column's two shim MM2S channels.
+                        if plane_major:
+                            # [2, rows, cols]: the band is one contiguous run
+                            # per plane, planes rows*cols apart. That stride is
+                            # the whole constraint; see the layout precondition.
+                            dma_memcpy_nd(
+                                l1_pk,
+                                h_pk,
+                                src_offsets=[0, row, 0],
+                                src_sizes=[2, rows_per_call, cols],
+                                src_strides=[rows * cols, cols, 1],
+                            )
+                        else:
+                            # [rows, 2, cols]: a band of rows_per_call
+                            # (x row, residual row) pairs is CONTIGUOUS, so
+                            # every stride here is at most 2*cols -- inside the
+                            # shim BD's 2^20 range at any row count.
+                            dma_memcpy_nd(
+                                l1_pk,
+                                h_pk,
+                                src_offsets=[row, 0, 0],
+                                src_sizes=[rows_per_call, 2, cols],
+                                src_strides=[2 * cols, cols, 1],
+                            )
                         # x + residual: elementwise_add's stage body (bf16
                         # vector addf). Row r's x vector j is at
                         # [r*2*cols + j], its residual at [r*2*cols+cols+j];
@@ -409,8 +482,12 @@ def build_norm_tail_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_cal
 
                 stage_norm.attributes["link_with"] = StringAttr.get(NORM_KERNEL_OBJ)
 
-                @herd(name="stage_scale", sizes=[herd_x, 1], operands=[s_g, s_out])
-                def stage_scale(_tx, _ty, _sx, _sy, h_g, h_out):
+                _scale_ops = [s_g, s_out] + ([s_out2] if mirror_out else [])
+
+                @herd(name="stage_scale", sizes=[herd_x, 1], operands=_scale_ops)
+                def stage_scale(_tx, _ty, _sx, _sy, *h_args):
+                    h_g, h_out = h_args[0], h_args[1]
+                    h_out2 = h_args[2] if mirror_out else None
                     c0 = ConstantOp.create_index(0)
                     l1_in = AllocOp(l1_flat_ty, [], [])
                     l1_g = AllocOp(l1_g_ty, [], [])
@@ -464,6 +541,18 @@ def build_norm_tail_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_cal
                             dst_sizes=[rows_per_call, cols],
                             dst_strides=[cols, 1],
                         )
+                        if mirror_out:
+                            # Same band, into plane 1 of the downstream packed
+                            # buffer. A second S2MM stream per column; the
+                            # inbound budget this file protects is MM2S and is
+                            # untouched.
+                            dma_memcpy_nd(
+                                h_out2,
+                                l1_out,
+                                dst_offsets=[1, row, 0],
+                                dst_sizes=[1, rows_per_call, cols],
+                                dst_strides=[rows * cols, cols, 1],
+                            )
                         yield_([])
 
                     DeallocOp(l1_in)
@@ -471,19 +560,27 @@ def build_norm_tail_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_cal
                     DeallocOp(l1_out)
 
 
-def norm_tail_device_inputs(x, residual):
-    """Pack x and residual as per-row pairs: ``np.stack(axis=1) -> [rows, 2, cols]``.
+def norm_tail_device_inputs(x, residual, plane_major=False):
+    """Pack x and residual for the builder's layout. MUST match the module's.
 
-    Row r's x then row r's residual, back to back -- the layout whose band
-    fetch stays inside the shim BD stride range at ANY row count, which the
-    plane-major ``np.stack(axis=0)`` does not (see the module docstring; it
-    looks equivalent and fails to compile at 4096 rows). Keeping the packing
-    beside the builder is what stops a caller from getting the layout right
-    today and wrong next time.
+    Default is per-row pairs, ``np.stack(axis=1) -> [rows, 2, cols]``: row r's x
+    then row r's residual, back to back -- the layout whose band fetch stays
+    inside the shim BD stride range at ANY row count. Keeping the packing beside
+    the builder is what stops a caller getting the layout right today and wrong
+    next time; the two stacks look interchangeable and are not.
+
+    ``plane_major=True`` gives ``np.stack(axis=0) -> [2, rows, cols]``, which
+    only compiles while ``rows*cols`` is inside the shim BD stride cap. Its
+    reason to exist is not the packing: plane 0 is then a contiguous
+    ``[rows, cols]`` block at offset 0, so a device producer that writes an
+    ordinary contiguous tensor writes plane 0 with NO change to it, and the host
+    fills plane 1. That is what lets this pipeline consume a GEMM's output
+    without teaching the shared GEMM builder to write interleaved.
     """
     if x.shape != residual.shape:
         raise ValueError(f"x {x.shape} and residual {residual.shape} must match")
-    return [np.ascontiguousarray(np.stack([x, residual], axis=1))]
+    axis = 0 if plane_major else 1
+    return [np.ascontiguousarray(np.stack([x, residual], axis=axis))]
 
 
 def norm_tail_reference(x, residual, gamma):

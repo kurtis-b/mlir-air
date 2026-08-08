@@ -11,9 +11,33 @@ CONTRACT
 
         entry 1  qkv_proj    the D2 module, unchanged     (fused-cast GEMM)
         entry 2  mha_out_proj  the D2 module, unchanged   (attention + o_proj)
-        entry 3  fused_tail  ONE stitched module: add + LayerNorm + gamma-mul
-                 (ln1), the whole staged FFN, add + LayerNorm + gamma-mul
-                 (ln2) — ten launches over whole [seq, emb] tensors
+        entry 3  fused_tail  ONE stitched module: the norm_tail PIPELINE
+                 (ln1), the whole staged FFN, the norm_tail PIPELINE (ln2)
+
+    `[2026-08-08]` Both normalization points are J7a's three-herd pipeline
+    (``builders/norm_tail.py``), not the decomposed add/LayerNorm/gamma-mul
+    launches this mode first shipped. That deletes four whole [seq, emb]
+    intermediates from L3 -- ln1_sum, ln1_norm, ln2_sum, ln2_norm -- and drops
+    both gammas from a host-materialized [seq, emb] broadcast to the [emb]
+    weight itself. Measured at 1024: 100.2 ms against the decomposed tail's
+    106.5, a 5.9% improvement against this mode's own 1.3% run-to-run spread at
+    that rung; at 512 and 256 the change is inside the spread. BOUNDED TO
+    256..1024 -- see the packing and floor notes below.
+
+    THREE THINGS THIS COST, all of them recorded because none is obvious:
+      - ``packed1``/``packed2`` are PLANE-MAJOR, so plane 0 is contiguous at
+        offset 0 and the GEMM that writes it needs no change. That caps the
+        mode at rows*cols <= 2^20 (1024 rows at emb 768). Row-interleaving has
+        no cap but demands a strided producer, which means the SHARED GEMM
+        builder.
+      - ``hidden`` is written TWICE by ln1's stage_scale (``mirror_out``): once
+        to its own buffer, which the FFN reads at a base, and once into
+        packed2's plane 1, which ln2 reads. The FFN cannot take a plane offset
+        without that same shared-builder change.
+      - ``ffn_out`` and ``packed2`` are two typed func args over ONE buffer
+        (``_TAIL_BUFFER_ALIAS``); stitch_elf wires args by position with
+        matching types, so the 2-D output view cannot map onto the 3-D packed
+        arg inside the module, and needs no reconciling outside it.
 
     Every intermediate stays device-resident: q/k/v flow from entry 1 to entry
     2 and ``attn_out`` from entry 2 to entry 3 through the BO pool, and inside
@@ -70,10 +94,15 @@ FOOTGUNS
       all of it, and the golden model only supplies inputs and expectations.
     - ``execution_mode`` comes from ``pattern.EXECUTION_MODE_CSV`` — the CSV
       value is ``fused_elf``. Do not inline the string.
-    - The gamma multiplies take a host-materialized ``[seq, emb]`` broadcast
-      of the ``[emb]`` LayerNorm weight, static and content-keyed — under
-      fault injection the key changes and the perturbed broadcast is
-      re-uploaded; nothing special-cases the injected path.
+    - ``bytes_transferred`` CANNOT SEE what the pipeline saves. It counts
+      host<->device sync traffic only, and the four intermediates removed were
+      device-resident, so the column rises here (verification reads back both
+      whole packed buffers for two boundary tensors, and x is uploaded twice)
+      while the traffic that actually fell is unmeasured. Latency is the only
+      proxy this port has for it today.
+    - ln2's gamma is now the ``[emb]`` weight, like ln1's. Both are static and
+      content-keyed; under fault injection the key changes and the perturbed
+      weight is re-uploaded, and nothing special-cases the injected path.
 """
 
 import os
@@ -107,6 +136,7 @@ from builders.elementwise_mul import (  # noqa: E402
 )
 from builders.ffn import build_ffn_module, ffn_arg_layout  # noqa: E402
 from builders.layer_norm import build_layer_norm_module  # noqa: E402
+from builders.norm_tail import build_norm_tail_module  # noqa: E402
 from builders.mha_out_proj import (  # noqa: E402
     MHA_OUT_PROJ_RUNNER_KWARGS,
     build_mha_out_proj_module,
@@ -150,6 +180,12 @@ _GEMM_BACKEND = {
     "omit_while_true_loop": False,
 }
 
+#: Tail func args that are backed by another arg's buffer. ``ffn_out`` is the
+#: FFN slice's 2-D output view of ``packed2``'s plane 0: one BO, two typed args,
+#: because the types cannot be reconciled inside the stitched module and do not
+#: need to be outside it.
+_TAIL_BUFFER_ALIAS = {"ffn_out": "packed2"}
+
 #: The stitched tail's combined func name, and therefore its instance_name — a
 #: mismatch does not fail to load, it times out far from the cause.
 _TAIL_FUNC = "fused_tail"
@@ -186,12 +222,14 @@ def fused_tail_arg_layout(seq_len, emb_dim, ffn_dim, up_spec, down_spec):
 
     act = f"memref<{seq_len}x{emb_dim}xbf16>"
     wide = f"memref<{seq_len}x{ffn_dim}xbf16>"
-    add("attn_out", act)  # entry 2's output, this module's first input
-    add("x", act)  # the layer input, ln1's residual
-    add("gamma1", act)  # ln1 weight, broadcast to [seq, emb]
-    add("ln1_sum", act)  # attn_out + x           (device-resident)
-    add("ln1_norm", act)  # LayerNorm(ln1_sum)     (device-resident)
-    add("hidden", act)  # ln1_norm * gamma1 — FFN input AND ln2 residual
+    # ln1 is the norm_tail PIPELINE (J7a), not three staged launches. Its two
+    # operands arrive in one plane-major buffer: plane 0 is entry 2's output,
+    # written contiguously at offset 0 by a GEMM that needs no change, and
+    # plane 1 is the layer input, filled by the host. ln1_sum and ln1_norm are
+    # gone -- they were the L3 round trips the pipeline exists to delete.
+    add("packed1", f"memref<2x{seq_len}x{emb_dim}xbf16>")
+    add("gamma1", f"memref<{emb_dim}xbf16>")  # the weight itself, NOT broadcast
+    add("hidden", act)  # LayerNorm(p0 + p1) * gamma1 — FFN in AND ln2 residual
     add("w_up", f"memref<{emb_dim}x{ffn_dim}xbf16>")
     if up_spec["needs_f32_scratch"]:
         add("ffn_up_f32", f"memref<{seq_len}x{ffn_dim}xf32>")
@@ -200,10 +238,20 @@ def fused_tail_arg_layout(seq_len, emb_dim, ffn_dim, up_spec, down_spec):
     add("w_down", f"memref<{ffn_dim}x{emb_dim}xbf16>")
     if down_spec["needs_f32_scratch"]:
         add("ffn_out_f32", f"memref<{seq_len}x{emb_dim}xf32>")
+    # ln2 is the pipeline too. Plane 0 is the FFN's output and plane 1 is
+    # `hidden`, mirrored there by ln1's own stage_scale so the FFN can still
+    # read it at a buffer base.
+    #
+    # ffn_out and packed2 are TWO func args backed by ONE buffer -- see
+    # _TAIL_BUFFER_ALIAS. The aliasing has to happen at the buffer level
+    # because it cannot happen at the MLIR level: the FFN slice's output arg is
+    # `memref<seq x emb>` and stitch_elf wires args by position with matching
+    # types, so mapping it onto a 3-D packed arg fails to parse. At the BO
+    # level there is nothing to reconcile -- the FFN writes seq*emb elements
+    # from the base, which IS plane 0.
     add("ffn_out", act)
-    add("gamma2", act)  # ln2 weight, broadcast
-    add("ln2_sum", act)  # ffn_out + hidden       (device-resident)
-    add("ln2_norm", act)  # LayerNorm(ln2_sum)     (device-resident)
+    add("packed2", f"memref<2x{seq_len}x{emb_dim}xbf16>")
+    add("gamma2", f"memref<{emb_dim}xbf16>")
     add("output", act)
     return args, idx
 
@@ -268,13 +316,33 @@ def build_fused_tail_module(cfg):
             ),
         ]
 
-    slices = (
-        norm_slices("l1", "attn_out", "x", "gamma1", "ln1_sum", "ln1_norm", "hidden")
-        + [KernelSlice(ffn_ir, "ff", ffn_map, extern_syms=_private_syms(ffn_ir))]
-        + norm_slices(
-            "l2", "ffn_out", "hidden", "gamma2", "ln2_sum", "ln2_norm", "output"
-        )
+    # ln1: ONE slice, three herds joined L1->L1 inside its own segment. Its
+    # per-column shim budget (packed fetch + gamma) is scoped to that segment,
+    # so it does not contend with the FFN's.
+    nt1_ir = str(
+        build_norm_tail_module(seq_len, emb_dim, plane_major=True, mirror_out=True)
     )
+    nt2_ir = str(build_norm_tail_module(seq_len, emb_dim, plane_major=True))
+    slices = [
+        KernelSlice(
+            nt1_ir,
+            "l1",
+            {
+                0: idx["packed1"],
+                1: idx["gamma1"],
+                2: idx["hidden"],
+                3: idx["packed2"],
+            },
+            extern_syms=_private_syms(nt1_ir),
+        ),
+        KernelSlice(ffn_ir, "ff", ffn_map, extern_syms=_private_syms(ffn_ir)),
+        KernelSlice(
+            nt2_ir,
+            "l2",
+            {0: idx["packed2"], 1: idx["gamma2"], 2: idx["output"]},
+            extern_syms=_private_syms(nt2_ir),
+        ),
+    ]
     module = stitch_elf(
         _TAIL_FUNC,
         args,
@@ -312,7 +380,8 @@ def fused_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
             "artifacts": artifacts,
             "tail_idx": tail_idx,
             "tail_order": tuple(
-                name for name, _ in sorted(tail_idx.items(), key=lambda kv: kv[1])
+                _TAIL_BUFFER_ALIAS.get(name, name)
+                for name, _ in sorted(tail_idx.items(), key=lambda kv: kv[1])
             ),
             "backend_kwargs": {
                 artifacts["qkv_proj"]: dict(_GEMM_BACKEND, instance_name="qkv_proj"),
@@ -502,10 +571,23 @@ def prepare_fused(shape, seed=42):
         def zeros_act():
             return np.zeros((seq_len, emb_dim), dtype=bfloat16)
 
-        gamma1 = round_bf16(broadcast_row_weight(ln1_weight, seq_len))
-        gamma2 = round_bf16(broadcast_row_weight(ln2_weight, seq_len))
+        # ln1's pipeline takes gamma as the [emb] weight; ln2's mul launch still
+        # takes the [seq, emb] broadcast. Two shapes on purpose, until ln2 moves
+        # to the pipeline too.
+        gamma1 = round_bf16(np.asarray(ln1_weight, dtype=bfloat16))
+        gamma2 = round_bf16(np.asarray(ln2_weight, dtype=bfloat16))
+        # Plane 1 is x; plane 0 is written on device by entry 2. x is uploaded
+        # twice -- here and as qkv_proj's own operand -- because qkv_proj reads
+        # it at a buffer base and cannot take a plane offset. That is a host
+        # upload, not a sync boundary.
+        packed1 = np.zeros((2, seq_len, emb_dim), dtype=bfloat16)
+        packed1[1] = x
+        # Both planes are device-written: plane 0 by the FFN, plane 1 by ln1.
+        packed2 = np.zeros((2, seq_len, emb_dim), dtype=bfloat16)
         arrays = {
             "x": x,
+            "packed1": packed1,
+            "packed2": packed2,
             "w_qkv": w_qkv,
             "w_o": w_o,
             "gamma1": gamma1,
@@ -517,15 +599,9 @@ def prepare_fused(shape, seed=42):
             "k": zeros_act(),
             "v": zeros_act(),
             "attn_context": zeros_act(),
-            "attn_out": zeros_act(),
-            "ln1_sum": zeros_act(),
-            "ln1_norm": zeros_act(),
             "hidden": zeros_act(),
             "ffn_up": np.zeros((seq_len, ffn_dim), dtype=bfloat16),
             "ffn_gelu": np.zeros((seq_len, ffn_dim), dtype=bfloat16),
-            "ffn_out": zeros_act(),
-            "ln2_sum": zeros_act(),
-            "ln2_norm": zeros_act(),
             "output": zeros_act(),
         }
         # The attention module's layout names onto this mode's buffer names —
@@ -537,7 +613,7 @@ def prepare_fused(shape, seed=42):
             "attn_out": "attn_context",
             "w_o": "w_o",
             "y_f32": "attn_f32",
-            "y": "attn_out",
+            "y": "packed1",
         }
         if "y_f32" in mha_idx:
             arrays["attn_f32"] = np.zeros((seq_len, emb_dim), dtype=np.float32)
@@ -546,7 +622,16 @@ def prepare_fused(shape, seed=42):
         if "ffn_out_f32" in tail_idx:
             arrays["ffn_out_f32"] = np.zeros((seq_len, emb_dim), dtype=np.float32)
 
-        host_filled = {"x", "w_qkv", "w_o", "gamma1", "w_up", "w_down", "gamma2"}
+        host_filled = {
+            "x",
+            "packed1",
+            "w_qkv",
+            "w_o",
+            "gamma1",
+            "w_up",
+            "w_down",
+            "gamma2",
+        }
         tail_writes = tuple(
             sorted(tail_idx[n] for n in tail_idx if n not in host_filled)
         )
@@ -572,11 +657,11 @@ def prepare_fused(shape, seed=42):
             "k",
             "v",
             "attn_context",
-            "attn_out",
+            "packed1",
             "hidden",
             "ffn_up",
             "ffn_gelu",
-            "ffn_out",
+            "packed2",
             "output",
         )
         statics = {"w_qkv", "w_o", "gamma1", "w_up", "w_down", "gamma2"}
@@ -602,6 +687,15 @@ def prepare_fused(shape, seed=42):
             require_single_submission=True,
         )
         boundaries = {n: np.array(results[n], copy=True) for n in outputs}
+        # attn_out is no longer its own buffer: it is what entry 2 wrote into
+        # plane 0 of packed1. Reshape from the flat readback view, then name it
+        # so ENCODER_BOUNDARIES compares the same tensor it always did.
+        boundaries["attn_out"] = boundaries.pop("packed1").reshape(2, seq_len, emb_dim)[
+            0
+        ]
+        boundaries["ffn_out"] = boundaries.pop("packed2").reshape(2, seq_len, emb_dim)[
+            0
+        ]
 
         vector_rows = [vector.as_row()]
         stages = []
@@ -632,7 +726,7 @@ def prepare_fused(shape, seed=42):
         "golden_seed": seed,
         "execution_mode": EXECUTION_MODE_CSV["fused"],
         "elf_count": len(names),
-        "fusion": "stitch_elf: add+ln+mul / ffn / add+ln+mul in one module",
+        "fusion": "stitch_elf: norm_tail(J7a) / ffn / norm_tail(J7a) in one module",
         "gemm_spec_source": cfg["qkv_source"],
         "gemm_spec_qkv": _spec_digest(cfg["qkv_spec"]),
         "gemm_spec_ffn_up": _spec_digest(cfg["ffn_up_spec"]),
