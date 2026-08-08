@@ -371,6 +371,16 @@ def prepare_layer_dispatch(
             "stages": stages,
             "stages_passed": clean == len(stages),
             "dispatch_vectors": vector_rows,
+            # The same latency decomposition the pattern modes report. This is
+            # the shared seam `coarse` dispatches through (builders/block.py),
+            # which runs every stage on the device -- so host_cpu_ms is empty
+            # BY CONSTRUCTION, exactly as in `fused`, and the comparison
+            # against the host-mediated modes is the point of recording it.
+            "device_ms": sum(
+                float(r.get("device_submission_ms", 0.0)) for r in vector_rows
+            ),
+            "sync_ms": sum(float(r.get("host_sync_ms", 0.0)) for r in vector_rows),
+            "host_cpu_ms": {},
         }
 
     record_extra = {

@@ -468,7 +468,7 @@ def prepare_runlist(shape, seed=42):
     from shared.infra.cache import KernelCache, Profiler
 
     cache = KernelCache(
-        cache_dir=RUNLIST_CACHE_DIR, verbose=False, profiler=Profiler(enabled=False)
+        cache_dir=RUNLIST_CACHE_DIR, verbose=False, profiler=Profiler(enabled=True)
     )
     compile_runlist_artifacts(cache, cfg, run_only=True)
 
@@ -633,6 +633,7 @@ def prepare_runlist(shape, seed=42):
         return out, vector
 
     def dispatch(device_inputs, stage_stats):
+        cache.profiler.cpu_times.clear()
         x, w_q, w_k, w_v, w_o, ln1_weight, w_up, w_down, ln2_weight = device_inputs
         blocks = cfg["norm_blocks"]
 
@@ -640,14 +641,15 @@ def prepare_runlist(shape, seed=42):
         proj, vec_1 = _run_projections(x, w_q, w_k, w_v)
 
         print(f"  [host] blocked attention, query block {cfg['query_block_size']}")
-        attn_context = blocked_attention(
-            proj["q"],
-            proj["k"],
-            proj["v"],
-            num_heads,
-            causal=False,
-            query_block_size=cfg["query_block_size"],
-        )
+        with cache.profiler.time_cpu("attention"):
+            attn_context = blocked_attention(
+                proj["q"],
+                proj["k"],
+                proj["v"],
+                num_heads,
+                causal=False,
+                query_block_size=cfg["query_block_size"],
+            )
 
         print("  [runlist 2/5] output_proj (1 entry, one submission)")
         attn_out, vec_2 = _run_o_proj(round_bf16(attn_context), w_o)
@@ -697,6 +699,19 @@ def prepare_runlist(shape, seed=42):
             "stages": stages,
             "stages_passed": clean == len(stages),
             "dispatch_vectors": vector_rows,
+            # `[2026-08-08]` The latency decomposition convention 10 asks for.
+            # device_ms and sync_ms were already measured by dispatch.py and
+            # thrown away; host_cpu_ms is this mode's own torch work, timed
+            # through Profiler.time_cpu. Together they say how much of a mode's
+            # latency is the NPU and how much is the host running attention --
+            # the confound every cross-mode comparison in this study carries.
+            "device_ms": sum(
+                float(r.get("device_submission_ms", 0.0)) for r in vector_rows
+            ),
+            "sync_ms": sum(float(r.get("host_sync_ms", 0.0)) for r in vector_rows),
+            "host_cpu_ms": {
+                k: sum(v) * 1000.0 for k, v in cache.profiler.cpu_times.items()
+            },
         }
 
     record_extra = {

@@ -472,11 +472,12 @@ def prepare_offload(shape, seed=42):
     from shared.infra.cache import KernelCache, Profiler
 
     cache = KernelCache(
-        cache_dir=OFFLOAD_CACHE_DIR, verbose=False, profiler=Profiler(enabled=False)
+        cache_dir=OFFLOAD_CACHE_DIR, verbose=False, profiler=Profiler(enabled=True)
     )
     compile_offload_artifacts(cache, cfg, run_only=True)
 
     def dispatch(device_inputs, stage_stats):
+        cache.profiler.cpu_times.clear()
         x, w_q, w_k, w_v, w_o, ln1_weight, w_up, w_down, ln2_weight = device_inputs
 
         vector_rows = []
@@ -491,23 +492,27 @@ def prepare_offload(shape, seed=42):
         k = gemm("k_proj", x, w_k)
         v = gemm("v_proj", x, w_v)
         print(f"  [host] blocked attention, query block {cfg['query_block_size']}")
-        attn_context = blocked_attention(
-            q,
-            k,
-            v,
-            num_heads,
-            causal=False,
-            query_block_size=cfg["query_block_size"],
-        )
+        with cache.profiler.time_cpu("attention"):
+            attn_context = blocked_attention(
+                q,
+                k,
+                v,
+                num_heads,
+                causal=False,
+                query_block_size=cfg["query_block_size"],
+            )
         print("  [4/6] output_proj")
         attn_out = gemm("output_proj", round_bf16(attn_context), w_o)
-        hidden = _host_addnorm(attn_out, x, ln1_weight)
+        with cache.profiler.time_cpu("ln1"):
+            hidden = _host_addnorm(attn_out, x, ln1_weight)
         print("  [5/6] up_proj")
         ffn_up = gemm("up_proj", hidden, w_up)
-        ffn_gelu = _host_gelu(ffn_up)
+        with cache.profiler.time_cpu("gelu"):
+            ffn_gelu = _host_gelu(ffn_up)
         print("  [6/6] down_proj")
         ffn_out = gemm("down_proj", round_bf16(ffn_gelu), w_down)
-        output = _host_addnorm(ffn_out, hidden, ln2_weight)
+        with cache.profiler.time_cpu("ln2"):
+            output = _host_addnorm(ffn_out, hidden, ln2_weight)
 
         boundaries = {
             "q": q,
@@ -544,6 +549,19 @@ def prepare_offload(shape, seed=42):
             "stages": stages,
             "stages_passed": clean == len(stages),
             "dispatch_vectors": vector_rows,
+            # `[2026-08-08]` The latency decomposition convention 10 asks for.
+            # device_ms and sync_ms were already measured by dispatch.py and
+            # thrown away; host_cpu_ms is this mode's own torch work, timed
+            # through Profiler.time_cpu. Together they say how much of a mode's
+            # latency is the NPU and how much is the host running attention --
+            # the confound every cross-mode comparison in this study carries.
+            "device_ms": sum(
+                float(r.get("device_submission_ms", 0.0)) for r in vector_rows
+            ),
+            "sync_ms": sum(float(r.get("host_sync_ms", 0.0)) for r in vector_rows),
+            "host_cpu_ms": {
+                k: sum(v) * 1000.0 for k, v in cache.profiler.cpu_times.items()
+            },
         }
 
     record_extra = {
