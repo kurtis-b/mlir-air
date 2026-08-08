@@ -53,6 +53,18 @@ __pycache__/
 sandbox
 agents/.state/
 
+# Study and measurement result trees (Phase F/G). A completed results root is
+# ~2.4 GB and an unattended runner writes one tree per run.
+#
+# Scoped to result TREES, deliberately not to the *.csv extension that iron's
+# rule set uses. A blanket `*.csv` silently ignores any CSV a future test wants
+# to track as a fixture, and the failure mode is a file that seems to commit and
+# does not. iron's own rules carry two negations to claw specific files back out
+# from under exactly that -- evidence they hit it. Measurements belong in a
+# result tree; if a CSV is being written outside one, that is the thing to fix.
+results/
+results_unattended_*/
+
 # build results
 libadf.a
 *.elf

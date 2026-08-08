@@ -87,7 +87,30 @@ def _stage_stats(actual, expected, atol):
     }
 
 
-def run(mode: str, warmup: int, samples: int, runs_per_sample: int) -> dict:
+def _shape_for(spec: dict, seq_len: int | None) -> tuple[dict, str]:
+    """The spec's shape, optionally at a different sequence length (J3's ladder).
+
+    Returns a COPY. Mutating ``spec["shape"]`` would rewrite the module-level
+    ``SPECS`` row, so a second rung in the same process would silently inherit
+    the first rung's length -- a ladder that reports several lengths and
+    measured one.
+    """
+    shape = dict(spec["shape"])
+    if seq_len is None:
+        return shape, spec["shape_key"]
+    shape["seq_len"] = seq_len
+    # Built, never parsed back out, per opcheck_specs' own note on shape_key.
+    emb = shape.get("emb_dim", shape.get("hidden_size", "?"))
+    return shape, f"{seq_len}x{emb}_encoder_bert"
+
+
+def run(
+    mode: str,
+    warmup: int,
+    samples: int,
+    runs_per_sample: int,
+    seq_len: int | None = None,
+) -> dict:
     """Run ``mode`` and return a schema row. Never raises for a run failure."""
     row = schema.empty_row("results")
     row["execution_mode"] = schema.EXECUTION_MODE_CSV.get(mode, mode)
@@ -100,9 +123,9 @@ def run(mode: str, warmup: int, samples: int, runs_per_sample: int) -> dict:
     row["latency_sample_count"] = samples
 
     spec = _spec_for(mode)
-    shape = spec["shape"]
-    row["study_case_id"] = spec["shape_key"]
-    row["study_case_label"] = f"{mode} {spec['shape_key']}"
+    shape, shape_key = _shape_for(spec, seq_len)
+    row["study_case_id"] = shape_key
+    row["study_case_label"] = f"{mode} {shape_key}"
     for key in ("seq_len", "hidden_size", "intermediate_size"):
         if key in shape:
             row[key] = shape[key]
@@ -198,14 +221,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--samples", type=int, default=3)
     ap.add_argument("--runs-per-sample", type=int, default=1)
     ap.add_argument("--study-id", default="adhoc")
+    ap.add_argument(
+        "--seq",
+        type=int,
+        default=None,
+        help="sequence length override; omit for the spec's own (J3's ladder)",
+    )
     args = ap.parse_args(argv)
 
-    row = run(args.mode, args.warmup, args.samples, args.runs_per_sample)
+    row = run(args.mode, args.warmup, args.samples, args.runs_per_sample, args.seq)
     row["study_id"] = args.study_id
     results_io.write_rows(args.out, [row])
 
     status = row["run_status"]
-    print(f"[run-mode] {args.mode}: {status}")
+    print(f"[run-mode] {args.mode} @ {row['study_case_id']}: {status}")
     if status == "passed":
         print(
             f"[run-mode]   avg {row['avg_latency_ms']:.3f} ms  "
