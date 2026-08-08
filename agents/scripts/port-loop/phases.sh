@@ -1759,15 +1759,71 @@ def mentions_diagnostic(text):
 
 problems = []
 
-# 1. THE PHASE. An IV-dependent offset on an L2 operand must be refused, by a message that names
-#    the problem -- not by the generic link failure every one of these compiles ends with.
-err = compile_err(build("L2", moving=True))
+# 1. THE PHASE, measured against the construction that actually hung.
+#
+#    NOT the synthetic L2 probe this clause used first. That one puts four contiguous per-step
+#    slices which TILE the buffer exactly, so air-opt-memtile-dma-bds coalesces them into one
+#    whole-buffer BD -- a correct lowering, so nothing is refused, so the clause demanded a
+#    refusal for a program that does not need one. It also failed before the fix, which read as
+#    discrimination and was not: it failed because nothing at all was refused then.
+#
+#    So: build the PRE-FIX J7b builder (e6cdd138) at 4 K steps -- whole-A staged in L2, per-step
+#    slice read at an advancing offset, interleaved with B across the feed so it cannot coalesce.
+#    That construction has no correct lowering, and it is the one that compiled, routed and hung.
+#
+#    The clause is self-discriminating: the SAME builder at 2 K steps must NOT be refused, because
+#    there the loop unrolls and every offset resolves to a literal. A refusal that fires on both
+#    is refusing the module, not the property.
+import importlib.util, subprocess
+
+prefix_src = os.path.join(tempfile.mkdtemp(prefix="h10-prefix-src-"), "ffn_accum_prefix.py")
+with open(prefix_src, "w") as fh:
+    fh.write(subprocess.run(
+        ["git", "-C", root, "show",
+         "e6cdd138:programming_examples/transformer_layer/builders/ffn_accum.py"],
+        capture_output=True, text=True, check=True).stdout)
+_spec = importlib.util.spec_from_file_location("ffn_accum_prefix", prefix_src)
+prefix = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(prefix)
+
+
+def compile_prefix(ksteps):
+    """Compile e6cdd138s ffn_accum at `ksteps` K steps; return the error text."""
+    prev = os.getcwd()
+    try:
+        os.chdir(tempfile.mkdtemp(prefix=f"h10-prefix-k{ksteps}-"))
+        prefix.compile_ffn_accum_kernel(tile_k=32, tile_n=64)
+        mod = prefix.build_ffn_accum_module(64, ksteps * 32, 64, herd_x=1, tile_k=32)
+        be = XRTBackend(omit_while_true_loop=False, output_format="xclbin",
+                        instance_name="h10prefix", target_device="npu2")
+        try:
+            be.compile(mod)
+            return None
+        except Exception as exc:
+            return f"{type(exc).__name__}: {exc}"
+        finally:
+            try: be.unload()
+            except Exception: pass
+    finally:
+        os.chdir(prev)
+
+
+err = compile_prefix(4)
 if not mentions_diagnostic(err):
     problems.append(
-        "clause 1 FAILED: an L2 channel-put offset derived from a loop induction variable was "
-        "NOT refused with a diagnostic about a non-constant/static offset. This is the "
-        "construction that compiles, routes and hangs; refusing it is the phase.  |  got: "
-        + (err or "compile reported success")[:400]
+        "clause 1 FAILED: the pre-fix J7b construction (e6cdd138 ffn_accum, 4 K steps, whole-A "
+        "staged in L2 and read at an advancing offset) was NOT refused with a diagnostic about a "
+        "non-constant/static offset. That is the program that compiled, routed and hung; refusing "
+        "it is the phase.  |  got: " + (err or "compile reported success")[:400]
+    )
+
+err = compile_prefix(2)
+if mentions_diagnostic(err):
+    problems.append(
+        "clause 1b FAILED: the SAME builder at 2 K steps was also refused. There the loop unrolls "
+        "and every offset resolves to a literal, so it has a correct lowering. A refusal that "
+        "fires at both trip counts is rejecting the module, not the property.  |  got: "
+        + err[:400]
     )
 
 # 2. NOT UNCONDITIONAL. The same shape with a constant offset must get past the MLIR pipeline.
