@@ -85,6 +85,24 @@ def read_rows(path: str | Path, table: str = "results") -> list[dict]:
             )
         rows = [{k: (v if v != "" else None) for k, v in r.items()} for r in reader]
 
+    # Restore schema_version as an int so read -> write round-trips. csv gives
+    # back the string "1", and validate_row compares against the int 1, so
+    # without this a row read from a results CSV cannot be written to another
+    # one -- it fails with "use the adapter", pointing at iron, for a file this
+    # module wrote itself. Found by run_ladder, which reads each rung's row from
+    # a child process and rewrites them as one CSV per mode.
+    #
+    # Only this field is coerced. The measurement columns stay strings because
+    # the schema declares meanings and timing boundaries, not types, and
+    # inventing a type per column here would put that decision in the wrong
+    # module. Callers doing arithmetic convert explicitly -- see ladder_report.
+    for row in rows:
+        if row.get("schema_version") is not None:
+            try:
+                row["schema_version"] = int(row["schema_version"])
+            except (TypeError, ValueError):
+                pass  # leave it; the check below reports it far better
+
     for i, row in enumerate(rows):
         version = row.get("schema_version")
         if str(version) != str(schema.SCHEMA_VERSION):
