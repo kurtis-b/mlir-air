@@ -74,11 +74,21 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | Goal 1 — sliding window | `make verify` passes with window-crossing prompts | not started |
 | Goal 2 — quantization | Second quantized model passes a gate that exercises the quantized path | not started |
 
-## `[2026-08-07]` Where things stand, for a session picking this up cold
+## `[2026-08-08]` Where things stand, for a session picking this up cold
 
-Read **[23](23-rules-and-open-items.md)** first — it holds the rules that govern everything
-downstream and what remains unclaimed. Then [16](16-compiler-work-and-remaining-essence.md)
-for the tranche map.
+**Read [26](26-mode-rebuild-feasibility.md) first.** The four execution modes were re-specified by
+the author on 2026-08-08, all four implementations diverge from the new definitions, and doc 26
+opens with **six things the plan had wrong** — three of which were blocking work that turned out not
+to be blocked. Then [03 §The taxonomy](03-measurement-model.md) for what the modes now mean, and
+[23](23-rules-and-open-items.md) for the rules that govern everything downstream.
+
+**The one-paragraph version.** The modes are no longer defined by *who sequences the work* but by
+**reconfiguration cost against DRAM traffic**: `runlist` pays per-operator reconfiguration with
+everything on device, `offload` minimizes it (one xclbin, N instruction streams — matching iron; all
+LINEAR operators on the NPU, all NON-LINEAR on the host), `fused` eliminates DRAM traffic between
+operators, and `coarse` blends `runlist` and `fused`. Every measurement recorded before that
+correction — including [25](25-first-study-result-sequence-ladder.md)'s ladder and crossover — ranks
+four implementations that are not those four modes.
 
 **Two rules to know before designing anything.**
 
@@ -98,26 +108,49 @@ to it. See [23](23-rules-and-open-items.md) and [24](24-phase-h10-non-constant-b
 
 **Where the live threads stand:**
 
-1. **H10 is staged and not started, and it is the next thing.** `PL_PHASES_IN_SCOPE` is already
-   `["H10"]`; the spec, the three-clause objective check and the phases.sh arms are committed, and
-   **the check is verified failing on today's compiler**. Start it with
-   `agents/scripts/port-loop.sh start` — see [24](24-phase-h10-non-constant-bd-offsets.md). It
-   turns the silent miscompile above into a refusal that says what to do instead. Root cause is
-   located to two unchecked dereferences; the scope is narrow and no shipped design uses the losing
-   form.
-2. **J7b landed** ([22](22-phase-j7b-accumulator-ring.md)) — the accumulator ring, formed by the
+1. **Corrected `offload` is unblocked and is the next thing.** Its two attention matmuls are linear,
+   so they belong on the NPU — and both are now **measured passing on hardware at every ladder
+   rung**, with tiles recorded in [26](26-mode-rebuild-feasibility.md). The change is local to
+   `pattern/offload/offload.py`: replace the `blocked_attention` call with two dispatched GEMMs plus
+   host softmax/scale/mask, injecting tiles through the `gemm_spec_fn` escape hatch every builder
+   already ships. **No registry write, no compiler work, no new operator.** Worktree-sized.
+2. **Corrected `runlist` needs one new operator: a device softmax.** The kernel already exists in
+   this tree and this port already builds it — `programming_examples/softmax/softmax.cc`, compiled
+   by `external_kernels.py:468` `compile_softmax_streaming()`, with `softmax_streaming.o` already in
+   `transformer_layer/build_peano/`. So the work is a `builders/softmax.py` around an existing
+   kernel plus an opcheck row and a fault-injection control, not a kernel port. Iron's
+   `aie_kernels/aie2p/softmax.cc` is the fallback, not the starting point.
+3. **Corrected `fused` — fix its build before anything else.** Doc 26 finds it **cannot build its
+   own SPECS shape today**, so `make check-fused` is presumed broken. It also finds the blocker the
+   mode's own docstring records — the FlashAttention `[1,1]` / GEMM `[2,2]` settings conflict — is
+   **false**: `runtime_loop_tiling_sizes` is inert. A different blocker is real, and the
+   no-DRAM-between-operators half is capacity-bounded rather than blocked. **Spike C was
+   compile-only: it is not established that the off-preset ELFs produce correct numbers.** Two
+   device jobs would settle that, and compiling is not passing.
+4. **Corrected `coarse` is last, by definition** — it is a mix of `runlist` and `fused`, so both
+   must be right first.
+5. **`devq` is the device scheduler now.** `agents/scripts/devq.sh` — builds run concurrently, a
+   measure runs alone with no build in flight, stale jobs reconcile by process liveness.
+   `devq-selftest.sh` proves 14/14 including that later builds cannot starve a queued measure. Use
+   it instead of hand-rolled `flock`; the migration of existing call sites
+   (`phases.sh:716`, `llms/llama32_1b_int4/Makefile:208`) is **not done**.
+6. **H10 ran and its substance passed** — five gate legs green, `check-air-mlir` 489/489, 11.44
+   tok/s against a 9.43 floor. Its **tamper check halted** on five gate-defining files with
+   documented provenance, and was deliberately not re-fingerprinted; see
+   [24](24-phase-h10-non-constant-bd-offsets.md).
+7. **J7b landed** ([22](22-phase-j7b-accumulator-ring.md)) — the accumulator ring, formed by the
    compiler. `mean_rel_L1` 1.417e-2 at `atol_required` 1.383e-3, K-loop data movement 4 → 2, zero
    packet-typed channels. Its implement session halted on a budget cap with a hardware hang; the
    hang was the compiler defect above, not the design.
-3. **J7a landed** ([21](21-phase-j7a-norm-tail-pipeline.md)) — the first piece of iron's dataflow
+8. **J7a landed** ([21](21-phase-j7a-norm-tail-pipeline.md)) — the first piece of iron's dataflow
    form on this port. Three herds, L1→L1 channels, **placement and buffer depth derived by the
    compiler**, `mean_rel_L1` 3.620e-3 against a 1.688e-2 target. Its round-3 fix also made
    `layer_norm` ~26× more accurate, for a measured ~13% throughput cost ([23 §1](23-rules-and-open-items.md)).
-4. **J1 is blocked, and precisely.** Not on correctness any more — H9 fixed the miscompile — but on
+9. **J1 is blocked, and precisely.** Not on correctness any more — H9 fixed the miscompile — but on
    shim **BD exhaustion at six trips** against a 64-trip target. It now refuses loudly instead of
    corrupting silently. **Not on the goal path**: J7a reaches the same dispatch collapse without
    the packet queue.
-5. **H8 is untouched** and is the largest remaining item: the pass that *derives* on-chip staging
+10. **H8 is untouched** and is the largest remaining item: the pass that *derives* on-chip staging
    rather than having the builder declare it. It wanted J7 as a hand-written reference to validate
    against, and J7a and J7b are now two.
 
@@ -127,7 +160,25 @@ elements wrong, not slightly wrong. This workload's worst row is 0.115, a ~35× 
 recorded figures stand; but nothing pins it. [23 §2](23-rules-and-open-items.md) has the sweep and
 what it would cost to fix.
 
-**Two things that cost this run time, so they do not cost the next one:**
+**`[2026-08-08]` Three things that cost THIS run time, so they do not cost the next one:**
+
+- **A recorded claim with no artifact behind it may simply be wrong.** Doc 16 said `attn_output`
+  "timed out on the one configuration tried" out of 828 legal ones, and that sentence shaped the
+  plan for two days. The first canonical configuration tried **passes**, at every ladder rung, by
+  all three methods. The 828 figure is unsourced and unreproducible. `attn_scores`' passing claim
+  had no artifact either — it happened to be true. **When a doc asserts a measurement, check that a
+  checkpoint, log or test exists behind it before planning around it.**
+- **Compare distributions, not a run against a number.** This cost the run twice in one day. A
+  four-mode latency table was published from runs taken while builds ran alongside them — `coarse`
+  at 4096 read 731 ms there and 467/477 ms on a quiet host, a **1.55×** inflation. Then a "5.9%
+  improvement" from pipelining was three fresh runs measured against a single stale high baseline;
+  repeat runs put the ranges on top of each other. Both errors are the same shape, and both were
+  caught only by re-measuring.
+- **Measurement conditions are part of the measurement.** Compilation sits outside the clock;
+  host-side dispatch does not. Nothing CPU-heavy may run beside a timed region — which is what
+  `devq`'s build/measure classes now enforce, so use it rather than re-learning this.
+
+**Two things that cost the previous run time:**
 
 - **Match a probe's altitude to its claim.** `air-opt` with a hand-built pass list answers "does
   this pass fire", not "does this compile". A construction measured as lowering cleanly through
