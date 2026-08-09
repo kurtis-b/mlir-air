@@ -4,7 +4,7 @@
 #
 # Contract: every phase declares four things —
 #   doc              the specification a fresh session is pointed at
-#   needs_hardware   whether the gate touches the NPU (drives flock + XRT sourcing)
+#   needs_hardware   whether the gate touches the NPU (drives devq class + XRT sourcing)
 #   gate_cmd         the phase's own gate, run by the DRIVER, never self-reported
 #   objective_check  a driver-side assertion about build products that a session cannot satisfy
 #                    by writing a more permissive test
@@ -123,11 +123,11 @@ multi-ELF runlist that is (1) numerically identical to sequential dispatch and (
 lower latency.
 
 Because this phase modifies programming_examples/llms/shared/infra/cache.py, the gate also runs
-the cross-deployment regression check: make verify on the shipped models, serialized under flock.
+the cross-deployment regression check: make verify on the shipped models, serialized through the devq broker.
 EOF
 ;;
     C1|C2|C3) cat <<'EOF'
-flock -x -w 1800 /tmp/mlir-air-npu.lock \
+agents/scripts/devq.sh run --class measure -- \
   ninja -C build-xrt check-programming-examples-transformer-layer
 
 Every test in the suite passes, on real hardware. That includes the tests earlier sub-phases added
@@ -147,12 +147,12 @@ injection, and the sub-phase fails for it.
 EOF
 ;;
     C4) cat <<'EOF'
-flock -x -w 1800 /tmp/mlir-air-npu.lock \
+agents/scripts/devq.sh run --class measure -- \
   ninja -C build-xrt check-programming-examples-transformer-layer
 
 plus the cross-deployment regression check, because this sub-phase writes rows into
 kernel_registry that the ten shipped LLM deployments resolve against: make verify in each
-programming_examples/llms/<model>/, serialized under flock.
+programming_examples/llms/<model>/, serialized through the devq broker.
 
 The driver then checks, independently of anything you write:
 
@@ -164,7 +164,7 @@ The driver then checks, independently of anything you write:
 EOF
 ;;
     D1) cat <<'EOF'
-flock -x -w 1800 /tmp/mlir-air-npu.lock \
+agents/scripts/devq.sh run --class measure -- \
   ninja -C build-xrt check-programming-examples-transformer-layer
 
 Every test in the suite passes, on real hardware. That includes every test Phases B and C added.
@@ -203,7 +203,7 @@ plus one clause specific to this sub-phase:
 EOF
 ;;
     D2) cat <<'EOF'
-flock -x -w 1800 /tmp/mlir-air-npu.lock \
+agents/scripts/devq.sh run --class measure -- \
   ninja -C build-xrt check-programming-examples-transformer-layer
 
 Every test in the suite passes on real hardware, including the new run_npu2_block_peano.lit. A new
@@ -229,7 +229,7 @@ LayerNorm can absorb a lot of upstream damage before an end-to-end comparison tr
 EOF
 ;;
     E1) cat <<'EOF'
-flock -x -w 1800 /tmp/mlir-air-npu.lock  agents/scripts/port-loop/gate-e1.sh
+agents/scripts/devq.sh run --class measure -- agents/scripts/port-loop/gate-e1.sh
 
 Two legs. The transformer-layer lit suite on real hardware, then the cross-deployment regression
 check -- `make verify` in each of the ten shipped programming_examples/llms/<model>/ directories --
@@ -263,7 +263,7 @@ The driver then checks, independently of anything you write:
 EOF
 ;;
     E2|E3|E4|E5) cat <<'EOF'
-flock -x -w 1800 /tmp/mlir-air-npu.lock \
+agents/scripts/devq.sh run --class measure -- \
   ninja -C build-xrt check-programming-examples-transformer-layer
 
 Every test in the suite passes on real hardware, including the ones earlier sub-phases added. A new
@@ -326,7 +326,7 @@ SUPERSEDED by phase H1s -- this text describes the `--variant hoisted` clause as
 REFUSAL, which measurement falsified. Kept only so a re-read of the halted H run makes sense.
 See the H1s arm below for the corrected gate.
 
-flock -x -w 1800 /tmp/mlir-air-npu.lock  agents/scripts/port-loop/gate-h.sh
+agents/scripts/devq.sh run --class measure -- agents/scripts/port-loop/gate-h.sh
 
 FOUR LEGS, cheapest first, so a cheap failure stops before an expensive one:
 
@@ -369,7 +369,7 @@ agents/scripts/port-loop/ -- including the fixture and this gate script.
 EOF
 ;;
     H1s) cat <<'EOF'
-flock -x -w 1800 /tmp/mlir-air-npu.lock  agents/scripts/port-loop/gate-h.sh
+agents/scripts/devq.sh run --class measure -- agents/scripts/port-loop/gate-h.sh
 
 FIVE LEGS, cheapest first, so a cheap failure stops before an expensive one:
 
@@ -437,7 +437,7 @@ were spent relearning that.
 EOF
 ;;
     H9) cat <<'EOF'
-flock -x -w 1800 /tmp/mlir-air-npu.lock  agents/scripts/port-loop/gate-h.sh
+agents/scripts/devq.sh run --class measure -- agents/scripts/port-loop/gate-h.sh
 
 FIVE LEGS, cheapest first: build + install (the install is not optional -- the examples resolve
 aircc from install-xrt, so a pass you edit and merely BUILD leaves every later leg testing the
@@ -467,7 +467,7 @@ measured boundary and widening it is J1's job, after this lands.
 EOF
 ;;
     H10) cat <<'EOF'
-flock -x -w 1800 /tmp/mlir-air-npu.lock  agents/scripts/port-loop/gate-h.sh
+agents/scripts/devq.sh run --class measure -- agents/scripts/port-loop/gate-h.sh
 
 FIVE LEGS, cheapest first: build + install (the install is not optional -- the examples resolve
 aircc from install-xrt, so a pass you edit and merely BUILD leaves every later leg testing the
@@ -506,7 +506,7 @@ it one layer down with dynamic-objFifos. Refusing correctly is this phase.
 EOF
 ;;
     J7b) cat <<'EOF'
-flock -x -w 1800 /tmp/mlir-air-npu.lock \
+agents/scripts/devq.sh run --class measure -- \
   ninja -C build-xrt check-programming-examples-transformer-layer
 
 The whole transformer-layer suite on hardware. Allowlist ^programming_examples/transformer_layer/.
@@ -549,7 +549,7 @@ operands into one strided fetch if needed -- that is how J7a stayed off it.
 EOF
 ;;
     J7a) cat <<'EOF'
-flock -x -w 1800 /tmp/mlir-air-npu.lock \
+agents/scripts/devq.sh run --class measure -- \
   ninja -C build-xrt check-programming-examples-transformer-layer
 
 The whole transformer-layer suite on hardware. Allowlist ^programming_examples/transformer_layer/.
@@ -595,7 +595,7 @@ writing a tile coordinate, stop -- deriving them is the whole point of the phase
 EOF
 ;;
     J1) cat <<'EOF'
-flock -x -w 1800 /tmp/mlir-air-npu.lock \
+agents/scripts/devq.sh run --class measure -- \
   ninja -C build-xrt check-programming-examples-transformer-layer
 
 The whole transformer-layer suite on real hardware: every operator, every execution mode, the
@@ -713,17 +713,31 @@ phase_gate_allowlist() {
   esac
 }
 
+# `[2026-08-08]` Every hardware gate goes through the devq broker rather than taking
+# /tmp/mlir-air-npu.lock by hand. `run` is the subcommand to use and not `submit`: it
+# relays the job's output to stdout and exits with the job's status, so run_gate's
+# `eval` still captures the gate log and still sees a failure. `submit` would divert the
+# output to the job log and hand back an id, which reads as a silent PASS.
+#
+# What the queue adds over the bare flock: FIFO order (flock has none, so a churn of
+# builds can starve a queued gate indefinitely -- measured at 3197ms before devq existed)
+# and the build/measure barrier, which keeps a compile off the box while a gate is timed.
+# The broker still takes the same /tmp/mlir-air-npu.lock underneath, so a gate and any
+# not-yet-migrated caller remain mutually exclusive.
+_pl_measure() { echo "agents/scripts/devq.sh run --class measure --name $1 -- $2"; }
+
 phase_gate_cmd() {
+  local suite="ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer"
   case "$1" in
-    A) echo "ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
-    B) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
-    C1|C2|C3) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
-    C4) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-c4.sh" ;;
-    D1|D2) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
+    A) echo "${suite}" ;;
+    B) _pl_measure "gate-B" "${suite}" ;;
+    C1|C2|C3) _pl_measure "gate-$1" "${suite}" ;;
+    C4) _pl_measure "gate-C4" "${PL_LIB}/gate-c4.sh" ;;
+    D1|D2) _pl_measure "gate-$1" "${suite}" ;;
     # E1 alone changes shared infrastructure, so E1 alone carries the ten-model leg.
-    E1) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-e1.sh" ;;
-    H|H1s|H9|H10) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ${PL_LIB}/gate-h.sh" ;;
-    E2|E3|E4|E5|J1|J7a|J7b) echo "flock -x -w 1800 /tmp/mlir-air-npu.lock ninja -C ${PL_ROOT}/build-xrt check-programming-examples-transformer-layer" ;;
+    E1) _pl_measure "gate-E1" "${PL_LIB}/gate-e1.sh" ;;
+    H|H1s|H9|H10) _pl_measure "gate-$1" "${PL_LIB}/gate-h.sh" ;;
+    E2|E3|E4|E5|J1|J7a|J7b) _pl_measure "gate-$1" "${suite}" ;;
     *) echo "false" ;;
   esac
 }
@@ -1036,7 +1050,7 @@ for e in json.load(sys.stdin):
     fi
     log_info "objective check: negative control ${op} [${key}] — this run MUST fail"
     if ( cd "${PL_ROOT}/programming_examples/transformer_layer" \
-         && flock -x -w 1800 /tmp/mlir-air-npu.lock \
+         && "${PL_ROOT}/agents/scripts/devq.sh" run --class measure --name opcheck-fault -- \
               python3 "${opcheck}" --operator "${op}" --shape-key "${key}" \
                                    --fault-inject input ) >/dev/null 2>&1; then
       log_error "objective check FAILED: ${op} PASSED with a fault injected into its input."
@@ -1357,7 +1371,7 @@ phase_d_negative_control() {
     n=$(( n + 1 ))
     log_info "objective check: negative control ${op} [${key}] — this run MUST fail"
     if ( cd "${PL_ROOT}/programming_examples/transformer_layer" \
-         && flock -x -w 1800 /tmp/mlir-air-npu.lock \
+         && "${PL_ROOT}/agents/scripts/devq.sh" run --class measure --name opcheck-fault -- \
               python3 "${opcheck}" --operator "${op}" --shape-key "${key}" \
                                    --fault-inject input ) >/dev/null 2>&1; then
       log_error "objective check FAILED: ${op} [${key}] PASSED with a fault injected into its input."
@@ -2184,7 +2198,7 @@ phase_h_objective_check() {
   for variant in inside hoisted annotated annotated_hoisted multicolumn; do
     log_info "objective check: fixture variant '${variant}'"
     if ! ( cd "${PL_ROOT}/programming_examples/transformer_layer" \
-           && flock -x -w 1800 /tmp/mlir-air-npu.lock \
+           && "${PL_ROOT}/agents/scripts/devq.sh" run --class measure --name fixture-variant -- \
                 python3 "${fixture}" --variant "${variant}" ); then
       log_error "objective check FAILED on variant '${variant}'."
       case "${variant}" in

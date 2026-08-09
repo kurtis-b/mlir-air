@@ -95,6 +95,37 @@ check "$LIVE == 0" "orphaned descendants of the killed runner were reaped ($LIVE
 N=$("$DEVQ" submit --class measure -- true); "$DEVQ" wait "$N" >/dev/null
 check "\"$(st "$N")\"==\"done\"" "a later measure is not blocked forever by the dead job (state=$(st "$N"))"
 
+# ---------------------------------------------------------------- 5
+# `run` is what replaces a bare `flock -x LOCK CMD` at a gate, so the two things a
+# gate depends on are the two things asserted here: the command's OUTPUT reaches
+# stdout (submit alone diverts it to the job log, which would blank a FileCheck
+# while still exiting 0) and its EXIT STATUS is the caller's.
+echo "TEST 5: run relays the job's output and exits with the job's status"
+fresh t5
+OUT=$("$DEVQ" run --class build -- bash -c 'echo relayed-one; echo relayed-two' 2>/dev/null); RC=$?
+# Newlines are flattened before the comparison: `check` evaluates through awk, and an
+# embedded newline in an awk string constant is a parse error, not a failed compare.
+FLAT=$(printf '%s' "$OUT" | tr '\n' '|')
+printf '  rc=%s output=[%s]\n' "$RC" "$FLAT"
+check "$RC == 0" "run exits 0 for a successful job"
+check "\"$FLAT\"==\"relayed-one|relayed-two\"" "both output lines reached stdout in order"
+"$DEVQ" run --class build -- bash -c 'echo doomed; exit 37' >/dev/null 2>&1
+check "$? == 37" "a job exiting 37 makes run exit 37 (a swallowed status would read as PASS)"
+"$DEVQ" run --class measure -- true >/dev/null 2>&1
+check "$? == 0" "run works for the measure class too, holding the device lock"
+
+# ---------------------------------------------------------------- 6
+# Nesting is the one way `run` can hang rather than fail: the inner measure queues
+# behind the device lock its own parent runner holds, and reports a lock timeout
+# NPU_LOCK_WAIT seconds later with nothing pointing at the nested call.
+echo "TEST 6: run refuses to nest inside a running devq job"
+fresh t6
+ERR=$(DEVQ_JOB_ID=999 "$DEVQ" run --class measure -- echo nope 2>&1 >/dev/null); RC=$?
+printf '  rc=%s stderr=[%s]\n' "$RC" "$ERR"
+check "$RC == 2" "a nested run exits 2 immediately rather than stalling for NPU_LOCK_WAIT"
+case $ERR in *"nesting would deadlock"*) ok "the refusal names the cause";;
+              *) bad "refusal message does not name nesting: $ERR";; esac
+
 echo
 printf 'RESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

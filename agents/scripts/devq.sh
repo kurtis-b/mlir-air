@@ -22,7 +22,14 @@
 # lock -- the forked child still holds the open file description, so we kill the
 # descendants, and the runner holds the lock on its own fd so death releases it).
 #
+# RUN IS THE ONE TO USE FROM A GATE.  `submit` sends the job's output to the job
+# log and prints only an id, so substituting it for a bare `flock CMD` silently
+# swallows everything the gate printed -- and a gate whose output vanished can
+# still exit 0.  `run` submits, relays the log to stdout as it grows, and exits
+# with the job's own status, so it is a drop-in for `flock -x LOCK CMD`.
+#
 # Usage:
+#   devq.sh run    --class build|measure [--name TAG] -- CMD [ARG...]
 #   devq.sh submit --class build|measure [--name TAG] [--wait] -- CMD [ARG...]
 #   devq.sh status [--raw]
 #   devq.sh wait ID [--timeout SEC]
@@ -228,6 +235,62 @@ cmd_status() {
   return 0
 }
 
+# relay <logfile> <offset>
+#
+# Writes the bytes past <offset> to fd 3 (the caller's real stdout) and echoes the new
+# offset on stdout, so the caller can do `off=$(relay "$lf" "$off")` without the payload
+# and the bookkeeping fighting over one stream.
+relay() {
+  local lf=$1 off=$2 sz
+  [ -e "$lf" ] || { printf '%s' "$off"; return 0; }
+  sz=$(wc -c <"$lf" 2>/dev/null); sz=${sz//[^0-9]/}; sz=${sz:-0}
+  if [ "$sz" -gt "$off" ]; then
+    tail -c "+$((off + 1))" "$lf" >&3
+    off=$sz
+  fi
+  printf '%s' "$off"
+}
+
+cmd_runjob() {
+  local class= name=- id lf mf off=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --class) class=${2:-}; shift 2;;
+      --name)  name=${2:-}; shift 2;;
+      --) shift; break;;
+      *) die "run: unexpected argument '$1' (did you forget --?)";;
+    esac
+  done
+  case $class in build|measure) ;; *) die "run: --class must be build or measure";; esac
+  [ $# -gt 0 ] || die "run: no command given after --"
+  # A measure submitted from inside a running job would queue behind the device lock its
+  # own parent runner is holding and sit there for NPU_LOCK_WAIT before failing 124 -- a
+  # 30-minute stall reported as a lock timeout, a long way from the nested call that
+  # caused it.  Refuse immediately instead.
+  if [ -n "${DEVQ_JOB_ID:-}" ]; then
+    die "run: already inside devq job ${DEVQ_JOB_ID}; nesting would deadlock on the device lock"
+  fi
+  ensure
+  id=$(cmd_submit --class "$class" --name "$name" -- "$@") || return $?
+  lf=$(logf "$id"); mf=$(metaf "$id")
+  printf 'devq: job %s (%s) submitted\n' "$id" "$class" >&2
+  exec 3>&1
+  while :; do
+    off=$(relay "$lf" "$off")
+    lock_state; reconcile; unlock_state
+    read_meta "$mf"
+    case $M_state in
+      done|failed)
+        # Relay once more AFTER the terminal state is observed: cmd_run writes the state
+        # only after its child has exited, so this pass cannot race the job's last write.
+        off=$(relay "$lf" "$off")
+        [ -n "$M_note" ] && printf 'devq: job %s %s (%s)\n' "$id" "$M_state" "$M_note" >&2
+        return "${M_exit:-1}";;
+    esac
+    sleep "$POLL"
+  done
+}
+
 cmd_wait() {
   local id=${1:?wait: need an id} deadline= f
   # printf, not print: awk's default OFMT (%.6g) mangles epoch floats to 1.78e+09.
@@ -248,6 +311,7 @@ cmd_wait() {
 }
 
 case ${1:-} in
+  run)    shift; cmd_runjob "$@";;
   submit) shift; cmd_submit "$@";;
   status) shift; cmd_status "$@";;
   wait)   shift; cmd_wait "$@";;

@@ -20,6 +20,13 @@
 
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
+# The device-job broker. Non-interactive NPU targets queue through it instead of
+# taking /tmp/mlir-air-npu.lock by hand, so they take a FIFO position and cannot
+# run beside a build that would contaminate a timed measurement. `run` (not
+# `submit`) is the drop-in for `flock CMD`: it relays output and exits with the
+# job's status.
+DEVQ := $(srcdir)/../../../agents/scripts/devq.sh
+
 ifdef PEANO_INSTALL_DIR
   BUILD_DIR := build_peano
 else
@@ -207,7 +214,7 @@ compile-decode:
 ## on the NPU. Override PROMPT, N_TOKENS, MODEL via the command line.
 run-inference:
 	@mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && flock /tmp/mlir-air-npu.lock python3 \
+	cd $(BUILD_DIR) && $(DEVQ) run --class measure --name int4-inference -- python3 \
 		$(srcdir)/llama32_1b_int4_inference.py \
 		--run-only --n-tokens $(N_TOKENS) --prompt "$(PROMPT)" \
 		--model-path $(MODEL) \
@@ -216,6 +223,11 @@ run-inference:
 
 ## Interactive chat REPL — each prompt is independent (no chat history).
 ## Ctrl-D / /quit exits.
+# NOT through devq, deliberately: the broker's runner is setsid'd with stdin from
+# /dev/null and stdout to a job log, so a REPL under it reads EOF on the first
+# prompt. It keeps the bare lock, which is still the same lock devq measure jobs
+# take -- so an interactive session and a queued gate remain mutually exclusive,
+# they just do not share a queue position.
 chat:
 	@mkdir -p $(BUILD_DIR)
 	cd $(BUILD_DIR) && flock /tmp/mlir-air-npu.lock python3 \
