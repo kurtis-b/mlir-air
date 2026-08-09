@@ -23,6 +23,16 @@ made to hold them.** At `baseline_768`, `seq = 4096`:
 attn_scores   4096 x   64 x 4096      attn_output   4096 x 4096 x   64
 ```
 
+> **`[superseded 2026-08-08]` The registry facts below are right; the conclusion drawn from them
+> is not.** No such row exists and the sweep genuinely cannot stage one — but that is a
+> **catalogue** constraint, not a hardware one. Both shapes are measured passing on real NPU2 at
+> every rung of the ladder, at 0% allowed mismatch over the full output, and `attn_output` passes
+> by all three GEMM methods. `offload` now dispatches both, with tiles injected through the
+> `gemm_spec_fn` escape hatch; the corrected mode is gated in
+> `run_npu2_offload_peano.lit` at 30 dispatches. One further claim in the paragraph below is
+> simply false: `attn_scores` does **not** need `tile_k_l2` 256. `tile_k_l2 = 64` is what passes,
+> and at K = 64 it is forced, because K admits no other L2 tile.
+
 `gemm_config()` raises `KeyError` on both — there is no `K = 64` or `N = 64` bf16-out row anywhere
 (`registry_lookup.py:115`). Nor can the C4 sweep produce one: `sweep_families.py` derives K and N
 from `FAMILY_HIDDEN × ROLE_KN_MULTIPLES` with a minimum hidden of 512 and M from `SEQ_LADDER`, so no

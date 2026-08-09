@@ -1,40 +1,74 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""``offload`` — the host owns the layer and sends one GEMM at a time to the device.
+"""``offload`` — every LINEAR operator on the device, every NON-LINEAR one on the host.
 
 CONTRACT
     ``prepare_offload(shape, seed=...)`` is this mode's entry in the ``SPECS``
     catalogue: the D2 layer prepared for ``opcheck.py``'s ``dispatch`` seam.
-    The host holds every intermediate and dispatches exactly SIX registry
-    GEMMs, each as a one-step ``KernelCache.run_sequence`` call::
+    The host holds every intermediate and dispatches EIGHT linear operators,
+    each as a one-step ``KernelCache.run_sequence`` call::
 
         q_proj  k_proj  v_proj  output_proj  up_proj  down_proj
+        attn_scores x num_heads     attn_output x num_heads
 
-    Six calls, six recorded ``DispatchVector`` rows, each with one host
-    submission holding one runlist entry — summed by the driver that is six
-    submissions and six entries, which is what "aggregates nothing" means.
-    Everything else — attention, softmax, both normalization points, the GeLU,
-    reshapes, residuals — is host torch. This is the host-mediated extreme of
-    the Phase E taxonomy: the most submissions, the most sync boundaries, no
-    aggregation at all.
+    Six projections plus two attention matmuls per head: at the gate
+    configuration's twelve heads that is 6 + 24 = 30 calls, 30 recorded
+    ``DispatchVector`` rows, each with one host submission holding one runlist
+    entry. Summed by the driver that is thirty submissions over thirty
+    entries, which is what "aggregates nothing" means.
 
-SIX GEMMS, NOT EIGHT, AND WHY THAT IS A DECISION RATHER THAN A SHORTCUT
-    iron's offload dispatches eight, including the two attention GEMMs. On
-    this device those two cannot be registry GEMMs: at the gate configuration
-    they are ``4096 x 64 x 4096`` (attn_scores) and ``4096 x 4096 x 64``
-    (attn_output), and no ``K = 64`` or ``N = 64`` bf16-out row exists or can
-    be swept (08c has the derivation). So ATTENTION STAYS IN HOST TORCH —
-    ``pattern/blocked_attention.py``, shared with ``runlist`` — and this mode
-    is a HYBRID boundary, not a pure per-GEMM device implementation. The
-    artifact records ``attention_path`` so the mode's own record says which
-    boundary it actually drew.
+    What stays on the host is exactly the NON-LINEAR set: the softmax between
+    the two attention matmuls, both normalization points, and the GeLU. Plus
+    layout — head slicing, the K transpose, residual adds — which is data
+    movement rather than arithmetic and is not what the partition is about.
+
+WHAT THIS MODE ISOLATES, AND WHY IT IS NOT "THE HOST-MEDIATED EXTREME"
+    `[2026-08-08]` The taxonomy was corrected by the study's author: the four
+    modes span RECONFIGURATION COST AGAINST DRAM TRAFFIC, not "who sequences
+    the work". ``offload`` is the mode that MINIMIZES reconfiguration — one
+    xclbin, N instruction streams, one per GEMM shape, which is what iron
+    implements. Its host/device split is decided by LINEARITY, not by which
+    GEMMs happen to resolve in the registry. See 03 §The taxonomy.
+
+    The N-streams-under-one-xclbin half is not built here yet; this module is
+    the linearity half. Until both land the mode is at parity with iron's
+    partition but still pays a reconfiguration per dispatch.
+
+THE TWO ATTENTION MATMULS ARE LINEAR, SO THEY ARE ON THE DEVICE
+    `[2026-08-08]` They resolve in no registry — ``sweep_families.py`` derives
+    K and N from ``FAMILY_HIDDEN x ROLE_KN_MULTIPLES`` with a minimum hidden of
+    512, so no ``--family`` can put a 64 in the K or N slot. That is a
+    CATALOGUE constraint and not a hardware one: both shapes are measured
+    passing on hardware at every rung of the study's ladder, by all three GEMM
+    methods for ``attn_output``. The tiles below come from those measurements
+    and are injected through the ``gemm_spec_fn`` escape hatch every builder
+    here ships, recorded as ``gemm_spec_source: injected``. Nothing about this
+    requires a registry write.
+
+    This mode used to keep attention in host torch via
+    ``pattern/blocked_attention.py`` and describe itself as a hybrid boundary.
+    That was the superseded taxonomy plus the catalogue constraint read as a
+    hardware one. Both are corrected; the artifact still records
+    ``attention_path`` so the mode's own record says which boundary it drew.
+
+THE DRAM COST OF THIS PARTITION IS THE RESULT, NOT A REGRESSION
+    A host softmax between two device matmuls means the full ``[seq, seq]``
+    score matrix crosses DRAM twice per head — at the gate configuration that
+    is ~64 MiB per head, ~792 MiB per layer, against ~140 MB for the whole of
+    the previous six-GEMM form. This mode is therefore MUCH slower at 4096
+    than the implementation it replaces. That is what "all linear on the NPU,
+    all non-linear on the host" costs when the non-linear operator sits
+    between two matmuls, and pricing it is the point of the mode. Do not read
+    the latency as a defect and do not "fix" it by moving softmax to the
+    device — that is ``runlist``.
 
 THE RULE THAT DECIDES WHETHER THIS MODE MEASURES ANYTHING
     The mode computes; the oracle checks. They may not share arithmetic. This
-    module does more host math than any other mode, and every piece of it is
-    written against torch — ``F.layer_norm``, ``F.gelu(approximate="tanh")``,
-    ``blocked_attention``'s torch softmax — while the oracle's boundaries come
+    module still does the layer's whole non-linear half on the host, and every
+    piece of it is written against torch — ``F.layer_norm``,
+    ``F.gelu(approximate="tanh")``, ``torch.softmax`` in
+    ``_host_softmax_bf16`` — while the oracle's boundaries come
     from the numpy operator references behind ``pattern/reference.py``. What
     this module imports from the reference: the golden draws, the boundary
     NAMES. What it must never import: ``addnorm_pre_add_reference``,
@@ -101,11 +135,7 @@ from opcheck_layer import (  # noqa: E402
 )
 from opcheck_prepare import _spec_digest  # noqa: E402
 from pattern import EXECUTION_MODE_CSV  # noqa: E402
-from pattern.blocked_attention import (  # noqa: E402
-    blocked_attention,
-    resolve_query_block_size,
-    round_bf16,
-)
+from pattern.blocked_attention import round_bf16  # noqa: E402
 from pattern.reference import (  # noqa: E402
     ENCODER_BOUNDARIES,
     generate_golden_reference,
@@ -115,8 +145,10 @@ from pattern.reference import (  # noqa: E402
 #: module footguns.
 OFFLOAD_CACHE_DIR = "offload_cache"
 
-#: The six device GEMMs, in dispatch order. The order is the layer's dataflow
-#: and each entry becomes one recorded DispatchVector row.
+#: The six projection GEMMs, in dispatch order. The order is the layer's
+#: dataflow and each entry becomes one recorded DispatchVector row. The two
+#: attention matmuls are dispatched per head and are not in this tuple; see
+#: ATTENTION_GEMM_TILES.
 OFFLOAD_GEMMS = (
     "q_proj",
     "k_proj",
@@ -125,6 +157,69 @@ OFFLOAD_GEMMS = (
     "up_proj",
     "down_proj",
 )
+
+# ---------------------------------------------------------------------------
+# THE TWO ATTENTION GEMMS: MEASURED TILES, INJECTED
+#
+# `[2026-08-08]` Neither shape resolves in the registry and neither can be swept
+# into it (see the module docstring). These tiles are not guesses and not
+# defaults -- each is the configuration that PASSED on real NPU2 at 0% allowed
+# mismatch over the full output, against the same `XRTRunner._check_outputs`
+# comparison every registry row was sized with:
+#
+#   attn_scores  4096x64x4096   drain  tm=32 tk2=64  tk1=32 tn=128  herd 8x4
+#                               0 / 16,777,216 mismatches, mean_rel_L1 9.386e-3,
+#                               2901.4 us, 740.1 GFLOP/s.
+#                               tk2=64 is FORCED: K=64 admits no other L2 tile.
+#
+#   attn_output  4096x4096x64   drain  tm=32 tk2=256 tk1=32 tn=16   herd 8x4
+#                               0 / 262,144 mismatches, mean_rel_L1 9.417e-3,
+#                               abs_err_max 7.324e-4 against atol 2.121e-3
+#                               (3.46x margin), 1179.3 us, 1820.9 GFLOP/s.
+#
+# `attn_output` also passes by `direct` (915.8 us, faster) and by `fused-cast`.
+# `drain` is chosen for ACCURACY, not speed: direct measures mean_rel_L1
+# 1.542e-2 against drain's 9.417e-3, and this layer's tolerance has no headroom
+# to spend -- `output` sits at the hard 1e-1 ceiling at a 1.35x margin.
+#
+# Two failure clusters bound the space, both fully characterised, so a future
+# reader does not re-search it: herd_n=1 at N=64 HANGS (returns the
+# host-written buffer at a flat 6,144,000 us per iteration), and tile_n=8 fails
+# the microkernel's own `static_assert(n % (2 * t) == 0)` for drain/fused-cast
+# while `direct` builds and returns garbage.
+# ---------------------------------------------------------------------------
+ATTENTION_GEMM_TILES = {
+    "attn_scores": {
+        "method": "drain",
+        "tile": {"tile_m": 32, "tile_k_l2": 64, "tile_k_l1": 32, "tile_n": 128},
+        "herd": (8, 4),
+    },
+    "attn_output": {
+        "method": "drain",
+        "tile": {"tile_m": 32, "tile_k_l2": 256, "tile_k_l1": 32, "tile_n": 16},
+        "herd": (8, 4),
+    },
+}
+
+
+def attention_gemm_spec(role):
+    """The injected build recipe for one attention matmul.
+
+    Built through ``llms/shared``'s own ``_spec_with_tiles`` rather than as a
+    hand-written dict, so an injected spec carries exactly the fields a
+    registry-resolved one does — ``sym_suffix`` and ``obj`` derived from
+    ``(tile_m, tile_n)``, ``needs_f32_scratch``, ``build_kwargs`` — and cannot
+    drift from what ``_build_gemm_module`` and ``ek.compile_gemm_mm`` expect.
+    The herd is set explicitly because an injected spec carries none and
+    ``spec_herd`` would otherwise fall back to 8x4 by coincidence rather than
+    by measurement (``builders/gemm_spec.py`` footguns).
+    """
+    from shared.builders.gemm_builder import _spec_with_tiles
+
+    entry = ATTENTION_GEMM_TILES[role]
+    spec = dict(_spec_with_tiles(entry["method"], entry["tile"]))
+    spec["herd_m"], spec["herd_n"] = entry["herd"]
+    return spec
 
 #: The host tensors the layer takes, in the order ``opcheck.py`` indexes them
 #: for fault injection. The q/k/v weights are SEPARATE here — this mode
@@ -141,9 +236,12 @@ OFFLOAD_INPUT_NAMES = (
     "ln2_weight",
 )
 
-#: Recorded in the artifact: this mode's attention boundary is host torch f32
-#: through the shared query-blocked implementation, NOT a device dispatch.
-ATTENTION_PATH = "host_torch_fp32_blocked"
+#: Recorded in the artifact: both attention matmuls are device dispatches and
+#: only the softmax between them is host torch. `[2026-08-08]` This value was
+#: ``host_torch_fp32_blocked`` until the taxonomy correction; a results tree
+#: mixing the two is mixing two different modes, and the field is what says so.
+#: The sequence ladder's slopes split on exactly this covariate.
+ATTENTION_PATH = "device_gemm_host_softmax"
 
 #: The single func.func each GEMM method's module emits, which is what
 #: ``instance_name`` must equal — a mismatch does not fail to load, it times
@@ -158,6 +256,39 @@ _GEMM_BACKEND = {
     "output_format": "elf",
     "omit_while_true_loop": False,
 }
+
+
+def _check_no_object_collision(specs):
+    """Raise if two GEMMs share an ``mm_*.o`` name without sharing its contents.
+
+    ``ek.compile_gemm_mm`` names the object from ``(tile_m, tile_n)`` alone
+    while ``tile_k_l1`` is baked in as a compile flag, so two GEMMs that agree
+    on the first two and differ on the third write the SAME file with DIFFERENT
+    micro-kernels — and whichever compiles last wins. D2 found exactly this
+    between the FFN's up-projection and the o-projection; it does not fail to
+    build, it silently returns the other GEMM's arithmetic.
+
+    Today ``up`` and ``attn_scores`` legitimately share ``mm_m32n128.o``: both
+    are drain at tile_m 32 / tile_n 128 / tile_k_l1 32, so the object really is
+    the same one and compiling it twice is a no-op. That is a coincidence of
+    the current tiles, not a property. Retuning either shape's ``tile_k_l1``
+    would reintroduce the collision, and this turns that into an immediate
+    raise naming both GEMMs instead of a wrong number 4096 rows later.
+    """
+    seen = {}
+    for key, (spec, _) in specs.items():
+        signature = (spec["tile_m"], spec["tile_n"], spec["tile_k_l1"])
+        previous_key, previous_signature = seen.get(spec["obj"], (None, None))
+        if previous_key is not None and previous_signature != signature:
+            raise ValueError(
+                f"GEMM object name collision: '{key}' and '{previous_key}' both "
+                f"compile to {spec['obj']} but from different micro-kernels "
+                f"({signature} vs {previous_signature}). compile_gemm_mm names "
+                f"the object from (tile_m, tile_n) only, so one would silently "
+                f"overwrite the other. Give one of them a different tile_n, or "
+                f"fix the naming in llms/shared/builders/gemm_builder.py."
+            )
+        seen[spec["obj"]] = (key, signature)
 
 
 def offload_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
@@ -188,7 +319,19 @@ def offload_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
             resolve_gemm_spec(seq_len, ffn_dim, emb_dim),
             (seq_len, ffn_dim, emb_dim),
         ),
+        # Per HEAD, not per layer: Q_h @ K_h^T is [seq, head_dim] @ [head_dim,
+        # seq], and P_h @ V_h is [seq, seq] @ [seq, head_dim]. One compiled
+        # module each, dispatched num_heads times.
+        "attn_scores": (
+            attention_gemm_spec("attn_scores"),
+            (seq_len, head_dim, seq_len),
+        ),
+        "attn_output": (
+            attention_gemm_spec("attn_output"),
+            (seq_len, seq_len, head_dim),
+        ),
     }
+    _check_no_object_collision(specs)
     artifacts = {key: f"off_gemm_{m}x{k}x{n}" for key, (_, (m, k, n)) in specs.items()}
     backend_kwargs = {
         artifacts[key]: dict(_GEMM_BACKEND, instance_name=_METHOD_FUNC[spec["method"]])
@@ -201,6 +344,8 @@ def offload_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
         "output_proj": "proj",
         "up_proj": "up",
         "down_proj": "down",
+        "attn_scores": "attn_scores",
+        "attn_output": "attn_output",
     }
     return {
         "seq_len": seq_len,
@@ -212,7 +357,10 @@ def offload_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
         "gemms": gemms,
         "artifacts": artifacts,
         "backend_kwargs": backend_kwargs,
-        "query_block_size": resolve_query_block_size(seq_len, num_heads),
+        # 6 projections + 2 attention matmuls per head. Derived here rather
+        # than written as a literal so the gate's count and the run's count
+        # cannot disagree at a shape with a different head count.
+        "n_dispatches": len(OFFLOAD_GEMMS) + 2 * num_heads,
     }
 
 
@@ -221,17 +369,29 @@ def describe_offload(cfg):
     print(
         f"  offload {cfg['seq_len']}x{cfg['emb_dim']} ffn {cfg['ffn_dim']} "
         f"{cfg['num_heads']}h x {cfg['head_dim']} (encoder_bert, non-causal, "
-        f"hybrid boundary: 6 device GEMMs, attention in host torch)"
+        f"linear boundary: 8 linear operators over 5 shapes, "
+        f"{cfg['n_dispatches']} dispatches, attention on device)"
     )
     parts = []
     for key in ("proj", "up", "down"):
         spec, (m, k, n) = cfg["specs"][key]
         parts.append(f"{key} {m}x{k}x{n} {spec['method']} (registry)")
     print("    " + ", ".join(parts))
-    blocks = cfg["seq_len"] // cfg["query_block_size"]
+    # The injected tiles, printed in full: this is the only place a reader sees
+    # that these two shapes came from a measurement rather than the registry,
+    # and the gate pins the line so a silent retune fails there.
+    parts = []
+    for key in ("attn_scores", "attn_output"):
+        spec, (m, k, n) = cfg["specs"][key]
+        parts.append(
+            f"{key} {m}x{k}x{n} {spec['method']} tk2={spec['tile_k_l2']} "
+            f"tk1={spec['tile_k_l1']} tn={spec['tile_n']} "
+            f"herd {spec['herd_m']}x{spec['herd_n']} (injected)"
+        )
+    print("    " + ", ".join(parts))
     print(
-        f"    attention host torch fp32, query block {cfg['query_block_size']} "
-        f"x{blocks} block(s)"
+        f"    attention on device: 2 GEMMs x {cfg['num_heads']} heads = "
+        f"{2 * cfg['num_heads']} dispatches, host keeps scale + softmax"
     )
 
 
@@ -418,6 +578,68 @@ def _host_addnorm(x, residual, weight):
     return round_bf16(normed.numpy())
 
 
+def _host_softmax_bf16(scores, scale):
+    """Scale, then row-softmax, in f32 on the host; rounded to bf16 for the device.
+
+    The one NON-LINEAR operator inside attention, and therefore the whole
+    reason the ``[seq, seq]`` score matrix crosses DRAM twice per head. torch
+    rather than numpy, per the oracle independence rule in the module
+    docstring: the CHECK path's softmax is
+    ``builders/mha_attention.py::chunked_attention_reference``, in numpy.
+
+    The ``1/sqrt(head_dim)`` scale is folded in here rather than into Q
+    upstream. Either is correct and neither is free of rounding, but doing it
+    on the already-materialized f32 scores keeps the device GEMM's operands
+    exactly the projections the previous dispatch produced, so a stage
+    comparison on ``q`` is comparing the tensor the next GEMM actually read.
+    """
+    import torch
+
+    probs = torch.softmax(_torch_f32(scores) * scale, dim=-1)
+    return round_bf16(probs.numpy())
+
+
+def _device_attention(cache, cfg, gemm, q, k, v):
+    """Non-causal multi-head attention with BOTH matmuls on the device.
+
+    One head at a time, because the two shapes are per-head: ``[seq, head_dim]
+    @ [head_dim, seq]`` and ``[seq, seq] @ [seq, head_dim]``. Two dispatches
+    per head, each its own submission, which is the mode being itself — see
+    the ``run_sequence`` footgun on why they are not batched.
+
+    ``q``/``k``/``v`` are ``[seq, num_heads * head_dim]`` bf16, head ``h`` in
+    columns ``h*head_dim : (h+1)*head_dim`` — the layout the projection GEMMs
+    produce and the one the golden reference indexes. Returns the context in
+    that same layout as float32.
+
+    The head slice and the K transpose are host LAYOUT, not host arithmetic:
+    the partition this mode implements is linear-on-device / non-linear-on-host,
+    and a transpose is neither. It is a real host cost and it is timed as one.
+    """
+    import math
+
+    seq_len, num_heads = cfg["seq_len"], cfg["num_heads"]
+    head_dim = cfg["head_dim"]
+    scale = 1.0 / math.sqrt(head_dim)
+
+    context = np.empty((seq_len, num_heads * head_dim), dtype=bfloat16)
+    for head in range(num_heads):
+        columns = slice(head * head_dim, (head + 1) * head_dim)
+        # Contiguous copies: the device operands are plain row-major memrefs,
+        # and a numpy view with a column stride is not one.
+        with cache.profiler.time_cpu("attention_layout"):
+            q_head = np.ascontiguousarray(q[:, columns])
+            k_head_t = np.ascontiguousarray(k[:, columns].T)
+            v_head = np.ascontiguousarray(v[:, columns])
+
+        scores = gemm("attn_scores", q_head, k_head_t)
+        with cache.profiler.time_cpu("softmax"):
+            probs = _host_softmax_bf16(scores, scale)
+        context[:, columns] = gemm("attn_output", probs, v_head)
+
+    return context.astype(np.float32)
+
+
 def _host_gelu(x):
     """Host tanh-approximation GeLU in f32, unrounded.
 
@@ -487,29 +709,30 @@ def prepare_offload(shape, seed=42):
             vector_rows.append(row)
             return out
 
-        print("  [1/6] q_proj + [2/6] k_proj + [3/6] v_proj (one dispatch each)")
+        print("  [1/8] q_proj + [2/8] k_proj + [3/8] v_proj (one dispatch each)")
         q = gemm("q_proj", x, w_q)
         k = gemm("k_proj", x, w_k)
         v = gemm("v_proj", x, w_v)
-        print(f"  [host] blocked attention, query block {cfg['query_block_size']}")
-        with cache.profiler.time_cpu("attention"):
-            attn_context = blocked_attention(
-                q,
-                k,
-                v,
-                num_heads,
-                causal=False,
-                query_block_size=cfg["query_block_size"],
-            )
-        print("  [4/6] output_proj")
+        print(
+            f"  [4/8+5/8] attn_scores + attn_output on device, "
+            f"{num_heads} heads, host softmax between them"
+        )
+        # Softmax and layout are timed SEPARATELY, accumulating per key across
+        # the per-head calls: softmax is the non-linear operator this mode
+        # deliberately leaves on the host, the head slicing and K transpose are
+        # data movement the partition says nothing about. Summing them into one
+        # "attention" figure would report the partition's cost as larger than
+        # it is.
+        attn_context = _device_attention(cache, cfg, gemm, q, k, v)
+        print("  [6/8] output_proj")
         attn_out = gemm("output_proj", round_bf16(attn_context), w_o)
         with cache.profiler.time_cpu("ln1"):
             hidden = _host_addnorm(attn_out, x, ln1_weight)
-        print("  [5/6] up_proj")
+        print("  [7/8] up_proj")
         ffn_up = gemm("up_proj", hidden, w_up)
         with cache.profiler.time_cpu("gelu"):
             ffn_gelu = _host_gelu(ffn_up)
-        print("  [6/6] down_proj")
+        print("  [8/8] down_proj")
         ffn_out = gemm("down_proj", round_bf16(ffn_gelu), w_down)
         with cache.profiler.time_cpu("ln2"):
             output = _host_addnorm(ffn_out, hidden, ln2_weight)
@@ -570,11 +793,18 @@ def prepare_offload(shape, seed=42):
         "golden_seed": seed,
         "execution_mode": EXECUTION_MODE_CSV["offload"],
         "attention_path": ATTENTION_PATH,
-        "query_block_size": cfg["query_block_size"],
-        "gemm_spec_source": "registry",
+        "n_dispatches": cfg["n_dispatches"],
+        # MIXED, and the field says so rather than rounding to one word: the
+        # three projection shapes resolve in the registry, the two attention
+        # shapes are injected measured tiles that resolve in none. The per-spec
+        # digests below are what a reader checks that against; the phase allows
+        # injection precisely on the condition that it is not silent.
+        "gemm_spec_source": "registry+injected",
         "gemm_spec_proj": _spec_digest(cfg["specs"]["proj"][0]),
         "gemm_spec_ffn_up": _spec_digest(cfg["specs"]["up"][0]),
         "gemm_spec_ffn_down": _spec_digest(cfg["specs"]["down"][0]),
+        "gemm_spec_attn_scores": _spec_digest(cfg["specs"]["attn_scores"][0]),
+        "gemm_spec_attn_output": _spec_digest(cfg["specs"]["attn_output"][0]),
     }
     return {
         "inputs": inputs,

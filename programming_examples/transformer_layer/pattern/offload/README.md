@@ -18,24 +18,51 @@ boundaries, no aggregation at all.
 
 ## This is a hybrid boundary, and the artifact says so
 
-iron's offload dispatches **eight** GEMMs, including the two attention GEMMs.
-On this device those two cannot be dispatched as registry GEMMs, and the
-registry cannot be made to hold them: at the gate configuration they are
+iron's offload dispatches **eight** GEMMs, including the two attention GEMMs,
+and `[2026-08-08]` **so does this one.** At the gate configuration they are
 `4096 x 64 x 4096` (attn_scores) and `4096 x 4096 x 64` (attn_output), and
-`gemm_config()` raises `KeyError` on both — there is no `K = 64` or `N = 64`
-bf16-out row anywhere, and the C4 sweep derives K and N from
+`gemm_config()` does raise `KeyError` on both: there is no `K = 64` or
+`N = 64` bf16-out row anywhere, and the C4 sweep derives K and N from
 `FAMILY_HIDDEN x ROLE_KN_MULTIPLES` with a minimum hidden of 512, so no
-`--family` can stage a 64 in either position. `attn_scores` would additionally
-need `K = 64` against a minimum `tile_k_l2` of 256, which does not tile.
+`--family` can stage a 64 in either position.
 
-**So attention stays in host torch**, alongside the softmax, scaling,
-masking, reshapes, normalization and residuals that were always going to.
-That makes `offload` a *hybrid* boundary rather than a pure per-GEMM device
-implementation, and the artifact records `attention_path:
-"host_torch_fp32_blocked"` so the mode's own record says which boundary it
-actually drew. Three consequences, from 08c:
+**That is a catalogue constraint, not a hardware one**, and this README used
+to draw the wrong conclusion from it. Both shapes are measured passing on real
+NPU2 at every rung of the ladder, at 0% allowed mismatch over the full output;
+`attn_output` passes by all three GEMM methods. The tiles are injected through
+the `gemm_spec_fn` escape hatch every builder ships and recorded as
+`gemm_spec_source: registry+injected`. A further claim that travelled with the
+old one — that `attn_scores` "would need `K = 64` against a minimum
+`tile_k_l2` of 256, which does not tile" — is false too: `tile_k_l2 = 64` is
+what passes, and at K = 64 it is forced.
 
-- It does not weaken the mode's role: six host submissions and six sync-heavy
+**So attention is on the device**, and only the softmax between the two
+matmuls stays on the host, with both LayerNorms and the GeLU. That is the
+corrected taxonomy's rule — every LINEAR operator on the NPU, every NON-LINEAR
+one on the host — rather than the *hybrid* boundary this mode used to draw.
+The artifact records `attention_path:
+"device_gemm_host_softmax"` so the mode's own record says which boundary it
+actually drew — a results tree mixing that value with the old
+`host_torch_fp32_blocked` is mixing two different modes, and the sequence
+ladder's slopes split on exactly this covariate.
+
+**What it costs, which is the mode's own result.** A host softmax between two
+device matmuls means the full `[seq, seq]` score matrix crosses DRAM twice per
+head: 970,457,088 bytes over 30 dispatches against 139,984,896 over six, a
+**6.9x** increase. This mode is therefore much slower at 4096 than the
+six-GEMM form it replaces. That is what the partition costs when the
+non-linear operator sits between two matmuls; it is priced, not broken.
+
+**What it did not cost: accuracy.** Measured at the gate configuration,
+`attn_context` needs `atol` 8.800e-05 against the 1.0e-03 the boundary
+allows — an 11.4x margin — and the layer output needs 5.788e-02 against the
+1e-1 hard ceiling, a **1.73x** margin, wider than `block` (1.35x), `runlist`
+(1.41x) or `fused` (1.27x). No tolerance was widened for this change.
+
+Three consequences of the OLD host-attention boundary, from 08c, kept because
+they explain the shape of the mode's history:
+
+- It did not weaken the mode's role: six host submissions and six sync-heavy
   round trips is still strictly the most host-mediated of the four, and the
   distinguishability gate asks for an ordering, not the number eight.
 - It is the numerically conservative choice: host FP32 attention lands closer

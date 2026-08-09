@@ -59,21 +59,31 @@ import results_io  # noqa: E402
 import schema  # noqa: E402
 
 # Which modes run attention on the host. Derived from a fact the code states:
-# `offload` and `runlist` import `blocked_attention` from `pattern/blocked_attention.py`
-# and call it; `coarse` and `fused` import at most `round_bf16` from that module
-# and dispatch attention to the device. `test_attention_path.py` re-derives this
-# from the pattern modules' imports and fails if the map drifts, because the map
-# is a claim about other files.
+# `runlist` imports `blocked_attention` from `pattern/blocked_attention.py` and
+# calls it; `coarse`, `fused` and `offload` import at most `round_bf16` from that
+# module and dispatch attention to the device. `test_attention_path.py`
+# re-derives this from the pattern modules' imports and fails if the map drifts,
+# because the map is a claim about other files.
 #
 # It is recorded per row because it is the single covariate that decides how a
 # latency curve reads -- the sequence ladder's host-attention modes fit a
 # log-log slope of 1.25 against the device-attention modes' 1.03 and 1.15 -- and
 # it was None in every row of the first ladder, which is how the schema had a
 # field for it and the data did not.
+#
+# `[2026-08-08]` offload moved host_torch -> device. Its two attention matmuls
+# are LINEAR, so the corrected taxonomy puts them on the NPU and leaves only the
+# softmax between them on the host; see pattern/offload/offload.py. The check in
+# test_attention_path.py is what caught this map going stale, which is the job it
+# was written for. Note what it means for the ladder: three of the four modes now
+# sit on the device side of the covariate, so a ladder that wants to separate the
+# two placements is leaning on `runlist` alone until that mode is rebuilt too --
+# and once it is, ATTENTION_PATH stops being a covariate in this study at all and
+# test_both_paths_are_represented will (correctly) fail.
 ATTENTION_PATH_BY_MODE = {
     "coarse": "device",
     "fused": "device",
-    "offload": "host_torch",
+    "offload": "device",
     "runlist": "host_torch",
 }
 

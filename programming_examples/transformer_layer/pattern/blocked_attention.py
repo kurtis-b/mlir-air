@@ -19,13 +19,30 @@ CONTRACT
     ``pattern/`` rather than in ``offload/`` so ``runlist`` imports the same
     blocking, per 08c.
 
-WHY THIS IS HOST MATH AT ALL
-    The two attention GEMMs cannot be dispatched as registry GEMMs on this
-    device: at the gate configuration they are ``4096 x 64 x 4096`` and
-    ``4096 x 4096 x 64``, and there is no ``K = 64`` or ``N = 64`` bf16-out
-    row anywhere -- nor can the C4 sweep stage one (08c has the derivation).
-    So the modes that decompose attention keep it in host torch, and this
-    module is the one implementation of that boundary.
+WHY THIS IS HOST MATH -- AND WHY THAT IS NO LONGER THE ONLY OPTION
+    ``[2026-08-08]`` This module's original rationale said the two attention
+    GEMMs "cannot be dispatched on this device", because at the gate
+    configuration they are ``4096 x 64 x 4096`` and ``4096 x 4096 x 64`` and no
+    ``K = 64`` or ``N = 64`` bf16-out row exists or can be swept. **The premise
+    is right and the conclusion was wrong.** No such row exists and
+    ``sweep_families.py`` genuinely cannot stage one -- it derives K and N from
+    ``FAMILY_HIDDEN x ROLE_KN_MULTIPLES`` with a minimum hidden of 512 -- but
+    that is a CATALOGUE constraint, not a hardware one. Both shapes are
+    measured passing on real NPU2 at every rung of the study's ladder, and
+    ``attn_output`` passes by all three GEMM methods. The route around the
+    catalogue is the ``gemm_spec_fn`` escape hatch every builder here ships:
+    inject the measured tiles, record ``gemm_spec_source: injected``.
+
+    (A related claim that circulated with it -- that ``attn_scores`` "would
+    need K = 64 against a minimum ``tile_k_l2`` of 256, which does not tile" --
+    is also false. ``tile_k_l2 = 64`` is what passes, and at K = 64 it is
+    forced, because K admits no other L2 tile.)
+
+    So ``offload`` no longer calls this module: ``pattern/offload/offload.py``
+    dispatches both matmuls and keeps only the softmax on the host, which is
+    what the corrected taxonomy's linearity rule requires. This module remains
+    the host-attention implementation for ``runlist``, which has not been
+    rebuilt yet, and as the reference for what the host boundary cost.
 
 WHY THE THRESHOLD IS SCRATCH BYTES, NOT iron's ``seq_len >= 16384``
     iron gates blocking on a hardcoded sequence length and then sizes the

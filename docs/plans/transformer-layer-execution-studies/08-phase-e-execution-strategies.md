@@ -275,7 +275,16 @@ it (minimum K is 512, minimum N is 128 across all 69 shapes). [06](06-phase-c-op
 row", which is true for `coarse` and `fused`, where attention is inside `mha_out_proj`. It is
 **false for `offload`**, the one mode whose whole premise is dispatching them as standalone GEMMs.
 
-**`[2026-08-05]` Decided: attention stays in host torch, and `offload` dispatches six GEMMs.**
+> **`[reversed 2026-08-08]` `offload` dispatches EIGHT linear operators — 30 dispatches — with
+> both attention matmuls on the device.** The registry facts below hold: no `K = 64` / `N = 64`
+> row exists and `sweep_families.py` cannot stage one. That is a **catalogue** constraint and was
+> read here as a hardware one. Both shapes are measured passing on real NPU2 by injected tiles
+> (`gemm_spec_fn`), and `attn_scores`' supposed `tile_k_l2` 256 requirement is false — 64 passes
+> and is forced. The numerical argument below ("host FP32 lands closer to the FP32 oracle") also
+> did not survive: with device attention the layer needs `atol` 5.788e-02 against the 1e-1
+> ceiling, a **1.73×** margin — wider than `block`, `runlist` or `fused`.
+
+**`[2026-08-05, reversed 2026-08-08]` Decided: attention stays in host torch, and `offload` dispatches six GEMMs.**
 
 ```
 q_proj  k_proj  v_proj  output_proj  up_proj  down_proj

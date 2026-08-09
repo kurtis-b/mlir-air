@@ -1,21 +1,28 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 //
-// Phase E3 offload-mode gate: the D2 layer at the host-mediated extreme of the
-// execution-strategy taxonomy.
+// offload-mode gate: the D2 layer partitioned by LINEARITY.
 //
-// Same golden model and same per-boundary comparisons as the block and coarse
-// gates, behind a different execution boundary: the host owns the layer and
-// dispatches six registry GEMMs one at a time -- q/k/v/output_proj over one
-// shared 4096x768x768 drain ELF, up (drain) and down (fused-cast) over their
-// own -- each as a one-step run_sequence call in a FRESH hw_context (a reused
-// context returns wrong numbers from an ELF's second execution onward; the
-// measurement is in pattern/offload/offload.py). Attention, softmax, both
-// norms and the GeLU are host torch, written independently of the numpy
-// oracle; the artifact records the hybrid boundary as attention_path.
+// `[2026-08-08]` Rewritten for the corrected taxonomy. The four modes span
+// reconfiguration cost against DRAM traffic, not "who sequences the work", and
+// offload is the mode that MINIMIZES reconfiguration -- with every LINEAR
+// operator on the NPU and every NON-LINEAR one on the host. See 03 The taxonomy.
+// The version of this file before that correction required
+// "attention host torch fp32" and pinned six dispatches: it certified the
+// obsolete implementation and would have passed the wrong build.
+//
+// So: eight linear operators over five compiled shapes. The six projections
+// resolve in the registry; the two attention matmuls resolve in NO registry and
+// cannot be swept into one (sweep_families.py derives K and N from
+// FAMILY_HIDDEN x ROLE_KN_MULTIPLES with a minimum hidden of 512, so no family
+// puts a 64 in the K or N slot). That is a CATALOGUE constraint, not a hardware
+// one -- both shapes are measured passing on real NPU2 -- and their tiles are
+// injected through the gemm_spec_fn escape hatch every builder ships. Only the
+// softmax between the two attention matmuls, both norms and the GeLU stay on
+// the host, written independently of the numpy oracle.
 //
 // Two recipes in one file, deliberately: they share a working directory and
-// therefore the ELF cache, so the injected run reuses the three ELFs the clean
+// therefore the ELF cache, so the injected run reuses the five ELFs the clean
 // run compiled -- compilation depends on the shape, not the data.
 //
 // NPU serialization lives one layer down, not in the recipes below: device
@@ -35,13 +42,22 @@
 // RUN: make -f %S/Makefile clean
 // RUN: make -f %S/Makefile check-offload PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
 //
-// The configuration first -- the forced gate configuration, each GEMM resolved
-// through the registry, and the mode's own statement that it is a hybrid
-// boundary with attention on the host. A registry change that moved a method
-// fails here with its cause on screen.
-// CHECK: offload 4096x768 ffn 3072 12h x 64 (encoder_bert, non-causal, hybrid boundary: 6 device GEMMs, attention in host torch)
+// The configuration first -- the forced gate configuration, each projection
+// resolved through the registry, and the mode's own statement that attention is
+// now on the device. A registry change that moved a method fails here with its
+// cause on screen.
+// CHECK: offload 4096x768 ffn 3072 12h x 64 (encoder_bert, non-causal, linear boundary: 8 linear operators over 5 shapes, 30 dispatches, attention on device)
 // CHECK: proj 4096x768x768 drain (registry), up 4096x768x3072 drain (registry), down 4096x3072x768 fused-cast (registry)
-// CHECK: attention host torch fp32, query block 4096 x1 block(s)
+//
+// The INJECTED tiles in full. These two lines are the whole reason the mode can
+// put attention on the device, and they are the one place a reader sees that
+// these tiles came from a measurement rather than from a lookup. Each is the
+// configuration that passed on hardware at 0% allowed mismatch over the full
+// output: attn_scores at mean_rel_L1 9.386e-3 (tk2=64 is forced -- K=64 admits
+// no other L2 tile), attn_output at 9.417e-3 with a 3.46x margin. A silent
+// retune to a faster or narrower configuration fails right here.
+// CHECK: attn_scores 4096x64x4096 drain tk2=64 tk1=32 tn=128 herd 8x4 (injected), attn_output 4096x4096x64 drain tk2=256 tk1=32 tn=16 herd 8x4 (injected)
+// CHECK: attention on device: 2 GEMMs x 12 heads = 24 dispatches, host keeps scale + softmax
 //
 // Every boundary, in execution order, each with zero mismatching elements.
 // Named individually rather than counted, so a stage list that dropped or
@@ -59,22 +75,31 @@
 // CHECK: [stage] output {{.*}} mismatch       0
 // CHECK: [offload] stages: 10/10 clean
 //
-// The mode's own instrumentation: one DispatchVector row per GEMM dispatch.
-// Six, one each for q/k/v/output_proj/up_proj/down_proj -- a wrapper that
-// batched them into one runlist, or stopped recording per-dispatch rows,
-// fails here before the driver's totals comparison sees it.
-// CHECK: [offload] recorded 6 dispatch vectors
+// The mode's own instrumentation: one DispatchVector row per dispatch. Thirty
+// -- six projections plus two attention matmuls on each of twelve heads. A
+// wrapper that batched the per-head pairs into one runlist, or stopped
+// recording per-dispatch rows, fails here before the driver's totals
+// comparison sees it.
+// CHECK: [offload] recorded 30 dispatch vectors
 //
-// The vectors' CONTENTS, not only their count: the six driver-summed totals.
-// Six submissions over six entries is the mode's defining non-aggregation
-// clause. Air is 7 (one launch per drain dispatch, two for the fused-cast
-// down projection); herd counts accumulate per dispatch; sync is 19 (three
-// per drain dispatch -- A and B up, C back -- plus four for the fused-cast
-// one, whose zero-filled f32 scratch also crosses); and the bytes are those
-// nineteen transfers exactly. The totals line prints only after every row
-// passes the as_row() schema in opcheck_prepare.dispatch_vector_totals, so a
-// malformed row aborts the run and a run whose totals drift fails right here.
-// CHECK: [offload] dispatch totals: submissions 6 entries 6 air 7 herd 19 sync 19 bytes 139984896
+// The vectors' CONTENTS, not only their count.
+//
+// WHERE THESE NUMBERS COME FROM, because it decides what a failure means.
+// submissions / entries / air / sync / bytes are DERIVED, from a per-dispatch
+// model: bytes = A + B + C plus a f32 C scratch for fused-cast, one air launch
+// per drain dispatch and two for fused-cast, three sync boundaries per drain
+// dispatch (A and B up, C back) and four for fused-cast. That model reproduces
+// the SIX-dispatch line this gate pinned before the rewrite exactly -- air 7,
+// sync 19, bytes 139984896 -- which is what made it safe to extend to thirty
+// rather than a guess dressed as a literal. herd is the one field the model
+// could NOT derive; it was left as a regex until the first clean run, which
+// returned 91, and every derived field came back exactly as predicted.
+//
+// bytes is 970457088: 926 MiB against the 134 MiB the six-dispatch form moved,
+// a 6.9x increase. That is NOT a regression to fix. A host softmax between two
+// device matmuls means the full 4096x4096 score matrix crosses DRAM twice per
+// head, and pricing exactly that is what the mode is for.
+// CHECK: [offload] dispatch totals: submissions 30 entries 30 air 31 herd 91 sync 91 bytes 970457088
 //
 // Then the layer output itself over all 4096 x 768 elements, and the label
 // naming the MODE's operator.
@@ -98,18 +123,21 @@
 // Nothing upstream of the first norm reads ln1_weight, so the attention half
 // must still be exact while `hidden` and everything after it moves -- which is
 // what says the stage comparisons are reading THIS run's buffers rather than
-// replaying the clean run's.
+// replaying the clean run's. attn_context is now produced by two DEVICE GEMMs
+// rather than by host torch, so this clause also says the device attention path
+// is exact on the run where the layer's verdict is FAIL.
 // FAULT: [stage] q {{.*}} mismatch       0
+// FAULT: [stage] attn_context {{.*}} mismatch       0
 // FAULT: [stage] attn_out {{.*}} mismatch       0
 // FAULT: [stage] hidden {{.*}} mismatch {{[1-9][0-9]*}}
 // FAULT: [offload] stages: 5/10 clean
 //
 // The vectors, still recorded under injection -- and totaling EXACTLY what
-// the clean run totals: the six literals below are the same six the clean
-// half pins above, which is the suite's own statement of the equality the
-// driver re-derives from the two artifacts.
-// FAULT: [offload] recorded 6 dispatch vectors
-// FAULT: [offload] dispatch totals: submissions 6 entries 6 air 7 herd 19 sync 19 bytes 139984896
+// the clean run totals: the literals below are the same ones the clean half
+// pins above, which is the suite's own statement of the equality the driver
+// re-derives from the two artifacts.
+// FAULT: [offload] recorded 30 dispatch vectors
+// FAULT: [offload] dispatch totals: submissions 30 entries 30 air 31 herd 91 sync 91 bytes 970457088
 //
 // And the verdict in the three forms opcheck.py reports it: the comparison's
 // own, the control's reading of it, and the exit-status summary.

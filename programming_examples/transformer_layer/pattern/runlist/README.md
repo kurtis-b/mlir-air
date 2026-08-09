@@ -68,12 +68,23 @@ hardware's dispatch caps (08d §Do not carry iron's entry count across).
 
 ## Why attention is host torch, and what that removes
 
+> **`[2026-08-08]` This section describes what this mode does TODAY, and it is
+> not what the corrected taxonomy requires.** `runlist` is defined as every
+> operator individually **on the device, nothing on the host**, so host
+> attention is a gap to close, not a property. The reasoning below is also
+> wrong about why: the missing registry rows are a CATALOGUE constraint, not a
+> hardware one — both attention shapes are measured passing on real NPU2, and
+> `offload` now dispatches them (see `pattern/offload/README.md`). What
+> `runlist` additionally needs, and `offload` does not, is a **device
+> softmax**; the kernel for it already exists in this tree as
+> `softmax_streaming.o`. Until that lands this mode prices host torch rather
+> than reconfiguration: 24.15 ms of host attention at 1024, 47.8% of its total.
+
 The two attention GEMMs are `4096 x 64 x 4096` and `4096 x 4096 x 64`; no
 `K = 64` or `N = 64` bf16-out row exists in the registry and the C4 sweep
 cannot stage one (08c has the derivation). So attention runs on the host
 through `blocked_attention` — the SAME implementation and query blocking
-`offload` uses (08d work item 4), making the two modes' attention boundaries
-identical by construction. This is the one submission seam a whole-BO
+`offload` used before its rebuild (08d work item 4). This is the one submission seam a whole-BO
 argument does not explain, and it is why "one runlist" — the mode's premise
 when attention is on device, as it is in iron's 29-kernel decomposition — is
 not reachable on this hardware: a host stage between the projections and the

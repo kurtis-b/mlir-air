@@ -12,10 +12,17 @@ CONTRACT
 
     The port of iron's ``transpose`` operator (``iron/operators/transpose``),
     re-expressed per convention 1 as a plain builder. iron's ``runlist`` mode
-    dispatches it as ``k_transpose`` to feed an on-device ``q @ k^T``; in this
-    port that GEMM stays on the host (no ``K = 64`` registry row exists or can
-    be swept -- 08c), so the operator is validated standalone here and the
-    ``runlist`` mode's README records why it is not on that mode's dataflow.
+    dispatches it as ``k_transpose`` to feed an on-device ``q @ k^T``.
+
+    ``[2026-08-08]`` That GEMM is now dispatched here too -- ``offload`` runs
+    both attention matmuls on the device. The old reason given for keeping this
+    operator off a mode's dataflow ("no ``K = 64`` registry row exists or can
+    be swept") described a CATALOGUE constraint as a hardware one; the missing
+    row is real, the impossibility was not, and the tiles are injected. The
+    operator stays standalone-validated for a smaller reason: ``offload`` takes
+    its K transpose on the host as a contiguous copy beside the head slice, so
+    dispatching one would add an entry while measuring nothing. Whether
+    ``runlist`` should dispatch it is open, and belongs to that mode's rebuild.
 
 WHY THE MOVEMENT IS CONTIGUOUS AND THE REORDERING IS IN A KERNEL
     A DMA-stride transpose is not available for this dtype: the innermost DMA

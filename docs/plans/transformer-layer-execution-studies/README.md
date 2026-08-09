@@ -70,6 +70,11 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | J7b — accumulator ring | transformer-layer suite; the in-place accumulator dispatched; C DMAs hoisted out of the K loop | **done** 2026-08-07 (58 min) |
 | H10 — non-constant BD offsets | `gate-h.sh` five legs, plus four objective clauses: an IV-dependent L2 offset refused by message, the SAME builder at 2 trips still compiling, a constant offset compiling, an L3-side moving offset compiling | **substance verified 2026-08-08; tamper check halted on documented changes** — `H GATE: PASS` all five legs (`check-air-mlir` 489/489, hardware suite, 11.44 tok/s vs a 9.43 floor, 10/10 models) and the objective check passed. The tamper check then halted on five gate files whose provenance is recorded below. The compiler fix is sound; the phase's *baseline* is not clean. See [24](24-phase-h10-non-constant-bd-offsets.md) |
 | F — study harness | `execution-smoke-test` yields ≥1 `run_status=passed` row per measurement CSV | **in progress** on `exper/phase-f-study-harness` (a worktree, unmerged). **The gate itself passes on hardware over all four modes** as of 2026-08-08 — `smoke_gate` PASS, `manifest complete: True`, and all four distinguishability clauses hold on the measured vectors ([09](09-phase-f-study-harness.md)). Work items 1, 2, 6, 8 done, plus the runner, results I/O, gate and manifest. Items 3 (the ~19k-line plot/analysis tier), 4, 5, 7 remain; **item 3 is blocked** — matplotlib/pandas/seaborn are absent and must not be installed while gates run |
+| Corrected `offload` — attention on device | `run_npu2_offload_peano.lit`, both recipes, at the corrected 30-dispatch boundary | **done** 2026-08-08. 10/10 stages clean, `submissions 30 entries 30 air 31 herd 91 sync 91 bytes 970457088`, negative control exact through the attention half. No registry write, no compiler work, no tolerance widened — `attn_context` 11.4× margin, `output` 1.73×. Costs 6.9× the DRAM traffic, which is the mode's result |
+| `fused` build repair — SPECS row 4096 → 1024 | `run_npu2_fused_peano.lit`, both recipes | **done** 2026-08-08. The gate was **red and unrun**: the row was left at 4096 while the mode has always been bounded to 256..1024, so it raised before aircc. Now green at 1024 — 10/10 stages, `mean_rel_L1` 1.756e-2 at `atol_required` 5.813e-2. Its cross-mode `sync` comparison against `coarse` is **suspended**, not restated: the two rows are now at different sequence lengths |
+| Backend-preset conflict — settled on hardware | none; a measurement that retracts [26 §4](26-mode-rebuild-feasibility.md) | **recorded** 2026-08-08. `runtime_loop_tiling_sizes` is **not inert**: `[2,2]` hangs `mha_out_proj` @4096 3/3, `[1,1]` passes 3/3, `omit_pingpong` irrelevant either way. Restores the conflict `fused.py` / `mha_out_proj.py` / `block.py` document, with a corrected reason. `agents/probes/probe_backend_preset_hardware.py` |
+| Corrected `runlist` — device softmax, then the mode | its own two phases | **not started.** Needs `builders/softmax.py` over the existing `softmax_streaming.o` (kernel present, five symbols, already built by `compile_kernels.py`), then the mode. Two decisions first: no row-max subtraction in `softmax_bf16`, and `SM_LOG2E` hardcoded as the scale. **Edits `builders/mha_attention.py`, which `mha_out_proj.py` imports** — serialize against any `fused` work |
+| Corrected `coarse` | its own phase | not started; a blend of `runlist` and `fused`, so both must be right first |
 | G — unattended runner + CI | Full profile run completes with a complete `results_manifest.json` | not started |
 | Goal 1 — sliding window | `make verify` passes with window-crossing prompts | not started |
 | Goal 2 — quantization | Second quantized model passes a gate that exercises the quantized path | not started |
@@ -81,6 +86,16 @@ the author on 2026-08-08, all four implementations diverge from the new definiti
 opens with **six things the plan had wrong** — three of which were blocking work that turned out not
 to be blocked. Then [03 §The taxonomy](03-measurement-model.md) for what the modes now mean, and
 [23](23-rules-and-open-items.md) for the rules that govern everything downstream.
+
+> **`[2026-08-08, later the same day]` Two of doc 26's six are themselves now settled by hardware,
+> in opposite directions.** Its **§4 is retracted**: `runtime_loop_tiling_sizes` is *not* inert, and
+> the backend-settings conflict it declared false is real — `mha_out_proj` at `[2,2]` compiles and
+> then hangs, 3/3, against 3/3 clean passes at `[1,1]`, with `omit_pingpong` irrelevant either way.
+> Its **§6 is confirmed and fixed**: `make check-fused` really was red, and the row is moved to 1024
+> and green. Doc 26 carries both corrections inline. The methodological lesson is §4's, and it is
+> the same one this plan keeps paying for — a compile-only observation ("the lowered IR is
+> identical") was turned into a hardware conclusion ("the knob is inert"), and the caveat against
+> exactly that was written down in the same section and then not applied.
 
 **The one-paragraph version.** The modes are no longer defined by *who sequences the work* but by
 **reconfiguration cost against DRAM traffic**: `runlist` pays per-operator reconfiguration with
@@ -108,32 +123,62 @@ to it. See [23](23-rules-and-open-items.md) and [24](24-phase-h10-non-constant-b
 
 **Where the live threads stand:**
 
-1. **Corrected `offload` is unblocked and is the next thing.** Its two attention matmuls are linear,
-   so they belong on the NPU — and both are now **measured passing on hardware at every ladder
-   rung**, with tiles recorded in [26](26-mode-rebuild-feasibility.md). The change is local to
-   `pattern/offload/offload.py`: replace the `blocked_attention` call with two dispatched GEMMs plus
-   host softmax/scale/mask, injecting tiles through the `gemm_spec_fn` escape hatch every builder
-   already ships. **No registry write, no compiler work, no new operator.** Worktree-sized.
+1. **~~Corrected `offload` is unblocked and is the next thing.~~ DONE `[2026-08-08]`, and gated.**
+   Both attention matmuls are on the device, tiles injected through `gemm_spec_fn`
+   (`gemm_spec_source: registry+injected`); only the softmax between them, both LayerNorms and the
+   GeLU are on the host. `run_npu2_offload_peano.lit` **passes on hardware**, both recipes: 10/10
+   stages clean, 30 dispatch vectors, `submissions 30 entries 30 air 31 herd 91 sync 91 bytes
+   970457088`, and the negative control still exact through the attention half. No registry write,
+   no compiler work, no new operator, and **no tolerance was widened** — `attn_context` needs
+   `atol` 8.800e-05 against the 1.0e-03 the boundary allows (11.4×) and the layer output 5.788e-02
+   against the 1e-1 ceiling (1.73×, the widest of the four modes).
+
+   **What it costs is the mode's result, not a regression:** a host softmax between two device
+   matmuls sends the full `[seq, seq]` score matrix through DRAM twice per head, so bytes go
+   139,984,896 → 970,457,088, a **6.9×** increase, and the mode is much slower at 4096 than the
+   six-GEMM form it replaces. Pricing that is the point. What remains for this mode is the
+   N-instruction-streams-under-one-xclbin half, which is untouched and is where its
+   reconfiguration-minimizing claim actually gets tested.
 2. **Corrected `runlist` needs one new operator: a device softmax.** The kernel already exists in
    this tree and this port already builds it — `programming_examples/softmax/softmax.cc`, compiled
    by `external_kernels.py:468` `compile_softmax_streaming()`, with `softmax_streaming.o` already in
    `transformer_layer/build_peano/`. So the work is a `builders/softmax.py` around an existing
    kernel plus an opcheck row and a fault-injection control, not a kernel port. Iron's
    `aie_kernels/aie2p/softmax.cc` is the fallback, not the starting point.
-3. **Corrected `fused` — fix its build before anything else.** Doc 26 finds it **cannot build its
-   own SPECS shape today**, so `make check-fused` is presumed broken. It also finds the blocker the
-   mode's own docstring records — the FlashAttention `[1,1]` / GEMM `[2,2]` settings conflict — is
-   **false**: `runtime_loop_tiling_sizes` is inert. A different blocker is real, and the
-   no-DRAM-between-operators half is capacity-bounded rather than blocked. **Spike C was
-   compile-only: it is not established that the off-preset ELFs produce correct numbers.** Two
-   device jobs would settle that, and compiling is not passing.
+3. **Corrected `fused` — ~~fix its build before anything else~~ build FIXED `[2026-08-08]`.** It
+   could not build its own SPECS shape: `fused.py:37` has always said the mode is bounded to
+   256..1024 and the row was left at 4096, so `prepare_fused` raised in `builders/norm_tail.py`
+   (plane_major stride over the shim `aie.dma_bd` cap) before aircc. The gate was run, confirmed
+   red, and the row is **moved to 1024**; `run_npu2_fused_peano.lit` now passes on hardware, 10/10
+   stages, `mean_rel_L1` 1.756e-2 at `atol_required` 5.813e-2. Two registry facts moved with the
+   shape: the FFN down-projection resolves to `drain` at 1024 (`fused-cast` at 4096), so the
+   stitched tail takes 11 whole-tensor args, not 16.
+
+   **The settings conflict is REAL** — doc 26 §4's refutation of it is retracted, see the note
+   above. `[2,2]` hangs `mha_out_proj` on hardware. So one xclbin stays blocked, now for a measured
+   reason plus `air-fuse-channels`, and the no-DRAM-between-operators half remains
+   capacity-bounded (6 MiB on chip against one 6 MiB S×F intermediate at 1024).
+
+   **The cross-mode comparison this gate used to make is suspended**, not restated: it read its
+   `sync 19` against `coarse`'s 402, and `coarse` is still a 4096 row while `fused` is now 1024.
+   Re-establishing that ranking means measuring both at one length, which is Phase F's job.
 4. **Corrected `coarse` is last, by definition** — it is a mix of `runlist` and `fused`, so both
    must be right first.
-5. **`devq` is the device scheduler now.** `agents/scripts/devq.sh` — builds run concurrently, a
-   measure runs alone with no build in flight, stale jobs reconcile by process liveness.
-   `devq-selftest.sh` proves 14/14 including that later builds cannot starve a queued measure. Use
-   it instead of hand-rolled `flock`; the migration of existing call sites
-   (`phases.sh:716`, `llms/llama32_1b_int4/Makefile:208`) is **not done**.
+5. **`devq` is the device scheduler, and the migration is now DONE `[2026-08-08]`.**
+   `agents/scripts/devq.sh` — builds run concurrently, a measure runs alone with no build in
+   flight, stale jobs reconcile by process liveness. **Use `devq.sh run`, not `submit`**: `run` is
+   the drop-in for `flock -x LOCK CMD` because it relays the job's output to stdout and exits with
+   the job's status, where `submit` diverts output to the job log and returns an id — substituting
+   *that* at a gate blanks the FileCheck while still exiting 0. `run` was added for this migration,
+   together with a guard that refuses to nest (an inner measure would otherwise queue behind the
+   device lock its own parent runner holds and report a lock timeout 30 minutes later).
+
+   All 23 `flock` sites in `phases.sh` are migrated — the seven live `phase_gate_cmd` arms, three
+   objective checks that dispatch, and the heredoc gate descriptions a session copies — plus
+   `llms/llama32_1b_int4/Makefile`'s `run-inference`. **`make chat` deliberately keeps the bare
+   lock:** the broker's runner is `setsid` with stdin from `/dev/null`, so a REPL under it reads EOF
+   on the first prompt. `devq-selftest.sh` is **20/20** (was 14), the six new clauses covering
+   `run`'s output relay, its status propagation and the nesting refusal.
 6. **H10 ran and its substance passed** — five gate legs green, `check-air-mlir` 489/489, 11.44
    tok/s against a 9.43 floor. Its **tamper check halted** on five gate-defining files with
    documented provenance, and was deliberately not re-fingerprinted; see

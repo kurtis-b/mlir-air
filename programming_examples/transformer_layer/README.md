@@ -480,14 +480,21 @@ mode's. Everything between the GEMMs — attention, softmax, both norms, the
 GeLU — is host torch. `pattern/offload/README.md` has the full story; the
 parts that cost time to learn:
 
-**It is six GEMMs, not iron's eight, and the artifact says so.** The two
-attention GEMMs (`4096x64x4096`, `4096x4096x64`) resolve in no registry —
-there is no `K = 64` or `N = 64` bf16-out row and the sweep cannot stage one —
-so attention stays in host torch through `pattern/blocked_attention.py`
-(shared with `runlist`, which is why it lives in `pattern/` and not in the
-mode directory). The artifact records `attention_path:
-"host_torch_fp32_blocked"`: the mode is a *hybrid* boundary, stated in its own
-record rather than discovered from the code.
+**`[2026-08-08]` It is eight linear operators over five shapes — 30 dispatches
+— and the artifact says so.** The two attention GEMMs (`4096x64x4096`,
+`4096x4096x64`) resolve in no registry, and the sweep genuinely cannot stage
+one, but that is a *catalogue* constraint rather than a hardware one: both are
+measured passing on real NPU2, and their tiles are injected through the
+`gemm_spec_fn` escape hatch (`gemm_spec_source: registry+injected`). So
+attention is on the device and only the softmax between the two matmuls is
+host torch, with both LayerNorms and the GeLU. The artifact records
+`attention_path: "device_gemm_host_softmax"`.
+
+This mode used to dispatch six GEMMs and call itself a *hybrid* boundary,
+keeping attention in host torch through `pattern/blocked_attention.py` — that
+was the superseded taxonomy plus the catalogue constraint read as a hardware
+one. `blocked_attention` still serves `runlist`, which is why it lives in
+`pattern/` and not in a mode directory.
 
 **The mode computes; the oracle checks; they may not share arithmetic.** This
 mode does more host math than any other, so every host stage is torch
@@ -580,10 +587,13 @@ injected path, which is what the driver's clean-equals-fault totals clause
 checks.
 
 **Transpose is validated standalone, not dispatched by the mode.** Its
-consumer in iron's decomposition — the on-device attention scores GEMM — is
-the thing this hardware cannot dispatch (no `K = 64` registry row), and a
-device transpose feeding a host `torch` matmul that re-layouts its operands
-anyway would add an entry while measuring nothing.
+consumer in iron's decomposition is the on-device attention scores GEMM, which
+`[2026-08-08]` this hardware turns out to dispatch fine — `offload` now does.
+The reason transpose is still not on a mode's dataflow is narrower than "the
+hardware cannot": `offload` does the K transpose on the host as a contiguous
+copy beside the head slice, and a device transpose feeding it would add an
+entry while measuring nothing. It becomes a live question for `runlist`, whose
+corrected form puts the whole attention interior on the device.
 
 ## The `fused` execution strategy (Phase E5)
 
