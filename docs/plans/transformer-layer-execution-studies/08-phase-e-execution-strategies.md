@@ -434,6 +434,15 @@ implementation:
    vector is not measuring the boundary.
 2. **`offload` is the host-mediated extreme:** its `host_submissions` strictly exceeds every other
    mode's, and `runlist_entries == host_submissions` — it aggregates nothing.
+
+   > **`[2026-08-09]` The CLAUSE still holds; its NAME is the superseded taxonomy.** Measured at
+   > 1024, `offload` is 30 submissions against `runlist` 17, `coarse` 4 and `fused` 1, with
+   > `entries == submissions`, so nothing here needs re-deriving. But
+   > [03](03-measurement-model.md) corrected `offload` to the mode that **minimizes
+   > reconfiguration**, not the most host-mediated one — that is one of the two load-bearing
+   > errors it names in the retired framing. What this clause actually tests is that the mode
+   > **aggregates nothing**, which is true of it under either taxonomy and is the property worth
+   > gating. Read the label as a historical name, not as what the mode isolates.
 3. **`runlist` is finer than `coarse`:** `runlist.runlist_entries > coarse.runlist_entries`.
 4. **`fused` removes intermediate host sync**, which is what MLIR-level fusion *is*:
    `fused.sync_boundaries < coarse.sync_boundaries`.

@@ -12,6 +12,15 @@ three different ways on an AMD NPU and measures the cost of each execution bound
 | `runlist` | runlist | Fine-grained NPU operator sequence, intermediates moved explicitly |
 | `hybrid` | coarse runlist | Runlist orchestration over a few coarse *fused* kernels |
 
+> **`[2026-08-09]` This table describes IRON, and it is not this port's taxonomy.** It is kept
+> because it is what the source repository implements and what the paper labels say. The study's
+> author corrected the axis on 2026-08-08 to **reconfiguration cost against DRAM traffic**, which
+> reverses two things above: `offload` is the mode with the *least* reconfiguration rather than the
+> most host-mediated one, and `coarse` is a per-workload **blend** of `runlist` and `fused` rather
+> than a point of its own. The CSV keys here are still current; the descriptions are not. For what
+> the four modes mean today read [03 §The taxonomy](03-measurement-model.md), and for what is built
+> against it read the README's status board.
+
 Around those sit seven measurement studies — `block`, `end_to_end`, `memory_tile_staging`,
 `resource_usage`, `host_comparison`, `memcpy_bandwidth`, `roofline` — over a shared case matrix
 of two workloads (`encoder_bert`, `decoder_gpt2`), six model families, and a 64..16384 sequence

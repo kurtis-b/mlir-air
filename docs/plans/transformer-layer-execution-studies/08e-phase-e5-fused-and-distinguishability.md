@@ -97,6 +97,13 @@ how a mode is implemented:
    produce the same vector, the vector is not measuring the boundary.
 2. **`offload` is the host-mediated extreme.** Its `host_submissions` strictly exceeds every other
    mode's, and its `runlist_entries == host_submissions` — it aggregates nothing.
+
+   > **`[2026-08-09]` The clause holds; the name is the superseded taxonomy.** At 1024 `offload`
+   > is 30 submissions against `runlist` 17, `coarse` 4 and `fused` 1, `entries == submissions`.
+   > But [03](03-measurement-model.md) corrected `offload` to the **reconfiguration-minimizing**
+   > mode, and since 2026-08-09 it configures the array **once** per layer rather than 30 times
+   > ([29](29-offload-n-streams.md)) — so "host-mediated extreme" is now doubly a misnomer, while
+   > what the clause tests (it aggregates nothing) is unaffected and still worth gating.
 3. **`runlist` is finer than `coarse`.** `runlist.runlist_entries > coarse.runlist_entries`.
 4. **`fused` removes intermediate host sync**, which is what MLIR-level fusion *is*:
    `fused.sync_boundaries < coarse.sync_boundaries`.

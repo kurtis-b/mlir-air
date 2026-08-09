@@ -1,7 +1,7 @@
 # Can two AIR kernels of DIFFERENT shape live in one xclbin and run from one `hw_context`?
 #
-# WHAT THIS ESTABLISHED `[2026-08-09]`: IT WORKS -- and it needs TWO distinct
-# identifiers per stream, not one. Two GEMMs of different shape chained with
+# WHAT THIS ESTABLISHED `[2026-08-09]`: IT WORKS -- and it needs THREE distinct
+# identifiers per stream. Two GEMMs of different shape chained with
 # `--xclbin-input`, at seq 1024, both executed from a SINGLE `hw_context`:
 #
 #   dpu_kernel_ids            first slot        second slot
@@ -9,43 +9,47 @@
 #   same (both default)       9.5676e-03 OK     ERT_CMD_STATE_TIMEOUT
 #
 # So `offload`'s N-instruction-streams-under-one-xclbin half is FEASIBLE on today's
-# stack. One xclbin, one context, N kernels, each with its own instruction stream.
+# stack. It has since LANDED -- see 29-offload-n-streams.md.
 #
-# THE TWO IDENTIFIERS, AND WHY MISSING EITHER FAILS SILENTLY-ISH:
+# THE THREE IDENTIFIERS, AND THEY FAIL THREE DIFFERENT WAYS. This probe found the
+# first two; the third turned up only when a real five-shape mode was built on it,
+# because two kernels can share it and still merge:
 #
-#   1. `instance_name` -- the kernel's NAME in the xclbin. The loader finds it by
+#   1. `kernel_name`   -- the EMBEDDED_METADATA entry. A duplicate makes xclbinutil
+#      REFUSE the merge outright: "Kernel name already exists in the
+#      EMBEDDED_METADATA section: 'MLIR_AIE'". The ONLY loud one of the three.
+#   2. `instance_name` -- the kernel's name in the xclbin. The loader finds it by
 #      SUBSTRING match (`xrt.py:634`), so two kernels sharing a name mean the match
 #      returns whichever came first: the wrong program with the right buffers.
-#   2. `kernel_id` -- the DPU kernel id, which is how the merged AIE_PARTITION routes a
-#      kernel to its PDI (its array configuration). EVERY AIR compile defaults to 0x901.
-#      Two PDIs both claiming 0x901 are indistinguishable to the runtime, so the second
-#      kernel executes against the FIRST kernel's configuration.
+#   3. `kernel_id`     -- the DPU kernel id, which is how the merged AIE_PARTITION
+#      routes a kernel to its PDI (its array configuration). EVERY AIR compile
+#      defaults to 0x901. Two PDIs both claiming 0x901 are indistinguishable to the
+#      runtime, so the second kernel executes against the FIRST's configuration.
 #
-# Verified directly in the packaging. With distinct ids the merged AIE_PARTITION carries
-# two PDIs with two ids:
+# This probe sets `kernel_name` and `instance_name` to the same distinct string per
+# stream, which is why it never exercised (1) separately -- worth knowing before
+# reading its arms as a full factorial over the three.
+#
+# Verified directly in the packaging. With distinct ids the merged AIE_PARTITION
+# carries two PDIs with two ids:
 #
 #   uuid ca013193 -> dpu_kernel_ids [['0x901']]
 #   uuid 1e347c3d -> dpu_kernel_ids [['0x902']]
 #
 # and with the default it carries two PDIs BOTH claiming 0x901.
 #
-# THE FAILURE MODE WHEN IT IS WRONG IS SHAPE-DEPENDENT, AND ONE HALF OF IT IS SILENT.
-# With colliding ids the second kernel times out at 1024x768x3072 and returns GARBAGE at
-# mean_rel_L1 1.41 with NO error raised at 1024x768x768. A gate that only checks for
-# exceptions would pass the second case.
+# THE FAILURE MODE WHEN AN ID COLLIDES IS SHAPE-DEPENDENT, AND ONE HALF IS SILENT.
+# With colliding ids the second kernel times out at 1024x768x3072 and returns
+# GARBAGE at mean_rel_L1 1.41 with NO error raised at 1024x768x768. A gate that
+# only checks for exceptions would pass the second case.
 #
-# WHAT MADE THIS EASY TO GET WRONG, recorded because the first pass of this probe DID get
-# it wrong and briefly concluded the mechanism was broken: the instruction streams are a
-# red herring. The second kernel's `insts.bin` is BYTE-IDENTICAL to its standalone build
-# (md5 ff968fab...), and both kernels appear in `get_kernels()` either way. Everything
-# that is easy to inspect looks correct; the discriminating field is inside the
-# AIE_PARTITION section and needs `xclbinutil --dump-section AIE_PARTITION:JSON`.
-#
-# CONSEQUENCE FOR THE PLAN. Doc 26 sizes this as its own phase and calls the mechanism
-# "already plumbed but never dispatched". The plumbing is real and it works, PROVIDED
-# both identifiers are set per stream -- which no caller in this tree does today.
-# `pattern/offload` names every drain GEMM `matmul_bf16` and sets no kernel id at all, so
-# at 1024 all five of its shapes would collide on both axes at once.
+# WHAT MADE THIS EASY TO GET WRONG, recorded because the first pass of this probe
+# DID get it wrong and briefly concluded the mechanism was broken: the instruction
+# streams are a red herring. The second kernel's `insts.bin` is BYTE-IDENTICAL to
+# its standalone build (md5 ff968fab...), and both kernels appear in
+# `get_kernels()` either way. Everything that is easy to inspect looks correct; the
+# discriminating field is inside the AIE_PARTITION section and needs
+# `xclbinutil --dump-section AIE_PARTITION:JSON`.
 #
 # WHY THIS EXISTS.  `offload`'s remaining half is "N instruction streams under one xclbin"
 # -- 03's mechanism for the mode's reconfiguration-minimizing claim, and the thing that
