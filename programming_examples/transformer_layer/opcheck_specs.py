@@ -772,37 +772,63 @@ SPECS = [
         # [4096, 768] tensors — streamed norms, no row banding — which is
         # what removes the 386 sync boundaries coarse pays restaging its 64
         # addnorm bands per normalization point through the host. One ELF for
-        # the whole layer is NOT available: attention requires backend
-        # settings (omit_pingpong, runtime_loop_tiling [1,1]) the 4096-row
-        # GEMMs cannot compile under, and one ELF is one aircc invocation —
-        # pattern/fused/fused.py has the derivation. The driver-summed vector
+        # the whole layer is NOT available: attention requires
+        # runtime_loop_tiling_sizes [1,1] and the 4096-row GEMMs are built at
+        # [2,2], and one ELF is one aircc invocation — pattern/fused/fused.py
+        # has the derivation. `[2026-08-08]` Measured: at [2,2] mha_out_proj
+        # compiles and then hangs (ERT_CMD_STATE_TIMEOUT, 3/3), so the conflict
+        # is real; omit_pingpong is NOT part of it and used to be cited here as
+        # if it were. The driver-summed vector
         # is 1 submission over 3 entries, against coarse's 4 over 131; the
         # sync-boundary drop is the mode's gating clause in the Phase E
         # distinguishability check.
         "operator": "fused",
-        "shape_key": "4096x768_encoder_bert",
+        # `[2026-08-08]` MOVED 4096 -> 1024, because the row could not build at
+        # all. fused.py:37 has said "BOUNDED TO 256..1024" since the mode was
+        # written and this row was never moved with it, so `make check-fused`
+        # RAISED before aircc was reached:
+        #
+        #   ValueError: plane_major packing needs a plane stride of rows*cols
+        #   (4096*768 = 3145728), over the shim aie.dma_bd cap of 1048576
+        #
+        # -- from builders/norm_tail.py, via fused.py's build_fused_tail_module
+        # (plane_major=True). Confirmed by running the gate, which nobody had
+        # done: it never reached the device. compile_fused_artifacts rebuilds
+        # every module on every call even with run_only=True, so the cached
+        # 4096 tail ELF could not rescue it either.
+        #
+        # 1024 is the top of the mode's own supported range, so this is the
+        # widest shape the row can honestly claim. The alternative -- keeping
+        # 4096 and switching the tail to row-interleaved packing, whose strides
+        # stay at or under 2*cols at any row count -- is a real option and a
+        # larger change: it requires the PRODUCER to write interleaved, which
+        # is the whole reason plane_major exists.
+        "shape_key": "1024x768_encoder_bert",
         "shape": {
-            "seq_len": 4096,
+            "seq_len": 1024,
             "emb_dim": 768,
             "ffn_dim": 3072,
             "num_heads": 12,
             "head_dim": 64,
         },
         # Same tensor as the block row, compared the same way at the same
-        # golden seed, so the 1e-1 HARD CEILING carries over. Measured over
-        # 3145728 elements: mean_rel_L1 1.784e-2, atol_required 7.896e-2, a
-        # 1.27x margin — the thinnest of the four modes, and the composition
-        # says why: device attention (the block's own modules, whose error the
-        # host-attention modes avoid) PLUS the decomposed norm tail (which
+        # golden seed, so the 1e-1 HARD CEILING carries over. Measured at 1024
+        # over 786432 elements: mean_rel_L1 1.756e-2, atol_required 5.813e-2, a
+        # 1.72x margin, every boundary n_mismatch 0. See the block entry for
+        # why exceeding the ceiling is a defect report, never a wider
+        # tolerance.
+        #
+        # The 4096 figures this row used to carry -- mean_rel_L1 1.784e-2,
+        # atol_required 7.896e-2, a 1.27x margin described as "the thinnest of
+        # the four modes" -- were produced before the row stopped building, and
+        # are NOT comparable to the line above: different sequence length,
+        # different element count. Do not read 1.27x -> 1.72x as an
+        # improvement. What the composition argument said still holds and is
+        # worth keeping: fused stacks device attention (whose error the
+        # host-attention modes avoided) on the decomposed norm tail (which
         # stages bf16 between add, LayerNorm and gamma-mul where the fused
-        # addnorm does not — runlist, the same decomposition banded, measures
-        # 1.732e-2). The two effects stack: block 1.688e-2 / runlist 1.732e-2
-        # / fused 1.784e-2, every boundary still n_mismatch 0. See the block
-        # entry for why exceeding the ceiling is a defect report, never a
-        # wider tolerance. (`[2026-08-07]` was 1.806e-2 / 7.572e-2 / 1.32x;
-        # J7a's f32 two-pass layer_norm statistics is the change. Note the
-        # mean improved while the MARGIN TIGHTENED, 1.32x -> 1.27x: the two
-        # move independently, atol_required being a worst-element statistic.)
+        # addnorm does not), and at 4096 that put it above block 1.688e-2 and
+        # runlist 1.732e-2.
         "atol": 1e-1,
         "prepare": prepare_fused,
     },

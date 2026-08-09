@@ -6,14 +6,18 @@
 // Three ELFs in ONE runlist submission: the D2 qkv_proj and mha_out_proj
 // modules unchanged, then fused_tail -- a NEW ten-launch stitched module
 // holding residual add + LayerNorm + gamma multiply (ln1), the whole staged
-// FFN, and add + LayerNorm + gamma multiply (ln2) over whole [4096, 768]
+// FFN, and add + LayerNorm + gamma multiply (ln2) over whole [1024, 768]
 // tensors. Whole tensors are the point: coarse pays 386 of its 402 sync
 // boundaries restaging 64-row addnorm bands through the host, and fusing the
 // norms into one module removes all of it, which is the gating clause this
 // mode owns in the Phase E distinguishability check. One ELF for the whole
-// layer is NOT available -- attention's backend settings cannot co-compile
-// with the GEMMs' and one ELF is one aircc invocation; pattern/fused/fused.py
-// has the derivation. The mode runs through its OWN ELF cache (fused_cache,
+// layer is NOT available -- attention needs runtime_loop_tiling_sizes [1,1]
+// and the wide GEMMs are built at [2,2], and one ELF is one aircc invocation.
+// `[2026-08-08]` That is now MEASURED rather than asserted: at [2,2]
+// mha_out_proj compiles and then returns ERT_CMD_STATE_TIMEOUT, 3/3, against
+// 3/3 clean passes at [1,1]; omit_pingpong turns out to be irrelevant and used
+// to be cited as half the reason. See agents/probes/probe_backend_preset_hardware.py
+// and pattern/fused/fused.py. The mode runs through its OWN ELF cache (fused_cache,
 // never shared -- cache reuse is keyed by directory name, and two modes
 // pointed at one directory can trade ELFs, attributing valid numbers to the
 // wrong execution boundary).
@@ -43,9 +47,23 @@
 // The configuration first -- the forced gate configuration, resolved through
 // the registry, plus the mode's own structure line. A registry change that
 // moved any operator's method fails here with its cause on screen.
-// CHECK: fused 4096x768 ffn 3072 12h x 64 (encoder_bert, non-causal, 3 entries over 3 ELFs in one submission)
-// CHECK: qkv_proj  fused-cast (registry), ffn up drain / down fused-cast (registry), o_proj drain (registry)
-// CHECK: fused_tail: add+ln+mul / ffn / add+ln+mul stitched over 16 whole-tensor args (streamed norms, no row banding)
+//
+// `[2026-08-08]` THE SHAPE MOVED, 4096 -> 1024. This gate was RED and nobody had
+// run it: pattern/fused/fused.py:37 has always said the mode is bounded to
+// 256..1024, the SPECS row was left at 4096, and prepare_fused raised in
+// builders/norm_tail.py (plane_major plane stride 4096*768 over the shim
+// aie.dma_bd cap of 1048576) before aircc was reached. Every literal below is
+// therefore re-measured at 1024 and is NOT comparable to the 4096 numbers this
+// file used to pin.
+// CHECK: fused 1024x768 ffn 3072 12h x 64 (encoder_bert, non-causal, 3 entries over 3 ELFs in one submission)
+// Two of these changed with the shape, and both are registry facts rather than
+// edits to make the gate pass: at 1024 the FFN down-projection's fastest
+// high-precision row is `drain`, where at 4096 it was `fused-cast`. drain
+// exposes no f32 C scratch, so the stitched tail takes 11 whole-tensor args
+// instead of 16. A registry re-sweep that moved either method back fails here
+// with its cause on screen, which is what this pair of lines is for.
+// CHECK: qkv_proj fused-cast (registry), ffn up drain / down drain (registry), o_proj drain (registry)
+// CHECK: fused_tail: add+ln+mul / ffn / add+ln+mul stitched over 11 whole-tensor args (streamed norms, no row banding)
 //
 // The layer executes as one submission -- a runlist split would print more
 // than one dispatch line and fail the totals below, since
@@ -74,21 +92,28 @@
 // CHECK: [fused] recorded 1 dispatch vectors
 //
 // The vector's CONTENTS, not only its count: the six driver-summed totals,
-// pinned to the measured numbers (the reading of each against coarse's
-// 4 / 131 / 12 / 146 / 402 / 202,902,528 is in pattern/fused/README.md --
-// sync 19 against 402 is the mode's gating clause; air 16 on 3 artifacts
-// against 12 on 4 is the fused-many-launches-into-one-ELF signature 08e
-// predicts). The totals line is printed only after every recorded row passes
-// the as_row() schema in opcheck_layer.dispatch_vector_totals, so a
+// measured at 1024. The totals line is printed only after every recorded row
+// passes the as_row() schema in opcheck_layer.dispatch_vector_totals, so a
 // malformed row aborts the run and a run whose totals drift fails right
 // here, before the driver's independent arithmetic over the artifact.
-// CHECK: [fused] dispatch totals: submissions 1 entries 3 air 16 herd 24 sync 19 bytes 184025088
 //
-// Then the layer output itself over all 4096 x 768 elements, and the label
+// THE CROSS-MODE READING IS SUSPENDED, NOT MERELY RESTATED. This file used to
+// set its totals against coarse's 4 / 131 / 12 / 146 / 402 / 202,902,528 and
+// call `sync 19 against 402` the mode's gating clause. coarse is still a 4096
+// row and this one is now 1024, so that comparison is between two sequence
+// lengths and means nothing until both modes are measured at the same one --
+// which is Phase F's job, not this gate's. sync 19 happens to be unchanged
+// from the 4096 run; air fell 16 -> 11 and bytes 184,025,088 -> 56,626,176,
+// so the invariance of sync is a fact about the mode's structure and the rest
+// is a fact about the shape. Do not reconstruct the old ranking from these.
+// CHECK: [fused] dispatch totals: submissions 1 entries 3 air 11 herd 23 sync 19 bytes 56626176
+//
+// Then the layer output itself over all 1024 x 768 elements, and the label
 // naming the MODE's operator -- a test wired to another mode's artifact by
-// mistake fails here rather than passing quietly.
+// mistake fails here rather than passing quietly. Measured: mean_rel_L1
+// 1.756e-2, atol_required 5.813e-2 against the 1e-1 hard ceiling.
 // CHECK: PASS!
-// CHECK: [opcheck] fused [4096x768_encoder_bert]: PASS
+// CHECK: [opcheck] fused [1024x768_encoder_bert]: PASS
 //
 // THE NEGATIVE CONTROL. Identical reasoning to the block gate's -- ln1_weight,
 // chosen by measurement, perturbed AFTER the golden model was computed -- plus
@@ -125,10 +150,10 @@
 // a fault run that totals anything else is instrumentation conditional on the
 // injected flag, or a vector that was not measured.
 // FAULT: [fused] recorded 1 dispatch vectors
-// FAULT: [fused] dispatch totals: submissions 1 entries 3 air 16 herd 24 sync 19 bytes 184025088
+// FAULT: [fused] dispatch totals: submissions 1 entries 3 air 11 herd 23 sync 19 bytes 56626176
 //
 // And the verdict in the three forms opcheck.py reports it: the comparison's
 // own, the control's reading of it, and the exit-status summary.
-// FAULT: [opcheck] fused [4096x768_encoder_bert]: FAIL
-// FAULT: [opcheck] fused [4096x768_encoder_bert]: fault-inject input -> FAIL (as required)
+// FAULT: [opcheck] fused [1024x768_encoder_bert]: FAIL
+// FAULT: [opcheck] fused [1024x768_encoder_bert]: fault-inject input -> FAIL (as required)
 // FAULT: NEGATIVE CONTROL: PASS

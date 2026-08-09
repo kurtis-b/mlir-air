@@ -51,7 +51,44 @@ divisibility at `:734`) over `sweep_families.py`'s knob lists, without its prefe
 gives **1584** for `attn_output` (fused-cast 1296 / drain 144 / direct 144) and **660** for
 `attn_scores`. No sub-product of the grid equals 828. Do not cite it again.
 
-### 4. `fused`'s "backend settings conflict" is false. `runtime_loop_tiling_sizes` is **inert**.
+### 4. ~~`fused`'s "backend settings conflict" is false. `runtime_loop_tiling_sizes` is **inert**.~~
+
+> **`[retracted 2026-08-08]` This entry is wrong, and the claim it retracted was right.** The
+> hardware run this section itself asked for has now happened, and `runtime_loop_tiling_sizes`
+> is **decisive**, not inert. A replicated 2×2 factorial on `mha_out_proj` @4096×768, twelve
+> heads, non-causal — each arm in its own process on an exclusive device:
+>
+> | tiling | ping-pong | n | result |
+> |---|---|---|---|
+> | `[1,1]` | OFF (shipped) | 2 | **PASS** — 0 / 3,145,728 mismatches, `mean_rel_L1` 5.3348e-02, `atol_required` 8.7061e-03 against `atol` 2.5e-02, a 2.87× margin |
+> | `[1,1]` | ON | 1 | **PASS** — byte-identical statistics to the above |
+> | `[2,2]` | ON | 2 | **`ERT_CMD_STATE_TIMEOUT`** |
+> | `[2,2]` | OFF | 1 | **`ERT_CMD_STATE_TIMEOUT`** |
+>
+> So the discriminating variable is the tiling, and **`omit_pingpong` is irrelevant at this
+> shape** — ping-pong ON passes, and `[2,2]` hangs whether it is set or not. The shipped preset
+> re-run through the same probe harness is the control and passes, which is what makes the
+> timeouts a property of the preset rather than of the probe.
+>
+> **The conflict `fused.py`, `mha_out_proj.py` and `block.py` document is therefore REAL:**
+> FlashAttention at 4096 requires `[1,1]`, the wide GEMMs are built at `[2,2]`, and one ELF is
+> one aircc invocation. Only the stated *reason* needed correcting — it is the tiling sizes and
+> not `omit_pingpong` — and it is now measured instead of asserted. Do **not** make the prose
+> edits this document's §Recommended order step 0 asks for; make the opposite ones.
+>
+> **The methodological error is worth more than the finding.** Everything measured below is
+> accurate: the lowered `aie.air.mlir` really is identical between the two settings, and
+> `air-opt-shim-dma-bds` really does early-exit. What does not follow is "therefore the value is
+> never consumed". Identical IR *at the altitude that was diffed* is not inertness; something
+> downstream of that dump consumes it. This section even wrote the caveat down — "compile-only
+> refutes *a placement failure at best*, it does not refute *wrong numbers at worst*" — and then
+> stated the conclusion without the caveat attached. The real outcome was a third branch neither
+> disjunct covered: it neither places badly nor computes wrongly, **it hangs**.
+>
+> Reproduce with `python3 agents/probes/probe_backend_preset_hardware.py [attn|gemm|t11nopp|t22pp]`,
+> one process per arm via `agents/scripts/devq.sh submit --class measure`.
+
+The refuted reasoning is kept below as a record.
 
 `pattern/fused/fused.py:63-74`, `builders/mha_out_proj.py:111-130`, `builders/block.py:90`,
 `opcheck_specs.py:775-781`, `run_npu2_fused_peano.lit:12-16` and [03](03-measurement-model.md) all
@@ -125,9 +162,24 @@ over the shim aie.dma_bd cap of 1048576
 Reproduced twice, 1.5 s each. `fused.py:37` already says the mode is "BOUNDED TO 256..1024"; the
 SPECS row was never moved with it. `compile_fused_artifacts` (`fused.py:492-495`) rebuilds every
 module on every call even with `run_only=True`, so the cached
-`fused_tail_4096x768x3072.elf` (dated Aug 5, pre-J7a) cannot rescue it. **Unverified:** nobody ran
-`make check-fused` to confirm the gate is red — it dispatches to the device and the spike was
-compile-only.
+`fused_tail_4096x768x3072.elf` (dated Aug 5, pre-J7a) cannot rescue it. ~~**Unverified:** nobody ran
+`make check-fused` to confirm the gate is red.~~
+
+> **`[2026-08-08]` CONFIRMED RED, AND NOW FIXED.** The gate was run: it raised the `ValueError`
+> above and never reached the device. The SPECS row is moved to **1024**, the top of the mode's own
+> supported range, and `run_npu2_fused_peano.lit` **passes** on hardware — both recipes, 10/10
+> stages clean, `mean_rel_L1` 1.756e-2, `atol_required` 5.813e-2 against the 1e-1 ceiling (1.72×).
+>
+> Two things moved with the shape that were not predicted here, both registry facts rather than
+> gate edits: at 1024 the FFN down-projection's fastest high-precision row is **`drain`**, where at
+> 4096 it was `fused-cast`, and `drain` exposes no f32 C scratch — so the stitched tail takes **11**
+> whole-tensor args instead of 16. Dispatch totals at 1024 are `submissions 1 entries 3 air 11
+> herd 23 sync 19 bytes 56626176`.
+>
+> **A comparison was suspended rather than restated.** The gate used to read its `sync 19` against
+> `coarse`'s 402 and call that the mode's gating clause. `coarse` is still a 4096 row and `fused` is
+> now 1024, so that ranking spans two sequence lengths and is withdrawn until both are measured at
+> one. (`sync` happens to be unchanged at 19; `air` fell 16 → 11 and bytes 184,025,088 → 56,626,176.)
 
 ---
 
@@ -137,7 +189,7 @@ compile-only.
 |---|---|---|---|
 | **B — `runlist`** | Can the attention interior run on the device? | **feasible-with-changes**, and the scope *shrinks* | 33 device jobs, 976 s of lock |
 | **A — `offload`** | Can matmul loop bounds come from a runtime parameter, so one xclbin + one instruction stream serves several GEMM shapes? | **blocked as posed**; already absorbed into [03](03-measurement-model.md) by `e58a2170` | 0 device jobs |
-| **C — `fused`** | One xclbin for the whole layer, and no DRAM between operators? | **split**: the documented blocker is wrong, a different one is real, and half 2 is capacity-bounded | compile-only |
+| **C — `fused`** | One xclbin for the whole layer, and no DRAM between operators? | **split**: the documented blocker is **real** after all (`[corrected 2026-08-08]` — see §4's retraction; the spike's compile-only refutation of it did not survive hardware), a second one is real too (`air-fuse-channels`), and half 2 is capacity-bounded | compile-only + 6 device jobs |
 
 ### B — attention on device
 
@@ -341,12 +393,23 @@ independent, all cheap, and one of them (the `fused` SPECS row) may already be a
   own list gave `docs/README.md:267` and `03:43/113`; both pointers are wrong — the plan
   directory's README carries :267, and doc 03 was renumbered by today's `df7153b2`/`e58a2170`.
   Re-grep before editing rather than trusting any line number in this document.)
-- `opcheck_specs.py:782-790` (the fused seq_len), and the `fused.py`/`mha_out_proj.py`/`block.py`
-  backend-settings prose.
+- `opcheck_specs.py:782-790` (the fused seq_len). **`[2026-08-08]` The `fused.py` /
+  `mha_out_proj.py` / `block.py` backend-settings prose is NOT to be softened** — step 1 measured
+  it and it is right; see §4's retraction. What those three files need is the measured basis
+  substituted for the asserted one, and `omit_pingpong` dropped from the stated reason.
 
-**1. One hardware run each, to close the two cheapest unknowns.** `probe_mha_gemm.elf` and
-`probe_tail_attn.elf` against the `mha_out_proj` / `fused_tail` oracles. Together these decide
-whether §4's correction lands as written or as "compiles, numerics unverified".
+**1. ~~One hardware run each, to close the two cheapest unknowns.~~ DONE `[2026-08-08]`, and it
+overturned §4.** Six device jobs on the `mha_out_proj` side rather than one: the GEMM preset
+`ERT_CMD_STATE_TIMEOUT`s at 4096, the shipped preset passes through the same harness as a control,
+and a 2×2 over (tiling × ping-pong) puts the cause on `runtime_loop_tiling_sizes` with
+`omit_pingpong` irrelevant. Replicated 3/3 per tiling level. See §4.
+
+The `fused_tail` half was **not** run and is not blocking: `fused_tail` has no standalone opcheck
+row — its oracle is the `fused` mode's own per-boundary comparison — so the question is answered by
+making `make check-fused` runnable (the `opcheck_specs.py` seq_len fix above) rather than by a
+bespoke probe with a bespoke oracle. Note the direction that matters is already settled the other
+way: the attention preset over the tail is ping-pong OFF, and ping-pong turns out not to be the
+variable that decides anything here.
 
 **2. Corrected `offload`.** It is the *cheap proof* of device attention and it is worktree-sized:
 replace the `blocked_attention` call in `pattern/offload/offload.py` with two dispatched GEMMs plus
@@ -373,7 +436,7 @@ xclbin is judged to matter, the `air-fuse-channels` scoping phase.
 
 | Question | Why it is open | The measurement | Cost |
 |---|---|---|---|
-| Do the off-preset ELFs produce **correct numbers**? | Spike C was compile-only; the new configuration is ping-pong ON over FlashAttention (344 bd vs 280, 660 buf vs 628) | Run the two built probes against their oracles | 2 device jobs |
+| ~~Do the off-preset ELFs produce **correct numbers**?~~ **ANSWERED `[2026-08-08]`: the GEMM preset does not RUN.** `[2,2]` `ERT_CMD_STATE_TIMEOUT`s 3/3 at 4096; `[1,1]` passes 3/3; ping-pong is irrelevant either way. Neither branch of "placement failure at best / wrong numbers at worst" was right — it hangs. §4 is retracted | — | `agents/probes/probe_backend_preset_hardware.py` | 6 device jobs, spent |
 | How long does `air-fuse-channels` actually take on a stitch? | Bounded below only: >1200 s at 90 channels, seq 256. It terminates (no fixed-point loop) but the bound could be 30 min or 3 h | One unattended `air-opt /home/cj/.claude/jobs/e75c34c9/tmp/spikeC/mt256_pass017.mlir --air-fuse-channels` with no cap | CPU-only, overnight, **must not overlap a timed measurement** |
 | Would a whole-layer ELF survive the rest of the pipeline? | Nothing past `air-fuse-channels` has ever run on an 11-launch module: `air-split-l2-memref`'s per-column shim cap (8 cols × 2), herd placement for 23 herds against 32 tiles, the 16-BD-per-shim-column budget | Only answerable after the pass finishes once | — |
 | Is `make check-fused` red today? | Only established that `prepare_fused(seq_len=4096)` raises in `build_norm_tail_module` | Run it | 1 device job |

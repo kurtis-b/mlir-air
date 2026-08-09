@@ -64,14 +64,27 @@ WHY THREE ELFs AND NOT ONE, WHICH IS THE MODE'S OWN FINDING
     A whole-layer single-module stitch is not blocked by symbol collisions —
     E1's ``(method, tile_n)`` naming fix removed those — but by BACKEND
     SETTINGS: one ELF is one aircc invocation, and FlashAttention requires
-    ``omit_pingpong="all"`` + ``runtime_loop_tiling_sizes=[1, 1]`` (it does
-    not place otherwise) while the 4096-row GEMMs require ``[2, 2]`` for
-    BD-ID recycling. ``builders/mha_out_proj.py`` documents the settings as
-    non-interchangeable — a placement failure at best, wrong numbers at
-    worst. So attention keeps its own ELF, qkv (which must run BEFORE it)
-    keeps its own, and everything after it fuses into one. The ELF ABI then
-    aggregates all three into one runlist (05a §5), which is what makes the
-    layer a single submission anyway.
+    ``runtime_loop_tiling_sizes=[1, 1]`` while the 4096-row GEMMs are built at
+    ``[2, 2]`` for BD-ID recycling. So attention keeps its own ELF, qkv (which
+    must run BEFORE it) keeps its own, and everything after it fuses into one.
+    The ELF ABI then aggregates all three into one runlist (05a §5), which is
+    what makes the layer a single submission anyway.
+
+    ``[2026-08-08]`` **This is now measured, and it is a HANG rather than
+    either thing the paragraph used to predict.** ``mha_out_proj`` at 4096
+    under ``[2, 2]`` compiles and then returns ``ERT_CMD_STATE_TIMEOUT``, 3/3,
+    against 3/3 clean passes at ``[1, 1]``. "A placement failure at best, wrong
+    numbers at worst" was the right instinct and neither disjunct: it places,
+    it never returns.
+
+    Two corrections that came with the measurement, so nobody re-derives them:
+    ``omit_pingpong="all"`` is **not** part of the conflict — ping-pong ON
+    passes at this shape with byte-identical statistics — and the claim that
+    the two settings produce different programs is **not** visible in the
+    lowered IR, which is identical op-for-op between them. A compile-only
+    comparison of the two therefore "refutes" this paragraph and is wrong to;
+    that is exactly what doc 26 §4 did before its retraction. Reproduce with
+    ``agents/probes/probe_backend_preset_hardware.py``.
 
 WHY THE NORMALIZATION IS STREAMED, NOT ROW-BLOCKED
     ``build_addnorm_module`` caps a launch at 104 rows of 768 (L1), so a

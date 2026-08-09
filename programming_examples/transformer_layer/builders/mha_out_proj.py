@@ -110,14 +110,26 @@ from builders.o_proj import (  # noqa: E402
 
 # Backend settings this design needs. FlashAttention's, because the attention
 # half is the constrained one:
-#   omit_pingpong "all": the seq-first design runs in shared-buffer mode
-#     (kv_seq_tile == head_dim); ping-pong buffering on top of that does not fit
-#     L1 and the design fails to place.
-#   runtime_loop_tiling_sizes [1, 1]: the launch grid is 2-D
-#     (Q iterations x head groups) and each iteration's shim BDs are already
-#     one transfer deep. The [2, 2] the standalone GEMM-only operators use is
-#     BD-ID recycling for a fused-cast herd; the projection here places without
-#     it, and raising it re-tiles the attention runtime loop as well.
+#   runtime_loop_tiling_sizes [1, 1]: LOAD-BEARING, and measured. At [2, 2] this
+#     design compiles and then HANGS on hardware -- ERT_CMD_STATE_TIMEOUT, 3/3
+#     at 4096x768 twelve heads non-causal, against 3/3 clean passes at [1, 1]
+#     (0 / 3,145,728 mismatches, mean_rel_L1 5.3348e-02, atol_required
+#     8.7061e-03 against the row's atol 2.5e-02). The launch grid is 2-D (Q
+#     iterations x head groups) and each iteration's shim BDs are already one
+#     transfer deep; [2, 2] is the BD-ID recycling the standalone GEMM-only
+#     operators want, and it re-tiles the attention runtime loop as well.
+#     `[2026-08-08]` Do not "simplify" this to match the GEMM preset on the
+#     grounds that the lowered IR is identical between the two. It is identical
+#     -- aircc's aie.air.mlir matches op-for-op, because air-opt-shim-dma-bds
+#     early-exits with no shim-level scf.for to tile -- and the setting is
+#     decisive anyway. That inference was drawn, written down, and refuted by
+#     the run above. See agents/probes/probe_backend_preset_hardware.py.
+#   omit_pingpong "all": NOT load-bearing at this shape, kept as shipped. The
+#     comment here used to say ping-pong "does not fit L1 and the design fails
+#     to place"; measured, it places, runs, and returns statistics byte-identical
+#     to ping-pong off. It may still matter at a shape this has not been run at
+#     -- causal, or a different head count -- so it stays, but it is not the
+#     reason one ELF cannot serve both halves. The tiling is.
 #   output_format "elf": multi-segment design -- one aie.device per air.launch.
 #     The xclbin path names a single instruction blob on the aircc command line,
 #     so a second segment collides on it.

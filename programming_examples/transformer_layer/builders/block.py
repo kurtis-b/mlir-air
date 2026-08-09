@@ -87,11 +87,14 @@ FOOTGUNS
     - ``instance_name`` must equal the emitted ``func.func`` name for each
       artifact. A mismatch does not fail to load; it times out with
       ``ERT_CMD_STATE_TIMEOUT`` a long way from the cause.
-    - The per-operator backend settings are NOT interchangeable.
-      ``mha_out_proj`` needs FlashAttention's (``omit_pingpong="all"``,
-      ``runtime_loop_tiling_sizes=[1, 1]``); the GEMM-backed pair needs
-      ``[2, 2]`` for BD-ID recycling. Swapping them is a placement failure at
-      best and wrong numbers at worst.
+    - The per-operator backend settings are NOT interchangeable, and
+      ``[2026-08-08]`` that is measured rather than inferred. ``mha_out_proj``
+      needs ``runtime_loop_tiling_sizes=[1, 1]``; the GEMM-backed pair is built
+      at ``[2, 2]`` for BD-ID recycling. Giving ``mha_out_proj`` the ``[2, 2]``
+      setting makes it compile and then HANG — ``ERT_CMD_STATE_TIMEOUT``, 3/3
+      at 4096, against 3/3 clean passes at ``[1, 1]``. The other half of the
+      old claim does not hold: ``omit_pingpong="all"`` is not load-bearing at
+      this shape. See ``agents/probes/probe_backend_preset_hardware.py``.
     - Each artifact's external objects are built IMMEDIATELY BEFORE ITS OWN ELF,
       never all up front. ``compile_gemm_mm`` names its output from the method
       alone while baking ``tile_n`` into it, so two operators of the same method
