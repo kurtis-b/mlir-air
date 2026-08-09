@@ -39,6 +39,7 @@ how to use MLIR-AIR.
 | [23-rules-and-open-items.md](23-rules-and-open-items.md) | **Read before building anything.** The design rules that govern later work — the per-column shim budget, the L3-side offset rule, one process per measurement — and the open items nobody has claimed |
 | [24-phase-h10-non-constant-bd-offsets.md](24-phase-h10-non-constant-bd-offsets.md) | **Substance verified, tamper baseline not clean.** The silent miscompile J7b lost a session to, located: an unchecked `std::optional` deref in `air-to-aie` |
 | [25-first-study-result-sequence-ladder.md](25-first-study-result-sequence-ladder.md) | **`[retracted]` Do not cite the crossover or the slopes.** It ranks four *implementations* that predate the corrected taxonomy, and its explanation — that the slopes split on attention placement — is now **unreproducible**, because as of 2026-08-09 all four modes run attention on the device. The measurement stands as a record of what was built on 2026-08-08 |
+| [27-common-ladder-result.md](27-common-ladder-result.md) | **The first four-mode comparison at one sequence length**, 512 and 1024, walked twice. DRAM traffic orders exactly as the taxonomy predicts; `fused` fastest and `coarse` second at both lengths; `runlist` and `offload` indistinguishable. **A crossover that walk 1 reported did not survive walk 2** — read its §The crossover that did not survive before running one walk of anything |
 | [26-mode-rebuild-feasibility.md](26-mode-rebuild-feasibility.md) | **The feasibility record for the mode rebuilds — read it for its CORRECTIONS, not as current state.** It opens with six things the plan had wrong, three of which have since been settled by hardware, two of them against what it concluded. **§4 is retracted** (`runtime_loop_tiling_sizes` is not inert) and **§5 is corrected twice** (the missing row-max is the single-shot kernel's, not the streaming family's; `SM_LOG2E` is a base conversion, not a blocking scale). Its §6 was right and is fixed |
 
 ## Status board
@@ -78,7 +79,8 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | Corrected `runlist` — every operator on device | `run_npu2_runlist_peano.lit`, clean + negative control | **done** 2026-08-09. **427 entries over 17 runlists, nothing on the host.** Per head `attn_scores` → `softmax` → `attn_output`, device-resident inside one submission; one submission per head is a memory bound (~800 MiB if batched, ~70 MiB per head), not a schedule choice. 10/10 stages clean, `submissions 17 entries 427 air 50 herd 488 sync 451 bytes 190513152`. In the end it never touched `builders/mha_attention.py`, so the `fused` serialization this table warned about was not needed |
 | **The first result on the corrected axis** | none; a measurement | **recorded** 2026-08-09. `runlist` moves **190,513,152** bytes against `offload`'s **970,457,088** for the same layer — **5.1×**, produced entirely by where the softmax runs. `offload` puts it on the host, so every `[4096, 4096]` score matrix crosses DRAM twice per head; `runlist` keeps it on the array. Two modes differing in exactly the corrected taxonomy's variable — reconfiguration against DRAM traffic — rather than in attention placement, which is the confound every earlier comparison carried |
 | `attention_path` retired as a covariate | none; a consequence | **recorded** 2026-08-09. With `runlist` on the device, **all four modes are**. The first sequence ladder's headline — slopes splitting on attention placement, host 1.23–1.27 against device 1.03–1.17 — **cannot be reproduced**, because no mode sits on the host side any more. `study/test_attention_path.py` now asserts that end state rather than the two-value invariant it was written with |
-| Corrected `coarse` | its own phase | not started; a blend of `runlist` and `fused`, so both must be right first |
+| **The four modes at one sequence length** | none; a measurement, walked twice | **recorded** 2026-08-09. 512 and 1024, all four modes, 8/8 rungs twice. **DRAM traffic orders as the taxonomy predicts at both lengths** — `fused` 42.5 MB < `coarse` 44.0 < `runlist` 55.2 < `offload` 99.1 at 1024, byte-identical across walks. On latency `fused` is fastest and `coarse` second at both lengths; **`runlist` and `offload` are indistinguishable** — averages and minimums disagree, and each flips between walks. **A crossover walk 1 reported did NOT survive walk 2.** `offload` alone drifts up to 120% intra-walk, corroborating [03](03-measurement-model.md)'s wider band for it from a fresh measurement. Trap 1 below is closed by this; the SPECS rows still span two lengths, so build cross-mode tables from a ladder run, never from the catalogue. See [27](27-common-ladder-result.md) |
+| Corrected `coarse` | its own phase | not started; a blend of `runlist` and `fused`, so both must be right first. **Its decision procedure is smaller than "a choice per operator" suggests**: `fused_config` resolves to exactly three artifacts, so the blend is a choice over three regions (2 × 2 × 3 = 12 configurations), not twenty operators — and three of the twelve are already built and gated (`fused`, `runlist`, and today's `coarse` are three of the cells) |
 | G — unattended runner + CI | Full profile run completes with a complete `results_manifest.json` | not started |
 | Goal 1 — sliding window | `make verify` passes with window-crossing prompts | not started |
 | Goal 2 — quantization | Second quantized model passes a gate that exercises the quantized path | not started |
@@ -109,7 +111,7 @@ traffic between operators, and `coarse` blends `runlist` and `fused`.
 | Mode | State | What is left |
 |---|---|---|
 | `runlist` | **Corrected and gated** 2026-08-09. 427 entries over 17 runlists, nothing on the host. Per head `attn_scores` → `softmax` → `attn_output`, device-resident inside one submission | Nothing for the definition. One submission per head is a memory bound (~800 MiB if batched), not a schedule choice |
-| `offload` | **Half corrected and gated** 2026-08-08. The LINEARITY half is done: both attention matmuls on device, only softmax / both LayerNorms / GeLU on the host | **N instruction streams under one xclbin** — untouched, and it is where the mode's reconfiguration-minimizing claim actually gets tested. Already plumbed (`xclbin_input`, `xrt.py:80`, `:372-374`), never dispatched. Touches `llms/shared/infra/dispatch.py:685`, shared with `fused` |
+| `offload` | **Half corrected and gated** 2026-08-08. The LINEARITY half is done: both attention matmuls on device, only softmax / both LayerNorms / GeLU on the host. **`[2026-08-09]` It currently pays the MAXIMUM reconfiguration cost, not the minimum** — `_evict_context` (`offload.py:465`) reloads the `hw_context` before every dispatch, 30 times per layer. That eviction is measured, but its **scope is narrower than its docstring claims**: the corruption is `elf`+`[2,2]` specifically, and `xclbin`+`[2,2]` reuses cleanly (`probe_context_reuse.py`). So the 30 reloads are removable, and they are the leading candidate for this mode's 120% intra-walk latency drift ([27](27-common-ladder-result.md)) | **N instruction streams under one xclbin** — untouched, and it is where the mode's reconfiguration-minimizing claim actually gets tested. Already plumbed (`xclbin_input`, `xrt.py:80`, `:372-374`), never dispatched. Touches `llms/shared/infra/dispatch.py:685`, shared with `fused`. **`[2026-08-09]` The context-reuse question that could have blocked this is answered, and the answer is favourable:** under the **xclbin** ABI — which N streams requires anyway — reuse is bit-identical over 4 runs at the mode's existing `[2,2]` tiling. Only `elf`+`[2,2]` corrupts. So no retune, no device-defect blocker, and `_evict_context` can go away on this path (`agents/probes/probe_context_reuse.py`). The split rule itself is small: `plan_submissions` should key on **array-configuration identity** rather than artifact identity, with `artifact_of` as the default proxy so today's behaviour is unchanged |
 | `fused` | **Builds and gates again** 2026-08-08, at **1024** — it was red and unrunnable, pinned at a 4096 its own builder rejects | One xclbin is blocked, now for a *measured* reason (below) plus `air-fuse-channels`. "No DRAM between operators" is capacity-bounded: 6 MiB on chip against one 6 MiB S×F intermediate at 1024 |
 | `coarse` | **Untouched, and now the front of the queue** — both its inputs are correct | Everything. See the warning below about what "a blend" has to mean |
 
@@ -145,12 +147,22 @@ direction of its own conclusion.
 
 ### Three traps in the current state, before you measure anything
 
-**1. The modes are no longer at the same sequence length.** `fused`'s SPECS row is at **1024**;
-`coarse`, `runlist` and `offload` are at **4096**. Any cross-mode table built from the catalogue as
-it stands compares two sequence lengths. `fused`'s own gate used to read its `sync 19` against
-`coarse`'s 402 and call that its gating clause; that comparison is **suspended**, not restated.
-Re-establishing any cross-mode ranking means measuring every mode at one length, which is Phase F's
-job and is the largest single thing outstanding.
+**1. ~~The modes are no longer at the same sequence length.~~ MEASURED `[2026-08-09]`, and the
+comparison exists now — see [27](27-common-ladder-result.md).** All four modes were walked at **512
+and 1024**, twice, 8/8 rungs each time. DRAM traffic orders exactly as the taxonomy predicts at both
+lengths; `fused` is fastest and `coarse` second; `runlist` and `offload` are indistinguishable.
+
+**The trap itself is unchanged for anyone reading the catalogue**, because the SPECS rows were not
+moved: `fused` is still a 1024 row and the other three are still 4096. So a table assembled from the
+SPECS rows still spans two lengths. **Build a cross-mode table from a ladder run, never from the
+catalogue.** `fused`'s old `sync 19` against `coarse`'s 402 stays withdrawn; at 1024 the two are 13
+and 107, and `coarse`'s 402 was a 64-band figure that does not survive the length change.
+
+**Two things that comparison establishes about how to run the next one.** A single walk would have
+published a crossover that a second walk refuted, which is the J3 failure repeating — so walk
+anything twice. And `offload` drifts up to 120% within one walk against 2-10% for the other three,
+enough to invert a ranking on its own, which is a fresh corroboration of the wider band
+[03](03-measurement-model.md) already gives it.
 
 **2. `attention_path` is no longer a covariate.** All four modes are on the device side now. The
 first sequence ladder's headline — slopes splitting on attention placement, host 1.23–1.27 against
@@ -158,11 +170,26 @@ device 1.03–1.17 — **cannot be reproduced**, because no mode sits on the hos
 showing separated slopes is measuring something else and needs a new explanation, not the old one
 restated. `study/test_attention_path.py` asserts that end state and will fail if a mode moves back.
 
-**3. `coarse` needs a decision procedure that does not exist.** It is defined as a *per-workload
-blend* of `runlist` and `fused` — a choice, per operator, between an individual dispatch and a fused
-region. Nothing in the port expresses such a choice: the D2 block `coarse` currently wraps is a
-fixed five-kernel sequence. Scoping `coarse` means deciding what the blend is selected *by* before
-writing any of it.
+**3. `coarse` needs a decision procedure that does not exist — but the space it ranges over is far
+smaller than "a choice per operator" implies.** It is defined as a *per-workload blend* of `runlist`
+and `fused`, and nothing in the port expresses such a choice: the D2 block `coarse` currently wraps
+is a fixed five-kernel sequence.
+
+`[2026-08-09]` **A fused region is not free-form — it is an artifact somebody stitched.**
+`fused_config` (`pattern/fused/fused.py:381-420`) resolves to exactly **three**: `qkv_proj`,
+`mha_out_proj` and `fused_tail`. The operators inside a region are not independently selectable,
+because `fused_tail` is one stitched module — fusing ln1 without the FFN is not a configuration, it
+is a new stitch. So the blend is a choice over **three regions**, with three levels on the tail
+(fused / the block's banded form / fully decomposed): **2 × 2 × 3 = 12 configurations, exhaustively
+measurable.** Three of the twelve already have gated artifacts — `(fused, fused, fused)` is the
+`fused` mode, `(decomposed, decomposed, decomposed)` is `runlist`, and `(fused, fused, banded)` is
+`coarse` as it stands. Scoping `coarse` is still deciding what the blend is selected *by*; the
+recommendation on the table is *by measurement*, with the twelve walked and the winner frozen as a
+static assignment table whose README records the basis for each region.
+
+**Any configuration selecting a fused level inherits `fused`'s 256..1024 bound**, so a corrected
+`coarse` is a 1024 row — the same length [27](27-common-ladder-result.md) puts the cross-mode
+comparison on.
 
 ### Two rules to know before designing anything
 
@@ -494,6 +521,12 @@ Two decisions taken on 2026-08-04, now reflected throughout these documents:
 | Can the two attention matmuls run on this device? | **Yes**, both, at every ladder rung, `attn_output` by all three GEMM methods. The registry genuinely holds no `K = 64` / `N = 64` row and the sweep cannot stage one, but that is a *catalogue* constraint; the tiles are injected through the `gemm_spec_fn` hatch. Two failure clusters bound the space and are fully characterised: `herd_n = 1` at N=64 hangs, `tile_n = 8` fails the microkernel's own assert. | [26](26-mode-rebuild-feasibility.md) · `pattern/offload/offload.py` |
 | Can one xclbin hold the whole layer? | **No**, blocked twice. `runtime_loop_tiling_sizes` `[2,2]` makes `mha_out_proj` @4096 hang on hardware (3/3) while `[1,1]` passes (3/3), and one ELF is one aircc invocation — so FlashAttention and the wide GEMMs cannot co-compile. Separately `air-fuse-channels` is O(N²) in channels and did not finish in 1200 s on a 90-channel stitch. | `agents/probes/probe_backend_preset_hardware.py` · [26](26-mode-rebuild-feasibility.md) |
 | Is `attention_path` still a covariate? | **No, not since 2026-08-09.** All four modes run attention on the device. Any comparison whose explanation rests on that split cannot be re-tested. | `study/test_attention_path.py` |
+| Does DRAM traffic order as the taxonomy predicts, across all four modes at one length? | **Yes**, at 512 and 1024 both, and the counts are byte-identical between two walks: `fused` < `coarse` < `runlist` < `offload`. The `offload`/`runlist` ratio is 1.79× at 1024 against 5.1× at 4096, because the softmax round trip is O(seq²) and the rest is O(seq). | [27](27-common-ladder-result.md) |
+| Which mode is fastest, at a common length? | **`fused`, at both 512 and 1024**, with `coarse` second — both survive two walks on averages and on minimums. **`runlist` and `offload` are indistinguishable**: the two statistics disagree and each flips between walks. | [27](27-common-ladder-result.md) |
+| What is the widest common sequence ladder? | **512 and 1024 only.** Above 1024 is `fused`'s `plane_major` stride cap (1365 rows). 256 fails for `offload` and `runlist` on the injected attention tile — `256 % (tile_n 128 × herd_n 4) ≠ 0` — a **tile** constraint, not a hardware one. A third rung, and therefore any scaling exponent, costs a retuned and revalidated 256 tile. | [27](27-common-ladder-result.md) |
+| How much does `offload` really drift? | **Up to 120% within a single walk**, and 23-32% walk to walk, against 2-10% for the other three — enough to invert a ranking by itself. Independently corroborates the wider band [03](03-measurement-model.md) inherited from iron. Candidate mechanism, unmeasured: it is the only mode that reloads its `hw_context` per dispatch. | [27](27-common-ladder-result.md) |
+| Can `offload` share one `hw_context` across its dispatches? | **Yes — under the xclbin ABI, at the mode's existing tiling.** A 2×2 factorial on `q_proj` 1024×768×768 puts the corruption in **exactly one cell of four**: `elf`+`[2,2]` diverges from its own first run by 3.8141e-01 (replicated 2/2), while `elf`+`[1,1]`, `xclbin`+`[2,2]` and `xclbin`+`[1,1]` are bit-identical over 4 runs. `_evict_context` attributes it to "these runtime-tiled GEMM ELFs" as a class; it is the ELF ABI **and** `[2,2]` together, and either knob alone removes it. It also does **not accumulate** — runs 2-4 are identical to each other, so it is a one-time state change, not decay. **This UNBLOCKS the N-streams-one-xclbin work**, which needs the xclbin ABI anyway and therefore needs no retune. | `agents/probes/probe_context_reuse.py` |
+| What does `runtime_loop_tiling_sizes = [2,2]` actually break? | **Two separate things, both measured on hardware.** It hangs `mha_out_proj` @4096 (`ERT_CMD_STATE_TIMEOUT` 3/3, `probe_backend_preset_hardware.py`) **and** it leaves context-corrupting residue in a plain projection GEMM under the ELF ABI (`probe_context_reuse.py`). Two independent refutations of [26 §4](26-mode-rebuild-feasibility.md)'s compile-only "inert" finding. A fix addressing one would leave the other live. | `agents/probes/` |
 
 ## Provenance
 

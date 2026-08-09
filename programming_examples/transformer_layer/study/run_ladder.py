@@ -43,17 +43,33 @@ WHY A LADDER AT ALL
     where a mode that wins at 512 and loses at 4096 becomes visible.
 
 FOOTGUNS
-    - **Hold the NPU lock around the whole invocation**, not per rung:
+    - **Reserve the device around the whole invocation**, not per rung:
 
-          flock -x -w 1800 /tmp/mlir-air-npu.lock python3 study/run_ladder.py ...
+          agents/scripts/devq.sh run --class measure -- \
+              python3 study/run_ladder.py ...
 
-      and never alongside a ``port-loop`` gate. Gate leg 4 is a decode-throughput
-      measurement against a floor, so interleaved dispatches corrupt it even
-      though they stay correct.
+      ``run``, never ``submit``: ``submit`` diverts output to the job log and
+      returns an id, so a gate that substitutes it blanks its own FileCheck and
+      still exits 0. Never alongside a ``port-loop`` gate either -- gate leg 4 is
+      a decode-throughput measurement against a floor, so interleaved dispatches
+      corrupt it even though they stay correct.
     - **Nothing CPU-heavy may run beside this.** Compilation is outside the
       clock, but the timed region includes host-side dispatch, so a concurrent
       build inflates latency for whichever rung is unlucky. That is a silent
-      distortion, not a failure.
+      distortion, not a failure. The ``measure`` class is an absolute barrier in
+      the queue -- later builds are not admitted until it has run -- so this is
+      enforced rather than left to discipline. **Compile before the walk**, as
+      separate ``--class build`` jobs, so no aircc runs inside the reservation.
+      Those builds must be SEQUENTIAL: aircc stages intermediates in
+      ``air_project/`` relative to cwd, so concurrent invocations from one
+      directory delete each other's object files, and one of them can "succeed"
+      out of the wreckage.
+    - **Walk it TWICE and compare the walks.** `[2026-08-09]` A single walk of
+      512/1024 produced a clean `offload`/`runlist` crossover, reported by
+      ``ladder_report``; a second walk under identical conditions reported no
+      crossover at all. `offload` drifts up to 120% within one walk, which is
+      enough to invert a ranking on its own. One walk cannot tell a ranking from
+      noise -- see 27-common-ladder-result.md.
     - **The working directory decides where caches land**, because aircc and
       KernelCache write relative to cwd. Run from
       ``programming_examples/transformer_layer`` so the ``*_cache/`` and ``*.o``

@@ -22,7 +22,14 @@ python3 agents/probes/<probe>.py
 | `probe_addnorm_variance_cliff.py` | **The fused `addnorm` collapses on large-mean rows; `layer_norm` does not.** Three modes: `compare` (does it break), `sweep` (where — measured at \|mean\|/σ between 2 and 4, against a hand-derived 16 that is wrong by ~4×), `reachability` (host-only: this workload's worst row is 0.115, a ~35× margin, so the defect is latent and the recorded mode figures stand). | [23 §2](../../docs/plans/transformer-layer-execution-studies/23-rules-and-open-items.md) |
 | `probe_backend_preset_hardware.py` | **`runtime_loop_tiling_sizes` is NOT inert, and `omit_pingpong` is irrelevant at this shape.** A replicated 2×2 on `mha_out_proj` @4096: `[1,1]` passes 3/3 with byte-identical statistics whether ping-pong is on or off; `[2,2]` gives `ERT_CMD_STATE_TIMEOUT` 3/3, likewise either way. The shipped preset re-run through the same harness is the control and passes, so the timeouts belong to the preset. **Refutes [26 §4](../../docs/plans/transformer-layer-execution-studies/26-mode-rebuild-feasibility.md)**, which read "identical lowered IR" as "inert" from a compile-only spike. | [26 §4](../../docs/plans/transformer-layer-execution-studies/26-mode-rebuild-feasibility.md) |
 
-**Why the last two both exist.** `air-opt` with a hand-built pass list answers *"does this pass
-fire"*; it does not answer *"does this compile"*. The two diverge wherever a later pass rewrites
-what was measured — `air-to-aie` normalizing external callee signatures is the case that cost this
-plan a spec claim. Match the probe's altitude to the claim.
+| `probe_context_reuse.py` | **`_evict_context`'s corruption is one CELL, not a class — and the ABI `offload`'s next phase needs is a clean one.** A 2×2 on `q_proj` 1024×768×768, four executions of one artifact on one input pair: `elf`+`[2,2]` diverges from its own run 1 by **3.8141e-01** (replicated 2/2), while `elf`+`[1,1]`, `xclbin`+`[2,2]` and `xclbin`+`[1,1]` are all bit-identical 4/4. The evicting control is clean and reproduces the `9.6e-3` reference error the mode's docstring cites. Also: the corruption **does not accumulate** — runs 2-4 are identical to each other. Second independent hardware refutation of "`runtime_loop_tiling_sizes` is inert". | [27](../../docs/plans/transformer-layer-execution-studies/27-common-ladder-result.md) |
+
+**Why `probe_accum_hoist.py` and `probe_accum_aircc.py` both exist.** `air-opt` with a hand-built
+pass list answers *"does this pass fire"*; it does not answer *"does this compile"*. The two diverge
+wherever a later pass rewrites what was measured — `air-to-aie` normalizing external callee
+signatures is the case that cost this plan a spec claim. Match the probe's altitude to the claim.
+
+**Why `probe_backend_preset_hardware.py` and `probe_context_reuse.py` both exist.** They are the
+same knob caught doing two different things. The first says `[2,2]` HANGS FlashAttention at 4096;
+the second says `[2,2]` leaves context-corrupting residue in a plain projection GEMM under the ELF
+ABI. Neither subsumes the other, and a fix that addressed only one would leave the other live.

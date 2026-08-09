@@ -30,9 +30,19 @@ FOOTGUNS
       decade cannot separate ``n^2`` from ``n log n`` from a linear term plus a
       constant, and a fixed per-launch cost pulls every slope toward 1 at short
       lengths. Read it as "closer to linear" or "closer to quadratic".
-    - **Latency comparisons across modes are still confounded** while attention
-      placement varies between them. This module reports what was measured; it
-      is not evidence that one mode is faster for a reason it names.
+    - **A reported crossover is a hypothesis until a second walk repeats it.**
+      `[2026-08-09]` This module reported an `offload`/`runlist` crossover from
+      one walk of 512/1024; a second walk under identical conditions reported
+      none. `offload` drifts up to 120% within a single walk, which inverts a
+      ranking without anything changing. The §Crossovers section says what THIS
+      tree of CSVs contains, not what reproduces -- see
+      docs/plans/transformer-layer-execution-studies/27-common-ladder-result.md.
+    - **Attention placement is no longer the confound it was.** `[2026-08-09]`
+      All four modes run attention on the device, so `attention_path` is
+      constant across every row a run can produce and no longer explains a
+      slope split. Latency comparisons across modes remain descriptive: this
+      module reports what was measured; it is not evidence that one mode is
+      faster for a reason it names.
     - Rows are matched on ``seq_len``, not on row order, so a partially written
       or reordered CSV lines up correctly.
 """

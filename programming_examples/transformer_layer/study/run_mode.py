@@ -35,8 +35,13 @@ FOOTGUNS
       ``sum(round(mean * submissions))``.
     - The mode's CSV value is not its code name: ``coarse`` records as
       ``hybrid`` (convention 7). Read it from ``schema.EXECUTION_MODE_CSV``.
-    - This needs the NPU. Serialize it like every other device job:
-      ``flock -x -w 1800 /tmp/mlir-air-npu.lock python3 study/run_mode.py ...``
+    - This needs the NPU. Serialize it like every other device job, through the
+      queue rather than the bare lock:
+      ``agents/scripts/devq.sh run --class measure -- python3 study/run_mode.py ...``
+      ``run``, never ``submit``: ``submit`` diverts output to the job log and
+      returns an id, so substituting it at a gate blanks the FileCheck while
+      still exiting 0. A measure is an absolute barrier in the queue, so no
+      build runs beside the timed region.
 """
 
 from __future__ import annotations
