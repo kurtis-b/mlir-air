@@ -76,9 +76,31 @@ hardware's dispatch caps (08d §Do not carry iron's entry count across).
 > hardware one — both attention shapes are measured passing on real NPU2, and
 > `offload` now dispatches them (see `pattern/offload/README.md`). What
 > `runlist` additionally needs, and `offload` does not, is a **device
-> softmax**; the kernel for it already exists in this tree as
-> `softmax_streaming.o`. Until that lands this mode prices host torch rather
-> than reconfiguration: 24.15 ms of host attention at 1024, 47.8% of its total.
+> softmax**. `[2026-08-09]` That operator now exists and is gated —
+> `builders/softmax.py`, `run_npu2_softmax_peano.lit`, three shapes including
+> 64x4096 — so this mode is unblocked. Until it is rebuilt it prices host torch
+> rather than reconfiguration: 24.15 ms of host attention at 1024, 47.8% of its
+> total.
+>
+> **Three sizing facts for whoever does the rebuild**, established while
+> building the operator:
+>
+> - At attention width the softmax module builds with `rows_per_call = 2` and
+>   no higher: three `[rows_per_call, cols]` bf16 buffers live in L1, so 2 needs
+>   48 KiB and 4 would need 96 KiB against a 64 KiB L1.
+> - **The row loop is inside the herd body**, so one softmax is ONE `air.launch`
+>   regardless of row count — 256 loop trips per tile at `[4096, 4096]`, not 256
+>   dispatches. The entry-count consequence of moving attention on-device is
+>   therefore 12 softmax dispatches plus 24 GEMMs, not thousands, which is what
+>   this mode's identity (391 entries over 5 runlists) has to be re-derived
+>   against.
+> - `[4096, 4096]` is **compile-verified only**. The hardware-verified
+>   attention-width row is `64x4096`; the full per-head score matrix is 32 MiB
+>   in and 32 MiB out and has not been run. Do not treat "it builds" as "it
+>   passes" — that inference is exactly what doc 26 §4 got wrong.
+>
+> The GEMM tiles are already measured and are in `pattern/offload/offload.py`
+> as `ATTENTION_GEMM_TILES`; inject them the same way rather than re-searching.
 
 The two attention GEMMs are `4096 x 64 x 4096` and `4096 x 4096 x 64`; no
 `K = 64` or `N = 64` bf16-out row exists in the registry and the C4 sweep
