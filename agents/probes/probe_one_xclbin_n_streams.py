@@ -1,40 +1,51 @@
 # Can two AIR kernels of DIFFERENT shape live in one xclbin and run from one `hw_context`?
 #
-# WHAT THIS ESTABLISHED `[2026-08-09]`: THE ANSWER IS NO, AND `offload`'s N-STREAMS HALF
-# IS BLOCKED ON IT. Two GEMMs chained with `--xclbin-input`, at seq 1024, run from a
-# single `hw_context`:
+# WHAT THIS ESTABLISHED `[2026-08-09]`: IT WORKS -- and it needs TWO distinct
+# identifiers per stream, not one. Two GEMMs of different shape chained with
+# `--xclbin-input`, at seq 1024, both executed from a SINGLE `hw_context`:
 #
-#   compile order                 kernels in xclbin      first            second
-#   q_proj then up_proj           ['mm_qproj','mm_up']   9.5676e-03 OK    ERT_CMD_STATE_TIMEOUT
-#   up_proj then q_proj (reverse) ['mm_up','mm_qproj']   9.5770e-03 OK    1.4124e+00 WRONG
+#   dpu_kernel_ids            first slot        second slot
+#   distinct (0x901/0x902)    9.5676e-03 OK     9.5770e-03 OK      <- and reversed: OK/OK
+#   same (both default)       9.5676e-03 OK     ERT_CMD_STATE_TIMEOUT
 #
-# THE FAILURE IS POSITIONAL, NOT SHAPE-SPECIFIC. Whichever kernel is compiled FIRST runs
-# correctly from the shared xclbin; whichever is SECOND does not. Reversing the order
-# reverses which one breaks. Both kernels are present in the xclbin by name either way --
-# `get_kernels()` lists both -- so the packaging succeeds and the execution does not.
+# So `offload`'s N-instruction-streams-under-one-xclbin half is FEASIBLE on today's
+# stack. One xclbin, one context, N kernels, each with its own instruction stream.
 #
-# THE SECOND KERNEL'S FAILURE MODE DEPENDS ON ITS SHAPE, AND ONE OF THE TWO IS SILENT.
-# `up_proj` (1024x768x3072) times out; `q_proj` (1024x768x768) returns garbage at
-# mean_rel_L1 1.41 with NO error raised. Wrong numbers with no signal is the worse of the
-# two and it is the one a gate would miss.
+# THE TWO IDENTIFIERS, AND WHY MISSING EITHER FAILS SILENTLY-ISH:
 #
-# THE CONTROLS THAT MAKE THIS A PROPERTY OF CHAINING RATHER THAN OF EITHER KERNEL:
-# compiled STANDALONE as its own xclbin, each runs correctly and reuses its context
-# cleanly -- `q_proj` 9.5676e-03 and `up_proj` 9.5770e-03, bit-identical across runs
-# (`probe_context_reuse.py reuse-xclbin --op ...`). The only variable is `--xclbin-input`.
+#   1. `instance_name` -- the kernel's NAME in the xclbin. The loader finds it by
+#      SUBSTRING match (`xrt.py:634`), so two kernels sharing a name mean the match
+#      returns whichever came first: the wrong program with the right buffers.
+#   2. `kernel_id` -- the DPU kernel id, which is how the merged AIE_PARTITION routes a
+#      kernel to its PDI (its array configuration). EVERY AIR compile defaults to 0x901.
+#      Two PDIs both claiming 0x901 are indistinguishable to the runtime, so the second
+#      kernel executes against the FIRST kernel's configuration.
 #
-# CONSEQUENCE FOR THE PLAN. Doc 26 sizes "N instruction streams under one xclbin" as its
-# own phase and records the mechanism as "already plumbed (`xclbin_input`, `xrt.py:80`,
-# `:372-374`) but never dispatched". The plumbing is there and it DOES NOT WORK: aircc
-# packages the kernel into the existing xclbin, and the result executes only in the first
-# slot. So the phase is not a dispatch-layer change gated on a split rule -- it is blocked
-# on the packaging path, which is `aircc --xclbin-input` and below. The `plan_submissions`
-# split rule and the `ensure_loaded` context sharing remain correct designs with nothing
-# to run on.
+# Verified directly in the packaging. With distinct ids the merged AIE_PARTITION carries
+# two PDIs with two ids:
 #
-# WHAT IS NOT YET KNOWN: whether the second kernel's instruction stream, its shim BD
-# programming, or the merged xclbin's partition metadata is what goes wrong. That is the
-# next question and it is a compiler-side one.
+#   uuid ca013193 -> dpu_kernel_ids [['0x901']]
+#   uuid 1e347c3d -> dpu_kernel_ids [['0x902']]
+#
+# and with the default it carries two PDIs BOTH claiming 0x901.
+#
+# THE FAILURE MODE WHEN IT IS WRONG IS SHAPE-DEPENDENT, AND ONE HALF OF IT IS SILENT.
+# With colliding ids the second kernel times out at 1024x768x3072 and returns GARBAGE at
+# mean_rel_L1 1.41 with NO error raised at 1024x768x768. A gate that only checks for
+# exceptions would pass the second case.
+#
+# WHAT MADE THIS EASY TO GET WRONG, recorded because the first pass of this probe DID get
+# it wrong and briefly concluded the mechanism was broken: the instruction streams are a
+# red herring. The second kernel's `insts.bin` is BYTE-IDENTICAL to its standalone build
+# (md5 ff968fab...), and both kernels appear in `get_kernels()` either way. Everything
+# that is easy to inspect looks correct; the discriminating field is inside the
+# AIE_PARTITION section and needs `xclbinutil --dump-section AIE_PARTITION:JSON`.
+#
+# CONSEQUENCE FOR THE PLAN. Doc 26 sizes this as its own phase and calls the mechanism
+# "already plumbed but never dispatched". The plumbing is real and it works, PROVIDED
+# both identifiers are set per stream -- which no caller in this tree does today.
+# `pattern/offload` names every drain GEMM `matmul_bf16` and sets no kernel id at all, so
+# at 1024 all five of its shapes would collide on both axes at once.
 #
 # WHY THIS EXISTS.  `offload`'s remaining half is "N instruction streams under one xclbin"
 # -- 03's mechanism for the mode's reconfiguration-minimizing claim, and the thing that
@@ -104,6 +115,12 @@ def main():
         "'running two different kernels in one context is broken'.",
     )
     ap.add_argument(
+        "--same-kernel-id",
+        action="store_true",
+        help="let both compiles take the default DPU kernel id (0x901), which is "
+        "what makes the merged partition ambiguous",
+    )
+    ap.add_argument(
         "--reverse",
         action="store_true",
         help="compile up_proj FIRST and q_proj second, to tell 'the second "
@@ -117,27 +134,33 @@ def main():
     # Two DIFFERENT shapes, so a mix-up is visible as wrong numbers rather than as a
     # coincidence: q_proj is seq x768x768 and up is seq x768x3072.
     order = (("q_proj", "mm_qproj"), ("up_proj", "mm_up"))
+    # Distinct DPU kernel ids per slot. The merged AIE_PARTITION routes a kernel to its
+    # PDI by `dpu_kernel_ids`, and every AIR compile defaults to 0x901, so without this
+    # both PDIs claim the same id and the runtime cannot tell them apart.
+    kernel_ids = ["", ""] if args.same_kernel_id else ["0x901", "0x902"]
     if args.reverse:
         order = tuple(reversed(order))
     picks = []
-    for op, inst in order:
+    for slot, (op, inst) in enumerate(order):
         key = cfg["gemms"][op]
         spec, mkn = cfg["specs"][key]
         name = "shared_kernel" if args.collide else inst
-        picks.append((op, key, spec, mkn, name))
+        picks.append((op, key, spec, mkn, name, kernel_ids[slot]))
 
     print(f"[probe] seq        : {args.seq}")
     print(f"[probe] instance   : {'COLLIDING (same name)' if args.collide else 'distinct'}")
-    for op, _, spec, (m, k, n), inst in picks:
-        print(f"[probe]   {op:8s} {m}x{k}x{n} {spec['method']} -> instance '{inst}'")
+    for op, _, spec, (m, k, n), inst, kid in picks:
+        print(f"[probe]   {op:8s} {m}x{k}x{n} {spec['method']} -> instance '{inst}' "
+              f"kernel_id={kid or 'DEFAULT'}")
 
     # ---- build: chain the second compile onto the first's xclbin -------------------
     xclbin_in, artifacts = "", []
-    for op, key, spec, (m, k, n), inst in picks:
+    for op, key, spec, (m, k, n), inst, kid in picks:
         backend = XRTBackend(
             output_format="xclbin",
             instance_name=inst,
             kernel_name=inst,
+            kernel_id=kid,
             xclbin_input=xclbin_in,
             runtime_loop_tiling_sizes=[2, 2],
             omit_while_true_loop=False,
