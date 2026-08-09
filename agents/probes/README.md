@@ -24,6 +24,8 @@ python3 agents/probes/<probe>.py
 
 | `probe_context_reuse.py` | **`_evict_context`'s corruption is one CELL, not a class — and the ABI `offload`'s next phase needs is a clean one.** A 2×2 on `q_proj` 1024×768×768, four executions of one artifact on one input pair: `elf`+`[2,2]` diverges from its own run 1 by **3.8141e-01** (replicated 2/2), while `elf`+`[1,1]`, `xclbin`+`[2,2]` and `xclbin`+`[1,1]` are all bit-identical 4/4. The evicting control is clean and reproduces the `9.6e-3` reference error the mode's docstring cites. Also: the corruption **does not accumulate** — runs 2-4 are identical to each other. Second independent hardware refutation of "`runtime_loop_tiling_sizes` is inert". | [27](../../docs/plans/transformer-layer-execution-studies/27-common-ladder-result.md) |
 
+| `probe_one_xclbin_n_streams.py` | **`--xclbin-input` chaining does not work, and it fails POSITIONALLY.** Two GEMMs packaged into one xclbin both appear in `get_kernels()`; only the one compiled FIRST runs correctly, and reversing the compile order reverses which breaks. The second times out (`up_proj`) or returns **garbage at `mean_rel_L1` 1.41 with no error raised** (`q_proj`) — the silent one is the one a gate would miss. Both are correct compiled standalone, so chaining is the only variable. Blocks `offload`'s N-streams half at the packaging layer, not the dispatch layer. | [26 §Sizing](../../docs/plans/transformer-layer-execution-studies/26-mode-rebuild-feasibility.md) |
+
 **Why `probe_accum_hoist.py` and `probe_accum_aircc.py` both exist.** `air-opt` with a hand-built
 pass list answers *"does this pass fire"*; it does not answer *"does this compile"*. The two diverge
 wherever a later pass rewrites what was measured — `air-to-aie` normalizing external callee
