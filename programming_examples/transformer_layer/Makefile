@@ -491,4 +491,5 @@ registry-writer-tests:
 
 clean:
 	rm -rf $(BUILD_DIR) __pycache__ runlist_gate_cache block_cache coarse_cache \
-	    offload_cache runlist_cache fused_cache
+	    offload_cache offload_shared_cache runlist_cache fused_cache \
+	    air_shared_*.xclbin air_shared_*.insts.bin

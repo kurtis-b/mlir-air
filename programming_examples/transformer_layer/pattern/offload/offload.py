@@ -143,7 +143,20 @@ from pattern.reference import (  # noqa: E402
 
 #: This mode's ELF cache, relative to the working directory. Its OWN — see the
 #: module footguns.
-OFFLOAD_CACHE_DIR = "offload_cache"
+#:
+#: `[2026-08-09]` The shared-xclbin path gets a SEPARATE directory, for the same
+#: reason two modes never share one: ``KernelCache`` keys the directory by name,
+#: and these two builds produce artifacts with identical NAMES
+#: (``off_gemm_1024x768x768`` either way) over different ABIs. Pointed at one
+#: directory they would trade artifacts whose fingerprints happen to agree, and
+#: the result is numerically valid output attributed to the wrong execution
+#: boundary — which here would mean crediting a 30-reconfiguration run to the
+#: one-reconfiguration claim.
+OFFLOAD_CACHE_DIR = (
+    "offload_shared_cache"
+    if os.environ.get("AIR_OFFLOAD_SHARED_XCLBIN", "") == "1"
+    else "offload_cache"
+)
 
 #: The six projection GEMMs, in dispatch order. The order is the layer's
 #: dataflow and each entry becomes one recorded DispatchVector row. The two
@@ -257,6 +270,28 @@ _GEMM_BACKEND = {
     "omit_while_true_loop": False,
 }
 
+#: `[2026-08-09]` The same settings on the **xclbin** ABI, which is what N
+#: instruction streams under one xclbin requires. `[2,2]` is kept: the tiling is
+#: the mode's validated one, and context reuse -- the thing N streams turns on --
+#: is clean at `[2,2]` under this ABI (it is `elf` + `[2,2]` that corrupts, and
+#: only that; `agents/probes/probe_context_reuse.py`).
+_GEMM_BACKEND_SHARED = dict(_GEMM_BACKEND, output_format="xclbin")
+
+#: Base DPU kernel id for the shared xclbin. Each stream gets `_KERNEL_ID_BASE +
+#: i`, because the merged `AIE_PARTITION` routes a kernel to its PDI -- its array
+#: configuration -- by `dpu_kernel_ids`, and EVERY AIR compile defaults to 0x901.
+#: Two PDIs both claiming 0x901 are indistinguishable to the runtime and the
+#: second kernel runs against the first's configuration: measured as
+#: `ERT_CMD_STATE_TIMEOUT` at one shape and garbage at `mean_rel_L1` 1.41 with no
+#: error raised at another (`agents/probes/probe_one_xclbin_n_streams.py`).
+_KERNEL_ID_BASE = 0x901
+
+#: Whether the mode packages its GEMMs into ONE xclbin. Off by default: the
+#: shared path is newer than the gated ELF one, and this keeps the mode's
+#: recorded provenance switchable in one place rather than by editing kwargs.
+#: `AIR_OFFLOAD_SHARED_XCLBIN=1` turns it on.
+SHARED_XCLBIN = os.environ.get("AIR_OFFLOAD_SHARED_XCLBIN", "") == "1"
+
 
 def _check_no_object_collision(specs):
     """Raise if two GEMMs share an ``mm_*.o`` name without sharing its contents.
@@ -333,10 +368,35 @@ def offload_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
     }
     _check_no_object_collision(specs)
     artifacts = {key: f"off_gemm_{m}x{k}x{n}" for key, (_, (m, k, n)) in specs.items()}
-    backend_kwargs = {
-        artifacts[key]: dict(_GEMM_BACKEND, instance_name=_METHOD_FUNC[spec["method"]])
-        for key, (spec, _) in specs.items()
-    }
+    if SHARED_XCLBIN:
+        # One xclbin over every shape, so the array is configured ONCE. Both
+        # identifiers must be distinct per stream and neither defaults usefully:
+        # `instance_name` is matched by SUBSTRING when the kernel is looked up,
+        # and `kernel_id` selects the PDI. Note the shipped ELF path gives every
+        # `drain` GEMM the same `instance_name` (`matmul_bf16`) -- harmless when
+        # each carries its own xclbin, fatal when they share one.
+        backend_kwargs = {
+            artifacts[key]: dict(
+                _GEMM_BACKEND_SHARED,
+                # THREE identifiers, all three required and none defaulting
+                # usefully. `kernel_name` is the EMBEDDED_METADATA entry and
+                # xclbinutil REFUSES a duplicate ("Kernel name already exists in
+                # the EMBEDDED_METADATA section: 'MLIR_AIE'") -- the one failure
+                # of the three that is loud. `instance_name` is what the kernel
+                # lookup substring-matches. `kernel_id` selects the PDI.
+                kernel_name=f"{_METHOD_FUNC[spec['method']]}_{key}",
+                instance_name=f"{_METHOD_FUNC[spec['method']]}_{key}",
+                kernel_id=hex(_KERNEL_ID_BASE + i),
+            )
+            for i, (key, (spec, _)) in enumerate(specs.items())
+        }
+    else:
+        backend_kwargs = {
+            artifacts[key]: dict(
+                _GEMM_BACKEND, instance_name=_METHOD_FUNC[spec["method"]]
+            )
+            for key, (spec, _) in specs.items()
+        }
     gemms = {
         "q_proj": "proj",
         "k_proj": "proj",
@@ -361,6 +421,9 @@ def offload_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
         # than written as a literal so the gate's count and the run's count
         # cannot disagree at a shape with a different head count.
         "n_dispatches": len(OFFLOAD_GEMMS) + 2 * num_heads,
+        # Resolved into the config rather than read from the environment at each
+        # use, so one run cannot be half shared and half not.
+        "shared_xclbin": SHARED_XCLBIN,
     }
 
 
@@ -393,6 +456,23 @@ def describe_offload(cfg):
         f"    attention on device: 2 GEMMs x {cfg['num_heads']} heads = "
         f"{2 * cfg['num_heads']} dispatches, host keeps scale + softmax"
     )
+    # THE MODE'S OWN AXIS, printed so a gate can pin it. Reconfiguration is not
+    # one of the six dispatch-vector fields and cannot be: the vector is
+    # identical between these two paths, because the mode makes one run_sequence
+    # call per GEMM either way. What changes is how many times the array is
+    # configured to serve them.
+    if cfg["shared_xclbin"]:
+        print(
+            f"    reconfiguration: ONE xclbin over {len(cfg['artifacts'])} shapes, "
+            f"{cfg['n_dispatches']} dispatches share 1 hw_context "
+            f"(N instruction streams, array configured once)"
+        )
+    else:
+        print(
+            f"    reconfiguration: {len(cfg['artifacts'])} xclbins, "
+            f"{cfg['n_dispatches']} hw_context loads for {cfg['n_dispatches']} "
+            f"dispatches (one per dispatch; see _evict_context)"
+        )
 
 
 def _build_offload_module(cfg, key):
@@ -442,6 +522,14 @@ def compile_offload_artifacts(cache, cfg, run_only=False):
         modules[key] = module
         stale.append(key)
 
+    if SHARED_XCLBIN and stale:
+        # A chain cannot be built piecemeal: only the LAST xclbin holds every
+        # kernel, so a partial rebuild would leave the reused artifacts pointing
+        # at a file without theirs. Rebuild the whole chain whenever any member
+        # is stale -- which is also why `reused` is recomputed as empty here.
+        stale, reused = list(names), []
+        modules = {key: _build_offload_module(cfg, key) for key in stale}
+
     for key in stale:
         spec, _ = cfg["specs"][key]
         print(f"== external objects for {names[key]} ==")
@@ -452,10 +540,19 @@ def compile_offload_artifacts(cache, cfg, run_only=False):
             sym_suffix=spec["sym_suffix"],
             out_name=spec["obj"],
         )
-    for key in stale:
-        name = names[key]
-        print(f"== compiling {name} ==")
-        cache.compile_and_cache(name, modules[key], cfg["backend_kwargs"][name])
+
+    if SHARED_XCLBIN:
+        if stale:
+            print(f"== compiling {len(stale)} kernels into ONE xclbin ==")
+            cache.compile_shared_xclbin(
+                [(names[key], modules[key], cfg["backend_kwargs"][names[key]])
+                 for key in stale]
+            )
+    else:
+        for key in stale:
+            name = names[key]
+            print(f"== compiling {name} ==")
+            cache.compile_and_cache(name, modules[key], cfg["backend_kwargs"][name])
     if reused:
         print(f"  reusing {len(reused)} cached offload artifacts: {', '.join(reused)}")
     cache._save_manifest()
@@ -497,14 +594,25 @@ def _dispatch_gemm(cache, cfg, op_name, a, b):
     (``run_sequence`` returns zero-copy views into pool memory, and the next
     dispatch reuses the slot) and ``vector_row`` is the call's
     ``DispatchVector.as_row()`` — one submission, one entry, recorded by the
-    shared implementation and never hand-built here. Each dispatch runs in a
-    FRESH ``hw_context`` — see ``_evict_context`` for the measurement that
-    forces that.
+    shared implementation and never hand-built here.
+
+    **Whether this dispatch reconfigures the array is the mode's whole point.**
+    On the shipped ELF path each dispatch runs in a FRESH ``hw_context`` — see
+    ``_evict_context`` for the measurement that forces it — so the layer pays 30
+    reconfigurations, which is the MAXIMUM rather than the minimum the mode is
+    defined to isolate. Under ``SHARED_XCLBIN`` every GEMM lives in one xclbin,
+    the context is loaded once and never evicted, and moving between shapes costs
+    an instruction swap. The dispatch VECTOR is identical either way — this mode
+    makes one ``run_sequence`` call per GEMM regardless, so submissions stay at
+    30 — which is what makes the existing gate a correctness check on the change
+    rather than a measurement of it. The reconfiguration count is recorded
+    separately by ``describe_offload``.
     """
     key = cfg["gemms"][op_name]
     spec, (m, k, n) = cfg["specs"][key]
     artifact = cfg["artifacts"][key]
-    _evict_context(cache, artifact)
+    if not SHARED_XCLBIN:
+        _evict_context(cache, artifact)
 
     arrays = {
         "a": np.ascontiguousarray(a),
@@ -768,7 +876,19 @@ def prepare_offload(shape, seed=42):
         # (the shared validation raises, failing the run) or drifted totals
         # fail in the suite before the driver's comparison sees them.
         print_dispatch_totals("offload", vector_rows)
+        # THE MODE'S OWN AXIS, MEASURED. The six-field vector above cannot carry
+        # it -- it is identical on both paths, because the mode makes one
+        # `run_sequence` call per GEMM whether the array is configured once or
+        # thirty times. This counts the configurations themselves, so the claim
+        # is read off a counter rather than asserted from the build settings.
+        loads, attaches = cache.reconfiguration_counts()
+        print(
+            f"[offload] reconfiguration: context_loads {loads} "
+            f"kernel_attaches {attaches} over {cfg['n_dispatches']} dispatches"
+        )
         return [boundaries["output"]], {
+            "context_loads": loads,
+            "kernel_attaches": attaches,
             "stages": stages,
             "stages_passed": clean == len(stages),
             "dispatch_vectors": vector_rows,

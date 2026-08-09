@@ -2,6 +2,7 @@ runlist_gate_cache/
 block_cache/
 coarse_cache/
 offload_cache/
+offload_shared_cache/
 runlist_cache/
 fused_cache/
 build_peano/
@@ -16,6 +17,12 @@ air.mlir
 air.elf
 air.insts.bin
 air.xclbin
+# The shared-xclbin chain writes one intermediate per link (`air_shared_0`..N):
+# each aircc invocation needs its OWN output name, because feeding a compile the
+# file it is about to write makes xclbinutil refuse. Only the last link holds
+# every kernel, and KernelCache copies that one into the mode's cache.
+air_shared_*.xclbin
+air_shared_*.insts.bin
 air_project/
 
 # opcheck.py writes its machine-readable verdicts here on every run. They are

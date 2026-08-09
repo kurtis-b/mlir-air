@@ -146,6 +146,9 @@ class XRTBackend(AirBackend):
         self.trace_offset = trace_offset
         self.trace_size = trace_size
         self.currently_loaded = False
+        #: The binary behind this backend's context once loaded; `attach_kernel`
+        #: refuses to bind a kernel from any other one.
+        self.loaded_binary = None
         self.output_format = output_format
         self.kernel_name = kernel_name
         self.instance_name = instance_name
@@ -547,6 +550,11 @@ class XRTBackend(AirBackend):
         # Determine the loading mode based on file extension
         is_elf = artifact.output_binary.endswith(".elf")
 
+        # Which binary this backend's context belongs to. `attach_kernel` checks
+        # it: binding a kernel from a DIFFERENT xclbin onto this context would
+        # execute it against the wrong array configuration.
+        self.loaded_binary = artifact.output_binary
+
         # create the device
         self.device = xrt.device(0)
 
@@ -711,6 +719,116 @@ class XRTBackend(AirBackend):
         self.currently_loaded = True
         return invoker
 
+    def attach_kernel(self, artifact):
+        """Bind ANOTHER kernel out of the xclbin this backend already loaded.
+
+        `[2026-08-09]` This is the runtime half of "N instruction streams under
+        one xclbin": several AIR kernels packaged into one xclbin by chaining
+        `xclbin_input`, then executed from ONE `hw_context` -- the array is
+        configured once and moving between kernels costs an instruction swap
+        rather than a reconfiguration.
+
+        `load()` builds a context per artifact. This reuses the context already
+        standing and binds only what is per-kernel: the `xrt.kernel` and its own
+        instruction BO. Returns a view exposing `kernel`, `bo_instr` and
+        `instr_v`, which is the surface a dispatch loop reads -- so a caller can
+        treat it exactly like a loaded backend without knowing they are shared.
+
+        Two identifiers must be distinct per stream, and NEITHER is checked here
+        because both fail at a distance:
+
+        - `instance_name`, the kernel's name in the xclbin. The lookup below is a
+          SUBSTRING match, so two kernels sharing a name silently return whichever
+          appears first -- the wrong program with the right buffers.
+        - `kernel_id`, which routes the kernel to its PDI (its array
+          configuration) in the merged `AIE_PARTITION`. Every AIR compile
+          defaults to `0x901`, so two PDIs both claiming it are indistinguishable
+          to the runtime and the second kernel executes against the first's
+          configuration. Measured: `ERT_CMD_STATE_TIMEOUT` at one shape and
+          garbage at `mean_rel_L1` 1.41 with no error raised at another.
+
+        Reproduce both with `agents/probes/probe_one_xclbin_n_streams.py`.
+
+        Args:
+            artifact: an `XRTCompileArtifact` whose `output_binary` is the SAME
+                xclbin this backend loaded, and whose `kernel` names a different
+                kernel inside it.
+
+        Returns:
+            An object with `kernel`, `bo_instr` and `instr_v`.
+        """
+        import pyxrt as xrt
+
+        if self.context is None or self.xclbin is None:
+            raise AirBackendError(
+                "attach_kernel needs a backend with an xclbin already loaded; "
+                "call load() on the first artifact of the shared xclbin first."
+            )
+        if artifact.output_binary != self.loaded_binary:
+            raise AirBackendError(
+                f"attach_kernel expects the SAME xclbin this backend loaded "
+                f"({self.loaded_binary}), got {artifact.output_binary}. Sharing a "
+                "context across two different xclbins would execute one kernel "
+                "against the other's array configuration."
+            )
+        if not artifact.insts or not os.path.isfile(artifact.insts):
+            raise AirBackendError(
+                f"attach_kernel needs this kernel's own instruction stream; "
+                f"{artifact.insts!r} is missing. Under one xclbin the kernels "
+                "share a configuration and differ ONLY in their instructions."
+            )
+
+        matches = [
+            k.get_name() for k in self.xclbin.get_kernels() if artifact.kernel in k.get_name()
+        ]
+        if not matches:
+            raise AirBackendError(
+                f"Kernel '{artifact.kernel}' not found in "
+                f"'{artifact.output_binary}'. Present: "
+                f"{[k.get_name() for k in self.xclbin.get_kernels()]}"
+            )
+        if len(matches) > 1:
+            # The substring match cannot choose, and choosing wrong is silent.
+            raise AirBackendError(
+                f"Kernel name '{artifact.kernel}' matches {len(matches)} kernels "
+                f"in '{artifact.output_binary}': {matches}. The lookup is a "
+                "substring match, so an ambiguous name would silently select the "
+                "wrong program. Give each stream a distinct instance_name."
+            )
+
+        kernel = xrt.kernel(self.context, matches[0])
+        with open(artifact.insts, "rb") as f:
+            instr_v = np.frombuffer(f.read(), dtype=np.uint32).copy()
+        bo_instr = xrt.bo(
+            self.device, len(instr_v) * 4, xrt.bo.cacheable, kernel.group_id(1)
+        )
+        bo_instr.write(instr_v.tobytes(), 0)
+
+        class _AttachedKernel:
+            """One stream's per-kernel state over a shared context.
+
+            Overrides only what is PER KERNEL -- the `xrt.kernel` and its own
+            instruction stream -- and delegates everything else to the backend
+            that owns the context (`device`, `context`, `xclbin`, ...). Written as
+            a proxy rather than a fixed attribute list so a caller reading some
+            other backend attribute gets the host's value instead of an
+            `AttributeError`; the surface a dispatch loop touches is not fully
+            enumerable from here.
+            """
+
+            def __init__(self, host, kernel, bo_instr, instr_v):
+                # Bypass __setattr__/__getattr__ recursion on the proxy target.
+                object.__setattr__(self, "_host", host)
+                object.__setattr__(self, "kernel", kernel)
+                object.__setattr__(self, "bo_instr", bo_instr)
+                object.__setattr__(self, "instr_v", instr_v)
+
+            def __getattr__(self, item):
+                # Only reached for attributes not set above.
+                return getattr(object.__getattribute__(self, "_host"), item)
+
+        return _AttachedKernel(self, kernel, bo_instr, instr_v)
+
     def compile_and_load(self, module):
         """
         Compile and load a module in one step.
@@ -735,4 +853,5 @@ class XRTBackend(AirBackend):
         self.device = None
         self.bo_instr = None
         self.instr_v = None
+        self.loaded_binary = None
         self.currently_loaded = False

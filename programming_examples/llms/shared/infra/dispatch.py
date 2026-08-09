@@ -216,7 +216,9 @@ class Submission:
         return self.artifacts[0]
 
 
-def plan_submissions(steps, artifact_of, require_single=False, elf_abi=True):
+def plan_submissions(
+    steps, artifact_of, require_single=False, elf_abi=True, config_of=None
+):
     """Group a dispatch sequence into the submissions the hardware allows.
 
     Under the **ELF ABI** every step is aggregatable: each artifact is loaded
@@ -228,18 +230,41 @@ def plan_submissions(steps, artifact_of, require_single=False, elf_abi=True):
     Under the **xclbin ABI** it is not: the array configuration comes from the
     xclbin behind the context, so entries from another artifact execute against
     the wrong configuration and return wrong numbers with no error raised
-    (05a §4). The sequence is therefore split at every artifact change.
+    (05a §4). The sequence is therefore split wherever the *configuration*
+    changes.
+
+    **Configuration identity, not artifact identity, is what the xclbin rule is
+    about.** `[2026-08-09]` Two artifacts compiled into ONE xclbin — N
+    instruction streams under one array configuration, which is `offload`'s
+    reconfiguration-minimizing mechanism — share a configuration by construction,
+    so the premise behind the split does not hold for them and they may share a
+    runlist. `config_of` expresses that; artifact identity is merely its default
+    proxy, which is exactly right when every artifact carries its own xclbin.
+
+    Two ways a caller can reach the shared-configuration case, and only one of
+    them needs this parameter. If the artifacts each record the merged xclbin as
+    their `output_binary`, the default proxy already compares equal and the
+    grouping is right without passing anything — they are distinguished by kernel
+    name, not by file. `config_of` is for the case where the artifacts keep
+    distinct identities (their own paths, or their own cache entries) while
+    sharing one configuration, and it is the semantically correct key either way:
+    what the rule is about is the configuration behind the context, and a file
+    path is only ever a stand-in for it.
 
     Args:
         steps: ordered list of `DispatchStep`.
-        artifact_of: callable step-kernel-name -> artifact identity. Under the
-            xclbin ABI two steps may share a runlist only if these compare equal.
+        artifact_of: callable step-kernel-name -> artifact identity. Names the
+            artifacts a `Submission` spans, and is the default configuration key.
         require_single: raise `RunlistSplitError` instead of splitting. Callers
             that are measuring a "one submission per layer" mode pass True so a
             silent split cannot be recorded as an aggregated dispatch.
         elf_abi: True when the artifacts are ELFs. Defaults True because that is
             the path the study's artifacts take; pass it explicitly rather than
             relying on the default when the ABI is not statically known.
+        config_of: callable step-kernel-name -> array-configuration identity,
+            for the xclbin ABI. Defaults to `artifact_of`, which reproduces the
+            one-xclbin-per-artifact behaviour exactly. Pass the shared xclbin's
+            path when several artifacts were packaged into one.
 
     Returns:
         list of `Submission`.
@@ -247,10 +272,12 @@ def plan_submissions(steps, artifact_of, require_single=False, elf_abi=True):
     Raises:
         RunlistSplitError: `require_single` and the sequence spans configurations.
     """
+    config_of = config_of or artifact_of
     subs = []
+    configs = []
     for idx, step in enumerate(steps):
         art = artifact_of(step.kernel)
-        mergeable = subs and (elf_abi or subs[-1].artifacts == (art,))
+        mergeable = subs and (elf_abi or configs[-1] == config_of(step.kernel))
         if mergeable:
             sub = subs[-1]
             sub.steps = sub.steps + (step,)
@@ -258,6 +285,7 @@ def plan_submissions(steps, artifact_of, require_single=False, elf_abi=True):
                 sub.artifacts = sub.artifacts + (art,)
         else:
             subs.append(Submission(artifacts=(art,), steps=(step,), first_index=idx))
+            configs.append(config_of(step.kernel))
 
     if require_single and len(subs) > 1:
         spanned = [s.context_artifact for s in subs]

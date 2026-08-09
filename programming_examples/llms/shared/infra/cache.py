@@ -336,6 +336,11 @@ class KernelCache:
         self.artifacts = {}  # name -> XRTCompileArtifact
         self.launch_counts = {}  # name -> {"air_launches":.., "herd_launches":..}
         self._loaded = {}  # name -> (backend, invoker) for XRT context reuse
+        #: How many times the ARRAY was configured, and how many kernels were
+        #: bound onto a configuration already standing. See
+        #: `reconfiguration_counts`.
+        self.context_loads = 0
+        self.kernel_attaches = 0
         self._cached_bos = {}  # name -> list of xrt.bo for BO reuse
         self._pools = {}  # PoolPlan.signature -> BoPool, for run_sequence
         self._instr_synced = set()  # artifact names whose instruction BO is resident
@@ -447,8 +452,120 @@ class KernelCache:
 
         print(f"  Compiled {name}: {compile_time:.1f}s -> {cached_binary.name}")
 
+    def compile_shared_xclbin(self, entries, output_binary_name="air"):
+        """Compile several modules into ONE xclbin, N instruction streams.
+
+        `[2026-08-09]` The build half of `offload`'s reconfiguration-minimizing
+        mechanism. Each module is compiled in turn with `xclbin_input` pointing at
+        the previous one's xclbin, so aircc packages every kernel into a single
+        file; the LAST xclbin written is the one holding them all, and every
+        artifact is recorded against it. The kernels then share one array
+        configuration and differ only in their instruction stream.
+
+        `compile_and_cache` cannot express this: it caches each compile's own
+        output, and in a chain every output but the last is missing kernels.
+
+        Args:
+            entries: ordered list of `(name, mlir_module, backend_kwargs)`. Each
+                `backend_kwargs` MUST carry `output_format="xclbin"` and a
+                distinct `kernel_name`, `instance_name` AND `kernel_id` -- see the
+                failure modes above and in `XRTBackend.attach_kernel`.
+                `xclbin_input` is supplied here and must not be set by the caller.
+            output_binary_name: base name aircc writes per compile.
+
+        The compile ORDER is the chain order and is therefore load-bearing; it is
+        taken from `entries` rather than from dict iteration so it is explicit.
+        """
+        from air.backend.xrt import XRTBackend, XRTCompileArtifact
+        from shared.infra.dispatch import LaunchCounts
+
+        if not entries:
+            return
+        # Three identifiers must be distinct per stream, and they fail three
+        # different ways: a duplicate `kernel_name` makes xclbinutil REFUSE the
+        # merge ("Kernel name already exists in the EMBEDDED_METADATA section"),
+        # a duplicate `instance_name` makes the kernel lookup's SUBSTRING match
+        # silently return the wrong program, and a duplicate `kernel_id` makes
+        # the second kernel run against the first's array configuration. Only the
+        # first is loud, so all three are checked here.
+        seen_names, seen_instances, seen_ids = {}, {}, {}
+        for name, _, kwargs in entries:
+            if kwargs.get("output_format") != "xclbin":
+                raise ValueError(
+                    f"{name}: a shared xclbin needs output_format='xclbin', got "
+                    f"{kwargs.get('output_format')!r}"
+                )
+            for field, seen in (
+                ("kernel_name", seen_names),
+                ("instance_name", seen_instances),
+                ("kernel_id", seen_ids),
+            ):
+                value = kwargs.get(field)
+                if not value:
+                    raise ValueError(
+                        f"{name}: a shared xclbin needs an explicit {field}. "
+                        "Without it every stream takes the same default and the "
+                        "second kernel runs against the first's configuration."
+                    )
+                if value in seen:
+                    raise ValueError(
+                        f"{name}: {field}={value!r} is already used by "
+                        f"{seen[value]!r}. Streams sharing an xclbin must differ "
+                        "in both; a collision fails silently at run time."
+                    )
+                seen[value] = name
+            if kwargs.get("xclbin_input"):
+                raise ValueError(
+                    f"{name}: xclbin_input is supplied by compile_shared_xclbin; "
+                    "setting it here would break the chain."
+                )
+
+        prepare_air_project(quant="bf16")
+        chained, kernels = "", {}
+        for i, (name, module, kwargs) in enumerate(entries):
+            self.launch_counts[name] = LaunchCounts.from_module(module).as_dict()
+            self._log(f"Compiling {name} into the shared xclbin...")
+            backend = XRTBackend(**dict(kwargs, xclbin_input=chained))
+            t0 = time.time()
+            # Each link needs its OWN output name. aircc writes relative to cwd,
+            # so reusing one base name makes link i+1's input and output the same
+            # file and xclbinutil refuses: "The following output file is also used
+            # for input". The chain is what makes these distinct compiles.
+            artifact = backend.compile(
+                module, output_binary_name=f"{output_binary_name}_shared_{i}"
+            )
+            self.profiler.record_compile(name, time.time() - t0)
+            # aircc writes relative to cwd and every compile uses the same base
+            # name, so the chain input must be an absolute path captured now.
+            chained = str(Path(artifact.output_binary).resolve())
+            cached_insts = None
+            if artifact.insts and Path(artifact.insts).exists():
+                cached_insts = str(self.cache_dir / f"{name}.insts.bin")
+                shutil.copy2(artifact.insts, cached_insts)
+            # The kernel is found in the xclbin by INSTANCE name, not by the
+            # `MLIR_AIE` default `compile` records for xclbin output.
+            kernels[name] = (kwargs["instance_name"], cached_insts)
+            backend.unload()
+            print(f"  Compiled {name} -> shared xclbin ({kwargs['instance_name']})")
+
+        shared = self.cache_dir / f"{entries[-1][0]}_shared.xclbin"
+        shutil.copy2(chained, shared)
+        for name, (instance, insts) in kernels.items():
+            self.artifacts[name] = XRTCompileArtifact(str(shared), instance, insts)
+        print(
+            f"  Shared xclbin: {shared.name} holding {len(kernels)} kernels "
+            f"({', '.join(i for i, _ in kernels.values())})"
+        )
+
     def ensure_loaded(self, name, backend_kwargs):
         """Load an artifact's XRT context once and cache it.
+
+        Artifacts that share an `output_binary` share ONE context: the first
+        loads it, the rest bind their own kernel and instruction BO onto the
+        standing context via `XRTBackend.attach_kernel`. That is what makes N
+        instruction streams under one xclbin cost one array configuration
+        instead of N -- and with distinct artifacts it changes nothing, because
+        no two of them compare equal.
 
         Lock path note: `/tmp/npu.lock` is intentionally a different inode from
         the `/tmp/mlir-air-npu.lock` file the project's outer `flock` convention
@@ -465,12 +582,69 @@ class KernelCache:
                 f"Available: {list(self.artifacts.keys())}"
             )
         if name not in self._loaded:
-            backend = XRTBackend(**backend_kwargs)
-            with filelock.FileLock("/tmp/npu.lock"):
-                invoker = backend.load(self.artifacts[name])
-            self._loaded[name] = (backend, invoker)
-            self._log(f"Loaded {name} (XRT context cached)")
+            binary = self.artifacts[name].output_binary
+            shares_with = [
+                other
+                for other, art in self.artifacts.items()
+                if other in self._loaded and art.output_binary == binary
+            ]
+            host = next(
+                (
+                    other
+                    for other, (backend, _) in self._loaded.items()
+                    if getattr(backend, "loaded_binary", None) == binary
+                ),
+                None,
+            )
+            # A stale `air` install is the reason this would be reachable, and it
+            # must not pass quietly: `attach_kernel`/`loaded_binary` live in
+            # `python/air/backend/xrt.py`, and the runtime imports from
+            # `install-xrt/`. Without the check, an un-installed change degrades
+            # to one context PER ARTIFACT while every printed line still claims
+            # one xclbin -- the mode would report a reconfiguration reduction it
+            # did not make.
+            if shares_with and host is None:
+                raise RuntimeError(
+                    f"'{name}' shares an xclbin with {shares_with} but no loaded "
+                    f"backend reports it. The installed air backend is missing "
+                    f"`loaded_binary`/`attach_kernel` -- almost certainly a stale "
+                    f"install: edits to python/air/backend/xrt.py need an install "
+                    f"step before the runtime sees them. Sharing an xclbin without "
+                    f"sharing the context would configure the array once per "
+                    f"artifact while the mode claims once per layer."
+                )
+            if host is not None:
+                backend = self._loaded[host][0]
+                with filelock.FileLock("/tmp/npu.lock"):
+                    attached = backend.attach_kernel(self.artifacts[name])
+                self._loaded[name] = (attached, None)
+                self.kernel_attaches += 1
+                self._log(f"Attached {name} to {host}'s context (shared xclbin)")
+            else:
+                backend = XRTBackend(**backend_kwargs)
+                with filelock.FileLock("/tmp/npu.lock"):
+                    invoker = backend.load(self.artifacts[name])
+                self._loaded[name] = (backend, invoker)
+                self.context_loads += 1
+                self._log(f"Loaded {name} (XRT context cached)")
         return self._loaded[name]
+
+    def reconfiguration_counts(self):
+        """`(context_loads, kernel_attaches)` since this cache was built.
+
+        `[2026-08-09]` The observable behind `offload`'s reconfiguration claim,
+        and it is deliberately NOT one of the six dispatch-vector fields: the
+        vector is identical whether the mode loads one context or thirty,
+        because it makes one `run_sequence` call per GEMM either way. What
+        separates the two is how often the ARRAY is configured, which is this.
+
+        A context load configures the array; an attach binds another kernel and
+        its instruction stream onto a configuration already standing. Evicting a
+        context (as the ELF path must, see `pattern/offload`'s
+        `_evict_context`) makes the next use count as another load, which is
+        what makes the two paths distinguishable here rather than only in prose.
+        """
+        return self.context_loads, self.kernel_attaches
 
     def pool_for(self, plan, alloc, sync_to_device, sync_from_device):
         """The `BoPool` backing one `PoolPlan`, created on first use.

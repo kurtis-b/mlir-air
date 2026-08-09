@@ -134,6 +134,83 @@ def test_empty_sequence_is_no_submissions():
     assert plan_submissions([], artifact_of) == []
 
 
+# --- N instruction streams under one xclbin --------------------------------
+#
+# `[2026-08-09]` Demonstrated on hardware by
+# `agents/probes/probe_one_xclbin_n_streams.py`: two GEMMs of different shape
+# chained with `--xclbin-input` both execute correctly from ONE `hw_context`,
+# given a distinct `instance_name` AND a distinct `kernel_id` per stream. That
+# makes the xclbin split rule a question about CONFIGURATION identity rather
+# than artifact identity, which is what `config_of` expresses.
+
+
+def test_config_of_defaults_to_artifact_of():
+    """The default must reproduce one-xclbin-per-artifact behaviour EXACTLY.
+
+    Every shipped model dispatches through this function; a default that changed
+    grouping would change their submission counts silently.
+    """
+    steps = [step("qkv", "x", "y"), step("attn", "y", "z"), step("ffn", "z", "w")]
+    assert [
+        (s.artifacts, len(s))
+        for s in plan_submissions(steps, artifact_of, elf_abi=False)
+    ] == [
+        (s.artifacts, len(s))
+        for s in plan_submissions(steps, artifact_of, elf_abi=False, config_of=artifact_of)
+    ]
+
+
+def test_xclbin_entries_sharing_one_xclbin_share_a_submission():
+    """N streams, one array configuration: the split premise does not apply.
+
+    The three artifacts are distinct files but were packaged into one xclbin, so
+    the configuration behind the context is the same for all three and entries
+    may share a runlist -- which is the whole of `offload`'s
+    reconfiguration-minimizing claim.
+    """
+    steps = [step("qkv", "x", "y"), step("attn", "y", "z"), step("ffn", "z", "w")]
+    subs = plan_submissions(
+        steps, artifact_of, elf_abi=False, config_of=lambda k: "shared.xclbin"
+    )
+    assert len(subs) == 1
+    assert len(subs[0]) == 3
+    assert subs[0].artifacts == ("a.elf", "b.elf", "c.elf")
+
+
+def test_xclbin_still_splits_when_configurations_differ():
+    """Two shared xclbins is still two configurations, so still two submissions."""
+    config = {"qkv": "one.xclbin", "attn": "one.xclbin", "ffn": "two.xclbin"}
+    steps = [step("qkv", "x", "y"), step("attn", "y", "z"), step("ffn", "z", "w")]
+    subs = plan_submissions(
+        steps, artifact_of, elf_abi=False, config_of=lambda k: config[k]
+    )
+    assert [len(s) for s in subs] == [2, 1]
+
+
+def test_require_single_is_satisfied_by_one_shared_xclbin():
+    """The clause `offload` will gate on once its N streams land."""
+    steps = [step("qkv", "x", "y"), step("attn", "y", "z")]
+    subs = plan_submissions(
+        steps,
+        artifact_of,
+        require_single=True,
+        elf_abi=False,
+        config_of=lambda k: "shared.xclbin",
+    )
+    assert len(subs) == 1
+
+
+def test_config_split_is_contiguous_like_the_artifact_split():
+    """A->B->A on configurations is three submissions, not two merged ones."""
+    config = {"qkv": "one.xclbin", "attn": "two.xclbin"}
+    steps = [step("qkv", "x", "y"), step("attn", "y", "z"), step("qkv", "z", "w")]
+    subs = plan_submissions(
+        steps, artifact_of, elf_abi=False, config_of=lambda k: config[k]
+    )
+    assert len(subs) == 3
+    assert subs[0].first_index == 0 and subs[2].first_index == 2
+
+
 # --- per-run ABI -----------------------------------------------------------
 
 
