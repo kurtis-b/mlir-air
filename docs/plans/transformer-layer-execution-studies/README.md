@@ -39,6 +39,7 @@ how to use MLIR-AIR.
 | [23-rules-and-open-items.md](23-rules-and-open-items.md) | **Read before building anything.** The design rules that govern later work — the per-column shim budget, the L3-side offset rule, one process per measurement — and the open items nobody has claimed |
 | [24-phase-h10-non-constant-bd-offsets.md](24-phase-h10-non-constant-bd-offsets.md) | **Substance verified, tamper baseline not clean.** The silent miscompile J7b lost a session to, located: an unchecked `std::optional` deref in `air-to-aie` |
 | [25-first-study-result-sequence-ladder.md](25-first-study-result-sequence-ladder.md) | **`[retracted]` Do not cite the crossover or the slopes.** It ranks four *implementations* that predate the corrected taxonomy, and its explanation — that the slopes split on attention placement — is now **unreproducible**, because as of 2026-08-09 all four modes run attention on the device. The measurement stands as a record of what was built on 2026-08-08 |
+| [28-coarse-blend-space.md](28-coarse-blend-space.md) | **What `coarse`'s blend is a blend OF, and what selects it.** The space is two axes and six cells, derived from the artifact plans — and **two of the six ARE `fused` and `runlist`**, so "pick the best cell" collapses the taxonomy. Resolves it: the blend is selected by **what the workload admits**, and `coarse` is the mode you use where `fused` does not fit. **Measure it at 2048/4096, not at 1024**, or it reports `fused` under another name |
 | [27-common-ladder-result.md](27-common-ladder-result.md) | **The first four-mode comparison at one sequence length**, 512 and 1024, walked twice. DRAM traffic orders exactly as the taxonomy predicts; `fused` fastest and `coarse` second at both lengths; `runlist` and `offload` indistinguishable. **A crossover that walk 1 reported did not survive walk 2** — read its §The crossover that did not survive before running one walk of anything |
 | [26-mode-rebuild-feasibility.md](26-mode-rebuild-feasibility.md) | **The feasibility record for the mode rebuilds — read it for its CORRECTIONS, not as current state.** It opens with six things the plan had wrong, three of which have since been settled by hardware, two of them against what it concluded. **§4 is retracted** (`runtime_loop_tiling_sizes` is not inert) and **§5 is corrected twice** (the missing row-max is the single-shot kernel's, not the streaming family's; `SM_LOG2E` is a base conversion, not a blocking scale). Its §6 was right and is fixed |
 
@@ -80,7 +81,7 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | **The first result on the corrected axis** | none; a measurement | **recorded** 2026-08-09. `runlist` moves **190,513,152** bytes against `offload`'s **970,457,088** for the same layer — **5.1×**, produced entirely by where the softmax runs. `offload` puts it on the host, so every `[4096, 4096]` score matrix crosses DRAM twice per head; `runlist` keeps it on the array. Two modes differing in exactly the corrected taxonomy's variable — reconfiguration against DRAM traffic — rather than in attention placement, which is the confound every earlier comparison carried |
 | `attention_path` retired as a covariate | none; a consequence | **recorded** 2026-08-09. With `runlist` on the device, **all four modes are**. The first sequence ladder's headline — slopes splitting on attention placement, host 1.23–1.27 against device 1.03–1.17 — **cannot be reproduced**, because no mode sits on the host side any more. `study/test_attention_path.py` now asserts that end state rather than the two-value invariant it was written with |
 | **The four modes at one sequence length** | none; a measurement, walked twice | **recorded** 2026-08-09. 512 and 1024, all four modes, 8/8 rungs twice. **DRAM traffic orders as the taxonomy predicts at both lengths** — `fused` 42.5 MB < `coarse` 44.0 < `runlist` 55.2 < `offload` 99.1 at 1024, byte-identical across walks. On latency `fused` is fastest and `coarse` second at both lengths; **`runlist` and `offload` are indistinguishable** — averages and minimums disagree, and each flips between walks. **A crossover walk 1 reported did NOT survive walk 2.** `offload` alone drifts up to 120% intra-walk, corroborating [03](03-measurement-model.md)'s wider band for it from a fresh measurement. Trap 1 below is closed by this; the SPECS rows still span two lengths, so build cross-mode tables from a ladder run, never from the catalogue. See [27](27-common-ladder-result.md) |
-| Corrected `coarse` | its own phase | not started; a blend of `runlist` and `fused`, so both must be right first. **Its decision procedure is smaller than "a choice per operator" suggests**: `fused_config` resolves to exactly three artifacts, so the blend is a choice over three regions (2 × 2 × 3 = 12 configurations), not twenty operators — and three of the twelve are already built and gated (`fused`, `runlist`, and today's `coarse` are three of the cells) |
+| Corrected `coarse` | its own phase | not started; a blend of `runlist` and `fused`, so both must be right first. **Its decision procedure is smaller than "a choice per operator" suggests**: `fused` and `coarse` build their FRONT from the same two modules and differ in the tail alone, so the blend has two axes — front {block-form, runlist-form} × tail {stitched, banded, decomposed} = **6 cells**. Two of the six ARE modes (`fused` and `runlist`), and today's `coarse` is already an interior cell; what it lacks is provenance for the choice, not blendedness |
 | G — unattended runner + CI | Full profile run completes with a complete `results_manifest.json` | not started |
 | Goal 1 — sliding window | `make verify` passes with window-crossing prompts | not started |
 | Goal 2 — quantization | Second quantized model passes a gate that exercises the quantized path | not started |
@@ -175,17 +176,38 @@ smaller than "a choice per operator" implies.** It is defined as a *per-workload
 and `fused`, and nothing in the port expresses such a choice: the D2 block `coarse` currently wraps
 is a fixed five-kernel sequence.
 
-`[2026-08-09]` **A fused region is not free-form — it is an artifact somebody stitched.**
-`fused_config` (`pattern/fused/fused.py:381-420`) resolves to exactly **three**: `qkv_proj`,
-`mha_out_proj` and `fused_tail`. The operators inside a region are not independently selectable,
-because `fused_tail` is one stitched module — fusing ln1 without the FFN is not a configuration, it
-is a new stitch. So the blend is a choice over **three regions**, with three levels on the tail
-(fused / the block's banded form / fully decomposed): **2 × 2 × 3 = 12 configurations, exhaustively
-measurable.** Three of the twelve already have gated artifacts — `(fused, fused, fused)` is the
-`fused` mode, `(decomposed, decomposed, decomposed)` is `runlist`, and `(fused, fused, banded)` is
-`coarse` as it stands. Scoping `coarse` is still deciding what the blend is selected *by*; the
-recommendation on the table is *by measurement*, with the twelve walked and the winner frozen as a
-static assignment table whose README records the basis for each region.
+`[2026-08-09]` **A fused region is not free-form — it is an artifact somebody stitched**, and
+reading the artifact plans makes the space small and specific. `fused_config`
+(`pattern/fused/fused.py:381-420`) builds its front from `build_qkv_proj_module` and
+`build_mha_out_proj_module` — **the same two modules `block_config` uses**. `fused` and `coarse`
+therefore differ in the **tail alone**: `fused` has one stitched `ln1+ffn+ln2`, `coarse` has an
+`ffn` ELF plus a row-banded `addnorm`. (A consequence for [27](27-common-ladder-result.md): the
+7-10% `fused`-over-`coarse` latency gap it measures is *entirely* a tail effect, since the front is
+identical by construction.)
+
+So the blend has **two axes, not three**:
+
+| axis | levels |
+|---|---|
+| **front** (qkv → attention → o_proj) | the `block`/`fused` form (two ELFs, q/k/v device-resident) · the `runlist` form (three projections, per-head `attn_scores`→`softmax`→`attn_output`, `output_proj`) |
+| **tail** (ln1 → ffn → ln2) | stitched (`fused_tail`) · row-banded (`ffn` ELF + `addnorm` ×N) · fully decomposed (`runlist`'s up/GeLU/down + per-band add/LayerNorm/multiply) |
+
+**2 × 3 = 6 cells, and two of them are already modes:** `(block-front, stitched)` **IS** `fused`, and
+`(runlist-front, decomposed)` **IS** `runlist`. That is the sharp form of the scoping problem — the
+space `coarse` is defined to blend over *contains the two things it blends*, so "pick the best cell"
+would just re-derive one of them and collapse the taxonomy. On [27](27-common-ladder-result.md)'s
+evidence it would collapse to `fused`, which is fastest AND lowest-byte at both measured lengths.
+
+**The resolution is the word the definition already uses — *per workload*.** The cells are not all
+available at every shape, and which are is a measured constraint: `fused`'s stitched tail caps at
+1365 rows, so **at seq 2048+ the entire stitched row is unbuildable**. `coarse` is the mode you use
+where `fused` does not fit, and today's `coarse` — `(block-front, banded)` — is already that cell,
+chosen implicitly by D2 having been built at 4096. What it lacks is not blendedness but *provenance*.
+
+**Consequence for sequencing, and it inverts what this README used to imply:** the corrected `coarse`
+must be measured at **2048 or 4096**, not at the 1024 the other three now share. At 1024 every cell
+is dominated by one that already has a mode name. Full derivation, the three interior cells worth
+measuring, and what each costs: [28](28-coarse-blend-space.md).
 
 **Any configuration selecting a fused level inherits `fused`'s 256..1024 bound**, so a corrected
 `coarse` is a 1024 row — the same length [27](27-common-ladder-result.md) puts the cross-mode
