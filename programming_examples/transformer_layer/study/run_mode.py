@@ -71,20 +71,28 @@ import schema  # noqa: E402
 # it was None in every row of the first ladder, which is how the schema had a
 # field for it and the data did not.
 #
-# `[2026-08-08]` offload moved host_torch -> device. Its two attention matmuls
-# are LINEAR, so the corrected taxonomy puts them on the NPU and leaves only the
-# softmax between them on the host; see pattern/offload/offload.py. The check in
-# test_attention_path.py is what caught this map going stale, which is the job it
-# was written for. Note what it means for the ladder: three of the four modes now
-# sit on the device side of the covariate, so a ladder that wants to separate the
-# two placements is leaning on `runlist` alone until that mode is rebuilt too --
-# and once it is, ATTENTION_PATH stops being a covariate in this study at all and
-# test_both_paths_are_represented will (correctly) fail.
+# `[2026-08-08]` offload moved host_torch -> device, and `[2026-08-09]` runlist
+# followed. Both are the corrected taxonomy landing: offload's two attention
+# matmuls are LINEAR so they belong on the NPU, and runlist is defined as every
+# operator on the device with nothing on the host, softmax included.
+# test_attention_path.py caught this map going stale on the first of those,
+# which is the job it was written for.
+#
+# ATTENTION_PATH IS NO LONGER A COVARIATE IN THIS STUDY. All four modes are now
+# on the device side and the field is constant across every row a run can
+# produce. That is the designed end state, not a loss -- but it has a
+# consequence worth stating where the map lives, because it invalidates a
+# published reading: the first sequence ladder's headline was that its slopes
+# split on attention placement (host-attention modes at 1.23-1.27 against
+# device-attention modes at 1.03-1.17), and that split CANNOT BE REPRODUCED
+# from any future run, because no mode sits on the host side any more. A rerun
+# showing separated slopes is measuring something else and needs a new
+# explanation, not the old one restated.
 ATTENTION_PATH_BY_MODE = {
     "coarse": "device",
     "fused": "device",
     "offload": "device",
-    "runlist": "host_torch",
+    "runlist": "device",
 }
 
 

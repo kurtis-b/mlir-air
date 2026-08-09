@@ -79,12 +79,33 @@ def test_the_symbol_not_the_module_is_what_decides():
     assert run_mode.ATTENTION_PATH_BY_MODE["fused"] == "device"
 
 
-def test_both_paths_are_represented():
-    """A map that had collapsed to one value would satisfy the check above."""
+def test_attention_placement_is_no_longer_a_covariate():
+    """`[2026-08-09]` All four modes are on the device. This is the END STATE.
+
+    This assertion used to read ``values == {"device", "host_torch"}``, with the
+    rationale that "the ladder's whole point is comparing the two placements; if
+    this ever holds only one, the confound is gone or the map broke". The
+    confound IS gone -- deliberately. `offload` moved on 2026-08-08 and
+    `runlist` on 2026-08-09, both because the corrected taxonomy puts their
+    attention on the device, and no mode is left on the host side.
+
+    Inverting it rather than deleting it keeps a live claim, and the claim is
+    now the one that matters: **the first sequence ladder's headline cannot be
+    reproduced.** That result read its slope split off this covariate --
+    host-attention modes at 1.23-1.27 against device-attention modes at
+    1.03-1.17 -- and there is no longer a host-attention mode to produce one
+    side of it. A future run that shows separated slopes is measuring something
+    else.
+
+    If a mode ever moves back to the host, this fails and the reader is sent
+    here rather than to a stale comparison.
+    """
     values = set(run_mode.ATTENTION_PATH_BY_MODE.values())
-    assert values == {"device", "host_torch"}, (
-        "the ladder's whole point is comparing the two placements; if this ever "
-        f"holds only {sorted(values)}, the confound is gone or the map broke"
+    assert values == {"device"}, (
+        f"expected every mode on the device, got {sorted(values)}. If a mode "
+        "moved back to host attention, the sequence ladder gains a covariate it "
+        "has not had since 2026-08-09 and every cross-mode latency comparison "
+        "recorded in between needs re-reading, not just this map updating"
     )
 
 

@@ -5,19 +5,36 @@
 // execution-strategy taxonomy.
 //
 // Same golden model and same per-boundary comparisons as the block, coarse and
-// offload gates, behind a different execution boundary: coarse's dispatch
-// schedule held fixed and every one of its dispatch units refined into
-// single-operator kernels, 391 entries over five runlists -- q/k/v
-// projections; host torch blocked attention (the implementation offload
-// shares, unchanged); the output projection; each normalization point as 64
-// bands of residual add, LayerNorm and gamma multiply at coarse's own 64-row
-// granularity (builders.block.norm_rows, imported); and up_proj, GeLU,
-// down_proj -- each runlist forced to one submission. Intermediates inside a
-// runlist stay device-resident. No GEMM ELF executes twice: the four
-// projections are one module compiled to four artifacts, because re-execution
-// in one hw_context corrupts INSIDE a single runlist exactly as it does
-// across submissions; the band add/ln/mul ELFs re-execute 128 times each and
-// that is measured clean (pattern/runlist/README.md has both measurements).
+// offload gates, behind a different execution boundary: every operator its own
+// kernel and NOTHING ON THE HOST, which is what the corrected taxonomy defines
+// this mode as. 427 entries over 17 runlists -- q/k/v projections; then per
+// head, attn_scores + softmax + attn_output; the output projection; each
+// normalization point as 64 bands of residual add, LayerNorm and gamma
+// multiply at coarse's own 64-row granularity (builders.block.norm_rows,
+// imported); and up_proj, GeLU, down_proj -- each runlist forced to one
+// submission. Intermediates inside a runlist stay device-resident.
+//
+// `[2026-08-09]` THE ATTENTION INTERIOR MOVED ON DEVICE. This gate used to
+// REQUIRE `attention host torch fp32` and pin 391 entries over 5 runlists; it
+// certified the obsolete implementation and would have passed the wrong build.
+// The two matmuls are linear and their tiles are injected from the measurement
+// in pattern/offload/offload.py; the softmax between them is the operator
+// builders/softmax.py added, one artifact serving all twelve heads because it
+// takes no runtime loop tiling and is therefore re-execution clean.
+//
+// ONE SUBMISSION PER HEAD is a memory bound, not a schedule choice: all twelve
+// heads in one runlist would need every [4096, 4096] score and probability
+// matrix live at once, ~800 MiB against ~70 MiB per head. It does not touch
+// the entry count, which is what the mode's granularity claim is about.
+//
+// No GEMM ELF executes twice: the four projections are one module compiled to
+// four artifacts, because re-execution in one hw_context corrupts INSIDE a
+// single runlist exactly as it does across submissions. The two attention
+// GEMMs get one artifact each instead, and that is consistent rather than an
+// exception -- each per-head submission dispatches them once, and their
+// contexts are evicted between heads the way offload evicts between its
+// dispatches. The band add/ln/mul ELFs re-execute 128 times each and that is
+// measured clean (pattern/runlist/README.md has both measurements).
 //
 // Two recipes in one file, deliberately: they share a working directory and
 // therefore the ELF cache, so the injected run reuses the ten ELFs the clean
@@ -44,9 +61,13 @@
 // through the registry, the mode's own statement of its decomposition, its
 // host attention boundary, and the band granularity imported from coarse. A
 // registry change that moved a method fails here with its cause on screen.
-// CHECK: runlist 4096x768 ffn 3072 12h x 64 (encoder_bert, non-causal, 391 fine-grained entries over 5 runlists, attention in host torch)
+// CHECK: runlist 4096x768 ffn 3072 12h x 64 (encoder_bert, non-causal, 427 fine-grained entries over 17 runlists, nothing on the host)
 // CHECK: proj 4096x768x768 drain (registry), up 4096x768x3072 drain (registry), down 4096x3072x768 fused-cast (registry)
-// CHECK: attention host torch fp32, query block 4096 x1 block(s)
+// The INJECTED attention tiles in full, and the softmax's L1-bounded row
+// count. These are the lines that say the attention interior is on the device
+// and on which measured configuration; a silent retune fails here.
+// CHECK: attn_scores 4096x64x4096 drain tk2=64 tk1=32 tn=128 herd 8x4 (injected), attn_output 4096x4096x64 drain tk2=256 tk1=32 tn=16 herd 8x4 (injected)
+// CHECK: attention on device: 12 x (attn_scores + softmax + attn_output), softmax 4096x4096 rows_per_call 2
 // CHECK: norm chains banded at 64 rows x64
 //
 // Every boundary, in execution order, each with zero mismatching elements.
@@ -65,27 +86,32 @@
 // CHECK: [stage] output {{.*}} mismatch       0
 // CHECK: [runlist] stages: 10/10 clean
 //
-// The mode's own instrumentation: one DispatchVector row per runlist. Five --
-// a wrapper that merged the norm chains into their neighbours, or stopped
-// recording per-sequence rows, fails here before the driver's totals
-// comparison sees it.
-// CHECK: [runlist] recorded 5 dispatch vectors
+// The mode's own instrumentation: one DispatchVector row per runlist. 17 --
+// a wrapper that merged the norm chains into their neighbours, batched the
+// per-head attention runlists together, or stopped recording per-sequence
+// rows, fails here before the driver's totals comparison sees it.
+// CHECK: [runlist] recorded 17 dispatch vectors
 //
 // The vectors' CONTENTS, not only their count: the six driver-summed totals.
-// Five submissions over 391 entries is the refinement made checkable --
-// 3 + 1 + 192 + 3 + 192, every coarse dispatch unit mapped onto one or more
-// single-operator entries, which is why the total strictly exceeds coarse's
-// 131. Air is 14: one launch per drain ELF (q/k/v; o; up) plus two for the
-// fused-cast down projection, one per band ELF per chain it appears in
-// (add/ln/mul in runlists 3 and 5), and one for gelu. Herd counts accumulate
-// per entry -- 384 of the 404 are the two chains' band launches. Sync and
-// bytes carry the banding's restage cost: 403 boundaries and ~165 MB against
-// the streaming structure's 21 and ~153 MB, the measured price of holding
-// coarse's schedule (and still under coarse's 202,902,528 bytes). The totals
-// line prints only after every row passes the as_row() schema validation, so
-// a malformed row aborts the run and a run whose totals drift fails right
-// here.
-// CHECK: [runlist] dispatch totals: submissions 5 entries 391 air 14 herd 404 sync 403 bytes 165347328
+// 17 submissions over 427 entries -- 3 + 36 + 1 + 192 + 3 + 192, where the 36
+// is twelve heads of (attn_scores, softmax, attn_output). Every coarse
+// dispatch unit still maps onto one or more single-operator entries, so the
+// total strictly exceeds coarse's 131, which is the ordinal claim this mode
+// owns.
+//
+// BYTES IS THE INTERESTING ONE, and it is the first number in this study that
+// speaks to the corrected taxonomy's actual axis. 190,513,152 against
+// `offload`'s 970,457,088 for the same layer: a 5.1x difference produced
+// entirely by where the softmax runs. offload puts it on the host, so each
+// head's [4096, 4096] score matrix crosses DRAM twice; here it stays resident
+// inside the head's runlist and only q_h/k_h_t/v_h in and ctx_h out cross.
+// That is the reconfiguration-versus-DRAM-traffic trade the four modes are
+// supposed to span, measured rather than asserted.
+//
+// The totals line prints only after every row passes the as_row() schema
+// validation, so a malformed row aborts the run and a run whose totals drift
+// fails right here.
+// CHECK: [runlist] dispatch totals: submissions 17 entries 427 air 50 herd 488 sync 451 bytes 190513152
 //
 // Then the layer output itself over all 4096 x 768 elements, and the label
 // naming the MODE's operator.
@@ -122,8 +148,8 @@
 // the clean run totals: the six literals below are the same six the clean
 // half pins above, which is the suite's own statement of the equality the
 // driver re-derives from the two artifacts.
-// FAULT: [runlist] recorded 5 dispatch vectors
-// FAULT: [runlist] dispatch totals: submissions 5 entries 391 air 14 herd 404 sync 403 bytes 165347328
+// FAULT: [runlist] recorded 17 dispatch vectors
+// FAULT: [runlist] dispatch totals: submissions 17 entries 427 air 50 herd 488 sync 451 bytes 190513152
 //
 // And the verdict in the three forms opcheck.py reports it: the comparison's
 // own, the control's reading of it, and the exit-status summary.

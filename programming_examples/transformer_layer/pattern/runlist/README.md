@@ -76,31 +76,38 @@ hardware's dispatch caps (08d §Do not carry iron's entry count across).
 > hardware one — both attention shapes are measured passing on real NPU2, and
 > `offload` now dispatches them (see `pattern/offload/README.md`). What
 > `runlist` additionally needs, and `offload` does not, is a **device
-> softmax**. `[2026-08-09]` That operator now exists and is gated —
-> `builders/softmax.py`, `run_npu2_softmax_peano.lit`, three shapes including
-> 64x4096 — so this mode is unblocked. Until it is rebuilt it prices host torch
-> rather than reconfiguration: 24.15 ms of host attention at 1024, 47.8% of its
-> total.
+> softmax**. `[2026-08-09]` **Both are now done and this mode is rebuilt.** The
+> section below describes the superseded host-attention structure and is kept
+> as a record; what the mode does today is at the top of
+> `pattern/runlist/runlist.py`.
 >
-> **Three sizing facts for whoever does the rebuild**, established while
-> building the operator:
+> **427 entries over 17 runlists, nothing on the host.** Per head:
+> `attn_scores` → `softmax` → `attn_output`, all three device-resident inside
+> one submission. The GEMM tiles are imported from
+> `pattern/offload/offload.py`'s `ATTENTION_GEMM_TILES` rather than copied;
+> the softmax is `builders/softmax.py` at `[4096, 4096]`, `rows_per_call = 2`
+> (L1-bounded by the row width, which for a score matrix IS the sequence
+> length). One submission per head is a **memory** bound — all twelve at once
+> would need ~800 MiB of score and probability matrices live simultaneously
+> against ~70 MiB per head — and it does not touch the entry count.
 >
-> - At attention width the softmax module builds with `rows_per_call = 2` and
->   no higher: three `[rows_per_call, cols]` bf16 buffers live in L1, so 2 needs
->   48 KiB and 4 would need 96 KiB against a 64 KiB L1.
-> - **The row loop is inside the herd body**, so one softmax is ONE `air.launch`
->   regardless of row count — 256 loop trips per tile at `[4096, 4096]`, not 256
->   dispatches. The entry-count consequence of moving attention on-device is
->   therefore 12 softmax dispatches plus 24 GEMMs, not thousands, which is what
->   this mode's identity (391 entries over 5 runlists) has to be re-derived
->   against.
-> - `[4096, 4096]` is **compile-verified only**. The hardware-verified
->   attention-width row is `64x4096`; the full per-head score matrix is 32 MiB
->   in and 32 MiB out and has not been run. Do not treat "it builds" as "it
->   passes" — that inference is exactly what doc 26 §4 got wrong.
+> **The number this rebuild produced.** `bytes` 190,513,152 against `offload`'s
+> 970,457,088 for the same layer, **5.1×**, entirely because of where the
+> softmax runs: `offload` puts it on the host so each `[4096, 4096]` score
+> matrix crosses DRAM twice, here it never leaves the array. That is the
+> corrected taxonomy's actual axis — reconfiguration against DRAM traffic —
+> measured on two modes that differ in exactly that and nothing else.
 >
-> The GEMM tiles are already measured and are in `pattern/offload/offload.py`
-> as `ATTENTION_GEMM_TILES`; inject them the same way rather than re-searching.
+> Accuracy cost of a bf16 device softmax against the f32 host one:
+> `attn_context` `mean_rel_L1` 6.665e-2 here against `offload`'s 1.554e-2, and
+> the layer output needs `atol` 6.981e-2 against the 1e-1 ceiling — a 1.43×
+> margin, between `runlist`'s old 1.41× and `offload`'s 1.73×. No tolerance was
+> widened.
+>
+> One consequence outside this mode: with `runlist` on the device, **all four
+> modes are**, so `attention_path` is no longer a covariate in this study and
+> the first sequence ladder's slope split cannot be reproduced. See
+> `study/test_attention_path.py`, which now asserts that end state.
 
 The two attention GEMMs are `4096 x 64 x 4096` and `4096 x 4096 x 64`; no
 `K = 64` or `N = 64` bf16-out row exists in the registry and the C4 sweep

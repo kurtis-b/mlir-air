@@ -1,35 +1,59 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""``runlist`` — the layer decomposed into single-operator entries over five runlists.
+"""``runlist`` — every operator its own kernel, on the device, nothing on the host.
 
 CONTRACT
     ``prepare_runlist(shape, seed=...)`` is this mode's entry in the ``SPECS``
     catalogue: the D2 layer prepared for ``opcheck.py``'s ``dispatch`` seam.
-    The mode holds ``coarse``'s dispatch schedule FIXED and refines every one
-    of its dispatch units into single-operator kernels, each
-    ``KernelCache.run_sequence`` call forced to one runlist with
+    Every operator in the encoder layer is dispatched individually, on the
+    device, each ``KernelCache.run_sequence`` call forced to one runlist with
     ``require_single_submission=True``::
 
         coarse's unit                        this mode's refinement
         ------------------------------       --------------------------------
         qkv_proj (fused)              ->     runlist 1: q_proj  k_proj  v_proj
-        mha_out_proj (fused)          ->     host blocked attention (shared
-                                             with offload), then
-                                             runlist 2: output_proj
-        64 x addnorm ln1 (pre-add)    ->     runlist 3: 64 x (add  ln  mul)
-        ffn (fused up+gelu+down)      ->     runlist 4: up_proj  gelu  down_proj
-        64 x addnorm ln2 (pre-add)    ->     runlist 5: 64 x (add  ln  mul)
+        mha_out_proj (fused)          ->     runlists 2..13, ONE PER HEAD:
+                                               attn_scores  softmax  attn_output
+                                             then runlist 14: output_proj
+        64 x addnorm ln1 (pre-add)    ->     runlist 15: 64 x (add  ln  mul)
+        ffn (fused up+gelu+down)      ->     runlist 16: up_proj gelu down_proj
+        64 x addnorm ln2 (pre-add)    ->     runlist 17: 64 x (add  ln  mul)
 
-    Five recorded ``DispatchVector`` rows; the driver-summed totals are 5
-    submissions over ``7 + 6 * norm_blocks`` runlist entries — 391 at the gate
-    configuration, against ``coarse``'s 131. Every coarse dispatch unit maps
-    onto one or more finer units, so ``runlist_entries > coarse`` holds BY
-    CONSTRUCTION, which is what the mode's ordinal claim ("the fine-grained
-    point of the taxonomy") means. Intermediates inside a runlist stay
-    DEVICE-RESIDENT: q/k/v never touch the host before attention reads them
-    back, each band's residual sum feeds its LayerNorm and gamma multiply on
-    device, and ``ffn_up``/``ffn_gelu`` chain into the down projection.
+    17 recorded ``DispatchVector`` rows; the driver-summed totals are 17
+    submissions over ``7 + 3 * num_heads + 6 * norm_blocks`` runlist entries —
+    427 at the gate configuration, against ``coarse``'s 131. Every coarse
+    dispatch unit maps onto one or more finer units, so
+    ``runlist_entries > coarse`` holds BY CONSTRUCTION, which is what the
+    mode's ordinal claim ("the fine-grained point of the taxonomy") means.
+    Intermediates inside a runlist stay DEVICE-RESIDENT: q/k/v never touch the
+    host before attention reads them, each head's score and probability
+    matrices never leave the array, each band's residual sum feeds its
+    LayerNorm and gamma multiply on device, and ``ffn_up``/``ffn_gelu`` chain
+    into the down projection.
+
+`[2026-08-09]` WHAT THE REBUILD CHANGED, AND THE ONE NUMBER TO READ
+    Attention used to run in host torch through ``blocked_attention``, which
+    made this mode price host torch rather than reconfiguration — 24.15 ms at
+    1024, 47.8% of its total. Both matmuls are linear and now dispatch with
+    the tiles measured in ``pattern/offload/offload.py`` (imported, not
+    copied); the softmax between them is ``builders/softmax.py``.
+
+    The consequence worth reading is **bytes**: 190,513,152 here against
+    ``offload``'s 970,457,088 for the same layer, a 5.1x difference produced
+    entirely by where the softmax runs. ``offload`` keeps it on the host, so
+    every head's ``[seq, seq]`` score matrix crosses DRAM twice; here it stays
+    resident inside the head's runlist and only ``q_h``/``k_h_t``/``v_h`` in
+    and ``ctx_h`` out cross. That is the reconfiguration-against-DRAM-traffic
+    axis the corrected taxonomy is about, measured on two modes that differ in
+    exactly that.
+
+ONE SUBMISSION PER HEAD, AND WHY IT IS NOT A SCHEDULE CHOICE
+    Twelve heads in one runlist would need every score and probability matrix
+    live simultaneously — ~800 MiB at the gate configuration against ~70 MiB
+    per head. It is a memory bound. It does not touch the ENTRY count, which
+    is what the mode's granularity claim is about, and
+    ``runlist_submission_count`` derives it rather than hardcoding 17.
 
 WHY THE NORM CHAINS ARE ROW-BANDED WHEN THE KERNELS COULD STREAM
     The decomposed ``elementwise_add``/``layer_norm``/``elementwise_mul``
@@ -71,12 +95,24 @@ FOOTGUNS
       all 64 band multiplies — every band multiplies by the same rows. Under
       fault injection the content key changes and the perturbed broadcast is
       re-uploaded; nothing special-cases the injected path.
-    - The mode computes; the oracle checks. Attention is torch
-      (``blocked_attention``), every device operator is its own kernel; the
-      per-boundary references come from the numpy oracles behind
-      ``pattern/reference.py``. Nothing here may import
-      ``addnorm_pre_add_reference``, ``gelu_tanh_reference`` or any other
-      function that computes a boundary.
+    - The two attention GEMM ELFs get ONE artifact each rather than one per
+      head, and that is consistent with the no-re-execution rule above rather
+      than an exception to it. The rule is about re-executing a runtime-tiled
+      GEMM ELF in a REUSED ``hw_context``; each per-head submission dispatches
+      each of them exactly once, and ``_evict_attention_contexts`` drops their
+      contexts between heads, which is available here precisely because the
+      boundary is BETWEEN submissions. The softmax artifact is not evicted:
+      no runtime loop tiling, the same re-execution-clean class as the band
+      ``add``/``ln``/``mul`` ELFs.
+    - The mode computes; the oracle checks. Every operator is its own device
+      kernel and nothing runs on the host; the per-boundary references come
+      from the numpy oracles behind ``pattern/reference.py``. Nothing here may
+      import ``addnorm_pre_add_reference``, ``gelu_tanh_reference`` or any
+      other function that computes a boundary. ``round_bf16`` is imported from
+      ``pattern/blocked_attention.py`` and is a plain rounding helper — the
+      module name is historical, and importing that SYMBOL does not make this
+      a host-attention mode (``study/test_attention_path.py`` checks the symbol
+      and not the module for exactly this reason).
     - The dispatch vectors are recorded on the fault-injected path too. The
       driver requires the fault artifact's summed totals to EQUAL the clean
       run's; anything conditional on the injected flag fails that.
@@ -117,13 +153,18 @@ from builders.elementwise_mul import (  # noqa: E402
 from builders.gelu import build_gelu_module  # noqa: E402
 from builders.gemm_spec import resolve_gemm_spec, spec_herd  # noqa: E402
 from builders.layer_norm import build_layer_norm_module  # noqa: E402
+from builders.softmax import build_softmax_module  # noqa: E402
 from opcheck_layer import BLOCK_STAGE_ATOL, print_dispatch_totals  # noqa: E402
 from opcheck_prepare import _spec_digest  # noqa: E402
 from pattern import EXECUTION_MODE_CSV  # noqa: E402
-from pattern.blocked_attention import (  # noqa: E402
-    blocked_attention,
-    resolve_query_block_size,
-    round_bf16,
+from pattern.blocked_attention import round_bf16  # noqa: E402
+# The measured attention tiles live in ONE place, offload's module, and are
+# imported rather than copied. They are a measurement (see that module's
+# ATTENTION_GEMM_TILES comment for the checkpoints), so two modes carrying two
+# copies is two things to keep in step and one of them silently going stale.
+from pattern.offload.offload import (  # noqa: E402
+    _check_no_object_collision,
+    attention_gemm_spec,
 )
 from pattern.reference import (  # noqa: E402
     ENCODER_BOUNDARIES,
@@ -149,15 +190,25 @@ RUNLIST_INPUT_NAMES = (
     "ln2_weight",
 )
 
-#: Recorded in the artifact: the attention boundary is host torch f32 through
-#: the shared query-blocked implementation, NOT a device dispatch. Its two
-#: GEMMs (``4096 x 64 x 4096`` and ``4096 x 4096 x 64``) resolve in no
-#: registry and the C4 sweep cannot stage them (08c has the derivation), so
-#: this seam — the one submission boundary a whole-BO argument does not
-#: explain — is forced, and it is why iron's ``k_transpose`` entry has no
-#: counterpart here: its consumer is the GEMM this hardware cannot dispatch.
-#: The ``transpose`` operator is validated standalone instead.
-ATTENTION_PATH = "host_torch_fp32_blocked"
+#: Recorded in the artifact: `[2026-08-09]` the whole attention interior is on
+#: the device — both matmuls AND the softmax between them — so this mode now
+#: runs NOTHING on the host, which is what the corrected taxonomy defines it as.
+#: It was ``host_torch_fp32_blocked`` until this rebuild; a results tree mixing
+#: the two values is mixing two different modes.
+ATTENTION_PATH = "device_all"
+
+#: instance_name for the softmax artifact — the func.func ``builders/softmax.py``
+#: emits. The small-operator backend applies: no runtime loop tiling, so unlike
+#: the GEMM ELFs it is re-execution clean and one artifact serves every head.
+_SOFTMAX_FUNC = "softmax_rows"
+
+#: Rows of the score matrix resident in L1 per softmax kernel call. Three
+#: ``[rows_per_call, cols]`` bf16 buffers live there and cols IS the sequence
+#: length for a score matrix, so this is bounded by the row width: at 4096 it
+#: needs 48 KiB of a 64 KiB L1 and 4 would need 96 KiB. The row loop is inside
+#: the herd body, so this bounds L1 and NOT the entry count — one softmax is
+#: one runlist entry however many trips it walks.
+SOFTMAX_ROWS_PER_CALL = 2
 
 #: The single func.func each GEMM method's module emits — what instance_name
 #: must equal, or the dispatch times out a long way from the cause.
@@ -185,6 +236,11 @@ _SMALL_FUNC = {
     "ln": "layer_norm_multi_row",
     "mul": "eltwise_mul_2d",
     "gelu": "ffn_gelu_2d",
+    # `[2026-08-09]` softmax belongs in this family and not with the GEMMs: it
+    # takes no runtime loop tiling, which is what makes an ELF re-execution
+    # clean, so ONE artifact serves all twelve heads. Being here also gets it
+    # the emitted-symbol assertion in compile_runlist_artifacts.
+    "softmax": "softmax_rows",
 }
 
 
@@ -225,7 +281,22 @@ def runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
             (seq_len, ffn_dim, emb_dim),
         ),
     }
+    # `[2026-08-09]` The attention interior, per head. Both matmuls are LINEAR
+    # and belong on the device under the corrected taxonomy; the tiles are
+    # imported from offload, where the measurement lives.
+    specs["attn_scores"] = (attention_gemm_spec("attn_scores"), (seq_len, head_dim, seq_len))
+    specs["attn_output"] = (attention_gemm_spec("attn_output"), (seq_len, seq_len, head_dim))
+
     # GEMM entry -> spec key. Four distinct proj ELFs on purpose; see above.
+    #
+    # The two attention entries get ONE artifact each, not one per head, and
+    # that is consistent with the no-re-execution rule rather than an exception
+    # to it: the rule is about re-executing a runtime-tiled GEMM ELF in a REUSED
+    # hw_context. Each per-head submission dispatches each of them exactly once,
+    # and their contexts are evicted between heads exactly as `offload` evicts
+    # between its dispatches (`_evict_attention_contexts`). Twelve artifacts
+    # apiece would also work and would cost 24 large ELF compiles per clean
+    # cache for nothing.
     gemms = {
         "q_proj": "proj",
         "k_proj": "proj",
@@ -233,7 +304,16 @@ def runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
         "o_proj": "proj",
         "up": "up",
         "down": "down",
+        "attn_scores": "attn_scores",
+        "attn_output": "attn_output",
     }
+    # Same guard offload carries, for the same reason: compile_gemm_mm names
+    # its object from (tile_m, tile_n) alone while tile_k_l1 is a compile flag,
+    # so two GEMMs agreeing on the first two and differing on the third write
+    # one file with two micro-kernels. `up` and `attn_scores` legitimately
+    # share mm_m32n128.o today because all three agree; retuning either would
+    # not.
+    _check_no_object_collision(specs)
     artifacts = {}
     for gemm_key, spec_key in gemms.items():
         _, (m, k, n) = specs[spec_key]
@@ -244,6 +324,7 @@ def runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
             "ln": f"rl_ln_{rows}x{emb_dim}",
             "mul": f"rl_mul_{rows}x{emb_dim}",
             "gelu": f"rl_gelu_{seq_len}x{ffn_dim}",
+            "softmax": f"rl_softmax_{seq_len}x{seq_len}",
         }
     )
     backend_kwargs = {
@@ -270,15 +351,28 @@ def runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
         "gemms": gemms,
         "artifacts": artifacts,
         "backend_kwargs": backend_kwargs,
-        "query_block_size": resolve_query_block_size(seq_len, num_heads),
     }
 
 
 def runlist_entry_count(cfg):
     """Total runlist entries the decomposition dispatches, derived not counted:
-    q/k/v (3) + output_proj (1) + up/gelu/down (3) + two norm chains of
-    ``3 * norm_blocks`` band entries each."""
-    return 7 + 6 * cfg["norm_blocks"]
+    q/k/v (3) + per head (attn_scores, softmax, attn_output) + output_proj (1)
+    + up/gelu/down (3) + two norm chains of ``3 * norm_blocks`` band entries
+    each."""
+    return 7 + 3 * cfg["num_heads"] + 6 * cfg["norm_blocks"]
+
+
+def runlist_submission_count(cfg):
+    """Submissions: qkv, one PER HEAD, o_proj, ln1, ffn, ln2.
+
+    The per-head split is a MEMORY bound, not a taste. One submission holding
+    every head's attention would need all of its buffers live at once: at the
+    gate configuration that is 12 score matrices and 12 probability matrices of
+    [4096, 4096] bf16, ~800 MiB before counting anything else. Per head it is
+    ~70 MiB. The mode's granularity claim is about ENTRIES, which the split
+    does not change.
+    """
+    return 5 + cfg["num_heads"]
 
 
 def describe_runlist(cfg):
@@ -286,18 +380,28 @@ def describe_runlist(cfg):
     print(
         f"  runlist {cfg['seq_len']}x{cfg['emb_dim']} ffn {cfg['ffn_dim']} "
         f"{cfg['num_heads']}h x {cfg['head_dim']} (encoder_bert, non-causal, "
-        f"{runlist_entry_count(cfg)} fine-grained entries over 5 runlists, "
-        f"attention in host torch)"
+        f"{runlist_entry_count(cfg)} fine-grained entries over "
+        f"{runlist_submission_count(cfg)} runlists, nothing on the host)"
     )
     parts = []
     for key in ("proj", "up", "down"):
         spec, (m, k, n) = cfg["specs"][key]
         parts.append(f"{key} {m}x{k}x{n} {spec['method']} (registry)")
     print("    " + ", ".join(parts))
-    blocks = cfg["seq_len"] // cfg["query_block_size"]
+    parts = []
+    for key in ("attn_scores", "attn_output"):
+        spec, (m, k, n) = cfg["specs"][key]
+        parts.append(
+            f"{key} {m}x{k}x{n} {spec['method']} tk2={spec['tile_k_l2']} "
+            f"tk1={spec['tile_k_l1']} tn={spec['tile_n']} "
+            f"herd {spec['herd_m']}x{spec['herd_n']} (injected)"
+        )
+    print("    " + ", ".join(parts))
     print(
-        f"    attention host torch fp32, query block {cfg['query_block_size']} "
-        f"x{blocks} block(s)"
+        f"    attention on device: {cfg['num_heads']} x "
+        f"(attn_scores + softmax + attn_output), "
+        f"softmax {cfg['seq_len']}x{cfg['seq_len']} rows_per_call "
+        f"{SOFTMAX_ROWS_PER_CALL}"
     )
     print(
         f"    norm chains banded at {cfg['norm_rows']} rows x"
@@ -332,6 +436,16 @@ def _build_runlist_module(cfg, key):
         return build_elementwise_mul_module(rows, emb_dim, bfloat16)
     if key == "gelu":
         return build_gelu_module(cfg["seq_len"], ffn_dim, bfloat16)
+    if key == "softmax":
+        # Square: a score matrix is [seq, seq], so the row width IS the
+        # sequence length and rows_per_call is bounded by it, not by the
+        # hidden size every other row-wise operator here works at.
+        return build_softmax_module(
+            cfg["seq_len"],
+            cfg["seq_len"],
+            bfloat16,
+            rows_per_call=SOFTMAX_ROWS_PER_CALL,
+        )
     raise KeyError(f"unknown runlist artifact key {key!r}")
 
 
@@ -386,6 +500,11 @@ def compile_runlist_artifacts(cache, cfg, run_only=False):
             ek.compile_encoder(
                 build_ffn=True, build_addnorm=False, out_name="encoder_ffn.o"
             )
+        elif key == "softmax":
+            # The STREAMING family behind -DSOFTMAX_STREAMING, not the
+            # single-shot softmax_bf16 in the same file; see builders/softmax.py
+            # for why. vec_len must match the builder's SM_VEC_LEN.
+            ek.compile_softmax_streaming(vec_len=64)
         # "add" and "mul" are direct vector codegen: nothing to compile.
     for key in stale:
         name = names[key]
@@ -510,6 +629,85 @@ def prepare_runlist(shape, seed=42):
         )
         out = {n: np.array(results[n], copy=True) for n in outputs}
         return out, vector
+
+    def _evict_attention_contexts():
+        """Drop the two attention GEMM artifacts' ``hw_context``s (and the pools).
+
+        MEASURED, NOT DEFENSIVE, and it is the same measurement this module's
+        no-re-execution footgun records: a runtime-tiled GEMM ELF returns wrong
+        numbers from its SECOND execution in one context onward. The per-head
+        submissions dispatch each attention GEMM once, so nothing re-executes
+        INSIDE a runlist -- what has to be broken is reuse ACROSS the twelve
+        submissions, which is exactly what ``offload._evict_context`` does
+        between its dispatches. Evicting is available here precisely because
+        the boundary is between submissions rather than inside one.
+
+        The softmax artifact is deliberately NOT evicted: no runtime loop
+        tiling, same class as the band add/ln/mul ELFs that already re-execute
+        128 times per layer clean.
+        """
+        for key in ("attn_scores", "attn_output"):
+            loaded = cache._loaded.pop(cfg["artifacts"][key], None)
+            if loaded is not None:
+                loaded[0].unload()
+        cache._pools.clear()
+
+    def _run_attention_head(head, q, k, v):
+        """One head's whole attention interior, three entries in one submission.
+
+        ``attn_scores`` (Q_h @ K_h^T), ``softmax`` over the score matrix, then
+        ``attn_output`` (P_h @ V_h). Nothing crosses to the host between them:
+        the score matrix and the probability matrix are device-resident inside
+        the runlist, which is the property this mode exists to have and the one
+        the host-softmax ``offload`` partition deliberately gives up.
+
+        ONE HEAD PER SUBMISSION IS A MEMORY BOUND. See
+        ``runlist_submission_count``: all twelve heads in one runlist would
+        need every score and probability matrix live at once, ~800 MiB at the
+        gate configuration against ~70 MiB per head.
+
+        The head slice and the K transpose are contiguous host COPIES, per the
+        module's band-inputs footgun -- a strided view would upload the wrong
+        bytes without complaining. They are layout, not arithmetic; the mode
+        still computes nothing.
+        """
+        columns = slice(head * head_dim, (head + 1) * head_dim)
+        arrays = {
+            "q_h": np.ascontiguousarray(q[:, columns]),
+            "k_h_t": np.ascontiguousarray(k[:, columns].T),
+            "v_h": np.ascontiguousarray(v[:, columns]),
+            "scores": np.zeros((seq_len, seq_len), dtype=bfloat16),
+            "probs": np.zeros((seq_len, seq_len), dtype=bfloat16),
+            "ctx_h": np.zeros((seq_len, head_dim), dtype=bfloat16),
+        }
+        steps = []
+        scratches = set()
+        step, scratch = _gemm_step(cfg, "attn_scores", "q_h", "k_h_t", "scores", arrays)
+        steps.append(step)
+        if scratch:
+            scratches.add(scratch)
+        steps.append(
+            DispatchStep(names["softmax"], ("scores", "probs"), writes=(1,))
+        )
+        step, scratch = _gemm_step(cfg, "attn_output", "probs", "v_h", "ctx_h", arrays)
+        steps.append(step)
+        if scratch:
+            scratches.add(scratch)
+        specs = {
+            name: _spec_buf(name, arr, host_output=name == "ctx_h")
+            for name, arr in arrays.items()
+        }
+        host_writes = {"q_h", "k_h_t", "v_h"} | scratches
+        _evict_attention_contexts()
+        results, vector = cache.run_sequence(
+            steps,
+            specs,
+            cfg["backend_kwargs"],
+            arrays,
+            host_writes=host_writes,
+            require_single_submission=True,
+        )
+        return np.array(results["ctx_h"], copy=True), vector
 
     def _run_o_proj(ctx, w_o):
         """Runlist 2: the output projection, one entry."""
@@ -637,48 +835,60 @@ def prepare_runlist(shape, seed=42):
         x, w_q, w_k, w_v, w_o, ln1_weight, w_up, w_down, ln2_weight = device_inputs
         blocks = cfg["norm_blocks"]
 
-        print("  [runlist 1/5] q_proj + k_proj + v_proj (3 entries, one submission)")
+        total = runlist_submission_count(cfg)
+        print(f"  [runlist 1/{total}] q_proj + k_proj + v_proj (3 entries)")
         proj, vec_1 = _run_projections(x, w_q, w_k, w_v)
 
-        print(f"  [host] blocked attention, query block {cfg['query_block_size']}")
-        with cache.profiler.time_cpu("attention"):
-            attn_context = blocked_attention(
-                proj["q"],
-                proj["k"],
-                proj["v"],
-                num_heads,
-                causal=False,
-                query_block_size=cfg["query_block_size"],
-            )
+        print(
+            f"  [runlist 2..{1 + num_heads}/{total}] attention on device: "
+            f"{num_heads} x (attn_scores + softmax + attn_output), "
+            f"3 entries each"
+        )
+        attn_vectors = []
+        attn_context = np.empty((seq_len, emb_dim), dtype=bfloat16)
+        for head in range(num_heads):
+            columns = slice(head * head_dim, (head + 1) * head_dim)
+            ctx_h, vec_h = _run_attention_head(head, proj["q"], proj["k"], proj["v"])
+            attn_context[:, columns] = ctx_h
+            attn_vectors.append(vec_h)
 
-        print("  [runlist 2/5] output_proj (1 entry, one submission)")
+        print(f"  [runlist {2 + num_heads}/{total}] output_proj (1 entry)")
         attn_out, vec_2 = _run_o_proj(round_bf16(attn_context), w_o)
 
         print(
-            f"  [runlist 3/5] {blocks} x (add + layer_norm + mul) ln1 "
-            f"({3 * blocks} entries, one submission)"
+            f"  [runlist {3 + num_heads}/{total}] {blocks} x "
+            f"(add + layer_norm + mul) ln1 ({3 * blocks} entries)"
         )
         gamma1 = round_bf16(broadcast_row_weight(ln1_weight, cfg["norm_rows"]))
         hidden, vec_3 = _run_norm_chain("ln1", attn_out, x, gamma1)
 
-        print("  [runlist 4/5] up_proj + gelu + down_proj (3 entries, one submission)")
+        print(
+            f"  [runlist {4 + num_heads}/{total}] up_proj + gelu + down_proj "
+            f"(3 entries)"
+        )
         ffn, vec_4 = _run_ffn(hidden, w_up, w_down)
 
         print(
-            f"  [runlist 5/5] {blocks} x (add + layer_norm + mul) ln2 "
-            f"({3 * blocks} entries, one submission)"
+            f"  [runlist {5 + num_heads}/{total}] {blocks} x "
+            f"(add + layer_norm + mul) ln2 ({3 * blocks} entries)"
         )
         gamma2 = round_bf16(broadcast_row_weight(ln2_weight, cfg["norm_rows"]))
         output, vec_5 = _run_norm_chain("ln2", ffn["ffn_out"], hidden, gamma2)
 
         boundaries = dict(ffn)
         boundaries.update({"q": proj["q"], "k": proj["k"], "v": proj["v"]})
-        boundaries["attn_context"] = attn_context
+        # bf16 straight from the device, widened for the comparison. The other
+        # modes' attn_context is f32 because a host implementation produced it;
+        # here the widening is exact and adds nothing.
+        boundaries["attn_context"] = attn_context.astype(np.float32)
         boundaries["attn_out"] = attn_out
         boundaries["hidden"] = hidden
         boundaries["output"] = output
 
-        vector_rows = [v.as_row() for v in (vec_1, vec_2, vec_3, vec_4, vec_5)]
+        vector_rows = [
+            v.as_row()
+            for v in ([vec_1] + attn_vectors + [vec_2, vec_3, vec_4, vec_5])
+        ]
         stages = []
         for name in ENCODER_BOUNDARIES:
             atol = BLOCK_STAGE_ATOL[name]
@@ -720,13 +930,19 @@ def prepare_runlist(shape, seed=42):
         "golden_seed": seed,
         "execution_mode": EXECUTION_MODE_CSV["runlist"],
         "attention_path": ATTENTION_PATH,
-        "query_block_size": cfg["query_block_size"],
         "norm_rows": cfg["norm_rows"],
         "norm_blocks": cfg["norm_blocks"],
-        "gemm_spec_source": "registry",
+        "runlist_entries": runlist_entry_count(cfg),
+        "runlist_submissions": runlist_submission_count(cfg),
+        "softmax_rows_per_call": SOFTMAX_ROWS_PER_CALL,
+        # MIXED: the three projection shapes resolve in the registry, the two
+        # attention shapes are injected measured tiles that resolve in none.
+        "gemm_spec_source": "registry+injected",
         "gemm_spec_proj": _spec_digest(cfg["specs"]["proj"][0]),
         "gemm_spec_ffn_up": _spec_digest(cfg["specs"]["up"][0]),
         "gemm_spec_ffn_down": _spec_digest(cfg["specs"]["down"][0]),
+        "gemm_spec_attn_scores": _spec_digest(cfg["specs"]["attn_scores"][0]),
+        "gemm_spec_attn_output": _spec_digest(cfg["specs"]["attn_output"][0]),
     }
     return {
         "inputs": inputs,
