@@ -73,7 +73,8 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | Corrected `offload` — attention on device | `run_npu2_offload_peano.lit`, both recipes, at the corrected 30-dispatch boundary | **done** 2026-08-08. 10/10 stages clean, `submissions 30 entries 30 air 31 herd 91 sync 91 bytes 970457088`, negative control exact through the attention half. No registry write, no compiler work, no tolerance widened — `attn_context` 11.4× margin, `output` 1.73×. Costs 6.9× the DRAM traffic, which is the mode's result |
 | `fused` build repair — SPECS row 4096 → 1024 | `run_npu2_fused_peano.lit`, both recipes | **done** 2026-08-08. The gate was **red and unrun**: the row was left at 4096 while the mode has always been bounded to 256..1024, so it raised before aircc. Now green at 1024 — 10/10 stages, `mean_rel_L1` 1.756e-2 at `atol_required` 5.813e-2. Its cross-mode `sync` comparison against `coarse` is **suspended**, not restated: the two rows are now at different sequence lengths |
 | Backend-preset conflict — settled on hardware | none; a measurement that retracts [26 §4](26-mode-rebuild-feasibility.md) | **recorded** 2026-08-08. `runtime_loop_tiling_sizes` is **not inert**: `[2,2]` hangs `mha_out_proj` @4096 3/3, `[1,1]` passes 3/3, `omit_pingpong` irrelevant either way. Restores the conflict `fused.py` / `mha_out_proj.py` / `block.py` document, with a corrected reason. `agents/probes/probe_backend_preset_hardware.py` |
-| Corrected `runlist` — device softmax, then the mode | its own two phases | **not started.** Needs `builders/softmax.py` over the existing `softmax_streaming.o` (kernel present, five symbols, already built by `compile_kernels.py`), then the mode. Two decisions first: no row-max subtraction in `softmax_bf16`, and `SM_LOG2E` hardcoded as the scale. **Edits `builders/mha_attention.py`, which `mha_out_proj.py` imports** — serialize against any `fused` work |
+| Device `softmax` operator | `run_npu2_softmax_peano.lit`, clean + negative control, three shapes | **done** 2026-08-09. `builders/softmax.py` over the existing `softmax_streaming.o`; no kernel written. 512×512, 4096×768 and **64×4096** (attention width, where `rows_per_call` drops 8 → 2 on L1). `mean_rel_L1` 1.60–1.63e-2, `atol` 2.7–2.9× `atol_required`, plus a `mean_rel_L1_max` ceiling because a softmax row spans three orders of magnitude and an element-wise `atol` alone is loose at the bottom. Two corrections to [26 §5](26-mode-rebuild-feasibility.md) recorded there |
+| Corrected `runlist` — every operator on device | its own phase | **not started**, and now unblocked: the softmax operator it was waiting on is gated. Still **edits `builders/mha_attention.py`, which `mha_out_proj.py` imports** — serialize against any `fused` work. Its lit pins `attention host torch fp32` and `391 entries over 5 runlists`; both change |
 | Corrected `coarse` | its own phase | not started; a blend of `runlist` and `fused`, so both must be right first |
 | G — unattended runner + CI | Full profile run completes with a complete `results_manifest.json` | not started |
 | Goal 1 — sliding window | `make verify` passes with window-crossing prompts | not started |
@@ -139,12 +140,23 @@ to it. See [23](23-rules-and-open-items.md) and [24](24-phase-h10-non-constant-b
    six-GEMM form it replaces. Pricing that is the point. What remains for this mode is the
    N-instruction-streams-under-one-xclbin half, which is untouched and is where its
    reconfiguration-minimizing claim actually gets tested.
-2. **Corrected `runlist` needs one new operator: a device softmax.** The kernel already exists in
-   this tree and this port already builds it — `programming_examples/softmax/softmax.cc`, compiled
-   by `external_kernels.py:468` `compile_softmax_streaming()`, with `softmax_streaming.o` already in
-   `transformer_layer/build_peano/`. So the work is a `builders/softmax.py` around an existing
-   kernel plus an opcheck row and a fault-injection control, not a kernel port. Iron's
-   `aie_kernels/aie2p/softmax.cc` is the fallback, not the starting point.
+2. **~~Corrected `runlist` needs one new operator: a device softmax.~~ THE OPERATOR IS DONE
+   `[2026-08-09]`; the mode is not.** `builders/softmax.py` wraps the existing streaming family in
+   `programming_examples/softmax/softmax.cc` — no kernel was written, and iron's
+   `aie_kernels/aie2p/softmax.cc` was never needed. Three gated shapes including 64×4096, the
+   attention width `runlist` actually wants. Two things it cost, both worth knowing before the next
+   builder:
+
+   - **Give every L1 buffer one role.** Normalizing back into the DMA-destination buffer — dead by
+     then, and legal as far as the kernel's `__restrict` is concerned — made the design return
+     **the input unchanged** from hardware at all three shapes. `builders/layer_norm.py` keeps one
+     role per buffer and that is not style.
+   - **A normalization needs its injection target chosen by measurement.** The standard
+     `(rows-1, 0)` left the negative control **passing** at two of three shapes, and at 512×512 no
+     `atol` admitting the clean run could have rejected the injection. The target is now the last
+     row's argmax.
+
+   What remains for the mode itself: `pattern/runlist/` with nothing on the host.
 3. **Corrected `fused` — ~~fix its build before anything else~~ build FIXED `[2026-08-08]`.** It
    could not build its own SPECS shape: `fused.py:37` has always said the mode is bounded to
    256..1024 and the row was left at 4096, so `prepare_fused` raised in `builders/norm_tail.py`

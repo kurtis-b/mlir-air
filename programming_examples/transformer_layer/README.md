@@ -94,6 +94,7 @@ memory bank) all produce plausible wrong numbers rather than errors.
 | `opcheck_specs.py` | WHICH `(operator, shape)` the port claims and at what `atol`, with the measurement behind every tolerance |
 | `builders/elementwise_add.py` | 2-D element-wise add and the `causal_mask=` keyword over it, plus their FP32 reference |
 | `builders/layer_norm.py` | Multi-row LayerNorm over `layer_norm_rows`, plus its two-pass FP32 reference |
+| `builders/softmax.py` | Row-wise softmax over the STREAMING family in `programming_examples/softmax/softmax.cc` (init / partial / normalize), plus its FP32 reference. Not the single-shot `softmax_bf16` in the same file, which subtracts no row max and fixes the row width |
 | `builders/addnorm.py` | Weighted LayerNorm and a residual in **either order** (`pre_add=`), weight as a runtime argument, plus one FP32 reference per ordering |
 | `builders/qkv_proj.py` | One GEMM over the fused `[K, 3K]` weight with C split three ways on the device, plus its FP32 reference |
 | `builders/gelu.py` | The FFN activation stage over `ffn_gelu_bf16`, plus its FP32 tanh-approximation reference |

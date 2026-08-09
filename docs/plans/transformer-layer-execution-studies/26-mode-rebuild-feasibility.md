@@ -145,6 +145,35 @@ applied upstream (`elementwise_mul`, or folded into Q) or the entry point extend
 `programming_examples/transformer_layer/builders/` references `softmax_streaming.o` today, and the
 object is not currently built in the tree.
 
+> **`[2026-08-09]` BUILT, and two of the gaps above are misstated.** `builders/softmax.py` exists,
+> three `opcheck_specs.py` rows are measured and gated, and `run_npu2_softmax_peano.lit` passes on
+> hardware with its negative control. Corrections to the paragraph above:
+>
+> - **The row-max gap belongs to the single-shot kernel, not the streaming family.**
+>   `partial_softmax_alias_bf16` computes a running row max and rebases the exponentials on it, so
+>   the streaming path is the numerically *safe* one. The paragraph reads as though the whole file
+>   lacks it.
+> - **`SM_LOG2E` is not "the scale" in the sense implied.** It is the base conversion for an
+>   `exp2`-based `exp` — the kernel computes `exp2(x·log2(e) − m)` — so for a plain softmax it is
+>   exactly the right value and there is nothing to extend. It matters only for attention, and the
+>   plumbing is already one level down: `partial_softmax_alias_bf16` takes `scale` as an argument,
+>   so folding in `1/sqrt(head_dim)` is `scale = SM_LOG2E / sqrt(head_dim)` plus a parameter on the
+>   wrapper, not a kernel rewrite.
+>
+> Two things the build cost that were not on anyone's list, both caught by measurement rather than
+> by reading:
+>
+> - **One role per L1 buffer.** The first version normalized back into the DMA-destination buffer,
+>   which was dead by then and legal as far as the kernel's `__restrict` is concerned. The design
+>   returned **the input unchanged** at all three shapes. A buffer that is both a DMA destination
+>   and a kernel output does not read back what the kernel wrote.
+> - **The standard injection target does not discriminate for a normalization.** `(rows-1, 0)`, what
+>   every other row-wise operator here uses, left the injected run **passing** at two of three
+>   shapes — `+2.0` on a low-probability element moves the tensor 1.06e-3 / 7.43e-3 against an
+>   `atol` of 7.5e-3. At 512×512 the injected run's `abs_err_max` *equalled the clean run's*, so no
+>   `atol` admitting the clean run could reject it. The target is now the last row's argmax, chosen
+>   per shape by measurement, which clears `atol` by 12–18×.
+
 **Consequence: the corrected-`runlist` softmax phase is smaller than Spike B priced it.** It is
 builder + gate work over an existing, hardware-gated kernel, not new kernel development.
 

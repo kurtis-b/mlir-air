@@ -1,0 +1,94 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Operator gate: softmax. `[2026-08-09]` The operator corrected `runlist`
+// needs, so that its attention interior can run on the device with nothing on
+// the host.
+//
+// Row-wise softmax over the STREAMING family in
+// programming_examples/softmax/softmax.cc -- init_softmax_scale_buffer, one
+// partial_softmax_rows_bf16 over the whole row, normalize_softmax_rows_bf16.
+// Not the single-shot softmax_bf16 in the same file, which subtracts no row
+// max and fixes the row width at 256; the streaming family does subtract a
+// running max and takes row_width and num_rows as runtime int32. No kernel was
+// written for this: the object was already built by compile_kernels.py and no
+// builder had ever linked it.
+//
+// Three shapes, and the third is the reason the operator exists. 512x512 is
+// the bring-up point and 4096x768 the block's own activation shape; 64x4096 is
+// ATTENTION width, because a per-head score matrix is [seq, seq] and the row
+// width is therefore the sequence length rather than the hidden size. It is
+// also where the builder's L1 budget bites -- three [rows_per_call, cols] bf16
+// buffers live in L1, so rows_per_call drops 8 -> 2 at that width.
+//
+// Runs opcheck.py on real NPU2 against an FP32 reference: np.isclose over the
+// full output at rtol=1.6e-2, zero permitted mismatches, PLUS a mean_rel_L1
+// ceiling. The ceiling is not decoration. A softmax row spans three orders of
+// magnitude, so an atol sized the registry way -- from the worst element -- is
+// set by the few large outputs and is loose against the small ones; the
+// aggregate bound is what an element-wise check cannot express. See
+// opcheck_specs.py for both numbers and how they were measured.
+//
+// NPU serialization lives one layer down, not in the recipes below. Device
+// access is locked on /tmp/npu.lock, which XRTRunner.run_test holds across
+// xclbin load and dispatch -- the same inode lit.cfg.py's NPU substitution and
+// KernelCache take. Taking the outer /tmp/mlir-air-npu.lock here would
+// DEADLOCK against the gate command that already holds it, since BSD flock(2)
+// treats a second open() of the same file as a foreign lock.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming
+// one in prose -- even inside a comment -- registers as a second directive and
+// leaves the test UNRESOLVED. Describe them, never spell them out.
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_npu2_softmax_peano
+// RUN: cd test_npu2_softmax_peano
+// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile check-softmax PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+//
+// Both lines per shape, not just the verdict: the first is XRTRunner's own,
+// the second names the operator and shape, so a test wired to the wrong
+// operator fails here rather than passing quietly.
+// CHECK: PASS!
+// CHECK: [opcheck] softmax [512x512]: PASS
+// CHECK: PASS!
+// CHECK: [opcheck] softmax [4096x768]: PASS
+// CHECK: PASS!
+// CHECK: [opcheck] softmax [64x4096]: PASS
+//
+// THE NEGATIVE CONTROL, WHICH THIS OPERATOR NEEDED MORE THAN MOST.
+//
+// It is a separate arm rather than a shared one because softmax's injection
+// target is chosen per shape BY MEASUREMENT, and that choice is load-bearing.
+// Every other row-wise operator here injects at (rows-1, 0). For softmax that
+// position does not discriminate: +2.0 on a low-probability element moves the
+// whole tensor by 1.06e-3 at 512x512 and 7.43e-3 at 4096x768, against an atol
+// of 7.5e-3, so the injected run PASSED -- measured, not hypothesised, on the
+// first version of these rows. At 512x512 the injected run's abs_err_max
+// equalled the clean run's exactly, so no atol admitting the clean run could
+// have rejected it; the target had to move, not the tolerance.
+//
+// prepare_softmax now perturbs the LAST ROW'S ARGMAX, which moves the tensor
+// 12-18x over atol at all three shapes. What that buys: a control that fails
+// here is saying the comparison resolves a single ELEMENT of a single ROW out
+// of the whole tensor, because softmax is row-independent and everything
+// outside that row must stay exact.
+//
+// RUN: make -f %S/Makefile check-softmax-fault PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s --check-prefix=FAULT
+//
+// The injected element first, so an injection that silently perturbed nothing
+// is visible here rather than read backwards from the verdict. The column is
+// the measured argmax and differs per shape, so it is matched loosely; the ROW
+// is pinned, because "the last row" is the part of the choice that is not
+// data-dependent.
+// FAULT: [fault-inject] input 0 at (511, {{[0-9]+}})
+// FAULT: [opcheck] softmax [512x512]: FAIL
+// FAULT: [opcheck] softmax [512x512]: fault-inject input -> FAIL (as required)
+// FAULT: [fault-inject] input 0 at (4095, {{[0-9]+}})
+// FAULT: [opcheck] softmax [4096x768]: FAIL
+// FAULT: [opcheck] softmax [4096x768]: fault-inject input -> FAIL (as required)
+// FAULT: [fault-inject] input 0 at (63, {{[0-9]+}})
+// FAULT: [opcheck] softmax [64x4096]: FAIL
+// FAULT: [opcheck] softmax [64x4096]: fault-inject input -> FAIL (as required)
+// FAULT: NEGATIVE CONTROL: PASS

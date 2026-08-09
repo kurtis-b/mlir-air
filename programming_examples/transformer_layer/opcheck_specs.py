@@ -66,6 +66,7 @@ from opcheck_prepare import (  # noqa: E402
     prepare_elementwise_mul,
     prepare_ffn,
     prepare_layer_norm,
+    prepare_softmax,
     prepare_mha_out_proj,
     prepare_norm_tail,
     prepare_qkv_proj,
@@ -223,6 +224,80 @@ SPECS = [
         "shape": {"rows": 512, "cols": 512},
         "atol": 5e-2,
         "prepare": prepare_layer_norm,
+    },
+    # ---------------------------------------------------------------------
+    # SOFTMAX. `[2026-08-09]` The operator corrected `runlist` needs, over the
+    # streaming family already in programming_examples/softmax/softmax.cc.
+    #
+    # WHY EVERY ROW HERE CARRIES A mean_rel_L1_max AND THE OTHER ROW-WISE
+    # OPERATORS DO NOT. A softmax row spans three orders of magnitude -- at
+    # cols 768 the largest output is ~1.9e-2 and the mean is 1/768 = 1.3e-3 --
+    # so an `atol` sized the registry way, from the worst ELEMENT, is set by
+    # the handful of large outputs and is loose against the small ones: at
+    # atol 7.5e-3 an expected 1e-4 would accept a returned 0. That is true of
+    # any single atol over a distribution this skewed and it is not fixable by
+    # choosing a different number.
+    #
+    # The element-wise check is kept as-is, per convention, and an AGGREGATE
+    # ceiling is conjoined -- the mechanism opcheck.run_spec already has for
+    # exactly this ("the element-wise check cannot enforce an aggregate
+    # claim"), and which norm_tail uses. Measured mean_rel_L1 is 1.60-1.63e-2
+    # across all three shapes, consistent with bf16 through an exp and a
+    # divide; the ceiling is 2.5e-2, ~1.5x. A device that passed elementwise
+    # while being globally wrong fails there.
+    #
+    # THE CONTROL HAD TO BE FIXED BEFORE THESE ROWS MEANT ANYTHING. Injecting
+    # at (rows-1, 0), which is what every other row-wise operator here does,
+    # left the injected run PASSING at 512x512 and 4096x768 -- +2.0 on a
+    # low-probability element moves the tensor by 1.06e-3 / 7.43e-3 against an
+    # atol of 7.5e-3. softmax is a normalization, so a perturbation's absolute
+    # effect depends on where it lands, and at 512x512 the injected run's
+    # abs_err_max equalled the clean run's exactly: no atol admitting the clean
+    # run could reject that injection. opcheck_prepare.prepare_softmax now
+    # targets the last row's argmax, measured per shape, which moves the tensor
+    # 12-18x over atol at all three.
+    {
+        "operator": "softmax",
+        "shape_key": "512x512",
+        "shape": {"rows": 512, "cols": 512, "rows_per_call": 8},
+        # Measured over 262144 elements: mean_rel_L1 1.630e-2, abs_err_max
+        # 4.883e-3, atol_required 2.570e-3. atol is that rounded up 2.9x.
+        "atol": 7.5e-3,
+        "mean_rel_L1_max": 2.5e-2,
+        "prepare": prepare_softmax,
+    },
+    {
+        # baseline_768 width, at the block's row count.
+        "operator": "softmax",
+        "shape_key": "4096x768",
+        "shape": {"rows": 4096, "cols": 768, "rows_per_call": 8},
+        # Measured over 3145728 elements: mean_rel_L1 1.615e-2, abs_err_max
+        # 4.883e-3, atol_required 2.586e-3. atol is that rounded up 2.9x.
+        "atol": 7.5e-3,
+        "mean_rel_L1_max": 2.5e-2,
+        "prepare": prepare_softmax,
+    },
+    {
+        # ATTENTION WIDTH. This row is the one corrected `runlist` actually
+        # needs -- its per-head score matrix is [seq, seq], so the row width is
+        # the sequence length and not the hidden size. Kept at 64 rows because
+        # what this row exists to prove is that a 4096-wide row works at all;
+        # the full [4096, 4096] is 32 MiB per tensor and belongs to the mode's
+        # own gate rather than to an operator row.
+        #
+        # rows_per_call drops 8 -> 2: three [rows_per_call, cols] bf16 buffers
+        # live in L1, so the row width is what bounds the row count. At 8 this
+        # shape would ask for 192 KiB of a 64 KiB L1.
+        "operator": "softmax",
+        "shape_key": "64x4096",
+        "shape": {"rows": 64, "cols": 4096, "rows_per_call": 2},
+        # Measured over 262144 elements: mean_rel_L1 1.596e-2, abs_err_max
+        # 8.545e-4, atol_required 5.459e-4 -- an order tighter than the 768
+        # rows because the outputs are an order smaller (1/4096 against
+        # 1/768). atol is that rounded up 2.7x.
+        "atol": 1.5e-3,
+        "mean_rel_L1_max": 2.5e-2,
+        "prepare": prepare_softmax,
     },
     {
         # baseline_768, at the block's own row count for the same reason as

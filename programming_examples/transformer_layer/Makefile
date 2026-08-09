@@ -24,6 +24,7 @@ SWEEP_ARGS ?=
 
 .PHONY: help compile runlist-gate seam-tests clean opcheck-list \
         check-elementwise-add check-causal-mask check-layer-norm check-addnorm \
+        check-softmax check-softmax-fault \
         check-qkv-proj check-ffn check-mha-out-proj check-fault-control \
         check-block check-block-fault check-coarse check-coarse-fault \
         check-offload check-offload-fault check-runlist check-runlist-fault \
@@ -201,6 +202,19 @@ check-causal-mask:
 
 check-layer-norm:
 	$(call opcheck,layer_norm)
+
+check-softmax:
+	$(call opcheck,softmax)
+
+# The mode-independent negative control for softmax. It has its own target
+# because the injection target for this operator is chosen per shape by
+# measurement rather than fixed at (rows-1, 0) -- see prepare_softmax -- and
+# that choice is exactly what a control has to keep honest.
+check-softmax-fault:
+	mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
+	    python3 $(srcdir)/opcheck.py --operator softmax \
+	        --fault-inject input --expect-failure
 
 check-addnorm:
 	$(call opcheck,addnorm)

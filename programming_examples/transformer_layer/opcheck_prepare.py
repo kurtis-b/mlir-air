@@ -123,6 +123,10 @@ from builders.layer_norm import (  # noqa: E402
     build_layer_norm_module,
     layer_norm_reference,
 )
+from builders.softmax import (  # noqa: E402
+    build_softmax_module,
+    softmax_reference,
+)
 from builders.norm_tail import (  # noqa: E402
     build_norm_tail_module,
     compile_norm_tail_kernels,
@@ -198,6 +202,57 @@ def prepare_layer_norm(shape, seed=2):
         "inputs": [x],
         "expected": [layer_norm_reference(x)],
         "inject": (0, (rows - 1, 0)),
+    }
+
+
+def prepare_softmax(shape, seed=11):
+    """Row-wise softmax. ``rows_per_call`` is in the shape because L1 bounds it.
+
+    Unlike every other row-wise operator here, the row WIDTH decides how many
+    rows fit: the builder holds two ``[rows_per_call, cols]`` bf16 buffers in
+    L1, so an attention-width row (4096) admits a quarter of what a
+    hidden-width row (768) does. Carrying it in the shape rather than
+    defaulting it keeps the number that was actually measured in the catalogue
+    next to the shape it was measured at.
+
+    THE INJECTION TARGET IS THE LAST ROW'S ARGMAX, AND IT IS MEASURED. Every
+    other row-wise operator here injects at ``(rows-1, 0)``. For softmax that
+    position DOES NOT DISCRIMINATE, and the negative control caught it: at
+    512x512 and 4096x768 the injected run PASSED.
+
+    The reason is that softmax is a normalization, so what a perturbation does
+    in ABSOLUTE terms depends entirely on where it lands. ``+2.0`` on a
+    low-probability element multiplies its exponential by 7.4 and still leaves
+    it small -- measured max |dp| of 1.06e-3 at 512x512 and 7.43e-3 at
+    4096x768, against atol 7.5e-3, so the whole tensor stays inside tolerance
+    while the input it was computed from is wrong. The same delta on the row's
+    LARGEST element moves it by 1.09e-1 and 9.00e-2, 14x and 12x over atol.
+
+    At 512x512 no atol fixes this: the injected run's ``abs_err_max`` equals
+    the clean run's exactly, so any atol that admits the clean run admits the
+    injected one too. The target has to move, not the tolerance.
+
+    So the position is chosen per shape from the golden input, the same way the
+    block's ``ln1_weight`` target was chosen by measurement rather than
+    assumed. It is still within ONE row -- softmax is row-independent, so the
+    control is also saying the comparison resolves a single row out of the
+    whole tensor.
+    """
+    rows, cols = shape["rows"], shape["cols"]
+    rows_per_call = shape.get("rows_per_call", 8)
+    ek.compile_softmax_streaming(vec_len=64)
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((rows, cols)).astype(bfloat16)
+    # argmax of the last row, in f32 so the comparison is not decided by bf16
+    # ties. See the docstring for why index 0 is not usable here.
+    target_col = int(np.asarray(x[rows - 1]).astype(np.float32).argmax())
+    return {
+        "module": build_softmax_module(
+            rows, cols, bfloat16, rows_per_call=rows_per_call
+        ),
+        "inputs": [x],
+        "expected": [softmax_reference(x)],
+        "inject": (0, (rows - 1, target_col)),
     }
 
 
