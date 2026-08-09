@@ -1,13 +1,70 @@
-# `runlist` — the fine-grained point of the execution-strategy taxonomy
+# `runlist` — every operator on the device, nothing on the host
 
-The D2 `encoder_bert` layer with `coarse`'s dispatch schedule held fixed and
-every one of its dispatch units refined into single-operator kernels,
-aggregated into runlists: iron's `pattern/runlist` re-expressed over
-`KernelCache` and the Phase B dispatch model. `prepare_runlist` is the mode's
-entry in the `SPECS` catalogue; `make check-runlist` / `check-runlist-fault`
-run it.
+The D2 `encoder_bert` layer with every operator dispatched individually as its
+own device kernel, aggregated into runlists: iron's `pattern/runlist`
+re-expressed over `KernelCache` and the Phase B dispatch model.
+`prepare_runlist` is the mode's entry in the `SPECS` catalogue;
+`make check-runlist` / `check-runlist-fault` run it.
 
-## The decomposition: a strict refinement of `coarse`'s schedule
+## What it is today `[2026-08-09]`
+
+**427 entries over 17 runlists, nothing on the host.**
+
+| runlist | contents | entries |
+|---|---|---|
+| 1 | `q_proj`, `k_proj`, `v_proj` | 3 |
+| 2..13 | **per head:** `attn_scores` → `softmax` → `attn_output`, device-resident | 3 × 12 = 36 |
+| 14 | `output_proj` | 1 |
+| 15 | 64 × (residual add → LayerNorm → gamma multiply), ln1 | 192 |
+| 16 | `up_proj`, GeLU, `down_proj` | 3 |
+| 17 | 64 × (residual add → LayerNorm → gamma multiply), ln2 | 192 |
+
+The attention GEMM tiles are imported from `pattern/offload/offload.py`'s
+`ATTENTION_GEMM_TILES` rather than copied — they are a measurement, and two
+copies is one of them going quietly stale. The softmax is
+`builders/softmax.py` at `[4096, 4096]`, `rows_per_call = 2`, L1-bounded by the
+row width (for a score matrix the row width IS the sequence length).
+
+**One submission per head is a memory bound, not a schedule choice:** all
+twelve at once would need every score and probability matrix live
+simultaneously, ~800 MiB against ~70 MiB per head. It does not touch the entry
+count, which is what the mode's granularity claim is about.
+
+### The number this rebuild produced
+
+Host↔device bytes against `offload` for the same layer at 4096, decomposed —
+the headline ratio is the weaker figure:
+
+| | attention | everything else | total |
+|---|---|---|---|
+| `offload` (host softmax) | 830,472,192 | 139,984,896 | 970,457,088 |
+| `runlist` (device softmax) | 25,165,824 | 165,347,328 | 190,513,152 |
+| ratio | **33.0×** | 0.85× | 5.1× |
+
+The 5.1× total **understates** it: this mode pays ~25 MB more than `offload` on
+its banded norm chains, so the confound opposes the result rather than
+producing it. And the non-attention figure is byte-identical to this mode's
+pre-rebuild pinned total, which says independently that the rebuild touched
+attention and nothing else.
+
+Accuracy cost of a bf16 device softmax against the f32 host one: `attn_context`
+`mean_rel_L1` 6.665e-2 here against `offload`'s 1.554e-2, and the layer output
+needs `atol` 6.981e-2 against the 1e-1 ceiling — a 1.43× margin, between this
+mode's old 1.41× and `offload`'s 1.73×. No tolerance was widened.
+
+One consequence outside this mode: with `runlist` on the device, **all four
+modes are**, so `attention_path` is no longer a covariate in this study and the
+first sequence ladder's slope split cannot be reproduced. See
+`study/test_attention_path.py`, which now asserts that end state.
+
+## `[history]` The superseded decomposition: a strict refinement of `coarse`'s schedule
+
+> Everything from here down describes the mode as it was BEFORE the 2026-08-09
+> rebuild — 391 entries over five runlists with attention in host torch. It is
+> kept because the ordinal argument it makes (why the norm chains are banded
+> rather than streamed) still governs runlists 15 and 17, and because the
+> host-attention reasoning is a worked example of a catalogue constraint being
+> read as a hardware one.
 
 391 entries over five runlists, each entry one operator kernel. The left
 column is `coarse`'s measured dispatch schedule (4 submissions, 131 entries);
@@ -66,48 +123,12 @@ section. Its count is not carried across for the same reason `coarse`'s 131
 is not iron's 12: entry counts are re-derived at `baseline_768` under this
 hardware's dispatch caps (08d §Do not carry iron's entry count across).
 
-## Why attention is host torch, and what that removes
+## `[history]` Why attention was host torch, and what that removed
 
-> **`[2026-08-08]` This section describes what this mode does TODAY, and it is
-> not what the corrected taxonomy requires.** `runlist` is defined as every
-> operator individually **on the device, nothing on the host**, so host
-> attention is a gap to close, not a property. The reasoning below is also
-> wrong about why: the missing registry rows are a CATALOGUE constraint, not a
-> hardware one — both attention shapes are measured passing on real NPU2, and
-> `offload` now dispatches them (see `pattern/offload/README.md`). What
-> `runlist` additionally needs, and `offload` does not, is a **device
-> softmax**. `[2026-08-09]` **Both are now done and this mode is rebuilt.** The
-> section below describes the superseded host-attention structure and is kept
-> as a record; what the mode does today is at the top of
-> `pattern/runlist/runlist.py`.
->
-> **427 entries over 17 runlists, nothing on the host.** Per head:
-> `attn_scores` → `softmax` → `attn_output`, all three device-resident inside
-> one submission. The GEMM tiles are imported from
-> `pattern/offload/offload.py`'s `ATTENTION_GEMM_TILES` rather than copied;
-> the softmax is `builders/softmax.py` at `[4096, 4096]`, `rows_per_call = 2`
-> (L1-bounded by the row width, which for a score matrix IS the sequence
-> length). One submission per head is a **memory** bound — all twelve at once
-> would need ~800 MiB of score and probability matrices live simultaneously
-> against ~70 MiB per head — and it does not touch the entry count.
->
-> **The number this rebuild produced.** `bytes` 190,513,152 against `offload`'s
-> 970,457,088 for the same layer, **5.1×**, entirely because of where the
-> softmax runs: `offload` puts it on the host so each `[4096, 4096]` score
-> matrix crosses DRAM twice, here it never leaves the array. That is the
-> corrected taxonomy's actual axis — reconfiguration against DRAM traffic —
-> measured on two modes that differ in exactly that and nothing else.
->
-> Accuracy cost of a bf16 device softmax against the f32 host one:
-> `attn_context` `mean_rel_L1` 6.665e-2 here against `offload`'s 1.554e-2, and
-> the layer output needs `atol` 6.981e-2 against the 1e-1 ceiling — a 1.43×
-> margin, between `runlist`'s old 1.41× and `offload`'s 1.73×. No tolerance was
-> widened.
->
-> One consequence outside this mode: with `runlist` on the device, **all four
-> modes are**, so `attention_path` is no longer a covariate in this study and
-> the first sequence ladder's slope split cannot be reproduced. See
-> `study/test_attention_path.py`, which now asserts that end state.
+> **`[superseded]`** The mode dispatches all of this on the device now; see the
+> top of this file. Kept because the reasoning below is wrong in an
+> instructive way: the missing registry rows are real, and the conclusion
+> drawn from them — that the hardware cannot run these shapes — was not.
 
 The two attention GEMMs are `4096 x 64 x 4096` and `4096 x 4096 x 64`; no
 `K = 64` or `N = 64` bf16-out row exists in the registry and the C4 sweep
@@ -133,26 +154,28 @@ Driver-summed totals for one layer (clean and fault-injected runs identical;
 the six literals are pinned in `run_npu2_runlist_peano.lit`, both halves):
 
 ```
-host submissions   5      runlist entries  391     air launches     14
-herd launches    404      sync boundaries  403     bytes    165,347,328
+host submissions  17      runlist entries  427     air launches     50
+herd launches    488      sync boundaries  451     bytes    190,513,152
 ```
 
-Against `coarse`'s 4 / 131 / 12 / 146 / 402 / 202,902,528: more entries (the
-ordinal clause, by construction), more submissions (the attention seam plus
-the banding restages), 2.8× the herd launches (384 of the 404 are the two
-chains' band launches), one more sync boundary, and fewer bytes — the
-streaming q/k/v/attention path is leaner than `coarse`'s fused mha even with
-the norm chains restaged, and the gamma broadcasts shrink from `[4096, 768]`
-to one shared `[64, 768]` band per norm point.
+All ten stage boundaries clean; layer output `mean_rel_L1` 1.746e-2 at
+`atol_required` 6.981e-2 — a 1.43× margin under the 1e-1 ceiling.
 
-All ten stage boundaries clean; layer output mean_rel_L1 1.732e-2 at
-atol_required 7.077e-2 — a 1.41x margin under the 1e-1 ceiling, between
-`offload`'s 1.82x (host norms) and the block's 1.35x (device fused norms),
-which is where device norms + host f32 attention should land. The banded
-chains produce bit-identical boundary tensors to the streaming structure
-(row-wise and element-wise operators do not see the banding), so these
-figures match the first structure's exactly — the restructuring moved
-dispatch structure, not arithmetic.
+**The `coarse` comparison this section used to make is suspended.** It read
+these totals against `coarse`'s 4 / 131 / 12 / 146 / 402 / 202,902,528, and
+that pairing no longer isolates anything: `coarse` still runs the D2 block
+with attention fused inside `mha_out_proj`, while this mode now decomposes the
+attention interior into 36 entries of its own. The two differ in operator
+granularity AND in where attention is expressed, which is two variables. The
+entry-count ordinal clause still holds by construction — 427 against 131, and
+every `coarse` dispatch unit still maps onto one or more finer units here — but
+the byte and sync readings are not a controlled comparison until `coarse` is
+rebuilt. See `pattern/offload/README.md` for the one cross-mode pair that IS
+controlled today.
+
+`[history]` The pre-rebuild totals were 5 / 391 / 14 / 404 / 403 / 165,347,328.
+The last of those survives exactly as this mode's non-attention traffic, which
+is what says the rebuild touched attention and nothing else.
 
 ## Footguns (each cost time; read before editing)
 

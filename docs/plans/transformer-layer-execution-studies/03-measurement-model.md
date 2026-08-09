@@ -73,21 +73,43 @@ existing production mechanism, and adding it as a measured point is what makes t
 rather than duplicative. Per convention rule 7, code and directories say `coarse`; only the CSV
 value says `hybrid`, and that mapping lives in one place in the schema module.
 
-### What is implemented instead, and the size of each gap
+### What is implemented, and what is left
 
-| Mode | Implemented today | Gap |
+`[2026-08-09]` **Rewritten.** This section used to size four gaps against the corrected definitions.
+Three of the four are now closed and the fourth is untouched, so it lists state rather than gaps.
+The superseded version is not kept: it was a to-do list, and a stale to-do list is worse than none.
+
+| Mode | Implemented today | Left |
 |---|---|---|
-| `runlist` | every operator individually on device **except attention, which is host torch** | **attention must move to the device.** This is J2, and it is a search: `attn_scores` already passes on hardware, `attn_output` timed out on 1 of 828 legal configurations. Measured at 1024: 24.15 ms of host attention, 47.8% of the mode's total — so today the mode prices host torch, not reconfiguration |
-| `offload` | six registry GEMMs dispatched one at a time, **everything else host torch** | three gaps. (a) The **two attention matmuls are linear and belong on the NPU** under the corrected rule, and they resolve in no registry — see the `[2026-08-05]` note under §The dispatch vector, which established that the C4 sweep cannot be made to produce them. (b) Only the non-linear operators — softmax, both LayerNorms, GeLU — should be on the host; today far more is. (c) Runtime loop-bound reconfiguration does not exist, and whether the stack can do it without a full reconfigure is **unestablished** — `runtime_loop_tiling_sizes` is a compile-time backend kwarg today. Net: the mode is currently the *most* host-mediated of the four rather than the reconfiguration-minimizing one |
-| `coarse` | the D2 block: five coarse fused kernels, four submissions | not a blend of anything. It cannot become one until `runlist` and `fused` mean what they should |
-| `fused` | **three ELFs**, and every operator boundary inside the tail still round-trips through DRAM | two gaps, and the second is the larger. One xclbin is blocked by a **backend-settings conflict** this mode already documents: FlashAttention needs `omit_pingpong="all"` + `runtime_loop_tiling_sizes=[1,1]`, the wide GEMMs need `[2,2]`, and one ELF is one aircc invocation. "No DRAM between operators" needs the whole layer L1/L2-resident — `norm_tail` (J7a) does that for the two norm points, `ffn_accum` (J7b) for the down-projection K loop, and nothing does it for the rest |
+| `runlist` | **every operator individually on the device, nothing on the host.** 427 entries over 17 runlists; per head `attn_scores` → `softmax` → `attn_output`, device-resident inside one submission. Gated 2026-08-09 | nothing for the definition |
+| `offload` | **every LINEAR operator on the NPU, every NON-LINEAR one on the host** — six projections plus both attention matmuls, with softmax / both LayerNorms / GeLU on the host. 30 dispatches. Gated 2026-08-08 | the reconfiguration half: **N instruction streams under one xclbin**. Plumbed but never dispatched. Until it lands the mode implements iron's *partition* while still paying a reconfiguration per dispatch, so it is not yet measuring what it is for |
+| `fused` | **three ELFs at seq 1024**, every operator boundary inside the tail still round-tripping through DRAM. Gated 2026-08-08 | one xclbin, blocked twice over — see below — and "no DRAM between operators", which is capacity-bounded rather than engineering-bounded: 6 MiB on chip against one 6 MiB S×F intermediate at 1024 |
+| `coarse` | the D2 block: five coarse fused kernels, four submissions | everything. It is defined as a per-workload *blend*, which is a choice per operator between an individual dispatch and a fused region, and nothing in the port expresses such a choice yet |
 
-**The measurement consequence.** Every result recorded before this correction — including the
-sequence ladder in [25](25-first-study-result-sequence-ladder.md) and its crossover — ranks four
-modes that are not the four modes the study means. The device/host split now recorded per mode
-(`device_ms`, `sync_ms`, `host_cpu_ms`) is what makes the difference visible: `offload` has the
-second-lowest **device** time of the four and the highest total, because 61.6% of it is host torch
-it is not supposed to be running at all.
+**`fused`'s one-xclbin blocker, measured rather than asserted.** `[2026-08-09]` FlashAttention
+requires `runtime_loop_tiling_sizes=[1,1]` and the wide GEMMs are built at `[2,2]`; one ELF is one
+aircc invocation. At `[2,2]` `mha_out_proj` @4096 compiles and then **hangs**
+(`ERT_CMD_STATE_TIMEOUT`, 3/3, against 3/3 clean passes at `[1,1]`). Two corrections travel with
+that: `omit_pingpong` is **not** part of the conflict, and the two settings produce **identical
+lowered IR**, so a compile-only comparison "refutes" the conflict and is wrong to — which is what
+[26 §4](26-mode-rebuild-feasibility.md) did before its retraction. The second blocker is
+`air-fuse-channels`, which is O(N²) in channels and did not finish in 1200 s on a 90-channel stitch.
+
+**The measurement consequence, restated for the current state.** Every result recorded before the
+taxonomy correction — including the sequence ladder in
+[25](25-first-study-result-sequence-ladder.md) and its crossover — ranks four implementations that
+are not these four modes, and additionally differed in **attention placement**, which is what its
+slopes actually split on. That covariate is now gone: all four modes run attention on the device, so
+the split cannot be reproduced and `attention_path` is constant across every row a run can produce.
+
+**Two things to check before building any cross-mode table from the catalogue as it stands.** The
+modes are **not at one sequence length** — `fused` is at 1024, the other three at 4096 — so a table
+assembled from the SPECS rows compares two lengths. And the one clean cross-mode number recorded so
+far is DRAM traffic at 4096, and it should be read DECOMPOSED rather than as its headline ratio:
+`runlist` 190,513,152 bytes against `offload` 970,457,088 is 5.1× overall, but on the **attention**
+component it is 25,165,824 against 830,472,192 — **33×** — which is the part the taxonomy is about.
+The total understates it because `runlist` additionally pays ~25 MB more on its banded norm chains,
+a confound that opposes the effect rather than producing it. The README carries the full table.
 
 ### The superseded taxonomy — "who sequences the work"
 

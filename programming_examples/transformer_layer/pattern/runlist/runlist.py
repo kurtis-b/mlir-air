@@ -556,8 +556,9 @@ def prepare_runlist(shape, seed=42):
     same injection target (``ln1_weight`` — the measured choice; here it feeds
     the first gamma multiply, scaling one column of ``hidden`` and cascading
     through both residual paths exactly as in the block). What differs is the
-    execution boundary: coarse's schedule refined into single-operator
-    entries, five runlists with host torch attention after the first.
+    execution boundary: every operator its own device kernel, nothing on the
+    host, over ``runlist_submission_count`` runlists — 17 at the gate
+    configuration, twelve of them the per-head attention interior.
     """
     seq_len, emb_dim = shape["seq_len"], shape["emb_dim"]
     ffn_dim, num_heads = shape["ffn_dim"], shape["num_heads"]

@@ -16,7 +16,7 @@ how to use MLIR-AIR.
 | [00-context-and-goals.md](00-context-and-goals.md) | Why this port, what is being ported, success criteria |
 | [01-port-inventory.md](01-port-inventory.md) | Per-artifact triage: port / adapt / rewrite / drop |
 | [02-porting-conventions.md](02-porting-conventions.md) | **How iron code is refactored into MLIR-AIR house style.** Reviewable checklist |
-| [03-measurement-model.md](03-measurement-model.md) | The execution-boundary taxonomy, the dispatch vector, CSV schema v1 |
+| [03-measurement-model.md](03-measurement-model.md) | **The definition of the four modes, and it is current.** The corrected taxonomy (reconfiguration cost against DRAM traffic), what is implemented against it today, the dispatch vector, CSV schema v1 |
 | [04-phase-a-kernels.md](04-phase-a-kernels.md) | AIE2P device kernels |
 | [05-phase-b-runtime-seam.md](05-phase-b-runtime-seam.md) | Runlist aggregation + BO liveness pooling |
 | [06-phase-c-operators.md](06-phase-c-operators.md) | The six new operators as AIR builders — **overview**; the four sub-phase specs are [06a](06a-phase-c1-gate-and-small-operators.md) · [06b](06b-phase-c2-qkv-proj-and-ffn.md) · [06c](06c-phase-c3-mha-out-proj.md) · [06d](06d-phase-c4-coverage-sweep.md) |
@@ -29,16 +29,17 @@ how to use MLIR-AIR.
 | [13-verification-and-acceptance.md](13-verification-and-acceptance.md) | Every gate, in one place |
 | [14-the-port-loop-harness.md](14-the-port-loop-harness.md) | The automated driver: how it works, how to run a phase, what it learned the hard way |
 | [15-environment-notes.md](15-environment-notes.md) | Toolchain state and the setup traps that silently hollow out hardware gates |
-| [16-compiler-work-and-remaining-essence.md](16-compiler-work-and-remaining-essence.md) | **Start here for what remains.** Tranche H (compiler) and tranche J (the study), the corrected root cause, and what AIR automates versus what iron writes by hand |
+| [16-compiler-work-and-remaining-essence.md](16-compiler-work-and-remaining-essence.md) | Tranche H (compiler) and tranche J (the study), and what AIR automates versus what iron writes by hand. **Its J2 row is false** — the `attn_output` timeout and the "828 legal configurations" it cites have no artifact and the first configuration tried passes |
 | [17-phase-h-compiler-hardening.md](17-phase-h-compiler-hardening.md) | Phase H spec plus its attempt-by-attempt record — including two of its own claims that measurement falsified |
 | [18-phase-h1s-skip-not-refuse.md](18-phase-h1s-skip-not-refuse.md) | H's correction, run fresh rather than resumed: the safety proof declines to *transform*, never to compile |
 | [19-phase-j1-collapse-norm-dispatches.md](19-phase-j1-collapse-norm-dispatches.md) | J1 — blocked, with both walls it hit measured and recorded |
 | [20-phase-h9-fuse-through-parallel.md](20-phase-h9-fuse-through-parallel.md) | H9 — the packet fusion that only ever worked on one column, and what it took to fix |
 | [21-phase-j7a-norm-tail-pipeline.md](21-phase-j7a-norm-tail-pipeline.md) | J7a — the norm-tail pipeline. **The first working piece of the dataflow goal** |
-| [22-phase-j7b-accumulator-ring.md](22-phase-j7b-accumulator-ring.md) | **The next phase, staged and not started.** Partial sums that never leave the chip, with the compiler forming the ring |
-| [23-rules-and-open-items.md](23-rules-and-open-items.md) | **Start here.** The rules that govern later work, and the open items nobody has claimed |
+| [22-phase-j7b-accumulator-ring.md](22-phase-j7b-accumulator-ring.md) | J7b — **landed** 2026-08-07. Partial sums that never leave the chip, with the compiler forming the ring |
+| [23-rules-and-open-items.md](23-rules-and-open-items.md) | **Read before building anything.** The design rules that govern later work — the per-column shim budget, the L3-side offset rule, one process per measurement — and the open items nobody has claimed |
 | [24-phase-h10-non-constant-bd-offsets.md](24-phase-h10-non-constant-bd-offsets.md) | **Substance verified, tamper baseline not clean.** The silent miscompile J7b lost a session to, located: an unchecked `std::optional` deref in `air-to-aie` |
-| [25-first-study-result-sequence-ladder.md](25-first-study-result-sequence-ladder.md) | **`[retracted 2026-08-08]` It measures the current implementations, not the study's four modes.** This entry used to promote it as "the first study RESULT rather than a capability" and as a `fused`/`coarse` crossover. That promotion is withdrawn. The measurement itself stands — 16 rungs, walked twice on hardware, every rung validated — but the four things it ranks are the four *implementations* named `runlist` / `offload` / `coarse` / `fused`, and none of them yet matches the corrected taxonomy in [03 §The taxonomy](03-measurement-model.md). Two of the four still run attention on the host, which is what its slopes split on. Read it as a measurement of what is built today |
+| [25-first-study-result-sequence-ladder.md](25-first-study-result-sequence-ladder.md) | **`[retracted]` Do not cite the crossover or the slopes.** It ranks four *implementations* that predate the corrected taxonomy, and its explanation — that the slopes split on attention placement — is now **unreproducible**, because as of 2026-08-09 all four modes run attention on the device. The measurement stands as a record of what was built on 2026-08-08 |
+| [26-mode-rebuild-feasibility.md](26-mode-rebuild-feasibility.md) | **The feasibility record for the mode rebuilds — read it for its CORRECTIONS, not as current state.** It opens with six things the plan had wrong, three of which have since been settled by hardware, two of them against what it concluded. **§4 is retracted** (`runtime_loop_tiling_sizes` is not inert) and **§5 is corrected twice** (the missing row-max is the single-shot kernel's, not the streaming family's; `SM_LOG2E` is a base conversion, not a blocking scale). Its §6 was right and is fixed |
 
 ## Status board
 
@@ -82,33 +83,88 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | Goal 1 — sliding window | `make verify` passes with window-crossing prompts | not started |
 | Goal 2 — quantization | Second quantized model passes a gate that exercises the quantized path | not started |
 
-## `[2026-08-08]` Where things stand, for a session picking this up cold
+## `[2026-08-09]` Where things stand, for a session picking this up cold
 
-**Read [26](26-mode-rebuild-feasibility.md) first.** The four execution modes were re-specified by
-the author on 2026-08-08, all four implementations diverge from the new definitions, and doc 26
-opens with **six things the plan had wrong** — three of which were blocking work that turned out not
-to be blocked. Then [03 §The taxonomy](03-measurement-model.md) for what the modes now mean, and
-[23](23-rules-and-open-items.md) for the rules that govern everything downstream.
+**All four modes now exist in some corrected form, and the study can be re-measured.** That is new
+as of 2026-08-09 and is the single most important thing to know: the plan spent two days blocked on
+claims that turned out to be wrong, and the documents still carry those claims with retractions
+attached rather than deleted.
 
-> **`[2026-08-08, later the same day]` Two of doc 26's six are themselves now settled by hardware,
-> in opposite directions.** Its **§4 is retracted**: `runtime_loop_tiling_sizes` is *not* inert, and
-> the backend-settings conflict it declared false is real — `mha_out_proj` at `[2,2]` compiles and
-> then hangs, 3/3, against 3/3 clean passes at `[1,1]`, with `omit_pingpong` irrelevant either way.
-> Its **§6 is confirmed and fixed**: `make check-fused` really was red, and the row is moved to 1024
-> and green. Doc 26 carries both corrections inline. The methodological lesson is §4's, and it is
-> the same one this plan keeps paying for — a compile-only observation ("the lowered IR is
-> identical") was turned into a hardware conclusion ("the knob is inert"), and the caveat against
-> exactly that was written down in the same section and then not applied.
+**Read in this order.** [03 §The taxonomy](03-measurement-model.md) for what the four modes mean —
+that is the definition and it is current. Then this section. Then
+[23](23-rules-and-open-items.md) for the design rules that govern anything you build.
+[26](26-mode-rebuild-feasibility.md) is the feasibility record and is worth reading *for its
+corrections*, not as current state: it opens with six things the plan had wrong, and three of those
+six have since been settled by hardware, two of them against what it concluded. Its §4 is
+**retracted** inline.
 
-**The one-paragraph version.** The modes are no longer defined by *who sequences the work* but by
+**The one-paragraph version.** The modes are not defined by *who sequences the work* but by
 **reconfiguration cost against DRAM traffic**: `runlist` pays per-operator reconfiguration with
-everything on device, `offload` minimizes it (one xclbin, N instruction streams — matching iron; all
-LINEAR operators on the NPU, all NON-LINEAR on the host), `fused` eliminates DRAM traffic between
-operators, and `coarse` blends `runlist` and `fused`. Every measurement recorded before that
-correction — including [25](25-first-study-result-sequence-ladder.md)'s ladder and crossover — ranks
-four implementations that are not those four modes.
+everything on device, `offload` minimizes reconfiguration (one xclbin, N instruction streams —
+matching iron; all LINEAR operators on the NPU, all NON-LINEAR on the host), `fused` eliminates DRAM
+traffic between operators, and `coarse` blends `runlist` and `fused`.
 
-**Two rules to know before designing anything.**
+### The four modes, as they actually are today
+
+| Mode | State | What is left |
+|---|---|---|
+| `runlist` | **Corrected and gated** 2026-08-09. 427 entries over 17 runlists, nothing on the host. Per head `attn_scores` → `softmax` → `attn_output`, device-resident inside one submission | Nothing for the definition. One submission per head is a memory bound (~800 MiB if batched), not a schedule choice |
+| `offload` | **Half corrected and gated** 2026-08-08. The LINEARITY half is done: both attention matmuls on device, only softmax / both LayerNorms / GeLU on the host | **N instruction streams under one xclbin** — untouched, and it is where the mode's reconfiguration-minimizing claim actually gets tested. Already plumbed (`xclbin_input`, `xrt.py:80`, `:372-374`), never dispatched. Touches `llms/shared/infra/dispatch.py:685`, shared with `fused` |
+| `fused` | **Builds and gates again** 2026-08-08, at **1024** — it was red and unrunnable, pinned at a 4096 its own builder rejects | One xclbin is blocked, now for a *measured* reason (below) plus `air-fuse-channels`. "No DRAM between operators" is capacity-bounded: 6 MiB on chip against one 6 MiB S×F intermediate at 1024 |
+| `coarse` | **Untouched, and now the front of the queue** — both its inputs are correct | Everything. See the warning below about what "a blend" has to mean |
+
+### The first result on the corrected axis
+
+Host↔device bytes for the same layer at 4096, decomposed — because the headline ratio is the
+*weaker* of the two numbers here:
+
+| | attention | everything else | total |
+|---|---|---|---|
+| `offload` (host softmax) | 830,472,192 | 139,984,896 | **970,457,088** |
+| `runlist` (device softmax) | 25,165,824 | 165,347,328 | **190,513,152** |
+| ratio | **33.0×** | 0.85× | 5.1× |
+
+**On the attention component it is 33×**, and that is the number the taxonomy is about. `offload`
+puts the softmax on the host, so each head's `[4096, 4096]` score matrix crosses DRAM in both
+directions; `runlist` keeps it on the array and only `q_h`/`k_h_t`/`v_h` in and `ctx_h` out cross.
+
+The 5.1× total **understates** it, because the two modes also differ in norm-chain granularity and
+that difference runs the *other* way: `runlist` bands its two normalization points into 64 dispatches
+each and pays 25 MB more than `offload`, which does its norms on the host. So this is not a
+single-variable comparison in the strict sense — but the confound opposes the effect rather than
+producing it, which is the direction that makes a result safe to read.
+
+**A free provenance check that the decomposition is real:** `runlist`'s non-attention total,
+165,347,328, is *byte-identical* to the total its gate pinned before the rebuild. The rebuild
+touched attention and nothing else, and the arithmetic says so independently of anyone's account
+of what changed.
+
+Every earlier cross-mode comparison, [25](25-first-study-result-sequence-ladder.md) included,
+differed in attention *placement* as well as in the variable under study, and was confounded in the
+direction of its own conclusion.
+
+### Three traps in the current state, before you measure anything
+
+**1. The modes are no longer at the same sequence length.** `fused`'s SPECS row is at **1024**;
+`coarse`, `runlist` and `offload` are at **4096**. Any cross-mode table built from the catalogue as
+it stands compares two sequence lengths. `fused`'s own gate used to read its `sync 19` against
+`coarse`'s 402 and call that its gating clause; that comparison is **suspended**, not restated.
+Re-establishing any cross-mode ranking means measuring every mode at one length, which is Phase F's
+job and is the largest single thing outstanding.
+
+**2. `attention_path` is no longer a covariate.** All four modes are on the device side now. The
+first sequence ladder's headline — slopes splitting on attention placement, host 1.23–1.27 against
+device 1.03–1.17 — **cannot be reproduced**, because no mode sits on the host side any more. A rerun
+showing separated slopes is measuring something else and needs a new explanation, not the old one
+restated. `study/test_attention_path.py` asserts that end state and will fail if a mode moves back.
+
+**3. `coarse` needs a decision procedure that does not exist.** It is defined as a *per-workload
+blend* of `runlist` and `fused` — a choice, per operator, between an individual dispatch and a fused
+region. Nothing in the port expresses such a choice: the D2 block `coarse` currently wraps is a
+fixed five-kernel sequence. Scoping `coarse` means deciding what the blend is selected *by* before
+writing any of it.
+
+### Two rules to know before designing anything
 
 *A column has **two shim MM2S channels**, and the budget is per column **across the whole
 segment*** — three stacked 8-wide herds put one tile of each into every column, so their L3 demands
@@ -124,104 +180,61 @@ not say so — it dereferences an unchecked `std::optional` and emits a chain th
 offset forever, which presents as a hardware hang with no compile-time signal. J7b lost a session
 to it. See [23](23-rules-and-open-items.md) and [24](24-phase-h10-non-constant-bd-offsets.md).
 
-**Where the live threads stand:**
+### Three things the mode rebuilds established that are not in any phase spec
 
-1. **~~Corrected `offload` is unblocked and is the next thing.~~ DONE `[2026-08-08]`, and gated.**
-   Both attention matmuls are on the device, tiles injected through `gemm_spec_fn`
-   (`gemm_spec_source: registry+injected`); only the softmax between them, both LayerNorms and the
-   GeLU are on the host. `run_npu2_offload_peano.lit` **passes on hardware**, both recipes: 10/10
-   stages clean, 30 dispatch vectors, `submissions 30 entries 30 air 31 herd 91 sync 91 bytes
-   970457088`, and the negative control still exact through the attention half. No registry write,
-   no compiler work, no new operator, and **no tolerance was widened** — `attn_context` needs
-   `atol` 8.800e-05 against the 1.0e-03 the boundary allows (11.4×) and the layer output 5.788e-02
-   against the 1e-1 ceiling (1.73×, the widest of the four modes).
+- **`runtime_loop_tiling_sizes` is not inert, and the lowered IR will tell you it is.** `[2,2]`
+  makes `mha_out_proj` @4096 compile and then **hang** — `ERT_CMD_STATE_TIMEOUT`, 3/3, against 3/3
+  clean passes at `[1,1]` — while aircc's `aie.air.mlir` is identical op-for-op between the two
+  settings. `omit_pingpong` is irrelevant at that shape and had been cited as half the reason. So
+  the backend-settings conflict `fused.py` / `mha_out_proj.py` / `block.py` document is **real**, and
+  doc 26 §4's compile-only refutation of it is retracted. Reproduce with
+  `agents/probes/probe_backend_preset_hardware.py`.
+- **Give every L1 buffer one role.** A buffer that is both a DMA destination and a kernel output
+  does not read back what the kernel wrote. `builders/softmax.py`'s first version normalized into
+  its own DMA-destination buffer — dead by then, and legal as far as the kernel's `__restrict` is
+  concerned — and the design returned **the input unchanged** at all three shapes.
+- **A normalization needs its fault-injection target chosen by measurement.** The standard
+  `(rows-1, 0)` left softmax's negative control **passing** at two of three shapes: `+2.0` on a
+  low-probability element moves the tensor less than `atol`, and at 512×512 the injected run's
+  `abs_err_max` equalled the clean run's, so no `atol` admitting the clean run could reject it. The
+  target had to move, not the tolerance.
 
-   **What it costs is the mode's result, not a regression:** a host softmax between two device
-   matmuls sends the full `[seq, seq]` score matrix through DRAM twice per head, so bytes go
-   139,984,896 → 970,457,088, a **6.9×** increase, and the mode is much slower at 4096 than the
-   six-GEMM form it replaces. Pricing that is the point. What remains for this mode is the
-   N-instruction-streams-under-one-xclbin half, which is untouched and is where its
-   reconfiguration-minimizing claim actually gets tested.
-2. **~~Corrected `runlist` needs one new operator: a device softmax.~~ THE OPERATOR IS DONE
-   `[2026-08-09]`; the mode is not.** `builders/softmax.py` wraps the existing streaming family in
-   `programming_examples/softmax/softmax.cc` — no kernel was written, and iron's
-   `aie_kernels/aie2p/softmax.cc` was never needed. Three gated shapes including 64×4096, the
-   attention width `runlist` actually wants. Two things it cost, both worth knowing before the next
-   builder:
+### The device queue
 
-   - **Give every L1 buffer one role.** Normalizing back into the DMA-destination buffer — dead by
-     then, and legal as far as the kernel's `__restrict` is concerned — made the design return
-     **the input unchanged** from hardware at all three shapes. `builders/layer_norm.py` keeps one
-     role per buffer and that is not style.
-   - **A normalization needs its injection target chosen by measurement.** The standard
-     `(rows-1, 0)` left the negative control **passing** at two of three shapes, and at 512×512 no
-     `atol` admitting the clean run could have rejected the injection. The target is now the last
-     row's argmax.
+**`devq` is the device scheduler and the migration is done** `[2026-08-08]`.
+`agents/scripts/devq.sh` — builds run concurrently, a measure runs alone with no build in flight,
+stale jobs reconcile by process liveness. **Use `devq.sh run`, not `submit`**: `run` is the drop-in
+for `flock -x LOCK CMD` because it relays the job's output to stdout and exits with the job's
+status, where `submit` diverts output to the job log and returns an id — substituting *that* at a
+gate blanks the FileCheck while still exiting 0. It also refuses to nest. All 23 `flock` sites in
+`phases.sh` and `llama32_1b_int4`'s `run-inference` are migrated; `make chat` keeps the bare lock
+because the runner is `setsid` with stdin from `/dev/null` and a REPL under it reads EOF.
+`devq-selftest.sh` is **20/20**.
 
-   What remains for the mode itself: `pattern/runlist/` with nothing on the host.
-3. **Corrected `fused` — ~~fix its build before anything else~~ build FIXED `[2026-08-08]`.** It
-   could not build its own SPECS shape: `fused.py:37` has always said the mode is bounded to
-   256..1024 and the row was left at 4096, so `prepare_fused` raised in `builders/norm_tail.py`
-   (plane_major stride over the shim `aie.dma_bd` cap) before aircc. The gate was run, confirmed
-   red, and the row is **moved to 1024**; `run_npu2_fused_peano.lit` now passes on hardware, 10/10
-   stages, `mean_rel_L1` 1.756e-2 at `atol_required` 5.813e-2. Two registry facts moved with the
-   shape: the FFN down-projection resolves to `drain` at 1024 (`fused-cast` at 4096), so the
-   stitched tail takes 11 whole-tensor args, not 16.
+### Compiler-side threads, unchanged by the mode work
 
-   **The settings conflict is REAL** — doc 26 §4's refutation of it is retracted, see the note
-   above. `[2,2]` hangs `mha_out_proj` on hardware. So one xclbin stays blocked, now for a measured
-   reason plus `air-fuse-channels`, and the no-DRAM-between-operators half remains
-   capacity-bounded (6 MiB on chip against one 6 MiB S×F intermediate at 1024).
-
-   **The cross-mode comparison this gate used to make is suspended**, not restated: it read its
-   `sync 19` against `coarse`'s 402, and `coarse` is still a 4096 row while `fused` is now 1024.
-   Re-establishing that ranking means measuring both at one length, which is Phase F's job.
-4. **Corrected `coarse` is last, by definition** — it is a mix of `runlist` and `fused`, so both
-   must be right first. `[2026-08-09]` `runlist` is done and `fused` builds again, so this is now
-   the front of the queue. Note what "a blend" has to mean concretely before it is scoped: `coarse`
-   must choose, per workload, between an individually dispatched kernel and a fused region, and
-   nothing in the port yet expresses that choice — the D2 block it currently wraps is a fixed
-   five-kernel sequence, not a decision procedure.
-5. **`devq` is the device scheduler, and the migration is now DONE `[2026-08-08]`.**
-   `agents/scripts/devq.sh` — builds run concurrently, a measure runs alone with no build in
-   flight, stale jobs reconcile by process liveness. **Use `devq.sh run`, not `submit`**: `run` is
-   the drop-in for `flock -x LOCK CMD` because it relays the job's output to stdout and exits with
-   the job's status, where `submit` diverts output to the job log and returns an id — substituting
-   *that* at a gate blanks the FileCheck while still exiting 0. `run` was added for this migration,
-   together with a guard that refuses to nest (an inner measure would otherwise queue behind the
-   device lock its own parent runner holds and report a lock timeout 30 minutes later).
-
-   All 23 `flock` sites in `phases.sh` are migrated — the seven live `phase_gate_cmd` arms, three
-   objective checks that dispatch, and the heredoc gate descriptions a session copies — plus
-   `llms/llama32_1b_int4/Makefile`'s `run-inference`. **`make chat` deliberately keeps the bare
-   lock:** the broker's runner is `setsid` with stdin from `/dev/null`, so a REPL under it reads EOF
-   on the first prompt. `devq-selftest.sh` is **20/20** (was 14), the six new clauses covering
-   `run`'s output relay, its status propagation and the nesting refusal.
-6. **H10 ran and its substance passed** — five gate legs green, `check-air-mlir` 489/489, 11.44
-   tok/s against a 9.43 floor. Its **tamper check halted** on five gate-defining files with
-   documented provenance, and was deliberately not re-fingerprinted; see
-   [24](24-phase-h10-non-constant-bd-offsets.md).
-7. **J7b landed** ([22](22-phase-j7b-accumulator-ring.md)) — the accumulator ring, formed by the
-   compiler. `mean_rel_L1` 1.417e-2 at `atol_required` 1.383e-3, K-loop data movement 4 → 2, zero
-   packet-typed channels. Its implement session halted on a budget cap with a hardware hang; the
-   hang was the compiler defect above, not the design.
-8. **J7a landed** ([21](21-phase-j7a-norm-tail-pipeline.md)) — the first piece of iron's dataflow
-   form on this port. Three herds, L1→L1 channels, **placement and buffer depth derived by the
-   compiler**, `mean_rel_L1` 3.620e-3 against a 1.688e-2 target. Its round-3 fix also made
-   `layer_norm` ~26× more accurate, for a measured ~13% throughput cost ([23 §1](23-rules-and-open-items.md)).
-9. **J1 is blocked, and precisely.** Not on correctness any more — H9 fixed the miscompile — but on
-   shim **BD exhaustion at six trips** against a 64-trip target. It now refuses loudly instead of
-   corrupting silently. **Not on the goal path**: J7a reaches the same dispatch collapse without
-   the packet queue.
-10. **H8 is untouched** and is the largest remaining item: the pass that *derives* on-chip staging
-   rather than having the builder declare it. It wanted J7 as a hand-written reference to validate
-   against, and J7a and J7b are now two.
+- **H8 is untouched** and is the largest remaining compiler item: the pass that *derives* on-chip
+  staging rather than having the builder declare it. It wanted J7 as a hand-written reference to
+  validate against, and J7a and J7b are now two.
+- **H10 ran and its substance passed** — five gate legs green, `check-air-mlir` 489/489, 11.44
+  tok/s against a 9.43 floor. Its **tamper check halted** on five gate-defining files with
+  documented provenance and was deliberately not re-fingerprinted; see
+  [24](24-phase-h10-non-constant-bd-offsets.md).
+- **J7a** ([21](21-phase-j7a-norm-tail-pipeline.md)) and **J7b**
+  ([22](22-phase-j7b-accumulator-ring.md)) landed — the norm-tail pipeline and the compiler-formed
+  accumulator ring. J7a's round-3 fix also made `layer_norm` ~26× more accurate for a measured ~13%
+  throughput cost ([23 §1](23-rules-and-open-items.md)).
+- **J1 is blocked, and precisely.** Not on correctness — H9 fixed the miscompile — but on shim **BD
+  exhaustion at six trips** against a 64-trip target. It refuses loudly instead of corrupting
+  silently, and it is **not on the goal path**: J7a reaches the same dispatch collapse without the
+  packet queue.
 
 **One latent cliff worth knowing about, measured and not reached.** The fused `addnorm` keeps
 one-pass bf16 variance and collapses completely once a row's `|mean|/sigma` exceeds ~4 — most
 elements wrong, not slightly wrong. This workload's worst row is 0.115, a ~35× margin, so the
 recorded figures stand; but nothing pins it. [23 §2](23-rules-and-open-items.md) has the sweep and
 what it would cost to fix.
+
 
 **`[2026-08-08]` Three things that cost THIS run time, so they do not cost the next one:**
 
@@ -305,7 +318,13 @@ two of nine cast sub-tiles), and both fixes were verified by hand afterwards —
 structure, not by a fourth Codex round. The driver now runs a narrow **confirm review** over the
 final round's fix diff before the gate; see [14](14-the-port-loop-harness.md).
 
-## Picking this up in a new session
+## Environment and conventions, before touching anything
+
+> **`[2026-08-09]` This section and everything below it is HISTORY plus setup.** It records how the
+> port was built and what each phase left behind. For current state read §Where things stand above;
+> the phase narratives below describe a Phase E that has since been superseded by the mode rebuilds,
+> and their cross-mode numbers predate both the taxonomy correction and those rebuilds. Setup, the
+> conventions and the environment traps are still live and still mandatory.
 
 Read [00-context-and-goals.md](00-context-and-goals.md) and
 [02-porting-conventions.md](02-porting-conventions.md) first — the conventions document is a hard
@@ -322,9 +341,13 @@ Then, before touching anything:
 - [14-the-port-loop-harness.md](14-the-port-loop-harness.md) — how the automated driver works and
   how to run the next phase through it.
 
-**The next phase is E (the four execution strategies).** Its specification is
-[08-phase-e-execution-strategies.md](08-phase-e-execution-strategies.md), rewritten on 2026-08-05
-against what Phase D actually produced.
+~~**The next phase is E (the four execution strategies).**~~ **`[2026-08-09]` Phase E ran, and
+was then superseded.** Its five sub-phases all landed
+([08](08-phase-e-execution-strategies.md) is the spec), and the taxonomy they were built against was
+corrected on 2026-08-08. Three of the four modes have since been rebuilt against the corrected
+definitions; `08` and its sub-specs describe the superseded ones and carry reversal notes where a
+claim was measured false. **The next work is `coarse`**, and it needs a decision procedure that does
+not exist yet — see §Where things stand.
 
 ### What Phase D left you
 
@@ -466,8 +489,11 @@ Two decisions taken on 2026-08-04, now reflected throughout these documents:
 | Can separately-compiled ELFs share one runlist? | Yes — N ELFs, N `hw_context`s, one runlist. Bit-identical to sequential, 1.02–1.15× faster. **Not** by sharing one context; XRT rejects that three ways. | [05a](05a-phase-b-runlist-spike-result.md) |
 | How many concurrent `hw_context`s does NPU2 grant? | 32 (33 fails with `DRM_IOCTL_AMDXDNA_CREATE_HWCTX err=-2`). Phase E's `runlist` mode wants 29 — fits, with three to spare. Caveats on the margin recorded. | [08 §Risks](08-phase-e-execution-strategies.md) |
 | Does a full layer survive the real runtime path? | Yes. One `encoder_bert` layer at `baseline_768`, `seq 4096`, matches an FP32 torch oracle over its whole 4096×768 output with zero mismatches, and localizes to any of ten per-boundary intermediates. | [07b](07b-phase-d2-block-integration.md) |
-| Can the whole sequence ladder be built? | **Not yet.** `seq = 4096` is the only point where the FFN's two projections do not collide, at the symbol level *and* the object level. One `(method, tile_n)` naming fix in `llms/shared/builders/gemm_builder.py` closes both; nothing before Phase E was permitted to make it. It also blocks the `fused` mode outright at any sequence length. | [08](08-phase-e-execution-strategies.md) |
-| Is there tolerance headroom for four modes? | Thin. The layer needs `atol` `1e-1` — the hard ceiling — at 1.35× its measured requirement. Driven by output scale, not by error. | [07b](07b-phase-d2-block-integration.md) |
+| Can the whole sequence ladder be built? | **Yes**, since E1 made the `(method, tile_n)` naming fix in `llms/shared/builders/gemm_builder.py`. The symbol- and object-level collisions that pinned everything to `seq = 4096` are closed. | [08](08-phase-e-execution-strategies.md) |
+| Is there tolerance headroom for four modes? | Thin but sufficient, and it did not shrink when attention moved on-device. Measured at the layer output against the hard `1e-1` ceiling: `offload` 1.73×, `runlist` 1.43×, `block` 1.35×, `fused` 1.27× (at 1024). **No tolerance has been widened for any mode.** | [07b](07b-phase-d2-block-integration.md) |
+| Can the two attention matmuls run on this device? | **Yes**, both, at every ladder rung, `attn_output` by all three GEMM methods. The registry genuinely holds no `K = 64` / `N = 64` row and the sweep cannot stage one, but that is a *catalogue* constraint; the tiles are injected through the `gemm_spec_fn` hatch. Two failure clusters bound the space and are fully characterised: `herd_n = 1` at N=64 hangs, `tile_n = 8` fails the microkernel's own assert. | [26](26-mode-rebuild-feasibility.md) · `pattern/offload/offload.py` |
+| Can one xclbin hold the whole layer? | **No**, blocked twice. `runtime_loop_tiling_sizes` `[2,2]` makes `mha_out_proj` @4096 hang on hardware (3/3) while `[1,1]` passes (3/3), and one ELF is one aircc invocation — so FlashAttention and the wide GEMMs cannot co-compile. Separately `air-fuse-channels` is O(N²) in channels and did not finish in 1200 s on a 90-channel stitch. | `agents/probes/probe_backend_preset_hardware.py` · [26](26-mode-rebuild-feasibility.md) |
+| Is `attention_path` still a covariate? | **No, not since 2026-08-09.** All four modes run attention on the device. Any comparison whose explanation rests on that split cannot be re-tested. | `study/test_attention_path.py` |
 
 ## Provenance
 

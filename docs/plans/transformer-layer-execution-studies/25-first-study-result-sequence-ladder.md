@@ -1,5 +1,28 @@
 # 25 — The first study result: the `baseline_768` sequence ladder
 
+> ## `[retracted 2026-08-08, and now unreproducible as of 2026-08-09]`
+>
+> **Do not cite the crossover or the slopes.** Two separate things invalidate this document, and the
+> second one is permanent:
+>
+> 1. **It ranks four implementations, not the four modes.** The taxonomy was corrected on
+>    2026-08-08 ([03 §The taxonomy](03-measurement-model.md)) and none of the four things measured
+>    here matched its corrected definition.
+> 2. **Its explanation cannot be re-tested.** The finding was that the slopes split on ATTENTION
+>    PLACEMENT — host-attention modes at 1.23–1.27 against device-attention modes at 1.03–1.17 —
+>    rather than on dispatch structure. As of 2026-08-09 **all four modes run attention on the
+>    device**, so there is no host-attention mode left to produce one side of that split. A rerun
+>    showing separated slopes is measuring something else and needs a new explanation.
+>
+> **What survives:** the measurement itself. 16 rungs, walked twice on hardware, every rung
+> validated, and the 1024 ordering correctly recorded as indistinguishable because it did not
+> survive the second walk. Read it as a record of what four *implementations* did on 2026-08-08, and
+> as the reason `attention_path` became a recorded per-row covariate at all.
+>
+> The one clean cross-mode number the study now has is DRAM traffic at 4096 — `runlist` 190,513,152
+> bytes against `offload` 970,457,088 — which differs in the taxonomy's own variable and nothing
+> else. See [03](03-measurement-model.md).
+
 `[2026-08-08]` Four execution modes across four sequence lengths on NPU2 hardware, 16 of 16 rungs
 passing. This is J3, and it is the first output of this project that is a *result* rather than a
 capability: every earlier measurement established that something works or how it is structured.
