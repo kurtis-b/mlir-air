@@ -6,44 +6,79 @@ records it.
 
 ## The taxonomy
 
-Four points on the spectrum, from most host-mediated to most fused:
+`[2026-08-08]` **Corrected by the study's author.** The table this document used to open with
+described the four modes by *who sequences the work*. That is not what the four points isolate, and
+it is superseded — it survives only as a record, in §The superseded taxonomy at the end of this
+section. This is the table to read.
 
-| Mode | CSV key | Who sequences the work | MLIR-AIR mechanism |
+The spectrum the four points span is **reconfiguration cost against DRAM traffic**:
+
+| Mode | CSV key | What it isolates | The mechanism it must use |
 |---|---|---|---|
-| offload | `offload` | Host, per GEMM | `KernelCache.load_and_run` per GEMM (exists) |
-| fine runlist | `runlist` | One XRT runlist over many small kernels | Runlist aggregation — Phase B |
-| coarse runlist | `hybrid` | One XRT runlist over few fused kernels | Same, plus coarse builders |
-| fused ELF | `fused_elf` | MLIR-level fusion before compilation | `shared/infra/stitching.py::stitch_elf` (exists) |
+| `runlist` | `runlist` | **Reconfiguration overhead**, paid in full. Every operator in the encoder layer executed **individually, on the device** | one kernel per operator, dispatched back to back; **nothing on the host** |
+| `offload` | `offload` | **Reconfiguration MINIMIZED by dynamic partitioning.** **`[2026-08-08]` One xclbin, N instruction streams — one per GEMM shape — which is what iron implements and what this port now matches.** The array configuration never changes; only the BD program does, so moving between the layer's GEMM shapes costs an instruction swap rather than a reconfiguration. *One* stream with runtime-parameterized loop bounds is the increment beyond parity, deliberately deferred — see below | **every LINEAR operator on the NPU** — the six projections *and* both attention matmuls — through one runtime-parameterized matmul; **every NON-LINEAR operator on the host**: softmax, both LayerNorms, GeLU |
+| `coarse` | `hybrid` | **Reconfiguration AND sync overhead minimized together**, by *mixing* `runlist` and `fused` per workload | per-operator choice between an individually dispatched kernel and a fused region |
+| `fused` | `fused_elf` | **DRAM movement eliminated.** The whole encoder layer placed on the array, so nothing but the layer input and output crosses DRAM | **one xclbin**, whole layer resident |
 
-The first three CSV keys are iron's, kept so results stay diffable against iron result trees
-through the adapter described below. `fused_elf` is new — it is MLIR-AIR's existing production
-mechanism, and adding it as a measured point is what makes this port additive rather than
-duplicative.
+`runlist` and `fused` are the two extremes — every operator reconfigured and nothing fused at one
+end, one configuration and no intermediate DRAM traffic at the other. `offload` attacks the
+reconfiguration axis with a runtime parameter instead of with fusion, and `coarse` is explicitly the
+**blend** of the two extremes rather than a point of its own.
 
-Per convention rule 7, code and directories say `coarse`; only the CSV value says `hybrid`, and
-that mapping lives in one place in the schema module.
+### `[2026-08-08]` Why `offload` matches iron rather than parameterizing the bounds
 
-## `[2026-08-08]` The taxonomy above is WRONG, per the study's author
+The corrected definition first said *one* instruction stream with the matmul's loop bounds arriving
+as a runtime parameter. A feasibility spike established that **the stack cannot do that today**, and
+the author's decision is to **match iron — N instruction streams under one xclbin — for now.**
 
-The table describes the modes by *who sequences the work*. That is not what the four points are
-supposed to isolate. Corrected, from the author:
+The two are the same idea at different depths: both bake the shape information, and the only
+question is whether the BD fields are *literals* or *patchable*. Today they are literals, with no
+SSA operand anywhere on the path:
 
-| Mode | What it isolates | The mechanism it must use |
-|---|---|---|
-| `runlist` | **Reconfiguration overhead.** Every operator in the encoder layer executed **individually, on the device** | one kernel per operator, dispatched back to back; nothing on the host |
-| `offload` | **Reconfiguration MINIMIZED by dynamic partitioning** — only the matmul **loop bounds** are partially reconfigured between shapes | one configured matmul reused across the layer's GEMMs |
-| `coarse` | **Reconfiguration AND sync overhead minimized together**, by *mixing* `runlist` and `fused` per workload | per-operator choice between an individually dispatched kernel and a fused region |
-| `fused` | **DRAM movement eliminated.** The whole encoder layer placed on the array, so nothing but the layer input and output crosses DRAM | **one xclbin**, whole layer resident |
+- `AIRRtToNpuPass.cpp:604-617` folds every offset/size/stride to `int64_t`; a still-dynamic entry
+  does not fail, it **silently defaults** — offset→0 with a warning, size→1, stride→0.
+- `AIEX.td:1095-1131` declares `NpuWriteBdOp`'s `buffer_length`, `d0_size`, `d1_size`, `d2_size`,
+  `iteration_size` and every stride as **`I32Attr`**, so there is nothing to bind a value to.
+  `DMAConfigureTaskForOp` likewise takes only `I32Attr:$repeat_count`, which is why AIR passes
+  `Value()` with the comment "dynamic repeat count unused here".
+- There is no loop left to parameterize regardless: `unrollAffineFors`/`unrollSCFFors`
+  (`AIRRtToNpuPass.cpp:1850`, `:1977`) run `loopUnrollFull` and hard-fail if they cannot. Measured
+  in real output — `air_project/npu.air.mlir:588-748` holds 25 `dma_configure_task_for` ops and
+  **zero** `scf.for`.
 
-So the spectrum is **reconfiguration cost against DRAM traffic**, and `coarse` is explicitly the
-blend of the two extremes rather than a point of its own.
+So runtime bounds means operand forms in **mlir-aie's** dialect plus a lowering change in
+**mlir-air** — two repos, its own port-loop phase. Recorded as a future increment, not a
+prerequisite: MLIR-AIR reaches parity with iron without it, and the increment is worth doing only
+if the study wants to *price* it.
+
+**One cheaper experiment is still open** and would settle it without a dialect change:
+`npu.update_from_scratchpad`, a firmware instruction documented as "originally intended to patch
+shim buffer descriptor addresses". If it can patch a shim BD *register* on NPU2, the BD stays baked
+and the size/stride fields are rewritten per run. Untested for BD registers — the only existing test
+patches an L1 `aie.buffer`.
+
+**A consequence to weigh before ever taking the increment:** one stream forces **one tiling recipe**
+on all three GEMM shapes, which today resolve to three (`drain/tile_n96`, `drain/tile_n128`,
+`fused-cast/tile_m64`). That cost is unmeasured, and it may exceed the reconfiguration cost the
+change is meant to remove.
+
+Two things about `offload` that the superseded table had backwards, and that the code does not yet
+do: it is the mode with the *least* reconfiguration rather than the most host-mediated one, and its
+host/device split is decided by **linearity** — not by which GEMMs happen to resolve in the
+registry.
+
+The CSV keys are naming, not taxonomy. The first three are iron's, kept so results stay diffable
+against iron result trees through the adapter described below; `fused_elf` is new — it is MLIR-AIR's
+existing production mechanism, and adding it as a measured point is what makes this port additive
+rather than duplicative. Per convention rule 7, code and directories say `coarse`; only the CSV
+value says `hybrid`, and that mapping lives in one place in the schema module.
 
 ### What is implemented instead, and the size of each gap
 
 | Mode | Implemented today | Gap |
 |---|---|---|
 | `runlist` | every operator individually on device **except attention, which is host torch** | **attention must move to the device.** This is J2, and it is a search: `attn_scores` already passes on hardware, `attn_output` timed out on 1 of 828 legal configurations. Measured at 1024: 24.15 ms of host attention, 47.8% of the mode's total — so today the mode prices host torch, not reconfiguration |
-| `offload` | six registry GEMMs dispatched one at a time, **everything else host torch** | the mode is currently the *most* host-mediated rather than the reconfiguration-minimizing one. Needs runtime loop-bound reconfiguration, and whether the stack can do that without a full reconfigure is **unestablished** — `runtime_loop_tiling_sizes` is a compile-time backend kwarg today |
+| `offload` | six registry GEMMs dispatched one at a time, **everything else host torch** | three gaps. (a) The **two attention matmuls are linear and belong on the NPU** under the corrected rule, and they resolve in no registry — see the `[2026-08-05]` note under §The dispatch vector, which established that the C4 sweep cannot be made to produce them. (b) Only the non-linear operators — softmax, both LayerNorms, GeLU — should be on the host; today far more is. (c) Runtime loop-bound reconfiguration does not exist, and whether the stack can do it without a full reconfigure is **unestablished** — `runtime_loop_tiling_sizes` is a compile-time backend kwarg today. Net: the mode is currently the *most* host-mediated of the four rather than the reconfiguration-minimizing one |
 | `coarse` | the D2 block: five coarse fused kernels, four submissions | not a blend of anything. It cannot become one until `runlist` and `fused` mean what they should |
 | `fused` | **three ELFs**, and every operator boundary inside the tail still round-trips through DRAM | two gaps, and the second is the larger. One xclbin is blocked by a **backend-settings conflict** this mode already documents: FlashAttention needs `omit_pingpong="all"` + `runtime_loop_tiling_sizes=[1,1]`, the wide GEMMs need `[2,2]`, and one ELF is one aircc invocation. "No DRAM between operators" needs the whole layer L1/L2-resident — `norm_tail` (J7a) does that for the two norm points, `ffn_accum` (J7b) for the down-projection K loop, and nothing does it for the rest |
 
@@ -53,6 +88,29 @@ modes that are not the four modes the study means. The device/host split now rec
 (`device_ms`, `sync_ms`, `host_cpu_ms`) is what makes the difference visible: `offload` has the
 second-lowest **device** time of the four and the highest total, because 61.6% of it is host torch
 it is not supposed to be running at all.
+
+### The superseded taxonomy — "who sequences the work"
+
+> **`[superseded 2026-08-08]` Do not use this table.** It is kept as a record, not as a definition:
+> the rest of this directory is ~2,900 lines that still describe the modes this way, and a reader
+> tracing that framing needs to be able to find where it came from and see that it is retired.
+> Every claim it makes about *what a mode isolates* is wrong. Rewriting the other documents is
+> deliberately deferred until the corrected mechanisms exist. The CSV keys in it are still current,
+> and are restated in the corrected table above.
+
+Four points on the spectrum, from most host-mediated to most fused:
+
+| Mode | CSV key | Who sequences the work | MLIR-AIR mechanism |
+|---|---|---|---|
+| offload | `offload` | Host, per GEMM | `KernelCache.load_and_run` per GEMM (exists) |
+| fine runlist | `runlist` | One XRT runlist over many small kernels | Runlist aggregation — Phase B |
+| coarse runlist | `hybrid` | One XRT runlist over few fused kernels | Same, plus coarse builders |
+| fused ELF | `fused_elf` | MLIR-level fusion before compilation | `shared/infra/stitching.py::stitch_elf` (exists) |
+
+Its two load-bearing errors, for anyone reconciling a downstream document against it: it places
+`offload` at the host-mediated *end* of the spectrum when the mode is meant to be the one that
+minimizes reconfiguration, and it makes `coarse` a point of its own — "one runlist over few fused
+kernels" — rather than the per-workload blend of `runlist` and `fused` the author defines.
 
 ## Why a single dispatch count does not work
 
