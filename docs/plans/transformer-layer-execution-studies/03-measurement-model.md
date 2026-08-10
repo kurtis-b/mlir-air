@@ -212,9 +212,9 @@ the choices induce:
 | knob | **graph coverage** — which operators run NPU-side | `study/test_attention_path.py`, which asserts all-device across every mode |
 | knob | **execution boundary** — where artifact and submission seams sit | `host_submissions` / `runlist_entries` / `air_launches` / `herd_launches` |
 | knob | **AIE role style** | core→core flow count; structural checks only |
-| cost | **reconfiguration** | `context_loads` / `kernel_attaches` (`offload`'s gate only) |
+| cost | **reconfiguration** | `context_loads` / `kernel_attaches` — ~~`offload`'s gate only~~ **`[2026-08-10]` schema v2 columns for every mode**: each whole-layer dispatch reports its per-dispatch delta. First measured rows at 1024 steady-state: `offload`-ELF **30**, `runlist` **24** (12 heads × 2 attention artifacts re-loaded), `coarse` and `fused` **0** |
 | cost | **off-chip traffic** | `bytes_transferred` |
-| cost | **synchronization** | `sync_boundaries`; the ms decomposition (`device_ms` / `sync_ms` / `host_cpu_ms`) is measured on every rung and **discarded** — schema v1 has no column for it, README queue item 2 |
+| cost | **synchronization** | `sync_boundaries`; the ms decomposition (`device_ms` / `sync_ms` / `host_cpu_ms`) ~~is measured on every rung and **discarded**~~ **`[2026-08-10]` persists as schema v2 columns** (README queue item 2, done). The components are disjoint and do NOT sum to `avg_latency_ms`; the remainder is unattributed host overhead, and at 1024 it dominates the per-operator modes — `runlist` reads device 44 / sync 6.4 / host 0 against ~1959 total, which is a result about where that mode's time actually goes, now visible |
 
 The corrected taxonomy is a two-**cost** spectrum with the knobs pinned. Coverage was equalized
 across three modes by the 2026-08-08/09 rebuilds — which is what retired `attention_path` — and
@@ -236,8 +236,13 @@ modes isolate* to *what induces the costs*.
 Sources: the README status board and [27](27-common-ladder-result.md) for `runlist` and
 `offload`; the re-measured D2 vector (§The dispatch vector, below) for `coarse`;
 [26 §6](26-mode-rebuild-feasibility.md)'s repair-run vector for `fused`'s structural counts.
-Reconfiguration counts exist for `offload` alone; the ELF-path modes' context loads are
-uninstrumented.
+~~Reconfiguration counts exist for `offload` alone; the ELF-path modes' context loads are
+uninstrumented.~~ **`[2026-08-10]` All four modes report both counters** as schema v2 columns —
+the counting always lived at `ensure_loaded`'s single increment site; the modes simply never
+surfaced it. Measured at 1024 steady-state: `offload`-ELF 30 / shared 0 (its 1 load + 4 attaches
+are once-per-process), `runlist` 24, `coarse` 0, `fused` 0. So `runlist` pays a **middle**
+reconfiguration regime — its per-head attention eviction, not zero and not `offload`'s
+everything — which is now a measured fact rather than an inference from its design.
 
 **Reading the historical documents against this section:** "stitched" reads as *packaged*;
 "homogeneous per operator" as *time-multiplexed*; "heterogeneous" and "dataflow" as

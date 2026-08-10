@@ -203,7 +203,10 @@ it is specific to the small shape. Nothing in hand separates them.
 `prepare_offload` already measures `device_ms`, `sync_ms` and `host_cpu_ms` per
 run and returns all three in its `extra` dict — and `run_mode.py` reads none of
 them, while schema v1 has **no column for any of them**. So the decomposition is
-computed and thrown away on every rung the study has ever walked. Unlike
+computed and thrown away on every rung the study has ever walked.
+**`[2026-08-10]` Closed — schema v2 persists all three plus the reconfiguration
+counters** (`eeb37a19`); the ~17–21 ms attribution this section asks for is now
+one walk away rather than a schema change away. Unlike
 `npu_unique_xclbin_count`, which was already a v1 column waiting to be filled,
 adding these is a **schema version bump** (`schema.py:53`), which is why it is
 recorded here rather than done in passing. With them persisted, the ~17–21 ms is
