@@ -107,6 +107,9 @@ memory bank) all produce plausible wrong numbers rather than errors.
 | `builders/test_block_cache.py` | Host-only: which cached block ELFs `check-block` reuses, and which it rebuilds |
 | `pattern/reference.py` | The shared golden model — iron's draw order and structure, this repository's FP32-from-bf16 numerics, both workload variants, every boundary. Phase E's strategy directories import this one copy |
 | `pattern/test_reference.py` | Host-only: that the golden model is the layer it claims to be |
+| `pattern/coarse/cells.py` | `coarse`'s blend space: the six cells, and the composition that builds the two interior ones out of the block and runlist halves rather than reimplementing either |
+| `pattern/coarse_c2/`, `pattern/coarse_c3/` | The two interior cells as catalogue operators — a preparer and an ELF cache each, and nothing else |
+| `coarse_cells_structure.py` | Host-only: what each cell WILL dispatch, derived from the configs, with the model checked against `coarse`'s and `runlist`'s shipped gate literals |
 | `run_npu2_<op>_peano.lit` | One per operator: that operator's numerical gate on a real NPU |
 | `run_npu2_fault_control_peano.lit` | Phase C's negative control: the injected run must FAIL |
 | `run_npu2_block_peano.lit` | Phase D2's gate: the whole layer on a real NPU, every boundary checked, then the same layer under injection which must FAIL |
@@ -730,6 +733,97 @@ ten read-back boundaries. The `air`/`herd` asymmetry (16/24 for fused
 against 12/146 for coarse) is the deliberate one from
 03-measurement-model.md: `air_launches` counts launches in the compiled
 module once per distinct ELF, `herd_launches` accumulates per dispatch step.
+
+## `coarse`'s blend cells (C2 and C3)
+
+`coarse` is defined as a per-workload **blend** of `runlist` and `fused`, and
+until
+`docs/plans/transformer-layer-execution-studies/28-coarse-blend-space.md`
+nothing here expressed such a choice: the mode wrapped the D2 block, which is
+one blend, chosen implicitly by D2 having been built at 4096.
+
+Doc 28 derives the space from the artifact plans rather than from the
+definition's wording, and it is **two axes, not a choice per operator** —
+`fused` and `coarse` build their front from the same two modules and differ in
+the tail alone:
+
+| | tail stitched | tail banded | tail decomposed |
+|---|---|---|---|
+| **front `block`** | = `fused` | = `coarse` today (C1) | **C2** |
+| **front `runlist`** | — | **C3** | = `runlist` |
+
+Two of the six cells already have mode names, which is the sharp form of the
+scoping problem: the space `coarse` blends over *contains the two things it
+blends*, so "the best cell" would re-derive an endpoint. The resolution is the
+word the definition already uses — *per workload*. `fused`'s stitched tail
+needs a `plane_major` plane stride of `rows × cols` against the shim
+`aie.dma_bd` cap of 1,048,576, so it caps at 1365 rows (`builders/norm_tail.py`)
+and **at seq ≥ 2048 the entire stitched row is unbuildable**. `coarse` is the
+mode you use where `fused` does not fit.
+
+`pattern/coarse/cells.py` builds the two interior cells. It **composes**, it
+does not reimplement: the block half's `_sequence_a` / `_sequence_norm` /
+`_sequence_ffn` and the runlist half's `run_projections` /
+`run_attention_interior` / `run_o_proj` / `run_norm_chain` / `run_ffn` are
+called as they are, so a cell measures the code the D2 and E4 gates validated.
+C1 is deliberately **not** built there — it is `pattern/coarse/coarse.py` over
+`builders/block.py`, and a second implementation would be a fork.
+
+Three things a composed cell needs that a single-half mode does not, each with
+a guard:
+
+- **A cross-half GEMM object collision check.** `ek.compile_gemm_mm` names its
+  object from `(tile_m, tile_n)` alone while `tile_k_l1` is a compile flag, so
+  two GEMMs agreeing on the first two and differing on the third write one file
+  with two micro-kernels — the silent failure D2 hit between the FFN's
+  up-projection and the o-projection. Each config already checked *itself*;
+  `cells._check_cell_objects` is what checks across a block half and a runlist
+  half.
+- **A subset compile.** Both `compile_block_artifacts` and
+  `compile_runlist_artifacts` take a `keys` argument, defaulting to everything,
+  so a cell builds only the artifacts it dispatches instead of large ELFs
+  nothing runs.
+- **A gamma adapter.** The banded tail's `addnorm` takes the `[emb]` weight
+  directly; the decomposed tail's `elementwise_mul` takes a host-materialized
+  `[norm_rows, emb]` broadcast. The composer adapts at the seam rather than
+  changing either callee.
+
+The cells' shape is **predicted before they run**, host-side, by
+`coarse_cells_structure.py` (`make coarse-cell-structure`, no NPU and no
+Peano). Each half contributes independently — front `block` 1 submission / 2
+entries, front `runlist` `2 + heads` / `4 + 3·heads`, tail banded 3 /
+`1 + 2·blocks`, tail decomposed 3 / `3 + 6·blocks` — and **two of the four
+combinations are already pinned by shipped gates**, which is what makes the
+model checkable rather than plausible: it reproduces `coarse`'s recorded 4/131
+and `runlist`'s 17/427 from the same arithmetic. At seq 4096 that gives:
+
+| cell | front | tail | submissions | entries |
+|---|---|---|---|---|
+| C1 (`coarse`) | block | banded | 4 | 131 |
+| **C3** | runlist | banded | 17 | **169** |
+| **C2** | block | decomposed | 4 | **389** |
+| C6 (`runlist`) | runlist | decomposed | 17 | 427 |
+
+Each cell refines exactly one half of C1 and neither refines both, so the
+ordinal claim the pair owns is `coarse 131 < C3 169 < C2 389 < runlist 427` —
+ordinal, never a threshold, as everywhere else in Phase E. A cell landing
+outside that bracket is not the cell it claims to be.
+
+A cell is **not a fifth taxonomy point.** Its `execution_mode` is `coarse`'s
+CSV value; the cell travels in the artifact as `blend_cell`, and cells separate
+in a results tree by `study_case_label` and by the per-mode CSV filename.
+
+**The measured answer, walked twice at 2048 and 4096:** `C1 < C2 < C3 < C6` on
+averages and on minimums at both lengths, so **`coarse` is C1** — the cell it
+already dispatched, now chosen rather than inherited. The front axis dominates:
+a block front is ~1.5–1.6× faster than a runlist front, an effect roughly an
+order of magnitude larger than the tail axis, which separates cleanly only at
+4096. Because the winner is an *interior* cell, `coarse` stays distinct from
+`runlist` and from `fused` and the taxonomy does not collapse to three points.
+`pattern/coarse/coarse.py` records the selection and its reason in every results
+artifact. Full derivation, the byte accounting and the two findings that are not
+about `coarse`:
+[`30-coarse-cells-built.md`](../../docs/plans/transformer-layer-execution-studies/30-coarse-cells-built.md).
 
 ## The registry sweep
 

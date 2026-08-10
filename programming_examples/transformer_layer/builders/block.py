@@ -381,7 +381,7 @@ _ARTIFACT_BUILD = {
 }
 
 
-def compile_block_artifacts(cache, cfg, run_only=False):
+def compile_block_artifacts(cache, cfg, run_only=False, keys=None):
     """Compile the four ELFs into ``cache``, reusing only exact matches.
 
     EVERY EXTERNAL OBJECT FIRST, THEN EVERY ELF. The order used to be the other
@@ -428,6 +428,14 @@ def compile_block_artifacts(cache, cfg, run_only=False):
     four costs about 0.1s against the minutes of ELF compilation the answer
     gates. A miss recompiles that artifact and only that one, and only a miss
     rebuilds its external objects.
+
+    ``keys`` narrows the build to a SUBSET of the four, and defaults to all of
+    them -- the block itself dispatches every one. A caller that composes this
+    half with another mode's (``pattern/coarse/cells.py``) dispatches only some,
+    and compiling the rest would build large ELFs nothing runs. Narrowing does
+    not weaken the fingerprint contract: the digests are per artifact and
+    ``save_fingerprints`` merges, so an artifact left out here keeps whatever a
+    previous build recorded for it.
     """
     names = cfg["artifacts"]
     have_manifest = bool(run_only and cache.load_manifest())
@@ -438,6 +446,8 @@ def compile_block_artifacts(cache, cfg, run_only=False):
     modules = {}
     stale = []
     for key, (_, build_module) in _ARTIFACT_BUILD.items():
+        if keys is not None and key not in keys:
+            continue
         name = names[key]
         module = build_module(cfg)
         fingerprints[name] = block_artifact_fingerprint(cfg, key, module)

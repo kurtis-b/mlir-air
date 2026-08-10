@@ -99,7 +99,7 @@ FOOTGUNS
       head, and that is consistent with the no-re-execution rule above rather
       than an exception to it. The rule is about re-executing a runtime-tiled
       GEMM ELF in a REUSED ``hw_context``; each per-head submission dispatches
-      each of them exactly once, and ``_evict_attention_contexts`` drops their
+      each of them exactly once, and ``evict_attention_contexts`` drops their
       contexts between heads, which is available here precisely because the
       boundary is BETWEEN submissions. The softmax artifact is not evicted:
       no runtime loop tiling, the same re-execution-clean class as the band
@@ -158,6 +158,7 @@ from opcheck_layer import BLOCK_STAGE_ATOL, print_dispatch_totals  # noqa: E402
 from opcheck_prepare import _spec_digest  # noqa: E402
 from pattern import EXECUTION_MODE_CSV  # noqa: E402
 from pattern.blocked_attention import round_bf16  # noqa: E402
+
 # The measured attention tiles live in ONE place, offload's module, and are
 # imported rather than copied. They are a measurement (see that module's
 # ATTENTION_GEMM_TILES comment for the checkpoints), so two modes carrying two
@@ -284,8 +285,14 @@ def runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
     # `[2026-08-09]` The attention interior, per head. Both matmuls are LINEAR
     # and belong on the device under the corrected taxonomy; the tiles are
     # imported from offload, where the measurement lives.
-    specs["attn_scores"] = (attention_gemm_spec("attn_scores"), (seq_len, head_dim, seq_len))
-    specs["attn_output"] = (attention_gemm_spec("attn_output"), (seq_len, seq_len, head_dim))
+    specs["attn_scores"] = (
+        attention_gemm_spec("attn_scores"),
+        (seq_len, head_dim, seq_len),
+    )
+    specs["attn_output"] = (
+        attention_gemm_spec("attn_output"),
+        (seq_len, seq_len, head_dim),
+    )
 
     # GEMM entry -> spec key. Four distinct proj ELFs on purpose; see above.
     #
@@ -294,7 +301,7 @@ def runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
     # to it: the rule is about re-executing a runtime-tiled GEMM ELF in a REUSED
     # hw_context. Each per-head submission dispatches each of them exactly once,
     # and their contexts are evicted between heads exactly as `offload` evicts
-    # between its dispatches (`_evict_attention_contexts`). Twelve artifacts
+    # between its dispatches (`evict_attention_contexts`). Twelve artifacts
     # apiece would also work and would cost 24 large ELF compiles per clean
     # cache for nothing.
     gemms = {
@@ -449,7 +456,7 @@ def _build_runlist_module(cfg, key):
     raise KeyError(f"unknown runlist artifact key {key!r}")
 
 
-def compile_runlist_artifacts(cache, cfg, run_only=False):
+def compile_runlist_artifacts(cache, cfg, run_only=False, keys=None):
     """Compile the ten ELFs into ``cache``, reusing only exact matches.
 
     Same shape as ``compile_block_artifacts`` and reusing its fingerprint
@@ -457,6 +464,11 @@ def compile_runlist_artifacts(cache, cfg, run_only=False):
     cached ELF is reused only when its recorded fingerprint matches, and only
     a miss rebuilds — including that artifact's external objects, whose names
     carry their tile shapes so variants cannot overwrite each other.
+
+    ``keys`` narrows the build to a SUBSET, and defaults to all of them — this
+    mode dispatches every one. A caller composing this half with another mode's
+    (``pattern/coarse/cells.py``) dispatches only some, and the rest would be
+    large ELFs nothing runs.
     """
     names = cfg["artifacts"]
     have_manifest = bool(run_only and cache.load_manifest())
@@ -467,6 +479,8 @@ def compile_runlist_artifacts(cache, cfg, run_only=False):
     modules = {}
     stale = []
     for key in names:
+        if keys is not None and key not in keys:
+            continue
         name = names[key]
         module = _build_runlist_module(cfg, key)
         if key in _SMALL_FUNC and _SMALL_FUNC[key] not in str(module):
@@ -549,6 +563,273 @@ def _gemm_step(cfg, key, a_name, b_name, out_name, arrays):
     return DispatchStep(artifact, (a_name, b_name, out_name), writes=(2,)), None
 
 
+def run_projections(cache, cfg, x, w_q, w_k, w_v):
+    """Runlist 1: q/k/v projections, three entries in one submission."""
+    seq_len, emb_dim = cfg["seq_len"], cfg["emb_dim"]
+    arrays = {"x": x, "w_q": w_q, "w_k": w_k, "w_v": w_v}
+    steps = []
+    scratches = set()
+    for gemm_key, out_name, w_name in (
+        ("q_proj", "q", "w_q"),
+        ("k_proj", "k", "w_k"),
+        ("v_proj", "v", "w_v"),
+    ):
+        arrays[out_name] = np.zeros((seq_len, emb_dim), dtype=bfloat16)
+        step, scratch = _gemm_step(cfg, gemm_key, "x", w_name, out_name, arrays)
+        steps.append(step)
+        if scratch:
+            scratches.add(scratch)
+    outputs = ("q", "k", "v")
+    specs = {
+        name: _spec_buf(
+            name,
+            arr,
+            static=name in ("w_q", "w_k", "w_v"),
+            host_output=name in outputs,
+        )
+        for name, arr in arrays.items()
+    }
+    host_writes = {"x", "w_q", "w_k", "w_v"} | scratches
+    results, vector = cache.run_sequence(
+        steps,
+        specs,
+        cfg["backend_kwargs"],
+        arrays,
+        host_writes=host_writes,
+        require_single_submission=True,
+    )
+    out = {n: np.array(results[n], copy=True) for n in outputs}
+    return out, vector
+
+
+def evict_attention_contexts(cache, cfg):
+    """Drop the two attention GEMM artifacts' ``hw_context``s (and the pools).
+
+    MEASURED, NOT DEFENSIVE, and it is the same measurement this module's
+    no-re-execution footgun records: a runtime-tiled GEMM ELF returns wrong
+    numbers from its SECOND execution in one context onward. The per-head
+    submissions dispatch each attention GEMM once, so nothing re-executes
+    INSIDE a runlist -- what has to be broken is reuse ACROSS the twelve
+    submissions, which is exactly what ``offload._evict_context`` does
+    between its dispatches. Evicting is available here precisely because
+    the boundary is between submissions rather than inside one.
+
+    The softmax artifact is deliberately NOT evicted: no runtime loop
+    tiling, same class as the band add/ln/mul ELFs that already re-execute
+    128 times per layer clean.
+    """
+    for key in ("attn_scores", "attn_output"):
+        loaded = cache._loaded.pop(cfg["artifacts"][key], None)
+        if loaded is not None:
+            loaded[0].unload()
+    cache._pools.clear()
+
+
+def run_attention_head(cache, cfg, head, q, k, v):
+    """One head's whole attention interior, three entries in one submission.
+
+    ``attn_scores`` (Q_h @ K_h^T), ``softmax`` over the score matrix, then
+    ``attn_output`` (P_h @ V_h). Nothing crosses to the host between them:
+    the score matrix and the probability matrix are device-resident inside
+    the runlist, which is the property this mode exists to have and the one
+    the host-softmax ``offload`` partition deliberately gives up.
+
+    ONE HEAD PER SUBMISSION IS A MEMORY BOUND. See
+    ``runlist_submission_count``: all twelve heads in one runlist would
+    need every score and probability matrix live at once, ~800 MiB at the
+    gate configuration against ~70 MiB per head.
+
+    The head slice and the K transpose are contiguous host COPIES, per the
+    module's band-inputs footgun -- a strided view would upload the wrong
+    bytes without complaining. They are layout, not arithmetic; the mode
+    still computes nothing.
+    """
+    seq_len, head_dim = cfg["seq_len"], cfg["head_dim"]
+    names = cfg["artifacts"]
+    columns = slice(head * head_dim, (head + 1) * head_dim)
+    arrays = {
+        "q_h": np.ascontiguousarray(q[:, columns]),
+        "k_h_t": np.ascontiguousarray(k[:, columns].T),
+        "v_h": np.ascontiguousarray(v[:, columns]),
+        "scores": np.zeros((seq_len, seq_len), dtype=bfloat16),
+        "probs": np.zeros((seq_len, seq_len), dtype=bfloat16),
+        "ctx_h": np.zeros((seq_len, head_dim), dtype=bfloat16),
+    }
+    steps = []
+    scratches = set()
+    step, scratch = _gemm_step(cfg, "attn_scores", "q_h", "k_h_t", "scores", arrays)
+    steps.append(step)
+    if scratch:
+        scratches.add(scratch)
+    steps.append(DispatchStep(names["softmax"], ("scores", "probs"), writes=(1,)))
+    step, scratch = _gemm_step(cfg, "attn_output", "probs", "v_h", "ctx_h", arrays)
+    steps.append(step)
+    if scratch:
+        scratches.add(scratch)
+    specs = {
+        name: _spec_buf(name, arr, host_output=name == "ctx_h")
+        for name, arr in arrays.items()
+    }
+    host_writes = {"q_h", "k_h_t", "v_h"} | scratches
+    evict_attention_contexts(cache, cfg)
+    results, vector = cache.run_sequence(
+        steps,
+        specs,
+        cfg["backend_kwargs"],
+        arrays,
+        host_writes=host_writes,
+        require_single_submission=True,
+    )
+    return np.array(results["ctx_h"], copy=True), vector
+
+
+def run_attention_interior(cache, cfg, q, k, v):
+    """Every head's attention interior, one submission each, columns reassembled.
+
+    The loop is here rather than in a mode's ``dispatch`` because it is the
+    ``runlist`` FRONT: `28-coarse-blend-space.md`'s C3 cell pairs exactly this
+    with a banded tail, and a second copy of the reassembly is a second place
+    for the column slicing to drift. Progress narration stays with the caller —
+    a mode numbers its own submissions.
+    """
+    seq_len, emb_dim = cfg["seq_len"], cfg["emb_dim"]
+    head_dim = cfg["head_dim"]
+    attn_context = np.empty((seq_len, emb_dim), dtype=bfloat16)
+    vectors = []
+    for head in range(cfg["num_heads"]):
+        columns = slice(head * head_dim, (head + 1) * head_dim)
+        ctx_h, vector = run_attention_head(cache, cfg, head, q, k, v)
+        attn_context[:, columns] = ctx_h
+        vectors.append(vector)
+    return attn_context, vectors
+
+
+def run_o_proj(cache, cfg, ctx, w_o):
+    """Runlist 2: the output projection, one entry."""
+    seq_len, emb_dim = cfg["seq_len"], cfg["emb_dim"]
+    arrays = {"ctx": ctx, "w_o": w_o}
+    arrays["attn_out"] = np.zeros((seq_len, emb_dim), dtype=bfloat16)
+    step, scratch = _gemm_step(cfg, "o_proj", "ctx", "w_o", "attn_out", arrays)
+    specs = {
+        name: _spec_buf(name, arr, static=name == "w_o", host_output=name == "attn_out")
+        for name, arr in arrays.items()
+    }
+    host_writes = {"ctx", "w_o"} | ({scratch} if scratch else set())
+    results, vector = cache.run_sequence(
+        [step],
+        specs,
+        cfg["backend_kwargs"],
+        arrays,
+        host_writes=host_writes,
+        require_single_submission=True,
+    )
+    return np.array(results["attn_out"], copy=True), vector
+
+
+def run_norm_chain(cache, cfg, label, x_full, residual_full, gamma_band):
+    """Runlists 3 and 5: one normalization point as ``norm_blocks`` bands
+    of add -> LayerNorm -> gamma multiply, ``3 * norm_blocks`` entries in
+    one submission.
+
+    ``x_full`` and ``residual_full`` are whole ``[seq_len, emb_dim]``
+    tensors cut into bands here, because a dispatch argument is a whole
+    BO. Within a band the residual sum and the normalized rows stay
+    device-resident; ``gamma_band`` is ONE static buffer shared by every
+    band's multiply.
+    """
+    emb_dim = cfg["emb_dim"]
+    names = cfg["artifacts"]
+    rows, blocks = cfg["norm_rows"], cfg["norm_blocks"]
+    gamma_name = f"{label}_gamma"
+    arrays = {gamma_name: gamma_band}
+    steps = []
+    out_names = []
+    for i in range(blocks):
+        lo, hi = i * rows, (i + 1) * rows
+        x_name, r_name = f"{label}_x{i}", f"{label}_r{i}"
+        s_name, n_name = f"{label}_sum{i}", f"{label}_norm{i}"
+        o_name = f"{label}_out{i}"
+        # Contiguous copies, not views — see the module footguns.
+        arrays[x_name] = np.ascontiguousarray(x_full[lo:hi])
+        arrays[r_name] = np.ascontiguousarray(residual_full[lo:hi])
+        arrays[s_name] = np.zeros((rows, emb_dim), dtype=bfloat16)
+        arrays[n_name] = np.zeros((rows, emb_dim), dtype=bfloat16)
+        arrays[o_name] = np.zeros((rows, emb_dim), dtype=bfloat16)
+        steps.append(DispatchStep(names["add"], (x_name, r_name, s_name), writes=(2,)))
+        steps.append(DispatchStep(names["ln"], (s_name, n_name), writes=(1,)))
+        steps.append(
+            DispatchStep(names["mul"], (n_name, gamma_name, o_name), writes=(2,))
+        )
+        out_names.append(o_name)
+    specs = {
+        name: _spec_buf(
+            name, arr, static=name == gamma_name, host_output=name in out_names
+        )
+        for name, arr in arrays.items()
+    }
+    host_writes = {gamma_name}
+    for i in range(blocks):
+        host_writes |= {f"{label}_x{i}", f"{label}_r{i}"}
+    results, vector = cache.run_sequence(
+        steps,
+        specs,
+        cfg["backend_kwargs"],
+        arrays,
+        host_writes=host_writes,
+        require_single_submission=True,
+    )
+    out = np.concatenate([np.array(results[n], copy=True) for n in out_names])
+    return out, vector
+
+
+def run_ffn(cache, cfg, hidden, w_up, w_down):
+    """Runlist 4: up_proj, GeLU, down_proj — three entries, the
+    interiors device-resident."""
+    seq_len, emb_dim = cfg["seq_len"], cfg["emb_dim"]
+    ffn_dim = cfg["ffn_dim"]
+    names = cfg["artifacts"]
+    arrays = {
+        "hidden": hidden,
+        "w_up": w_up,
+        "w_down": w_down,
+        "ffn_up": np.zeros((seq_len, ffn_dim), dtype=bfloat16),
+        "ffn_gelu": np.zeros((seq_len, ffn_dim), dtype=bfloat16),
+        "ffn_out": np.zeros((seq_len, emb_dim), dtype=bfloat16),
+    }
+    steps = []
+    scratches = set()
+    step, scratch = _gemm_step(cfg, "up", "hidden", "w_up", "ffn_up", arrays)
+    steps.append(step)
+    if scratch:
+        scratches.add(scratch)
+    steps.append(DispatchStep(names["gelu"], ("ffn_up", "ffn_gelu"), writes=(1,)))
+    step, scratch = _gemm_step(cfg, "down", "ffn_gelu", "w_down", "ffn_out", arrays)
+    steps.append(step)
+    if scratch:
+        scratches.add(scratch)
+    outputs = ("ffn_up", "ffn_gelu", "ffn_out")
+    specs = {
+        name: _spec_buf(
+            name,
+            arr,
+            static=name in ("w_up", "w_down"),
+            host_output=name in outputs,
+        )
+        for name, arr in arrays.items()
+    }
+    host_writes = {"hidden", "w_up", "w_down"} | scratches
+    results, vector = cache.run_sequence(
+        steps,
+        specs,
+        cfg["backend_kwargs"],
+        arrays,
+        host_writes=host_writes,
+        require_single_submission=True,
+    )
+    out = {n: np.array(results[n], copy=True) for n in outputs}
+    return out, vector
+
+
 def prepare_runlist(shape, seed=42):
     """The ``runlist`` mode's ``SPECS`` preparer: the D2 layer, fine-grained.
 
@@ -592,245 +873,6 @@ def prepare_runlist(shape, seed=42):
     )
     compile_runlist_artifacts(cache, cfg, run_only=True)
 
-    names = cfg["artifacts"]
-
-    def _run_projections(x, w_q, w_k, w_v):
-        """Runlist 1: q/k/v projections, three entries in one submission."""
-        arrays = {"x": x, "w_q": w_q, "w_k": w_k, "w_v": w_v}
-        steps = []
-        scratches = set()
-        for gemm_key, out_name, w_name in (
-            ("q_proj", "q", "w_q"),
-            ("k_proj", "k", "w_k"),
-            ("v_proj", "v", "w_v"),
-        ):
-            arrays[out_name] = np.zeros((seq_len, emb_dim), dtype=bfloat16)
-            step, scratch = _gemm_step(cfg, gemm_key, "x", w_name, out_name, arrays)
-            steps.append(step)
-            if scratch:
-                scratches.add(scratch)
-        outputs = ("q", "k", "v")
-        specs = {
-            name: _spec_buf(
-                name,
-                arr,
-                static=name in ("w_q", "w_k", "w_v"),
-                host_output=name in outputs,
-            )
-            for name, arr in arrays.items()
-        }
-        host_writes = {"x", "w_q", "w_k", "w_v"} | scratches
-        results, vector = cache.run_sequence(
-            steps,
-            specs,
-            cfg["backend_kwargs"],
-            arrays,
-            host_writes=host_writes,
-            require_single_submission=True,
-        )
-        out = {n: np.array(results[n], copy=True) for n in outputs}
-        return out, vector
-
-    def _evict_attention_contexts():
-        """Drop the two attention GEMM artifacts' ``hw_context``s (and the pools).
-
-        MEASURED, NOT DEFENSIVE, and it is the same measurement this module's
-        no-re-execution footgun records: a runtime-tiled GEMM ELF returns wrong
-        numbers from its SECOND execution in one context onward. The per-head
-        submissions dispatch each attention GEMM once, so nothing re-executes
-        INSIDE a runlist -- what has to be broken is reuse ACROSS the twelve
-        submissions, which is exactly what ``offload._evict_context`` does
-        between its dispatches. Evicting is available here precisely because
-        the boundary is between submissions rather than inside one.
-
-        The softmax artifact is deliberately NOT evicted: no runtime loop
-        tiling, same class as the band add/ln/mul ELFs that already re-execute
-        128 times per layer clean.
-        """
-        for key in ("attn_scores", "attn_output"):
-            loaded = cache._loaded.pop(cfg["artifacts"][key], None)
-            if loaded is not None:
-                loaded[0].unload()
-        cache._pools.clear()
-
-    def _run_attention_head(head, q, k, v):
-        """One head's whole attention interior, three entries in one submission.
-
-        ``attn_scores`` (Q_h @ K_h^T), ``softmax`` over the score matrix, then
-        ``attn_output`` (P_h @ V_h). Nothing crosses to the host between them:
-        the score matrix and the probability matrix are device-resident inside
-        the runlist, which is the property this mode exists to have and the one
-        the host-softmax ``offload`` partition deliberately gives up.
-
-        ONE HEAD PER SUBMISSION IS A MEMORY BOUND. See
-        ``runlist_submission_count``: all twelve heads in one runlist would
-        need every score and probability matrix live at once, ~800 MiB at the
-        gate configuration against ~70 MiB per head.
-
-        The head slice and the K transpose are contiguous host COPIES, per the
-        module's band-inputs footgun -- a strided view would upload the wrong
-        bytes without complaining. They are layout, not arithmetic; the mode
-        still computes nothing.
-        """
-        columns = slice(head * head_dim, (head + 1) * head_dim)
-        arrays = {
-            "q_h": np.ascontiguousarray(q[:, columns]),
-            "k_h_t": np.ascontiguousarray(k[:, columns].T),
-            "v_h": np.ascontiguousarray(v[:, columns]),
-            "scores": np.zeros((seq_len, seq_len), dtype=bfloat16),
-            "probs": np.zeros((seq_len, seq_len), dtype=bfloat16),
-            "ctx_h": np.zeros((seq_len, head_dim), dtype=bfloat16),
-        }
-        steps = []
-        scratches = set()
-        step, scratch = _gemm_step(cfg, "attn_scores", "q_h", "k_h_t", "scores", arrays)
-        steps.append(step)
-        if scratch:
-            scratches.add(scratch)
-        steps.append(
-            DispatchStep(names["softmax"], ("scores", "probs"), writes=(1,))
-        )
-        step, scratch = _gemm_step(cfg, "attn_output", "probs", "v_h", "ctx_h", arrays)
-        steps.append(step)
-        if scratch:
-            scratches.add(scratch)
-        specs = {
-            name: _spec_buf(name, arr, host_output=name == "ctx_h")
-            for name, arr in arrays.items()
-        }
-        host_writes = {"q_h", "k_h_t", "v_h"} | scratches
-        _evict_attention_contexts()
-        results, vector = cache.run_sequence(
-            steps,
-            specs,
-            cfg["backend_kwargs"],
-            arrays,
-            host_writes=host_writes,
-            require_single_submission=True,
-        )
-        return np.array(results["ctx_h"], copy=True), vector
-
-    def _run_o_proj(ctx, w_o):
-        """Runlist 2: the output projection, one entry."""
-        arrays = {"ctx": ctx, "w_o": w_o}
-        arrays["attn_out"] = np.zeros((seq_len, emb_dim), dtype=bfloat16)
-        step, scratch = _gemm_step(cfg, "o_proj", "ctx", "w_o", "attn_out", arrays)
-        specs = {
-            name: _spec_buf(
-                name, arr, static=name == "w_o", host_output=name == "attn_out"
-            )
-            for name, arr in arrays.items()
-        }
-        host_writes = {"ctx", "w_o"} | ({scratch} if scratch else set())
-        results, vector = cache.run_sequence(
-            [step],
-            specs,
-            cfg["backend_kwargs"],
-            arrays,
-            host_writes=host_writes,
-            require_single_submission=True,
-        )
-        return np.array(results["attn_out"], copy=True), vector
-
-    def _run_norm_chain(label, x_full, residual_full, gamma_band):
-        """Runlists 3 and 5: one normalization point as ``norm_blocks`` bands
-        of add -> LayerNorm -> gamma multiply, ``3 * norm_blocks`` entries in
-        one submission.
-
-        ``x_full`` and ``residual_full`` are whole ``[seq_len, emb_dim]``
-        tensors cut into bands here, because a dispatch argument is a whole
-        BO. Within a band the residual sum and the normalized rows stay
-        device-resident; ``gamma_band`` is ONE static buffer shared by every
-        band's multiply.
-        """
-        rows, blocks = cfg["norm_rows"], cfg["norm_blocks"]
-        gamma_name = f"{label}_gamma"
-        arrays = {gamma_name: gamma_band}
-        steps = []
-        out_names = []
-        for i in range(blocks):
-            lo, hi = i * rows, (i + 1) * rows
-            x_name, r_name = f"{label}_x{i}", f"{label}_r{i}"
-            s_name, n_name = f"{label}_sum{i}", f"{label}_norm{i}"
-            o_name = f"{label}_out{i}"
-            # Contiguous copies, not views — see the module footguns.
-            arrays[x_name] = np.ascontiguousarray(x_full[lo:hi])
-            arrays[r_name] = np.ascontiguousarray(residual_full[lo:hi])
-            arrays[s_name] = np.zeros((rows, emb_dim), dtype=bfloat16)
-            arrays[n_name] = np.zeros((rows, emb_dim), dtype=bfloat16)
-            arrays[o_name] = np.zeros((rows, emb_dim), dtype=bfloat16)
-            steps.append(
-                DispatchStep(names["add"], (x_name, r_name, s_name), writes=(2,))
-            )
-            steps.append(DispatchStep(names["ln"], (s_name, n_name), writes=(1,)))
-            steps.append(
-                DispatchStep(names["mul"], (n_name, gamma_name, o_name), writes=(2,))
-            )
-            out_names.append(o_name)
-        specs = {
-            name: _spec_buf(
-                name, arr, static=name == gamma_name, host_output=name in out_names
-            )
-            for name, arr in arrays.items()
-        }
-        host_writes = {gamma_name}
-        for i in range(blocks):
-            host_writes |= {f"{label}_x{i}", f"{label}_r{i}"}
-        results, vector = cache.run_sequence(
-            steps,
-            specs,
-            cfg["backend_kwargs"],
-            arrays,
-            host_writes=host_writes,
-            require_single_submission=True,
-        )
-        out = np.concatenate([np.array(results[n], copy=True) for n in out_names])
-        return out, vector
-
-    def _run_ffn(hidden, w_up, w_down):
-        """Runlist 4: up_proj, GeLU, down_proj — three entries, the
-        interiors device-resident."""
-        arrays = {
-            "hidden": hidden,
-            "w_up": w_up,
-            "w_down": w_down,
-            "ffn_up": np.zeros((seq_len, ffn_dim), dtype=bfloat16),
-            "ffn_gelu": np.zeros((seq_len, ffn_dim), dtype=bfloat16),
-            "ffn_out": np.zeros((seq_len, emb_dim), dtype=bfloat16),
-        }
-        steps = []
-        scratches = set()
-        step, scratch = _gemm_step(cfg, "up", "hidden", "w_up", "ffn_up", arrays)
-        steps.append(step)
-        if scratch:
-            scratches.add(scratch)
-        steps.append(DispatchStep(names["gelu"], ("ffn_up", "ffn_gelu"), writes=(1,)))
-        step, scratch = _gemm_step(cfg, "down", "ffn_gelu", "w_down", "ffn_out", arrays)
-        steps.append(step)
-        if scratch:
-            scratches.add(scratch)
-        outputs = ("ffn_up", "ffn_gelu", "ffn_out")
-        specs = {
-            name: _spec_buf(
-                name,
-                arr,
-                static=name in ("w_up", "w_down"),
-                host_output=name in outputs,
-            )
-            for name, arr in arrays.items()
-        }
-        host_writes = {"hidden", "w_up", "w_down"} | scratches
-        results, vector = cache.run_sequence(
-            steps,
-            specs,
-            cfg["backend_kwargs"],
-            arrays,
-            host_writes=host_writes,
-            require_single_submission=True,
-        )
-        out = {n: np.array(results[n], copy=True) for n in outputs}
-        return out, vector
-
     def dispatch(device_inputs, stage_stats):
         cache.profiler.cpu_times.clear()
         x, w_q, w_k, w_v, w_o, ln1_weight, w_up, w_down, ln2_weight = device_inputs
@@ -838,43 +880,41 @@ def prepare_runlist(shape, seed=42):
 
         total = runlist_submission_count(cfg)
         print(f"  [runlist 1/{total}] q_proj + k_proj + v_proj (3 entries)")
-        proj, vec_1 = _run_projections(x, w_q, w_k, w_v)
+        proj, vec_1 = run_projections(cache, cfg, x, w_q, w_k, w_v)
 
         print(
             f"  [runlist 2..{1 + num_heads}/{total}] attention on device: "
             f"{num_heads} x (attn_scores + softmax + attn_output), "
             f"3 entries each"
         )
-        attn_vectors = []
-        attn_context = np.empty((seq_len, emb_dim), dtype=bfloat16)
-        for head in range(num_heads):
-            columns = slice(head * head_dim, (head + 1) * head_dim)
-            ctx_h, vec_h = _run_attention_head(head, proj["q"], proj["k"], proj["v"])
-            attn_context[:, columns] = ctx_h
-            attn_vectors.append(vec_h)
+        attn_context, attn_vectors = run_attention_interior(
+            cache, cfg, proj["q"], proj["k"], proj["v"]
+        )
 
         print(f"  [runlist {2 + num_heads}/{total}] output_proj (1 entry)")
-        attn_out, vec_2 = _run_o_proj(round_bf16(attn_context), w_o)
+        attn_out, vec_2 = run_o_proj(cache, cfg, round_bf16(attn_context), w_o)
 
         print(
             f"  [runlist {3 + num_heads}/{total}] {blocks} x "
             f"(add + layer_norm + mul) ln1 ({3 * blocks} entries)"
         )
         gamma1 = round_bf16(broadcast_row_weight(ln1_weight, cfg["norm_rows"]))
-        hidden, vec_3 = _run_norm_chain("ln1", attn_out, x, gamma1)
+        hidden, vec_3 = run_norm_chain(cache, cfg, "ln1", attn_out, x, gamma1)
 
         print(
             f"  [runlist {4 + num_heads}/{total}] up_proj + gelu + down_proj "
             f"(3 entries)"
         )
-        ffn, vec_4 = _run_ffn(hidden, w_up, w_down)
+        ffn, vec_4 = run_ffn(cache, cfg, hidden, w_up, w_down)
 
         print(
             f"  [runlist {5 + num_heads}/{total}] {blocks} x "
             f"(add + layer_norm + mul) ln2 ({3 * blocks} entries)"
         )
         gamma2 = round_bf16(broadcast_row_weight(ln2_weight, cfg["norm_rows"]))
-        output, vec_5 = _run_norm_chain("ln2", ffn["ffn_out"], hidden, gamma2)
+        output, vec_5 = run_norm_chain(
+            cache, cfg, "ln2", ffn["ffn_out"], hidden, gamma2
+        )
 
         boundaries = dict(ffn)
         boundaries.update({"q": proj["q"], "k": proj["k"], "v": proj["v"]})
@@ -887,8 +927,7 @@ def prepare_runlist(shape, seed=42):
         boundaries["output"] = output
 
         vector_rows = [
-            v.as_row()
-            for v in ([vec_1] + attn_vectors + [vec_2, vec_3, vec_4, vec_5])
+            v.as_row() for v in ([vec_1] + attn_vectors + [vec_2, vec_3, vec_4, vec_5])
         ]
         stages = []
         for name in ENCODER_BOUNDARIES:

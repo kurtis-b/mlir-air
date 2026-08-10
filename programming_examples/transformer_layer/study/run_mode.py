@@ -93,8 +93,16 @@ import schema  # noqa: E402
 # from any future run, because no mode sits on the host side any more. A rerun
 # showing separated slopes is measuring something else and needs a new
 # explanation, not the old one restated.
+#
+# `[2026-08-09]` The two `coarse` CELLS are here for the same reason the modes
+# are: they are dispatched, measured and written to a results row, so the field
+# has to be right for them too. Both are on the device by construction -- each
+# composes a `block` half with a `runlist` half and neither half runs anything
+# on the host (28-coarse-blend-space.md).
 ATTENTION_PATH_BY_MODE = {
     "coarse": "device",
+    "coarse_c2": "device",
+    "coarse_c3": "device",
     "fused": "device",
     "offload": "device",
     "runlist": "device",

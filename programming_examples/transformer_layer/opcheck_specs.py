@@ -73,6 +73,8 @@ from opcheck_prepare import (  # noqa: E402
     prepare_transpose,
 )
 from pattern.coarse import prepare_coarse  # noqa: E402
+from pattern.coarse_c2 import prepare_coarse_c2  # noqa: E402
+from pattern.coarse_c3 import prepare_coarse_c3  # noqa: E402
 from pattern.fused import prepare_fused  # noqa: E402
 from pattern.offload import prepare_offload  # noqa: E402
 from pattern.runlist import prepare_runlist  # noqa: E402
@@ -805,16 +807,25 @@ SPECS = [
         # PHASE E4: the same layer, measured as the `runlist` execution
         # strategy — the fine-grained point of the taxonomy. coarse's
         # dispatch schedule held fixed and every unit refined into
-        # single-operator kernels: q/k/v; host torch attention through the
-        # SAME blocked implementation offload uses; output_proj; each
-        # normalization point as 64 bands of add + LayerNorm + gamma multiply
-        # at coarse's own row granularity (builders.block.norm_rows,
-        # imported); up_proj, GeLU, down_proj. The driver-summed vector is 5
-        # submissions over 391 entries — above coarse's 131 BY CONSTRUCTION,
+        # single-operator kernels: q/k/v; per head attn_scores -> softmax ->
+        # attn_output, device-resident inside one submission; output_proj;
+        # each normalization point as 64 bands of add + LayerNorm + gamma
+        # multiply at coarse's own row granularity (builders.block.norm_rows,
+        # imported); up_proj, GeLU, down_proj. The driver-summed vector is 17
+        # submissions over 427 entries — above coarse's 131 BY CONSTRUCTION,
         # since every coarse unit maps onto one or more finer entries, which
         # is the ordinal clause this mode owns. pattern/runlist/README.md
         # records the refinement, its measured restage cost, and why the
         # first structure tried (13 streaming entries) was rejected.
+        #
+        # `[2026-08-09]` THIS COMMENT WAS STALE and is corrected here. It
+        # described "host torch attention through the SAME blocked
+        # implementation offload uses" and "5 submissions over 391 entries",
+        # which is the mode as it stood BEFORE the corrected-taxonomy rebuild
+        # (52b93e1a) put every operator on the device. The lit recipe was
+        # moved with the rebuild and pins 17/427; this row was not, so the
+        # catalogue asserted a structure the code had stopped having — and
+        # the tolerance figures below travelled with it. Both are re-measured.
         "operator": "runlist",
         "shape_key": "4096x768_encoder_bert",
         "shape": {
@@ -825,16 +836,22 @@ SPECS = [
             "head_dim": 64,
         },
         # Same tensor as the block row, compared the same way at the same
-        # golden seed, so the 1e-1 HARD CEILING carries over. Measured over
-        # 3145728 elements: mean_rel_L1 1.732e-2, atol_required 7.077e-2, a
-        # 1.41x margin — between offload's 1.82x (host norms and attention)
-        # and the block's 1.35x (device fused norms), exactly where a mode
-        # with device norms but host f32 attention should land. See the block
-        # entry for why exceeding the ceiling is a defect report, never a
-        # wider tolerance. (`[2026-08-07]` was 1.755e-2 / 7.011e-2 / 1.43x;
-        # J7a's move of layer_norm_rows to f32 two-pass statistics is the
-        # change. The mean improved and the margin TIGHTENED slightly —
-        # atol_required is a worst-element statistic and moves independently.)
+        # golden seed, so the 1e-1 HARD CEILING carries over. `[2026-08-09]`
+        # Re-measured on the REBUILT mode over 3145728 elements: mean_rel_L1
+        # 1.746e-2, atol_required 6.981e-2, a 1.43x margin, zero mismatching
+        # elements.
+        #
+        # The figures this row carried before — 1.732e-2 / 7.077e-2 / 1.41x,
+        # and 1.755e-2 / 7.011e-2 / 1.43x before that — were measured on the
+        # HOST-ATTENTION mode and are not comparable: the arithmetic changed
+        # when both attention matmuls and the softmax moved to the device. Do
+        # not read 1.732 -> 1.746 as a regression; it is a different
+        # computation. The explanation that travelled with the old number
+        # ("device norms but host f32 attention") no longer describes
+        # anything, since nothing here runs on the host.
+        #
+        # See the block entry for why exceeding the ceiling is a defect
+        # report, never a wider tolerance.
         "atol": 1e-1,
         "prepare": prepare_runlist,
     },
@@ -906,6 +923,94 @@ SPECS = [
         # runlist 1.732e-2.
         "atol": 1e-1,
         "prepare": prepare_fused,
+    },
+    {
+        # `coarse` CELL C2: the block front, the decomposed tail.
+        #
+        # 28-coarse-blend-space.md derives `coarse`'s blend space from the
+        # artifact plans and finds it is two axes over six cells -- front
+        # {block, runlist} x tail {stitched, banded, decomposed} -- of which
+        # two ARE modes: (block, stitched) is `fused` and (runlist,
+        # decomposed) is `runlist`. C1 = (block, banded) is today's `coarse`,
+        # inherited from D2 rather than chosen. This row and the C3 row below
+        # are the two INTERIOR cells, and they exist so the blend has
+        # provenance: a measurement selects the cell.
+        #
+        # C2 holds `coarse`'s front and refines only the tail. Predicted 4
+        # submissions over 389 entries at this shape (2 for the block front,
+        # 3 + 6*64 for the decomposed tail), which is the ordinal claim the
+        # pair owns: coarse's 131 < C3's 169 < C2's 389 < runlist's 427. Every
+        # coarse tail unit maps onto finer units and the front is untouched,
+        # so the bracket holds BY CONSTRUCTION.
+        #
+        # THE MEASUREMENT DOES NOT BELONG AT 1024. `fused`'s stitched tail
+        # caps at 1365 rows (builders/norm_tail.py's plane_major stride
+        # check), so at seq >= 2048 the whole stitched row of the table is
+        # unbuildable and `coarse` is the mode you use where `fused` does not
+        # fit. At 1024 every cell is dominated by one that already has a mode
+        # name. This row gates at 4096 -- where the incumbent C1 and `runlist`
+        # are also gated -- so the four points are compared where they are all
+        # real.
+        "operator": "coarse_c2",
+        "shape_key": "4096x768_encoder_bert",
+        "shape": {
+            "seq_len": 4096,
+            "emb_dim": 768,
+            "ffn_dim": 3072,
+            "num_heads": 12,
+            "head_dim": 64,
+        },
+        # Same tensor as the block row, compared the same way at the same
+        # golden seed, so the 1e-1 HARD CEILING carries over. `[2026-08-09]`
+        # Measured over 3145728 elements: mean_rel_L1 1.784e-2, atol_required
+        # 7.896e-2, a 1.27x margin, zero mismatching elements.
+        #
+        # THE THINNEST OF THE FOUR CORNERS, and the composition says why: the
+        # error tracks the TAIL, not the front. The two decomposed-tail cells
+        # land at 1.784e-2 (this one) and 1.746e-2 (`runlist`); the two
+        # banded-tail cells at 1.688e-2 (`coarse`) and 1.654e-2 (C3). A
+        # decomposed tail stages bf16 between the add, the LayerNorm and the
+        # gamma multiply where the fused addnorm keeps it in one kernel, which
+        # is the same effect `fused`'s row records for its own tail. 1.27x is
+        # the least headroom any whole-layer row has ever carried; if a future
+        # change pushes it past the ceiling the answer is a recorded defect,
+        # never a wider tolerance. See the block entry.
+        "atol": 1e-1,
+        "prepare": prepare_coarse_c2,
+    },
+    {
+        # `coarse` CELL C3: the runlist front, the banded tail. The other
+        # interior cell -- see the C2 row above for the blend space and why
+        # these two exist. C3 varies the axis C2 holds fixed: the front
+        # becomes `runlist`'s three projections plus per-head attn_scores ->
+        # softmax -> attn_output plus output_proj, and the tail stays
+        # `coarse`'s banded one. Varying one axis per cell is what keeps the
+        # comparison a comparison; the first `runlist` structure moved two at
+        # once and its entry count measured the schedule change rather than
+        # the decomposition.
+        #
+        # Predicted 17 submissions over 169 entries at this shape (4 + 3*12
+        # for the runlist front, 1 + 2*64 for the banded tail). The 17
+        # submissions are the front's memory bound -- one per head, ~800 MiB
+        # if batched -- and not a schedule choice, exactly as in `runlist`.
+        "operator": "coarse_c3",
+        "shape_key": "4096x768_encoder_bert",
+        "shape": {
+            "seq_len": 4096,
+            "emb_dim": 768,
+            "ffn_dim": 3072,
+            "num_heads": 12,
+            "head_dim": 64,
+        },
+        # The 1e-1 hard ceiling, for the reason the C2 row states.
+        # `[2026-08-09]` Measured over 3145728 elements: mean_rel_L1
+        # 1.654e-2, atol_required 7.266e-2, a 1.38x margin, zero mismatching
+        # elements. The BEST mean of the four corners, which is the other half
+        # of the tail effect the C2 row describes -- this cell keeps the fused
+        # addnorm and refines the front, and the front is not where the error
+        # is made.
+        "atol": 1e-1,
+        "prepare": prepare_coarse_c3,
     },
     {
         # PHASE J7B: the FFN down-projection as a COMPILER-FORMED accumulator

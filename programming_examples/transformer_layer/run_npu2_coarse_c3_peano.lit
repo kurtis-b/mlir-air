@@ -1,0 +1,117 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// `coarse` CELL C3: the runlist front, the banded tail.
+//
+// The other interior cell of 28-coarse-blend-space.md's two-axis blend space --
+// see run_npu2_coarse_c2_peano.lit for the space and why the pair exists. C3
+// varies the axis C2 holds fixed: the front becomes `runlist`'s three
+// projections plus per-head attn_scores -> softmax -> attn_output plus
+// output_proj, and the tail stays `coarse`'s banded one. One axis per cell is
+// what keeps the pair a comparison; the first `runlist` structure moved two at
+// once and its entry count measured the schedule change rather than the
+// decomposition it meant to.
+//
+// SEVENTEEN SUBMISSIONS IS A MEMORY BOUND, NOT A SCHEDULE CHOICE. The runlist
+// front dispatches one submission per head because twelve heads in one runlist
+// would need every score and probability matrix live at once -- ~800 MiB at
+// this configuration against ~70 MiB per head. It does not touch the ENTRY
+// count, which is what the blend space compares.
+//
+// THE CELL IS NOT A FIFTH MODE. Its recorded execution_mode is `coarse`'s CSV
+// value; the cell is carried in the artifact as blend_cell.
+//
+// Two recipes share the working directory and therefore the ELF cache. NPU
+// serialization lives one layer down, on /tmp/npu.lock inside KernelCache.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming
+// one in prose -- even inside a comment -- registers as a second directive and
+// leaves the test UNRESOLVED. Describe them, never spell them out.
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_npu2_coarse_c3_peano
+// RUN: cd test_npu2_coarse_c3_peano
+// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile coarse-cell-structure | FileCheck %s --check-prefix=STRUCT
+// RUN: make -f %S/Makefile check-coarse-c3 PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+// RUN: make -f %S/Makefile check-coarse-c3-fault PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s --check-prefix=FAULT
+//
+// THE STRUCTURE ARM, first and with no device. Two of its four front x tail
+// combinations are already pinned by shipped gates, so it re-derives `coarse`'s
+// 4/131 and `runlist`'s 17/427 from the same arithmetic that produces this
+// cell's numbers.
+// STRUCT: PASS  test_the_prediction_reproduces_both_measured_endpoints
+// STRUCT: PASS  test_the_two_new_cells_predict_the_bracket_they_claim
+// STRUCT: [cell] C1 block   front + banded      tail: 4 submissions, 131 entries
+// STRUCT: [cell] C3 runlist front + banded      tail: 17 submissions, 169 entries
+// STRUCT: [cell] C2 block   front + decomposed  tail: 4 submissions, 389 entries
+// STRUCT: [cell] C6 runlist front + decomposed  tail: 17 submissions, 427 entries
+//
+// The configuration first -- both halves resolved. The front's two attention
+// shapes resolve in NO registry and are injected measured tiles; the tail's
+// two FFN projections are registry rows. A change to either fails here.
+// CHECK: coarse C3 4096x768 ffn 3072 12h x 64 (encoder_bert, non-causal, runlist front + banded tail, 169 entries over 17 runlists)
+// CHECK: front: q/k/v/o_proj 4096x768x768 drain (registry), per head attn_scores + softmax + attn_output (injected tiles)
+// CHECK: tail: ffn drain up / fused-cast down (registry), addnorm pre-add 64x768 x64 dispatches
+//
+// Every boundary, in execution order, each with zero mismatching elements.
+// CHECK: [stage] q {{.*}} mismatch       0
+// CHECK: [stage] k {{.*}} mismatch       0
+// CHECK: [stage] v {{.*}} mismatch       0
+// CHECK: [stage] attn_context {{.*}} mismatch       0
+// CHECK: [stage] attn_out {{.*}} mismatch       0
+// CHECK: [stage] hidden {{.*}} mismatch       0
+// CHECK: [stage] ffn_up {{.*}} mismatch       0
+// CHECK: [stage] ffn_gelu {{.*}} mismatch       0
+// CHECK: [stage] ffn_out {{.*}} mismatch       0
+// CHECK: [coarse_c3] stages: 10/10 clean
+//
+// The cell's granularity. Seventeen recorded vectors -- fourteen for the
+// runlist front (q/k/v, twelve heads, output_proj) and three for the banded
+// tail -- over 169 entries: the front refined, the tail untouched, which is the
+// mirror of C2 and is why the two together separate the axes. The bracket the
+// pair owns is coarse 131 < C3 169 < C2 389 < runlist 427.
+// CHECK: [coarse_c3] recorded 17 dispatch vectors
+// CHECK: [coarse_c3] dispatch totals: submissions 17 entries 169 air 46 herd 232 sync 451 bytes 190319616
+//
+// `[2026-08-09]` The last four were patterns until this cell first ran, for the
+// reason run_npu2_coarse_c2_peano.lit states -- and they land on the additivity
+// that file records: C1 + C6 = C2 + C3 on air, herd, sync and bytes, the last
+// EXACTLY (393,415,680 both ways). Two numbers here are worth reading rather
+// than only checking. This cell's byte total is 190,319,616 against
+// `runlist`'s 190,513,152, a difference of 193,536 -- the whole cost of the
+// banded tail against the decomposed one, on a layer that moves 190 MB. And it
+// is 12,582,912 BELOW `coarse`'s 202,902,528, which is exactly two
+// [4096, 768] bf16 tensors: that is what the front costs, and it is the axis
+// that actually moves bytes here.
+
+//
+// Then the layer output over all 4096 x 768 elements, and the label naming the
+// CELL.
+// CHECK: PASS!
+// CHECK: [opcheck] coarse_c3 [4096x768_encoder_bert]: PASS
+//
+// THE NEGATIVE CONTROL. The same measured ln1_weight target, at index 5 of the
+// RUNLIST input list -- this cell takes that list because its FRONT is the
+// runlist form, which dispatches three separate projections rather than one
+// fused w_qkv. The index differs from C2's and the target does not.
+//
+// FAULT: [fault-inject] input 5 at (0,)
+//
+// Nothing upstream of the first norm reads ln1_weight, so the whole front must
+// still be exact while `hidden` and everything after it moves.
+// FAULT: [stage] q {{.*}} mismatch       0
+// FAULT: [stage] attn_out {{.*}} mismatch       0
+// FAULT: [stage] hidden {{.*}} mismatch {{[1-9][0-9]*}}
+// FAULT: [coarse_c3] stages: 5/10 clean
+//
+// The vectors, still recorded under injection, and totaling what the clean run
+// totals.
+// FAULT: [coarse_c3] recorded 17 dispatch vectors
+// FAULT: [coarse_c3] dispatch totals: submissions 17 entries 169 air 46 herd 232 sync 451 bytes 190319616
+//
+// And the verdict in the three forms opcheck.py reports it.
+// FAULT: [opcheck] coarse_c3 [4096x768_encoder_bert]: FAIL
+// FAULT: [opcheck] coarse_c3 [4096x768_encoder_bert]: fault-inject input -> FAIL (as required)
+// FAULT: NEGATIVE CONTROL: PASS

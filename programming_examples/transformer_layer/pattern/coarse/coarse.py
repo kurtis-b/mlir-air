@@ -59,19 +59,66 @@ from pattern import EXECUTION_MODE_CSV  # noqa: E402
 #: ``BLOCK_CACHE_DIR``, but the mode's own. See the module footguns.
 COARSE_CACHE_DIR = "coarse_cache"
 
+# ---------------------------------------------------------------------------
+# WHICH BLEND THIS MODE IS, AND WHAT CHOSE IT
+#
+# `coarse` is defined as a per-workload BLEND of `runlist` and `fused`, and
+# until 2026-08-09 nothing recorded which blend it was. 28-coarse-blend-space.md
+# derives the space from the artifact plans -- front {block, runlist} x tail
+# {stitched, banded, decomposed}, six cells, four of them already owned by an
+# existing mode -- and 30-coarse-cells-built.md measures the four that build at
+# seq >= 2048, which is where `fused`'s stitched tail cannot pack and therefore
+# where `coarse` is a mode rather than `fused` under another name.
+#
+# The measurement, walked TWICE at 2048 and 4096: C1 < C2 < C3 < C6 on averages
+# and on minimums at both lengths. This cell wins.
+#
+# THE DISPATCH DID NOT CHANGE. C1 is `builders/block.py`, which is what this
+# module has always called. What changed is that the choice now has provenance:
+# it was measured against its three siblings rather than inherited from D2
+# having been built at 4096. If a future workload admits a stitched tail, or a
+# retune moves the front axis, the answer is a fresh walk of the cells -- not an
+# edit here.
+#
+# `coarse_cells_structure.py` and the two cell gates keep the alternatives
+# runnable, so re-deciding costs a measurement rather than a rebuild.
+# ---------------------------------------------------------------------------
+
+#: The cell of 28-coarse-blend-space.md's space that this mode dispatches.
+BLEND_CELL = "C1"
+BLEND_FRONT = "block"
+BLEND_TAIL = "banded"
+
+#: How the cell was chosen, recorded into every results artifact so a row can
+#: be traced to the measurement behind it rather than to a convention.
+BLEND_SELECTED_BY = (
+    "measured: fastest of the four cells that build at seq >= 2048, on averages "
+    "and minimums, over two walks at 2048 and 4096 (30-coarse-cells-built.md)"
+)
+
 
 def prepare_coarse(shape, seed=42):
     """The ``coarse`` mode's ``SPECS`` preparer: the D2 layer, measured as a mode.
 
     Same golden model, same injection target, same per-boundary comparisons as
     ``prepare_block`` — by construction, not by parallel implementation. Only
-    the cache directory, the stage-print label and the recorded
-    ``execution_mode`` differ.
+    the cache directory, the stage-print label, the recorded ``execution_mode``
+    and the recorded blend cell differ.
     """
     return prepare_layer_dispatch(
         shape,
         seed=seed,
         cache_dir=COARSE_CACHE_DIR,
         label="coarse",
-        extra={"execution_mode": EXECUTION_MODE_CSV["coarse"]},
+        extra={
+            "execution_mode": EXECUTION_MODE_CSV["coarse"],
+            # THE BLEND, AND WHY IT IS THIS ONE. See the module note above.
+            # Recorded rather than implicit: the dispatch is unchanged, and
+            # what is new is that the artifact now says which cell of
+            # 28-coarse-blend-space.md's space was run and what selected it.
+            "blend_cell": BLEND_CELL,
+            "blend_front": BLEND_FRONT,
+            "blend_tail": BLEND_TAIL,
+            "blend_selected_by": BLEND_SELECTED_BY,
+        },
     )

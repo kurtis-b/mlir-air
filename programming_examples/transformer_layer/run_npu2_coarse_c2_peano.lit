@@ -1,0 +1,133 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// `coarse` CELL C2: the block front, the decomposed tail.
+//
+// 28-coarse-blend-space.md derives `coarse`'s blend space from the artifact
+// plans -- two axes, front {block, runlist} x tail {stitched, banded,
+// decomposed}, six cells -- and finds that two of the six ARE modes:
+// (block, stitched) is `fused` and (runlist, decomposed) is `runlist`. C1 =
+// (block, banded) is today's `coarse`, which D2 chose implicitly by having been
+// built at 4096. This is one of the two INTERIOR cells, and the pair exists so
+// the blend can be SELECTED by measurement instead of inherited.
+//
+// What is under test here is that the composition is real: that a front from
+// one mode and a tail from another compute the same layer to the same
+// per-boundary tolerances, and dispatch at the granularity the cell claims.
+// The numbers cannot show the second part on their own -- C2 computes what
+// `coarse` computes -- which is why the structure arm runs first and why the
+// dispatch totals are pinned.
+//
+// THE CELL IS NOT A FIFTH MODE. Its recorded execution_mode is `coarse`'s CSV
+// value; the cell is carried in the artifact as blend_cell. A results tree that
+// gave it its own value would invite a cross-mode table to compare the four
+// modes against one of them measured differently.
+//
+// Two recipes share the working directory and therefore the ELF cache, so the
+// injected run reuses what the clean run compiled -- compilation depends on the
+// shape, not the data.
+//
+// NPU serialization lives one layer down: device access is locked on
+// /tmp/npu.lock inside KernelCache. Taking the outer /tmp/mlir-air-npu.lock
+// here would DEADLOCK against the gate command that already holds it.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming
+// one in prose -- even inside a comment -- registers as a second directive and
+// leaves the test UNRESOLVED. Describe them, never spell them out.
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_npu2_coarse_c2_peano
+// RUN: cd test_npu2_coarse_c2_peano
+// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile coarse-cell-structure | FileCheck %s --check-prefix=STRUCT
+// RUN: make -f %S/Makefile check-coarse-c2 PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+// RUN: make -f %S/Makefile check-coarse-c2-fault PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s --check-prefix=FAULT
+//
+// THE STRUCTURE ARM, first and with no device. The prediction is derived from
+// the two halves' configs, and two of its four front x tail combinations are
+// already pinned by shipped gates -- so this arm also re-derives `coarse`'s own
+// 4/131 and `runlist`'s 17/427 from the same arithmetic that produces the
+// numbers below. A model that reproduces both endpoints is a model.
+// STRUCT: PASS  test_the_prediction_reproduces_both_measured_endpoints
+// STRUCT: PASS  test_the_two_new_cells_predict_the_bracket_they_claim
+// STRUCT: [cell] C1 block   front + banded      tail: 4 submissions, 131 entries
+// STRUCT: [cell] C3 runlist front + banded      tail: 17 submissions, 169 entries
+// STRUCT: [cell] C2 block   front + decomposed  tail: 4 submissions, 389 entries
+// STRUCT: [cell] C6 runlist front + decomposed  tail: 17 submissions, 427 entries
+//
+// The configuration first -- both halves resolved, so a registry change that
+// moved either half's method fails here with its cause on screen.
+// CHECK: coarse C2 4096x768 ffn 3072 12h x 64 (encoder_bert, non-causal, block front + decomposed tail, 389 entries over 4 runlists)
+// CHECK: front: qkv_proj fused-cast (registry), mha_out_proj + o_proj drain (registry), q/k/v device-resident
+// CHECK: tail: up drain / gelu / down fused-cast (registry), norm chains 64 rows x64 of (add + layer_norm + mul)
+//
+// Every boundary, in execution order, each with zero mismatching elements.
+// Named individually rather than counted, so a stage list that dropped or
+// repeated an entry fails here.
+// CHECK: [stage] q {{.*}} mismatch       0
+// CHECK: [stage] k {{.*}} mismatch       0
+// CHECK: [stage] v {{.*}} mismatch       0
+// CHECK: [stage] attn_context {{.*}} mismatch       0
+// CHECK: [stage] attn_out {{.*}} mismatch       0
+// CHECK: [stage] hidden {{.*}} mismatch       0
+// CHECK: [stage] ffn_up {{.*}} mismatch       0
+// CHECK: [stage] ffn_gelu {{.*}} mismatch       0
+// CHECK: [stage] ffn_out {{.*}} mismatch       0
+// CHECK: [coarse_c2] stages: 10/10 clean
+//
+// The cell's granularity, which is its whole claim. Four recorded vectors --
+// one for the block front, three for the decomposed tail -- and 389 entries
+// against `coarse`'s 131 at the same front: every tail unit refined, the front
+// untouched. The bracket the pair owns is coarse 131 < C3 169 < C2 389 <
+// runlist 427, and the structure arm above pins all four.
+// CHECK: [coarse_c2] recorded 4 dispatch vectors
+// CHECK: [coarse_c2] dispatch totals: submissions 4 entries 389 air 16 herd 402 sync 402 bytes 203096064
+//
+// `[2026-08-09]` The last four were patterns until this cell first ran --
+// they are properties of the dispatch, not of the config, so nothing host-side
+// derives them and a guess would have been a claim with no artifact behind it.
+// These are the measured numbers, and they carry a check nobody had to write:
+// THE FOUR CELLS' VECTORS ARE ADDITIVE ACROSS THE TWO AXES. On every column,
+// C1 + C6 equals C2 + C3 -- air 12+50 = 16+46 = 62, herd 146+488 = 402+232 =
+// 634, sync 402+451 = 402+451 = 853, and bytes 202,902,528 + 190,513,152 =
+// 203,096,064 + 190,319,616 = 393,415,680 EXACTLY. A cell that had quietly
+// forked a half, or composed something other than one mode's front with the
+// other's tail, would not sum. The arithmetic says the composition is what it
+// claims, independently of anyone's account of it.
+//
+// Then the layer output over all 4096 x 768 elements, and the label naming the
+// CELL -- a test wired to another mode's artifact fails here rather than
+// passing quietly.
+// CHECK: PASS!
+// CHECK: [opcheck] coarse_c2 [4096x768_encoder_bert]: PASS
+//
+// THE NEGATIVE CONTROL. Same measured target every whole-layer check uses --
+// ln1_weight, perturbed AFTER the golden model was computed -- at index 3 of
+// the BLOCK input list, which is the list this cell takes because its FRONT is
+// the block form.
+//
+// FAULT: [fault-inject] input 3 at (0,)
+//
+// Nothing upstream of the first norm reads ln1_weight, so the whole front must
+// still be exact while `hidden` and everything after it moves -- which is what
+// says the stage comparisons read THIS run's device buffers rather than
+// replaying the clean run's. It is also the cell's own composition claim: the
+// front is untouched by a tail-side perturbation.
+// FAULT: [stage] q {{.*}} mismatch       0
+// FAULT: [stage] attn_out {{.*}} mismatch       0
+// FAULT: [stage] hidden {{.*}} mismatch {{[1-9][0-9]*}}
+// FAULT: [coarse_c2] stages: 5/10 clean
+//
+// The vectors, still recorded under injection, and totaling what the clean run
+// totals. Injection perturbs one input element after the reference exists and
+// never touches the dispatch path, so a fault run that totals anything else is
+// instrumentation conditional on the injected flag, or a vector that was not
+// measured.
+// FAULT: [coarse_c2] recorded 4 dispatch vectors
+// FAULT: [coarse_c2] dispatch totals: submissions 4 entries 389 air 16 herd 402 sync 402 bytes 203096064
+//
+// And the verdict in the three forms opcheck.py reports it.
+// FAULT: [opcheck] coarse_c2 [4096x768_encoder_bert]: FAIL
+// FAULT: [opcheck] coarse_c2 [4096x768_encoder_bert]: fault-inject input -> FAIL (as required)
+// FAULT: NEGATIVE CONTROL: PASS

@@ -24,8 +24,18 @@ it labels.
 """
 
 #: mode name in this repository -> ``execution_mode`` value in the study CSV.
+#:
+#: `[2026-08-09]` ``coarse_c2`` and ``coarse_c3`` are CELLS of ``coarse``
+#: (28-coarse-blend-space.md), not new taxonomy points, so they record
+#: ``coarse``'s value. Giving a cell its own value would put it in
+#: ``schema.EXECUTION_MODES`` and invite a cross-mode table to compare four
+#: modes against a fifth thing that is one of them measured differently. A cell
+#: separates in a results tree by ``study_case_label`` and by the per-mode CSV
+#: filename, and the cell itself is recorded in the artifact as ``blend_cell``.
 EXECUTION_MODE_CSV = {
     "coarse": "hybrid",
+    "coarse_c2": "hybrid",
+    "coarse_c3": "hybrid",
     "offload": "offload",
     "runlist": "runlist",
     "fused": "fused_elf",

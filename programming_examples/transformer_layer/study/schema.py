@@ -364,8 +364,15 @@ EXECUTION_MODES: tuple[str, ...] = ("offload", "runlist", "hybrid", "fused_elf")
 #: which the shipped modes read from; the two agree, and closing the duplication
 #: means pointing that one here rather than adding a third. Asserted equal by
 #: ``test_schema.py`` so they cannot drift in the meantime.
+#: `[2026-08-09]` ``coarse_c2`` and ``coarse_c3`` are CELLS of ``coarse``
+#: (28-coarse-blend-space.md) and record ``coarse``'s value: a cell is a point
+#: inside the mode, not a fifth taxonomy point, and ``EXECUTION_MODES`` stays
+#: four so a cross-mode table cannot silently compare a cell against the modes
+#: as though it were one of them.
 EXECUTION_MODE_CSV: dict[str, str] = {
     "coarse": "hybrid",
+    "coarse_c2": "hybrid",
+    "coarse_c3": "hybrid",
     "offload": "offload",
     "runlist": "runlist",
     "fused": "fused_elf",

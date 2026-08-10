@@ -310,6 +310,43 @@ check-coarse-fault:
 	    python3 $(srcdir)/opcheck.py --operator coarse \
 	        --fault-inject input --expect-failure
 
+# `coarse` CELL C2: the block front with the tail refined to runlist's
+# up/GeLU/down plus per-band add/LayerNorm/multiply. One of the two interior
+# cells of 28-coarse-blend-space.md's two-axis blend space; the cell exists so
+# the blend has provenance — a measurement selects it — rather than being
+# inherited from D2. Its own ELF cache (./coarse_c2_cache under $(BUILD_DIR))
+# for the same reason as coarse's.
+check-coarse-c2:
+	$(call opcheck,coarse_c2)
+
+# The cell's negative control, same stake as check-coarse-fault: the dispatch
+# vectors must be recorded on the injected path too.
+check-coarse-c2-fault:
+	mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
+	    python3 $(srcdir)/opcheck.py --operator coarse_c2 \
+	        --fault-inject input --expect-failure
+
+# `coarse` CELL C3: the runlist front (three projections, per-head
+# attn_scores/softmax/attn_output, output_proj) with coarse's banded tail. The
+# other interior cell — it varies the axis C2 holds fixed, which is what keeps
+# the pair a comparison rather than two unrelated points.
+check-coarse-c3:
+	$(call opcheck,coarse_c3)
+
+# The cell's negative control, same stake as check-coarse-fault.
+check-coarse-c3-fault:
+	mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
+	    python3 $(srcdir)/opcheck.py --operator coarse_c3 \
+	        --fault-inject input --expect-failure
+
+# Host-only: the blend space's shape, derived from the configs with no device.
+# The predicted dispatch vectors the two cells' lit recipes pin, and the ordinal
+# bracket coarse < {C3, C2} < runlist that says each cell refines one half.
+coarse-cell-structure:
+	python3 $(srcdir)/coarse_cells_structure.py
+
 # Phase E3: the same layer, measured as the `offload` execution strategy. The
 # host owns every intermediate and dispatches six registry GEMMs one at a
 # time — each a one-step run_sequence call, so the driver-summed vector is six
@@ -556,5 +593,6 @@ registry-writer-tests:
 
 clean:
 	rm -rf $(BUILD_DIR) __pycache__ runlist_gate_cache block_cache coarse_cache \
+	    coarse_c2_cache coarse_c3_cache \
 	    offload_cache offload_shared_cache runlist_cache fused_cache \
 	    air_shared_*.xclbin air_shared_*.insts.bin

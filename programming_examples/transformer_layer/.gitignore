@@ -1,6 +1,8 @@
 runlist_gate_cache/
 block_cache/
 coarse_cache/
+coarse_c2_cache/
+coarse_c3_cache/
 offload_cache/
 offload_shared_cache/
 runlist_cache/
