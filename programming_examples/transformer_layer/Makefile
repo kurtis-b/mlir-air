@@ -27,7 +27,8 @@ SWEEP_ARGS ?=
         check-softmax check-softmax-fault \
         check-qkv-proj check-ffn check-mha-out-proj check-fault-control \
         check-block check-block-fault check-coarse check-coarse-fault \
-        check-offload check-offload-fault check-runlist check-runlist-fault \
+        check-offload check-offload-fault check-offload-shared \
+        check-runlist check-runlist-fault \
         check-fused check-fused-fault \
         check-transpose check-elementwise-mul check-norm-tail \
         check-norm-tail-fault check-norm-tail-structure \
@@ -79,11 +80,20 @@ help:
 	@echo "  make check-coarse-fault"
 	@echo "                      That mode's negative control; must FAIL under"
 	@echo "                      injection, with the vectors still recorded."
-	@echo "  make check-offload  The same layer as the Phase E 'offload' strategy:"
-	@echo "                      host torch owns the layer and dispatches six"
-	@echo "                      registry GEMMs one at a time, each its own"
+	@echo "  make check-offload  The same layer as the 'offload' strategy: every"
+	@echo "                      LINEAR operator on the device -- six projections"
+	@echo "                      plus both attention matmuls per head, 30"
+	@echo "                      dispatches -- with softmax, both LayerNorms and"
+	@echo "                      the GeLU on the host. Each dispatch is its own"
 	@echo "                      submission, through its own ELF cache. NEEDS AN"
 	@echo "                      NPU."
+	@echo "  make check-offload-shared"
+	@echo "                      The same mode over its shared-xclbin path: five"
+	@echo "                      shapes in ONE xclbin, the array configured once"
+	@echo "                      instead of once per dispatch. Same numbers, same"
+	@echo "                      dispatch vector; only the reconfiguration count"
+	@echo "                      moves. At seq 1024 -- the chain needs every"
+	@echo "                      shape single-launch. NEEDS AN NPU."
 	@echo "  make check-offload-fault"
 	@echo "                      That mode's negative control; must FAIL under"
 	@echo "                      injection, with the vectors still recorded."
@@ -310,6 +320,61 @@ check-coarse-fault:
 # (./offload_cache under $(BUILD_DIR)) for the same reason as coarse's.
 check-offload:
 	$(call opcheck,offload)
+
+# `[2026-08-09]` The same mode over its SHARED-XCLBIN path: five GEMM shapes
+# compiled into one xclbin, loaded once, each binding its own kernel and
+# instruction stream onto the standing context. This is the mode's defining
+# axis — doc 03 defines offload as "reconfiguration MINIMIZED" — and until this
+# target existed nothing in the suite ran the path at all, so the claim was
+# printed by describe_offload and enforced by nothing.
+#
+# The env var is the whole switch: offload.py resolves it once into cfg
+# (SHARED_XCLBIN) so a run cannot be half shared and half not, and it also
+# selects a SEPARATE ELF cache (offload_shared_cache). That separation is not
+# tidiness — the two builds emit artifacts with identical names over different
+# ABIs, so one directory could hand a 30-reconfiguration run's ELF to the
+# one-reconfiguration claim.
+#
+# WHY 1024 AND NOT THE MODE'S OWN 4096 SPECS ROW. The chain does not build at
+# 4096, and the reason is exact: at 4096 the down-projection resolves to
+# `fused-cast`, which is TWO air.launch ops, while every other shape at either
+# length is single-launch `drain`. XRTBackend.compile defaults its instruction
+# file to the fixed name `air.insts.bin` and the xclbin branch passes it through
+# as `-i`; the ELF branch passes `--elf-name` and no `-i` at all, so only the
+# ELF path lets aircc derive a name per launch. A two-launch module under the
+# xclbin ABI therefore asks aiecc to write every instruction stream to one path
+# and it refuses: "edge 'air.insts.bin' produced duplicate output path". So the
+# shared path is bounded to SINGLE-LAUNCH modules today, 1024 is where all five
+# shapes are single-launch, and that is the shape doc 29 demonstrated.
+#
+# This uses study/run_mode.py rather than opcheck.py because the sequence length
+# is the whole point and only run_mode takes one; opcheck reads its shape from
+# the SPECS row, and adding a second offload row to move it would churn the
+# 4096 row that is gated, provenanced and cited. Numerics are still checked
+# against the same golden reference at the same row's atol -- run_mode compares
+# every boundary and writes run_status -- and the mode's negative control is
+# unaffected, because the shared path changes packaging and not arithmetic.
+#
+# WARMUP 1 IS LOAD-BEARING, and measurement found it rather than design. The
+# FIRST dispatch under the xclbin ABI uploads each artifact's INSTRUCTION
+# stream once -- `sync_instruction_bos`, which the ELF ABI skips entirely
+# because an ELF embeds its instructions. Five artifacts is five extra sync
+# boundaries and exactly 51,088 bytes, the size of the five cached
+# `.insts.bin` files, so the cold call reads sync 95 / bytes 99141520 and every
+# later one reads sync 90 / bytes 99090432. The ELF path shows no such step:
+# it reads sync 90 on the first dispatch and on every one after.
+#
+# The steady-state figures are the ones doc 27's ladder records and the ones
+# the gate pins, so the layer must be dispatched at least twice. The
+# reconfiguration counts are unaffected either way, which is what a per-layer
+# array configuration should look like.
+check-offload-shared:
+	mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
+	    AIR_OFFLOAD_SHARED_XCLBIN=1 \
+	    python3 $(srcdir)/study/run_mode.py --mode offload --seq 1024 \
+	        --warmup 1 --samples 1 --study-id offload-shared-gate \
+	        --out offload_shared_gate.csv
 
 # The mode's negative control. Same reasoning as check-coarse-fault, including
 # the mode-specific stake: the dispatch vectors must be recorded on the

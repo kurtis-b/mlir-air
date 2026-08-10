@@ -123,7 +123,29 @@ _INCOMPARABLE: dict[str, str] = {
     "vector because doc 03 established a scalar cannot separate the taxonomy.",
     "npu_unique_instruction_binary_count": "packaging detail, not a taxonomy "
     "point; no counterpart here.",
-    "npu_unique_xclbin_count": "same.",
+    # `[2026-08-09]` This entry used to read "same", deferring to the line above
+    # it, and its REASON was wrong even though its verdict was right. It was
+    # written under the SUPERSEDED taxonomy, where the modes were distinguished
+    # by who sequences the work and packaging really was incidental. Under the
+    # corrected axis -- reconfiguration cost against DRAM traffic (doc 03) --
+    # this is the opposite of incidental: it is `offload`'s OWN axis, the mode
+    # is defined as the one that minimizes it, and its two packaging paths
+    # differ in this column and in no other. This port now populates it.
+    #
+    # That makes crossing it MORE dangerous, not less, which is why the verdict
+    # does not change. This port's value is defined per measured layer as the
+    # count of distinct binaries; what iron's is counted over is not established
+    # anywhere in this tree, and every other entry here that claims something
+    # about iron's internals cites the source for it. Carrying a definitional
+    # field across on an unverified assumption would silently corrupt the very
+    # axis it names -- exactly the failure the contract at the top of this
+    # module exists to prevent. Establish iron's unit first, with a source; then
+    # this can move to _SAFE and not before.
+    "npu_unique_xclbin_count": "under the corrected taxonomy this is NOT a "
+    "packaging detail -- it is `offload`'s defining axis, and this port records "
+    "it per measured layer as the count of distinct binaries. What iron counts "
+    "it over is not established in this tree, and a definitional field carried "
+    "across on an assumption would corrupt the axis it names.",
     "run_status": "iron's gate is FINAL_REL_TOL 0.1 / FINAL_ABS_TOL 0.5 with a "
     "5% mismatch budget, degrading to a finite-output check above seq_len 512. "
     "This port permits ZERO mismatches at the registry tolerance, so `passed` "

@@ -216,6 +216,8 @@ def run(
         row["min_latency_ms"] = min(per_inference) * 1000.0
         row["max_latency_ms"] = max(per_inference) * 1000.0
 
+        _apply_mode_counters(row, extra)
+
         totals = _dispatch_totals(extra)
         if totals:
             subs = totals["host_submissions"] or 1
@@ -244,6 +246,35 @@ def run(
         row["failure_message"] = f"{type(e).__name__}: {e}".splitlines()[0][:300]
         traceback.print_exc()
     return row
+
+
+#: mode-reported key -> schema column. Both columns have been in schema v1 since
+#: it was written, inherited from iron and populated by nothing in this port.
+_MODE_COUNTERS = (
+    ("unique_xclbins", "npu_unique_xclbin_count"),
+    ("n_dispatches", "npu_dispatch_count"),
+)
+
+
+def _apply_mode_counters(row: dict, extra: dict) -> None:
+    """Copy the packaging counters a mode reports into their schema columns.
+
+    `[2026-08-09]` Under the CORRECTED taxonomy ``npu_unique_xclbin_count`` is
+    not a packaging detail: `offload` is DEFINED as the mode that minimizes
+    reconfiguration, and this column is what tells one of its rows taken over a
+    shared xclbin (1) from one taken over the ELF path (0 -- that path loads no
+    xclbin at all). Without it the two are byte-identical and a walk comparing
+    them compares two files nothing distinguishes.
+
+    Only copied where the mode reports them, so a mode that keeps no such
+    counter is left ``None`` rather than filled with a derived guess. A
+    reported **zero** must survive, which is why this tests against ``None``
+    and not truthiness -- zero is the ELF path's honest value and the whole
+    point of the column here.
+    """
+    for key, column in _MODE_COUNTERS:
+        if extra.get(key) is not None:
+            row[column] = extra[key]
 
 
 def _dispatch_totals(extra: dict) -> dict | None:

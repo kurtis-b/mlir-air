@@ -31,9 +31,28 @@ WHAT THIS MODE ISOLATES, AND WHY IT IS NOT "THE HOST-MEDIATED EXTREME"
     implements. Its host/device split is decided by LINEARITY, not by which
     GEMMs happen to resolve in the registry. See 03 §The taxonomy.
 
-    The N-streams-under-one-xclbin half is not built here yet; this module is
-    the linearity half. Until both land the mode is at parity with iron's
-    partition but still pays a reconfiguration per dispatch.
+    `[2026-08-09]` BOTH HALVES ARE BUILT. This module was the linearity half
+    only; the N-streams-under-one-xclbin half landed in ``93e15a64`` and is
+    reached through ``SHARED_XCLBIN`` below — five shapes chained into one
+    xclbin, ``context_loads 1`` against the ELF path's 30, with the dispatch
+    vector identical between them because the mode makes one ``run_sequence``
+    call per GEMM either way. Both paths are gated by
+    ``run_npu2_offload_peano.lit``, which pins the reconfiguration counters on
+    each.
+
+    Two limits travel with it, and neither is a to-do hidden in a docstring:
+
+    - **The ELF path is still the DEFAULT**, so an unconfigured run pays a
+      reconfiguration per dispatch and the sentence above describes it. The
+      shared path is opt-in because it trades ~20% of best-case latency at 512
+      for a ~20x reduction in run-to-run spread, and because flipping the
+      default re-dates every recorded ``offload`` number (doc 29 §What this
+      does not do).
+    - **The shared path builds only where every module is SINGLE-LAUNCH.** At
+      4096 the down-projection is a two-launch ``fused-cast`` and the backend's
+      fixed ``air.insts.bin`` name collides with itself, so the chain builds at
+      1024 and not at this mode's own 4096 gate. Doc 29 §The 4096 wall has the
+      cause; the first blocker is located but the whole fix is not yet scoped.
 
 THE TWO ATTENTION MATMULS ARE LINEAR, SO THEY ARE ON THE DEVICE
     `[2026-08-08]` They resolve in no registry — ``sweep_families.py`` derives
@@ -889,6 +908,35 @@ def prepare_offload(shape, seed=42):
         return [boundaries["output"]], {
             "context_loads": loads,
             "kernel_attaches": attaches,
+            # The two schema v1 columns that separate this mode's two packaging
+            # paths in a results row. Without them a shared-path CSV is
+            # byte-identical to an ELF-path one, and a walk comparing the two
+            # would be comparing two files nothing distinguishes.
+            #
+            # COUNTED off the artifacts this run actually loaded, not inferred
+            # from `shared_xclbin`, and counted as what the column literally
+            # says -- xclbins. The ELF path loads `.elf` artifacts through
+            # `xrt.elf()` and loads NO xclbin at all, so its honest value here
+            # is **zero**, not five: five is the number of distinct BINARIES,
+            # which is a different quantity and not what this column means.
+            # 0 against 1 still separates the two paths, and both values are
+            # true.
+            #
+            # This column is NOT the reconfiguration count. That is 30 against
+            # 1, it is the mode's actual axis, and schema v1 has nowhere to put
+            # it -- adding one is a version bump. `reconfiguration_counts()`
+            # and the gated `reconfiguration:` line carry it meanwhile.
+            "unique_xclbins": sum(
+                1
+                for binary in {
+                    cache.artifacts[name].output_binary
+                    for name in cfg["artifacts"].values()
+                    if name in cache.artifacts
+                }
+                if str(binary).endswith(".xclbin")
+            ),
+            # Per LAYER, which is the unit every other count in this row uses.
+            "n_dispatches": cfg["n_dispatches"],
             "stages": stages,
             "stages_passed": clean == len(stages),
             "dispatch_vectors": vector_rows,

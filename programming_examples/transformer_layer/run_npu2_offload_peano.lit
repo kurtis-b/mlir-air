@@ -101,6 +101,16 @@
 // head, and pricing exactly that is what the mode is for.
 // CHECK: [offload] dispatch totals: submissions 30 entries 30 air 31 herd 91 sync 91 bytes 970457088
 //
+// THE MODE'S OWN AXIS ON THIS PATH, and it was unpinned until `[2026-08-09]`.
+// The six fields above cannot carry it: they are identical whether the array is
+// configured once or thirty times, because the mode makes one run_sequence call
+// per GEMM either way. This is the ELF path, so thirty is CORRECT here -- each
+// dispatch evicts and reloads its hw_context (see _evict_context). Pinning it
+// is what makes the two paths distinguishable in the suite rather than only in
+// prose: without this line a build that silently switched packaging would pass
+// green on both recipes.
+// CHECK: [offload] reconfiguration: context_loads 30 kernel_attaches 0 over 30 dispatches
+//
 // Then the layer output itself over all 4096 x 768 elements, and the label
 // naming the MODE's operator.
 // CHECK: PASS!
@@ -144,3 +154,98 @@
 // FAULT: [opcheck] offload [4096x768_encoder_bert]: FAIL
 // FAULT: [opcheck] offload [4096x768_encoder_bert]: fault-inject input -> FAIL (as required)
 // FAULT: NEGATIVE CONTROL: PASS
+//
+// ===========================================================================
+// THE SHARED-XCLBIN PATH -- the half of this mode's definition that was
+// PRINTED AND NOT ENFORCED until `[2026-08-09]`.
+//
+// doc 03 defines offload as "reconfiguration MINIMIZED by dynamic
+// partitioning", and doc 29 landed the mechanism: five GEMM shapes chained into
+// ONE xclbin, loaded once, each binding its own kernel and instruction stream
+// onto the standing context. Nothing in this suite ran that path. Its central
+// claim -- context_loads 1 against the ELF path's 30 -- was reported by a print
+// statement, so a regression to thirty loads would have passed every gate here
+// green while the mode quietly stopped being the mode.
+//
+// WHY THIS RECIPE IS AT 1024 WHEN THE TWO ABOVE ARE AT 4096, measured rather
+// than chosen. The chain does not build at 4096. At 4096 the down-projection
+// resolves to `fused-cast`, which is TWO air.launch ops; every other shape at
+// either length is single-launch `drain`. XRTBackend.compile defaults its
+// instruction file to the fixed name air.insts.bin and the xclbin branch passes
+// it straight through, while the ELF branch passes an elf name and no
+// instruction flag at all -- so only the ELF path lets aircc derive a name per
+// launch. A two-launch module under the xclbin ABI therefore asks aiecc to
+// write every instruction stream to one path, and aiecc refuses:
+// "edge 'air.insts.bin' produced duplicate output path". The shared path is
+// bounded to SINGLE-LAUNCH modules today. 1024 is where all five shapes are
+// single-launch, and it is the shape doc 29 demonstrated -- which nothing in
+// that document said, because it never ran the other one.
+//
+// So this recipe enforces the claim WHERE THE CLAIM HOLDS, and the 4096 wall is
+// recorded in doc 29 as its own item rather than left as an unexplained gap.
+//
+// It runs through study/run_mode.py rather than opcheck.py because the sequence
+// length is the whole point here and only run_mode takes one; opcheck reads its
+// shape from the SPECS row, and adding a second offload row to move it would
+// churn the 4096 row that is gated, provenanced and cited across three
+// documents. run_mode still compares every boundary against the same golden
+// reference at the same row's atol and still reports a status, so this is a
+// correctness check and not only a counter check. No fault recipe accompanies
+// it: the shared path changes PACKAGING, not arithmetic, and the negative
+// control above already covers the arithmetic.
+//
+// RUN: make -f %S/Makefile check-offload-shared PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s --check-prefix=SHARED
+//
+// The mode's own statement of what it built, first -- so a run that fell back
+// to per-artifact xclbins fails here, before any counter is read.
+// SHARED: reconfiguration: ONE xclbin over 5 shapes, 30 dispatches share 1 hw_context
+//
+// Every boundary clean at this length too. The shared path must be numerically
+// indistinguishable from the ELF one: it changes how the array is configured,
+// not what it computes, so any drift here means the chain bound a kernel to the
+// wrong instruction stream -- the failure mode doc 29 records as silent, where
+// a colliding kernel id returned garbage at mean_rel_L1 1.41 with no error.
+// SHARED: [stage] q {{.*}} mismatch       0
+// SHARED: [stage] attn_context {{.*}} mismatch       0
+// SHARED: [stage] output {{.*}} mismatch       0
+// SHARED: [offload] stages: 10/10 clean
+//
+// The dispatch vector at this length, pinned to literals. The mode makes one
+// run_sequence call per GEMM whichever way it is packaged, and that equality is
+// MEASURED rather than assumed: the ELF path run at this same length reports
+// submissions 30 entries 30 air 30 herd 90 sync 90 bytes 99090432, field for
+// field the line below, and doc 27's ladder records the same 99090432. What
+// this line ENFORCES is that the shared path's own structure does not drift,
+// which is the regression that would otherwise be invisible.
+//
+// A COLD DISPATCH DOES NOT PRODUCE THESE NUMBERS, and the target dispatches
+// twice for that reason. Under the xclbin ABI the first call uploads each
+// artifact's INSTRUCTION stream once -- five artifacts, five extra sync
+// boundaries, exactly 51,088 bytes, which is the total size of the five cached
+// insts files. The ELF ABI skips that entirely, because an ELF embeds its
+// instructions, and its first dispatch already reads the steady state.
+//
+// BOTH lines are pinned, cold first and steady second, so each check is
+// anchored to a known invocation. Pinning only the steady one would leave the
+// checks free to match whichever dispatch happened to agree, and a second
+// dispatch that regressed could be skipped over.
+// SHARED: [offload] dispatch totals: submissions 30 entries 30 air 30 herd 90 sync 95 bytes 99141520
+// SHARED: [offload] dispatch totals: submissions 30 entries 30 air 30 herd 90 sync 90 bytes 99090432
+//
+// AND THE CLAIM ITSELF. One context load for thirty dispatches, with four
+// kernels attached onto the standing configuration -- against thirty loads and
+// zero attaches on the ELF path pinned in the clean half above. This single
+// line is what this recipe exists for.
+//
+// The counter is CUMULATIVE over the cache's life, and the two paths therefore
+// diverge with every layer rather than by a constant. Measured over this
+// target's two dispatches of the layer: the ELF path reads context_loads 30
+// after the first and 60 after the second, while the shared path reads 1 after
+// both. So the check below is also insensitive to how many times the target
+// dispatches, where the clean half's `context_loads 30` is a single-dispatch
+// figure and would read 60 if opcheck ever dispatched twice.
+// SHARED: [offload] reconfiguration: context_loads 1 kernel_attaches 4 over 30 dispatches
+//
+// The run's own verdict last, so none of the above can pass on a run that
+// failed its comparison.
+// SHARED: [run-mode] offload @ 1024x768_encoder_bert: passed

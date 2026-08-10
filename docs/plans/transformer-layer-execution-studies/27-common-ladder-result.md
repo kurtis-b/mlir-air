@@ -127,6 +127,29 @@ modes, the eviction was the cause. That is a rung of the N-streams work rather
 than a separate experiment, and it should be taken before anyone attributes
 `offload`'s noise to the mode's partition.
 
+> **`[2026-08-09]` TAKEN. The variance collapses — but the hypothesis is
+> SUPPORTED, not confirmed.** Four walks, `{ELF, shared} × {w1, w2}`,
+> interleaved, with `runlist` inside each as a same-conditions control. At 512
+> the intra-walk spread goes **316.9% / 134.1% to 17.6% / 14.0%**, in both
+> walks, while the control stayed in band.
+>
+> **The intervention is not single-variable, which this paragraph asked for and
+> the measurement could not deliver.** Switching to the shared xclbin stops the
+> per-dispatch reconfiguration *and* changes the ABI from ELF to xclbin. The
+> control rules out environmental drift, not the ABI. Eviction is still the
+> leading candidate; isolating it needs a third arm — the xclbin ABI with
+> eviction forced back on — and that knob does not exist yet.
+> [29](29-offload-n-streams.md) has the table and the experiment.
+>
+> Two qualifications this document's own numbers need. **The 1024 rung did not
+> reproduce**: the 61.6% / 59.8% in the table above read 9.0% / 10.5% on the
+> same ELF path today, so the baseline is unstable day to day and the effect
+> *size* should not be quoted from one measurement. And the shared path costs
+> **~20% on best-case latency at 512** (97.5–99.5 ms against 78.9–82.0), so it
+> is a trade rather than a free win. The minimums here *do* reproduce this
+> document's — 82.0 / 78.9 against its 78.2 / 79.9 — which is what says the two
+> measurements are of the same thing. Full table: [29](29-offload-n-streams.md).
+
 ## What this does and does not settle
 
 **Settles trap 1.** There is now a cross-mode comparison at one set of lengths.

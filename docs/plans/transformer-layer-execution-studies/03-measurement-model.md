@@ -82,7 +82,7 @@ The superseded version is not kept: it was a to-do list, and a stale to-do list 
 | Mode | Implemented today | Left |
 |---|---|---|
 | `runlist` | **every operator individually on the device, nothing on the host.** 427 entries over 17 runlists; per head `attn_scores` → `softmax` → `attn_output`, device-resident inside one submission. Gated 2026-08-09 | nothing for the definition |
-| `offload` | **every LINEAR operator on the NPU, every NON-LINEAR one on the host** — six projections plus both attention matmuls, with softmax / both LayerNorms / GeLU on the host. 30 dispatches. Gated 2026-08-08. **`[2026-08-09]` The reconfiguration half landed too** ([29](29-offload-n-streams.md)): five shapes in ONE xclbin, `context_loads 1` against the ELF path's 30, dispatch vector unchanged. So the mode now implements both halves of its definition | **make the shared path the default and gate it.** It is opt-in (`AIR_OFFLOAD_SHARED_XCLBIN=1`) and **not exercised by any lit recipe**, so its central claim is printed rather than enforced. Beyond that only the deferred increment remains: *one* stream with runtime-parameterized loop bounds, still blocked in the stack (§A of [26](26-mode-rebuild-feasibility.md)) |
+| `offload` | **every LINEAR operator on the NPU, every NON-LINEAR one on the host** — six projections plus both attention matmuls, with softmax / both LayerNorms / GeLU on the host. 30 dispatches. Gated 2026-08-08. **`[2026-08-09]` The reconfiguration half landed too** ([29](29-offload-n-streams.md)): five shapes in ONE xclbin, `context_loads 1` against the ELF path's 30, dispatch vector unchanged. So the mode now implements both halves of its definition | **`[2026-08-09]` GATED** — `run_npu2_offload_peano.lit` has a third recipe pinning `context_loads 1 kernel_attaches 4` on the shared path and `context_loads 30 kernel_attaches 0` on the ELF one, verified in the failing direction. Two things remain. **The shared path is bounded to single-launch modules**, so it builds at 1024 and *not* at the mode's own gated 4096, where the down-projection is a two-launch `fused-cast` and the fixed `air.insts.bin` name collides with itself ([29](29-offload-n-streams.md)); a fix is a change to `python/air/backend/xrt.py` and its own phase. **The default is still the ELF path** — switching packaging removes this mode's variance (316.9% → 17.6% at 512), though the switch changes the ABI as well as the reconfiguration and so does not isolate `_evict_context`; and the shared path costs ~20% on best-case latency there, and flipping would invalidate every recorded `offload` number including [27](27-common-ladder-result.md)'s table. Beyond that only the deferred increment: *one* stream with runtime-parameterized loop bounds, still blocked in the stack (§A of [26](26-mode-rebuild-feasibility.md)) |
 | `fused` | **three ELFs at seq 1024**, every operator boundary inside the tail still round-tripping through DRAM. Gated 2026-08-08 | one xclbin, blocked twice over — see below — and "no DRAM between operators", which is capacity-bounded rather than engineering-bounded: 6 MiB on chip against one 6 MiB S×F intermediate at 1024 |
 | `coarse` | the D2 block: five coarse fused kernels, four submissions | everything. It is defined as a per-workload *blend*, which is a choice per operator between an individual dispatch and a fused region, and nothing in the port expresses such a choice yet |
 
@@ -212,6 +212,21 @@ entries; `fused_elf` has few submissions with many AIR launches and near-zero in
 Each field must have a written definition in the schema module, tied to the Phase B dispatch
 model, and a single implementation that all four modes call. A per-mode reimplementation of
 "what counts as a submission" would make the comparison meaningless.
+
+> **`[2026-08-09]` Under the xclbin ABI a vector read from a COLD dispatch is inflated, and two
+> of its fields move.** The first call uploads each artifact's **instruction stream** once
+> (`sync_instruction_bos`), so `offload` at 1024 reads `sync 95 bytes 99141520` on the first
+> dispatch and `sync 90 bytes 99090432` on every one after — five artifacts, five extra sync
+> boundaries, and exactly **51,088 bytes**, which is the total size of the five cached
+> `.insts.bin` files. **The ELF ABI does not do this at all**: an ELF embeds its instructions, the
+> caller skips the upload, and the ELF path reads `sync 90` on its first dispatch and on every
+> one after — measured on both paths at the same length.
+>
+> **The steady-state figures are what every recorded number in this study means**, because the
+> ladder always runs with warmup; anything quoting a vector from a single cold dispatch under the
+> xclbin ABI is quoting a different number. Found by a gate that dispatched once and disagreed
+> with [27](27-common-ladder-result.md)'s ladder by exactly this delta. Reconfiguration counts
+> are unaffected.
 
 ## CSV schema
 

@@ -468,6 +468,14 @@ ELFs.
 
 ## The `offload` execution strategy (Phase E3)
 
+> **`[2026-08-09]` Read the two dated blocks below before this paragraph.** It
+> opens on the **superseded** taxonomy — `offload` is not "the host-mediated
+> extreme", it is the mode that **minimizes reconfiguration** — and on a
+> six-dispatch shape that two corrections have moved to **30**. The paragraph is
+> kept because the *non-aggregation* argument in it is still exactly right and
+> is still the mode's clause in the distinguishability gate. Current state:
+> `pattern/offload/README.md`.
+
 `pattern/offload/` is the host-mediated extreme of the taxonomy: the host owns
 the layer, holds every intermediate, and dispatches **six** registry GEMMs one
 at a time — `q_proj k_proj v_proj output_proj up_proj down_proj` — each as a
@@ -490,6 +498,26 @@ measured passing on real NPU2, and their tiles are injected through the
 attention is on the device and only the softmax between the two matmuls is
 host torch, with both LayerNorms and the GeLU. The artifact records
 `attention_path: "device_gemm_host_softmax"`.
+
+**`[2026-08-09]` It has TWO packaging paths, and the difference between them is
+the mode's defining axis.** The same 30 dispatches run either over five
+xclbins with the `hw_context` torn down and reloaded before each one — 30
+reconfigurations, the ELF path, still the **default** — or over **one** xclbin
+holding all five shapes, loaded once with four kernel attaches. Set
+`AIR_OFFLOAD_SHARED_XCLBIN=1` for the second; `make check-offload-shared` gates
+it. The dispatch vector is identical either way, by design, because the mode
+makes one `run_sequence` call per GEMM regardless — so reconfiguration is
+counted separately, by `KernelCache.reconfiguration_counts()`, and both recipes
+in `run_npu2_offload_peano.lit` pin it.
+
+Two facts worth carrying: the shared chain **only builds where every module is
+single-launch**, which rules out 4096, where the down-projection is a two-launch
+`fused-cast`; and this mode's status as the noisiest of the four is
+**measured to be removable** — 316.9% intra-walk spread on the ELF path against
+17.6% on the shared one at 512 — though the switch changes the ABI as well as
+the reconfiguration, so `_evict_context` is the leading candidate rather than a
+demonstrated cause. Both are written up in
+`docs/plans/transformer-layer-execution-studies/29-offload-n-streams.md`.
 
 This mode used to dispatch six GEMMs and call itself a *hybrid* boundary,
 keeping attention in host torch through `pattern/blocked_attention.py` — that
@@ -644,6 +672,30 @@ to f32 two-pass statistics; was 1.806e-2 at 7.572e-2, a 1.32x margin. The
 mean improved and the margin tightened — they are different statistics.)
 
 ## The four-mode dispatch-vector table (Phase E's headline result)
+
+> **`[2026-08-09]` EVERY ROW BELOW IS SUPERSEDED. Do not cite this table.** It
+> records the four implementations as they stood before the taxonomy was
+> corrected and the modes rebuilt against it. Two rows have since been
+> re-measured at this same configuration:
+>
+> | mode | subs | entries | air | herd | sync | bytes |
+> |---|---|---|---|---|---|---|
+> | `offload` | 30 | 30 | 31 | 91 | 91 | 970,457,088 |
+> | `runlist` | 17 | 427 | 50 | 488 | 451 | 190,513,152 |
+>
+> — and the other two cannot be restated here at all, because **`fused` no
+> longer builds at 4096**: its stitched tail caps at 1365 rows, so it is bounded
+> to 256..1024. A four-mode table at this configuration is therefore not
+> something that can exist any more.
+>
+> **The current cross-mode comparison is at 512 and 1024**, walked twice, in
+> `docs/plans/transformer-layer-execution-studies/27-common-ladder-result.md`.
+> Build cross-mode tables from a ladder run, never from per-mode catalogue rows
+> — those still sit at two different sequence lengths.
+>
+> The distinguishability *reasoning* below is kept because it is still how the
+> gate works: the criterion is ordinal over driver-summed totals, never an
+> absolute threshold.
 
 Driver-summed totals over each mode's recorded `DispatchVector` rows, at the
 forced configuration (seq 4096, emb 768, ffn 3072, 12 heads × 64), clean and

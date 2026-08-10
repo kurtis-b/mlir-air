@@ -1,20 +1,62 @@
-# `offload` — the host owns the layer, one GEMM per dispatch
+# `offload` — every linear operator on the device, reconfiguration minimized
 
-The host-mediated extreme of the Phase E execution-strategy taxonomy. The host
-holds every intermediate in RAM and sends one GEMM at a time to the device:
-six one-step `KernelCache.run_sequence` calls —
+> **`[2026-08-09]` The title and this opening were rewritten.** They described
+> "the host-mediated extreme … six one-step `run_sequence` calls … the mode
+> aggregates nothing", which is the **superseded** taxonomy plus a dispatch
+> count that two corrections have since moved. Sections below carry their own
+> dates; where one still argues from the old framing it says so.
 
-```
-q_proj  k_proj  v_proj  output_proj  up_proj  down_proj
-```
+The mode that **MINIMIZES reconfiguration**, which is one axis of the corrected
+taxonomy (`docs/plans/transformer-layer-execution-studies/03-measurement-model.md`
+§The taxonomy). Its host/device split is decided by **linearity**:
 
-— each recording one `DispatchVector` row with one host submission holding one
-runlist entry. Summed by the driver that is six submissions and six entries:
-the mode aggregates **nothing**, which is its clause in the distinguishability
-gate. Everything between the GEMMs — attention, softmax, both normalization
-points, the GeLU, reshapes, residuals — is host torch. The mode exists to be
-the expensive end of the comparison: the most submissions, the most sync
-boundaries, no aggregation at all.
+- **every LINEAR operator on the NPU** — the six projections *and* both
+  attention matmuls, dispatched per head;
+- **every NON-LINEAR operator on the host** — the softmax between the two
+  attention matmuls, both LayerNorms, the GeLU.
+
+At the gate configuration that is **30 dispatches**: 6 projections + 2 attention
+matmuls × 12 heads. Each is one one-step `KernelCache.run_sequence` call
+recording one `DispatchVector` row, so the summed vector is 30 submissions over
+30 entries — the mode still aggregates **nothing**, and that part of the old
+framing survives the correction.
+
+## Two packaging paths, and the difference between them IS the mode
+
+`[2026-08-09]` The same 30 dispatches are served two ways. They compute the same
+thing and produce an identical dispatch vector; what differs is how often the
+array is configured, which is the axis the mode is defined by.
+
+| | ELF path (**default**) | shared xclbin (`AIR_OFFLOAD_SHARED_XCLBIN=1`) |
+|---|---|---|
+| binaries | 5 xclbins | **1**, five shapes chained |
+| `context_loads` per layer | **30** — `_evict_context` tears down and reloads before every dispatch | **1**, plus 4 kernel attaches |
+| dispatch vector | identical | identical |
+| builds at | 512 · 1024 · 4096 | **512 · 1024 only** |
+
+Both are gated: `run_npu2_offload_peano.lit` pins the reconfiguration counters
+on each, and the shared recipe was verified failing against an ELF-packaged run
+of the same mode at the same length. `make check-offload-shared` runs it.
+
+**Three things to know before touching either.**
+
+- **The shared path needs THREE distinct identifiers per stream** —
+  `kernel_name`, `instance_name` and `kernel_id` — and only the first fails
+  loudly. A duplicate `instance_name` returns the wrong program via the loader's
+  substring match; a duplicate `kernel_id` runs the second kernel against the
+  first's array configuration and returns garbage at `mean_rel_L1` 1.41 **with
+  no error raised**. `compile_shared_xclbin` validates all three up front.
+- **It builds only where every module is SINGLE-LAUNCH.** At 4096 the
+  down-projection is a two-launch `fused-cast`, and `XRTBackend.compile`'s fixed
+  `insts="air.insts.bin"` — passed as `-i` on the xclbin branch, omitted
+  entirely on the ELF branch — makes aiecc refuse with *"edge 'air.insts.bin'
+  produced duplicate output path"*. That is why the shared gate is at 1024 and
+  why the default has not moved.
+- **The two paths get SEPARATE cache directories** (`offload_cache` /
+  `offload_shared_cache`), chosen by `OFFLOAD_CACHE_DIR` from the same env var.
+  They emit artifacts with identical names over different ABIs, so one directory
+  could hand a 30-reconfiguration run's artifact to the one-reconfiguration
+  claim.
 
 ## This is a hybrid boundary, and the artifact says so
 
@@ -71,7 +113,16 @@ they explain the shape of the mode's history:
 - The plan documents that said eight are corrected; the artifact contract
   never counted to eight.
 
-## Blocked attention, shared with `runlist`
+## Blocked attention — `[2026-08-09]` NO LONGER THIS MODE'S PATH
+
+> **This section describes what `offload` used to do.** Since attention moved to
+> the device (2026-08-08) this mode imports exactly one name from
+> `pattern/blocked_attention.py` — `round_bf16` — and computes attention as
+> per-head device matmuls with `_host_softmax_bf16` between them
+> (`ATTENTION_PATH = "device_gemm_host_softmax"`). The blocking machinery below
+> now serves **`runlist`**, which is why the module still lives in `pattern/`.
+> Kept because the scratch-cap reasoning is what sized the host side of this
+> mode and still explains `runlist`'s.
 
 `pattern/blocked_attention.py` ports iron's `_blocked_attention` /
 `_resolve_query_block_size` pair, which `offload` and `runlist` share in iron
@@ -125,6 +176,14 @@ single runlist, measure before assuming either behaviour.**
 
 ## What the numbers look like, and why
 
+> **`[2026-08-09]` The accuracy figures in the next paragraph are the OLD
+> host-attention form's** — `1.396e-2` / `5.489e-2` / 1.82x. With attention on
+> the device the mode measures `atol_required` **5.788e-02** against the same
+> 1e-1 ceiling, a **1.73x** margin (§This is a hybrid boundary, above, has the
+> current numbers). The reasoning below — that host FP32 attention lands closer
+> to the oracle — explains why the margin was *wider* before and is kept for
+> that; it no longer describes what the mode does.
+
 The measured stage table at the gate configuration (clean run): every
 boundary at `n_mismatch 0`, end-to-end `mean_rel_L1 1.396e-2` with
 `atol_required 5.489e-2` against the 1e-1 ceiling — a 1.82x margin, against
@@ -134,19 +193,28 @@ predicted: `attn_context` needs only 3.5e-5 of absolute tolerance here where
 the fused device attention needs 2.3e-4, and `hidden` 1.3e-3 where the
 device addnorm needs 1.2e-2.
 
-Six recorded `DispatchVector` rows, one per GEMM, in dispatch order:
+**`[2026-08-09]` 30** recorded `DispatchVector` rows, in dispatch order — six
+projections and two attention matmuls on each of twelve heads:
 
 - Every row: 1 submission, 1 runlist entry. Batching them into one runlist
-  would record one submission over six entries — that is `coarse`, not this
+  would record one submission over many entries — that is `coarse`, not this
   mode, and `run_sequence` under the ELF ABI merges everything it is given
-  into one submission, which is why the six dispatches are six SEPARATE
-  calls.
-- q/k/v/output_proj ride one shared `4096x768x768` drain ELF (1 `air.launch`
-  each); up_proj is its own `4096x768x3072` drain ELF; down_proj is a
-  `4096x3072x768` fused-cast ELF (2 launches: GEMM into an f32 scratch, then
-  the cast). Sharing a *binary* is not aggregation — each dispatch is its own
-  submission — and three ELF compiles instead of six is real minutes on every
-  gate.
+  into one submission, which is why the dispatches are SEPARATE calls.
+- **Five compiled shapes, not five binaries per se.** q/k/v/output_proj ride one
+  `4096x768x768` drain artifact (1 `air.launch` each); up_proj is
+  `4096x768x3072` drain; down_proj is `4096x3072x768` **fused-cast (2
+  launches**: GEMM into an f32 scratch, then the cast — this is the shape that
+  blocks the shared chain at 4096); `attn_scores` is `4096x64x4096` and
+  `attn_output` `4096x4096x64`, both drain, both on injected tiles. Sharing an
+  artifact is not aggregation — each dispatch is its own submission — and five
+  compiles instead of thirty is real minutes on every gate.
+- **Under the xclbin ABI a cold dispatch does not produce the steady-state
+  vector.** The first call uploads each artifact's instruction stream once
+  (`sync_instruction_bos`); at 1024 that is `sync 95 bytes 99141520` against a
+  steady `sync 90 bytes 99090432` — five artifacts, five sync boundaries, and
+  exactly 51,088 bytes, the total size of the five cached `.insts.bin` files.
+  The ELF path skips it (an ELF embeds its instructions) and reads `sync 90`
+  from its first dispatch. Every recorded number in the study is steady-state.
 - Each drain dispatch syncs 3 buffers (A and B up, C back); the fused-cast
   dispatch syncs 4 (A, B and the zero-filled f32 scratch up, C back). x is
   re-uploaded for each of q/k/v and every weight is uploaded per dispatch:
@@ -159,16 +227,29 @@ the driver requires that equality as proof the vectors were measured.
 
 ## What it costs
 
-A third full-layer run in the lit suite (`run_npu2_offload_peano.lit` beside
-`block` and `coarse`), compiling three ELFs into its own `offload_cache/` —
-the cache directory is chosen by NAME, so modes must never share one (two
-modes pointed at one directory can trade ELFs whose fingerprints happen to
+A full-layer run in the lit suite (`run_npu2_offload_peano.lit` beside
+`block` and `coarse`), compiling **five shapes** into its own `offload_cache/`
+— the cache directory is chosen by NAME, so modes must never share one (two
+modes pointed at one directory can trade artifacts whose fingerprints happen to
 agree, attributing numerically valid output to the wrong execution boundary).
 `offload_cache/` is gitignored and in `make clean`, in the same commit that
 created it, because the driver's negative control runs `opcheck.py` from the
 source directory and the cache lands there — the leak D2's `block_cache/`
-had. This mode is also intrinsically noisy in LATENCY (~10x the run-to-run
-drift of the others; an XRT version change alone has moved it 19–39% at
-`seq_len >= 4096`) — that is a property of host-mediated dispatch the
-study's comparator tolerances already budget for, and it does not affect this
-gate, which is numerical rather than temporal.
+had. `[2026-08-09]` The shared path adds a third recipe at 1024 and its own
+`offload_shared_cache/`, both likewise gitignored and cleaned.
+
+**This mode is the noisiest of the four, and `[2026-08-09]` the drift is now
+known to be REMOVABLE rather than intrinsic.** Four interleaved walks with
+`runlist` as a same-conditions control put the intra-walk spread at **316.9% /
+134.1%** on the ELF path against **17.6% / 14.0%** on the shared xclbin, at seq
+512, in both walks. So it is **not** "a property of host-mediated dispatch" as
+this section used to say — switching packaging removes it.
+
+**Which half of the switch does it is not established.** The env var changes the
+reconfiguration *and* the ABI at once, and the control rules out environmental
+drift rather than the ABI, so `_evict_context` is the leading candidate and not
+a demonstrated cause. Two further caveats: the effect size is unstable day to
+day (the 1024 rung did not reproduce its own recorded baseline), and the shared
+path costs ~20% of best-case latency at 512. None of it affects this gate, which
+is numerical rather than temporal. Full table:
+`docs/plans/transformer-layer-execution-studies/29-offload-n-streams.md`.
