@@ -133,6 +133,90 @@ def test_dispatch_vector_is_all_six_fields():
         assert name in schema.RESULTS_FIELDNAMES
 
 
+# Every v1 results column, in v1 order. Frozen HERE, independently of schema.py,
+# so an edit over there that renames, drops or reorders a v1 column fails this
+# file rather than silently reshaping every existing results tree. The v2
+# additions are appended strictly AFTER this prefix (the section comment in
+# schema.py and the test below).
+_V1_RESULTS_FIELDNAMES = (
+    "schema_version", "study_id", "study_case_id", "study_case_label",
+    "workload_variant", "backend", "execution_mode", "attention_path",
+    "seq_len", "hidden_size", "intermediate_size", "num_attention_heads",
+    "attention_head_size", "batch_size", "dtype", "use_bias", "weights_source",
+    "warmup_runs", "runs_per_sample", "measured_inference_count",
+    "latency_sample_count", "timed_total_sec", "avg_latency_ms",
+    "min_latency_ms", "max_latency_ms", "compile_setup_time_ms",
+    "host_qkv_precompute_ms", "effective_gflops_per_sec",
+    "host_submissions_per_layer", "runlist_entries_per_submission",
+    "air_launches_per_elf", "herd_launches", "sync_boundaries",
+    "bytes_transferred", "power_backend", "avg_power_w", "min_power_w",
+    "max_power_w", "power_sample_count", "power_std_w", "raw_avg_power_w",
+    "raw_min_power_w", "raw_max_power_w", "raw_power_sample_count",
+    "raw_power_std_w", "power_outlier_sample_count",
+    "power_outlier_filter_applied", "effective_gflops_per_sec_per_watt",
+    "quant_packing_scheme", "quant_group_size", "quant_scale_layout",
+    "quant_zero_point_layout", "quant_accum_type", "quant_gemm_contract",
+    "quant_gemv_contract", "validation_error_count", "run_status",
+    "failure_message", "process_model", "npu_dispatch_count",
+    "npu_unique_instruction_binary_count", "npu_unique_xclbin_count",
+    "selected_config_json", "selected_candidate_ids_json", "is_best",
+)
+
+
+def test_v2_keeps_every_v1_column_first_and_unchanged():
+    """The bump is ADDITIVE: v1 names, meanings-by-name and POSITIONS survive.
+
+    Position matters because the CSV header is the field order, and anything
+    that read a v1 file by column index must read a v2 file the same way. So
+    the v1 columns are pinned as an exact ordered PREFIX, not as a subset.
+    """
+    prefix = schema.RESULTS_FIELDNAMES[: len(_V1_RESULTS_FIELDNAMES)]
+    assert prefix == _V1_RESULTS_FIELDNAMES, (
+        "a v1 results column was renamed, dropped or reordered; the v2 bump "
+        "is additive-only and new columns go AFTER every v1 one"
+    )
+
+
+def test_v2_appends_the_decomposition_then_the_reconfiguration_columns():
+    """The five v2 columns, in order, after every v1 column and nowhere else."""
+    assert schema.SCHEMA_VERSION == 2
+    assert schema.DECOMPOSITION_FIELDNAMES == ("device_ms", "sync_ms", "host_cpu_ms")
+    assert schema.RECONFIGURATION_FIELDNAMES == ("context_loads", "kernel_attaches")
+    suffix = schema.DECOMPOSITION_FIELDNAMES + schema.RECONFIGURATION_FIELDNAMES
+    assert schema.RESULTS_FIELDNAMES[-len(suffix):] == suffix
+    for name in suffix:
+        assert name not in _V1_RESULTS_FIELDNAMES
+
+
+def test_the_decomposition_components_declare_disjoint_regions():
+    """The three ms columns are one decomposition, not three clocks.
+
+    Each must say it sits INSIDE the latency region -- the same region
+    avg_latency_ms covers -- or a reader cannot know whether the components
+    may be compared against the total they decompose.
+    """
+    by_name = {f.name: f for f in schema.fields_for("results")}
+    for name in schema.DECOMPOSITION_FIELDNAMES:
+        assert "INSIDE the latency region" in by_name[name].timing, (
+            f"{name} does not place itself inside the latency region"
+        )
+
+
+def test_the_reconfiguration_columns_state_the_steady_state_convention():
+    """context_loads/kernel_attaches record ONE steady-state dispatch.
+
+    The cumulative counter the offload gate pins is a different quantity, and
+    the meaning must say so -- that distinction is what makes offload-ELF's 30
+    and a warmed shared-path row's 0 both correct at once.
+    """
+    by_name = {f.name: f for f in schema.fields_for("results")}
+    for name in schema.RECONFIGURATION_FIELDNAMES:
+        assert "steady-state" in by_name[name].meaning
+    assert "eviction followed by a reload counts AGAIN" in (
+        by_name["context_loads"].meaning
+    )
+
+
 def test_empty_row_is_complete_and_versioned():
     row = schema.empty_row()
     assert set(row) == set(schema.RESULTS_FIELDNAMES)

@@ -118,7 +118,11 @@ from builders.block import (  # noqa: E402
     compile_block_artifacts,
 )
 from builders.elementwise_mul import broadcast_row_weight  # noqa: E402
-from opcheck_layer import BLOCK_STAGE_ATOL, print_dispatch_totals  # noqa: E402
+from opcheck_layer import (  # noqa: E402
+    BLOCK_STAGE_ATOL,
+    print_dispatch_totals,
+    reconfiguration_delta,
+)
 from opcheck_prepare import _spec_digest  # noqa: E402
 from pattern import EXECUTION_MODE_CSV  # noqa: E402
 from pattern.blocked_attention import round_bf16  # noqa: E402
@@ -619,6 +623,7 @@ def prepare_cell(cell_name, shape, seed=42, cache_dir=None, label=None, extra=No
 
     def dispatch(device_inputs, stage_stats):
         cache.profiler.cpu_times.clear()
+        reconfig_baseline = cache.reconfiguration_counts()
         boundaries, vector_rows = run_cell(cache, cfgs, device_inputs)
         stages = []
         for name in ENCODER_BOUNDARIES:
@@ -651,6 +656,12 @@ def prepare_cell(cell_name, shape, seed=42, cache_dir=None, label=None, extra=No
             "host_cpu_ms": {
                 k: sum(v) * 1000.0 for k, v in cache.profiler.cpu_times.items()
             },
+            # What THIS dispatch loaded and attached (schema v2's
+            # reconfiguration columns). A cell with the runlist front pays that
+            # front's per-head attention reloads in steady state; a cell with
+            # the block front keeps every context standing and honestly
+            # reports 0.
+            **reconfiguration_delta(cache, reconfig_baseline),
         }
 
     block, runlist = cfgs["block"], cfgs["runlist"]

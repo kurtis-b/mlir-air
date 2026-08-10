@@ -58,7 +58,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-SCHEMA_VERSION = 1
+#: v2 `[2026-08-10]`: adds the per-run millisecond decomposition
+#: (``device_ms`` / ``sync_ms`` / ``host_cpu_ms``) and the reconfiguration
+#: counters (``context_loads`` / ``kernel_attaches``). Both were measured and
+#: DISCARDED under v1 -- doc 29 records that ``prepare_offload`` returned all
+#: three ms components in its extra dict while ``run_mode`` read none of them,
+#: and that the reconfiguration count, the ``offload`` mode's own axis, had
+#: "nowhere to put it" in a results row. Every v1 column is unchanged in name,
+#: meaning and position; the five new columns are appended AFTER all of them
+#: (see the v2 section below), so a v1-shaped reader keeps working column for
+#: column and only the version check tells the two apart.
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -285,6 +295,92 @@ _OUTCOME = (
     Field("is_best", "Whether this row won its case after selection."),
 )
 
+# ---------------------------------------------------------------------------
+# v2: the per-run millisecond decomposition, and the reconfiguration counters.
+#
+# Appended AFTER every v1 column, never interleaved -- ``test_schema.py`` pins
+# the v1 prefix -- so anything that read a v1 file by column position reads a
+# v2 file the same way and the five new columns are strictly additive.
+#
+# The decomposition answers the question a bare latency cannot: how much of a
+# mode's time is the DEVICE executing, how much is DATA SYNC, and how much is
+# the mode's own HOST arithmetic. Doc 03 lists it under the synchronization
+# cost as "measured on every rung and discarded"; these columns stop the
+# discarding. The three components are disjoint by construction and do NOT sum
+# to ``avg_latency_ms`` -- the remainder is unattributed host overhead (Python
+# scheduling, layout copies, the per-boundary stage comparisons), and a reader
+# treating the gap as noise is misreading it.
+# ---------------------------------------------------------------------------
+
+_DECOMPOSITION = (
+    Field(
+        "device_ms",
+        "Mean per-inference milliseconds the device spent executing submitted "
+        "runlists: DispatchVector.submission_ms summed over the layer's "
+        "submissions for one dispatch, averaged over the same timed "
+        "iterations avg_latency_ms averages.",
+        timing="INSIDE the latency region. Covers xrt.runlist "
+        "execute()+wait() only (dispatch rule T1) -- EXCLUDES the bo.sync() "
+        "traffic around it (that is sync_ms), the mode's host compute between "
+        "submissions (host_cpu_ms), and the unattributed remainder. The three "
+        "components do NOT sum to avg_latency_ms.",
+    ),
+    Field(
+        "sync_ms",
+        "Mean per-inference milliseconds in bo.sync() data traffic: host "
+        "writes before submission, instruction-BO uploads (xclbin ABI, once "
+        "per artifact identity), and host-output readbacks after -- "
+        "DispatchVector.sync_ms, summed and averaged exactly as device_ms is.",
+        timing="INSIDE the latency region and DISJOINT from device_ms by "
+        "construction: the sync clock stops before execute() starts. With "
+        "warmup >= 1 the once-per-process instruction upload lands in warmup, "
+        "so this is the steady-state figure -- the same convention doc 03 "
+        "fixes for the dispatch vector's cold-dispatch inflation.",
+    ),
+    Field(
+        "host_cpu_ms",
+        "Mean per-inference milliseconds of the mode's OWN timed host "
+        "compute: the Profiler.time_cpu buckets (softmax, both LayerNorms, "
+        "GeLU, attention layout), summed across buckets per dispatch and "
+        "averaged as device_ms is. A recorded 0.0 is a MEASUREMENT -- the "
+        "mode instruments host compute and ran none (fused, coarse) -- and an "
+        "empty field means the mode reported no such component at all; never "
+        "write a fabricated zero for the latter.",
+        timing="INSIDE the latency region; disjoint from device_ms and "
+        "sync_ms (a time_cpu block never wraps a dispatch). NOT all host "
+        "time: untimed layout, Python overhead and the stage comparisons are "
+        "in avg_latency_ms and in none of the three components.",
+    ),
+)
+
+_RECONFIGURATION = (
+    Field(
+        "context_loads",
+        "Array configurations performed during ONE steady-state layer "
+        "dispatch. Every hw_context load counts one -- an xclbin load or an "
+        "ELF backend.load(), both counted at the single increment in "
+        "KernelCache.ensure_loaded -- and an eviction followed by a reload "
+        "counts AGAIN: that is offload-ELF's 30 (a fresh context per GEMM "
+        "dispatch, see pattern/offload's _evict_context) and the runlist "
+        "front's per-head attention reloads. Taken from the LAST timed "
+        "iteration, so with warmup >= 1 a once-per-process load -- the "
+        "shared xclbin's single configuration -- lands in warmup and this "
+        "column honestly reads 0 there. The cumulative-since-process counts "
+        "the offload lit gate pins (context_loads 30 / 1) are "
+        "KernelCache.reconfiguration_counts(), a different quantity; on a "
+        "single cold dispatch the two coincide.",
+    ),
+    Field(
+        "kernel_attaches",
+        "Kernels bound onto an ALREADY-STANDING configuration "
+        "(XRTBackend.attach_kernel) during that same dispatch -- the cheap "
+        "half of reconfiguration, an instruction-stream bind rather than an "
+        "array configuration. Non-zero only under a shared xclbin, and those "
+        "attaches happen once per process, so a warmed row reads 0: the "
+        "steady-state per-layer figure, same convention as context_loads.",
+    ),
+)
+
 RESULTS_FIELDS: tuple[Field, ...] = (
     *_IDENTITY,
     *_SHAPE,
@@ -293,6 +389,10 @@ RESULTS_FIELDS: tuple[Field, ...] = (
     *_POWER,
     *_QUANT,
     *_OUTCOME,
+    # v2 additions -- LAST, and appended in this order. See the section
+    # comment above; test_schema.py pins the v1 prefix and this suffix.
+    *_DECOMPOSITION,
+    *_RECONFIGURATION,
 )
 
 # The per-candidate tuning table: one row per candidate config per operator.
@@ -344,6 +444,10 @@ TUNING_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in TUNING_FIELDS)
 DISPATCH_VECTOR_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _DISPATCH)
 POWER_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _POWER)
 QUANT_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _QUANT)
+DECOMPOSITION_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _DECOMPOSITION)
+RECONFIGURATION_FIELDNAMES: tuple[str, ...] = tuple(
+    f.name for f in _RECONFIGURATION
+)
 
 #: The CSV values ``execution_mode`` may take -- taxonomy points as they appear
 #: in a results file. ``fused_elf`` is a VALUE here, never a column.

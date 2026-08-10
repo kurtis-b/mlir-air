@@ -7,7 +7,7 @@
 
 CONTRACT
     Given a results root and the CSVs a run was supposed to produce, return 0
-    only if EVERY one of them exists, is readable as schema v1, and carries at
+    only if EVERY one of them exists, is readable as the current schema, and carries at
     least one row with ``run_status=passed``. Anything else is a failure, and
     the report names the file and quotes the first ``failure_message`` verbatim
     -- which is usually enough to identify the cause without opening the tree.
@@ -34,7 +34,7 @@ FOOTGUNS
     - **The expected list is the contract.** This gate cannot know what a run
       was supposed to produce; passing no ``--expect`` checks nothing and says
       so rather than returning a cheerful 0.
-    - A CSV whose header is not schema v1 fails here rather than being skipped.
+    - A CSV whose header is not the current schema fails here rather than being skipped.
       Silently ignoring an unreadable results file is how a gate ends up
       measuring nothing.
 """
@@ -79,7 +79,7 @@ def check_results_root(root: str | Path, expected: list[str]) -> list[str]:
         try:
             rows = results_io.read_rows(path)
         except Exception as e:
-            problems.append(f"{rel}: unreadable as schema v1 -- {e}")
+            problems.append(f"{rel}: unreadable as the current schema -- {e}")
             continue
         if not rows:
             problems.append(

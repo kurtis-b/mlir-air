@@ -154,7 +154,11 @@ from builders.gelu import build_gelu_module  # noqa: E402
 from builders.gemm_spec import resolve_gemm_spec, spec_herd  # noqa: E402
 from builders.layer_norm import build_layer_norm_module  # noqa: E402
 from builders.softmax import build_softmax_module  # noqa: E402
-from opcheck_layer import BLOCK_STAGE_ATOL, print_dispatch_totals  # noqa: E402
+from opcheck_layer import (  # noqa: E402
+    BLOCK_STAGE_ATOL,
+    print_dispatch_totals,
+    reconfiguration_delta,
+)
 from opcheck_prepare import _spec_digest  # noqa: E402
 from pattern import EXECUTION_MODE_CSV  # noqa: E402
 from pattern.blocked_attention import round_bf16  # noqa: E402
@@ -886,6 +890,7 @@ def prepare_runlist(shape, seed=42):
 
     def dispatch(device_inputs, stage_stats):
         cache.profiler.cpu_times.clear()
+        reconfig_baseline = cache.reconfiguration_counts()
         x, w_q, w_k, w_v, w_o, ln1_weight, w_up, w_down, ln2_weight = device_inputs
         blocks = cfg["norm_blocks"]
 
@@ -973,6 +978,15 @@ def prepare_runlist(shape, seed=42):
             "host_cpu_ms": {
                 k: sum(v) * 1000.0 for k, v in cache.profiler.cpu_times.items()
             },
+            # What THIS dispatch loaded and attached (schema v2's
+            # reconfiguration columns). Steady state here is the per-head
+            # attention reloads -- `evict_attention_contexts` drops both
+            # attention GEMM contexts before every head, so each head pays two
+            # loads -- while every other artifact's context stands for the
+            # process. That reload count is this mode's real reconfiguration
+            # cost, the thing its bytes advantage over `offload` is traded
+            # against.
+            **reconfiguration_delta(cache, reconfig_baseline),
         }
 
     record_extra = {

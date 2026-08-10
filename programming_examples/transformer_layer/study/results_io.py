@@ -1,7 +1,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""Read and write schema-v1 result CSVs. The mechanism to ``schema.py``'s catalogue.
+"""Read and write current-schema result CSVs. The mechanism to ``schema.py``'s catalogue.
 
 CONTRACT
     ``write_rows(path, rows, table)`` writes a CSV whose header is exactly that

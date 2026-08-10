@@ -151,6 +151,7 @@ from builders.gemm_spec import resolve_gemm_spec, spec_herd  # noqa: E402
 from opcheck_layer import (  # noqa: E402
     BLOCK_STAGE_ATOL,
     print_dispatch_totals,
+    reconfiguration_delta,
 )
 from opcheck_prepare import _spec_digest  # noqa: E402
 from pattern import EXECUTION_MODE_CSV  # noqa: E402
@@ -827,6 +828,7 @@ def prepare_offload(shape, seed=42):
 
     def dispatch(device_inputs, stage_stats):
         cache.profiler.cpu_times.clear()
+        reconfig_baseline = cache.reconfiguration_counts()
         x, w_q, w_k, w_v, w_o, ln1_weight, w_up, w_down, ln2_weight = device_inputs
 
         vector_rows = []
@@ -900,14 +902,25 @@ def prepare_offload(shape, seed=42):
         # `run_sequence` call per GEMM whether the array is configured once or
         # thirty times. This counts the configurations themselves, so the claim
         # is read off a counter rather than asserted from the build settings.
+        #
+        # The PRINTED line is CUMULATIVE since the cache was built, and must
+        # stay so: run_npu2_offload_peano.lit pins it across the shared
+        # recipe's two dispatches (`context_loads 1 kernel_attaches 4` after
+        # both), which only holds for the cumulative counter. The EXTRA dict
+        # below reports the schema-v2 quantity instead -- what THIS dispatch
+        # loaded and attached (reconfiguration_delta) -- so a warmed results
+        # row carries the steady-state per-layer cost: 30 on the ELF path,
+        # which reloads every context per dispatch, and 0 on the shared path,
+        # whose one configuration stands for the process. On a single cold
+        # dispatch the two numbers coincide, which is why the ELF gate's
+        # `context_loads 30` is both at once.
         loads, attaches = cache.reconfiguration_counts()
         print(
             f"[offload] reconfiguration: context_loads {loads} "
             f"kernel_attaches {attaches} over {cfg['n_dispatches']} dispatches"
         )
         return [boundaries["output"]], {
-            "context_loads": loads,
-            "kernel_attaches": attaches,
+            **reconfiguration_delta(cache, reconfig_baseline),
             # The two schema v1 columns that separate this mode's two packaging
             # paths in a results row. Without them a shared-path CSV is
             # byte-identical to an ELF-path one, and a walk comparing the two
@@ -922,10 +935,10 @@ def prepare_offload(shape, seed=42):
             # 0 against 1 still separates the two paths, and both values are
             # true.
             #
-            # This column is NOT the reconfiguration count. That is 30 against
-            # 1, it is the mode's actual axis, and schema v1 has nowhere to put
-            # it -- adding one is a version bump. `reconfiguration_counts()`
-            # and the gated `reconfiguration:` line carry it meanwhile.
+            # This column is NOT the reconfiguration count. That is the mode's
+            # actual axis, and `[2026-08-10]` schema v2 now has somewhere to
+            # put it: the `context_loads` / `kernel_attaches` delta unpacked
+            # above, alongside the gated cumulative `reconfiguration:` line.
             "unique_xclbins": sum(
                 1
                 for binary in {

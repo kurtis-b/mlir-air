@@ -474,6 +474,153 @@ def test_evict_pools_for_drops_exactly_the_named_kernels_pools():
         assert set(cache._pools) == {front}
 
 
+# --- reconfiguration accounting ---------------------------------------------
+#
+# The counters behind `offload`'s gated `reconfiguration:` line and schema v2's
+# context_loads / kernel_attaches columns. The single increment lives in
+# `KernelCache.ensure_loaded`: every `backend.load()` -- an ELF exactly as an
+# xclbin -- is one context load, an `attach_kernel` onto a standing context is
+# one attach, and an evicted context's reload counts AGAIN. These tests drive
+# the REAL `ensure_loaded` against a fake `air.backend.xrt` and a fake
+# `filelock`, injected into sys.modules around the call, so the accounting is
+# checked host-side without XRT.
+
+
+class _FakeLoadedBackend:
+    """What `ensure_loaded` needs of an `XRTBackend`."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.loaded_binary = None
+        self.attached = []
+
+    def load(self, artifact):
+        self.loaded_binary = artifact.output_binary
+        return "invoker"
+
+    def attach_kernel(self, artifact):
+        self.attached.append(artifact.output_binary)
+        return self  # the attached pseudo-backend, as the real one returns
+
+    def unload(self):
+        pass
+
+
+class _FakeArtifact:
+    """The one attribute the load path reads."""
+
+    def __init__(self, output_binary):
+        self.output_binary = output_binary
+
+
+@contextmanager
+def _fake_runtime():
+    """`filelock` + `air.backend.xrt` stand-ins, restored on exit.
+
+    `ensure_loaded` imports both inside the function body, so injecting the
+    modules here is enough; nothing touches /tmp/npu.lock or a device.
+    """
+    import types
+
+    names = ("filelock", "air", "air.backend", "air.backend.xrt")
+    saved = {name: sys.modules.get(name) for name in names}
+
+    class _FakeFileLock:
+        def __init__(self, path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    filelock = types.ModuleType("filelock")
+    filelock.FileLock = _FakeFileLock
+    air = types.ModuleType("air")
+    air_backend = types.ModuleType("air.backend")
+    air_xrt = types.ModuleType("air.backend.xrt")
+    air_xrt.XRTBackend = _FakeLoadedBackend
+    air.backend = air_backend
+    air_backend.xrt = air_xrt
+    sys.modules.update(
+        {
+            "filelock": filelock,
+            "air": air,
+            "air.backend": air_backend,
+            "air.backend.xrt": air_xrt,
+        }
+    )
+    try:
+        yield
+    finally:
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+def _counting_cache(tmpdir, artifacts):
+    cache = KernelCache(cache_dir=tmpdir)
+    cache.artifacts = {n: _FakeArtifact(b) for n, b in artifacts.items()}
+    return cache
+
+
+def test_elf_loads_count_as_context_loads():
+    """An ELF `backend.load()` configures the array like an xclbin load does.
+
+    Doc 03 recorded the ELF-path modes' context loads as uninstrumented; the
+    instrument is in fact the same increment the shared-xclbin path uses, and
+    this pins that an ELF artifact's load raises it.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d, _fake_runtime():
+        cache = _counting_cache(d, {"g1": "a.elf", "g2": "b.elf"})
+        cache.ensure_loaded("g1", {})
+        cache.ensure_loaded("g2", {})
+        assert cache.reconfiguration_counts() == (2, 0)
+        # A cached context is NOT a reconfiguration.
+        cache.ensure_loaded("g1", {})
+        assert cache.reconfiguration_counts() == (2, 0)
+
+
+def test_an_evicted_context_reloaded_counts_again():
+    """Eviction then reload is offload-ELF's 30 and the runlist front's
+    per-head attention reloads -- the mode's real reconfiguration cost. A
+    counter that only counted first loads would read both modes as free."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d, _fake_runtime():
+        cache = _counting_cache(d, {"g1": "a.elf"})
+        cache.ensure_loaded("g1", {})
+        # What pattern/offload's _evict_context and pattern/runlist's
+        # evict_attention_contexts do, minus the pool eviction.
+        loaded = cache._loaded.pop("g1")
+        loaded[0].unload()
+        cache.ensure_loaded("g1", {})
+        assert cache.reconfiguration_counts() == (2, 0)
+
+
+def test_a_shared_binary_attaches_instead_of_reloading():
+    """Artifacts sharing one xclbin cost one load plus N-1 attaches.
+
+    The shared-xclbin gate's `context_loads 1 kernel_attaches 4` is this
+    accounting at five artifacts; two are enough to pin which counter moves.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d, _fake_runtime():
+        cache = _counting_cache(
+            d, {"s1": "shared.xclbin", "s2": "shared.xclbin"}
+        )
+        cache.ensure_loaded("s1", {})
+        assert cache.reconfiguration_counts() == (1, 0)
+        cache.ensure_loaded("s2", {})
+        assert cache.reconfiguration_counts() == (1, 1)
+
+
 def _main():
     tests = [
         (n, o) for n, o in globals().items() if n.startswith("test_") and callable(o)

@@ -1,7 +1,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""Run one execution mode on hardware and write a schema-v1 results row.
+"""Run one execution mode on hardware and write a schema-v2 results row.
 
     python3 study/run_mode.py --mode coarse --out results/coarse.csv
 
@@ -209,10 +209,19 @@ def run(
         durations = []
         outputs = None
         extra = {}
+        decomposition = {key: [] for key in _MS_COMPONENTS}
         for _ in range(samples):
             t0 = time.perf_counter()
             for _ in range(runs_per_sample):
                 outputs, extra = dispatch(inputs, _stage_stats)
+                # Collected per ITERATION, inside the sample window, because
+                # only the innermost loop sees every extra dict -- collecting
+                # after the window would keep one iteration per sample and the
+                # mean would be over a different population than
+                # avg_latency_ms averages. The cost is a dict lookup and a
+                # small sum, noise against the stage comparisons the dispatch
+                # itself already runs inside this clock.
+                _collect_ms_decomposition(decomposition, extra)
             durations.append(time.perf_counter() - t0)
         # --- clock stops ---------------------------------------------------
 
@@ -225,6 +234,7 @@ def run(
         row["max_latency_ms"] = max(per_inference) * 1000.0
 
         _apply_mode_counters(row, extra)
+        _apply_ms_decomposition(row, decomposition, samples * runs_per_sample)
 
         totals = _dispatch_totals(extra)
         if totals:
@@ -256,16 +266,30 @@ def run(
     return row
 
 
-#: mode-reported key -> schema column. Both columns have been in schema v1 since
-#: it was written, inherited from iron and populated by nothing in this port.
+#: mode-reported key -> schema column. The first two have been in schema v1
+#: since it was written, inherited from iron; the last two are the v2
+#: reconfiguration columns. Every mode's dispatch reports the reconfiguration
+#: pair as the DELTA that one dispatch performed (opcheck_layer.
+#: reconfiguration_delta), so the value copied from the final timed iteration
+#: is the steady-state per-layer cost -- offload-ELF's 30, the runlist front's
+#: per-head reloads, 0 for a mode whose contexts stand for the process.
 _MODE_COUNTERS = (
     ("unique_xclbins", "npu_unique_xclbin_count"),
     ("n_dispatches", "npu_dispatch_count"),
+    ("context_loads", "context_loads"),
+    ("kernel_attaches", "kernel_attaches"),
 )
+
+#: The schema-v2 millisecond decomposition, in extra-dict key == column order.
+#: ``device_ms`` and ``sync_ms`` arrive as floats summed from the dispatch
+#: vectors; ``host_cpu_ms`` arrives as the mode's Profiler.time_cpu bucket
+#: dict and is totalled here (the schema column is the layer total; the
+#: per-bucket split stays in the opcheck artifact's extra).
+_MS_COMPONENTS = ("device_ms", "sync_ms", "host_cpu_ms")
 
 
 def _apply_mode_counters(row: dict, extra: dict) -> None:
-    """Copy the packaging counters a mode reports into their schema columns.
+    """Copy the counters a mode reports into their schema columns.
 
     `[2026-08-09]` Under the CORRECTED taxonomy ``npu_unique_xclbin_count`` is
     not a packaging detail: `offload` is DEFINED as the mode that minimizes
@@ -274,15 +298,62 @@ def _apply_mode_counters(row: dict, extra: dict) -> None:
     xclbin at all). Without it the two are byte-identical and a walk comparing
     them compares two files nothing distinguishes.
 
+    `[2026-08-10]` The v2 reconfiguration pair rides the same copy: the mode
+    reports what ONE dispatch loaded and attached, and the schema records the
+    final timed iteration's values as the steady-state per-layer cost.
+
     Only copied where the mode reports them, so a mode that keeps no such
     counter is left ``None`` rather than filled with a derived guess. A
     reported **zero** must survive, which is why this tests against ``None``
-    and not truthiness -- zero is the ELF path's honest value and the whole
-    point of the column here.
+    and not truthiness -- zero is the ELF path's honest ``unique_xclbins`` and
+    every standing-context mode's honest ``context_loads``, and the whole
+    point of the columns here.
     """
     for key, column in _MODE_COUNTERS:
         if extra.get(key) is not None:
             row[column] = extra[key]
+
+
+def _component_ms(extra: dict, key: str):
+    """One dispatch's milliseconds for ``key``, or ``None`` if unreported.
+
+    ``host_cpu_ms`` arrives as a dict of per-op totals -- the mode's own
+    ``Profiler.time_cpu`` buckets -- and the column wants the layer total, so
+    it is summed here. An EMPTY dict is a reported zero: the mode instruments
+    host compute and ran none (``fused``, ``coarse``), which is a measurement
+    and must survive as 0.0 exactly as ``_apply_mode_counters`` keeps a
+    reported zero. A missing key is genuinely unmeasured and stays ``None``.
+    """
+    value = extra.get(key)
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return float(sum(value.values()))
+    return float(value)
+
+
+def _collect_ms_decomposition(decomposition: dict, extra: dict) -> None:
+    """Append one timed iteration's reported components to the running lists."""
+    for key in _MS_COMPONENTS:
+        ms = _component_ms(extra, key)
+        if ms is not None:
+            decomposition[key].append(ms)
+
+
+def _apply_ms_decomposition(row: dict, decomposition: dict, count: int) -> None:
+    """Persist each component's mean per inference, or leave the column None.
+
+    Follows how the latency statistics are persisted: an aggregate over the
+    SAME timed iterations ``avg_latency_ms`` averages, so the three columns
+    and the latency column describe one region and one population. A component
+    the mode did not report on EVERY timed iteration stays ``None`` -- a
+    partial series has no defensible mean, and an empty field is honest where
+    a fabricated zero is not (schema v2's ``host_cpu_ms`` semantics).
+    """
+    for key in _MS_COMPONENTS:
+        values = decomposition[key]
+        if count > 0 and len(values) == count:
+            row[key] = sum(values) / count
 
 
 def _dispatch_totals(extra: dict) -> dict | None:
@@ -324,6 +395,21 @@ def main(argv: list[str] | None = None) -> int:
             f"submissions {row['host_submissions_per_layer']}  "
             f"sync {row['sync_boundaries']}"
         )
+        # The v2 columns, printed so a log carries what the CSV carries. A NEW
+        # line rather than an edit to the one above, whose format the shared
+        # offload gate's FileCheck neighbourhood relies on staying stable.
+        parts = [
+            f"{name} {row[name]:.3f}"
+            for name in _MS_COMPONENTS
+            if row[name] is not None
+        ]
+        parts += [
+            f"{name} {row[name]}"
+            for name in ("context_loads", "kernel_attaches")
+            if row[name] is not None
+        ]
+        if parts:
+            print("[run-mode]   " + "  ".join(parts))
     else:
         print(f"[run-mode]   {row['failure_message']}")
     print(f"[run-mode] wrote {args.out}")

@@ -168,7 +168,11 @@ from builders.mha_out_proj import (  # noqa: E402
     compile_mha_out_proj_kernels,
 )
 from builders.qkv_proj import build_qkv_proj_module  # noqa: E402
-from opcheck_layer import BLOCK_STAGE_ATOL, print_dispatch_totals  # noqa: E402
+from opcheck_layer import (  # noqa: E402
+    BLOCK_STAGE_ATOL,
+    print_dispatch_totals,
+    reconfiguration_delta,
+)
 from opcheck_prepare import _spec_digest  # noqa: E402
 from pattern import EXECUTION_MODE_CSV  # noqa: E402
 from pattern.blocked_attention import round_bf16  # noqa: E402
@@ -591,6 +595,7 @@ def prepare_fused(shape, seed=42):
     tail_idx, tail_order = cfg["tail_idx"], cfg["tail_order"]
 
     def dispatch(device_inputs, stage_stats):
+        reconfig_baseline = cache.reconfiguration_counts()
         x, w_qkv, w_o, ln1_weight, w_up, w_down, ln2_weight = device_inputs
 
         def zeros_act():
@@ -752,6 +757,11 @@ def prepare_fused(shape, seed=42):
             ),
             "sync_ms": sum(float(r.get("host_sync_ms", 0.0)) for r in vector_rows),
             "host_cpu_ms": {},
+            # What THIS dispatch loaded and attached (schema v2's
+            # reconfiguration columns). Three ELFs, loaded once, contexts
+            # standing for the process: a warmed dispatch honestly reports 0,
+            # which is the packaged mode's whole claim on this axis.
+            **reconfiguration_delta(cache, reconfig_baseline),
         }
 
     record_extra = {

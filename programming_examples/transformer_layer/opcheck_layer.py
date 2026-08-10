@@ -255,6 +255,33 @@ def dispatch_vector_totals(rows):
     return totals
 
 
+def reconfiguration_delta(cache, baseline):
+    """The ``(context_loads, kernel_attaches)`` THIS dispatch performed, as a dict.
+
+    ``KernelCache.reconfiguration_counts()`` is cumulative since the cache was
+    built -- the right number for ``offload``'s gated ``reconfiguration:``
+    line, which ``run_npu2_offload_peano.lit`` pins ACROSS dispatches, and the
+    wrong one for a results row, which records one steady-state layer dispatch
+    (schema v2's ``context_loads`` / ``kernel_attaches``). Every whole-layer
+    ``dispatch`` snapshots the counters at entry and reports the difference at
+    exit through this one helper, so what counts as a reconfiguration stays
+    defined in exactly one place -- ``ensure_loaded``'s single increment,
+    which counts an ELF ``backend.load`` and an xclbin load identically, and
+    counts an evicted context's reload AGAIN. That reload is the number:
+    ``offload``-ELF's 30 per layer and the ``runlist`` front's per-head
+    attention reloads are this delta, where the standing-context modes read 0.
+
+    Args:
+        cache: the mode's ``KernelCache``.
+        baseline: ``cache.reconfiguration_counts()`` captured at dispatch entry.
+    """
+    loads, attaches = cache.reconfiguration_counts()
+    return {
+        "context_loads": loads - baseline[0],
+        "kernel_attaches": attaches - baseline[1],
+    }
+
+
 def print_dispatch_totals(label, vector_rows):
     """Validate, sum and print a mode's recorded vectors, one shared format.
 
@@ -352,6 +379,7 @@ def prepare_layer_dispatch(
     compile_block_artifacts(cache, cfg, run_only=True)
 
     def dispatch(device_inputs, stage_stats):
+        reconfig_baseline = cache.reconfiguration_counts()
         boundaries, vector_rows = run_block(cache, cfg, device_inputs)
         stages = []
         for name in BLOCK_BOUNDARIES:
@@ -381,6 +409,12 @@ def prepare_layer_dispatch(
             ),
             "sync_ms": sum(float(r.get("host_sync_ms", 0.0)) for r in vector_rows),
             "host_cpu_ms": {},
+            # What THIS dispatch loaded and attached (schema v2's
+            # reconfiguration columns). The block path loads its four ELFs on
+            # the first dispatch and keeps every context standing, so a warmed
+            # dispatch honestly reports 0 -- which is the mode's steady-state
+            # per-layer reconfiguration cost, not a missing measurement.
+            **reconfiguration_delta(cache, reconfig_baseline),
         }
 
     record_extra = {

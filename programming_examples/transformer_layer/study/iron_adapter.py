@@ -171,7 +171,7 @@ def incomparable_reason(iron_field: str) -> str | None:
 def adapt_iron_row(
     row: dict[str, object], *, require: tuple[str, ...] = ()
 ) -> dict[str, object]:
-    """One iron results row as a schema-v1 row.
+    """One iron results row as a current-schema row.
 
     ``require`` names iron fields the caller insists on carrying over; each one
     that does not cross raises ``IncomparableField``. Callers that just want the

@@ -7,7 +7,7 @@
         --seqs 512,1024,2048,4096 --out-dir <results-root> --study-id j3-ladder
 
 CONTRACT
-    One CSV per mode, named ``<mode>.csv``, holding one schema-v1 row per rung.
+    One CSV per mode, named ``<mode>.csv``, holding one current-schema row per rung.
     Delegates every rung to ``run_mode.py`` -- the timing, the dispatch-vector
     totals and the pass/fail verdict all come from the one implementation the
     single-shape path already uses, so a ladder row and a single-shape row are
