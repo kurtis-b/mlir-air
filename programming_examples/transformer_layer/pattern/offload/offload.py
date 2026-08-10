@@ -159,6 +159,7 @@ from builders.gemm_spec import resolve_gemm_spec, spec_herd  # noqa: E402
 from opcheck_layer import (  # noqa: E402
     BLOCK_STAGE_ATOL,
     print_dispatch_totals,
+    reconfiguration_delta,
 )
 from opcheck_prepare import _spec_digest  # noqa: E402
 from pattern import EXECUTION_MODE_CSV  # noqa: E402
@@ -835,6 +836,11 @@ def prepare_offload(shape, seed=42):
 
     def dispatch(device_inputs, stage_stats):
         cache.profiler.cpu_times.clear()
+        # Snapshot at entry so the extra dict reports what THIS dispatch
+        # loaded and attached (schema v2's per-dispatch quantity), same as
+        # every other mode. The PRINTED reconfiguration line below stays
+        # cumulative -- the shared gate pins it across two dispatches.
+        reconfig_baseline = cache.reconfiguration_counts()
         x, w_q, w_k, w_v, w_o, ln1_weight, w_up, w_down, ln2_weight = device_inputs
 
         vector_rows = []
@@ -914,8 +920,12 @@ def prepare_offload(shape, seed=42):
             f"kernel_attaches {attaches} over {cfg['n_dispatches']} dispatches"
         )
         return [boundaries["output"]], {
-            "context_loads": loads,
-            "kernel_attaches": attaches,
+            # Per-dispatch delta, NOT the cumulative printed above: run_mode
+            # records the LAST timed dispatch's extra, so a cumulative value
+            # here multiplies with warmup+samples (measured: 210 for a
+            # 30-load layer at warmup 2, samples 5) and depends on the
+            # harness's iteration count rather than the mode.
+            **reconfiguration_delta(cache, reconfig_baseline),
             # The two schema v1 columns that separate this mode's two packaging
             # paths in a results row. Without them a shared-path CSV is
             # byte-identical to an ELF-path one, and a walk comparing the two
