@@ -42,8 +42,8 @@ how to use MLIR-AIR.
 | [26-mode-rebuild-feasibility.md](26-mode-rebuild-feasibility.md) | **The feasibility record for the mode rebuilds — read it for its CORRECTIONS, not as current state.** It opens with six things the plan had wrong, three of which have since been settled by hardware, two of them against what it concluded. **§4 is retracted** (`runtime_loop_tiling_sizes` is not inert) and **§5 is corrected twice** (the missing row-max is the single-shot kernel's, not the streaming family's; `SM_LOG2E` is a base conversion, not a blocking scale). Its §6 was right and is fixed |
 | [27-common-ladder-result.md](27-common-ladder-result.md) | **The first four-mode comparison at one sequence length**, 512 and 1024, walked twice. DRAM traffic orders exactly as the taxonomy predicts; `fused` fastest and `coarse` second at both lengths; `runlist` and `offload` indistinguishable. **A crossover that walk 1 reported did not survive walk 2** — read its §The crossover that did not survive before running one walk of anything |
 | [28-coarse-blend-space.md](28-coarse-blend-space.md) | **What `coarse`'s blend is a blend OF, and what selects it.** The space is two axes and six cells, derived from the artifact plans — and **two of the six ARE `fused` and `runlist`**, so "pick the best cell" collapses the taxonomy. Resolves it: the blend is selected by **what the workload admits**, and `coarse` is the mode you use where `fused` does not fit. **Measure it at 2048/4096, not at 1024**, or it reports `fused` under another name |
-| [30-coarse-cells-built.md](30-coarse-cells-built.md) | **`coarse`'s two interior cells, built, gated and measured — and the mode's blend now has provenance.** C2 and C3 passed their first hardware run; their entry counts were predicted host-side beforehand by a model that also reproduces `coarse`'s and `runlist`'s shipped gate literals. **The four cells' dispatch vectors are ADDITIVE** across the two axes on all six columns (bytes exactly), which is a provenance check nobody wrote. The ladder puts C1 first at 2048 and 4096 over two walks, so **`coarse` = C1** — an interior cell, so the taxonomy does not collapse. Also records two things that are not about `coarse`: the `runlist` catalogue row was **stale** (it described the pre-rebuild host-attention mode, tolerance figures included), and `run_npu2_runlist_gate.lit`'s latency clause has **no margin** and is now intermittent under suite contention (red once, green twice, same code) |
 | [29-offload-n-streams.md](29-offload-n-streams.md) | **`offload`'s reconfiguration half, landed and now GATED.** Five shapes in one xclbin, the array configured once instead of thirty times, dispatch vector unchanged by design. Records the **three** identifiers a stream needs and the two that fail silently; the stale-install trap that made a no-op run look like a success; **the `[2026-08-09]` gate and the 4096 wall that bounds it to single-launch modules** — so everything the document originally claimed is a **1024** result; and **the variance measurement that confirms `_evict_context` is why this mode is noisy**, along with the ~20% best-case latency it costs to remove |
+| [30-coarse-cells-built.md](30-coarse-cells-built.md) | **`coarse`'s two interior cells, built, gated and measured — and the mode's blend now has provenance.** C2 and C3 passed their first hardware run; their entry counts were predicted host-side beforehand by a model that also reproduces `coarse`'s and `runlist`'s shipped gate literals. **The four cells' dispatch vectors are ADDITIVE** across the two axes on all six columns (bytes exactly), which is a provenance check nobody wrote. The ladder puts C1 first at 2048 and 4096 over two walks, so **`coarse` = C1** — an interior cell, so the taxonomy does not collapse. Also records two things that are not about `coarse`: the `runlist` catalogue row was **stale** (it described the pre-rebuild host-attention mode, tolerance figures included), and `run_npu2_runlist_gate.lit`'s latency clause has **no margin** and is now intermittent under suite contention (red once, green twice, same code) |
 
 ## Status board
 
@@ -92,21 +92,34 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 
 ## `[2026-08-09]` Where things stand, for a session picking this up cold
 
-**All four modes now exist in some corrected form, and the study can be re-measured.** That is new
-as of 2026-08-09 and is the single most important thing to know: the plan spent two days blocked on
-claims that turned out to be wrong, and the documents still carry those claims with retractions
-attached rather than deleted.
+**All four modes are corrected AND gated, and the four-mode study is no longer blocked on any of
+them.** That is the single most important thing to know. `runlist` and `offload` landed on
+2026-08-09 morning, `fused` on 2026-08-08, and **`coarse` closed the set the same day** — it is now
+cell C1 of [28](28-coarse-blend-space.md)'s blend space, chosen by measurement rather than inherited
+([30](30-coarse-cells-built.md)). The transformer-layer suite is **30/30 on NPU2**.
 
-**Three of the four are gated. `coarse` is the one that is not, and it is the next work.**
+**Read the retractions, not just the claims.** The plan spent two days blocked on things that turned
+out to be wrong, and the documents keep those claims with retractions attached rather than deleting
+them — so a sentence you find here may be marked false three paragraphs later. Anything dated before
+2026-08-08 predates the taxonomy correction and ranks *implementations*, not the four modes.
+
+**What is left is the `offload` chain and the phases nobody has started** — see §What to do next.
+Nothing in it blocks anything else in it except where stated.
 
 **Read in this order.** [03 §The taxonomy](03-measurement-model.md) for what the four modes mean —
 that is the definition and it is current. Then this section. Then
-[23](23-rules-and-open-items.md) for the design rules that govern anything you build.
+[23](23-rules-and-open-items.md) for the design rules that govern anything you build — the
+per-column shim budget and the L3-side offset rule are the two that have cost sessions.
 [26](26-mode-rebuild-feasibility.md) is the feasibility record and is worth reading *for its
 corrections*, not as current state: it opens with six things the plan had wrong, and three of those
 six have since been settled by hardware, two of them against what it concluded. Its §4 is
-**retracted** inline. Then, for the front of the queue,
-[28](28-coarse-blend-space.md) — it scopes `coarse` and is the spec the next session works from.
+**retracted** inline. Then, for the front of the queue, [29 §The 4096
+wall](29-offload-n-streams.md) — it is where the next work is specified.
+
+**If you are picking up `coarse`, do not re-derive it.** [28](28-coarse-blend-space.md) is the
+scoping and [30](30-coarse-cells-built.md) is the result; the two sibling cells stay runnable
+(`make check-coarse-c2`, `check-coarse-c3`, `make coarse-cell-structure`) precisely so that
+re-deciding the blend costs a measurement rather than a rebuild.
 
 **The one-paragraph version.** The modes are not defined by *who sequences the work* but by
 **reconfiguration cost against DRAM traffic**: `runlist` pays per-operator reconfiguration with
@@ -118,13 +131,21 @@ traffic between operators, and `coarse` blends `runlist` and `fused`.
 
 | # | Work | Size | Spec |
 |---|---|---|---|
-| ~~1~~ | ~~**Corrected `coarse`.**~~ **DONE 2026-08-09** — [30](30-coarse-cells-built.md). C2 and C3 built, gated and measured; `coarse` is cell C1 with the measurement behind it. Two notes for whoever reads this next. The `prepare_fused` half of the extraction was **deliberately not done**: no cell at 2048+ uses a stitched tail because none *builds* there, so it would have churned a gated mode for a composition nothing calls. And the walk found a **removable inefficiency that is not `coarse`'s**: `evict_attention_contexts` clears ALL of `cache._pools`, not just the two attention artifacts', so the `runlist` front re-uploads every static weight on every dispatch — ~14 MB per layer, measured, and demonstrably **not** the reason those cells are slower | Large — was the study's critical path | [28](28-coarse-blend-space.md) · [30](30-coarse-cells-built.md) |
-| 2 | **The xclbin multi-launch instruction streams.** `offload`'s shared path cannot build at 4096 because a two-launch module collides with the fixed `air.insts.bin`. The **first blocker** is located — parameterize the name per launch — but that is not proven sufficient: `XRTCompileArtifact` carries one `insts` string and the xclbin loader reads one file, so artifact and runtime changes may follow. Do **not** fix it by dropping `-i`, which would change the artifact contract for every xclbin and txn caller | Medium-to-large — touches `python/air/backend/xrt.py`, so `install-xrt` rebuild + the ten-model regression. Its own phase, and scope it after the first experiment | [29 §The 4096 wall](29-offload-n-streams.md) |
-| 3 | **Persist the latency decomposition.** `device_ms` / `sync_ms` / `host_cpu_ms` are measured on every rung and discarded — schema v1 has no column for any of them. This is what would explain `offload`'s ~20% best-case regression on the shared path, and it is a **schema v2 bump** | Small, but it re-versions the schema | [29](29-offload-n-streams.md) · `study/schema.py:53` |
-| 4 | **`offload`'s default**, after item 2. Flip to the shared path once it builds at the mode's own gated shape, decided there rather than extrapolated from 512, with the ELF path renamed to what it then is — a legacy/control packaging. Forces a full four-mode re-walk of [27](27-common-ladder-result.md) | Medium, mostly machine time | [29](29-offload-n-streams.md) |
+| **1** | **The xclbin multi-launch instruction streams.** `offload`'s shared path cannot build at 4096 because a two-launch module collides with the fixed `air.insts.bin`. The **first blocker** is located — parameterize the name per launch — but that is not proven sufficient: `XRTCompileArtifact` carries one `insts` string and the xclbin loader reads one file, so artifact and runtime changes may follow. Do **not** fix it by dropping `-i`, which would change the artifact contract for every xclbin and txn caller | Medium-to-large — touches `python/air/backend/xrt.py`, so `install-xrt` rebuild + the ten-model regression. Its own phase, and scope it after the first experiment | [29 §The 4096 wall](29-offload-n-streams.md) |
+| 2 | **Persist the latency decomposition.** `device_ms` / `sync_ms` / `host_cpu_ms` are measured on every rung and discarded — schema v1 has no column for any of them. This is what would explain `offload`'s ~20% best-case regression on the shared path, and it is a **schema v2 bump**. Every whole-layer mode already *reports* all three, the two `coarse` cells included, so the day the column exists the data lands with it | Small, but it re-versions the schema | [29](29-offload-n-streams.md) · `study/schema.py:53` |
+| 3 | **`offload`'s default**, after item 1. Flip to the shared path once it builds at the mode's own gated shape, decided there rather than extrapolated from 512, with the ELF path renamed to what it then is — a legacy/control packaging. Forces a full four-mode re-walk of [27](27-common-ladder-result.md) | Medium, mostly machine time | [29](29-offload-n-streams.md) |
+| 4 | **`evict_attention_contexts` clears too much.** It drops ALL of `cache._pools`, not just the two attention artifacts', so the `runlist` front re-uploads every static weight on every dispatch — ~14 MB per layer at 4096, measured. Small, isolated, and **not** why that front is slower (7% of traffic against a 60% latency gap), so it is a clean win rather than a performance fix | Small | [30](30-coarse-cells-built.md) |
+| 5 | **`run_npu2_runlist_gate.lit`'s latency clause has no margin.** Leg A passes only on `agg_ms < seq_ms`, and it is now intermittent under suite contention — red once, green twice, same code. Decide between a stated margin, a serialized recipe, or leaving it and knowing a red there needs an isolated re-run before it means anything. **Do not widen it blind**: doc 05a measured the real effect at 1.02–1.15×, so the claim is sound and the margin is the question | Small, but it is a gate | [30](30-coarse-cells-built.md) |
 
-Items 2–4 are a chain and are all `offload`; item 1 is independent of them and is the study's
-critical path. **Nothing below is blocked on anything above.**
+Items 1–3 are a chain and are all `offload`. Items 4 and 5 are independent of everything and of each
+other. **Nothing below is blocked on anything above.**
+
+`[2026-08-09]` **`coarse` came off this list**, which is what makes item 1 the front of the queue —
+see [30](30-coarse-cells-built.md). Two notes from that work that are not captured anywhere else:
+the `prepare_fused` half of the extraction its spec asked for was **deliberately not done** (no cell
+at 2048+ uses a stitched tail because none *builds* there, so it would have churned a gated mode for
+a composition nothing calls), and items 4 and 5 above are both things the phase found rather than
+things it set out to do.
 
 ### The four modes, as they actually are today
 
@@ -416,13 +437,16 @@ Then, before touching anything:
 ~~**The next phase is E (the four execution strategies).**~~ **`[2026-08-09]` Phase E ran, and
 was then superseded.** Its five sub-phases all landed
 ([08](08-phase-e-execution-strategies.md) is the spec), and the taxonomy they were built against was
-corrected on 2026-08-08. Three of the four modes have since been rebuilt against the corrected
+corrected on 2026-08-08. **All four** modes have since been rebuilt against the corrected
 definitions; `08` and its sub-specs describe the superseded ones and carry reversal notes where a
 claim was measured false. ~~**The next work is `coarse`**, and it needs a decision procedure that
-does not exist yet.~~ **`[2026-08-09]` `coarse` is still the next work, but the decision procedure
-now EXISTS** — [28](28-coarse-blend-space.md) derived it from the artifact plans: the blend is two
-axes over six cells, selected by what the workload admits, and `coarse` is the mode you use where
-`fused` does not fit. See §What to do next, which orders it against the three `offload` items.
+does not exist yet.~~ ~~**`[2026-08-09]` `coarse` is still the next work, but the decision procedure
+now EXISTS.**~~ **`[2026-08-09]` `coarse` is DONE** — [28](28-coarse-blend-space.md) derived the
+decision procedure from the artifact plans (two axes over six cells, selected by what the workload
+admits) and [30](30-coarse-cells-built.md) executed it: the two interior cells were built and gated,
+all four buildable cells were walked twice at 2048 and 4096, and the mode is cell C1 with the
+measurement recorded in its artifact. **The four modes are no longer what this plan is waiting on.**
+See §What to do next, which is now the `offload` chain plus two small items the `coarse` work found.
 
 ### What Phase D left you
 
