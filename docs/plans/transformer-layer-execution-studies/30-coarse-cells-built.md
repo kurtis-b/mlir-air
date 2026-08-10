@@ -184,6 +184,20 @@ what it claims:
 against ~190 MB, ~7% of traffic, while the latency gap is ~60%. Recorded because it is a
 removable inefficiency somebody will want, not because it explains the ranking.
 
+> **`[2026-08-10]` REMOVED — the eviction is targeted now.** `evict_attention_contexts` drops
+> only the pools whose sequences involve the two attention artifacts
+> (`KernelCache.evict_pools_for`, reading the kernel names out of the plan signature via
+> `signature_kernels`), and the content-keyed static-weight pools survive. The measured footgun
+> it exists for is context state, not BO state — pooled ELF-ABI BOs are `xrt.ext.bo`,
+> device-level, and survive a context unload — so nothing safety-shaped was riding on the
+> wholesale clear. Measured after the fix: a warm `runlist` run reads `sync 443
+> bytes 176160768` against the cold 451 / 190,513,152 — a drop of exactly **14,352,384** bytes,
+> the same static set C2's drop decomposes into, across 8 skipped uploads. **The cold totals
+> did not move**, because within one cold layer run the per-head evictions only ever destroyed
+> pools that run never reused — so every pinned gate literal stands unchanged. `check-runlist`,
+> its fault twin and `check-coarse-c3` re-ran green, dispatch host tests 32/32 (one new,
+> verified in the failing direction first).
+
 ## What `coarse` is, with provenance
 
 **`coarse` = C1 = (block front, banded tail).** That is what it already was — and the point of this
@@ -237,5 +251,17 @@ sound and its margin is the problem, not its claim. Recorded here rather than pa
 picks it up should decide between a stated margin, a serialized recipe, or leaving it and knowing
 that a full-suite red on this one clause is a scheduling artefact until an isolated re-run says
 otherwise.
+
+> **`[2026-08-10]` Decided, and it is none of the three options as offered: the verdict now
+> compares interleaved MINIMUMS** (`agg_min < seq_min`, both legs of `runlist_gate.py`), with
+> medians and the win count still reported beside them. The reasoning is doc
+> [23 §1](23-rules-and-open-items.md)'s own convention: host contention only ever *inflates* a
+> sample, so the minimum over interleaved samples converges on the mechanism's floor while the
+> median carries whatever ran beside the suite — which is exactly what the 0.9966× red was.
+> The inequality stays strict; nothing was widened. Validated on an isolated run: leg A
+> minimums 24.786 vs 24.921 ms (saved 135 µs, 1.0054×), leg B 23.263 vs 23.607 ms (saved
+> 344 µs, 1.0148×), `PHASE B GATE: PASS` on all four legs. A contended suite can still in
+> principle inflate every one of 15 interleaved samples, but it has to do so in *both* arms'
+> quiet windows at once — the failure now needs sustained, not incidental, contention.
 
 **The suite's standing state on the committed tree is 30/30** (`b795deb1`, 541 s).
