@@ -320,6 +320,32 @@ SPECS = [
         "prepare": prepare_layer_norm,
     },
     {
+        # DOC 23 ITEM 2, the layer_norm half: rows at a COMMON OFFSET large
+        # next to their spread (mean 8, sigma 0.25 -- |mean|/sigma 32), the
+        # regime where a one-pass bf16 variance loses the row's statistics
+        # entirely and the measured addnorm collapse boundary sits between
+        # |mean|/sigma 2 and 4. J7a's round-3 move to two-pass f32 statistics
+        # is what makes this kernel pass here, and until this row nothing
+        # pinned that: doc 23 measured it clean (0/49152, mean_rel_L1 1.1e-4,
+        # probe_addnorm_variance_cliff.py) and a revert to one-pass would have
+        # failed only a probe nobody runs. 128 rows to match the sibling
+        # norm_tail offset row, NOT first in declaration order, so the
+        # standing negative control keeps its measured 512x512 target.
+        "operator": "layer_norm",
+        "shape_key": "128x768_offset",
+        "shape": {"rows": 128, "cols": 768, "offset_regime": True},
+        # Measured over 98304 elements: mean_rel_L1 9.819e-5, abs_err_max
+        # 1.562e-2, rel_err_max 7.812e-3 and atol_required 0.0 -- rtol ALONE
+        # covers every element, the same signature as the 4096x768 row,
+        # because the f32 two-pass statistics are exact at any common offset
+        # and what remains is per-element bf16 rounding on O(1) normalized
+        # outputs. Within 1.4x of the zero-mean row's 7.117e-5, so the offset
+        # costs the kernel nothing measurable. atol stays the sibling row's
+        # 5e-3 rather than being driven to something arbitrarily small.
+        "atol": 5e-3,
+        "prepare": prepare_layer_norm,
+    },
+    {
         # 64 rows, not 512: addnorm needs one kernel call per tile, which caps
         # rows at herd_x * (what fits L1). See builders/addnorm.py.
         "operator": "addnorm",

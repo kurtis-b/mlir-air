@@ -48,3 +48,5 @@
 // CHECK: [opcheck] layer_norm [512x512]: PASS
 // CHECK: PASS!
 // CHECK: [opcheck] layer_norm [4096x768]: PASS
+// CHECK: PASS!
+// CHECK: [opcheck] layer_norm [128x768_offset]: PASS

@@ -211,11 +211,17 @@ is a ~35× margin, so the recorded `block` / `coarse` / `runlist` / `fused` figu
 question. The defect is latent, and unpinned by any test. (Measured for `encoder_bert` only;
 `decoder_gpt2` is pre-norm and no mode dispatches it — that is J5.)
 
-**What to do, unclaimed.** Adding the offset row to `layer_norm` pins its boundary and passes today.
-Adding one to `addnorm` would fail, so it needs the kernel moved to two-pass f32 first — which by
-analogy with item 1 costs ~13% on that kernel and would shift every provenance figure that flows
-through it (`block` and the three modes), probably improving them. That is a phase, not a patch, and
-the trade should be decided knowing the cliff is real but ~35× away.
+**What to do, ~~unclaimed~~ half done.** ~~Adding the offset row to `layer_norm` pins its boundary
+and passes today.~~ **`[2026-08-10]` The `layer_norm` half is DONE**: `128x768_offset` is a
+catalogue row (`opcheck_specs.py`), pinned by `run_npu2_layer_norm_peano.lit`, and its first
+hardware run measured `mean_rel_L1` 9.819e-5 with `atol_required` 0.0 — rtol alone covers every
+element, within 1.4× of the zero-mean row, so the offset costs the two-pass kernel nothing
+measurable. A revert to one-pass statistics now fails a suite recipe rather than a probe nobody
+runs. Adding one to `addnorm` would fail, so it needs the kernel moved to two-pass f32 first —
+which by analogy with item 1 costs ~13% on that kernel and would shift every provenance figure that
+flows through it (`block` and the three modes), probably improving them. That is a phase, not a
+patch, and the trade should be decided knowing the cliff is real but ~35× away — and it is still
+unclaimed.
 
 Reproduce with `agents/probes/probe_addnorm_variance_cliff.py`.
 

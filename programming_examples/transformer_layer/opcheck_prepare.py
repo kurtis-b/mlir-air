@@ -193,10 +193,24 @@ def prepare_causal_mask(shape, seed=1):
 
 
 def prepare_layer_norm(shape, seed=2):
+    """Row-wise LayerNorm over a standard-normal draw.
+
+    A shape carrying ``offset_regime`` draws x at a COMMON OFFSET large next
+    to its spread (mean 8, sigma 0.25 -- mean/sigma 32), the same regime as
+    ``prepare_norm_tail``'s offset row and doc 23 item 2's sweep. It is the
+    regime where a one-pass bf16 variance loses the row's statistics entirely
+    (the addnorm kernels still do, measured collapse boundary between
+    |mean|/sigma 2 and 4), and where this kernel's two-pass f32 statistics
+    must not. Doc 23 measured the kernel clean here (0/49152,
+    mean_rel_L1 1.1e-4) but nothing pinned it; the offset row is that pin.
+    """
     rows, cols = shape["rows"], shape["cols"]
     ek.compile_layer_norm()
     rng = np.random.default_rng(seed)
-    x = rng.standard_normal((rows, cols)).astype(bfloat16)
+    if shape.get("offset_regime"):
+        x = (8.0 + 0.25 * rng.standard_normal((rows, cols))).astype(bfloat16)
+    else:
+        x = rng.standard_normal((rows, cols)).astype(bfloat16)
     return {
         "module": build_layer_norm_module(rows, cols, bfloat16),
         "inputs": [x],
