@@ -283,6 +283,17 @@ def plan_signature(steps, specs, elf_abi, host_supplied=None):
     )
 
 
+def signature_kernels(signature):
+    """The kernel (artifact) names a `plan_signature` value covers.
+
+    The signature's step component carries each step's kernel name; this is
+    the one place allowed to know that structure, so callers that need "which
+    pools involve artifact X" (targeted eviction) do not decompose the tuple
+    themselves.
+    """
+    return frozenset(step[0] for step in signature[1])
+
+
 def plan_pool(steps, specs, elf_abi, host_supplied=None):
     """Assign pool slots to the sequence's buffers.
 

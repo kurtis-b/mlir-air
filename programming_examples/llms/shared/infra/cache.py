@@ -667,6 +667,25 @@ class KernelCache:
             self._pools[key] = BoPool(alloc, sync_to_device, sync_from_device)
         return self._pools[key]
 
+    def evict_pools_for(self, kernels):
+        """Drop every pool whose sequence involves any of `kernels`.
+
+        The targeted form of what `pattern/runlist`'s eviction used to do with
+        `_pools.clear()`: a caller breaking context reuse for specific
+        artifacts drops exactly the pools those artifacts' sequences own, and
+        every other pool — the content-keyed static-weight pools included —
+        keeps its slots and its resident uploads. Clearing wholesale made the
+        runlist front re-upload ~14 MB of static weights per layer at 4096
+        (measured, doc 30) for artifacts the eviction was never about.
+        """
+        kernels = frozenset(kernels)
+        from shared.infra.bo_pool import signature_kernels
+
+        for key in [
+            k for k in self._pools if signature_kernels(k) & kernels
+        ]:
+            del self._pools[key]
+
     def _mark_instr_synced(self, name):
         """True the first time an artifact's instruction BO needs syncing (D6)."""
         if name in self._instr_synced:

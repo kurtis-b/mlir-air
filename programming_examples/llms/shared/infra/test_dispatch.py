@@ -438,6 +438,42 @@ def test_launch_counts_come_from_the_mlir_module():
     assert counts.as_dict() == {"air_launches": 2, "herd_launches": 2}
 
 
+def test_evict_pools_for_drops_exactly_the_named_kernels_pools():
+    """Targeted eviction: a caller breaking context reuse for specific artifacts
+    (pattern/runlist's per-head attention eviction) drops only the pools whose
+    sequences involve those kernels. The wholesale `_pools.clear()` this
+    replaces also destroyed the content-keyed static-weight pools — ~14 MB
+    re-uploaded per layer at 4096, measured in doc 30 as the runlist-front
+    cells' zero warm-vs-cold byte drop.
+    """
+    import tempfile
+
+    from shared.infra.bo_pool import plan_pool, signature_kernels
+
+    def signature_of(*kernels):
+        steps = [DispatchStep(k, ("in", "out"), writes=(1,)) for k in kernels]
+        specs = {
+            "in": BufferSpec("in", 4096),
+            "out": BufferSpec("out", 4096, host_output=True),
+        }
+        return plan_pool(steps, specs, elf_abi=True).signature
+
+    attention = signature_of("attn_scores", "softmax")
+    front = signature_of("qkv_proj")
+    assert signature_kernels(attention) == {"attn_scores", "softmax"}
+
+    with tempfile.TemporaryDirectory() as d:
+        cache = KernelCache(cache_dir=d)
+        cache._pools = {attention: object(), front: object()}
+
+        # The failing direction first: a kernel no pool involves drops nothing.
+        cache.evict_pools_for({"unrelated"})
+        assert set(cache._pools) == {attention, front}
+
+        cache.evict_pools_for({"attn_scores", "attn_output"})
+        assert set(cache._pools) == {front}
+
+
 def _main():
     tests = [
         (n, o) for n, o in globals().items() if n.startswith("test_") and callable(o)

@@ -617,12 +617,23 @@ def evict_attention_contexts(cache, cfg):
     The softmax artifact is deliberately NOT evicted: no runtime loop
     tiling, same class as the band add/ln/mul ELFs that already re-execute
     128 times per layer clean.
+
+    The pool eviction is TARGETED, not wholesale. Only the pools whose
+    sequences involve the two attention artifacts are dropped -- the reuse
+    being broken is theirs, and the measured footgun is context state, not
+    BO state (pooled ELF-ABI BOs are allocated device-level,
+    ``xrt.ext.bo``, and survive a context unload). The first version did
+    ``cache._pools.clear()``, which also destroyed the content-keyed
+    static-weight pools and made every runlist-front layer run re-upload
+    ~14 MB of weights at 4096 -- measured as the zero warm-vs-cold byte
+    drop in doc 30, and never a safety property.
     """
-    for key in ("attn_scores", "attn_output"):
-        loaded = cache._loaded.pop(cfg["artifacts"][key], None)
+    names = {cfg["artifacts"]["attn_scores"], cfg["artifacts"]["attn_output"]}
+    for name in names:
+        loaded = cache._loaded.pop(name, None)
         if loaded is not None:
             loaded[0].unload()
-    cache._pools.clear()
+    cache.evict_pools_for(names)
 
 
 def run_attention_head(cache, cfg, head, q, k, v):
