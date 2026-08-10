@@ -346,6 +346,7 @@ L3/DDR memrefs and every inter-operator boundary is a DDR buffer. Logical tensor
 | `attn_context` | 3.0 | 4 % |
 | `attn_out` (`packed1` plane 0) | 3.0 | 4 % |
 | `x` re-read as residual | 1.5 | 2 % |
+| `ffn_out` (written by the down-projection, read by ln2) — **`[2026-08-10]` row was missing**: the items above summed to 64.5 against the stated 67.5, found by 31a's independent re-derivation; the totals were always right, the list was short one tensor | 3.0 | 4 % |
 | **total** | **84.0** (49.5 read + 34.5 write) | |
 | irreducible (weights 13.5 + x in 1.5 + output out 1.5) | 16.5 | 20 % |
 | **intermediate activation traffic** | **67.5** | **80 %** |
