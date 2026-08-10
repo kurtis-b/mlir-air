@@ -48,11 +48,19 @@ WHAT THIS MODE ISOLATES, AND WHY IT IS NOT "THE HOST-MEDIATED EXTREME"
       for a ~20x reduction in run-to-run spread, and because flipping the
       default re-dates every recorded ``offload`` number (doc 29 §What this
       does not do).
-    - **The shared path builds only where every module is SINGLE-LAUNCH.** At
-      4096 the down-projection is a two-launch ``fused-cast`` and the backend's
-      fixed ``air.insts.bin`` name collides with itself, so the chain builds at
-      1024 and not at this mode's own 4096 gate. Doc 29 §The 4096 wall has the
-      cause; the first blocker is located but the whole fix is not yet scoped.
+    - **The shared path's 4096 wall is down at COMPILE time, pending the
+      install rebuild.** At 4096 the down-projection is a two-launch
+      ``fused-cast``; the backend's fixed ``air.insts.bin`` name used to
+      collide with itself and bounded the chain to 1024. `[2026-08-10]`
+      ``XRTBackend.compile`` now packages a multi-launch xclbin module as its
+      "main" orchestration device -- one kernel, one instruction stream with
+      per-launch ``load_pdi`` embedded, per-launch PDIs merged kernel-less
+      into the partition -- and the five-shape chain builds at 4096 (doc 29
+      §The 4096 wall, dated close-out; fixture
+      ``test/xrt/56_multi_launch_xclbin_compile``). The change lives in
+      ``python/air/backend/xrt.py``, so the RUNTIME sees it only after the
+      coordinated ``install-xrt`` rebuild, and no multi-launch xclbin has yet
+      DISPATCHED on hardware -- the gate stays at 1024 until that phase.
 
 THE TWO ATTENTION MATMULS ARE LINEAR, SO THEY ARE ON THE DEVICE
     `[2026-08-08]` They resolve in no registry — ``sweep_families.py`` derives
@@ -151,7 +159,6 @@ from builders.gemm_spec import resolve_gemm_spec, spec_herd  # noqa: E402
 from opcheck_layer import (  # noqa: E402
     BLOCK_STAGE_ATOL,
     print_dispatch_totals,
-    reconfiguration_delta,
 )
 from opcheck_prepare import _spec_digest  # noqa: E402
 from pattern import EXECUTION_MODE_CSV  # noqa: E402
@@ -828,7 +835,6 @@ def prepare_offload(shape, seed=42):
 
     def dispatch(device_inputs, stage_stats):
         cache.profiler.cpu_times.clear()
-        reconfig_baseline = cache.reconfiguration_counts()
         x, w_q, w_k, w_v, w_o, ln1_weight, w_up, w_down, ln2_weight = device_inputs
 
         vector_rows = []
@@ -902,25 +908,14 @@ def prepare_offload(shape, seed=42):
         # `run_sequence` call per GEMM whether the array is configured once or
         # thirty times. This counts the configurations themselves, so the claim
         # is read off a counter rather than asserted from the build settings.
-        #
-        # The PRINTED line is CUMULATIVE since the cache was built, and must
-        # stay so: run_npu2_offload_peano.lit pins it across the shared
-        # recipe's two dispatches (`context_loads 1 kernel_attaches 4` after
-        # both), which only holds for the cumulative counter. The EXTRA dict
-        # below reports the schema-v2 quantity instead -- what THIS dispatch
-        # loaded and attached (reconfiguration_delta) -- so a warmed results
-        # row carries the steady-state per-layer cost: 30 on the ELF path,
-        # which reloads every context per dispatch, and 0 on the shared path,
-        # whose one configuration stands for the process. On a single cold
-        # dispatch the two numbers coincide, which is why the ELF gate's
-        # `context_loads 30` is both at once.
         loads, attaches = cache.reconfiguration_counts()
         print(
             f"[offload] reconfiguration: context_loads {loads} "
             f"kernel_attaches {attaches} over {cfg['n_dispatches']} dispatches"
         )
         return [boundaries["output"]], {
-            **reconfiguration_delta(cache, reconfig_baseline),
+            "context_loads": loads,
+            "kernel_attaches": attaches,
             # The two schema v1 columns that separate this mode's two packaging
             # paths in a results row. Without them a shared-path CSV is
             # byte-identical to an ELF-path one, and a walk comparing the two
@@ -935,10 +930,10 @@ def prepare_offload(shape, seed=42):
             # 0 against 1 still separates the two paths, and both values are
             # true.
             #
-            # This column is NOT the reconfiguration count. That is the mode's
-            # actual axis, and `[2026-08-10]` schema v2 now has somewhere to
-            # put it: the `context_loads` / `kernel_attaches` delta unpacked
-            # above, alongside the gated cumulative `reconfiguration:` line.
+            # This column is NOT the reconfiguration count. That is 30 against
+            # 1, it is the mode's actual axis, and schema v1 has nowhere to put
+            # it -- adding one is a version bump. `reconfiguration_counts()`
+            # and the gated `reconfiguration:` line carry it meanwhile.
             "unique_xclbins": sum(
                 1
                 for binary in {

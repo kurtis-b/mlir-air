@@ -16,6 +16,7 @@ from air.dialects import air as _air_dialect  # noqa: F401
 
 import numpy as np
 import os
+import glob
 import shutil
 import subprocess
 import time
@@ -293,9 +294,23 @@ class XRTBackend(AirBackend):
 
         with air.ir.Context():
 
+            module_str = str(air_module)
+
             if self.verbose:
                 print("AIR Module:")
-                print(air_module)
+                print(module_str)
+
+            # A module with SEVERAL air.launch ops lowers to one aie.device per
+            # launch plus a "main" orchestration device whose runtime sequence
+            # configures and runs each launch in order. aiecc then produces one
+            # instruction stream and one xclbin PER DEVICE, so a fixed -o/-i
+            # name collides with itself: "edge 'air.insts.bin' produced
+            # duplicate output path". The xclbin case threads {0} templates
+            # through instead and repackages the main device's outputs into the
+            # single-artifact contract below (_finalize_multi_launch_xclbin).
+            # Counted the same way LaunchCounts.from_module does.
+            n_launches = module_str.count("air.launch")
+            multi_launch_xclbin = self.output_format == "xclbin" and n_launches > 1
 
             aircc_options = [
                 "--device",
@@ -311,6 +326,21 @@ class XRTBackend(AirBackend):
             elif self.output_format == "pdi":
                 aircc_options += ["--pdi-name", output_binary]
                 aircc_options += ["-i", insts]
+            elif multi_launch_xclbin:
+                # {0} is aiecc's per-device substitution: the device symbol for
+                # the xclbin edge, "<device>_<sequence>" for the insts edge.
+                # Scoped to the xclbin case ON PURPOSE: this else-branch also
+                # serves txn, and dropping or templating -i unconditionally
+                # would change the artifact contract for every txn caller.
+                insts_base, insts_ext = os.path.splitext(insts)
+                aircc_options += ["-o", f"{output_binary_name}_{{0}}.xclbin"]
+                aircc_options += ["-i", f"{insts_base}.{{0}}{insts_ext}"]
+                # Stale template outputs from a PREVIOUS multi-launch compile in
+                # this directory would defeat the exactly-one globs below.
+                for stale in glob.glob(
+                    f"{insts_base}.*{insts_ext}"
+                ) + glob.glob(f"{output_binary_name}_*.xclbin"):
+                    os.remove(stale)
             else:
                 aircc_options += ["-o", output_binary]
                 aircc_options += ["-i", insts]
@@ -397,7 +427,6 @@ class XRTBackend(AirBackend):
                 print("Running aircc with options:", " ".join(aircc_options))
 
             # Write the in-memory module to the input file expected by aircc
-            module_str = str(air_module)
             with open("air.mlir", "w") as f:
                 f.write(module_str)
 
@@ -414,6 +443,11 @@ class XRTBackend(AirBackend):
             if result.returncode != 0:
                 error_msg = result.stderr if result.stderr else result.stdout
                 raise AirBackendError(f"aircc compilation failed:\n{error_msg}")
+
+            if multi_launch_xclbin:
+                self._finalize_multi_launch_xclbin(
+                    output_binary_name, output_binary, insts
+                )
 
         # For ELF mode, the kernel identifier is "main:instance_name"
         # This is used when loading the ELF via xrt.ext.kernel()
@@ -440,6 +474,297 @@ class XRTBackend(AirBackend):
             elf_kernel = kernel
 
         return XRTCompileArtifact(output_binary, elf_kernel, insts)
+
+    # The 16-byte header every NPU instruction stream starts with, and the
+    # 16-byte load_pdi instruction whose first word is (pdi_id << 16) | 0x0008.
+    # Observed layout of a multi-launch main stream, asserted below rather than
+    # assumed: header, then one (load_pdi, device-sequence body) pair per
+    # configure/run step, with each body byte-identical to that device's own
+    # stream minus its header.
+    _INSTS_HEADER_BYTES = 16
+    _LOAD_PDI_OP_BYTES = 16
+    _LOAD_PDI_OPCODE = 0x0008
+
+    def _finalize_multi_launch_xclbin(
+        self, output_binary_name, output_binary, insts, tmpdir="air_project"
+    ):
+        """Repackage aiecc's per-device outputs into the single-artifact contract.
+
+        A multi-launch module reaches aiecc as N per-launch aie.device ops plus
+        a "main" device whose runtime sequence inlines every launch's DMA
+        program with an aiex.npu.load_pdi between them -- the same orchestration
+        the ELF path packages (there, with --expand-load-pdis) into one ELF. On
+        the xclbin path aiecc writes one xclbin and one instruction stream per
+        device and NOTHING combines them: the main xclbin's AIE_PARTITION holds
+        only the main device's (empty) PDI, while the main stream's load_pdi
+        instructions reference the per-launch PDIs by an id no partition entry
+        carries. This method finishes the packaging:
+
+        1. picks the main device's xclbin and instruction stream;
+        2. walks the main stream, matching each embedded device body to its own
+           per-device stream to recover which load_pdi id names which device;
+        3. renumbers those ids to values unique within the (possibly chained)
+           partition -- aiecc numbers devices 1..N per compile, so two
+           multi-launch kernels chained into one xclbin would otherwise collide,
+           and single-launch chain links already occupy pdi_id 0x1;
+        4. merges the per-launch PDIs into the main xclbin's AIE_PARTITION as
+           kernel-less entries under the renumbered ids (the kernel keeps
+           routing to the main PDI via dpu_kernel_ids; the others are reachable
+           only through load_pdi);
+        5. renames the finished pair to the names the caller asked for, so the
+           XRTCompileArtifact contract (one binary, one kernel, one insts file)
+           is unchanged and load()/attach_kernel()/the shared-xclbin chain need
+           no knowledge that the module had several launches.
+
+        Every layout assumption is asserted; a violation raises with the
+        evidence rather than packaging a stream this method does not understand.
+
+        NOTE on validation status: the compiled artifact executes its load_pdi
+        instructions in the DPU stream (opcode 0x8) against partition-resident
+        PDIs. That is aiecc's default lowering for multi-device xclbin modules,
+        but this tree has not yet run such an artifact on hardware -- the
+        hardware gate is a separate phase.
+        """
+        import glob
+        import json
+        import struct
+        import tempfile
+        import uuid
+
+        insts_base, insts_ext = os.path.splitext(insts)
+
+        main_xclbin = f"{output_binary_name}_main.xclbin"
+        if not os.path.isfile(main_xclbin):
+            raise AirBackendError(
+                f"multi-launch xclbin packaging: expected aiecc to write "
+                f"'{main_xclbin}' for the main orchestration device, found: "
+                f"{sorted(glob.glob(f'{output_binary_name}_*.xclbin'))}"
+            )
+
+        stream_files = sorted(glob.glob(f"{insts_base}.*{insts_ext}"))
+
+        def _middle(path):
+            # "<insts_base>.<device>_<sequence><insts_ext>" -> "<device>_<sequence>"
+            name = os.path.basename(path)
+            prefix = os.path.basename(insts_base) + "."
+            return name[len(prefix) : len(name) - len(insts_ext)]
+
+        # Device names come from THIS run's per-device xclbins -- the compile
+        # pre-cleans '{output_binary_name}_*.xclbin' before aircc, so unlike
+        # aircc's tmpdir (which a chained build reuses across links, and whose
+        # partition JSON names differ between the fresh and the xclbin_input
+        # case) the set is exactly this module's devices. Match each
+        # instruction stream to its device ({0} on the insts edge is
+        # "<device>_<sequence>"), longest device name first so one name being
+        # a prefix of another cannot mis-attribute a stream.
+        device_names = sorted(
+            (
+                os.path.basename(p)[
+                    len(f"{os.path.basename(output_binary_name)}_") : -len(".xclbin")
+                ]
+                for p in glob.glob(f"{output_binary_name}_*.xclbin")
+            ),
+            key=len,
+            reverse=True,
+        )
+        streams_by_device = {}
+        for f in stream_files:
+            middle = _middle(f)
+            device = next(
+                (d for d in device_names if middle.startswith(d + "_")), None
+            )
+            if device is None:
+                raise AirBackendError(
+                    f"multi-launch xclbin packaging: instruction stream '{f}' "
+                    f"matches no device in {sorted(device_names)}"
+                )
+            if device in streams_by_device:
+                raise AirBackendError(
+                    f"multi-launch xclbin packaging: device '{device}' has two "
+                    f"instruction streams ({streams_by_device[device]!r} and "
+                    f"{f!r}); one runtime sequence per device is assumed."
+                )
+            streams_by_device[device] = f
+        if "main" not in streams_by_device:
+            raise AirBackendError(
+                f"multi-launch xclbin packaging: no instruction stream for the "
+                f"main orchestration device among {stream_files}"
+            )
+        main_stream_file = streams_by_device.pop("main")
+        device_stream_files = list(streams_by_device.values())
+        bodies = {}
+        for device, f in streams_by_device.items():
+            with open(f, "rb") as fh:
+                bodies[device] = fh.read()[self._INSTS_HEADER_BYTES :]
+
+        # Walk the main stream: header, then (load_pdi, body) pairs. Recover
+        # the load_pdi id for each device and record each op's byte offset so
+        # the renumbering below patches exactly the words it understood.
+        with open(main_stream_file, "rb") as fh:
+            main_bytes = bytearray(fh.read())
+        pos = self._INSTS_HEADER_BYTES
+        device_ids = {}  # device -> id aiecc assigned
+        op_offsets = []  # (byte offset of load_pdi word, device)
+        while pos < len(main_bytes):
+            (opword,) = struct.unpack_from("<I", main_bytes, pos)
+            if opword & 0xFFFF != self._LOAD_PDI_OPCODE:
+                raise AirBackendError(
+                    f"multi-launch xclbin packaging: expected a load_pdi "
+                    f"instruction at byte {pos} of '{main_stream_file}', got "
+                    f"word 0x{opword:08x}. The stream layout this packaging "
+                    f"understands is header + (load_pdi + device body)*."
+                )
+            body_start = pos + self._LOAD_PDI_OP_BYTES
+            device = next(
+                (
+                    d
+                    for d, b in bodies.items()
+                    if main_bytes[body_start : body_start + len(b)] == b
+                ),
+                None,
+            )
+            if device is None:
+                raise AirBackendError(
+                    f"multi-launch xclbin packaging: no per-device stream "
+                    f"matches the body at byte {body_start} of "
+                    f"'{main_stream_file}' (devices: {sorted(bodies)})."
+                )
+            assigned = opword >> 16
+            if device_ids.setdefault(device, assigned) != assigned:
+                raise AirBackendError(
+                    f"multi-launch xclbin packaging: device '{device}' is "
+                    f"loaded under two different pdi ids "
+                    f"({device_ids[device]} and {assigned})."
+                )
+            op_offsets.append((pos, device))
+            pos = body_start + len(bodies[device])
+
+        # Renumber. aiecc assigns 1..N per compile; chained into a shared
+        # xclbin those collide with other links (single-launch links' PDIs sit
+        # at pdi_id 0x1, a second multi-launch link would reuse 1..N). The
+        # kernel id is distinct per chain link by construction (the shared
+        # chain validates it), so it seeds ids unique across links.
+        base = (int(self.kernel_id, 16) << 4) & 0xFFFF if self.kernel_id else 0x40
+        new_ids = {
+            device: base + k for k, device in enumerate(sorted(device_ids), start=1)
+        }
+        for offset, device in op_offsets:
+            struct.pack_into(
+                "<I",
+                main_bytes,
+                offset,
+                (new_ids[device] << 16) | self._LOAD_PDI_OPCODE,
+            )
+
+        # Merge the per-launch PDIs into the main xclbin's partition under the
+        # renumbered ids. Done via dump + add-replace-section so a chained
+        # xclbin_input's already-merged PDIs survive untouched.
+        xclbinutil = shutil.which("xclbinutil") or "/opt/xilinx/xrt/bin/xclbinutil"
+        workdir = tempfile.mkdtemp(prefix="multi_launch_pack_", dir=tmpdir)
+        dump_json = os.path.join(workdir, "partition.json")
+        dump = subprocess.run(
+            [
+                xclbinutil,
+                "--input",
+                os.path.abspath(main_xclbin),
+                "--dump-section",
+                f"AIE_PARTITION:JSON:{os.path.basename(dump_json)}",
+                "--force",
+            ],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+        )
+        if dump.returncode != 0:
+            raise AirBackendError(
+                f"multi-launch xclbin packaging: xclbinutil could not dump "
+                f"AIE_PARTITION from '{main_xclbin}':\n{dump.stderr or dump.stdout}"
+            )
+        with open(dump_json) as fh:
+            partition = json.load(fh)
+        pdis = partition["aie_partition"]["PDIs"]
+        existing = {
+            int(group["pdi_id"], 16)
+            for entry in pdis
+            for group in entry["cdo_groups"]
+        }
+        for device, new_id in sorted(new_ids.items()):
+            if new_id in existing:
+                raise AirBackendError(
+                    f"multi-launch xclbin packaging: renumbered pdi id "
+                    f"0x{new_id:x} for device '{device}' already exists in the "
+                    f"partition ({sorted(hex(i) for i in existing)}). Give this "
+                    f"compile a different kernel_id."
+                )
+            pdi_file = os.path.abspath(os.path.join(tmpdir, f"{device}.pdi"))
+            if not os.path.isfile(pdi_file):
+                raise AirBackendError(
+                    f"multi-launch xclbin packaging: no PDI for device "
+                    f"'{device}' at '{pdi_file}'."
+                )
+            pdis.append(
+                {
+                    "uuid": str(uuid.uuid4()),
+                    "file_name": pdi_file,
+                    "cdo_groups": [
+                        {
+                            "name": "DPU",
+                            "type": "PRIMARY",
+                            "pdi_id": hex(new_id),
+                            # No dpu_kernel_ids: nothing routes here at context
+                            # creation; the PDI is reachable only through the
+                            # stream's load_pdi. Claiming the kernel id would
+                            # recreate the duplicate-kernel-id failure the
+                            # shared-xclbin chain validates against.
+                            "dpu_kernel_ids": [],
+                            "pre_cdo_groups": ["0xC1"],
+                        }
+                    ],
+                }
+            )
+        merged_json = os.path.join(workdir, "merged.json")
+        with open(merged_json, "w") as fh:
+            json.dump(partition, fh, indent=1)
+        merge = subprocess.run(
+            [
+                xclbinutil,
+                "--input",
+                os.path.abspath(main_xclbin),
+                "--add-replace-section",
+                f"AIE_PARTITION:JSON:{os.path.basename(merged_json)}",
+                "--force",
+                "--output",
+                os.path.abspath(output_binary),
+            ],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+        )
+        if merge.returncode != 0:
+            raise AirBackendError(
+                f"multi-launch xclbin packaging: xclbinutil could not merge the "
+                f"per-launch PDIs into '{output_binary}':\n"
+                f"{merge.stderr or merge.stdout}"
+            )
+        shutil.rmtree(workdir, ignore_errors=True)
+
+        with open(insts, "wb") as fh:
+            fh.write(main_bytes)
+
+        # Drop the per-device intermediates so a later compile in this
+        # directory (the shared chain reuses one cwd) cannot glob them up.
+        for stale in device_stream_files + [main_stream_file]:
+            os.remove(stale)
+        for stale in glob.glob(f"{output_binary_name}_*.xclbin"):
+            os.remove(stale)
+
+        if self.verbose:
+            print(
+                f"multi-launch xclbin packaging: '{output_binary}' holds "
+                f"{len(pdis)} PDIs; per-launch ids "
+                f"{ {d: hex(i) for d, i in sorted(new_ids.items())} } "
+                f"embedded in '{insts}'."
+            )
 
     def compile_from_torch_mlir(
         self,

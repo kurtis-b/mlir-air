@@ -203,10 +203,7 @@ it is specific to the small shape. Nothing in hand separates them.
 `prepare_offload` already measures `device_ms`, `sync_ms` and `host_cpu_ms` per
 run and returns all three in its `extra` dict — and `run_mode.py` reads none of
 them, while schema v1 has **no column for any of them**. So the decomposition is
-computed and thrown away on every rung the study has ever walked.
-**`[2026-08-10]` Closed — schema v2 persists all three plus the reconfiguration
-counters** (`eeb37a19`); the ~17–21 ms attribution this section asks for is now
-one walk away rather than a schema change away. Unlike
+computed and thrown away on every rung the study has ever walked. Unlike
 `npu_unique_xclbin_count`, which was already a v1 column waiting to be filled,
 adding these is a **schema version bump** (`schema.py:53`), which is why it is
 recorded here rather than done in passing. With them persisted, the ~17–21 ms is
@@ -323,6 +320,60 @@ every xclbin and txn caller in the tree. Scope the change to per-launch naming
 within the xclbin case, and give it backend-level tests — a two-launch module
 compiled to xclbin is the fixture, and it does not exist today, which is why
 this shipped broken.
+
+#### `[2026-08-10]` The wall is down at COMPILE time — and the rename was a third of the fix
+
+The five-shape chain now **builds at 4096**: one shared xclbin holding all
+five kernels (`matmul_bf16_{proj,up,attn_scores,attn_output}` +
+`gemm_cast_bf16_down`), verified by dumping the final `AIE_PARTITION` — seven
+PDIs, five kernel-owning. The change is confined to
+`XRTBackend.compile`/`_finalize_multi_launch_xclbin` in
+`python/air/backend/xrt.py`, takes effect only when the module has more than
+one `air.launch` AND `output_format == "xclbin"`, and needed **three** pieces,
+of which the doc's predicted rename was only the first:
+
+1. **The rename is a `{0}` template, not a name.** aiecc's `--npu-insts-name`
+   and `--xclbin-name` accept a per-device `{0}` substitution; the fixed name
+   collides because a two-launch module reaches aiecc as **three**
+   `aie.device` ops — one per launch plus a `main` orchestration device whose
+   runtime sequence inlines every launch's DMA program with an
+   `aiex.npu.load_pdi` between them. That main device IS the ELF path's
+   combined-stream mechanism, already generated in xclbin mode; the xclbin
+   path just discarded it.
+2. **The artifact is the main device's pair, repackaged.** One kernel, one
+   instruction stream, one xclbin — `XRTCompileArtifact`, `load()`,
+   `attach_kernel`, `sync_instruction_bos` and the dispatch loop are all
+   untouched, because the multi-launch execution lives INSIDE the one stream
+   exactly as it does inside an ELF.
+3. **aiecc leaves the main xclbin unexecutable, so the backend finishes the
+   packaging.** The main partition as emitted holds only the (empty) main PDI
+   while the stream's `load_pdi` words reference the per-launch PDIs by ids no
+   partition entry carries — and those ids restart at 1 per compile, so two
+   chained multi-launch kernels would collide, and single-launch links already
+   sit at `pdi_id 0x1`. The backend walks the stream (header + per-launch
+   bodies, each byte-identical to that device's own stream), renumbers the ids
+   off the link's `kernel_id` (`0x903 → 0x9031, 0x9032`), patches the words,
+   and merges the per-launch PDIs into the partition as **kernel-less** entries
+   via `xclbinutil --add-replace-section`. Every layout assumption raises with
+   evidence when violated. aiecc's own `--xclbin-input` merge on the two
+   subsequent chain links accepted the kernel-less entries.
+
+The fixture the last paragraph asked for exists:
+`test/xrt/56_multi_launch_xclbin_compile` (compile-only, two-launch, checks
+the partition/stream/id agreement). Verified in the failing direction: on the
+unpatched backend it dies on the duplicate-output-path error this section
+documents.
+
+**What this does NOT establish: hardware.** The artifact executes in-stream
+`load_pdi` (opcode `0x8`) against partition-resident PDIs — aiecc's default
+lowering for multi-device xclbin, but never yet dispatched by this tree. The
+alternative if hardware balks: `--expand-load-pdis` also completes in xclbin
+mode (measured: the main stream grows 19 KB → 174 KB, embedding the config as
+writes — the exact content the ELF gate validates at 4096), but aircc only
+passes that flag on its ELF branch, so it needs an aircc change. Both paths
+still need everything in item 3. The install-rebuild + ten-model regression
+phase this section already scoped is unchanged, and the shared recipe's 1024
+pin can only move to 4096 after the hardware gate passes.
 
 ## What this does not do
 
