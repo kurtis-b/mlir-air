@@ -144,7 +144,8 @@ lost.
 whole-channel-after-whole-channel against a consumer ring built for per-iteration interleave, which
 past one trip is **silently wrong data**. The untransformed program is the broken one.
 
-The pass currently contains **zero** diagnostics on any decline path. Proposal, unclaimed:
+~~The pass currently contains **zero** diagnostics on any decline path.~~ Proposal, ~~unclaimed~~
+**DONE `[2026-08-10]`**:
 
 > When it leaves two or more same-bounds packet put loops unfused **and the trip count exceeds
 > one**, warn — naming the loop, the channels and the trip count.
@@ -154,6 +155,15 @@ grouping key). Not unconditional: at one trip the orders coincide and the unfuse
 so an unconditional diagnostic would fire on most shipped designs. Not an error either, because the
 pass cannot establish that the group's channels share a queue before placement —
 `aie.shim_dma_allocation` does not exist until `air-to-aie`.
+
+**Implemented as specified**, as a post-transform scan in the pass (`warnUnfusedGroups`,
+`AIRDependencyScheduleOpt.cpp`): whatever candidate shape remains after the transform was declined,
+so the scan re-groups remaining same-bounds candidates per block — covering the dominance decline,
+sealed group splits, *and* candidates inside a wrapper `scf.parallel` the expansion declined,
+while excluding herd/segment bodies the pass does not own. The warning names the channels and trip
+count and notes each sibling loop; one-trip declines and different-bounds pairs are verified
+silent. `fuse_packet_put_loops_decline_warns.mlir`, four cases under `-verify-diagnostics`, both
+lit tests green.
 
 ## Open items nobody has claimed
 

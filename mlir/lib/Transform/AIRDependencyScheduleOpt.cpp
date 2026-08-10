@@ -5039,6 +5039,59 @@ public:
     return true;
   }
 
+  // Declining to fuse is not neutral for THIS pass, so a decline is loud.
+  // The skip-and-warn convention (H1s) was settled for ping-pong labelling
+  // because declining there leaves a correct single-buffered loop; here the
+  // untransformed program is the broken one: past one trip, unfused
+  // same-bounds put loops deliver whole channels back to back against a
+  // consumer ring built for per-iteration interleave -- silently wrong data
+  // whenever the channels share a packet queue. Whether they share one is
+  // unknowable at this altitude (aie.shim_dma_allocation does not exist
+  // until air-to-aie), so this warns and never errors; and the one-trip
+  // shape stays silent, since with a single iteration the whole-channel and
+  // per-iteration orders coincide and the unfused form is correct.
+  void warnUnfusedGroups(Block *blk) {
+    SmallVector<std::pair<SmallVector<int64_t, 3>, SmallVector<scf::ForOp>>>
+        remaining;
+    for (auto &op : *blk) {
+      SmallVector<int64_t, 3> key;
+      auto forOp = dyn_cast<scf::ForOp>(&op);
+      if (!forOp || !isCandidate(forOp, key))
+        continue;
+      auto *grp =
+          llvm::find_if(remaining, [&](auto &g) { return g.first == key; });
+      if (grp == remaining.end())
+        remaining.push_back({key, {forOp}});
+      else
+        grp->second.push_back(forOp);
+    }
+    for (auto &[key, loops] : remaining) {
+      if (loops.size() < 2 || key[2] <= 0)
+        continue;
+      int64_t trips = (key[1] - key[0] + key[2] - 1) / key[2];
+      if (trips <= 1)
+        continue;
+      SmallVector<StringRef> chans;
+      for (auto l : loops)
+        for (auto &bodyOp : l.getBody()->without_terminator())
+          if (auto put = dyn_cast<air::ChannelPutOp>(&bodyOp))
+            chans.push_back(put.getChanName());
+      InFlightDiagnostic diag = loops.front()->emitWarning();
+      diag << loops.size()
+           << " same-bounds packet put loops left unfused at trip count "
+           << trips << " (channels: ";
+      llvm::interleaveComma(chans, diag);
+      diag << "): if these channels share a packet queue after placement, "
+              "the puts run whole-channel-after-whole-channel against a "
+              "consumer expecting per-iteration interleave, which is wrong "
+              "data past the first trip. Restructure so the group is "
+              "consecutive with results used only after its last loop, or "
+              "take the operands off the packet path.";
+      for (auto l : llvm::drop_begin(loops))
+        diag.attachNote(l.getLoc()) << "unfused sibling put loop here";
+    }
+  }
+
   void runOnOperation() override {
     auto module = getOperation();
     OpBuilder builder(module.getContext());
@@ -5056,6 +5109,22 @@ public:
         (void)expandParallelOfPacketPutLoops(par, builder);
       runOnBlock(b, builder);
     }
+    // Post-transform: whatever candidate shape remains was declined, so scan
+    // for the hazard and say so. The walk covers launch scope INCLUDING the
+    // body of any wrapper scf.parallel the expansion declined (its loops
+    // never became block siblings, but they hold the same hazard), and
+    // excludes herd/segment bodies, which this pass does not own.
+    module.walk([&](air::LaunchOp l) {
+      llvm::SmallSetVector<Block *, 8> seen;
+      l.walk([&](scf::ForOp f) {
+        if (f->getParentOfType<air::HerdOp>() ||
+            f->getParentOfType<air::SegmentOp>())
+          return;
+        seen.insert(f->getBlock());
+      });
+      for (auto *b : seen)
+        warnUnfusedGroups(b);
+    });
   }
 };
 
