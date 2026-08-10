@@ -219,16 +219,23 @@ and marked non-comparable.
 The general lesson is doc 16's, one layer over: when a mode is rebuilt, the *gate* gets updated
 because it fails otherwise. Nothing fails when a catalogue comment goes stale.
 
-**2. `run_npu2_runlist_gate.lit`'s latency clause has no margin, and the suite can now trip it.**
-Its leg A passes only if `agg_ms < seq_ms` — a strict inequality with no tolerance. In the
-30-test suite (28 before these two cells) it failed at `sequential 25.191 ms / runlist 25.277 ms`,
-**saved -87 µs, 0.9966×**, while its three bit-identical checks all passed. The discriminating test
-from [23 §One process per device measurement](23-rules-and-open-items.md) — the isolated re-run —
-**passes**. So this is contention, not a regression: the two new full-layer tests add compile load
-beside a timed region that has no headroom to absorb it.
+**2. `run_npu2_runlist_gate.lit`'s latency clause has no margin, and it is now INTERMITTENT.**
+Its leg A passes only if `agg_ms < seq_ms` — a strict inequality with no tolerance. In one 30-test
+suite run (28 tests before these two cells) it failed at `sequential 25.191 ms / runlist 25.277 ms`,
+**saved -87 µs, 0.9966×**, while its three bit-identical checks all passed.
+
+**Three runs of the same code disagree, which is the whole finding:** red in that suite run, green
+on the isolated re-run (31 s), green again in a second full 30-test suite on the committed tree
+(**30/30**, 541 s). The discriminating test from [23 §One process per device
+measurement](23-rules-and-open-items.md) is the isolated re-run, and it passes — so this is
+contention rather than a regression, and it is *occasional* contention rather than a new steady
+state. Do not read a single red here as "the cells broke the seam gate"; do not read a single green
+as "it is fine" either.
 
 **The criterion was NOT widened.** Doc 05a measured the real effect at 1.02–1.15×, so the clause is
 sound and its margin is the problem, not its claim. Recorded here rather than papered over; whoever
 picks it up should decide between a stated margin, a serialized recipe, or leaving it and knowing
 that a full-suite red on this one clause is a scheduling artefact until an isolated re-run says
 otherwise.
+
+**The suite's standing state on the committed tree is 30/30** (`b795deb1`, 541 s).
