@@ -134,6 +134,118 @@ Its two load-bearing errors, for anyone reconciling a downstream document agains
 minimizes reconfiguration, and it makes `coarse` a point of its own — "one runlist over few fused
 kernels" — rather than the per-workload blend of `runlist` and `fused` the author defines.
 
+## `[2026-08-10]` The vocabulary — one term per level, and where the spectrum sits among the axes
+
+Recorded by the study's author. Two kinds of drift had accumulated: "dispatch" had come to name
+two different levels of the execution hierarchy — harmless in `offload`, where they coincide at
+30/30, and load-bearing in `coarse`, where they are 4 and 131 — and "fused" names both a
+mechanism the tree has (`stitch_elf`) and an aspiration it does not (operators resident on the
+array), which is why every description of `fused`-the-mode has needed a footnote about DRAM
+round-trips. This section fixes the terms and places the two-cost spectrum among the other axes
+an execution strategy has.
+
+### The execution hierarchy
+
+One term per level, each tied to the counter that measures it. The runtime half of these
+definitions already exists as written text — `DispatchVector`'s docstring
+(`llms/shared/infra/dispatch.py:121-153`), whose "equals the number of dispatch steps" for
+`runlist_entries` is the pin this table ratifies rather than competes with.
+
+| Term | Definition | Instrument |
+|---|---|---|
+| **configuration** | one array state; loading one is a **reconfiguration** | `context_loads` / `kernel_attaches` — instrumented and gated for `offload` only ([29](29-offload-n-streams.md)) |
+| **artifact** | one compiled, loadable unit — an ELF or an xclbin; one aircc invocation | the SPECS catalogue row |
+| **submission** | one host→device handoff, and the host's completion-wait granularity. A runlist counts as one whatever it holds | `host_submissions` |
+| **dispatch** | one `xrt.run` — one kernel invocation. ≡ *runlist entry*, and **never** the submission | `runlist_entries` |
+| **launch** | one `air.launch` op in a compiled module; counted once per distinct artifact (a compile-time property) | `air_launches` |
+| **herd launch** | one `air.herd` executed; accumulates per dispatch | `herd_launches` |
+| **data sync** | one `bo.sync()`, either direction, with its bytes | `sync_boundaries`, `bytes_transferred` |
+
+**Control sync and data sync are different events, and the vector already separates them.** A
+submission's completion wait is a *control* sync, counted by `host_submissions`; a `bo.sync()`
+is a *data* sync, counted by `sync_boundaries`. That distinction — not the raw counts — is what
+reconciles `offload` having the fewest counted syncs at 4096 (90, against `runlist`'s 451)
+while being the most synchronization-bound mode: each of its 90 sits on the critical path with
+host compute between submissions, where `runlist`'s 451 are dominated by dispatches chained
+inside 17 submissions.
+
+### Composition — packaged against resident
+
+"Fusion" was doing double duty. Split by mechanism:
+
+| Term | Mechanism | What it collapses |
+|---|---|---|
+| **packaged** | what the code calls *stitched*: sub-kernel IRs spliced into one multi-launch module before compilation (`stitch_elf`, `shared/infra/stitching.py:318`) — one artifact, one configuration, hand-offs still crossing DRAM through the function's L3 arguments | submissions, dispatches, reconfigurations |
+| **resident** | operators on the array **simultaneously**, hand-offs L1→L1 | bytes |
+
+`fused`-the-mode becomes one line instead of a recurring footnote: **packaged today, resident
+by definition.** Its 42.5 MB against `coarse`'s 44.0 at 1024 ([27](27-common-ladder-result.md))
+is a *packaged* result; the resident result does not exist and is capacity-bounded (§What is
+implemented, above).
+
+### AIE role style — named by the multiplexing dimension
+
+"Homogeneous per operator" is true at any instant and false across the run, which made it a
+poor name. Name what is being multiplexed instead:
+
+| Term | Supersedes | Meaning | Discriminator |
+|---|---|---|---|
+| **single-function** | homogeneous | the array only ever runs one kernel family; operator diversity is the host's problem | one kernel family per mode |
+| **time-multiplexed** | homogeneous per operator | the array is wholly re-purposed, operator by operator | **zero** core→core `aie.flow` ops |
+| **space-multiplexed** | heterogeneous, dataflow | tiles differentiated into concurrent stages, hand-offs L1→L1 | ≥ stage-count core→core flows |
+
+Nothing in the dispatch vector measures this axis; the one instrument the tree has is
+`norm_tail_structure.py`'s flow count — exactly 16 core→core at `herd_x = 8`
+([23 §5](23-rules-and-open-items.md)). The only space-multiplexed designs in the tree are J7a's
+norm-tail pipeline and J7b's accumulator ring, both standalone gates; **no mode's SPECS row
+dispatches either.**
+
+### The axes — three knobs, three costs
+
+The author's extension of the axis list: alongside reconfiguration and off-chip traffic sit
+NPU-side graph coverage, host↔NPU synchronization, AIE role style and the execution boundary.
+They are not six independent dimensions — three are knobs a builder chooses, three are costs
+the choices induce:
+
+| Kind | Axis | Instrument |
+|---|---|---|
+| knob | **graph coverage** — which operators run NPU-side | `study/test_attention_path.py`, which asserts all-device across every mode |
+| knob | **execution boundary** — where artifact and submission seams sit | `host_submissions` / `runlist_entries` / `air_launches` / `herd_launches` |
+| knob | **AIE role style** | core→core flow count; structural checks only |
+| cost | **reconfiguration** | `context_loads` / `kernel_attaches` (`offload`'s gate only) |
+| cost | **off-chip traffic** | `bytes_transferred` |
+| cost | **synchronization** | `sync_boundaries`; the ms decomposition (`device_ms` / `sync_ms` / `host_cpu_ms`) is measured on every rung and **discarded** — schema v1 has no column for it, README queue item 2 |
+
+The corrected taxonomy is a two-**cost** spectrum with the knobs pinned. Coverage was equalized
+across three modes by the 2026-08-08/09 rebuilds — which is what retired `attention_path` — and
+`offload`'s partial coverage is definitional *and instrumental*: restricting the NPU to linear
+operators is what lets one configuration cover its whole graph. Role style is single-function
+or time-multiplexed in every gated row. The execution boundary is the mechanism knob: the
+superseded table above ordered the modes by it, and the correction demoted it from *what the
+modes isolate* to *what induces the costs*.
+
+### The four modes, restated
+
+| | artifacts | submissions | dispatches | composition | role style |
+|---|---|---|---|---|---|
+| `runlist` | one ELF per operator instance | 17 | 427 @4096 · 139 @1024 | none — fully decomposed | time-multiplexed |
+| `offload` | 5 ELFs, or 1 xclbin on the shared path | 30 | 30 | none on the device — the host stitches the graph | single-function |
+| `coarse` (C1) | 5 | 4 | 131 @4096 | packaged front, banded tail | time-multiplexed |
+| `fused` | 3 | 1 | 3 | packaged — resident by definition | time-multiplexed — space-multiplexed by definition |
+
+Sources: the README status board and [27](27-common-ladder-result.md) for `runlist` and
+`offload`; the re-measured D2 vector (§The dispatch vector, below) for `coarse`;
+[26 §6](26-mode-rebuild-feasibility.md)'s repair-run vector for `fused`'s structural counts.
+Reconfiguration counts exist for `offload` alone; the ELF-path modes' context loads are
+uninstrumented.
+
+**Reading the historical documents against this section:** "stitched" reads as *packaged*;
+"homogeneous per operator" as *time-multiplexed*; "heterogeneous" and "dataflow" as
+*space-multiplexed*; an unqualified "dispatches" resolves by its number (`offload`'s "30
+dispatches" is both levels at once; the banded `addnorm`'s "64 dispatches" are dispatches
+inside one submission). The historical documents are deliberately not rewritten — the same
+policy as the superseded-taxonomy note above.
+
 ## Why a single dispatch count does not work
 
 `[Codex]` iron records `npu_dispatch_count`. That metric does not exist in MLIR-AIR, and

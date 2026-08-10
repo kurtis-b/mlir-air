@@ -12,6 +12,28 @@ not need and this mode deliberately does not reproduce.
 The CSV `execution_mode` value is `fused_elf`, mapped in one place
 (`pattern/__init__.py::EXECUTION_MODE_CSV`).
 
+> **`[2026-08-10]` The measured rows below are 4096-era and are withdrawn as comparisons; the
+> mode now gates at 1024.** The SPECS row moved 4096 → 1024 on 2026-08-08 — the stitched tail's
+> `plane_major` packing exceeds the shim `aie.dma_bd` cap above 1365 rows, so the 4096 build
+> raises before aircc
+> ([26 §6](../../../../docs/plans/transformer-layer-execution-studies/26-mode-rebuild-feasibility.md)).
+> The repair run's vector at 1024 is `submissions 1 entries 3 air 11 herd 23 sync 19 bytes
+> 56626176` (the down-projection resolves to `drain` there, so the tail takes 11 whole-tensor
+> args instead of 16), and its numerics are `mean_rel_L1` 1.756e-2 at `atol_required` 5.813e-2 —
+> a 1.72× margin, not §Numerics' 1.27×. The §What it measures row (1/3/16/24/19/184,025,088) and
+> every comparison it makes against `coarse`'s 402-boundary figures are **suspended, not
+> restated**: the two SPECS rows now sit at different lengths. Build cross-mode tables from a
+> ladder run
+> ([27](../../../../docs/plans/transformer-layer-execution-studies/27-common-ladder-result.md)),
+> never from this file. The structure — three ELFs, three dispatches, one submission — is
+> unchanged and current.
+>
+> **One unreconciled pair, recorded rather than averaged:** at the same 1024, the 2026-08-09
+> ladder reads `sync 13 / bytes 42,467,328` against the repair run's `19 / 56,626,176`.
+> Candidate mechanism, unmeasured: the gate's per-boundary verification readbacks sit inside its
+> measured sequence and the ladder's production dispatch omits them. Do not quote either pair as
+> the mode's vector without a fresh run.
+
 ## What this mode isolates
 
 The removal of *intermediate host synchronization*, which is what MLIR-level
@@ -140,6 +162,12 @@ statistics: was 1.806e-2 at `atol_required` 7.572e-2, a 1.32x margin. Worth
 noting that the mean improved while the margin **tightened** — `mean_rel_L1`
 is an average and `atol_required` is a worst-element statistic, so they move
 independently, and this mode has the least room of the four either way.
+
+`[2026-08-10]` Superseded at the mode's current length: the 1024 repair run
+measures `mean_rel_L1` 1.756e-2 at `atol_required` 5.813e-2 — a 1.72× margin
+(banner above). The 1.784e-2 / 7.896e-2 / 1.27× here is the 4096-era figure
+and survives as cell C2's
+([30](../../../../docs/plans/transformer-layer-execution-studies/30-coarse-cells-built.md)).
 
 ## What it costs
 

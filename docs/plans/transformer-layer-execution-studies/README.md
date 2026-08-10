@@ -16,7 +16,7 @@ how to use MLIR-AIR.
 | [00-context-and-goals.md](00-context-and-goals.md) | Why this port, what is being ported, success criteria |
 | [01-port-inventory.md](01-port-inventory.md) | Per-artifact triage: port / adapt / rewrite / drop |
 | [02-porting-conventions.md](02-porting-conventions.md) | **How iron code is refactored into MLIR-AIR house style.** Reviewable checklist |
-| [03-measurement-model.md](03-measurement-model.md) | **The definition of the four modes, and it is current.** The corrected taxonomy (reconfiguration cost against DRAM traffic), what is implemented against it today, the dispatch vector, CSV schema v1 |
+| [03-measurement-model.md](03-measurement-model.md) | **The definition of the four modes, and it is current.** The corrected taxonomy (reconfiguration cost against DRAM traffic), what is implemented against it today, the dispatch vector, CSV schema v1 — and `[2026-08-10]` **§The vocabulary**: the standard terms (submission against dispatch, packaged against resident composition, the role-style names) and the knobs-and-costs axis map |
 | [04-phase-a-kernels.md](04-phase-a-kernels.md) | AIE2P device kernels |
 | [05-phase-b-runtime-seam.md](05-phase-b-runtime-seam.md) | Runlist aggregation + BO liveness pooling |
 | [06-phase-c-operators.md](06-phase-c-operators.md) | The six new operators as AIR builders — **overview**; the four sub-phase specs are [06a](06a-phase-c1-gate-and-small-operators.md) · [06b](06b-phase-c2-qkv-proj-and-ffn.md) · [06c](06c-phase-c3-mha-out-proj.md) · [06d](06d-phase-c4-coverage-sweep.md) |
@@ -107,7 +107,9 @@ them — so a sentence you find here may be marked false three paragraphs later.
 Nothing in it blocks anything else in it except where stated.
 
 **Read in this order.** [03 §The taxonomy](03-measurement-model.md) for what the four modes mean —
-that is the definition and it is current. Then this section. Then
+that is the definition and it is current — and its `[2026-08-10]` §The vocabulary, which fixes the
+terms this directory uses (submission against dispatch, packaged against resident, the role-style
+names) and says which axes are knobs and which are costs. Then this section. Then
 [23](23-rules-and-open-items.md) for the design rules that govern anything you build — the
 per-column shim budget and the L3-side offset rule are the two that have cost sessions.
 [26](26-mode-rebuild-feasibility.md) is the feasibility record and is worth reading *for its
@@ -589,7 +591,7 @@ Two decisions taken on 2026-08-04, now reflected throughout these documents:
 | How many concurrent `hw_context`s does NPU2 grant? | 32 (33 fails with `DRM_IOCTL_AMDXDNA_CREATE_HWCTX err=-2`). Phase E's `runlist` mode wants 29 — fits, with three to spare. Caveats on the margin recorded. | [08 §Risks](08-phase-e-execution-strategies.md) |
 | Does a full layer survive the real runtime path? | Yes. One `encoder_bert` layer at `baseline_768`, `seq 4096`, matches an FP32 torch oracle over its whole 4096×768 output with zero mismatches, and localizes to any of ten per-boundary intermediates. | [07b](07b-phase-d2-block-integration.md) |
 | Can the whole sequence ladder be built? | **Yes**, since E1 made the `(method, tile_n)` naming fix in `llms/shared/builders/gemm_builder.py`. The symbol- and object-level collisions that pinned everything to `seq = 4096` are closed. | [08](08-phase-e-execution-strategies.md) |
-| Is there tolerance headroom for four modes? | Thin but sufficient, and it did not shrink when attention moved on-device. Measured at the layer output against the hard `1e-1` ceiling: `offload` 1.73×, `runlist` 1.43×, `block` 1.35×, `fused` 1.27× (at 1024). **No tolerance has been widened for any mode.** | [07b](07b-phase-d2-block-integration.md) |
+| Is there tolerance headroom for four modes? | Thin but sufficient, and it did not shrink when attention moved on-device. Measured at the layer output against the hard `1e-1` ceiling: `offload` 1.73×, `runlist` 1.43×, `block` 1.35×, `fused` ~~1.27× (at 1024)~~ **`[2026-08-10]` 1.72× at 1024** — the repair run's `atol_required` 5.813e-2 ([26 §6](26-mode-rebuild-feasibility.md)). The 1.27× was the retired 4096-era row's figure (`atol_required` 7.896e-2, [23 §3](23-rules-and-open-items.md)), mislabeled 1024 here; it survives as cell **C2**'s margin ([30](30-coarse-cells-built.md)). **No tolerance has been widened for any mode.** | [07b](07b-phase-d2-block-integration.md) |
 | Can the two attention matmuls run on this device? | **Yes**, both, at every ladder rung, `attn_output` by all three GEMM methods. The registry genuinely holds no `K = 64` / `N = 64` row and the sweep cannot stage one, but that is a *catalogue* constraint; the tiles are injected through the `gemm_spec_fn` hatch. Two failure clusters bound the space and are fully characterised: `herd_n = 1` at N=64 hangs, `tile_n = 8` fails the microkernel's own assert. | [26](26-mode-rebuild-feasibility.md) · `pattern/offload/offload.py` |
 | Can one xclbin hold the whole layer? | **No**, blocked twice. `runtime_loop_tiling_sizes` `[2,2]` makes `mha_out_proj` @4096 hang on hardware (3/3) while `[1,1]` passes (3/3), and one ELF is one aircc invocation — so FlashAttention and the wide GEMMs cannot co-compile. Separately `air-fuse-channels` is O(N²) in channels and did not finish in 1200 s on a 90-channel stitch. | `agents/probes/probe_backend_preset_hardware.py` · [26](26-mode-rebuild-feasibility.md) |
 | Is `attention_path` still a covariate? | **No, not since 2026-08-09.** All four modes run attention on the device. Any comparison whose explanation rests on that split cannot be re-tested. | `study/test_attention_path.py` |
