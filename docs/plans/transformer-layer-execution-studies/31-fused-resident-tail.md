@@ -441,7 +441,8 @@ lowers unchanged; that is the claim the regression evidence rests on. Verified:
 `shim_bd_liveness_bound.mlir` **fails against the pre-fix binary** (no `issue_token`, no awaits,
 the weight feed still trailing the bulk run) and passes after; `check-air-mlir` **492 pass /
 0 fail** (491 + the new test); the transformer-layer suite on NPU2 **31 pass / 1 unsupported /
-0 fail**, the recorded baseline, devq 241; the hermetic structural probe re-run against the fixed
+0 fail**, the recorded baseline, re-run against the final binary (devq 248; devq 241 is the
+same result one commit earlier); the hermetic structural probe re-run against the fixed
 pass **PASS**, 59 dumps in 1.0 s, one tile-bearing device, 4 core→core flows, 12 channel symbols,
 0 packet dumps, devq 239 — R1's structure is unchanged by the compiler work.
 

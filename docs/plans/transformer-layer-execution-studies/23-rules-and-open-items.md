@@ -304,7 +304,7 @@ plus a drain of the tail), the depth taken from the tile's free budget, and the 
 behind the feeds it must not out-order. **Awaits, not frees**: mlir-aie's own guidance is that a
 `dma_free_task` before completion is a race, so a compiler-inserted free has no argument to offer;
 an await consumes the TCT, which is proof the BD is idle. The step is a no-op when every tile
-already fits, so no shipped design moves — `check-air-mlir` 492/0, transformer-layer suite 31/1/0.
+already fits, so no shipped design moves — `check-air-mlir` 492/0, transformer-layer suite 31/1/0 (devq 248).
 
 **The other candidate — loop-shaped BD programs — is closed for this shape, measured.** R1's
 offending descriptor is the seam-1 retile, `sizes [8, 4, 8, 8]` `strides [6144, 8, 768, 1]`: a shim
