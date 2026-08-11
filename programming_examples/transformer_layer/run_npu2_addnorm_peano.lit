@@ -31,9 +31,10 @@
 // outside tolerance, collapse boundary between |mean|/sigma 2 and 4 -- and
 // the two-pass f32 statistics they carry now must not. These two rows are
 // what pin that: a revert to one-pass statistics fails here rather than in a
-// probe nobody runs. Their atol figures are provisional (the sibling rows')
-// until the first gated hardware run records their measured
-// mean_rel_L1 / atol_required in opcheck_specs.py.
+// probe nobody runs. Their first gated hardware run (2026-08-11) measured
+// mean_rel_L1 1.390e-3 / 1.409e-3 with atol_required 0.0 on both -- recorded
+// in opcheck_specs.py; the atol figures stay the sibling rows' as
+// never-binding slack.
 //
 // Runs opcheck.py on real NPU2 against an FP32 reference: np.isclose over the
 // full output at rtol=1.6e-2, zero permitted mismatches. Not cosine similarity

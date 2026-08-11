@@ -298,28 +298,83 @@ the defect was two defects wearing one stack trace:
    instead of picking either bound.
 
 **Verified**, old binary (`install-xrt`, 2026-08-07) against fixed (`build-xrt`):
-N=3 probe dump — old SEGV/hang, fixed **10/10 clean**; N=2 dump — outputs **bit-identical**
-(behavior preserved where the old pass worked); N=4 dump — clean, 4-slot wrap; **R1's own
-`pass_017` dump — old 10/10 SEGV, fixed 10/10 clean**; `check-air-mlir` tree 490 pass / 0 fail;
-new lit regression `fuse_channels_sibling_nests.mlir` (N=3 and N=4 cases, pinning the 3- and
-4-slot wraps) passes fixed and hangs the old binary — verified failing per H9's discipline.
+N=3 probe dump — old SEGV/hang, fixed **10/10 clean**; N=4 dump — clean; **R1's own
+`pass_017` dump — old 10/10 SEGV, fixed 10/10 clean**; `check-air-mlir` tree 491 pass / 0 fail;
+new lit regression `fuse_channels_sibling_nests.mlir` crashes the old binary — verified failing
+per H9's discipline.
+
+**`[2026-08-11]` later, from the same-day Codex review — the fix's first form had preserved a
+THIRD defect, and the revision removed it.** The pairwise NFL merge had always compared dynamic
+offsets with a comparison that treats any two non-constant values as equal, then cloned ONLY the
+destination's transfer body and erased the sources — so sibling nests reading DIFFERENT L3
+slices (exactly R1's down feed, and this probe's shape) fused into a stream that transferred the
+destination's slice repeatedly and silently dropped the other slices' data. The first fix
+faithfully preserved that (its "N=2 bit-identical" check proved preservation of a miscompile);
+the revision replaces the per-side consistency test with strict structural equivalence under an
+IV correspondence: a side whose patterns are provably identical multiplexes (1 + k slots as
+before), a side whose patterns differ keeps ALL its ops on the merged channel — each with its
+own offsets, so every slice still moves — which is the pass's own documented split shape
+(`fuse_channels.mlir` func9). One shipped expectation (func13) had encoded the miscompiled
+output — puts from two different buffers wrapped as clones of the first — and was corrected to
+the surviving-puts form. The review also closed two residual hazards: the region-validity scan
+now rejects non-target channel ops at ANY depth (a nested erased-source op inside a wrapped
+region was still a reachable use-after-free), and a destination absorbing sources by LB/UB and
+NFL at once — which would compose multiplicatively — is declined by per-destination strategy
+tracking.
 
 **A finding that re-dates this section's own "compiled clean twice":** the old pass's *lucky*
-green runs on R1 did not produce the fused module this phase designed. Diffing the old clean
-run's `pass_018` against the fixed output: the old output left `@channel_4` **alive with its own
-2-trip wrap** beside the destination's 2-trip wrap (pairwise-overlap debris from the same defect,
-surviving only when the freed reads happened to land on intact memory), where the fixed output
-has ONE surviving channel wrapped at **4** — 4×6 = 24 transfers, matching the herd's 24-trip
-consumer by construction. So trap 4's "a green compile proves nothing about the next run"
-sharpens to: **the green compiles' outputs were themselves wrong**. Any structural literal
-derived from a pre-fix dump of a ≥3-clique module (flow counts, shim-inbound counts, channel
-liveness) must be re-derived after the fix, not compared against.
+green runs on R1 did not produce the fused module this phase designed. The old clean run's
+`pass_018` left `@channel_4` **alive with its own 2-trip wrap** beside the destination's 2-trip
+wrap — pairwise-overlap debris from the same defect, surviving only when the freed reads
+happened to land on intact memory — and, per the review round above, even a debris-free pairwise
+output would have repeated the destination slice's data in place of the sources'. Under the
+revised pass, R1's down-feed refills (heterogeneous per-slice offsets) all SURVIVE on the merged
+channel — 4 nests × 6 tasks, every slice's data moving — with only pattern-identical sides
+multiplexed. So trap 4's "a green compile proves nothing about the next run" sharpens to: **the
+green compiles' outputs were themselves wrong**. Any structural literal derived from a pre-fix
+dump of a ≥3-clique module (flow counts, shim-inbound counts, channel liveness) must be
+re-derived after the fix, not compared against; the structural probe re-derived and passed 3/3
+against the revised pass.
 
-**What remains before the gate runs:** aircc sees the pass through `install-xrt`, whose write is
-operator-only — the fix reaches the R1 gate when the operator refreshes the install from
-`build-xrt`. Then: delete the one `UNSUPPORTED` line in `run_npu2_ffn_resident_peano.lit`, run
-the gate via devq, and replace the SPECS row's provisional atol with the measured figures. The
-builder-side dodges above are moot.
+~~**What remains before the gate runs:** aircc sees the pass through `install-xrt`...~~ **The
+gate RAN the same day** — the suite's lit config compiles through `build-xrt/python`, which
+carries the fix, so the operator's install refresh was not on the gate's path after all (it
+stays owed for everything that resolves through `install-xrt`: the probes' defaults, the
+shipped models' backend).
+
+### `[2026-08-11]` The gate ran — wall 3 is gone, and wall 4 is measured: shim BD exhaustion
+
+Armed and run via devq the day the fix landed. **The STRUCT arm passes** (the structural probe
+also re-ran 3/3 standalone against the fixed pass — the derived constants hold on the corrected
+fusion). **The numeric arm then fails deterministically and loudly** at a wall this module had
+never reached, because every earlier full compile died or lied in `air-fuse-channels`:
+
+```
+air_project/npu.air.mlir:1178: 'aiex.dma_configure_task' op Too many simultaneously
+active buffer descriptors on tile (1,0), which supports up to 16.
+```
+
+This is the **J1 wall** ([23 §4](23-rules-and-open-items.md)), now measured on R1 — and measured
+to be **independent of the fusion shape**: the gate reproduced the identical refusal (same tile,
+same `npu.air.mlir` line) under the first fix's all-on-one-stream fusion AND under the revised
+per-side form where each refill survives with its own offsets. The invariant is the module's:
+the down feed's herd_x = 4 sibling refills are 4 × 6 = 24 tasks whose lowering emits one
+`aiex.dma_configure_task` per iteration with no `dma_free_task`/`dma_await_task` reuse, against
+the assigned shim tile's 16 BDs, however the channels are grouped. Three things worth being
+precise about:
+
+- **It is not a regression from the fuse fix.** The 24 transfers are semantically required (the
+  consumer herd does 24 gets); the pre-fix "lucky-green" debris fusion carried the same total
+  and had simply never been pushed through the BD allocator. The failure class improved from
+  ASLR coin toss to loud deterministic refusal — H9/J1's preferred failure shape.
+- **The candidate fix is J1's**: loop-shaped BD programs (or free/await insertion) on the shim
+  rather than one task per iteration — a compiler item ([23 §4](23-rules-and-open-items.md)'s
+  "candidate fix", unclaimed since J1 hit it at 6 trips against a 64-trip target). R1 needs 24
+  against 16, a much smaller gap. The builder-side dodges recorded above (staggered bounds,
+  ≤2-clique restructuring) do NOT help here — they change who fuses, not the task count.
+- **The gate is RE-PARKED `UNSUPPORTED`** with wall 4 named in the recipe header (queue item
+  6b). The SPECS row's atol stays provisional; the emulation tests and structure arm remain the
+  standing evidence.
 
 ## Gate
 

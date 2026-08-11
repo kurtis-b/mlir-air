@@ -527,8 +527,9 @@ status as the noisiest of the four is **measured to be removable** — 316.9%
 intra-walk spread on the ELF path against 17.6% on the shared one at 512 —
 though the switch changes the ABI as well as the reconfiguration, so
 `_evict_context` is the leading candidate rather than a demonstrated cause.
-Every recorded `offload` latency/variance number predates the flip and
-describes the ELF path; the four-mode re-walk is owed. Both are written up in
+Every recorded `offload` latency/variance number from before the flip
+describes the ELF path; the post-flip four-mode re-walk ran the same day and
+separates all four modes (doc 32 §The post-flip walk). Both are written up in
 `docs/plans/transformer-layer-execution-studies/29-offload-n-streams.md`.
 
 This mode used to dispatch six GEMMs and call itself a *hybrid* boundary,
@@ -1509,9 +1510,10 @@ Footguns that cost time, in the order they fired:
   and the pipeline's from 4.4e-3 to 3.6e-3. The fused addnorm kernels (`encoder.cc`,
   `addnorm_ffn_norm.cc`) carried the one-pass form until 2026-08-11, when doc 23 item 2's addnorm
   half moved both dispatched variants to the same two-pass f32 statistics and added the
-  `64x512_offset` / `64x768_pre_add_offset` catalogue rows (provisional atol, the sibling rows',
-  until their first hardware run). The addnorm gates' recorded figures are still the one-pass
-  kernel's until the post-merge re-measure; only `encoder.cc`'s staged forms — whose sum/sumsq
+  `64x512_offset` / `64x768_pre_add_offset` catalogue rows. Their first gated hardware run
+  measured the offset rows at `mean_rel_L1` 1.390e-3 / 1.409e-3 with `atol_required` 0.0 —
+  against the one-pass kernel's 22.2 / 33.1 collapse in the same regime — and refreshed the
+  zero-mean rows to 1.486e-3 / 1.963e-3; only `encoder.cc`'s staged forms — whose sum/sumsq
   interface is the one-pass decomposition, dispatched by no builder — keep one-pass statistics,
   and their file-header footgun notes say so.
 

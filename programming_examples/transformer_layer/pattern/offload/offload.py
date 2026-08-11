@@ -59,8 +59,9 @@ WHAT THIS MODE ISOLATES, AND WHY IT IS NOT "THE HOST-MEDIATED EXTREME"
       name; the taxonomy did (doc 29's recorded decision).
     - **Every ``offload`` latency/variance number recorded before 2026-08-11
       describes the ELF path** -- doc 27's four-mode table included. The
-      four-mode re-walk is the flip's recorded cost and a separate hardware
-      task.
+      post-flip four-mode re-walk ran the same day (doc 32 SSThe post-flip
+      walk): all four modes separate, this mode slowest but with its ELF-era
+      variance gone and timed-region ``context_loads`` 0.
     - **``AIR_OFFLOAD_SHARED_XCLBIN`` is retired and RAISES** if set at all;
       see the guard above ``LEGACY_ELF`` for why silence is the one behavior
       it must not have.

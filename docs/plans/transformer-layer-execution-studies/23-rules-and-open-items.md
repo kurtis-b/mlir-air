@@ -285,8 +285,14 @@ example README, `pattern/fused/README.md`, `pattern/runlist/README.md` and
 **4. J1 is blocked on shim BD exhaustion**, not on correctness any more: `herd_x=8` multi-trip
 refuses at six trips (column 0 carries weight + x + residual, three packet tasks per trip, 18 > 16)
 against a 64-trip target. The candidate fix is loop-shaped packet BD programs on the shim rather
-than one `aiex.dma_configure_task` per iteration. **Not on the goal path** — J7a reaches the same
-dispatch collapse without the packet queue.
+than one `aiex.dma_configure_task` per iteration. ~~**Not on the goal path** — J7a reaches the same
+dispatch collapse without the packet queue.~~ **`[2026-08-11]` Now ON the goal path**: R1's device
+gate hit the same wall the day wall 3 (the fuse crash) fell — the corrected fusion's single
+time-multiplexed refill stream needs 24 sequential tasks against tile (1,0)'s 16 BDs (no packet
+queue involved, so this is the plain-task variant of the same missing reuse). R1 needs 24-vs-16
+where J1 needed 64-vs-16; queue item 6b in the README, record in
+[31 §The gate ran](31-fused-resident-tail.md). This item is the resident tail's one remaining
+blocker.
 
 **5a. `phases.sh`'s J7b objective check calls its builder with no shape.** `[2026-08-07]`
 `phase_j7b_objective_check` does `build_ffn_accum_module()`, while J7a's sibling passes one

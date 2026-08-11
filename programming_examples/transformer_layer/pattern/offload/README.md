@@ -35,9 +35,11 @@ gated, renamed to what it now is: the **legacy/control** arm, opt-in via
 `AIR_OFFLOAD_LEGACY_ELF=1`. `AIR_OFFLOAD_SHARED_XCLBIN` is retired and
 **raises** if set at all — a stale script setting `=0` would otherwise
 silently run the opposite packaging to the one it was written to measure.
-**Every recorded `offload` latency/variance number predates the flip and
-describes the ELF path** (doc 27's four-mode table included); the four-mode
-re-walk is the flip's owed remainder, a separate hardware task.
+**Every recorded `offload` latency/variance number from before the flip
+describes the ELF path** (doc 27's four-mode table included). The post-flip
+four-mode re-walk ran the same day (doc 32 §The post-flip walk): all four
+modes separate for the first time, this mode slowest on every statistic but
+with its ELF-era variance gone.
 
 | | ELF path (legacy/control, `AIR_OFFLOAD_LEGACY_ELF=1`) | shared xclbin (**default**) |
 |---|---|---|

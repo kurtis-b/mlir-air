@@ -174,3 +174,23 @@ predating that day's work (none of the three directories has a 2026-08 commit):
 
 If a whole-tree sweep is ever promoted to a gate, these three need owners first; until then a
 red whole-tree run with exactly these three is the known baseline, not a regression.
+
+## `[2026-08-11]` Which toolchain tree a run actually tests
+
+Two resolution paths coexist and they diverge whenever `mlir/` changes:
+
+- **The lit suites test the BUILD tree**: `build-xrt/programming_examples/lit.site.cfg.py` puts
+  `build-xrt/python` on PYTHONPATH (sandbox python, sandbox aiecc from `mlir_aie`'s wheel). A
+  compiler fix gates through the suite as soon as `ninja -C build-xrt` has relinked
+  `build-xrt/python/air/_mlir_libs/` — no install refresh needed. Under the build tree the
+  backend resolves `aircc` package-relative (…`/bin/aircc` beside `python/`), so an ad-hoc run
+  with `PYTHONPATH=build-xrt/python` also needs `build-xrt/bin` on PATH.
+- **The probes and models test the INSTALL tree**: `agents/probes/*` default to
+  `install-xrt/bin` / `install-xrt/python`, and the llms verify path resolves the installed
+  backend. These see a compiler fix only after the operator's `ninja -C build-xrt install`.
+
+A fix that is green in one path and untested in the other is exactly how "the gate passed" and
+"the probe still crashes" can both be true on the same day. Also: pairing ironenv's `aiecc`
+with the build tree's air bindings produces `error: expected attribute value` parsing
+`npu.air.mlir` — a version-mismatch artifact of the ad-hoc env, not a compiler bug; the suites'
+sandbox aiecc is the referee.

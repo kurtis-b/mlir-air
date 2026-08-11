@@ -30,14 +30,26 @@
 // /tmp/mlir-air-npu.lock here would DEADLOCK against the gate command that
 // invokes this suite.
 //
-// PARKED `[2026-08-11]`: every arm below compiles the module through aircc,
-// and air-fuse-channels SEGVs on it NONDETERMINISTICALLY (use-after-free
-// profile in the NFL merge path; minimal shape and boundary measured by
-// agents/probes/probe_fuse_channels_sibling_nests.py -- 2 sibling
-// same-bounds channel nests fuse, 3 crash). A gate that is an ASLR coin
-// toss would flake the shared suite, so this recipe is UNSUPPORTED until
-// the compiler fix lands; doc 31 "R1's gate is BLOCKED" carries the full
-// report. Delete the UNSUPPORTED line -- and nothing else -- to arm it.
+// RE-PARKED `[2026-08-11]`, on a DIFFERENT wall than the first park. Wall 3
+// (air-fuse-channels' nondeterministic use-after-free) is FIXED (61a3bb2b:
+// merge roles kept disjoint + per-destination 1 + k trip counts; regression
+// lit fuse_channels_sibling_nests.mlir; structural probe 3/3 against the
+// fixed pass). The gate was armed and RUN the same day: the STRUCT arm
+// passes, and the numeric arm then hits wall 4 -- deterministic and loud,
+// the first time this module ever reached the BD allocator:
+//
+//   'aiex.dma_configure_task' op Too many simultaneously active buffer
+//   descriptors on tile (1,0), which supports up to 16.
+//
+// The wall is INDEPENDENT of the fusion shape: it reproduced identically
+// under both the first fix (all four refills multiplexed onto one stream)
+// and the revised per-side fix (each refill surviving with its own
+// offsets) -- the down feed's 4 x 6 = 24 refill tasks emit one
+// dma_configure_task per iteration with no free/await reuse, against the
+// assigned shim tile's 16 BDs, however the channels are grouped. The J1
+// wall (doc 23 SS4), now measured on R1. Queue item 6b; doc 31 SSstatus
+// carries the record. Delete the UNSUPPORTED line -- and nothing else --
+// to re-arm after the BD-reuse work lands.
 // UNSUPPORTED: true
 //
 // REQUIRES: ryzen_ai_npu2, peano

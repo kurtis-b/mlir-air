@@ -414,12 +414,14 @@ Weighted layer normalization and a residual, per row, fused into one kernel call
 
 Pre-add is what a post-norm encoder (`encoder_bert`) computes at both of its normalization points. Full datapath and the one-call-per-tile constraint in [`details/AddNorm_bf16.md`](details/AddNorm_bf16.md).
 
-Since 2026-08-11 both orderings keep **f32 two-pass statistics** (mean first, then `E[(x − mean)²]`), the same discipline as LayerNorm above and for the same measured reason — the one-pass `E[x²] − E[x]²` form they shipped with loses an offset row's variance entirely (collapse between `|mean|/σ` 2 and 4). The `64x512_offset` / `64x768_pre_add_offset` opcheck rows pin the regime at provisional (sibling-row) tolerances. **The figures below were measured on the one-pass kernel and their re-measure is owed**; the tolerances were not widened for the move.
+Since 2026-08-11 both orderings keep **f32 two-pass statistics** (mean first, then `E[(x − mean)²]`), the same discipline as LayerNorm above and for the same measured reason — the one-pass `E[x²] − E[x]²` form they shipped with loses an offset row's variance entirely (collapse between `|mean|/σ` 2 and 4). The `64x512_offset` / `64x768_pre_add_offset` opcheck rows pin the regime. **The figures below are the two-pass kernels' first gated hardware run (2026-08-11)**; the tolerances were not widened for the move.
 
 | (M×N) | ordering | herd (hx/hy) | rows_per_call | mean_rel_L1 | abs_err max | atol_required | mismatches | Used by | Status |
 |---|---|---|---|---|---|---|---|---|---|
-| 64×512 | post-add | 8/1 | 8 | 1.9e-3 | 3.1e-2 | 1.75e-2 | 0 / 32768 | transformer-layer studies, encoder sublayer boundary (hidden = 512) | ✅ |
-| 64×768 | pre-add | 8/1 | 8 | 2.7e-3 | 6.3e-2 | 6.65e-4 | 0 / 49152 | transformer-layer studies, `baseline_768` encoder sublayer boundary | ✅ |
+| 64×512 | post-add | 8/1 | 8 | 1.486e-3 | 3.1e-2 | 1.289e-2 | 0 / 32768 | transformer-layer studies, encoder sublayer boundary (hidden = 512) | ✅ |
+| 64×768 | pre-add | 8/1 | 8 | 1.963e-3 | 3.1e-2 | 1.667e-4 | 0 / 49152 | transformer-layer studies, `baseline_768` encoder sublayer boundary | ✅ |
+| 64×512 | post-add, offset regime (mean 8, σ 0.25) | 8/1 | 8 | 1.390e-3 | 3.1e-2 | **0.0** | 0 / 32768 | the variance-cliff pin (doc 23 item 2); one-pass measured `mean_rel_L1` 22.2 here | ✅ |
+| 64×768 | pre-add, offset regime (mean 8, σ 0.25) | 8/1 | 8 | 1.409e-3 | 3.1e-2 | **0.0** | 0 / 49152 | the variance-cliff pin, pre-add object; one-pass measured `mean_rel_L1` 33.1 here | ✅ |
 
 > **The pre-add row needs 26× less `atol` than the post-add one at a higher relative error, and the ordering is why.** Post-add finishes with `+ residual` in bf16, so an element where `norm · weight` nearly cancels the residual carries an absolute error set by the *residual's* magnitude while its own value sits near zero — `rtol` covers none of that, and `atol_required` jumps to 1.75e-2. Pre-add has no trailing add, so every error is proportional to the output carrying it. It is the same kernel with the cancellation removed, not a better datapath.
 >
