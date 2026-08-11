@@ -194,3 +194,33 @@ A fix that is green in one path and untested in the other is exactly how "the ga
 with the build tree's air bindings produces `error: expected attribute value` parsing
 `npu.air.mlir` — a version-mismatch artifact of the ad-hoc env, not a compiler bug; the suites'
 sandbox aiecc is the referee.
+
+### `[2026-08-11]` The four things a bare shell is missing, and why the first one costs the most
+
+The lit config carries these; a hand-run shell does not. Collected from four failed submissions
+during the Phase F device legs plus one probe re-run at merge review:
+
+| missing | symptom |
+|---|---|
+| `sandbox/bin` on PATH (for `aiecc`) | `AirBackendError: aircc compilation failed:` with the real line, `Error: could not find aiecc in PATH`, **below the first line** |
+| `PEANO_INSTALL_DIR` | aiecc drops off the peano path and dies at the per-core link edge (`chesslinked_{0}.ll`) |
+| `MLIR_AIE_INSTALL_DIR` | `aie-opt`-on-PATH does not resolve to the wheel's include directory |
+| `/opt/xilinx/xrt/python` on PYTHONPATH (for `pyxrt`) | **everything compiles**, the xclbin builds, and the FIRST DISPATCH raises `ModuleNotFoundError` — minutes in, looking like a runtime bug |
+
+The full incantation, which is what every ad-hoc probe run should start from:
+
+```
+PATH=$PWD/sandbox/bin:$PWD/build-xrt/bin:$PATH \
+PYTHONPATH=$PWD/build-xrt/python:/opt/xilinx/xrt/python \
+PEANO_INSTALL_DIR=$PWD/sandbox/lib/python3.12/site-packages/llvm-aie \
+MLIR_AIE_INSTALL_DIR=$PWD/sandbox/lib/python3.12/site-packages/mlir_aie \
+  ./sandbox/bin/python agents/probes/<probe>.py
+```
+
+**The trap is the diagnostic, not the variable.** A probe that summarizes an exception by its
+first line reports `aircc compilation failed:` and nothing else, which reads as *the design
+refused* when it means *the toolchain was never found*. A green-looking probe suite and an
+env-broken one are distinguishable only by reading the whole exception — so when an arm reports
+zero dumps in **0.0 s**, suspect the environment before the IR. Seen twice in one day: once as
+three failed devq submissions, once as a probe re-run that looked like a design regression and
+was not.
