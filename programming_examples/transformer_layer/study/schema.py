@@ -438,16 +438,167 @@ TUNING_FIELDS: tuple[Field, ...] = (
     Field("is_operator_best", "Whether this candidate won its operator."),
 )
 
+# The per-artifact resource table: one row per compiled design, read off the
+# routed AIE artifact `aircc_artifacts.routed_design` pins. A STRUCTURAL table
+# -- every column is a property of the compiled design, so a row is reproducible
+# from the artifact alone and no column is a wall-clock measurement.
+#
+# WHY IT IS A THIRD TABLE AND NOT COLUMNS ON `results`. A results row is one
+# MEASUREMENT of one mode at one shape; a resource row is one COMPILED ARTIFACT,
+# and a mode dispatches several (`offload` five, `coarse` five, `fused` three).
+# Folding these columns into `results` would force one artifact's occupancy to
+# stand for the mode's, which is the aggregation doc 03 refuses for the dispatch
+# vector for the same reason. Adding a table is not a version bump of an
+# existing one: `results` and `tuning` keep their field order exactly.
+RESOURCE_FIELDS: tuple[Field, ...] = (
+    Field("schema_version", "This module's SCHEMA_VERSION at write time."),
+    Field("study_id", "The study run this row belongs to."),
+    Field("study_case_id", "Case identity within the study."),
+    Field("study_case_label", "Human-readable case name."),
+    Field(
+        "execution_mode",
+        "One of EXECUTION_MODES, or None for an artifact that belongs to no "
+        "mode -- a standalone operator compile has resource usage and no "
+        "taxonomy point.",
+    ),
+    Field("artifact_name", "The compiled design's name, as the study knows it."),
+    Field(
+        "routed_design_path",
+        "Where the parsed artifact was read from. Recorded because the file is "
+        "per-segment-name and a second compile into the same project directory "
+        "overwrites it (see aircc_artifacts).",
+    ),
+    Field("compute_tiles_used", "Distinct tiles carrying an aie.core."),
+    Field("aie_tiles_with_buffers", "Distinct compute tiles declaring a buffer."),
+    Field("aie_tile_allocated_bytes", "Bytes of L1 buffers over those tiles."),
+    Field(
+        "aie_tile_memory_utilization",
+        "aie_tile_allocated_bytes / (aie_tiles_with_buffers * 65536). A POOLED "
+        "ratio over the tiles that hold something, not over the array -- a "
+        "design on 4 tiles and one on 32 are both measured against their own "
+        "footprint. The min/max/mean/median below are the per-tile spread.",
+    ),
+    Field("aie_tile_memory_utilization_min", "Least-loaded compute tile."),
+    Field("aie_tile_memory_utilization_max", "Most-loaded compute tile."),
+    Field("aie_tile_memory_utilization_mean", "Mean over compute tiles."),
+    Field("aie_tile_memory_utilization_median", "Median over compute tiles."),
+    Field("mem_tiles_with_buffers", "Distinct memory tiles declaring a buffer."),
+    Field("mem_tile_allocated_bytes", "Bytes of L2 buffers over those tiles."),
+    Field(
+        "mem_tile_memory_utilization",
+        "Pooled against 524288 bytes per memory tile, same convention as the "
+        "compute-tile ratio.",
+    ),
+    Field("mem_tile_memory_utilization_min", "Least-loaded memory tile."),
+    Field("mem_tile_memory_utilization_max", "Most-loaded memory tile."),
+    Field("mem_tile_memory_utilization_mean", "Mean over memory tiles."),
+    Field("mem_tile_memory_utilization_median", "Median over memory tiles."),
+    Field("shim_tiles_with_s2mm", "Shim tiles with at least one S2MM allocation."),
+    Field("shim_s2mm_channels_used", "Distinct (shim tile, S2MM channel) pairs."),
+    Field(
+        "shim_s2mm_channel_utilization",
+        "Against 2 channels per direction per shim tile (AIE2P).",
+    ),
+    Field("shim_tiles_with_mm2s", "Shim tiles with at least one MM2S allocation."),
+    Field("shim_mm2s_channels_used", "Distinct (shim tile, MM2S channel) pairs."),
+    Field("shim_mm2s_channel_utilization", "Against 2 channels per direction."),
+    Field("shim_tiles_with_dma", "Shim tiles with any DMA allocation."),
+    Field("shim_dma_channels_used", "Distinct channels over those tiles."),
+    Field("shim_dma_channel_utilization", "Against 4 channels per shim tile."),
+    Field("mem_tiles_with_dma", "Memory tiles with an explicit DMA allocation."),
+    Field("mem_dma_channels_used", "Distinct channels over those tiles."),
+    Field("mem_dma_channel_utilization", "Against 6 channels per memory tile."),
+    Field(
+        "mem_dma_channel_note",
+        "Why the three columns above are None, when they are. An absent "
+        "allocation is not zero usage -- it means the artifact does not state "
+        "it -- so the note is written rather than a 0 invented.",
+    ),
+    Field("compute_tiles_with_dma", "Compute tiles with an explicit DMA allocation."),
+    Field("compute_dma_channels_used", "Distinct channels over those tiles."),
+    Field("compute_dma_channel_utilization", "Against 2 channels per compute tile."),
+    Field("compute_dma_channel_note", "As mem_dma_channel_note, for compute tiles."),
+    Field(
+        "core_to_core_flows",
+        "aie.flow ops whose source AND destination are compute tiles (row >= 2). "
+        "AIR-specific and NOT in iron's table: doc 03 makes this the "
+        "discriminator for AIE role style -- zero is time-multiplexed, at least "
+        "the stage count is space-multiplexed -- and names "
+        "norm_tail_structure.py's flow count as the tree's only instrument for "
+        "it. Reading it off the same artifact as the occupancy makes the axis "
+        "measurable per design instead of per hand-written gate.",
+    ),
+    Field("total_flows", "aie.flow ops of every kind, for the ratio's denominator."),
+    Field("run_status", "One of RUN_STATUSES."),
+    Field("failure_message", "First failure verbatim."),
+)
+
+# The per-component-group table: one row per named group of one mode's layer,
+# so a whole-layer latency can be read as where the time went rather than as one
+# number. `study/component_groups.py` writes it.
+#
+# WHY `is_complete` IS A COLUMN AND NOT AN ASSERTION. Only some of a mode's
+# components are individually timed today -- doc 09's 2026-08-08 section scopes
+# the per-stage `record_kernel`/`record_cpu` instrumentation the rest needs and
+# notes it lands in Lane 1 pattern files. So a group row says how many of its
+# expected components it actually accounted for, and which are missing by name.
+# A table that silently reported partial groups as whole ones would understate
+# every device group by exactly the amount nobody measured.
+COMPONENT_FIELDS: tuple[Field, ...] = (
+    Field("schema_version", "This module's SCHEMA_VERSION at write time."),
+    Field("study_id", "The study run this row belongs to."),
+    Field("study_case_id", "Case identity within the study."),
+    Field("study_case_label", "Human-readable case name."),
+    Field("workload_variant", "encoder_bert or decoder_gpt2."),
+    Field("execution_mode", "One of EXECUTION_MODES."),
+    Field("seq_len", "Sequence length."),
+    Field("group_label", "The component group this row aggregates."),
+    Field(
+        "group_kind",
+        "host_cpu, device or sync. WHICH INSTRUMENT produced the row: named "
+        "Profiler.time_cpu buckets, the dispatch vectors' device submission "
+        "time, or their sync time. Not decoration -- a device row is a mode "
+        "TOTAL today and a host_cpu row is a named component, and reading the "
+        "two as the same granularity is the mistake this column prevents.",
+    ),
+    Field(
+        "avg_latency_ms",
+        "Mean milliseconds this group accounted for, per timed iteration.",
+        timing="Inside the same region as the results table's avg_latency_ms, "
+        "and over the same iterations. The groups are DISJOINT but do NOT sum "
+        "to it -- the remainder is unattributed host overhead, which doc 03 "
+        "records as dominating the per-operator modes at 1024.",
+    ),
+    Field("component_count", "Components this group actually accounted for."),
+    Field(
+        "expected_component_count",
+        "Components the taxonomy says the group has. Equal to component_count "
+        "only when the group is fully instrumented.",
+    ),
+    Field(
+        "missing_components_json",
+        "The expected components with no measurement, as a JSON list. Empty "
+        "list when the group is complete.",
+    ),
+    Field(
+        "is_complete",
+        "component_count == expected_component_count. False is the normal "
+        "state for device groups today; see this table's note.",
+    ),
+    Field("run_status", "One of RUN_STATUSES."),
+    Field("failure_message", "First failure verbatim."),
+)
+
 RESULTS_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in RESULTS_FIELDS)
 TUNING_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in TUNING_FIELDS)
+RESOURCE_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in RESOURCE_FIELDS)
+COMPONENT_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in COMPONENT_FIELDS)
 
 DISPATCH_VECTOR_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _DISPATCH)
 POWER_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _POWER)
 QUANT_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _QUANT)
 DECOMPOSITION_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _DECOMPOSITION)
-RECONFIGURATION_FIELDNAMES: tuple[str, ...] = tuple(
-    f.name for f in _RECONFIGURATION
-)
+RECONFIGURATION_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _RECONFIGURATION)
 
 #: The CSV values ``execution_mode`` may take -- taxonomy points as they appear
 #: in a results file. ``fused_elf`` is a VALUE here, never a column.
@@ -491,11 +642,13 @@ RUN_STATUSES: tuple[str, ...] = ("passed", "failed", "skipped")
 _FIELDS_BY_TABLE: dict[str, tuple[Field, ...]] = {
     "results": RESULTS_FIELDS,
     "tuning": TUNING_FIELDS,
+    "resource": RESOURCE_FIELDS,
+    "component": COMPONENT_FIELDS,
 }
 
 
 def fields_for(table: str) -> tuple[Field, ...]:
-    """The Field tuple for ``results`` or ``tuning``. Raises on anything else."""
+    """The Field tuple for a known table. Raises on anything else."""
     try:
         return _FIELDS_BY_TABLE[table]
     except KeyError:

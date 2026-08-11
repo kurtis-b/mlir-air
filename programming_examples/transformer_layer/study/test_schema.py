@@ -35,7 +35,13 @@ if _HERE not in sys.path:
 
 import schema  # noqa: E402
 
-TABLES = ("results", "tuning")
+# `[2026-08-11]` `resource` joins the two measurement tables: one row per
+# COMPILED ARTIFACT (study/resource_usage.py), which is a different unit from a
+# measurement and so a third table rather than columns on `results`. The generic
+# checks below -- every field documented, no duplicate names, timing declared
+# where the name implies a duration -- apply to it unchanged, which is the point
+# of driving them off this tuple.
+TABLES = ("results", "tuning", "resource")
 
 # Names whose value is a duration or a rate, so ``Field.timing`` is mandatory.
 _TIMED_SUFFIXES = ("_ms", "_sec", "_gflops_per_sec", "_gflops_per_sec_per_watt")

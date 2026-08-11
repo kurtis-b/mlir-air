@@ -29,17 +29,15 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import aircc_artifacts  # noqa: E402
+import resource_usage  # noqa: E402
 
-# iron's regexes, verbatim from resource_usage/analysis.py. Copied rather than
-# imported because that module is not ported yet; when it is, import them from
-# there so there is one copy.
-_CORE_RE = re.compile(r"aie\.core\(\s*(%tile_\d+_\d+)\s*\)")
-_DMA_ALLOCATION_RE = re.compile(
-    r"aie\.(?P<kind>\w*dma_allocation)\s+@\w+\(\s*"
-    r"(?P<tile>%(?:shim_noc_tile|mem_tile|tile)_\d+_\d+)\s*,\s*"
-    r"(?P<direction>S2MM|MM2S)\s*,\s*(?P<channel>\d+)\s*\)"
-)
-_BUFFER_RE = re.compile(r"aie\.buffer\(\s*(%tile_\d+_\d+)\s*\)")
+# `[2026-08-11]` iron's regexes, IMPORTED rather than copied. This file used to
+# carry its own copies with a note saying to import them once the analysis
+# module was ported; `study/resource_usage.py` is that port, so the note is
+# discharged and there is one copy again.
+_CORE_RE = resource_usage._CORE_RE
+_DMA_ALLOCATION_RE = resource_usage._DMA_ALLOCATION_RE
+_BUFFER_RE = resource_usage._BUFFER_RE
 
 
 def _raises(exc, match, fn, *args):
