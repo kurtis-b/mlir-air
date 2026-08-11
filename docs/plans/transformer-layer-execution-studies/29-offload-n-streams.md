@@ -423,8 +423,30 @@ main stream: the gated 4096 down-projection ELF's 176 KB section
    a second standing context — `context_loads 2` instead of 30, preserving
    "reconfiguration minimized" to within one extra load.
 
-The 1024 pin stays. Item 3's flip remains blocked on a 4096-capable shared
-path by whichever route lands.
+**`[2026-08-11]` Route 3 taken, and the shared path is now GATED AT 4096.**
+`offload_config` re-resolves a `fused-cast` tier winner to the shape's
+measured `drain` row under the shared path only (`_chain_spec`; the ELF path
+keeps the winner, and a shape with no drain row raises through the registry —
+the correct refusal). The pin is priced in the run log — `down 4096x3072x768
+drain (registry, pinned over fused-cast)`, 6,226 against 6,927 GFLOP/s on
+that GEMM (~10%) — and ENFORCED by the recipe, which fails if the pin is lost
+or a retune changes the chain.
+
+Measured at 4096, then gated: **10/10 stages clean on both dispatches, and
+`context_loads 1 kernel_attaches 4` over 30 dispatches** — the array
+configured once at the mode's own spec shape. The byte provenance holds to
+the byte twice over: the cold−steady delta is 293,200 = the five cached
+instruction streams exactly (the same identity read 51,088 at 1024), and
+against the ELF clean half the steady totals differ by exactly 12,582,912 =
+4096 × 768 × 4 — the `fused-cast` module's f32 C scratch, which the pinned
+`drain` module does not stage — plus one launch's worth of air/herd/sync
+(31/91/91 → 30/90/90). `run_npu2_offload_peano.lit` re-ran green with all
+three recipes at 4096 (lit 1/1, 95.9 s, 2026-08-11). The single-sample
+latency (989.9 ms avg, Turbo) is a smoke figure, not a record — walk it
+before citing it.
+
+Item 3's flip is now decidable at the canonical shape. Routes 1/2/4 stay
+scoped above in case a future shape has no single-launch row to pin to.
 
 ## What this does not do
 

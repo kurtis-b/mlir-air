@@ -167,22 +167,24 @@
 // statement, so a regression to thirty loads would have passed every gate here
 // green while the mode quietly stopped being the mode.
 //
-// WHY THIS RECIPE IS AT 1024 WHEN THE TWO ABOVE ARE AT 4096, measured rather
-// than chosen. The chain does not build at 4096. At 4096 the down-projection
-// resolves to `fused-cast`, which is TWO air.launch ops; every other shape at
-// either length is single-launch `drain`. XRTBackend.compile defaults its
-// instruction file to the fixed name air.insts.bin and the xclbin branch passes
-// it straight through, while the ELF branch passes an elf name and no
-// instruction flag at all -- so only the ELF path lets aircc derive a name per
-// launch. A two-launch module under the xclbin ABI therefore asks aiecc to
-// write every instruction stream to one path, and aiecc refuses:
-// "edge 'air.insts.bin' produced duplicate output path". The shared path is
-// bounded to SINGLE-LAUNCH modules today. 1024 is where all five shapes are
-// single-launch, and it is the shape doc 29 demonstrated -- which nothing in
-// that document said, because it never ran the other one.
+// AT 4096 SINCE `[2026-08-11]` -- the mode's own SPECS shape, where the two
+// recipes above already run. This recipe sat at 1024 while the 4096 wall
+// stood; the wall fell in two acts, and the second one is why the chain below
+// is all-`drain`. The compile half: the down-projection's registry winner at
+// 4096 is `fused-cast`, a TWO-launch module, and the fixed air.insts.bin name
+// used to collide in aiecc until the multi-launch packaging landed
+// (`623768f2`). The dispatch half: that packaged multi-launch xclbin then
+// faulted the NPU firmware on its first-ever dispatch (in-stream load_pdi,
+// fatal_error_type 0x10, exception PC 0x161AD), and aiecc's
+// --expand-load-pdis proved a no-op on the raw-insts edge -- so the chain is
+// bounded to SINGLE-LAUNCH modules by the PLATFORM, and offload_config pins a
+// `fused-cast` winner to the shape's measured `drain` row under the shared
+// path. Doc 29 §The hardware verdict is the full record.
 //
-// So this recipe enforces the claim WHERE THE CLAIM HOLDS, and the 4096 wall is
-// recorded in doc 29 as its own item rather than left as an unexplained gap.
+// The pin is ENFORCED here, not just priced in the run log: the line below
+// fails this gate if the pin is lost (a lost pin faults the firmware at
+// dispatch) or if a registry retune silently changes what this chain builds.
+// SHARED: down 4096x3072x768 drain (registry, pinned over fused-cast)
 //
 // It runs through study/run_mode.py rather than opcheck.py because the sequence
 // length is the whole point here and only run_mode takes one; opcheck reads its
@@ -210,27 +212,31 @@
 // SHARED: [stage] output {{.*}} mismatch       0
 // SHARED: [offload] stages: 10/10 clean
 //
-// The dispatch vector at this length, pinned to literals. The mode makes one
-// run_sequence call per GEMM whichever way it is packaged, and that equality is
-// MEASURED rather than assumed: the ELF path run at this same length reports
-// submissions 30 entries 30 air 30 herd 90 sync 90 bytes 99090432, field for
-// field the line below, and doc 27's ladder records the same 99090432. What
-// this line ENFORCES is that the shared path's own structure does not drift,
-// which is the regression that would otherwise be invisible.
+// The dispatch vector at this length, pinned to literals. At 1024 the two
+// packagings were field-for-field identical; at 4096 they are NOT, and the
+// deltas are the pin's own provenance. Against the ELF path's clean half
+// above (air 31 herd 91 sync 91 bytes 970457088): bytes differ by exactly
+// 12,582,912 = 4096 x 768 x 4 -- the `fused-cast` module's f32 C scratch,
+// which the pinned `drain` module does not stage -- and air/herd/sync each
+// drop by 1, the two-launch module's second launch. A run matching the ELF
+// figures here means the pin was lost; a run matching neither means the
+// shared path's structure drifted, the regression that would otherwise be
+// invisible.
 //
 // A COLD DISPATCH DOES NOT PRODUCE THESE NUMBERS, and the target dispatches
 // twice for that reason. Under the xclbin ABI the first call uploads each
 // artifact's INSTRUCTION stream once -- five artifacts, five extra sync
-// boundaries, exactly 51,088 bytes, which is the total size of the five cached
-// insts files. The ELF ABI skips that entirely, because an ELF embeds its
-// instructions, and its first dispatch already reads the steady state.
+// boundaries, exactly 293,200 bytes, which is the total size of the five
+// cached insts files at this length (the same identity read 51,088 at 1024).
+// The ELF ABI skips that entirely, because an ELF embeds its instructions,
+// and its first dispatch already reads the steady state.
 //
 // BOTH lines are pinned, cold first and steady second, so each check is
 // anchored to a known invocation. Pinning only the steady one would leave the
 // checks free to match whichever dispatch happened to agree, and a second
 // dispatch that regressed could be skipped over.
-// SHARED: [offload] dispatch totals: submissions 30 entries 30 air 30 herd 90 sync 95 bytes 99141520
-// SHARED: [offload] dispatch totals: submissions 30 entries 30 air 30 herd 90 sync 90 bytes 99090432
+// SHARED: [offload] dispatch totals: submissions 30 entries 30 air 30 herd 90 sync 95 bytes 958167376
+// SHARED: [offload] dispatch totals: submissions 30 entries 30 air 30 herd 90 sync 90 bytes 957874176
 //
 // AND THE CLAIM ITSELF. One context load for thirty dispatches, with four
 // kernels attached onto the standing configuration -- against thirty loads and
@@ -248,4 +254,4 @@
 //
 // The run's own verdict last, so none of the above can pass on a run that
 // failed its comparison.
-// SHARED: [run-mode] offload @ 1024x768_encoder_bert: passed
+// SHARED: [run-mode] offload @ 4096x768_encoder_bert: passed

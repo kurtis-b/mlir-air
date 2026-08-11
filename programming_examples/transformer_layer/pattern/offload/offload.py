@@ -369,17 +369,35 @@ def offload_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
             f"({emb_dim}); the head reshape around host attention assumes it"
         )
 
+    def _chain_spec(m, k, n):
+        # `[2026-08-11]` The shared chain is bounded to SINGLE-LAUNCH modules by
+        # the platform, not by packaging any more: a multi-launch xclbin
+        # compiles and chains, but its in-stream `load_pdi` faults the NPU
+        # firmware on dispatch (fatal_error_type 0x10 at the 4096 down
+        # projection, first multi-launch dispatch ever run), and aiecc's
+        # `--expand-load-pdis` is a no-op on the raw-insts edge (doc 29 §The
+        # hardware verdict). `fused-cast` is a two-launch module by
+        # construction, so under the shared path it is re-resolved to the
+        # shape's measured `drain` row -- the registry raises if none exists,
+        # which is the correct refusal. `tier_winner` records what the row
+        # would have chosen so the run log prices the pin (~10% at
+        # 4096x3072x768: 6226 vs 6927 GFLOP/s). The ELF path keeps the winner.
+        spec = resolve_gemm_spec(m, k, n)
+        if SHARED_XCLBIN and spec["method"] == "fused-cast":
+            spec = resolve_gemm_spec(m, k, n, method="drain")
+        return spec
+
     specs = {
         "proj": (
-            resolve_gemm_spec(seq_len, emb_dim, emb_dim),
+            _chain_spec(seq_len, emb_dim, emb_dim),
             (seq_len, emb_dim, emb_dim),
         ),
         "up": (
-            resolve_gemm_spec(seq_len, emb_dim, ffn_dim),
+            _chain_spec(seq_len, emb_dim, ffn_dim),
             (seq_len, emb_dim, ffn_dim),
         ),
         "down": (
-            resolve_gemm_spec(seq_len, ffn_dim, emb_dim),
+            _chain_spec(seq_len, ffn_dim, emb_dim),
             (seq_len, ffn_dim, emb_dim),
         ),
         # Per HEAD, not per layer: Q_h @ K_h^T is [seq, head_dim] @ [head_dim,
@@ -466,7 +484,15 @@ def describe_offload(cfg):
     parts = []
     for key in ("proj", "up", "down"):
         spec, (m, k, n) = cfg["specs"][key]
-        parts.append(f"{key} {m}x{k}x{n} {spec['method']} (registry)")
+        winner = spec.get("tier_winner")
+        # A pinned method prices itself in the run log; "(registry)" alone
+        # would claim the row was the tier winner when it was not.
+        tag = (
+            f"(registry, pinned over {winner})"
+            if winner and winner != spec["method"]
+            else "(registry)"
+        )
+        parts.append(f"{key} {m}x{k}x{n} {spec['method']} {tag}")
     print("    " + ", ".join(parts))
     # The injected tiles, printed in full: this is the only place a reader sees
     # that these two shapes came from a measurement rather than the registry,

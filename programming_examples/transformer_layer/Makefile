@@ -372,17 +372,19 @@ check-offload:
 # ABIs, so one directory could hand a 30-reconfiguration run's ELF to the
 # one-reconfiguration claim.
 #
-# WHY 1024 AND NOT THE MODE'S OWN 4096 SPECS ROW. The chain does not build at
-# 4096, and the reason is exact: at 4096 the down-projection resolves to
-# `fused-cast`, which is TWO air.launch ops, while every other shape at either
-# length is single-launch `drain`. XRTBackend.compile defaults its instruction
-# file to the fixed name `air.insts.bin` and the xclbin branch passes it through
-# as `-i`; the ELF branch passes `--elf-name` and no `-i` at all, so only the
-# ELF path lets aircc derive a name per launch. A two-launch module under the
-# xclbin ABI therefore asks aiecc to write every instruction stream to one path
-# and it refuses: "edge 'air.insts.bin' produced duplicate output path". So the
-# shared path is bounded to SINGLE-LAUNCH modules today, 1024 is where all five
-# shapes are single-launch, and that is the shape doc 29 demonstrated.
+# AT 4096 -- THE MODE'S OWN SPECS ROW -- SINCE `[2026-08-11]`. This recipe ran
+# at 1024 while the 4096 wall stood, and the wall fell in two acts. The compile
+# half: at 4096 the down-projection's registry winner is `fused-cast`, a
+# TWO-launch module, and the fixed `air.insts.bin` name used to collide in
+# aiecc ("duplicate output path") until the multi-launch packaging landed
+# (`623768f2`). The dispatch half: the packaged multi-launch xclbin then
+# FAULTED the NPU firmware on its first-ever dispatch (in-stream `load_pdi`,
+# fatal_error_type 0x10), and aiecc's `--expand-load-pdis` proved a no-op on
+# the raw-insts edge -- so the chain stays bounded to SINGLE-LAUNCH modules by
+# the PLATFORM, and `offload_config` pins any `fused-cast` winner to the
+# shape's measured `drain` row under the shared path (~10% on that GEMM,
+# priced in the run log as "pinned over fused-cast"). Doc 29 §The hardware
+# verdict carries the whole record.
 #
 # This uses study/run_mode.py rather than opcheck.py because the sequence length
 # is the whole point and only run_mode takes one; opcheck reads its shape from
@@ -396,10 +398,11 @@ check-offload:
 # FIRST dispatch under the xclbin ABI uploads each artifact's INSTRUCTION
 # stream once -- `sync_instruction_bos`, which the ELF ABI skips entirely
 # because an ELF embeds its instructions. Five artifacts is five extra sync
-# boundaries and exactly 51,088 bytes, the size of the five cached
-# `.insts.bin` files, so the cold call reads sync 95 / bytes 99141520 and every
-# later one reads sync 90 / bytes 99090432. The ELF path shows no such step:
-# it reads sync 90 on the first dispatch and on every one after.
+# boundaries and exactly the summed size of the five cached `.insts.bin`
+# files: 293,200 bytes at 4096 (cold sync 95 / bytes 958167376, steady
+# sync 90 / bytes 957874176; at 1024 the same identity read 51,088). The ELF
+# path shows no such step: it reads its steady sync on the first dispatch and
+# on every one after.
 #
 # The steady-state figures are the ones doc 27's ladder records and the ones
 # the gate pins, so the layer must be dispatched at least twice. The
@@ -409,7 +412,7 @@ check-offload-shared:
 	mkdir -p $(BUILD_DIR)
 	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
 	    AIR_OFFLOAD_SHARED_XCLBIN=1 \
-	    python3 $(srcdir)/study/run_mode.py --mode offload --seq 1024 \
+	    python3 $(srcdir)/study/run_mode.py --mode offload --seq 4096 \
 	        --warmup 1 --samples 1 --study-id offload-shared-gate \
 	        --out offload_shared_gate.csv
 
