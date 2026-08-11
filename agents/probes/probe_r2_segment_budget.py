@@ -30,6 +30,14 @@ WHY THIS EXISTS
        memtile port occupancy beside it (a memtile has 6 MM2S / 6 S2MM, and R1
        already sits at 5 of 6 S2MM on one of them).
 
+    3. THE SYMBOL BUDGET. R1 found that ``-D``-baked symbols cannot coexist
+       twice in one module. R2 changes ``DIM_M`` (the row partition) and adds a
+       norm-tail object, so both halves need re-checking: does the microkernel
+       accept ``DIM_M = band / herd_x``, and which GLOBAL symbols do the
+       objects actually share? Arm ``objects`` compiles them and reads the
+       symbol tables instead of trusting the source comments -- which turns out
+       to matter, because one of those comments is wider than the truth.
+
 ARMS
     ``herds``  N herds of [herd_x, 1] in one segment, each a trivial L1->L1
         stage, N swept. Reports placement and the row/column map. The first
@@ -39,6 +47,12 @@ ARMS
     ``shim``   Full per-column shim MM2S / S2MM census of R1's own
         ``build_ffn_resident_module``, printed beside what R1's shipped clause
         counts, so the undercount is a diff and not an assertion.
+    ``objects``  Compiles the kernel objects R2 needs at the row-partitioned
+        tiles and diffs their global symbol tables. Needs PEANO_INSTALL_DIR
+        (the sandbox's ``llvm-aie``); skips loudly without it. Its negative
+        control is ``DIM_M = MICRO``, which the source static_asserts against
+        and which must be REFUSED -- if it compiled, ``DIM_M % 16`` would not
+        be the constraint that forces every R2 herd to width 4.
 
 HERMETIC. No NPU, no Peano, no kernel objects.
 PROVENANCE. Prints the air-opt path and mtime. Item 6b changes shim BD
@@ -88,7 +102,12 @@ from air.dialects.func import FuncOp  # noqa: E402
 from air.backend.xrt import XRTBackend  # noqa: E402
 from air.backend.xrt_runner import type_mapper  # noqa: E402
 
-from builders.ffn_accum import FFN_ACCUM_HERD_X, TILE_M  # noqa: E402
+from builders.ffn_accum import (  # noqa: E402
+    FFN_ACCUM_HERD_X,
+    FFN_ACCUM_TILE_K,
+    MICRO,
+    TILE_M,
+)
 from builders.ffn_resident import build_ffn_resident_module  # noqa: E402
 
 range_ = for_
@@ -319,9 +338,88 @@ def arm_shim():
     return over, mm2s, mm2s_core
 
 
+def _global_syms(obj):
+    """Global (externally-linkable) defined symbols only.
+
+    --extern-only matters: without it llvm-nm also lists local assembler labels
+    (.LBB*, .L_LEnd*), which every object built by the same compiler shares and
+    which have nothing to do with link collisions. Counting those makes every
+    pair look like it collides.
+    """
+    out = subprocess.run(
+        ["llvm-nm", "--defined-only", "--extern-only", obj],
+        capture_output=True, text=True,
+    )
+    return {ln.split()[-1] for ln in out.stdout.splitlines() if ln.split()}
+
+
+def arm_objects(band, herd_x, tile_k, emb):
+    print("\n[r2-budget] ===== arm objects: the -D and symbol budget =====")
+    if not os.environ.get("PEANO_INSTALL_DIR"):
+        print("[r2-budget]   SKIPPED: PEANO_INSTALL_DIR unset. Set it to the sandbox "
+              "llvm-aie, e.g.\n[r2-budget]   PEANO_INSTALL_DIR=<repo>/sandbox/lib/"
+              "python3.12/site-packages/llvm-aie")
+        return None
+    import shared.infra.external_kernels as ek
+
+    rows_per_core = band // herd_x
+    group_n = emb // herd_x
+    prev = os.getcwd()
+    work = tempfile.mkdtemp(prefix="r2-objects-")
+    os.chdir(work)
+    built, refused = {}, {}
+    try:
+        # DIM_M sweep: the design's value, the control below it, R1's.
+        for tm in (rows_per_core, MICRO, TILE_M):
+            name = f"mm_m{tm}.o"
+            try:
+                ek.compile_encoder(tile_m=tm, tile_k=tile_k, tile_n=group_n,
+                                   build_ffn=True, build_addnorm=False, out_name=name)
+                built[f"DIM_M={tm}"] = name if os.path.exists(name) else None
+            except Exception as exc:
+                line = next((l for l in str(exc).splitlines()
+                             if "static assertion" in l or "error" in l),
+                            (str(exc).splitlines() or [""])[0])
+                refused[f"DIM_M={tm}"] = line.strip()[:150]
+        ek.compile_encoder(build_ffn=True, build_addnorm=False,
+                           out_name="encoder_ffn.o")
+        ek.compile_layer_norm()
+        ek.compile_addnorm_ffn(build_ffn=False, build_addnorm=True, pre_add=True,
+                               out_name="addnorm_pre.o")
+        for k, v in built.items():
+            print(f"[r2-budget]   {k:12s} BUILT   {v}")
+        for k, v in refused.items():
+            print(f"[r2-budget]   {k:12s} REFUSED {v}")
+
+        objs = [f"mm_m{rows_per_core}.o", "encoder_ffn.o", "layer_norm.o",
+                "addnorm_pre.o"]
+        objs = [o for o in objs if os.path.exists(o)]
+        syms = {o: _global_syms(o) for o in objs}
+        for o in objs:
+            print(f"[r2-budget]   {o}: {len(syms[o])} GLOBAL symbols")
+        collisions = {}
+        for i, a in enumerate(objs):
+            for b in objs[i + 1:]:
+                inter = sorted(syms[a] & syms[b])
+                collisions[(a, b)] = inter
+                print(f"[r2-budget]   {a} ^ {b}: "
+                      f"{len(inter)} shared{' -> ' + ', '.join(inter[:4]) if inter else ''}"
+                      f"{' ...' if len(inter) > 4 else ''}")
+        print("[r2-budget]   where each symbol R2 calls is defined:")
+        for s in ("ffn_matmul_bf16_bf16_up_proj", "ffn_zero_bf16_up_proj",
+                  "ffn_gelu_bf16", "layer_norm_rows"):
+            where = [o for o in objs if s in syms[o]]
+            print(f"[r2-budget]     {s:34s} {where}")
+        return built, refused, collisions, syms, objs
+    finally:
+        os.chdir(prev)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arm", default=None, choices=["herds", "shim"])
+    ap.add_argument("--arm", default=None, choices=["herds", "shim", "objects"])
+    ap.add_argument("--band", type=int, default=TILE_M)
+    ap.add_argument("--emb", type=int, default=768)
     ap.add_argument("--max-herds", type=int, default=12)
     ap.add_argument("--herd-x", type=int, default=FFN_ACCUM_HERD_X)
     ns = ap.parse_args()
@@ -363,6 +461,21 @@ def main():
                     "CONTROL: the shim->core-only count is not an undercount on this "
                     "module, so the arm demonstrates nothing -- re-check before "
                     "citing it")
+    if ns.arm in (None, "objects"):
+        res = arm_objects(ns.band, ns.herd_x, FFN_ACCUM_TILE_K, ns.emb)
+        if res is not None:
+            built, refused, _coll, _syms, _objs = res
+            rows_per_core = ns.band // ns.herd_x
+            if f"DIM_M={rows_per_core}" not in built:
+                problems.append(
+                    f"the row-partitioned microkernel does NOT build at "
+                    f"DIM_M={rows_per_core}: {refused.get(f'DIM_M={rows_per_core}')} "
+                    "-- the whole row partition rests on this")
+            if f"DIM_M={MICRO}" not in refused:
+                problems.append(
+                    f"CONTROL: DIM_M={MICRO} BUILT. The kernel's DIM_M % 16 assert is "
+                    "what forces every R2 herd to width 4; if it no longer holds, "
+                    "re-derive the herd width rather than inheriting it")
 
     print()
     if problems:

@@ -355,7 +355,7 @@ device with zero slack for the placer.
 | inventory | herds | tiles | notes |
 |---|---|---|---|
 | nt1 J7a (3) + up + gelu + down + nt2 J7a (3) | **9** | 36 | **MEASURED REFUSED** |
-| nt1 J7a (3) + up+gelu folded (1) + down + nt2 J7a (3) | 8 | 32 | fits at 100 % occupancy, no slack; GeLU as an up-stage epilogue is [26](26-mode-rebuild-feasibility.md)'s priced alternative |
+| nt1 J7a (3) + up+gelu folded (1) + down + nt2 J7a (3) | 8 | 32 | fits at 100 % occupancy, no slack. The fold is **free at the object level** — `ffn_accum_mm.o` already exports `ffn_gelu_bf16` (§7.2) — so the only cost is the placer's zero headroom |
 | nt1 J7a (3) + up + gelu + down + **nt2 fused (1)** | **7** | 28 | keeps J7a's pipeline on the first tail |
 | **nt1 fused (1) + up + gelu + down + nt2 fused (1)** | **5** | **20** | recommended primary |
 
@@ -431,10 +431,10 @@ These compose unchanged and must not be re-derived:
 2. **A precondition: `MICRO % rows_per_call == 0`.** A producer tile must not straddle a microtile
    row boundary, or the source buffer stops being a codegen-time choice. At `MICRO` 8 and
    `rows_per_call` 4 it holds. The builder should refuse otherwise, with the reason.
-3. **A precondition: `(band / herd_x) % 16 == 0`.** `DIM_M` is `rows_per_core`, and
-   `compile_encoder` static_asserts `DIM_M % 16` under `build_ffn` (SOURCE:
-   `shared/infra/external_kernels.py`). At band 64 / `herd_x` 4 → 16 ✓. **At `herd_x` 8 it would be
-   8 and the kernel refuses** — another reason all herds sit at 4.
+3. **A precondition: `(band / herd_x) % 16 == 0`.** `DIM_M` is `rows_per_core`, and the kernel
+   static_asserts `DIM_M % 16` under `build_ffn`. **MEASURED** (§7.1): `DIM_M` 16 builds, `DIM_M` 8
+   is refused at `encoder.cc:136`. So at `herd_x` 8 with a 64-row band the kernel refuses — another
+   reason all herds sit at 4.
 4. **`compile_ffn_accum_kernel` must take `tile_m`.** It hardcodes `tile_m=TILE_M` (64) today; R2
    needs `DIM_M = rows_per_core`. One parameter, defaulted from the module's shape the way
    `tile_n` already is — the same discipline that exists because two no-argument calls disagreeing
@@ -448,39 +448,83 @@ These compose unchanged and must not be re-derived:
 
 ---
 
-## 7. The kernel-object `-D`-symbol constraints
+## 7. The kernel-object `-D`-symbol constraints — MEASURED, and simpler than expected
 
 R1 found that `-D`-baked symbols cannot coexist twice in one module: a second tile shape would be a
 second object exporting the *same* `ffn_matmul_bf16_bf16_up_proj`, and two private `FuncOp`s cannot
-share a symbol. R2 inherits that and adds a third object. The constraint set:
+share a symbol. R2 changes `DIM_M` and adds a norm-tail object, so both halves needed re-checking.
+`probe_r2_segment_budget.py --arm objects` compiles them and reads the symbol tables rather than
+trusting the source comments.
 
-| object | symbols R2 uses | `-D`-shaped? | linked by |
-|---|---|---|---|
-| `ffn_accum_mm.o` at (`DIM_M`=`rows_per_core`, `DIM_K`=`tile_k`, `DIM_N`=`group_n`) | `ffn_matmul_bf16_bf16_up_proj`, `ffn_zero_bf16_up_proj` | **yes** | up herd **and** down herd |
-| `encoder_ffn.o` | `ffn_gelu_bf16` | shape-irrelevant (elementwise) | GeLU herd only |
-| `layer_norm.o` *(J7a inventory)* or `addnorm_ffn.o` *(fused inventory)* | `layer_norm_rows` / the fused addnorm entry points | **no** — cols/rows are runtime `i32` args | norm herds only |
+### 7.1 The row-partitioned microkernel builds, and its refusal is what sets the herd width
 
-Four rules fall out:
+| `DIM_M` | result |
+|---|---|
+| **16** (`band`/`herd_x` = the design) | **BUILT** |
+| 64 (R1's) | BUILT |
+| **8** (`MICRO`) | **REFUSED** — `encoder.cc:136` static assertion |
 
-1. **One `FuncOp` per symbol, shared by both GEMM herds.** So the up stage's tile shape **is** the
-   down stage's, in all three dimensions — which is what forces `DIM_M = rows_per_core` on both, and
-   is fine only because the row partition makes them genuinely the same shape. (In R1 the same
-   constraint forced `group_n = emb/herd_x`; in R2 it forces the M dimension instead.)
-2. **`encoder_ffn.o` and `ffn_accum_mm.o` both define `ffn_gelu_bf16`.** They may coexist **only
-   because no core links both** — R1's measured constraint, and still true in R2 since GeLU is its
-   own herd. If GeLU is folded into the up herd (the 8-herd inventory in §5), **this breaks**: that
-   herd would need both objects. The fold would require a GeLU entry point inside `ffn_accum_mm.o`
-   instead. Naming it here so the 8-herd option is not costed as free.
-3. **`encoder.o` and `addnorm_ffn.o` also collide** on `ffn_gelu_bf16` and
-   `ffn_eltwise_add_bf16_vector` (SOURCE: `compile_addnorm_ffn`'s FOOTGUN). Same resolution, same
-   caveat: it holds while no core links both.
-4. **`layer_norm_rows` takes its shape at runtime**, so nt1 and nt2 can run at different
-   `rows_per_call` off one declaration and one object.
+So `DIM_M % 16` is not merely a comment in `external_kernels.py`; it is enforced, and it is what
+makes `herd_x` = 8 at a 64-row band impossible (`rows_per_core` would be 8). **Every R2 herd sits at
+width 4 because the microkernel says so**, and `MAX_PLACEABLE_HERD_X` = 4 agrees for an unrelated
+reason. Both roads lead to 4, which is a comfortable place for a design to be.
 
-> **STATUS: DESIGN INTENT, UNVERIFIED.** Symbol coexistence is a **link-time** property, and every
-> probe here stops before the link (deliberately — that is what makes them hermetic and seconds-
-> fast). R1's two-object coexistence is the only measured precedent. Verifying three objects needs
-> a Peano link, which is `check-ffn-resident`-class work and belongs to R2's build, not its scoping.
+### 7.2 Global symbols, counted — one collision, not three
+
+Global (externally-linkable) defined symbols only. Counting *all* defined symbols makes every pair
+look like it collides, because objects from one compiler share local assembler labels (`.LBB*`,
+`.L_LEnd*`); `llvm-nm --extern-only` is the discriminating flag.
+
+| pair | shared global symbols |
+|---|---|
+| `ffn_accum_mm.o` (M=16) ^ `encoder_ffn.o` | **8 — all of them** |
+| `ffn_accum_mm.o` ^ `layer_norm.o` | 0 |
+| `ffn_accum_mm.o` ^ `addnorm_ffn.o` (`build_ffn=False`, `pre_add=True`) | **0** |
+| `encoder_ffn.o` ^ `layer_norm.o` | 0 |
+| `encoder_ffn.o` ^ `addnorm_ffn.o` | **0** |
+| `layer_norm.o` ^ `addnorm_ffn.o` | 0 |
+
+And where each symbol R2 calls actually lives:
+
+| symbol | defined in |
+|---|---|
+| `ffn_matmul_bf16_bf16_up_proj` | `ffn_accum_mm.o`, `encoder_ffn.o` |
+| `ffn_zero_bf16_up_proj` | `ffn_accum_mm.o`, `encoder_ffn.o` |
+| **`ffn_gelu_bf16`** | **`ffn_accum_mm.o`**, `encoder_ffn.o` |
+| `layer_norm_rows` | `layer_norm.o` |
+
+Two things follow, and both make R2 easier than §5 assumed:
+
+1. **R2 does not need `encoder_ffn.o` at all.** `ffn_accum_mm.o` already exports `ffn_gelu_bf16` —
+   the two are the same source (`encoder.cc` under `-DBUILD_FFN`) at different `-DDIM_*`, and GeLU is
+   elementwise with its length as a runtime `i32`, so the tile defines do not reach it. Link the
+   GeLU herd against `ffn_accum_mm.o` and the module drops from three objects to two, the 8-symbol
+   collision stops existing, and **§5's 8-herd "fold GeLU into the up herd" option becomes free** —
+   the fold was costed as needing a new GeLU entry point, and it does not.
+   *This applies to R1 as well*: `builders/ffn_resident.py`'s FOOTGUN reasons about coexistence
+   ("they may coexist here ONLY because no core links both") for a second object it need not link.
+   **Not changed here** — R1's gate is parked and about to run; noted for whoever unparks it.
+2. **`compile_addnorm_ffn`'s FOOTGUN is wider than the truth.** It says *"encoder.o and
+   addnorm_ffn.o both define `ffn_gelu_bf16` and `ffn_eltwise_add_bf16_vector`, so they cannot be
+   linked into one ELF as-is"*. That is a statement about the **default `build_ffn=True`**. Built
+   with `build_ffn=False` — which is all a norm-tail herd needs — `addnorm_ffn.o` shares **zero**
+   global symbols with either FFN object. The fused-norm-tail inventory of §5 therefore carries no
+   symbol hazard whatsoever.
+
+### 7.3 What still holds
+
+- **One `FuncOp` per symbol, shared by both GEMM herds.** The up stage's tile shape **is** the down
+  stage's, in all three dimensions — which is what forces `DIM_M = rows_per_core` on both and is
+  fine only because the row partition makes them genuinely the same shape. (In R1 the same
+  constraint forced `group_n = emb/herd_x`; in R2 it forces the M dimension instead.)
+- **`layer_norm_rows` takes its shape at runtime**, so nt1 and nt2 can run at different
+  `rows_per_call` off one declaration and one object.
+
+> **STATUS.** The object builds and the symbol tables are **MEASURED**. What remains **UNVERIFIED**
+> is the link itself: every structural probe here stops before it (deliberately — that is what makes
+> them hermetic and seconds-fast), so "no core links two objects that collide" is checked by
+> construction and by symbol table, not by a completed aiecc link. That arrives with R2's first
+> `check-` recipe.
 
 ---
 
@@ -492,6 +536,8 @@ Four rules fall out:
 | 2 | `air-shrink-memref-sizes-by-access` silently shrinks a multi-get L1 band | **MEASURED**, with the dodge measured (§3.2) |
 | 3 | `air-split-l2-memref` aborts on a two-symbol L3-side offset | **MEASURED**, deterministic on the round-tripped dump, with an exact dodge (§3.4) |
 | 4 | An L2-staged band feed exhausts the memtile's 48 BDs | **MEASURED** (§3.3) |
+| 4b | The microkernel refusing the row partition's `DIM_M` | **MEASURED** — 16 builds, 8 refused (§7.1) |
+| 4c | Objects colliding on global symbols | **MEASURED** — one pair collides and R2 need not link it (§7.2); the **link** remains unverified |
 | 5 | Per-column shim MM2S over 2 | **MEASURABLE** — `probe_r2_segment_budget.py --arm shim`, once the R2 module exists |
 | 6 | Memtile port pressure (6/6) | **MEASURABLE**, same arm |
 | 7 | `air-fuse-channels` channel census and compile time | **MEASURABLE** — R1 sits at 12 symbols / 1 s against the >1200 s wall at 90; R2 adds the tails' channels |
@@ -531,6 +577,10 @@ export PATH=/home/cj/mlir-air/build-xrt/bin:\
 python3 agents/probes/probe_r2_order_seam.py           # design arm + 2 controls, ~15 s
 python3 agents/probes/probe_r2_order_seam.py --arm row_tiles --wloop nested   # control 3
 python3 agents/probes/probe_r2_segment_budget.py       # herd sweep + shim census
+
+# the objects arm also needs Peano (kernel compiles only, still no device):
+PEANO_INSTALL_DIR=/home/cj/mlir-air/sandbox/lib/python3.12/site-packages/llvm-aie \
+  python3 agents/probes/probe_r2_segment_budget.py --arm objects
 ```
 
 The **build** tree, not `install-xrt`: [15 §Which toolchain tree](15-environment-notes.md) — the
