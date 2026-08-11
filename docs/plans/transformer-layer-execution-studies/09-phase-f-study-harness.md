@@ -151,7 +151,7 @@ The two genuinely new ones:
   keeps iron's three regexes verbatim — only the FILE moved — and adds `core_to_core_flows`,
   which makes doc 03's AIE-role-style axis measurable per design instead of per hand-written
   gate. **Verified against real artifacts in both directions** (devq job 238, build class, log
-  `agents/.state/devq/jobs/job-000238.log`): a fresh norm-tail compile reads **24 cores, 40
+  `agents/.state/devq/jobs/job-000238.log`): a norm-tail compile reads **24 cores, 40
   flows, 16 core→core → space-multiplexed**, matching [23 §5](23-rules-and-open-items.md)'s
   independent pin of 2 × `herd_x` at `herd_x = 8` and the 40/24 counts `aircc_artifacts.py`
   recorded when item 2 closed; the `transformer_layer` project reads **0/116 → time-multiplexed**,
@@ -160,6 +160,19 @@ The two genuinely new ones:
   version: the combined `shim_dma_channels_used` set is keyed on the channel NUMBER, so a tile
   using S2MM 0 and MM2S 0 reads one channel of four when two distinct hardware channels are
   busy. Keyed on `(direction, channel)` here; the per-direction columns are unchanged.
+
+  **What job 238 actually compiled, since the distinction matters for what the numbers prove.**
+  That job's norm-tail compile did **not** run to completion: it stopped at the per-core object
+  edge (`aiecc: edge 'chesslinked_{0}.ll' (key 'norm_tail_seg_core_7_4') failed`, an
+  `AirBackendError`) — the bare-shell environment gap the three failed jobs below document,
+  which drops aiecc off the peano path. The structural counts are read from the
+  `aie.air.mlir` the AIR→AIE lowering had **already emitted** before that edge, which is the
+  right altitude for them anyway: cores, flows and shim channels are properties of the routed
+  design, not of the core objects linked afterwards. So the artifact is real and the reads are
+  real, and they agree with two independent pins (doc 23 §5's 2 × `herd_x`, item 2's 40/24 —
+  neither derived from this run). What this job does **not** establish is that the module still
+  compiles end to end; nothing here claims it does, and the parked R1 work is where that
+  question lives.
 - **`study/component_groups.py`** is deliberately a PARTIAL, and says so in its columns rather
   than in a footnote. See §The component aggregate is honestly partial below.
 
@@ -491,7 +504,11 @@ worktrees as the case it exists for), then `/opt/xilinx/xrt/python` on `PYTHONPA
 The third is the nastiest: **everything compiles, the shared xclbin is built, and the FIRST
 DISPATCH raises `ModuleNotFoundError`** — a failure that arrives minutes in and looks like a
 runtime bug. `study/resource_usage.py`'s device leg DID run (job 238) and is the one
-whose numbers above are measured.
+whose numbers above are measured — though **that job carried the first gap too**: its
+norm-tail compile stopped at the per-core link edge, and the structural reads come from the
+routed `aie.air.mlir` emitted before it (§above). The lesson generalizes past this port:
+an analysis at routed-design altitude survives a compile that dies downstream of it, so a
+failed compile is worth inspecting for the artifact it already wrote rather than discarding.
 
 ### `[2026-08-08]` Item 5 landed without pytest, and item 7 without `*.csv`
 
