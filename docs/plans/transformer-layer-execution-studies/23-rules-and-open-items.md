@@ -289,10 +289,36 @@ than one `aiex.dma_configure_task` per iteration. ~~**Not on the goal path** —
 dispatch collapse without the packet queue.~~ **`[2026-08-11]` Now ON the goal path**: R1's device
 gate hit the same wall the day wall 3 (the fuse crash) fell — the corrected fusion's single
 time-multiplexed refill stream needs 24 sequential tasks against tile (1,0)'s 16 BDs (no packet
-queue involved, so this is the plain-task variant of the same missing reuse). R1 needs 24-vs-16
-where J1 needed 64-vs-16; queue item 6b in the README, record in
-[31 §The gate ran](31-fused-resident-tail.md). This item is the resident tail's one remaining
-blocker.
+queue involved, so this is the plain-task variant of the same missing reuse). ~~R1 needs 24-vs-16
+where J1 needed 64-vs-16~~ R1 needs **96**-vs-16 (the 24 was wrong and named the wrong feed — see
+[31 §Wall 4 is fixed](31-fused-resident-tail.md)); queue item 6b in the README, record in
+[31 §The gate ran](31-fused-resident-tail.md). ~~This item is the resident tail's one remaining
+blocker.~~
+
+**`[2026-08-11]` DONE for the plain-task variant, and one of the two candidates is CLOSED as
+arithmetically unavailable.** `ea3b98ce` adds a BD-liveness bounding step to `airrt-to-npu`: any
+shim tile whose simultaneously-active BD count exceeds the pool has its offending MM2S feed paced
+with completion-token awaits (`issue_token` + `dma_await_task(t[i-depth])` before task `i`'s
+CONFIGURE — the allocator hands the ID out there, so an await one op later is one ID too late —
+plus a drain of the tail), the depth taken from the tile's free budget, and the paced run sunk
+behind the feeds it must not out-order. **Awaits, not frees**: mlir-aie's own guidance is that a
+`dma_free_task` before completion is a race, so a compiler-inserted free has no argument to offer;
+an await consumes the TCT, which is proof the BD is idle. The step is a no-op when every tile
+already fits, so no shipped design moves — `check-air-mlir` 492/0, transformer-layer suite 31/1/0.
+
+**The other candidate — loop-shaped BD programs — is closed for this shape, measured.** R1's
+offending descriptor is the seam-1 retile, `sizes [8, 4, 8, 8]` `strides [6144, 8, 768, 1]`: a shim
+BD carries three data dimensions plus one iteration dimension, all four are in use, and no adjacent
+pair merges (the microtile dimension is deliberately out of address order — that is what makes it a
+retile). The chunk loop would be a fifth. So for any *retiling* feed this branch is unavailable and
+free/await is the only route; the candidate list as originally written reads more open than it is.
+J1's own packet variant is untouched by this — the step declines packet-typed and
+`air.preserve_shim_dma_order` feeds, which own their own pacing.
+
+**R1 is still not green.** Behind the BD wall sits a scheduling wall — the shim issue order is
+channel-major (`air-dma-to-channel`'s per-channel hoist, not reachable by
+`air.preserve_shim_dma_order`) — which is queue item **6c**, scoped in
+[31 §Wall 5](31-fused-resident-tail.md).
 
 **5a. `phases.sh`'s J7b objective check calls its builder with no shape.** `[2026-08-07]`
 `phase_j7b_objective_check` does `build_ffn_accum_module()`, while J7a's sibling passes one

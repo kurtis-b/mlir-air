@@ -367,6 +367,10 @@ precise about:
   consumer herd does 24 gets); the pre-fix "lucky-green" debris fusion carried the same total
   and had simply never been pushed through the BD allocator. The failure class improved from
   ASLR coin toss to loud deterministic refusal — H9/J1's preferred failure shape.
+  ~~the down feed's herd_x = 4 sibling refills are 4 × 6 = 24 tasks~~ **`[2026-08-11]` the count
+  in this section is wrong and the feed is the wrong one** — corrected in §"Wall 4 is fixed"
+  below from the emitted runtime sequence: the offending feed is **`hidden`**, at **96** tasks
+  (sweeps 4 × k_steps 24, the operand's deliberate re-read), not the down feed at 24.
 - **The candidate fix is J1's**: loop-shaped BD programs (or free/await insertion) on the shim
   rather than one task per iteration — a compiler item ([23 §4](23-rules-and-open-items.md)'s
   "candidate fix", unclaimed since J1 hit it at 6 trips against a 64-trip target). R1 needs 24
@@ -375,6 +379,112 @@ precise about:
 - **The gate is RE-PARKED `UNSUPPORTED`** with wall 4 named in the recipe header (queue item
   6b). The SPECS row's atol stays provisional; the emulation tests and structure arm remain the
   standing evidence.
+
+### `[2026-08-11]` Wall 4 is FIXED in the compiler — and wall 5 is behind it, one layer down
+
+Queue item 6b ran. **The BD wall is gone** (`ea3b98ce`,
+`mlir/lib/Conversion/AIRRtToNpuPass.cpp`): R1's numeric arm now compiles through the buffer-
+descriptor allocator for the first time in this phase's history and reaches the ELF/xclbin stage.
+**The gate still does not go green**, because the module then times out on hardware. Both halves
+are measured; the second is a different defect class and is scoped, not fixed, here.
+
+**What the wall actually was, re-derived from the emitted runtime sequence** (devq 231, pre-fix
+reproduction of the identical refusal at `npu.air.mlir:1178`) — and it corrects two things this
+document asserted above:
+
+| | recorded above | measured from `npu.air.mlir` |
+|---|---|---|
+| offending feed | the **down** (`w_down`) feed | **`hidden`**, `@air_channel_2` |
+| task count | 4 × 6 = **24** | **96** = sweeps 4 × k_steps 24 |
+| what the 4 is | `herd_x` sibling refills | the **sweep** re-read (`hidden` is read once per sweep by design) |
+| tile occupancy | 24 vs 16 | 96 (`@air_channel_2`) + 1 (`@air_channel_3`, `w_up`) = **97 vs 16** on tile (1,0) |
+
+The mechanism is not the fusion and not the feed's identity: **AIR emits a transfer's BD release
+where the `airrt.wait_all` that joined its token was**, and R1 joins every token at one segment
+terminator, so 96 configures are followed by 96 clustered frees — 96 live BDs. Any feed whose
+tokens are terminally joined has this shape; R1 is simply the first to exceed the pool.
+
+**The fix, and why this mechanism and not the other candidate.** [23 §4](23-rules-and-open-items.md)
+named two: loop-shaped BD programs, or free/await insertion.
+
+- **Loop-shaped BD programs are arithmetically unavailable for this feed** — measured, not
+  assumed. `hidden`'s shim descriptor is the seam-1 retile, `sizes [8, 4, 8, 8]`
+  `strides [6144, 8, 768, 1]`: row-block, microtile column, row, element. A shim BD carries three
+  data dimensions plus one iteration dimension = **four**, all four are in use, and **no adjacent
+  pair merges** (a pair merges only when `stride[outer] == size[inner] · stride[inner]`;
+  6144 ≠ 32, 8 ≠ 6144, 768 ≠ 8 — the microtile dimension is deliberately out of address order,
+  which is what makes it a retile). The 24-chunk loop would be a **fifth** dimension. So that
+  branch is closed for this shape, and doc 23 §4's candidate list is narrower than it reads.
+- **Free/await insertion, with awaits.** `dma_free_task` is only a claim — mlir-aie's own
+  guidance is that "using `dma_free_task(X)` before task `X` has completed will lead to a race
+  condition", and a compiler-inserted free has no argument to offer for it. A
+  `dma_await_task` consumes the task's completion token, which is *proof* the BD is idle, and the
+  toolchain refuses loudly if the task was not configured to issue one. So the step sets
+  `issue_token` and paces: `dma_await_task(t[i-depth])` before task `i`, depth taken from the
+  tile's actual free budget (15 here: 16 minus `w_up`'s permanently-held BD).
+
+Three details worth keeping, each of which cost a run:
+
+1. **The pacing await must precede the CONFIGURE, not the start.** The allocator hands the ID out
+   at the configure, so an await one op later is one ID too late — measured: the first form
+   refused at task 16 of the run instead of task 0 (devq 233).
+2. **Every token created must be consumed exactly once**, or a later dispatch mis-consumes a
+   stale TCT: the first `n − depth` tasks are awaited by the pacing, the last `depth` by a drain
+   after the last start.
+3. **A blocking await is a deadlock hazard unless everything else is already issued**, which is
+   the same hazard `air.runtime_hoist` exists for. The step therefore sinks the paced run to just
+   before the first pre-existing blocking op that follows it. Sinking cannot violate a dependence
+   — the run's tokens were joined at the terminal wait_all, which bounds the move.
+
+The step is a **no-op unless a tile is already over budget**, so every design that compiles today
+lowers unchanged; that is the claim the regression evidence rests on. Verified:
+`shim_bd_liveness_bound.mlir` **fails against the pre-fix binary** (no `issue_token`, no awaits,
+the weight feed still trailing the bulk run) and passes after; `check-air-mlir` **492 pass /
+0 fail** (491 + the new test); the transformer-layer suite on NPU2 **31 pass / 1 unsupported /
+0 fail**, the recorded baseline, devq 241; the hermetic structural probe re-run against the fixed
+pass **PASS**, 59 dumps in 1.0 s, one tile-bearing device, 4 core→core flows, 12 channel symbols,
+0 packet dumps, devq 239 — R1's structure is unchanged by the compiler work.
+
+### `[2026-08-11]` Wall 5: the shim issue order is channel-major and R1's consumers are not
+
+With the BDs bounded, the numeric arm compiles and then **hangs**: `ERT_CMD_STATE_TIMEOUT`,
+`txn_op_idx 0xFFFFFFFF` (devq 235). Measured from the runtime sequence, at both settings tried:
+
+- **The three coupled L3 feeds are issued channel-major**, not round-major: `@air_channel_2`
+  (`hidden`) ×96, then `@air_channel_3` (`w_up`), then `@air_channel_4` (`w_down`). An up core
+  cannot consume `hidden` chunk 0 without its `w_up` block — the memtile BD chain interleaves
+  them A,B,A,B — and `hidden`'s L2 landing pad holds **one** chunk (double-buffered by the
+  labeller to two), so the feed cannot drain before its co-operand is issued.
+- **`air.preserve_shim_dma_order` does not fix it** — measured, devq 236: with the marker on the
+  launch the grouping is *still* `[ch2 ×96][ch3 ×96][ch4 ×96]` and the module still times out.
+  The marker only *prevents* `air-opt-shim-dma-bds` from regrouping; the channel-major grouping
+  is produced **upstream**, by `air-dma-to-channel` hoisting each L3-side DMA into its own
+  launch-scope loop ([19](19-phase-j1-collapse-norm-dispatches.md) §"Why it is safe now", step 1).
+  Nothing downstream of that hoist can restore the round-major order.
+- **A second, independent order defect in the same dump**: `w_down`'s deliveries are
+  **non-monotonic in its own K index even with folding off** — offsets 0, 24576 … 122880, then
+  589824 … — i.e. **c-major with the sweep inner**, against the builder's s-major K order. Cause:
+  H5 forces the sub-channel index to a literal, so the down feed is 4 *textual* instances, which
+  the same hoist turns into 4 sibling per-channel loops that are then concatenated.
+
+**Inference, marked as such** (there is no green run to confirm it): those two facts are
+sufficient to explain the timeout, and no ordering of *whole channel runs* can satisfy R1 —
+every linear channel-major order starves some consumer, because all three feeds are coupled
+through one compute pipeline. What R1 needs is a **round-major (interleaved) shim issue order**,
+which is neither loop-shaped BD programs nor free/await insertion.
+
+**Scoping, deliberately not attempted here.** Restoring round-major order means either changing
+how `air-dma-to-channel` hoists L3 DMAs out of a launch, or a new runtime-sequence scheduling step
+that re-interleaves coupled shim feeds. Both are structurally larger than item 6b's brief, and the
+second would need a definition of "coupled" the IR does not currently carry. Recorded as **queue
+item 6c**. The SPECS row's atol stays PROVISIONAL; the emulation tests and the structure arm
+remain the standing evidence, exactly as before.
+
+**One consequence for the compiler fix's evidence, stated plainly:** because R1 is the only module
+in the tree that triggers BD recycling and it hangs on wall 5, the pacing is verified at
+pass altitude (lit, verified-failing) and at compile altitude (the allocator now accepts the
+module) but **NOT on hardware**. The no-op-when-under-budget property is what makes that
+acceptable to land, and it is what the 31/1/0 suite run measures.
 
 ## Gate
 

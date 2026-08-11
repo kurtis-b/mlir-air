@@ -44,12 +44,28 @@
 // The wall is INDEPENDENT of the fusion shape: it reproduced identically
 // under both the first fix (all four refills multiplexed onto one stream)
 // and the revised per-side fix (each refill surviving with its own
-// offsets) -- the down feed's 4 x 6 = 24 refill tasks emit one
-// dma_configure_task per iteration with no free/await reuse, against the
-// assigned shim tile's 16 BDs, however the channels are grouped. The J1
-// wall (doc 23 SS4), now measured on R1. Queue item 6b; doc 31 SSstatus
-// carries the record. Delete the UNSUPPORTED line -- and nothing else --
-// to re-arm after the BD-reuse work lands.
+// offsets) -- the refill tasks emit one dma_configure_task per iteration
+// with no free/await reuse, against the assigned shim tile's 16 BDs,
+// however the channels are grouped. The J1 wall (doc 23 SS4), now measured
+// on R1. Queue item 6b; doc 31 SSstatus carries the record.
+//
+// `[2026-08-11]` WALL 4 IS FIXED (ea3b98ce, airrt-to-npu bounds shim BD
+// liveness by completion-token pacing; regression lit
+// shim_bd_liveness_bound.mlir; check-air-mlir 492/0; this suite 31/1/0).
+// The numeric arm now compiles through the BD allocator for the first
+// time -- and the recipe STAYS PARKED, on wall 5, one layer further down:
+// the module then TIMES OUT on hardware (ERT_CMD_STATE_TIMEOUT, devq 235).
+//
+// Two corrections this work forced on the paragraph above. The refill task
+// count is 96, not 24 -- sweeps(4) x k_steps(24), the `hidden` re-read,
+// with the 4 being the sweep and not herd_x. And the shim issue order is
+// CHANNEL-MAJOR: @air_channel_2 x96, then w_up, then w_down, so a feed
+// cannot drain before its co-operand is issued. That grouping comes from
+// air-dma-to-channel's per-channel loop hoisting, upstream of anything BD
+// recycling or air.preserve_shim_dma_order can reach -- measured, the
+// marker leaves the grouping intact and the module still times out
+// (devq 236). Wall 5 is a scheduling item, not a BD item; it is queue
+// item 6c. Delete the UNSUPPORTED line -- and nothing else -- to re-arm.
 // UNSUPPORTED: true
 //
 // REQUIRES: ryzen_ai_npu2, peano
