@@ -415,12 +415,12 @@ SPECS = [
         "operator": "addnorm",
         "shape_key": "64x512_offset",
         "shape": {"rows": 64, "cols": 512, "offset_regime": True},
-        # PROVISIONAL until the first gated hardware run records its
-        # mean_rel_L1 / atol_required here: the sibling 64x512 row's 5e-2.
-        # Expected slack, not to bind -- the zero residual removes the
-        # trailing add's cancellation (which is what sized the sibling's
-        # atol_required at 1.747e-2), and layer_norm's offset row measured
-        # atol_required 0.0 under the same two-pass statistics.
+        # First gated hardware run [2026-08-11]: mean_rel_L1 1.390e-3,
+        # atol_required 0.0, 0/32768 -- rtol alone covers every element,
+        # the same signature as layer_norm's offset row, and within 1.1x of
+        # the zero-mean sibling's 1.486e-3. The one-pass kernel measured
+        # mean_rel_L1 33.1 in this regime; the sibling row's 5e-2 is kept
+        # as slack that never binds.
         "atol": 5e-2,
         "prepare": prepare_addnorm,
     },
@@ -436,11 +436,11 @@ SPECS = [
         "operator": "addnorm",
         "shape_key": "64x768_pre_add_offset",
         "shape": {"rows": 64, "cols": 768, "pre_add": True, "offset_regime": True},
-        # PROVISIONAL until the first gated hardware run records its
-        # mean_rel_L1 / atol_required here: the sibling pre-add row's 2e-3.
-        # Pre-add errors stay proportional to the outputs carrying them (no
-        # trailing add), and the offset cost the two-pass statistics nothing
-        # measurable on layer_norm's sibling row.
+        # First gated hardware run [2026-08-11]: mean_rel_L1 1.409e-3,
+        # atol_required 0.0, 0/49152 -- rtol alone covers every element,
+        # against the one-pass kernel's measured 43058/49152 (mean_rel_L1
+        # 33.1) in this exact regime. The sibling pre-add row's 2e-3 is
+        # kept; it never binds here.
         "atol": 2e-3,
         "prepare": prepare_addnorm,
     },

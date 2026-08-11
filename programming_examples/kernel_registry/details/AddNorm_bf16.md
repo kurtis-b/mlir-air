@@ -68,7 +68,7 @@ x bf16 → Σx  (widened lane-by-lane, f32 vector accumulate) → mean  (f32)
 
 ## Numerical accuracy
 
-> **Measured on the one-pass kernel.** Every figure in this section and in "Tested shapes" below predates the 2026-08-11 two-pass move; the re-measure (these rows plus the two offset rows' first run) is owed and the tolerances were **not** widened for the move.
+> **`[2026-08-11]` Re-measured on the two-pass kernel.** The first gated hardware run after the two-pass move recorded: `64x512` `mean_rel_L1` **1.486e-3**, `64x768_pre_add` **1.963e-3** (both 0 mismatches at unchanged tolerances), and the two new offset rows `64x512_offset` **1.390e-3** / `64x768_pre_add_offset` **1.409e-3**, both `atol_required` **0.0** — against the one-pass kernel's measured collapse (`mean_rel_L1` 22.2 / 33.1) in the same regime. Tolerances were **not** widened for the move. Older figures below that disagree are the one-pass kernel's historical record.
 
 Verified element-wise over the full output against the **two-pass FP32** reference:
 

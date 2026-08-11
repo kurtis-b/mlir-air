@@ -243,13 +243,25 @@ PROVISIONAL until the first gated hardware run records their `mean_rel_L1` / `at
 one-pass decomposition, a two-pass rewrite there means redesigning the split reduction, and no
 builder dispatches them.
 
-**Owed to hardware, in one re-measure pass after merge:** the two offset rows' first run (which
-replaces the provisional figures), and the provenance figures that flow through the fused
-`addnorm` — the two zero-mean `addnorm` rows' measured comments, `block`, and the three modes.
-By analogy with item 1 the move costs ~13% on this kernel and probably improves those figures;
-every existing figure in this document and in `opcheck_specs.py` is still the ONE-PASS kernel's
-until that pass runs. Compile-only evidence so far: all ten kernel objects build and the pre-add /
-post-add byte-difference gate still holds; nothing here has touched the NPU.
+~~**Owed to hardware, in one re-measure pass after merge**~~ **RAN `[2026-08-11]` — the item is
+CLOSED.** The transformer-layer suite passed with the new kernels (31 pass / 1 unsupported —
+the parked R1 gate — / 0 fail), and the re-measure pass (`check-addnorm` + `check-block` +
+`check-coarse` + `check-runlist` + `check-fused` under one devq measure job, log 226) recorded:
+
+- **The offset rows**: `64x512_offset` `mean_rel_L1` **1.390e-3**, `atol_required` **0.0**,
+  0/32768; `64x768_pre_add_offset` **1.409e-3**, `atol_required` **0.0**, 0/49152 — rtol alone
+  covers every element, layer_norm's offset signature exactly, against the one-pass kernel's
+  measured 33.1 / 43058-out in the same regime. Within 1.1–1.4× of the zero-mean siblings
+  (1.486e-3 / 1.963e-3), so the offset costs the two-pass statistics nothing measurable —
+  the same result item 1's layer_norm row gave.
+- **The provenance refresh** (the §3 table's successor): `block` and `coarse` @4096 output
+  `mean_rel_L1` 1.688e-2 → **1.663e-2** with `atol_required` 7.398e-2 → **6.995e-2** (margin
+  1.35× → **1.43×**); `runlist` @4096 1.732e-2 → **1.746e-2** with `atol_required` 7.077e-2 →
+  **6.981e-2** (1.41× → 1.43×; mean and worst element moved in opposite directions, §3's own
+  lesson); `fused` @1024 **unchanged to the digit** (1.756e-2 / 5.813e-2 / 1.72×) — correctly,
+  since its stitched tail dispatches the layer_norm path, not the fused `addnorm`. **No
+  tolerance moved anywhere.** The cliff is now pinned by suite rows on both variants and the
+  kernels that had it no longer exist in any dispatched path.
 
 Reproduce with `agents/probes/probe_addnorm_variance_cliff.py`.
 
