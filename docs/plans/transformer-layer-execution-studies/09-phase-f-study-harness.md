@@ -455,14 +455,42 @@ the columns are short — doc 03 records that remainder dominating the per-opera
 other files, so it is re-derived from the pattern sources by a test that reads text and imports
 nothing, the way `test_attention_path.py` guards the attention map.
 
-**What is verified and what is not, stated rather than left to be assumed.** The aggregation, the
-taxonomy, the schema round-trip and the report are covered by 20 host tests over fixtures shaped
-like a real `extra` dict. **Its DEVICE leg has not run.** It was submitted as devq job **242**
-(`measure` class, `--mode offload --seq 1024`) and was still queued behind a sibling agent's
-transformer-layer suite run when this was written; poll it with
-`agents/scripts/devq.sh log 242`. So the CLI's dispatch path — `prepare` → warmup → timed
-dispatch → `extra` — is host-checked and not hardware-checked, and a first real run should be
-read as a first run. `study/resource_usage.py`'s device leg DID run (job 238) and is the one
+**The device leg ran, and the first real component table is this.** devq job **246**, `measure`
+class, `--mode offload --seq 1024 --warmup 1`, log `agents/.state/devq/jobs/job-000246.log`.
+NPU pmode verified Turbo beforehand.
+
+| group | kind | ms | components | complete |
+|---|---|---|---|---|
+| GEMMs (NPU) | `device` | 64.388 | 0/8 | no |
+| Non-linear operations (host) | `host_cpu` | 10.914 | **5/5** | **yes** |
+| Data sync | `sync` | 4.494 | 0/0 | yes |
+
+**Attributed 79.795 ms of a 159.795 ms layer — the remainder is 80.000 ms, 50.1%.** That is the
+result, and it is the one this module exists to make visible: half of `offload`'s layer time at
+1024 sits outside every instrumented region, neither device submission nor sync nor any timed
+host bucket. Doc 03 predicted the shape of this from the `runlist` decomposition; it is now
+measured on a second mode, and it says the per-stage instrumentation is worth doing.
+
+Three cross-checks passed without being asked for. The run's dispatch totals read
+`submissions 30 entries 30 air 30 herd 90 sync 90 bytes 99090432` and `context_loads 1
+kernel_attaches 4` — **`sync 90` and `bytes 99090432` match doc 03's recorded steady-state
+`offload` figures at 1024 exactly**, and the reconfiguration pair is the shared-xclbin default
+doc 29 gated. All 10 stages were numerically clean. And the host group came back **5/5
+complete**, which is the taxonomy test's claim about `pattern/offload/offload.py` confirmed by
+the mode itself rather than by reading its source.
+
+**Read the 159.795 ms as a denominator, not as a latency.** It is one un-sampled dispatch taken
+so the remainder could be stated; `run_mode.py` remains the only thing that produces a latency,
+and doc 09's own retracted table is what happens when that distinction is left implicit.
+
+**The environment took four submissions, and the failures are worth keeping.** Jobs 242, 243 and
+245 died before dispatch on three separate missing pieces that a bare shell does not carry and
+the lit config does: `PEANO_INSTALL_DIR`, then `MLIR_AIE_INSTALL_DIR` (the `aie-opt`-on-PATH
+route did not resolve to the wheel's include directory — the override's own comment names git
+worktrees as the case it exists for), then `/opt/xilinx/xrt/python` on `PYTHONPATH` for `pyxrt`.
+The third is the nastiest: **everything compiles, the shared xclbin is built, and the FIRST
+DISPATCH raises `ModuleNotFoundError`** — a failure that arrives minutes in and looks like a
+runtime bug. `study/resource_usage.py`'s device leg DID run (job 238) and is the one
 whose numbers above are measured.
 
 ### `[2026-08-08]` Item 5 landed without pytest, and item 7 without `*.csv`
