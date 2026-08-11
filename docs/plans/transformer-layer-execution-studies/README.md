@@ -130,13 +130,19 @@ machine anomaly; and [27](27-common-ladder-result.md)'s warm DRAM ordering is su
 [32](32-cost-decomposed-ladder.md)'s (the targeted pool eviction moved `runlist` below `fused`
 and `coarse`).
 
-**The front of the queue is the `offload` chain's hardware phase.** The 4096 compile wall fell on
-2026-08-10 (multi-launch xclbin packaging, `623768f2`) and the backend was activated in
-`install-xrt` on 2026-08-11 with its fixture re-verified against the real install — but **no
-multi-launch xclbin has ever DISPATCHED**: whether in-stream `load_pdi` executes on this platform
-is the open experiment, with the fallback already scoped ([29 §The 4096
-wall](29-offload-n-streams.md)). After it: the default flip and the four-mode re-walk (queue
-items 1 and 3), and the first *un*-conditional cost-decomposed comparison.
+**The front of the queue is now a route decision for the `offload` chain.** The 4096 compile
+wall fell on 2026-08-10 (multi-launch xclbin packaging, `623768f2`), the backend was activated in
+`install-xrt` on 2026-08-11 — and the dispatch experiment ran the same day: **in-stream
+`load_pdi` faults the firmware** (29 single-launch dispatches clean off the shared xclbin at
+4096; the one multi-launch module dies with `fatal_error_type 0x10`), and the scoped fallback
+(`--expand-load-pdis`) turned out to be a no-op on this toolchain's aiecc — the flag never
+reaches the raw-insts edge's output, and the ELF ABI's multi-launch works via aiebu-embedded
+PDIs instead. Four routes are scoped in [29 §The hardware
+verdict](29-offload-n-streams.md); two of them (single-launch method for the 4096
+down-projection, split-chain with one extra standing context) need no compiler change. After a
+route lands: the default flip and the four-mode re-walk (queue items 1 and 3), and the first
+*un*-conditional cost-decomposed comparison — now genuinely unconditional, since the pmode
+anomaly (item 1b) is resolved.
 
 **Read in this order.** [03 §The taxonomy](03-measurement-model.md) for what the four modes mean —
 that is the definition and it is current — and its §The vocabulary (submission against dispatch,
@@ -162,7 +168,7 @@ traffic between operators, and `coarse` blends `runlist` and `fused`.
 
 | # | Work | Size | Spec |
 |---|---|---|---|
-| **1** | **The xclbin multi-launch instruction streams — COMPILE HALF DONE 2026-08-10** (`623768f2`): the five-shape chain builds at 4096; a multi-launch module's per-device outputs are repackaged into the unchanged single-artifact contract (main orchestration stream with per-launch `load_pdi`, PDIs merged kernel-less into the partition; fixture `test/xrt/56`). **Remaining, in order**: ~~(a) activate in `install-xrt`~~ **done 2026-08-11** — the operator ran the `cp` and the two-launch fixture passes against the real install; (b) the hardware experiment: no multi-launch xclbin has ever DISPATCHED in this tree — in-stream `load_pdi` against partition-resident PDIs is aiecc's default lowering, unvalidated. Run the shared path at 4096 (`AIR_OFFLOAD_SHARED_XCLBIN=1`, the mode's own spec shape; the chain compiles into `offload_shared_cache` first — warm it as a build-class job). Clean 10/10 stages = the wall is fully down, re-pin the shared lit recipe at 4096; timeout or garbage = the scoped fallback (`--expand-load-pdis` + an aircc passthrough, doc 29); (c) re-run the offload suite + ten-model regression under the new install (on the OLD install 2026-08-10: suite 30/30, models 10/10) | (b) one gate run after a chain compile; (c) machine time | [29 §The 4096 wall](29-offload-n-streams.md) |
+| **1** | **The xclbin multi-launch instruction streams — COMPILE HALF DONE 2026-08-10** (`623768f2`), **HARDWARE VERDICT IN 2026-08-11**: the five-shape chain builds at 4096 and ~~(a) activate in `install-xrt`~~ **done 2026-08-11**. **(b) the dispatch experiment ran — the answer is NO**: 29 single-launch dispatches execute clean off the shared xclbin at 4096 (packaging, chaining, routing all work), and the one multi-launch module (`fused-cast` down-proj) **faults the firmware** on its first submission (`fatal_error_type 0x10`, exception PC `0x161AD`) — in-stream `load_pdi` does not execute on this platform. **The scoped fallback is falsified**: `--expand-load-pdis` is a no-op on mlir-aie 1.4.0's aiecc for BOTH edges (three probes), the ELF ABI's multi-launch works via aiebu-embedded PDIs instead, and doc 29's "19→174 KB" claim has no artifact. **Remaining: pick a route** — upstream mlir-aie insts-edge fix (wheel rebuild), ctrl-packet flow, single-launch method for the 4096 down-proj, or split-chain (shared xclbin + one ELF context, `context_loads 2`); doc 29's verdict section scopes all four. The 1024 pin stays; (c) the suite + ten-model re-run under the new install is still owed | route decision + (c) machine time | [29 §The hardware verdict](29-offload-n-streams.md) |
 | ~~1b~~ | **RESOLVED 2026-08-11 — the anomaly was the NPU power mode.** The reboot did NOT clear it (82.5 ms/load) and a held-context pin refuted runtime PM (82.2 ms/load with the device active); the discriminator was the boot history — the machine **rebooted itself at 01:09 on 2026-08-10, the exact onset**, resetting the non-persistent `xrt-smi` pmode from the **Turbo** the healthy window's uninterrupted boot had carried (set for C4's `require_turbo()` sweep) back to `Default`. Confirmed by re-measure: Turbo → **156.2 ms avg, 3.7 ms/load**, inside doc 29's band. **New standing rule: Turbo is a measurement condition** — re-set and verify it after every reboot/driver reload, before any latency run (trap 0 below); 08-10's recorded latencies are `Default`-conditional, pre-08-10's are Turbo-conditional, bytes/counts unaffected | done | [32](32-cost-decomposed-ladder.md) |
 | ~~2~~ | **DONE 2026-08-10.** Schema v2 (`eeb37a19`): `device_ms` / `sync_ms` / `host_cpu_ms` plus `context_loads` / `kernel_attaches`, appended after the pinned v1 prefix, semantics written per field. First hardware rows at 1024 confirm every known truth — `offload`-ELF 30 loads with 18.8 ms of host compute, `runlist` 24 (its per-head eviction, a measured middle regime), `coarse`/`fused` 0 — and both pinned offload gate lines re-verified on NPU | done | [03](03-measurement-model.md) |
 | 3 | **`offload`'s default**, after item 1. Flip to the shared path once it builds at the mode's own gated shape, decided there rather than extrapolated from 512, with the ELF path renamed to what it then is — a legacy/control packaging. Forces a full four-mode re-walk of [27](27-common-ladder-result.md) | Medium, mostly machine time | [29](29-offload-n-streams.md) |

@@ -370,10 +370,61 @@ lowering for multi-device xclbin, but never yet dispatched by this tree. The
 alternative if hardware balks: `--expand-load-pdis` also completes in xclbin
 mode (measured: the main stream grows 19 KB → 174 KB, embedding the config as
 writes — the exact content the ELF gate validates at 4096), but aircc only
-passes that flag on its ELF branch, so it needs an aircc change. Both paths
-still need everything in item 3. The install-rebuild + ten-model regression
-phase this section already scoped is unchanged, and the shared recipe's 1024
-pin can only move to 4096 after the hardware gate passes.
+passes that flag on its ELF branch, so it needs an aircc change. **`[2026-08-11]`
+Both halves of this fallback sentence are now falsified — see the hardware
+verdict below.** Both paths still need everything in item 3. The
+install-rebuild + ten-model regression phase this section already scoped is
+unchanged, and the shared recipe's 1024 pin can only move to 4096 after the
+hardware gate passes.
+
+### `[2026-08-11]` The hardware verdict: load_pdi faults, and the scoped fallback does not exist
+
+**The dispatch experiment ran.** The five-shape chain compiled at 4096 into one
+shared xclbin (the two-launch `fused-cast` down-projection included, packaged
+by the multi-launch backend), and the first-ever multi-launch xclbin dispatch
+in this tree was attempted on NPU2 (XRT 2.21.0, firmware 1.1.2.64, Turbo
+pmode). **Twenty-nine single-launch dispatches executed clean off the shared
+xclbin at 4096** — the packaging, chaining and kernel routing all work — and
+the ONE multi-launch module faulted the firmware on its first submission:
+`off_gemm_4096x3072x768`, `ERT_CMD_STATE_TIMEOUT` with `fatal_error_type
+0x10`, `fatal_error_exception_pc 0x161AD`, `txn_op_idx 0xFFFFFFFF` (a context
+firmware exception, not a slow kernel). **In-stream `load_pdi` against
+partition-resident PDIs does not execute on this platform.**
+
+**The fallback as scoped is not implementable, and its measurement claim has
+no artifact.** `--expand-load-pdis` is a no-op on mlir-aie 1.4.0's `aiecc` for
+BOTH output edges, established by three probes on the two-launch fixture
+module: (a) an aircc passthrough, verified present on the echoed aiecc command
+line, leaves the main stream byte-identical (4,800 B, leading word
+`0x00020008` — a load_pdi); (b) requesting `--get-full-elf` alongside the
+xclbin/insts edges changes nothing; (c) pure ELF mode emits the same 4,800 B
+`.ctrltext.0`. The ELF ABI's multi-launch support never came from expansion:
+`aiebu` embeds per-sequence `.pdi.N` sections next to each `.ctrltext.N` and
+the ELF loader resolves reconfiguration from those — packaging the raw-insts
+xclbin path cannot use. The "19 KB → 174 KB" figure above matches no expanded
+main stream: the gated 4096 down-projection ELF's 176 KB section
+(`.ctrltext.2`) is a *launch* DMA program, and its main sequence
+(`.ctrltext.0`) is 2,288 B with no load_pdi-shaped words on the 16-byte grid.
+
+**Routes that remain, none of them the one-line aircc change predicted above:**
+
+1. **Upstream mlir-aie**: wire expansion (`aie-materialize-runtime-sequences` +
+   `aie-expand-load-pdi`, both present in `aie-opt`) into aiecc's npu-insts
+   edge. A wheel rebuild — a toolchain change with doc-15 blast radius.
+2. **The ctrl-packet flow** (`--load-pdi-to-ctrl-pkt` + control overlay):
+   exists in this aiecc, but changes routing and is mutually exclusive with
+   expansion; its overlay cost on an 8-column chain is unscoped.
+3. **Mode-level, no compiler change**: force a single-launch method for the
+   4096 down-projection in the shared chain (`drain` instead of `fused-cast`),
+   sidestepping multi-launch entirely. Numerics must re-gate at that method;
+   the registry precedent for not-this-shape's-fastest methods exists.
+4. **Split-chain, no compiler change**: shared xclbin over the four
+   single-launch shapes plus the gated ELF artifact for the down-projection on
+   a second standing context — `context_loads 2` instead of 30, preserving
+   "reconfiguration minimized" to within one extra load.
+
+The 1024 pin stays. Item 3's flip remains blocked on a 4096-capable shared
+path by whichever route lands.
 
 ## What this does not do
 
