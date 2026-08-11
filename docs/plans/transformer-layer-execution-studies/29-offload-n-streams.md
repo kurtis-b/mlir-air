@@ -497,8 +497,10 @@ scoped above in case a future shape has no single-launch row to pin to.
   literal is unchanged. What the flip re-dates: **EVERY recorded `offload`
   latency/variance number — [27](27-common-ladder-result.md)'s four-mode
   table included — predates it and describes the ELF path.** The four-mode
-  re-walk is the cost this section priced; it is now owed, and it is a
-  separate hardware task, not part of the flip change.
+  re-walk is the cost this section priced; ~~it is now owed~~ **it ran the
+  same day** — [32 §The post-flip walk](32-cost-decomposed-ladder.md): 16/16
+  orderings `fused` < `coarse` < `runlist` < `offload`, the ELF-era variance
+  gone, timed-region `context_loads` 0 on the standing context.
 - **It does not deliver runtime-parameterized loop bounds.** That is the increment
   *beyond* iron parity, deferred by [03](03-measurement-model.md) and still
   blocked in the stack ([26 §A](26-mode-rebuild-feasibility.md)).

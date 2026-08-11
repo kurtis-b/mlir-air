@@ -113,3 +113,46 @@ column any results reader can see.
   (warm caches, light shapes, 7 dispatches/rung), but it is also the reason the anomalous
   latencies got noticed at all: the numbers were checked against the recorded distributions
   before being believed, per the README's standing rule.
+
+## `[2026-08-11]` The post-flip walk: the first unconditional four-mode comparison
+
+The re-walk item 3's flip owed, run the day the flip landed: four modes at 512 and 1024,
+`--warmup 2 --samples 5`, walked twice under one devq measure job each, **Turbo verified
+in-job before either walk** (trap 0), with `offload` on its NEW default — the shared xclbin
+(`npu_unique_xclbin_count 1` over 30 dispatches in every offload row, which is the CSV's own
+attestation that the shared path ran). Artifacts:
+`results/postflip-ladder-w1/`, `-w2/` (gitignored), devq job log 224.
+
+**Latency orders `fused` < `coarse` < `runlist` < `offload` — on averages AND minimums, both
+walks, both lengths, 16/16 orderings.** For the first time all four modes fully separate:
+doc 27's `runlist`/`offload` indistinguishability is gone, removed by the flip (`offload`'s
+ELF-era intra-walk spread of 120–316% collapsed to ~3–16% shared; one walk-1 sample at 1024
+reached 238 ms against a 163.6 min, so its band is not yet tight — but no statistic in any
+walk brings the pair closer than 23 ms).
+
+| avg ms (w1 / w2) | 512 | 1024 |
+|---|---|---|
+| `fused` | 45.73 / 45.23 | 100.84 / 99.48 |
+| `coarse` | 53.66 / 48.25 | 105.02 / 111.95 |
+| `runlist` | 77.82 / 77.51 | 150.96 / 152.94 |
+| `offload` | 109.49 / 99.72 | 179.88 / 175.48 |
+
+Minimums preserve the same order (512: 44.4 / 47.2 / 76.8 / 102.6 on walk 1; 1024: 98.6 /
+103.5 / 149.9 / 163.6; walk 2 agrees).
+
+**Bytes are walk-identical and reproduce this doc's warm ordering** — `runlist` < `fused` <
+`coarse` < `offload`: 20,447,232 / 21,233,664 / 22,020,096 / 44,040,192 at 512 and
+40,894,464 / 42,467,328 / 44,040,192 / 99,090,432 at 1024.
+
+**The reconfiguration column shows the flip doing its work**: `offload`'s timed-region
+`context_loads` is now **0** (the standing context is created once at setup and outlives every
+dispatch — against 30 *per dispatch* on the ELF path in this doc's first walk), `runlist` keeps
+its measured 24, `coarse`/`fused` 0. `offload`'s host half remains visible as `host_cpu_ms`
+4.2 / 12.7 (512 / 1024), which no other mode has — the two taxonomy costs and the mode's host
+residue are now all separately legible in one row.
+
+**One confound, declared**: this walk is not single-variable against doc 27's or this doc's
+earlier walks — it also carries the two-pass f32 `addnorm` (item 7's kernel change, merged the
+same day) in the three modes that dispatch `addnorm` on the device; `offload` norms on the host
+and does not. Within-walk cross-mode comparison is unaffected (that asymmetry is real mode
+behavior); against pre-flip records, both the packaging and the kernel changed.
