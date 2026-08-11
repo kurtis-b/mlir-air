@@ -489,6 +489,42 @@ check-ffn-accum-fault:
 check-ffn-accum-structure:
 	python3 $(srcdir)/ffn_accum_structure.py
 
+# Doc 31 increment R1: the resident FFN interior -- up-projection, GeLU and
+# the J7b down ring as three herds of ONE segment for a 64-row band, the
+# [seq, ffn] interior existing only as chunks in flight. Same function and
+# scaling as `ffn`; the residency claim is the structural arm's.
+check-ffn-resident:
+	$(call opcheck,ffn_resident)
+
+# The interior's negative control. Injects hidden's (0, 0) -- hidden is
+# handed over ROW-MAJOR (the device retiles it on the shim), so the position
+# needs no packing arithmetic. The delta moves H[0, :] by delta * w_up[0, :]
+# and, through GeLU and the down ring, the whole first output row.
+check-ffn-resident-fault:
+	mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
+	    python3 $(srcdir)/opcheck.py --operator ffn_resident \
+	        --fault-inject input --expect-failure
+
+# The interior's structural check, host-only: one tile-bearing aie.device
+# (the resident claim -- the stitched composition measures one per launch),
+# core->core flows exactly herd_x (the up->GeLU edges; every other hand-off
+# is memtile-mediated by port arithmetic), the shim column budget counted
+# directly, zero packet-typed channels, the down ring's 4 -> 2 hoist scoped
+# to its own herd, and the three kernels dispatched by name. The numerical
+# check sees none of this. No NPU (the compile stops at the core-ELF link,
+# deliberately).
+#
+# `[2026-08-11]` KNOWN COIN TOSS until the air-fuse-channels crash is fixed:
+# the compile this target runs SEGVs nondeterministically in that pass on
+# this module (use-after-free profile; minimal shape in
+# agents/probes/probe_fuse_channels_sibling_nests.py, boundary measured at
+# 2-clean/3-crash sibling nests). The lit recipe is parked UNSUPPORTED for
+# the same reason; doc 31 "R1's gate is BLOCKED" is the report. The arm that
+# stays live meanwhile is run_ffn_resident_emulation_tests.lit.
+check-ffn-resident-structure:
+	python3 $(srcdir)/ffn_resident_structure.py
+
 # Phase E4: the same layer, measured as the `runlist` execution strategy — the
 # fine-grained point of the taxonomy. coarse's dispatch schedule refined into
 # 391 single-operator entries over five runlists (host torch attention after

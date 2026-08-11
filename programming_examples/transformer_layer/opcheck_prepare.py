@@ -115,6 +115,12 @@ from builders.ffn import (  # noqa: E402
     ffn_gemm_specs,
     ffn_reference,
 )
+from builders.ffn_resident import (  # noqa: E402
+    build_ffn_resident_module,
+    compile_ffn_resident_kernels,
+    ffn_resident_device_inputs,
+    ffn_resident_reference,
+)
 from builders.elementwise_mul import (  # noqa: E402
     build_elementwise_mul_module,
     elementwise_mul_reference,
@@ -613,6 +619,55 @@ def prepare_ffn_accum(shape, seed=11):
         "inputs": ffn_accum_device_inputs(a, w, herd_x=herd_x, tile_k=tile_k),
         "expected": [ffn_accum_reference(a, w)],
         "inject": (0, (0,)),
+        "runner_kwargs": _GEMM_RUNNER_KWARGS,
+    }
+
+
+def prepare_ffn_resident(shape, seed=13):
+    """Doc 31 R1: the one-segment resident FFN interior, one 64-row band.
+
+    ``y = gelu(hidden @ w_up) @ w_down`` with the interior resident -- the
+    same function as ``ffn``, so the data is scaled exactly as
+    ``prepare_ffn``'s (up-projection at unit output variance so GeLU is
+    exercised where it is nonlinear; down weight sized so y lands at the
+    registry sweep's scale) and the reference is the same imported oracle.
+    What this operator adds over ``ffn`` is structural, and its own arm
+    checks that (``ffn_resident_structure.py``); what it adds NUMERICALLY is
+    the honest cost of bf16 accumulation in BOTH rings (the in-place
+    kernel's C is bf16: emb/tile_k roundings in the up ring, ffn/tile_k in
+    the down) where ``ffn``'s registry GEMMs accumulate in f32.
+
+    ``hidden`` is handed over ROW-MAJOR -- the device retiles it on the shim
+    (seam 1) -- so the injection position indexes the true (0, 0) element
+    with no packing arithmetic in the way. A delta there moves H[0, :] by
+    ``delta * w_up[0, :]`` before GeLU and the whole first output row after
+    the down ring, an order above the band at these scales.
+    """
+    seq_len, ffn_dim = shape["seq_len"], shape["ffn_dim"]
+    emb_dim = shape["emb_dim"]
+    # One source of truth for the tile geometry: the builder's constants
+    # (measured walls, not a registry sweep -- builders/ffn_accum.py records
+    # why). tile_n is passed explicitly, derived from THIS row's emb_dim:
+    # the object bakes DIM_N in as a -D flag and both GEMM herds link it.
+    herd_x, tile_k = FFN_ACCUM_HERD_X, FFN_ACCUM_TILE_K
+    compile_ffn_resident_kernels(
+        tile_k=tile_k, tile_n=emb_dim // herd_x, emb_dim=emb_dim
+    )
+    rng = np.random.default_rng(seed)
+    up_scale = _unit_output_scale(emb_dim)
+    down_scale = _registry_gemm_scale(ffn_dim) / np.sqrt(ffn_dim * _GELU_SECOND_MOMENT)
+    hidden = (rng.standard_normal((seq_len, emb_dim)) * up_scale).astype(bfloat16)
+    w_up = (rng.standard_normal((emb_dim, ffn_dim)) * up_scale).astype(bfloat16)
+    w_down = (rng.standard_normal((ffn_dim, emb_dim)) * down_scale).astype(bfloat16)
+    return {
+        "module": build_ffn_resident_module(
+            seq_len, ffn_dim, emb_dim, herd_x=herd_x, tile_k=tile_k
+        ),
+        "inputs": ffn_resident_device_inputs(
+            hidden, w_up, w_down, herd_x=herd_x, tile_k=tile_k
+        ),
+        "expected": [ffn_resident_reference(hidden, w_up, w_down)],
+        "inject": (0, (0, 0)),
         "runner_kwargs": _GEMM_RUNNER_KWARGS,
     }
 

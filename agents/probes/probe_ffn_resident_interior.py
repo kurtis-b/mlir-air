@@ -92,6 +92,7 @@ def _on_alarm(_sig, _frame):
     subprocess.run(["pkill", "-P", str(os.getpid()), "aircc"], check=False)
     raise _CompileTimeout(f"compile exceeded {COMPILE_TIMEOUT_S}s")
 
+
 _REPO = Path(__file__).resolve().parents[2]
 _PE = _REPO / "programming_examples"
 # transformer_layer LAST so it ends up FIRST: its builders/ must shadow
@@ -163,9 +164,7 @@ def _aircc_debug_dumps(module, keep_dumps=None):
                 for p in sorted(glob.glob("air_project/debug_ir/pass_*.mlir"))
             ]
             if keep_dumps and os.path.isdir("air_project/debug_ir"):
-                shutil.copytree(
-                    "air_project/debug_ir", keep_dumps, dirs_exist_ok=True
-                )
+                shutil.copytree("air_project/debug_ir", keep_dumps, dirs_exist_ok=True)
         finally:
             os.chdir(prev_cwd)
     return dumps, error
@@ -306,9 +305,7 @@ def main():
         down_before = _first_loop(
             _braced_block(dumps[hoist_idx - 1][1], _DOWN_HERD_MARKER)
         )
-        down_after = _first_loop(
-            _braced_block(dumps[hoist_idx][1], _DOWN_HERD_MARKER)
-        )
+        down_after = _first_loop(_braced_block(dumps[hoist_idx][1], _DOWN_HERD_MARKER))
         before = len(_MOVEMENT.findall(down_before or ""))
         after = len(_MOVEMENT.findall(down_after or ""))
         mm_in = f"call @{FFN_ACCUM_MM_SYMBOL}(" in (down_after or "")
@@ -326,9 +323,7 @@ def main():
 
     # 5. the up accumulator's ping-pong fate, measured in the last AIR dump
     group_n = EMB_DIM // herd_x
-    last_air = next(
-        (t for _, t in reversed(dumps) if _UP_HERD_MARKER in t), None
-    )
+    last_air = next((t for _, t in reversed(dumps) if _UP_HERD_MARKER in t), None)
     if last_air is not None:
         up_body = _braced_block(last_air, _UP_HERD_MARKER)
         n_group_allocs = len(
@@ -346,11 +341,7 @@ def main():
     # set in the final dump (measured 2026-08-11: C+A+B, all single -- the
     # labelling ping-pongs NOTHING in this composition, so the up core sits
     # at 40 KiB of 64 and the open question is latency overlap, not fit).
-    final_bufs = Counter(
-        re.findall(
-            r"aie\.buffer\((%tile_\d+_[23])\)", dumps[-1][1]
-        )
-    )
+    final_bufs = Counter(re.findall(r"aie\.buffer\((%tile_\d+_[23])\)", dumps[-1][1]))
     if final_bufs:
         by_count = Counter(final_bufs.values())
         print(
@@ -397,9 +388,7 @@ def main():
         core_core = edges.get(("core", "core"), 0)
         total_core_core += core_core
         inbound = Counter(
-            cols_by.get(d)
-            for s, d in flows
-            if kind(s) == "shim" and kind(d) == "core"
+            cols_by.get(d) for s, d in flows if kind(s) == "shim" and kind(d) == "core"
         )
         over = {c: n for c, n in inbound.items() if n > 2}
         max_inbound = max(max_inbound, max(inbound.values(), default=0))
@@ -409,9 +398,7 @@ def main():
                 f"shim-facing inbound flows ({over})"
             )
         core_rows = Counter(r for r in rows_by.values() if r >= 2)
-        memtile_cols = sorted(
-            {cols_by[t] for t, r in rows_by.items() if r == 1}
-        )
+        memtile_cols = sorted({cols_by[t] for t, r in rows_by.items() if r == 1})
         print(
             f"[ffn-resident-probe]   device {dev_name}: core rows "
             f"{dict(sorted(core_rows.items()))}, memtile cols {memtile_cols}, "
