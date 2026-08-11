@@ -3274,6 +3274,15 @@ struct AIRRtToNpuPass : public impl::AIRRtToNpuBase<AIRRtToNpuPass> {
                 t.cfg->hasAttr(air::attrs::CoalescedShimFeed) ||
                 t.cfg->hasAttr(air::attrs::ShimFeedNoPace))
               ok = false;
+            // Packet-typed feeds share one shim queue and are serialized whole
+            // channel after whole channel; their delivery order is already the
+            // fragile thing air-fuse-packet-put-loops exists to protect, and
+            // inserting a blocking await into it is not a change this step can
+            // argue for. Leave them to the allocator's loud refusal.
+            t.cfg.walk([&](AIE::DMABDOp bd) {
+              if (bd.getPacket())
+                ok = false;
+            });
             // Exactly one release, and it must be a free (an await here would
             // mean the feed is already recycling on some other schedule).
             if (t.releases.size() != 1 ||
