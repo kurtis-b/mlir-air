@@ -277,6 +277,50 @@ non-terminating) bounds the same design space from above: the feed's legal shape
 "few enough textual instances for isolate-loop-nests" and "≤2 mutually-mergeable channels for
 fuse-channels", and today only the left constraint has a green point.
 
+### `[2026-08-11]` The crash is FIXED in source; the gate stays parked until the install carries it
+
+The compiler phase ran (queue item 6a, `mlir/lib/Transform/AIRDependencyScheduleOpt.cpp`), and
+the defect was two defects wearing one stack trace:
+
+1. **The use-after-free, as diagnosed.** The pairwise candidate loop had no notion of merge
+   *roles*: on a 3-clique {A,B,C} it accepted (A,B), (A,C) **and (B,C)**, so B's ops entered the
+   fuse-destination set (pair B,C) after already entering the erased set (pair A,B).
+   `wrapRegionsWithForLoops` **clones the wrapped region's parent and erases the original**, so
+   the erase loop's `air::isAsyncOp(e)` then read freed memory. The fix keeps the roles disjoint:
+   a channel merged away as a source is never revisited as either side of a later pair, and a
+   destination never later becomes a source. The two sets are disjoint by construction now.
+2. **Behind it, a silent N-way miscompile the crash was hiding.** The NFL wrap hardcoded
+   `ub = 2` — correct only for one destination absorbing one source. A destination absorbing k
+   sources needs **1 + k** time-multiplexed slots. The fix counts sources per destination and
+   sizes each wrap accordingly (the LB/UB path already composed N-way through its `setLB`/`setUB`
+   attribute increments; this is the wrap path's equivalent). Two destinations with *different*
+   counts sharing one wrap region — a shape nothing yet produces — now **declines loudly**
+   instead of picking either bound.
+
+**Verified**, old binary (`install-xrt`, 2026-08-07) against fixed (`build-xrt`):
+N=3 probe dump — old SEGV/hang, fixed **10/10 clean**; N=2 dump — outputs **bit-identical**
+(behavior preserved where the old pass worked); N=4 dump — clean, 4-slot wrap; **R1's own
+`pass_017` dump — old 10/10 SEGV, fixed 10/10 clean**; `check-air-mlir` tree 490 pass / 0 fail;
+new lit regression `fuse_channels_sibling_nests.mlir` (N=3 and N=4 cases, pinning the 3- and
+4-slot wraps) passes fixed and hangs the old binary — verified failing per H9's discipline.
+
+**A finding that re-dates this section's own "compiled clean twice":** the old pass's *lucky*
+green runs on R1 did not produce the fused module this phase designed. Diffing the old clean
+run's `pass_018` against the fixed output: the old output left `@channel_4` **alive with its own
+2-trip wrap** beside the destination's 2-trip wrap (pairwise-overlap debris from the same defect,
+surviving only when the freed reads happened to land on intact memory), where the fixed output
+has ONE surviving channel wrapped at **4** — 4×6 = 24 transfers, matching the herd's 24-trip
+consumer by construction. So trap 4's "a green compile proves nothing about the next run"
+sharpens to: **the green compiles' outputs were themselves wrong**. Any structural literal
+derived from a pre-fix dump of a ≥3-clique module (flow counts, shim-inbound counts, channel
+liveness) must be re-derived after the fix, not compared against.
+
+**What remains before the gate runs:** aircc sees the pass through `install-xrt`, whose write is
+operator-only — the fix reaches the R1 gate when the operator refreshes the install from
+`build-xrt`. Then: delete the one `UNSUPPORTED` line in `run_npu2_ffn_resident_peano.lit`, run
+the gate via devq, and replace the SPECS row's provisional atol with the measured figures. The
+builder-side dodges above are moot.
+
 ## Gate
 
 The transformer-layer suite, allowlist `^programming_examples/transformer_layer/`, plus a

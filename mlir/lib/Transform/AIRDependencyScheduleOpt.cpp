@@ -5206,6 +5206,12 @@ public:
       return res;
     };
 
+    // Merge destinations chosen so far. Together with chan_merge_map (whose
+    // keys are the merged-away sources) this keeps the two merge roles
+    // disjoint across pairs, which the NFL apply phase below relies on for
+    // memory safety.
+    llvm::SmallPtrSet<Operation *, 8> merge_dest_set;
+
     // Identify mergeable channel pairs and classify fusion type.
     for (unsigned i = 0; i < channelOps.size() - 1; i++) {
       for (unsigned j = i + 1; j < channelOps.size(); j++) {
@@ -5217,12 +5223,29 @@ public:
           continue;
         air::ChannelOp chanA = channelOps[i];
         air::ChannelOp chanB = channelOps[j];
+        if (mergeType == "LB" || mergeType == "UB")
+          sortChannelsByLoopNests(chanA, chanB);
+        // Keep merge roles disjoint across pairs (chanA is the destination
+        // from here on, chanB the source). A channel already merged away as a
+        // source has no ops of its own any more: NFL erases them only after
+        // ALL pairs are collected, so revisiting it here would insert the
+        // same ops into both the fuse-destination and the erased sets --
+        // wrapRegionsWithForLoops then clones-and-erases the destination
+        // regions, leaving the erase loop reading freed operations. A prior
+        // destination must likewise not be merged away as a later source:
+        // it is the surviving representative of its group, and erasing it
+        // drops the traffic of every source already folded into it. A
+        // destination absorbing several sources IS allowed; the per-
+        // destination trip count below accounts for it.
+        if (chan_merge_map.count(chanA) || chan_merge_map.count(chanB) ||
+            merge_dest_set.count(chanB.getOperation()))
+          continue;
         if (mergeType == "LB" || mergeType == "UB") {
           // Case 1: Merge via loop unpeeling (recover missing first/last
           // iterations).
-          sortChannelsByLoopNests(chanA, chanB);
           mergeChannelOpsTemporally(chanA, chanB, mergeType);
           chan_merge_map[chanB] = chanA;
+          merge_dest_set.insert(chanA.getOperation());
         } else if (mergeType == "NFL") {
           // Case 2: Fuse channels into a new loop (requires creating an
           // scf.for). Skip if either channel's ops sit inside a multi-result
@@ -5230,26 +5253,74 @@ public:
           if (opInMultiResultIfOp(chanA) || opInMultiResultIfOp(chanB))
             continue;
           chan_merge_map[chanB] = chanA;
+          merge_dest_set.insert(chanA.getOperation());
           nfl_merge_pairs.push_back(std::make_pair(chanA, chanB));
         }
       }
     }
 
     // Collect channel interface ops to fuse and erase for NFL (loop-based)
-    // merges.
+    // merges, plus how many sources each destination absorbs: a destination
+    // standing in for k erased sources must run 1 + k time-multiplexed
+    // iterations. (The LB/UB path composes N-way through its setLB/setUB
+    // attribute increments; this count is the wrap path's equivalent.)
     llvm::SetVector<Operation *> nfl_merge_destinations, nfl_erased_ops;
+    llvm::DenseMap<Operation *, unsigned> nfl_dest_src_count;
+    llvm::DenseMap<Operation *, Operation *> nfl_op_to_dest_chan;
     for (auto &[destChan, srcChan] : nfl_merge_pairs) {
       auto [toFuse, toErase] = getChannelIfOpsFusableByFor(destChan, srcChan);
       for (auto chanIf : toFuse) {
         nfl_merge_destinations.insert(chanIf);
+        nfl_op_to_dest_chan[chanIf.getOperation()] = destChan.getOperation();
       }
       for (auto chanIf : toErase) {
         nfl_erased_ops.insert(chanIf);
       }
+      nfl_dest_src_count[destChan.getOperation()]++;
     }
     // Find minimal enclosing regions for the destinations that need wrapping.
     auto nfl_merge_regions =
         findMinimalChannelIfOpContainingRegions(nfl_merge_destinations);
+    // Each wrapped region gets the trip count of the destination channel(s)
+    // whose fusable ops it contains. Two destinations sharing one region must
+    // agree on that count -- a single loop bound cannot multiplex 1 + k and
+    // 1 + k' transfers at once -- so on disagreement the whole NFL merge for
+    // this func is declined (loudly; fusion is only an optimization) rather
+    // than moving the wrong amount of data for one of them.
+    llvm::SmallPtrSet<Region *, 4> nfl_region_set(nfl_merge_regions.begin(),
+                                                  nfl_merge_regions.end());
+    llvm::DenseMap<Region *, unsigned> nfl_region_trip_counts;
+    bool nfl_trip_count_conflict = false;
+    for (Operation *op : nfl_merge_destinations) {
+      Region *containing = nullptr;
+      for (Region *r = op->getParentRegion(); r;) {
+        if (nfl_region_set.count(r)) {
+          containing = r;
+          break;
+        }
+        Operation *parentOp = r->getParentOp();
+        r = parentOp ? parentOp->getParentRegion() : nullptr;
+      }
+      if (!containing)
+        continue;
+      unsigned trips = 1 + nfl_dest_src_count[nfl_op_to_dest_chan[op]];
+      auto [it, inserted] =
+          nfl_region_trip_counts.try_emplace(containing, trips);
+      if (!inserted && it->second != trips)
+        nfl_trip_count_conflict = true;
+    }
+    if (nfl_trip_count_conflict) {
+      f->emitWarning(
+          "air-fuse-channels: NFL merge declined; destinations with "
+          "different source counts share one enclosing region, so no single "
+          "time-multiplexing loop bound is correct for both.");
+      for (auto &[destChan, srcChan] : nfl_merge_pairs)
+        chan_merge_map.erase(srcChan);
+      nfl_merge_pairs.clear();
+      nfl_merge_destinations.clear();
+      nfl_erased_ops.clear();
+      nfl_merge_regions.clear();
+    }
     IRRewriter rewriter(f.getContext());
 
     // Apply transformations: create dummy loops or wrap existing regions.
@@ -5265,7 +5336,8 @@ public:
       }
     } else {
       // Found enclosing regions → wrap them with scf.for loops.
-      wrapRegionsWithForLoops(rewriter, nfl_merge_regions);
+      wrapRegionsWithForLoops(rewriter, nfl_merge_regions,
+                              nfl_region_trip_counts);
       // Erase obsolete ops (nfl_erased_ops) and replace async semantics.
       for (auto e : nfl_erased_ops) {
         if (air::isAsyncOp(e)) {
@@ -6302,8 +6374,9 @@ private:
   /// Wraps the given regions with `scf.for` loops.
   ///
   /// For each region in `regions`, this function:
-  ///   1. Inserts a new `scf.for` loop with lower bound = 0, upper bound = 2,
-  ///   and step = 1
+  ///   1. Inserts a new `scf.for` loop with lower bound = 0, upper bound =
+  ///   the region's entry in `tripCounts` (the number of channels its
+  ///   destination time-multiplexes; 2 when absent), and step = 1
   ///      **before** the operation that owns the region.
   ///   2. Moves (clones) the parent operation of the region into the body of
   ///   the new loop.
@@ -6312,8 +6385,9 @@ private:
   ///      consumes `air::AsyncTokenType`.
   ///   4. Replaces the original parent operation with the new loop and erases
   ///   the old op.
-  void wrapRegionsWithForLoops(OpBuilder &builder,
-                               const SmallVector<Region *> &regions) {
+  void wrapRegionsWithForLoops(
+      OpBuilder &builder, const SmallVector<Region *> &regions,
+      const llvm::DenseMap<Region *, unsigned> &tripCounts) {
     for (Region *region : regions) {
       if (!region || region->empty())
         continue;
@@ -6331,10 +6405,13 @@ private:
       // Insert the new `scf.for` loop *before* the parent operation.
       builder.setInsertionPoint(parentOp);
 
-      // Create constant bounds: lb = 0, ub = 2, step = 1.
+      // Create constant bounds: lb = 0, ub = the time-multiplex count, step =
+      // 1.
+      auto tripCountIt = tripCounts.find(region);
+      int64_t ubVal = tripCountIt == tripCounts.end() ? 2 : tripCountIt->second;
       auto loc = parentOp->getLoc();
       auto lb = arith::ConstantIndexOp::create(builder, loc, 0);
-      auto ub = arith::ConstantIndexOp::create(builder, loc, 2);
+      auto ub = arith::ConstantIndexOp::create(builder, loc, ubVal);
       auto step = arith::ConstantIndexOp::create(builder, loc, 1);
 
       // Prepare to create the new loop. Also set up a remapping for SSA values
