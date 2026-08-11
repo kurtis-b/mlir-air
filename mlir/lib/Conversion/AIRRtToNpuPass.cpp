@@ -709,6 +709,13 @@ struct DmaToNpuPattern : public OpConversionPattern<airrt::DmaMemcpyNdOp> {
     if (paced)
       configTaskOp->setAttr(air::attrs::PreserveShimDmaOrder,
                             rewriter.getUnitAttr());
+    // Carry the pacing opt-out so the BD-liveness bounding step below leaves
+    // this feed fire-and-free: a feed that opted out did so because a single one
+    // of its BDs can exceed its consumer's ring depth, which is exactly the
+    // shape where awaiting task i-depth before starting task i deadlocks.
+    if (op->hasAttr(air::attrs::ShimFeedNoPace))
+      configTaskOp->setAttr(air::attrs::ShimFeedNoPace,
+                            rewriter.getUnitAttr());
     // Carry the runtime-sequence hoist marker onto the task so the
     // post-lowering reordering step can move this input feed ahead of the
     // weight stream.
@@ -1987,6 +1994,10 @@ struct AIRRtToNpuPass : public impl::AIRRtToNpuBase<AIRRtToNpuPass> {
     // DMAConfigureTaskForOp result.
     generateAwaitsFromWaitAllOps(module);
 
+    // Recycle shim buffer descriptors on any tile whose simultaneously-active
+    // BD count exceeds the hardware pool. No-op when every tile already fits.
+    boundShimBdLiveness(module);
+
     // Renumber npu dma ops
     renumberNpuDmaOps(module.getBody());
 
@@ -3055,6 +3066,347 @@ struct AIRRtToNpuPass : public impl::AIRRtToNpuBase<AIRRtToNpuPass> {
         paceSegment(tasks, /*fenceEnd=*/false);
       }
     }
+  }
+
+  // Marks a configure task whose BD this pass recycles by completion-token
+  // pacing. Read back when a sibling feed on the same tile looks for a
+  // pre-existing blocking op to sink behind.
+  static constexpr StringLiteral kBdRecycled = "air.bd_recycled";
+
+  // One shim DMA task in a runtime sequence, with the program-order facts the
+  // BD-liveness accounting needs.
+  struct ShimBdTask {
+    AIEX::DMAConfigureTaskForOp cfg;
+    AIEX::DMAStartTaskOp start = nullptr;
+    // dma_free_task / dma_await_task ops that give this task's BD back.
+    SmallVector<Operation *> releases;
+    StringRef channel;
+    int col = -1;
+    int row = -1;
+    bool mm2s = false;
+    // Program-order index of the configure and of the FIRST release; the BD is
+    // held over [birth, death). No release means the BD is held to the end.
+    unsigned birth = 0;
+    unsigned death = std::numeric_limits<unsigned>::max();
+  };
+
+  // Collect the shim DMA tasks of `blk` in program order. Tasks whose configure
+  // resolves to no aie.shim_dma_allocation (objectfifo-shaped metadata) are not
+  // collected: this step accounts only for what the shim BD allocator sees.
+  void collectShimBdTasks(Block &blk, AIE::DeviceOp device,
+                          SmallVectorImpl<ShimBdTask> &tasks) {
+    llvm::DenseMap<Operation *, unsigned> pos;
+    unsigned n = 0;
+    for (auto &o : blk)
+      pos[&o] = n++;
+    llvm::DenseMap<Operation *, unsigned> taskOfCfg;
+    for (auto &o : blk) {
+      auto cfg = dyn_cast<AIEX::DMAConfigureTaskForOp>(&o);
+      if (!cfg)
+        continue;
+      StringRef md = cfg.getAlloc().getLeafReference().getValue();
+      auto alloc = AIE::ShimDMAAllocationOp::getForSymbol(device, md);
+      if (!alloc)
+        continue;
+      auto tile = alloc.getTileOp();
+      if (!tile)
+        continue;
+      ShimBdTask t;
+      t.cfg = cfg;
+      t.channel = md;
+      t.col = tile.getCol();
+      t.row = tile.getRow();
+      t.mm2s = alloc.getChannelDir() == AIE::DMAChannelDir::MM2S;
+      t.birth = pos[&o];
+      taskOfCfg[cfg.getOperation()] = tasks.size();
+      tasks.push_back(t);
+    }
+    for (auto &t : tasks) {
+      for (auto *u : t.cfg.getResult().getUsers()) {
+        // A user outside this block is not part of the linear program order the
+        // allocator walks; leave the task's death at "never" so the accounting
+        // is conservative rather than optimistic.
+        if (u->getBlock() != &blk)
+          continue;
+        if (auto s = dyn_cast<AIEX::DMAStartTaskOp>(u)) {
+          if (!t.start)
+            t.start = s;
+        } else if (isa<AIEX::DMAFreeTaskOp, AIEX::DMAAwaitTaskOp>(u)) {
+          t.releases.push_back(u);
+          t.death = std::min(t.death, pos[u]);
+        }
+      }
+    }
+  }
+
+  // Peak simultaneously-live BDs per tile, replaying the linear walk that
+  // mlir-aie's aie-assign-runtime-sequence-bd-ids performs.
+  llvm::DenseMap<std::pair<int, int>, unsigned>
+  peakLiveBdsPerTile(ArrayRef<ShimBdTask> tasks,
+                     llvm::function_ref<bool(const ShimBdTask &)> include) {
+    llvm::DenseMap<std::pair<int, int>, unsigned> peak;
+    llvm::DenseMap<std::pair<int, int>, SmallVector<std::pair<unsigned, int>>>
+        events;
+    for (auto &t : tasks) {
+      if (!include(t))
+        continue;
+      auto key = std::make_pair(t.col, t.row);
+      events[key].push_back({t.birth, +1});
+      if (t.death != std::numeric_limits<unsigned>::max())
+        events[key].push_back({t.death, -1});
+    }
+    for (auto &kv : events) {
+      // Releases at the same index as a configure are impossible (one op per
+      // index), so a plain sort by index is a faithful replay.
+      llvm::sort(kv.second);
+      int live = 0;
+      unsigned hi = 0;
+      for (auto &e : kv.second) {
+        live += e.second;
+        hi = std::max(hi, (unsigned)std::max(0, live));
+      }
+      peak[kv.first] = hi;
+    }
+    return peak;
+  }
+
+  // Bound the number of simultaneously-active shim buffer descriptors.
+  //
+  // mlir-aie's runtime-sequence BD allocator is a linear program-order walk over
+  // one shim tile's fixed BD pool: an `aiex.dma_configure_task` takes an ID and
+  // holds it until an `aiex.dma_free_task` / `aiex.dma_await_task` gives it
+  // back. AIR emits that give-back where the `airrt.wait_all` that joined the
+  // transfer's token was, so a feed whose N tokens are all joined by ONE
+  // terminal wait_all lowers to N configures followed by N clustered releases --
+  // N BDs live at once. Past the pool (16 on a shim tile) the allocator refuses:
+  // "Too many simultaneously active buffer descriptors on tile (c,r)".
+  //
+  // The refusal is reachable from a shipped design: doc 31's resident FFN
+  // interior stages its `hidden` operand as a 4-D shim retile inside a
+  // sweeps x k_steps loop, 96 iterations, every token joined at the segment
+  // terminator -- 96 live BDs on tile (1,0) against 16.
+  //
+  // MECHANISM. The offending feed is paced with completion-token awaits: the
+  // configure issues a token and `dma_await_task(t[i-depth])` runs before
+  // `dma_start_task(t[i])`, so at most `depth` of its BDs are live. Awaits, not
+  // `dma_free_task`, because a free is only a claim: mlir-aie's own guidance is
+  // that "using dma_free_task(X) before task X has completed will lead to a race
+  // condition", so a compiler-inserted recycle has no argument to offer for it.
+  // An await consumes the task's TCT, which is proof the BD is idle.
+  //
+  // Why not fold the loop into the descriptor instead (doc 23 SS4's other
+  // candidate, loop-shaped BD programs): that only works when the transfer has a
+  // spare BD dimension. It does not here -- the retile already uses all four
+  // hardware dimensions (row-block, microtile column, row, element) in an order
+  // with no mergeable adjacent pair, and the chunk loop would be a fifth.
+  //
+  // Two invariants keep this from trading a compile refusal for a hang:
+  //  * every task converted issues a token AND is awaited exactly once (paced
+  //    awaits for the first n-depth, a drain after the last start for the rest),
+  //    so no TCT is left outstanding for a later dispatch to mis-consume;
+  //  * the paced run is SUNK to just before the first pre-existing blocking op
+  //    that follows it, so every other feed in the sequence has already been
+  //    started before the first await this step introduces can block. Sinking
+  //    cannot violate a dependence: the run's tokens were joined at the terminal
+  //    wait_all, so nothing between the old and the new position consumed them.
+  //    This is the hazard `air.runtime_hoist` exists for, closed from the other
+  //    side -- and it is why the pacing cannot starve a consumer that is waiting
+  //    on a feed the control program has not issued yet.
+  //
+  // The whole step is a no-op unless some shim tile is already over budget, so
+  // every design that compiles today lowers unchanged.
+  void boundShimBdLiveness(ModuleOp module) {
+    SmallVector<func::FuncOp> funcOps;
+    module.walk([&](func::FuncOp f) { funcOps.push_back(f); });
+    for (auto f : funcOps) {
+      auto device = f->getParentOfType<AIE::DeviceOp>();
+      if (!device || f.getBody().empty())
+        continue;
+      Block &blk = f.getBody().front();
+      const AIE::AIETargetModel &tm = device.getTargetModel();
+
+      SmallVector<ShimBdTask> tasks;
+      collectShimBdTasks(blk, device, tasks);
+      if (tasks.empty())
+        continue;
+
+      auto all = [](const ShimBdTask &) { return true; };
+      auto peak = peakLiveBdsPerTile(tasks, all);
+      SmallVector<std::pair<int, int>> overBudget;
+      for (auto &kv : peak)
+        if (kv.second > tm.getNumBDs(kv.first.first, kv.first.second))
+          overBudget.push_back(kv.first);
+      if (overBudget.empty())
+        continue;
+      // Deterministic order: the diagnostics and the transform must not depend
+      // on DenseMap iteration order.
+      llvm::sort(overBudget);
+
+      for (auto tile : overBudget) {
+        unsigned capacity = tm.getNumBDs(tile.first, tile.second);
+
+        // Candidate feeds on this tile: MM2S runs of fire-and-forget tasks whose
+        // BD releases are all clustered after the run's last start. Anything
+        // else already recycles, or owns an ordering contract this step must not
+        // rewrite.
+        llvm::MapVector<StringRef, SmallVector<unsigned>> byChannel;
+        for (auto [i, t] : llvm::enumerate(tasks))
+          if (t.col == tile.first && t.row == tile.second)
+            byChannel[t.channel].push_back(i);
+
+        SmallVector<StringRef> candidates;
+        for (auto &kv : byChannel) {
+          auto &idxs = kv.second;
+          if (idxs.size() < 3)
+            continue;
+          bool ok = true;
+          unsigned lastStart = 0;
+          for (unsigned i : idxs) {
+            auto &t = tasks[i];
+            // S2MM outputs must stay armed ahead of their producing core; this
+            // step neither paces nor sinks them.
+            if (!t.mm2s || !t.start || t.cfg.getIssueToken())
+              ok = false;
+            // Feeds carrying an ordering contract pace themselves
+            // (synthesizeDoubleBufferedAwaits) or have explicitly opted out of
+            // pacing because a single BD can exceed their consumer's ring depth.
+            if (t.cfg->hasAttr(air::attrs::PreserveShimDmaOrder) ||
+                t.cfg->hasAttr(air::attrs::CoalescedShimFeed) ||
+                t.cfg->hasAttr(air::attrs::ShimFeedNoPace))
+              ok = false;
+            // Exactly one release, and it must be a free (an await here would
+            // mean the feed is already recycling on some other schedule).
+            if (t.releases.size() != 1 ||
+                !isa<AIEX::DMAFreeTaskOp>(t.releases.front()))
+              ok = false;
+            if (!ok)
+              break;
+            lastStart = std::max(lastStart, t.birth);
+          }
+          if (!ok)
+            continue;
+          // Fire-and-forget run: every release sits after the run's last start.
+          for (unsigned i : idxs)
+            if (tasks[i].death < lastStart)
+              ok = false;
+          if (ok)
+            candidates.push_back(kv.first);
+        }
+
+        if (candidates.empty()) {
+          tasks[byChannel.begin()->second.front()].cfg->emitWarning(
+              "shim tile (" + llvm::Twine(tile.first) + "," +
+              llvm::Twine(tile.second) + ") needs " +
+              llvm::Twine(peak[tile]) + " simultaneously active buffer "
+              "descriptors against a pool of " + llvm::Twine(capacity) +
+              ", and no feed on it can be bounded by completion-token pacing; "
+              "the buffer-descriptor allocator will refuse this design");
+          continue;
+        }
+
+        // Budget: everything this step will not pace stays live as it is today.
+        llvm::DenseSet<StringRef> paced(candidates.begin(), candidates.end());
+        auto fixedPeak = peakLiveBdsPerTile(tasks, [&](const ShimBdTask &t) {
+          return t.col == tile.first && t.row == tile.second &&
+                 !paced.contains(t.channel);
+        });
+        unsigned fixed = fixedPeak.lookup(tile);
+        if (fixed + 2 * candidates.size() > capacity) {
+          tasks[byChannel.begin()->second.front()].cfg->emitWarning(
+              "shim tile (" + llvm::Twine(tile.first) + "," +
+              llvm::Twine(tile.second) + ") holds " + llvm::Twine(fixed) +
+              " un-recyclable buffer descriptors of " + llvm::Twine(capacity) +
+              ", leaving no room to double-buffer its " +
+              llvm::Twine(candidates.size()) +
+              " paceable feed(s); the buffer-descriptor allocator will refuse "
+              "this design");
+          continue;
+        }
+        // Deepest pacing the pool allows: a deeper in-flight set blocks the
+        // control program strictly less often, and the drain is the same size.
+        unsigned depth = (capacity - fixed) / candidates.size();
+
+        for (StringRef ch : candidates)
+          paceShimFeedForBdReuse(blk, tasks, byChannel[ch], depth);
+      }
+    }
+  }
+
+  // Convert one fire-and-forget shim MM2S run into a `depth`-bounded
+  // completion-token-paced run, and sink it past the feeds it must not
+  // out-order. `idxs` indexes `tasks` in program order.
+  void paceShimFeedForBdReuse(Block &blk, SmallVectorImpl<ShimBdTask> &tasks,
+                              ArrayRef<unsigned> idxs, unsigned depth) {
+    unsigned n = idxs.size();
+    if (n <= depth || depth < 2)
+      return;
+
+    llvm::DenseSet<Operation *> runOps;
+    for (unsigned i : idxs) {
+      runOps.insert(tasks[i].cfg.getOperation());
+      runOps.insert(tasks[i].start.getOperation());
+      for (auto *r : tasks[i].releases)
+        runOps.insert(r);
+    }
+
+    // Sink anchor: the first pre-existing blocking op after the run that is not
+    // the run's own. Everything before it has been issued by the time our first
+    // await can block. With no such op the run is already last and stays put.
+    Operation *lastStart = tasks[idxs.back()].start.getOperation();
+    Operation *anchor = nullptr;
+    for (Operation *o = lastStart->getNextNode(); o; o = o->getNextNode()) {
+      auto aw = dyn_cast<AIEX::DMAAwaitTaskOp>(o);
+      if (!aw || runOps.contains(o))
+        continue;
+      // An await this step already inserted for a SIBLING recycled feed is not
+      // a pre-existing blocking op: sinking behind it would put this run after
+      // a barrier that is itself waiting on the pipeline, not before it.
+      if (auto *def = aw.getTask().getDefiningOp())
+        if (def->hasAttr(kBdRecycled))
+          continue;
+      anchor = o;
+      break;
+    }
+
+    // The clustered frees are superseded: an await gives the BD back too (the
+    // allocator emits the free for us), and leaving them would double-free a
+    // task the drain already awaited.
+    for (unsigned i : idxs)
+      for (auto *r : tasks[i].releases)
+        r->erase();
+    for (unsigned i : idxs)
+      tasks[i].releases.clear();
+
+    if (anchor)
+      for (unsigned i : idxs) {
+        tasks[i].cfg->moveBefore(anchor);
+        tasks[i].start->moveBefore(anchor);
+      }
+
+    // A task can only be awaited if it issues a completion token.
+    for (unsigned i : idxs) {
+      tasks[i].cfg.setIssueToken(true);
+      tasks[i].cfg->setAttr(kBdRecycled,
+                            UnitAttr::get(tasks[i].cfg->getContext()));
+    }
+
+    // Pace: give task i-depth's BD back before task i takes one. The await goes
+    // before the CONFIGURE, not before the start -- the allocator hands out the
+    // ID at the configure, so an await placed one op later is one ID too late.
+    for (unsigned i = depth; i < n; i++) {
+      auto cfgOp = tasks[idxs[i]].cfg;
+      OpBuilder b(cfgOp);
+      AIEX::DMAAwaitTaskOp::create(b, cfgOp.getLoc(),
+                                   tasks[idxs[i - depth]].cfg.getResult());
+    }
+    // Drain the in-flight tail, so every token this step created is consumed
+    // exactly once.
+    auto tailStart = tasks[idxs[n - 1]].start;
+    OpBuilder b(tailStart);
+    b.setInsertionPointAfter(tailStart);
+    for (unsigned j = n - depth; j < n; j++)
+      AIEX::DMAAwaitTaskOp::create(b, tailStart.getLoc(),
+                                   tasks[idxs[j]].cfg.getResult());
   }
 
   // Purge DMA async tokens - they are no longer needed after WaitAllOp
