@@ -27,10 +27,21 @@
 //     byte.
 //   - Include guarded, so including it twice in one translation unit is safe.
 //
-// FOOTGUN: variance is E[x^2] - E[x]^2, which cancels when a row's mean is
-// large next to its spread and can round below zero. Both sites clamp it at
-// zero before aie::invsqrt, because invsqrt of a negative operand returns NaN
-// and would poison the whole row. Keep the clamp if you add another site.
+// STATISTICS ARE f32 AND THE VARIANCE IS TWO-PASS: mean first, then
+// E[(x - mean)^2], the same discipline as layer_norm/layer_norm.cc and for the
+// same measured reason (doc 23 item 2). The one-pass E[x^2] - E[x]^2 form both
+// fused templates used to ship -- with the row sum accumulating in bf16 --
+// loses a row's variance entirely once its mean is large next to its spread:
+// the collapse boundary is between |mean|/sigma 2 and 4
+// (agents/probes/probe_addnorm_variance_cliff.py), where E[x^2] and E[x]^2
+// become the same bf16 number, the variance clamps at zero, and the row
+// normalizes by 1/sqrt(eps) ~ 316. Offset rows are valid inputs under every
+// builder that links these objects; the *_offset opcheck rows pin the regime.
+//
+// The two-pass variance is non-negative by construction, but the clamp before
+// aie::invsqrt stays: invsqrt of a negative operand returns NaN and would
+// poison the whole row, and the clamp is one compare against that class of
+// surprise. Keep it if you add another site.
 //
 //===----------------------------------------------------------------------===//
 
@@ -44,6 +55,15 @@
 //
 // See the ADDNORM_PRE_ADD table at the top of this file. The flag also moves
 // the mean/variance reduction from `input` to `input + residual`.
+//
+// Statistics follow layer_norm.cc's layer_norm_rows_impl: the row sum widens
+// to f32 lane-by-lane, the variance is two-pass E[(x - mean)^2] with the
+// deviations exact in f32 (every bf16 value is exact in f32) and rounded to
+// bf16 only for the squaring, and the normalization applies
+// (x - mean) * inv_std in f32 with one rounding to bf16 before the weight
+// multiply. Under ADDNORM_PRE_ADD the elementwise sum itself is bf16 -- the
+// same single rounding a caller that materializes it (norm_tail's stage_add)
+// pays -- and is recomputed per pass rather than materialized.
 template <typename T, int N>
 void fused_add_layer_norm_1(const T *__restrict input,
                             const T *__restrict residual,
@@ -52,52 +72,62 @@ void fused_add_layer_norm_1(const T *__restrict input,
   event0();
 #ifndef DEBUG_AIE_KERNELS
   constexpr float epsilon = 1e-5f;
-  int vector_chunks = cols / N;
+  const int vector_chunks = cols / N;
 
   AIE_PREPARE_FOR_PIPELINING
   AIE_LOOP_MIN_ITERATION_COUNT(4)
   for (int row = 0; row < rows_to_process; row++) {
-
-    ::aie::vector<T, N> sum_acc = ::aie::zeros<T, N>();
-    ::aie::vector<float, N> sum_sq_acc = ::aie::zeros<float, N>();
     int input_idx = row * cols;
 
-    // Pass 1: accumulate sum and sum-of-squares for this row.
+    // Pass 1: the row sum, widened to f32 lane-by-lane before accumulating.
+    ::aie::vector<float, N> sum_acc = ::aie::zeros<float, N>();
     for (int i = 0; i < vector_chunks; i++) {
-
       ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input + input_idx);
 #ifdef ADDNORM_PRE_ADD
       // Statistics are taken over (input + residual), not over input alone.
       ::aie::vector<T, N> reg_res = ::aie::load_v<N>(residual + input_idx);
-      ::aie::vector<T, N> reg_preadd = ::aie::add(reg_a, reg_res);
-      sum_acc = ::aie::add(sum_acc, reg_preadd);
-      ::aie::vector<float, N> sq_acc = ::aie::mul(reg_preadd, reg_preadd);
+      ::aie::vector<T, N> reg_stat = ::aie::add(reg_a, reg_res);
 #else
-      sum_acc = ::aie::add(sum_acc, reg_a);
-      ::aie::vector<float, N> sq_acc = ::aie::mul(reg_a, reg_a);
+      ::aie::vector<T, N> reg_stat = reg_a;
 #endif
-      sum_sq_acc = ::aie::add(sum_sq_acc, sq_acc);
+      ::aie::accum<accfloat, N> s_acc;
+      s_acc.from_vector(reg_stat);
+      sum_acc = ::aie::add(sum_acc, s_acc.template to_vector<float>());
       input_idx += N;
     }
+    input_idx -= cols;
+    const float mean = ::aie::reduce_add(sum_acc) / float(cols);
 
-    float sum_of_vals = ::aie::reduce_add(sum_acc);
-    float sum_of_sq_vals = ::aie::reduce_add(sum_sq_acc);
-
-    float mean = sum_of_vals / float(cols);
-    float mean_sq = mean * mean;
-    float variance = (sum_of_sq_vals / float(cols)) - mean_sq;
-    // E[x^2] - E[x]^2 can round below zero when the row's spread is small next
-    // to its mean; invsqrt of a negative operand is NaN, which would poison the
-    // whole row. Clamp to the true zero-variance case instead.
+    // Pass 2: E[(x - mean)^2]. The one-pass form this replaced loses the
+    // variance whole on offset rows; see the file header.
+    ::aie::vector<float, N> sum_sq_acc = ::aie::zeros<float, N>();
+    for (int i = 0; i < vector_chunks; i++) {
+      ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input + input_idx);
+#ifdef ADDNORM_PRE_ADD
+      ::aie::vector<T, N> reg_res = ::aie::load_v<N>(residual + input_idx);
+      ::aie::vector<T, N> reg_stat = ::aie::add(reg_a, reg_res);
+#else
+      ::aie::vector<T, N> reg_stat = reg_a;
+#endif
+      ::aie::accum<accfloat, N> s_acc;
+      s_acc.from_vector(reg_stat);
+      ::aie::accum<accfloat, N> diff_acc = ::aie::sub(s_acc, mean);
+      ::aie::vector<T, N> diff_v = diff_acc.template to_vector<T>();
+      ::aie::vector<float, N> sq_v = ::aie::mul(diff_v, diff_v);
+      sum_sq_acc = ::aie::add(sum_sq_acc, sq_v);
+      input_idx += N;
+    }
+    float variance = ::aie::reduce_add(sum_sq_acc) / float(cols);
+    // Non-negative by construction now; kept because invsqrt of a negative
+    // operand returns NaN and would poison the whole row.
     if (variance < 0.0f) {
       variance = 0.0f;
     }
-    float inv_std = aie::invsqrt(variance + epsilon);
+    const float inv_std = aie::invsqrt(variance + epsilon);
 
-    ::aie::vector<T, N> mean_v = ::aie::broadcast<T, N>(mean);
-    ::aie::vector<T, N> inv_std_v = ::aie::broadcast<T, N>(inv_std);
-
-    // Pass 2: normalize, scale, and emit. pIn restarts at the head of the row.
+    // Pass 3: (x - mean) * inv_std in f32, one rounding to bf16, then the
+    // weight multiply and the residual ordering. pIn restarts at the head of
+    // the row.
     const T *__restrict pW = weight;
     const T *__restrict pIn = input + row * cols;
     const T *__restrict pRes = residual + row * cols;
@@ -108,13 +138,17 @@ void fused_add_layer_norm_1(const T *__restrict input,
       ::aie::vector<T, N> reg_weight = ::aie::load_v<N>(pW);
       ::aie::vector<T, N> reg_res = ::aie::load_v<N>(pRes);
 #ifdef ADDNORM_PRE_ADD
-      ::aie::vector<T, N> reg_preadd = ::aie::add(reg_a, reg_res);
-      ::aie::vector<T, N> diff_v = ::aie::sub(reg_preadd, mean_v);
+      ::aie::vector<T, N> reg_stat = ::aie::add(reg_a, reg_res);
 #else
-      ::aie::vector<T, N> diff_v = ::aie::sub(reg_a, mean_v);
+      ::aie::vector<T, N> reg_stat = reg_a;
 #endif
-      ::aie::vector<T, N> norm_v = ::aie::mul(diff_v, inv_std_v);
-      ::aie::vector<T, N> scaled_v = aie::mul(norm_v, reg_weight);
+      ::aie::accum<accfloat, N> s_acc;
+      s_acc.from_vector(reg_stat);
+      ::aie::accum<accfloat, N> diff_acc = ::aie::sub(s_acc, mean);
+      ::aie::accum<accfloat, N> norm_acc =
+          ::aie::mul(diff_acc.template to_vector<float>(), inv_std);
+      ::aie::vector<T, N> scaled_v =
+          aie::mul(norm_acc.template to_vector<T>(), reg_weight);
 #ifdef ADDNORM_PRE_ADD
       // Residual is already inside scaled_v; do NOT add it a second time.
       ::aie::store_v(pOut, scaled_v);
@@ -169,7 +203,8 @@ void fused_add_layer_norm_1(const T *__restrict input,
 //                           output2 = input + residual  (raw pre-add sum, which
 //                           downstream uses as the next block's residual)
 //
-// See the ADDNORM_PRE_ADD table at the top of this file.
+// See the ADDNORM_PRE_ADD table at the top of this file. Statistics follow
+// the same f32 two-pass discipline as fused_add_layer_norm_1 above.
 template <typename T, int N>
 void fused_add_layer_norm_2(const T *__restrict input,
                             const T *__restrict residual,
@@ -179,51 +214,61 @@ void fused_add_layer_norm_2(const T *__restrict input,
   event0();
 #ifndef DEBUG_AIE_KERNELS
   constexpr float epsilon = 1e-5f;
-  int vector_chunks = cols / N;
+  const int vector_chunks = cols / N;
 
   AIE_PREPARE_FOR_PIPELINING
   AIE_LOOP_MIN_ITERATION_COUNT(4)
   for (int row = 0; row < rows_to_process; row++) {
-
-    ::aie::vector<T, N> sum_acc = ::aie::zeros<T, N>();
-    ::aie::vector<float, N> sum_sq_acc = ::aie::zeros<float, N>();
     int input_idx = row * cols;
 
-    // Pass 1: accumulate sum and sum-of-squares for this row.
+    // Pass 1: the row sum, widened to f32 lane-by-lane before accumulating.
+    ::aie::vector<float, N> sum_acc = ::aie::zeros<float, N>();
     for (int i = 0; i < vector_chunks; i++) {
-
       ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input + input_idx);
 #ifdef ADDNORM_PRE_ADD
       // Statistics are taken over (input + residual), not over input alone.
       ::aie::vector<T, N> reg_res = ::aie::load_v<N>(residual + input_idx);
-      ::aie::vector<T, N> reg_preadd = ::aie::add(reg_a, reg_res);
-      sum_acc = ::aie::add(sum_acc, reg_preadd);
-      ::aie::vector<float, N> sq_acc = ::aie::mul(reg_preadd, reg_preadd);
+      ::aie::vector<T, N> reg_stat = ::aie::add(reg_a, reg_res);
 #else
-      sum_acc = ::aie::add(sum_acc, reg_a);
-      ::aie::vector<float, N> sq_acc = ::aie::mul(reg_a, reg_a);
+      ::aie::vector<T, N> reg_stat = reg_a;
 #endif
-      sum_sq_acc = ::aie::add(sum_sq_acc, sq_acc);
+      ::aie::accum<accfloat, N> s_acc;
+      s_acc.from_vector(reg_stat);
+      sum_acc = ::aie::add(sum_acc, s_acc.template to_vector<float>());
       input_idx += N;
     }
+    input_idx -= cols;
+    const float mean = ::aie::reduce_add(sum_acc) / float(cols);
 
-    float sum_of_vals = ::aie::reduce_add(sum_acc);
-    float sum_of_sq_vals = ::aie::reduce_add(sum_sq_acc);
-
-    float mean = sum_of_vals / float(cols);
-    float mean_sq = mean * mean;
-    float variance = (sum_of_sq_vals / float(cols)) - mean_sq;
-    // Same clamp as the 1-output form: without it a row whose variance rounds
-    // negative emits NaN for every element.
+    // Pass 2: E[(x - mean)^2]; see fused_add_layer_norm_1.
+    ::aie::vector<float, N> sum_sq_acc = ::aie::zeros<float, N>();
+    for (int i = 0; i < vector_chunks; i++) {
+      ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input + input_idx);
+#ifdef ADDNORM_PRE_ADD
+      ::aie::vector<T, N> reg_res = ::aie::load_v<N>(residual + input_idx);
+      ::aie::vector<T, N> reg_stat = ::aie::add(reg_a, reg_res);
+#else
+      ::aie::vector<T, N> reg_stat = reg_a;
+#endif
+      ::aie::accum<accfloat, N> s_acc;
+      s_acc.from_vector(reg_stat);
+      ::aie::accum<accfloat, N> diff_acc = ::aie::sub(s_acc, mean);
+      ::aie::vector<T, N> diff_v = diff_acc.template to_vector<T>();
+      ::aie::vector<float, N> sq_v = ::aie::mul(diff_v, diff_v);
+      sum_sq_acc = ::aie::add(sum_sq_acc, sq_v);
+      input_idx += N;
+    }
+    float variance = ::aie::reduce_add(sum_sq_acc) / float(cols);
+    // Same clamp as the 1-output form: non-negative by construction, kept as
+    // the NaN guard.
     if (variance < 0.0f) {
       variance = 0.0f;
     }
-    float inv_std = aie::invsqrt(variance + epsilon);
+    const float inv_std = aie::invsqrt(variance + epsilon);
 
-    ::aie::vector<T, N> mean_v = ::aie::broadcast<T, N>(mean);
-    ::aie::vector<T, N> inv_std_v = ::aie::broadcast<T, N>(inv_std);
-
-    // Pass 2: normalize, scale, and emit. pIn restarts at the head of the row.
+    // Pass 3: (x - mean) * inv_std in f32, one rounding to bf16, then the
+    // weight multiply and the residual ordering. pIn restarts at the head of
+    // the row.
     const T *__restrict pW = weight;
     const T *__restrict pIn = input + row * cols;
     const T *__restrict pRes = residual + row * cols;
@@ -235,18 +280,23 @@ void fused_add_layer_norm_2(const T *__restrict input,
       ::aie::vector<T, N> reg_weight = ::aie::load_v<N>(pW);
       ::aie::vector<T, N> reg_res = ::aie::load_v<N>(pRes);
 #ifdef ADDNORM_PRE_ADD
-      ::aie::vector<T, N> reg_preadd = ::aie::add(reg_a, reg_res);
-      ::aie::vector<T, N> diff_v = ::aie::sub(reg_preadd, mean_v);
+      ::aie::vector<T, N> reg_stat = ::aie::add(reg_a, reg_res);
 #else
-      ::aie::vector<T, N> diff_v = ::aie::sub(reg_a, mean_v);
+      ::aie::vector<T, N> reg_stat = reg_a;
 #endif
-      ::aie::vector<T, N> norm_v = ::aie::mul(diff_v, inv_std_v);
-      ::aie::vector<T, N> scaled_v = aie::mul(norm_v, reg_weight);
+      ::aie::accum<accfloat, N> s_acc;
+      s_acc.from_vector(reg_stat);
+      ::aie::accum<accfloat, N> diff_acc = ::aie::sub(s_acc, mean);
+      ::aie::accum<accfloat, N> norm_acc =
+          ::aie::mul(diff_acc.template to_vector<float>(), inv_std);
+      ::aie::vector<T, N> scaled_v =
+          aie::mul(norm_acc.template to_vector<T>(), reg_weight);
 #ifdef ADDNORM_PRE_ADD
       // Residual is already inside scaled_v; do NOT add it a second time.
-      // output2 exports the raw pre-add sum for the next block's residual path.
+      // output2 exports the raw pre-add sum (reg_stat, bf16) for the next
+      // block's residual path.
       ::aie::store_v(pOut1, scaled_v);
-      ::aie::store_v(pOut2, reg_preadd);
+      ::aie::store_v(pOut2, reg_stat);
 #else
       // ::aie::vector<T, N> out_v = ::aie::add(scaled_v, beta_v);
       ::aie::vector<T, N> out_v = ::aie::add(scaled_v, reg_res);

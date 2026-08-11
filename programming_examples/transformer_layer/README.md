@@ -1501,8 +1501,13 @@ Footguns that cost time, in the order they fired:
   statistics — and every design linking `layer_norm.o` improved for free: the `layer_norm`
   operator's own rows went from mean_rel_L1 2.0e-3 to 8.1e-5 (rtol now covers every element),
   and the pipeline's from 4.4e-3 to 3.6e-3. The fused addnorm kernels (`encoder.cc`,
-  `addnorm_ffn_norm.cc`) still carry the one-pass form; their file-header footgun notes say so
-  and their gates measure it.
+  `addnorm_ffn_norm.cc`) carried the one-pass form until 2026-08-11, when doc 23 item 2's addnorm
+  half moved both dispatched variants to the same two-pass f32 statistics and added the
+  `64x512_offset` / `64x768_pre_add_offset` catalogue rows (provisional atol, the sibling rows',
+  until their first hardware run). The addnorm gates' recorded figures are still the one-pass
+  kernel's until the post-merge re-measure; only `encoder.cc`'s staged forms — whose sum/sumsq
+  interface is the one-pass decomposition, dispatched by no builder — keep one-pass statistics,
+  and their file-header footgun notes say so.
 
 ## Phase J7b: `ffn_accum` — the compiler-formed accumulator ring
 
