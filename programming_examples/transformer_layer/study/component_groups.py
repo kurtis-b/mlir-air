@@ -68,6 +68,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import traceback
 from dataclasses import dataclass
 
@@ -369,14 +370,21 @@ def main(argv: list[str] | None = None) -> int:
         dispatch = prepared["dispatch"]
         for _ in range(args.warmup):
             dispatch(prepared["inputs"], run_mode._stage_stats)
+        # The whole-layer clock, wrapped around the SAME dispatch the groups are
+        # read from -- one iteration, not a distribution. It exists so the
+        # report can state the unattributed remainder, which is the number this
+        # table is really about; it is NOT a latency measurement and
+        # `run_mode.py` remains the only thing that produces one.
+        started = time.perf_counter()
         _outputs, extra = dispatch(prepared["inputs"], run_mode._stage_stats)
+        whole_layer_ms = (time.perf_counter() - started) * 1000.0
     except Exception as e:
         print(f"[component-groups] {args.mode}: {type(e).__name__}: {e}")
         traceback.print_exc()
         return 1
 
     totals = aggregate(extra, csv_mode)
-    report = render(totals, execution_mode=csv_mode)
+    report = render(totals, execution_mode=csv_mode, avg_latency_ms=whole_layer_ms)
     print(report)
     if args.md:
         with open(args.md, "w", encoding="utf-8") as fh:
