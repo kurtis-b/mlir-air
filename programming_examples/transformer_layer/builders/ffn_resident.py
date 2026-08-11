@@ -299,7 +299,9 @@ def build_ffn_resident_module(
 
     # L2: every staged buffer holds ONE step. Doubled for possible ping-pong,
     # as ffn_accum's guard does.
-    l2_need = 2 * itemsize * (chunk_elems + herd_x * up_b_block + chunk_elems + down_chunk)
+    l2_need = (
+        2 * itemsize * (chunk_elems + herd_x * up_b_block + chunk_elems + down_chunk)
+    )
     if l2_need > L2_BYTES:
         raise ValueError(
             f"staged slices need {l2_need} B ping-ponged, over the "
@@ -310,9 +312,10 @@ def build_ffn_resident_module(
     # buffer across the sweep loop is measured by the structure probe, not
     # assumed here -- if it does, this guard understates and aiecc's
     # allocator refuses loudly.
-    l1_up = itemsize * (
-        2 * (TILE_M * tile_k) + 2 * (tile_k * group_n) + TILE_M * group_n
-    ) + L1_STACK_BYTES
+    l1_up = (
+        itemsize * (2 * (TILE_M * tile_k) + 2 * (tile_k * group_n) + TILE_M * group_n)
+        + L1_STACK_BYTES
+    )
     if l1_up > L1_BYTES:
         raise ValueError(
             f"the up core needs {l1_up} B of L1 (pp A + pp B + resident C), "
@@ -327,9 +330,7 @@ def build_ffn_resident_module(
 
     l2_space = IntegerAttr.get(T.i32(), MemorySpace.L2)
     l2_a_up_ty = MemRefType.get([chunk_elems], xrt_dtype, memory_space=l2_space)
-    l2_b_up_ty = MemRefType.get(
-        [herd_x * up_b_block], xrt_dtype, memory_space=l2_space
-    )
+    l2_b_up_ty = MemRefType.get([herd_x * up_b_block], xrt_dtype, memory_space=l2_space)
     l2_h_ty = MemRefType.get([chunk_elems], xrt_dtype, memory_space=l2_space)
     l2_b_down_ty = MemRefType.get([down_chunk], xrt_dtype, memory_space=l2_space)
 
@@ -366,9 +367,7 @@ def build_ffn_resident_module(
         @launch(operands=[arg0, arg1, arg2, arg3])
         def fr_launch(l_hidden, l_wup, l_wdown, l_y):
 
-            @segment(
-                name="ffn_resident_seg", operands=[l_hidden, l_wup, l_wdown, l_y]
-            )
+            @segment(name="ffn_resident_seg", operands=[l_hidden, l_wup, l_wdown, l_y])
             def fr_seg(s_hidden, s_wup, s_wdown, s_y):
                 l2_a_up = AllocOp(l2_a_up_ty, [], [])
                 l2_b_up = AllocOp(l2_b_up_ty, [], [])
@@ -408,9 +407,7 @@ def build_ffn_resident_module(
                         DeallocOp(l1_c)
                         yield_([])
 
-                up_herd.attributes["link_with"] = StringAttr.get(
-                    FFN_ACCUM_KERNEL_OBJ
-                )
+                up_herd.attributes["link_with"] = StringAttr.get(FFN_ACCUM_KERNEL_OBJ)
 
                 @herd(name="ffn_res_gelu", sizes=[herd_x, 1])
                 def gelu_herd(tx, ty, _sx, _sy):
@@ -481,9 +478,7 @@ def build_ffn_resident_module(
                         DeallocOp(l1_c)
                         yield_([])
 
-                down_herd.attributes["link_with"] = StringAttr.get(
-                    FFN_ACCUM_KERNEL_OBJ
-                )
+                down_herd.attributes["link_with"] = StringAttr.get(FFN_ACCUM_KERNEL_OBJ)
 
                 # ---- UP FEED (emitted after the herds; see FOOTGUNS) ----
                 # Per (sweep, k'): refill the hidden k'-slice -- ROW-MAJOR in
@@ -571,9 +566,7 @@ def build_ffn_resident_module(
                                 src_strides=[1],
                             )
                             for tx in range(herd_x):
-                                ChannelPut(
-                                    CHANNEL_DOWN_FEED, l2_h, indices=[tx, 0]
-                                )
+                                ChannelPut(CHANNEL_DOWN_FEED, l2_h, indices=[tx, 0])
                                 ChannelPut(
                                     CHANNEL_DOWN_FEED,
                                     l2_b_down,
