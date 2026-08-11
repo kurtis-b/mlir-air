@@ -508,21 +508,27 @@ host torch, with both LayerNorms and the GeLU. The artifact records
 **`[2026-08-09]` It has TWO packaging paths, and the difference between them is
 the mode's defining axis.** The same 30 dispatches run either over five
 xclbins with the `hw_context` torn down and reloaded before each one — 30
-reconfigurations, the ELF path, still the **default** — or over **one** xclbin
-holding all five shapes, loaded once with four kernel attaches. Set
-`AIR_OFFLOAD_SHARED_XCLBIN=1` for the second; `make check-offload-shared` gates
-it. The dispatch vector is identical either way, by design, because the mode
-makes one `run_sequence` call per GEMM regardless — so reconfiguration is
-counted separately, by `KernelCache.reconfiguration_counts()`, and both recipes
-in `run_npu2_offload_peano.lit` pin it.
+reconfigurations, the ELF path — or over **one** xclbin holding all five
+shapes, loaded once with four kernel attaches. `[2026-08-11]` **The shared
+path is the DEFAULT**: the flip doc 29 §What this does not do scoped landed
+once the shared chain gated at 4096, and the ELF packaging is now the
+legacy/control opt-in, `AIR_OFFLOAD_LEGACY_ELF=1` (the retired
+`AIR_OFFLOAD_SHARED_XCLBIN` raises if set at all). `make check-offload-shared`
+gates the default with no env var; the mode makes one `run_sequence` call per
+GEMM regardless of packaging, so reconfiguration is counted separately, by
+`KernelCache.reconfiguration_counts()`, and the recipes in
+`run_npu2_offload_peano.lit` pin it on both paths.
 
-Two facts worth carrying: the shared chain **only builds where every module is
-single-launch**, which rules out 4096, where the down-projection is a two-launch
-`fused-cast`; and this mode's status as the noisiest of the four is
-**measured to be removable** — 316.9% intra-walk spread on the ELF path against
-17.6% on the shared one at 512 — though the switch changes the ABI as well as
-the reconfiguration, so `_evict_context` is the leading candidate rather than a
-demonstrated cause. Both are written up in
+Two facts worth carrying: the shared chain **only runs where every module is
+single-launch** — a PLATFORM bound since the 2026-08-11 hardware verdict
+(in-stream `load_pdi` faults the firmware), which at 4096 pins the two-launch
+`fused-cast` down-projection to its measured `drain` row; and this mode's
+status as the noisiest of the four is **measured to be removable** — 316.9%
+intra-walk spread on the ELF path against 17.6% on the shared one at 512 —
+though the switch changes the ABI as well as the reconfiguration, so
+`_evict_context` is the leading candidate rather than a demonstrated cause.
+Every recorded `offload` latency/variance number predates the flip and
+describes the ELF path; the four-mode re-walk is owed. Both are written up in
 `docs/plans/transformer-layer-execution-studies/29-offload-n-streams.md`.
 
 This mode used to dispatch six GEMMs and call itself a *hybrid* boundary,

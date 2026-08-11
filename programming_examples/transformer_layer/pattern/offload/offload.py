@@ -40,27 +40,30 @@ WHAT THIS MODE ISOLATES, AND WHY IT IS NOT "THE HOST-MEDIATED EXTREME"
     ``run_npu2_offload_peano.lit``, which pins the reconfiguration counters on
     each.
 
-    Two limits travel with it, and neither is a to-do hidden in a docstring:
+    `[2026-08-11]` THE SHARED PATH IS THE DEFAULT, and the ELF path is the
+    opt-in. This is the flip doc 29 §What this does not do scoped ("fix the
+    4096 wall first, then flip"), taken the day its precondition was met: the
+    shared chain runs and GATES at 4096 -- the mode's own SPECS shape --
+    through the ``drain`` pin (the platform faults in-stream ``load_pdi``, so
+    ``offload_config`` re-resolves a ``fused-cast`` tier winner to the
+    shape's measured ``drain`` row under this path; doc 29 §The hardware
+    verdict). An unconfigured run now configures the array ONCE per layer,
+    which is what the mode's definition asks for. Three consequences travel
+    with the flip, and none is a to-do hidden in a docstring:
 
-    - **The ELF path is still the DEFAULT**, so an unconfigured run pays a
-      reconfiguration per dispatch and the sentence above describes it. The
-      shared path is opt-in because it trades ~20% of best-case latency at 512
-      for a ~20x reduction in run-to-run spread, and because flipping the
-      default re-dates every recorded ``offload`` number (doc 29 §What this
-      does not do).
-    - **The shared path's 4096 wall is down at COMPILE time, pending the
-      install rebuild.** At 4096 the down-projection is a two-launch
-      ``fused-cast``; the backend's fixed ``air.insts.bin`` name used to
-      collide with itself and bounded the chain to 1024. `[2026-08-10]`
-      ``XRTBackend.compile`` now packages a multi-launch xclbin module as its
-      "main" orchestration device -- one kernel, one instruction stream with
-      per-launch ``load_pdi`` embedded, per-launch PDIs merged kernel-less
-      into the partition -- and the five-shape chain builds at 4096 (doc 29
-      §The 4096 wall, dated close-out; fixture
-      ``test/xrt/56_multi_launch_xclbin_compile``). The change lives in
-      ``python/air/backend/xrt.py``, so the RUNTIME sees it only after the
-      coordinated ``install-xrt`` rebuild, and no multi-launch xclbin has yet
-      DISPATCHED on hardware -- the gate stays at 1024 until that phase.
+    - **The ELF packaging is now the LEGACY/CONTROL arm**, opt-in via
+      ``AIR_OFFLOAD_LEGACY_ELF=1``: unchanged, fully gated, one
+      ``hw_context`` reload per dispatch (see ``_evict_context``) -- the
+      maximum reconfiguration cost in the mode defined to minimize it, which
+      is why it no longer gets to be the default. Latency did not decide the
+      name; the taxonomy did (doc 29's recorded decision).
+    - **Every ``offload`` latency/variance number recorded before 2026-08-11
+      describes the ELF path** -- doc 27's four-mode table included. The
+      four-mode re-walk is the flip's recorded cost and a separate hardware
+      task.
+    - **``AIR_OFFLOAD_SHARED_XCLBIN`` is retired and RAISES** if set at all;
+      see the guard above ``LEGACY_ELF`` for why silence is the one behavior
+      it must not have.
 
 THE TWO ATTENTION MATMULS ARE LINEAR, SO THEY ARE ON THE DEVICE
     `[2026-08-08]` They resolve in no registry — ``sweep_families.py`` derives
@@ -104,11 +107,13 @@ THE RULE THAT DECIDES WHETHER THIS MODE MEASURES ANYTHING
     are the same call compares a value against itself.
 
 FOOTGUNS
-    - ``OFFLOAD_CACHE_DIR`` is this mode's OWN ELF cache, in
+    - ``OFFLOAD_CACHE_DIR`` is this mode's OWN artifact cache, in
       ``transformer_layer/.gitignore`` AND the Makefile ``clean`` target.
       ``KernelCache`` picks the directory by NAME, so two modes sharing one
-      can trade ELFs whose fingerprints happen to agree — numerically valid
-      output attributed to the wrong execution boundary.
+      can trade artifacts whose fingerprints happen to agree — numerically
+      valid output attributed to the wrong execution boundary. The mode's own
+      TWO packagings are the sharpest case of the same trap; see the comment
+      on the constant.
     - The six dispatches are six SEPARATE ``run_sequence`` calls on purpose.
       Under the ELF ABI ``run_sequence`` merges every step it is given into
       ONE submission, so batching the six steps into one call would record
@@ -169,22 +174,54 @@ from pattern.reference import (  # noqa: E402
     generate_golden_reference,
 )
 
-#: This mode's ELF cache, relative to the working directory. Its OWN — see the
-#: module footguns.
+# `[2026-08-11]` The RETIRED switch. ``AIR_OFFLOAD_SHARED_XCLBIN=1`` selected
+# the shared path while the ELF packaging was the default; the default flipped
+# per the decision recorded in doc 29 §What this does not do, so the variable
+# now selects nothing -- and a script still setting it expects semantics this
+# module no longer has. Refusing ANY setting is deliberate: ``=1`` would be
+# redundant today and diverge silently if the default ever moved again, while
+# ``=0`` (or empty) would silently run the OPPOSITE packaging to the one the
+# script was written to measure. Both failure shapes are indistinguishable in
+# the logs from a correct run, which per doc 29's own rule means the default
+# has to be an error.
+if "AIR_OFFLOAD_SHARED_XCLBIN" in os.environ:
+    raise RuntimeError(
+        "AIR_OFFLOAD_SHARED_XCLBIN is retired: the shared xclbin has been "
+        "offload's DEFAULT packaging since 2026-08-11 (doc 29 §What this does "
+        "not do). Unset it. For the legacy/control ELF packaging -- five "
+        "xclbins, one hw_context reload per dispatch -- set "
+        "AIR_OFFLOAD_LEGACY_ELF=1 instead."
+    )
+
+#: Whether the mode runs its GEMMs over the LEGACY/CONTROL packaging: one
+#: artifact per shape over the ELF ABI, every dispatch in a fresh
+#: ``hw_context`` (see ``_evict_context``), 30 reconfigurations per layer.
+#: ``AIR_OFFLOAD_LEGACY_ELF=1`` opts in. It is the packaging every ``offload``
+#: number recorded before 2026-08-11 describes, kept fully functional and
+#: gated as the control arm — and as maximum reconfiguration it contradicts
+#: the mode's definition, which is why it is no longer the default.
+LEGACY_ELF = os.environ.get("AIR_OFFLOAD_LEGACY_ELF", "") == "1"
+
+#: Whether the mode packages its GEMMs into ONE xclbin — N instruction streams
+#: over a standing context, the array configured once per layer. THE DEFAULT
+#: since `[2026-08-11]`. Resolved once here (and once into cfg by
+#: ``offload_config``) so a run cannot be half shared and half not.
+SHARED_XCLBIN = not LEGACY_ELF
+
+#: This mode's artifact cache, relative to the working directory. Its OWN — see
+#: the module footguns.
 #:
-#: `[2026-08-09]` The shared-xclbin path gets a SEPARATE directory, for the same
+#: `[2026-08-09]` Each packaging path gets a SEPARATE directory, for the same
 #: reason two modes never share one: ``KernelCache`` keys the directory by name,
 #: and these two builds produce artifacts with identical NAMES
 #: (``off_gemm_1024x768x768`` either way) over different ABIs. Pointed at one
 #: directory they would trade artifacts whose fingerprints happen to agree, and
 #: the result is numerically valid output attributed to the wrong execution
 #: boundary — which here would mean crediting a 30-reconfiguration run to the
-#: one-reconfiguration claim.
-OFFLOAD_CACHE_DIR = (
-    "offload_shared_cache"
-    if os.environ.get("AIR_OFFLOAD_SHARED_XCLBIN", "") == "1"
-    else "offload_cache"
-)
+#: one-reconfiguration claim. `[2026-08-11]` The default flip did NOT rename or
+#: merge these: ``offload_shared_cache`` stays the shared path's directory even
+#: as the default, so old ELF-path artifacts can never be picked up by it.
+OFFLOAD_CACHE_DIR = "offload_shared_cache" if SHARED_XCLBIN else "offload_cache"
 
 #: The six projection GEMMs, in dispatch order. The order is the layer's
 #: dataflow and each entry becomes one recorded DispatchVector row. The two
@@ -262,6 +299,7 @@ def attention_gemm_spec(role):
     spec["herd_m"], spec["herd_n"] = entry["herd"]
     return spec
 
+
 #: The host tensors the layer takes, in the order ``opcheck.py`` indexes them
 #: for fault injection. The q/k/v weights are SEPARATE here — this mode
 #: dispatches three projections, not one fused ``w_qkv``.
@@ -313,12 +351,6 @@ _GEMM_BACKEND_SHARED = dict(_GEMM_BACKEND, output_format="xclbin")
 #: `ERT_CMD_STATE_TIMEOUT` at one shape and garbage at `mean_rel_L1` 1.41 with no
 #: error raised at another (`agents/probes/probe_one_xclbin_n_streams.py`).
 _KERNEL_ID_BASE = 0x901
-
-#: Whether the mode packages its GEMMs into ONE xclbin. Off by default: the
-#: shared path is newer than the gated ELF one, and this keeps the mode's
-#: recorded provenance switchable in one place rather than by editing kwargs.
-#: `AIR_OFFLOAD_SHARED_XCLBIN=1` turns it on.
-SHARED_XCLBIN = os.environ.get("AIR_OFFLOAD_SHARED_XCLBIN", "") == "1"
 
 
 def _check_no_object_collision(specs):
@@ -418,7 +450,7 @@ def offload_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
         # One xclbin over every shape, so the array is configured ONCE. Both
         # identifiers must be distinct per stream and neither defaults usefully:
         # `instance_name` is matched by SUBSTRING when the kernel is looked up,
-        # and `kernel_id` selects the PDI. Note the shipped ELF path gives every
+        # and `kernel_id` selects the PDI. Note the legacy ELF path gives every
         # `drain` GEMM the same `instance_name` (`matmul_bf16`) -- harmless when
         # each carries its own xclbin, fatal when they share one.
         backend_kwargs = {
@@ -599,8 +631,10 @@ def compile_offload_artifacts(cache, cfg, run_only=False):
         if stale:
             print(f"== compiling {len(stale)} kernels into ONE xclbin ==")
             cache.compile_shared_xclbin(
-                [(names[key], modules[key], cfg["backend_kwargs"][names[key]])
-                 for key in stale]
+                [
+                    (names[key], modules[key], cfg["backend_kwargs"][names[key]])
+                    for key in stale
+                ]
             )
     else:
         for key in stale:
@@ -651,10 +685,11 @@ def _dispatch_gemm(cache, cfg, op_name, a, b):
     shared implementation and never hand-built here.
 
     **Whether this dispatch reconfigures the array is the mode's whole point.**
-    On the shipped ELF path each dispatch runs in a FRESH ``hw_context`` — see
-    ``_evict_context`` for the measurement that forces it — so the layer pays 30
-    reconfigurations, which is the MAXIMUM rather than the minimum the mode is
-    defined to isolate. Under ``SHARED_XCLBIN`` every GEMM lives in one xclbin,
+    On the legacy ELF path (``AIR_OFFLOAD_LEGACY_ELF=1``) each dispatch runs in
+    a FRESH ``hw_context`` — see ``_evict_context`` for the measurement that
+    forces it — so the layer pays 30 reconfigurations, which is the MAXIMUM
+    rather than the minimum the mode is defined to isolate. Under the default
+    ``SHARED_XCLBIN`` every GEMM lives in one xclbin,
     the context is loaded once and never evicted, and moving between shapes costs
     an instruction swap. The dispatch VECTOR is identical either way — this mode
     makes one ``run_sequence`` call per GEMM regardless, so submissions stay at
