@@ -5206,11 +5206,16 @@ public:
       return res;
     };
 
-    // Merge destinations chosen so far. Together with chan_merge_map (whose
-    // keys are the merged-away sources) this keeps the two merge roles
-    // disjoint across pairs, which the NFL apply phase below relies on for
-    // memory safety.
-    llvm::SmallPtrSet<Operation *, 8> merge_dest_set;
+    // Merge destinations chosen so far, with the strategy that chose them.
+    // Together with chan_merge_map (whose keys are the merged-away sources)
+    // this keeps the two merge roles disjoint across pairs, which the NFL
+    // apply phase below relies on for memory safety. The strategy is
+    // recorded because the two composition rules do not mix: LB/UB extends
+    // the destination's own loop (setLB/setUB increments), NFL repeats the
+    // destination's whole nest (1 + k wrap) -- a destination that took one
+    // and then the other would multiply the two extensions instead of
+    // adding sources, so a cross-strategy addition is declined.
+    llvm::DenseMap<Operation *, StringRef> merge_dest_strategy;
 
     // Identify mergeable channel pairs and classify fusion type.
     for (unsigned i = 0; i < channelOps.size() - 1; i++) {
@@ -5238,22 +5243,32 @@ public:
         // destination absorbing several sources IS allowed; the per-
         // destination trip count below accounts for it.
         if (chan_merge_map.count(chanA) || chan_merge_map.count(chanB) ||
-            merge_dest_set.count(chanB.getOperation()))
+            merge_dest_strategy.count(chanB.getOperation()))
           continue;
+        auto destStrategyIt = merge_dest_strategy.find(chanA.getOperation());
         if (mergeType == "LB" || mergeType == "UB") {
           // Case 1: Merge via loop unpeeling (recover missing first/last
-          // iterations).
+          // iterations). A destination already absorbing sources by NFL
+          // must not also unpeel -- see merge_dest_strategy.
+          if (destStrategyIt != merge_dest_strategy.end() &&
+              destStrategyIt->second != "LBUB")
+            continue;
           mergeChannelOpsTemporally(chanA, chanB, mergeType);
           chan_merge_map[chanB] = chanA;
-          merge_dest_set.insert(chanA.getOperation());
+          merge_dest_strategy[chanA.getOperation()] = "LBUB";
         } else if (mergeType == "NFL") {
           // Case 2: Fuse channels into a new loop (requires creating an
           // scf.for). Skip if either channel's ops sit inside a multi-result
-          // scf.if, which wrapRegionsWithForLoops cannot safely wrap.
+          // scf.if, which wrapRegionsWithForLoops cannot safely wrap, and
+          // skip a destination already absorbing sources by LB/UB -- see
+          // merge_dest_strategy.
+          if (destStrategyIt != merge_dest_strategy.end() &&
+              destStrategyIt->second != "NFL")
+            continue;
           if (opInMultiResultIfOp(chanA) || opInMultiResultIfOp(chanB))
             continue;
           chan_merge_map[chanB] = chanA;
-          merge_dest_set.insert(chanA.getOperation());
+          merge_dest_strategy[chanA.getOperation()] = "NFL";
           nfl_merge_pairs.push_back(std::make_pair(chanA, chanB));
         }
       }
@@ -5456,6 +5471,16 @@ public:
 
 private:
   // Get a vector of channel ops which can be fused using a new for loop.
+  // "Consistent" is STRICT structural equivalence, not the loose comparison:
+  // a side that passes here has its a-ops cloned in a multiplexing loop and
+  // its b-ops ERASED, so b's transfer sequence must be provably a's --
+  // constants equal, and dynamic values the same SSA value or structurally
+  // identical chains with the two control-equivalent nests' block arguments
+  // mapped to each other (areEquivalentIndexValues). A side that fails is
+  // simply left unfused (its ops all survive, on the renamed channel), which
+  // is func9's documented shape -- NOT erased against a mismatched clone,
+  // which silently replaced a source's data with repeats of the
+  // destination's range.
   template <typename T>
   bool areConsistentMemoryAccessPattern(std::vector<T> a_vec,
                                         std::vector<T> b_vec) {
@@ -5463,21 +5488,32 @@ private:
     SmallVector<Value> offsets = air::getOffsetsAsValues(a_vec[0]);
     SmallVector<Value> sizes = air::getSizesAsValues(a_vec[0]);
     SmallVector<Value> strides = air::getStridesAsValues(a_vec[0]);
+    auto strictlyEquivalentTo = [&](T other) -> bool {
+      IRMapping ivMap;
+      auto aNest = getParentLoopNest(a_vec[0].getOperation());
+      auto bNest = getParentLoopNest(other.getOperation());
+      if (aNest.size() != bNest.size())
+        return false;
+      for (unsigned i = 0; i < aNest.size(); i++) {
+        if (aNest[i]->getNumArguments() != bNest[i]->getNumArguments())
+          continue;
+        for (unsigned j = 0; j < aNest[i]->getNumArguments(); j++)
+          ivMap.map(bNest[i]->getArgument(j), aNest[i]->getArgument(j));
+      }
+      return memrefsAreAffinitiveToSameChannel(memref, other.getMemref()) &&
+             areEquivalentIndexValues(memref, other.getMemref(), ivMap) &&
+             areEquivalentSSAValueLists(offsets, air::getOffsetsAsValues(other),
+                                        ivMap) &&
+             areEquivalentSSAValueLists(sizes, air::getSizesAsValues(other),
+                                        ivMap) &&
+             areEquivalentSSAValueLists(strides, air::getStridesAsValues(other),
+                                        ivMap);
+    };
     for (unsigned i = 1; i < a_vec.size(); i++)
-      if ((!memrefsAreAffinitiveToSameChannel(memref, a_vec[i].getMemref())) ||
-          (!areTheSameSSAValueLists(offsets,
-                                    air::getOffsetsAsValues(a_vec[i]))) ||
-          (!areTheSameSSAValueLists(sizes, air::getSizesAsValues(a_vec[i]))) ||
-          (!areTheSameSSAValueLists(strides,
-                                    air::getStridesAsValues(a_vec[i]))))
+      if (!strictlyEquivalentTo(a_vec[i]))
         return false; // Inconsistent memory use for all puts
     for (unsigned i = 0; i < b_vec.size(); i++)
-      if ((!memrefsAreAffinitiveToSameChannel(memref, b_vec[i].getMemref())) ||
-          (!areTheSameSSAValueLists(offsets,
-                                    air::getOffsetsAsValues(b_vec[i]))) ||
-          (!areTheSameSSAValueLists(sizes, air::getSizesAsValues(b_vec[i]))) ||
-          (!areTheSameSSAValueLists(strides,
-                                    air::getStridesAsValues(b_vec[i]))))
+      if (!strictlyEquivalentTo(b_vec[i]))
         return false; // Inconsistent memory use between a puts and b puts
     return true;
   }
@@ -5821,7 +5857,10 @@ private:
     // Otherwise, they are assumed to be affinitive to different channels.
     return false;
   }
-  // Check if two ssa value lists are identical.
+  // Check if two ssa value lists are identical. Loose on dynamic values: two
+  // non-constant elements are assumed equal, which the LB/UB unpeel path
+  // relies on (an IV-affine offset against its peeled constant). The NFL
+  // multiplex path must NOT use this form -- see the strict variant below.
   bool areTheSameSSAValueLists(SmallVector<Value> a, SmallVector<Value> b) {
     if (a.size() != b.size())
       return false;
@@ -5833,6 +5872,69 @@ private:
         if (*constAElem != *constBElem)
           return false;
     }
+    return true;
+  }
+  // Strict form, for the NFL multiplex path: two values are equivalent iff
+  // they are the same SSA value, equal constants, corresponding block
+  // arguments of the two (already control-equivalent) loop nests, or results
+  // of structurally identical defining chains over equivalent operands.
+  // air.execute is looked through to the terminator operand its result
+  // carries. The NFL merge clones ONLY the destination's transfer body and
+  // erases the sources, so it is sound exactly when every source's transfer
+  // sequence is provably the destination's; a source whose offsets differ
+  // (e.g. a different affine map over its own IV) would have its data
+  // silently replaced by (1 + k) repeats of the destination's range.
+  bool areEquivalentIndexValues(Value a, Value b, IRMapping &ivMap,
+                                int depth = 0) {
+    if (a == b)
+      return true;
+    if (depth > 16)
+      return false;
+    auto constAElem = getConstantIntValue(a);
+    auto constBElem = getConstantIntValue(b);
+    if (constAElem && constBElem)
+      return *constAElem == *constBElem;
+    if (constAElem || constBElem)
+      return false;
+    if (isa<BlockArgument>(a) || isa<BlockArgument>(b))
+      return ivMap.contains(b) && ivMap.lookup(b) == a;
+    Operation *da = a.getDefiningOp();
+    Operation *db = b.getDefiningOp();
+    if (!da || !db)
+      return false;
+    if (da->getName() != db->getName())
+      return false;
+    unsigned resNoA = cast<OpResult>(a).getResultNumber();
+    unsigned resNoB = cast<OpResult>(b).getResultNumber();
+    if (resNoA != resNoB)
+      return false;
+    if (auto ea = dyn_cast<air::ExecuteOp>(da)) {
+      // Result 0 is the async token; value results map to the terminator's
+      // operands. Attribute dictionaries are metadata (ids) here, so the
+      // comparison is on the carried computation.
+      if (resNoA == 0)
+        return false;
+      auto eb = cast<air::ExecuteOp>(db);
+      Value ta = ea.getRegion().front().getTerminator()->getOperand(resNoA - 1);
+      Value tb = eb.getRegion().front().getTerminator()->getOperand(resNoA - 1);
+      return areEquivalentIndexValues(ta, tb, ivMap, depth + 1);
+    }
+    if (da->getAttrDictionary() != db->getAttrDictionary())
+      return false;
+    if (da->getNumOperands() != db->getNumOperands())
+      return false;
+    for (auto [oa, ob] : llvm::zip(da->getOperands(), db->getOperands()))
+      if (!areEquivalentIndexValues(oa, ob, ivMap, depth + 1))
+        return false;
+    return true;
+  }
+  bool areEquivalentSSAValueLists(SmallVector<Value> a, SmallVector<Value> b,
+                                  IRMapping &ivMap) {
+    if (a.size() != b.size())
+      return false;
+    for (unsigned i = 0; i < a.size(); i++)
+      if (!areEquivalentIndexValues(a[i], b[i], ivMap))
+        return false;
     return true;
   }
   // Check if two channel ops are under identical affine.if condition blocks.
@@ -6024,6 +6126,12 @@ private:
       overallLBMergeable &= (std::get<1>(getRes) == "LB");
       overallNFLMergeable &= (std::get<1>(getRes) == "NFL");
     }
+    // NFL classification stays pattern-agnostic on purpose: whether each
+    // SIDE's ops actually fuse (clone-and-erase) or merely survive on the
+    // renamed channel is decided per side by
+    // areConsistentMemoryAccessPattern's strict structural equivalence.
+    // func9 pins the split shape: differing-pattern puts all survive while
+    // the equivalent-pattern gets multiplex.
     if (overallNFLMergeable)
       return mergeableNoForLoop;
     else if (overallLBMergeable)
@@ -6308,18 +6416,29 @@ private:
       const llvm::SetVector<Operation *> &opSet) {
 
     // Helper to check whether a region:
-    //   (1) Contains at least one of the target channel operations.
-    //   (2) Does not contain any unrelated channel operations.
+    //   (1) Contains at least one of the target channel operations as an
+    //       immediate child (which is what makes wrapping it multiplex the
+    //       target).
+    //   (2) Does not contain any non-target channel operation at ANY depth.
+    //       wrapRegionsWithForLoops clones-and-erases the region's parent,
+    //       so a non-target channel op nested in a child region (e.g. an
+    //       erased-source op inside an scf.if) would be destroyed while the
+    //       erase loop still holds its pointer -- the nested variant of the
+    //       use-after-free the pairwise role guard closes. A top-level-only
+    //       scan misses exactly that case.
     auto isValidRegion = [&](Region *region) -> bool {
       bool foundTarget = false;
-      for (auto &op : region->getOps()) {
-        if (opSet.contains(&op)) {
-          foundTarget = true;
-        } else if (isa<air::ChannelInterface>(&op)) {
-          // Region contains a channel op not in the target set -> invalid.
-          return false;
+      WalkResult wr = region->walk([&](Operation *op) {
+        if (isa<air::ChannelInterface>(op)) {
+          if (!opSet.contains(op))
+            return WalkResult::interrupt();
+          if (op->getParentRegion() == region)
+            foundTarget = true;
         }
-      }
+        return WalkResult::advance();
+      });
+      if (wr.wasInterrupted())
+        return false;
       return foundTarget;
     };
 

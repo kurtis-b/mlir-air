@@ -1736,97 +1736,77 @@ module {
 
 // -----
 
-// No-for-loop (NFL) mode: preserve async dependencies of multiple fused channe put/get ops, by fusing their parent regions.
+// No-for-loop (NFL) mode: preserve async dependencies of multiple fused channel
+// put/get ops, by fusing their parent regions. The two channels' L3-side puts
+// read DIFFERENT buffers (%arg12/%arg13 vs the staged %arg15/%arg14), so the
+// put side is NOT loop-fused: every put survives on the merged channel with
+// its own buffer, and only the pattern-identical get side is wrapped in the
+// time-multiplexing loop. (The pre-2026-08-11 expectation had the put side
+// wrapped too, which cloned only the first channel's transfers and silently
+// dropped the staged buffers' data.)
 
 // CHECK-LABEL: func13
-// CHECK: %[[FOR1:.*]] = scf.for %{{.*}} = %c0{{.*}} to %c2{{.*}} step %c1{{.*}}
-// CHECK-NEXT: %[[FOR1:.*]] = scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
+// CHECK: scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
 // CHECK-NEXT: affine.apply
 // CHECK-NEXT: air.channel.put async {{.*}} @channel_0
-// CHECK-NEXT: scf.yield
-// CHECK-NEXT: }
-// CHECK-NEXT: scf.yield
-// CHECK-NEXT: }
-// CHECK: %[[FOR2:.*]] = scf.for %{{.*}} = %c0{{.*}} to %c2{{.*}} step %c1{{.*}}
-// CHECK-NEXT: %[[FOR1:.*]] = scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
+// CHECK: scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
 // CHECK-NEXT: affine.apply
 // CHECK-NEXT: air.channel.put async {{.*}} @channel_1
-// CHECK-NEXT: scf.yield
-// CHECK-NEXT: }
-// CHECK-NEXT: scf.yield
-// CHECK-NEXT: }
+// CHECK: air.channel.get async{{.*}}@channel_11
+// CHECK: scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
+// CHECK-NEXT: affine.apply
+// CHECK-NEXT: air.channel.put async {{.*}} @channel_0
+// CHECK: scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
+// CHECK-NEXT: affine.apply
+// CHECK-NEXT: air.channel.put async {{.*}} @channel_1
 // CHECK: air.segment
-// CHECK: %[[FOR3:.*]] = scf.for %{{.*}} = %c0{{.*}} to %c2{{.*}} step %c1{{.*}}
-// CHECK-NEXT: %[[FOR1:.*]] = scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
+// CHECK: scf.for %{{.*}} = %c0{{.*}} to %c2{{.*}} step %c1{{.*}}
+// CHECK-NEXT: scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
 // CHECK-NEXT: air.channel.get async {{.*}} @channel_0
 // CHECK-NEXT: scf.yield
-// CHECK-NEXT: }
-// CHECK-NEXT: scf.yield
-// CHECK-NEXT: }
-// CHECK: %[[FOR4:.*]] = scf.for %{{.*}} = %c0{{.*}} to %c2{{.*}} step %c1{{.*}}
-// CHECK-NEXT: %[[FOR1:.*]] = scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
+// CHECK: scf.for %{{.*}} = %c0{{.*}} to %c2{{.*}} step %c1{{.*}}
+// CHECK-NEXT: scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
 // CHECK-NEXT: air.channel.get async {{.*}} @channel_1
 // CHECK-NEXT: scf.yield
-// CHECK-NEXT: }
-// CHECK-NEXT: scf.yield
-// CHECK-NEXT: }
 
 // AGGRESSIVE-LABEL: func13
-// AGGRESSIVE: %[[FOR1:.*]] = scf.for %{{.*}} = %c0{{.*}} to %c2{{.*}} step %c1{{.*}}
-// AGGRESSIVE-NEXT: %[[FOR1:.*]] = scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
-// AGGRESSIVE-NEXT: affine.apply
-// AGGRESSIVE-NEXT: air.channel.put async {{.*}} @channel_0
-// AGGRESSIVE-NEXT: affine.apply
-// AGGRESSIVE-NEXT: affine.apply
-// AGGRESSIVE-NEXT: air.channel.put async {{.*}} @channel_0
-// AGGRESSIVE-NEXT: air.wait_all
-// AGGRESSIVE-NEXT: scf.yield
-// AGGRESSIVE-NEXT: }
-// AGGRESSIVE-NEXT: scf.yield
-// AGGRESSIVE-NEXT: }
+// AGGRESSIVE: scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
+// AGGRESSIVE: air.channel.put async {{.*}} @channel_0
+// AGGRESSIVE: air.channel.put async {{.*}} @channel_0
+// AGGRESSIVE: air.channel.get async{{.*}}@channel_11
+// AGGRESSIVE: scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
+// AGGRESSIVE: air.channel.put async {{.*}} @channel_0
+// AGGRESSIVE: air.channel.put async {{.*}} @channel_0
 // AGGRESSIVE: air.segment
-// AGGRESSIVE: %[[FOR2:.*]] = scf.for %{{.*}} = %c0{{.*}} to %c2{{.*}} step %c1{{.*}}
-// AGGRESSIVE-NEXT: %[[FOR1:.*]] = scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
+// AGGRESSIVE: scf.for %{{.*}} = %c0{{.*}} to %c2{{.*}} step %c1{{.*}}
+// AGGRESSIVE-NEXT: scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
 // AGGRESSIVE-NEXT: air.channel.get async {{.*}} @channel_0
 // AGGRESSIVE-NEXT: air.channel.get async {{.*}} @channel_0
 // AGGRESSIVE-NEXT: air.wait_all
-// AGGRESSIVE-NEXT: scf.yield
-// AGGRESSIVE-NEXT: }
-// AGGRESSIVE-NEXT: scf.yield
-// AGGRESSIVE-NEXT: }
 
 // AGGL1-LABEL: func13
-// AGGL1: %[[FOR1:.*]] = scf.for %{{.*}} = %c0{{.*}} to %c2{{.*}} step %c1{{.*}}
-// AGGL1-NEXT: %[[FOR1:.*]] = scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
+// AGGL1: scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
 // AGGL1-NEXT: affine.apply
 // AGGL1-NEXT: air.channel.put async {{.*}} @channel_0
-// AGGL1-NEXT: scf.yield
-// AGGL1-NEXT: }
-// AGGL1-NEXT: scf.yield
-// AGGL1-NEXT: }
-// AGGL1: %[[FOR2:.*]] = scf.for %{{.*}} = %c0{{.*}} to %c2{{.*}} step %c1{{.*}}
-// AGGL1-NEXT: %[[FOR1:.*]] = scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
+// AGGL1: scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
 // AGGL1-NEXT: affine.apply
 // AGGL1-NEXT: air.channel.put async {{.*}} @channel_1
-// AGGL1-NEXT: scf.yield
-// AGGL1-NEXT: }
-// AGGL1-NEXT: scf.yield
-// AGGL1-NEXT: }
+// AGGL1: air.channel.get async{{.*}}@channel_11
+// AGGL1: scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
+// AGGL1-NEXT: affine.apply
+// AGGL1-NEXT: air.channel.put async {{.*}} @channel_0
+// AGGL1: scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
+// AGGL1-NEXT: affine.apply
+// AGGL1-NEXT: air.channel.put async {{.*}} @channel_1
 // AGGL1: air.segment
-// AGGL1: %[[FOR3:.*]] = scf.for %{{.*}} = %c0{{.*}} to %c2{{.*}} step %c1{{.*}}
-// AGGL1-NEXT: %[[FOR1:.*]] = scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
+// AGGL1: scf.for %{{.*}} = %c0{{.*}} to %c2{{.*}} step %c1{{.*}}
+// AGGL1-NEXT: scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
 // AGGL1-NEXT: air.channel.get async {{.*}} @channel_0
 // AGGL1-NEXT: scf.yield
-// AGGL1-NEXT: }
-// AGGL1-NEXT: scf.yield
-// AGGL1-NEXT: }
-// AGGL1: %[[FOR4:.*]] = scf.for %{{.*}} = %c0{{.*}} to %c2{{.*}} step %c1{{.*}}
-// AGGL1-NEXT: %[[FOR1:.*]] = scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
+// AGGL1: scf.for %{{.*}} = %c0{{.*}} to %c2{{.*}} step %c1{{.*}}
+// AGGL1-NEXT: scf.for %{{.*}} = %c0{{.*}} to %c4{{.*}} step %c1{{.*}}
 // AGGL1-NEXT: air.channel.get async {{.*}} @channel_1
 // AGGL1-NEXT: scf.yield
-// AGGL1-NEXT: }
-// AGGL1-NEXT: scf.yield
-// AGGL1-NEXT: }
 
 #map = affine_map<()[s0] -> (s0 * 256)>
 #map1 = affine_map<()[s0] -> (s0 * 128)>

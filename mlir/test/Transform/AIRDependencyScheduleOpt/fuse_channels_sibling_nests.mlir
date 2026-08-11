@@ -8,31 +8,46 @@
 // RUN: air-opt %s -air-fuse-channels="aggressive-mode=false" --split-input-file | FileCheck %s
 
 // N sibling same-bounds scf.for nests, each carrying one put of its own
-// channel, all N channels mutually NFL-mergeable. Two channels fused cleanly;
-// a third made the pairwise candidate loop revisit a channel whose ops an
-// earlier merge of the same set had already marked erased, so the erased set
-// shared ops with the fuse-destination set that wrapRegionsWithForLoops
-// clones-and-erases -- a use-after-free the erase loop then read (SEGV under
-// air-opt 10/10, an ASLR coin toss under aircc). The fused loop must also
-// time-multiplex 1 + k iterations for k absorbed sources, not the pairwise 2:
-// three channels of 6 puts each must total 18, matching the consumer.
+// channel, all N channels mutually NFL-mergeable. This shape used to be a
+// use-after-free: the pairwise candidate loop had no merge roles, so on a
+// 3-clique the third pair put one channel's ops into both the
+// fuse-destination and the erased sets, and wrapRegionsWithForLoops
+// clones-and-erases what the erase loop then reads (SEGV/hang under air-opt,
+// an ASLR coin toss under aircc). Both cases below crash the unfixed pass.
 //
-// The shape is programming_examples/transformer_layer's ffn_resident down
-// feed after air-dma-to-channel (its sub-channel index is compile-time, so
-// the feed unrolls to herd_x textual nests -> herd_x sibling auto channels);
-// minimized by agents/probes/probe_fuse_channels_sibling_nests.py, which
-// measured the N=2 clean / N=3 crash boundary.
+// Case 1 pins the SEMANTIC boundary, per side: the NFL merge clones only the
+// destination's transfer body and erases the sources on any side it fuses,
+// so the put side -- whose three nests read DIFFERENT dynamic offsets (+6144
+// / +12288, the shape ffn_resident's down feed presents after
+// air-dma-to-channel unrolls its sub-channel dimension) -- must NOT be
+// loop-fused: all three puts survive on the merged channel, each keeping its
+// own offsets, so every slice's data still moves. Only the
+// pattern-identical get side is wrapped in the 1 + k = 3-trip multiplexing
+// loop (6 x 3 = 18 gets against 3 x 6 = 18 surviving puts). The pre-fix
+// pass wrapped the put side too, transferring the destination's slice three
+// times and dropping the other two slices' data.
+//
+// Case 2 pins the N-way multiplex where BOTH sides are identical: four
+// channels of 6 whole-buffer puts each fuse into one 4 x 6 = 24-slot
+// stream, matching the consumer -- not the pairwise 2 the wrap hardcoded.
+//
+// Minimized by agents/probes/probe_fuse_channels_sibling_nests.py, which
+// measured the N=2 clean / N=3 crash boundary on the unfixed pass.
 
-// CHECK-LABEL: func.func @three_sibling_nests
+// CHECK-LABEL: func.func @heterogeneous_offsets_keep_puts
 // CHECK: air.launch
-// CHECK: %[[C3:.*]] = arith.constant 3 : index
-// CHECK: scf.for %{{.*}} = %{{.*}} to %[[C3]] step
 // CHECK: scf.for %{{.*}} = %{{.*}} to %{{.*}} step
+// CHECK: air.channel.put {{.*}} @chan_a
+// CHECK: scf.for
+// CHECK: air.channel.put {{.*}} @chan_a
+// CHECK: scf.for
 // CHECK: air.channel.put {{.*}} @chan_a
 // CHECK-NOT: air.channel.put {{.*}} @chan_b
 // CHECK-NOT: air.channel.put {{.*}} @chan_c
 // CHECK: air.segment
-// CHECK: air.channel.get {{.*}} @chan_a
+// CHECK: %[[C3:.*]] = arith.constant 3 : index
+// CHECK: scf.for %{{.*}} = %{{.*}} to %[[C3]] step
+// CHECK-NEXT: air.channel.get {{.*}} @chan_a
 // CHECK-NOT: air.channel.get {{.*}} @chan_b
 // CHECK-NOT: air.channel.get {{.*}} @chan_c
 #map = affine_map<()[s0] -> (s0 * 1024)>
@@ -43,7 +58,7 @@ module {
   air.channel @chan_a []
   air.channel @chan_b []
   air.channel @chan_c []
-  func.func @three_sibling_nests(%arg0: memref<18432xbf16>) {
+  func.func @heterogeneous_offsets_keep_puts(%arg0: memref<18432xbf16>) {
     %0 = air.launch async () in () args(%arg1=%arg0) : memref<18432xbf16> {
       %c6 = arith.constant 6 : index
       %c0 = arith.constant 0 : index
@@ -116,10 +131,7 @@ module {
 
 // -----
 
-// Four nests -- the production witness's width (ffn_resident's down feed has
-// herd_x = 4 such nests). The surviving channel must multiplex 4 x 6 = 24.
-
-// CHECK-LABEL: func.func @four_sibling_nests
+// CHECK-LABEL: func.func @fuse_identical_four_way
 // CHECK: air.launch
 // CHECK: %[[C4:.*]] = arith.constant 4 : index
 // CHECK: scf.for %{{.*}} = %{{.*}} to %[[C4]] step
@@ -129,43 +141,35 @@ module {
 // CHECK-NOT: air.channel.put {{.*}} @chan_c
 // CHECK-NOT: air.channel.put {{.*}} @chan_d
 // CHECK: air.segment
-#map = affine_map<()[s0] -> (s0 * 1024)>
-#map1 = affine_map<()[s0] -> (s0 * 1024 + 6144)>
-#map2 = affine_map<()[s0] -> (s0 * 1024 + 12288)>
-#map3 = affine_map<()[s0] -> (s0 * 1024 + 18432)>
 module {
   air.channel @feed [1, 1]
   air.channel @chan_a []
   air.channel @chan_b []
   air.channel @chan_c []
   air.channel @chan_d []
-  func.func @four_sibling_nests(%arg0: memref<24576xbf16>) {
-    %0 = air.launch async () in () args(%arg1=%arg0) : memref<24576xbf16> {
+  func.func @fuse_identical_four_way(%arg0: memref<1024xbf16>) {
+    %0 = air.launch async () in () args(%arg1=%arg0) : memref<1024xbf16> {
       %c6 = arith.constant 6 : index
       %c0 = arith.constant 0 : index
       %c1 = arith.constant 1 : index
       %1 = air.wait_all async
       %2 = scf.for %arg2 = %c0 to %c6 step %c1 iter_args(%arg3 = %1) -> (!air.async.token) {
-        %11 = affine.apply #map()[%arg2]
-        %12 = air.channel.put async [%arg3]  @chan_a[] (%arg1[%11] [1024] [1]) : (memref<24576xbf16>)
+        %12 = air.channel.put async [%arg3]  @chan_a[] (%arg1[] [] []) : (memref<1024xbf16>)
         scf.yield %12 : !air.async.token
       }
       %3 = air.wait_all async
       %4 = scf.for %arg2 = %c0 to %c6 step %c1 iter_args(%arg3 = %3) -> (!air.async.token) {
-        %11 = affine.apply #map1()[%arg2]
-        %12 = air.channel.put async [%arg3]  @chan_b[] (%arg1[%11] [1024] [1]) : (memref<24576xbf16>)
+        %12 = air.channel.put async [%arg3]  @chan_b[] (%arg1[] [] []) : (memref<1024xbf16>)
         scf.yield %12 : !air.async.token
       }
       %5 = air.wait_all async
       %6 = scf.for %arg2 = %c0 to %c6 step %c1 iter_args(%arg3 = %5) -> (!air.async.token) {
-        %11 = affine.apply #map2()[%arg2]
-        %12 = air.channel.put async [%arg3]  @chan_c[] (%arg1[%11] [1024] [1]) : (memref<24576xbf16>)
+        %12 = air.channel.put async [%arg3]  @chan_c[] (%arg1[] [] []) : (memref<1024xbf16>)
         scf.yield %12 : !air.async.token
       }
       %7 = air.wait_all async
       %8 = scf.for %arg2 = %c0 to %c6 step %c1 iter_args(%arg3 = %7) -> (!air.async.token) {
-        %11 = affine.apply #map3()[%arg2]
-        %12 = air.channel.put async [%arg3]  @chan_d[] (%arg1[%11] [1024] [1]) : (memref<24576xbf16>)
+        %12 = air.channel.put async [%arg3]  @chan_d[] (%arg1[] [] []) : (memref<1024xbf16>)
         scf.yield %12 : !air.async.token
       }
       %10 = air.segment @seg async {
