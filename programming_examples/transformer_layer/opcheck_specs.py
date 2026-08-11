@@ -349,6 +349,12 @@ SPECS = [
     {
         # 64 rows, not 512: addnorm needs one kernel call per tile, which caps
         # rows at herd_x * (what fits L1). See builders/addnorm.py.
+        #
+        # atol was sized on the ONE-PASS kernel (atol_required 1.747e-2, set
+        # by the trailing residual add's cancellation, not the statistics);
+        # the 2026-08-11 move to two-pass f32 statistics owes this row a
+        # hardware re-measure -- doc 23 item 2. The tolerance was NOT widened
+        # for the move.
         "operator": "addnorm",
         "shape_key": "64x512",
         "shape": {"rows": 64, "cols": 512},
@@ -375,6 +381,9 @@ SPECS = [
         "shape": {"rows": 64, "cols": 768, "pre_add": True},
         # Measured over 49152 elements: mean_rel_L1 2.687e-3, abs_err_max
         # 6.25e-2, atol_required 6.646e-4. atol is that rounded up, 3.0x.
+        # (Measured on the ONE-PASS kernel; the 2026-08-11 two-pass f32 move
+        # owes this row a re-measure -- doc 23 item 2 -- and the tolerance was
+        # NOT widened for it.)
         #
         # 26x tighter than the post-add row above (atol_required 1.747e-2) at a
         # HIGHER relative error, and the ordering is the whole reason. Post-add
@@ -385,6 +394,53 @@ SPECS = [
         # every error is proportional to the output that carries it. Do not
         # read the tighter number as the pre-add path being a better kernel; it
         # is the same kernel with the cancellation removed.
+        "atol": 2e-3,
+        "prepare": prepare_addnorm,
+    },
+    {
+        # DOC 23 ITEM 2, the addnorm half, POST-ADD: rows at a COMMON OFFSET
+        # large next to their spread (mean 8, sigma 0.25 -- |mean|/sigma 32),
+        # residual identically zero -- the regime where the one-pass bf16
+        # statistics this kernel shipped with lose the row's variance
+        # ENTIRELY (E[x^2] and E[x]^2 become the same bf16 number, the
+        # variance clamps, the row normalizes by 1/sqrt(eps) ~ 316 --
+        # measured 28170/32768 outside tolerance at this exact shape,
+        # probe_addnorm_variance_cliff.py, collapse boundary between
+        # |mean|/sigma 2 and 4). The move of fused_add_layer_norm_2
+        # (encoder.cc) to two-pass f32 statistics is what makes this row
+        # passable, and this row is what keeps it that way: a revert now
+        # fails a suite recipe rather than a probe nobody runs. Appended
+        # after the operator's existing rows so 64x512 keeps the standing
+        # negative control.
+        "operator": "addnorm",
+        "shape_key": "64x512_offset",
+        "shape": {"rows": 64, "cols": 512, "offset_regime": True},
+        # PROVISIONAL until the first gated hardware run records its
+        # mean_rel_L1 / atol_required here: the sibling 64x512 row's 5e-2.
+        # Expected slack, not to bind -- the zero residual removes the
+        # trailing add's cancellation (which is what sized the sibling's
+        # atol_required at 1.747e-2), and layer_norm's offset row measured
+        # atol_required 0.0 under the same two-pass statistics.
+        "atol": 5e-2,
+        "prepare": prepare_addnorm,
+    },
+    {
+        # The same regime for the PRE-ADD ordering, at its own claimed shape:
+        # statistics over (x + residual), residual identically zero so the
+        # bf16 sum is exact and the row isolates the statistics -- measured
+        # 43058/49152 outside tolerance here on the one-pass kernel
+        # (mean_rel_L1 33.1). Separate evidence, not a wider shape of the
+        # row above: different object (addnorm_pre_add.o), different entry
+        # point, different source file (addnorm_ffn_norm.cc's templates
+        # under -DADDNORM_PRE_ADD).
+        "operator": "addnorm",
+        "shape_key": "64x768_pre_add_offset",
+        "shape": {"rows": 64, "cols": 768, "pre_add": True, "offset_regime": True},
+        # PROVISIONAL until the first gated hardware run records its
+        # mean_rel_L1 / atol_required here: the sibling pre-add row's 2e-3.
+        # Pre-add errors stay proportional to the outputs carrying them (no
+        # trailing add), and the offset cost the two-pass statistics nothing
+        # measurable on layer_norm's sibling row.
         "atol": 2e-3,
         "prepare": prepare_addnorm,
     },

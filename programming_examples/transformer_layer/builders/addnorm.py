@@ -133,14 +133,17 @@ MULTI-TRIP IS SAFE ONLY ON A ONE-COLUMN HERD -- MEASURED, PHASE J1
       ``addnorm_max_rows`` exposes the arithmetic.
 
 FOOTGUNS
-    - Variance is ONE-PASS (``E[x^2] - E[x]^2``) inside the kernel; the
-      reference below is the stable TWO-PASS f32 form. They are algebraically
-      equal and numerically are not -- see ``layer_norm.py``'s note. The kernel
-      clamps a negative variance to zero because ``aie::invsqrt`` of a negative
-      operand returns NaN.
-    - The row sum accumulates in a bf16 vector (only the sum of squares is
-      f32), so the mean carries more error than the FP32 reference's. It shows
-      up as a small uniform shift of a row, not as an outlier.
+    - Statistics are f32 and the variance is TWO-PASS (mean first, then
+      ``E[(x - mean)^2]``) in BOTH kernel variants, following
+      ``layer_norm/layer_norm.cc``'s discipline -- doc 23 item 2's addnorm
+      half. The one-pass ``E[x^2] - E[x]^2`` form both shipped with (bf16 row
+      sum) loses an offset row's variance ENTIRELY: measured collapse between
+      ``|mean|/sigma`` 2 and 4 (``probe_addnorm_variance_cliff.py`` under
+      ``agents/probes/``), where the variance clamps at zero and the row
+      normalizes by ``1/sqrt(eps)`` ~ 316. The ``*_offset``
+      opcheck rows pin the regime. The kernels still clamp a negative
+      variance before ``aie::invsqrt`` as a NaN guard, though it is
+      non-negative by construction now.
     - ``cols`` must be a multiple of 32 (the kernel's ``N``). A non-multiple is
       silently truncated by ``vector_chunks = cols / N``, not diagnosed.
     - Both objects are compiled with ONLY the addnorm half
@@ -487,9 +490,11 @@ def addnorm_reference(x, residual, weight, eps=EPS):
     oracle for ``build_addnorm_module(..., pre_add=False)`` and for nothing
     else -- see ``addnorm_pre_add_reference`` for the other ordering.
 
-    Two-pass variance in f32, one rounding to bf16 at the end. Not the kernel's
-    one-pass form and not its bf16 intermediate roundings -- the point of the
-    check is to measure that gap, not to reproduce it.
+    Two-pass variance in f32, one rounding to bf16 at the end. The kernel now
+    keeps the same two-pass f32 statistics, but this oracle still reproduces
+    none of its bf16 intermediate roundings (the squared deviations, the
+    normalized value, the weight multiply, the trailing add) -- the point of
+    the check is to measure that gap, not to reproduce it.
     """
     normed = _layer_norm_f32(x.astype(np.float32), eps)
     out = normed * weight.astype(np.float32) + residual.astype(np.float32)

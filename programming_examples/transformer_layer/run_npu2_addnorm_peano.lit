@@ -23,6 +23,18 @@
 // exactly the failure this pair exists to catch, and it is a failure that
 // leaves the output the right shape.
 //
+// EACH FUNCTION ALSO RUNS AN OFFSET-REGIME SHAPE (doc 23 item 2's addnorm
+// half): rows at a common offset large next to their spread (mean 8, sigma
+// 0.25), residual identically zero so the row isolates the statistics. The
+// one-pass bf16 statistics both kernels shipped with lose such rows' variance
+// entirely -- measured 28170/32768 (post-add) and 43058/49152 (pre-add)
+// outside tolerance, collapse boundary between |mean|/sigma 2 and 4 -- and
+// the two-pass f32 statistics they carry now must not. These two rows are
+// what pin that: a revert to one-pass statistics fails here rather than in a
+// probe nobody runs. Their atol figures are provisional (the sibling rows')
+// until the first gated hardware run records their measured
+// mean_rel_L1 / atol_required in opcheck_specs.py.
+//
 // Runs opcheck.py on real NPU2 against an FP32 reference: np.isclose over the
 // full output at rtol=1.6e-2, zero permitted mismatches. Not cosine similarity
 // -- kernel_registry/README.md is explicit that a correlation gate is blind to
@@ -59,3 +71,10 @@
 // CHECK: Compiling addnorm_pre_add.o from addnorm_ffn.cc
 // CHECK: PASS!
 // CHECK: [opcheck] addnorm [64x768_pre_add]: PASS
+// The offset rows, in declaration order: post-add first, then pre-add with
+// the same object guard as above.
+// CHECK: PASS!
+// CHECK: [opcheck] addnorm [64x512_offset]: PASS
+// CHECK: Compiling addnorm_pre_add.o from addnorm_ffn.cc
+// CHECK: PASS!
+// CHECK: [opcheck] addnorm [64x768_pre_add_offset]: PASS

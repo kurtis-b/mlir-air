@@ -201,9 +201,9 @@ residual identically zero so the bf16 sum is exact and the row isolates the stat
 | `addnorm` (pre-add, 64×768) | 0/49152 | **43058/49152**, `mean_rel_L1` 33.1 |
 | `addnorm` (post-add, 64×512) | 0/32768 | **28170/32768**, `mean_rel_L1` 22.2 |
 
-J7a's f32 two-pass fix covers `layer_norm` completely. Both `addnorm` variants share the one-pass
-path and lose the row's variance entirely: `E[x²]` and `E[x]²` become the same bf16 number, variance
-clamps, and the row normalizes by `1/sqrt(eps)` ≈ 316.
+J7a's f32 two-pass fix covers `layer_norm` completely. Both `addnorm` variants shared the one-pass
+path (until the `[2026-08-11]` move below) and lose the row's variance entirely: `E[x²]` and `E[x]²`
+become the same bf16 number, variance clamps, and the row normalizes by `1/sqrt(eps)` ≈ 316.
 
 **Where the cliff is, measured rather than derived.** Sweeping only the input against one binary:
 
@@ -221,17 +221,35 @@ is a ~35× margin, so the recorded `block` / `coarse` / `runlist` / `fused` figu
 question. The defect is latent, and unpinned by any test. (Measured for `encoder_bert` only;
 `decoder_gpt2` is pre-norm and no mode dispatches it — that is J5.)
 
-**What to do, ~~unclaimed~~ half done.** ~~Adding the offset row to `layer_norm` pins its boundary
-and passes today.~~ **`[2026-08-10]` The `layer_norm` half is DONE**: `128x768_offset` is a
-catalogue row (`opcheck_specs.py`), pinned by `run_npu2_layer_norm_peano.lit`, and its first
-hardware run measured `mean_rel_L1` 9.819e-5 with `atol_required` 0.0 — rtol alone covers every
-element, within 1.4× of the zero-mean row, so the offset costs the two-pass kernel nothing
-measurable. A revert to one-pass statistics now fails a suite recipe rather than a probe nobody
-runs. Adding one to `addnorm` would fail, so it needs the kernel moved to two-pass f32 first —
-which by analogy with item 1 costs ~13% on that kernel and would shift every provenance figure that
-flows through it (`block` and the three modes), probably improving them. That is a phase, not a
-patch, and the trade should be decided knowing the cliff is real but ~35× away — and it is still
-unclaimed.
+**What to do, ~~unclaimed~~ ~~half done~~ code done; the hardware half is owed.**
+~~Adding the offset row to `layer_norm` pins its boundary and passes today.~~ **`[2026-08-10]`
+The `layer_norm` half is DONE**: `128x768_offset` is a catalogue row (`opcheck_specs.py`), pinned
+by `run_npu2_layer_norm_peano.lit`, and its first hardware run measured `mean_rel_L1` 9.819e-5
+with `atol_required` 0.0 — rtol alone covers every element, within 1.4× of the zero-mean row, so
+the offset costs the two-pass kernel nothing measurable. A revert to one-pass statistics now fails
+a suite recipe rather than a probe nobody runs.
+
+~~Adding one to `addnorm` would fail, so it needs the kernel moved to two-pass f32 first.~~
+**`[2026-08-11]` The `addnorm` kernels are MOVED**, mirroring `layer_norm.cc`'s idiom (f32 row
+sum, two-pass `E[(x - mean)^2]` with the deviations exact in f32, normalization in f32 with one
+rounding before the weight multiply): `encoder.cc`'s `fused_add_layer_norm_2` — the post-add
+entry point — and both of `addnorm_ffn_norm.cc`'s fused templates under either
+`-DADDNORM_PRE_ADD` setting. Symbols, interfaces and the `-D` variant structure are unchanged, so
+no builder moved. `64x512_offset` and `64x768_pre_add_offset` are catalogue rows in the probe's
+exact regime, pinned by `run_npu2_addnorm_peano.lit`, their atol figures the sibling rows' and
+PROVISIONAL until the first gated hardware run records their `mean_rel_L1` / `atol_required`.
+`encoder.cc`'s STAGED forms (`ln_calc_sum_sumsq` feeding `fused_add_layer_norm_1` /
+`fused_layer_norm_1`) deliberately keep one-pass statistics — their sum/sumsq interface IS the
+one-pass decomposition, a two-pass rewrite there means redesigning the split reduction, and no
+builder dispatches them.
+
+**Owed to hardware, in one re-measure pass after merge:** the two offset rows' first run (which
+replaces the provisional figures), and the provenance figures that flow through the fused
+`addnorm` — the two zero-mean `addnorm` rows' measured comments, `block`, and the three modes.
+By analogy with item 1 the move costs ~13% on this kernel and probably improves those figures;
+every existing figure in this document and in `opcheck_specs.py` is still the ONE-PASS kernel's
+until that pass runs. Compile-only evidence so far: all ten kernel objects build and the pre-add /
+post-add byte-difference gate still holds; nothing here has touched the NPU.
 
 Reproduce with `agents/probes/probe_addnorm_variance_cliff.py`.
 

@@ -205,10 +205,11 @@ def prepare_layer_norm(shape, seed=2):
     to its spread (mean 8, sigma 0.25 -- mean/sigma 32), the same regime as
     ``prepare_norm_tail``'s offset row and doc 23 item 2's sweep. It is the
     regime where a one-pass bf16 variance loses the row's statistics entirely
-    (the addnorm kernels still do, measured collapse boundary between
-    |mean|/sigma 2 and 4), and where this kernel's two-pass f32 statistics
-    must not. Doc 23 measured the kernel clean here (0/49152,
-    mean_rel_L1 1.1e-4) but nothing pinned it; the offset row is that pin.
+    (measured collapse boundary between |mean|/sigma 2 and 4, on the one-pass
+    form the addnorm kernels carried until doc 23 item 2's second half moved
+    them), and where this kernel's two-pass f32 statistics must not. Doc 23
+    measured the kernel clean here (0/49152, mean_rel_L1 1.1e-4) but nothing
+    pinned it; the offset row is that pin.
     """
     rows, cols = shape["rows"], shape["cols"]
     ek.compile_layer_norm()
@@ -283,14 +284,30 @@ def prepare_addnorm(shape, seed=3):
     together -- see ``builders/addnorm.py``. Taking the reference from the same
     flag that built the module is what stops the two from drifting apart into a
     check that passes against the wrong function.
+
+    A shape carrying ``offset_regime`` draws x at a COMMON OFFSET large next
+    to its spread (mean 8, sigma 0.25 -- |mean|/sigma 32) with residual
+    identically zero, doc 23 item 2's regime and exactly what
+    probe_addnorm_variance_cliff.py injects. The one-pass bf16 statistics
+    BOTH kernel variants shipped with collapse here -- measured 43058/49152
+    (pre-add, 64x768) and 28170/32768 (post-add, 64x512) outside tolerance,
+    boundary between |mean|/sigma 2 and 4 -- and the two-pass f32 statistics
+    they carry now must not. The zero residual is deliberate: adding zero is
+    exact in bf16, so the row isolates the STATISTICS -- for pre-add it
+    removes the sum's own rounding, for post-add the trailing add's
+    cancellation.
     """
     rows, cols = shape["rows"], shape["cols"]
     pre_add = shape.get("pre_add", False)
     # addnorm half only -- the FFN half collides on ffn_gelu_bf16.
     compile_addnorm_kernel(pre_add=pre_add)
     rng = np.random.default_rng(seed)
-    x = rng.standard_normal((rows, cols)).astype(bfloat16)
-    residual = rng.standard_normal((rows, cols)).astype(bfloat16)
+    if shape.get("offset_regime"):
+        x = (8.0 + 0.25 * rng.standard_normal((rows, cols))).astype(bfloat16)
+        residual = np.zeros((rows, cols), dtype=bfloat16)
+    else:
+        x = rng.standard_normal((rows, cols)).astype(bfloat16)
+        residual = rng.standard_normal((rows, cols)).astype(bfloat16)
     # A trained LayerNorm gamma sits near 1; uniform(0.5, 1.5) is that range
     # without being exactly 1, which would hide a dropped weight multiply.
     weight = rng.uniform(0.5, 1.5, size=cols).astype(bfloat16)

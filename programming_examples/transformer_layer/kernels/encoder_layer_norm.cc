@@ -17,18 +17,38 @@
 //     `ln_`-prefixed extern "C" entry points.
 //   - Include only AFTER <aie_api/aie.hpp> and
 //   <aie_kernels/aie_kernel_utils.h>.
-//   - The file offers both the fused form (fused_add_layer_norm_1/_2, which
-//     reduce and normalize in one call) and the staged form
-//     (ln_calc_sum_sumsq_vectorized -> fused_layer_norm_1 -> ln_mul_weights_1
-//     -> ln_mul_add_1), where the reduction is done elsewhere and its sum /
-//     sum-of-squares are passed in. The staged form exists so a herd can split
-//     the reduction across cores; it is not a drop-in alternative.
+//   - The file offers both the fused form (fused_add_layer_norm_2, which owns
+//     its whole reduction and normalizes in one call) and the staged forms
+//     (ln_calc_sum_sumsq_vectorized -> fused_add_layer_norm_1 /
+//     fused_layer_norm_1 -> ln_mul_weights_1 -> ln_mul_add_1), where the
+//     reduction is done elsewhere and its sum / sum-of-squares are passed in.
+//     The staged forms exist so a herd can split the reduction across cores;
+//     they are not a drop-in alternative, and their statistics differ -- see
+//     STATISTICS below.
 //   - Include guarded, so including it twice in one translation unit is safe.
 //
-// FOOTGUN: variance is E[x^2] - E[x]^2, which cancels when a row's mean is
-// large next to its spread and can round below zero. Every site clamps it at
-// zero before aie::invsqrt, because invsqrt of a negative operand returns NaN
-// and would poison the whole row. Keep the clamp if you add another site.
+// STATISTICS: two regimes, deliberately different.
+//   - fused_add_layer_norm_2 owns its whole reduction and keeps f32 TWO-PASS
+//     statistics -- mean first, then E[(x - mean)^2] -- following
+//     layer_norm/layer_norm.cc, because the one-pass E[x^2] - E[x]^2 form it
+//     used to ship (bf16 row sum) loses a row's variance entirely once the
+//     mean is large next to the spread: measured collapse between
+//     |mean|/sigma 2 and 4 (agents/probes/probe_addnorm_variance_cliff.py,
+//     doc 23 item 2). This is the entry point the addnorm operator's post-add
+//     form dispatches, and the *_offset opcheck rows pin the regime.
+//   - The STAGED sites (fused_add_layer_norm_1, fused_layer_norm_1) compute
+//     variance as E[x^2] - E[x]^2 from the sum / sum-of-squares they are
+//     handed: that interface IS the one-pass decomposition, so a two-pass
+//     rewrite there means redesigning the split reduction
+//     (ln_calc_sum_sumsq_vectorized would have to run twice with a mean
+//     broadcast between), not editing a formula. They keep the one-pass form
+//     and its full cancellation footgun; no current builder dispatches them.
+//
+// FOOTGUN: every variance is clamped at zero before aie::invsqrt, because
+// invsqrt of a negative operand returns NaN and would poison the whole row.
+// The one-pass sites NEED the clamp (the cancellation can round below zero);
+// the two-pass site keeps it as a one-compare guard. Keep it if you add
+// another site.
 //
 //===----------------------------------------------------------------------===//
 
@@ -304,6 +324,14 @@ void ln_mul_add_1(const T *__restrict input, const T *__restrict residual,
   event1();
 }
 
+// The fused post-add add-norm the addnorm operator dispatches (via
+// fused_add_layer_norm_2outs): output1 = output2 = gamma * norm(input)
+// + residual, statistics over `input` alone. Statistics follow
+// layer_norm.cc's layer_norm_rows_impl -- f32 row sum, two-pass variance
+// with the deviations exact in f32 and rounded to bf16 only for the
+// squaring, normalization in f32 with one rounding to bf16 before the
+// weight multiply. See the file header on why the staged forms above do
+// not follow it.
 template <typename T, int N>
 void fused_add_layer_norm_2(const T *__restrict input,
                             const T *__restrict residual,
@@ -313,41 +341,48 @@ void fused_add_layer_norm_2(const T *__restrict input,
   event0();
 #ifndef DEBUG_AIE_KERNELS
   constexpr float epsilon = 1e-5f;
-  int vector_chunks = cols / N;
+  const int vector_chunks = cols / N;
 
   AIE_PREPARE_FOR_PIPELINING
   AIE_LOOP_MIN_ITERATION_COUNT(4)
   for (int row = 0; row < rows_to_process; row++) {
-
-    ::aie::vector<T, N> sum_acc = ::aie::zeros<T, N>();
-    ::aie::vector<float, N> sum_sq_acc = ::aie::zeros<float, N>();
     int input_idx = row * cols;
 
+    // Pass 1: the row sum, widened to f32 lane-by-lane before accumulating.
+    ::aie::vector<float, N> sum_acc = ::aie::zeros<float, N>();
     for (int i = 0; i < vector_chunks; i++) {
-
       ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input + input_idx);
-      sum_acc = ::aie::add(sum_acc, reg_a);
-      ::aie::vector<float, N> sq_acc = ::aie::mul(reg_a, reg_a);
-      sum_sq_acc = ::aie::add(sum_sq_acc, sq_acc);
+      ::aie::accum<accfloat, N> a_acc;
+      a_acc.from_vector(reg_a);
+      sum_acc = ::aie::add(sum_acc, a_acc.template to_vector<float>());
       input_idx += N;
     }
+    input_idx -= cols;
+    const float mean = ::aie::reduce_add(sum_acc) / float(cols);
 
-    input_idx -= cols; // reset pointer to beginning of the row
-
-    float sum_of_vals = ::aie::reduce_add(sum_acc);
-    float sum_of_sq_vals = ::aie::reduce_add(sum_sq_acc);
-
-    float mean = sum_of_vals / float(cols);
-    float mean_sq = mean * mean;
-    float variance = (sum_of_sq_vals / float(cols)) - mean_sq;
+    // Pass 2: E[(x - mean)^2]. The one-pass form this replaced loses the
+    // variance whole on offset rows; see the file header.
+    ::aie::vector<float, N> sum_sq_acc = ::aie::zeros<float, N>();
+    for (int i = 0; i < vector_chunks; i++) {
+      ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input + input_idx);
+      ::aie::accum<accfloat, N> a_acc;
+      a_acc.from_vector(reg_a);
+      ::aie::accum<accfloat, N> diff_acc = ::aie::sub(a_acc, mean);
+      ::aie::vector<T, N> diff_v = diff_acc.template to_vector<T>();
+      ::aie::vector<float, N> sq_v = ::aie::mul(diff_v, diff_v);
+      sum_sq_acc = ::aie::add(sum_sq_acc, sq_v);
+      input_idx += N;
+    }
+    input_idx -= cols;
+    float variance = ::aie::reduce_add(sum_sq_acc) / float(cols);
+    // Non-negative by construction now; kept as the NaN guard (file header).
     if (variance < 0.0f) {
       variance = 0.0f;
     }
-    float inv_std = aie::invsqrt(variance + epsilon);
+    const float inv_std = aie::invsqrt(variance + epsilon);
 
-    ::aie::vector<T, N> mean_v = ::aie::broadcast<T, N>(mean);
-    ::aie::vector<T, N> inv_std_v = ::aie::broadcast<T, N>(inv_std);
-
+    // Pass 3: (x - mean) * inv_std in f32, one rounding to bf16, then the
+    // weight multiply and the trailing residual add.
     const T *__restrict pW = weight;
     const T *__restrict pRes = residual + row * cols;
     T *__restrict pOut1 = output1 + row * cols;
@@ -357,9 +392,13 @@ void fused_add_layer_norm_2(const T *__restrict input,
       ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input + input_idx);
       ::aie::vector<T, N> reg_weight = ::aie::load_v<N>(pW);
       ::aie::vector<T, N> reg_res = ::aie::load_v<N>(pRes);
-      ::aie::vector<T, N> diff_v = ::aie::sub(reg_a, mean_v);
-      ::aie::vector<T, N> norm_v = ::aie::mul(diff_v, inv_std_v);
-      ::aie::vector<T, N> scaled_v = aie::mul(norm_v, reg_weight);
+      ::aie::accum<accfloat, N> a_acc;
+      a_acc.from_vector(reg_a);
+      ::aie::accum<accfloat, N> diff_acc = ::aie::sub(a_acc, mean);
+      ::aie::accum<accfloat, N> norm_acc =
+          ::aie::mul(diff_acc.template to_vector<float>(), inv_std);
+      ::aie::vector<T, N> scaled_v =
+          aie::mul(norm_acc.template to_vector<T>(), reg_weight);
       // ::aie::vector<T, N> out_v = ::aie::add(scaled_v, beta_v);
       ::aie::vector<T, N> out_v = ::aie::add(scaled_v, reg_res);
       ::aie::store_v(pOut1, out_v);

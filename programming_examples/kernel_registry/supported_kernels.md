@@ -414,6 +414,8 @@ Weighted layer normalization and a residual, per row, fused into one kernel call
 
 Pre-add is what a post-norm encoder (`encoder_bert`) computes at both of its normalization points. Full datapath and the one-call-per-tile constraint in [`details/AddNorm_bf16.md`](details/AddNorm_bf16.md).
 
+Since 2026-08-11 both orderings keep **f32 two-pass statistics** (mean first, then `E[(x − mean)²]`), the same discipline as LayerNorm above and for the same measured reason — the one-pass `E[x²] − E[x]²` form they shipped with loses an offset row's variance entirely (collapse between `|mean|/σ` 2 and 4). The `64x512_offset` / `64x768_pre_add_offset` opcheck rows pin the regime at provisional (sibling-row) tolerances. **The figures below were measured on the one-pass kernel and their re-measure is owed**; the tolerances were not widened for the move.
+
 | (M×N) | ordering | herd (hx/hy) | rows_per_call | mean_rel_L1 | abs_err max | atol_required | mismatches | Used by | Status |
 |---|---|---|---|---|---|---|---|---|---|
 | 64×512 | post-add | 8/1 | 8 | 1.9e-3 | 3.1e-2 | 1.75e-2 | 0 / 32768 | transformer-layer studies, encoder sublayer boundary (hidden = 512) | ✅ |

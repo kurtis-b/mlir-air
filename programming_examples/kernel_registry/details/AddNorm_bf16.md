@@ -8,7 +8,7 @@
 # AddNorm (BF16) — Kernel Detail
 
 > Weighted layer normalization and a residual, fused into one kernel call, in either order:
-> `out = LayerNorm(x) · weight + residual` (post-add, the default) or `out = LayerNorm(x + residual) · weight` (pre-add, `pre_add=True`), per row. The sublayer boundary of an encoder-style transformer block; a post-norm encoder such as `encoder_bert` wants the **pre-add** form. BF16 in/out, one-pass variance, **weight as a runtime memref argument**.
+> `out = LayerNorm(x) · weight + residual` (post-add, the default) or `out = LayerNorm(x + residual) · weight` (pre-add, `pre_add=True`), per row. The sublayer boundary of an encoder-style transformer block; a post-norm encoder such as `encoder_bert` wants the **pre-add** form. BF16 in/out, f32 two-pass statistics (since 2026-08-11 — see the datapath note), **weight as a runtime memref argument**.
 > Shapes are written **`M×N`**: `x[M, N]`, `residual[M, N]`, `weight[N]` → `out[M, N]` (M = rows / seq, N = embedding dim, the normalization axis).
 >
 > Companion: [`../supported_kernels.md`](../supported_kernels.md) · [`../README.md`](../README.md) · [`LayerNorm_bf16.md`](LayerNorm_bf16.md) (the unweighted, no-residual form)
@@ -52,19 +52,23 @@ Both are built with the **addnorm half only** (`build_ffn=False`), because the F
 ## Numerical datapath (what "BF16 AddNorm" means here)
 
 ```
-x bf16 → Σx  (bf16 vector accumulate, 32 lanes) ─┐
-      → Σx² (f32 vector accumulate)              ├→ mean, var = E[x²] − E[x]²  (f32, clamped ≥ 0)
-                                                  └→ inv_std = aie::invsqrt(var + 1e-5)  (f32)
-   → ((x − bf16(mean)) · bf16(inv_std)) · weight + residual   (bf16 vector) → bf16
+x bf16 → Σx  (widened lane-by-lane, f32 vector accumulate) → mean  (f32)
+      → Σ(x − mean)²  (deviation exact in f32, rounded to bf16 for the
+                       squaring, f32 vector accumulate) → var  (f32, clamped ≥ 0)
+      → inv_std = aie::invsqrt(var + 1e-5)  (f32)
+   → bf16((x − mean) · inv_std) · weight + residual   (normalize in f32, one
+                       rounding before the bf16 weight multiply) → bf16
 ```
 
-- The diagram is the **post-add** form: statistics come from `x` alone, the residual never enters the mean or the variance, and it is added after the weighted normalization. The **pre-add** form (`-DADDNORM_PRE_ADD`) folds `x + residual` in bf16 *before* Σx and Σx², normalizes that sum, and does **not** add the residual again — so its epilogue has three bf16 roundings rather than four, and none of them is a cancelling add. Both are measured in this entry.
-- **Variance is one-pass**, `E[x²] − E[x]²`, clamped at zero before `invsqrt` — it cancels catastrophically on a row whose mean is large next to its spread, and the clamp avoids the NaN `aie::invsqrt` returns on a negative operand. This is the formula the multi-row `layer_norm_rows` kernel also carried until J7a's round-3 review moved that kernel to two-pass f32 statistics ([`LayerNorm_bf16.md`](LayerNorm_bf16.md) documents the offset-row regime that forced it); the fused kernels here still measure and gate the one-pass form, on zero-mean-ish activations where the cancellation does not bite.
-- **Four bf16 roundings in the epilogue**: `sub`, `mul` by `inv_std`, `mul` by `weight`, `add` of the residual. The residual add is where an output can land near zero through cancellation, which is what sets `rel_err max`.
+- The diagram is the **post-add** form: statistics come from `x` alone, the residual never enters the mean or the variance, and it is added after the weighted normalization. The **pre-add** form (`-DADDNORM_PRE_ADD`) folds `x + residual` in bf16 *before* the statistics, normalizes that sum, and does **not** add the residual again — so none of its epilogue roundings is a cancelling add. Both are measured in this entry.
+- **Statistics are f32 and the variance is two-pass** (mean first, then `E[(x − mean)²]`) since 2026-08-11, the same discipline J7a's round-3 review gave the multi-row `layer_norm_rows` kernel and for the same measured reason ([`LayerNorm_bf16.md`](LayerNorm_bf16.md) documents the regime). The one-pass `E[x²] − E[x]²` form both orderings shipped with — with the row sum accumulating in **bf16** — loses an offset row's variance entirely: measured collapse between `|mean|/σ` 2 and 4 (`agents/probes/probe_addnorm_variance_cliff.py`), 28170/32768 elements out at 64×512 post-add and 43058/49152 at 64×768 pre-add in the `mean 8, σ 0.25` regime. The `64x512_offset` / `64x768_pre_add_offset` opcheck rows pin it. The clamp before `invsqrt` stays as a NaN guard, though the two-pass variance is non-negative by construction.
+- **Three bf16 roundings in the epilogue**: the normalized value (normalization itself runs in f32), the `mul` by `weight`, and the `add` of the residual. The residual add is where an output can land near zero through cancellation, which is what sets `rel_err max`.
 
 ---
 
 ## Numerical accuracy
+
+> **Measured on the one-pass kernel.** Every figure in this section and in "Tested shapes" below predates the 2026-08-11 two-pass move; the re-measure (these rows plus the two offset rows' first run) is owed and the tolerances were **not** widened for the move.
 
 Verified element-wise over the full output against the **two-pass FP32** reference:
 
@@ -114,7 +118,7 @@ Element-wise over the **full output**: every element must pass `|out−ref| ≤ 
 | bf16 | post-add | 1.6e-2 | 5e-2 |
 | bf16 | pre-add | 1.6e-2 | 2e-3 |
 
-- **Reference** — one per ordering, not one with a branch. Post-add: CPU FP32 **two-pass** LayerNorm of `x`, multiplied by the f32 weight, plus the f32 residual. Pre-add: the f32 sum `x + residual` normalized the same way and multiplied by the weight, with **no** second residual add. Both cast once to bf16 at the end. Two-pass on purpose: the device's one-pass variance is exactly the error the check should be able to see, so reproducing it in the oracle would hide it. The pre-add oracle likewise sums in f32 while the kernel sums in bf16, for the same reason.
+- **Reference** — one per ordering, not one with a branch. Post-add: CPU FP32 **two-pass** LayerNorm of `x`, multiplied by the f32 weight, plus the f32 residual. Pre-add: the f32 sum `x + residual` normalized the same way and multiplied by the weight, with **no** second residual add. Both cast once to bf16 at the end. The kernel now keeps the same two-pass f32 statistics, but the oracle still reproduces none of its bf16 intermediate roundings (the squared deviations, the normalized value, the weight multiply, the trailing add) — the point of the check is to measure that gap, not to reproduce it. The pre-add oracle likewise sums in f32 while the kernel sums in bf16, for the same reason.
 - `rtol = 1.6e-2` is held fixed across the registry; each `atol` is that row's measured `atol_required` rounded up ~3×, per the registry methodology. Post-add's is set by its trailing residual add, not by the normalization.
 
 ---

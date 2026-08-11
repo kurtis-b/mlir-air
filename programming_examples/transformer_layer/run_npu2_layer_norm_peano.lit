@@ -4,9 +4,10 @@
 // Phase C1 operator gate: layer_norm.
 //
 // Multi-row LayerNorm over the ported layer_norm_rows kernel, checked
-// against a two-pass FP32 reference. The kernel's variance is one-pass, so
-// the two are not bit-equivalent by construction; that gap is what the
-// tolerance is sized against.
+// against a two-pass FP32 reference. The kernel keeps f32 two-pass statistics
+// too (since J7a's round-3 review), but its bf16 intermediate roundings keep
+// the two from being bit-equivalent; that gap is what the tolerance is sized
+// against.
 //
 // Two shapes: the 512x512 C1 point, and Phase D1's 4096x768 -- the block's own
 // activation shape in the baseline_768 family. Rows are free for this operator
