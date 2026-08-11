@@ -1,0 +1,26 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Doc 31 R1, the host-only half: ffn_resident's addressing arithmetic,
+// emulated to exactness.
+//
+// The resident FFN interior moves every byte through hand-derived patterns
+// (the w_up packing, the shim's row-major->blocked retile, the strided
+// chunk extraction, the w_down slices, a global K order assembled from
+// three herds' loops). builders/test_ffn_resident.py emulates the device's
+// exact address arithmetic in numpy, f64 throughout, and requires the
+// composition to equal gelu(hidden @ w_up) @ w_down EXACTLY -- so only
+// ordering and addressing are tested, and a slip in either cannot hide
+// behind a tolerance.
+//
+// This arm is deliberately the one that stays LIVE while the operator's
+// device gate (run_npu2_ffn_resident_peano.lit) is parked on the
+// air-fuse-channels crash: no aircc, no XRT, no kernel objects, no NPU.
+//
+// No framework dependency (pytest is not in the sandbox venv): the file
+// runs as a plain script and prints a named pass count, matched exactly so
+// a check that stops being collected fails here rather than passing
+// quietly.
+//
+// RUN: python3 %S/builders/test_ffn_resident.py | FileCheck %s
+// CHECK: ffn_resident emulation tests: 5/5 passed

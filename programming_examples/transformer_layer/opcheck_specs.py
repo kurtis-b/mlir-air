@@ -61,6 +61,7 @@ from opcheck_layer import prepare_block  # noqa: E402
 from opcheck_prepare import (  # noqa: E402
     prepare_addnorm,
     prepare_ffn_accum,
+    prepare_ffn_resident,
     prepare_causal_mask,
     prepare_elementwise_add,
     prepare_elementwise_mul,
@@ -1060,5 +1061,26 @@ SPECS = [
         # FP32 reference deliberately reproduces none of it.
         "atol": 5e-3,
         "prepare": prepare_ffn_accum,
+    },
+    {
+        # DOC 31 INCREMENT R1: the resident FFN interior -- up-projection,
+        # GeLU and the J7b down ring as three herds of ONE segment, the
+        # [seq, ffn] interior existing only as chunks in flight (never in
+        # DRAM, never whole in L2). Same function and data scaling as `ffn`;
+        # what this row's numbers price is bf16 accumulation in BOTH rings
+        # (the in-place kernel's C: 24 roundings up, 96 down) where `ffn`'s
+        # registry GEMMs accumulate in f32 and round at the drain. The
+        # structural claim -- one aie.device, core->core up->GeLU edges,
+        # the interior's crossings gone -- is ffn_resident_structure.py's
+        # arm; these numbers cannot see it (doc 31's instrument warning).
+        "operator": "ffn_resident",
+        "shape_key": "64x3072x768",
+        "shape": {"seq_len": 64, "ffn_dim": 3072, "emb_dim": 768},
+        # PROVISIONAL until the first gated hardware run records its
+        # mean_rel_L1 / atol_required here: the GEMM tier's 5e-3 with the
+        # down ring's measured order-above-tier relative error (ffn_accum's
+        # 1.417e-2) compounded through a second bf16 ring in front of it.
+        "atol": 5e-3,
+        "prepare": prepare_ffn_resident,
     },
 ]
