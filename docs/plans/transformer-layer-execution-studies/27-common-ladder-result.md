@@ -1,5 +1,19 @@
 # 27 — The first four-mode comparison at one sequence length
 
+> **`[2026-08-10]` Two of this document's results are superseded — read
+> [32](32-cost-decomposed-ladder.md) beside it.** The warm DRAM ordering it
+> measured (`fused` < `coarse` < `runlist` < `offload`) described the
+> wholesale-eviction implementation: the targeted pool eviction landed
+> 2026-08-10 moved `runlist` below `fused` and `coarse` by exactly its
+> static-weight set, so the warm ordering is now
+> `runlist` < `fused` < `coarse` < `offload` (byte-identical across two
+> walks). And its latencies were measured on a machine whose `hw_context`
+> load cost has since risen ~30× — they remain the healthy-machine record,
+> but no comparison against post-2026-08-09 numbers is valid until [32]'s
+> verdict rung reads healthy again. The byte totals for `fused`, `coarse`
+> and `offload`, the two-walk discipline, and the cold-vs-warm conventions
+> all stand.
+
 `[2026-08-09]` The four modes had never been measured at the same sequence
 length. `fused` sat at 1024 and the other three at 4096, so every cross-mode
 table assembled from the catalogue compared two lengths — the first of the three

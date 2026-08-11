@@ -24,7 +24,10 @@ zero-load modes are unaffected, and unattributed host time per load —
 walks, both lengths. Yesterday's recorded offload minimums (78–82 ms total at 512, 30 loads
 inside) bound the same cost at **≤ 2.6 ms/load on 2026-08-09**. So the machine's context-creation
 cost rose ~30× overnight. Cause unknown; `xrt-smi examine` shows nothing anomalous from
-userspace; the next diagnostic is a reboot / `amdxdna` reload followed by one `offload` rung —
+userspace. **`[2026-08-11]` A clean `amdxdna` reload does NOT clear it** — the same rung read
+2514 ms avg (~80.9 ms/load residual) immediately after — and nothing on disk changed since May
+(XRT userspace, `/lib/firmware/amdnpu`, kernel all pre-date the anomaly), so it is runtime
+platform state. The remaining diagnostic is a **full reboot** followed by one `offload` rung —
 **do not publish any latency comparison against pre-2026-08-10 numbers until that is done**, and
 treat even this walk's runlist/offload-vs-rest gaps as conditional on the anomaly
 ([27](27-common-ladder-result.md) called runlist/offload latency-indistinguishable at healthy
