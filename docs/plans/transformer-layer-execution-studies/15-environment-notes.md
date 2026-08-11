@@ -154,3 +154,23 @@ Two deliberately different inodes — do not unify them:
 Work is on `exper/transformer-layer-execution-studies`, **not pushed**. A `pre-commit` hook is
 installed with no `.pre-commit-config.yaml` on this branch, so commits need
 `PRE_COMMIT_ALLOW_NO_CONFIG=1` — or run `pre-commit uninstall`.
+
+## `[2026-08-11]` The wider lit tree carries three pre-existing failures — not study regressions
+
+The full `build-xrt/programming_examples` lit tree (361 tests) is NOT a study gate; the standing
+regression legs are the transformer-layer suite (`ninja check-programming-examples-transformer-layer`)
+and the ten-model `make verify`. A whole-tree sweep on 2026-08-11 — both legs green the same
+day — found three failures, reproducible 2/2, all outside every standing gate leg and all
+predating that day's work (none of the three directories has a 2026-08 commit):
+
+- `llms/llama32_1b_int4/multi_launch_builder/run_o_gemv_ffn_int4_fused_npu2_peano.lit` — kernel
+  compile fails: `aie_api/adf/stream.hpp` includes `adf.h`, a Chess-only header, under Peano
+  (the mlir-aie 1.4.0 include-layout family above). The int4 *model* itself verifies (10/10 run
+  the same day includes it); only this sub-example's lit is red.
+- `conv2d_14x14/run_npu2_makefile_peano.lit` — device run completes, `Output 0 does not meet
+  expected output` (an NPU1-port example).
+- `matrix_vector_multiplication/bf16/run_npu2_makefile_peano.lit` — the `profile` target dies
+  with `std::runtime_error` (abort 134).
+
+If a whole-tree sweep is ever promoted to a gate, these three need owners first; until then a
+red whole-tree run with exactly these three is the known baseline, not a regression.
