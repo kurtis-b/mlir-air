@@ -533,9 +533,66 @@ RESOURCE_FIELDS: tuple[Field, ...] = (
     Field("failure_message", "First failure verbatim."),
 )
 
+# The per-component-group table: one row per named group of one mode's layer,
+# so a whole-layer latency can be read as where the time went rather than as one
+# number. `study/component_groups.py` writes it.
+#
+# WHY `is_complete` IS A COLUMN AND NOT AN ASSERTION. Only some of a mode's
+# components are individually timed today -- doc 09's 2026-08-08 section scopes
+# the per-stage `record_kernel`/`record_cpu` instrumentation the rest needs and
+# notes it lands in Lane 1 pattern files. So a group row says how many of its
+# expected components it actually accounted for, and which are missing by name.
+# A table that silently reported partial groups as whole ones would understate
+# every device group by exactly the amount nobody measured.
+COMPONENT_FIELDS: tuple[Field, ...] = (
+    Field("schema_version", "This module's SCHEMA_VERSION at write time."),
+    Field("study_id", "The study run this row belongs to."),
+    Field("study_case_id", "Case identity within the study."),
+    Field("study_case_label", "Human-readable case name."),
+    Field("workload_variant", "encoder_bert or decoder_gpt2."),
+    Field("execution_mode", "One of EXECUTION_MODES."),
+    Field("seq_len", "Sequence length."),
+    Field("group_label", "The component group this row aggregates."),
+    Field(
+        "group_kind",
+        "host_cpu, device or sync. WHICH INSTRUMENT produced the row: named "
+        "Profiler.time_cpu buckets, the dispatch vectors' device submission "
+        "time, or their sync time. Not decoration -- a device row is a mode "
+        "TOTAL today and a host_cpu row is a named component, and reading the "
+        "two as the same granularity is the mistake this column prevents.",
+    ),
+    Field(
+        "avg_latency_ms",
+        "Mean milliseconds this group accounted for, per timed iteration.",
+        timing="Inside the same region as the results table's avg_latency_ms, "
+        "and over the same iterations. The groups are DISJOINT but do NOT sum "
+        "to it -- the remainder is unattributed host overhead, which doc 03 "
+        "records as dominating the per-operator modes at 1024.",
+    ),
+    Field("component_count", "Components this group actually accounted for."),
+    Field(
+        "expected_component_count",
+        "Components the taxonomy says the group has. Equal to component_count "
+        "only when the group is fully instrumented.",
+    ),
+    Field(
+        "missing_components_json",
+        "The expected components with no measurement, as a JSON list. Empty "
+        "list when the group is complete.",
+    ),
+    Field(
+        "is_complete",
+        "component_count == expected_component_count. False is the normal "
+        "state for device groups today; see this table's note.",
+    ),
+    Field("run_status", "One of RUN_STATUSES."),
+    Field("failure_message", "First failure verbatim."),
+)
+
 RESULTS_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in RESULTS_FIELDS)
 TUNING_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in TUNING_FIELDS)
 RESOURCE_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in RESOURCE_FIELDS)
+COMPONENT_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in COMPONENT_FIELDS)
 
 DISPATCH_VECTOR_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _DISPATCH)
 POWER_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _POWER)
@@ -586,6 +643,7 @@ _FIELDS_BY_TABLE: dict[str, tuple[Field, ...]] = {
     "results": RESULTS_FIELDS,
     "tuning": TUNING_FIELDS,
     "resource": RESOURCE_FIELDS,
+    "component": COMPONENT_FIELDS,
 }
 
 
