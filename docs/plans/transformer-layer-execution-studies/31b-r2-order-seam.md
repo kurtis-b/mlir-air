@@ -16,8 +16,12 @@ fix changes shim BD emission; [31 §The gate ran](31-fused-resident-tail.md) alr
 structural literals taken from a pre-fix dump of a ≥3-clique module had to be *re-derived, not
 compared against*. The same discipline applies to this document: re-run the probes after 6b lands
 and re-derive. Both probes print the `air-opt` binary mtime for exactly this reason — the tree was
-rebuilt underneath this session twice (`2026-08-11 11:05:06` → `13:03:54` → `13:06:01`), and a
-number without that stamp cannot be placed.
+rebuilt underneath this session **four times** (`2026-08-11 11:05:06` → `13:03:54` → `13:06:01` →
+`13:28:03`) by the concurrent item-6b work, and a number without that stamp cannot be placed.
+
+That churn is also a small piece of evidence in the findings' favour: every measurement below
+reproduced unchanged across those builds. It is *not* evidence about 6b, which had not landed —
+`build-xrt` was being relinked, not necessarily with the shim-BD fix in it.
 
 ---
 
