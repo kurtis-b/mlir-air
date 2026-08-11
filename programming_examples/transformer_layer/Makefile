@@ -84,17 +84,20 @@ help:
 	@echo "                      LINEAR operator on the device -- six projections"
 	@echo "                      plus both attention matmuls per head, 30"
 	@echo "                      dispatches -- with softmax, both LayerNorms and"
-	@echo "                      the GeLU on the host. Each dispatch is its own"
-	@echo "                      submission, through its own ELF cache. NEEDS AN"
-	@echo "                      NPU."
+	@echo "                      the GeLU on the host. Runs the LEGACY/CONTROL"
+	@echo "                      ELF packaging (AIR_OFFLOAD_LEGACY_ELF=1, set"
+	@echo "                      by the target): one hw_context reload per"
+	@echo "                      dispatch, its own ELF cache. NEEDS AN NPU."
 	@echo "  make check-offload-shared"
-	@echo "                      The same mode over its shared-xclbin path: five"
-	@echo "                      shapes in ONE xclbin, the array configured once"
-	@echo "                      instead of once per dispatch. At seq 4096, the"
-	@echo "                      mode's own SPECS shape -- the chain needs every"
-	@echo "                      shape single-launch (the platform faults"
-	@echo "                      in-stream load_pdi), so a fused-cast winner is"
-	@echo "                      pinned to its drain row. NEEDS AN NPU."
+	@echo "                      The same mode over its shared-xclbin path --"
+	@echo "                      the DEFAULT packaging since 2026-08-11, so no"
+	@echo "                      env var: five shapes in ONE xclbin, the array"
+	@echo "                      configured once instead of once per dispatch."
+	@echo "                      At seq 4096, the mode's own SPECS shape -- the"
+	@echo "                      chain needs every shape single-launch (the"
+	@echo "                      platform faults in-stream load_pdi), so a"
+	@echo "                      fused-cast winner is pinned to its drain row."
+	@echo "                      NEEDS AN NPU."
 	@echo "  make check-offload-fault"
 	@echo "                      That mode's negative control; must FAIL under"
 	@echo "                      injection, with the vectors still recorded."
@@ -348,16 +351,24 @@ check-coarse-c3-fault:
 coarse-cell-structure:
 	python3 $(srcdir)/coarse_cells_structure.py
 
-# Phase E3: the same layer, measured as the `offload` execution strategy. The
-# host owns every intermediate and dispatches six registry GEMMs one at a
-# time — each a one-step run_sequence call, so the driver-summed vector is six
-# submissions over six entries: the mode aggregates nothing, which is its
-# clause in the distinguishability gate. Attention stays in host torch (its
-# two GEMMs resolve in no registry — see pattern/offload/README.md), so the
-# artifact records the hybrid boundary as attention_path. Its own ELF cache
-# (./offload_cache under $(BUILD_DIR)) for the same reason as coarse's.
+# Phase E3: the same layer, measured as the `offload` execution strategy over
+# its LEGACY/CONTROL packaging — AIR_OFFLOAD_LEGACY_ELF=1, the opt-in since
+# the `[2026-08-11]` default flip (doc 29 §What this does not do). The host
+# owns every intermediate and dispatches every LINEAR operator one at a time —
+# six projections plus both attention matmuls per head, 30 one-step
+# run_sequence calls, so the driver-summed vector is thirty submissions over
+# thirty entries: the mode aggregates nothing, which is its clause in the
+# distinguishability gate. This packaging reloads the hw_context before every
+# dispatch — the maximum reconfiguration, which is exactly what the recipe's
+# `context_loads 30` line pins. It stays gated as the control arm the shared
+# default is measured against, and every offload number recorded before the
+# flip describes it. Its own ELF cache (./offload_cache under $(BUILD_DIR))
+# for the same reason as coarse's.
 check-offload:
-	$(call opcheck,offload)
+	mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
+	    AIR_OFFLOAD_LEGACY_ELF=1 \
+	    python3 $(srcdir)/opcheck.py --operator offload $(OPCHECK_ARGS)
 
 # `[2026-08-09]` The same mode over its SHARED-XCLBIN path: five GEMM shapes
 # compiled into one xclbin, loaded once, each binding its own kernel and
@@ -366,12 +377,15 @@ check-offload:
 # target existed nothing in the suite ran the path at all, so the claim was
 # printed by describe_offload and enforced by nothing.
 #
-# The env var is the whole switch: offload.py resolves it once into cfg
-# (SHARED_XCLBIN) so a run cannot be half shared and half not, and it also
-# selects a SEPARATE ELF cache (offload_shared_cache). That separation is not
-# tidiness — the two builds emit artifacts with identical names over different
-# ABIs, so one directory could hand a 30-reconfiguration run's ELF to the
-# one-reconfiguration claim.
+# `[2026-08-11]` THIS IS THE DEFAULT PACKAGING, so the target sets NO env
+# var: an unconfigured run takes the shared path, and this recipe is what
+# gates that default. offload.py resolves the packaging once into cfg
+# (SHARED_XCLBIN, inverted by the AIR_OFFLOAD_LEGACY_ELF=1 opt-in the two
+# opcheck targets set) so a run cannot be half shared and half not, and it
+# also selects a SEPARATE cache (offload_shared_cache). That separation is
+# not tidiness — the two builds emit artifacts with identical names over
+# different ABIs, so one directory could hand a 30-reconfiguration run's ELF
+# to the one-reconfiguration claim.
 #
 # AT 4096 -- THE MODE'S OWN SPECS ROW -- SINCE `[2026-08-11]`. This recipe ran
 # at 1024 while the 4096 wall stood, and the wall fell in two acts. The compile
@@ -412,7 +426,6 @@ check-offload:
 check-offload-shared:
 	mkdir -p $(BUILD_DIR)
 	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
-	    AIR_OFFLOAD_SHARED_XCLBIN=1 \
 	    python3 $(srcdir)/study/run_mode.py --mode offload --seq 4096 \
 	        --warmup 1 --samples 1 --study-id offload-shared-gate \
 	        --out offload_shared_gate.csv
@@ -420,10 +433,15 @@ check-offload-shared:
 # The mode's negative control. Same reasoning as check-coarse-fault, including
 # the mode-specific stake: the dispatch vectors must be recorded on the
 # injected path too, since the driver requires the fault artifact's summed
-# totals to equal the clean run's.
+# totals to equal the clean run's. It runs the SAME legacy packaging as
+# check-offload — at 4096 the two packagings' totals differ (the shared
+# path's drain pin drops the fused-cast f32 scratch), so a fault twin on the
+# default would fail the totals equality against the ELF clean run instead of
+# proving anything about injection.
 check-offload-fault:
 	mkdir -p $(BUILD_DIR)
 	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
+	    AIR_OFFLOAD_LEGACY_ELF=1 \
 	    python3 $(srcdir)/opcheck.py --operator offload \
 	        --fault-inject input --expect-failure
 

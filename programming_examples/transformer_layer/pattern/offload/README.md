@@ -24,19 +24,34 @@ framing survives the correction.
 ## Two packaging paths, and the difference between them IS the mode
 
 `[2026-08-09]` The same 30 dispatches are served two ways. They compute the same
-thing and produce an identical dispatch vector; what differs is how often the
-array is configured, which is the axis the mode is defined by.
+thing; what differs is how often the array is configured, which is the axis the
+mode is defined by.
 
-| | ELF path (**default**) | shared xclbin (`AIR_OFFLOAD_SHARED_XCLBIN=1`) |
+`[2026-08-11]` **The default FLIPPED to the shared path** (doc 29 §What this
+does not do, dated close-out). The recorded precondition — fix the 4096 wall
+first, then flip — was met the same day, when the shared chain first ran and
+gated at the mode's own SPECS shape. The ELF packaging is unchanged and stays
+gated, renamed to what it now is: the **legacy/control** arm, opt-in via
+`AIR_OFFLOAD_LEGACY_ELF=1`. `AIR_OFFLOAD_SHARED_XCLBIN` is retired and
+**raises** if set at all — a stale script setting `=0` would otherwise
+silently run the opposite packaging to the one it was written to measure.
+**Every recorded `offload` latency/variance number predates the flip and
+describes the ELF path** (doc 27's four-mode table included); the four-mode
+re-walk is the flip's owed remainder, a separate hardware task.
+
+| | ELF path (legacy/control, `AIR_OFFLOAD_LEGACY_ELF=1`) | shared xclbin (**default**) |
 |---|---|---|
 | binaries | 5 xclbins | **1**, five shapes chained |
 | `context_loads` per layer | **30** — `_evict_context` tears down and reloads before every dispatch | **1**, plus 4 kernel attaches |
-| dispatch vector | identical | identical |
-| builds at | 512 · 1024 · 4096 | **512 · 1024 only** |
+| dispatch vector | identical at ≤1024; at 4096 keeps the `fused-cast` down-projection (air 31 / sync 91) | identical at ≤1024; at 4096 the `drain` pin drops the f32 scratch (air 30 / sync 90, −12,582,912 bytes) |
+| builds at | 512 · 1024 · 4096 | 512 · 1024 · 4096 (`[2026-08-11]`, via the `drain` pin) |
 
 Both are gated: `run_npu2_offload_peano.lit` pins the reconfiguration counters
-on each, and the shared recipe was verified failing against an ELF-packaged run
-of the same mode at the same length. `make check-offload-shared` runs it.
+on each — `context_loads 1 kernel_attaches 4` on the default recipe, which
+sets **no** env var, and `context_loads 30 kernel_attaches 0` on the legacy
+recipe, which sets the opt-in explicitly — and the shared recipe was verified
+failing against an ELF-packaged run of the same mode at the same length.
+`make check-offload-shared` runs it.
 
 **Three things to know before touching either.**
 
@@ -46,17 +61,22 @@ of the same mode at the same length. `make check-offload-shared` runs it.
   substring match; a duplicate `kernel_id` runs the second kernel against the
   first's array configuration and returns garbage at `mean_rel_L1` 1.41 **with
   no error raised**. `compile_shared_xclbin` validates all three up front.
-- **It builds only where every module is SINGLE-LAUNCH.** At 4096 the
-  down-projection is a two-launch `fused-cast`, and `XRTBackend.compile`'s fixed
-  `insts="air.insts.bin"` — passed as `-i` on the xclbin branch, omitted
-  entirely on the ELF branch — makes aiecc refuse with *"edge 'air.insts.bin'
-  produced duplicate output path"*. That is why the shared gate is at 1024 and
-  why the default has not moved.
+- **It runs only where every module is SINGLE-LAUNCH, and `[2026-08-11]` the
+  bound is the PLATFORM's, not the compiler's.** At 4096 the down-projection's
+  registry winner is a two-launch `fused-cast`. The compile-side collision
+  (`XRTBackend.compile`'s fixed `insts="air.insts.bin"`, refused by aiecc as a
+  duplicate output path) fell 2026-08-10 to the multi-launch packaging — but
+  the packaged module's in-stream `load_pdi` **faults the NPU firmware** on
+  dispatch (`fatal_error_type 0x10`), so `offload_config` pins a `fused-cast`
+  winner to the shape's measured `drain` row under the shared path (~10% on
+  that GEMM, priced in the run log and enforced by the gate). Doc 29 §The
+  hardware verdict is the full record.
 - **The two paths get SEPARATE cache directories** (`offload_cache` /
-  `offload_shared_cache`), chosen by `OFFLOAD_CACHE_DIR` from the same env var.
+  `offload_shared_cache`), chosen by `OFFLOAD_CACHE_DIR` from the same switch.
   They emit artifacts with identical names over different ABIs, so one directory
   could hand a 30-reconfiguration run's artifact to the one-reconfiguration
-  claim.
+  claim. The `[2026-08-11]` flip deliberately renamed and merged **nothing**
+  here.
 
 ## This is a hybrid boundary, and the artifact says so
 
@@ -235,7 +255,8 @@ agree, attributing numerically valid output to the wrong execution boundary).
 `offload_cache/` is gitignored and in `make clean`, in the same commit that
 created it, because the driver's negative control runs `opcheck.py` from the
 source directory and the cache lands there — the leak D2's `block_cache/`
-had. `[2026-08-09]` The shared path adds a third recipe at 1024 and its own
+had. `[2026-08-09]` The shared path adds a third recipe (at 1024 then, at
+**4096** since `[2026-08-11]`, the mode's own SPECS shape) and its own
 `offload_shared_cache/`, both likewise gitignored and cleaned.
 
 **This mode is the noisiest of the four, and `[2026-08-09]` the drift is now
@@ -251,5 +272,8 @@ drift rather than the ABI, so `_evict_context` is the leading candidate and not
 a demonstrated cause. Two further caveats: the effect size is unstable day to
 day (the 1024 rung did not reproduce its own recorded baseline), and the shared
 path costs ~20% of best-case latency at 512. None of it affects this gate, which
-is numerical rather than temporal. Full table:
+is numerical rather than temporal. `[2026-08-11]` Since the default flip the
+noisy packaging is the opt-in control arm, so an unconfigured run no longer
+pays this drift — but every number in this section was measured on the ELF
+path and predates the flip. Full table:
 `docs/plans/transformer-layer-execution-studies/29-offload-n-streams.md`.

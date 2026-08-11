@@ -450,7 +450,9 @@ scoped above in case a future shape has no single-launch row to pin to.
 
 ## What this does not do
 
-- **It does not make the shared path the default.** `AIR_OFFLOAD_SHARED_XCLBIN=1`
+- ~~**It does not make the shared path the default.**~~ **`[2026-08-11]` It
+  does now — flipped; see the dated close-out at the end of this bullet.** As
+  it stood: `AIR_OFFLOAD_SHARED_XCLBIN=1`
   opts in, and the gated ELF path is untouched, with its own cache directory —
   the two builds produce artifacts with identical NAMES over different ABIs, so a
   shared directory could trade them and credit a 30-reconfiguration run to the
@@ -472,6 +474,31 @@ scoped above in case a future shape has no single-launch row to pin to.
   implementation gets to be called `offload`.** The taxonomy defines the mode by
   minimized reconfiguration; a default that maximizes it contradicts the
   definition, and a small-shape best-case win does not settle that.
+
+  **`[2026-08-11]` FLIPPED, per this decision, the day its precondition was
+  met.** The shared path gates at 4096 (§The hardware verdict above), so the
+  default moved in the same tree state: an unconfigured run now takes the
+  shared xclbin, and the ELF path is renamed to what it now is — the
+  **legacy/control** packaging, opt-in via `AIR_OFFLOAD_LEGACY_ELF=1`.
+  `AIR_OFFLOAD_SHARED_XCLBIN` is retired and **RAISES** if set in any form:
+  `=1` would be redundant today, `=0` would silently run the OPPOSITE
+  packaging to the one a stale script was written to measure, and a silently
+  wrong packaging is exactly the failure class this document records — so per
+  its own rule, the default has to be an error. The cache directories did
+  NOT move: `offload_shared_cache` stays the shared path's own and
+  `offload_cache` the legacy path's, so the identical-names-over-different-ABIs
+  trade this bullet describes remains impossible. The lit recipes flipped
+  which side sets the env var and nothing else: the shared recipe (now the
+  default, **no** env var) still pins `context_loads 1 kernel_attaches 4`,
+  the legacy recipe (`AIR_OFFLOAD_LEGACY_ELF=1`, set inside its Makefile
+  targets, the fault twin included — at 4096 the two packagings' totals
+  differ, so the fault twin must ride the same arm as its clean half) still
+  pins `context_loads 30 kernel_attaches 0`, and every dispatch-total
+  literal is unchanged. What the flip re-dates: **EVERY recorded `offload`
+  latency/variance number — [27](27-common-ladder-result.md)'s four-mode
+  table included — predates it and describes the ELF path.** The four-mode
+  re-walk is the cost this section priced; it is now owed, and it is a
+  separate hardware task, not part of the flip change.
 - **It does not deliver runtime-parameterized loop bounds.** That is the increment
   *beyond* iron parity, deferred by [03](03-measurement-model.md) and still
   blocked in the stack ([26 §A](26-mode-rebuild-feasibility.md)).
