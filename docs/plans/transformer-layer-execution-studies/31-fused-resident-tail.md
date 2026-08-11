@@ -204,6 +204,79 @@ Incremental, each with its own gate arm, none touching `mlir/`:
 (herd_y through more memtile ports, or row-band multiplexing per core) is its own decision with
 its own placement walls (`MAX_PLACEABLE_HERD_X`, measured) and is not assumed anywhere above.
 
+### `[2026-08-11]` R1 status: built, structurally green at pass-dump altitude
+
+`builders/ffn_resident.py` + `agents/probes/probe_ffn_resident_interior.py` (hermetic, ~1 s), the
+structure promoted to `ffn_resident_structure.py` as a suite arm. Measured, one 64×3072×768 band:
+
+- **One tile-bearing `aie.device`** — the resident claim the stitched probe measured as three.
+  12 channel symbols, `air-fuse-channels` 12 → 12, whole compile 1.0 s.
+- **Seam 3 resolved as predicted, with one correction.** The up-projection produces H's column
+  blocks in exactly the down ring's K order (groups of `group_n` = 192, chunked at `tile_k` = 32),
+  GeLU on tiles in flight as its own herd. The correction: the GeLU→down hand-off **fans through a
+  memtile by port arithmetic** — every down core consumes every chunk, a down core's two S2MM
+  ports are spoken for (A|B feed + hoisted C fetch), and a channel has one physical source — so
+  gate arm (b)'s derived core→core constant for R1 is `herd_x` (the up→GeLU edges), not
+  3×herd_x. The interior still crosses DRAM nowhere; the L2 hop is the broadcast's price.
+- **Seam 1 (L3 case) costs nothing**: `hidden` arrives row-major and the shim's 4-D read pattern
+  (J7b's C-fetch idiom) retiles it during the per-k' refill. The R2 (on-chip producer) case
+  remains open — a memtile MM2S cannot walk a per-iteration offset, so the same trick does NOT
+  transfer to a staged band (doc 23's frozen-BD rule); the order seam owns that problem.
+- **The kernel object is a composition constraint.** `-D`-baked symbols cannot coexist twice in
+  one module, so the up stage's group width IS the down stage's `tile_n` (`emb/herd_x`) and both
+  GEMM herds link the one 64×32×192 object. `ffn_dim % (herd_x · group_n) == 0` is now a
+  precondition (holds at 3072/768/4: 4 sweeps of 4 groups).
+- **The predicted ping-pong overflow does not happen**: the labelling ping-pongs NOTHING in this
+  composition (up core C+A+B single = 40 KiB of 64; J7b standalone had A/B doubled). Fit is
+  settled; the un-overlapped feed is a latency question for the ladder to price, not a gate
+  matter.
+- **A compile-time wall found and routed around** (in-builder comment + probe): every TEXTUAL
+  segment-scope `dma_memcpy_nd` instance becomes its own auto channel under `air-dma-to-channel`,
+  and 24 unrolled copies of the w_down refill left `air-isolate-async-dma-loop-nests`
+  non-terminating (>25 min, 99.9 % CPU, on a 692-line module). The feed shape that compiles:
+  real loops everywhere except the sub-channel index, which H5 forces to a literal. Cross-loop
+  put ORDER on a shared sub-channel is carried by the shared staging buffers' inferred
+  dependencies — the reason the relay keeps ONE `l2_h`/`l2_b_down` pair.
+- **Ordering verified host-side to exactness** (session scratch, f64 emulation of every DMA
+  pattern and channel op: packing, shim retile, chunk extraction, global K order — max error
+  5.5e-12 vs the plain composition), so a device-run failure isolates to hardware behavior, not
+  addressing arithmetic.
+
+Numeric arm (`check-ffn-resident` + fault twin + lit recipe) registered at the catalogue's
+64×3072×768 with the `ffn` scaling; atol provisional until the first gated hardware run records
+its `mean_rel_L1`/`atol_required` in the row.
+
+### `[2026-08-11]` R1's gate is BLOCKED by a compiler crash — the wall this scope did not predict
+
+**`air-fuse-channels` segfaults on the R1 module, nondeterministically under aircc** — the same
+binary (`install-xrt`, 2026-08-07) on the same 284-line module compiled clean twice (59 dumps,
+the structural PASS above) and then crashed twice (stops after pass_017; SEGV in
+`xilinx::air::isAsyncOp(mlir::Operation*)` ← `AIRFuseChannels::runOnFunction`,
+`AIRDependencyScheduleOpt.cpp`). On the round-tripped pre-fuse dump the crash is deterministic:
+`air-opt --air-fuse-channels pass_017_after_cse.mlir` → SEGV 10/10.
+
+**Minimal shape, measured** (`agents/probes/probe_fuse_channels_sibling_nests.py`): a segment
+whose body carries N sibling SAME-BOUNDS `scf.for` nests, each with one textual
+`dma_memcpy_nd` refill (→ one auto channel each under `air-dma-to-channel`) and named-channel
+puts. **N=2 fuses cleanly (5/5); N=3 crashes (5/5)** — the third mutually-mergeable channel is
+what makes the pairwise O(N²) candidate loop revisit ops an earlier merge of the same set
+already erased, consistent with a use-after-free in the NFL merge path (`runOnFunction` collects
+`nfl_erased_ops`, calls `wrapRegionsWithForLoops`, then queries `air::isAsyncOp(e)` on them) and
+with the ASLR-coin-toss behavior under aircc. The R1 down feed presents exactly herd_x=4 such
+nests — forced there by H5 (the sub-channel index must be a literal, so the c dimension is
+textually unrolled) — so the module is a production witness, not an exotic corner.
+
+**Consequence:** every R1 gate arm (structure and numerics both compile through aircc) is a coin
+toss until the pass is fixed; the wiring is landed verified-failing, and per this doc's rules the
+defect is REPORTED with its minimal shape, not fixed in-phase (the H9/H10 route). Candidate
+builder-side dodges, both unverified: staggered per-nest bounds (c·6 … (c+1)·6, which moves the
+pair into the LB/UB unpeel path instead — different code, same stale-pointer risk), or any
+restructuring that leaves ≤2 mutually-mergeable channels per candidate set. Note the OTHER
+compile-time wall this phase measured (24 sibling instances → `air-isolate-async-dma-loop-nests`
+non-terminating) bounds the same design space from above: the feed's legal shapes sit between
+"few enough textual instances for isolate-loop-nests" and "≤2 mutually-mergeable channels for
+fuse-channels", and today only the left constraint has a green point.
+
 ## Gate
 
 The transformer-layer suite, allowlist `^programming_examples/transformer_layer/`, plus a
