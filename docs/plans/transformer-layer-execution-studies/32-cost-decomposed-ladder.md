@@ -34,6 +34,38 @@ treat even this walk's runlist/offload-vs-rest gaps as conditional on the anomal
 load costs; today's clean ~25% separation is the per-load cost times a 24-vs-30 difference, not
 necessarily the modes).
 
+**`[2026-08-11]` RESOLVED: it was the NPU power mode.** The full reboot did NOT clear it (verdict
+rung 2717 ms avg, 82.5 ms/load residual), and a userspace experiment then refuted runtime PM as
+the mechanism: pinning the device active with a held `hw_context` from a second process (device
+`runtime_status: active` throughout) left the rung at 82.2 ms/load — the cost is in context
+creation itself, not device wake. What settled it was the boot history: the machine **rebooted
+itself at 01:09 on 2026-08-10 — the exact onset** — and a reboot resets the non-persistent
+`xrt-smi` power mode to `Default`. The healthy window (08-04 → 08-09) sat inside one
+uninterrupted boot (08-03 09:50 → 08-10 01:08) that carried the **Turbo** set for the C4
+registry sweep — `registry_sweep.py`'s `require_turbo()` is the paper trail; the registry's
+numbers are Turbo-conditional by design and C4 ran under that guard on 08-04. Every "it survives
+X" observation follows: an `amdxdna` reload and a reboot BOTH reset pmode, and nothing on disk
+changes because pmode is runtime state. (One correction in passing: the `[2026-08-11]` "kernel
+unchanged" claim above was wrong — the 08-10 overnight boot ran `6.14.0-1020-oem`, not the
+healthy window's `7.0.0-28-generic` — but the kernel is not the discriminator: the post-reboot
+slow rung ran back on `7.0.0-28-generic`.)
+
+**Confirmation, same rung, minutes apart on 2026-08-11:** after
+`sudo xrt-smi configure --device 0000:64:00.1 --pmode turbo` the rung reads **156.2 ms avg**
+(min 146.1; device 20.6 / sync 13.8 / host_cpu 11.6 ms), residual **3.7 ms/load** — back inside
+doc [29](29-offload-n-streams.md)'s 164–183 ms band. At `Default`, the same rung minutes earlier:
+2717/2547 ms avg, ~82 ms/load, device_ms ~38. So `Default` costs ~22× on context creation and
+~1.8× on device compute at this shape.
+
+**Consequences.** (1) **`pmode` is a measurement condition.** Every latency in this document's
+2026-08-10 walks was measured at `Default` (they ran after the 01:09 reboot); every pre-08-10
+record is Turbo-conditional. The byte and count columns are pmode-independent. (2) Turbo must be
+re-set after every reboot or `amdxdna` reload, and verified (`xrt-smi examine -r platform`)
+before any latency run; `run_mode.py` should grow the same `require_turbo()` guard the registry
+sweep already has. (3) That `fused`/`coarse` at `Default` still matched their records is
+consistent with their totals being host-dominated at these shapes (device_ms 10–13 of ~50–105 ms
+total) — which is exactly why the anomaly presented as context-load-specific.
+
 `fused` and `coarse` latencies ARE comparable to their records, and match them.
 
 ## What is solid: the byte totals, walk-identical, and a changed warm ordering

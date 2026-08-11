@@ -92,7 +92,7 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | Small confounds — queue items 4 + 5 | `check-runlist` + fault twin + `check-coarse-c3`; isolated seam-gate re-run | **done** 2026-08-10 (`2f66fc86`, `e2996fbd`). Targeted pool eviction (warm `runlist` −14,352,384 bytes, cold totals unchanged so no literal moved) and the seam gate's verdict on interleaved minimums (not widened) |
 | Multi-launch xclbin packaging — the 4096 compile wall | fixture `test/xrt/56` (verified failing unpatched), the real fused-cast module, the five-shape chain; suite 30/30 + ten models 10/10 on the pre-activation install | **compile half done** 2026-08-10 (`623768f2`), **activated in install-xrt** 2026-08-11 by the operator, fixture re-verified against the real install. **No multi-launch xclbin has ever dispatched** — the hardware experiment is queue item 1(b), fallback scoped in [29](29-offload-n-streams.md) |
 | `fused` resident-tail scoping | hermetic structural probe (negative control verified failing); byte-floor derivation checkable to the byte | **done** 2026-08-10 (`601c54ae`). [31](31-fused-resident-tail.md) is the phase spec, [31a](31a-resident-byte-floor.md) the floor (84.0 → 16.5 MiB at 1024); J7a×2 + J7b route within the column budget at 1024 AND 4096; stitching is time-multiplexed at segment granularity, so residency needs a one-segment builder. Also found doc 26 §C's itemization missing its `ffn_out` row |
-| First cost-decomposed ladder | none; a measurement, walked twice — and a **machine anomaly** | **recorded** 2026-08-10 ([32](32-cost-decomposed-ladder.md)). Bytes walk-identical; warm DRAM ordering now `runlist` < `fused` < `coarse` < `offload`; reconfiguration columns on first walk. **Latency quarantined**: `hw_context` loads cost ~78–80 ms (≤2.6 on 2026-08-09), bisected to the environment; `[2026-08-11]` an `amdxdna` reload does NOT clear it — full reboot is the next diagnostic, and its verdict rung gates every latency claim |
+| First cost-decomposed ladder | none; a measurement, walked twice — and a **machine anomaly** | **recorded** 2026-08-10 ([32](32-cost-decomposed-ladder.md)). Bytes walk-identical; warm DRAM ordering now `runlist` < `fused` < `coarse` < `offload`; reconfiguration columns on first walk. **Latency quarantined** at recording time (`hw_context` loads ~78–80 ms against ≤2.6 on 2026-08-09); **`[2026-08-11]` anomaly RESOLVED — it was the NPU pmode**, reset from Turbo to `Default` by an overnight self-reboot at the exact onset; Turbo re-set → verdict rung **156 ms, 3.7 ms/load**, healthy. The walk's latencies stand as `Default`-conditional; trap 0 has the standing rule |
 | `layer_norm` offset-regime row | `run_npu2_layer_norm_peano.lit`, three shapes | **done** 2026-08-10 (`b4fe19a3`). The large-mean boundary is a pinned catalogue row: `mean_rel_L1` 9.819e-5, `atol_required` 0.0 — a one-pass revert now fails the suite, not a probe nobody runs |
 | `air-fuse-packet-put-loops` decline diagnostic | four `-verify-diagnostics` cases; pass lit tests 2/2 | **done** 2026-08-10 (`1b15a1b0`). Doc 23's proposal as specified: ≥2 same-bounds packet put loops left unfused at trip count > 1 warn with channels and trip count; one-trip and different-bounds declines verified silent |
 | G — unattended runner + CI | Full profile run completes with a complete `results_manifest.json` | not started |
@@ -101,14 +101,19 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 
 ## `[2026-08-11]` Where things stand, for a session picking this up cold
 
-**Do not measure latency until the machine is cleared.** That is the single most important thing
-to know: the host's `hw_context` creation cost rose ~30× on 2026-08-10 (~78–80 ms/load against
-≤2.6 the day before), bisected to the ENVIRONMENT — pre-anomaly code reproduces it, an `amdxdna`
-reload does not clear it, nothing on disk changed — so the first hardware action of any session is
-the verdict rung after a full reboot: `study/run_mode.py --mode offload --seq 1024 --warmup 2
---samples 5`, expecting ~164–183 ms avg. Until that reads healthy, every latency is conditional
-and no cross-day comparison is valid ([32](32-cost-decomposed-ladder.md), trap 0 below). Byte and
-count instrumentation is unaffected.
+**Verify NPU power mode is Turbo before measuring any latency.** The 2026-08-10 "machine anomaly"
+(hw_context creation ~78–80 ms/load against ≤2.6 the day before) was **resolved 2026-08-11: it
+was the `xrt-smi` power mode**, reset from Turbo to `Default` by an overnight self-reboot at the
+exact onset — non-persistent state, which is why an `amdxdna` reload and a full reboot both
+failed to clear it and nothing on disk had changed. At Turbo the verdict rung
+(`study/run_mode.py --mode offload --seq 1024 --warmup 2 --samples 5`) reads **156 ms avg,
+3.7 ms/load**, inside doc 29's 164–183 ms band; at `Default` the same rung reads ~2.5–2.7 s.
+So the first hardware action of any session is
+`sudo xrt-smi configure --device 0000:64:00.1 --pmode turbo` (needs the operator), verified with
+`xrt-smi examine -r platform`, and **re-set after every reboot or driver reload**. Latencies
+recorded on 2026-08-10 are `Default`-conditional; pre-08-10 records are Turbo-conditional
+([32](32-cost-decomposed-ladder.md), trap 0 below). Byte and count instrumentation is
+pmode-independent.
 
 **All four modes are corrected AND gated, and both costs of the taxonomy are now measured for all
 of them.** The modes landed 2026-08-08/09 (`coarse` = cell C1 of [28](28-coarse-blend-space.md)'s
@@ -158,7 +163,7 @@ traffic between operators, and `coarse` blends `runlist` and `fused`.
 | # | Work | Size | Spec |
 |---|---|---|---|
 | **1** | **The xclbin multi-launch instruction streams — COMPILE HALF DONE 2026-08-10** (`623768f2`): the five-shape chain builds at 4096; a multi-launch module's per-device outputs are repackaged into the unchanged single-artifact contract (main orchestration stream with per-launch `load_pdi`, PDIs merged kernel-less into the partition; fixture `test/xrt/56`). **Remaining, in order**: ~~(a) activate in `install-xrt`~~ **done 2026-08-11** — the operator ran the `cp` and the two-launch fixture passes against the real install; (b) the hardware experiment: no multi-launch xclbin has ever DISPATCHED in this tree — in-stream `load_pdi` against partition-resident PDIs is aiecc's default lowering, unvalidated. Run the shared path at 4096 (`AIR_OFFLOAD_SHARED_XCLBIN=1`, the mode's own spec shape; the chain compiles into `offload_shared_cache` first — warm it as a build-class job). Clean 10/10 stages = the wall is fully down, re-pin the shared lit recipe at 4096; timeout or garbage = the scoped fallback (`--expand-load-pdis` + an aircc passthrough, doc 29); (c) re-run the offload suite + ten-model regression under the new install (on the OLD install 2026-08-10: suite 30/30, models 10/10) | (b) one gate run after a chain compile; (c) machine time | [29 §The 4096 wall](29-offload-n-streams.md) |
-| **1b** | **The machine's `hw_context` load cost rose ~30× overnight** — ~78–80 ms/load measured from `runlist` and `offload` independently against ≤2.6 ms/load implied by 2026-08-09's records, bisected to the environment (pre-today code + warm caches reproduces it). Diagnose: ~~reboot / `amdxdna` reload~~ `[2026-08-11]` a clean `amdxdna` reload did **not** clear it (2514 ms avg immediately after, ~80.9 ms/load residual) and nothing on disk changed since May (XRT userspace, NPU firmware, kernel all pre-date the anomaly) — so it is runtime platform state and the remaining diagnostic is a **full reboot**, then the same rung. Until it reads ~164–183 ms, **no cross-day latency comparison is valid**, and [32](32-cost-decomposed-ladder.md)'s latency section is conditional | Small, but it gates every latency claim | [32](32-cost-decomposed-ladder.md) |
+| ~~1b~~ | **RESOLVED 2026-08-11 — the anomaly was the NPU power mode.** The reboot did NOT clear it (82.5 ms/load) and a held-context pin refuted runtime PM (82.2 ms/load with the device active); the discriminator was the boot history — the machine **rebooted itself at 01:09 on 2026-08-10, the exact onset**, resetting the non-persistent `xrt-smi` pmode from the **Turbo** the healthy window's uninterrupted boot had carried (set for C4's `require_turbo()` sweep) back to `Default`. Confirmed by re-measure: Turbo → **156.2 ms avg, 3.7 ms/load**, inside doc 29's band. **New standing rule: Turbo is a measurement condition** — re-set and verify it after every reboot/driver reload, before any latency run (trap 0 below); 08-10's recorded latencies are `Default`-conditional, pre-08-10's are Turbo-conditional, bytes/counts unaffected | done | [32](32-cost-decomposed-ladder.md) |
 | ~~2~~ | **DONE 2026-08-10.** Schema v2 (`eeb37a19`): `device_ms` / `sync_ms` / `host_cpu_ms` plus `context_loads` / `kernel_attaches`, appended after the pinned v1 prefix, semantics written per field. First hardware rows at 1024 confirm every known truth — `offload`-ELF 30 loads with 18.8 ms of host compute, `runlist` 24 (its per-head eviction, a measured middle regime), `coarse`/`fused` 0 — and both pinned offload gate lines re-verified on NPU | done | [03](03-measurement-model.md) |
 | 3 | **`offload`'s default**, after item 1. Flip to the shared path once it builds at the mode's own gated shape, decided there rather than extrapolated from 512, with the ELF path renamed to what it then is — a legacy/control packaging. Forces a full four-mode re-walk of [27](27-common-ladder-result.md) | Medium, mostly machine time | [29](29-offload-n-streams.md) |
 | ~~4~~ | **DONE 2026-08-10.** `evict_attention_contexts` evicts by artifact now (`KernelCache.evict_pools_for`), so the content-keyed static-weight pools survive the per-head evictions. Measured: warm `runlist` bytes 190,513,152 → **176,160,768** (−14,352,384 — the static set, to the byte) and sync 451 → 443. **Cold totals unchanged**, so no gate literal moved; `check-runlist`, fault twin and `check-coarse-c3` re-ran green | done | [30](30-coarse-cells-built.md) |
@@ -167,11 +172,11 @@ traffic between operators, and `coarse` blends `runlist` and `fused`.
 | **6** | **The `fused` resident tail — the mode's remaining definitional gap, now a specced phase.** Compose J7a's norm-tail pipeline and J7b's accumulator ring (iron's partial-sum staging, standalone-gated, dispatched by no mode) into a one-segment resident tail: 84.0 → 16.5 MiB of DRAM crossings at 1024 is the prize, the structural probe already routes the composition within the column budget at both lengths, and the spec names the three seams that are the real engineering (layout retile, band order, up→GeLU→down dataflow) | A phase, not a patch — its own port-loop run | [31](31-fused-resident-tail.md) · [31a](31a-resident-byte-floor.md) |
 | 7 | **`addnorm` to two-pass f32** — doc 23 item 2's remaining half: the kernel's variance cliff is measured (collapse between \|mean\|/sigma 2 and 4, ~35× margin on this workload, latent and unpinned); the fix costs ~13% on that kernel and shifts every provenance figure that flows through it, probably improving them | A phase — re-runs block + three modes' provenance | [23 §2](23-rules-and-open-items.md) |
 
-**Order for a fresh session: 1b first** (the reboot verdict rung — it gates every latency claim),
-then item 1's remainder and item 3, which are a chain and are all `offload`. Items 6 and 7 are
-phases, independent of the chain and of each other. ~~Items 4 and 5 are independent.~~
-`[2026-08-10]` **Items 2, 4 and 5 are done**, gates re-run on hardware the same day. **Nothing
-below is blocked on anything above.**
+**Order for a fresh session:** ~~1b first~~ `[2026-08-11]` **1b is resolved** (pmode; trap 0 is
+the standing rule — set Turbo, verify, then measure). The front is item 1's remainder and item 3,
+which are a chain and are all `offload`. Items 6 and 7 are phases, independent of the chain and
+of each other. ~~Items 4 and 5 are independent.~~ `[2026-08-10]` **Items 2, 4 and 5 are done**,
+gates re-run on hardware the same day. **Nothing below is blocked on anything above.**
 
 `[2026-08-09]` **`coarse` came off this list**, which is what makes item 1 the front of the queue —
 see [30](30-coarse-cells-built.md). Two notes from that work that are not captured anywhere else:
@@ -221,15 +226,20 @@ direction of its own conclusion.
 
 ### Four traps in the current state, before you measure anything
 
-**0. `[2026-08-10]` The machine is not the machine the recorded latencies were measured on.**
-`hw_context` creation currently costs ~78–80 ms against ≤2.6 ms on 2026-08-09, so every mode that
-loads contexts per dispatch (`offload` 30, `runlist` 24) reads ~15–20× above its recorded
-latency while zero-load modes match theirs. Bisected to the environment: the pre-today tree
-reproduces it. `[2026-08-11]` An `amdxdna` reload does **not** clear it and nothing on disk
-changed since May — a full reboot is the remaining diagnostic, and its verdict rung (one offload
-run at 1024, expect ~164–183 ms) is the first hardware action of any session. See
-[32](32-cost-decomposed-ladder.md) and queue item 1b — fix the machine before trusting any
-latency, and re-measure a whole comparison after, never splice.
+**0. `[2026-08-11]` The NPU power mode is a measurement condition, and it silently resets.**
+The 2026-08-10 "machine anomaly" (`hw_context` creation ~78–80 ms/load against ≤2.6 the day
+before, inflating the per-dispatch-load modes ~15–20×) was the `xrt-smi` **pmode**: the healthy
+records were measured at **Turbo** (set for C4's `require_turbo()` sweep and carried by one
+uninterrupted boot, 08-03 → 08-10), and an overnight self-reboot at 01:09 on 2026-08-10 — the
+exact onset — reset it to `Default`. Confirmed both ways on 2026-08-11: at `Default` the verdict
+rung reads ~2.5–2.7 s (82 ms/load, surviving a driver reload, a full reboot, and a held-context
+PM pin); at Turbo the same rung reads **156 ms (3.7 ms/load)**, inside doc 29's band. **The
+setting does not persist** across reboot or `amdxdna` reload, so the first hardware action of
+any session is `sudo xrt-smi configure --device 0000:64:00.1 --pmode turbo` (operator), verified
+via `xrt-smi examine -r platform`, then the verdict rung. Latencies recorded 2026-08-10 are
+`Default`-conditional; pre-08-10 records are Turbo-conditional; bytes and counts are
+pmode-independent. See [32](32-cost-decomposed-ladder.md) and queue item 1b — and re-measure a
+whole comparison after any pmode change, never splice.
 
 **1. ~~The modes are no longer at the same sequence length.~~ MEASURED `[2026-08-09]`, and the
 comparison exists now — see [27](27-common-ladder-result.md).** All four modes were walked at **512
