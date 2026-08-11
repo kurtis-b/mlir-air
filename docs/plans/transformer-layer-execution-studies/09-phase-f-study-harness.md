@@ -455,6 +455,16 @@ the columns are short — doc 03 records that remainder dominating the per-opera
 other files, so it is re-derived from the pattern sources by a test that reads text and imports
 nothing, the way `test_attention_path.py` guards the attention map.
 
+**What is verified and what is not, stated rather than left to be assumed.** The aggregation, the
+taxonomy, the schema round-trip and the report are covered by 20 host tests over fixtures shaped
+like a real `extra` dict. **Its DEVICE leg has not run.** It was submitted as devq job **242**
+(`measure` class, `--mode offload --seq 1024`) and was still queued behind a sibling agent's
+transformer-layer suite run when this was written; poll it with
+`agents/scripts/devq.sh log 242`. So the CLI's dispatch path — `prepare` → warmup → timed
+dispatch → `extra` — is host-checked and not hardware-checked, and a first real run should be
+read as a first run. `study/resource_usage.py`'s device leg DID run (job 238) and is the one
+whose numbers above are measured.
+
 ### `[2026-08-08]` Item 5 landed without pytest, and item 7 without `*.csv`
 
 Both are deliberate departures from this document as first written, and both are narrower than
