@@ -28,6 +28,11 @@ WHY A FAILED RUN STILL WRITES A ROW
     the one case that writes nothing, because there is no row to attribute.
 
 FOOTGUNS
+    - **Refuses off-turbo, before preparing anything.** The same
+      ``require_turbo()`` the registry sweep uses; exit 2, no row written.
+      Doc 32's resolved anomaly is why: pmode silently resets to ``Default``
+      on every reboot or driver reload, and a ``Default`` latency is ~15-20x
+      off any recorded number for the context-loading modes.
     - **``runlist_entries_per_submission`` is a MEAN, not a total.**
       ``dispatch_vector_totals`` returns the total; doc 03 defines the column as
       a per-submission mean, so this divides. Summing the column across rows
@@ -62,6 +67,7 @@ for _p in (_PE, os.path.join(_PE, "llms"), _EXAMPLE, _HERE):
 
 import results_io  # noqa: E402
 import schema  # noqa: E402
+from sweep.registry_sweep import TurboNotEnforced, require_turbo  # noqa: E402
 
 # Which modes run attention on the host. Derived from a fact the code states:
 # `runlist` imports `blocked_attention` from `pattern/blocked_attention.py` and
@@ -381,6 +387,17 @@ def main(argv: list[str] | None = None) -> int:
         help="sequence length override; omit for the spec's own (J3's ladder)",
     )
     args = ap.parse_args(argv)
+
+    # Fail-closed before preparing anything, same guard as the registry sweep:
+    # pmode resets to Default on every reboot or driver reload and costs ~22x
+    # on hw_context creation there (doc 32), so a non-turbo latency is not
+    # comparable with any recorded number. A refusal writes no row by design --
+    # it is a precondition of the measurement, not a result of it.
+    try:
+        require_turbo()
+    except TurboNotEnforced as exc:
+        print(f"[run-mode] refused: {exc}")
+        return 2
 
     row = run(args.mode, args.warmup, args.samples, args.runs_per_sample, args.seq)
     row["study_id"] = args.study_id

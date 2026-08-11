@@ -61,8 +61,9 @@ doc [29](29-offload-n-streams.md)'s 164–183 ms band. At `Default`, the same ru
 2026-08-10 walks was measured at `Default` (they ran after the 01:09 reboot); every pre-08-10
 record is Turbo-conditional. The byte and count columns are pmode-independent. (2) Turbo must be
 re-set after every reboot or `amdxdna` reload, and verified (`xrt-smi examine -r platform`)
-before any latency run; `run_mode.py` should grow the same `require_turbo()` guard the registry
-sweep already has. (3) That `fused`/`coarse` at `Default` still matched their records is
+before any latency run; `run_mode.py` now enforces this itself — the same `require_turbo()`
+guard the registry sweep has, checked before anything is prepared (exit 2, no row), so a
+`Default`-pmode measurement can no longer run silently. (3) That `fused`/`coarse` at `Default` still matched their records is
 consistent with their totals being host-dominated at these shapes (device_ms 10–13 of ~50–105 ms
 total) — which is exactly why the anomaly presented as context-load-specific.
 
