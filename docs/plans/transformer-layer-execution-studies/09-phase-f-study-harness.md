@@ -471,16 +471,22 @@ serves *measurement* tests, and the suite today is host logic only, so nothing n
 **When it is ported, port its unbracketed-node-ID fix with it.**
 
 The wrapper pins the test and module counts exactly (~~`61/61 passed in 6 modules`~~
-~~`103/103 passed in 10 modules`~~ **`[2026-08-11]` `229/229 passed in 17 modules`**). Discovery by
+~~`103/103 passed in 10 modules`~~ **`[2026-08-11]` `231/231 passed in 17 modules`**). Discovery by
 glob satisfies convention rule 11, but glob alone cannot notice a test that stops being *defined* —
 a deleted test function leaves a smaller suite passing. Verified in all three directions: matches
 as-is, a shrunken 60/60 suite fails the `CHECK`, an injected failure exits nonzero.
 
-`[2026-08-11]` The pin moved twice today, 103 → 133 → 196 → 229 over the four commits that added
+`[2026-08-11]` The pin moved 103 → 133 → 196 → 229 → 231 over the commits that added
 `resource_usage`, `run_lock`, `cases`, `power`, `compare_roots`, `component_groups` and
 `select_rows` with their tests. Re-verified in the shrinking direction at the new value: a doctored
 `228/228` output fails the `CHECK` with "expected string not found in input". **The suite is host
 only and runs in ~0.4 s**, which is what keeps the pin cheap enough to be worth moving by hand.
+
+Two of those 231 exist because writing the test found a bug in the port rather than confirming it:
+`iter_cases` was carrying iron's short-circuit, where naming a family makes the variant filter a
+no-op and a caller asking for decoders gets an encoder case back — a silently wrong answer that
+looks correct. It now composes, and refuses an unknown family instead of returning an empty tuple
+that reads the same as "no matches".
 
 **Item 7 — result trees, not the extension.** The rules above proposed a blanket `*.csv`. That
 silently ignores any CSV a future test wants to track as a fixture, and the failure mode is a file

@@ -193,6 +193,21 @@ def test_iter_cases_walks_families_then_the_ladder():
     assert [c.study_case_id for c in both] == list(cases.FAMILY_IDS)
 
 
+def test_iter_cases_composes_family_and_variant_rather_than_short_circuiting():
+    """iron ignores the variant once a family is named and hands back the family."""
+    assert (
+        cases.iter_cases(family="baseline_768", workload_variant="decoder_gpt2") == ()
+    )
+    assert len(
+        cases.iter_cases(family="baseline_768", workload_variant="encoder_bert")
+    ) == len(cases.SEQUENCE_LADDER)
+
+
+def test_iter_cases_raises_on_an_unknown_family_rather_than_returning_nothing():
+    """Empty and 'you typed it wrong' must not look the same."""
+    _raises(ValueError, "unknown family", cases.iter_cases, family="baseline_999")
+
+
 def test_iter_cases_filters_by_variant():
     encoder = cases.iter_cases(workload_variant="encoder_bert", seq_len=512)
     assert {c.workload_variant for c in encoder} == {"encoder_bert"}

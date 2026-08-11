@@ -29,4 +29,4 @@
 // friction to route around with a looser pattern.
 //
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 229/229 passed in 17 modules
+// CHECK: study host tests: 231/231 passed in 17 modules

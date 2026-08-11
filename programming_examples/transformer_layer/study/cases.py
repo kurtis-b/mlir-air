@@ -324,8 +324,21 @@ def iter_cases(
     family: str = "all",
     seq_len: int | str = "all",
 ) -> tuple[Case, ...]:
-    """The filtered matrix, in declaration order then ladder order."""
+    """The filtered matrix, in declaration order then ladder order.
+
+    The filters COMPOSE. Naming a family that is not in the named variant
+    returns nothing rather than returning the family anyway -- iron's version
+    short-circuits on the family and silently ignores the variant, which hands
+    back an encoder case to a caller that asked for decoders and looks like a
+    correct answer.
+    """
     if family != "all":
+        if family not in FAMILY_SPECS:
+            raise ValueError(f"unknown family {family!r}; known are {list(FAMILY_IDS)}")
+        if workload_variant != "all" and FAMILY_SPECS[
+            family
+        ].workload_variant != canonical_workload_variant(workload_variant):
+            return ()
         family_ids: tuple[str, ...] = (family,)
     else:
         family_ids = tuple(
