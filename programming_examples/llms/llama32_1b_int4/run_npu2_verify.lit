@@ -8,7 +8,40 @@
 // download). 2 prompts × 32 greedy tokens, k=5. Mirrors the bf16
 // sibling's run_npu2_verify.lit methodology.
 //
-// REQUIRES: false
+// RE-ENABLED `[2026-08-12]` (queue item 14). This carried a bare
+// `// REQUIRES: false` from 18d1dac2 (2026-06-18, "[CI] Disable
+// llama32_1b_int4 verify: OOM on amdhx370 runner") — a CI host-memory
+// problem, never an int4 defect, and the only hard-disabled lit among the
+// ten shipped models. A bare `REQUIRES: false` is indistinguishable from a
+// deleted test: it reports UNSUPPORTED, the suite still exits 0, and the
+// nightly's own status collapse (fail > pass > skip) then reported this
+// model's verify from the bfp16-prefill sibling instead. Since this is the
+// tree's only quantized end-to-end gate, lit-based CI had quantized
+// COMPILE coverage (run_npu2_compile.lit) and zero quantized NUMERICS.
+//
+// The disable's cause was removed a month after it landed, by
+// verify_runner.py's `auto` gate phase (7f2e03d8, 2026-07-14), which runs
+// the NPU-capture and HF-compare halves as separate subprocesses. The same
+// change is why nightlyPerfBenchmark.yml now carries 3B/4B on this runner
+// class at ~24-27 GB with "No LIT_FILTER_OUT needed" — this 1B model was
+// simply never revisited.
+//
+// Re-armed on measurement, not on assumption (devq job 255; NPU2 host,
+// 31 GiB RAM — the size class the disable named; Turbo). Peak RSS summed
+// over the whole process tree, sampled at 5 Hz, cross-checked against
+// /usr/bin/time -v's ru_maxrss:
+//   this lit end to end (auto split)  : 10.53 GiB peak, 17.3 GiB still free
+//   legacy single process (the pre-fix shape, --gate-phase both, and it
+//   recompiled every kernel inside the measured process, so it is an
+//   over-estimate)                    : 12.57 GiB peak, 15.4 GiB still free
+// Both PASS. The OOM does not reproduce here with OR without the split, so
+// the split is headroom rather than the thing holding this test up.
+//
+// No hf_token, unlike the eight bf16 models: verify_adapter.py resolves the
+// tokenizer AND the HF reference config to one ungated AWQ repo, which
+// ships tokenizer.json itself. Matches run_npu2_verify_prefill_bfp16.lit.
+//
+// REQUIRES: ryzen_ai_npu2, peano, hfweights_amd_llama_3_2_1b_instruct_awq_uint4_asym_g128_bf16_lmhead
 //
 // RUN: mkdir -p test_peano_verify
 // RUN: cd test_peano_verify
