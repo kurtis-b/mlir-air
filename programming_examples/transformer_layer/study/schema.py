@@ -589,10 +589,132 @@ COMPONENT_FIELDS: tuple[Field, ...] = (
     Field("failure_message", "First failure verbatim."),
 )
 
+# ---------------------------------------------------------------------------
+# The MEASUREMENT CONDITION block `[2026-08-12]` (doc 34 M4).
+#
+# WHAT IT IS FOR. A latency is a number measured under conditions, and until now
+# the conditions lived in README prose: "08-10's records are `Default`-
+# conditional, pre-08-10's are Turbo-conditional". That rule is in prose because
+# the data could not carry it, and it cost a day -- the 2026-08-10 "machine
+# anomaly" was the non-persistent `xrt-smi` power mode resetting itself on an
+# overnight reboot, and every latency recorded after it is ~15-20x off every
+# latency recorded before it with nothing in either file saying so (README trap
+# 0, doc 32). This block is that rule moved out of prose and into the artifact.
+#
+# WHY IT IS A BLOCK ON THE MANIFEST AND NOT A COLUMN ON `results`. Two reasons,
+# and the first one is decisive.
+#
+#   1. A new `results` column is a SCHEMA VERSION BUMP, and a bump makes every
+#      recorded CSV unreadable. `results_io.read_rows` rejects a header mismatch
+#      AND a version mismatch, so v1 -> v2 on 2026-08-10 took 56 recorded CSVs
+#      out of every current reader in one edit (doc 34 §1.4 records the Phase F
+#      gate artifact failing for exactly this reason). Doing it again would take
+#      the 8 that survived -- `ladder-v2-w{1,2}`, `postflip-ladder-w{1,2}` --
+#      which are the roots `compare_roots` is actually pointed at. A guard bought
+#      by destroying the artifacts it guards is not a fix.
+#   2. It is not a per-row quantity. The pmode is a property of the RUN, holds
+#      across every rung of a walk, and is exactly what two runs must agree on
+#      before their rows may be compared at all. `RESOURCE_FIELDS` above already
+#      states the general form of this rule -- "Adding a table is not a version
+#      bump of an existing one: `results` and `tuning` keep their field order
+#      exactly" -- and this is the same move: a new declared block, no bump,
+#      `SCHEMA_VERSION` stays 2 and every recorded CSV keeps reading.
+#
+# It is deliberately NOT registered in `_FIELDS_BY_TABLE`. That registry is the
+# CSV-table registry -- `results_io` builds a header out of it -- and a JSON
+# block that turned up there could be written out as a one-row CSV by anything
+# that iterates tables. `test_schema.py` pins `fields_for("conditions")` raising.
+#
+# DEGRADING TO `unknown` IS THE WHOLE POINT, AND IT IS NOT A SYNONYM FOR TURBO.
+# Every root recorded before today has no such block, and an old root CANNOT be
+# stamped after the fact: the mode it ran at is not recoverable from the files.
+# So a reader gets `unknown` with the reason attached, never a crash and never a
+# quiet match -- `conditions_from_manifest` below is the only supported way to
+# read it. Writing an inference ("that walk falls inside the uninterrupted Turbo
+# window, so call it turbo") into a data field is how the prose rule got there in
+# the first place; `agents/scripts/port-loop/pmode_guard.py` made the same call
+# for the throughput floor and for the same reason.
+#
+# WHAT ELSE BELONGS HERE, NOT ADDED TODAY. `xrt_version` and the LLVM/mlir-aie/
+# Peano pin plus the `install-xrt`-vs-`build-xrt` resolution are the other
+# conditions doc 34 M4 names, and doc 03 records an XRT version change alone
+# moving `offload` 19-39%. They are declarations away -- adding one here is a
+# field, not a redesign -- but they are not what cost a day, and `compare_roots`
+# already has somewhere to put them: it diffs a `toolchain` manifest block that
+# `manifest.py` has never actually written. Closing that is a separate item; see
+# the note in `manifest.build_manifest`.
+# ---------------------------------------------------------------------------
+
+#: What a condition records when it is not known. See the block comment: this is
+#: never to be replaced by a guess, and a reader must treat it as "unconditioned
+#: on the axis that costs 15-20x", not as "probably fine".
+UNKNOWN_CONDITION = "unknown"
+
+#: How a recorded condition was obtained. The three that may be WRITTEN, plus one
+#: the reader synthesises.
+#:
+#:   observed                 -- the party that ran the measurement observed the
+#:                               mode and stamped it. The strongest form, and the
+#:                               only one whose clock is the measurement's clock.
+#:   probed_at_manifest_build -- this host was queried when the manifest was
+#:                               written, which is AFTER the run. Same machine,
+#:                               later clock: good evidence, not an observation
+#:                               of the measurement, and labelled so a reader can
+#:                               tell the difference.
+#:   unknown                  -- could not be determined, or was never supplied.
+#:   absent                   -- READER-ONLY. The manifest predates this block
+#:                               entirely. Never written; produced by
+#:                               `conditions_from_manifest` so a guard can say
+#:                               "this root is older than the field" rather than
+#:                               "this root failed to determine its mode".
+CONDITION_SOURCES: tuple[str, ...] = (
+    "observed",
+    "probed_at_manifest_build",
+    "unknown",
+    "absent",
+)
+
+CONDITION_FIELDS: tuple[Field, ...] = (
+    Field(
+        "npu_power_mode",
+        "The `xrt-smi` NPU power mode this run was measured at, lowercased -- "
+        "`turbo`, `default`, or UNKNOWN_CONDITION. THE gating condition: it is "
+        "non-persistent (every reboot and every amdxdna reload resets it to "
+        "`Default`), it is invisible in every other recorded field, and on this "
+        "host a dispatch-bound measurement at `Default` runs ~15-20x slow. Two "
+        "runs at different modes are not a comparison; README trap 0's closing "
+        "rule is to re-measure the whole comparison after a pmode change and "
+        "never to splice across one.",
+    ),
+    Field(
+        "npu_power_mode_source",
+        "One of CONDITION_SOURCES: how the mode above was obtained. Load-"
+        "bearing, because `observed` and `probed_at_manifest_build` are not the "
+        "same claim -- the second was read after the measurement finished and a "
+        "driver reload in between would have moved it silently.",
+    ),
+    Field(
+        "npu_power_mode_detail",
+        "Provenance verbatim: the `xrt-smi` report the value was parsed out of, "
+        "or the reason it could not be. An `unknown` that does not say why is "
+        "indistinguishable from an `unknown` nobody tried to fill.",
+    ),
+    Field(
+        "observed_at_utc",
+        "When the condition was observed, ISO-8601 UTC. Read against the "
+        "measurement CSVs' own mtimes it says whether the observation and the "
+        "measurement belong to the same window. None when nothing was observed.",
+    ),
+)
+
 RESULTS_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in RESULTS_FIELDS)
 TUNING_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in TUNING_FIELDS)
 RESOURCE_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in RESOURCE_FIELDS)
 COMPONENT_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in COMPONENT_FIELDS)
+CONDITION_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in CONDITION_FIELDS)
+
+#: The manifest key the conditions block lives under.
+CONDITIONS_KEY = "conditions"
 
 DISPATCH_VECTOR_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _DISPATCH)
 POWER_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _POWER)
@@ -711,3 +833,110 @@ def validate_row(row: dict[str, object], table: str = "results") -> None:
                     else ""
                 )
             )
+
+
+# ---------------------------------------------------------------------------
+# The conditions block: build, read, validate. See the section comment above.
+# ---------------------------------------------------------------------------
+
+
+def empty_conditions() -> dict[str, object]:
+    """A complete conditions block that claims nothing.
+
+    Every declared field present, the mode ``unknown``, the source ``unknown``.
+    Callers fill it in; nothing assembles a dict of the keys it remembers, for
+    the same reason ``empty_row`` exists.
+    """
+    return {
+        "npu_power_mode": UNKNOWN_CONDITION,
+        "npu_power_mode_source": UNKNOWN_CONDITION,
+        "npu_power_mode_detail": None,
+        "observed_at_utc": None,
+    }
+
+
+def normalise_power_mode(value: object) -> str:
+    """A recorded mode as a comparable string; anything unusable is ``unknown``.
+
+    ``None``, ``""``, whitespace and the literal ``"unknown"`` all collapse to
+    UNKNOWN_CONDITION, so a reader never has to enumerate the ways a field can
+    fail to say something. Case is folded because ``xrt-smi`` prints ``Turbo``
+    and every comparison in this study is against the lowercased form.
+    """
+    text = str("" if value is None else value).strip().lower()
+    return text or UNKNOWN_CONDITION
+
+
+def conditions_from_manifest(manifest: object) -> dict[str, object]:
+    """The conditions block of a manifest dict, degrading to ``unknown``.
+
+    THE ONLY SUPPORTED READER, and the reason is back-compatibility: every
+    results root recorded before `[2026-08-12]` has no such block -- the shipped
+    `results/phasef_smoke/manifest.json` is schema v1 and the recorded ladder
+    walks carry no manifest at all -- so a reader that indexed the key would
+    raise on the whole recorded corpus. It returns a COMPLETE block whatever it
+    is handed, with ``npu_power_mode_source`` set to:
+
+      ``absent``  the manifest predates the block, or is not a mapping at all.
+                  Distinguished from ``unknown`` on purpose: "older than the
+                  field" and "tried and failed" are different things to tell an
+                  operator, and only the first is expected of the corpus.
+      whatever the manifest recorded, otherwise.
+
+    It never returns a mode that was inferred rather than recorded.
+    """
+    if not isinstance(manifest, dict):
+        block = None
+    else:
+        block = manifest.get(CONDITIONS_KEY)
+
+    out = empty_conditions()
+    if not isinstance(block, dict):
+        out["npu_power_mode_source"] = "absent"
+        out["npu_power_mode_detail"] = (
+            "this manifest has no conditions block -- it was written before "
+            "the measurement condition was recorded (doc 34 M4). The mode it "
+            "ran at is not recoverable from the files and must not be guessed."
+        )
+        return out
+
+    for name in CONDITION_FIELDNAMES:
+        if name in block:
+            out[name] = block[name]
+    out["npu_power_mode"] = normalise_power_mode(out["npu_power_mode"])
+    out["npu_power_mode_source"] = normalise_power_mode(out["npu_power_mode_source"])
+    return out
+
+
+def validate_conditions(block: dict[str, object]) -> None:
+    """Raise ``ValueError`` unless ``block`` is a writable conditions block.
+
+    Same shape of check as ``validate_row``: a missing or extra key, and a
+    ``source`` outside CONDITION_SOURCES. The MODE's domain is deliberately open
+    -- ``xrt-smi`` names the modes and may name a new one, and a schema that
+    rejected an unrecognised mode would refuse to record the very thing a reader
+    most needs to see.
+    """
+    expected = set(CONDITION_FIELDNAMES)
+    got = set(block)
+    if missing := expected - got:
+        raise ValueError(f"conditions block is missing keys: {sorted(missing)}")
+    if extra := got - expected:
+        raise ValueError(
+            f"conditions block has keys not in the schema: {sorted(extra)}. "
+            "Adding a condition is a declaration in schema.CONDITION_FIELDS, "
+            "not a key invented at the call site."
+        )
+    source = normalise_power_mode(block.get("npu_power_mode_source"))
+    if source not in CONDITION_SOURCES:
+        raise ValueError(
+            f"npu_power_mode_source={block.get('npu_power_mode_source')!r} is "
+            f"not one of {list(CONDITION_SOURCES)}"
+        )
+    if source == "absent":
+        raise ValueError(
+            "npu_power_mode_source='absent' is READER-ONLY -- it is what "
+            "conditions_from_manifest synthesises for a manifest older than the "
+            "block, and writing it would claim a run predates a field it "
+            "carries. Use 'unknown' if the mode could not be determined."
+        )

@@ -84,9 +84,10 @@ tested in both directions against synthetic logs (doc 14:347-352).
 
 ### 1.3 The Phase F study tier — larger than doc 10 anticipates, and partly unwired
 
-17 modules, `study/run_host_tests.py` reports **231/231 in 17 modules** in ~0.4 s, pinned by
-FileCheck in `run_study_host_tests.lit:31` and verified in the shrinking direction
-(`09-phase-f-study-harness.md:528-538`).
+17 modules, `study/run_host_tests.py` reports ~~231/231~~ **`[2026-08-12]` 265/265 in 17 modules**
+(M4 below) in ~0.4 s, pinned by FileCheck in `run_study_host_tests.lit` and verified in the
+shrinking direction (`09-phase-f-study-harness.md:528-538`). Still hermetic: the M4 probe is
+exercised against a stub `xrt-smi` on PATH, never the device.
 
 Mapping onto doc 10's stated behaviours:
 
@@ -220,7 +221,28 @@ hold 9 rungs and holds 1 is `complete: True` today. Verified on the probe manife
 results_root, schema_version, study_id, system` — **no row count anywhere**. *Effort: ~30 lines +
 fixtures in the existing 231-test suite.*
 
-**M4. Neither the manifest nor the schema records the measurement condition.**
+**M4. ~~Neither the manifest nor the schema records the measurement condition.~~ CLOSED
+`[2026-08-12]` by queue item 15, which was blocked on it.**
+
+> `schema.CONDITION_FIELDS` declares a `conditions` block — `npu_power_mode`, how it was obtained
+> (`observed` / `probed_at_manifest_build` / `unknown`), the provenance verbatim, and when —
+> and `manifest.build_manifest` writes it. **A BLOCK, not a `results` column, and that is the whole
+> versioning decision**: a column bumps `SCHEMA_VERSION` to 3, and `results_io.read_rows` rejects
+> both a header and a version mismatch, so it would have done to the 16 surviving v2 CSVs exactly
+> what §1.4 above records v1 → v2 doing to 56 — including `postflip-ladder-w{1,2}`, the roots the
+> comparator is actually pointed at. `schema.py`'s own `RESOURCE_FIELDS` precedent covers it:
+> "adding a table is not a version bump". `SCHEMA_VERSION` stays **2**, pinned by a test, and the
+> block is deliberately absent from `_FIELDS_BY_TABLE` so nothing can emit it as a CSV.
+> A manifest predating the block reads back `unknown` with source `absent`, never a crash and never
+> a silent match. `compare_roots` then **refuses** a recorded mismatch and **flags** an unknown.
+> Verified: 6/6 readable v2 root pairs byte-identical against the pre-change binary, 16/16 v2 CSVs
+> still parse, host suite 231 → **265/265 in 17 modules**. §M3's row counts are a separate item and
+> untouched. The remaining conditions this section names — `xrt_version`, the LLVM/mlir-aie/Peano
+> pin, `install-xrt`-vs-`build-xrt` — are now a **declaration** in that block rather than a design;
+> note while adding them that `compare_roots.compare_manifests` has been diffing a `toolchain` key
+> `manifest.py` has never written. Original text follows.
+
+**Neither the manifest nor the schema records the measurement condition.**
 `grep -n "turbo\|power_mode\|pmode\|xrt_version\|toolchain\|firmware" schema.py manifest.py` → one
 hit, and it is `manifest.py`'s docstring *claiming* "the toolchain and git provenance to reproduce
 it" (`manifest.py:10`). Actual provenance is git sha/branch/dirty plus `python`/`platform`/`machine`.
@@ -437,7 +459,7 @@ per run on a laptop — retention policy is part of the design, not an afterthou
 |---|---|---|
 | **M1** pmode guard on `gate-h.sh` leg 4 + runlist gate latency clause; pmode into `throughput-baseline.json` | ~60 lines, 2 files, both already tested in both directions elsewhere | **1–2 h** |
 | **M11** CI target rename/re-filter/re-comment + wire the 10 PR-safe tests into a workflow | 1 CMake block, 1 workflow edit | **1 h + one CI round trip** |
-| **G0** profile + runner + manifest counts (M2, M3, M4, M6, M8, M9) | ~400–600 lines across `study/profiles.py`, `study/run_profile.py`, edits to `manifest.py`; host-only tests into the existing 231 | **1 session code + 1 devq measure window** |
+| **G0** profile + runner + manifest counts (M2, M3, ~~M4~~ **done**, M6, M8, M9) | ~400–600 lines across `study/profiles.py`, `study/run_profile.py`, edits to `manifest.py`; host-only tests into the existing suite (231 → **265** after M4) | **1 session code + 1 devq measure window** |
 | **M7** resume, copying `REUSABLE_STATUSES`' verdict split from the registry sweep | ~150 lines | **half a session** |
 | **M5** widen the matrix past `baseline_768` | new registry coverage at hidden 512/1024 + a decoder variant | **unbounded — C4's precedent is 504 + 66 min of gate time alone** |
 | doc 10's crontab / TTM / thermal / reboot orchestration | — | **recommend NOT doing — see §4.4** |
@@ -453,7 +475,10 @@ per run on a laptop — retention policy is part of the design, not an afterthou
   `README.md:507-523` lists three, two of them measurement-condition failures (a 1.55× inflation
   from host work running alongside; a "5.9% improvement" that was three fresh runs against one
   stale number). An unattended runner multiplies the opportunity. Mitigation is M4: put the
-  conditions **in the data**, not in prose.
+  conditions **in the data**, not in prose. **`[2026-08-12]` DONE for the pmode** — the manifest
+  carries it and `compare_roots` refuses a splice across it — so the risk narrows to the conditions
+  still unrecorded (`xrt_version`, the toolchain pin), each now a declaration in
+  `schema.CONDITION_FIELDS`.
 - **MEDIUM — structural holes are not failures (M6).** `fused` above 1024 and anything gated on
   item 6c will populate a count-based manifest with `failed` rows that are not regressions.
 - **MEDIUM — 2.4 GB per results root on a laptop**, times however often CI runs.
