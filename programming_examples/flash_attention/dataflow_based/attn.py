@@ -803,7 +803,11 @@ if __name__ == "__main__":
     runner = XRTRunner(
         omit_while_true_loop=False,
         omit_pingpong=True,
-        verbose=False,
+        # `[2026-08-12]` was `verbose=False`, a literal, while `-v/--verbose`
+        # was parsed and never read -- so `attn.py -v` was accepted and ran
+        # exactly as quietly as without it. Default is unchanged: `store_true`
+        # gives False when the flag is absent.
+        verbose=args.verbose,
         runtime_loop_tiling_sizes=[1, 1],
         output_format=args.output_format,
         instance_name="attention_bf16",

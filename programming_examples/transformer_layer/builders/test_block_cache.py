@@ -194,8 +194,24 @@ def test_the_shape_under_test_is_the_gate_s_own_specs_row():
     configuration the gate runs. A hand-written copy of that configuration
     holds until ``opcheck_specs`` moves and then describes a shape nobody
     runs -- while every check here goes on passing, because they are all
-    self-consistent about the wrong number. This is the assertion that turns
-    that drift red.
+    self-consistent about the wrong number.
+
+    WHAT THIS ASSERTION DOES AND DOES NOT DETECT
+        `[2026-08-12]` It does NOT turn a moved shape red, and must not be
+        read as if it did. ``SHAPE`` is derived by ``_gate_shape()`` from the
+        very row compared against here, so ``SHAPE == rows[0]["shape"]`` is
+        ``dict(x) == x`` and holds by construction. Measured: moving the block
+        row to ``2048x768`` leaves this module at 10/10 with ``SHAPE`` quietly
+        following to ``seq_len 2048``.
+
+        That is the intended behaviour, not a gap -- derivation exists so the
+        checks track the gate rather than a number transcribed once, and
+        demanding a red here would mean re-introducing the transcription this
+        replaced. What this assertion still catches is STRUCTURAL: the block
+        row disappearing or being duplicated, and a row that no longer carries
+        the fields ``block_config`` needs. The drift-detecting check of this
+        family is ``study/test_run_ladder.py``'s catalogue pin, which CAN go
+        red because its fixture is deliberately not derived.
     """
     rows = [r for r in opcheck_specs.SPECS if r.get("operator") == GATE_OPERATOR]
     assert len(rows) == 1, (
