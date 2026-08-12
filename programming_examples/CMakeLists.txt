@@ -196,11 +196,16 @@ set_target_properties(check-programming-examples-transformer-layer PROPERTIES FO
 
 # Transformer-layer PR gate: the subset that dispatches nothing.
 #
-# 10 tests -- run_npu2_compile_peano (Peano objects plus a symbol check) and the
-# nine host-only ones: the study host suite, the seam/reference/block-cache/
-# blocked-attention/FFN-resident emulation checks, and the sweep's family,
-# writer and registry-resolution checks. No NPU, no XRT dispatch, no HF token,
-# no secrets.
+# 11 tests -- run_npu2_compile_peano (Peano objects plus a symbol check) and the
+# ten host-only ones: the study host suite, the seam/reference/block-cache/
+# blocked-attention/FFN-resident emulation checks, the mapping-space census, and
+# the sweep's family, writer and registry-resolution checks. No NPU, no XRT
+# dispatch, no HF token, no secrets.
+#
+# `run_mapping_space_tests` is the slowest of them at about a minute: it walks
+# the whole declared mapping space and pins the two space sizes exactly. It runs
+# no compiler and touches no device -- the cost is Python enumerating ~10^5
+# (structure, seam) pairs, which is the measurement itself.
 #
 # AN EXPLICIT ALLOWLIST, NOT A FILTER-OUT, AND THE DIRECTION IS THE POINT.
 # A negative filter would enrol every FUTURE .lit automatically, so a new
@@ -219,10 +224,10 @@ set_target_properties(check-programming-examples-transformer-layer PROPERTIES FO
 # `[.]lit$` rather than `\.lit$`: CMake eats a backslash before a
 # non-escapable character, so the anchor would silently become `.lit$`.
 add_lit_testsuite(check-programming-examples-transformer-layer-host
-  "Running transformer-layer PR-safe tests (10, no NPU dispatch)"
+  "Running transformer-layer PR-safe tests (11, no NPU dispatch)"
   ${CMAKE_CURRENT_BINARY_DIR}
   DEPENDS ${TEST_DEPENDS}
-  ARGS ${AIR_TEST_LIT_ARGS} --filter "transformer_layer/(run_npu2_compile_peano|run_block_cache_tests|run_blocked_attention_tests|run_ffn_resident_emulation_tests|run_reference_tests|run_seam_tests|run_study_host_tests|sweep/run_npu2_registry_resolution|sweep/run_sweep_families_tests|sweep/run_sweep_writer_tests)[.]lit$"
+  ARGS ${AIR_TEST_LIT_ARGS} --filter "transformer_layer/(run_npu2_compile_peano|run_block_cache_tests|run_blocked_attention_tests|run_ffn_resident_emulation_tests|run_mapping_space_tests|run_reference_tests|run_seam_tests|run_study_host_tests|sweep/run_npu2_registry_resolution|sweep/run_sweep_families_tests|sweep/run_sweep_writer_tests)[.]lit$"
 )
 set_target_properties(check-programming-examples-transformer-layer-host PROPERTIES FOLDER "Tests")
 
