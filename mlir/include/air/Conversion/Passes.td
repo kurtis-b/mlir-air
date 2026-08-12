@@ -212,6 +212,16 @@ def AIRToAIE : Pass<"air-to-aie", "ModuleOp"> {
           "the memtile DMA. Mutually exclusive with use-lock-race-condition-fix. "
           "Requires upstream to preserve the shared L2 buffer (typically via "
           "`air.no_split` on the alloc).">,
+    Option<"clMimoChainLock", "mimo-chain-lock", "bool", /*default=*/"false",
+          "FALSIFIER ARM -- not a fix. Admit the MIMO (M writers + N readers) "
+          "shape into the v2 chain-lock as two chains back to back (writers, "
+          "then readers). It does order the writers, and it is still unsound: "
+          "an AIE2 BD has one acquire and one release, so spending the "
+          "writer's release on the chain leaves the readers unsignalled and "
+          "writer i+1 overwrites a fill nobody has read. Kept only so the "
+          "measurement is reproducible; without it, use-lock-race-condition-"
+          "fix-v2 REFUSES a MIMO memtile buffer by name instead of silently "
+          "falling through to the racing legacy template.">,
     Option<"clStackSize", "stack-size", "unsigned", /*default=*/"1024",
           "Stack size in bytes to allocate per AIE core. Must be large enough "
           "to hold the full call chain stack depth including callee frames. "

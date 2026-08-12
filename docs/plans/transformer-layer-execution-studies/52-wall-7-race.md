@@ -256,3 +256,188 @@ the compiler-side fix is outstanding.
 
 `fused`'s SPECS atol stays **PROVISIONAL**, and **no resident-tail latency or
 byte figure has been measured on hardware.** Nothing here changes either.
+
+---
+
+## 8 — `[2026-08-12]` The compiler fix §7.1 asked for does not exist. Here is the proof, and what shipped instead
+
+Queue item 22. Compiler: worktree build `build-mimo`, `aircc` sha
+`9f5a52af…`, provenance-gated in every leg (the pre-fix reference is
+`build-xrt`'s `0651a0e5…`, the same binary §3 used). **`build-mimo` exists
+because `build-xrt`'s `CMAKE_HOME_DIRECTORY` is the shared checkout**: a
+worktree agent running `ninja -C build-xrt` would have compiled the parent's
+sources and produced a green-looking binary containing none of this change —
+the toolchain-provenance trap one level up. Artifacts: devq **313** (compiler
+build), **319** (airhost runtime), **321** and **322** (`check-air-mlir`), all
+build class; the R1 arm dumps in §8.3/§8.5 are compile-only, no device, as
+§5's sweep was. Instrument:
+`agents/probes/probe_aie_buffer_writer_race.py --check-order` (new this
+evening). Regression: `mlir/test/Conversion/AIRToAIE/
+memtile_chain_lock_v2_mimo.mlir`, **verified failing pre-fix**.
+
+### 8.1 The prediction, recorded first, and what happened to it
+
+Recorded before building anything, per §7.2:
+
+> Once the compiler orders the writers, `percol` and `shared` become
+> byte-identical at every rung.
+
+**That prediction was never reached, and it is reported unresolved rather than
+confirmed.** It presupposes a compiler fix that orders the writers *and* binds
+the readers. §8.3 measures that no such fix exists on a single slot. There was
+therefore no fixed compiler to run the ladder against, and running it anyway
+would have produced a number with nothing behind it. The falsifier fired one
+level up — on the premise, not on the outcome.
+
+The two side predictions were reached and both held: **buffer count does not
+change** (§8.5) and **`check-air-mlir` moves by exactly the new test** (§8.6).
+
+### 8.2 What §7.1 asked for, built and measured
+
+`isChainLockCandidate` was extended to admit MIMO, and
+`getOrCreateChainLockSet` given two chains — `nW` writer stages then `nR`
+reader stages, sharing the writer→reader handoff lock, so `nW + nR - 1` signal
+locks plus the cap. Ping-pong is suppressed for MIMO on purpose: the whole
+claim being tested is that the writers can be ordered on the **one** buffer, and
+splicing a twin would quietly turn it into the per-column fix.
+
+It ships as `mimo-chain-lock` (pass option, `aircc` flag, and
+`XRTBackend(mimo_chain_lock=)`), **default false**, and it is labelled a
+falsifier arm in all three places — the same way `shared_h_staging` is kept.
+
+### 8.3 It orders the writers. It is still wrong, and it cannot not be
+
+The instrument is new because the old one could not answer this. `--refuse-race`
+is a **shape** test: >1 writer channel on a 1-slot buffer. A shape test cannot
+tell an unordered counting semaphore from a correctly chained one — both have N
+writer channels on one slot — so it can neither certify a fix nor refute one.
+
+`--check-order` simulates the emitted lock protocol instead: places are the
+tile's `aie.lock`s with their declared `init`, transitions are the
+`aie.dma_bd`s with their single acquire and single release advancing a
+per-channel program counter along `aie.next_bd`, streams are modelled
+always-ready (the conservative reading of *does the DMA program alone force
+this*). It explores the reachable state space and decides two things
+separately: is the k-th writer the same channel on every interleaving, and is
+every fill consumed by every reader before the next lands.
+
+Calibration, both directions, before use: the existing v2 **fan-in** chain
+(`memtile_chain_lock_v2_fanin.mlir`, 4 writers) reads **ORDERED**; R1's shared
+`l2_h` reads **RACE**. Neither is assumed.
+
+On R1 D2 (`128×128, herd_x 2`), one line per arm:
+
+| arm | writer order | read binding |
+|---|---|---|
+| shipped default (v2 off) | **RACE** — write #0 by either channel | — |
+| `use-lock-race-condition-fix-v2` | **refused** (§8.4) | — |
+| `+ mimo-chain-lock` | **ORDERED** — `S2MM 1, 0, 1, 0, …`, one channel per position | **OVERWRITE** — fill #0 destroyed before *either* reader read it |
+
+The two-chain form delivers exactly half the constraint and loses the other
+half. That is not an implementation slip, it is the budget:
+
+> **An AIE2 BD descriptor carries one acquire-lock field and one release-lock
+> field.** `generateDmaBd` emits exactly one of each. So a writer's single
+> release goes **either** to the next writer (ordering the writers, leaving the
+> readers unsignalled) **or** to the readers (binding the readers, leaving the
+> writers on a shared counting semaphore — which is the legacy template, and is
+> wall 7). There is no third place to put it.
+
+The remaining freedom is asymmetric acquire/release *counts*, and a counting
+argument closes it. Take the minimal case — 2 writers, 2 readers, one slot,
+required cycle `w0, {r0,r1}, w1, {r0,r1}`. Both writers must be gated on
+something the readers release (else a writer can fire before the reads), so
+both readers must feed each writer's input place; two readers releasing into
+two *different* places lets one writer fire on one reader's release alone, so
+the writers share one input place `G`, fed `2ρ` per fill. With `a₀ + a₁ = 4ρ`
+per period, "w1 enabled after the first read pair" gives `X ≥ 2ρ` and "w0 not
+re-enabled at that same moment" gives `X < 2a₀ − 2ρ`, forcing `a₀ > 2ρ`; while
+"w1 disabled at period start" with `X ≥ 2ρ` forces `a₀ < 2ρ`. Contradiction,
+independent of the constants. The same argument with a writer run length of
+`k ≥ 2` (R1's `chunks_per_group`) contradicts identically.
+
+**The escape is not a cleverer lock assignment — it is more BDs.** The reader
+chains must distinguish all `P = herd_x × chunks_per_group` phases, one BD per
+fill. Which is measurable and measured: R1 D2's reader chain is **1** `h`-BD in
+the shared arm and **4** in the per-column arm, and `P` = 2 × 2 = 4.
+
+### 8.4 So v2 refuses MIMO by name instead of silently racing
+
+`isChainLockCandidate` still excludes MIMO, and that exclusion is now
+documented as load-bearing rather than as an oversight. What changed is the
+fall-through: under `use-lock-race-condition-fix-v2` a MIMO memtile buffer now
+**errors**, naming the buffer, the counts, and the one-acquire/one-release
+reason. v2 is the "do not race on the memtile DMA" mode; silently emitting the
+racing legacy template was the worst available behaviour, and it is precisely
+why v2 read as **inert** in five A/Bs when it had simply never been reached
+(§2). A diagnostic on that path is what would have found wall 7 on day 1.
+
+### 8.5 Nothing shipped moves, and that is checked rather than argued
+
+The default path (v2 off) is untouched. R1 D2's emitted `aie.air.mlir` is
+**byte-identical** across the pre-fix and post-fix compilers — sha256
+`5439c51d…` from both `0651a0e5…` and `9f5a52af…`. Buffer counts:
+
+| arm | `aie.buffer` total | L2 | H staging on the down-feed memtile |
+|---|---|---|---|
+| shared, pre-fix | 22 | 6 | **1** |
+| shared, post-fix default | 22 | 6 | **1** |
+| `mimo-chain-lock` | 23 | 7 | **1** |
+| per-column (the builder fix) | 25 | 9 | **4** |
+
+The chain arm's `+1` is v2's ping-pong twin on the *`w_down`* fan-out buffer,
+a different buffer. So the compiler arm does keep the H staging at one buffer —
+the property that would have let it reach the gate. It simply is not correct.
+
+### 8.6 Gate
+
+`check-air-mlir` **512 discovered / 498 pass / 0 fail** before,
+**513 / 499 / 0** after; the delta is exactly
+`memtile_chain_lock_v2_mimo.mlir` and no other test's expectations were
+touched. That test pins three things and was **verified failing first**: with
+the pre-fix binary its refusal line exits 0 (the module compiles silently,
+which is the defect) and its `mimo-chain-lock` line fails on an unknown option.
+
+### 8.7 What this means for §5 and §7, stated plainly
+
+§5 and §7.1 both assert that the compiler-side fix is "the version that would
+scale", costing signal locks rather than BDs. **That is retracted.** Any
+correct scheme must distinguish `P = herd_x × chunks_per_group` phases in the
+reader BD chains, which is the same BD cost as per-column staging — measured
+equal at D2 (4 `h`-BDs either way). At the gate shape (`768×3072, herd_x 4`:
+`group_n` 192, `cpg` 6, `sweeps` 4) `P` = 24, so a correct reader chain is 24
+`h`-BDs + 24 `b`-BDs per MM2S channel across 4 channels, against a 48-block cap
+for the whole `memtile_dma`. **Both fixes hit the same wall, and the compiler
+one hits it no later.** That is why §5's per-column sweep starts failing at
+`256×256`, and it is not a property of per-column staging.
+
+There is a second, independent reason the two-chain form is wrong at the gate
+even ignoring the read side: its writer order is strict **round-robin**
+(measured: `S2MM 1, 0, 1, 0, …`), while R1 needs run length `cpg` — at D2 the
+correct order is `c0, c0, c1, c1`, which the per-column arm's BD chain shows
+directly (reader chain `buf19, buf18` from one column then `buf17, buf16` from
+the other). Round-robin happens to coincide with the requirement only at
+`cpg = 1`, which is 6 of the 7 failing rungs and **not** the gate.
+
+**`shared_h_staging` therefore stays `True`, and cannot yet become the
+default in either direction.** Per-column remains correct and compiles to
+`128×128` at `herd_x 4` (§5); above that neither arm both compiles and is
+correct. Reaching the gate needs the *period* reduced, not the locks changed —
+e.g. staging a whole column group per transfer so `P` falls from
+`herd_x × cpg` to `herd_x` — which is a builder change and is not attempted
+here.
+
+### 8.8 A lead this instrument turned up, not chased
+
+`--check-order` reports **OVERWRITE** on `%buf20`/`%buf24` — the `w_down`
+down-feed buffer, 1 writer, 2 readers, one slot, legacy counted template — in
+**both** arms and at `herd_x = 1`, where the read side is unbound for the same
+one-release reason. It is present in the arm that is 35/35 on hardware, so it
+is a latent hazard the DMA program does not exclude rather than a fired one,
+and the probe's epistemic status is the same as §2's ("no ordering mechanism",
+not "reachable"). It is worth pointing at **F1** (§5b: `96×96, tile_k 16,
+herd_x 1`, 5/5 TIMEOUT in both arms, the only known `herd_x = 1` failure) —
+a `herd_x = 1` hang whose only unbound buffer is this one. Not investigated
+here; filed as a lead with its instrument attached. Note that v2's fan-out
+chain **does** fix this buffer (arm C reads ORDERED on `%buf20`), so there is a
+cheap experiment available.

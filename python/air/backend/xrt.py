@@ -71,6 +71,7 @@ class XRTBackend(AirBackend):
         channel_multiplexing: list[str] = [],
         use_lock_race_condition_fix: bool = False,
         use_lock_race_condition_fix_v2: bool = False,
+        mimo_chain_lock: bool = False,
         coalesce_shim_dma: bool = False,
         trace_offset: int = 0,
         trace_size: int = 0,
@@ -141,8 +142,17 @@ class XRTBackend(AirBackend):
                 "use_lock_race_condition_fix and use_lock_race_condition_fix_v2 "
                 "are mutually exclusive; enable at most one"
             )
+        if mimo_chain_lock and not use_lock_race_condition_fix_v2:
+            raise AirBackendError(
+                "mimo_chain_lock only has an effect under "
+                "use_lock_race_condition_fix_v2; enable both or neither"
+            )
         self.use_lock_race_condition_fix = use_lock_race_condition_fix
         self.use_lock_race_condition_fix_v2 = use_lock_race_condition_fix_v2
+        # FALSIFIER ARM, off by default. See doc 52 §8: it orders the writers
+        # and is still unsound on the read side. Kept reachable only so the
+        # measurement can be reproduced from the tree.
+        self.mimo_chain_lock = mimo_chain_lock
         self.coalesce_shim_dma = coalesce_shim_dma
         self.trace_offset = trace_offset
         self.trace_size = trace_size
@@ -380,6 +390,9 @@ class XRTBackend(AirBackend):
 
             if self.use_lock_race_condition_fix_v2:
                 aircc_options += ["--use-lock-race-condition-fix-v2"]
+
+            if self.mimo_chain_lock:
+                aircc_options += ["--mimo-chain-lock"]
 
             if self.coalesce_shim_dma:
                 aircc_options += ["--coalesce-shim-dma"]

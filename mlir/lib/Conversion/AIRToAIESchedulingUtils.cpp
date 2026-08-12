@@ -647,7 +647,15 @@ static bool isL2MemtileBuffer(AIE::BufferOp buf) {
   return memrefTy && air::isL2(memrefTy);
 }
 
-bool air::isChainLockCandidate(AIE::BufferOp buf) {
+bool air::isUnorderableMimoMemtileBuffer(AIE::BufferOp buf) {
+  if (!isL2MemtileBuffer(buf))
+    return false;
+  int nW = 0, nR = 0;
+  countChainBufferRoles(buf, nW, nR);
+  return nW > 1 && nR > 1;
+}
+
+bool air::isChainLockCandidate(AIE::BufferOp buf, bool allowMimo) {
   // Predicate is shape-based on the buffer's user list. Only L2 memtile
   // buffers are eligible (this is a memtile-specific lock pattern).
   if (!isL2MemtileBuffer(buf))
@@ -671,9 +679,16 @@ bool air::isChainLockCandidate(AIE::BufferOp buf) {
       return false;
     return true;
   }
-  // Single-writer/single-reader (legacy 1:1) or MIMO (M writers + N
-  // readers) are NOT chain-lock candidates; legacy lock template
-  // applies.
+  // MIMO (M writers + N readers). NOT a chain-lock candidate by default, and
+  // that exclusion is load-bearing rather than an oversight: see
+  // `isUnorderableMimoMemtileBuffer` for why no per-BD lock protocol can both
+  // order the writers and bind the readers on a single slot. `allowMimo` is
+  // the falsifier arm (`mimo-chain-lock`), off by default, kept so the
+  // measurement that rules the two-chain form out stays reproducible.
+  if (nW > 1 && nR > 1)
+    return allowMimo;
+  // Single-writer/single-reader (legacy 1:1) is NOT a chain-lock candidate;
+  // legacy lock template applies.
   return false;
 }
 
@@ -723,8 +738,9 @@ int air::computeStageIndexForMemcpyOp(Operation *memcpyOp, AIE::BufferOp buf) {
 
 FailureOr<air::ChainLockSet *>
 air::DMAAllocator::getOrCreateChainLockSet(AIE::BufferOp buf,
-                                           AIE::TileLike tile) {
-  if (!buf || !isChainLockCandidate(buf))
+                                           AIE::TileLike tile,
+                                           bool allowMimo) {
+  if (!buf || !isChainLockCandidate(buf, allowMimo))
     return failure();
   auto it = chain_lock_sets.find(buf.getOperation());
   if (it != chain_lock_sets.end())
@@ -732,7 +748,10 @@ air::DMAAllocator::getOrCreateChainLockSet(AIE::BufferOp buf,
 
   int nW = 0, nR = 0;
   classifyChainBuffer(buf, nW, nR);
-  int nStages = (nW > 1) ? nW : nR; // fan-in or fan-out
+  // fan-in: nW writer transitions; fan-out: nR reader transitions; MIMO: both
+  // chains back to back, sharing the writer→reader handoff lock, so
+  // nW + nR - 1 rather than nW + nR.
+  int nStages = (nW > 1 && nR > 1) ? (nW + nR - 1) : ((nW > 1) ? nW : nR);
 
   ChainLockSet cls;
   cls.n_writers = nW;
@@ -790,7 +809,30 @@ air::DMAAllocator::pickChainBdLocks(const ChainLockSet &cls,
   // gives the correct chain semantics.
   AIE::LockOp toAcquire, toRelease;
 
-  if (cls.isFanIn()) {
+  if (cls.isMimo()) {
+    // Falsifier arm (`mimo-chain-lock`). Two chains back to back:
+    //   Cap → W0 → W1 → ... → W{nW-1} → R0 → R1 → ... → R{nR-1} → Cap
+    // sig_locks[0 .. nW-1]      writer→writer transitions + the W→R handoff
+    // sig_locks[nW .. nW+nR-2]  reader→reader transitions
+    //
+    // This DOES order the writers -- `probe_aie_buffer_writer_race.py
+    // --check-order` reports ORDERED on the emitted program -- and it is still
+    // WRONG, which is the point of keeping it. Each writer's one release is
+    // spent handing the baton to the next writer, so no reader is signalled
+    // between two writes: on a single-slot buffer writer i+1 overwrites a fill
+    // no reader has consumed. The probe reports that separately as OVERWRITE.
+    // Doc 52 §8.
+    if (dir == AIE::DMAChannelDir::S2MM) {
+      toAcquire = (stage == 0) ? cls.cap_lock : cls.sig_locks[stage - 1];
+      toRelease = cls.sig_locks[stage];
+    } else {
+      toAcquire = (stage == 0) ? cls.sig_locks[cls.n_writers - 1]
+                               : cls.sig_locks[cls.n_writers + stage - 1];
+      toRelease = (stage == cls.n_readers - 1)
+                      ? cls.cap_lock
+                      : cls.sig_locks[cls.n_writers + stage];
+    }
+  } else if (cls.isFanIn()) {
     // Writers serialized W0 → W1 → ... → W{N-1} → Reader → Cap → W0
     if (dir == AIE::DMAChannelDir::S2MM) {
       // Writer stage `stage` (0..N-1)
@@ -1087,7 +1129,7 @@ air::DMAAllocator::lookupDMAAllocation(AIE::TileLike tile,
 // locks depending on the target device.
 FailureOr<std::pair<AIE::LockOp, AIE::LockOp>> air::DMAAllocator::getLockForDMA(
     air::MemcpyInterface &memcpyOp, AIE::TileLike tile, Operation *bufferOp,
-    bool lockRaceConditionFix, bool lockRaceConditionFixV2) {
+    bool lockRaceConditionFix, bool lockRaceConditionFixV2, bool mimoChainLock) {
   auto alloc = lookupDMAAllocation(tile, memcpyOp);
   if (failed(alloc))
     return memcpyOp->emitOpError("failed to look up dma allocation.");
@@ -1140,8 +1182,25 @@ FailureOr<std::pair<AIE::LockOp, AIE::LockOp>> air::DMAAllocator::getLockForDMA(
   // Takes precedence over the legacy / v1 paths when it applies.
   if (lockRaceConditionFixV2 && tileIsMemTile && UsesSemaphoreLocks) {
     auto buf = dyn_cast_or_null<AIE::BufferOp>(bufferOp);
-    if (buf && isChainLockCandidate(buf)) {
-      auto clsOrFail = getOrCreateChainLockSet(buf, tile);
+    // A MIMO memtile buffer is UNORDERABLE by any per-BD lock protocol (see
+    // isUnorderableMimoMemtileBuffer). v2 is the "do not race on the memtile
+    // DMA" mode, so refuse it by name rather than falling through to the
+    // legacy counted-lock template -- that silent fall-through is what made
+    // v2 read as "inert" on wall 7 when it had simply never been reached.
+    if (buf && !mimoChainLock && isUnorderableMimoMemtileBuffer(buf)) {
+      int nW = 0, nR = 0;
+      classifyChainBuffer(buf, nW, nR);
+      return buf->emitOpError()
+             << "v2 chain-lock: memtile buffer has " << nW << " writers and "
+             << nR << " readers (MIMO) on a single slot, which no per-BD lock "
+                "protocol can order: a BD has one acquire and one release, so "
+                "a writer cannot both chain to the next writer and signal the "
+                "readers. Give each writer its own buffer upstream, or pass "
+                "mimo-chain-lock to opt into the measured-unsound two-chain "
+                "form";
+    }
+    if (buf && isChainLockCandidate(buf, mimoChainLock)) {
+      auto clsOrFail = getOrCreateChainLockSet(buf, tile, mimoChainLock);
       if (failed(clsOrFail))
         return memcpyOp->emitOpError(
             "v2 chain-lock: failed to allocate chain lock set");
@@ -1162,8 +1221,10 @@ FailureOr<std::pair<AIE::LockOp, AIE::LockOp>> air::DMAAllocator::getLockForDMA(
           {bufferOp, air_chan, channel, pair.first, pair.second});
       return pair;
     }
-    // Fall through to the legacy path for non-candidate buffers (e.g.
-    // 1:1 single-writer single-reader L2 buffers, or MIMO buffers).
+    // Fall through to the legacy path for non-candidate buffers (1:1
+    // single-writer single-reader L2 buffers, and fan-out buffers pinned with
+    // air.no_chain_lock). MIMO no longer reaches here: it is either refused
+    // above or handled by the mimo-chain-lock falsifier arm.
   }
 
   if (UsesSemaphoreLocks) {

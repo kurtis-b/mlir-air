@@ -235,6 +235,18 @@ static cl::opt<bool> useLockRaceConditionFixV2(
              "use-lock-race-condition-fix."),
     cl::init(false), cl::cat(airCompilerOptions));
 
+static cl::opt<bool> mimoChainLock(
+    "mimo-chain-lock",
+    cl::desc("FALSIFIER ARM -- not a fix. Admit the MIMO (M writers + N "
+             "readers) shape into the v2 chain-lock as two chains back to "
+             "back. Measured to order the writers and STILL be unsound: a BD "
+             "has one acquire and one release, so the writer's release goes "
+             "to the chain rather than to the readers and writer i+1 "
+             "overwrites a fill nobody has read (doc 52 §8). Without it, "
+             "use-lock-race-condition-fix-v2 refuses a MIMO memtile buffer by "
+             "name instead of silently emitting the racing legacy template."),
+    cl::init(false), cl::cat(airCompilerOptions));
+
 static cl::opt<bool> coalesceShimDma(
     "coalesce-shim-dma",
     cl::desc("Coalesce consecutive contiguous shim DMA transfers on the same "
@@ -1124,6 +1136,8 @@ static LogicalResult runAieCompilation() {
        << (useLockRaceConditionFix ? "true" : "false");
     os << " use-lock-race-condition-fix-v2="
        << (useLockRaceConditionFixV2 ? "true" : "false");
+    if (mimoChainLock)
+      os << " mimo-chain-lock=true";
     if (stackSize.getNumOccurrences() > 0)
       os << " stack-size=" << stackSize.getValue();
     os << "}";
