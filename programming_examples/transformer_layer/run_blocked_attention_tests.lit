@@ -21,6 +21,18 @@
 // matched exactly so a test that stops being collected fails here instead of
 // passing quietly.
 //
+// `[2026-08-12]` 5 -> 10: the module had NO negative control, so not one of the
+// comparisons above had ever been shown able to fail. Four controls now feed
+// the SAME comparison at the SAME tolerance a difference a real defect would
+// produce -- a flipped causal mask, a wrong head split, a dropped
+// 1/sqrt(head_dim), and a genuinely different computation against the blocking
+// bound -- and assert it is REJECTED. The fifth is the anti-self-comparison
+// one: the module's docstring forbids the mode path and the oracle from
+// sharing arithmetic, and folding them together is invisible to every
+// agreement check because it makes them agree BETTER. Its tell is the margin
+// going to exactly zero, so the margin is asserted non-zero (it is ~4.8e-7,
+// from f32 reduction order) as well as under tolerance.
+//
 // Editing this header: lit scans the WHOLE file for its directives, so naming
 // one in prose -- even inside a comment -- registers as a second directive and
 // leaves the test UNRESOLVED. Describe them, never spell them out.
@@ -30,6 +42,11 @@
 // CHECK: PASS  test_agrees_with_the_independent_oracle
 // CHECK: PASS  test_blocking_does_not_change_the_arithmetic
 // CHECK: PASS  test_causal_first_row_attends_only_to_itself
+// CHECK: PASS  test_negative_control_the_blocking_comparison_rejects_a_real_difference
+// CHECK: PASS  test_negative_control_the_oracle_comparison_rejects_a_wrong_head_split
+// CHECK: PASS  test_negative_control_the_oracle_comparison_rejects_a_wrong_mask
+// CHECK: PASS  test_negative_control_the_scale_check_rejects_a_dropped_rsqrt
 // CHECK: PASS  test_query_block_size_thresholds
 // CHECK: PASS  test_scale_is_rsqrt_head_dim
-// CHECK: blocked attention tests: 5/5 passed
+// CHECK: PASS  test_the_two_implementations_are_not_the_same_arithmetic
+// CHECK: blocked attention tests: 10/10 passed

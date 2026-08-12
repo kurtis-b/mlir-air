@@ -30,5 +30,11 @@
 // count is named rather than matched loosely, so a test that stops being
 // collected fails here instead of passing quietly.
 //
+// `[2026-08-12]` 9 -> 10: the shape these checks run at was a hand-transcribed
+// copy of the gate's own SPECS row. It is read from that row now, and the new
+// test pins the two together -- a copy agrees with the catalogue until the
+// catalogue moves, and then every check here goes on passing while describing
+// a configuration nobody runs.
+//
 // RUN: python3 %S/builders/test_block_cache.py | FileCheck %s
-// CHECK: block cache tests: 9/9 passed
+// CHECK: block cache tests: 10/10 passed

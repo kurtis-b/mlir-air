@@ -61,5 +61,23 @@
 // left unread. The broker half is gated separately by
 // agents/scripts/devq-selftest.sh TEST 7.
 //
+// `[2026-08-12]` 346 -> 357, the transcription/entry-point batch. No new module.
+// +8 test_ladder_report: the module never exercised `ladder_report.load` or
+// `main` -- it hand-built the POST-load row shape, so every check in it held
+// whether or not `load` produced that shape at all. The eight run the real
+// entry points over CSVs the shipped writer wrote, and one of them pins the
+// in-memory fixture against what `load` actually attaches. Five injected
+// defects in load/main are rejected by 0 of the 11 pre-existing tests.
+// +1 test_run_ladder: `_spec()` is a hand-written stand-in for a real SPECS
+// row (deliberately not imported -- opcheck_specs needs a toolchain this
+// suite does not), now pinned to the catalogue by an ast walk of its source.
+// +1 test_profiles: `expected_files()` was compared against a TYPED list of
+// the four CSV names; it is compared against the files a stubbed
+// `run_ladder.walk` actually writes, which is what the assertion claimed.
+// +1 test_component_groups: the mode -> pattern-module map was typed, and it
+// named `pattern/coarse/cells.py` while `coarse.py` sat beside it unread --
+// undetectable, since BOTH open zero host buckets. The whole package is read
+// now, with a control asserting exactly one mode opens any.
+//
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 346/346 passed in 19 modules
+// CHECK: study host tests: 357/357 passed in 19 modules

@@ -34,13 +34,42 @@ import schema  # noqa: E402
 
 _TIME_CPU_RE = re.compile(r'time_cpu\(\s*"([a-zA-Z_0-9]+)"\s*\)')
 
-#: mode code name -> the pattern module that implements its dispatch.
-_PATTERN_SOURCES = {
-    "offload": "pattern/offload/offload.py",
-    "runlist": "pattern/runlist/runlist.py",
-    "coarse": "pattern/coarse/cells.py",
-    "fused": "pattern/fused/fused.py",
-}
+#: Where a mode's dispatch lives: ``pattern/<code name>/``. The package, not one
+#: file inside it.
+#:
+#: This used to be a typed ``{mode: "pattern/<x>/<y>.py"}`` map, and it named
+#: ``pattern/coarse/cells.py`` while ``pattern/coarse/coarse.py`` sat beside it
+#: unread. That went unnoticed because BOTH files open zero ``time_cpu``
+#: buckets, so the check could not tell a correct path from an incorrect one --
+#: an entry agreeing with production by accident. Reading the whole package
+#: removes the choice: a bucket opened anywhere in a mode's dispatch counts,
+#: wherever that mode later moves it.
+_PATTERN_ROOT = Path(_EXAMPLE) / "pattern"
+
+
+def _pattern_package(code_name):
+    """The directory holding ``code_name``'s dispatch, asserted to exist."""
+    pkg = _PATTERN_ROOT / code_name
+    assert pkg.is_dir(), (
+        f"no pattern package for mode {code_name!r} at {pkg}. The taxonomy in "
+        "component_groups.py claims a host bucket set for it, so a missing "
+        "package means that claim is about nothing."
+    )
+    return pkg
+
+
+def _dispatch_modes():
+    """Mode code names that have a pattern package -- derived, not listed.
+
+    Keyed off ``schema.EXECUTION_MODE_CSV`` so a new mode is covered the day it
+    is declared, rather than the day someone remembers to add it here.
+    """
+    found = {}
+    for code_name in schema.EXECUTION_MODE_CSV:
+        if (_PATTERN_ROOT / code_name).is_dir():
+            found[code_name] = _pattern_package(code_name)
+    assert found, "no pattern packages found; the derivation broke, not the tree"
+    return found
 
 
 def _raises(exc, match, fn, *args, **kwargs):
@@ -63,9 +92,12 @@ def _extra(**overrides):
     return extra
 
 
-def _host_buckets_in(relative_path):
-    text = (Path(_EXAMPLE) / relative_path).read_text(encoding="utf-8")
-    return set(_TIME_CPU_RE.findall(text))
+def _host_buckets_in(package):
+    """Every ``time_cpu`` bucket opened anywhere in a mode's dispatch package."""
+    found = set()
+    for path in sorted(package.glob("*.py")):
+        found |= set(_TIME_CPU_RE.findall(path.read_text(encoding="utf-8")))
+    return found
 
 
 def test_every_csv_execution_mode_has_a_taxonomy():
@@ -108,7 +140,7 @@ def test_the_host_taxonomy_matches_what_the_pattern_modules_actually_time():
     grows or loses a bucket, this fails here rather than silently dropping that
     component out of every aggregate.
     """
-    for code_name, relative_path in _PATTERN_SOURCES.items():
+    for code_name, package in sorted(_dispatch_modes().items()):
         csv_mode = schema.EXECUTION_MODE_CSV[code_name]
         declared = {
             component
@@ -116,11 +148,33 @@ def test_the_host_taxonomy_matches_what_the_pattern_modules_actually_time():
             if spec.kind == "host_cpu"
             for component in spec.components
         }
-        assert declared == _host_buckets_in(relative_path), (
-            code_name,
-            declared,
-            _host_buckets_in(relative_path),
+        derived = _host_buckets_in(package)
+        assert declared == derived, (
+            f"{code_name}: the taxonomy declares host buckets {sorted(declared)} "
+            f"but {package.name}/ opens {sorted(derived)}"
         )
+
+
+def test_the_host_bucket_derivation_can_tell_the_modes_apart():
+    """The control for the check above.
+
+    Every mode but ``offload`` has an EMPTY host bucket set, so a derivation
+    that read the wrong file -- or no file -- would agree with the taxonomy on
+    three of the four and never say so. Pin that exactly one mode is non-empty
+    and that it is the one that runs host compute, so a derivation that has
+    stopped reading anything is a failure rather than three easy passes.
+    """
+    buckets = {c: _host_buckets_in(p) for c, p in _dispatch_modes().items()}
+    non_empty = {c: b for c, b in buckets.items() if b}
+    assert set(non_empty) == {"offload"}, (
+        f"host buckets are now opened by {sorted(non_empty)}, not offload alone. "
+        "component_groups' empty host groups for the other modes need revisiting."
+    )
+    assert len(non_empty["offload"]) >= 3, (
+        f"offload opens only {sorted(non_empty['offload'])}; a derivation reading "
+        "the wrong file would also produce a short set. It runs softmax, both "
+        "LayerNorms and the GeLU on the host by definition."
+    )
 
 
 def test_offload_is_the_only_mode_with_host_components():

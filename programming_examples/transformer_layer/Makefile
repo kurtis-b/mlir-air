@@ -182,10 +182,29 @@ compile:
 	    python3 $(srcdir)/compile_kernels.py \
 	        --tile-m $(TILE_M) --tile-k $(TILE_K) --tile-n $(TILE_N)
 
+# EVERY HOST-ONLY ARM BELOW GOES THROUGH lit_pin.
+#
+# `[2026-08-12]` Each of these arms has both a `make` target and a lit, and the
+# lit pins an exact count (`blocked attention tests: 5/5 passed`) while the make
+# target ran the script bare. The pinned count is the ONLY thing that catches a
+# test which stops being DEFINED -- discovery reports a smaller suite passing --
+# so under `make` those pins asserted nothing, and a developer running `make
+# blocked-attention-tests` saw a green that meant "exited 0" and no more.
+#
+# lit_pin.py READS the pins out of the sibling .lit and asserts them, so the
+# number lives in exactly one place and `make` and `lit` cannot disagree.
+# FileCheck itself is deliberately NOT used here: it is not in build-xrt/bin or
+# install-xrt/bin and the suites reach it only through an absolute path baked
+# into lit.site.cfg.py, so requiring it would break these "No NPU required"
+# targets on any host without a second LLVM install. See lit_pin.py's docstring.
+LIT_PIN := python3 $(srcdir)/lit_pin.py
+
 # Host-only. The seam's rules are unit-testable without hardware, deliberately.
 seam-tests:
-	cd $(srcdir)/../llms && python3 shared/infra/test_bo_pool.py
-	cd $(srcdir)/../llms && python3 shared/infra/test_dispatch.py
+	cd $(srcdir)/../llms && $(LIT_PIN) --lit $(srcdir)/run_seam_tests.lit \
+	    --check-prefix POOL -- python3 shared/infra/test_bo_pool.py
+	cd $(srcdir)/../llms && $(LIT_PIN) --lit $(srcdir)/run_seam_tests.lit \
+	    --check-prefix DISPATCH -- python3 shared/infra/test_dispatch.py
 
 # NPU required. Serialize on the repository lock, which is a DIFFERENT inode from
 # the /tmp/npu.lock KernelCache takes internally -- both are BSD flock(2), so one
@@ -602,18 +621,21 @@ check-fused-fault:
 
 # Host-only: the query-blocked attention offload and runlist share. No NPU.
 blocked-attention-tests:
-	python3 $(srcdir)/pattern/test_blocked_attention.py
+	$(LIT_PIN) --lit $(srcdir)/run_blocked_attention_tests.lit -- \
+	    python3 $(srcdir)/pattern/test_blocked_attention.py
 
 # Host-only: the golden model is the layer it claims to be. No NPU, no MLIR.
 reference-tests:
-	python3 $(srcdir)/pattern/test_reference.py
+	$(LIT_PIN) --lit $(srcdir)/run_reference_tests.lit -- \
+	    python3 $(srcdir)/pattern/test_reference.py
 
 # Host-only: what check-block's ELF cache will and will not reuse. Builds the
 # four MLIR modules and stubs everything past them, so it needs no NPU and
 # writes nothing outside a temporary directory -- which is why it can run from
 # $(srcdir) rather than from $(BUILD_DIR) like the checks above.
 block-cache-tests:
-	python3 $(srcdir)/builders/test_block_cache.py
+	$(LIT_PIN) --lit $(srcdir)/run_block_cache_tests.lit -- \
+	    python3 $(srcdir)/builders/test_block_cache.py
 
 # The negative control: it succeeds only when the injected run is REJECTED BY
 # THE COMPARISON. A check that ignored --fault-inject, or one whose tolerance
@@ -655,10 +677,12 @@ registry-write:
 	python3 $(srcdir)/sweep/registry_sweep.py --family $(FAMILY) --write-registry $(SWEEP_ARGS)
 
 sweep-families-tests:
-	python3 $(srcdir)/sweep/test_sweep_families.py
+	$(LIT_PIN) --lit $(srcdir)/sweep/run_sweep_families_tests.lit -- \
+	    python3 $(srcdir)/sweep/test_sweep_families.py
 
 registry-writer-tests:
-	python3 $(srcdir)/sweep/test_registry_writer.py
+	$(LIT_PIN) --lit $(srcdir)/sweep/run_sweep_writer_tests.lit -- \
+	    python3 $(srcdir)/sweep/test_registry_writer.py
 
 clean:
 	rm -rf $(BUILD_DIR) __pycache__ runlist_gate_cache block_cache coarse_cache \
