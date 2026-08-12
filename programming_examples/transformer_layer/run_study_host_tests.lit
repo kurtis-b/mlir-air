@@ -79,5 +79,18 @@
 // undetectable, since BOTH open zero host buckets. The whole package is read
 // now, with a control asserting exactly one mode opens any.
 //
+// `[2026-08-12]` 357 -> 429 and 19 -> 21 modules, queue item 25: the balance
+// instrument (doc 47). +29 test_balance_ert: the ERT's argument requirement
+// (a `dma_transfer` priced as a scalar is REFUSED -- doc 44's named defect),
+// exact lookup on strides, the value/source pairing that stops an unpriced
+// action reading as a free one, and repeat measurements folded into a spread
+// rather than overwritten. +43 test_balance: the [step x port] demand matrix,
+// the back-solve, the slope (an over-budget column is PRICED and still present,
+// which is doc 44's correction of this project's own legality-predicate
+// proposal), the bottleneck argmax, and iron's two instrument defects (doc 38
+// §3.3) made structurally impossible. 16 injected defects across both modules
+// are rejected -- including the two that matter most: making the budget a
+// legality predicate again, and pricing a `dma_transfer` without its strides.
+//
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 357/357 passed in 19 modules
+// CHECK: study host tests: 429/429 passed in 21 modules
