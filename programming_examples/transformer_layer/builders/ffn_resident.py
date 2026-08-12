@@ -212,6 +212,38 @@ def _two_iv_map(factor0, factor1, offset=0):
     )
 
 
+def _three_iv_map(factor0, factor1, factor2, offset=0):
+    """AffineMap for ``s0*factor0 + s1*factor1 + s2*factor2 + offset``.
+
+    Exists for E1 (doc 37 §4): the w_down refill's L3 offset is affine in
+    all three of (s, c, jj) once ``c`` stops being Python-unrolled, and a
+    single affine expression in the loop IVs is what lets
+    ``air-opt-shim-dma-bds`` fold the whole feed into one wide BD.
+    """
+    return AffineMap.get(
+        0,
+        3,
+        [
+            AffineExpr.get_add(
+                AffineExpr.get_add(
+                    AffineExpr.get_add(
+                        AffineExpr.get_mul(
+                            AffineSymbolExpr.get(0), AffineConstantExpr.get(factor0)
+                        ),
+                        AffineExpr.get_mul(
+                            AffineSymbolExpr.get(1), AffineConstantExpr.get(factor1)
+                        ),
+                    ),
+                    AffineExpr.get_mul(
+                        AffineSymbolExpr.get(2), AffineConstantExpr.get(factor2)
+                    ),
+                ),
+                AffineConstantExpr.get(offset),
+            )
+        ],
+    )
+
+
 @module_builder
 def build_ffn_resident_module(
     seq_len=TILE_M,
@@ -542,22 +574,55 @@ def build_ffn_resident_module(
                 #
                 # ORDERING across the four per-c loops (the down cores'
                 # A|B interleave requires j order on every sub-channel) is
-                # carried by the SHARED staging buffers: c+1's first get
-                # writes l2_h (WAR on c's last A put), and every put reads
-                # what a chained refill wrote, so air-dependency serializes
-                # the chain c0 < c1 < c2 < c3 without a hand token. Giving
-                # each c its own staging buffer would delete exactly that
-                # serialization -- do not "parallelize" it.
+                # carried by the SHARED l2_h staging buffer: c+1's first get
+                # writes l2_h (WAR on c's last A put), so air-dependency
+                # serializes the chain c0 < c1 < c2 < c3 without a hand
+                # token. Giving each c its own staging buffer would delete
+                # exactly that serialization -- do not "parallelize" it.
+                #
+                # ---- E1 (doc 37 §4): the w_down refill lives in its OWN
+                # nest, over a REAL scf.for c ----
+                #
+                # WHY IT IS LEGAL. H5 forces a CHANNEL INDEX to be a
+                # compile-time literal. The refill below is a plain
+                # segment-scope dma_memcpy_nd and carries NO channel index
+                # -- only the ChannelGet(CHANNEL_G, ..., indices=[c, 0]) and
+                # the ChannelPut(CHANNEL_DOWN_FEED, ..., indices=[tx, 0]) in
+                # the second nest do, and those keep their Python unroll.
+                #
+                # WHY IT IS WANTED. air-dma-to-channel hoists each TEXTUAL
+                # segment-scope dma_memcpy_nd into its own launch-scope loop
+                # nest, so four textual refills became four sibling per-c
+                # nests, concatenated -- delivering w_down C-MAJOR
+                # (all four sweeps of column 0, then column 1, ...) against
+                # a sweep-major producer. One textual instance over a real
+                # `c` loop keeps the source (s, c, jj) order in ONE hoisted
+                # nest, and since 589824*s + 147456*c + 24576*jj is the
+                # identity tiling of the packed array, the whole feed then
+                # folds to a single contiguous wide BD -- measured, doc 37:
+                # 13 tasks -> 1, channel symbols 12 -> 9, no compile blow-up
+                # (the >25-minute air-isolate-async-dma-loop-nests hazard
+                # recorded above came from MORE textual instances; this
+                # moves the other way).
+                #
+                # WHAT IT GIVES UP, stated because it is the real risk. The
+                # refill no longer sits between the puts that read
+                # l2_b_down, so the per-iteration RAW/WAR chain on that
+                # buffer is gone and the pairing of refill chunk i with put
+                # group i is carried by the channel's FIFO order and the
+                # memtile ring's backpressure instead -- exactly the model
+                # w_up's already-folded feed rides (doc 37 §1.3). The l2_h
+                # chain above, which is what actually serializes c, is
+                # untouched.
+                wd_map_e1 = _three_iv_map(
+                    herd_x * chunks_per_group * down_chunk,
+                    chunks_per_group * down_chunk,
+                    down_chunk,
+                )
                 for s in range_(0, sweeps):
-                    for c in range(herd_x):
-                        wd_map = _two_iv_map(
-                            herd_x * chunks_per_group * down_chunk,
-                            down_chunk,
-                            c * chunks_per_group * down_chunk,
-                        )
+                    for c in range_(0, herd_x):
                         for jj in range_(0, chunks_per_group):
-                            ChannelGet(CHANNEL_G, l2_h, indices=[c, 0])
-                            wd_off = affine_apply(wd_map, [s, jj])
+                            wd_off = affine_apply(wd_map_e1, [s, c, jj])
                             dma_memcpy_nd(
                                 l2_b_down,
                                 s_wdown,
@@ -565,6 +630,14 @@ def build_ffn_resident_module(
                                 src_sizes=[down_chunk],
                                 src_strides=[1],
                             )
+                            yield_([])
+                        yield_([])
+                    yield_([])
+
+                for s in range_(0, sweeps):
+                    for c in range(herd_x):
+                        for jj in range_(0, chunks_per_group):
+                            ChannelGet(CHANNEL_G, l2_h, indices=[c, 0])
                             for tx in range(herd_x):
                                 ChannelPut(CHANNEL_DOWN_FEED, l2_h, indices=[tx, 0])
                                 ChannelPut(
