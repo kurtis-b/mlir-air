@@ -162,11 +162,84 @@ Shapes verified on NPU2 (heads-first harness; the seq-first variant is bit-ident
 | 2048×2048 | 128/128 | 24/8 | ✓ | 2 | 25.9 ms | 995 | 3.8e-2 | 7.0e-2 | ✅ Llama-3.2-3B prefill (head_dim=128, 24q/8kv GQA) |
 | 2048×2048 | 128/128 | 32/8 | ✓ | 2 | 35.0 ms | 983 | 3.8e-2 | 8.8e-2 | ✅ Qwen3-4B prefill (head_dim=128, 32q/8kv GQA) |
 
+Every row above is `window = 0` (full causal, or non-causal). The one **windowed** row is separated out below, because its latency column means something different — see [Sliding window](#sliding-window-banded-causal).
+
+| lq×lk | dk/dv | heads q/kv | causal | window | dv_chunks | latency | GFLOP/s | mean_rel_L1 | abs_err max | atol_required | Status |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2048×2048 | 64/64 | 32/8 | ✓ | **512** | 1 | 14.47 ms † | — † | 3.676e-2 | 8.398e-2 | 8.048e-2 | ✅ |
+| 2048×2048 | 64/64 | 32/8 | ✓ | 0 | 1 | 14.06 ms † | — † | 3.856e-2 | 8.398e-2 | 8.048e-2 | ✅ matched control, same session |
+
+† Latency from a separate `--perf-iters` run (accuracy from a clean one). **No GFLOP/s** — see [Sliding window](#sliding-window-banded-causal): a window changes no executed work, so the existing FLOP convention would misreport it. The pair is here to show the *absence* of a speedup, not to rank the two.
+
 > The **2048×2048, 32q/8kv, causal** row is the config llama-3.2-1B prefill imports (`attn_npu2_seqfirst.py`'s `build_module` → `flash_attn` ELF); its two-harness GFLOP/s range reflects run-to-run timing variation (~5%). The **2048×2048, 32q/32kv, causal** row is SmolLM2-1.7B's prefill config (pure MHA — every Q head has its own KV head, no GQA broadcast); same near-unique tiling, same `mean_rel_L1` (FA error is datapath-bound, independent of kv-head count), but ~2× the GFLOP/s because MHA does ~2× the attention FLOPs of 8-KV GQA in similar wall-time. The other rows are additional NPU2-verified shapes (head dim 64/128, MHA & GQA ratios, short & long sequences, causal & non-causal) — they record what the kernel is known to run, independent of any specific model. `head_dim = 128` shapes use `dv_chunks = 2` (heads-first only). The **2048×2048, 16q/8kv, causal, head_dim=128** row is Qwen3-0.6B's prefill attention config (lq=lk=2048, full-chip `lqp=256/num_q_tiles=4/heads_per_unroll=2/cascade=4`, `dv_chunks=2`), verified PASS at 3.8e-2. Note: long-sequence `head_dim=128` FA has been flaky (`ERT_CMD_STATE_TIMEOUT` / NaN) on some NPU2 setups; this run completed cleanly, but a deployment hitting the hang can fall back to CPU attention (`cpu_attn`). The **2048×2048, 14q/2kv, causal, head_dim=64** row is Qwen2.5-0.5B's prefill attention config (lq=lk=2048, `dv_chunks=1`); head_dim=64 has no hang risk, verified PASS at 3.8e-2. The **2048×2048, 12q/2kv, causal, head_dim=128** row is Qwen2.5-1.5B's prefill attention config (lq=lk=2048, `dv_chunks=2`); like Qwen3-0.6B's head_dim=128 it carries the long-sequence hang risk but completed cleanly this run (3.8e-2), with `cpu_attn` available as the fallback.
 
 **Reading the table**:
 - **Compute-bound**: FA is dominated by the two matmuls (Q@Kᵀ, P@V); throughput is GFLOP/s.
 - **Accuracy** `mean_rel_L1 ≈ 3.9e-2` at the reference shape — ~4× the GEMM tier from chaining two BFP16-emulated MMAs + bf16 online-softmax; set by the datapath, not the tile config.
+
+---
+
+## Sliding window (banded causal)
+
+`-DWINDOW_LEN=W` on `attn_npu2.o` turns the causal mask into a **band**: an element survives only when `q_abs − W < k_abs ≤ q_abs`. `W = 0` is the default, means "no window", and is the full-causal kernel every shipped model links.
+
+**Where it lives.** `apply_causal_mask` (`attn_npu2.cc`) is the *entire* causality implementation for every model in the repository — the heads-first and seq-first builders call it with identical arguments and link the same object — so the band is one function, and it propagates to all of them with no per-model kernel work. The absolute positions it needs were already derivable in-kernel: the builder passes **global** block indices, and `lqp` / `lkp` are compile-time `-D`s, so `q_abs = q_block_idx·lqp + row` and `k_abs = kv_block_idx·lkp + col`. Only `W` was missing.
+
+**Why it is a `-D` and not an argument.** The launch signature is `attention_bf16(q, k, v, gp)` — there is no host scalar path. So the window is baked per ELF, and a **local/global model needs two compiled attention modules, not a runtime toggle.**
+
+**Block dispatch.** With `tile_q = lkp` (which causal already asserts) and `d = q_block_idx − kv_block_idx`, `D = W/lkp`:
+
+| `d` | unwindowed | windowed |
+|---|---|---|
+| `< 0` | all `-inf` | unchanged |
+| `0` | diagonal partial (`mask_start = row+1`) | unchanged — the window always includes the diagonal |
+| `0 < d < D` | untouched early return | unchanged |
+| `d = D` | untouched early return | **new**: trailing-edge partial, the complement of the diagonal case |
+| `d > D` | untouched early return | **new**: full `-inf` fill |
+
+Every element still goes through a vector load+store cycle in the partial path — the consuming DMA requires it (see the `CAUSAL_ROW_HELPERS` FOOTGUN).
+
+**It is correctness-only: zero speedup, and slightly more work — measured, not assumed.** The KV chunk loop bound is a static compile-time constant, so a windowed run streams and multiplies every `(Q tile, KV block)` pair exactly as an unwindowed one does, and *then* masks more of the result — the `d > D` blocks turn a bare `return` into a full `-inf` fill. Matched timing pair at this config:
+
+| window | scores surviving the mask | latency | GFLOP/s (convention) |
+|---|---|---|---|
+| 512 | 21.9% | 14.47 ms | 1187 |
+| 0 | 50.0% | 14.06 ms | 1222 |
+
+The band discards **56% of the surviving scores** and the kernel got **no faster** — if anything ~3% slower, which is inside the ±5% run-to-run variation this table already records elsewhere, so the honest reading is *no change*, and emphatically not the ~2.3× a work-proportional speedup would give. **No GFLOP/s is carried into the summary row for the windowed config**: `perf_flops *= 0.5` under `causal` is already a *convention* rather than executed work, and scaling it again by the band ratio would report a speedup that does not exist. Tile *skipping* is the change that would pay, and it is out of scope: deleting the no-op `copy_O_tile_rows` hangs the design (`ERT_CMD_STATE_TIMEOUT`), and an IV-dependent KV base offset is a two-symbol affine map on an L3 operand, which the current `air-split-l2-memref` cannot build.
+
+> ⚠️ The two timing runs above come from `--perf-iters`, and **their precision output is the documented buffer-reuse artifact** — both of them report `failed.`, including the `window = 0` one, which links a byte-identical object to the pre-windowing kernel. So the artifact is a property of the timing mode, not of windowing. It does differ in flavour: under buffer reuse the windowed kernel returns NaN where the unwindowed one returns garbage, which is what more fully-masked blocks over stale buffers would do. Accuracy numbers must come from a clean run, as they do above.
+
+**`W` must be a multiple of `lkp` (= 64).** The kernel math is general, but only chunk-aligned windows have been validated on hardware, so the builder refuses the rest rather than running them. `W = 512` — the value the Gemma-3 prior art records — is aligned.
+
+**`W = 0` is bit-identical to the pre-windowing kernel, verified rather than asserted.** The banded code sits behind `#if WINDOW_LEN > 0`, so at `W = 0` the preprocessed source is byte-identical to the original (9,716,083 bytes, `cmp` clean) and the compiled object has the same `sha256` (15,508 bytes) at the canonical `lqp=64, lkp=64, dk=dv=64` shape. Neither the canonical Makefile's default nor `llms/shared/infra/external_kernels.py`'s `compile_attn_npu2()` passes `-DWINDOW_LEN`, so **every shipped model links a byte-identical object** and the ten-model regression is satisfied by construction, not by re-measurement.
+
+**Accuracy: a band did not cost headroom.** Matched pair, one session, 2048×2048 dk/dv 64/64 32q/8kv causal:
+
+| window | mean_rel_L1 | abs_err max | atol_required | margin under `atol = 1e-1` | mismatches |
+|---|---|---|---|---|---|
+| 512 | 3.676e-2 | 8.398e-2 | 8.048e-2 | 1.24× | 0 / 4194304 |
+| 0 | 3.856e-2 | 8.398e-2 | 8.048e-2 | 1.24× | 0 / 4194304 |
+
+`atol_required` and `abs_err max` are **identical**, and the windowed `mean_rel_L1` is marginally *lower*. The expectation had been the opposite — that a band concentrates the softmax harder, produces more fully-masked blocks, and lands closer to the hard `1e-1` ceiling. The reason it does not is structural: the worst-magnitude outputs are in the **first `W` rows**, and for `q_abs < W` a band and full causal are the *same mask*. A window can only remove contributions in the region where `|y|` is already small, so it cannot move the worst case.
+
+**Its gate has a negative control, and it is not optional.** Full causal is a strict *superset* of a window, so an implementation that silently ignored `W` still produces plausible output — and since the band is a `-D` on one object, an object built without it links and runs perfectly happily. `run_npu2_makefile_peano_causal_window512_negative.lit` rebuilds the same shape with the band switched off in the kernel only (`EXTRA_KERNEL_FLAGS="-DWINDOW_LEN=0"`, which wins because the last `-D` wins) and requires the banded reference to reject it. Measured: rejected on **197331 / 4194304 elements (4.70%)**, `mean_rel_L1 = 4.56e-1`, `atol_required = 5.34e-1` — **5.3× over** the ceiling. The inversion lives in the driver (`--expect-failure`), not in the recipe's exit status, so a missing toolchain or an absent NPU cannot masquerade as a passing control.
+
+### Reproduce
+
+```bash
+cd programming_examples/flash_attention/kernel_fusion_based
+
+# windowed (W must be a multiple of LKP; WINDOW feeds BOTH -DWINDOW_LEN and --window)
+make run LK=2048 LQ=2048 LKP=64 LQP=256 DK=64 DV=64 NUM_HEADS=32 NUM_KV_HEADS=8 \
+  WINDOW=512 EXTRA_PY_FLAGS="--causal" PEANO_INSTALL_DIR=$PEANO_INSTALL_DIR
+
+# the negative control -- band the REFERENCE, unwindow the KERNEL; must report
+# NEGATIVE CONTROL: PASS, i.e. the banded oracle rejected the unwindowed kernel
+make run LK=2048 LQ=2048 LKP=64 LQP=256 DK=64 DV=64 NUM_HEADS=32 NUM_KV_HEADS=8 \
+  WINDOW=512 EXTRA_KERNEL_FLAGS="-DWINDOW_LEN=0" \
+  EXTRA_PY_FLAGS="--causal --expect-failure" PEANO_INSTALL_DIR=$PEANO_INSTALL_DIR
+```
 
 ---
 
