@@ -281,14 +281,24 @@ LINEAR operators on the NPU, all NON-LINEAR on the host), `fused` eliminates DRA
 operators, and `coarse` blends `runlist` and `fused`.
 ### The work queue
 
-`[2026-08-12]` **Evening session: 23, 24, 25 and 26 all closed, and the open rows are now 12 and 21.**
-Four ran in parallel. **24** held at 8/8 vs 0/8 and left behind the rule that `aie.air.mlir` is not
-byte-reproducible, so no inertness question is settled by an IR dump. **25** built the balance
-instrument, seeded 1,208 measured / 5 counted / **0 modelled**. **26** measured the mapping space and
-**falsified its own row's hypothesis** — the space does not collapse, and 59% of what is legal is
-*priced* rather than refused. **23** turned out not to be an R1 wall at all but a general `air-to-aie`
-lock-placement defect, now fixed and confirmed on hardware 21/21. The struck rows below are kept
-because their evidence chains are cited elsewhere; read the bold verdict, not the whole cell. The
+`[2026-08-12]` **Evening session: 21, 23, 24, 25, 26 and 27 all closed or located, Phase G's G1 landed,
+and the open rows are now 12 and the new 28.** Work ran in parallel across the queue.
+**24** held at 8/8 vs 0/8 and left behind the rule that `aie.air.mlir` is not byte-reproducible, so
+no inertness question is settled by an IR dump. **25** built the balance instrument, seeded 1,208
+measured / 5 counted / **0 modelled**. **26** measured the mapping space and **falsified its own row's
+hypothesis** — the space does not collapse, and 59% of what is legal is *priced* rather than refused.
+**27** re-demonstrated the blind-check lists and retracted one claim inside their own fix.
+
+**The two that matter most are 23 and 21, and together they retire this study's longest-standing
+misattribution.** Neither was a wall in the residency composition. **23** was a general `air-to-aie`
+lock-*placement* defect — fixed, gated at every altitude, and R1 now passes the **whole `herd_x=1`
+ladder 21/21**. **21** is a memtile buffer with `herd_x` writers and **no ordering**, whose hazards
+are *vacuous* at `herd_x=1` — mechanism proven on hardware by a single-variable A/B (5/35 → 35/35).
+So six walls were charged to the composition, and the last two were general compiler defects that R1
+was merely the first design to reach.
+
+The struck rows below are kept because their evidence chains are cited elsewhere; read the bold
+verdict, not the whole cell. The
 struck rows are kept because their evidence chains are cited elsewhere; read the bold verdict, not
 the whole cell.
 
