@@ -153,31 +153,62 @@ UNREACHABLE_FAMILIES: dict[str, str] = {
     ),
 }
 
+#: Which METHOD each projection role's owning consumer pins, keyed by the
+#: ``(K multiple, N multiple)`` of the family's hidden size. Full TRIPLE coverage
+#: is not full METHOD coverage, and this is the table that says which of the two
+#: a walk actually needs.
+#:
+#: The value is ``(method, the module that pins it)``. Both pins are real and
+#: neither is a preference:
+#:
+#:   - ``qkv_proj`` resolves ``(seq, h, 3h)`` with ``method=SCRATCH_METHOD`` and
+#:     raises if it is absent -- its three-way C split rides fused-cast's
+#:     separate cast launch, so no other method substitutes.
+#:   - ``offload``'s shared-xclbin chain re-resolves any ``fused-cast`` winner to
+#:     ``drain`` (``_chain_spec``), because a two-launch module faults the
+#:     firmware's in-stream ``load_pdi``. That pin applies to the three shapes
+#:     its chain resolves -- ``proj`` ``(seq, h, h)``, ``up`` ``(seq, h, 4h)``
+#:     and ``down`` ``(seq, 4h, h)`` -- and to no others.
+#:
+#: ``test_profiles.py`` re-derives both pins from those two modules by ``ast``
+#: and checks this table against them, then checks the registry against this
+#: table for every reachable family at every ladder point. Three sources, so a
+#: pin that moves fails a test rather than making this comment a lie.
+PINNED_PROJECTION_METHODS: dict[tuple[int, int], tuple[str, str]] = {
+    (1, 3): ("fused-cast", "builders/qkv_proj.py::SCRATCH_METHOD"),
+    (1, 1): ("drain", "pattern/offload/offload.py::_chain_spec"),
+    (1, 4): ("drain", "pattern/offload/offload.py::_chain_spec"),
+    (4, 1): ("drain", "pattern/offload/offload.py::_chain_spec"),
+}
+
 #: Known holes in the registry that make a REACHABLE family's rung fail. Not
 #: skips: a skip is a claim about what a MODE supports, and this is a missing
 #: measurement -- so the rung is run and its refusal is the result, which is
 #: `cases.py`'s rule that "pre-declaring a failure is how a matrix stops being a
-#: measurement". Recorded here so an operator reading an incomplete
-#: `baseline_1024` walk finds the cause in one line instead of in a traceback.
+#: measurement". Recorded here so an operator reading an incomplete walk finds
+#: the cause in one line instead of in a traceback.
 #:
-#: ``test_profiles.py`` asserts each entry is STILL TRUE against the registry
-#: JSON, so sweeping the missing method makes this list fail rather than quietly
-#: keep warning about a hole somebody closed.
-KNOWN_REGISTRY_GAPS: tuple[dict, ...] = (
-    {
-        "family": "baseline_1024",
-        "modes": ("offload", "runlist"),
-        "seq": 2048,
-        "triple": (2048, 1024, 3072),
-        "method": "drain",
-        "why": (
-            "offload and runlist re-resolve the qkv projection through the "
-            "`drain` method, and 2048x1024x3072 is the one triple in the "
-            "baseline_1024 sweep with no drain row. coarse and fused are "
-            "unaffected: qkv_proj pins `fused-cast`, which is present"
-        ),
-    },
-)
+#: `[2026-08-12]` EMPTY, AND THE ONE ENTRY IT HELD WAS NEVER A GAP. G1 recorded
+#: ``2048x1024x3072`` / ``drain`` against ``offload`` and ``runlist``, and the
+#: registry fact was true -- that triple has ``direct`` and ``fused-cast`` and no
+#: ``drain`` row. The CONSEQUENCE was false. Neither mode resolves a ``3h`` shape
+#: at all: ``offload``'s chain is ``proj`` ``(seq, h, h)``, ``up``
+#: ``(seq, h, 4h)`` and ``down`` ``(seq, 4h, h)``, and ``runlist``'s is the same
+#: three. The only consumer of ``(seq, h, 3h)`` is ``qkv_proj``, which pins
+#: ``fused-cast`` -- present. So nothing anywhere asks for ``drain`` at that
+#: triple, and ``baseline_1024`` was 36/36 the whole time rather than 35/36.
+#:
+#: The mis-recording is the same failure the module docstring above records, one
+#: level in: G1 corrected M5 by reading the REGISTRY instead of
+#: ``opcheck_specs.py``, and then modelled ``offload``'s drain pin against the
+#: qkv shape, which ``offload`` never resolves. A re-derivation is only as good
+#: as its choice of source, and that applies to the fix as well as to the bug.
+#:
+#: So the test no longer only asks "is this method still missing". A missing
+#: method is not a gap unless something DEMANDS it, and the demand is
+#: ``PINNED_PROJECTION_METHODS`` above. An entry that names a (triple, method)
+#: nothing pins now fails -- which is what the deleted entry would do.
+KNOWN_REGISTRY_GAPS: tuple[dict, ...] = ()
 
 #: ``fused``'s packing cap, from ``builders/norm_tail.py``: plane-major staging
 #: needs a plane stride of ``rows*cols``, and the shim ``aie.dma_bd`` field caps

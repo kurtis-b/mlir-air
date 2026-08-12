@@ -710,7 +710,10 @@ Full account in [50](50-coverage-sweep-costing.md). In brief:
   of hidden 512, 768, 1024 — landed 2026-08-07, 69 → 103 → 136 rows. Verified twice: by triple, and
   by **resolution through the owning builder** (which is the stronger check, since `qkv_proj` pins
   `fused-cast` and `offload`/`runlist` re-resolve through `drain`). 36/36 at 512 and 768,
-  **35/36 at 1024** — `2048x1024x3072` has no `drain` row, so two modes fail at one ladder point.
+  ~~**35/36 at 1024** — `2048x1024x3072` has no `drain` row, so two modes fail at one ladder point.~~
+  **`[2026-08-12]` 36/36 at 1024 too — see the correction below and [50](50-coverage-sweep-costing.md)
+  §7.** The probe applied `offload`'s `drain` re-resolution to the **qkv** shape; `offload` resolves
+  `(seq, h, h)`, `(seq, h, 4h)` and `(seq, 4h, h)` and never a `3h` shape.
 - The blocker was `run_mode._shape_for` overriding `seq_len` and not the width. It is a parameter now.
   **Three families are reachable**; the three decoders are **refused by name**.
 - `tinybert_512` end to end: devq **304**, `measure`, Turbo, cold, **301 s**, 4/4 passed, ten clean
@@ -724,9 +727,24 @@ Full account in [50](50-coverage-sweep-costing.md). In brief:
   perfect and asserted something still true; the *inference* from it was false. It now reads the
   registry, asserts the converse, and asserts each declared method gap is still open.
 
-`profiles.KNOWN_REGISTRY_GAPS` records the `drain` hole as a **failure to be run**, not a skip —
+~~`profiles.KNOWN_REGISTRY_GAPS` records the `drain` hole as a **failure to be run**, not a skip —
 `cases.py`'s rule that pre-declaring a failure is how a matrix stops being a measurement — and a test
-asserts it is still a gap, so sweeping it makes the warning fail rather than linger.
+asserts it is still a gap, so sweeping it makes the warning fail rather than linger.~~
+
+> **`[2026-08-12]` CORRECTED — THE HOLE WAS NOT A GAP, AND THE TEST COULD NOT HAVE SAID SO.**
+> Full account in [50](50-coverage-sweep-costing.md) §7. `2048x1024x3072` really has no `drain`
+> row, and the consequence drawn from it was false: **`offload` and `runlist` never resolve a `3h`
+> shape**. Both chains are `(seq, h, h)`, `(seq, h, 4h)`, `(seq, 4h, h)`; the only consumer of
+> `(seq, h, 3h)` is `qkv_proj`, which pins `fused-cast`, which is present. `baseline_1024` was
+> **36/36, not 35/36**, and it is now walked (devq **307**). The guarding test asserted only "the
+> method is still missing" — true of every method nobody asks for — so it would have passed forever.
+> It now also requires a declared gap to name a `(triple, method)` some consumer **pins**, and the
+> deleted entry is its negative control. `KNOWN_REGISTRY_GAPS` is empty.
+>
+> The shape of the error is this section's own lesson applied one level in: G1 corrected M5 by
+> reading the **registry** instead of `opcheck_specs.py`, then modelled `offload`'s `drain` pin
+> against the qkv shape `offload` never resolves. *A re-derivation is only as good as its choice of
+> source* — and that applies to the fix as much as to the bug.
 
 ## The negative controls
 
