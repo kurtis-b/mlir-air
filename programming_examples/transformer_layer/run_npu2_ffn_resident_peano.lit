@@ -66,6 +66,30 @@
 // marker leaves the grouping intact and the module still times out
 // (devq 236). Wall 5 is a scheduling item, not a BD item; it is queue
 // item 6c. Delete the UNSUPPORTED line -- and nothing else -- to re-arm.
+//
+// `[2026-08-12]` WALL 6 IS FIXED and the recipe is RE-PARKED on a SEVENTH
+// wall. Wall 6 was a compiler defect in the legacy counted memtile lock:
+// air::getLockValuePair sized the lock from the number of static reader OPS,
+// which for l2_b_down was 16 (4 sub-channels x the 4-way Python unroll of the
+// `c` loop) against 1 writer op. The producer therefore did
+// AcquireGreaterEqual 16 / Release 16 against four consumers returning 1 each
+// -- 16*W <= 16 + 384, so at most 25 of the 96 w_down refills could ever
+// complete. FIXED: reader ops that share a channel endpoint AND an access
+// region are ONE emitted BD re-executed on a later fill, so they now collapse
+// (regression lit memtile_lock_count_per_fill.mlir, verified failing pre-fix;
+// check-air-mlir 495/0). MEASURED on the fixed compiler: l2_b_down's pair is
+// 4/4 against four consumers at 1, and a whole-module audit shows EVERY lock
+// on both memtiles and all eight core tiles now conserving.
+//
+// The gate was then RE-ARMED AND RUN. The STRUCT arm PASSES against the fixed
+// compiler, matching all four pinned literals below. The numeric arm STILL
+// TIMES OUT -- ERT_CMD_STATE_TIMEOUT, txn_op_idx 0xFFFFFFFF, ctx_pc
+// 0x28B060AD, fatal_error_type 0x0 -- so the lock-conservation bound was real
+// and necessary but NOT sufficient. What the remaining wall is has NOT been
+// established; it is NOT a lock-count defect of this class, because the audit
+// above finds none left. The negative-control arm is INCONCLUSIVE rather than
+// passing: it times out before it can compare, so it never exercises the
+// rejection it exists to prove. Delete the UNSUPPORTED line to re-arm.
 // UNSUPPORTED: true
 //
 // REQUIRES: ryzen_ai_npu2, peano
