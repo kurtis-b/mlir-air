@@ -5,8 +5,12 @@
 # H is the first phase in this plan to change mlir/ -- the AIR compiler itself. Every example and
 # all ten shipped LLM deployments compile through it, so this gate is the widest in the plan.
 #
-# FIVE LEGS, in increasing cost, so a cheap failure stops before an expensive one:
+# FIVE LEGS, in increasing cost, so a cheap failure stops before an expensive one -- behind a
+# free leg 0 that checks the one MEASUREMENT CONDITION legs 3 and 4 both depend on:
 #
+#   0. the NPU power mode is Turbo. `[2026-08-06]`->`[2026-08-12]` NEW -- see pl_require_turbo below.
+#      Milliseconds, and it refuses rather than warning, because at `Default` this host measures
+#      ~15-20x slow and both latency-asserting legs fail looking like a compiler regression.
 #   1. build + INSTALL. The install is not optional and it is the easy thing to get wrong: the
 #      examples run against install-xrt (utils/env_setup.sh and lib-env.sh both point there), so a
 #      pass edited and merely *built* leaves every downstream leg testing the OLD aircc and the
@@ -45,7 +49,52 @@ MODELS=(
 THROUGHPUT_MODELS=(llama32_1b llama32_1b_int4)
 THROUGHPUT_BASELINE="${HERE}/throughput-baseline.json"
 EXTRACT_PERF="${ROOT}/programming_examples/llms/bench/extract_perf.py"
+PMODE_GUARD="${HERE}/pmode_guard.py"
 
+# ------------------------------------------------------------------------------------------------
+# THE POWER MODE IS A PRECONDITION OF THIS GATE, NOT A DETAIL OF LEG 4.
+#
+# `[2026-08-12]` The xrt-smi pmode is non-persistent -- every reboot and every amdxdna reload puts
+# it back to `Default` -- and at `Default` this host measures ~15-20x slow (the study's verdict rung
+# reads ~2.5-2.7 s against 156 ms at Turbo; README trap 0, doc 32). Two legs here assert on that
+# axis: leg 4 directly, against a recorded tok/s floor, and leg 3 indirectly, because the
+# transformer-layer suite contains run_npu2_runlist_gate.lit and its latency clause.
+#
+# So at `Default` this gate fails, and it fails LOOKING LIKE A COMPILER REGRESSION -- which reaches
+# the one place in the harness that halts an unattended run and hands whoever reads the halt a wrong
+# diagnosis. That is worth refusing over. It cost a day of measurement once already, diagnosed as a
+# "machine anomaly" until the boot history gave it away.
+#
+# CHECKED TWICE, AND THE SECOND ONE IS NOT REDUNDANT. Up front because the check is free and legs 1-3
+# are an hour, which is this file's own cheapest-first principle; again at leg 4 because the mode can
+# reset UNDER a running gate (a driver reload during leg 1's install is enough) and an hour is a long
+# window. study/run_ladder.py re-takes the same check per rung for exactly this reason.
+#
+# The detection is sweep/registry_sweep.py's require_turbo, imported rather than re-derived -- the
+# same implementation run_mode.py and component_groups.py already fail closed on. Do not add a second
+# parser here, for the same reason the leg 4 header gives about extract_perf.py.
+# ------------------------------------------------------------------------------------------------
+pl_require_turbo() {
+  local where="$1"
+  shift
+  if [ ! -f "${PMODE_GUARD}" ]; then
+    echo "H GATE: FAIL -- ${PMODE_GUARD} is missing; this is a harness bug, not a task"
+    echo "  A latency gate that cannot check its own precondition must not run."
+    return 1
+  fi
+  python3 "${PMODE_GUARD}" require --where "${where}" "$@"
+}
+
+echo "== H gate leg 0: the NPU power mode, before an hour of build =="
+if ! pl_require_turbo "gate-h, before leg 1"; then
+  echo "H GATE: FAIL -- refused on the power mode, having measured nothing."
+  echo "  This is NOT a compiler regression. Legs 3 and 4 both assert on latency and both would"
+  echo "  fail on this alone. Setting the mode needs the operator; it does not persist across a"
+  echo "  reboot or an amdxdna reload, so it has to be re-set and re-verified per session."
+  exit 1
+fi
+
+echo
 echo "== H gate leg 1: rebuild AND INSTALL the compiler =="
 echo "   (the examples resolve aircc/air-opt from install-xrt; a build without an install would"
 echo "    leave every later leg testing the previous compiler)"
@@ -209,6 +258,23 @@ if [ ${#tp_seeded[@]} -eq 0 ]; then
   exit 1
 fi
 echo "  gating ${#tp_seeded[@]} of ${#THROUGHPUT_MODELS[@]} declared model(s): ${tp_seeded[*]}"
+
+# Re-taken here, after legs 1-3, because the mode can reset under a running gate -- and now also
+# conditioned against the FLOOR's own recorded mode. A floor measured at one pmode and compared at
+# another is not a comparison at all, the same argument the run_params above already make for
+# n_tokens and prompt: tok/s depends on the power mode far more strongly than on either of those.
+#
+# Entries seeded before `[2026-08-12]` carry no mode and are flagged, not refused -- the field did
+# not exist when they were recorded, and refusing would leave a gate that cannot pass until someone
+# re-seeds, which is the precise pressure the driver-owned floor file exists to remove.
+tp_pmode_models=()
+for m in "${tp_seeded[@]}"; do tp_pmode_models+=(--model "${m}"); done
+if ! pl_require_turbo "gate-h leg 4" --baseline "${THROUGHPUT_BASELINE}" "${tp_pmode_models[@]}"; then
+  echo "H GATE: FAIL -- refused on the power mode before measuring throughput."
+  echo "  This is NOT a throughput regression and NOT a compiler defect: the measurement's"
+  echo "  precondition does not hold, so no verdict was taken. Do not re-seed the floor to clear it."
+  exit 1
+fi
 
 for m in "${tp_seeded[@]}"; do
   d="${ROOT}/programming_examples/llms/${m}"

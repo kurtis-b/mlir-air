@@ -191,6 +191,20 @@ exactly two places: `study/run_mode.py:397` and `study/component_groups.py:357`.
 At `Default` both fail spuriously. An unattended runner halts, and the halt looks like a compiler
 regression. *Effort: ~1–2 h. This is the item to do first regardless of whether Phase G is taken.*
 
+> **`[2026-08-12]` DONE — queue item 13 is closed.** `agents/scripts/port-loop/pmode_guard.py`
+> imports `require_turbo` rather than re-deriving it; `gate-h.sh` gains a **leg 0** that refuses
+> before the build (and re-checks at leg 4, because a driver reload during legs 1–3 resets the mode
+> under the running gate) and **leg 3 was exposed too** — the transformer-layer suite contains the
+> runlist gate. `runlist_gate.py` refuses with exit 2 before compiling and prints a banner
+> `run_npu2_runlist_gate.lit` now matches, so deleting the guard turns the lit red. The floor file
+> carries `npu_power_mode`, the seed script refuses to seed off Turbo and stamps the observed mode,
+> and leg 4 refuses a floor/run mismatch. **No number moved and no tolerance widened** — the "no
+> margin" half of this finding was already answered on 2026-08-10 by comparing minimums (queue item
+> 5), so the clause needed a guard, not a margin. Both directions shown with a stub `xrt-smi` on
+> PATH; `pmode_guard.py selftest` is 11/11 in both directions. The shipped floor's own pmode is
+> **unrecoverable as an observation** and is recorded `unknown` — flagged, not refused. **M4 below
+> is NOT closed by this**: the manifest and schema still record no measurement condition.
+
 **M2. No suite profile, and therefore no derivable expected counts.** `cases.py` declares the
 matrix (6 families × 9 ladder points = 54 cases) but nothing consumes it except `select_rows.py`.
 There is no `profiles.py`, no `build_job_plan` equivalent, and `manifest.py`'s `--expect` list is

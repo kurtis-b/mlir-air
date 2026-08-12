@@ -7,6 +7,11 @@
 # fingerprints and which no phase's allowlist covers, so any change to either during a phase halts
 # it. That is the point: leg 4's floor must not be movable by the thing being gated.
 #
+# `[2026-08-12]` IT REFUSES TO SEED OFF TURBO, and records the mode it did seed at. The pmode is
+# non-persistent and resets to `Default` on every reboot and every amdxdna reload, and at `Default`
+# this host measures ~15-20x slow -- so a floor seeded without checking is an unconditioned number
+# that looks like a conditioned one, and gate-h leg 4 would then pass anything. See pmode_guard.py.
+#
 # WHEN TO RE-SEED. Only when the measurement is legitimately supposed to change and you can say why
 # in a sentence -- a deliberate performance change that lands, or new hardware. Re-seeding because
 # the gate failed is exactly the move this arrangement exists to prevent; a failing leg 4 is a
@@ -90,6 +95,24 @@ if [ ! -f "${EXTRACT_PERF}" ]; then
   exit 1
 fi
 
+# `[2026-08-12]` THE POWER MODE IS PART OF WHAT A FLOOR MEANS, so it is checked before the
+# measurement and recorded with it. A floor seeded at `Default` is ~15-20x below the same build's
+# Turbo number on this host (README trap 0), and gate-h leg 4 would then pass anything -- an
+# unconditioned floor is worse than no floor, because it looks like one. Refusing here is the
+# cheaper half of the fix; stamping npu_power_mode into each entry is the half that makes the
+# comparison checkable afterwards.
+PMODE_GUARD="${HERE}/pmode_guard.py"
+if [ ! -f "${PMODE_GUARD}" ]; then
+  echo "seed: ${PMODE_GUARD} is missing; refusing to record a floor whose power mode is unknown" >&2
+  exit 1
+fi
+if ! python3 "${PMODE_GUARD}" require --where "seeding the throughput floor"; then
+  echo "seed: refusing to record a floor measured off Turbo. This is the operator's action and it" >&2
+  echo "  does not persist across a reboot or an amdxdna reload." >&2
+  exit 1
+fi
+SEED_PMODE="$(python3 "${PMODE_GUARD}" observe)"
+
 workdir="$(mktemp -d)"
 trap 'rm -rf "${workdir}"' EXIT
 
@@ -129,7 +152,7 @@ done
 
 PL_SEED_DIR="${workdir}" PL_SEED_OUT="${OUT}" PL_SEED_MODELS="${MODELS[*]}" \
 PL_SEED_NTOK="${N_TOKENS}" PL_SEED_PROMPT="${PROMPT}" PL_SEED_FRAC="${FLOOR_FRACTION}" \
-PL_SEED_SHA="$(git -C "${ROOT}" rev-parse --short HEAD)" \
+PL_SEED_SHA="$(git -C "${ROOT}" rev-parse --short HEAD)" PL_SEED_PMODE="${SEED_PMODE}" \
 python3 -c '
 import datetime, json, os
 
@@ -170,6 +193,11 @@ for m in os.environ["PL_SEED_MODELS"].split():
         "context_len": d["metrics"]["context_len"],
         "recorded_utc": now,
         "recorded_at_sha": os.environ["PL_SEED_SHA"],
+        # The measurement condition, observed rather than assumed. The guard above
+        # already refused anything but turbo; this records WHICH turbo run it was, so
+        # gate-h leg 4 can refuse a comparison across a pmode change instead of taking
+        # a verdict from one.
+        "npu_power_mode": os.environ["PL_SEED_PMODE"],
     }
 
 out["_comment"] = (
@@ -177,8 +205,16 @@ out["_comment"] = (
     "phase allowlist, so a session cannot move it. Re-seed with "
     "agents/scripts/port-loop/seed-throughput-baseline.sh, and only when the measurement is "
     "legitimately supposed to change -- never because the gate failed. Each model carries the SHA "
-    "it was measured at: a floor recorded after a change cannot gate that change."
+    "it was measured at: a floor recorded after a change cannot gate that change, and the "
+    "npu_power_mode it was measured at, because tok/s on this host differs ~15-20x across "
+    "Turbo/Default and a floor compared across that boundary is not a comparison."
 )
+# The note explaining the pre-2026-08-12 `unknown` entries is only true while one exists. Drop it
+# once every entry carries an observed mode, so the file cannot end up documenting a state it is no
+# longer in -- a stale caveat is read as a live one.
+if all(e.get("npu_power_mode", "unknown") != "unknown" for e in models.values()):
+    out.pop("_comment_npu_power_mode", None)
+
 out["run_params"] = {"n_tokens": n_tokens, "prompt": prompt}
 out["floor_fraction"] = frac
 out["last_seeded_utc"] = now
