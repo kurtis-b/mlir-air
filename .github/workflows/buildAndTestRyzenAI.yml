@@ -151,6 +151,33 @@ jobs:
           # concurrent NPU inference causing out-of-memory crashes.
           ninja check-programming-examples-peano || ninja check-programming-examples-peano
 
+          # Transformer-layer execution-study PR gate: the 10 tests that
+          # dispatch nothing (Peano objects plus a symbol check, and nine
+          # host-only checks). The full 32-test suite is NOT run here -- 22 of
+          # those REQUIRE ryzen_ai_npu2, and on a runner without one they all
+          # report UNSUPPORTED while lit still exits 0.
+          #
+          # THE COUNT IS ASSERTED, and that is the whole point of the step. A
+          # lit suite that selects nothing, or that reports every test
+          # unsupported, exits 0 -- so "the gate was green" is not evidence
+          # that it ran. Same shape as lib-guard.sh's pl_assert_gate_ran_hardware:
+          # Passed must reach the expected count AND be the only category.
+          ninja check-programming-examples-transformer-layer-host 2>&1 | tee tl-host.log
+          if ! grep -qE "^Total Discovered Tests: 10$" tl-host.log; then
+            echo "::error::transformer-layer PR gate selected the wrong number of tests"
+            grep -E "^Total Discovered Tests:" tl-host.log || echo "  (no summary at all)"
+            exit 1
+          fi
+          if ! grep -qE "^  Passed *: *10 " tl-host.log; then
+            echo "::error::transformer-layer PR gate: fewer than 10 tests passed"
+            exit 1
+          fi
+          if grep -qE "^  (Unsupported|Failed|Unresolved|Timed Out|Unexpectedly Passed) *:" tl-host.log; then
+            echo "::error::transformer-layer PR gate: Passed must be the only nonzero category"
+            exit 1
+          fi
+          rm -f tl-host.log
+
           # LLM compile/verify are intentionally NOT run here. They are covered
           # end to end (compile + verify + perf, all models) by the dedicated
           # nightly benchmark (nightlyPerfBenchmark.yml) on the Krackan runner,

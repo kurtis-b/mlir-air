@@ -17,11 +17,14 @@ pinned here rather than left to review.
 
 import os
 import sys
+import tempfile
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import results_io  # noqa: E402
+import run_ladder  # noqa: E402
 import run_mode  # noqa: E402
 
 
@@ -80,6 +83,98 @@ def test_key_falls_back_when_the_shape_names_hidden_size():
     }
     _, key = run_mode._shape_for(spec, 1024)
     assert key == "1024x768_encoder_bert"
+
+
+def _fake_rung(seen):
+    """Stands in for the one function that dispatches, so no device is needed."""
+
+    def fake(mode, seq, study_id, warmup, samples, rps, scratch):
+        seen.append((mode, seq))
+        row = run_ladder.schema.empty_row("results")
+        row["execution_mode"] = run_ladder.schema.EXECUTION_MODE_CSV[mode]
+        row["study_id"] = study_id
+        row["seq_len"] = seq
+        row["study_case_label"] = f"{mode} {seq}"
+        row["run_status"] = "passed"
+        row["failure_message"] = ""
+        return row
+
+    return fake
+
+
+def _walk_with_stub(seen, **kwargs):
+    original, run_ladder._rung = run_ladder._rung, _fake_rung(seen)
+    try:
+        return run_ladder.walk(**kwargs)
+    finally:
+        run_ladder._rung = original
+
+
+def test_a_skipped_rung_is_written_and_never_run():
+    """The skipped rung must not reach `_rung` -- the only thing that dispatches.
+
+    Asserted on the CALL LIST rather than only on the row, because a runner that
+    ran the rung and then relabelled the row would produce identical output and
+    cost the whole compile.
+    """
+    seen = []
+    with tempfile.TemporaryDirectory() as d:
+        rows = _walk_with_stub(
+            seen,
+            modes=["fused"],
+            seqs=[512, 2048],
+            out_dir=d,
+            study_id="test",
+            warmup=0,
+            samples=1,
+            runs_per_sample=1,
+            skip_reason=lambda m, s: "out of range" if s > 1024 else None,
+        )
+        assert [r["run_status"] for r in rows] == ["passed", "skipped"]
+        back = results_io.read_rows(os.path.join(d, "fused.csv"))
+        assert [r["run_status"] for r in back] == ["passed", "skipped"]
+        assert back[1]["failure_message"] == "skipped: out of range"
+        assert [r["seq_len"] for r in back] == ["512", "2048"]
+    assert seen == [("fused", 512)], "the 2048 rung must not have been dispatched"
+
+
+def test_a_skipped_rung_is_not_a_failed_run():
+    """`main`'s exit code: skipped rungs are not regressions."""
+    seen = []
+    with tempfile.TemporaryDirectory() as d:
+        rows = _walk_with_stub(
+            seen,
+            modes=["fused"],
+            seqs=[2048],
+            out_dir=d,
+            study_id="test",
+            warmup=0,
+            samples=1,
+            runs_per_sample=1,
+            skip_reason=lambda m, s: "out of range",
+        )
+    passed = [r for r in rows if r["run_status"] == "passed"]
+    skipped = [r for r in rows if r["run_status"] == "skipped"]
+    assert len(passed) + len(skipped) == len(rows) and not passed
+    assert seen == []
+
+
+def test_no_skip_callback_is_the_existing_behaviour():
+    """Every existing caller passes nothing and must be unaffected."""
+    seen = []
+    with tempfile.TemporaryDirectory() as d:
+        rows = _walk_with_stub(
+            seen,
+            modes=["coarse"],
+            seqs=[512, 1024],
+            out_dir=d,
+            study_id="test",
+            warmup=0,
+            samples=1,
+            runs_per_sample=1,
+        )
+    assert seen == [("coarse", 512), ("coarse", 1024)]
+    assert [r["run_status"] for r in rows] == ["passed", "passed"]
 
 
 def main():

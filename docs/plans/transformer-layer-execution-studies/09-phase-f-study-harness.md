@@ -526,7 +526,11 @@ serves *measurement* tests, and the suite today is host logic only, so nothing n
 **When it is ported, port its unbracketed-node-ID fix with it.**
 
 The wrapper pins the test and module counts exactly (~~`61/61 passed in 6 modules`~~
-~~`103/103 passed in 10 modules`~~ **`[2026-08-11]` `231/231 passed in 17 modules`**). Discovery by
+~~`103/103 passed in 10 modules`~~ ~~`[2026-08-11]` `231/231 passed in 17 modules`~~
+**`[2026-08-12]` `265/265 passed in 19 modules`**, moved by G0's `test_profiles.py` (15) and
+`test_run_profile.py` (9) plus the manifest row-count (7) and ladder-skip (3) additions;
+re-verified in the shrinking direction at the new value (a doctored `264/264` fails the `CHECK`
+with "expected string not found in input")). Discovery by
 glob satisfies convention rule 11, but glob alone cannot notice a test that stops being *defined* —
 a deleted test function leaves a smaller suite passing. Verified in all three directions: matches
 as-is, a shrunken 60/60 suite fails the `CHECK`, an injected failure exits nonzero.

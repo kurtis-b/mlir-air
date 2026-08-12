@@ -19,10 +19,38 @@ one.
 make compile                 # build every object and check its symbols (no NPU)
 make seam-tests              # BO pooling + runlist aggregation rules (no NPU)
 
+ninja -C build-xrt check-programming-examples-transformer-layer-host   # the 10 PR-safe tests
+
 flock -x -w 1800 /tmp/mlir-air-npu.lock make runlist-gate   # NEEDS AN NPU
 flock -x -w 1800 /tmp/mlir-air-npu.lock \
-  ninja -C build-xrt check-programming-examples-transformer-layer   # all three, NEEDS AN NPU
+  ninja -C build-xrt check-programming-examples-transformer-layer   # all 32, NEEDS AN NPU
 ```
+
+**Two lit targets, and the split is the point.**
+`check-programming-examples-transformer-layer` is the whole suite — 32 tests, **22 of which carry
+`REQUIRES: ryzen_ai_npu2`** — and it is the local regression gate the port-loop driver runs.
+It is **not** a PR gate: on a runner with no NPU2 those 22 report UNSUPPORTED and lit still exits
+0, which is a hardware gate that runs zero hardware tests and reports success.
+`check-programming-examples-transformer-layer-host` is the PR gate: an explicit allowlist of the
+**10** tests that dispatch nothing (`make compile`'s Peano objects plus the nine host-only
+checks). It is an allowlist and not a `--filter-out` on purpose — a negative filter would enrol
+every future `.lit` automatically, so a new NPU-gated test would join the PR gate silently. Add a
+new host-only test to that list in the same commit that adds the test.
+
+**Running a study profile** — one profile, one command, one manifest:
+
+```bash
+systemd-inhibit --what=handle-lid-switch:sleep:idle \
+  ../../agents/scripts/devq.sh run --class measure -- \
+    python3 study/run_profile.py --profile smoke --out-dir results/smoke-w1
+```
+
+`run`, never `submit` (`submit` diverts output to the job log and still exits 0), and the
+`measure` class is what keeps builds off the box while the clock runs. `--dry-run` prints the
+plan and the expected row counts without touching the device; `--gate-only` re-verifies a
+recorded results root and rewrites its manifest without re-measuring it. Walk it **twice** into
+two roots and compare with `study/compare_roots.py`: a single walk once published a crossover
+that a second walk refuted.
 
 The lit suite needs an NPU because `run_npu2_runlist_gate.lit` dispatches. It did not always: the
 suite held only the compile-only and host-only tests, so Phase B's hardware claim was gated by
