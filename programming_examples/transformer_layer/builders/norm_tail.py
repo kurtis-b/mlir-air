@@ -172,6 +172,7 @@ from air.dialects.scf import for_, yield_
 from air.backend.xrt_runner import type_mapper
 
 from builders.addnorm import addnorm_pre_add_reference
+from builders.pipeline_spec import StageSpec, launch_attributes, stage_indices
 
 range_ = for_
 
@@ -195,6 +196,23 @@ L1_STACK_BYTES = 1024
 # to column i of the next -- the channel bundle is indexed by the herd's tx.
 CHANNEL_A2B = "norm_tail_a2b"
 CHANNEL_B2C = "norm_tail_b2c"
+
+# The segment the three herds share. Named the same in BOTH arrangements (see
+# build_norm_tail_module's stage_launches): air-fuse-pipeline-launches takes
+# the fused segment's name from the earliest stage that declares one, so
+# agreeing here is what makes the fused module reproduce the one-segment one
+# exactly rather than up to a name.
+NORM_TAIL_SEGMENT = "norm_tail_seg"
+
+# The pipeline as DECLARED. No stage states an air.staging: all three hand off
+# in L1 and none stages an operand through the memtile, and a claim the pass
+# cannot check is worth nothing -- see builders/pipeline_spec.py.
+NORM_TAIL_PIPELINE_GROUP = "norm_tail"
+NORM_TAIL_STAGE_SPEC = (
+    StageSpec("add"),
+    StageSpec("norm"),
+    StageSpec("scale"),
+)
 
 
 def _stage_l1_bytes(rows_per_call, cols, itemsize):
@@ -229,6 +247,7 @@ def build_norm_tail_module(
     rows_per_call=4,
     plane_major=False,
     mirror_out=False,
+    stage_launches=False,
 ):
     """Build the three-herd norm-tail pipeline.
 
@@ -244,6 +263,17 @@ def build_norm_tail_module(
             that fits at ``cols=768`` WITH aircc's ping-pong doubling of both
             of stage_add's tiles -- 8 was measured to overflow the 64 KiB
             tile; see ``_stage_l1_bytes``.
+
+        stage_launches: emit one ``air.launch`` per stage, each attributed for
+            ``air-opt --air-fuse-pipeline-launches``, instead of the single
+            launch/segment this file has always built. The stage BODIES are
+            identical -- only the nesting differs -- so
+            ``pass(stage_launches=True)`` reproducing ``stage_launches=False``
+            is a statement about the pass and not about two transcriptions.
+            The unfused module is NOT a working design on its own: each launch
+            lowers to its own ``aie.device``, so the declared L1->L1 edges
+            would span devices. Default ``False``; J7a's gate pins that path
+            and nothing about it moves.
 
     Returns:
         air.ir.Module with one function ``norm_tail(packed, gamma, out)``.
@@ -378,186 +408,254 @@ def build_norm_tail_module(
 
     _sig = [l3_pk_ty, l3_g_ty, l3_out_ty] + ([l3_out2_ty] if mirror_out else [])
 
+    # The three stage bodies, emitted at whatever insertion point the caller is
+    # at. Both arrangements below call THESE -- the one-segment form this file
+    # has always built, and the stage-per-launch form that
+    # air-fuse-pipeline-launches consumes. Sharing the bodies is what makes the
+    # H8 reproduction gate a test OF THE PASS: if each arrangement had its own
+    # copy of these loops, "pass(unfused) == hand-written" would be comparing
+    # two transcriptions and would pass or fail for reasons about them.
+    def _emit_stage_add(s_pk):
+        @herd(name="stage_add", sizes=[herd_x, 1], operands=[s_pk])
+        def stage_add(_tx, _ty, _sx, _sy, h_pk):
+            c0 = ConstantOp.create_index(0)
+            l1_pk = AllocOp(l1_pk_ty, [], [])
+            l1_sum = AllocOp(l1_flat_ty, [], [])
+            cst0 = arith.ConstantOp(xrt_dtype, 0.0)
+
+            for loop_iv in range_(0, rows_per_tile, rows_per_call):
+                row = affine_apply(row_map, [loop_iv, _tx])
+                # Both operands in ONE DMA either way -- one L3-facing
+                # stream is what leaves room for gamma inside the
+                # column's two shim MM2S channels.
+                if plane_major:
+                    # [2, rows, cols]: the band is one contiguous run
+                    # per plane, planes rows*cols apart. That stride is
+                    # the whole constraint; see the layout precondition.
+                    dma_memcpy_nd(
+                        l1_pk,
+                        h_pk,
+                        src_offsets=[0, row, 0],
+                        src_sizes=[2, rows_per_call, cols],
+                        src_strides=[rows * cols, cols, 1],
+                    )
+                else:
+                    # [rows, 2, cols]: a band of rows_per_call
+                    # (x row, residual row) pairs is CONTIGUOUS, so
+                    # every stride here is at most 2*cols -- inside the
+                    # shim BD's 2^20 range at any row count.
+                    dma_memcpy_nd(
+                        l1_pk,
+                        h_pk,
+                        src_offsets=[row, 0, 0],
+                        src_sizes=[rows_per_call, 2, cols],
+                        src_strides=[2 * cols, cols, 1],
+                    )
+                # x + residual: elementwise_add's stage body (bf16
+                # vector addf). Row r's x vector j is at
+                # [r*2*cols + j], its residual at [r*2*cols+cols+j];
+                # the sum lands CONTIGUOUS at [r*cols + j], the tile
+                # every later stage sees.
+                for r_iv in range_(0, rows_per_call):
+                    for j_iv in range_(0, cols, NORM_TAIL_VEC_LEN):
+                        x_off = affine_apply(pk_x_map, [r_iv, j_iv])
+                        r_off = affine_apply(pk_r_map, [r_iv, j_iv])
+                        s_off = affine_apply(flat_map, [r_iv, j_iv])
+                        sub_x = subview(l1_pk.result, [x_off], [NORM_TAIL_VEC_LEN], [1])
+                        sub_r = subview(l1_pk.result, [r_off], [NORM_TAIL_VEC_LEN], [1])
+                        sub_out = subview(
+                            l1_sum.result, [s_off], [NORM_TAIL_VEC_LEN], [1]
+                        )
+                        v_x = transfer_read(
+                            vec_ty, sub_x, [c0], identity_map, cst0, [True]
+                        )
+                        v_r = transfer_read(
+                            vec_ty, sub_r, [c0], identity_map, cst0, [True]
+                        )
+                        v_sum = arith.addf(v_x, v_r)
+                        transfer_write(None, v_sum, sub_out, [c0], identity_map, [True])
+                        yield_([])
+                    yield_([])
+                ChannelPut(CHANNEL_A2B, l1_sum, indices=[_tx, c0])
+                yield_([])
+
+            DeallocOp(l1_pk)
+            DeallocOp(l1_sum)
+
+    def _emit_stage_norm():
+        @herd(name="stage_norm", sizes=[herd_x, 1])
+        def stage_norm(_tx, _ty, _sx, _sy):
+            c0 = ConstantOp.create_index(0)
+            l1_in = AllocOp(l1_flat_ty, [], [])
+            l1_norm = AllocOp(l1_flat_ty, [], [])
+            cols_i32 = ConstantOp(T.i32(), cols)
+            nrows_i32 = ConstantOp(T.i32(), rows_per_call)
+
+            for _ in range_(0, rows_per_tile, rows_per_call):
+                ChannelGet(CHANNEL_A2B, l1_in, indices=[_tx, c0])
+                CallOp(ln_func, [l1_in, l1_norm, cols_i32, nrows_i32])
+                ChannelPut(CHANNEL_B2C, l1_norm, indices=[_tx, c0])
+                yield_([])
+
+            DeallocOp(l1_in)
+            DeallocOp(l1_norm)
+
+        stage_norm.attributes["link_with"] = StringAttr.get(NORM_KERNEL_OBJ)
+
+    def _emit_stage_scale(s_g, s_out, s_out2):
+        _scale_ops = [s_g, s_out] + ([s_out2] if mirror_out else [])
+
+        @herd(name="stage_scale", sizes=[herd_x, 1], operands=_scale_ops)
+        def stage_scale(_tx, _ty, _sx, _sy, *h_args):
+            h_g, h_out = h_args[0], h_args[1]
+            h_out2 = h_args[2] if mirror_out else None
+            c0 = ConstantOp.create_index(0)
+            l1_in = AllocOp(l1_flat_ty, [], [])
+            l1_g = AllocOp(l1_g_ty, [], [])
+            l1_out = AllocOp(l1_flat_ty, [], [])
+            cst0 = arith.ConstantOp(xrt_dtype, 0.0)
+
+            # gamma: ONE L3 fetch per tile, before the trip loop. This
+            # is the column's second (and last) shim MM2S stream.
+            dma_memcpy_nd(
+                l1_g,
+                h_g,
+                src_offsets=[0],
+                src_sizes=[cols],
+                src_strides=[1],
+            )
+
+            for loop_iv in range_(0, rows_per_tile, rows_per_call):
+                row = affine_apply(row_map, [loop_iv, _tx])
+                ChannelGet(CHANNEL_B2C, l1_in, indices=[_tx, c0])
+                # normed * gamma, gamma broadcast over the tile's rows:
+                # elementwise_mul's stage body (bf16 vector mulf -- the
+                # AIE vector unit does not legalize f32 multiplies).
+                for r_iv in range_(0, rows_per_call):
+                    for j_iv in range_(0, cols, NORM_TAIL_VEC_LEN):
+                        flat = affine_apply(flat_map, [r_iv, j_iv])
+                        sub_in = subview(l1_in.result, [flat], [NORM_TAIL_VEC_LEN], [1])
+                        sub_g = subview(l1_g.result, [j_iv], [NORM_TAIL_VEC_LEN], [1])
+                        sub_out = subview(
+                            l1_out.result, [flat], [NORM_TAIL_VEC_LEN], [1]
+                        )
+                        v_in = transfer_read(
+                            vec_ty, sub_in, [c0], identity_map, cst0, [True]
+                        )
+                        v_g = transfer_read(
+                            vec_ty, sub_g, [c0], identity_map, cst0, [True]
+                        )
+                        v_out = arith.mulf(v_in, v_g)
+                        transfer_write(None, v_out, sub_out, [c0], identity_map, [True])
+                        yield_([])
+                    yield_([])
+                dma_memcpy_nd(
+                    h_out,
+                    l1_out,
+                    dst_offsets=[row, 0],
+                    dst_sizes=[rows_per_call, cols],
+                    dst_strides=[cols, 1],
+                )
+                if mirror_out:
+                    # Same band, into plane 1 of the downstream packed
+                    # buffer. A second S2MM stream per column; the
+                    # inbound budget this file protects is MM2S and is
+                    # untouched.
+                    dma_memcpy_nd(
+                        h_out2,
+                        l1_out,
+                        dst_offsets=[1, row, 0],
+                        dst_sizes=[1, rows_per_call, cols],
+                        dst_strides=[rows * cols, cols, 1],
+                    )
+                yield_([])
+
+            DeallocOp(l1_in)
+            DeallocOp(l1_g)
+            DeallocOp(l1_out)
+
+    # --- the two arrangements ------------------------------------------
+    # Same three stage bodies, differing ONLY in launch/segment nesting.
+    #
+    #   stage_launches=False  ONE launch, ONE segment, three herds. What this
+    #                         file has always built and what J7a's gate pins.
+    #   stage_launches=True   THREE launches, one segment and one herd each,
+    #                         attributed for air-fuse-pipeline-launches. On its
+    #                         own this arrangement is NOT a working design --
+    #                         each launch lowers to its own aie.device, so the
+    #                         declared L1->L1 edges span devices. It exists to
+    #                         be fused, and the pass refuses rather than
+    #                         silently leaving it (doc 23's refuse rule).
+    #
+    # The segment name is the same in both, because the fusion pass takes the
+    # fused segment's name from the earliest stage that declares one -- so a
+    # pipeline whose stages agree on a name reproduces the one-segment module
+    # exactly rather than approximately.
+    _idx = stage_indices(NORM_TAIL_STAGE_SPEC)
+
     @FuncOp.from_py_func(*_sig)
     def norm_tail(*args):
         _ops = list(args)
 
-        @launch(operands=_ops)
-        def nt_launch(*l_args):
-            _l = list(l_args)
+        if not stage_launches:
 
-            @segment(name="norm_tail_seg", operands=_l)
-            def nt_seg(*s_args):
-                s_pk, s_g, s_out = s_args[0], s_args[1], s_args[2]
-                s_out2 = s_args[3] if mirror_out else None
+            @launch(operands=_ops)
+            def nt_launch(*l_args):
+                _l = list(l_args)
 
-                @herd(name="stage_add", sizes=[herd_x, 1], operands=[s_pk])
-                def stage_add(_tx, _ty, _sx, _sy, h_pk):
-                    c0 = ConstantOp.create_index(0)
-                    l1_pk = AllocOp(l1_pk_ty, [], [])
-                    l1_sum = AllocOp(l1_flat_ty, [], [])
-                    cst0 = arith.ConstantOp(xrt_dtype, 0.0)
-
-                    for loop_iv in range_(0, rows_per_tile, rows_per_call):
-                        row = affine_apply(row_map, [loop_iv, _tx])
-                        # Both operands in ONE DMA either way -- one L3-facing
-                        # stream is what leaves room for gamma inside the
-                        # column's two shim MM2S channels.
-                        if plane_major:
-                            # [2, rows, cols]: the band is one contiguous run
-                            # per plane, planes rows*cols apart. That stride is
-                            # the whole constraint; see the layout precondition.
-                            dma_memcpy_nd(
-                                l1_pk,
-                                h_pk,
-                                src_offsets=[0, row, 0],
-                                src_sizes=[2, rows_per_call, cols],
-                                src_strides=[rows * cols, cols, 1],
-                            )
-                        else:
-                            # [rows, 2, cols]: a band of rows_per_call
-                            # (x row, residual row) pairs is CONTIGUOUS, so
-                            # every stride here is at most 2*cols -- inside the
-                            # shim BD's 2^20 range at any row count.
-                            dma_memcpy_nd(
-                                l1_pk,
-                                h_pk,
-                                src_offsets=[row, 0, 0],
-                                src_sizes=[rows_per_call, 2, cols],
-                                src_strides=[2 * cols, cols, 1],
-                            )
-                        # x + residual: elementwise_add's stage body (bf16
-                        # vector addf). Row r's x vector j is at
-                        # [r*2*cols + j], its residual at [r*2*cols+cols+j];
-                        # the sum lands CONTIGUOUS at [r*cols + j], the tile
-                        # every later stage sees.
-                        for r_iv in range_(0, rows_per_call):
-                            for j_iv in range_(0, cols, NORM_TAIL_VEC_LEN):
-                                x_off = affine_apply(pk_x_map, [r_iv, j_iv])
-                                r_off = affine_apply(pk_r_map, [r_iv, j_iv])
-                                s_off = affine_apply(flat_map, [r_iv, j_iv])
-                                sub_x = subview(
-                                    l1_pk.result, [x_off], [NORM_TAIL_VEC_LEN], [1]
-                                )
-                                sub_r = subview(
-                                    l1_pk.result, [r_off], [NORM_TAIL_VEC_LEN], [1]
-                                )
-                                sub_out = subview(
-                                    l1_sum.result, [s_off], [NORM_TAIL_VEC_LEN], [1]
-                                )
-                                v_x = transfer_read(
-                                    vec_ty, sub_x, [c0], identity_map, cst0, [True]
-                                )
-                                v_r = transfer_read(
-                                    vec_ty, sub_r, [c0], identity_map, cst0, [True]
-                                )
-                                v_sum = arith.addf(v_x, v_r)
-                                transfer_write(
-                                    None, v_sum, sub_out, [c0], identity_map, [True]
-                                )
-                                yield_([])
-                            yield_([])
-                        ChannelPut(CHANNEL_A2B, l1_sum, indices=[_tx, c0])
-                        yield_([])
-
-                    DeallocOp(l1_pk)
-                    DeallocOp(l1_sum)
-
-                @herd(name="stage_norm", sizes=[herd_x, 1])
-                def stage_norm(_tx, _ty, _sx, _sy):
-                    c0 = ConstantOp.create_index(0)
-                    l1_in = AllocOp(l1_flat_ty, [], [])
-                    l1_norm = AllocOp(l1_flat_ty, [], [])
-                    cols_i32 = ConstantOp(T.i32(), cols)
-                    nrows_i32 = ConstantOp(T.i32(), rows_per_call)
-
-                    for _ in range_(0, rows_per_tile, rows_per_call):
-                        ChannelGet(CHANNEL_A2B, l1_in, indices=[_tx, c0])
-                        CallOp(ln_func, [l1_in, l1_norm, cols_i32, nrows_i32])
-                        ChannelPut(CHANNEL_B2C, l1_norm, indices=[_tx, c0])
-                        yield_([])
-
-                    DeallocOp(l1_in)
-                    DeallocOp(l1_norm)
-
-                stage_norm.attributes["link_with"] = StringAttr.get(NORM_KERNEL_OBJ)
-
-                _scale_ops = [s_g, s_out] + ([s_out2] if mirror_out else [])
-
-                @herd(name="stage_scale", sizes=[herd_x, 1], operands=_scale_ops)
-                def stage_scale(_tx, _ty, _sx, _sy, *h_args):
-                    h_g, h_out = h_args[0], h_args[1]
-                    h_out2 = h_args[2] if mirror_out else None
-                    c0 = ConstantOp.create_index(0)
-                    l1_in = AllocOp(l1_flat_ty, [], [])
-                    l1_g = AllocOp(l1_g_ty, [], [])
-                    l1_out = AllocOp(l1_flat_ty, [], [])
-                    cst0 = arith.ConstantOp(xrt_dtype, 0.0)
-
-                    # gamma: ONE L3 fetch per tile, before the trip loop. This
-                    # is the column's second (and last) shim MM2S stream.
-                    dma_memcpy_nd(
-                        l1_g,
-                        h_g,
-                        src_offsets=[0],
-                        src_sizes=[cols],
-                        src_strides=[1],
+                @segment(name=NORM_TAIL_SEGMENT, operands=_l)
+                def nt_seg(*s_args):
+                    _emit_stage_add(s_args[0])
+                    _emit_stage_norm()
+                    _emit_stage_scale(
+                        s_args[1], s_args[2], s_args[3] if mirror_out else None
                     )
 
-                    for loop_iv in range_(0, rows_per_tile, rows_per_call):
-                        row = affine_apply(row_map, [loop_iv, _tx])
-                        ChannelGet(CHANNEL_B2C, l1_in, indices=[_tx, c0])
-                        # normed * gamma, gamma broadcast over the tile's rows:
-                        # elementwise_mul's stage body (bf16 vector mulf -- the
-                        # AIE vector unit does not legalize f32 multiplies).
-                        for r_iv in range_(0, rows_per_call):
-                            for j_iv in range_(0, cols, NORM_TAIL_VEC_LEN):
-                                flat = affine_apply(flat_map, [r_iv, j_iv])
-                                sub_in = subview(
-                                    l1_in.result, [flat], [NORM_TAIL_VEC_LEN], [1]
-                                )
-                                sub_g = subview(
-                                    l1_g.result, [j_iv], [NORM_TAIL_VEC_LEN], [1]
-                                )
-                                sub_out = subview(
-                                    l1_out.result, [flat], [NORM_TAIL_VEC_LEN], [1]
-                                )
-                                v_in = transfer_read(
-                                    vec_ty, sub_in, [c0], identity_map, cst0, [True]
-                                )
-                                v_g = transfer_read(
-                                    vec_ty, sub_g, [c0], identity_map, cst0, [True]
-                                )
-                                v_out = arith.mulf(v_in, v_g)
-                                transfer_write(
-                                    None, v_out, sub_out, [c0], identity_map, [True]
-                                )
-                                yield_([])
-                            yield_([])
-                        dma_memcpy_nd(
-                            h_out,
-                            l1_out,
-                            dst_offsets=[row, 0],
-                            dst_sizes=[rows_per_call, cols],
-                            dst_strides=[cols, 1],
-                        )
-                        if mirror_out:
-                            # Same band, into plane 1 of the downstream packed
-                            # buffer. A second S2MM stream per column; the
-                            # inbound budget this file protects is MM2S and is
-                            # untouched.
-                            dma_memcpy_nd(
-                                h_out2,
-                                l1_out,
-                                dst_offsets=[1, row, 0],
-                                dst_sizes=[1, rows_per_call, cols],
-                                dst_strides=[rows * cols, cols, 1],
-                            )
-                        yield_([])
+            return
 
-                    DeallocOp(l1_in)
-                    DeallocOp(l1_g)
-                    DeallocOp(l1_out)
+        # Stage 0 -- the packed x|residual fetch is this stage's only L3
+        # operand, so its launch carries only that one.
+        @launch(
+            operands=[_ops[0]],
+            attributes=launch_attributes(
+                NORM_TAIL_PIPELINE_GROUP, _idx[0], NORM_TAIL_STAGE_SPEC[0]
+            ),
+        )
+        def nt_launch_add(l_pk):
+
+            @segment(name=NORM_TAIL_SEGMENT, operands=[l_pk])
+            def seg_add(s_pk):
+                _emit_stage_add(s_pk)
+
+        # Stage 1 -- no L3 operand at all: it reads AtoB and writes BtoC.
+        # A launch with no operands is exactly what makes the point that this
+        # stage cannot stand alone.
+        @launch(
+            operands=[],
+            attributes=launch_attributes(
+                NORM_TAIL_PIPELINE_GROUP, _idx[1], NORM_TAIL_STAGE_SPEC[1]
+            ),
+        )
+        def nt_launch_norm():
+
+            @segment(name=NORM_TAIL_SEGMENT, operands=[])
+            def seg_norm():
+                _emit_stage_norm()
+
+        # Stage 2 -- gamma in, out (and the mirror) back.
+        @launch(
+            operands=_ops[1:],
+            attributes=launch_attributes(
+                NORM_TAIL_PIPELINE_GROUP, _idx[2], NORM_TAIL_STAGE_SPEC[2]
+            ),
+        )
+        def nt_launch_scale(*l_args):
+
+            @segment(name=NORM_TAIL_SEGMENT, operands=list(l_args))
+            def seg_scale(*s_args):
+                _emit_stage_scale(
+                    s_args[0], s_args[1], s_args[2] if mirror_out else None
+                )
 
 
 def norm_tail_device_inputs(x, residual, plane_major=False):

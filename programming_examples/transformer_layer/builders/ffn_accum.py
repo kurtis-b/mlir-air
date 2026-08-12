@@ -208,6 +208,12 @@ from air.dialects.memref import AllocOp, DeallocOp
 from air.dialects.scf import IfOp, for_, yield_
 from air.backend.xrt_runner import type_mapper
 
+from builders.pipeline_spec import (
+    STAGING_ACCUM_IN_PLACE,
+    StageSpec,
+    launch_attributes,
+)
+
 range_ = for_
 
 # The aie::mmul microtile edge (r = s = t = 8). Every tile dimension below is
@@ -274,6 +280,21 @@ FFN_ACCUM_KERNEL_OBJ = "ffn_accum_mm.o"
 # The hand-declared L2->L1 A|B feed. The accumulator ring itself declares no
 # channel anywhere -- that is the phase's point.
 CHANNEL_FEED = "ffn_accum_feed"
+
+# This builder as ONE pipeline stage (H8). Declared "accum_in_place" because
+# that is the claim worth checking: air-fuse-pipeline-launches refuses the
+# declaration unless the segment really holds a loop that allocates a buffer
+# which is BOTH the destination and the source of an air.dma_memcpy_nd -- doc
+# 22's two measured conditions (the IN-PLACE kernel, and the accumulator
+# allocated INSIDE the K loop) in one predicate. Both of the constructions
+# that lose the ring compile and return correct numbers, so nothing else in
+# the toolchain can tell this builder it stopped ringing.
+#
+# The A|B memtile feed is a SECOND staging mechanism in this same module, and
+# it is deliberately not what is declared: air.staging carries one value, and
+# the accumulator claim is the one a silent regression would destroy
+# invisibly. The feed's loss would show up as a placement or routing failure.
+FFN_ACCUM_STAGE_SPEC = StageSpec("down", staging=STAGING_ACCUM_IN_PLACE)
 
 
 def compile_ffn_accum_kernel(
@@ -398,6 +419,7 @@ def build_ffn_accum_module(
     np_dtype=bfloat16,
     herd_x=FFN_ACCUM_HERD_X,
     tile_k=FFN_ACCUM_TILE_K,
+    pipeline_group=None,
 ):
     """Build the down-projection accumulator module.
 
@@ -427,6 +449,11 @@ def build_ffn_accum_module(
             capacity for 1 input/1 output channels near centroid column 3",
             with all 16 slots demonstrably free) -- a windowed-search
             artifact of that binary pass, measured here. 4 places.
+        pipeline_group: when given, stamp this builder's single ``air.launch``
+            as stage 0 of that pipeline group, with
+            ``air.staging = "accum_in_place"``, for
+            ``air-opt --air-fuse-pipeline-launches``. Default ``None`` stamps
+            nothing, so J7b's own gate sees exactly the module it always did.
         tile_k: K advance per kernel call, multiple of 8. 32 keeps the
             worst-case L1 (ping-ponged A and B tiles plus the resident C)
             comfortably under the 64 KiB tile; 64 measures just over it.
@@ -520,10 +547,21 @@ def build_ffn_accum_module(
 
     Channel(CHANNEL_FEED, size=[herd_x, herd_y])
 
+    # Stage 0 of a pipeline named `pipeline_group`, when one is asked for.
+    # A ONE-stage group is not a degenerate case worth skipping: fusing it must
+    # be an IDENTITY, which is what says the pass leaves the compiler-formed
+    # accumulator ring and the memtile A|B feed alone. It is also where the
+    # air.staging claim is checked.
+    _launch_attrs = (
+        {}
+        if pipeline_group is None
+        else launch_attributes(pipeline_group, 0, FFN_ACCUM_STAGE_SPEC)
+    )
+
     @FuncOp.from_py_func(l3_a_ty, l3_w_ty, l3_y_ty)
     def ffn_accum(arg0, arg1, arg2):
 
-        @launch(operands=[arg0, arg1, arg2])
+        @launch(operands=[arg0, arg1, arg2], attributes=_launch_attrs)
         def fa_launch(l_a, l_w, l_y):
 
             @segment(name="ffn_accum_seg", operands=[l_a, l_w, l_y])
