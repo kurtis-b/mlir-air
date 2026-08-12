@@ -559,6 +559,110 @@ def test_the_toolchain_source_domain_is_shared_with_conditions():
             schema.validate_toolchain(block)
 
 
+# ---------------------------------------------------------------------------
+# The WALK block `[2026-08-12]` -- resume. Same three pins as the toolchain
+# block, because the same mistake would cost the same thing.
+# ---------------------------------------------------------------------------
+
+
+def test_the_walk_block_did_not_bump_the_schema_version():
+    """The decisive one. A `session_id` COLUMN is the obvious design for
+    attribution and is the wrong one: it bumps SCHEMA_VERSION to 3, and
+    `results_io.read_rows` rejects both a header and a version mismatch, so it
+    would take every surviving v2 root out of every reader -- including the ones
+    `compare_roots` is pointed at. Item 15's decision, unchanged."""
+    assert schema.SCHEMA_VERSION == 2
+    assert "session_id" not in schema.RESULTS_FIELDNAMES
+    assert "walk_session" not in schema.RESULTS_FIELDNAMES
+
+
+def test_the_walk_block_is_not_a_csv_table():
+    """Anything iterating CSV tables must not be able to write it out as one."""
+    _raises(ValueError, "unknown table", schema.fields_for, schema.WALK_KEY)
+    _raises(ValueError, "unknown table", schema.fields_for, "sessions")
+
+
+def test_empty_walk_is_complete_and_claims_nothing():
+    block = schema.empty_walk()
+    assert set(block) == set(schema.WALK_FIELDNAMES)
+    assert block["walk_source"] == schema.UNKNOWN_CONDITION
+    assert block["sessions"] == []
+    assert block["attribution_problems"] == []
+
+
+def test_a_manifest_older_than_the_walk_block_reads_back_as_absent():
+    """`absent` (older than the field) and `unknown` (tried and failed) are
+    different things to tell an operator, and neither is a match."""
+    assert schema.walk_from_manifest({})["walk_source"] == "absent"
+    assert schema.walk_from_manifest(None)["walk_source"] == "absent"
+    assert "must not be guessed" in schema.walk_from_manifest({})["walk_detail"]
+
+
+def test_validate_walk_rejects_a_missing_or_invented_key():
+    block = schema.empty_walk()
+    block["walk_source"] = "single_session"
+    schema.validate_walk(block)
+
+    del block["rungs_reused"]
+    _raises(ValueError, "missing keys", schema.validate_walk, block)
+
+    block = schema.empty_walk()
+    block["walk_source"] = "single_session"
+    block["rungs_reusd"] = 0
+    _raises(ValueError, "not in the schema", schema.validate_walk, block)
+
+
+def test_validate_walk_rejects_a_bad_source_and_reader_only_absent():
+    block = schema.empty_walk()
+    block["walk_source"] = "partially"
+    _raises(ValueError, "walk_source", schema.validate_walk, block)
+
+    block["walk_source"] = "absent"
+    _raises(ValueError, "READER-ONLY", schema.validate_walk, block)
+
+
+def test_validate_session_rejects_a_malformed_rung():
+    """A hand-assembled ledger with a typo'd key must fail here rather than be
+    read back as a session that recorded nothing."""
+    base = {name: None for name in schema.SESSION_FIELDNAMES}
+    base["status"] = "complete"
+    base["rungs"] = []
+    schema.validate_session(base)
+
+    bad = dict(base, status="finished")
+    _raises(ValueError, "session status", schema.validate_session, bad)
+
+    bad = dict(base, rungs=[{"execution_mode": "hybrid"}])
+    _raises(ValueError, "SESSION_RUNG_FIELDS", schema.validate_session, bad)
+
+    rung = {name: None for name in schema.SESSION_RUNG_FIELDNAMES}
+    rung["source"] = "carried"
+    _raises(ValueError, "not one of", schema.validate_session, dict(base, rungs=[rung]))
+
+    rung["source"] = "reused"
+    schema.validate_session(dict(base, rungs=[rung]))
+
+    bad = dict(base)
+    bad["extra"] = 1
+    _raises(ValueError, "not in the schema", schema.validate_session, bad)
+
+
+def test_reused_and_skipped_are_distinct_rung_sources():
+    """Neither dispatches, and collapsing them would make "we did not run this
+    today" mean two different things under one label: a skip is a claim about
+    what the MODE supports, a reuse that an EARLIER MEASUREMENT still stands."""
+    assert set(schema.RUNG_SOURCES) == {"measured", "reused", "skipped"}
+    assert set(schema.SESSION_STATUSES) == {"running", "complete", "interrupted"}
+
+
+def test_every_walk_field_is_documented_and_unique():
+    for fields in (schema.WALK_FIELDS, schema.SESSION_FIELDS, schema.SESSION_RUNG_FIELDS):
+        names = [f.name for f in fields]
+        assert len(names) == len(set(names)), names
+        for f in fields:
+            assert f.meaning and len(f.meaning) > 20, f.name
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

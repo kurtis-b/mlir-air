@@ -79,5 +79,53 @@
 // undetectable, since BOTH open zero host buckets. The whole package is read
 // now, with a control asserting exactly one mode opens any.
 //
+// `[2026-08-12]` 357 -> 396 and 19 -> 20 modules, RESUME (doc 10 work item 8).
+// A `ladder` walk is ~45 min cold on a laptop that suspends on a lid close, and
+// a reboot at minute 40 used to cost all of it. +24 the new test_resume module,
+// +4 run_ladder (a carried rung must reach no child process and be written BYTE
+// FOR BYTE, a skip must beat a reuse, and the per-rung hook must see every
+// rung), +9 schema (the walk block, its reader-only `absent`, and the pin that
+// matters most: SCHEMA_VERSION STAYS 2 and there is no `session_id` COLUMN --
+// attribution rides a manifest block precisely because a column would take
+// every surviving v2 root out of every reader, item 15's decision unchanged),
+// +2 run_profile for a hole the conditions block left when it landed before its
+// caller: `gate` never passed `conditions=`, so every profile manifest recorded
+// `npu_power_mode: unknown` on a run that had just REFUSED to start off Turbo.
+//
+// EVERY NEW CLAUSE IS PAIRED WITH THE BROKEN INPUT THAT MAKES IT FIRE, because
+// a resume's natural implementation is bookkeeping and bookkeeping agrees with
+// itself whatever the walk did -- which is the shape of both defects G0 closed.
+// The load-bearing one is a walker that IGNORES `reuse` and re-measures: the
+// plan, the ledger and the run report would all still say "reused", and only
+// re-hashing the row afterwards catches it.
+//
+// `[2026-08-12]` 396 -> 403, THE COVERAGE SWEEP -- and the count moved by seven
+// because the work was seven tests, not a sweep. `run_mode._shape_for` varied
+// only `seq_len`, which is why five of six declared families read as
+// unreachable; the registry coverage those two width families were said to need
+// had been in the tree since 2026-08-07 and nothing had read the file. +4
+// run_ladder (width override, no spec mutation on the second axis either, and a
+// decoder REFUSED rather than measured as an encoder under a causal name), +3
+// profiles net (the reachability check now re-derives from the registry JSON
+// instead of from opcheck_specs' widths -- same idiom, right file; the fused
+// bound is derived from the 2^20 plane cap so it MOVES with the width, 256..2048
+// at emb 512; and a retarget re-derives every expected count with no number
+// edited).
+//
+// `[2026-08-12]` 403 -> 409, doc 10's WORK ITEM 5 -- "write the prerequisites
+// and recovery sections of the example README", taken as a CHECK. The item's
+// requirement is its last four words, "rather than mid-suite"; a README
+// paragraph cannot fail, and this project's own record is of prose rules that
+// were true when written and silently stopped being (README trap 0 lived in
+// prose until the conditions block moved it into the artifact). Doc 10's
+// six-tool table is separately obsolete -- five are already recorded as dropped
+// with a measurement each, and the sixth is only READ here -- so the
+// prerequisite that was actually unguarded is not a binary: it is the two
+// Python modules a bare devq shell lacks, `pyxrt` and `ml_dtypes`, BOTH of
+// which fail late. +6 run_profile: each of the three clauses driven by the
+// broken input that makes it fire, a control that a good shell produces no
+// problems at all, and an audit that the check runs before the lock AND before
+// the device is read.
+//
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 357/357 passed in 19 modules
+// CHECK: study host tests: 409/409 passed in 20 modules

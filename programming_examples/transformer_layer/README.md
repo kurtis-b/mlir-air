@@ -931,6 +931,89 @@ registry's detail page:
   docstring has the three-point hardware calibration and why the low tier, whose
   error comes from a different mechanism, is left unscaled.
 
+## Running a profile: invocation and recovery
+
+`[2026-08-12]` The unattended runner is one command. There is no daemon, no
+crontab hook and no reboot orchestration — all four were dropped on measured
+grounds (doc 10 §Deliberately dropped).
+
+```bash
+systemd-inhibit --what=handle-lid-switch:sleep:idle \
+  agents/scripts/devq.sh run --class measure -- \
+    python3 study/run_profile.py --profile ladder --out-dir results/ladder-w1
+```
+
+`run`, never `submit`: `submit` diverts output to the job log and returns an id,
+so substituting it blanks a gate's own FileCheck and still exits 0. The
+`systemd-inhibit` wrapper is not optional on this host — a lid close suspends it
+mid-walk.
+
+### Prerequisites are checked, not documented
+
+There is deliberately **no prerequisites table here**. The runner refuses at
+start rather than mid-suite, which is what such a table exists to achieve and is
+the half a paragraph cannot do — `run_profile.environment_problems()` refuses a
+shell with no `pyxrt` or no `ml_dtypes` (both fail *late*: after every kernel has
+compiled, with a `ModuleNotFoundError` that reads like a broken model), and a
+working directory that is not this one (aircc and `KernelCache` write relative to
+cwd and only this directory's `.gitignore` covers the debris). The power mode and
+the device lock are refused by their own guards. Each refusal names its fix.
+
+The one thing no script here can do for you: **the NPU power mode needs root and
+is not persistent.** Every reboot and every `amdxdna` reload resets it, and at
+`Default` this host measures ~15–20× slow.
+
+```bash
+sudo xrt-smi configure --device 0000:64:00.1 --pmode turbo
+xrt-smi examine -r platform | grep -i "Power Mode"     # verify
+```
+
+### Recovery: resuming an interrupted walk
+
+A cold `ladder` walk is ~45 minutes and compilation dominates it ~20×. If the
+machine reboots at minute 40, resume the same root:
+
+```bash
+python3 study/run_profile.py --profile ladder --out-dir results/ladder-w1 --resume
+```
+
+Every rung with a `passed` row is carried forward and no child process starts for
+it. **Failed rungs are re-run on purpose** — between two sessions the tree can
+change, and a retained failure is a claim about code that may no longer be there.
+A structural skip is re-derived from the profile every session, because it is a
+claim about what the mode supports rather than a recorded observation.
+
+Without `--resume`, a results root that already holds CSVs is **refused**. There
+is no flag to overwrite one: walking over a recorded root leaves one CSV from
+each walk with nothing saying which is which, and wanting that is wanting a
+different `--out-dir`.
+
+What the run leaves behind, and what each file answers:
+
+| file | question |
+|---|---|
+| `<mode>.csv` | what was measured — rewritten after every rung, so a killed walk keeps what it got |
+| `results_manifest.json` | is the walk complete — row counts derived from the profile, plus the power mode, the toolchain and the session attribution |
+| `profile_run.json` | what this session did — the plan, per-rung outcomes, reused-vs-measured counts, the devq job id |
+| `walk_sessions.json` | who measured which rung — appended after every rung, so it survives the kill it exists for |
+
+Inspect a root without touching the device:
+
+```bash
+python3 study/resume.py results/ladder-w1 --profile ladder          # what a resume would do
+python3 study/resume.py results/ladder-w1 --profile ladder --audit  # does the ledger match the files
+python3 study/run_profile.py --profile ladder --out-dir results/ladder-w1 --gate-only
+```
+
+**Resuming does not make a walk complete that is not one.** The manifest's row
+counts read the CSVs and know nothing about sessions. And a resumed walk is
+*audited*: every carried-forward row is re-hashed afterwards, so a rung the plan
+called reused whose row moved is reported as a defect and makes the run
+incomplete. What resume cannot do is make two sessions one measurement — rows
+taken hours apart on a laptop are two populations, and the `walk` block says so
+rather than fixing it. A splice across power modes is refused outright; one
+across a toolchain or a git sha is flagged.
+
 ## Things that will bite you
 
 **An object with no symbols still links.** `encoder.cc` and `addnorm_ffn.cc`

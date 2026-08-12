@@ -132,13 +132,13 @@ def test_the_stand_in_row_still_matches_the_catalogue():
 
 def test_no_override_returns_the_specs_own_shape():
     spec = _spec()
-    shape, key = run_mode._shape_for(spec, None)
+    shape, key, variant = run_mode._shape_for(spec, None)
     assert shape == spec["shape"]
     assert key == spec["shape_key"], "the catalogue's own key must survive verbatim"
 
 
 def test_override_sets_the_length_and_derives_a_key():
-    shape, key = run_mode._shape_for(_spec(), 512)
+    shape, key, variant = run_mode._shape_for(_spec(), 512)
     assert shape["seq_len"] == 512
     assert key == "512x768_encoder_bert"
     assert shape["emb_dim"] == 768, "only the length moves"
@@ -165,6 +165,56 @@ def test_successive_rungs_are_independent():
     assert lens == [512, 1024, 2048]
 
 
+def test_a_family_overrides_the_width_and_the_key_says_so():
+    """`[2026-08-12]` The coverage-sweep unblock. `_shape_for` had varied only
+    `seq_len`, which is the whole reason five of six declared families were
+    called unreachable -- the registry rows for hidden 512 and 1024 had existed
+    since 2026-08-07."""
+    shape, key, variant = run_mode._shape_for(_spec(), 1024, "tinybert_512")
+    assert (shape["emb_dim"], shape["ffn_dim"], shape["num_heads"]) == (512, 2048, 8)
+    assert shape["head_dim"] == 64, "derived from hidden//heads, never carried"
+    assert key == "1024x512_encoder_bert"
+    assert variant == "encoder_bert"
+
+    shape, key, _ = run_mode._shape_for(_spec(), 2048, "baseline_1024")
+    assert (shape["emb_dim"], shape["ffn_dim"], shape["num_heads"]) == (1024, 4096, 16)
+    assert key == "2048x1024_encoder_bert"
+
+
+def test_a_family_override_does_not_mutate_the_spec_either():
+    """`test_override_does_not_mutate_the_spec`'s bug, on the second axis: a
+    width leaking into the module-level SPECS row would make every later rung in
+    the process a different family than its row claims."""
+    spec = _spec()
+    run_mode._shape_for(spec, 512, "tinybert_512")
+    assert spec["shape"]["emb_dim"] == 768
+    assert spec["shape"]["ffn_dim"] == 3072
+
+
+def test_a_decoder_family_is_refused_rather_than_run_as_an_encoder():
+    """The worst outcome available here is a valid-looking bidirectional
+    measurement stamped `decoder_gpt2`, because nothing downstream could detect
+    it. So the variant is carried into the row AND the run is refused."""
+    _, key, variant = run_mode._shape_for(_spec(), 512, "gpt2_small_768")
+    assert variant == "decoder_gpt2"
+    assert key == "512x768_decoder_gpt2"
+    assert variant in run_mode.UNBUILDABLE_VARIANTS
+
+    # And `run` must actually branch on it. Audited from the source rather than
+    # called: `run` imports opcheck_specs, which pulls in the builders and needs
+    # a toolchain this suite deliberately does not have. A refusal that is
+    # declared and never consulted is the item 19 defect shape.
+    source = open(os.path.join(_HERE, "run_mode.py"), encoding="utf-8").read()
+    assert "if variant in UNBUILDABLE_VARIANTS:" in source, (
+        "run_mode.run no longer refuses an unbuildable variant; a decoder "
+        "family would be measured as an encoder and stamped `decoder_gpt2`"
+    )
+    # ...before anything is prepared, or the refusal costs a compile.
+    assert source.index("if variant in UNBUILDABLE_VARIANTS:") < source.index(
+        'prepared = spec["prepare"](shape)'
+    )
+
+
 def test_key_falls_back_when_the_shape_names_hidden_size():
     """Some rows carry hidden_size rather than emb_dim; the key must not say '?'."""
     spec = {
@@ -172,14 +222,14 @@ def test_key_falls_back_when_the_shape_names_hidden_size():
         "shape_key": "4096x768_encoder_bert",
         "shape": {"seq_len": 4096, "hidden_size": 768},
     }
-    _, key = run_mode._shape_for(spec, 1024)
+    _, key, _variant = run_mode._shape_for(spec, 1024)
     assert key == "1024x768_encoder_bert"
 
 
 def _fake_rung(seen):
     """Stands in for the one function that dispatches, so no device is needed."""
 
-    def fake(mode, seq, study_id, warmup, samples, rps, scratch):
+    def fake(mode, seq, study_id, warmup, samples, rps, scratch, family=None):
         seen.append((mode, seq))
         row = run_ladder.schema.empty_row("results")
         row["execution_mode"] = run_ladder.schema.EXECUTION_MODE_CSV[mode]
@@ -266,6 +316,127 @@ def test_no_skip_callback_is_the_existing_behaviour():
         )
     assert seen == [("coarse", 512), ("coarse", 1024)]
     assert [r["run_status"] for r in rows] == ["passed", "passed"]
+
+
+def test_a_reused_rung_is_written_verbatim_and_never_run():
+    """`test_a_skipped_rung_is_written_and_never_run`'s argument, for reuse.
+
+    Asserted on the CALL LIST, because a walk that re-ran the rung and wrote a
+    row that happened to look similar would cost the whole compile and be
+    invisible in the output. And asserted BYTE FOR BYTE, because
+    `resume.fidelity_problems` compares digests afterwards: a row rebuilt rather
+    than copied would fail that audit as if the walker had cheated.
+    """
+    seen = []
+    carried = run_ladder.schema.empty_row("results")
+    carried["execution_mode"] = "hybrid"
+    carried["study_id"] = "an-earlier-session"
+    carried["seq_len"] = 512
+    carried["study_case_label"] = "coarse 512"
+    carried["avg_latency_ms"] = 3.25
+    carried["run_status"] = "passed"
+    carried["failure_message"] = ""
+
+    with tempfile.TemporaryDirectory() as d:
+        rows = _walk_with_stub(
+            seen,
+            modes=["coarse"],
+            seqs=[512, 1024],
+            out_dir=d,
+            study_id="today",
+            warmup=0,
+            samples=1,
+            runs_per_sample=1,
+            reuse={("coarse", 512): carried},
+        )
+        back = results_io.read_rows(os.path.join(d, "coarse.csv"))
+    assert seen == [("coarse", 1024)], "the carried rung must not have dispatched"
+    assert rows[0]["study_id"] == "an-earlier-session"
+    assert back[0]["avg_latency_ms"] == "3.25"
+    assert back[0]["study_id"] == "an-earlier-session"
+
+
+def test_a_skip_beats_a_reuse():
+    """A rung the profile now refuses must not be resurrected from a row
+    measured back when it did not. `resume.plan` excludes those too; checking
+    here as well means the two cannot disagree in the resurrecting direction."""
+    seen = []
+    carried = run_ladder.schema.empty_row("results")
+    carried["execution_mode"] = "fused_elf"
+    carried["study_id"] = "before-the-bound-moved"
+    carried["seq_len"] = 2048
+    carried["study_case_label"] = "fused 2048"
+    carried["run_status"] = "passed"
+    carried["failure_message"] = ""
+
+    with tempfile.TemporaryDirectory() as d:
+        rows = _walk_with_stub(
+            seen,
+            modes=["fused"],
+            seqs=[2048],
+            out_dir=d,
+            study_id="today",
+            warmup=0,
+            samples=1,
+            runs_per_sample=1,
+            skip_reason=lambda m, s: "the bound moved",
+            reuse={("fused", 2048): carried},
+        )
+    assert seen == []
+    assert rows[0]["run_status"] == "skipped"
+    assert rows[0]["study_id"] == "today"
+
+
+def test_the_per_rung_hook_sees_every_rung_with_its_source():
+    """The ledger is written from this, so a source it never reports is a rung
+    that lands on disk attributed to nobody."""
+    events = []
+    carried = run_ladder.schema.empty_row("results")
+    carried["execution_mode"] = "fused_elf"
+    carried["study_id"] = "earlier"
+    carried["seq_len"] = 512
+    carried["study_case_label"] = "fused 512"
+    carried["run_status"] = "passed"
+    carried["failure_message"] = ""
+
+    with tempfile.TemporaryDirectory() as d:
+        _walk_with_stub(
+            [],
+            modes=["fused"],
+            seqs=[512, 1024, 2048],
+            out_dir=d,
+            study_id="test",
+            warmup=0,
+            samples=1,
+            runs_per_sample=1,
+            skip_reason=lambda m, s: "out of range" if s > 1024 else None,
+            reuse={("fused", 512): carried},
+            on_rung=lambda m, s, row, source: events.append((m, s, source)),
+        )
+    assert events == [
+        ("fused", 512, "reused"),
+        ("fused", 1024, "measured"),
+        ("fused", 2048, "skipped"),
+    ]
+    assert set(e[2] for e in events) <= set(run_ladder.schema.RUNG_SOURCES)
+
+
+def test_neither_new_callback_changes_the_existing_behaviour():
+    """Every caller predating resume passes neither and must be unaffected."""
+    seen = []
+    with tempfile.TemporaryDirectory() as d:
+        rows = _walk_with_stub(
+            seen,
+            modes=["coarse"],
+            seqs=[512, 1024],
+            out_dir=d,
+            study_id="test",
+            warmup=0,
+            samples=1,
+            runs_per_sample=1,
+        )
+    assert seen == [("coarse", 512), ("coarse", 1024)]
+    assert [r["study_id"] for r in rows] == ["test", "test"]
 
 
 def main():

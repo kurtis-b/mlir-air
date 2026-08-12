@@ -1171,3 +1171,261 @@ def toolchain_differences(left: dict, right: dict) -> list[tuple[str, str, str]]
         if a != b:
             out.append((name, a, b))
     return out
+
+
+# ---------------------------------------------------------------------------
+# THE WALK BLOCK `[2026-08-12]` -- resume (doc 10 work item 8).
+#
+# WHAT IT IS FOR. A profile walk is long -- 45 min cold for `ladder`, hours for
+# a matrix -- and this host is a laptop that suspends on a lid close. Resume
+# makes an interrupted walk restartable without re-measuring the rungs that
+# already produced rows. The moment it does, one CSV can hold rows measured in
+# two sessions, hours or days apart, possibly across a reboot -- and NOTHING in
+# a results row says which session it came from.
+#
+# That is the same defect the conditions block closed one level up: a fact the
+# numbers depend on, living nowhere in the artifact. Two runs at different
+# power modes are not a comparison; two HALVES OF ONE CSV measured at different
+# toolchains are not one walk either, and until this block existed a resumed
+# walk was indistinguishable from a single-session one.
+#
+# WHY A BLOCK AND NOT A `results` COLUMN -- item 15's decision, unchanged and
+# for its reason. A `session_id` column is the obvious design and it is the
+# wrong one: a new column bumps `SCHEMA_VERSION` to 3, `results_io.read_rows`
+# rejects both a header and a version mismatch, and the bump that took 56 v1
+# CSVs out of every reader on 08-10 would take the surviving v2 roots
+# `compare_roots` is actually pointed at. So attribution lives OUT of the row,
+# keyed by `(execution_mode, seq_len)`, and the cost of that choice is stated
+# in `resume.py`: attribution is a claim ABOUT rows rather than a field IN them,
+# which is exactly why every attributed rung carries a `row_digest`.
+#
+# THE DIGEST IS THE LOAD-BEARING PART, and it is what makes this block able to
+# fail. Bookkeeping that only counts what the runner says it did cannot catch a
+# runner that says the wrong thing -- G0's two closed defects were both checks
+# that could not fail. A digest is evidence: a rung the ledger calls `reused`
+# whose row no longer hashes to what was recorded was NOT reused, it was
+# re-measured or edited, and either way the ledger is lying about the file.
+#
+# `absent` IS NOT `unknown`, for `toolchain_from_manifest`'s reason. Every root
+# recorded before today has no ledger, and a walk block synthesised for one says
+# `absent` -- "older than the field" -- and adds NO problems. Back-compatible by
+# construction: a manifest built without a walk block is byte-identical to what
+# it was, exactly as `expected_rows=None` leaves the counts unchecked.
+#
+# SCHEMA_VERSION STAYS 2. Not in `_FIELDS_BY_TABLE` either -- it is a JSON block,
+# and anything iterating CSV tables must not be able to write it out as a
+# one-row CSV. `test_schema.py` pins both.
+# ---------------------------------------------------------------------------
+
+#: How a walk's rows came to exist. `single_session` and `resumed` are the two
+#: WRITABLE values; `absent` is reader-only, for a root older than the ledger.
+WALK_SOURCES: tuple[str, ...] = (
+    "single_session",
+    "resumed",
+    "unknown",
+    "absent",
+)
+
+#: A session's own state. `interrupted` is not written by the session it
+#: describes -- a killed process writes nothing -- it is what the NEXT session
+#: relabels an unfinished predecessor as, which is the only party in a position
+#: to observe that it never ended.
+SESSION_STATUSES: tuple[str, ...] = ("running", "complete", "interrupted")
+
+#: Where one rung's row came from, within a session.
+#:
+#:   measured  a child process ran and produced it in THIS session.
+#:   reused    it was carried forward from an earlier session unchanged.
+#:   skipped   the profile's applicability rule refused it; nothing ran.
+#:
+#: `reused` and `skipped` are deliberately distinct even though neither
+#: dispatches: a skip is a claim about what the MODE supports and is re-derived
+#: every session, while a reuse is a claim that an EARLIER MEASUREMENT still
+#: stands. Collapsing them would make "we did not run this today" mean two
+#: different things under one label.
+RUNG_SOURCES: tuple[str, ...] = ("measured", "reused", "skipped")
+
+#: One rung's entry in a session's ledger. `row_digest` is the evidence; the
+#: rest is identity.
+SESSION_RUNG_FIELDS: tuple[Field, ...] = (
+    Field("execution_mode", "The row's `execution_mode` CSV value, not the code name."),
+    Field("seq_len", "The rung's sequence length. With the mode, the row key."),
+    Field("source", "One of RUNG_SOURCES: how this session came by the row."),
+    Field("run_status", "The row's `run_status`, copied so the ledger is readable alone."),
+    Field(
+        "row_digest",
+        "Stable hash of every schema field of the row as this session left it. "
+        "The check that can fail: a `reused` rung whose on-disk row no longer "
+        "hashes to this was re-measured or edited behind the ledger.",
+    ),
+)
+
+#: One walk session. Everything two sessions must agree on before their rows may
+#: sit in one CSV is recorded here, per session, so the disagreement is visible.
+SESSION_FIELDS: tuple[Field, ...] = (
+    Field("session_id", "Monotonic within a results root: s001, s002, ..."),
+    Field("profile", "The profile name this session walked. A session that walked a DIFFERENT profile into the same root is a splice of two plans, not a resume."),
+    Field(
+        "status",
+        "One of SESSION_STATUSES. `interrupted` is the one that carries "
+        "information: it is a session that started walking and never recorded "
+        "an end, which is what a reboot mid-walk looks like from the outside.",
+    ),
+    Field("started_utc", "ISO-8601 UTC when the session began walking."),
+    Field("ended_utc", "ISO-8601 UTC when it finished, or None if it never did."),
+    Field("devq_job_id", "The `DEVQ_JOB_ID` this session ran under, or None off-queue. The log behind the session."),
+    Field("git_sha", "HEAD at session start. Two sessions at different shas measured two trees."),
+    Field("npu_power_mode", "The mode this session measured at. THE axis a splice must never cross -- README trap 0."),
+    Field("toolchain_fingerprint", "The toolchain identity fields joined, so a splice across a rebuild is one string comparison."),
+    Field("rungs", "List of SESSION_RUNG_FIELDS records, appended AS EACH RUNG COMPLETES so a killed session's attribution survives it."),
+)
+
+WALK_FIELDS: tuple[Field, ...] = (
+    Field(
+        "walk_source",
+        "One of WALK_SOURCES: whether these rows came from one walk or several. "
+        "`resumed` is not a defect and is not a warning -- it is the fact a "
+        "reader needs before treating a CSV as one population.",
+    ),
+    Field("session_count", "How many sessions produced this root's rows."),
+    Field("sessions", "The ledger: a list of SESSION_FIELDS records, oldest first."),
+    Field("rungs_measured", "Rungs a child process actually ran, summed over sessions."),
+    Field("rungs_reused", "Rungs carried forward from an earlier session."),
+    Field(
+        "rungs_unattributed",
+        "Rows on disk that no session claims. Never zero by accident: a row "
+        "nobody measured is a row whose provenance is unknown, and the whole "
+        "point of the ledger is that there are none of those.",
+    ),
+    Field(
+        "condition_splices",
+        "Axes on which the measuring sessions disagree -- any of "
+        "`npu_power_mode`, `toolchain`, `git_sha`. A pmode splice is a PROBLEM "
+        "(compare_roots refuses one between roots; inside one CSV it is worse); "
+        "the other two are FLAGGED, because resuming after a commit is normal "
+        "and refusing it would make resume unusable.",
+    ),
+    Field(
+        "attribution_problems",
+        "Why this walk cannot be described honestly, if it cannot. Merged into "
+        "the manifest's `incomplete_reasons`, so a lying ledger makes a run "
+        "INCOMPLETE rather than merely annotated.",
+    ),
+    Field("walk_detail", "Prose provenance, or why a field is empty."),
+)
+
+#: The manifest key the walk block lives under.
+WALK_KEY = "walk"
+
+WALK_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in WALK_FIELDS)
+SESSION_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in SESSION_FIELDS)
+SESSION_RUNG_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in SESSION_RUNG_FIELDS)
+
+
+def empty_walk() -> dict[str, object]:
+    """A complete walk block that claims nothing. ``empty_conditions``' rule."""
+    return {
+        "walk_source": UNKNOWN_CONDITION,
+        "session_count": 0,
+        "sessions": [],
+        "rungs_measured": 0,
+        "rungs_reused": 0,
+        "rungs_unattributed": 0,
+        "condition_splices": [],
+        "attribution_problems": [],
+        "walk_detail": None,
+    }
+
+
+def walk_from_manifest(manifest: object) -> dict[str, object]:
+    """The walk block of a manifest dict, degrading to ``absent``.
+
+    THE ONLY SUPPORTED READER, for ``toolchain_from_manifest``'s reason: no
+    manifest written before `[2026-08-12]` carries this key, and a reader that
+    indexed it would raise on the entire recorded corpus. ``absent`` means the
+    root predates the ledger -- its rows may well have come from one session,
+    but nothing recorded that, and a reader must not assume it.
+    """
+    block = manifest.get(WALK_KEY) if isinstance(manifest, dict) else None
+
+    out = empty_walk()
+    if not isinstance(block, dict):
+        out["walk_source"] = "absent"
+        out["walk_detail"] = (
+            "this manifest has no walk block -- it was written before resume "
+            "existed. Whether its rows came from one session is not recoverable "
+            "from the files and must not be guessed."
+        )
+        return out
+    for name in WALK_FIELDNAMES:
+        if name in block:
+            out[name] = block[name]
+    out["walk_source"] = normalise_power_mode(out["walk_source"])
+    return out
+
+
+def validate_session(record: dict[str, object]) -> None:
+    """Raise ``ValueError`` unless ``record`` is a writable session record."""
+    expected = set(SESSION_FIELDNAMES)
+    got = set(record)
+    if missing := expected - got:
+        raise ValueError(f"session record is missing keys: {sorted(missing)}")
+    if extra := got - expected:
+        raise ValueError(
+            f"session record has keys not in the schema: {sorted(extra)}. "
+            "Adding a session fact is a declaration in schema.SESSION_FIELDS, "
+            "not a key invented at the call site."
+        )
+    if record["status"] not in SESSION_STATUSES:
+        raise ValueError(
+            f"session status={record['status']!r} is not one of "
+            f"{list(SESSION_STATUSES)}"
+        )
+    rungs = record["rungs"]
+    if not isinstance(rungs, list):
+        raise ValueError(f"session `rungs` must be a list, got {type(rungs).__name__}")
+    for i, rung in enumerate(rungs):
+        if not isinstance(rung, dict) or set(rung) != set(SESSION_RUNG_FIELDNAMES):
+            raise ValueError(
+                f"session rung {i} does not match SESSION_RUNG_FIELDS: "
+                f"{sorted(rung) if isinstance(rung, dict) else rung}"
+            )
+        if rung["source"] not in RUNG_SOURCES:
+            raise ValueError(
+                f"session rung {i} source={rung['source']!r} is not one of "
+                f"{list(RUNG_SOURCES)}"
+            )
+
+
+def validate_walk(block: dict[str, object]) -> None:
+    """Raise ``ValueError`` unless ``block`` is a writable walk block.
+
+    Same shape of check as ``validate_conditions``, plus every session record.
+    ``absent`` is refused for its reason: it is what ``walk_from_manifest``
+    synthesises for a root older than the ledger, and writing it would claim a
+    run predates a field it carries.
+    """
+    expected = set(WALK_FIELDNAMES)
+    got = set(block)
+    if missing := expected - got:
+        raise ValueError(f"walk block is missing keys: {sorted(missing)}")
+    if extra := got - expected:
+        raise ValueError(
+            f"walk block has keys not in the schema: {sorted(extra)}. Adding a "
+            "walk fact is a declaration in schema.WALK_FIELDS, not a key "
+            "invented at the call site."
+        )
+    source = normalise_power_mode(block.get("walk_source"))
+    if source not in WALK_SOURCES:
+        raise ValueError(
+            f"walk_source={block.get('walk_source')!r} is not one of "
+            f"{list(WALK_SOURCES)}"
+        )
+    if source == "absent":
+        raise ValueError(
+            "walk_source='absent' is READER-ONLY -- it is what "
+            "walk_from_manifest synthesises for a root older than the ledger, "
+            "and writing it would claim a run predates a field it carries."
+        )
+    for record in block["sessions"]:
+        validate_session(record)

@@ -27,6 +27,35 @@ CONTRACT
     profile could not reach. The manifest says whether the run is complete; this
     says what the run was.
 
+RESUME `[2026-08-12]` -- doc 10 work item 8
+    ``--resume`` carries forward every rung this root already holds a ``passed``
+    row for and walks the rest. A ``ladder`` walk is ~45 min cold and this host
+    is a laptop that suspends on a lid close; without resume a reboot at minute
+    40 costs the whole thing.
+
+    Three things make it a resume rather than a shortcut, and the third is the
+    one that matters:
+
+      - ``study/resume.py`` decides reuse. ``failed`` is never reused, only
+        ``passed``; a skip is re-derived from the profile every session.
+      - the ledger (``walk_sessions.json``) is opened before the walk and
+        flushed after EVERY rung, so a session killed halfway leaves an
+        ``interrupted`` record naming what it attributed, which the next session
+        closes out. That record reaches the manifest as the ``walk`` block.
+      - the run AUDITS ITSELF. Every carried-forward rung is re-hashed after the
+        walk; a rung the plan called reused whose row moved is a ``RESUME
+        DEFECT`` and makes the run INCOMPLETE. A resume that silently redoes
+        work empties every downstream diff, and bookkeeping that only counts
+        what the runner intended could never see it.
+
+    Completeness is unaffected by resuming: ``manifest``'s row-count clauses
+    read the CSVs and know nothing about sessions, so a resumed walk that is
+    short is incomplete exactly as a fresh one is. **A resume cannot report a
+    complete walk that is not one.** What it cannot do is make two sessions one
+    measurement -- see ``resume.py`` §WHAT IT CANNOT.
+
+    A results root that already holds CSVs is REFUSED without ``--resume``.
+
 WHAT IT DELIBERATELY DOES NOT DO
     No reboot orchestration, no ``@reboot`` crontab hook, no TTM page-limit
     transitions, no thermal gate, no ``turbostat``. Doc 34 §4.4 recommends
@@ -109,15 +138,32 @@ for _p in (_PE, os.path.join(_PE, "llms"), _EXAMPLE, _HERE):
 import manifest  # noqa: E402
 import power  # noqa: E402
 import profiles  # noqa: E402
+import resume as resume_mod  # noqa: E402
 import run_lock  # noqa: E402
+import schema  # noqa: E402
 import smoke_gate  # noqa: E402
 
 MANIFEST_NAME = "results_manifest.json"
 RUN_REPORT_NAME = "profile_run.json"
 
 
-def _require_turbo() -> None:
-    """The measurement precondition. Imported, never re-derived.
+def _require_turbo() -> str:
+    """The measurement precondition, and it RETURNS what it observed.
+
+    `[2026-08-12]` The return value is new and it closes a hole opened by the
+    conditions block landing before this caller did: ``gate`` never passed
+    ``conditions=`` to ``build_manifest``, so every profile manifest recorded
+    ``npu_power_mode: unknown`` -- on a run that had just REFUSED to start
+    unless the mode was turbo. The rule is "never stamp a condition you did not
+    observe"; this was its inverse, observing and then discarding, which is the
+    worse half because the artifact then looks like nobody could tell.
+
+    Stamped ``observed`` rather than ``probed_at_manifest_build`` because this
+    call happens before the walk, on the clock of the measurement, which is what
+    that source value means. ``seed-throughput-baseline.sh`` stamps the
+    throughput floor the same way for the same reason.
+
+    Imported, never re-derived.
 
     ``sweep.registry_sweep.require_turbo`` is the single implementation
     ``run_mode.py``, ``component_groups.py`` and
@@ -134,10 +180,12 @@ def _require_turbo() -> None:
     failed measurement and a caller must be able to tell them apart: 1 means the
     profile ran and did not complete, 2 means it never started.
     """
-    from sweep.registry_sweep import TurboNotEnforced, require_turbo
+    from sweep.registry_sweep import TurboNotEnforced, npu_power_mode, require_turbo
 
     try:
         require_turbo()
+        mode, _detail = npu_power_mode()
+        return schema.normalise_power_mode(mode)
     except TurboNotEnforced as exc:
         print(f"[run-profile] refused: {exc}")
         print(
@@ -214,6 +262,84 @@ def device_preflight(devq: Path | None = None) -> bool | None:
     return None
 
 
+#: Modules a rung needs that a bare shell does not have, with what a caller who
+#: is missing one sees instead. Both are LATE failures: they surface at the first
+#: dispatch or the first builder import, minutes into a cold walk, looking like a
+#: model regression rather than like a shell that was never set up.
+_REQUIRED_MODULES = {
+    "pyxrt": (
+        "pyxrt lives beside the XRT install and `env_setup.sh` does NOT add it. "
+        "Without it XRTBackend.load() raises at the FIRST DISPATCH -- after "
+        "every kernel has compiled -- and the traceback says "
+        "ModuleNotFoundError, which reads as a broken model. Source "
+        "agents/scripts/port-loop/lib-env.sh and call BOTH pl_env_ensure and "
+        "pl_env_ensure_xrt"
+    ),
+    "ml_dtypes": (
+        "every builder imports bfloat16 from ml_dtypes at module scope, so the "
+        "first rung dies importing opcheck_specs. Same fix: the port-loop "
+        "environment, not a pip install beside a live gate"
+    ),
+}
+
+
+def environment_problems(cwd: Path | None = None, importable=None) -> list[str]:
+    """What would make this walk die mid-suite. Empty means nothing found.
+
+    `[2026-08-12]` DOC 10's WORK ITEM 5, TAKEN AS A CHECK RATHER THAN AS PROSE.
+    That item asks for "the prerequisites and recovery sections of the example
+    README", because "the runner shells out to all of them, and a missing tool
+    fails mid-suite rather than at start unless checked". The last four words are
+    the requirement; the README is one way to meet it, and the weaker one -- a
+    paragraph cannot fail, and this project's own record is of prose rules that
+    were true when written and silently stopped being true (README trap 0 lived
+    in prose for exactly that reason until the conditions block moved it into the
+    artifact).
+
+    The TABLE doc 10 specifies is separately obsolete and is recorded as dropped:
+    of its six tools, `amd-ttm`, `turbostat`, `sensors`, `rocm-smi` and `crontab`
+    are all in doc 10 §Deliberately dropped with a measurement behind each, and
+    the sixth, `xrt-smi`, is only ever READ here -- `require_turbo` already
+    refuses when it is missing or unparsable. So the prerequisite that is
+    actually unguarded is not a binary at all: it is the two Python modules a
+    bare devq shell lacks, both of which fail LATE.
+
+    ``importable`` is injectable so the host tests can drive both directions
+    without unloading a module out from under the interpreter running them.
+    """
+    import importlib.util
+
+    if importable is None:
+
+        def importable(name):
+            try:
+                return importlib.util.find_spec(name) is not None
+            except Exception:
+                return False
+
+    problems = []
+    for name, why in _REQUIRED_MODULES.items():
+        if not importable(name):
+            problems.append(f"`{name}` is not importable. {why}")
+
+    # aircc and KernelCache write relative to cwd, and only the example
+    # directory's .gitignore covers the debris -- doc 15's rule that "a new
+    # artifact directory is the DEFAULT OUTCOME of adding a KernelCache-backed
+    # gate, not an exception". A walk from anywhere else leaks .o files,
+    # air_project/ and four *_cache/ directories into whatever it was launched
+    # from, which is how eleven artifacts were committed by mistake once.
+    cwd = Path(cwd) if cwd else Path.cwd()
+    if cwd.resolve() != Path(_EXAMPLE).resolve():
+        problems.append(
+            f"the working directory is {cwd}, not {_EXAMPLE}. aircc and "
+            "KernelCache write relative to cwd and only the example's own "
+            ".gitignore covers what they write, so a walk from here leaves "
+            "*.o, air_project/ and the per-mode *_cache/ directories loose in "
+            "the tree (doc 15)"
+        )
+    return problems
+
+
 def _tree_dirt(repo: Path) -> list[str]:
     """Tracked-tree paths a run left behind. Best effort; never raises.
 
@@ -236,6 +362,20 @@ def _tree_dirt(repo: Path) -> list[str]:
     return [line for line in out.stdout.splitlines() if line.strip()]
 
 
+def _rung_sources(ledger) -> dict[str, int]:
+    """This session's rungs by ``schema.RUNG_SOURCES``, read off the ledger.
+
+    Off the LEDGER and not off the plan, deliberately: the ledger is appended by
+    the walker as each rung lands, so it says what happened, while the plan says
+    what was intended. A report built from the plan would agree with itself no
+    matter what the walk did, which is the shape of check G0 closed twice.
+    """
+    counts = {source: 0 for source in schema.RUNG_SOURCES}
+    for rung in ledger.sessions[-1]["rungs"]:
+        counts[rung["source"]] += 1
+    return counts
+
+
 def _rung_outcomes(rows: list[dict]) -> list[dict]:
     """Per-rung outcome for the run report. Counts and status, no latency."""
     return [
@@ -250,7 +390,12 @@ def _rung_outcomes(rows: list[dict]) -> list[dict]:
 
 
 def gate(
-    profile: profiles.Profile, out_dir: str | Path, repo=None, observe_toolchain=False
+    profile: profiles.Profile,
+    out_dir: str | Path,
+    repo=None,
+    conditions=None,
+    toolchain=None,
+    walk=None,
 ) -> dict:
     """Run the gate over an existing tree and write its manifest. No device.
 
@@ -259,15 +404,17 @@ def gate(
     Phase F gate artifact no longer verifies against schema v2. A gate you
     cannot re-run over an old tree is a gate whose past verdicts are hearsay.
 
-    ``observe_toolchain`` `[2026-08-12]`, queue item 16, AND IT DEFAULTS FALSE.
-    This function has two callers with opposite entitlements. ``run`` calls it
-    immediately after walking on this host, so probing describes the toolchain
-    that did the measuring and is stamped ``probed_at_manifest_build``.
+    EVERY CONDITION BLOCK IS THE CALLER'S, AND ALL THREE DEFAULT TO NONE.
+    `[2026-08-12]`, queue item 16 and resume. This function has two callers with
+    opposite entitlements. ``run`` measured on this host just now, so it hands
+    over what it observed -- the power mode it refused to start without, the
+    toolchain it dispatched through, and the ledger it just wrote.
     ``--gate-only`` re-verifies a tree measured at some earlier time, possibly
-    against a toolchain since overwritten -- probing there would write TODAY's
-    versions onto SOMEONE ELSE's measurement, which is the "never stamp a
-    condition you did not observe" rule broken by a helpful default. So the
-    honest answer for a re-gate is ``unknown``, and the flag has to be asked for.
+    against a toolchain since overwritten and a power mode since reset; probing
+    there would write TODAY's conditions onto SOMEONE ELSE's measurement, which
+    is the "never stamp a condition you did not observe" rule broken by a
+    helpful default. So a re-gate records ``unknown``, loudly, and the walk
+    block it reads back is whatever the tree already carries.
     """
     out_dir = Path(out_dir)
     expected = profile.expected_files()
@@ -283,7 +430,9 @@ def gate(
         expected,
         repo=repo,
         expected_rows=expected_rows,
-        toolchain=manifest.observe_toolchain() if observe_toolchain else None,
+        conditions=conditions,
+        toolchain=toolchain,
+        walk=walk,
     )
     manifest.write_manifest(out_dir / MANIFEST_NAME, built)
     print(f"[manifest] wrote {out_dir / MANIFEST_NAME}")
@@ -299,6 +448,9 @@ def gate(
                 f"passed {got['passed']}/{want['measured']}  "
                 f"skipped {got['skipped']}/{want['skipped']}"
             )
+    block = built[schema.WALK_KEY]
+    if built["walk_attribution_checked"]:
+        print(f"[manifest]   walk: {block['walk_detail']}")
     return built
 
 
@@ -313,12 +465,23 @@ def run(
     power_backend: str = "auto",
     walker=None,
     repo=None,
+    resume: bool = False,
+    npu_power_mode: str | None = None,
 ) -> dict:
     """Walk the profile, gate it, and write both artifacts. Returns the report.
 
     ``walker`` is injectable so the host tests can exercise every step of this
     function without a device; production leaves it ``None`` and gets
     ``run_ladder.walk``.
+
+    ``resume`` carries forward every rung this root already holds a ``passed``
+    row for. The ledger is opened BEFORE the walk and flushed after every rung,
+    so a session killed halfway leaves an ``interrupted`` record naming exactly
+    the rungs it attributed -- not a hole where the reason for the resume was.
+
+    ``npu_power_mode`` is what the caller OBSERVED before starting (``main``
+    passes what ``_require_turbo`` saw). It is stamped ``observed``, and it is
+    also what a later session's rows are checked against for a pmode splice.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -327,26 +490,92 @@ def run(
 
         walker = run_ladder.walk
 
-    started = datetime.now(timezone.utc)
-    t0 = time.perf_counter()
-    with power.open_monitor(power_backend) as monitor:
-        rows = walker(
-            list(profile.modes),
-            list(profile.seqs),
-            str(out_dir),
-            study_id,
-            warmup,
-            samples,
-            runs_per_sample,
-            skip_reason=profiles.skip_reason,
+    expected_files = profile.expected_files()
+    repo_root = Path(repo) if repo else Path(_PE).parent
+
+    # Scanned BEFORE the ledger is opened: what the root holds is a fact about
+    # the previous sessions, and opening a session first would make this
+    # session's own (empty) attribution part of the input to its own plan.
+    prior = resume_mod.scan(out_dir, expected_files)
+    ledger = resume_mod.Ledger.load(out_dir)
+    conditions = manifest.observe_conditions(npu_power_mode)
+    toolchain = manifest.observe_toolchain()
+
+    plan = resume_mod.plan(profile, prior, enabled=resume)
+    if resume:
+        for line in resume_mod.describe(plan):
+            print(f"[run-profile] {line}")
+        print(
+            f"[run-profile] resume: {len(plan.reuse)} rung(s) carried forward, "
+            f"{len(plan.remeasure)} to walk, {len(plan.skipped)} skipped"
         )
-        power_columns = monitor.stats()
+
+    started = datetime.now(timezone.utc)
+    ledger.open_session(
+        profile=profile.name,
+        started_utc=started.isoformat(),
+        devq_job_id=os.environ.get("DEVQ_JOB_ID"),
+        git_sha=resume_mod.git_sha(repo_root),
+        npu_power_mode=conditions["npu_power_mode"],
+        toolchain_fingerprint=resume_mod.toolchain_fingerprint(toolchain),
+    )
+    t0 = time.perf_counter()
+    try:
+        with power.open_monitor(power_backend) as monitor:
+            rows = walker(
+                list(profile.modes),
+                list(profile.seqs),
+                str(out_dir),
+                study_id,
+                warmup,
+                samples,
+                runs_per_sample,
+                # BOUND to this profile's family. The bare module function
+                # would apply the 768 packing bound to a 512 walk, skipping
+                # `fused` rungs it supports -- and a skipped rung is not a
+                # failure, so the walk would report complete having never
+                # attempted them.
+                skip_reason=profile.skip_rule(),
+                reuse=plan.reuse_for_walk,
+                on_rung=ledger.record_rung,
+                family=profile.family,
+            )
+            power_columns = monitor.stats()
+    finally:
+        # Closed in a `finally` so a walk that raises still leaves a readable
+        # session -- an exception mid-walk is the ordinary case here, not the
+        # exceptional one, and an unclosed session is what the NEXT run reports
+        # as `interrupted`. Nothing is invented: `ended_utc` is set because this
+        # process did observe the end.
+        ledger.close_session()
     wall_sec = time.perf_counter() - t0
 
-    # The walk just happened, on this host: probing the toolchain now describes
-    # the build that produced these rows. See `gate`'s docstring for why the
-    # `--gate-only` caller below deliberately does not.
-    built = gate(profile, out_dir, repo=repo, observe_toolchain=True)
+    # THE CHECK AGAINST A RESUME THAT SILENTLY REDOES WORK. `plan` said which
+    # rungs would be carried forward; this re-hashes what the walk actually
+    # produced for them. Bookkeeping alone would report whatever the plan said.
+    fidelity = resume_mod.fidelity_problems(plan.reuse, rows)
+    for line in fidelity:
+        print(f"[run-profile] RESUME DEFECT {line}")
+
+    # Re-scanned AFTER the walk, so the audit compares the ledger against the
+    # files as they now are rather than against the rows this process happens to
+    # be holding -- the two differing is precisely what it is looking for.
+    after = resume_mod.scan(out_dir, expected_files)
+    walk_block = resume_mod.walk_block(
+        ledger, after, profile=profile, fidelity=fidelity
+    )
+
+    # The walk just happened, on this host: the conditions and the toolchain
+    # observed here describe the build that produced these rows. See `gate`'s
+    # docstring for why the `--gate-only` caller below deliberately does not.
+    built = gate(
+        profile,
+        out_dir,
+        repo=repo,
+        conditions=conditions,
+        toolchain=toolchain,
+        walk=walk_block,
+    )
 
     by_status: dict[str, int] = {}
     for row in rows:
@@ -360,12 +589,21 @@ def run(
         "wall_clock_sec": round(wall_sec, 3),
         "rungs": _rung_outcomes(rows),
         "rungs_by_status": by_status,
+        # Counted from the LEDGER, which is written per rung by the walker --
+        # not from the plan, which is what this process intended. The two
+        # disagreeing is `resume_defects` below.
+        "rungs_by_source": _rung_sources(ledger),
+        "resume_requested": resume,
+        "resume_defects": fidelity,
+        "session_id": ledger.sessions[-1]["session_id"],
+        "session_count": len(ledger.sessions),
+        "condition_splices": walk_block["condition_splices"],
         "complete": built["complete"],
         "incomplete_reasons": built["incomplete_reasons"],
         # SoC watts over the WHOLE walk, compilation included. See the footgun.
         "power_over_whole_walk": power_columns,
         "devq_job_id": os.environ.get("DEVQ_JOB_ID"),
-        "tree_dirt_after_run": _tree_dirt(Path(repo) if repo else Path(_PE).parent),
+        "tree_dirt_after_run": _tree_dirt(repo_root),
     }
     (out_dir / RUN_REPORT_NAME).write_text(
         json.dumps(report, indent=2, sort_keys=True, default=str) + "\n",
@@ -398,6 +636,14 @@ def main(argv: list[str] | None = None) -> int:
         "--profile", required=True, help=f"one of {sorted(profiles.PROFILES)}"
     )
     ap.add_argument("--out-dir", required=True, help="results root for this walk")
+    ap.add_argument(
+        "--family",
+        default=None,
+        help=f"retarget the profile to another case-matrix family; one of "
+        f"{list(profiles.REACHABLE_FAMILIES)}. Every expected count is "
+        f"re-derived, including `fused`'s applicability bound, which moves "
+        f"with the width.",
+    )
     ap.add_argument("--study-id", default=None, help="defaults to g0-<profile>")
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--samples", type=int, default=3)
@@ -413,14 +659,26 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="re-verify an existing results root and rewrite its manifest",
     )
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="carry forward every rung this root already has a PASSED row for, "
+        "and walk the rest. Required to write into a root that already holds "
+        "results: without it a populated root is refused rather than half "
+        "overwritten. Failed rungs are always re-run -- see study/resume.py.",
+    )
     args = ap.parse_args(argv)
 
     try:
         prof = profiles.profile(args.profile)
+        if args.family:
+            prof = prof.retarget(args.family)
     except ValueError as exc:
         print(f"[run-profile] {exc}")
         return 2
     study_id = args.study_id or f"g0-{prof.name}"
+    if args.family:
+        study_id = args.study_id or f"g0-{prof.name}-{args.family}"
 
     if args.dry_run:
         _print_plan(prof)
@@ -431,7 +689,39 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if built["complete"] else 1
 
     _print_plan(prof)
-    _require_turbo()
+
+    # A POPULATED ROOT IS REFUSED UNLESS A RESUME WAS ASKED FOR, and this guard
+    # points both ways. Walking a used root without `--resume` half-overwrites
+    # it: `run_ladder` rewrites a mode's CSV from the rungs of THIS walk, so a
+    # root would end up holding one mode's old rows beside another mode's new
+    # ones with nothing recording the seam. And resuming a root by accident is
+    # the opposite failure -- last week's rows presented as today's walk. There
+    # is no flag to overwrite, because wanting to overwrite a recorded walk is
+    # wanting a different --out-dir, which costs nothing and keeps both.
+    populated = [
+        rel for rel in prof.expected_files() if (Path(args.out_dir) / rel).is_file()
+    ]
+    if populated and not args.resume:
+        print(
+            f"[run-profile] refused: {args.out_dir} already holds "
+            f"{', '.join(populated)}. Pass --resume to carry forward the rungs "
+            "that already have passed rows, or give a fresh --out-dir. Walking "
+            "over a recorded root would leave one CSV from each walk and "
+            "nothing saying which is which."
+        )
+        return 2
+
+    # Doc 10 item 5: refuse at START, not mid-suite. AFTER the argument checks
+    # above -- an out-dir mistake is the caller's and is instant to fix -- and
+    # BEFORE the pmode check, because a shell with no pyxrt cannot dispatch
+    # whatever the power mode is.
+    environment = environment_problems()
+    for problem in environment:
+        print(f"[run-profile] refused: {problem}")
+    if environment:
+        return 2
+
+    mode = _require_turbo()
 
     if not os.environ.get("DEVQ_JOB_ID"):
         # Not a refusal: a host-only rehearsal is legitimate. But the device is
@@ -461,17 +751,29 @@ def main(argv: list[str] | None = None) -> int:
                 samples=args.samples,
                 runs_per_sample=args.runs_per_sample,
                 power_backend=args.power_backend,
+                resume=args.resume,
+                npu_power_mode=mode,
             )
     except run_lock.StudyAlreadyRunning as exc:
         print(f"[run-profile] refused: {exc}")
         return 2
 
     counts = report["rungs_by_status"]
+    sources = report["rungs_by_source"]
     print(
         f"[run-profile] {prof.name}: "
         + "  ".join(f"{k} {v}" for k, v in sorted(counts.items()))
         + f"  ({report['wall_clock_sec']:.0f}s wall)"
     )
+    print(
+        f"[run-profile] {report['session_id']} of {report['session_count']}: "
+        + "  ".join(f"{k} {v}" for k, v in sorted(sources.items()))
+    )
+    for axis in report["condition_splices"]:
+        print(
+            f"[run-profile] WARNING this root's rows were measured across a "
+            f"{axis} change; they were not all produced by one tree"
+        )
     if report["tree_dirt_after_run"]:
         print(
             f"[run-profile] WARNING the run left {len(report['tree_dirt_after_run'])} "

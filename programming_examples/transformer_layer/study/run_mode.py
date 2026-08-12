@@ -143,21 +143,80 @@ def _stage_stats(actual, expected, atol):
     }
 
 
-def _shape_for(spec: dict, seq_len: int | None) -> tuple[dict, str]:
-    """The spec's shape, optionally at a different sequence length (J3's ladder).
+def _shape_for(
+    spec: dict, seq_len: int | None, family: str | None = None
+) -> tuple[dict, str, str]:
+    """The spec's shape at a different length and/or WIDTH. Returns a copy.
 
     Returns a COPY. Mutating ``spec["shape"]`` would rewrite the module-level
     ``SPECS`` row, so a second rung in the same process would silently inherit
     the first rung's length -- a ladder that reports several lengths and
     measured one.
+
+    ``family`` `[2026-08-12]` OVERRIDES THE WIDTH, and it is the same liberty
+    ``seq_len`` has taken since J3 rather than a new one. A SPECS row is a
+    (builder, tolerance) pair with ONE shape written beside it; the ladder has
+    always walked that builder at eight lengths the row does not name, keeping
+    the row's ``atol``. Widening it to the case matrix's other encoder widths is
+    that precedent applied to a second axis, and it is why the coverage sweep is
+    not a Phase-C-sized job: the registry rows for hidden 512 and 1024 have
+    existed since 2026-08-07, so nothing needed measuring -- only reaching.
+
+    WHAT THAT COSTS, SAID OUT LOUD. The row's ``atol`` was measured at ITS shape
+    (doc 06's hard-ceiling argument), and a run at another width inherits it
+    unmeasured, exactly as a 16384 rung does today. That is acceptable because
+    the ceiling is a defect threshold rather than a fitted tolerance -- exceeding
+    it is a defect report, never a widened number -- but the first run at a new
+    width must have its ``atol_required`` recorded, and a row that needs a wider
+    tolerance is a finding, not a knob.
+
+    ``head_dim`` is DERIVED, not carried: every family in the matrix is
+    ``hidden // heads == 64``, and carrying the 768 row's 64 forward by accident
+    would be right for the wrong reason and wrong the moment one is not.
     """
     shape = dict(spec["shape"])
-    if seq_len is None:
-        return shape, spec["shape_key"]
-    shape["seq_len"] = seq_len
+    variant = "encoder_bert"
+    if family is not None:
+        import cases
+
+        fam = cases.FAMILY_SPECS[family]
+        variant = fam.workload_variant
+        shape["emb_dim"] = fam.hidden_size
+        shape["ffn_dim"] = fam.intermediate_size
+        shape["num_heads"] = fam.num_attention_heads
+        shape["head_dim"] = fam.hidden_size // fam.num_attention_heads
+    if seq_len is None and family is None:
+        return shape, spec["shape_key"], variant
+    if seq_len is not None:
+        shape["seq_len"] = seq_len
     # Built, never parsed back out, per opcheck_specs' own note on shape_key.
     emb = shape.get("emb_dim", shape.get("hidden_size", "?"))
-    return shape, f"{seq_len}x{emb}_encoder_bert"
+    return shape, f"{shape['seq_len']}x{emb}_{variant}", variant
+
+
+#: Families whose LAYER GRAPH this module cannot build, with the reason. A
+#: decoder is not the encoder graph with a flag: it needs the norm before
+#: attention, a plain residual add the encoder block never dispatches, and a
+#: masked add between the score GEMM and softmax that `runlist` and `offload`
+#: have no step for at all. The causal KERNEL exists and is validated
+#: (`opcheck_specs` carries causal `mha_out_proj` rows); the whole-layer wiring
+#: does not.
+#:
+#: REFUSED RATHER THAN SILENTLY RUN, and that is the whole point of the dict.
+#: Overriding the width alone and labelling the row `decoder_gpt2` would produce
+#: a perfectly valid-looking bidirectional measurement under a causal name --
+#: the worst outcome available here, because nothing downstream could ever
+#: detect it.
+UNBUILDABLE_VARIANTS = {
+    "decoder_gpt2": (
+        "the decoder layer graph is not built by any whole-layer mode: it needs "
+        "the norm BEFORE attention, a plain elementwise residual add the encoder "
+        "block never dispatches, and a causal masked-add between the score GEMM "
+        "and softmax that `runlist` and `offload` have no masking step for. The "
+        "causal kernel itself exists and is validated -- see opcheck_specs' "
+        "causal mha_out_proj rows -- so this is layer wiring, not a kernel gap"
+    )
+}
 
 
 def run(
@@ -166,12 +225,12 @@ def run(
     samples: int,
     runs_per_sample: int,
     seq_len: int | None = None,
+    family: str | None = None,
 ) -> dict:
     """Run ``mode`` and return a schema row. Never raises for a run failure."""
     row = schema.empty_row("results")
     row["execution_mode"] = schema.EXECUTION_MODE_CSV.get(mode, mode)
     row["backend"] = "xrt"
-    row["workload_variant"] = "encoder_bert"
     row["attention_path"] = ATTENTION_PATH_BY_MODE.get(mode)
     row["batch_size"] = 1
     row["dtype"] = "bf16"
@@ -180,7 +239,8 @@ def run(
     row["latency_sample_count"] = samples
 
     spec = _spec_for(mode)
-    shape, shape_key = _shape_for(spec, seq_len)
+    shape, shape_key, variant = _shape_for(spec, seq_len, family)
+    row["workload_variant"] = variant
     row["study_case_id"] = shape_key
     row["study_case_label"] = f"{mode} {shape_key}"
     for key in ("seq_len", "hidden_size", "intermediate_size"):
@@ -196,6 +256,11 @@ def run(
         row["attention_head_size"] = shape["head_dim"]
 
     try:
+        if variant in UNBUILDABLE_VARIANTS:
+            raise RuntimeError(
+                f"{variant} is not buildable by any whole-layer mode: "
+                f"{UNBUILDABLE_VARIANTS[variant]}"
+            )
         # --- everything here is OUTSIDE the timed region -------------------
         setup_t0 = time.perf_counter()
         prepared = spec["prepare"](shape)
@@ -386,6 +451,13 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="sequence length override; omit for the spec's own (J3's ladder)",
     )
+    ap.add_argument(
+        "--family",
+        default=None,
+        help="case-matrix family whose WIDTH to run at (study/cases.py). Omit "
+        "for the spec's own 768. A decoder family is refused with its reason "
+        "rather than run as an encoder under a causal name.",
+    )
     args = ap.parse_args(argv)
 
     # Fail-closed before preparing anything, same guard as the registry sweep:
@@ -399,7 +471,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[run-mode] refused: {exc}")
         return 2
 
-    row = run(args.mode, args.warmup, args.samples, args.runs_per_sample, args.seq)
+    row = run(
+        args.mode,
+        args.warmup,
+        args.samples,
+        args.runs_per_sample,
+        args.seq,
+        args.family,
+    )
     row["study_id"] = args.study_id
     results_io.write_rows(args.out, [row])
 
