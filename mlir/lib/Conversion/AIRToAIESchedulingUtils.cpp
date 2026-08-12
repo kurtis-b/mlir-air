@@ -14,7 +14,9 @@
 #include "mlir/IR/BuiltinOps.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <limits>
 #include <mutex>
@@ -473,6 +475,40 @@ air::getWrapsAndStrides(ArrayRef<OpFoldResult> memcpy_sizes,
   return output;
 }
 
+// Per-fill identity of a channel endpoint, for sizing a legacy counted lock:
+// the channel symbol, its constant bundle indices, and the constant access
+// region. Two channel memcpys that agree on all three are ONE emitted DMA BD
+// re-executed on a later fill -- air-to-aie collapses them into a single BD in
+// that channel's chain -- not two participants in one fill. Returns nullopt if
+// anything is non-constant, so such an op keeps its own identity exactly as
+// before and can never be collapsed into another.
+static std::optional<std::string> getPerFillEndpointKey(Operation *op) {
+  auto chan = dyn_cast_if_present<air::ChannelInterface>(op);
+  if (!chan)
+    return std::nullopt;
+  std::string key;
+  llvm::raw_string_ostream os(key);
+  os << chan.getChanName() << '|';
+  for (auto v : chan.getIndices()) {
+    auto c = getConstantIntValue(v);
+    if (!c)
+      return std::nullopt;
+    os << *c << ',';
+  }
+  os << '|';
+  for (auto &pattern :
+       {chan.getMixedOffsets(), chan.getMixedSizes(), chan.getMixedStrides()}) {
+    for (auto ofr : pattern) {
+      auto c = getConstantIntValue(ofr);
+      if (!c)
+        return std::nullopt;
+      os << *c << ',';
+    }
+    os << ';';
+  }
+  return os.str();
+}
+
 std::pair<int64_t, int64_t>
 air::getLockValuePair(const AIE::AIETargetModel &targetModel,
                       Value buffer_memref) {
@@ -485,29 +521,55 @@ air::getLockValuePair(const AIE::AIETargetModel &targetModel,
     return std::make_pair(-1, -1);
   int read_counter = 0;
   int write_counter = 0;
+  // Reader identities, collapsed per fill (see getPerFillEndpointKey). Anything
+  // without a provable key gets a unique identity, so it is never merged.
+  std::set<std::string> unique_read_endpoints;
+  auto noteRead = [&](Operation *user) {
+    read_counter++;
+    auto key = getPerFillEndpointKey(user);
+    unique_read_endpoints.insert(key ? *key
+                                     : "#" + std::to_string(read_counter));
+  };
   for (auto user : buffer_memref.getUsers()) {
     if (auto memcpyOp = dyn_cast_if_present<air::MemcpyInterface>(user)) {
       if (buffer_memref == memcpyOp.getSrcMemref())
-        read_counter++;
+        noteRead(user);
       else if (buffer_memref == memcpyOp.getDstMemref())
         write_counter++;
     } else if (isa<affine::AffineLoadOp>(user))
-      read_counter++;
+      noteRead(user);
     else if (isa<affine::AffineStoreOp>(user))
       write_counter++;
     else if (auto linalgop = dyn_cast_if_present<linalg::LinalgOp>(user)) {
       for (auto opoperand : linalgop.getDpsInputOperands())
         if (opoperand->is(buffer_memref))
-          read_counter++;
+          noteRead(user);
       for (auto &opoperand : linalgop.getDpsInitsMutable())
         if (opoperand.is(buffer_memref)) {
-          read_counter++;
+          noteRead(user);
           write_counter++;
         }
     }
   }
   if (!read_counter || !write_counter)
     return std::make_pair(1, 1);
+
+  // ONE writer op filling the buffer is the fan-out shape: every distinct
+  // consumer endpoint drains that fill exactly once, so the producer must wait
+  // for as many reads as there are distinct consumer BDs. The raw op count is
+  // not that number -- it also counts the SAME consumer BD as it reappears in
+  // later fills (e.g. a reader nest unrolled over an outer dimension that the
+  // single producer op is not unrolled over). Using it makes the producer
+  // acquire/release more tokens per fill than the consumers can ever return,
+  // and the buffer's refills stall after init/(surplus) rounds.
+  //
+  // Deliberately scoped to write_counter == 1. With several writer ops the
+  // writers are time-multiplexed -- one fires per fill -- and the raw ratio is
+  // correct precisely because both sides carry the same replication; collapsing
+  // only the read side there would halve every fan-in/MIMO design in tree.
+  if (write_counter == 1)
+    read_counter = static_cast<int>(unique_read_endpoints.size());
+
   if (read_counter >= write_counter)
     return std::make_pair(llvm::divideCeilSigned(read_counter, write_counter),
                           1);
