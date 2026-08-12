@@ -310,6 +310,22 @@ add_lit_testsuite(check-programming-examples-transformer-layer
 > UNSUPPORTED test on an NPU-less runner, a host-only test added but not enrolled (9 of 10), and
 > a real failure. Each is caught by exactly one clause.
 >
+> **The 10 tests were run, and the corrected guard passes over them** — devq job **261**,
+> `agents/.state/devq/jobs/job-000261.log`, 19.9 s:
+>
+> ```
+> [ci-leg] lit exit=0
+> [ci-leg] categories: Excluded=352 Passed=10
+> [ci-leg] guard verdict: PASS
+> ```
+>
+> Run as `lit --filter <the target's exact pattern>` against `build-xrt/programming_examples`,
+> which is precisely what `add_lit_testsuite` wraps — **no CMake reconfigure**, because
+> `build-xrt` was not to be touched. The 10 are `run_npu2_compile_peano`, `run_block_cache_tests`,
+> `run_blocked_attention_tests`, `run_ffn_resident_emulation_tests`, `run_reference_tests`,
+> `run_seam_tests`, `run_study_host_tests`, and the sweep's `run_npu2_registry_resolution`,
+> `run_sweep_families_tests`, `run_sweep_writer_tests`.
+>
 > **`-j1`, deliberately not applied to either transformer-layer target.** The host target
 > dispatches nothing, so parallelism costs nothing. The hardware target has been run at 24
 > workers and passed (30/30 in 519.7 s) — but doc 30 records `run_npu2_runlist_gate.lit`'s
@@ -387,6 +403,39 @@ written for. The power block is deliberately **run-level**: it is SoC watts over
 with compilation included, no sensor on this platform measures the NPU, and compilation
 dominates a cold walk ~20× — so it is a condition of the run and is never written into a
 results row.
+
+### It ran end to end — devq job **256**, `measure` class
+
+`agents/.state/devq/jobs/job-000256.log`, NPU pmode Turbo, one command, cold caches (a fresh
+worktree), **347 s wall**:
+
+```
+[smoke-gate] PASS (4 CSV(s))
+[manifest] wrote results/g0-smoke-w1/results_manifest.json
+[manifest] complete: True
+[manifest]   coarse.csv     rows 1/1  passed 1/1  skipped 0/0
+[manifest]   offload.csv    rows 1/1  passed 1/1  skipped 0/0
+[manifest]   runlist.csv    rows 1/1  passed 1/1  skipped 0/0
+[manifest]   fused.csv      rows 1/1  passed 1/1  skipped 0/0
+[run-profile] smoke: passed 4  (347s wall)
+```
+
+The manifest carries `complete: true`, `row_counts_checked: true`, and per file both
+`expected_rows` and `observed_rows` — **the first manifest in this tree whose completeness is a
+statement about rows.** `profile_run.json` carries `devq_job_id: 256`, the five families not
+walked with their reasons, `rungs_by_status: {passed: 4}`, and:
+
+- **`tree_dirt_after_run: []`** — the runner asserted doc 15's rule itself rather than leaving it
+  to a human. Every cache the walk created (`coarse_cache/`, `offload_cache/`, `runlist_cache/`,
+  `fused_cache/`, `air_project/`, the `.o` files) was already covered by the example's
+  `.gitignore`.
+- **`power_backend: rapl_package`, 3390 of 3465 samples retained, avg 25.1 W** (min 17.4, max
+  33.0) — `power.py`'s first real caller, and a figure that is a **run condition, not a result**:
+  it covers 347 s that were mostly aircc.
+
+No latency is quoted here. The walk is one process per rung on a quiet reserved device, but it is
+a **single** walk, and README trap 1 is that a single walk once published a crossover a second
+walk refuted. Walk twice into two roots and compare before quoting anything.
 
 **Not done, and named so nobody assumes otherwise:** resume (item 8), the example README's
 prerequisites/recovery sections (item 5), and the reachability sweep that would make `full` mean
