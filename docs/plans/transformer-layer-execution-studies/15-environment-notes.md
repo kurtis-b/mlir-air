@@ -192,12 +192,22 @@ Two resolution paths coexist and they diverge whenever `mlir/` changes:
 A fix that is green in one path and untested in the other is exactly how "the gate passed" and
 "the probe still crashes" can both be true on the same day.
 
-**`[2026-08-12]` The two trees are currently four days apart, and the way to check is timestamps.**
-`install-xrt/bin/air-opt` is dated 2026-08-07; `build-xrt/bin/air-opt` is 2026-08-11. So both of
-the resident tail's compiler fixes — 6a's fusion correction and 6b's shim-BD pacing — are in every
-lit suite and in **no** probe or model run, until the operator's `ninja -C build-xrt install`.
-Check it with `ls -l` on the two binaries, **never with `cmp`**: the install step rewrites RUNPATH,
-so the bytes always differ and a `cmp` difference proves nothing about staleness. Also: pairing ironenv's `aiecc`
+~~**`[2026-08-12]` The two trees are currently four days apart**~~ **`[2026-08-12]` REFRESHED — the
+two trees now agree, and the divergence above is closed.** `ninja -C build-xrt install` ran with no
+compile or link steps (`build-xrt` was already current, so it was a copy);
+`install-xrt/bin/air-opt`, `install-xrt/bin/aircc` and `install-xrt/python/air/_mlir_libs/_air*.so`
+are all **2026-08-11 13:28**, matching `build-xrt`. Both of the resident tail's compiler fixes —
+6a's fusion correction and 6b's shim-BD pacing — are now in every probe and model run as well as in
+every lit suite. **Verified by artifact rather than by timestamp**:
+`agents/probes/probe_fuse_channels_sibling_nests.py --nests 4 --tries 5` resolves
+`install-xrt/bin/air-opt` directly (line 222) and reports `{'ok': 5}` / "does not reproduce" where
+the pre-refresh binary was a deterministic 5/5 SEGV; its aircc leg succeeded off the same tree.
+
+**The check itself is permanent and worth keeping**, because the trees diverge again the moment
+`mlir/` changes: use `ls -l` on the two binaries, **never `cmp`**. The install step rewrites
+RUNPATH, so the bytes always differ and a `cmp` difference proves nothing about staleness. And
+prefer an artifact to a timestamp where one is cheap — a matching mtime proves a file was copied,
+not that the copy behaves. Also: pairing ironenv's `aiecc`
 with the build tree's air bindings produces `error: expected attribute value` parsing
 `npu.air.mlir` — a version-mismatch artifact of the ad-hoc env, not a compiler bug; the suites'
 sandbox aiecc is the referee.

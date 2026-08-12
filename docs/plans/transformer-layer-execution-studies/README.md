@@ -125,12 +125,19 @@ parallel streams of 2026-08-11 (item 6b's compiler fix, R2's scoping, Phase F's 
 3-portable) are merged into `exper/transformer-layer-execution-studies`, tip `d87c3701`, tree
 clean. Four git worktrees stay registered under `.claude/worktrees/` — three agent worktrees and
 `phase-f` — and all four are **fully merged (0 unmerged commits) and clean**, so they hold nothing
-and are safe to remove; do not read them as pending work. **What is NOT in the branch is the
-install**: `install-xrt/bin/air-opt` is dated 2026-08-07 against `build-xrt`'s 2026-08-11, so both
-compiler fixes (6a's fusion correction, 6b's BD pacing) are **absent from every probe and model
-path**, which resolve the install tree. The lit suites do not care — they run `build-xrt/python`
-([15 §Which toolchain tree](15-environment-notes.md)). `ninja -C build-xrt install` is owed to the
-operator and needs an exclusive window.
+and are safe to remove; do not read them as pending work. ~~**What is NOT in the branch is the
+install**~~ **`[2026-08-12]` The install is REFRESHED and the two trees now agree.**
+`ninja -C build-xrt install` ran (no compile or link steps — `build-xrt` was already current, so it
+was a copy); `install-xrt/bin/air-opt`, `install-xrt/bin/aircc` and
+`install-xrt/python/air/_mlir_libs/_air*.so` are all **2026-08-11 13:28**, matching `build-xrt`
+exactly. So both compiler fixes (6a's fusion correction, 6b's BD pacing) are now in **every probe
+and model path** as well as in the lit suites, and the two resolution paths of
+[15 §Which toolchain tree](15-environment-notes.md) no longer diverge. **Verified by artifact, not
+by timestamp alone**: `agents/probes/probe_fuse_channels_sibling_nests.py --nests 4 --tries 5`
+resolves `install-xrt/bin/air-opt` directly and now reports `{'ok': 5}` / "does not reproduce",
+against the pre-refresh binary's deterministic 5/5 SEGV — and its aircc leg succeeded, which is the
+same tree. 6b's pacing rides the same install but was **not** independently re-verified here; its
+evidence stays the build-tree regression lit and `check-air-mlir` 492/0.
 
 **All four modes are corrected, gated, and — as of late 2026-08-11 — fully separated by one
 measurement.** The modes landed 2026-08-08/09 (`coarse` = cell C1 of [28](28-coarse-blend-space.md)'s
@@ -247,7 +254,7 @@ the whole cell.
 | **8** | **`tileChannelOpByFactor` aborts on a two-symbol L3-side offset** `[2026-08-11]`, found while scoping R2 ([31b](31b-r2-order-seam.md) §3.4). `air-split-l2-memref` composes the existing `affine.apply` and then builds the replacement with **exactly one symbol** — `AffineMap::get(0, 1, add)` — so a two-level loop nest over an L3 operand (`()[s0, s1] -> (s0 * 589824 + s1 * 24576)`) trips `willBeValidAffineMap` and SIGABRTs. Deterministic 5/5 on the round-tripped pre-split dump, the discipline 6a settled on. **This is not a corner**: [23](23-rules-and-open-items.md)'s standing *advance on the L3 side* rule produces two-symbol maps as a matter of course, and R1's own dump carries the identical map — surviving only because the pass declines to split there. **Verified in source at review: the hardcoded one-symbol construction appears at THREE sites** (`AIRMiscPasses.cpp:1671`, `:1674`, `:1681`), so the fix is wider than 31b's "one-line shape" aside implies. Builder-side dodge is exact (flatten the refill nest to one loop) and R2 uses it | A compiler item, unclaimed | [31b §3.4](31b-r2-order-seam.md) |
 | **9** | **`air-shrink-memref-sizes-by-access` silently shrinks a multi-get L1 band** `[2026-08-11]`, found the same way ([31b](31b-r2-order-seam.md) §3.2). `pass_029` rewrites `memref<12288xbf16, 2>` → `<3072>` while leaving the gets at 3072/6144/9216, so a retile reads to element 12,256 of a 3,072-element buffer. **No error, no warning** — the same class as the frozen-BD trap that cost J7b a session, and the reason 31b's design does not use literal-offset L1 bands. Reported with its minimal shape, not fixed (doc 31's rule for defects a phase exposes) | A compiler item, unclaimed | [31b §3.2](31b-r2-order-seam.md) |
 | **10** | **R1's shipped gate arm under-counts the per-column shim budget** `[2026-08-11]`. `ffn_resident_structure.py`'s column census counts `shim→core` flows only and reports **1** for a column that carries **2** of the 2-per-column budget when both flow kinds are counted ([31b](31b-r2-order-seam.md) §7.1, measured at 7/16 ports, worst column 2). The arm is green today because R1 fits either way; it stops being green-for-the-right-reason the moment R2 adds streams to that column, which is exactly what it exists to catch | Small: widen the census, re-pin | [31b §7.1](31b-r2-order-seam.md) |
-| **11** | **Phase F's remainder, and it is two unlike halves** `[2026-08-12]`. (a) **`memcpy_bandwidth` is re-scoped from a port to a device design**: iron's operator has no AIR equivalent, and one of its four case axes — `num_channels` — is not an input here at all, since routing produces it. Nothing is blocked on it; the component table already measures what the study needs. (b) **The plot/analysis tier stays blocked on an install**: `regenerate_plots.py`, `roofline/{run,test}.py` and every `plot_*.py` need matplotlib/pandas/seaborn, which **must not be installed while gates run**. That is a scheduling constraint, not a technical one — it needs an exclusive window, the same window the owed `ninja -C build-xrt install` needs | (a) a device design; (b) an exclusive window | [09](09-phase-f-study-harness.md) |
+| **11** | **Phase F's remainder, and it is two unlike halves** `[2026-08-12]`. (a) **`memcpy_bandwidth` is re-scoped from a port to a device design**: iron's operator has no AIR equivalent, and one of its four case axes — `num_channels` — is not an input here at all, since routing produces it. Nothing is blocked on it; the component table already measures what the study needs. (b) **The plot/analysis tier stays blocked on an install**: `regenerate_plots.py`, `roofline/{run,test}.py` and every `plot_*.py` need matplotlib/pandas/seaborn, which **must not be installed while gates run**. That is a scheduling constraint, not a technical one — it needs an exclusive window. ~~the same window the owed `ninja -C build-xrt install` needs~~ **`[2026-08-12]` the install half is DONE** (refreshed and verified by artifact), so 11(b) is now the only claimant on that window | (a) a device design; (b) an exclusive window | [09](09-phase-f-study-harness.md) |
 | **12** | **Phase G and the two goals — never started, and never chosen.** Phase G is the unattended runner + CI ([doc 10](10-phase-g-unattended-runner-and-ci.md)); Goal 1 is sliding-window / local-global attention ([doc 11](11-goal-sota-sliding-window.md)); Goal 2 is quantized inference ([doc 12](12-goal-quantized-inference.md)) — the doc numbers collide with these queue numbers, so read them as doc references. All three are independent of the resident tail and of each other, so any of them can run beside 6c. **This row exists because the choice has been offered and not taken** — it is a decision, not a blocker | A phase each | [doc 10](10-phase-g-unattended-runner-and-ci.md) · [doc 11](11-goal-sota-sliding-window.md) · [doc 12](12-goal-quantized-inference.md) |
 | ~~7~~ | **DONE `[2026-08-11]` — `addnorm` is two-pass f32 and the cliff is pinned.** Both fused variants moved (mirroring J7a's layer_norm fix; staged one-pass forms stay, undispatched and documented); the offset rows' first hardware run measured `mean_rel_L1` **1.390e-3 / 1.409e-3** with `atol_required` **0.0** against the one-pass kernel's 22.2 / 33.1 collapse; the provenance refresh moved `block`/`coarse` to **1.663e-2** (margin 1.35× → 1.43×), `runlist` to 1.746e-2 (worst element improved), and left `fused` **unchanged to the digit** — correctly, its tail is the layer_norm path. Suite green with the new kernels; no tolerance widened | done | [23 §2](23-rules-and-open-items.md) |
 
@@ -270,9 +277,10 @@ the whole cell.
    increment so it starts from a design rather than a blank page — and it **corrects doc 31's own
    prediction** about which side of the order seam moves. After 6c: re-arm
    `run_npu2_ffn_resident_peano.lit`, one gate run, measured atol into the SPECS row.
-5. **Housekeeping the operator owes, whenever an exclusive window opens**: `ninja -C build-xrt
-   install`, so probes and models stop resolving a 2026-08-07 compiler. Item 11(b)'s plotting
-   packages want the same window.
+5. ~~**Housekeeping the operator owes, whenever an exclusive window opens**: `ninja -C build-xrt
+   install`~~ **`[2026-08-12]` DONE — the install is refreshed and verified by artifact** (cold-start
+   section above), so probes and models resolve the 2026-08-11 compiler. Item 11(b)'s plotting
+   packages still want an exclusive window; that half is unchanged.
 
 Closed and not worth re-opening: items **1** (offload shared path gates at 4096; ten models 10/10
 under the new install), **1b** (the machine anomaly — it was the pmode), **2**, **4**, **5**
@@ -425,9 +433,12 @@ measured from both sides: N=2 fuses cleanly 5/5, N=3 crashes 5/5.
 sharpening: the coin toss's *green* outcomes were also wrong — the old pass's clean R1 compiles
 left an extra channel alive with pairwise 2-slot wraps where one 4-slot multiplexed stream
 belongs — so a structural literal derived from ANY pre-fix dump of such a module is invalid, not
-merely unlucky. The residue: aircc reads the pass from `install-xrt`, so **this trap stands for
-aircc until the operator refreshes the install from `build-xrt`**; the fixed `build-xrt/bin/air-opt`
-is deterministic 10/10 on every measured shape. (A same-day review round then also fixed the
+merely unlucky. ~~The residue: aircc reads the pass from `install-xrt`, so this trap stands for
+aircc until the operator refreshes the install from `build-xrt`~~ — **`[2026-08-12]` the residue is
+GONE: the install was refreshed and the reproducer, which resolves `install-xrt/bin/air-opt`, is
+now clean 5/5 with its aircc leg succeeding.** The trap is closed on both resolution paths. What
+survives it is the *sharpening*, which is not about staleness at all: any structural literal
+derived from a pre-fix dump of such a module is invalid and must be re-derived. (A same-day review round then also fixed the
 pairwise semantics the crash had been hiding — heterogeneous-offset sides now keep all their
 ops instead of erasing sources against a cloned destination; doc 31 §status.) The regression is
 pinned by `mlir/test/.../fuse_channels_sibling_nests.mlir`.
