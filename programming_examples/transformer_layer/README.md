@@ -101,7 +101,7 @@ memory bank) all produce plausible wrong numbers rather than errors.
 | `builders/ffn.py` | Staged up-projection / GeLU / down-projection composition, plus its FP32 reference |
 | `builders/ffn_resident.py` | Doc 31 R1: the same FFN as ONE segment — up ring, GeLU herd and the J7b down ring on channels, the `[seq, ffn]` interior never crossing DRAM. Reference imported from `ffn.py` |
 | `builders/test_ffn_resident.py` | Host-only: the interior's addressing arithmetic emulated to EXACTNESS in f64 — packing, shim retile, chunk order. The arm that stays live while the device gate is parked. No NPU, no aircc |
-| `ffn_resident_structure.py` | Host-only: the interior IS resident — one `aie.device`, core→core stage edges, the column budget, the down ring's hoist, the dispatched kernels. No NPU. PARKED with the device gate on the `air-fuse-channels` crash (doc 31) |
+| `ffn_resident_structure.py` | Host-only: the interior IS resident — one `aie.device`, core→core stage edges, the per-column shim MM2S budget (counted as DEMAND over both flow kinds and over packet flows, with its own negative control — `[2026-08-12]` queue item 10; measured 7/16 ports, worst column 2), the down ring's hoist, the dispatched kernels. No NPU. The `air-fuse-channels` crash is fixed; the *device* gate stays parked on wall 5 (queue item 6c), this arm runs green |
 | `builders/mha_attention.py` | Attention staging: the seq-first FlashAttention design point, its kernel `-D` flags, and the chunked FP32 oracle |
 | `builders/o_proj.py` | O-projection staging: the registry lookup, the GEMM sub-kernel, and its FP32 oracle |
 | `builders/mha_out_proj.py` | The entry layer that composes the two into one ELF, plus the composed FP32 reference |

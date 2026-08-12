@@ -498,7 +498,9 @@ driver-owned objective check with four arms:
    today, so this clause is verified-failing from birth); **(b)** core→core flow count equals
    the composed stage-edge count (32 for the two norm tails alone today; the constant moves
    with the design and must be derived, not copied); **(c)** ≤ 2 shim-facing inbound flows per
-   column; **(d)** zero packet-typed channels in every dump; **(e)** liveness at both ends so
+   column — `[2026-08-12]` **corrected to ≤ 2 per-column shim MM2S DEMAND**, counted over
+   `shim→core` *and* `shim→memtile` and over packet flows, with the census's own negative
+   control (queue item 10, [31b §3.6](31b-r2-order-seam.md)); **(d)** zero packet-typed channels in every dump; **(e)** liveness at both ends so
    no count passes vacuously (dma-to-channel dump clean of `air.dma_memcpy_nd`, channels
    present by name; final dump routed, no `air.channel` left). An edge that silently
    round-trips through L3 or a memtile passes every numeric arm — (b) is what catches it

@@ -20,15 +20,23 @@ WHY THIS EXISTS
 
     2. THE SHIM BUDGET, COUNTED WHERE IT LIVES. Doc 23's rule is two L3-facing
        MM2S per COLUMN across the whole segment. R1's own structural check
-       (``probe_ffn_resident_interior.py`` clause F, doc 31 gate arm (c)) counts
-       ``shim -> core`` flows only -- but an L2-staged refill is a
+       (``probe_ffn_resident_interior.py`` clause F, doc 31 gate arm (c)) used
+       to count ``shim -> core`` flows only -- but an L2-staged refill is a
        ``shim -> memtile`` flow and consumes a shim MM2S port just the same.
        Measured on R1's routed design: 4 shim->core AND 3 shim->memtile, so the
-       arm reports "max 1 per column" while column 1's shim actually drives 2.
+       arm reported "max 1 per column" while column 1's shim actually drives 2.
        Not a violation there; a blind spot everywhere. Arm ``shim`` recounts
        BOTH directions per column on any module it is given, and reports the
        memtile port occupancy beside it (a memtile has 6 MM2S / 6 S2MM, and R1
        already sits at 5 of 6 S2MM on one of them).
+       **`[2026-08-12]` THE FINDING IS FIXED, queue item 10.** Both the gate
+       (``ffn_resident_structure.py``) and the probe twin now count per-column
+       MM2S demand over both flow kinds AND over packet flows -- 7 of 16,
+       worst column 2, re-derived from a build-xrt dump -- and the gate carries
+       a negative control that refuses a 3-per-column design. This arm stays as
+       the independent recount and as the record of the undercount; its
+       ``mm2s_core`` column below is the SUPERSEDED narrow count, kept so the
+       diff stays visible, not a description of what ships.
 
     3. THE SYMBOL BUDGET. R1 found that ``-D``-baked symbols cannot coexist
        twice in one module. R2 changes ``DIM_M`` (the row partition) and adds a
@@ -329,9 +337,10 @@ def arm_shim():
             over.append(c)
     print(f"[r2-budget]   TOTAL shim MM2S {sum(mm2s.values())} of "
           f"{2 * NPU2_COLUMNS} ports; worst column {max(mm2s.values(), default=0)}")
-    print(f"[r2-budget]   R1's shipped clause counts shim->core ONLY: worst column "
-          f"{max(mm2s_core.values(), default=0)} -- the undercount is "
-          f"{max(mm2s.values(), default=0)} vs {max(mm2s_core.values(), default=0)}")
+    print(f"[r2-budget]   the SUPERSEDED narrow count (shim->core only) reads worst "
+          f"column {max(mm2s_core.values(), default=0)} -- the undercount was "
+          f"{max(mm2s.values(), default=0)} vs {max(mm2s_core.values(), default=0)}; "
+          "the shipped gate counts the wide figure since 2026-08-12 (item 10)")
     for c in sorted(set(list(mt_out) + list(mt_in))):
         print(f"[r2-budget]   memtile col {c}: MM2S(out) {mt_out.get(c, 0)}/6, "
               f"S2MM(in) {mt_in.get(c, 0)}/6")
@@ -431,8 +440,10 @@ def main():
         else "NOT ON PATH"
     )
     print(f"[r2-budget] air-opt: {air_opt} (mtime {stamp})")
-    print("[r2-budget] PROVISIONAL pending queue item 6b: the shim BD fix changes "
-          "shim BD emission; re-derive, do not compare.")
+    print("[r2-budget] Record the stamp above beside any number taken from here. "
+          "Items 6a and 6b have LANDED (2026-08-11); a figure derived from a "
+          "compiler older than the 6a fuse-pass fix is invalid, not merely "
+          "unlucky -- re-derive, do not compare.")
 
     problems = []
     if ns.arm in (None, "herds"):

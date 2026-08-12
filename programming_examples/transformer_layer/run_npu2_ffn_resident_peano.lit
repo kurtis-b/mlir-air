@@ -77,11 +77,31 @@
 // RUN: make -f %S/Makefile check-ffn-resident PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
 // RUN: make -f %S/Makefile check-ffn-resident-fault PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s --check-prefix=FAULT
 //
-// The device count, flow count and hoist count are stated inside the
-// verdict line, so a lowering that re-split the segment, moved a stage
-// edge, or kept the C pair in the K loop cannot match here; the script
-// itself fails vacuous zeros (dumps present, channels present by name).
-// STRUCT: [ffn-resident-structure] ffn_resident [64x3072x768]: PASS (1 device, 4 core->core, K-loop 4 -> 2, 0 packet-typed
+// The device count, flow count, hoist count and the per-column shim MM2S
+// census are stated inside the verdict line, so a lowering that re-split
+// the segment, moved a stage edge, kept the C pair in the K loop, or moved
+// an L3-facing stream between columns cannot match here; the script itself
+// fails vacuous zeros (dumps present, channels present by name).
+//
+// `[2026-08-12]` THE SHIM CENSUS IS RE-PINNED, queue item 10. The clause
+// used to count shim->core flows ONLY and reported "4/16 worst column 1"
+// for a design whose worst column really carries 2 -- shim column 1 drives
+// both L2-staged refills, and an L2-staged refill is a shim->memtile flow
+// burning the same MM2S port (doc 31b 3.6). It now counts per-column MM2S
+// DEMAND over both flow kinds AND over packet flows, and the literal is
+// RE-DERIVED from a dump of build-xrt's aircc of 2026-08-11 13:28:03
+// (sha256 5cb08407), which carries the item-6a fusion fix and its review
+// round -- NOT carried over from the pre-fix value, which would be invalid
+// rather than merely unlucky.
+//
+// Each of the two lines below holds one half of the widening. Reverting to
+// shim->core-only moves the verdict literal to "4/16 worst column 1" and
+// the third line stops matching; dropping the packet half leaves the
+// census reading 0 on an over-budget design and the FIRST line stops
+// matching, because that control is the arm's proof it can fail at all.
+// STRUCT: census negative control: 3 L3 streams per column -> widened census 3, pre-widening shim->core count 0, packet streams 12
+// STRUCT: shim col 1: MM2S 2 (circuit 2 = 0 ->core + 2 ->memtile, packet 0)
+// STRUCT: [ffn-resident-structure] ffn_resident [64x3072x768]: PASS (1 device, 4 core->core, K-loop 4 -> 2, 0 packet-typed channels, shim MM2S 7/16 worst column 2)
 // STRUCT: [ffn-resident-structure] PASS
 //
 // Both lines, not just the verdict: the first is XRTRunner's own, the

@@ -12,7 +12,8 @@ CONTRACT
     (aiecc writes every MLIR dump first, doc 23 section 5). Do not "fix"
     that failure by compiling kernels; it only slows the check down.
 
-    Seven clauses, each catching a regression the numeric arm cannot see:
+    Seven clauses plus the census's own negative control, each catching a
+    regression the numeric arm cannot see:
 
     1. ONE SEGMENT. Exactly one tile-bearing ``aie.device`` in the routed
        design (plus the anonymous control device). This is the resident
@@ -26,9 +27,27 @@ CONTRACT
        physical source (the builder's docstring carries the arithmetic).
        Fewer means an edge silently rerouted through L3 or a memtile;
        MORE is equally wrong (a hand-off left the derived shape).
-    3. THE COLUMN BUDGET, counted directly: at most 2 shim-facing inbound
-       flows per column on the routed design (measured today: 1 -- the
-       down C fetch; the three refill streams land on separate columns).
+    3. THE COLUMN BUDGET, counted directly: a column has TWO shim MM2S
+       channels and the budget is per column ACROSS THE WHOLE SEGMENT
+       (doc 23). Measured on this design today: 7 of the 16 ports, worst
+       column 2 -- shim column 1 carries both staged refills. Two things
+       this count must NOT do, because the arm did both until
+       `[2026-08-12]` and read 1 where the truth is 2:
+         - count ``shim -> core`` flows only. An L2-staged refill is a
+           ``shim -> memtile`` flow and burns the same MM2S port; on R1
+           that IS the whole difference between 1 and 2 (doc 31b 3.6).
+         - count circuit-switched ``aie.flow`` only. Over budget AIR does
+           not refuse -- it PACKET-multiplexes the streams onto one queue,
+           so the circuit census of an over-budget column reads ZERO and
+           the clause goes blind exactly when it is needed. The rule
+           bounds DEMAND, so a packet-multiplexed group counts once per
+           stream. Measured on the control below: 3 streams, one queue.
+       A broadcast is one stream on one port, so the circuit half counts
+       distinct source (bundle, channel) pairs rather than flows.
+       THE CENSUS NEGATIVE CONTROL runs first, every time: a one-segment
+       herd with 3 herd-direct L3 operands is 3 of the 2-per-column budget
+       and the census MUST refuse it. An arm that cannot fail is not a
+       gate; this one proves it can, on the same code path, in ~0.5 s.
     4. ZERO packet-typed channels in every dump (the J7a/J7b rule; the
        packet path is BD-starved post-H9 at these trip counts).
     5. THE DOWN RING STILL FORMS INSIDE THE COMPOSITION: K-loop data
@@ -51,6 +70,16 @@ FOOTGUNS
       legitimately changes (e.g. R2 attaches the norm tails), re-derive it
       from the port arithmetic and say so here -- do not widen it to "at
       least herd_x" to make a regression pass.
+    - Clause 3's 7-of-16 total is a RE-DERIVED literal, not a carried one.
+      It was taken from a dump written by ``build-xrt``'s aircc of
+      2026-08-11 13:28:03 (sha256 5cb08407...), which carries the item-6a
+      fuse-pass fix and its review round. A structural literal off any
+      PRE-6a dump is invalid rather than merely unlucky -- the old pass's
+      lucky-GREEN R1 compiles left an extra channel alive with pairwise
+      2-slot wraps where one 4-slot multiplexed stream belongs. If this
+      count ever has to move, re-derive it from a fresh dump of the
+      compiler in hand and record that compiler; never confirm it against
+      the previous value.
     - The probe twin (``agents/probes/probe_ffn_resident_interior.py``)
       reports the same census with the exploratory extras; THIS file is the
       gate. Verifying the probe standalone is not verifying this arm
@@ -71,7 +100,15 @@ for _p in (str(_PROJ_ROOT), str(_PROJ_ROOT / "llms"), str(_HERE)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from ml_dtypes import bfloat16  # noqa: E402
+
+from air.ir import *  # noqa: E402,F403
+from air.dialects.affine import apply as affine_apply  # noqa: E402
+from air.dialects.air import *  # noqa: E402,F403
+from air.dialects.func import FuncOp  # noqa: E402
+from air.dialects.memref import AllocOp, DeallocOp  # noqa: E402
 from air.backend.xrt import XRTBackend  # noqa: E402
+from air.backend.xrt_runner import type_mapper  # noqa: E402
 
 from builders.ffn_resident import (  # noqa: E402
     CHANNEL_DOWN_FEED,
@@ -100,11 +137,28 @@ _DOWN_HERD_MARKER = "air.herd @ffn_res_down"
 _HOIST_DUMP_SUFFIX = "_after_air-hoist-dma-in-accum-pattern.mlir"
 _CHANNEL_DUMP_SUFFIX = "_after_air-dma-to-channel.mlir"
 
+# From mlir_aie's AIETargetModel.h, quoted rather than assumed:
+# NPU2TargetModel::columns() = 8, and a shim NOC tile drives TWO MM2S DMA
+# channels. Doc 23's rule is per COLUMN across the whole segment.
+NPU2_COLUMNS = 8
+SHIM_MM2S_PER_COLUMN = 2
+NPU2_SHIM_MM2S_PORTS = NPU2_COLUMNS * SHIM_MM2S_PER_COLUMN
+
+# The census's own negative control: one more herd-direct L3 operand than a
+# column has MM2S channels. Verified over-budget by construction (the herd
+# occupies one column per lane and every lane fetches all three).
+CONTROL_L3_STREAMS = SHIM_MM2S_PER_COLUMN + 1
+
 _MOVEMENT = re.compile(r"air\.dma_memcpy_nd|air\.channel\.(?:put|get)")
 _TILE_RE = re.compile(r"%(\S+) = aie\.tile\((\d+),\s*(\d+)\)")
 _FLOW_RE = re.compile(
-    r"aie\.flow\(%(\S+),\s*\w+\s*:\s*\d+,\s*%(\S+),\s*\w+\s*:\s*\d+\)"
+    r"aie\.flow\(%(\S+),\s*(\w+)\s*:\s*(\d+),\s*%(\S+),\s*(\w+)\s*:\s*(\d+)\)"
 )
+# aie.packet_flow(<id>) { aie.packet_source<...>  aie.packet_dest<...> ... }
+# ONE source per flow (a flow may broadcast to many dests), so counting the
+# sources counts the flows and needs no brace matching. Verified on the
+# negative control's routed dump: 12 packet_flow, 12 packet_source.
+_PACKET_SOURCE_RE = re.compile(r"aie\.packet_source<%(\S+),\s*(\w+)\s*:\s*(\d+)>")
 
 
 def _aircc_debug_dumps(module):
@@ -188,6 +242,194 @@ def _device_blocks(text):
         else:
             i += 1
     return blocks
+
+
+def _shim_mm2s_census(dev):
+    """Per-column shim MM2S demand on one routed ``aie.device`` block.
+
+    Returns ``(demand, detail)``: ``demand`` maps column -> the number of
+    L3-facing streams that column's shim must drive, and ``detail`` maps
+    column -> ``(circuit_ports, packet_streams, to_core, to_memtile, s2mm)``
+    for the report. Doc 23's rule bounds ``demand`` at
+    ``SHIM_MM2S_PER_COLUMN``.
+
+    Both halves are load-bearing:
+
+    - a CIRCUIT-switched ``aie.flow`` out of a shim tile takes one MM2S
+      channel per distinct source (bundle, channel), whatever it is wired
+      to -- a core (a herd-direct fetch) or a memtile (an L2-staged refill).
+      Several flows off ONE source port are a broadcast: one stream, one
+      port, counted once.
+    - a PACKET flow is what AIR emits when the budget is already blown: k
+      streams share one queue by packet id. Counting the surviving ports
+      there would read 1 (or, with the whole design converted, 0) for a
+      column carrying k, so each packet flow counts as the separate stream
+      it is.
+
+    The two halves are added. A design that somehow ran a circuit flow and
+    a packet flow off the SAME shim port would be counted twice; that errs
+    toward refusing, which is the safe direction for a budget, and no
+    routed design in this tree does it (AIR converts wholesale).
+    """
+    tiles = {m[0]: (int(m[1]), int(m[2])) for m in _TILE_RE.findall(dev)}
+
+    def kind(t):
+        rc = tiles.get(t)
+        if rc is None:
+            return None
+        return "shim" if rc[1] == 0 else "memtile" if rc[1] == 1 else "core"
+
+    def col(t):
+        rc = tiles.get(t)
+        return None if rc is None else rc[0]
+
+    circuit_ports = {}
+    to_core, to_memtile, s2mm = Counter(), Counter(), Counter()
+    for s, sb, sp, d, _db, _dp in _FLOW_RE.findall(dev):
+        if kind(s) == "shim" and sb == "DMA":
+            circuit_ports.setdefault(col(s), set()).add((sb, int(sp)))
+            if kind(d) == "core":
+                to_core[col(s)] += 1
+            elif kind(d) == "memtile":
+                to_memtile[col(s)] += 1
+        if kind(d) == "shim" and _db == "DMA":
+            s2mm[col(d)] += 1
+
+    packet = Counter()
+    for t, b, _p in _PACKET_SOURCE_RE.findall(dev):
+        if kind(t) == "shim" and b == "DMA":
+            packet[col(t)] += 1
+
+    cols = set(circuit_ports) | set(packet) | set(s2mm)
+    demand, detail = {}, {}
+    for c in sorted(x for x in cols if x is not None):
+        nc = len(circuit_ports.get(c, ()))
+        np_ = packet.get(c, 0)
+        demand[c] = nc + np_
+        detail[c] = (nc, np_, to_core.get(c, 0), to_memtile.get(c, 0),
+                     s2mm.get(c, 0))
+    return demand, detail
+
+
+@module_builder
+def build_over_budget_module(n_l3=CONTROL_L3_STREAMS, herd_x=4, elems=512):
+    """The census's negative control: ``n_l3`` herd-direct L3 fetches per column.
+
+    One segment, one herd of ``[herd_x, 1]``, every lane fetching all
+    ``n_l3`` L3 operands into its own L1 buffer and storing one back. Each
+    fetch is an L3-facing MM2S in EVERY column the herd occupies, so the
+    column demand is ``n_l3`` by construction and nothing about the shape of
+    R1 is involved.
+
+    Each lane takes its OWN L3 slice at both ends: giving every core the
+    same slice makes the inbound copy a broadcast and the outbound one a
+    fan-in, which would change what is being counted.
+    """
+    xrt_dtype = type_mapper(bfloat16)
+    l3_ty = MemRefType.get([herd_x * elems], xrt_dtype)
+    l1_space = IntegerAttr.get(T.i32(), MemorySpace.L1)
+    l1_ty = MemRefType.get([elems], xrt_dtype, memory_space=l1_space)
+    off_map = AffineMap.get(
+        0,
+        1,
+        [AffineExpr.get_mul(AffineSymbolExpr.get(0), AffineConstantExpr.get(elems))],
+    )
+
+    @FuncOp.from_py_func(*([l3_ty] * (n_l3 + 1)))
+    def over_budget(*a):
+
+        @launch(operands=list(a))
+        def ob_launch(*l):
+
+            @segment(name="over_budget_seg", operands=list(l))
+            def ob_seg(*s):
+
+                def _stage(tx, ty, _sx, _sy, *h):
+                    bufs = []
+                    for i in range(n_l3):
+                        buf = AllocOp(l1_ty, [], [])
+                        dma_memcpy_nd(
+                            buf,
+                            h[i],
+                            src_offsets=[affine_apply(off_map, [tx])],
+                            src_sizes=[elems],
+                            src_strides=[1],
+                        )
+                        bufs.append(buf)
+                    dma_memcpy_nd(
+                        h[n_l3],
+                        bufs[0],
+                        dst_offsets=[affine_apply(off_map, [tx])],
+                        dst_sizes=[elems],
+                        dst_strides=[1],
+                    )
+                    for buf in bufs:
+                        DeallocOp(buf)
+
+                herd(name="ob_stage", sizes=[herd_x, 1], operands=list(s))(_stage)
+
+
+def check_census_control():
+    """Clause 3's negative control. Returns problems; empty means it FAILED as required.
+
+    MEASURED, 2026-08-12, build-xrt aircc 2026-08-11 13:28:03: at three
+    herd-direct L3 operands AIR routes the design with ZERO inbound circuit
+    flows and 12 ``aie.packet_flow`` -- three streams multiplexed onto each
+    column's single shim queue. So the pre-widening count (``shim -> core``
+    circuit flows) reads 0 on a design that is 50% over budget, and the
+    widened one reads 3. Both numbers are asserted here, so reverting either
+    half of the widening fails this control rather than passing quietly.
+    """
+    label = "census negative control"
+    module = build_over_budget_module()
+    dumps, compile_error = _aircc_debug_dumps(module)
+    if not dumps:
+        return [
+            f"{label}: aircc wrote no debug dumps -- the census is unproven "
+            f"({compile_error or 'compile reported success'})"
+        ]
+    routed = next(
+        (t for _, t in reversed(dumps) if _TILE_RE.search(t)),
+        None,
+    )
+    if routed is None:
+        return [f"{label}: no routed dump -- the census is unproven"]
+    devices = [d for _, d in _device_blocks(routed) if _TILE_RE.search(d)]
+    demand, detail = {}, {}
+    for dev in devices:
+        d, x = _shim_mm2s_census(dev)
+        demand.update(d)
+        detail.update(x)
+    worst = max(demand.values(), default=0)
+    # what the pre-widening clause counted: circuit shim->core flows only
+    old_worst = max((v[2] for v in detail.values()), default=0)
+    print(
+        f"[ffn-resident-structure] {label}: {CONTROL_L3_STREAMS} L3 streams "
+        f"per column -> widened census {worst}, pre-widening shim->core "
+        f"count {old_worst}, packet streams "
+        f"{sum(v[1] for v in detail.values())}"
+    )
+    problems = []
+    if worst <= SHIM_MM2S_PER_COLUMN:
+        problems.append(
+            f"{label}: the census ADMITTED a design demanding "
+            f"{CONTROL_L3_STREAMS} shim MM2S per column (worst column read "
+            f"{worst}, budget {SHIM_MM2S_PER_COLUMN}) -- clause 3 cannot "
+            "fail, so it is not gating anything"
+        )
+    if worst != CONTROL_L3_STREAMS:
+        problems.append(
+            f"{label}: the census read {worst} where the construction "
+            f"demands exactly {CONTROL_L3_STREAMS} -- it is counting "
+            "something other than per-column L3-facing streams"
+        )
+    if old_worst > SHIM_MM2S_PER_COLUMN:
+        problems.append(
+            f"{label}: the pre-widening shim->core count already reads "
+            f"{old_worst} here, so this control does not discriminate the "
+            "widening -- pick a control the narrow count cannot see"
+        )
+    return problems
 
 
 def check_shape(shape_key, seq_len, ffn_dim, emb_dim):
@@ -315,12 +557,13 @@ def check_shape(shape_key, seq_len, ffn_dim, emb_dim):
         )
     total_core_core = 0
     any_flow = False
+    mm2s_total = 0
+    mm2s_worst = 0
     for dev_name, dev in devices:
         tiles = {m[0]: (int(m[1]), int(m[2])) for m in _TILE_RE.findall(dev)}
         if not tiles:
             continue
         rows_by = {k: v[1] for k, v in tiles.items()}
-        cols_by = {k: v[0] for k, v in tiles.items()}
 
         def kind(t):
             r = rows_by.get(t)
@@ -331,16 +574,26 @@ def check_shape(shape_key, seq_len, ffn_dim, emb_dim):
         flows = _FLOW_RE.findall(dev)
         any_flow = any_flow or bool(flows)
         total_core_core += sum(
-            1 for s, d in flows if kind(s) == "core" and kind(d) == "core"
+            1 for s, _sb, _sp, d, _db, _dp in flows
+            if kind(s) == "core" and kind(d) == "core"
         )
-        inbound = Counter(
-            cols_by.get(d) for s, d in flows if kind(s) == "shim" and kind(d) == "core"
-        )
-        over = {c: n for c, n in inbound.items() if n > 2}
+        # clause 3: the per-column shim MM2S budget, BOTH flow kinds
+        demand, detail = _shim_mm2s_census(dev)
+        mm2s_total += sum(demand.values())
+        mm2s_worst = max([mm2s_worst] + list(demand.values()))
+        for c in sorted(demand):
+            nc, np_, tc, tm, _s2 = detail[c]
+            print(
+                f"[ffn-resident-structure]   shim col {c}: MM2S {demand[c]} "
+                f"(circuit {nc} = {tc} ->core + {tm} ->memtile, packet {np_})"
+            )
+        over = {c: n for c, n in demand.items() if n > SHIM_MM2S_PER_COLUMN}
         if over:
             problems.append(
-                f"{label}: device {dev_name}: columns {sorted(over)} take "
-                f"more than 2 shim-facing inbound flows ({over})"
+                f"{label}: device {dev_name}: columns {sorted(over)} demand "
+                f"more than {SHIM_MM2S_PER_COLUMN} shim MM2S ({over}) -- doc "
+                "23's per-column budget; AIR packet-multiplexes past it "
+                "instead of refusing"
             )
     if not any_flow:
         problems.append(
@@ -358,7 +611,8 @@ def check_shape(shape_key, seq_len, ffn_dim, emb_dim):
     print(
         f"[ffn-resident-structure] {label}: {verdict} "
         f"({len(tiled)} device, {total_core_core} core->core, K-loop "
-        f"{before} -> {after}, {n_packet} packet-typed channels)"
+        f"{before} -> {after}, {n_packet} packet-typed channels, shim MM2S "
+        f"{mm2s_total}/{NPU2_SHIM_MM2S_PORTS} worst column {mm2s_worst})"
     )
     return problems
 
@@ -368,7 +622,9 @@ def main():
     if not shapes:
         print("[ffn-resident-structure] FAIL: no ffn_resident shapes in SPECS")
         return 1
-    problems = []
+    # Clause 3's negative control FIRST and unconditionally: if the census
+    # cannot refuse an over-budget design, nothing below it is a gate.
+    problems = check_census_control()
     for spec in shapes:
         shape = spec["shape"]
         problems += check_shape(

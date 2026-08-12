@@ -290,6 +290,27 @@ L2-staged streams (`w_up`, `w_down`, the gammas) and those are exactly the ones 
 see. Correcting arm (c) to count both flow kinds is a prerequisite of R2's gate, and is the reason
 `probe_r2_segment_budget.py` exists as a separate arm rather than a note.
 
+> **`[2026-08-12]` FIXED — queue item 10, and the table above is no longer PROVISIONAL.** Arm (c)
+> in `ffn_resident_structure.py` (and its probe twin's clause F) now counts per-column shim MM2S
+> **demand**, and the literal is **re-derived** from a fresh dump of `build-xrt`'s aircc of
+> **2026-08-11 13:28:03** (sha256 `5cb08407`), which carries the item-6a fuse fix *and* its review
+> round and the item-6b BD pacing — not carried over from this section's pre-6b measurement. It
+> re-derives to the same figures, column for column: **7 of 16 ports, worst column 2**, with
+> column 1 at 2 `shim→memtile`, column 5 at 1 `shim→memtile`, and columns 0/2/3/4 at 1 `shim→core`
+> each. `4 shim→core + 3 shim→memtile` likewise reproduces. The gate now pins
+> `shim MM2S 7/16 worst column 2` in its verdict line, so this literal moves loudly.
+>
+> **Widening to both flow kinds was necessary but not sufficient**, and this is the part §3.6 did
+> not know. Over budget AIR does **not** emit a third circuit flow — it converts the design to
+> **packet** flows, k streams sharing one shim queue by packet id. Measured on a purpose-built
+> control (one segment, one herd of 4, three herd-direct L3 operands): **zero** inbound `aie.flow`
+> and **12 `aie.packet_flow`**, three per column. So a census counting surviving *ports* reads 0
+> for a column carrying 3, and the corrected clause would still have been unable to fail. It
+> counts a packet-multiplexed group **once per stream**, and that control now runs inside the gate
+> on every invocation. Tamper-verified in both directions: reverting to `shim→core`-only moves the
+> pinned literal to `4/16 worst column 1` (FileCheck red) *and* fails the control; dropping only
+> the packet half leaves the R1 literal at 7/16 and is caught by the control alone.
+
 Memtile occupancy on the same routed design, for the same reason (a memtile has 6 MM2S / 6 S2MM):
 
 | memtile column | MM2S out | S2MM in |
@@ -542,7 +563,7 @@ Two things follow, and both make R2 easier than §5 assumed:
 | 4 | An L2-staged band feed exhausts the memtile's 48 BDs | **MEASURED** (§3.3) |
 | 4b | The microkernel refusing the row partition's `DIM_M` | **MEASURED** — 16 builds, 8 refused (§7.1) |
 | 4c | Objects colliding on global symbols | **MEASURED** — one pair collides and R2 need not link it (§7.2); the **link** remains unverified |
-| 5 | Per-column shim MM2S over 2 | **MEASURABLE** — `probe_r2_segment_budget.py --arm shim`, once the R2 module exists |
+| 5 | Per-column shim MM2S over 2 | **MEASURABLE** — `probe_r2_segment_budget.py --arm shim`, once the R2 module exists; `[2026-08-12]` **also GATED** — R1's arm (c) now counts the demand over both flow kinds and over packet flows, with a negative control that refuses a 3-per-column design (item 10, §3.6) |
 | 6 | Memtile port pressure (6/6) | **MEASURABLE**, same arm |
 | 7 | `air-fuse-channels` channel census and compile time | **MEASURABLE** — R1 sits at 12 symbols / 1 s against the >1200 s wall at 90; R2 adds the tails' channels |
 | 8 | Down-herd L1 fit (4 C accumulators + A + B ≈ 51,200 B of 65,536) | **MEASURABLE** once the down herd is row-partitioned; **not yet measured** |
@@ -563,7 +584,8 @@ nest aborts the compiler.
 
 Two things bound the design rather than block it: **eight herds at width 4** (so J7a's three-herd
 pipeline cannot be used on both tails), and **the per-column shim budget**, which the arithmetic
-clears at 8 of 16 ports and which R1's own gate clause currently cannot see.
+clears at 8 of 16 ports and which R1's own gate clause could not see — `[2026-08-12]` it can now
+(item 10, §3.6), so R2's own gate inherits a working column census rather than needing one written.
 
 **The bounded fallback, if R2-rows proves unbuildable**: keep R1's column-partitioned interior
 verbatim and attach **nt2 only** — `hidden` continues to bounce through L3 as R1 expects, and the

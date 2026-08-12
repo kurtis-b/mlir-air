@@ -53,8 +53,19 @@ CHECKS (assertions; everything else is reported)
     E. core->core flows == herd_x (the up->GeLU edges, one per column);
        every other hand-off is memtile-mediated BY the port arithmetic in
        the builder's docstring, so more core->core is as wrong as fewer.
-    F. Shim-facing inbound flows per column <= 2, counted on the routed
-       design.
+    F. Per-column shim MM2S DEMAND <= 2 on the routed design (doc 23's
+       rule: a column has two shim MM2S channels and the budget is per
+       column across the whole segment). `[2026-08-12]` WIDENED with the
+       gate's, queue item 10: it counted ``shim -> core`` circuit flows
+       only and read 1 for a column at 2, because an L2-staged refill is a
+       ``shim -> memtile`` flow on the same port (doc 31b 3.6), and because
+       AIR answers an over-budget column by PACKET-multiplexing the streams
+       onto one queue rather than refusing -- so a circuit-only count reads
+       0 exactly when the clause is needed. Measured on R1: 7 of 16 ports,
+       worst column 2 (was 4 of 16, worst 1). The gate twin
+       (``programming_examples/transformer_layer/ffn_resident_structure.py``)
+       carries the same census AND its negative control; this probe is the
+       exploratory half.
     G. Down-herd K loop 4 -> 2 across the hoist pass, with the accumulate
        call and guarded zero inside.
 
@@ -122,10 +133,19 @@ from builders.ffn_accum import (  # noqa: E402
 FFN_DIM = 3072
 EMB_DIM = 768
 
+# AIETargetModel.h: NPU2TargetModel::columns() = 8, and a shim NOC tile
+# drives two MM2S DMA channels -- doc 23's per-column budget.
+NPU2_COLUMNS = 8
+SHIM_MM2S_PER_COLUMN = 2
+NPU2_SHIM_MM2S_PORTS = NPU2_COLUMNS * SHIM_MM2S_PER_COLUMN
+
 _TILE_RE = re.compile(r"%(\S+) = aie\.tile\((\d+),\s*(\d+)\)")
 _FLOW_RE = re.compile(
-    r"aie\.flow\(%(\S+),\s*\w+\s*:\s*\d+,\s*%(\S+),\s*\w+\s*:\s*\d+\)"
+    r"aie\.flow\(%(\S+),\s*(\w+)\s*:\s*(\d+),\s*%(\S+),\s*(\w+)\s*:\s*(\d+)\)"
 )
+# ONE aie.packet_source per aie.packet_flow (a flow may broadcast to many
+# dests), so counting sources counts flows and needs no brace matching.
+_PACKET_SOURCE_RE = re.compile(r"aie\.packet_source<%(\S+),\s*(\w+)\s*:\s*(\d+)>")
 _MOVEMENT = re.compile(r"air\.dma_memcpy_nd|air\.channel\.(?:put|get)")
 _CHANNEL_DUMP_SUFFIX = "_after_air-dma-to-channel.mlir"
 _HOIST_DUMP_SUFFIX = "_after_air-hoist-dma-in-accum-pattern.mlir"
@@ -209,6 +229,63 @@ def _device_blocks(text):
         else:
             i += 1
     return blocks or ([("<module>", text)] if "aie.tile" in text else [])
+
+
+def _shim_mm2s_census(dev):
+    """Per-column shim MM2S demand -- the same census the gate twin runs.
+
+    Kept literally in step with
+    ``programming_examples/transformer_layer/ffn_resident_structure.py``'s
+    ``_shim_mm2s_census``; that one is the gate and carries the negative
+    control. Returns ``(demand, detail)`` with ``detail[col] =
+    (circuit_ports, packet_streams, to_core, to_memtile, s2mm)``.
+
+    A circuit ``aie.flow`` out of a shim tile takes one MM2S channel per
+    distinct source (bundle, channel) whatever it is wired to -- core (a
+    herd-direct fetch) or memtile (an L2-staged refill); several flows off
+    one source port are one broadcast and count once. A packet flow counts
+    once per stream, because packet-multiplexing IS the over-budget
+    behaviour and counting surviving ports there reads 1 (or 0) for a
+    column carrying k.
+    """
+    tiles = {m[0]: (int(m[1]), int(m[2])) for m in _TILE_RE.findall(dev)}
+
+    def kind(t):
+        rc = tiles.get(t)
+        if rc is None:
+            return None
+        return "shim" if rc[1] == 0 else "memtile" if rc[1] == 1 else "core"
+
+    def col(t):
+        rc = tiles.get(t)
+        return None if rc is None else rc[0]
+
+    circuit_ports = {}
+    to_core, to_memtile, s2mm = Counter(), Counter(), Counter()
+    for s, sb, sp, d, db, _dp in _FLOW_RE.findall(dev):
+        if kind(s) == "shim" and sb == "DMA":
+            circuit_ports.setdefault(col(s), set()).add((sb, int(sp)))
+            if kind(d) == "core":
+                to_core[col(s)] += 1
+            elif kind(d) == "memtile":
+                to_memtile[col(s)] += 1
+        if kind(d) == "shim" and db == "DMA":
+            s2mm[col(d)] += 1
+
+    packet = Counter()
+    for t, b, _p in _PACKET_SOURCE_RE.findall(dev):
+        if kind(t) == "shim" and b == "DMA":
+            packet[col(t)] += 1
+
+    cols = set(circuit_ports) | set(packet) | set(s2mm)
+    demand, detail = {}, {}
+    for c in sorted(x for x in cols if x is not None):
+        nc = len(circuit_ports.get(c, ()))
+        np_ = packet.get(c, 0)
+        demand[c] = nc + np_
+        detail[c] = (nc, np_, to_core.get(c, 0), to_memtile.get(c, 0),
+                     s2mm.get(c, 0))
+    return demand, detail
 
 
 def main():
@@ -364,7 +441,8 @@ def main():
             "exactly 1 -- the one-segment claim itself"
         )
     total_core_core = 0
-    max_inbound = 0
+    mm2s_total = 0
+    mm2s_worst = 0
     if not any(_FLOW_RE.search(d) for _, d in devices):
         problems.append(
             f"no aie.flow in {final_name} -- nothing was routed "
@@ -384,25 +462,34 @@ def main():
             return "shim" if r == 0 else "memtile" if r == 1 else "core"
 
         flows = _FLOW_RE.findall(dev)
-        edges = Counter((kind(s), kind(d)) for s, d in flows)
+        edges = Counter(
+            (kind(s), kind(d)) for s, _sb, _sp, d, _db, _dp in flows
+        )
         core_core = edges.get(("core", "core"), 0)
         total_core_core += core_core
-        inbound = Counter(
-            cols_by.get(d) for s, d in flows if kind(s) == "shim" and kind(d) == "core"
-        )
-        over = {c: n for c, n in inbound.items() if n > 2}
-        max_inbound = max(max_inbound, max(inbound.values(), default=0))
+        demand, detail = _shim_mm2s_census(dev)
+        mm2s_total += sum(demand.values())
+        mm2s_worst = max([mm2s_worst] + list(demand.values()))
+        over = {c: n for c, n in demand.items() if n > SHIM_MM2S_PER_COLUMN}
         if over:
             problems.append(
-                f"device {dev_name}: columns {sorted(over)} take more than 2 "
-                f"shim-facing inbound flows ({over})"
+                f"device {dev_name}: columns {sorted(over)} demand more than "
+                f"{SHIM_MM2S_PER_COLUMN} shim MM2S ({over}) -- doc 23's "
+                "per-column budget; AIR packet-multiplexes past it rather "
+                "than refusing"
             )
         core_rows = Counter(r for r in rows_by.values() if r >= 2)
         memtile_cols = sorted({cols_by[t] for t, r in rows_by.items() if r == 1})
+        census_str = ", ".join(
+            "col {}: {} (core {}, memtile {}, packet {})".format(
+                c, demand[c], detail[c][2], detail[c][3], detail[c][1]
+            )
+            for c in sorted(demand)
+        )
         print(
             f"[ffn-resident-probe]   device {dev_name}: core rows "
             f"{dict(sorted(core_rows.items()))}, memtile cols {memtile_cols}, "
-            f"flows {dict(edges)}, shim inbound/col {dict(sorted(inbound.items()))}"
+            f"flows {dict(edges)}, shim MM2S [{census_str}]"
         )
     if tiled and total_core_core != herd_x:
         problems.append(
@@ -415,9 +502,10 @@ def main():
     print(
         f"[ffn-resident-probe] {verdict} ({len(dumps)} dumps in {elapsed:.1f}s, "
         f"{n_channels} air.channel symbols, {len(devices)} aie.device "
-        f"({len(tiled)} with tiles), {total_core_core} core->core flows, max "
-        f"{max_inbound} shim inbound per column, {len(packet_dumps)} packet "
-        f"dumps; compile: {compile_error or 'succeeded'})"
+        f"({len(tiled)} with tiles), {total_core_core} core->core flows, shim "
+        f"MM2S {mm2s_total}/{NPU2_SHIM_MM2S_PORTS} worst column {mm2s_worst}, "
+        f"{len(packet_dumps)} packet dumps; "
+        f"compile: {compile_error or 'succeeded'})"
     )
     if problems:
         print()
