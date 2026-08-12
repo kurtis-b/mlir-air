@@ -272,6 +272,156 @@ def test_cli_stamps_an_observed_mode_and_can_refuse_to_probe():
         assert block["npu_power_mode"] == schema.UNKNOWN_CONDITION
 
 
+# ---------------------------------------------------------------------------
+# The toolchain block `[2026-08-12]` -- queue item 16.
+#
+# HERMETIC, like the conditions tests beside them: `observe_toolchain` is
+# exercised against a scratch XRT version.json and a scratch sys.path, never
+# against this host's real toolchain. A test that asserted "xrt_version ==
+# 2.21.0" would be asserting the machine, and would go red on the next upgrade
+# -- which is the event the field exists to RECORD, not to fail on.
+# ---------------------------------------------------------------------------
+
+
+def _manifest_toolchain(tmp, **kwargs):
+    results_io.write_rows(Path(tmp) / "m.csv", [_row("passed")])
+    return manifest.build_manifest(tmp, ["m.csv"], **kwargs)
+
+
+def test_a_manifest_records_the_toolchain_under_the_diffed_key():
+    """The point of the whole item: the key must be the one the diff reads."""
+    with tempfile.TemporaryDirectory() as d:
+        block = schema.empty_toolchain()
+        block["xrt_version"] = "2.21.0+4eb1f4392a01"
+        block["toolchain_source"] = "probed_at_manifest_build"
+        man = _manifest_toolchain(d, toolchain=block)
+        assert "toolchain" in man, sorted(man)
+        assert man["toolchain"]["xrt_version"] == "2.21.0+4eb1f4392a01"
+
+
+def test_no_supplied_toolchain_records_unknown_with_a_reason():
+    """It is not probed behind the caller's back, and it is not assumed."""
+    with tempfile.TemporaryDirectory() as d:
+        block = _manifest_toolchain(d)["toolchain"]
+        for name in schema.TOOLCHAIN_IDENTITY_FIELDNAMES:
+            assert block[name] == schema.UNKNOWN_CONDITION, name
+        assert "NOT assumed" in block["toolchain_detail"]
+        assert "19-39%" in block["toolchain_detail"]
+
+
+def test_a_malformed_toolchain_block_is_refused_at_build_time():
+    """A typo'd key must fail here, not be written and read back as unknown."""
+    with tempfile.TemporaryDirectory() as d:
+        block = schema.empty_toolchain()
+        block["xrt_verison"] = block.pop("xrt_version")
+        try:
+            _manifest_toolchain(d, toolchain=block)
+        except ValueError as exc:
+            # A typo trips both clauses (a key missing AND one invented); the
+            # assertion is that it is refused and that the message names the
+            # field, not which clause happens to fire first.
+            assert "xrt_version" in str(exc), exc
+        else:
+            raise AssertionError("a typo'd toolchain key was accepted")
+
+
+def test_an_unknown_toolchain_does_not_make_a_tree_incomplete():
+    """Same split as the pmode: measuring everything asked for is `complete`.
+
+    Whether two such trees may be COMPARED is compare_roots' question.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        assert _manifest_toolchain(d)["complete"] is True
+
+
+def test_the_toolchain_block_did_not_change_the_schema_version_on_disk():
+    """Pinned on the written artifact, not just on the constant."""
+    with tempfile.TemporaryDirectory() as d:
+        assert _manifest_toolchain(d)["schema_version"] == 2
+
+
+def test_observe_toolchain_reads_versions_and_labels_the_source():
+    with tempfile.TemporaryDirectory() as d:
+        version_json = Path(d) / "version.json"
+        version_json.write_text(
+            json.dumps({"BUILD_VERSION": "2.21.0", "VERSION_HASH": "4eb1f4392a01beef"})
+        )
+        old = manifest.XRT_VERSION_JSON
+        manifest.XRT_VERSION_JSON = version_json
+        try:
+            block = manifest.observe_toolchain()
+        finally:
+            manifest.XRT_VERSION_JSON = old
+        # Truncated to 12 so the diff line stays readable.
+        assert block["xrt_version"] == "2.21.0+4eb1f4392a01", block["xrt_version"]
+        assert block["toolchain_source"] == "probed_at_manifest_build"
+        schema.validate_toolchain(block)
+
+
+def test_observe_toolchain_degrades_field_by_field_with_reasons():
+    """A missing layer must not take the readable ones down with it."""
+    with tempfile.TemporaryDirectory() as d:
+        old = manifest.XRT_VERSION_JSON
+        manifest.XRT_VERSION_JSON = Path(d) / "nope.json"
+        try:
+            block = manifest.observe_toolchain()
+        finally:
+            manifest.XRT_VERSION_JSON = old
+        assert block["xrt_version"] == schema.UNKNOWN_CONDITION
+        assert "does not exist" in block["toolchain_detail"]
+        assert "xrt_version:" in block["toolchain_detail"]
+        schema.validate_toolchain(block)
+
+
+def test_observe_toolchain_survives_a_malformed_version_file():
+    """Best-effort like _git: a manifest with imperfect provenance still beats none."""
+    with tempfile.TemporaryDirectory() as d:
+        bad = Path(d) / "version.json"
+        bad.write_text("{not json at all")
+        old = manifest.XRT_VERSION_JSON
+        manifest.XRT_VERSION_JSON = bad
+        try:
+            block = manifest.observe_toolchain()
+        finally:
+            manifest.XRT_VERSION_JSON = old
+        assert block["xrt_version"] == schema.UNKNOWN_CONDITION
+        schema.validate_toolchain(block)
+
+
+def test_observe_toolchain_never_writes_the_reader_only_absent():
+    """`absent` means "older than the field" and a fresh probe is never that."""
+    with tempfile.TemporaryDirectory() as d:
+        old = manifest.XRT_VERSION_JSON
+        manifest.XRT_VERSION_JSON = Path(d) / "nope.json"
+        try:
+            block = manifest.observe_toolchain()
+        finally:
+            manifest.XRT_VERSION_JSON = old
+        assert block["toolchain_source"] != "absent"
+
+
+def test_cli_probes_the_toolchain_and_no_probe_suppresses_it():
+    with tempfile.TemporaryDirectory() as d:
+        results_io.write_rows(Path(d) / "m.csv", [_row("passed")])
+        out = Path(d) / "m.json"
+        version_json = Path(d) / "version.json"
+        version_json.write_text(json.dumps({"BUILD_VERSION": "0.0.0-test"}))
+        old = manifest.XRT_VERSION_JSON
+        manifest.XRT_VERSION_JSON = version_json
+        try:
+            assert manifest.main([d, "--expect", "m.csv", "-o", str(out)]) == 0
+        finally:
+            manifest.XRT_VERSION_JSON = old
+        block = json.loads(out.read_text())["toolchain"]
+        assert set(block) == set(schema.TOOLCHAIN_FIELDNAMES), sorted(block)
+        assert block["xrt_version"] == "0.0.0-test", block
+
+        assert manifest.main([d, "--expect", "m.csv", "-o", str(out), "--no-probe"]) == 0
+        block = json.loads(out.read_text())["toolchain"]
+        for name in schema.TOOLCHAIN_IDENTITY_FIELDNAMES:
+            assert block[name] == schema.UNKNOWN_CONDITION, name
+
+
 def _rungs(passed=0, failed=0, skipped=0):
     return (
         [_row("passed") for _ in range(passed)]

@@ -83,6 +83,23 @@ THE MEASUREMENT CONDITION IS CHECKED BEFORE ANY DRIFT IS GATED `[2026-08-12]`
     comparison exactly as on an accepted one, and a structural change still
     fails on its own terms.
 
+THE BUILD CONDITION IS CHECKED TOO, AND IT FLAGS RATHER THAN REFUSING `[2026-08-12]`
+    Queue item 16. The docstring above has always said the manifests are compared
+    first so that "the latency moved" and "the toolchain moved" stop being the
+    same observation -- and until today that was not true: ``compare_manifests``
+    diffed a ``toolchain`` block ``manifest.py`` had never written, so the loop
+    iterated an empty key and the toolchain half compared nothing. It is written
+    now (``schema.TOOLCHAIN_FIELDS``: XRT version, the mlir-aie and Peano wheel
+    pins, and the ``build-xrt``-vs-``install-xrt`` resolution), the existing diff
+    prints it field by field, and ``compare_toolchain`` gives it a verdict-level
+    reading.
+
+    It WARNS on a mismatch and keeps gating, where the power mode REFUSES. That
+    asymmetry is argued in full at ``compare_toolchain``; in one line, a pmode
+    mismatch guarantees a false verdict and has an actionable exit, while a
+    toolchain mismatch may not invalidate anything and frequently has no exit at
+    all, because the toolchain it would re-walk against has been overwritten.
+
 WHAT IS DELIBERATELY DIFFERENT FROM IRON'S COMPARATOR
     - **No file list is baked in.** iron hardcodes its ``RESULT_CSVS`` and
       ``DERIVED_CSVS`` tuples, which silently skip a file a run stopped
@@ -380,6 +397,135 @@ def compare_conditions(report: Report, baseline: Path, candidate: Path) -> bool:
     return True
 
 
+def compare_toolchain(report: Report, baseline: Path, candidate: Path) -> None:
+    """The build-condition guard. FLAGS; never withdraws the gate.
+
+    `[2026-08-12]`, queue item 16. Its prerequisite was that anything wrote the
+    block at all: ``compare_manifests`` below has diffed ``manifest["toolchain"]``
+    since it was written and ``manifest.py`` never wrote one, so the toolchain
+    half of every root comparison compared NOTHING. That half is now populated by
+    ``manifest.observe_toolchain`` and prints as NOTE lines; this function is the
+    verdict-level reading of the same fact.
+
+    WHY THIS FLAGS WHERE THE POWER MODE REFUSES. The split is not inherited, and
+    it is the decision worth arguing. Four reasons, and the first two are
+    decisive.
+
+      1. MAGNITUDE. A pmode mismatch drifts ~1500-2000% against fail bands of
+         15-35% -- a 30-100x overshoot, so a mismatch GUARANTEES the latency
+         verdict is false, and withdrawing it costs nothing that was true. The
+         recorded toolchain effect is doc 03's XRT change: ``offload`` 19-39%
+         against its own 35% band, the other three modes within 0.6% against
+         15%. That straddles the band rather than dwarfing it. A guard that
+         withdrew the verdict here would discard true regressions -- most fields,
+         most of the time, are still inside tolerance -- to suppress a false one
+         that may not be there.
+      2. THE EXIT IS OFTEN NOT AVAILABLE. Item 15's rule for choosing is whether
+         the operator can act: it refuses a pmode mismatch because "re-walk one
+         side" is actionable, and ``pmode_guard`` flags the throughput floor
+         because refusing left "re-seed until it passes" as the only exit. A
+         toolchain is INSTALLED, singular and destructive -- doc 15's four-layer
+         upgrade replaces LLVM, mlir-aie, the stale tablegen output and the
+         bindings bottom-up, and `install-xrt` overwrites. A baseline recorded
+         against a toolchain no longer on the host CANNOT be re-walked at that
+         toolchain, so the refusal's only real exit is "delete the baseline".
+         That is item 15's own argument against refusing, transferred.
+      3. THE TOOLCHAIN IS OFTEN THE INDEPENDENT VARIABLE. The pmode is never what
+         a study is measuring; the toolchain frequently is. The README's own
+         provenance check -- ``runlist``'s non-attention total byte-identical to
+         the figure its gate pinned BEFORE the rebuild -- is a comparison taken
+         deliberately across a toolchain change. Refusing would drop exactly the
+         latency fields to ``[SPLICED]`` for the operator who ran it to see them.
+      4. IT IS ALREADY HOW PROVENANCE IS TREATED HERE. ``compare_manifests``
+         diffs the git sha as a NOTE and does not refuse, because a code change
+         is the normal reason to run a comparison at all. The toolchain sits on
+         the same axis one layer down.
+
+    So a mismatch WARNS, names the fields that moved, and gating continues. What
+    a reader gets is the one thing they did not have before: when a latency moves
+    and the toolchain moved with it, the tool now says so instead of leaving
+    "the latency moved" and "the toolchain moved" indistinguishable -- which is
+    what the module docstring has always claimed this section was for.
+
+    An ABSENT or UNKNOWN side also warns, for ``compare_conditions``' reason
+    exactly: a recorded root cannot be stamped after the fact, and refusing there
+    would make the module useless against the whole recorded corpus. Both roots
+    recording nothing is NOT agreement, and is not reported as any.
+
+    Returns None on purpose -- there is no ``may_gate`` to return, because this
+    guard never withdraws the verdict.
+    """
+    report.say("\n=== build condition (toolchain) ===")
+    left_payload, left_why = load_manifest(baseline)
+    right_payload, right_why = load_manifest(candidate)
+    left = schema.toolchain_from_manifest(left_payload)
+    right = schema.toolchain_from_manifest(right_payload)
+
+    for name in schema.TOOLCHAIN_IDENTITY_FIELDNAMES:
+        report.say(f"  {name}: baseline={left[name]}  candidate={right[name]}")
+
+    blind = [
+        (label, block, why)
+        for label, block, why in (
+            ("baseline", left, left_why),
+            ("candidate", right, right_why),
+        )
+        if any(
+            block[name] == schema.UNKNOWN_CONDITION
+            for name in schema.TOOLCHAIN_IDENTITY_FIELDNAMES
+        )
+    ]
+
+    if blind:
+        for label, block, why in blind:
+            missing = [
+                name
+                for name in schema.TOOLCHAIN_IDENTITY_FIELDNAMES
+                if block[name] == schema.UNKNOWN_CONDITION
+            ]
+            reason = why or block["toolchain_detail"] or "no reason recorded"
+            report.warn(
+                f"the {label} root does not record {', '.join(missing)} -- " f"{reason}"
+            )
+        report.say(
+            "        This comparison is UNCONDITIONED on the toolchain: doc 03 "
+            "records an XRT version\n"
+            "        change ALONE moving `offload` 19-39% at seq_len >= 4096, "
+            "which is inside its own fail\n"
+            "        band, so a drift below may be a toolchain change rather "
+            "than a code change and nothing\n"
+            "        here can tell you which. Flagged rather than refused, and "
+            "still gating: a recorded\n"
+            "        root's toolchain is NOT recoverable from its files and must "
+            "not be stamped after the\n"
+            "        fact. Two roots that both record nothing are not two roots "
+            "that agree."
+        )
+
+    differences = schema.toolchain_differences(left, right)
+    if differences:
+        for name, before, after in differences:
+            report.warn(
+                f"the two roots were built against different {name} "
+                f"(baseline={before}, candidate={after})"
+            )
+        report.say(
+            "        The drift below is NOT conditioned on the toolchain and is "
+            "still gated -- see this\n"
+            "        function's docstring for why a toolchain mismatch flags "
+            "where a power-mode mismatch\n"
+            "        refuses. Read a red latency verdict here as `code OR "
+            "toolchain`, and settle it by\n"
+            "        re-walking one side at the other's toolchain if that "
+            "toolchain still exists."
+        )
+    elif not blind:
+        report.say(
+            "  both roots were built against the same toolchain -- the "
+            "comparison is conditioned on this axis too"
+        )
+
+
 def compare_manifests(report: Report, baseline: Path, candidate: Path) -> None:
     """Provenance first: a toolchain change explains drift that code does not."""
     report.say("\n=== manifest.json ===")
@@ -575,6 +721,10 @@ def compare_roots(baseline: Path, candidate: Path, csvs: list[str]) -> Report:
     # different question from whether their numbers agree, and it has to be
     # settled first or the second question's answer is meaningless.
     may_gate = compare_conditions(report, baseline, candidate)
+    # Beside it, and also before any CSV: the toolchain is the other half of the
+    # condition. It FLAGS rather than refusing, so it returns nothing and cannot
+    # move `may_gate` -- the argument is in its docstring.
+    compare_toolchain(report, baseline, candidate)
     for rel in csvs:
         compare_csv(report, rel, baseline, candidate, may_gate=may_gate)
 

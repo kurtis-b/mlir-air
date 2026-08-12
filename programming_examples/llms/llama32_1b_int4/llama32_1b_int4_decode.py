@@ -321,11 +321,31 @@ def run_decode_block(
 def _main():
     import argparse
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--compile-only", action="store_true")
+    ap = argparse.ArgumentParser(
+        description="Compile the int4 decode kernels. This entry NEVER "
+        "dispatches -- it only fills the kernel cache."
+    )
+    ap.add_argument(
+        "--compile-only",
+        action="store_true",
+        help="accepted for symmetry with the other model entries, and "
+        "redundant: this entry only ever compiles. Passing it changes nothing "
+        "because there is no dispatching branch to opt out of.",
+    )
     ap.add_argument("--cache-dir", type=str, default=None)
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
+
+    # `[2026-08-12]` queue item 19: `--compile-only` was parsed and never read.
+    # Unlike the `--compile-mode` that item is about, this one failed CLOSED --
+    # the entry compiles unconditionally, so asking for the safe branch got the
+    # safe branch. It was still misleading (a reader could reasonably infer a
+    # dispatching mode exists), so the flag is now documented as redundant and
+    # its value is read, rather than left dead for the next audit to re-find.
+    if args.compile_only and args.verbose:
+        print(
+            "[int4-decode] --compile-only is redundant here: this entry only compiles"
+        )
 
     config = LlamaConfig()
     cache = KernelCache(cache_dir=args.cache_dir, verbose=args.verbose)

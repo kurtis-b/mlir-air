@@ -126,6 +126,40 @@ check "$RC == 2" "a nested run exits 2 immediately rather than stalling for NPU_
 case $ERR in *"nesting would deadlock"*) ok "the refusal names the cause";;
               *) bad "refusal message does not name nesting: $ERR";; esac
 
+# ---------------------------------------------------------------- 7
+# `[2026-08-12]` queue item 19.  The device lock is advisory: nothing outside this
+# broker consults it, which is how a run that meant to be compile-only dispatched
+# beside job 252's 65-minute regression.  `preflight` is the askable form of the
+# probe build admission already uses, so the properties worth pinning are that it
+# REFUSES when held, that it cannot be turned into a way to acquire, and that it
+# does not refuse the caller its own queued job.
+echo "TEST 7: preflight fails CLOSED on a held device and holds nothing itself"
+fresh t7
+RC=0; "$DEVQ" preflight >/dev/null 2>&1 || RC=$?
+check "$RC == 0" "an idle device passes preflight (rc=$RC)"
+
+# Stand in for an un-migrated job that took the lock directly.
+( exec 8>>"$DEVQ_NPU_LOCK"; flock -x 8; sleep 3 ) &
+HOLDER=$!
+sleep 0.4
+ERR=$("$DEVQ" preflight 2>&1 >/dev/null); RC=$?
+printf '  rc=%s stderr=[%.120s]\n' "$RC" "$ERR"
+check "$RC == 3" "a held device REFUSES with 3, distinct from a command's own failure"
+case $ERR in *"run --class measure"*) ok "the refusal names the queued alternative";;
+              *) bad "refusal does not say how to dispatch correctly: $ERR";; esac
+# Inside a job the runner holds the lock on its own fd; probing there would refuse
+# every legitimate measure.  Same nesting trap `run` refuses for, other way round.
+RC=0; DEVQ_JOB_ID=999 "$DEVQ" preflight >/dev/null 2>&1 || RC=$?
+check "$RC == 0" "inside a devq job preflight passes without probing (rc=$RC)"
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+# It must never acquire: after a passing preflight the lock is still takeable.
+"$DEVQ" preflight >/dev/null 2>&1
+if ( exec 7>>"$DEVQ_NPU_LOCK" && flock -n -x 7 ) 2>/dev/null; then
+  ok "preflight holds nothing -- the lock is still free after it passes"
+else
+  bad "preflight left the device lock held; it must only ever ask"
+fi
+
 echo
 printf 'RESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -485,6 +485,220 @@ def test_the_guard_reads_the_RECORDED_condition_and_never_the_live_one():
         )
 
 
+# ---------------------------------------------------------------------------
+# The toolchain guard `[2026-08-12]` -- queue item 16.
+#
+# The defect these close: `compare_manifests` diffed a `toolchain` block nothing
+# wrote, so its inner loop iterated an empty key and the toolchain half of every
+# comparison compared NOTHING. The tests therefore come in two kinds -- that the
+# block is now actually read, and that reading it FLAGS without withdrawing the
+# gate, which is where it deliberately differs from the pmode guard.
+# ---------------------------------------------------------------------------
+
+_TOOLCHAIN_A = {
+    "xrt_version": "2.21.0+4eb1f4392a01",
+    "mlir_aie_version": "1.4.0",
+    "peano_version": "21.0.0.2026080401+512badad",
+    "air_resolution": "build-xrt",
+    "toolchain_source": "probed_at_manifest_build",
+    "toolchain_detail": "probed 4/4 field(s) at manifest build",
+}
+
+
+def _tc(**overrides):
+    return dict(_TOOLCHAIN_A, **overrides)
+
+
+def _tool_manifest(toolchain, mode="turbo"):
+    """A manifest with a matched pmode, so only the toolchain axis varies."""
+    payload = _manifest(mode)
+    if toolchain is None:
+        payload.pop("toolchain", None)  # a manifest predating the block
+    else:
+        payload["toolchain"] = toolchain
+    return payload
+
+
+def _tool_roots(left, right, *, drift=0.0):
+    return _roots(
+        [_row(latency=100.0)],
+        [_row(latency=100.0 * (1 + drift / 100.0))],
+        manifests=(_tool_manifest(left), _tool_manifest(right)),
+    )
+
+
+def test_the_toolchain_block_is_actually_read_now():
+    """The regression test for the original defect.
+
+    Before item 16 this section did not exist and the diff loop it depends on
+    iterated `{}`. A mismatch had to produce no output at all.
+    """
+    tmp, a, b = _tool_roots(_tc(), _tc(xrt_version="2.20.0+aaaaaaaaaaaa"))
+    with tmp:
+        text = compare_roots.compare_roots(a, b, ["coarse.csv"]).render()
+    assert "=== build condition (toolchain) ===" in text, text
+    assert "2.20.0+aaaaaaaaaaaa" in text, text
+
+
+def test_a_toolchain_mismatch_flags_and_does_NOT_refuse():
+    """The decision item 16 had to take, asserted as behaviour.
+
+    A pmode mismatch refuses; this one warns and keeps going. With no drift to
+    gate on, the verdict must stay OK -- a flag that failed the run would be a
+    refusal wearing a warning's name.
+    """
+    tmp, a, b = _tool_roots(_tc(), _tc(xrt_version="2.20.0+aaaaaaaaaaaa"))
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    text = report.render()
+    assert not report.refusals, text
+    assert report.warnings >= 1, text
+    assert "different xrt_version" in text, text
+    assert "VERDICT: OK" in text, text
+
+
+def test_a_toolchain_mismatch_names_the_field_that_moved():
+    """"the toolchain differs" is not actionable; naming the layer is."""
+    tmp, a, b = _tool_roots(_tc(), _tc(peano_version="20.0.0.2026010101+beef"))
+    with tmp:
+        text = compare_roots.compare_roots(a, b, ["coarse.csv"]).render()
+    assert "different peano_version" in text, text
+    assert "21.0.0.2026080401+512badad" in text and "20.0.0" in text, text
+
+
+def test_THE_SAME_DRIFT_fails_identically_at_matched_and_mismatched_toolchains():
+    """THE anti-swallow check, and the reason `may_gate` is not touched.
+
+    Item 15's key assertion was that an identical drift at the same condition
+    still fails. The equivalent here is stronger, because this guard is not
+    allowed to withdraw anything at all: the FAIL text must be IDENTICAL on both
+    sides, so the only thing a toolchain mismatch can add is a warning.
+    """
+    matched, a1, b1 = _tool_roots(_tc(), _tc(), drift=40.0)
+    with matched:
+        left = compare_roots.compare_roots(a1, b1, ["coarse.csv"])
+        left_fails = [l for l in left.render().splitlines() if "FAIL " in l]
+    mismatched, a2, b2 = _tool_roots(
+        _tc(), _tc(xrt_version="2.20.0+aaaaaaaaaaaa"), drift=40.0
+    )
+    with mismatched:
+        right = compare_roots.compare_roots(a2, b2, ["coarse.csv"])
+        right_fails = [l for l in right.render().splitlines() if "FAIL " in l]
+
+    assert left_fails == right_fails, (left_fails, right_fails)
+    assert left_fails, "the 40% drift must fail at all -- otherwise this proves nothing"
+    assert left.failures == right.failures == len(left_fails)
+    assert right.warnings > left.warnings, (left.warnings, right.warnings)
+
+
+def test_a_toolchain_mismatch_never_splices_the_gate():
+    """`[SPLICED]` belongs to the pmode refusal alone; this guard must not reach it."""
+    tmp, a, b = _tool_roots(
+        _tc(), _tc(air_resolution="install-xrt"), drift=40.0
+    )
+    with tmp:
+        text = compare_roots.compare_roots(a, b, ["coarse.csv"]).render()
+    assert "[GATE]" in text, text
+    assert "[SPLICED]" not in text, text
+
+
+def test_matching_toolchains_say_so_and_add_no_warning():
+    tmp, a, b = _tool_roots(_tc(), _tc())
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    text = report.render()
+    assert "both roots were built against the same toolchain" in text, text
+    assert report.warnings == 0, text
+    assert "VERDICT: OK" in text
+
+
+def test_a_provenance_only_difference_is_not_a_toolchain_difference():
+    """How the values were obtained is not what they are."""
+    tmp, a, b = _tool_roots(
+        _tc(toolchain_source="observed", toolchain_detail="one way"),
+        _tc(toolchain_detail="another way"),
+    )
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    text = report.render()
+    assert "both roots were built against the same toolchain" in text, text
+    assert report.warnings == 0, text
+
+
+def test_a_manifest_predating_the_block_flags_on_both_sides():
+    """Every root recorded before today, and it must not crash or match."""
+    tmp, a, b = _tool_roots(None, None)
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    text = report.render()
+    assert text.count("does not record xrt_version") == 2, text
+    assert "must not be stamped after the" in text, text
+    assert "both roots were built against the same toolchain" not in text, text
+    assert not report.refusals, text
+    assert "VERDICT: OK" in text, text
+
+
+def test_an_absent_toolchain_still_fails_on_a_real_regression():
+    """The corpus keeps gating -- refusing there would make the tool useless."""
+    tmp, a, b = _tool_roots(None, None, drift=40.0)
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    text = report.render()
+    assert "exceeds the fail threshold" in text, text
+    assert "VERDICT: PROBLEM" in text, text
+
+
+def test_one_side_recorded_and_one_side_not_is_flagged_not_compared():
+    """A half-known axis is unknown, not agreement and not a difference."""
+    tmp, a, b = _tool_roots(_tc(), None)
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    text = report.render()
+    assert text.count("does not record xrt_version") == 1, text
+    assert "different xrt_version" not in text, text
+    assert report.warnings >= 1, text
+
+
+def test_a_root_with_no_manifest_at_all_is_flagged_on_the_toolchain_axis_too():
+    """The recorded ladder walks carry no manifest; the guard must still run."""
+    tmp, a, b = _roots([_row(latency=100.0)], [_row(latency=100.0)])
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    text = report.render()
+    assert "=== build condition (toolchain) ===" in text, text
+    assert "no manifest.json in the root" in text, text
+    assert report.warnings >= 2, text
+
+
+def test_the_pmode_refusal_still_wins_when_both_conditions_moved():
+    """The two guards compose; the stronger verdict is not softened by the flag."""
+    tmp, a, b = _roots(
+        [_row(latency=100.0)],
+        [_row(latency=100.0 * (1 + _SPLICE_DRIFT / 100.0))],
+        manifests=(
+            _tool_manifest(_tc(), mode="turbo"),
+            _tool_manifest(_tc(xrt_version="2.20.0+aaaaaaaaaaaa"), mode="default"),
+        ),
+    )
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    text = report.render()
+    assert report.refusals, text
+    assert "COMPARISON REFUSED" in text and "[SPLICED]" in text, text
+    assert "different xrt_version" in text, text
+    assert "VERDICT: PROBLEM" in text
+
+
+def test_every_toolchain_identity_field_is_reported_and_compared():
+    """A field declared but never printed would be a fifth silent half-check."""
+    for name in schema.TOOLCHAIN_IDENTITY_FIELDNAMES:
+        tmp, a, b = _tool_roots(_tc(), _tc(**{name: "moved-value"}))
+        with tmp:
+            text = compare_roots.compare_roots(a, b, ["coarse.csv"]).render()
+        assert f"  {name}: baseline=" in text, (name, text)
+        assert f"different {name}" in text, (name, text)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

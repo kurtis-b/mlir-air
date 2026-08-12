@@ -36,13 +36,26 @@ THE MEASUREMENT CONDITION `[2026-08-12]` (doc 34 M4)
     ``xrt-smi`` on its critical path. ``observe_conditions()`` is the one-line
     probe for a caller that wants it, and the CLI runs it by default.
 
-    Not recorded, and named so it is not mistaken for an oversight:
-    ``xrt_version`` and the LLVM/mlir-aie/Peano pin. Doc 34 M4 asks for those
-    too and doc 03 records an XRT version change alone moving ``offload``
-    19-39%. They are a declaration in ``schema.CONDITION_FIELDS`` away. Note
-    while you are there that ``compare_roots.compare_manifests`` diffs a
-    ``toolchain`` block that this module has NEVER written -- the diff loop has
-    been iterating an empty key since it was written.
+THE TOOLCHAIN CONDITION `[2026-08-12]` (queue item 16)
+    The other half. ``compare_roots.compare_manifests`` has always diffed a
+    ``toolchain`` manifest block, and this module never wrote one, so that half
+    of every root comparison compared nothing -- for as long as it existed.
+
+    ``observe_toolchain()`` writes it: XRT version, the mlir-aie and Peano wheel
+    pins, and which AIR tree (``build-xrt`` vs ``install-xrt``) the interpreter
+    resolves. Declared in ``schema.TOOLCHAIN_FIELDS``, under
+    ``schema.TOOLCHAIN_KEY`` -- a name that is not a free choice, since matching
+    the key the diff already reads is the whole point.
+
+    Same rules as the conditions block, for the same reasons: the observation is
+    the CALLER's, ``build_manifest`` records ``unknown`` rather than probing
+    behind its back, the host suite stays hermetic, ``SCHEMA_VERSION`` STAYS 2,
+    and a manifest older than the block reads back as ``absent`` rather than
+    crashing or quietly matching.
+
+    Where they differ is what ``compare_roots`` does with a mismatch: it REFUSES
+    a pmode mismatch and FLAGS a toolchain one. That asymmetry is argued in
+    ``compare_roots.compare_toolchain``, not here.
 
 COMPLETENESS MEANS MEASURED, NOT PRESENT -- the one deliberate departure
     iron's ``results_manifest.py`` defines ``"complete": not missing_files``, so
@@ -214,6 +227,137 @@ def observe_conditions(mode: str | None = None) -> dict:
     return block
 
 
+#: Where XRT records its own version. A JSON file the runtime ships, read rather
+#: than shelled out to: `xrt-smi --version` is a device-touching binary and this
+#: module must not put one on a host-only critical path.
+XRT_VERSION_JSON = Path("/opt/xilinx/xrt/version.json")
+
+#: The two AIR trees doc 15 keeps distinct, longest-first so `install-xrt` cannot
+#: be matched by a prefix of `build-xrt` or vice versa.
+_AIR_TREES = ("install-xrt", "build-xrt")
+
+
+def _wheel_version(distribution: str) -> tuple[str | None, str | None]:
+    """``(version, why_not)`` for an installed wheel, without importing it.
+
+    ``importlib.metadata`` reads the dist-info of whatever the CURRENT
+    interpreter would import, which is the point: it reports the wheel that
+    actually resolves rather than a path this module guessed. Importing the
+    package instead would be both slow and, for these two, capable of failing on
+    a machine whose toolchain is exactly the thing in question.
+    """
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        return version(distribution), None
+    except PackageNotFoundError:
+        return None, f"no {distribution} distribution is visible to this interpreter"
+    except Exception as exc:  # pragma: no cover - harness breakage, not a task
+        return None, f"could not read {distribution} ({type(exc).__name__}: {exc})"
+
+
+def _xrt_version() -> tuple[str | None, str | None]:
+    """``(version, why_not)`` from XRT's own ``version.json``.
+
+    ``BUILD_VERSION+VERSION_HASH[:12]``: the release number alone has been
+    identical across rebuilt runtimes, and doc 03's 19-39% ``offload`` swing is
+    attributed to an XRT change -- so the build hash is carried too, truncated
+    because a full 40-char hash makes the diff line unreadable and the first 12
+    already separate every build this host has seen.
+    """
+    try:
+        payload = json.loads(XRT_VERSION_JSON.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, f"{XRT_VERSION_JSON} does not exist on this host"
+    except (OSError, ValueError) as exc:
+        return None, f"could not read {XRT_VERSION_JSON} ({type(exc).__name__}: {exc})"
+    if not isinstance(payload, dict):
+        return None, f"{XRT_VERSION_JSON} is not a JSON object"
+    build = str(payload.get("BUILD_VERSION") or "").strip()
+    digest = str(payload.get("VERSION_HASH") or "").strip()
+    if not build:
+        return None, f"{XRT_VERSION_JSON} records no BUILD_VERSION"
+    return (f"{build}+{digest[:12]}" if digest else build), None
+
+
+def _air_resolution() -> tuple[str | None, str | None]:
+    """Which AIR tree this interpreter would import: build-xrt, install-xrt, ...
+
+    Uses ``find_spec``, which locates a top-level package WITHOUT executing its
+    ``__init__``. Importing ``air`` here would be the wrong tool twice over: it
+    is slow, and on a host whose bindings are stale it raises -- and a stale
+    binding is precisely the condition this field exists to make visible, so the
+    probe for it must not be the thing that fails.
+    """
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec("air")
+    except Exception as exc:
+        return None, f"could not locate the air package ({type(exc).__name__}: {exc})"
+    if spec is None:
+        return None, "no `air` package is visible to this interpreter"
+    origin = spec.origin or (list(spec.submodule_search_locations or []) or [None])[0]
+    if not origin:
+        return None, "the `air` package has no locatable origin"
+    for tree in _AIR_TREES:
+        if f"/{tree}/" in str(origin):
+            return tree, None
+    # Verbatim rather than "other": doc 15's whole point is that WHICH tree is
+    # resolved decides whether a run saw a compiler fix, and collapsing an
+    # unrecognised path to a label throws away the only clue.
+    return str(Path(origin).parent), None
+
+
+def observe_toolchain() -> dict:
+    """The toolchain this host would build and dispatch with, best-effort.
+
+    Never raises, and every field degrades to ``unknown`` WITH the reason
+    attached -- ``_git``'s rule and ``observe_conditions``' rule, for the same
+    reason: a manifest with imperfect provenance still beats no manifest, and an
+    `unknown` that does not say why is indistinguishable from one nobody tried
+    to fill.
+
+    Stamped ``probed_at_manifest_build`` whenever anything at all was read. There
+    is no ``observed`` variant and no caller-supplied override, which is the one
+    place this differs from ``observe_conditions``: a pmode can reset between the
+    run and the manifest build, so who observed it and when is load-bearing,
+    whereas a toolchain changes only when somebody deliberately rebuilds it. If
+    that ever stops being true the field's domain (CONDITION_SOURCES) already has
+    room for ``observed``.
+    """
+    block = schema.empty_toolchain()
+    reasons = []
+    for name, probe in (
+        ("xrt_version", _xrt_version),
+        ("mlir_aie_version", lambda: _wheel_version("mlir_aie")),
+        ("peano_version", lambda: _wheel_version("llvm-aie")),
+        ("air_resolution", _air_resolution),
+    ):
+        try:
+            value, why_not = probe()
+        except Exception as exc:  # pragma: no cover - a probe must never raise
+            value, why_not = None, f"{type(exc).__name__}: {exc}"
+        if value:
+            block[name] = str(value)
+        else:
+            reasons.append(f"{name}: {why_not}")
+
+    known = sum(
+        1
+        for name in schema.TOOLCHAIN_IDENTITY_FIELDNAMES
+        if block[name] != schema.UNKNOWN_CONDITION
+    )
+    if known:
+        block["toolchain_source"] = "probed_at_manifest_build"
+    block["toolchain_detail"] = (
+        f"probed {known}/{len(schema.TOOLCHAIN_IDENTITY_FIELDNAMES)} field(s) "
+        f"at manifest build"
+        + (f"; not determined -- {'; '.join(reasons)}" if reasons else "")
+    )
+    return block
+
+
 def _file_record(root: Path, rel: str) -> dict:
     path = root / rel
     exists = path.is_file()
@@ -310,6 +454,7 @@ def build_manifest(
     repo=None,
     conditions=None,
     expected_rows: dict | None = None,
+    toolchain=None,
 ) -> dict:
     """Describe ``results_root``; ``complete`` means every expected CSV measured.
 
@@ -321,10 +466,15 @@ def build_manifest(
     A supplied block is validated, so a hand-assembled dict with a typo'd key
     fails here rather than being written and read back as a silent ``unknown``.
 
+    ``toolchain`` is the build condition -- a block from ``observe_toolchain()``
+    -- and behaves identically: omitting it records ``unknown`` with a reason
+    rather than probing, and a hand-assembled block is validated so a typo'd key
+    fails here rather than being read back as a silent ``unknown``.
+
     ``expected_rows`` adds the row-count clauses -- see the docstring section.
 
-    Both kwargs default to None and are therefore back-compatible: a caller
-    that passes neither gets the pre-2026-08-12 behaviour, an unconditioned
+    All three kwargs default to None and are therefore back-compatible: a caller
+    that passes none gets the pre-2026-08-12 behaviour, an unconditioned
     manifest whose completeness is judged on files alone.
     """
     root = Path(results_root)
@@ -341,6 +491,17 @@ def build_manifest(
             "probes by default."
         )
     schema.validate_conditions(conditions)
+
+    if toolchain is None:
+        toolchain = schema.empty_toolchain()
+        toolchain["toolchain_detail"] = (
+            "no toolchain was supplied to build_manifest. It is NOT assumed: a "
+            "comparison against this root is unconditioned on the axis doc 03 "
+            "records moving `offload` 19-39% on an XRT change alone. Pass "
+            "manifest.observe_toolchain(), or run this module's CLI, which "
+            "probes by default."
+        )
+    schema.validate_toolchain(toolchain)
 
     problems = smoke_gate.check_results_root(root, expected)
     files = [_file_record(root, rel) for rel in expected]
@@ -374,6 +535,11 @@ def build_manifest(
         # keeping the two verdicts apart is what stops "unknown pmode" from
         # making an otherwise finished run report as unfinished.
         schema.CONDITIONS_KEY: conditions,
+        # The build condition, and NOT part of `complete` for the conditions
+        # block's reason. Written under the key `compare_manifests` has always
+        # diffed -- before this, that loop iterated `{}` on both sides and the
+        # toolchain half of every comparison compared nothing (queue item 16).
+        schema.TOOLCHAIN_KEY: toolchain,
         "expected_files": files,
         "missing_files": [f["path"] for f in files if not f["exists"]],
         # Recorded so a reader can tell "the counts were met" from "no counts
@@ -413,15 +579,25 @@ def main(argv: list[str] | None = None) -> int:
         "--no-probe",
         action="store_true",
         help="record the condition as `unknown` rather than querying the "
-        "device. For a manifest built on a host that did not do the measuring.",
+        "device. For a manifest built on a host that did not do the measuring. "
+        "Suppresses the toolchain probe too: both describe THIS host, and a "
+        "manifest built elsewhere should claim neither.",
     )
     args = ap.parse_args(argv)
 
     conditions = None
+    toolchain = None
     if not args.no_probe or args.npu_power_mode is not None:
         conditions = observe_conditions(args.npu_power_mode)
+    if not args.no_probe:
+        # No `--toolchain-*` override to match `--npu-power-mode`: nothing about
+        # a toolchain is observable at measurement time and not at manifest
+        # build, so an override would only be a way to write a claim by hand.
+        toolchain = observe_toolchain()
 
-    manifest = build_manifest(args.results_root, args.expect, conditions=conditions)
+    manifest = build_manifest(
+        args.results_root, args.expect, conditions=conditions, toolchain=toolchain
+    )
     write_manifest(args.output, manifest)
 
     print(f"[manifest] wrote {args.output}")
@@ -436,6 +612,20 @@ def main(argv: list[str] | None = None) -> int:
         # that measured everything incomplete. compare_roots decides what an
         # unknown means for a COMPARISON; this only refuses to be quiet.
         print(f"[manifest]   {block['npu_power_mode_detail']}")
+
+    tools = manifest[schema.TOOLCHAIN_KEY]
+    print(
+        "[manifest] toolchain: "
+        + " ".join(
+            f"{name}={tools[name]}" for name in schema.TOOLCHAIN_IDENTITY_FIELDNAMES
+        )
+        + f" ({tools['toolchain_source']})"
+    )
+    if any(
+        tools[name] == schema.UNKNOWN_CONDITION
+        for name in schema.TOOLCHAIN_IDENTITY_FIELDNAMES
+    ):
+        print(f"[manifest]   {tools['toolchain_detail']}")
     for reason in manifest["incomplete_reasons"]:
         print(f"[manifest]   {reason}")
     return 0 if manifest["complete"] else 1

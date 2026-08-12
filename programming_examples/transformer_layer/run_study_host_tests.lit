@@ -35,5 +35,31 @@
 // xrt-smi on PATH -- this suite stays hermetic), +12 compare_roots (both
 // branches of the guard, each asserted as a difference against the same drift).
 //
+// `[2026-08-12]` 299 -> 338, queue item 16: the TOOLCHAIN block. `compare_roots`
+// has diffed a `toolchain` manifest block since it was written and `manifest.py`
+// never wrote one, so that half of every root comparison compared NOTHING. +14
+// schema (the block, its reader-only `absent`, and a pin that the KEY is the one
+// compare_manifests diffs -- rename it and the diff goes quietly empty again),
+// +9 manifest (the probe, against a scratch version.json -- this suite stays
+// hermetic and never asserts THIS host's toolchain), +14 compare_roots (the
+// guard FLAGS where the pmode guard REFUSES, so the load-bearing one asserts an
+// identical drift produces an IDENTICAL FAIL set at matched and mismatched
+// toolchains: this guard may add a warning and may withdraw nothing).
+// SCHEMA_VERSION stays 2 and all 16 recorded v2 CSVs still read. +2 run_profile
+// for the block reaching a REAL artifact: a walk records the toolchain it
+// measured against, and `--gate-only` deliberately does NOT stamp today's
+// versions onto a tree measured earlier.
+//
+// `[2026-08-12]` 338 -> 346, queue item 19: the device preflight. A
+// `--compile-mode` parsed and never branched on dispatched off-queue while devq
+// job 252 held the device lock, and the lock is advisory -- nothing outside the
+// broker consults it. +8 run_profile: the three-valued `device_preflight`
+// (free / held / indeterminate, refuse-known and flag-unknown, driven against a
+// STUB broker so this suite still touches no device), a pin that no flag can
+// skip it, and two audits that ARE the item -- that main() branches on the
+// result before taking the output lock, and that no flag this module parses is
+// left unread. The broker half is gated separately by
+// agents/scripts/devq-selftest.sh TEST 7.
+//
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 299/299 passed in 19 modules
+// CHECK: study host tests: 346/346 passed in 19 modules
