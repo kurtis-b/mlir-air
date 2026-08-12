@@ -143,6 +143,14 @@ measurement, dominates a cold run. Preserve `build/` between runs.
 > `full` is the nine-point ladder over **one** family, not a six-family matrix walk, and does not
 > claim to be — the other five are recorded in the manifest's run report with the reason each is
 > out of reach.
+>
+> **`full` is not expected to be green today, deliberately.** It attempts 64, 128, 8192 and
+> 16384, which no mode has ever been measured at. Truncating it to the four points that are known
+> to work would make it a synonym for `ladder` and would quietly convert "we have not measured
+> this" into "this is not in the matrix" — the opposite of what `cases.py` says, which is that
+> "which of them a mode can build is a separate question that only a run answers". So a rung that
+> CANNOT apply is `skipped`; a rung nobody has tried is RUN, and its refusal message is the
+> result. **`smoke` and `ladder` are the profiles to gate on.**
 
 ## Host prerequisites
 

@@ -67,6 +67,13 @@ FOOTGUNS
     - **A profile is a plan, not a promise.** ``expected_rows`` says how many
       rows each CSV must hold and how many of them must have passed. It says
       nothing about latency, and a profile completing is not a result.
+    - **`full` is not expected to be green today, and that is deliberate.** It
+      attempts 64, 128, 8192 and 16384, which no mode has ever been measured at.
+      Truncating it to the four points that are known to work would make it a
+      synonym for `ladder` and would quietly convert "we have not measured this"
+      into "this is not in the matrix". The rungs that CANNOT apply are
+      `skipped`; the rungs nobody has tried are RUN, and their refusal messages
+      are the result. `smoke` and `ladder` are the profiles to gate on.
     - **Two walks is the standing rule** (README trap 1: a single walk published
       a crossover a second walk refuted). ``run_profile`` walks once; run it
       twice into two roots and compare with ``compare_roots.py``. A profile that
@@ -275,7 +282,9 @@ PROFILES: dict[str, Profile] = {
         description=(
             "the whole declared nine-point ladder over the ONE reachable "
             "family. Not a six-family matrix walk and does not claim to be; "
-            "the other five families are recorded as unreachable with reasons."
+            "the other five families are recorded as unreachable with reasons. "
+            "EXPECT IT TO FAIL TODAY -- 64, 128, 8192 and 16384 have never been "
+            "measured for any mode, and this profile deliberately attempts them."
         ),
         modes=PROFILE_MODES,
         seqs=cases.SEQUENCE_LADDER,
