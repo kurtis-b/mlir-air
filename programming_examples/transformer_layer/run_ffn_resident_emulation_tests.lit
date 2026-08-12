@@ -1,26 +1,76 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 //
-// Doc 31 R1, the host-only half: ffn_resident's addressing arithmetic,
-// emulated to exactness.
+// Doc 31 R1, the host-only half: ffn_resident's dataflow, INTERPRETED OUT
+// OF THE BUILT MODULE.
 //
 // The resident FFN interior moves every byte through hand-derived patterns
 // (the w_up packing, the shim's row-major->blocked retile, the strided
-// chunk extraction, the w_down slices, a global K order assembled from
-// three herds' loops). builders/test_ffn_resident.py emulates the device's
-// exact address arithmetic in numpy, f64 throughout, and requires the
-// composition to equal gelu(hidden @ w_up) @ w_down EXACTLY -- so only
-// ordering and addressing are tested, and a slip in either cannot hide
-// behind a tolerance.
+// chunk extraction, the w_down refill, a global K order assembled from
+// three herds' loops and three segment-scope feed nests).
+// builders/test_ffn_resident.py BUILDS build_ffn_resident_module and
+// executes the resulting air.ir.Module in numpy -- every air.dma_memcpy_nd
+// and air.channel.put/get with the offsets, sizes and strides the op
+// actually carries, every scf.for at its actual bounds, every func.call
+// dispatched by the symbol the builder named, the three herds as four
+// concurrent actors each -- f64 throughout, and requires the composition to
+// equal gelu(hidden @ w_up) @ w_down to f64 round-off.
+//
+// `[2026-08-12]` REBUILT, queue item 17. Until today this arm imported
+// ffn_resident_pack_w_up and NEVER BUILT THE MODULE: it re-derived every
+// DMA pattern and every loop order by hand, so the builder and the check
+// were two independent transcriptions of one design and the check could
+// only ever disagree with itself. Re-imposing the exact c-major w_down
+// order route E1 deleted still printed 5/5. Measured after the rebuild, on
+// the real pre-E1 builder source (918c202f, unmodified, loaded and built):
+// the shipped builder emits THREE textual segment-scope refills and comes
+// out element-exact at 5.457e-12; the pre-E1 builder emits SIX -- four of
+// them landing in the same L2 buffer -- and comes out at 4.72e+03. The
+// in-arm negative control reproduces that figure to the digit.
 //
 // This arm is deliberately the one that stays LIVE while the operator's
-// device gate (run_npu2_ffn_resident_peano.lit) is parked on the
-// air-fuse-channels crash: no aircc, no XRT, no kernel objects, no NPU.
+// device gate (run_npu2_ffn_resident_peano.lit) is parked on wall 6: no
+// aircc, no XRT, no kernel objects, no NPU. It reads the AIR module, so it
+// models addressing and delivery ORDER and nothing else -- not timing, not
+// BD folding, not channel fusion, and neither wall 5's D1 nor wall 6's
+// lock-conservation imbalance (queue item 18). Cite it for the dataflow;
+// the device gate settles the rest.
 //
-// No framework dependency (pytest is not in the sandbox venv): the file
-// runs as a plain script and prints a named pass count, matched exactly so
-// a check that stops being collected fails here rather than passing
-// quietly.
+// THIS RECIPE AND THE SCRIPT ARE ONE ARM, and that is stated rather than
+// worked around. There is no `make` target for it and none should be added:
+// a second name for one command is exactly what let a gate list "run the
+// script" and "run the lit" as two steps and call the arm doubly covered
+// (queue item 17). What the recipe adds over `python3 builders/
+// test_ffn_resident.py` is the assertions below -- that the two negative
+// controls FIRED and were rejected, that the census is live, and that the
+// count is what it claims. Run the recipe, not the script (doc 23 section
+// 5). No framework dependency: pytest is not in the sandbox venv, so the
+// file runs as a plain script and prints a named pass count.
 //
 // RUN: python3 %S/builders/test_ffn_resident.py | FileCheck %s
-// CHECK: ffn_resident emulation tests: 5/5 passed
+//
+// Element-exactness, checked as an ORDER of magnitude rather than a digit:
+// the mantissa moves with the BLAS, the exponent does not. e-1x is at or
+// under 1e-10 against operands of order 1e+2, which is f64 round-off.
+// CHECK: module-interpreted dataflow: max |y - reference| = {{[0-9.]+}}e-1{{[0-9]}} over 64x768 f64 elements
+//
+// Liveness, so the exactness line cannot pass vacuously: the interpreter
+// must have dispatched the kernels the design derives (768 = 4*4*24 up +
+// 4*96 down in-place accumulates, 20 zeros = 16 up groups + 4 guarded
+// first-K-step calls, 96 GeLU chunks), moved every channel op, and drained
+// every staged stream the shim delivered.
+// CHECK: dispatch census: ffn_gelu_bf16 96, ffn_matmul_bf16_bf16_up_proj 768, ffn_zero_bf16_up_proj 20
+// CHECK: channel census: ffn_res_down_feed 768p/768g, ffn_res_g 96p/96g, ffn_res_h 96p/96g, ffn_res_up_feed 768p/768g; undrained staged streams: 0
+//
+// THE NEGATIVE CONTROLS ARE MATCHED HERE, both of them, because an arm that
+// cannot fail is not a gate -- the lesson of queue items 10, 14 and 17 in
+// one week. Each must report an error of order 1 or larger against a bar of
+// 1e-9. A control that stopped being re-imposed would print no line and
+// this recipe would go red; a control that stopped discriminating would
+// print an e-1x figure and the e+0x match would fail.
+// CHECK: negative control: c-major w_down refill (pre-E1 c unroll) -> max err {{[0-9.]+}}e+0{{[0-9]}}
+// CHECK: negative control: hidden 4-D retile walked with its two inner strides swapped -> max err {{[0-9.]+}}e+0{{[0-9]}}
+//
+// The count last, matched exactly so a clause that stops being defined
+// fails here rather than passing quietly.
+// CHECK: ffn_resident emulation tests: 8/8 passed
