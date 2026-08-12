@@ -289,6 +289,114 @@ def test_unknown_table_raises():
     _raises(ValueError, "unknown table", schema.fields_for, "results_v2")
 
 
+# ---------------------------------------------------------------------------
+# The measurement-condition block `[2026-08-12]` (doc 34 M4).
+#
+# The load-bearing one is test_the_conditions_block_is_not_a_csv_table: the
+# whole reason this is a manifest block and not a `results` column is that a
+# column would bump SCHEMA_VERSION, and a bump makes every recorded CSV
+# unreadable -- v1 -> v2 did exactly that to 56 of them. If someone later
+# registers it as a table, results_io will happily build a header out of it and
+# the next person to add a condition will bump the version to ship it.
+# ---------------------------------------------------------------------------
+
+
+def test_the_conditions_block_is_not_a_csv_table():
+    _raises(ValueError, "unknown table", schema.fields_for, "conditions")
+    for name in schema.CONDITION_FIELDNAMES:
+        assert name not in schema.RESULTS_FIELDNAMES, name
+        assert name not in schema.TUNING_FIELDNAMES, name
+
+
+def test_recording_the_condition_did_not_bump_the_schema_version():
+    """The point of the design: every recorded v2 CSV still reads."""
+    assert schema.SCHEMA_VERSION == 2
+    prefix = schema.RESULTS_FIELDNAMES[: len(_V1_RESULTS_FIELDNAMES)]
+    assert prefix == _V1_RESULTS_FIELDNAMES
+
+
+def test_every_condition_field_has_a_meaning():
+    for field in schema.CONDITION_FIELDS:
+        assert field.meaning.strip(), field.name
+    names = [f.name for f in schema.CONDITION_FIELDS]
+    assert len(names) == len(set(names))
+
+
+def test_empty_conditions_claims_nothing():
+    block = schema.empty_conditions()
+    assert set(block) == set(schema.CONDITION_FIELDNAMES)
+    assert block["npu_power_mode"] == schema.UNKNOWN_CONDITION
+    assert block["npu_power_mode_source"] == schema.UNKNOWN_CONDITION
+    schema.validate_conditions(block)
+
+
+def test_normalise_power_mode_collapses_every_way_of_saying_nothing():
+    for nothing in (None, "", "   ", "unknown", "UNKNOWN"):
+        assert schema.normalise_power_mode(nothing) == schema.UNKNOWN_CONDITION
+    assert schema.normalise_power_mode("Turbo") == "turbo"
+    assert schema.normalise_power_mode(" Default ") == "default"
+
+
+def test_a_manifest_predating_the_block_reads_as_absent_not_as_a_match():
+    """Every recorded root is in this state and none of them can be stamped."""
+    v1_manifest = {"schema_version": 1, "complete": True, "git": {}}
+    for older in (v1_manifest, {}, None, "not a manifest", []):
+        block = schema.conditions_from_manifest(older)
+        assert set(block) == set(schema.CONDITION_FIELDNAMES)
+        assert block["npu_power_mode"] == schema.UNKNOWN_CONDITION
+        assert block["npu_power_mode_source"] == "absent"
+        assert "not recoverable" in block["npu_power_mode_detail"]
+
+
+def test_a_recorded_block_is_read_back_normalised():
+    block = schema.conditions_from_manifest(
+        {"conditions": {"npu_power_mode": "Turbo", "npu_power_mode_source": "observed"}}
+    )
+    assert block["npu_power_mode"] == "turbo"
+    assert block["npu_power_mode_source"] == "observed"
+    # A partial block still comes back complete, so no reader indexes a missing key.
+    assert set(block) == set(schema.CONDITION_FIELDNAMES)
+
+
+def test_a_recorded_but_undeterminable_mode_is_unknown_not_absent():
+    """`older than the field` and `tried and failed` are different facts."""
+    block = schema.conditions_from_manifest(
+        {"conditions": schema.empty_conditions()}
+    )
+    assert block["npu_power_mode"] == schema.UNKNOWN_CONDITION
+    assert block["npu_power_mode_source"] == schema.UNKNOWN_CONDITION
+
+
+def test_validate_conditions_rejects_a_missing_or_invented_key():
+    block = schema.empty_conditions()
+    del block["observed_at_utc"]
+    _raises(ValueError, "missing keys", schema.validate_conditions, block)
+    block = schema.empty_conditions()
+    block["npu_pmode"] = "turbo"
+    _raises(ValueError, "not in the schema", schema.validate_conditions, block)
+
+
+def test_validate_conditions_rejects_an_unknown_source():
+    block = schema.empty_conditions()
+    block["npu_power_mode_source"] = "probably"
+    _raises(ValueError, "npu_power_mode_source", schema.validate_conditions, block)
+
+
+def test_absent_is_reader_only_and_cannot_be_written():
+    """Writing it would claim a run predates a field it is carrying."""
+    block = schema.empty_conditions()
+    block["npu_power_mode_source"] = "absent"
+    _raises(ValueError, "READER-ONLY", schema.validate_conditions, block)
+
+
+def test_the_mode_domain_is_open_on_purpose():
+    """xrt-smi names the modes; a schema that rejected a new one would hide it."""
+    block = schema.empty_conditions()
+    block["npu_power_mode"] = "some_future_mode"
+    block["npu_power_mode_source"] = "observed"
+    schema.validate_conditions(block)  # must not raise
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

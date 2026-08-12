@@ -12,6 +12,7 @@ computes the right percentage and then fails the wrong way is still wrong.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -258,6 +259,230 @@ def test_every_csv_execution_mode_has_a_tolerance_band():
     """A mode with no band silently gets the default; that must be a choice."""
     for mode in schema.EXECUTION_MODES:
         assert mode in compare_roots.LATENCY_TOLERANCE, mode
+
+
+# ---------------------------------------------------------------------------
+# The measurement-condition guard `[2026-08-12]`, queue item 15.
+#
+# Every clause below is asserted as a DIFFERENCE -- the same two roots, the same
+# drift, with only the recorded power mode changed -- because a guard that
+# refuses everything and a guard that refuses nothing both pass a one-sided
+# test. The drift used is 1900%, the size a Turbo-vs-Default pair actually
+# produces on this host, so the "before" behaviour under test is the real one:
+# a red latency verdict printed for a power-mode change.
+# ---------------------------------------------------------------------------
+
+_SPLICE_DRIFT = 2000.0  # 100 ms at Turbo against ~2 s at Default, README trap 0
+
+
+def _manifest(mode=None, source="observed", *, block=True):
+    """A manifest payload; ``block=False`` for one predating the conditions block."""
+    payload = {"complete": True, "git": {}, "toolchain": {}}
+    if block:
+        conditions = schema.empty_conditions()
+        if mode is not None:
+            conditions["npu_power_mode"] = mode
+            conditions["npu_power_mode_source"] = source
+        payload[schema.CONDITIONS_KEY] = conditions
+    return payload
+
+
+def _spliced_roots(baseline_mode, candidate_mode, **kw):
+    """Two roots whose latencies differ by a pmode-sized amount."""
+    return _roots(
+        [_row(latency=100.0)],
+        [_row(latency=100.0 * (1 + _SPLICE_DRIFT / 100.0))],
+        manifests=(_manifest(baseline_mode, **kw), _manifest(candidate_mode, **kw)),
+    )
+
+
+def test_a_pmode_mismatch_is_refused_rather_than_read_as_a_regression():
+    """THE defect: a power-mode change alone printed VERDICT: PROBLEM."""
+    tmp, a, b = _spliced_roots("turbo", "default")
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    text = report.render()
+    assert report.refusals, text
+    assert "COMPARISON REFUSED" in text
+    assert "different NPU power modes" in text
+    assert "baseline=turbo, candidate=default" in text
+    assert "VERDICT: PROBLEM" in text
+
+
+def test_the_same_drift_at_the_same_pmode_is_a_latency_failure():
+    """The other side of the difference: the drift itself is unchanged."""
+    tmp, a, b = _spliced_roots("turbo", "turbo")
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    text = report.render()
+    assert not report.refusals, text
+    assert "avg_latency_ms" in text
+    assert "exceeds the fail threshold" in text
+    assert "[GATE]" in text
+    assert "VERDICT: PROBLEM" in text
+
+
+def test_a_refused_comparison_withdraws_the_latency_VERDICT_not_the_numbers():
+    """Reported as SPLICED: no FAIL on the latency, and no silence either."""
+    tmp, a, b = _spliced_roots("turbo", "default")
+    with tmp:
+        refused = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    tmp, a, b = _spliced_roots("turbo", "turbo")
+    with tmp:
+        gated = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    assert "[SPLICED]" in refused.render()
+    assert "[GATE]" not in refused.render()
+    assert "exceeds the fail threshold" not in refused.render()
+    assert "exceeds the fail threshold" in gated.render()
+    # The drift is still measured and printed on both sides.
+    for report in (refused, gated):
+        assert "avg_latency_ms" in report.render()
+    # And the refusal is the ONLY failure: the numbers did not vote.
+    assert refused.failures == 1, refused.render()
+
+
+def test_matching_pmodes_say_so_and_gate_normally():
+    tmp, a, b = _roots(
+        [_row(latency=100.0)],
+        [_row(latency=101.0)],
+        manifests=(_manifest("turbo"), _manifest("turbo")),
+    )
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    text = report.render()
+    assert report.failures == 0, text
+    assert "both roots were measured at `turbo`" in text
+    assert "VERDICT: OK" in text
+
+
+def test_an_unrecorded_pmode_flags_and_KEEPS_gating():
+    """A recorded root cannot be stamped after the fact, so refusing is a dead end."""
+    tmp, a, b = _roots(
+        [_row(latency=100.0)],
+        [_row(latency=101.0)],
+        manifests=(_manifest(block=False), _manifest("turbo")),
+    )
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    text = report.render()
+    assert report.failures == 0, text
+    assert report.warnings >= 1
+    assert "does not record the NPU power mode" in text
+    assert "[GATE]" in text  # still gating: an unknown must not disarm the tool
+    assert "VERDICT: OK" in text
+
+
+def test_an_unknown_pmode_still_fails_on_a_real_regression():
+    """The reason unknown flags rather than refusing: the tool stays useful."""
+    tmp, a, b = _roots(
+        [_row(latency=100.0)],
+        [_row(latency=130.0)],
+        manifests=(_manifest(block=False), _manifest(block=False)),
+    )
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    assert report.failures >= 1, report.render()
+    assert "exceeds the fail threshold" in report.render()
+
+
+def test_a_root_with_no_manifest_at_all_flags_rather_than_skipping_silently():
+    """The recorded ladder walks are exactly this shape -- no manifest either side."""
+    tmp, a, b = _roots([_row(latency=100.0)], [_row(latency=101.0)])
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    text = report.render()
+    assert report.failures == 0, text
+    assert report.warnings >= 2  # one per side
+    assert "no manifest.json in the root" in text
+    assert "=== measurement condition ===" in text
+
+
+def test_the_condition_section_runs_even_when_the_provenance_diff_skips():
+    """A guard behind the manifest early-out would never run on real evidence."""
+    tmp, a, b = _roots([_row()], [_row()])
+    with tmp:
+        text = compare_roots.compare_roots(a, b, ["coarse.csv"]).render()
+    assert "SKIP (missing on one side)" in text  # the provenance diff skipped
+    assert "npu_power_mode: baseline=unknown" in text  # the guard did not
+
+
+def test_a_refused_comparison_still_reports_the_pmode_independent_half():
+    """Bytes, counts and identifiers are pmode-independent (trap 0) and still hold."""
+    tmp, a, b = _roots(
+        [_row()],
+        [_row(host_submissions_per_layer=6)],
+        manifests=(_manifest("turbo"), _manifest("default")),
+    )
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    text = report.render()
+    assert "host_submissions_per_layer" in text  # the structural change is still caught
+    assert "COMPARISON REFUSED" in text
+    assert report.failures >= 2  # the refusal AND the structural mismatch
+
+
+def test_an_unreadable_manifest_is_a_failure_and_an_unknown_condition():
+    tmp, a, b = _roots([_row()], [_row()], manifests=(_manifest("turbo"), _manifest("turbo")))
+    with tmp:
+        (b / "manifest.json").write_text("{not json", encoding="utf-8")
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    text = report.render()
+    assert "could not be read" in text
+    assert "does not record the NPU power mode" in text  # and it flags, not matches
+    assert report.failures >= 1
+
+
+def test_there_is_no_way_to_defeat_the_pmode_guard():
+    """pmode_guard's rule: nothing added for a guard may become its bypass.
+
+    Asserted through the CLI rather than by grepping, so the docstring may go
+    on saying which flag deliberately does not exist.
+    """
+    tmp, a, b = _spliced_roots("turbo", "default")
+    with tmp:
+        for bypass in ("--allow-pmode-splice", "--ignore-pmode", "--force"):
+            try:
+                # argparse writes its usage to stderr on a rejection; swallow it
+                # so a passing suite stays quiet.
+                with open(os.devnull, "w") as null, contextlib.redirect_stderr(null):
+                    compare_roots.main(
+                        ["--baseline", str(a), "--candidate", str(b), bypass]
+                    )
+            except SystemExit as e:
+                assert e.code == 2, f"{bypass} was accepted"
+                continue
+            raise AssertionError(f"{bypass} did not raise; the guard has a bypass")
+        # And no environment variable is consulted anywhere in the module.
+        assert "environ" not in Path(compare_roots.__file__).read_text(
+            encoding="utf-8"
+        )
+        # The refusal stands on the honest invocation.
+        assert (
+            compare_roots.main(
+                ["--baseline", str(a), "--candidate", str(b), "--csv", "coarse.csv"]
+            )
+            == 1
+        )
+
+
+def test_the_guard_reads_the_RECORDED_condition_and_never_the_live_one():
+    """The whole reason item 13's fix does not transfer.
+
+    `require_turbo()` reads the mode NOW and says nothing about a run recorded
+    last week. A live query creeping in here would make the guard pass or fail
+    on the state of the machine running the comparison, which is not a fact
+    about either root -- so the guard reads the manifest through the schema and
+    subprocesses nothing.
+    """
+    source = Path(compare_roots.__file__).read_text(encoding="utf-8")
+    assert "schema.conditions_from_manifest" in source
+    # Asserted on the module's bindings rather than on its text, so the
+    # docstring may keep explaining require_turbo without tripping this.
+    for live in ("subprocess", "shutil", "npu_power_mode", "require_turbo"):
+        assert not hasattr(compare_roots, live), (
+            f"compare_roots binds {live}: that is a LIVE query, and this module "
+            "compares two runs recorded earlier"
+        )
 
 
 def main():

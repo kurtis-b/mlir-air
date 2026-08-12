@@ -28,5 +28,12 @@
 // Update the numbers below when you add tests. That edit is the point, not
 // friction to route around with a looser pattern.
 //
+// `[2026-08-12]` 231 -> 265, queue item 15: the measurement-condition block
+// (doc 34 M4) in schema.py + manifest.py, and compare_roots' pmode guard. +12
+// schema (the block is NOT a CSV table and did NOT bump SCHEMA_VERSION, so
+// every recorded v2 CSV still reads), +10 manifest (the probe, against a stub
+// xrt-smi on PATH -- this suite stays hermetic), +12 compare_roots (both
+// branches of the guard, each asserted as a difference against the same drift).
+//
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 231/231 passed in 17 modules
+// CHECK: study host tests: 265/265 passed in 17 modules
