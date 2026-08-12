@@ -27,6 +27,7 @@ has shown discriminates.
 import ast
 import os
 import sys
+import tempfile
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _EXAMPLE = os.path.dirname(_HERE)
@@ -35,7 +36,46 @@ if _HERE not in sys.path:
 
 import cases  # noqa: E402
 import profiles  # noqa: E402
+import run_ladder  # noqa: E402
 import schema  # noqa: E402
+
+
+def _files_walk_writes(prof):
+    """The CSVs a real ``run_ladder.walk`` of ``prof`` puts on disk.
+
+    ``_rung`` -- the only function that dispatches -- is stubbed, so this walks
+    the real writer with no device and no compile. One sequence length is
+    enough: ``walk`` opens one file per mode regardless of ladder depth, and a
+    full walk would only make the check slower.
+    """
+    original = run_ladder._rung
+
+    def _stub(mode, seq, study_id, warmup, samples, rps, scratch):
+        row = schema.empty_row("results")
+        row["execution_mode"] = schema.EXECUTION_MODE_CSV[mode]
+        row["study_id"] = study_id
+        row["seq_len"] = seq
+        row["study_case_label"] = f"{mode} {seq}"
+        row["run_status"] = "passed"
+        row["failure_message"] = ""
+        return row
+
+    run_ladder._rung = _stub
+    try:
+        with tempfile.TemporaryDirectory() as out_dir:
+            run_ladder.walk(
+                modes=list(prof.modes),
+                seqs=list(prof.seqs)[:1],
+                out_dir=out_dir,
+                study_id="test-expected-files",
+                warmup=0,
+                samples=1,
+                runs_per_sample=1,
+                skip_reason=profiles.skip_reason,
+            )
+            return sorted(os.listdir(out_dir))
+    finally:
+        run_ladder._rung = original
 
 #: The whole-layer modes a profile can name. Operator rows for single kernels
 #: (``ffn``, ``softmax``, ...) are not profile rungs and are not checked here.
@@ -141,13 +181,33 @@ def test_expected_rows_are_derived_and_balance():
 
 
 def test_expected_files_are_one_per_mode_and_match_run_ladder():
+    """The expectation must match ``run_ladder.walk``'s OUTPUT, so take the
+    output rather than a typed list of it.
+
+    A transcribed ``["coarse.csv", ...]`` states the claim and does not check
+    it: it agrees with ``walk`` until ``walk``'s naming or mode order moves,
+    and then it agrees with the day it was written -- while the manifest that
+    consumes ``expected_files()`` starts looking for files no run produces and
+    reports the tree incomplete for a reason nothing here would catch.
+    """
     prof = profiles.profile("ladder")
-    assert prof.expected_files() == [
-        "coarse.csv",
-        "offload.csv",
-        "runlist.csv",
-        "fused.csv",
-    ], "run_ladder.walk writes <mode>.csv; the expectation must match its output"
+    written = _files_walk_writes(prof)
+    assert sorted(prof.expected_files()) == written, (
+        f"the profile expects {sorted(prof.expected_files())} and "
+        f"run_ladder.walk wrote {written}"
+    )
+    # One CSV per mode, in the profile's own mode order -- the manifest reads
+    # this list positionally nowhere, but the gate's contract says mode order.
+    assert prof.expected_files() == [f"{mode}.csv" for mode in prof.modes]
+    assert len(written) == len(set(written)) == len(prof.modes)
+
+
+def test_every_profile_expects_exactly_what_a_walk_of_it_writes():
+    """Not just ``ladder``: the smoke and full profiles too, since the manifest
+    gates each of them on ``expected_files()``."""
+    for name in sorted(profiles.PROFILES):
+        prof = profiles.profile(name)
+        assert sorted(prof.expected_files()) == _files_walk_writes(prof), name
 
 
 def test_the_ladder_profile_skips_exactly_the_two_out_of_range_fused_rungs():

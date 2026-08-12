@@ -29,6 +29,30 @@ Example invocations:
         --prompts topk_token --max-prompts 2
     python verify_runner.py --runner=llama32_1b_int4.verify_adapter \\
         --prompts topk_token --max-prompts 2
+
+WHY THERE IS NO --seed
+    `[2026-08-12]` This driver parsed `--seed` (default 42) and never read it,
+    so a run invoked with `--seed N` was not seeded by it and any
+    reproducibility claim resting on that flag was empty. It is removed rather
+    than wired, because nothing this gate reaches consumes randomness:
+
+      - both decode paths are GREEDY (`top1_token` is an argmax), so no
+        sampling RNG exists to seed;
+      - weights are loaded from a checkpoint, and the HF reference is
+        `from_pretrained` over the same one;
+      - tokenization and the top-k set comparison are deterministic.
+
+    Measured rather than assumed: an AST walk of this module's repo-local
+    import closure -- verify_runner plus all ten `verify_adapter.py` -- finds
+    every RNG site inside an `if __name__ == "__main__"` self-test block of a
+    builder, or inside `synthetic_weights()`, which has ZERO call sites
+    anywhere in the tree. So the gate is deterministic by construction, and a
+    seed would have nothing to make reproducible.
+
+    If a future arm does introduce randomness (a sampled decode, a randomized
+    prompt subset, a synthetic-weight smoke path), add the flag back TOGETHER
+    with the code that reads it -- `test_verify_runner.py` beside this file
+    fails on any flag left unread.
 """
 
 from __future__ import annotations
@@ -221,7 +245,10 @@ def main():
         action="store_true",
         help="Disable hard exit on FAIL (default: exit 1 on FAIL)",
     )
-    p.add_argument("--seed", type=int, default=42)
+    # NOTE: there is deliberately no --seed. Nothing on this path consumes
+    # randomness -- see this module's docstring section "WHY THERE IS NO
+    # --seed". test_verify_runner.py fails if any flag added here is left
+    # unread, which is how the dead one was found.
     p.add_argument(
         "--prompts",
         choices=["single", "topk_token"],

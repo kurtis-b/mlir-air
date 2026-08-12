@@ -53,16 +53,40 @@ if _EXAMPLE_ROOT not in sys.path:
 
 import builders.block as block  # noqa: E402
 import builders.block_cache as block_cache  # noqa: E402
+import opcheck_specs  # noqa: E402
 from builders.block import (  # noqa: E402
     block_config,
     compile_block_artifacts,
 )
 from builders.block_cache import block_artifact_fingerprint  # noqa: E402
 
-#: The gate's own configuration. Not a cheaper one: the point of these checks is
-#: the decision taken for the shape the gate runs, and resolving it costs
-#: nothing because nothing here compiles.
-SHAPE = dict(seq_len=4096, emb_dim=768, ffn_dim=3072, num_heads=12, head_dim=64)
+#: The operator whose SPECS row is the configuration these checks reason about.
+GATE_OPERATOR = "block"
+
+
+def _gate_shape(operator=GATE_OPERATOR):
+    """The gate's own configuration, READ FROM the row the gate runs.
+
+    Transcribing this dict was the defect: it agreed with ``opcheck_specs``
+    until that row moved, and then it agreed with history instead -- and the
+    checks below would have gone on reporting a caching decision for a shape
+    nobody runs. ``opcheck_specs`` is imported rather than parsed because this
+    module already builds the block's MLIR, so it already needs everything
+    that import pulls in (unlike ``study/test_run_ladder.py``, which does not
+    and derives the same claim by AST for that reason).
+    """
+    for row in opcheck_specs.SPECS:
+        if row.get("operator") == operator:
+            return dict(row["shape"])
+    raise AssertionError(
+        f"no {operator!r} row in opcheck_specs.SPECS -- the gate this module "
+        f"checks the caching decision for no longer exists, so these checks "
+        f"describe nothing. Known operators: "
+        f"{sorted({r.get('operator') for r in opcheck_specs.SPECS})}"
+    )
+
+
+SHAPE = _gate_shape()
 
 
 class FakeCache:
@@ -161,6 +185,30 @@ def _recorded(cache):
 def _fresh(tmp):
     """A cold cache and the resolved configuration for ``SHAPE``."""
     return FakeCache(tmp), block_config(**SHAPE)
+
+
+def test_the_shape_under_test_is_the_gate_s_own_specs_row():
+    """``SHAPE`` must BE the gate's row, not a copy that agreed with it once.
+
+    Every check in this module reasons about the caching decision taken for the
+    configuration the gate runs. A hand-written copy of that configuration
+    holds until ``opcheck_specs`` moves and then describes a shape nobody
+    runs -- while every check here goes on passing, because they are all
+    self-consistent about the wrong number. This is the assertion that turns
+    that drift red.
+    """
+    rows = [r for r in opcheck_specs.SPECS if r.get("operator") == GATE_OPERATOR]
+    assert len(rows) == 1, (
+        f"expected exactly one {GATE_OPERATOR!r} SPECS row, found {len(rows)}"
+    )
+    assert SHAPE == rows[0]["shape"], (
+        f"the shape these checks run is {SHAPE}, but the {GATE_OPERATOR!r} gate "
+        f"row is {rows[0]['shape']}. They must be the same object's value -- if "
+        "SHAPE has been re-transcribed, derive it from the row again."
+    )
+    # Not vacuous: the row must actually carry the fields block_config needs.
+    assert set(SHAPE) >= {"seq_len", "emb_dim", "ffn_dim", "num_heads", "head_dim"}
+    assert all(isinstance(v, int) and v > 0 for v in SHAPE.values())
 
 
 def test_a_cold_cache_compiles_every_artifact():
