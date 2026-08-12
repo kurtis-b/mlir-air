@@ -26,10 +26,17 @@ parallelising are mixed**, and we have neither a balance instrument nor a search
 
 > **`[2026-08-12]` CORRECTED by [45](45-research-flat.md), and the correction matters.** This section
 > originally read "…and the state of the art ships no fused mapper at all." That is false. **TileFlow
-> ships a fused mapper** — GA + MCTS over `sequential` / `pipeline` / `parallel` scopes, with FLAT
-> encoded as its test data — and it is **validated against RTL** (5.4% latency, 6.1% energy) on a
-> four-core machine with per-core matrix and vector arrays, **which is an AIE column in all but
-> name**. It was simply not among the five surveyed. The claim that survives is the narrower one: none
+> ships a fused mapper** — a tree of `Tile` / `Scope` / `Op` nodes over **four** scopes
+> (`Sequential` / `Sharing` / `Parallel` / `Pipeline`), with FLAT encoded as its test data.
+> **`[2026-08-12]` two details in this box were wrong and are corrected by [46](46-research-tileflow.md)**:
+> there is **no genetic algorithm** anywhere in the repo (structure is exhaustively enumerated then
+> *uniformly randomly sampled*; MCTS applies only to tile factors), and the machine is **not "an AIE
+> column in all but name"** — no memtile in the validated config, no channel cardinality, no DMA
+> descriptor, and the vector unit is absent from every architecture YAML, though on AIE the vector
+> unit *is* the core. Its RTL validation is the best in this survey and still narrower than it
+> sounds: a two-GEMM chain **with no softmax** (the dataset directory is named `No_Softmax`) on a
+> single array through a **`Sequential`** scope — **`Pipeline` and `Parallel` are validated against
+> nothing**. It was simply not among the five surveyed. The claim that survives is the narrower one: none
 > of *these five* can express fusion, and each says so in its own words. **Read TileFlow before
 > FLAT.**
 
@@ -39,9 +46,13 @@ operator fusion in this paper."* FLAT (ASPLOS 2023), surveying the field includi
 them offer support for cross-layer performance (and reuse) modeling, assuming layer-by-layer
 execution."*
 
-The closest anyone gets is **LoopTree** (Timeloop v4, in-tree): it *models* fused chains with
-`Pipeline`/`Sequential` nodes at under 4% error, including FLAT attention — but ships **no fused
-mapspace, no fused search and no fused constraints**. You hand it the mapping.
+The closest anyone gets is **LoopTree** (Timeloop v4, in-tree): it *models* fused chains at under 4%
+error, including FLAT attention — but ships **no fused mapspace, no fused search and no fused
+constraints**. You hand it the mapping. **`[2026-08-12]` correction** ([46](46-research-tileflow.md)):
+LoopTree is **polyhedral (ISL)**, not a node tree, and its sequential-vs-pipeline distinction is a
+single **global** flag — so it and TileFlow are different ideas rather than the same one twice. They
+are complementary: take TileFlow's tree for *composition*, LoopTree's per-intermediate retention for
+*residency*.
 
 **So the thing we are trying to do is not a solved problem we failed to look up.** That is worth
 knowing before treating our four walls as evidence of incompetence: the walls are real and the
@@ -117,6 +128,15 @@ defect did.
    > against a stale model of the other. That axis is a small enum, so **let it multiply** and decouple
    > everything else. A reduction move applied at the wrong joint is worse than none, because it
    > converges confidently.
+   >
+   > **`[2026-08-12]` SUPERSEDED by [46](46-research-tileflow.md) — replace the exemption, do not keep
+   > it.** TileFlow §7.3 shows FLAT's `{M, B, H, R}` granularity enum is an **artifact of FLAT
+   > refusing to tile the column dimension**, and dissolving it wins **82× L1**. The joint is not
+   > inseparable; the enum was. What replaces the exemption is a sharper warning from its Table 7:
+   > under **fixed** tiling, granularity looked **18× important**, and under **searched** tiling
+   > **three of four granularities tie exactly**. **Every four-mode comparison in this study is at a
+   > fixed tiling**, so before any packaged-vs-resident-vs-interleaved claim is published it must
+   > survive a tile-size search **on both sides**.
 2. **Infer tiles instead of enumerating them.** LoopTree specifies only the *final* stage's tiling and
    derives every upstream stage's by walking dependences; then **one small enumerable choice per
    intermediate** — the last partitioned rank its retained tile spans — decides resident vs refetched
