@@ -22,8 +22,16 @@ parallelising are mixed**, and we have neither a balance instrument nor a search
 
 ## The finding that matters most
 
-**None of the five can express our central axis, and the state of the art ships no fused mapper at
-all.**
+**None of the five can express our central axis.**
+
+> **`[2026-08-12]` CORRECTED by [45](45-research-flat.md), and the correction matters.** This section
+> originally read "…and the state of the art ships no fused mapper at all." That is false. **TileFlow
+> ships a fused mapper** — GA + MCTS over `sequential` / `pipeline` / `parallel` scopes, with FLAT
+> encoded as its test data — and it is **validated against RTL** (5.4% latency, 6.1% energy) on a
+> four-core machine with per-core matrix and vector arrays, **which is an AIE column in all but
+> name**. It was simply not among the five surveyed. The claim that survives is the narrower one: none
+> of *these five* can express fusion, and each says so in its own words. **Read TileFlow before
+> FLAT.**
 
 Every one of them is single-operator. Not by oversight — each says so in its own words. Timeloop:
 *"We leave exploration of cross-layer reuse to future work."* LLMCompass: *"We do not explore
@@ -102,6 +110,13 @@ defect did.
    5.9×10⁷, a factor of 10¹⁰**. Our cut has the same shape, and it gives the per-column budget a
    natural home as an outer-subproblem constraint decided once. This is the single largest reduction
    available and it is arithmetic, not heuristics.
+
+   > **`[2026-08-12]` EXEMPT ONE JOINT — and it is ours** ([45](45-research-flat.md)). FLAT §5.3 argues
+   > that **fusion granularity and intra-stage tiling are not separable**: the granularity choice
+   > changes what the inner tiling is optimising against. Decoupling *there* would optimise each half
+   > against a stale model of the other. That axis is a small enum, so **let it multiply** and decouple
+   > everything else. A reduction move applied at the wrong joint is worse than none, because it
+   > converges confidently.
 2. **Infer tiles instead of enumerating them.** LoopTree specifies only the *final* stage's tiling and
    derives every upstream stage's by walking dependences; then **one small enumerable choice per
    intermediate** — the last partitioned rank its retained tile spans — decides resident vs refetched
@@ -140,7 +155,14 @@ defect did.
 
 ## Read next
 
-- **FLAT** (ASPLOS 2023) — **the paper to read instead of MAESTRO for our problem.** It searches
+- **TileFlow** — **read this first.** It is the fused mapper the section above wrongly said did not
+  exist: GA + MCTS over `sequential`/`pipeline`/`parallel` scopes, RTL-validated at 5.4% latency on a
+  machine that is an AIE column in all but name.
+- **FuseMax** (MICRO'24) — worked from FLAT's private code and found confirmed bugs, conceptual errors
+  in part of its search space, and an unmodelled softmax worth **6.7× iso-area**. Read it beside FLAT,
+  not after.
+- **FLAT** (ASPLOS 2023) — still worth reading for the *reasoning*, with [45](45-research-flat.md)'s
+  caveats attached. It searches
   tiles × order × **fusion granularity** across a *fused attention chain*. It is the closest published
   work to what we are trying to do.
 - **LoopTree** — the fused *model*, in-tree in Timeloop v4, for the tile-inference and retention
@@ -161,3 +183,47 @@ Accelergy's ART is absent from the ICCAD'19 paper entirely; SCALE-Sim's v3 paper
 Table I on multi-core support, with the code agreeing with the prose. Two agents also corrected
 themselves mid-investigation (MAESTRO's bandwidth check exists at warning tier; the wall-6 style
 "initially concluded X, then found Y"). **Cite these documents, not the abstracts.**
+
+---
+
+## `[2026-08-12]` What FLAT changed — the plan as it now stands
+
+[45](45-research-flat.md) settled the two questions that could have reordered everything above, and
+one of its answers is a genuine redirection.
+
+**Fusing by interleaving is not the same thing as fusing by residency, and we had one word for both.**
+FLAT achieves its win by **re-ordering loops on one array**, not by placing stages on distinct cores.
+Its arXiv v1 §5.2(2) — a passage cut from the published version — compares interleaved against
+spatially pipelined and gives four reasons for choosing interleaving, of which one is directly ours:
+**a prefetch spread across two stage durations halves peak off-chip demand**. LoopTree independently
+classifies FLAT's parallelism as `sequential`.
+
+So **add `interleaved` as a third composition state** beside doc 03's *packaged* and *resident*. We
+currently have one word for two very different DMA profiles, and R1 spent four walls pursuing the
+harder of the two without anyone having established that it was the one worth having.
+
+**FLAT's reasoning does not transfer from attention to the FFN interior, and the authors say so in
+four places.** The mechanism needs a *quadratic* intermediate **and** operands with zero algorithmic
+reuse, so that shrinking the tile is free. R1's FFN interior has neither — its 64-row band **divides
+weight reuse**, which is exactly the cost FLAT §5.3 prices. `f(FC, FC)` was considered and rejected.
+
+**But that is not an argument to retarget R1, because the answer depends on the rung.** FLAT's own
+end-to-end numbers give the crossover: the L/A chain is **12% of the layer at N=512, 49% at 4096,
+79% at 16384**. At `baseline_768` the FFN interior is the right target; at the top of our sequence
+ladder attention is. **Make the sequence length an input to which increment gets built**, rather than
+picking one and defending it.
+
+**R1's wall 5 and FLAT §5 are the same object.** Doc 31 needs round-major shim issue order and got
+channel-major. FLAT's shared outer loop **makes channel-major unreachable by construction** — the
+ordering constraint we have been trying to impose downstream is a property of the loop structure
+upstream. **Before implementing queue item 6c as a re-interleaving step, check whether the new
+`air-fuse-pipeline-launches` spec can carry that shape**; if it can, 6c may be a builder change rather
+than a scheduling pass.
+
+**One caveat on FLAT itself, and it is severe.** Its cost model was validated *"within 1% to
+MAESTRO"* — analytical against analytical, single-layer only, so **the fused path is validated against
+nothing**. FuseMax (MICRO'24), working from the authors' private code, reports confirmed bugs,
+"larger conceptual errors" in part of the search space, and that the codebase does not model the
+softmax cost at all — worth **6.7× iso-area**. No public code exists; the docs page has said "Code
+Available — Coming soon" since June 2023. And the published abstract's headline speedups are **stale
+v1 numbers that appear in no table of the paper**. Take FLAT's *reasoning*; do not take its numbers.
