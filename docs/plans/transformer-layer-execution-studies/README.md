@@ -158,9 +158,7 @@ sequence and every structural literal derived from the earlier binary carries ov
 **`[2026-08-12]` The branch is the whole state — there is nothing unmerged anywhere.** The three
 parallel streams of 2026-08-11 (item 6b's compiler fix, R2's scoping, Phase F's items 4 and
 3-portable) are merged into `exper/transformer-layer-execution-studies`, tip `d87c3701`, tree
-clean. Four git worktrees stay registered under `.claude/worktrees/` — three agent worktrees and
-`phase-f` — and all four are **fully merged (0 unmerged commits) and clean**, so they hold nothing
-and are safe to remove; do not read them as pending work. ~~**What is NOT in the branch is the
+clean. **`[2026-08-12]` The worktrees are gone.** Twenty-six agent branches were merged over the day and all 26 verified at **0 unmerged commits** before removal, so the tree is now a single worktree with no `worktree-agent-*` branches left. Nothing is registered that could be mistaken for pending work. ~~**What is NOT in the branch is the
 install**~~ **`[2026-08-12]` The install is REFRESHED and the two trees now agree.**
 `ninja -C build-xrt install` ran (no compile or link steps — `build-xrt` was already current, so it
 was a copy); `install-xrt/bin/air-opt`, `install-xrt/bin/aircc` and
