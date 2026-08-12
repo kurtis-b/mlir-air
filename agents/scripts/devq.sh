@@ -28,6 +28,20 @@
 # still exit 0.  `run` submits, relays the log to stdout as it grows, and exits
 # with the job's own status, so it is a drop-in for `flock -x LOCK CMD`.
 #
+# NEVER `tee /dev/stderr` (OR /dev/stdout) INSIDE A JOB.  `[2026-08-12]`, queue
+# item 20.  A job's log is held open here `O_APPEND` on ONE fd, but /dev/stderr
+# re-opens that same regular file at offset 0 -- so the tee writes over the log
+# from the top.  Measured: job 266 lost 10 of its 13 legs this way and STILL
+# PRINTED PASS, because the verdict is emitted last and therefore survives the
+# overwrite.  That is the worst available failure shape on a project whose first
+# rule is no claim without an artifact: the artifact is destroyed while the
+# verdict is preserved, and a truncated log is indistinguishable from a short
+# clean run unless you count the legs.  Capture to a separate file and `cat` it,
+# or just let the job write to stdout.  When READING any job log as evidence,
+# count the legs against what the script should have emitted; do not trust a
+# trailing verdict on its own.  `devq.sh log` cannot detect this after the fact
+# -- the bytes are gone -- which is why the rule is at the writing end.
+#
 # PREFLIGHT MAKES THE ADVISORY LOCK ASKABLE.  `[2026-08-12]`, queue item 19: a
 # `--compile-mode` flag was parsed and never branched on, so an intended
 # compile-only run dispatched to the NPU off-queue WHILE job 252 held the device
