@@ -6,8 +6,17 @@
 // Peano pipeline. No NPU dispatch.
 //
 // The default AWQ checkpoint (amd/Llama-3.2-1B-Instruct-awq-uint4-asym-g128-
-// bf16-lmhead) is NOT gated, so HF_TOKEN is not required for compile —
-// unlike run_npu2_verify.lit which fetches the gated upstream tokenizer.
+// bf16-lmhead) is NOT gated, so HF_TOKEN is not required for compile.
+//
+// `[2026-08-12]` The sentence that used to follow — "unlike
+// run_npu2_verify.lit which fetches the gated upstream tokenizer" — was
+// stale and is removed. verify_adapter.py resolves BOTH the tokenizer and
+// the HF reference config to this same ungated AWQ repo
+// (`resolve_model` -> MODEL_CHOICES["instruct"], and `hf_reference()`
+// returns its argument unchanged), and the cached repo carries
+// tokenizer.json / tokenizer_config.json itself. So the verify path is
+// ungated too, and run_npu2_verify.lit's REQUIRES correctly omits
+// hf_token — same as run_npu2_verify_prefill_bfp16.lit already did.
 //
 // Gated on ryzen_ai_npu2 because matmul_int4_packed and the bf16 stitchers
 // hardcode the AIE2P target (arch="aie2p"); running this on a non-NPU2

@@ -198,6 +198,48 @@ Note also: `run_npu2_verify_prefill_bfp16.lit:11` **is** live
 (`REQUIRES: ryzen_ai_npu2, peano, hfweights_amd_llama_...`), so the bfp16 *prefill* backend has a
 lit gate that the int4 model's own end-to-end gate does not.
 
+### 1.9.1 `[2026-08-12]` RESOLVED — queue item 14 closed; the inference above was right, for a reason it did not name
+
+The **[inference]** in §1.9 is **CONFIRMED, and dated**: the `auto` subprocess split is
+`7f2e03d8` (2026-07-14), which is **a month AFTER** the 2026-06-18 disable. The same change is
+what let `nightlyPerfBenchmark.yml` drop its 3B/4B exclusion — its `env` block now records
+"Measured verify peaks: llama32_3b ~24GB, qwen25_3b ~25GB, qwen3_4b ~27GB. No LIT_FILTER_OUT
+needed." The 1B int4 model was simply never revisited.
+
+**Measured before deciding** (devq **255**; this 31 GiB NPU2 host is the same size class as the
+"~32GB runner" the disable names; Turbo. Method: peak RSS summed over the whole process tree,
+sampled at 5 Hz, cross-checked against `/usr/bin/time -v`'s `ru_maxrss` — the tree sum is the
+OOM-relevant quantity, `ru_maxrss` only reports the largest single process):
+
+| arm | peak tree RSS | min free | result |
+|---|---|---|---|
+| the lit end to end (`auto` split, what CI runs) | **10.53 GiB** (capture-npu 10.53 / compare-hf 9.59) | 17.3 GiB | **PASS**, 462.6 s |
+| legacy single process (`--gate-phase both` = the pre-fix shape) | **12.57 GiB** | 15.4 GiB | **PASS** |
+
+**The OOM does not reproduce with OR without the split**, so on this host the split is headroom
+rather than the thing holding the test up. Note the naive `NPU + HF` sum of the split's two phases
+is **20.12 GiB**, but the single-process arm actually measured **12.57 GiB** — the sum badly
+over-estimates, because the host numpy weight duplicates are dropped once resident in BOs. That is
+why this was measured rather than derived. (The 12.57 GiB arm also recompiled every kernel inside
+the measured process, so it is itself an over-estimate.)
+
+**Decision: re-enabled** with `ryzen_ai_npu2, peano,
+hfweights_amd_llama_3_2_1b_instruct_awq_uint4_asym_g128_bf16_lmhead` and **no `hf_token`** —
+`verify_adapter.py` resolves the tokenizer *and* the HF reference config to that one ungated AWQ
+repo, which ships its own `tokenizer.json`. (`run_npu2_compile.lit`'s comment claimed the verify
+path "fetches the gated upstream tokenizer"; that was stale and is corrected in the same change.)
+
+**Two corrections to §1.9's consequence sentence.** (a) lit CI was not testing *zero* quantized
+code — `run_npu2_compile.lit` is live (`REQUIRES: ryzen_ai_npu2, peano`), so quantized
+**compilation** was gated; only quantized **numerics** were not. (b) The hole was worse than
+"untested": `nightlyPerfBenchmark.yml` collapses a model's several `run_npu2_verify*` lits with
+precedence fail > pass > skip, so this model's reported verify status came from the passing
+bfp16-prefill sibling — the dashboard read green for a gate that never ran.
+
+Also found while sweeping for the same pattern: `run_npu2_profile.lit:12` requires `hf_token`
+for the same ungated AWQ checkpoint, so it skips on any runner without a token for no reason.
+Reported, not changed — arming it would mean arming a gate this work did not run.
+
 ---
 
 ## 2. The red lit test — beside the path, and a one-line cause
@@ -496,8 +538,9 @@ Codex specified in doc 03 §Quantization fields — `quant_packing_scheme`, `qua
 **(A) Split the int4 gate — ~2 days, no new model, no new kernel.** Doc 12 work item 2.
 Most pieces exist: `make verify-prefill PREFILL_DTYPE=int4` (`Makefile:138`) and
 `run_npu2_verify_prefill_bfp16.lit` already gate two of the three backends. Missing: an `int4`
-sibling of the bfp16 prefill lit; a decision on `run_npu2_verify.lit`'s `REQUIRES: false` (§1.9 —
-the `auto` gate phase may already have fixed the OOM); and three named PASS/FAIL lines instead of
+sibling of the bfp16 prefill lit; ~~a decision on `run_npu2_verify.lit`'s `REQUIRES: false`~~
+(**settled `[2026-08-12]`, §1.9.1: measured, re-enabled, and green — it was the `auto` gate phase,
+which post-dates the disable by a month**); and three named PASS/FAIL lines instead of
 one. **Evidence produced:** for the first time the repo can state, per backend, which quantized
 paths are gated. This is also the honest reading of Goal 2's own gate text.
 
@@ -634,9 +677,12 @@ doc 12, one in the model README that doc 12 partially catches.
      pmode condition. Any figure taken from it is unconditioned. *(No latency claim is made in this
      document; this note exists so the next reader does not lift those numbers.)*
 
-**Also newly recorded, in no doc:** `llms/llama32_1b_int4/run_npu2_verify.lit:11` is
+**Also newly recorded, in no doc:** `llms/llama32_1b_int4/run_npu2_verify.lit:11` was
 `REQUIRES: false` — disabled upstream in `18d1dac2` (2026-06-17) for **CI-runner OOM**, not for any
-int4 defect. It is the only one of the ten models whose verify lit is disabled. §1.9.
+int4 defect. It was the only one of the ten models whose verify lit was disabled. §1.9.
+**`[2026-08-12]` CLOSED (queue item 14): measured on this 31 GiB host, the OOM does not reproduce
+with or without the subprocess split (10.53 / 12.57 GiB peak, devq 255), and the lit is re-enabled
+and passing. §1.9.1.**
 
 ---
 
@@ -655,7 +701,9 @@ int4 defect. It is the only one of the ten models whose verify lit is disabled. 
 | Prefill is bf16-on-dequant, by design | `llms/llama32_1b_int4/verify_adapter.py:196-202` |
 | HF reference patched with AWQ-dequant to isolate NPU drift | `llms/llama32_1b_int4/verify_adapter.py:90-171` |
 | int4 model passes; ten models pass | `agents/.state/devq/jobs/job-000222.log:198` + final line; `job-000222.meta` (`exit=0`) |
-| int4 verify lit disabled | `llms/llama32_1b_int4/run_npu2_verify.lit:11`; commit `18d1dac2` |
+| int4 verify lit disabled (as filed) | `llms/llama32_1b_int4/run_npu2_verify.lit:11`; commit `18d1dac2` |
+| ~~disabled~~ **re-enabled and green `[2026-08-12]`**; OOM does not reproduce (10.53 GiB split / 12.57 GiB single-process peak, 31 GiB host) | `agents/.state/devq/jobs/job-000255.log` (`PASS ... run_npu2_verify.lit`, both arms + both sampler summaries); `job-000255.meta` (`exit=0`) |
+| the `auto` split post-dates the disable by a month | `18d1dac2` 2026-06-18 vs `7f2e03d8` 2026-07-14; `.github/workflows/nightlyPerfBenchmark.yml:30-36` |
 | bfp16 prefill lit live | `llms/llama32_1b_int4/run_npu2_verify_prefill_bfp16.lit:11` |
 | FFN-side shape assert | `llms/llama32_1b_int4/multi_launch_builder/o_gemv_ffn_int4_multi.py:119-124` |
 | QKV-side shape asserts | `llms/llama32_1b_int4/multi_launch_builder/rms_qkv_int4_rope_multi.py:380-382` |
