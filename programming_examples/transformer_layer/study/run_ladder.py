@@ -99,6 +99,29 @@ A RUNG THAT CANNOT APPLY IS `skipped`, AND THAT IS A DIFFERENT THING
     support and this module only walks what it is given.
 
     Default ``None`` means no skips, which is what every existing caller gets.
+
+A RUNG CARRIED FORWARD IS `reuse`, AND IT STARTS NO CHILD EITHER
+    `[2026-08-12]` ``walk(..., reuse={(mode, seq): row})`` writes that row
+    VERBATIM and runs nothing. It is how a walk interrupted by a reboot restarts
+    without re-measuring what it already measured; ``study/resume.py`` decides
+    which rungs qualify and this module only carries out the decision, exactly
+    as it does for ``skip_reason``.
+
+    **Skips are decided before reuse, deliberately.** A rung the profile now
+    refuses must not be resurrected from a row measured when it did not --
+    ``resume.plan`` already excludes those, and checking here too means the two
+    cannot disagree in the direction that resurrects a stale claim.
+
+    **Verbatim is load-bearing.** The row is copied, not rebuilt, so its digest
+    is unchanged and ``resume.fidelity_problems`` can prove afterwards that the
+    rung really was carried forward rather than quietly re-run. A resume whose
+    own account of what it measured is wrong is worse than no resume: it empties
+    every downstream diff.
+
+    ``on_rung(mode, seq, row, source)`` fires as each rung lands, with ``source``
+    one of ``schema.RUNG_SOURCES``. The ledger is flushed from it, which is what
+    makes attribution survive the kill this whole feature exists for -- the CSV
+    is already rewritten per rung and the record of WHO wrote it must be too.
 """
 
 from __future__ import annotations
@@ -142,6 +165,7 @@ def _rung(
     samples: int,
     runs_per_sample: int,
     scratch: str,
+    family: str | None = None,
 ) -> dict:
     """One rung, in its own process. See ONE PROCESS PER RUNG in the docstring."""
     out = os.path.join(scratch, f"{mode}_{seq}.csv")
@@ -163,6 +187,8 @@ def _rung(
         "--runs-per-sample",
         str(runs_per_sample),
     ]
+    if family:
+        cmd += ["--family", family]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     sys.stdout.write(proc.stdout)
     sys.stderr.write(proc.stderr)
@@ -218,11 +244,16 @@ def walk(
     samples: int,
     runs_per_sample: int,
     skip_reason=None,
+    reuse=None,
+    on_rung=None,
+    family=None,
 ) -> list[dict]:
     """Run every (mode, seq) rung, writing each mode's CSV as it fills.
 
     ``skip_reason(mode, seq)`` returning text records the rung as ``skipped``
-    and starts no child process.
+    and starts no child process. ``reuse[(mode, seq)]`` carries a prior row
+    forward verbatim and starts no child process either. ``on_rung`` sees every
+    rung as it lands. See the two docstring sections above.
     """
     every = []
     scratch = tempfile.mkdtemp(prefix="ladder-rungs-")
@@ -232,19 +263,45 @@ def walk(
         for seq in seqs:
             t0 = time.perf_counter()
             reason = skip_reason(mode, seq) if skip_reason is not None else None
+            carried = None if reason else (reuse or {}).get((mode, seq))
             if reason:
                 row = _skipped_row(mode, seq, study_id, reason)
+                source = "skipped"
+            elif carried is not None:
+                # Copied, never rebuilt: the digest must not move. See the
+                # docstring on why verbatim is what makes the audit possible.
+                row = dict(carried)
+                source = "reused"
             else:
                 row = _rung(
-                    mode, seq, study_id, warmup, samples, runs_per_sample, scratch
+                    mode,
+                    seq,
+                    study_id,
+                    warmup,
+                    samples,
+                    runs_per_sample,
+                    scratch,
+                    family,
                 )
+                source = "measured"
             rows.append(row)
             every.append(row)
             # Rewrite the whole mode after each rung: cheap, and a killed run
             # keeps what it measured.
             results_io.write_rows(out, rows)
+            # ...and attribute it in the same breath, so the record of who wrote
+            # a row is exactly as durable as the row.
+            if on_rung is not None:
+                on_rung(mode, seq, row, source)
             wall = time.perf_counter() - t0
-            if row["run_status"] == "passed":
+            if source == "reused":
+                print(
+                    f"[ladder] {mode:9s} seq {seq:5d}  REUSED   "
+                    f"{row['run_status']} row carried forward from an earlier "
+                    f"session; no child process started",
+                    flush=True,
+                )
+            elif row["run_status"] == "passed":
                 print(
                     f"[ladder] {mode:9s} seq {seq:5d}"
                     f"  avg {_f(row['avg_latency_ms']):9.3f} ms"
@@ -279,6 +336,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--samples", type=int, default=3)
     ap.add_argument("--runs-per-sample", type=int, default=1)
+    ap.add_argument("--family", default=None, help="case-matrix family width")
     args = ap.parse_args(argv)
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -293,6 +351,7 @@ def main(argv: list[str] | None = None) -> int:
         args.warmup,
         args.samples,
         args.runs_per_sample,
+        family=args.family,
     )
 
     passed = [r for r in rows if r["run_status"] == "passed"]

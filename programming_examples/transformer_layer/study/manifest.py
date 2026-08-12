@@ -93,6 +93,24 @@ AND IT VALIDATES ROWS, NOT ONLY FILES
     exactly as it was, so an existing caller is unaffected -- but a caller that
     omits it is back to file-level evidence and should say why.
 
+AND IT SAYS WHICH SESSION WALKED WHICH RUNG `[2026-08-12]` (resume, item 8)
+    Once a walk can be resumed, one CSV can hold rows measured days apart, and
+    nothing in a results row says so. ``walk`` is a block from
+    ``resume.walk_block()`` recording the sessions, what each measured, and the
+    axes they disagree on.
+
+    Its ``attribution_problems`` are merged into ``incomplete_reasons``, which
+    is the half that matters: a ledger claiming rungs the CSVs do not hold, or a
+    row whose hash no longer matches the session that recorded it, makes a run
+    INCOMPLETE rather than merely annotated. The row counts alone cannot see
+    either -- they count rows, and both defects leave the count right.
+
+    Omitting ``walk`` records ``absent`` and adds no problems, exactly as
+    ``expected_rows=None`` leaves the counts unchecked. That is what keeps every
+    root recorded before the ledger existed readable, and it is why
+    ``walk_attribution_checked`` is recorded beside the verdict: "attributed"
+    and "nobody looked" used to be the same absence, which is M3's shape again.
+
 FOOTGUNS
     - **``expected`` is the contract**, exactly as in ``smoke_gate``. A manifest
       built with no expected files is marked incomplete rather than trivially
@@ -455,6 +473,7 @@ def build_manifest(
     conditions=None,
     expected_rows: dict | None = None,
     toolchain=None,
+    walk=None,
 ) -> dict:
     """Describe ``results_root``; ``complete`` means every expected CSV measured.
 
@@ -473,7 +492,11 @@ def build_manifest(
 
     ``expected_rows`` adds the row-count clauses -- see the docstring section.
 
-    All three kwargs default to None and are therefore back-compatible: a caller
+    ``walk`` is the session attribution -- a block from ``resume.walk_block()``
+    -- and omitting it records ``absent`` and checks nothing, which is what
+    every root recorded before the ledger existed gets.
+
+    All four kwargs default to None and are therefore back-compatible: a caller
     that passes none gets the pre-2026-08-12 behaviour, an unconditioned
     manifest whose completeness is judged on files alone.
     """
@@ -503,7 +526,22 @@ def build_manifest(
         )
     schema.validate_toolchain(toolchain)
 
+    walk_checked = walk is not None
+    if walk is None:
+        walk = schema.empty_walk()
+        walk["walk_detail"] = (
+            "no walk ledger was supplied to build_manifest. Whether these rows "
+            "came from one session is NOT assumed: a resumed walk can hold rows "
+            "measured days apart at two toolchains, and nothing in a results "
+            "row says so. Pass resume.walk_block()."
+        )
+    schema.validate_walk(walk)
+
     problems = smoke_gate.check_results_root(root, expected)
+    # Merged rather than reported beside, so one list answers "why is this run
+    # not complete" -- a ledger that describes a walk the files do not hold is
+    # not an annotation on a finished run, it is an unfinished run.
+    problems.extend(walk["attribution_problems"])
     files = [_file_record(root, rel) for rel in expected]
     for record in files:
         rel = record["path"]
@@ -540,11 +578,18 @@ def build_manifest(
         # diffed -- before this, that loop iterated `{}` on both sides and the
         # toolchain half of every comparison compared nothing (queue item 16).
         schema.TOOLCHAIN_KEY: toolchain,
+        # Which session walked which rung. NOT part of the conditions block: a
+        # pmode is one value for a run, while this is a value PER ROW, and the
+        # whole reason it exists is that a resumed run has more than one.
+        schema.WALK_KEY: walk,
         "expected_files": files,
         "missing_files": [f["path"] for f in files if not f["exists"]],
         # Recorded so a reader can tell "the counts were met" from "no counts
         # were checked" -- the two used to look identical, which is M3.
         "row_counts_checked": bool(expected_rows),
+        # Same distinction one level up: "every row is attributed" and "nobody
+        # looked" are different facts and must not read the same.
+        "walk_attribution_checked": walk_checked,
         # NOT `not missing_files` -- see the module docstring.
         "complete": not problems,
         "incomplete_reasons": problems,

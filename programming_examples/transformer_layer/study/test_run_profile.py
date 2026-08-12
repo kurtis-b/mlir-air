@@ -46,19 +46,47 @@ def _row(mode, seq, status, message=""):
     return row
 
 
-def _fake_walker(status_for):
-    """A walker writing one CSV per mode, honouring the profile's skip rule."""
+def _fake_walker(status_for, *, honour_reuse=True, nonce=""):
+    """A walker writing one CSV per mode, honouring skip, reuse and the hook.
 
-    def walk(modes, seqs, out_dir, study_id, warmup, samples, rps, skip_reason=None):
+    ``honour_reuse=False`` is a DELIBERATELY BROKEN walker: it re-measures a
+    rung the plan said it would carry forward. That is the negative control for
+    ``resume.fidelity_problems`` -- the check against a resume that silently
+    redoes work -- and without it that check could not be shown to fail.
+
+    ``nonce`` perturbs the row so a re-measurement is distinguishable from a
+    reuse, standing in for the timings a real rung would differ by.
+    """
+
+    def walk(
+        modes,
+        seqs,
+        out_dir,
+        study_id,
+        warmup,
+        samples,
+        rps,
+        skip_reason=None,
+        reuse=None,
+        on_rung=None,
+        family=None,
+    ):
         every = []
         for mode in modes:
             rows = []
             for seq in seqs:
                 reason = skip_reason(mode, seq) if skip_reason else None
+                carried = None if reason else (reuse or {}).get((mode, seq))
                 if reason:
-                    rows.append(_row(mode, seq, "skipped", f"skipped: {reason}"))
+                    row, source = _row(mode, seq, "skipped", f"skipped: {reason}"), "skipped"
+                elif carried is not None and honour_reuse:
+                    row, source = dict(carried), "reused"
                 else:
-                    rows.append(_row(mode, seq, status_for(mode, seq)))
+                    row = _row(mode, seq, status_for(mode, seq), nonce)
+                    source = "reused" if carried is not None else "measured"
+                rows.append(row)
+                if on_rung is not None:
+                    on_rung(mode, seq, row, source)
             results_io.write_rows(os.path.join(out_dir, f"{mode}.csv"), rows)
             every.extend(rows)
         return every
@@ -66,7 +94,7 @@ def _fake_walker(status_for):
     return walk
 
 
-def _run(profile_name, walker, directory):
+def _run(profile_name, walker, directory, resume=False):
     return run_profile.run(
         profiles.profile(profile_name),
         directory,
@@ -77,6 +105,7 @@ def _run(profile_name, walker, directory):
         power_backend="none",
         walker=walker,
         repo=directory,
+        resume=resume,
     )
 
 
@@ -93,11 +122,18 @@ def test_a_clean_ladder_walk_is_complete():
 def test_a_short_walk_is_not_complete():
     """M3: a CSV that should hold four rungs and holds one used to be complete."""
 
-    def walk(modes, seqs, out_dir, study_id, w, s, r, skip_reason=None):
-        rows = [_row("coarse", 512, "passed")]
+    def walk(
+        modes, seqs, out_dir, study_id, w, s, r, skip_reason=None, reuse=None,
+        on_rung=None, family=None,
+    ):
+        every = []
         for mode in modes:
+            rows = [_row(mode, 512, "passed")]
             results_io.write_rows(os.path.join(out_dir, f"{mode}.csv"), rows)
-        return rows * len(modes)
+            if on_rung is not None:
+                on_rung(mode, 512, rows[0], "measured")
+            every.extend(rows)
+        return every
 
     with tempfile.TemporaryDirectory() as d:
         report = _run("ladder", walk, d)
@@ -111,7 +147,10 @@ def test_a_short_walk_is_not_complete():
 def test_an_inapplicable_rung_recorded_as_failed_is_caught():
     """M6: without an emitted `skipped`, this is indistinguishable from a break."""
 
-    def walk(modes, seqs, out_dir, study_id, w, s, r, skip_reason=None):
+    def walk(
+        modes, seqs, out_dir, study_id, w, s, r, skip_reason=None, reuse=None,
+        on_rung=None, family=None,
+    ):
         every = []
         for mode in modes:
             rows = [
@@ -132,6 +171,9 @@ def test_an_inapplicable_rung_recorded_as_failed_is_caught():
                 for seq in seqs
             ]
             results_io.write_rows(os.path.join(out_dir, f"{mode}.csv"), rows)
+            for seq, row in zip(seqs, rows):
+                if on_rung is not None:
+                    on_rung(mode, seq, row, "measured")
             every.extend(rows)
         return every
 
@@ -160,9 +202,11 @@ def test_the_run_report_records_the_plan_and_what_was_not_walked():
         _run("smoke", _fake_walker(lambda m, s: "passed"), d)
         report = json.loads((Path(d) / run_profile.RUN_REPORT_NAME).read_text())
         assert report["profile"]["name"] == "smoke"
-        assert set(report["profile"]["families_not_walked"]) == set(
-            profiles.UNREACHABLE_FAMILIES
-        )
+        not_walked = report["profile"]["families_not_walked"]
+        # Both kinds are named: unbuildable, and simply not targeted.
+        assert set(profiles.UNREACHABLE_FAMILIES) <= set(not_walked)
+        assert profiles.REACHABLE_FAMILY not in not_walked
+        assert all(not_walked.values()), "a family named with no reason"
         assert report["profile"]["rung_count"] == 4
         assert len(report["rungs"]) == 4
         assert "power_over_whole_walk" in report
@@ -242,6 +286,53 @@ def test_a_walk_records_the_toolchain_it_measured_against():
         assert block["toolchain_source"] != "absent"
 
 
+def test_a_walk_records_the_power_mode_it_refused_to_start_without():
+    """`[2026-08-12]` A hole the conditions block landing before this caller left.
+
+    `gate` never passed `conditions=`, so every profile manifest recorded
+    `npu_power_mode: unknown` -- on a run that had just REFUSED to start unless
+    the mode was turbo. The rule is "never stamp a condition you did not
+    observe"; this was its inverse, observing and then discarding, which is the
+    worse half because the artifact then reads as though nobody could tell.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        run_profile.run(
+            profiles.profile("smoke"),
+            d,
+            study_id="test",
+            warmup=0,
+            samples=1,
+            runs_per_sample=1,
+            power_backend="none",
+            walker=_fake_walker(lambda m, s: "passed"),
+            repo=d,
+            npu_power_mode="turbo",
+        )
+        block = json.loads((Path(d) / run_profile.MANIFEST_NAME).read_text())[
+            schema.CONDITIONS_KEY
+        ]
+    assert block["npu_power_mode"] == "turbo"
+    # `observed`, not `probed_at_manifest_build`: the check ran BEFORE the walk,
+    # on the clock of the measurement, which is what that source value means.
+    assert block["npu_power_mode_source"] == "observed"
+
+
+def test_a_re_gate_does_NOT_stamp_todays_power_mode_on_an_old_tree():
+    """The other half, and the one that would be a data corruption. A mode reset
+    by a reboot since the walk must not be written onto the walk's rows."""
+    with tempfile.TemporaryDirectory() as d:
+        _run("smoke", _fake_walker(lambda m, s: "passed"), d)
+        (Path(d) / run_profile.MANIFEST_NAME).unlink()
+        assert (
+            run_profile.main(["--profile", "smoke", "--out-dir", d, "--gate-only"]) == 0
+        )
+        block = json.loads((Path(d) / run_profile.MANIFEST_NAME).read_text())[
+            schema.CONDITIONS_KEY
+        ]
+    assert block["npu_power_mode"] == schema.UNKNOWN_CONDITION
+    assert "NOT assumed" in block["npu_power_mode_detail"]
+
+
 def test_gate_only_does_NOT_stamp_todays_toolchain_on_an_old_tree():
     """The other half, and the one that would be a data corruption.
 
@@ -260,6 +351,83 @@ def test_gate_only_does_NOT_stamp_todays_toolchain_on_an_old_tree():
         for name in schema.TOOLCHAIN_IDENTITY_FIELDNAMES:
             assert block[name] == schema.UNKNOWN_CONDITION, name
         assert "NOT assumed" in block["toolchain_detail"]
+
+
+# ---------------------------------------------------------------------------
+# The environment preflight `[2026-08-12]` -- doc 10 work item 5, taken as a
+# check rather than as a README paragraph. Both failures it covers are LATE
+# ones: minutes into a cold walk, reading like a model regression.
+# ---------------------------------------------------------------------------
+
+
+def test_a_shell_with_no_pyxrt_is_refused_before_anything_compiles():
+    """BROKEN INPUT: an importer that cannot find pyxrt.
+
+    THE failure this check exists for. `env_setup.sh` does not add pyxrt, so a
+    devq job that sources it and stops compiles every kernel and then dies at
+    the first dispatch -- after the expensive part, with a ModuleNotFoundError.
+    """
+    problems = run_profile.environment_problems(
+        cwd=Path(run_profile._EXAMPLE),
+        importable=lambda name: name != "pyxrt",
+    )
+    assert len(problems) == 1
+    assert "pyxrt" in problems[0] and "FIRST DISPATCH" in problems[0]
+
+
+def test_a_shell_with_no_ml_dtypes_is_refused_too():
+    """BROKEN INPUT: an importer that cannot find ml_dtypes."""
+    problems = run_profile.environment_problems(
+        cwd=Path(run_profile._EXAMPLE),
+        importable=lambda name: name != "ml_dtypes",
+    )
+    assert len(problems) == 1
+    assert "ml_dtypes" in problems[0]
+
+
+def test_the_wrong_working_directory_is_refused():
+    """BROKEN INPUT: a cwd that is not the example directory.
+
+    aircc and KernelCache write relative to cwd and only the example's own
+    .gitignore covers what they write -- doc 15's rule that a new artifact
+    directory is the DEFAULT outcome of a KernelCache-backed gate.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        problems = run_profile.environment_problems(
+            cwd=Path(d), importable=lambda name: True
+        )
+    assert len(problems) == 1
+    assert "working directory" in problems[0] and ".gitignore" in problems[0]
+
+
+def test_a_correct_environment_produces_no_problems():
+    """The control: with everything present this must say nothing, or the guard
+    is a refusal that fires on a good shell and gets routed around."""
+    assert (
+        run_profile.environment_problems(
+            cwd=Path(run_profile._EXAMPLE), importable=lambda name: True
+        )
+        == []
+    )
+
+
+def test_every_required_module_says_what_a_caller_would_see_instead():
+    """An unexplained refusal gets worked around. Each must name the symptom."""
+    for name, why in run_profile._REQUIRED_MODULES.items():
+        assert len(why) > 80, name
+        assert "pl_env_ensure" in why or "port-loop environment" in why
+
+
+def test_the_preflight_runs_before_the_walk_takes_the_lock():
+    """Doc 10's actual requirement is the words "rather than mid-suite". A check
+    that runs after the first rung is the failure it was written to prevent."""
+    source = Path(_HERE, "run_profile.py").read_text(encoding="utf-8")
+    assert source.index("environment = environment_problems()") < source.index(
+        "with run_lock.hold("
+    )
+    assert source.index("environment = environment_problems()") < source.index(
+        "mode = _require_turbo()"
+    ), "a shell that cannot dispatch should be refused before the device is read"
 
 
 def test_preflight_passes_when_the_device_is_free():

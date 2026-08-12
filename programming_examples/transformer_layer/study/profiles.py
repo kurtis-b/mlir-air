@@ -21,20 +21,35 @@ CONTRACT
     ``manifest.expected_rows``; the counts below are computed from the tables,
     never typed out, so retargeting a profile retargets its gate.
 
-WHAT THIS PROFILE CANNOT REACH, SAID OUT LOUD
-    ``cases.py`` declares six families x a nine-point ladder. The runner can
-    reach **one** family. ``run_mode.run`` writes ``workload_variant =
-    "encoder_bert"`` unconditionally and ``run_mode._shape_for`` varies only
-    ``seq_len``, building the case key as ``f"{seq_len}x{emb}_encoder_bert"``
-    from the SPECS row's own ``emb_dim`` -- and every whole-layer SPECS row is
-    ``emb_dim 768``. So ``baseline_768`` is reachable and the other five are
-    not, at any length, by construction rather than by omission.
+WHAT THIS PROFILE CAN AND CANNOT REACH, SAID OUT LOUD
+    ``cases.py`` declares six families x a nine-point ladder. The runner reaches
+    **three**: the encoder widths. The three decoder families are refused with a
+    reason rather than omitted.
 
-    Widening that is a coverage sweep, not a profile edit: new registry rows at
-    hidden 512/1024 plus a decoder variant. The precedent (C4) cost 504 + 66
-    minutes of gate time. Until then ``UNREACHABLE_FAMILIES`` carries each one
-    with its reason, ``run_profile`` copies them into the run report, and no
-    profile silently presents a one-family walk as a matrix walk. This follows
+    `[2026-08-12]` THE PREVIOUS TEXT HERE WAS WRONG, AND ITS WRONGNESS COST THE
+    SCOPING OF A WHOLE PHASE. It said ``tinybert_512`` and ``baseline_1024``
+    "need registry coverage at hidden 512/1024" and that widening the matrix was
+    a Phase-C-sized sweep -- doc 34 M5 sized it against C4's 504 + 66 minutes.
+    Measured instead of assumed: ``kernel_registry/details/
+    GEMM_bf16_in_bf16_out.json`` holds **36 of 36** projection triples for each
+    of hidden 512, 768 and 1024, landed 2026-08-07 by the baseline_512 and
+    baseline_1024 sweeps (69 -> 103 -> 136 rows). The sweep the estimate was
+    sized against **had already been run**, and nothing since read the file.
+
+    So the real blocker was never coverage, it was that ``run_mode._shape_for``
+    overrode ``seq_len`` and not the width. That is now a parameter, and the
+    cost of two more families is zero device-hours of sweeping.
+
+    The decoder half of the old text stands and is unchanged: ``decoder_gpt2``
+    is a different LAYER GRAPH, not a flag -- see
+    ``run_mode.UNBUILDABLE_VARIANTS``, which refuses it. Refusing matters more
+    than omitting here: overriding the width alone and stamping the row
+    ``decoder_gpt2`` would produce a valid-looking bidirectional measurement
+    under a causal name, and nothing downstream could detect it.
+
+    ``UNREACHABLE_FAMILIES`` carries each unreachable family with its reason,
+    ``run_profile`` copies them into the run report, and no profile silently
+    presents a partial walk as a matrix walk -- following
     ``component_groups.py``, which reports ``0/12`` rather than putting a mode
     total under a group label.
 
@@ -88,7 +103,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -97,40 +112,102 @@ if _HERE not in sys.path:
 import cases  # noqa: E402
 import schema  # noqa: E402
 
-#: The family every reachable rung runs at. Not a preference -- see the module
-#: docstring; ``test_profiles.py`` re-derives it from ``opcheck_specs.py`` and
-#: ``run_mode.py`` rather than trusting this line.
+#: The default family, kept as the name every existing caller and every recorded
+#: root already uses. NOT "the only one" any more -- see REACHABLE_FAMILIES.
 REACHABLE_FAMILY = "baseline_768"
+
+#: Every family a profile can walk today. Derived from the two things that
+#: actually decide it -- the layer graph must be buildable, and every projection
+#: GEMM must resolve -- rather than listed; ``test_profiles.py`` re-derives both
+#: halves from the sources, so a family that stops resolving fails a test rather
+#: than making this line a lie.
+REACHABLE_FAMILIES: tuple[str, ...] = (
+    "tinybert_512",
+    "baseline_768",
+    "baseline_1024",
+)
 
 #: Why each declared family the runner cannot reach is out of reach. Keyed by
 #: ``cases.FAMILY_IDS`` so a family added to the matrix and forgotten here fails
 #: a test rather than quietly disappearing from the report.
+#:
+#: `[2026-08-12]` All three surviving entries are the SAME reason, and it is a
+#: layer-graph reason rather than a coverage one. The two width entries that
+#: used to sit here ("needs registry coverage at hidden 512/1024") were false:
+#: that coverage landed 2026-08-07 and nothing had read the file since.
 UNREACHABLE_FAMILIES: dict[str, str] = {
-    "tinybert_512": (
-        "no whole-layer SPECS row at emb_dim 512, and run_mode._shape_for "
-        "varies only seq_len -- needs registry coverage at hidden 512"
-    ),
-    "baseline_1024": (
-        "no whole-layer SPECS row at emb_dim 1024, and run_mode._shape_for "
-        "varies only seq_len -- needs registry coverage at hidden 1024"
-    ),
     "gpt2_512": (
-        "decoder_gpt2: run_mode.run writes workload_variant='encoder_bert' "
-        "unconditionally, and there is no emb_dim 512 row either"
+        "decoder_gpt2 is a different layer graph, not a width -- see "
+        "run_mode.UNBUILDABLE_VARIANTS. Its width (512) IS reachable, so this "
+        "family is one graph away rather than one sweep away"
     ),
     "gpt2_small_768": (
-        "decoder_gpt2: run_mode.run writes workload_variant='encoder_bert' "
-        "unconditionally, so the causal-mask path is unreachable from a profile"
+        "decoder_gpt2 is a different layer graph, not a width -- see "
+        "run_mode.UNBUILDABLE_VARIANTS. Its width is the default 768, so this "
+        "is the cheapest of the three decoders: the graph is the whole cost"
     ),
     "gpt2_medium_1024": (
-        "decoder_gpt2: run_mode.run writes workload_variant='encoder_bert' "
-        "unconditionally, and there is no emb_dim 1024 row either"
+        "decoder_gpt2 is a different layer graph, not a width -- see "
+        "run_mode.UNBUILDABLE_VARIANTS. Its width (1024) is reachable, so like "
+        "the other two decoders the graph is the whole cost"
     ),
 }
 
-#: ``fused``'s supported sequence range, from ``pattern/fused/fused.py``'s own
-#: "BOUNDED TO 256..1024" and the packing derivation behind it. Inclusive.
-FUSED_SEQ_RANGE: tuple[int, int] = (256, 1024)
+#: Known holes in the registry that make a REACHABLE family's rung fail. Not
+#: skips: a skip is a claim about what a MODE supports, and this is a missing
+#: measurement -- so the rung is run and its refusal is the result, which is
+#: `cases.py`'s rule that "pre-declaring a failure is how a matrix stops being a
+#: measurement". Recorded here so an operator reading an incomplete
+#: `baseline_1024` walk finds the cause in one line instead of in a traceback.
+#:
+#: ``test_profiles.py`` asserts each entry is STILL TRUE against the registry
+#: JSON, so sweeping the missing method makes this list fail rather than quietly
+#: keep warning about a hole somebody closed.
+KNOWN_REGISTRY_GAPS: tuple[dict, ...] = (
+    {
+        "family": "baseline_1024",
+        "modes": ("offload", "runlist"),
+        "seq": 2048,
+        "triple": (2048, 1024, 3072),
+        "method": "drain",
+        "why": (
+            "offload and runlist re-resolve the qkv projection through the "
+            "`drain` method, and 2048x1024x3072 is the one triple in the "
+            "baseline_1024 sweep with no drain row. coarse and fused are "
+            "unaffected: qkv_proj pins `fused-cast`, which is present"
+        ),
+    },
+)
+
+#: ``fused``'s packing cap, from ``builders/norm_tail.py``: plane-major staging
+#: needs a plane stride of ``rows*cols``, and the shim ``aie.dma_bd`` field caps
+#: it at 2^20. This is the NUMBER the mode's "BOUNDED TO 256..1024" was derived
+#: from at emb 768, and carrying the derivation rather than its answer is what
+#: makes the bound follow a width change.
+FUSED_PLANE_STRIDE_CAP = 2**20
+
+#: The bottom of ``fused``'s range, which is a tiling floor rather than a
+#: packing one and therefore does NOT move with width.
+FUSED_SEQ_MIN = 256
+
+
+def fused_seq_range(family: str = REACHABLE_FAMILY) -> tuple[int, int]:
+    """``fused``'s supported (min, max) sequence at a family's width. Inclusive.
+
+    DERIVED, not tabulated. At emb 768 this returns (256, 1024), which is the
+    range ``fused.py`` states in prose and which the previous hardcoded
+    ``FUSED_SEQ_RANGE`` carried -- so the 768 profiles are unchanged. At emb 512
+    it returns (256, 2048) and at emb 1024 (256, 1024), because the cap is on
+    ``rows*cols`` and cols is the width. A tabulated bound would have been right
+    at one width and silently wrong at the other two, which is the same class of
+    error as the row this module's docstring records: a number that was correct
+    when written and became a claim about somebody else's shape.
+    """
+    import cases
+
+    emb = cases.FAMILY_SPECS[family].hidden_size
+    # The largest power-of-two ladder point whose plane fits.
+    return (FUSED_SEQ_MIN, max(s for s in cases.SEQUENCE_LADDER if s * emb <= FUSED_PLANE_STRIDE_CAP))
 
 #: The four whole-layer execution modes, in taxonomy order. Validated against
 #: the schema rather than redeclared -- convention 7 keeps the mode vocabulary
@@ -138,20 +215,24 @@ FUSED_SEQ_RANGE: tuple[int, int] = (256, 1024)
 PROFILE_MODES: tuple[str, ...] = ("coarse", "offload", "runlist", "fused")
 
 
-def skip_reason(mode: str, seq: int) -> str | None:
+def skip_reason(mode: str, seq: int, family: str = REACHABLE_FAMILY) -> str | None:
     """Why ``(mode, seq)`` cannot apply, or ``None`` if it can be attempted.
 
     Structural inapplicability only. A rung that MIGHT fail is not skipped --
     it is run, and its failure is the result.
     """
     if mode == "fused":
-        low, high = FUSED_SEQ_RANGE
+        import cases
+
+        emb = cases.FAMILY_SPECS[family].hidden_size
+        low, high = fused_seq_range(family)
         if seq < low or seq > high:
             return (
-                f"fused is bounded to {low}..{high} (pattern/fused/fused.py): "
-                f"its plane-major packing caps the mode at rows*cols <= 2^20, "
-                f"which is {2 ** 20 // 768} rows at emb 768, and the builder "
-                f"raises before aircc is reached. seq {seq} is outside it"
+                f"fused is bounded to {low}..{high} at {family} (emb {emb}): "
+                f"its plane-major packing caps the mode at rows*cols <= "
+                f"{FUSED_PLANE_STRIDE_CAP}, which is "
+                f"{FUSED_PLANE_STRIDE_CAP // emb} rows at this width, and the "
+                f"builder raises before aircc is reached. seq {seq} is outside it"
             )
     return None
 
@@ -171,7 +252,7 @@ class Rung:
 
     @property
     def skip_reason(self) -> str | None:
-        return skip_reason(self.mode, self.seq)
+        return skip_reason(self.mode, self.seq, self.family)
 
 
 @dataclass(frozen=True)
@@ -193,6 +274,36 @@ class Profile:
                 f"profile {self.name!r} names family {self.family!r}, which is "
                 f"not in the case matrix; known are {list(cases.FAMILY_IDS)}"
             )
+        if self.family not in REACHABLE_FAMILIES:
+            # Refused at construction rather than walked and failed 36 times.
+            # A decoder profile would otherwise cost a full cold walk to learn
+            # what UNREACHABLE_FAMILIES already says in one line.
+            raise ValueError(
+                f"profile {self.name!r} names family {self.family!r}, which no "
+                f"whole-layer mode can build: "
+                f"{UNREACHABLE_FAMILIES.get(self.family, 'no reason recorded')}"
+            )
+
+    def retarget(self, family: str) -> "Profile":
+        """The same plan at another family's width, with its own derived counts.
+
+        The point of the profile table's discipline: retargeting retargets the
+        gate. ``fused``'s applicability bound moves with the width, so the
+        expected skipped-row count for `ladder` at ``tinybert_512`` differs from
+        the one at ``baseline_768`` WITHOUT a number being edited anywhere.
+        """
+        return replace(self, family=family)
+
+    def skip_rule(self):
+        """``skip_reason`` bound to THIS profile's family, for the walker.
+
+        The walker takes a two-argument callable and knows nothing about
+        families. Handing it the bare module function would silently apply the
+        768 bound to a 512 walk -- `fused` at seq 2048 would be skipped where it
+        is supported, and a skipped rung is not a failure, so the walk would
+        report complete having never attempted it.
+        """
+        return lambda mode, seq: skip_reason(mode, seq, self.family)
 
     def rungs(self) -> tuple[Rung, ...]:
         """Mode-major, then ladder order -- the order ``run_ladder`` walks."""
