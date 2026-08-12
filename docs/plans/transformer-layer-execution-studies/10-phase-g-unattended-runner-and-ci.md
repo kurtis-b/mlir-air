@@ -291,9 +291,24 @@ add_lit_testsuite(check-programming-examples-transformer-layer
 >
 > **The count is asserted in the workflow, and that is the load-bearing half.** A lit suite that
 > selects nothing, or reports everything unsupported, exits 0 — so a green step is not evidence
-> it ran. `buildAndTestRyzenAI.yml` now requires `Total Discovered Tests: 10`, `Passed: 10`, and
-> that Passed is the only nonzero category. Same shape as `lib-guard.sh`'s
-> `pl_assert_gate_ran_hardware`, which exists for this exact regression.
+> it ran. `buildAndTestRyzenAI.yml` requires **`Passed = 10`** and that **`Passed` and `Excluded`
+> are the only categories reported**. That is `lib-guard.sh`'s `pl_assert_gate_ran_hardware`
+> invariant verbatim, and it exists for this exact regression.
+>
+> **Do not assert `Total Discovered Tests: 10`. Measured: it is 362.** The first version of this
+> guard did assert it and **failed on a fully green run** — devq job 258, where the filter
+> selected exactly 10 and all 10 passed. `add_lit_testsuite` runs lit over the *whole*
+> `programming_examples` tree and narrows with `--filter`; lit counts every discovered test in
+> that line and records the filtered-out 352 as `Excluded`. This is why doc 14's rule names
+> `Excluded` explicitly rather than talking about a total, and it is the reason to state a gate's
+> invariant as "N passed and nothing else nonzero" rather than as a total.
+>
+> Worth keeping for its own sake: **the guard caught its own author's mistake before it reached
+> CI**, which is the argument for asserting counts at all. The corrected guard is verified
+> against job 258's real output (accepts) and against four synthetic summaries it must refuse —
+> the filter matching nothing (doc 10's own proposed filter, which selects 0 of 32), one
+> UNSUPPORTED test on an NPU-less runner, a host-only test added but not enrolled (9 of 10), and
+> a real failure. Each is caught by exactly one clause.
 >
 > **`-j1`, deliberately not applied to either transformer-layer target.** The host target
 > dispatches nothing, so parallelism costs nothing. The hardware target has been run at 24

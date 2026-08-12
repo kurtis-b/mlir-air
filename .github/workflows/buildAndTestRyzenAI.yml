@@ -160,20 +160,32 @@ jobs:
           # THE COUNT IS ASSERTED, and that is the whole point of the step. A
           # lit suite that selects nothing, or that reports every test
           # unsupported, exits 0 -- so "the gate was green" is not evidence
-          # that it ran. Same shape as lib-guard.sh's pl_assert_gate_ran_hardware:
-          # Passed must reach the expected count AND be the only category.
+          # that it ran. This is lib-guard.sh's pl_assert_gate_ran_hardware
+          # invariant verbatim: Passed must reach the expected count, and
+          # Passed + Excluded must be the only nonzero categories.
+          #
+          # DO NOT assert "Total Discovered Tests: 10". Measured: it is 362.
+          # add_lit_testsuite runs lit over the WHOLE programming_examples tree
+          # and narrows with --filter, and lit counts every discovered test in
+          # that line, recording the filtered-out ones as Excluded. Asserting it
+          # fails on a green run -- which is why lib-guard.sh's rule names
+          # Excluded explicitly, and why "Passed: N with nothing else nonzero"
+          # is the assertion that actually means "N tests ran and all passed".
           ninja check-programming-examples-transformer-layer-host 2>&1 | tee tl-host.log
-          if ! grep -qE "^Total Discovered Tests: 10$" tl-host.log; then
-            echo "::error::transformer-layer PR gate selected the wrong number of tests"
-            grep -E "^Total Discovered Tests:" tl-host.log || echo "  (no summary at all)"
+
+          # Every summary category line, as Label=count. lit prints a category
+          # only when its count is nonzero and pads the labels, hence the
+          # tolerant pattern.
+          cats=$(sed -nE 's/^  ([A-Za-z][A-Za-z ]*[A-Za-z]) *: *([0-9]+).*/\1=\2/p' tl-host.log)
+          if ! printf '%s\n' "$cats" | grep -qx "Passed=10"; then
+            echo "::error::transformer-layer PR gate did not run all 10 tests"
+            echo "  categories reported: ${cats:-(no summary at all)}"
             exit 1
           fi
-          if ! grep -qE "^  Passed *: *10 " tl-host.log; then
-            echo "::error::transformer-layer PR gate: fewer than 10 tests passed"
-            exit 1
-          fi
-          if grep -qE "^  (Unsupported|Failed|Unresolved|Timed Out|Unexpectedly Passed) *:" tl-host.log; then
-            echo "::error::transformer-layer PR gate: Passed must be the only nonzero category"
+          unexpected=$(printf '%s\n' "$cats" | grep -vE '^(Passed|Excluded)=' || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::transformer-layer PR gate: Passed and Excluded must be the only categories"
+            echo "  also reported: $unexpected"
             exit 1
           fi
           rm -f tl-host.log
