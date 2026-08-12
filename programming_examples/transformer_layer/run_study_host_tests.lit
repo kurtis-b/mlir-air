@@ -92,5 +92,30 @@
 // are rejected -- including the two that matter most: making the budget a
 // legality predicate again, and pricing a `dma_transfer` without its strides.
 //
+//
+// `[2026-08-12]` 357 -> 393 and 19 -> 20 modules, queue item 26: the static
+// legality predicate and the mapping-space census (study/mapping_space.py).
+// +36 test_mapping_space, and the module count moves too because this is the
+// first new module here since the count was pinned -- a suite that gained tests
+// without gaining a module would be a test file edited, not a tier added, and
+// the two numbers say which happened.
+//
+// Three of those 36 are the load-bearing ones and none of them is a unit test
+// in the usual sense. Two REPRODUCE MEASUREMENTS with no compiler in the loop
+// (R1's 7-of-16 per-column shim census and both memtile rows, doc 31b section
+// 3.6; the herd inventory that refuses at nine herds, section 3.5), one
+// brute-forces whole sub-spaces against the factorisation the census counts
+// with. The census itself is NOT here -- it is run_mapping_space_tests.lit,
+// deliberately a separate arm, because "the predicate is right" and "here is
+// what it measures" are two claims and one recipe asserting both would let
+// either pass on the other's evidence.
+//
+//
+// `[2026-08-12]` The two items above landed in the same session and their
+// counts were written against the same 357 baseline, so neither literal is the
+// truth after both merged. This number was MEASURED on the merged tree rather
+// than arrived at by adding the two deltas -- 72 + 36 happens to be right here,
+// but a count reconciled by arithmetic is a count nobody ran.
+//
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 429/429 passed in 21 modules
+// CHECK: study host tests: 465/465 passed in 22 modules

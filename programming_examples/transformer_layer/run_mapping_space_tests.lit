@@ -1,0 +1,112 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Queue item 26: the static legality predicate, and the SIZE OF THE MAPPING
+// SPACE before and after it.
+//
+// The deliverable of item 26 is a number, not machinery. Doc 38 measured that
+// iron's legality prune left a space small enough that its placements are
+// hand-authored tables with only seven legal (parallel_heads, parallel_ffn)
+// tails; if ours collapses the same way, item 25's instrument plus plain
+// enumeration beats any search, and the mapping-work plan reorders. So the two
+// space sizes are pinned HERE, exactly, rather than written into a document
+// where nothing re-derives them.
+//
+// No NPU, no XRT, no aircc, no toolchain. study/mapping_space.py reads
+// DECLARATIONS -- herd widths, operand routing, scope per seam -- and never a
+// routed design, which is the whole claim: the per-column budget that
+// ffn_resident_structure.py can only count after a compile is derivable before
+// one. pytest is not in the sandbox venv, so this runs as a plain script, the
+// convention run_ffn_resident_emulation_tests.lit sets.
+//
+// THE UNIT CHECKS ARE NOT HERE. study/test_mapping_space.py is collected by
+// study/run_host_tests.py's glob and pinned by run_study_host_tests.lit's exact
+// count (392). This recipe runs the CENSUS, which is a different arm: the unit
+// checks say the predicate is right, this says what it measures. Adding a
+// second name for either would be the "doubly covered" mistake queue item 17
+// records.
+//
+// RUN: python3 %S/study/mapping_space.py | FileCheck %s
+//
+// THE CONTROLS FIRST, AND THEY RUN ON EVERY INVOCATION. A predicate that
+// cannot refuse is not a predicate, and one that refuses everything is not one
+// either. Both are matched, so a change that breaks either direction goes red
+// here rather than shrinking the headline number quietly.
+//
+// NEGATIVE: queue item 10's own over-budget design -- one herd of [4,1] with
+// three herd-direct L3 operands. MEASURED through aircc 2026-08-12: zero
+// inbound aie.flow and 12 aie.packet_flow, three streams per column. The
+// compiled census reads ZERO surviving circuit ports there and had to be
+// widened twice; a static predicate reads the declaration, so it must see the
+// three directly.
+// CHECK: negative control: one herd [4,1] with 3 herd-direct L3 operands -> 12 of 16 slots, 3 per column, predicted [3, 3, 3, 3, 0, 0, 0, 0] -> REFUSED
+//
+// POSITIVE: R1's shipped interior, which routes today. The static count must
+// reproduce doc 31b section 3.6's MEASURED table with no compiler involved --
+// 7 of 16 ports, 4 shim->core + 3 shim->memtile -- and both memtile rows with
+// it (the up feed at 4 MM2S / 2 S2MM, the down feed at 4 / 5, which is the
+// GeLU fan-out plus the w_down refill).
+// CHECK: positive control: R1 interior -> shim MM2S 7/16, 4 shim->core + 3 shim->memtile, 12 cores over 3 herds -> ADMITTED
+// CHECK: positive control: R1 memtiles (MM2S, S2MM) [(4, 2), (4, 5)]
+//
+// The herd inventory, doc 31b section 3.5, MEASURED by sweeping N herds of
+// [4,1] in one segment: nine refuse with "'aie.tile' op row index (6) must be
+// less than the number of rows in the device (6)", eight place at 100%
+// occupancy. Matched in both directions so a core budget that stopped being a
+// cliff, or started being one too early, fails here.
+// CHECK: herd inventory: 9 herds of [4,1] = 36 tiles -> REFUSED
+// CHECK: herd inventory: 8 herds of [4,1] = 32 tiles -> places
+// CHECK: herd inventory: 7 herds of [4,1] = 28 tiles -> places
+// CHECK: herd inventory: 5 herds of [4,1] = 20 tiles -> places
+//
+// Doc 23's rule at its sharpest: J7a's three 8-wide herds fetch packed and
+// gamma and the budget "is exactly met". Two is legal, three is the packet
+// path, and a model that rounded either way would be useless for R2 -- which
+// is the increment that walks into this.
+// CHECK: J7a control: predicted per-column MM2S [2, 2, 2, 2, 2, 2, 2, 2]
+//
+// THE MEASUREMENT. Both numbers exact. "Before" is after the divisibility the
+// builders raise on (Timeloop's first tier, doc 46: "divisors constructed-in,
+// capacity rejected") with the raw axis product beside it, because an
+// enumerator that generated the raw product would be generating shapes no
+// builder will build. Every range behind these is sourced in AXES -- run
+// `python3 study/mapping_space.py --axes` to see each bound with the artifact
+// that fixes it.
+//
+// 115,343,360 -> 3,721,772 is a 31x cut, NOT the collapse item 26 anticipated
+// from iron's seven hand-authored tails. Doc 48 is the writeup.
+// CHECK: space before legality: 115343360 (raw product 293601280)
+// CHECK: space after legality: 3721772
+//
+// The priced subset, and it must be a PROPER subset. Doc 44 as corrected: a
+// column over budget is legal-but-degraded, because AIR packet-multiplexes
+// rather than refusing, and filtering those points out would hide the exact
+// failure mode this study is trying to see. If this line ever read 0 the slope
+// would be dead code; if it equalled the line above, the price would not
+// discriminate. main() asserts both, so this CHECK is the value, not the shape.
+//
+// It is 59% of the legal space, which is the single most consequential number
+// here: had the per-column budget been made a hard filter -- the proposal doc
+// 44 corrects -- 2.18 million routable designs would have been deleted from the
+// space, and the silent packet-multiplexing they exhibit would have been
+// deleted with them.
+// CHECK: of the legal points, 2181680 are priced, not refused
+//
+// THE SLICES THAT ANSWER "DOES ENUMERATION BEAT SEARCH". Doc 38's SEVEN is a
+// two-axis slice of iron's space, not its size, so the honest comparison is
+// against the same slice of ours -- the spatial-replication pair. 21 against
+// iron's 7: the same order, three times as many. The structural sub-space
+// (15,347 shapes) is what a builder and a placement have to exist for, and it
+// is three orders above the seven iron hand-authored, which is why copying
+// iron's hardcoded-table approach is not open to us.
+// CHECK: legal structures: 428, legal (structure, seam vector): 15347
+// CHECK: legal (gemm_herd_x, parallel_bands) pairs: 21
+// CHECK: legal (gemm_herd_x, norm_herd_x) pairs: 16
+//
+// The honesty clause, matched so it cannot be dropped: one axis in this space
+// is bounded by no artifact in the tree, and the census says which.
+// CHECK: axes no artifact bounds: ['parallel_bands']
+//
+// The verdict last, so a run whose controls printed but whose count went
+// vacuous still fails.
+// CHECK: PASS
