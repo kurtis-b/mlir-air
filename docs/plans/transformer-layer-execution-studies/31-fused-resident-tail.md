@@ -568,6 +568,55 @@ target and none should be added. The recipe's contribution is the assertions (co
 census live, count exact), and it says so in its own header — the gate that listed "run the
 script" and "run the lit" as steps 3.1 and 3.2 was counting one arm twice.
 
+### `[2026-08-12]` Wall 7 is LOCATED — a memtile staging buffer with N writers and no order
+
+Full account in **[52](52-wall-7-race.md)**; the shape of it, and what it changes here.
+
+R1's down feed stages every GeLU column's H chunk through **one** L2 buffer. At `herd_x > 1`
+those `ChannelGet`s are `herd_x` different sub-channels from `herd_x` different cores, so
+`air-to-aie` emits **one S2MM channel per GeLU core onto one single-slot memtile buffer, all on
+the same counting semaphore with identical acquire/release counts**. A counting semaphore has no
+participant identity, so nothing orders the writers and nothing binds a token to a reader. The
+device delivers an **arbitrary interleaving** of the columns' chunk streams — every chunk whole,
+matched to the wrong `w_down` K step — and deadlocks when a reader takes a peer's token. At
+`herd_x == 1` there is one writer and one reader and both hazards are vacuous: that, and not the
+residency composition, is why the whole `herd_x=1` ladder is clean.
+
+**Timeout and wrong answer are ONE defect**, settled by a single-variable A/B (devq **309**, 120
+legs, 5 fresh processes per arm per rung). One H staging buffer **per column** takes five
+`herd_x=2` and two `herd_x=4` rungs from **5/35 to 35/35 PASS**, and both symptoms go together.
+The three `herd_x=1` controls come back **byte-identical across the arms**, so the change cannot
+be what carries them; and `herd_x >= 2` now reproduces `herd_x = 1` **to the bit** at matching
+shapes (`B2 == B1`, `C2 == C1`, `D2 == D4 == D1`). The herd width has become invisible in the
+answer.
+
+Two things it does **not** fix, and both matter here:
+
+- **The gate shape does not compile with per-column staging.** At `768×3072, herd_x 4` the extra
+  buffers push the down-feed memtile over `'aie.memtile_dma' op has more than 48 blocks`; the
+  boundary is between `128×128` (compiles) and `256×256` (does not) at `herd_x 4`. So this
+  unblocks the measured ladder, not the gate. The version that scales is the **compiler** one —
+  order the writers on the *single* buffer with the chain lock that already exists, which costs
+  signal locks rather than BDs. `air::isChainLockCandidate` explicitly excludes the MIMO case
+  R1 presents while its own header calls the legacy template one "that allows concurrent stage
+  firing and races on the memtile DMA", and that exclusion is also the mechanical reason
+  `use_lock_race_condition_fix_v2` measured byte-identical five times: it was never reached.
+  **So `shared_h_staging` stays `True` by default and nothing shipped moves** — flipping it
+  turns `ffn_resident_structure.py` red at the gate shape, which was measured rather than
+  assumed. Both arms are explicit flags on `probe_r1_rung.py`.
+- **`96×96` at `tile_k 16` hangs at `herd_x = 1` as well** (5/5 TIMEOUT, both arms, byte-identical
+  output). It is untouched by wall 7 and is a **new open item**; the `21/21` ladder and doc 49's
+  out-of-sample `96×96` were all `tile_k 32`. Its `herd_x=2` twin is therefore confounded and must
+  not be read as a wall-7 datum.
+
+**A retraction this section owns.** The builder's comment claimed the shared `l2_h` buffer was
+what serialized the per-column loops ("do not 'parallelize' it"). That AIR-level dependency does
+not survive lowering, and relying on it was the defect. It is retracted in place. The
+[emulation arm's model (M2)](#) — "values land in the order the shim issued them" — is falsified
+in the same stroke, which is why that arm certified R1 element-exact at all 11 ladder shapes while
+hardware disagreed; it now refuses a module whose staging is shared at `herd_x > 1`, with the
+shared form rebuilt as its matched control.
+
 ## Gate
 
 The transformer-layer suite, allowlist `^programming_examples/transformer_layer/`, plus a

@@ -71,6 +71,20 @@
 // CHECK: negative control: c-major w_down refill (pre-E1 c unroll) -> max err {{[0-9.]+}}e+0{{[0-9]}}
 // CHECK: negative control: hidden 4-D retile walked with its two inner strides swapped -> max err {{[0-9.]+}}e+0{{[0-9]}}
 //
+// `[2026-08-12]` 8 -> 10, queue item 21 (wall 7). Clause 9 asserts the down
+// feed's H staging is one L2 allocation PER GeLU COLUMN, and control 3 is its
+// matched refusal. This is not style: model (M2) at the head of the test module
+// assumes an L2 staging buffer's values "land in the order the shim issued
+// them", and with ONE shared allocation at herd_x > 1 that assumption is FALSE
+// on hardware -- air-to-aie emits one S2MM channel per GeLU core onto one
+// single-slot memtile buffer, all on the same counting semaphore with the same
+// acquire/release counts, so the write order is an arbitration outcome. This
+// arm interprets AIR and therefore cannot see that; without clause 9 it
+// certifies element-exact a module the device answers wrong. The control is
+// what makes the clause able to fail: it rebuilds the shared form
+// (`shared_h_staging=True`) and requires it REFUSED.
+// CHECK: negative control: shared H staging (wall 7's form) -> REFUSED
+//
 // The count last, matched exactly so a clause that stops being defined
 // fails here rather than passing quietly.
-// CHECK: ffn_resident emulation tests: 8/8 passed
+// CHECK: ffn_resident emulation tests: 10/10 passed

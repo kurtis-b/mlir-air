@@ -800,6 +800,65 @@ def _h_put_patterns(module):
     return out
 
 
+def _g_get_staging_buffers(module):
+    """The set of distinct L2 allocations the ``ffn_res_g`` gets land in.
+
+    The sub-channel index is an SSA operand, not an attribute, so the identity
+    that matters is read off the DESTINATION memref: ``air.channel.get`` takes
+    its indices first (index-typed) and then the destination, so the first
+    memref operand is the staging buffer. Two gets naming one allocation
+    collapse to one entry -- which is exactly the shape under test.
+    """
+    out = set()
+    n_gets = 0
+
+    def walk(ops):
+        nonlocal n_gets
+        for op in ops:
+            if op.name == "air.channel.get" and _chan_name(op).endswith("_g"):
+                n_gets += 1
+                for v in op.operands:
+                    if _is_memref(v):
+                        out.add(v.get_name())
+                        break
+            for region in op.regions:
+                for block in region.blocks:
+                    walk([c.operation for c in block.operations])
+
+    walk(_body(module.operation))
+    return out, n_gets
+
+
+def _staging_is_per_column(module, herd_x):
+    """True iff every GeLU column's chunk lands in its OWN L2 allocation.
+
+    THIS IS WALL 7 (queue item 21), and it is a precondition of model (M2)
+    above, not a style preference. (M2) assumes an L2 staging buffer's values
+    "land in the order the shim issued them". When herd_x > 1 and every column
+    shares ONE allocation, that assumption is FALSE on hardware: the gets are
+    herd_x different sub-channels from herd_x different GeLU cores, so
+    air-to-aie emits one S2MM channel PER CORE onto one single-slot memtile
+    buffer, all gated by the same counting semaphore with the same
+    acquire/release counts. A counting semaphore has no participant identity,
+    so the write ORDER is an arbitration outcome, and the device delivers an
+    arbitrary interleaving of the columns' chunk streams -- measured on NPU2 as
+    wrong answers whose pairing permutation is exactly such an interleaving,
+    plus hangs, at every herd_x>=2 rung.
+
+    So this arm must NOT certify a module whose staging is shared: under (M2)
+    it would compute the right answer for a design the hardware rejects.
+    """
+    bufs, n_gets = _g_get_staging_buffers(module)
+    if n_gets == 0:
+        raise ControlNotApplicable(
+            "no ffn_res_g gets found -- the clause read nothing, so it tested "
+            "nothing (the channel name or the loop shape moved)"
+        )
+    if herd_x <= 1:
+        return True  # one column: nothing to order against
+    return len(bufs) == herd_x
+
+
 def main():
     rng = np.random.default_rng(0)
     hidden = rng.standard_normal((SEQ, EMB))
@@ -948,6 +1007,41 @@ def main():
             detail = str(exc).split("\n")[0]
         print(f"negative control: {tag} -> {detail}")
         _check(clause, rejected)
+
+    # 9-10. WALL 7 (queue item 21). Model (M2) at the head of this file assumes
+    # an L2 staging buffer's values "land in the order the shim issued them".
+    # At herd_x > 1 with ONE shared H staging allocation that assumption is
+    # FALSE on hardware: air-to-aie emits one S2MM channel per GeLU core onto
+    # one single-slot memtile buffer, all on the same counting semaphore with
+    # identical acquire/release counts, so the write order is an arbitration
+    # outcome and the device delivers an arbitrary interleaving (doc 52).
+    #
+    # This arm interprets AIR and CANNOT see that. What it can do -- and what
+    # these two clauses pin -- is tell the two module shapes apart, so the
+    # discriminator cannot rot while the compiler-side fix is outstanding.
+    #
+    # Note what is NOT asserted: that the SHIPPED default is the fixed form. It
+    # is not. Per-column staging does not compile at the gate shape (over 48
+    # memtile_dma blocks), so `shared_h_staging` stays True by default and
+    # `ffn_resident_structure.py` keeps gating the real thing. Asserting the
+    # default here would either be false or would force a default that trades
+    # the hang for a compile refusal.
+    per_col = build_ffn_resident_module(shared_h_staging=False)
+    _check(
+        "wall 7: the per-column build has one L2 allocation per GeLU column",
+        _staging_is_per_column(per_col, HERD_X),
+    )
+
+    shared = build_ffn_resident_module(shared_h_staging=True)
+    refused = not _staging_is_per_column(shared, HERD_X)
+    print(
+        "negative control: shared H staging (wall 7's form) -> "
+        + ("REFUSED" if refused else "ACCEPTED -- clause 9 cannot fail")
+    )
+    _check(
+        "NEGATIVE CONTROL 3: the shared H staging is REJECTED",
+        refused,
+    )
 
     total = _passed + _failed
     print(f"ffn_resident emulation tests: {_passed}/{total} passed")
