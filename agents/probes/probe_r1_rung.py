@@ -225,6 +225,31 @@ def _parse_ctx_health(text):
     return out
 
 
+def dump_npz(path, inputs, expected, y, geom, args):
+    """Persist EXACTLY the bytes this dispatch used, for off-line analysis.
+
+    Queue item 23 needs two things a printed summary cannot give: a byte-level
+    equality test across repeated dispatches (``5/5 identical`` is a claim
+    about bytes, not about a correlation that rounds the same), and the raw
+    ``y`` beside the operands that produced it, so a host-side model of the
+    dataflow can be scored against the device element by element.  The
+    operands are saved rather than re-derived from ``--seed`` so the analysis
+    can never drift from the run.
+    """
+    from ml_dtypes import bfloat16
+
+    payload = {
+        "y_raw": np.asarray(y).view(np.uint16) if y is not None else np.zeros(0, np.uint16),
+        "expected": np.asarray(expected, dtype=np.float64),
+        "geom": np.array(json.dumps(geom)),
+        "argv": np.array(json.dumps(sys.argv[1:])),
+    }
+    for i, a in enumerate(inputs):
+        a = np.asarray(a)
+        payload[f"in{i}"] = a.view(np.uint16) if a.dtype == bfloat16 else a
+    np.savez(path, **payload)
+
+
 def dispatch(backend, artifact, inputs, expected, geom, args):
     """Load, fill BOs (y with a sentinel), run, and read back WHATEVER happened."""
     _fail_closed("dispatch")
@@ -362,6 +387,13 @@ def main():
         "recompiling; refuses if the path does not exist",
     )
     p.add_argument("--json-out", default=None)
+    p.add_argument(
+        "--dump-npz",
+        default=None,
+        help="write the raw device y AND the operands that produced it to this "
+        ".npz (queue item 23: determinism is a claim about bytes, and the "
+        "element-wise comparison needs the operands beside the output)",
+    )
     args = p.parse_args()
     MODE = args.mode
 
@@ -449,6 +481,10 @@ def main():
             flush=True,
         )
     print(f"[wait] {res['wait_s']}s, dispatch verdict {res['verdict']}", flush=True)
+
+    if args.dump_npz:
+        dump_npz(args.dump_npz, inputs, expected, y, geom, args)
+        print(f"[dump] {args.dump_npz}", flush=True)
 
     if y is not None:
         ok, stats = compare(y, expected, args)
