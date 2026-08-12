@@ -13,6 +13,15 @@
 # inner loop's ping-pong viable without exceeding the 2-S2MM-per-tile cap.
 # The kernel slices Q, S, Z back out via pointer arithmetic — offsets are
 # 32-byte aligned for typical M_TILE/K_CHUNK/GS choices.
+#
+# SYMMETRIC mode (`symmetric=True`) drops the Z plane from both the pack and
+# the module and dispatches `matvec_int4_bf16_packed_sym`, whose zero point is
+# the kernel-side immediate Q4_0_ZP. It exists for llama.cpp's q4_0, whose Z is
+# the constant 8 by construction; shipping that plane is pure redundant DRAM
+# traffic (K*M/32 bytes per weight, 0.25 bits/weight). The default is False and
+# every existing caller — including `llama32_1b_int4/awq_repacker.py`, which is
+# on the shipped, gated AWQ decode path — keeps the asymmetric layout
+# unchanged, byte for byte.
 
 import argparse
 
@@ -54,17 +63,26 @@ from air.backend.xrt_runner import XRTRunner
 KERNEL_OBJ_NAME = "mv_int4_bf16.o"
 
 
-def pack_inputs(A_q, A_s, A_z, M, K, GS, M_TILE, K_CHUNK, N_CORES, M_PER_LAUNCH):
+def pack_inputs(
+    A_q, A_s, A_z, M, K, GS, M_TILE, K_CHUNK, N_CORES, M_PER_LAUNCH, symmetric=False
+):
     """Pack Q+S+Z per kernel-call tile into a single contiguous L3 buffer.
 
     Output: uint8 array shaped [total_tiles, TILE_BYTES] where total_tiles =
     N_LAUNCHES * N_CORES * (M_PER_LAUNCH / N_CORES / M_TILE) * (K / K_CHUNK).
+
+    `symmetric=True` emits Q+S only; `A_z` is then unused and may be None.
     """
     n_gpc = K_CHUNK // GS
     q_bytes = M_TILE * (K_CHUNK // 2)
     s_bytes = n_gpc * M_TILE * 2
-    z_bytes = n_gpc * M_TILE
+    z_bytes = 0 if symmetric else n_gpc * M_TILE
     tile_bytes = q_bytes + s_bytes + z_bytes
+    if symmetric and A_z is not None:
+        raise ValueError(
+            "symmetric pack takes no Z plane; pass A_z=None so a caller cannot "
+            "believe a zero point was shipped when it was not"
+        )
 
     M_per_core_per_launch = M_PER_LAUNCH // N_CORES
     M_div = M_per_core_per_launch // M_TILE
@@ -88,7 +106,6 @@ def pack_inputs(A_q, A_s, A_z, M, K, GS, M_TILE, K_CHUNK, N_CORES, M_PER_LAUNCH)
                         q_col : q_col + (K_CHUNK // 2),
                     ]
                     s_tile = A_s[g_off : g_off + n_gpc, row_off : row_off + M_TILE]
-                    z_tile = A_z[g_off : g_off + n_gpc, row_off : row_off + M_TILE]
                     p = packed[tile_idx]
                     p[0:q_bytes] = (
                         np.ascontiguousarray(q_tile).view(np.uint8).reshape(-1)
@@ -96,14 +113,27 @@ def pack_inputs(A_q, A_s, A_z, M, K, GS, M_TILE, K_CHUNK, N_CORES, M_PER_LAUNCH)
                     p[q_bytes : q_bytes + s_bytes] = (
                         np.ascontiguousarray(s_tile).view(np.uint8).reshape(-1)
                     )
-                    p[q_bytes + s_bytes :] = (
-                        np.ascontiguousarray(z_tile).view(np.uint8).reshape(-1)
-                    )
+                    if not symmetric:
+                        z_tile = A_z[
+                            g_off : g_off + n_gpc, row_off : row_off + M_TILE
+                        ]
+                        p[q_bytes + s_bytes :] = (
+                            np.ascontiguousarray(z_tile).view(np.uint8).reshape(-1)
+                        )
                     tile_idx += 1
     return packed
 
 
-def build_module(M, K, GS=128, M_TILE=8, K_CHUNK=2048, N_CORES=8, M_PER_LAUNCH=None):
+def build_module(
+    M,
+    K,
+    GS=128,
+    M_TILE=8,
+    K_CHUNK=2048,
+    N_CORES=8,
+    M_PER_LAUNCH=None,
+    symmetric=False,
+):
     if M_PER_LAUNCH is None:
         M_PER_LAUNCH = M  # 1 launch by default
 
@@ -121,11 +151,19 @@ def build_module(M, K, GS=128, M_TILE=8, K_CHUNK=2048, N_CORES=8, M_PER_LAUNCH=N
 
     q_bytes = M_TILE * (K_CHUNK // 2)
     s_bytes = n_groups_per_chunk * M_TILE * 2
-    z_bytes = n_groups_per_chunk * M_TILE
+    z_bytes = 0 if symmetric else n_groups_per_chunk * M_TILE
     tile_bytes = q_bytes + s_bytes + z_bytes
 
+    # S starts at q_bytes in both layouts. Z, when present, starts after S, so
+    # the asymmetric layout carries one extra alignment obligation that the
+    # symmetric layout simply does not have.
     assert q_bytes % 32 == 0
-    assert (q_bytes + s_bytes) % 32 == 0
+    if not symmetric:
+        assert (q_bytes + s_bytes) % 32 == 0
+
+    kernel_entry = (
+        "matvec_int4_bf16_packed_sym" if symmetric else "matvec_int4_bf16_packed"
+    )
 
     @module_builder
     def build():
@@ -154,7 +192,7 @@ def build_module(M, K, GS=128, M_TILE=8, K_CHUNK=2048, N_CORES=8, M_PER_LAUNCH=N
         zero_func.attributes["llvm.emit_c_interface"] = UnitAttr.get()
 
         matvec_func = FuncOp(
-            "matvec_int4_bf16_packed",
+            kernel_entry,
             ([packed_l1, B_l1, D_l1], []),
             visibility="private",
         )

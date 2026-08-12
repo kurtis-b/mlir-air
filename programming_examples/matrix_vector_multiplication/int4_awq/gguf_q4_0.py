@@ -399,6 +399,45 @@ def q4_0_traffic_bytes(K, M, gs=32, with_zeros=True):
     }
 
 
+def checkpoint_traffic(g, gs=QK4_0, roles=None):
+    """Sum the packed-BO traffic over every pure-q4_0 2-D tensor in a GGUF.
+
+    Measured off the checkpoint's own tensor_info records, not off a config:
+    a `Q4_0` file type is mixed in practice (llama.cpp promotes some tensors to
+    Q4_1/Q6_K), and the promoted ones cannot go through this kernel at all.
+    Both the pure-q4_0 subset and the all-q4_0 idealization are returned, since
+    the study's DRAM axis wants the second and the hardware only admits the
+    first.
+    """
+    per_type = {}
+    q4 = []
+    for name, t in g.tensors.items():
+        if len(t.ne) != 2:
+            continue
+        nelem = int(t.ne[0]) * int(t.ne[1])
+        per_type.setdefault(t.type_name, [0, 0])
+        per_type[t.type_name][0] += 1
+        per_type[t.type_name][1] += nelem
+        if roles is not None and not any(r in name for r in roles):
+            continue
+        if t.type_name == "Q4_0":
+            q4.append((name, int(t.ne[0]), int(t.ne[1]), nelem))
+
+    n_q4 = sum(r[3] for r in q4)
+    n_all = sum(v[1] for v in per_type.values())
+    z_q4 = n_q4 // gs
+    return {
+        "per_type": per_type,
+        "n_tensors_q4_0": len(q4),
+        "n_weights_q4_0": n_q4,
+        "n_weights_all_2d": n_all,
+        "asym_bytes": n_q4 // 2 + 2 * (n_q4 // gs) + z_q4,
+        "sym_bytes": n_q4 // 2 + 2 * (n_q4 // gs),
+        "z_bytes": z_q4,
+        "tensors": q4,
+    }
+
+
 def scale_rounding_error(d_fp16):
     """Relative error introduced by rounding q4_0's fp16 `d` to bf16.
 
@@ -550,6 +589,73 @@ def self_test(K=256, M=64, seed=42, verbose=True):
     if verbose:
         print("  [g] un-permute moves Q rows and S/Z together: PASS")
 
+    # (h) the SYMMETRIC pack is the asymmetric pack with the Z plane removed
+    #     and nothing else moved, and the byte delta is exactly K*M/gs.
+    from matvec_int4_packed import pack_inputs  # type: ignore
+
+    M_TILE, K_CHUNK, N_CORES = 8, K, 8
+    n_gpc = K_CHUNK // QK4_0
+    q_bytes = M_TILE * (K_CHUNK // 2)
+    s_bytes = n_gpc * M_TILE * 2
+    p_asym = pack_inputs(
+        A_q, A_s, A_z, M, K, QK4_0, M_TILE, K_CHUNK, N_CORES, M
+    )
+    p_sym = pack_inputs(
+        A_q, A_s, None, M, K, QK4_0, M_TILE, K_CHUNK, N_CORES, M, symmetric=True
+    )
+    if not np.array_equal(p_sym, p_asym[:, : q_bytes + s_bytes]):
+        raise AssertionError("symmetric pack is not the asymmetric Q+S prefix")
+    if not np.all(p_asym[:, q_bytes + s_bytes :] == 8):
+        raise AssertionError("the region the symmetric pack drops is not all 8s")
+    delta = p_asym.nbytes - p_sym.nbytes
+    if delta != K * M // QK4_0:
+        raise AssertionError(
+            "symmetric saving %d B != K*M/gs = %d B" % (delta, K * M // QK4_0)
+        )
+    if verbose:
+        print(
+            "  [h] symmetric pack == asymmetric minus the all-8s Z plane: PASS "
+            "(%d -> %d B, saved %d = K*M/%d)"
+            % (p_asym.nbytes, p_sym.nbytes, delta, QK4_0)
+        )
+
+    # (i) negative control for (h): the symmetric pack must REFUSE a Z plane.
+    #     Without this, a caller could believe a zero point shipped when the
+    #     kernel is using an immediate.
+    try:
+        pack_inputs(
+            A_q, A_s, A_z, M, K, QK4_0, M_TILE, K_CHUNK, N_CORES, M, symmetric=True
+        )
+        raise AssertionError(
+            "NEGATIVE CONTROL FAILED: the symmetric pack accepted a Z plane"
+        )
+    except ValueError:
+        pass
+    if verbose:
+        print("  [i] negative control (symmetric pack + Z plane): correctly REFUSED")
+
+    # (j) the traffic model must agree with the packed BO it describes, both
+    #     ways, and must reproduce llama.cpp's canonical bits/weight.
+    t_a = q4_0_traffic_bytes(K, M, gs=QK4_0, with_zeros=True)
+    t_s = q4_0_traffic_bytes(K, M, gs=QK4_0, with_zeros=False)
+    if t_a["total_bytes"] != p_asym.nbytes or t_s["total_bytes"] != p_sym.nbytes:
+        raise AssertionError(
+            "traffic model %d/%d B disagrees with the packed BOs %d/%d B"
+            % (t_a["total_bytes"], t_s["total_bytes"], p_asym.nbytes, p_sym.nbytes)
+        )
+    if abs(t_a["bits_per_weight"] - 4.75) > 1e-9 or abs(
+        t_s["bits_per_weight"] - 4.50
+    ) > 1e-9:
+        raise AssertionError(
+            "bits/weight %.6f / %.6f, expected 4.750 / 4.500"
+            % (t_a["bits_per_weight"], t_s["bits_per_weight"])
+        )
+    if verbose:
+        print(
+            "  [j] traffic model matches the packed BOs, 4.750 -> 4.500 "
+            "bits/weight: PASS"
+        )
+
 
 # ---------------------------------------------------------------------------
 
@@ -561,6 +667,11 @@ def _main():
     ap.add_argument("--gguf", type=str, default=None, help="checkpoint to inspect")
     ap.add_argument("--list", action="store_true", help="list tensors")
     ap.add_argument("--meta", action="store_true", help="dump metadata KVs")
+    ap.add_argument(
+        "--traffic",
+        action="store_true",
+        help="packed-BO bytes over the whole checkpoint, both variants",
+    )
     ap.add_argument("--self-test", action="store_true", dest="self_test_")
     ap.add_argument("--k", type=int, default=256)
     ap.add_argument("--m", type=int, default=64)
@@ -587,6 +698,53 @@ def _main():
         print("  type histogram: %s" % dict(c))
         for name, t in g.tensors.items():
             print("  %-34s ne=%-16s %-6s %10d B" % (name, t.ne, t.type_name, t.nbytes))
+    if args.traffic:
+        MiB = 1024.0 * 1024.0
+        LIN = ("attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up",
+               "ffn_down")
+        tr = checkpoint_traffic(g, roles=LIN)
+        print()
+        print("packed-BO traffic for ONE full pass over the linear weights")
+        print("  2-D tensor types in this checkpoint:")
+        for tn, (cnt, ne) in sorted(tr["per_type"].items()):
+            print("    %-6s %4d tensors %15d weights" % (tn, cnt, ne))
+        print("  pure-q4_0 linears: %d tensors, %d weights"
+              % (tr["n_tensors_q4_0"], tr["n_weights_q4_0"]))
+        print("  asymmetric (Z present): %d B = %.2f MiB  (%.3f bits/weight)"
+              % (tr["asym_bytes"], tr["asym_bytes"] / MiB,
+                 tr["asym_bytes"] * 8.0 / tr["n_weights_q4_0"]))
+        print("  symmetric  (no Z)     : %d B = %.2f MiB  (%.3f bits/weight)"
+              % (tr["sym_bytes"], tr["sym_bytes"] / MiB,
+                 tr["sym_bytes"] * 8.0 / tr["n_weights_q4_0"]))
+        print("  Z plane                : %d B = %.2f MiB  (%.3f bits/weight)"
+              % (tr["z_bytes"], tr["z_bytes"] / MiB,
+                 tr["z_bytes"] * 8.0 / tr["n_weights_q4_0"]))
+        # And the idealization the study quotes: every linear q4_0, including
+        # the ones llama.cpp promoted. Reported separately, never merged.
+        nl = g.metadata.get("llama.block_count")
+        emb = g.metadata.get("llama.embedding_length")
+        ff = g.metadata.get("llama.feed_forward_length")
+        nh = g.metadata.get("llama.attention.head_count")
+        nkv = g.metadata.get("llama.attention.head_count_kv")
+        if None not in (nl, emb, ff, nh, nkv):
+            hd = emb // nh
+            per_layer = (emb * emb                 # q
+                         + emb * (nkv * hd)        # k
+                         + emb * (nkv * hd)        # v
+                         + emb * emb               # o
+                         + 3 * emb * ff)           # gate, up, down
+            tot = per_layer * nl
+            print("  --- idealization: all %d x 7 linears q4_0 ---" % nl)
+            print("  weights: %d (%d per layer x %d layers)" % (tot, per_layer, nl))
+            print("  asymmetric %d B = %.2f MiB (%.3f b/w) | symmetric %d B = "
+                  "%.2f MiB (%.3f b/w) | Z %d B = %.2f MiB"
+                  % (tot // 2 + 2 * (tot // QK4_0) + tot // QK4_0,
+                     (tot // 2 + 2 * (tot // QK4_0) + tot // QK4_0) / MiB,
+                     (tot // 2 + 2 * (tot // QK4_0) + tot // QK4_0) * 8.0 / tot,
+                     tot // 2 + 2 * (tot // QK4_0),
+                     (tot // 2 + 2 * (tot // QK4_0)) / MiB,
+                     (tot // 2 + 2 * (tot // QK4_0)) * 8.0 / tot,
+                     tot // QK4_0, (tot // QK4_0) / MiB))
     return 0
 
 

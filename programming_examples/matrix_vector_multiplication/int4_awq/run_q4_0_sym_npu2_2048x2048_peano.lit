@@ -1,0 +1,37 @@
+// (c) Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_q4_0_sym_npu2_2048x2048_peano
+// RUN: cd test_q4_0_sym_npu2_2048x2048_peano
+// RUN: make -f %S/Makefile clean
+//
+// llama.cpp q4_0 GEMV through the SYMMETRIC kernel variant
+// (`matvec_int4_bf16_packed_sym`): the zero point is the immediate Q4_0_ZP=8,
+// so the packed BO carries Q and S only. Same arithmetic as the asymmetric
+// run in run_q4_0_npu2_2048x2048_peano.lit, K*M/32 fewer bytes on the wire --
+// 4.750 -> 4.500 bits/weight, llama.cpp's own figure.
+//
+// Synthetic q4_0 payload, so this needs no checkpoint.
+//
+// The host bridge's self-test covers the symmetric pack and refuses a Z plane;
+// two of its items are negative controls asserted to be non-vacuous.
+// RUN: make -f %S/Makefile selftest_q4_0 | FileCheck %s --check-prefix=SELFTEST
+// SELFTEST: symmetric pack == asymmetric minus the all-8s Z plane: PASS
+// SELFTEST: negative control (symmetric pack + Z plane): correctly REFUSED
+// SELFTEST: All self-tests PASSED.
+//
+// RUN: make -f %S/Makefile run_q4_0_sym M=2048 K=2048 OUTPUT_FORMAT=elf PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+// CHECK: variant=SYMMETRIC (no Z plane)
+// CHECK: packed bytes THIS RUN: Q=2097152 S=262144 Z=0 total=2359296 (4.500 bits/weight)
+// CHECK: reference cross-check: fast_reference_sym == cpu_reference
+// CHECK: PASS!
+//
+// The PASS above is only worth its ink if a wrong immediate fails. This
+// rebuilds the kernel with -DQ4_0_ZP=7 and requires the device run NOT to
+// match; the inversion is inside matvec_q4_0.py (`--expect-mismatch`), so a
+// crash or a bad argument fails the test instead of passing it.
+// RUN: make -f %S/Makefile run_q4_0_sym_wrongzp M=2048 K=2048 OUTPUT_FORMAT=elf PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s --check-prefix=NEGZP
+// NEGZP: NEGATIVE CONTROL (external: kernel built with -DQ4_0_ZP=7) active
+// NEGZP: NEGATIVE CONTROL 'kernel built with -DQ4_0_ZP=7' failed as required.
