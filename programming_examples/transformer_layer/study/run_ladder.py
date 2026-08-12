@@ -83,6 +83,22 @@ FOOTGUNS
       if any rung failed, so a gate still sees it.
     - Rows are rewritten after **every** rung, so a killed run leaves the rungs
       it finished rather than nothing.
+
+A RUNG THAT CANNOT APPLY IS `skipped`, AND THAT IS A DIFFERENT THING
+    ``walk(..., skip_reason=fn)`` takes a callable ``fn(mode, seq) -> str|None``.
+    Where it returns text the rung is NOT run: a row is written with
+    ``run_status="skipped"`` carrying the reason, and no child process starts.
+
+    ``schema.RUN_STATUSES`` has held ``"skipped"`` since v1 and nothing had ever
+    emitted it, so a structurally inapplicable rung -- ``fused`` outside its
+    256..1024 packing bound -- was recorded as ``failed``, identical to a mode
+    that regressed. The one-passed-row gate survives that; a COUNT-based gate
+    cannot, which is why this landed with ``manifest``'s row counts rather than
+    before them. The applicability rule itself is NOT here: it belongs to the
+    profile (``study/profiles.py``), because it is a claim about what the modes
+    support and this module only walks what it is given.
+
+    Default ``None`` means no skips, which is what every existing caller gets.
 """
 
 from __future__ import annotations
@@ -175,6 +191,24 @@ def _rung(
     return row
 
 
+def _skipped_row(mode: str, seq: int, study_id: str, reason: str) -> dict:
+    """A rung that cannot apply. Written, never run. See the docstring section.
+
+    The reason rides ``failure_message`` because a new column is a schema
+    version bump; the ``skipped:`` prefix keeps it readable wherever that field
+    surfaces, including the smoke gate's verbatim quote.
+    """
+    row = schema.empty_row("results")
+    row["execution_mode"] = schema.EXECUTION_MODE_CSV.get(mode, mode)
+    row["study_id"] = study_id
+    row["seq_len"] = seq
+    row["study_case_id"] = f"{seq}x?_encoder_bert"
+    row["study_case_label"] = f"{mode} seq {seq}"
+    row["run_status"] = "skipped"
+    row["failure_message"] = f"skipped: {reason}"
+    return row
+
+
 def walk(
     modes: list[str],
     seqs: list[int],
@@ -183,8 +217,13 @@ def walk(
     warmup: int,
     samples: int,
     runs_per_sample: int,
+    skip_reason=None,
 ) -> list[dict]:
-    """Run every (mode, seq) rung, writing each mode's CSV as it fills."""
+    """Run every (mode, seq) rung, writing each mode's CSV as it fills.
+
+    ``skip_reason(mode, seq)`` returning text records the rung as ``skipped``
+    and starts no child process.
+    """
     every = []
     scratch = tempfile.mkdtemp(prefix="ladder-rungs-")
     for mode in modes:
@@ -192,7 +231,13 @@ def walk(
         out = os.path.join(out_dir, f"{mode}.csv")
         for seq in seqs:
             t0 = time.perf_counter()
-            row = _rung(mode, seq, study_id, warmup, samples, runs_per_sample, scratch)
+            reason = skip_reason(mode, seq) if skip_reason is not None else None
+            if reason:
+                row = _skipped_row(mode, seq, study_id, reason)
+            else:
+                row = _rung(
+                    mode, seq, study_id, warmup, samples, runs_per_sample, scratch
+                )
             rows.append(row)
             every.append(row)
             # Rewrite the whole mode after each rung: cheap, and a killed run
@@ -207,6 +252,12 @@ def walk(
                     f"  herd {_i(row['herd_launches']):4d}"
                     f"  sync {_i(row['sync_boundaries']):4d}"
                     f"  ({wall:.0f}s wall)",
+                    flush=True,
+                )
+            elif row["run_status"] == "skipped":
+                print(
+                    f"[ladder] {mode:9s} seq {seq:5d}  SKIPPED  "
+                    f"{row['failure_message']}",
                     flush=True,
                 )
             else:
@@ -245,11 +296,17 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     passed = [r for r in rows if r["run_status"] == "passed"]
-    print(f"[ladder] {len(passed)}/{len(rows)} rungs passed")
+    skipped = [r for r in rows if r["run_status"] == "skipped"]
+    print(
+        f"[ladder] {len(passed)}/{len(rows)} rungs passed"
+        + (f", {len(skipped)} skipped" if skipped else "")
+    )
     for r in rows:
-        if r["run_status"] != "passed":
+        if r["run_status"] == "failed":
             print(f"[ladder]   FAILED {r['study_case_label']}: {r['failure_message']}")
-    return 0 if len(passed) == len(rows) else 1
+    # A skipped rung is not a failure: it is a rung the mode does not support,
+    # and reporting it as one is the confusion `skipped` exists to remove.
+    return 0 if len(passed) + len(skipped) == len(rows) else 1
 
 
 if __name__ == "__main__":

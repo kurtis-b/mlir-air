@@ -162,17 +162,68 @@ add_lit_testsuite(check-programming-examples-llms-profile
 )
 set_target_properties(check-programming-examples-llms-profile PROPERTIES FOLDER "Tests")
 
-# Transformer-layer device-kernel suite: Peano object builds plus a symbol
+# Transformer-layer execution-study suite: THE WHOLE SUITE, AND IT NEEDS AN NPU.
+#
+# `[2026-08-12]` This comment used to read "Peano object builds plus a symbol
 # check, no NPU dispatch and no HF download. Safe as a PR gate on any runner
-# that has Peano, which is why it is a target of its own rather than being
-# folded into the llms suites (those need an NPU and, for verify, a token).
-# Matched by path so the .lit filename does not have to encode anything.
+# that has Peano". That was true through Phases A and B and has been false since
+# Phase C1: the suite now carries the runlist gate and every operator gate.
+# Measured on the discovered test list, not inferred: 32 tests, of which
+# 22 carry `REQUIRES: ryzen_ai_npu2`, 1 is Peano-only and 9 are host-only.
+#
+# Wiring THIS target into PR CI on the strength of the old comment would produce
+# the worst available outcome: on a runner with no NPU2 all 22 report
+# UNSUPPORTED and lit still exits 0 -- a hardware gate that runs zero hardware
+# tests and reports success. Use it as the local regression gate (which is what
+# agents/scripts/port-loop drives it as, with lib-guard.sh asserting that Passed
+# reaches the tracked .lit count and that Passed+Excluded are the only nonzero
+# categories); use the -host target below for CI.
+#
+# Enrolment is path-based, so a new .lit anywhere under the example joins this
+# suite with no CMake change.
+#
+# Not `-j1`: the suite has been run at 24 workers and passed (30/30 in 519.7 s).
+# But doc 30 records run_npu2_runlist_gate.lit's latency clause going
+# intermittent under exactly that contention, so if this target is ever used as
+# a measurement-adjacent gate rather than a correctness one, run it -j1.
 add_lit_testsuite(check-programming-examples-transformer-layer
-  "Running transformer-layer device kernel compile tests"
+  "Running the transformer-layer execution-study suite (NEEDS AN NPU: 22 of 32)"
   ${CMAKE_CURRENT_BINARY_DIR}
   DEPENDS ${TEST_DEPENDS}
   ARGS ${AIR_TEST_LIT_ARGS} --filter "transformer_layer/"
 )
 set_target_properties(check-programming-examples-transformer-layer PROPERTIES FOLDER "Tests")
+
+# Transformer-layer PR gate: the subset that dispatches nothing.
+#
+# 10 tests -- run_npu2_compile_peano (Peano objects plus a symbol check) and the
+# nine host-only ones: the study host suite, the seam/reference/block-cache/
+# blocked-attention/FFN-resident emulation checks, and the sweep's family,
+# writer and registry-resolution checks. No NPU, no XRT dispatch, no HF token,
+# no secrets.
+#
+# AN EXPLICIT ALLOWLIST, NOT A FILTER-OUT, AND THE DIRECTION IS THE POINT.
+# A negative filter would enrol every FUTURE .lit automatically, so a new
+# NPU-gated test would silently join the PR gate and report UNSUPPORTED while
+# the suite exits 0 -- the failure this file already carries a warning about.
+# An allowlist fails the other way: a new host-only test is simply not gated
+# until someone adds it here, which is visible and harmless. Add it here in the
+# same commit that adds the test.
+#
+# `run_npu2_registry_resolution` carries `npu2` in its name because that is the
+# TARGET ITS ROWS DESCRIBE -- kernel_registry is an NPU2-only registry. The
+# check itself resolves rows through the production builders and dispatches
+# nothing; its own header says adding a hardware requirement "would only stop
+# the regression from surfacing on a compile-only runner".
+#
+# `[.]lit$` rather than `\.lit$`: CMake eats a backslash before a
+# non-escapable character, so the anchor would silently become `.lit$`.
+add_lit_testsuite(check-programming-examples-transformer-layer-host
+  "Running transformer-layer PR-safe tests (10, no NPU dispatch)"
+  ${CMAKE_CURRENT_BINARY_DIR}
+  DEPENDS ${TEST_DEPENDS}
+  ARGS ${AIR_TEST_LIT_ARGS} --filter "transformer_layer/(run_npu2_compile_peano|run_block_cache_tests|run_blocked_attention_tests|run_ffn_resident_emulation_tests|run_reference_tests|run_seam_tests|run_study_host_tests|sweep/run_npu2_registry_resolution|sweep/run_sweep_families_tests|sweep/run_sweep_writer_tests)[.]lit$"
+)
+set_target_properties(check-programming-examples-transformer-layer-host PROPERTIES FOLDER "Tests")
 
 add_dependencies(check-all check-programming-examples)

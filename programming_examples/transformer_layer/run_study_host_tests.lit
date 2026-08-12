@@ -36,4 +36,4 @@
 // branches of the guard, each asserted as a difference against the same drift).
 //
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 265/265 passed in 17 modules
+// CHECK: study host tests: 299/299 passed in 19 modules
