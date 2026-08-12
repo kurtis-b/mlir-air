@@ -223,6 +223,33 @@ try:
 except Exception:
     print("Peano check failed.")
 
+# Test if this air-opt carries air-fuse-pipeline-launches (H8). Probed the way
+# Peano is, so a tree predating the pass reports the arm UNSUPPORTED -- visibly
+# not run -- instead of failing for a reason that has nothing to do with the
+# design under test.
+#
+# This does NOT weaken the pass's own coverage: the pass's existence and
+# behaviour are pinned UNCONDITIONALLY by
+# mlir/test/Transform/AIRFusePipelineLaunches/*.mlir in check-air-mlir. What
+# this feature guards is only the builder-level REPRODUCTION gate, which needs
+# a matching air-opt on PATH to say anything at all.
+try:
+    _air_opt = os.path.join(config.air_tools_dir, "air-opt")
+    _probe = subprocess.run(
+        [_air_opt, "--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    if b"air-fuse-pipeline-launches" in _probe.stdout:
+        config.available_features.add("air_fuse_pipeline_launches")
+        print("air-fuse-pipeline-launches found in " + _air_opt)
+    else:
+        print(
+            "air-fuse-pipeline-launches NOT in "
+            + _air_opt
+            + "; the H8 reproduction gate will report UNSUPPORTED"
+        )
+except Exception:
+    print("air-fuse-pipeline-launches probe failed.")
+
 # Test if Chess is available
 if not config.enable_chess_tests:
     print("Chess tests disabled.")

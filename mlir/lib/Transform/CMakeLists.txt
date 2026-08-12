@@ -16,6 +16,7 @@ if(AIR_ENABLE_AIE)
 endif()
 list(APPEND TRANSFORM_SOURCES
   AIRDmaToChannel.cpp
+  AIRFusePipelineLaunches.cpp
   AIRHerdAssignPass.cpp
   AIRHerdPlacementPass.cpp
   AIRHerdVectorize.cpp

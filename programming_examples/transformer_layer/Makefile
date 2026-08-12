@@ -33,6 +33,7 @@ SWEEP_ARGS ?=
         check-transpose check-elementwise-mul check-norm-tail \
         check-norm-tail-fault check-norm-tail-structure \
         check-ffn-accum check-ffn-accum-fault check-ffn-accum-structure \
+        check-pipeline-fusion \
         reference-tests block-cache-tests blocked-attention-tests \
         registry-resolution registry-sweep registry-write registry-plan \
         registry-writer-tests
@@ -118,6 +119,12 @@ help:
 	@echo "                      must route as three herds on core-to-core"
 	@echo "                      flows, take at most 2 shim-facing streams per"
 	@echo "                      column, and carry ZERO packet-typed channels."
+	@echo "  make check-pipeline-fusion"
+	@echo "                      H8: air-fuse-pipeline-launches given J7a's"
+	@echo "                      three stages as separate attributed launches"
+	@echo "                      must reproduce the hand-written one-segment"
+	@echo "                      module BYTE FOR BYTE, and must REFUSE a"
+	@echo "                      malformed group."
 	@echo "                      No NPU and no Peano: aiecc dumps every MLIR"
 	@echo "                      pass before it builds core ELFs, so the"
 	@echo "                      expected link failure costs nothing."
@@ -501,6 +508,17 @@ check-norm-tail-fault:
 # silently wrong past it, so the regression only shows here. No NPU, no lock.
 check-norm-tail-structure:
 	python3 $(srcdir)/norm_tail_structure.py
+
+# H8: air-fuse-pipeline-launches REPRODUCES the hand-written norm_tail module.
+# The deliverable is reproduction of a known-good reference, not "a fused module
+# came out": the pass is given J7a's three stages as separate attributed
+# launches and must produce, byte for byte, the one-launch/one-segment module
+# builders/norm_tail.py writes by hand. Plus the negative controls -- a
+# malformed group must be REFUSED, since an unfused pipeline is a broken
+# program (its L1->L1 edges span aie.devices) and not a slow one. Needs an
+# air-opt carrying the pass; no NPU, no Peano, no lock.
+check-pipeline-fusion:
+	python3 $(srcdir)/pipeline_fusion_structure.py
 
 # Phase J7b: the FFN down-projection as a COMPILER-FORMED accumulator ring.
 # The builder ships the naive per-K-step C round trip and

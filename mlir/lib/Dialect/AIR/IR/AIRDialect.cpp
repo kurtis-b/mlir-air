@@ -92,6 +92,46 @@ air::airDialect::verifyOperationAttribute(Operation *op, NamedAttribute attr) {
               "single-value [0] for the skip-tile sentinel)");
     return success();
   }
+  // The declarative pipeline-fusion markers. Validated here so a mistyped or
+  // misplaced declaration is caught at the op that carries it, rather than
+  // reaching air-fuse-pipeline-launches as a group that silently does not
+  // group -- a launch whose air.pipeline_group is not a string would simply
+  // not be collected, and the pipeline would quietly stay unfused.
+  if (name == attrs::PipelineGroup) {
+    if (!isa<air::LaunchOp>(op))
+      return op->emitError(
+          "air.pipeline_group may only be attached to an air.launch");
+    if (!llvm::isa<StringAttr>(attr.getValue()))
+      return op->emitError("air.pipeline_group must be a string attribute");
+    return success();
+  }
+  if (name == attrs::PipelineStage) {
+    if (!isa<air::LaunchOp>(op))
+      return op->emitError(
+          "air.pipeline_stage may only be attached to an air.launch");
+    auto stage = llvm::dyn_cast<IntegerAttr>(attr.getValue());
+    if (!stage)
+      return op->emitError("air.pipeline_stage must be an integer attribute");
+    if (stage.getInt() < 0)
+      return op->emitError("air.pipeline_stage must be non-negative");
+    return success();
+  }
+  if (name == attrs::Staging) {
+    if (!isa<air::LaunchOp>(op))
+      return op->emitError(
+          "air.staging may only be attached to an air.launch");
+    auto staging = llvm::dyn_cast<StringAttr>(attr.getValue());
+    if (!staging)
+      return op->emitError("air.staging must be a string attribute");
+    StringRef v = staging.getValue();
+    if (v != attrs::StagingL1 && v != attrs::StagingMemtile &&
+        v != attrs::StagingAccumInPlace)
+      return op->emitError("air.staging must be one of \"")
+             << attrs::StagingL1 << "\", \"" << attrs::StagingMemtile
+             << "\" or \"" << attrs::StagingAccumInPlace << "\"; got \"" << v
+             << "\"";
+    return success();
+  }
   return success();
 }
 

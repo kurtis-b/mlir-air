@@ -112,6 +112,37 @@ constexpr StringLiteral NoChainLock = "air.no_chain_lock";
 // hand-written aggregator patterns where splitting would multiply the
 // launch-level shim endpoint count.
 constexpr StringLiteral NoSplit = "air.no_split";
+
+// --- Declarative pipeline fusion (air-fuse-pipeline-launches) ---------------
+// A builder that emits one air.launch per pipeline stage declares, on each
+// launch, which pipeline it belongs to and where in it that stage sits.
+// air-fuse-pipeline-launches co-locates the group into ONE air.launch holding
+// ONE air.segment, because residency holds only within a segment: each launch
+// otherwise lowers to its own aie.device and the stages are time-multiplexed.
+//
+// These are DECLARATIONS, not inferences. The pass never decides which
+// launches belong together; it fuses exactly what was declared, and refuses a
+// group that does not describe a pipeline.
+//
+// PipelineGroup: StringAttr, on an air.launch. The pipeline's name.
+constexpr StringLiteral PipelineGroup = "air.pipeline_group";
+// PipelineStage: IntegerAttr, on an air.launch carrying PipelineGroup. This
+// stage's position; a group must cover 0..N-1 exactly once.
+constexpr StringLiteral PipelineStage = "air.pipeline_stage";
+// Staging: StringAttr, on an air.launch carrying PipelineGroup. How this
+// stage's operands are staged on chip. This is a claim ABOUT the construction
+// the builder emitted, not a request for one -- choosing "memtile" over
+// "accum_in_place" is choosing a different loop construction, which no pass
+// rewrites into the other. The fusion pass CHECKS the claim against the IR and
+// refuses when it does not hold, which is the whole reason it is in the IR:
+// both constructions compile and compute the right numbers whether or not
+// they actually stage anything, so nothing else in the toolchain can tell a
+// builder that silently lost its ring (doc 22, "Clause 3 is the phase").
+constexpr StringLiteral Staging = "air.staging";
+// Legal values of attrs::Staging.
+constexpr StringLiteral StagingL1 = "l1";
+constexpr StringLiteral StagingMemtile = "memtile";
+constexpr StringLiteral StagingAccumInPlace = "accum_in_place";
 } // namespace attrs
 
 // Copy the DMA-steering / runtime-ordering markers

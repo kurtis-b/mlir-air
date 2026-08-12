@@ -1,0 +1,101 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// H8, the reproduction gate: air-fuse-pipeline-launches given J7a's three
+// stages as SEPARATE attributed air.launch ops must produce the module
+// builders/norm_tail.py writes BY HAND -- the one that is gated, measured
+// (mean_rel_L1 3.620e-3) and known to route.
+//
+// WHY REPRODUCTION IS THE DELIVERABLE AND NOT "IT EMITTED A FUSED MODULE"
+// R1 -- the one hand-built instance of this composition (J7a x2 + J7b) -- is
+// correct only at the fully degenerate rung and carries two distinct open
+// hardware defects (README queue items 21 and 23), while the module-
+// interpreting arm certifies it element-exact at all 11 ladder shapes. So a
+// pass that can GENERATE these compositions generates instances of a shape not
+// yet known to work, and "the pass emitted plausible IR" would be exactly the
+// kind of check this project has four times found could not fail. What is
+// gated here is bounded and checkable: the pass reproduces a KNOWN-GOOD
+// reference, and refuses malformed input.
+//
+// WHY BYTE EQUALITY RATHER THAN A LIST OF STRUCTURAL RESEMBLANCES
+// A structural comparison is only as good as the list of things it names, and
+// doc 23 section 5 records the list missing the phase's own claim (a check
+// counting packet typing could not see an edge round-tripping through L3).
+// Byte equality of the printed module needs no list: it implies equality on
+// every axis such a check could name and on every axis it could forget, and --
+// aircc being deterministic -- it implies the ROUTED designs are identical
+// without compiling either. Both sides are printed by the same air-opt, so the
+// comparison cannot turn on printer differences.
+//
+// WHY THE UNFUSED FORM IS THE SAME BUILDER
+// build_norm_tail_module(stage_launches=True) emits the same three herd bodies
+// as the default arrangement, differing only in launch/segment nesting. Were
+// it a separate transcription this gate would compare two pieces of Python
+// rather than test the pass. Verified separately: the DEFAULT arrangement's IR
+// is byte-identical to the pre-H8 builder's, so J7a's own gate does not move.
+//
+// This arm needs an air-opt carrying the pass and nothing else -- no NPU, no
+// Peano, no kernel objects, no device lock. A tree predating the pass reports
+// UNSUPPORTED rather than failing, and that does NOT weaken coverage of the
+// pass itself: its existence and behaviour are pinned unconditionally by
+// mlir/test/Transform/AIRFusePipelineLaunches/*.mlir in check-air-mlir. What
+// this feature guards is only the builder-level reproduction gate, which can
+// say nothing at all without a matching binary.
+//
+// Editing this header: lit scans the WHOLE file for directives, so naming one
+// in prose registers as a second directive. Describe them, never spell them out.
+//
+// REQUIRES: air_fuse_pipeline_launches
+//
+// RUN: mkdir -p test_pipeline_fusion
+// RUN: cd test_pipeline_fusion
+// RUN: make -f %S/Makefile check-pipeline-fusion | FileCheck %s
+//
+// The provenance line first: which binary answered. A gate that silently ran
+// an air-opt without the pass would fail every comparison for the wrong reason,
+// so the script refuses that case explicitly rather than reporting differences.
+// CHECK: [pipeline-fusion] air-opt:
+//
+// THE REPRODUCTION CLAUSE, per shape and variant. The byte count is in the
+// verdict so a comparison that succeeded against an empty or truncated module
+// cannot match here, and the launch/segment/herd counts are too -- 3 launches
+// and 3 segments IN is what says the gate was not comparing the reference to
+// itself, and 1 launch / 1 segment / 3 herds OUT is the operation itself
+// (residency holds only within a segment).
+// CHECK: [pipeline-fusion] norm_tail 128x768: REPRODUCED (3 launches/3 segments in -> 1 launch/1 segment/3 herds out, {{[0-9]+}} bytes byte-identical to the hand-written module)
+// CHECK: [pipeline-fusion] norm_tail 128x768 plane_major: REPRODUCED (3 launches/3 segments in -> 1 launch/1 segment/3 herds out, {{[0-9]+}} bytes byte-identical to the hand-written module)
+// CHECK: [pipeline-fusion] norm_tail 128x768 plane_major+mirror_out: REPRODUCED (3 launches/3 segments in -> 1 launch/1 segment/3 herds out, {{[0-9]+}} bytes byte-identical to the hand-written module)
+// CHECK: [pipeline-fusion] norm_tail 4096x768: REPRODUCED (3 launches/3 segments in -> 1 launch/1 segment/3 herds out, {{[0-9]+}} bytes byte-identical to the hand-written module)
+//
+// The two skips are matched, not tolerated: plane_major at 4096 rows exceeds
+// the shim BD stride cap and the BUILDER refuses it (see builders/norm_tail.py).
+// Matching the line is what stops a shape silently disappearing from the gate.
+// CHECK: [pipeline-fusion] norm_tail 4096x768 plane_major: SKIPPED
+// CHECK: [pipeline-fusion] norm_tail 4096x768 plane_major+mirror_out: SKIPPED
+//
+// J7b, where it applies: ffn_accum is ONE stage, so fusing its group must be an
+// IDENTITY. Not a degenerate case worth skipping -- it is the clause that says
+// the pass leaves the compiler-formed accumulator ring and the memtile A|B feed
+// untouched, and it is where the air.staging = "accum_in_place" claim is
+// checked against the IR rather than carried.
+// CHECK: [pipeline-fusion] ffn_accum 1-stage group: IDENTITY (accum_in_place claim accepted, module byte-unchanged)
+//
+// THE NEGATIVE CONTROLS, matched individually because an arm that cannot fail
+// is not a gate. Declining to fuse is NOT a safe fallback here: the stages stay
+// in separate air.launch ops, each lowers to its own aie.device, and the
+// declared L1->L1 edges span them -- doc 23's refuse-versus-skip discriminator,
+// the same one that makes air-fuse-packet-put-loops' silence wrong. The first
+// two are derived by rewriting the real builder's output, so they cannot drift
+// away from what the builder emits.
+// CHECK: [pipeline-fusion] negative control: duplicate stage index: REFUSED
+// CHECK: [pipeline-fusion] negative control: gap in stage indices: REFUSED
+// CHECK: [pipeline-fusion] negative control: accum_in_place claim without the ring shape: REFUSED
+//
+// The routed clause last: fusing N stages into one segment ADDS their
+// per-column L3-facing demand (doc 23's rule, per column ACROSS stacked herds),
+// which is the constraint fusion itself creates. Counted with
+// ffn_resident_structure's census, not a third counter. One aie.device is the
+// point of the exercise; 16 core-to-core flows are the two inter-stage edges,
+// one per column each.
+// CHECK: [pipeline-fusion] norm_tail 128x768 fused: ROUTED (1 aie.device, 16 L1->L1 flows, worst column 2/2 shim MM2S)
+// CHECK: [pipeline-fusion] PASS

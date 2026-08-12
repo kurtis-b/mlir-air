@@ -1385,6 +1385,35 @@ def AIRFuseParallelHerdPass : Pass<"air-fuse-parallel-launch", "ModuleOp"> {
   let constructor = "xilinx::air::createAIRFuseParallelHerdPass()";
 }
 
+def AIRFusePipelineLaunchesPass : Pass<"air-fuse-pipeline-launches", "ModuleOp"> {
+  let summary = "Co-locate a declared group of air.launch pipeline stages into one air.segment.";
+  let constructor = "xilinx::air::createAIRFusePipelineLaunchesPass()";
+  let description = [{
+    Fuse the `air.launch` ops carrying the same `air.pipeline_group` into a
+    single `air.launch` holding a single `air.segment`, ordered by their
+    `air.pipeline_stage`.
+
+    Residency holds only within a segment: each `air.launch` lowers to its own
+    `aie.device`, so stages in separate launches are time-multiplexed and the
+    L1->L1 `air.channel` edges a pipeline declares would span devices. Fusing
+    into one segment is therefore what makes a resident pipeline expressible.
+
+    The grouping is DECLARED, never inferred. A group must cover stages
+    `0..N-1` exactly once, sit in one block, and each stage's launch body must
+    be exactly one `air.segment`; anything else is refused with a diagnostic
+    rather than left silently unfused, because an unfused pipeline is a wrong
+    program and not merely a slow one.
+
+    `air.staging` on a stage declares how that stage's operands are staged on
+    chip -- `"l1"`, `"memtile"` or `"accum_in_place"`. Nothing is rewritten
+    from it; the pass CHECKS the claim against the IR, since both
+    constructions compute correct numbers whether or not they stage anything.
+
+    Run BEFORE `air-dependency`, so dependency construction sees the fused
+    form. The pipeline markers are erased on consume.
+  }];
+}
+
 
 def AIRRenumberDmaIdPass : Pass<"air-renumber-dma", "func::FuncOp"> {
   let summary = "Renumber air dma op ids";
