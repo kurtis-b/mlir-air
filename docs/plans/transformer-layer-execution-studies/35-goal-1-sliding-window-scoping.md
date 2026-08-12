@@ -274,6 +274,17 @@ Anyone quoting GFLOP/s for a windowed variant would compound that error by the b
 
 ### 2.3 Numerics headroom is thin, and banding pushes the wrong way
 
+> **`[2026-08-12]` FALSIFIED by measurement — banding does NOT push toward the ceiling.** On the
+> registry's headline 2048×2048 causal row (devq 262), `atol_required` and `abs_err max` are
+> **identical** across the matched W=512 / W=0 pair (8.048e-2 each, 1.24× margin under the hard 1e-1),
+> and the windowed `mean_rel_L1` is marginally **lower** (3.676e-2 against 3.856e-2).
+>
+> The reason is structural rather than lucky, which is what makes it worth keeping: the
+> worst-magnitude outputs live in the **first W rows**, where a band and full causal are *the same
+> mask*. A window only removes contributions where `|y|` is already small. The thin-headroom concern
+> was reasonable and is simply not what happens.
+
+
 `kernel_registry/details/FlashAttention_bf16.md:130-139` — element-wise over the full output vs an
 FP32 reference, `rtol = 1.6e-2`, **`atol = 1e-1`** (looser than GEMM's `4e-3`, sized to FA's
 measured worst case: two BFP16-emulated MMAs plus a bf16 online softmax). Measured
@@ -564,6 +575,26 @@ is windowed for free, given `transformers` support and weights on disk. Adapters
 pre-built model via `model=` (`verify_runner.py:317-324`), the hook `llama32_1b_int4` already uses.
 
 ### 4.5 **The gate as specified may not discriminate** — the most important finding in this section
+
+> **`[2026-08-12]` MEASURED, and the answer is "partially" — this section was right that it is a
+> hazard and wrong that it is a certainty.** Tested directly, host-only: Llama-3.2-1B-Instruct bf16,
+> `ref` = a real 512-token sliding window, `test` = the same model degraded to full causal, both
+> free-running 32 greedy tokens through the REAL `compute_topk_set_check`. **The gate accepted the
+> degradation on 1 of 4 window-crossing prompts** — `generic_a` (847 tokens), where only **6 of 32**
+> tokens agreed, passing purely because at the first divergence each side's token sat in the other's
+> top-5. The other three failed (2/32, 2/32, 0/32 agreeing).
+>
+> So: **a real hazard, quantified at 25% on this fixture — not universal, and not reliably vacuous.**
+> That is a coin flip on exactly the naive long-prompt fixture doc 11's "add long-prompt fixtures"
+> would have produced. The W1 increment therefore gates on **element-wise `np.isclose` with a
+> negative control**, not on the token-set check, and the control is verified failing on device
+> (4.70% mismatches, `atol_required` 5.3× over the ceiling).
+>
+> **A second finding from the same run, and it is the same shape one level up**: transformers 5.10.2
+> **silently ignores `config.sliding_window` and `config.layer_types` on Llama** — setting them
+> changed the logits by **exactly 0**. Anyone windowing an HF reference that way gets a silently
+> unwindowed reference, and would then be comparing two unwindowed things and calling it a match.
+
 
 The gate reads the **first divergence only**, over 32 greedy tokens, on a prompt whose length it
 does not otherwise constrain (`comparators.py:175-249`).
