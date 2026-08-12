@@ -448,6 +448,20 @@ pass **PASS**, 59 dumps in 1.0 s, one tile-bearing device, 4 core→core flows, 
 
 ### `[2026-08-11]` Wall 5: the shim issue order is channel-major and R1's consumers are not
 
+> **`[2026-08-12]` SUPERSEDED IN PART — the issue order below describes a binary that no longer
+> exists, and the current one emits the OPPOSITE.** A census of the unmarked build against
+> `build-xrt` of 2026-08-11 13:28 measures `[w_up][w_down][hidden ×96]` — `hidden` **last**, not
+> first — with `w_up` folded to a single whole-array BD and `w_down` to 13. That is **6b's sink
+> having already fired**, so the inter-channel half of this wall is closed and only the `w_down`
+> c-major defect below survives. The timing accounts for it: devq 235/236 ran at 13:06:15 / 13:08:52,
+> `AIRRtToNpuPass.cpp` was relinked at 13:28:03, and 6b's own fix (`ea3b98ce`) is the only
+> order-producing change in that window — so **devq 235's binary is not the current binary**. Which
+> of "the sink was not yet in 235's build" or "the order was carried from an earlier dump" is correct
+> is **not established**; both scratchpads are gone and the dump cannot be re-read. **Do not cite the
+> ordering in this section against the current compiler.** The `hidden`-cannot-drain mechanism it
+> describes is still the right shape of argument — it is the *instance* that is stale. Full census,
+> both E-arms and the residual risk: [37](37-wall-5-order-seam-design.md).
+
 With the BDs bounded, the numeric arm compiles and then **hangs**: `ERT_CMD_STATE_TIMEOUT`,
 `txn_op_idx 0xFFFFFFFF` (devq 235). Measured from the runtime sequence, at both settings tried:
 

@@ -569,3 +569,61 @@ Two smaller findings this raised, both worth carrying:
   pattern limitation** (`AIRDmaToChannel.cpp:1543-1554`; the pattern is already N-ary). That
   distinction is exactly what makes route A's blast radius large and route C's small, and it is not
   currently written anywhere.
+
+---
+
+## `[2026-08-12]` §5's census was TAKEN — route E confirmed, and the recorded order is refuted
+
+Three arms, no device touched, `air_project/npu.air.mlir` read directly.
+
+**Provenance, recorded first as §5 requires.** `build-xrt/bin/air-opt` 2026-08-11 13:28:03.455570624,
+unchanged before *and* after every arm; `build-xrt/bin/aircc` sha256 `5cb08407…`, the same binary the
+re-pinned item-10 STRUCT literal cites. Baseline compile 1.3 s, module unmarked
+(`preserve_shim_dma_order` count = 0), so this is the **unmarked** build the design argued had never
+been measured.
+
+| row | measured | what it settles |
+|---|---|---|
+| 1 — task counts | `hidden` **96**, `w_up` **1** (one BD, `offset 0 len 2359296 sizes [2359296] strides [1]`), `w_down` **13** | §1.3's premise **holds**; "all ≈ 96" refuted; **route C's trigger is not met** |
+| 2 — emitted order | **`[w_up][w_down][hidden ×96]`** | **6b's sink ALREADY FIRED.** Inter-channel order is fixed, **route D is not needed**, residual blocker is defect 2 alone |
+| 3 — pacing | all 96 `hidden` configures carry `{air.bd_recycled, issue_token, repeat_count 7}`; awaits at **uniform depth 15**, 96 tokens each consumed once | 6b active, did not silently decline |
+| 4 — `w_down` K order | `0, 147456, 737280, 1327104, 1916928, 294912, …` — c=0 folded across all four sweeps, then c=1 s=0..3, c=2, c=3 | **defect 2 survives folding, in a stronger form**: the whole of column 0 streams before column 1 begins |
+| 5 — live BDs | (1,0) 97 by configure→free, all others ≤2 — **but the metric is misleading**: `hidden` emits **zero** `dma_free_task`, since 6b recycles BD *ids* via `air.bd_recycled` + awaits | direct evidence is that it compiled clean through the allocator; *inference*: ≤15 outstanding + `w_up`'s permanent 1 = 16, exactly the budget |
+
+**Verdict: route E, and E1 alone is the whole remaining structural fix.** Rows 1 + 2 kill the premise
+route C was reserved for and show route D's target already achieved.
+
+**Second arm, E1 applied to a COPY** (shipped builder untouched): `@air_channel_4` collapses to **1**
+task — the entire `w_down` array as one contiguous BD, monotone in `(s, c, jj)` by construction, so
+**defect 2 is gone**. Order `[w_up][w_down][hidden ×96]`, pacing unchanged. **No blow-up**: channel
+symbols **12 → 9** (down, not up), compile 1.4 s against 1.3 s, and the builder's measured
+>25-minute `air-isolate-async-dma-loop-nests` hazard did not materialize. Structure identical to
+baseline on every clause. **E1+E2 is structurally identical to E1, so E2 is inert by measurement** —
+the sink already produces its target order.
+
+### The discrepancy, and it is not resolved
+
+Doc 31 §Wall 5 and the README's queue row both record the order as **`@air_channel_2 ×96, then
+w_up, then w_down`**. This census measures the **opposite**. The timing is the likely explanation and
+is recorded rather than assumed: devq 235/236 ran at **13:06:15 / 13:08:52**, `AIRRtToNpuPass.cpp`
+was edited at **13:27:46** and relinked at **13:28:03**, and the only committed change to an
+order-producing pass in that window is `ea3b98ce` — 6b's own fix. **So devq 235's binary is not this
+binary.** Whether "the sink was not yet in 235's build" or "the recorded order was carried from an
+earlier dump" is correct **is not established**: both scratchpads are gone and the old dump cannot be
+re-read. Either way, **the order sentence in doc 31 §Wall 5 and in the queue row describes a
+superseded binary** and must not be cited against the current one.
+
+### What this census does NOT establish
+
+- **Nothing numerical, nothing on hardware.** E1 and E1+E2 are structural verdicts only.
+- **E1's correctness is UNVERIFIED, and this is its real risk.** E1 decouples the `w_down` refill from
+  the `l2_b_down` puts, deleting the shared-buffer WAR chain the builder's own comment (`:543-550`)
+  relies on. The token graph becomes cross-nest. That it *schedules* correctly is exactly what the
+  emulation tests and a device run would settle, and neither has been run.
+- **Why the baseline folds `w_down` to 13** (one 4-sweep mega-BD for c=0 plus 12 singles) rather than
+  4 or 96 — mechanism unexplained.
+- **Whether the same-day compiler merges move any of this.** The census binary predates `ba3916f8`
+  (item 9, `air-shrink-memref-sizes-by-access`) and `971bab2a` (item 8, `air-split-l2-memref`). **Item
+  8's pass is squarely on R1's L3-offset path**, so the census should be re-taken against the
+  integrated build before E1 is committed to.
+- **No claim that route E greens the gate.** §4's caveat about a possible third wall stands.
