@@ -64,6 +64,14 @@ Footguns:
   contention (doc 30 item 2: red at 0.9966x once, green twice, same code).
   Contention only inflates samples, so the interleaved minimum measures the
   mechanism's floor; the inequality itself was not widened.
+- **`[2026-08-12]` Turbo is a precondition, checked before anything is compiled.**
+  Legs A and B assert on latency, so the xrt-smi power mode is part of what they
+  measure; it resets to `Default` on every reboot and every amdxdna reload, and
+  at `Default` this host runs ~15-20x slow on the dispatch-bound path (README
+  trap 0, doc 32). Off Turbo this refuses and returns 2 rather than taking a
+  verdict. **The tolerance was NOT touched to go with it** -- doc 30's
+  `[2026-08-10]` decision already answered the "no margin" finding with a better
+  statistic, and widening the inequality now would undo that on purpose.
 """
 
 import argparse
@@ -103,6 +111,11 @@ from shared.infra.cache import KernelCache, Profiler  # noqa: E402
 from shared.infra.dispatch import RunlistSplitError, plan_submissions  # noqa: E402
 
 from builders.gemm_spec import resolve_gemm_spec, spec_herd  # noqa: E402
+from sweep.registry_sweep import (  # noqa: E402
+    TurboNotEnforced,
+    npu_power_mode,
+    require_turbo,
+)
 
 #: Llama-3.2-1B decoder-layer projection GEMMs at seq_len 2048, as (label, M, K, N).
 #: q/o and gate/up each share a shape, so these five compile to three distinct
@@ -693,6 +706,46 @@ def main():
     )
     parser.add_argument("--cache-dir", default=str(_HERE / "runlist_gate_cache"))
     args = parser.parse_args()
+
+    # `[2026-08-12]` FAIL CLOSED ON THE POWER MODE, before compiling four ELFs at
+    # seq_len 2048. Legs A and B assert `agg_min < seq_min` -- a latency claim, and
+    # therefore one the xrt-smi pmode is a precondition of. The mode is
+    # non-persistent (every reboot and every amdxdna reload resets it to `Default`)
+    # and at `Default` this host runs ~15-20x slow on the dispatch-bound path these
+    # legs measure, so the saving being gated -- one host submission, order 100 us --
+    # sits far below the noise. The verdict would then be a coin flip reported as a
+    # seam regression, which is README trap 0's failure mode reaching a gate.
+    #
+    # REFUSE, DO NOT SKIP. A skip here would be "cannot check, so green", which is
+    # the shape gate-h.sh's leg 4 header rejects by name. The refusal prints and
+    # returns non-zero, so the lit wrapper goes red with the reason in its output
+    # rather than red on a timing mismatch that reads like a code defect.
+    #
+    # Same require_turbo() study/run_mode.py and study/component_groups.py already
+    # fail closed on -- imported, not re-derived.
+    try:
+        require_turbo()
+    except TurboNotEnforced as exc:
+        print(f"[runlist-gate] refused: {exc}")
+        # require_turbo's own message is written for the registry sweep and names the
+        # command without a device. Spell out this host's, because the whole point of
+        # refusing here is that whoever reads the halt should not have to work out
+        # that it is not a seam regression.
+        print(
+            "[runlist-gate] this is NOT a runlist regression: legs A and B assert on "
+            "latency and\n"
+            "  the power mode is a precondition of that measurement. Fix (operator, "
+            "does not persist\n"
+            "  across a reboot or an amdxdna reload):\n"
+            "    sudo xrt-smi configure --device 0000:64:00.1 --pmode turbo\n"
+            "  then verify with `xrt-smi examine -r platform`. See README trap 0."
+        )
+        return 2
+    mode, detail = npu_power_mode()
+    # Printed so the lit wrapper can CHECK it: a guard that can be deleted without a
+    # test going red is a guard that will be. Same argument as checking all four legs
+    # rather than the summary line.
+    print(f"NPU power mode: {mode} ({detail}) -- the measurement condition holds")
 
     cache = KernelCache(
         cache_dir=args.cache_dir, verbose=True, profiler=Profiler(enabled=False)
