@@ -237,10 +237,16 @@ structure promoted to `ffn_resident_structure.py` as a suite arm. Measured, one 
   real loops everywhere except the sub-channel index, which H5 forces to a literal. Cross-loop
   put ORDER on a shared sub-channel is carried by the shared staging buffers' inferred
   dependencies — the reason the relay keeps ONE `l2_h`/`l2_b_down` pair.
-- **Ordering verified host-side to exactness** (session scratch, f64 emulation of every DMA
+- ~~**Ordering verified host-side to exactness** (session scratch, f64 emulation of every DMA
   pattern and channel op: packing, shim retile, chunk extraction, global K order — max error
   5.5e-12 vs the plain composition), so a device-run failure isolates to hardware behavior, not
-  addressing arithmetic.
+  addressing arithmetic.~~ **`[2026-08-12]` WITHDRAW THE SCOPE OF THIS BULLET, and read
+  §"The emulation arm was blind" below for what replaced it.** The 5.5e-12 figure is real and
+  reproduces, but the arm that produced it **never built the module**: it imported
+  `ffn_resident_pack_w_up` and re-derived every DMA pattern and every loop order by hand, so it
+  emulated *a transcription of* the design, not the design. It could not see a change to the
+  refill nest at all (queue item 17). As of 2026-08-12 the arm interprets the built
+  `air.ir.Module` and the figure is **5.457e-12 measured on the module the builder emits**.
 
 Numeric arm (`check-ffn-resident` + fault twin + lit recipe) registered at the catalogue's
 64×3072×768 with the `ffn` scaling; atol provisional until the first gated hardware run records
@@ -500,6 +506,67 @@ in the tree that triggers BD recycling and it hangs on wall 5, the pacing is ver
 pass altitude (lit, verified-failing) and at compile altitude (the allocator now accepts the
 module) but **NOT on hardware**. The no-op-when-under-budget property is what makes that
 acceptable to land, and it is what the 31/1/0 suite run measures.
+
+### `[2026-08-12]` The emulation arm was BLIND; it now interprets the module, and it can fail
+
+Queue item 17. Every "dataflow emulated element-exact" claim above and in the README's rows was
+produced by `builders/test_ffn_resident.py`, which **imported `ffn_resident_pack_w_up` and never
+called `build_ffn_resident_module`**. It re-derived every DMA pattern, every sub-channel index and
+every loop order by hand in numpy — so the builder and the check were two independent
+transcriptions of one design, and the check could only ever disagree with itself. Proven, not
+suspected: re-imposing the exact c-major w_down order route E1 deleted still printed 5/5. That is
+why E1 landed on a **structural** substitute (memtile DMA programs byte-identical with buffer
+names erased) rather than on the emulation — the emulation had nothing to say.
+
+**What the arm is now.** It builds the module and INTERPRETS it: every `air.dma_memcpy_nd` and
+`air.channel.put`/`get` executed with the offsets, sizes and strides the op carries, every
+`scf.for` at its actual bounds, every `func.call` dispatched by the symbol the builder named, the
+three herds as four concurrent actors each, the four channels as FIFOs, f64 throughout. It applies
+exactly **two models, both named in the file**: (M1) `air-dma-to-channel`'s hoist — each TEXTUAL
+segment-scope dma becomes its own auto channel whose L3 side is hoisted into a nest cloned from
+its enclosing `scf.for`s, siblings concatenated in textual order; and (M2) the memtile lock
+pairing — one staging buffer is one allocation behind one lock pair, so the k-th consumption round
+reads the k-th value that landed, and sibling auto channels landing in the SAME buffer share ONE
+stream. (M1) is the rule the builder is written against; (M2) is the pairing E1's own commit
+message names.
+
+**Measured, on the module the builder emits** (host-only, ~1 s, no aircc and no NPU):
+
+| | shipped builder (E1) | real pre-E1 builder (`918c202f`, unmodified) |
+| --- | --- | --- |
+| textual segment-scope refills | **3** — `hidden` nest (4,24), `w_up` nest (4,24), `w_down` nest **(4,4,6)** | **6** — and **four of them land in the same L2 buffer**, each nest (4,6) |
+| max \|y − reference\| | **5.457e-12** over 64×768 f64 | **4.716e+03** |
+| arm's verdict | 8/8 | **red**: clause 5 FAILS, 7/8, and the lit's first CHECK does not match |
+
+The in-arm negative control (NC1: the refill nest's `c` loop Python-unrolled back into `herd_x`
+sibling nests) reproduces the real pre-E1 builder's error **to the digit — 4.715995e+03 both
+ways**, so the control is the defect, not an approximation of it. A second control (NC2) swaps the
+two innermost strides of the `hidden` retile — seam 1's off-by-one — and lands at 5.23e+03. Both
+run on every invocation and are FileCheck-matched in the recipe, so a control that stopped firing
+takes the arm red rather than passing quietly. A control whose **anchor** goes stale (the refill
+nest stops being one 3-deep nest over (sweeps, herd_x, chunks_per_group)) reports `STALE` and
+fails its clause — folding "not applicable" into "rejected" would have been item 17 again.
+
+**Tamper-verified three ways**, each against the real recipe: neuter NC1's injection → `7/8` and
+the `e+0x` match fails; break NC1's anchor → `STALE`, `7/8`; install the real pre-E1 builder in
+the tree → the recipe goes red on its first CHECK. Liveness is pinned too, so clause 5 cannot pass
+vacuously: the dispatch census (768 in-place accumulates = 4·4·24 up + 4·96 down, 20 zeros = 16 up
+groups + 4 guarded first-K calls, 96 GeLU chunks), the four channels' put/get counts, and
+**zero undrained staged streams**.
+
+**What this arm still does NOT model, stated so nobody cites it for them**: timing, BD folding,
+`air-fuse-channels`, wall 5's D1 (inter-channel starvation) and wall 6's lock-conservation
+imbalance (queue item 18). Those are properties of the LOWERED design's lock and BD counts; this
+arm reads the AIR module. A delivery/consumption mismatch is element-visible **here** and a
+timeout **on hardware** — both rejections, but only the device gate settles the lock walls. So the
+correct form of the claim is: *R1's addressing and delivery order are verified element-exact at
+5.457e-12 by the module-interpreting arm; its lock and scheduling behaviour is not verified at
+all.*
+
+**One arm, not two.** The lit recipe and the script are the same command; there is no `make`
+target and none should be added. The recipe's contribution is the assertions (controls fired,
+census live, count exact), and it says so in its own header — the gate that listed "run the
+script" and "run the lit" as steps 3.1 and 3.2 was counting one arm twice.
 
 ## Gate
 
