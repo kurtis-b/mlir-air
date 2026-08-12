@@ -113,20 +113,25 @@ def _require_turbo() -> None:
     ``run_mode`` re-takes this per rung because it runs as a fresh process, so a
     driver reload mid-walk is caught at the next rung. This call is the
     fail-fast one: it refuses before a results root exists.
+
+    **Exit 2, matching ``run_mode``**, because a refused precondition is not a
+    failed measurement and a caller must be able to tell them apart: 1 means the
+    profile ran and did not complete, 2 means it never started.
     """
     from sweep.registry_sweep import TurboNotEnforced, require_turbo
 
     try:
         require_turbo()
     except TurboNotEnforced as exc:
-        raise SystemExit(
-            f"[run-profile] refused: {exc}\n"
+        print(f"[run-profile] refused: {exc}")
+        print(
             "[run-profile] The power mode is non-persistent and resets on every "
             "reboot and every amdxdna reload; at `Default` this host measures "
             "~15-20x slow, so a walk taken there is not comparable with any "
             "recorded number (README trap 0). Setting it is the operator's "
             "action and needs root."
-        ) from None
+        )
+        raise SystemExit(2) from None
 
 
 def _tree_dirt(repo: Path) -> list[str]:
