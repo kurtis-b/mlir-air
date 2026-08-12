@@ -28,9 +28,32 @@
 # still exit 0.  `run` submits, relays the log to stdout as it grows, and exits
 # with the job's own status, so it is a drop-in for `flock -x LOCK CMD`.
 #
+# PREFLIGHT MAKES THE ADVISORY LOCK ASKABLE.  `[2026-08-12]`, queue item 19: a
+# `--compile-mode` flag was parsed and never branched on, so an intended
+# compile-only run dispatched to the NPU off-queue WHILE job 252 held the device
+# lock for the 65-minute ten-model regression.  252 survived only because
+# contention pushes a correctness gate toward false FAILURE, not false pass.
+# Nothing outside this broker consults the lock, so it stops nothing.
+#
+# `preflight` is the smallest thing that changes that: a READ-ONLY subcommand a
+# dispatching script can call to ask "is the device busy?" and get an exit code.
+# It is deliberately NOT a new mechanism -- it exposes `device_idle` below, the
+# probe this broker has always used to keep builds off the box, so there is ONE
+# probe and ONE lock path.  It never holds the lock across anything (microseconds
+# inside a subshell, exactly as build admission does), it never touches
+# /tmp/npu.lock (a different inode KernelCache owns -- taking it from a wrapper
+# deadlocks the suites), and it can only ever REFUSE: nothing acquires the device
+# through preflight, so it cannot become the way to get it without queueing.
+#
+# Inside a devq job it exits 0 WITHOUT probing.  A measure runner holds the lock
+# on its own fd, so probing there would report the caller's own job as the
+# contender and refuse every legitimate measurement -- the same nesting trap
+# `run` refuses for, seen from the other side.
+#
 # Usage:
 #   devq.sh run    --class build|measure [--name TAG] -- CMD [ARG...]
 #   devq.sh submit --class build|measure [--name TAG] [--wait] -- CMD [ARG...]
+#   devq.sh preflight [--quiet]        # 0 = device free, 3 = held by another job
 #   devq.sh status [--raw]
 #   devq.sh wait ID [--timeout SEC]
 #   devq.sh log ID
@@ -291,6 +314,46 @@ cmd_runjob() {
   done
 }
 
+# preflight [--quiet] -- read-only: may a dispatch start right now?
+#
+#   0  free, or the caller is already inside a devq job (the queue scheduled it)
+#   3  the device lock is held by something else
+#
+# 3 rather than 1 so a caller can tell "busy" from its own command failing.
+cmd_preflight() {
+  local quiet=0; [ "${1:-}" = "--quiet" ] && quiet=1
+  local say=printf; [ "$quiet" = 1 ] && say=:
+
+  if [ -n "${DEVQ_JOB_ID:-}" ]; then
+    $say 'devq: preflight OK -- inside devq job %s, already scheduled\n' "$DEVQ_JOB_ID"
+    return 0
+  fi
+  if device_idle; then
+    $say 'devq: preflight OK -- %s is free\n' "$NPU_LOCK"
+    return 0
+  fi
+
+  # Held.  Name the holder if the queue knows it; an un-migrated job that took
+  # the lock directly will not be in the queue, and saying so is the useful
+  # answer rather than pretending nobody is there.
+  local holder= f
+  if [ -d "$JOBS" ]; then
+    local M_id M_class M_name M_state M_submitted M_started M_finished M_exit M_pid M_note M_cmd
+    for f in "$JOBS"/job-*.meta; do
+      [ -e "$f" ] || continue
+      read_meta "$f"
+      [ "$M_state" = running ] && [ "$M_class" = measure ] && \
+        holder="job $M_id (${M_name:--}) pid $M_pid: $M_cmd"
+    done
+  fi
+  printf 'devq: preflight REFUSED -- the device lock %s is held%s\n' \
+    "$NPU_LOCK" "${holder:+ by $holder}" >&2
+  [ -n "$holder" ] || printf 'devq:   no running measure job in the queue owns it; something took the lock outside the broker\n' >&2
+  printf 'devq:   dispatching now would run beside that job. Queue instead:\n' >&2
+  printf 'devq:     %s run --class measure -- <your command>\n' "$SELF" >&2
+  return 3
+}
+
 cmd_wait() {
   local id=${1:?wait: need an id} deadline= f
   # printf, not print: awk's default OFMT (%.6g) mangles epoch floats to 1.78e+09.
@@ -313,6 +376,7 @@ cmd_wait() {
 case ${1:-} in
   run)    shift; cmd_runjob "$@";;
   submit) shift; cmd_submit "$@";;
+  preflight) shift; cmd_preflight "$@";;
   status) shift; cmd_status "$@";;
   wait)   shift; cmd_wait "$@";;
   log)    shift; cat "$(logf "${1:?log: need an id}")";;

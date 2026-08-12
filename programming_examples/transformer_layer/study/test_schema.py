@@ -397,6 +397,168 @@ def test_the_mode_domain_is_open_on_purpose():
     schema.validate_conditions(block)  # must not raise
 
 
+# ---------------------------------------------------------------------------
+# The toolchain block `[2026-08-12]` -- queue item 16.
+# ---------------------------------------------------------------------------
+
+
+def test_the_toolchain_key_is_the_one_compare_manifests_diffs():
+    """THE load-bearing assertion of item 16.
+
+    ``compare_roots.compare_manifests`` iterates ``manifest["toolchain"]`` by
+    that literal name and always has. The defect was that nothing wrote it. If
+    this key is ever renamed, the diff silently goes back to iterating an empty
+    dict and the toolchain half of every comparison compares nothing again --
+    with no test failing anywhere else, because an empty diff is a quiet one.
+    """
+    assert schema.TOOLCHAIN_KEY == "toolchain", schema.TOOLCHAIN_KEY
+    source = open(os.path.join(_HERE, "compare_roots.py"), encoding="utf-8").read()
+    assert '("toolchain", "toolchain")' in source, (
+        "compare_manifests no longer diffs a block named `toolchain`; "
+        "TOOLCHAIN_KEY exists to match it"
+    )
+
+
+def test_the_toolchain_block_did_not_bump_the_schema_version():
+    """Item 15's precedent, and the reason the block is not a results column.
+
+    A column bump makes ``results_io.read_rows`` reject every recorded CSV on
+    the version check -- it took 56 v1 files out of every reader on 08-10, and
+    would take the 16 v2 files that survive, which are the roots compare_roots
+    is pointed at. ``RESOURCE_FIELDS`` states the rule: adding a table is not a
+    version bump.
+    """
+    assert schema.SCHEMA_VERSION == 2, schema.SCHEMA_VERSION
+
+
+def test_the_toolchain_block_is_not_a_csv_table():
+    """It must not be reachable by anything that iterates CSV tables.
+
+    Registered in ``_FIELDS_BY_TABLE`` it could be written out as a one-row CSV
+    by any table-walking caller. Same pin as the conditions block has.
+    """
+    _raises(ValueError, "unknown table", schema.fields_for, "toolchain")
+
+
+def test_every_toolchain_field_is_documented_and_unique():
+    names = list(schema.TOOLCHAIN_FIELDNAMES)
+    assert len(names) == len(set(names)), names
+    for field in schema.TOOLCHAIN_FIELDS + schema.TOOLCHAIN_PROVENANCE_FIELDS:
+        assert field.meaning.strip(), field.name
+
+
+def test_empty_toolchain_is_complete_and_claims_nothing():
+    block = schema.empty_toolchain()
+    assert set(block) == set(schema.TOOLCHAIN_FIELDNAMES)
+    for name in schema.TOOLCHAIN_IDENTITY_FIELDNAMES:
+        assert block[name] == schema.UNKNOWN_CONDITION, name
+    schema.validate_toolchain(block)  # a claim-nothing block is still writable
+
+
+def test_a_manifest_older_than_the_block_reads_back_as_absent():
+    """Not a crash, and not a quiet match. Every recorded root is in this state.
+
+    In fact EVERY manifest ever written is: the block's reader was in
+    compare_roots before its writer was in manifest.py.
+    """
+    out = schema.toolchain_from_manifest({"study_id": "x"})
+    assert out["toolchain_source"] == "absent", out
+    assert "must not be guessed" in out["toolchain_detail"]
+    for name in schema.TOOLCHAIN_IDENTITY_FIELDNAMES:
+        assert out[name] == schema.UNKNOWN_CONDITION, name
+
+
+def test_a_non_mapping_manifest_reads_back_as_absent_too():
+    for junk in (None, [], "toolchain", 7):
+        assert schema.toolchain_from_manifest(junk)["toolchain_source"] == "absent"
+
+
+def test_two_roots_recording_nothing_are_not_two_roots_that_agree():
+    """The trap this block exists to avoid, stated as a test.
+
+    Both sides `absent` must produce NO reported difference AND must not be
+    readable as a match -- the caller distinguishes them by the source field,
+    never by an empty difference list.
+    """
+    left = schema.toolchain_from_manifest({})
+    right = schema.toolchain_from_manifest({})
+    assert schema.toolchain_differences(left, right) == []
+    assert left["toolchain_source"] == right["toolchain_source"] == "absent"
+
+
+def test_toolchain_differences_reports_only_identity_fields():
+    """Provenance differing is not the toolchain differing."""
+    left = schema.empty_toolchain()
+    right = schema.empty_toolchain()
+    for name in schema.TOOLCHAIN_IDENTITY_FIELDNAMES:
+        left[name] = right[name] = "same"
+    left["toolchain_source"] = "observed"
+    right["toolchain_source"] = "probed_at_manifest_build"
+    left["toolchain_detail"] = "read from a file"
+    right["toolchain_detail"] = "read from somewhere else"
+    assert schema.toolchain_differences(left, right) == []
+
+    right["xrt_version"] = "2.20.0"
+    assert schema.toolchain_differences(left, right) == [
+        ("xrt_version", "same", "2.20.0")
+    ]
+
+
+def test_an_unknown_on_either_side_is_not_a_difference():
+    """"We do not know" and "these differ" are different findings.
+
+    Reporting an unknown as a difference would tell an operator two roots
+    disagree on evidence that does not exist.
+    """
+    left = schema.empty_toolchain()
+    right = schema.empty_toolchain()
+    left["xrt_version"] = "2.21.0"
+    # right's stays `unknown`
+    assert schema.toolchain_differences(left, right) == []
+    assert schema.toolchain_differences(right, left) == []
+
+
+def test_validate_toolchain_rejects_a_missing_or_invented_key():
+    block = schema.empty_toolchain()
+    del block["xrt_version"]
+    _raises(ValueError, "missing keys", schema.validate_toolchain, block)
+
+    block = schema.empty_toolchain()
+    block["gcc_version"] = "13"
+    _raises(ValueError, "not in the schema", schema.validate_toolchain, block)
+
+
+def test_validate_toolchain_rejects_a_bad_source_and_reader_only_absent():
+    block = schema.empty_toolchain()
+    block["toolchain_source"] = "probably"
+    _raises(ValueError, "toolchain_source", schema.validate_toolchain, block)
+
+    block = schema.empty_toolchain()
+    block["toolchain_source"] = "absent"
+    _raises(ValueError, "READER-ONLY", schema.validate_toolchain, block)
+
+
+def test_the_toolchain_value_domains_are_open_on_purpose():
+    """A wheel may take a version string this module has never seen."""
+    block = schema.empty_toolchain()
+    block["xrt_version"] = "9.9.9+deadbeefcafe"
+    block["peano_version"] = "some-future-pin"
+    block["air_resolution"] = "/an/unrecognised/tree"
+    block["toolchain_source"] = "probed_at_manifest_build"
+    schema.validate_toolchain(block)  # must not raise
+
+
+def test_the_toolchain_source_domain_is_shared_with_conditions():
+    """One enum, not two saying the same four things."""
+    for value in schema.CONDITION_SOURCES:
+        block = schema.empty_toolchain()
+        block["toolchain_source"] = value
+        if value == "absent":
+            _raises(ValueError, "READER-ONLY", schema.validate_toolchain, block)
+        else:
+            schema.validate_toolchain(block)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

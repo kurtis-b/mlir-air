@@ -43,6 +43,22 @@ WHAT IT DELIBERATELY DOES NOT DO
     pointing it at either device inode would deadlock against the wrapper that
     launched the run.
 
+    IT DOES ASK, THOUGH `[2026-08-12]` (queue item 19). The lock is advisory --
+    nothing outside the broker consults it -- which is how a run that meant to
+    be compile-only dispatched beside job 252's 65-minute regression. Off-queue,
+    this script now calls ``devq.sh preflight`` and REFUSES to start when the
+    device is held by another job. Asking is not taking: preflight holds nothing
+    and cannot acquire, so this still takes no device lock.
+
+    The split is the codebase's existing one, not a new rule. A DEFINITE "held"
+    refuses, because the exit is actionable and obvious -- re-run under ``devq.sh
+    run --class measure``. An INDETERMINATE answer (no broker, unrunnable) warns
+    and continues, exactly as ``compare_roots`` flags an unrecorded power mode:
+    refusing on an unknown would make a broken broker block all measurement. And
+    there is no ``--ignore-device-lock``, for ``pmode_guard``'s reason: nothing
+    added for a guard may become the way to defeat it. Wanting to dispatch
+    anyway is wanting ``devq.sh run``.
+
 FOOTGUNS
     - **``run``, never ``submit``.** ``submit`` diverts output to the job log and
       returns an id, so a gate that substitutes it blanks its own FileCheck and
@@ -134,6 +150,70 @@ def _require_turbo() -> None:
         raise SystemExit(2) from None
 
 
+#: The broker, resolved from this file rather than from cwd or PATH -- doc 15's
+#: rule that a probe must not depend on where it was launched from.
+DEVQ = Path(_HERE).resolve().parents[2] / "agents" / "scripts" / "devq.sh"
+
+
+def device_preflight(devq: Path | None = None) -> bool | None:
+    """Is the NPU free to dispatch to right now? ``None`` means indeterminate.
+
+    `[2026-08-12]`, queue item 19. The device lock is advisory: nothing outside
+    ``devq.sh`` consults it, so an off-queue dispatch runs beside whatever holds
+    it. This ASKS -- ``devq.sh preflight`` is read-only, holds nothing and cannot
+    acquire -- so the module's "takes no device lock" contract is intact.
+
+      True   the lock is free, or the caller is already inside a devq job.
+      False  another job holds it. The caller must not dispatch.
+      None   the broker could not answer. Warn, do not refuse.
+
+    THE THREE-VALUED RETURN IS THE POINT. A bool would collapse "the device is
+    busy" into "I could not tell", and those need opposite responses: the first
+    is a definite finding with an obvious exit (re-run under ``devq.sh run
+    --class measure``), the second is the guard itself being broken, and
+    refusing there would let a missing broker block all measurement. That is
+    ``compare_roots``' refuse-known / flag-unknown split, applied to a device
+    rather than to a recorded condition.
+
+    Never raises: a guard that dies is a guard that stops the run it was meant
+    to protect, for a reason that has nothing to do with the device.
+    """
+    devq = Path(devq) if devq else DEVQ
+    if not devq.is_file():
+        print(f"[run-profile] WARNING cannot preflight the device: no {devq}")
+        return None
+    try:
+        proc = subprocess.run(
+            ["bash", str(devq), "preflight"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception as exc:
+        print(f"[run-profile] WARNING cannot preflight the device ({exc})")
+        return None
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 3:
+        for line in (proc.stderr or "").strip().splitlines():
+            print(f"[run-profile] {line}")
+        print(
+            "[run-profile] refused: the NPU is held by another job. Dispatching "
+            "now would corrupt its measurement and distort this one -- devq job "
+            "252's ten-model regression survived exactly this only because "
+            "contention causes false FAILURES rather than false passes. Re-run "
+            "under `devq.sh run --class measure -- ...`; there is deliberately "
+            "no flag to skip this."
+        )
+        return False
+    print(
+        f"[run-profile] WARNING the device preflight was inconclusive "
+        f"(devq.sh preflight exited {proc.returncode}): "
+        f"{(proc.stderr or '').strip()[:200]}"
+    )
+    return None
+
+
 def _tree_dirt(repo: Path) -> list[str]:
     """Tracked-tree paths a run left behind. Best effort; never raises.
 
@@ -169,13 +249,25 @@ def _rung_outcomes(rows: list[dict]) -> list[dict]:
     ]
 
 
-def gate(profile: profiles.Profile, out_dir: str | Path, repo=None) -> dict:
+def gate(
+    profile: profiles.Profile, out_dir: str | Path, repo=None, observe_toolchain=False
+) -> dict:
     """Run the gate over an existing tree and write its manifest. No device.
 
     Separated from the walk so a recorded results root can be re-verified
     without re-measuring it -- which is how doc 34 discovered that the recorded
     Phase F gate artifact no longer verifies against schema v2. A gate you
     cannot re-run over an old tree is a gate whose past verdicts are hearsay.
+
+    ``observe_toolchain`` `[2026-08-12]`, queue item 16, AND IT DEFAULTS FALSE.
+    This function has two callers with opposite entitlements. ``run`` calls it
+    immediately after walking on this host, so probing describes the toolchain
+    that did the measuring and is stamped ``probed_at_manifest_build``.
+    ``--gate-only`` re-verifies a tree measured at some earlier time, possibly
+    against a toolchain since overwritten -- probing there would write TODAY's
+    versions onto SOMEONE ELSE's measurement, which is the "never stamp a
+    condition you did not observe" rule broken by a helpful default. So the
+    honest answer for a re-gate is ``unknown``, and the flag has to be asked for.
     """
     out_dir = Path(out_dir)
     expected = profile.expected_files()
@@ -187,7 +279,11 @@ def gate(profile: profiles.Profile, out_dir: str | Path, repo=None) -> dict:
     print(f"[smoke-gate] {'FAIL' if problems else 'PASS'} " f"({len(expected)} CSV(s))")
 
     built = manifest.build_manifest(
-        out_dir, expected, repo=repo, expected_rows=expected_rows
+        out_dir,
+        expected,
+        repo=repo,
+        expected_rows=expected_rows,
+        toolchain=manifest.observe_toolchain() if observe_toolchain else None,
     )
     manifest.write_manifest(out_dir / MANIFEST_NAME, built)
     print(f"[manifest] wrote {out_dir / MANIFEST_NAME}")
@@ -247,7 +343,10 @@ def run(
         power_columns = monitor.stats()
     wall_sec = time.perf_counter() - t0
 
-    built = gate(profile, out_dir, repo=repo)
+    # The walk just happened, on this host: probing the toolchain now describes
+    # the build that produced these rows. See `gate`'s docstring for why the
+    # `--gate-only` caller below deliberately does not.
+    built = gate(profile, out_dir, repo=repo, observe_toolchain=True)
 
     by_status: dict[str, int] = {}
     for row in rows:
@@ -344,6 +443,10 @@ def main(argv: list[str] | None = None) -> int:
             "`devq.sh run --class measure -- ...` so no build or gate runs "
             "beside the timed region."
         )
+        # ...and being off-queue is only a warning while the device is FREE.
+        # See the module docstring for the refuse/flag split.
+        if device_preflight() is False:
+            return 3
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -635,14 +635,12 @@ COMPONENT_FIELDS: tuple[Field, ...] = (
 # the first place; `agents/scripts/port-loop/pmode_guard.py` made the same call
 # for the throughput floor and for the same reason.
 #
-# WHAT ELSE BELONGS HERE, NOT ADDED TODAY. `xrt_version` and the LLVM/mlir-aie/
-# Peano pin plus the `install-xrt`-vs-`build-xrt` resolution are the other
-# conditions doc 34 M4 names, and doc 03 records an XRT version change alone
-# moving `offload` 19-39%. They are declarations away -- adding one here is a
-# field, not a redesign -- but they are not what cost a day, and `compare_roots`
-# already has somewhere to put them: it diffs a `toolchain` manifest block that
-# `manifest.py` has never actually written. Closing that is a separate item; see
-# the note in `manifest.build_manifest`.
+# THE OTHER HALF OF THE CONDITION IS `TOOLCHAIN_FIELDS`, BELOW `[2026-08-12]`.
+# `xrt_version`, the mlir-aie/Peano pin and the `install-xrt`-vs-`build-xrt`
+# resolution are the remaining conditions doc 34 M4 names, and doc 03 records an
+# XRT version change alone moving `offload` 19-39%. Queue item 16 closed them as
+# a SIBLING BLOCK rather than four more fields here; the reason is in that
+# block's own comment.
 # ---------------------------------------------------------------------------
 
 #: What a condition records when it is not known. See the block comment: this is
@@ -705,6 +703,128 @@ CONDITION_FIELDS: tuple[Field, ...] = (
         "measurement CSVs' own mtimes it says whether the observation and the "
         "measurement belong to the same window. None when nothing was observed.",
     ),
+)
+
+# ---------------------------------------------------------------------------
+# THE TOOLCHAIN BLOCK `[2026-08-12]` -- queue item 16.
+#
+# WHAT WAS BROKEN. `compare_roots.compare_manifests` has always contained
+#
+#     for label, block in (("git", "git"), ("toolchain", "toolchain")):
+#
+# and `manifest.py` has never written a `toolchain` key. `a.get("toolchain") or
+# {}` is therefore `{}` on both sides, the inner loop iterates nothing, and the
+# toolchain half of every root comparison has compared NOTHING for as long as it
+# has existed. That is item 10's defect shape exactly: a check that reads as
+# present in the source and is blind precisely where it is needed. The fix is to
+# write the block, not to rewrite the reader -- the reader was always right.
+#
+# WHY A SIBLING BLOCK AND NOT FOUR MORE `CONDITION_FIELDS`. Three reasons.
+#
+#   1. DECISIVE: `compare_manifests` diffs `manifest["toolchain"]` BY NAME. Put
+#      these fields in `conditions` and that loop is still iterating an empty
+#      key -- the record gets fixed and the reader stays broken, which is half a
+#      fix wearing a whole one's clothes.
+#   2. `validate_conditions` rejects unknown keys, so widening CONDITION_FIELDS
+#      would change the validation surface of every block item 15 shipped and
+#      every test that pins it. A sibling leaves `conditions` byte-identical.
+#   3. They answer different questions. The pmode is a property of the RUN and
+#      resets under it; the toolchain is a property of the BUILD the run
+#      exercised. `compare_roots` treats them differently on purpose (refuse vs
+#      flag -- see `compare_toolchain` there), and two verdicts should not be
+#      computed from one bag of fields.
+#
+# THE VERSIONING IS ITEM 15's, UNCHANGED AND FOR ITS REASON. A new `results`
+# COLUMN would bump `SCHEMA_VERSION` to 3; `results_io.read_rows` rejects both a
+# header and a version mismatch, so the bump that took 56 v1 CSVs out of every
+# reader on 08-10 would take the 16 v2 CSVs that survive -- which are the roots
+# `compare_roots` is actually pointed at. `RESOURCE_FIELDS` above states the
+# governing precedent ("adding a table is not a version bump"). So: a new
+# declared block, **`SCHEMA_VERSION` STAYS 2**, and deliberately NOT in
+# `_FIELDS_BY_TABLE`, so nothing that iterates CSV tables can write it out as a
+# one-row CSV. `test_schema.py` pins both.
+#
+# `absent` IS NOT `unknown` AND NEITHER IS A MATCH. Every root recorded before
+# today has no such block. `toolchain_from_manifest` synthesises `absent` for
+# those -- "older than the field" -- while `unknown` means "tried and failed".
+# A reader must never treat either as agreement: two roots that both record
+# nothing are not two roots that record the same thing.
+#
+# WHICH FIELDS COMPARE. Only `TOOLCHAIN_IDENTITY_FIELDNAMES` decide whether two
+# roots agree. `toolchain_source` and `toolchain_detail` are PROVENANCE -- they
+# say how the values were obtained, and a difference there is not a toolchain
+# difference. There is deliberately no `observed_at_utc` here (the conditions
+# block has one because a pmode can reset between the run and the manifest
+# build): the manifest's own `created_at_utc` is the observation time, and a
+# per-block timestamp would differ on every pair and print a NOTE on every
+# comparison, which is how a diff teaches its reader to skip it.
+# ---------------------------------------------------------------------------
+
+#: The toolchain facts that decide whether two roots were built the same way.
+#: A difference in ANY of these is a real toolchain difference; see the block
+#: comment on why `toolchain_source`/`toolchain_detail` are excluded.
+TOOLCHAIN_FIELDS: tuple[Field, ...] = (
+    Field(
+        "xrt_version",
+        "The XRT runtime version this run dispatched through, as "
+        "`BUILD_VERSION+VERSION_HASH[:12]` from `/opt/xilinx/xrt/version.json`. "
+        "Doc 03 records an XRT version change ALONE moving `offload` 19-39% at "
+        "seq_len >= 4096 while leaving the other three modes within 0.6% -- so "
+        "this single field can move a latency by more than `offload`'s own 35% "
+        "fail band, and is invisible in every recorded results column.",
+    ),
+    Field(
+        "mlir_aie_version",
+        "The installed `mlir_aie` wheel version. Layer 2 of the four-layer "
+        "toolchain stack: AIR's build requires a floor here (the "
+        "`ExpandModeAttr` wall), and the layers mask each other when stale, so "
+        "a run's mlir-aie pin is part of what its numbers mean.",
+    ),
+    Field(
+        "peano_version",
+        "The installed `llvm-aie` (Peano) wheel version -- the per-core "
+        "backend `PEANO_INSTALL_DIR` points at. It compiles the core code whose "
+        "execution is being timed, so two roots at different Peanos are two "
+        "different binaries measured.",
+    ),
+    Field(
+        "air_resolution",
+        "Which AIR tree the measuring interpreter would import: `build-xrt`, "
+        "`install-xrt`, another path verbatim, or UNKNOWN_CONDITION. Doc 15's "
+        "install-vs-build divergence is exactly this: the lit suites see a "
+        "compiler fix as soon as `build-xrt` relinks, while an `install-xrt` "
+        "caller sees it only after `ninja -C build-xrt install`. Two roots that "
+        "differ here may have measured the same source at different ages.",
+    ),
+)
+
+#: PROVENANCE, recorded beside the block and NOT compared. Same split, and the
+#: same reasoning, as `npu_power_mode_source`/`_detail` in the conditions block.
+TOOLCHAIN_PROVENANCE_FIELDS: tuple[Field, ...] = (
+    Field(
+        "toolchain_source",
+        "One of CONDITION_SOURCES -- reused rather than duplicated, because the "
+        "distinction it draws (`observed` at measurement time vs "
+        "`probed_at_manifest_build` afterwards vs `unknown` vs reader-only "
+        "`absent`) is the same distinction here. A second enum saying the same "
+        "four things is a second enum to keep in sync.",
+    ),
+    Field(
+        "toolchain_detail",
+        "Why a field is missing, or where the values were read from. An "
+        "`unknown` that does not say why is indistinguishable from an `unknown` "
+        "nobody tried to fill.",
+    ),
+)
+
+#: The manifest key the toolchain block lives under. This string is not a free
+#: choice: `compare_manifests` has diffed `manifest["toolchain"]` since it was
+#: written, and matching it is the entire point of the block.
+TOOLCHAIN_KEY = "toolchain"
+
+TOOLCHAIN_IDENTITY_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in TOOLCHAIN_FIELDS)
+TOOLCHAIN_FIELDNAMES: tuple[str, ...] = TOOLCHAIN_IDENTITY_FIELDNAMES + tuple(
+    f.name for f in TOOLCHAIN_PROVENANCE_FIELDS
 )
 
 RESULTS_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in RESULTS_FIELDS)
@@ -940,3 +1060,114 @@ def validate_conditions(block: dict[str, object]) -> None:
             "block, and writing it would claim a run predates a field it "
             "carries. Use 'unknown' if the mode could not be determined."
         )
+
+
+# ---------------------------------------------------------------------------
+# The toolchain block: build, read, validate. See the section comment above.
+# ---------------------------------------------------------------------------
+
+
+def empty_toolchain() -> dict[str, object]:
+    """A complete toolchain block that claims nothing.
+
+    Every declared field present and ``unknown``. Same rule as
+    ``empty_conditions``: nothing assembles a dict of the keys it remembers.
+    """
+    block: dict[str, object] = {
+        name: UNKNOWN_CONDITION for name in TOOLCHAIN_IDENTITY_FIELDNAMES
+    }
+    block["toolchain_source"] = UNKNOWN_CONDITION
+    block["toolchain_detail"] = None
+    return block
+
+
+def toolchain_from_manifest(manifest: object) -> dict[str, object]:
+    """The toolchain block of a manifest dict, degrading to ``absent``.
+
+    THE ONLY SUPPORTED READER, for ``conditions_from_manifest``'s reason: no
+    manifest written before `[2026-08-12]` has this key -- and, because the diff
+    that consumes it was written against a key nothing produced, NO manifest ever
+    written has it. A reader that indexed the key would raise on the entire
+    recorded corpus.
+
+    ``toolchain_source='absent'`` means the manifest predates the block. It is
+    NOT ``unknown`` and it is emphatically not a match: see the section comment.
+    """
+    if not isinstance(manifest, dict):
+        block = None
+    else:
+        block = manifest.get(TOOLCHAIN_KEY)
+
+    out = empty_toolchain()
+    if not isinstance(block, dict):
+        out["toolchain_source"] = "absent"
+        out["toolchain_detail"] = (
+            "this manifest has no toolchain block -- it was written before the "
+            "toolchain condition was recorded (doc 34 M4, queue item 16). The "
+            "toolchain it ran against is not recoverable from the files and "
+            "must not be guessed."
+        )
+        return out
+
+    for name in TOOLCHAIN_FIELDNAMES:
+        if name in block:
+            out[name] = block[name]
+    for name in TOOLCHAIN_IDENTITY_FIELDNAMES:
+        out[name] = normalise_power_mode(out[name])
+    out["toolchain_source"] = normalise_power_mode(out["toolchain_source"])
+    return out
+
+
+def validate_toolchain(block: dict[str, object]) -> None:
+    """Raise ``ValueError`` unless ``block`` is a writable toolchain block.
+
+    Same shape of check as ``validate_conditions``, and the same open domain on
+    the VALUES: a wheel may take a version string this module has never seen, and
+    a schema that rejected an unrecognised one would refuse to record the very
+    thing a reader most needs. Only ``toolchain_source`` has a closed domain.
+    """
+    expected = set(TOOLCHAIN_FIELDNAMES)
+    got = set(block)
+    if missing := expected - got:
+        raise ValueError(f"toolchain block is missing keys: {sorted(missing)}")
+    if extra := got - expected:
+        raise ValueError(
+            f"toolchain block has keys not in the schema: {sorted(extra)}. "
+            "Adding a toolchain fact is a declaration in "
+            "schema.TOOLCHAIN_FIELDS, not a key invented at the call site."
+        )
+    source = normalise_power_mode(block.get("toolchain_source"))
+    if source not in CONDITION_SOURCES:
+        raise ValueError(
+            f"toolchain_source={block.get('toolchain_source')!r} is not one of "
+            f"{list(CONDITION_SOURCES)}"
+        )
+    if source == "absent":
+        raise ValueError(
+            "toolchain_source='absent' is READER-ONLY -- it is what "
+            "toolchain_from_manifest synthesises for a manifest older than the "
+            "block, and writing it would claim a run predates a field it "
+            "carries. Use 'unknown' if the toolchain could not be determined."
+        )
+
+
+def toolchain_differences(left: dict, right: dict) -> list[tuple[str, str, str]]:
+    """``(field, left, right)`` for each IDENTITY field the two disagree on.
+
+    Provenance fields are not compared -- two roots whose values were obtained
+    differently are not two roots built differently.
+
+    An ``unknown`` on either side is NOT reported as a difference here: "we do
+    not know" is a different finding from "these differ", and the caller reports
+    it separately so an operator is never told two roots disagree on evidence
+    that does not exist.
+    """
+    out = []
+    for name in TOOLCHAIN_IDENTITY_FIELDNAMES:
+        a = normalise_power_mode(left.get(name))
+        b = normalise_power_mode(right.get(name))
+        if UNKNOWN_CONDITION in (a, b):
+            continue
+        if a != b:
+            out.append((name, a, b))
+    return out
