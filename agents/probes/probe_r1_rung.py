@@ -153,7 +153,12 @@ def build(args, need_module=True):
 
     module = (
         build_ffn_resident_module(
-            seq_len, ffn_dim, emb_dim, herd_x=herd_x, tile_k=tile_k
+            seq_len,
+            ffn_dim,
+            emb_dim,
+            herd_x=herd_x,
+            tile_k=tile_k,
+            shared_h_staging=(args.h_staging == "shared"),
         )
         if need_module
         else None
@@ -377,6 +382,33 @@ def main():
     p.add_argument("--lockfix", default="none", choices=("none", "v1", "v2"))
     p.add_argument("--omit-pingpong", default="", choices=("", "L1", "L2", "all"))
     p.add_argument("--fault-inject", action="store_true")
+    # Wall 7's A/B (queue item 21). BOTH arms are spelled explicitly: the
+    # builder's default is the shared (defective) form, so an unflagged run is
+    # the shipped design, and `--shared-h-staging` states that intent rather
+    # than relying on the default. devq 309's shared arm passed
+    # `--shared-h-staging`; its per-column arm ran when per-column was briefly
+    # the builder default, and `--per-column-h-staging` is that same module.
+    g = p.add_mutually_exclusive_group()
+    g.add_argument(
+        "--shared-h-staging",
+        dest="h_staging",
+        action="store_const",
+        const="shared",
+        help="stage every GeLU column's H chunk through ONE L2 buffer (the "
+        "shipped default). At herd_x>1 this is herd_x S2MM channels racing for "
+        "one single-slot memtile buffer on a counting semaphore that cannot "
+        "order them -- wall 7",
+    )
+    g.add_argument(
+        "--per-column-h-staging",
+        dest="h_staging",
+        action="store_const",
+        const="per-column",
+        help="one H staging buffer per GeLU column: the measured fix for wall "
+        "7 (5/35 -> 35/35, devq 309). Does NOT compile at the gate shape -- "
+        "see the builder's docstring",
+    )
+    p.set_defaults(h_staging="shared")
     p.add_argument("--atol", type=float, default=5e-3)
     p.add_argument("--seed", type=int, default=13)
     p.add_argument("--tag", default="rung")

@@ -252,6 +252,7 @@ def build_ffn_resident_module(
     np_dtype=bfloat16,
     herd_x=FFN_ACCUM_HERD_X,
     tile_k=FFN_ACCUM_TILE_K,
+    shared_h_staging=True,
 ):
     """Build the one-segment resident FFN interior for one TILE_M-row band.
 
@@ -266,6 +267,25 @@ def build_ffn_resident_module(
             J7b's measured placement wall for the down herd's shim pair.
         tile_k: K advance per kernel call, and the chunk width of the
             resident hand-off. Capped by J7b's measured L1 fit.
+        shared_h_staging: stage every GeLU column's chunk through ONE L2
+            buffer (default, and DEFECTIVE at ``herd_x > 1``) instead of one
+            per column. This is wall 7 (queue item 21): the shared form lowers
+            to herd_x S2MM channels racing for one single-slot memtile buffer
+            on a counting semaphore that cannot order them, and the device
+            delivers an arbitrary interleaving of the columns' chunk streams,
+            or hangs. ``False`` fixes it -- measured 5/35 -> 35/35 PASS over
+            five herd_x=2 and two herd_x=4 rungs (devq 309, doc 52).
+
+            IT IS NOT THE DEFAULT, and that is deliberate. Per-column staging
+            adds ``herd_x - 1`` buffers to the down-feed memtile's DMA program
+            and crosses a hardware cap above ``128x128`` at ``herd_x 4``
+            (``'aie.memtile_dma' op has more than 48 blocks``), so at the
+            SHIPPED gate shape (``768x3072, herd_x 4``) it does not compile at
+            all. Flipping the default would trade a hang for a compile
+            refusal. The fix that scales is the compiler one -- order the
+            writers on the single buffer with the chain lock that already
+            exists (doc 52 §7) -- and this flag stays the way to reproduce the
+            A/B and to run a correct R1 below that boundary.
 
     Returns:
         air.ir.Module with one function
@@ -331,8 +351,18 @@ def build_ffn_resident_module(
 
     # L2: every staged buffer holds ONE step. Doubled for possible ping-pong,
     # as ffn_accum's guard does.
+    # The H staging is one buffer per GeLU column unless the shared (racing)
+    # form is explicitly asked for -- so it costs herd_x chunks, not one.
+    n_h_bufs = 1 if shared_h_staging else herd_x
     l2_need = (
-        2 * itemsize * (chunk_elems + herd_x * up_b_block + chunk_elems + down_chunk)
+        2
+        * itemsize
+        * (
+            chunk_elems
+            + herd_x * up_b_block
+            + n_h_bufs * chunk_elems
+            + down_chunk
+        )
     )
     if l2_need > L2_BYTES:
         raise ValueError(
@@ -403,7 +433,13 @@ def build_ffn_resident_module(
             def fr_seg(s_hidden, s_wup, s_wdown, s_y):
                 l2_a_up = AllocOp(l2_a_up_ty, [], [])
                 l2_b_up = AllocOp(l2_b_up_ty, [], [])
-                l2_h = AllocOp(l2_h_ty, [], [])
+                # One H staging buffer per GeLU column (see the ordering note
+                # on the down feed below). `shared_h_staging` rebuilds the
+                # single-buffer form that wall 7 was measured on.
+                l2_h_bufs = [
+                    AllocOp(l2_h_ty, [], [])
+                    for _ in range(1 if shared_h_staging else herd_x)
+                ]
                 l2_b_down = AllocOp(l2_b_down_ty, [], [])
 
                 @herd(name="ffn_res_up", sizes=[herd_x, 1])
@@ -573,12 +609,38 @@ def build_ffn_resident_module(
                 # the rule this loop shape exists to keep.
                 #
                 # ORDERING across the four per-c loops (the down cores'
-                # A|B interleave requires j order on every sub-channel) is
-                # carried by the SHARED l2_h staging buffer: c+1's first get
-                # writes l2_h (WAR on c's last A put), so air-dependency
-                # serializes the chain c0 < c1 < c2 < c3 without a hand
-                # token. Giving each c its own staging buffer would delete
-                # exactly that serialization -- do not "parallelize" it.
+                # A|B interleave requires j order on every sub-channel).
+                #
+                # `[2026-08-12]` RETRACTED, and it was wall 7. This comment
+                # used to read: "carried by the SHARED l2_h staging buffer:
+                # c+1's first get writes l2_h (WAR on c's last A put), so
+                # air-dependency serializes the chain c0 < c1 < c2 < c3
+                # without a hand token. Giving each c its own staging buffer
+                # would delete exactly that serialization -- do not
+                # 'parallelize' it."
+                #
+                # That serialization DOES NOT SURVIVE LOWERING. With one
+                # shared buffer the herd_x gets are herd_x DIFFERENT
+                # sub-channels from herd_x different GeLU cores, so air-to-aie
+                # emits one S2MM channel PER GeLU CORE onto ONE single-slot
+                # memtile buffer, every one of them gated by the SAME counting
+                # semaphore with the SAME acquire/release counts (measured:
+                # `agents/probes/probe_aie_buffer_writer_race.py` on the
+                # emitted aie.air.mlir). A counting semaphore has no
+                # participant identity, so the WRITE ORDER is whatever the
+                # DMA arbiter picks -- and the device delivers an arbitrary
+                # INTERLEAVING of the herd_x cores' chunk streams. At
+                # herd_x == 1 there is one writer and the claim is vacuously
+                # true, which is why the whole herd_x=1 ladder is correct.
+                #
+                # So the ordering is taken structurally instead: ONE STAGING
+                # BUFFER PER GeLU COLUMN. Each l2_h[c] then has exactly one
+                # writer, and the order across c is carried by the down feed's
+                # BD chain -- [h0, b, h1, b, ...] in this loop's textual order
+                # -- which is a compile-time constant, not an arbitration
+                # outcome. Set `shared_h_staging=True` to rebuild the old
+                # shared-buffer form; it is kept only so the two arms can be
+                # A/B'd on hardware.
                 #
                 # ---- E1 (doc 37 §4): the w_down refill lives in its OWN
                 # nest, over a REAL scf.for c ----
@@ -636,10 +698,11 @@ def build_ffn_resident_module(
 
                 for s in range_(0, sweeps):
                     for c in range(herd_x):
+                        h_buf = l2_h_bufs[0 if shared_h_staging else c]
                         for jj in range_(0, chunks_per_group):
-                            ChannelGet(CHANNEL_G, l2_h, indices=[c, 0])
+                            ChannelGet(CHANNEL_G, h_buf, indices=[c, 0])
                             for tx in range(herd_x):
-                                ChannelPut(CHANNEL_DOWN_FEED, l2_h, indices=[tx, 0])
+                                ChannelPut(CHANNEL_DOWN_FEED, h_buf, indices=[tx, 0])
                                 ChannelPut(
                                     CHANNEL_DOWN_FEED,
                                     l2_b_down,
@@ -653,7 +716,8 @@ def build_ffn_resident_module(
 
                 DeallocOp(l2_a_up)
                 DeallocOp(l2_b_up)
-                DeallocOp(l2_h)
+                for _h in l2_h_bufs:
+                    DeallocOp(_h)
                 DeallocOp(l2_b_down)
 
 
