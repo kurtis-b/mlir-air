@@ -1586,9 +1586,22 @@ FailureOr<Value> tileChannelOpByFactor(
             originalApplyOperands = applyOp->getOperands();
           } else if (auto execOp =
                          dyn_cast_if_present<air::ExecuteOp>(affineApplyOp)) {
-            SetVector<Value> opers;
-            getUsedValuesDefinedAbove(execOp.getRegion(), opers);
-            originalApplyOperands = llvm::to_vector(opers);
+            // Why the wrapped apply's own operands, and not just any value the
+            // region captures: the replacement map reuses that apply's
+            // expression verbatim, so symbol i of the expression must bind to
+            // operand i of the apply. The captured-value set carries no such
+            // ordering guarantee; that only went unnoticed while the
+            // replacement map was hardcoded to a single symbol.
+            affine::AffineApplyOp innerApply =
+                dyn_cast_if_present<affine::AffineApplyOp>(
+                    execOp.getChildOps().front());
+            if (innerApply)
+              originalApplyOperands = innerApply->getOperands();
+            else {
+              SetVector<Value> opers;
+              getUsedValuesDefinedAbove(execOp.getRegion(), opers);
+              originalApplyOperands = llvm::to_vector(opers);
+            }
           } else {
             // Why: the base offset is independent of the access pattern;
             // propagate any non-zero base on the split dim instead of zeroing
@@ -1608,28 +1621,33 @@ FailureOr<Value> tileChannelOpByFactor(
           return originalApplyOperands;
         };
 
-    auto getOriginalExpr = [&rewriter](Operation *affineApplyOp,
-                                       AffineMap splitInfoAffineMap) {
-      AffineExpr originalExpr = nullptr;
+    // Returns the map the offset expression is lifted out of, not just its
+    // expression: the replacement map built below must be shaped like this one
+    // (same dim/symbol split, same operand order), because it is created with
+    // this map's operands.
+    auto getOriginalMap = [&rewriter](Operation *affineApplyOp) {
+      AffineMap originalMap;
       if (auto applyOp =
               dyn_cast_if_present<affine::AffineApplyOp>(affineApplyOp)) {
-        originalExpr = applyOp.getAffineMap().getResult(0);
+        originalMap = applyOp.getAffineMap();
       } else if (auto execOp =
                      dyn_cast_if_present<air::ExecuteOp>(affineApplyOp)) {
-        originalExpr = dyn_cast_if_present<affine::AffineApplyOp>(
-                           execOp.getChildOps().front())
-                           .getAffineMap()
-                           .getResult(0);
+        originalMap = dyn_cast_if_present<affine::AffineApplyOp>(
+                          execOp.getChildOps().front())
+                          .getAffineMap();
       } else {
-        originalExpr = rewriter.getAffineSymbolExpr(0);
+        // No pre-existing apply: the offset is a function of the base alone.
+        originalMap =
+            AffineMap::get(0, 1, rewriter.getAffineSymbolExpr(0),
+                           rewriter.getContext());
       }
-      return originalExpr;
+      return originalMap;
     };
 
     SmallVector<Value> originalApplyOperands = getOriginalApplyOperands(
         affineApplyOp, originalChanOp, splitInfoSplitOffset);
-    AffineExpr originalExpr =
-        getOriginalExpr(affineApplyOp, splitInfoAffineMap);
+    AffineMap originalMap = getOriginalMap(affineApplyOp);
+    AffineExpr originalExpr = originalMap.getResult(0);
 
     // Preserve original channel indices and prepend the split index
     SmallVector<Value> newIndices;
@@ -1650,35 +1668,69 @@ FailureOr<Value> tileChannelOpByFactor(
     // (potentially overlapping access pattern).
     affine::AffineApplyOp newApplyOp = nullptr;
 
+    // Shape the replacement map after `originalMap` rather than hardcoding a
+    // single symbol.
+    //
+    // Why: `originalExpr` is lifted out of an existing affine.apply whose map
+    // may span an arbitrarily deep loop nest. A two-level nest over an L3
+    // operand -- which is what the standing "advance the staged buffer on the
+    // L3 side" pattern produces -- yields
+    //   affine_map<()[s0, s1] -> (s0 * 589824 + s1 * 24576)>
+    // and asking AffineMap::get for one symbol there references a symbol
+    // position the map does not declare, tripping willBeValidAffineMap and
+    // aborting the compiler. The map is created with `originalApplyOperands`,
+    // which is `originalMap`'s operand list, so matching that map's dim/symbol
+    // split also keeps getNumInputs() == the operand count.
+    auto composeAffineMap = [](AffineExpr expr, AffineMap originalMap) {
+      unsigned numDims = originalMap.getNumDims();
+      unsigned numSymbols = originalMap.getNumSymbols();
+      // Composition can only ever widen the expression, never narrow it; cover
+      // whatever it actually references so the map stays well formed.
+      expr.walk([&numDims, &numSymbols](AffineExpr e) {
+        if (auto dimExpr = dyn_cast<AffineDimExpr>(e))
+          numDims = std::max(numDims, dimExpr.getPosition() + 1);
+        else if (auto symExpr = dyn_cast<AffineSymbolExpr>(e))
+          numSymbols = std::max(numSymbols, symExpr.getPosition() + 1);
+      });
+      return AffineMap::get(numDims, numSymbols, expr);
+    };
+
     // Methods to compose affine expression for offset at each split.
-    auto composeAffineExprWithOffsetAndAffineMap = [](AffineExpr originalExpr,
-                                                      AffineMap affineMap,
-                                                      std::optional<int> offset,
-                                                      MLIRContext *ctx) {
+    auto composeAffineExprWithOffsetAndAffineMap = [&composeAffineMap](
+                                                       AffineExpr originalExpr,
+                                                       AffineMap originalMap,
+                                                       AffineMap affineMap,
+                                                       std::optional<int> offset,
+                                                       MLIRContext *ctx) {
       int const_in = offset ? *offset : 0;
       if (affineMap) {
         auto original_map = affineMap;
+        // Substituting the split offset for the leading dim/symbol must not
+        // drop the trailing ones: keep this map's own shape, or a multi-symbol
+        // access pattern would abort here instead.
         if (original_map.getNumSymbols() > 0) {
-          original_map =
-              original_map.replace(getAffineSymbolExpr(0, ctx),
-                                   getAffineConstantExpr(const_in, ctx), 0, 1);
+          original_map = original_map.replace(
+              getAffineSymbolExpr(0, ctx), getAffineConstantExpr(const_in, ctx),
+              original_map.getNumDims(), original_map.getNumSymbols());
         } else if (original_map.getNumDims() > 0) {
-          original_map =
-              original_map.replace(getAffineDimExpr(0, ctx),
-                                   getAffineConstantExpr(const_in, ctx), 1, 0);
+          original_map = original_map.replace(
+              getAffineDimExpr(0, ctx), getAffineConstantExpr(const_in, ctx),
+              original_map.getNumDims(), original_map.getNumSymbols());
         }
         AffineExpr add = originalExpr + original_map.getResult(0);
-        return AffineMap::get(0, 1, add);
+        return composeAffineMap(add, originalMap);
       }
       AffineExpr add = originalExpr + getAffineConstantExpr(const_in, ctx);
-      return AffineMap::get(0, 1, add);
+      return composeAffineMap(add, originalMap);
     };
-    auto composeAffineExprFromSizes = [](AffineExpr originalExpr,
-                                         int originalMemrefSize, int factor,
-                                         int i) {
+    auto composeAffineExprFromSizes = [&composeAffineMap](
+                                          AffineExpr originalExpr,
+                                          AffineMap originalMap,
+                                          int originalMemrefSize, int factor,
+                                          int i) {
       AffineExpr add =
           originalExpr + i * llvm::divideCeilSigned(originalMemrefSize, factor);
-      return AffineMap::get(0, 1, add);
+      return composeAffineMap(add, originalMap);
     };
 
     AffineMap map;
@@ -1687,10 +1739,11 @@ FailureOr<Value> tileChannelOpByFactor(
       // If any overriding offset affine mapping, size or stride factor is
       // logged, it must be respected throughout the splitting process.
       map = composeAffineExprWithOffsetAndAffineMap(
-          originalExpr, splitInfoAffineMap, splitInfoSplitOffset, ctx);
+          originalExpr, originalMap, splitInfoAffineMap, splitInfoSplitOffset,
+          ctx);
     } else
-      map = composeAffineExprFromSizes(originalExpr, originalMemrefSize, factor,
-                                       i);
+      map = composeAffineExprFromSizes(originalExpr, originalMap,
+                                       originalMemrefSize, factor, i);
     newApplyOp = affine::AffineApplyOp::create(rewriter, loc, map,
                                                originalApplyOperands);
     if (affineApplyOp)
