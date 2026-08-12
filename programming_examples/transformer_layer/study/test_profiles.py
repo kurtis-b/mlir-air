@@ -178,9 +178,10 @@ def test_reachability_is_re_derived_from_the_registry_not_asserted():
     have = {(r["M"], r["K"], r["N"]) for r in rows}
     assert len(have) > 100, f"only {len(have)} registry rows parsed; the reader broke"
 
-    # (K multiple, N multiple) of hidden, per projection role. cases.py's own
-    # FLOP derivation names the same four.
-    roles = ((1, 3), (1, 4), (4, 1), (1, 1))
+    # (K multiple, N multiple) of hidden, per projection role -- taken from the
+    # table that also records WHICH METHOD each role's consumer pins, rather
+    # than retyped here. cases.py's own FLOP derivation names the same four.
+    roles = tuple(profiles.PINNED_PROJECTION_METHODS)
     for family in profiles.REACHABLE_FAMILIES:
         h = cases.FAMILY_SPECS[family].hidden_size
         missing = [
@@ -195,6 +196,23 @@ def test_reachability_is_re_derived_from_the_registry_not_asserted():
             "A profile that walks it would fail at gemm_config, not at the device."
         )
 
+    # ...and the TRIPLE being present is the weaker half. `[2026-08-12]` The one
+    # entry KNOWN_REGISTRY_GAPS ever held was a triple-vs-method confusion in the
+    # other direction, so the check that a reachable family is really reachable
+    # is the PINNED METHOD being present, not the row existing.
+    by_method = {(r["M"], r["K"], r["N"]): set(r.get("methods", {})) for r in rows}
+    for family in profiles.REACHABLE_FAMILIES:
+        h = cases.FAMILY_SPECS[family].hidden_size
+        for (km, nm), (method, pinned_by) in profiles.PINNED_PROJECTION_METHODS.items():
+            for seq in cases.SEQUENCE_LADDER:
+                triple = (seq, h * km, h * nm)
+                assert method in by_method[triple], (
+                    f"{family} is declared reachable but {triple} has no "
+                    f"{method!r} row (it has {sorted(by_method[triple])}). "
+                    f"{pinned_by} pins that method and raises without it, so "
+                    f"this rung fails at resolution rather than at the device."
+                )
+
     # ...and the converse, so this cannot pass by declaring nothing reachable.
     for family, reason in profiles.UNREACHABLE_FAMILIES.items():
         assert "registry" not in reason and "coverage" not in reason, (
@@ -203,9 +221,45 @@ def test_reachability_is_re_derived_from_the_registry_not_asserted():
             "reason here is the stale claim this test exists to prevent."
         )
 
-    # Full TRIPLE coverage is not full METHOD coverage, and the difference is a
-    # real failing rung. Each declared gap must still be a gap.
+
+def test_a_declared_registry_gap_must_be_one_some_mode_actually_demands():
+    """A missing method is not a gap unless something ASKS for it.
+
+    `[2026-08-12]` THIS TEST USED TO ASSERT ONLY THE CONVERSE, AND THE ONE ENTRY
+    IT GUARDED WAS INERT. It checked that each declared gap's method was still
+    absent from the registry -- true, and not the question. ``2048x1024x3072``
+    really has no ``drain`` row, and the entry concluded that ``offload`` and
+    ``runlist`` therefore fail at seq 2048 on ``baseline_1024``. Neither mode
+    resolves a ``3h`` shape at all: both chains are ``(seq, h, h)``,
+    ``(seq, h, 4h)``, ``(seq, 4h, h)``. The only consumer of ``(seq, h, 3h)`` is
+    ``qkv_proj``, which pins ``fused-cast``, which is present.
+
+    So the old assertion would have gone on passing forever while the entry it
+    protected described a failure that does not happen -- and doc 50 cited that
+    entry as the reason ``baseline_1024`` was 35/36 and went unwalked.
+
+    Both directions now:
+
+    - a declared gap's method must still be MISSING (the old check, kept -- a
+      warning about a hole somebody swept is worse than no warning), and
+    - the (triple, method) must be one ``PINNED_PROJECTION_METHODS`` says a
+      consumer actually pins. A gap nothing demands is not a gap, and filing one
+      costs a walk that never happens.
+
+    The negative control is the deleted entry itself: feeding
+    ``{"triple": (2048, 1024, 3072), "method": "drain", ...}`` back in fails the
+    second clause, because no role at ``N = 3h`` pins ``drain``.
+    """
+    import json
+
+    registry = os.path.join(
+        os.path.dirname(_EXAMPLE), "kernel_registry", "details",
+        "GEMM_bf16_in_bf16_out.json",
+    )
+    with open(registry, encoding="utf-8") as handle:
+        rows = json.load(handle)["shapes"]
     by_method = {(r["M"], r["K"], r["N"]): set(r.get("methods", {})) for r in rows}
+
     for gap in profiles.KNOWN_REGISTRY_GAPS:
         triple = tuple(gap["triple"])
         assert triple in by_method, f"{triple} is not in the registry at all"
@@ -215,6 +269,83 @@ def test_reachability_is_re_derived_from_the_registry_not_asserted():
             "warning about a hole somebody swept is worse than no warning."
         )
         assert gap["family"] in profiles.REACHABLE_FAMILIES
+
+        # ...and the half that was missing. Which role is this triple, at this
+        # family's width, and does that role's consumer pin this method?
+        hidden = cases.FAMILY_SPECS[gap["family"]].hidden_size
+        seq, k, n = triple
+        role = (k // hidden, n // hidden)
+        assert k % hidden == 0 and n % hidden == 0 and role in (
+            profiles.PINNED_PROJECTION_METHODS
+        ), (
+            f"{gap['family']}'s gap names {triple}, which is not a projection "
+            f"shape of a family whose hidden size is {hidden} "
+            f"(roles are {sorted(profiles.PINNED_PROJECTION_METHODS)}). A gap "
+            "against a shape no mode resolves is not a gap."
+        )
+        pinned, pinned_by = profiles.PINNED_PROJECTION_METHODS[role]
+        assert gap["method"] == pinned, (
+            f"{gap['family']}'s gap says {gap['method']!r} is missing at "
+            f"{triple}, but the consumer of that role pins {pinned!r} "
+            f"({pinned_by}). Nothing asks for {gap['method']!r} there, so the "
+            "absent row costs no rung -- this is the inert entry that made "
+            "baseline_1024 read as 35/36 and go unwalked."
+        )
+
+
+def test_the_pinned_methods_are_re_derived_from_the_modules_that_pin_them():
+    """``PINNED_PROJECTION_METHODS`` is a claim about two OTHER files.
+
+    Stated in ``profiles.py`` so the reachability check can use it without
+    importing the builders (which need ml_dtypes and a toolchain this suite
+    deliberately does not have), and therefore re-derived here by ``ast`` from
+    the two modules that really carry the pins. A table copied out of a source
+    file agrees with the day it was copied; this fails instead.
+    """
+    qkv = os.path.join(_EXAMPLE, "builders", "qkv_proj.py")
+    source = open(qkv, encoding="utf-8").read()
+    scratch = None
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "SCRATCH_METHOD" for t in node.targets
+        ):
+            scratch = node.value.value
+    assert scratch, "qkv_proj.py no longer assigns SCRATCH_METHOD at module scope"
+    assert profiles.PINNED_PROJECTION_METHODS[(1, 3)][0] == scratch, (
+        f"qkv_proj pins {scratch!r} and the table says "
+        f"{profiles.PINNED_PROJECTION_METHODS[(1, 3)][0]!r}"
+    )
+
+    # offload's shared chain re-resolves a fused-cast winner to one named
+    # method. Take the name from the call rather than from the comment above it.
+    offload = os.path.join(_EXAMPLE, "pattern", "offload", "offload.py")
+    source = open(offload, encoding="utf-8").read()
+    pinned = {
+        kw.value.value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "resolve_gemm_spec"
+        for kw in node.keywords
+        if kw.arg == "method" and isinstance(kw.value, ast.Constant)
+    }
+    assert len(pinned) == 1, (
+        f"offload.py pins {sorted(pinned)} through resolve_gemm_spec; the table "
+        "assumes exactly one re-resolution method for its whole chain"
+    )
+    chain_method = pinned.pop()
+    for role in ((1, 1), (1, 4), (4, 1)):
+        assert profiles.PINNED_PROJECTION_METHODS[role][0] == chain_method, (
+            f"offload re-resolves to {chain_method!r} and the table says "
+            f"{profiles.PINNED_PROJECTION_METHODS[role][0]!r} for role {role}"
+        )
+    # ...and the qkv role is NOT the chain's, which is the confusion that filed
+    # the inert gap: offload's drain pin does not reach the 3h shape.
+    assert profiles.PINNED_PROJECTION_METHODS[(1, 3)][0] != chain_method, (
+        "the 3h role is pinned to offload's chain method. offload and runlist "
+        "resolve (h,h), (h,4h) and (4h,h) only -- if that has really changed, "
+        "the gap record deleted on 2026-08-12 needs revisiting"
+    )
 
 
 def test_a_decoder_variant_is_refused_by_name_not_omitted():

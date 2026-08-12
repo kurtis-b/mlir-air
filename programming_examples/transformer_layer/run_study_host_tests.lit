@@ -173,5 +173,27 @@
 // the number below was MEASURED on the merged tree. A count reconciled by
 // adding deltas is a count nobody ran.
 //
+// `[2026-08-12]` 517 -> 519, no module added: the `baseline_1024` registry gap
+// that G1 left open was not a gap, and the test that guarded it could not have
+// said so. `KNOWN_REGISTRY_GAPS` held one entry -- `2048x1024x3072` has no
+// `drain` row, therefore `offload`/`runlist` fail at seq 2048 -- whose registry
+// half was true and whose consequence was false: neither mode resolves a `3h`
+// shape at all, and the only consumer of one pins `fused-cast`, which is
+// present. The old clause asserted only "the method is still missing", which is
+// true of every method nobody asks for, so it would have passed forever.
+//
+// +2 test_profiles, and both are about the difference between a MISSING method
+// and a DEMANDED one. `test_a_declared_registry_gap_must_be_one_some_mode
+// _actually_demands` adds the second direction -- a gap must also name a
+// (triple, method) that `PINNED_PROJECTION_METHODS` says a consumer pins -- and
+// the deleted entry is its negative control, since no role at `N = 3h` pins
+// `drain`. `test_the_pinned_methods_are_re_derived_from_the_modules_that_pin
+// _them` keeps that new table honest by `ast`-reading the two files that carry
+// the pins (`qkv_proj.SCRATCH_METHOD`, offload's `_chain_spec` re-resolution),
+// because a table copied out of a source file agrees with the day it was copied.
+// The pre-existing reachability test also stopped checking only that the TRIPLE
+// is present and now checks that the PINNED METHOD is, which is the check that
+// would have caught this class in the first place.
+//
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 517/517 passed in 23 modules
+// CHECK: study host tests: 519/519 passed in 23 modules
