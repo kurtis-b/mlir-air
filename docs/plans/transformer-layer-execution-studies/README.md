@@ -239,7 +239,7 @@ traffic between operators, and `coarse` blends `runlist` and `fused`.
 
 ### The work queue
 
-`[2026-08-12]` **The open rows are 6c, 12, 13 and 14, and they are not sequenced** — 6c
+`[2026-08-12]` **The open rows are 6c, 12, 14 and 15, and they are not sequenced** — 6c
 blocks only the resident tail, and everything else is independent of it and of each other. The
 struck rows are kept because their evidence chains are cited elsewhere; read the bold verdict, not
 the whole cell.
@@ -321,9 +321,18 @@ literal case trap 0's closing sentence forbids. It cannot be fixed the same way 
    ~~**11** is Phase F's remainder~~
    **11 is closed** (11(a) defers to 11(b), whose only claimant is now an exclusive window);
    **12** is Phase G and the two goals — **all three now scoped, none chosen**, which makes it the
-   one row that is a decision rather than a task; **13** is a missing pmode guard on the two
-   latency-asserting gates and is the cheapest real risk on this list; **14** is the int4 model's
-   disabled verify lit.
+   one row that is a decision rather than a task; ~~**13** is a missing pmode guard~~ **13 closed
+   the same day** — both gates refuse off Turbo now, the refusal is itself gated by a lit banner,
+   and the throughput floor carries the mode it was measured at; **14** is the int4 model's
+   disabled verify lit; **15** is the third unguarded latency gate, `compare_roots.py`, which
+   **cannot** be fixed the way 13 was — it compares runs recorded earlier, so it needs the pmode in
+   the manifest first ([34](34-phase-g-scoping.md)'s M4).
+
+   **One operational consequence of 13, for anyone running a port-loop phase**: five of the seven
+   files it touched are gate-defining (`guard_gate_files()` covers all of
+   `agents/scripts/port-loop/` and every `programming_examples/**/*.lit`), so a phase whose
+   fingerprint baseline predates this work will report them as tampering. Take the next baseline
+   from a commit that includes it.
 4. **If you take 6c, R2 is already designed.** [31b](31b-r2-order-seam.md) scopes the next
    increment so it starts from a design rather than a blank page — and it **corrects doc 31's own
    prediction** about which side of the order seam moves. After 6c: re-arm
