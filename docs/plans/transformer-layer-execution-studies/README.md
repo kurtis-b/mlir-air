@@ -123,183 +123,147 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 
 ## `[2026-08-12]` Where things stand, for a session picking this up cold
 
-**Verify NPU power mode is Turbo before measuring any latency.** The 2026-08-10 "machine anomaly"
-(hw_context creation ~78–80 ms/load against ≤2.6 the day before) was **resolved 2026-08-11: it
-was the `xrt-smi` power mode**, reset from Turbo to `Default` by an overnight self-reboot at the
-exact onset — non-persistent state, which is why an `amdxdna` reload and a full reboot both
-failed to clear it and nothing on disk had changed. At Turbo the verdict rung
-(`study/run_mode.py --mode offload --seq 1024 --warmup 2 --samples 5`) reads **156 ms avg,
-3.7 ms/load**, inside doc 29's 164–183 ms band; at `Default` the same rung reads ~2.5–2.7 s.
-So the first hardware action of any session is
+**Verify NPU power mode is Turbo before measuring any latency.** It is non-persistent state and it
+resets on every reboot and every driver reload. At `Default` the verdict rung
+(`study/run_mode.py --mode offload --seq 1024 --warmup 2 --samples 5`) reads ~2.5–2.7 s against
+**156 ms, 3.7 ms/load** at Turbo — a ~15–20× error that presents as a compiler regression, and it
+already cost this project a day of measurement. So the first hardware action of any session is
 `sudo xrt-smi configure --device 0000:64:00.1 --pmode turbo` (needs the operator), verified with
-`xrt-smi examine -r platform`, and **re-set after every reboot or driver reload**. Latencies
-recorded on 2026-08-10 are `Default`-conditional; pre-08-10 records are Turbo-conditional
-([32](32-cost-decomposed-ladder.md), trap 0 below). Byte and count instrumentation is
-pmode-independent.
+`xrt-smi examine -r platform`. Latencies recorded 2026-08-10 are `Default`-conditional; pre-08-10 are
+Turbo-conditional. Bytes and counts are pmode-independent. Full chain: trap 0 below,
+[32](32-cost-decomposed-ladder.md).
 
-**`[2026-08-12]` late: the toolchain is integrated end to end, and wall 6's fix moves nothing
-shipped.** After wall 6 landed, `build-xrt` was rebuilt (`check-air-mlir` **495 pass / 0 fail**, the
-predicted 494 + one regression lit) and `install-xrt` refreshed to match — **both `air-opt` at
-2026-08-12 05:13**, so probes, models and lit suites all resolve the same compiler for the first time
-today. The standing regression leg then re-ran against it: **transformer-layer suite 31 pass / 1
-unsupported / 0 fail** (devq 270, 518 s, Turbo verified in-job), which is exactly the pre-today
-baseline — the 1 unsupported is R1's own parked gate. **And the model path agrees**:
-`POST-INSTALL TEN-MODEL: PASS`, all 10 verify under the refreshed install (devq 271, 65 min, Turbo
-verified in-job, preflight clean). Together those are the evidence that wall 6's per-fill lock count is a
-no-op for every shipped design, as its `write_counter == 1` scoping intended — checked on **both**
-resolution paths rather than one. (Unlike devq 252 earlier the same day, this run had no concurrent
-off-queue dispatch; see queue item 19.) Check the two
-trees with `ls -l`, **never `cmp`** (the install rewrites RUNPATH, so the bytes always differ).
+**The tree is the whole state, and the toolchain is integrated end to end.** Everything is merged on
+`exper/transformer-layer-execution-studies`; **no worktrees and no `worktree-agent-*` branches remain**
+(26 were merged and each verified at 0 unmerged commits before removal). `build-xrt` and `install-xrt`
+both carry every fix — check with `ls -l`, **never `cmp`**, since the install rewrites RUNPATH so the
+bytes always differ. All four regression legs are green against that integrated toolchain:
+**`check-air-mlir` 497 pass / 0 fail**, **transformer-layer suite 31 pass / 1 unsupported / 0 fail**
+(the 1 is R1's parked gate), **ten-model 10/10**, **study host suite 357/357 in 19 modules**.
 
-**`[2026-08-12]` The two owed verifications are GREEN, and both were measurements rather than
-inferences.** The install refresh moved the ten shipped models onto the 2026-08-11 compiler, and the
-claim that 6a/6b are no-ops for every shipped design had only ever been checked in the BUILD tree —
-`POST-INSTALL TEN-MODEL: PASS`, all 10 verify under the refreshed install (devq 252, 65 min, Turbo
-verified in-job). **Provenance caveat, self-reported and recorded rather than dropped**: a
-concurrently-running agent dispatched one dry run to the device **off-queue** during job 252, which
-held the device lock. **The verdict stands, and the reason is directional**: contention pushes a
-correctness gate toward *false failure* — timeouts, `hw_context` exhaustion — and cannot make wrong
-output match an HF bf16 token set, so a PASS obtained under contention is at least as strong as one
-without. The run's wall-clock is not a latency figure and no latency was claimed from it. The
-lesson is queued as item 19. And items 8 and 9, each verified only in its own isolated tree, were built together
-for the first time: **`check-air-mlir` 494 pass / 0 fail** (devq 254), the predicted 492 baseline plus
-one regression lit each. A third result falls out of the same build: R1's `npu.air.mlir` is
-**byte-identical** before and after that integration, so neither compiler fix moves R1's runtime
-sequence and every structural literal derived from the earlier binary carries over unchanged.
+**All four modes are corrected, gated and fully separated by one measurement.** The standing
+cross-mode comparison is [32 §The post-flip walk](32-cost-decomposed-ladder.md): `offload` on its
+shared-xclbin default, Turbo verified, two walks — `fused` < `coarse` < `runlist` < `offload` on
+averages *and* minimums at 512 and 1024, 16/16 orderings. `coarse` is cell C1 of
+[28](28-coarse-blend-space.md)'s space, chosen by measurement ([30](30-coarse-cells-built.md)).
 
-**`[2026-08-12]` The branch is the whole state — there is nothing unmerged anywhere.** The three
-parallel streams of 2026-08-11 (item 6b's compiler fix, R2's scoping, Phase F's items 4 and
-3-portable) are merged into `exper/transformer-layer-execution-studies`, tip `d87c3701`, tree
-clean. **`[2026-08-12]` The worktrees are gone.** Twenty-six agent branches were merged over the day and all 26 verified at **0 unmerged commits** before removal, so the tree is now a single worktree with no `worktree-agent-*` branches left. Nothing is registered that could be mistaken for pending work. ~~**What is NOT in the branch is the
-install**~~ **`[2026-08-12]` The install is REFRESHED and the two trees now agree.**
-`ninja -C build-xrt install` ran (no compile or link steps — `build-xrt` was already current, so it
-was a copy); `install-xrt/bin/air-opt`, `install-xrt/bin/aircc` and
-`install-xrt/python/air/_mlir_libs/_air*.so` are all **2026-08-11 13:28**, matching `build-xrt`
-exactly. So both compiler fixes (6a's fusion correction, 6b's BD pacing) are now in **every probe
-and model path** as well as in the lit suites, and the two resolution paths of
-[15 §Which toolchain tree](15-environment-notes.md) no longer diverge. **Verified by artifact, not
-by timestamp alone**: `agents/probes/probe_fuse_channels_sibling_nests.py --nests 4 --tries 5`
-resolves `install-xrt/bin/air-opt` directly and now reports `{'ok': 5}` / "does not reproduce",
-against the pre-refresh binary's deterministic 5/5 SEGV — and its aircc leg succeeded, which is the
-same tree. 6b's pacing rides the same install but was **not** independently re-verified here; its
-evidence stays the build-tree regression lit and `check-air-mlir` 492/0.
+### What 2026-08-12 settled, and it was a lot
 
-**All four modes are corrected, gated, and — as of late 2026-08-11 — fully separated by one
-measurement.** The modes landed 2026-08-08/09 (`coarse` = cell C1 of [28](28-coarse-blend-space.md)'s
-space, chosen by measurement, [30](30-coarse-cells-built.md)); 2026-08-10 added schema v2 — the
-`device_ms`/`sync_ms`/`host_cpu_ms` decomposition plus `context_loads`/`kernel_attaches` as
-columns for every mode — and the first cost-decomposed ladder ([32](32-cost-decomposed-ladder.md)).
-**The standing cross-mode comparison is now [32 §The post-flip walk](32-cost-decomposed-ladder.md)**:
-`offload` on its shared-xclbin default, Turbo verified, two walks — `fused` < `coarse` <
-`runlist` < `offload` on averages and minimums at 512 and 1024, 16/16 orderings. Suite green on
-NPU2 with the two-pass `addnorm` kernels (31 pass / 1 unsupported — the re-parked R1 gate — / 0
-fail); the ten shipped models re-verified **10/10 under the new install on 2026-08-11** (item
-1(c), closed). The same 31/1/0 re-ran unchanged under item 6b's compiler fix (devq 248), which
-is the evidence that the BD-liveness step is a no-op for every design already under budget.
+Thirteen queue items closed, three phases advanced, and eight new items opened *by* the work. The
+queue below is authoritative; this is the shape.
 
-**Read the retractions, not just the claims.** The documents keep falsified claims with dated
-retractions attached rather than deleting them — a sentence you find here may be marked false
-three paragraphs later. Anything dated before 2026-08-08 predates the taxonomy correction and
-ranks *implementations*, not the four modes; latency is pmode-conditional per trap 0 (2026-08-10's
-records are `Default`, pre-08-10's are Turbo); [27](27-common-ladder-result.md)'s warm DRAM
-ordering is superseded by [32](32-cost-decomposed-ladder.md)'s (the targeted pool eviction moved
-`runlist` below `fused` and `coarse`); doc 29's original fallback sentence
-(`--expand-load-pdis`) is falsified in place by its §The hardware verdict; and **every `offload`
-latency/variance figure recorded before 2026-08-11 describes the now-retired ELF default** —
-the current default is the shared xclbin, and the post-flip walk is the record for it.
+- **Three silent-miscompile classes fixed** — items **8**, **9** and **wall 6**. Each produced a
+  *green wrong answer* rather than an error: an affine map sized with one symbol while composing an
+  N-symbol one (and the fix found two more of the same class, one silently producing **wrong
+  addresses**); an extent measured from sizes while offsets were ignored, shrinking a buffer under
+  its own readers with `EXIT=0`; a memtile semaphore sized from *static op count* while the same pass
+  emitted a quarter as many BDs. `check-air-mlir` 492 → 497.
+- **Six checks that could not fail, made able to fail** — items **10**, **14**, **16**, **17**, **19**,
+  **20**, plus a five-item cleanup batch. A census counting the wrong flow kind and reading **0**
+  exactly when over budget; a CI dashboard reading **green off a sibling test**; an emulation arm that
+  **never built the module it certified**; a manifest diff whose **reader shipped before its writer**;
+  a flag where asking for the safe branch changed nothing; and `tee /dev/stderr` **shredding a devq log
+  while the trailing PASS survived**. This is the session's dominant theme — none of them produced a
+  wrong number, all produced a *green* one.
+- **Three phases advanced**: **Phase G's G0** (one profile, one command, one manifest — ran cold in
+  347 s), **Goal 1's W1** (the banded mask, gated at 1.24× margin with its negative control verified
+  failing on device), and **q4_0 steps 1–4 + 6** (device-green, step 4 and step 6 **bit-identical on
+  device**, 4.750 → 4.500 bits/weight).
+- **H8's first cut landed** — declarative pipeline fusion, gated by **byte-identical** reproduction of
+  a hand-written reference. Doc 16 sized H8 "large, and needs H2"; **H2 had already landed** and its
+  other prerequisite (J7 as a hand-written reference) was satisfied twice over. Nobody had connected
+  either.
 
-**What 2026-08-11 settled, in one list.** Four queue items closed that day and the earlier
-versions of this paragraph tracked each one twice as it moved; the retraction chains live in the
-phase docs, and this is the settled state. Read the linked section, not this summary, before
-citing a number.
+### R1's standing changed, and this is the paragraph to read before spending a session on it
 
-- **Item 3 — `offload`'s shared xclbin is the DEFAULT, and the 4096 wall is gone.** The
-  multi-launch dispatch experiment answered **NO**: in-stream `load_pdi` faults the firmware
-  (`fatal_error_type 0x10`), and the scoped `--expand-load-pdis` fallback was **falsified** (a
-  no-op on this aiecc; the claim had no artifact). Route 3 landed instead — the shared chain pins
-  a `fused-cast` winner to the shape's `drain` row and runs 10/10 clean at 4096 with
-  `context_loads 1` over 30 dispatches. `AIR_OFFLOAD_LEGACY_ELF=1` is now the ELF opt-in; no
-  pinned gate literal moved. The owed re-walk ran the same day — **all four modes separate for
-  the first time** ([29 §The hardware verdict](29-offload-n-streams.md),
-  [32 §The post-flip walk](32-cost-decomposed-ladder.md)).
-- **Item 6a — the `air-fuse-channels` crash was three defects, not one.** The diagnosed
-  use-after-free, a silent N-way miscompile behind it (pairwise 2-slot wraps where 1 + k belong),
-  and — found by the same-day review, which the first fix had faithfully *preserved* — a loose
-  dynamic-offset comparison that let sibling nests reading different L3 slices fuse into clones of
-  one transfer. Fixed in `AIRDependencyScheduleOpt.cpp` with a regression lit. **The sharp
-  consequence: the old pass's lucky-green outputs were themselves wrong, so any structural literal
-  derived from a pre-fix dump must be re-derived, never compared against.**
-- **Item 6b — shim BD exhaustion is fixed, and the wall had been mis-attributed twice.** The
-  offending feed is `hidden` at **96** tasks (not the down feed at 24), 97 live BDs against tile
-  (1,0)'s 16. `ea3b98ce` paces the offending MM2S feed with completion-token awaits in
-  `airrt-to-npu`. **Awaits, not frees** — a compiler-inserted `dma_free_task` before completion is
-  a race. The other J1 candidate, loop-shaped BD programs, is **closed as arithmetically
-  unavailable** for a retiling feed (all four hardware BD dimensions in use, no mergeable pair).
-  No-op unless a tile is over budget, which is why nothing shipped moves: `check-air-mlir` 492/0,
-  suite 31/1/0 against the final binary. **Stated evidence gap: R1 is the only module that
-  triggers the recycling and it hangs on 6c, so the pacing is verified at pass and compile
-  altitude and NOT on hardware.**
-- **Item 7 — `addnorm` is two-pass f32 and the variance cliff is pinned.** The offset rows' first
-  hardware run measured `atol_required` **0.0** on both variants, against the one-pass kernel's
-  22.2 / 33.1 collapse in the same regime; the provenance refresh moved `block`/`coarse` to
-  1.663e-2 (margin 1.43×) and left `fused` unchanged to the digit, as its tail predicts
-  ([23 §2](23-rules-and-open-items.md)).
+Four walls behind R1 were found, fixed and verified today — **4** BD liveness, **5** issue order
+(closed by E1), **6** the memtile lock count, plus a builder change — **and the gate still does not
+pass**. Wall 7 is now *characterized* rather than merely hit: it is a **race** — one ELF, identical
+inputs, fresh processes, `herd_x 2` alternating PASS/TIMEOUT and at 128 producing **four distinct
+wrong answers**. Task count, 6b's pacing, shim order, lock counts and `runtime_loop_tiling_sizes` are
+excluded **by measurement**. And a **second, deterministic** wrong answer sits at `herd_x=1, k'=4,
+chunks=4` (queue item 23).
 
-**`[2026-08-12]` R1's standing has changed, and this is the paragraph to read before spending a
-session on the resident tail.** Four walls behind it were found, fixed and verified today (4 BD
-liveness, 5 issue order, 6 the memtile lock count, plus E1's builder change), and the gate still does
-not pass. Wall 7 is now **characterized rather than merely hit**: it is a **race** — one ELF, identical
-inputs, fresh processes, `herd_x 2` alternating PASS/TIMEOUT and at 128 producing *four distinct wrong
-answers*. Task count, 6b's pacing, shim order, lock counts and `runtime_loop_tiling_sizes` are all
-excluded **by measurement**. And a **second, deterministic** defect is now visible at `herd_x=1,
-k'=4, chunks=4` (5/5, corr 0.869).
+**So R1 is correct only at the fully degenerate 1×1×1 rung** — while the module-interpreting
+emulation arm certifies it element-exact at all 11 ladder shapes. The hardware disagrees with a design
+the interpreter passes. The honest framing is **not** "one more wall" but that **the one-segment
+residency composition has never been shown to work beyond degenerate**. It does at least now have a
+**discriminator**: `probe_r1_rung.py` reads the output BO back on timeout, which nothing had ever
+done, so the next attempt starts with an instrument rather than a hang.
 
-**So R1 is correct only at the fully degenerate 1×1×1 rung**, while the module-interpreting emulation
-arm certifies it element-exact at all 11 ladder shapes — the hardware disagrees with a design the
-interpreter passes. The honest framing is not "one more wall" but that **the one-segment residency
-composition has never been shown to work beyond degenerate**. The gate does at least now have a
-**discriminator** (`probe_r1_rung.py` reads the output BO back on timeout, which nothing had ever
-done), so the next attempt starts with an instrument rather than a hang. `fused`'s SPECS atol stays
-PROVISIONAL and **no resident-tail latency or byte figure has ever been measured on hardware**.
+`fused`'s SPECS atol stays **PROVISIONAL** and **no resident-tail latency or byte figure has ever
+been measured on hardware.**
 
-**The one thing blocking the study's definitional gap is item 6c.** `fused` is *packaged* today
-and *resident* by definition ([03 §The vocabulary](03-measurement-model.md)), and R1 — the
-one-segment FFN interior — is the increment that closes it. R1 is built and structurally green,
-but **its device gate has never passed**: with BDs bounded the numeric arm compiles for the first
-time and then times out on hardware (`ERT_CMD_STATE_TIMEOUT`) because the shim issue order is
-channel-major while R1's consumers need round-major interleave. `air.preserve_shim_dma_order` was
-measured and does **not** reach it — the grouping is made upstream by `air-dma-to-channel`'s
-per-channel hoisting. So **`fused`'s SPECS atol stays PROVISIONAL**, the emulation tests and the
-structure arm are the standing evidence, and no resident-tail latency or byte figure has been
-measured on hardware. Item 6c was scoped rather than attempted because the fix is structurally
-larger than 6b's brief ([31 §Wall 5](31-fused-resident-tail.md)).
+### The research changed the framing, and one finding reorders the work
 
-**Read in this order.** [03 §The taxonomy](03-measurement-model.md) for what the four modes mean —
-that is the definition and it is current — and its §The vocabulary (submission against dispatch,
-packaged against resident, knobs against costs). Then this section, then
-[23](23-rules-and-open-items.md) for the design rules that have cost sessions (the per-column shim
-budget, the L3-side offset rule), then [32](32-cost-decomposed-ladder.md) before ANY measurement.
-For the resident-`fused` phase, [31](31-fused-resident-tail.md) is the spec and
-[31a](31a-resident-byte-floor.md) the byte floor. [26](26-mode-rebuild-feasibility.md) stays worth
-reading *for its corrections*, not as current state.
+Seven mapping/cost frameworks were surveyed against primary sources **including their repositories**
+— docs [39](39-research-llmcompass.md)–[46](46-research-tileflow.md), with
+[44](44-mapping-frameworks-synthesis.md) the synthesis. **Read 44 and 46 before designing anything in
+this space.** Four load-bearing results:
+
+1. **We have four composition states and only three words.** TileFlow's scopes are a 2×2 of {compute
+   shared in time vs partitioned in space} × {footprint exclusive vs additive}. *Packaged*, *resident*
+   and — new today — *interleaved* are three of them. The fourth, independent copies with additive
+   footprint, is what iron's autotune actually converged on and what our `parallel_seq`/`parallel_heads`
+   axis has been building **without a name**.
+2. **Fusing by interleaving is not fusing by residency**, and FLAT *considered and rejected*
+   co-residency ([45](45-research-flat.md)). R1 spent four walls pursuing the harder of the two
+   without anyone having established it was the one worth having.
+3. **Which sub-chain to fuse is a function of the rung.** The attention chain is 12% of the layer at
+   N=512 and 79% at 16K. At `baseline_768` the FFN interior is the right target; at the top of our
+   ladder attention is. Make sequence length an *input* to which increment gets built.
+4. **Every four-mode comparison in this study is at a fixed tiling** — and TileFlow's Table 7 shows
+   granularity looking **18× important under fixed tiling** while **three of four granularities tie
+   exactly under searched tiling**. No packaged-vs-resident-vs-interleaved claim should be published
+   until it survives a tile-size search **on both sides**.
+
+Also: **R1's wall 5 and FLAT §5 are the same object.** A shared outer loop makes channel-major
+unreachable *by construction*, so the ordering constraint we tried to impose downstream is a property
+of the loop structure upstream — check whether `air-fuse-pipeline-launches` can carry that shape
+before implementing queue item 6c as a scheduling pass.
+
+**Read the retractions, not just the claims.** These documents keep falsified claims with dated
+retractions attached rather than deleting them — a sentence you find here may be marked false three
+paragraphs later. Anything dated before 2026-08-08 predates the taxonomy correction and ranks
+*implementations*, not modes. And that discipline applies to the surveyed literature too: **four of
+the seven frameworks had shipped code contradicting their papers**, and three headline validations do
+not cover the path we care about.
+
+**Read in this order.** [03 §The taxonomy and §The vocabulary](03-measurement-model.md) for what the
+four modes mean — that is current. Then this section, then [23](23-rules-and-open-items.md) for the
+design rules that have cost sessions (the per-column shim budget; the L3-side offset rule), then
+[32](32-cost-decomposed-ladder.md) before **any** measurement. For mapping-space work,
+[44](44-mapping-frameworks-synthesis.md) then [46](46-research-tileflow.md). For the resident tail,
+[31](31-fused-resident-tail.md), [37](37-wall-5-order-seam-design.md) and
+[38](38-iron-encoder-pipeline-reference.md) — the last being a **working fused BERT layer in `~/iron`
+that this study was never ported from**. [26](26-mode-rebuild-feasibility.md) stays worth reading
+*for its corrections*, not as current state.
 
 **If you are picking up `coarse`, do not re-derive it.** [28](28-coarse-blend-space.md) is the
-scoping and [30](30-coarse-cells-built.md) is the result; the two sibling cells stay runnable
-(`make check-coarse-c2`, `check-coarse-c3`, `make coarse-cell-structure`) precisely so that
-re-deciding the blend costs a measurement rather than a rebuild.
+scoping and [30](30-coarse-cells-built.md) the result; the sibling cells stay runnable
+(`make check-coarse-c2`, `check-coarse-c3`, `make coarse-cell-structure`) so re-deciding the blend
+costs a measurement rather than a rebuild.
 
 **The one-paragraph version.** The modes are not defined by *who sequences the work* but by
 **reconfiguration cost against DRAM traffic**: `runlist` pays per-operator reconfiguration with
-everything on device, `offload` minimizes reconfiguration (one xclbin, N instruction streams —
-matching iron; all LINEAR operators on the NPU, all NON-LINEAR on the host), `fused` eliminates DRAM
-traffic between operators, and `coarse` blends `runlist` and `fused`.
-
+everything on device, `offload` minimizes reconfiguration (one xclbin, N instruction streams; all
+LINEAR operators on the NPU, all NON-LINEAR on the host), `fused` eliminates DRAM traffic between
+operators, and `coarse` blends `runlist` and `fused`.
 ### The work queue
 
-`[2026-08-12]` **The open rows are 6c, 12, 21, 23 and 24, and they are not sequenced** — 6c
-blocks only the resident tail, and everything else is independent of it and of each other. The
+`[2026-08-12]` **The open rows are 12, 21, 23, 24, 25 and 26, and they are not sequenced.** The
 struck rows are kept because their evidence chains are cited elsewhere; read the bold verdict, not
 the whole cell.
+
+**Where to start, if you want a recommendation.** **25** — the balance instrument — is the highest
+leverage thing on this list and depends on nothing: it is the objective function for every mapping
+question, seven frameworks converge on its design ([44](44-mapping-frameworks-synthesis.md)), and
+without it no search or tuning here is falsifiable. **23** is next: deterministic beats a race by a
+wide margin on cost, and it is the one R1 question that might actually close. **26** is small and
+answers whether the mapping space needs a search at all. **21** (wall 7's race) is large and
+uncertain, and [45](45-research-flat.md)/[46](46-research-tileflow.md) raise a real question about
+whether the resident composition is the right target at our sequence lengths — **that is a decision
+for the operator, not a default.**
 
 **`[2026-08-12]` Four rows closed that day and two are new — and the compiler half of the queue is
 now empty.** **8** (the two-symbol offset map, sized from the map it composes — plus two further
@@ -366,6 +330,8 @@ literal case trap 0's closing sentence forbids. It cannot be fixed the same way 
 | **23** | **R1 runs DETERMINISTICALLY WRONG at `herd_x=1, k'=4, chunks=4`** `[2026-08-12]` — a second, distinct hardware defect found while characterizing wall 7, and not chased. 5/5 identical, corr 0.869, no timeout. **This is the finding that reframes the increment**: R1 is correct only at the fully degenerate 1×1×1 rung, so the honest statement is not "an eighth wall" but that **the one-segment residency composition has never been shown to work beyond degenerate**, with two distinct hardware defects now visible — one nondeterministic (item 21), one deterministic (this). Note the module-interpreting arm calls the built module **element-exact at all 11 ladder shapes**, so the hardware disagrees with a design the interpreter certifies | Independent of 21; deterministic, so cheaper to chase | devq 273–276 |
 | **24** | **`mha_out_proj`'s `[1,1]` "load-bearing, and measured" claim deserves re-measurement** `[2026-08-12]`, flagged not found. Doc 26 §4's retraction and the backend-preset row rest on `[2,2]` hanging `mha_out_proj` @4096 3/3 against `[1,1]` passing 3/3. But for R1 the two settings are **byte-identical** through `aie.air.mlir`, `npu.air.mlir`, `.ctrltext` and `.pdi` — provably inert. That does not refute the mha result (different design, different shape) but it does mean the knob's mechanism is not what a reader would assume, and **wall 7 has just shown that this composition hangs nondeterministically** — so a 3/3 that predates that knowledge is weaker evidence than it looks. **Not re-measured at mha's shape**; flagged so the next person does not inherit it as settled | Re-run the backend-preset probe at mha's shape with ≥5 repeats | [26 §4](26-mode-rebuild-feasibility.md) · `agents/probes/probe_backend_preset_hardware.py` |
 | ~~**22**~~ | **DONE `[2026-08-12]` — the flags are wired, and the alarming half of this row was wrong.** `mmult_aie2{,p}.py` parsed `--herd-m`/`--herd-n` and never passed them to `mmult_runner`, so the defaults were used while `herd_m` still shaped the built artifact — item 19's defect in a benchmark. **But the row's consequence does not follow**: `bf16/Makefile:156` invokes the runner **bare, with no arguments at all**, and the `--herd-*` callers found by grep are `i16`/`i8`'s `Makefile` driving a *different* script, `run.py`, which **does** read `args.herd_m` (`:555`). So **no recorded figure is affected** — the defect was **latent**, waiting for the first hand-run sweep, which is a materially smaller claim than the row made. Fixed in both files with the reasoning in a comment; an AST audit now reports **zero dead flags** in each | done | [23 §3](23-rules-and-open-items.md) |
+| **25** | **Build the balance instrument** `[2026-08-12]`, specified by the seven-framework survey ([44 §The instrument](44-mapping-frameworks-synthesis.md)) and by the two defects found in iron's hand-rolled version ([38](38-iron-encoder-pipeline-reference.md)). Five parts, each taken from a different framework and none of them speculative: a **`[cycle × port]` demand matrix per column** (SCALE-Sim); a **static back-solve** of the bandwidth stall-free execution would have required — **no simulator, no hardware run**, which is what makes a search affordable at all (SCALE-Sim's `InterfaceBandwidth: CALC`); overflow priced as a **slope**, `min(1, 2/demand)`, with **demand printed beside budget** (Timeloop + MAESTRO); **latency = `max` over per-resource isolated cycles whose ARGMAX NAMES the bottleneck** (Timeloop, ~100 lines); persisted as a `(component, action, **arguments**) → cost` table where **ours holds measured ns and bytes** (Accelergy's ERT — and the arguments matter: a `dma_transfer` is a function of `(n_words, n_dims, stride)`, so a counter reporting one scalar has already destroyed what our BD-stride walls need). **Fix iron's two defects on the way in**: its isolated arm kept MHA in the measurement, and never fetched ~9.4 MB of weights the full build does. **Why this first**: 480,000 mappings within 5% of peak performance vary **19×** in energy — the objective matters more than the search, and building a search against an unsound one converges confidently on the wrong point, which is exactly what iron's defect did | Medium; host + device | [44](44-mapping-frameworks-synthesis.md) · [38](38-iron-encoder-pipeline-reference.md) |
+| **26** | **Derive legality statically, and find out how big the space actually is** `[2026-08-12]`. Cores ≤ 32, per-column shim MM2S ≤ 2 **across the segment**, memtile feed ports, reduction routing. The mechanism is TileFlow's in ~30 lines ([46](46-research-tileflow.md)): a **cardinality** resource accumulated up a scope tree, **`max` for shared-in-time scopes and Σ for partitioned-in-space ones** — which is our per-column budget structurally, and the thing MAESTRO's byte-rate model could not express. Three things to change on the way: count *our* quantity rather than spatial loop extents, make the budget **per column** rather than one uniform pair per level, and **slope rather than exit**. **The point is the measurement, not the machinery**: iron's legality prune left a space small enough that placements were hand-authored tables with only **seven** legal `(parallel_heads, parallel_ffn)` tails, so ours may be large before legality and small after — and if it is small, item 25's instrument plus enumeration beats any search | Small, host-only; reuses item 10's census | [46](46-research-tileflow.md) · [38](38-iron-encoder-pipeline-reference.md) |
 | ~~**19**~~ | **DONE `[2026-08-12]` — the fail-open flag is closed and the device lock has a preflight.** Audit by AST (every argparse `dest` never read): **0 dead flags across 115 study and agent scripts**; the wider tree gave 9, **two of dispatch shape**. `channel_examples/mmio/mmio.py`'s `--compile-mode` was parsed and never read, falling straight through to `run_test` — item 19's defect verbatim, where **asking for the safe branch got the dispatch**. Fixed. Flipping the *default* was judged too invasive and reported: ~15 examples default to `compile-and-run` with lit recipes invoking them bare, so flipping one makes the tree inconsistent and flipping all breaks every example lit — and **the defect was never the default, it was that asking changed nothing**. `devq.sh preflight` exposes devq's **existing** `device_idle()` rather than adding a second lock path, never touches `/tmp/npu.lock`, holds nothing, and **exits 0 inside a devq job** (probing there would see the caller's own runner and refuse every legitimate measure). Three-valued — held refuses, indeterminate warns. Wired into `run_profile.py` so it is not itself a check nobody calls. `devq-selftest` **20 → 25**. **Reported, not fixed**: 7 remaining dead flags, of which `--seed` in `llms/verify/verify_runner.py` is the one worth attention — a *seeded* verification is not | done | devq · [23 §3](23-rules-and-open-items.md) |
 | ~~**20**~~ | **DONE `[2026-08-12]` — documented at the writing end, where it is the only place it can be caught.** `tee /dev/stderr` inside a devq job overwrites the job log from offset 0: devq holds it `O_APPEND` on one fd while `/dev/stderr` re-opens the same regular file at 0. Job 266 **lost 10 of 13 legs and still printed PASS**, because the verdict is emitted last and survives the overwrite. Now a named block in `devq.sh`'s header beside the existing `run`-not-`submit` warning, carrying the measurement, the fix (capture to a file, or just write to stdout) **and the reading rule**: count a log's legs against what the script should have emitted rather than trusting a trailing verdict. Stated explicitly there — **`devq.sh log` cannot detect this after the fact, the bytes are gone**, which is why the rule lives at the writing end and not in a checker. `devq-selftest` still 25/25 | done | devq |
 | ~~7~~ | **DONE `[2026-08-11]` — `addnorm` is two-pass f32 and the cliff is pinned.** Both fused variants moved (mirroring J7a's layer_norm fix; staged one-pass forms stay, undispatched and documented); the offset rows' first hardware run measured `mean_rel_L1` **1.390e-3 / 1.409e-3** with `atol_required` **0.0** against the one-pass kernel's 22.2 / 33.1 collapse; the provenance refresh moved `block`/`coarse` to **1.663e-2** (margin 1.35× → 1.43×), `runlist` to 1.746e-2 (worst element improved), and left `fused` **unchanged to the digit** — correctly, its tail is the layer_norm path. Suite green with the new kernels; no tolerance widened | done | [23 §2](23-rules-and-open-items.md) |
@@ -378,39 +344,19 @@ literal case trap 0's closing sentence forbids. It cannot be fixed the same way 
 2. **Read [03 §The taxonomy and §The vocabulary](03-measurement-model.md)** if you have not. The
    four modes isolate reconfiguration cost against DRAM traffic, and the knobs-and-costs map is
    the axis every measurement here is reported on.
-3. **Then pick from the queue above.** The open set is small and none of it is sequenced:
-   **6c** is the only item blocking the resident tail (and therefore `fused`'s definition);
-   ~~**8**, **9** and **10**~~ **8, 9 and 10 all closed 2026-08-12** — the two-symbol offset map is
-   sized from the map it composes (plus two more hardcodes of the same class the fix uncovered, one
-   of them silently producing wrong addresses); the silent shrink now computes a real extent; the
-   column census counts demand and carries its own negative control. **Read 8's and 9's rows before
-   touching R2**: 9's fix invalidates 31b's reason for avoiding literal-offset L1 bands, and 8
-   removes the abort that forced R2's flatten-the-refill-nest dodge — so **both of R2's design
-   constraints have moved** and it should be re-derived rather than inherited;
-   ~~**11** is Phase F's remainder~~
-   **11 is closed** (11(a) defers to 11(b), whose only claimant is now an exclusive window);
-   **12** is Phase G and the two goals — **all three now scoped, none chosen**, which makes it the
-   one row that is a decision rather than a task; ~~**13** is a missing pmode guard~~ **13 closed
-   the same day** — both gates refuse off Turbo now, the refusal is itself gated by a lit banner,
-   and the throughput floor carries the mode it was measured at;
-   ~~**14** is the int4 model's disabled verify lit~~ **14 closed the same day** — the OOM it was
-   disabled for does not reproduce on a host of the size the disable named (10.53 GiB peak split /
-   12.57 GiB single-process, devq 255), the lit is re-enabled and green, and lit CI now carries the
-   tree's only quantized end-to-end gate — which had been reporting **green off a sibling test**;
-   ~~**15** is the third unguarded latency gate~~ **15 closed `[2026-08-12]`, and with it**
-   [34](34-phase-g-scoping.md)'s **M4** — the measurement condition is recorded in the manifest now
-   (a new declared block, **no schema version bump**, so all 16 v2 CSVs still read) and
-   `compare_roots` **refuses** a pmode mismatch while **flagging** an unrecorded one.
-
-   **One operational consequence of 13, for anyone running a port-loop phase**: five of the seven
-   files it touched are gate-defining (`guard_gate_files()` covers all of
-   `agents/scripts/port-loop/` and every `programming_examples/**/*.lit`), so a phase whose
-   fingerprint baseline predates this work will report them as tampering. Take the next baseline
-   from a commit that includes it.
-4. **If you take 6c, R2 is already designed.** [31b](31b-r2-order-seam.md) scopes the next
-   increment so it starts from a design rather than a blank page — and it **corrects doc 31's own
-   prediction** about which side of the order seam moves. After 6c: re-arm
-   `run_npu2_ffn_resident_peano.lit`, one gate run, measured atol into the SPECS row.
+3. **Then pick from the queue above**, where the row order carries a recommendation: **25** (the
+   balance instrument) is highest-leverage and blocks nothing; **23** (R1's *deterministic* wrong
+   answer) is the cheapest R1 question; **26** measures whether the mapping space needs a search at
+   all; **24** is a small re-measurement; **21** (wall 7's race) is large and its target is itself in
+   question; **12** is Phase G / Goal 1 / Goal 2, all three scoped and each a decision rather than a
+   task.
+4. **If you take the resident tail, read three things first.** [31b](31b-r2-order-seam.md) designs
+   the R2 increment — but note **both of its design constraints dissolved** when items 8 and 9 landed,
+   so it must be **re-derived rather than inherited**. [45](45-research-flat.md) argues the ordering
+   constraint R1 kept failing on is a property of the loop structure *upstream*, so **check whether
+   `air-fuse-pipeline-launches` can carry that shape before writing a scheduling pass**. And
+   [38](38-iron-encoder-pipeline-reference.md) is a **working fused BERT layer in `~/iron`** whose
+   answer to our four walls is that **it never creates a second segment**.
 5. ~~**Housekeeping the operator owes, whenever an exclusive window opens**: `ninja -C build-xrt
    install`~~ **`[2026-08-12]` DONE — the install is refreshed and verified by artifact** (cold-start
    section above), so probes and models resolve the 2026-08-11 compiler. Item 11(b)'s plotting
