@@ -90,6 +90,52 @@
 // above finds none left. The negative-control arm is INCONCLUSIVE rather than
 // passing: it times out before it can compare, so it never exercises the
 // rejection it exists to prove. Delete the UNSUPPORTED line to re-arm.
+//
+// `[2026-08-12]` WALL 7 IS CHARACTERIZED, AND IT IS A RACE. The recipe stays
+// parked, but no longer on an unknown. Measured over 4 device jobs (devq
+// 273/274/275/276), 100+ dispatches, with the SAME builder at reduced shapes
+// -- and with the module-interpreting emulation arm run at all 11 of those
+// shapes host-side, ELEMENT-EXACT at every one, so the shapes below are valid
+// probes of the lowering and not of the builder:
+//
+//   herd_x 1, 64x32x32   (sweeps 1, k' 1, chunks 1): 5/5 identical PASS,
+//       0/2048 mismatches, corr 0.99986. R1's dataflow DOES run on hardware.
+//   herd_x 2, 64x64x64   (sweeps 1, k' 2, chunks 1): PASS, TIMEOUT, PASS,
+//       TIMEOUT, PASS over 5 dispatches of ONE ELF with identical inputs.
+//   herd_x 2, 64x128x128 (sweeps 1, k' 4, chunks 2): TIMEOUT, then 3031,
+//       4426, 4502, 4502 mismatches -- five dispatches, four distinct wrong
+//       answers (corr 0.73 / 0.44 / 0.42 / 0.42).
+//   herd_x 4 (every shape tried: 4, 8, 12, 16, 24, 64, 96 hidden tasks;
+//       tiling [2,2], [1,1] and none; paced and unpaced): 5/5 TIMEOUT, with
+//       0 of 4 down cores ever writing its y strip.
+//
+// So the wall is NOT task count, NOT item 6b's BD pacing (herd_x 4 hangs at 4
+// hidden tasks, well under the 16-BD budget and squarely in the UNPACED
+// regime -- a census of npu.air.mlir puts that rung at 4 awaits / 10 frees
+// against the paced rungs' 20 awaits / 6 frees, the pacing turning on at 16
+// tasks), NOT the shim issue order, NOT runtime_loop_tiling_sizes (provably
+// inert for this design: [2,2] and [1,1] give byte-identical aie.air.mlir,
+// npu.air.mlir, .ctrltext.0, .ctrltext.1 and .pdi.2 -- only the 368-byte
+// main/empty PDI wrappers and the .note.xrt.UID build stamp move), and NOT a
+// lock COUNT defect (wall 6, closed).
+// It is a nondeterministic scheduling/lock race whose probability of landing
+// on a deadlock rises with herd width, and which at herd_x 4 is 1.0.
+//
+// ctx_pc 0x28B060AD IS NOT A DATUM ABOUT R1. It is the firmware's
+// clean-timeout report site: it appears in 11 recorded hangs across four
+// unrelated designs (mha GEMM devq 58/61/62, offload N-streams 103/104/109,
+// R1 235/236/259/268), and a purpose-built control -- a two-herd i32 copy
+// with one unmatched ChannelGet, no GEMM, no memtile staging -- reproduces it
+// exactly (devq 273). The only other value in the whole corpus, 0x28B0EC98,
+// is the fatal_error_type 0x10 firmware fault. The field encodes the hang
+// CLASS, not which stage is stuck; do not spend another session decoding it.
+//
+// Three backend knobs were A/B'd against the race, five dispatches each, and
+// NONE fixes it (devq 276): use_lock_race_condition_fix takes herd_x 2 from
+// 3/5 PASS to 0/5; ..._v2 removes the deadlock and replaces it with a
+// DETERMINISTIC wrong answer (5/5 FAIL, 2688/4096, corr 0.517); and
+// omit_pingpong="all" is inert (3/5 PASS, the baseline). All three leave
+// herd_x 4 at 0/5.
 // UNSUPPORTED: true
 //
 // REQUIRES: ryzen_ai_npu2, peano
