@@ -6110,10 +6110,26 @@ struct ShrinkMemrefSizesByAccessPattern
     if (getAllChanUsers(memref, users, dealloc, rewriter).failed())
       return failure();
 
-    // Analyze data access pattern.
+    // Analyze data access pattern. `bounded` reports whether every offset of
+    // every user could be bounded; if it could not, the extent below is not a
+    // safe size for the allocation and shrinking would silently truncate it.
+    bool bounded = true;
     SmallVector<int64_t> overall_access_bounds =
-        air::getDataAccessShapeFromMemcpyOp(memref, users);
+        air::getDataAccessShapeFromMemcpyOp(memref, users, bounded);
     auto memref_shape = getTensorShape(memref.getType());
+
+    if (!bounded) {
+      // Decline, loudly. Leaving the memref at its declared size is always
+      // correct -- only the optimization is lost -- whereas shrinking on an
+      // unbounded access pattern produces a buffer the surviving accesses run
+      // off the end of, with no other check downstream to catch it.
+      alloc->setAttr("air.shrinkage", rewriter.getBoolAttr(false));
+      alloc->emitWarning("air-shrink-memref-sizes-by-access: declining to "
+                         "shrink this allocation. Its access pattern has an "
+                         "offset this pass cannot bound, so no size can be "
+                         "shown to contain every access.");
+      return failure();
+    }
 
     bool shrinkMemref = false;
     bool boundsAreAllOnes = true;
@@ -6287,6 +6303,17 @@ private:
     auto new_offsets = getUpdatedOffsetsAfterShrinkage(
         memref_shape, overall_access_bounds, air::getOffsetsAsValues(chanOp));
     auto mixedOffsets = chanOp.getMixedOffsets();
+    // An empty result means the analysis hit an offset from an iteration space
+    // it does not model. Bail instead of indexing past the end of the vector,
+    // which is what the loop below used to do.
+    if (new_offsets.size() < mixedOffsets.size()) {
+      chanOp->emitWarning(
+          "air-shrink-memref-sizes-by-access: declining to shrink this "
+          "allocation. This access pattern's offset comes from an iteration "
+          "space the pass does not model, so it cannot be rebased onto a "
+          "smaller memref.");
+      return failure();
+    }
     for (unsigned i = 0; i < mixedOffsets.size(); i++) {
       if (new_offsets[i] < 0)
         continue;
