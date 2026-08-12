@@ -89,7 +89,37 @@ getLockValuePair(const AIE::AIETargetModel &targetModel, Value buffer_memref,
 // `isChainLockCandidate` is a pure structural predicate; the caller is
 // responsible for gating it on the `use_lock_race_condition_fix_v2` pass
 // option.
-bool isChainLockCandidate(AIE::BufferOp buf);
+//
+// `allowMimo` additionally admits the MIMO shape (M writers + N readers) and
+// is gated on the separate `mimo-chain-lock` option. It is OFF by default and
+// it is a FALSIFIER ARM, not a fix: see `isUnorderableMimoMemtileBuffer` below
+// and doc 52 §8 for the measurement that rules the two-chain form out.
+bool isChainLockCandidate(AIE::BufferOp buf, bool allowMimo = false);
+
+// True iff `buf` is an L2 memtile buffer whose access shape is MIMO -- M > 1
+// writers AND N > 1 readers -- on a single slot.
+//
+// This shape is UNORDERABLE by any per-BD lock protocol, which is why
+// `isChainLockCandidate` excludes it and why extending the chain lock to cover
+// it does not work. An AIE2 BD descriptor carries exactly one acquire-lock
+// field and one release-lock field, so a writer's single release must serve
+// EITHER the writer chain (hand the baton to the next writer) OR the readers
+// (signal data-ready) -- it cannot do both. Spending it on the chain leaves
+// the readers unbound and the next writer overwrites a fill nobody has read;
+// spending it on the readers leaves the writers unordered, which is exactly
+// the legacy template's race. A counting argument closes the remaining
+// freedom (asymmetric acquire/release counts): with one BD per participant
+// there is no assignment of lock identities and counts that both orders the
+// writers and binds the readers. Doc 52 §8 carries the argument, the two
+// measured verdicts from `agents/probes/probe_aie_buffer_writer_race.py
+// --check-order`, and the BD-count arithmetic showing that the unrolled form
+// which WOULD work costs the same BDs as the builder-side per-column fix and
+// so does not reach the gate shape either.
+//
+// Used to emit a diagnostic naming the buffer instead of silently falling
+// through to the legacy counted-lock template, which is how this defect
+// stayed invisible for five days.
+bool isUnorderableMimoMemtileBuffer(AIE::BufferOp buf);
 
 // Classify a chain-lock buffer's access shape. Counts distinct memcpy
 // users (channel puts/gets) on the buffer's underlying memref result.
@@ -227,6 +257,14 @@ struct MemcpyBundleAsFlow {
 //             used. Both buffers share the cap_lock + sig_locks above.
 //   pp_slots: 1 = single-buffer chain (no ping-pong overlap),
 //             2 = 2-buffer ping-pong (default under v2).
+//   MIMO (falsifier arm, `mimo-chain-lock`): sig_locks holds
+//             nW + nR - 1 locks -- [0, nW) chain the writers and
+//             [nW, nW+nR-1) chain the readers behind them. Measured
+//             UNSOUND (doc 52 §8): it orders the writers, and the probe
+//             confirms that, but the writers' single release is then spent
+//             on the chain rather than on data-ready, so writer i+1
+//             overwrites a fill no reader has consumed. Kept only so the
+//             A/B is reproducible from the tree.
 struct ChainLockSet {
   AIE::LockOp cap_lock;
   SmallVector<AIE::LockOp> sig_locks;
@@ -237,6 +275,7 @@ struct ChainLockSet {
   int pp_slots = 1;
   bool isFanIn() const { return n_writers > 1 && n_readers == 1; }
   bool isFanOut() const { return n_writers == 1 && n_readers > 1; }
+  bool isMimo() const { return n_writers > 1 && n_readers > 1; }
 };
 
 class DMAAllocator {
@@ -251,7 +290,8 @@ public:
   FailureOr<std::pair<AIE::LockOp, AIE::LockOp>>
   getLockForDMA(air::MemcpyInterface &memcpyOp, AIE::TileLike tile,
                 Operation *bufferOp, bool lockRaceConditionFix = false,
-                bool lockRaceConditionFixV2 = false);
+                bool lockRaceConditionFixV2 = false,
+                bool mimoChainLock = false);
   FailureOr<allocation_info_t>
   allocNewDmaChannel(air::MemcpyInterface &memcpyOp, AIE::TileLike tile,
                      int chan, int col, int row, std::vector<int> dma_id);
@@ -262,7 +302,8 @@ public:
   // the cached set on subsequent calls. Returns failure if the buffer is
   // not a chain-lock candidate.
   FailureOr<ChainLockSet *> getOrCreateChainLockSet(AIE::BufferOp buf,
-                                                    AIE::TileLike tile);
+                                                    AIE::TileLike tile,
+                                                    bool allowMimo = false);
 
   // v2: promote a chain-lock set to 2-slot ping-pong. Records the twin buffer,
   // sets pp_slots = 2, and bumps cap_lock init to 2 together so the slot count
