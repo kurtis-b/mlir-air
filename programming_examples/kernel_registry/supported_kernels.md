@@ -496,22 +496,31 @@ Since 2026-08-11 both orderings keep **f32 two-pass statistics** (mean first, th
 
 Fused scaled-dot-product attention (online-softmax FlashAttention) with grouped-query attention and optional causal masking. **Compute-bound** (two matmuls Q@Kᵀ and P@V), so throughput is GFLOP/s. Kernel = `attn_npu2.o`, driven by the **heads-first** harness `attn_npu2.py`; verified on NPU2 across head dim 64/128, MHA & GQA, short & long sequences, causal & non-causal. (A **seq-first** variant `attn_npu2_seqfirst.py` drives the same `.o` for llama-3.2-1B prefill — bit-identical.) **All rows use the one near-unique full-chip config** `lqp=256, num_q_tiles=4, num_heads_per_unroll=2, num_cascade_stages=4` (FA's tile config is determined by the constraints, not tuned — see detail page). Full datapath, tunables, and reproduce commands in [`details/FlashAttention_bf16.md`](details/FlashAttention_bf16.md).
 
-| lq×lk | dk/dv | heads q/kv | causal | dv_chunks | latency | GFLOP/s | mean_rel_L1 | Status |
-|---|---|---|---|---|---|---|---|---|
-| 2048×2048 | 64/64 | 32/8 | ✓ | 1 | 15.4–16.1 ms | **1065–1116** | 3.9e-2 | ✅ |
-| 2048×2048 | 64/64 | 32/32 | ✓ | 1 | 16.9 ms | 2031 | 3.9e-2 | ✅ |
-| 512×512 | 64/64 | 2/2 | ✗ | 1 | 0.73 ms | 184 | 4.4e-2 | ✅ |
-| 512×512 | 64/64 | 12/6 | ✗ | 1 | 1.22 ms | 661 | 4.6e-2 | ✅ |
-| 512×512 | 64/64 | 64/8 | ✗ | 1 | 3.79 ms | 1135 | 4.6e-2 | ✅ |
-| 512×512 | 128/128 | 32/8 | ✗ | 2 | 4.38 ms | 980 | 4.4e-2 | ✅ |
-| 512×512 | 128/128 | 28/4 | ✗ | 2 | 4.05 ms | 928 | 4.4e-2 | ✅ |
-| 16384×16384 | 64/64 | 2/2 | ✓ | 1 | 39.6 ms | 1734 | 4.5e-2 | ✅ |
-| 16384×16384 | 64/64 | 2/2 | ✗ | 1 | 40.1 ms | **3427** | 5.5e-2 | ✅ |
-| 2048×2048 | 128/128 | 16/8 | ✓ | 2 | 17.6 ms | 979 | 3.8e-2 | ✅ |
-| 2048×2048 | 64/64 | 14/2 | ✓ | 1 | 7.27 ms | 1035 | 3.8e-2 | ✅ |
-| 2048×2048 | 128/128 | 12/2 | ✓ | 2 | 14.5 ms | 891 | 3.8e-2 | ✅ |
-| 2048×2048 | 128/128 | 24/8 | ✓ | 2 | 25.9 ms | 995 | 3.8e-2 | ✅ |
-| 2048×2048 | 128/128 | 32/8 | ✓ | 2 | 35.0 ms | 983 | 3.8e-2 | ✅ |
+| lq×lk | dk/dv | heads q/kv | causal | window | dv_chunks | latency | GFLOP/s | mean_rel_L1 | Status |
+|---|---|---|---|---|---|---|---|---|---|
+| 2048×2048 | 64/64 | 32/8 | ✓ | 0 | 1 | 15.4–16.1 ms | **1065–1116** | 3.9e-2 | ✅ |
+| 2048×2048 | 64/64 | 32/32 | ✓ | 0 | 1 | 16.9 ms | 2031 | 3.9e-2 | ✅ |
+| 512×512 | 64/64 | 2/2 | ✗ | 0 | 1 | 0.73 ms | 184 | 4.4e-2 | ✅ |
+| 512×512 | 64/64 | 12/6 | ✗ | 0 | 1 | 1.22 ms | 661 | 4.6e-2 | ✅ |
+| 512×512 | 64/64 | 64/8 | ✗ | 0 | 1 | 3.79 ms | 1135 | 4.6e-2 | ✅ |
+| 512×512 | 128/128 | 32/8 | ✗ | 0 | 2 | 4.38 ms | 980 | 4.4e-2 | ✅ |
+| 512×512 | 128/128 | 28/4 | ✗ | 0 | 2 | 4.05 ms | 928 | 4.4e-2 | ✅ |
+| 16384×16384 | 64/64 | 2/2 | ✓ | 0 | 1 | 39.6 ms | 1734 | 4.5e-2 | ✅ |
+| 16384×16384 | 64/64 | 2/2 | ✗ | 0 | 1 | 40.1 ms | **3427** | 5.5e-2 | ✅ |
+| 2048×2048 | 128/128 | 16/8 | ✓ | 0 | 2 | 17.6 ms | 979 | 3.8e-2 | ✅ |
+| 2048×2048 | 64/64 | 14/2 | ✓ | 0 | 1 | 7.27 ms | 1035 | 3.8e-2 | ✅ |
+| 2048×2048 | 128/128 | 12/2 | ✓ | 0 | 2 | 14.5 ms | 891 | 3.8e-2 | ✅ |
+| 2048×2048 | 128/128 | 24/8 | ✓ | 0 | 2 | 25.9 ms | 995 | 3.8e-2 | ✅ |
+| 2048×2048 | 128/128 | 32/8 | ✓ | 0 | 2 | 35.0 ms | 983 | 3.8e-2 | ✅ |
+| 2048×2048 | 64/64 | 32/8 | ✓ | **512** | 1 | 14.5 ms | *n/a — see note* | 3.68e-2 | ✅ |
+
+> **`window` is new, and `window = 0` means full causal — which is every row above and every shipped model.** It is a compile-time constant of the kernel object (`-DWINDOW_LEN`), not a runtime argument: the launch signature `attention_bf16(q, k, v, gp)` has no host scalar path, so a local/global model needs **two compiled attention modules**, not a toggle. `window = 0` is bit-identical to the pre-windowing kernel — verified at the object level, `sha256(attn_npu2.o)` unchanged and the preprocessed source byte-identical, so the `window = 0` rows above are unaffected by construction rather than by re-measurement.
+>
+> **The windowed row deliberately carries no GFLOP/s, and its latency is there to show the ABSENCE of a speedup.** Measured matched pair, same config, same session: `W = 512` **14.47 ms** vs `W = 0` **14.06 ms**, while the band discards 56% of the scores full causal keeps (21.9% surviving vs 50.0%). The windowed kernel is if anything ~3% *slower*, inside the ±5% run-to-run variation this table records elsewhere — so: no change, and nothing like the ~2.3× a work-proportional speedup would give. Masking here is **element-wise, not tile-skipping**: the KV chunk loop bound is a static compile-time constant (`attn_npu2.py`, the `chunks_per_stage` loop), so a windowed run streams and multiplies every `(Q tile, KV block)` pair exactly as an unwindowed one does and then masks *more* of the result — today's bare `return` for a below-diagonal block becomes a full `-inf` fill. A window is **correctness-only, zero speedup**, and quoting a throughput for it would compound the existing convention error (`perf_flops *= 0.5` under `causal` is a convention, not executed work; a band ratio would be a second one). The route that *would* pay is tile skipping, which is a documented `ERT_CMD_STATE_TIMEOUT` path plus two open compiler items — out of scope here and not attempted.
+>
+> **Its gate carries a negative control, and the control is the point.** Full causal is a strict superset of a `W = 512` window, so an implementation that silently degraded to full causal would still produce plausible output. `run_npu2_makefile_peano_causal_window512_negative.lit` rebuilds the same shape with the band switched off in the kernel and requires the banded reference to **reject** it, reading the completed comparison's own statistics rather than inverting an exit status. Measured: the unwindowed kernel is rejected on **197331 / 4194304 elements (4.70%)** at `mean_rel_L1 = 4.56e-1` and `atol_required = 5.34e-1`, i.e. **5.3× over** the `1e-1` ceiling it has to clear. The gate discriminates.
+>
+> **Banding did NOT cost accuracy headroom, which was not the expectation.** A matched pair measured in one session at this exact config: windowed `mean_rel_L1 = 3.676e-2`, unwindowed `3.856e-2`; `atol_required = 8.048e-2` for **both**, i.e. the same 1.24× margin under the `1e-1` ceiling, and `abs_err max = 8.398e-2` for both. The reason is structural: the worst-magnitude elements sit in the **first `W` rows**, where a `q − W < k ≤ q` band and full causal are *the same mask* (a row at `q_abs < W` attends to `[0, q_abs]` either way). A band cannot make that region worse, and it only removes contributions elsewhere. The prior expectation — that concentrating the softmax harder would push a banded row toward the ceiling — is **not what the hardware did**.
 
 > **Qwen3-0.6B prefill attention** (`head_dim = 128`, 16q/8kv GQA, causal, lq=lk=2048): verified PASS at mean_rel_L1 = 3.8e-2 (full-output check, rtol 1.6e-2 / atol 1e-1) with the default full-chip config (`lqp=256, num_q_tiles=4, num_heads_per_unroll=2, num_cascade_stages=4`, `dv_chunks=2` for head_dim=128). Note: head_dim=128 FA has been flaky (hang/NaN) on some NPU2 setups; this run completed cleanly, and Qwen3-0.6B prefill can also fall back to CPU attention (`cpu_attn`) if a deployment hits the hang.
 

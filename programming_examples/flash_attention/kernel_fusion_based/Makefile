@@ -16,6 +16,21 @@ DV ?= 64
 NUM_HEADS ?= 2
 NUM_KV_HEADS ?= $(NUM_HEADS)
 
+# Sliding-window (banded causal) length. 0 = disabled = full causal, which is
+# what every shipped model builds.
+#
+# ONE VARIABLE, TWO CONSUMERS, ON PURPOSE. WINDOW feeds BOTH the kernel's
+# -DWINDOW_LEN (compile-kernel, below) and the harness's --window (the NumPy
+# FP32 reference). They cannot be set independently from the command line, so
+# they cannot drift. If they ever did drift, the reference and the device would
+# implement different masks and the element-wise np.isclose check would FAIL --
+# in either direction. This flag has no silent-pass mode.
+#
+# Requires EXTRA_PY_FLAGS to contain --causal when WINDOW > 0; the driver
+# refuses the combination otherwise rather than running an unmasked kernel
+# against a banded reference.
+WINDOW ?= 0
+
 # Derived: kernel tile size = LQP / num_q_tiles (4)
 NUM_Q_TILES ?= 4
 LQP_TILE := $(shell echo $$(($(LQP) / $(NUM_Q_TILES))))
@@ -40,13 +55,13 @@ print:
 
 run: compile-kernel
 	mkdir -p $(BUILD_DIR)
-	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} python3 ${srcdir}/$(SCRIPT) --lk $(LK) --lkp $(LKP) --lq $(LQ) --lqp $(LQP) --dk $(DK) --dv $(DV) --num-heads $(NUM_HEADS) --num-kv-heads $(NUM_KV_HEADS) $(EXTRA_PY_FLAGS)
+	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} python3 ${srcdir}/$(SCRIPT) --lk $(LK) --lkp $(LKP) --lq $(LQ) --lqp $(LQP) --dk $(DK) --dv $(DV) --num-heads $(NUM_HEADS) --num-kv-heads $(NUM_KV_HEADS) --window $(WINDOW) $(EXTRA_PY_FLAGS)
 
 # Profile ELF: compile elf and run with C++ test executable for elf format
 # Usage: make profile [LK=...] [LQ=...] etc.
 profile: compile-kernel build-test-exe
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} python3 ${srcdir}/$(SCRIPT) \
-		--lk $(LK) --lkp $(LKP) --lq $(LQ) --lqp $(LQP) --dk $(DK) --dv $(DV) --num-heads $(NUM_HEADS) --num-kv-heads $(NUM_KV_HEADS) \
+		--lk $(LK) --lkp $(LKP) --lq $(LQ) --lqp $(LQP) --dk $(DK) --dv $(DV) --num-heads $(NUM_HEADS) --num-kv-heads $(NUM_KV_HEADS) --window $(WINDOW) $(EXTRA_PY_FLAGS) \
 		--compile-mode compile-only
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ./test_elf_npu2.exe -e air.elf -k "main:attention_bf16" \
 		--lq $(LQ) --lk $(LK) --dk $(DK) --dv $(DV) --num-heads $(NUM_HEADS)
@@ -55,7 +70,7 @@ profile: compile-kernel build-test-exe
 # Usage: make profile-xclbin [LK=...] [LQ=...] etc.
 profile-xclbin: compile-kernel build-test-exe-xclbin
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ${powershell} python3 ${srcdir}/$(SCRIPT) \
-		--lk $(LK) --lkp $(LKP) --lq $(LQ) --lqp $(LQP) --dk $(DK) --dv $(DV) --num-heads $(NUM_HEADS) --num-kv-heads $(NUM_KV_HEADS) \
+		--lk $(LK) --lkp $(LKP) --lq $(LQ) --lqp $(LQP) --dk $(DK) --dv $(DV) --num-heads $(NUM_HEADS) --num-kv-heads $(NUM_KV_HEADS) --window $(WINDOW) $(EXTRA_PY_FLAGS) \
 		--compile-mode compile-only --output-format xclbin
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && ./test_xclbin.exe \
 		-x air.xclbin -k "MLIR_AIE" -i air.insts.bin \
@@ -125,14 +140,14 @@ compile-kernel:
 		echo "Detected PEANO_INSTALL_DIR from environment: $(PEANO_INSTALL_DIR)"; \
 		if [ -x "$(PEANO_INSTALL_DIR)/bin/clang++" ]; then \
 			echo "Using clang++ from PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR)"; \
-			$(PEANO_INSTALL_DIR)/bin/clang++ ${PEANOWRAP2P_FLAGS} -DBIT_WIDTH=8 -c ${srcdir}/attn_npu2.cc -o $(BUILD_DIR)/attn_npu2.o -Dlqp=$(LQP_TILE) -Dlkp=$(LKP) -Ddk=$(LKP) -Ddk_full=$(DK) -Ddv=$(LKP) -Ddv_full=$(DV) -DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16 -DROUND_CONV_EVEN $(EXTRA_KERNEL_FLAGS); \
+			$(PEANO_INSTALL_DIR)/bin/clang++ ${PEANOWRAP2P_FLAGS} -DBIT_WIDTH=8 -c ${srcdir}/attn_npu2.cc -o $(BUILD_DIR)/attn_npu2.o -Dlqp=$(LQP_TILE) -Dlkp=$(LKP) -Ddk=$(LKP) -Ddk_full=$(DK) -Ddv=$(LKP) -Ddv_full=$(DV) -DWINDOW_LEN=$(WINDOW) -DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16 -DROUND_CONV_EVEN $(EXTRA_KERNEL_FLAGS); \
 		else \
 			echo "Error: invalid PEANO_INSTALL_DIR, clang++ not found."; \
 			exit 1; \
 		fi; \
 	elif command -v xchesscc_wrapper >/dev/null 2>&1; then \
 		echo "Using xchesscc_wrapper from PATH"; \
-		cd $(BUILD_DIR) && ${powershell} xchesscc_wrapper aie2p -c ${srcdir}/attn_npu2.cc -o attn_npu2.o -Dlqp=$(LQP_TILE) -Dlkp=$(LKP) -Ddk=$(LKP) -Ddk_full=$(DK) -Ddv=$(LKP) -Ddv_full=$(DV); \
+		cd $(BUILD_DIR) && ${powershell} xchesscc_wrapper aie2p -c ${srcdir}/attn_npu2.cc -o attn_npu2.o -Dlqp=$(LQP_TILE) -Dlkp=$(LKP) -Ddk=$(LKP) -Ddk_full=$(DK) -Ddv=$(LKP) -Ddv_full=$(DV) -DWINDOW_LEN=$(WINDOW); \
 	else \
 		echo "Error: Neither PEANO_INSTALL_DIR nor xchesscc_wrapper found."; \
 		exit 1; \

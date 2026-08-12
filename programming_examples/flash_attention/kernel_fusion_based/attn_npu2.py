@@ -66,6 +66,7 @@ def build_module(
     num_kv_heads=None,
     causal=False,
     num_heads_per_unroll=2,
+    window=0,
 ):
     """Build flash attention module with selective Q capture pattern.
 
@@ -86,6 +87,21 @@ def build_module(
             Acts as the physical-column multiplier — physical columns =
             num_heads_per_unroll * num_q_tiles (must be <= 8 on NPU2). Requires
             num_heads % num_heads_per_unroll == 0.
+        window: Sliding-window length W (default 0 = full causal). W > 0 keeps
+            q_abs - W < k_abs <= q_abs.
+
+            **This kwarg emits no MLIR.** The window is a compile-time constant
+            of the KERNEL (``-DWINDOW_LEN=W`` on attn_npu2.cc), because the
+            launch signature attention_bf16(q,k,v,gp) has no host scalar path.
+            It is accepted here so the builder can (a) reject window/tiling
+            combinations the kernel cannot express and (b) let the harness band
+            its reference. The caller is responsible for compiling
+            attn_npu2.o with a MATCHING -DWINDOW_LEN — the canonical Makefile
+            drives both from one WINDOW variable.
+
+            A mismatch is not silent: the reference and the device then
+            implement different masks and the element-wise check FAILS. It
+            cannot produce a false PASS in either direction.
     """
     # Validate
     assert lq % lqp == 0, f"lq ({lq}) must be divisible by lqp ({lqp})"
@@ -108,6 +124,18 @@ def build_module(
         assert lqp // num_q_tiles == lkp, (
             f"Causal masking requires tile_size_q == lkp, got "
             f"tile_size_q={lqp // num_q_tiles}, lkp={lkp}"
+        )
+    assert window >= 0, f"window must be >= 0, got {window}"
+    if window > 0:
+        # Fail CLOSED: a window without causal masking would emit no mask call
+        # at all while the reference bands, which is a confusing failure rather
+        # than a refusal.
+        assert causal, "window > 0 requires causal=True (the band is a two-sided causal mask)"
+        assert window % lkp == 0, (
+            f"window ({window}) must be a multiple of lkp ({lkp}). The kernel's "
+            f"partial-select path is per 8-column block within one lkp chunk; a "
+            f"window that is not chunk-aligned is expressible but has never been "
+            f"validated, so it is refused rather than run"
         )
 
     # Multi-head / GQA parameters
@@ -1260,6 +1288,25 @@ if __name__ == "__main__":
         help="Enable causal masking (autoregressive attention)",
     )
     parser.add_argument(
+        "--window",
+        type=int,
+        default=0,
+        help="Sliding-window length W (default 0 = full causal). W > 0 keeps "
+        "q_abs - W < k_abs <= q_abs. MUST match the -DWINDOW_LEN the kernel "
+        "object was compiled with; the canonical Makefile drives both from "
+        "WINDOW=. A mismatch fails the correctness check, it cannot pass.",
+    )
+    parser.add_argument(
+        "--expect-failure",
+        action="store_true",
+        dest="expect_failure",
+        help="Negative control for the windowed gate. Inverts the verdict: exit "
+        "0 if and only if the comparison RAN and REJECTED the run. Intended "
+        "use is a banded reference (--window W) against a kernel object built "
+        "WITHOUT the band (EXTRA_KERNEL_FLAGS=-DWINDOW_LEN=0), which must be "
+        "rejected -- otherwise the windowed gate proves nothing.",
+    )
+    parser.add_argument(
         "--perf-iters",
         type=int,
         default=0,
@@ -1275,6 +1322,27 @@ if __name__ == "__main__":
         parser.error("--num-q-tiles must be >= 1")
     if args.num_heads_per_unroll < 1:
         parser.error("--num-heads-per-unroll must be >= 1")
+    if args.window < 0:
+        parser.error("--window must be >= 0")
+    if args.window > 0 and not args.causal:
+        parser.error("--window requires --causal (the band is a two-sided causal mask)")
+    # --expect-failure must FAIL CLOSED. A flag that is parsed and then never
+    # branched on is how an off-queue hardware dispatch happened here before:
+    # refuse every combination in which the inversion would silently do nothing
+    # rather than accept it and report a verdict nobody computed.
+    if args.expect_failure:
+        if args.window <= 0:
+            parser.error(
+                "--expect-failure requires --window > 0: the control's whole "
+                "content is that a BANDED reference rejects an unwindowed kernel"
+            )
+        if args.compile_mode != "compile-and-run":
+            parser.error(
+                f"--expect-failure requires --compile-mode compile-and-run, got "
+                f"'{args.compile_mode}': there is no comparison to invert otherwise"
+            )
+        if args.print_module_only:
+            parser.error("--expect-failure is meaningless with -p/--print-module-only")
 
     lk = args.lk
     lkp = args.lkp
@@ -1288,6 +1356,7 @@ if __name__ == "__main__":
     num_heads = args.num_heads
     num_kv_heads = args.num_kv_heads if args.num_kv_heads is not None else num_heads
     causal = args.causal
+    window = args.window
     gqa_group_size = num_heads // num_kv_heads
 
     mlir_module = build_module(
@@ -1303,6 +1372,7 @@ if __name__ == "__main__":
         num_kv_heads=num_kv_heads,
         causal=causal,
         num_heads_per_unroll=num_heads_per_unroll,
+        window=window,
     )
 
     if args.print_module_only:
@@ -1339,7 +1409,12 @@ if __name__ == "__main__":
         Vf = input_v_orig[kv_h].astype(np.float32)
         scores = Qf @ Kf.T * inv_sqrt_dk
         if causal:
+            # Upper triangle: k_abs > q_abs.
             mask = np.triu(np.ones(scores.shape, dtype=bool), k=1)
+            if window > 0:
+                # Lower band edge: k_abs <= q_abs - window, i.e. row-col >= window.
+                # The diagonal is always kept, so no row is ever wholly masked.
+                mask |= np.tril(np.ones(scores.shape, dtype=bool), k=-window)
             scores = np.where(mask, -1e9, scores)
         mx = np.max(scores, axis=-1, keepdims=True)
         P = np.exp(scores - mx)
@@ -1361,6 +1436,13 @@ if __name__ == "__main__":
     perf_flops = 2.0 * num_heads * lq * lk * (dk + dv)
     if causal:
         perf_flops *= 0.5
+    # NOTE (windowing): perf_flops is a CONVENTION, not executed work. The KV
+    # chunk loop bound is a static constant (see the c_chunks_h loop above), so
+    # a windowed run multiplies exactly as many elements as an unwindowed one
+    # and then masks more of them. Deliberately NOT scaled by the band ratio:
+    # doing so would report a speedup that does not exist. Any GFLOP/s quoted
+    # for window > 0 is therefore already inflated by the causal 0.5 above, and
+    # must not be inflated again.
     backend_opts = dict(
         omit_while_true_loop=False,
         omit_pingpong="all",
@@ -1374,17 +1456,148 @@ if __name__ == "__main__":
         perf_flops=(perf_flops if args.perf_iters > 0 else None),
     )
 
-    if args.compile_mode == "compile-and-run":
-        runner = XRTRunner(**backend_opts)
-        exit(
-            runner.run_test(
-                mlir_module,
-                inputs=[input_q, input_k, input_v],
-                expected_outputs=[sdpa_output_transposed],
-                rtol=1.6e-2,
-                atol=1e-1,
+    RTOL, ATOL = 1.6e-2, 1e-1
+
+    class _RecordingRunner(XRTRunner):
+        """XRTRunner that copies out the check's statistics as it passes.
+
+        Same idiom as transformer_layer/opcheck.py:151. The VERDICT is
+        unchanged -- ``_check_outputs`` records and then returns
+        ``super()._check_outputs(...)``, so ``n_mismatch`` agrees with the
+        verdict by construction rather than by assertion.
+
+        Two things this buys that the stock runner does not print:
+
+        - ``atol_required`` = ``max(|a - e| - rtol * |e|)``, the smallest atol
+          the run would have passed at. It is what makes an atol choice
+          checkable, and this datapath needs it: ``1e-1`` is a hard ceiling and
+          FlashAttention's honest error already gets within a factor of two of
+          it. ``abs_err max`` alone overstates the danger, because under a
+          causal (and far more so a banded) mask the largest absolute error
+          lands on a large-magnitude element that ``rtol`` already covers --
+          early rows attend to a handful of keys, so |y| runs large.
+        - ``n_mismatch``, which is what lets the negative control below assert
+          that the TOLERANCE CHECK is what rejected the run.
+        """
+
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.stats = None
+
+        def _check_outputs(
+            self,
+            actual_outputs,
+            expected_outputs,
+            rtol=1e-3,
+            atol=1e-8,
+            max_mismatch_percentage=0,
+            min_correlation=None,
+        ):
+            n_elements = n_mismatch = 0
+            abs_err_sum = ref_abs_sum = 0.0
+            abs_err_max = atol_required = 0.0
+            for actual, expected in zip(actual_outputs, expected_outputs):
+                a = np.reshape(actual, expected.shape).astype(np.float64)
+                e = np.asarray(expected).astype(np.float64)
+                abs_err = np.abs(a - e)
+                n_elements += e.size
+                n_mismatch += int(
+                    np.count_nonzero(~np.isclose(a, e, rtol=rtol, atol=atol))
+                )
+                abs_err_sum += float(abs_err.sum())
+                ref_abs_sum += float(np.abs(e).sum())
+                abs_err_max = max(abs_err_max, float(abs_err.max()))
+                atol_required = max(
+                    atol_required, float((abs_err - rtol * np.abs(e)).max())
+                )
+            self.stats = {
+                "mean_rel_L1": abs_err_sum / (ref_abs_sum + 1e-30),
+                "abs_err_max": abs_err_max,
+                "atol_required": max(atol_required, 0.0),
+                "n_elements": n_elements,
+                "n_mismatch": n_mismatch,
+            }
+            return super()._check_outputs(
+                actual_outputs=actual_outputs,
+                expected_outputs=expected_outputs,
+                rtol=rtol,
+                atol=atol,
+                max_mismatch_percentage=max_mismatch_percentage,
+                min_correlation=min_correlation,
             )
+
+    def _negative_control_verdict(rc, stats):
+        """Exit status for --expect-failure. 0 only on EVIDENCE the banded
+        reference did the rejecting.
+
+        "The process exited non-zero" is not that evidence: a missing
+        PEANO_INSTALL_DIR, a kernel that fails to link and an NPU that never
+        comes up all exit non-zero without ever comparing anything, and a
+        caller that simply inverted the exit status would report a passing
+        negative control for every one of them. So this reads the completed
+        comparison's own statistics, exactly as
+        transformer_layer/opcheck.py:414 does for fault injection.
+        """
+        problems = []
+        if stats is None:
+            problems.append(
+                "no comparison statistics were recorded -- the run never reached "
+                "the output check, so nothing was rejected"
+            )
+        else:
+            if stats["n_elements"] <= 0:
+                problems.append("the comparison saw 0 elements")
+            if rc == 0:
+                problems.append(
+                    f"the run PASSED against a W={window} banded reference, so the "
+                    f"gate cannot tell a windowed kernel from an unwindowed one"
+                )
+            elif stats["n_mismatch"] <= 0:
+                problems.append(
+                    f"the run FAILED with n_mismatch={stats['n_mismatch']}, so the "
+                    f"tolerance check is not what rejected it"
+                )
+        if problems:
+            print("NEGATIVE CONTROL: FAIL")
+            for p in problems:
+                print(f"  {p}")
+            return 1
+        pct = 100.0 * stats["n_mismatch"] / stats["n_elements"]
+        print(
+            f"NEGATIVE CONTROL: PASS (banded W={window} reference rejected the "
+            f"unwindowed kernel on {stats['n_mismatch']}/{stats['n_elements']} "
+            f"elements = {pct:.1f}%, as required)"
         )
+        return 0
+
+    if args.compile_mode == "compile-and-run":
+        if window > 0:
+            print(
+                f"[window] reference band W={window}: keeping "
+                f"q_abs - {window} < k_abs <= q_abs. The KERNEL OBJECT must have "
+                f"been compiled -DWINDOW_LEN={window} to match; if it was not, "
+                f"this check FAILS (it has no silent-pass mode)."
+            )
+        runner = _RecordingRunner(**backend_opts)
+        rc = runner.run_test(
+            mlir_module,
+            inputs=[input_q, input_k, input_v],
+            expected_outputs=[sdpa_output_transposed],
+            rtol=RTOL,
+            atol=ATOL,
+        )
+        st = runner.stats
+        if st is not None:
+            margin = ATOL / st["atol_required"] if st["atol_required"] > 0 else float("inf")
+            print(
+                f"[precision] atol_required={st['atol_required']:.3e} "
+                f"| atol={ATOL:.1e} | margin={margin:.2f}x under the 1e-1 ceiling "
+                f"| mean_rel_L1={st['mean_rel_L1']:.3e} "
+                f"| mismatches={st['n_mismatch']}/{st['n_elements']}"
+            )
+        if args.expect_failure:
+            exit(_negative_control_verdict(rc, st))
+        exit(rc)
     elif args.compile_mode == "compile-only":
         backend = XRTBackend(**backend_opts)
         module_function = backend.compile(mlir_module)

@@ -1,0 +1,47 @@
+// (c) Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Goal 1 increment W1: the SLIDING-WINDOW (banded causal) FlashAttention row.
+//
+// Shape is deliberately one the registry already carries as causal-passing --
+// 2048x2048, dk/dv 64/64, the full-chip config lqp=256 / num_q_tiles=4 /
+// num_heads_per_unroll=2 / num_cascade_stages=4 -- so the only variable
+// between this and the existing causal coverage is the mask itself.
+//
+// W = 512 is a multiple of lkp = 64, so the band's trailing edge lands on a
+// chunk boundary and no partial-select generalization is required. (The kernel
+// handles a non-aligned W too, but the builder refuses it because nothing has
+// validated it on hardware.)
+//
+// WINDOW= feeds BOTH the kernel's -DWINDOW_LEN and the harness's --window from
+// one variable, so the reference and the device cannot be given different
+// masks from the command line. If they ever were, the element-wise np.isclose
+// check would FAIL in either direction; there is no silent-pass mode.
+//
+// This is CORRECTNESS-ONLY and buys no speedup: the KV chunk loop bound is a
+// static compile-time constant, so a windowed run streams and multiplies every
+// (Q tile, KV block) pair exactly as an unwindowed one does and then masks more
+// of the result. Any GFLOP/s figure from this recipe is the same convention
+// the causal rows use and must not be rescaled by the band ratio.
+//
+// Its negative control is run_npu2_makefile_peano_causal_window512_negative.lit
+// and is NOT optional: full causal is a strict SUPERSET of a window, so a
+// windowing implementation that silently degraded to full causal is the most
+// likely bug class here. Without the control, a PASS below is consistent with
+// nothing having been windowed at all.
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_causal_window512
+// RUN: cd test_causal_window512
+// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile run PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR LK=2048 LKP=64 LQ=2048 LQP=256 DK=64 DV=64 NUM_HEADS=32 NUM_KV_HEADS=8 WINDOW=512 EXTRA_PY_FLAGS="--causal" | FileCheck %s
+//
+// The band line first, so a run that quietly took the unwindowed path is
+// visible here rather than inferred from the verdict. Then the comparison's
+// own statistics, then the verdict, then the headroom against the 1e-1 ceiling
+// -- in the order they are actually printed.
+// CHECK: [window] reference band W=512
+// CHECK: [precision] Output 0
+// CHECK: PASS!
+// CHECK: [precision] atol_required=

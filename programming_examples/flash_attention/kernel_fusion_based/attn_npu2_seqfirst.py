@@ -66,6 +66,7 @@ def build_module(
     num_kv_heads=None,
     causal=False,
     num_heads_per_unroll=2,
+    window=0,
 ):
     """Build flash attention module with selective Q capture pattern.
 
@@ -86,6 +87,16 @@ def build_module(
             Acts as the physical-column multiplier — physical columns =
             num_heads_per_unroll * num_q_tiles (must be <= 8 on NPU2). Requires
             num_heads % num_heads_per_unroll == 0.
+        window: Sliding-window length W (default 0 = full causal). W > 0 keeps
+            q_abs - W < k_abs <= q_abs.
+
+            **This kwarg emits no MLIR.** The window is a compile-time constant
+            of the KERNEL (``-DWINDOW_LEN=W`` on attn_npu2.cc) -- this builder
+            links the same attn_npu2.o as the heads-first one. The caller must
+            compile it with a MATCHING -DWINDOW_LEN; the canonical Makefile
+            drives both from one WINDOW variable. A mismatch makes the
+            reference and the device implement different masks, so the
+            element-wise check FAILS; it cannot produce a false PASS.
     """
     # Validate
     assert lq % lqp == 0, f"lq ({lq}) must be divisible by lqp ({lqp})"
@@ -117,6 +128,18 @@ def build_module(
         assert lqp // num_q_tiles == lkp, (
             f"Causal masking requires tile_size_q == lkp, got "
             f"tile_size_q={lqp // num_q_tiles}, lkp={lkp}"
+        )
+    assert window >= 0, f"window must be >= 0, got {window}"
+    if window > 0:
+        # Fail CLOSED: a window without causal masking would emit no mask call
+        # at all while the reference bands, which is a confusing failure rather
+        # than a refusal.
+        assert causal, "window > 0 requires causal=True (the band is a two-sided causal mask)"
+        assert window % lkp == 0, (
+            f"window ({window}) must be a multiple of lkp ({lkp}). The kernel's "
+            f"partial-select path is per 8-column block within one lkp chunk; a "
+            f"window that is not chunk-aligned is expressible but has never been "
+            f"validated, so it is refused rather than run"
         )
 
     # Multi-head / GQA parameters
@@ -1257,6 +1280,15 @@ if __name__ == "__main__":
         help="Enable causal masking (autoregressive attention)",
     )
     parser.add_argument(
+        "--window",
+        type=int,
+        default=0,
+        help="Sliding-window length W (default 0 = full causal). W > 0 keeps "
+        "q_abs - W < k_abs <= q_abs. MUST match the -DWINDOW_LEN the kernel "
+        "object was compiled with; the canonical Makefile drives both from "
+        "WINDOW=. A mismatch fails the correctness check, it cannot pass.",
+    )
+    parser.add_argument(
         "--perf-iters",
         type=int,
         default=0,
@@ -1272,6 +1304,10 @@ if __name__ == "__main__":
         parser.error("--num-q-tiles must be >= 1")
     if args.num_heads_per_unroll < 1:
         parser.error("--num-heads-per-unroll must be >= 1")
+    if args.window < 0:
+        parser.error("--window must be >= 0")
+    if args.window > 0 and not args.causal:
+        parser.error("--window requires --causal (the band is a two-sided causal mask)")
 
     lk = args.lk
     lkp = args.lkp
@@ -1285,6 +1321,7 @@ if __name__ == "__main__":
     num_heads = args.num_heads
     num_kv_heads = args.num_kv_heads if args.num_kv_heads is not None else num_heads
     causal = args.causal
+    window = args.window
     gqa_group_size = num_heads // num_kv_heads
 
     mlir_module = build_module(
@@ -1300,6 +1337,7 @@ if __name__ == "__main__":
         num_kv_heads=num_kv_heads,
         causal=causal,
         num_heads_per_unroll=num_heads_per_unroll,
+        window=window,
     )
 
     if args.print_module_only:
@@ -1330,7 +1368,12 @@ if __name__ == "__main__":
         Vf = input_v[:, kv_h * dv : (kv_h + 1) * dv].astype(np.float32)
         scores = Qf @ Kf.T * inv_sqrt_dk
         if causal:
+            # Upper triangle: k_abs > q_abs.
             mask = np.triu(np.ones(scores.shape, dtype=bool), k=1)
+            if window > 0:
+                # Lower band edge: k_abs <= q_abs - window, i.e. row-col >= window.
+                # The diagonal is always kept, so no row is ever wholly masked.
+                mask |= np.tril(np.ones(scores.shape, dtype=bool), k=-window)
             scores = np.where(mask, -1e9, scores)
         mx = np.max(scores, axis=-1, keepdims=True)
         P = np.exp(scores - mx)
@@ -1350,6 +1393,11 @@ if __name__ == "__main__":
     perf_flops = 2.0 * num_heads * lq * lk * (dk + dv)
     if causal:
         perf_flops *= 0.5
+    # NOTE (windowing): perf_flops is a CONVENTION, not executed work. The KV
+    # chunk loop bound is a static constant, so a windowed run multiplies
+    # exactly as many elements as an unwindowed one and then masks more of
+    # them. Deliberately NOT scaled by the band ratio: doing so would report a
+    # speedup that does not exist.
     backend_opts = dict(
         omit_while_true_loop=False,
         omit_pingpong="all",

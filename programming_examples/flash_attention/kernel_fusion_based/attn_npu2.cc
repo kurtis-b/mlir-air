@@ -40,6 +40,24 @@
 #define dv_full dv
 #endif
 
+// Sliding-window (banded) causal masking. 0 = disabled = plain full causal,
+// which is what every shipped model compiles today: neither the canonical
+// Makefile's default nor llms/shared/infra/external_kernels.py's
+// compile_attn_npu2() passes -DWINDOW_LEN, so they take this default and the
+// preprocessed body of apply_causal_mask below is token-for-token what it was
+// before windowing existed.
+//
+// WINDOW_LEN > 0 keeps q_abs - WINDOW_LEN < k_abs <= q_abs, i.e. a band of
+// WINDOW_LEN keys ending at (and including) the query's own position.
+//
+// It is a compile-time constant for the same reason lqp/lkp are: the launch
+// signature attention_bf16(q,k,v,gp) has no host scalar path, so the window is
+// baked per ELF. A local/global model therefore needs two compiled attention
+// modules, not a runtime toggle.
+#ifndef WINDOW_LEN
+#define WINDOW_LEN 0
+#endif
+
 // Column-major B matmul with compile-time transpose control.
 // transpose_b: true  = apply aie::transpose before mac (K DMA: inner [n_in,
 // k_in])
@@ -631,6 +649,21 @@ void add_gp_g(bfloat16 *gp, bfloat16 *g) {
 // G is in column-major 8×8 tiled layout: block(col_blk, row_blk) at
 // offset col_blk * (lqp * 8) + row_blk * 64, element within block at
 // row_in_blk * 8 + col_in_blk.
+//
+// With -DWINDOW_LEN=W (W > 0) the mask becomes two-sided: an element survives
+// only when q_abs - W < k_abs <= q_abs, where the absolute positions are
+// q_abs = q_block_idx * lqp + row and k_abs = kv_block_idx * lkp + col. Both
+// are already available here -- lqp and lkp are compile-time -D's and the
+// builder passes GLOBAL block indices (attn_npu2.py:731-751), so no new
+// argument and no host scalar path is needed.
+//
+// Note the cost direction: unwindowed, a block strictly below the diagonal is
+// a bare `return`. Under a window the blocks older than the band become full
+// -inf fills, i.e. MORE stores. Windowing here is correctness-only; it buys no
+// speedup, because the KV chunk loop bound is a static constant
+// (attn_npu2.py:693-694) and every (Q tile, KV block) pair is multiplied
+// before it is masked. Skipping the multiply is a different change and is a
+// documented hang path (see the CAUSAL_ROW_HELPERS FOOTGUN below).
 void apply_causal_mask(bfloat16 *g, int32_t q_block_idx, int32_t kv_block_idx) {
   SET_ROUNDING();
   uint16_t neg_inf_u16 = (uint16_t)0xff80;
@@ -648,6 +681,93 @@ void apply_causal_mask(bfloat16 *g, int32_t q_block_idx, int32_t kv_block_idx) {
     }
     return;
   }
+
+#if WINDOW_LEN > 0
+
+  // ---------------------------------------------------------------------
+  // Banded (sliding-window) path. Compiled only when -DWINDOW_LEN=W > 0;
+  // at W == 0 the preprocessor emits the #else arm, which is byte-for-byte
+  // the unwindowed implementation this function has always had.
+  // ---------------------------------------------------------------------
+  {
+    const int32_t q_base = q_block_idx * lqp;
+    const int32_t kv_base = kv_block_idx * lkp;
+
+    // 1b. Entirely older than the band -> all masked. Tightest element is the
+    // newest key (kv_base + lkp - 1) against the oldest query (q_base).
+    if (q_base - (kv_base + lkp - 1) >= WINDOW_LEN) {
+      constexpr int VecLen = 32;
+      aie::vector<bfloat16, VecLen> neg_inf_vec =
+          aie::broadcast<bfloat16, VecLen>(neg_inf_val);
+      bfloat16 *p = g;
+      for (int i = 0; i < lqp * lkp; i += VecLen) {
+        aie::store_v(p, neg_inf_vec);
+        p += VecLen;
+      }
+      return;
+    }
+
+    // 2b. Wholly inside the band AND wholly below the diagonal -> nothing to
+    // mask, so return without touching the tile exactly as the unwindowed
+    // path does for its own below-diagonal case. Needs the newest key not to
+    // exceed the oldest query, and the oldest key to still be inside the
+    // newest query's window.
+    if (kv_base + lkp - 1 <= q_base &&
+        (q_base + lqp - 1) - kv_base < WINDOW_LEN) {
+      return;
+    }
+
+    // 3b. Partial: the band's leading edge (the diagonal), its trailing edge,
+    // or both cross this tile. Per row the surviving columns are the half-open
+    // interval [lo_end, hi_start); every position still goes through a vector
+    // load+store cycle, which is what the consuming DMA requires.
+    constexpr int BlkDim = 8;
+    aie::vector<bfloat16, BlkDim> mask_vec =
+        aie::broadcast<bfloat16, BlkDim>(neg_inf_val);
+
+    for (int row = 0; row < lqp; row++) {
+      const int32_t q_abs = q_base + row;
+      // k_abs > q_abs  ->  col >= hi_start
+      int32_t hi_start = q_abs - kv_base + 1;
+      // k_abs <= q_abs - WINDOW_LEN  ->  col < lo_end
+      int32_t lo_end = hi_start - WINDOW_LEN;
+      hi_start = hi_start < 0 ? 0 : (hi_start > lkp ? lkp : hi_start);
+      lo_end = lo_end < 0 ? 0 : (lo_end > lkp ? lkp : lo_end);
+
+      int row_blk = row / BlkDim;
+      int row_in = row % BlkDim;
+
+      for (int col_blk = 0; col_blk < lkp / BlkDim; col_blk++) {
+        int col_start = col_blk * BlkDim;
+        int off = col_blk * (lqp * BlkDim) + row_blk * (BlkDim * BlkDim) +
+                  row_in * BlkDim;
+
+        aie::vector<bfloat16, BlkDim> orig = aie::load_v<BlkDim>(g + off);
+
+        if (col_start >= lo_end && col_start + BlkDim <= hi_start) {
+          // Entire block survives: write back unchanged.
+          aie::store_v(g + off, orig);
+        } else if (col_start + BlkDim <= lo_end || col_start >= hi_start) {
+          // Entire block masked (before the band, or after the diagonal).
+          aie::store_v(g + off, mask_vec);
+        } else {
+          // Partial block: either edge, or both inside these 8 columns.
+          uint32_t sel_bits = 0;
+          for (int c = 0; c < BlkDim; c++) {
+            int col = col_start + c;
+            if (col < lo_end || col >= hi_start) {
+              sel_bits |= (1u << c);
+            }
+          }
+          aie::mask<BlkDim> sel(sel_bits);
+          aie::store_v(g + off, aie::select(orig, mask_vec, sel));
+        }
+      }
+    }
+    return;
+  }
+
+#else
 
   // 2. Block below diagonal: no masking needed
   if (kv_block_idx < q_block_idx) {
@@ -698,6 +818,8 @@ void apply_causal_mask(bfloat16 *g, int32_t q_block_idx, int32_t kv_block_idx) {
       }
     }
   }
+
+#endif // WINDOW_LEN > 0
 }
 
 #ifdef CAUSAL_ROW_HELPERS
