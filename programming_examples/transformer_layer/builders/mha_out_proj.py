@@ -111,19 +111,35 @@ from builders.o_proj import (  # noqa: E402
 # Backend settings this design needs. FlashAttention's, because the attention
 # half is the constrained one:
 #   runtime_loop_tiling_sizes [1, 1]: LOAD-BEARING, and measured. At [2, 2] this
-#     design compiles and then HANGS on hardware -- ERT_CMD_STATE_TIMEOUT, 3/3
-#     at 4096x768 twelve heads non-causal, against 3/3 clean passes at [1, 1]
+#     design compiles and then HANGS on hardware -- ERT_CMD_STATE_TIMEOUT, 8/8
+#     at 4096x768 twelve heads non-causal, against 8/8 clean passes at [1, 1]
 #     (0 / 3,145,728 mismatches, mean_rel_L1 5.3348e-02, atol_required
-#     8.7061e-03 against the row's atol 2.5e-02). The launch grid is 2-D (Q
-#     iterations x head groups) and each iteration's shim BDs are already one
-#     transfer deep; [2, 2] is the BD-ID recycling the standalone GEMM-only
-#     operators want, and it re-tiles the attention runtime loop as well.
-#     `[2026-08-08]` Do not "simplify" this to match the GEMM preset on the
-#     grounds that the lowered IR is identical between the two. It is identical
-#     -- aircc's aie.air.mlir matches op-for-op, because air-opt-shim-dma-bds
-#     early-exits with no shim-level scf.for to tile -- and the setting is
-#     decisive anyway. That inference was drawn, written down, and refuted by
-#     the run above. See agents/probes/probe_backend_preset_hardware.py.
+#     8.7061e-03 against the row's atol 2.5e-02). 3+3 of those are the original
+#     `[2026-08-08]` factorial; the other 5+5 are a `[2026-08-12]` re-measurement
+#     in fresh interleaved processes, run because wall 7 had meanwhile shown a
+#     composition of this class hanging NONDETERMINISTICALLY, which makes a 3/3
+#     taken before that was known weaker than it reads. Neither arm came back
+#     mixed and every pass returns the same statistics to the bit -- that is what
+#     separates this from wall 7's coin flip, not the count on its own.
+#     The launch grid is 2-D (Q iterations x head groups) and each iteration's
+#     shim BDs are already one transfer deep; [2, 2] is the BD-ID recycling the
+#     standalone GEMM-only operators want, and it re-tiles the attention runtime
+#     loop as well.
+#     `[2026-08-12]` Do not "simplify" this to match the GEMM preset -- and do
+#     not re-derive its inertness from an IR dump. The claim that stood here --
+#     that aircc's aie.air.mlir "matches op-for-op, because air-opt-shim-dma-bds
+#     early-exits with no shim-level scf.for to tile" -- is WRONG FOR THIS
+#     DESIGN, twice over. (1) aie.air.mlir is not byte-reproducible at all: two
+#     compiles of the SAME preset differ by ~95 lines, the same size as the
+#     [1,1]-vs-[2,2] diff that was read as evidence of sameness. (2) The
+#     early-exit does not fire here: that pass lowers air.launch to scf.for
+#     FIRST and collects the shim band afterwards, so this design's launches ARE
+#     the band it tiles. The artifacts downstream diverge accordingly -- the
+#     emitted NPU instruction streams shrink 11% (attention), 10% (main) and
+#     2.96x (the projection segment) under [2, 2], byte-stably across repeat
+#     compiles. Inertness is a question about .bin/.pdi/.ctrltext, never about
+#     an IR dump. See agents/probes/probe_backend_preset_hardware.py, which has
+#     a --compile-only mode that answers it for a new design without a device.
 #   omit_pingpong "all": NOT load-bearing at this shape, kept as shipped. The
 #     comment here used to say ping-pong "does not fit L1 and the design fails
 #     to place"; measured, it places, runs, and returns statistics byte-identical

@@ -87,6 +87,12 @@ gives **1584** for `attn_output` (fused-cast 1296 / drain 144 / direct 144) and 
 >
 > Reproduce with `python3 agents/probes/probe_backend_preset_hardware.py [attn|gemm|t11nopp|t22pp]`,
 > one process per arm via `agents/scripts/devq.sh submit --class measure`.
+>
+> **`[2026-08-12]` RE-MEASURED at 5 repeats per arm — this retraction stands (8/8 versus 0/8), and
+> the "identical lowered IR" reasoning in the paragraph below it turns out to have been measuring
+> nothing: `aie.air.mlir` is not byte-reproducible compile-to-compile. See
+> [§ `[2026-08-12]` §4 re-measured](#2026-08-12-4-re-measured--the-retraction-holds-its-mechanism-does-not)
+> at the end of this document.**
 
 The refuted reasoning is kept below as a record.
 
@@ -488,3 +494,132 @@ xclbin is judged to matter, the `air-fuse-channels` scoping phase.
   `sweep_families.py` derives K and N from `FAMILY_HIDDEN × ROLE_KN_MULTIPLES` with a minimum hidden
   of 512, so no `--family` puts a 64 in the K or N slot. The fix is the `gemm_spec_fn` escape hatch
   (inject the measured tiles) or a new attention role. **Nothing requires editing the registry.**
+
+---
+
+## `[2026-08-12]` §4 re-measured — the retraction HOLDS, its mechanism does not
+
+Queue item 24. §4's retraction above rests on `[2,2]` hanging `mha_out_proj` @4096 3/3 against
+`[1,1]` passing 3/3. Two things weakened that afterwards, neither of them a counter-measurement:
+
+1. For **R1** the same two settings are **byte-identical** through `aie.air.mlir`, `npu.air.mlir`,
+   `.ctrltext` and `.pdi` — provably inert there (queue item 21). Different design, different shape,
+   so it refutes nothing here; but it means the knob's mechanism is not the universal one a reader
+   would assume from §4.
+2. **Wall 7** has since shown this class of composition hanging **nondeterministically** — one ELF,
+   identical inputs, fresh processes, `PASS/TIMEOUT/PASS/TIMEOUT/PASS`. Against a fair coin, a
+   clean 3-versus-3 split arises about 3% of the time. A 3/3 recorded *before* that was known is
+   therefore much weaker evidence than a 3/3 read today.
+
+The item was flagged, not found: nobody had re-measured. This section is that re-measurement. It was
+run in the order the cheap test comes first — artifacts, then device.
+
+### The compile-only test, which nearly settled it the other way
+
+If the two settings produced identical artifacts at *this* shape, as they do for R1, then no
+hardware outcome could be caused by the knob and the item would close with no device time at all.
+Four independent compiles, `--class build`, each in its own empty cwd, **two per arm** — because a
+cross-arm difference means nothing without knowing whether the compiler is byte-reproducible at all.
+The two arms differ in exactly one thing (`attn` = `[1,1]` + `omit_pingpong`, `t22pp` = `[2,2]` +
+`omit_pingpong`).
+
+| artifact | `[1,1]` | `[2,2]` | stable within arm? |
+|---|---|---|---|
+| `aie.air.mlir` | 640,697 B | 640,697 B | **NO** — differs compile-to-compile |
+| `placed.air.mlir` | 107,593 B | 107,593 B | **NO** |
+| `npu.air.mlir` | **1,507,775 B** | **1,306,762 B** | length yes, bytes no |
+| `at_attn_seg.pdi` | 352,480 B | 352,480 B, **different content** | yes |
+| `op_matmul_seg.pdi` | 138,160 B | identical | yes |
+| `npu_insts …at_attn_seg_sequence.bin` = `.ctrltext.0` | **402,448 B** | **356,368 B** (−11.4%) | yes |
+| `npu_insts …op_matmul_seg_sequence.bin` = `.ctrltext.1` | **88,080 B** | **29,712 B** (**2.96×**) | yes |
+| `npu_insts …main_mha_out_proj.bin` = `.ctrltext.2` | **1,026,496 B** | **922,048 B** (−10.2%) | yes |
+
+**The knob is not inert at this shape.** Every binary artifact that reaches the device is byte-stable
+across repeat compiles of one arm and different across arms, so those deltas are the setting and
+nothing else. Devq **279–282**; the `attn` ELF also reproduces the 2026-08-08 spike-C ELF
+byte-for-byte, so the 4-day-old archive and today's toolchain agree.
+
+**And the control is worth more than the result — again.** `aie.air.mlir` **is not byte-reproducible**:
+two compiles of the *same* preset differ by 94 lines (`attn`) and 98 lines (`t22pp`) — the same size as
+the 98-line `[1,1]`-vs-`[2,2]` diff §4 above dismisses as "channel renumbering and nothing else". That
+diff was **compiler noise**. So the compile-only spike was not reading a knob that made no difference;
+it was reading a difference it had no way to attribute, in either direction, and it happened to
+conclude in the direction that was wrong. §4's confession — "identical IR *at the altitude that was
+diffed* is not inertness" — is right and does not go far enough: **that altitude was not measuring
+anything at all.** Settle inertness on `.bin` / `.pdi` / `.ctrltext`, never on an IR dump, and always
+with a same-arm repeat as the control.
+
+### The hardware distribution
+
+Ten runs, five per arm, **interleaved** `attn, t22pp, attn, t22pp, …` so anything drifting with wall
+clock is spread over both arms instead of loading one. One process per measurement, each in its own
+empty cwd, via `agents/scripts/devq.sh submit --class measure`. Turbo verified before the first run.
+
+| job | arm | tiling | outcome | detail |
+|---|---|---|---|---|
+| 283 | `attn` | `[1,1]` | **PASS** | 0 / 3,145,728, `mean_rel_L1` 5.3348e-02, `atol_required` 8.7061e-03 |
+| 284 | `t22pp` | `[2,2]` | **TIMEOUT** | `ERT_CMD_STATE_TIMEOUT`, `ctx_pc 0x28B060AD` |
+| 285 | `attn` | `[1,1]` | **PASS** | statistics identical to 283 |
+| 286 | `t22pp` | `[2,2]` | **TIMEOUT** | as 284 |
+| 287 | `attn` | `[1,1]` | **PASS** | statistics identical to 283 |
+| 288 | `t22pp` | `[2,2]` | **TIMEOUT** | as 284 |
+| 289 | `attn` | `[1,1]` | **PASS** | statistics identical to 283 |
+| 290 | `t22pp` | `[2,2]` | **TIMEOUT** | as 284 |
+| 291 | `attn` | `[1,1]` | **PASS** | statistics identical to 283 |
+| 292 | `t22pp` | `[2,2]` | **TIMEOUT** | as 284 |
+
+**5/5 and 0/5. No mixed arm.** The failure mode is the same one every time — a timeout, never a wrong
+answer and never a compile failure, which are three different findings and are reported separately for
+that reason. Each run's log carries its own `start`/`end` markers and both were checked present on all
+ten, so no log is truncated.
+
+Pooled with the 2026-08-08 factorial (jobs **58–63**: `gemm`×2 and `t22pp`×1 timing out, `attn`×2 and
+`t11nopp`×1 passing), the record is **`[1,1]` 8/8 PASS, `[2,2]` 0/8**. Fisher exact on the ten new runs
+alone is p = 0.0079; pooled, p = 1.6e-4.
+
+### Which hypothesis survives
+
+- **H3, the knob is inert here too — REFUTED**, by the artifacts, before any device time.
+- **H2, both arms are the same flaky distribution and the 3/3 was luck — REFUTED.** Wall 7's signature
+  is a *mixed arm* (and, at 128, four *distinct* wrong answers). Here neither arm is mixed over five
+  fresh processes, and the passing arm returns not merely "a pass" but **the same statistics to the
+  bit**, five times today and identically to 2026-08-08. A composition drawing from a race does not
+  reproduce `atol_required` to five figures eight times running.
+- **H1, the original reading — SURVIVES.** `runtime_loop_tiling_sizes` is decisive at this shape,
+  deterministically.
+
+**How many repeats it would have taken.** If either arm flaked at wall 7's rate (≈50%), five runs show
+a mixed record with probability 93.75%, so this design would have caught it; three runs only 75%. What
+five runs do *not* buy is a bound on a rare flake — zero failures in five leaves a 95% upper bound of
+45% on the passing arm's hidden failure rate (31% pooled over eight). **Five is the right number for
+"is this wall 7?" and nowhere near enough for "is this ever flaky?"** If a future item needs the
+latter, it needs tens of runs, not units.
+
+### The mechanism, corrected
+
+§4 says the value "is never consumed" because `air-opt-shim-dma-bds` early-exits with no shim-level
+`scf.for`. The early-exit is real (`AIRDependencyScheduleOpt.cpp:8287-8291`) — and it **does not fire
+for this design**. The pass lowers `air.launch` to `scf.for` *first*
+(`AIRLaunchToScfForPattern`, `:8275`) and collects the shim band *after*, so `mha_out_proj`'s 2-D
+attention launch grid and its projection launch **are** the band it tiles, by
+`findLargestFactor(trip_count, 2)`. That is why the emitted BD program shrinks, most sharply on the
+projection segment. R1 is a design where the early-exit *does* fire, which is exactly why the same
+knob is inert there and decisive here.
+
+**So the honest general statement is neither "inert" nor "decisive" but *design-dependent*, and the
+test is cheap**: `probe_backend_preset_hardware.py <preset> --compile-only` compiles one arm and
+digests every artifact aircc wrote. Run it twice per arm, diff, and read the `.bin`/`.pdi` rows.
+
+### What this leaves standing
+
+- §4's retraction **stands** — its verdict was right and is now 8/8 versus 0/8.
+- The `pattern/fused/fused.py`, `builders/block.py` and `builders/mha_out_proj.py` conflict comments
+  **stand**: one ELF is one aircc invocation, FlashAttention @4096 needs `[1,1]`, the wide GEMMs are
+  built at `[2,2]`. `fused.py` and `block.py` quote the 3/3 as a historical record and are superseded
+  rather than wrong; they were left alone.
+- `mha_out_proj.py`'s comment **was corrected**: it asserted the aie.air.mlir sameness and the
+  early-exit as the reason not to trust that sameness, and both halves of that are wrong for this
+  design. The load-bearing verdict it guards is unchanged.
+
+Artifacts: devq **279–282** (compiles), **283–292** (hardware), **58–63** (the 2026-08-08 record this
+extends).
