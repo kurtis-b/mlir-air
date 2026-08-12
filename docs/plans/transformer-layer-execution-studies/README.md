@@ -125,6 +125,16 @@ recorded on 2026-08-10 are `Default`-conditional; pre-08-10 records are Turbo-co
 ([32](32-cost-decomposed-ladder.md), trap 0 below). Byte and count instrumentation is
 pmode-independent.
 
+**`[2026-08-12]` late: the toolchain is integrated end to end, and wall 6's fix moves nothing
+shipped.** After wall 6 landed, `build-xrt` was rebuilt (`check-air-mlir` **495 pass / 0 fail**, the
+predicted 494 + one regression lit) and `install-xrt` refreshed to match — **both `air-opt` at
+2026-08-12 05:13**, so probes, models and lit suites all resolve the same compiler for the first time
+today. The standing regression leg then re-ran against it: **transformer-layer suite 31 pass / 1
+unsupported / 0 fail** (devq 270, 518 s, Turbo verified in-job), which is exactly the pre-today
+baseline — the 1 unsupported is R1's own parked gate. That is the evidence that wall 6's per-fill lock
+count is a no-op for every shipped design, as its `write_counter == 1` scoping intended. Check the two
+trees with `ls -l`, **never `cmp`** (the install rewrites RUNPATH, so the bytes always differ).
+
 **`[2026-08-12]` The two owed verifications are GREEN, and both were measurements rather than
 inferences.** The install refresh moved the ten shipped models onto the 2026-08-11 compiler, and the
 claim that 6a/6b are no-ops for every shipped design had only ever been checked in the BUILD tree —
