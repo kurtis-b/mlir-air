@@ -1,0 +1,23 @@
+// (c) Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_q4_0_npu2_2048x2048_peano
+// RUN: cd test_q4_0_npu2_2048x2048_peano
+// RUN: make -f %S/Makefile clean
+//
+// llama.cpp q4_0 GEMV through the UNMODIFIED int4-AWQ kernel at GS=32 with
+// the zero point pinned to 8 -- q4_0's dequant d*(q-8) is a strict special
+// case of the kernel's (q-z)*s. Synthetic q4_0 payload, so this needs no
+// checkpoint; runs against real GGUF weights go through
+// `make run_q4_0 GGUF=... TENSOR=...`.
+//
+// The host bridge carries its own self-test, including two negative controls
+// that are asserted to be non-vacuous.
+// RUN: make -f %S/Makefile selftest_q4_0 | FileCheck %s --check-prefix=SELFTEST
+// SELFTEST: All self-tests PASSED.
+//
+// RUN: make -f %S/Makefile run_q4_0 M=2048 K=2048 OUTPUT_FORMAT=elf PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+// CHECK: reference cross-check: fast_reference == cpu_reference
+// CHECK: PASS!

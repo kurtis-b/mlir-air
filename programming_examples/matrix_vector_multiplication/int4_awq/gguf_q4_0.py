@@ -355,6 +355,25 @@ def dequant_q4_0_reference(raw, K, M, scale_dtype="fp16"):
     return w.reshape(M, K)
 
 
+def repack_q4_0_for_gemv(raw, K, M, n_head=None, M_TILE=8, K_CHUNK=2048, N_CORES=8):
+    """A q4_0 tensor -> the [total_tiles, tile_bytes] uint8 BO the decode ELFs take.
+
+    Mirrors `llama32_1b_int4/awq_repacker.repack_for_gemv`, single-launch
+    (`M_PER_LAUNCH = M`). Pass `n_head` (q_proj) or `n_kv_head` (k_proj) to undo
+    llama.cpp's RoPE row permutation; leave it None for v/o/gate/up/down.
+    """
+    from matvec_int4_packed import pack_inputs  # same directory
+
+    A_q, A_s, A_z = repack_q4_0_linear(raw, K, M)
+    if n_head is not None:
+        # The permutation reorders OUTPUT rows, so it applies to A_q's rows and
+        # to the M axis of the per-group S/Z planes alike.
+        A_q = np.ascontiguousarray(llama_unpermute_rows(A_q, n_head))
+        A_s = np.ascontiguousarray(llama_unpermute_rows(A_s.T, n_head).T)
+        A_z = np.ascontiguousarray(llama_unpermute_rows(A_z.T, n_head).T)
+    return pack_inputs(A_q, A_s, A_z, M, K, QK4_0, M_TILE, K_CHUNK, N_CORES, M)
+
+
 # ---------------------------------------------------------------------------
 # Cost accounting (bytes, not adjectives)
 # ---------------------------------------------------------------------------
@@ -506,6 +525,30 @@ def self_test(K=256, M=64, seed=42, verbose=True):
         raise AssertionError("llama_unpermute_rows does not invert permute")
     if verbose:
         print("  [f] llama_unpermute_rows inverts llama.cpp's RoPE permute: PASS")
+
+    # (g) the un-permute must move Q's rows and S/Z's M axis TOGETHER, or every
+    #     row silently gets another row's scale. Dequantizing the permuted
+    #     triple must equal un-permuting the dense dequant.
+    A_q2, A_s2, A_z2 = repack_q4_0_linear(raw, K, M)
+    A_qp = np.ascontiguousarray(llama_unpermute_rows(A_q2, n_head))
+    A_sp = np.ascontiguousarray(llama_unpermute_rows(A_s2.T, n_head).T)
+    A_zp = np.ascontiguousarray(llama_unpermute_rows(A_z2.T, n_head).T)
+    nib_p = np.zeros((M, K), dtype=np.uint8)
+    nib_p[:, 0::2] = A_qp & 0x0F
+    nib_p[:, 1::2] = (A_qp >> 4) & 0x0F
+    got = (nib_p.astype(np.float32) - A_zp.astype(np.float32).T.repeat(QK4_0, axis=1)) * (
+        A_sp.astype(np.float32).T.repeat(QK4_0, axis=1)
+    )
+    want = llama_unpermute_rows(
+        dequant_q4_0_reference(raw, K, M, scale_dtype="bf16"), n_head
+    )
+    if not np.allclose(got, want, rtol=1e-3, atol=1e-6):
+        raise AssertionError(
+            "permuted repack disagrees with un-permuted dense dequant: max |d| = %g"
+            % float(np.max(np.abs(got - want)))
+        )
+    if verbose:
+        print("  [g] un-permute moves Q rows and S/Z together: PASS")
 
 
 # ---------------------------------------------------------------------------
