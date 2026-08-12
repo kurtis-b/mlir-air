@@ -537,13 +537,24 @@ check-ffn-resident-fault:
 # check sees none of this. No NPU (the compile stops at the core-ELF link,
 # deliberately).
 #
+# `[2026-08-12]` The shim column clause counts per-column MM2S DEMAND over
+# BOTH flow kinds and over packet flows (queue item 10): an L2-staged refill
+# is a shim->memtile flow on the same port, and AIR answers an over-budget
+# column by packet-multiplexing rather than refusing, so the old
+# shim->core-circuit-only count read 1 for a column at 2 and read 0 on a
+# design 50% over budget. The target now runs the census's own negative
+# control first -- a one-segment herd with 3 herd-direct L3 operands, which
+# the census MUST refuse -- so the clause is demonstrably able to fail. Adds
+# one ~0.5 s hermetic compile.
+#
 # `[2026-08-11]` KNOWN COIN TOSS until the air-fuse-channels crash is fixed:
 # the compile this target runs SEGVs nondeterministically in that pass on
 # this module (use-after-free profile; minimal shape in
 # agents/probes/probe_fuse_channels_sibling_nests.py, boundary measured at
-# 2-clean/3-crash sibling nests). The lit recipe is parked UNSUPPORTED for
-# the same reason; doc 31 "R1's gate is BLOCKED" is the report. The arm that
-# stays live meanwhile is run_ffn_resident_emulation_tests.lit.
+# 2-clean/3-crash sibling nests). FIXED 2026-08-11 (61a3bb2b + 8b118345);
+# this target has run clean against the fixed compiler since. The lit recipe
+# is still parked UNSUPPORTED, now on wall 5 (queue item 6c), so the arm
+# that stays live meanwhile is run_ffn_resident_emulation_tests.lit.
 check-ffn-resident-structure:
 	python3 $(srcdir)/ffn_resident_structure.py
 
