@@ -616,3 +616,140 @@ recorded, or not taken.
 
 And **M1 is worth doing this week regardless**: two latency gates that a CI leg would run assert on
 throughput with no pmode guard, on a machine whose pmode is `Default` right now.
+
+---
+
+# `[2026-08-12]` G1 — resume, doc 10 item 5, and the coverage sweep measured
+
+Phase G's three open items, taken in the order queue row 12 names them. Worktree branch
+`worktree-agent-a0bab073cb6414184` off the tip `39a08a8b`; commit `869b8684`. NPU pmode **Turbo**,
+verified before any device work (`xrt-smi examine -r platform` → `Power Mode : Turbo`).
+
+**Headline: §M5 was wrong, and it was wrong in the direction that mis-sized a phase.** The registry
+coverage two of the five unreachable families were said to need has been in the tree since
+2026-08-07. `tinybert_512` walked end to end in **301 s** against §4.1's estimate of **unbounded —
+504 + 66 min**. Full costing in [50](50-coverage-sweep-costing.md); the correction is §M5 below.
+
+## M7 — resume: CLOSED
+
+`study/resume.py` (new), `run_ladder.walk(..., reuse=, on_rung=)`, `manifest.build_manifest(walk=)`,
+`schema`'s `WALK`/`SESSION`/`SESSION_RUNG` blocks, `run_profile --resume`.
+
+**What it guarantees.** A rung with a `passed` row is not re-run. Every profile rung appears in its
+CSV exactly once. The completeness verdict is **unchanged by resuming** — `manifest`'s three
+row-count clauses read the CSVs and know nothing about sessions, so a resumed short walk is
+incomplete exactly as a fresh one is. A rung the plan declared reused whose final row does not hash
+to the prior row's digest is a **`RESUME DEFECT`** and makes the run incomplete. A row on disk that
+no session claims is `rungs_unattributed` and a problem. A splice across power modes is refused; one
+across a toolchain or a git sha is flagged — `compare_roots`' refuse-known / flag-unknown split,
+applied *within* one root instead of between two.
+
+**What it cannot.** It cannot make a spliced walk one measurement — rows from two sessions are two
+populations on a laptop whose thermal and load state nobody recorded; the block says so and does not
+fix it. It cannot resume mid-rung: the granularity is one `run_mode` child process. It cannot detect
+a *distorted* measurement — a rung measured beside another job's dispatches produces a valid row with
+a good digest, and contention stays devq's problem. And attribution is keyed by
+`(execution_mode, seq_len)` **outside** the CSV, because a `session_id` column would bump
+`SCHEMA_VERSION` to 3 and take every surviving v2 root out of every reader (item 15's decision,
+unchanged and **not** revisited). The digest is what buys back the confidence key-based attribution
+loses.
+
+**The design decision worth arguing.** Doc 10 §Resume idempotence points at the registry sweep's
+`REUSABLE_STATUSES`, which reuses `failed_build`/`failed_precision`/`failed_tier`. Here **only
+`passed` is reused**. The sweep can reuse a failure because a registry row is keyed by a
+`MEASUREMENT_CONTRACT` hash that changes when the meaning does; a results CSV has no such key, and
+between two sessions the tree can change — which is *why* the walk was interrupted often enough to
+need resume. A retained failure is a claim about code that may no longer be there. A skip is
+re-derived every session for the mirror reason: it is the profile's current claim about what a mode
+supports, not a recorded observation, so freezing one would leave a superseded rule in force.
+
+**The trap that shaped it.** Bookkeeping agrees with itself whatever the walk did. G0's two closed
+defects were both checks that could not fail, and a resume's natural implementation is a third. So
+the ledger is *evidence*: written per rung by the walker (not by the plan), carrying a row digest,
+and re-hashed against the files afterwards. `profile_run.json`'s `rungs_by_source` is counted off the
+ledger for the same reason.
+
+Also closed in passing: **`run_profile`'s gate never passed `conditions=`**, so every profile manifest
+recorded `npu_power_mode: unknown` — on a run that had just *refused to start* unless the mode was
+turbo. The rule is "never stamp a condition you did not observe"; this was its inverse, observing and
+discarding, which is the worse half because the artifact then reads as though nobody could tell.
+
+## Doc 10 work item 5 — SPLIT: the table dropped with evidence, the requirement met by a check
+
+Item 5 asks for "the prerequisites and recovery sections of the example README", because "the runner
+shells out to all of them, and a missing tool fails mid-suite rather than at start **unless
+checked**."
+
+**The prerequisites TABLE is dropped**, joining the other four. Of its six tools, `amd-ttm`,
+`turbostat`, `sensors`, `rocm-smi` and `crontab` are already recorded as dropped in doc 10
+§Deliberately dropped with a measurement behind each; the sixth, `xrt-smi`, is only ever *read* here,
+and `require_turbo` already refuses when it is missing or unparsable. A table of five tools nothing
+invokes is a false claim about what the runner does.
+
+**The requirement is its last four words, and a README paragraph cannot fail.** This project's own
+record is of prose rules that were true when written and silently stopped being — README trap 0 lived
+in prose until the conditions block moved it into the artifact. So
+`run_profile.environment_problems()` refuses at start, and what it refuses is not a binary at all: it
+is the two Python modules a bare devq shell lacks. `pyxrt` is not added by `env_setup.sh`, so a job
+that sources it and stops **compiles every kernel and then dies at the first dispatch** with a
+`ModuleNotFoundError` that reads like a model regression; `ml_dtypes` fails at the first builder
+import. The third clause refuses a working directory that is not the example's, because aircc and
+`KernelCache` write relative to cwd and only that directory's `.gitignore` covers the debris (doc 15;
+eleven artifacts were committed by mistake once).
+
+**The recovery half is written**, because it carries information that did not exist before resume did:
+README §"Running a profile: invocation and recovery" — the one command, what each of the four
+artifacts answers, how to resume, why failed rungs are re-run, and why a populated root is refused
+with no override.
+
+## M5 — CORRECTED. The blocker was not coverage, and the test that guarded it read the wrong file
+
+Full account in [50](50-coverage-sweep-costing.md). In brief:
+
+- `kernel_registry/details/GEMM_bf16_in_bf16_out.json` holds **36 of 36** projection triples at each
+  of hidden 512, 768, 1024 — landed 2026-08-07, 69 → 103 → 136 rows. Verified twice: by triple, and
+  by **resolution through the owning builder** (which is the stronger check, since `qkv_proj` pins
+  `fused-cast` and `offload`/`runlist` re-resolve through `drain`). 36/36 at 512 and 768,
+  **35/36 at 1024** — `2048x1024x3072` has no `drain` row, so two modes fail at one ladder point.
+- The blocker was `run_mode._shape_for` overriding `seq_len` and not the width. It is a parameter now.
+  **Three families are reachable**; the three decoders are **refused by name**.
+- `tinybert_512` end to end: devq **304**, `measure`, Turbo, cold, **301 s**, 4/4 passed, ten clean
+  boundaries per mode, `atol_required` 5.2–6.0e-2 against the inherited 1e-1 ceiling (1.66–1.92×
+  margin). The resume leg carried all four rungs in **0 s** and the ledger audit found no problems;
+  a populated root without `--resume` refused with exit 2. **No latency is quoted as a result** —
+  one walk is not a result (README trap 1).
+- **The lesson is about this project's strongest habit.** Re-deriving a claim from source is what has
+  repeatedly saved this study, and it failed in the one way it can: a re-derivation is only as good
+  as its choice of source. `test_profiles.py`'s ast walk over `opcheck_specs.py` was mechanically
+  perfect and asserted something still true; the *inference* from it was false. It now reads the
+  registry, asserts the converse, and asserts each declared method gap is still open.
+
+`profiles.KNOWN_REGISTRY_GAPS` records the `drain` hole as a **failure to be run**, not a skip —
+`cases.py`'s rule that pre-declaring a failure is how a matrix stops being a measurement — and a test
+asserts it is still a gap, so sweeping it makes the warning fail rather than linger.
+
+## The negative controls
+
+Every check added here is demonstrated failing on a deliberately broken input, and the input is named
+in `study/test_resume.py`'s docstring beside the clause it drives. The load-bearing one is a walker
+that **ignores `reuse` and re-measures**: the plan, the ledger and the run report would all still say
+"reused", and only re-hashing the row afterwards catches it.
+
+## Counts
+
+Host suite **357 → 409 in 20 modules**, pinned in `run_study_host_tests.lit` and verified in both
+directions (one test renamed out of discovery → 395/395, refused; the module hidden → 372/372 in 19,
+refused). `SCHEMA_VERSION` **stays 2** and every recorded v2 CSV still reads.
+
+## Still open after G1
+
+- **`baseline_1024` has not been walked.** It is reachable; two of 36 ladder rungs will fail on the
+  one missing `drain` method until somebody sweeps that single shape (~2 min) or accepts the gap.
+- **The three decoder families**, unchanged and correctly sized: a D2-class layer-graph integration
+  per mode, no sweep. `gpt2_small_768` is cheapest — its width is already the default.
+- **Two walks into two roots**, which nothing here has done. Every latency in this section is a
+  single walk and is quoted as evidence that a mode *built*, never as a ranking.
+- **The `tree_dirt_after_run` check cannot distinguish a leak from an author.** It reports every
+  tracked-tree change, so on a dirty working tree it names the operator's edits. Job 304's report
+  listed eleven modified files, all mine, and **zero untracked** — which is the half that would have
+  shown a leak. Worth narrowing to untracked paths, or worth saying in the field's own description.
