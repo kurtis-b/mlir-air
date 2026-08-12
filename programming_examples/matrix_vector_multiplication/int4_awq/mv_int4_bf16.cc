@@ -18,6 +18,19 @@
 //             [ S : k/gs * m bf16                   ]
 //             [ Z : k/gs * m uint8                  ]
 //         Offsets are 32-byte aligned when m and gs are powers of two ≥ 16.
+//   - matvec_int4_bf16_packed_sym(packed, b, c):  SYMMETRIC variant.
+//         c[0..m] += dequant_sym(A)[m, k] @ b[k]
+//         where dequant_sym(A)[r, k] = (q[r, k] - Q4_0_ZP) * s_a[r, g(k)],
+//         Q4_0_ZP an immediate (8 by default = llama.cpp q4_0's d*(q-8)).
+//         No per-group zero-point fetch, so the packed BO carries no Z plane:
+//             [ Q : m * k/2 bytes uint8 (row-major) ]
+//             [ S : k/gs * m bf16                   ]
+//         There is exactly one interior offset left (S at m*k/2), and it is
+//         32-byte aligned iff m*k is a multiple of 64 — a strictly weaker
+//         condition than the asymmetric layout's, which additionally needs
+//         m*k/2 + 2*m*k/gs aligned for Z. The GEMV config (m=8, k=2048,
+//         gs=32) satisfies both; only the symmetric one stays satisfied if Z
+//         would have been unaligned.
 //   - matmul_int4_bf16_packed(packed, a, c):
 //         c[0..m, 0..n] += a[0..m, 0..k] @ dequant(W)[0..k, 0..n]
 //         W laid out as [n_tile, k/2] (output-major) — same packed layout
@@ -52,6 +65,14 @@
 #define DIM_K_CHUNK 128
 #endif
 
+// Zero point of the SYMMETRIC matvec variant, as an immediate. 8 is
+// llama.cpp's q4_0 (`d * (q - 8)`). Overridable only so the gate can build a
+// deliberately-wrong kernel and watch it fail on device — the asymmetric
+// entries never read it.
+#ifndef Q4_0_ZP
+#define Q4_0_ZP 8
+#endif
+
 static_assert(DIM_K % DIM_GS == 0, "DIM_K must be a multiple of DIM_GS");
 static_assert(DIM_K_CHUNK % DIM_GS == 0,
               "DIM_K_CHUNK must be a multiple of DIM_GS");
@@ -78,6 +99,58 @@ void matvec_int4_bf16_impl(uint8_t *__restrict a_q, bfloat16 *__restrict a_s,
     for (unsigned g = 0; g < k / gs; g++) {
       aie::vector<int8, r> zv =
           aie::broadcast<int8, r>((int8_t)a_z[g * m + row]);
+      bfloat16 sa = a_s[g * m + row];
+
+      aie::accum<accfloat, r> g_acc;
+      g_acc.from_vector(aie::zeros<float, r>());
+
+#pragma clang loop unroll(full)
+      for (unsigned i = 0; i < NSUB; i++) {
+        const unsigned off = (g * gs + i * r) / 2;
+        aie::vector<uint8, r / 2> packed = aie::load_v<r / 2>(aq + off);
+        aie::vector<int8, r> w_int8 =
+            packed.template cast_to<uint4>().template unpack_sign<int8>(false);
+        w_int8 = aie::sub(w_int8, zv);
+        aie::vector<bfloat16, r> w_bf16 = aie::to_float<bfloat16>(w_int8, 0);
+        aie::vector<bfloat16, r> b_vec = aie::load_v<r>(b + g * gs + i * r);
+        g_acc = aie::mac(g_acc, w_bf16, b_vec);
+      }
+
+      aie::vector<bfloat16, r> g_bf16 = g_acc.template to_vector<bfloat16>();
+      acc = aie::mac(acc, g_bf16, sa);
+    }
+
+    float s = aie::reduce_add(acc.template to_vector<float>());
+    c[row] = (bfloat16)((float)c[row] + s);
+  }
+}
+
+// SYMMETRIC int4 matvec: identical arithmetic to matvec_int4_bf16_impl with
+// the zero point pinned to the immediate `zp`, so no Z plane is loaded and
+// none has to be shipped. This is llama.cpp's q4_0 (`d * (q - 8)`) natively
+// rather than as a special case of AWQ's `(q - z) * s`.
+//
+// The subtraction stays — a symmetric format still offsets the nibbles — but
+// its operand is a single loop-invariant broadcast instead of one uint8 load
+// per (group, row). Everything else, including the per-group accumulate and
+// the cold-path scale fold, is byte-for-byte the asymmetric loop, which is
+// what makes the two numerically identical rather than merely close.
+template <unsigned m, unsigned k, unsigned gs, unsigned r, int8_t zp>
+void matvec_int4_bf16_sym_impl(uint8_t *__restrict a_q,
+                               bfloat16 *__restrict a_s,
+                               bfloat16 *__restrict b, bfloat16 *__restrict c) {
+  ::aie::set_rounding(aie::rounding_mode::conv_even);
+  static_assert(gs % r == 0, "group size must be multiple of inner vector r");
+  constexpr unsigned NSUB = gs / r;
+
+  const aie::vector<int8, r> zv = aie::broadcast<int8, r>(zp);
+
+  for (unsigned row = 0; row < m; row++) {
+    aie::accum<accfloat, r> acc;
+    acc.from_vector(aie::zeros<float, r>());
+    const uint8_t *__restrict aq = a_q + row * (k / 2);
+
+    for (unsigned g = 0; g < k / gs; g++) {
       bfloat16 sa = a_s[g * m + row];
 
       aie::accum<accfloat, r> g_acc;
@@ -431,6 +504,17 @@ void matvec_int4_bf16_packed_store(uint8_t *packed, bfloat16 *b, bfloat16 *c) {
   bfloat16 *a_s = reinterpret_cast<bfloat16 *>(packed + Q_BYTES);
   uint8_t *a_z = packed + Q_BYTES + S_BYTES;
   matvec_int4_bf16_store_impl<DIM_M, DIM_K, DIM_GS, 32>(a_q, a_s, a_z, b, c);
+}
+
+// Symmetric packed-BO entry. The BO holds Q and S only — the zero point is
+// the immediate Q4_0_ZP, so there is no Z plane to slice out and no third
+// offset to keep aligned.
+void matvec_int4_bf16_packed_sym(uint8_t *packed, bfloat16 *b, bfloat16 *c) {
+  constexpr unsigned Q_BYTES = DIM_M * (DIM_K / 2);
+  uint8_t *a_q = packed;
+  bfloat16 *a_s = reinterpret_cast<bfloat16 *>(packed + Q_BYTES);
+  matvec_int4_bf16_sym_impl<DIM_M, DIM_K, DIM_GS, 32, (int8_t)Q4_0_ZP>(a_q, a_s,
+                                                                       b, c);
 }
 
 void zero_vectorized_bf16(bfloat16 *c) { zero_impl<DIM_M>(c); }

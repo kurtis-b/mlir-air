@@ -34,6 +34,10 @@ print_packed:
 print_packed_add:
 	${powershell} python3 ${srcdir}/matvec_int4_packed_add.py $(OUTPUT_FORMAT_FLAG) -p $(PY_ARGS)
 
+# Zero point of the SYMMETRIC matvec, baked in as an immediate. 8 is q4_0's.
+# The only reason it is overridable is the negative control below.
+ZP ?= 8
+
 compile-kernel:
 	mkdir -p $(BUILD_DIR)
 	@if [ -z "$(PEANO_INSTALL_DIR)" ]; then \
@@ -41,7 +45,7 @@ compile-kernel:
 		exit 1; \
 	fi
 	$(PEANO_INSTALL_DIR)/bin/clang++ ${PEANOWRAP2P_FLAGS} \
-		-DDIM_M=$(M_TILE) -DDIM_K=$(K_CHUNK) -DDIM_GS=$(GS) \
+		-DDIM_M=$(M_TILE) -DDIM_K=$(K_CHUNK) -DDIM_GS=$(GS) -DQ4_0_ZP=$(ZP) \
 		-c ${srcdir}/mv_int4_bf16.cc -o $(BUILD_DIR)/mv_int4_bf16.o
 
 # GEMV: D = dequant(A) @ B
@@ -80,6 +84,49 @@ run_q4_0_negative:
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
 	  ${powershell} python3 ${srcdir}/matvec_q4_0.py $(OUTPUT_FORMAT_FLAG) \
 	    --negative-control $(NEG) $(Q4_0_ARGS)
+
+# --- q4_0, SYMMETRIC ------------------------------------------------------
+# Same arithmetic with the zero point as an immediate, so the packed BO drops
+# the all-8s Z plane: K*M/32 fewer bytes per weight tensor, 4.750 -> 4.500
+# bits/weight. Dispatches matvec_int4_bf16_packed_sym.
+run_q4_0_sym:
+	$(MAKE) -f $(firstword $(MAKEFILE_LIST)) compile-kernel GS=32
+	mkdir -p $(BUILD_DIR)
+	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
+	  ${powershell} python3 ${srcdir}/matvec_q4_0.py $(OUTPUT_FORMAT_FLAG) \
+	    --symmetric --check-reference $(Q4_0_ARGS)
+
+run_q4_0_sym_negative:
+	$(MAKE) -f $(firstword $(MAKEFILE_LIST)) compile-kernel GS=32
+	mkdir -p $(BUILD_DIR)
+	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
+	  ${powershell} python3 ${srcdir}/matvec_q4_0.py $(OUTPUT_FORMAT_FLAG) \
+	    --symmetric --negative-control $(NEG) $(Q4_0_ARGS)
+
+# The symmetric replacement for the asymmetric gate's `wrong-zero` control:
+# once the zero point is an immediate, the off-by-one lives in the KERNEL, so
+# the control has to be built there. Inverted exit code, like the others.
+# The inversion lives in the script (`--expect-mismatch`), not here: a shell
+# `if [ $$? -ne 0 ]` would report a crashed run, a missing checkpoint or a bad
+# argument as a passing control.
+run_q4_0_sym_wrongzp:
+	$(MAKE) -f $(firstword $(MAKEFILE_LIST)) compile-kernel GS=32 ZP=7
+	mkdir -p $(BUILD_DIR)
+	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
+	  ${powershell} python3 ${srcdir}/matvec_q4_0.py $(OUTPUT_FORMAT_FLAG) \
+	    --symmetric --expect-mismatch "kernel built with -DQ4_0_ZP=7" \
+	    $(Q4_0_ARGS)
+
+# Dump the raw device output of one variant, for the variant-vs-variant
+# equivalence check. SYM=1 selects the symmetric variant.
+DUMP ?= dump.npy
+SYM  ?=
+run_q4_0_dump:
+	$(MAKE) -f $(firstword $(MAKEFILE_LIST)) compile-kernel GS=32
+	mkdir -p $(BUILD_DIR)
+	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
+	  ${powershell} python3 ${srcdir}/matvec_q4_0.py $(OUTPUT_FORMAT_FLAG) \
+	    $(if $(SYM),--symmetric,) --dump-output $(DUMP) $(Q4_0_ARGS)
 
 # GEMV + fused residual add (LA-style 2-tile cascade)
 run_packed_add: compile-kernel
