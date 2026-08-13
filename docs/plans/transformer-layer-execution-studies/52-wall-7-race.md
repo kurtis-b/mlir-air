@@ -1020,3 +1020,180 @@ instrument.
 
 `fused`'s SPECS atol stays **PROVISIONAL**, and **no resident-tail latency or
 byte figure has been measured on hardware.** Nothing here changes either.
+
+---
+
+## 11 — `[2026-08-12]` Row 28 defect (b): the fold §10.9 specified is **arithmetically unavailable**, and the pacing that replaces it is written but **UNBUILT**
+
+Queue row 28, defect (b). **NO MEASUREMENT IN THIS SECTION.** No compiler was
+built, no rung was compiled, no device leg was run. What is here is one
+refutation proved off a recorded artifact, one implementation, one regression
+lit verified failing pre-fix, and a prediction recorded before any run. The
+obstruction that stopped it is named in §11.5 and it is not a technical one.
+
+Instruments: none new. Artifact re-read: devq 332's `O3` compile
+(`row28why-private/elf/O3/air_project/npu.air.mlir`, the `down_K = 6` rung).
+Prediction file `PREDICTION-MAXQ.md`, sha256 `90b92618…`, written before the
+first compile of the changed compiler.
+
+### 11.1 Why the existing folding path does not reach R1's `hidden` refill
+
+It **does** reach it. That is the finding, and it inverts §10.9's premise.
+
+Read straight off `O3`'s emitted runtime sequence, all six `@air_channel_2`
+tasks are **byte-identical to each other and to the two channels §10.9 held up
+as the ones that already fold**:
+
+```
+%2..%7 = aiex.dma_configure_task_for @air_channel_2 {
+  aie.dma_bd(%arg0 : memref<64x32xbf16> offset = 0 len = 256
+             sizes = [8, 4, 8, 8] strides = [256, 8, 32, 1])
+} {repeat_count = 7 : i32}
+```
+
+`@air_channel_0` and `@air_channel_1` carry the **same** descriptor and the
+**same `repeat_count = 7`**. The refill is not missing the fold; each of its six
+transfers is *already folded*, and what is unfolded is the **launch-level loop
+around them** — `down_K` copies of a descriptor that is itself complete.
+
+So the question is whether that outer loop can be folded too, and it cannot:
+
+- `repeat_count` **is** the descriptor's iteration dimension. `airrt-to-npu`
+  sets it to `sizes[0] - 1` and, when `strides[0] != 0`, *also* emits dim 0 in
+  the BD layout to carry the iteration stride. `repeat_count + 1` executions
+  therefore **advance** the address by `strides[0]`; they cannot restart it.
+- That is settled against a **passing** artifact rather than from the dialect
+  docs: `@air_channel_1` is the output `y`, `len = 256`, `repeat_count = 7`,
+  and `O5` (`down_K 4`) returns a **correct 2048-element** `y`. 256 x 8 = 2048.
+  If `repeat_count` were a queue-level re-issue that restarted the BD, `y` would
+  be eight overwrites of its first 256 elements and `O5` would not pass.
+- Concatenating six identical copies of that descriptor therefore needs an
+  outer dimension of size 6 **at stride 0**, on top of an iteration dimension
+  already in use — a **fifth** hardware dimension.
+- And the four in use are irreducible. `sizes = [8,4,8,8]`,
+  `strides = [256,8,32,1]` is the retile (row-block, microtile column, row,
+  element) and **no adjacent pair is mergeable**: 256 != 8x4, 8 != 32x8,
+  32 != 1x8.
+
+**§10.9's first move is refused at its premise**, one level above the
+experiment, exactly as §9.1's hypothesis was. It is the same wall item 6b
+already recorded from the other side ("the retile already uses all four
+hardware dimensions … the chunk loop would be a fifth") — 6b hit it on the
+96-task feed and this is the same feed at `down_K` tasks.
+
+### 11.2 What shipped instead, and why pacing rather than folding
+
+6b's machinery is the right shape and is reused **unchanged**:
+`paceShimFeedForBdReuse` — sink the run past the feeds it must not out-order,
+`issue_token` + `dma_await_task(t[i-depth])` before task `i`'s **configure**
+(the allocator hands the ID out there), drain the tail so every token is
+consumed exactly once.
+
+What 6b does **not** do is fire here. Its trigger is `peak live BDs > tile BD
+pool`, and six live BDs on a 16-BD tile is comfortably under budget. **That is
+precisely why this shape survived 6b**: the hang is an *occupancy* of the
+channel's task queue, not an exhaustion of the tile's descriptor pool, and
+nothing was counting it.
+
+New step `boundIdenticalShimPutRuns` in `AIRRtToNpuPass.cpp`, run once after
+`boundShimBdLiveness`. It paces a run of **>= 3 structurally identical**
+fire-and-forget MM2S configure/start pairs on one shim channel to **depth 2**.
+
+**The trigger is structural and no queue depth is claimed.** §10.6 was careful
+that "5 outstanding starts complete and 6 do not" is *not* a documented queue
+depth, and nothing here converts that observation into a constant. What fires
+the step is that the run is a loop of **identical** puts — a trip-shaped
+occupancy the design can raise without bound and that the compiler never
+folded. Identity is tested with `OperationEquivalence::exactValueMatch`, so two
+puts of *different slices* of the same operand never match; a feed whose
+transfers carry distinct offsets is a real multi-part transfer and is left
+alone. Depth 2 is not a capacity claim either: it is the smallest in-flight set
+that still overlaps a transfer with the next configure, and it is the same
+per-feed figure `boundShimBdLiveness` already reserves out of the BD pool.
+
+Pacing at `i-2` cannot deadlock a ring consumer: the consumer takes fills in
+order, so fill `i-2` is retired before fill `i` could be accepted, whatever the
+staging buffer's slot count.
+
+**Note the two effects are not separable by this change.** The sink moves the
+refill run *after* the `w_up`/`w_down` starts, which §10.6 names as part of the
+shape, and the pacing bounds the outstanding count. A PASS would not say which
+of the two did it. Separating them needs the synthetic instrument §10.9.2 asks
+for, and that instrument is still unbuilt.
+
+### 11.3 The regression lit, verified failing pre-fix
+
+`mlir/test/Conversion/AIRRtToNpu/identical_shim_put_run_bound.mlir`. Six
+identical `@refill` transfers plus a **negative control** on its own channel —
+six transfers with **distinct** offsets, which must come out untouched — plus a
+one-shot `@weights` feed issued after the run, which is what the sink must move
+the run behind.
+
+Lowered by the **pre-fix** `build-xrt/bin/air-opt` it reproduces R1's shape
+exactly: `@out`, six `@varying`, six `@refill` with no token and no await,
+`@weights` last, then fourteen clustered `dma_free_task`s. FileCheck **exits 1**
+on it, on the intended clause — after `@weights` there is no `@refill`
+configure, i.e. the run was never sunk and never paced.
+
+Calibrated in both directions inside the one file: the `@varying` control's
+`CHECK-NOT: issue_token` is what a trigger keyed on *count* rather than on
+*identity* would trip over.
+
+### 11.4 The prediction, recorded before any run
+
+`PREDICTION-MAXQ.md`, sha256 `90b92618…`, five clauses and four named
+falsifiers. In summary: `O3`/`O6` (`down_K` 6/7) TIMEOUT 5/5 -> **PASS 5/5**;
+`O2` (`down_K` 5) **stays FAIL 5/5** with the same `sigma = [0,1,4,2,3]`,
+because defect (a) is untouched; `O5`/`O1` (`down_K` 4) stay PASS with a
+**byte-identical `y` sha** but a **changed control program** (their runs are
+also >= 3 identical tasks, so they are paced too — they are *not* predicted
+byte-identical at the IR level, and that is stated up front rather than
+discovered); `check-air-mlir` 499 -> 500 with the delta being exactly the new
+lit.
+
+The consequence is recorded so it cannot be quietly dropped: with (b) fixed and
+(a) open the ladder becomes PASS 2/3/4, **FAIL 5**, PASS 6+ — **non-monotonic**,
+which is the signature of two independent defects.
+
+### 11.5 The obstruction, named: this is UNBUILT and UNMEASURED
+
+`build-xrt` is configured with `CMAKE_HOME_DIRECTORY=/home/cj/mlir-air`, so
+building a compiler change requires the edit to be in the **shared checkout**.
+This work was done in a git worktree, and **the permission classifier refuses
+the copy into the shared checkout**. No build, therefore:
+
+- **`check-air-mlir` NOT RUN.** Baseline 499/0 stands unverified against this
+  change; the predicted 500/0 is a prediction, not a result.
+- **No rung compiled**, so §11.4's clause 0 (the compile-only gate: `maxq`
+  6 -> 2 on `O3`, the run sunk past `w_up`/`w_down`) is **unverified**. Clause 0
+  was written as a gate that must pass *before* any device leg precisely so
+  that this cannot be skipped.
+- **No device leg.** Every rung figure in §11.4 is a prediction.
+- The transformer-layer suite and the ten-model leg are **owed**, as §10.8 said
+  they would be for whoever took the fix.
+
+**Nothing in §§8–10 moves.** No measurement is added, corrected or retracted
+here, and the only claim §11 makes about hardware is a prediction with its
+falsifiers written down first.
+
+### 11.6 What the next person should do first
+
+1. **Build it and run clause 0**, which is compile-only and needs no device:
+   `maxq` on `%shim_noc_tile_0_0 / MM2S 0` must read **2** at every `down_K`,
+   and the refill run must sit after `@air_channel_3`/`@air_channel_4`'s starts.
+   If clause 0 fails, stop — the device legs would be uninterpretable.
+2. **`check-air-mlir`, and read the delta by name.** The step is a no-op unless
+   a run of >= 3 identical puts exists on one shim channel; any test other than
+   the new lit that moves falsifies that and is the red flag to stop on.
+3. **Then the rungs**, >= 5 fresh processes per arm, `O5`/`O2`/`O3`/`O6`.
+   `O2` staying FAIL is as much the result as `O3` turning PASS: it is what
+   shows the step did not reach into defect (a).
+4. **Do not read a PASS as "maxq was the mechanism."** The sink and the pacing
+   move together here (§11.2). §10.9.2's synthetic N-sweep is still the only
+   thing that decides blocked-versus-dropped and still the only thing that may
+   quote a queue depth.
+5. **Defect (a) is untouched and stays open** at
+   `detectNBufferRotation`'s divisibility fallback (§10.3).
+
+`fused`'s SPECS atol stays **PROVISIONAL**, and **no resident-tail latency or
+byte figure has been measured on hardware.** Nothing here changes either.
