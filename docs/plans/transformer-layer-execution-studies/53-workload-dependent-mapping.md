@@ -241,24 +241,53 @@ export the same symbol in one module, so *"the up stage's output group width IS 
 **So any change that decouples `group_n` from `emb/herd_x` decouples `maxq` from `down_K` — and it
 decouples upward**, since `maxq` scales as `1/group_n`. That is the whole content of §5.
 
-**`[2026-08-13]` CAUTION — the closed form above is NOT what the gate shape measures.** Read off the
-`airrt-to-npu` dump (devq 340, §2.4a's control arm), outstanding starts before the first await are
-**15** on one channel and **1** on every other, against the **96** that `sweeps × k_steps_up`
-predicts. So the compiler already folds this refill substantially at the gate shape, and doc 52
-§10.6's `maxq == down_K` — measured on rungs 2 through 12 — **does not extend to it**.
+~~**`[2026-08-13]` CAUTION — the closed form above is NOT what the gate shape measures.** …the
+compiler already folds this refill substantially at the gate shape…~~ **RETRACTED the same day, and
+the error was mine rather than the formula's** — see §3.1. The caution conflated **task starts**
+with **outstanding** starts. The closed form predicts the former and is exactly right.
 
-Three things follow, and only the first two are established:
+### 3.1 `[2026-08-13]` The formula holds; the hazard quantity is a different number, and something is already pacing it
 
-1. **The formula is an upper bound at this shape, not the value.** Every use of it in this document
-   (§4's table, §5.2's 256) is a count of *puts in the loop nest*, not of *task starts in the
-   emitted sequence*, and the two diverge once folding is in play. Treat those columns as the shape
-   of the trade, not as predicted `maxq`.
-2. **The conclusion that the gate shape is over the wall survives** — §10.6's separation is PASS at
-   2/3/4, FAIL at 5, TIMEOUT at 6+, and 15 is over. What changes is the margin.
-3. **Unresolved, and it is the next thing to settle**: which channel carries the 15 is *not*
-   verified here — doc 52 §10.6 names `@air_channel_2` as the `hidden` refill at ITS shapes, and the
-   symbol numbering at the gate shape has not been attributed. Do not cite the 15 as "the hidden
-   refill's `maxq`" until it is.
+Walked the runtime sequence in program order, tracking starts and awaits per channel (devq 340's
+control arm, `pass_056_after_airrt-to-npu.mlir`):
+
+| channel | operand | total starts | peak outstanding |
+|---|---|---|---|
+| `air_channel_2` | `%arg0` = `hidden` | **96** | **15** |
+| `air_channel_3` | `%arg1` = `w_up` | 1 | 1 |
+| `air_channel_4` | `%arg2` = `w_down` | 1 | 1 |
+| `air_channel_0_*`, `air_channel_1_*` | C fetch / `y` out | 1 each | 1 |
+
+**Attribution is now settled** and §3's earlier "unresolved" is closed: `air_channel_2` reads
+`%arg0 : memref<64x768xbf16>` with `sizes = [8, 4, 8, 8] strides = [6144, 8, 768, 1]` — the per-k'
+blocked retile, on `%shim_noc_tile_1_0 MM2S 0`. It is the `hidden` refill, and it carries
+`repeat_count = 7`, which is doc 52 §11's finding at this shape.
+
+**Total starts are 96, exactly `sweeps × k_steps_up`.** §3's closed form is correct. What it does
+not predict — and never claimed to — is the *outstanding* count, which peaks at **15** because
+awaits interleave after the first 25 events (10 single-start channels + 15 of `air_channel_2`).
+Doc 52 §10.6's `maxq == down_K` held on rungs 2–12 because at those sizes *every* start precedes
+the first await; at the gate shape it cannot, and the two quantities separate.
+
+**What sets the 15 is item 6b's pacing, and this is read off the source, not guessed.**
+`AIRRtToNpuPass.cpp:3340` computes `depth = (capacity - fixed) / candidates.size()`, where
+`capacity = tm.getNumBDs(tile)` — 16 for a shim tile. With one un-recyclable descriptor fixed and
+one paceable feed, `depth = (16 − 1) / 1 = 15`. So `paceShimFeedForBdReuse` is **already bounding
+this refill**, and it reaches R1 today.
+
+**And it is pacing the wrong budget — which is exactly what doc 52 §11 concluded, now visible in a
+number.** 6b's depth is derived from the **descriptor pool**; the hazard is **channel task-queue
+occupancy**, whose measured band is PASS at 2/3/4, FAIL at 5, TIMEOUT at 6+. A BD-pool-optimal
+depth of 15 sits four rungs above the last passing value. The two budgets are different resources
+and only one of them is being counted.
+
+**This gives queue row 28(b) a quantified prediction it did not have.** Its shipped step
+`boundIdenticalShimPutRuns` paces to `depth = 2` — a queue-appropriate depth — and is inert only
+because it walks `func::FuncOp` while R1 presents `aie.runtime_sequence` (doc 52 §12). Note the
+tell: `paceShimFeedForBdReuse`'s *other* caller reaches R1 fine, so the fix is to give 28(b)'s
+caller the traversal the working one already uses. **Predicted effect at the gate shape: peak
+outstanding 15 → 2, from above the TIMEOUT threshold to inside the measured PASS band.** Recorded
+here, before the fix, so it can be checked against what happens rather than fitted afterwards.
 
 ---
 
