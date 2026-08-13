@@ -253,6 +253,7 @@ def build_ffn_resident_module(
     herd_x=FFN_ACCUM_HERD_X,
     tile_k=FFN_ACCUM_TILE_K,
     shared_h_staging=True,
+    stage_hidden=False,
 ):
     """Build the one-segment resident FFN interior for one TILE_M-row band.
 
@@ -391,7 +392,18 @@ def build_ffn_resident_module(
     l3_y_ty = MemRefType.get([seq_len, emb_dim], xrt_dtype)
 
     l2_space = IntegerAttr.get(T.i32(), MemorySpace.L2)
-    l2_a_up_ty = MemRefType.get([chunk_elems], xrt_dtype, memory_space=l2_space)
+    # `stage_hidden` (doc 53 section 2.4, EXPERIMENTAL, default off): stage the
+    # whole band once instead of refilling one k' slice per (sweep, k').  The
+    # refill is `sweeps * k_steps_up` shim task starts on ONE channel with no
+    # await -- doc 52 section 10.6's `maxq`, and the binding wall at the gate
+    # shape.  Staged, the same bytes arrive in ONE 4-D shim read.  What this
+    # probes is whether the DRAIN side is expressible: the L2-side offset per
+    # k' may not depend on an induction variable (doc 23 section 2), so the put
+    # streams the whole staged buffer and the core's existing chunk-sized gets
+    # take it k' at a time.  Whether AIR admits that granularity mismatch is
+    # the open question; a refusal here is a RESULT, not a bug.
+    a_up_elems = TILE_M * emb_dim if stage_hidden else chunk_elems
+    l2_a_up_ty = MemRefType.get([a_up_elems], xrt_dtype, memory_space=l2_space)
     l2_b_up_ty = MemRefType.get([herd_x * up_b_block], xrt_dtype, memory_space=l2_space)
     l2_h_ty = MemRefType.get([chunk_elems], xrt_dtype, memory_space=l2_space)
     l2_b_down_ty = MemRefType.get([down_chunk], xrt_dtype, memory_space=l2_space)
@@ -557,21 +569,39 @@ def build_ffn_resident_module(
                 wup_map = _two_iv_map(
                     k_steps_up * herd_x * up_b_block, herd_x * up_b_block
                 )
+                if stage_hidden:
+                    # Q1 (doc 53 section 2.3a): the whole band in ONE 4-D shim
+                    # read.  Note this is a re-parameterization of the per-k'
+                    # read, not a new dimension -- the k' slices ARE a
+                    # contiguous run of the column-block axis.
+                    dma_memcpy_nd(
+                        l2_a_up,
+                        s_hidden,
+                        src_offsets=[0, 0, 0, 0],
+                        src_sizes=[
+                            TILE_M // MICRO,
+                            emb_dim // MICRO,
+                            MICRO,
+                            MICRO,
+                        ],
+                        src_strides=[MICRO * emb_dim, MICRO, emb_dim, 1],
+                    )
                 for s in range_(0, sweeps):
                     for k in range_(0, k_steps_up):
-                        a_col = affine_apply(a_col_map, [k])
-                        dma_memcpy_nd(
-                            l2_a_up,
-                            s_hidden,
-                            src_offsets=[0, a_col, 0, 0],
-                            src_sizes=[
-                                TILE_M // MICRO,
-                                tile_k // MICRO,
-                                MICRO,
-                                MICRO,
-                            ],
-                            src_strides=[MICRO * emb_dim, MICRO, emb_dim, 1],
-                        )
+                        if not stage_hidden:
+                            a_col = affine_apply(a_col_map, [k])
+                            dma_memcpy_nd(
+                                l2_a_up,
+                                s_hidden,
+                                src_offsets=[0, a_col, 0, 0],
+                                src_sizes=[
+                                    TILE_M // MICRO,
+                                    tile_k // MICRO,
+                                    MICRO,
+                                    MICRO,
+                                ],
+                                src_strides=[MICRO * emb_dim, MICRO, emb_dim, 1],
+                            )
                         w_off = affine_apply(wup_map, [s, k])
                         dma_memcpy_nd(
                             l2_b_up,
@@ -581,7 +611,32 @@ def build_ffn_resident_module(
                             src_strides=[1],
                         )
                         for c in range(herd_x):
-                            ChannelPut(CHANNEL_UP_FEED, l2_a_up, indices=[c, 0])
+                            if stage_hidden:
+                                # Q2: drain k' slice `k` out of the staged band.
+                                # offsets[0] is the LOOP IV, so this is an
+                                # L2-side moving offset -- doc 23 section 2 says
+                                # inexpressible and H10 made it refuse by
+                                # message.  A refusal here is the RESULT: it
+                                # says the drain needs its own channel (an
+                                # A-only stream), not a moving offset.
+                                ChannelPut(
+                                    CHANNEL_UP_FEED,
+                                    l2_a_up,
+                                    offsets=[k, 0, 0],
+                                    sizes=[
+                                        1,
+                                        TILE_M // MICRO,
+                                        (tile_k // MICRO) * MICRO * MICRO,
+                                    ],
+                                    strides=[
+                                        (tile_k // MICRO) * MICRO * MICRO,
+                                        (emb_dim // MICRO) * MICRO * MICRO,
+                                        1,
+                                    ],
+                                    indices=[c, 0],
+                                )
+                            else:
+                                ChannelPut(CHANNEL_UP_FEED, l2_a_up, indices=[c, 0])
                             ChannelPut(
                                 CHANNEL_UP_FEED,
                                 l2_b_up,

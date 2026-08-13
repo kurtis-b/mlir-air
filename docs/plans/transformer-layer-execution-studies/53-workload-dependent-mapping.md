@@ -176,6 +176,49 @@ choice, not a compiler capability. **Unverified.** Its bytes and its block count
 nothing else is. The check is compile-only, no device: build through
 `XRTBackend.compile(debug_ir=True)` and count `aie.dma_bd` blocks per `aie.memtile_dma`.
 
+### 2.4a `[2026-08-13]` COMPILED. Q1 lands, Q2 is REFUSED BY MESSAGE, and that is the answer
+
+`agents/probes/probe_r1_staged_hidden.py`, two arms at the gate shape, hermetic, devq **339/340**
+(build-class). `builders/ffn_resident.py` gains `stage_hidden=False`, mirroring the existing
+`shared_h_staging` experiment flag; **the default path is byte-identical** (module sha256
+`2582c733e19f26ba` against the committed builder, checked by building both), so no gated design moves.
+
+**Q1 — the whole band in one 4-D shim read — builds.** As §2.3a predicted, it is a
+re-parameterization of the per-k' read rather than a new dimension.
+
+**Q2 — the per-k' drain out of the staged buffer — is REFUSED, verbatim:**
+
+```
+'air.channel.put' op channel @channel_23: BD offset is not a compile-time constant:
+an aie.dma_bd is a static descriptor whose offset cannot advance per loop iteration,
+so this transfer cannot be lowered to a tile-side (L1/L2) BD.
+Stage the operand per iteration from L3 instead
+```
+
+That is doc 23 §2's rule and H10's diagnostic doing exactly their job — refusing rather than
+emitting a chain that repeats a stale offset. **The refusal is the result**, and it converts §2.4
+from open to conditionally closed: a staged `hidden` cannot be drained by a moving L2 offset, so the
+contiguous re-stream **requires its own A-only channel**. A and B share `CHANNEL_UP_FEED` today and
+the stream is FIFO, so an A-only contiguous put would desynchronize the core's alternating gets.
+
+**And the next obstacle on that route is priced rather than guessed**: splitting A and B into two
+channels wants **8 memtile MM2S ports against the 6 a memtile has** (§2.3a measured the up feed at
+4 MM2S on `mem_tile_1_1`). Whether the allocator spreads them across memtiles or packet-multiplexes
+is the question that route opens, and doc 23's counting rule says a port census reads **0** exactly
+when it multiplexes.
+
+### 2.4b The instrument was wrong first, and the number it printed was confident
+
+The first run of this probe reported `maxq = 25` for the control. It is **15**. The configure op
+opens with a brace and the regex required a paren, so *every* task resolved to one anonymous bucket
+and the maximum over that bucket was reported as a per-channel maximum. Nothing in the output looked
+wrong.
+
+Fixed, and the probe now **raises** if any task resolves to no channel — a per-channel count that
+silently collapses to one bucket is doc 51's defect class exactly, and this is the second time in
+two iterations that the instrument, not the design, was the thing at fault. Recorded because
+`maxq` is the quantity the whole `down_K` story rests on.
+
 ---
 
 ## 3. The identity that couples `maxq` to `group_n`, and when it breaks
@@ -197,6 +240,25 @@ export the same symbol in one module, so *"the up stage's output group width IS 
 
 **So any change that decouples `group_n` from `emb/herd_x` decouples `maxq` from `down_K` — and it
 decouples upward**, since `maxq` scales as `1/group_n`. That is the whole content of §5.
+
+**`[2026-08-13]` CAUTION — the closed form above is NOT what the gate shape measures.** Read off the
+`airrt-to-npu` dump (devq 340, §2.4a's control arm), outstanding starts before the first await are
+**15** on one channel and **1** on every other, against the **96** that `sweeps × k_steps_up`
+predicts. So the compiler already folds this refill substantially at the gate shape, and doc 52
+§10.6's `maxq == down_K` — measured on rungs 2 through 12 — **does not extend to it**.
+
+Three things follow, and only the first two are established:
+
+1. **The formula is an upper bound at this shape, not the value.** Every use of it in this document
+   (§4's table, §5.2's 256) is a count of *puts in the loop nest*, not of *task starts in the
+   emitted sequence*, and the two diverge once folding is in play. Treat those columns as the shape
+   of the trade, not as predicted `maxq`.
+2. **The conclusion that the gate shape is over the wall survives** — §10.6's separation is PASS at
+   2/3/4, FAIL at 5, TIMEOUT at 6+, and 15 is over. What changes is the margin.
+3. **Unresolved, and it is the next thing to settle**: which channel carries the 15 is *not*
+   verified here — doc 52 §10.6 names `@air_channel_2` as the `hidden` refill at ITS shapes, and the
+   symbol numbering at the gate shape has not been attributed. Do not cite the 15 as "the hidden
+   refill's `maxq`" until it is.
 
 ---
 
