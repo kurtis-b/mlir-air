@@ -23,6 +23,7 @@
 #include "mlir/Dialect/SCF/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/OperationSupport.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -1998,6 +1999,10 @@ struct AIRRtToNpuPass : public impl::AIRRtToNpuBase<AIRRtToNpuPass> {
     // BD count exceeds the hardware pool. No-op when every tile already fits.
     boundShimBdLiveness(module);
 
+    // Bound the outstanding task starts of an unfolded launch-level loop of
+    // IDENTICAL puts on one shim channel. No-op unless such a run exists.
+    boundIdenticalShimPutRuns(module);
+
     // Renumber npu dma ops
     renumberNpuDmaOps(module.getBody());
 
@@ -3337,6 +3342,140 @@ struct AIRRtToNpuPass : public impl::AIRRtToNpuBase<AIRRtToNpuPass> {
 
         for (StringRef ch : candidates)
           paceShimFeedForBdReuse(blk, tasks, byChannel[ch], depth);
+      }
+    }
+  }
+
+  // Bound the outstanding task starts of an unfolded launch-level loop of
+  // IDENTICAL puts on one shim channel.
+  //
+  // THE SHAPE. A launch-level loop whose body is one `air.channel.put` of the
+  // SAME slice of the SAME operand lowers to `trip` byte-identical
+  // `airrt.dma_memcpy_nd` ops, hence `trip` byte-identical configure/start
+  // pairs on one shim channel, every release clustered at the terminal
+  // wait_all. Doc 52 SS10.6 measures that shape: R1's `hidden` refill pushes
+  // `down_K` starts on `%shim_noc_tile_0_0 / MM2S 0` with no await between
+  // them and BEFORE the `w_up` / `w_down` feeds its consumers need in order to
+  // drain them. `aiex.npu.push_queue` is a bare register write to that
+  // channel's Start_Queue and nothing in this compiler accounts for how many
+  // are outstanding, so the count is whatever the design's trip count is.
+  //
+  // WHY NOT FOLD IT INTO `repeat_count` (doc 52 SS10.9's suggestion, and doc 23
+  // SS4's older one). A task's `repeat_count` IS the descriptor's iteration
+  // dimension -- the lowering above sets it to `sizes[0] - 1` and, when
+  // `strides[0] != 0`, ALSO emits dim 0 in the BD layout to carry the
+  // iteration stride. So `repeat_count + 1` executions advance the address by
+  // `strides[0]` each time; they cannot restart it. Concatenating `trip`
+  // identical copies of such a descriptor needs an outer dimension of size
+  // `trip` at stride 0 ON TOP of the iteration dimension -- a fifth hardware
+  // dimension. Measured on R1's own emitted module: the `hidden` descriptor is
+  // `sizes = [8, 4, 8, 8] strides = [256, 8, 32, 1]` (row-block, microtile
+  // column, row, element) with `repeat_count = 7`, and no adjacent pair is
+  // mergeable (256 != 8*4, 8 != 32*8, 32 != 1*8), so all four are in use. The
+  // fold is arithmetically unavailable here, exactly as it was for the
+  // over-budget feed in boundShimBdLiveness.
+  //
+  // SO PACE IT, with the same mechanism and the same two invariants: the run
+  // is sunk past the feeds it must not out-order, and every token it creates
+  // is consumed exactly once.
+  //
+  // THE TRIGGER IS STRUCTURAL, NOT A CAPACITY. No queue depth is claimed or
+  // hardcoded -- the hardware task queue's depth has not been measured, and
+  // inferring one from R1's rungs is exactly the move this project has been
+  // burned by. What fires this step is that the run is a loop of IDENTICAL
+  // puts: a `trip`-shaped occupancy the design can raise without bound and
+  // which the compiler never folded. A feed whose tasks differ (distinct
+  // offsets per transfer) is a real multi-part transfer and is left alone.
+  //
+  // DEPTH 2 is not a queue-depth claim either: it is the smallest in-flight
+  // set that still overlaps one transfer with the next configure, and it is
+  // the same per-feed figure boundShimBdLiveness already reserves out of the
+  // BD pool. Pacing at i-2 cannot deadlock a ring consumer: the consumer takes
+  // the fills in order, so fill i-2 is retired before fill i could be
+  // accepted, whatever the staging buffer's slot count.
+  void boundIdenticalShimPutRuns(ModuleOp module) {
+    SmallVector<func::FuncOp> funcOps;
+    module.walk([&](func::FuncOp f) { funcOps.push_back(f); });
+    for (auto f : funcOps) {
+      auto device = f->getParentOfType<AIE::DeviceOp>();
+      if (!device || f.getBody().empty())
+        continue;
+      Block &blk = f.getBody().front();
+
+      SmallVector<ShimBdTask> tasks;
+      collectShimBdTasks(blk, device, tasks);
+      if (tasks.empty())
+        continue;
+
+      // Group by channel, per shim tile, in program order.
+      llvm::MapVector<std::tuple<int, int, StringRef>, SmallVector<unsigned>>
+          byChannel;
+      for (auto [i, t] : llvm::enumerate(tasks))
+        byChannel[std::make_tuple(t.col, t.row, t.channel)].push_back(i);
+
+      for (auto &kv : byChannel) {
+        auto &idxs = kv.second;
+        // Two starts are not a loop worth rewriting, and depth 2 would leave
+        // the run unchanged anyway.
+        if (idxs.size() < 3)
+          continue;
+
+        bool ok = true;
+        unsigned lastStart = 0;
+        for (unsigned i : idxs) {
+          auto &t = tasks[i];
+          // S2MM outputs must stay armed ahead of their producing core.
+          if (!t.mm2s || !t.start || t.cfg.getIssueToken())
+            ok = false;
+          // Already recycling, or carrying an ordering contract this step must
+          // not rewrite -- including a run boundShimBdLiveness just paced.
+          if (t.cfg->hasAttr(air::attrs::PreserveShimDmaOrder) ||
+              t.cfg->hasAttr(air::attrs::CoalescedShimFeed) ||
+              t.cfg->hasAttr(air::attrs::ShimFeedNoPace) ||
+              t.cfg->hasAttr(kBdRecycled))
+            ok = false;
+          // Packet-typed feeds share one shim queue and are serialized whole
+          // channel after whole channel; their delivery order is the fragile
+          // thing air-fuse-packet-put-loops exists to protect.
+          t.cfg.walk([&](AIE::DMABDOp bd) {
+            if (bd.getPacket())
+              ok = false;
+          });
+          // Fire-and-forget: exactly one release and it is a free.
+          if (t.releases.size() != 1 ||
+              !isa<AIEX::DMAFreeTaskOp>(t.releases.front()))
+            ok = false;
+          if (!ok)
+            break;
+          lastStart = std::max(lastStart, t.birth);
+        }
+        if (!ok)
+          continue;
+        // Every release sits after the run's last start.
+        for (unsigned i : idxs)
+          if (tasks[i].death < lastStart)
+            ok = false;
+        if (!ok)
+          continue;
+
+        // The discriminator: every task in the run is the SAME transfer.
+        // exactValueMatch, so the source operand must be the same Value and not
+        // merely the same type -- two puts of different slices never match.
+        Operation *first = tasks[idxs.front()].cfg.getOperation();
+        for (unsigned i : ArrayRef<unsigned>(idxs).drop_front()) {
+          if (!OperationEquivalence::isEquivalentTo(
+                  tasks[i].cfg.getOperation(), first,
+                  OperationEquivalence::exactValueMatch,
+                  /*markEquivalent=*/nullptr,
+                  OperationEquivalence::IgnoreLocations)) {
+            ok = false;
+            break;
+          }
+        }
+        if (!ok)
+          continue;
+
+        paceShimFeedForBdReuse(blk, tasks, idxs, /*depth=*/2);
       }
     }
   }
