@@ -142,9 +142,17 @@ Turbo-conditional. Bytes and counts are pmode-independent. Full chain: trap 0 be
 `exper/transformer-layer-execution-studies`; **no worktrees and no `worktree-agent-*` branches remain**
 (26 were merged and each verified at 0 unmerged commits before removal). `build-xrt` and `install-xrt`
 both carry every fix — check with `ls -l`, **never `cmp`**, since the install rewrites RUNPATH so the
-bytes always differ. All four regression legs are green against that integrated toolchain:
-**`check-air-mlir` 497 pass / 0 fail**, **transformer-layer suite 31 pass / 1 unsupported / 0 fail**
-(the 1 is R1's parked gate), **ten-model 10/10**, **study host suite 357/357 in 19 modules**.
+bytes always differ. All four regression legs are green against that integrated toolchain, and **`[2026-08-12, evening]`
+all four numbers moved** — re-measured after the day's three compiler changes and six merges:
+**`check-air-mlir` 499 pass / 0 fail** (was 497), **transformer-layer suite 33 pass / 1 unsupported /
+0 fail** (was 31; the 1 is still R1's parked gate), **ten-model 10/10** (run twice this evening, once
+per compiler change), **study host suite 519/519 in 23 modules** (was 357/357 in 19).
+
+**A note on that last figure, because it caught three items in one evening.** Items 25, 26 and Phase
+G's G1 each moved `run_study_host_tests.lit`'s pinned count against the *same* 357 baseline, so after
+merging, **none of the three literals was true**. Each merge conflict was resolved by **running the
+merged suite** and pinning what it printed, then verifying the pin red at the stale value — never by
+adding the deltas. A count reconciled by arithmetic is a count nobody ran.
 
 **All four modes are corrected, gated and fully separated by one measurement.** The standing
 cross-mode comparison is [32 §The post-flip walk](32-cost-decomposed-ladder.md): `offload` on its
