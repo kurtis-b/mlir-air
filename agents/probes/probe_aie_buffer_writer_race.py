@@ -77,6 +77,26 @@ false positives, in the direction that manufactures hazards.  Such buffers are
 therefore reported ``UNMODELLED`` rather than given a hazard verdict, and
 ``--refuse-unordered`` does not gate on them.  Reading an L1 verdict as a hazard
 is how a latent-race claim gets attached to a tile the instrument cannot see.
+
+``--check-rotation`` (added for queue row 28) answers a question BOTH of the
+above are blind to by construction.  When an L2 staging buffer is
+multi-buffered, air-to-aie emits N distinct ``aie.buffer``s and rotates them.
+Every slot then has exactly ONE writer and ONE reader, so ``--refuse-race`` is
+clean, ``--check-order`` reads ORDERED, lock counts are conserved and every
+acquire dominates its own BD.  Nothing is raced.  What can still be wrong is the
+PHASE: the cyclic order in which the consumer's BD program visits the slots
+against the order the producer's fills them.  Out of phase, the stream is
+delivered as a PERMUTATION (a plausible-looking wrong answer) or the consumer
+waits for a fill that never comes (a hang).  Measured on R1: the whole
+``herd_x = 1`` ladder reads 0 hazards on every other check while six of its
+rungs fail on hardware.
+
+Verdicts: ``IN-STEP``, ``SKEWED`` (permutation) and ``STARVED`` (deadlock).
+``--stream-len N`` is how many items the producer's own upstream sends -- it is
+what separates a skew from a starvation, and for R1 it is ``down_K``.
+``--refuse-skew`` gates on it.  Deciding this needs NO timing model: with one
+writer and one reader on a slot, the lock pair forces the n-th read of a slot to
+see the n-th write of it on every interleaving.
 """
 
 import argparse
@@ -758,6 +778,316 @@ _SELFTEST_SECOND_START_BLOCKS = """  ^bb9:
 """
 
 
+# ---------------------------------------------------------------------------
+# Slot-rotation PHASE (queue row 28).
+#
+# A THIRD class again, and the one `--check-order` is structurally blind to.
+# When an L2 staging buffer is multi-buffered, air-to-aie emits N distinct
+# `aie.buffer`s and rotates them: the S2MM chain fills slot 0, 1, .. N-1, 0, ..
+# and the MM2S chain drains them.  Every slot is 1 writer / 1 reader, every
+# acquire dominates its own BD, and lock counts are conserved -- so the writer
+# -order and read-binding questions both come back ORDERED, correctly.  Nothing
+# is raced.  The stream is simply delivered in the WRONG ORDER, because the
+# consumer's BD program visits the slots in a different cyclic phase from the
+# producer's.
+#
+# That happens when `getRepeatCounts` (AIRToAIESchedulingUtils.cpp) cannot put
+# every op of the channel into ONE repeat-count group -- `detectNBufferRotation`
+# requires `ops.size() % numBuffers == 0` -- so `generateDmaBdProgram` drops out
+# of `infiniteBDLoopMode` and emits the chain as SEVERAL terminated tasks
+# (a `repeat_count = k` prologue plus a remainder) instead of one circular
+# chain.  The tasks replay a PREFIX of the rotation k times and then the
+# remainder, while the producer keeps rotating over all N slots.
+#
+# The check needs no timing model.  With one writer and one reader on a slot,
+# the lock pair forces the n-th read of slot b to see the n-th write of b, on
+# every interleaving.  So the delivered item of the p-th consumer firing is
+# fully determined by the two BD chains, and correctness is exactly
+#
+#     delivered == [0, 1, 2, ... ]
+#
+# Verdicts: ROT_IN_STEP (the consumer tracks the producer), ROT_SKEWED (a
+# permutation of the stream -- a plausible-looking wrong answer), ROT_STARVED
+# (the consumer needs an item beyond the end of the producer's stream, so it
+# blocks forever).  Buffers with fewer than 2 slots have no phase to get wrong
+# and are not reported.
+# ---------------------------------------------------------------------------
+ROT_IN_STEP = "IN-STEP"
+ROT_SKEWED = "SKEWED"
+ROT_STARVED = "STARVED"
+
+# `aie.dma_start(MM2S, 0, ^bb1, ^bb6, repeat_count = 1)`; the clause is absent
+# when the task runs once.  `repeat_count = 0` means "do it once and do not
+# repeat" (AIEOps.td), so a chain executes `repeat_count + 1` times.
+_RE_DMA_START_ROT = re.compile(
+    r"aie\.dma_start\((MM2S|S2MM),\s*(\d+),\s*(\^bb\d+),\s*(\^bb\d+)"
+    r"(?:,\s*repeat_count\s*=\s*(\d+))?\s*\)"
+)
+
+
+def parse_channel_programs(text):
+    """{tile: {(dir, chan): [(chain, cyclic, reps), ...]}} in program order.
+
+    Several `aie.dma_start`s on ONE physical channel are the emitted form of a
+    prologue + remainder pair; they run in the order they appear.  `cyclic` is
+    True when the chain's last `next_bd` re-enters the chain (an endless BD
+    loop) and False when it falls through to the region's `aie.end`.
+    """
+    out = {}
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        m = _RE_DMA_OP.search(lines[i])
+        if not m:
+            i += 1
+            continue
+        tile = m.group(2)
+        depth, body = 0, []
+        while i < len(lines):
+            body.append(lines[i])
+            depth += lines[i].count("{") - lines[i].count("}")
+            i += 1
+            if depth <= 0 and len(body) > 1:
+                break
+        blocks, starts, cur = {}, [], None
+        for line in body:
+            lm = _RE_BLOCK_LABEL.match(line)
+            if lm:
+                cur = {"buf": None, "nxt": None}
+                blocks[lm.group(1)] = cur
+                continue
+            sm = _RE_DMA_START_ROT.search(line)
+            if sm:
+                starts.append((sm.group(1), int(sm.group(2)), sm.group(3),
+                               int(sm.group(5)) if sm.group(5) else 0))
+                continue
+            if cur is None:
+                continue
+            bm = _RE_DMA_BD.search(line)
+            if bm:
+                cur["buf"] = bm.group(1)
+                continue
+            nm = _RE_NEXT_BD.search(line)
+            if nm:
+                cur["nxt"] = nm.group(1)
+        chans = {}
+        for d, ch, first, reps in starts:
+            chain, seen, cursor, cyclic = [], [], first, False
+            while cursor in blocks:
+                if cursor in seen:
+                    cyclic = True
+                    break
+                b = blocks[cursor]
+                if b["buf"] is None:
+                    break
+                seen.append(cursor)
+                chain.append(b["buf"])
+                cursor = b["nxt"]
+            if chain:
+                chans.setdefault((d, ch), []).append((chain, cyclic, reps))
+        if chans:
+            out[tile] = chans
+    return out
+
+
+def _expand(tasks, horizon):
+    """Buffer touched by each successive firing of one channel."""
+    seq = []
+    for chain, cyclic, reps in tasks:
+        n = horizon if cyclic else reps + 1
+        for _ in range(n):
+            for b in chain:
+                seq.append(b)
+                if len(seq) >= horizon:
+                    return seq
+    return seq
+
+
+def rotation_verdicts(text, stream_len=None, horizon=64):
+    """[(tile, prod, cons, slots, delivered, verdict, note), ...].
+
+    `stream_len` is how many items the producer's own upstream actually sends.
+    It is what turns a skew into a deadlock: a consumer whose k-th firing wants
+    producer item `i >= stream_len` waits for a fill that is never produced.
+    Without it only the phase is decided, and STARVED is never reported.
+    """
+    res = []
+    for tile, chans in sorted(parse_channel_programs(text).items()):
+        prods = {k: v for k, v in chans.items() if k[0] == "S2MM"}
+        cons = {k: v for k, v in chans.items() if k[0] == "MM2S"}
+        for pk, ptasks in prods.items():
+            pseq = _expand(ptasks, horizon)
+            slots = sorted(set(pseq))
+            if len(slots) < 2:
+                continue  # one slot: there is no phase to get wrong
+            wpos = {}
+            for idx, b in enumerate(pseq):
+                wpos.setdefault(b, []).append(idx)
+            for ck, ctasks in cons.items():
+                cseq = [b for b in _expand(ctasks, horizon) if b in wpos]
+                if not cseq:
+                    continue
+                seen, delivered, verdict, note = {}, [], ROT_IN_STEP, ""
+                for b in cseq:
+                    n = seen.get(b, 0)
+                    seen[b] = n + 1
+                    if n >= len(wpos[b]):
+                        verdict = ROT_STARVED
+                        note = (f"consumer wants fill #{n} of {b}, which the "
+                                f"producer's chain never reaches")
+                        break
+                    delivered.append(wpos[b][n])
+                if verdict != ROT_STARVED:
+                    if delivered != list(range(len(delivered))):
+                        verdict = ROT_SKEWED
+                        note = "the consumer visits the slots out of phase"
+                    if stream_len is not None:
+                        over = [i for i in delivered[:stream_len] if i >= stream_len]
+                        if over:
+                            verdict = ROT_STARVED
+                            note = (f"needs producer item(s) {sorted(set(over))} "
+                                    f"of a {stream_len}-item stream")
+                if stream_len is not None:
+                    delivered = delivered[:stream_len]
+                res.append((tile, pk, ck, slots, delivered, verdict, note))
+    return res
+
+
+def check_rotation(paths, stream_len=None, refuse_skew=False, quiet=False):
+    rc = 0
+    for p in paths:
+        text = Path(p).read_text()
+        rows = rotation_verdicts(text, stream_len=stream_len)
+        print(f"=== {p} : slot-rotation phase ===")
+        if not rows:
+            print("  no multi-slot rotation on any DMA channel "
+                  "(nothing for this check to decide)")
+        for tile, pk, ck, slots, delivered, verdict, note in rows:
+            mark = "" if verdict == ROT_IN_STEP else "   <== "
+            print(f"  {tile:<18} {pk[0]}{pk[1]} -> {ck[0]}{ck[1]}  "
+                  f"slots {len(slots)} {slots}")
+            print(f"      delivered {delivered[:16]}  {mark}{verdict}"
+                  + (f" -- {note}" if note else ""))
+            if verdict != ROT_IN_STEP:
+                rc |= 1 if refuse_skew else 0
+                if not refuse_skew:
+                    rc |= 1
+    return rc
+
+
+_ROT_HEAD = """
+module {
+  aie.device(npu2) {
+    %mem_tile_0_1 = aie.tile(0, 1)
+    %bufA = aie.buffer(%mem_tile_0_1) {sym_name = "bufA"} : memref<8xbf16, 1 : i32>
+    %bufB = aie.buffer(%mem_tile_0_1) {sym_name = "bufB"} : memref<8xbf16, 1 : i32>
+    %bufC = aie.buffer(%mem_tile_0_1) {sym_name = "bufC"} : memref<8xbf16, 1 : i32>
+    %memtile_dma_0_1 = aie.memtile_dma(%mem_tile_0_1) {
+      %c1_i32 = arith.constant 1 : i32
+      %p = aie.dma_start(S2MM, 0, ^bb1, ^bb4)
+    ^bb1:
+      aie.dma_bd(%bufA : memref<8xbf16, 1 : i32> offset = 0 len = 8)
+      aie.next_bd ^bb2
+    ^bb2:
+      aie.dma_bd(%bufB : memref<8xbf16, 1 : i32> offset = 0 len = 8)
+      aie.next_bd ^bb3
+    ^bb3:
+      aie.dma_bd(%bufC : memref<8xbf16, 1 : i32> offset = 0 len = 8)
+      aie.next_bd ^bb1
+    ^bb4:
+CONSUMER
+    ^bb9:
+      aie.end
+    }
+  }
+}
+"""
+# One circular chain over all three slots: the shipped, correct form.
+_ROT_CONS_CIRCULAR = """      %c = aie.dma_start(MM2S, 0, ^bb5, ^bb9)
+    ^bb5:
+      aie.dma_bd(%bufA : memref<8xbf16, 1 : i32> offset = 0 len = 8)
+      aie.next_bd ^bb6
+    ^bb6:
+      aie.dma_bd(%bufB : memref<8xbf16, 1 : i32> offset = 0 len = 8)
+      aie.next_bd ^bb7
+    ^bb7:
+      aie.dma_bd(%bufC : memref<8xbf16, 1 : i32> offset = 0 len = 8)
+      aie.next_bd ^bb5"""
+# A two-slot prologue run twice, then the third slot once: R1's emitted form at
+# down_K = 5.  Same BDs, same locks, same buffers -- only the task split differs.
+_ROT_CONS_SPLIT2 = """      %c = aie.dma_start(MM2S, 0, ^bb5, ^bb7, repeat_count = 1)
+    ^bb5:
+      aie.dma_bd(%bufA : memref<8xbf16, 1 : i32> offset = 0 len = 8)
+      aie.next_bd ^bb6
+    ^bb6:
+      aie.dma_bd(%bufB : memref<8xbf16, 1 : i32> offset = 0 len = 8)
+      aie.next_bd ^bb9
+    ^bb7:
+      %c2 = aie.dma_start(MM2S, 0, ^bb8, ^bb9)
+    ^bb8:
+      aie.dma_bd(%bufC : memref<8xbf16, 1 : i32> offset = 0 len = 8)
+      aie.next_bd ^bb9"""
+# The same split run three times: at a 7-item stream this needs item 7.
+_ROT_CONS_SPLIT3 = _ROT_CONS_SPLIT2.replace("repeat_count = 1",
+                                            "repeat_count = 2")
+# A single-slot channel pair: no rotation, so the check must stay silent.
+_ROT_CONS_ONESLOT = """      %c = aie.dma_start(MM2S, 0, ^bb5, ^bb9)
+    ^bb5:
+      aie.dma_bd(%bufA : memref<8xbf16, 1 : i32> offset = 0 len = 8)
+      aie.next_bd ^bb5"""
+
+
+def rotation_self_test():
+    """Both directions, on modules differing ONLY in the consumer's task split.
+
+    The producer chain, the buffers and the BD bodies are byte-identical across
+    the first three cases; only how the consumer's chain is cut into tasks
+    moves.  If the check stopped discriminating those, it would be reporting the
+    module's shape rather than its delivery order.
+    """
+    cases = [
+        # (name, consumer, stream_len, want verdict, want delivered prefix)
+        ("one circular chain over 3 slots (correct form)",
+         _ROT_CONS_CIRCULAR, 5, ROT_IN_STEP, [0, 1, 2, 3, 4]),
+        ("2-slot prologue x2 then the 3rd slot (R1 at down_K 5)",
+         _ROT_CONS_SPLIT2, 5, ROT_SKEWED, [0, 1, 3, 4, 2]),
+        ("the same split x3 against a 7-item stream (R1 at down_K 7)",
+         _ROT_CONS_SPLIT3, 7, ROT_STARVED, None),
+        # A rotation whose period divides the stream must NOT be flagged: this
+        # is the guard against the check firing on every multi-slot buffer.
+        ("one circular chain, stream a multiple of the period",
+         _ROT_CONS_CIRCULAR, 6, ROT_IN_STEP, [0, 1, 2, 3, 4, 5]),
+    ]
+    ok = True
+    for name, cons, slen, want, want_del in cases:
+        text = _ROT_HEAD.replace("CONSUMER", cons)
+        rows = rotation_verdicts(text, stream_len=slen)
+        if len(rows) != 1:
+            print(f"[self-test] FAIL rotation/{name}: expected exactly one "
+                  f"producer/consumer pair, parsed {len(rows)}")
+            ok = False
+            continue
+        _, _, _, slots, delivered, got, note = rows[0]
+        bad = got != want or (want_del is not None and delivered != want_del)
+        ok &= not bad
+        print(f"[self-test] {'FAIL' if bad else 'ok  '} rotation/{name}: "
+              f"want {want}"
+              + (f" {want_del}" if want_del else "")
+              + f", got {got} {delivered} ({note or 'in phase'})")
+    # And the check must be SILENT where there is no rotation at all.
+    rows = rotation_verdicts(_ROT_HEAD.replace("CONSUMER", _ROT_CONS_ONESLOT),
+                             stream_len=5)
+    single = [r for r in rows if len(r[3]) < 2]
+    if single:
+        print("[self-test] FAIL rotation/single-slot consumer: a channel with "
+              "no multi-slot rotation was given a verdict")
+        ok = False
+    else:
+        print("[self-test] ok   rotation/single-slot consumer: no verdict, as "
+              "required (one slot has no phase to get wrong)")
+    return ok
+
+
 def _selftest_module(cfg, with_core=False, second_start=False):
     text = _SELFTEST_HEAD
     if second_start:
@@ -823,6 +1153,7 @@ def self_test():
         if got != want:
             ok = False
         print(f"[self-test] {mark} {name}: want {want}, got {got} ({note})")
+    ok &= rotation_self_test()
     print(f"[self-test] {'PASS' if ok else 'FAILED'}")
     return 0 if ok else 1
 
@@ -846,12 +1177,25 @@ def main():
                     help="how many write positions to decide (default 8)")
     ap.add_argument("--space", type=int, default=None,
                     help="restrict to a memory space (1 = L2, 2 = L1)")
+    ap.add_argument("--check-rotation", action="store_true",
+                    help="report whether each multi-slot L2 rotation is "
+                         "DELIVERED IN ORDER (IN-STEP/SKEWED/STARVED). This is "
+                         "not a lock hazard: every slot is 1 writer / 1 reader "
+                         "and --check-order correctly reads it as sound")
+    ap.add_argument("--stream-len", type=int, default=None,
+                    help="items the producer's upstream actually sends (R1: "
+                         "down_K). Needed to tell a SKEW from a STARVATION")
+    ap.add_argument("--refuse-skew", action="store_true",
+                    help="exit 1 if any rotation is not IN-STEP")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
     if a.self_test:
         return self_test()
     if not a.mlir:
         ap.error("give at least one aie.air.mlir, or --self-test")
+    if a.check_rotation:
+        return check_rotation(a.mlir, stream_len=a.stream_len,
+                              refuse_skew=a.refuse_skew, quiet=a.quiet)
     rc = 0
     for p in a.mlir:
         rc |= analyze(p, a.refuse_race, a.space, a.quiet,
