@@ -65,6 +65,18 @@ probe asks: *does the DMA program by itself force the order*.
 ``--refuse-unordered`` gates on that simulation.  ``--refuse-race`` is left
 exactly as it was -- structural -- so the numbers already recorded against it
 stay comparable.
+
+WHERE ``--check-order`` IS VALID, AND WHERE IT IS NOT.  `[2026-08-12]`, queue
+rows 28/30.  The net models the DMA program and NOTHING ELSE.  On a memtile that
+is the whole protocol: measured on R1, an ``aie.memtile_dma``'s locks are
+touched by 0 core ops.  On an L1 tile it is NOT -- ``aie.core`` acquires and
+releases *the same locks* the ``aie.mem`` BDs do (measured on R1: 4 of 4 and 6
+of 6 locks shared on every compute tile).  A net missing one participant loses
+releases, so it reports DEADLOCK/OVERWRITE where the real protocol is fine:
+false positives, in the direction that manufactures hazards.  Such buffers are
+therefore reported ``UNMODELLED`` rather than given a hazard verdict, and
+``--refuse-unordered`` does not gate on them.  Reading an L1 verdict as a hazard
+is how a latent-race claim gets attached to a tile the instrument cannot see.
 """
 
 import argparse
@@ -187,8 +199,17 @@ _RE_LOCK_DECL = re.compile(
 )
 _RE_BLOCK_LABEL = re.compile(r"^\s*(\^bb\d+):")
 _RE_NEXT_BD = re.compile(r"aie\.next_bd\s+(\^bb\d+)")
+# `aie.dma_start(MM2S, 0, ^bb1, ^bb6, repeat_count = 1)`. The trailing
+# `repeat_count` clause is NOT optional decoration to ignore: requiring `)`
+# straight after the second block label made this regex SILENTLY DROP such a
+# dma_start, so the simulator ran a channel's steady-state chain without its
+# prologue -- a 2-BD program where the emitted one has 6 -- and wedged.
+# Measured on R1 at odd chunks_per_group >= 5 (rungs T5, T7, K5), where it
+# produced DEADLOCK on three modules whose hardware failure is a wrong ANSWER.
+# A dropped op is the worst shape for a checker: the verdict is confident and
+# the program it describes was never emitted.
 _RE_DMA_START_FULL = re.compile(
-    r"aie\.dma_start\((MM2S|S2MM),\s*(\d+),\s*(\^bb\d+),\s*(\^bb\d+)\)"
+    r"aie\.dma_start\((MM2S|S2MM),\s*(\d+),\s*(\^bb\d+),\s*(\^bb\d+)\s*[,)]"
 )
 
 
@@ -299,6 +320,42 @@ def parse_tile_programs(text):
 
 
 ORDER_UNKNOWN = "UNKNOWN"
+# The DMA program is not the whole protocol on this tile: an `aie.core` region
+# holds some of the same locks, and the net does not model it. Distinct from
+# UNKNOWN, which means the simulation ran and could not decide.
+ORDER_UNMODELLED = "UNMODELLED"
+
+_RE_CORE_OP = re.compile(r"aie\.core\((%[\w]+)\)")
+
+
+def parse_core_locks(text):
+    """{tile: {lock sym, ...}} for every ``aie.core`` region.
+
+    A lock in here is a participant the Petri net does NOT have a transition
+    for, so any buffer whose tile program shares one is outside what
+    ``check_write_order`` can decide.
+    """
+    out = defaultdict(set)
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        m = _RE_CORE_OP.search(lines[i])
+        if not m:
+            i += 1
+            continue
+        tile = m.group(1)
+        depth, body = 0, []
+        while i < len(lines):
+            body.append(lines[i])
+            depth += lines[i].count("{") - lines[i].count("}")
+            i += 1
+            if depth <= 0 and len(body) > 1:
+                break
+        for line in body:
+            lm = _RE_USE_LOCK.search(line)
+            if lm:
+                out[tile].add(lm.group(1))
+    return out
 
 
 def check_write_order(prog, buf, depth=8, max_states=400000, slots=1):
@@ -445,6 +502,48 @@ def check_write_order(prog, buf, depth=8, max_states=400000, slots=1):
     )
 
 
+def order_verdict(prog, tile_core_locks, buf, depth=8, slots=1):
+    """The order verdict for one buffer, INCLUDING both validity guards.
+
+    Factored out so `--self-test` exercises the same decision `analyze` makes:
+    a guard that only the real path runs is a guard with no calibration.
+    """
+    shared = sorted(set(tile_core_locks or ()) & set(prog["locks"]))
+    if shared:
+        return (
+            ORDER_UNMODELLED,
+            f"aie.core holds {len(shared)} of this tile's DMA locks "
+            f"({', '.join(shared[:3])}{', ...' if len(shared) > 3 else ''}); "
+            "the net models the DMA program only, so a verdict here would be "
+            "a false positive",
+        )
+    # Second guard, same class. `air-to-aie` can emit MORE THAN ONE
+    # `aie.dma_start` on the same physical (direction, channel) -- a
+    # `repeat_count` prologue chain and a steady-state chain (measured on R1 at
+    # odd chunks_per_group >= 5). Those are a SEQUENCE on one channel, not two
+    # channels. `parse_tile_programs` gives each `dma_start` its own program
+    # counter and the net fires them CONCURRENTLY, inventing a channel the
+    # hardware does not have and contending for the same locks -- which wedges
+    # and reads DEADLOCK. Measured: it reported DEADLOCK on three R1 rungs whose
+    # actual hardware failure is a wrong ANSWER, not a hang, while reading clean
+    # on eight rungs that do hang. The verdict does not track the defect, and
+    # the model is wrong, so it is withdrawn.
+    dup = defaultdict(int)
+    for d, ch, _ in prog["chans"]:
+        dup[(d, ch)] += 1
+    multi = sorted(f"{d} {ch}" for (d, ch), n in dup.items() if n > 1)
+    if multi:
+        return (
+            ORDER_UNMODELLED,
+            f"{', '.join(multi)} carries more than one aie.dma_start "
+            "(prologue + steady state on ONE physical channel); the net models "
+            "them as concurrent channels, so a verdict here would be a false "
+            "positive",
+        )
+    verdict, _, note = check_write_order(prog, buf, depth=depth, slots=slots)
+    return verdict, note
+
+
 def analyze(path, refuse_race=False, only_space=None, quiet=False,
             check_order=False, refuse_unordered=False, order_depth=8):
     text = Path(path).read_text()
@@ -461,7 +560,9 @@ def analyze(path, refuse_race=False, only_space=None, quiet=False,
     for st, sb, sc, dt, db, dc in flows:
         src_of[(dt, dc)] = (st, sc)
 
-    tile_progs = parse_tile_programs(text) if (check_order or refuse_unordered) else {}
+    want_order = check_order or refuse_unordered
+    tile_progs = parse_tile_programs(text) if want_order else {}
+    core_locks = parse_core_locks(text) if want_order else {}
     order_verdicts = {}
 
     races, multi = [], []
@@ -508,30 +609,46 @@ def analyze(path, refuse_race=False, only_space=None, quiet=False,
         # and whether every fill is consumed before the next lands.  Run for
         # every buffer that is both written and read -- the read-binding
         # hazard does not need a second writer.
-        if (check_order or refuse_unordered) and w and r:
+        if want_order and w and r:
             owner = info.get("tile") or next(iter(w))[0]
             prog = tile_progs.get(owner)
             if prog is None:
                 order_verdicts[buf] = (ORDER_UNKNOWN, "no DMA program parsed for tile")
             else:
-                verdict, _, note = check_write_order(
-                    prog, buf, depth=order_depth, slots=nslots)
-                order_verdicts[buf] = (verdict, note)
+                # The net has a transition per BD and none for the core. If the
+                # core holds any of this tile's DMA locks, its releases are
+                # missing and every hazard verdict here is a false positive.
+                order_verdicts[buf] = order_verdict(
+                    prog, core_locks.get(owner), buf,
+                    depth=order_depth, slots=nslots)
             v, note = order_verdicts[buf]
             if v != "ORDERED" or not quiet:
                 print(f"         [order] {v}: {note}")
 
     print(f"[verdict] {len(multi)} multi-writer buffer(s), {len(races)} of them "
           f"single-slot (unordered writer race): {races if races else 'none'}")
-    if check_order or refuse_unordered:
-        unordered = sorted(b for b, (v, _) in order_verdicts.items() if v != "ORDERED")
-        print(f"[order] {len(order_verdicts)} written+read buffer(s) simulated, "
-              f"{len(unordered)} not provably sound: "
+    if want_order:
+        outside = sorted(
+            b for b, (v, _) in order_verdicts.items() if v == ORDER_UNMODELLED
+        )
+        unordered = sorted(
+            b for b, (v, _) in order_verdicts.items()
+            if v not in ("ORDERED", ORDER_UNMODELLED)
+        )
+        print(f"[order] {len(order_verdicts) - len(outside)} written+read "
+              f"buffer(s) simulated, {len(unordered)} not provably sound: "
               f"{unordered if unordered else 'none'}")
+        print(f"[order] {len(outside)} buffer(s) OUTSIDE the model (core shares "
+              f"the tile's DMA locks; not a hazard verdict): "
+              f"{outside if outside else 'none'}")
     rc = 0
     if refuse_race and races:
         rc = 1
-    if refuse_unordered and any(v != "ORDERED" for v, _ in order_verdicts.values()):
+    # UNMODELLED is not a finding: gating on it would fail every module that has
+    # an L1 buffer, which is every module.
+    if refuse_unordered and any(
+        v not in ("ORDERED", ORDER_UNMODELLED) for v, _ in order_verdicts.values()
+    ):
         rc = 1
     return rc
 
@@ -611,8 +728,47 @@ _SELFTEST_FANOUT = {
 }
 
 
-def _selftest_module(cfg):
+# An aie.core region that touches ONE of the tile's DMA locks. Appended to the
+# FANOUT case, whose verdict without it is ORDERED -- so the guard is calibrated
+# in both directions on the same protocol: with no core the verdict stands, and
+# adding a single shared lock must withdraw it.
+_SELFTEST_CORE = """
+  %c = aie.core(%mem_tile_0_1) {
+    aie.use_lock(%lk1, AcquireGreaterEqual, %c1_i32)
+    aie.use_lock(%lk2, Release, %c1_i32)
+    aie.end
+  }
+"""
+
+
+# A SECOND aie.dma_start on S2MM channel 0, INSIDE the same memtile_dma region
+# (which is how air-to-aie emits it): a repeat_count prologue plus a steady
+# state, one physical channel. Measured on R1 at odd chunks_per_group >= 5.
+# Spliced into the FANOUT case, whose verdict without it is ORDERED.
+_SELFTEST_SECOND_START_BLOCKS = """  ^bb9:
+    %9 = aie.dma_start(S2MM, 0, ^bb10, ^bb11, repeat_count = 1)
+  ^bb10:
+    aie.use_lock(%lk0, AcquireGreaterEqual, %c1_i32)
+    aie.dma_bd(%b : memref<8xbf16, 1 : i32> offset = 0 len = 8)
+    aie.use_lock(%lk1, Release, %c1_i32)
+    aie.next_bd ^bb10
+  ^bb11:
+    aie.end
+  }
+"""
+
+
+def _selftest_module(cfg, with_core=False, second_start=False):
     text = _SELFTEST_HEAD
+    if second_start:
+        # Replace the region's trailing `^bb8: aie.end }` with the extra blocks,
+        # so the second dma_start lands in the SAME memtile_dma region rather
+        # than a second one (a second region would just overwrite the first in
+        # parse_tile_programs and test nothing).
+        text = text.replace("  ^bb8:\n    aie.end\n  }\n",
+                            "  ^bb8:\n" + _SELFTEST_SECOND_START_BLOCKS)
+    if with_core:
+        text += _SELFTEST_CORE
     for k, v in cfg.items():
         text = text.replace(f"%{k}", str(v) if not str(v).startswith("%") else v)
     return text
@@ -626,20 +782,43 @@ def self_test():
     instrument is reporting its own shape rather than the protocol.
     """
     cases = [
-        ("legacy counted (wall 7 as shipped)", _SELFTEST_LEGACY, "RACE"),
-        ("two chains (mimo-chain-lock arm)", _SELFTEST_TWOCHAIN, "OVERWRITE"),
-        ("single writer + reader chain", _SELFTEST_FANOUT, "ORDERED"),
+        ("legacy counted (wall 7 as shipped)", _SELFTEST_LEGACY, False, False, "RACE"),
+        ("two chains (mimo-chain-lock arm)", _SELFTEST_TWOCHAIN, False, False,
+         "OVERWRITE"),
+        ("single writer + reader chain", _SELFTEST_FANOUT, False, False, "ORDERED"),
+        # Same protocol as the line above, plus an aie.core holding one of the
+        # tile's locks. The verdict must be WITHDRAWN, not kept and not turned
+        # into a hazard -- the net has no transition for the core.
+        ("+ a core sharing one lock", _SELFTEST_FANOUT, True, False, ORDER_UNMODELLED),
+        # Same again, with a SECOND dma_start on one physical channel instead.
+        ("+ a second dma_start on one channel", _SELFTEST_FANOUT, False, True,
+         ORDER_UNMODELLED),
+        # And neither guard may fire on a protocol it does not apply to: the
+        # racing legacy template still reads RACE with no core and one start.
+        ("legacy counted, both guards absent (must not fire)",
+         _SELFTEST_LEGACY, False, False, "RACE"),
     ]
     ok = True
-    for name, cfg, want in cases:
-        text = _selftest_module(cfg)
+    for name, cfg, with_core, second, want in cases:
+        text = _selftest_module(cfg, with_core=with_core, second_start=second)
         progs = parse_tile_programs(text)
         prog = progs.get("%mem_tile_0_1")
         if prog is None:
             print(f"[self-test] FAIL {name}: synthetic module did not parse")
             ok = False
             continue
-        got, _, note = check_write_order(prog, "%b", depth=6, slots=1)
+        core = parse_core_locks(text).get("%mem_tile_0_1")
+        if with_core and not core:
+            print(f"[self-test] FAIL {name}: the core region did not parse, so "
+                  "this case would pass for the wrong reason")
+            ok = False
+            continue
+        if second and len(prog["chans"]) < 5:
+            print(f"[self-test] FAIL {name}: the second dma_start did not parse, "
+                  "so this case would pass for the wrong reason")
+            ok = False
+            continue
+        got, note = order_verdict(prog, core, "%b", depth=6, slots=1)
         mark = "ok  " if got == want else "FAIL"
         if got != want:
             ok = False

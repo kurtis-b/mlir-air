@@ -441,3 +441,265 @@ a `herd_x = 1` hang whose only unbound buffer is this one. Not investigated
 here; filed as a lead with its instrument attached. Note that v2's fan-out
 chain **does** fix this buffer (arm C reads ORDERED on `%buf20`), so there is a
 cheap experiment available.
+
+---
+
+## 9 — `[2026-08-12]` Rows 28 and 30 are NOT the same object. Row 28 is `down_K >= 5`, and §8.8's reason for pairing them was false
+
+Queue rows 28 and 30. Compiler: `install-xrt`, `aircc` sha256 `b6e3de13…`
+(mtime 16:59:35), printed from python in every job's leg 0 and **refused** on
+mismatch — `air.tools.resolve_tool` prefers the bundled binary, so PATH does not
+decide this. Artifacts: devq **327** (the A/B + localizing ladder, 40 legs),
+**328** (bracket, 20), **329** (separating controls, 25), **330**
+(out-of-sample, 30), **331** (the tiling arm, 25) — 140 device legs, one fresh
+process each, all measure class. Compile-only sweeps are off-queue, as §5's and
+§8.3's were. Instruments: `probe_aie_buffer_writer_race.py --check-order` (two
+defects found in it, both fixed), `probe_r1_rung.py --dump-npz`,
+`probe_r1_emulate_shape.py`.
+
+### 9.1 The premise §8.8 rested on is false
+
+§8.8 pointed row 30 at row 28 on one clause: the `w_down` feed's OVERWRITE holds
+"in both wall-7 arms **and at `herd_x = 1`**". That clause is the whole reason
+the two rows were candidates for one object, and it is **wrong**.
+
+Row 30's buffer is 1 writer / **2 readers** / one slot. The reader count is the
+number of **down cores**, and the down herd is `herd_x` wide. At `herd_x = 1`
+there is one down core, so the same buffer is 1 writer / 1 reader — the legacy
+1:1 shape, with no read-binding hazard to have.
+
+Measured compile-only across **nine** `herd_x = 1` modules (row 28's own rung,
+doc 49's out-of-sample rung, four ladder rungs, `sweeps` 1/2/4, both `tile_k`,
+**both** H-staging arms): every L2 buffer is **1 writer, 1 reader**, and
+`--check-order` reads **0 not provably sound** on all nine. Row 30's shape does
+not occur once.
+
+The instrument is not silently broken there: on the same afternoon's `D2` module
+it still reads `RACE` on `%buf21` and `OVERWRITE` on `%buf20`, and that module's
+`aie.air.mlir` sha256 is `5439c51d…` — **byte-equal to the one §8.5 recorded**.
+Same object, re-measured.
+
+**Row 28's module does not contain row 30's buffer shape.** The hypothesis is
+refused at the premise, one level above the experiment, exactly as §8.1's was.
+
+### 9.2 The arm, and why it needed no isolation
+
+The brief's complication was row 29: v2 now **refuses** a MIMO memtile buffer by
+name, so enabling it on R1 might refuse rather than run. It does not, and the
+reason is structural rather than lucky. `isUnorderableMimoMemtileBuffer` is
+`nW > 1 && nR > 1`. At `herd_x = 1` **no** L2 buffer has a second writer or a
+second reader (§9.1), so nothing is MIMO, nothing is even a chain-lock
+candidate, and the refusal cannot fire. No isolation, no `air.no_chain_lock`
+pin, no synthetic probe module: **row 28's rung already sits on the axis where
+v2's refusal is out of scope.**
+
+That is asserted with a positive control rather than by reading the predicate.
+The same design at `herd_x = 2`, in the same job, compiles to
+
+```
+error: 'aie.buffer' op v2 chain-lock: memtile buffer has 2 writers and 2 readers
+(MIMO) on a single slot, which no per-BD lock protocol can order …
+```
+
+so the refusal **is** live in this binary. A refusal at `herd_x 2` beside a clean
+compile at `herd_x 1` is the discriminator, and it doubles as a stronger
+provenance check than the sha alone: it proves the compiler under test carries
+this afternoon's change.
+
+### 9.3 The A/B is a null, by construction and by measurement
+
+At `herd_x = 1` v2 has nothing to apply to, so it should emit the same module.
+It does: `aie.air.mlir` sha256 **`a1b66f22c8579595` from both arms**, and
+`--check-order` reports an identical per-buffer table. Five fresh processes per
+arm, devq 327:
+
+| arm | rung | P/F/T | distinct `y` sha256 | `y` sentinel | cores finished |
+|---|---|---|---|---|---|
+| A — shipped (v2 off) | `96×96 tk16 hx1` | **0/0/5** | 1 — `17c9c1bb` | 1.0000 | 0/1 |
+| C — `use_lock_race_condition_fix_v2` | same | **0/0/5** | 1 — `17c9c1bb` | 1.0000 | 0/1 |
+
+Zero spread: 10 processes, one output sha, and that sha is **`17c9c1bb`, equal
+to devq 309's `F1` across both of its arms (10/10)** — reproduced today on an
+independently compiled ELF, the same move §3 made against devq 306.
+
+**Verdict on the briefed experiment: it cannot settle the hypothesis, and it is
+reported as a null rather than as evidence.** v2's fan-out chain does fix
+`%buf20` — at `herd_x >= 2`, where `%buf20` has two readers. Row 28 is at
+`herd_x = 1`.
+
+### 9.4 What row 28 actually is: `down_K >= 5`, and the headline named the wrong axis
+
+Row 28 is filed as "`96×96` at `tile_k 16`". It is neither.
+
+At `herd_x = 1` with `emb == ffn`, `chunks_per_group`, `k_steps_up` and the down
+herd's K-step count are all `emb/tile_k` — one number wearing three names, which
+is why the rung looked like a `tile_k` story. Two moves separate them: `ffn >
+emb` raises `down_K` and `sweeps` while holding `cpg` and `k_up`; and `herd_x 2`
+with **per-column** staging (item 21's measured fix, 35/35 — the shared arm would
+confound every leg) makes `k_up = 2·cpg`.
+
+Over **32** rungs — devq 327/328/329/330/331 plus devq 309's recorded arms, whose
+geometry was re-derived from 309's own `argv` and **not** from §3's table (§3's
+`C2` is `tile_k 32`; reading it as 16 cost this investigation an hour and one
+wrong model) — exactly one quantity separates the set:
+
+```
+down_K  =  ffn_dim / tile_k  =  chunks_per_group  x  herd_x  x  sweeps
+```
+
+| `down_K` | verdict, 5 fresh processes each | rungs |
+|---|---|---|
+| 2, 3, 4 | **PASS** | T2 T3 T4 K3 K4 O1 O5 B1s C1s D1s A2p B2p C2p D2p G2p H4p D4p |
+| **5** | **FAIL** — byte-deterministic wrong answer, one sha, ~50% of elements | T5 K5 O2 |
+| 6, 7, 8, 9, 12 | **TIMEOUT** — `y` sentinel **1.0000**, 0 cores finished | A T7 T8 K6 O3 O4 O6 N1 N2 N3 N4 N5 |
+
+`down_K` is the **product** of the three counts that were each tested separately
+and each excluded, which is why every single-count model dies:
+
+- **`tile_k` is excluded.** Every `down_K` measured at both `tile_k` gives the
+  same verdict — 3 PASS/PASS, 4 PASS/PASS, 5 FAIL/FAIL, 6 TIMEOUT/TIMEOUT. `K6`
+  is `192×192` at **`tile_k 32`** and hangs 5/5.
+- **`chunks_per_group` is excluded.** `K3` has `cpg 3` and passes; `N4` has
+  `cpg 3` and hangs; `O3` has `cpg 1` and hangs.
+- **`k_steps_up` is excluded.** `K3` has `k_up 3` and passes; `N2` has `k_up 3`
+  and hangs. `N3` carries `T8`'s exact `k_up 8` at `cpg 4` and hangs anyway.
+- **`herd_x` is excluded.** It fires at 1 and at 2 (`N3 N4 N5 O4`).
+- **The H-staging arm is excluded.** It fires in both (`N3 N4 N5 O4` are
+  per-column).
+- **The host DMA task count is excluded.** `H4p`/`D4p` issue 14 tasks and pass;
+  `N4` issues 12 and hangs.
+- **`runtime_loop_tiling_sizes` is excluded BY MEASUREMENT** (devq 331), not by
+  the inheritance §4 recorded. `--tiling none` leaves `A`, `K6`, `O3` and `T8`
+  at 5/5 TIMEOUT with their sha unchanged, and leaves `T4` at 5/5 PASS
+  **byte-identical** (`69ad2530`) to its `2,2` twin. `--tiling 4,4` is inert one
+  level earlier: its `npu.air.mlir` is byte-identical to `2,2`'s (`4d3cce96…`).
+
+**Recorded before the measurement and confirmed 6 for 6** (devq 330, prediction
+file sha `d5be991a…` printed in its leg 0). `O5/O2/O3/O6` are `emb 32,
+tile_k 32, herd_x 1`: `cpg 1`, `k_steps_up 1`, `group_n 32` — the most degenerate
+per-step geometry the builder admits. **Only `sweeps` moves.**
+
+| rung | `sweeps` | `down_K` | predicted | measured |
+|---|---|---|---|---|
+| O5 `32×128` | 4 | 4 | PASS 5/5 | **PASS 5/5** |
+| O2 `32×160` | 5 | 5 | FAIL 5/5, one sha | **FAIL 5/5, one sha** |
+| O3 `32×192` | 6 | 6 | TIMEOUT 5/5, sentinel 1.0 | **TIMEOUT 5/5, sentinel 1.0** |
+| O6 `32×224` | 7 | 7 | TIMEOUT 5/5 | **TIMEOUT 5/5** |
+| O1 `16×64`  | 4 | 4 | PASS 5/5 | **PASS 5/5** |
+| O4 `96×96` hx2 percol | 1 | 6 | TIMEOUT 5/5 | **TIMEOUT 5/5** |
+
+`O5` **is doc 49 §2's own `emb 32 / ffn 128` rung**, from which it concluded
+"**`sweeps` is excluded by measurement**". **That exclusion is retracted**:
+`sweeps` was never taken above 4. At 5 the same family gives a deterministic
+wrong answer and at 6 it hangs, with every other count pinned at 1.
+
+The two earlier models are recorded as **falsified**, not quietly dropped.
+`PREDICTION-SEP.md` predicted `cpg` as the axis and put N1–N4 at PASS; all four
+timed out. Before that, `--check-order`'s DEADLOCK verdict was taken as a
+predictor and predicted TIMEOUT at `down_K 5`; the measurement is FAIL, and §9.7
+is why.
+
+Every rung is a valid probe: `probe_r1_emulate_shape.py` calls the built module
+**EXACT** at `96×96 tk16` (2.27e-13), `192×192 tk32` (5.12e-13), `96×96 tk32`,
+`64×64 tk16`, `128×128 tk32` and `80×80 tk16`. The builder and the AIR module
+are right at all of them; the defect is below AIR.
+
+### 9.5 So: same buffer, different hazard
+
+`down_K` is not an arbitrary count. It is **the number of times the `w_down`
+feed's L2 buffer is filled and drained** — `l2_b_down`, which is `%buf20` /
+`%buf24`: **row 30's buffer.** The two rows land on the same feed.
+
+They are still **different objects**, and this is the part to keep:
+
+- Row 30's hazard is **reader binding**, and it needs `>= 2` readers, i.e.
+  `herd_x >= 2`. Row 28 fires at `herd_x = 1`, where that buffer has one reader
+  and `--check-order` reads ORDERED.
+- Row 30's hazard is **present in rungs that pass 5/5** — `D2p`, `H4p`, `D4p`
+  are `herd_x` 2 and 4 with `down_K 4`. So it stays *latent, not shown
+  reachable*, exactly as §8.8 filed it.
+- The one mechanism that would have connected them (v2's fan-out chain) is
+  **inert** on row 28's rung, measured (§9.3).
+
+**Fixing row 30 would not fix row 28.** But row 28 does raise the value of that
+buffer: it is now the site of a second, independent, *demonstrated* defect, where
+before it carried only a latent one.
+
+### 9.6 How far row 28 is localized, and what is still open
+
+Localized to: **the `w_down` feed path, at a refill count above 4**, below AIR
+(the interpreter is exact), independent of `tile_k`, `herd_x`, `group_n`, `cpg`,
+`k_steps_up`, the H-staging arm, the host task count, `runtime_loop_tiling_sizes`
+and both lock-race knobs.
+
+The sentinel read-back localizes the hang further: **`y` sentinel fraction is
+exactly 1.0000 and `cores_finished` is 0 on every timing-out rung**, so no down
+core ever reached its hoisted C store — the design stalls upstream of the last
+write rather than partway through it. `ctx_health` is the firmware constant
+(`ctx_pc=0x28b060ad`, `txn_op_idx=0xffffffff`) on all of them, as §4 closed.
+
+**Not established, and the honest gap**: *why* 4. A threshold at exactly 4 wants
+a capacity of 4, and the obvious candidate — `runtime_loop_tiling_sizes = [2,2]`,
+`2 x 2 = 4` — is now excluded by measurement. The next instrument is not another
+shape sweep: it is a per-BD reading of the `w_down` feed's lock protocol as a
+function of `down_K` on the down-feed memtile, comparing `down_K` 4 against 5 and
+6 on modules that are otherwise identical. `O5`/`O2`/`O3` are exactly that set —
+same `emb`, same `tile_k`, same `herd_x`, differing only in `ffn_dim`.
+
+**This is a compiler-side diagnosis and NO COMPILER FILE WAS TOUCHED here.** It
+owes `check-air-mlir`, the transformer-layer suite and the ten-model leg when
+someone takes it, which is why it stops at the diagnosis.
+
+### 9.7 Two defects in `--check-order`, both fixed, both in the same direction
+
+The instrument was reporting hazards that are not there, twice.
+
+1. **A dropped op.** `_RE_DMA_START_FULL` required `)` immediately after the
+   second block label, so it **silently dropped**
+   `aie.dma_start(MM2S, 0, ^bb1, ^bb6, repeat_count = 1)`. `air-to-aie` emits
+   that prologue + steady-state pair at odd `chunks_per_group >= 5`. The
+   simulator therefore ran a **2-BD** steady-state chain where the emitted
+   channel has **6**, wedged, and reported `DEADLOCK` on `T5`, `T7` and `K5` —
+   whose measured hardware failure is a byte-deterministic **wrong answer**, not
+   a hang. A dropped op is the worst shape for a checker: a confident verdict
+   about a program that was never emitted.
+2. **A missing participant.** The net models the DMA program and nothing else.
+   On a memtile that is the whole protocol (measured on R1: a memtile's locks are
+   touched by **0** core ops). On an L1 tile it is not — `aie.core` holds **4 of
+   4 and 6 of 6** of every compute tile's DMA locks. The missing releases
+   produced a spurious `DEADLOCK` on R1's `%buf7`, on a flag
+   `--refuse-unordered` would have gated a build on.
+
+Both now read **`UNMODELLED`**, which is not a hazard verdict and does not gate.
+The decision lives in `order_verdict()`, which `--self-test` calls, so each guard
+is **calibrated in both directions** — a must-fire case and a must-not-fire case:
+self-test **3 cases -> 6**.
+
+**Nothing recorded moves.** §8.3's calibration re-verified after the change: the
+v2 fan-in chain reads ORDERED, the v2 fan-out chain reads ORDERED, and R1's `D2`
+still reads `RACE` on `%buf21` and `OVERWRITE` on `%buf20`. After the fix,
+`--check-order` reports **0 hazards on all 17 `herd_x = 1` rungs measured today,
+6 of which fail on hardware** — so the instrument is *silent* about row 28's
+defect. That is the honest position, and strictly better than the previous
+confident-and-wrong `DEADLOCK`.
+
+### 9.8 What the next person should do first
+
+1. **Read the `w_down` feed's lock protocol against `down_K`**, per BD, on the
+   down-feed memtile, over `O5` (`down_K 4`, passes), `O2` (5, wrong answer) and
+   `O3` (6, hangs) — three modules differing only in `ffn_dim`. The wrong answer
+   at exactly 5 is the most informative rung in the set and it is
+   *byte-deterministic*, so it decomposes the way item 23's did
+   (`probe_r1_arrival_map.py` with `--dump-npz` beside it).
+2. **Do not re-litigate** `tile_k`, `chunks_per_group`, `k_steps_up`, `sweeps` in
+   isolation, `herd_x`, the H-staging arm, the host task count,
+   `runtime_loop_tiling_sizes`, or either lock-race knob — §9.4, each excluded by
+   a measurement here.
+3. **Row 30 stays open and stays latent.** It is on the same buffer, which makes
+   it more interesting, but nothing here shows it reachable and `D2p`/`H4p`/`D4p`
+   carry it while passing 5/5.
+4. **`sweeps` is no longer excluded** anywhere it appears as an exclusion (doc 49
+   §2, and §4's table by inheritance). It was only ever tested to 4.
+
+`fused`'s SPECS atol stays **PROVISIONAL**, and **no resident-tail latency or
+byte figure has been measured on hardware.** Nothing here changes either.
