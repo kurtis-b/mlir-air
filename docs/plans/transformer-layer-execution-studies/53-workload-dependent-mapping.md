@@ -371,6 +371,55 @@ At the very width the split exists to unlock, `H` fills a memtile on its own, le
 the port arithmetic the design's fan-out rests on (`builders/ffn_resident.py:54-61`). **That is the
 question to answer before committing to the split**, and it is answerable statically.
 
+### 5.4 `[2026-08-13]` SPECIFIED — and the split's price is R1's own central property
+
+Two things settle it, both host-only arithmetic over the builder's allocation types.
+
+**First: the split is forced by the DOWN herd, which is why decoupling the kernel objects is not an
+alternative to it.** Both herds allocate the same three L1 buffers — `l1_a[TILE_M, tile_k]`,
+`l1_b[tile_k, group_n]`, `l1_c[TILE_M, group_n]` (`:400-403`, `:509-511`) — but the builder guards
+only `l1_up` (`:376-379`). So the down core is over L1 at emb 1024 for the same reason the up core is:
+
+| | group_n | L1/core | |
+|---|---|---|---|
+| emb 768, `herd_x` 4 | 192 | 58,368 | FIT |
+| emb 1024, `herd_x` 4 | 256 | 74,752 | **OVER** (cap 65,536) |
+| emb 1024, split 2 | 128 | 41,984 | FIT |
+| emb 1024, split 4 | 64 | 25,600 | FIT |
+
+Breaking the `-D` identity (§3) frees the **up** stage's group width, since its output is the `ffn`
+axis and is tied to the down stage's `tile_n` only by the shared object. It does **not** free the
+down stage: `group_n = emb/herd_x` is the definition of partitioning `y`'s columns across the herd,
+so the only way to narrow it is to narrow `y` — which is the emb-split. **Two objects and the split
+are not alternatives; the split is the necessary half.**
+
+**Second, and this is the price: both halves need ALL of `H`.** `y[:, j] = Σ_k H[:, k]·w_down[k, j]`,
+so every output column depends on the whole interior. That collides with R1's contract head-on — the
+`[seq_len, ffn_dim]` interior is specified to exist *"not in DRAM, not whole in L2 — only as
+`[TILE_M, tile_k]` chunks in flight"* (`:14-18`). An emb-split cannot preserve that clause:
+
+| | what it costs | at the gate shape |
+|---|---|---|
+| **(a) recompute `H` per half** | up projection runs twice: 2× up compute **and** a second full `w_up` fetch per band | **+37.7 MB @512, +75.5 MB @1024** of DRAM, on top of §6's already-negative total |
+| **(b) materialize `H` in L2** | breaks *"not whole in L2"* — but **not** the DRAM clause, so 31a's crossing count is untouched | 393,216 B at ffn 3072 (75% of a memtile); **524,288 B at ffn 4096 = 100%**, so it must spread |
+
+**(b) is the right form and (a) should not be built.** (a) pays in the currency §6 just showed is
+the binding one; (b) pays in L2 capacity and in a contract clause that was a design *simplification*
+rather than a result. Note what (b) does not cost: nothing crosses DRAM that did not before, so
+every crossing 31a credits residency with removing stays removed.
+
+**The one remaining question is narrow and static.** At ffn 4096 `H` is exactly one memtile, so (b)
+needs it across at least two — and the fan-through-memtile hand-off is derived from port arithmetic
+on a *single* memtile node (`:54-61`: "the only node that can serialize `herd_x` producers into
+`herd_x` identical consumer feeds is a memtile"). Whether that hand-off survives `H` on two memtiles
+is answerable by doc 48's predicate with no compile, and it is the last thing before the split is
+buildable.
+
+**Ordering, with §6 folded in.** §5.2 already required the `hidden` refill fix before the split. §6
+adds that **weight retention across bands belongs before both** — it is the larger term, it is
+orthogonal to the split, and (a)-vs-(b) only matters once per-band weight traffic is not already
+dominating.
+
 ---
 
 ## 6. The band-serial weight term, deliberately uncosted
