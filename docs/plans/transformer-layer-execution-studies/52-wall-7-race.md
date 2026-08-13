@@ -1197,3 +1197,60 @@ falsifiers written down first.
 
 `fused`'s SPECS atol stays **PROVISIONAL**, and **no resident-tail latency or
 byte figure has been measured on hardware.** Nothing here changes either.
+
+## §12 `[2026-08-12, 21:20]` Why `boundIdenticalShimPutRuns` does not fire — traversal, not trigger
+
+§11's step is in the pipeline (`AIRRtToNpuPass.cpp:2004`, immediately after `boundShimBdLiveness`)
+and `check-air-mlir` went 499 → 500 with its regression lit green. It still does not fire on R1.
+Measured on the rebuilt compiler, devq 334, `work_maxq/O3/air_project/npu.air.mlir`.
+
+**The cause is the traversal, not the trigger.** The step opens with
+
+```cpp
+module.walk([&](func::FuncOp f) { funcOps.push_back(f); });
+```
+
+so it handles `func::FuncOp` only. R1's module presents its runtime sequence as
+`aie.runtime_sequence` (`AIEX::RuntimeSequenceOp`):
+
+```
+aie.device(npu2) @ffn_resident_seg {
+  func.func private @ffn_zero_bf16_up_proj(...)        <- declaration, empty body
+  ...
+  aie.runtime_sequence @ffn_resident_seg_sequence(%arg0: ...) {
+    %2 = aiex.dma_configure_task_for @air_channel_2 { ... } {repeat_count = 7 : i32}
+    aiex.dma_start_task(%2)                            <- x6, the run to be paced
+```
+
+The walk therefore collects only the private *declarations*, every one of which hits
+`f.getBody().empty() → continue`. The sequence is never visited, `collectShimBdTasks` is never
+called on it, and the step is a silent no-op.
+
+**Why the lit is green anyway, which is the part worth keeping.** The lit's input is a
+hand-written `func.func` (`identical_shim_put_run_bound.mlir:101`) and its own CHECK expects
+`aie.runtime_sequence` (`:50`) — the pass converts one to the other. So the lit exercises the
+**pre-conversion** shape while aircc presents the **post-conversion** one. The test and the
+target are on opposite sides of a conversion the pass performs, and nothing in either says so.
+This is the project's dominant defect class once more: a check that passes and cannot fail for
+the case it exists to cover.
+
+**Everything else was verified against the artifact and passes**, so the trigger itself is sound:
+
+| gate | R1's module |
+|---|---|
+| `idxs.size() >= 3` | 6 tasks on `@air_channel_2` |
+| `t.mm2s && t.start && !issue_token` | MM2S feed, started, no token |
+| no `PreserveShimDmaOrder` / `CoalescedShimFeed` / `ShimFeedNoPace` / `kBdRecycled` | none present |
+| no packet BD | none |
+| exactly one release, a `dma_free_task` | one each, 9 frees at `:354-362` |
+| every release after the run's last start | all frees follow every start |
+| `exactValueMatch` across the run | textually identical, same `%arg0`, same `repeat_count = 7` |
+
+**The fix is one line** — walk `AIEX::RuntimeSequenceOp` as well as `func::FuncOp` (or walk the
+op interface both satisfy) — **plus a second lit case in the post-conversion shape**, without
+which the lit will keep passing over a step that cannot fire.
+
+**Deliberately not applied here.** A compiler change owes the transformer-layer suite and the
+ten-model leg, ~75 minutes, and the operator is due back; an ungated compiler edit is worth less
+than a named one-line change with its test gap written down. `PREDICTION-MAXQ.md`'s clauses 1
+and 3 remain **untested**, not falsified — nothing has yet run a compiler in which the step fires.
