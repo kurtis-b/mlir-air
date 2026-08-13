@@ -380,10 +380,57 @@ arguments (`builders/ffn_resident.py` FOOTGUNS) — so `w_up` and `w_down` cross
 band**. That is the reuse term scaling with **sequence length** rather than with width, and §5's
 split leaves it exactly where it is.
 
-**No number is given here on purpose.** [31a](31a-resident-byte-floor.md) derives the resident byte
-floor with its own accounting of what counts as a crossing, and a per-band weight figure quoted
-outside that accounting is the shape of claim this directory has twice had to retract. Costing it
-against 31a is an open item, not a result.
+~~**No number is given here on purpose.**~~ **`[2026-08-13]` COSTED, inside 31a's accounting — and
+the answer is that the band-serial weight term is larger than everything residency removes.**
+
+**The per-band quantity is measured, not assumed.** In the emitted runtime sequence (devq 338/340,
+§2.4a's control arm) the weight feeds are `%arg1 : memref<2359296xbf16> offset = 0 len = 2359296`
+and the same for `%arg2` — each band dispatch fetches **the whole `w_up` and the whole `w_down`**,
+9,437,184 B. That is structural rather than a defect: one band of 64 rows needs every element of
+both weights, so band-serial execution cannot fetch less.
+
+**31a's lens counts each static weight once per layer execution**, and its tail floor (rows 11, 12,
+16, 21, 24, 25) counts both FFN weights exactly once. R1 is band-serial — `seq_len` must equal
+`TILE_M`, one dispatch per 64-row band advancing on launch arguments — so it fetches them `S/64`
+times:
+
+| | @512 (8 bands) | @1024 (16 bands) |
+|---|---|---|
+| weights once (31a tail floor) | 9,437,184 | 9,437,184 |
+| weights band-serial | **75,497,472** (8×) | **150,994,944** (16×) |
+| tail total: floor → band-serial | 11,799,552 → **77,859,840** (6.6×) | 14,158,848 → **155,716,608** (11.0×) |
+| whole packaged layer, 31a's derived floor | 51,121,152 | 88,083,456 |
+| so R1's tail alone is | **1.52× the packaged LAYER** | **1.77× the packaged LAYER** |
+
+**And it is net-negative against what residency buys.** 31a's per-scope split puts tail-internal
+removable crossings at 17,301,504 @512 and 34,603,008 @1024 — linear at **33,792 B/row**, identical
+at both lengths. Against an extra weight cost of `(S/64 − 1) × 9,437,184`:
+
+| | @512 | @1024 |
+|---|---|---|
+| residency removes | 17,301,504 | 34,603,008 |
+| band-serial weights add | 66,060,288 | 141,557,760 |
+| **net** | **−48,758,784** | **−106,954,752** |
+
+Setting the two equal gives the crossover: `33,792·S = 9,437,184·(S/64 − 1)` → **S = 83 rows, or
+1.30 bands.** Above roughly one band, the composition costs more DRAM traffic than it saves.
+
+**What this does and does not say.** It does *not* falsify resident composition — every crossing
+31a says residency removes is still removed. It falsifies **band-serial** residency, and the term
+is orthogonal to walls 7 and 28: neither `herd_x` nor `down_K` appears in it. So a session that
+cleared both walls would arrive at a design that still moves 1.77× the packaged layer at 1024.
+
+**The lever is weight retention across bands**, which is a different piece of work from either wall
+— keeping `w_up`/`w_down` resident in L2 across a multi-band launch, or making the band loop
+internal so one dispatch covers all bands. Doc 31's FOOTGUNS make band-serial a deliberate
+simplification of the increment ("iterate bands on launch arguments, never inside the module"), so
+this is a scoping consequence rather than a defect — but it is the first quantity that makes the
+simplification expensive rather than merely temporary.
+
+**Caveats, stated plainly.** This is arithmetic on 31a's DRAM-crossing lens — a logical-traffic
+floor, not hardware. The per-band descriptor is read off an emitted artifact; the band count is
+arithmetic. **No resident-tail byte figure has ever been measured on hardware**, and this is not
+one.
 
 ---
 
