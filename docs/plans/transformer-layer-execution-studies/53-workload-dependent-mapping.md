@@ -492,10 +492,50 @@ one.
    stage runs once with `H` reused or twice, and what a second kernel object costs once the `-D`
    identity is broken on purpose.
 3. **Cost the band term against 31a** (§6).
-4. **Nothing here composes into a selector.** §4 says the mapping is derived from the shape; doc 48's
-   predicate enumerates the legal set for a shape with no compiler and no device; doc 47's ERT prices
-   it; the GEMM registry is the precedent for a shape-keyed cache. No queue row claims the composition
-   — see the README's queue row **31**.
+4. ~~**Nothing here composes into a selector.**~~ **`[2026-08-13]` The two instruments do not compose,
+   and the reason is structural — see §8. Row 31's premise is wrong as written.**
+
+---
+
+## 8 `[2026-08-13]` The selector cannot be assembled from the parts row 31 names, and the gap is a decision
+
+Row 31 describes the selector as composing three existing things: doc 48's static predicate to
+enumerate the legal set, doc 47's ERT to price it, and the GEMM registry's shape-keyed cache. Read
+against the sources, **the first two live on opposite sides of the compile**:
+
+| | input | needs a compile? |
+|---|---|---|
+| `mapping_space.legality(mapping)` | a **declaration** — "no compile, no device, no dump: it reads the declaration, not a routed design" | **no** |
+| `balance.demand_matrix` / `back_solve` / `balance_ports` / `bottleneck` | `parse_transfers(text)` + `parse_allocations(text)` off `routed_design_path(project_dir)` — a **routed artifact** | **yes** |
+
+Doc 47's "affordable to run over a search space" is true *per artifact*; it is not a claim that the
+space can be priced without compiling. There is no declaration-side entry point in `balance.py` —
+every stage downstream of `demand_matrix` takes parsed transfers.
+
+**So pricing the legal space means compiling it, and the census sizes that three ways** (numbers
+from `study/mapping_space.py`'s own run, at the observed 2.1 s hermetic compile of devq 338):
+
+| granularity | points | compile cost at 2.1 s |
+|---|---|---|
+| every legal point | 3,721,772 | **~90 days** — out |
+| legal (structure, seam vector) | 15,347 | **~9 hours** of build-class jobs |
+| legal structure | 428 | **~15 minutes** |
+
+**Every route requires a modelled step, and that is the decision.** Compiling per structure or per
+(structure, seam) prices a *representative* and attributes it to the points beneath — an
+approximation over the axes not compiled. Pricing declaration-side needs a `Demand → cost` bridge
+that does not exist. Either way something is modelled.
+
+**Why that is not mine to choose.** Doc 47's central property is **1,208 measured / 5 counted / 0
+modelled**, and it deliberately declined to import iron's cross-toolchain bandwidth figure so that
+ports report `unpriced` rather than ranking against a constant wearing a measurement's label. A
+selector introduces the first modelled numbers into that instrument. Which of the three routes to
+take — and whether to keep the modelled costs in a separate table so the 0 stays 0 — is a call
+about what the instrument is *for*.
+
+**What is established here**: the composition row 31 describes does not exist as a composition, the
+three granularities and their costs are as tabled, and the cheapest route is affordable. **What is
+not**: which approximation is acceptable. The loop stops here rather than picking one.
 
 **A note on what `fused` can and cannot do dynamically.** `group_n` is baked into the kernel object
 as `-D` flags and the herd structure is baked into the xclbin, so for `fused` a workload-dependent
