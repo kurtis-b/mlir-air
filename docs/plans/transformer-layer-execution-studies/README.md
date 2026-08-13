@@ -61,6 +61,20 @@ how to use MLIR-AIR.
 | [41-research-timeloop.md](41-research-timeloop.md) | Timeloop — the canonical mapspace decomposition (**four** sub-spaces; the paper names three), **two-tier legality** with structure constructed-in and resources rejected by typed failure, and the **bottleneck cost model whose argmax names the offending resource**. Also LoopTree's tile inference + retention encoding — our residency-within-a-segment constraint in searchable form. **480k mappings within 5% of peak vary 19× in energy** |
 | [40-research-accelergy.md](40-research-accelergy.md) | Accelergy — **do not adopt**, steal two patterns. Its whole cost model is `Σ count × energy_per_action`: no time, no contention, no stalls; and "95% accurate" means against **post-layout simulation, not silicon**. Take the **ERT indirection** (ours would hold *measured* ns and bytes) and **actions carrying arguments** — a `dma_transfer` is a function of `(n_words, n_dims, stride)`, which our BD-stride walls make load-bearing |
 | [39-research-llmcompass.md](39-research-llmcompass.md) | LLMCompass — the only one whose workload is ours, and it **cannot express pipelined residency structurally**: twelve operator latencies summed, no `max()` anywhere, transposes and KV-concat **never costed at all**. Its 10.9% operator validation is sound; its **4.1% end-to-end figure should be discounted** (a ratio of two 12-term sums; no TPU hardware data in the repo). It answers the **dual** of our question — take mechanisms, not framing |
+| [47-balance-instrument.md](47-balance-instrument.md) | **The objective function, built** (queue item 25). All five parts doc 44 specified, host-only: a `[step × port]` demand matrix per column, a static back-solve, overflow as a **slope** with demand printed beside budget, a bottleneck whose **argmax names the resource**, and a `(component, action, **arguments**) → cost` table. **1,208 measured / 5 counted / 0 modelled** — iron's cross-toolchain bandwidth figure deliberately NOT imported, so ports report `unpriced` rather than ranking against a constant wearing a measurement's label. Read its two findings even if you never use the instrument: a per-column ingress count defined as `shim→core` flows reads **0** exactly when over budget, and **259 sweep results are repeat measurements of an identical action with spread to 42.2%**, so a 5% band does not separate a fifth of them from themselves |
+| [48-static-legality-and-space-size.md](48-static-legality-and-space-size.md) | **How big the mapping space is** (queue item 26), via TileFlow's cardinality combinator with doc 46's three changes. **115,343,360 before legality → 3,721,772 after.** It **falsifies its own row's hypothesis**: the space does *not* collapse to anything hand-enumerable (15,347 structures against iron's 7-entry table), so iron's hardcoded placements do not port. Enumeration still beats search — because the predicate is **static**, not because the space is small. **59% of the legal space is PRICED, not refused**, which is doc 44's slope argument turned into a measurement |
+| [49-r1-deterministic-defect.md](49-r1-deterministic-defect.md) | **Item 23 located and fixed** — an `air-to-aie` lock-*placement* defect, **not** an R1 wall. The acquire sat at each put, pacing put *i+1* against put *i* while leaving the core's own writes unguarded. Confirmed **out of sample** (0.810 predicted in writing, 0.81 measured). **Read §2's `sweeps` exclusion with its retraction** — it was only ever tested to 4 |
+| [50-coverage-sweep-costing.md](50-coverage-sweep-costing.md) | **Phase G's reachability, and doc 34's M5 retracted.** The coverage sweep M5 sized at "Phase-C-sized, 504 + 66 min" **had already been run on 2026-08-07** and nothing read the file; the reachability test re-derived its claim by `ast` over the wrong source. Three families reachable, not one. **§7**: `baseline_1024`'s "registry gap" **never existed**, and the walk found a real **width wall** instead — `runlist`'s `norm_rows` derives 32 against a multiple-of-64 requirement, **0 of 9** at emb 1024 against 9 of 9 at 512/768 |
+| [51-blind-check-census.md](51-blind-check-census.md) | **Items 17 and 19's filed-but-not-fixed lists, re-demonstrated** — each by injecting the defect into the **production** file and running the check as it stood before the fix. Also finds that one claim inside that fix does not hold (`test_block_cache` stays green when its production value moves, because the pin compares a value against the row it was derived from), and retracts item 19's dead-flag count. Carries the **stale-`.pyc`** trap: a same-size inject-and-restore inside one second can fake **either** direction of a before/after, with a pristine `git diff` |
+| [52-wall-7-race.md](52-wall-7-race.md) | **The whole `herd_x ≥ 2` / `down_K` story, and the densest doc here.** §§1–7 wall 7 located (a memtile buffer with `herd_x` writers and **no ordering**, one counting semaphore, no participant identity; timeout and wrong answer are **one** defect, 5/35 → 35/35 under a single-variable A/B). **§8** the compiler fix proved **impossible**, with §8.8's `herd_x = 1` claim retracted in §9. **§9** rows 28 and 30 separated; row 28's axis is **`down_K`**, not a shape. **§10** row 28 split into two defects, inseparable by shape because `maxq ≡ down_K` identically. **§11** the pacing step written. **§12** why that step is **inert** — it walks `func::FuncOp` and R1 presents `aie.runtime_sequence` |
+
+One file in this directory is **not** a plan document and should not be edited:
+**`PREDICTION-MAXQ.md`** is a sealed prediction, written before its measurement and cited **by
+sha256** (`90b92618…`) in queue row 28 and in [52 §11](52-wall-7-race.md). Its value is that it was
+fixed in advance and can be checked against what happened — editing it destroys exactly that. Its
+clauses 1 and 3 are still **untested** (not falsified): nothing has yet run a compiler in which the
+step they describe fires. Predictions recorded this way are the reason several of this directory's
+diagnoses are believable; one of them was **falsified** and is recorded as such.
 
 ## Status board
 
@@ -126,7 +140,7 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | Balance instrument — queue item 25 | 72 new host tests at a re-pinned literal FileCheck-verified in four directions; 16 injected defects rejected; every cost traceable to a named artifact | **done** 2026-08-12 (`7d17ea15`, [47](47-balance-instrument.md)). All five parts of [44 §The instrument](44-mapping-frameworks-synthesis.md), host-only: `[step × port]` demand matrix per column off a routed `aie.air.mlir`, static back-solve, overflow as a **slope** with demand beside budget, bottleneck argmax, and a `(component, action, **arguments**) → cost` ERT. **Seeded from artifacts that already existed**: 1,213 entries — **1,208 measured** device latencies, **5 counted** shim descriptors, **0 modelled**. iron's 67.9–70.9 GB/s deliberately NOT imported as a shim byte rate, so ports report `unpriced` rather than ranking against a constant wearing a measurement's label. Reproduces doc 23's `addnorm` row off the artifact — column 0 MM2S **demand 3 / budget 2**, priced ×1.500, not rejected. **Two findings**: a per-column ingress count defined as `shim→core` `aie.flow` reads **0** on that design (AIR emits packet flows when over budget) — item 10's failure mode in a second place; and **259 sweep results are repeats of an identical priced action, spread median 1.6% / worst 42.2%**, so a 5% band does not separate a fifth of them from themselves. Back-solve closed end-to-end on one build-class job (devq 293, no dispatch): 655,360 B against a measured 122.81 µs → **5.336 GB/s sustained**, bytes closing exactly. Suite 357/357 in 19 modules → **429/429 in 21** |
 | Goal 2 — quantization | Second quantized model passes a gate that exercises the quantized path | **q4_0 steps 1–4 and 6 done** 2026-08-12 ([36](36-goal-2-quantized-scoping.md)); **step 5, the model, NOT started**. q4_0 turned out to be a strict special case of the shipped kernel — `d*(q-8)` is `(q-z)*s` with `z≡8` — so steps 1–4 needed **no kernel change at all**, only a dependency-free GGUF reader and packer. Device gate devq 257: corr 0.999996 on a real SmolLM2 tensor, **both negative controls verified failing on device**, their correlations predicted on host to four decimals beforehand. Step 6's symmetric variant drops the all-8s `Z` plane: **bit-identical to step 4 on device** (0/2048 differ, corr 1.000000000) at **4.750 → 4.500 bits/weight**, and the retired `wrong-zero` control is **refused** rather than left to pass vacuously. Traffic **46.50 MiB** per weight pass on this checkpoint (48.00 on the 24×7 idealization — only 165 of 168 linears are Q4_0; three `ffn_down` are Q4_1, which the kernel **cannot** consume). Compute is 1.6× at `gs=32`, unchanged by the variant, confirmed in AIE2P assembly. **Step 5 needs a decision**: 3–5 weeks, plus the llama.cpp RoPE un-permute (cosine 0.03 → 0.996) and a route for the 3 Q4_1 tensors and the Q6_K tied embedding |
 
-## `[2026-08-12]` Where things stand, for a session picking this up cold
+## `[2026-08-13]` Where things stand, for a session picking this up cold
 
 **Verify NPU power mode is Turbo before measuring any latency.** It is non-persistent state and it
 resets on every reboot and every driver reload. At `Default` the verdict rung
@@ -139,21 +153,30 @@ Turbo-conditional. Bytes and counts are pmode-independent. Full chain: trap 0 be
 [32](32-cost-decomposed-ladder.md).
 
 **The tree is the whole state, and the toolchain is integrated end to end.** Everything is merged on
-`exper/transformer-layer-execution-studies`; **no worktrees and no `worktree-agent-*` branches remain**
-(26 were merged and each verified at 0 unmerged commits before removal). `build-xrt` and `install-xrt`
-both carry every fix — check with `ls -l`, **never `cmp`**, since the install rewrites RUNPATH so the
-bytes always differ. All four regression legs are green against that integrated toolchain, and **`[2026-08-12, evening]`
-all four numbers moved** — re-measured after the day's **four** compiler changes and nine merges:
-**`check-air-mlir` 500 pass / 0 fail** (was 497), **transformer-layer suite 33 pass / 1 unsupported /
-0 fail** (was 31; the 1 is still R1's parked gate), **ten-model 10/10** (run **three times** this
-evening, once per compiler change — devq 305, 326, 337), **study host suite 519/519 in 23 modules**
-(was 357/357 in 19). `install-xrt` was refreshed after each change and carries the 19:41 build.
+`exper/transformer-layer-execution-studies` — twelve agent branches on 2026-08-12 alone, each verified
+at 0 unmerged commits before its worktree was removed. **One worktree remains and is not mine to
+delete**: `.claude/worktrees/agent-ae4f6abdc09902a77` (H8's, from an earlier session; branch fully
+merged, holding an untracked `build-h8/`). `build-xrt` and `install-xrt` both carry every fix — check
+with `ls -l`, **never `cmp`**, since the install rewrites RUNPATH so the bytes always differ.
+
+**All four regression legs are green, and all four numbers moved on 2026-08-12** — three compiler
+changes landed that evening, and the legs were re-run against each:
+
+| Leg | Now | Was |
+|---|---|---|
+| `check-air-mlir` | **500 pass / 0 fail** | 497 |
+| transformer-layer suite | **33 pass / 1 unsupported / 0 fail** | 31 / 1 / 0 — the 1 is still R1's parked gate |
+| ten shipped models | **10/10** | 10/10, re-run **three times**, once per compiler change (devq 305, 326, 337) |
+| study host suite | **519/519 in 23 modules** | 357/357 in 19 |
+
+`install-xrt` was refreshed after each change and carries the 19:41 build.
 
 **A note on that last figure, because it caught three items in one evening.** Items 25, 26 and Phase
 G's G1 each moved `run_study_host_tests.lit`'s pinned count against the *same* 357 baseline, so after
-merging, **none of the three literals was true**. Each merge conflict was resolved by **running the
-merged suite** and pinning what it printed, then verifying the pin red at the stale value — never by
-adding the deltas. A count reconciled by arithmetic is a count nobody ran.
+merging, **none of the three literals was true**. Each conflict was resolved by **running the merged
+suite** and pinning what it printed, then verifying the pin red at the stale value — never by adding
+the deltas. A count reconciled by arithmetic is a count nobody ran, which is the one thing that suite
+exists to prevent.
 
 **All four modes are corrected, gated and fully separated by one measurement.** The standing
 cross-mode comparison is [32 §The post-flip walk](32-cost-decomposed-ladder.md): `offload` on its
@@ -161,75 +184,89 @@ shared-xclbin default, Turbo verified, two walks — `fused` < `coarse` < `runli
 averages *and* minimums at 512 and 1024, 16/16 orderings. `coarse` is cell C1 of
 [28](28-coarse-blend-space.md)'s space, chosen by measurement ([30](30-coarse-cells-built.md)).
 
-### What 2026-08-12 settled, and it was a lot
+### What 2026-08-12 settled — one long day, and the queue below is authoritative
 
-Thirteen queue items closed, three phases advanced, and eight new items opened *by* the work. The
-queue below is authoritative; this is the shape.
+Nineteen queue rows closed across two sessions, four phases advanced, eleven new rows opened *by* the
+work. Grouped by **kind**, because the grouping is the finding.
 
-- **Three silent-miscompile classes fixed** — items **8**, **9** and **wall 6**. Each produced a
-  *green wrong answer* rather than an error: an affine map sized with one symbol while composing an
-  N-symbol one (and the fix found two more of the same class, one silently producing **wrong
-  addresses**); an extent measured from sizes while offsets were ignored, shrinking a buffer under
-  its own readers with `EXIT=0`; a memtile semaphore sized from *static op count* while the same pass
-  emitted a quarter as many BDs. `check-air-mlir` 492 → 497.
-- **Six checks that could not fail, made able to fail** — items **10**, **14**, **16**, **17**, **19**,
-  **20**, plus a five-item cleanup batch. A census counting the wrong flow kind and reading **0**
-  exactly when over budget; a CI dashboard reading **green off a sibling test**; an emulation arm that
-  **never built the module it certified**; a manifest diff whose **reader shipped before its writer**;
-  a flag where asking for the safe branch changed nothing; and `tee /dev/stderr` **shredding a devq log
-  while the trailing PASS survived**. This is the session's dominant theme — none of them produced a
-  wrong number, all produced a *green* one.
-- **Three phases advanced**: **Phase G's G0** (one profile, one command, one manifest — ran cold in
-  347 s), **Goal 1's W1** (the banded mask, gated at 1.24× margin with its negative control verified
-  failing on device), and **q4_0 steps 1–4 + 6** (device-green, step 4 and step 6 **bit-identical on
-  device**, 4.750 → 4.500 bits/weight).
-- **H8's first cut landed** — declarative pipeline fusion, gated by **byte-identical** reproduction of
-  a hand-written reference. Doc 16 sized H8 "large, and needs H2"; **H2 had already landed** and its
-  other prerequisite (J7 as a hand-written reference) was satisfied twice over. Nobody had connected
-  either.
+- **Checks that could not fail, made able to fail — the dominant theme, and it did not stop.** Daytime:
+  items **10**, **14**, **16**, **17**, **19**, **20** plus a five-item batch — a census counting the
+  wrong flow kind and reading **0** exactly when over budget; a CI dashboard green off a **sibling
+  test**; an emulation arm that **never built the module it certified**; a manifest diff whose
+  **reader shipped before its writer**; a flag where asking for the safe branch changed nothing; and
+  `tee /dev/stderr` **shredding a devq log while the trailing PASS survived**. Evening added four more:
+  a `KNOWN_REGISTRY_GAPS` test asserting only that a method was *missing* — true of every method
+  nobody asks for, and it **still passes on the deleted entry**; a regression lit exercising the
+  **pre-conversion** shape of a pass that converts it, so it is green while the step it covers cannot
+  fire; a `--check-order` instrument silently **dropping** `repeat_count = 1` and giving confident
+  verdicts about programs never emitted; and my own verification script **printing** its compile-only
+  gate instead of enforcing it, which let 25 device dispatches run past a failed precondition.
+  **None of these produced a wrong number. Every one produced a green one.**
+- **Silent-miscompile classes fixed** — daytime items **8**, **9** and **wall 6** (an affine map sized
+  from one symbol while composing an N-symbol one, with two further hardcodes of the same class found
+  by the fix — one producing **wrong addresses**; an extent measured from sizes while offsets were
+  ignored, shrinking a buffer under its own readers at `EXIT=0`; a memtile semaphore sized from static
+  op count while the same pass emitted a quarter as many BDs). Evening added item **23**, an
+  `air-to-aie` **lock-placement** defect. `check-air-mlir` 492 → **500** over the day.
+- **Two negative results, both established rather than assumed** — and they are worth as much as the
+  fixes, because each stops a future session spending itself on an impossibility. Row **29**: wall 7's
+  recommended compiler fix **cannot exist** (an AIE2 BD has one acquire and one release field, so a
+  writer's release either orders the writers or binds the readers, never both; a counting argument
+  closes the rest) — it was **built and measured** before being concluded. Row **28(b)**: the specified
+  fold was **refused at its premise** (those puts already carry `repeat_count = 7`, and `repeat_count`
+  *is* the iteration dimension).
+- **Four phases advanced**: **Phase G's G0 and G1** (profile → manifest, then resume with a
+  **row-digest audit**, because plan and ledger agree with themselves whatever the walk did),
+  **Goal 1's W1** (the banded mask, 1.24× margin, negative control verified failing on device),
+  **q4_0 steps 1–4 + 6** (step 4 and 6 **bit-identical on device**, 4.750 → 4.500 bits/weight), and
+  **H8's first cut** (declarative pipeline fusion gated by **byte-identical** reproduction — doc 16
+  sized it "large, and needs H2"; H2 had already landed and nobody had connected the two).
+- **Instruments built, and they are why the evening's diagnoses landed**: the balance instrument
+  (item **25**, 1,208 measured / 5 counted / **0 modelled**), the static legality predicate (item
+  **26**), and R1's three probes (see the R1 section below).
 
-### R1's standing changed, and this is the paragraph to read before spending a session on it
+**Five claims were retracted on evidence**, four of them same-day: doc 34's **M5** coverage-sweep
+estimate (wrong by two orders of magnitude — the sweep had already been run and nothing read the
+file), doc 49's **`sweeps` is excluded by measurement** (only ever tested to 4, which is exactly where
+the threshold sits), doc 52's **"the compiler fix scales"**, item 19's **"7 remaining dead flags"**
+(2, and the gap was scope), and doc 52 §8.8's **"and at `herd_x = 1`"**. Reading the retractions is
+not optional here — see the note at the end of the research section.
 
-Four walls behind R1 were found, fixed and verified today — **4** BD liveness, **5** issue order
-(closed by E1), **6** the memtile lock count, plus a builder change — **and the gate still does not
-pass**. Wall 7 is now *characterized* rather than merely hit: it is a **race** — one ELF, identical
-inputs, fresh processes, `herd_x 2` alternating PASS/TIMEOUT and at 128 producing **four distinct
-wrong answers**. Task count, 6b's pacing, shim order, lock counts and `runtime_loop_tiling_sizes` are
-excluded **by measurement**. And a **second, deterministic** wrong answer sits at `herd_x=1, k'=4,
-chunks=4` (queue item 23).
+### R1's standing, rewritten — and the headline is that none of its walls were ever R1's
 
-~~**So R1 is correct only at the fully degenerate 1×1×1 rung**~~ **`[2026-08-12, evening]` That is
-superseded, and the correction is large.** The deterministic defect (item 23) turned out **not to be
-an R1 wall at all** but a general `air-to-aie` lock-*placement* defect that R1 was simply the first
-design to hit — the acquire was placed at each put, pacing put *i+1* against put *i* while leaving
-the core's **own** writes unguarded. It is **fixed and confirmed on hardware**, and with it R1 is now
-correct across the **entire `herd_x=1` ladder**: 7 rungs × 3 fresh processes = **21/21 PASS** (devq
-300), up to and including `128×128` at k' 4 / chunks 4. The rungs that already passed came back
-**byte-identical**, so the fix moved exactly the broken designs and nothing else.
+**Read this before spending a session on the resident tail.** It changed three times on 2026-08-12
+and the intermediate framings are all superseded; what follows is the settled account.
 
-**So the honest framing is now the opposite one**: the one-segment residency composition **works on
-the whole `herd_x=1` axis**, and what remains is confined to `herd_x ≥ 2`. Wall 7 was re-measured
-after the fix and **survives** (devq 306) — so items 21 and 23 were two different defects, and the
-unguarded-core-write hypothesis is excluded for 21 by measurement rather than by argument.
+**Where R1 works today: `herd_x = 1` and `down_K ≤ 4`.** Inside that box it is correct on hardware —
+7 rungs × 3 fresh processes = **21/21 PASS** (devq 300), and the rungs that already passed came back
+**byte-identical** across the fix that got it there, which is what distinguishes a fix from a change.
+Outside it, two independent walls remain, on two different axes.
 
-**`[2026-08-12, later]` And then wall 7 was LOCATED.** It is a **memtile staging buffer with `herd_x`
-writers and no ordering**: R1's down feed stages every GeLU column's H chunk through one L2 buffer,
-so `air-to-aie` emits one S2MM channel per GeLU core onto one single-slot buffer, all on **one
-counting semaphore** — which carries no participant identity, so neither writer order nor reader
-identity is fixed. **At `herd_x=1` there is one writer and one reader and both hazards are vacuous:
-that, and not the residency composition, is why the `herd_x=1` ladder is clean.** The timeout and the
-wrong answer are **one defect** — a single-variable A/B (one staging buffer per column) takes
-**5/35 → 35/35**, both symptoms together, with the `herd_x=1` controls byte-identical across arms and
-`herd_x ≥ 2` reproducing `herd_x=1` to the bit. **The mechanism is proven; what is left is a compiler
-change** — `isChainLockCandidate` excludes MIMO, which is also why `use_lock_race_condition_fix_v2`
-read as "inert": it was never reached. The builder-side fix is **not** the default because per-column
-staging does not compile at the gate shape. See [52](52-wall-7-race.md), and note the **new item 28**:
-`96×96` at `tile_k 16` hangs at `herd_x=1` too, which is *not* wall 7 and confounds that rung's twin.
+**Neither wall is in the residency composition, and that is the finding.** Through 2026-08-12 the
+project charged **six** walls to the one-segment composition. The last two were resolved and both
+turned out to be **general compiler defects that R1 was merely the first design to reach**:
 
-The interpreter's verdict is now *consistent* with hardware everywhere the hardware works, rather
-than disagreeing everywhere above degenerate. R1 also has a **discriminator**: `probe_r1_rung.py`
-reads the output BO back on timeout, which nothing had ever done, so the next attempt starts with an
-instrument rather than a hang.
+| Axis | Wall | What it actually is |
+|---|---|---|
+| `herd_x ≥ 2` | item **21** (wall 7) | A **memtile staging buffer with `herd_x` writers and no ordering**. R1's down feed stages every GeLU column's H chunk through one L2 buffer, so `air-to-aie` emits one S2MM channel per GeLU core onto one single-slot buffer, all on **one counting semaphore** — which carries **no participant identity**, so neither writer order nor reader identity is fixed. **At `herd_x = 1` there is one writer and one reader and both hazards are vacuous** — that, and not the composition, is why the `herd_x=1` ladder is clean. Timeout and wrong answer are **one** defect: a single-variable A/B takes **5/35 → 35/35**, both symptoms together |
+| `down_K ≥ 5` | item **28** | **Two** defects wearing one number, inseparable by shape because `maxq ≡ down_K` identically in this builder. **(a)** an L2 slot-rotation **phase skew** (`==5` → a byte-deterministic wrong answer, a pure permutation predicted with zero free parameters off the emitted BD chains); **(b)** `down_K` outstanding shim task starts with no await (`≥6` → hang, 0 cores finished) |
+
+The former deterministic defect (item **23**) was the third of these and is **fixed and gated**: an
+`air-to-aie` lock-*placement* defect where the acquire sat at each put, pacing put *i+1* against put
+*i* while leaving the core's **own** writes unguarded.
+
+**What this means for the phase.** The gate shape (`768×3072` at `tile_k 32`) is `down_K = 96` at
+`herd_x 4`, so it needs **both** walls cleared. Neither is a residency question — so the case for
+finishing R1 rests on whether resident composition is worth having ([45](45-research-flat.md),
+[46](46-research-tileflow.md) raise that separately), not on whether the composition works. The
+mechanisms are proven; the remaining work is compiler work, itemized in rows 21, 28 and 29.
+
+**What you inherit that earlier sessions did not.** `probe_r1_rung.py` reads the output BO back
+**on timeout** (`--dump-npz` makes determinism a claim about bytes), `probe_r1_arrival_map.py`
+decomposes a wrong answer into per-(chunk, row-run) coefficients *and* fits a pairing dictionary,
+and `probe_aie_buffer_writer_race.py` decides writer-order and read-binding separately as a Petri
+net (`--check-order`, `--check-rotation`, `--refuse-skew`, self-test 11 cases calibrated both ways).
+Every diagnosis on this page since 2026-08-12 came out of those three.
 
 `fused`'s SPECS atol stays **PROVISIONAL** and **no resident-tail latency or byte figure has ever
 been measured on hardware.**
@@ -291,36 +328,43 @@ LINEAR operators on the NPU, all NON-LINEAR on the host), `fused` eliminates DRA
 operators, and `coarse` blends `runlist` and `fused`.
 ### The work queue
 
-`[2026-08-12]` **Evening session: 21, 23, 24, 25, 26 and 27 all closed or located, Phase G's G1 landed,
-and the open rows are now 12 and the new 28.** Work ran in parallel across the queue.
-**24** held at 8/8 vs 0/8 and left behind the rule that `aie.air.mlir` is not byte-reproducible, so
-no inertness question is settled by an IR dump. **25** built the balance instrument, seeded 1,208
-measured / 5 counted / **0 modelled**. **26** measured the mapping space and **falsified its own row's
-hypothesis** — the space does not collapse, and 59% of what is legal is *priced* rather than refused.
-**27** re-demonstrated the blind-check lists and retracted one claim inside their own fix.
+`[2026-08-13]` **The open rows are 6, 11, 12, 28 and 30, and they are not sequenced.** Rows recorded
+done are struck; they are kept because their evidence chains are cited elsewhere, so read the bold
+verdict rather than the whole cell.
 
-**The two that matter most are 23 and 21, and together they retire this study's longest-standing
-misattribution.** Neither was a wall in the residency composition. **23** was a general `air-to-aie`
-lock-*placement* defect — fixed, gated at every altitude, and R1 now passes the **whole `herd_x=1`
-ladder 21/21**. **21** is a memtile buffer with `herd_x` writers and **no ordering**, whose hazards
-are *vacuous* at `herd_x=1` — mechanism proven on hardware by a single-variable A/B (5/35 → 35/35).
-So six walls were charged to the composition, and the last two were general compiler defects that R1
-was merely the first design to reach.
+**The one finding to carry out of 2026-08-12: none of R1's walls were R1's.** Six were charged to the
+one-segment residency composition. The last two resolved — **23** (an `air-to-aie` lock-*placement*
+defect, fixed and gated at every altitude) and **21** (a memtile buffer with `herd_x` writers and no
+ordering, whose hazards are *vacuous* at `herd_x = 1`) — were **general compiler defects R1 was merely
+the first design to reach**. The R1 section above has the current box: correct at `herd_x = 1` and
+`down_K ≤ 4`.
 
-The struck rows below are kept because their evidence chains are cited elsewhere; read the bold
-verdict, not the whole cell. The
-struck rows are kept because their evidence chains are cited elsewhere; read the bold verdict, not
-the whole cell.
+**Where to start, if you want a recommendation.**
 
-**Where to start, if you want a recommendation.** **25** — the balance instrument — is the highest
-leverage thing on this list and depends on nothing: it is the objective function for every mapping
-question, seven frameworks converge on its design ([44](44-mapping-frameworks-synthesis.md)), and
-without it no search or tuning here is falsifiable. **23** is next: deterministic beats a race by a
-wide margin on cost, and it is the one R1 question that might actually close. **26** is small and
-answers whether the mapping space needs a search at all. **21** (wall 7's race) is large and
-uncertain, and [45](45-research-flat.md)/[46](46-research-tileflow.md) raise a real question about
-whether the resident composition is the right target at our sequence lengths — **that is a decision
-for the operator, not a default.**
+1. **28(b)'s traversal fix is the cheapest real progress on the board** — fully diagnosed in
+   [52 §12](52-wall-7-race.md), **one line** plus a second lit case. The step is written, built and
+   gated; it walks `func::FuncOp` while R1 presents `aie.runtime_sequence`, so it never fires. Note
+   what makes it worth doing carefully rather than quickly: the existing lit is green **and cannot
+   fail** for the case it covers, so the fix must add the post-conversion case or it will stay green
+   over a step that still cannot fire. Budget the two long gate legs (~75 min).
+2. **28(a), the L2 slot-rotation phase skew** — located in source (`detectNBufferRotation`'s guard
+   drops into a fallback that is not order-preserving), with a pure permutation predicted off the
+   emitted BD chains at zero free parameters. Larger than (b), and it is the wrong-answer half.
+3. **11(b) needs a scheduling decision, not engineering** — the plot/analysis tier wants
+   matplotlib/pandas/seaborn, which **must not be installed while gates run**. It needs an exclusive
+   window and is the only claimant on one.
+4. **12 is yours** — Goal 1's model path and Goal 2's step 5 (3–5 weeks) are decisions with costed
+   options, not tasks.
+5. **30 is latent** and cheap to leave; **6** is the umbrella row for R1's gate and is blocked on the
+   two above.
+
+**Before committing a session to R1, read this.** Wall 7's mechanism is proven, but its *compiler*
+fix is **proved impossible** (row **29**: an AIE2 BD has one acquire and one release field), and the
+builder-side fix that does work **does not compile at the gate shape**. So there is currently **no
+known route to R1's gate at `herd_x ≥ 2`** — closing it needs a new idea, not an increment. That, plus
+[45](45-research-flat.md)/[46](46-research-tileflow.md)'s question about whether resident composition
+is the right target at our sequence lengths, makes continuing R1 **a decision for the operator rather
+than a default.**
 
 **`[2026-08-12]` Four rows closed that day and two are new — and the compiler half of the queue is
 now empty.** **8** (the two-symbol offset map, sized from the map it composes — plus two further
@@ -361,16 +405,16 @@ literal case trap 0's closing sentence forbids. It cannot be fixed the same way 
 
 | # | Work | Size | Spec |
 |---|---|---|---|
-| **1** | **The shared `offload` path now runs AND GATES at 4096 — the mode's own spec shape** (2026-08-11, route 3 of the hardware verdict). The chain of findings, in order: the five-shape chain builds at 4096 (`623768f2`, compile half); the multi-launch dispatch experiment answered NO — 29 single-launch dispatches clean off the shared xclbin, the one multi-launch module (`fused-cast` down-proj) **faults the firmware** (`fatal_error_type 0x10`) — and the scoped fallback was **falsified** (`--expand-load-pdis` is a no-op on aiecc 1.4.0's raw-insts edge; the ELF ABI's multi-launch works via aiebu-embedded PDIs; the "19→174 KB" claim had no artifact). **The landing: `offload_config` pins a `fused-cast` winner to the shape's `drain` row under the shared path** (~10% priced on that GEMM, ELF path keeps the winner), measured 10/10 stages clean with `context_loads 1 kernel_attaches 4` over 30 dispatches, byte provenance exact (cold delta 293,200 = the five insts streams; −12,582,912 vs ELF = the fused-cast f32 C scratch), and `run_npu2_offload_peano.lit` re-ran green with all three recipes at 4096. ~~**Remaining of (c): the ten-model regression**~~ — the suite half re-ran the same day: **30/30** (519.7 s, 24 workers, the drain-pinned 4096 recipe among them; the runlist gate's no-margin latency clause held under this contention), and **`[2026-08-11]` later the ten-model half re-ran under the new install: 10/10 PASS** (devq job, gate-e1 leg-2 procedure, ~66 min). **Item 1 is CLOSED** | done | [29 §The hardware verdict](29-offload-n-streams.md) |
+| ~~**1**~~ | **The shared `offload` path now runs AND GATES at 4096 — the mode's own spec shape** (2026-08-11, route 3 of the hardware verdict). The chain of findings, in order: the five-shape chain builds at 4096 (`623768f2`, compile half); the multi-launch dispatch experiment answered NO — 29 single-launch dispatches clean off the shared xclbin, the one multi-launch module (`fused-cast` down-proj) **faults the firmware** (`fatal_error_type 0x10`) — and the scoped fallback was **falsified** (`--expand-load-pdis` is a no-op on aiecc 1.4.0's raw-insts edge; the ELF ABI's multi-launch works via aiebu-embedded PDIs; the "19→174 KB" claim had no artifact). **The landing: `offload_config` pins a `fused-cast` winner to the shape's `drain` row under the shared path** (~10% priced on that GEMM, ELF path keeps the winner), measured 10/10 stages clean with `context_loads 1 kernel_attaches 4` over 30 dispatches, byte provenance exact (cold delta 293,200 = the five insts streams; −12,582,912 vs ELF = the fused-cast f32 C scratch), and `run_npu2_offload_peano.lit` re-ran green with all three recipes at 4096. ~~**Remaining of (c): the ten-model regression**~~ — the suite half re-ran the same day: **30/30** (519.7 s, 24 workers, the drain-pinned 4096 recipe among them; the runlist gate's no-margin latency clause held under this contention), and **`[2026-08-11]` later the ten-model half re-ran under the new install: 10/10 PASS** (devq job, gate-e1 leg-2 procedure, ~66 min). **Item 1 is CLOSED** | done | [29 §The hardware verdict](29-offload-n-streams.md) |
 | ~~1b~~ | **RESOLVED 2026-08-11 — the anomaly was the NPU power mode.** The reboot did NOT clear it (82.5 ms/load) and a held-context pin refuted runtime PM (82.2 ms/load with the device active); the discriminator was the boot history — the machine **rebooted itself at 01:09 on 2026-08-10, the exact onset**, resetting the non-persistent `xrt-smi` pmode from the **Turbo** the healthy window's uninterrupted boot had carried (set for C4's `require_turbo()` sweep) back to `Default`. Confirmed by re-measure: Turbo → **156.2 ms avg, 3.7 ms/load**, inside doc 29's band. **New standing rule: Turbo is a measurement condition** — re-set and verify it after every reboot/driver reload, before any latency run (trap 0 below); 08-10's recorded latencies are `Default`-conditional, pre-08-10's are Turbo-conditional, bytes/counts unaffected | done | [32](32-cost-decomposed-ladder.md) |
 | ~~2~~ | **DONE 2026-08-10.** Schema v2 (`eeb37a19`): `device_ms` / `sync_ms` / `host_cpu_ms` plus `context_loads` / `kernel_attaches`, appended after the pinned v1 prefix, semantics written per field. First hardware rows at 1024 confirm every known truth — `offload`-ELF 30 loads with 18.8 ms of host compute, `runlist` 24 (its per-head eviction, a measured middle regime), `coarse`/`fused` 0 — and both pinned offload gate lines re-verified on NPU | done | [03](03-measurement-model.md) |
-| 3 | **CODE HALF DONE `[2026-08-11]` — the default IS the shared path.** `AIR_OFFLOAD_LEGACY_ELF=1` is the legacy/control opt-in (the retired `AIR_OFFLOAD_SHARED_XCLBIN` raises on any setting), the two cache directories stay unmerged, and all three lit recipes re-pointed with **no pinned literal moved**: the default recipe runs with no env var and still pins `context_loads 1 kernel_attaches 4`; the legacy pair sets the var and still pins `context_loads 30 kernel_attaches 0`. ~~**Remaining — the owed re-walk**~~ **RAN the same day — item 3 is CLOSED.** Both walks, 8/8 rungs each, Turbo verified in-job, `offload` on the shared default (`npu_unique_xclbin_count 1` in every row): **`fused` < `coarse` < `runlist` < `offload` on averages AND minimums, both walks, both lengths — 16/16 orderings, all four modes fully separate for the first time** ([32 §The post-flip walk](32-cost-decomposed-ladder.md)). `offload`'s timed-region `context_loads` is 0 (standing context) against the ELF era's 30/dispatch; its ELF-era 120–316% spread is gone. One declared confound: the same day's two-pass `addnorm` rides in the three modes that dispatch it, so cross-walk comparisons against pre-flip records are not single-variable | done | [32 §The post-flip walk](32-cost-decomposed-ladder.md) |
+| ~~3~~ | **CODE HALF DONE `[2026-08-11]` — the default IS the shared path.** `AIR_OFFLOAD_LEGACY_ELF=1` is the legacy/control opt-in (the retired `AIR_OFFLOAD_SHARED_XCLBIN` raises on any setting), the two cache directories stay unmerged, and all three lit recipes re-pointed with **no pinned literal moved**: the default recipe runs with no env var and still pins `context_loads 1 kernel_attaches 4`; the legacy pair sets the var and still pins `context_loads 30 kernel_attaches 0`. ~~**Remaining — the owed re-walk**~~ **RAN the same day — item 3 is CLOSED.** Both walks, 8/8 rungs each, Turbo verified in-job, `offload` on the shared default (`npu_unique_xclbin_count 1` in every row): **`fused` < `coarse` < `runlist` < `offload` on averages AND minimums, both walks, both lengths — 16/16 orderings, all four modes fully separate for the first time** ([32 §The post-flip walk](32-cost-decomposed-ladder.md)). `offload`'s timed-region `context_loads` is 0 (standing context) against the ELF era's 30/dispatch; its ELF-era 120–316% spread is gone. One declared confound: the same day's two-pass `addnorm` rides in the three modes that dispatch it, so cross-walk comparisons against pre-flip records are not single-variable | done | [32 §The post-flip walk](32-cost-decomposed-ladder.md) |
 | ~~4~~ | **DONE 2026-08-10.** `evict_attention_contexts` evicts by artifact now (`KernelCache.evict_pools_for`), so the content-keyed static-weight pools survive the per-head evictions. Measured: warm `runlist` bytes 190,513,152 → **176,160,768** (−14,352,384 — the static set, to the byte) and sync 451 → 443. **Cold totals unchanged**, so no gate literal moved; `check-runlist`, fault twin and `check-coarse-c3` re-ran green | done | [30](30-coarse-cells-built.md) |
 | ~~5~~ | **DONE 2026-08-10.** Decided: the seam gate's verdict compares interleaved **minimums** (`agg_min < seq_min`, both legs) — doc 23 §1's own convention, since contention only inflates samples. The inequality was NOT widened; medians and the win count stay reported. Validated isolated: leg A 1.0054× on minimums, leg B 1.0148×, `PHASE B GATE: PASS` | done | [30](30-coarse-cells-built.md) |
 | **6** | **The `fused` resident tail — R1 BUILT 2026-08-11; the gate RAN the same day and is RE-PARKED on wall 4 (item 6b).** The one-segment FFN interior (up-proj + GeLU + J7b's down ring, three herds per 64-row band) is structurally green: hermetic probe 8/8 clauses — **re-verified 3/3 against the FIXED fuse pass**, so the derived constants hold on the corrected fusion — ~~dataflow emulated element-exact in f64, 5/5 host tests~~ **`[2026-08-12]` read that clause with item 17's correction — the emulation arm never built the module; the rebuilt arm interprets it, measures 5.457e-12 and is 8/8**, both kernel objects compiling. Wall 3 (the `air-fuse-channels` crash, item 6a) is FIXED and the gate was armed and run via devq through `build-xrt/python` (no install refresh needed on this path): **STRUCT arm passes; the numeric arm hits wall 4** — shim BD exhaustion, deterministic and loud (item 6b). ~~SPECS atol stays provisional~~ **`[2026-08-11]` wall 4 is FIXED** (`ea3b98ce`, item 6b) and the numeric arm now compiles through the BD allocator for the first time — **and stops on wall 5, the channel-major shim issue order** (`ERT_CMD_STATE_TIMEOUT`, item 6c). The STRUCT arm re-ran PASS against the fixed compiler. SPECS atol stays PROVISIONAL; the emulation tests and the structure arm remain the standing evidence — **and `[2026-08-12]` the emulation half of that sentence is only worth citing from item 17 onward: before it, the arm did not build the module** | Unblock 6c, then re-arm the recipe + one gate run | [31](31-fused-resident-tail.md) §status · [31a](31a-resident-byte-floor.md) |
-| **6a** | **FIXED IN SOURCE 2026-08-11, and the fix is CLOSED — the gate reached the next allocator the same day.** The crash was two defects wearing one stack trace: the diagnosed use-after-free (the pairwise loop had no merge *roles* — on a 3-clique the third pair put one channel's ops in both the fuse-destination and erased sets, and `wrapRegionsWithForLoops` clones-and-erases what the erase loop then reads) **plus a silent N-way miscompile behind it** (the NFL wrap hardcoded 2 time-multiplex slots; k absorbed sources need 1 + k — the LB/UB path already composed N-way via its attr increments). Fix in `AIRDependencyScheduleOpt.cpp`: roles kept disjoint across pairs; per-destination trip counts; loud decline if two destinations with different counts ever share a wrap region. **Verified**: N=3 old SEGV/hang → fixed 10/10; N=4 clean; **R1's own `pass_017` dump old 10/10 SEGV → fixed 10/10 clean**; `check-air-mlir` 491 pass / 0 fail; regression lit `fuse_channels_sibling_nests.mlir` verified failing on the old binary. **The same-day Codex review then found a THIRD defect the first fix had faithfully preserved** (its "N=2 bit-identical" check proved preservation of a miscompile): the loose dynamic-offset comparison let sibling nests reading DIFFERENT L3 slices fuse into clones of the destination's transfer, silently dropping the sources' data. The revision moves the test to strict structural equivalence per SIDE — identical-pattern sides multiplex at 1 + k, differing sides keep ALL their ops on the merged channel (func9's documented split shape; func13's expectation had encoded the miscompile and was corrected) — and closes two residual hazards (nested-op UAF via recursive region validation; multiplicative LB/UB×NFL mixing via per-destination strategy). **Sharper finding**: the old pass's *lucky-green* R1 outputs were themselves wrong, so structural literals derived from pre-fix dumps must be re-derived, not compared against. The gate then RAN through `build-xrt/python` (the install refresh turned out not to be on the gate's path; it stays owed for `install-xrt` consumers) and hit wall 4 — item 6b | done; the gate's next blocker is 6b | [31](31-fused-resident-tail.md) §status |
+| ~~**6a**~~ | **FIXED IN SOURCE 2026-08-11, and the fix is CLOSED — the gate reached the next allocator the same day.** The crash was two defects wearing one stack trace: the diagnosed use-after-free (the pairwise loop had no merge *roles* — on a 3-clique the third pair put one channel's ops in both the fuse-destination and erased sets, and `wrapRegionsWithForLoops` clones-and-erases what the erase loop then reads) **plus a silent N-way miscompile behind it** (the NFL wrap hardcoded 2 time-multiplex slots; k absorbed sources need 1 + k — the LB/UB path already composed N-way via its attr increments). Fix in `AIRDependencyScheduleOpt.cpp`: roles kept disjoint across pairs; per-destination trip counts; loud decline if two destinations with different counts ever share a wrap region. **Verified**: N=3 old SEGV/hang → fixed 10/10; N=4 clean; **R1's own `pass_017` dump old 10/10 SEGV → fixed 10/10 clean**; `check-air-mlir` 491 pass / 0 fail; regression lit `fuse_channels_sibling_nests.mlir` verified failing on the old binary. **The same-day Codex review then found a THIRD defect the first fix had faithfully preserved** (its "N=2 bit-identical" check proved preservation of a miscompile): the loose dynamic-offset comparison let sibling nests reading DIFFERENT L3 slices fuse into clones of the destination's transfer, silently dropping the sources' data. The revision moves the test to strict structural equivalence per SIDE — identical-pattern sides multiplex at 1 + k, differing sides keep ALL their ops on the merged channel (func9's documented split shape; func13's expectation had encoded the miscompile and was corrected) — and closes two residual hazards (nested-op UAF via recursive region validation; multiplicative LB/UB×NFL mixing via per-destination strategy). **Sharper finding**: the old pass's *lucky-green* R1 outputs were themselves wrong, so structural literals derived from pre-fix dumps must be re-derived, not compared against. The gate then RAN through `build-xrt/python` (the install refresh turned out not to be on the gate's path; it stays owed for `install-xrt` consumers) and hit wall 4 — item 6b | done; the gate's next blocker is 6b | [31](31-fused-resident-tail.md) §status |
 | ~~**6b**~~ | **FIXED `[2026-08-11]` — the BD wall is gone, and the gate is now parked one layer further down (item 6c).** The wall as recorded was mis-attributed twice, corrected from the emitted runtime sequence: the offending feed is **`hidden`**, not the down feed, at **96** tasks (sweeps 4 × k_steps 24 — the 4 is the sweep re-read, not `herd_x`), 96 + `w_up`'s 1 = **97 live BDs on tile (1,0) against 16**. Mechanism: AIR emits a transfer's BD release where the `airrt.wait_all` that joined its token was, and R1 joins every token at one segment terminator. **Fix `ea3b98ce`** (`airrt-to-npu`): a tile over budget has its offending MM2S feed paced with completion-token awaits — `issue_token` + `dma_await_task(t[i-depth])` before task `i`'s **configure** (the allocator hands the ID out there; an await one op later is one ID too late — measured, the first form refused at task 16 instead of task 0), plus a drain so every token is consumed exactly once, and the paced run sunk behind the feeds it must not out-order. **Awaits, not frees**: mlir-aie's own guidance is that a `dma_free_task` before completion is a race, so a compiler-inserted free has no argument to offer. **[23 §4](23-rules-and-open-items.md)'s other candidate — loop-shaped BD programs — is CLOSED as arithmetically unavailable for a retiling feed**: `hidden`'s descriptor already uses all four hardware BD dimensions with no mergeable adjacent pair, so the chunk loop would be a fifth. No-op unless a tile is over budget, so no shipped design moves: regression lit `shim_bd_liveness_bound.mlir` **verified failing** pre-fix, `check-air-mlir` **492/0**, transformer-layer suite **31/1/0** against the final binary (devq 248), structural probe PASS against the fixed pass (devq 239). **Evidence gap, stated**: R1 is the only module that triggers the recycling and it hangs on 6c, so the pacing is verified at pass and compile altitude but **not on hardware** | done; the gate's next blocker is 6c | [31 §Wall 4 is fixed](31-fused-resident-tail.md) · [23 §4](23-rules-and-open-items.md) |
-| **6c** | **Wall 5 — R1's shim issue order is CHANNEL-MAJOR and its consumers are not** `[2026-08-11]`. With BDs bounded the numeric arm compiles for the first time and then **times out on hardware** (`ERT_CMD_STATE_TIMEOUT`, devq 235). Measured from the runtime sequence: the three coupled L3 feeds are issued `@air_channel_2` (`hidden`) ×96, then `w_up`, then `w_down` — but an up core cannot consume `hidden` chunk 0 without its `w_up` block (the memtile BD chain interleaves them A,B,A,B) and `hidden`'s L2 landing pad holds one chunk, so a feed cannot drain before its co-operand is issued. **`air.preserve_shim_dma_order` does NOT fix it** — measured, devq 236: with the marker the grouping is still `[ch2 ×96][ch3 ×96][ch4 ×96]` and the module still times out, because the grouping is produced **upstream** by `air-dma-to-channel`'s per-channel loop hoisting ([19](19-phase-j1-collapse-norm-dispatches.md) §"Why it is safe now", step 1) and the marker only *prevents further* regrouping. Second, independent order defect in the same dump: `w_down`'s deliveries are non-monotonic in its own K index (c-major, sweep inner) because H5 forces the sub-channel index literal → 4 textual instances → 4 sibling per-channel loops concatenated. ~~**Inference, marked**: no ordering of whole channel runs can satisfy R1; it needs round-major interleave.~~ **`[2026-08-12]` DESIGNED, and that inference is NOT established by the artifact it rests on** ([37](37-wall-5-order-seam-design.md)). The `[96][96][96]` grouping is from devq **236, marker-ON** — and `air.preserve_shim_dma_order` is a **folding** switch as well as an ordering one, verified in source at `AIRDependencyScheduleOpt.cpp:8499-8534` ("no per-channel BD regrouping/**folding**"; the early return "skips per-channel BD folding for the whole launch region"). So it says nothing about the unmarked build's fold state, where doc 31 §Wall 4's own table records `w_up` at **1 BD** — folded to one wide streaming transfer, which is not a run and cannot starve. The design also finds **two independent deadlocks, not one**: D1 inter-channel, and D2 — `w_down` c-major against a sweep-major producer — which deadlocks on its own with inter-channel order perfect. It **rejects both routes this row named** (A's blast radius is four passes keyed in writing to the hoist's output shape) and recommends **route E: builder-side, zero compiler change**, since `w_down`'s refill carries no channel index (H5 constrains the `CHANNEL_G` get beside it, not the refill) — with route C held as the durable follow-up. Weighs that 31b's R2 deletes the `hidden` crossings entirely, so heavy machinery would be bought for a configuration R2 removes. **Next step is one hermetic compile, ~13 s, no device** — §5's census settles all three unpinned facts, and row 2 (has 6b's sink already fired?) decides between route E alone and route D first  **`[2026-08-12]` THE CENSUS RAN — route E confirmed, E1 alone is the whole remaining structural fix, and the order this row records is REFUTED.** Three arms, no device. Measured on the **unmarked** build (`preserve_shim_dma_order` count 0 — the build the design argued had never been read): `hidden` **96** tasks, `w_up` **1** (one BD spanning the whole array), `w_down` **13** — so §1.3's premise holds and **route C's trigger is not met**. Emitted order is **`[w_up][w_down][hidden ×96]`**, i.e. **6b's sink already fired**, so **route D is not needed** and defect 2 is the sole surviving order defect. **This row's own sentence — `@air_channel_2 ×96, then w_up, then w_down` — describes a SUPERSEDED BINARY**: devq 235/236 ran 13:06/13:08, `AIRRtToNpuPass.cpp` relinked 13:28, and 6b's fix (`ea3b98ce`) is the only order-producing change in that window. Which of *the sink was not yet in 235's build* or *the order was carried from an earlier dump* is correct is **not established** — both scratchpads are gone. **E1 on a copy**: `w_down` collapses to **1** contiguous BD monotone in `(s,c,jj)` — defect 2 gone — with channel symbols **12 → 9** and compile 1.4 s vs 1.3 s, no blow-up; **E2 is inert by measurement**. **Two things gate committing to it**: E1 deletes the shared-buffer WAR chain the builder's own comment relies on, so its token graph is cross-nest and **its correctness is unverified** (emulation tests + a device run settle it); and the census binary **predates items 8 and 9**, with item 8's `air-split-l2-memref` squarely on R1's L3-offset path, so **re-take the census against the integrated build first**  **`[2026-08-12]` E1 LANDED AND THE GATE RAN — wall 5 is closed and wall 6 is confirmed on hardware.** The re-taken census against the integrated build (items 8 + 9) is **byte-identical** to the pre-integration one, so neither compiler fix moves R1's runtime sequence and doc 37's stated worry retires. E1 folds `w_down` **13 → 1** contiguous monotone BD; `check-air-mlir` 494/0; STRUCT arm PASS on both binaries against all four pinned literals. **The numeric arm then timed out** (`ERT_CMD_STATE_TIMEOUT`, `fatal_error_type 0x0`, devq 259) — **predicted in advance by item 18's lock-conservation bound**, which is arm-independent, so E1 is correct and insufficient. **The recipe is re-parked** on wall 6, its re-arm deliberately left uncommitted so the tree does not claim an armed gate. SPECS atol stays **PROVISIONAL**; still no resident-tail latency or byte figure on hardware. Note for whoever takes wall 6: 31a's 84.0 → 16.5 MiB is a whole-layer @1024 figure while R1 prices one 64-row band, so this gate cannot by itself produce that number | Wall 6 is item 18; E1 is landed and needs no rework | [37](37-wall-5-order-seam-design.md) · [31 §Wall 5](31-fused-resident-tail.md) · [23 §4](23-rules-and-open-items.md) |
+| ~~**6c**~~ | **Wall 5 — R1's shim issue order is CHANNEL-MAJOR and its consumers are not** `[2026-08-11]`. With BDs bounded the numeric arm compiles for the first time and then **times out on hardware** (`ERT_CMD_STATE_TIMEOUT`, devq 235). Measured from the runtime sequence: the three coupled L3 feeds are issued `@air_channel_2` (`hidden`) ×96, then `w_up`, then `w_down` — but an up core cannot consume `hidden` chunk 0 without its `w_up` block (the memtile BD chain interleaves them A,B,A,B) and `hidden`'s L2 landing pad holds one chunk, so a feed cannot drain before its co-operand is issued. **`air.preserve_shim_dma_order` does NOT fix it** — measured, devq 236: with the marker the grouping is still `[ch2 ×96][ch3 ×96][ch4 ×96]` and the module still times out, because the grouping is produced **upstream** by `air-dma-to-channel`'s per-channel loop hoisting ([19](19-phase-j1-collapse-norm-dispatches.md) §"Why it is safe now", step 1) and the marker only *prevents further* regrouping. Second, independent order defect in the same dump: `w_down`'s deliveries are non-monotonic in its own K index (c-major, sweep inner) because H5 forces the sub-channel index literal → 4 textual instances → 4 sibling per-channel loops concatenated. ~~**Inference, marked**: no ordering of whole channel runs can satisfy R1; it needs round-major interleave.~~ **`[2026-08-12]` DESIGNED, and that inference is NOT established by the artifact it rests on** ([37](37-wall-5-order-seam-design.md)). The `[96][96][96]` grouping is from devq **236, marker-ON** — and `air.preserve_shim_dma_order` is a **folding** switch as well as an ordering one, verified in source at `AIRDependencyScheduleOpt.cpp:8499-8534` ("no per-channel BD regrouping/**folding**"; the early return "skips per-channel BD folding for the whole launch region"). So it says nothing about the unmarked build's fold state, where doc 31 §Wall 4's own table records `w_up` at **1 BD** — folded to one wide streaming transfer, which is not a run and cannot starve. The design also finds **two independent deadlocks, not one**: D1 inter-channel, and D2 — `w_down` c-major against a sweep-major producer — which deadlocks on its own with inter-channel order perfect. It **rejects both routes this row named** (A's blast radius is four passes keyed in writing to the hoist's output shape) and recommends **route E: builder-side, zero compiler change**, since `w_down`'s refill carries no channel index (H5 constrains the `CHANNEL_G` get beside it, not the refill) — with route C held as the durable follow-up. Weighs that 31b's R2 deletes the `hidden` crossings entirely, so heavy machinery would be bought for a configuration R2 removes. **Next step is one hermetic compile, ~13 s, no device** — §5's census settles all three unpinned facts, and row 2 (has 6b's sink already fired?) decides between route E alone and route D first  **`[2026-08-12]` THE CENSUS RAN — route E confirmed, E1 alone is the whole remaining structural fix, and the order this row records is REFUTED.** Three arms, no device. Measured on the **unmarked** build (`preserve_shim_dma_order` count 0 — the build the design argued had never been read): `hidden` **96** tasks, `w_up` **1** (one BD spanning the whole array), `w_down` **13** — so §1.3's premise holds and **route C's trigger is not met**. Emitted order is **`[w_up][w_down][hidden ×96]`**, i.e. **6b's sink already fired**, so **route D is not needed** and defect 2 is the sole surviving order defect. **This row's own sentence — `@air_channel_2 ×96, then w_up, then w_down` — describes a SUPERSEDED BINARY**: devq 235/236 ran 13:06/13:08, `AIRRtToNpuPass.cpp` relinked 13:28, and 6b's fix (`ea3b98ce`) is the only order-producing change in that window. Which of *the sink was not yet in 235's build* or *the order was carried from an earlier dump* is correct is **not established** — both scratchpads are gone. **E1 on a copy**: `w_down` collapses to **1** contiguous BD monotone in `(s,c,jj)` — defect 2 gone — with channel symbols **12 → 9** and compile 1.4 s vs 1.3 s, no blow-up; **E2 is inert by measurement**. **Two things gate committing to it**: E1 deletes the shared-buffer WAR chain the builder's own comment relies on, so its token graph is cross-nest and **its correctness is unverified** (emulation tests + a device run settle it); and the census binary **predates items 8 and 9**, with item 8's `air-split-l2-memref` squarely on R1's L3-offset path, so **re-take the census against the integrated build first**  **`[2026-08-12]` E1 LANDED AND THE GATE RAN — wall 5 is closed and wall 6 is confirmed on hardware.** The re-taken census against the integrated build (items 8 + 9) is **byte-identical** to the pre-integration one, so neither compiler fix moves R1's runtime sequence and doc 37's stated worry retires. E1 folds `w_down` **13 → 1** contiguous monotone BD; `check-air-mlir` 494/0; STRUCT arm PASS on both binaries against all four pinned literals. **The numeric arm then timed out** (`ERT_CMD_STATE_TIMEOUT`, `fatal_error_type 0x0`, devq 259) — **predicted in advance by item 18's lock-conservation bound**, which is arm-independent, so E1 is correct and insufficient. **The recipe is re-parked** on wall 6, its re-arm deliberately left uncommitted so the tree does not claim an armed gate. SPECS atol stays **PROVISIONAL**; still no resident-tail latency or byte figure on hardware. Note for whoever takes wall 6: 31a's 84.0 → 16.5 MiB is a whole-layer @1024 figure while R1 prices one 64-row band, so this gate cannot by itself produce that number | Wall 6 is item 18; E1 is landed and needs no rework | [37](37-wall-5-order-seam-design.md) · [31 §Wall 5](31-fused-resident-tail.md) · [23 §4](23-rules-and-open-items.md) |
 | ~~**8**~~ | **DONE `[2026-08-12]` — the map is sized from the map it composes, and the fix uncovered two more hardcodes of the same class.** As filed: `air-split-l2-memref` lifted the expression out of the offset's existing `affine.apply` — whose map may reference N symbols — then rebuilt the replacement as `AffineMap::get(0, 1, add)`, naming symbol positions the map did not declare, so a two-level nest over an L3 operand tripped `willBeValidAffineMap` and SIGABRTed (**exit 134, 5/5**). All three sites now delegate to one `composeAffineMap` helper that shapes the map from the original and widens it to what the composed expression actually references, keeping `getNumInputs()` equal to the operand count. **Which site fires was MEASURED**: instrumenting all three shows the reproducer hits the *third* (`composeAffineExprFromSizes`), not the first as the composition path suggests — and the existing corpus exercises all three (18 / 6 / 128), so one-symbol behaviour stays covered. **Two further defects of the same class, found while fixing**: the `replace(...)` calls passed literal `(0,1)`/`(1,0)` result counts, which would drop a trailing symbol and abort on their own; and the `air.execute`-wrapped path bound operands via `getUsedValuesDefinedAbove`, which has no ordering guarantee against the wrapped apply's symbols — harmless at one symbol and **wrong addresses at two**. That one was latent and silent, the same class as item 9. **Verified**: regression lit covering both composition paths and both operand paths, negative control checked **per case** against the preserved unpatched binary (134 each, 0 patched); `check-air-mlir` **493/0** against a 492 baseline, and the same suite with only `air-opt` swapped for the unfixed binary gives 480/13 with the set-diff showing exactly one status change and **zero regressions**. Output checked semantically rather than for absence of a crash — both launch IVs survive and the overlap stride matches the pre-existing `test9` golden with only the base widened | done | [31b §3.4](31b-r2-order-seam.md) |
 | ~~**9**~~ | **DONE `[2026-08-12]` — the silent shrink is fixed with a real extent computation, and it moves shipped output.** As filed: `pass_029` rewrote `memref<12288xbf16, 2>` → `<3072>` while leaving the gets at 3072/6144/9216, reading past the end with **no error, no warning** — the frozen-BD trap's class ([31b §3.2](31b-r2-order-seam.md)). **Root cause**: `getDataAccessShapeFromMemcpyOp` bounded the buffer from sizes and strides alone — offsets were used *only* to test emptiness — so N gets of equal volume at different offsets all measured as one get. **Fix is outcome (a), not a blanket refusal**: a new extent function computes `offset + size` per dimension, so a band whose gets reach only 6144 still shrinks to **6144**; declining with a diagnostic is reserved for offsets that cannot be classified. Offsets are classified against what the shrinkage fix-up actually does, so the two cannot drift. A latent out-of-bounds read on the empty offsets vector was fixed alongside. **Verified**: regression lit `shrink_memref_multi_get_band.mlir` (4 cases) **verified failing** on the unpatched binary at three distinct CHECK lines *and* on `-verify-diagnostics`; **481 pass / 12 fail against an unpatched 480 / 12** in the same isolated tree, identical failure list (the 12 are an absent `aircc` in an uninstalled tree; 480 + 12 = the main tree's 492). **Two consequences, recorded not absorbed**: five allocs in `loop_fusion.mlir`'s *output* stop shrinking — the same defect on channel ops, pinned by no CHECK, so it moved silently before and would have again (no shipped design depends on it: zero offset-bearing `ChannelGet` in `programming_examples/`) — and **`probe_r2_order_seam.py --arm row_band` now fails BY DESIGN**, since its clause E asserts that control must stay broken. **So 31b's reason for excluding literal-offset L1 bands is gone and R2's design should be re-derived, not left to inherit the better option silently** | done | [31b §3.2](31b-r2-order-seam.md) |
 | ~~**10**~~ | **DONE `[2026-08-12]` — the census counts the rule now, and it can fail.** As filed: `ffn_resident_structure.py`'s column census counted `shim→core` flows only and read **1** for a column carrying **2** of the 2-per-column budget ([31b §3.6](31b-r2-order-seam.md); the row used to cite §7.1, which is the `-D`-symbol section — the measurement is §3.6). Widening it to both flow kinds was **necessary but not sufficient**, and that is the finding: over budget AIR does **not** emit a third circuit flow, it converts the design to **packet** flows sharing one shim queue, so a census counting surviving *ports* reads **0** on an over-budget column — blind exactly when it is needed. The clause now counts per-column MM2S **demand**, circuit flows by distinct source port (a broadcast is one stream) **plus one per packet-multiplexed stream. Re-derived, not carried**: `build-xrt` aircc **2026-08-11 13:28:03** (sha256 `5cb08407`, carrying 6a + its review round + 6b) gives **7 of 16 ports, worst column 2** — column for column identical to 31b's pre-6b table, and `4 shim→core + 3 shim→memtile` reproduces. Pinned in the verdict line (`shim MM2S 7/16 worst column 2`) and FileCheck-verified green on real output. **The negative control is inside the gate**: three herd-direct L3 operands per column → census reads 3, refuses; measured 0 inbound `aie.flow` and 12 `aie.packet_flow`. Tamper-verified both ways — the `shim→core`-only revert moves the literal to `4/16 worst column 1` (FileCheck red) *and* fails the control; the circuit-only revert leaves the literal at 7/16 and is caught by the control alone. Probe twin and `--arm shim` recount independently to the same figures | done | [31b §3.6](31b-r2-order-seam.md) |
@@ -409,30 +453,37 @@ literal case trap 0's closing sentence forbids. It cannot be fixed the same way 
 2. **Read [03 §The taxonomy and §The vocabulary](03-measurement-model.md)** if you have not. The
    four modes isolate reconfiguration cost against DRAM traffic, and the knobs-and-costs map is
    the axis every measurement here is reported on.
-3. **Then pick from the queue above**, where the row order carries a recommendation: **25** (the
-   balance instrument) is highest-leverage and blocks nothing; **23** (R1's *deterministic* wrong
-   answer) is the cheapest R1 question; **26** measures whether the mapping space needs a search at
-   all; **24** is a small re-measurement; **21** (wall 7's race) is large and its target is itself in
-   question; **12** is Phase G / Goal 1 / Goal 2, all three scoped and each a decision rather than a
-   task.
-4. **If you take the resident tail, read three things first.** [31b](31b-r2-order-seam.md) designs
-   the R2 increment — but note **both of its design constraints dissolved** when items 8 and 9 landed,
-   so it must be **re-derived rather than inherited**. [45](45-research-flat.md) argues the ordering
-   constraint R1 kept failing on is a property of the loop structure *upstream*, so **check whether
-   `air-fuse-pipeline-launches` can carry that shape before writing a scheduling pass**. And
+3. **If you are about to verify a COMPILER change, read trap 5 before you build.** Two complete
+   21-leg hardware runs on 2026-08-12 produced green-looking logs against a compiler nine hours
+   stale, and byte-identical output against a recorded pre-fix run was the only tell. Any job
+   verifying a compiler change must print the resolved `aircc` path and sha256 **from python** and
+   **refuse to run** on a mismatch.
+4. **Then pick from the queue above**, whose preamble carries the recommendation: **28(b)**'s
+   traversal fix is one line and fully diagnosed; **28(a)** is the wrong-answer half and larger;
+   **11(b)** wants an exclusive window rather than engineering; **12** is Phase G / Goal 1 / Goal 2,
+   all scoped and each a decision rather than a task; **30** is latent.
+5. **If you take the resident tail, read four things first.** The **R1 section above** — its box is
+   `herd_x = 1`, `down_K ≤ 4`, and **there is currently no known route to the gate at `herd_x ≥ 2`**.
+   [52](52-wall-7-race.md) for why (§8's impossibility proof, §12's traversal gap).
+   [31b](31b-r2-order-seam.md) designs the R2 increment — but **both of its design constraints
+   dissolved** when items 8 and 9 landed, so it must be **re-derived rather than inherited**. And
    [38](38-iron-encoder-pipeline-reference.md) is a **working fused BERT layer in `~/iron`** whose
-   answer to our four walls is that **it never creates a second segment**.
-5. ~~**Housekeeping the operator owes, whenever an exclusive window opens**: `ninja -C build-xrt
-   install`~~ **`[2026-08-12]` DONE — the install is refreshed and verified by artifact** (cold-start
-   section above), so probes and models resolve the 2026-08-11 compiler. Item 11(b)'s plotting
-   packages still want an exclusive window; that half is unchanged.
+   answer to our walls is that **it never creates a second segment** — which, given that the last two
+   walls were general compiler defects rather than composition defects, is worth re-reading with that
+   in mind.
+6. **Housekeeping**: the install is current (19:41 on 2026-08-12, carrying all three of that evening's
+   compiler changes). Item 11(b)'s plotting packages still want an exclusive window. One worktree
+   remains — `agent-ae4f6abdc09902a77`, H8's, fully merged but holding an untracked `build-h8/`; it
+   was left rather than deleted because the build directory is not mine to discard.
 
-Closed and not worth re-opening: items **1** (offload shared path gates at 4096; ten models 10/10
-under the new install), **1b** (the machine anomaly — it was the pmode), **2**, **4**, **5**
-(2026-08-10), **3**, **6a**, **6b** and **7** (2026-08-11, itemized above).
+Closed and not worth re-opening: items **1** (offload shared path gates at 4096), **1b** (the machine
+anomaly — it was the pmode), **2**, **4**, **5**, **3**, **6a**, **6b**, **7**, **8**, **9**, **10**,
+**13**, **14**, **15**, **16**, **17**, **18**, **19**, **20**, **21**, **22**, **23**, **24**, **25**,
+**26**, **27** and **29** — every one itemized in its own struck row above, with the evidence chain
+attached. **29 is closed NEGATIVE and is the one to actually read** before proposing anything in that
+area: it proves a fix cannot exist rather than reporting that one was not found.
 
-`[2026-08-09]` **`coarse` came off this list**, which is what makes item 1 the front of the queue —
-see [30](30-coarse-cells-built.md). Two notes from that work that are not captured anywhere else:
+`[2026-08-09]` **`coarse` came off this list** — see [30](30-coarse-cells-built.md). Two notes from that work that are not captured anywhere else:
 the `prepare_fused` half of the extraction its spec asked for was **deliberately not done** (no cell
 at 2048+ uses a stitched tail because none *builds* there, so it would have churned a gated mode for
 a composition nothing calls), and items 4 and 5 above are both things the phase found rather than
@@ -477,7 +528,7 @@ Every earlier cross-mode comparison, [25](25-first-study-result-sequence-ladder.
 differed in attention *placement* as well as in the variable under study, and was confounded in the
 direction of its own conclusion.
 
-### Five traps in the current state, before you measure anything
+### Six traps in the current state, before you measure anything
 
 **0. `[2026-08-11]` The NPU power mode is a measurement condition, and it silently resets.**
 The 2026-08-10 "machine anomaly" (`hw_context` creation ~78–80 ms/load against ≤2.6 the day
@@ -598,6 +649,28 @@ derived from a pre-fix dump of such a module is invalid and must be re-derived. 
 pairwise semantics the crash had been hiding — heterogeneous-offset sides now keep all their
 ops instead of erasing sources against a cloned destination; doc 31 §status.) The regression is
 pinned by `mlir/test/.../fuse_channels_sibling_nests.mlir`.
+
+**5. `[2026-08-12]` A rebuilt compiler is NOT the compiler your job runs, and nothing says so.**
+`air/backend/xrt.py` shells out to the native `aircc` via `air.tools.resolve_tool`, which **prefers a
+bundled binary over PATH**: `bundled_tool_path` is `parents[2]` of `tools.py` + `/bin`. Under
+`tlenv.sh` the `air` package is `install-xrt/python/air`, whose `parents[2]` is `install-xrt/` — and
+`install-xrt/bin/aircc` **exists**, so **PATH is ignored entirely** and a `PATH=build-xrt/bin:$PATH`
+override is completely inert. Separately, `build-xrt/python/air/*.py` are **symlinks into the source
+tree**, so *there* `parents[2]` resolves to the repo root, `bin/aircc` does not exist, and it falls
+back to PATH. **So testing a freshly built compiler needs BOTH** `PYTHONPATH=…/build-xrt/python` **and**
+`PATH=…/build-xrt/bin` — either alone silently keeps the install binary.
+
+**What it cost, and the tell.** Devq **298** and **299** each ran a full, green-looking 21-leg
+verification against an `aircc` **nine hours older than the fix under test**, and reported the
+pre-fix answer as though it were a result. The tell was that the outputs were **byte-identical to a
+recorded pre-fix run** — a real-but-insufficient fix would have moved *something*.
+
+**The rule**: any job verifying a compiler change must print the resolved `aircc` path and sha256
+**from python itself** (`from air.tools import resolve_tool`; the tool is named `aircc`, **not**
+`aircc.py` — that typo made one agent's provenance line fail silently) and **refuse to run** unless it
+matches the binary under test. Do not assert it from PATH. And note the corollary: **an ELF-hash diff
+is not a valid discriminator** — the ELF is not byte-reproducible, the same class of result item 24
+found for `aie.air.mlir`, where two compiles of the *same* preset differ by ~95 lines.
 
 ### Two rules to know before designing anything
 
