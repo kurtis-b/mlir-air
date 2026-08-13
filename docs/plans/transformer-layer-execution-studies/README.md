@@ -143,10 +143,11 @@ Turbo-conditional. Bytes and counts are pmode-independent. Full chain: trap 0 be
 (26 were merged and each verified at 0 unmerged commits before removal). `build-xrt` and `install-xrt`
 both carry every fix — check with `ls -l`, **never `cmp`**, since the install rewrites RUNPATH so the
 bytes always differ. All four regression legs are green against that integrated toolchain, and **`[2026-08-12, evening]`
-all four numbers moved** — re-measured after the day's three compiler changes and six merges:
-**`check-air-mlir` 499 pass / 0 fail** (was 497), **transformer-layer suite 33 pass / 1 unsupported /
-0 fail** (was 31; the 1 is still R1's parked gate), **ten-model 10/10** (run twice this evening, once
-per compiler change), **study host suite 519/519 in 23 modules** (was 357/357 in 19).
+all four numbers moved** — re-measured after the day's **four** compiler changes and nine merges:
+**`check-air-mlir` 500 pass / 0 fail** (was 497), **transformer-layer suite 33 pass / 1 unsupported /
+0 fail** (was 31; the 1 is still R1's parked gate), **ten-model 10/10** (run **three times** this
+evening, once per compiler change — devq 305, 326, 337), **study host suite 519/519 in 23 modules**
+(was 357/357 in 19). `install-xrt` was refreshed after each change and carries the 19:41 build.
 
 **A note on that last figure, because it caught three items in one evening.** Items 25, 26 and Phase
 G's G1 each moved `run_study_host_tests.lit`'s pinned count against the *same* 357 baseline, so after
