@@ -537,6 +537,42 @@ about what the instrument is *for*.
 three granularities and their costs are as tabled, and the cheapest route is affordable. **What is
 not**: which approximation is acceptable. The loop stops here rather than picking one.
 
+> **`[2026-08-14]` THE OPERATOR CHOSE: an analytical model. `study/analytical_cost.py` is the
+> declaration-side `Demand → cost` bridge this section said did not exist.**
+>
+> It takes the fourth route rather than any of the three tabled — not "compile a representative and
+> attribute it to the points beneath", but a cost function evaluated **on the declaration**, so the
+> ~90-day / ~9-hour / ~15-minute ladder above does not apply at all. The mapping already carries the
+> one structural quantity a rate needs: `Demand.shim_mm2s_slots`, which `mapping_space` documents as
+> **placement-invariant** and which [31b §3.6](31b-r2-order-seam.md) measured as 7 of 16 on R1.
+>
+> **The traffic half is not modelled, and that is what makes it checkable.** It is 31a's lens plus
+> §6's band term, and `test_analytical_cost.py` reproduces **every figure in §6's two tables to the
+> byte** — weights once, both band-serial columns, both tail rows, both net rows, the 83-row /
+> 1.30-band crossover and the 1.52×/1.77× ratios — from a formula written off the mechanism rather
+> than transcribed from the tables. §6 derived those by hand off devq 338/340, so two independent
+> derivations agree to the byte. The discrimination control is that the floor and band-serial forms
+> must **coincide at one band and diverge from the second on**, or a formula wrong everywhere else
+> could still match every figure.
+>
+> **The rate half is the modelled part and is labelled per term.** A single-port cost is `measured`
+> ([47](47-balance-instrument.md)'s back-solve, 655,360 B / 122.81 µs → 5.336 GB/s, devq 293); a
+> multi-port one is `modelled`, because it scales that figure **linearly** while [33](33-memcpy-bandwidth-scoping.md)'s
+> imported ladder is non-monotonic and peaks at **4** shim tiles rather than 8. So the model
+> **over-credits wide designs**, and a design that wins only by occupying more ports should be read
+> as unresolved rather than as a winner.
+>
+> **Doc 47's `1,208 measured / 5 counted / 0 modelled` survives**, which was the sub-decision this
+> section flagged. The modelled numbers live in the new module's own table, and the test asserts by
+> **`ast`** that it does not import `balance_ert` — reading imports rather than searching text,
+> because the docstring says *"nothing in this file writes into `balance_ert`"* and a substring scan
+> flags the very sentence documenting the property it checks. It did, on first writing.
+>
+> **Still owed**: validation against compiled ground truth. The bridge agrees with §6's arithmetic,
+> which is a check on the *traffic*; nothing yet checks a predicted **ranking** against measured
+> latency. Rank two mappings, build both, and compare — the module's own footguns say the ratio is
+> better founded than either absolute number, and that is the claim to test.
+
 **A note on what `fused` can and cannot do dynamically.** `group_n` is baked into the kernel object
 as `-D` flags and the herd structure is baked into the xclbin, so for `fused` a workload-dependent
 mapping is **build-time selection plus a shape-keyed artifact cache**, never runtime dispatch.
