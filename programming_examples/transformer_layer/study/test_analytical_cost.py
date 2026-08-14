@@ -202,6 +202,72 @@ def test_rank_orders_cheapest_first_and_is_stable():
     assert times == sorted(times)
 
 
+# --- the measured bound on what the model may claim -------------------------
+
+
+def test_a_traffic_only_time_UNDER_predicts_measured_latency():
+    """Pinned so nobody reads an absolute `ns` from this module as a latency.
+
+    Every recorded point is 9x-21x slower than shim bandwidth alone would say,
+    because the layer is not shim-bound at these shapes.
+    """
+    ratios = []
+    for _mode, _seq, byts, meas_ms in ac.RECORDED_MODE_POINTS:
+        pred_ms = byts / ac.SHIM_PORT_BYTES_PER_NS / 1e6
+        ratios.append(meas_ms / pred_ms)
+    assert min(ratios) > 9.0, min(ratios)
+    assert max(ratios) < 21.0, max(ratios)
+
+
+def test_BYTE_ORDER_DOES_NOT_PREDICT_LATENCY_ORDER_across_modes():
+    """The bound itself, as a check rather than a paragraph.
+
+    If this ever starts passing as "the orders agree", either the modes have
+    changed or someone has taught the model reconfiguration -- and in both cases
+    the licence in the module docstring needs rewriting rather than quietly
+    widening.
+    """
+    at1024 = [p for p in ac.RECORDED_MODE_POINTS if p[1] == 1024]
+    by_bytes = [m for m, _s, _b, _l in sorted(at1024, key=lambda p: p[2])]
+    by_latency = [m for m, _s, _b, _l in sorted(at1024, key=lambda p: p[3])]
+    assert by_bytes == ["runlist", "fused", "coarse", "offload"], by_bytes
+    assert by_latency == ["fused", "coarse", "runlist", "offload"], by_latency
+    assert by_bytes != by_latency, (
+        "byte order now predicts latency order; the module's 'same structure "
+        "only' licence rests on it NOT doing so"
+    )
+
+
+def test_the_bytes_to_time_ratio_is_stable_WITHIN_a_mode():
+    """The other half: within one dispatch structure, bytes do track latency.
+
+    This is what licenses ranking mappings that share a structure, and without
+    it the test above would say the model is useless rather than bounded.
+    """
+    by_mode = {}
+    for mode, _seq, byts, meas_ms in ac.RECORDED_MODE_POINTS:
+        pred_ms = byts / ac.SHIM_PORT_BYTES_PER_NS / 1e6
+        by_mode.setdefault(mode, []).append(meas_ms / pred_ms)
+    spread = {m: max(r) / min(r) for m, r in by_mode.items()}
+
+    # The three reconfiguration-light modes hold to ~10%.
+    for mode in ("coarse", "fused", "runlist"):
+        assert spread[mode] < 1.15, f"{mode} ratio spread {spread[mode]:.2f}"
+
+    # `offload` is the outlier at 1.37, and it is the mode that pays 30
+    # hw_context loads: its bytes grow 2.25x from 512 to 1024 while its latency
+    # grows 1.64x, so the fixed reconfiguration cost dominates a larger share at
+    # the short end. Asserted as a BOUND rather than smoothed into the others,
+    # because it is the measured signature of exactly the axis this module does
+    # not model.
+    assert 1.30 < spread["offload"] < 1.45, f"offload {spread['offload']:.2f}"
+
+    # And the BETWEEN-mode spread must exceed every within-mode one, or the
+    # "same structure only" licence would be arbitrary rather than derived.
+    flat = [r for rs in by_mode.values() for r in rs]
+    assert max(flat) / min(flat) > max(spread.values())
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

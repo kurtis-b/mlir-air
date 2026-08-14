@@ -264,7 +264,7 @@
 // choice of approximation to the operator. The operator chose an analytical
 // model, and this is it.
 //
-// +17 test_analytical_cost, and the first nine are the reason to believe the
+// +20 test_analytical_cost, and the first nine are the reason to believe the
 // rest. The traffic half is NOT modelled: it is doc 31a's DRAM-crossing lens
 // plus doc 53 section 6's band-serial term, and section 6 derived those figures
 // BY HAND off measured artifacts (devq 338/340). This module reproduces every
@@ -296,4 +296,21 @@
 // and says so in the term's own provenance string.
 //
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 556/556 passed in 25 modules
+// Three of the twenty are the MEASURED BOUND on what the module may claim, and
+// they are the most useful thing in it. Against the standing four-mode
+// comparison: a traffic-only time under-predicts measured latency by 9.7x to
+// 20.3x, so an absolute `ns` from here is not a latency; and **byte order does
+// not predict latency order** -- by bytes at 1024 it is runlist < fused <
+// coarse < offload, by latency fused < coarse < runlist < offload, because
+// `runlist` moves the FEWEST bytes and pays 24-32 hw_context loads.
+// Reconfiguration is the taxonomy's other axis and this module does not model
+// it. What licenses the module at all is the third clause: the bytes-to-time
+// ratio is stable WITHIN a mode (coarse 1.02, fused 1.10, runlist 1.03) and the
+// between-mode spread is larger than any of them, so the licence is exactly
+// "same dispatch structure, different mapping". `offload` is the outlier at
+// 1.37 and is bounded rather than smoothed in, because it is the measured
+// signature of the axis being left out -- its bytes grow 2.25x from 512 to 1024
+// while its latency grows 1.64x.
+//
+// RUN: python3 %S/study/run_host_tests.py | FileCheck %s
+// CHECK: study host tests: 559/559 passed in 25 modules

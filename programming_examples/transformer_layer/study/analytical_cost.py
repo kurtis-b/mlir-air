@@ -61,6 +61,16 @@ FOOTGUNS
     - **Ranking is safer than absolute time.** Two mappings' costs share every
       modelled constant, so their RATIO is far better founded than either
       number. ``rank()`` exists so callers do the comparison this supports.
+    - **AND IT MAY ONLY RANK WITHIN ONE DISPATCH STRUCTURE.** This is measured,
+      not cautionary: on the recorded four-mode comparison the byte order at
+      1024 is ``runlist < fused < coarse < offload`` and the LATENCY order is
+      ``fused < coarse < runlist < offload``. ``runlist`` moves the fewest bytes
+      and is third slowest, because it pays 24-32 ``hw_context`` loads --
+      reconfiguration, the taxonomy's other axis, which this module does not
+      model. The bytes-to-time ratio is stable within a mode (coarse
+      13.00/12.72, runlist 20.31/19.70) and differs between modes, so the
+      licence is exactly: same structure, different mapping. See
+      ``RECORDED_MODE_POINTS`` and the test that pins it.
     - The traffic model covers the FFN tail (doc 31b's nt1 -> up -> gelu ->
       down -> nt2), which is what ``mapping_space`` enumerates. It is not a
       whole-layer model and ``whole_layer_floor`` is provided only to reproduce
@@ -97,6 +107,41 @@ SHIM_MM2S_PER_COLUMN = mapping_space.SHIM_MM2S_PER_COLUMN
 #: Rows per band. The design is band-serial: one dispatch per TILE_M rows, the
 #: band loop advancing on launch arguments (builders/ffn_resident.py FOOTGUNS).
 BAND_ROWS = mapping_space.BAND_ROWS
+
+#: `[2026-08-14]` THE MEASURED BOUND ON WHAT THIS MODULE MAY CLAIM.
+#:
+#: ``(mode, seq, bytes_transferred, avg_latency_ms)`` from the standing
+#: cross-mode comparison (results/postflip-ladder-w1, Turbo, doc 32's post-flip
+#: walk). Pinned as literals rather than read from the tree because result roots
+#: are gitignored, and a check that silently skips on a fresh clone is the
+#: failure mode this project keeps finding.
+#:
+#: Two things fall out, and both bound the model rather than support it:
+#:
+#:   1. A traffic-only time UNDER-PREDICTS by 9.7x to 20.3x. The layer is
+#:      nowhere near shim-bandwidth-bound at these shapes, so an absolute ``ns``
+#:      from this module is not a latency and must not be read as one.
+#:   2. **Byte order does NOT predict latency order.** By bytes at 1024:
+#:      runlist < fused < coarse < offload. By latency: fused < coarse <
+#:      runlist < offload. `runlist` moves the FEWEST bytes and is third
+#:      slowest, because it pays 24-32 hw_context loads -- reconfiguration,
+#:      which is the OTHER axis of the corrected taxonomy (doc 03) and which
+#:      this module does not model at all.
+#:
+#: The ratio is stable WITHIN a mode (coarse 13.00/12.72, fused 11.49/12.67,
+#: runlist 20.31/19.70) and differs BETWEEN modes. That is the whole licence
+#: this module has: it may rank mappings that share a dispatch structure, and it
+#: may not rank across structures that differ in reconfiguration.
+RECORDED_MODE_POINTS = (
+    ("coarse", 512, 22020096, 53.7),
+    ("coarse", 1024, 44040192, 105.0),
+    ("fused", 512, 21233664, 45.7),
+    ("fused", 1024, 42467328, 100.8),
+    ("offload", 512, 44040192, 109.5),
+    ("offload", 1024, 99090432, 179.9),
+    ("runlist", 512, 20447232, 77.8),
+    ("runlist", 1024, 40894464, 151.0),
+)
 
 #: Doc 31a's per-scope split puts tail-internal removable crossings at
 #: 17,301,504 B @512 and 34,603,008 B @1024 -- linear, and identical at both
