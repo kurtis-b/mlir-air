@@ -312,5 +312,28 @@
 // signature of the axis being left out -- its bytes grow 2.25x from 512 to 1024
 // while its latency grows 1.64x.
 //
+// `[2026-08-14]` 559 -> 562, no module added: compare_roots READ THE WRONG
+// MANIFEST NAME, and it made queue items 15 and 16 inert on every root the
+// Phase G runner produces. `run_profile.py` writes `results_manifest.json`
+// (its own MANIFEST_NAME); this module looked only for `manifest.json`. A
+// comparison of two real ladder walks therefore printed
+// `npu_power_mode: unknown (absent)` and the warning that the mode is "NOT
+// recoverable from its files" -- while a manifest recording `turbo`
+// (observed), plus the whole toolchain block, sat in the same directory under
+// the other name. Conditioning silently off is the exact failure item 15 was
+// built to prevent.
+//
+// NO TEST COULD HAVE CAUGHT IT, and that is the transferable part: every
+// fixture in test_compare_roots.py wrote the manifest under whatever name the
+// module read, so reader and fixture agreed with each other and with nothing
+// else. +3, and only one of them is the obvious one. The load-bearing clause
+// pins `run_profile.MANIFEST_NAME` to be IN `compare_roots.MANIFEST_NAMES` --
+// by construction, so a third rename fails here rather than going quiet again
+// -- and the control asserts a differently-named manifest is still flagged, so
+// the fallback is a list and not a wildcard.
+//
+// Found by running Phase G's "two walks into two roots", which nothing had
+// done.
+//
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 559/559 passed in 25 modules
+// CHECK: study host tests: 562/562 passed in 25 modules

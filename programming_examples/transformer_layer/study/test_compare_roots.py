@@ -74,6 +74,74 @@ def _roots(baseline_rows, candidate_rows, *, name="coarse.csv", manifests=None):
     return tmp, root / "a", root / "b"
 
 
+def _named_roots(filename, payload):
+    """Two roots whose manifest carries ``filename``. Returns (tmp, a, b)."""
+    tmp = tempfile.TemporaryDirectory()
+    root = Path(tmp.name)
+    for side in ("a", "b"):
+        (root / side).mkdir()
+        results_io.write_rows(root / side / "coarse.csv", [_row()])
+        (root / side / filename).write_text(json.dumps(payload), encoding="utf-8")
+    return tmp, root / "a", root / "b"
+
+
+def _turbo_manifest():
+    block = schema.empty_conditions()
+    block["npu_power_mode"] = "turbo"
+    block["npu_power_mode_source"] = "observed"
+    return {schema.CONDITIONS_KEY: block}
+
+
+def test_the_manifest_the_RUNNER_writes_is_the_one_this_module_reads():
+    """`[2026-08-14]` The name mismatch that made items 15 and 16 inert.
+
+    ``run_profile.py`` writes ``results_manifest.json``; this module looked only
+    for ``manifest.json``. A comparison of two real Phase G walks therefore
+    reported `npu_power_mode: unknown (absent)` and said the mode was "NOT
+    recoverable from its files", while a manifest recording `turbo` (observed)
+    sat in the same directory under the other name.
+
+    No test caught it because every fixture in this file wrote whatever the
+    module read -- which is why this one takes the filename as a parameter and
+    asserts BOTH names work.
+    """
+    for filename in ("results_manifest.json", "manifest.json"):
+        tmp, a, b = _named_roots(filename, _turbo_manifest())
+        try:
+            payload, why = compare_roots.load_manifest(a)
+            assert payload is not None, f"{filename} unreadable: {why}"
+            assert payload[schema.CONDITIONS_KEY]["npu_power_mode"] == "turbo"
+        finally:
+            tmp.cleanup()
+
+
+def test_the_runner_and_this_module_agree_on_the_name_BY_CONSTRUCTION():
+    """The pin that stops the two drifting apart again.
+
+    Asserting both names load is not enough: a future runner could rename its
+    output a third time and this module would go quiet again. So the runner's
+    own constant must appear in the list this module searches.
+    """
+    import run_profile
+
+    assert run_profile.MANIFEST_NAME in compare_roots.MANIFEST_NAMES, (
+        f"run_profile writes {run_profile.MANIFEST_NAME!r} and compare_roots "
+        f"searches {compare_roots.MANIFEST_NAMES!r} -- the reader would go "
+        "silently unconditioned on every root the runner produces"
+    )
+
+
+def test_a_root_with_a_DIFFERENT_name_is_still_flagged():
+    """The control: the fallback must not be a wildcard."""
+    tmp, a, _b = _named_roots("some_other_manifest.json", _turbo_manifest())
+    try:
+        payload, why = compare_roots.load_manifest(a)
+        assert payload is None
+        assert "results_manifest.json or manifest.json" in why
+    finally:
+        tmp.cleanup()
+
+
 def test_relative_percent_handles_a_zero_baseline_without_dividing():
     assert compare_roots.relative_percent(0.0, 0.0) is None
     assert compare_roots.relative_percent(0.0, 1.0) == float("inf")
@@ -393,7 +461,7 @@ def test_a_root_with_no_manifest_at_all_flags_rather_than_skipping_silently():
     text = report.render()
     assert report.failures == 0, text
     assert report.warnings >= 2  # one per side
-    assert "no manifest.json in the root" in text
+    assert "no results_manifest.json or manifest.json in the root" in text
     assert "=== measurement condition ===" in text
 
 
@@ -422,7 +490,9 @@ def test_a_refused_comparison_still_reports_the_pmode_independent_half():
 
 
 def test_an_unreadable_manifest_is_a_failure_and_an_unknown_condition():
-    tmp, a, b = _roots([_row()], [_row()], manifests=(_manifest("turbo"), _manifest("turbo")))
+    tmp, a, b = _roots(
+        [_row()], [_row()], manifests=(_manifest("turbo"), _manifest("turbo"))
+    )
     with tmp:
         (b / "manifest.json").write_text("{not json", encoding="utf-8")
         report = compare_roots.compare_roots(a, b, ["coarse.csv"])
@@ -453,9 +523,7 @@ def test_there_is_no_way_to_defeat_the_pmode_guard():
                 continue
             raise AssertionError(f"{bypass} did not raise; the guard has a bypass")
         # And no environment variable is consulted anywhere in the module.
-        assert "environ" not in Path(compare_roots.__file__).read_text(
-            encoding="utf-8"
-        )
+        assert "environ" not in Path(compare_roots.__file__).read_text(encoding="utf-8")
         # The refusal stands on the honest invocation.
         assert (
             compare_roots.main(
@@ -558,7 +626,7 @@ def test_a_toolchain_mismatch_flags_and_does_NOT_refuse():
 
 
 def test_a_toolchain_mismatch_names_the_field_that_moved():
-    """"the toolchain differs" is not actionable; naming the layer is."""
+    """ "the toolchain differs" is not actionable; naming the layer is."""
     tmp, a, b = _tool_roots(_tc(), _tc(peano_version="20.0.0.2026010101+beef"))
     with tmp:
         text = compare_roots.compare_roots(a, b, ["coarse.csv"]).render()
@@ -593,9 +661,7 @@ def test_THE_SAME_DRIFT_fails_identically_at_matched_and_mismatched_toolchains()
 
 def test_a_toolchain_mismatch_never_splices_the_gate():
     """`[SPLICED]` belongs to the pmode refusal alone; this guard must not reach it."""
-    tmp, a, b = _tool_roots(
-        _tc(), _tc(air_resolution="install-xrt"), drift=40.0
-    )
+    tmp, a, b = _tool_roots(_tc(), _tc(air_resolution="install-xrt"), drift=40.0)
     with tmp:
         text = compare_roots.compare_roots(a, b, ["coarse.csv"]).render()
     assert "[GATE]" in text, text
@@ -666,7 +732,7 @@ def test_a_root_with_no_manifest_at_all_is_flagged_on_the_toolchain_axis_too():
         report = compare_roots.compare_roots(a, b, ["coarse.csv"])
     text = report.render()
     assert "=== build condition (toolchain) ===" in text, text
-    assert "no manifest.json in the root" in text, text
+    assert "no results_manifest.json or manifest.json in the root" in text, text
     assert report.warnings >= 2, text
 
 

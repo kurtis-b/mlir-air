@@ -299,6 +299,35 @@ def row_key(row: dict) -> tuple[str, ...]:
     return tuple(str(row.get(field, "")).strip() for field in KEY_FIELDS)
 
 
+#: The manifest filenames a root may carry, newest writer first.
+#:
+#: `[2026-08-14]` THIS MODULE READ THE WRONG NAME, and it made items 15 and 16
+#: inert on every root the Phase G runner produces. ``run_profile.py`` writes
+#: ``results_manifest.json`` (its ``MANIFEST_NAME``) and this module looked only
+#: for ``manifest.json``, so a comparison of two real walks reported
+#: ``npu_power_mode: unknown (absent)`` and warned that the mode was "NOT
+#: recoverable from its files" -- while a fully populated manifest recording
+#: ``turbo`` (observed), plus the whole toolchain block, sat in the same
+#: directory under the other name.
+#:
+#: Found by running the two-walk comparison for the first time (Phase G's "two
+#: walks into two roots", which nothing had done). It is the same shape as item
+#: 16, one level over: that item found the toolchain diff comparing NOTHING
+#: because the writer never wrote the block; this is the reader and the writer
+#: disagreeing about the FILENAME, which no test caught because every test built
+#: its own fixture and named it whatever it read.
+MANIFEST_NAMES = ("results_manifest.json", "manifest.json")
+
+
+def manifest_path(root: Path) -> Path | None:
+    """The first manifest name this root actually has, or None."""
+    for name in MANIFEST_NAMES:
+        path = root / name
+        if path.exists():
+            return path
+    return None
+
+
 def load_manifest(root: Path) -> tuple[dict | None, str | None]:
     """``(payload, why_not)`` for one root's manifest. Never raises.
 
@@ -306,15 +335,15 @@ def load_manifest(root: Path) -> tuple[dict | None, str | None]:
     their own vocabulary: the provenance diff wants "there is nothing to diff"
     and the condition guard wants "the measurement condition cannot be read".
     """
-    path = root / "manifest.json"
-    if not path.exists():
-        return None, "no manifest.json in the root"
+    path = manifest_path(root)
+    if path is None:
+        return None, f"no {' or '.join(MANIFEST_NAMES)} in the root"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
-        return None, f"its manifest.json could not be read ({e})"
+        return None, f"its {path.name} could not be read ({e})"
     if not isinstance(payload, dict):
-        return None, "its manifest.json is not a JSON object"
+        return None, f"its {path.name} is not a JSON object"
     return payload, None
 
 
@@ -528,9 +557,10 @@ def compare_toolchain(report: Report, baseline: Path, candidate: Path) -> None:
 
 def compare_manifests(report: Report, baseline: Path, candidate: Path) -> None:
     """Provenance first: a toolchain change explains drift that code does not."""
-    report.say("\n=== manifest.json ===")
-    left, right = baseline / "manifest.json", candidate / "manifest.json"
-    if not left.exists() or not right.exists():
+    left, right = manifest_path(baseline), manifest_path(candidate)
+    seen = sorted({p.name for p in (left, right) if p is not None})
+    report.say(f"\n=== {' / '.join(seen) if seen else MANIFEST_NAMES[0]} ===")
+    if left is None or right is None:
         report.say("  SKIP (missing on one side)")
         return
     a, left_why = load_manifest(baseline)
