@@ -24,10 +24,21 @@ WHY DISCOVERY RATHER THAN A LIST
     that quietly shrinks fails the gate instead of passing it.
 
 NO FRAMEWORK
-    pytest is not installed in the sandbox venv, and installing it while a gate
-    or a measurement run is live is the hazard doc 09 records. These modules are
-    written to be collectible by pytest unchanged if it ever lands -- ``test_*``
-    functions, plain ``assert`` -- but nothing here depends on it.
+    These modules are collectible by pytest unchanged -- ``test_*`` functions,
+    plain ``assert`` -- but nothing here depends on it.
+
+    `[2026-08-14]` pytest IS now installed (queue item 11(b) installed it beside
+    matplotlib/pandas/seaborn in an exclusive window), so the original reason --
+    "it is not installed" -- no longer holds. The choice does. Installing into
+    the venv the gates run from is the hazard doc 09 records, and a suite that
+    only runs under a framework is a suite that stops running the moment that
+    framework is inconvenient to have present. This runner needs a bare
+    interpreter and stays that way.
+
+    One module does need a package: ``test_plots.py`` imports ``plots.py``,
+    which imports matplotlib. That is a dependency ``study/requirements.txt``
+    has declared since Phase F, and its absence surfaces as the import FAILURE
+    below rather than as a silent skip.
 
 FOOTGUNS
     - **Each module is imported, so its ``main()`` does not run**; the functions

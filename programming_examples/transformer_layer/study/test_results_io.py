@@ -18,6 +18,7 @@ process and rewrites them as one CSV per mode, which is the first caller to
 compose the pair -- and it failed on the first rung. Hence this module.
 """
 
+import csv
 import os
 import sys
 import tempfile
@@ -120,6 +121,105 @@ def test_a_foreign_header_is_refused_and_points_at_the_adapter():
             assert "iron_adapter" in str(e)
         else:
             raise AssertionError("a non-schema header must be refused")
+
+
+def _v1_header():
+    """The 65 v1 names: every current field except the five v2 appended."""
+    names = [f.name for f in schema.fields_for("results")]
+    return names[: len(names) - 5]
+
+
+def test_the_v2_columns_really_are_appended_at_the_end():
+    """``read_rows_compatible`` rests on schema.py's claim that v2's columns are
+    appended AFTER every v1 one. If a later version ever inserts a column in the
+    middle, the prefix rule silently starts misreading archived trees -- so the
+    property is pinned here rather than trusted."""
+    names = [f.name for f in schema.fields_for("results")]
+    assert names[-5:] == [
+        "device_ms",
+        "sync_ms",
+        "host_cpu_ms",
+        "context_loads",
+        "kernel_attaches",
+    ], names[-5:]
+
+
+def test_compatible_read_accepts_a_v1_file_and_fills_none():
+    """Fifteen of this project's nineteen result trees are v1 and are not
+    re-measurable at will. The absent columns must come back None, never 0."""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "v1.csv"
+        names = _v1_header()
+        with path.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=names)
+            w.writeheader()
+            row = {n: "" for n in names}
+            row["schema_version"] = 1
+            row["run_status"] = "passed"
+            row["avg_latency_ms"] = "12.5"
+            w.writerow(row)
+        rows = results_io.read_rows_compatible(path)
+    assert len(rows) == 1
+    assert rows[0]["avg_latency_ms"] == "12.5"
+    assert rows[0]["device_ms"] is None, "an absent column must not read as 0"
+    assert rows[0]["context_loads"] is None
+
+
+def test_the_exact_reader_still_refuses_that_same_v1_file():
+    """The control: writers stay strict. If ``read_rows`` also accepted v1 this
+    whole function would be pointless, and a v1-shaped row could be written."""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "v1.csv"
+        names = _v1_header()
+        with path.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=names)
+            w.writeheader()
+            w.writerow({n: ("1" if n == "schema_version" else "") for n in names})
+        try:
+            results_io.read_rows(path)
+        except ValueError as e:
+            assert "does not match schema" in str(e)
+        else:
+            raise AssertionError("the exact reader must still refuse a v1 header")
+
+
+def test_compatible_read_refuses_a_REORDERED_header():
+    """A prefix is not the same as a subset. Swapping two columns keeps the name
+    set identical and changes every value's meaning."""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "swapped.csv"
+        names = _v1_header()
+        names[3], names[4] = names[4], names[3]
+        with path.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=names)
+            w.writeheader()
+            w.writerow({n: ("1" if n == "schema_version" else "") for n in names})
+        try:
+            results_io.read_rows_compatible(path)
+        except ValueError as e:
+            assert "not a prefix" in str(e)
+        else:
+            raise AssertionError("a reordered header must be refused")
+
+
+def test_compatible_read_refuses_a_NEWER_version():
+    """Reading a v3 file here would silently drop columns this code cannot see."""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "future.csv"
+        rows = [schema.empty_row("results")]
+        rows[0]["run_status"] = "passed"
+        rows[0]["execution_mode"] = "hybrid"
+        results_io.write_rows(path, rows)
+        text = path.read_text(encoding="utf-8").splitlines()
+        head, first = text[0], text[1].split(",")
+        first[0] = str(schema.SCHEMA_VERSION + 1)
+        path.write_text(head + "\n" + ",".join(first) + "\n", encoding="utf-8")
+        try:
+            results_io.read_rows_compatible(path)
+        except ValueError as e:
+            assert "NEWER" in str(e)
+        else:
+            raise AssertionError("a newer schema version must be refused")
 
 
 def main():

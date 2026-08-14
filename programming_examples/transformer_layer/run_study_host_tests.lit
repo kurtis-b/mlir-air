@@ -12,11 +12,28 @@
 // No NPU, no XRT, no compilation and no framework. The study tier's schema,
 // results I/O, smoke gate, manifest, iron adapter and ladder shape override are
 // all pure host logic, so they gate here rather than waiting for a device.
-// pytest is not installed in the sandbox venv and installing it while a gate or
-// a measurement run is live is the hazard doc 09 records, so these modules run
-// as plain scripts -- written to be collectible by pytest unchanged if it ever
-// lands, but depending on none of it. Same choice, and the same reasoning, as
+// These modules run as plain scripts -- collectible by pytest unchanged, but
+// depending on none of it. Same choice, and the same reasoning, as
 // run_block_cache_tests.lit.
+//
+// `[2026-08-14]` The reason given here used to be "pytest is not installed in
+// the sandbox venv", and that is no longer true: queue item 11(b) installed
+// matplotlib, pandas, seaborn and pytest in an exclusive window. The CHOICE to
+// use no framework is unchanged, and the second half of the original sentence
+// is why -- installing into the venv the gates run from is a hazard whenever a
+// gate or a measurement is live, so no module here may depend on a TEST
+// framework being present.
+//
+// One dependency IS now real and is called out rather than hidden:
+// `test_plots.py` imports `study/plots.py`, which imports matplotlib at module
+// level (it must select the Agg backend before pyplot, since gates run with no
+// display). `study/requirements.txt` has declared matplotlib for this tier
+// since Phase F, so this is a declared dependency finally being installed, not
+// a new one. On a host without it the suite does NOT silently shrink: the
+// runner reports `FAILURE test_plots.py: import failed: ImportError`, exits
+// non-zero, AND the total below stops matching -- measured at 524/525, so both
+// signals fire independently. That is the documented behaviour ("a module that
+// fails to import is a failure, not a skip"), and it is the right one here.
 //
 // THE COUNT IS PINNED ON PURPOSE. Discovery alone cannot catch a test that
 // stops being *defined*: delete a test function and a globbing runner happily
@@ -195,5 +212,49 @@
 // is present and now checks that the PINNED METHOD is, which is the check that
 // would have caught this class in the first place.
 //
+// `[2026-08-14]` 519 -> 539 and 23 -> 24 modules, queue item 11(b): the figure
+// tier (study/plots.py). The module count moves because this is a tier added,
+// not a test file edited -- the same signal the item-26 note above relies on.
+//
+// +15 test_plots, and the reason this module exists is that a plot is the one
+// artifact here that is read by LOOKING at it: a wrong one does not raise, it
+// renders. Fifteen of the nineteen recorded result trees predate schema v2, so
+// their decomposition columns are empty, and the natural implementation stacks
+// them as zero -- a chart that looks measured, showing every mode's
+// reconfiguration cost as nothing, which is the exact opposite of what
+// `offload` exists to demonstrate. Both v2 figures REFUSE such a tree by typed
+// failure and `regenerate` reports the skip; the v2 case renders the same two
+// figures, so the refusal is not a function that always refuses.
+//
+// The pairs are the point. An ABSENT component is named rather than drawn, with
+// a MEASURED ZERO as its control (schema.py: `host_cpu_ms` 0.0 for
+// fused/coarse/runlist is a measurement -- those modes instrument host compute
+// and ran none -- while an empty field means the mode reported no such
+// component, and fabricating a zero for it is forbidden). A NEGATIVE remainder
+// is flagged as the defect it is, with a large POSITIVE remainder as its
+// control, because `device_ms.timing` states the three components are disjoint
+// and "do NOT sum to avg_latency_ms" -- on the post-flip trees the remainder
+// runs 37-47% for `offload` and 84-89% for `fused`, and that is uninstrumented
+// time, not lost device time. Two injected defects in plots.py are rejected by
+// 7 and 10 of the 15.
+//
+// +5 test_results_io for `read_rows_compatible`, which is what made the v1
+// trees readable at all. `read_rows` is exact by design and every WRITER stays
+// on it; the analysis tier reads archived trees, and the v2 bump had silently
+// taken `ladder_report` out on all fifteen -- including `j3_ladder_full`, the
+// nine-rung ladder, whose own report.md that module wrote on 2026-08-08 and
+// could not have regenerated the day after v2 landed. The rule is a STRICT
+// PREFIX and the tests pin all four edges: a v1 file reads with the absent
+// columns as None (never 0), the exact reader still refuses that same file, a
+// REORDERED header is refused (a prefix is not a subset -- swapping two columns
+// keeps the name set identical and changes every value's meaning), and a NEWER
+// version is refused. One more pins the schema property the whole scheme rests
+// on: that v2's five columns really are appended at the END, so a later version
+// inserting a column in the middle fails here instead of silently misreading
+// every archived tree.
+//
+// This number was MEASURED on the tree after both files landed, not obtained by
+// adding 15 and 5 to 519.
+//
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 519/519 passed in 23 modules
+// CHECK: study host tests: 539/539 passed in 24 modules

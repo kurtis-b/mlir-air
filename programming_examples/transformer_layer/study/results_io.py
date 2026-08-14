@@ -111,3 +111,74 @@ def read_rows(path: str | Path, table: str = "results") -> list[dict]:
                 f"is v{schema.SCHEMA_VERSION}"
             )
     return rows
+
+
+def read_rows_compatible(path: str | Path, table: str = "results") -> list[dict]:
+    """Read a CSV written by THIS schema or an older one. Analysis tier only.
+
+    ``read_rows`` is exact by design and every writer must stay on it: a
+    measurement that cannot be written at the current version is a bug, and
+    accepting a near-miss header is how a column silently changes meaning.
+
+    Reading an ARCHIVED tree is the other case. ``schema.py`` states that v2's
+    five columns "are appended AFTER all of them, so a v1-shaped reader keeps
+    working column for column" -- a property deliberately engineered and, until
+    this function, never used. Fifteen of this project's nineteen result trees
+    are v1, including the nine-rung ladder and doc 30's coarse-cell result, and
+    they are not re-measurable at will.
+
+    So the rule is a STRICT PREFIX and nothing looser: the file's header must be
+    exactly the first N names of the current table, in order. Columns the file
+    predates are filled with ``None`` -- which every caller must then treat as
+    "not measured", never as zero. A reordered header, an unknown column, or a
+    version NEWER than this module still raises, unchanged.
+
+    FOOTGUN
+        The ``None`` fill is indistinguishable from a v2 row whose measurement
+        failed, and that is intentional -- both mean "no number here". A caller
+        that needs to tell an old tree from a failed measurement must read
+        ``schema_version``, not the absent column.
+    """
+    expected = [f.name for f in schema.fields_for(table)]
+    with Path(path).open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        header = reader.fieldnames or []
+        if header != expected[: len(header)]:
+            missing = sorted(set(expected) - set(header))
+            extra = sorted(set(header) - set(expected))
+            raise ValueError(
+                f"{path} header is not a prefix of schema v{schema.SCHEMA_VERSION} "
+                f"{table} (missing={missing}, extra={extra}). Only columns "
+                "appended at the end are readable across versions; a reordered "
+                "or foreign header is not. Read it through iron_adapter if it "
+                "came from iron."
+            )
+        absent = expected[len(header) :]
+        rows = []
+        for record in reader:
+            row = {k: (v if v != "" else None) for k, v in record.items()}
+            row.update({name: None for name in absent})
+            rows.append(row)
+
+    for row in rows:
+        if row.get("schema_version") is not None:
+            try:
+                row["schema_version"] = int(row["schema_version"])
+            except (TypeError, ValueError):
+                pass
+
+    for i, row in enumerate(rows):
+        version = row.get("schema_version")
+        try:
+            numeric = int(version)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{path} row {i} carries an unreadable schema_version {version!r}"
+            ) from None
+        if numeric > schema.SCHEMA_VERSION:
+            raise ValueError(
+                f"{path} row {i} carries schema_version {numeric}, NEWER than "
+                f"this module's v{schema.SCHEMA_VERSION}. Reading it here would "
+                "drop columns this code does not know about."
+            )
+    return rows

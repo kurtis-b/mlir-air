@@ -338,12 +338,26 @@ A completed results root is ~2.4 GB.
 
 1. ~~Define and implement the versioned study schema~~ **done** — `study/schema.py`.
 2. ~~Resolve the resource-usage artifact question~~ **done** — `study/aircc_artifacts.py`.
-3. Port the ~19k-line infrastructure tier, applying the convention rules. ~~**Partly blocked, and
-   the split is measured**~~ **`[2026-08-11]` The PORTABLE half is done; only the plot/analysis
-   tier is left, and it is still blocked on an install that must not happen beside a live gate.**
-   See §Item 3's portable half below. `matplotlib`, `pandas` and `seaborn` are absent, and
-   installing them into the sandbox venv while a gate or a measurement run is live is the hazard
-   item 6 records.
+3. Port the ~19k-line infrastructure tier, applying the convention rules. ~~**Partly blocked**~~
+   **`[2026-08-14]` DONE except `memcpy_bandwidth`, which is not a port.** The portable half landed
+   `[2026-08-11]`; the plot/analysis tier landed 2026-08-14 as `study/plots.py` (queue item 11(b)).
+   `matplotlib`, `pandas`, `seaborn` and `pytest` are installed — in an exclusive window with the
+   device queue idle, under a **full-freeze constraints file** rather than the `--no-deps` item 6
+   suggests, because constraints make pip *fail* instead of moving a package the ten shipped models
+   stand on. Before/after `pip freeze` diff empty; `make verify` PASS afterwards.
+
+   **The figure tier is a rewrite, not a port, and iron's own modules are why.** iron's five
+   `plot_*.py` read `results_all_power.csv` / `tuning_all_power.csv` and an `execution_mode`
+   vocabulary predating the taxonomy correction, and none of them can draw a cost decomposition
+   because iron's schema has nowhere to put one. `study/plots.py` draws latency, DRAM traffic, the
+   v2 decomposition and the reconfiguration counters, and calls `ladder_report.load` rather than
+   parsing the tree again so the two tiers cannot disagree about which rungs passed.
+
+   **`roofline/run.py` is deliberately still unported**, and that is 11(a)'s finding rather than an
+   omission: it makes `peak_bandwidth_gbps` the memory roof's slope and `memcpy_bandwidth` is its
+   only empirical input, so porting it now would mean importing iron's 64.3–70.9 GB/s band as a
+   constant wearing a measurement's label. `memcpy_bandwidth` needs a multi-core AIR memcpy operator
+   that does not exist.
 4. ~~Retarget the five device-touching modules.~~ **`[2026-08-11]` Four of five.** Two were
    already retargeted under other names (`run_mode.py` + `pattern/`; `sweep/registry_sweep.py`),
    `resource_usage` and the component aggregate landed today, and `memcpy_bandwidth` is open

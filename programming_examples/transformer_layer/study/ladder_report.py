@@ -69,13 +69,21 @@ _STRUCT = [
 
 
 def load(root: str, modes: list[str]) -> dict[str, list[dict]]:
-    """{mode: [rows sorted by seq_len]}, skipping modes with no CSV."""
+    """{mode: [rows sorted by seq_len]}, skipping modes with no CSV.
+
+    Reads through ``read_rows_compatible``: this is the ANALYSIS tier, and its
+    inputs are archived trees. `[2026-08-14]` The v2 bump silently took this
+    module out on every v1 tree -- including ``j3_ladder_full``, the nine-rung
+    ladder, whose own ``report.md`` this module wrote on 2026-08-08 and could
+    not have regenerated the day after v2 landed. Writers stay on the exact
+    ``read_rows``; nothing about reporting on a finished measurement needs it.
+    """
     out = {}
     for mode in modes:
         path = os.path.join(root, f"{mode}.csv")
         if not os.path.isfile(path):
             continue
-        rows = results_io.read_rows(path)
+        rows = results_io.read_rows_compatible(path)
         for row in rows:
             row["_seq"] = int(row["seq_len"])
             row["_ok"] = row["run_status"] == "passed"
