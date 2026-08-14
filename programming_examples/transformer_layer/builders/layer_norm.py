@@ -63,9 +63,67 @@ LN_VEC_LEN = 16
 
 KERNEL_OBJ = "layer_norm.o"
 
+# AIE2P data memory per core, matching addnorm.py and ffn_resident.py.
+L1_BYTES = 64 * 1024
+
+# The historical default, and the ceiling the derivation may never exceed --
+# see ``derive_rows_per_call``.
+DEFAULT_ROWS_PER_CALL = 8
+
+
+def derive_rows_per_call(
+    rows, cols, np_dtype=bfloat16, herd_x=8, ceiling=DEFAULT_ROWS_PER_CALL
+):
+    """The largest legal ``rows_per_call`` for this shape, never above `ceiling`.
+
+    Legal is two things at once: it must divide ``rows // herd_x`` (each core
+    walks its own rows in whole calls), and the ping-ponged L1 tile
+    ``2 * rows_per_call * cols * itemsize`` must fit.
+
+    WHY THIS EXISTS `[2026-08-14]`
+        ``block.norm_rows`` is DERIVED per width and says so in its own
+        docstring -- "the cap moves with ``emb_dim`` -- 104 rows at 768, 80 at
+        1024 -- and a row count that happened to fit at one width is a
+        placement failure at the next". ``rows_per_call`` was the other half of
+        the same sum and was NOT derived: it defaulted to 8, which with
+        ``herd_x = 8`` silently requires ``64 | rows``. At ``emb_dim 1024``
+        ``norm_rows`` derives 32, so `runlist` refused to build at EVERY
+        sequence length -- 0 of 9 ladder points against 9 of 9 at 512 and 768
+        ([50 section 7](../../../docs/plans/transformer-layer-execution-studies/50-coverage-sweep-costing.md)).
+        With 32 rows over 8 columns each core owns 4, so 4 is legal and 8 was
+        never the only choice.
+
+    THE CEILING IS THE POINT, and it is what makes this safe to land. The
+    derivation may only ever go DOWN from the historical default, so any shape
+    where 8 is legal still gets 8 and its IR is byte-identical. A repair that
+    could raise the value would change designs that already gate.
+    """
+    itemsize = np.dtype(np_dtype).itemsize
+    if rows % herd_x:
+        raise ValueError(
+            f"rows ({rows}) must be divisible by herd_x ({herd_x}) before a "
+            "rows_per_call can be derived"
+        )
+    rows_per_tile = rows // herd_x
+    legal = [
+        n
+        for n in range(1, min(ceiling, rows_per_tile) + 1)
+        if rows_per_tile % n == 0 and 2 * n * cols * itemsize <= L1_BYTES
+    ]
+    if not legal:
+        raise ValueError(
+            f"no legal rows_per_call for rows={rows} cols={cols} "
+            f"herd_x={herd_x}: each core owns {rows_per_tile} rows and the "
+            f"ping-ponged L1 tile 2*n*{cols}*{itemsize} must fit "
+            f"{L1_BYTES} B, so even n=1 does not fit"
+        )
+    return max(legal)
+
 
 @module_builder
-def build_layer_norm_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_call=8):
+def build_layer_norm_module(
+    rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_call=None
+):
     """Build multi-row LayerNorm over an ``herd_x x 1`` herd.
 
     Args:
@@ -76,7 +134,12 @@ def build_layer_norm_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_ca
             channel budget is comfortable at the full 8.
         rows_per_call: rows resident in L1 per ``layer_norm_rows`` call. Larger
             amortizes the call and DMA setup; ``2 * rows_per_call * cols * 2``
-            bytes must fit L1 with ping-pong.
+            bytes must fit L1 with ping-pong. ``None`` (the default) DERIVES it
+            with ``derive_rows_per_call`` -- which never exceeds the historical
+            default of 8, so every shape that built before builds identically.
+            An explicit value is still validated and still raises, because
+            silently repairing a caller's stated choice would hide the case
+            this parameter exists to express.
 
     Returns:
         air.ir.Module with one function ``layer_norm_multi_row(x, y)``.
@@ -85,6 +148,10 @@ def build_layer_norm_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_ca
         raise ValueError(
             f"cols ({cols}) must be a multiple of LN_VEC_LEN ({LN_VEC_LEN}); "
             "the kernel has no scalar tail and would drop the remainder"
+        )
+    if rows_per_call is None:
+        rows_per_call = derive_rows_per_call(
+            rows, cols, np_dtype=np_dtype, herd_x=herd_x
         )
     if rows % (herd_x * rows_per_call):
         raise ValueError(

@@ -223,11 +223,36 @@ set_target_properties(check-programming-examples-transformer-layer PROPERTIES FO
 #
 # `[.]lit$` rather than `\.lit$`: CMake eats a backslash before a
 # non-escapable character, so the anchor would silently become `.lit$`.
+#
+# `[2026-08-14]` THE FILTER PASSES THROUGH THREE PARSERS AND EACH ONE WANTED
+# SOMETHING DIFFERENT. This target could not run at all before this commit --
+# `/bin/sh: 1: Syntax error: "(" unexpected` -- and the breakage predates the
+# change that found it (verified by stashing: the 11-test form fails
+# identically). It was green once, at devq 261, so a toolchain regenerated
+# build.ninja differently at some point and nothing re-ran the target. A gate
+# nobody runs stops being a gate silently, which is this suite's own subject.
+#
+#   * add_lit_testsuite does NOT shell-quote ARGS, so `(` and `|` reach
+#     /bin/sh bare. They are escaped with `\\(` / `\\|` -- doubled, because
+#     CMake collapses one level -- and sh strips the backslash and hands lit
+#     the plain regex character.
+#   * `$` must be `$$` or ninja rejects its own generated file
+#     (`bad $-escape`).
+#   * Single-quoting instead is NOT a fix and was tried: CMake stops seeing a
+#     quoted argument, parses the parens as its own syntax, and emits
+#     `transformer_layer/ ( run_...` with spaces injected.
+#
+# Verified end to end rather than by reading: 369 discovered, 357 excluded,
+# **12 passed, 0 failed**, and the workflow's `Passed=12` guard checked against
+# that real log in both directions. Run it with the toolchain environment
+# sourced -- lit invokes a bare `python3`, and the system one has no
+# `ml_dtypes`, which fails all eight builder-touching tests with an empty
+# FileCheck stdin.
 add_lit_testsuite(check-programming-examples-transformer-layer-host
-  "Running transformer-layer PR-safe tests (11, no NPU dispatch)"
+  "Running transformer-layer PR-safe tests (12, no NPU dispatch)"
   ${CMAKE_CURRENT_BINARY_DIR}
   DEPENDS ${TEST_DEPENDS}
-  ARGS ${AIR_TEST_LIT_ARGS} --filter "transformer_layer/(run_npu2_compile_peano|run_block_cache_tests|run_blocked_attention_tests|run_ffn_resident_emulation_tests|run_mapping_space_tests|run_reference_tests|run_seam_tests|run_study_host_tests|sweep/run_npu2_registry_resolution|sweep/run_sweep_families_tests|sweep/run_sweep_writer_tests)[.]lit$"
+  ARGS ${AIR_TEST_LIT_ARGS} --filter "transformer_layer/\\(run_npu2_compile_peano\\|run_block_cache_tests\\|run_blocked_attention_tests\\|run_ffn_resident_emulation_tests\\|run_layer_norm_rows_tests\\|run_mapping_space_tests\\|run_reference_tests\\|run_seam_tests\\|run_study_host_tests\\|sweep/run_npu2_registry_resolution\\|sweep/run_sweep_families_tests\\|sweep/run_sweep_writer_tests\\)[.]lit$$"
 )
 set_target_properties(check-programming-examples-transformer-layer-host PROPERTIES FOLDER "Tests")
 

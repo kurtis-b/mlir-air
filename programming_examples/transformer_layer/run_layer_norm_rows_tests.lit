@@ -1,0 +1,39 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Phase G's width wall, and the derivation that closes it. Host-only: this
+// builds air.ir.Modules and hashes them, and never reaches a device.
+//
+// THE WALL. `builders.block.norm_rows` is DERIVED per width and says so in its
+// own docstring -- the L1 cap moves with emb_dim, so a row count that fit at
+// one width is a placement failure at the next. `build_layer_norm_module`'s
+// `rows_per_call` was the other half of the same sum and was NOT derived: it
+// defaulted to 8, which with herd_x = 8 silently requires 64 | rows. At
+// emb_dim 1024 norm_rows derives 32, so `runlist` refused to build at EVERY
+// sequence length -- 0 of 9 ladder points against 9 of 9 at 512 and 768
+// (doc 50 section 7, found by devq 307 and left unfixed deliberately).
+//
+// With 32 rows over 8 columns each core owns 4, so a rows_per_call of 4 was
+// legal all along. The repair is to DERIVE the parameter, bounded above by the
+// historical default.
+//
+// WHY THE CEILING IS THE WHOLE ARGUMENT. Doc 50 declined to fix this because
+// "every plausible repair changes what a `runlist` row means" -- correct, and
+// the reason a mode's row is only comparable across widths if its dispatch
+// structure is unchanged. A derivation that may only go DOWN from 8 cannot
+// move any shape where 8 was legal, and this suite asserts that as BYTE
+// EQUALITY over the emitted module at five shapes rather than as an argument
+// about it. [23 section 5] records a structural check missing the very claim
+// its phase rested on; byte equality covers every axis such a check could name
+// and every one it could forget.
+//
+// The byte-identity clause is paired with its discrimination control -- a
+// module built at rows_per_call 4 must DIFFER from one built at 8, or the
+// equality above would hold no matter what the derivation returned. And the
+// wall itself is pinned as still real: an EXPLICIT rows_per_call of 8 at 32
+// rows must still raise, which is what separates "derive the parameter" from
+// "delete the constraint". The divisibility rule is a property of the herd
+// walk, not a formality: without it a core steps past its own rows.
+//
+// RUN: python3 %S/builders/test_layer_norm_rows.py | FileCheck %s
+// CHECK: layer-norm row tests: 9/9 passed
