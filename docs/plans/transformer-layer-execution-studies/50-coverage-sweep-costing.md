@@ -218,6 +218,30 @@ walk has ever run]**. That is a scheduling decision, not a phase.
 
 ## 7. `[2026-08-12]` The `baseline_1024` gap was not a gap — and the wall that is really there
 
+> **`[2026-08-14]` THE WIDTH WALL IS CLOSED, and it was narrower than this section concluded.**
+> §7.0 ends with "a *width* wall, it is nothing to do with the registry", which is right, and §7's
+> decision to leave it unfixed rested on *"every plausible repair changes what a `runlist` row
+> means"*. That is true of the repairs this section had in view — moving `norm_rows`, or the L1
+> margin, or `herd_x` — and false of the one that was available.
+>
+> `build_layer_norm_module`'s **`rows_per_call` was never derived**. It defaulted to 8, and with
+> `herd_x = 8` that silently requires `64 | rows`. `block.norm_rows` is derived per width and says so
+> in its own docstring — "a row count that happened to fit at one width is a placement failure at the
+> next" — and `rows_per_call` was the other half of the same sum, carried over as a constant. At
+> emb 1024 `norm_rows` derives **32**, each of the 8 cores owns **4** rows, and **4 was legal all
+> along**.
+>
+> `derive_rows_per_call` is bounded **above** by the historical default, which is what makes it safe
+> to land beside gated designs: wherever 8 was legal it still returns 8, and the **emitted IR is
+> byte-identical** — asserted at five shapes, with a control that `rows_per_call` 4 vs 8 really does
+> change the module, or the equality would hold whatever the derivation returned. The divisibility
+> rule is untouched: an **explicit** `rows_per_call = 8` at 32 rows still raises, which is what
+> separates deriving the parameter from deleting the constraint.
+>
+> `run_layer_norm_rows_tests.lit`, 9 host-only clauses. **Not yet walked on device** — a `runlist`
+> row at emb 1024 needs `run_mode.py`, which refuses off Turbo, and the machine is at `Default`.
+> The builder-side claim is proven; the ladder rung is owed.
+
 `[2026-08-12]` Repo `/home/cj/mlir-air`, worktree branch `worktree-agent-a8cbef1a620b6f8f9` off
 `exper/transformer-layer-execution-studies` at `35e9c382`. NPU power mode **Turbo**, verified.
 
