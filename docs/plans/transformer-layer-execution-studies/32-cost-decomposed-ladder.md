@@ -116,6 +116,18 @@ column any results reader can see.
 
 ## `[2026-08-11]` The post-flip walk: the first unconditional four-mode comparison
 
+> **`[2026-08-18]` Read this section's ORDERINGS as current and its LATENCIES as superseded.** A
+> re-walk under this walk's exact conditions (devq 353; warmup 2 / samples 5, same mode order, two
+> walks, Turbo verified in-job; roots at `results/rewalk-doc32-w{1,2}`) reproduces
+> `fused` < `coarse` **8/8** on avgs and minimums — but every absolute number here moved **down
+> 13–26%** (all 8 (mode, length) pairs, same direction), consistent with the three 2026-08-12
+> compiler changes, which postdate these trees. The @1024 `fused`/`coarse` margin has nearly closed
+> (0.76 ms avg / 0.04 ms min in the re-walk's w2), so treat that pair as tied at 1024. Dispatch
+> vectors and `sync` counts are unchanged. Also measured on the way: `fused`@1024 at **warmup 1** is
+> unstable (101.5 then 80.0 across two walks) and stabilizes to 0.4% at warmup 2 — a cross-mode
+> comparison at warmup 1 compares warmup tails, not modes, which is what made devq 352's inversion
+> look real.
+
 The re-walk item 3's flip owed, run the day the flip landed: four modes at 512 and 1024,
 `--warmup 2 --samples 5`, walked twice under one devq measure job each, **Turbo verified
 in-job before either walk** (trap 0), with `offload` on its NEW default — the shared xclbin
