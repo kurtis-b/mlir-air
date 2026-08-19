@@ -384,5 +384,21 @@
 // against a plan that said it could not); without the expectation the old
 // rule is byte-identical. The +1 pins all three clauses.
 //
+// `[2026-08-19]` 566 -> 567, no module added: row 31's owed ranking
+// validation, closed as the negative finding it is. A scoping pass proved
+// the model's licence and its buildable set are DISJOINT: every axis that
+// distinguishes two designs which both build and run today (norm-tail form,
+// gemm fold, tile_k, rows_per_call) is priced as an exact tie -- including
+// C1 vs C2, the one pair a measurement cleanly resolves (doc 30, 6.6% at
+// 4096, byte-identical traffic) -- while every axis the model does price is
+// unbuildable, unrunnable, or the disclaimed linear port term. The +1 pins
+// that tie sweep plus the loud over-budget note (an illegal 32-slot
+// declaration prices with "slots 32 of 16" in its notes; rank() filters
+// nothing). RECORDED_MODE_POINTS refreshed from doc 32's re-walk (devq 353,
+// both walks, identical bytes, latencies down 9-24%): the under-prediction
+// band moved 9.7-20.3x -> 8.5-18.4x and the bound test's floor 9.0 -> 8.0;
+// offload's within-mode spread re-measures at 1.41, inside its existing
+// 1.30-1.45 bound.
+//
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 566/566 passed in 25 modules
+// CHECK: study host tests: 567/567 passed in 25 modules

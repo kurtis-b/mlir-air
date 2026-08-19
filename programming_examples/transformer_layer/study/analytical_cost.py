@@ -67,8 +67,8 @@ FOOTGUNS
       ``fused < coarse < runlist < offload``. ``runlist`` moves the fewest bytes
       and is third slowest, because it pays 24-32 ``hw_context`` loads --
       reconfiguration, the taxonomy's other axis, which this module does not
-      model. The bytes-to-time ratio is stable within a mode (coarse
-      13.00/12.72, runlist 20.31/19.70) and differs between modes, so the
+      model. The bytes-to-time ratio is stable within a mode (`[2026-08-19]`
+      coarse 9.89/10.03, runlist 18.44/17.91) and differs between modes, so the
       licence is exactly: same structure, different mapping. See
       ``RECORDED_MODE_POINTS`` and the test that pins it.
     - The traffic model covers the FFN tail (doc 31b's nt1 -> up -> gelu ->
@@ -118,7 +118,8 @@ BAND_ROWS = mapping_space.BAND_ROWS
 #:
 #: Two things fall out, and both bound the model rather than support it:
 #:
-#:   1. A traffic-only time UNDER-PREDICTS by 9.7x to 20.3x. The layer is
+#:   1. A traffic-only time UNDER-PREDICTS by 8.5x to 18.4x (`[2026-08-19]`
+#:      re-measured; was 9.7x-20.3x on the 08-14 numbers). The layer is
 #:      nowhere near shim-bandwidth-bound at these shapes, so an absolute ``ns``
 #:      from this module is not a latency and must not be read as one.
 #:   2. **Byte order does NOT predict latency order.** By bytes at 1024:
@@ -128,19 +129,28 @@ BAND_ROWS = mapping_space.BAND_ROWS
 #:      which is the OTHER axis of the corrected taxonomy (doc 03) and which
 #:      this module does not model at all.
 #:
-#: The ratio is stable WITHIN a mode (coarse 13.00/12.72, fused 11.49/12.67,
-#: runlist 20.31/19.70) and differs BETWEEN modes. That is the whole licence
+#: The ratio is stable WITHIN a mode (`[2026-08-19]` coarse 9.89/10.03,
+#: fused 9.61/9.71, runlist 18.44/17.91; offload's 11.97/8.47 spread is the
+#: measured signature of its 30 context loads) and differs BETWEEN modes. That is the whole licence
 #: this module has: it may rank mappings that share a dispatch structure, and it
 #: may not rank across structures that differ in reconfiguration.
+#: `[2026-08-19]` REFRESHED from doc 32's re-walk (devq 353, Turbo verified
+#: in-job, warmup 2 / samples 5, results/rewalk-doc32-w1 pinned here with w2
+#: beside it in the comment): every latency moved DOWN 9-24% from the
+#: 2026-08-14 values while the BYTES are identical -- the machine got faster
+#: (context-load cost), the traffic did not move, so every under-prediction
+#: ratio tightened. Both walks agree on every ordering. w2's avgs:
+#: coarse 43.14/78.41, fused 39.11/77.65, offload 101.74/153.24,
+#: runlist 73.33/129.98 -- within 6% of w1 at every point.
 RECORDED_MODE_POINTS = (
-    ("coarse", 512, 22020096, 53.7),
-    ("coarse", 1024, 44040192, 105.0),
-    ("fused", 512, 21233664, 45.7),
-    ("fused", 1024, 42467328, 100.8),
-    ("offload", 512, 44040192, 109.5),
-    ("offload", 1024, 99090432, 179.9),
-    ("runlist", 512, 20447232, 77.8),
-    ("runlist", 1024, 40894464, 151.0),
+    ("coarse", 512, 22020096, 40.8),
+    ("coarse", 1024, 44040192, 82.8),
+    ("fused", 512, 21233664, 38.2),
+    ("fused", 1024, 42467328, 77.3),
+    ("offload", 512, 44040192, 98.8),
+    ("offload", 1024, 99090432, 157.3),
+    ("runlist", 512, 20447232, 70.7),
+    ("runlist", 1024, 40894464, 137.3),
 )
 
 #: Doc 31a's per-scope split puts tail-internal removable crossings at
@@ -384,6 +394,16 @@ def rank(mappings, seq: int, ffn: int | None = None):
     Prefer this to reading an absolute ``ns``: every entry shares the same
     modelled constants, so the ORDER is far better founded than any single
     number. See the module footguns.
+
+    `[2026-08-19]` TWO LIMITS, both pinned in the test suite. This ranks
+    DECLARATIONS: legality is a separate question, an over-budget mapping is
+    priced (its Cost.notes carry "shim_mm2s_slots N of 16"), and nothing here
+    filters -- run ``mapping_space.legality`` first. And within one workload
+    the only discriminator is the MODELLED port term: every axis on which two
+    buildable-and-runnable designs differ today prices as an exact tie, so a
+    rank() order between such designs is a statement about port occupancy
+    under the disclaimed linear scaling, never about dispatch structure --
+    doc 30's resolved C1/C2 6.6% is invisible to this function.
     """
     priced = [(m, cost(m, seq, ffn)) for m in mappings]
     priced.sort(key=lambda pair: pair[1].ns)
