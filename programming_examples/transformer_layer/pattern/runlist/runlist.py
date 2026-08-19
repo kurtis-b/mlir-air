@@ -145,7 +145,10 @@ from builders.block_cache import (  # noqa: E402
     load_fingerprints,
     save_fingerprints,
 )
-from builders.elementwise_add import build_elementwise_add_module  # noqa: E402
+from builders.elementwise_add import (  # noqa: E402
+    build_elementwise_add_module,
+    causal_mask_bias,
+)
 from builders.elementwise_mul import (  # noqa: E402
     broadcast_row_weight,
     build_elementwise_mul_module,
@@ -156,6 +159,7 @@ from builders.layer_norm import build_layer_norm_module  # noqa: E402
 from builders.softmax import build_softmax_module  # noqa: E402
 from opcheck_layer import (  # noqa: E402
     BLOCK_STAGE_ATOL,
+    DECODER_STAGE_ATOL,
     print_dispatch_totals,
     reconfiguration_delta,
 )
@@ -172,6 +176,7 @@ from pattern.offload.offload import (  # noqa: E402
     attention_gemm_spec,
 )
 from pattern.reference import (  # noqa: E402
+    DECODER_BOUNDARIES,
     ENCODER_BOUNDARIES,
     generate_golden_reference,
 )
@@ -246,10 +251,15 @@ _SMALL_FUNC = {
     # clean, so ONE artifact serves all twelve heads. Being here also gets it
     # the emitted-symbol assertion in compile_runlist_artifacts.
     "softmax": "softmax_rows",
+    # Decoder only (`runlist_config(causal=True)` adds the artifact): the
+    # [seq, seq] mask-tensor add between the score GEMM and the softmax --
+    # the same builder as `add`, at score shape, with the validated
+    # `causal_mask` op's semantics (builders/elementwise_add.py).
+    "causal_mask": "eltwise_add_2d",
 }
 
 
-def runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
+def runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim, causal=False):
     """Resolve every operator's configuration without building anything.
 
     Three GEMM shapes serve six of the entries, but the four
@@ -338,6 +348,12 @@ def runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
             "softmax": f"rl_softmax_{seq_len}x{seq_len}",
         }
     )
+    if causal:
+        # The decoder-only keys are added CONDITIONALLY, same argument as
+        # builders/block.py: the fingerprint hashes the whole cfg, and a new
+        # key on the encoder path would invalidate every cached encoder ELF
+        # for a config that resolved identically.
+        artifacts["causal_mask"] = f"rl_causal_mask_{seq_len}x{seq_len}"
     backend_kwargs = {
         artifacts[gemm_key]: dict(
             _GEMM_BACKEND, instance_name=_METHOD_FUNC[specs[spec_key][0]["method"]]
@@ -348,9 +364,10 @@ def runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
         {
             artifacts[key]: dict(_SMALL_BACKEND, instance_name=func)
             for key, func in _SMALL_FUNC.items()
+            if key in artifacts
         }
     )
-    return {
+    cfg = {
         "seq_len": seq_len,
         "emb_dim": emb_dim,
         "ffn_dim": ffn_dim,
@@ -363,14 +380,21 @@ def runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
         "artifacts": artifacts,
         "backend_kwargs": backend_kwargs,
     }
+    if causal:
+        cfg["causal"] = True
+    return cfg
 
 
 def runlist_entry_count(cfg):
     """Total runlist entries the decomposition dispatches, derived not counted:
     q/k/v (3) + per head (attn_scores, softmax, attn_output) + output_proj (1)
     + up/gelu/down (3) + two norm chains of ``3 * norm_blocks`` band entries
-    each."""
-    return 7 + 3 * cfg["num_heads"] + 6 * cfg["norm_blocks"]
+    each. The DECODER adds one mask-add entry per head and two bare
+    residual-add runs of ``norm_blocks`` band entries each."""
+    base = 7 + 3 * cfg["num_heads"] + 6 * cfg["norm_blocks"]
+    if cfg.get("causal"):
+        base += cfg["num_heads"] + 2 * cfg["norm_blocks"]
+    return base
 
 
 def runlist_submission_count(cfg):
@@ -382,15 +406,21 @@ def runlist_submission_count(cfg):
     [4096, 4096] bf16, ~800 MiB before counting anything else. Per head it is
     ~70 MiB. The mode's granularity claim is about ENTRIES, which the split
     does not change.
+
+    The DECODER's two bare residual-add runs are two more submissions (the
+    mask add rides inside each head's existing one).
     """
-    return 5 + cfg["num_heads"]
+    return (7 if cfg.get("causal") else 5) + cfg["num_heads"]
 
 
 def describe_runlist(cfg):
     """One line per resolved decision, for the run log and the lit gate."""
+    variant = (
+        "decoder_gpt2, causal" if cfg.get("causal") else "encoder_bert, non-causal"
+    )
     print(
         f"  runlist {cfg['seq_len']}x{cfg['emb_dim']} ffn {cfg['ffn_dim']} "
-        f"{cfg['num_heads']}h x {cfg['head_dim']} (encoder_bert, non-causal, "
+        f"{cfg['num_heads']}h x {cfg['head_dim']} ({variant}, "
         f"{runlist_entry_count(cfg)} fine-grained entries over "
         f"{runlist_submission_count(cfg)} runlists, nothing on the host)"
     )
@@ -441,6 +471,12 @@ def _build_runlist_module(cfg, key):
         )
     if key == "add":
         return build_elementwise_add_module(rows, emb_dim, bfloat16)
+    if key == "causal_mask":
+        # Score shape, whole [seq, seq] in one launch; the causal_mask keyword
+        # asserts the square shape and records that `b` is the static mask.
+        return build_elementwise_add_module(
+            cfg["seq_len"], cfg["seq_len"], bfloat16, causal_mask=True
+        )
     if key == "ln":
         return build_layer_norm_module(rows, emb_dim, bfloat16)
     if key == "mul":
@@ -523,7 +559,8 @@ def compile_runlist_artifacts(cache, cfg, run_only=False, keys=None):
             # single-shot softmax_bf16 in the same file; see builders/softmax.py
             # for why. vec_len must match the builder's SM_VEC_LEN.
             ek.compile_softmax_streaming(vec_len=64)
-        # "add" and "mul" are direct vector codegen: nothing to compile.
+        # "add", "mul" and "causal_mask" are direct vector codegen: nothing
+        # to compile.
     for key in stale:
         name = names[key]
         print(f"== compiling {name} ==")
@@ -640,7 +677,7 @@ def evict_attention_contexts(cache, cfg):
     cache.evict_pools_for(names)
 
 
-def run_attention_head(cache, cfg, head, q, k, v):
+def run_attention_head(cache, cfg, head, q, k, v, mask=None):
     """One head's whole attention interior, three entries in one submission.
 
     ``attn_scores`` (Q_h @ K_h^T), ``softmax`` over the score matrix, then
@@ -648,6 +685,15 @@ def run_attention_head(cache, cfg, head, q, k, v):
     the score matrix and the probability matrix are device-resident inside
     the runlist, which is the property this mode exists to have and the one
     the host-softmax ``offload`` partition deliberately gives up.
+
+    ``mask`` is the decoder's [seq, seq] additive causal mask
+    (``causal_mask_bias``: 0 on and below the diagonal, -10000 above, bf16 --
+    NOT -inf, which turns the bf16 add into NaN). It becomes a FOURTH entry
+    between the score GEMM and the softmax, the validated ``causal_mask`` op
+    at score shape; the softmax then reads the masked scores. One static
+    content-keyed buffer serves all heads and all dispatches. The q slices
+    arrive pre-scaled, so the masked tensor is scale*QK^T - 10000 above the
+    diagonal, which the plain streaming softmax drives to exactly zero.
 
     ONE HEAD PER SUBMISSION IS A MEMORY BOUND. See
     ``runlist_submission_count``: all twelve heads in one runlist would
@@ -694,16 +740,33 @@ def run_attention_head(cache, cfg, head, q, k, v):
     steps.append(step)
     if scratch:
         scratches.add(scratch)
-    steps.append(DispatchStep(names["softmax"], ("scores", "probs"), writes=(1,)))
+    softmax_in = "scores"
+    if mask is not None:
+        arrays["mask"] = mask
+        arrays["masked"] = np.zeros((seq_len, seq_len), dtype=bfloat16)
+        steps.append(
+            DispatchStep(names["causal_mask"], ("scores", "mask", "masked"), writes=(2,))
+        )
+        softmax_in = "masked"
+    steps.append(DispatchStep(names["softmax"], (softmax_in, "probs"), writes=(1,)))
     step, scratch = _gemm_step(cfg, "attn_output", "probs", "v_h", "ctx_h", arrays)
     steps.append(step)
     if scratch:
         scratches.add(scratch)
     specs = {
-        name: _spec_buf(name, arr, host_output=name == "ctx_h")
+        name: _spec_buf(
+            name, arr, static=name == "mask", host_output=name == "ctx_h"
+        )
         for name, arr in arrays.items()
     }
     host_writes = {"q_h", "k_h_t", "v_h"} | scratches
+    if mask is not None:
+        # A static buffer still needs the host write, exactly as the norm
+        # chain's gamma does -- left out, the device reads ZEROS and the mask
+        # add is silently `scores + 0`: the first decoder walk (devq 365)
+        # failed from attn_context onward with exactly that signature, and the
+        # step probe (devq 366) read the unmasked scores back out of `masked`.
+        host_writes.add("mask")
     evict_attention_contexts(cache, cfg)
     results, vector = cache.run_sequence(
         steps,
@@ -716,7 +779,7 @@ def run_attention_head(cache, cfg, head, q, k, v):
     return np.array(results["ctx_h"], copy=True), vector
 
 
-def run_attention_interior(cache, cfg, q, k, v):
+def run_attention_interior(cache, cfg, q, k, v, mask=None):
     """Every head's attention interior, one submission each, columns reassembled.
 
     The loop is here rather than in a mode's ``dispatch`` because it is the
@@ -731,7 +794,7 @@ def run_attention_interior(cache, cfg, q, k, v):
     vectors = []
     for head in range(cfg["num_heads"]):
         columns = slice(head * head_dim, (head + 1) * head_dim)
-        ctx_h, vector = run_attention_head(cache, cfg, head, q, k, v)
+        ctx_h, vector = run_attention_head(cache, cfg, head, q, k, v, mask=mask)
         attn_context[:, columns] = ctx_h
         vectors.append(vector)
     return attn_context, vectors
@@ -815,6 +878,48 @@ def run_norm_chain(cache, cfg, label, x_full, residual_full, gamma_band):
     return out, vector
 
 
+def run_add_bands(cache, cfg, label, a_full, b_full):
+    """One bare elementwise add over ``[seq_len, emb_dim]``, banded.
+
+    The DECODER's raw residual stream: ``norm_blocks`` band entries of the
+    same ``add`` artifact the norm chains dispatch, in one submission, with
+    no layer_norm or gamma multiply after them -- the decoder's residual is
+    the unnormalized sum.
+    """
+    emb_dim = cfg["emb_dim"]
+    names = cfg["artifacts"]
+    rows, blocks = cfg["norm_rows"], cfg["norm_blocks"]
+    arrays = {}
+    steps = []
+    out_names = []
+    for i in range(blocks):
+        lo, hi = i * rows, (i + 1) * rows
+        a_name, b_name, o_name = f"{label}_a{i}", f"{label}_b{i}", f"{label}_out{i}"
+        # Contiguous copies, not views — see the module footguns.
+        arrays[a_name] = np.ascontiguousarray(a_full[lo:hi])
+        arrays[b_name] = np.ascontiguousarray(b_full[lo:hi])
+        arrays[o_name] = np.zeros((rows, emb_dim), dtype=bfloat16)
+        steps.append(DispatchStep(names["add"], (a_name, b_name, o_name), writes=(2,)))
+        out_names.append(o_name)
+    specs = {
+        name: _spec_buf(name, arr, host_output=name in out_names)
+        for name, arr in arrays.items()
+    }
+    host_writes = set()
+    for i in range(blocks):
+        host_writes |= {f"{label}_a{i}", f"{label}_b{i}"}
+    results, vector = cache.run_sequence(
+        steps,
+        specs,
+        cfg["backend_kwargs"],
+        arrays,
+        host_writes=host_writes,
+        require_single_submission=True,
+    )
+    out = np.concatenate([np.array(results[n], copy=True) for n in out_names])
+    return out, vector
+
+
 def run_ffn(cache, cfg, hidden, w_up, w_down):
     """Runlist 4: up_proj, GeLU, down_proj — three entries, the
     interiors device-resident."""
@@ -877,12 +982,21 @@ def prepare_runlist(shape, seed=42):
     seq_len, emb_dim = shape["seq_len"], shape["emb_dim"]
     ffn_dim, num_heads = shape["ffn_dim"], shape["num_heads"]
     head_dim = shape["head_dim"]
+    # The variant rides in the shape dict (run_mode._shape_for stamps it).
+    # The decoder's one new DEVICE piece is the [seq, seq] mask-tensor add
+    # between the score GEMM and the softmax -- the validated `causal_mask`
+    # op at score shape; the pre-norms and raw residual adds reuse the band
+    # artifacts the encoder's norm chains already dispatch.
+    variant = shape.get("workload_variant", "encoder_bert")
+    causal = variant == "decoder_gpt2"
+    boundary_names = DECODER_BOUNDARIES if causal else ENCODER_BOUNDARIES
+    stage_atol = DECODER_STAGE_ATOL if causal else BLOCK_STAGE_ATOL
 
-    cfg = runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim)
+    cfg = runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim, causal=causal)
     describe_runlist(cfg)
 
     golden = generate_golden_reference(
-        seq_len, emb_dim, ffn_dim, num_heads, seed=seed, workload_variant="encoder_bert"
+        seq_len, emb_dim, ffn_dim, num_heads, seed=seed, workload_variant=variant
     )
     weights = golden["weights"]
     reference = golden["boundaries"]
@@ -913,59 +1027,105 @@ def prepare_runlist(shape, seed=42):
         blocks = cfg["norm_blocks"]
 
         total = runlist_submission_count(cfg)
-        print(f"  [runlist 1/{total}] q_proj + k_proj + v_proj (3 entries)")
-        proj, vec_1 = run_projections(cache, cfg, x, w_q, w_k, w_v)
-
-        print(
-            f"  [runlist 2..{1 + num_heads}/{total}] attention on device: "
-            f"{num_heads} x (attn_scores + softmax + attn_output), "
-            f"3 entries each"
-        )
-        attn_context, attn_vectors = run_attention_interior(
-            cache, cfg, proj["q"], proj["k"], proj["v"]
-        )
-
-        print(f"  [runlist {2 + num_heads}/{total}] output_proj (1 entry)")
-        attn_out, vec_2 = run_o_proj(cache, cfg, round_bf16(attn_context), w_o)
-
-        print(
-            f"  [runlist {3 + num_heads}/{total}] {blocks} x "
-            f"(add + layer_norm + mul) ln1 ({3 * blocks} entries)"
-        )
         gamma1 = round_bf16(broadcast_row_weight(ln1_weight, cfg["norm_rows"]))
-        hidden, vec_3 = run_norm_chain(cache, cfg, "ln1", attn_out, x, gamma1)
-
-        print(
-            f"  [runlist {4 + num_heads}/{total}] up_proj + gelu + down_proj "
-            f"(3 entries)"
-        )
-        ffn, vec_4 = run_ffn(cache, cfg, hidden, w_up, w_down)
-
-        print(
-            f"  [runlist {5 + num_heads}/{total}] {blocks} x "
-            f"(add + layer_norm + mul) ln2 ({3 * blocks} entries)"
-        )
         gamma2 = round_bf16(broadcast_row_weight(ln2_weight, cfg["norm_rows"]))
-        output, vec_5 = run_norm_chain(
-            cache, cfg, "ln2", ffn["ffn_out"], hidden, gamma2
-        )
+        boundaries = {}
+        if causal:
+            zeros = np.zeros_like(x)
+            mask = causal_mask_bias(cfg["seq_len"], bfloat16)
+            print(
+                f"  [runlist 1/{total}] {blocks} x (add + layer_norm + mul) "
+                f"ln1 pre-norm, zero residual ({3 * blocks} entries)"
+            )
+            ln_in, vec_0 = run_norm_chain(cache, cfg, "ln1", x, zeros, gamma1)
+            boundaries["ln_in"] = ln_in
+            print(f"  [runlist 2/{total}] q_proj + k_proj + v_proj (3 entries)")
+            proj, vec_1 = run_projections(cache, cfg, ln_in, w_q, w_k, w_v)
+            print(
+                f"  [runlist 3..{2 + num_heads}/{total}] attention on device: "
+                f"{num_heads} x (attn_scores + causal_mask + softmax + "
+                f"attn_output), 4 entries each"
+            )
+            attn_context, attn_vectors = run_attention_interior(
+                cache, cfg, proj["q"], proj["k"], proj["v"], mask=mask
+            )
+            print(f"  [runlist {3 + num_heads}/{total}] output_proj (1 entry)")
+            attn_out, vec_2 = run_o_proj(cache, cfg, round_bf16(attn_context), w_o)
+            print(
+                f"  [runlist {4 + num_heads}/{total}] {blocks} x add "
+                f"(residual = attn_out + x, {blocks} entries)"
+            )
+            residual, vec_r1 = run_add_bands(cache, cfg, "res1", attn_out, x)
+            boundaries["residual"] = residual
+            print(
+                f"  [runlist {5 + num_heads}/{total}] {blocks} x "
+                f"(add + layer_norm + mul) ln2 pre-norm, zero residual "
+                f"({3 * blocks} entries)"
+            )
+            ffn_in, vec_3 = run_norm_chain(cache, cfg, "ln2", residual, zeros, gamma2)
+            boundaries["ffn_in"] = ffn_in
+            print(
+                f"  [runlist {6 + num_heads}/{total}] up_proj + gelu + "
+                f"down_proj (3 entries)"
+            )
+            ffn, vec_4 = run_ffn(cache, cfg, ffn_in, w_up, w_down)
+            print(
+                f"  [runlist {7 + num_heads}/{total}] {blocks} x add "
+                f"(output = ffn_out + residual, {blocks} entries)"
+            )
+            output, vec_5 = run_add_bands(cache, cfg, "res2", ffn["ffn_out"], residual)
+            vecs = [vec_0, vec_1] + attn_vectors + [vec_2, vec_r1, vec_3, vec_4, vec_5]
+        else:
+            print(f"  [runlist 1/{total}] q_proj + k_proj + v_proj (3 entries)")
+            proj, vec_1 = run_projections(cache, cfg, x, w_q, w_k, w_v)
 
-        boundaries = dict(ffn)
+            print(
+                f"  [runlist 2..{1 + num_heads}/{total}] attention on device: "
+                f"{num_heads} x (attn_scores + softmax + attn_output), "
+                f"3 entries each"
+            )
+            attn_context, attn_vectors = run_attention_interior(
+                cache, cfg, proj["q"], proj["k"], proj["v"]
+            )
+
+            print(f"  [runlist {2 + num_heads}/{total}] output_proj (1 entry)")
+            attn_out, vec_2 = run_o_proj(cache, cfg, round_bf16(attn_context), w_o)
+
+            print(
+                f"  [runlist {3 + num_heads}/{total}] {blocks} x "
+                f"(add + layer_norm + mul) ln1 ({3 * blocks} entries)"
+            )
+            hidden, vec_3 = run_norm_chain(cache, cfg, "ln1", attn_out, x, gamma1)
+
+            print(
+                f"  [runlist {4 + num_heads}/{total}] up_proj + gelu + down_proj "
+                f"(3 entries)"
+            )
+            ffn, vec_4 = run_ffn(cache, cfg, hidden, w_up, w_down)
+
+            print(
+                f"  [runlist {5 + num_heads}/{total}] {blocks} x "
+                f"(add + layer_norm + mul) ln2 ({3 * blocks} entries)"
+            )
+            output, vec_5 = run_norm_chain(
+                cache, cfg, "ln2", ffn["ffn_out"], hidden, gamma2
+            )
+            boundaries["hidden"] = hidden
+            vecs = [vec_1] + attn_vectors + [vec_2, vec_3, vec_4, vec_5]
+
+        boundaries.update(ffn)
         boundaries.update({"q": proj["q"], "k": proj["k"], "v": proj["v"]})
         # bf16 straight from the device, widened for the comparison. The other
         # modes' attn_context is f32 because a host implementation produced it;
         # here the widening is exact and adds nothing.
         boundaries["attn_context"] = attn_context.astype(np.float32)
         boundaries["attn_out"] = attn_out
-        boundaries["hidden"] = hidden
         boundaries["output"] = output
 
-        vector_rows = [
-            v.as_row() for v in ([vec_1] + attn_vectors + [vec_2, vec_3, vec_4, vec_5])
-        ]
+        vector_rows = [v.as_row() for v in vecs]
         stages = []
-        for name in ENCODER_BOUNDARIES:
-            atol = BLOCK_STAGE_ATOL[name]
+        for name in boundary_names:
+            atol = stage_atol[name]
             stats = stage_stats(boundaries[name], reference[name], atol=atol)
             stages.append(dict(stats, name=name, atol=atol))
             print(
@@ -1008,8 +1168,8 @@ def prepare_runlist(shape, seed=42):
         }
 
     record_extra = {
-        "variant": "encoder_bert",
-        "causal": False,
+        "variant": variant,
+        "causal": causal,
         "golden_seed": seed,
         "execution_mode": EXECUTION_MODE_CSV["runlist"],
         "attention_path": ATTENTION_PATH,
@@ -1027,7 +1187,7 @@ def prepare_runlist(shape, seed=42):
         "gemm_spec_attn_scores": _spec_digest(cfg["specs"]["attn_scores"][0]),
         "gemm_spec_attn_output": _spec_digest(cfg["specs"]["attn_output"][0]),
     }
-    return {
+    prepared = {
         "inputs": inputs,
         # ln1_weight, index 5. Same measured target as the block's; see
         # opcheck_layer.py for the numbers.
@@ -1036,3 +1196,9 @@ def prepare_runlist(shape, seed=42):
         "dispatch": dispatch,
         "record_extra": record_extra,
     }
+    if causal:
+        # Same seam as opcheck_layer's: the decoder's whole-layer comparison
+        # runs at its own output boundary's atol, not the spec row's
+        # encoder-measured one. run_mode prefers this key when present.
+        prepared["atol"] = stage_atol["output"]
+    return prepared

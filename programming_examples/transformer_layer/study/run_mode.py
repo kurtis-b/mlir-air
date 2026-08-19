@@ -204,11 +204,14 @@ def _shape_for(
 #: block never dispatches, and causal masking between the score GEMM and
 #: softmax. `[2026-08-19]` `coarse` builds it -- `builders/block.py::
 #: run_decoder_block` wires the six-sequence pre-norm graph from the validated
-#: operators -- and `offload` builds it host-side (its mask rides into the host
+#: operators -- `offload` builds it host-side (its mask rides into the host
 #: softmax, its pre-norms and residual adds are host arithmetic; NO device
-#: artifact changes), so neither appears here. The remaining modes still
-#: refuse, per mode rather than per variant, because their gaps are different
-#: gaps and a shared message would rot as each one closes.
+#: artifact changes) -- and `runlist` builds it fine-grained (the validated
+#: `causal_mask` add as a fourth per-head entry between the score GEMM and the
+#: device softmax, pre-norm chains with a zero residual, banded bare adds for
+#: the raw residual stream). The remaining modes still refuse, per mode rather
+#: than per variant, because their gaps are different gaps and a shared
+#: message would rot as each one closes.
 #:
 #: REFUSED RATHER THAN SILENTLY RUN, and that is the whole point of the dict.
 #: Overriding the width alone and labelling the row `decoder_gpt2` would produce
@@ -222,12 +225,6 @@ UNBUILDABLE_VARIANTS = {
             "pipeline (builders/norm_tail.py, plane_major): a pre-norm layer "
             "needs a zero-residual norm BEFORE attention and a bare residual "
             "add that packing cannot express"
-        ),
-        "runlist": (
-            "its attention interior is scores -> softmax -> output with no "
-            "masking step between the score GEMM and the softmax; the mask-"
-            "tensor add (builders/elementwise_add.py causal_mask) has no "
-            "runlist step wired"
         ),
         "coarse_c2": (
             "the C2 cell composes the encoder's post-norm cell structure "
