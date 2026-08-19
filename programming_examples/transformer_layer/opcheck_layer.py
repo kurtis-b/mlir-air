@@ -47,10 +47,12 @@ for _p in (_PROJ_ROOT, os.path.join(_PROJ_ROOT, "llms"), _HERE):
 from builders.block import (  # noqa: E402
     BLOCK_BOUNDARIES,
     BLOCK_INPUT_NAMES,
+    DECODER_BLOCK_BOUNDARIES,
     block_config,
     compile_block_artifacts,
     describe_block,
     run_block,
+    run_decoder_block,
 )
 from opcheck_prepare import _spec_digest  # noqa: E402
 from pattern.reference import (  # noqa: E402
@@ -148,6 +150,63 @@ BLOCK_STAGE_ATOL = {
     "ffn_gelu": 1.5e-1,
     "ffn_out": 3e-1,
     "output": 1e-1,
+}
+
+# Per-boundary `atol` for the DECODER's stage comparisons, MEASURED at
+# 512x768x3072x12h causal (devq 359, first walk; devq 360, the audit), each
+# entry the boundary's atol_required rounded up. THE DECODER'S NUMBERS ARE
+# STRUCTURALLY LARGER THAN THE ENCODER'S AND THE AUDIT SAYS WHY: the encoder's
+# chain has a shared raw input at q/k/v (device and reference feed the SAME x,
+# so that boundary shows kernel error alone) and a final norm that shrinks
+# accumulated drift; the pre-norm decoder has neither, so every boundary past
+# `ln_in` carries upstream drift THROUGH the comparison.
+#
+# devq 360's stage-transfer audit is what licenses these as tolerances rather
+# than as a defect report: for every stage it compared the device output
+# against the reference STEP applied to the device's OWN upstream input
+# (kernel-grade error, chaining removed) and against the reference chain
+# (the number below). Transfer error: ln_in / residual / ffn_in / output
+# EXACT within rtol (atol_required 0.0); attn_context 3.9e-2 and attn_out
+# 2.2e-2, inside the causal row's 8e-2; ffn_up/gelu/out 3.6e-2 / 3.5e-2 /
+# 9.5e-2, inside the encoder's FFN tiers. So the graph is correct and the
+# totals are chain accumulation. THE ONE KERNEL-LEVEL FINDING: q/k/v transfer
+# error is 3.5e-2 (mean_rel_L1 1.03e-2) against the encoder boundary's 5e-3 --
+# the SAME fused-cast kernel at ~1% under the pre-norm input regime
+# (LayerNorm x gamma widens the per-column dynamic range and the cancellation
+# in the bf16 partial re-accumulation) where the encoder's raw N(0,1) draw
+# holds it under 5e-3. Regime-dependence of this method, measured; the same
+# shape of finding as addnorm's offset rows.
+#
+#     boundary       atol_required   atol    margin
+#     ln_in              0.0         3.5e-2  (addnorm tier kept, not driven
+#                                            arbitrarily small)
+#     q / k / v          3.7e-2      7.5e-2   2.0x
+#     attn_context       4.4e-2      8e-2     1.8x
+#     attn_out           7.3e-2      1.5e-1   2.1x
+#     residual           7.3e-2      1.5e-1   2.1x
+#     ffn_in             1.5e-1      3.0e-1   2.0x
+#     ffn_up             1.6e-1      3.5e-1   2.1x
+#     ffn_gelu           1.6e-1      3.5e-1   2.2x
+#     ffn_out            2.9e-1      4.5e-1   1.5x
+#     output             3.0e-1      4.5e-1   1.5x
+#
+# The two end boundaries run the thin margins end boundaries run everywhere
+# in this file (`output` 1.35x above, the causal rows 1.5-1.6x). `output` is
+# also the whole-layer comparison's atol via the preparer's `atol` key: same
+# tensor, same comparison, one number.
+DECODER_STAGE_ATOL = {
+    "ln_in": 3.5e-2,
+    "q": 7.5e-2,
+    "k": 7.5e-2,
+    "v": 7.5e-2,
+    "attn_context": 8e-2,
+    "attn_out": 1.5e-1,
+    "residual": 1.5e-1,
+    "ffn_in": 3e-1,
+    "ffn_up": 3.5e-1,
+    "ffn_gelu": 3.5e-1,
+    "ffn_out": 4.5e-1,
+    "output": 4.5e-1,
 }
 
 # Where the four block ELFs are cached, relative to the working directory. It
@@ -351,12 +410,20 @@ def prepare_layer_dispatch(
     seq_len, emb_dim = shape["seq_len"], shape["emb_dim"]
     ffn_dim, num_heads = shape["ffn_dim"], shape["num_heads"]
     head_dim = shape["head_dim"]
+    # The variant rides in the shape dict (run_mode._shape_for stamps it from
+    # the family) so the per-mode preparers pass it through unchanged. Absent
+    # means the encoder, which is every pre-family caller.
+    variant = shape.get("workload_variant", "encoder_bert")
+    causal = variant == "decoder_gpt2"
+    boundary_names = DECODER_BLOCK_BOUNDARIES if causal else BLOCK_BOUNDARIES
+    stage_atol = DECODER_STAGE_ATOL if causal else BLOCK_STAGE_ATOL
+    run_layer = run_decoder_block if causal else run_block
 
-    cfg = block_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim)
+    cfg = block_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim, causal=causal)
     describe_block(cfg)
 
     golden = generate_golden_reference(
-        seq_len, emb_dim, ffn_dim, num_heads, seed=seed, workload_variant="encoder_bert"
+        seq_len, emb_dim, ffn_dim, num_heads, seed=seed, workload_variant=variant
     )
     weights = golden["weights"]
     reference = golden["boundaries"]
@@ -380,10 +447,10 @@ def prepare_layer_dispatch(
 
     def dispatch(device_inputs, stage_stats):
         reconfig_baseline = cache.reconfiguration_counts()
-        boundaries, vector_rows = run_block(cache, cfg, device_inputs)
+        boundaries, vector_rows = run_layer(cache, cfg, device_inputs)
         stages = []
-        for name in BLOCK_BOUNDARIES:
-            atol = BLOCK_STAGE_ATOL[name]
+        for name in boundary_names:
+            atol = stage_atol[name]
             stats = stage_stats(boundaries[name], reference[name], atol=atol)
             stages.append(dict(stats, name=name, atol=atol))
             print(
@@ -418,8 +485,8 @@ def prepare_layer_dispatch(
         }
 
     record_extra = {
-        "variant": "encoder_bert",
-        "causal": False,
+        "variant": variant,
+        "causal": causal,
         "golden_seed": seed,
         "gemm_spec_source": cfg["qkv_source"],
         "gemm_spec_qkv": _spec_digest(cfg["qkv_spec"]),
@@ -442,12 +509,22 @@ def prepare_layer_dispatch(
         },
     }
     record_extra.update(extra or {})
-    return {
+    prepared = {
         "inputs": inputs,
         "expected": [reference["output"]],
         # ln1_weight, index 3. See the section header for the measurement that
-        # rules out every attention-side target.
+        # rules out every attention-side target. The decoder keeps the same
+        # target: its ln1 is the pre-norm feeding attention, so the
+        # perturbation is upstream of every boundary rather than two of ten.
         "inject": (BLOCK_INPUT_NAMES.index("ln1_weight"), (0,)),
         "dispatch": dispatch,
         "record_extra": record_extra,
     }
+    if causal:
+        # The decoder's whole-layer comparison must run at ITS output
+        # boundary's atol, not the spec row's encoder-measured one: same
+        # tensor, same comparison, one number -- the symmetry the encoder's
+        # stage table pins in the other direction. run_mode prefers this key
+        # over spec["atol"] when present.
+        prepared["atol"] = stage_atol["output"]
+    return prepared

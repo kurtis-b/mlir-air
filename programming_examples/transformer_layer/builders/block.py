@@ -1,7 +1,12 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""One ``encoder_bert`` transformer layer, assembled from the Phase C operators.
+"""One whole transformer layer, assembled from the Phase C operators.
+
+The primary graph is the ``encoder_bert`` layer (``run_block``); ``block_config
+(..., causal=True)`` + ``run_decoder_block`` assemble the pre-norm causal
+``decoder_gpt2`` layer from the same operator set plus the bare
+``elementwise_add`` its raw residual stream needs.
 
 CONTRACT
     ``block_config(...)`` resolves every operator's configuration without
@@ -156,6 +161,7 @@ from builders.mha_out_proj import (  # noqa: E402
     mha_out_proj_arg_layout,
     mha_out_proj_config,
 )
+from builders.elementwise_add import build_elementwise_add_module  # noqa: E402
 from builders.qkv_proj import build_qkv_proj_module, qkv_gemm_spec  # noqa: E402
 
 #: The host tensors the layer takes, in the order ``opcheck.py`` indexes them
@@ -181,6 +187,27 @@ BLOCK_BOUNDARIES = (
     "attn_context",
     "attn_out",
     "hidden",
+    "ffn_up",
+    "ffn_gelu",
+    "ffn_out",
+    "output",
+)
+
+#: Every boundary ``run_decoder_block`` reads back, in execution order. Matches
+#: ``pattern/reference.py::DECODER_BOUNDARIES`` name for name, under the same
+#: name-matched comparison contract as ``BLOCK_BOUNDARIES`` above. The decoder
+#: has twelve where the encoder has ten: the two pre-norms surface ``ln_in``
+#: and ``ffn_in``, the raw residual stream surfaces ``residual``, and the
+#: encoder's post-attention ``hidden`` does not exist.
+DECODER_BLOCK_BOUNDARIES = (
+    "ln_in",
+    "q",
+    "k",
+    "v",
+    "attn_context",
+    "attn_out",
+    "residual",
+    "ffn_in",
     "ffn_up",
     "ffn_gelu",
     "ffn_out",
@@ -247,7 +274,7 @@ def norm_rows(seq_len, emb_dim, herd_x=NORM_HERD_X):
     return max(legal)
 
 
-def block_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
+def block_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim, causal=False):
     """Resolve every operator's configuration without building anything.
 
     Split from the builders the same way ``mha_out_proj_config`` and
@@ -257,6 +284,14 @@ def block_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
     Raises if ``num_heads * head_dim != emb_dim``: the fused QKV weight, the
     attention layout and the output projection all assume it, and none of them
     would report the mismatch as a mismatch.
+
+    ``causal=True`` resolves the DECODER's configuration: the attention kernel
+    is built with its in-kernel causal mask, and a fifth artifact -- the bare
+    ``elementwise_add`` the decoder's raw residual stream needs -- joins the
+    set. The decoder-only keys are added CONDITIONALLY rather than defaulted,
+    because ``block_artifact_fingerprint`` hashes this whole dict: a new key on
+    the encoder path would invalidate every cached encoder ELF for a config
+    that resolved identically.
     """
     if num_heads * head_dim != emb_dim:
         raise ValueError(
@@ -268,7 +303,7 @@ def block_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
     qkv_spec, qkv_source = qkv_gemm_spec(seq_len, emb_dim)
     up_spec, down_spec, ffn_source = ffn_gemm_specs(seq_len, emb_dim, ffn_dim)
     attn_cfg, o_spec, o_source = mha_out_proj_config(
-        seq_len, head_dim, num_heads, causal=False
+        seq_len, head_dim, num_heads, causal=causal
     )
     rows = norm_rows(seq_len, emb_dim)
 
@@ -282,7 +317,13 @@ def block_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
         "ffn": f"blk_ffn_{suffix}x{ffn_dim}",
         "addnorm": f"blk_addnorm_{rows}x{emb_dim}_pre_add",
     }
-    return {
+    if causal:
+        # Distinct names, not a rebuilt encoder artifact: the causal and
+        # non-causal attention ELFs coexist in one cache, and a shared name
+        # would make a stale-fingerprint recompile of one clobber the other.
+        artifacts["mha_out_proj"] = f"blk_mha_out_proj_{suffix}x{num_heads}h_causal"
+        artifacts["add"] = f"blk_add_{suffix}"
+    cfg = {
         "seq_len": seq_len,
         "emb_dim": emb_dim,
         "ffn_dim": ffn_dim,
@@ -310,6 +351,15 @@ def block_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
             artifacts["addnorm"]: dict(_ADDNORM_BACKEND, instance_name="addnorm"),
         },
     }
+    if causal:
+        cfg["causal"] = True
+        # The add builder emits one function named `eltwise_add_2d`; the
+        # instance_name must match it (footgun: a mismatch times out, it does
+        # not fail to load). Single-launch, so the addnorm backend settings fit.
+        cfg["backend_kwargs"][artifacts["add"]] = dict(
+            _ADDNORM_BACKEND, instance_name="eltwise_add_2d"
+        )
+    return cfg
 
 
 def _compile_gemm_object(spec):
@@ -365,7 +415,10 @@ _ARTIFACT_BUILD = {
     "mha_out_proj": (
         compile_mha_kernels,
         lambda cfg: build_mha_out_proj_module(
-            cfg["seq_len"], cfg["head_dim"], cfg["num_heads"], causal=False
+            cfg["seq_len"],
+            cfg["head_dim"],
+            cfg["num_heads"],
+            causal=cfg.get("causal", False),
         ),
     ),
     "ffn": (
@@ -376,6 +429,14 @@ _ARTIFACT_BUILD = {
         compile_addnorm_kernels,
         lambda cfg: build_addnorm_module(
             cfg["norm_rows"], cfg["emb_dim"], bfloat16, herd_x=NORM_HERD_X, pre_add=True
+        ),
+    ),
+    # Decoder only (`block_config(causal=True)` adds the artifact): the bare
+    # residual add. Pure MLIR, no external objects, hence the no-op compile fn.
+    "add": (
+        lambda cfg: None,
+        lambda cfg: build_elementwise_add_module(
+            cfg["seq_len"], cfg["emb_dim"], bfloat16
         ),
     ),
 }
@@ -447,6 +508,10 @@ def compile_block_artifacts(cache, cfg, run_only=False, keys=None):
     stale = []
     for key, (_, build_module) in _ARTIFACT_BUILD.items():
         if keys is not None and key not in keys:
+            continue
+        # An encoder cfg has no "add" artifact; the build table is the union
+        # of both variants and the cfg names which subset applies.
+        if key not in names:
             continue
         name = names[key]
         module = build_module(cfg)
@@ -670,6 +735,30 @@ def _sequence_ffn(cache, cfg, hidden, w_up, w_down):
     return _copy_out(results, outputs), vector
 
 
+def _sequence_add(cache, cfg, label, a_full, b_full):
+    """One bare elementwise add, ``out = a + b`` over ``[seq_len, emb_dim]``.
+
+    The decoder's residual stream is the RAW sum -- no norm rides on it -- so
+    unlike the encoder this graph dispatches ``elementwise_add`` as its own
+    step. One dispatch, not row-blocked: the add builder is row-parallel with
+    one shim DMA triple per tile, so the whole activation fits a single launch.
+    """
+    seq_len, emb_dim = cfg["seq_len"], cfg["emb_dim"]
+    name = cfg["artifacts"]["add"]
+    a_name, b_name, o_name = f"{label}_a", f"{label}_b", f"{label}_out"
+    arrays = {
+        a_name: np.ascontiguousarray(a_full),
+        b_name: np.ascontiguousarray(b_full),
+        o_name: np.zeros((seq_len, emb_dim), dtype=bfloat16),
+    }
+    steps = [DispatchStep(name, (a_name, b_name, o_name), writes=(2,))]
+    specs = {
+        n: _spec(n, arr, host_output=n == o_name) for n, arr in arrays.items()
+    }
+    results, vector = cache.run_sequence(steps, specs, cfg["backend_kwargs"], arrays)
+    return np.array(results[o_name], copy=True), vector
+
+
 def run_block(cache, cfg, inputs):
     """Dispatch the whole layer and return every device boundary.
 
@@ -710,11 +799,77 @@ def run_block(cache, cfg, inputs):
     return boundaries, [v.as_row() for v in (vec_a, vec_b, vec_c, vec_d)]
 
 
+def run_decoder_block(cache, cfg, inputs):
+    """Dispatch one pre-norm causal decoder layer; every device boundary back.
+
+    Same contract as ``run_block`` -- ``cfg`` from ``block_config(...,
+    causal=True)``, ``inputs`` in ``BLOCK_INPUT_NAMES`` order (the decoder
+    takes the SAME seven tensors; ``pattern/reference.py`` draws both variants'
+    weights in one order) -- but the graph is the decoder's, mirroring
+    ``pattern/reference.py::_decoder_gpt2_boundaries`` step for step:
+
+        1  addnorm(x, 0)        ln1   -> ln_in     (pre-norm as pre-add + zeros)
+        2  qkv_proj + causal mha      -> q, k, v, attn_context, attn_out
+        3  add(attn_out, x)           -> residual  (raw, unnormalized)
+        4  addnorm(residual, 0) ln2   -> ffn_in
+        5  ffn                        -> ffn_up, ffn_gelu, ffn_out
+        6  add(ffn_out, residual)     -> output
+
+    The pre-norms reuse the SAME pre-add addnorm artifact the encoder
+    dispatches, with a zero residual plane -- the reference computes them the
+    same way, so device and reference share one function rather than agreeing
+    across two LayerNorm implementations. That zeros upload is paid bandwidth,
+    accepted for the first build; a dedicated no-residual norm is an
+    optimization with its own validation bill.
+    """
+    x, w_qkv, w_o, ln1_weight, w_up, w_down, ln2_weight = inputs
+    if not cfg.get("causal"):
+        raise ValueError(
+            "run_decoder_block needs block_config(..., causal=True); this cfg "
+            "resolved the encoder's non-causal attention"
+        )
+    zeros = np.zeros((cfg["seq_len"], cfg["emb_dim"]), dtype=bfloat16)
+
+    print(f"  [1/6] addnorm ln1 x{cfg['norm_blocks']} (pre-norm: zero residual)")
+    ln_in, vec_a = _sequence_norm(cache, cfg, "ln1", x, zeros, ln1_weight)
+
+    print("  [2/6] qkv_proj + mha_out_proj (causal, device-resident q/k/v)")
+    attn, vec_b = _sequence_a(cache, cfg, ln_in, w_qkv, w_o)
+
+    print("  [3/6] elementwise_add (residual = attn_out + x)")
+    residual, vec_c = _sequence_add(cache, cfg, "res1", attn["attn_out"], x)
+
+    print(f"  [4/6] addnorm ln2 x{cfg['norm_blocks']} (pre-norm: zero residual)")
+    ffn_in, vec_d = _sequence_norm(cache, cfg, "ln2", residual, zeros, ln2_weight)
+
+    print("  [5/6] ffn")
+    ffn, vec_e = _sequence_ffn(cache, cfg, ffn_in, w_up, w_down)
+
+    print("  [6/6] elementwise_add (output = ffn_out + residual)")
+    output, vec_f = _sequence_add(cache, cfg, "res2", ffn["ffn_out"], residual)
+
+    boundaries = dict(attn)
+    boundaries["ln_in"] = ln_in
+    boundaries["residual"] = residual
+    boundaries["ffn_in"] = ffn_in
+    boundaries.update(ffn)
+    boundaries["output"] = output
+    missing = [n for n in DECODER_BLOCK_BOUNDARIES if n not in boundaries]
+    if missing:
+        raise AssertionError(f"run_decoder_block produced no value for {missing}")
+    return boundaries, [
+        v.as_row() for v in (vec_a, vec_b, vec_c, vec_d, vec_e, vec_f)
+    ]
+
+
 def describe_block(cfg):
     """One line per operator, naming what the registry resolved for it."""
+    variant = (
+        "decoder_gpt2, causal" if cfg.get("causal") else "encoder_bert, non-causal"
+    )
     print(
         f"  block {cfg['seq_len']}x{cfg['emb_dim']} ffn {cfg['ffn_dim']} "
-        f"{cfg['num_heads']}h x {cfg['head_dim']} (encoder_bert, non-causal)"
+        f"{cfg['num_heads']}h x {cfg['head_dim']} ({variant})"
     )
     print(
         f"    qkv_proj  {cfg['qkv_spec']['method']} ({cfg['qkv_source']}), "

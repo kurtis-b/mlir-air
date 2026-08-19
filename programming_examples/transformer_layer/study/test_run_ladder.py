@@ -133,7 +133,10 @@ def test_the_stand_in_row_still_matches_the_catalogue():
 def test_no_override_returns_the_specs_own_shape():
     spec = _spec()
     shape, key, variant = run_mode._shape_for(spec, None)
-    assert shape == spec["shape"]
+    # The ONE addition over the catalogue row is the variant stamp the
+    # dispatch seam reads (`workload_variant`); everything else survives
+    # verbatim, and the equality is exact so a second addition fails here.
+    assert shape == dict(spec["shape"], workload_variant="encoder_bert")
     assert key == spec["shape_key"], "the catalogue's own key must survive verbatim"
 
 
@@ -191,27 +194,45 @@ def test_a_family_override_does_not_mutate_the_spec_either():
     assert spec["shape"]["ffn_dim"] == 3072
 
 
-def test_a_decoder_family_is_refused_rather_than_run_as_an_encoder():
+def test_a_decoder_family_is_refused_per_mode_rather_than_run_as_an_encoder():
     """The worst outcome available here is a valid-looking bidirectional
     measurement stamped `decoder_gpt2`, because nothing downstream could detect
-    it. So the variant is carried into the row AND the run is refused."""
-    _, key, variant = run_mode._shape_for(_spec(), 512, "gpt2_small_768")
+    it. So the variant is carried into the row AND the unwired modes refuse.
+    `[2026-08-19]` `coarse` builds the decoder graph (builders/block.py::
+    run_decoder_block), so the refusal is per (variant, mode) now -- and this
+    test pins BOTH halves: coarse absent, every other whole-layer mode present
+    with a reason of its own."""
+    shape, key, variant = run_mode._shape_for(_spec(), 512, "gpt2_small_768")
     assert variant == "decoder_gpt2"
     assert key == "512x768_decoder_gpt2"
-    assert variant in run_mode.UNBUILDABLE_VARIANTS
+    # The dispatch seam reads the variant out of the shape dict; a family
+    # override that dropped it would run the decoder family as the seam's
+    # encoder default -- exactly the silent outcome this test exists to block.
+    assert shape["workload_variant"] == "decoder_gpt2"
+    blockers = run_mode.UNBUILDABLE_VARIANTS[variant]
+    assert "coarse" not in blockers
+    assert set(blockers) == {"fused", "runlist", "offload", "coarse_c2", "coarse_c3"}
+    assert all(reason for reason in blockers.values())
 
     # And `run` must actually branch on it. Audited from the source rather than
     # called: `run` imports opcheck_specs, which pulls in the builders and needs
     # a toolchain this suite deliberately does not have. A refusal that is
     # declared and never consulted is the item 19 defect shape.
     source = open(os.path.join(_HERE, "run_mode.py"), encoding="utf-8").read()
-    assert "if variant in UNBUILDABLE_VARIANTS:" in source, (
-        "run_mode.run no longer refuses an unbuildable variant; a decoder "
-        "family would be measured as an encoder and stamped `decoder_gpt2`"
+    probe = "blocked = UNBUILDABLE_VARIANTS.get(variant, {}).get(mode)"
+    assert probe in source, (
+        "run_mode.run no longer refuses an unbuildable (variant, mode); a "
+        "decoder family would be measured as an encoder and stamped "
+        "`decoder_gpt2`"
     )
     # ...before anything is prepared, or the refusal costs a compile.
-    assert source.index("if variant in UNBUILDABLE_VARIANTS:") < source.index(
-        'prepared = spec["prepare"](shape)'
+    assert source.index(probe) < source.index('prepared = spec["prepare"](shape)')
+    # And the whole-layer comparison honors the preparer's variant atol: the
+    # decoder's output is an unnormalized residual sum, so comparing it at the
+    # spec row's encoder-measured atol would fail every valid decoder run.
+    assert 'prepared.get("atol", spec["atol"])' in source, (
+        "run_mode.run no longer prefers the preparer's atol; the decoder's "
+        "whole-layer comparison would run at the encoder's tolerance"
     )
 
 
@@ -437,6 +458,52 @@ def test_neither_new_callback_changes_the_existing_behaviour():
         )
     assert seen == [("coarse", 512), ("coarse", 1024)]
     assert [r["study_id"] for r in rows] == ["test", "test"]
+
+
+def _assigned_names(path, target):
+    """The tuple elements or dict keys assigned to ``target`` in ``path``.
+
+    Extracted from source rather than imported: two of the three modules below
+    pull in the device toolchain, which this suite deliberately does not have.
+    """
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == target for t in node.targets
+        ):
+            value = node.value
+            if isinstance(value, ast.Tuple):
+                return tuple(elt.value for elt in value.elts)
+            if isinstance(value, ast.Dict):
+                return tuple(key.value for key in value.keys)
+    raise AssertionError(f"{target} not assigned a tuple or dict in {path}")
+
+
+def test_decoder_boundary_names_agree_across_their_three_sources():
+    """block.py's DECODER_BLOCK_BOUNDARIES, reference.py's DECODER_BOUNDARIES
+    and opcheck_layer.py's DECODER_STAGE_ATOL must name the same twelve
+    boundaries, the first two in the same order. The runtime comparison pairs
+    device value to reference value BY NAME, so a drift between these sources
+    is not a failure at run time -- it is a boundary silently never compared,
+    or a KeyError a device-hour into a walk."""
+    block = _assigned_names(
+        os.path.join(_EXAMPLE, "builders", "block.py"), "DECODER_BLOCK_BOUNDARIES"
+    )
+    reference = _assigned_names(
+        os.path.join(_EXAMPLE, "pattern", "reference.py"), "DECODER_BOUNDARIES"
+    )
+    atol = _assigned_names(
+        os.path.join(_EXAMPLE, "opcheck_layer.py"), "DECODER_STAGE_ATOL"
+    )
+    assert block == reference, (
+        "run_decoder_block reads back different boundaries than the golden "
+        "model produces; the name-matched comparison would silently skip the "
+        "difference"
+    )
+    assert set(atol) == set(block), (
+        "DECODER_STAGE_ATOL does not cover exactly the decoder's boundaries"
+    )
+    assert len(block) == 12
 
 
 def main():

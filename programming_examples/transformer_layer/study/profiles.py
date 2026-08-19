@@ -40,12 +40,14 @@ WHAT THIS PROFILE CAN AND CANNOT REACH, SAID OUT LOUD
     overrode ``seq_len`` and not the width. That is now a parameter, and the
     cost of two more families is zero device-hours of sweeping.
 
-    The decoder half of the old text stands and is unchanged: ``decoder_gpt2``
-    is a different LAYER GRAPH, not a flag -- see
-    ``run_mode.UNBUILDABLE_VARIANTS``, which refuses it. Refusing matters more
-    than omitting here: overriding the width alone and stamping the row
-    ``decoder_gpt2`` would produce a valid-looking bidirectional measurement
-    under a causal name, and nothing downstream could detect it.
+    The decoder half of the old text held until `[2026-08-19]`: ``decoder_gpt2``
+    is a different LAYER GRAPH, not a flag, and ``coarse`` now BUILDS that graph
+    (``builders/block.py::run_decoder_block``) while
+    ``run_mode.UNBUILDABLE_VARIANTS`` refuses the modes that do not, per
+    (variant, mode). Refusing matters more than omitting here: overriding the
+    width alone and stamping the row ``decoder_gpt2`` would produce a
+    valid-looking bidirectional measurement under a causal name, and nothing
+    downstream could detect it.
 
     ``UNREACHABLE_FAMILIES`` carries each unreachable family with its reason,
     ``run_profile`` copies them into the run report, and no profile silently
@@ -135,21 +137,31 @@ REACHABLE_FAMILIES: tuple[str, ...] = (
 #: layer-graph reason rather than a coverage one. The two width entries that
 #: used to sit here ("needs registry coverage at hidden 512/1024") were false:
 #: that coverage landed 2026-08-07 and nothing had read the file since.
+#: `[2026-08-19]` The decoder layer graph EXISTS for `coarse`
+#: (builders/block.py::run_decoder_block); run_mode.UNBUILDABLE_VARIANTS now
+#: refuses per (variant, mode), with `coarse` absent. The three families stay
+#: out of PROFILE reach for two reasons that are not the old one: no decoder
+#: layer has run on hardware yet (DECODER_STAGE_ATOL is provisional until the
+#: first walk records atol_required), and a profile walks the MODE MATRIX --
+#: reachability here is per family, so admitting a family three of whose four
+#: modes refuse would present a partial walk as a matrix walk. Lifting this
+#: needs the hardware validation plus per-(family, mode) reachability.
 UNREACHABLE_FAMILIES: dict[str, str] = {
     "gpt2_512": (
-        "decoder_gpt2 is a different layer graph, not a width -- see "
-        "run_mode.UNBUILDABLE_VARIANTS. Its width (512) IS reachable, so this "
-        "family is one graph away rather than one sweep away"
+        "decoder_gpt2 is a different layer graph, not a width -- coarse builds "
+        "it now, the other modes refuse per run_mode.UNBUILDABLE_VARIANTS, and "
+        "no decoder walk is hardware-validated; see the block note above"
     ),
     "gpt2_small_768": (
-        "decoder_gpt2 is a different layer graph, not a width -- see "
-        "run_mode.UNBUILDABLE_VARIANTS. Its width is the default 768, so this "
-        "is the cheapest of the three decoders: the graph is the whole cost"
+        "decoder_gpt2 is a different layer graph, not a width -- coarse builds "
+        "it now, the other modes refuse per run_mode.UNBUILDABLE_VARIANTS, and "
+        "no decoder walk is hardware-validated; the default-width 768 makes "
+        "this the first decoder to validate"
     ),
     "gpt2_medium_1024": (
-        "decoder_gpt2 is a different layer graph, not a width -- see "
-        "run_mode.UNBUILDABLE_VARIANTS. Its width (1024) is reachable, so like "
-        "the other two decoders the graph is the whole cost"
+        "decoder_gpt2 is a different layer graph, not a width -- coarse builds "
+        "it now, the other modes refuse per run_mode.UNBUILDABLE_VARIANTS, and "
+        "no decoder walk is hardware-validated; see the block note above"
     ),
 }
 

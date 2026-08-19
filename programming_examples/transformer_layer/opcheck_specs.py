@@ -781,6 +781,32 @@ SPECS = [
         "prepare": prepare_mha_out_proj,
     },
     {
+        # The decoder families' attention: 12 heads x head_dim 64 = emb_dim
+        # 768, CAUSAL, at the ladder's cheapest length. This is the one
+        # (heads, width) the causal rows above do not cover -- 512x512x8h and
+        # 2048x1024x16h are exactly gpt2_512's and gpt2_medium_1024's shapes,
+        # and the gap between them is gpt2_small_768's. The projection is
+        # 512x768x768, a registered shape.
+        "operator": "mha_out_proj",
+        "shape_key": "512x768x12h_causal",
+        "shape": {
+            "seq_len": 512,
+            "head_dim": 64,
+            "num_heads": 12,
+            "causal": True,
+        },
+        # Measured mean_rel_L1 3.63e-2, atol_required 5.42e-2 over 393216
+        # elements, 0 mismatches (devq 359, 2026-08-19) -- the same band as
+        # the operator's other two causal rows (3.6e-2 / 4.1e-2, atol_required
+        # 4.88e-2 / 4.81e-2), so the error is set by the causal datapath and
+        # not by the head count, exactly as those rows' comments predict. The
+        # 8e-2 they share holds here at 1.48x margin -- the thinnest of the
+        # three causal rows, still strictly tighter than the FlashAttention
+        # tier's 1e-1 ceiling it inherits.
+        "atol": 8e-2,
+        "prepare": prepare_mha_out_proj,
+    },
+    {
         # PHASE D2: the whole encoder_bert layer, at the one configuration the
         # phase forces. `seq_len 4096` because that is the only point on the
         # ladder where `build_ffn_module` builds at hidden 768 (see the ffn row

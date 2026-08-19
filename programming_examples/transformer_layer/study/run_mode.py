@@ -185,6 +185,10 @@ def _shape_for(
         shape["ffn_dim"] = fam.intermediate_size
         shape["num_heads"] = fam.num_attention_heads
         shape["head_dim"] = fam.hidden_size // fam.num_attention_heads
+    # The dispatch seam reads the variant out of the shape dict
+    # (opcheck_layer.prepare_layer_dispatch), so it is stamped here once
+    # rather than threaded through every mode preparer's signature.
+    shape["workload_variant"] = variant
     if seq_len is None and family is None:
         return shape, spec["shape_key"], variant
     if seq_len is not None:
@@ -194,13 +198,15 @@ def _shape_for(
     return shape, f"{shape['seq_len']}x{emb}_{variant}", variant
 
 
-#: Families whose LAYER GRAPH this module cannot build, with the reason. A
-#: decoder is not the encoder graph with a flag: it needs the norm before
-#: attention, a plain residual add the encoder block never dispatches, and a
-#: masked add between the score GEMM and softmax that `runlist` and `offload`
-#: have no step for at all. The causal KERNEL exists and is validated
-#: (`opcheck_specs` carries causal `mha_out_proj` rows); the whole-layer wiring
-#: does not.
+#: {variant: {mode: reason}} -- the (variant, mode) pairs whose LAYER GRAPH is
+#: not built, each with ITS OWN reason. A decoder is not the encoder graph with
+#: a flag: it needs the norm before attention, a plain residual add the encoder
+#: block never dispatches, and causal masking between the score GEMM and
+#: softmax. `[2026-08-19]` `coarse` builds it -- `builders/block.py::
+#: run_decoder_block` wires the six-sequence pre-norm graph from the validated
+#: operators, so `coarse` no longer appears here. The remaining modes still
+#: refuse, per mode rather than per variant, because their gaps are different
+#: gaps and a shared message would rot as each one closes.
 #:
 #: REFUSED RATHER THAN SILENTLY RUN, and that is the whole point of the dict.
 #: Overriding the width alone and labelling the row `decoder_gpt2` would produce
@@ -208,14 +214,33 @@ def _shape_for(
 #: the worst outcome available here, because nothing downstream could ever
 #: detect it.
 UNBUILDABLE_VARIANTS = {
-    "decoder_gpt2": (
-        "the decoder layer graph is not built by any whole-layer mode: it needs "
-        "the norm BEFORE attention, a plain elementwise residual add the encoder "
-        "block never dispatches, and a causal masked-add between the score GEMM "
-        "and softmax that `runlist` and `offload` have no masking step for. The "
-        "causal kernel itself exists and is validated -- see opcheck_specs' "
-        "causal mha_out_proj rows -- so this is layer wiring, not a kernel gap"
-    )
+    "decoder_gpt2": {
+        "fused": (
+            "the fused tail packs the residual into the post-norm packed-plane "
+            "pipeline (builders/norm_tail.py, plane_major): a pre-norm layer "
+            "needs a zero-residual norm BEFORE attention and a bare residual "
+            "add that packing cannot express"
+        ),
+        "runlist": (
+            "its attention interior is scores -> softmax -> output with no "
+            "masking step between the score GEMM and the softmax; the mask-"
+            "tensor add (builders/elementwise_add.py causal_mask) has no "
+            "runlist step wired"
+        ),
+        "offload": (
+            "its host softmax (_host_softmax_bf16) applies no mask before the "
+            "exponentials, and its addnorm chain is the encoder's post-norm "
+            "order"
+        ),
+        "coarse_c2": (
+            "the C2 cell composes the encoder's post-norm cell structure "
+            "(pattern/coarse/cells.py); no decoder cell exists"
+        ),
+        "coarse_c3": (
+            "the C3 cell composes the encoder's post-norm cell structure "
+            "(pattern/coarse/cells.py); no decoder cell exists"
+        ),
+    }
 }
 
 
@@ -256,10 +281,10 @@ def run(
         row["attention_head_size"] = shape["head_dim"]
 
     try:
-        if variant in UNBUILDABLE_VARIANTS:
+        blocked = UNBUILDABLE_VARIANTS.get(variant, {}).get(mode)
+        if blocked is not None:
             raise RuntimeError(
-                f"{variant} is not buildable by any whole-layer mode: "
-                f"{UNBUILDABLE_VARIANTS[variant]}"
+                f"{variant} is not buildable by mode {mode!r}: {blocked}"
             )
         # --- everything here is OUTSIDE the timed region -------------------
         setup_t0 = time.perf_counter()
@@ -318,7 +343,16 @@ def run(
             row["sync_boundaries"] = totals["sync_boundaries"]
             row["bytes_transferred"] = totals["bytes_transferred"]
 
-        stats = _stage_stats(outputs[0], expected, atol=spec["atol"])
+        # The row's atol is the spec's -- measured at the encoder shape --
+        # unless the preparer supplies the variant's own. The decoder's output
+        # is an unnormalized residual sum, not the norm-shrunk tensor the
+        # spec's atol was measured on, so its preparer hands back its output
+        # boundary's atol: the same number for the same tensor compared the
+        # same way, which is the symmetry the encoder's stage table pins in
+        # the other direction ("output ... is the same tensor compared the
+        # same way").
+        final_atol = prepared.get("atol", spec["atol"])
+        stats = _stage_stats(outputs[0], expected, atol=final_atol)
         row["validation_error_count"] = stats["n_mismatch"]
         stages_ok = bool(extra.get("stages_passed", True))
         if stats["n_mismatch"] == 0 and stages_ok:
@@ -328,7 +362,7 @@ def run(
             row["run_status"] = "failed"
             row["failure_message"] = (
                 f"{stats['n_mismatch']} element(s) outside tolerance "
-                f"(atol {spec['atol']}), stages_passed={stages_ok}"
+                f"(atol {final_atol}), stages_passed={stages_ok}"
             )
     except Exception as e:  # a failed measurement still writes a complete row
         row["run_status"] = "failed"

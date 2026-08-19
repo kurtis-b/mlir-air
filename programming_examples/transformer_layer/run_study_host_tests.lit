@@ -335,5 +335,16 @@
 // Found by running Phase G's "two walks into two roots", which nothing had
 // done.
 //
+// `[2026-08-19]` 562 -> 563, no module added: the decoder layer graph landed
+// for `coarse` (builders/block.py::run_decoder_block; the six-sequence
+// pre-norm graph, causal attention, bare residual adds). run_mode's decoder
+// refusal became per (variant, mode) -- coarse absent, the four unwired modes
+// each with their own reason -- and test_run_ladder's refusal test now pins
+// both halves of that. The +1 is the three-source name-match audit:
+// DECODER_BLOCK_BOUNDARIES (block.py), DECODER_BOUNDARIES (reference.py) and
+// DECODER_STAGE_ATOL (opcheck_layer.py) must name the same twelve boundaries,
+// checked from source because the runtime pairs them BY NAME -- the drift
+// failure is a boundary silently never compared, not an error.
+//
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 562/562 passed in 25 modules
+// CHECK: study host tests: 563/563 passed in 25 modules
