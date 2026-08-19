@@ -1,0 +1,18 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// SmolLM2-1.7B int4 (GGUF q4_0) verify gate: top-k token-level inclusion
+// check, NPU (bf16 prefill on q4_0-dequant + int4 gs=32 decode) vs the PLAIN
+// HF bf16 model, 2 prompts x 32 greedy tokens, k=5. The delta deliberately
+// INCLUDES q4_0 quantization error — the quantization is what is shipped.
+// Needs the Q4_0 GGUF checkpoint on disk (Makefile GGUF= / $SMOLLM2_GGUF).
+//
+// NOT CI-triggered by design: the filename intentionally OMITS "peano", so
+// the CI peano suite (`lit --filter "peano"`) does not collect it. Run on
+// demand with:
+//   lit -v programming_examples/llms/smollm2_1_7b_int4/run_npu2_verify.lit
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: make -f %S/Makefile verify PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+// CHECK: [verify] PASS

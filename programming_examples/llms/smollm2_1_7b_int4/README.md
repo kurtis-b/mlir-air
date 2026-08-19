@@ -45,5 +45,6 @@ GGUF=/path/to/other.gguf make run   # another Q4_0 checkpoint
   surfaced (ChatML prompt-length, gs canonical staging): `llama32_1b`,
   `llama32_1b_int4`, `smollm2_1_7b` all PASS (devq 379).
 
-Not yet ported from the siblings: the `run_npu2_*.lit` CI recipes and an
-`ARCHITECTURE.md`.
+On-demand lit recipes (`run_npu2_compile.lit`, `run_npu2_verify.lit` — not
+CI-collected, same policy as the bf16 sibling) and [ARCHITECTURE.md](ARCHITECTURE.md)
+round out the example.
