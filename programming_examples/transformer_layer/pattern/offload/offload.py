@@ -164,6 +164,7 @@ from builders.block_cache import (  # noqa: E402
 from builders.gemm_spec import resolve_gemm_spec, spec_herd  # noqa: E402
 from opcheck_layer import (  # noqa: E402
     BLOCK_STAGE_ATOL,
+    DECODER_STAGE_ATOL,
     print_dispatch_totals,
     reconfiguration_delta,
 )
@@ -171,6 +172,7 @@ from opcheck_prepare import _spec_digest  # noqa: E402
 from pattern import EXECUTION_MODE_CSV  # noqa: E402
 from pattern.blocked_attention import round_bf16  # noqa: E402
 from pattern.reference import (  # noqa: E402
+    DECODER_BOUNDARIES,
     ENCODER_BOUNDARIES,
     generate_golden_reference,
 )
@@ -506,11 +508,12 @@ def offload_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
     }
 
 
-def describe_offload(cfg):
+def describe_offload(cfg, causal=False):
     """One line per resolved decision, for the run log and the lit gate."""
+    variant = "decoder_gpt2, causal" if causal else "encoder_bert, non-causal"
     print(
         f"  offload {cfg['seq_len']}x{cfg['emb_dim']} ffn {cfg['ffn_dim']} "
-        f"{cfg['num_heads']}h x {cfg['head_dim']} (encoder_bert, non-causal, "
+        f"{cfg['num_heads']}h x {cfg['head_dim']} ({variant}, "
         f"linear boundary: 8 linear operators over 5 shapes, "
         f"{cfg['n_dispatches']} dispatches, attention on device)"
     )
@@ -776,7 +779,7 @@ def _host_addnorm(x, residual, weight):
     return round_bf16(normed.numpy())
 
 
-def _host_softmax_bf16(scores, scale):
+def _host_softmax_bf16(scores, scale, mask=None):
     """Scale, then row-softmax, in f32 on the host; rounded to bf16 for the device.
 
     The one NON-LINEAR operator inside attention, and therefore the whole
@@ -790,15 +793,29 @@ def _host_softmax_bf16(scores, scale):
     on the already-materialized f32 scores keeps the device GEMM's operands
     exactly the projections the previous dispatch produced, so a stage
     comparison on ``q`` is comparing the tensor the next GEMM actually read.
+
+    ``mask`` is the decoder's additive causal mask, f32 ``[seq, seq]``, 0 on
+    and below the diagonal and ``-inf`` above -- host f32 makes ``-inf`` safe
+    here (added AFTER scaling, it is exactly the reference's ``np.where``
+    replacement), where the DEVICE mask path uses ``-10000.0`` because bf16
+    ``-inf`` turns the add into NaN (builders/elementwise_add.py).
     """
     import torch
 
-    probs = torch.softmax(_torch_f32(scores) * scale, dim=-1)
+    scaled = _torch_f32(scores) * scale
+    if mask is not None:
+        scaled = scaled + torch.from_numpy(mask)
+    probs = torch.softmax(scaled, dim=-1)
     return round_bf16(probs.numpy())
 
 
-def _device_attention(cache, cfg, gemm, q, k, v):
-    """Non-causal multi-head attention with BOTH matmuls on the device.
+def _device_attention(cache, cfg, gemm, q, k, v, mask=None):
+    """Multi-head attention with BOTH matmuls on the device.
+
+    ``mask=None`` is the encoder's non-causal form; the decoder passes the
+    additive causal mask, which rides into the host softmax and changes no
+    device dispatch -- the masked positions are host arithmetic between the
+    two GEMMs, exactly where this mode's partition puts non-linearity.
 
     One head at a time, because the two shapes are per-head: ``[seq, head_dim]
     @ [head_dim, seq]`` and ``[seq, seq] @ [seq, head_dim]``. Two dispatches
@@ -832,7 +849,7 @@ def _device_attention(cache, cfg, gemm, q, k, v):
 
         scores = gemm("attn_scores", q_head, k_head_t)
         with cache.profiler.time_cpu("softmax"):
-            probs = _host_softmax_bf16(scores, scale)
+            probs = _host_softmax_bf16(scores, scale, mask=mask)
         context[:, columns] = gemm("attn_output", probs, v_head)
 
     return context.astype(np.float32)
@@ -866,12 +883,21 @@ def prepare_offload(shape, seed=42):
     seq_len, emb_dim = shape["seq_len"], shape["emb_dim"]
     ffn_dim, num_heads = shape["ffn_dim"], shape["num_heads"]
     head_dim = shape["head_dim"]
+    # The variant rides in the shape dict (run_mode._shape_for stamps it).
+    # The decoder changes NO device artifact in this mode: the causal mask is
+    # host arithmetic inside the softmax, and the pre-norms/residual adds are
+    # host torch/numpy -- the mode's own partition (linear on device,
+    # everything else host) is what makes its decoder host-only.
+    variant = shape.get("workload_variant", "encoder_bert")
+    causal = variant == "decoder_gpt2"
+    boundary_names = DECODER_BOUNDARIES if causal else ENCODER_BOUNDARIES
+    stage_atol = DECODER_STAGE_ATOL if causal else BLOCK_STAGE_ATOL
 
     cfg = offload_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim)
-    describe_offload(cfg)
+    describe_offload(cfg, causal=causal)
 
     golden = generate_golden_reference(
-        seq_len, emb_dim, ffn_dim, num_heads, seed=seed, workload_variant="encoder_bert"
+        seq_len, emb_dim, ffn_dim, num_heads, seed=seed, workload_variant=variant
     )
     weights = golden["weights"]
     reference = golden["boundaries"]
@@ -912,10 +938,28 @@ def prepare_offload(shape, seed=42):
             vector_rows.append(row)
             return out
 
+        boundaries = {}
+        if causal:
+            # Pre-norm: the projections consume LayerNorm(x) * gamma, computed
+            # the pre-add way with a zero residual -- the same function shape
+            # the reference and the coarse decoder use.
+            print("  [pre] host pre-norm ln1 (zero residual)")
+            zeros = np.zeros_like(x)
+            with cache.profiler.time_cpu("ln1"):
+                proj_in = _host_addnorm(x, zeros, ln1_weight)
+            boundaries["ln_in"] = proj_in
+            # Additive causal mask for the host softmax: f32 makes -inf exact
+            # (see _host_softmax_bf16); one array, shared by every head.
+            mask = np.triu(
+                np.full((seq_len, seq_len), -np.inf, dtype=np.float32), k=1
+            )
+        else:
+            proj_in = x
+            mask = None
         print("  [1/8] q_proj + [2/8] k_proj + [3/8] v_proj (one dispatch each)")
-        q = gemm("q_proj", x, w_q)
-        k = gemm("k_proj", x, w_k)
-        v = gemm("v_proj", x, w_v)
+        q = gemm("q_proj", proj_in, w_q)
+        k = gemm("k_proj", proj_in, w_k)
+        v = gemm("v_proj", proj_in, w_v)
         print(
             f"  [4/8+5/8] attn_scores + attn_output on device, "
             f"{num_heads} heads, host softmax between them"
@@ -926,35 +970,58 @@ def prepare_offload(shape, seed=42):
         # data movement the partition says nothing about. Summing them into one
         # "attention" figure would report the partition's cost as larger than
         # it is.
-        attn_context = _device_attention(cache, cfg, gemm, q, k, v)
+        attn_context = _device_attention(cache, cfg, gemm, q, k, v, mask=mask)
         print("  [6/8] output_proj")
         attn_out = gemm("output_proj", round_bf16(attn_context), w_o)
-        with cache.profiler.time_cpu("ln1"):
-            hidden = _host_addnorm(attn_out, x, ln1_weight)
+        if causal:
+            # The decoder's residual stream is the RAW sum -- an exact f32 add
+            # rounded once, the same single-rounding contract as
+            # elementwise_add_reference and the device add kernel.
+            with cache.profiler.time_cpu("residual_add"):
+                residual = round_bf16(
+                    np.asarray(attn_out, np.float32) + np.asarray(x, np.float32)
+                )
+            boundaries["residual"] = residual
+            print("  [pre] host pre-norm ln2 (zero residual)")
+            with cache.profiler.time_cpu("ln2"):
+                ffn_src = _host_addnorm(residual, zeros, ln2_weight)
+            boundaries["ffn_in"] = ffn_src
+        else:
+            with cache.profiler.time_cpu("ln1"):
+                ffn_src = _host_addnorm(attn_out, x, ln1_weight)
+            boundaries["hidden"] = ffn_src
         print("  [7/8] up_proj")
-        ffn_up = gemm("up_proj", hidden, w_up)
+        ffn_up = gemm("up_proj", ffn_src, w_up)
         with cache.profiler.time_cpu("gelu"):
             ffn_gelu = _host_gelu(ffn_up)
         print("  [8/8] down_proj")
         ffn_out = gemm("down_proj", round_bf16(ffn_gelu), w_down)
-        with cache.profiler.time_cpu("ln2"):
-            output = _host_addnorm(ffn_out, hidden, ln2_weight)
+        if causal:
+            with cache.profiler.time_cpu("residual_add"):
+                output = round_bf16(
+                    np.asarray(ffn_out, np.float32)
+                    + np.asarray(residual, np.float32)
+                )
+        else:
+            with cache.profiler.time_cpu("ln2"):
+                output = _host_addnorm(ffn_out, ffn_src, ln2_weight)
 
-        boundaries = {
-            "q": q,
-            "k": k,
-            "v": v,
-            "attn_context": attn_context,
-            "attn_out": attn_out,
-            "hidden": hidden,
-            "ffn_up": ffn_up,
-            "ffn_gelu": ffn_gelu,
-            "ffn_out": ffn_out,
-            "output": output,
-        }
+        boundaries.update(
+            {
+                "q": q,
+                "k": k,
+                "v": v,
+                "attn_context": attn_context,
+                "attn_out": attn_out,
+                "ffn_up": ffn_up,
+                "ffn_gelu": ffn_gelu,
+                "ffn_out": ffn_out,
+                "output": output,
+            }
+        )
         stages = []
-        for name in ENCODER_BOUNDARIES:
-            atol = BLOCK_STAGE_ATOL[name]
+        for name in boundary_names:
+            atol = stage_atol[name]
             stats = stage_stats(boundaries[name], reference[name], atol=atol)
             stages.append(dict(stats, name=name, atol=atol))
             print(
@@ -1017,6 +1084,9 @@ def prepare_offload(shape, seed=42):
             ),
             # Per LAYER, which is the unit every other count in this row uses.
             "n_dispatches": cfg["n_dispatches"],
+            # The variant, so component_groups judges a decoder dispatch
+            # against the decoder's host-bucket set (its `residual_add`).
+            "variant": variant,
             "stages": stages,
             "stages_passed": clean == len(stages),
             "dispatch_vectors": vector_rows,
@@ -1036,8 +1106,8 @@ def prepare_offload(shape, seed=42):
         }
 
     record_extra = {
-        "variant": "encoder_bert",
-        "causal": False,
+        "variant": variant,
+        "causal": causal,
         "golden_seed": seed,
         "execution_mode": EXECUTION_MODE_CSV["offload"],
         "attention_path": ATTENTION_PATH,
@@ -1054,7 +1124,7 @@ def prepare_offload(shape, seed=42):
         "gemm_spec_attn_scores": _spec_digest(cfg["specs"]["attn_scores"][0]),
         "gemm_spec_attn_output": _spec_digest(cfg["specs"]["attn_output"][0]),
     }
-    return {
+    prepared = {
         "inputs": inputs,
         "expected": [reference["output"]],
         # ln1_weight, index 5. See the docstring for why the block's measured
@@ -1063,3 +1133,9 @@ def prepare_offload(shape, seed=42):
         "dispatch": dispatch,
         "record_extra": record_extra,
     }
+    if causal:
+        # Same seam as opcheck_layer's: the decoder's whole-layer comparison
+        # runs at its own output boundary's atol, not the spec row's
+        # encoder-measured one. run_mode prefers this key when present.
+        prepared["atol"] = stage_atol["output"]
+    return prepared

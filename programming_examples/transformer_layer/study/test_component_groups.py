@@ -142,9 +142,13 @@ def test_the_host_taxonomy_matches_what_the_pattern_modules_actually_time():
     """
     for code_name, package in sorted(_dispatch_modes().items()):
         csv_mode = schema.EXECUTION_MODE_CSV[code_name]
+        # The DECODER taxonomy is the superset (encoder buckets plus the
+        # variant's declared extras), and the source scan cannot tell which
+        # variant opens a bucket -- so the union is the right comparand. The
+        # variant SPLIT is pinned by its own test below.
         declared = {
             component
-            for spec in cg.groups_for(csv_mode)
+            for spec in cg.groups_for(csv_mode, "decoder_gpt2")
             if spec.kind == "host_cpu"
             for component in spec.components
         }
@@ -153,6 +157,62 @@ def test_the_host_taxonomy_matches_what_the_pattern_modules_actually_time():
             f"{code_name}: the taxonomy declares host buckets {sorted(declared)} "
             f"but {package.name}/ opens {sorted(derived)}"
         )
+
+
+def test_the_decoder_taxonomy_widens_offload_and_only_offload():
+    """The variant split, pinned in both directions.
+
+    `offload`'s decoder opens `residual_add` (its raw residual sum is host
+    arithmetic, like its norms); its ENCODER path never does, so a merged
+    declaration would report every encoder row incomplete over a bucket the
+    graph does not have. The encoder taxonomy must therefore exclude it, the
+    decoder taxonomy include it, and no other mode may differ between
+    variants. `aggregate` keys the choice off the dispatch extra's `variant`,
+    so a decoder extra is judged against the decoder set."""
+    encoder = {
+        c
+        for s in cg.groups_for("offload")
+        if s.kind == "host_cpu"
+        for c in s.components
+    }
+    decoder = {
+        c
+        for s in cg.groups_for("offload", "decoder_gpt2")
+        if s.kind == "host_cpu"
+        for c in s.components
+    }
+    assert "residual_add" not in encoder
+    assert decoder == encoder | {"residual_add"}
+    for mode in cg.COMPONENT_GROUPS:
+        if mode == "offload":
+            continue
+        assert cg.groups_for(mode) == cg.groups_for(mode, "decoder_gpt2"), mode
+    # And the extras table names only modes the taxonomy knows.
+    assert set(cg.DECODER_EXTRA_HOST_COMPONENTS) <= set(cg.COMPONENT_GROUPS)
+    # aggregate consults the extra's variant: the same buckets, judged
+    # complete as a decoder dispatch and incomplete as an encoder one.
+    buckets = {
+        "attention_layout": 1.0,
+        "softmax": 1.0,
+        "ln1": 1.0,
+        "gelu": 1.0,
+        "ln2": 1.0,
+        "residual_add": 1.0,
+    }
+    as_decoder = next(
+        t
+        for t in cg.aggregate(
+            _extra(host_cpu_ms=dict(buckets), variant="decoder_gpt2"), "offload"
+        )
+        if t.kind == "host_cpu"
+    )
+    assert as_decoder.is_complete and as_decoder.ms == 6.0
+    as_encoder = next(
+        t
+        for t in cg.aggregate(_extra(host_cpu_ms=dict(buckets)), "offload")
+        if t.kind == "host_cpu"
+    )
+    assert not as_encoder.is_complete or as_encoder.ms == 5.0
 
 
 def test_the_host_bucket_derivation_can_tell_the_modes_apart():

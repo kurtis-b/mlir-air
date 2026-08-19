@@ -204,7 +204,9 @@ def _shape_for(
 #: block never dispatches, and causal masking between the score GEMM and
 #: softmax. `[2026-08-19]` `coarse` builds it -- `builders/block.py::
 #: run_decoder_block` wires the six-sequence pre-norm graph from the validated
-#: operators, so `coarse` no longer appears here. The remaining modes still
+#: operators -- and `offload` builds it host-side (its mask rides into the host
+#: softmax, its pre-norms and residual adds are host arithmetic; NO device
+#: artifact changes), so neither appears here. The remaining modes still
 #: refuse, per mode rather than per variant, because their gaps are different
 #: gaps and a shared message would rot as each one closes.
 #:
@@ -226,11 +228,6 @@ UNBUILDABLE_VARIANTS = {
             "masking step between the score GEMM and the softmax; the mask-"
             "tensor add (builders/elementwise_add.py causal_mask) has no "
             "runlist step wired"
-        ),
-        "offload": (
-            "its host softmax (_host_softmax_bf16) applies no mask before the "
-            "exponentials, and its addnorm chain is the encoder's post-norm "
-            "order"
         ),
         "coarse_c2": (
             "the C2 cell composes the encoder's post-norm cell structure "

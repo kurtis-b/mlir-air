@@ -346,5 +346,20 @@
 // checked from source because the runtime pairs them BY NAME -- the drift
 // failure is a boundary silently never compared, not an error.
 //
+// `[2026-08-19]` 563 -> 564, no module added: the OFFLOAD decoder landed --
+// host-only (the causal mask rides into the host softmax as additive -inf in
+// f32, the pre-norms and raw residual adds are host arithmetic; no device
+// artifact changes), so run_mode's per-(variant, mode) refusal loses its
+// offload entry. The +1 pins the taxonomy's variant split: offload's decoder
+// opens a `residual_add` host bucket its encoder never does, so
+// component_groups.groups_for is variant-aware -- a merged declaration would
+// report every encoder row incomplete over a bucket the encoder graph does
+// not have, and the source-derivation test now compares against the decoder
+// superset while the new test pins the split both ways. Found and fixed in
+// passing: component_groups' CLI main() unpacked TWO values from
+// run_mode._shape_for, which has returned three since the family override
+// (2026-08-12) -- the CLI crashed at every invocation since and nothing
+// covered it.
+//
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 563/563 passed in 25 modules
+// CHECK: study host tests: 564/564 passed in 25 modules

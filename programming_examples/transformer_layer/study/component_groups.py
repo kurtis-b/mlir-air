@@ -189,16 +189,46 @@ class GroupTotal:
         return self.component_count == self.expected_component_count
 
 
-def groups_for(execution_mode: str) -> tuple[GroupSpec, ...]:
-    """The taxonomy for a CSV execution_mode. Raises rather than returning ()."""
+#: Host buckets a mode's DECODER variant opens beyond its encoder set, keyed by
+#: CSV execution_mode. Declared beside the encoder table rather than merged
+#: into it, because the completeness check is per variant: `offload`'s encoder
+#: path never opens `residual_add`, and a merged 6-bucket declaration would
+#: report every encoder row incomplete over a bucket the graph does not have.
+DECODER_EXTRA_HOST_COMPONENTS: dict[str, tuple[str, ...]] = {
+    "offload": ("residual_add",),
+}
+
+
+def groups_for(
+    execution_mode: str, variant: str = "encoder_bert"
+) -> tuple[GroupSpec, ...]:
+    """The taxonomy for a CSV execution_mode. Raises rather than returning ().
+
+    ``variant`` widens the host group for a decoder run by the mode's declared
+    extra buckets (``DECODER_EXTRA_HOST_COMPONENTS``); the encoder taxonomy is
+    returned untouched for every other value.
+    """
     try:
-        return COMPONENT_GROUPS[execution_mode]
+        specs = COMPONENT_GROUPS[execution_mode]
     except KeyError:
         raise ValueError(
             f"no component taxonomy for execution_mode {execution_mode!r}; "
             f"known are {sorted(COMPONENT_GROUPS)}. Note this keys on the CSV "
             "value, so `coarse` is `hybrid` (convention 7)."
         ) from None
+    extra = (
+        DECODER_EXTRA_HOST_COMPONENTS.get(execution_mode, ())
+        if variant == "decoder_gpt2"
+        else ()
+    )
+    if not extra:
+        return specs
+    return tuple(
+        GroupSpec(s.label, s.kind, s.components + extra)
+        if s.kind == "host_cpu"
+        else s
+        for s in specs
+    )
 
 
 def aggregate(extra: dict, execution_mode: str) -> tuple[GroupTotal, ...]:
@@ -211,7 +241,9 @@ def aggregate(extra: dict, execution_mode: str) -> tuple[GroupTotal, ...]:
     """
     host_buckets = extra.get("host_cpu_ms")
     totals = []
-    for spec in groups_for(execution_mode):
+    # The variant is read off the dispatch's own extra (the offload decoder
+    # reports it), so a decoder run is judged against its own bucket set.
+    for spec in groups_for(execution_mode, extra.get("variant", "encoder_bert")):
         if spec.kind == "host_cpu":
             if host_buckets is None:
                 ms, counted, missing = None, 0, spec.components
@@ -363,7 +395,9 @@ def main(argv: list[str] | None = None) -> int:
 
     csv_mode = schema.EXECUTION_MODE_CSV.get(args.mode, args.mode)
     spec = run_mode._spec_for(args.mode)
-    shape, shape_key = run_mode._shape_for(spec, args.seq)
+    # Three values since the family override (2026-08-12); this line unpacked
+    # two until 2026-08-19, so the CLI crashed at every invocation since.
+    shape, shape_key, _variant = run_mode._shape_for(spec, args.seq)
 
     try:
         prepared = spec["prepare"](shape)

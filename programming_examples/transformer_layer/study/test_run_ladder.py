@@ -199,9 +199,9 @@ def test_a_decoder_family_is_refused_per_mode_rather_than_run_as_an_encoder():
     measurement stamped `decoder_gpt2`, because nothing downstream could detect
     it. So the variant is carried into the row AND the unwired modes refuse.
     `[2026-08-19]` `coarse` builds the decoder graph (builders/block.py::
-    run_decoder_block), so the refusal is per (variant, mode) now -- and this
-    test pins BOTH halves: coarse absent, every other whole-layer mode present
-    with a reason of its own."""
+    run_decoder_block) and `offload` builds it host-side, so the refusal is
+    per (variant, mode) now -- and this test pins BOTH halves: the built modes
+    absent, every unwired whole-layer mode present with a reason of its own."""
     shape, key, variant = run_mode._shape_for(_spec(), 512, "gpt2_small_768")
     assert variant == "decoder_gpt2"
     assert key == "512x768_decoder_gpt2"
@@ -211,7 +211,8 @@ def test_a_decoder_family_is_refused_per_mode_rather_than_run_as_an_encoder():
     assert shape["workload_variant"] == "decoder_gpt2"
     blockers = run_mode.UNBUILDABLE_VARIANTS[variant]
     assert "coarse" not in blockers
-    assert set(blockers) == {"fused", "runlist", "offload", "coarse_c2", "coarse_c3"}
+    assert "offload" not in blockers
+    assert set(blockers) == {"fused", "runlist", "coarse_c2", "coarse_c3"}
     assert all(reason for reason in blockers.values())
 
     # And `run` must actually branch on it. Audited from the source rather than
