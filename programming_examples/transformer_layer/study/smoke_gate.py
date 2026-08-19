@@ -53,11 +53,25 @@ if _HERE not in sys.path:
 import results_io  # noqa: E402
 
 
-def check_results_root(root: str | Path, expected: list[str]) -> list[str]:
+def check_results_root(
+    root: str | Path,
+    expected: list[str],
+    expected_rows: dict[str, dict[str, int]] | None = None,
+) -> list[str]:
     """Problems with ``root``; empty means the gate passes.
 
     ``expected`` are paths relative to ``root``. An empty list is itself a
     problem: a gate given nothing to check has checked nothing.
+
+    ``expected_rows`` is the profile's per-file count expectation
+    (``Profile.expected_rows``). `[2026-08-19]` It exists here for ONE case
+    per-(family, mode) reachability created: a file whose plan expects ZERO
+    measured rows (every rung structurally skipped -- `fused` at a decoder
+    family). The one-passed-row rule would demand a measurement the plan says
+    cannot exist; such a file must instead hold ONLY skipped rows, and a
+    passed or failed row in it is flagged -- a rung that ran against a plan
+    that said it could not. Without ``expected_rows`` the gate behaves
+    exactly as before.
     """
     root = Path(root)
     if not expected:
@@ -86,6 +100,18 @@ def check_results_root(root: str | Path, expected: list[str]) -> list[str]:
                 f"{rel}: 0 rows. A failed measurement still writes a complete "
                 "row, so an empty CSV means nothing was attempted."
             )
+            continue
+
+        exp = (expected_rows or {}).get(rel)
+        if exp is not None and exp.get("measured") == 0:
+            not_skipped = [r for r in rows if r.get("run_status") != "skipped"]
+            if not_skipped:
+                problems.append(
+                    f"{rel}: the plan expects every rung of this file "
+                    f"structurally skipped, but {len(not_skipped)} row(s) "
+                    "carry another run_status -- a rung ran against a plan "
+                    "that said it could not"
+                )
             continue
 
         passed = [r for r in rows if r.get("run_status") == "passed"]

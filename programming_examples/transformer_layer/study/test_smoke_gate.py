@@ -120,6 +120,40 @@ def test_gate_fails_when_every_row_failed_and_quotes_the_reason():
         assert "ERT_CMD_STATE_TIMEOUT" in problems[0]
 
 
+def test_gate_exempts_a_file_the_plan_expects_fully_skipped_and_only_that():
+    """`[2026-08-19]` Per-(family, mode) reachability's one new case: `fused`
+    at a decoder family expects ZERO measured rows, so the one-passed-row rule
+    would demand a measurement the plan says cannot exist. Three clauses, and
+    each is load-bearing: the all-skipped file passes WITH the expectation, a
+    non-skipped row in it is flagged (a rung ran against a plan that said it
+    could not), and WITHOUT the expectation the old rule is untouched."""
+    with tempfile.TemporaryDirectory() as d:
+        results_io.write_rows(
+            os.path.join(d, "fused.csv"),
+            [_row("skipped", "skipped: fused cannot build decoder_gpt2")],
+        )
+        expect = {"fused.csv": {"rows": 1, "measured": 0, "skipped": 1}}
+        assert (
+            smoke_gate.check_results_root(d, ["fused.csv"], expected_rows=expect)
+            == []
+        )
+        # A passed row where the plan said nothing could run is a finding.
+        results_io.write_rows(
+            os.path.join(d, "fused.csv"), [_row("passed"), _row("skipped")]
+        )
+        problems = smoke_gate.check_results_root(
+            d, ["fused.csv"], expected_rows=expect
+        )
+        assert len(problems) == 1 and "ran against a plan" in problems[0]
+        # Without the expectation the old rule stands: all-skipped fails.
+        results_io.write_rows(
+            os.path.join(d, "fused.csv"),
+            [_row("skipped", "skipped: fused cannot build decoder_gpt2")],
+        )
+        problems = smoke_gate.check_results_root(d, ["fused.csv"])
+        assert len(problems) == 1 and "none with run_status=passed" in problems[0]
+
+
 def test_gate_fails_on_a_missing_file():
     """iron's version skips these; a measurement that never ran must fail."""
     with tempfile.TemporaryDirectory() as d:

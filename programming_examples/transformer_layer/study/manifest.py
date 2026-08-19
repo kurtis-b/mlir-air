@@ -537,7 +537,12 @@ def build_manifest(
         )
     schema.validate_walk(walk)
 
-    problems = smoke_gate.check_results_root(root, expected)
+    # With the row expectation, so a file the PLAN expects fully skipped is
+    # judged by the all-skipped rule rather than demanded a passed row -- the
+    # gate call in run_profile and this one must agree, or a decoder profile
+    # passes the gate and then fails its own manifest (Codex review finding,
+    # 2026-08-19; job 368 measured exactly that).
+    problems = smoke_gate.check_results_root(root, expected, expected_rows=expected_rows)
     # Merged rather than reported beside, so one list answers "why is this run
     # not complete" -- a ledger that describes a walk the files do not hold is
     # not an annotation on a finished run, it is an unfinished run.

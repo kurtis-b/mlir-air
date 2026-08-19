@@ -420,7 +420,9 @@ def gate(
     expected = profile.expected_files()
     expected_rows = profile.expected_rows()
 
-    problems = smoke_gate.check_results_root(out_dir, expected)
+    problems = smoke_gate.check_results_root(
+        out_dir, expected, expected_rows=expected_rows
+    )
     for line in problems:
         print(f"[smoke-gate] {line}")
     print(f"[smoke-gate] {'FAIL' if problems else 'PASS'} " f"({len(expected)} CSV(s))")

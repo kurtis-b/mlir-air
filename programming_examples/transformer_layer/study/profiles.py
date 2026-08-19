@@ -22,9 +22,12 @@ CONTRACT
     never typed out, so retargeting a profile retargets its gate.
 
 WHAT THIS PROFILE CAN AND CANNOT REACH, SAID OUT LOUD
-    ``cases.py`` declares six families x a nine-point ladder. The runner reaches
-    **three**: the encoder widths. The three decoder families are refused with a
-    reason rather than omitted.
+    ``cases.py`` declares six families x a nine-point ladder. `[2026-08-19]`
+    The runner reaches **all six**: the encoder widths, and the decoder
+    families since three of the four modes gained the decoder graph --
+    reachability is per (family, mode) now, with the one unwired pairing
+    (`fused` x decoder) surfacing as a structural skip rather than keeping the
+    whole family out.
 
     `[2026-08-12]` THE PREVIOUS TEXT HERE WAS WRONG, AND ITS WRONGNESS COST THE
     SCOPING OF A WHOLE PHASE. It said ``tinybert_512`` and ``baseline_1024``
@@ -123,47 +126,39 @@ REACHABLE_FAMILY = "baseline_768"
 #: GEMM must resolve -- rather than listed; ``test_profiles.py`` re-derives both
 #: halves from the sources, so a family that stops resolving fails a test rather
 #: than making this line a lie.
+#: `[2026-08-19]` All six. The decoder families joined when their layer graph
+#: landed in three of the four modes -- `coarse` (builders/block.py::
+#: run_decoder_block, hardware-validated 12/12 stages at gpt2_small_768 x 512),
+#: `offload` (host-side mask/pre-norms, 12/12) and `runlist` (the causal_mask
+#: entry, 12/12) -- and reachability became per (family, mode): the one mode
+#: with no decoder graph, `fused`, surfaces through ``skip_reason`` as a
+#: structural skip whose reason is READ from run_mode.UNBUILDABLE_VARIANTS, so
+#: a decoder profile is 3 measured + 1 skipped per length rather than a
+#: partial walk presented as a matrix walk. Only gpt2_small_768 (at 512) has
+#: walked on hardware; the other decoder rungs are RUN, not pre-declared, per
+#: this module's own rule that pre-declaring a failure is how a matrix stops
+#: being a measurement.
 REACHABLE_FAMILIES: tuple[str, ...] = (
     "tinybert_512",
     "baseline_768",
     "baseline_1024",
+    "gpt2_512",
+    "gpt2_small_768",
+    "gpt2_medium_1024",
 )
 
 #: Why each declared family the runner cannot reach is out of reach. Keyed by
 #: ``cases.FAMILY_IDS`` so a family added to the matrix and forgotten here fails
 #: a test rather than quietly disappearing from the report.
 #:
-#: `[2026-08-12]` All three surviving entries are the SAME reason, and it is a
-#: layer-graph reason rather than a coverage one. The two width entries that
-#: used to sit here ("needs registry coverage at hidden 512/1024") were false:
-#: that coverage landed 2026-08-07 and nothing had read the file since.
-#: `[2026-08-19]` The decoder layer graph EXISTS for `coarse`
-#: (builders/block.py::run_decoder_block); run_mode.UNBUILDABLE_VARIANTS now
-#: refuses per (variant, mode), with `coarse` absent. The three families stay
-#: out of PROFILE reach for two reasons that are not the old one: no decoder
-#: layer has run on hardware yet (DECODER_STAGE_ATOL is provisional until the
-#: first walk records atol_required), and a profile walks the MODE MATRIX --
-#: reachability here is per family, so admitting a family three of whose four
-#: modes refuse would present a partial walk as a matrix walk. Lifting this
-#: needs the hardware validation plus per-(family, mode) reachability.
-UNREACHABLE_FAMILIES: dict[str, str] = {
-    "gpt2_512": (
-        "decoder_gpt2 is a different layer graph, not a width -- coarse builds "
-        "it now, the other modes refuse per run_mode.UNBUILDABLE_VARIANTS, and "
-        "no decoder walk is hardware-validated; see the block note above"
-    ),
-    "gpt2_small_768": (
-        "decoder_gpt2 is a different layer graph, not a width -- coarse builds "
-        "it now, the other modes refuse per run_mode.UNBUILDABLE_VARIANTS, and "
-        "no decoder walk is hardware-validated; the default-width 768 makes "
-        "this the first decoder to validate"
-    ),
-    "gpt2_medium_1024": (
-        "decoder_gpt2 is a different layer graph, not a width -- coarse builds "
-        "it now, the other modes refuse per run_mode.UNBUILDABLE_VARIANTS, and "
-        "no decoder walk is hardware-validated; see the block note above"
-    ),
-}
+#: `[2026-08-12]` the three gpt2 entries' old reason ("needs registry
+#: coverage") was false; `[2026-08-19]` EMPTY -- the decoder families moved to
+#: REACHABLE_FAMILIES when three modes gained the decoder graph (see the note
+#: there). The dict stays, and ``test_profiles.py`` still requires REACHABLE +
+#: UNREACHABLE to cover every declared family, so the next family added to the
+#: matrix must land a verdict in one of the two rather than quietly
+#: disappearing from every run report.
+UNREACHABLE_FAMILIES: dict[str, str] = {}
 
 #: Which METHOD each projection role's owning consumer pins, keyed by the
 #: ``(K multiple, N multiple)`` of the family's hidden size. Full TRIPLE coverage
@@ -264,9 +259,23 @@ def skip_reason(mode: str, seq: int, family: str = REACHABLE_FAMILY) -> str | No
     Structural inapplicability only. A rung that MIGHT fail is not skipped --
     it is run, and its failure is the result.
     """
-    if mode == "fused":
-        import cases
+    import cases
 
+    # `[2026-08-19]` The variant clause, first because it is mode-level: a
+    # (variant, mode) run_mode refuses by name is structurally inapplicable
+    # in exactly the sense this function means -- known in advance, no child
+    # process worth starting -- and surfacing it as a SKIP is what lets a
+    # decoder family into a profile while `fused` has no decoder graph. The
+    # reason is READ from run_mode.UNBUILDABLE_VARIANTS rather than restated,
+    # so the skip disappears the day the graph lands there.
+    variant = cases.FAMILY_SPECS[family].workload_variant
+    import run_mode
+
+    blocked = run_mode.UNBUILDABLE_VARIANTS.get(variant, {}).get(mode)
+    if blocked is not None:
+        return f"{mode} cannot build {variant}: {blocked}"
+
+    if mode == "fused":
         emb = cases.FAMILY_SPECS[family].hidden_size
         low, high = fused_seq_range(family)
         if seq < low or seq > high:

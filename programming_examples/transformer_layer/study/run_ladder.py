@@ -157,6 +157,25 @@ def _i(value) -> int:
         return -1
 
 
+def _case_identity(seq: int, family: str | None) -> tuple[str, str]:
+    """``(study_case_id, workload_variant)`` for a SYNTHESIZED row.
+
+    `[2026-08-19]` Codex review finding: with decoder families reachable, a
+    skipped or died-child rung stamped ``{seq}x?_encoder_bert`` records a
+    decoder walk's row under the wrong workload identity, and decoder-variant
+    selection excludes it. With the family known, the key matches what
+    ``run_mode._shape_for`` derives for a measured row; without it the old
+    placeholder is kept verbatim, so pre-family callers' artifacts are
+    unchanged.
+    """
+    if family is None:
+        return f"{seq}x?_encoder_bert", "encoder_bert"
+    import cases
+
+    fam = cases.FAMILY_SPECS[family]
+    return f"{seq}x{fam.hidden_size}_{fam.workload_variant}", fam.workload_variant
+
+
 def _rung(
     mode: str,
     seq: int,
@@ -204,10 +223,12 @@ def _rung(
     # rather than dropping the rung, or the ladder would silently have a hole
     # where its worst failure was.
     row = schema.empty_row("results")
+    case_id, variant = _case_identity(seq, family)
     row["execution_mode"] = schema.EXECUTION_MODE_CSV.get(mode, mode)
     row["study_id"] = study_id
     row["seq_len"] = seq
-    row["study_case_id"] = f"{seq}x?_encoder_bert"
+    row["study_case_id"] = case_id
+    row["workload_variant"] = variant
     row["study_case_label"] = f"{mode} seq {seq}"
     row["run_status"] = "failed"
     tail = (proc.stderr or proc.stdout or "").strip().splitlines()
@@ -217,7 +238,9 @@ def _rung(
     return row
 
 
-def _skipped_row(mode: str, seq: int, study_id: str, reason: str) -> dict:
+def _skipped_row(
+    mode: str, seq: int, study_id: str, reason: str, family: str | None = None
+) -> dict:
     """A rung that cannot apply. Written, never run. See the docstring section.
 
     The reason rides ``failure_message`` because a new column is a schema
@@ -225,10 +248,12 @@ def _skipped_row(mode: str, seq: int, study_id: str, reason: str) -> dict:
     surfaces, including the smoke gate's verbatim quote.
     """
     row = schema.empty_row("results")
+    case_id, variant = _case_identity(seq, family)
     row["execution_mode"] = schema.EXECUTION_MODE_CSV.get(mode, mode)
     row["study_id"] = study_id
     row["seq_len"] = seq
-    row["study_case_id"] = f"{seq}x?_encoder_bert"
+    row["study_case_id"] = case_id
+    row["workload_variant"] = variant
     row["study_case_label"] = f"{mode} seq {seq}"
     row["run_status"] = "skipped"
     row["failure_message"] = f"skipped: {reason}"
@@ -265,7 +290,7 @@ def walk(
             reason = skip_reason(mode, seq) if skip_reason is not None else None
             carried = None if reason else (reuse or {}).get((mode, seq))
             if reason:
-                row = _skipped_row(mode, seq, study_id, reason)
+                row = _skipped_row(mode, seq, study_id, reason, family)
                 source = "skipped"
             elif carried is not None:
                 # Copied, never rebuilt: the digest must not move. See the

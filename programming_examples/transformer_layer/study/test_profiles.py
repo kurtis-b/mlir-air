@@ -348,23 +348,40 @@ def test_the_pinned_methods_are_re_derived_from_the_modules_that_pin_them():
     )
 
 
-def test_a_decoder_variant_is_refused_by_name_not_omitted():
-    """The decoder half. ``run_mode`` no longer hardcodes the variant, so the
-    thing to check is that a decoder is REFUSED rather than quietly measured as
-    an encoder under a causal name -- which nothing downstream could detect."""
+def test_a_blocked_variant_mode_pair_surfaces_as_a_skip_not_a_run():
+    """The decoder half, per (variant, mode) since `[2026-08-19]`.
+
+    Every pairing run_mode still refuses by name must surface through
+    ``skip_reason`` -- so a profile SKIPS it and never starts a child process
+    that would fail -- and the skip's text must carry run_mode's own reason
+    rather than a restatement that would rot. And every reachable family must
+    have at least one profile mode that is NOT blocked, or admitting it walks
+    nothing."""
     import run_mode
 
-    for family, reason in profiles.UNREACHABLE_FAMILIES.items():
-        variant = cases.FAMILY_SPECS[family].workload_variant
-        assert variant in run_mode.UNBUILDABLE_VARIANTS, (
-            f"{family} is listed unreachable but its variant {variant!r} is not "
-            "refused by run_mode; a profile could reach it and mislabel the row"
-        )
-        assert "layer graph" in reason
-    # and the reachable ones must NOT be refused, or nothing is walkable.
     for family in profiles.REACHABLE_FAMILIES:
         variant = cases.FAMILY_SPECS[family].workload_variant
-        assert variant not in run_mode.UNBUILDABLE_VARIANTS, family
+        blockers = run_mode.UNBUILDABLE_VARIANTS.get(variant, {})
+        for mode in profiles.PROFILE_MODES:
+            reason = profiles.skip_reason(mode, 512, family)
+            if mode in blockers:
+                assert reason is not None and blockers[mode] in reason, (
+                    f"({variant}, {mode}) is refused by run_mode but "
+                    f"skip_reason returns {reason!r}; a profile would start a "
+                    "child process that can only fail"
+                )
+        unblocked = [m for m in profiles.PROFILE_MODES if m not in blockers]
+        assert unblocked, (
+            f"{family} is listed reachable but every profile mode is refused"
+        )
+    # Ordering: the variant clause must win over the fused packing bound --
+    # probed at 4096, where BOTH apply to a decoder family. A fused decoder
+    # rung reported as "outside 256..1024" would read as a width limit on a
+    # graph that does not exist at any width, and an implementation that
+    # checks the bound first passes every in-bound probe above.
+    reason = profiles.skip_reason("fused", 4096, "gpt2_small_768")
+    assert run_mode.UNBUILDABLE_VARIANTS["decoder_gpt2"]["fused"] in reason
+    assert "plane-major packing" not in reason
 
 
 def test_unreachable_families_cover_every_declared_family():
@@ -374,6 +391,22 @@ def test_unreachable_families_cover_every_declared_family():
         "an undeclared family silently disappears from every run report"
     )
     assert profiles.REACHABLE_FAMILY not in profiles.UNREACHABLE_FAMILIES
+    # Disjoint -- one verdict per family, never both.
+    assert not set(profiles.UNREACHABLE_FAMILIES) & set(profiles.REACHABLE_FAMILIES)
+    # And DERIVED, not tabulated: any family with at least one unblocked
+    # profile mode must be REACHABLE. Leaving a buildable family in the
+    # unreachable table misreports reachability in every run report -- the
+    # `[2026-08-19]` contract is that reachability is per (family, mode), so
+    # family-level unreachability is only for a family NO mode can build.
+    import run_mode
+
+    for fid in cases.FAMILY_IDS:
+        variant = cases.FAMILY_SPECS[fid].workload_variant
+        blockers = run_mode.UNBUILDABLE_VARIANTS.get(variant, {})
+        if any(m not in blockers for m in profiles.PROFILE_MODES):
+            assert fid in profiles.REACHABLE_FAMILIES, (
+                f"{fid} has a buildable profile mode but is not reachable"
+            )
 
 
 def test_fused_bound_is_applied_in_both_directions():
@@ -421,15 +454,24 @@ def test_retargeting_a_profile_retargets_its_gate_with_no_number_edited():
     assert at512["rows"] == at768["rows"] == len(ladder.seqs)
 
 
-def test_a_profile_cannot_be_retargeted_to_an_unbuildable_family():
-    """Refused at construction rather than after a full cold walk fails 36 times."""
-    for family in profiles.UNREACHABLE_FAMILIES:
-        try:
-            profiles.profile("smoke").retarget(family)
-        except ValueError as exc:
-            assert "no whole-layer mode can build" in str(exc)
-        else:
-            raise AssertionError(f"{family} was accepted as a profile target")
+def test_retargeting_to_a_decoder_family_skips_fused_and_only_fused():
+    """`[2026-08-19]` The old refusal-at-construction test, inverted by the
+    decoder graphs landing: a decoder retarget now SUCCEEDS and derives its
+    gate -- every fused rung skipped (no decoder graph there), every other
+    mode's rung measured -- with no number edited anywhere."""
+    smoke = profiles.profile("smoke").retarget("gpt2_small_768")
+    counts = smoke.expected_rows()
+    assert counts["fused.csv"] == {"rows": 1, "measured": 0, "skipped": 1}
+    for rel in ("coarse.csv", "offload.csv", "runlist.csv"):
+        assert counts[rel] == {"rows": 1, "measured": 1, "skipped": 0}, rel
+    ladder = profiles.profile("ladder").retarget("gpt2_small_768")
+    lcounts = ladder.expected_rows()
+    assert lcounts["fused.csv"] == {"rows": 4, "measured": 0, "skipped": 4}
+    for rel in ("coarse.csv", "offload.csv", "runlist.csv"):
+        assert lcounts[rel] == {"rows": 4, "measured": 4, "skipped": 0}, rel
+    # The skip carries run_mode's own reason, and names the variant.
+    reason = smoke.rungs()[-1].skip_reason
+    assert reason is not None and "decoder_gpt2" in reason
 
 
 def test_skip_reason_names_the_source_of_the_bound():

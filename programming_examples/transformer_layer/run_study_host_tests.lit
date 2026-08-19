@@ -361,5 +361,28 @@
 // (2026-08-12) -- the CLI crashed at every invocation since and nothing
 // covered it.
 //
+// `[2026-08-19]` 564 -> 565, no module added: profile reachability became per
+// (family, mode) -- skip_reason gained a variant clause READ from
+// run_mode.UNBUILDABLE_VARIANTS, REACHABLE_FAMILIES grew to all six, and a
+// decoder profile derives 3 measured + 1 fused-skipped per length. The +1
+// pins the Codex-review finding on that change: run_ladder's synthesized
+// rows (skips, died children) hardcoded `{seq}x?_encoder_bert`, so a decoder
+// walk's fused skip was recorded under the wrong workload identity and
+// excluded by decoder-variant selection; _case_identity derives it from the
+// family now, with the no-family placeholder byte-identical to the old one.
+// The review's two test gaps are also closed in existing tests: the variant
+// clause is pinned to WIN over the fused packing bound at 4096, and
+// reachability is derived (any family with an unblocked profile mode must be
+// reachable), not tabulated.
+//
+// 565 -> 566, same change, found by the first decoder profile walk (devq
+// 368): the smoke gate's one-passed-row rule predates files whose PLAN
+// expects zero measurements, so a decoder smoke walk with three green modes
+// and a correctly-skipped fused file gated FAIL. check_results_root now
+// takes the profile's expected_rows and requires an expected-fully-skipped
+// file to hold ONLY skipped rows (a passed row there is a rung that ran
+// against a plan that said it could not); without the expectation the old
+// rule is byte-identical. The +1 pins all three clauses.
+//
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 564/564 passed in 25 modules
+// CHECK: study host tests: 566/566 passed in 25 modules

@@ -463,6 +463,34 @@ def test_neither_new_callback_changes_the_existing_behaviour():
     assert [r["study_id"] for r in rows] == ["test", "test"]
 
 
+def test_synthesized_rows_carry_the_familys_identity():
+    """`[2026-08-19]` Codex review finding on the reachability change: a
+    skipped or died-child rung used to stamp `{seq}x?_encoder_bert` regardless
+    of family, so a decoder walk's fused skip -- or its worst failure -- was
+    recorded under the wrong workload identity and excluded by decoder-variant
+    selection. The identity is derived from the family now, matching the key
+    `_shape_for` builds for a measured row; the no-family placeholder is
+    byte-identical to the old one so pre-family artifacts do not move."""
+    assert run_ladder._case_identity(512, "gpt2_small_768") == (
+        "512x768_decoder_gpt2",
+        "decoder_gpt2",
+    )
+    assert run_ladder._case_identity(1024, "baseline_768") == (
+        "1024x768_encoder_bert",
+        "encoder_bert",
+    )
+    assert run_ladder._case_identity(1024, None) == (
+        "1024x?_encoder_bert",
+        "encoder_bert",
+    )
+    row = run_ladder._skipped_row(
+        "fused", 1024, "s", "fused cannot build decoder_gpt2", "gpt2_small_768"
+    )
+    assert row["study_case_id"] == "1024x768_decoder_gpt2"
+    assert row["workload_variant"] == "decoder_gpt2"
+    assert row["run_status"] == "skipped"
+
+
 def _assigned_names(path, target):
     """The tuple elements or dict keys assigned to ``target`` in ``path``.
 
