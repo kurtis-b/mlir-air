@@ -6430,18 +6430,53 @@ public:
 
       // Map key: repeat counts. Map value: vector of memcpy operations sharing
       // the same repeat count.
+      // The non-clean-rotation plan re-emits the cycle's leading sites as
+      // fresh BDs in a second task; ShimDMAAllocator::getBuffer allocates a
+      // new external buffer per request, so on shim DMA those duplicates
+      // would bind to fresh buffers instead of the rotation's own. Tile and
+      // memtile allocators resolve a site to its one buffer, so the plan is
+      // restricted to them.
+      std::optional<air::NonCleanRotationPlan> nonCleanPlan;
+      constexpr bool allowNonCleanPlan =
+          !std::is_same_v<dmaAllocatorTy, air::ShimDMAAllocator>;
       llvm::MapVector<int, llvm::SetVector<Operation *>> repeat_counts =
-          air::getRepeatCounts(memcpy_ops);
+          air::getRepeatCounts(memcpy_ops,
+                               allowNonCleanPlan ? &nonCleanPlan : nullptr);
 
       // Note: we designate each unique repeat value in repeat_counts map with a
       // new BD task. If there is only one repeat value for all memcpy ops
       // associated to the channel, then there is no need to do repeat count; we
       // generate BDs in infinite loop mode instead.
-      bool infiniteBDLoopMode = repeat_counts.size() == 1;
+      bool infiniteBDLoopMode = !nonCleanPlan && repeat_counts.size() == 1;
+
+      // Normalize to an ordered task list: (dma_start repeat value, BDs in
+      // chain order). A NON-CLEAN rotation cannot ride the repeat_counts map
+      // (its two tasks may share a repeat value, and the remainder task
+      // re-emits a prefix of the cycle's sites as fresh BDs): the only
+      // order-preserving program is the whole cycle executed `cycles` times
+      // followed by the first `remainder` BDs once, matching the producer's
+      // circular chain phase (queue row 28(a), doc 52 section 10 -- the
+      // per-repeat-count split replayed a sub-pattern and permuted the
+      // delivered stream, a measured byte-deterministic wrong answer).
+      SmallVector<std::pair<int, SmallVector<Operation *>>> bd_tasks;
+      if (nonCleanPlan) {
+        bd_tasks.push_back(
+            {nonCleanPlan->cycles - 1,
+             SmallVector<Operation *>(nonCleanPlan->cycleOps.begin(),
+                                      nonCleanPlan->cycleOps.end())});
+        bd_tasks.push_back(
+            {0, SmallVector<Operation *>(
+                    nonCleanPlan->cycleOps.begin(),
+                    nonCleanPlan->cycleOps.begin() + nonCleanPlan->remainder)});
+      } else {
+        for (auto &[rep, task_ops] : repeat_counts)
+          bd_tasks.push_back(
+              {rep, SmallVector<Operation *>(task_ops.begin(), task_ops.end())});
+      }
 
       unsigned taskId = 0;
       // For every BD task
-      for (auto &[rep, task_ops] : repeat_counts) {
+      for (auto &[rep, task_ops] : bd_tasks) {
         // The block containing aie.dma_start
         Block *start_bb = new Block();
         mem.getBody().push_back(start_bb);

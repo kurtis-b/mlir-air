@@ -1254,3 +1254,187 @@ which the lit will keep passing over a step that cannot fire.
 ten-model leg, ~75 minutes, and the operator is due back; an ungated compiler edit is worth less
 than a named one-line change with its test gap written down. `PREDICTION-MAXQ.md`'s clauses 1
 and 3 remain **untested**, not falsified — nothing has yet run a compiler in which the step fires.
+
+## §13 `[2026-08-19]` Row 28 defect (a) FIXED: the non-clean-rotation fallback is now order-preserving, and O2/T5/K5 go FAIL 5/5 → PASS 5/5 on hardware
+
+§10.9 item 3 offered two shapes: emit a phase-correct chain, or refuse by name. This lands the
+first, scoped to the shape that was measured wrong.
+
+### 13.1 The fix
+
+`air::getRepeatCounts` (`AIRToAIESchedulingUtils.cpp`) gains an optional out-parameter,
+`NonCleanRotationPlan`. After the clean `detectNBufferRotation` path has passed on a group, the
+fallback — which previously went straight to trip-count bucketing — now looks for the one
+non-clean shape that has an order-preserving two-task program:
+
+- the group's sites, **in program order**, form one full cycle of a buffer rotation;
+- their trip counts form a `{q, q+1}` staircase whose `q+1` entries are **one contiguous
+  cyclic run** (an epilogue peel gives a prefix run; a prologue peel gives a suffix run
+  wrapping to the front — both are the same cyclic object, so the cycle is rotated to start at
+  the run);
+- then the only BD program that preserves program order is **the whole cycle × q** (one
+  `dma_start` with `repeat_count = q-1`) **plus the first `r` BDs once** (a second task,
+  `repeat_count` absent). Sites appear in both tasks and get fresh BDs in each.
+
+`generateDmaBdProgram` (`AIRToAIEPass.cpp`) emits exactly those two tasks when the plan is
+present; when it is not, the bucketing fallback is byte-for-byte what it was.
+
+**The load-bearing discovery is the grouping key, and it re-derives §10.3's cause.** The plan
+groups sites by `(channel declaration, memref type)`, not declaration alone: R1's bundled
+`@ffn_res_up_feed` carries BOTH the H stream (`64x32xbf16`, 3-slot rotation) and the W stream
+(`32x32xbf16`, single buffer) under ONE declaration. Grouped by declaration alone the streams
+mix, nothing looks like a rotation, and the plan refuses — which is the same memref-type check
+that stops `detectNBufferRotation`'s clean path on these modules. The multiplexed channel is
+constitutive of the defect: an unbundled 3-buffer rotation with a peel takes the clean path and
+never reaches the fallback at all.
+
+### 13.2 Verification ladder, compile side
+
+- **Regression lit** `mlir/test/Conversion/AIRToAIE/air_channel_nonclean_rotation.mlir`:
+  mixed-type bundled channel, steady loop `(A0,B,A1,B)` trip 2 + epilogue peel `(A2,B)` —
+  10 firings over a 6-site cycle, q=1, r=4. **Verified red pre-fix at the load-bearing
+  clause** (`--implicit-check-not=repeat_count` catches the bucketing's `repeat_count = 1`
+  prefix task; the dma_start block-arg patterns exclude `,` so a greedy match cannot swallow
+  it — the first draft's `^{{.*}})` did exactly that and was tightened). Green post-fix; the
+  remainder task's captures pin that it re-visits the CYCLE's first two A buffers.
+- **`check-air-mlir` 501 → 502 / 0 fail**, delta exactly that lit (devq 395).
+- **Byte-identity, measured not argued** (same tree, fix reverted vs applied, `air-opt` on each
+  rung's `placed.air.mlir`): **O5, O1, O3, O6 all byte-identical**. The fix touches only
+  `{q,q+1}` staircase shapes; uniform-trip and non-staircase modules are untouched bytes.
+- **Rotation instrument** (post-fix, full aircc pipeline through the installed toolchain, per
+  trap 5): O2/T5/K5 read **IN-STEP `[0,1,2,3,4]` on all three L2 feeds** where the baseline
+  read SKEWED on the `w_down` feed; O5/O1/O3 IN-STEP as before.
+
+### 13.3 Verification ladder, device side (devq 398, prediction-first)
+
+`PREDICTION-28A-FIX.md` (sha `1070338e…`, echoed in leg 0 before any dispatch): 25 legs,
+5 rungs × 5 fresh processes, `--reuse-elf`, conditions matched to devq 328/330. **25/25, every
+clause held**:
+
+| rung | down_K | baseline | measured post-fix |
+|---|---|---|---|
+| O5 `32x128 tk32` | 4 | PASS 5/5 | **PASS 5/5** (control) |
+| O1 `16x64 tk16` | 4 | PASS 5/5 | **PASS 5/5** (control) |
+| O2 `32x160 tk32` | 5 | FAIL 5/5, σ=[0,1,4,2,3] | **PASS 5/5** |
+| T5 `80x80 tk16` | 5 | FAIL 5/5, σ=[0,1,3,4,2] | **PASS 5/5** |
+| K5 `160x160 tk32` | 5 | FAIL 5/5, σ=[0,1,3,4,2] | **PASS 5/5** |
+
+**The `down_K = 5` wrong answer is fixed at its cause.** R1's correct-answer ceiling moves from
+`ffn_dim ≤ 4·tile_k` to **5** without `--omit-pingpong L2` — i.e. with L2 double buffering kept.
+
+### 13.4 O6, and a correction to §10.8
+
+A second prediction file (`PREDICTION-28A-O3O6.md`) expected O6's rotation to become IN-STEP.
+**Falsified at the compile gate, before any dispatch**: O6 (`down_K 7`) still reads SKEWED
+`[0,1,3,4,6,7,2]`, because its `w_down` consumer sites carry trips `{3,3,1}` — two in-loop
+sites at trip 3 plus a peel — which is **not** a `{q,q+1}` staircase, and no two-task
+cycle+remainder program can spell `A,B,A,B,A,B,C` as one rotation cycle. The plan refuses by
+design and O6's module is **byte-identical pre/post fix** — so devq 330's TIMEOUT 5/5 remains
+its measurement, no re-dispatch owed. §10.8's "with the rotation correct, `down_K` 5 **and 7**
+become correct" is therefore **half-corrected: 5 yes, 7 no** — 7's skew is decided further up
+(which sites the builder puts in the loop vs the peel, and which slots the two memtile sides
+assign), stays latent behind the `>= 6` hang (28-remainder), and cannot matter before that
+hang is fixed, since O6 never delivers bytes at all.
+
+### 13.5 Suite and model legs
+
+Transformer-layer device suite and the model verify sweep (now eleven models — the ten plus
+`smollm2_1_7b_int4`, which shipped 2026-08-19) ran against the installed fixed compiler:
+devq 401 and 402. Results recorded in the README status board's leg table, which is the
+authoritative copy of those counts.
+
+### 13.6 The Codex review findings, and the tightening they forced
+
+The pre-commit Codex review (run against the working diff, per the session's
+review-before-commit rule) confirmed the q/q+1 arithmetic and found no
+iterator/lifetime defects, but flagged the planner's structural predicates as
+weaker than its comments — it could classify shapes as rotations that are
+not. All findings were addressed by NARROWING acceptance, never by widening:
+
+1. **Repeated-buffer sites** (High): `[2,2,1]` trips over sites `A0,A0,A1`
+   passed every old predicate but is not a rotation, and the two-task program
+   would reorder the `A0` firings. Now refused: a multi-buffer group must be
+   ONE full cycle of DISTINCT buffers — site count == buffer count.
+2. **Unvalidated single-buffer groups** (High): the interleaved single-buffer
+   stream's sites land in both tasks, so their mutual order must be
+   semantically irrelevant. Now enforced: singleton groups require
+   pairwise-equivalent BDs, offsets included (`chansMappedToEquivalentBDs`,
+   not merely the same sizes/strides).
+3. **Bundle indices ignored**: two logical sub-channels sharing a payload
+   type are indistinguishable to the `(declaration, type)` key. Now refused
+   unless all of a group's sites agree on constant channel indices (same
+   rule as `isSameLogicalFlowEndpoint`). Defense-in-depth: distinct-index
+   sub-channels normally land on distinct DMA channels and never share one
+   `getRepeatCounts` call, so no lit can reach this clause honestly.
+4. **Shim DMA** (Medium): `ShimDMAAllocator::getBuffer` allocates a fresh
+   external buffer per request, so the remainder task's re-emitted sites
+   would bind to new buffers. The plan is now compile-time restricted to
+   tile/memtile allocators (`!std::is_same_v<dmaAllocatorTy,
+   ShimDMAAllocator>`).
+5. **The cyclic-run generalization is DROPPED**: the run of `(q+1)`-trip
+   sites must be a program-order PREFIX (epilogue peel — the measured
+   O2/T5/K5 class). Prologue peels rotated the cycle relative to program
+   order, no artifact exercises that, and its order-preservation was
+   unproven — ship only what is measured.
+
+A second review pass over the tightened diff closed all four findings and
+found one more, High, that the first pass missed:
+
+6. **Shared-loop evidence was GLOBAL, not per-group**: a rotation group
+   could borrow its interleaving evidence from a different group's loop.
+   Counter-shape: `A0` alone in its own trip-2 loop, two equivalent `B`
+   sites sharing a separate trip-2 loop, `A1` peeled — trips `[2,2,2,1]`
+   pass the staircase, the A group supplies rotation evidence, the B group
+   supplies the shared loop, and the plan would spell a cycle the disjoint
+   loops never fire (bursts per loop, not round-robin). Now enforced
+   structurally, replacing the global check: every run site's ONLY loop
+   ancestor inside the common region must be ONE shared steady loop with
+   `r >= 2` sites, and every tail site must be loop-free there (the peel).
+   Loop-free tails have trip 1, so every accepted shape has `q == 1` — the
+   general `{q, q+1}` arithmetic stays as documentation of the class.
+
+Three refusal lits pin counterexamples 1, 2 and 6
+(`air_channel_nonclean_rotation_refuse_repeated_buffer.mlir`,
+`air_channel_nonclean_rotation_refuse_mixed_offsets.mlir`,
+`air_channel_nonclean_rotation_refuse_disjoint_loops.mlir`): each asserts
+the legacy bucketing shape survives — `repeat_count = 1` present, the
+peel's BD only in the second task. The main lit additionally pins the B
+stream's buffer identity across all six of its BDs and closes the
+inter-task windows with `CHECK-NOT: aie.dma_bd`. After EVERY tightening
+round, the planner's output on O2/T5/K5/O5/O1/O3/O6 was byte-compared
+against the reviewed-and-measured binary's — identical all seven, twice —
+so devq 398/401/402/403's measurements carry over to the committed
+compiler. `check-air-mlir` lands at **505 / 0 fail** (delta exactly the
+four 28(a) lits), and the installed compiler was behaviorally probed
+post-install (O2 reproducer through the full pipeline, IN-STEP x3).
+
+### 13.7 The `down_K >= 6` ladder re-measured — 6 is HEALED by 28(b)'s pacing, 7 still wedges, and devq 330's TIMEOUTs were measurements of a dead binary
+
+§13.4's byte-identity argument ("devq 330's TIMEOUT remains O3/O6's measurement") was WRONG one
+level down, caught before it shipped: air-to-aie identity does not survive 28(b), which lives in
+`airrt-to-npu`, downstream. Measured: today's O3 elf is `0ed23416…` vs devq 330's `b2c0f26f…`,
+and O3's `npu.air.mlir` carries 7 `issue_token`s — **the pacing fires on these rungs' refill
+runs**, so the `>= 6` hang had never been measured against a compiler in which 28(b)'s step
+fires. `PREDICTION-28B-LADDER.md` (sha `cb2c7472…`, echoed in leg 0) predicted O3 PASS / O6
+FAIL-with-wrong-bytes. Measured (devq 403, 10 legs):
+
+| rung | down_K | devq 330 (pre-both-fixes) | devq 403 (both fixes) | prediction |
+|---|---|---|---|---|
+| O3 `32x192 tk32` | 6 | TIMEOUT 5/5 | **PASS 5/5**, 0/2048 mismatches | **HELD** |
+| O6 `32x224 tk32` | 7 | TIMEOUT 5/5 | **TIMEOUT 5/5**, sentinel 1.0000, cores 0/1 | **FALSIFIED** (said FAIL) |
+
+Three consequences:
+
+1. **R1's correct-answer ceiling is now `down_K <= 6`** — 4 was the pre-fix ceiling, 5 is
+   28(a)'s rotation fix, 6 is 28(b)'s pacing, each measured 5/5 with zero mismatches. §10.8's
+   box is superseded.
+2. **Row 28-remainder narrows to `down_K >= 7`, mechanism unresolved.** Either a wedge that
+   pacing-to-depth-2 does not close, or — the new candidate the falsified clause raises — the
+   still-skewed O6 rotation (§13.4) deadlocking under flow control instead of surfacing as
+   wrong bytes: a skewed drain can hold a lock the paced fill needs, where the unpaced fill ran
+   ahead and the skew surfaced as a permutation. Not separated here. §10.6's synthetic
+   queue-occupancy instrument remains the right next tool, now with "unskew O6's rotation
+   builder-side, re-dispatch" as a second discriminating arm.
+3. **The O2 attribution closes**: O6 shows pacing does not silently green a module with a
+   skewed rotation (it wedges), so O2's FAIL→PASS in devq 398 belongs to the 28(a) rotation
+   fix, not to the pacing both rungs ride on.

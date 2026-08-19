@@ -57,10 +57,30 @@ bool areIdenticalVectors(std::vector<unsigned> &a, std::vector<unsigned> &b);
 std::optional<int64_t> get1DOffset(ArrayRef<OpFoldResult> memcpy_offsets,
                                    ArrayRef<OpFoldResult> memcpy_strides);
 
+// A NON-CLEAN buffer rotation: the channel's memcpy sites, in program order,
+// form one full cycle of the rotation pattern (`ops`), but the total firing
+// count is not a multiple of the cycle length -- the sites' trip counts form
+// a {cycles, cycles+1} staircase whose (cycles+1) entries are a prefix of the
+// cycle. The only order-preserving BD program for it is `cycles` executions
+// of the whole cycle followed by one execution of the first `remainder` BDs;
+// any other task split replays a sub-pattern out of phase against the
+// producer's circular chain and permutes the delivered stream (queue row
+// 28(a), doc 52 section 10: measured as a byte-deterministic wrong answer,
+// delivered order [0,1,3,4,2] at down_K=5).
+struct NonCleanRotationPlan {
+  llvm::SmallVector<Operation *> cycleOps; // one full cycle, program order
+  int cycles;                              // whole-cycle executions, >= 1
+  int remainder;                           // prefix BDs after the cycles, >= 1
+};
+
 // Given a vector of memcpy operations, return a map of their repeat counts,
-// relative to a common ancestor region.
+// relative to a common ancestor region. If `nonCleanPlan` is non-null and the
+// ops form a NON-CLEAN rotation (see NonCleanRotationPlan), the plan is
+// stored there and the returned map must be ignored -- the caller emits the
+// cycle-plus-remainder program instead of per-repeat-count tasks.
 llvm::MapVector<int, llvm::SetVector<Operation *>>
-getRepeatCounts(std::vector<Operation *> memcpy_ops);
+getRepeatCounts(std::vector<Operation *> memcpy_ops,
+                std::optional<NonCleanRotationPlan> *nonCleanPlan = nullptr);
 
 // Build the aie.dma_bd (wrap, stride) dim layout from the memcpy sizes and
 // strides. Returns std::nullopt when any wrap or stride is not a compile-time

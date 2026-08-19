@@ -223,8 +223,11 @@ std::optional<int64_t> air::get1DOffset(ArrayRef<OpFoldResult> memcpy_offsets,
 // Given a vector of memcpy operations, return a map of their repeat counts,
 // relative to a common ancestor region.
 llvm::MapVector<int, llvm::SetVector<Operation *>>
-air::getRepeatCounts(std::vector<Operation *> memcpy_ops) {
+air::getRepeatCounts(std::vector<Operation *> memcpy_ops,
+                     std::optional<NonCleanRotationPlan> *nonCleanPlan) {
   llvm::MapVector<int, llvm::SetVector<Operation *>> repeatCounts;
+  if (nonCleanPlan)
+    nonCleanPlan->reset();
   llvm::SetVector<Operation *> memcpyIOps;
   for (auto o : memcpy_ops) {
     memcpyIOps.insert(o);
@@ -434,8 +437,8 @@ air::getRepeatCounts(std::vector<Operation *> memcpy_ops) {
   if (!commonRegion)
     return repeatCounts;
 
-  // Get each memcpy op's repeat count, relative to the common region.
-  for (auto o : memcpyIOpVec) {
+  // Each memcpy op's trip count, relative to the common region.
+  auto tripCountOf = [commonRegion](Operation *o) {
     int tripCount = 1;
     Region *currRegion = o->getParentRegion();
     while (commonRegion->isAncestor(currRegion)) {
@@ -449,8 +452,168 @@ air::getRepeatCounts(std::vector<Operation *> memcpy_ops) {
         tripCount *= *air::getStaticScfForTripCountAsInt(scfFor);
       }
     }
+    return tripCount;
+  };
+
+  // NON-CLEAN ROTATION (queue row 28(a), doc 52 section 10). The set is
+  // rotation-shaped -- some channel rotates over >=2 distinct buffers with a
+  // matching access pattern, at least two sites share a loop -- but the total
+  // firing count is not a multiple of the cycle, so detectNBufferRotation
+  // correctly refused the circular chain. The per-repeat-count fallback below
+  // would then emit separately terminated tasks that replay a SUB-PATTERN of
+  // the rotation out of phase against the producer's circular chain: measured
+  // as a byte-deterministic permutation of the delivered stream (delivered
+  // order [0,1,3,4,2] at down_K=5, wrong answer, locks all conserved). The
+  // only order-preserving program is `q` executions of the WHOLE cycle
+  // followed by the first `r` BDs once, where the sites' trip counts form a
+  // {q, q+1} staircase whose (q+1) entries prefix the cycle -- exactly the
+  // shape loop-peeling gives a non-divisible fill count. Hand the caller that
+  // plan; it cannot be expressed in the returned map (two tasks may need the
+  // same repeat count, and one site appears in both).
+  if (nonCleanPlan) {
+    auto planFor =
+        [&]() -> std::optional<NonCleanRotationPlan> {
+      if (memcpyIOpVec.size() < 2)
+        return std::nullopt;
+      // Every site a channel op; group into sub-streams. A bundled channel
+      // multiplexes several logical streams under ONE declaration (the sites
+      // differ by indices and payload shape), so the declaration alone is
+      // too coarse a key -- the O2 artifact interleaves the rotating H chunks
+      // with same-declaration weight chunks of a different memref type. The
+      // (declaration, memref type) pair separates them; pattern consistency
+      // inside each group is then checked below.
+      llvm::MapVector<std::pair<Operation *, Type>,
+                      SmallVector<air::ChannelInterface>>
+          byDecl;
+      for (auto *op : memcpyIOpVec) {
+        auto chanOp = dyn_cast_if_present<air::ChannelInterface>(op);
+        if (!chanOp)
+          return std::nullopt;
+        byDecl[{air::getChannelDeclarationThroughSymbol(chanOp),
+                chanOp.getMemref().getType()}]
+            .push_back(chanOp);
+      }
+      // Rotation evidence, and per-group soundness. Every group must be one
+      // of exactly two things, or the plan refuses:
+      //  - a rotation: ONE full cycle of DISTINCT buffers in program order
+      //    (each buffer exactly once -- repeated sites on one buffer are not
+      //    a rotation, and the two-task program would reorder them), sharing
+      //    one access pattern;
+      //  - a single-buffer stream whose sites are pairwise-equivalent BDs
+      //    (offsets included): those sites land in both tasks, so their
+      //    mutual order must be semantically irrelevant.
+      // In both cases the sites must agree on constant channel indices --
+      // two logical sub-channels of one bundle sharing a payload type are
+      // indistinguishable to this key, and reordering across them is not
+      // order-preserving (same rule as isSameLogicalFlowEndpoint).
+      bool anyRotation = false;
+      for (auto &[decl, chans] : byDecl) {
+        auto frontIdx = chans.front().getIndices();
+        for (auto c : chans) {
+          auto idx = c.getIndices();
+          if (idx.size() != frontIdx.size())
+            return std::nullopt;
+          for (auto [va, vb] : llvm::zip_equal(idx, frontIdx)) {
+            auto ca = getConstantIntValue(va);
+            auto cb = getConstantIntValue(vb);
+            if (!ca || !cb || *ca != *cb)
+              return std::nullopt;
+          }
+        }
+        llvm::DenseSet<Value> bufs;
+        for (auto c : chans)
+          bufs.insert(c.getMemref());
+        if (bufs.size() < 2) {
+          for (auto c : chans)
+            if (!chansMappedToEquivalentBDs(chans.front(), c))
+              return std::nullopt;
+          continue;
+        }
+        if (chans.size() != bufs.size())
+          return std::nullopt;
+        for (auto c : chans)
+          if (!chansPartOfSameRotation(chans.front(), c))
+            return std::nullopt;
+        anyRotation = true;
+      }
+      if (!anyRotation)
+        return std::nullopt;
+      // Trip counts must form the {q, q+1} prefix staircase in program order.
+      SmallVector<int> trips;
+      for (auto *op : memcpyIOpVec)
+        trips.push_back(tripCountOf(op));
+      int q = *llvm::min_element(trips);
+      if (q < 1)
+        return std::nullopt;
+      // The (q+1)-trip sites must be ONE contiguous PREFIX of the cycle in
+      // program order: they are the sites the partial last cycle re-fires,
+      // and epilogue peeling -- the measured O2/T5/K5 shape -- is exactly a
+      // (q+1)-trip steady run followed by a q-trip peel. Any other layout
+      // (a fragmented run, or a prologue peel wrapping the run around the
+      // cycle boundary) is refused: no artifact exercises those, and a
+      // rotated cycle's order-preservation is unproven for them.
+      size_t L = trips.size();
+      size_t r = 0;
+      while (r < L && trips[r] == q + 1)
+        r++;
+      if (r == 0 || r == L)
+        return std::nullopt; // no prefix run, or divisible after all
+      for (size_t i = r; i < L; i++)
+        if (trips[i] != q)
+          return std::nullopt; // not a {q+1}^r {q}^(L-r) prefix staircase
+      // The staircase alone does not prove the firing order interleaves the
+      // way the cycle program spells it -- sites in DISJOINT loops fire in
+      // separate bursts, not round-robin (a site alone in its own trip-2
+      // loop next to a pair sharing a different trip-2 loop reads [2,2,2,1]
+      // and would silently reorder). The measured class is one peeled steady
+      // loop, and that is what is required structurally: every run site's
+      // ONLY loop ancestor inside the common region is one shared loop
+      // (whose interleaved body IS the cycle prefix, in program order), at
+      // least two sites share it (a single-site loop is a time-multiplexed
+      // block consumer, per detectNBufferRotation's reasoning), and every
+      // tail site is loop-free there (the peel). Loop-free tails have trip
+      // 1, so q == 1 in every shape this accepts.
+      if (r < 2)
+        return std::nullopt;
+      auto loopsWithinCommonRegion = [commonRegion](Operation *o) {
+        SmallVector<Operation *> loops;
+        Region *currRegion = o->getParentRegion();
+        while (commonRegion->isAncestor(currRegion)) {
+          Operation *parent = currRegion->getParentOp();
+          if (isa<LoopLikeOpInterface>(parent))
+            loops.push_back(parent);
+          currRegion = currRegion->getParentRegion();
+        }
+        return loops;
+      };
+      Operation *steadyLoop = nullptr;
+      for (size_t i = 0; i < r; i++) {
+        auto loops = loopsWithinCommonRegion(memcpyIOpVec[i]);
+        if (loops.size() != 1)
+          return std::nullopt;
+        if (!steadyLoop)
+          steadyLoop = loops.front();
+        else if (loops.front() != steadyLoop)
+          return std::nullopt;
+      }
+      for (size_t i = r; i < L; i++)
+        if (!loopsWithinCommonRegion(memcpyIOpVec[i]).empty())
+          return std::nullopt;
+      NonCleanRotationPlan plan;
+      plan.cycleOps.assign(memcpyIOpVec.begin(), memcpyIOpVec.end());
+      plan.cycles = q;
+      plan.remainder = static_cast<int>(r);
+      return plan;
+    };
+    *nonCleanPlan = planFor();
+    if (nonCleanPlan->has_value())
+      return repeatCounts; // deliberately empty; the caller uses the plan
+  }
+
+  // Get each memcpy op's repeat count, relative to the common region.
+  for (auto o : memcpyIOpVec) {
     // In English, repeat count is trip count minus one.
-    repeatCounts[tripCount - 1].insert(o);
+    repeatCounts[tripCountOf(o) - 1].insert(o);
   }
 
   return repeatCounts;
