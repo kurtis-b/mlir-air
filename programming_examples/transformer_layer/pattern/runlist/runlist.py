@@ -662,8 +662,26 @@ def run_attention_head(cache, cfg, head, q, k, v):
     seq_len, head_dim = cfg["seq_len"], cfg["head_dim"]
     names = cfg["artifacts"]
     columns = slice(head * head_dim, (head + 1) * head_dim)
+    # `[2026-08-19]` THE ATTENTION SCALE, APPLIED WHERE builders/softmax.py
+    # SAYS IT MUST BE. The device softmax is the plain streaming family
+    # (SM_LOG2E only), so 1/sqrt(head_dim) has to be applied upstream -- the
+    # documented offload precedent -- and from the runlist front's landing
+    # until today NOTHING applied it: the interior computed
+    # softmax(QK^T) and every per-boundary gate passed anyway, because the
+    # golden model keeps the deviation inside attn_context's 1e-3 absolute
+    # ceiling while the RELATIVE error sat at 3.7-9.8e-2 (25x the other
+    # modes) in every recorded log. Settled on device (devq 363): a crafted
+    # q/k makes the two hypotheses' contexts diverge, and the device output
+    # correlated 0.9993 with the UNSCALED form against 0.45 with the scaled
+    # one. Folded into the q head slice, one multiply per head: head_dim is
+    # 64 everywhere in the matrix, 1/8 is a power of two, so the bf16
+    # multiply is an exponent shift -- exact, no added rounding.
     arrays = {
-        "q_h": np.ascontiguousarray(q[:, columns]),
+        "q_h": np.ascontiguousarray(
+            (q[:, columns].astype(np.float32) * (1.0 / np.sqrt(head_dim))).astype(
+                bfloat16
+            )
+        ),
         "k_h_t": np.ascontiguousarray(k[:, columns].T),
         "v_h": np.ascontiguousarray(v[:, columns]),
         "scores": np.zeros((seq_len, seq_len), dtype=bfloat16),
