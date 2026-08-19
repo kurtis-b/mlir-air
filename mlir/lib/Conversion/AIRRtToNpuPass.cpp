@@ -3393,14 +3393,32 @@ struct AIRRtToNpuPass : public impl::AIRRtToNpuBase<AIRRtToNpuPass> {
   // BD pool. Pacing at i-2 cannot deadlock a ring consumer: the consumer takes
   // the fills in order, so fill i-2 is retired before fill i could be
   // accepted, whatever the staging buffer's slot count.
+  // THE TRAVERSAL MUST SEE BOTH SHAPES THE PROGRAM CAN ARRIVE IN. Inside this
+  // pass a control program is a `func.func` until `ControlFuncConversion`
+  // rewrites it -- which runs AFTER this step -- so a module entering the pass
+  // as a function is caught by the func walk. But a module can also ARRIVE
+  // with `aie.runtime_sequence` already formed (R1's does: `aie.device(npu2)`
+  // holding `aie.runtime_sequence @..._sequence`, doc 52 SS12), and then the
+  // func walk finds only the module's private DECLARATIONS, whose bodies are
+  // empty, and the step never fires. That is not hypothetical: the step
+  // shipped with the func walk alone, its lit was green -- the lit's input is
+  // a hand-written func.func, the pre-conversion shape -- and five device
+  // arms re-measured pre-fix behaviour before anyone noticed nothing had
+  // changed (devq 334). The lit now carries the post-conversion case too.
   void boundIdenticalShimPutRuns(ModuleOp module) {
-    SmallVector<func::FuncOp> funcOps;
-    module.walk([&](func::FuncOp f) { funcOps.push_back(f); });
-    for (auto f : funcOps) {
+    SmallVector<std::pair<Block *, AIE::DeviceOp>> workBlocks;
+    module.walk([&](func::FuncOp f) {
       auto device = f->getParentOfType<AIE::DeviceOp>();
-      if (!device || f.getBody().empty())
-        continue;
-      Block &blk = f.getBody().front();
+      if (device && !f.getBody().empty())
+        workBlocks.push_back({&f.getBody().front(), device});
+    });
+    module.walk([&](AIE::RuntimeSequenceOp seq) {
+      auto device = seq->getParentOfType<AIE::DeviceOp>();
+      if (device && !seq.getBody().empty())
+        workBlocks.push_back({&seq.getBody().front(), device});
+    });
+    for (auto &[blkPtr, device] : workBlocks) {
+      Block &blk = *blkPtr;
 
       SmallVector<ShimBdTask> tasks;
       collectShimBdTasks(blk, device, tasks);
