@@ -128,7 +128,29 @@ from pattern.reference import (  # noqa: E402
 #
 #     boundary       atol_required   atol    margin
 #     q / k / v          3.1e-3      5e-3     1.6x
-#     attn_context       2.3e-4      1e-3     4.4x
+#     attn_context       2.3e-4      4e-4     see below
+#
+# `[2026-08-19]` attn_context TIGHTENED 1e-3 -> 4e-4, and the number is set
+# by a real recorded defect, not by the usual 2-3x rounding. The runlist
+# attention ran UNSCALED (softmax(QK^T), no 1/sqrt(d)) from its landing
+# until 2026-08-19 and this boundary's 1e-3 ceiling passed it at every
+# length -- the absolute error stayed small while the relative error ran
+# 25x the other modes. The measured table (Turbo, per-mode):
+#
+#     honest paths                unscaled defect (recorded, pre-fix)
+#     FA kernel  2.288e-4 @4096   runlist  4.631e-4 @4096
+#     FA kernel  2.716e-4 @1024   runlist  5.706e-4 @1024
+#     FA kernel  3.165e-4 @512    runlist  5.452e-4 @512
+#     offload    1.655e-4 @512
+#     runlist(fixed) 0.996e-4 @4096, 1.388e-4 @1024, 1.617e-4 @512
+#
+# 4e-4 sits in the separation window: 1.26x over the honest maximum (the
+# FlashAttention path at 512 -- thin, and deliberately so: widening past
+# 4.6e-4 re-admits the defect) and every recorded defect point is >=1.16x
+# OVER it. The window is narrow because the defect's absolute error is
+# genuinely small; the RELATIVE error (3.7-9.8e-2 vs ~1.4e-2) is the wide
+# signal, and a per-boundary mean_rel guard remains the named design task
+# (it changes gate semantics the fault-injection lit halves pin).
 #     attn_out           7.4e-4      2.5e-3   3.4x
 #     hidden             1.2e-2      3.5e-2   3.0x
 #     ffn_up             5.0e-2      1.5e-1   3.0x
@@ -143,7 +165,7 @@ BLOCK_STAGE_ATOL = {
     "q": 5e-3,
     "k": 5e-3,
     "v": 5e-3,
-    "attn_context": 1e-3,
+    "attn_context": 4e-4,
     "attn_out": 2.5e-3,
     "hidden": 3.5e-2,
     "ffn_up": 1.5e-1,
