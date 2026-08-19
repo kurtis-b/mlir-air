@@ -301,25 +301,33 @@ def compile_mv(tile_m=8):
 def compile_mv_int4_bf16(m_tile=8, k_chunk=2048, gs=128):
     """Compile mv_int4_bf16.o (int4-AWQ GEMV micro-kernel) from source.
 
-    Produces `mv_int4_bf16_gemv.o` (config-tagged) and stages it as the
-    canonical `mv_int4_bf16.o` (the name link_with attributes expect).
-    The int4 GEMM prefill compiles the same .cc with DIM_M=16 to a
-    different config-tagged name (`mv_int4_bf16_matmul.o`), so the two
-    variants don't clobber each other in CWD across sessions; the
-    last-staged canonical .o is whichever variant the current compile
-    needs.
+    Produces a config-tagged object and stages it as the canonical
+    `mv_int4_bf16.o` (the name link_with attributes expect). The int4 GEMM
+    prefill compiles the same .cc with DIM_M=16 to a different config-tagged
+    name (`mv_int4_bf16_matmul.o`), so the two variants don't clobber each
+    other in CWD across sessions; the last-staged canonical .o is whichever
+    variant the current compile needs.
+
+    `[2026-08-19]` The tag carries the GROUP SIZE too: `_compile_kernel`
+    skips an existing .o by NAME, and DIM_GS is baked in at compile time --
+    a gs=32 build (GGUF q4_0, SmolLM2) after a gs=128 one (AWQ) in the same
+    CWD would silently reuse the wrong kernel, the same
+    same-name-different-content class `compile_gemm_mm` was bitten by. The
+    canonical copy runs on every call, so the right variant is staged even
+    when the tagged object is reused.
     """
     src = _PROJ_ROOT / "matrix_vector_multiplication" / "int4_awq" / "mv_int4_bf16.cc"
+    tagged = f"mv_int4_bf16_gemv_gs{gs}.o"
     _compile_kernel(
         src,
-        "mv_int4_bf16_gemv.o",
+        tagged,
         extra_flags=[
             f"-DDIM_M={m_tile}",
             f"-DDIM_K={k_chunk}",
             f"-DDIM_GS={gs}",
         ],
     )
-    shutil.copy2("mv_int4_bf16_gemv.o", "mv_int4_bf16.o")
+    shutil.copy2(tagged, "mv_int4_bf16.o")
 
 
 def compile_mv_bf16():
@@ -486,7 +494,7 @@ def compile_softmax_streaming(vec_len=64, out_name="softmax_streaming.o"):
     )
 
 
-def compile_all_external_kernels(head_dim=64, quant="bf16"):
+def compile_all_external_kernels(head_dim=64, quant="bf16", int4_gs=128):
     """Compile all external C++ kernels from source.
 
     Call this before kernel compilation to ensure all .o files are fresh.
@@ -507,4 +515,11 @@ def compile_all_external_kernels(head_dim=64, quant="bf16"):
     compile_mv()
     compile_mv_bf16()
     if quant == "awq":
-        compile_mv_int4_bf16()
+        # `int4_gs` is the checkpoint's group size (AWQ 128, GGUF q4_0 32).
+        # It MUST reach this call: this sweep runs inside EVERY
+        # compile_and_cache via prepare_air_project, so a default here
+        # restages the canonical mv_int4_bf16.o at gs=128 AFTER any earlier
+        # gs=32 staging and immediately BEFORE aiecc links -- the first
+        # SmolLM2 int4 build linked the wrong group size exactly this way
+        # (devq 372/376: k/v from the decode ELF uncorrelated with host).
+        compile_mv_int4_bf16(gs=int4_gs)

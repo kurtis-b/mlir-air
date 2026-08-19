@@ -349,6 +349,7 @@ def run_npu_prefill(
     tokenizer,
     cpu_attn=True,
     quiet=False,
+    prompt_len=None,
 ):
     """NPU bf16 prefill on dequantized AWQ weights → first token + KV cache."""
     from llama32_1b_cpu_helpers import rms_norm
@@ -396,7 +397,16 @@ def run_npu_prefill(
             )
         prefill_cache.profiler.end_layer(layer_idx, t0)
 
-    prompt_len = len([t for t in token_ids if t != tokenizer.eos_token_id])
+    if prompt_len is None:
+        # Fallback heuristic, kept for existing callers: count non-EOS tokens
+        # in the padded array. VALID ONLY when the chat template contains no
+        # EOS -- true for Llama-3 (<|end_of_text|> never appears mid-prompt),
+        # FALSE for ChatML-style models: SmolLM2's <|im_end|> IS its EOS and
+        # appears after every message, so this undercounts by the number of
+        # turns and the logits are read at the wrong row (measured: the
+        # "first token" came back as a token FROM the prompt). Callers that
+        # know the real length pass it explicitly.
+        prompt_len = len([t for t in token_ids if t != tokenizer.eos_token_id])
     pred_pos = prompt_len - 1
 
     with prefill_cache.profiler.time_cpu("final_rms_norm"):
@@ -503,6 +513,7 @@ def generate(
     cpu_attn=True,
     on_token=None,
     ttft_start=None,
+    prompt_len=None,
 ):
     seq_len = len(prompt_tokens)
     max_seq = seq_len + n_tokens
@@ -526,6 +537,7 @@ def generate(
         tokenizer=tokenizer,
         cpu_attn=cpu_attn,
         quiet=streaming,
+        prompt_len=prompt_len,
     )
 
     ttft = time.perf_counter() - ttft_start
@@ -684,6 +696,10 @@ def run_once(
         cpu_attn=cpu_attn,
         on_token=on_token,
         ttft_start=ttft_start,
+        # The EXACT pre-padding length: the in-driver fallback counts non-EOS
+        # tokens, which undercounts for ChatML-style templates whose EOS
+        # (SmolLM2's <|im_end|>) appears inside the prompt.
+        prompt_len=prompt_len_actual,
     )
     return generated, prompt_len_actual
 

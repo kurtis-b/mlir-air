@@ -12,7 +12,7 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 
-def prepare_air_project(quant: str = "bf16"):
+def prepare_air_project(quant: str = "bf16", int4_gs: int = 128):
     """Clean and prepare the air_project/ directory for a fresh compilation.
 
     aircc defaults to 'air_project/' as its working directory. Sequential
@@ -32,7 +32,7 @@ def prepare_air_project(quant: str = "bf16"):
     # Compile external kernels from source (not stale .o copies)
     from shared.infra.external_kernels import compile_all_external_kernels
 
-    compile_all_external_kernels(quant=quant)
+    compile_all_external_kernels(quant=quant, int4_gs=int4_gs)
 
     # Copy compiled .o files to air_project/ for aiecc to find. Must include
     # every external symbol referenced by `link_with` in the kernel modules:
@@ -423,7 +423,14 @@ class KernelCache:
         # objects. Detect from kernel name so existing call sites don't need
         # an extra flag.
         quant = "awq" if "int4" in name else "bf16"
-        prepare_air_project(quant=quant)
+        # The group size rides the backend kwargs (popped -- XRTBackend does
+        # not know it) so the per-compile kernel sweep stages the CALLER'S
+        # variant of mv_int4_bf16.o rather than the gs=128 default. See
+        # external_kernels.compile_all_external_kernels for the failure this
+        # prevents.
+        backend_kwargs = dict(backend_kwargs)
+        int4_gs = backend_kwargs.pop("int4_gs", 128)
+        prepare_air_project(quant=quant, int4_gs=int4_gs)
         backend = XRTBackend(**backend_kwargs)
 
         t0 = time.time()

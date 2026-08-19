@@ -428,6 +428,7 @@ def run_npu_prefill(
     cpu_attn=True,
     profile=False,
     quiet=False,
+    prompt_len=None,
 ):
     """Run NPU prefill and extract KV cache for decode.
 
@@ -499,7 +500,16 @@ def run_npu_prefill(
     # Do CPU RMSNorm on just that row (<1 ms) and reuse the decode-side
     # 8-partition GEMV ELF (~14 ms NPU) instead of the full-seq GEMM ELF.
     vocab_size = weights.lm_head.shape[0]
-    prompt_len = len([t for t in token_ids if t != tokenizer.eos_token_id])
+    if prompt_len is None:
+        # Fallback heuristic, kept for existing callers: count non-EOS tokens
+        # in the padded array. VALID ONLY when the chat template contains no
+        # EOS -- true for Llama-3 (<|end_of_text|> never appears mid-prompt),
+        # FALSE for ChatML-style models: SmolLM2's <|im_end|> IS its EOS and
+        # appears after every message, so this undercounts by the number of
+        # turns and the logits are read at the wrong row (measured on the
+        # int4 sibling: the "first token" came back as a token FROM the
+        # prompt). Callers that know the real length pass it explicitly.
+        prompt_len = len([t for t in token_ids if t != tokenizer.eos_token_id])
     pred_pos = prompt_len - 1
 
     from llama32_1b_cpu_helpers import rms_norm
