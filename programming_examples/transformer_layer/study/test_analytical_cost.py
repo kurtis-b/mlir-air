@@ -317,13 +317,12 @@ def test_within_workload_cost_is_slots_only_and_ties_where_slots_agree():
             assert slots == ms.whole_design(base).shim_mm2s_slots, (field, v)
             assert got.ns == baseline.ns, (field, v, got.ns, baseline.ns)
 
-    # Clause 2: the configuration the Codex review located, where the nt1
-    # form DOES move the slot count. Split-GEMM seams are
-    # (nt1,up)(up,gelu)(gelu,down)(down,nt2); scoping only (down,nt2) as Seq
-    # with narrow herds makes BOTH nt1 forms legal, at 4 slots (fused) vs 6
-    # (j7a). The order rank() would give them is 100% the modelled port term
-    # -- the dram_bytes are asserted identical to make that visible.
-    seam_cfg = (
+    # Clause 2, `[2026-08-19]` REVISED by the slot-authority fix: the pair
+    # the Codex review first located (nt1 fused vs j7a under a (down,nt2)-Seq
+    # scope, 4 vs 6 slots) discriminated only through the cost-vs-legality
+    # DISAGREEMENT -- under the shared peak semantics both sides peak at the
+    # same worst segment and tie. Pinned, so the artifact cannot return:
+    seam_tail_seq = (
         (("nt1", "up"), "Pipe"),
         (("up", "gelu"), "Pipe"),
         (("gelu", "down"), "Pipe"),
@@ -335,20 +334,28 @@ def test_within_workload_cost_is_slots_only_and_ties_where_slots_agree():
         gemm_fold="split",
         gemm_herd_x=1,
         norm_herd_x=2,
-        seams=seam_cfg,
+        seams=seam_tail_seq,
     )
     a = dataclasses.replace(narrow, nt1_form="fused")
     b = dataclasses.replace(narrow, nt1_form="j7a")
-    assert ms.legality(a).legal and ms.legality(b).legal, (
-        ms.legality(a),
-        ms.legality(b),
-    )
-    ca, cb = ac.cost(a, 1024), ac.cost(b, 1024)
-    assert ca.dram_bytes == cb.dram_bytes
-    slots_a = ms.whole_design(a).shim_mm2s_slots
-    slots_b = ms.whole_design(b).shim_mm2s_slots
-    assert slots_a != slots_b, (slots_a, slots_b)
-    assert ca.ns != cb.ns, "the port term stopped discriminating this pair"
+    assert ms.legality(a).legal and ms.legality(b).legal
+    assert ms.peak_shim_mm2s_slots(a) == ms.peak_shim_mm2s_slots(b)
+    assert ac.cost(a, 1024).ns == ac.cost(b, 1024).ns
+
+    # What the port term DOES still discriminate, and it is the one axis a
+    # builder really parameterizes (norm_tail's herd_x keyword): the all-Seq
+    # norm width. 8 slots at herd_x 4 against 16 at herd_x 8, both legal,
+    # identical bytes -- so the order is 100% the modelled port term whose
+    # own docstring calls a port-only winner "unresolved".
+    all_seq = tuple((pair, "Seq") for pair in ms.SEAMS_SPLIT)
+    n4 = dataclasses.replace(base, seams=all_seq, norm_herd_x=4)
+    n8 = dataclasses.replace(base, seams=all_seq, norm_herd_x=8)
+    assert ms.legality(n4).legal and ms.legality(n8).legal
+    s4, s8 = ms.peak_shim_mm2s_slots(n4), ms.peak_shim_mm2s_slots(n8)
+    assert (s4, s8) == (8, 16), (s4, s8)
+    c4, c8 = ac.cost(n4, 1024), ac.cost(n8, 1024)
+    assert c4.dram_bytes == c8.dram_bytes
+    assert c8.ns < c4.ns, "the port term stopped discriminating this pair"
 
     # Pricing of an over-budget declaration is LOUD, not silent: the default
     # mapping demands 32 slots against the machine's 16, legality refuses it,

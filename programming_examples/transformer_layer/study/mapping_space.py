@@ -780,6 +780,27 @@ def segments(mapping: Mapping) -> list:
     return out
 
 
+def peak_shim_mm2s_slots(mapping: Mapping, per_segment=None) -> int:
+    """The slot count the legality check AND the cost model both use.
+
+    Segments are time-multiplexed, so the design's peak shim occupancy is the
+    MAX over segments -- each meets the whole budget on its own -- and band
+    lanes are concurrent, so they multiply.
+
+    `[2026-08-19]` This exists because the two consumers used to disagree:
+    ``legality`` computed exactly this, while ``cost()`` read
+    ``whole_design(...).shim_mm2s_slots`` -- the slots of the single segment
+    ``compose(Seq)`` picks by ``(cores, slots)``. At all-Seq seams with
+    ``norm_herd_x=2`` the segments are [(6c,4s),(4c,8s),(4c,4s),(4c,8s),
+    (6c,4s)]: legality reported 8, cost priced 4, and the cost-side port
+    count was non-monotonic in ``norm_herd_x`` (8, 4, 8, 16). A Codex review
+    surfaced it; one authority, consumed by both, is the repair.
+    """
+    per_segment = segments(mapping) if per_segment is None else per_segment
+    worst = max(per_segment, key=lambda d: d.shim_mm2s_slots, default=Demand())
+    return worst.shim_mm2s_slots * mapping.parallel_bands
+
+
 def whole_design(mapping: Mapping, per_segment=None) -> Demand:
     """The top of the tree: band lanes are ``Para`` over the composed chain.
 
@@ -948,11 +969,9 @@ def legality(mapping: Mapping) -> Verdict:
 
     # --- the shim budget ---------------------------------------------------
     # Segments are time-multiplexed, so each meets the whole budget on its own;
-    # band lanes are concurrent, so they add.
-    worst_segment = max(
-        per_segment, key=lambda d: d.shim_mm2s_slots, default=Demand()
-    )
-    total_slots = worst_segment.shim_mm2s_slots * lanes
+    # band lanes are concurrent, so they add. ONE authority shared with the
+    # cost model -- see peak_shim_mm2s_slots.
+    total_slots = peak_shim_mm2s_slots(mapping, per_segment)
     v.report["shim_mm2s_slots"] = total_slots
     v.report["shim_mm2s_budget"] = NPU2_SHIM_MM2S_PORTS
 

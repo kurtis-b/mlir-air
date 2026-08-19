@@ -370,8 +370,11 @@ def cost(mapping, seq: int, ffn: int | None = None) -> Cost:
     rate half needs, which is why this bridge is possible at all.
     """
     ffn = FFN_DIM if ffn is None else ffn
-    demand = mapping_space.whole_design(mapping)
-    ports = max(1, demand.shim_mm2s_slots)
+    # The PEAK over time-multiplexed segments, times concurrent band lanes --
+    # the same authority the legality check consumes. Reading
+    # whole_design(...).shim_mm2s_slots here under-counted Seq compositions
+    # (mapping_space.peak_shim_mm2s_slots has the measured case).
+    ports = max(1, mapping_space.peak_shim_mm2s_slots(mapping))
     out = cost_for_shape(
         seq, mapping.cols, ffn, itemsize=mapping.itemsize, shim_ports=ports
     )
