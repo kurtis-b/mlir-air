@@ -375,12 +375,11 @@ def test_a_blocked_variant_mode_pair_surfaces_as_a_skip_not_a_run():
             f"{family} is listed reachable but every profile mode is refused"
         )
     # Ordering: the variant clause must win over the fused packing bound --
-    # probed at 4096, where BOTH apply to a decoder family. A fused decoder
-    # rung reported as "outside 256..1024" would read as a width limit on a
-    # graph that does not exist at any width, and an implementation that
-    # checks the bound first passes every in-bound probe above.
+    # probed at 4096, where BOTH would apply. A fused decoder rung reported
+    # as "outside 256..1024" would read as a width limit on a wall that has
+    # nothing to do with width (re-execution unmasks at EVERY length).
     reason = profiles.skip_reason("fused", 4096, "gpt2_small_768")
-    assert run_mode.UNBUILDABLE_VARIANTS["decoder_gpt2"]["fused"] in reason
+    assert reason is not None and "UNMASKED" in reason
     assert "plane-major packing" not in reason
 
 
@@ -454,11 +453,12 @@ def test_retargeting_a_profile_retargets_its_gate_with_no_number_edited():
     assert at512["rows"] == at768["rows"] == len(ladder.seqs)
 
 
-def test_retargeting_to_a_decoder_family_skips_fused_and_only_fused():
-    """`[2026-08-19]` The old refusal-at-construction test, inverted by the
-    decoder graphs landing: a decoder retarget now SUCCEEDS and derives its
-    gate -- every fused rung skipped (no decoder graph there), every other
-    mode's rung measured -- with no number edited anywhere."""
+def test_retargeting_to_a_decoder_family_skips_fused_with_the_wall_reason():
+    """`[2026-08-19]` Three modes run the decoder; fused's stitch is
+    single-dispatch-correct but re-execution unmasks its attention (devq
+    382-384), so a decoder retarget derives fused fully SKIPPED -- with the
+    measured wall as the reason, not the retired wiring-gap text -- and
+    everything else measured, with no number edited anywhere."""
     smoke = profiles.profile("smoke").retarget("gpt2_small_768")
     counts = smoke.expected_rows()
     assert counts["fused.csv"] == {"rows": 1, "measured": 0, "skipped": 1}
@@ -469,9 +469,8 @@ def test_retargeting_to_a_decoder_family_skips_fused_and_only_fused():
     assert lcounts["fused.csv"] == {"rows": 4, "measured": 0, "skipped": 4}
     for rel in ("coarse.csv", "offload.csv", "runlist.csv"):
         assert lcounts[rel] == {"rows": 4, "measured": 4, "skipped": 0}, rel
-    # The skip carries run_mode's own reason, and names the variant.
     reason = smoke.rungs()[-1].skip_reason
-    assert reason is not None and "decoder_gpt2" in reason
+    assert reason is not None and "UNMASKED" in reason
 
 
 def test_skip_reason_names_the_source_of_the_bound():

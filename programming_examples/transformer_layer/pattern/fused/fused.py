@@ -170,6 +170,7 @@ from builders.mha_out_proj import (  # noqa: E402
 from builders.qkv_proj import build_qkv_proj_module  # noqa: E402
 from opcheck_layer import (  # noqa: E402
     BLOCK_STAGE_ATOL,
+    DECODER_STAGE_ATOL,
     print_dispatch_totals,
     reconfiguration_delta,
 )
@@ -177,6 +178,7 @@ from opcheck_prepare import _spec_digest  # noqa: E402
 from pattern import EXECUTION_MODE_CSV  # noqa: E402
 from pattern.blocked_attention import round_bf16  # noqa: E402
 from pattern.reference import (  # noqa: E402
+    DECODER_BOUNDARIES,
     ENCODER_BOUNDARIES,
     fuse_qkv_weight,
     generate_golden_reference,
@@ -218,6 +220,13 @@ _TAIL_BUFFER_ALIAS = {"ffn_out": "packed2"}
 #: The stitched tail's combined func name, and therefore its instance_name — a
 #: mismatch does not fail to load, it times out far from the cause.
 _TAIL_FUNC = "fused_tail"
+
+#: The DECODER's two stitched func names. The decoder variant has no packed
+#: plane anywhere: its pre-norm normalizes `x` alone (no residual add), and
+#: its raw residual stream flows through bare add slices over separate args,
+#: so the plane-major packing — and its rows*cols cap — never enters.
+_PRE_NORM_FUNC = "decoder_pre_norm"
+_DECODER_TAIL_FUNC = "decoder_tail"
 
 
 def _private_syms(ir_text):
@@ -382,25 +391,228 @@ def build_fused_tail_module(cfg):
     return module
 
 
-def fused_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
+def decoder_pre_norm_arg_layout(seq_len, emb_dim):
+    """The pre-attention norm's signature: LN(x) * gamma, no residual.
+
+    ``ln1_norm`` is the LayerNorm's own output, a real func arg because the
+    two slices hand off through it; ``gamma1b`` is the [seq, emb] broadcast
+    the decomposed mul launch takes (the norm_tail PIPELINE takes the [emb]
+    weight, but the decoder deliberately uses the decomposed slices -- no
+    packed planes, no rows*cols cap).
+    """
+    from shared.infra.stitching import FuncArg
+
+    args, idx = [], {}
+
+    def add(name, type_str):
+        idx[name] = len(args)
+        args.append(FuncArg(f"%arg{len(args)}", type_str))
+
+    act = f"memref<{seq_len}x{emb_dim}xbf16>"
+    add("x", act)
+    add("ln1_norm", act)
+    add("gamma1b", act)
+    add("ln_in", act)
+    return args, idx
+
+
+def build_decoder_pre_norm_module(cfg):
+    """Stitch LayerNorm + gamma-mul into one module: ``ln_in = LN(x) * g1``."""
+    seq_len, emb_dim = cfg["seq_len"], cfg["emb_dim"]
+    args, idx = decoder_pre_norm_arg_layout(seq_len, emb_dim)
+    ln_ir = str(build_layer_norm_module(seq_len, emb_dim, bfloat16))
+    mul_ir = str(build_elementwise_mul_module(seq_len, emb_dim, bfloat16))
+    slices = [
+        KernelSlice(
+            ln_ir,
+            "pn",
+            {0: idx["x"], 1: idx["ln1_norm"]},
+            extern_syms=_private_syms(ln_ir),
+        ),
+        KernelSlice(
+            mul_ir,
+            "pm",
+            {0: idx["ln1_norm"], 1: idx["gamma1b"], 2: idx["ln_in"]},
+            extern_syms=_private_syms(mul_ir),
+        ),
+    ]
+    module = stitch_elf(_PRE_NORM_FUNC, args, slices)
+    print(f"  pre_norm module: {len(str(module).splitlines())} lines, parsed OK")
+    return module
+
+
+def decoder_tail_arg_layout(seq_len, emb_dim, ffn_dim, up_spec, down_spec):
+    """The decoder tail's signature. No packed planes, no aliases.
+
+    add(attn_out, x) -> residual; LN(residual) -> ln2_norm; ln2_norm * g2 ->
+    ffn_in; FFN(ffn_in) -> ffn_out; add(ffn_out, residual) -> output. The
+    f32 scratch entries exist only for a GEMM method that stages one, same
+    as the encoder tail's layout.
+    """
+    from shared.infra.stitching import FuncArg
+
+    args, idx = [], {}
+
+    def add(name, type_str):
+        idx[name] = len(args)
+        args.append(FuncArg(f"%arg{len(args)}", type_str))
+
+    act = f"memref<{seq_len}x{emb_dim}xbf16>"
+    wide = f"memref<{seq_len}x{ffn_dim}xbf16>"
+    add("attn_out", act)
+    add("x", act)
+    add("residual", act)
+    add("ln2_norm", act)
+    add("gamma2b", act)
+    add("ffn_in", act)
+    add("w_up", f"memref<{emb_dim}x{ffn_dim}xbf16>")
+    if up_spec["needs_f32_scratch"]:
+        add("ffn_up_f32", f"memref<{seq_len}x{ffn_dim}xf32>")
+    add("ffn_up", wide)
+    add("ffn_gelu", wide)
+    add("w_down", f"memref<{ffn_dim}x{emb_dim}xbf16>")
+    if down_spec["needs_f32_scratch"]:
+        add("ffn_out_f32", f"memref<{seq_len}x{emb_dim}xf32>")
+    add("ffn_out", act)
+    add("output", act)
+    return args, idx
+
+
+def build_decoder_tail_module(cfg):
+    """Stitch the decoder's raw-residual tail into one multi-launch module.
+
+    Five slices in execution order -- add, LayerNorm, gamma-mul, the whole
+    staged FFN, add -- each a builder's parsed-and-reprinted module, exactly
+    the mechanism the encoder tail uses, minus the packed-plane pipeline the
+    pre-norm structure cannot express (and therefore minus its rows*cols
+    cap; the decoder rides the encoder's seq bound anyway, via the profile
+    skip rule, until someone measures past it).
+    """
+    seq_len, emb_dim, ffn_dim = cfg["seq_len"], cfg["emb_dim"], cfg["ffn_dim"]
+    up_spec, down_spec = cfg["ffn_up_spec"], cfg["ffn_down_spec"]
+    args, idx = decoder_tail_arg_layout(seq_len, emb_dim, ffn_dim, up_spec, down_spec)
+    _, ffn_idx = ffn_arg_layout(seq_len, emb_dim, ffn_dim, up_spec, down_spec)
+
+    add_ir = str(build_elementwise_add_module(seq_len, emb_dim, bfloat16))
+    ln_ir = str(build_layer_norm_module(seq_len, emb_dim, bfloat16))
+    mul_ir = str(build_elementwise_mul_module(seq_len, emb_dim, bfloat16))
+    ffn_ir = str(build_ffn_module(seq_len, emb_dim, ffn_dim))
+
+    ffn_pairs = [
+        ("x", "ffn_in"),
+        ("w_up", "w_up"),
+        ("h", "ffn_up"),
+        ("a", "ffn_gelu"),
+        ("w_down", "w_down"),
+        ("y", "ffn_out"),
+    ]
+    if "h_f32" in ffn_idx:
+        ffn_pairs.append(("h_f32", "ffn_up_f32"))
+    if "y_f32" in ffn_idx:
+        ffn_pairs.append(("y_f32", "ffn_out_f32"))
+    ffn_map = {ffn_idx[src]: idx[dst] for src, dst in ffn_pairs}
+
+    slices = [
+        KernelSlice(
+            add_ir,
+            "r1",
+            {0: idx["attn_out"], 1: idx["x"], 2: idx["residual"]},
+            extern_syms=_private_syms(add_ir),
+        ),
+        KernelSlice(
+            ln_ir,
+            "dn",
+            {0: idx["residual"], 1: idx["ln2_norm"]},
+            extern_syms=_private_syms(ln_ir),
+        ),
+        KernelSlice(
+            mul_ir,
+            "dm",
+            {0: idx["ln2_norm"], 1: idx["gamma2b"], 2: idx["ffn_in"]},
+            extern_syms=_private_syms(mul_ir),
+        ),
+        KernelSlice(ffn_ir, "ff", ffn_map, extern_syms=_private_syms(ffn_ir)),
+        KernelSlice(
+            add_ir,
+            "r2",
+            {0: idx["ffn_out"], 1: idx["residual"], 2: idx["output"]},
+            extern_syms=_private_syms(add_ir),
+        ),
+    ]
+    module = stitch_elf(
+        _DECODER_TAIL_FUNC,
+        args,
+        slices,
+        debug_dump_path="/tmp/debug_decoder_tail.mlir",
+    )
+    print(
+        f"  decoder_tail module: {len(str(module).splitlines())} lines, parsed OK"
+    )
+    return module
+
+
+def fused_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim, causal=False):
     """Resolve every operator's configuration without building anything.
 
     Delegates the spec resolution to ``block_config`` — same registry rows,
     same attention configuration, same arg layouts as the code D2 validated —
     and replaces the artifact plan with this mode's three ELFs.
     """
-    base = block_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim)
+    base = block_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim, causal=causal)
     suffix = f"{seq_len}x{emb_dim}"
-    artifacts = {
-        "qkv_proj": f"fused_qkv_proj_{suffix}",
-        "mha_out_proj": f"fused_mha_out_proj_{suffix}x{num_heads}h",
-        "fused_tail": f"fused_tail_{suffix}x{ffn_dim}",
-    }
+    if causal:
+        artifacts = {
+            "pre_norm": f"fused_pre_norm_{suffix}",
+            "qkv_proj": f"fused_qkv_proj_{suffix}",
+            "mha_out_proj": f"fused_mha_out_proj_{suffix}x{num_heads}h_causal",
+            "decoder_tail": f"fused_decoder_tail_{suffix}x{ffn_dim}",
+        }
+    else:
+        artifacts = {
+            "qkv_proj": f"fused_qkv_proj_{suffix}",
+            "mha_out_proj": f"fused_mha_out_proj_{suffix}x{num_heads}h",
+            "fused_tail": f"fused_tail_{suffix}x{ffn_dim}",
+        }
     cfg = {
         k: v
         for k, v in base.items()
         if k not in ("artifacts", "backend_kwargs", "norm_rows", "norm_blocks")
     }
+    if causal:
+        tail_args, tail_idx = decoder_tail_arg_layout(
+            seq_len, emb_dim, ffn_dim, cfg["ffn_up_spec"], cfg["ffn_down_spec"]
+        )
+        _, pre_idx = decoder_pre_norm_arg_layout(seq_len, emb_dim)
+        cfg.update(
+            {
+                "artifacts": artifacts,
+                "tail_idx": tail_idx,
+                # No aliases in the decoder layout: every name is its own BO.
+                "tail_order": tuple(
+                    name for name, _ in sorted(tail_idx.items(), key=lambda kv: kv[1])
+                ),
+                "pre_idx": pre_idx,
+                "backend_kwargs": {
+                    artifacts["pre_norm"]: dict(
+                        _GEMM_BACKEND, instance_name=_PRE_NORM_FUNC
+                    ),
+                    artifacts["qkv_proj"]: dict(
+                        _GEMM_BACKEND, instance_name="qkv_proj"
+                    ),
+                    artifacts["mha_out_proj"]: dict(
+                        MHA_OUT_PROJ_RUNNER_KWARGS, instance_name="mha_out_proj"
+                    ),
+                    artifacts["decoder_tail"]: dict(
+                        _GEMM_BACKEND, instance_name=_DECODER_TAIL_FUNC
+                    ),
+                },
+            }
+        )
+        # Conditional, never defaulted: block_artifact_fingerprint hashes the
+        # whole cfg, and a new key on the encoder path would invalidate every
+        # cached encoder ELF (same argument as builders/block.py).
+        cfg["causal"] = True
+        return cfg
     tail_args, tail_idx = fused_tail_arg_layout(
         seq_len, emb_dim, ffn_dim, cfg["ffn_up_spec"], cfg["ffn_down_spec"]
     )
@@ -427,10 +639,14 @@ def fused_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim):
 def describe_fused(cfg):
     """One line per resolved decision, for the run log and the lit gate."""
     n_tail = len(cfg["tail_order"])
+    if cfg.get("causal"):
+        variant, entries = "decoder_gpt2, causal", 4
+    else:
+        variant, entries = "encoder_bert, non-causal", 3
     print(
         f"  fused {cfg['seq_len']}x{cfg['emb_dim']} ffn {cfg['ffn_dim']} "
-        f"{cfg['num_heads']}h x {cfg['head_dim']} (encoder_bert, non-causal, "
-        f"3 entries over 3 ELFs in one submission)"
+        f"{cfg['num_heads']}h x {cfg['head_dim']} ({variant}, "
+        f"{entries} entries over {entries} ELFs in one submission)"
     )
     print(
         f"    qkv_proj  {cfg['qkv_spec']['method']} ({cfg['qkv_source']}), "
@@ -462,12 +678,27 @@ _ARTIFACT_BUILD = {
     "mha_out_proj": (
         lambda cfg: compile_mha_out_proj_kernels(cfg["attn_cfg"], cfg["o_proj_spec"]),
         lambda cfg: build_mha_out_proj_module(
-            cfg["seq_len"], cfg["head_dim"], cfg["num_heads"], causal=False
+            cfg["seq_len"],
+            cfg["head_dim"],
+            cfg["num_heads"],
+            causal=cfg.get("causal", False),
         ),
     ),
     "fused_tail": (
         lambda cfg: _compile_tail_kernels(cfg),
         build_fused_tail_module,
+    ),
+    # Decoder only (`fused_config(causal=True)` swaps the artifact set): the
+    # pre-attention norm and the raw-residual tail. The tail's externs are
+    # the SAME set _compile_tail_kernels builds (FFN micro-kernels + GeLU +
+    # multi-row LayerNorm); the pre-norm links the LayerNorm kernel alone.
+    "pre_norm": (
+        lambda cfg: ek.compile_layer_norm(),
+        build_decoder_pre_norm_module,
+    ),
+    "decoder_tail": (
+        lambda cfg: _compile_tail_kernels(cfg),
+        build_decoder_tail_module,
     ),
 }
 
@@ -507,6 +738,10 @@ def compile_fused_artifacts(cache, cfg, run_only=False):
     modules = {}
     stale = []
     for key, (_, build_module) in _ARTIFACT_BUILD.items():
+        # The build table is the union of both variants; the cfg's artifact
+        # set names which subset applies (same guard as the block's).
+        if key not in names:
+            continue
         name = names[key]
         module = build_module(cfg)
         fingerprints[name] = block_artifact_fingerprint(cfg, key, module)
@@ -563,12 +798,20 @@ def prepare_fused(shape, seed=42):
     seq_len, emb_dim = shape["seq_len"], shape["emb_dim"]
     ffn_dim, num_heads = shape["ffn_dim"], shape["num_heads"]
     head_dim = shape["head_dim"]
+    # The variant rides in the shape dict (run_mode._shape_for stamps it).
+    # The decoder is FOUR entries in the one submission -- pre_norm, qkv,
+    # causal mha, decoder_tail -- with NO packed plane anywhere; see the
+    # decoder builders above.
+    variant = shape.get("workload_variant", "encoder_bert")
+    causal = variant == "decoder_gpt2"
+    boundary_names = DECODER_BOUNDARIES if causal else ENCODER_BOUNDARIES
+    stage_atol = DECODER_STAGE_ATOL if causal else BLOCK_STAGE_ATOL
 
-    cfg = fused_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim)
+    cfg = fused_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim, causal=causal)
     describe_fused(cfg)
 
     golden = generate_golden_reference(
-        seq_len, emb_dim, ffn_dim, num_heads, seed=seed, workload_variant="encoder_bert"
+        seq_len, emb_dim, ffn_dim, num_heads, seed=seed, workload_variant=variant
     )
     weights = golden["weights"]
     reference = golden["boundaries"]
@@ -764,13 +1007,191 @@ def prepare_fused(shape, seed=42):
             **reconfiguration_delta(cache, reconfig_baseline),
         }
 
+    def decoder_dispatch(device_inputs, stage_stats):
+        # `[2026-08-19]` MEASURED WALL -- this dispatch is correct ONCE and
+        # is refused by run_mode until the wall is root-caused. The in-kernel
+        # causal mask applies only on the FIRST execution within this
+        # four-entry composition: executions 2+ correlate 0.9994 with the
+        # UNMASKED reference (devq 383) while ln_in/q/k/v stay clean, and the
+        # byte-identical instruction stream re-executes causally in coarse's
+        # two-entry submission across three dispatches (devq 359/361; the
+        # two compiled ELFs differ only in embedded name bytes, insts.bin
+        # identical). Evicting and reloading the mha hw_context per dispatch
+        # does NOT reset it (devq 384: context_loads 1 per dispatch, failure
+        # numbers byte-identical), so the state lives device-side OUTSIDE
+        # the context -- the H10 frozen-BD family. Root-causing what the
+        # four-entry runlist does to the causal row-helper state that the
+        # two-entry one does not is the named open investigation; the code
+        # stays so the investigation has a running reproducer.
+        reconfig_baseline = cache.reconfiguration_counts()
+        x, w_qkv, w_o, ln1_weight, w_up, w_down, ln2_weight = device_inputs
+
+        def zeros_act():
+            return np.zeros((seq_len, emb_dim), dtype=bfloat16)
+
+        # Both gammas are the [seq, emb] broadcast the decomposed mul slices
+        # take (the norm_tail PIPELINE takes the [emb] weight; the decoder
+        # deliberately uses the decomposed slices -- no packed planes).
+        gamma1b = round_bf16(broadcast_row_weight(ln1_weight, seq_len))
+        gamma2b = round_bf16(broadcast_row_weight(ln2_weight, seq_len))
+        arrays = {
+            "x": x,
+            "w_qkv": w_qkv,
+            "w_o": w_o,
+            "gamma1b": gamma1b,
+            "gamma2b": gamma2b,
+            "w_up": w_up,
+            "w_down": w_down,
+            "ln1_norm": zeros_act(),
+            "ln_in": zeros_act(),
+            "qkv_f32": np.zeros((seq_len, 3 * emb_dim), dtype=np.float32),
+            "q": zeros_act(),
+            "k": zeros_act(),
+            "v": zeros_act(),
+            "attn_context": zeros_act(),
+            "attn_out": zeros_act(),
+            "residual": zeros_act(),
+            "ln2_norm": zeros_act(),
+            "ffn_in": zeros_act(),
+            "ffn_up": np.zeros((seq_len, ffn_dim), dtype=bfloat16),
+            "ffn_gelu": np.zeros((seq_len, ffn_dim), dtype=bfloat16),
+            "ffn_out": zeros_act(),
+            "output": zeros_act(),
+        }
+        # attn_out is its own buffer here -- the encoder packs it into
+        # packed1 plane 0 for the norm_tail pipeline; the decoder's residual
+        # add takes two plain 2-D args.
+        mha_rename = {
+            "q": "q",
+            "k": "k",
+            "v": "v",
+            "attn_out": "attn_context",
+            "w_o": "w_o",
+            "y_f32": "attn_f32",
+            "y": "attn_out",
+        }
+        if "y_f32" in mha_idx:
+            arrays["attn_f32"] = np.zeros((seq_len, emb_dim), dtype=np.float32)
+        if "ffn_up_f32" in tail_idx:
+            arrays["ffn_up_f32"] = np.zeros((seq_len, ffn_dim), dtype=np.float32)
+        if "ffn_out_f32" in tail_idx:
+            arrays["ffn_out_f32"] = np.zeros((seq_len, emb_dim), dtype=np.float32)
+
+        host_filled = {
+            "x",
+            "w_qkv",
+            "w_o",
+            "gamma1b",
+            "gamma2b",
+            "w_up",
+            "w_down",
+        }
+        tail_writes = tuple(
+            sorted(tail_idx[n] for n in tail_idx if n not in host_filled)
+        )
+        pre_idx = cfg["pre_idx"]
+        pre_order = tuple(
+            name for name, _ in sorted(pre_idx.items(), key=lambda kv: kv[1])
+        )
+        pre_writes = tuple(sorted(pre_idx[n] for n in ("ln1_norm", "ln_in")))
+        steps = [
+            DispatchStep(names["pre_norm"], pre_order, writes=pre_writes),
+            DispatchStep(
+                names["qkv_proj"],
+                ("ln_in", "w_qkv", "qkv_f32", "q", "k", "v"),
+                writes=(2, 3, 4, 5),
+            ),
+            DispatchStep(
+                names["mha_out_proj"],
+                _ordered_args(mha_idx, mha_rename),
+                writes=tuple(
+                    sorted(
+                        mha_idx[n] for n in ("attn_out", "y_f32", "y") if n in mha_idx
+                    )
+                ),
+            ),
+            DispatchStep(names["decoder_tail"], cfg["tail_order"], writes=tail_writes),
+        ]
+        outputs = (
+            "ln_in",
+            "q",
+            "k",
+            "v",
+            "attn_context",
+            "attn_out",
+            "residual",
+            "ffn_in",
+            "ffn_up",
+            "ffn_gelu",
+            "ffn_out",
+            "output",
+        )
+        statics = {"w_qkv", "w_o", "gamma1b", "gamma2b", "w_up", "w_down"}
+        specs = {
+            name: _spec_buf(
+                name, arr, static=name in statics, host_output=name in outputs
+            )
+            for name, arr in arrays.items()
+        }
+        host_writes = (host_filled | {"qkv_f32"}) | (
+            {"attn_f32", "ffn_up_f32", "ffn_out_f32"} & set(arrays)
+        )
+        print(
+            "  [fused 1/1] pre_norm + qkv_proj + mha_out_proj + decoder_tail "
+            "(one submission)"
+        )
+        results, vector = cache.run_sequence(
+            steps,
+            specs,
+            cfg["backend_kwargs"],
+            arrays,
+            host_writes=host_writes,
+            require_single_submission=True,
+        )
+        boundaries = {n: np.array(results[n], copy=True) for n in outputs}
+
+        vector_rows = [vector.as_row()]
+        stages = []
+        for name in boundary_names:
+            atol = stage_atol[name]
+            stats = stage_stats(boundaries[name], reference[name], atol=atol)
+            stages.append(dict(stats, name=name, atol=atol))
+            print(
+                f"  [stage] {name:13s} {stats['n_elements']:>9d} elements  "
+                f"mismatch {stats['n_mismatch']:>7d}  "
+                f"mean_rel_L1 {stats['mean_rel_L1']:.3e}  "
+                f"atol_required {stats['atol_required']:.3e} (atol {atol:.1e})"
+            )
+        clean = sum(1 for s_ in stages if s_["n_mismatch"] == 0)
+        print(f"[fused] stages: {clean}/{len(stages)} clean")
+        print_dispatch_totals("fused", vector_rows)
+        return [boundaries["output"]], {
+            "stages": stages,
+            "stages_passed": clean == len(stages),
+            "dispatch_vectors": vector_rows,
+            "device_ms": sum(
+                float(r.get("device_submission_ms", 0.0)) for r in vector_rows
+            ),
+            "sync_ms": sum(float(r.get("host_sync_ms", 0.0)) for r in vector_rows),
+            "host_cpu_ms": {},
+            **reconfiguration_delta(cache, reconfig_baseline),
+        }
+
+    if causal:
+        dispatch = decoder_dispatch
+
     record_extra = {
-        "variant": "encoder_bert",
-        "causal": False,
+        "variant": variant,
+        "causal": causal,
         "golden_seed": seed,
         "execution_mode": EXECUTION_MODE_CSV["fused"],
         "elf_count": len(names),
-        "fusion": "stitch_elf: norm_tail(J7a) / ffn / norm_tail(J7a) in one module",
+        "fusion": (
+            "stitch_elf: pre_norm / qkv / causal mha / decoder_tail "
+            "(add-ln-mul-ffn-add), no packed planes"
+            if causal
+            else "stitch_elf: norm_tail(J7a) / ffn / norm_tail(J7a) in one module"
+        ),
         "gemm_spec_source": cfg["qkv_source"],
         "gemm_spec_qkv": _spec_digest(cfg["qkv_spec"]),
         "gemm_spec_ffn_up": _spec_digest(cfg["ffn_up_spec"]),
@@ -789,12 +1210,18 @@ def prepare_fused(shape, seed=42):
             )
         },
     }
-    return {
+    prepared = {
         "inputs": inputs,
         # ln1_weight, index 3. Same measured target as the block's; see
-        # opcheck_layer.py for the numbers.
+        # opcheck_layer.py for the numbers. For the decoder it feeds the
+        # pre-attention gamma multiply, upstream of every boundary.
         "inject": (FUSED_INPUT_NAMES.index("ln1_weight"), (0,)),
         "expected": [reference["output"]],
         "dispatch": dispatch,
         "record_extra": record_extra,
     }
+    if causal:
+        # Same seam as opcheck_layer's: the decoder's whole-layer comparison
+        # runs at its own output boundary's atol.
+        prepared["atol"] = stage_atol["output"]
+    return prepared

@@ -198,12 +198,14 @@ def test_a_decoder_family_is_refused_per_mode_rather_than_run_as_an_encoder():
     """The worst outcome available here is a valid-looking bidirectional
     measurement stamped `decoder_gpt2`, because nothing downstream could detect
     it. So the variant is carried into the row AND the unwired modes refuse.
-    `[2026-08-19]` `coarse` builds the decoder graph (builders/block.py::
-    run_decoder_block), `offload` builds it host-side, and `runlist` builds it
-    fine-grained (the causal_mask add between score GEMM and device softmax),
-    so the refusal is per (variant, mode) now -- and this test pins BOTH
-    halves: the built modes absent, every unwired whole-layer mode present
-    with a reason of its own."""
+    `[2026-08-19]` Three whole-layer modes build AND RUN the decoder graph
+    (`coarse` via run_decoder_block, `offload` host-side, `runlist` via the
+    causal_mask entry). `fused`'s decoder stitch builds and is
+    single-dispatch-correct but re-execution unmasks its attention -- a
+    measured device-side wall (devq 382-384), so it is REFUSED with that
+    reason rather than run into a green first dispatch and wrong steady
+    state. This test pins both halves: the runnable modes absent, fused and
+    the two coarse cells present with reasons of their own."""
     shape, key, variant = run_mode._shape_for(_spec(), 512, "gpt2_small_768")
     assert variant == "decoder_gpt2"
     assert key == "512x768_decoder_gpt2"
@@ -215,6 +217,9 @@ def test_a_decoder_family_is_refused_per_mode_rather_than_run_as_an_encoder():
     for built in ("coarse", "offload", "runlist"):
         assert built not in blockers, built
     assert set(blockers) == {"fused", "coarse_c2", "coarse_c3"}
+    # fused's entry must carry the MEASURED wall, not the retired wiring-gap
+    # text -- the graph builds; what fails is re-execution.
+    assert "UNMASKED" in blockers["fused"]
     assert all(reason for reason in blockers.values())
 
     # And `run` must actually branch on it. Audited from the source rather than

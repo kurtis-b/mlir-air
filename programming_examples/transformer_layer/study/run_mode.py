@@ -209,9 +209,12 @@ def _shape_for(
 #: artifact changes) -- and `runlist` builds it fine-grained (the validated
 #: `causal_mask` add as a fourth per-head entry between the score GEMM and the
 #: device softmax, pre-norm chains with a zero residual, banded bare adds for
-#: the raw residual stream). The remaining modes still refuse, per mode rather
-#: than per variant, because their gaps are different gaps and a shared
-#: message would rot as each one closes.
+#: the raw residual stream). `fused`'s decoder stitch BUILDS and is
+#: single-dispatch-correct, but re-execution unmasks its attention -- a
+#: measured device-side wall, not a wiring gap; its entry below carries the
+#: probe chain. The remaining entries are per mode rather than per variant,
+#: because the gaps are different gaps and a shared message would rot as
+#: each one closes.
 #:
 #: REFUSED RATHER THAN SILENTLY RUN, and that is the whole point of the dict.
 #: Overriding the width alone and labelling the row `decoder_gpt2` would produce
@@ -221,10 +224,17 @@ def _shape_for(
 UNBUILDABLE_VARIANTS = {
     "decoder_gpt2": {
         "fused": (
-            "the fused tail packs the residual into the post-norm packed-plane "
-            "pipeline (builders/norm_tail.py, plane_major): a pre-norm layer "
-            "needs a zero-residual norm BEFORE attention and a bare residual "
-            "add that packing cannot express"
+            "MEASURED WALL, not a wiring gap: the four-entry decoder stitch "
+            "builds, compiles, and its FIRST dispatch is 12/12 stages clean "
+            "(devq 382) -- but every later dispatch computes UNMASKED "
+            "attention (corr 0.9994 with the non-causal reference, devq 383) "
+            "while the byte-identical instruction stream re-executes causally "
+            "in coarse's two-entry submission. The state loss survives a full "
+            "hw-context unload/reload (devq 384, context_loads 1 per "
+            "dispatch), so it lives device-side outside the context. "
+            "pattern/fused/fused.py keeps the builders and dispatch behind "
+            "this refusal; root-causing the composition-level state is a "
+            "named open investigation"
         ),
         "coarse_c2": (
             "the C2 cell composes the encoder's post-norm cell structure "
