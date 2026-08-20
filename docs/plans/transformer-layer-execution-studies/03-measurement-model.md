@@ -367,6 +367,16 @@ rather than pretending the schemas are identical. The adapter's job is to make
 `compare_results_roots.py` able to read both, and to fail loudly on fields whose semantics
 differ rather than silently comparing incomparable numbers.
 
+> `[2026-08-20]` The adapter is `study/iron_adapter.py`, and its first run against a real iron
+> tree corrected this paragraph in one respect: the key the two sides were meant to meet on did
+> not exist. This port's `study_case_id` is the SPECS shape key (`512x768_encoder_bert` — the
+> resume key, pinned by tests and every results root); iron's is the family id (`baseline_768`).
+> The adapter translates through `cases.FAMILY_SPECS` and refuses what that table does not know.
+> What crosses after translation is identity and shape; `validate_port` checks shape agreement
+> per shared point and reads no latency on either side. `compare_roots.py` itself stays a
+> same-toolchain drift tool and does not read iron trees — the cross-toolchain comparison has a
+> different verdict (shape agreement, not drift) and a different command.
+
 iron's two schemas, for reference:
 
 - `TUNING_CSV_FIELDNAMES` — 24 columns, one row per candidate config per internal operator.

@@ -400,5 +400,24 @@
 // offload's within-mode spread re-measures at 1.41, inside its existing
 // 1.30-1.45 bound.
 //
+// `[2026-08-20]` 567 -> 584, no module added: the iron adapter grew its tree
+// level and the port validation doc 00's success criterion 3 names. Its FIRST
+// run against a real iron tree (the 162-row full suite of 2026-08-01) found
+// the declared join key matching 0 rows: this port stamps study_case_id with
+// the SPECS shape key where iron stamps its family id. The adapter now
+// translates iron's id through cases.FAMILY_SPECS (refusing an unknown family
+// or a row contradicting its own width) and validate_port checks SHAPE
+// agreement per shared key, reads no latency on either side (the refusals
+// stand), and names why a row has no counterpart. The +14 pin the
+// translation against BOTH of this side's key derivations, the refusals, the
+// tree reader, a shape-disagreement negative control, and the no-latency
+// clause against a 10^7x latency gap. The last +3 are the pre-commit Codex
+// review's findings: validate_port passed VACUOUSLY when zero shared points
+// were compared (information-only branches summed to OK), reported "agrees
+// on 7" over partially-unset rows, and let a malformed iron seq_len escape
+// as a traceback -- each pinned by a test the pre-fix code fails (the
+// vacuous path printed VERDICT: OK with 0 failures; the partial path said
+// "agrees on 7"; the malformed path raised).
+//
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 567/567 passed in 25 modules
+// CHECK: study host tests: 584/584 passed in 25 modules

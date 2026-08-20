@@ -100,7 +100,11 @@ that harness rather than standing alone:
 2. A measurement suite runs unattended to completion and emits a manifest with no missing files
    or rows.
 3. Results are comparable — through an explicit adapter — to the iron result trees, so the port
-   can be validated rather than merely run.
+   can be validated rather than merely run. `[2026-08-20]` **Met, narrowly and on purpose**:
+   `study/iron_adapter.py` joins this port's roots to iron's on identity and validates SHAPE
+   agreement per shared point (0 disagreements over four roots against iron's 162-row full
+   suite); it refuses to compare latency, power, dispatch counts or `run_status`, each for a
+   documented reason — see the README status board row and [03](03-measurement-model.md).
 4. The ten shipped LLM deployments still pass `make verify` after every shared-infrastructure
    change.
 5. No iron-shaped code lands: no `AIE*` operator classes, no `op.py`/`design.py` pairs, no

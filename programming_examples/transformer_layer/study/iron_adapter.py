@@ -16,6 +16,31 @@ CONTRACT
     fail loudly on fields whose semantics differ rather than silently comparing
     incomparable numbers."
 
+    `[2026-08-20]` The tree level, and the port validation doc 00's success
+    criterion 3 asks for ("comparable -- through an explicit adapter -- to the
+    iron result trees, so the port can be validated rather than merely run"):
+
+    - ``read_iron_results(root)`` reads an iron results root
+      (``end_to_end/results_all_power.csv``) into adapted rows, and
+      ``split_by_mode_csv(rows)`` files them under the per-mode CSV names this
+      study's roots use, so the two layouts meet on ``compare_roots.row_key``.
+    - ``validate_port(iron_root, our_root, csvs)`` is the validation itself:
+      for every row this port measured that iron also measured, the SHAPE
+      must agree field for field -- that is the claim "the same layer" rests
+      on, and it is the only cross-toolchain claim the refusals above leave
+      standing. It FAILS on a shape disagreement, reports coverage both ways,
+      and never compares a latency, because the refusals are not optional.
+
+    The first real-tree run found the join itself broken: this port stamps
+    ``study_case_id`` with the SPECS shape key (``512x768_encoder_bert`` --
+    the resume key, pinned by tests and every results root) where iron stamps
+    its family id (``baseline_768``), so the declared key matched 0 rows of a
+    162-row iron tree. The adapter now TRANSLATES the identity through
+    ``cases.FAMILY_SPECS`` (the authority for iron's family ids and their
+    shapes), refusing a family it does not know or a row whose own width
+    contradicts its family, and keeps iron's id in ``study_case_label``, the
+    field the schema declares human-readable and never parsed.
+
 WHAT DOES NOT CROSS, AND WHY -- read before adding anything to _SAFE
     **The latency fields.** iron builds ``timed_total_sec`` two different ways.
     Its plain path sums per-sample durations (``modes.py``: ``timed_total_sec =
@@ -53,8 +78,14 @@ FOOTGUNS
       Every entry in ``_SAFE`` below should be defensible as "this means the
       same thing on both sides". When unsure, leave it out: a missing column is
       visible, a wrongly-carried one is not.
-    - The adapter does not read CSV files. Give it dicts; file handling and
-      schema-version dispatch belong to the caller.
+    - ``adapt_iron_row`` does not read CSV files. Give it dicts; file handling
+      and schema-version dispatch belong to the caller. ``read_iron_results``
+      is the one file reader, and it reads ONE iron layout -- the end-to-end
+      results file -- not iron's tuning, block or component tables.
+    - **The identity translation is a claim too.** iron's ``baseline_768`` is
+      this port's ``{seq}x768_encoder_bert`` only because ``cases.FAMILY_SPECS``
+      says so and the iron row's own ``hidden_size``/``workload_variant`` agree.
+      A family outside that table is refused, not transliterated.
 """
 
 from __future__ import annotations
@@ -68,9 +99,30 @@ if _HERE not in sys.path:
 
 import schema  # noqa: E402
 
+#: Where an iron results root keeps the rows this adapter reads. iron's
+#: unattended runner writes one file for all modes and all cases; this study
+#: writes one CSV per mode.
+IRON_RESULTS_REL = "end_to_end/results_all_power.csv"
+
+#: The shape fields whose agreement is the whole of "the same layer". Names are
+#: identical on both sides and every one is in _SAFE.
+SHAPE_FIELDS: tuple[str, ...] = (
+    "workload_variant",
+    "hidden_size",
+    "intermediate_size",
+    "num_attention_heads",
+    "attention_head_size",
+    "batch_size",
+    "dtype",
+)
+
 
 class IncomparableField(ValueError):
     """Raised when a caller asks for a field whose meaning does not cross."""
+
+
+class UnknownIronCase(ValueError):
+    """Raised for an iron ``study_case_id`` this port has no family for."""
 
 
 #: iron column -> this schema's column, for fields that mean the same thing on
@@ -200,6 +252,13 @@ def adapt_iron_row(
     # `coarse` here, which turned a valid CSV value into one the schema rejects
     # -- the code name and the CSV value are different on purpose.
 
+    # Identity: iron's family id becomes this port's shape key, through the
+    # one table that knows both, and only when the row's own width agrees.
+    iron_case = row.get("study_case_id")
+    if iron_case is not None and str(iron_case) != "":
+        out["study_case_id"] = case_key_for(row)
+        out["study_case_label"] = f"iron:{iron_case}"
+
     # iron rows carry no attention_path; leaving it None is honest, and
     # validate_row permits it. Inferring one from execution_mode would be a
     # guess about where attention ran, which is the confound that column exists
@@ -215,3 +274,284 @@ def adapt_iron_row(
 
     schema.validate_row(out, "results")
     return out
+
+
+def case_key_for(row: dict[str, object]) -> str:
+    """This port's ``study_case_id`` for an iron row, or raise.
+
+    The key is ``{seq_len}x{hidden_size}_{workload_variant}`` -- what
+    ``run_mode._shape_for`` derives for a measured row and
+    ``run_ladder._case_identity`` for a synthesized one. The family comes from
+    ``cases.FAMILY_SPECS`` keyed by iron's id; the row's own ``hidden_size`` and
+    ``workload_variant``, when present, must agree with it or the row is
+    refused -- a tree whose case ids and widths disagree is corrupt, and
+    translating it would launder that into a clean-looking join.
+    """
+    import cases
+
+    iron_case = str(row.get("study_case_id"))
+    fam = cases.FAMILY_SPECS.get(iron_case)
+    if fam is None:
+        raise UnknownIronCase(
+            f"iron study_case_id {iron_case!r} is not a family in "
+            f"cases.FAMILY_SPECS ({sorted(cases.FAMILY_SPECS)}); it cannot be "
+            "translated into this port's case key without guessing"
+        )
+    seq = row.get("seq_len")
+    if seq is None or str(seq) == "":
+        raise UnknownIronCase(
+            f"iron row for {iron_case!r} carries no seq_len; the case key "
+            "needs one"
+        )
+    for field, expected in (
+        ("hidden_size", fam.hidden_size),
+        ("workload_variant", fam.workload_variant),
+    ):
+        got = row.get(field)
+        if got is not None and str(got) != "" and str(got) != str(expected):
+            raise UnknownIronCase(
+                f"iron row says study_case_id={iron_case!r} but "
+                f"{field}={got!r} where the family has {expected!r}; refusing "
+                "to translate a row that disagrees with its own case"
+            )
+    return f"{int(seq)}x{fam.hidden_size}_{fam.workload_variant}"
+
+
+def is_iron_root(root) -> bool:
+    """Does ``root`` hold the one iron layout this adapter reads?"""
+    from pathlib import Path
+
+    return (Path(root) / IRON_RESULTS_REL).is_file()
+
+
+def read_iron_results(root) -> list[dict[str, object]]:
+    """Every row of ``root``'s end-to-end results file, adapted.
+
+    Raises ``FileNotFoundError`` for a root without the file -- a missing tree
+    must not read as an empty one -- and lets ``UnknownIronCase`` propagate,
+    because one untranslatable row means the tree is not the grid this port
+    declares and the caller should know before comparing anything.
+    """
+    import csv
+    from pathlib import Path
+
+    path = Path(root) / IRON_RESULTS_REL
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"{root} is not an iron results root: no {IRON_RESULTS_REL}"
+        )
+    with path.open(newline="", encoding="utf-8") as handle:
+        return [adapt_iron_row(r) for r in csv.DictReader(handle)]
+
+
+#: iron CSV mode value -> the per-mode file this study's roots write. `hybrid`
+#: maps to the canonical `coarse` cell, not to `coarse_c2`/`coarse_c3`: iron
+#: has ONE hybrid design and doc 30 chose C1 as this port's `coarse` by
+#: measurement, so C1 is the cell that answers to iron's row.
+MODE_CSV_NAMES: dict[str, str] = {
+    "hybrid": "coarse.csv",
+    "runlist": "runlist.csv",
+    "offload": "offload.csv",
+}
+
+
+def split_by_mode_csv(rows: list[dict[str, object]]) -> dict[str, list[dict]]:
+    """File adapted rows under this study's per-mode CSV names."""
+    out: dict[str, list[dict]] = {}
+    for row in rows:
+        mode = str(row.get("execution_mode"))
+        name = MODE_CSV_NAMES.get(mode)
+        if name is None:
+            raise IncomparableField(
+                f"iron execution_mode {mode!r} has no per-mode CSV in this "
+                f"study ({sorted(MODE_CSV_NAMES)})"
+            )
+        out.setdefault(name, []).append(row)
+    return out
+
+
+def validate_port(iron_root, our_root, csvs: list[str]):
+    """Does this port measure the layers iron measured? A ``compare_roots.Report``.
+
+    For each of this port's rows (in ``csvs`` under ``our_root``) with a
+    counterpart in the iron tree on ``compare_roots.row_key``, every field in
+    ``SHAPE_FIELDS`` must agree -- FAIL otherwise. A row with no counterpart is
+    reported with the reason: ``fused_elf`` has no iron mode at all; a (family,
+    seq_len) outside iron's grid is outside it. Coverage of iron's grid by this
+    port is printed as counts. iron's ``run_status`` rides along as information,
+    never as a verdict (it is a weaker claim -- see _INCOMPARABLE). No latency
+    or power field is read on either side, which is the contract, not a gap.
+
+    An empty ``csvs`` FAILS, as in ``compare_roots``: a comparison over nothing
+    must not print OK.
+    """
+    from pathlib import Path
+
+    import compare_roots
+    import results_io
+
+    report = compare_roots.Report()
+    report.say(f"iron root : {iron_root}")
+    report.say(f"port root : {our_root}")
+    if not csvs:
+        report.fail(
+            "no CSVs were named, so this validation proved nothing. Name the "
+            "files the port run produced."
+        )
+        report.say("")
+        report.say(f"warnings: {report.warnings}   failures: {report.failures}")
+        report.say("VERDICT: PROBLEM")
+        return report
+
+    try:
+        iron_rows = read_iron_results(iron_root)
+    except (FileNotFoundError, ValueError) as e:
+        # UnknownIronCase and IncomparableField are ValueErrors; so are a
+        # malformed seq_len and a schema validation failure. All four mean
+        # the tree cannot be read, and a tree that cannot be read is a
+        # PROBLEM report, not a traceback.
+        report.fail(f"iron tree unreadable -- {e}")
+        report.say("")
+        report.say(f"warnings: {report.warnings}   failures: {report.failures}")
+        report.say("VERDICT: PROBLEM")
+        return report
+    iron_by_key = {compare_roots.row_key(r): r for r in iron_rows}
+    iron_modes = {str(r.get("execution_mode")) for r in iron_rows}
+    iron_cases = {str(r.get("study_case_label")) for r in iron_rows}
+    iron_seqs = {str(r.get("seq_len")) for r in iron_rows}
+    report.say(
+        f"iron rows: {len(iron_rows)} over {len(iron_cases)} families, "
+        f"{len(iron_seqs)} lengths, modes {sorted(iron_modes)}"
+    )
+
+    covered: set[tuple[str, ...]] = set()
+    for rel in csvs:
+        report.say(f"\n=== {rel} ===")
+        path = Path(our_root) / rel
+        if not path.exists():
+            report.fail("missing in the port root; it was named, so its absence fails")
+            continue
+        try:
+            # The strict-prefix reader: the shape block is in the v1 prefix,
+            # and schema v2 silently took ladder_report out on 15 v1 trees
+            # before plots.py adopted this reader (README, figure tier row).
+            ours = results_io.read_rows_compatible(path)
+        except Exception as e:
+            report.fail(f"unreadable through the schema's prefix reader -- {e}")
+            continue
+        if not ours:
+            report.fail(
+                "holds no rows; it was named as a measurement file, so an "
+                "empty one is a failure rather than something to skip"
+            )
+            continue
+        for row in ours:
+            key = compare_roots.row_key(row)
+            mode = str(row.get("execution_mode"))
+            status = row.get("run_status")
+            other = iron_by_key.get(key)
+            if other is None:
+                if mode not in iron_modes:
+                    report.say(
+                        f"  info  {key}: no iron counterpart -- iron has no "
+                        f"{mode!r} mode"
+                    )
+                elif str(row.get("seq_len")) not in iron_seqs:
+                    report.say(
+                        f"  info  {key}: no iron counterpart -- seq_len outside "
+                        "iron's ladder"
+                    )
+                else:
+                    report.warn(
+                        f"{key}: iron measured this mode and length but has no "
+                        "row under this case; check the family translation"
+                    )
+                continue
+            covered.add(key)
+            disagreements = []
+            unset = []
+            for field in SHAPE_FIELDS:
+                mine, theirs = row.get(field), other.get(field)
+                if mine is None or theirs is None:
+                    unset.append(
+                        f"{field} ({'port' if mine is None else 'iron'} unset)"
+                    )
+                    continue
+                if str(mine) != str(theirs):
+                    disagreements.append(f"{field}: port={mine!r} iron={theirs!r}")
+            compared = len(SHAPE_FIELDS) - len(unset)
+            note = str(other.get("failure_message") or "")
+            iron_status = next(
+                (s.strip() for s in note.split(";") if "iron_run_status" in s),
+                "iron_run_status unknown",
+            )
+            if disagreements:
+                report.fail(f"{key} shape disagrees -- " + "; ".join(disagreements))
+                continue
+            if compared == 0:
+                report.fail(
+                    f"{key}: no shape field is set on both sides, so nothing "
+                    "was compared"
+                )
+                continue
+            report.say(
+                f"  ok    {key}: shape agrees on {compared}/{len(SHAPE_FIELDS)} "
+                f"fields; port run_status={status!r}; {iron_status}"
+            )
+            if unset:
+                # A partial agreement is reported as partial: "agrees on 7"
+                # over a row with three fields unset is the false OK the
+                # review flagged.
+                report.warn(f"{key}: {len(unset)} shape field(s) not compared -- "
+                            + ", ".join(unset))
+
+    report.say("")
+    report.say(
+        f"iron grid covered by this port root: {len(covered)}/{len(iron_by_key)} "
+        "(coverage is information; the verdict is shape agreement)"
+    )
+    if not covered:
+        # Zero shared points means zero comparisons, and a validation that
+        # compared nothing must not print OK -- the same rule as the empty
+        # --csv case. Wholly mis-keyed roots, a header-only iron file and a
+        # port root outside iron's grid all land here, each already named
+        # above; this line is what turns them from information into a verdict.
+        report.fail(
+            "no shared (case, mode, seq_len) point was compared, so this "
+            "validation proved nothing about the port"
+        )
+    report.say(f"warnings: {report.warnings}   failures: {report.failures}")
+    report.say(f"VERDICT: {'OK' if report.failures == 0 else 'PROBLEM'}")
+    return report
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    from pathlib import Path
+
+    ap = argparse.ArgumentParser(
+        description="Validate a port results root against an iron results tree."
+    )
+    ap.add_argument("--iron-root", required=True, type=Path)
+    ap.add_argument("--root", required=True, type=Path, help="this port's root")
+    ap.add_argument(
+        "--csv",
+        action="append",
+        default=[],
+        dest="csvs",
+        metavar="REL/PATH.csv",
+        help="a results CSV under --root. Repeatable. Required: with none, "
+        "the validation checks nothing.",
+    )
+    args = ap.parse_args(argv)
+    report = validate_port(
+        args.iron_root.expanduser().resolve(),
+        args.root.expanduser().resolve(),
+        args.csvs,
+    )
+    print(report.render())
+    return 0 if report.failures == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
