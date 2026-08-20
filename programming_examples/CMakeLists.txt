@@ -252,7 +252,7 @@ add_lit_testsuite(check-programming-examples-transformer-layer-host
   "Running transformer-layer PR-safe tests (12, no NPU dispatch)"
   ${CMAKE_CURRENT_BINARY_DIR}
   DEPENDS ${TEST_DEPENDS}
-  ARGS ${AIR_TEST_LIT_ARGS} --filter "transformer_layer/\\(run_npu2_compile_peano\\|run_block_cache_tests\\|run_blocked_attention_tests\\|run_ffn_resident_emulation_tests\\|run_layer_norm_rows_tests\\|run_softmax_rows_tests\\|run_mapping_space_tests\\|run_reference_tests\\|run_seam_tests\\|run_study_host_tests\\|sweep/run_npu2_registry_resolution\\|sweep/run_sweep_families_tests\\|sweep/run_sweep_writer_tests\\)[.]lit$$"
+  ARGS ${AIR_TEST_LIT_ARGS} --filter "transformer_layer/\\(run_npu2_compile_peano\\|run_block_cache_tests\\|run_blocked_attention_tests\\|run_ffn_resident_emulation_tests\\|run_layer_norm_rows_tests\\|run_softmax_rows_tests\\|run_profile_bounds_tests\\|run_mapping_space_tests\\|run_reference_tests\\|run_seam_tests\\|run_study_host_tests\\|sweep/run_npu2_registry_resolution\\|sweep/run_sweep_families_tests\\|sweep/run_sweep_writer_tests\\)[.]lit$$"
 )
 set_target_properties(check-programming-examples-transformer-layer-host PROPERTIES FOLDER "Tests")
 

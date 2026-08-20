@@ -1,0 +1,22 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// The profile's derived bounds agree with the builders at every ladder point.
+// Host-only: constructs IR, never compiles, never touches a device.
+//
+// `[2026-08-20]` The first `full` profile (devq 427) found three bounds the
+// case matrix's 64..16384 ladder crosses: the FlashAttention parallel_seq
+// floor (coarse and fused below 256), the attention GEMMs' fixed-tile
+// multiple (offload and runlist below 512), and the softmax's L1 row width
+// (runlist at 16384). study/profiles.skip_reason now carries each as a
+// derived structural skip -- the same standing as fused's packing bound, the
+// builder raising before aircc is reached -- with every constant re-derived
+// from the refusing builder's SOURCE by ast in run_study_host_tests. This
+// suite is the other altitude: WITH air, for all four modes at all nine
+// lengths, skip_reason says "skip" exactly when the mode's config or module
+// construction refuses, and "run" exactly when every module builds. Both
+// directions are non-vacuous per bounded mode, and the refusal messages are
+// the mechanisms the bounds cite.
+//
+// RUN: python3 %S/builders/test_profile_bounds.py | FileCheck %s
+// CHECK: profile bound tests: 3/3 passed

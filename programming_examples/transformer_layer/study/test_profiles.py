@@ -440,15 +440,130 @@ def test_fused_bound_is_applied_in_both_directions():
     assert profiles.skip_reason("fused", high) is None
     assert profiles.skip_reason("fused", low // 2)
     assert profiles.skip_reason("fused", high * 2)
-    # and no other mode is bounded, at any declared ladder point
+    # and no other bound fires inside 512..4096, where every mode has gated
+    # on hardware -- only artifact-backed bounds belong in skip_reason, and a
+    # rung that MIGHT fail must run. `[2026-08-20]` The ladder's ends carry
+    # three such bounds now (the first full profile measured every one of them
+    # refusing, devq 427/431); they have their own tests below.
     for mode in profiles.PROFILE_MODES:
         if mode == "fused":
             continue
-        for seq in cases.SEQUENCE_LADDER:
+        for seq in (512, 1024, 2048, 4096):
             assert profiles.skip_reason(mode, seq) is None, (
                 f"{mode} at {seq} was declared inapplicable; only artifact-backed "
                 "bounds belong in skip_reason -- a rung that MIGHT fail must run"
             )
+
+
+def _module_constant(rel, name):
+    """A module-scope ``NAME = <literal>`` from a source file, by ast, so the
+    constant is read from the builder WITHOUT importing it (the builders
+    import air; this suite must not)."""
+    source = open(os.path.join(_EXAMPLE, rel), encoding="utf-8").read()
+
+    def fold(node):
+        # Literals, plus the one non-literal form a budget constant takes:
+        # `64 * 1024`. Anything else is a test failure, not a guess.
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+            return fold(node.left) * fold(node.right)
+        return ast.literal_eval(node)
+
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(tgt, ast.Name) and tgt.id == name for tgt in node.targets
+        ):
+            return fold(node.value)
+    raise AssertionError(f"{rel} no longer assigns {name} at module scope")
+
+
+def _default_argument(rel, func, arg):
+    source = open(os.path.join(_EXAMPLE, rel), encoding="utf-8").read()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.FunctionDef) and node.name == func:
+            args = node.args
+            positional = args.posonlyargs + args.args
+            defaults = [None] * (len(positional) - len(args.defaults)) + list(args.defaults)
+            for a, d in zip(positional, defaults):
+                if a.arg == arg:
+                    assert d is not None, f"{func}.{arg} has no default"
+                    return ast.literal_eval(d)
+    raise AssertionError(f"{rel} has no {func}({arg}=...)")
+
+
+def test_the_three_full_profile_bounds_are_read_from_their_builders():
+    """`[2026-08-20]` Each constant the new bounds carry is re-derived from the
+    builder that refuses, by ast. A builder change that moves the bound fails
+    here instead of leaving a skip that no longer describes the builder --
+    the stale-skip direction is the dangerous one, since a skipped rung is
+    not a failure and the walk would report complete."""
+    # 1. FlashAttention's parallel_seq default.
+    assert profiles.FA_PARALLEL_SEQ == _default_argument(
+        os.path.join("builders", "mha_attention.py"), "attention_config", "parallel_seq"
+    )
+    assert profiles.FUSED_SEQ_MIN == profiles.FA_PARALLEL_SEQ
+    # 2. The attention GEMMs' fixed tiles: the lcm of every multiple the GEMM
+    #    builder asserts on a seq-sized dimension.
+    import math
+
+    tiles = _module_constant(os.path.join("pattern", "offload", "offload.py"), "ATTENTION_GEMM_TILES")
+    scores, output = tiles["attn_scores"], tiles["attn_output"]
+    multiples = (
+        scores["tile"]["tile_m"] * scores["herd"][0],  # m = seq
+        scores["tile"]["tile_n"] * scores["herd"][1],  # n = seq
+        output["tile"]["tile_m"] * output["herd"][0],  # m = seq
+        output["tile"]["tile_k_l2"],  # k = seq
+    )
+    assert profiles.ATTN_GEMM_SEQ_MULTIPLE == math.lcm(*multiples), multiples
+    # 3. The softmax's L1 arithmetic.
+    assert profiles.SOFTMAX_L1_BYTES == _module_constant(os.path.join("builders", "softmax.py"), "L1_BYTES")
+    assert profiles.SOFTMAX_SCALE_BANDS == _module_constant(os.path.join("builders", "softmax.py"), "SM_SCALE_BANDS")
+    # softmax_l1_bytes(1, cols) in the builder is (3*cols + bands) * itemsize;
+    # the formula is duplicated here because the builder imports air.
+    source = open(os.path.join(_EXAMPLE, "builders", "softmax.py"), encoding="utf-8").read()
+    assert "(3 * rows_per_call * cols + SM_SCALE_BANDS * rows_per_call) * itemsize" in source
+
+
+def test_the_three_bounds_are_applied_in_both_directions_per_mode():
+    """Inside each bound no skip; at its first violation a skip naming the
+    mechanism; and the derived plan reproduces the first full profile's
+    measured counts (devq 427/431: 7/6/5/3 measured of 9)."""
+    # FlashAttention floor: coarse, its cells and fused at 64/128; not 256.
+    for mode in profiles.FA_MODES:
+        for seq in (64, 128):
+            reason = profiles.skip_reason(mode, seq)
+            # fused's own packing clause states the same floor first
+            # (FUSED_SEQ_MIN == FA_PARALLEL_SEQ, pinned above).
+            expect = "bounded to" if mode == "fused" else "parallel_seq"
+            assert reason and expect in reason, (mode, seq, reason)
+    assert profiles.skip_reason("coarse", 256) is None
+    # Attention-GEMM multiple: offload and runlist below 512; not at 512.
+    for mode in profiles.ATTN_GEMM_MODES:
+        for seq in (64, 128, 256):
+            reason = profiles.skip_reason(mode, seq)
+            assert reason and "ATTENTION_GEMM_TILES" in reason, (mode, seq, reason)
+        assert profiles.skip_reason(mode, 512) is None
+    # Softmax L1: runlist at 16384 only; 8192 fits with one row.
+    assert profiles.softmax_fits_l1(8192) and not profiles.softmax_fits_l1(16384)
+    reason = profiles.skip_reason("runlist", 16384)
+    assert reason and "device softmax" in reason and "98312" in reason
+    assert profiles.skip_reason("runlist", 8192) is None
+    assert profiles.skip_reason("offload", 16384) is None
+    assert profiles.skip_reason("coarse", 16384) is None
+    # Precedence: a variant refusal still wins over every bound (synthetic).
+    import run_mode
+
+    saved = run_mode.UNBUILDABLE_VARIANTS
+    try:
+        run_mode.UNBUILDABLE_VARIANTS = {"decoder_gpt2": {"coarse": "SYNTHETIC"}}
+        assert "SYNTHETIC" in profiles.skip_reason("coarse", 64, "gpt2_small_768")
+    finally:
+        run_mode.UNBUILDABLE_VARIANTS = saved
+    # The plan IS the measurement: what devq 427/431 measured, rung for rung.
+    counts = profiles.profile("full").expected_rows()
+    assert counts["coarse.csv"] == {"rows": 9, "measured": 7, "skipped": 2}
+    assert counts["offload.csv"] == {"rows": 9, "measured": 6, "skipped": 3}
+    assert counts["runlist.csv"] == {"rows": 9, "measured": 5, "skipped": 4}
+    assert counts["fused.csv"] == {"rows": 9, "measured": 3, "skipped": 6}
 
 
 def test_the_fused_bound_moves_with_the_width_rather_than_being_tabulated():

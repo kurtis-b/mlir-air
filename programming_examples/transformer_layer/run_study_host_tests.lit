@@ -429,5 +429,17 @@
 // to the base table, overrides confined to names the base table has, the 1024
 // entry exactly two boundaries, and every mode reading the authority.
 //
+// `[2026-08-20]` 585 -> 587, no module added: the three bounds the first
+// `full` profile found (devq 427) join skip_reason as derived structural
+// skips -- the FlashAttention parallel_seq floor, the attention GEMMs'
+// fixed-tile multiple, the softmax's L1 row width -- each constant read from
+// the refusing builder's source by ast (a BinOp-folding reader for
+// `64 * 1024`), applied in both directions per mode, and the derived `full`
+// plan reproducing devq 427/431's measured counts rung for rung (7/6/5/3).
+// The old "no other mode is bounded at any ladder point" clause narrows to
+// 512..4096, where every mode has gated on hardware; the ends now carry
+// bounds that were measured refusing. run_profile_bounds_tests.lit (3/3,
+// with air) checks the same predicates against the builders themselves.
+//
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 585/585 passed in 25 modules
+// CHECK: study host tests: 587/587 passed in 25 modules

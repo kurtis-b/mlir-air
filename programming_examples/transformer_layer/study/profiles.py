@@ -229,6 +229,59 @@ FUSED_PLANE_STRIDE_CAP = 2**20
 #: packing one and therefore does NOT move with width.
 FUSED_SEQ_MIN = 256
 
+# --- `[2026-08-20]` the three bounds the first `full` profile found --------
+#
+# devq 427 walked baseline_768 over 64..16384 and ten rungs failed before or
+# inside aircc, every one of them deterministic and every one a bound that
+# can be READ from the builder that refuses (test_profiles re-derives each
+# constant below from that source by ast, so a builder change fails a test
+# rather than leaving a stale skip). They are structural in exactly the sense
+# the fused packing bound is: the builder raises before aircc is reached.
+#
+# A bound here is a claim that the mode CANNOT build the rung today, not that
+# it should not. Lifting one is a builder change (a smaller FlashAttention
+# `parallel_seq`, smaller attention tiles, a column-chunked softmax), and the
+# ast pins are what turn that change into a measured rung instead of a skip.
+
+#: FlashAttention's ``parallel_seq`` (``builders/mha_attention.attention_config``
+#: default, iron's ``lqp``): the Q rows one launch iteration owns. ``seq_len``
+#: must divide by it -- the builder raises ``seq_len (64) must be divisible by
+#: parallel_seq (256)`` -- and every mode whose attention is the device
+#: FlashAttention (`coarse`, its cells, `fused`) inherits the floor. This is
+#: also ``FUSED_SEQ_MIN``'s origin.
+FA_PARALLEL_SEQ = 256
+
+#: The two attention GEMMs `offload` and `runlist` dispatch per head use fixed,
+#: measured tiles (``pattern/offload/offload.ATTENTION_GEMM_TILES``; `runlist`
+#: injects the same spec). For ``attn_scores`` ([seq, 64] @ [64, seq]) both
+#: ``m`` and ``n`` are the sequence length, so seq must divide by
+#: ``tile_m * herd_m`` (32 x 8 = 256) AND ``tile_n * herd_n`` (128 x 4 = 512);
+#: for ``attn_output`` ([seq, seq] @ [seq, 64]) ``k`` is the sequence length
+#: and must divide by ``tile_k_l2`` (256). The GEMM builder asserts each before
+#: any IR is built. The binding multiple is the lcm, 512.
+ATTN_GEMM_SEQ_MULTIPLE = 512
+
+#: The device softmax's L1 footprint per core: three ``[rows_per_call, cols]``
+#: bf16 tiles plus a ``SM_SCALE_BANDS * rows_per_call`` scale band, against one
+#: 64 KiB tile (``builders/softmax.softmax_l1_bytes`` / ``L1_BYTES``). For a
+#: score matrix cols IS the sequence length, so even ``rows_per_call = 1``
+#: stops fitting above ``(L1_BYTES // 2 - SM_SCALE_BANDS) // 3`` columns --
+#: 10,922 -- which is why `runlist` builds at 8192 and refuses 16384.
+SOFTMAX_L1_BYTES = 64 * 1024
+SOFTMAX_SCALE_BANDS = 4
+SOFTMAX_ITEMSIZE = 2
+
+
+def softmax_fits_l1(seq: int) -> bool:
+    """Can ONE row of a ``[seq, seq]`` bf16 score matrix be softmaxed in L1?"""
+    return (3 * seq + SOFTMAX_SCALE_BANDS) * SOFTMAX_ITEMSIZE <= SOFTMAX_L1_BYTES
+
+
+#: Which modes carry which bound. `coarse`'s cells share its block front.
+FA_MODES = ("coarse", "coarse_c2", "coarse_c3", "fused")
+ATTN_GEMM_MODES = ("offload", "runlist")
+DEVICE_SOFTMAX_MODES = ("runlist",)
+
 
 def fused_seq_range(family: str = REACHABLE_FAMILY) -> tuple[int, int]:
     """``fused``'s supported (min, max) sequence at a family's width. Inclusive.
@@ -287,6 +340,32 @@ def skip_reason(mode: str, seq: int, family: str = REACHABLE_FAMILY) -> str | No
                 f"{FUSED_PLANE_STRIDE_CAP // emb} rows at this width, and the "
                 f"builder raises before aircc is reached. seq {seq} is outside it"
             )
+
+    # `[2026-08-20]` The three bounds the first full profile found (devq 427),
+    # each a builder refusal before aircc, each read from the builder's source.
+    if mode in FA_MODES and seq % FA_PARALLEL_SEQ:
+        return (
+            f"{mode}'s attention is the device FlashAttention, whose "
+            f"attention_config requires seq_len to divide by parallel_seq "
+            f"({FA_PARALLEL_SEQ}) and raises before aircc is reached; seq {seq} "
+            "does not"
+        )
+    if mode in ATTN_GEMM_MODES and seq % ATTN_GEMM_SEQ_MULTIPLE:
+        return (
+            f"{mode}'s per-head attention GEMMs use fixed measured tiles "
+            f"(ATTENTION_GEMM_TILES) whose m/n/k multiples require seq_len to "
+            f"divide by {ATTN_GEMM_SEQ_MULTIPLE}; the GEMM builder asserts "
+            f"before any IR is built. seq {seq} does not"
+        )
+    if mode in DEVICE_SOFTMAX_MODES and not softmax_fits_l1(seq):
+        need = (3 * seq + SOFTMAX_SCALE_BANDS) * SOFTMAX_ITEMSIZE
+        return (
+            f"{mode}'s device softmax holds three [rows_per_call, seq] bf16 "
+            f"tiles in L1 and one row of a {seq}-wide score matrix already "
+            f"needs {need} B against {SOFTMAX_L1_BYTES}; runlist_config refuses "
+            "by name before aircc is reached (a column-chunked softmax is the "
+            "builder change that would lift this)"
+        )
     return None
 
 
