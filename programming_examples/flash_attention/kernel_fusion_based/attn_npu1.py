@@ -525,6 +525,12 @@ def build_module(
                 if causal:
                     # Counter layout: [0]=q_block, [1]=boot_flag, [2]=head_local,
                     # [3]=dv_iter (counts dv_chunk iterations, for dv_chunks>1 guard)
+                    #
+                    # BOOT CONTRACT: see attn_npu2.py at this site -- the alloc
+                    # lowers to an AIE buffer with NO initial value; the boot
+                    # flag test relies on partition init zeroing L1, and the
+                    # counter-increment wrap below restores the boot state at
+                    # the end of every complete execution.
                     ctr_size = 4 if dv_chunks > 1 else 3
                     ctr_t = MemRefType.get([ctr_size], i32, memory_space=l1_space)
                     causal_ctr = AllocOp(ctr_t, [], [])
@@ -1038,7 +1044,21 @@ def build_module(
                                 q_cur = load(counter_buf, [c0_ctr])
                                 c_nq_i32 = ConstantOp(i32, NQ)
                                 q_next = arith.AddIOp(q_cur, c_nq_i32)
-                                store(q_next.result, counter_buf, [c0_ctr])
+                                # Same defect class as attn_npu2*.py (fixed
+                                # there 2026-08-19, measured on NPU2): the
+                                # counter lives in UNINITIALIZED L1 that
+                                # persists across host dispatches and the boot
+                                # flag only fires on zeroed memory, so the
+                                # q_block base must return to its boot value
+                                # by the END of every complete execution or a
+                                # re-executed design runs unmasked. Within one
+                                # execution q_next never exceeds the total, so
+                                # the wrap changes no in-flight value. Applied
+                                # for parity; NOT hardware-verified on NPU1
+                                # (no NPU1 device on the study machine).
+                                c_total_q = ConstantOp(i32, num_lq_iters * NQ)
+                                q_wrapped = arith.RemSIOp(q_next.result, c_total_q)
+                                store(q_wrapped.result, counter_buf, [c0_ctr])
                                 store(ConstantOp(i32, 0), counter_buf, [c2_ctr])
                                 scf.YieldOp([])
                             not_wrapped = arith.CmpIOp(

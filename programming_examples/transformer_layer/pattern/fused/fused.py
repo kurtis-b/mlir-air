@@ -1008,21 +1008,24 @@ def prepare_fused(shape, seed=42):
         }
 
     def decoder_dispatch(device_inputs, stage_stats):
-        # `[2026-08-19]` MEASURED WALL -- this dispatch is correct ONCE and
-        # is refused by run_mode until the wall is root-caused. The in-kernel
-        # causal mask applies only on the FIRST execution within this
-        # four-entry composition: executions 2+ correlate 0.9994 with the
-        # UNMASKED reference (devq 383) while ln_in/q/k/v stay clean, and the
-        # byte-identical instruction stream re-executes causally in coarse's
-        # two-entry submission across three dispatches (devq 359/361; the
-        # two compiled ELFs differ only in embedded name bytes, insts.bin
-        # identical). Evicting and reloading the mha hw_context per dispatch
-        # does NOT reset it (devq 384: context_loads 1 per dispatch, failure
-        # numbers byte-identical), so the state lives device-side OUTSIDE
-        # the context -- the H10 frozen-BD family. Root-causing what the
-        # four-entry runlist does to the causal row-helper state that the
-        # two-entry one does not is the named open investigation; the code
-        # stays so the investigation has a running reproducer.
+        # `[2026-08-19]` the re-execution wall this dispatch sat behind is
+        # ROOT-CAUSED AND FIXED. The wall: dispatch 1 was 12/12 stages clean
+        # (devq 382) while every later dispatch computed UNMASKED attention
+        # (corr 0.9994 with the non-causal reference, devq 383) with q/k/v
+        # clean, surviving a full hw-context unload/reload (devq 384). The
+        # cause was NOT composition-level runlist state (the H10 frozen-BD
+        # framing is retracted): the causal mha keeps its Q-block base in an
+        # UNINITIALIZED L1 counter behind a boot flag that only fires on
+        # zeroed memory, and the base only ever advanced -- so a completed
+        # execution left it past every kv block, and on re-execution
+        # `apply_causal_mask` never fired. Coarse re-executed causally only
+        # because its per-dispatch flow re-zeroes the partition; the context
+        # reload did not heal it because the counter is not CDO-initialized
+        # state. Fixed in attn_npu2*.py by wrapping the advance modulo the
+        # execution's total Q blocks (identity within one execution, boot
+        # state restored at its end); measured after the fix: three
+        # dispatches of this stitch 12/12 clean each, attn_context corr
+        # 0.9995 with the CAUSAL reference on every one, d2 == d3 bytes.
         reconfig_baseline = cache.reconfiguration_counts()
         x, w_qkv, w_o, ln1_weight, w_up, w_down, ln2_weight = device_inputs
 

@@ -66,8 +66,11 @@ def check_results_root(
     ``expected_rows`` is the profile's per-file count expectation
     (``Profile.expected_rows``). `[2026-08-19]` It exists here for ONE case
     per-(family, mode) reachability created: a file whose plan expects ZERO
-    measured rows (every rung structurally skipped -- `fused` at a decoder
-    family). The one-passed-row rule would demand a measurement the plan says
+    measured rows, every rung structurally skipped -- `fused` at a decoder
+    family while its re-execution wall stood; since that wall's fix any
+    profile walking `fused` entirely outside its 256..1024 packing bound
+    would still derive one. The one-passed-row rule would demand a
+    measurement the plan says
     cannot exist; such a file must instead hold ONLY skipped rows, and a
     passed or failed row in it is flagged -- a rung that ran against a plan
     that said it could not. Without ``expected_rows`` the gate behaves

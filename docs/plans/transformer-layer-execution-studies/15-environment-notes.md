@@ -136,10 +136,28 @@ exception.** If Phase E adds a cache per strategy, add each one to both places i
 | NPU | `/dev/accel/accel0`, AMD Ryzen AI 9 HX 370 (NPU2 / Strix), firmware 1.1.2.64 |
 | iGPU | Radeon 890M — `host_comparison` (Phase F) is possible on this machine |
 | XRT | 2.21.0, `amdxdna` 2.21.0_20260514 |
-| RAM | 31 GB — 3B/4B verify needs `verify_runner.py`'s subprocess split |
+| RAM | 31 GB — 3B/4B verify needs `verify_runner.py`'s subprocess split. **`[2026-08-20]` and still OOM-kills the session — see the oomd note below** |
 | Concurrent `hw_context` ceiling | **32**; 33 fails with `DRM_IOCTL_AMDXDNA_CREATE_HWCTX err=-2` |
 | Chassis | **laptop** — lid close suspends. Wrap long runs in `systemd-inhibit`. On battery, GNOME suspends after 15 min idle; on AC it does not. |
 | Logout | Background runs survive (`KillUserProcesses=no`) |
+
+## `[2026-08-20]` The big-model `verify` leg is killed by systemd-oomd, and it takes the session with it
+
+What looked like two overnight laptop reboots on 2026-08-19/20 were **systemd-oomd cgroup kills**
+at ~27 GB used of 30 (`uptime -s` still reads 2026-08-13): `llama32_3b`'s `make verify` crosses the
+memory-pressure threshold during its HF-compare phase, and because the devq runner and the terminal
+share one session scope, oomd kills the whole scope — the job reads `exit 137` with
+`runner pid gone` (devq 416, 419, 423, 424) and every foreground shell dies with it.
+
+Two mitigations were measured. Wrapping each model in its own `systemd-run --user --scope -p
+MemoryHigh=… -p MemoryMax=…` contains the kill to that scope, but at `MemoryMax=18G` the 0.5B model's
+`verify` itself gets `Terminated` (exit 143, devq 424) — the per-model ceiling has to sit between the
+small models' real peak and the session threshold, and the 3B/4B peaks are above any ceiling that
+leaves the session alive. So the operator **deferred `qwen25_3b`, `llama32_3b`, `qwen3_4b`** from the
+regression leg rather than keep losing sessions: **8/11 is the standing leg** (devq 416 + 425, eight
+models ≤ 1.7B, scope-wrapped at `MemoryHigh=16G MemoryMax=18G`, small-first). The three are
+**deferred, not failed** — the last time they ran, 11/11 passed on the 28(a) compiler (devq 402) —
+and they are owed one pass each, singly, in a window where nothing else holds memory.
 
 ## Locks
 

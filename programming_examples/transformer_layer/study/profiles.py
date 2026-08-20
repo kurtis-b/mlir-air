@@ -24,8 +24,8 @@ CONTRACT
 WHAT THIS PROFILE CAN AND CANNOT REACH, SAID OUT LOUD
     ``cases.py`` declares six families x a nine-point ladder. `[2026-08-19]`
     The runner reaches **all six**: the encoder widths, and the decoder
-    families since three of the four modes gained the decoder graph --
-    reachability is per (family, mode) now, with the one unwired pairing
+    families since all four modes gained the decoder graph --
+    reachability is per (family, mode) now, with any refused pairing
     (`fused` x decoder) surfacing as a structural skip rather than keeping the
     whole family out.
 
@@ -127,14 +127,15 @@ REACHABLE_FAMILY = "baseline_768"
 #: halves from the sources, so a family that stops resolving fails a test rather
 #: than making this line a lie.
 #: `[2026-08-19]` All six. The decoder families joined when their layer graph
-#: landed in three of the four modes -- `coarse` (builders/block.py::
+#: landed in all four modes -- `coarse` (builders/block.py::
 #: run_decoder_block, hardware-validated 12/12 stages at gpt2_small_768 x 512),
-#: `offload` (host-side mask/pre-norms, 12/12) and `runlist` (the causal_mask
-#: entry, 12/12) -- and reachability became per (family, mode): the one mode
-#: with no decoder graph, `fused`, surfaces through ``skip_reason`` as a
-#: structural skip whose reason is READ from run_mode.UNBUILDABLE_VARIANTS, so
-#: a decoder profile is 3 measured + 1 skipped per length rather than a
-#: partial walk presented as a matrix walk. Only gpt2_small_768 (at 512) has
+#: `offload` (host-side mask/pre-norms, 12/12), `runlist` (the causal_mask
+#: entry, 12/12) and, once its re-execution wall was fixed at the causal
+#: mha's Q-block counter, `fused` (the four-entry stitch, 12/12 across
+#: repeated dispatches) -- and reachability became per (family, mode): any
+#: refused pairing surfaces through ``skip_reason`` with a reason READ from
+#: run_mode.UNBUILDABLE_VARIANTS rather than a partial walk presented as a
+#: matrix walk. Only gpt2_small_768 has
 #: walked on hardware; the other decoder rungs are RUN, not pre-declared, per
 #: this module's own rule that pre-declaring a failure is how a matrix stops
 #: being a measurement.

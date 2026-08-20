@@ -31,9 +31,11 @@ only as good as its choice of source.
   returns the first ``operator`` match, so a second row at another width would
   be unreachable code.
 
-  ``test_a_decoder_variant_is_refused_by_name_not_omitted`` reads
-  ``run_mode.py`` for the refusal that keeps a decoder family from being
-  measured as an encoder under a causal name.
+  ``test_a_blocked_variant_mode_pair_surfaces_as_a_skip_not_a_run`` pins the
+  refusal PLUMBING with a synthetic ``UNBUILDABLE_VARIANTS`` entry -- the
+  real decoder refusals this suite once read were lifted `[2026-08-19]` when
+  the fused decoder's re-execution wall fell, and a propagation test that
+  read them would be vacuous today.
 
 The load-bearing bound check is ``test_fused_bound_is_applied_in_both
 _directions``: a skip rule with no case that skips and no case that does not is
@@ -374,13 +376,37 @@ def test_a_blocked_variant_mode_pair_surfaces_as_a_skip_not_a_run():
         assert unblocked, (
             f"{family} is listed reachable but every profile mode is refused"
         )
-    # Ordering: the variant clause must win over the fused packing bound --
-    # probed at 4096, where BOTH would apply. A fused decoder rung reported
-    # as "outside 256..1024" would read as a width limit on a wall that has
-    # nothing to do with width (re-execution unmasks at EVERY length).
+    # `[2026-08-19]` the fused decoder's variant refusal is lifted (the
+    # re-execution wall was fixed at the causal mha's Q-block counter), so
+    # the packing bound is what remains at 4096 -- a fused decoder rung
+    # outside 256..1024 must now skip for the width reason, and a rung
+    # inside the bound must not skip at all.
     reason = profiles.skip_reason("fused", 4096, "gpt2_small_768")
-    assert reason is not None and "UNMASKED" in reason
-    assert "plane-major packing" not in reason
+    assert reason is not None and "plane-major packing" in reason
+    assert profiles.skip_reason("fused", 512, "gpt2_small_768") is None
+    # With no profile mode left in the registry, the propagation loop above
+    # never exercises its assert arm, and skip_reason's variant clause -- and
+    # its PRECEDENCE over the packing bound -- would go unwatched (the exact
+    # vacuous-check shape this suite documents). A SYNTHETIC blocker keeps
+    # both under test without reinstating a refusal no measurement backs.
+    saved = run_mode.UNBUILDABLE_VARIANTS
+    try:
+        run_mode.UNBUILDABLE_VARIANTS = {
+            "decoder_gpt2": {"fused": "SYNTHETIC-BLOCKER for the vacuity test"}
+        }
+        reason = profiles.skip_reason("fused", 512, "gpt2_small_768")
+        assert reason is not None and "SYNTHETIC-BLOCKER" in reason, (
+            "skip_reason no longer reads run_mode.UNBUILDABLE_VARIANTS; a "
+            "refused (variant, mode) would start a child process that can "
+            "only fail"
+        )
+        # Precedence at 4096, where BOTH clauses apply: the variant clause
+        # must win, or a variant wall would be reported as a width limit.
+        reason = profiles.skip_reason("fused", 4096, "gpt2_small_768")
+        assert reason is not None and "SYNTHETIC-BLOCKER" in reason
+        assert "plane-major packing" not in reason
+    finally:
+        run_mode.UNBUILDABLE_VARIANTS = saved
 
 
 def test_unreachable_families_cover_every_declared_family():
@@ -453,24 +479,26 @@ def test_retargeting_a_profile_retargets_its_gate_with_no_number_edited():
     assert at512["rows"] == at768["rows"] == len(ladder.seqs)
 
 
-def test_retargeting_to_a_decoder_family_skips_fused_with_the_wall_reason():
-    """`[2026-08-19]` Three modes run the decoder; fused's stitch is
-    single-dispatch-correct but re-execution unmasks its attention (devq
-    382-384), so a decoder retarget derives fused fully SKIPPED -- with the
-    measured wall as the reason, not the retired wiring-gap text -- and
-    everything else measured, with no number edited anywhere."""
+def test_retargeting_to_a_decoder_family_measures_all_four_modes():
+    """`[2026-08-19]` All four modes run the decoder. fused's variant
+    refusal was lifted when its re-execution wall (devq 382-384) was fixed
+    at the causal mha's Q-block counter, so a decoder retarget derives
+    fused MEASURED inside its packing bound -- exactly like the encoder --
+    and its only skips are the width bound's, with no number edited
+    anywhere. (The pre-fix derivation was fused fully skipped with the
+    UNMASKED wall as the reason; that expectation retired with the wall.)"""
     smoke = profiles.profile("smoke").retarget("gpt2_small_768")
     counts = smoke.expected_rows()
-    assert counts["fused.csv"] == {"rows": 1, "measured": 0, "skipped": 1}
-    for rel in ("coarse.csv", "offload.csv", "runlist.csv"):
+    for rel in ("coarse.csv", "offload.csv", "runlist.csv", "fused.csv"):
         assert counts[rel] == {"rows": 1, "measured": 1, "skipped": 0}, rel
     ladder = profiles.profile("ladder").retarget("gpt2_small_768")
     lcounts = ladder.expected_rows()
-    assert lcounts["fused.csv"] == {"rows": 4, "measured": 0, "skipped": 4}
+    # The ladder walks lengths outside fused's 256..1024 packing bound; the
+    # decoder ladder must skip exactly where the encoder ladder skips.
+    encoder_fused = profiles.profile("ladder").expected_rows()["fused.csv"]
+    assert lcounts["fused.csv"] == encoder_fused
     for rel in ("coarse.csv", "offload.csv", "runlist.csv"):
         assert lcounts[rel] == {"rows": 4, "measured": 4, "skipped": 0}, rel
-    reason = smoke.rungs()[-1].skip_reason
-    assert reason is not None and "UNMASKED" in reason
 
 
 def test_skip_reason_names_the_source_of_the_bound():

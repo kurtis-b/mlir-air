@@ -547,6 +547,20 @@ def build_module(
                 if causal:
                     # Counter layout: [0]=q_block, [1]=boot_flag, [2]=head_local,
                     # [3]=dv_iter (counts dv_chunk iterations, for dv_chunks>1 guard)
+                    #
+                    # BOOT CONTRACT: this alloc lowers to an AIE buffer with NO
+                    # initial value, so the boot-flag test ([1] == 0) is only
+                    # meaningful because partition initialization zeroes tile
+                    # data memory before the first execution -- a property of
+                    # the runtime stack, measured (every cold dispatch of every
+                    # causal artifact boots correctly), not guaranteed by this
+                    # source. The counter-increment wrap below restores the
+                    # boot state at the END of every complete execution, so
+                    # after the first boot the design no longer depends on
+                    # anything re-zeroing this memory. Plumbing a real
+                    # initial_value through air-to-aie would close the
+                    # remaining cold-start assumption and is a compiler
+                    # feature, not a builder change.
                     ctr_size = 4 if dv_chunks > 1 else 3
                     ctr_t = MemRefType.get([ctr_size], i32, memory_space=l1_space)
                     causal_ctr = AllocOp(ctr_t, [], [])
@@ -1060,7 +1074,20 @@ def build_module(
                                 q_cur = load(counter_buf, [c0_ctr])
                                 c_nq_i32 = ConstantOp(i32, NQ)
                                 q_next = arith.AddIOp(q_cur, c_nq_i32)
-                                store(q_next.result, counter_buf, [c0_ctr])
+                                # The counter lives in UNINITIALIZED L1 that
+                                # persists across host dispatches, and the boot
+                                # flag only fires on zeroed memory -- so the
+                                # q_block base must return to its boot value by
+                                # the END of every complete execution, or the
+                                # second dispatch runs with q_base past every
+                                # kv block and apply_causal_mask never fires
+                                # (measured: unmasked attention from dispatch 2
+                                # on, with q/k/v all clean). Within one
+                                # execution q_next never exceeds the total, so
+                                # the wrap changes no in-flight value.
+                                c_total_q = ConstantOp(i32, num_lq_iters * NQ)
+                                q_wrapped = arith.RemSIOp(q_next.result, c_total_q)
+                                store(q_wrapped.result, counter_buf, [c0_ctr])
                                 store(ConstantOp(i32, 0), counter_buf, [c2_ctr])
                                 scf.YieldOp([])
                             not_wrapped = arith.CmpIOp(

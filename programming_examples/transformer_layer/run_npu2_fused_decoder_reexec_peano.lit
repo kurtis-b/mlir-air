@@ -1,0 +1,34 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// The fused DECODER's re-execution gate. `[2026-08-19]` This pins the class
+// of defect that survived every single-dispatch check in the suite: the
+// causal mha's Q-block base lived in uninitialized L1 behind a boot flag and
+// never wrapped, so the fused decoder's first dispatch was 12/12 boundaries
+// clean while every later one computed UNMASKED attention with q/k/v still
+// clean (devq 382-384). The fix wraps the counter modulo the execution's
+// total Q blocks (attn_npu2*.py); this gate dispatches ONE prepared stitch
+// TWICE and requires both dispatches clean plus a causal correlation on the
+// second -- reverting the wrap flips the second dispatch's verdict line, so
+// the gate is red exactly on the defect. The encoder fused gate
+// (run_npu2_fused_peano) cannot see any of this: its attention is
+// non-causal, so the counter code is never emitted there.
+//
+// NPU serialization lives one layer down (KernelCache takes /tmp/npu.lock,
+// the same inode lit.cfg.py's NPU substitution takes); taking the outer lock
+// here would deadlock, same note as the other device gates in this suite.
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_npu2_fused_decoder_reexec
+// RUN: cd test_npu2_fused_decoder_reexec
+// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile check-fused-decoder-reexec PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+//
+// Both dispatches clean, the second causally correlated, and the driver's
+// own verdict last -- three independent clauses, so a partial failure names
+// the dispatch it happened on.
+// CHECK: [reexec] dispatch 1: 12/12 boundaries clean
+// CHECK: [reexec] dispatch 2: 12/12 boundaries clean
+// CHECK: [reexec] dispatch 2 attn_context corr vs causal reference: {{(0\.99[0-9][0-9]|1\.0000)}}
+// CHECK: [reexec] PASS

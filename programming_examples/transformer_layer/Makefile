@@ -29,7 +29,7 @@ SWEEP_ARGS ?=
         check-block check-block-fault check-coarse check-coarse-fault \
         check-offload check-offload-fault check-offload-shared \
         check-runlist check-runlist-fault \
-        check-fused check-fused-fault \
+        check-fused check-fused-fault check-fused-decoder-reexec \
         check-transpose check-elementwise-mul check-norm-tail \
         check-norm-tail-fault check-norm-tail-structure \
         check-ffn-accum check-ffn-accum-fault check-ffn-accum-structure \
@@ -626,6 +626,15 @@ check-runlist-fault:
 # for the same reason as the other modes'.
 check-fused:
 	$(call opcheck,fused)
+
+# The fused DECODER's re-execution gate: two dispatches of one prepared
+# stitch, both required 12/12 clean. One dispatch cannot see the defect this
+# pins (the causal mha's Q-block counter surviving into dispatch 2 unwrapped
+# -- a silent unmasked-attention wrong answer); see study/fused_reexec_gate.py.
+check-fused-decoder-reexec:
+	mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
+	    python3 $(srcdir)/study/fused_reexec_gate.py
 
 # The mode's negative control. Same reasoning as check-coarse-fault, including
 # the mode-specific stake: the dispatch vectors must be recorded on the
