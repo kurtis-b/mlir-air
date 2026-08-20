@@ -542,6 +542,35 @@ def test_decoder_boundary_names_agree_across_their_three_sources():
     assert len(block) == 12
 
 
+def test_decoder_stage_atol_per_width_entries_are_measured_overrides_only():
+    """`[2026-08-20]` The decoder ceilings were measured at one width and the
+    1024-wide family crossed the last two on the device-norm modes (devq 430).
+    decoder_stage_atol(hidden) is the one authority the four modes read: a
+    width with no entry gets the base table BYTE-FOR-BYTE, an entry may only
+    override boundaries the base table names (never add one the comparison
+    would silently skip), and the 1024 entry is exactly the two measured
+    boundaries -- widening a third here would be a tolerance moved without a
+    measurement."""
+    import opcheck_layer
+
+    base = opcheck_layer.DECODER_STAGE_ATOL
+    for hidden in (512, 768, 2048):
+        assert opcheck_layer.decoder_stage_atol(hidden) == base, hidden
+    for hidden, over in opcheck_layer.DECODER_STAGE_ATOL_BY_HIDDEN.items():
+        assert set(over) <= set(base), (hidden, set(over) - set(base))
+        merged = opcheck_layer.decoder_stage_atol(hidden)
+        assert set(merged) == set(base)
+        for name in base:
+            assert merged[name] == over.get(name, base[name])
+    assert set(opcheck_layer.DECODER_STAGE_ATOL_BY_HIDDEN[1024]) == {"ffn_out", "output"}
+    assert opcheck_layer.decoder_stage_atol(1024)["ffn_out"] == 6e-1
+    # And every mode reads the authority rather than the base table directly.
+    for rel in ("pattern/runlist/runlist.py", "pattern/fused/fused.py", "pattern/offload/offload.py"):
+        src = open(os.path.join(_EXAMPLE, rel)).read()
+        assert "decoder_stage_atol(emb_dim)" in src, rel
+        assert "DECODER_STAGE_ATOL if causal" not in src, rel
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

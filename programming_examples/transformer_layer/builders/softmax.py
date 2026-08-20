@@ -105,6 +105,63 @@ SM_VEC_LEN = 64
 # O-rescale factor. All four are indexed as `scale_buffer[band * num_rows + r]`.
 SM_SCALE_BANDS = 4
 
+#: One AIE2P core's data memory. The three ``[rows_per_call, cols]`` tiles
+#: plus the scale band must fit it; the row WIDTH is the sequence length for a
+#: score matrix, so this is the bound `runlist` hits first as seq grows.
+L1_BYTES = 64 * 1024
+
+
+def softmax_l1_bytes(rows_per_call, cols, np_dtype=bfloat16):
+    """Bytes of L1 the design allocates per core: three row tiles + scale band.
+
+    Counted from the four ``AllocOp``s in ``build_softmax_module`` (``l1_in``,
+    ``l1_exp``, ``l1_out``, ``l1_scale``) and nothing else -- the design
+    single-buffers its tiles (the row loop is inside the herd body), so there
+    is no ping-pong factor. Kept beside the allocations it counts so the two
+    cannot drift.
+    """
+    itemsize = np.dtype(np_dtype).itemsize
+    return (3 * rows_per_call * cols + SM_SCALE_BANDS * rows_per_call) * itemsize
+
+
+def derive_rows_per_call(rows, cols, np_dtype=bfloat16, herd_x=8, ceiling=8):
+    """The largest legal ``rows_per_call`` for this shape, never above ``ceiling``.
+
+    Legal is two things at once: it must divide ``rows // herd_x`` (each core
+    walks its own rows in whole calls) and ``softmax_l1_bytes`` must fit
+    ``L1_BYTES``. The ceiling is the caller's historical constant, so any shape
+    where that constant is legal still gets it and its IR is byte-identical --
+    the same argument ``builders/layer_norm.derive_rows_per_call`` makes.
+
+    WHY THIS EXISTS `[2026-08-20]`
+        The first ``full`` profile (devq 427) walked `runlist` to 8192 and
+        16384 and both failed inside aircc with an EMPTY error body. The
+        module was the softmax: `runlist` pinned ``rows_per_call = 2``, sized
+        at 4096 (48 KiB), and at 8192 that is 96 KiB on a 64 KiB tile. One
+        row fits at 8192; at 16384 one row is already 96 KiB, so that length
+        is a wall of this design, and a wall should be a named ValueError at
+        prepare time rather than a blank compiler failure after 468 s.
+    """
+    if rows % herd_x:
+        raise ValueError(
+            f"rows ({rows}) must be divisible by herd_x ({herd_x}) before a "
+            "rows_per_call can be derived"
+        )
+    rows_per_tile = rows // herd_x
+    legal = [
+        n
+        for n in range(1, min(ceiling, rows_per_tile) + 1)
+        if rows_per_tile % n == 0 and softmax_l1_bytes(n, cols, np_dtype) <= L1_BYTES
+    ]
+    if not legal:
+        raise ValueError(
+            f"softmax over {rows}x{cols} {np.dtype(np_dtype).name}: even "
+            f"rows_per_call=1 needs {softmax_l1_bytes(1, cols, np_dtype)} B of "
+            f"L1 against {L1_BYTES} B (three row tiles + the scale band); the "
+            "row width is the bound, and this design has no column chunking"
+        )
+    return max(legal)
+
 KERNEL_OBJ = "softmax_streaming.o"
 
 
@@ -132,6 +189,13 @@ def build_softmax_module(rows, cols, np_dtype=bfloat16, herd_x=8, rows_per_call=
             f"cols ({cols}) must be a multiple of SM_VEC_LEN ({SM_VEC_LEN}); "
             "the kernel has no scalar tail and would leave the remainder of "
             "every row unexponentiated"
+        )
+    need = softmax_l1_bytes(rows_per_call, cols, np_dtype)
+    if need > L1_BYTES:
+        raise ValueError(
+            f"softmax rows_per_call={rows_per_call} at cols={cols} needs {need} B "
+            f"of L1 per core, over the {L1_BYTES}-byte tile; derive_rows_per_call "
+            "gives the largest value that fits, or refuses by name"
         )
     if rows % (herd_x * rows_per_call):
         raise ValueError(

@@ -231,6 +231,35 @@ DECODER_STAGE_ATOL = {
     "output": 4.5e-1,
 }
 
+# `[2026-08-20]` The table above was measured at ONE width, and the first walk
+# of the 1024-wide decoder family (gpt2_medium_1024: 1024x4096, devq 430)
+# crossed its last two ceilings on the two device-norm modes while the
+# mean-relative error stayed where the 768 family reads it: `coarse` ffn_out
+# atol_required 4.869e-1 (2 of 1,048,576 elements over, mean_rel 4.95e-2),
+# `fused` 5.412e-1 (40 over, mean_rel 5.57e-2); `offload` and `runlist` 12/12
+# clean (offload's tail 2.40e-1 -- its pre-norms are host f32). That is the
+# element-wise tail of a 4096-deep bf16 reduction against a ceiling sized at
+# 3072, not a 25x relative excess of the kind the attention-scale defect read
+# as. Per-width entries are therefore MEASURED and rounded up, like the base
+# table: 1024 -> 6e-1 on ffn_out/output (1.11x over fused's 5.412e-1). A
+# width with no entry uses the base table unchanged, which is why gpt2_512
+# (hidden 512, ffn 2048; 4/4 clean at devq 429) needs none. Confirmation
+# walk: the second gpt2_medium_1024 smoke must read 4/4 under these.
+DECODER_STAGE_ATOL_BY_HIDDEN = {
+    1024: {"ffn_out": 6e-1, "output": 6e-1},
+}
+
+
+def decoder_stage_atol(hidden_size):
+    """The decoder's per-boundary atol table at ``hidden_size``.
+
+    The one authority the four modes read, so a per-width entry lands in all
+    of them at once and none can carry its own copy of the base table.
+    """
+    table = dict(DECODER_STAGE_ATOL)
+    table.update(DECODER_STAGE_ATOL_BY_HIDDEN.get(int(hidden_size), {}))
+    return table
+
 # Where the four block ELFs are cached, relative to the working directory. It
 # sits under the working directory rather than beside opcheck.py so `make
 # clean` takes it with the rest of the build, and so a clean and a
@@ -438,7 +467,7 @@ def prepare_layer_dispatch(
     variant = shape.get("workload_variant", "encoder_bert")
     causal = variant == "decoder_gpt2"
     boundary_names = DECODER_BLOCK_BOUNDARIES if causal else BLOCK_BOUNDARIES
-    stage_atol = DECODER_STAGE_ATOL if causal else BLOCK_STAGE_ATOL
+    stage_atol = decoder_stage_atol(emb_dim) if causal else BLOCK_STAGE_ATOL
     run_layer = run_decoder_block if causal else run_block
 
     cfg = block_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim, causal=causal)

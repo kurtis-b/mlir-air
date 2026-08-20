@@ -419,5 +419,15 @@
 // vacuous path printed VERDICT: OK with 0 failures; the partial path said
 // "agrees on 7"; the malformed path raised).
 //
+// `[2026-08-20]` 584 -> 585, no module added: the decoder's stage ceilings
+// were measured at one width, and the first walk of the 1024-wide family
+// (gpt2_medium_1024, devq 430) crossed ffn_out/output on the two device-norm
+// modes -- coarse 4.869e-1, fused 5.412e-1 against 4.5e-1, mean-relative
+// error unchanged from the 768 family. decoder_stage_atol(hidden) is now the
+// one authority the four modes read, with a MEASURED per-width entry (1024 ->
+// 6e-1 on exactly those two boundaries). The +1 pins: base widths byte-equal
+// to the base table, overrides confined to names the base table has, the 1024
+// entry exactly two boundaries, and every mode reading the authority.
+//
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 584/584 passed in 25 modules
+// CHECK: study host tests: 585/585 passed in 25 modules

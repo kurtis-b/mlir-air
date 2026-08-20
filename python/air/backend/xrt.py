@@ -455,7 +455,14 @@ class XRTBackend(AirBackend):
             )
             if result.returncode != 0:
                 error_msg = result.stderr if result.stderr else result.stdout
-                raise AirBackendError(f"aircc compilation failed:\n{error_msg}")
+                # Keep the return code: a compiler killed by a signal (OOM,
+                # timeout) returns negative with NO output, and without the
+                # code that is indistinguishable from a compiler error whose
+                # message was empty.
+                raise AirBackendError(
+                    f"aircc compilation failed (returncode {result.returncode}"
+                    f"{', no output' if not error_msg else ''}):\n{error_msg}"
+                )
 
             if multi_launch_xclbin:
                 self._finalize_multi_launch_xclbin(

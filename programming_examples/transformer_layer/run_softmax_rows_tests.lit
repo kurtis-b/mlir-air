@@ -1,0 +1,22 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// The device softmax's row-width wall, and the derivation that names it.
+// Host-only: builds air.ir.Modules and hashes them, never reaches a device.
+//
+// THE WALL `[2026-08-20]`. `runlist` pinned its softmax's rows_per_call at 2,
+// sized at seq 4096 (three [2, 4096] bf16 tiles = 48 KiB of a 64 KiB L1). The
+// first `full` profile (devq 427) walked the mode to 8192 and 16384 and both
+// rungs failed inside aircc with an EMPTY error body -- the installed backend
+// drops the return code -- after 88 s and 468 s. The module was the softmax:
+// at 8192 two rows are 96 KiB. The repair is the same one the layer-norm
+// width wall took (run_layer_norm_rows_tests.lit): DERIVE the parameter,
+// bounded above by the historical constant, so every length where 2 fits
+// emits byte-identical IR (asserted as byte equality at 512..4096, with the
+// discrimination control that 1 vs 2 DOES change the module), 8192 gets the
+// one row that fits, and 16384 -- where even one 16384-wide row is 96 KiB --
+// refuses by name at CONFIG time. The explicit-2-at-8192 case still raises,
+// which separates "derive the parameter" from "delete the constraint".
+//
+// RUN: python3 %S/builders/test_softmax_rows.py | FileCheck %s
+// CHECK: softmax row tests: 9/9 passed

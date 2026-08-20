@@ -164,7 +164,7 @@ from builders.block_cache import (  # noqa: E402
 from builders.gemm_spec import resolve_gemm_spec, spec_herd  # noqa: E402
 from opcheck_layer import (  # noqa: E402
     BLOCK_STAGE_ATOL,
-    DECODER_STAGE_ATOL,
+    decoder_stage_atol,
     print_dispatch_totals,
     reconfiguration_delta,
 )
@@ -891,7 +891,7 @@ def prepare_offload(shape, seed=42):
     variant = shape.get("workload_variant", "encoder_bert")
     causal = variant == "decoder_gpt2"
     boundary_names = DECODER_BOUNDARIES if causal else ENCODER_BOUNDARIES
-    stage_atol = DECODER_STAGE_ATOL if causal else BLOCK_STAGE_ATOL
+    stage_atol = decoder_stage_atol(emb_dim) if causal else BLOCK_STAGE_ATOL
 
     cfg = offload_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim)
     describe_offload(cfg, causal=causal)

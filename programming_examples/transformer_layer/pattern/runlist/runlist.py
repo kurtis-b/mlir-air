@@ -157,9 +157,10 @@ from builders.gelu import build_gelu_module  # noqa: E402
 from builders.gemm_spec import resolve_gemm_spec, spec_herd  # noqa: E402
 from builders.layer_norm import build_layer_norm_module  # noqa: E402
 from builders.softmax import build_softmax_module  # noqa: E402
+from builders.softmax import derive_rows_per_call as derive_softmax_rows_per_call  # noqa: E402
 from opcheck_layer import (  # noqa: E402
     BLOCK_STAGE_ATOL,
-    DECODER_STAGE_ATOL,
+    decoder_stage_atol,
     print_dispatch_totals,
     reconfiguration_delta,
 )
@@ -218,6 +219,14 @@ _SOFTMAX_FUNC = "softmax_rows"
 #: needs 48 KiB of a 64 KiB L1 and 4 would need 96 KiB. The row loop is inside
 #: the herd body, so this bounds L1 and NOT the entry count — one softmax is
 #: one runlist entry however many trips it walks.
+#:
+#: `[2026-08-20]` This is now a CEILING, not the value: the first ``full``
+#: profile (devq 427) took `runlist` to 8192, where 2 rows are 96 KiB, and
+#: aircc failed with an empty message after 88 s. ``builders.softmax.
+#: derive_rows_per_call`` picks the largest legal value at or below this, so
+#: every length where 2 fits (<= 4096) emits byte-identical IR, 8192 gets 1,
+#: and 16384 -- where even one 16384-wide row is 96 KiB -- refuses by name at
+#: prepare time instead of 468 s into a compile.
 SOFTMAX_ROWS_PER_CALL = 2
 
 #: The single func.func each GEMM method's module emits — what instance_name
@@ -375,6 +384,11 @@ def runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim, causal=False)
         "head_dim": head_dim,
         "norm_rows": rows,
         "norm_blocks": seq_len // rows,
+        # Derived once here -- the artifact builder and the record both read
+        # it -- so a width where nothing fits refuses at CONFIG time, by name.
+        "softmax_rows_per_call": derive_softmax_rows_per_call(
+            seq_len, seq_len, bfloat16, ceiling=SOFTMAX_ROWS_PER_CALL
+        ),
         "specs": specs,
         "gemms": gemms,
         "artifacts": artifacts,
@@ -491,7 +505,7 @@ def _build_runlist_module(cfg, key):
             cfg["seq_len"],
             cfg["seq_len"],
             bfloat16,
-            rows_per_call=SOFTMAX_ROWS_PER_CALL,
+            rows_per_call=cfg["softmax_rows_per_call"],
         )
     raise KeyError(f"unknown runlist artifact key {key!r}")
 
@@ -990,7 +1004,7 @@ def prepare_runlist(shape, seed=42):
     variant = shape.get("workload_variant", "encoder_bert")
     causal = variant == "decoder_gpt2"
     boundary_names = DECODER_BOUNDARIES if causal else ENCODER_BOUNDARIES
-    stage_atol = DECODER_STAGE_ATOL if causal else BLOCK_STAGE_ATOL
+    stage_atol = decoder_stage_atol(emb_dim) if causal else BLOCK_STAGE_ATOL
 
     cfg = runlist_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim, causal=causal)
     describe_runlist(cfg)
@@ -1177,7 +1191,7 @@ def prepare_runlist(shape, seed=42):
         "norm_blocks": cfg["norm_blocks"],
         "runlist_entries": runlist_entry_count(cfg),
         "runlist_submissions": runlist_submission_count(cfg),
-        "softmax_rows_per_call": SOFTMAX_ROWS_PER_CALL,
+        "softmax_rows_per_call": cfg["softmax_rows_per_call"],
         # MIXED: the three projection shapes resolve in the registry, the two
         # attention shapes are injected measured tiles that resolve in none.
         "gemm_spec_source": "registry+injected",

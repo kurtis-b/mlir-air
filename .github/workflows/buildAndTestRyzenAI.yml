@@ -177,8 +177,8 @@ jobs:
           # only when its count is nonzero and pads the labels, hence the
           # tolerant pattern.
           cats=$(sed -nE 's/^  ([A-Za-z][A-Za-z ]*[A-Za-z]) *: *([0-9]+).*/\1=\2/p' tl-host.log)
-          if ! printf '%s\n' "$cats" | grep -qx "Passed=12"; then
-            echo "::error::transformer-layer PR gate did not run all 12 tests"
+          if ! printf '%s\n' "$cats" | grep -qx "Passed=13"; then
+            echo "::error::transformer-layer PR gate did not run all 13 tests"
             echo "  categories reported: ${cats:-(no summary at all)}"
             exit 1
           fi
