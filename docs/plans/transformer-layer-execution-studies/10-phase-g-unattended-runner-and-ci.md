@@ -376,6 +376,18 @@ against counts derived from the profile itself, not hard-coded.
 > Read "full profile" as **the profile a profile names**, not as the declared 6×9 matrix. The
 > matrix is not reachable (see the header) and a gate that cannot be satisfied is not a gate.
 
+> `[2026-08-20]` **MET.** `run_profile --profile full` (baseline_768, the declared 9-length
+> ladder × 4 modes = 36 rungs) reads `complete: True`, `row_counts_checked: True`, smoke gate
+> PASS — 21 measured, 15 structurally skipped, 0 failed — and was walked twice (devq 434 resumed
+> across three sessions; devq 435 in one session from scratch, 419 s warm; `compare_roots` OK).
+> The first session found ten rungs failing in builders before aircc; one wall was repaired and
+> the rest became skips whose reasons are READ from the refusing builders' sources (`ast`-pinned
+> in the host suite, and `run_profile_bounds_tests.lit` asserts skip ⇔ refuses with air). So
+> "complete" means: every rung the current designs can build is measured, and every rung they
+> cannot is a `skipped` row naming the clause — the standing `fused`'s packing bound has had
+> since G0. The reachability caveat in the header is also closed: all six families have walked
+> ([54](54-first-full-profile-and-decoder-families.md)).
+
 ## What G0 shipped `[2026-08-12]`
 
 Doc 34's recommended first increment, "one profile, one command, one manifest".

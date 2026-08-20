@@ -317,6 +317,8 @@ Not "it feels done". [13](13-verification-and-acceptance.md) already defines it:
   writes complete, well-formed CSVs full of failed rows; iron shipped a smoke test that reported
   21/21 passed on a machine where every measurement had failed.
 - **Phase G gate** — a full profile run with a complete `results_manifest.json`.
+  `[2026-08-20]` **Passed** — 36 rungs, 21 measured + 15 skips derived from the refusing
+  builders, walked twice ([54](54-first-full-profile-and-decoder-families.md)).
 
 When those pass over the four modes across the ladder, with `attention_path` and the norm-staging
 difference recorded beside every row, the port captures the study's essence: it can say what each

@@ -44,11 +44,11 @@ then the narrowest useful test.
 | Strategy distinguishability | Dispatch vector per mode, summed by the driver | Phase E5 — **passed 2026-08-05**, with one caveat: the `runlist > coarse` clause is satisfied *by construction* rather than by measurement, because `runlist` is defined as `coarse`'s schedule subdivided. See [08 §Outcome](08-phase-e-execution-strategies.md). Replace it with a `herd_launches` comparison before Phase F relies on it |
 | Harness plumbing | `unattended_reboot smoke-test` | Phase F — plot/regeneration path only, measures nothing |
 | End-to-end setup | `unattended_reboot execution-smoke-test` | Phase F — **≥1 row with `run_status=passed` per measurement CSV** |
-| Full suite | `unattended_reboot start --suite-profile <profile>` | Phase G — complete manifest, counts derived from the profile |
-| Cross-run sanity | `compare_results_roots <old> <new>` | Median/p90 drift within per-mode tolerance |
+| Full suite | ~~`unattended_reboot start --suite-profile <profile>`~~ `study/run_profile.py --profile full --out-dir <root>` | Phase G — complete manifest, counts derived from the profile. **`[2026-08-20]` passed**: `complete: True` over 36 rungs, 21 measured + 15 derived skips, walked twice ([54](54-first-full-profile-and-decoder-families.md)) |
+| Cross-run sanity | `study/compare_roots.py --baseline <old> --candidate <new> --csv …` | Median/p90 drift within per-mode tolerance. `[2026-08-20]` Same-toolchain only; an iron tree is read by `study/iron_adapter.py --iron-root … --root … --csv …`, whose verdict is SHAPE agreement, never drift (criterion 3 row in the README) |
 | Sliding window | `make verify` with window-crossing prompts | Goal 1 |
-| Quantized path | `make verify` under a gate exercising the quantized path | Goal 2 |
-| LLM regression | `make verify` in each `llms/<model>/` | Shared-infrastructure changes did not break the ten shipped models |
+| Quantized path | `make verify` under a gate exercising the quantized path | Goal 2 — **passed 2026-08-19**, `smollm2_1_7b_int4` |
+| LLM regression | `make verify` in each `llms/<model>/` | Shared-infrastructure changes did not break the shipped models — eleven since 2026-08-19. `[2026-08-20]` **8/11 is the standing leg**: the three ≥3B models are deferred, not failed — their `verify` is oomd-killed with the whole session ([15](15-environment-notes.md)) |
 
 ## Two gates that deserve emphasis
 

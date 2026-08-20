@@ -569,7 +569,7 @@ Compilation, not measurement, dominates: 631 s cold against 32 s warm for the id
 a **~20× swing** on the same hardware in the same job. Doc 10's "wall clock swings by a factor of
 four depending on how warm `build/` is" understates it at this granularity.
 
-### 5.2 The estimate **[inference — extrapolation from the above; no full profile has ever run]**
+### 5.2 The estimate **[inference — extrapolation from the above; ~~no full profile has ever run~~ `[2026-08-20]` one has: 1902 s cold for baseline_768's 36 rungs (devq 427) against the ~1.7–2 h row below, 419 s warm (devq 435) — see [54](54-first-full-profile-and-decoder-families.md)]**
 
 Per-rung cold cost from doc 25's 16-rung figure: 45 min / 16 ≈ **2.8 min/rung** averaged over
 512–4096. Job 224's cold rungs at 512/1024 (29–132 s) bracket that consistently.
