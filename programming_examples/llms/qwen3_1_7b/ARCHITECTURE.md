@@ -19,7 +19,7 @@ FlashAttention.
 **Prefill — 3 NPU ELFs/layer:**
 
 ```
-x ─[NPU elf:rms_qkv_qknorm_rope]   FUSED, 8 launches, 1 ELF
+x ─[NPU elf:rms_qkv_qknorm_rope]   FUSED, 1 ELF, 9 launches (8 ops + the Q GEMM's fused-cast launch)
       { RMSNorm + Q/K/V GEMM + QK-norm(Q) + QK-norm(K) + RoPE-Q + RoPE-K }
       QK-norm = per-head RMSNorm over head_dim=128, eps=1e-6
       → q_roped[seq,2048], k_roped[seq,1024], v[seq,1024]
@@ -27,7 +27,7 @@ x ─[NPU elf:rms_qkv_qknorm_rope]   FUSED, 8 launches, 1 ELF
       (HOST) seq→head transpose → NPU FA → (HOST) head→seq transpose → attn_out[seq,2048]
   ─[NPU elf:o_ffn_qwen]   FUSED, 1 ELF
       { O GEMM (square 2048→2048) + Add + RMSNorm + Gate + Up + SwiGLU + Down + Add } → layer_out[seq,2048]
-once: (HOST) final RMSNorm → [NPU elf:lm_head_gemv] (19 partitions ×8192, vocab 151936)
+once: (HOST) final RMSNorm → [NPU elf:lm_head_gemv] (10 partitions: 9 × 16384 + 4480 = vocab 151936, m_input 8; was 19 × 8192 before 2026-08-21)
 ```
 
 **Decode — 2 NPU ELFs/layer (+ lm_head once/token):**
@@ -38,7 +38,7 @@ x ─[NPU elf:rms_qkv_qknorm_rope_gemv4]   FUSED, 1 ELF, 4 launches (was 8 befor
   (HOST) KV-cache write → (HOST) decode_attention_cpu (single-token GQA over KV cache)
   ─[NPU elf:o_gemv_ffn]   FUSED cascade, 1 ELF
       { O GEMV + Add + RMSNorm + Gate/Up cascade + SwiGLU + Down } → layer_out[2048]
-once: (HOST) embed/final RMSNorm → [NPU elf:lm_head_gemv]
+once: (HOST) embed/final RMSNorm → [NPU elf:lm_head_gemv] (10 partitions, 9 × 16384 + 4480)
 ```
 
 The fused 2-ELF decode cascade is reachable here because emb=2048 (< 2560) and

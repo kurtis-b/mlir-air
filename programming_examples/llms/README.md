@@ -46,14 +46,18 @@ per token.
 | Llama-3.2-1B (bf16) | 1.21 s | 12.2 tok/s | 3 / 2 |
 | SmolLM2-1.7B (bf16) | 2.02 s | 8.0 tok/s | 3 / 2 |
 | Qwen2.5-0.5B | 0.99 s | 11.9 tok/s | 4 / 5 |
-| Qwen3-0.6B | 1.52 s | 11.7 tok/s | 3 / 2 |
-| Qwen3-1.7B | 2.08 s | 7.4 tok/s | 3 / 2 |
+| Qwen3-0.6B | 1.52 s | **13.0 tok/s** (08-21) | 3 / 2 |
+| Qwen3-1.7B | 2.08 s | **7.8 tok/s** (08-21) | 3 / 2 |
 | Qwen2.5-1.5B | 2.43 s | 6.6 tok/s | 5 / 5 |
 | Llama-3.2-3B | 3.70 s | 4.7 tok/s | 3 / 5 |
 | Qwen2.5-3B | 4.24 s | 3.5 tok/s | 6 / 5 |
 | Qwen3-4B | 5.45 s | 3.5 tok/s | 7 / 5 |
 
-Measured via `make profile N_TOKENS=32` on NPU2, 2026-06. All pass `make verify`
+Measured via `make profile N_TOKENS=32` on NPU2, 2026-06 (NPU power mode not recorded for the
+June rows). **Qwen3-0.6B and Qwen3-1.7B decode re-measured 2026-08-21 under recorded Turbo** after
+three launch-count changes (decode QKV stage 8 → 4 launches, LM head `m_input` 8 and 10 mixed
+partitions; `docs/plans/transformer-layer-execution-studies/57-…md` §5): 77 and 128–130 ms/token.
+All pass `make verify`
 (top-5 token-set vs HF bf16, exit 0). The lean **3-ELF prefill / 2-ELF decode**
 form (Qwen3-0.6B/1.7B, matching Llama-3.2-1B) needs aligned dims + emb<2560 +
 hidden÷512; bigger models split the FFN and run a 5-ELF decode (the fused
