@@ -49,6 +49,12 @@ The Llama-3.2-1B bf16 path (June table: 12.2 tok/s, 2.47 GB/token) implies ~30 G
 because its weight matrices are bigger per launch (emb 2048, hidden 8192) and amortize the
 same fixed costs better — which is the first hint of §2.
 
+**`[2026-08-21]` The table above is the 2026-08-20 baseline; two landed changes move it** (§5
+items 3c and 5, same-session before/after under recorded Turbo): `lm_head` 9.77 → **8.79 ms**
+(`m_input = 8`) and `rms_qkv` 1.03 → **0.62 ms** (8 → 4 launches) — per layer 2.92 → 2.52 ms,
+layer loop −11.5 ms/token, token **89 → ~76.5 ms**. Boundaries per token: 28 × 7 + 19 = **215**
+(from 327), ≈ 23 ms ≈ 30 % of the new token.
+
 ### 1.2 Qwen3-0.6B bf16, prefill at `seq_len = 2048` (same run)
 
 | Kernel | NPU run | BO write | Per layer | Share | Rate |
@@ -107,7 +113,7 @@ broadcast-DMA repeat geometry from the 255 limit to ~127. The 2.07 ms therefore 
 reconfiguration **plus** whatever the changed per-launch DMA schedule costs; BD-count equality
 is not established. "109 µs per boundary" is the right order and the right direction — the
 per-layer gaps in §1.1 say the same thing independently — but as an *isolated* boundary cost
-it is **unverified**. The isolating experiments: 38 correct 4096-row segments run either as 38
+it is ~~**unverified**~~ **`[2026-08-21]` verified at 106–108 µs with the geometry held fixed — §1.5**. The isolating experiments: 38 correct 4096-row segments run either as 38
 devices or as **19 devices each performing two segments** (same descriptors and repeat
 geometry, only the configuration count differs — not yet run); and, for the repeat edge,
 19 × 8192 at `m_input = 4` (repeat 255) against `m_input = 8` (~127), same bytes and launch
@@ -123,7 +129,9 @@ The shorter repeat geometry is **faster** per byte, not slower — so the 38-lau
 it too, and the confound makes the isolated boundary cost **larger** than the naive delta, not
 smaller: between (12.23 − 9.96) / 19 = **120 µs** and (12.23 − 9.12) / 19 = **164 µs**
 depending on which single-launch geometry the 4096-row form matches. Every conclusion drawn
-from "~110 µs" below holds with that band; the 19-devices-×-2-segments probe would pin it.
+from "~110 µs" below holds with that band; ~~the 19-devices-×-2-segments probe would pin it~~
+**`[2026-08-21]` pinned at 106–108 µs by §1.5's geometry-fixed probe (devq 451) — the band
+collapses to the naive delta, and the repeat-geometry speed-up is a separate, additive effect.**
 Two by-products: **`m_input = 8` is a free ~0.85 ms/token on the production LM head** if it
 verifies (§5 item 4); and the per-launch geometry is itself an O3 knob.
 
@@ -149,10 +157,85 @@ repeat count. Production's gate cannot see it: only the token
 set gates, the full-logit comparison is informational (`verify/report.py:54`,
 `comparators.py:184`). The settling experiment: the same 19-launch ELF at `n_part = 4096`-sized partitions but 8192
 rows via two BDs, re-executed back-to-back; and the existing two-dispatch re-execution gate
-shape applied to `lm_head_gemv`. The timing comparison is unaffected — both forms move the
+shape applied to `lm_head_gemv` — **`[2026-08-21]` done, §1.5: the gate is checked in
+(`qwen3_0_6b/lm_head_reexec_gate.py`, lit `run_npu2_lm_head_reexec.lit` under `XFAIL`), the
+production artifact reads 5 of 7 dispatches wrong, a 0.5 s idle does not heal it, any other
+ELF does.** The timing comparison is unaffected — both forms move the
 same bytes through the same kernel, the timed loop alternated the two ELFs (the correct
 case), and the per-boundary figure is corroborated independently by §1.1's per-layer gaps
 (`rms_qkv`: 1.03 ms measured − 0.26 ms at 32 GB/s = 0.77 ms over 8 boundaries ≈ 0.1 ms each).
+
+### 1.5 `[2026-08-21]` The boundary cost isolated, and the defect gated — devq 450–452
+
+**Codex's isolating design cannot be built as stated.** "19 devices each performing two
+4096-row segments" assumes two `air.segment`s in one `air.launch` share a device; they do not
+— `air-to-aie` creates one `aie.device` per segment (`AIRToAIEPass.cpp`,
+`createAIEModulesAndOutlineCores`: `module.walk([&](air::SegmentOp s) …)` then one
+`AIE::DeviceOp::create` per segment), so that form is 38 configurations again.
+
+**The isolation run instead holds the per-launch geometry fixed and varies only the
+configuration count.** `probe_boundary_cost.py` (evidence root
+`results/hexagon-opt-20260821/`) keeps the 19 production launches byte-for-byte
+(`build_lm_head_gemv_module`, `n_part = 8192`, `m_input = 4`, repeat 255 — the seeded
+`p19x8192.elf` is the 2026-08-20 build of the same module) and adds *tiny* launches of the
+same GEMV: the same 8-column herd, the same kernel object, the same BD shape, over 64 rows —
+one launch iteration, 128 KB. Five ELFs, 3 warm-ups, 20 timed calls each, variants
+interleaved so no ELF re-executes back-to-back (§1.4's defect pattern), every output checked
+against f32 (all five exact, max 2.66e-3):
+
+| ELF | launches | p50 | min | avg | max |
+|---|---|---|---|---|---|
+| `p19x8192` (production) | 19 | **9.829 ms** | 9.620 | 9.892 | 10.301 |
+| `p19x8192_t19` (19 production + 19 tiny, interleaved; +0.76 % bytes) | 38 | **11.882 ms** | 11.730 | 11.946 | 12.301 |
+| `t1` | 1 | 0.251 ms | 0.193 | 0.284 | 0.475 |
+| `t19` | 19 | 2.167 ms | 2.127 | 2.202 | 2.373 |
+| `t38` | 38 | 4.184 ms | 4.144 | 4.213 | 4.411 |
+
+Three estimates of the per-boundary cost, from two independent forms:
+
+- **additive**: (11.882 − 9.829) / 19 = **108.1 µs** — 19 extra configurations *between*
+  the production launches, whose own descriptors did not change;
+- **tiny-only slopes**: (t19 − t1) / 18 = **106.4 µs**, (t38 − t19) / 19 = **106.1 µs**;
+  least-squares over N = 1, 19, 38: **106.3 µs per launch, 146 µs intercept** (the fixed
+  per-`xrt.run` cost: submission, completion wait, the 2 KB input and 128 B output syncs).
+
+They agree to 2 %, and the additive form agreeing with the tiny-only form says the cost does
+**not depend on the neighbouring device** — it is a per-configuration constant. Each figure
+still contains the tiny launch's own work (128 KB at the streaming rate is ~4 µs, plus one
+kernel call and one L1→L3 return), so **~100 µs is reconfiguration proper** and 106–108 µs
+is the number to charge per `air.launch` boundary in a multi-launch ELF. Doc 57's "~110 µs"
+stands; the 120–164 µs band of §1.4 was the repeat-geometry effect stacked on top of it, and
+that effect is a *separate*, additive knob (O3), not an error bar on the boundary. Two
+by-products: the production LM head spends 19 × 107 = **2.0 ms of its 9.83 ms in
+boundaries**, so its 319 MB actually stream at **40.8 GB/s** between them (the 32.4 GB/s
+figure is the boundary-diluted rate); and `t1 = 251 µs` is the floor for *any* decode ELF
+dispatched on its own — 57 of them per token is 14 ms before a byte moves, which is O2's
+ceiling (§5).
+
+**The re-execution defect, on the production artifact.** `lm_head_reexec_probe.py` loaded
+`build_peano/decode_kernel_cache/lm_head_gemv.elf` itself (8,605,040 bytes, built
+2026-08-20 03:32) and dispatched it seven times (devq 452):
+
+| dispatch | pattern | verdict | bad rows (partition 0 only) |
+|---|---|---|---|
+| d1 | first after load | **clean** (max_rel 2.50e-3) | — |
+| d2 | immediately after d1 | WRONG, max_rel 0.93 | 2,455 from row 64 |
+| d3 | immediately after d2 | WRONG, max_rel 0.91, **≠ d2** (max diff 2.88) | 741 from rows 24, 32, 40, 64… |
+| d4 | after a **0.5 s host idle**, nothing in between | WRONG, max_rel 0.92 | 2,194 from rows 24, 32, 64… |
+| d5 | a **different input**, back-to-back | WRONG, max_rel 1.15 | 2,063 |
+| d6 | after a **different ELF** (a 1-launch GEMV) | **clean**, bit-identical to d1 | — |
+| d7 | immediately after d6 | WRONG, max_rel 0.93 | 2,084 from row 64 |
+
+What this adds to §1.4: the idle does not heal it, so it is **stale state left in the
+partition or context, not a race with in-flight work**; the input does not matter; the
+rows are tile boundaries (multiples of 8) from row 24 on, not "64 onward" only; and the
+healing is exactly one intervening configuration of anything else. The gate is checked in as
+`qwen3_0_6b/lm_head_reexec_gate.py` + `make check-lm-head-reexec` +
+`run_npu2_lm_head_reexec.lit` — it compiles the production builder's module fresh (so a fix
+anywhere from builder to device is what flips it), needs no HF weights, and carries
+`XFAIL: *` while the defect is open: a fix turns it into an XPASS, which is the instruction
+to drop that line. Through `make check-lm-head-reexec` from a scratch cwd (the lit's
+invocation) it reads the same 2 / 7 (devq 458).
 
 ## 2. The structural fact: every `air.launch` boundary is a partition reconfiguration
 
@@ -169,7 +252,7 @@ Count them per decode token for Qwen3-0.6B: `rms_qkv_qknorm_rope_gemv` is 8 laun
 (`rms_qkv_qknorm_rope_multi.py:670`: RMSNorm, Q, K, V, QK-norm ×2, RoPE ×2), `o_gemv_ffn` is 3
 (`o_gemv_ffn_multi.py`: `matvec_2tile_add`, `matvec_swiglu_rms` cascade, `matvec_2tile_add`),
 `lm_head` 19 — **28 × 11 + 19 = 327 launch boundaries per token**, against 57 `xrt.run`s and
-one logical token. **Measured: 109 µs per boundary, with §1.4's caveat that the probe did not hold the per-launch DMA geometry constant** — the order of magnitude is corroborated by the per-layer gaps. Applied to the 308 per-layer
+one logical token. **Measured: 109 µs per boundary, ~~with §1.4's caveat that the probe did not hold the per-launch DMA geometry constant~~ `[2026-08-21]` and 106–108 µs with the geometry held constant (§1.5)** — corroborated independently by the per-layer gaps. Applied to the 308 per-layer
 boundaries that is **33.6 ms of the 89 ms token — 38 %** — before a single weight byte moves.
 It also explains the June int4 result: Llama-1B int4 decode went 12.2 → 17.8 tok/s (1.46×,
 15.3 re-measured today) on a ~4× narrower weight stream because its token still carries
@@ -237,15 +320,69 @@ H2/H3 phases measure.
 3. ~~**Long-context decode profile**~~ **DONE** (devq 444, §1.1): 25 / 54 ms per token of CPU
    attention at ~1,000 / ~1,900 context.
 3b. ~~**Repeat-geometry isolation**~~ **DONE** (devq 448/449, §1.4): `m_input 8` is 8.5 %
-   faster at the same launch count; the defect is not the repeat limit. **Still to run**: the
-   19-devices-×-2-segments probe and the `lm_head` back-to-back re-execution gate.
-3c. **`m_input = 8` on the production LM head**: `make verify` for Qwen3-0.6B; predicted
-   −0.85 ms/token.
-4. **O2 prototype** behind a driver flag: `run_sequence` over the (L `o_gemv_ffn`, L+1
-   `rms_qkv`) pairs; dispatch vector `host_submissions 57 → 29`; `make verify`.
-5. **O1 first cut**: `rms_qkv_qknorm_rope_gemv` as one GEMV launch over `[wq; wk; wv]` with
+   faster at the same launch count; the defect is not the repeat limit. ~~**Still to run**: the
+   19-devices-×-2-segments probe and the `lm_head` back-to-back re-execution gate.~~
+   **`[2026-08-21]` both DONE** (devq 450–452, 458, §1.5): boundary cost **106–108 µs**
+   with the geometry held fixed (the two-segments form is unbuildable — one device per
+   segment — so the isolation adds near-empty configurations instead); the gate is checked
+   in under `XFAIL`, 5 / 7 dispatches wrong on the production artifact, idle does not heal.
+3c. ~~**`m_input = 8` on the production LM head**: `make verify` for Qwen3-0.6B; predicted
+   −0.85 ms/token.~~ **`[2026-08-21]` DONE and LANDED** (devq 453 → 454 → 455, same session,
+   Turbo observed): `make verify` **PASS** (2 / 2 prompts) with
+   `build_lm_head_gemv_qwen_module` at `m_input = 8`; `make profile N_TOKENS=32` twice
+   before and twice after — `lm_head_gemv` kernel **9.77 / 9.79 → 8.79 / 8.79 ms**
+   (**−1.0 ms/token**, the prediction was −0.85), `o_gemv_ffn` 1.54 → 1.53, `rms_qkv`
+   1.04 → 1.03 (unchanged within noise). The ELF shrank 8,605,040 → 8,307,120 bytes (half
+   the kernel calls per tile). The LM-head re-execution defect is unchanged by this (devq
+   448 already showed it at `m_input = 8`); the gate of §1.5 stays red.
+4. ~~**O2 prototype** behind a driver flag: `run_sequence` over the (L `o_gemv_ffn`, L+1
+   `rms_qkv`) pairs; dispatch vector `host_submissions 57 → 29`; `make verify`.~~
+   **`[2026-08-21]` DONE, MEASURED, SMALL** (devq 456, 457, 460). `qwen3_0_6b_decode_runlist.py`
+   behind `QWEN3_DECODE_RUNLIST=1` / `--decode-runlist`: the 27 (L `o_gemv_ffn`, L+1
+   `rms_qkv`) pairs as one `run_sequence` each, `x` device-resident between them; dispatch
+   vector per token **57 → 30 submissions** (27 × 2 entries + 3 singles), `air` 327
+   unchanged by construction. `make verify` **PASS** (2 / 2). Cost, `make profile
+   N_TOKENS=32` ×2 against the same-session `m_input = 8` baseline (devq 455): first
+   prototype **slower** — layer-loop wall 3264 / 3323 vs 2614 / 2637 ms, pair avg 3.01 /
+   3.08 ms against 1.53 + 1.04 for the two separate runs — because `run_sequence`
+   re-derived the pool plan every call (0.18 ms) and the 27 pair pools uploaded their
+   weights inside the first measured token. With the plan memoized
+   (`dispatch._plan_memo`) and the pools preloaded: **2560 / 2564 ms** layer-loop wall,
+   pair **2.70 / 2.71 ms avg, 2.59 min** — **−2 ms/token, about 2 %**. The mechanism
+   works and is correct; its ceiling is the per-`xrt.run` fixed cost (§1.5's 146 µs
+   intercept, minus a runlist entry's own cost) × 27, and that is what it delivers. It
+   stays behind the flag (the pools double the resident decode weights — see the module
+   docstring) and is not the production path. The launch count is the cost that matters;
+   O1 is where the token goes. **On top of O1's 4-launch stage** (devq 464, ported to the
+   9-arg ABI): layer-loop wall **2186 / 2120 vs 2247 / 2249 ms**, pair 2.27 / 2.23 ms avg
+   (2.17 min) against 1.53 + 0.62 — **−2 to −4 ms/token**; the saving per pair is the same
+   ~0.1 ms, a larger share of a shorter token.
+5. ~~**O1 first cut**: `rms_qkv_qknorm_rope_gemv` as one GEMV launch over `[wq; wk; wv]` with
    QK-norm + RoPE as an epilogue; predicted `rms_qkv` line 1.03 → ~0.4 ms (8.4 MB at 32 GB/s
-   + 1 boundary); `make verify`.
+   + 1 boundary); `make verify`.~~ **`[2026-08-21]` FIRST CUT DONE and LANDED: 8 → 4
+   launches, no new kernel** (devq 461 probe, 462 verify, 463 profile).
+   `build_rms_qkv_qknorm_rope_gemv4_module`: RMSNorm; **one** GEMV over the row-packed
+   `[wq; wk; wv]` (4096 × 1024); **one** QK-norm over the Q|K rows with a per-row weight
+   (`_build_qknorm_1d(per_row_weight=True, in_total=qkv_dim)` — the weight is the host-tiled
+   `[q_norm × 16; k_norm × 8]`, static, and the launch takes the whole `qkv` arg and reads
+   its first 24 rows, so V rides untouched in the tail); **one** RoPE over Q|K with the
+   position LUT tiled 24×. Same kernels, same bytes. Probe: outputs **bit-identical** to the
+   8-launch ELF on all four boundaries, deterministic; **1.125 → 0.680 ms per layer, −0.445
+   ms = 111 µs per removed boundary** — §1.5's constant, recovered a third way. Production
+   (`_RMS_QKV_KERNEL = "rms_qkv_qknorm_rope_gemv4"`, single-owner helpers `rms_qkv4_args` /
+   `run_rms_qkv4` in `qwen3_0_6b_decode.py`, preload and the O2 module ported): `make verify`
+   **PASS** (2 / 2); `make profile N_TOKENS=32` ×2: `rms_qkv` kernel **1.03 → 0.62 ms**,
+   per-layer 2.92 → **2.52 ms**, layer-loop wall 2614 / 2637 → **2247 / 2249 ms** over 896
+   invocations = **−11.5 ms/token**. With item 3c the token is **89 → ~76.5 ms** (−14 %)
+   from two changes that moved no new bytes. A wall met on the way: the `memref.subview` +
+   `memref.cast` prelude that `o_gemv_ffn_multi` uses fails when the alias has ONE use
+   (`'memref.cast' op using value defined outside the region` — the cast is sunk into the
+   launch region, its subview is not; devq 459), hence `in_total`.
+   **What is left of O1** (the predicted ~0.4 ms needs 4 → 1–2): the RMSNorm launch
+   (1 boundary; fold as a prologue on the broadcast `x` or precompute `rstd` host-side) and
+   the QK-norm + RoPE pair (2 boundaries; an epilogue needs each column to own whole heads,
+   i.e. a column-contiguous row distribution that the current L2-staged GEMV does not have —
+   a new core kernel). Each remaining boundary is worth ~107 µs × 28 = 3 ms/token.
 6. **O4**: int4 LM head; predicted 9.7 → ~3 ms.
 7. Then O3 / O5 / O6(ii) / O8 / O9 per [56](56-full-model-mixed-precision-study-plan.md)'s phases.
 

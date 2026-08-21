@@ -510,6 +510,41 @@ def default_host_writes(steps, specs):
     }
 
 
+_PLAN_MEMO = {}
+_PLAN_MEMO_MAX = 512
+
+
+def _plan_memo(steps, specs, elf_abi, host_writes, dispatched):
+    """`plan_pool`, memoized on the sequence's value identity.
+
+    `[2026-08-21]` A repeated sequence (decode's per-layer pairs, 27 per token)
+    re-derives the same plan every call; at ~0.2 ms per derivation that was a
+    measurable share of the pair's cost (doc 57 O2). The key is everything
+    `plan_pool` reads: the steps (frozen dataclasses), the dispatched specs'
+    fields, the ABI and the caller's host-write set. A plan is never mutated
+    after `plan_pool` returns (`pool_for` keys on `plan.signature`; the pool
+    only reads it), so sharing one object across calls is safe.
+    """
+    from shared.infra.bo_pool import plan_pool
+
+    key = (
+        tuple(steps),
+        tuple(
+            (n, specs[n].nbytes, specs[n].static, specs[n].host_output, specs[n].content_key)
+            for n in sorted(dispatched)
+        ),
+        elf_abi,
+        None if host_writes is None else frozenset(host_writes),
+    )
+    plan = _PLAN_MEMO.get(key)
+    if plan is None:
+        if len(_PLAN_MEMO) >= _PLAN_MEMO_MAX:
+            _PLAN_MEMO.clear()
+        plan = plan_pool(steps, specs, elf_abi, host_supplied=host_writes)
+        _PLAN_MEMO[key] = plan
+    return plan
+
+
 def run_sequence(
     cache,
     steps,
@@ -598,7 +633,7 @@ def run_sequence(
     # the plan has to know it: an in-place buffer treated as produced starts at
     # the step that writes it, and an earlier-dying buffer takes the slot its
     # host bytes are sitting in.
-    plan = plan_pool(steps, specs, elf_abi, host_supplied=host_writes)
+    plan = _plan_memo(steps, specs, elf_abi, host_writes, dispatched)
 
     # After `plan_pool`, which is what reports a step naming a buffer with no
     # spec — deriving the default first would turn that into a bare KeyError.

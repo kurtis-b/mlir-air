@@ -33,8 +33,10 @@ once: (HOST) final RMSNorm → [NPU elf:lm_head_gemv] (19 partitions ×8192, voc
 **Decode — 2 NPU ELFs/layer (+ lm_head once/token):**
 
 ```
-x ─[NPU elf:rms_qkv_qknorm_rope_gemv]   FUSED, 1 ELF
-      { RMSNorm + Q/K/V GEMV + QK-norm(Q,K) + RoPE-Q/K }   (RoPE LUT per-position, NOT a static BO)
+x ─[NPU elf:rms_qkv_qknorm_rope_gemv4]   FUSED, 1 ELF, 4 launches (was 8 before 2026-08-21)
+      { RMSNorm | ONE GEMV over [wq;wk;wv] | ONE per-row-weighted QK-norm over Q|K | ONE RoPE over Q|K }
+      (RoPE LUT per-position, tiled over the 24 Q|K rows, NOT a static BO; each air.launch
+       boundary costs ~107 us, so 8 -> 4 took the stage 1.03 -> 0.62 ms/layer, bit-identical)
   (HOST) KV-cache write → (HOST) decode_attention_cpu (single-token GQA over KV cache)
   ─[NPU elf:o_gemv_ffn]   FUSED cascade, 1 ELF
       { O GEMV + Add + RMSNorm + Gate/Up cascade + SwiGLU + Down } → layer_out[1024]

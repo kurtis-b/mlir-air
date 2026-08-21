@@ -263,15 +263,40 @@ def _build_qknorm_2d(
 
 
 @module_builder
-def _build_qknorm_1d(n_rows, head_dim, np_dtype, eps, herd_x=8, vector_size=16):
+def _build_qknorm_1d(
+    n_rows,
+    head_dim,
+    np_dtype,
+    eps,
+    herd_x=8,
+    vector_size=16,
+    per_row_weight=False,
+    in_total=None,
+):
     """Decode per-head RMSNorm with 1D func args (M=1 token).
 
     Func signature: (in_1d: [n_rows*head_dim], weight: [head_dim], out_1d: [n_rows*head_dim]).
     The herd processes n_rows rows (= n_heads or n_kv_heads) of head_dim each.
     Mirrors _build_qknorm_2d math but with no collapse (args are already 1D).
+
+    per_row_weight=True `[2026-08-21]` (doc 57 O1): the weight arg is
+    [n_rows*head_dim] and row r is normalized with weight row r. That lets ONE
+    launch normalize Q's n_heads rows with q_norm and K's n_kv_heads rows with
+    k_norm from a host-tiled [q_norm x n_heads; k_norm x n_kv_heads] buffer,
+    which is static, so two launches become one with no kernel change.
+
+    in_total (default n_rows*head_dim): length of the INPUT buffer. Larger than
+    the rows processed when the input is a packed [q | k | v] GEMV output whose
+    first n_rows*head_dim elements are Q|K -- the launch then takes the whole
+    func arg and never reads past row n_rows. (A `memref.subview` + `cast`
+    prelude, the o_gemv_ffn pattern, fails here: with a single use the cast is
+    sunk into the launch region and its subview operand is left outside --
+    "'memref.cast' op using value defined outside the region", devq 459.)
     """
     xrt_dtype = type_mapper(np_dtype)
     total = n_rows * head_dim
+    in_total = total if in_total is None else in_total
+    assert in_total >= total
     herd_y = 1
     total_tiles = herd_x * herd_y
     assert head_dim % vector_size == 0
@@ -284,7 +309,8 @@ def _build_qknorm_1d(n_rows, head_dim, np_dtype, eps, herd_x=8, vector_size=16):
     identity_map = AffineMapAttr.get(AffineMap.get_identity(1))
 
     l3_1d_ty = MemRefType.get([total], xrt_dtype)
-    l3_w_ty = MemRefType.get([head_dim], xrt_dtype)
+    l3_in_ty = MemRefType.get([in_total], xrt_dtype)
+    l3_w_ty = MemRefType.get([total if per_row_weight else head_dim], xrt_dtype)
     l1_mem_space = IntegerAttr.get(T.i32(), MemorySpace.L1)
     l1RowTy = MemRefType.get([head_dim], xrt_dtype, memory_space=l1_mem_space)
     l1VecTyF32 = MemRefType.get([vector_size], f32, memory_space=l1_mem_space)
@@ -313,7 +339,7 @@ def _build_qknorm_1d(n_rows, head_dim, np_dtype, eps, herd_x=8, vector_size=16):
         ],
     )
 
-    @FuncOp.from_py_func(l3_1d_ty, l3_w_ty, l3_1d_ty)
+    @FuncOp.from_py_func(l3_in_ty, l3_w_ty, l3_1d_ty)
     def qknorm_1d(arg0_in, arg1_w, arg2_out):
         @launch(operands=[arg0_in, arg1_w, arg2_out])
         def qkn_launch(l_in, l_w, l_out):
@@ -338,13 +364,14 @@ def _build_qknorm_1d(n_rows, head_dim, np_dtype, eps, herd_x=8, vector_size=16):
                     eps_f = arith.ConstantOp(f32, eps)
                     v_zero_f32 = BroadcastOp(vecTyF32, cst0_f32)
 
-                    dma_memcpy_nd(
-                        l1_w,
-                        h_w,
-                        src_offsets=[0],
-                        src_sizes=[head_dim],
-                        src_strides=[1],
-                    )
+                    if not per_row_weight:
+                        dma_memcpy_nd(
+                            l1_w,
+                            h_w,
+                            src_offsets=[0],
+                            src_sizes=[head_dim],
+                            src_strides=[1],
+                        )
 
                     for local_row in range_(rows_per_tile):
                         row_off = affine_apply(row_offset_map, [local_row, _tx, _ty])
@@ -355,6 +382,14 @@ def _build_qknorm_1d(n_rows, head_dim, np_dtype, eps, herd_x=8, vector_size=16):
                             src_sizes=[head_dim],
                             src_strides=[1],
                         )
+                        if per_row_weight:
+                            dma_memcpy_nd(
+                                l1_w,
+                                h_w,
+                                src_offsets=[row_off],
+                                src_sizes=[head_dim],
+                                src_strides=[1],
+                            )
 
                         transfer_write(
                             None, v_zero_f32, l1_acc, [c0], identity_map, [True]
@@ -795,5 +830,133 @@ def build_rms_qkv_qknorm_rope_gemv_module(
     )
     print(
         f"  rms_qkv_qknorm_rope_gemv module: {len(str(module).splitlines())} lines, parsed OK"
+    )
+    return module
+
+
+# ===========================================================================
+# DECODE (M=1) fused builder, 4 launches `[2026-08-21]` (doc 57 O1, first cut).
+# ===========================================================================
+
+
+def build_rms_qkv_qknorm_rope_gemv4_module(
+    emb_dim,
+    q_dim,
+    kv_dim,
+    n_heads,
+    n_kv_heads,
+    head_dim,
+    tile_m=8,
+    m_input=4,
+    herd_m=8,
+    qknorm_eps=1e-6,
+    herd_x=8,
+):
+    """4-launch decode ELF: the 8-launch `build_rms_qkv_qknorm_rope_gemv_module`
+    with its three GEMVs, two QK-norms and two RoPEs each collapsed to one.
+
+    Doc 57 measured every `air.launch` boundary at ~107 us (section 1.5), so
+    the 8-launch form spends ~0.75 ms of its 1.03 ms per layer in boundaries.
+    This form keeps every kernel (no new C code) and halves the count:
+
+      1. RMSNorm   x_in x norm_w                      -> normed   (emb_dim,)
+      2. QKV GEMV  normed x [wq; wk; wv]              -> qkv      (q_dim+2*kv_dim,)
+      3. QK-norm   qkv[0 : q_dim+kv_dim] viewed as (n_heads+n_kv_heads, head_dim)
+                   rows, weight row r = q_norm (r < n_heads) else k_norm
+                                                       -> qk_n     (q_dim+kv_dim,)
+      4. RoPE      qk_n x lut (the same position LUT tiled n_heads+n_kv_heads x)
+                                                       -> qk_roped (q_dim+kv_dim,)
+
+    The weights are concatenated ROW-wise by the host ONCE (`wqkv = [wq_t; wk_t;
+    wv_t]`, static), the QK-norm weight is tiled once (static), and the LUT is
+    one (n_heads+n_kv_heads) x head_dim tile per position instead of two. The
+    QK-norm launch takes the whole qkv arg and processes its first
+    n_heads+n_kv_heads rows (`in_total`), so V rides in the tail untouched.
+
+    9 args:
+    %arg0  x_in      (emb_dim,)
+    %arg1  norm_w    (emb_dim,)                 static
+    %arg2  normed    (emb_dim,)                 intermediate
+    %arg3  wqkv      (q_dim+2*kv_dim, emb_dim)  static, rows [wq; wk; wv]
+    %arg4  qkv       (q_dim+2*kv_dim,)          q | k | v  (v = qkv[q_dim+kv_dim:], host output)
+    %arg5  qk_norm_w (q_dim+kv_dim,)            static, [q_norm x n_heads; k_norm x n_kv_heads]
+    %arg6  qk_n      (q_dim+kv_dim,)            intermediate
+    %arg7  lut       (q_dim+kv_dim,)            position LUT tiled (n_heads+n_kv_heads) x
+    %arg8  qk_roped  (q_dim+kv_dim,)            q_roped | k_roped (host output)
+    """
+    import shared.builders.rms_gemv_rope_multi as rgr
+    from shared.infra.stitching import stitch_elf, KernelSlice, FuncArg
+    from matvec import build_module as build_gemv
+
+    assert q_dim == n_heads * head_dim
+    assert kv_dim == n_kv_heads * head_dim
+    qk_dim = q_dim + kv_dim
+    qkv_dim = q_dim + 2 * kv_dim
+    n_qk_rows = n_heads + n_kv_heads
+    assert n_qk_rows % herd_x == 0, (n_qk_rows, herd_x)
+
+    _saved_eps = rgr.EPS
+    rgr.EPS = qknorm_eps
+    try:
+        print("  [1/4] RMSNorm (decode 1D, eps=%g)..." % qknorm_eps)
+        rms_ir = str(rgr._build_rms_1d(emb_dim, bfloat16, 16))
+    finally:
+        rgr.EPS = _saved_eps
+
+    print(f"  [2/4] QKV GEMV M={qkv_dim} K={emb_dim} (one launch over [wq; wk; wv])...")
+    qkv_ir = str(
+        build_gemv(qkv_dim, emb_dim, tile_m, m_input, herd_m, bfloat16, bfloat16)
+    )
+    print(
+        f"  [3/4] QK-norm Q|K (rows={n_qk_rows} dim={head_dim} eps={qknorm_eps}, per-row weight)..."
+    )
+    qkn_ir = str(
+        _build_qknorm_1d(
+            n_qk_rows,
+            head_dim,
+            bfloat16,
+            qknorm_eps,
+            herd_x,
+            per_row_weight=True,
+            in_total=qkv_dim,
+        )
+    )
+    print(f"  [4/4] RoPE Q|K (rows={n_qk_rows} dim={head_dim})...")
+    rope_ir = str(rgr._build_rope_1d(n_qk_rows, head_dim, bfloat16, herd_x=herd_x))
+
+    base_args = [
+        FuncArg("%arg0", f"memref<{emb_dim}xbf16>"),
+        FuncArg("%arg1", f"memref<{emb_dim}xbf16>"),
+        FuncArg("%arg2", f"memref<{emb_dim}xbf16>"),
+        FuncArg("%arg3", f"memref<{qkv_dim}x{emb_dim}xbf16>"),
+        FuncArg("%arg4", f"memref<{qkv_dim}xbf16>"),
+        FuncArg("%arg5", f"memref<{qk_dim}xbf16>"),
+        FuncArg("%arg6", f"memref<{qk_dim}xbf16>"),
+        FuncArg("%arg7", f"memref<{qk_dim}xbf16>"),
+        FuncArg("%arg8", f"memref<{qk_dim}xbf16>"),
+    ]
+    slices = [
+        KernelSlice(rms_ir, "r", {0: 0, 1: 1, 2: 2}, private_from=False),
+        KernelSlice(qkv_ir, "qkv", {0: 3, 1: 2, 2: 4}),
+        # QK-norm takes the WHOLE qkv arg (in_total=qkv_dim) and reads rows
+        # [0, n_heads+n_kv_heads) only; V in the tail is never touched.
+        KernelSlice(qkn_ir, "qkn", {0: 4, 1: 5, 2: 6}, private_from=False),
+        KernelSlice(rope_ir, "rp", {0: 6, 1: 7, 2: 8}, extern_syms={"@rope"}),
+    ]
+    module = stitch_elf(
+        "rms_qkv_qknorm_rope_gemv",
+        base_args,
+        slices,
+        extra_externs={
+            "@zero_vectorized_bf16",
+            "@matvec_vectorized_bf16_bf16",
+            "@linalg_fill_bf16",
+            "@rope",
+        },
+        debug_dump_path="/tmp/debug_rms_qkv_qknorm_rope_gemv4.mlir",
+    )
+    print(
+        f"  rms_qkv_qknorm_rope_gemv4 module: {len(str(module).splitlines())} lines, "
+        f"4 launches, parsed OK"
     )
     return module
