@@ -48,10 +48,22 @@ from qwen3_1_7b_weights import LlamaConfig
 from shared.infra.cache import KernelCache
 
 
-def build_rms_qkv_qknorm_rope_gemv_module(config):
-    """Fused decode ELF: RMSNorm + Q/K/V GEMV + per-head QK-norm + RoPE (M=1)."""
+# The decode QKV stage ELF. `[2026-08-21]` 4 launches (doc 57 O1 first cut,
+# ported from qwen3_0_6b): RMSNorm, ONE GEMV over [wq; wk; wv], ONE per-row-
+# weighted QK-norm over Q|K, ONE RoPE over Q|K -- same kernels as the 8-launch
+# form, four fewer ~107 us air.launch boundaries per layer. The artifact name
+# carries the launch count so a stale 8-launch cache cannot bind to this ABI.
+_RMS_QKV_KERNEL = "rms_qkv_qknorm_rope_gemv4"
+
+
+def build_rms_qkv_qknorm_rope_gemv_module(config, n_launches=4):
+    """Fused decode ELF: RMSNorm + Q/K/V GEMV + per-head QK-norm + RoPE (M=1).
+
+    n_launches=4 is production; 8 is the pre-2026-08-21 form (kept for A/B).
+    """
     from shared.builders.rms_qkv_qknorm_rope_multi import (
-        build_rms_qkv_qknorm_rope_gemv_module as _build,
+        build_rms_qkv_qknorm_rope_gemv_module as _build8,
+        build_rms_qkv_qknorm_rope_gemv4_module as _build4,
     )
 
     emb_dim = config.emb_dim
@@ -60,8 +72,24 @@ def build_rms_qkv_qknorm_rope_gemv_module(config):
     head_dim = config.head_dim
     q_dim = n_heads * head_dim
     kv_dim = n_kv_heads * head_dim
-    return _build(
+    build = {4: _build4, 8: _build8}[n_launches]
+    return build(
         emb_dim, q_dim, kv_dim, n_heads, n_kv_heads, head_dim, qknorm_eps=1e-6
+    )
+
+
+# Host side of the 4-launch stage: shared.infra.decode_qkv4 owns the 9-arg layout.
+from shared.infra import decode_qkv4 as _qkv4  # noqa: E402
+
+prep_rms_qkv4_weights = _qkv4.prep_weights
+rms_qkv4_lut = _qkv4.position_lut
+
+
+def run_rms_qkv4(cache, lw, x_bf16, lut, config, layer_idx, verbose=False):
+    """One call of the 4-launch QKV stage -> (v, q_roped, k_roped)."""
+    return _qkv4.run(
+        cache, _RMS_QKV_KERNEL, _rms_qkv_qknorm_rope_gemv_backend(verbose),
+        lw, x_bf16, lut, config, layer_idx,
     )
 
 
@@ -194,7 +222,11 @@ def build_lm_head_gemv_qwen_module(emb_dim):
         n_partitions=_LM_N_PARTITIONS,
         n_part=_LM_N_PART,
         tile_m=8,
-        m_input=4,
+        # m_input 8: one kernel call per 8-row tile, B-broadcast repeat ~127;
+        # 8.5 % faster than m_input 4 at the same launch count and bytes on
+        # qwen3_0_6b (doc 57 section 1.4 / section 5 item 3c, -1.0 ms/token,
+        # verify PASS); gated here by this model's own `make verify`.
+        m_input=8,
         herd_m=8,
     )
 
@@ -250,10 +282,10 @@ def compile_decode_kernels(cache, config, verbose=False):
     compile_silu_and_mul()
 
     print(
-        "\n--- rms_qkv_qknorm_rope_gemv (FUSED: RMSNorm+QKV+QK-norm+RoPE, 8 launches) ---"
+        f"\n--- {_RMS_QKV_KERNEL} (FUSED: RMSNorm+QKV+QK-norm+RoPE, 4 launches) ---"
     )
     cache.compile_and_cache(
-        "rms_qkv_qknorm_rope_gemv",
+        _RMS_QKV_KERNEL,
         build_rms_qkv_qknorm_rope_gemv_module(config),
         _rms_qkv_qknorm_rope_gemv_backend(verbose),
     )
@@ -331,58 +363,20 @@ def run_decode_block(
 ):
     """Run one Qwen3 transformer block for a single decode token.
 
-    Stages: rms_qkv_qknorm_rope_gemv (NPU: RMSNorm + Q/K/V GEMV + per-head
-    QK-norm + RoPE) -> KV-cache write -> CPU attention -> o_gemv_ffn (NPU).
+    Stages: rms_qkv_qknorm_rope_gemv4 (NPU, 4 launches: RMSNorm + QKV GEMV +
+    per-head QK-norm + RoPE) -> KV-cache write -> CPU attention -> o_gemv_ffn (NPU).
     """
-    emb_dim = config.emb_dim
     n_heads = config.n_heads
     n_kv_heads = config.n_kv_heads
     head_dim = config.head_dim
-    q_dim = n_heads * head_dim
-    kv_dim = n_kv_heads * head_dim
 
     layer_idx = getattr(layer_weights, "_layer_idx", None)
 
-    # RoPE LUT for this position (position-dependent — NOT static).
-    rope_lut_pos = rope_lut_bf16[current_pos : current_pos + 1]  # (1, head_dim)
-    lut_q = np.tile(rope_lut_pos, (n_heads, 1)).flatten().astype(bfloat16)
-    lut_k = np.tile(rope_lut_pos, (n_kv_heads, 1)).flatten().astype(bfloat16)
-
-    # --- One ELF = RMSNorm + Q/K/V GEMV + per-head QK-norm + RoPE ---
-    res = cache.load_and_run(
-        "rms_qkv_qknorm_rope_gemv",
-        _rms_qkv_qknorm_rope_gemv_backend(verbose),
-        x_bf16.flatten().astype(bfloat16),  # 0 x_in
-        layer_weights.attn_norm.reshape(emb_dim).astype(bfloat16),  # 1 norm_w (static)
-        np.zeros(emb_dim, dtype=bfloat16),  # 2 normed
-        layer_weights._wq_t,  # 3 wq (static)
-        np.zeros(q_dim, dtype=bfloat16),  # 4 q
-        layer_weights._wk_t,  # 5 wk (static)
-        np.zeros(kv_dim, dtype=bfloat16),  # 6 k
-        layer_weights._wv_t,  # 7 wv (static)
-        np.zeros(kv_dim, dtype=bfloat16),  # 8 v
-        np.asarray(layer_weights.q_norm, bfloat16).reshape(
-            head_dim
-        ),  # 9 q_norm (static)
-        np.asarray(layer_weights.k_norm, bfloat16).reshape(
-            head_dim
-        ),  # 10 k_norm (static)
-        np.zeros(q_dim, dtype=bfloat16),  # 11 q_n
-        np.zeros(kv_dim, dtype=bfloat16),  # 12 k_n
-        lut_q,  # 13 lut_q (DYNAMIC — position-dependent)
-        lut_k,  # 14 lut_k (DYNAMIC)
-        np.zeros(q_dim, dtype=bfloat16),  # 15 q_roped
-        np.zeros(kv_dim, dtype=bfloat16),  # 16 k_roped
-        output_indices=[8, 15, 16],
-        static_input_indices={1, 3, 5, 7, 9, 10},
-        intermediate_indices={2, 4, 6, 8, 11, 12, 15, 16},
-        bo_key=(
-            f"rms_qkv_qknorm_rope_gemv_L{layer_idx}" if layer_idx is not None else None
-        ),
+    # --- One ELF (4 launches) = RMSNorm + QKV GEMV + per-head QK-norm + RoPE ---
+    lut = rms_qkv4_lut(rope_lut_bf16, current_pos, config)
+    v, q_roped, k_roped = run_rms_qkv4(
+        cache, layer_weights, x_bf16, lut, config, layer_idx, verbose
     )
-    v = res[8].astype(bfloat16)
-    q_roped = res[15].astype(bfloat16)
-    k_roped = res[16].astype(bfloat16)
 
     # --- Update KV cache (K after qk-norm AND rope; V raw projection) ---
     k_cache_layer[:, current_pos, :] = k_roped.reshape(n_kv_heads, head_dim)

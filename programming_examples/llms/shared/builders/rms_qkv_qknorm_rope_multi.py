@@ -851,9 +851,16 @@ def build_rms_qkv_qknorm_rope_gemv4_module(
     herd_m=8,
     qknorm_eps=1e-6,
     herd_x=8,
+    host_rmsnorm=False,
 ):
     """4-launch decode ELF: the 8-launch `build_rms_qkv_qknorm_rope_gemv_module`
     with its three GEMVs, two QK-norms and two RoPEs each collapsed to one.
+
+    host_rmsnorm=True `[2026-08-21]` (doc 57 O1, second cut): the RMSNorm launch
+    is dropped and arg0 is the already-normalized vector -- the host computes
+    bf16(x * rsqrt(mean(x^2) + eps) * norm_w) over emb_dim elements (~10 us)
+    instead of the device paying a ~107 us launch boundary for it. 3 launches,
+    7 args: 0 normed, 1 wqkv, 2 qkv, 3 qk_norm_w, 4 qk_n, 5 lut, 6 qk_roped.
 
     Doc 57 measured every `air.launch` boundary at ~107 us (section 1.5), so
     the 8-launch form spends ~0.75 ms of its 1.03 ms per layer in boundaries.
@@ -895,13 +902,14 @@ def build_rms_qkv_qknorm_rope_gemv4_module(
     n_qk_rows = n_heads + n_kv_heads
     assert n_qk_rows % herd_x == 0, (n_qk_rows, herd_x)
 
-    _saved_eps = rgr.EPS
-    rgr.EPS = qknorm_eps
-    try:
-        print("  [1/4] RMSNorm (decode 1D, eps=%g)..." % qknorm_eps)
-        rms_ir = str(rgr._build_rms_1d(emb_dim, bfloat16, 16))
-    finally:
-        rgr.EPS = _saved_eps
+    if not host_rmsnorm:
+        _saved_eps = rgr.EPS
+        rgr.EPS = qknorm_eps
+        try:
+            print("  [1/4] RMSNorm (decode 1D, eps=%g)..." % qknorm_eps)
+            rms_ir = str(rgr._build_rms_1d(emb_dim, bfloat16, 16))
+        finally:
+            rgr.EPS = _saved_eps
 
     print(f"  [2/4] QKV GEMV M={qkv_dim} K={emb_dim} (one launch over [wq; wk; wv])...")
     qkv_ir = str(
@@ -924,25 +932,41 @@ def build_rms_qkv_qknorm_rope_gemv4_module(
     print(f"  [4/4] RoPE Q|K (rows={n_qk_rows} dim={head_dim})...")
     rope_ir = str(rgr._build_rope_1d(n_qk_rows, head_dim, bfloat16, herd_x=herd_x))
 
-    base_args = [
-        FuncArg("%arg0", f"memref<{emb_dim}xbf16>"),
-        FuncArg("%arg1", f"memref<{emb_dim}xbf16>"),
-        FuncArg("%arg2", f"memref<{emb_dim}xbf16>"),
-        FuncArg("%arg3", f"memref<{qkv_dim}x{emb_dim}xbf16>"),
-        FuncArg("%arg4", f"memref<{qkv_dim}xbf16>"),
-        FuncArg("%arg5", f"memref<{qk_dim}xbf16>"),
-        FuncArg("%arg6", f"memref<{qk_dim}xbf16>"),
-        FuncArg("%arg7", f"memref<{qk_dim}xbf16>"),
-        FuncArg("%arg8", f"memref<{qk_dim}xbf16>"),
-    ]
-    slices = [
-        KernelSlice(rms_ir, "r", {0: 0, 1: 1, 2: 2}, private_from=False),
-        KernelSlice(qkv_ir, "qkv", {0: 3, 1: 2, 2: 4}),
-        # QK-norm takes the WHOLE qkv arg (in_total=qkv_dim) and reads rows
-        # [0, n_heads+n_kv_heads) only; V in the tail is never touched.
-        KernelSlice(qkn_ir, "qkn", {0: 4, 1: 5, 2: 6}, private_from=False),
-        KernelSlice(rope_ir, "rp", {0: 6, 1: 7, 2: 8}, extern_syms={"@rope"}),
-    ]
+    if host_rmsnorm:
+        base_args = [
+            FuncArg("%arg0", f"memref<{emb_dim}xbf16>"),  # normed (host)
+            FuncArg("%arg1", f"memref<{qkv_dim}x{emb_dim}xbf16>"),
+            FuncArg("%arg2", f"memref<{qkv_dim}xbf16>"),
+            FuncArg("%arg3", f"memref<{qk_dim}xbf16>"),
+            FuncArg("%arg4", f"memref<{qk_dim}xbf16>"),
+            FuncArg("%arg5", f"memref<{qk_dim}xbf16>"),
+            FuncArg("%arg6", f"memref<{qk_dim}xbf16>"),
+        ]
+        slices = [
+            KernelSlice(qkv_ir, "qkv", {0: 1, 1: 0, 2: 2}),
+            KernelSlice(qkn_ir, "qkn", {0: 2, 1: 3, 2: 4}, private_from=False),
+            KernelSlice(rope_ir, "rp", {0: 4, 1: 5, 2: 6}, extern_syms={"@rope"}),
+        ]
+    else:
+        base_args = [
+            FuncArg("%arg0", f"memref<{emb_dim}xbf16>"),
+            FuncArg("%arg1", f"memref<{emb_dim}xbf16>"),
+            FuncArg("%arg2", f"memref<{emb_dim}xbf16>"),
+            FuncArg("%arg3", f"memref<{qkv_dim}x{emb_dim}xbf16>"),
+            FuncArg("%arg4", f"memref<{qkv_dim}xbf16>"),
+            FuncArg("%arg5", f"memref<{qk_dim}xbf16>"),
+            FuncArg("%arg6", f"memref<{qk_dim}xbf16>"),
+            FuncArg("%arg7", f"memref<{qk_dim}xbf16>"),
+            FuncArg("%arg8", f"memref<{qk_dim}xbf16>"),
+        ]
+        slices = [
+            KernelSlice(rms_ir, "r", {0: 0, 1: 1, 2: 2}, private_from=False),
+            KernelSlice(qkv_ir, "qkv", {0: 3, 1: 2, 2: 4}),
+            # QK-norm takes the WHOLE qkv arg (in_total=qkv_dim) and reads rows
+            # [0, n_heads+n_kv_heads) only; V in the tail is never touched.
+            KernelSlice(qkn_ir, "qkn", {0: 4, 1: 5, 2: 6}, private_from=False),
+            KernelSlice(rope_ir, "rp", {0: 6, 1: 7, 2: 8}, extern_syms={"@rope"}),
+        ]
     module = stitch_elf(
         "rms_qkv_qknorm_rope_gemv",
         base_args,
@@ -956,7 +980,7 @@ def build_rms_qkv_qknorm_rope_gemv4_module(
         debug_dump_path="/tmp/debug_rms_qkv_qknorm_rope_gemv4.mlir",
     )
     print(
-        f"  rms_qkv_qknorm_rope_gemv4 module: {len(str(module).splitlines())} lines, "
-        f"4 launches, parsed OK"
+        f"  rms_qkv_qknorm_rope_gemv{3 if host_rmsnorm else 4} module: "
+        f"{len(str(module).splitlines())} lines, {3 if host_rmsnorm else 4} launches, parsed OK"
     )
     return module

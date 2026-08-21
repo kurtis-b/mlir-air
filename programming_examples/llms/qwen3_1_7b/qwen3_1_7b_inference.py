@@ -39,7 +39,8 @@ from qwen3_1_7b_prefill import (
 from qwen3_1_7b_decode import (
     compile_decode_kernels,
     run_decode_block,
-    _rms_qkv_qknorm_rope_gemv_backend,
+    run_rms_qkv4,
+    prep_rms_qkv4_weights,
     _o_gemv_ffn_backend,
     _lm_gemv_backend,
     _LM_N_PARTITIONS,
@@ -132,6 +133,10 @@ def prepare_runtime(
             lw._wdown_t = np.ascontiguousarray(
                 lw.w_down.astype(bfloat16).reshape(hidden_dim, emb_dim).T
             )  # (emb, hidden)
+            # 4-launch QKV stage: packed [wq; wk; wv] + tiled QK-norm weight,
+            # then drop the three separate transposes (one resident copy).
+            prep_rms_qkv4_weights(lw, config)
+            del lw._wq_t, lw._wk_t, lw._wv_t
         weights._decode_weights_transposed = True
 
     # 2. Tag layer index for per-layer BO isolation.
@@ -193,39 +198,14 @@ def _preload_decode_weights(decode_cache, weights, config):
     _was = decode_cache.profiler.enabled
     decode_cache.profiler.enabled = False
 
-    lut_q_dummy = np.zeros(n_heads * head_dim, dtype=bfloat16)
-    lut_k_dummy = np.zeros(n_kv_heads * head_dim, dtype=bfloat16)
+    lut_dummy = np.zeros((n_heads + n_kv_heads) * head_dim, dtype=bfloat16)
 
     for li in range(config.n_layers):
         lw = weights.layers[li]
 
-        # Fused decode ELF warmup (RMSNorm+QKV GEMV+QK-norm+RoPE). LUTs
-        # (args 13/14) are position-dependent -> NOT static.
-        decode_cache.load_and_run(
-            "rms_qkv_qknorm_rope_gemv",
-            _rms_qkv_qknorm_rope_gemv_backend(),
-            np.zeros(emb_dim, dtype=bfloat16),  # 0 x_in
-            lw.attn_norm.reshape(emb_dim).astype(bfloat16),  # 1 norm_w (static)
-            np.zeros(emb_dim, dtype=bfloat16),  # 2 normed
-            lw._wq_t,  # 3 wq (static)
-            np.zeros(q_dim, dtype=bfloat16),  # 4 q
-            lw._wk_t,  # 5 wk (static)
-            np.zeros(kv_dim, dtype=bfloat16),  # 6 k
-            lw._wv_t,  # 7 wv (static)
-            np.zeros(kv_dim, dtype=bfloat16),  # 8 v
-            np.asarray(lw.q_norm, bfloat16).reshape(head_dim),  # 9 q_norm (static)
-            np.asarray(lw.k_norm, bfloat16).reshape(head_dim),  # 10 k_norm (static)
-            np.zeros(q_dim, dtype=bfloat16),  # 11 q_n
-            np.zeros(kv_dim, dtype=bfloat16),  # 12 k_n
-            lut_q_dummy,  # 13 lut_q (dynamic)
-            lut_k_dummy,  # 14 lut_k (dynamic)
-            np.zeros(q_dim, dtype=bfloat16),  # 15 q_roped
-            np.zeros(kv_dim, dtype=bfloat16),  # 16 k_roped
-            output_indices=[8, 15, 16],
-            static_input_indices={1, 3, 5, 7, 9, 10},
-            intermediate_indices={2, 4, 6, 8, 11, 12, 15, 16},
-            bo_key=f"rms_qkv_qknorm_rope_gemv_L{li}",
-        )
+        # Fused decode ELF warmup (4 launches: RMSNorm+QKV GEMV+QK-norm+RoPE).
+        # The LUT (arg 7) is position-dependent -> NOT static.
+        run_rms_qkv4(decode_cache, lw, np.zeros(emb_dim, dtype=bfloat16), lut_dummy, config, li)
 
         # o_gemv_ffn: build interleaved w_gateup + packed RMS-input buffer.
         wgateup = np.empty((2 * hidden_dim, emb_dim), dtype=bfloat16)

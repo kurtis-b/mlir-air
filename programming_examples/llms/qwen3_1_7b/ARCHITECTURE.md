@@ -33,7 +33,7 @@ once: (HOST) final RMSNorm → [NPU elf:lm_head_gemv] (19 partitions ×8192, voc
 **Decode — 2 NPU ELFs/layer (+ lm_head once/token):**
 
 ```
-x ─[NPU elf:rms_qkv_qknorm_rope_gemv]   FUSED, 1 ELF
+x ─[NPU elf:rms_qkv_qknorm_rope_gemv4]   FUSED, 1 ELF, 4 launches (was 8 before 2026-08-21; ~107 us per air.launch boundary)
       { RMSNorm + Q/K/V GEMV + QK-norm(Q,K) + RoPE-Q/K }   (RoPE LUT per-position, NOT a static BO)
   (HOST) KV-cache write → (HOST) decode_attention_cpu (single-token GQA over KV cache)
   ─[NPU elf:o_gemv_ffn]   FUSED cascade, 1 ELF

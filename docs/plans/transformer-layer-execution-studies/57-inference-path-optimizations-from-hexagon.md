@@ -378,6 +378,17 @@ H2/H3 phases measure.
    `memref.cast` prelude that `o_gemv_ffn_multi` uses fails when the alias has ONE use
    (`'memref.cast' op using value defined outside the region` — the cast is sunk into the
    launch region, its subview is not; devq 459), hence `in_total`.
+   **Ported to Qwen3-1.7B the same day** (devq 465–470; emb 2048, same head geometry):
+   stage probe 1.326 → 0.873 ms/layer (113 µs per boundary), `make verify` PASS with the
+   4-launch stage (devq 466) and again with `m_input = 8` on its LM head (469); `make profile
+   N_TOKENS=32` ×2: `rms_qkv` **0.80 ms**, `o_gemv_ffn` 2.67, LM head 16.4 → **15.9–16.2 ms**
+   (K = 2048 gains less from `m_input = 8` than K = 1024 did, and the two reps straddle the
+   noise), per layer ~4.0 ms, layer loop 3554–3647 ms / 32 tokens — **≈127–130 ms per 1.7B
+   token** under recorded Turbo, the first such number (the June table is pmode-unrecorded;
+   the stage A/B says the 8-launch form was ≈12.7 ms/token slower). Qwen3-4B keeps the
+   8-launch builder: its verify is oomd-deferred, so the port cannot be gated. The host side
+   of the 4-launch stage now lives in `shared/infra/decode_qkv4.py` (one owner of the 9-arg
+   layout for every Qwen3 driver).
    **What is left of O1** (the predicted ~0.4 ms needs 4 → 1–2): the RMSNorm launch
    (1 boundary; fold as a prologue on the broadcast `x` or precompute `rstd` host-side) and
    the QK-norm + RoPE pair (2 boundaries; an epilogue needs each column to own whole heads,

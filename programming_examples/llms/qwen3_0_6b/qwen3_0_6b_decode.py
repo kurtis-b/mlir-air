@@ -81,86 +81,30 @@ def build_rms_qkv_qknorm_rope_gemv_module(config, n_launches=4):
     )
 
 
-def prep_rms_qkv4_weights(lw, config):
-    """Host-side, once per layer: the 4-launch ELF's two packed static buffers.
+# Host side of the 4-launch stage: shared.infra.decode_qkv4 owns the 9-arg
+# layout; these are the model driver's thin names for it.
+from shared.infra import decode_qkv4 as _qkv4  # noqa: E402
 
-    `_wqkv_t` = [wq_t; wk_t; wv_t] (q_dim+2*kv_dim, emb_dim) -- row-concatenated
-    GEMV weights; `_qk_norm_w` = [q_norm x n_heads; k_norm x n_kv_heads]
-    (q_dim+kv_dim,) -- the per-row QK-norm weight. Idempotent.
-    """
-    if getattr(lw, "_wqkv_t", None) is not None:
-        return
-    head_dim = config.head_dim
-    lw._wqkv_t = np.ascontiguousarray(
-        np.concatenate([lw._wq_t, lw._wk_t, lw._wv_t], axis=0)
-    )
-    lw._qk_norm_w = np.ascontiguousarray(
-        np.concatenate(
-            [
-                np.tile(np.asarray(lw.q_norm, bfloat16).reshape(head_dim), config.n_heads),
-                np.tile(np.asarray(lw.k_norm, bfloat16).reshape(head_dim), config.n_kv_heads),
-            ]
-        ).astype(bfloat16)
-    )
-
-
-def rms_qkv4_lut(rope_lut_bf16, current_pos, config):
-    """The position's RoPE LUT row tiled over the n_heads+n_kv_heads Q|K rows."""
-    pos = rope_lut_bf16[current_pos : current_pos + 1]  # (1, head_dim)
-    return np.tile(pos, (config.n_heads + config.n_kv_heads, 1)).flatten().astype(bfloat16)
+prep_rms_qkv4_weights = _qkv4.prep_weights
+rms_qkv4_lut = _qkv4.position_lut
 
 
 def rms_qkv4_args(lw, x_bf16, lut, config):
-    """The 4-launch ELF's 9-arg call, single owner of its index layout.
-
-    Returns (inputs, output_indices, static_input_indices, intermediate_indices);
-    the outputs are arg4 qkv = q | k | v and arg8 qk_roped = q_roped | k_roped.
-    """
-    prep_rms_qkv4_weights(lw, config)
-    emb_dim = config.emb_dim
-    q_dim = config.n_heads * config.head_dim
-    kv_dim = config.n_kv_heads * config.head_dim
-    qk_dim = q_dim + kv_dim
-    inputs = [
-        np.asarray(x_bf16).flatten().astype(bfloat16),  # 0 x_in
-        lw.attn_norm.reshape(emb_dim).astype(bfloat16),  # 1 norm_w (static)
-        np.zeros(emb_dim, dtype=bfloat16),  # 2 normed
-        lw._wqkv_t,  # 3 wqkv (static)
-        np.zeros(qk_dim + kv_dim, dtype=bfloat16),  # 4 qkv
-        lw._qk_norm_w,  # 5 qk_norm_w (static)
-        np.zeros(qk_dim, dtype=bfloat16),  # 6 qk_n
-        np.asarray(lut, bfloat16),  # 7 lut (DYNAMIC -- position)
-        np.zeros(qk_dim, dtype=bfloat16),  # 8 qk_roped
-    ]
-    return inputs, [4, 8], {1, 3, 5}, {2, 4, 6, 8}
-
-
-def rms_qkv4_split(res, config):
-    """(v, q_roped, k_roped) from the 4-launch ELF's outputs."""
-    q_dim = config.n_heads * config.head_dim
-    kv_dim = config.n_kv_heads * config.head_dim
-    qkv = np.asarray(res[4]).astype(bfloat16)
-    qk_roped = np.asarray(res[8]).astype(bfloat16)
+    """(inputs, output_indices, static_input_indices, intermediate_indices)."""
     return (
-        np.ascontiguousarray(qkv[q_dim + kv_dim :]),
-        np.ascontiguousarray(qk_roped[:q_dim]),
-        np.ascontiguousarray(qk_roped[q_dim:]),
+        _qkv4.call_args(lw, x_bf16, lut, config),
+        _qkv4.OUTPUT_INDICES,
+        _qkv4.STATIC_INDICES,
+        _qkv4.INTERMEDIATE_INDICES,
     )
 
 
 def run_rms_qkv4(cache, lw, x_bf16, lut, config, layer_idx, verbose=False):
     """One call of the 4-launch QKV stage -> (v, q_roped, k_roped)."""
-    inputs, out_idx, static, inter = rms_qkv4_args(lw, x_bf16, lut, config)
-    res = cache.load_and_run(
-        _RMS_QKV_KERNEL,
-        _rms_qkv_qknorm_rope_gemv_backend(verbose),
-        *inputs,
-        output_indices=out_idx,
-        static_input_indices=static,
-        intermediate_indices=inter,
-        bo_key=f"{_RMS_QKV_KERNEL}_L{layer_idx}" if layer_idx is not None else None,
+    return _qkv4.run(
+        cache, _RMS_QKV_KERNEL, _rms_qkv_qknorm_rope_gemv_backend(verbose),
+        lw, x_bf16, lut, config, layer_idx,
     )
-    return rms_qkv4_split(res, config)
 
 
 def _rms_qkv_qknorm_rope_gemv_backend(verbose=False):
