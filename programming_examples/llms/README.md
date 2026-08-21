@@ -10,7 +10,7 @@ multi-launch ELFs and gates correctness against a Hugging Face bf16 reference.
 | Model | HF checkpoint | Layers | emb / head_dim / hidden | Attention | Family delta | Status |
 |---|---|---|---|---|---|---|
 | **Llama-3.2-1B** | `meta-llama/Llama-3.2-1B` | 16 | 2048 / 64 / 8192 | GQA 32Q/8KV | reference exemplar | prefill + decode |
-| **Llama-3.2-1B int4-AWQ** | `amd/Llama-3.2-1B-Instruct-awq-...` | 16 | 2048 / 64 / 8192 | GQA 32Q/8KV | int4-AWQ (prefill) | prefill; decode follow-up |
+| **Llama-3.2-1B int4-AWQ** | `amd/Llama-3.2-1B-Instruct-awq-...` | 16 | 2048 / 64 / 8192 | GQA 32Q/8KV | int4-AWQ (bf16 prefill on dequantized AWQ + int4 NPU decode) | prefill + decode (`make run-inference`, ~17.8 tok/s) |
 | **SmolLM2-1.7B** | `HuggingFaceTB/SmolLM2-1.7B` | 24 | 2048 / 64 / 8192 | MHA 32Q/32KV | pure MHA | prefill + decode |
 | **Qwen2.5-0.5B** | `Qwen/Qwen2.5-0.5B` | 24 | 896 / 64 / 4864 | GQA 14Q/2KV | QKV bias | prefill + decode |
 | **Qwen2.5-1.5B** | `Qwen/Qwen2.5-1.5B` | 28 | 1536 / 128 / 8960 | GQA 12Q/2KV | QKV bias, hd=128 | prefill + decode |

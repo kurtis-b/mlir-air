@@ -6,9 +6,12 @@ NPU2 (AIE2P) hardware via MLIR-AIR, with a top-K correctness gate
 against a CPU bf16 reference built from the same dequantized weights.
 
 The example ships two prefill backends behind a `--prefill-dtype` flag.
-The bf16 path is the recommended one for prefill today; the int4 path
-is preserved so the int4 decode driver (a separate follow-up PR) can
-share this directory and the AWQ packer.
+The bf16 path is the recommended one for prefill today; the int4 prefill
+path is preserved for its kernel work. End-to-end inference
+(`llama32_1b_int4_inference.py`, `make run-inference` / `make chat`) runs
+bf16 NPU prefill on dequantized AWQ weights followed by **int4 NPU decode**
+(`rms_qkv_int4_rope` + `o_gemv_ffn_int4` ELFs), ~56 ms/token (17.8 tok/s)
+on NPU2 per the Makefile header.
 
 ## Performance
 
@@ -29,8 +32,12 @@ kernel:
 - Peano AIE2P `VLD_x_pstm_nrm_imm` 9-bit immediate range forces
   `tile_n=16` (16× more launch iterations than bf16's `tile_n=128`).
 
-Decode is DMA-bandwidth-bound and benefits from int4's halved weight
-footprint; the int4 decode driver lives in a follow-up PR.
+Decode streams int4 weights (a 4× narrower payload than bf16 before
+scales/zero-points); the int4 decode driver is `llama32_1b_int4_decode.py`,
+wired by `llama32_1b_int4_inference.py`, and measures ~56 ms/token (17.8
+tok/s) against the bf16 sibling's 12.2 tok/s — 1.46×, not the ~4× the byte
+ratio alone would predict; attributing the rest is an open item
+(docs/plans/transformer-layer-execution-studies/56 §4 H2a).
 
 ## Prerequisites
 
@@ -82,10 +89,10 @@ make verify-full
 make diagnosis
 ```
 
-`make {verify,verify-full,diagnosis}` are decode-independent and run on
-either backend (`PREFILL_DTYPE=bf16` or `int4`). `make chat` is not yet
-present — it requires the int4 autoregressive decode driver, which
-lands in a follow-up.
+`make {verify-prefill,verify-prefill-full}` are decode-independent and run on
+either backend (`PREFILL_DTYPE=bf16` or `int4`); `make verify` runs the full
+bf16-prefill + int4-decode path through the shared `verify/` gate, and
+`make chat` is the interactive REPL over the same path.
 
 ## Key Files
 
