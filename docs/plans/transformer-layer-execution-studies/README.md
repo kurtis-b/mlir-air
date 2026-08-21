@@ -232,7 +232,9 @@ each a same-session before/after under recorded Turbo), and **§1.1's correction
 bf16 decode 77 ms/token (12.96–13.12 tok/s), devq 486, idle host, Turbo**. **Do not cite** the June
 `llms/` table nor Hexagon's figures as like-for-like.
 
-**What a next session can pick up, by value per hour:**
+**What a next session can pick up, by value per hour** (the loop that wrote this stopped here on
+purpose: the remaining items are multi-hour builds with no gate-able 30-minute increment, and
+belong to a fresh context):
 
 1. ~~Re-profile the current tree~~ done: Qwen3-0.6B **77 ms/token** (devq 486), Qwen3-1.7B
    **128–130 ms/token** (devq 487).
@@ -247,8 +249,8 @@ bf16 decode 77 ms/token (12.96–13.12 tok/s), devq 486, idle host, Turbo**. **D
    with a faster int4 GEMV.
 5. **Doc 56 H1a** (model adapter + runner, schema v3, the kernel-scaling curve) — the planner's
    `Plan.sha` is ready to be its artifact key.
-6. Port the mixed-partition head to Llama-1B (2,816 pad rows, ~0.36 ms) and Qwen3-1.7B
-   (same vocab; needs its own verify).
+6. Port the mixed-partition head to Llama-1B (2,816 pad rows, ~0.36 ms); ~~Qwen3-1.7B~~ done
+   (devq 485 / 487).
 7. The morning list's operator items: the iron latency gap, the big-three leg, the doc rewrite, R1.
 
 ## `[2026-08-20, evening]` Where things stand, for a session picking this up cold
