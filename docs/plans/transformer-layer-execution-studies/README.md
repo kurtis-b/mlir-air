@@ -171,6 +171,84 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | **Doc 56 H0 — the analytical planner, host-only** | `llms/shared/plan/test_plan.py`, pinned in `run_seam_tests.lit` (`PLAN: 10/10`) | **done** 2026-08-21 ([56 §4](56-full-model-mixed-precision-study-plan.md)). `ModelGraph` + golden JSON for Qwen3-0.6B / Llama-1B; `plan()` reproduces both drivers' shipped ELF sequences, launch counts and host split from structure (fused-cast = +1 cast launch; lean-form predicate; LM-head pin), `study_skip` ≡ `profiles.skip_reason` over every family, solver vs registry 61 / 136 identical with every mismatch in a named class. One finding: the Qwen3-0.6B LM head at `m_input = 8` could be 10 × 16384 instead of 19 × 8192 (−9 boundaries ≈ −1 ms/token, untested) |
 | **LM head re-partitioned from the planner's finding: 19 × 8192 → 9 × 16384 + 4480** | probe (exact, −1.10 ms), `make verify`, `make profile` ×2 | **done, landed** 2026-08-21 (devq 476 / 478 / 479, [57 §5 item 5b](57-inference-path-optimizations-from-hexagon.md)). Verify PASS; `lm_head_gemv` kernel **8.79 → 7.90 ms** per token, ELF 8.3 → 2.6 MB. Mixed partition sizes via `build_lm_head_gemv_module(parts=…)`; the BD repeat cap at `m_input = 8` admits 16384 rows. Qwen3-0.6B decode token: 89 (08-20) → ~75 ms after O1 + `m_input = 8` + this |
 
+## `[2026-08-21]` Where things stand, for a session picking this up cold
+
+**First: NPU power mode.** Unchanged rule — `sudo xrt-smi configure --device 0000:64:00.1
+--pmode turbo` (operator), verify with `xrt-smi examine -r platform`. It read Turbo through every
+job of 2026-08-21 (devq 450–484); no reboot since 08-13.
+
+**The tree is the whole state.** Tip is the commit carrying this note; ten commits landed on
+2026-08-21 (`5ad7af60` … `c31ebf73`), tree clean. Evidence root:
+`programming_examples/transformer_layer/results/hexagon-opt-20260821/` (gitignored, local:
+every probe script named below, its devq job script, JSON results, and `LOOP-QUEUE.md` — the
+loop's own work list). **Two things learned about running probes** are in memory and worth
+repeating: a compile inside a `measure`-class devq job holds the device lock for its whole
+duration (the int4 compile blocked the queue for 20 min before it was moved to a detached
+build), and `XRTBackend.compile` writes `air_project/` into the *cwd*, so two compiles from one
+directory clobber each other — give each its own subdirectory.
+
+**What 2026-08-21 did** (status-board rows above; numbers in
+[57](57-inference-path-optimizations-from-hexagon.md) §1.5 and §5, and [56 §4](56-full-model-mixed-precision-study-plan.md)):
+
+1. **The launch-boundary cost pinned: 106–108 µs per configuration**, geometry held fixed, three
+   estimates agreeing (devq 450–451). Codex's two-segments form is unbuildable (one `aie.device`
+   per `air.segment`).
+2. **The Qwen3-0.6B decode token 89 → ~75 ms from three launch-count changes, all through
+   `make verify`**: `m_input = 8` on the LM head (−1.0 ms); the QKV stage at **4 launches** instead
+   of 8 — one GEMV over `[wq; wk; wv]`, one per-row-weighted QK-norm, one RoPE, no new kernel,
+   bit-identical (−11.5 ms); and the LM head as **9 × 16384 + 4480 mixed partitions** (10 launches,
+   64 pad rows; −0.85 ms kernel). Qwen3-1.7B got the first two (≈127–130 ms/token, its first
+   recorded-Turbo number). The last clean per-token profile is devq 463 (before the head change);
+   devq 479's layer-loop wall was confounded by a background compile — **re-profile before citing a
+   token number for the current tree** (`make profile N_TOKENS=32`, idle host).
+3. **O2 (runlist pairs) measured small** — −2 to −4 ms/token once the prototype's own overhead
+   was removed (`dispatch._plan_memo`); kept behind `QWEN3_DECODE_RUNLIST=1`, not production.
+4. **Doc 56 H0 — the analytical planner — landed** (`llms/shared/plan/`, `PLAN: 10/10` in the seam
+   lit): reproduces both golden drivers' ELF sequences and launch counts from structure,
+   `study_skip ≡ profiles.skip_reason`, solver vs registry with every mismatch named. Its first
+   finding was item 2's LM-head partitioning.
+5. **The LM-head re-execution defect: gated, then avoided.** The gate (`make check-lm-head-reexec`)
+   read 5 / 7 wrong on the 19 × 8192 head and 7 / 7 clean on the re-partitioned one; the XFAIL is
+   gone and the lit is a regression guard. **The family is not understood**: [57 §1.5](57-inference-path-optimizations-from-hexagon.md)'s
+   seven-row table has two other forms that *hang* (a 3-launch host-RMSNorm QKV stage, measured at
+   only −0.7 ms/token and not shipped; an RMSNorm-prologue + 16384-row GEMVs ELF).
+6. **O4 (int4 LM head)**: the probe is written (`probe_o4_lm_head_int4.py`; the int4 builder expresses
+   the 19 partitions as iterations of ONE `air.launch`), but `aircc` on that module ran past 40 min
+   twice — see the status row for where it ended. Unmeasured.
+
+**The regression legs**, all re-run on 2026-08-21 after the `dispatch.py` memo and the shared
+builder change: `check-air-mlir` not re-run (no compiler source moved); transformer-layer suite
+**37 / 1 / 0** (devq 471); PR-safe host allowlist unchanged at the lit level (the seam lit gained
+the planner's `PLAN: 10/10` clause); study host suite **587 / 587**; shared infra `dispatch`
+35 / 35, `plan` 10 / 10; shipped models **6 / 6 on the six-model leg → 8 / 11 standing** (devq 472;
+the big three still operator-deferred).
+
+**Standing numbers to cite.** Layer study: doc 54 walk 2 and doc 32, unchanged. Model path: doc
+57 §1.5 (boundary 106–108 µs, 146 µs per `xrt.run`), §5 items 3c / 5 / 5b (kernel-line deltas,
+each a same-session before/after under recorded Turbo). **Do not cite** a per-token number for the
+current tree until re-profiled on an idle host (item 2), nor the June `llms/` table, nor Hexagon's
+figures as like-for-like.
+
+**What a next session can pick up, by value per hour:**
+
+1. **Re-profile the current tree** (one `make profile` ×2, idle host) and write the token number
+   into doc 57 §1.1's correction line.
+2. **The re-execution family** — the systematic matrix (launch-0 kind × GEMV geometry × dispatch
+   index) with BD dumps per configuration; seven rows exist. Until it is understood, every new
+   multi-launch form needs the gate shape (`fused_reexec_gate.py` / `lm_head_reexec_gate.py`) run
+   on it before shipping.
+3. **O1's second half**: the QK-norm + RoPE epilogue needs a column-owns-heads GEMV (each column
+   streams whole 128-row heads; the current L2-staged tile distribution cannot) — a new core
+   kernel, ~2 boundaries × 28 ≈ 6 ms/token.
+4. **O4**: either find why the int4 module's compile explodes (19 launch iterations × 8 cores ×
+   128 tiles — try `M_PER_LAUNCH = 16384`/10 iterations, or one partition per `air.launch` as the
+   bf16 head does) or measure a smaller head first.
+5. **Doc 56 H1a** (model adapter + runner, schema v3, the kernel-scaling curve) — the planner's
+   `Plan.sha` is ready to be its artifact key.
+6. Port the mixed-partition head to Llama-1B (2,816 pad rows, ~0.36 ms) and Qwen3-1.7B
+   (same vocab; needs its own verify).
+7. The morning list's operator items: the iron latency gap, the big-three leg, the doc rewrite, R1.
+
 ## `[2026-08-20, evening]` Where things stand, for a session picking this up cold
 
 **First: NPU power mode.** Unchanged rule — `sudo xrt-smi configure --device 0000:64:00.1
@@ -478,6 +556,12 @@ everything on device, `offload` minimizes reconfiguration (one xclbin, N instruc
 LINEAR operators on the NPU, all NON-LINEAR on the host), `fused` eliminates DRAM traffic between
 operators, and `coarse` blends `runlist` and `fused`.
 ### The work queue
+
+`[2026-08-21]` **Items 1, 2, 3, 4 and 6-H0 of the evening ranking are done** (boundary pinned;
+`m_input = 8`; O2 measured small; O1 first cut at 4 launches plus the planner's LM-head
+re-partition; H0). What remains, in the order the cold-pickup note above ranks it: the clean
+re-profile, the re-execution family's matrix, O1's epilogue kernel, O4's compile wall, H1a, the
+Llama/1.7B head ports, then the operator items.
 
 `[2026-08-20, evening]` **The queue below is re-ranked by [57](57-inference-path-optimizations-from-hexagon.md)'s
 measurements.** Nothing on it changed status; what changed is the evidence: a Qwen3-0.6B decode
