@@ -39,7 +39,7 @@ help:
 	@echo "  make verify           Top-k token-level inclusion gate vs HF bf16 (2 prompts × 32 tokens, k=5) — fast CI gate"
 	@echo "  make verify-full      Same as above but runs the full prompt set (longer, exhaustive)"
 	@echo "  make diagnosis        Per-layer ffn_out cosine + max_abs vs HF bf16 (single prompt, informational)"
-	@echo "  make check-lm-head-reexec  LM-head ELF back-to-back re-execution gate (no HF weights; RED while open)"
+	@echo "  make check-lm-head-reexec  LM-head ELF back-to-back re-execution gate (no HF weights)"
 	@echo ""
 	@echo "Maintenance:"
 	@echo "  make clean            Remove all build artifacts and verify reports"
@@ -87,10 +87,10 @@ diagnosis:
 	cd $(BUILD_DIR) && python3 $(VERIFY_RUNNER) --runner=$(RUNNER_ADAPTER) \
 		--prompts single --prompt "$(PROMPT)" --model $(MODEL)
 
-## LM-head re-execution gate (doc 57 section 1.4): the production 19 x 8192
-## lm_head_gemv ELF dispatched back-to-back must stay exact. No HF weights
-## needed (random weights, f32 reference). RED while the defect is open --
-## its lit carries XFAIL.
+## LM-head re-execution gate (doc 57 section 1.5): the production lm_head_gemv
+## ELF dispatched back-to-back must stay exact. No HF weights needed (random
+## weights, f32 reference). Green since the 9 x 16384 + 4480 head (2026-08-21);
+## red again means the re-execution family is back.
 check-lm-head-reexec:
 	@mkdir -p $(BUILD_DIR)
 	cd $(BUILD_DIR) && python3 $(srcdir)/lm_head_reexec_gate.py lm_head_reexec_cache

@@ -1,23 +1,28 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 //
-// The LM-head GEMV's re-execution gate. `[2026-08-21]` The production
-// 19 x 8192 `lm_head_gemv` multi-launch ELF returns wrong, non-deterministic
-// values in partition 0 whenever it executes immediately after itself (doc 57
-// section 1.4, devq 446-448; confirmed on the production artifact, devq 452:
+// The LM-head GEMV's re-execution gate. `[2026-08-21]` The 19 x 8192
+// `lm_head_gemv` multi-launch ELF that shipped until this morning returned
+// wrong, non-deterministic values in partition 0 whenever it executed
+// immediately after itself (doc 57 section 1.4/1.5, devq 446-448, 452, 458:
 // 5 of 7 dispatches wrong, healed only by running another ELF in between, NOT
 // by a 0.5 s idle). Production decode never places the head next to itself
-// and `make verify` judges token sets, so neither can see it; this gate
+// and `make verify` judges token sets, so neither could see it; this gate
 // compiles the production builder's module fresh and dispatches it seven
-// times in the patterns that expose it. The defect is OPEN: the lit is
-// expected to FAIL, and a fix anywhere from builder to device turns it into
-// an XPASS -- drop the XFAIL line then, and the gate is green on the fix.
+// times in the patterns that expose it.
+//
+// `[2026-08-21, 03:40]` The production head became 9 x 16384 + 4480 (mixed
+// partitions, m_input 8; doc 57 section 5 item 5b) and this gate went 7 / 7
+// clean on it (devq 482, 484) -- the XFAIL that stood for the 19 x 8192 form
+// is gone and the gate is now a regression guard: a builder or compiler
+// change that brings the re-execution family back (doc 57 section 1.5's
+// seven-row table -- it is NOT understood, only avoided) turns this red.
+// The 19 x 8192 reproducer lives on in the evidence root's probes.
 //
 // No HF weights: random weights against an f32 reference. NPU serialization
 // lives one layer down (KernelCache takes /tmp/npu.lock).
 //
 // REQUIRES: ryzen_ai_npu2, peano
-// XFAIL: *
 //
 // RUN: mkdir -p test_npu2_lm_head_reexec
 // RUN: cd test_npu2_lm_head_reexec

@@ -22,8 +22,13 @@ between builder and device is what flips this), dispatched seven times in the
 patterns above, every dispatch judged fail-closed against an f32 reference
 (clean = finite, no element beyond 1e-2 of the output scale -- the honest
 bf16 error is 2.5e-3 -- and bit-identical to the first dispatch for the same
-input). PASS requires 7/7. While the defect is open the lit carries
-`XFAIL: *`; fixing it makes the lit XPASS, which is the signal to drop that line.
+input). PASS requires 7/7.
+
+`[2026-08-21, 03:40]` With the production head re-partitioned to
+9 x 16384 + 4480 (doc 57 section 5 item 5b) this gate reads 7/7 clean (devq
+482, 484): the shipped artifact no longer shows the defect, the lit's XFAIL is
+gone, and the gate guards against the family's return. The defect is avoided,
+not understood -- doc 57 section 1.5's table has the seven configurations.
 
 Usage: python3 lm_head_reexec_gate.py [CACHE_DIR]   (default ./lm_head_reexec_cache)
 """
