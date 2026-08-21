@@ -461,7 +461,16 @@ H2/H3 phases measure.
    form is impossible past 2 iterations at this geometry (the same cap that pins the bf16 head's
    rows per launch), and the 19-iteration compile was lost in a pass before that check. The int4
    head therefore takes the bf16 head's shape — ten stitched `air.launch`es, 10 boundaries —
-   and what int4 buys is bytes alone (319 → ~88 MB): `probe_o4b_int4_stitched.py`, devq 488.
+   and what int4 buys is bytes alone (319 → ~88 MB): `probe_o4b_int4_stitched.py`, devq 488 —
+   **measured, and closed for now**: the ten-launch int4 head (81 MB packed, RTN gs=128) runs in
+   **7.37 ms against the bf16 head's 7.82 ms, −0.46 ms/token**; the int4 packed GEMV streams at
+   **11 GB/s** (the bf16 head streams at ~47 GB/s between its boundaries), so the kernel is
+   dequant-bound exactly as §1.3's per-layer int4 GEMVs were (4–14 GB/s), and a 3.8× byte cut buys
+   6 %. The stitched form also returned wrong values (max_rel 0.69 against the kernel's own CPU
+   dequant reference, deterministic — a static mapping error in the ten-slice stitch, not chased:
+   the timing is representative, the ceiling is 0.46 ms). **The prerequisite for O4 is a faster
+   int4 GEMV** (dequant throughput, HMX-class on Hexagon), a kernel project; the accuracy question
+   (RTN int4 on the LM head under the top-5 gate) stays unasked until then.
 7. Then O3 / O5 / O6(ii) / O8 / O9 per [56](56-full-model-mixed-precision-study-plan.md)'s phases.
 
 ## 6. What does not transfer, restated for the inference path

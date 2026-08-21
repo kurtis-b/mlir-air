@@ -170,7 +170,7 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | **O1 + `m_input = 8` ported to Qwen3-1.7B** | stage probe at emb 2048; `make verify` twice (4-launch stage, then `m_input = 8`); `make profile` ×2 | **done, landed** 2026-08-21 (devq 465–470). Probe 1.326 → 0.873 ms/layer; both verifies PASS 2 / 2; `rms_qkv` 0.80 ms, LM head 16.4 → 15.9–16.2 ms; **≈127–130 ms per token** under recorded Turbo (first such number for 1.7B). Host helpers moved to `shared/infra/decode_qkv4.py`. Qwen3-4B not ported: its verify is oomd-deferred, so the port cannot be gated |
 | **Doc 56 H0 — the analytical planner, host-only** | `llms/shared/plan/test_plan.py`, pinned in `run_seam_tests.lit` (`PLAN: 10/10`) | **done** 2026-08-21 ([56 §4](56-full-model-mixed-precision-study-plan.md)). `ModelGraph` + golden JSON for Qwen3-0.6B / Llama-1B; `plan()` reproduces both drivers' shipped ELF sequences, launch counts and host split from structure (fused-cast = +1 cast launch; lean-form predicate; LM-head pin), `study_skip` ≡ `profiles.skip_reason` over every family, solver vs registry 61 / 136 identical with every mismatch in a named class. One finding: the Qwen3-0.6B LM head at `m_input = 8` could be 10 × 16384 instead of 19 × 8192 (−9 boundaries ≈ −1 ms/token, untested) |
 | **LM head re-partitioned from the planner's finding: 19 × 8192 → 9 × 16384 + 4480** | probe (exact, −1.10 ms), `make verify`, `make profile` ×2 | **done, landed** 2026-08-21 (devq 476 / 478 / 479, [57 §5 item 5b](57-inference-path-optimizations-from-hexagon.md)). Verify PASS; `lm_head_gemv` kernel **8.79 → 7.90 ms** per token, ELF 8.3 → 2.6 MB. Mixed partition sizes via `build_lm_head_gemv_module(parts=…)`; the BD repeat cap at `m_input = 8` admits 16384 rows. Qwen3-0.6B decode token: 89 (08-20) → ~75 ms after O1 + `m_input = 8` + this |
-| **O4 — int4 LM head** | `probe_o4_lm_head_int4.py` (one `air.launch`, 19 iterations; RTN gs=128) | **blocked on compile time** 2026-08-21: the module parses, `aircc` did not finish in 75 min twice (devq 468 + a detached build). Two routes in [57 §5 item 6](57-inference-path-optimizations-from-hexagon.md): bisect the pass on a 2-iteration module, or ten `air.launch`es of the int4 GEMV |
+| **O4 — int4 LM head** | one-launch form bisected (1 / 2 / 4 iterations); ten-launch form probed vs the bf16 head (devq 488) | **measured, closed for now** 2026-08-21 ([57 §5 item 6](57-inference-path-optimizations-from-hexagon.md)). The one-launch form hits the `push_queue` repeat cap at 4 iterations (its 19-iteration compile never finished, 75 min ×2). The ten-launch form: **7.37 vs 7.82 ms, −0.46 ms/token** — the int4 packed GEMV streams at 11 GB/s, dequant-bound, so bytes are not the lever; a faster int4 kernel is the prerequisite. (The stitched probe also had a static correctness bug, not chased at that ceiling) |
 | **Mixed-partition LM head ported to Qwen3-1.7B** | `make verify`, `make profile` ×2 | **done, landed** 2026-08-21 (devq 485, 487). 19 → 10 launches at K = 2048; PASS 2 / 2; `lm_head_gemv` 15.9–16.2 → **14.6–14.95 ms**; **7.70 / 7.83 tok/s ≈ 128–130 ms per token** (a CPU-only compile started mid-run; kernel lines unaffected) |
 
 ## `[2026-08-21]` Where things stand, for a session picking this up cold
@@ -213,10 +213,11 @@ directory clobber each other — give each its own subdirectory.
    gone and the lit is a regression guard. **The family is not understood**: [57 §1.5](57-inference-path-optimizations-from-hexagon.md)'s
    seven-row table has two other forms that *hang* (a 3-launch host-RMSNorm QKV stage, measured at
    only −0.7 ms/token and not shipped; an RMSNorm-prologue + 16384-row GEMVs ELF).
-6. **O4 (int4 LM head)**: the probe is written (`probe_o4_lm_head_int4.py`; the int4 builder expresses
-   the 19 partitions as iterations of ONE `air.launch`), but `aircc` on that module did not finish in
-   **75 min, twice** ([57 §5 item 6](57-inference-path-optimizations-from-hexagon.md) has the two routes
-   out). Unmeasured.
+6. **O4 (int4 LM head) measured and closed for now**: the one-launch form cannot exist (BD repeat
+   cap at 4 iterations; its 19-iteration compile never finished), the ten-launch form saves only
+   **0.46 ms/token** because the int4 packed GEMV streams at 11 GB/s (dequant-bound). A faster int4
+   kernel is the prerequisite; until then O4 is not a decode lever
+   ([57 §5 item 6](57-inference-path-optimizations-from-hexagon.md)).
 
 **The regression legs**, all re-run on 2026-08-21 after the `dispatch.py` memo and the shared
 builder change: `check-air-mlir` not re-run (no compiler source moved); transformer-layer suite
@@ -242,9 +243,8 @@ bf16 decode 77 ms/token (12.96–13.12 tok/s), devq 486, idle host, Turbo**. **D
 3. **O1's second half**: the QK-norm + RoPE epilogue needs a column-owns-heads GEMV (each column
    streams whole 128-row heads; the current L2-staged tile distribution cannot) — a new core
    kernel, ~2 boundaries × 28 ≈ 6 ms/token.
-4. **O4**: either find why the int4 module's compile explodes (19 launch iterations × 8 cores ×
-   128 tiles — try `M_PER_LAUNCH = 16384`/10 iterations, or one partition per `air.launch` as the
-   bf16 head does) or measure a smaller head first.
+4. ~~**O4**~~ measured and closed for now (−0.46 ms ceiling at the int4 kernel's 11 GB/s); reopen
+   with a faster int4 GEMV.
 5. **Doc 56 H1a** (model adapter + runner, schema v3, the kernel-scaling curve) — the planner's
    `Plan.sha` is ready to be its artifact key.
 6. Port the mixed-partition head to Llama-1B (2,816 pad rows, ~0.36 ms) and Qwen3-1.7B
