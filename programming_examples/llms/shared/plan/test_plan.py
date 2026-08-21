@@ -94,7 +94,7 @@ def test_qwen_decode_token_counts_match_doc57():
     assert p.total_submissions == 57
     assert p.total_host_ops == 28 * 2 + 2
     # the planner sees the LM-head partitioning the driver pins is not the repeat cap's best
-    assert any(r[0] == "lm_head_gemv partitioning" and "10 launches" in r[1] for r in p.rejected)
+    assert any(r[0] == "lm_head_gemv partitioning" and "10 launches" in r[1] and "4480" in r[1] for r in p.rejected)
 
 
 def test_plan_hash_is_value_identity():

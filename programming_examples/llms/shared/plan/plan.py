@@ -137,9 +137,16 @@ def _gemm_launches(cand):
     return 2 if (cand and cand.get("method") == "fused-cast") else 1
 
 
-def _gemv_partitions(rows, caps, herd_m=8, m_input=4):
+def _gemv_partitions(rows, caps, herd_m=8, m_input=4, tile_m=8):
+    """(launch count, partition rows) for a GEMV of `rows`: full partitions at the BD
+    repeat cap plus ONE tail partition sized to the remainder (rounded up to the
+    tile grid) -- stitching accepts launches of different shapes, so padding the
+    vocab to a whole number of full partitions is never required."""
     cap = (caps.bd_repeat_cap + 1) * herd_m * m_input
-    return math.ceil(rows / cap), min(rows, cap)
+    grid = tile_m * herd_m
+    full, rem = divmod(rows, cap)
+    parts = [cap] * full + ([math.ceil(rem / grid) * grid] if rem else [])
+    return len(parts), tuple(parts)
 
 
 def fuse(graph, wl, placements, caps=NPU2_CAPS):
@@ -245,24 +252,29 @@ def fuse(graph, wl, placements, caps=NPU2_CAPS):
                         boundary_bytes=g.nbytes("x_final_normed")))
     # LM head: the shipped partitioning is a driver fact (spec.lm_head_rows_per_launch); the
     # BD-repeat derivation is reported beside it, as an alternative when it differs.
-    derived_count, derived_rows = _gemv_partitions(spec.vocab_size, caps, herd_m=8, m_input=8)
+    derived_count, derived_parts = _gemv_partitions(spec.vocab_size, caps, herd_m=8, m_input=8)
     if spec.lm_head_rows_per_launch:
         n_part = spec.lm_head_rows_per_launch
         n_part_count = math.ceil(spec.vocab_size / n_part)
+        parts = (n_part,) * n_part_count
         why = f"driver pins {n_part} rows per launch"
-        if derived_count != n_part_count:
+        if derived_count != n_part_count or sum(derived_parts) != sum(parts):
+            saved_b = n_part_count - derived_count
+            saved_rows = sum(parts) - sum(derived_parts)
             rejected.append(("lm_head_gemv partitioning",
-                             f"derived: {derived_count} launches of {derived_rows} rows fit the BD repeat cap "
-                             f"({caps.bd_repeat_cap}) at m_input 8, {n_part_count - derived_count} boundaries "
-                             f"(~{(n_part_count - derived_count) * caps.launch_boundary_us / 1e3:.1f} ms/token) fewer "
+                             f"derived: {derived_count} launches {list(derived_parts)} fit the BD repeat cap "
+                             f"({caps.bd_repeat_cap}) at m_input 8 -- {saved_b} boundaries fewer "
+                             f"(~{saved_b * caps.launch_boundary_us / 1e3:.1f} ms/token) and {saved_rows} fewer pad rows "
+                             f"({saved_rows * spec.emb_dim * 2 / 1e6:.1f} MB, ~{saved_rows * spec.emb_dim * 2 / (caps.gemv_stream_gbs * 1e6):.2f} ms) "
                              f"than the shipped {n_part_count} x {n_part}; untested, an O3 knob"))
     else:
-        n_part_count, n_part = derived_count, derived_rows
-        why = f"BD repeat cap {caps.bd_repeat_cap} x herd 8 x m_input 8"
+        n_part_count, parts = derived_count, derived_parts
+        why = f"BD repeat cap {caps.bd_repeat_cap} x herd 8 x m_input 8, tail partition on the tile grid"
+    rows_total = sum(parts)
     stages.append(Stage("lm_head_gemv", DEVICE, ("lm_head",), launches=n_part_count, repeated=False,
-                        launch_breakdown=(("lm_head", n_part_count, f"GEMV partitions of {n_part} rows: {why}"),),
-                        weight_bytes=n_part_count * n_part * spec.emb_dim * 2, boundary_bytes=n_part_count * n_part * 2,
-                        note="vocab padded to the partition grid; logits truncated on the host"))
+                        launch_breakdown=(("lm_head", n_part_count, f"GEMV partitions {list(parts)}: {why}"),),
+                        weight_bytes=rows_total * spec.emb_dim * 2, boundary_bytes=rows_total * 2,
+                        note=f"{rows_total - spec.vocab_size} pad rows; logits truncated on the host"))
     return stages, rejected
 
 
