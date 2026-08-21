@@ -1,0 +1,962 @@
+{
+ "spec": {
+  "name": "qwen3_0_6b",
+  "hf_id": "Qwen/Qwen3-0.6B",
+  "n_layers": 28,
+  "emb_dim": 1024,
+  "n_heads": 16,
+  "n_kv_heads": 8,
+  "head_dim": 128,
+  "hidden_dim": 3072,
+  "vocab_size": 151936,
+  "qk_norm": true,
+  "tied_embeddings": true,
+  "rope_theta": 1000000.0,
+  "eps": 1e-06,
+  "activation": "swiglu",
+  "weight_dtype": "bf16",
+  "rope_convention": "halfsplit",
+  "lm_head_rows_per_launch": 8192
+ },
+ "tensors": [
+  {
+   "id": "embed_table",
+   "shape": [
+    "vocab",
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "weight",
+   "lifetime": "resident"
+  },
+  {
+   "id": "token_ids",
+   "shape": [
+    "M"
+   ],
+   "logical_dtype": "i32",
+   "storage_dtype": "f32",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "x_0",
+   "shape": [
+    "M",
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "final_norm_w",
+   "shape": [
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "weight",
+   "lifetime": "resident"
+  },
+  {
+   "id": "x_final",
+   "shape": [
+    "M",
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "x_final_normed",
+   "shape": [
+    1,
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "lm_head_w",
+   "shape": [
+    1024,
+    "vocab"
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "weight",
+   "lifetime": "resident"
+  },
+  {
+   "id": "logits",
+   "shape": [
+    1,
+    "vocab"
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "f32",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "k_cache_L",
+   "shape": [
+    "ctx",
+    8,
+    128
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "head_first",
+   "storage_class": "kv_state",
+   "lifetime": "resident"
+  },
+  {
+   "id": "v_cache_L",
+   "shape": [
+    "ctx",
+    8,
+    128
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "head_first",
+   "storage_class": "kv_state",
+   "lifetime": "resident"
+  },
+  {
+   "id": "attn_norm_w_L",
+   "shape": [
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "weight",
+   "lifetime": "resident"
+  },
+  {
+   "id": "wq_L",
+   "shape": [
+    1024,
+    2048
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "weight",
+   "lifetime": "resident"
+  },
+  {
+   "id": "wk_L",
+   "shape": [
+    1024,
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "weight",
+   "lifetime": "resident"
+  },
+  {
+   "id": "wv_L",
+   "shape": [
+    1024,
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "weight",
+   "lifetime": "resident"
+  },
+  {
+   "id": "wo_L",
+   "shape": [
+    2048,
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "weight",
+   "lifetime": "resident"
+  },
+  {
+   "id": "ffn_norm_w_L",
+   "shape": [
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "weight",
+   "lifetime": "resident"
+  },
+  {
+   "id": "w_gate_L",
+   "shape": [
+    1024,
+    3072
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "weight",
+   "lifetime": "resident"
+  },
+  {
+   "id": "w_up_L",
+   "shape": [
+    1024,
+    3072
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "weight",
+   "lifetime": "resident"
+  },
+  {
+   "id": "w_down_L",
+   "shape": [
+    3072,
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "weight",
+   "lifetime": "resident"
+  },
+  {
+   "id": "q_norm_w_L",
+   "shape": [
+    128
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "weight",
+   "lifetime": "resident"
+  },
+  {
+   "id": "k_norm_w_L",
+   "shape": [
+    128
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "weight",
+   "lifetime": "resident"
+  },
+  {
+   "id": "rope_lut",
+   "shape": [
+    "ctx",
+    128
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "weight",
+   "lifetime": "resident"
+  },
+  {
+   "id": "x_in_L",
+   "shape": [
+    "M",
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "normed_L",
+   "shape": [
+    "M",
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "q_L",
+   "shape": [
+    "M",
+    2048
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "k_L",
+   "shape": [
+    "M",
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "v_L",
+   "shape": [
+    "M",
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "q_n_L",
+   "shape": [
+    "M",
+    2048
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "k_n_L",
+   "shape": [
+    "M",
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "q_roped_L",
+   "shape": [
+    "M",
+    2048
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "k_roped_L",
+   "shape": [
+    "M",
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "attn_out_L",
+   "shape": [
+    "M",
+    2048
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "o_L",
+   "shape": [
+    "M",
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "x_mid_L",
+   "shape": [
+    "M",
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "ffn_normed_L",
+   "shape": [
+    "M",
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "gate_L",
+   "shape": [
+    "M",
+    3072
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "up_L",
+   "shape": [
+    "M",
+    3072
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "swiglu_L",
+   "shape": [
+    "M",
+    3072
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "down_L",
+   "shape": [
+    "M",
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  },
+  {
+   "id": "x_out_L",
+   "shape": [
+    "M",
+    1024
+   ],
+   "logical_dtype": "bf16",
+   "storage_dtype": "bf16",
+   "compute_dtype": "bf16",
+   "accum_dtype": "f32",
+   "layout": "row_major",
+   "storage_class": "activation",
+   "lifetime": "node"
+  }
+ ],
+ "nodes": [
+  {
+   "id": "embed",
+   "op": "embed_lookup",
+   "inputs": [
+    "token_ids",
+    "embed_table"
+   ],
+   "outputs": [
+    "x_0"
+   ],
+   "attrs": [],
+   "phase": "both",
+   "repeated": false
+  },
+  {
+   "id": "final_norm",
+   "op": "rms_norm",
+   "inputs": [
+    "x_final",
+    "final_norm_w"
+   ],
+   "outputs": [
+    "x_final_normed"
+   ],
+   "attrs": [
+    [
+     "eps",
+     1e-06
+    ],
+    [
+     "rows",
+     "last"
+    ]
+   ],
+   "phase": "both",
+   "repeated": false
+  },
+  {
+   "id": "lm_head",
+   "op": "matmul",
+   "inputs": [
+    "x_final_normed",
+    "lm_head_w"
+   ],
+   "outputs": [
+    "logits"
+   ],
+   "attrs": [
+    [
+     "M_rows",
+     1
+    ],
+    [
+     "tied",
+     true
+    ]
+   ],
+   "phase": "both",
+   "repeated": false
+  },
+  {
+   "id": "attn_norm_L",
+   "op": "rms_norm",
+   "inputs": [
+    "x_in_L",
+    "attn_norm_w_L"
+   ],
+   "outputs": [
+    "normed_L"
+   ],
+   "attrs": [
+    [
+     "eps",
+     1e-06
+    ]
+   ],
+   "phase": "both",
+   "repeated": true
+  },
+  {
+   "id": "q_proj_L",
+   "op": "matmul",
+   "inputs": [
+    "normed_L",
+    "wq_L"
+   ],
+   "outputs": [
+    "q_L"
+   ],
+   "attrs": [],
+   "phase": "both",
+   "repeated": true
+  },
+  {
+   "id": "k_proj_L",
+   "op": "matmul",
+   "inputs": [
+    "normed_L",
+    "wk_L"
+   ],
+   "outputs": [
+    "k_L"
+   ],
+   "attrs": [],
+   "phase": "both",
+   "repeated": true
+  },
+  {
+   "id": "v_proj_L",
+   "op": "matmul",
+   "inputs": [
+    "normed_L",
+    "wv_L"
+   ],
+   "outputs": [
+    "v_L"
+   ],
+   "attrs": [],
+   "phase": "both",
+   "repeated": true
+  },
+  {
+   "id": "q_norm_L",
+   "op": "rms_norm_per_head",
+   "inputs": [
+    "q_L",
+    "q_norm_w_L"
+   ],
+   "outputs": [
+    "q_n_L"
+   ],
+   "attrs": [
+    [
+     "eps",
+     1e-06
+    ],
+    [
+     "head_dim",
+     128
+    ]
+   ],
+   "phase": "both",
+   "repeated": true
+  },
+  {
+   "id": "k_norm_L",
+   "op": "rms_norm_per_head",
+   "inputs": [
+    "k_L",
+    "k_norm_w_L"
+   ],
+   "outputs": [
+    "k_n_L"
+   ],
+   "attrs": [
+    [
+     "eps",
+     1e-06
+    ],
+    [
+     "head_dim",
+     128
+    ]
+   ],
+   "phase": "both",
+   "repeated": true
+  },
+  {
+   "id": "rope_q_L",
+   "op": "rope",
+   "inputs": [
+    "q_n_L",
+    "rope_lut"
+   ],
+   "outputs": [
+    "q_roped_L"
+   ],
+   "attrs": [
+    [
+     "convention",
+     "halfsplit"
+    ],
+    [
+     "head_dim",
+     128
+    ]
+   ],
+   "phase": "both",
+   "repeated": true
+  },
+  {
+   "id": "rope_k_L",
+   "op": "rope",
+   "inputs": [
+    "k_n_L",
+    "rope_lut"
+   ],
+   "outputs": [
+    "k_roped_L"
+   ],
+   "attrs": [
+    [
+     "convention",
+     "halfsplit"
+    ],
+    [
+     "head_dim",
+     128
+    ]
+   ],
+   "phase": "both",
+   "repeated": true
+  },
+  {
+   "id": "kv_append_L",
+   "op": "kv_append",
+   "inputs": [
+    "k_roped_L",
+    "v_L"
+   ],
+   "outputs": [
+    "k_cache_L",
+    "v_cache_L"
+   ],
+   "attrs": [],
+   "phase": "both",
+   "repeated": true
+  },
+  {
+   "id": "attention_L",
+   "op": "attention",
+   "inputs": [
+    "q_roped_L",
+    "k_cache_L",
+    "v_cache_L"
+   ],
+   "outputs": [
+    "attn_out_L"
+   ],
+   "attrs": [
+    [
+     "causal",
+     true
+    ],
+    [
+     "n_heads",
+     16
+    ],
+    [
+     "n_kv_heads",
+     8
+    ],
+    [
+     "head_dim",
+     128
+    ],
+    [
+     "scale",
+     0.08838834764831845
+    ]
+   ],
+   "phase": "both",
+   "repeated": true
+  },
+  {
+   "id": "o_proj_L",
+   "op": "matmul",
+   "inputs": [
+    "attn_out_L",
+    "wo_L"
+   ],
+   "outputs": [
+    "o_L"
+   ],
+   "attrs": [],
+   "phase": "both",
+   "repeated": true
+  },
+  {
+   "id": "residual_1_L",
+   "op": "add",
+   "inputs": [
+    "x_in_L",
+    "o_L"
+   ],
+   "outputs": [
+    "x_mid_L"
+   ],
+   "attrs": [],
+   "phase": "both",
+   "repeated": true
+  },
+  {
+   "id": "ffn_norm_L",
+   "op": "rms_norm",
+   "inputs": [
+    "x_mid_L",
+    "ffn_norm_w_L"
+   ],
+   "outputs": [
+    "ffn_normed_L"
+   ],
+   "attrs": [
+    [
+     "eps",
+     1e-06
+    ]
+   ],
+   "phase": "both",
+   "repeated": true
+  },
+  {
+   "id": "gate_proj_L",
+   "op": "matmul",
+   "inputs": [
+    "ffn_normed_L",
+    "w_gate_L"
+   ],
+   "outputs": [
+    "gate_L"
+   ],
+   "attrs": [],
+   "phase": "both",
+   "repeated": true
+  },
+  {
+   "id": "up_proj_L",
+   "op": "matmul",
+   "inputs": [
+    "ffn_normed_L",
+    "w_up_L"
+   ],
+   "outputs": [
+    "up_L"
+   ],
+   "attrs": [],
+   "phase": "both",
+   "repeated": true
+  },
+  {
+   "id": "swiglu_L",
+   "op": "swiglu",
+   "inputs": [
+    "gate_L",
+    "up_L"
+   ],
+   "outputs": [
+    "swiglu_L"
+   ],
+   "attrs": [],
+   "phase": "both",
+   "repeated": true
+  },
+  {
+   "id": "down_proj_L",
+   "op": "matmul",
+   "inputs": [
+    "swiglu_L",
+    "w_down_L"
+   ],
+   "outputs": [
+    "down_L"
+   ],
+   "attrs": [],
+   "phase": "both",
+   "repeated": true
+  },
+  {
+   "id": "residual_2_L",
+   "op": "add",
+   "inputs": [
+    "x_mid_L",
+    "down_L"
+   ],
+   "outputs": [
+    "x_out_L"
+   ],
+   "attrs": [],
+   "phase": "both",
+   "repeated": true
+  }
+ ]
+}

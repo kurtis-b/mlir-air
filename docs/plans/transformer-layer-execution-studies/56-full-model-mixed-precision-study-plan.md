@@ -258,7 +258,7 @@ is `passed` only if the gate passed under the same plan hash. Study runs default
 
 | Phase | Deliverable | Gate |
 |---|---|---|
-| **H0 — planner, host-only, two models** | `llms/shared/plan/`: `ModelGraph` + golden JSON for Qwen3-0.6B and Llama-3.2-1B, `DeviceCaps`, candidate providers over the lifted bounds, placement, solver with registry override and `analytical_unmeasured` marking, fusion/residency/dispatch grouping, `Plan` hash. | Host suite: the plan for each of the two models **reproduces its hand-built ELF sequence and NPU/CPU split**; every study skip in `profiles.skip_reason` is reproduced by `placement`; solver vs registry on the 36 swept shapes, mismatches explained by a named bound. Pinned count moves and is verified red. Host tests cannot validate routing or ranking — that is H1/H4's job. |
+| **H0 — planner, host-only, two models** — **DONE 2026-08-21**, see below | `llms/shared/plan/`: `ModelGraph` + golden JSON for Qwen3-0.6B and Llama-3.2-1B, `DeviceCaps`, candidate providers over the lifted bounds, placement, solver with registry override and `analytical_unmeasured` marking, fusion/residency/dispatch grouping, `Plan` hash. | Host suite: the plan for each of the two models **reproduces its hand-built ELF sequence and NPU/CPU split**; every study skip in `profiles.skip_reason` is reproduced by `placement`; solver vs registry on the 36 swept shapes, mismatches explained by a named bound. Pinned count moves and is verified red. Host tests cannot validate routing or ranking — that is H1/H4's job. |
 | **H1a — model adapter + runner, fixed shapes (S0)** | The adapter seam over the Qwen3-0.6B and Llama-1B drivers; `study/run_model.py`; schema v3; `model-smoke` profile; manifest / resume / `compare_roots` extended; artifacts keyed by plan hash; the kernel-scaling curve at `M ∈ {512, 1024, 2048}` and decode at `ctx ∈ {512, 1024, 2048}`. Six registry sweep rows for Qwen3-0.6B at `M = 512, 1024`. | Two walks, `complete: True`, `compare_roots OK`, verify PASS per plan hash, Turbo recorded, failures as complete rows. |
 | **H1b — valid ubatch prefill (S1)** | Incremental causal prefill for Qwen3-0.6B: chunk-outer / layer-inner, per-layer KV append, rectangular head-first FA at `(512, 512)`, `(512, 1024)`, `(1024, 1024)` (or the run-time trip count), masked tail; EOS padding gone. | **The two-point ubatch curve** (§5): same 1024-token prompt at ubatch 512 and 1024; verify PASS at both; TTFT and prefill-only tok/s reported separately. |
 | **H2a — decompose the existing int4 decode (S3.1)** | `llama32_1b_int4` decode under `run_model.py`: `device / sync / host` decomposition, dispatch vector, `quant_*` populated, a prediction written first. | The 56 ms token attributed: weight stream vs dequant vs dispatch vs host attention/glue. |
@@ -269,6 +269,36 @@ is `passed` only if the gate passed under the same plan hash. Study runs default
 
 H0 and H1a are independent and can run in parallel; H2a needs only H1a's runner; H2b and H3
 need H1a; H4 needs H0; H5 last.
+
+**`[2026-08-21]` H0 landed** — `programming_examples/llms/shared/plan/` (`graph.py`, `caps.py`,
+`placement.py`, `plan.py`, `golden/`, `test_plan.py`; pure Python, no `air`), its gate pinned in
+`transformer_layer/run_seam_tests.lit` (`PLAN: 10/10 passed`). What the gate shows:
+
+- `decoder_graph(spec)` for Qwen3-0.6B and Llama-3.2-1B, golden JSON pinned;
+- `plan()` **reproduces both drivers' shipped sequences from structure**: per-layer ELFs, launch
+  counts and the host split equal the cached manifests — qwen prefill `rms_qkv_qknorm_rope` 9 /
+  `flash_attn` 1 + two host transposes / `o_ffn_qwen` 12, decode `rms_qkv_qknorm_rope_gemv4` 4 /
+  host attention / `o_gemv_ffn` 3, LM head 19; llama 7 / 1 / 12, 6 / 3, LM head 8. The launch
+  counts are *derived*: a GEMM costs one launch plus a cast launch when its registry method is
+  `fused-cast` (that is why 8 ops make 9 and 12 launches), the lean-form predicate (emb < 2560,
+  hidden % 512) picks the fused O+FFN cascade over the split forms, the LM head's partitions
+  follow the driver pin — and where the pin is not the BD-repeat cap's best the plan says so:
+  for Qwen3-0.6B **10 × 16384 at `m_input = 8` would cost 9 boundaries (~1.0 ms/token) fewer than
+  the shipped 19 × 8192** (recorded as a rejected alternative; untested — an O3 knob);
+- the doc 57 token counts fall out: 215 launches and 57 submissions per Qwen3-0.6B decode token;
+  the analytical cost (boundaries × 107 µs + submissions × 146 µs + weight stream at 32 GB/s)
+  predicts 68.8 ms against the measured ~76.5 (host attention and glue are not modelled);
+- `study_skip` equals `profiles.skip_reason` over every reachable family × the four profile
+  modes × the sequence ladder, and `DeviceCaps` is cross-checked against the study constants;
+- the capacity solver (traffic-minimizing tiles under L2/L1 legality) against the registry's
+  136 swept shapes: **61 identical; every mismatch in one of three named classes** — 22 differ
+  only in K-panel depth (same traffic), 40 are the method tier's forced `tile_m` (drain /
+  fused-cast, a precision choice the traffic model cannot see), 13 are a narrower N tile (a
+  channel/BD budget it does not model). The registry overrides wherever it has the shape; the
+  solver's picks are marked `analytical_unmeasured` and never written back.
+
+Not in H0 (by design): routing, ranking by latency, and anything that needs the device — H1's
+runner takes those. The `Plan` SHA is the artifact key H1a will write into every row.
 
 ## 5. The first measurable milestone
 
