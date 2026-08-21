@@ -171,7 +171,7 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | **Doc 56 H0 — the analytical planner, host-only** | `llms/shared/plan/test_plan.py`, pinned in `run_seam_tests.lit` (`PLAN: 10/10`) | **done** 2026-08-21 ([56 §4](56-full-model-mixed-precision-study-plan.md)). `ModelGraph` + golden JSON for Qwen3-0.6B / Llama-1B; `plan()` reproduces both drivers' shipped ELF sequences, launch counts and host split from structure (fused-cast = +1 cast launch; lean-form predicate; LM-head pin), `study_skip` ≡ `profiles.skip_reason` over every family, solver vs registry 61 / 136 identical with every mismatch in a named class. One finding: the Qwen3-0.6B LM head at `m_input = 8` could be 10 × 16384 instead of 19 × 8192 (−9 boundaries ≈ −1 ms/token, untested) |
 | **LM head re-partitioned from the planner's finding: 19 × 8192 → 9 × 16384 + 4480** | probe (exact, −1.10 ms), `make verify`, `make profile` ×2 | **done, landed** 2026-08-21 (devq 476 / 478 / 479, [57 §5 item 5b](57-inference-path-optimizations-from-hexagon.md)). Verify PASS; `lm_head_gemv` kernel **8.79 → 7.90 ms** per token, ELF 8.3 → 2.6 MB. Mixed partition sizes via `build_lm_head_gemv_module(parts=…)`; the BD repeat cap at `m_input = 8` admits 16384 rows. Qwen3-0.6B decode token: 89 (08-20) → ~75 ms after O1 + `m_input = 8` + this |
 | **O4 — int4 LM head** | `probe_o4_lm_head_int4.py` (one `air.launch`, 19 iterations; RTN gs=128) | **blocked on compile time** 2026-08-21: the module parses, `aircc` did not finish in 75 min twice (devq 468 + a detached build). Two routes in [57 §5 item 6](57-inference-path-optimizations-from-hexagon.md): bisect the pass on a 2-iteration module, or ten `air.launch`es of the int4 GEMV |
-| **Mixed-partition LM head ported to Qwen3-1.7B** | `make verify` | **done, landed** 2026-08-21 (devq 485). 19 → 10 launches at K = 2048; PASS 2 / 2; profile pending |
+| **Mixed-partition LM head ported to Qwen3-1.7B** | `make verify`, `make profile` ×2 | **done, landed** 2026-08-21 (devq 485, 487). 19 → 10 launches at K = 2048; PASS 2 / 2; `lm_head_gemv` 15.9–16.2 → **14.6–14.95 ms**; **7.70 / 7.83 tok/s ≈ 128–130 ms per token** (a CPU-only compile started mid-run; kernel lines unaffected) |
 
 ## `[2026-08-21]` Where things stand, for a session picking this up cold
 
@@ -233,8 +233,8 @@ bf16 decode 77 ms/token (12.96–13.12 tok/s), devq 486, idle host, Turbo**. **D
 
 **What a next session can pick up, by value per hour:**
 
-1. ~~Re-profile the current tree~~ done (devq 486, 77 ms/token). **Profile Qwen3-1.7B** after its
-   head change (one `make profile N_TOKENS=32` ×2, idle host).
+1. ~~Re-profile the current tree~~ done: Qwen3-0.6B **77 ms/token** (devq 486), Qwen3-1.7B
+   **128–130 ms/token** (devq 487).
 2. **The re-execution family** — the systematic matrix (launch-0 kind × GEMV geometry × dispatch
    index) with BD dumps per configuration; seven rows exist. Until it is understood, every new
    multi-launch form needs the gate shape (`fused_reexec_gate.py` / `lm_head_reexec_gate.py`) run

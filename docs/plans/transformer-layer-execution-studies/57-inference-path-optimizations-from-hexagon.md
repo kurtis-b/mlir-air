@@ -442,8 +442,10 @@ H2/H3 phases measure.
    42 → 13 s. The layer-loop wall of that profile (2395–2433 ms) is **not** a token number:
    a detached int4 compile was pinning a core and the per-layer host glue slowed 0.2 ms
    while the device kernel lines did not move — re-profiled clean below when the compile
-   ended. Llama-1B's head has the same 2,816-pad-row waste (7 × 16384 + 13568, same launch
-   count; ~0.36 ms) and is not yet ported.
+   ended. **Ported to Qwen3-1.7B the same night** (devq 485 verify PASS, 487 profile):
+   `lm_head_gemv` 15.9–16.2 → **14.6–14.95 ms**, the token **7.70 / 7.83 tok/s ≈ 128–130 ms**.
+   Llama-1B's head has the same 2,816-pad-row waste (7 × 16384 + 13568, same launch count;
+   ~0.36 ms) and is not yet ported.
 6. **O4**: int4 LM head; predicted 9.7 → ~3 ms. **`[2026-08-21]` BLOCKED on compile time,
    unmeasured.** `probe_o4_lm_head_int4.py` (evidence root) builds the head with the int4 packed
    GEMV (`matvec_int4_packed.build_module`, RTN uint4 gs=128 via `awq_pack.fake_quantize_awq_int4`,
