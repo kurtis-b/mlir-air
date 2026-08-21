@@ -454,10 +454,14 @@ H2/H3 phases measure.
    `air.launch`, 231 lines) but `aircc` did not finish in **75 minutes, twice** (devq 468, then a
    detached build in its own cwd), single-threaded in the MLIR pipeline before any core compile.
    The llama int4 per-layer GEMVs (one iteration, M = 2048) compile in seconds, so the cost is in
-   the 19-iteration × 8-core × 128-tile runtime sequence some pass unrolls. Next: bisect the
-   pass with `--debug-ir` on a 2-iteration module, or build the head as ten `air.launch`es of
-   the int4 GEMV (the bf16 head's shape, 10 boundaries) which compiles like the per-layer ones.
-   The payoff is still the largest single decode item (bf16 head 7.9 ms of a ~75 ms token).
+   the 19-iteration × 8-core × 128-tile runtime sequence some pass unrolls. **Bisected the same
+   night** (`job_o4_bisect.sh`): 1 and 2 iterations compile in 16–17 s; **4 iterations fail at
+   `aiecc` — `'aiex.npu.push_queue' op Repeat count exceeds the [0:255] range`** — the single
+   launch's iteration loop folds into one BD repeat, so the "one configuration for the whole head"
+   form is impossible past 2 iterations at this geometry (the same cap that pins the bf16 head's
+   rows per launch), and the 19-iteration compile was lost in a pass before that check. The int4
+   head therefore takes the bf16 head's shape — ten stitched `air.launch`es, 10 boundaries —
+   and what int4 buys is bytes alone (319 → ~88 MB): `probe_o4b_int4_stitched.py`, devq 488.
 7. Then O3 / O5 / O6(ii) / O8 / O9 per [56](56-full-model-mixed-precision-study-plan.md)'s phases.
 
 ## 6. What does not transfer, restated for the inference path
