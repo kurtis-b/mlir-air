@@ -237,6 +237,24 @@ anywhere from builder to device is what flips it), needs no HF weights, and carr
 to drop that line. Through `make check-lm-head-reexec` from a scratch cwd (the lit's
 invocation) it reads the same 2 / 7 (devq 458).
 
+**`[2026-08-21, later]` The defect follows a GEMV as the ELF's FIRST launch.** The 3-launch
+QKV stage (host RMSNorm, §5 item 5 — the RMSNorm launch removed, so the `[wq; wk; wv]` GEMV
+becomes launch 0) **hangs** (`ERT_CMD_STATE_TIMEOUT`) on its second consecutive dispatch,
+every time (devq 475, 480: `rq3 ×3` hangs at dispatch 2; `rq4 ×3`, whose launch 0 is the
+RMSNorm, runs clean; either ELF alone, or the two alternated, run clean in both orders, devq
+477). The 4-launch and 8-launch stages, the 6-launch llama stage and `o_gemv_ffn` all begin
+with a non-GEMV launch and all re-execute clean; the LM head begins with a GEMV and returns
+wrong values back-to-back; this form begins with a GEMV and hangs. Two data points with
+the same discriminator: whatever state a `matvec.py` GEMV leaves in its partition is not
+reset when the same ELF's launch 0 reconfigures that partition immediately after the ELF's
+last launch ran — an intervening configuration of *anything else* (the next ELF in production,
+the RMSNorm launch inside the 4-launch form) is what heals it. The settling experiment is
+now cheap: prepend a near-empty non-GEMV launch to the LM-head ELF and re-run the gate; if
+it passes, the defect is "GEMV at launch 0", and the fix is either that prologue (one ~107 µs
+boundary) or the real reset in the loader/compiler. **Until then the 3-launch QKV form is not
+shipped** — production never runs the stage back-to-back, but a form that hangs is not one
+to ship on that argument.
+
 ## 2. The structural fact: every `air.launch` boundary is a partition reconfiguration
 
 [29](29-offload-n-streams.md) records the multi-launch mechanism: a module with N
