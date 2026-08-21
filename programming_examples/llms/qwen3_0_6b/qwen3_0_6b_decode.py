@@ -122,8 +122,24 @@ def _rms_qkv_qknorm_rope_gemv_backend(verbose=False):
 # n_part must be <= 8192 (8192/32 - 1 = 255). 19 * 8192 = 155648 >= 151936;
 # the final partition carries 3712 zero-padded rows (logits truncated to
 # vocab on host).
-_LM_N_PARTITIONS = 19
-_LM_N_PART = 8192  # % 64 == 0; n_part/32 - 1 = 255 (at the repeat-count limit)
+# `[2026-08-21]` Mixed partitions: 9 full partitions at the BD-repeat cap for
+# m_input 8 (16384 rows: 16384/64 launch iterations x 1 kernel call = 256
+# broadcasts, repeat 255) plus one 4480-row tail on the 64-row tile grid --
+# 10 launches and 64 pad rows against the former 19 x 8192 (3712 pad rows).
+# Measured 9.35 -> 8.25 ms per token on the probe (devq 476); the planner
+# (shared/plan, doc 56 H0) derived it. Gated by `make verify`.
+_LM_PARTS = tuple([16384] * 9 + [4480])   # sum 151936 == vocab
+_LM_N_PARTITIONS = len(_LM_PARTS)
+_LM_N_PART = 8192  # the pre-2026-08-21 uniform partition (repeat cap at m_input 4); kept for A/B
+
+
+def lm_head_partition_slices(vocab_size):
+    """[(start, end)] of the vocab rows each partition carries (end clipped to vocab)."""
+    out, start = [], 0
+    for rows in _LM_PARTS:
+        out.append((start, min(start + rows, vocab_size)))
+        start += rows
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -233,8 +249,7 @@ def build_lm_head_gemv_qwen_module(emb_dim):
 
     return build_lm_head_gemv_module(
         emb_dim=emb_dim,
-        n_partitions=_LM_N_PARTITIONS,
-        n_part=_LM_N_PART,
+        parts=_LM_PARTS,
         tile_m=8,
         # m_input 8 (one kernel call per 8-row tile, B-broadcast repeat ~127)
         # measured 8.5 % faster than m_input 4 at the same launch count and

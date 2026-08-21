@@ -394,6 +394,20 @@ H2/H3 phases measure.
    the QK-norm + RoPE pair (2 boundaries; an epilogue needs each column to own whole heads,
    i.e. a column-contiguous row distribution that the current L2-staged GEMV does not have —
    a new core kernel). Each remaining boundary is worth ~107 µs × 28 = 3 ms/token.
+5b. **`[2026-08-21]` LM-head partitioning, the planner's finding — DONE and LANDED** (devq
+   476 probe, 478 verify, 479 profile). Doc 56 H0's planner derived that at `m_input = 8`
+   the BD repeat cap admits 16384-row partitions, and that stitching takes launches of
+   *different* shapes, so the Qwen3-0.6B head can be **9 × 16384 + 1 × 4480 = 10 launches
+   with 64 pad rows** instead of 19 × 8192 with 3,712: 9 boundaries and 7.6 MB fewer.
+   Probe (same weights, exact outputs): **9.348 → 8.253 ms** (−1.10; predicted −1.2).
+   Production (`_LM_PARTS` in `qwen3_0_6b_decode.py`, `build_lm_head_gemv_module(parts=…)`,
+   preload / `_run_lm_head` / the re-exec gate over the partition list): `make verify`
+   **PASS**, `lm_head_gemv` kernel **8.79 → 7.90 / 7.95 ms**, ELF 8.3 → 2.56 MB, compile
+   42 → 13 s. The layer-loop wall of that profile (2395–2433 ms) is **not** a token number:
+   a detached int4 compile was pinning a core and the per-layer host glue slowed 0.2 ms
+   while the device kernel lines did not move — re-profiled clean below when the compile
+   ended. Llama-1B's head has the same 2,816-pad-row waste (7 × 16384 + 13568, same launch
+   count; ~0.36 ms) and is not yet ported.
 6. **O4**: int4 LM head; predicted 9.7 → ~3 ms.
 7. Then O3 / O5 / O6(ii) / O8 / O9 per [56](56-full-model-mixed-precision-study-plan.md)'s phases.
 

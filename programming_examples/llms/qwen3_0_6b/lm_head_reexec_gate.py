@@ -42,11 +42,15 @@ for _p in (_HERE, _HERE.parent, _HERE.parent.parent, _HERE.parent.parent / "matr
 
 from shared.infra.cache import KernelCache  # noqa: E402
 from qwen3_0_6b_decode import (  # noqa: E402
-    _LM_N_PART,
-    _LM_N_PARTITIONS,
+    _LM_PARTS,
     _lm_gemv_backend,
     build_lm_head_gemv_qwen_module,
 )
+
+_OFFS = [0]
+for _r in _LM_PARTS:
+    _OFFS.append(_OFFS[-1] + _r)
+_N_ROWS = _OFFS[-1]
 
 EMB = 1024
 TINY_M = 64
@@ -66,25 +70,26 @@ def main():
     cache.compile_and_cache("other_gemv", _other_module(),
                             {**_lm_gemv_backend(), "instance_name": "matvec_bf16"})
     cache._save_manifest()
-    print(f"[reexec] compiled production lm_head_gemv ({_LM_N_PARTITIONS} x {_LM_N_PART}) "
+    print(f"[reexec] compiled production lm_head_gemv (partitions {list(_LM_PARTS)}) "
           f"+ a 1-launch other ELF in {time.perf_counter() - t0:.0f}s", flush=True)
 
     rng = np.random.default_rng(0)
-    W = (rng.standard_normal((_LM_N_PARTITIONS * _LM_N_PART, EMB), dtype=np.float32) * 0.02).astype(bfloat16)
+    W = (rng.standard_normal((_N_ROWS, EMB), dtype=np.float32) * 0.02).astype(bfloat16)
     xs = [rng.standard_normal(EMB, dtype=np.float32).astype(bfloat16) for _ in range(2)]
     refs = [x.astype(np.float32) @ W.astype(np.float32).T for x in xs]
     Wt = (rng.standard_normal((TINY_M, EMB), dtype=np.float32) * 0.02).astype(bfloat16)
 
     def run_head(x):
         ins = [x]
-        for p in range(_LM_N_PARTITIONS):
-            ins.append(np.ascontiguousarray(W[p * _LM_N_PART:(p + 1) * _LM_N_PART]))
-            ins.append(np.zeros(_LM_N_PART, dtype=bfloat16))
+        n = len(_LM_PARTS)
+        for p, rows in enumerate(_LM_PARTS):
+            ins.append(np.ascontiguousarray(W[_OFFS[p]:_OFFS[p + 1]]))
+            ins.append(np.zeros(rows, dtype=bfloat16))
         res = cache.load_and_run("lm_head_gemv", _lm_gemv_backend(), *ins,
-                                 output_indices=[2 + 2 * p for p in range(_LM_N_PARTITIONS)],
-                                 static_input_indices={1 + 2 * p for p in range(_LM_N_PARTITIONS)},
-                                 intermediate_indices={2 + 2 * p for p in range(_LM_N_PARTITIONS)})
-        return np.concatenate([np.asarray(res[2 + 2 * p]).astype(np.float32) for p in range(_LM_N_PARTITIONS)])
+                                 output_indices=[2 + 2 * p for p in range(n)],
+                                 static_input_indices={1 + 2 * p for p in range(n)},
+                                 intermediate_indices={2 + 2 * p for p in range(n)})
+        return np.concatenate([np.asarray(res[2 + 2 * p]).astype(np.float32) for p in range(n)])
 
     def run_other(x):
         cache.load_and_run("other_gemv", {**_lm_gemv_backend(), "instance_name": "matvec_bf16"},
@@ -97,11 +102,11 @@ def main():
         bad = np.nonzero(rel > 1e-2)[0]
         finite = bool(np.all(np.isfinite(out)))
         same = bool(np.array_equal(out, base)) if base is not None else True
-        parts = sorted({int(i // _LM_N_PART) for i in bad})
+        parts = sorted({int(np.searchsorted(_OFFS, i, side="right") - 1) for i in bad})
         clean = finite and bad.size == 0 and same
         print(f"[reexec] {tag}: {'clean' if clean else 'WRONG'} -- max_rel {rel.max():.2e} "
               f"n_bad {bad.size}/{ref.size} partitions {parts} "
-              f"first_rows {[int(i % _LM_N_PART) for i in bad[:6]]}"
+              f"first_rows {[int(i - _OFFS[np.searchsorted(_OFFS, i, side='right') - 1]) for i in bad[:6]]}"
               f"{'' if base is None else f' bit_identical_to_first {same}'} finite {finite}", flush=True)
         return clean
 
