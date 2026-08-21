@@ -237,23 +237,35 @@ anywhere from builder to device is what flips it), needs no HF weights, and carr
 to drop that line. Through `make check-lm-head-reexec` from a scratch cwd (the lit's
 invocation) it reads the same 2 / 7 (devq 458).
 
-**`[2026-08-21, later]` The defect follows a GEMV as the ELF's FIRST launch.** The 3-launch
-QKV stage (host RMSNorm, §5 item 5 — the RMSNorm launch removed, so the `[wq; wk; wv]` GEMV
-becomes launch 0) **hangs** (`ERT_CMD_STATE_TIMEOUT`) on its second consecutive dispatch,
-every time (devq 475, 480: `rq3 ×3` hangs at dispatch 2; `rq4 ×3`, whose launch 0 is the
-RMSNorm, runs clean; either ELF alone, or the two alternated, run clean in both orders, devq
-477). The 4-launch and 8-launch stages, the 6-launch llama stage and `o_gemv_ffn` all begin
-with a non-GEMV launch and all re-execute clean; the LM head begins with a GEMV and returns
-wrong values back-to-back; this form begins with a GEMV and hangs. Two data points with
-the same discriminator: whatever state a `matvec.py` GEMV leaves in its partition is not
-reset when the same ELF's launch 0 reconfigures that partition immediately after the ELF's
-last launch ran — an intervening configuration of *anything else* (the next ELF in production,
-the RMSNorm launch inside the 4-launch form) is what heals it. The settling experiment is
-now cheap: prepend a near-empty non-GEMV launch to the LM-head ELF and re-run the gate; if
-it passes, the defect is "GEMV at launch 0", and the fix is either that prologue (one ~107 µs
-boundary) or the real reset in the loader/compiler. **Until then the 3-launch QKV form is not
-shipped** — production never runs the stage back-to-back, but a form that hangs is not one
-to ship on that argument.
+**`[2026-08-21, later]` More data points, and no single rule yet.** The same-ELF re-execution
+family, every observation under recorded Turbo, each ELF built from the same `matvec.py`
+GEMV and the same stitching:
+
+| ELF (launch 0 first) | dispatch 1 | back-to-back dispatches | devq |
+|---|---|---|---|
+| `19 × GEMV(8192, m_input 4)` — the 08-20 production head, 128 iterations/launch | clean | **wrong values**, non-deterministic, partition 0 | 446–448, 452, 458 |
+| `19 × GEMV(8192, m_input 8)` | clean | wrong (fewer rows) | 448 |
+| `38 × GEMV(4096, m_input 4)`, 64 iterations | clean | clean | 446–447 |
+| `9 × GEMV(16384, m_input 8) + GEMV(4480)` — **the production head since 03:22 today**, 256 iterations | clean | **clean ×3** | 482 |
+| `RMSNorm(1024) → 9 × GEMV(16384, m_input 8) + GEMV(4480)` | **HANG** (`ERT_CMD_STATE_TIMEOUT`) | — | 482 |
+| `GEMV(4096, m_input 4) → QK-norm → RoPE` — the 3-launch QKV form | clean | **HANG** at dispatch 2, every time; clean when alternated with another ELF | 475, 477, 480, 481, 483 |
+| `RMSNorm → GEMV(4096, m_input 4) → QK-norm → RoPE` — the 4-launch production stage | clean | clean ×3 (and 28 × per token in production, never adjacent) | 461–463, 480 |
+
+What survives: the defect is **not** "a GEMV at launch 0" (row 4 refutes it), **not** the repeat
+count alone (rows 1 and 4 are both at repeat 255), and **not** a property of the 8192-row
+launch only (row 6 hangs at 4096). What the rows do share is that a `matvec.py` GEMV launch's
+partition state after one execution is sometimes not what the next configuration of the
+same partition expects — and which configurations are fragile is a function of the launch
+geometry that this table has five points on and no model of. Two things are settled:
+**production today (row 4 head, row 7 stage) re-executes clean**, and the 3-launch QKV form
+(row 6) is **not shipped** — it bought only 0.027 ms/layer (0.7 ms/token; the first launch's
+boundary is evidently cheaper than a mid-ELF one, and 29 µs of it moved to the host) while
+being the one form that hangs. A side finding from the same probe: the host RMSNorm is
+*more accurate* than the device kernel (vs f32: `normed` 3.6e-3 against 4.1e-2 — the device
+truncates `rstd` to bf16 before the multiply), which is a kernel improvement to make
+independently of launch counts. The systematic study — a matrix of launch-0 kind ×
+GEMV geometry × dispatch index, with `aie-translate` dumps of the shim BDs per configuration
+— is the next step for whoever takes the defect; the five rows above are its seed.
 
 ## 2. The structural fact: every `air.launch` boundary is a partition reconfiguration
 
@@ -407,8 +419,11 @@ H2/H3 phases measure.
    8-launch builder: its verify is oomd-deferred, so the port cannot be gated. The host side
    of the 4-launch stage now lives in `shared/infra/decode_qkv4.py` (one owner of the 9-arg
    layout for every Qwen3 driver).
-   **What is left of O1** (the predicted ~0.4 ms needs 4 → 1–2): the RMSNorm launch
-   (1 boundary; fold as a prologue on the broadcast `x` or precompute `rstd` host-side) and
+   **What is left of O1** (the predicted ~0.4 ms needs 4 → 1–2): ~~the RMSNorm launch
+   (1 boundary; fold as a prologue on the broadcast `x` or precompute `rstd` host-side)~~
+   **`[2026-08-21, later]` tried as host RMSNorm (3 launches): −0.027 ms/layer only, and
+   the form hangs when re-executed back-to-back (§1.5's table, row 6) — not shipped; the
+   builder keeps `host_rmsnorm=True` for the day the defect is understood** — and
    the QK-norm + RoPE pair (2 boundaries; an epilogue needs each column to own whole heads,
    i.e. a column-contiguous row distribution that the current L2-staged GEMV does not have —
    a new core kernel). Each remaining boundary is worth ~107 µs × 28 = 3 ms/token.
