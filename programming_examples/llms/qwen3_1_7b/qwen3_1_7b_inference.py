@@ -43,8 +43,8 @@ from qwen3_1_7b_decode import (
     prep_rms_qkv4_weights,
     _o_gemv_ffn_backend,
     _lm_gemv_backend,
-    _LM_N_PARTITIONS,
-    _LM_N_PART,
+    _LM_PARTS,
+    lm_head_partition_slices,
 )
 
 EPS = 1e-6
@@ -251,27 +251,26 @@ def _preload_decode_weights(decode_cache, weights, config):
 
     # LM-head GEMV weights (19 partitions, n_part=8192).
     weights._lm_weight_parts_gemv = []
-    for p in range(_LM_N_PARTITIONS):
-        n_start = p * _LM_N_PART
-        n_end = min(n_start + _LM_N_PART, vocab_size)
-        w = np.zeros((_LM_N_PART, emb_dim), dtype=bfloat16)
+    for rows, (n_start, n_end) in zip(_LM_PARTS, lm_head_partition_slices(vocab_size)):
+        w = np.zeros((rows, emb_dim), dtype=bfloat16)
         if n_end > n_start:
             w[: n_end - n_start, :] = np.ascontiguousarray(
                 weights.lm_head[n_start:n_end, :]
             ).astype(bfloat16)
         weights._lm_weight_parts_gemv.append(w)
 
+    n_parts = len(_LM_PARTS)
     lm_inputs = [np.zeros(emb_dim, dtype=bfloat16)]
-    for p in range(_LM_N_PARTITIONS):
+    for p, rows in enumerate(_LM_PARTS):
         lm_inputs.append(weights._lm_weight_parts_gemv[p])
-        lm_inputs.append(np.zeros(_LM_N_PART, dtype=bfloat16))
+        lm_inputs.append(np.zeros(rows, dtype=bfloat16))
     decode_cache.load_and_run(
         "lm_head_gemv",
         _lm_gemv_backend(),
         *lm_inputs,
-        output_indices=[2 + 2 * p for p in range(_LM_N_PARTITIONS)],
-        static_input_indices={1 + 2 * p for p in range(_LM_N_PARTITIONS)},
-        intermediate_indices={2 + 2 * p for p in range(_LM_N_PARTITIONS)},
+        output_indices=[2 + 2 * p for p in range(n_parts)],
+        static_input_indices={1 + 2 * p for p in range(n_parts)},
+        intermediate_indices={2 + 2 * p for p in range(n_parts)},
     )
 
     decode_cache.profiler.enabled = _was
@@ -285,24 +284,23 @@ def _preload_decode_weights(decode_cache, weights, config):
 
 
 def _run_lm_head(decode_cache, weights, x_normed_bf16, vocab_size):
+    n_parts = len(_LM_PARTS)
     lm_inputs = [x_normed_bf16.flatten().astype(bfloat16)]
     out_idx = []
-    for p in range(_LM_N_PARTITIONS):
+    for p, rows in enumerate(_LM_PARTS):
         lm_inputs.append(weights._lm_weight_parts_gemv[p])
-        lm_inputs.append(np.zeros(_LM_N_PART, dtype=bfloat16))
+        lm_inputs.append(np.zeros(rows, dtype=bfloat16))
         out_idx.append(2 + 2 * p)
     res = decode_cache.load_and_run(
         "lm_head_gemv",
         _lm_gemv_backend(),
         *lm_inputs,
         output_indices=out_idx,
-        static_input_indices={1 + 2 * p for p in range(_LM_N_PARTITIONS)},
-        intermediate_indices={2 + 2 * p for p in range(_LM_N_PARTITIONS)},
+        static_input_indices={1 + 2 * p for p in range(n_parts)},
+        intermediate_indices={2 + 2 * p for p in range(n_parts)},
     )
     logits = np.zeros(vocab_size, dtype=np.float32)
-    for p in range(_LM_N_PARTITIONS):
-        n_start = p * _LM_N_PART
-        n_end = min(n_start + _LM_N_PART, vocab_size)
+    for p, (n_start, n_end) in enumerate(lm_head_partition_slices(vocab_size)):
         logits[n_start:n_end] = res[2 + 2 * p][: n_end - n_start].astype(np.float32)
     return logits
 
