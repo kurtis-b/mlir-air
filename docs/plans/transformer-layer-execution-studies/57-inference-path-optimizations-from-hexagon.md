@@ -49,11 +49,14 @@ The Llama-3.2-1B bf16 path (June table: 12.2 tok/s, 2.47 GB/token) implies ~30 G
 because its weight matrices are bigger per launch (emb 2048, hidden 8192) and amortize the
 same fixed costs better — which is the first hint of §2.
 
-**`[2026-08-21]` The table above is the 2026-08-20 baseline; two landed changes move it** (§5
-items 3c and 5, same-session before/after under recorded Turbo): `lm_head` 9.77 → **8.79 ms**
-(`m_input = 8`) and `rms_qkv` 1.03 → **0.62 ms** (8 → 4 launches) — per layer 2.92 → 2.52 ms,
-layer loop −11.5 ms/token, token **89 → ~76.5 ms**. Boundaries per token: 28 × 7 + 19 = **215**
-(from 327), ≈ 23 ms ≈ 30 % of the new token.
+**`[2026-08-21]` The table above is the 2026-08-20 baseline; three landed changes move it** (§5
+items 3c, 5 and 5b, each a same-session before/after under recorded Turbo): `lm_head` 9.77 →
+8.79 (`m_input = 8`) → **7.63 ms** (9 × 16384 + 4480), `rms_qkv` 1.03 → **0.62 ms** (8 → 4
+launches), `o_gemv_ffn` 1.53 unchanged. **Clean idle-host profile of the tree at `fd7e17b8`
+(devq 486, `make profile N_TOKENS=32` ×2, load 1.2): 12.96 / 13.12 tok/s — 77 ms per token**,
+per layer 2.45–2.47 ms, layer loop 2187–2217 ms / 896 invocations, against 89 ms (11.2 tok/s)
+on 2026-08-20. Boundaries per token: 28 × 7 + 10 = **206** (from 327), ≈ 22 ms ≈ 29 % of the new
+token; the three changes moved no new bytes and added no kernel.
 
 ### 1.2 Qwen3-0.6B bf16, prefill at `seq_len = 2048` (same run)
 
@@ -441,7 +444,18 @@ H2/H3 phases measure.
    while the device kernel lines did not move — re-profiled clean below when the compile
    ended. Llama-1B's head has the same 2,816-pad-row waste (7 × 16384 + 13568, same launch
    count; ~0.36 ms) and is not yet ported.
-6. **O4**: int4 LM head; predicted 9.7 → ~3 ms.
+6. **O4**: int4 LM head; predicted 9.7 → ~3 ms. **`[2026-08-21]` BLOCKED on compile time,
+   unmeasured.** `probe_o4_lm_head_int4.py` (evidence root) builds the head with the int4 packed
+   GEMV (`matvec_int4_packed.build_module`, RTN uint4 gs=128 via `awq_pack.fake_quantize_awq_int4`,
+   `pack_inputs`), whose `M_PER_LAUNCH` chunks are *iterations of one `air.launch`* — so the whole
+   head would be **one configuration** instead of ten. The module builds and parses (one
+   `air.launch`, 231 lines) but `aircc` did not finish in **75 minutes, twice** (devq 468, then a
+   detached build in its own cwd), single-threaded in the MLIR pipeline before any core compile.
+   The llama int4 per-layer GEMVs (one iteration, M = 2048) compile in seconds, so the cost is in
+   the 19-iteration × 8-core × 128-tile runtime sequence some pass unrolls. Next: bisect the
+   pass with `--debug-ir` on a 2-iteration module, or build the head as ten `air.launch`es of
+   the int4 GEMV (the bf16 head's shape, 10 boundaries) which compiles like the per-layer ones.
+   The payoff is still the largest single decode item (bf16 head 7.9 ms of a ~75 ms token).
 7. Then O3 / O5 / O6(ii) / O8 / O9 per [56](56-full-model-mixed-precision-study-plan.md)'s phases.
 
 ## 6. What does not transfer, restated for the inference path

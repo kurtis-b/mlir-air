@@ -170,6 +170,8 @@ Update the status column as phases land. A phase is `done` only when its gate pa
 | **O1 + `m_input = 8` ported to Qwen3-1.7B** | stage probe at emb 2048; `make verify` twice (4-launch stage, then `m_input = 8`); `make profile` ×2 | **done, landed** 2026-08-21 (devq 465–470). Probe 1.326 → 0.873 ms/layer; both verifies PASS 2 / 2; `rms_qkv` 0.80 ms, LM head 16.4 → 15.9–16.2 ms; **≈127–130 ms per token** under recorded Turbo (first such number for 1.7B). Host helpers moved to `shared/infra/decode_qkv4.py`. Qwen3-4B not ported: its verify is oomd-deferred, so the port cannot be gated |
 | **Doc 56 H0 — the analytical planner, host-only** | `llms/shared/plan/test_plan.py`, pinned in `run_seam_tests.lit` (`PLAN: 10/10`) | **done** 2026-08-21 ([56 §4](56-full-model-mixed-precision-study-plan.md)). `ModelGraph` + golden JSON for Qwen3-0.6B / Llama-1B; `plan()` reproduces both drivers' shipped ELF sequences, launch counts and host split from structure (fused-cast = +1 cast launch; lean-form predicate; LM-head pin), `study_skip` ≡ `profiles.skip_reason` over every family, solver vs registry 61 / 136 identical with every mismatch in a named class. One finding: the Qwen3-0.6B LM head at `m_input = 8` could be 10 × 16384 instead of 19 × 8192 (−9 boundaries ≈ −1 ms/token, untested) |
 | **LM head re-partitioned from the planner's finding: 19 × 8192 → 9 × 16384 + 4480** | probe (exact, −1.10 ms), `make verify`, `make profile` ×2 | **done, landed** 2026-08-21 (devq 476 / 478 / 479, [57 §5 item 5b](57-inference-path-optimizations-from-hexagon.md)). Verify PASS; `lm_head_gemv` kernel **8.79 → 7.90 ms** per token, ELF 8.3 → 2.6 MB. Mixed partition sizes via `build_lm_head_gemv_module(parts=…)`; the BD repeat cap at `m_input = 8` admits 16384 rows. Qwen3-0.6B decode token: 89 (08-20) → ~75 ms after O1 + `m_input = 8` + this |
+| **O4 — int4 LM head** | `probe_o4_lm_head_int4.py` (one `air.launch`, 19 iterations; RTN gs=128) | **blocked on compile time** 2026-08-21: the module parses, `aircc` did not finish in 75 min twice (devq 468 + a detached build). Two routes in [57 §5 item 6](57-inference-path-optimizations-from-hexagon.md): bisect the pass on a 2-iteration module, or ten `air.launch`es of the int4 GEMV |
+| **Mixed-partition LM head ported to Qwen3-1.7B** | `make verify` | **done, landed** 2026-08-21 (devq 485). 19 → 10 launches at K = 2048; PASS 2 / 2; profile pending |
 
 ## `[2026-08-21]` Where things stand, for a session picking this up cold
 
@@ -197,10 +199,9 @@ directory clobber each other — give each its own subdirectory.
    `make verify`**: `m_input = 8` on the LM head (−1.0 ms); the QKV stage at **4 launches** instead
    of 8 — one GEMV over `[wq; wk; wv]`, one per-row-weighted QK-norm, one RoPE, no new kernel,
    bit-identical (−11.5 ms); and the LM head as **9 × 16384 + 4480 mixed partitions** (10 launches,
-   64 pad rows; −0.85 ms kernel). Qwen3-1.7B got the first two (≈127–130 ms/token, its first
-   recorded-Turbo number). The last clean per-token profile is devq 463 (before the head change);
-   devq 479's layer-loop wall was confounded by a background compile — **re-profile before citing a
-   token number for the current tree** (`make profile N_TOKENS=32`, idle host).
+   64 pad rows; −0.85 ms kernel). **Clean idle-host profile of the tree at `fd7e17b8` (devq 486):
+   12.96 / 13.12 tok/s = 77 ms per token**, from 89 ms (11.2 tok/s) on 08-20. Qwen3-1.7B got all
+   three (≈127–130 ms/token before its head change; its profile after it is pending).
 3. **O2 (runlist pairs) measured small** — −2 to −4 ms/token once the prototype's own overhead
    was removed (`dispatch._plan_memo`); kept behind `QWEN3_DECODE_RUNLIST=1`, not production.
 4. **Doc 56 H0 — the analytical planner — landed** (`llms/shared/plan/`, `PLAN: 10/10` in the seam
@@ -213,8 +214,9 @@ directory clobber each other — give each its own subdirectory.
    seven-row table has two other forms that *hang* (a 3-launch host-RMSNorm QKV stage, measured at
    only −0.7 ms/token and not shipped; an RMSNorm-prologue + 16384-row GEMVs ELF).
 6. **O4 (int4 LM head)**: the probe is written (`probe_o4_lm_head_int4.py`; the int4 builder expresses
-   the 19 partitions as iterations of ONE `air.launch`), but `aircc` on that module ran past 40 min
-   twice — see the status row for where it ended. Unmeasured.
+   the 19 partitions as iterations of ONE `air.launch`), but `aircc` on that module did not finish in
+   **75 min, twice** ([57 §5 item 6](57-inference-path-optimizations-from-hexagon.md) has the two routes
+   out). Unmeasured.
 
 **The regression legs**, all re-run on 2026-08-21 after the `dispatch.py` memo and the shared
 builder change: `check-air-mlir` not re-run (no compiler source moved); transformer-layer suite
@@ -225,14 +227,14 @@ the big three still operator-deferred).
 
 **Standing numbers to cite.** Layer study: doc 54 walk 2 and doc 32, unchanged. Model path: doc
 57 §1.5 (boundary 106–108 µs, 146 µs per `xrt.run`), §5 items 3c / 5 / 5b (kernel-line deltas,
-each a same-session before/after under recorded Turbo). **Do not cite** a per-token number for the
-current tree until re-profiled on an idle host (item 2), nor the June `llms/` table, nor Hexagon's
-figures as like-for-like.
+each a same-session before/after under recorded Turbo), and **§1.1's correction line: Qwen3-0.6B
+bf16 decode 77 ms/token (12.96–13.12 tok/s), devq 486, idle host, Turbo**. **Do not cite** the June
+`llms/` table nor Hexagon's figures as like-for-like.
 
 **What a next session can pick up, by value per hour:**
 
-1. **Re-profile the current tree** (one `make profile` ×2, idle host) and write the token number
-   into doc 57 §1.1's correction line.
+1. ~~Re-profile the current tree~~ done (devq 486, 77 ms/token). **Profile Qwen3-1.7B** after its
+   head change (one `make profile N_TOKENS=32` ×2, idle host).
 2. **The re-execution family** — the systematic matrix (launch-0 kind × GEMV geometry × dispatch
    index) with BD dumps per configuration; seven rows exist. Until it is understood, every new
    multi-launch form needs the gate shape (`fused_reexec_gate.py` / `lm_head_reexec_gate.py`) run
