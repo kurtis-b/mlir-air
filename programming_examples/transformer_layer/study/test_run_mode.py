@@ -191,39 +191,86 @@ def test_the_skipped_stats_sentinel_can_never_read_clean():
     assert out["mean_rel_L1"] != out["mean_rel_L1"]  # NaN: no number was computed
 
 
-def test_no_stage_stats_takes_the_warm_up_verdict_and_needs_a_warm_up():
-    """With the comparison out of the clock, correctness is the warm-up's: a
-    warm-up that fails its stages fails the row even though every timed
-    iteration reports the sentinel, and warmup=0 is refused outright."""
+def _fake_mode(fail_on_call=None):
+    """A fake mode whose dispatch reports the stats callback's verdict and can
+    be made to FAIL its stages on the n-th dispatch (1-based). Returns
+    (spec, calls) where calls records each dispatch's n_mismatch."""
     import numpy as np
     calls = []
 
     def fake_prepare(shape):
         expected = np.zeros((4, 4), dtype=np.float32)
+        wrong = np.ones((4, 4), dtype=np.float32)
 
         def dispatch(inputs, stage_stats):
-            st = stage_stats(expected, expected, atol=1e-3)
+            n = len(calls) + 1
+            actual = wrong if n == fail_on_call else expected
+            st = stage_stats(actual, expected, atol=1e-3)
             calls.append(st["n_mismatch"])
             return [expected], {"stages_passed": st["n_mismatch"] == 0}
 
         return {"dispatch": dispatch, "inputs": [expected], "expected": [expected]}
 
-    spec = {"operator": "fake", "prepare": fake_prepare, "atol": 1e-3,
-            "shape": {"seq_len": 4, "emb_dim": 4}}
+    return ({"operator": "fake", "prepare": fake_prepare, "atol": 1e-3,
+             "shape": {"seq_len": 4, "emb_dim": 4}}, calls)
+
+
+def _with_fake(spec, fn):
     saved = (run_mode._spec_for, run_mode._shape_for, run_mode.require_turbo)
     run_mode._spec_for = lambda mode: spec
     run_mode._shape_for = lambda spec, seq, family=None: (dict(spec["shape"]), "4x4_fake", "fake")
     run_mode.require_turbo = lambda: None
     try:
-        row = run_mode.run("fake", warmup=1, samples=2, runs_per_sample=1,
-                           stage_stats_in_clock=False)
-        assert row["run_status"] == "passed", row["failure_message"]
-        assert calls == [0, -1, -1], calls  # real comparison once, sentinel in the clock
-        try:
-            run_mode.run("fake", warmup=0, samples=1, runs_per_sample=1, stage_stats_in_clock=False)
-        except ValueError as exc:
-            assert "warmup >= 1" in str(exc)
-        else:
-            raise AssertionError("warmup=0 with --no-stage-stats was accepted")
+        return fn()
     finally:
         run_mode._spec_for, run_mode._shape_for, run_mode.require_turbo = saved
+
+
+def test_no_stage_stats_brackets_the_timed_population_with_two_real_checks():
+    """Warm-up (real), two timed (sentinel), post-check (real): the row passes
+    and the dispatch sequence is exactly that."""
+    spec, calls = _fake_mode()
+    row = _with_fake(spec, lambda: run_mode.run(
+        "fake", warmup=1, samples=2, runs_per_sample=1, stage_stats_in_clock=False))
+    assert row["run_status"] == "passed", row["failure_message"]
+    assert calls == [0, -1, -1, 0], calls
+
+
+def test_no_stage_stats_fails_the_row_when_the_warm_up_fails():
+    spec, calls = _fake_mode(fail_on_call=1)
+    row = _with_fake(spec, lambda: run_mode.run(
+        "fake", warmup=1, samples=2, runs_per_sample=1, stage_stats_in_clock=False))
+    assert row["run_status"] == "failed" and "stages_passed=False" in row["failure_message"], row
+    assert calls[0] == 16, calls  # the warm-up saw the mismatch
+
+
+def test_no_stage_stats_fails_the_row_when_the_post_check_fails():
+    spec, calls = _fake_mode(fail_on_call=4)  # warm-up, 2 timed, then the post-check
+    row = _with_fake(spec, lambda: run_mode.run(
+        "fake", warmup=1, samples=2, runs_per_sample=1, stage_stats_in_clock=False))
+    assert row["run_status"] == "failed" and "stages_passed=False" in row["failure_message"], row
+    assert calls == [0, -1, -1, 16], calls
+
+
+def test_the_default_path_fails_a_timed_mismatch_that_the_flag_cannot_see():
+    """The one asymmetry, pinned both ways: a mismatch confined to a timed
+    iteration fails the DEFAULT row and is invisible to the flagged one."""
+    spec, calls = _fake_mode(fail_on_call=3)  # the last timed dispatch
+    row = _with_fake(spec, lambda: run_mode.run(
+        "fake", warmup=1, samples=2, runs_per_sample=1))
+    assert row["run_status"] == "failed", row["failure_message"]
+    spec, calls = _fake_mode(fail_on_call=3)
+    row = _with_fake(spec, lambda: run_mode.run(
+        "fake", warmup=1, samples=2, runs_per_sample=1, stage_stats_in_clock=False))
+    assert row["run_status"] == "passed" and calls == [0, -1, -1, 0], (row["run_status"], calls)
+
+
+def test_no_stage_stats_needs_a_warm_up():
+    spec, _ = _fake_mode()
+    try:
+        _with_fake(spec, lambda: run_mode.run(
+            "fake", warmup=0, samples=1, runs_per_sample=1, stage_stats_in_clock=False))
+    except ValueError as exc:
+        assert "warmup >= 1" in str(exc)
+    else:
+        raise AssertionError("warmup=0 with --no-stage-stats was accepted")

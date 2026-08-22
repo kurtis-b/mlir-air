@@ -205,21 +205,28 @@ clock. What remains: (a) **`runlist`**'s 1.9× and `coarse`'s residual ~10 ms ar
 traffic — and `builders/block.py`'s `_sequence_*` rebuild every `BufferSpec` per forward, re-hashing
 the static weights (`content_key`, rule S1: 36 SHA-256 calls over ~14 MB per six forwards ≈ 6 ms
 each) before the pool decides nothing changed; iron keeps its weights resident once. (b)
-**`offload`**'s 6.4× is `device_ms` itself — 60.5 of 77.4 ms for 30 submissions — because the
-corrected `offload` runs attention and the small operators on the array where iron's keeps them
-on the host; that is the taxonomy difference §1 names, measured. Two follow-ups, both operator
-questions rather than increments: whether the study's measurement model should move the
-comparison out of the clock by default (every standing number in [27](27-common-ladder-result.md),
+**`offload`**'s 6.4× is `device_ms` itself — 60.5 of 77.4 ms — and it is **not attributed**:
+both ports use the same partition at this point (every LINEAR operator on the device, softmax /
+LayerNorm / GeLU on the host — `pattern/offload/offload.py`'s own contract) and both dispatch the
+same 30 GEMMs (six projections plus the per-head attention matmuls), so the residual is
+**~2.0 ms of execute+wait per submission here against ~0.4 ms per dispatch for iron's whole
+forward**. `device_ms` is a whole-mode total over unnamed dispatch vectors
+(`study/component_groups.py` says so), so which of the 30 carry it is not instrumented; the next
+increment, if the operator wants it, is per-submission device timing on those 30. Two follow-ups,
+both operator questions rather than increments: whether the study's measurement model should move
+the comparison out of the clock by default (every standing number in [27](27-common-ladder-result.md),
 [32](32-cost-decomposed-ladder.md) and §1 would shift down by the ~24–27 ms of comparison per
 forward), and whether rule S1's content key should be computed once per plan rather than per
-sequence (a `block.py` change that moves `coarse`/`fused` by ~6 ms).
+sequence (`builders/block.py` for `coarse` AND `pattern/fused/fused.py::_spec_buf` for `fused`,
+which hashes its own specs; ~6 ms per forward each).
 
 ## 6. Open after this document
 
 - **`runlist` at 16384**: a column-chunked device softmax (kernel + builder).
 - **Sub-256 / sub-512 lengths**: a smaller `parallel_seq` and smaller attention tiles, each
   measured as the current ones were; the `ast` pins flip the skips to rungs automatically.
-- **The iron latency gap** (§5): unattributed.
+- **The iron latency gap** (§5): attributed 2026-08-22 for the device-resident modes (the
+  comparison inside our clock); `offload`'s per-submission residual (~2.0 vs ~0.4 ms) is not.
 - **The big-three model leg**: `qwen25_3b`, `llama32_3b`, `qwen3_4b` deferred — their
   `verify` is oomd-killed with the whole session ([15](15-environment-notes.md)); 8/11 is the
   standing leg.

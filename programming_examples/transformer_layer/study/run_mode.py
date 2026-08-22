@@ -278,9 +278,12 @@ def run(
     """Run ``mode`` and return a schema row. Never raises for a run failure.
 
     ``stage_stats_in_clock=False`` (``--no-stage-stats``) moves the per-boundary
-    comparison out of the timed iterations: the warm-up still runs it and its
-    verdict stands in for the timed ones (so ``warmup >= 1`` is required), and
-    the final output check is unchanged. Opt-in; see ``_stage_stats_skipped``.
+    comparison out of the timed iterations: the warm-up still runs it (so
+    ``warmup >= 1`` is required), ONE MORE untimed dispatch runs it after the
+    timed population, both must pass for the row to, and the final output check
+    is unchanged. A mismatch confined to a timed iteration between those two
+    checks is the one thing this path cannot see that the default can; the
+    default stays the default. Opt-in; see ``_stage_stats_skipped``.
     """
     if not stage_stats_in_clock and warmup < 1:
         raise ValueError("--no-stage-stats needs warmup >= 1: the warm-up is the correctness check")
@@ -354,6 +357,11 @@ def run(
                 _collect_ms_decomposition(decomposition, extra)
             durations.append(time.perf_counter() - t0)
         # --- clock stops ---------------------------------------------------
+        if not stage_stats_in_clock:
+            # The post-check: the real comparison once more, outside the clock,
+            # so the timed population is bracketed by two verified dispatches.
+            _, post_extra = dispatch(inputs, _stage_stats)
+            warm_stages_ok = warm_stages_ok and bool(post_extra.get("stages_passed", True))
 
         total_sec = sum(durations)
         per_inference = [d / runs_per_sample for d in durations]

@@ -455,11 +455,13 @@
 // lost a declared length behind duplicate rows, and one where a skip and a
 // failing length traded places (skip identity against the declared skips).
 //
-// `[2026-08-22]` 611 -> 613, no module added: item 8 (the iron latency gap)
+// `[2026-08-22]` 611 -> 617, no module added: item 8 (the iron latency gap)
 // found ~22 of a 42 ms coarse forward was the per-boundary comparison running
-// INSIDE the clock; run_mode gains --no-stage-stats (opt-in, warm-up verifies)
-// and test_run_mode pins that the sentinel can never read clean and that the
-// warm-up's verdict governs the row (+2).
+// INSIDE the clock; run_mode gains --no-stage-stats (opt-in: the warm-up and a
+// post-timed dispatch run the real comparison, the timed ones a sentinel) and
+// test_run_mode pins it both ways (+6): the sentinel can never read clean, a
+// failing warm-up or post-check fails the row, and the one asymmetry -- a
+// mismatch confined to a timed iteration -- fails the default and not the flag.
 //
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 613/613 passed in 27 modules
+// CHECK: study host tests: 617/617 passed in 27 modules
