@@ -97,8 +97,9 @@ from [54 §4](54-first-full-profile-and-decoder-families.md). Model path: [57 §
 same-session before/after under recorded Turbo), and **§1.1's correction line: Qwen3-0.6B bf16
 decode 77 ms/token (12.96–13.12 tok/s), devq 486, idle host, Turbo**. **Do not cite** the June
 `llms/` table (pmode-unrecorded), Hexagon's figures as like-for-like ([55 §5](55-hexagon-llama-cpp-lessons-for-xdna2.md)),
-or iron's latency figures as a comparison ([54 §5](54-first-full-profile-and-decoder-families.md)
-has the three reasons the adapter refuses it).
+or iron's latency figures against the DEFAULT study numbers — the only like-for-like iron
+comparison is [54 §5](54-first-full-profile-and-decoder-families.md)'s `[2026-08-22]` table (devq
+504, `--no-stage-stats`, same session): coarse 17.25 / fused 14.83 vs iron hybrid 15.07 ms at 512.
 
 **Operator decisions `[2026-08-21, afternoon]`** — every "operator decision" row is settled:
 
@@ -350,6 +351,7 @@ that appear nowhere else.
 | Cleanup cluster D — `transformer_layer/` | done 2026-08-22 (`db0ba4f6`) | no code deleted: builders IMPORT `llms/shared/builders`; every `study/` module is consumed by `run_profile`/`run_ladder`/`manifest`, a lit, or the H0 planner; `coarse_c2/c3` are live modes; lit dedupe would weaken shape gates. tl README 1,688 → 976; [16 §11](16-compiler-changes.md) corrected (plane-major was the spec; builder ships `[rows, 2, cols]`); the doc-number table below. Codex review stopped externally, no verdict | — |
 | Cleanup cluster E — `llms/` | done 2026-08-22 (`d2d652d0`) | the O2 decode-runlist prototype removed (275 lines + 4 hooks; [57 §5](57-inference-path-optimizations-from-hexagon.md) keeps the measurement); qwen3 0.6B/1.7B duplication is `main`'s convention; golden and registry JSON stay pretty-printed drift guards; Goal 1's W1 kernel + lits stay. Gate devq 494: verify PASS, reexec 7/7. Codex review stopped externally, no verdict | — |
 | Cleanup cluster F — compiler | closed 2026-08-22, no change | docs landed in C as [16](16-compiler-changes.md); the 33 `mlir/test` files are paired positive/negative regression lits, one pair per defect class — nothing to merge without weakening a gate; compiler code untouched (operator) | — |
+| Item 8 — the iron latency gap, attributed | done 2026-08-22 (devq 503 / 504; `results/iron-gap-20260822/`) | Both clocks have the same shape; ours runs the per-boundary comparison INSIDE it (~22–27 ms of a forward) and iron's does not. Like-for-like at `baseline_768`/512, same session, Turbo, `--no-stage-stats`: iron hybrid **15.07** vs ours coarse **17.25** (1.14×) / fused **14.83** (0.98×); runlist 24.29 vs **46.30** (1.91×, host BO traffic + per-forward weight re-hashing); offload 12.11 vs **77.44** (6.4×, `device_ms` 60.5: attention + small operators on the array, the taxonomy difference). Default numbers unchanged; two operator questions in the queue | [54 §5](54-first-full-profile-and-decoder-families.md) |
 | Cleanup close — final gates | done 2026-08-22 (devq 495/496/497) | `check-air-mlir` 505 / 7 xfail / 7 unsupported (= baseline); study host **611/611** in 27 modules (was 587); seam 35/35 + 10/10; tl suite **38 / 1 / 0** (39 lits, was 38); six-model verify **6/6**. Branch squashed per cluster; not pushed | results/cleanup-20260821/ (local) |
 | Operator decisions 2026-08-21 | recorded (`c4dd1f2a`) | R1 → supertiles (finished block per execution, `down_K = 96`; two-form comparison first); J1 closed; Goal 1 parked; big three not run (8/11 permanent); iron gap at devel HEAD `cc7083f` approved; docs 01–12 demoted; Goal 2 step 5 already done | this file |
 
@@ -373,7 +375,7 @@ Then:
 
 | # | Item | Gate |
 |---|---|---|
-| 8 | **IRON** — latency-gap attribution: build `~/iron` at devel HEAD (`cc7083f`), read `modes.py`'s timing region, pair each iron mode with the corrected mode whose host/device split matches, re-walk ONE shared point on both sides under recorded Turbo, one devq job per side (~half day; the study's most-asked number) | a like-for-like row in [54 §5](54-first-full-profile-and-decoder-families.md) |
+| 8 | ~~**IRON** — latency-gap attribution~~ **done 2026-08-22** — the gap is the per-stage comparison inside our clock (parity for the device-resident modes without it) plus, for `offload`, the taxonomy; [54 §5](54-first-full-profile-and-decoder-families.md). Two operator questions follow (measurement model; rule S1 per-plan hashing) | done |
 | 9 | **R1** — the supertile first increment: finished block per execution (`down_K = 96`, meets the ≥7 wedge) vs accumulate-across-executions (in-box, `ffn_accum`), builder/sequence work, one devq measure per form | the first-ever measured resident-tail latency and byte figure; the faster form becomes R1's route |
 | 10 | **REEX** — the re-execution family matrix: launch-0 kind × GEMV geometry × dispatch index, a BD dump per configuration, over [57 §1.5](57-inference-path-optimizations-from-hexagon.md)'s seven rows. Prerequisite for shipping any new multi-launch form; until then every new form runs the gate shape (`fused_reexec_gate.py` / `lm_head_reexec_gate.py`) before shipping | every row classified hang / wrong / clean with a named mechanism |
 | 11 | **5b** — column-owns-heads GEMV kernel: QK-norm + RoPE epilogue, QKV stage 3 → 1–2 launches, ~6 ms/token on 0.6B (each column streams whole 128-row heads; the L2-staged tile distribution cannot). New core kernel | `make verify` + the reexec gate shape from 10 |

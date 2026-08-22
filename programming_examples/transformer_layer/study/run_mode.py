@@ -143,6 +143,30 @@ def _stage_stats(actual, expected, atol):
     }
 
 
+def _stage_stats_skipped(actual, expected, atol):
+    """The per-boundary comparison SKIPPED: the sentinel the timed iterations
+    pass under ``--no-stage-stats``.
+
+    `[2026-08-22]` Item 8 (the iron latency gap) profiled a ``coarse`` forward
+    at 512: of ~42 ms, ~22 ms was ``_stage_stats`` -- ten full-array float32
+    comparisons the dispatch seam runs INSIDE the clock -- and iron's region
+    contains no such check. The sentinel does no arithmetic and reports
+    ``n_mismatch = -1``, which no clean-count accepts, so a timed iteration can
+    never pass on its own: correctness comes from the warm-up iteration(s),
+    which still run the real comparison, and from the final output check,
+    which was always outside the clock. The default is unchanged -- every
+    recorded number in the study keeps the comparison inside its region.
+    """
+    import numpy as np
+
+    return {
+        "n_elements": int(np.asarray(actual).size),
+        "n_mismatch": -1,
+        "mean_rel_L1": float("nan"),
+        "atol_required": float("nan"),
+    }
+
+
 def _shape_for(
     spec: dict, seq_len: int | None, family: str | None = None
 ) -> tuple[dict, str, str]:
@@ -249,8 +273,17 @@ def run(
     runs_per_sample: int,
     seq_len: int | None = None,
     family: str | None = None,
+    stage_stats_in_clock: bool = True,
 ) -> dict:
-    """Run ``mode`` and return a schema row. Never raises for a run failure."""
+    """Run ``mode`` and return a schema row. Never raises for a run failure.
+
+    ``stage_stats_in_clock=False`` (``--no-stage-stats``) moves the per-boundary
+    comparison out of the timed iterations: the warm-up still runs it and its
+    verdict stands in for the timed ones (so ``warmup >= 1`` is required), and
+    the final output check is unchanged. Opt-in; see ``_stage_stats_skipped``.
+    """
+    if not stage_stats_in_clock and warmup < 1:
+        raise ValueError("--no-stage-stats needs warmup >= 1: the warm-up is the correctness check")
     row = schema.empty_row("results")
     row["execution_mode"] = schema.EXECUTION_MODE_CSV.get(mode, mode)
     row["backend"] = "xrt"
@@ -297,8 +330,11 @@ def run(
         expected = prepared["expected"][0]
         row["compile_setup_time_ms"] = (time.perf_counter() - setup_t0) * 1000.0
 
+        warm_stages_ok = True
         for _ in range(warmup):
-            dispatch(inputs, _stage_stats)
+            _, warm_extra = dispatch(inputs, _stage_stats)
+            warm_stages_ok = warm_stages_ok and bool(warm_extra.get("stages_passed", True))
+        timed_stats = _stage_stats if stage_stats_in_clock else _stage_stats_skipped
 
         durations = []
         outputs = None
@@ -307,7 +343,7 @@ def run(
         for _ in range(samples):
             t0 = time.perf_counter()
             for _ in range(runs_per_sample):
-                outputs, extra = dispatch(inputs, _stage_stats)
+                outputs, extra = dispatch(inputs, timed_stats)
                 # Collected per ITERATION, inside the sample window, because
                 # only the innermost loop sees every extra dict -- collecting
                 # after the window would keep one iteration per sample and the
@@ -352,7 +388,8 @@ def run(
         final_atol = prepared.get("atol", spec["atol"])
         stats = _stage_stats(outputs[0], expected, atol=final_atol)
         row["validation_error_count"] = stats["n_mismatch"]
-        stages_ok = bool(extra.get("stages_passed", True))
+        stages_ok = (bool(extra.get("stages_passed", True)) if stage_stats_in_clock
+                     else warm_stages_ok)
         if stats["n_mismatch"] == 0 and stages_ok:
             row["run_status"] = "passed"
             row["failure_message"] = ""
@@ -478,6 +515,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--runs-per-sample", type=int, default=1)
     ap.add_argument("--study-id", default="adhoc")
     ap.add_argument(
+        "--no-stage-stats",
+        action="store_true",
+        help="keep the per-boundary comparison OUT of the timed iterations (the "
+        "warm-up still runs it). Opt-in; item 8 of the 2026-08-21 queue.",
+    )
+    ap.add_argument(
         "--seq",
         type=int,
         default=None,
@@ -510,6 +553,7 @@ def main(argv: list[str] | None = None) -> int:
         args.runs_per_sample,
         args.seq,
         args.family,
+        stage_stats_in_clock=not args.no_stage_stats,
     )
     row["study_id"] = args.study_id
     results_io.write_rows(args.out, [row])

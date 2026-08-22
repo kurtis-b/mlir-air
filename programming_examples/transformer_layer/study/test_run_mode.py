@@ -179,3 +179,51 @@ def test_every_ms_component_is_a_real_schema_column():
     for key in run_mode._MS_COMPONENTS:
         assert key in schema.RESULTS_FIELDNAMES, f"{key} is not in the schema"
     assert tuple(run_mode._MS_COMPONENTS) == schema.DECOMPOSITION_FIELDNAMES
+
+
+# --- --no-stage-stats (item 8, 2026-08-22) ------------------------------------
+
+
+def test_the_skipped_stats_sentinel_can_never_read_clean():
+    import numpy as np
+    out = run_mode._stage_stats_skipped(np.zeros(8), np.zeros(8), atol=1e-3)
+    assert out["n_mismatch"] == -1 and out["n_elements"] == 8
+    assert out["mean_rel_L1"] != out["mean_rel_L1"]  # NaN: no number was computed
+
+
+def test_no_stage_stats_takes_the_warm_up_verdict_and_needs_a_warm_up():
+    """With the comparison out of the clock, correctness is the warm-up's: a
+    warm-up that fails its stages fails the row even though every timed
+    iteration reports the sentinel, and warmup=0 is refused outright."""
+    import numpy as np
+    calls = []
+
+    def fake_prepare(shape):
+        expected = np.zeros((4, 4), dtype=np.float32)
+
+        def dispatch(inputs, stage_stats):
+            st = stage_stats(expected, expected, atol=1e-3)
+            calls.append(st["n_mismatch"])
+            return [expected], {"stages_passed": st["n_mismatch"] == 0}
+
+        return {"dispatch": dispatch, "inputs": [expected], "expected": [expected]}
+
+    spec = {"operator": "fake", "prepare": fake_prepare, "atol": 1e-3,
+            "shape": {"seq_len": 4, "emb_dim": 4}}
+    saved = (run_mode._spec_for, run_mode._shape_for, run_mode.require_turbo)
+    run_mode._spec_for = lambda mode: spec
+    run_mode._shape_for = lambda spec, seq, family=None: (dict(spec["shape"]), "4x4_fake", "fake")
+    run_mode.require_turbo = lambda: None
+    try:
+        row = run_mode.run("fake", warmup=1, samples=2, runs_per_sample=1,
+                           stage_stats_in_clock=False)
+        assert row["run_status"] == "passed", row["failure_message"]
+        assert calls == [0, -1, -1], calls  # real comparison once, sentinel in the clock
+        try:
+            run_mode.run("fake", warmup=0, samples=1, runs_per_sample=1, stage_stats_in_clock=False)
+        except ValueError as exc:
+            assert "warmup >= 1" in str(exc)
+        else:
+            raise AssertionError("warmup=0 with --no-stage-stats was accepted")
+    finally:
+        run_mode._spec_for, run_mode._shape_for, run_mode.require_turbo = saved

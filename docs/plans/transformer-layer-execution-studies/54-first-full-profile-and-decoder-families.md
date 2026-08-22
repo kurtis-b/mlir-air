@@ -176,9 +176,43 @@ against this port's 43.5 / 82.9, 72.8 / 131.2, 109.5 / 142.7 (§1). Every shared
 iron's `offload`/`hybrid` keep attention and the non-linear operators on the host under the
 superseded taxonomy where every mode here runs them on the array since 2026-08-09; iron's
 pmode is not in its manifest. A gap this size is not explained by the first alone.
-**Attributing it is a real open item**: establish iron's timing region from its source, pair
-each iron mode with the corrected mode whose host/device split matches, and re-walk one
-shared point under recorded conditions on both sides.
+~~**Attributing it is a real open item**~~ **`[2026-08-22]` ATTRIBUTED** (queue item 8; evidence
+`results/iron-gap-20260822/`, devq 503 / 504, both sides in one session under recorded Turbo,
+iron at devel HEAD `cc7083f`):
+
+**The two clocks have the same shape.** iron (`study/end_to_end/modes.py:2173`) wraps one
+`_run_pattern_once` forward in `perf_counter`, warm-up excluded, `runs_per_sample` iterations,
+avg/min/max — `timed_total_sec` is the plain sum of those latencies, so the "power-sampler span"
+reading above was wrong. Ours (`study/run_mode.py`) wraps one `dispatch()` the same way.
+
+**What differs is what a forward contains.** Every mode's dispatch seam runs the per-boundary
+correctness comparison (`_stage_stats`: ten full-array float32 `abs`/`sum`/`max` passes per
+forward) **inside** the clock; iron's region has no such check. Profiled (`prof_coarse_512.pstats`),
+a `coarse` forward at 512 is ~42 ms = `_stage_stats` ~22 + `bo_pool.sync_to_device_if_needed`
+~10 (H2D BO syncs, which the `sync_ms` column under-reports at ~1) + device execute+wait 7.4 +
+~1. `run_mode.py --no-stage-stats` (opt-in; the warm-up still verifies) removes the first term
+and is the like-for-like measurement:
+
+| `baseline_768`, 512 | iron (devq 504) | ours, comparison in the clock (default) | ours, `--no-stage-stats` | ratio |
+|---|---|---|---|---|
+| hybrid ↔ `coarse` | **15.07** (min 14.77, 5 dispatches) | 44.90 (min 42.25) | **17.25** (min 16.17; device 7.39, sync 0.93) | 1.14× |
+| hybrid ↔ `fused` | 15.07 | 38.52 | **14.83** (min 14.15; device 6.26) | 0.98× |
+| runlist | **24.29** (min 24.22, 16) | 71.70 | **46.30** (min 45.34; device 21.74) | 1.91× |
+| offload | **12.11** (min 10.89, 30) | 101.03 | **77.44** (min 75.08; device 60.49) | 6.4× |
+
+So the device-resident modes are at parity with iron's `hybrid` once the comparison is out of the
+clock. What remains: (a) **`runlist`**'s 1.9× and `coarse`'s residual ~10 ms are host-side BO
+traffic — and `builders/block.py`'s `_sequence_*` rebuild every `BufferSpec` per forward, re-hashing
+the static weights (`content_key`, rule S1: 36 SHA-256 calls over ~14 MB per six forwards ≈ 6 ms
+each) before the pool decides nothing changed; iron keeps its weights resident once. (b)
+**`offload`**'s 6.4× is `device_ms` itself — 60.5 of 77.4 ms for 30 submissions — because the
+corrected `offload` runs attention and the small operators on the array where iron's keeps them
+on the host; that is the taxonomy difference §1 names, measured. Two follow-ups, both operator
+questions rather than increments: whether the study's measurement model should move the
+comparison out of the clock by default (every standing number in [27](27-common-ladder-result.md),
+[32](32-cost-decomposed-ladder.md) and §1 would shift down by the ~24–27 ms of comparison per
+forward), and whether rule S1's content key should be computed once per plan rather than per
+sequence (a `block.py` change that moves `coarse`/`fused` by ~6 ms).
 
 ## 6. Open after this document
 
