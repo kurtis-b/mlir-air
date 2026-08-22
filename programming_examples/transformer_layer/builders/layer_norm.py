@@ -89,7 +89,7 @@ def derive_rows_per_call(
         ``herd_x = 8`` silently requires ``64 | rows``. At ``emb_dim 1024``
         ``norm_rows`` derives 32, so `runlist` refused to build at EVERY
         sequence length -- 0 of 9 ladder points against 9 of 9 at 512 and 768
-        ([50 section 7](../../../docs/plans/transformer-layer-execution-studies/50-coverage-sweep-costing.md)).
+        ([50 section 7](../../../docs/plans/transformer-layer-execution-studies/25-mode-rebuilds-and-results.md)).
         With 32 rows over 8 columns each core owns 4, so 4 is legal and 8 was
         never the only choice.
 

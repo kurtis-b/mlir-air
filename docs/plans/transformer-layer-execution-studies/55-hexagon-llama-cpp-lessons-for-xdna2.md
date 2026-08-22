@@ -4,7 +4,7 @@
 for (§1); whether this framework's four modes optimize inference per workload (§2 — **no**,
 with the evidence); and what Qualcomm's Hexagon NPU and llama.cpp's `ggml-hexagon` backend do
 that this framework should learn from (§3–§6). The last was researched two ways — Codex with
-live web access ([55a](55a-codex-hexagon-research-report.md), verbatim) and a direct reading of
+live web access (55a (the verbatim Codex report, retired 2026-08-22 to git tag `pre-cleanup-20260821`), verbatim) and a direct reading of
 the upstream source at `ggml-org/llama.cpp@6503355df0eb` (master, 2026-08-20). A second Codex
 pass then audited this document against source and the repository and corrected it in the
 places marked `[per Codex review]` (its report: [56 §7](56-full-model-mixed-precision-study-plan.md)).
@@ -38,7 +38,7 @@ Two places where 55a is corrected here:
 ## 1. What the iron adapter is for
 
 `study/iron_adapter.py` is the mechanism behind success criterion 3 of
-[00](00-context-and-goals.md) ("comparable to iron's result trees through an explicit
+[00](01-original-plan-superseded.md) ("comparable to iron's result trees through an explicit
 adapter"), and it is **deliberately a shape-only join**. It reads exactly one file of an iron
 results tree — `<root>/end_to_end/results_all_power.csv` — translates iron's family id
 (`baseline_768`) into this port's `study_case_id` (`512x768_encoder_bert`) through
@@ -257,7 +257,7 @@ distance between 1.46× and ~4× is now the measurement to make: at 56 ms/token,
 weights at the ~30 GB/s implied rate is ~23 ms, so roughly 30 ms of every int4 token is
 dequant, the 33 dispatches, CPU attention and host glue — which is Lesson 2's territory. The
 study's decomposition (`device_ms / sync_ms / host_cpu_ms`) on that path is the first thing to
-run. This is also [Goal 2's](00-context-and-goals.md) missing step 5 by another route, and the
+run. This is also [Goal 2's](01-original-plan-superseded.md) missing step 5 by another route, and the
 `quant_*` schema columns, with their separate GEMM/GEMV contracts, were designed for exactly
 this row.
 

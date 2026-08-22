@@ -1,6 +1,6 @@
 # 05b — Phase B: buffer ownership, synchronization, bank and aliasing rules
 
-[05-phase-b-runtime-seam.md](05-phase-b-runtime-seam.md) work item 2: *"Define buffer ownership,
+[05-phase-b-runtime-seam.md](01-original-plan-superseded.md) work item 2: *"Define buffer ownership,
 host/device synchronization rules, bank compatibility and aliasing rules before implementing."*
 
 This is that definition. `shared/infra/bo_pool.py` implements it and its module docstring points

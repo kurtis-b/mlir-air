@@ -1,8 +1,8 @@
 # 44 — Five mapping frameworks, side by side, and what we should take
 
-`[2026-08-12]` Synthesis of docs [39](39-research-llmcompass.md) (LLMCompass),
-[40](40-research-accelergy.md) (Accelergy), [41](41-research-timeloop.md) (Timeloop),
-[42](42-research-scalesim.md) (SCALE-Sim) and [43](43-research-maestro.md) (MAESTRO). Each was
+`[2026-08-12]` Synthesis of docs [39](44-mapping-frameworks-synthesis.md) (LLMCompass),
+[40](44-mapping-frameworks-synthesis.md) (Accelergy), [41](44-mapping-frameworks-synthesis.md) (Timeloop),
+[42](44-mapping-frameworks-synthesis.md) (SCALE-Sim) and [43](44-mapping-frameworks-synthesis.md) (MAESTRO). Each was
 researched against primary sources — papers, docs and **the actual repositories** — and three of the
 five agents found the shipped code disagreeing with the published paper. Read the individual docs for
 the evidence; this one is the comparison and the recommendation.
@@ -24,11 +24,11 @@ parallelising are mixed**, and we have neither a balance instrument nor a search
 
 **None of the five can express our central axis.**
 
-> **`[2026-08-12]` CORRECTED by [45](45-research-flat.md), and the correction matters.** This section
+> **`[2026-08-12]` CORRECTED by [45](44-mapping-frameworks-synthesis.md), and the correction matters.** This section
 > originally read "…and the state of the art ships no fused mapper at all." That is false. **TileFlow
 > ships a fused mapper** — a tree of `Tile` / `Scope` / `Op` nodes over **four** scopes
 > (`Sequential` / `Sharing` / `Parallel` / `Pipeline`), with FLAT encoded as its test data.
-> **`[2026-08-12]` two details in this box were wrong and are corrected by [46](46-research-tileflow.md)**:
+> **`[2026-08-12]` two details in this box were wrong and are corrected by [46](44-mapping-frameworks-synthesis.md)**:
 > there is **no genetic algorithm** anywhere in the repo (structure is exhaustively enumerated then
 > *uniformly randomly sampled*; MCTS applies only to tile factors), and the machine is **not "an AIE
 > column in all but name"** — no memtile in the validated config, no channel cardinality, no DMA
@@ -48,7 +48,7 @@ execution."*
 
 The closest anyone gets is **LoopTree** (Timeloop v4, in-tree): it *models* fused chains at under 4%
 error, including FLAT attention — but ships **no fused mapspace, no fused search and no fused
-constraints**. You hand it the mapping. **`[2026-08-12]` correction** ([46](46-research-tileflow.md)):
+constraints**. You hand it the mapping. **`[2026-08-12]` correction** ([46](44-mapping-frameworks-synthesis.md)):
 LoopTree is **polyhedral (ISL)**, not a node tree, and its sequential-vs-pipeline distinction is a
 single **global** flag — so it and TileFlow are different ideas rather than the same one twice. They
 are complementary: take TileFlow's tree for *composition*, LoopTree's per-intermediate retention for
@@ -100,7 +100,7 @@ counts derived from a tiling:
 4. **Latency = `max` over per-resource isolated cycles, and the argmax NAMES the offending
    resource** (Timeloop's bottleneck model, ~100 lines). That is precisely the
    "which stage is the bottleneck" answer iron approximated by hand with truncated binaries —
-   and doc [38](38-iron-encoder-pipeline-reference.md) found iron's version had two defects
+   and doc [38](25-mode-rebuilds-and-results.md) found iron's version had two defects
    inflating its headline gap.
 5. **Persist it as a `(component, action, arguments) → cost` table** and make every candidate a dot
    product against it (Accelergy's ERT). **Ours holds *measured* nanoseconds and bytes**, which makes
@@ -122,14 +122,14 @@ defect did.
    natural home as an outer-subproblem constraint decided once. This is the single largest reduction
    available and it is arithmetic, not heuristics.
 
-   > **`[2026-08-12]` EXEMPT ONE JOINT — and it is ours** ([45](45-research-flat.md)). FLAT §5.3 argues
+   > **`[2026-08-12]` EXEMPT ONE JOINT — and it is ours** ([45](44-mapping-frameworks-synthesis.md)). FLAT §5.3 argues
    > that **fusion granularity and intra-stage tiling are not separable**: the granularity choice
    > changes what the inner tiling is optimising against. Decoupling *there* would optimise each half
    > against a stale model of the other. That axis is a small enum, so **let it multiply** and decouple
    > everything else. A reduction move applied at the wrong joint is worse than none, because it
    > converges confidently.
    >
-   > **`[2026-08-12]` SUPERSEDED by [46](46-research-tileflow.md) — replace the exemption, do not keep
+   > **`[2026-08-12]` SUPERSEDED by [46](44-mapping-frameworks-synthesis.md) — replace the exemption, do not keep
    > it.** TileFlow §7.3 shows FLAT's `{M, B, H, R}` granularity enum is an **artifact of FLAT
    > refusing to tile the column dimension**, and dissolving it wins **82× L1**. The joint is not
    > inseparable; the enum was. What replaces the exemption is a sharper warning from its Table 7:
@@ -181,7 +181,7 @@ defect did.
 - **FuseMax** (MICRO'24) — worked from FLAT's private code and found confirmed bugs, conceptual errors
   in part of its search space, and an unmodelled softmax worth **6.7× iso-area**. Read it beside FLAT,
   not after.
-- **FLAT** (ASPLOS 2023) — still worth reading for the *reasoning*, with [45](45-research-flat.md)'s
+- **FLAT** (ASPLOS 2023) — still worth reading for the *reasoning*, with [45](44-mapping-frameworks-synthesis.md)'s
   caveats attached. It searches
   tiles × order × **fusion granularity** across a *fused attention chain*. It is the closest published
   work to what we are trying to do.
@@ -208,7 +208,7 @@ themselves mid-investigation (MAESTRO's bandwidth check exists at warning tier; 
 
 ## `[2026-08-12]` What FLAT changed — the plan as it now stands
 
-[45](45-research-flat.md) settled the two questions that could have reordered everything above, and
+[45](44-mapping-frameworks-synthesis.md) settled the two questions that could have reordered everything above, and
 one of its answers is a genuine redirection.
 
 **Fusing by interleaving is not the same thing as fusing by residency, and we had one word for both.**
@@ -247,3 +247,147 @@ nothing**. FuseMax (MICRO'24), working from the authors' private code, reports c
 softmax cost at all — worth **6.7× iso-area**. No public code exists; the docs page has said "Code
 Available — Coming soon" since June 2023. And the published abstract's headline speedups are **stale
 v1 numbers that appear in no table of the paper**. Take FLAT's *reasoning*; do not take its numbers.
+
+
+---
+
+## Bibliography of the retired research docs (39–43, 45, 46)
+
+`[2026-08-22]` Docs 39, 40, 41, 42, 43, 45 and 46 are consolidated into this section; their full text
+(every repo line cited, every paper-vs-artifact audit) is at git tag `pre-cleanup-20260821`. Each entry
+gives what the framework is, the finding this study drew from it that the sections above do not already
+carry, and what was done with it. The five instrument parts named in §The instrument were built as
+queue item 25 and live in [31](31-resident-tail-r1-record.md) (the balance-instrument record, formerly
+47: 1,213 ERT entries, 1,208 measured on device; first finding `addnorm` column 0 MM2S demand 3 against
+budget 2, priced `slowdown 0.667`); the static legality derivation is queue item 26 in
+[16](16-compiler-changes.md) (formerly 48: 115,343,360 → 3,721,772 legal points, a 31× / 96.77% cut,
+of which 2,181,680 = 59% are over the shim budget and **priced, not refused**).
+
+**39 — LLMCompass** (Zhang, Ning, Prabhakar, Wentzlaff, ISCA 2024; repo 7,878 lines of Python, read
+nearly whole). A transformer-template cost model built to search *hardware* with the mapping held cheap
+— the dual of our question. It sums 12 independent operator latencies per block (`"We do not explore
+operator fusion"`, §VI-2), `Mapping` is 13 scalars with no field naming a core, data movement is two
+scalar bandwidths, and `template_to_system` hardcodes A100's fitted overheads (matmul 21 µs, softmax
+12 µs, layernorm 45 µs, gelu 45 µs) for *every* described target — a trap for any NPU config. Audit of
+the artifact: the headline 4.1% inference error is one ratio of two 12-term sums whose components carry
+9.0–14.9% error; no TPU v3 data exists in the AE (the TPU is configured with infinite DRAM bandwidth and
+capacity); the all-reduce "measurements" are transcribed values (8.7% of prefill, 4.7% of decode); the
+MI210 was validated with its clock pinned to 1400 MHz (the cousin of our pmode trap); the 26,400-round /
+15–16 min figure is the heuristic mapper, not `exhaustive`. The 10.9% per-operator A100/MI210 figure is
+the one to trust. Taken: wave batching with cross-wave operand deduplication (`matmul.py:1197-1274`),
+which turns a loop order into a *count of distinct transfers per wave* — the currency of the MM2S
+budget; and a measured per-operator-class overhead constant fitted at input size 1, the shape
+[57 §1](57-inference-path-optimizations-from-hexagon.md) later filled with a measured launch boundary.
+The count-as-legality-predicate reading of it is what §The correction we owe ourselves retracted.
+
+**40 — Accelergy** (MIT, ICCAD 2019). Not a mapper, simulator or performance model: a per-action
+energy/area accumulator `E = Σ count(action, args) × ERT[component][action][args]`, with counts supplied
+by someone else (Timeloop). Findings: the CACTI plug-in supports 22–90 nm and reaches a 4 nm-class node
+by `read_energy *= scale**0.5` with `scale = 4/22 ≈ 0.18` (energy ×0.43, area ×0.18), 5.5× outside its
+range; plug-in "accuracy" is a self-declared constant (`percent_accuracy_0_to_100 = 80`, Aladdin 70);
+the "95% on Eyeriss" is post-layout simulation at 65 nm on N = 1 design and 1 workload (AlexNet), with
+leaf energies calibrated from the same flow (Fig. 7: Accelergy 95%, Aladdin 88%, fixed-cost 78%) — no
+silicon anywhere. Verdict: **do not adopt**; build the action-count layer, because that artifact *is* the
+balance instrument and the energy multiplication is incidental. Taken: the ERT indirection with
+actions carrying arguments (instrument part 5, `balance_ert.Ert`), holding measured nanoseconds and
+counted bytes rather than modelled picojoules.
+
+**41 — Timeloop** (Parashar et al., ISPASS 2019; `NVlabs/timeloop` @ `32370826`, 2025-06-09; with
+Sparseloop, Ruby, LoopTree, Orojenesis, Union). Findings beyond the table above: the unconstrained
+mapspace for a 7D CNN on 4 levels is `(7!)⁴ × (2⁴)³ ≈ 2.6 × 10¹⁸` before index factorisation, and
+`Uber::Init` hard-fails past 2¹²⁸; the hybrid mapper terminates on `victory_condition` (default 500) or
+`timeout` (1000 consecutive invalid); validation is mean 95% cycle accuracy (78–99%) and energy within
+8% over 107 DeepBench workloads; bandwidth is deliberately not legality — `buffer.cpp:2475-2599` turns
+over-subscription into `slowdown = min(slowdown, bw/demand)`; LoopTree (v4, in-tree) models fused
+chains under 4% error including FLAT attention but ships no fused mapspace, search or constraints.
+Taken: "capacity is the cliff, bandwidth is a slope" (§The correction); instrument parts 3 and 4
+(`balance.balance_ports`, `balance.bottleneck`); the constructed-in / rejected two-tier legality that
+[16](16-compiler-changes.md)'s derivation applies; the 480,000-within-5%-vary-19× argument that the
+objective matters more than the search, which is why item 25 was built before any search.
+
+**42 — SCALE-Sim** (Samajdar et al., ISPASS 2020; v3 on arXiv). A single-systolic-array performance
+model whose whole space is `{os, ws, is} × array dims × 3 SRAM sizes × DRAM bandwidth` — nine INI
+scalars, no search, no legality, layer-at-a-time with branches serialised in file order. Paper-vs-repo
+ledger: scale-out and DSE are paper-only (v1's `run_sweep()` is dead code); v3's `multi-core/` directory
+is absent from `main` (`9f98c43`) and `3.1`; v3 Table II's Sc/T columns are swapped against
+`systolic_compute_{ws,is}.py`; `main` crashes on its own `tpuv4.cfg` (`NoSectionError: 'layout'`) and
+in both bandwidth modes after patching; only tag `v2.0.2` with a hand-fixed topology runs. RTL
+validation covers compute cycles only (OS, 4×4–90×90, full utilisation); v3 reports OS 30.1% fewer
+cycles than WS once DRAM stalls count, reversing the compute-only ranking — so v2's unvalidated stall
+numbers were load-bearing. Taken: the `[cycle × port]` demand trace and `InterfaceBandwidth: CALC`
+(`read_buffer_estimate_bw.py:96-152`) — back-solve the bandwidth a stall-free run required, no
+simulator, no hardware — as instrument parts 1 and 2 (`balance.demand_matrix`, `balance.back_solve`),
+with the recorded deviation that our rows are ASAP async-dependence levels, not cycles. Its
+global-lockstep stall service was left behind.
+
+**43 — MAESTRO** (Kwon, Chatarasi, Pellauer, Parashar, Sarkar, Krishna, MICRO-52 2019; arXiv
+1805.02566; Georgia Tech). Data-centric directives `SpatialMap` / `TemporalMap` / `Cluster`; three-tier
+legality with the `NotEnough*Buffer` aborts commented out in shipped code, so capacity and rate only
+`[WARNING:…]` with demand printed beside budget while the rate shortfall is also charged into runtime;
+validated within 3.9% mean error vs MAERI RTL and Eyeriss. No mapping search of its own (the
+480M-explored / 2.5M-valid figure is a *hardware* sweep); GAMMA (O(10²⁴) per layer), Marvel
+(9.4 × 10¹⁸ → ~2.1 × 10⁸ by sequential off-chip/on-chip decoupling), ConfuciuX and DNNFuser (fusion
+mapspaces 64¹⁸ = O(10³²) for ResNet18, O(10⁹⁰) for ResNet50) are each thin wrappers shelling out to the
+binary per candidate — the lesson being *build the fast deterministic evaluator first*. FLAT and
+DNNFuser both had to write their own cost models because MAESTRO cannot express fusion (FLAT↔MAESTRO
+"within 1%" holds only single-layer). Taken: warn-with-demand-beside-budget *and* charge (instrument
+part 3, `PortBalance.warning`); Marvel's decoupling as §How to make the space small item 1. Not taken:
+its byte-rate budget, which cannot see a 2-MM2S cardinality violation — the gap TileFlow later closed.
+
+**45 — FLAT** (Kao, Subramanian, Agrawal, Yazdanbakhsh, Krishna, ASPLOS 2023; arXiv 2107.06419; no
+public code — "Coming soon" since June 2023). Its amendments to this doc are in §What FLAT changed; the
+numbers behind them: geomean 1.75× (Edge) / 1.65× (Cloud) speedup and 44% / 55% energy over an
+exhaustively-searched intra-operator baseline (v7 Table 5, Fig. 14), 2.8× / 3.07× at N = 64K, off-chip
+bandwidth to reach 0.95 utilisation −82% cloud / −71% edge; **Table 4 at N = 512: 1.02× at 20 MB and
+2 GB buffer, 1.7× (L/A) and 1.1× (end-to-end) at 200 KB** — fusion buys 2% at conventional length with a
+real buffer; batch 64 throughout; Edge = 32×32 PEs, 1 TB/s on-chip, 50 GB/s off-chip, Cloud = 256×256,
+8 TB/s, 400 GB/s. The abstract's 1.94× / 1.76× are v1 numbers appearing in no table of the published
+paper. FuseMax's audit: the private code models the softmax on 2³⁰ 1D PEs and omits its data transfers;
+charging it gives FuseMax 6.7× iso-area on attention (79% of energy), 5.3× end-to-end; four analytical
+models agreeing to 1–4% (FLAT↔MAESTRO 1%, LoopTree↔FLAT 3.4%, FuseMax↔FLAT <1%) on a number wrong by
+6.7× — *agreement between analytical models is not evidence*. FLAT rejected `f(FC, FC)` in four places;
+the FFN interior has neither property its win needs (quadratic intermediate; zero-reuse operands), and
+R1's 64-row band divides weight reuse across the three coupled feeds `hidden ×96`, `w_up`, `w_down`
+([31](31-resident-tail-r1-record.md)) — with the qualifications that "FCs are compute-bound" is a
+batch-64 statement, that the lost reuse is DRAM refetch which memtile residency could remove, and that
+our reason for fusing is the 24.0 of 33.0 MiB @1024 crossing of a linear intermediate. Also adopted:
+`proportion_spilled` (0 → 0.0078 → 0.50 in FuseMax's CSV) as a first-class instrument output, and the
+rule that every resource in the instrument's `max` carries a measured budget or is named as excluded.
+
+**46 — TileFlow** (Zheng, Chen, Gao, Jia, Sun, Wang, Liang, MICRO 2023; `pku-liang/TileFlow` +
+`KnowingNothing/Domino`; DOI 10.5281/zenodo.8350955). Its corrections to this doc are in the boxes
+above; the numbers: 5,103–20,412 dataflow trees per workload; tiling search 50 rounds × 200 choices at
+~12 s/round (3.2–6.4 min, ~60 ms per fused-mapping evaluation); the 3D search visits < 50 rounds × 20
+dataflows = 1,000 trees, 5–20% of the structure space (1–2 days single-threaded, < 1 hour on 56
+processes). RTL validation: 131 mappings of a two-GEMM chain with **no softmax**, on **one** 16×16 core
+(384 KB, 25.6 GB/s, TSMC 22 nm, 7.84 mm², 400 MHz, Verilator), **5.4% per-point MAPE on cycles,
+unfitted** — the best-supported claim in the survey — while the 6.1% energy figure is against a table
+synthesised in `validation.py` and the 48.8% "graph-based" strawman is three lines in the same script;
+vs Timeloop, 1,152 single-operator mappings at R² 0.999. Table 7c: FLAT-HGran 4.10 MB L1 / 32.77 MB L2
+against TileFlow 0.05 MB / 20.48 MB (82× less L1) at 16.78 vs 14.68 × 10⁶ cycles (14% slower).
+Taken: the scope-typed resource combinator (`checker.cpp:486-535`, ~30 lines: `max` over `Seq`/`Shar`
+children, Σ over `Para`/`Pipe`), reimplemented as a per-column vector priced as a slope — the mechanism
+behind [16](16-compiler-changes.md)'s legality derivation; `SlowDown` per level with the bandwidth sweep
+as a spec generator; the 2×2 composition ontology `Seq`/`Shar`/`Pipe`/`Para` = packaged / resident /
+interleaved / *(unnamed, the `f(heads ‖ ffn)` tails)* replacing the three-state list above; free
+variables by naming (`factors: B=? H=?`) and the ERT as an input file; max-of-rollouts and `−log₁₀`
+reward if a search is ever built. Rejected: `Pipeline` as a bare `max` with no fill or drain (ours must
+be `T·max(stage) + (S−1)·max(stage) + handoff`, COMET concurring), its small-tile data movement (an
+upper bound, since it "assumes data replacement happens for every outer iteration"), and TileFlow as a
+tool — an unmaintained 2023 Timeloop fork that `exit(1)`s on an illegal mapping, usable at most as a
+batch oracle for data-movement volume. Read-next additions: COMET (arXiv 2509.00599 — collectives as
+nodes, ramp-up/ramp-down modelled, spatially distributed clusters), Chimera, AccelForge (pushed
+2026-08-10, not investigated).
+
+**What the two fused-dataflow docs left open, and how it closed.** 45 and 46 together asked whether
+*resident* composition is the right target at our sequence lengths at all — FLAT's crossover puts
+attention at 12% of the layer at N = 512 and 79% at 16K, TileFlow's Table 7 shows composition claims at
+fixed tiling can be artifacts of the tiling, and FLAT itself reaches its win by interleaving on one
+array rather than by co-residency. That made continuing R1 an operator decision rather than a default.
+**It is settled `[2026-08-21]`**: R1 is reframed, not closed — the array's workload is modelled as
+**supertiles** of per-core tiles composed as regions, one supertile after another as separate executions
+in the runtime sequence, each inside the working box (`herd_x = 1`, `down_K ≤ 6`) so wall 7's shared-L2
+multi-writer buffer is designed out; each supertile produces a finished output block (`down_K = 96` per
+execution, meeting the unresolved `down_K ≥ 7` wedge), and accumulating down partials across executions is admissible only if it measures faster —
+R1's first increment is that two-form comparison on hardware. Recorded in
+[31](31-resident-tail-r1-record.md).

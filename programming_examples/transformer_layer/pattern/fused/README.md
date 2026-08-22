@@ -16,7 +16,7 @@ The CSV `execution_mode` value is `fused_elf`, mapped in one place
 > mode now gates at 1024.** The SPECS row moved 4096 → 1024 on 2026-08-08 — the stitched tail's
 > `plane_major` packing exceeds the shim `aie.dma_bd` cap above 1365 rows, so the 4096 build
 > raises before aircc
-> ([26 §6](../../../../docs/plans/transformer-layer-execution-studies/26-mode-rebuild-feasibility.md)).
+> ([26 §6](../../../../docs/plans/transformer-layer-execution-studies/25-mode-rebuilds-and-results.md)).
 > The repair run's vector at 1024 is `submissions 1 entries 3 air 11 herd 23 sync 19 bytes
 > 56626176` (the down-projection resolves to `drain` there, so the tail takes 11 whole-tensor
 > args instead of 16), and its numerics are `mean_rel_L1` 1.756e-2 at `atol_required` 5.813e-2 —
@@ -167,7 +167,7 @@ independently, and this mode has the least room of the four either way.
 measures `mean_rel_L1` 1.756e-2 at `atol_required` 5.813e-2 — a 1.72× margin
 (banner above). The 1.784e-2 / 7.896e-2 / 1.27× here is the 4096-era figure
 and survives as cell C2's
-([30](../../../../docs/plans/transformer-layer-execution-studies/30-coarse-cells-built.md)).
+([30](../../../../docs/plans/transformer-layer-execution-studies/25-mode-rebuilds-and-results.md)).
 
 ## What it costs
 

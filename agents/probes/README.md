@@ -13,8 +13,8 @@ python3 /home/cj/mlir-air/agents/probes/<probe>.py
 
 | probe | what it is for | cited by |
 |---|---|---|
-| `probe_r1_rung.py` | The R1 resident-FFN rung runner: builds one `(herd_x, down_K)` point of `builders/ffn_resident.py`, runs it through devq, reads the output BO back **on timeout** (`--dump-npz` makes determinism a claim about bytes). The seed of the supertile increment (queue item 9). | [49](../../docs/plans/transformer-layer-execution-studies/49-r1-deterministic-defect.md) · [52](../../docs/plans/transformer-layer-execution-studies/52-wall-7-race.md) |
-| `probe_r1_emulate_shape.py` | Its host-side shape emulation (imported by the rung runner). | [49](../../docs/plans/transformer-layer-execution-studies/49-r1-deterministic-defect.md) |
+| `probe_r1_rung.py` | The R1 resident-FFN rung runner: builds one `(herd_x, down_K)` point of `builders/ffn_resident.py`, runs it through devq, reads the output BO back **on timeout** (`--dump-npz` makes determinism a claim about bytes). The seed of the supertile increment (queue item 9). | [49](../../docs/plans/transformer-layer-execution-studies/31-resident-tail-r1-record.md) · [52](../../docs/plans/transformer-layer-execution-studies/31-resident-tail-r1-record.md) |
+| `probe_r1_emulate_shape.py` | Its host-side shape emulation (imported by the rung runner). | [49](../../docs/plans/transformer-layer-execution-studies/31-resident-tail-r1-record.md) |
 
 **Retired probes** (2026-08-21 cleanup; every one is at git tag `pre-cleanup-20260821` under
 `agents/probes/`, and the claim each established is recorded in the doc named): `probe_packet_streams`,

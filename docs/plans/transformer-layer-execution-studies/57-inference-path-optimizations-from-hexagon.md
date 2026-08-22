@@ -148,7 +148,7 @@ ELF (`_LM_N_PART = 8192`, pinned at the BD repeat-count limit `n_part/32 − 1 =
 top-5 gate passes because decode never runs `lm_head` back-to-back — an `o_gemv_ffn` always
 precedes it. Any design that does run it back-to-back (batched logits, a per-token runlist
 that places it adjacent to itself, re-scoring) will hit this. It is the same family as the
-fused decoder's re-execution wall ([PREDICTION-FUSED-REEXEC](PREDICTION-FUSED-REEXEC.md):
+fused decoder's re-execution wall ([PREDICTION-FUSED-REEXEC](16-compiler-changes.md):
 state left in the partition by one execution corrupting the next), with the repeat-count edge
 as one suspect — though the pattern (non-deterministic, partition 0 only, from row 64, healed
 by any intervening configuration) fits **stale repeat / buffer / configuration state** better
@@ -272,12 +272,12 @@ GEMV geometry × dispatch index, with `aie-translate` dumps of the shim BDs per 
 
 ## 2. The structural fact: every `air.launch` boundary is a partition reconfiguration
 
-[29](29-offload-n-streams.md) records the multi-launch mechanism: a module with N
+[29](25-mode-rebuilds-and-results.md) records the multi-launch mechanism: a module with N
 `air.launch` ops lowers to **N `aie.device` ops plus a `main` device** whose runtime sequence
 issues a configure/run pair per launch (`mlir/lib/Conversion/AIRRtToNpuPass.cpp:1443`). On the
 ELF path the per-launch images travel as `.pdi.N` / `.ctrltext.N` sections and the **ELF
 loader resolves the reconfiguration** — a raw in-stream `load_pdi` faults NPU2 firmware
-([29 §The hardware verdict](29-offload-n-streams.md)) — so the precise statement is that **each
+([29 §The hardware verdict](25-mode-rebuilds-and-results.md)) — so the precise statement is that **each
 launch selects and configures a distinct device image** `[per Codex review]`. Either way the
 array has no resident program: a "launch" costs a reconfiguration, not a descriptor.
 
@@ -484,7 +484,7 @@ each row's own before/after under recorded Turbo.
 
 ## 7. Codex review
 
-Report: [57a](57a-codex-review-of-inference-optimizations.md), verbatim. Verdict as delivered:
+Report: 57a (the verbatim Codex review, retired 2026-08-22 to git tag `pre-cleanup-20260821`), verbatim. Verdict as delivered:
 "major revision — the launch-count diagnosis is directionally persuasive, but 109 µs is not an
 isolated PDI-boundary measurement, and the 18–22 ms endpoint rests on overlapping or
 unsupported assumptions." Applied, each marked above: the ELF reconfiguration mechanism

@@ -20,7 +20,7 @@ Measured through `air-dma-to-channel`:
 | `elementwise_add` (a, b) | 2 | 0 |
 | `layer_norm` (in) | 1 | 0 |
 
-Reproduce with `python3 agents/probes/probe_packet_streams.py`; the probes and what each one
+Measured by `probe_packet_streams.py` (retired 2026-08-22 to tag `pre-cleanup-20260821`; the probes and what each one
 establishes are indexed in [`agents/probes/README.md`](../../../agents/probes/README.md).
 
 This one fact explains a chain of things that looked unrelated:
@@ -48,8 +48,10 @@ the induction variable, and:
 
 | trips | what the memtile MM2S chain does |
 |---|---|
-| 2 | the K loop fully unrolls; each BD carries its own literal offset — **correct** |
+| 2 | ~~the K loop fully unrolls; each BD carries its own literal offset — correct~~ **RETRACTED 2026-08-07** ([16 §H10](16-compiler-changes.md)): the offsets {0, 32, 2048, 2080} that reading credited to the IV-carrying feeds belong to the one feed with **no** loop IV; per-buffer BD attribution shows the IV-carrying A and B feeds **frozen at k=0 even at two trips** ({0, 0, 2048, 2048} and {0, 32, 0, 32}) |
 | ≥ 4 | the chain becomes a cycle covering two steps with **every offset frozen at 0** |
+
+There is no trip count at which an IV-dependent L2 offset is correct; H10 refuses it by message.
 
 Past the unroll limit the core stalls, the design's output DMA never fires, and the output
 buffer is returned **byte-identical to what the host wrote** — seed it with 1.0 and every
@@ -68,7 +70,7 @@ offset on a **launch argument (L3)** is fine, the same thing on a `memref<..., 1
 is silently wrong, and a whole-buffer put with no offset is fine. Survey: no other design in
 `programming_examples/` takes a non-literal offset on an L2/L1 operand.
 
-Reproduce with `python3 agents/probes/probe_ffn_accum_bd_offset.py`; the docstring says how to
+Measured by `probe_ffn_accum_bd_offset.py` (retired to tag `pre-cleanup-20260821`; the live gate is `run_npu2_ffn_accum_peano.lit` + `ffn_accum_structure.py`); its docstring said how to
 point it at the pre-fix builder (`e6cdd138`) to see the frozen chain.
 
 **This is H5, and H5 understates it.** Doc 16 records H5 as "channel indices are compile-time, so
@@ -186,7 +188,7 @@ for the run that sized that row's `atol` — and 2.009e-3 → 8.082e-5 at 512×5
 document's own recorded ≈2.0e-3 → 8.1e-5. Without that, a "before" build that was not actually the
 old kernel would produce a plausible and meaningless number.
 
-Reproduce with `agents/probes/probe_layer_norm_twopass_cost.py`. **~13% for ~26× is the trade Phase F
+Measured by `probe_layer_norm_twopass_cost.py` (retired to tag `pre-cleanup-20260821`). **~13% for ~26× is the trade Phase F
 should quote**; nothing here argues for reverting it.
 
 **2. Large-mean activations, measured `[2026-08-07]`: `layer_norm` is fine, the fused `addnorm`
@@ -263,7 +265,7 @@ the parked R1 gate — / 0 fail), and the re-measure pass (`check-addnorm` + `ch
   tolerance moved anywhere.** The cliff is now pinned by suite rows on both variants and the
   kernels that had it no longer exist in any dispatched path.
 
-Reproduce with `agents/probes/probe_addnorm_variance_cliff.py`.
+Measured by `probe_addnorm_variance_cliff.py` (retired to tag `pre-cleanup-20260821`; the offset-regime rows it motivated are gated by `run_npu2_addnorm_peano.lit` and `run_npu2_layer_norm_peano.lit`).
 
 **3. ~~`fused` and `runlist` provenance figures are stale.~~ REFRESHED `[2026-08-07]`** from the
 J7b gate run — the driver's own, so the provenance is a gate and not a hand-run:
@@ -280,7 +282,7 @@ tightened while the means improved**, which the item did not anticipate: `mean_r
 average and `atol_required` is a worst element, so they move independently. `fused` now sits 1.27×
 under the hard ceiling, the least headroom of the four modes. Updated in `opcheck_specs.py`, the
 example README, `pattern/fused/README.md`, `pattern/runlist/README.md` and
-[09](09-phase-f-study-harness.md).
+[09](01-original-plan-superseded.md).
 
 **4. J1 is blocked on shim BD exhaustion**, not on correctness any more: `herd_x=8` multi-trip
 refuses at six trips (column 0 carries weight + x + residual, three packet tasks per trip, 18 > 16)
@@ -291,8 +293,8 @@ gate hit the same wall the day wall 3 (the fuse crash) fell — the corrected fu
 time-multiplexed refill stream needs 24 sequential tasks against tile (1,0)'s 16 BDs (no packet
 queue involved, so this is the plain-task variant of the same missing reuse). ~~R1 needs 24-vs-16
 where J1 needed 64-vs-16~~ R1 needs **96**-vs-16 (the 24 was wrong and named the wrong feed — see
-[31 §Wall 4 is fixed](31-fused-resident-tail.md)); queue item 6b in the README, record in
-[31 §The gate ran](31-fused-resident-tail.md). ~~This item is the resident tail's one remaining
+[31 §Wall 4 is fixed](31-resident-tail-r1-record.md)); queue item 6b in the README, record in
+[31 §The gate ran](31-resident-tail-r1-record.md). ~~This item is the resident tail's one remaining
 blocker.~~
 
 **`[2026-08-11]` DONE for the plain-task variant, and one of the two candidates is CLOSED as
@@ -318,9 +320,12 @@ J1's own packet variant is untouched by this — the step declines packet-typed 
 **R1 is still not green.** Behind the BD wall sits a scheduling wall — the shim issue order is
 channel-major (`air-dma-to-channel`'s per-channel hoist, not reachable by
 `air.preserve_shim_dma_order`) — which is queue item **6c**, scoped in
-[31 §Wall 5](31-fused-resident-tail.md).
+[31 §Wall 5](31-resident-tail-r1-record.md).
 
-**5a. `phases.sh`'s J7b objective check calls its builder with no shape.** `[2026-08-07]`
+**5a. ~~`phases.sh`'s J7b objective check calls its builder with no shape~~ CLOSED 2026-08-22: the
+port-loop harness and its objective checks were retired (tag `pre-cleanup-20260821`); J7b's live
+gates are `run_npu2_ffn_accum_peano.lit` and `make check-ffn-accum-structure`, which pass the shape.
+The record stays for the lesson.** `[2026-08-07]`
 `phase_j7b_objective_check` does `build_ffn_accum_module()`, while J7a's sibling passes one
 (`build_norm_tail_module(4096, 768, herd_x=8)`) and no builder here defaults its shape. Written
 before the builder existed, it would have raised `TypeError` at the objective-check step —
@@ -333,7 +338,7 @@ not a gap. It does mean a bug in a checker costs a whole run unless someone runs
 first, which is worth doing for any newly-written objective check.
 
 **5b. The static-BD-offset defect, LOCATED `[2026-08-07]` — it is an unchecked `std::optional`
-dereference, and it is specced as [24](24-phase-h10-non-constant-bd-offsets.md).** J7b routed
+dereference, and it is specced as [24](16-compiler-changes.md).** J7b routed
 around it (advance on L3, never on the L2 read), but the compiler still accepts the losing
 construction silently. Root cause, in
 `mlir/lib/Conversion/AIRToAIESchedulingUtils.cpp`:
@@ -355,7 +360,7 @@ while the accumulator fetch beside it is all literals, which is exactly why the 
 and the A BD was not.
 
 So this is not "add a diagnostic to a pass that cannot know" — the pass has the information and
-throws it away. Doc [24](24-phase-h10-non-constant-bd-offsets.md) specs the fix: return an optional,
+throws it away. Doc [24](16-compiler-changes.md) specs the fix: return an optional,
 refuse with a message that says what to do instead. **Refuse, not skip** — unlike ping-pong
 labelling there is no correct fallback, since a BD cannot express a per-iteration offset. The
 dynamic-index lowering that would make it expressible is H5 and is much larger.

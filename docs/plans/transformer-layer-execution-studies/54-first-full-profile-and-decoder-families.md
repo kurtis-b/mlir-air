@@ -1,7 +1,7 @@
 # 54 — The first `full` profile, the three walls it found, and the decoder families
 
 `[2026-08-20]` Phase G's gate — "a full profile run with a complete `results_manifest.json`" —
-had never been attempted; [34 §5.2](34-phase-g-scoping.md) estimated it at ~2 h cold and said
+had never been attempted; [34 §5.2](25-mode-rebuilds-and-results.md) estimated it at ~2 h cold and said
 so. It was run (devq 427, 1902 s), it was not met (20 passed / 10 failed / 6 skipped), and
 every one of the ten failures turned out to be a bound that can be read from the builder that
 refuses. This document records the measurements, the three walls, the repairs, and the state
@@ -96,7 +96,7 @@ compiler and a compiler error were indistinguishable from the log; `python/air/b
 now carries `returncode` in the message (install refresh pending). Reproduced with rc/stderr
 kept (devq 428): a real compile failure of the softmax module, not memory.
 
-Repair, the same one the layer-norm width wall took ([50 §7](50-coverage-sweep-costing.md),
+Repair, the same one the layer-norm width wall took ([50 §7](25-mode-rebuilds-and-results.md),
 `run_layer_norm_rows_tests.lit`): `builders/softmax.derive_rows_per_call` returns the largest
 legal value **at or below the historical constant**, so 512–4096 emit byte-identical IR
 (asserted as byte equality with the discrimination control that 1 vs 2 does change the

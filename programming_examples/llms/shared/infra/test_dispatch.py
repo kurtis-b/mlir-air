@@ -4,7 +4,7 @@
 """Host-only tests for runlist grouping, the ABI split and the dispatch vector.
 
 The hardware behaviour these encode was measured in
-`docs/plans/transformer-layer-execution-studies/05a-phase-b-runlist-spike-result.md`;
+`docs/plans/transformer-layer-execution-studies/01-original-plan-superseded.md`;
 this file keeps the code honest about it without needing an NPU.
 
 No test-framework dependency — see `test_bo_pool.py` for why.

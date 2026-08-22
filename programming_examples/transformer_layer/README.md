@@ -1,7 +1,7 @@
 # Transformer Layer — AIE2P Device Kernels
 
 Phase A of the [transformer-layer execution
-studies](../../docs/plans/transformer-layer-execution-studies/04-phase-a-kernels.md):
+studies](../../docs/plans/transformer-layer-execution-studies/01-original-plan-superseded.md):
 the C++ device kernels a full encoder/decoder block needs, compiled with Peano
 for AIE2P.
 
@@ -71,7 +71,7 @@ serialize against every other NPU job in the repository.
 ## The Phase B runtime seam
 
 `runlist_gate.py` is
-[Phase B](../../docs/plans/transformer-layer-execution-studies/05-phase-b-runtime-seam.md)'s
+[Phase B](../../docs/plans/transformer-layer-execution-studies/01-original-plan-superseded.md)'s
 gate: three separately-compiled ELFs in one runlist, bit-identical to sequential dispatch and
 measurably faster, plus the whole layer through the seam in one submission.
 
@@ -80,7 +80,7 @@ on XRT 2.21.0 / NPU2, and does not need to. An AIR ELF is a *full* ELF carrying 
 configuration and a `hw_context` accepts exactly one of those, but a runlist is constructed
 *against* a context rather than restricted *to* it: each entry is dispatched on the context its
 kernel came from, so N ELFs means N contexts and still one runlist.
-[05a](../../docs/plans/transformer-layer-execution-studies/05a-phase-b-runlist-spike-result.md)
+[05a](../../docs/plans/transformer-layer-execution-studies/01-original-plan-superseded.md)
 records both halves and every measurement.
 
 The one aggregation that is silently wrong is the *xclbin* cross-artifact runlist — there the
@@ -294,7 +294,7 @@ mask for the encoder variant and a `tril` one only for `decoder_gpt2`.
 ## The block integration gate (Phase D2)
 
 One whole `encoder_bert` layer, at the configuration
-[07b](../../docs/plans/transformer-layer-execution-studies/07b-phase-d2-block-integration.md)
+[07b](../../docs/plans/transformer-layer-execution-studies/01-original-plan-superseded.md)
 forces: `seq_len 4096`, hidden 768, ffn 3072, 12 heads × head_dim 64, non-causal.
 
 ```bash
@@ -558,7 +558,7 @@ though the switch changes the ABI as well as the reconfiguration, so
 Every recorded `offload` latency/variance number from before the flip
 describes the ELF path; the post-flip four-mode re-walk ran the same day and
 separates all four modes (doc 32 §The post-flip walk). Both are written up in
-`docs/plans/transformer-layer-execution-studies/29-offload-n-streams.md`.
+`docs/plans/transformer-layer-execution-studies/25-mode-rebuilds-and-results.md`.
 
 This mode used to dispatch six GEMMs and call itself a *hybrid* boundary,
 keeping attention in host torch through `pattern/blocked_attention.py` — that
@@ -778,7 +778,7 @@ module once per distinct ELF, `herd_launches` accumulates per dispatch step.
 
 `coarse` is defined as a per-workload **blend** of `runlist` and `fused`, and
 until
-`docs/plans/transformer-layer-execution-studies/28-coarse-blend-space.md`
+`docs/plans/transformer-layer-execution-studies/25-mode-rebuilds-and-results.md`
 nothing here expressed such a choice: the mode wrapped the D2 block, which is
 one blend, chosen implicitly by D2 having been built at 4096.
 
@@ -863,7 +863,7 @@ order of magnitude larger than the tail axis, which separates cleanly only at
 `pattern/coarse/coarse.py` records the selection and its reason in every results
 artifact. Full derivation, the byte accounting and the two findings that are not
 about `coarse`:
-[`30-coarse-cells-built.md`](../../docs/plans/transformer-layer-execution-studies/30-coarse-cells-built.md).
+[`30-coarse-cells-built.md`](../../docs/plans/transformer-layer-execution-studies/25-mode-rebuilds-and-results.md).
 
 ## The registry sweep
 

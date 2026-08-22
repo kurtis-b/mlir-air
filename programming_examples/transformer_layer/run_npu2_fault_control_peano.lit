@@ -15,7 +15,7 @@
 // tolerance wide enough to swallow anything, and an ignored --fault-inject flag
 // all still report PASS under injection -- and all three fail here. The
 // harness's own lesson from Phase A, in
-// docs/plans/transformer-layer-execution-studies/14-the-port-loop-harness.md:
+// docs/plans/transformer-layer-execution-studies/01-original-plan-superseded.md:
 // a fix is only trusted after confirming it fails when it should.
 //
 // One operator, because the injection machinery in opcheck.py is shared by all

@@ -82,7 +82,7 @@ The superseded version is not kept: it was a to-do list, and a stale to-do list 
 | Mode | Implemented today | Left |
 |---|---|---|
 | `runlist` | **every operator individually on the device, nothing on the host.** 427 entries over 17 runlists; per head `attn_scores` → `softmax` → `attn_output`, device-resident inside one submission. Gated 2026-08-09 | nothing for the definition |
-| `offload` | **every LINEAR operator on the NPU, every NON-LINEAR one on the host** — six projections plus both attention matmuls, with softmax / both LayerNorms / GeLU on the host. 30 dispatches. Gated 2026-08-08. **`[2026-08-09]` The reconfiguration half landed too** ([29](29-offload-n-streams.md)): five shapes in ONE xclbin, `context_loads 1` against the ELF path's 30, dispatch vector unchanged. So the mode now implements both halves of its definition | **`[2026-08-09]` GATED** — `run_npu2_offload_peano.lit` has a third recipe pinning `context_loads 1 kernel_attaches 4` on the shared path and `context_loads 30 kernel_attaches 0` on the ELF one, verified in the failing direction. Two things remain. **The shared path is bounded to single-launch modules**, so it builds at 1024 and *not* at the mode's own gated 4096, where the down-projection is a two-launch `fused-cast` and the fixed `air.insts.bin` name collides with itself ([29](29-offload-n-streams.md)); a fix is a change to `python/air/backend/xrt.py` and its own phase. **The default is still the ELF path** — switching packaging removes this mode's variance (316.9% → 17.6% at 512), though the switch changes the ABI as well as the reconfiguration and so does not isolate `_evict_context`; and the shared path costs ~20% on best-case latency there, and flipping would invalidate every recorded `offload` number including [27](27-common-ladder-result.md)'s table. Beyond that only the deferred increment: *one* stream with runtime-parameterized loop bounds, still blocked in the stack (§A of [26](26-mode-rebuild-feasibility.md)) |
+| `offload` | **every LINEAR operator on the NPU, every NON-LINEAR one on the host** — six projections plus both attention matmuls, with softmax / both LayerNorms / GeLU on the host. 30 dispatches. Gated 2026-08-08. **`[2026-08-09]` The reconfiguration half landed too** ([29](25-mode-rebuilds-and-results.md)): five shapes in ONE xclbin, `context_loads 1` against the ELF path's 30, dispatch vector unchanged. So the mode now implements both halves of its definition | **`[2026-08-09]` GATED** — `run_npu2_offload_peano.lit` has a third recipe pinning `context_loads 1 kernel_attaches 4` on the shared path and `context_loads 30 kernel_attaches 0` on the ELF one, verified in the failing direction. Two things remain. **The shared path is bounded to single-launch modules**, so it builds at 1024 and *not* at the mode's own gated 4096, where the down-projection is a two-launch `fused-cast` and the fixed `air.insts.bin` name collides with itself ([29](25-mode-rebuilds-and-results.md)); a fix is a change to `python/air/backend/xrt.py` and its own phase. **The default is still the ELF path** — switching packaging removes this mode's variance (316.9% → 17.6% at 512), though the switch changes the ABI as well as the reconfiguration and so does not isolate `_evict_context`; and the shared path costs ~20% on best-case latency there, and flipping would invalidate every recorded `offload` number including [27](27-common-ladder-result.md)'s table. Beyond that only the deferred increment: *one* stream with runtime-parameterized loop bounds, still blocked in the stack (§A of [26](25-mode-rebuilds-and-results.md)) |
 | `fused` | **three ELFs at seq 1024**, every operator boundary inside the tail still round-tripping through DRAM. Gated 2026-08-08 | one xclbin, blocked twice over — see below — and "no DRAM between operators", which is capacity-bounded rather than engineering-bounded: 6 MiB on chip against one 6 MiB S×F intermediate at 1024 |
 | `coarse` | the D2 block: five coarse fused kernels, four submissions | everything. It is defined as a per-workload *blend*, which is a choice per operator between an individual dispatch and a fused region, and nothing in the port expresses such a choice yet |
 
@@ -92,12 +92,12 @@ aircc invocation. At `[2,2]` `mha_out_proj` @4096 compiles and then **hangs**
 (`ERT_CMD_STATE_TIMEOUT`, 3/3, against 3/3 clean passes at `[1,1]`). Two corrections travel with
 that: `omit_pingpong` is **not** part of the conflict, and the two settings produce **identical
 lowered IR**, so a compile-only comparison "refutes" the conflict and is wrong to — which is what
-[26 §4](26-mode-rebuild-feasibility.md) did before its retraction. The second blocker is
+[26 §4](25-mode-rebuilds-and-results.md) did before its retraction. The second blocker is
 `air-fuse-channels`, which is O(N²) in channels and did not finish in 1200 s on a 90-channel stitch.
 
 **The measurement consequence, restated for the current state.** Every result recorded before the
 taxonomy correction — including the sequence ladder in
-[25](25-first-study-result-sequence-ladder.md) and its crossover — ranks four implementations that
+[25](25-mode-rebuilds-and-results.md) and its crossover — ranks four implementations that
 are not these four modes, and additionally differed in **attention placement**, which is what its
 slopes actually split on. That covariate is now gone: all four modes run attention on the device, so
 the split cannot be reproduced and `attention_path` is constant across every row a run can produce.
@@ -153,7 +153,7 @@ definitions already exists as written text — `DispatchVector`'s docstring
 
 | Term | Definition | Instrument |
 |---|---|---|
-| **configuration** | one array state; loading one is a **reconfiguration** | `context_loads` / `kernel_attaches` — instrumented and gated for `offload` only ([29](29-offload-n-streams.md)) |
+| **configuration** | one array state; loading one is a **reconfiguration** | `context_loads` / `kernel_attaches` — instrumented and gated for `offload` only ([29](25-mode-rebuilds-and-results.md)) |
 | **artifact** | one compiled, loadable unit — an ELF or an xclbin; one aircc invocation | the SPECS catalogue row |
 | **submission** | one host→device handoff, and the host's completion-wait granularity. A runlist counts as one whatever it holds | `host_submissions` |
 | **dispatch** | one `xrt.run` — one kernel invocation. ≡ *runlist entry*, and **never** the submission | `runlist_entries` |
@@ -235,7 +235,7 @@ modes isolate* to *what induces the costs*.
 
 Sources: the README status board and [27](27-common-ladder-result.md) for `runlist` and
 `offload`; the re-measured D2 vector (§The dispatch vector, below) for `coarse`;
-[26 §6](26-mode-rebuild-feasibility.md)'s repair-run vector for `fused`'s structural counts.
+[26 §6](25-mode-rebuilds-and-results.md)'s repair-run vector for `fused`'s structural counts.
 ~~Reconfiguration counts exist for `offload` alone; the ELF-path modes' context loads are
 uninstrumented.~~ **`[2026-08-10]` All four modes report both counters** as schema v2 columns —
 the counting always lived at `ensure_loaded`'s single increment site; the modes simply never
@@ -292,7 +292,7 @@ entries; `fused_elf` has few submissions with many AIR launches and near-zero in
 > K or N position. Phase E therefore keeps `offload`'s attention in host torch and dispatches the
 > six projection GEMMs, which makes it a hybrid boundary rather than a pure per-GEMM device mode.
 > Recorded as `attention_path` in every `offload` artifact. See
-> [08 §Build order](08-phase-e-execution-strategies.md) and [08c](08c-phase-e3-offload.md).
+> [08 §Build order](01-original-plan-superseded.md) and [08c](01-original-plan-superseded.md).
 >
 > The consequence for this section is that **no absolute submission count is load-bearing**. The
 > distinguishability gate asks for an ordering — `offload` above every other mode, and aggregating
@@ -311,7 +311,7 @@ entries; `fused_elf` has few submissions with many AIR launches and near-zero in
 > two normalization points is 64 dispatches, and 128 of those 131 entries are that one operator's
 > row blocking.
 >
-> This matters more than a corrected constant. [08](08-phase-e-execution-strategies.md)'s
+> This matters more than a corrected constant. [08](01-original-plan-superseded.md)'s
 > distinguishability gate says `runlist` should have "many" entries and `coarse` "few"; on these
 > numbers `coarse` already has 131 before any fine-grained mode exists, so the predicted separation
 > may be between a number and itself. **Decide which fields actually discriminate, and re-derive
@@ -321,7 +321,7 @@ entries; `fused_elf` has few submissions with many AIR launches and near-zero in
 > **`[2026-08-05]` Decided, before the modes were built**, and implemented in
 > `agents/scripts/port-loop/phase_e_checks.py`: the criterion is ordinal over driver-summed totals,
 > never an absolute threshold. Four gating clauses and two recorded-but-not-halting predictions,
-> listed in [08 §Gate](08-phase-e-execution-strategies.md). One arithmetic note that belongs here
+> listed in [08 §Gate](01-original-plan-superseded.md). One arithmetic note that belongs here
 > rather than there: `as_row()` emits `runlist_entries_per_submission` as a derived **mean**
 > (`dispatch.py:166`), so a mode's total entry count is `Σ round(mean × submissions)` and not the
 > sum of the means. The two agree for the block only because each of its submissions is 1.

@@ -24,7 +24,7 @@ Footguns:
   configuration comes from the xclbin behind the context, not from the run — so
   entries there may only share a runlist when they share an artifact.
   `plan_submissions` splits on exactly that distinction. See
-  `05a-phase-b-runlist-spike-result.md` for both measurements.
+  `01-original-plan-superseded.md §4.2 (the Phase B spike result)` for both measurements.
 
 - **Never build a cross-artifact runlist under the xclbin ABI "to see what
   happens".** It executes, raises nothing, times out on nothing, and returns wrong
@@ -94,7 +94,7 @@ class RunlistSplitError(RuntimeError):
     Only reachable under the xclbin ABI, where the configuration comes from the
     xclbin behind the context rather than from the run. Raised at build time,
     never worked around: see the module docstring and
-    `05a-phase-b-runlist-spike-result.md` §4 for why emitting the runlist anyway
+    `01-original-plan-superseded.md §4.2 (the Phase B spike result)` for why emitting the runlist anyway
     is worse than failing.
     """
 
@@ -297,7 +297,7 @@ def plan_submissions(
             f"from the run, so entries from another artifact execute against "
             f"the wrong configuration — see docs/plans/"
             f"transformer-layer-execution-studies/"
-            f"05a-phase-b-runlist-spike-result.md §4. Building the runlist "
+            f"01-original-plan-superseded.md §4.2 (the Phase B spike result). Building the runlist "
             f"anyway executes without error and returns wrong numbers. Compile "
             f"these artifacts to ELF to aggregate them."
         )

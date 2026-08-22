@@ -8,7 +8,7 @@ permanently foreign — harder to review, harder to extend, and visibly grafted 
 follow-up.** This document is the checklist; use it at review time.
 
 This refactoring is not free, and the plan's effort estimates assume it. The ~19,000-line
-"ports by structure" tier in [09-phase-f-study-harness.md](09-phase-f-study-harness.md) is
+"ports by structure" tier in [09-phase-f-study-harness.md](01-original-plan-superseded.md) is
 where most of it lands.
 
 ---
@@ -46,7 +46,7 @@ with its `reset_runtime()` workarounds exist to solve problems that `KernelCache
 `aircc` + `XRTBackend` already solve.
 
 The one genuinely valuable idea inside them — BO liveness pooling — is extracted into
-`KernelCache` in [05-phase-b-runtime-seam.md](05-phase-b-runtime-seam.md). The rest is dropped.
+`KernelCache` in [05-phase-b-runtime-seam.md](01-original-plan-superseded.md). The rest is dropped.
 
 ## 3. The `design.py`-loaded-by-file-path seam disappears
 

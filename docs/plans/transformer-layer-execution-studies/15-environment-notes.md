@@ -86,7 +86,7 @@ NPU-free any more: it carries the Phase B runlist gate and every Phase C operato
 new shapes to six existing tests; D2 added `run_npu2_block_peano.lit`, `run_reference_tests.lit`
 and `run_block_cache_tests.lit`. The driver now refuses to accept a `needs_hardware` phase whose
 gate log does not show all of them passing with nothing unsupported or xfailed — see
-[14](14-the-port-loop-harness.md). Enrolment is path-based (`--filter "transformer_layer/"`), so a
+[14](01-original-plan-superseded.md). Enrolment is path-based (`--filter "transformer_layer/"`), so a
 new `.lit` anywhere under the example joins the suite with no CMake change, and the driver's count
 follows automatically.
 
@@ -259,3 +259,85 @@ env-broken one are distinguishable only by reading the whole exception — so wh
 zero dumps in **0.0 s**, suspect the environment before the IR. Seen twice in one day: once as
 three failed devq submissions, once as a probe re-run that looked like a design regression and
 was not.
+
+
+## `[2026-08-22]` Folded in from the README at consolidation
+
+These rules lived only in the README's cold-pickup notes; the README keeps the measurement
+consequences (§Traps and rules, trap 0), this section keeps the environment mechanics.
+
+### The NPU power mode is non-persistent state
+
+`xrt-smi`'s pmode resets to `Default` on every reboot and every `amdxdna` reload. The healthy
+records of 08-03 → 08-10 were measured at **Turbo** (set for C4's `require_turbo()` sweep and carried
+by one uninterrupted boot); the machine **rebooted itself at 01:09 on 2026-08-10** and the next day
+read as a ~30× `hw_context` load-cost regression (82 ms/load at `Default`, surviving a driver reload,
+a full reboot and a held-context PM pin; **3.7 ms/load** at Turbo). So the first hardware action of
+any session is `sudo xrt-smi configure --device 0000:64:00.1 --pmode turbo` (operator), verified
+with `xrt-smi examine -r platform`, then the verdict rung. `study/run_mode.py`, `run_profile.py`
+and `run_npu2_runlist_gate.lit` refuse off Turbo (queue item 13 named two latency gates; the other,
+`gate-h.sh`'s throughput floor, retired with the port-loop harness on 2026-08-21 -- decode
+throughput has no standing threshold gate now, only the README's same-session comparison rule), and
+`compare_roots.py` refuses
+roots recording different modes; roots recorded before 2026-08-12 carry no `conditions` block and
+read `unknown`. Full diagnostic chain: [32](32-cost-decomposed-ladder.md).
+
+### A rebuilt compiler is NOT the compiler your job runs, and nothing says so
+
+`air/backend/xrt.py` shells out to the native `aircc` via `air.tools.resolve_tool`, which **prefers a
+bundled binary over PATH**: `bundled_tool_path` is `parents[2]` of `tools.py` + `/bin`. Under
+`tlenv.sh` the `air` package is `install-xrt/python/air`, whose `parents[2]` is `install-xrt/`, and
+`install-xrt/bin/aircc` exists — so PATH is ignored entirely and `PATH=build-xrt/bin:$PATH` alone is
+inert. Under `build-xrt/python` the `air/*.py` files are symlinks into the source tree, `parents[2]`
+is the repo root, `bin/aircc` does not exist there, and it falls back to PATH. **Testing a freshly
+built compiler needs BOTH** `PYTHONPATH=…/build-xrt/python` **and** `PATH=…/build-xrt/bin`.
+
+What it cost: devq **298** and **299** each ran a full, green-looking 21-leg verification against an
+`aircc` nine hours older than the fix under test and reported the pre-fix answer as a result. The
+tell was output **byte-identical to a recorded pre-fix run**.
+
+**The rule**: any job verifying a compiler change prints the resolved `aircc` path and sha256 **from
+python** (`from air.tools import resolve_tool`; the tool is named `aircc`, **not** `aircc.py` — that
+typo made one agent's provenance line fail silently) and **refuses to run** on a mismatch. Never
+assert it from PATH. Corollary: **an ELF-hash diff is not a discriminator** — the ELF is not
+byte-reproducible, like `aie.air.mlir` (two compiles of one preset differ by ~95 lines).
+
+### The device queue
+
+`agents/scripts/devq.sh` is the device scheduler (migration done 2026-08-08): builds run
+concurrently, a `measure` runs alone with no build in flight, stale jobs reconcile by process
+liveness, `devq-selftest.sh` is 20/20. **Use `devq.sh run`, not `submit`, at a gate**: `run` is the
+drop-in for `flock -x LOCK CMD` (relays output, exits with the job's status); `submit` diverts output
+to the job log and returns an id, which blanks a FileCheck while exiting 0. It refuses to nest. All
+23 `flock` sites in the retired `phases.sh` and `llama32_1b_int4`'s `run-inference` were migrated;
+`make chat` keeps the bare lock because the runner is `setsid` with stdin from `/dev/null` and a
+REPL under it reads EOF. Three further rules, each learned once:
+
+- **Never touch a build or cache directory while devq shows a `measure` job running.** Cleanup
+  step 1's `rm *.o.tmp` deleted devq 490's in-flight compiler temp
+  (`mm_m64n128-1364b083.o.tmp`) and failed `run_npu2_runlist_gate.lit`; not a tree defect, and the
+  suite was resubmitted as devq 492/493.
+- **A compile inside a `measure`-class job holds the device lock for its whole duration** (20 min
+  of queue blocked by one int4 compile); submit compiles as detached builds.
+- **Do not `tee /dev/stderr` inside a devq job**: the tee reopens the log at offset 0, most legs are
+  lost and the trailing PASS survives — count legs, do not trust the verdict.
+
+### Smaller facts
+
+- `XRTBackend.compile` writes `air_project/` into the **cwd**; two compiles from one directory
+  clobber each other — one subdirectory per compile.
+- An empty `aircc compilation failed:` body is the backend dropping the return code, not proof the
+  compiler was killed (devq 428 proved the difference); since 2026-08-20 the installed backend prints
+  `aircc compilation failed (returncode N):`.
+- Add to the sandbox venv only under a **full-freeze constraints file** built from `pip freeze`, so
+  pip fails rather than moving a package the shipped models stand on (stronger than `--no-deps`);
+  the 2026-08-14 plot-tier install had an empty before/after diff and `make verify` PASS after.
+- One worktree remains and is not the study's to delete: `.claude/worktrees/agent-ae4f6abdc09902a77`
+  (H8's, branch fully merged, holding an untracked `build-h8/`).
+- `[2026-08-22]` Files this document names that cluster B retired (all at tag `pre-cleanup-20260821`):
+  `port-loop.sh` and its preflight (the `xrt_bin_dir` guard now lives only in this note — check the
+  two CMake flags by hand), `agents/probes/probe_fuse_channels_sibling_nests.py` (its regression is
+  `mlir/test/.../fuse_channels_sibling_nests.mlir`), `probe_backend_preset_hardware.py`,
+  `probe_context_reuse.py`, `probe_r1_arrival_map.py`, `probe_aie_buffer_writer_race.py`. The
+  surviving probes are `probe_r1_rung.py` and `probe_r1_emulate_shape.py`; `port-loop/lib-env.sh`
+  stays at its path because `~/.claude/jobs/…/tlenv.sh` sources it.

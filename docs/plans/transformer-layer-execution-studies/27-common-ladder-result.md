@@ -94,7 +94,7 @@ Walk 2, same code, same conditions, reports **`none: the ranking is the same at
 every rung`**. The crossover was `offload`'s run-to-run noise, not a curve.
 
 **Had one walk been run, this document would have published a crossover.** It is
-the same failure J3 recorded — [25](25-first-study-result-sequence-ladder.md)'s
+the same failure J3 recorded — [25](25-mode-rebuilds-and-results.md)'s
 1024 ordering also failed to survive a second walk — and the same failure the
 README's own lesson names twice. The two-walk rule is what caught it, and
 nothing else would have: walk 1 is internally consistent, 8/8 passed, and the
@@ -153,7 +153,7 @@ than a separate experiment, and it should be taken before anyone attributes
 > control rules out environmental drift, not the ABI. Eviction is still the
 > leading candidate; isolating it needs a third arm — the xclbin ABI with
 > eviction forced back on — and that knob does not exist yet.
-> [29](29-offload-n-streams.md) has the table and the experiment.
+> [29](25-mode-rebuilds-and-results.md) has the table and the experiment.
 >
 > Two qualifications this document's own numbers need. **The 1024 rung did not
 > reproduce**: the 61.6% / 59.8% in the table above read 9.0% / 10.5% on the
@@ -162,7 +162,7 @@ than a separate experiment, and it should be taken before anyone attributes
 > **~20% on best-case latency at 512** (97.5–99.5 ms against 78.9–82.0), so it
 > is a trade rather than a free win. The minimums here *do* reproduce this
 > document's — 82.0 / 78.9 against its 78.2 / 79.9 — which is what says the two
-> measurements are of the same thing. Full table: [29](29-offload-n-streams.md).
+> measurements are of the same thing. Full table: [29](25-mode-rebuilds-and-results.md).
 
 ## What this does and does not settle
 

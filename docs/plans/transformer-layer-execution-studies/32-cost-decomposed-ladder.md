@@ -9,7 +9,7 @@ this document leads with what may NOT be concluded from the walk.
 ## What may not be concluded: any cross-day latency comparison
 
 **`runlist` and `offload` read ~15–20× above their recorded latencies at the same shapes**
-(runlist ~1.9 s, offload ~2.4 s at 1024, against [29](29-offload-n-streams.md)'s 164–183 ms for
+(runlist ~1.9 s, offload ~2.4 s at 1024, against [29](25-mode-rebuilds-and-results.md)'s 164–183 ms for
 offload at 1024 on 2026-08-09), while `coarse` and `fused` match their records (~48/~90–105 ms).
 
 **It is the machine, not the day's code.** A worktree at `3b9f811a` — before every one of today's
@@ -53,7 +53,7 @@ slow rung ran back on `7.0.0-28-generic`.)
 **Confirmation, same rung, minutes apart on 2026-08-11:** after
 `sudo xrt-smi configure --device 0000:64:00.1 --pmode turbo` the rung reads **156.2 ms avg**
 (min 146.1; device 20.6 / sync 13.8 / host_cpu 11.6 ms), residual **3.7 ms/load** — back inside
-doc [29](29-offload-n-streams.md)'s 164–183 ms band. At `Default`, the same rung minutes earlier:
+doc [29](25-mode-rebuilds-and-results.md)'s 164–183 ms band. At `Default`, the same rung minutes earlier:
 2717/2547 ms avg, ~82 ms/load, device_ms ~38. So `Default` costs ~22× on context creation and
 ~1.8× on device compute at this shape.
 
@@ -91,7 +91,7 @@ contradict the taxonomy's mechanism claims (the intermediate-traffic story is un
 moved is re-upload traffic that was never intermediate), but every sentence citing doc 27's
 ordering should now cite it as the ordering *under the wholesale-eviction implementation*.
 `runlist` under `fused` decomposes cleanly: its front moves 2×[S,E] fewer bytes than the block
-front ([30](30-coarse-cells-built.md)'s solved system, at this length ~3.1 MB) against its tail's
+front ([30](25-mode-rebuilds-and-results.md)'s solved system, at this length ~3.1 MB) against its tail's
 small broadcast surcharge.
 
 ## The reconfiguration columns, on their first walk

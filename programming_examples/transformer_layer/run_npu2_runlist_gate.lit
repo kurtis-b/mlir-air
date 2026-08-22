@@ -4,7 +4,7 @@
 // Phase B runtime seam: the hardware gate.
 //
 // Runs the multi-ELF runlist legs in runlist_gate.py on a real NPU -- the
-// measurement docs/plans/transformer-layer-execution-studies/05a-phase-b-runlist-spike-result.md
+// measurement docs/plans/transformer-layer-execution-studies/01-original-plan-superseded.md
 // records, and the load-bearing assumption Phases E and F are built on.
 //
 // This test exists because the driver-run gate for Phase B was
@@ -13,7 +13,7 @@
 // Neither touches the NPU, so the phase's central hardware claim reached the
 // status board on the session's own say-so. Putting the gate into the suite is
 // what makes it driver-verifiable, per
-// docs/plans/transformer-layer-execution-studies/14-the-port-loop-harness.md
+// docs/plans/transformer-layer-execution-studies/01-original-plan-superseded.md
 // ("gates are run by the driver, never self-reported").
 //
 // Slower than its siblings: four distinct GEMM ELFs are compiled at seq_len 2048

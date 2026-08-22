@@ -14,7 +14,7 @@
 
 This is the plan, after one round with Codex: the first draft was written from a subagent's
 inventory of the repository, then sent to Codex for an adversarial read together with doc 55
-([56a](56a-codex-review-of-plan.md), verbatim). §7 lists what it changed. §1 restates the
+(56a (the verbatim Codex review, retired 2026-08-22 to git tag `pre-cleanup-20260821`), verbatim). §7 lists what it changed. §1 restates the
 reference precisely enough to copy; §2 the inventory; §3 the architecture; §4 the phases with
 gates; §5 the first measurable milestone; §6 what was cut. Citations are `file:line` at
 `debf9be2`. Targets are stated as targets, never as results.
@@ -325,7 +325,7 @@ H1a's kernel-scaling curve comes first as the cheaper validation of the runner a
 - A general op-graph IR or a ggml port — a small semantic graph feeding the existing builders
   is enough for six architectures with four deltas.
 - A latency cost model as a mode selector — closed negative as row 31
-  ([53](53-workload-dependent-mapping.md)); the reference has none either. The planner ranks
+  ([53](31-resident-tail-r1-record.md)); the reference has none either. The planner ranks
   tiles by traffic and fixes the dispatch structure; it never ranks modes.
 - `M = 4` buckets until a multi-token decode workload exists.
 - All-model H0 parity — two models.
@@ -344,7 +344,7 @@ Prompt: verify the operator's ≥ 3,300 tok/s Qwen3-0.6B figure and the ubatch/o
 dependence against published numbers and source; restate the prefill comparison; audit doc
 55 §4 items 1–9 against `ggml-org/llama.cpp` master; state the mixed-precision contract
 precisely; then critique the first draft of this plan (H0–H4) and answer five design questions.
-Report: [56a](56a-codex-review-of-plan.md), verbatim, SOURCE / INFERENCE / UNVERIFIABLE labelled.
+Report: 56a (the verbatim Codex review, retired 2026-08-22 to git tag `pre-cleanup-20260821`), verbatim, SOURCE / INFERENCE / UNVERIFIABLE labelled.
 
 **Verdicts on the understanding** (all applied to doc 55, marked `[per Codex review]`):
 ≥ 3,300 is a plausible S26+ target, unproven on S25+, and no controlled ubatch sweep is

@@ -278,4 +278,4 @@ is numerical rather than temporal. `[2026-08-11]` Since the default flip the
 noisy packaging is the opt-in control arm, so an unconfigured run no longer
 pays this drift — but every number in this section was measured on the ELF
 path and predates the flip. Full table:
-`docs/plans/transformer-layer-execution-studies/29-offload-n-streams.md`.
+`docs/plans/transformer-layer-execution-studies/25-mode-rebuilds-and-results.md`.

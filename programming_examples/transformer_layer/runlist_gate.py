@@ -29,7 +29,7 @@ sequential dispatch is itself wrong.
 
 The one thing that does **not** work is what 05-phase-b proposed: binding several
 full ELFs into a single `hw_context`. XRT rejects that three separate ways, and
-`docs/plans/transformer-layer-execution-studies/05a-phase-b-runlist-spike-result.md`
+`docs/plans/transformer-layer-execution-studies/01-original-plan-superseded.md`
 records each. Aggregation does not need it — `xrt.runlist` dispatches each entry
 against the context its kernel came from, so N ELFs means N contexts and still
 one runlist.
@@ -796,7 +796,7 @@ def main():
         print(
             "\nPHASE B GATE: FAIL. Do not relax a leg to clear it — see\n"
             "docs/plans/transformer-layer-execution-studies/\n"
-            "05a-phase-b-runlist-spike-result.md for what each leg measures and\n"
+            "01-original-plan-superseded.md §4.2 (the Phase B spike result) for what each leg measures and\n"
             "which failure means what."
         )
     return 0 if ok else 1

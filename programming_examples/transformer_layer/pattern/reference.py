@@ -36,7 +36,7 @@ WHY THE DRAWS ARE torch AND THE ARITHMETIC IS NOT
 WHY THIS IS NOT A VERBATIM PORT OF iron's reference.py
     iron's takes ``dtype: str = "bf16"`` and builds EVERY tensor at that dtype,
     then runs the whole layer in it. That is the defect corrected in
-    ``docs/plans/transformer-layer-execution-studies/06-phase-c-operators.md``,
+    ``docs/plans/transformer-layer-execution-studies/01-original-plan-superseded.md``,
     and it is worse for a whole layer than it was per operator: this chain is
     eight GEMMs, two LayerNorms and a softmax, so a bf16 oracle accumulates error
     in the same direction as the device and the comparison flatters itself the
