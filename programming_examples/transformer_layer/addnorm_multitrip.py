@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026, Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """Driver-owned fixture for the ping-pong safety proof. NOT part of the example.
 
 The only hardware gate for H9's multi-column multi-trip packet fix (`multicolumn` must go from

@@ -489,11 +489,17 @@ tiles, three herd rows of 8) and ping-pong labeling chooses depth. Modelled on
 **The constraint that decided it**: a column has two shim MM2S channels and the budget is per column
 across the whole segment, stacked herds adding. Measured at 4096×768, `herd_x=8`, 64 trips per tile:
 x, residual, gamma each streamed → **3 packet-typed channels** (the §1/§5 path); x|residual packed,
-gamma second → **0**. Pack as **planes** `[2, rows, cols]` (3-D DMA, `strides=[rows*cols, cols,
-1]`, L1 tile `[2, rpc, cols]`, existing kernels usable, host `np.stack`), not wide `[rows, 2*cols]`.
-The plane-1 subview `memref<8x768xbf16, strided<[768, 1], offset: 6144>, 2>` will not cast to the
-identity layout (H7's wall one level down); the callee declares strided operand types instead, and
-the L1 offset is honoured on hardware — measured with deliberately asymmetric x and residual. It is
+gamma second → **0**. Doc 21 SPECIFIED packing as planes `[2, rows, cols]` (3-D DMA,
+`strides=[rows*cols, cols, 1]`) and a callee declaring strided operand types; **the builder
+measured otherwise** (`builders/norm_tail.py`): plane-major's band fetch has plane stride
+`rows*cols`, and a shim `aie.dma_bd` stride is capped at 2^20 — `'aie.dma_bd' op Stride 2 exceeds
+the [1:1048576] range` (strides `[3072, 3145728, 768, 1]` at 4096×768), through full aiecc where
+the spec's probe had stopped at `air-opt`. The shipped layout is row-interleaved `[rows, 2, cols]`
+(a `rows_per_call` band is contiguous in L3 at any row count); plane-major compiles at 128 rows
+(stride 98,304) and was measured numerically exact there, so `[2026-08-08]` it is back as the
+`plane_major` opt-in for a device-written plane 0, bounded by `rows*cols <= 2^20` → `rows <= 1365`
+at `cols=768` (the 64…1024 rungs, not 2048 and up). Doc 21's "L1 offset honoured" claim was
+measured with deliberately asymmetric x and residual at the 128-row shape. It is
 also why J1's L2-staged weight failed: 8 × 2 = 16 shim MM2S already full before a third stream.
 J7a is unaffected by §5's BD wall because BD exhaustion counts *packet* tasks and the packed form
 has none; the existing streamed builders already run 64 trips at `herd_x=8` on that path.

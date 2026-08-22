@@ -1,3 +1,5 @@
+# Copyright (C) 2026, Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """Both directions of ``sweep.registry_sweep.require_turbo`` -- the ONE Turbo-pmode rule --
 through the REAL ``npu_power_mode`` parser, with ``xrt-smi`` stubbed on PATH.
 

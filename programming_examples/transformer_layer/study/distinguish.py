@@ -1,3 +1,5 @@
+# Copyright (C) 2026, Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """The cross-mode distinguishability gate over a profile's recorded dispatch vectors.
 
     python3 study/distinguish.py <results_root> [--seq-len N]

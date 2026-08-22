@@ -1,3 +1,5 @@
+# Copyright (C) 2026, Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
 """Both directions of the cross-mode distinguishability gate (``distinguish.py``)."""
 from __future__ import annotations
 

@@ -392,3 +392,15 @@ all four clauses met; `PREDICTION-ROT`, falsified; `PREDICTION-PP`, held) are re
 outcomes in [31](31-resident-tail-r1-record.md) and [16](16-compiler-changes.md). The 82-doc tree
 before consolidation — every retired phase spec, research reading, prediction file, the port-loop
 harness and the 19 retired probes — is at git tag `pre-cleanup-20260821` (`60e287d3`).
+
+### Where the old doc numbers went
+
+Code comments and lit headers still cite the pre-consolidation numbers ("doc 31b §3.6", "doc 09").
+Resolve them here; the retired text itself is at tag `pre-cleanup-20260821`.
+
+| old | now in | old | now in |
+|---|---|---|---|
+| 00, 01, 04, 05, 05a, 06, 06a–d, 07, 07a, 07b, 08, 08a–e, 09, 10, 11, 12, 13, 14 | [01](01-original-plan-superseded.md) | 16, 17, 18, 19, 20, 21, 22, 24, 48, PREDICTION-FUSED-REEXEC | [16](16-compiler-changes.md) |
+| 25, 26, 28, 29, 30, 33, 34, 38, 50, 51 | [25](25-mode-rebuilds-and-results.md) | 31, 31a, 31b, 37, 47, 49, 52, 53, PREDICTION-28A-*/28B/MAXQ | [31](31-resident-tail-r1-record.md) |
+| 35, 36 | [35](35-goals-1-and-2.md) | 39, 40, 41, 42, 43, 45, 46 | [44 §Bibliography](44-mapping-frameworks-synthesis.md) |
+| 55a, 56a, 57a (verbatim Codex reports) | their parents 55, 56, 57 | unchanged | 02, 03, 05b, 15, 23, 27, 32, 44, 54, 55, 56, 57 |
