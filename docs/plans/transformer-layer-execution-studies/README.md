@@ -37,7 +37,7 @@ from the 82-doc tree (its full text is at git tag `pre-cleanup-20260821`, commit
 reboot or `amdxdna` reload: `sudo xrt-smi configure --device 0000:64:00.1 --pmode turbo` (operator),
 verified with `xrt-smi examine -r platform`, before any latency. It read Turbo through every job of
 2026-08-21 (devq 450–484); no reboot since 08-13. **The tree is the whole state**: tip `244fefe9`
-(cluster B of the cleanup closed), tree clean; evidence roots are gitignored local copies under
+(the cleanup closed 2026-08-22), tree clean; evidence roots are gitignored local copies under
 `programming_examples/transformer_layer/results/` (`hexagon-opt-20260821/` has every probe script,
 its devq job script, JSON results and `LOOP-QUEUE.md`; `cleanup-20260821/` has the cleanup
 scoreboard, job scripts and Codex verdicts). **Two things learned about running probes**: a compile
@@ -346,11 +346,30 @@ that appear nowhere else.
 | Mixed-partition head → Qwen3-1.7B | landed 2026-08-21 (devq 485, 487; `fd7e17b8`) | 19 → 10 launches at K = 2048; `lm_head_gemv` 15.9–16.2 → 14.6–14.95 ms; 7.70 / 7.83 tok/s ≈ 128–130 ms/token | [57](57-inference-path-optimizations-from-hexagon.md) |
 | Cleanup cluster A — root artifacts | done 2026-08-21 (`3d08333b`; decisions block `c4dd1f2a`) | 16 files → 0 (12 `*.o`, `air.mlir`, `coarse_cache/`, one `.o.tmp`); root ignore rules anchored; +lines 131,003 → 130,953; Codex PASS, 0 blocking (`results/cleanup-20260821/review/verdict-A.json`). Baseline gates devq 489 (host legs), 491 (six models); devq 490's suite run was contaminated by the `.o.tmp` delete | [15](15-environment-notes.md) |
 | Cleanup cluster B — `agents/` | done 2026-08-21/22 (`cbd2858e` .. `244fefe9`, five review rounds) | port-loop harness and 19 one-shot probes retired (at the tag); `agents/` 15,140 → 1,714 lines; kept `devq.sh`, `devq-selftest.sh`, `audit-gemm-object-links.py`, `doctor.sh`, `bootstrap-*.sh`, `port-loop/lib-env.sh` (out-of-repo consumer), `schema/review.json`, `probe_r1_rung.py` + `probe_r1_emulate_shape.py`. Re-homed gates: H9's `herd_x=8` fixture → `addnorm_multitrip.py` + lit + make target; `phase_e_checks` distinguish → `study/distinguish.py`, live in `run_profile.gate()`, fails closed (NaN, failed rows, duplicate lengths, skip identity); `require_turbo` refusing-branch test. Accepted retirements: `gate-h` throughput floor, opcheck-tree clauses. Gates: host 587 → 611 in 27 modules, seam 35 + 10, suite 38/1/0 (devq 493), six-model leg unchanged | [15](15-environment-notes.md) |
+| Cleanup cluster C — plan docs | done 2026-08-22 (`1fa9a78f` + review fixes `f12f198a`) | 82 → 18 docs, 29,766 → 8,871 lines; six parallel consolidations under one preserve-every-number brief; 0 broken links; 20 outside citations repointed; one Codex round: six blocking, all fixed (a retracted two-trip rule, four retired-probe commands, a dead harness item, a stale two-gates claim, two code strings building the old 05a path) | [this README](README.md) |
+| Cleanup cluster D — `transformer_layer/` | done 2026-08-22 (`db0ba4f6`) | no code deleted: builders IMPORT `llms/shared/builders`; every `study/` module is consumed by `run_profile`/`run_ladder`/`manifest`, a lit, or the H0 planner; `coarse_c2/c3` are live modes; lit dedupe would weaken shape gates. tl README 1,688 → 976; [16 §11](16-compiler-changes.md) corrected (plane-major was the spec; builder ships `[rows, 2, cols]`); the doc-number table below. Codex review stopped externally, no verdict | — |
+| Cleanup cluster E — `llms/` | done 2026-08-22 (`d2d652d0`) | the O2 decode-runlist prototype removed (275 lines + 4 hooks; [57 §5](57-inference-path-optimizations-from-hexagon.md) keeps the measurement); qwen3 0.6B/1.7B duplication is `main`'s convention; golden and registry JSON stay pretty-printed drift guards; Goal 1's W1 kernel + lits stay. Gate devq 494: verify PASS, reexec 7/7. Codex review stopped externally, no verdict | — |
+| Cleanup cluster F — compiler | closed 2026-08-22, no change | docs landed in C as [16](16-compiler-changes.md); the 33 `mlir/test` files are paired positive/negative regression lits, one pair per defect class — nothing to merge without weakening a gate; compiler code untouched (operator) | — |
+| Cleanup close — final gates | done 2026-08-22 (devq 495/496/497) | `check-air-mlir` 505 / 7 xfail / 7 unsupported (= baseline); study host **611/611** in 27 modules (was 587); seam 35/35 + 10/10; tl suite **38 / 1 / 0** (39 lits, was 38); six-model verify **6/6**. Branch squashed per cluster; not pushed | results/cleanup-20260821/ (local) |
 | Operator decisions 2026-08-21 | recorded (`c4dd1f2a`) | R1 → supertiles (finished block per execution, `down_K = 96`; two-form comparison first); J1 closed; Goal 1 parked; big three not run (8/11 permanent); iron gap at devel HEAD `cc7083f` approved; docs 01–12 demoted; Goal 2 step 5 already done | this file |
 
 ## The work queue
 
-Ordered as the operator decided. Cleanup first (§Where things stand: C, D, E, F, close), then:
+Ordered as the operator decided. The cleanup is done (2026-08-22); what it removed, per cluster,
+against `main` (lines the branch adds; `results/cleanup-20260821/scoreboard-step{0,7}.txt`):
+
+| cluster | before | after | what went |
+|---|---|---|---|
+| A root artifacts | 80 + 12 binaries | 0 | 12 `*.o`, `air.mlir`, `coarse_cache/`, one `.o.tmp` |
+| B `agents/` | 15,140 | 1,714 | the port-loop harness and 19 probes; two gates re-homed stronger (H9 lit, `study/distinguish.py`) |
+| C plan docs | 29,742 | 8,871 | 82 → 18 docs |
+| D `transformer_layer/` | 57,886 | 58,254 | README −712; +1,080 for the re-homed gates and their tests; no code deleted |
+| E `llms/` + kernels | 18,746 | 18,454 | the O2 prototype |
+| F compiler | 8,854 | 8,854 | untouched |
+| other | 555 | 560 | `.gitignore` anchors |
+| **total** | **131,003** | **96,707** | **−34,296 (−26 %)**; host suite 587 → 611 tests, tl suite 38 → 39 lits |
+
+Then:
 
 | # | Item | Gate |
 |---|---|---|
