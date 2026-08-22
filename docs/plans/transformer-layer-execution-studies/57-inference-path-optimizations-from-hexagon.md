@@ -370,7 +370,7 @@ H2/H3 phases measure.
    448 already showed it at `m_input = 8`); the gate of §1.5 stays red.
 4. ~~**O2 prototype** behind a driver flag: `run_sequence` over the (L `o_gemv_ffn`, L+1
    `rms_qkv`) pairs; dispatch vector `host_submissions 57 → 29`; `make verify`.~~
-   **`[2026-08-21]` DONE, MEASURED, SMALL** (devq 456, 457, 460). `qwen3_0_6b_decode_runlist.py`
+   **`[2026-08-21]` DONE, MEASURED, SMALL** (devq 456, 457, 460). `qwen3_0_6b_decode_runlist.py` (removed in the 2026-08-22 cleanup, tag `pre-cleanup-20260821`; was)
    behind `QWEN3_DECODE_RUNLIST=1` / `--decode-runlist`: the 27 (L `o_gemv_ffn`, L+1
    `rms_qkv`) pairs as one `run_sequence` each, `x` device-resident between them; dispatch
    vector per token **57 → 30 submissions** (27 × 2 entries + 3 singles), `air` 327

@@ -59,7 +59,7 @@ its own subdirectory. Everything else environmental is in [15](15-environment-no
    tok/s = 77 ms per token**, from 89 ms (11.2 tok/s) on 08-20. Qwen3-1.7B got all three:
    **128–130 ms/token** (devq 487).
 3. **O2 (runlist pairs) measured small** — −2 to −4 ms/token once the prototype's own overhead was
-   removed (`dispatch._plan_memo`); kept behind `QWEN3_DECODE_RUNLIST=1`, not production.
+   removed (`dispatch._plan_memo`); the prototype was kept behind `QWEN3_DECODE_RUNLIST=1` until the 2026-08-22 cleanup removed it (tag `pre-cleanup-20260821`); doc 57 §5 holds the measurement.
 4. **Doc 56 H0 — the analytical planner — landed** (`llms/shared/plan/`, `PLAN: 10/10` in the seam
    lit): reproduces both golden drivers' ELF sequences and launch counts from structure,
    `study_skip ≡ profiles.skip_reason`, solver vs registry with every mismatch named. Its first
@@ -337,7 +337,7 @@ that appear nowhere else.
 | Launch-boundary cost isolated | done 2026-08-21 (devq 450–451) | 106–108 µs per configuration: additive 108.1; tiny-only slopes 106.4 / 106.1; fit 106.3 + 146 µs fixed per `xrt.run`; near-empty launches ~4 µs own work; `t1 = 251 µs` floor for a lone ELF; production head streams 40.8 GB/s between boundaries | [57 §1.5](57-inference-path-optimizations-from-hexagon.md) |
 | LM-head defect gated, then avoided | gated 2026-08-21 (devq 452); clean 7/7 on the new head (devq 482/484) | production ELF 5 of 7 wrong (back-to-back ×2, after 0.5 s idle, with a new input; bad rows from row 24, partition 0); `lm_head_reexec_gate.py`, `make check-lm-head-reexec`, `run_npu2_lm_head_reexec.lit`, XFAIL dropped; family avoided, not understood | [57 §1.5](57-inference-path-optimizations-from-hexagon.md) |
 | `m_input = 8` on the LM head | landed 2026-08-21 (devq 453–455) | verify 2/2; `lm_head_gemv` 9.77 / 9.79 → 8.79 / 8.79 ms (−1.0, predicted −0.85) | [57 §5](57-inference-path-optimizations-from-hexagon.md) |
-| O2 — runlist pairs | measured small 2026-08-21 (devq 456/457/460) | 57 → 30 submissions; layer loop 2560 / 2564 vs 2614 / 2637 ms → −2 ms/token after `plan_pool` memo + preload; behind `QWEN3_DECODE_RUNLIST=1` | [57](57-inference-path-optimizations-from-hexagon.md) |
+| O2 — runlist pairs | measured small 2026-08-21 (devq 456/457/460) | 57 → 30 submissions; layer loop 2560 / 2564 vs 2614 / 2637 ms → −2 ms/token after `plan_pool` memo + preload; prototype removed 2026-08-22 (tag `pre-cleanup-20260821`) | [57](57-inference-path-optimizations-from-hexagon.md) |
 | O1 first cut — QKV at 4 launches | landed 2026-08-21 (devq 461–463; `5ad7af60`) | probe 1.125 → 0.680 ms/layer (111 µs per removed boundary); `rms_qkv` 1.03 → 0.62, per-layer 2.92 → 2.52, −11.5 ms/token; verify 2/2; remaining: RMSNorm prologue + QK-norm/RoPE epilogue (column-owns-heads GEMV) for 4 → 1–2 | [57 §5 item 5](57-inference-path-optimizations-from-hexagon.md) |
 | O1 + `m_input = 8` → Qwen3-1.7B | landed 2026-08-21 (devq 465–470; `61a40a00`) | probe 1.326 → 0.873 ms/layer; `rms_qkv` 0.80; LM head 16.4 → 15.9–16.2; ≈127–130 ms/token; `shared/infra/decode_qkv4.py`; Qwen3-4B not ported (verify oomd-deferred) | [57](57-inference-path-optimizations-from-hexagon.md) |
 | Doc 56 H0 — the planner | done 2026-08-21 (`859dee7f`, `decba364`) | `llms/shared/plan/`, `PLAN: 10/10` in `run_seam_tests.lit`; golden JSON for Qwen3-0.6B / Llama-1B; solver vs registry 61 / 136 identical, mismatches classed; finding: 10 × 16384 instead of 19 × 8192 | [56 §4](56-full-model-mixed-precision-study-plan.md) |

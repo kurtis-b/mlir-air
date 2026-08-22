@@ -46,7 +46,6 @@ from qwen3_0_6b_decode import (
     _LM_PARTS,
     lm_head_partition_slices,
 )
-import qwen3_0_6b_decode_runlist as _decode_runlist  # noqa: E402
 
 EPS = 1e-6
 
@@ -277,8 +276,6 @@ def _preload_decode_weights(decode_cache, weights, config):
     decode_cache.profiler.enabled = _was
     weights._decode_weights_preloaded_to_bos = True
     print(f"  Pre-loaded {config.n_layers} decode layers + LM Head.")
-    if _decode_runlist.enabled():
-        _decode_runlist.preload_pairs(decode_cache, config, weights)
 
 
 # ---------------------------------------------------------------------------
@@ -409,16 +406,11 @@ def run_npu_decode_step(
     v_cache,
     current_pos,
 ):
-    """Run one NPU decode step: 28 blocks + final RMSNorm + LM-head."""
-    if _decode_runlist.enabled():
-        # O2 prototype (doc 57): (o_gemv_ffn_L, rms_qkv_{L+1}) pairs as single
-        # submissions. Env QWEN3_DECODE_RUNLIST=1 / --decode-runlist.
-        return _decode_runlist.run_npu_decode_step_runlist(
-            x_decode_bf16, weights, config, decode_cache, rope_lut_bf16,
-            k_cache, v_cache, current_pos,
-            run_lm_head=_run_lm_head, rms_norm=rms_norm,
-            final_norm=weights.final_norm, eps=EPS,
-        )
+    """Run one NPU decode step: 28 blocks + final RMSNorm + LM-head.
+
+    (The O2 runlist-pairs prototype that once hooked here measured -2 to -4 ms/token and was
+    removed in the 2026-08-22 cleanup; doc 57 §5 records it, tag pre-cleanup-20260821 holds it.)
+    """
     vocab_size = weights.lm_head.shape[0]
     x = x_decode_bf16.copy()
     for layer_idx in range(config.n_layers):
@@ -544,8 +536,6 @@ def generate(
     if decode_cache.profiler.enabled:
         print(f"\n{'='*60}\nDECODE detail")
         decode_cache.profiler.report()
-        if _decode_runlist.enabled():
-            print(_decode_runlist.describe_last_step())
 
     return generated_tokens
 
@@ -717,15 +707,7 @@ if __name__ == "__main__":
         "--model", type=str, choices=["base", "instruct"], default="instruct"
     )
     parser.add_argument("--interactive", action="store_true")
-    parser.add_argument(
-        "--decode-runlist",
-        action="store_true",
-        help="O2 prototype: decode (o_gemv_ffn_L, rms_qkv_L+1) pairs as one "
-        "submission each (sets QWEN3_DECODE_RUNLIST=1)",
-    )
     args = parser.parse_args()
-    if args.decode_runlist:
-        os.environ["QWEN3_DECODE_RUNLIST"] = "1"
 
     if args.interactive:
         if args.compile_only:
