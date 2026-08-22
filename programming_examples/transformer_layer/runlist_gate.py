@@ -106,7 +106,7 @@ if _here in sys.path:
 sys.path.insert(0, _here)
 
 from shared.builders.gemm_builder import _build_gemm_module  # noqa: E402
-from shared.infra.bo_pool import BufferSpec, DispatchStep, content_key  # noqa: E402
+from shared.infra.bo_pool import BufferSpec, DispatchStep, content_key_once  # noqa: E402
 from shared.infra.cache import KernelCache, Profiler  # noqa: E402
 from shared.infra.dispatch import RunlistSplitError, plan_submissions  # noqa: E402
 
@@ -625,7 +625,7 @@ def leg_c_run_sequence(cache, specs, arrays, reference):
                 nbytes=arr.size * arr.itemsize,
                 static=static,
                 host_output=arg_name.endswith("_out"),
-                content_key=content_key(arr) if static else None,
+                content_key=content_key_once(arr) if static else None,
             )
             seq_arrays[arg_name] = arr
 

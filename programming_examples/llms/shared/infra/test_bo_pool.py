@@ -604,6 +604,29 @@ def test_slot_assignment_is_deterministic():
         assert plan_pool(steps, specs, elf_abi=True).slot_of == first
 
 
+def test_content_key_once_hashes_an_array_object_once_and_tracks_its_identity():
+    """Rule S1 per plan (2026-08-22): the same object keys once; a different
+    object with the same bytes keys on its own (and agrees); an in-place
+    mutation is invisible until `forget_content_key`, which is the stated contract."""
+    import numpy as np
+    from bo_pool import content_key, content_key_once, forget_content_key, _CONTENT_KEYS
+
+    w = np.arange(64, dtype=np.int32)
+    k1 = content_key_once(w)
+    assert k1 == content_key(w)
+    hit = _CONTENT_KEYS[id(w)]
+    assert hit[0] is w and hit[1] == k1
+    assert content_key_once(w) is k1  # cached object, no rehash
+    w2 = w.copy()
+    assert content_key_once(w2) == k1 and id(w2) in _CONTENT_KEYS
+    w[0] = 99  # in-place mutation: the cache cannot see it ...
+    assert content_key_once(w) == k1
+    assert forget_content_key(w) is True  # ... until the caller says so
+    assert content_key_once(w) != k1 and content_key_once(w) == content_key(w)
+    assert forget_content_key(w2) is True and forget_content_key(w2) is False
+
+
+
 def _main():
     """Run every test_* in definition order and report. Exit 1 on any failure."""
     tests = [

@@ -621,11 +621,16 @@ def prepare_cell(cell_name, shape, seed=42, cache_dir=None, label=None, extra=No
     )
     compile_cell_artifacts(cache, cfgs, run_only=True)
 
-    def dispatch(device_inputs, stage_stats):
+    def dispatch(device_inputs, stage_stats, forward_done=None):
         cache.profiler.cpu_times.clear()
         reconfig_baseline = cache.reconfiguration_counts()
         boundaries, vector_rows = run_cell(cache, cfgs, device_inputs)
         stages = []
+        # The forward is DONE here: every boundary is a host array. The study's
+        # clock stops at this instant (operator rule, 2026-08-22); the per-boundary
+        # comparison below is verification and runs outside it.
+        if forward_done is not None:
+            forward_done()
         for name in ENCODER_BOUNDARIES:
             atol = BLOCK_STAGE_ATOL[name]
             stats = stage_stats(boundaries[name], reference[name], atol=atol)

@@ -137,7 +137,7 @@ for _p in (_PROJ_ROOT, os.path.join(_PROJ_ROOT, "llms")):
         sys.path.insert(0, _p)
 
 import shared.infra.external_kernels as ek  # noqa: E402
-from shared.infra.bo_pool import BufferSpec, DispatchStep, content_key  # noqa: E402
+from shared.infra.bo_pool import BufferSpec, DispatchStep, content_key_once  # noqa: E402
 
 from builders.addnorm import (  # noqa: E402
     addnorm_max_rows,
@@ -542,7 +542,7 @@ def _spec(name, array, static=False, host_output=False):
         nbytes=array.size * array.itemsize,
         static=static,
         host_output=host_output,
-        content_key=content_key(array) if static else None,
+        content_key=content_key_once(array) if static else None,
     )
 
 

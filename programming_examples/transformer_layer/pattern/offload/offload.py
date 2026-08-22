@@ -922,7 +922,7 @@ def prepare_offload(shape, seed=42):
     )
     compile_offload_artifacts(cache, cfg, run_only=True)
 
-    def dispatch(device_inputs, stage_stats):
+    def dispatch(device_inputs, stage_stats, forward_done=None):
         cache.profiler.cpu_times.clear()
         # Snapshot at entry so the extra dict reports what THIS dispatch
         # loaded and attached (schema v2's per-dispatch quantity), same as
@@ -1020,6 +1020,11 @@ def prepare_offload(shape, seed=42):
             }
         )
         stages = []
+        # The forward is DONE here: every boundary is a host array. The study's
+        # clock stops at this instant (operator rule, 2026-08-22); the per-boundary
+        # comparison below is verification and runs outside it.
+        if forward_done is not None:
+            forward_done()
         for name in boundary_names:
             atol = stage_atol[name]
             stats = stage_stats(boundaries[name], reference[name], atol=atol)

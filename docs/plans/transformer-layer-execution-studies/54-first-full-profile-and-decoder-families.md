@@ -16,7 +16,33 @@ verified in-job on every run. Results roots are gitignored:
 `results/decoder-gpt2_medium_1024-smoke-w{1,2}/`, `results/iron-validation-20260820/`; each
 holds its devq job log.
 
-## 1. The matrix, as measured — walk 2 (devq 435, one session, 419 s warm, `complete: True`)
+## 1. The matrix, as measured
+
+### 1a. `[2026-08-22]` Walk 3 — THE STANDING MATRIX, under the forward-only clock (devq 507, one session, Turbo, `complete: True`)
+
+The operator's rule of 2026-08-22 (queue item 8, §5): a timed iteration runs from the dispatch
+call to the instant the forward is done — every boundary read back and CPU-readable — and the
+per-boundary correctness comparison runs after that instant, outside the clock, on every
+iteration still. Rule S1's content key is computed once per plan. Walk 2 below was taken with the
+comparison inside the clock (~24–27 ms per forward at 512, growing with the tensors) and is kept
+as the record of that clock; **cite walk 3**. Same profile, same `--warmup 1 --samples 3`, same 21
+measured / 15 derived skips; the cross-mode gate (`study/distinguish.py`) gated 512 and 1024 clean.
+
+| mode | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
+|---|---|---|---|---|---|---|---|---|---|
+| `coarse` | FA floor | FA floor | **8.2** | **13.4** | **20.3** | **39.0** | **72.7** | **165.7** | **437.2** |
+| `offload` | GEMM tile | GEMM tile | GEMM tile | **77.0** | **98.9** | **187.9** | **537.4** | **1767.4** | **6080.4** |
+| `runlist` | GEMM tile | GEMM tile | GEMM tile | **42.7** | **67.0** | **143.7** | **369.8** | **1241.3** | softmax L1 |
+| `fused` | packing | packing | **6.4** | **9.9** | **16.9** | packing | packing | packing | packing |
+
+Against walk 2, every measured cell moved down and the ordering `fused` < `coarse` < `runlist` <
+`offload` held at every length where it was measured; the shift is the comparison's cost, which
+scales with the tensors — `coarse` −69 % at 512 (43.5 → 13.4), −78 % at 4096 (325.7 → 72.7),
+−71 % at 16384 (1505.8 → 437.2); `offload` −30 % at 512, −11 % at 16384 (its forward is
+dominated by `device_ms`, §5). DRAM traffic and the dispatch vectors are clock-independent and
+unchanged (tables below). Root: `results/g-full-baseline768-w3/`.
+
+### 1b. Walk 2 — the old clock (devq 435, one session, 419 s warm, `complete: True`)
 
 | mode | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
 |---|---|---|---|---|---|---|---|---|---|
@@ -201,7 +227,11 @@ and is the like-for-like measurement:
 | offload | **12.11** (min 10.89, 30) | 101.03 | **77.44** (min 75.08; device 60.49) | 6.4× |
 
 So the device-resident modes are at parity with iron's `hybrid` once the comparison is out of the
-clock. What remains: (a) **`runlist`**'s 1.9× and `coarse`'s residual ~10 ms are host-side BO
+clock. **`[2026-08-22]` Final, under the decided clock and rule S1 once per plan** (devq 507, same
+session, Turbo): iron hybrid **15.05** / runlist 24.05 / offload 10.86 vs ours coarse **13.47**
+(min 12.92; 0.90×) / fused **8.92** (min 8.73; 0.59×) / runlist 42.25 (1.76×) / offload 76.49
+(7.0×). The `--no-stage-stats` flag that produced the interim column was superseded by the clock
+rule the same day and no longer exists. What remains: (a) **`runlist`**'s 1.9× and `coarse`'s residual ~10 ms are host-side BO
 traffic — and `builders/block.py`'s `_sequence_*` rebuild every `BufferSpec` per forward, re-hashing
 the static weights (`content_key`, rule S1: 36 SHA-256 calls over ~14 MB per six forwards ≈ 6 ms
 each) before the pool decides nothing changed; iron keeps its weights resident once. (b)

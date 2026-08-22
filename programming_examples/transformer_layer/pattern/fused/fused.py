@@ -145,7 +145,7 @@ for _p in (_PROJ_ROOT, os.path.join(_PROJ_ROOT, "llms"), _EXAMPLE_ROOT):
         sys.path.insert(0, _p)
 
 import shared.infra.external_kernels as ek  # noqa: E402
-from shared.infra.bo_pool import BufferSpec, DispatchStep, content_key  # noqa: E402
+from shared.infra.bo_pool import BufferSpec, DispatchStep, content_key_once  # noqa: E402
 from shared.infra.stitching import KernelSlice, stitch_elf  # noqa: E402
 
 from builders.block import block_config  # noqa: E402
@@ -771,7 +771,7 @@ def _spec_buf(name, array, static=False, host_output=False):
         nbytes=array.size * array.itemsize,
         static=static,
         host_output=host_output,
-        content_key=content_key(array) if static else None,
+        content_key=content_key_once(array) if static else None,
     )
 
 
@@ -837,7 +837,7 @@ def prepare_fused(shape, seed=42):
     mha_idx = cfg["mha_idx"]
     tail_idx, tail_order = cfg["tail_idx"], cfg["tail_order"]
 
-    def dispatch(device_inputs, stage_stats):
+    def dispatch(device_inputs, stage_stats, forward_done=None):
         reconfig_baseline = cache.reconfiguration_counts()
         x, w_qkv, w_o, ln1_weight, w_up, w_down, ln2_weight = device_inputs
 
@@ -972,6 +972,11 @@ def prepare_fused(shape, seed=42):
 
         vector_rows = [vector.as_row()]
         stages = []
+        # The forward is DONE here: every boundary is a host array. The study's
+        # clock stops at this instant (operator rule, 2026-08-22); the per-boundary
+        # comparison below is verification and runs outside it.
+        if forward_done is not None:
+            forward_done()
         for name in ENCODER_BOUNDARIES:
             atol = BLOCK_STAGE_ATOL[name]
             stats = stage_stats(boundaries[name], reference[name], atol=atol)

@@ -88,18 +88,22 @@ then after cleanup cluster B:
 
 `install-xrt` was refreshed after each compiler change; check with `ls -l`, never `cmp`.
 
-**Standing numbers to cite.** Layer study: [54 §1](54-first-full-profile-and-decoder-families.md)
-walk 2 for the nine-length matrix and DRAM table (`full`'s `--warmup 1 --samples 3` — do not splice
-against doc 32's `2/5`), cross-mode orderings from [32 §The post-flip walk](32-cost-decomposed-ladder.md)
-and its 2026-08-18 re-walk (absolute numbers from `results/rewalk-doc32-w{1,2}`), decoder families
-from [54 §4](54-first-full-profile-and-decoder-families.md). Model path: [57 §1.5](57-inference-path-optimizations-from-hexagon.md)
+**Standing numbers to cite.** **THE CLOCK `[2026-08-22]`**: a layer-study latency is the forward
+pass only — dispatch call to the instant the result is CPU-readable; verification outside — with
+rule S1's content key once per plan (operator rule, item 8). Everything measured before 2026-08-22
+carries the old clock (comparison inside, ~24–27 ms per forward at 512, more at longer lengths)
+and is re-recorded: the nine-length matrix and DRAM table are [54 §1a](54-first-full-profile-and-decoder-families.md)
+**walk 3** (devq 507; `full`'s `--warmup 1 --samples 3` — do not splice against doc 32's `2/5`);
+cross-mode orderings and the 512/1024 absolutes are [32](32-cost-decomposed-ladder.md)'s
+2026-08-22 re-walk (`results/rewalk-doc32-w3`, devq 508); decoder families from
+[54 §4](54-first-full-profile-and-decoder-families.md) are old-clock and not yet re-walked. Model path: [57 §1.5](57-inference-path-optimizations-from-hexagon.md)
 (boundary 106–108 µs, 146 µs per `xrt.run`), §5 items 3c / 5 / 5b (kernel-line deltas, each a
 same-session before/after under recorded Turbo), and **§1.1's correction line: Qwen3-0.6B bf16
 decode 77 ms/token (12.96–13.12 tok/s), devq 486, idle host, Turbo**. **Do not cite** the June
 `llms/` table (pmode-unrecorded), Hexagon's figures as like-for-like ([55 §5](55-hexagon-llama-cpp-lessons-for-xdna2.md)),
-or iron's latency figures against the DEFAULT study numbers — the only like-for-like iron
-comparison is [54 §5](54-first-full-profile-and-decoder-families.md)'s `[2026-08-22]` table (devq
-504, `--no-stage-stats`, same session): coarse 17.25 / fused 14.83 vs iron hybrid 15.07 ms at 512.
+or iron's latency figures against the DEFAULT study numbers — the like-for-like iron
+comparison is [54 §5](54-first-full-profile-and-decoder-families.md)'s `[2026-08-22]` final line
+(devq 507, the decided clock, same session): coarse 13.47 / fused 8.92 vs iron hybrid 15.05 ms at 512.
 
 **Operator decisions `[2026-08-21, afternoon]`** — every "operator decision" row is settled:
 
@@ -352,6 +356,7 @@ that appear nowhere else.
 | Cleanup cluster E — `llms/` | done 2026-08-22 (`d2d652d0`) | the O2 decode-runlist prototype removed (275 lines + 4 hooks; [57 §5](57-inference-path-optimizations-from-hexagon.md) keeps the measurement); qwen3 0.6B/1.7B duplication is `main`'s convention; golden and registry JSON stay pretty-printed drift guards; Goal 1's W1 kernel + lits stay. Gate devq 494: verify PASS, reexec 7/7. Codex review stopped externally, no verdict | — |
 | Cleanup cluster F — compiler | closed 2026-08-22, no change | docs landed in C as [16](16-compiler-changes.md); the 33 `mlir/test` files are paired positive/negative regression lits, one pair per defect class — nothing to merge without weakening a gate; compiler code untouched (operator) | — |
 | Item 8 — the iron latency gap, attributed | done 2026-08-22 (devq 503 / 504; `results/iron-gap-20260822/`) | Both clocks have the same shape; ours runs the per-boundary comparison INSIDE it (~22–27 ms of a forward) and iron's does not. Like-for-like at `baseline_768`/512, same session, Turbo, `--no-stage-stats`: iron hybrid **15.07** vs ours coarse **17.25** (1.14×) / fused **14.83** (0.98×); runlist 24.29 vs **46.30** (1.91×, host BO traffic + per-forward weight re-hashing); offload 12.11 vs **77.44** (6.4×: `device_ms` 60.5 over the SAME 30 GEMM dispatches and the same linear-device / non-linear-host partition — ~2.0 ms per submission vs ~0.4; which of the 30 carry it is not instrumented, so this residual is NOT attributed). Default numbers unchanged; two operator questions in the queue | [54 §5](54-first-full-profile-and-decoder-families.md) |
+| The clock — forward pass only; S1 once per plan; standing numbers re-recorded | done 2026-08-22 (devq 506 gate; 507 walk 3; 508 doc-32 re-walk) | Operator rule after item 8: the five dispatch seams report `forward_done` (last boundary CPU-readable); `run_mode` times to it and still verifies every iteration (host 614/614, tl 38/1/0); `bo_pool.content_key_once`. Walk 3: coarse 13.4 / fused 9.9 / runlist 42.7 / offload 77.0 at 512, 437.2 / — / — / 6080.4 at 16384, `complete: True`, distinguish clean; like-for-like vs iron hybrid 15.05: coarse 0.90×, fused 0.59× | [54 §1a](54-first-full-profile-and-decoder-families.md) · [32](32-cost-decomposed-ladder.md) |
 | Cleanup close — final gates | done 2026-08-22 (devq 495/496/497) | `check-air-mlir` 505 / 7 xfail / 7 unsupported (= baseline); study host **611/611** in 27 modules (was 587); seam 35/35 + 10/10; tl suite **38 / 1 / 0** (39 lits, was 38); six-model verify **6/6**. Branch squashed per cluster; not pushed | results/cleanup-20260821/ (local) |
 | Operator decisions 2026-08-21 | recorded (`c4dd1f2a`) | R1 → supertiles (finished block per execution, `down_K = 96`; two-form comparison first); J1 closed; Goal 1 parked; big three not run (8/11 permanent); iron gap at devel HEAD `cc7083f` approved; docs 01–12 demoted; Goal 2 step 5 already done | this file |
 

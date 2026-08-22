@@ -143,30 +143,6 @@ def _stage_stats(actual, expected, atol):
     }
 
 
-def _stage_stats_skipped(actual, expected, atol):
-    """The per-boundary comparison SKIPPED: the sentinel the timed iterations
-    pass under ``--no-stage-stats``.
-
-    `[2026-08-22]` Item 8 (the iron latency gap) profiled a ``coarse`` forward
-    at 512: of ~42 ms, ~22 ms was ``_stage_stats`` -- ten full-array float32
-    comparisons the dispatch seam runs INSIDE the clock -- and iron's region
-    contains no such check. The sentinel does no arithmetic and reports
-    ``n_mismatch = -1``, which no clean-count accepts, so a timed iteration can
-    never pass on its own: correctness comes from the warm-up iteration(s),
-    which still run the real comparison, and from the final output check,
-    which was always outside the clock. The default is unchanged -- every
-    recorded number in the study keeps the comparison inside its region.
-    """
-    import numpy as np
-
-    return {
-        "n_elements": int(np.asarray(actual).size),
-        "n_mismatch": -1,
-        "mean_rel_L1": float("nan"),
-        "atol_required": float("nan"),
-    }
-
-
 def _shape_for(
     spec: dict, seq_len: int | None, family: str | None = None
 ) -> tuple[dict, str, str]:
@@ -273,20 +249,21 @@ def run(
     runs_per_sample: int,
     seq_len: int | None = None,
     family: str | None = None,
-    stage_stats_in_clock: bool = True,
 ) -> dict:
     """Run ``mode`` and return a schema row. Never raises for a run failure.
 
-    ``stage_stats_in_clock=False`` (``--no-stage-stats``) moves the per-boundary
-    comparison out of the timed iterations: the warm-up still runs it (so
-    ``warmup >= 1`` is required), ONE MORE untimed dispatch runs it after the
-    timed population, both must pass for the row to, and the final output check
-    is unchanged. A mismatch confined to a timed iteration between those two
-    checks is the one thing this path cannot see that the default can; the
-    default stays the default. Opt-in; see ``_stage_stats_skipped``.
+    THE CLOCK `[2026-08-22]`: one iteration's latency runs from the instant the
+    dispatch is called to the instant the dispatch seam reports the forward
+    DONE -- every boundary read back and readable by the CPU -- through the
+    ``forward_done`` callback. The per-boundary comparison the seam runs after
+    that instant is verification, not execution, and is outside the clock
+    (operator rule, item 8 of the 2026-08-21 queue: ~24-27 ms of a 512-token
+    forward before this change). It still runs on EVERY iteration, so a row
+    reads ``passed`` only if every timed forward verified. A seam that never
+    calls ``forward_done`` cannot be timed under this rule and is refused.
+    Numbers recorded before this change carry the old clock; see the README's
+    standing-numbers rule.
     """
-    if not stage_stats_in_clock and warmup < 1:
-        raise ValueError("--no-stage-stats needs warmup >= 1: the warm-up is the correctness check")
     row = schema.empty_row("results")
     row["execution_mode"] = schema.EXECUTION_MODE_CSV.get(mode, mode)
     row["backend"] = "xrt"
@@ -333,20 +310,31 @@ def run(
         expected = prepared["expected"][0]
         row["compile_setup_time_ms"] = (time.perf_counter() - setup_t0) * 1000.0
 
-        warm_stages_ok = True
         for _ in range(warmup):
-            _, warm_extra = dispatch(inputs, _stage_stats)
-            warm_stages_ok = warm_stages_ok and bool(warm_extra.get("stages_passed", True))
-        timed_stats = _stage_stats if stage_stats_in_clock else _stage_stats_skipped
+            dispatch(inputs, _stage_stats)
+
+        done_at = []
+
+        def _forward_done():
+            done_at.append(time.perf_counter())
 
         durations = []
         outputs = None
         extra = {}
         decomposition = {key: [] for key in _MS_COMPONENTS}
         for _ in range(samples):
-            t0 = time.perf_counter()
+            sample_sec = 0.0
             for _ in range(runs_per_sample):
-                outputs, extra = dispatch(inputs, timed_stats)
+                t0 = time.perf_counter()
+                del done_at[:]
+                outputs, extra = dispatch(inputs, _stage_stats, forward_done=_forward_done)
+                if len(done_at) != 1:
+                    raise RuntimeError(
+                        f"{mode}'s dispatch seam reported forward_done {len(done_at)} time(s); "
+                        "the clock needs exactly one -- this seam cannot be timed under the "
+                        "2026-08-22 rule (forward only, verification outside)"
+                    )
+                sample_sec += done_at[0] - t0
                 # Collected per ITERATION, inside the sample window, because
                 # only the innermost loop sees every extra dict -- collecting
                 # after the window would keep one iteration per sample and the
@@ -355,13 +343,8 @@ def run(
                 # small sum, noise against the stage comparisons the dispatch
                 # itself already runs inside this clock.
                 _collect_ms_decomposition(decomposition, extra)
-            durations.append(time.perf_counter() - t0)
-        # --- clock stops ---------------------------------------------------
-        if not stage_stats_in_clock:
-            # The post-check: the real comparison once more, outside the clock,
-            # so the timed population is bracketed by two verified dispatches.
-            _, post_extra = dispatch(inputs, _stage_stats)
-            warm_stages_ok = warm_stages_ok and bool(post_extra.get("stages_passed", True))
+            durations.append(sample_sec)
+        # --- clock stops at each iteration's forward_done ------------------
 
         total_sec = sum(durations)
         per_inference = [d / runs_per_sample for d in durations]
@@ -396,8 +379,7 @@ def run(
         final_atol = prepared.get("atol", spec["atol"])
         stats = _stage_stats(outputs[0], expected, atol=final_atol)
         row["validation_error_count"] = stats["n_mismatch"]
-        stages_ok = (bool(extra.get("stages_passed", True)) if stage_stats_in_clock
-                     else warm_stages_ok)
+        stages_ok = bool(extra.get("stages_passed", True))
         if stats["n_mismatch"] == 0 and stages_ok:
             row["run_status"] = "passed"
             row["failure_message"] = ""
@@ -523,12 +505,6 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--runs-per-sample", type=int, default=1)
     ap.add_argument("--study-id", default="adhoc")
     ap.add_argument(
-        "--no-stage-stats",
-        action="store_true",
-        help="keep the per-boundary comparison OUT of the timed iterations (the "
-        "warm-up still runs it). Opt-in; item 8 of the 2026-08-21 queue.",
-    )
-    ap.add_argument(
         "--seq",
         type=int,
         default=None,
@@ -561,7 +537,6 @@ def main(argv: list[str] | None = None) -> int:
         args.runs_per_sample,
         args.seq,
         args.family,
-        stage_stats_in_clock=not args.no_stage_stats,
     )
     row["study_id"] = args.study_id
     results_io.write_rows(args.out, [row])

@@ -1,5 +1,15 @@
 # 32 — The first cost-decomposed four-mode ladder, and what it caught
 
+> **`[2026-08-22]` Every latency in this document is under the OLD clock** (the per-boundary
+> comparison inside the timed region, ~24–27 ms per forward at 512; [54 §5](54-first-full-profile-and-decoder-families.md)).
+> Its orderings stand. The absolute numbers to cite are the re-walk under the forward-only clock
+> with rule S1 once per plan — `results/rewalk-doc32-w3`, devq 508, same `--warmup 2 --samples 5`,
+> same mode order, Turbo: at 512 `offload` **75.0** / `runlist` **43.2** / `coarse` **12.7** /
+> `fused` **9.7** ms; at 1024 **102.9** / **68.3** / **21.2** / **15.4** (w2 under the old clock:
+> 101.7 / 73.3 / 43.1 / 39.1 and 153.2 / 130.0 / 78.4 / 77.6). `fused` < `coarse` < `runlist` <
+> `offload` 8/8, as before; the `fused`/`coarse` margin at 1024 that had "nearly closed" is 27 %
+> under the new clock (15.4 vs 21.2) — the comparison had been hiding it.
+
 `[2026-08-10]` The first ladder walked with schema v2's cost columns: four modes × 512/1024,
 `--warmup 2 --samples 5`, one process per rung, **two walks** (results/ladder-v2-w1, -w2,
 gitignored; 16/16 rungs passed). Three findings, in decreasing order of solidity — and the third

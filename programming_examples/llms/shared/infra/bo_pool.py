@@ -540,3 +540,31 @@ def content_key(buf):
     if not mv.c_contiguous:
         mv = memoryview(bytes(mv))
     return "sha256:" + hashlib.sha256(mv.cast("B")).hexdigest()
+
+
+#: `[2026-08-22]` static buffers keyed ONCE per array object (rule S1, per plan).
+#: Item 8 of the 2026-08-21 queue profiled the mode seams rebuilding every
+#: BufferSpec per forward and re-hashing ~14 MB of weights each time -- ~6 ms of
+#: a 512-token forward -- to conclude nothing had changed. The operator's rule:
+#: the same model's weights are the same across sequences, so the key is
+#: computed when the array is first seen and reused while that object lives.
+#: The entry pins the array (the key is valid for exactly that object, and a
+#: pinned id() cannot be recycled); a caller that MUTATES a static array in
+#: place must call `forget_content_key` or use `content_key` directly.
+_CONTENT_KEYS: dict = {}
+
+
+def content_key_once(buf):
+    """`content_key(buf)`, computed once per buffer object and cached by identity."""
+    hit = _CONTENT_KEYS.get(id(buf))
+    if hit is not None and hit[0] is buf:
+        return hit[1]
+    key = content_key(buf)
+    _CONTENT_KEYS[id(buf)] = (buf, key)
+    return key
+
+
+def forget_content_key(buf):
+    """Drop `buf`'s cached key (after an in-place mutation). Returns True if one was cached."""
+    hit = _CONTENT_KEYS.pop(id(buf), None)
+    return hit is not None and hit[0] is buf

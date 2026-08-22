@@ -1,5 +1,10 @@
 # 27 — The first four-mode comparison at one sequence length
 
+> **`[2026-08-22]` Every latency here is under the OLD clock** (comparison inside the timed
+> region; [54 §5](54-first-full-profile-and-decoder-families.md)). Cite absolute numbers from
+> [54 §1a](54-first-full-profile-and-decoder-families.md) (walk 3) or [32](32-cost-decomposed-ladder.md)'s
+> 2026-08-22 re-walk; this document's orderings and DRAM figures stand.
+
 > **`[2026-08-10]` Two of this document's results are superseded — read
 > [32](32-cost-decomposed-ladder.md) beside it.** The warm DRAM ordering it
 > measured (`fused` < `coarse` < `runlist` < `offload`) described the

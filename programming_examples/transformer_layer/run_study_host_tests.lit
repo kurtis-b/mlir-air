@@ -455,13 +455,15 @@
 // lost a declared length behind duplicate rows, and one where a skip and a
 // failing length traded places (skip identity against the declared skips).
 //
-// `[2026-08-22]` 611 -> 617, no module added: item 8 (the iron latency gap)
-// found ~22 of a 42 ms coarse forward was the per-boundary comparison running
-// INSIDE the clock; run_mode gains --no-stage-stats (opt-in: the warm-up and a
-// post-timed dispatch run the real comparison, the timed ones a sentinel) and
-// test_run_mode pins it both ways (+6): the sentinel can never read clean, a
-// failing warm-up or post-check fails the row, and the one asymmetry -- a
-// mismatch confined to a timed iteration -- fails the default and not the flag.
+// `[2026-08-22]` 611 -> 614, no module added: the CLOCK moved (operator rule,
+// item 8 of the 2026-08-21 queue). A timed iteration now runs from the dispatch
+// call to the seam's forward_done -- every boundary read back and CPU-readable
+// -- and the per-boundary comparison runs after that instant, outside the
+// clock, on every iteration still. test_run_mode pins it (+3): 20 ms of
+// comparison per dispatch leaves the latency under 5 ms; a mismatch confined
+// to the last timed dispatch still fails the row; a seam that never reports
+// forward_done is refused. (The interim --no-stage-stats flag and its six
+// tests, 613 -> 617 earlier the same day, are superseded and gone.)
 //
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 617/617 passed in 27 modules
+// CHECK: study host tests: 614/614 passed in 27 modules
