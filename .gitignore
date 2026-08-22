@@ -42,6 +42,11 @@ install-xrt
 # Anchored, so a future programming_examples/*/llvm/ is not silently swallowed too.
 /llvm/
 /my_install/
+# Kernel objects and aircc output written to the REPO ROOT by a build run from the wrong cwd
+# (twelve *.o, air.mlir and coarse_cache/ were committed this way once). Anchored to the root.
+/*.o
+/air.mlir
+/coarse_cache/
 platform_repo
 myproj
 sw_comp

@@ -15,6 +15,7 @@ build_peano/
 # the only tracked object files in the repository, and air.mlir/air.elf are
 # aircc intermediates that nothing reads and that are rewritten on every run.
 *.o
+*.o.tmp
 air.mlir
 air.elf
 air.insts.bin
