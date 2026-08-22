@@ -384,8 +384,9 @@ H2/H3 phases measure.
    pair **2.70 / 2.71 ms avg, 2.59 min** — **−2 ms/token, about 2 %**. The mechanism
    works and is correct; its ceiling is the per-`xrt.run` fixed cost (§1.5's 146 µs
    intercept, minus a runlist entry's own cost) × 27, and that is what it delivers. It
-   stays behind the flag (the pools double the resident decode weights — see the module
-   docstring) and is not the production path. The launch count is the cost that matters;
+   stayed behind the flag (the pools doubled the resident decode weights) and was never the
+   production path; the 2026-08-22 cleanup removed the module and the flag (tag
+   `pre-cleanup-20260821` holds them). The launch count is the cost that matters;
    O1 is where the token goes. **On top of O1's 4-launch stage** (devq 464, ported to the
    9-arg ABI): layer-loop wall **2186 / 2120 vs 2247 / 2249 ms**, pair 2.27 / 2.23 ms avg
    (2.17 min) against 1.53 + 0.62 — **−2 to −4 ms/token**; the saving per pair is the same

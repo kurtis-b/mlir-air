@@ -498,8 +498,13 @@ the spec's probe had stopped at `air-opt`. The shipped layout is row-interleaved
 (a `rows_per_call` band is contiguous in L3 at any row count); plane-major compiles at 128 rows
 (stride 98,304) and was measured numerically exact there, so `[2026-08-08]` it is back as the
 `plane_major` opt-in for a device-written plane 0, bounded by `rows*cols <= 2^20` → `rows <= 1365`
-at `cols=768` (the 64…1024 rungs, not 2048 and up). Doc 21's "L1 offset honoured" claim was
-measured with deliberately asymmetric x and residual at the 128-row shape. It is
+at `cols=768` (the 64…1024 rungs, not 2048 and up). Doc 21's open question — whether a strided
+L1 subview's offset reaches an external callee — was never measured and is **moot**: `air-to-aie`
+normalizes every external callee signature to the identity layout and `memref.cast` then refuses
+`strided<[768, 1], offset: 6144>` → identity, so the strided call never compiles (the builder's
+docstring quotes the error). The shipped add is the builder's own direct `arith.addf` codegen on
+the packed tile held flat — no callee, no strided type — and that is what the 128-row plane-major
+run validated numerically. It is
 also why J1's L2-staged weight failed: 8 × 2 = 16 shim MM2S already full before a third stream.
 J7a is unaffected by §5's BD wall because BD exhaustion counts *packet* tasks and the packed form
 has none; the existing streamed builders already run 64 trips at `herd_x=8` on that path.
