@@ -1012,7 +1012,7 @@ def prepare_fused(shape, seed=42):
             **reconfiguration_delta(cache, reconfig_baseline),
         }
 
-    def decoder_dispatch(device_inputs, stage_stats):
+    def decoder_dispatch(device_inputs, stage_stats, forward_done=None):
         # `[2026-08-19]` the re-execution wall this dispatch sat behind is
         # ROOT-CAUSED AND FIXED. The wall: dispatch 1 was 12/12 stages clean
         # (devq 382) while every later dispatch computed UNMASKED attention
@@ -1160,6 +1160,10 @@ def prepare_fused(shape, seed=42):
 
         vector_rows = [vector.as_row()]
         stages = []
+        # The forward is DONE here (every boundary a host array); the clock stops
+        # at this instant (operator rule, 2026-08-22), the comparison is outside it.
+        if forward_done is not None:
+            forward_done()
         for name in boundary_names:
             atol = stage_atol[name]
             stats = stage_stats(boundaries[name], reference[name], atol=atol)

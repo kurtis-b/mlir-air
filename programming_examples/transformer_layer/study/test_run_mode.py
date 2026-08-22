@@ -250,3 +250,12 @@ def test_a_seam_that_never_reports_forward_done_cannot_be_timed():
     row = _with_fake(spec, lambda: run_mode.run("fake", warmup=1, samples=1, runs_per_sample=1))
     assert row["run_status"] == "failed", row
     assert "forward_done 0 time(s)" in row["failure_message"], row["failure_message"]
+
+
+def test_a_transient_mismatch_in_a_middle_timed_iteration_fails_the_row():
+    """[clean warm-up, timed clean, timed MISMATCH, timed clean] -> failed. Before
+    2026-08-22 only the LAST timed dispatch's verdict governed run_status."""
+    spec, calls = _fake_mode(fail_on_call=3)
+    row = _with_fake(spec, lambda: run_mode.run("fake", warmup=1, samples=3, runs_per_sample=1))
+    assert row["run_status"] == "failed" and "stages_passed=False" in row["failure_message"], row
+    assert calls == [0, 0, 16, 0], calls

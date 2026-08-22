@@ -455,15 +455,16 @@
 // lost a declared length behind duplicate rows, and one where a skip and a
 // failing length traded places (skip identity against the declared skips).
 //
-// `[2026-08-22]` 611 -> 614, no module added: the CLOCK moved (operator rule,
+// `[2026-08-22]` 611 -> 615, no module added: the CLOCK moved (operator rule,
 // item 8 of the 2026-08-21 queue). A timed iteration now runs from the dispatch
 // call to the seam's forward_done -- every boundary read back and CPU-readable
 // -- and the per-boundary comparison runs after that instant, outside the
 // clock, on every iteration still. test_run_mode pins it (+3): 20 ms of
 // comparison per dispatch leaves the latency under 5 ms; a mismatch confined
 // to the last timed dispatch still fails the row; a seam that never reports
-// forward_done is refused. (The interim --no-stage-stats flag and its six
+// forward_done is refused; and (+1, the review round) a mismatch in a MIDDLE
+// timed iteration fails the row -- every iteration's verdict governs. (The interim --no-stage-stats flag and its six
 // tests, 613 -> 617 earlier the same day, are superseded and gone.)
 //
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 614/614 passed in 27 modules
+// CHECK: study host tests: 615/615 passed in 27 modules

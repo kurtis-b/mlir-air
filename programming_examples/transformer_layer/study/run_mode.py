@@ -314,6 +314,7 @@ def run(
             dispatch(inputs, _stage_stats)
 
         done_at = []
+        all_stages_ok = True  # every timed iteration's verdict, not just the last
 
         def _forward_done():
             done_at.append(time.perf_counter())
@@ -335,6 +336,7 @@ def run(
                         "2026-08-22 rule (forward only, verification outside)"
                     )
                 sample_sec += done_at[0] - t0
+                all_stages_ok = all_stages_ok and bool(extra.get("stages_passed", True))
                 # Collected per ITERATION, inside the sample window, because
                 # only the innermost loop sees every extra dict -- collecting
                 # after the window would keep one iteration per sample and the
@@ -379,7 +381,7 @@ def run(
         final_atol = prepared.get("atol", spec["atol"])
         stats = _stage_stats(outputs[0], expected, atol=final_atol)
         row["validation_error_count"] = stats["n_mismatch"]
-        stages_ok = bool(extra.get("stages_passed", True))
+        stages_ok = all_stages_ok
         if stats["n_mismatch"] == 0 and stages_ok:
             row["run_status"] = "passed"
             row["failure_message"] = ""

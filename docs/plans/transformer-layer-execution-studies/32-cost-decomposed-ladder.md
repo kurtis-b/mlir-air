@@ -5,8 +5,8 @@
 > Its orderings stand. The absolute numbers to cite are the re-walk under the forward-only clock
 > with rule S1 once per plan — `results/rewalk-doc32-w3`, devq 508, same `--warmup 2 --samples 5`,
 > same mode order, Turbo: at 512 `offload` **75.0** / `runlist` **43.2** / `coarse` **12.7** /
-> `fused` **9.7** ms; at 1024 **102.9** / **68.3** / **21.2** / **15.4** (w2 under the old clock:
-> 101.7 / 73.3 / 43.1 / 39.1 and 153.2 / 130.0 / 78.4 / 77.6). `fused` < `coarse` < `runlist` <
+> `fused` **9.7** ms; at 1024 **102.9** / **68.3** / **21.2** / **15.4** (`results/rewalk-doc32-w2`, the same ladder under the old
+> clock, devq 353: 101.7 / 73.3 / 43.1 / 39.1 and 153.2 / 130.0 / 78.4 / 77.6). `fused` < `coarse` < `runlist` <
 > `offload` 8/8, as before; the `fused`/`coarse` margin at 1024 that had "nearly closed" is 27 %
 > under the new clock (15.4 vs 21.2) — the comparison had been hiding it.
 

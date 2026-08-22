@@ -231,10 +231,14 @@ clock. **`[2026-08-22]` Final, under the decided clock and rule S1 once per plan
 session, Turbo): iron hybrid **15.05** / runlist 24.05 / offload 10.86 vs ours coarse **13.47**
 (min 12.92; 0.90×) / fused **8.92** (min 8.73; 0.59×) / runlist 42.25 (1.76×) / offload 76.49
 (7.0×). The `--no-stage-stats` flag that produced the interim column was superseded by the clock
-rule the same day and no longer exists. What remains: (a) **`runlist`**'s 1.9× and `coarse`'s residual ~10 ms are host-side BO
-traffic — and `builders/block.py`'s `_sequence_*` rebuild every `BufferSpec` per forward, re-hashing
-the static weights (`content_key`, rule S1: 36 SHA-256 calls over ~14 MB per six forwards ≈ 6 ms
-each) before the pool decides nothing changed; iron keeps its weights resident once. (b)
+rule the same day and no longer exists. What remained at that point, and what became of it: (a) `runlist`'s 1.9× and `coarse`'s
+residual ~10 ms were host-side BO traffic plus a per-forward re-hash of the static weights —
+`builders/block.py`'s `_sequence_*` rebuilt every `BufferSpec` per forward (`content_key`, rule S1:
+36 SHA-256 calls over ~14 MB per six forwards ≈ 6 ms each) before the pool decided nothing had
+changed, where iron keeps its weights resident once. **Resolved the same day**: rule S1's key is now
+computed once per plan (`bo_pool.content_key_once`), which is why the final line above reads coarse
+13.47 / runlist 42.25 rather than 17.25 / 46.30; the ~4 ms of H2D BO syncs per forward stay, as the
+mode's own traffic. (b)
 **`offload`**'s 6.4× is `device_ms` itself — 60.5 of 77.4 ms — and it is **not attributed**:
 both ports use the same partition at this point (every LINEAR operator on the device, softmax /
 LayerNorm / GeLU on the host — `pattern/offload/offload.py`'s own contract) and both dispatch the
@@ -242,13 +246,12 @@ same 30 GEMMs (six projections plus the per-head attention matmuls), so the resi
 **~2.0 ms of execute+wait per submission here against ~0.4 ms per dispatch for iron's whole
 forward**. `device_ms` is a whole-mode total over unnamed dispatch vectors
 (`study/component_groups.py` says so), so which of the 30 carry it is not instrumented; the next
-increment, if the operator wants it, is per-submission device timing on those 30. Two follow-ups,
-both operator questions rather than increments: whether the study's measurement model should move
-the comparison out of the clock by default (every standing number in [27](27-common-ladder-result.md),
-[32](32-cost-decomposed-ladder.md) and §1 would shift down by the ~24–27 ms of comparison per
-forward), and whether rule S1's content key should be computed once per plan rather than per
-sequence (`builders/block.py` for `coarse` AND `pattern/fused/fused.py::_spec_buf` for `fused`,
-which hashes its own specs; ~6 ms per forward each).
+increment, if the operator wants it, is per-submission device timing on those 30. The two operator
+questions this raised — whether the measurement model should put the comparison outside the clock,
+and whether rule S1's key should be per plan — were both **decided yes on 2026-08-22** and are
+implemented: the clock is the forward pass only (§1a, the re-recorded matrix) and the key is
+computed once per plan (`builders/block.py` and `pattern/fused/fused.py::_spec_buf`, which hashes its
+own specs, both through `content_key_once`).
 
 ## 6. Open after this document
 

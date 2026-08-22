@@ -1129,20 +1129,22 @@ def prepare_runlist(shape, seed=42):
 
         boundaries.update(ffn)
         boundaries.update({"q": proj["q"], "k": proj["k"], "v": proj["v"]})
+        boundaries["attn_out"] = attn_out
+        boundaries["output"] = output
+        # The forward is DONE here: every boundary is a host array (attn_context
+        # as the bf16 the device produced). The study's clock stops at this
+        # instant (operator rule, 2026-08-22); everything below -- the f32
+        # widening that exists only for the comparison, and the comparison --
+        # is verification and runs outside it.
+        if forward_done is not None:
+            forward_done()
         # bf16 straight from the device, widened for the comparison. The other
         # modes' attn_context is f32 because a host implementation produced it;
         # here the widening is exact and adds nothing.
         boundaries["attn_context"] = attn_context.astype(np.float32)
-        boundaries["attn_out"] = attn_out
-        boundaries["output"] = output
 
         vector_rows = [v.as_row() for v in vecs]
         stages = []
-        # The forward is DONE here: every boundary is a host array. The study's
-        # clock stops at this instant (operator rule, 2026-08-22); the per-boundary
-        # comparison below is verification and runs outside it.
-        if forward_done is not None:
-            forward_done()
         for name in boundary_names:
             atol = stage_atol[name]
             stats = stage_stats(boundaries[name], reference[name], atol=atol)
