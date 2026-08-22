@@ -678,6 +678,16 @@ block-cache-tests:
 #
 # One operator, because the injection machinery is shared by all four and the
 # driver runs it against each of them directly.
+# H9's hardware gate: the five addnorm multi-trip variants, the `multicolumn` one at herd_x=8
+# two trips per column -- the shape that miscompiled (4070/4096) before H9 and that no other lit
+# covers. Ran from the retired port-loop's gate-h.sh until 2026-08-21; the fixture is its own
+# builder and runner and exits non-zero on any failed clause.
+check-addnorm-multitrip:
+	mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && for v in inside hoisted annotated annotated_hoisted multicolumn; do \
+	    PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) python3 $(srcdir)/addnorm_multitrip.py --variant $$v || exit 1; \
+	done
+
 check-fault-control:
 	mkdir -p $(BUILD_DIR)
 	cd $(BUILD_DIR) && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \

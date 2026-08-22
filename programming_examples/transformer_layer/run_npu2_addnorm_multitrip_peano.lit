@@ -1,0 +1,20 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// H9's hardware gate (docs 17/20): `addnorm` at two trips of the row loop --
+// the count builders/addnorm.py forbids -- in five variants, the last at
+// herd_x=8 with two trips per column. That shape silently miscompiled
+// (4070/4096) until H9 fused the packet put loops through scf.parallel, and
+// the fixture's clauses are exact, not a tolerance. It ran from the port-loop
+// harness's gate-h.sh until the 2026-08-21 cleanup retired the harness; the
+// fixture moved beside this suite and this lit is now its only runner.
+//
+// REQUIRES: ryzen_ai_npu2, peano
+// RUN: mkdir -p test_npu2_addnorm_multitrip_peano
+// RUN: cd test_npu2_addnorm_multitrip_peano
+// RUN: make -f %S/Makefile check-addnorm-multitrip PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+// CHECK: PASS (inside)
+// CHECK: PASS (hoisted)
+// CHECK: PASS (annotated)
+// CHECK: PASS (annotated_hoisted)
+// CHECK: PASS (multicolumn)

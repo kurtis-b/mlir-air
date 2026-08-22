@@ -88,7 +88,8 @@ MULTI-TRIP IS SAFE ONLY ON A ONE-COLUMN HERD -- MEASURED, PHASE J1
     ``air-fuse-packet-put-loops`` (commit ``bfb647d9``) fixes exactly the
     ``herd_x=1`` form: it fuses SIBLING ``scf.for`` put loops that share a
     block into one loop doing the puts in program order, and the driver's
-    fixture (``agents/scripts/port-loop/fixtures/addnorm_multitrip.py``) pins
+    fixture (``addnorm_multitrip.py`` beside this suite, gated by
+      ``run_npu2_addnorm_multitrip_peano.lit``) pins
     that two-trip loop on hardware at zero mismatches. Phase J1 measured the
     same at ``cols=768``, ``herd_x=1``, ``rows_per_call=8``.
 

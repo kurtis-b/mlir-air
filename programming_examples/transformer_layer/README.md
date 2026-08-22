@@ -735,8 +735,10 @@ mean improved and the margin tightened — they are different statistics.)
 > — those still sit at two different sequence lengths.
 >
 > The distinguishability *reasoning* below is kept because it is still how the
-> gate works: the criterion is ordinal over driver-summed totals, never an
-> absolute threshold.
+> gate works: the criterion is ordinal over the recorded dispatch vectors, never
+> an absolute threshold. The gate itself is `study/distinguish.py` (four
+> clauses over a profile root's `<mode>.csv` rows, every length where all four
+> modes passed; `study/test_distinguish.py` runs each clause both ways).
 
 Driver-summed totals over each mode's recorded `DispatchVector` rows, at the
 forced configuration (seq 4096, emb 768, ffn 3072, 12 heads × 64), clean and

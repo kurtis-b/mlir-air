@@ -12,9 +12,11 @@ running iron's own three regexes against the artifact and reporting the counts.
 That second mode is how the claim gets checked against a fresh toolchain rather
 than trusted from this file's docstring.
 
-Generate a project directory to point it at with any compile, e.g.
-
-    python3 agents/probes/probe_ffn_accum_bd_offset.py --ksteps 2
+Generate a project directory to point it at with any compile under
+``debug_ir=True`` that keeps its workdir -- ``addnorm_multitrip.py --variant
+inside`` prints its temp workdir, which holds ``air_project/debug_ir/`` (the
+structure scripts compile in a TemporaryDirectory and delete it; the retired
+``probe_ffn_accum_bd_offset.py`` at tag ``pre-cleanup-20260821`` kept its).
 """
 
 import argparse

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Driver-owned fixture for the ping-pong safety proof. NOT part of the example.
 
-This file lives under agents/scripts/port-loop/, which `guard_gate_files()` fingerprints and no
-phase allowlist covers -- so a session that edits it to make the check easier halts the run. That
-is the point: the claim is about the COMPILER, and the evidence for it must not come from code the
-phase authored.
+The only hardware gate for H9's multi-column multi-trip packet fix (`multicolumn` must go from
+corrupt to exact). Gated by `run_npu2_addnorm_multitrip_peano.lit` (all five variants) in the
+transformer-layer suite since the 2026-08-21 cleanup retired the port-loop harness that ran it
+(gate-h.sh, git tag `pre-cleanup-20260821`). The claim is about the COMPILER: do not edit this
+file to make a compiler change pass.
 
 WHAT WENT WRONG, AND WHAT ACTUALLY FIXED IT
 `[2026-08-06] This section replaces one that was wrong.` It blamed a missing dependency edge --
@@ -62,7 +63,7 @@ Each row kills a different way of passing without doing the work:
   - `annotated` must be LABELED. Without this clause the proof can be narrowed until it never
     fires -- which passes every correctness check ever written and silently costs the optimization.
     That is not hypothetical: dropping ping-pong regressed a shipped model 12.4 -> 7.8 tok/s
-    (llms/shared/infra/backend_presets.py). gate-h.sh leg 4 watches the same risk from the
+    (llms/shared/infra/backend_presets.py). the retired gate-h.sh leg 4 watched the same risk from the
     throughput side; this watches it structurally.
   - `annotated_hoisted` must be labeled AND must leave the weight buffer OUT of the rotation set.
     This is the safety clause. The weight is loop-invariant there, so rotating it would hand later
@@ -88,7 +89,10 @@ Usage:
 
 Exit 0 iff every clause for that variant holds.
 
-Run under: flock -x -w 1800 /tmp/mlir-air-npu.lock
+Standalone, from the repo root, inside a devq measure job (it owns its own temp workdir and
+prints it):
+    agents/scripts/devq.sh run --class measure -- \
+        python3 programming_examples/transformer_layer/addnorm_multitrip.py --variant <v>
 """
 
 import argparse
@@ -102,7 +106,7 @@ import tempfile
 import numpy as np
 from ml_dtypes import bfloat16
 
-_PE = "/home/cj/mlir-air/programming_examples"
+_PE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for _p in (_PE, os.path.join(_PE, "llms"), os.path.join(_PE, "transformer_layer")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -318,10 +322,8 @@ def main():
     # RUN IN A TEMP DIRECTORY, ALWAYS.
     #
     # compile_addnorm_kernel writes its .o to the CWD and aircc writes air.mlir / air.elf /
-    # air_project/ there too. This file lives under agents/scripts/port-loop/, which
-    # guard_gate_files() fingerprints and no phase allowlist covers -- so when a session ran it
-    # from this directory, commit_step's `git add -A` committed air.mlir and addnorm_pre_add.o
-    # into the driver's own tree, and the tamper check would have halted the run for it.
+    # air_project/ there too. A session once ran it from the repo root and committed air.mlir and
+    # addnorm_pre_add.o (removed in the 2026-08-21 cleanup; the root .gitignore now anchors them).
     #
     # 15-environment-notes.md predicted exactly this ("anything new that runs from that directory
     # will leak artifacts there too") and it was still missed when this fixture was written. A

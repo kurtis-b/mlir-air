@@ -135,6 +135,7 @@ for _p in (_PE, os.path.join(_PE, "llms"), _EXAMPLE, _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import distinguish  # noqa: E402
 import manifest  # noqa: E402
 import power  # noqa: E402
 import profiles  # noqa: E402
@@ -436,6 +437,30 @@ def gate(
         toolchain=toolchain,
         walk=walk,
     )
+    # The cross-mode clause, for a profile that walks all four modes: doc 08e's
+    # distinguishability criterion over the recorded dispatch vectors, at every
+    # length all four passed. It is part of `complete`, so a walk whose four
+    # modes recorded the same vector -- or one whose mode FAILED where the
+    # others passed -- does not verify. A profile that does not walk all four
+    # modes has nothing to compare and records that, rather than a vacuous pass.
+    if set(distinguish.MODES) <= set(profile.modes):
+        expected_seqs, expected_skips = distinguish.declared(profile)
+        gated, lines = distinguish.gate_root(
+            out_dir, expected_seqs=expected_seqs, expected_skips=expected_skips)
+        for line in lines:
+            print(f"[distinguish] {line}")
+        fails = [line for line in lines if ": FAIL " in line]
+        print(f"[distinguish] {distinguish.summary(gated, len(fails))}")
+        if gated == 0:
+            fails.append(distinguish.summary(0, 0))
+        built["distinguish"] = {"gated_lengths": gated, "lines": lines}
+        if fails:
+            built["incomplete_reasons"] = list(built["incomplete_reasons"]) + [
+                f"distinguish: {line}" for line in fails]
+            built["complete"] = False
+    else:
+        built["distinguish"] = {"gated_lengths": 0, "lines": [
+            f"not applicable: profile walks {sorted(profile.modes)}, not all four modes"]}
     manifest.write_manifest(out_dir / MANIFEST_NAME, built)
     print(f"[manifest] wrote {out_dir / MANIFEST_NAME}")
     print(f"[manifest] complete: {built['complete']}")
@@ -601,6 +626,7 @@ def run(
         "session_count": len(ledger.sessions),
         "condition_splices": walk_block["condition_splices"],
         "complete": built["complete"],
+        "distinguish": built["distinguish"],
         "incomplete_reasons": built["incomplete_reasons"],
         # SoC watts over the WHOLE walk, compilation included. See the footgun.
         "power_over_whole_walk": power_columns,

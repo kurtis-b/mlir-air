@@ -28,6 +28,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import distinguish  # noqa: E402
 import profiles  # noqa: E402
 import results_io  # noqa: E402
 import run_profile  # noqa: E402
@@ -43,6 +44,10 @@ def _row(mode, seq, status, message=""):
     row["seq_len"] = seq
     row["run_status"] = status
     row["failure_message"] = message
+    if status == "passed":
+        # Production rows always carry the dispatch vector; the profile gate's
+        # cross-mode clause (study/distinguish.py) reads it.
+        row.update(distinguish.WALK2_512_VECTORS[mode])
     return row
 
 
@@ -117,6 +122,77 @@ def test_a_clean_ladder_walk_is_complete():
         built = json.loads((Path(d) / run_profile.MANIFEST_NAME).read_text())
         assert built["complete"] is True
         assert built["row_counts_checked"] is True
+
+
+def test_a_walk_whose_modes_do_not_distinguish_is_not_complete():
+    """The cross-mode clause is part of `complete`: four passed rows that record
+    the same dispatch vector verify nothing about the taxonomy. Negative control
+    for the wiring of study/distinguish.py into gate()."""
+    with tempfile.TemporaryDirectory() as d:
+        report = _run("ladder", _fake_walker(lambda m, s: "passed"), d)
+        assert report["complete"] is True
+        assert report["distinguish"]["gated_lengths"] >= 1, report["distinguish"]
+        # Forge fused's vectors into coarse's and re-gate the same tree.
+        path = os.path.join(d, "fused.csv")
+        rows = results_io.read_rows(path)
+        for row in rows:
+            if row["run_status"] == "passed":
+                row.update(distinguish.WALK2_512_VECTORS["coarse"])
+        results_io.write_rows(path, rows)
+        prof = profiles.profile("ladder")
+        built = run_profile.gate(prof, d)
+        assert built["complete"] is False
+        reasons = [r for r in built["incomplete_reasons"] if "identical dispatch vectors" in r]
+        assert reasons and all(r.startswith("distinguish: ") for r in reasons), built["incomplete_reasons"]
+
+
+def test_a_walk_that_lost_a_declared_length_is_not_complete():
+    """Codex's round-4 reproduction: every mode's 1024 row replaced by a duplicate
+    of its 512 row keeps every row count and status the manifest expects, and
+    the cross-mode clause must still refuse it -- it gates the profile's
+    DECLARED lengths, not the ones it happened to find."""
+    with tempfile.TemporaryDirectory() as d:
+        report = _run("ladder", _fake_walker(lambda m, s: "passed"), d)
+        assert report["complete"] is True
+        for mode in distinguish.MODES:
+            path = os.path.join(d, f"{mode}.csv")
+            rows = results_io.read_rows(path)
+            r512 = next(r for r in rows if str(r["seq_len"]) == "512")
+            rows = [dict(r512) if str(r["seq_len"]) == "1024" else r for r in rows]
+            results_io.write_rows(path, rows)
+        built = run_profile.gate(profiles.profile("ladder"), d)
+        assert built["complete"] is False
+        assert any("seq 1024: FAIL no mode has a row" in r for r in built["incomplete_reasons"]), \
+            built["incomplete_reasons"]
+
+
+def test_a_skip_and_a_failing_length_cannot_trade_places():
+    """Codex's round-5 reproduction: in the ladder profile, fused is measurable
+    at 1024 and structurally skipped at 2048. Mark 1024 skipped (hiding a
+    non-distinguishing vector) and 2048 passed with valid vectors; every
+    row/pass/skip COUNT the manifest expects still holds. Skip identity is
+    what refuses it."""
+    with tempfile.TemporaryDirectory() as d:
+        report = _run("ladder", _fake_walker(lambda m, s: "passed"), d)
+        assert report["complete"] is True
+        path = os.path.join(d, "fused.csv")
+        rows = results_io.read_rows(path)
+        for row in rows:
+            if str(row["seq_len"]) == "1024":
+                row["run_status"] = "skipped"
+                row["failure_message"] = "forged skip"
+            elif str(row["seq_len"]) == "2048":
+                row["run_status"] = "passed"
+                row.update(distinguish.WALK2_512_VECTORS["fused"])
+        results_io.write_rows(path, rows)
+        built = run_profile.gate(profiles.profile("ladder"), d)
+        assert built["complete"] is False
+        reasons = built["incomplete_reasons"]
+        assert any("seq 1024: FAIL fused is skipped but the profile declares it measurable" in r
+                   for r in reasons), reasons
+        assert any("seq 2048: FAIL fused is passed where the profile declares a structural skip" in r
+                   for r in reasons), reasons
+        assert built["distinguish"]["gated_lengths"] == 1, built["distinguish"]
 
 
 def test_a_short_walk_is_not_complete():

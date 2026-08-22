@@ -441,5 +441,19 @@
 // bounds that were measured refusing. run_profile_bounds_tests.lit (3/3,
 // with air) checks the same predicates against the builders themselves.
 //
+// `[2026-08-21]` 587 -> 611, two modules added by the branch cleanup's
+// cluster B, which retired the port-loop harness: test_distinguish (+18) --
+// the Phase E cross-mode distinguishability gate re-homed as
+// study/distinguish.py over a profile root's recorded dispatch vectors, both
+// directions per clause plus the fail-closed validation the retired gate had
+// (NaN, negative, fractional counts, zero submissions, zero bytes), pinned to
+// doc 54 walk 2's seq-512 vectors -- and
+// test_require_turbo (+4), the refusing branches of the one live Turbo-pmode
+// rule through the REAL xrt-smi parser (a stub xrt-smi on PATH, or none), as
+// the retired pmode_guard selftest drove it; and test_run_profile +3, the
+// profile gate refusing a walk whose modes do not distinguish, one that
+// lost a declared length behind duplicate rows, and one where a skip and a
+// failing length traded places (skip identity against the declared skips).
+//
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 587/587 passed in 25 modules
+// CHECK: study host tests: 611/611 passed in 27 modules
