@@ -90,6 +90,45 @@ Standing elsewhere from the same block: J1 closed (superseded by J7a); Goal 1 pa
 big-three model leg will not be run (8/11 is the standing leg); docs 01–12 demoted to
 [01-original-plan-superseded.md](01-original-plan-superseded.md).
 
+### 2.1 `[2026-08-22]` The first increment, attempted: the box does not exist at the layer's width
+
+Queue item 9's first step was to build the two forms at the gate width. Neither can be built, for
+reasons that precede the `down_K ≥ 7` wedge (evidence `results/r1-supertile-20260822/`, devq 511;
+builder checks host-only):
+
+- **`down_K` at real width.** `down_K = chunks_per_group × herd_x × sweeps` with
+  `chunks_per_group = (emb_dim / herd_x) / tile_k`, `tile_k ≤ 32` (`MAX_L1_TILE_K`, measured), and
+  the builder requiring whole sweeps (`ffn_dim % (herd_x × group_n) == 0`, `group_n = emb_dim /
+  herd_x`). The ≤ 6 box was measured on `emb × ffn` **toy widths** (`O3 = 32×192`: one chunk per
+  sweep, six sweeps; re-run 3/3 PASS, devq 511, corr 0.99987, 0/2048). At `emb 768, herd_x 1` a
+  single sweep is already **24** refills; the finished-block form is 96. Both forms sit above the
+  wedge before anything else is considered.
+- **L1 at real width, `herd_x 1`.** The builder refuses before `aircc`: *"the up core needs 205,824 B
+  of L1 (pp A + pp B + resident C), over the 65,536-byte tile"* at `tile_k 32`; 152,576 at 16;
+  125,952 at 8. The resident H group for one 64-row band is `64 × 768` bf16 = 96 KB on its own.
+  **The `herd_x = 1` box cannot hold the layer's hidden group at any `tile_k`.** `herd_x 2` fits only
+  at `tile_k 8`; `herd_x 4` (the gate shape) builds at 32/16/8 — and every `herd_x ≥ 2` form is the
+  multi-column H staging that wall 7 (shared, §7.1) or the 48-block memtile cap (per-column, §1.1)
+  blocks at this width.
+- **What a real-width supertile would have to be.** To put one execution inside a `down_K ≤ 6`,
+  `herd_x 1` box, the up herd's group width must be decoupled from `emb_dim` (today `group_n =
+  emb_dim / herd_x`): an execution covering 64 rows × a 192-column hidden slice (6 chunks; resident
+  C 24 KB + pp A 8 KB + pp B 24 KB ≈ 56 KB, fits) with its down partial accumulated across
+  executions — 16 executions per band, 12 bands per 768-token layer = **192 executions**, each a
+  launch boundary at the measured 106–108 µs ([57 §1.5](57-inference-path-optimizations-from-hexagon.md))
+  ≈ **21 ms per layer in boundaries alone**, against the H round-trip the resident tail exists to
+  remove (`64 × 3072` bf16 ≈ 393 KB per band, written and read: ~26 µs per band at 30 GB/s) and
+  against `coarse`'s whole-layer **13.4 ms** at 512 under the new clock ([54 §1a](54-first-full-profile-and-decoder-families.md)).
+  A finished-block execution (form A) at real width needs `herd_x 4` plus wall 7 cleared plus the
+  wedge cleared — two walls whose routes are closed (§7.3: the lock fix proved impossible; the
+  per-column builder fix does not compile at the gate shape) and one unresolved.
+
+The two-form comparison therefore has no hardware instance to run. What R1 at real width would
+cost in boundaries is larger by ~60× than what it saves in DRAM traffic, under today's launch
+cost; the increment is returned to the operator with that arithmetic (queue file).
+
+---
+
 ---
 
 ## 3. The byte floor (formerly doc 31a) — host-only arithmetic, no device dispatched
