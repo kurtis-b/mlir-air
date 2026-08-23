@@ -699,27 +699,41 @@ The model knows no bytes or cycles, no column, and whether the shim clauses are 
 
 ## 18. The LOAD_PDI parity pad — the same-ELF re-execution family, fixed `[2026-08-22]`
 
-**Defect class**: a green wrong answer or a hang on the *second* back-to-back dispatch of any
-full-ELF program whose per-dispatch `LOAD_PDI` count is odd, healed by any other ELF in between
-(doc 57 §1.5's seven-row family; [57 §1.5](57-inference-path-optimizations-from-hexagon.md) for
-the matrix and the firmware rule). **Mechanism**: aiecc's `aie-expand-load-pdi` alternates two
-empty reset PDIs by position per dispatch; the NPU2 firmware skips a `LOAD_PDI` whose id it
-loaded last; an odd count makes the next dispatch's first load the skipped one, so launch 0 runs
-on the previous dispatch's DMA-channel / lock state. **Change** (`mlir/lib/Conversion/AIRRtToNpuPass.cpp`,
-+92/−3): `countDispatchLoadPdis` (configures plus `npu.load_pdi` resets inside the configured
-devices' sequences) and `padDispatchLoadPdiParity`, called from `createMainDeviceWrapper` on both
-ELF paths, NPU2 only: when odd, append `aiex.configure @air_dispatch_end_reset {}` of a tile-less
-device — one trailing empty-PDI load, zero configuration writes; never emitted when even (a
-single-launch device's repeat-count / cascade `_reset` already makes it 2). **Gate**:
-`mlir/test/Conversion/AIRRtToNpu/load_pdi_parity_pad.mlir` — four cases (3 launches → pad; 2 →
-none; 1 → pad; 1 with a `_reset` → none; XCLBIN prefix → never), **verified failing** on the
-08-19 binary (`ELF-LABEL: expected string not found … @air_dispatch_end_reset`);
-`check-air-mlir` 505 → **506** / 7 xfail / 7 unsupported. **Measured**: the whole family and
-its discriminators clean ×5 with the pad (devq 533/534); cost 26–32 µs per dispatch, odd ELFs
-only (devq 538); `check-lm-head-reexec` 7/7, `qwen3_0_6b` verify, the tl suite 40/1/0 all green
-on the rebuilt toolchain. The pre-existing reset rule (§13's `deviceHasRepeatCountDMAs` /
-cascade) is untouched — it addresses core/memtile DMA state inside one dispatch, not the
-cross-dispatch firmware skip.
+**Defect class**: a full-ELF program whose per-dispatch `LOAD_PDI` count is odd is *vulnerable*
+on its second back-to-back dispatch: launch 0 runs unreset, and the symptom is launch 0's to
+give — a multi-iteration GEMV answers wrong (green), the QKV / RMS forms hang, a one-iteration
+launch is benign; any other ELF in between heals it (doc 57 §1.5's seven-row family;
+[57 §1.5](57-inference-path-optimizations-from-hexagon.md) for the matrix and the firmware
+rule). **Mechanism**: aiecc's `aie-expand-load-pdi` alternates two empty reset PDIs by position
+per dispatch; the NPU2 firmware skips a `LOAD_PDI` whose id it loaded last; an odd count makes
+the next dispatch's first load the skipped one, so launch 0 starts on the previous dispatch's
+DMA-channel / lock state (*what* state is inferred, not probed — see 57 §1.5).
+**Change** (`mlir/lib/Conversion/AIRRtToNpuPass.cpp`, ELF output, NPU2 only): count the loads
+the emitted stream will carry, and when odd append one tile-less load at the dispatch's end —
+one empty-PDI `LOAD_PDI`, zero configuration writes. Revised after its review (devq 539):
+(1) the count is the *emitted* stream's — a `npu.load_pdi` at the head of a configured device's
+sequence whose target is that device merges into the configure (counted once), a load inside a
+static loop counts its trip count, and a non-static loop disables the pad with a warning rather
+than guessing; (2) the pad device's symbol is made unique against the module (`_0`, `_1`, … on
+collision); (3) the path that emits no main wrapper — one device, one sequence, the
+repeat-count `_reset` loads already in it — pads the same way, as a trailing
+`aiex.npu.load_pdi` of the pad device, so a 2-trip launch (1 configure + 2 resets = 3) is
+padded to 4. Never emitted when even; never in XCLBIN output. **Gate**:
+`mlir/test/Conversion/AIRRtToNpu/load_pdi_parity_pad.mlir` — seven cases (3 launches → pad;
+2 → none; 1 → pad; 1 with a `_reset` → none; a head-of-sequence load that merges → pad; a
+2-trip loop on the single-device path → two `_reset`s then the pad; an existing
+`@air_dispatch_end_reset` global → `_0`; XCLBIN prefix → never). **Verified failing** on the
+pre-fix compiler built from 33d8967a in a scratch worktree (devq 550, the whole lit:
+`load_pdi_parity_pad.mlir:35:15: error: ELF-LABEL: expected string not found in input` —
+no `@air_dispatch_end_reset` device exists); the pre-existing `load_pdi_repeat_count.mlir`
+test 4 (a no-`launch_end` single device, one load) now *expects* the pad, since one load is the
+vulnerable count. `check-air-mlir` 505 → **506** / 7 xfail / 7 unsupported on the complete
+fix. **Measured** (first version, main-wrapper path only): the whole family and its
+discriminators clean ×5 with the pad (devq 533/534); cost 26–32 µs per dispatch, odd ELFs only
+(devq 538); `check-lm-head-reexec` 7/7, `qwen3_0_6b` verify, the tl suite 40/1/0 (devq
+535–537). Complete fix, re-gated under Turbo (devq 551): `qwen3_0_6b` compile (every kernel) + verify PASS, `check-lm-head-reexec` 7/7, the tl suite 40/1/0. The pre-existing reset rule (§13's
+`deviceHasRepeatCountDMAs` / cascade) is untouched — it addresses core/memtile DMA state inside
+one dispatch, not the cross-dispatch firmware skip.
 
 ## 15. Compiler items not started
 

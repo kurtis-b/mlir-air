@@ -181,15 +181,20 @@ module {
 
 // -----
 
-// Test 4: wait_all WITHOUT air.launch_end attribute should NOT get load_pdi
-// regardless of output-elf setting
+// Test 4: wait_all WITHOUT air.launch_end attribute should NOT get the
+// device's per-launch reset load_pdi regardless of output-elf setting.
+// `[2026-08-23]` In ELF mode the dispatch is then ONE LOAD_PDI (the
+// materialized configure), which is odd, so the dispatch-end parity pad --
+// a load_pdi of the tile-less @air_dispatch_end_reset device -- IS appended
+// (load_pdi_parity_pad.mlir); the NOT below is for the device's own reset.
 
 // EMIT-TRUE-LABEL: aie.device(npu2) @segment_no_launch_end {
 // EMIT-TRUE: aie.runtime_sequence @func_no_launch_end
 // EMIT-TRUE:   aiex.dma_configure_task_for @airMemcpyId10 {
 // EMIT-TRUE:   aiex.dma_start_task
 // EMIT-TRUE:   aiex.dma_await_task
-// EMIT-TRUE-NOT:   aiex.npu.load_pdi
+// EMIT-TRUE-NOT:   aiex.npu.load_pdi {device_ref = @segment_no_launch_end
+// EMIT-TRUE:   aiex.npu.load_pdi {device_ref = @air_dispatch_end_reset}
 // EMIT-TRUE: }
 
 // EMIT-FALSE-LABEL: aie.device(npu2) @segment_no_launch_end {

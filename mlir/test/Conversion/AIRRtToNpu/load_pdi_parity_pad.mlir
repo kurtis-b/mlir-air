@@ -222,3 +222,105 @@ module {
     return
   }
 }
+
+// -----
+
+// Case 5 `[2026-08-23]`: an EXISTING runtime sequence (the XRTRunner path)
+// that BEGINS with a load_pdi of its own device.  aie-materialize-runtime-
+// sequences canonicalizes that head load into the configure's own load, so
+// aiecc emits ONE LOAD_PDI for it, not two: the count is 1 (odd) and the pad
+// must be appended.  Before the review this counted 2 and emitted no pad.
+// ELF-LABEL: aie.device(npu2) @air_dispatch_end_reset {
+// ELF:       aie.runtime_sequence @head_load(
+// ELF:         aiex.configure @head_seg {
+// ELF:         aiex.configure @air_dispatch_end_reset {
+// XCLBIN-LABEL: aie.runtime_sequence @head_load(
+// XCLBIN-NOT:   air_dispatch_end_reset
+
+module {
+  aie.device(npu2) @head_seg {
+    %tile_0_0 = aie.tile(0, 0)
+    aie.shim_dma_allocation @in_h(%tile_0_0, MM2S, 0)
+    aie.shim_dma_allocation @out_h(%tile_0_0, S2MM, 0)
+    aie.runtime_sequence @head_load(%arg0: memref<64xi32>) {
+      aiex.npu.load_pdi {device_ref = @head_seg}
+      aie.end
+    }
+  }
+}
+
+// -----
+
+// Case 6 `[2026-08-23]`: a MULTI-ITERATION launch (2 trips) whose device gets
+// the per-launch reset: the reset load_pdi sits inside the iteration loop and
+// aiecc emits it once per trip, so the dispatch issues 1 configure + 2 resets
+// = 3 loads (odd) -> pad.  Before the review the loop body was counted once
+// (2, no pad).
+// This launch lowers to the SINGLE-DEVICE form (the sequence inside @seg_l,
+// no main wrapper: the module holds @seg_l and its reset device), where aiecc
+// materializes the configure load itself; the pad is therefore an explicit
+// load_pdi of the pad device appended to the sequence.
+// ELF-LABEL: aie.device(npu2) @air_dispatch_end_reset {
+// ELF:       aie.runtime_sequence @two_trips(
+// ELF:         aiex.npu.load_pdi {device_ref = @seg_l_reset}
+// ELF:         aiex.npu.load_pdi {device_ref = @seg_l_reset}
+// ELF:         aiex.npu.load_pdi {device_ref = @air_dispatch_end_reset}
+// XCLBIN-LABEL: aie.runtime_sequence @two_trips(
+// XCLBIN-NOT:   load_pdi {device_ref = @air_dispatch_end_reset
+
+module {
+  aie.device(npu2) {
+    %tile_0_0 = aie.tile(0, 0)
+    %tile_0_2 = aie.tile(0, 2)
+    aie.shim_dma_allocation @in_l(%tile_0_0, MM2S, 0)
+    aie.shim_dma_allocation @out_l(%tile_0_0, S2MM, 0)
+    %mem_0_2 = aie.mem(%tile_0_2) {
+      %0 = aie.dma_start(S2MM, 0, ^bb1, ^bb2, repeat_count = 3)
+    ^bb1:
+      aie.end
+    ^bb2:
+      aie.end
+    }
+  } {sym_name = "seg_l"}
+  airrt.module_metadata {
+  }
+  func.func @two_trips(%arg0: memref<512xi32>) {
+    %c0_i64 = arith.constant 0 : i64
+    %c1_i64 = arith.constant 1 : i64
+    %c512_i64 = arith.constant 512 : i64
+    %c1_i32 = arith.constant 1 : i32
+    %c2_i32 = arith.constant 2 : i32
+    affine.for %arg1 = 0 to 2 {
+      %0 = airrt.dma_memcpy_nd(%c1_i32, %c0_i64, %c0_i64, %arg0[%c0_i64, %c0_i64, %c0_i64, %c0_i64], [%c1_i64, %c1_i64, %c1_i64, %c512_i64], [%c0_i64, %c0_i64, %c0_i64, %c0_i64]) {metadata = @in_l} : (i32, i64, i64, memref<512xi32>) : !airrt.event
+      %1 = airrt.dma_memcpy_nd(%c2_i32, %c0_i64, %c0_i64, %arg0[%c0_i64, %c0_i64, %c0_i64, %c0_i64], [%c1_i64, %c1_i64, %c1_i64, %c512_i64], [%c0_i64, %c0_i64, %c0_i64, %c0_i64]) {metadata = @out_l} : (i32, i64, i64, memref<512xi32>) : !airrt.event
+      airrt.wait_all %0, %1 {"air.launch_end"}
+      %p = airrt.segment_load "seg_l" : i64
+    } {affine_opt_label = "tiling"}
+    return
+  }
+}
+
+// -----
+
+// Case 7 `[2026-08-23]`: the pad's symbol must not collide with a symbol the
+// module already holds -- here a memref.global named like the pad.  The pad
+// takes the next free name and the global is untouched.
+// ELF-LABEL: memref.global "private" constant @air_dispatch_end_reset
+// ELF:       aie.device(npu2) @air_dispatch_end_reset_0 {
+// ELF:       aie.runtime_sequence @collide(
+// ELF:         aiex.configure @col_seg {
+// ELF:         aiex.configure @air_dispatch_end_reset_0 {
+// XCLBIN-LABEL: aie.runtime_sequence @collide(
+// XCLBIN-NOT:   air_dispatch_end_reset_0
+
+module {
+  memref.global "private" constant @air_dispatch_end_reset : memref<1xi32> = dense<0>
+  aie.device(npu2) @col_seg {
+    %tile_0_0 = aie.tile(0, 0)
+    aie.shim_dma_allocation @in_c(%tile_0_0, MM2S, 0)
+    aie.shim_dma_allocation @out_c(%tile_0_0, S2MM, 0)
+    aie.runtime_sequence @collide(%arg0: memref<64xi32>) {
+      aie.end
+    }
+  }
+}

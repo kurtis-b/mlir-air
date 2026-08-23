@@ -1410,17 +1410,52 @@ static constexpr llvm::StringLiteral kDispatchEndResetDevice =
 // plus every aiex.npu.load_pdi reset inside the configured devices' runtime
 // sequences (aiex.run inlines them; a fused multi-iteration launch carries one
 // per iteration).
+//
+// The count models what aiecc EMITS, not what this IR contains (review,
+// 2026-08-23): (a) `aie-materialize-runtime-sequences` canonicalizes a load of
+// the configured device that sits at the HEAD of its run sequence into the
+// configure's own load -- one LOAD_PDI, not two -- so such a load is not
+// counted; (b) a load inside affine loops is emitted once per trip (the loops
+// are unrolled downstream), so it is counted `enclosingLoopTrips` times; (c) a
+// load under a non-static loop cannot be counted -- `countable` is cleared and
+// the caller warns instead of guessing a parity.
 static int64_t countDispatchLoadPdis(ModuleOp module,
-                                     AIE::RuntimeSequenceOp mainSeq) {
+                                     AIE::RuntimeSequenceOp mainSeq,
+                                     bool &countable) {
   int64_t n = 0;
+  countable = true;
   for (auto configure : mainSeq.getOps<AIEX::ConfigureOp>()) {
     ++n;
+    StringRef configuredDevice = configure.getSymbol();
     for (auto run : configure.getOps<AIEX::RunOp>()) {
       // The sequence is nested in its device's symbol table; match by name.
       StringRef seqName = run.getRuntimeSequenceSymbol();
       module.walk([&](AIE::RuntimeSequenceOp seq) {
-        if (seq.getSymName() == seqName)
-          seq.walk([&](AIEX::NpuLoadPdiOp) { ++n; });
+        if (seq.getSymName() != seqName)
+          return;
+        Block *seqBody =
+            seq.getBody().empty() ? nullptr : &seq.getBody().front();
+        Operation *head = nullptr;
+        if (seqBody)
+          for (Operation &op : *seqBody) {
+            head = &op;
+            break;
+          }
+        seq.walk([&](AIEX::NpuLoadPdiOp load) {
+          // (a): a head-of-sequence load of the configured device merges with
+          // the configure's load.
+          if (load.getOperation() == head) {
+            if (auto ref = load.getDeviceRefAttr())
+              if (ref.getValue() == configuredDevice)
+                return;
+          }
+          int64_t trips = enclosingLoopTrips(load);
+          if (trips == std::numeric_limits<int64_t>::max()) {
+            countable = false; // (c)
+            return;
+          }
+          n += trips; // (b)
+        });
       });
     }
   }
@@ -1452,33 +1487,111 @@ static int64_t countDispatchLoadPdis(ModuleOp module,
 // OTHER empty pdi and leaves the partition reset.  Never emitted when the
 // count is already even (the repeat_count / cascade `_reset` load_pdi of a
 // single-launch device already makes it 2).
+// The tile-less pad device, created once per module under a symbol the module
+// does not already use (a colliding memref.global or a real device must never
+// be configured as the pad -- review, 2026-08-23). Returns its name.
+static std::string getOrCreateDispatchEndResetDevice(ModuleOp module,
+                                                     AIE::DeviceOp likeDevice,
+                                                     OpBuilder &builder) {
+  std::string padName = kDispatchEndResetDevice.str();
+  for (unsigned k = 0; module.lookupSymbol(padName); ++k) {
+    if (auto d = module.lookupSymbol<AIE::DeviceOp>(padName))
+      if (d.getRegion().hasOneBlock() &&
+          llvm::hasSingleElement(d.getRegion().front()) &&
+          d->hasAttr("air.dispatch_end_reset"))
+        return padName; // ours, from an earlier call
+    padName = (kDispatchEndResetDevice + "_" + std::to_string(k)).str();
+  }
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPoint(likeDevice);
+  auto pad =
+      AIE::DeviceOp::create(builder, likeDevice.getLoc(), likeDevice.getDevice());
+  pad->setAttr(SymbolTable::getSymbolAttrName(), builder.getStringAttr(padName));
+  pad->setAttr("air.dispatch_end_reset", builder.getUnitAttr());
+  Block *body = new Block;
+  pad.getRegion().push_back(body);
+  builder.setInsertionPointToEnd(body);
+  AIE::EndOp::create(builder, likeDevice.getLoc());
+  return padName;
+}
+
 static void padDispatchLoadPdiParity(ModuleOp module, AIE::DeviceOp mainDevice,
                                      AIE::RuntimeSequenceOp mainSeq,
                                      OpBuilder &builder) {
   const AIE::AIETargetModel &tm = mainDevice.getTargetModel();
   if (!llvm::isa<AIE::BaseNPU2TargetModel>(tm))
     return;
-  int64_t n = countDispatchLoadPdis(module, mainSeq);
+  bool countable = true;
+  int64_t n = countDispatchLoadPdis(module, mainSeq, countable);
+  if (!countable) {
+    mainDevice.emitWarning()
+        << "LOAD_PDI parity undetermined (a load_pdi under a non-static loop); "
+           "no dispatch-end reset pad emitted -- back-to-back re-execution of "
+           "this ELF in one context may run launch 0 on an unreset partition";
+    return;
+  }
   if (n == 0 || n % 2 == 0)
     return;
   Location loc = mainDevice.getLoc();
-  if (!module.lookupSymbol<AIE::DeviceOp>(kDispatchEndResetDevice)) {
-    OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPoint(mainDevice);
-    auto pad = AIE::DeviceOp::create(builder, loc, mainDevice.getDevice());
-    pad->setAttr(SymbolTable::getSymbolAttrName(),
-                 builder.getStringAttr(kDispatchEndResetDevice));
-    Block *body = new Block;
-    pad.getRegion().push_back(body);
-    builder.setInsertionPointToEnd(body);
-    AIE::EndOp::create(builder, loc);
-  }
+  std::string padName =
+      getOrCreateDispatchEndResetDevice(module, mainDevice, builder);
   builder.setInsertionPointToEnd(&mainSeq.getBody().front());
   auto configureOp = AIEX::ConfigureOp::create(
-      builder, loc,
-      FlatSymbolRefAttr::get(builder.getContext(), kDispatchEndResetDevice),
+      builder, loc, FlatSymbolRefAttr::get(builder.getContext(), padName),
       AIEX::ExpandModeAttr());
   configureOp.getBody().push_back(new Block);
+}
+
+// The SINGLE-DEVICE form: a module whose runtime sequence lives inside its one
+// real device with no main wrapper (a single segment that carries a reset
+// device; `wrapExistingDevicesWithMainIfNeeded` leaves it alone). aiecc's
+// materialize-runtime-sequences then emits ONE implicit configure load for the
+// device plus the sequence's own load_pdi resets (once per unrolled trip), so
+// the dispatch's LOAD_PDI count is 1 + those -- and it can be odd (a 2-trip
+// fused launch: 1 + 2). Pad it the same way: an explicit load_pdi of the
+// tile-less pad device appended to the sequence. Reviewed 2026-08-23.
+static void padSingleDeviceSequenceParity(ModuleOp module, OpBuilder &builder) {
+  bool anyConfigure = false;
+  module.walk([&](AIEX::ConfigureOp) { anyConfigure = true; });
+  if (anyConfigure)
+    return; // a main wrapper exists: padDispatchLoadPdiParity handled it
+  SmallVector<AIE::RuntimeSequenceOp> seqs;
+  module.walk([&](AIE::RuntimeSequenceOp seq) { seqs.push_back(seq); });
+  if (seqs.size() != 1)
+    return;
+  AIE::RuntimeSequenceOp seq = seqs[0];
+  auto device = seq->getParentOfType<AIE::DeviceOp>();
+  if (!device || !llvm::isa<AIE::BaseNPU2TargetModel>(device.getTargetModel()))
+    return;
+  int64_t n = 1; // the materialized configure load of the device itself
+  bool countable = true;
+  seq.walk([&](AIEX::NpuLoadPdiOp load) {
+    int64_t trips = enclosingLoopTrips(load);
+    if (trips == std::numeric_limits<int64_t>::max()) {
+      countable = false;
+      return;
+    }
+    n += trips;
+  });
+  if (!countable) {
+    device.emitWarning()
+        << "LOAD_PDI parity undetermined (a load_pdi under a non-static loop); "
+           "no dispatch-end reset pad emitted -- back-to-back re-execution of "
+           "this ELF in one context may run launch 0 on an unreset partition";
+    return;
+  }
+  if (n % 2 == 0)
+    return;
+  std::string padName = getOrCreateDispatchEndResetDevice(module, device, builder);
+  Block &body = seq.getBody().front();
+  if (!body.empty() && body.back().hasTrait<OpTrait::IsTerminator>())
+    builder.setInsertionPoint(&body.back());
+  else
+    builder.setInsertionPointToEnd(&body);
+  AIEX::NpuLoadPdiOp::create(
+      builder, seq.getLoc(), FlatSymbolRefAttr::get(builder.getContext(), padName),
+      /*id=*/IntegerAttr(), /*size=*/IntegerAttr(), /*address=*/IntegerAttr(),
+      /*expand_mode=*/AIEX::ExpandModeAttr());
 }
 
 // Helper to create a main device with orchestration runtime_sequence.
@@ -2120,6 +2233,10 @@ struct AIRRtToNpuPass : public impl::AIRRtToNpuBase<AIRRtToNpuPass> {
     // This MUST run at the very end after ALL patterns that modify
     // runtime_sequence arguments.
     generateMainDeviceIfNeeded(module);
+    if (clOutputElf) {
+      OpBuilder padBuilder(module.getContext());
+      padSingleDeviceSequenceParity(module, padBuilder);
+    }
 
     // Strip the internal reset-decision marker so it does not leak into the
     // emitted IR (the reset clones copy it too).
