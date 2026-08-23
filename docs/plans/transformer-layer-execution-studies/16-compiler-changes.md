@@ -697,6 +697,30 @@ only through a `Seq` seam (`test_the_axis_values_legality_eliminates_outright_ar
 The model knows no bytes or cycles, no column, and whether the shim clauses are jointly sufficient
 (both necessary, none of the herd multisets produces a joint counterexample).
 
+## 18. The LOAD_PDI parity pad — the same-ELF re-execution family, fixed `[2026-08-22]`
+
+**Defect class**: a green wrong answer or a hang on the *second* back-to-back dispatch of any
+full-ELF program whose per-dispatch `LOAD_PDI` count is odd, healed by any other ELF in between
+(doc 57 §1.5's seven-row family; [57 §1.5](57-inference-path-optimizations-from-hexagon.md) for
+the matrix and the firmware rule). **Mechanism**: aiecc's `aie-expand-load-pdi` alternates two
+empty reset PDIs by position per dispatch; the NPU2 firmware skips a `LOAD_PDI` whose id it
+loaded last; an odd count makes the next dispatch's first load the skipped one, so launch 0 runs
+on the previous dispatch's DMA-channel / lock state. **Change** (`mlir/lib/Conversion/AIRRtToNpuPass.cpp`,
++92/−3): `countDispatchLoadPdis` (configures plus `npu.load_pdi` resets inside the configured
+devices' sequences) and `padDispatchLoadPdiParity`, called from `createMainDeviceWrapper` on both
+ELF paths, NPU2 only: when odd, append `aiex.configure @air_dispatch_end_reset {}` of a tile-less
+device — one trailing empty-PDI load, zero configuration writes; never emitted when even (a
+single-launch device's repeat-count / cascade `_reset` already makes it 2). **Gate**:
+`mlir/test/Conversion/AIRRtToNpu/load_pdi_parity_pad.mlir` — four cases (3 launches → pad; 2 →
+none; 1 → pad; 1 with a `_reset` → none; XCLBIN prefix → never), **verified failing** on the
+08-19 binary (`ELF-LABEL: expected string not found … @air_dispatch_end_reset`);
+`check-air-mlir` 505 → **506** / 7 xfail / 7 unsupported. **Measured**: the whole family and
+its discriminators clean ×5 with the pad (devq 533/534); cost 26–32 µs per dispatch, odd ELFs
+only (devq 538); `check-lm-head-reexec` 7/7, `qwen3_0_6b` verify, the tl suite 40/1/0 all green
+on the rebuilt toolchain. The pre-existing reset rule (§13's `deviceHasRepeatCountDMAs` /
+cascade) is untouched — it addresses core/memtile DMA state inside one dispatch, not the
+cross-dispatch firmware skip.
+
 ## 15. Compiler items not started
 
 - **H5 — dynamic channel indices.** Split `air.channel` `indices` into a static dimension (flow/tile)

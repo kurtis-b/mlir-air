@@ -15,9 +15,14 @@
 // partitions, m_input 8; doc 57 section 5 item 5b) and this gate went 7 / 7
 // clean on it (devq 482, 484) -- the XFAIL that stood for the 19 x 8192 form
 // is gone and the gate is now a regression guard: a builder or compiler
-// change that brings the re-execution family back (doc 57 section 1.5's
-// seven-row table -- it is NOT understood, only avoided) turns this red.
-// The 19 x 8192 reproducer lives on in the evidence root's probes.
+// change that brings the re-execution family back turns this red.
+// `[2026-08-22]` The family IS understood now (doc 57 section 1.5, doc 16
+// section 18): an ODD per-dispatch LOAD_PDI count ends on the empty reset
+// PDI the next dispatch starts with, the NPU2 firmware skips that load, and
+// launch 0 runs on the previous dispatch's DMA/lock state. The ten-load head
+// was green by parity; the compiler now pads odd dispatches (the 19 x 8192
+// form re-executes clean too, devq 534). The reproducer lives on in
+// results/reexec-matrix-20260822/.
 //
 // No HF weights: random weights against an f32 reference. NPU serialization
 // lives one layer down (KernelCache takes /tmp/npu.lock).

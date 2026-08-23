@@ -89,8 +89,12 @@ diagnosis:
 
 ## LM-head re-execution gate (doc 57 section 1.5): the production lm_head_gemv
 ## ELF dispatched back-to-back must stay exact. No HF weights needed (random
-## weights, f32 reference). Green since the 9 x 16384 + 4480 head (2026-08-21);
-## red again means the re-execution family is back.
+## weights, f32 reference). The 9 x 16384 + 4480 head went green on 2026-08-21 by
+## PARITY ACCIDENT (ten LOAD_PDIs); the family's mechanism -- an odd LOAD_PDI
+## count leaves the next dispatch's first load skipped by the firmware, so launch
+## 0 runs on an unreset partition -- is fixed in the compiler on 2026-08-22
+## (AIRRtToNpuPass pads odd dispatches; mlir/test/.../load_pdi_parity_pad.mlir).
+## Red again means the pad is gone or a new reset path bypasses it.
 check-lm-head-reexec:
 	@mkdir -p $(BUILD_DIR)
 	cd $(BUILD_DIR) && python3 $(srcdir)/lm_head_reexec_gate.py lm_head_reexec_cache

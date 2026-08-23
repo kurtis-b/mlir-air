@@ -266,9 +266,45 @@ boundary is evidently cheaper than a mid-ELF one, and 29 µs of it moved to the 
 being the one form that hangs. A side finding from the same probe: the host RMSNorm is
 *more accurate* than the device kernel (vs f32: `normed` 3.6e-3 against 4.1e-2 — the device
 truncates `rstd` to bf16 before the multiply), which is a kernel improvement to make
-independently of launch counts. The systematic study — a matrix of launch-0 kind ×
-GEMV geometry × dispatch index, with `aie-translate` dumps of the shim BDs per configuration
-— is the next step for whoever takes the defect; the five rows above are its seed.
+independently of launch counts. ~~The systematic study … is the next step for whoever takes
+the defect.~~
+
+**`[2026-08-22]` THE MECHANISM, NAMED: LOAD_PDI parity** (queue item 10; evidence
+`results/reexec-matrix-20260822/`, devq 527–538). On the full-ELF path every `aiex.configure`
+(and every `npu.load_pdi` reset) becomes one `LOAD_PDI`, which aiecc's `aie-expand-load-pdi`
+turns into *load an EMPTY PDI — the firmware's partition reset — then the device's configuration
+as inline writes*, alternating **two** empty PDIs by the load's *position* in the stream
+(`AIEExpandLoadPdi.cpp:66`, `"empty_" + (index % 2)`, "to avoid PDI address caching"). The NPU2
+firmware **skips a `LOAD_PDI` whose id equals the last one loaded** (aie2ps ISA, `LOAD_PDI`:
+"consecutive loading of same pdi results in following loading skipped by the uC") and remembers
+that id across dispatches. The alternation restarts at position 0 every dispatch, so a dispatch
+issuing an **odd** number of loads ends on the empty PDI it starts with, and the next dispatch of
+the same ELF in the same context begins with a load the firmware skips: launch 0 runs with no
+partition reset on the previous dispatch's final DMA-channel / lock state (core and memtile
+channels sit mid-BD holding a pre-acquired credit; the inline configuration re-inits locks and
+BDs but never resets a channel). A different ELF in between loads a different id (heals); idle
+and input cannot matter; partition 0 because launch 0 is the unreset one. The symptom then
+depends on launch 0's device: a multi-iteration GEMV has its weight tile overwritten under the
+core (wrong rows, non-deterministic), the QKV / RMS forms hang with every output written, a
+one-iteration launch is benign. The seven rows, re-read: loads 19, 19, 38, 10, 11, 3, 4 —
+**odd ⇔ wrong/hang, 7/7**; row 5's "hang at dispatch 1" was its *second* dispatch (the probe's
+heal call was its first). Discriminators on the device (devq 528/529): the same 8192-row launch
+×20 is clean ×5 and ×1 is wrong at dispatch 2; ×37 of the "benign" 4096 geometry is wrong.
+The reset rule this tree already had (`deviceHasRepeatCountDMAs` / cascade, [16 §13](16-compiler-changes.md))
+never fired here: the GEMV's repeat is the *shim* task's, which that rule does not inspect, and
+rows 3/4/7 were clean without any reset — by parity.
+
+**The fix** ([16 §18](16-compiler-changes.md)): `AIRRtToNpuPass` counts a dispatch's `LOAD_PDI`s
+and, when odd, appends `aiex.configure @air_dispatch_end_reset {}` of a tile-less device — one
+trailing empty-PDI load, zero writes, **26–32 µs per dispatch on odd ELFs only** (devq 538);
+lit `mlir/test/Conversion/AIRRtToNpu/load_pdi_parity_pad.mlir`, verified failing on the 08-19
+compiler. With it every row and discriminator re-executes **clean ×5** (devq 533/534, 14 ELFs),
+`check-lm-head-reexec` 7/7 (devq 535), `qwen3_0_6b` verify PASS with every kernel recompiled
+(devq 536), the transformer-layer suite 40/1/0 (devq 537), `check-air-mlir` 506/7/7. The 19 ×
+8192 head is no longer defective; the 10-launch head's "clean" of 08-21 was parity. Left open:
+whether the firmware keys the skip on id alone or (id, address) per context — only "not id alone
+across contexts" is shown; upstream could make `expand-load-pdi`'s alternation dispatch-aware
+instead of this mlir-air-side pad.
 
 ## 2. The structural fact: every `air.launch` boundary is a partition reconfiguration
 

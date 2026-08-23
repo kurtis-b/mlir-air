@@ -1399,13 +1399,98 @@ struct PendingMainDevice {
   SmallVector<std::string> sequenceNames;
 };
 
+// Name of the tile-less device the main sequence configures at the END of a
+// dispatch whose LOAD_PDI count would otherwise be odd (see
+// padDispatchLoadPdiParity).
+static constexpr llvm::StringLiteral kDispatchEndResetDevice =
+    "air_dispatch_end_reset";
+
+// Count the LOAD_PDI ops one dispatch of `mainSeq` issues on the full-ELF
+// path: one per aiex.configure (aiecc lowers it to npu.load_pdi of the device)
+// plus every aiex.npu.load_pdi reset inside the configured devices' runtime
+// sequences (aiex.run inlines them; a fused multi-iteration launch carries one
+// per iteration).
+static int64_t countDispatchLoadPdis(ModuleOp module,
+                                     AIE::RuntimeSequenceOp mainSeq) {
+  int64_t n = 0;
+  for (auto configure : mainSeq.getOps<AIEX::ConfigureOp>()) {
+    ++n;
+    for (auto run : configure.getOps<AIEX::RunOp>()) {
+      // The sequence is nested in its device's symbol table; match by name.
+      StringRef seqName = run.getRuntimeSequenceSymbol();
+      module.walk([&](AIE::RuntimeSequenceOp seq) {
+        if (seq.getSymName() == seqName)
+          seq.walk([&](AIEX::NpuLoadPdiOp) { ++n; });
+      });
+    }
+  }
+  return n;
+}
+
+// Keep the per-dispatch LOAD_PDI count EVEN on the full-ELF path.
+//
+// aiecc's expand-load-pdi turns every npu.load_pdi into "load an EMPTY pdi
+// (the firmware's partition reset) + the device's configuration as inline
+// writes", alternating two empty pdis by the load's POSITION in the control
+// stream, because the NPU2 firmware skips a LOAD_PDI whose pdi_id equals the
+// one it loaded last (aie2ps ISA, LOAD_PDI: "consecutive loading of same pdi
+// results in following loading skipped by the uC").  The alternation restarts
+// at position 0 in every dispatch, so a dispatch that issues an ODD number of
+// loads ends on the empty pdi it starts with, and the next dispatch of the
+// same ELF in the same context begins with a load the firmware skips: launch 0
+// then runs on the previous dispatch's final DMA-channel / lock state (core
+// and memtile channels sit mid-BD holding a pre-acquired credit; the inline
+// configuration re-inits locks and BDs but never resets a channel).  Measured
+// (results/reexec-matrix-20260822, devq 528/529): 19 x GEMV(8192) wrong in
+// partition 0 from dispatch 2 while 20 x the same launch is clean; 1 launch
+// wrong, 2 clean; 3-launch QKV hangs at dispatch 2, 4-launch clean; 9 and 11
+// launches wrong/hang, 10 clean -- parity alone, no geometry rule.
+//
+// The pad is one `aiex.configure @air_dispatch_end_reset {}` of a tile-less
+// device appended to the main sequence: its expansion is exactly one
+// empty-pdi load and zero configuration writes, so the dispatch ends on the
+// OTHER empty pdi and leaves the partition reset.  Never emitted when the
+// count is already even (the repeat_count / cascade `_reset` load_pdi of a
+// single-launch device already makes it 2).
+static void padDispatchLoadPdiParity(ModuleOp module, AIE::DeviceOp mainDevice,
+                                     AIE::RuntimeSequenceOp mainSeq,
+                                     OpBuilder &builder) {
+  const AIE::AIETargetModel &tm = mainDevice.getTargetModel();
+  if (!llvm::isa<AIE::BaseNPU2TargetModel>(tm))
+    return;
+  int64_t n = countDispatchLoadPdis(module, mainSeq);
+  if (n == 0 || n % 2 == 0)
+    return;
+  Location loc = mainDevice.getLoc();
+  if (!module.lookupSymbol<AIE::DeviceOp>(kDispatchEndResetDevice)) {
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPoint(mainDevice);
+    auto pad = AIE::DeviceOp::create(builder, loc, mainDevice.getDevice());
+    pad->setAttr(SymbolTable::getSymbolAttrName(),
+                 builder.getStringAttr(kDispatchEndResetDevice));
+    Block *body = new Block;
+    pad.getRegion().push_back(body);
+    builder.setInsertionPointToEnd(body);
+    AIE::EndOp::create(builder, loc);
+  }
+  builder.setInsertionPointToEnd(&mainSeq.getBody().front());
+  auto configureOp = AIEX::ConfigureOp::create(
+      builder, loc,
+      FlatSymbolRefAttr::get(builder.getContext(), kDispatchEndResetDevice),
+      AIEX::ExpandModeAttr());
+  configureOp.getBody().push_back(new Block);
+}
+
 // Helper to create a main device with orchestration runtime_sequence.
 // This is used both for multi-device func lowering and for wrapping
 // existing aie.device ops with runtime_sequence when emit-main-device is set.
+// `outputElf` pads the dispatch's LOAD_PDI count to even (see
+// padDispatchLoadPdiParity); it is only meaningful on the full-ELF path.
 AIE::DeviceOp createMainDeviceWrapper(
     ModuleOp module, Location loc, AIE::AIEDevice deviceType,
     StringRef mainSeqName,
-    const SmallVector<DeviceSequenceInfo> &deviceSequences) {
+    const SmallVector<DeviceSequenceInfo> &deviceSequences,
+    bool outputElf = false) {
 
   OpBuilder builder(module.getContext());
   builder.setInsertionPointToEnd(module.getBody());
@@ -1464,6 +1549,9 @@ AIE::DeviceOp createMainDeviceWrapper(
     // Move insertion point after configure op
     builder.setInsertionPointAfter(configureOp);
   }
+
+  if (outputElf)
+    padDispatchLoadPdiParity(module, mainDevice, mainSeq, builder);
 
   // Add aie.end terminator to the main device body
   builder.setInsertionPointToEnd(mainDeviceBody);
@@ -2560,7 +2648,7 @@ struct AIRRtToNpuPass : public impl::AIRRtToNpuBase<AIRRtToNpuPass> {
 
     // Create main device wrapper using the helper function
     createMainDeviceWrapper(module, device.getLoc(), device.getDevice(),
-                            originalSeqName, deviceSequences);
+                            originalSeqName, deviceSequences, clOutputElf);
   }
 
   // Unified entry point for main device generation. Handles two mutually
@@ -2638,7 +2726,8 @@ struct AIRRtToNpuPass : public impl::AIRRtToNpuBase<AIRRtToNpuPass> {
     // Create the main device wrapper with the correct (final) argument types
     createMainDeviceWrapper(module, pendingMainDevice->loc,
                             pendingMainDevice->deviceType,
-                            pendingMainDevice->mainSeqName, deviceSequences);
+                            pendingMainDevice->mainSeqName, deviceSequences,
+                            clOutputElf);
 
     // Clear the pending request
     pendingMainDevice = std::nullopt;
