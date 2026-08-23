@@ -172,6 +172,54 @@ What it does NOT promise: that AIR's lowering of a long `w_down` stream plus an 
 the `≥ 7` wedge — J7b's 96-step `w_down` stream passes on hardware, which is the evidence it is
 R1's composition and not the stream; increment 2 is where that is learned.
 
+### 2.3 `[2026-08-22]` The port, done: it runs at the layer's width — and it measures 5× slower than `coarse`'s tail
+
+All four increments landed the same day (`builders/tail_pipeline.py`, `tail_pipeline_structure.py`,
+`tail_pipeline_rung.py`, `tail_pipeline_timed.py`, `tail_baseline_coarse.py`;
+`run_tail_pipeline_structure_tests.lit` hermetic, `run_npu2_tail_pipeline_peano.lit` on the device;
+evidence `results/r1-supertile-20260822/`).
+
+**Correctness.** The `≥ 7` wedge never appeared: the first hang was the port's own — the down core's
+final-block buffer was the destination of two gets and the source of one put, and `air-to-aie`'s
+buffer-level lock pairing (`AIRToAIESchedulingUtils.cpp:676`) gave that put BD two tokens against
+one release (bisected by stage on hardware, devq 513–516, then read in the routed dump). Fixed at
+the builder by the one-token rule (every L1 buffer is a channel source OR a destination), which
+uncovered two further defects the hang had masked (a four-BD feed cycle against a two-burst band;
+a three-buffer feed overwriting under the matmul). Then the width: iron's rows (`k 96 / n 128 /
+depth 8`, `k 128 / depth 6`) do not fit AIR — `'aie.mem' op has more than 16 blocks`, then aiecc's
+*Allocator exhausted available BD IDs (maximum 24 available for channel 0)* — so the form is
+`tile_k 192`, depth 4; `aie-place-tiles` refuses `n_b 4` (ten shim MM2S streams) and `n_b 3` is
+impossible at `tile_n 96`, so **`n_b` caps at 2**; and in-module bands with `sweeps > 1` are
+unexpressible (AIE DMA tasks do not loop), so the layer runs **band-serial: 32 dispatches of one
+16-row band each**, with a `*_reset` PDI re-arming the device per run. Two compiler defects found
+and reported, not fixed: `air-to-aie` silently drops a channel put whose source buffers straddle
+two memtiles; `air-fuse-channels` + `air-opt-shim-dma-bds` erase an identical standalone L3→L2
+fetch. **Result**: `512×768×3072 m16 k192 n96 d4 n_b 2` PASS 3/3, 0 / 393,216 mismatches, corr
+0.999933, bit-identical across dispatches (devq 520, 522); 320 consecutive re-executions on one
+context all verified (devq 524) — the re-execution shape passes.
+
+**Latency, forward-only clock, same session, Turbo** (devq 523 / 524; one context, weights
+uploaded once; a forward = 32 band dispatches; 1 warm-up, 10 samples, each verified outside the clock):
+
+| at 512, the layer's AN1 + FFN + AN2 | latency | device (execute+wait) |
+|---|---|---|
+| `tail_pipeline`, `n_b 2` | **26.39 ms** (min 26.02, max 26.91) | 26.02 = 0.813 ms/band × 32 |
+| `tail_pipeline`, `n_b 1` | 34.04 (min 33.70) | 33.64 = 1.051/band |
+| `coarse`'s tail — submissions AN1 1.04 + FFN 2.46 + AN2 1.04 | — | **4.66** (+ 0.46 sync); whole forward 12.77 |
+| `fused`, whole forward (one submission, no stage split) | 9.22 (min 8.74) | 6.08 |
+
+**Why it is 5× slower, and why that was predictable.** A 16-row band must stream both weight
+matrices (`w_up` + `w_down` = 9.4 MB) from DRAM, so band-serial re-streams them 32 times per
+layer: ~302 MB against `coarse`'s 22 MB for the *whole* layer ([54 §1](54-first-full-profile-and-decoder-families.md)).
+What residency saves — the H round trip, ~0.4 MB per band, 12 MB per layer — is 25× smaller than
+what the band structure costs, which is §3.6's band-serial weight term, now measured: 0.81 ms per
+band ≈ 11.6 GB/s of weight streaming through two shim columns. The only escapes are a wider band
+(more rows per weight pass — capped by L1 at `tile_m 16` with `tile_k 192`), more columns (capped
+at 2 by placement), or in-module band pipelining (unexpressible under AIE DMA tasks today). None
+of them closes a 5× gap. **R1's question is answered on hardware: at this width, a resident FFN
+tail is weight-bandwidth-bound and loses to `coarse`'s whole-array GEMMs.** The builder, its two
+lits and the measurement stay as the study's resident-tail instrument; the record is closed.
+
 ---
 
 ---

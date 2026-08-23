@@ -33,7 +33,7 @@ SWEEP_ARGS ?=
         check-transpose check-elementwise-mul check-norm-tail \
         check-norm-tail-fault check-norm-tail-structure \
         check-ffn-accum check-ffn-accum-fault check-ffn-accum-structure \
-        check-pipeline-fusion check-tail-pipeline-structure \
+        check-pipeline-fusion check-tail-pipeline-structure check-tail-pipeline \
         reference-tests block-cache-tests blocked-attention-tests \
         registry-resolution registry-sweep registry-write registry-plan \
         registry-writer-tests
@@ -120,6 +120,7 @@ help:
 	@echo "                      flows, take at most 2 shim-facing streams per"
 	@echo "                      column, and carry ZERO packet-typed channels."
 	@echo "  make check-tail-pipeline-structure"
+	@echo "  make check-tail-pipeline          # the tail pipeline on the NPU: chain + the layer width"
 	@echo "                      The tail pipeline (iron's addnorm_ffn port,"
 	@echo "                      builders/tail_pipeline.py): AN1 -> FFN with"
 	@echo "                      partial-sum staging -> AN2 compiled through"
@@ -622,6 +623,17 @@ check-ffn-resident-structure:
 # why PEANO_INSTALL_DIR is passed through: without it aiecc takes the chess
 # path and fails earlier, on a different text, and the clause reads that as
 # a refusal (lit sanitizes the environment; the recipe supplies it).
+# The tail pipeline (item 9, 2026-08-22) ON THE DEVICE: the chain shape (up->down L1->L1, a depth-2
+# L2 ring, the two-column reduction) and the layer's width (512x768x3072, band-serial), three
+# dispatches each, exact against the FP32 reference within the rung's derived tolerance.
+check-tail-pipeline:
+	mkdir -p $(BUILD_DIR)/tail_chain $(BUILD_DIR)/tail_width
+	cd $(BUILD_DIR)/tail_chain && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) python3 $(srcdir)/tail_pipeline_rung.py \
+	    --seq 64 --emb 96 --ffn 192 --tile-m 16 --tile-k 48 --tile-n 96 --depth 2 --n-b 2 --dispatches 3 --tag chain
+	cd $(BUILD_DIR)/tail_width && PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) python3 $(srcdir)/tail_pipeline_rung.py \
+	    --seq 512 --emb 768 --ffn 3072 --tile-m 16 --tile-k 192 --tile-n 96 --depth 4 --n-b 2 \
+	    --band-serial --omit-pingpong L2 --dispatches 3 --tag width
+
 check-tail-pipeline-structure:
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
 	    python3 $(srcdir)/tail_pipeline_structure.py
