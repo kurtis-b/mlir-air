@@ -526,13 +526,15 @@ H2/H3 phases measure.
    weights, every cell correct vs f32, max_rel 2.75e-3, argmax agrees):
    8 × 16384 at `m_input 4` (production) **15.10** ms p50 (min 14.84); 7 × 16384 + 13568 at
    `m_input 4` **15.15** (14.91); 7 × 16384 + 13568 at `m_input 8` **14.16** (13.84);
-   8 × 16384 at `m_input 8` **13.91** (13.83). Dropping the pad rows is never faster — the
-   13568-row tail (212 iterations, not a multiple of the preset's 16-iteration loop tiling) costs
-   what its 11.5 MB saves — while `m_input 8` alone is **−1.19 ms** (as on the Qwen3 heads,
-   §1.4). A preset trap on the way: the Qwen probe's backend fails aiecc on a 16384-row partition
-   at `m_input 4` (`push_queue ... Repeat count exceeds the [0:255] range`, devq 562); Llama's
-   `LM_GEMV_BACKEND` carries `runtime_loop_tiling_sizes [16, 16]`, which is what keeps it under
-   the cap. **Port**: `build_lm_head_gemv_llama_module` (`m_input=8`, partitions unchanged, host
+   8 × 16384 at `m_input 8` **13.91** (13.83). Dropping the pad rows is never faster, while
+   `m_input 8` alone is **−1.19 ms** (as on the Qwen3 heads, §1.4). *Why* the 13568-row tail
+   gives nothing back is **not measured** — the probe changed partition size, padded bytes and
+   the generated schedule together; one hypothesis is that the tail's 212 iterations are not a
+   multiple of the preset's 16-iteration loop tiling (a remainder loop), untested. A preset trap
+   on the way: the Qwen probe's backend fails aiecc on a 16384-row partition at `m_input 4`
+   (`push_queue ... Repeat count exceeds the [0:255] range`, **devq 561**; 562 is the rerun on
+   Llama's preset, three cells, all correct); Llama's `LM_GEMV_BACKEND` carries
+   `runtime_loop_tiling_sizes [16, 16]`, which is what keeps it under the cap. **Port**: `build_lm_head_gemv_llama_module` (`m_input=8`, partitions unchanged, host
    slicing untouched); the re-execution gate factored into `shared/infra/lm_head_reexec.py`
    (the Qwen wrapper keeps its name and lit; Llama gets `make check-lm-head-reexec`). **Landing**
    (devq 564, same session, Turbo before and after): `make verify` PASS 2 / 0;
