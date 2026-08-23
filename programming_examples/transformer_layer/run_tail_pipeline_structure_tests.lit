@@ -7,8 +7,8 @@
 //
 // Host-only, on purpose: tail_pipeline_structure.py compiles the module
 // through XRTBackend(debug_ir=True) in a temp cwd, reads the per-pass dumps
-// and asserts twelve clauses (one tile-bearing device, core->core flows
-// exactly n_b, zero packet channels, the per-column shim MM2S census with
+// and asserts twelve clauses (one tile-bearing device besides aircc's reset
+// PDI, core->core flows exactly n_b + 2, zero packet channels, the per-column shim MM2S census with
 // its negative control, the memtile and core BD caps, the L1 buffer plan
 // per core, the 4-D retile living on a memtile, dispatch by symbol,
 // lowering liveness, one token on every core-tile lock op, and the down
@@ -44,32 +44,46 @@
 // column, grew a memtile program, rotated an L1 buffer, or moved the retile
 // off the memtile cannot match here. The literals are RE-DERIVED from a
 // dump written by build-xrt's aircc of 2026-08-19 15:36 (sha256 254eb3ba)
-// on 2026-08-22, and re-derived the same day after the deadlock fix (the
-// same compiler): the down core's feed is one BD per transfer per band
-// (baseline 4, chain 8) and every down core carries l1_red; a lone core
-// folds in its own zero partial (one adder at the baseline). If one has
-// to move, re-derive it from a fresh dump of the compiler in hand and
-// record that compiler -- never confirm it against the previous value.
+// on 2026-08-22, and re-derived the same day twice (the same compiler):
+// after the deadlock fix, and after the width restructure -- one down herd
+// per column with its own channels and memtile, every feed get the same
+// whole-buffer BD (a two-BD cycle on every down core), AN1's residual
+// core->core to AN2 (two more core->core flows), the chain's last column
+// forwarding its block through the accumulate kernel against a zero chunk
+// (no adder at the baseline). If one has to move, re-derive it from a
+// fresh dump of the compiler in hand and record that compiler -- never
+// confirm it against the previous value.
 //
 // Baseline: iron's test.py row (64, 48, 96, m 64, k 48, n 96, depth 1,
 // nB 1). Six cores in one row; ONE core->core flow (up -> down); six
 // L2-staged shim streams over five columns, worst column 2; the
 // row-major -> blocked retile as FOUR-dimensional memtile BDs (rpc = 32,
-// four microtile rows); ONE adder (the lone core folds in its zero
-// partial); core BDs 7 = the feed's 4 (b, acc, b-prefix, acc) + H + two
-// MM2S; L1 53248 B = the down core's six buffers plus the stack.
-// CHECK: [tail-pipeline-structure] tail_pipeline [baseline 64x48x96 m64 k48 n96 d1 nb1]: PASS (1 device, 6 cores, 1 core->core, 0 packet-typed channels, shim MM2S 6/16 worst column 2, memtile BDs max 12/48, core BDs max 7/16, L1 worst 53248 B, memtile 4-D BDs 4, adders 1, multi-token core locks 0, alternating feeds 1/1)
+// four microtile rows); THREE core->core flows (one H edge, two residual
+// edges); no adder (the lone column forwards its block through the
+// accumulate kernel against the zero chunk); seven shim MM2S (the six
+// inputs plus the zero slab); core BDs 5 = the feed's two + H + two MM2S;
+// L1 53248 B = the down core's six buffers plus the stack.
+// CHECK: [tail-pipeline-structure] tail_pipeline [baseline 64x48x96 m64 k48 n96 d1 nb1]: PASS (1 device, 6 cores, 3 core->core, 0 packet-typed channels, shim MM2S 7/16 worst column 2, memtile BDs max 9/48, core BDs max 5/16, L1 worst 53248 B, memtile 4-D BDs 4, adders 0, multi-token core locks 0, alternating feeds 1/1)
 //
-// Chain: the 16-row tile with a two-block ring and two columns. Eight
-// cores; TWO core->core flows; the retile collapses to 3-D (rpc = 8, one
-// microtile row) so the 4-D count is legitimately 0 and clause 8 only
-// forbids a 4-D BD on a core there; exactly ONE down core carries the
-// eltwise add (core 0 folds in core 1's final blocks, relayed from core
-// 1's ring; core 1 has no tail), the role specialization through
-// scf.index_switch surviving air-to-aie; core BDs 11 = core 0's feed of 8
-// (two (b, acc) sweep steps, two (b-prefix, acc) tail steps) + H + two
-// MM2S.
-// CHECK: [tail-pipeline-structure] tail_pipeline [chain 64x96x192 m16 k48 n96 d2 nb2]: PASS (1 device, 8 cores, 2 core->core, 0 packet-typed channels, shim MM2S 6/16 worst column 2, memtile BDs max 34/48, core BDs max 11/16, L1 worst 20992 B, memtile 4-D BDs 0, adders 1, multi-token core locks 0, alternating feeds 2/2)
+// Chain: the 16-row tile with a two-block ring and two columns, four bands
+// inside the module. Eight cores; FOUR core->core flows (two H edges, two
+// residual edges); the retile collapses to 3-D (rpc = 8, one microtile
+// row) so the 4-D count is legitimately 0 and clause 8 only forbids a 4-D
+// BD on a core there; exactly ONE down core carries the eltwise add
+// (column 0 folds in column 1's block, relayed through L2; column 1
+// forwards its own against the zero chunk); eight shim MM2S (x, residual,
+// gamma1, w_up, gamma2, two w_down slabs, the zero slab); memtile BDs 18 on the
+// AN1-input memtile (its three buffers double-buffered across the bands).
+// CHECK: [tail-pipeline-structure] tail_pipeline [chain 64x96x192 m16 k48 n96 d2 nb2]: PASS (1 device, 8 cores, 4 core->core, 0 packet-typed channels, shim MM2S 8/16 worst column 2, memtile BDs max 18/48, core BDs max 5/16, L1 worst 20992 B, memtile 4-D BDs 0, adders 1, multi-token core locks 0, alternating feeds 2/2)
+//
+// Width: the layer's width as one band (band-serial), tile_k 192 so the ring
+// is four deep (a memtile channel pair's 24 BDs hold a column's two feed
+// tasks at 4*depth = 16 plus its refill), two columns, single-slot L2
+// (the backend's omit_pingpong, the only form whose AN memtile fits 48).
+// Memtile BDs 22 on a down column (16 feed, 4 store, refill, relay);
+// core BDs 7 on the AN cores (gamma, four un-tiled blocks, the residual,
+// the y store); L1 62464 B = the k-192 down core.
+// CHECK: [tail-pipeline-structure] tail_pipeline [width 16x768x3072 m16 k192 n96 d4 nb2]: PASS (1 device, 8 cores, 4 core->core, 0 packet-typed channels, shim MM2S 8/16 worst column 2, memtile BDs max 22/48, core BDs max 7/16, L1 worst 62464 B, memtile 4-D BDs 0, adders 1, multi-token core locks 0, alternating feeds 2/2)
 //
 // The verdict last, so a clause that stops being defined fails here rather
 // than passing quietly.

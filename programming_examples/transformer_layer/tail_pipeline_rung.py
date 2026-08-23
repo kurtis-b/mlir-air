@@ -4,7 +4,17 @@
 
     python3 tail_pipeline_rung.py --seq 64 --emb 96 --ffn 192 --tile-m 16 --tile-k 48 \\
         --tile-n 96 --depth 2 --n-b 2 [--stop-after an1|up|down] [--atol 5e-2] \\
-        [--dispatches 3] [--tag T]
+        [--dispatches 3] [--band-serial] [--omit-pingpong L2] [--tag T]
+
+BAND-SERIAL. With several sweeps (ffn_dim > n_b * tile_n) the module is ONE
+band (the builder's rule; its FOOTGUNS say why) and ``--band-serial`` makes
+the rung iterate the bands on the host: the module is built at
+``seq_len = tile_m``, each band's rows of x and residual go in their own BOs,
+and the per-band y are assembled before the compare -- one hardware context
+per band per "dispatch", the band loop on launch arguments that
+builders/ffn_resident.py follows. ``--omit-pingpong L2`` hands the backend's
+option through (single-slot L2 staging: at the layer's width the memtile's
+48 BDs do not hold the double-buffered programs).
 
 ``--stop-after`` is the bisection instrument (``build_tail_pipeline_module``'s
 ``stop_after``): the module stops at that herd and routes its output to ``y``;
@@ -82,13 +92,15 @@ def compile_all(args):
 
     compile_tail_pipeline_kernels(tile_m=args.tile_m, tile_k=args.tile_k, tile_n=args.tile_n)
     module = build_tail_pipeline_module(
-        seq_len=args.seq, emb_dim=args.emb, ffn_dim=args.ffn, tile_m=args.tile_m,
-        tile_k=args.tile_k, tile_n=args.tile_n, down_proj_depth=args.depth, n_b=args.n_b,
+        seq_len=args.tile_m if args.band_serial else args.seq, emb_dim=args.emb,
+        ffn_dim=args.ffn, tile_m=args.tile_m, tile_k=args.tile_k, tile_n=args.tile_n,
+        down_proj_depth=args.depth, n_b=args.n_b,
         allow_an_lane_truncation=args.allow_an_lane_truncation, stop_after=args.stop_after,
     )
     backend = XRTBackend(
         verbose=False, output_format="elf", instance_name="tail_pipeline",
         runtime_loop_tiling_sizes=[2, 2], target_device="npu2",
+        omit_pingpong=args.omit_pingpong,
     )
     t0 = time.time()
     artifact = backend.compile(module)
@@ -97,6 +109,7 @@ def compile_all(args):
 
 
 def dispatch(artifact, inputs, expected):
+    """One hardware context, one run; returns (record, y or None)."""
     import filelock
     import tempfile
     import pyxrt as xrt
@@ -145,6 +158,43 @@ def dispatch(artifact, inputs, expected):
     return res, y
 
 
+def dispatch_bands(artifact, inputs, expected, args):
+    """Band-serial: one context per band, rows sliced on the host, y assembled.
+
+    Every cut's y layout has the band outermost (rows for an1/full, the
+    (band, sweep, column) run for up, the (band, d) run for down), so the
+    per-band outputs concatenate. The record is the worst band's verdict;
+    wait_s sums the bands.
+    """
+    if not args.band_serial:
+        return dispatch(artifact, inputs, expected)
+    bands = args.seq // args.tile_m
+    per_band = expected.size // bands
+    y = np.zeros(expected.shape, expected.dtype).reshape(bands, -1)
+    rec = {"verdict": "RAN", "wait_s": 0.0, "y_sentinel_fraction": 0.0, "bands": bands}
+    for b in range(bands):
+        rows = slice(b * args.tile_m, (b + 1) * args.tile_m)
+        band_inputs = [np.ascontiguousarray(inputs[0][rows]), np.ascontiguousarray(inputs[1][rows])] + list(inputs[2:])
+        band_expected = expected.reshape(bands, -1)[b].reshape(
+            (args.tile_m, args.emb) if expected.ndim == 2 else (per_band,))
+        r, yb = dispatch(artifact, band_inputs, band_expected)
+        rec["wait_s"] += r.get("wait_s", 0.0)
+        if r["verdict"] != "RAN":
+            # A hung band says everything the later bands would; stop here.
+            rec["verdict"] = r["verdict"]
+            rec["exception"] = r.get("exception", "")
+            rec["failed_band"] = b
+            rec["y_sentinel_fraction"] = r.get("y_sentinel_fraction", 1.0)
+            return rec, None
+        if yb is None:
+            rec["y_sentinel_fraction"] = 1.0
+            return rec, None
+        rec["y_sentinel_fraction"] = max(rec["y_sentinel_fraction"], r.get("y_sentinel_fraction", 0.0))
+        y[b] = yb.reshape(-1)
+    rec["wait_s"] = round(rec["wait_s"], 4)
+    return rec, y.reshape(expected.shape)
+
+
 def compare(y, expected, atol):
     a = y.astype(np.float32)
     e = expected.astype(np.float32)
@@ -180,6 +230,10 @@ def main(argv=None):
                          "1e-1 for the whole pipeline; see the docstring)")
     ap.add_argument("--dispatches", type=int, default=3)
     ap.add_argument("--seed", type=int, default=13)
+    ap.add_argument("--band-serial", action="store_true",
+                    help="build the module at one band (seq_len = tile_m) and iterate bands on the host")
+    ap.add_argument("--omit-pingpong", default="", choices=["", "L1", "L2", "all"],
+                    help="XRTBackend(omit_pingpong=...)")
     ap.add_argument("--tag", default="rung")
     ap.add_argument("--dump-npz", action="store_true",
                     help="also save y, expected and the host inputs per dispatch (<tag>_dispatch<i>.npz)")
@@ -189,12 +243,16 @@ def main(argv=None):
     geom = f"{args.seq}x{args.emb}x{args.ffn} m{args.tile_m} k{args.tile_k} n{args.tile_n} d{args.depth} nb{args.n_b}"
     if args.stop_after:
         geom += f" stop_after={args.stop_after}"
+    if args.band_serial:
+        geom += f" band-serial x{args.seq // args.tile_m}"
+    if args.omit_pingpong:
+        geom += f" omit-pingpong={args.omit_pingpong}"
     print(f"[rung] {args.tag}: {geom}")
     inputs, expected, host = _inputs(args, np.random.default_rng(args.seed))
     backend, artifact = compile_all(args)
     verdicts = []
     for i in range(args.dispatches):
-        res, y = dispatch(artifact, inputs, expected)
+        res, y = dispatch_bands(artifact, inputs, expected, args)
         rec = {"tag": args.tag, "geom": geom, "dispatch": i + 1, **res}
         if y is not None and res["verdict"] == "RAN":
             rec.update(compare(y, expected, args.atol))

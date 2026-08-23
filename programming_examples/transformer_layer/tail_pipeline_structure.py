@@ -4,10 +4,12 @@
 """The tail pipeline's structural check: AN1 -> FFN -> AN2 as ONE routed segment.
 
 CONTRACT
-    Compiles ``build_tail_pipeline_module`` at two shapes -- iron's baseline
-    (seq 64, emb 48, ffn 96, m 64, k 48, n 96, depth 1, n_b 1) and a
+    Compiles ``build_tail_pipeline_module`` at three shapes -- iron's
+    baseline (seq 64, emb 48, ffn 96, m 64, k 48, n 96, depth 1, n_b 1), a
     16-row-tile chain (seq 64, emb 96, ffn 192, m 16, k 48, n 96, depth 2,
-    n_b 2) -- through ``XRTBackend(debug_ir=True)``, the production aircc,
+    n_b 2) and the layer's width as one band (seq 16, emb 768, ffn 3072,
+    m 16, k 192, n 96, depth 4, n_b 2, single-slot L2) -- through
+    ``XRTBackend(debug_ir=True)``, the production aircc,
     and asserts on the per-pass dumps. Hermetic: no NPU, no kernel objects;
     the compile fails at the core-ELF link deliberately (aiecc writes every
     MLIR dump and the link scripts first). Do not "fix" that failure by
@@ -20,15 +22,18 @@ CONTRACT
     1. NO REFUSAL. aircc runs to the routed design and the only error is
        the deliberate missing-object link.
     2. ONE SEGMENT. Exactly one tile-bearing ``aie.device`` (plus the
-       anonymous control device). A composition that re-split into a device
-       per herd would compute identical numbers while deleting the design.
-    3. THE STAGE EDGES. core->core ``aie.flow`` count EXACTLY ``n_b``: the
-       up->down H hand-offs, one per column. Derived for THIS design from
-       the core DMA port budget (two S2MM, two MM2S per core): every other
-       hop -- AN1->up (a 4-D retile a core BD cannot carry), the ring, the
-       reduction relay, down->AN2 (the un-tile) -- is memtile-mediated. The
-       builder's docstring carries the arithmetic. Fewer means an edge went
-       through L3; more means one left the derived shape.
+       anonymous control device, and aircc's ``*_reset`` PDI when the design
+       holds repeat-counted DMA tasks). A composition that re-split into a
+       device per herd would compute identical numbers while deleting the
+       design.
+    3. THE STAGE EDGES. core->core ``aie.flow`` count EXACTLY ``n_b + 2``:
+       the up->down H hand-offs, one per column, and the two AN1->AN2
+       residual hand-offs. Derived for THIS design from the core DMA port
+       budget (two S2MM, two MM2S per core): every other hop -- AN1->up (a
+       4-D retile a core BD cannot carry), the ring, the reduction relay,
+       down->AN2 (the un-tile) -- is memtile-mediated. The builder's
+       docstring carries the arithmetic. Fewer means an edge went through
+       L3; more means one left the derived shape.
     4. ZERO packet-typed channels in every dump and zero ``aie.packet_flow``
        in the routed design (over a column's budget AIR packet-multiplexes
        rather than refusing, and that path is BD-starved at these trip
@@ -109,6 +114,7 @@ from air.backend.xrt import XRTBackend  # noqa: E402
 from builders.tail_pipeline import (  # noqa: E402
     ADD_SYMBOL,
     AN_SYMBOL,
+    CHANNEL_AN1_A,
     CHANNEL_A_FEED,
     CHANNEL_ACC_STORE,
     CHANNEL_AN1_FEED,
@@ -131,6 +137,7 @@ from builders.tail_pipeline import (  # noqa: E402
     UP_MM_SYMBOL,
     UP_ZERO_SYMBOL,
     build_tail_pipeline_module,
+    down_channel,
     tail_pipeline_l1_bytes,
 )
 from ffn_resident_structure import (  # noqa: E402
@@ -155,6 +162,7 @@ SHAPES = [
             seq_len=64, emb_dim=48, ffn_dim=96, tile_m=64, tile_k=48, tile_n=96,
             down_proj_depth=1, n_b=1, allow_an_lane_truncation=True,
         ),
+        {},
     ),
     (
         "chain 64x96x192 m16 k48 n96 d2 nb2",
@@ -162,6 +170,20 @@ SHAPES = [
             seq_len=64, emb_dim=96, ffn_dim=192, tile_m=16, tile_k=48, tile_n=96,
             down_proj_depth=2, n_b=2,
         ),
+        {},
+    ),
+    # The layer's width, one band (band-serial: sweeps 32), tile_k 192 so the
+    # ring is 4 deep (the per-column feed's two tasks are 4*depth memtile
+    # BDs against the 24 one channel pair may hold; depth 6 is 25), two
+    # columns, single-slot L2 staging (the backend option the width needs:
+    # double-buffered, the AN memtile's program crosses 48).
+    (
+        "width 16x768x3072 m16 k192 n96 d4 nb2",
+        dict(
+            seq_len=16, emb_dim=768, ffn_dim=3072, tile_m=16, tile_k=192, tile_n=96,
+            down_proj_depth=4, n_b=2,
+        ),
+        {"omit_pingpong": "L2"},
     ),
 ]
 
@@ -185,7 +207,7 @@ _USE_LOCK_RE = re.compile(r"aie\.use_lock\(%(\S+), (\w+), %c(\d+)_i32\)")
 _HERD_NAME_RE = re.compile(r'air\.herd_name = "([^"]+)"')
 
 
-def _aircc_debug_dumps(module):
+def _aircc_debug_dumps(module, backend_kwargs=None):
     """The production pipeline's per-pass dumps for ``module``, plus its error."""
     prev_cwd = os.getcwd()
     error = None
@@ -199,6 +221,7 @@ def _aircc_debug_dumps(module):
                 runtime_loop_tiling_sizes=[2, 2],
                 target_device="npu2",
                 debug_ir=True,
+                **(backend_kwargs or {}),
             )
             try:
                 backend.compile(module)
@@ -245,13 +268,13 @@ def _memref_elems(shape):
     return n
 
 
-def check_shape(label, kwargs):
+def check_shape(label, kwargs, backend_kwargs=None):
     """One shape's verdict. Returns the list of problems, empty on pass."""
     n_b = kwargs["n_b"]
     rpc = kwargs["tile_m"] // 2
     problems = []
     module = build_tail_pipeline_module(**kwargs)
-    dumps, compile_error = _aircc_debug_dumps(module)
+    dumps, compile_error = _aircc_debug_dumps(module, backend_kwargs)
     names = [n for n, _ in dumps]
 
     # 1. no refusal: the dumps reach a routed design, and the only error is
@@ -285,10 +308,13 @@ def check_shape(label, kwargs):
                 "after air-dma-to-channel -- lowering incomplete"
             )
         expected_channels = [
-            CHANNEL_AN1_FEED, CHANNEL_AN1_OUT, CHANNEL_A_FEED, CHANNEL_WUP_FEED,
-            CHANNEL_H, CHANNEL_DOWN_FEED, CHANNEL_ACC_STORE, CHANNEL_DOWN_OUT,
-            CHANNEL_AN2_FEED,
-        ] + ([CHANNEL_REDUCE] if n_b > 2 else [])
+            CHANNEL_AN1_FEED, CHANNEL_AN1_OUT, CHANNEL_AN1_A, CHANNEL_A_FEED,
+            CHANNEL_WUP_FEED, CHANNEL_H, CHANNEL_DOWN_OUT, CHANNEL_AN2_FEED,
+        ] + [
+            down_channel(prefix, t)
+            for t in range(n_b)
+            for prefix in (CHANNEL_DOWN_FEED, CHANNEL_ACC_STORE)
+        ] + [down_channel(CHANNEL_REDUCE, t) for t in range(n_b - 1)]
         missing = [c for c in expected_channels if f"@{c}" not in chan]
         if missing:
             problems.append(
@@ -313,12 +339,22 @@ def check_shape(label, kwargs):
             "to AIE routing"
         )
     devices = _device_blocks(final)
-    tiled = [(n, d) for n, d in devices if _TILE_RE.search(d)]
+    # A ``*_reset`` device is aircc's reset PDI: emitted when the design holds
+    # terminated (repeat-counted) DMA tasks and reloaded at the end of every
+    # run so the next dispatch starts clean (the multi-sweep shapes). It
+    # mirrors the main device's tiles and is not a second segment.
+    tiled = [
+        (n, d) for n, d in devices
+        if _TILE_RE.search(d) and not (n or "").rstrip('"').endswith("_reset")
+    ]
     if len(tiled) != 1:
         problems.append(
             f"{label}: {len(tiled)} tile-bearing aie.device in {final_name}, need "
             "exactly 1 -- the one-segment claim itself"
         )
+    # Every per-tile clause below reads the MAIN device's body only.
+    if tiled:
+        final = tiled[0][1]
     total_core_core = 0
     any_flow = False
     mm2s_total = mm2s_worst = 0
@@ -355,12 +391,12 @@ def check_shape(label, kwargs):
             )
     if not any_flow:
         problems.append(f"{label}: no aie.flow in {final_name} -- nothing was routed")
-    elif tiled and total_core_core != n_b:
+    elif tiled and total_core_core != n_b + 2:
         problems.append(
-            f"{label}: {total_core_core} core->core flows, need exactly {n_b} "
-            "(the up->down H edges; every other hop is memtile-mediated by the "
-            "core port budget -- the derivation is in the builder's docstring) "
-            "-- a stage edge moved"
+            f"{label}: {total_core_core} core->core flows, need exactly {n_b + 2} "
+            "(the up->down H edges and the two AN1->AN2 residual edges; every "
+            "other hop is memtile-mediated by the core port budget -- the "
+            "derivation is in the builder's docstring) -- a stage edge moved"
         )
 
     # 6. DMA block caps
@@ -402,12 +438,8 @@ def check_shape(label, kwargs):
     blk = kwargs["tile_m"] * kwargs["tile_k"]
     l1_worst = 0
     for t, herd_name in sorted(tile_herd.items()):
-        want = [e for _, e in plan[herd_name][1]]
-        if herd_name == HERD_DOWN and f"call @{ADD_SYMBOL}(" not in tile_body[t]:
-            # The chain's last core has no tail; air-to-aie drops its
-            # unreferenced l1_red after role specialization.
-            want = [e for n, e in plan[herd_name][1] if n != "l1_red"]
-        want = sorted(want)
+        plan_name = HERD_DOWN if herd_name.startswith(HERD_DOWN) else herd_name
+        want = sorted(e for _, e in plan[plan_name][1])
         got = sorted(bufs.get(t, []))
         nbytes = sum(got) * 2 + L1_STACK_BYTES
         l1_worst = max(l1_worst, nbytes)
@@ -422,6 +454,7 @@ def check_shape(label, kwargs):
                 f"{label}: tile {t} ({herd_name}) needs {nbytes} B of L1, not "
                 f"under {L1_BYTES}"
             )
+    tile_herd = {t: (HERD_DOWN if h.startswith(HERD_DOWN) else h) for t, h in tile_herd.items()}
     if len(tile_herd) != 2 + 2 * n_b + 2:
         problems.append(
             f"{label}: {len(tile_herd)} routed cores, need {4 + 2 * n_b} "
@@ -456,19 +489,21 @@ def check_shape(label, kwargs):
         h = _HERD_NAME_RE.search(body)
         if not (m and h):
             continue
-        for sym in per_herd.get(h.group(1), []):
+        herd_kind = HERD_DOWN if h.group(1).startswith(HERD_DOWN) else h.group(1)
+        for sym in per_herd.get(herd_kind, []):
             if f"call @{sym}(" not in body:
                 problems.append(
                     f"{label}: core {m.group(1)} ({h.group(1)}) does not call "
                     f"@{sym} -- the stage is not dispatching its kernel"
                 )
-        if h.group(1) == HERD_DOWN and f"call @{ADD_SYMBOL}(" in body:
+        if herd_kind == HERD_DOWN and f"call @{ADD_SYMBOL}(" in body:
             adders += 1
-    if adders != max(n_b - 1, 1):
+    if adders != n_b - 1:
         problems.append(
             f"{label}: {adders} down cores call @{ADD_SYMBOL}, need exactly "
-            f"{max(n_b - 1, 1)} -- the chain's role specialization did not "
-            "survive air-to-aie"
+            f"{n_b - 1} -- every column but the chain's last folds in its "
+            "neighbour's block; the last forwards its own through the accumulate "
+            "kernel against the zero chunk"
         )
 
     # 11. one token on every core-tile lock op
@@ -544,8 +579,8 @@ def main():
     # The column census's negative control first and unconditionally: if it
     # cannot refuse an over-budget design, clause 5 is not a gate.
     problems = check_census_control()
-    for label, kwargs in SHAPES:
-        problems += check_shape(label, kwargs)
+    for label, kwargs, backend_kwargs in SHAPES:
+        problems += check_shape(label, kwargs, backend_kwargs)
     if problems:
         print(f"{TAG} FAIL")
         for problem in problems:
