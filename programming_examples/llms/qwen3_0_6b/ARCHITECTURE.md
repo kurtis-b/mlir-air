@@ -33,6 +33,13 @@ once: (HOST) final RMSNorm → [NPU elf:lm_head_gemv] (10 partitions: 9 × 16384
 **Decode — 2 NPU ELFs/layer (+ lm_head once/token):**
 
 ```
+x ─[NPU elf:rms_qkv_qknorm_rope_gemv2]   FUSED, 1 ELF, 2 launches (8 before 2026-08-21, 4 before 2026-08-23)
+      (RMSNorm launch writes the head of the packed B = [normed | RoPE LUT | q_norm | k_norm];
+       the GEMV launch is the head-aligned mv_heads.cc kernel: each column owns 4 whole heads,
+       accumulates a head over 16 iterations in L1 and runs QK-norm + RoPE in-core on the last
+       chunk; chunk TAG / Q-K-V KIND ride in a 64-element row padding of the static weight,
+       the head goes out through per-iteration slots the host gathers. QWEN3_RMS_QKV_LAUNCHES=4
+       keeps the form below for A/B. Stage 0.62 -> 0.49 ms/layer, 13.0 -> 13.4-13.5 tok/s.)
 x ─[NPU elf:rms_qkv_qknorm_rope_gemv4]   FUSED, 1 ELF, 4 launches (was 8 before 2026-08-21)
       { RMSNorm | ONE GEMV over [wq;wk;wv] | ONE per-row-weighted QK-norm over Q|K | ONE RoPE over Q|K }
       (RoPE LUT per-position, tiled over the 24 Q|K rows, NOT a static BO; each air.launch

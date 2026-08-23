@@ -68,6 +68,9 @@ def prepare_air_project(quant: str = "bf16", int4_gs: int = 128):
     # never reached air_project/ fails inside aiecc, several frames from the list
     # that omitted it.
     obj_names.extend(sorted(p.name for p in Path(".").glob("mm_m*.o")))
+    # The head-aligned GEMV + epilogue object (doc 57 O1 second half), tagged
+    # by head_dim like the GEMM variants: `mv_heads_hd128.o`.
+    obj_names.extend(sorted(p.name for p in Path(".").glob("mv_heads_hd*.o")))
     for obj_name in obj_names:
         src = Path(obj_name)
         if src.exists():

@@ -161,3 +161,101 @@ def run(cache, kernel_name, backend_kwargs, lw, x_bf16, lut, config, layer_idx):
         bo_key=f"{kernel_name}_L{layer_idx}" if layer_idx is not None else None,
     )
     return split_outputs(res, config)
+
+
+# ---------------------------------------------------------------------------
+# 2-launch form `[2026-08-22]` (doc 57 O1 second half): the head-aligned GEMV
+# with QK-norm + RoPE as an in-core epilogue
+# (`shared.builders.rms_qkv_qknorm_rope_multi.build_rms_qkv_qknorm_rope_gemv2_module`).
+# 5 args:
+#     0 x_in (emb)          1 norm_w (emb, static)
+#     2 bvec (emb + 3*head_dim) = [normed | lut | q_norm | k_norm]: the device
+#       writes [0, emb) (RMSNorm launch), the host fills the tail every call
+#       (the LUT is position-dependent), so it is a DYNAMIC input, not an
+#       intermediate
+#     3 wqkv2 (static): the builder form's storage of [wq; wk; wv]
+#       (`qkv2_prep_weight`)   4 out (output, device-written)
+# The GEMV's output buffer may be larger than q|k|v (per-iteration slots);
+# `qkv2_gather` (None for logical-order forms) maps it to q_roped | k_roped | v.
+# ---------------------------------------------------------------------------
+
+OUTPUT_INDICES_2 = [4]
+STATIC_INDICES_2 = {1, 3}
+INTERMEDIATE_INDICES_2 = {4}
+
+
+def prep_weights_2(lw, config):
+    """Host-side, once per layer: the 2-launch form's static weight. Idempotent.
+    Needs `_wq_t`, `_wk_t`, `_wv_t` (or an existing `_wqkv_t`)."""
+    if getattr(lw, "_wqkv2", None) is not None:
+        return
+    from shared.builders.rms_qkv_qknorm_rope_multi import qkv2_prep_weight
+
+    prep_weights(lw, config)  # `_wqkv_t` (the logical [wq; wk; wv]) and `_qk_norm_w`
+    q_dim = config.n_heads * config.head_dim
+    kv_dim = config.n_kv_heads * config.head_dim
+    lw._wqkv2 = qkv2_prep_weight(lw._wqkv_t, q_dim, q_dim + kv_dim, config.head_dim)
+    lw._q_norm_row = np.asarray(lw.q_norm, bfloat16).reshape(config.head_dim)
+    lw._k_norm_row = np.asarray(lw.k_norm, bfloat16).reshape(config.head_dim)
+    if lw._wqkv2 is not lw._wqkv_t:
+        del lw._wqkv_t  # one resident copy of the packed weight
+
+
+def position_lut_2(rope_lut_bf16, current_pos, config):
+    """One position's LUT row (head_dim,): the epilogue applies it to every head."""
+    return np.ascontiguousarray(rope_lut_bf16[current_pos]).astype(bfloat16)
+
+
+def call_args_2(lw, x_bf16, lut_row, config):
+    """The 5 positional inputs of the 2-launch form, in ELF arg order."""
+    from shared.builders.rms_qkv_qknorm_rope_multi import qkv2_out_total
+
+    prep_weights_2(lw, config)
+    emb_dim, head_dim = config.emb_dim, config.head_dim
+    q_dim = config.n_heads * head_dim
+    kv_dim = config.n_kv_heads * head_dim
+    qkv_dim = q_dim + 2 * kv_dim
+    bvec = np.zeros(emb_dim + 3 * head_dim, dtype=bfloat16)
+    bvec[emb_dim:emb_dim + head_dim] = np.asarray(lut_row, bfloat16).reshape(head_dim)
+    bvec[emb_dim + head_dim:emb_dim + 2 * head_dim] = lw._q_norm_row
+    bvec[emb_dim + 2 * head_dim:] = lw._k_norm_row
+    return [
+        np.asarray(x_bf16).flatten().astype(bfloat16),  # 0 x_in
+        lw.attn_norm.reshape(emb_dim).astype(bfloat16),  # 1 norm_w (static)
+        bvec,  # 2 bvec (DYNAMIC: lut)
+        lw._wqkv2,  # 3 wqkv2 (static)
+        np.zeros(qkv2_out_total(qkv_dim, head_dim), dtype=bfloat16),  # 4 out
+    ]
+
+
+def split_outputs_2(res, config):
+    """(v, q_roped, k_roped) from the ELF's output (arg 4)."""
+    from shared.builders.rms_qkv_qknorm_rope_multi import qkv2_gather
+
+    head_dim = config.head_dim
+    q_dim = config.n_heads * head_dim
+    kv_dim = config.n_kv_heads * head_dim
+    qkv_dim = q_dim + 2 * kv_dim
+    out = np.asarray(res[4]).astype(bfloat16)
+    g = qkv2_gather(qkv_dim, head_dim)
+    if g is not None:
+        out = out[g]
+    return (
+        np.ascontiguousarray(out[q_dim + kv_dim:]),
+        np.ascontiguousarray(out[:q_dim]),
+        np.ascontiguousarray(out[q_dim:q_dim + kv_dim]),
+    )
+
+
+def run_2(cache, kernel_name, backend_kwargs, lw, x_bf16, lut_row, config, layer_idx):
+    """One call of the 2-launch stage -> (v, q_roped, k_roped)."""
+    res = cache.load_and_run(
+        kernel_name,
+        backend_kwargs,
+        *call_args_2(lw, x_bf16, lut_row, config),
+        output_indices=OUTPUT_INDICES_2,
+        static_input_indices=STATIC_INDICES_2,
+        intermediate_indices=INTERMEDIATE_INDICES_2,
+        bo_key=f"{kernel_name}_L{layer_idx}" if layer_idx is not None else None,
+    )
+    return split_outputs_2(res, config)

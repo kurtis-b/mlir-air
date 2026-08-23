@@ -470,6 +470,52 @@ H2/H3 phases measure.
    the QK-norm + RoPE pair (2 boundaries; an epilogue needs each column to own whole heads,
    i.e. a column-contiguous row distribution that the current L2-staged GEMV does not have —
    a new core kernel). Each remaining boundary is worth ~107 µs × 28 = 3 ms/token.
+5c. **`[2026-08-23]` O1 second half — the head-aligned GEMV with QK-norm + RoPE as an in-core
+   epilogue: 4 → 2 launches, LANDED** (devq 553 compile, 555 probe, 556 verify, 557 reexec,
+   558 profile; evidence `results/o1-epilogue-20260822/`). New kernel
+   `matrix_vector_multiplication/bf16/mv_heads.cc` (`qkv_heads_chunk_bf16`: `mv.cc`'s matvec
+   with a row stride; on a head's last chunk the epilogue runs QK-norm — f32 sum of squares,
+   rstd truncated to bf16 as `_build_qknorm_1d` does — then `rope_halfsplit`'s loop verbatim;
+   `HEAD_DIM` baked in, object `mv_heads_hd128.o`), builder
+   `build_rms_qkv_qknorm_rope_gemv2_module` (5-arg ABI) and `_build_qkv_heads_gemv` in
+   `rms_qkv_qknorm_rope_multi.py`, host side `decode_qkv4.py` (`prep_weights_2`, `run_2`,
+   `qkv2_gather`), `QWEN3_RMS_QKV_LAUNCHES` (default **2**) in the 0.6B driver. **Mapping**:
+   column `tx` owns logical rows `[512 tx, +512)` = heads `4tx..4tx+3` (cols 0–3 Q, 4–5 K,
+   6–7 V), but the *whole-head-per-iteration* tile (256 KB per column, 4 iterations) measured
+   **0.13 ms/layer slower** than matvec.py's GEMV — the single-buffered memtile tile refills
+   only after the core drains all 16 chunks, so fill and drain serialize (tile sweep 8 rows
+   0.463 → 128 rows 0.577–0.588 vs 0.444 ms; a chunked L3→L2 fill loop changed nothing; devq
+   544/545/552). Production therefore keeps matvec.py's 8-row tile and 64 iterations: iteration
+   `i` gives column `tx` chunk `i mod 16` of head `i div 16`; the core accumulates the head in
+   a persistent L1 buffer over 16 consecutive iterations and runs the epilogue on the last
+   chunk. Three walls shaped the rest: a core tile has **two inbound DMA channels** (A from the
+   memtile, B from the shim; a fourth stream fails the router, devq 540), so the chunk TAG and
+   Q/K/V KIND are baked into a 64-element row padding of the static weight (+6.25 % bytes,
+   rows stored iteration-major) and the epilogue operands ride in B as `[normed | lut | q_norm
+   | k_norm]` (1408 elements per chunk); the locality verifier rejects a per-iteration write to
+   the head's logical slot (`iteration variable does not appear in any offset of this access`),
+   so each iteration writes a disjoint 1024-element slot (128 KB) that the host gathers.
+   Layout + slots cost the single GEMV 0.444 → 0.492 ms (devq 552), ≈48 µs/layer against the
+   2 × ~107 µs of boundaries removed. **Probe** (devq 555, random weights, the driver's LUT at
+   six positions, two x): `normed` and `v` bit-identical to the 4-launch form; `q`/`k` vs an f32
+   reference **3.4–7.1e-3 of scale (rq2) vs 9.6–15.5e-3 (rq4)** — the epilogue is the more
+   accurate path; rq2 vs rq4 differ by 1–2 bf16 ulp on ~80 % of elements (not bit-identical,
+   stated); deterministic; stage **0.672 → 0.494 ms/layer** interleaved ×20 (−0.178 = 89 µs
+   per removed boundary). `make verify` **PASS** 2 / 0 (devq 556). **Re-execution gate**
+   (devq 557, the `lm_head_reexec_gate` shape on the production module): d2–d5 back-to-back
+   bit-identical to d1, d6 after another ELF, d7 new input — **7/7 clean**. **Profile** (devq
+   558, same session, Turbo before and after, `make profile N_TOKENS=32` ×2 each):
+   4 launches **13.04 / 12.91 tok/s** (76.7 / 77.5 ms; layer loop 2201.7 / 2227.8 ms per 896
+   invocations; `rms_qkv` 0.65 / 0.66, kernel 0.61 / 0.62) → 2 launches **13.40 / 13.52
+   tok/s** (74.6 / 74.0 ms; layer loop 2135.6 / 2114.4; `rms_qkv` **0.49**, kernel 0.44);
+   `lm_head_gemv` 7.68–7.72 and `o_gemv_ffn` 1.57–1.61 unchanged. **−2.7 … −3.5 ms/token
+   against the −6 predicted**: the line moved −0.16 … −0.17 × 28 = −4.6, the layout/slots
+   cost takes ~1.3 back, the rest is within the other lines' rep-to-rep spread. Boundaries per
+   token 206 → **150** (28 × 5 + 10). The 1.7B driver keeps its 4-launch names (re-verified on
+   the same compiler: `make verify` PASS 2 / 0, devq 559). Open: the 128 KB slot D2H and the +6 % weight
+   bytes are the ~48 µs still paid (a partial BO sync or a host index trick could recover
+   some); the form assumes `rows_per_col % head_dim == 0` (true for 0.6B / 1.7B / 4B); the
+   1.7B port (K = 2048) is not done.
 5b. **`[2026-08-21]` LM-head partitioning, the planner's finding — DONE and LANDED** (devq
    476 probe, 478 verify, 479 profile). Doc 56 H0's planner derived that at `m_input = 8`
    the BD repeat cap admits 16384-row partitions, and that stitching takes launches of

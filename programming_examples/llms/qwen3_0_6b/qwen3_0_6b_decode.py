@@ -56,18 +56,34 @@ from shared.infra.cache import KernelCache
 # because each air.launch boundary costs ~107 us (doc 57 section 1.5). The
 # artifact name carries the launch count so a stale 8-launch cache can never
 # be bound to this arg layout.
-_RMS_QKV_KERNEL = "rms_qkv_qknorm_rope_gemv4"
+# `[2026-08-22]` 2 launches (doc 57 O1 second half), PRODUCTION since
+# `make verify` PASS (devq 556): RMSNorm, then ONE head-aligned GEMV whose
+# cores apply QK-norm + RoPE in L1 (kernel mv_heads.cc, evidence
+# results/o1-epilogue-20260822/; stage 0.672 -> 0.494 ms per layer, devq 555).
+# QWEN3_RMS_QKV_LAUNCHES=4 selects the 4-launch form for A/B; the launch
+# count is in the artifact name.
+import os as _os  # noqa: E402
+
+_RMS_QKV_LAUNCHES = int(_os.environ.get("QWEN3_RMS_QKV_LAUNCHES", "2"))
+assert _RMS_QKV_LAUNCHES in (2, 4), _RMS_QKV_LAUNCHES
+_RMS_QKV_KERNEL = f"rms_qkv_qknorm_rope_gemv{_RMS_QKV_LAUNCHES}"
 
 
-def build_rms_qkv_qknorm_rope_gemv_module(config, n_launches=4):
+def build_rms_qkv_qknorm_rope_gemv_module(config, n_launches=None):
     """Fused decode ELF: RMSNorm + Q/K/V GEMV + per-head QK-norm + RoPE (M=1).
 
-    n_launches=4 is production; 8 is the pre-2026-08-21 form (kept for A/B).
+    n_launches: 4 (the 2026-08-21 production form), 2 (the head-aligned GEMV
+    with the in-core epilogue), 8 (the pre-2026-08-21 form, kept for A/B).
+    Default: `_RMS_QKV_LAUNCHES`.
     """
     from shared.builders.rms_qkv_qknorm_rope_multi import (
         build_rms_qkv_qknorm_rope_gemv_module as _build8,
         build_rms_qkv_qknorm_rope_gemv4_module as _build4,
+        build_rms_qkv_qknorm_rope_gemv2_module as _build2,
     )
+
+    if n_launches is None:
+        n_launches = _RMS_QKV_LAUNCHES
 
     emb_dim = config.emb_dim
     n_heads = config.n_heads
@@ -75,18 +91,27 @@ def build_rms_qkv_qknorm_rope_gemv_module(config, n_launches=4):
     head_dim = config.head_dim
     q_dim = n_heads * head_dim
     kv_dim = n_kv_heads * head_dim
-    build = {4: _build4, 8: _build8}[n_launches]
+    build = {2: _build2, 4: _build4, 8: _build8}[n_launches]
     return build(
         emb_dim, q_dim, kv_dim, n_heads, n_kv_heads, head_dim, qknorm_eps=1e-6
     )
 
 
 # Host side of the 4-launch stage: shared.infra.decode_qkv4 owns the 9-arg
-# layout; these are the model driver's thin names for it.
+# layout (and the 2-launch form's 5-arg layout); these are the model driver's
+# thin names for it. The `rms_qkv4_*` names stay for the inference driver;
+# they dispatch on `_RMS_QKV_LAUNCHES`.
 from shared.infra import decode_qkv4 as _qkv4  # noqa: E402
 
-prep_rms_qkv4_weights = _qkv4.prep_weights
-rms_qkv4_lut = _qkv4.position_lut
+
+def prep_rms_qkv4_weights(lw, config):
+    if _RMS_QKV_LAUNCHES == 2:
+        _qkv4.prep_weights_2(lw, config)
+    else:
+        _qkv4.prep_weights(lw, config)
+
+
+rms_qkv4_lut = _qkv4.position_lut  # the tiled LUT; the 2-launch form takes its first head_dim
 
 
 def rms_qkv4_args(lw, x_bf16, lut, config):
@@ -100,7 +125,14 @@ def rms_qkv4_args(lw, x_bf16, lut, config):
 
 
 def run_rms_qkv4(cache, lw, x_bf16, lut, config, layer_idx, verbose=False):
-    """One call of the 4-launch QKV stage -> (v, q_roped, k_roped)."""
+    """One call of the QKV stage (4- or 2-launch form) -> (v, q_roped, k_roped).
+    `lut` is the tiled (n_heads+n_kv_heads) x head_dim LUT of `rms_qkv4_lut`;
+    the 2-launch form takes one row of it."""
+    if _RMS_QKV_LAUNCHES == 2:
+        return _qkv4.run_2(
+            cache, _RMS_QKV_KERNEL, _rms_qkv_qknorm_rope_gemv_backend(verbose),
+            lw, x_bf16, np.asarray(lut).reshape(-1)[: config.head_dim], config, layer_idx,
+        )
     return _qkv4.run(
         cache, _RMS_QKV_KERNEL, _rms_qkv_qknorm_rope_gemv_backend(verbose),
         lw, x_bf16, lut, config, layer_idx,
@@ -310,8 +342,13 @@ def compile_decode_kernels(cache, config, verbose=False):
     compile_rope()
     compile_silu_and_mul()
 
+    if _RMS_QKV_LAUNCHES == 2:
+        from shared.infra.external_kernels import compile_mv_heads
+
+        compile_mv_heads(config.head_dim)
     print(
-        f"\n--- {_RMS_QKV_KERNEL} (FUSED: RMSNorm+QKV+QK-norm+RoPE, 4 launches) ---"
+        f"\n--- {_RMS_QKV_KERNEL} (FUSED: RMSNorm+QKV+QK-norm+RoPE, "
+        f"{_RMS_QKV_LAUNCHES} launches) ---"
     )
     cache.compile_and_cache(
         _RMS_QKV_KERNEL,

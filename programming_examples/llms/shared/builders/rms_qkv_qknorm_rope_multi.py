@@ -984,3 +984,573 @@ def build_rms_qkv_qknorm_rope_gemv4_module(
         f"{len(str(module).splitlines())} lines, {3 if host_rmsnorm else 4} launches, parsed OK"
     )
     return module
+
+
+# ===========================================================================
+# DECODE (M=1) fused builder, 2 launches `[2026-08-22]` (doc 57 O1, second half):
+# the QKV GEMV with a HEAD-ALIGNED row -> column mapping and QK-norm + RoPE
+# as an in-core epilogue.
+# ===========================================================================
+
+K_PAD = 64  # row padding of the augmented weight matrix: [tag, kind, 0 ...]
+
+
+@module_builder
+def _build_qkv_heads_gemv(
+    m,
+    k,
+    head_dim,
+    np_dtype,
+    tile_m=8,
+    herd_m=8,
+    eps=1e-6,
+    link_with="mv_heads_hd128.o",
+    out_slots=True,
+):
+    """GEMV C[M] = A[M,K] @ B[K] whose rows are distributed so that every
+    core owns WHOLE heads, with the per-head QK-norm + RoPE epilogue applied
+    in L1 before the head leaves the core (kernel mv_heads.cc).
+
+    out_slots=True: the per-iteration head write goes to its OWN slot of a
+    [n_iter, herd_m, head_dim] output (`qkv_heads_slot_gather` picks each
+    head's last-chunk slot on the host). Required by the compiler: with the
+    head's logical slot as the target, 16 iterations write the same region
+    and `air-verify-hierarchy-locality` (strict, aircc's default) rejects
+    the launch -- "iteration variable does not appear in any offset of this
+    access; iterations cannot be disjoint". out_slots=False keeps that
+    (rejected) logical-slot form for reference.
+
+    Row -> core mapping. matvec.py's L2-staged tiles interleave 8-row tiles
+    across the herd_m columns (launch iteration i gives column tx the LOGICAL
+    rows [i*herd_m*tile_m + tx*tile_m, +tile_m)), so a head's 128 rows land on
+    16 different cores. Here column tx owns the CONTIGUOUS logical block
+    [tx*rows_per_col, (tx+1)*rows_per_col), rows_per_col = M / herd_m, and
+    launch iteration i gives it the rows
+
+        logical(tx, i) = tx*rows_per_col + i*tile_m + [0, tile_m)
+
+    -- chunk (i mod chunks_per_head) of head (tx*heads_per_col + i // chunks_per_head),
+    chunks_per_head = head_dim / tile_m. A core therefore sees a head as
+    chunks_per_head CONSECUTIVE launch iterations, accumulates them into a
+    persistent L1 head buffer, and runs the epilogue on the last chunk.
+
+    Storage. The host stores A ITERATION-MAJOR (`qkv_heads_store_perm`): stored
+    row i*herd_m*tile_m + tx*tile_m + r holds logical(tx, i)[r], so the L3 -> L2
+    fetch is matvec.py's contiguous [herd_m, tile_m, K] block and the L2 stage
+    keeps its 16 KB granularity (a whole-head 256 KB tile serializes the fill
+    against the core's drain: 0.577 vs 0.444 ms per 8 MB single-launch GEMV,
+    results/o1-epilogue-20260822/probe_gemv_variants*.json). The OUTPUT is
+    written in LOGICAL order (the L2 -> L3 write is column-strided), so the
+    host un-permutes nothing.
+
+    Tag and kind. The core does not see the launch iteration (its program is a
+    while(true) over lock handshakes), and a core tile has two inbound DMA
+    channels, both taken (A from the memtile, B from the shim: a third stream
+    fails in aiecc's router, "'aie.connect' op ... targets same dst as another
+    connect op"). So every weight row carries, in a K_PAD-element padding the
+    host bakes once, its chunk index within the head (TAG, a[k]) and its head
+    kind (KIND, a[k+1]: 0 Q, 1 K, 2 V). The kernel writes the chunk at
+    c[tag*tile_m] and, at the last tag, runs the epilogue with the kind's
+    weight. The per-iteration output DMA writes the head's 128 outputs to its
+    logical slot every chunk; only the last chunk's write carries the final
+    values and it is the last one issued (same channel, in order).
+
+    B is the PACKED vector [normed (K) | lut (head_dim) | q_norm (head_dim) |
+    k_norm (head_dim)], fetched whole per iteration (broadcast).
+
+    Func signature: (A: [M, K + K_PAD], B: [K + 3*head_dim], OUT: [M]).
+    """
+    assert m % herd_m == 0, (m, herd_m)
+    rows_per_col = m // herd_m
+    assert rows_per_col % head_dim == 0, (rows_per_col, head_dim)
+    assert head_dim % tile_m == 0, (head_dim, tile_m)
+    chunks_per_head = head_dim // tile_m
+    n_iter = rows_per_col // tile_m
+    assert k % 64 == 0, k
+    k_pad = k + K_PAD
+    tail = 3 * head_dim
+    b_total = k + tail
+
+    from air.dialects.func import CallOp
+    from air.ir import StringAttr, UnitAttr, FloatAttr
+
+    xrt_dtype = type_mapper(np_dtype)
+    f32 = F32Type.get()
+
+    memrefTyA = MemRefType.get([m, k_pad], xrt_dtype)
+    memrefTyB = MemRefType.get([b_total], xrt_dtype)
+    out_total = n_iter * herd_m * head_dim if out_slots else m
+    memrefTyOut = MemRefType.get([out_total], xrt_dtype)
+
+    l2_mem_space = IntegerAttr.get(T.i32(), MemorySpace.L2)
+    l2MemrefTyA = MemRefType.get([herd_m, tile_m, k_pad], xrt_dtype, memory_space=l2_mem_space)
+    l2MemrefTyOut = MemRefType.get([herd_m, head_dim], xrt_dtype, memory_space=l2_mem_space)
+
+    l1_mem_space = IntegerAttr.get(T.i32(), MemorySpace.L1)
+    l1MemrefTyA = MemRefType.get([tile_m, k_pad], xrt_dtype, memory_space=l1_mem_space)
+    l1MemrefTyB = MemRefType.get([b_total], xrt_dtype, memory_space=l1_mem_space)
+    l1MemrefTyHead = MemRefType.get([head_dim], xrt_dtype, memory_space=l1_mem_space)
+
+    chunk_func = FuncOp(
+        "qkv_heads_chunk_bf16",
+        ([T.i32(), T.i32(), l1MemrefTyA, l1MemrefTyB, l1MemrefTyHead, l1MemrefTyHead, f32], []),
+        visibility="private",
+    )
+    chunk_func.attributes["link_with"] = StringAttr.get(link_with)
+    chunk_func.attributes["llvm.emit_c_interface"] = UnitAttr.get()
+
+    @FuncOp.from_py_func(memrefTyA, memrefTyB, memrefTyOut)
+    def matvec_heads(arg_a, arg_b, arg_out):
+        @launch(operands=[arg_a, arg_b, arg_out], sizes=[n_iter, 1])
+        def launch_body(l_ivx, l_ivy, l_sx, l_sy, l3_a, l3_b, l3_out):
+            @segment(name="qkvh_seg", operands=[l_ivx, l3_a, l3_b, l3_out])
+            def segment_body(ivx_s, l3_a_s, l3_b_s, l3_out_s):
+                # stored row offset of this iteration's contiguous block
+                stored_map = AffineMap.get(
+                    0, 1,
+                    [AffineExpr.get_mul(AffineSymbolExpr.get(0), AffineConstantExpr.get(herd_m * tile_m))],
+                )
+                stored_offset_m = affine_apply(stored_map, [ivx_s])
+                # logical row offset WITHIN a column of this iteration's head: (i // chunks_per_head) * head_dim
+                head_map = AffineMap.get(
+                    0, 1,
+                    [AffineExpr.get_mul(
+                        AffineExpr.get_floor_div(AffineSymbolExpr.get(0), AffineConstantExpr.get(chunks_per_head)),
+                        AffineConstantExpr.get(head_dim))],
+                )
+                head_offset_m = affine_apply(head_map, [ivx_s])
+
+                l2_a = AllocOp(l2MemrefTyA, [], [])
+                l2_out = AllocOp(l2MemrefTyOut, [], [])
+                l1_a = AllocOp(l1MemrefTyA, [], [])
+                l1_b = AllocOp(l1MemrefTyB, [], [])
+                l1_c = AllocOp(l1MemrefTyHead, [], [])
+                l1_out = AllocOp(l1MemrefTyHead, [], [])
+
+                # L3 -> L2: the iteration's contiguous [herd_m, tile_m, k_pad] block.
+                dma_memcpy_nd(
+                    l2_a,
+                    l3_a_s,
+                    src_offsets=[0, stored_offset_m, 0],
+                    src_sizes=[herd_m, tile_m, k_pad],
+                    src_strides=[tile_m * k_pad, k_pad, 1],
+                )
+
+                @herd(
+                    name="qkvh_herd",
+                    sizes=[herd_m, 1],
+                    operands=[l1_a, l1_b, l1_c, l1_out, l2_a, l3_b_s, l2_out],
+                )
+                def herd_body(_tx, _ty, _sx, _sy, _l1_a, _l1_b, _l1_c, _l1_out, _l2_a, _l3_b, _l2_out):
+                    # B (packed): L3 -> L1 (broadcast, repeat channel).
+                    dma_memcpy_nd(_l1_b, _l3_b, src_offsets=[], src_sizes=[b_total], src_strides=[1])
+                    # A: L2 -> L1, this core's column slice.
+                    dma_memcpy_nd(
+                        _l1_a,
+                        _l2_a,
+                        src_offsets=[_tx, 0, 0],
+                        src_sizes=[1, tile_m, k_pad],
+                        src_strides=[tile_m * k_pad, k_pad, 1],
+                    )
+                    m_const = arith.ConstantOp(IntegerAttr.get(T.i32(), tile_m), None)
+                    k_const = arith.ConstantOp(IntegerAttr.get(T.i32(), k), None)
+                    eps_c = arith.ConstantOp(f32, FloatAttr.get(f32, eps))
+                    CallOp(chunk_func, [m_const, k_const, _l1_a, _l1_b, _l1_c, _l1_out, eps_c])
+                    # OUT (the head, final on the last chunk): L1 -> L2 row tx.
+                    dma_memcpy_nd(
+                        _l2_out,
+                        _l1_out,
+                        dst_offsets=[_tx, 0],
+                        dst_sizes=[1, head_dim],
+                        dst_strides=[head_dim, 1],
+                        src_offsets=[],
+                        src_sizes=[head_dim],
+                        src_strides=[1],
+                    )
+
+                herd_body.attributes["link_with"] = StringAttr.get(link_with)
+
+                if out_slots:
+                    # L2 -> L3: this iteration's own [herd_m * head_dim] slot.
+                    slot_map = AffineMap.get(
+                        0, 1,
+                        [AffineExpr.get_mul(AffineSymbolExpr.get(0), AffineConstantExpr.get(herd_m * head_dim))],
+                    )
+                    slot_offset = affine_apply(slot_map, [ivx_s])
+                    dma_memcpy_nd(
+                        l3_out_s,
+                        l2_out,
+                        dst_offsets=[slot_offset],
+                        dst_sizes=[herd_m * head_dim],
+                        dst_strides=[1],
+                        src_offsets=[0, 0],
+                        src_sizes=[herd_m, head_dim],
+                        src_strides=[head_dim, 1],
+                    )
+                else:
+                    # L2 -> L3: every column's head slot, logical order (column stride rows_per_col).
+                    dma_memcpy_nd(
+                        l3_out_s,
+                        l2_out,
+                        dst_offsets=[0, head_offset_m],
+                        dst_sizes=[herd_m, head_dim],
+                        dst_strides=[rows_per_col, 1],
+                        src_offsets=[0, 0],
+                        src_sizes=[herd_m, head_dim],
+                        src_strides=[head_dim, 1],
+                    )
+
+                for buf in (l2_a, l2_out, l1_a, l1_b, l1_c, l1_out):
+                    DeallocOp(buf)
+
+
+@module_builder
+def _build_qkv_heads_gemv_wholehead(
+    m,
+    k,
+    head_dim,
+    n_q_rows,
+    n_qk_rows,
+    np_dtype,
+    m_input=8,
+    herd_m=8,
+    eps=1e-6,
+    link_with="mv_heads_hd128.o",
+    fill_chunks=True,
+):
+    """The whole-head-per-iteration form of the head-aligned GEMV (study
+    variant): launch iteration i gives column tx the logical rows
+    [tx*rows_per_col + i*head_dim, +head_dim) -- ONE head -- through a
+    [herd_m, head_dim, K] L2 tile (256 KB per memtile at K = 1024), the L1 C
+    tile is the head, and the epilogue runs after the head_dim/m_input chunk
+    calls. The epilogue kind is per column (n_q_rows / n_qk_rows must be whole
+    columns). No weight permutation or padding; outputs in logical order.
+
+    fill_chunks=True: the L3 -> L2 fill is a loop of head_dim/m_input
+    sub-tile DMAs (one per m_input rows) instead of one whole-tile DMA, meant
+    to let the memtile hand sub-tiles to the core while the rest of the tile
+    streams in. MEASURED NO DIFFERENT (devq 552: 0.588 ms either way vs
+    matvec.py's 0.444; the memtile keeps one lock cycle per tile), which is
+    why production is the tagged-chunk form `_build_qkv_heads_gemv` (0.492).
+    Kept as the record of the study (results/o1-epilogue-20260822/).
+
+    Func signature: (A: [M, K], B: [K + 3*head_dim], OUT: [M]).
+    """
+    assert m % herd_m == 0, (m, herd_m)
+    rows_per_col = m // herd_m
+    assert rows_per_col % head_dim == 0, (rows_per_col, head_dim)
+    heads_per_col = rows_per_col // head_dim
+    assert head_dim % m_input == 0, (head_dim, m_input)
+    assert k % 64 == 0, k
+    for name, rows in (("n_q_rows", n_q_rows), ("n_qk_rows", n_qk_rows)):
+        assert rows % rows_per_col == 0, (name, rows, rows_per_col)
+    n_q_cols = n_q_rows // rows_per_col
+    n_qk_cols = n_qk_rows // rows_per_col
+    tile_m = head_dim
+    n_chunks = tile_m // m_input
+    tail = 3 * head_dim
+    b_total = k + tail
+
+    from air.dialects.func import CallOp
+    from air.ir import StringAttr, UnitAttr, FloatAttr
+
+    xrt_dtype = type_mapper(np_dtype)
+    f32 = F32Type.get()
+    memrefTyA = MemRefType.get([m, k], xrt_dtype)
+    memrefTyB = MemRefType.get([b_total], xrt_dtype)
+    memrefTyOut = MemRefType.get([m], xrt_dtype)
+    l2_mem_space = IntegerAttr.get(T.i32(), MemorySpace.L2)
+    l2MemrefTyA = MemRefType.get([herd_m, tile_m, k], xrt_dtype, memory_space=l2_mem_space)
+    l2MemrefTyOut = MemRefType.get([herd_m, tile_m], xrt_dtype, memory_space=l2_mem_space)
+    l1_mem_space = IntegerAttr.get(T.i32(), MemorySpace.L1)
+    l1MemrefTyA = MemRefType.get([m_input, k], xrt_dtype, memory_space=l1_mem_space)
+    l1MemrefTyB = MemRefType.get([b_total], xrt_dtype, memory_space=l1_mem_space)
+    l1MemrefTyHead = MemRefType.get([tile_m], xrt_dtype, memory_space=l1_mem_space)
+    l1MemrefTyScratch = MemRefType.get([tail], xrt_dtype, memory_space=l1_mem_space)
+
+    chunk_func = FuncOp(
+        "qkv_heads_chunk_scratch_bf16",
+        ([T.i32(), T.i32(), T.i32(), l1MemrefTyA, l1MemrefTyB, l1MemrefTyHead, l1MemrefTyScratch], []),
+        visibility="private",
+    )
+    epilogue_func = FuncOp(
+        "qknorm_rope_head_bf16",
+        ([l1MemrefTyHead, l1MemrefTyScratch, l1MemrefTyHead, f32, T.i32()], []),
+        visibility="private",
+    )
+    for func in (chunk_func, epilogue_func):
+        func.attributes["link_with"] = StringAttr.get(link_with)
+        func.attributes["llvm.emit_c_interface"] = UnitAttr.get()
+
+    @FuncOp.from_py_func(memrefTyA, memrefTyB, memrefTyOut)
+    def matvec_heads(arg_a, arg_b, arg_out):
+        @launch(operands=[arg_a, arg_b, arg_out], sizes=[heads_per_col, 1])
+        def launch_body(l_ivx, l_ivy, l_sx, l_sy, l3_a, l3_b, l3_out):
+            @segment(name="qkvh_seg", operands=[l_ivx, l3_a, l3_b, l3_out])
+            def segment_body(ivx_s, l3_a_s, l3_b_s, l3_out_s):
+                ivx_map = AffineMap.get(
+                    0, 1, [AffineExpr.get_mul(AffineSymbolExpr.get(0), AffineConstantExpr.get(tile_m))]
+                )
+                launch_offset_m = affine_apply(ivx_map, [ivx_s])
+                l2_a = AllocOp(l2MemrefTyA, [], [])
+                l2_out = AllocOp(l2MemrefTyOut, [], [])
+                l1_a = AllocOp(l1MemrefTyA, [], [])
+                l1_b = AllocOp(l1MemrefTyB, [], [])
+                l1_c = AllocOp(l1MemrefTyHead, [], [])
+                l1_scratch = AllocOp(l1MemrefTyScratch, [], [])
+                l1_out = AllocOp(l1MemrefTyHead, [], [])
+
+                if fill_chunks:
+                    # head rows of every column, m_input rows at a time
+                    for j in range_(0, n_chunks):
+                        sub_map = AffineMap.get(
+                            0, 2,
+                            [AffineExpr.get_add(
+                                AffineSymbolExpr.get(0),
+                                AffineExpr.get_mul(AffineSymbolExpr.get(1), AffineConstantExpr.get(m_input)))],
+                        )
+                        row_off = affine_apply(sub_map, [launch_offset_m, j])
+                        j_off = affine_apply(
+                            AffineMap.get(0, 1, [AffineExpr.get_mul(AffineSymbolExpr.get(0), AffineConstantExpr.get(m_input))]),
+                            [j],
+                        )
+                        dma_memcpy_nd(
+                            l2_a,
+                            l3_a_s,
+                            dst_offsets=[0, j_off, 0],
+                            dst_sizes=[herd_m, m_input, k],
+                            dst_strides=[tile_m * k, k, 1],
+                            src_offsets=[0, row_off, 0],
+                            src_sizes=[herd_m, m_input, k],
+                            src_strides=[rows_per_col * k, k, 1],
+                        )
+                        yield_([])
+                else:
+                    dma_memcpy_nd(
+                        l2_a,
+                        l3_a_s,
+                        src_offsets=[0, launch_offset_m, 0],
+                        src_sizes=[herd_m, tile_m, k],
+                        src_strides=[rows_per_col * k, k, 1],
+                    )
+
+                @herd(
+                    name="qkvh_herd",
+                    sizes=[herd_m, 1],
+                    operands=[l1_a, l1_b, l1_c, l1_scratch, l1_out, l2_a, l3_b_s, l2_out],
+                )
+                def herd_body(_tx, _ty, _sx, _sy, _l1_a, _l1_b, _l1_c, _l1_scratch, _l1_out, _l2_a, _l3_b, _l2_out):
+                    for j_m in range_(0, n_chunks):
+                        j_m_offset = affine_apply(
+                            AffineMap.get(0, 1, [AffineExpr.get_mul(AffineSymbolExpr.get(0), AffineConstantExpr.get(m_input))]),
+                            [j_m],
+                        )
+                        dma_memcpy_nd(_l1_b, _l3_b, src_offsets=[], src_sizes=[b_total], src_strides=[1])
+                        dma_memcpy_nd(
+                            _l1_a, _l2_a,
+                            src_offsets=[_tx, j_m_offset, 0],
+                            src_sizes=[1, m_input, k],
+                            src_strides=[tile_m * k, k, 1],
+                        )
+                        row_offset_i32 = arith.index_cast(T.i32(), j_m_offset)
+                        m_const = arith.ConstantOp(IntegerAttr.get(T.i32(), m_input), None)
+                        k_const = arith.ConstantOp(IntegerAttr.get(T.i32(), k), None)
+                        CallOp(chunk_func, [m_const, k_const, row_offset_i32, _l1_a, _l1_b, _l1_c, _l1_scratch])
+                        yield_([])
+                    two = arith.ConstantOp(IntegerAttr.get(T.i32(), 2), None)
+                    c_q = arith.ConstantOp.create_index(n_q_cols)
+                    c_qk = arith.ConstantOp.create_index(n_qk_cols)
+                    is_q = arith.extui(T.i32(), arith.cmpi(arith.CmpIPredicate.ult, _tx, c_q))
+                    is_qk = arith.extui(T.i32(), arith.cmpi(arith.CmpIPredicate.ult, _tx, c_qk))
+                    kind = arith.subi(arith.subi(two, is_qk), is_q)
+                    eps_c = arith.ConstantOp(f32, FloatAttr.get(f32, eps))
+                    CallOp(epilogue_func, [_l1_c, _l1_scratch, _l1_out, eps_c, kind])
+                    dma_memcpy_nd(
+                        _l2_out, _l1_out,
+                        dst_offsets=[_tx, 0], dst_sizes=[1, tile_m], dst_strides=[tile_m, 1],
+                        src_offsets=[], src_sizes=[tile_m], src_strides=[1],
+                    )
+
+                herd_body.attributes["link_with"] = StringAttr.get(link_with)
+
+                dma_memcpy_nd(
+                    l3_out_s, l2_out,
+                    dst_offsets=[0, launch_offset_m], dst_sizes=[herd_m, tile_m], dst_strides=[rows_per_col, 1],
+                    src_offsets=[0, 0], src_sizes=[herd_m, tile_m], src_strides=[tile_m, 1],
+                )
+                for buf in (l2_a, l2_out, l1_a, l1_b, l1_c, l1_scratch, l1_out):
+                    DeallocOp(buf)
+
+
+def qkv_heads_store_perm(m, herd_m, tile_m):
+    """Index array P with A_stored = A_logical[P]: stored row
+    i*herd_m*tile_m + tx*tile_m + r = logical row tx*rows_per_col + i*tile_m + r."""
+    rows_per_col = m // herd_m
+    n_iter = rows_per_col // tile_m
+    perm = np.empty(m, dtype=np.int64)
+    for i in range(n_iter):
+        for tx in range(herd_m):
+            base = i * herd_m * tile_m + tx * tile_m
+            perm[base:base + tile_m] = tx * rows_per_col + i * tile_m + np.arange(tile_m)
+    return perm
+
+
+def qkv_heads_slot_gather(m, herd_m, head_dim, tile_m=8):
+    """Index array G with out_logical = slots[G] for out_slots=True: head h of
+    column tx is final in the slot of its last chunk's iteration
+    (h*chunks_per_head + chunks_per_head - 1), at [tx*head_dim, +head_dim)."""
+    rows_per_col = m // herd_m
+    cph = head_dim // tile_m
+    g = np.empty(m, dtype=np.int64)
+    for tx in range(herd_m):
+        for h in range(rows_per_col // head_dim):
+            it = h * cph + cph - 1
+            lo = tx * rows_per_col + h * head_dim
+            g[lo:lo + head_dim] = it * herd_m * head_dim + tx * head_dim + np.arange(head_dim)
+    return g
+
+
+def qkv_heads_row_map(m, herd_m, head_dim, tile_m=8):
+    """The logical row -> (column, launch iteration) mapping of
+    `_build_qkv_heads_gemv`, as (column, iteration, row_lo, row_hi) blocks."""
+    rows_per_col = m // herd_m
+    blocks = []
+    for tx in range(herd_m):
+        for i in range(rows_per_col // tile_m):
+            lo = tx * rows_per_col + i * tile_m
+            blocks.append((tx, i, lo, lo + tile_m))
+    return blocks
+
+
+def qkv_heads_augment_weight(w_logical, q_rows, qk_rows, head_dim, herd_m=8, tile_m=8):
+    """The static A of `_build_qkv_heads_gemv` from the logical [wq; wk; wv]
+    (M, K): rows permuted iteration-major and padded by K_PAD with
+    [tag, kind, 0...] per row (tag = the row's chunk index within its head,
+    kind = 0 Q / 1 K / 2 V). Done once per layer by the host."""
+    m, k = w_logical.shape
+    perm = qkv_heads_store_perm(m, herd_m, tile_m)
+    aug = np.zeros((m, k + K_PAD), dtype=bfloat16)
+    aug[:, :k] = np.asarray(w_logical, dtype=bfloat16)[perm]
+    logical = perm  # logical row of each stored row
+    tag = (logical % head_dim) // tile_m
+    kind = np.where(logical < q_rows, 0, np.where(logical < qk_rows, 1, 2))
+    aug[:, k] = tag.astype(bfloat16)
+    aug[:, k + 1] = kind.astype(bfloat16)
+    return np.ascontiguousarray(aug)
+
+
+def build_rms_qkv_qknorm_rope_gemv2_module(
+    emb_dim,
+    q_dim,
+    kv_dim,
+    n_heads,
+    n_kv_heads,
+    head_dim,
+    tile_m=None,
+    herd_m=None,
+    qknorm_eps=1e-6,
+    link_with=None,
+):
+    """2-launch decode ELF (doc 57 O1, second half): RMSNorm, then ONE GEMV
+    over [wq; wk; wv] whose columns own whole heads and whose cores apply
+    QK-norm + RoPE to the Q|K heads in L1 before the head leaves the core
+    (`_build_qkv_heads_gemv`, kernel mv_heads.cc). The 4-launch form's
+    separate QK-norm and RoPE launches -- two ~107 us boundaries -- are gone,
+    and so are its qk_n intermediate and the 24x-tiled LUT.
+
+    5 args:
+    %arg0  x_in   (emb_dim,)
+    %arg1  norm_w (emb_dim,)                         static
+    %arg2  bvec   (emb_dim + 3*head_dim,)            [normed | lut | q_norm | k_norm]:
+                                                     the RMSNorm launch writes [0, emb_dim);
+                                                     the host fills the tail every call
+    %arg3  wqkv_aug (q_dim+2*kv_dim, emb_dim+K_PAD)  static: `qkv_heads_augment_weight`
+                                                     of the row-packed [wq; wk; wv]
+    %arg4  out    (qkv2_out_total,)                  per-iteration head slots; the host's
+                                                     `qkv2_gather` reads q_roped | k_roped | v
+    """
+    import shared.builders.rms_gemv_rope_multi as rgr
+    from shared.infra.stitching import stitch_elf, KernelSlice, FuncArg
+    from shared.infra.external_kernels import mv_heads_object_name
+
+    assert q_dim == n_heads * head_dim
+    assert kv_dim == n_kv_heads * head_dim
+    qkv_dim = q_dim + 2 * kv_dim
+    b_total = emb_dim + 3 * head_dim
+    if link_with is None:
+        link_with = mv_heads_object_name(head_dim)
+    tile_m = QKV2_TILE_M if tile_m is None else tile_m
+    herd_m = QKV2_HERD_M if herd_m is None else herd_m
+    assert (tile_m, herd_m) == (QKV2_TILE_M, QKV2_HERD_M), "the host hooks (qkv2_*) assume these"
+
+    _saved_eps = rgr.EPS
+    rgr.EPS = qknorm_eps
+    try:
+        print("  [1/2] RMSNorm (decode 1D, eps=%g, into the packed B head)..." % qknorm_eps)
+        rms_ir = str(rgr._build_rms_1d(emb_dim, bfloat16, 16, out_total=b_total))
+    finally:
+        rgr.EPS = _saved_eps
+
+    print(
+        f"  [2/2] head-aligned QKV GEMV M={qkv_dim} K={emb_dim}(+{K_PAD} pad) "
+        f"tile_m={tile_m} (+ in-core QK-norm/RoPE on the Q|K heads)..."
+    )
+    gemv_ir = str(
+        _build_qkv_heads_gemv(
+            qkv_dim, emb_dim, head_dim, bfloat16,
+            tile_m=tile_m, herd_m=herd_m, eps=qknorm_eps, link_with=link_with,
+        )
+    )
+
+    base_args = [
+        FuncArg("%arg0", f"memref<{emb_dim}xbf16>"),
+        FuncArg("%arg1", f"memref<{emb_dim}xbf16>"),
+        FuncArg("%arg2", f"memref<{b_total}xbf16>"),
+        FuncArg("%arg3", f"memref<{qkv_dim}x{emb_dim + K_PAD}xbf16>"),
+        FuncArg("%arg4", f"memref<{qkv2_out_total(qkv_dim, head_dim)}xbf16>"),
+    ]
+    slices = [
+        KernelSlice(rms_ir, "r", {0: 0, 1: 1, 2: 2}, private_from=False),
+        # GEMV func args: {0: A (wqkv_aug), 1: B (packed bvec), 2: OUT}.
+        KernelSlice(gemv_ir, "qh", {0: 3, 1: 2, 2: 4}),
+    ]
+    module = stitch_elf(
+        "rms_qkv_qknorm_rope_gemv",
+        base_args,
+        slices,
+        extra_externs={"@zero_vectorized_bf16", "@qkv_heads_chunk_bf16"},
+        debug_dump_path="/tmp/debug_rms_qkv_qknorm_rope_gemv2.mlir",
+    )
+    print(
+        f"  rms_qkv_qknorm_rope_gemv2 module: {len(str(module).splitlines())} lines, "
+        f"2 launches, parsed OK"
+    )
+    return module
+
+
+# ---------------------------------------------------------------------------
+# The 2-launch form's host-side hooks (what shared.infra.decode_qkv4's
+# prep_weights_2 / call_args_2 / split_outputs_2 use). They describe the GEMV
+# form `build_rms_qkv_qknorm_rope_gemv2_module` builds: the tagged-chunk GEMV
+# (`_build_qkv_heads_gemv`, tile_m 8, iteration-major storage with the
+# [tag, kind] row padding, per-iteration output slots).
+# ---------------------------------------------------------------------------
+
+QKV2_TILE_M = 8
+QKV2_HERD_M = 8
+
+
+def qkv2_prep_weight(w_logical, q_dim, qk_dim, head_dim):
+    """Static weight of the 2-launch ELF from the logical [wq; wk; wv] (M, K)."""
+    return qkv_heads_augment_weight(w_logical, q_dim, qk_dim, head_dim, QKV2_HERD_M, QKV2_TILE_M)
+
+
+def qkv2_out_total(qkv_dim, head_dim):
+    """Length of the ELF's output arg (per-iteration head slots)."""
+    rows_per_col = qkv_dim // QKV2_HERD_M
+    return (rows_per_col // QKV2_TILE_M) * QKV2_HERD_M * head_dim
+
+
+def qkv2_gather(qkv_dim, head_dim):
+    """Index array mapping the output arg to q_roped | k_roped | v (or None)."""
+    return qkv_heads_slot_gather(qkv_dim, QKV2_HERD_M, head_dim, QKV2_TILE_M)

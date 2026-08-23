@@ -15,7 +15,7 @@ Measured on NPU2 (AIE2P), `make profile N_TOKENS=32`, 2026-06-28.
 | Phase | Measured | Notes |
 |-------|----------|-------|
 | Prefill / TTFT (2048 tokens) | **1.52 s wall** | head_dim=128 → host head-first FA seq↔head transpose included in wall; NPU-kernel time is lower (~1.29 s) |
-| Decode / TPOT (steady-state) | **13.0 tok/s** (77 ms/token, 2026-08-21, Turbo recorded; 11.7 in 2026-06) | 28 layers; per token: 28 × (`rms_qkv_qknorm_rope_gemv4` 0.62 + `o_gemv_ffn` 1.53 + host attention 0.11 ms) + `lm_head_gemv` 7.6 ms; 206 `air.launch` boundaries at ~107 µs each are ~29 % of it |
+| Decode / TPOT (steady-state) | **13.4–13.5 tok/s** (74–75 ms/token, 2026-08-23, Turbo recorded; 13.0 on 08-21, 11.7 in 2026-06) | 28 layers; per token: 28 × (`rms_qkv_qknorm_rope_gemv2` 0.49 + `o_gemv_ffn` 1.6 + host attention 0.11 ms) + `lm_head_gemv` 7.7 ms; 150 `air.launch` boundaries at ~107 µs each are ~22 % of it |
 
 ## Model Config
 
