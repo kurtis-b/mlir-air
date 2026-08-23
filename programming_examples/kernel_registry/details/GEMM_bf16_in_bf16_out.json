@@ -6003,6 +6003,276 @@
         "high": "fused-cast",
         "low": "direct"
       }
+    },
+    {
+      "M": 512,
+      "K": 1024,
+      "N": 2048,
+      "used_by": "transformer-layer study qwen3_0_6b q_proj (seq=512)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 2341,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 3862,
+          "mean_rel_L1": 0.0095,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4415,
+          "mean_rel_L1": 0.011,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 1024,
+      "K": 1024,
+      "N": 2048,
+      "used_by": "transformer-layer study qwen3_0_6b q_proj (seq=1024)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 3309,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4007,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4983,
+          "mean_rel_L1": 0.011,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 512,
+      "K": 2048,
+      "N": 1024,
+      "used_by": "transformer-layer study qwen3_0_6b o_proj_q (seq=512)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 2764,
+          "mean_rel_L1": 0.0097,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4515,
+          "mean_rel_L1": 0.0093,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4794,
+          "mean_rel_L1": 0.013,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 1024,
+      "K": 2048,
+      "N": 1024,
+      "used_by": "transformer-layer study qwen3_0_6b o_proj_q (seq=1024)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 3910,
+          "mean_rel_L1": 0.0097,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4751,
+          "mean_rel_L1": 0.0093,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5253,
+          "mean_rel_L1": 0.013,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 512,
+      "K": 3072,
+      "N": 1024,
+      "used_by": "transformer-layer study qwen3_0_6b ffn_down (seq=512)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 3474,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5010,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5162,
+          "mean_rel_L1": 0.014,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
+    },
+    {
+      "M": 1024,
+      "K": 3072,
+      "N": 1024,
+      "used_by": "transformer-layer study qwen3_0_6b ffn_down (seq=1024)",
+      "methods": {
+        "fused-cast": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 4677,
+          "mean_rel_L1": 0.0099,
+          "tier": "high"
+        },
+        "drain": {
+          "tile": {
+            "tile_m": 32,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5148,
+          "mean_rel_L1": 0.0094,
+          "tier": "high"
+        },
+        "direct": {
+          "tile": {
+            "tile_m": 64,
+            "tile_k_l2": 256,
+            "tile_k_l1": 32,
+            "tile_n": 128
+          },
+          "gflops": 5465,
+          "mean_rel_L1": 0.014,
+          "tier": "low"
+        }
+      },
+      "best": {
+        "high": "drain",
+        "low": "direct"
+      }
     }
   ]
 }

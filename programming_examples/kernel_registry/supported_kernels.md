@@ -305,6 +305,37 @@ high-precision `atol` is K-scaled here, in
 
 <!-- END transformer-layer-sweep baseline_1024 -->
 
+<!-- BEGIN transformer-layer-sweep qwen3_0_6b -->
+### Transformer-layer execution study — `qwen3_0_6b` sweep
+
+The projection GEMMs the transformer-layer execution study's case matrix needs, swept
+across the full 9-point sequence ladder. Full per-candidate detail, and why the
+high-precision `atol` is K-scaled here, in
+[`details/GEMM_bf16_in_bf16_out.md`](details/GEMM_bf16_in_bf16_out.md).
+
+**`q_proj`** — `K = 1024` → `N = 2048`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 512 | 512×1024×2048 | 2341 | **3862** | 4415 | 32/256/32/128 (8×4) | 9.5e-3 / 1.1e-2 | ✅ |
+| 1024 | 1024×1024×2048 | 3309 | **4007** | 4983 | 32/256/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+
+**`o_proj_q`** — `K = 2048` → `N = 1024`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 512 | 512×2048×1024 | 2764 | **4515** | 4794 | 32/256/32/128 (8×4) | 9.3e-3 / 1.3e-2 | ✅ |
+| 1024 | 1024×2048×1024 | 3910 | **4751** | 5253 | 32/256/32/128 (8×4) | 9.3e-3 / 1.3e-2 | ✅ |
+
+**`ffn_down`** — `K = 3072` → `N = 1024`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 512 | 512×3072×1024 | 3474 | **5010** | 5162 | 32/256/32/128 (8×4) | 9.4e-3 / 1.4e-2 | ✅ |
+| 1024 | 1024×3072×1024 | 4677 | **5148** | 5465 | 32/256/32/128 (8×4) | 9.4e-3 / 1.4e-2 | ✅ |
+
+<!-- END transformer-layer-sweep qwen3_0_6b -->
+
 ---
 
 ## GEMV — tested shapes

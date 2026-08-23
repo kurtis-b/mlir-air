@@ -153,7 +153,7 @@ for _p in (str(_PROJ_ROOT), str(_EXAMPLE_DIR), str(_HERE)):
 
 import registry_writer  # noqa: E402
 from sweep_families import (  # noqa: E402
-    FAMILY_HIDDEN,
+    FAMILIES,
     METHODS,
     ROLES,
     SEQ_LADDER,
@@ -544,7 +544,7 @@ def main():
     parser.add_argument(
         "--family",
         default="baseline_768",
-        choices=sorted(FAMILY_HIDDEN),
+        choices=list(FAMILIES),
         help="which width of the case matrix to sweep",
     )
     parser.add_argument("--role", action="append", choices=ROLES)

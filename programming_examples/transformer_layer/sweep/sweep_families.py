@@ -104,7 +104,19 @@ ROLE_KN_MULTIPLES = {
     "ffn_down": (4, 1),
     "o_proj": (1, 1),
 }
-ROLES = ("qkv_proj", "ffn_up", "ffn_down", "o_proj")
+ROLES = ("qkv_proj", "ffn_up", "ffn_down", "o_proj", "q_proj", "o_proj_q")
+
+# Model families `[2026-08-23]` (doc 56 H1a): a model's prefill GEMMs whose (K, N)
+# are not multiples of one hidden size -- Qwen3-0.6B's decoupled head_dim makes
+# Q (1024 -> 2048), O (2048 -> 1024) and down (3072 -> 1024) three shapes no
+# baseline family has; K/V (1024 -> 1024) and gate/up (1024 -> 3072) are
+# baseline_1024's o_proj and qkv_proj. role -> absolute (K, N); M is the
+# sequence length, and the ladder is the model runner's M buckets.
+MODEL_FAMILY_ROLE_KN = {
+    "qwen3_0_6b": {"q_proj": (1024, 2048), "o_proj_q": (2048, 1024), "ffn_down": (3072, 1024)},
+}
+MODEL_FAMILY_SEQ_LADDER = (512, 1024, 2048)
+FAMILIES = tuple(sorted(FAMILY_HIDDEN)) + tuple(sorted(MODEL_FAMILY_ROLE_KN))
 
 # The three bf16-out GEMM methods the example harness exposes, and the two facts
 # about each that the sweep cannot choose: the tile_m the method forces, and the
@@ -247,14 +259,32 @@ class Candidate:
 
 
 def shapes_for_family(family, seq_ladder=SEQ_LADDER, roles=ROLES):
-    """Every (role, seq) shape one family contributes, in a stable order."""
+    """Every (role, seq) shape one family contributes, in a stable order.
+
+    A model family (``MODEL_FAMILY_ROLE_KN``) contributes its own roles over
+    ``MODEL_FAMILY_SEQ_LADDER`` unless the caller narrows either; the baseline
+    families keep the case matrix's ladder and role multiples.
+    """
+    if family in MODEL_FAMILY_ROLE_KN:
+        role_kn = MODEL_FAMILY_ROLE_KN[family]
+        if seq_ladder is SEQ_LADDER:
+            seq_ladder = MODEL_FAMILY_SEQ_LADDER
+        if roles is ROLES:
+            roles = tuple(role_kn)
+        shapes = []
+        for role in roles:
+            if role not in role_kn:
+                continue
+            for seq in seq_ladder:
+                shapes.append(ShapeSpec(family=family, role=role, seq=seq, M=seq, K=role_kn[role][0], N=role_kn[role][1]))
+        return shapes
     if family not in FAMILY_HIDDEN:
-        raise KeyError(
-            f"unknown family {family!r}; known families: {sorted(FAMILY_HIDDEN)}"
-        )
+        raise KeyError(f"unknown family {family!r}; known families: {list(FAMILIES)}")
     hidden = FAMILY_HIDDEN[family]
     shapes = []
     for role in roles:
+        if role not in ROLE_KN_MULTIPLES:
+            continue
         k_mult, n_mult = ROLE_KN_MULTIPLES[role]
         for seq in seq_ladder:
             shapes.append(

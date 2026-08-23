@@ -66,6 +66,13 @@ ROLE_BUILDERS = {
     "ffn_up": "build_ffn_module",
     "ffn_down": "build_ffn_module",
     "o_proj": "build_mha_out_proj_module",
+    # `[2026-08-23]` the qwen3_0_6b model family (doc 56 H1a): the llms builders
+    # resolve through `gemm_registry_config(M, K, N)` directly -- the Q GEMM in
+    # `rms_qkv_qknorm_rope_multi.build_rms_qkv_qknorm_rope_module` (K = emb,
+    # N = q_dim) and the O GEMM in `qwen3_0_6b_prefill.build_o_ffn_qwen_module`
+    # (K = q_dim, N = emb).
+    "q_proj": "build_rms_qkv_qknorm_rope_module",
+    "o_proj_q": "build_o_ffn_qwen_module",
 }
 
 
@@ -98,6 +105,8 @@ def builder_gemm_spec(shape):
             f"this shape be checked against the generic lookup"
         )
     builder = ROLE_BUILDERS[shape.role]
+    if shape.role in ("q_proj", "o_proj_q"):
+        return builder, _llms_gemm_registry_config(shape.M, shape.K, shape.N)
     if shape.role == "qkv_proj":
         # emb_dim is K; the builder derives N = 3 * emb_dim itself.
         return builder, qkv_gemm_spec(shape.M, shape.K)[0]
@@ -108,6 +117,27 @@ def builder_gemm_spec(shape):
         # relative to the builder's (emb_dim, ffn_dim) argument order.
         return builder, ffn_gemm_specs(shape.M, shape.N, shape.K)[1]
     return builder, o_proj_gemm_spec(shape.M, shape.K)[0]
+
+
+def _llms_gemm_registry_config(m, k, n):
+    """The llms builders' resolver (`shared/builders/gemm_builder.py`), imported
+    the way those builders import it: with `programming_examples/llms` on the
+    path, ahead of this example's `builders` package (see the module note in
+    `registry_sweep.py` on the trailing-colon PYTHONPATH)."""
+    import sys
+    from pathlib import Path
+
+    llms = str(Path(__file__).resolve().parents[2] / "llms")
+    if llms not in sys.path:
+        sys.path.insert(0, llms)
+    from shared.builders.gemm_builder import gemm_registry_config
+
+    spec = dict(gemm_registry_config(m, k, n, "bf16", "high"))
+    # The llms builders take the herd as a builder argument (8 x 4 throughout
+    # qwen3_0_6b_prefill.py), not from the spec; the check needs it.
+    spec.setdefault("herd_m", 8)
+    spec.setdefault("herd_n", 4)
+    return spec
 
 
 def verify_resolution(shapes):

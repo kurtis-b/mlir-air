@@ -448,6 +448,57 @@ ladder starting at 64:
 
 <!-- END transformer-layer-sweep baseline_1024 -->
 
+<!-- BEGIN transformer-layer-sweep qwen3_0_6b -->
+### Transformer-layer execution study — `qwen3_0_6b` sweep
+
+Written by `programming_examples/transformer_layer/sweep/registry_sweep.py`, which
+measures every candidate tiling for a shape and keeps the fastest that passes. **Bold**
+= the winner recorded in `best` for that tier. `—` = no legal candidate for that method
+at this shape; `❌` = every candidate for it failed.
+
+Two things differ from the model-deployment rows above, both forced by the sequence
+ladder starting at 64:
+
+- **`herd` is per-row.** `M % (tile_m × herd_m) == 0` cannot hold at `M = 64` with
+  `herd_m = 8` for either method's forced `tile_m`, so short-sequence rows carry a
+  per-method `herd` in the JSON that overrides the file-level `8×4`. The herd used is in
+  the table's tile column.
+- **The high-precision `atol` is carried forward at constant strictness, not held
+  constant.** The harness scales its inputs by `1/sqrt(K)`, so the output magnitude —
+  and the absolute error of a fixed-relative-precision datapath with it — goes as
+  `K^-1/2`. The published `atol = 1.5e-3` is that rule evaluated at `K = 8192`; at this
+  family's `K = 768` it is a 3.3× *tightening*, which is exactly the "harness tolerance
+  edge, not a datapath failure" already recorded for Qwen3-0.6B Gate/Up and
+  Qwen2.5-0.5B Gate/Up above. The sweep therefore checks the high tier at
+  `1.5e-3 × sqrt(8192 / K)`, which reproduces the registry's own ~2.5× design margin at
+  every K (measured: 2.5× at K=8192, 2.9× at K=3072, 2.8× at K=768). `rtol` is the
+  canonical `1.6e-2` unchanged, the low tier's `4e-3` is unchanged, and every run must
+  additionally land inside its tier's `mean_rel_L1` band — a scale-free check the
+  example harness does not make at all.
+
+**`q_proj`** — `K = 1024` → `N = 2048`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 512 | 512×1024×2048 | 2341 | **3862** | 4415 | 32/256/32/128 (8×4) | 9.5e-3 / 1.1e-2 | ✅ |
+| 1024 | 1024×1024×2048 | 3309 | **4007** | 4983 | 32/256/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+
+**`o_proj_q`** — `K = 2048` → `N = 1024`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 512 | 512×2048×1024 | 2764 | **4515** | 4794 | 32/256/32/128 (8×4) | 9.3e-3 / 1.3e-2 | ✅ |
+| 1024 | 1024×2048×1024 | 3910 | **4751** | 5253 | 32/256/32/128 (8×4) | 9.3e-3 / 1.3e-2 | ✅ |
+
+**`ffn_down`** — `K = 3072` → `N = 1024`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 512 | 512×3072×1024 | 3474 | **5010** | 5162 | 32/256/32/128 (8×4) | 9.4e-3 / 1.4e-2 | ✅ |
+| 1024 | 1024×3072×1024 | 4677 | **5148** | 5465 | 32/256/32/128 (8×4) | 9.4e-3 / 1.4e-2 | ✅ |
+
+<!-- END transformer-layer-sweep qwen3_0_6b -->
+
 ## How to reproduce (correctness + performance, one command)
 
 `make run` drives `run.py --compile-mode compile-and-run` (correctness + `--perf-iters` timing in one invocation). Example: the 2048×8192×2048 (Down) row.
