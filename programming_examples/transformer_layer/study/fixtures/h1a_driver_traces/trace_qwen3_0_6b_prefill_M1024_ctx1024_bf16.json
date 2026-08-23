@@ -1,0 +1,115 @@
+{
+ "model_id": "qwen3_0_6b",
+ "case_id": "qwen3_0_6b/prefill/M1024/ctx1024/bf16",
+ "phase": "prefill",
+ "M": 1024,
+ "context_end": 1024,
+ "scope": "prefill",
+ "trace_samples": 3,
+ "trace": {
+  "kernels": {
+   "rms_qkv_qknorm_rope": {
+    "calls": 84,
+    "n_written": 84,
+    "n_readback": 252,
+    "bytes_written": 176160768,
+    "bytes_readback": 704643072,
+    "kernel_ms": 420.98538763821125,
+    "sync_ms": 29.19510833453387
+   },
+   "flash_attn": {
+    "calls": 84,
+    "n_written": 336,
+    "n_readback": 84,
+    "bytes_written": 1056964608,
+    "bytes_readback": 352321536,
+    "kernel_ms": 688.9586569741368,
+    "sync_ms": 66.87055539805442
+   },
+   "o_ffn_qwen": {
+    "calls": 84,
+    "n_written": 168,
+    "n_readback": 84,
+    "bytes_written": 528482304,
+    "bytes_readback": 176160768,
+    "kernel_ms": 626.7651951638982,
+    "sync_ms": 41.39280295930803
+   },
+   "lm_head_gemv": {
+    "calls": 3,
+    "n_written": 3,
+    "n_readback": 30,
+    "bytes_written": 6144,
+    "bytes_readback": 911616,
+    "kernel_ms": 23.00747693516314,
+    "sync_ms": 0.40207605343312025
+   }
+  },
+  "cpu": {
+   "embed_lookup": {
+    "calls": 3,
+    "ms": 1.5277930069714785
+   },
+   "kv_cache_extract": {
+    "calls": 84,
+    "ms": 39.951050537638366
+   },
+   "final_rms_norm": {
+    "calls": 3,
+    "ms": 0.7814049022272229
+   }
+  }
+ },
+ "launch_counts": {
+  "rms_qkv_qknorm_rope": {
+   "air_launches": 8,
+   "herd_launches": 14
+  },
+  "o_ffn_qwen": {
+   "air_launches": 12,
+   "herd_launches": 20
+  },
+  "flash_attn": {
+   "air_launches": 1,
+   "herd_launches": 1
+  },
+  "rms_qkv_qknorm_rope_gemv2": {
+   "air_launches": 2,
+   "herd_launches": 2
+  },
+  "o_gemv_ffn": {
+   "air_launches": 3,
+   "herd_launches": 5
+  },
+  "lm_head_gemv": {
+   "air_launches": 10,
+   "herd_launches": 10
+  }
+ },
+ "plan_sha": "f06dddbc887838f16a2dfec72e11903d1966b2771605149f202481b2813bf217",
+ "forced": {
+  "o_ffn_qwen": "fused-cast",
+  "o_ffn": "fused-cast"
+ },
+ "measured_vector": {
+  "scope": "prefill",
+  "host_submissions": 85,
+  "runlist_entries": 85,
+  "air_launches": 598,
+  "herd_launches": 990,
+  "sync_boundaries": 347,
+  "bytes_transferred": 998550272
+ },
+ "predicted_vector": {
+  "scope": "prefill",
+  "host_submissions": 85,
+  "runlist_entries": 85,
+  "air_launches": 598,
+  "herd_launches": 990,
+  "sync_boundaries": 0,
+  "bytes_transferred": 0
+ },
+ "timed_artifact_sha": "16a61436ed4311cb0cb0375a6686e424f3b0f95b287c8b8a0788809c9a9cc198",
+ "devq_job_id": "574",
+ "recorded_utc": "2026-08-23T12:24:45.350754+00:00"
+}

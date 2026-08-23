@@ -110,6 +110,18 @@ def test_plan_hash_is_value_identity():
     b = plan(g, Workload("decode", 1, 512)).sha
     c = plan(g, Workload("decode", 1, 1024)).sha
     assert a == b and a != c
+    # `[2026-08-23]` a FORCED GEMM method is part of the plan: its hash, its
+    # source and its launch count (H1a review finding 4 -- the M=1024 Qwen
+    # o_ffn cascade is fused-cast where the registry best is drain: 12 launches, not 8)
+    wl = Workload("prefill", 1024, 1024)
+    best = plan(g, wl)
+    forced = plan(g, wl, forced={"o_ffn_qwen": "fused-cast"})
+    assert forced.sha != best.sha and forced.forced == {"o_ffn_qwen": "fused-cast"}
+    o = lambda p: [s for s in p.stages if s.name == "o_ffn_qwen"][0]
+    assert o(best).source == "measured" and o(forced).source == "forced"
+    if o(best).candidates["o_proj_L"] and o(best).candidates["o_proj_L"]["method"] == "drain":
+        assert o(best).launches == 8 and o(forced).launches == 12, (o(best).launches, o(forced).launches)
+    assert forced.source == "forced"
 
 
 def test_non_lean_form_splits_o_ffn():

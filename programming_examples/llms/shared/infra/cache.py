@@ -382,6 +382,18 @@ class KernelCache:
             json.dump(manifest, f, indent=2)
         self._log(f"Saved manifest with {len(manifest)} entries")
 
+    def _anchor(self, path):
+        """`[2026-08-23]` A manifest written from `cd build_peano` records
+        RELATIVE binary paths (`prefill_kernel_cache/x.elf`); they resolve only
+        from that cwd, and the backend loads them by the recorded path later.
+        Resolve such a path against the cache's parent when it is not found
+        from the cwd, so a caller anywhere binds the same bytes."""
+        p = Path(path)
+        if p.is_absolute() or p.exists():
+            return str(p)
+        anchored = self.cache_dir.parent / p
+        return str(anchored.resolve()) if anchored.exists() else str(p)
+
     def load_manifest(self):
         """Load artifact metadata from a previous compilation.
 
@@ -397,12 +409,13 @@ class KernelCache:
             manifest = json.load(f)
 
         for name, info in manifest.items():
-            binary_path = info["output_binary"]
+            binary_path = self._anchor(info["output_binary"])
+            insts = self._anchor(info["insts"]) if info.get("insts") else info.get("insts")
             if not Path(binary_path).exists():
                 print(f"  WARNING: cached binary not found: {binary_path}")
                 return False
             self.artifacts[name] = XRTCompileArtifact(
-                binary_path, info["kernel"], info["insts"]
+                binary_path, info["kernel"], insts
             )
             # Absent in manifests written before the dispatch vector landed; a
             # missing entry costs the launch counts, not the run.

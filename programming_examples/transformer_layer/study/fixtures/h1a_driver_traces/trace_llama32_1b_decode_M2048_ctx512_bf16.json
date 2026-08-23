@@ -1,0 +1,99 @@
+{
+ "model_id": "llama32_1b",
+ "case_id": "llama32_1b/decode/M2048/ctx512/bf16",
+ "phase": "decode",
+ "M": 2048,
+ "context_end": 512,
+ "scope": "decode_token",
+ "trace_samples": 32,
+ "trace": {
+  "kernels": {
+   "lm_head_gemv": {
+    "calls": 32,
+    "n_written": 32,
+    "n_readback": 256,
+    "bytes_written": 131072,
+    "bytes_readback": 8388608,
+    "kernel_ms": 438.4170452831313,
+    "sync_ms": 0.7330242078751326
+   },
+   "rms_gemv_rope": {
+    "calls": 512,
+    "n_written": 1536,
+    "n_readback": 1536,
+    "bytes_written": 4718592,
+    "bytes_readback": 3145728,
+    "kernel_ms": 437.1250629192218,
+    "sync_ms": 9.909847285598516
+   },
+   "o_gemv_ffn": {
+    "calls": 512,
+    "n_written": 1024,
+    "n_readback": 512,
+    "bytes_written": 4194304,
+    "bytes_readback": 2097152,
+    "kernel_ms": 1556.7714021308348,
+    "sync_ms": 9.484353358857334
+   }
+  },
+  "cpu": {
+   "decode_attention_cpu": {
+    "calls": 512,
+    "ms": 235.96836742945015
+   },
+   "final_rms_norm": {
+    "calls": 32,
+    "ms": 1.415512408129871
+   }
+  }
+ },
+ "launch_counts": {
+  "rms_gemms_rope": {
+   "air_launches": 7,
+   "herd_launches": 13
+  },
+  "o_ffn": {
+   "air_launches": 12,
+   "herd_launches": 20
+  },
+  "flash_attn": {
+   "air_launches": 1,
+   "herd_launches": 1
+  },
+  "rms_gemv_rope": {
+   "air_launches": 6,
+   "herd_launches": 6
+  },
+  "o_gemv_ffn": {
+   "air_launches": 3,
+   "herd_launches": 5
+  },
+  "lm_head_gemv": {
+   "air_launches": 8,
+   "herd_launches": 8
+  }
+ },
+ "plan_sha": "f5a51ce05eff760bff7d5c9bbd9c2bb8cca7eb24e98d045e0cfa879b994cda7b",
+ "forced": {},
+ "measured_vector": {
+  "scope": "decode_token",
+  "host_submissions": 33,
+  "runlist_entries": 33,
+  "air_launches": 152,
+  "herd_launches": 184,
+  "sync_boundaries": 153,
+  "bytes_transferred": 708608
+ },
+ "predicted_vector": {
+  "scope": "decode",
+  "host_submissions": 33,
+  "runlist_entries": 33,
+  "air_launches": 152,
+  "herd_launches": 184,
+  "sync_boundaries": 0,
+  "bytes_transferred": 0
+ },
+ "timed_artifact_sha": "c571a6158c4e86fb29931a1ef91d8b46ea894c549d7956e6fda047156497324d",
+ "devq_job_id": "574",
+ "recorded_utc": "2026-08-23T12:25:53.779777+00:00"
+}

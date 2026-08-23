@@ -106,33 +106,53 @@ class NpuRunner:
             bfloat16
         )
 
-        # `[2026-08-23]` LLMS_VERIFY_CACHE_ROOT lets the model study (doc 56 H1a,
-        # transformer_layer/study/run_model.py) run THIS gate against a prefill
-        # artifact set compiled at another M in its own directory; unset, the
-        # production `make verify` path is byte-for-byte what it was.
-        _cache_root = Path(os.environ.get("LLMS_VERIFY_CACHE_ROOT") or _THIS_DIR / "build_peano")
+        # `[2026-08-23]` THE TIMED ARTIFACT SET -- see llama32_1b/verify_adapter.py
+        # for the contract: LLMS_VERIFY_PREFILL_CACHE / LLMS_VERIFY_DECODE_CACHE
+        # are LOADED, never compiled; LLMS_VERIFY_PREFILL_M is the pad target;
+        # unset, production compiles into build_peano and pads to max_seq.
+        _prefill_dir = os.environ.get("LLMS_VERIFY_PREFILL_CACHE")
+        _decode_dir = os.environ.get("LLMS_VERIFY_DECODE_CACHE")
+        self.prefill_M = int(os.environ.get("LLMS_VERIFY_PREFILL_M") or max_seq)
+        if self.prefill_M > max_seq:
+            raise ValueError(f"LLMS_VERIFY_PREFILL_M {self.prefill_M} exceeds max_seq {max_seq}")
+        _cache_root = _THIS_DIR / "build_peano"
         self.prefill_cache = KernelCache(
-            str(_cache_root / "prefill_kernel_cache"), verbose=False
+            _prefill_dir or str(_cache_root / "prefill_kernel_cache"), verbose=False
         )
-        # `[2026-08-23]` LLMS_VERIFY_O_FFN_GEMM_METHOD: the model study gates an
-        # artifact set whose O+FFN cascade was compiled with a forced GEMM
-        # method (doc 56 H1a, M=1024); the gate must build the same artifact.
-        _forced = os.environ.get("LLMS_VERIFY_O_FFN_GEMM_METHOD") or None
-        compile_prefill_kernels(
-            self.prefill_cache, config, seq_len=max_seq, cpu_attn=self.cpu_attn,
-            **({"o_ffn_gemm_method": _forced} if _forced else {}),
-        )
+        if _prefill_dir:
+            if not self.prefill_cache.load_manifest():
+                raise RuntimeError(f"LLMS_VERIFY_PREFILL_CACHE {_prefill_dir}: no loadable manifest")
+            # the QKV ELF's scratch-arg layout, which only compiling used to set
+            from qwen3_0_6b_prefill import restore_scratch_layout
+
+            restore_scratch_layout(config, self.prefill_M)
+        else:
+            compile_prefill_kernels(
+                self.prefill_cache, config, seq_len=max_seq, cpu_attn=self.cpu_attn
+            )
         self.decode_cache = KernelCache(
-            str(_cache_root / "decode_kernel_cache"), verbose=False
+            _decode_dir or str(_cache_root / "decode_kernel_cache"), verbose=False
         )
-        compile_decode_kernels(self.decode_cache, config)
+        if _decode_dir:
+            if not self.decode_cache.load_manifest():
+                raise RuntimeError(f"LLMS_VERIFY_DECODE_CACHE {_decode_dir}: no loadable manifest")
+        else:
+            compile_decode_kernels(self.decode_cache, config)
+        self.loaded_artifacts = {
+            name: art.output_binary
+            for cache in (self.prefill_cache, self.decode_cache)
+            for name, art in cache.artifacts.items()
+        }
+        print(f"[verify-adapter] artifact set: prefill_M={self.prefill_M} max_seq={max_seq} "
+              f"{'LOADED' if _prefill_dir or _decode_dir else 'compiled'}: "
+              f"{sorted(self.loaded_artifacts.values())}")
 
         prepare_runtime(
             self.prefill_cache,
             self.decode_cache,
             weights,
             config,
-            max_seq,
+            self.prefill_M,
             self.rope_lut_bf16,
         )
 
@@ -141,10 +161,10 @@ class NpuRunner:
 
     def prefill(self, prompt_tokens: np.ndarray) -> PrefillRecord:
         eos = self._tokenizer.eos_token_id
-        if len(prompt_tokens) < self.max_seq:
-            padded = list(prompt_tokens) + [eos] * (self.max_seq - len(prompt_tokens))
+        if len(prompt_tokens) < self.prefill_M:
+            padded = list(prompt_tokens) + [eos] * (self.prefill_M - len(prompt_tokens))
         else:
-            padded = list(prompt_tokens)[: self.max_seq]
+            padded = list(prompt_tokens)[: self.prefill_M]
         prefill_token, logits_row, k_cache, v_cache, prompt_len = run_npu_prefill(
             padded,
             self.weights,
@@ -173,11 +193,11 @@ class NpuRunner:
         # Diagnosis-only: re-run the prefill layer loop capturing per-layer
         # ffn_out + final post-norm hidden state.
         cfg = self.config
-        if len(prompt_tokens) < self.max_seq:
-            pad = np.zeros(self.max_seq - len(prompt_tokens), dtype=prompt_tokens.dtype)
+        if len(prompt_tokens) < self.prefill_M:
+            pad = np.zeros(self.prefill_M - len(prompt_tokens), dtype=prompt_tokens.dtype)
             padded_diag = np.concatenate([prompt_tokens, pad])
         else:
-            padded_diag = prompt_tokens[: self.max_seq]
+            padded_diag = prompt_tokens[: self.prefill_M]
         x = self.weights.embed_table[padded_diag].astype(np.float32).astype(bfloat16)
         layer_intermediates = []
         for li in range(cfg.n_layers):

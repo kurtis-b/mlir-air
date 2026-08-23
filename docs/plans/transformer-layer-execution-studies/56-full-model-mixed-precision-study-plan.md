@@ -301,57 +301,81 @@ Not in H0 (by design): routing, ranking by latency, and anything that needs the 
 runner takes those. The `Plan` SHA is the artifact key H1a will write into every row.
 
 **`[2026-08-23]` H1a landed** (queue item 13; evidence `results/h1a-20260823/`, local: job scripts,
-`devq.sh log` copies, the two walk roots, the verify reports, `compare_walk1_walk2.txt`). What
-landed: the adapter seam `llms/shared/model_adapter.py` over the two drivers (`prepare` / `prefill` /
+`devq.sh log` copies, the walk roots, the verify reports, `compare_walk3_walk4.txt`; the one Codex
+review round is `review/verdict-13.json`, five blocking findings, all fixed below). What landed:
+the adapter seam `llms/shared/model_adapter.py` over the two drivers (`prepare` / `prefill` /
 `decode` / `dispatch_vector` / `verify_against_hf`, built on their own `Session` / `prepare_runtime` /
 `run_npu_prefill` / `run_npu_decode_step`; the per-model difference is one `ModelBinding` row, no
-fork; the dispatch vector is read off the drivers' `Profiler` per phase, and the same record is
-derived statically from a cache manifest + `Plan`); the runner `transformer_layer/study/run_model.py`
-+ `model_profiles.py` (`model-smoke`: both models, decode at ctx 512 / 1024 / 2048 on the shipped
-M = 2048 set, the Qwen3-0.6B kernel-scaling prefill curve at M 512 / 1024 / 2048; one worker
-process per artifact set, the production `make verify` command line after each set over the
-set's own prompts, a row `passed` only on its own prompt's verdict); **schema v3** (`study/schema.py`:
-the thirteen §3.6 columns appended last, per-layer dispatch columns refused in a model row, the
-seven-key vector validated strictly; `resume.row_key` / `compare_roots.KEY_FIELDS` gain the six
-model columns, the ledger gains `model_key`; `compare_roots` gates `tokens_per_second` at the
-mode's band and treats `plan_hash` as an identifier; the recorded v2 roots keep reading through
-`read_rows_compatible`, which `compare_roots` / `smoke_gate` / `manifest` now use — a v2 root
-against a v3 root fails on `schema_version` rather than comparing silently); the host suite
-615 → **652 in 30 modules** (`run_study_host_tests.lit`); and the planner brought to the
+fork; the dispatch vector is read off the drivers' `Profiler` per phase through ONE arithmetic,
+`dispatch_vector_from_trace`, and the same record is derived statically from a cache manifest +
+`Plan`); the runner `transformer_layer/study/run_model.py` + `model_profiles.py` (`model-smoke`:
+both models, decode at ctx 512 / 1024 / 2048 on the shipped M = 2048 set, the Qwen3-0.6B
+kernel-scaling prefill curve at M 512 / 1024 / 2048; one worker process per artifact set, the
+production `make verify` command line after each set over the set's own prompts); **schema v3**
+(`study/schema.py`: the thirteen §3.6 columns appended last, per-layer dispatch columns refused in
+a model row, the seven-key vector validated strictly; `resume.row_key` / `compare_roots.KEY_FIELDS`
+gain the six model columns, the ledger gains `model_key`; `compare_roots` gates `tokens_per_second`
+at the mode's band and treats `plan_hash` as an identifier; the recorded v2 roots keep reading
+through `read_rows_compatible`, which `compare_roots` / `smoke_gate` / `manifest` now use — a v2
+root against a v3 root fails on `schema_version` rather than comparing silently); the host suite
+615 → **656 in 30 modules** (`run_study_host_tests.lit`); and the planner brought to the
 items-11/12 kernels (decode QKV `rms_qkv_qknorm_rope_gemv2` at 2 launches, the Qwen head derived
 as 9 × 16384 + 4480; `PLAN: 10/10`, golden regenerated) so that **for both models and both phases
 every plan stage's launch count equals the cached manifest's** — qwen prefill 85 submissions /
-626 executed launches, decode 57 / 150 per token; llama 49 / 328 and 33 / 152 — pinned as a host
-test and reproduced by the measured vectors below to the launch.
+626 executed launches, decode 57 / 150 per token; llama 49 / 328 and 33 / 152.
 
-What the gate shows (devq 571 walk 1, devq 572 walk 2; HEAD `0f1cedd7`; Turbo observed before
+**What binds a `passed` row to what it measured** (the review's five findings, each now a clause
+with a host test and a live check): (1) the gate runs on EXACTLY the timed artifact set — the
+verify adapters LOAD the caches named by `LLMS_VERIFY_PREFILL_CACHE` / `_DECODE_CACHE` (never
+compile on that path; the production `make verify`, unset, is what it was), and the worker
+sha256s every ELF's bytes before timing, the runner again before and after the gate: all three
+must agree or every row of the set is `failed` with the mismatch; (2) a row is `passed` only if
+the gate process exited 0, wrote its own report into a fresh `mkdtemp` directory this call
+created, and that report says OK for the row's prompt; (3) the gate's prompt IS the timed prompt
+— a prefill rung's full M tokens (the 32 generation slots come from `LLMS_VERIFY_MAX_SEQ = M + 32`
+and `LLMS_VERIFY_PREFILL_M = M`, the pad target decoupled from the KV capacity) — and the row
+records the verified prompt length; (4) a forced GEMM method is part of the `Plan` and its hash
+(`plan(..., forced={"o_ffn_qwen": "fused-cast"})`, source `forced`, planner `h0.3`), so the
+M = 1024 rows hash as the plan that built their artifacts and the worker refuses a rung whose
+plan's launch counts differ from the manifest's; (5) the provenance test runs over RECORDED driver
+traces (`study/fixtures/h1a_driver_traces/`, five Profiler traces the production drivers produced
+on the device, devq 574) against a plan recomputed in the test, with a negative control, and the
+worker checks live on every rung that the driver's dispatch equals the plan's (per forward / per
+token) — `{'host_submissions': (measured, predicted)}` fails the row.
+
+What the gate shows (devq 575 walk 3, devq 576 walk 4; HEAD `3a1fd6c9`; Turbo observed before
 and after both; `complete: True` both; `compare_roots OK`, 0 warnings, 0 failures, identifier
-mismatches 0, tok/s drift median 2.6 % / p90 3.1 % qwen and 1.3 % / 1.6 % llama inside the 5 %
-warn band; the production gate PASS on every artifact set — three prompts at M = 2048, one at
-M = 1024, 32 tokens, top-5 set vs HF bf16 — recorded per row with its prompt index):
+mismatches 0, tok/s drift median 1.3 % / p90 2.7 % qwen and 1.1 % / 1.6 % llama inside the 5 %
+warn band; the production gate PASS on every artifact set, on the timed bytes, at the timed
+prompt lengths — 2048 / 480 / 992 / 2016 tokens at M = 2048, 1024 at M = 1024, 32 tokens, top-5
+set vs HF bf16; a walk takes ~4 min now that the gate loads instead of compiling). The first
+pass (devq 571 / 572, the same numbers within the band) is **superseded**: its gates recompiled
+the caches and verified M − 32-token prompts.
 
-| row (walk 1 / walk 2) | tok/s | ms per forward or token | device / sync / host-cpu ms | per-phase or per-token vector |
+| row (walk 3 / walk 4) | tok/s | ms per forward or token | device / sync / host-cpu ms | per-phase or per-token vector |
 |---|---|---|---|---|
-| Qwen3-0.6B prefill M = 2048, prompt 2048 (kernel-scaling) | **1359 / 1395** | 1507 / 1468 | 1184 / 79 / 40 | 85 submissions, 626 launches, 1018 herds, 347 syncs, 1997 MB |
-| Qwen3-0.6B prefill M = 1024, prompt 1024 (kernel-scaling; O+FFN cascade **forced fused-cast**, see below) | **1371 / 1369** | 747 / 748 | 585 / 43 / 11 | 85, 598, 990, 347, 999 MB |
+| Qwen3-0.6B prefill M = 2048, prompt 2048 (kernel-scaling) | **1367 / 1371** | 1498 / 1494 | 1185 / 85 / 26 | 85 submissions, 626 launches, 1018 herds, 347 syncs, 1997 MB |
+| Qwen3-0.6B prefill M = 1024, prompt 1024 (kernel-scaling; O+FFN cascade **forced fused-cast**, plan source `forced`, see below) | **1359 / 1338** | 754 / 765 | 590 / 43 / 12 | 85, 598, 990, 347, 999 MB |
 | Qwen3-0.6B prefill M = 512 | skipped (wall 2, below) | | | |
-| Qwen3-0.6B decode, ctx 480 → 512 | **11.85 / 12.19** | 84.4 / 82.0 | 63.3 / 0.9 / 12.5 | 57, 150, 206, 179, 4.3 MB per token |
-| Qwen3-0.6B decode, ctx 992 → 1024 | **10.11 / 10.23** | 98.9 / 97.7 | 64.0 / 1.1 / 24.2 | same |
-| Qwen3-0.6B decode, ctx 2016 → 2048 | **7.07 / 7.29** | 141.5 / 137.3 | 66.0 / 1.8 / 58.7 | same |
-| Llama-3.2-1B prefill M = 2048, prompt 2048 | **1750 / 1736** | 1171 / 1180 | 1100 / 46 / 10 | 49, 328, 552, 201, 1208 MB |
-| Llama-3.2-1B decode, ctx 480 → 512 | **10.70 / 10.88** | 93.4 / 91.9 | 75.9 / 0.7 / 8.1 | 33, 152, 184, 153, 0.7 MB per token |
-| Llama-3.2-1B decode, ctx 992 → 1024 | **10.16 / 10.28** | 98.4 / 97.3 | 76.1 / 0.7 / 13.0 | same |
-| Llama-3.2-1B decode, ctx 2016 → 2048 | **8.90 / 8.77** | 112.4 / 114.0 | 76.7 / 0.9 / 25.0 | same |
+| Qwen3-0.6B decode, ctx 480 → 512 | **12.01 / 12.17** | 83.3 / 82.2 | 62.9 / 0.9 / 11.6 | 57, 150, 206, 179, 4.3 MB per token |
+| Qwen3-0.6B decode, ctx 992 → 1024 | **10.62 / 10.33** | 94.2 / 96.8 | 63.4 / 0.9 / 21.7 | same |
+| Qwen3-0.6B decode, ctx 2016 → 2048 | **7.31 / 7.35** | 136.7 / 136.1 | 65.6 / 1.7 / 55.6 | same |
+| Llama-3.2-1B prefill M = 2048, prompt 2048 | **1736 / 1739** | 1180 / 1178 | 1106 / 52 / 9 | 49, 328, 552, 201, 1208 MB |
+| Llama-3.2-1B decode, ctx 480 → 512 | **10.75 / 10.83** | 93.1 / 92.4 | 76.9 / 0.7 / 7.7 | 33, 152, 184, 153, 0.7 MB per token |
+| Llama-3.2-1B decode, ctx 992 → 1024 | **10.03 / 10.18** | 99.7 / 98.3 | 76.1 / 0.9 / 14.2 | same |
+| Llama-3.2-1B decode, ctx 2016 → 2048 | **8.85 / 8.99** | 113.0 / 111.2 | 77.2 / 0.9 / 25.6 | same |
 
 Reading it: the decode context cost is the host attention and nothing else — device ms is flat
 (63 → 66 qwen, 76 → 77 llama) while `host_cpu_ms` (the `decode_attention_cpu` + glue buckets)
-grows 12.5 → 24.2 → 58.7 ms/token on qwen, 8.1 → 13.0 → 25.0 on llama; the short-prompt 77 ms
-token of §1.1 / doc 57 reads 84 ms at ctx 512 for that reason. The per-token vector is the
-plan's to the launch (150 and 152 executed launches; 57 and 33 submissions). The prefill clock
-is the forward only (tokenization and EOS padding outside; `measured_token_count` = valid
-prompt tokens; the first-forward BO allocation lands in the warmup). Qwen prefill at M = 2048
-leaves ~200 ms per forward outside device + sync + host-cpu — the untimed host glue (the
-head-first FA transposes, Python) that `host_cpu_ms` does not bucket.
+grows 11.6 → 21.7 → 55.6 ms/token on qwen, 7.7 → 14.2 → 25.6 on llama; the short-prompt 77 ms
+token of §1.1 / doc 57 reads 83 ms at ctx 512 for that reason. The per-token vector is the
+plan's to the launch (150 and 152 executed launches; 57 and 33 submissions), checked live on
+every rung. The prefill clock is the forward only (tokenization and EOS padding outside;
+`measured_token_count` = valid prompt tokens; the first-forward BO allocation lands in the
+warmup). Qwen prefill at M = 2048 leaves ~200 ms per forward outside device + sync + host-cpu —
+the untimed host glue (the head-first FA transposes, Python) that `host_cpu_ms` does not bucket;
+`host_ops` counts the instrumented buckets only (n_layers + 1 per decode token, + 2 per prefill),
+fewer than the plan's host ops (kv_append and the embed lookup are not bucketed).
 
 **Two walls, met on the kernel-scaling curve.** (1) `o_ffn_qwen` (and the shared `o_ffn`) is
 fused-cast-only: its slices bind a 4-arg GEMM with an f32 scratch, and the registry's best at
@@ -359,27 +383,30 @@ M = 512 / 1024 for O, gate/up and down is **`drain`** (3 args, no scratch) — d
 `use of value '%arg15' expects different type than prior uses: 'memref<512x1024xbf16>' vs
 'memref<512x1024xf32>'`. The builder now refuses that case by name; a `gemm_method=` knob
 (`gemm_registry_config(..., method=)`, `compile_all_kernels(o_ffn_gemm_method=)`) forces the
-cascade's only form, the deviation is written to the artifact set's `compile.json` and onto
-every row that ran on it (`selected_config_json.artifact_deviation`, the label). The
-M = 1024 point is that forced form (fused-cast rows measured 3910 / 3739 / 4677 GFLOP/s for
-O / gate-up / down against drain's 4751 / 3977 / 5148, registry); its QKV stage is the
-registry-driven all-drain form (8 launches, no cast — hence 598 executed launches, not 626).
-(2) At M = 512 the forced form does not build either: the registry's fused-cast row for
-512 × 1024 × 3072 (gate/up) was measured at `tile_n 96` while O and down are `tile_n 128`, and
-the cascade links one `mm.o` variant per ELF — devq 570: `Qwen o_ffn assumes all 4 GEMMs share
-... got O=fused-cast_m64n128 G=fused-cast_m64n96 D=fused-cast_m64n128`. Building it needs an
-explicit policy for an unmeasured `n128` tile (§3.3's `analytical_unmeasured` rule) or the
-cascade taught to co-link two variants; neither was taken here. The M = 512 row is a complete
-skipped row carrying that text in both walks. A drain-capable cascade (per-GEMM arg maps and
-extern sets, as `rms_qkv_qknorm_rope_multi` already does through `alloc_gemm_scratch`) is the
-repair that makes the curve the registry's own at every M.
+cascade's only form, the deviation is written to the artifact set's `compile.json`, folded into
+the `Plan` that hashes the rows (`forced`), and copied onto every row (`artifact_deviation`, the
+label). The M = 1024 point is that forced form (fused-cast rows measured 3910 / 3739 / 4677
+GFLOP/s for O / gate-up / down against drain's 4751 / 3977 / 5148, registry); its QKV stage is
+the registry-driven all-drain form (8 launches, no cast — hence 598 executed launches, not 626,
+and the plan says exactly that). (2) At M = 512 the forced form does not build either: the
+registry's fused-cast row for 512 × 1024 × 3072 (gate/up) was measured at `tile_n 96` while O
+and down are `tile_n 128`, and the cascade links one `mm.o` variant per ELF — devq 570: `Qwen
+o_ffn assumes all 4 GEMMs share ... got O=fused-cast_m64n128 G=fused-cast_m64n96
+D=fused-cast_m64n128`. Building it needs an explicit policy for an unmeasured `n128` tile
+(§3.3's `analytical_unmeasured` rule) or the cascade taught to co-link two variants; neither was
+taken here. The M = 512 row is a complete skipped row carrying that text in both walks. A
+drain-capable cascade (per-GEMM arg maps and extern sets, as `rms_qkv_qknorm_rope_multi` already
+does through `alloc_gemm_scratch`) is the repair that makes the curve the registry's own at
+every M.
 
-**Also found, not fixed.** The drivers' `--run-only` path (`make run` / `make profile`) leaves
-`qwen3_0_6b_prefill._FUSED_SCRATCH_FOR` at `None`, so the block runner passes 17 args to the
-M = 2048 QKV ELF that declares 18 (Q is fused-cast there); the adapter restores the layout
-from the registry exactly as `compile_all_kernels` would (`alloc_gemm_scratch`, base arg 17)
-so the measured path is the gate's path. Whether the 17-arg call is benign on the device
-(devq 486's 12.96 tok/s came from it) is untested.
+**Also found, and fixed.** The drivers' `--run-only` path (`make run` / `make profile`) left
+`qwen3_0_6b_prefill._FUSED_SCRATCH_FOR` at `None`, so the block runner passed 17 args to the
+M = 2048 QKV ELF that declares 18 (Q is fused-cast there). `qwen3_0_6b_prefill.restore_scratch_layout`
+now derives the layout from the registry exactly as `compile_all_kernels` leaves it
+(`alloc_gemm_scratch`, base arg 17), and `build_session --run-only`, the verify adapter on a
+loaded artifact set and the model adapter all call it. Whether the 17-arg call was benign on the
+device (devq 486's 12.96 tok/s came from it) was not separately tested; the gate now runs the
+18-arg path and passes.
 
 ## 5. The first measurable milestone
 

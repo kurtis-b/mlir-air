@@ -1,0 +1,99 @@
+{
+ "model_id": "qwen3_0_6b",
+ "case_id": "qwen3_0_6b/decode/M2048/ctx512/bf16",
+ "phase": "decode",
+ "M": 2048,
+ "context_end": 512,
+ "scope": "decode_token",
+ "trace_samples": 32,
+ "trace": {
+  "kernels": {
+   "lm_head_gemv": {
+    "calls": 32,
+    "n_written": 32,
+    "n_readback": 320,
+    "bytes_written": 65536,
+    "bytes_readback": 9723904,
+    "kernel_ms": 243.42281033750623,
+    "sync_ms": 0.9559239260852337
+   },
+   "rms_qkv_qknorm_rope_gemv2": {
+    "calls": 896,
+    "n_written": 1792,
+    "n_readback": 896,
+    "bytes_written": 4358144,
+    "bytes_readback": 117440512,
+    "kernel_ms": 398.6699302913621,
+    "sync_ms": 11.513797100633383
+   },
+   "o_gemv_ffn": {
+    "calls": 896,
+    "n_written": 1792,
+    "n_readback": 896,
+    "bytes_written": 5505024,
+    "bytes_readback": 1835008,
+    "kernel_ms": 1371.2425444973633,
+    "sync_ms": 12.921256246045232
+   }
+  },
+  "cpu": {
+   "decode_attention_cpu": {
+    "calls": 896,
+    "ms": 364.96062437072396
+   },
+   "final_rms_norm": {
+    "calls": 32,
+    "ms": 1.439757994376123
+   }
+  }
+ },
+ "launch_counts": {
+  "rms_qkv_qknorm_rope": {
+   "air_launches": 9,
+   "herd_launches": 15
+  },
+  "o_ffn_qwen": {
+   "air_launches": 12,
+   "herd_launches": 20
+  },
+  "flash_attn": {
+   "air_launches": 1,
+   "herd_launches": 1
+  },
+  "rms_qkv_qknorm_rope_gemv2": {
+   "air_launches": 2,
+   "herd_launches": 2
+  },
+  "o_gemv_ffn": {
+   "air_launches": 3,
+   "herd_launches": 5
+  },
+  "lm_head_gemv": {
+   "air_launches": 10,
+   "herd_launches": 10
+  }
+ },
+ "plan_sha": "49ba58fc59e5fa5d88ce9b2a3970fa414d79fbc0c17c62fc14ba345eaf3fdae7",
+ "forced": {},
+ "measured_vector": {
+  "scope": "decode_token",
+  "host_submissions": 57,
+  "runlist_entries": 57,
+  "air_launches": 150,
+  "herd_launches": 206,
+  "sync_boundaries": 179,
+  "bytes_transferred": 4341504
+ },
+ "predicted_vector": {
+  "scope": "decode",
+  "host_submissions": 57,
+  "runlist_entries": 57,
+  "air_launches": 150,
+  "herd_launches": 206,
+  "sync_boundaries": 0,
+  "bytes_transferred": 0
+ },
+ "timed_artifact_sha": "4974673a197c07d1108642f6f53800271ea622c1312a53e1055cf76207b1acb0",
+ "devq_job_id": "574",
+ "recorded_utc": "2026-08-23T12:25:03.443519+00:00"
+}

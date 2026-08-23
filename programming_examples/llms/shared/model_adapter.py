@@ -55,9 +55,10 @@ FOOTGUNS
       object in place with idempotency guards; the drivers say "do not call
       twice", and this module keeps that promise by refusing a second `prepare`.
     - `verify_against_hf` runs the production verify subprocess (`make verify`'s
-      command line), which COMPILES the artifact set it verifies into the cache
-      root it is pointed at. Point it at the root the rows ran on, and run it
-      outside the clock.
+      command line) over the artifact set it is handed BY PATH, which the
+      adapters LOAD -- the gate never compiles on this path, so the bytes it
+      verifies are the bytes that were timed; `artifact_content_sha` is how a
+      caller proves it. Run it outside the clock.
 """
 
 from __future__ import annotations
@@ -133,10 +134,49 @@ MODELS: dict[str, ModelBinding] = {
 # ---------------------------------------------------------------------------
 
 
-def plan_for(model_id: str, phase: str, M: int, kv_len: int, ctx: int = 2048, precision_plan: str = "bf16"):
-    """The `Plan` whose sha keys a row: `plan(decoder_graph(spec), Workload(...))`."""
+def plan_for(model_id: str, phase: str, M: int, kv_len: int, ctx: int = 2048, precision_plan: str = "bf16", forced: dict | None = None):
+    """The `Plan` whose sha keys a row: `plan(decoder_graph(spec), Workload(...),
+    forced=...)`. `forced` ({stage: GEMM method}) is the artifact set's recorded
+    deviation (`compile.json`), so the hash names the plan that BUILT the timed
+    artifacts, not the registry's best (H1a review, finding 4)."""
     spec = MODELS[model_id].spec
-    return _plan(decoder_graph(spec), Workload(phase, M, kv_len, ctx, precision_plan), NPU2_CAPS)
+    return _plan(decoder_graph(spec), Workload(phase, M, kv_len, ctx, precision_plan), NPU2_CAPS, forced=forced)
+
+
+def forced_methods_of(deviation: dict | None) -> dict:
+    """`compile.json`'s `artifact_deviation` as the planner's `forced` mapping."""
+    if not deviation or not deviation.get("o_ffn_gemm_method"):
+        return {}
+    return {"o_ffn_qwen": deviation["o_ffn_gemm_method"], "o_ffn": deviation["o_ffn_gemm_method"]}
+
+
+def artifact_content_sha(cache_dirs) -> dict:
+    """Content identity of an artifact set: sha256 of every manifest binary's
+    BYTES (and its instruction file), and one digest over all of them, keyed by
+    kernel name. Not mtimes, not paths: this is what "the same ELFs" means
+    (H1a review, finding 1). Relative manifest paths anchor to the cache's parent."""
+    per = {}
+    for d in cache_dirs:
+        d = Path(d)
+        manifest = read_cache_manifest(d)
+        for name in sorted(manifest):
+            info = manifest[name]
+            files = []
+            for key in ("output_binary", "insts"):
+                raw = info.get(key)
+                if not raw:
+                    continue
+                path = Path(raw)
+                if not path.is_absolute() and not path.exists():
+                    path = d.parent / path
+                h = hashlib.sha256()
+                with path.open("rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(chunk)
+                files.append((key, path.name, h.hexdigest()))
+            per[f"{d.name}/{name}"] = files
+    total = hashlib.sha256(json.dumps(per, sort_keys=True).encode()).hexdigest()
+    return {"sha256": total, "files": per}
 
 
 def read_cache_manifest(cache_dir: str | Path) -> dict:
@@ -272,6 +312,8 @@ class PhaseResult:
     decomposition: dict  # device_ms / sync_ms / host_cpu_ms / host_ops over the phase
     tokens: list = field(default_factory=list)
     state: DecodeState | None = None
+    trace: dict = field(default_factory=dict)  # `trace_since` over the timed samples (summed)
+    trace_samples: int = 1  # forwards (prefill) or tokens (decode) the trace sums over
 
     @property
     def tokens_per_second(self) -> float:
@@ -287,33 +329,58 @@ class _ProfilerMark:
         self.cpu = [{k: len(v) for k, v in p.cpu_times.items()} for p in self.profilers]
 
 
-def _delta(mark: _ProfilerMark, launch_counts: dict[str, dict], scope: str) -> tuple[dict, dict]:
-    """(dispatch vector, decomposition) accumulated since `mark`."""
-    subs = air = herd = syncs = nbytes = 0
-    device_ms = sync_ms = host_ms = 0.0
-    host_ops = 0
-    elfs = set()
+def trace_since(mark: _ProfilerMark) -> dict:
+    """What the DRIVER did since `mark`, per kernel name and per host bucket --
+    the record a recorded fixture carries (H1a review, finding 5):
+    {"kernels": {name: {calls, n_written, n_readback, bytes_written, bytes_readback, kernel_ms, sync_ms}},
+     "cpu": {name: {calls, ms}}}."""
+    kernels: dict = {}
+    cpu: dict = {}
     for p, k0, c0 in zip(mark.profilers, mark.kernels, mark.cpu):
         for name, records in p.kernel_breakdowns.items():
             new = records[k0.get(name, 0):]
             if not new:
                 continue
-            elfs.add(name)
-            counts = launch_counts.get(name)
-            if counts is None:
-                raise KeyError(f"{name!r} was dispatched but the cache manifest has no launch counts for it")
-            subs += len(new)
-            air += len(new) * int(counts["air_launches"])
-            herd += len(new) * int(counts["herd_launches"])
+            k = kernels.setdefault(name, {"calls": 0, "n_written": 0, "n_readback": 0, "bytes_written": 0, "bytes_readback": 0, "kernel_ms": 0.0, "sync_ms": 0.0})
+            k["calls"] += len(new)
             for r in new:
-                syncs += int(r["n_written"]) + int(r["n_readback"])
-                nbytes += int(r["bytes_written"]) + int(r.get("bytes_readback", 0))
-                device_ms += float(r["kernel_ms"])
-                sync_ms += float(r["write_ms"]) + float(r["read_ms"])
+                k["n_written"] += int(r["n_written"])
+                k["n_readback"] += int(r["n_readback"])
+                k["bytes_written"] += int(r["bytes_written"])
+                k["bytes_readback"] += int(r.get("bytes_readback", 0))
+                k["kernel_ms"] += float(r["kernel_ms"])
+                k["sync_ms"] += float(r["write_ms"]) + float(r["read_ms"])
         for name, times in p.cpu_times.items():
             new = times[c0.get(name, 0):]
-            host_ops += len(new)
-            host_ms += 1000.0 * sum(new)
+            if new:
+                c = cpu.setdefault(name, {"calls": 0, "ms": 0.0})
+                c["calls"] += len(new)
+                c["ms"] += 1000.0 * sum(new)
+    return {"kernels": kernels, "cpu": cpu}
+
+
+def dispatch_vector_from_trace(trace: dict, launch_counts: dict[str, dict], scope: str) -> tuple[dict, dict]:
+    """(dispatch vector, decomposition) from a driver trace and the cache
+    manifest's launch counts: one submission per load_and_run call, its
+    artifact's launches executed per call. The ONE arithmetic, used live by
+    the adapter and offline by the host test over a recorded trace."""
+    subs = air = herd = syncs = nbytes = 0
+    device_ms = sync_ms = host_ms = 0.0
+    host_ops = 0
+    for name, k in trace["kernels"].items():
+        counts = launch_counts.get(name)
+        if counts is None:
+            raise KeyError(f"{name!r} was dispatched but the cache manifest has no launch counts for it")
+        subs += k["calls"]
+        air += k["calls"] * int(counts["air_launches"])
+        herd += k["calls"] * int(counts["herd_launches"])
+        syncs += k["n_written"] + k["n_readback"]
+        nbytes += k["bytes_written"] + k["bytes_readback"]
+        device_ms += k["kernel_ms"]
+        sync_ms += k["sync_ms"]
+    for c in trace["cpu"].values():
+        host_ops += c["calls"]
+        host_ms += c["ms"]
     vector = {
         "scope": scope,
         "host_submissions": subs,
@@ -323,8 +390,15 @@ def _delta(mark: _ProfilerMark, launch_counts: dict[str, dict], scope: str) -> t
         "sync_boundaries": syncs,
         "bytes_transferred": nbytes,
     }
-    decomposition = {"device_ms": device_ms, "sync_ms": sync_ms, "host_cpu_ms": host_ms, "host_ops": host_ops, "distinct_elfs": len(elfs)}
+    decomposition = {"device_ms": device_ms, "sync_ms": sync_ms, "host_cpu_ms": host_ms, "host_ops": host_ops, "distinct_elfs": len(trace["kernels"])}
     return vector, decomposition
+
+
+def _delta(mark: _ProfilerMark, launch_counts: dict[str, dict], scope: str) -> tuple[dict, dict, dict]:
+    """(dispatch vector, decomposition, trace) accumulated since `mark`."""
+    trace = trace_since(mark)
+    vector, decomposition = dispatch_vector_from_trace(trace, launch_counts, scope)
+    return vector, decomposition, trace
 
 
 class ModelAdapter:
@@ -388,27 +462,8 @@ class ModelAdapter:
         prefill_cache = KernelCache(str(prefill_dir), verbose=verbose, profiler=Profiler(enabled=True))
         decode_cache = KernelCache(str(decode_dir), verbose=verbose, profiler=Profiler(enabled=True))
         for cache, d in ((prefill_cache, prefill_dir), (decode_cache, decode_dir)):
-            # A cache compiled from `cd build_peano` (the Makefiles' cwd) records
-            # RELATIVE binary paths; `load_manifest` resolves them against the
-            # cwd and the backend loads them by that path later. Anchor them to
-            # the cache's parent so the worker can run from its own directory.
-            old_cwd = os.getcwd()
-            os.chdir(d.parent)
-            try:
-                ok = cache.load_manifest()
-            finally:
-                os.chdir(old_cwd)
-            if not ok:
+            if not cache.load_manifest():  # KernelCache anchors relative manifest paths itself
                 raise RuntimeError(f"the cache manifest under {d} names a binary that is missing")
-            from air.backend.xrt import XRTCompileArtifact
-
-            for name, art in list(cache.artifacts.items()):
-                binary, insts = Path(art.output_binary), art.insts
-                if not binary.is_absolute():
-                    binary = (d.parent / binary).resolve()
-                if insts and not Path(insts).is_absolute():
-                    insts = str((d.parent / insts).resolve())
-                cache.artifacts[name] = XRTCompileArtifact(str(binary), art.kernel, insts)
         self._launch_counts = launch_counts_of({"prefill": read_cache_manifest(prefill_dir), "decode": read_cache_manifest(decode_dir)})
 
         import importlib
@@ -438,33 +493,16 @@ class ModelAdapter:
         return self.ms
 
     def _restore_scratch_layout(self, config, M):
-        """What `compile_all_kernels` leaves in the prefill module and a
-        run-only process lacks: the QKV ELF's f32-scratch arg layout
-        (`_FUSED_SCRATCH_FOR`), derived from the registry exactly as the
-        builder derives it (`alloc_gemm_scratch` over the Q/K/V specs at M,
-        base arg 17). Without it the block runner passes 17 args to an ELF that
-        declares 18 when Q is `fused-cast` (M=2048) -- the drivers' own
-        `--run-only` path does exactly that today, and this adapter refuses to
-        measure a path the gate does not run. Models whose prefill module has
-        no such global (llama32_1b) need nothing.
-        """
+        """The QKV ELF's f32-scratch arg layout a run-only process lacks, set by
+        the driver's own `restore_scratch_layout` (the single owner, shared
+        with `--run-only` and the verify adapter). None for a driver without
+        the global (llama32_1b)."""
         import importlib
 
         prefill_mod = importlib.import_module(f"{self.binding.package}_prefill")
-        if not hasattr(prefill_mod, "_FUSED_SCRATCH_FOR"):
+        if not hasattr(prefill_mod, "restore_scratch_layout"):
             return None
-        from shared.builders.gemm_builder import gemm_registry_config
-        from shared.infra.stitching import alloc_gemm_scratch
-
-        q_dim, kv_dim = config.n_heads * config.head_dim, config.n_kv_heads * config.head_dim
-        specs = [
-            (gemm_registry_config(M, config.emb_dim, q_dim, "bf16", "high"), M, q_dim),
-            (gemm_registry_config(M, config.emb_dim, kv_dim, "bf16", "high"), M, kv_dim),
-            (gemm_registry_config(M, config.emb_dim, kv_dim, "bf16", "high"), M, kv_dim),
-        ]
-        _args, scratch_for = alloc_gemm_scratch(specs, base_arg_count=17)
-        prefill_mod._FUSED_SCRATCH_FOR = scratch_for
-        return list(scratch_for)
+        return prefill_mod.restore_scratch_layout(config, M)
 
     # -- tokens ---------------------------------------------------------------
 
@@ -521,7 +559,7 @@ class ModelAdapter:
         for _ in range(samples):
             dt, out = forward()
             times.append(dt)
-        vector, decomposition = _delta(mark, self._launch_counts, "prefill")
+        vector, decomposition, trace = _delta(mark, self._launch_counts, "prefill")
         # the vector is per forward: divide the accumulated counts by the sample count
         vector = {k: (v if k == "scope" else v // samples) for k, v in vector.items()}
         decomposition = {k: (v if k == "distinct_elfs" else v / samples) for k, v in decomposition.items()}
@@ -535,6 +573,7 @@ class ModelAdapter:
             phase="prefill", elapsed_s=sum(times), samples_s=times, logical_tokens=prompt_len,
             measured_tokens=prompt_len * samples, context_start=0, context_end=prompt_len,
             dispatch=vector, decomposition=decomposition, tokens=[int(prefill_token)], state=st,
+            trace=trace, trace_samples=samples,
         )
 
     def decode(self, state: DecodeState, n_tokens: int, *, warmup: int = 0) -> PhaseResult:
@@ -566,7 +605,7 @@ class ModelAdapter:
             pos += 1
             times.append(dt)
             tokens.append(tok)
-        vector, decomposition = _delta(mark, self._launch_counts, "decode")
+        vector, decomposition, trace = _delta(mark, self._launch_counts, "decode")
         per_token = {k: (v if k == "scope" else v // n_tokens) for k, v in vector.items()}
         per_token["scope"] = "decode_token"
         decomposition = {k: (v if k == "distinct_elfs" else v / n_tokens) for k, v in decomposition.items()}
@@ -578,6 +617,7 @@ class ModelAdapter:
             phase="decode", elapsed_s=sum(times), samples_s=times, logical_tokens=n_tokens,
             measured_tokens=n_tokens, context_start=start, context_end=pos,
             dispatch=per_token, decomposition=decomposition, tokens=tokens, state=state,
+            trace=trace, trace_samples=n_tokens,
         )
 
     def dispatch_vector(self, scope: str) -> dict:
@@ -589,41 +629,68 @@ class ModelAdapter:
 
     # -- the gate ---------------------------------------------------------------
 
-    def verify_against_hf(self, prompts_file: str | Path, report_dir: str | Path, *, cache_root: str | Path, max_seq: int, cwd: str | Path, timeout_s: int = 3600, extra_env: dict | None = None) -> dict:
+    def verify_against_hf(self, prompts_file: str | Path, report_root: str | Path, *, prefill_cache: str | Path, decode_cache: str | Path,
+                          prefill_M: int, max_seq: int, cwd: str | Path, timeout_s: int = 3600, extra_env: dict | None = None) -> dict:
         """Run the production verify gate (`make verify`'s command line:
         `verify_runner.py --runner <adapter> --prompts topk_token`) over
-        `prompts_file`, against the artifact set under `cache_root` at
-        `max_seq`. Returns `{passed, returncode, report_json, per_prompt, log}`.
+        `prompts_file`, against EXACTLY the artifact set named by
+        `prefill_cache` / `decode_cache` (the adapter loads them, never
+        compiles), padding prompts to `prefill_M` with `max_seq` KV room.
+        Returns `{passed, returncode, report_json, report_dir, per_prompt, log, ...}`.
 
-        Outside the clock by construction: a subprocess, after the rows.
+        `passed` requires ALL of: exit code 0, a report THIS call wrote (the
+        report dir is created fresh and unique per call; a report that was
+        there before is not this call's), and every prompt OK. Outside the
+        clock by construction: a subprocess, after the rows.
         """
         runner = _LLMS / "verify" / "verify_runner.py"
+        import tempfile
+
+        Path(report_root).mkdir(parents=True, exist_ok=True)
+        # fresh, unique and EMPTY: mkdtemp creates it, so no earlier call's
+        # report can be in it (review finding 2)
+        report_dir = Path(tempfile.mkdtemp(prefix=time.strftime("%Y%m%d-%H%M%S") + "-", dir=str(report_root)))
         cmd = [
             sys.executable, str(runner), f"--runner={self.binding.verify_adapter}",
             "--prompts", "topk_token", "--model", self.binding.model_variant,
             "--prompts-file", str(prompts_file), "--report-dir", str(report_dir), "--no-strict",
         ]
         env = dict(os.environ)
-        env["LLMS_VERIFY_CACHE_ROOT"] = str(cache_root)
+        env["LLMS_VERIFY_PREFILL_CACHE"] = str(Path(prefill_cache).resolve())
+        env["LLMS_VERIFY_DECODE_CACHE"] = str(Path(decode_cache).resolve())
+        env["LLMS_VERIFY_PREFILL_M"] = str(int(prefill_M))
         env["LLMS_VERIFY_MAX_SEQ"] = str(int(max_seq))
         env.update(extra_env or {})
-        Path(report_dir).mkdir(parents=True, exist_ok=True)
         Path(cwd).mkdir(parents=True, exist_ok=True)
+        before = set(report_dir.glob("verify_topk_token_*.json"))
         t0 = time.perf_counter()
         proc = subprocess.run(cmd, cwd=str(cwd), env=env, capture_output=True, text=True, timeout=timeout_s)
         log = (proc.stdout or "") + (proc.stderr or "")
-        reports = sorted(Path(report_dir).glob("verify_topk_token_*.json"), key=lambda p: p.stat().st_mtime)
-        per_prompt, report_json = [], None
-        if reports:
-            report_json = reports[-1]
+        written = sorted(set(report_dir.glob("verify_topk_token_*.json")) - before, key=lambda p: p.stat().st_mtime)
+        per_prompt, report_json, problems = [], None, []
+        if len(written) == 1:
+            report_json = written[0]
             payload = json.loads(report_json.read_text(encoding="utf-8"))
             for rec in payload.get("topk_checks") or []:
                 per_prompt.append({"prompt_idx": rec["prompt_idx"], "status": rec["status"], "fail_reason": rec.get("fail_reason"), "divergence_step": rec.get("divergence_step")})
-        passed = proc.returncode == 0 and "[verify] PASS" in log and bool(per_prompt) and all(r["status"] == "OK" for r in per_prompt)
+        elif not written:
+            problems.append("the gate wrote no report")
+        else:
+            problems.append(f"the gate wrote {len(written)} reports; expected exactly one")
+        if proc.returncode != 0:
+            problems.append(f"the gate exited {proc.returncode}")
+        if not per_prompt:
+            problems.append("no per-prompt verdict in the report")
+        elif any(r["status"] != "OK" for r in per_prompt):
+            problems.append("a prompt failed the top-k set check")
+        if "[verify] PASS" not in log:
+            problems.append("the gate did not print [verify] PASS")
         return {
-            "passed": passed, "returncode": proc.returncode, "report_json": str(report_json) if report_json else None,
+            "passed": not problems, "problems": problems, "returncode": proc.returncode,
+            "report_json": str(report_json) if report_json else None, "report_dir": str(report_dir),
             "per_prompt": per_prompt, "log": log, "command": cmd, "wall_s": time.perf_counter() - t0,
-            "cache_root": str(cache_root), "max_seq": int(max_seq),
+            "prefill_cache": env["LLMS_VERIFY_PREFILL_CACHE"], "decode_cache": env["LLMS_VERIFY_DECODE_CACHE"],
+            "prefill_M": int(prefill_M), "max_seq": int(max_seq),
         }
 
 

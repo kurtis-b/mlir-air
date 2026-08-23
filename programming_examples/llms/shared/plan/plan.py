@@ -97,7 +97,26 @@ def solve_gemm_tiles(M, K, N, caps=NPU2_CAPS, out_itemsize=4):
     return {"tile": best[1], "herd": best[2], "traffic_bytes": best[3], "source": ANALYTICAL}
 
 
-def gemm_candidate(M, K, N, caps=NPU2_CAPS):
+def _registry_lookup_method(M, K, N, method):
+    """A SPECIFIC registry method's measured row, or None."""
+    try:
+        from registry_lookup import gemm_config_method
+        return gemm_config_method(M, K, N, "bf16", method)
+    except Exception:
+        return None
+
+
+def gemm_candidate(M, K, N, caps=NPU2_CAPS, method=None):
+    """`method` `[2026-08-23]` FORCES a registry method (its measured row for this
+    shape) over the tier's best: source `forced`, so a plan built for an
+    artifact whose builder supports one form only (o_ffn is fused-cast-only)
+    hashes as that plan and derives that artifact's launch count."""
+    if method is not None:
+        reg = _registry_lookup_method(M, K, N, method)
+        if reg is None:
+            return None
+        return {"tile": reg["tile"], "herd": tuple(reg["herd"]), "method": reg["method"],
+                "gflops": reg["gflops"], "source": FORCED}
     reg = _registry_lookup(M, K, N)
     if reg is not None:
         return {"tile": reg["tile"], "herd": tuple(reg["herd"]), "method": reg["method"],
@@ -149,20 +168,27 @@ def _gemv_partitions(rows, caps, herd_m=8, m_input=4, tile_m=8):
     return len(parts), tuple(parts)
 
 
-def fuse(graph, wl, placements, caps=NPU2_CAPS):
-    """Group the phase's ops into stages in execution order, deriving launch counts."""
+def fuse(graph, wl, placements, caps=NPU2_CAPS, forced=None):
+    """Group the phase's ops into stages in execution order, deriving launch counts.
+
+    `forced` `[2026-08-23]`: {stage name: GEMM method} -- every matmul of that
+    stage takes the named registry method (source `forced`). The deviation the
+    kernel-scaling curve needed at Qwen3-0.6B M=1024 (`o_ffn_qwen` fused-cast
+    where the registry best is drain) is expressed HERE, in the plan, so the
+    plan's hash and launch count describe the artifact that was built."""
     spec = graph.spec
     g = graph
     stages, rejected = [], []
     lean = _lean_form(spec, caps)
     Mq = wl.M
+    forced = dict(forced or {})
 
     def wbytes(*tids):
         return sum(g.nbytes(t, Mq, wl.kv_len) for t in tids)
 
-    def gemm(op, w):
+    def gemm(op, w, stage=None):
         Min, Nout = g.shape_of(w)
-        return gemm_candidate(Mq, Min, Nout, caps)
+        return gemm_candidate(Mq, Min, Nout, caps, method=forced.get(stage))
 
     # embed (host)
     stages.append(Stage("embed_lookup", HOST, ("embed",), repeated=False,
@@ -197,8 +223,13 @@ def fuse(graph, wl, placements, caps=NPU2_CAPS):
         for hop in pa.extra_host_ops[1:]:
             stages.append(Stage(hop, HOST, ("attention_L",), boundary_bytes=g.nbytes("attn_out_L", Mq), note=pa.reason))
         # --- O + FFN ---
-        cands = {op: gemm(op, w) for op, w in (("o_proj_L", "wo_L"), ("gate_proj_L", "w_gate_L"),
-                                                ("up_proj_L", "w_up_L"), ("down_proj_L", "w_down_L"))}
+        o_ffn_stage = ("o_ffn_qwen" if qk else "o_ffn") if lean else "o_ffn_head"
+        cands = {op: gemm(op, w, o_ffn_stage) for op, w in (("o_proj_L", "wo_L"), ("gate_proj_L", "w_gate_L"),
+                                                            ("up_proj_L", "w_up_L"), ("down_proj_L", "w_down_L"))}
+        if o_ffn_stage in forced:
+            for op, c in cands.items():
+                if c is None:
+                    rejected.append((op, f"forced method {forced[o_ffn_stage]!r} has no registry row at M={Mq}"))
         def gl(op, what):
             n = _gemm_launches(cands[op]); return (op, n, f"{what} GEMM {cands[op]['method'] if cands[op] else '?'}" + (" + cast" if n == 2 else ""))
         if lean:
@@ -208,7 +239,9 @@ def fuse(graph, wl, placements, caps=NPU2_CAPS):
                                 ("o_proj_L", "residual_1_L", "ffn_norm_L", "gate_proj_L", "up_proj_L", "swiglu_L", "down_proj_L", "residual_2_L"),
                                 launches=sum(b[1] for b in bd), launch_breakdown=tuple(bd),
                                 weight_bytes=wbytes("wo_L", "ffn_norm_w_L", "w_gate_L", "w_up_L", "w_down_L"), candidates=cands,
-                                note=f"lean fused O+FFN: emb {spec.emb_dim} < {caps.lean_form_emb_max} and hidden {spec.hidden_dim} % {caps.lean_form_hidden_multiple} == 0"))
+                                source=FORCED if o_ffn_stage in forced else MEASURED,
+                                note=f"lean fused O+FFN: emb {spec.emb_dim} < {caps.lean_form_emb_max} and hidden {spec.hidden_dim} % {caps.lean_form_hidden_multiple} == 0"
+                                + (f"; GEMM method FORCED to {forced[o_ffn_stage]!r} (the cascade builder's only form)" if o_ffn_stage in forced else "")))
         else:
             bd1 = [gl("o_proj_L", "O"), ("residual_1_L", 1, "add"), ("ffn_norm_L", 1, "RMSNorm"), gl("gate_proj_L", "gate"), gl("up_proj_L", "up"), ("swiglu_L", 1, "SwiGLU")]
             stages.append(Stage("o_ffn_head", DEVICE, ("o_proj_L", "residual_1_L", "ffn_norm_L", "gate_proj_L", "up_proj_L", "swiglu_L"),
@@ -305,7 +338,10 @@ class Plan:
     est_us: float = 0.0
     est_breakdown: dict = field(default_factory=dict)
     source: str = MEASURED
-    planner_version: str = "h0.2"   # h0.1 -> h0.2 `[2026-08-23]`: decode QKV 2-launch form, derived Qwen LM head
+    #: h0.1 -> h0.2 `[2026-08-23]`: decode QKV 2-launch form, derived Qwen LM head;
+    #: h0.2 -> h0.3: `forced` GEMM methods are part of the plan and its hash.
+    planner_version: str = "h0.3"
+    forced: dict = field(default_factory=dict)
     sha: str = ""
 
     def elf_sequence(self, repeated=None):
@@ -319,16 +355,17 @@ class Plan:
         return json.dumps(d, indent=1, default=str, sort_keys=True)
 
 
-def plan(graph, wl, caps=NPU2_CAPS):
+def plan(graph, wl, caps=NPU2_CAPS, forced=None):
     spec = graph.spec
     placements = place(graph, wl, caps)
-    stages, rejected = fuse(graph, wl, placements, caps)
+    forced = dict(forced or {})
+    stages, rejected = fuse(graph, wl, placements, caps, forced=forced)
     L = spec.n_layers
     per_layer = [s for s in stages if s.repeated]
     once = [s for s in stages if not s.repeated]
     dev = lambda ss: [s for s in ss if s.where == DEVICE]
     hst = lambda ss: [s for s in ss if s.where == HOST]
-    p = Plan(spec.name, asdict(wl), caps.as_dict(), {k: asdict(v) for k, v in placements.items()}, stages, rejected)
+    p = Plan(spec.name, asdict(wl), caps.as_dict(), {k: asdict(v) for k, v in placements.items()}, stages, rejected, forced=forced)
     p.per_layer_launches = sum(s.launches for s in dev(per_layer))
     p.per_layer_submissions = len(dev(per_layer))         # one xrt.run per ELF, split at host ops
     p.per_layer_host_ops = len(hst(per_layer))
@@ -354,9 +391,9 @@ def plan(graph, wl, caps=NPU2_CAPS):
                     gemm_us += (2.0 * wl.M * K_ * N_) / (c["gflops"] * 1e3) * (L if s.repeated else 1)
         p.est_breakdown = {"boundaries_us": bnd, "submissions_us": sub, "gemm_us_from_registry": gemm_us}
     p.est_us = sum(p.est_breakdown.values())
-    p.source = ANALYTICAL if any(s.source == ANALYTICAL for s in stages) else MEASURED
+    p.source = (FORCED if forced else ANALYTICAL) if any(s.source != MEASURED for s in stages) else MEASURED
     body = json.dumps({"spec": asdict(spec), "workload": p.workload, "caps": p.caps, "placements": p.placements,
-                       "stages": [asdict(s) for s in stages], "planner_version": p.planner_version},
+                       "stages": [asdict(s) for s in stages], "planner_version": p.planner_version, "forced": forced},
                       sort_keys=True, default=str)
     p.sha = hashlib.sha256(body.encode()).hexdigest()
     return p

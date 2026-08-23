@@ -577,6 +577,11 @@ def build_session(args) -> Session:
     if args.run_only:
         prefill_cache.load_manifest()
         decode_cache.load_manifest()
+        # `[2026-08-23]` the QKV ELF's scratch-arg layout, which only the
+        # compile path used to set (doc 56 H1a review: 17 args to an 18-arg ELF)
+        from qwen3_0_6b_prefill import restore_scratch_layout
+
+        restore_scratch_layout(config, seq_len)
 
     model_id = MODEL_CHOICES.get(args.model, args.model)
     print(f"\nLoading weights ({model_id})...")

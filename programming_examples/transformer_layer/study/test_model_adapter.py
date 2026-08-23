@@ -47,6 +47,10 @@ PINNED_MANIFESTS = {
     },
 }
 
+#: The Qwen3-0.6B M=1024 prefill set (devq 570): the registry-driven QKV stage is
+#: all-drain there (no cast launch), the O+FFN cascade forced fused-cast.
+PINNED_MANIFEST_QWEN_M1024 = {"rms_qkv_qknorm_rope": (8, 14), "o_ffn_qwen": (12, 20), "flash_attn": (1, 1)}
+
 #: Executed launches / submissions per phase (doc 57 section 5 after items 5c, 5/5b).
 EXPECTED_TOTALS = {
     ("qwen3_0_6b", "prefill"): (85, 626, 1018),
@@ -77,25 +81,15 @@ def _raises(exc, match, fn, *args, **kwargs):
     raise AssertionError(f"expected {exc.__name__} containing {match!r}")
 
 
-class _FakeProfiler:
-    def __init__(self):
-        self.kernel_breakdowns = {}
-        self.cpu_times = {}
+FIXTURES = Path(_HERE) / "fixtures" / "h1a_driver_traces"
 
 
-def _simulate(plan_, counts, profilers):
-    """Replay the plan's sequence as Profiler records: one load_and_run per
-    device stage instance (2 syncs, 1000 bytes each), one time_cpu per host op."""
-    n_layers = ma.MODELS[plan_.spec_name].spec.n_layers
-    p = profilers[0]
-    for stage in plan_.stages:
-        reps = n_layers if stage.repeated else 1
-        for _ in range(reps):
-            if stage.where == "device":
-                p.kernel_breakdowns.setdefault(stage.name, []).append(
-                    {"write_ms": 0.1, "kernel_ms": 1.0, "read_ms": 0.1, "n_written": 1, "bytes_written": 600, "n_readback": 1, "bytes_readback": 400})
-            else:
-                p.cpu_times.setdefault(stage.name, []).append(0.002)
+def _traces():
+    out = []
+    for path in sorted(FIXTURES.glob("trace_*.json")):
+        out.append(json.loads(path.read_text(encoding="utf-8")))
+    assert len(out) == 5, sorted(p.name for p in FIXTURES.glob("*"))
+    return out
 
 
 def test_models_bind_both_drivers_and_nothing_else():
@@ -130,35 +124,82 @@ def test_plan_launch_counts_equal_the_cached_manifests_for_both_models():
         schema.validate_model_dispatch_vector(vec)
 
 
-def test_measured_arithmetic_reproduces_the_manifest_vector():
-    """`_delta` over Profiler records of the plan's own sequence must produce the
-    SAME launches/submissions as the static derivation, plus the syncs and
-    bytes only a run can know."""
-    for (model_id, phase), (subs, air, herd) in sorted(EXPECTED_TOTALS.items()):
-        counts, _ = _launch_counts(model_id)
-        plan_ = ma.plan_for(model_id, phase, 2048 if phase == "prefill" else 1, 2048 if phase == "prefill" else 512)
-        profilers = (_FakeProfiler(), _FakeProfiler())
-        mark = ma._ProfilerMark(profilers)
-        _simulate(plan_, counts, profilers)
-        vec, decomposition = ma._delta(mark, counts, phase)
-        static = ma.model_dispatch_vector_from_manifest(plan_, counts, phase)
+def test_the_recorded_driver_traces_reproduce_the_plan_vector():
+    """THE LOAD-BEARING ONE, and it is NOT derived from the plan (H1a review,
+    finding 5). `fixtures/h1a_driver_traces/*.json` are Profiler traces the
+    PRODUCTION DRIVERS produced on the device (devq 574: every `load_and_run`
+    call per kernel name, its syncs and bytes, every `time_cpu` bucket) over
+    the rungs of one walk, with the cache manifests they loaded. This test
+    runs the adapter's one arithmetic over that recorded driver behaviour and
+    compares it with what the PLAN + manifest derive -- recomputing the plan
+    here, not reading the fixture's prediction. A driver that adds, removes or
+    duplicates a `load_and_run` (or a planner that changes a stage's launch
+    count) changes one side and not the other: the runner's live check fails
+    the row on the next walk, and re-recording the fixture fails this test.
+    The fixture's plan sha is pinned too, so the planner cannot drift quietly."""
+    seen = set()
+    for t in _traces():
+        model_id, phase = t["model_id"], t["phase"]
+        seen.add((model_id, phase, t["M"]))
+        # the launch counts the driver loaded are the pinned manifests
+        for name, counts in t["launch_counts"].items():
+            pinned = PINNED_MANIFESTS[model_id]["prefill" if name in PINNED_MANIFESTS[model_id]["prefill"] else "decode"]
+            if t["M"] == 1024 and name in PINNED_MANIFEST_QWEN_M1024:
+                pinned = PINNED_MANIFEST_QWEN_M1024
+            assert (counts["air_launches"], counts["herd_launches"]) == pinned[name], (t["case_id"], name, counts)
+        vec, decomposition = ma.dispatch_vector_from_trace(t["trace"], t["launch_counts"], t["scope"])
+        n = int(t["trace_samples"])
+        per = {k: (v if k == "scope" else v // n) for k, v in vec.items()}
+        plan_ = ma.plan_for(model_id, phase, t["M"] if phase == "prefill" else 1, t["context_end"], t["M"], forced=t["forced"])
+        assert plan_.sha == t["plan_sha"], (t["case_id"], plan_.sha, t["plan_sha"])
+        assert ma.plan_launches_match_manifest(plan_, t["launch_counts"]) == []
+        static = ma.model_dispatch_vector_from_manifest(plan_, t["launch_counts"], "prefill" if phase == "prefill" else "decode")
         for key in ("host_submissions", "runlist_entries", "air_launches", "herd_launches"):
-            assert vec[key] == static[key] == {"host_submissions": subs, "runlist_entries": subs, "air_launches": air, "herd_launches": herd}[key], (model_id, phase, key)
-        assert vec["sync_boundaries"] == 2 * subs and vec["bytes_transferred"] == 1000 * subs
-        assert decomposition["host_ops"] == plan_.total_host_ops, (model_id, phase, decomposition, plan_.total_host_ops)
+            assert per[key] == static[key], (t["case_id"], key, per[key], static[key])
+        # the driver's own record, which the plan cannot produce: syncs and bytes are real
+        assert per["sync_boundaries"] > 0 and per["bytes_transferred"] > 0
+        # host_ops counts the driver's INSTRUMENTED time_cpu buckets, which is
+        # fewer than the plan's host ops (kv_append and the embed lookup are not
+        # bucketed): decode = n_layers attention + final norm; prefill =
+        # n_layers kv_cache_extract + embed + final norm. The plan's count is
+        # the upper bound the row's host_ops_note states.
+        L = ma.MODELS[model_id].spec.n_layers
+        assert decomposition["host_ops"] // n == (L + 1 if phase == "decode" else L + 2), (t["case_id"], decomposition["host_ops"] // n)
+        assert decomposition["host_ops"] // n <= plan_.total_host_ops
         assert decomposition["distinct_elfs"] == len(plan_.elf_sequence())
-        assert abs(decomposition["device_ms"] - 1.0 * subs) < 1e-9
-        assert tuple(vec) == ma.DISPATCH_VECTOR_KEYS == schema.MODEL_DISPATCH_VECTOR_KEYS
-        # a second mark after the phase sees nothing: the vector is per scope, not cumulative
-        again, _ = ma._delta(ma._ProfilerMark(profilers), counts, phase)
-        assert again["host_submissions"] == 0
+        assert per == t["measured_vector"], (t["case_id"], per, t["measured_vector"])
+        schema.validate_model_dispatch_vector(per)
+    assert seen == {("qwen3_0_6b", "prefill", 2048), ("qwen3_0_6b", "decode", 2048), ("qwen3_0_6b", "prefill", 1024),
+                    ("llama32_1b", "prefill", 2048), ("llama32_1b", "decode", 2048)}
+    # the forced M=1024 trace carries its deviation in the plan it was hashed with
+    forced = [t for t in _traces() if t["M"] == 1024][0]
+    assert forced["forced"] == {"o_ffn_qwen": "fused-cast", "o_ffn": "fused-cast"}
+    assert ma.plan_for("qwen3_0_6b", "prefill", 1024, 1024, 1024).sha != forced["plan_sha"]
+
+
+def test_a_driver_that_dispatches_one_more_call_is_caught_by_the_arithmetic():
+    """The negative control for the test above: one extra `o_gemv_ffn` call in
+    a recorded decode trace (what a driver duplicating a launch looks like)
+    moves the vector off the plan's."""
+    t = [x for x in _traces() if x["phase"] == "decode" and x["model_id"] == "qwen3_0_6b"][0]
+    trace = json.loads(json.dumps(t["trace"]))
+    trace["kernels"]["o_gemv_ffn"]["calls"] += 1
+    vec, _ = ma.dispatch_vector_from_trace(trace, t["launch_counts"], t["scope"])
+    per = {k: (v if k == "scope" else v // t["trace_samples"]) for k, v in vec.items()}
+    plan_ = ma.plan_for("qwen3_0_6b", "decode", 1, t["context_end"], t["M"])
+    static = ma.model_dispatch_vector_from_manifest(plan_, t["launch_counts"], "decode")
+    # 32 tokens: one extra call is 1/32 of a submission per token -- per-token
+    # integer division hides it, the SUMMED vector does not; the runner's live
+    # check compares the summed phase vector divided by n exactly as here, so
+    # the control asserts on the phase total.
+    assert vec["host_submissions"] == static["host_submissions"] * t["trace_samples"] + 1
+    assert vec["air_launches"] != static["air_launches"] * t["trace_samples"]
+    assert per != t["measured_vector"] or vec["host_submissions"] != t["measured_vector"]["host_submissions"] * t["trace_samples"]
 
 
 def test_a_dispatched_kernel_without_launch_counts_is_refused_not_zeroed():
-    p = _FakeProfiler()
-    mark = ma._ProfilerMark((p,))
-    p.kernel_breakdowns["mystery"] = [{"write_ms": 0, "kernel_ms": 0, "read_ms": 0, "n_written": 0, "bytes_written": 0, "n_readback": 0}]
-    _raises(KeyError, "no launch counts", ma._delta, mark, {}, "prefill")
+    trace = {"kernels": {"mystery": {"calls": 1, "n_written": 0, "n_readback": 0, "bytes_written": 0, "bytes_readback": 0, "kernel_ms": 0.0, "sync_ms": 0.0}}, "cpu": {}}
+    _raises(KeyError, "no launch counts", ma.dispatch_vector_from_trace, trace, {}, "prefill")
     plan_ = ma.plan_for("qwen3_0_6b", "decode", 1, 512)
     _raises(KeyError, "no artifact in the cache manifest", ma.model_dispatch_vector_from_manifest, plan_, {}, "decode")
 
@@ -177,26 +218,28 @@ def test_prepare_refuses_before_touching_a_driver():
     assert "air" not in sys.modules or True  # the import guard is structural; see module docstring
 
 
-def test_verify_against_hf_runs_the_production_command_and_reads_the_report():
+def test_verify_against_hf_runs_the_production_command_on_the_named_artifacts():
     """The gate is `make verify`'s command line (verify_runner, the model's
-    adapter, topk_token) pointed at the artifact set; the verdict is read off
-    the JSON report per prompt, and a FAIL on one prompt is not a pass."""
-    import subprocess as sp
-
+    adapter, topk_token) handed the TIMED artifact set by path (loaded, never
+    compiled: the env names prefill/decode caches, the pad M and the KV room);
+    the verdict is read off the report THIS call wrote, per prompt. A FAIL on
+    one prompt, a nonzero exit, or a stale report from an earlier call is not
+    a pass (H1a review, findings 1 and 2)."""
     calls = []
+    behaviour = {"returncode": 0, "write_report": True, "statuses": ["OK", "FAIL"]}
 
     def fake_run(cmd, cwd=None, env=None, capture_output=None, text=None, timeout=None):
         calls.append((cmd, cwd, env))
         report_dir = Path(cmd[cmd.index("--report-dir") + 1])
-        report_dir.mkdir(parents=True, exist_ok=True)
-        payload = {"topk_checks": [
-            {"prompt_idx": 0, "status": "OK", "fail_reason": None, "divergence_step": None},
-            {"prompt_idx": 1, "status": "FAIL", "fail_reason": "chosen token not in ref top-5", "divergence_step": 7},
-        ]}
-        (report_dir / "verify_topk_token_20260823-000000.json").write_text(json.dumps(payload))
+        assert report_dir.is_dir() and not list(report_dir.iterdir()), "the report dir must be fresh and empty"
+        if behaviour["write_report"]:
+            payload = {"topk_checks": [
+                {"prompt_idx": i, "status": st, "fail_reason": None if st == "OK" else "chosen token not in ref top-5", "divergence_step": None}
+                for i, st in enumerate(behaviour["statuses"])]}
+            (report_dir / "verify_topk_token_20260823-000000.json").write_text(json.dumps(payload))
 
         class P:
-            returncode = 0
+            returncode = behaviour["returncode"]
             stdout = "[verify] PASS\n"
             stderr = ""
 
@@ -207,16 +250,46 @@ def test_verify_against_hf_runs_the_production_command_and_reads_the_report():
     try:
         with tempfile.TemporaryDirectory() as d:
             a = ma.ModelAdapter("llama32_1b")
-            v = a.verify_against_hf(Path(d) / "p.txt", Path(d) / "rep", cache_root=Path(d) / "root", max_seq=512, cwd=Path(d) / "cwd")
+            kw = dict(prefill_cache=Path(d) / "p", decode_cache=Path(d) / "dec", prefill_M=1024, max_seq=1056, cwd=Path(d) / "cwd")
+            v = a.verify_against_hf(Path(d) / "p.txt", Path(d) / "rep", **kw)
+            cmd, cwd, env = calls[0]
+            assert cmd[1].endswith("verify/verify_runner.py")
+            assert "--runner=llama32_1b.verify_adapter" in cmd and "topk_token" in cmd and "--no-strict" in cmd
+            assert env["LLMS_VERIFY_PREFILL_CACHE"].endswith("/p") and env["LLMS_VERIFY_DECODE_CACHE"].endswith("/dec")
+            assert env["LLMS_VERIFY_PREFILL_M"] == "1024" and env["LLMS_VERIFY_MAX_SEQ"] == "1056"
+            assert "LLMS_VERIFY_CACHE_ROOT" not in env and "LLMS_VERIFY_O_FFN_GEMM_METHOD" not in env
+            assert v["passed"] is False and "a prompt failed" in " ".join(v["problems"])
+            assert [p["status"] for p in v["per_prompt"]] == ["OK", "FAIL"]
+            assert v["report_json"].startswith(v["report_dir"]) and v["report_dir"].startswith(str(Path(d) / "rep"))
+            # all OK, exit 0: passed, in a SECOND fresh dir
+            behaviour["statuses"] = ["OK", "OK"]
+            v2 = a.verify_against_hf(Path(d) / "p.txt", Path(d) / "rep", **kw)
+            assert v2["passed"] is True and v2["report_dir"] != v["report_dir"]
+            # exit 1 with an OK report: not a pass
+            behaviour["returncode"] = 1
+            v3 = a.verify_against_hf(Path(d) / "p.txt", Path(d) / "rep", **kw)
+            assert v3["passed"] is False and "exited 1" in " ".join(v3["problems"])
+            # exit 0 but no report of its own (a crash that left older reports in OTHER dirs): not a pass
+            behaviour["returncode"] = 0
+            behaviour["write_report"] = False
+            v4 = a.verify_against_hf(Path(d) / "p.txt", Path(d) / "rep", **kw)
+            assert v4["passed"] is False and v4["report_json"] is None and "wrote no report" in " ".join(v4["problems"])
     finally:
         ma.subprocess.run = real
-    cmd, cwd, env = calls[0]
-    assert cmd[1].endswith("verify/verify_runner.py")
-    assert "--runner=llama32_1b.verify_adapter" in cmd and "topk_token" in cmd and "--no-strict" in cmd
-    assert env["LLMS_VERIFY_CACHE_ROOT"].endswith("root") and env["LLMS_VERIFY_MAX_SEQ"] == "512"
-    assert v["passed"] is False  # prompt 1 failed even though the process said PASS
-    assert [p["status"] for p in v["per_prompt"]] == ["OK", "FAIL"]
-    assert v["report_json"].endswith(".json") and v["max_seq"] == 512
+
+
+def test_artifact_content_sha_identifies_the_bytes_not_the_paths():
+    with tempfile.TemporaryDirectory() as d:
+        cache = Path(d) / "prefill_kernel_cache"
+        cache.mkdir()
+        (cache / "a.elf").write_bytes(b"x" * 10)
+        (cache / "manifest.json").write_text(json.dumps({"a": {"output_binary": "prefill_kernel_cache/a.elf", "kernel": "k", "insts": None, "launches": {"air_launches": 1, "herd_launches": 1}}}))
+        k1 = ma.artifact_content_sha([cache])
+        k1b = ma.artifact_content_sha([cache])  # relative manifest path, resolved against the cache's parent
+        (cache / "a.elf").write_bytes(b"y" * 10)  # same size, same name, other bytes
+        k2 = ma.artifact_content_sha([cache])
+    assert k1["sha256"] == k1b["sha256"] and k1["sha256"] != k2["sha256"]
+    assert k1["files"]["prefill_kernel_cache/a"][0][2] != k2["files"]["prefill_kernel_cache/a"][0][2]
 
 
 def test_weights_source_names_the_checkpoint_and_never_guesses_a_revision():

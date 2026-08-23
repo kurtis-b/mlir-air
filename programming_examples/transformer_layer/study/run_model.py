@@ -25,9 +25,12 @@ CONTRACT
     once and measures every rung on that set -- the drivers' `prepare_runtime`
     is one-shot per process, which is why the worker is a process and not a
     call; then run the production verify gate over that set's own prompts
-    (outside the clock, a subprocess) and stamp every row of the set with its
-    verdict: a row is `passed` ONLY if the gate passed on its prompt under the
-    same artifact set (doc 56 section 3.7); write the CSVs; audit the ledger;
+    (outside the clock, a subprocess, LOADING the timed artifact set by path --
+    the ELF bytes are sha256'd before timing, before the gate and after it, and
+    all three must agree) and stamp every row of the set with its verdict: a
+    row is `passed` ONLY if the gate exited 0, wrote its own report, ran the
+    row's own prompt at its own length (a prefill rung's full M tokens) and
+    said OK for it (doc 56 section 3.7); write the CSVs; audit the ledger;
     gate the root; write the manifest and the run report.
 
     THE CLOCK (operator rule 2026-08-22) is the adapter's: forward pass only.
@@ -252,10 +255,12 @@ def measured_row(rung, study_id: str, result: dict, plan_hash: str, extras: dict
     return row
 
 
-def stamp_verdict(row: dict, verdict: dict | None, prompt_idx: int | None) -> dict:
-    """Apply the gate's verdict to a measured row IN PLACE: `passed` only if the
-    gate passed on this row's prompt; otherwise `failed` with the reason. The
-    verdict is recorded inside selected_config_json either way."""
+def stamp_verdict(row: dict, verdict: dict | None, prompt_idx: int | None, prompt_tokens: int | None = None) -> dict:
+    """Apply the gate's verdict to a measured row IN PLACE: `passed` ONLY if the
+    gate process exited 0, wrote its own report, ran on the timed artifact
+    bytes, and that report says OK for THIS row's prompt; otherwise `failed`
+    with the reason. The verdict (and the verified prompt length) is recorded
+    inside selected_config_json either way."""
     if row["run_status"] != "passed":
         return row
     cfg = json.loads(row["selected_config_json"] or "{}")
@@ -264,19 +269,32 @@ def stamp_verdict(row: dict, verdict: dict | None, prompt_idx: int | None) -> di
         row["failure_message"] = "verify gate not run (--no-verify): an ungated row is not a passed row"
         cfg["verify"] = {"ran": False}
     else:
-        mine = [p for p in verdict["per_prompt"] if p["prompt_idx"] == prompt_idx]
-        # the row's OWN prompt decides it (doc 56 section 3.7: the gate at the
-        # row's plan); the whole-set verdict is recorded beside it.
-        ok = verdict.get("returncode") is not None and len(mine) == 1 and mine[0]["status"] == "OK"
+        mine = [p for p in verdict.get("per_prompt") or [] if p["prompt_idx"] == prompt_idx]
+        why = []
+        if verdict.get("returncode") != 0:
+            why.append(f"the gate exited {verdict.get('returncode')}")
+        if not verdict.get("report_json"):
+            why.append("the gate wrote no report of its own")
+        for problem in verdict.get("artifact_problems") or []:
+            why.append(problem)
+        if verdict.get("error"):
+            why.append(str(verdict["error"]))
+        if len(mine) != 1:
+            why.append(f"no verdict for prompt {prompt_idx}")
+        elif mine[0]["status"] != "OK":
+            why.append(mine[0].get("fail_reason") or "top-k set check FAIL")
         cfg["verify"] = {
-            "ran": True, "passed": ok, "gate_passed_all_prompts": verdict["passed"], "prompt_idx": prompt_idx,
-            "per_prompt": mine, "report_json": verdict.get("report_json"), "returncode": verdict.get("returncode"),
-            "cache_root": verdict.get("cache_root"), "max_seq": verdict.get("max_seq"),
+            "ran": True, "passed": not why, "gate_passed_all_prompts": bool(verdict.get("passed")),
+            "prompt_idx": prompt_idx, "prompt_tokens": prompt_tokens, "per_prompt": mine,
+            "report_json": verdict.get("report_json"), "report_dir": verdict.get("report_dir"),
+            "returncode": verdict.get("returncode"), "prefill_cache": verdict.get("prefill_cache"),
+            "decode_cache": verdict.get("decode_cache"), "prefill_M": verdict.get("prefill_M"), "max_seq": verdict.get("max_seq"),
+            "artifact_sha_timed": verdict.get("artifact_sha_timed"), "artifact_sha_before_gate": verdict.get("artifact_sha_before_gate"),
+            "artifact_sha_after_gate": verdict.get("artifact_sha_after_gate"), "problems": why,
         }
-        if not ok:
+        if why:
             row["run_status"] = "failed"
-            why = (mine[0].get("fail_reason") if mine else None) or f"gate returncode {verdict.get('returncode')}"
-            row["failure_message"] = f"verify gate FAIL on this row's prompt: {why}"[:300]
+            row["failure_message"] = ("verify gate: " + "; ".join(why))[:300]
     row["selected_config_json"] = json.dumps(cfg, sort_keys=True)
     schema.validate_row(row)
     return row
@@ -313,8 +331,12 @@ def worker(args) -> int:
     forbidden = {tok.eos_token_id}
     caches = (ms.session.prefill_cache, ms.session.decode_cache)
     artifact = model_adapter.artifact_key(model_id, M, spec["precision_plan"], [ms.prefill_cache_dir, ms.decode_cache_dir])
+    timed_sha = model_adapter.artifact_content_sha([ms.prefill_cache_dir, ms.decode_cache_dir])
+    out["timed_artifact_sha"] = timed_sha
     note_path = ms.prefill_cache_dir / model_adapter.COMPILE_NOTE
     deviation = json.loads(note_path.read_text(encoding="utf-8")).get("artifact_deviation") if note_path.is_file() else None
+    forced = model_adapter.forced_methods_of(deviation)
+    work_dir = Path(args.out).parent
 
     prompt_cache: dict[int, str] = {}
 
@@ -341,7 +363,11 @@ def worker(args) -> int:
         try:
             text = prompt(rung.prompt_tokens)
             ids = encode(text)
-            plan_ = model_adapter.plan_for(model_id, rung.phase, rung.seq, rung.context_end, M, rung.precision_plan)
+            plan_ = model_adapter.plan_for(model_id, rung.phase, rung.seq, rung.context_end, M, rung.precision_plan, forced=forced)
+            mismatch = model_adapter.plan_launches_match_manifest(plan_, adapter._launch_counts)
+            if mismatch:
+                raise RuntimeError("the plan does not describe the artifact set: " + "; ".join(mismatch))
+            predicted = model_adapter.model_dispatch_vector_from_manifest(plan_, adapter._launch_counts, "prefill" if rung.phase == "prefill" else "decode")
             c0 = reconf()
             if rung.phase == "prefill":
                 res = adapter.prefill(ids, "whole", None, samples=spec["prefill_samples"], warmup=spec["prefill_warmup"])
@@ -351,6 +377,20 @@ def worker(args) -> int:
                 res = adapter.decode(pre.state, rung.n_tokens, warmup=spec["decode_warmup"])
                 warm = spec["decode_warmup"]
             c1 = reconf()
+            # THE LIVE CHECK (review finding 5): what the driver dispatched, per
+            # forward or per token, equals what the plan + manifest derive.
+            drift = {k: (res.dispatch[k], predicted[k]) for k in ("host_submissions", "runlist_entries", "air_launches", "herd_launches")
+                     if res.dispatch[k] != predicted[k]}
+            trace_path = work_dir / f"trace_{rung.case_id.replace('/', '_')}.json"
+            trace_path.write_text(json.dumps({
+                "model_id": model_id, "case_id": rung.case_id, "phase": rung.phase, "M": M, "context_end": rung.context_end,
+                "scope": res.dispatch["scope"], "trace_samples": res.trace_samples, "trace": res.trace,
+                "launch_counts": adapter._launch_counts, "plan_sha": plan_.sha, "forced": forced,
+                "measured_vector": res.dispatch, "predicted_vector": predicted, "timed_artifact_sha": timed_sha["sha256"],
+                "devq_job_id": os.environ.get("DEVQ_JOB_ID"), "recorded_utc": datetime.now(timezone.utc).isoformat(),
+            }, indent=1, default=str), encoding="utf-8")
+            if drift:
+                raise RuntimeError(f"the driver's dispatch differs from the plan's: {drift} (measured, predicted)")
             result = {
                 "weights_source": ms.weights_source, "prepare_s": ms.prepare_s, "warmup": warm,
                 "samples_s": res.samples_s, "logical_tokens": res.logical_tokens, "measured_tokens": res.measured_tokens,
@@ -369,6 +409,11 @@ def worker(args) -> int:
                 "phase_dispatch_vector": adapter.dispatch_vector("decode") if rung.phase == "decode" else res.dispatch,
                 "qkv_scratch_layout": adapter._scratch_layout,
                 "artifact_deviation": deviation,
+                "plan_forced": forced,
+                "plan_source": plan_.source,
+                "timed_artifact_sha": timed_sha["sha256"],
+                "predicted_vector": predicted,
+                "trace_file": str(trace_path),
             }
             row = measured_row(rung, spec["study_id"], result, plan_.sha, extras)
             if deviation:
@@ -384,7 +429,9 @@ def worker(args) -> int:
             out["errors"].append(f"{rung.case_id}: {msg}")
     gate_file = prompts_dir / "gate_prompts.txt"
     gate_file.write_text("".join(prompt(n) + "\n" for n in gate_prompts), encoding="utf-8")
-    out["gate"] = {"prompts_file": str(gate_file), "prompt_tokens": gate_prompts, "map": gate_map}
+    out["gate"] = {"prompts_file": str(gate_file), "prompt_tokens": gate_prompts, "map": gate_map,
+                   "prefill_M": M, "max_seq": M + model_profiles.GATE_N_TOKENS,
+                   "prefill_cache": str(ms.prefill_cache_dir), "decode_cache": str(ms.decode_cache_dir)}
     Path(args.out).write_text(json.dumps(out, indent=1, default=str), encoding="utf-8")
     return 0
 
@@ -418,21 +465,35 @@ def run_worker(model_id: str, M: int, rungs: list, *, compiled: dict, study_id: 
     return json.loads(out_json.read_text(encoding="utf-8"))
 
 
-def run_verify(model_id: str, M: int, gate: dict, *, compiled: dict, out_dir: Path) -> dict:
-    """The production gate over the set's prompts, in the set's cache root."""
+def run_verify(model_id: str, M: int, gate: dict, *, compiled: dict, out_dir: Path, timed_sha: dict | None = None) -> dict:
+    """The production gate over the set's prompts, on EXACTLY the timed
+    artifact set: the ELF bytes are content-hashed before and after the gate
+    and both must equal the hash the worker took before timing; a mismatch is
+    an `artifact_problems` entry that fails every row of the set."""
     adapter = model_adapter.ModelAdapter(model_id)
-    cache_root = Path(compiled["prefill_cache"]).parent
-    report_dir = out_dir / "verify" / f"{model_id}_M{M}"
-    cwd = cache_root if M == model_profiles.SHIPPED_PREFILL_M else Path(compiled["prefill_cache"]).parent / "verify_cwd"
-    extra_env = {}
-    note = Path(compiled["prefill_cache"]) / model_adapter.COMPILE_NOTE
-    if note.is_file():
-        deviation = json.loads(note.read_text(encoding="utf-8")).get("artifact_deviation") or {}
-        if deviation.get("o_ffn_gemm_method"):
-            extra_env["LLMS_VERIFY_O_FFN_GEMM_METHOD"] = deviation["o_ffn_gemm_method"]
-    verdict = adapter.verify_against_hf(gate["prompts_file"], report_dir, cache_root=cache_root, max_seq=M, cwd=cwd, extra_env=extra_env)
+    prefill_cache, decode_cache = Path(compiled["prefill_cache"]), Path(compiled["decode_cache"])
+    report_root = out_dir / "verify" / f"{model_id}_M{M}"
+    cwd = out_dir / "verify" / f"{model_id}_M{M}" / "cwd"
+    before = model_adapter.artifact_content_sha([prefill_cache, decode_cache])
+    verdict = adapter.verify_against_hf(gate["prompts_file"], report_root, prefill_cache=prefill_cache, decode_cache=decode_cache,
+                                        prefill_M=gate.get("prefill_M", M), max_seq=gate.get("max_seq", M + model_profiles.GATE_N_TOKENS), cwd=cwd)
+    after = model_adapter.artifact_content_sha([prefill_cache, decode_cache])
+    problems = []
+    if timed_sha is not None and before["sha256"] != timed_sha["sha256"]:
+        problems.append(f"artifact set changed between timing and the gate ({timed_sha['sha256'][:12]} -> {before['sha256'][:12]})")
+    if after["sha256"] != before["sha256"]:
+        problems.append(f"the gate modified the artifact set ({before['sha256'][:12]} -> {after['sha256'][:12]})")
+    verdict["artifact_problems"] = problems
+    verdict["artifact_sha_timed"] = timed_sha["sha256"] if timed_sha else None
+    verdict["artifact_sha_before_gate"] = before["sha256"]
+    verdict["artifact_sha_after_gate"] = after["sha256"]
+    if problems:
+        verdict["passed"] = False
+        verdict["problems"] = list(verdict.get("problems") or []) + problems
+    report_dir = Path(verdict["report_dir"])
     (report_dir / "verify.log").write_text(verdict.pop("log") or "", encoding="utf-8")
     (report_dir / "verdict.json").write_text(json.dumps(verdict, indent=1, default=str), encoding="utf-8")
+    (report_root / "latest_verdict.json").write_text(json.dumps(verdict, indent=1, default=str), encoding="utf-8")
     return verdict
 
 
@@ -470,7 +531,7 @@ def run(profile, out_dir, *, study_id: str, worker_fn=None, verifier=None, repo=
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     worker_fn = worker_fn or (lambda model_id, M, rungs, compiled: run_worker(model_id, M, rungs, compiled=compiled, study_id=study_id, profile=profile, out_dir=out_dir))
-    verifier = verifier or (lambda model_id, M, g, compiled: run_verify(model_id, M, g, compiled=compiled, out_dir=out_dir))
+    verifier = verifier or (lambda model_id, M, g, compiled, timed_sha=None: run_verify(model_id, M, g, compiled=compiled, out_dir=out_dir, timed_sha=timed_sha))
     repo_root = Path(repo) if repo else Path(_PE).parent
     expected_files = profile.expected_files()
 
@@ -521,14 +582,17 @@ def run(profile, out_dir, *, study_id: str, worker_fn=None, verifier=None, repo=
                 verdict = None
                 if verify and result.get("gate"):
                     try:
-                        verdict = verifier(model_id, M, result["gate"], compiled=compiled)
+                        verdict = verifier(model_id, M, result["gate"], compiled=compiled, timed_sha=result.get("timed_artifact_sha"))
                     except Exception as exc:
                         verdict = {"passed": False, "returncode": None, "per_prompt": [], "report_json": None, "error": f"{type(exc).__name__}: {exc}"}
                     verdicts[f"{model_id}_M{M}"] = {k: v for k, v in verdict.items() if k != "log"}
-                gate_map = (result.get("gate") or {}).get("map") or {}
+                gate_spec = result.get("gate") or {}
+                gate_map = gate_spec.get("map") or {}
+                gate_tokens = gate_spec.get("prompt_tokens") or []
                 for row in result["rows"]:
                     rung = next(r for r in todo if r.case_id == row["study_case_id"])
-                    stamp_verdict(row, verdict, gate_map.get(rung.case_id))
+                    idx = gate_map.get(rung.case_id)
+                    stamp_verdict(row, verdict, idx, gate_tokens[idx] if idx is not None and idx < len(gate_tokens) else None)
                     rows_by_key[resume_mod.rung_key(rung.mode, rung.seq, rung.extra)] = row
                     ledger.record_rung(rung.mode, rung.seq, row, "measured")
             power_columns = monitor.stats()

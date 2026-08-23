@@ -26,9 +26,10 @@ ubatch curve holds the prompt fixed and varies the chunk, and is H1b's.
 
 THE DECODE RUNGS END at the named context: `context_end_tokens` is the ctx,
 the prompt is `ctx - n_tokens` tokens and the n_tokens decode steps fill the
-context up to it. That is what lets the production verify gate (32 tokens
-after the prompt, inside the compiled max_seq) run the SAME prompt as the
-measurement, so the row's plan hash and the gate's are one workload.
+context up to it. The production verify gate runs the SAME prompt as every
+measurement -- the decode rung's `ctx - 32` tokens, the prefill rung's full
+M tokens -- with `M + 32` of KV room, so the row's plan hash, its prompt and
+the gate's are one workload.
 
 FOOTGUNS
     - `model-smoke`'s M=512 and M=1024 prefill rungs for Qwen3-0.6B need the
@@ -123,10 +124,19 @@ class ModelRung:
 
     @property
     def gate_prompt_tokens(self) -> int:
-        """Tokens the gate's prompt holds: the decode rung's own prompt; for a
-        prefill rung, M - n_tokens so the gate's 32 decode steps fit the
-        compiled max_seq. Same artifact set, same plan hash (the plan keys on M)."""
-        return self.prompt_tokens if self.phase == "decode" else self.M - GATE_N_TOKENS
+        """Tokens the gate's prompt holds: EXACTLY the measurement's prompt
+        (H1a review finding 3 -- the gate must run the timed workload, a full
+        M-token prompt for a prefill rung, not a padded shorter one). The
+        gate's 32 generation slots come from `gate_max_seq`, never from
+        shortening the prompt."""
+        return self.prompt_tokens
+
+    @property
+    def gate_max_seq(self) -> int:
+        """KV / RoPE capacity the gate runs with: the compiled M plus the 32
+        generation steps (LLMS_VERIFY_MAX_SEQ); the prefill ELF still pads to
+        M (LLMS_VERIFY_PREFILL_M)."""
+        return self.M + GATE_N_TOKENS
 
 
 #: The production gate decodes 32 tokens after each prompt (verify_runner.GATE_N_TOKENS).

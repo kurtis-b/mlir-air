@@ -468,6 +468,31 @@ def _o_ffn_backend(verbose=False):
 _FUSED_SCRATCH_FOR = None
 
 
+def restore_scratch_layout(config, seq_len):
+    """`[2026-08-23]` Set `_FUSED_SCRATCH_FOR` WITHOUT compiling: the layout
+    `alloc_gemm_scratch` gives the QKV ELF at this seq_len from the registry's
+    Q/K/V methods (base arg 17), exactly as `compile_all_kernels` leaves it.
+    A process that loads the manifest (`--run-only`, the verify adapter on a
+    timed artifact set, the model study) passed 17 args to an 18-arg ELF at
+    seq_len 2048 (Q is fused-cast there) until this existed. Returns the layout."""
+    global _FUSED_SCRATCH_FOR
+    from shared.builders.gemm_builder import gemm_registry_config
+    from shared.infra.stitching import alloc_gemm_scratch
+
+    q_dim = config.n_heads * config.head_dim
+    kv_dim = config.n_kv_heads * config.head_dim
+    _args, scratch_for = alloc_gemm_scratch(
+        [
+            (gemm_registry_config(seq_len, config.emb_dim, q_dim, "bf16", "high"), seq_len, q_dim),
+            (gemm_registry_config(seq_len, config.emb_dim, kv_dim, "bf16", "high"), seq_len, kv_dim),
+            (gemm_registry_config(seq_len, config.emb_dim, kv_dim, "bf16", "high"), seq_len, kv_dim),
+        ],
+        base_arg_count=17,
+    )
+    _FUSED_SCRATCH_FOR = scratch_for
+    return list(scratch_for)
+
+
 def compile_all_kernels(cache, config, seq_len, verbose=False, cpu_attn=False, o_ffn_gemm_method=None):
     global _FUSED_SCRATCH_FOR
     emb_dim = config.emb_dim

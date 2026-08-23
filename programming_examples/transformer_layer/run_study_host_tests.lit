@@ -502,5 +502,26 @@
 // compiled set; two walks compare OK and a 25 % tok/s drift fails; an exact
 // prompt length under an uneven tokenizer.
 //
+// `[2026-08-23]` 652 -> 656, no module added: item 13's one Codex review
+// round (devq 573, five blocking findings, all on the gate's BINDING of a
+// passed row to what it measured). test_model_adapter: the tautological
+// provenance test (a profiler trace fabricated FROM the plan) is replaced by
+// one over RECORDED driver traces -- `study/fixtures/h1a_driver_traces/`,
+// five Profiler traces the production drivers produced on the device (devq
+// 574) with the manifests they loaded -- run through the adapter's one
+// arithmetic against a plan recomputed here (its sha pinned), plus a negative
+// control where one extra `load_and_run` call moves the vector; the gate test
+// now asserts the verify call hands the TIMED artifact set by path (loaded,
+// never compiled), owns a fresh empty report dir per call, and refuses a
+// nonzero exit or a report it did not write; +1 content identity of the ELF
+// bytes (same size, same name, other bytes -> other sha). test_run_model +2:
+// a verifier exiting 1 with an OK report fails every row; one that wrote no
+// report fails every row; an artifact set that changed under the gate fails
+// every row and the worker's content hash reaches the verifier.
+// test_model_profiles: the gate prompt IS the timed prompt (a prefill rung's
+// full M tokens; the 32 generation slots come from `gate_max_seq`), replacing
+// the M-32 clause. PLAN stays 10/10 with a forced GEMM method now part of the
+// plan and its hash (the M=1024 cascade hashes as the plan that built it).
+//
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 652/652 passed in 30 modules
+// CHECK: study host tests: 656/656 passed in 30 modules

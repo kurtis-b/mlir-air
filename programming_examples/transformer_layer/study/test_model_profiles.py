@@ -59,11 +59,16 @@ def test_prefill_rungs_are_labelled_kernel_scaling_and_never_ubatch():
             assert r.M == mp.SHIPPED_PREFILL_M
 
 
-def test_gate_prompt_fits_the_compiled_max_seq_and_shares_the_artifact_set():
+def test_the_gate_runs_the_timed_prompt_at_its_own_length():
+    """H1a review finding 3: a prefill rung times M valid tokens, so its gate
+    prompt is M tokens -- never M-32 -- and the 32 generation slots come from
+    `gate_max_seq` (= M + 32, the KV capacity), not from a shorter prompt."""
     for r in mp.profile("model-smoke").rungs():
-        assert r.gate_prompt_tokens + mp.GATE_N_TOKENS <= r.M
-        if r.phase == "decode":
-            assert r.gate_prompt_tokens == r.prompt_tokens  # the gate runs the measurement's own prompt
+        assert r.gate_prompt_tokens == r.prompt_tokens, r.case_id
+        if r.phase == "prefill":
+            assert r.gate_prompt_tokens == r.M
+        assert r.gate_max_seq == r.M + mp.GATE_N_TOKENS
+        assert r.gate_prompt_tokens + mp.GATE_N_TOKENS <= r.gate_max_seq
 
 
 def test_resume_identity_is_the_v3_row_key():
