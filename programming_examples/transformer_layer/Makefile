@@ -33,7 +33,7 @@ SWEEP_ARGS ?=
         check-transpose check-elementwise-mul check-norm-tail \
         check-norm-tail-fault check-norm-tail-structure \
         check-ffn-accum check-ffn-accum-fault check-ffn-accum-structure \
-        check-pipeline-fusion \
+        check-pipeline-fusion check-tail-pipeline-structure \
         reference-tests block-cache-tests blocked-attention-tests \
         registry-resolution registry-sweep registry-write registry-plan \
         registry-writer-tests
@@ -119,6 +119,15 @@ help:
 	@echo "                      must route as three herds on core-to-core"
 	@echo "                      flows, take at most 2 shim-facing streams per"
 	@echo "                      column, and carry ZERO packet-typed channels."
+	@echo "  make check-tail-pipeline-structure"
+	@echo "                      The tail pipeline (iron's addnorm_ffn port,"
+	@echo "                      builders/tail_pipeline.py): AN1 -> FFN with"
+	@echo "                      partial-sum staging -> AN2 compiled through"
+	@echo "                      the real aircc at both claimed shapes must"
+	@echo "                      route as ONE segment with core->core flows"
+	@echo "                      exactly n_b, at most 2 shim MM2S per column,"
+	@echo "                      ZERO packet-typed channels, every memtile"
+	@echo "                      under 48 BDs, one L1 copy per buffer. Host-only."
 	@echo "  make check-pipeline-fusion"
 	@echo "                      H8: air-fuse-pipeline-launches given J7a's"
 	@echo "                      three stages as separate attributed launches"
@@ -594,6 +603,28 @@ check-ffn-resident-fault:
 # that stays live meanwhile is run_ffn_resident_emulation_tests.lit.
 check-ffn-resident-structure:
 	python3 $(srcdir)/ffn_resident_structure.py
+
+# The tail pipeline's structural check, host-only: iron's addnorm_ffn
+# (branch dev-addnorm-ffn, commit 5cebcd7) ported as builders/tail_pipeline.py
+# -- two AN1 cores, n_b up cores, n_b down cores with their private partial
+# accumulators ringing through L2, the reduction chain, two AN2 cores -- in
+# ONE air.segment. Compiled through the real aircc (--debug-ir) at iron's
+# baseline (64x48x96, m 64, k 48, n 96, depth 1, n_b 1) and a 16-row chain
+# (64x96x192, m 16, k 48, n 96, depth 2, n_b 2); the dumps must show one
+# tile-bearing aie.device, core->core flows exactly n_b (the up->down H
+# edges -- every other hop is memtile-mediated by the core port budget, the
+# builder's docstring carries the arithmetic), the per-column shim MM2S
+# census at or under 2 (its negative control runs first), ZERO packet-typed
+# channels, fewer than 48 BDs per memtile, the builder's L1 buffer plan per
+# core, the 4-D retile on a memtile, and every kernel dispatched by name.
+# No NPU and no kernel objects: the compile stops at the core-ELF link,
+# deliberately, and clause 1 requires that to be the only error -- which is
+# why PEANO_INSTALL_DIR is passed through: without it aiecc takes the chess
+# path and fails earlier, on a different text, and the clause reads that as
+# a refusal (lit sanitizes the environment; the recipe supplies it).
+check-tail-pipeline-structure:
+	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) \
+	    python3 $(srcdir)/tail_pipeline_structure.py
 
 # Phase E4: the same layer, measured as the `runlist` execution strategy — the
 # fine-grained point of the taxonomy. coarse's dispatch schedule refined into

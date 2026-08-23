@@ -1,0 +1,65 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// The tail pipeline's structural gate: iron's addnorm_ffn (AN1 -> FFN with
+// partial-sum staging -> AN2), ported as builders/tail_pipeline.py, ROUTED
+// AS ONE SEGMENT by the production aircc.
+//
+// Host-only, on purpose: tail_pipeline_structure.py compiles the module
+// through XRTBackend(debug_ir=True) in a temp cwd, reads the per-pass dumps
+// and asserts ten clauses (one tile-bearing device, core->core flows
+// exactly n_b, zero packet channels, the per-column shim MM2S census with
+// its negative control, the memtile and core BD caps, the L1 buffer plan
+// per core, the 4-D retile living on a memtile, dispatch by symbol, and
+// lowering liveness). No NPU, no device lock, no kernel objects: the
+// compile ends at the core-ELF link, deliberately, and clause 1 requires
+// that THAT be the only error. Modelled on run_ffn_resident_emulation_tests
+// .lit (the arm that stays live while a device gate is parked); what it
+// needs beyond that lit is aircc and the Peano linker, so a tree without
+// Peano reports UNSUPPORTED rather than failing clause 1 on a different
+// error text -- and the Peano root is handed to make explicitly, because
+// lit sanitizes the environment and without it aiecc takes the chess path
+// and fails earlier, on that other text.
+//
+// Editing this header: lit scans the WHOLE file for directives, so naming
+// one in prose registers as a second directive. Describe them, never spell
+// them out.
+//
+// REQUIRES: peano
+//
+// RUN: mkdir -p test_tail_pipeline_structure
+// RUN: cd test_tail_pipeline_structure
+// RUN: make -f %S/Makefile check-tail-pipeline-structure PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+//
+// The census's negative control FIRST: an arm that cannot fail is not a
+// gate. Three herd-direct L3 streams per column must read 3 against a
+// budget of 2, and the pre-widening shim->core-only count must read 0 on it.
+// CHECK: census negative control: 3 L3 streams per column -> widened census 3, pre-widening shim->core count 0, packet streams 12
+//
+// Both verdict lines, with every count stated inside them, so a lowering
+// that re-split the segment, moved a stage edge, packet-multiplexed a
+// column, grew a memtile program, rotated an L1 buffer, or moved the retile
+// off the memtile cannot match here. The literals are RE-DERIVED from a
+// dump written by build-xrt's aircc of 2026-08-19 15:36 (sha256 254eb3ba)
+// on 2026-08-22; if one has to move, re-derive it from a fresh dump of the
+// compiler in hand and record that compiler -- never confirm it against
+// the previous value.
+//
+// Baseline: iron's test.py row (64, 48, 96, m 64, k 48, n 96, depth 1,
+// nB 1). Six cores in one row; ONE core->core flow (up -> down); six
+// L2-staged shim streams over five columns, worst column 2; the
+// row-major -> blocked retile as FOUR-dimensional memtile BDs (rpc = 32,
+// four microtile rows); no adder (no chain).
+// CHECK: [tail-pipeline-structure] tail_pipeline [baseline 64x48x96 m64 k48 n96 d1 nb1]: PASS (1 device, 6 cores, 1 core->core, 0 packet-typed channels, shim MM2S 6/16 worst column 2, memtile BDs max 12/48, core BDs max 6/16, L1 worst 47104 B, memtile 4-D BDs 4, adders 0)
+//
+// Chain: the 16-row tile with a two-block ring and two columns. Eight
+// cores; TWO core->core flows; the retile collapses to 3-D (rpc = 8, one
+// microtile row) so the 4-D count is legitimately 0 and clause 8 only
+// forbids a 4-D BD on a core there; exactly ONE down core carries the
+// eltwise add (core 0 folds in core 1's partial), the role specialization
+// through scf.index_switch surviving air-to-aie.
+// CHECK: [tail-pipeline-structure] tail_pipeline [chain 64x96x192 m16 k48 n96 d2 nb2]: PASS (1 device, 8 cores, 2 core->core, 0 packet-typed channels, shim MM2S 6/16 worst column 2, memtile BDs max 34/48, core BDs max 7/16, L1 worst 20992 B, memtile 4-D BDs 0, adders 1)
+//
+// The verdict last, so a clause that stops being defined fails here rather
+// than passing quietly.
+// CHECK: [tail-pipeline-structure] PASS
