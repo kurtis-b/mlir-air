@@ -115,7 +115,19 @@ rms_qkv4_lut = _qkv4.position_lut  # the tiled LUT; the 2-launch form takes its 
 
 
 def rms_qkv4_args(lw, x_bf16, lut, config):
-    """(inputs, output_indices, static_input_indices, intermediate_indices)."""
+    """(inputs, output_indices, static_input_indices, intermediate_indices) of
+    the QKV stage in the form `_RMS_QKV_KERNEL` names -- the 2-launch ABI
+    (5 args, one LUT row) when `QWEN3_RMS_QKV_LAUNCHES` is 2, else the
+    4-launch ABI (9 args, the tiled LUT). Mirrors `run_rms_qkv4`."""
+    if _RMS_QKV_LAUNCHES == 2:
+        return (
+            _qkv4.call_args_2(
+                lw, x_bf16, np.asarray(lut).reshape(-1)[: config.head_dim], config
+            ),
+            _qkv4.OUTPUT_INDICES_2,
+            _qkv4.STATIC_INDICES_2,
+            _qkv4.INTERMEDIATE_INDICES_2,
+        )
     return (
         _qkv4.call_args(lw, x_bf16, lut, config),
         _qkv4.OUTPUT_INDICES,

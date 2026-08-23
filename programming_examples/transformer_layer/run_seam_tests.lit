@@ -31,3 +31,10 @@
 // the registry with every mismatch in a named class.
 // RUN: python3 %S/../llms/shared/plan/test_plan.py | FileCheck %s --check-prefix=PLAN
 // PLAN: 10/10 passed
+//
+// `[2026-08-23]` Doc 57 O1 second half: the Qwen3 QKV stage's two host ABIs --
+// the driver's argument helper follows QWEN3_RMS_QKV_LAUNCHES, the 2-launch
+// shapes, the augmented weight's (tag, kind) per row, the slot gather as the
+// inverse of the device's slot layout.
+// RUN: python3 %S/../llms/shared/infra/test_decode_qkv4.py | FileCheck %s --check-prefix=QKV4
+// QKV4: 4/4 passed

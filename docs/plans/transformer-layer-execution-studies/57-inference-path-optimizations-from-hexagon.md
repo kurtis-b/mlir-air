@@ -508,10 +508,13 @@ H2/H3 phases measure.
    4 launches **13.04 / 12.91 tok/s** (76.7 / 77.5 ms; layer loop 2201.7 / 2227.8 ms per 896
    invocations; `rms_qkv` 0.65 / 0.66, kernel 0.61 / 0.62) → 2 launches **13.40 / 13.52
    tok/s** (74.6 / 74.0 ms; layer loop 2135.6 / 2114.4; `rms_qkv` **0.49**, kernel 0.44);
-   `lm_head_gemv` 7.68–7.72 and `o_gemv_ffn` 1.57–1.61 unchanged. **−2.7 … −3.5 ms/token
-   against the −6 predicted**: the line moved −0.16 … −0.17 × 28 = −4.6, the layout/slots
-   cost takes ~1.3 back, the rest is within the other lines' rep-to-rep spread. Boundaries per
-   token 206 → **150** (28 × 5 + 10). The 1.7B driver keeps its 4-launch names (re-verified on
+   `lm_head_gemv` 7.68–7.72 and `o_gemv_ffn` 1.57–1.61 unchanged. **−2.1 … −3.5 ms/token**
+   (layer-loop pairs (2201.7 − 2135.6) / 32 = 2.06 and (2227.8 − 2114.4) / 32 = 3.54;
+   76.7 / 77.5 → 74.6 / 74.0 ms by tok/s) **against the −6 predicted**: the `rms_qkv` line
+   moved −0.16 … −0.17 ms × 28 = −4.6 ms, and that line already contains the ~48 µs/layer
+   layout/slot cost (it is why the line did not fall by the full 2 × ~107 µs); the gap between
+   −4.6 and the token delta is the other lines' rep-to-rep spread (the 4-launch reps themselves
+   differ by 0.8 ms/token). Boundaries per token 206 → **150** (28 × 5 + 10). The 1.7B driver keeps its 4-launch names (re-verified on
    the same compiler: `make verify` PASS 2 / 0, devq 559). Open: the 128 KB slot D2H and the +6 % weight
    bytes are the ~48 µs still paid (a partial BO sync or a host index trick could recover
    some); the form assumes `rows_per_col % head_dim == 0` (true for 0.6B / 1.7B / 4B); the
