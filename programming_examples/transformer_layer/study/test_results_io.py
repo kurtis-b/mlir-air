@@ -135,13 +135,13 @@ def test_the_v2_columns_really_are_appended_at_the_end():
     middle, the prefix rule silently starts misreading archived trees -- so the
     property is pinned here rather than trusted."""
     names = [f.name for f in schema.fields_for("results")]
-    assert names[-5:] == [
-        "device_ms",
-        "sync_ms",
-        "host_cpu_ms",
-        "context_loads",
-        "kernel_attaches",
-    ], names[-5:]
+    v2_suffix = ["device_ms", "sync_ms", "host_cpu_ms", "context_loads", "kernel_attaches"]
+    v3 = list(schema.MODEL_SCOPE_FIELDNAMES)
+    # `[2026-08-23]` v3 appended thirteen model-scope columns AFTER the v2 five,
+    # so a v2 file is a strict prefix of a v3 header exactly as a v1 file was
+    # of a v2 one. Both suffixes are pinned by position.
+    assert names[-len(v3):] == v3, names[-len(v3):]
+    assert names[-len(v3) - 5 : -len(v3)] == v2_suffix, names[-len(v3) - 5 : -len(v3)]
 
 
 def test_compatible_read_accepts_a_v1_file_and_fills_none():

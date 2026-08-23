@@ -93,8 +93,15 @@ def build_o_ffn_qwen_module(
     swiglu_tile_n=4096,
     swiglu_herd_x=8,
     swiglu_herd_y=1,
+    gemm_method=None,
 ):
     """O-proj(q_dim->emb_dim) + Residual + FFN, 8 launches.
+
+    `gemm_method` `[2026-08-23]`: force every GEMM's registry method (the
+    cascade below is fused-cast-only: its slices bind a 4-arg GEMM with an f32
+    scratch). At M=512/1024 the registry's best is `drain` (3-arg, no scratch),
+    which this builder cannot stitch -- doc 56 H1a compiles those artifact sets
+    with `gemm_method="fused-cast"` and records the deviation on every row.
 
     Func args:
       %arg0  attn_out  (seq, q_dim)         <- DECOUPLED (q_dim, not emb_dim)
@@ -139,9 +146,9 @@ def build_o_ffn_qwen_module(
     n_total = seq_len * emb_dim
 
     # O GEMM is decoupled: M=seq, K=q_dim, N=emb_dim.
-    o_spec = gemm_registry_config(seq_len, q_dim, emb_dim, "bf16", "high")
-    g_spec = gemm_registry_config(seq_len, emb_dim, hidden_dim, "bf16", "high")
-    d_spec = gemm_registry_config(seq_len, hidden_dim, emb_dim, "bf16", "high")
+    o_spec = gemm_registry_config(seq_len, q_dim, emb_dim, "bf16", "high", method=gemm_method)
+    g_spec = gemm_registry_config(seq_len, emb_dim, hidden_dim, "bf16", "high", method=gemm_method)
+    d_spec = gemm_registry_config(seq_len, hidden_dim, emb_dim, "bf16", "high", method=gemm_method)
 
     def _tiles(spec):
         return (
@@ -346,9 +353,19 @@ def build_o_ffn_qwen_module(
         "@f32_to_bf16_mn" + _gemm_sym,
     }
     assert g_spec["sym_suffix"] == _gemm_sym and d_spec["sym_suffix"] == _gemm_sym, (
-        "Qwen o_ffn assumes all 4 GEMMs share the fused-cast mm_m64n128.o suffix; "
-        f"got O={o_spec['method']} G={g_spec['method']} D={d_spec['method']}"
+        "Qwen o_ffn assumes all 4 GEMMs share one mm.o variant (one sym suffix per ELF); "
+        f"got O={o_spec['method']}{o_spec['sym_suffix']} G={g_spec['method']}{g_spec['sym_suffix']} "
+        f"D={d_spec['method']}{d_spec['sym_suffix']} -- the registry measured these shapes' "
+        "tiles at different tile_n"
     )
+    for nm, sp in (("O", o_spec), ("gate/up", g_spec), ("down", d_spec)):
+        if not sp["needs_f32_scratch"]:
+            raise ValueError(
+                f"o_ffn_qwen at seq_len={seq_len}: the {nm} GEMM's registry method is "
+                f"{sp['method']!r} (3 args, no f32 scratch) and this cascade binds a 4-arg "
+                "fused-cast GEMM at every slice; pass gemm_method='fused-cast' to force the "
+                "supported form (recorded as a plan deviation) -- doc 56 H1a wall"
+            )
 
     base_args = [
         FuncArg("%arg0", f"memref<{seq_len}x{q_dim}xbf16>"),  # attn_out (DECOUPLED)
@@ -451,7 +468,7 @@ def _o_ffn_backend(verbose=False):
 _FUSED_SCRATCH_FOR = None
 
 
-def compile_all_kernels(cache, config, seq_len, verbose=False, cpu_attn=False):
+def compile_all_kernels(cache, config, seq_len, verbose=False, cpu_attn=False, o_ffn_gemm_method=None):
     global _FUSED_SCRATCH_FOR
     emb_dim = config.emb_dim
     n_heads = config.n_heads
@@ -482,7 +499,7 @@ def compile_all_kernels(cache, config, seq_len, verbose=False, cpu_attn=False):
     print("\n--- o_ffn_qwen (O proj decoupled + Residual + FFN) ---")
     cache.compile_and_cache(
         "o_ffn_qwen",
-        build_o_ffn_qwen_module(seq_len, emb_dim, q_dim, hidden_dim),
+        build_o_ffn_qwen_module(seq_len, emb_dim, q_dim, hidden_dim, gemm_method=o_ffn_gemm_method),
         _o_ffn_backend(verbose),
     )
 

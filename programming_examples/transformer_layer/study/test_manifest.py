@@ -335,9 +335,11 @@ def test_an_unknown_toolchain_does_not_make_a_tree_incomplete():
 
 
 def test_the_toolchain_block_did_not_change_the_schema_version_on_disk():
-    """Pinned on the written artifact, not just on the constant."""
+    """Pinned on the written artifact, not just on the constant. The manifest
+    records whatever `schema.SCHEMA_VERSION` is -- 2 when this block landed,
+    3 since the model scope (`[2026-08-23]`); the block itself never moved it."""
     with tempfile.TemporaryDirectory() as d:
-        assert _manifest_toolchain(d)["schema_version"] == 2
+        assert _manifest_toolchain(d)["schema_version"] == schema.SCHEMA_VERSION
 
 
 def test_observe_toolchain_reads_versions_and_labels_the_source():

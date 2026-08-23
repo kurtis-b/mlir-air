@@ -400,7 +400,7 @@ def _observed_status_counts(path: Path) -> dict[str, int] | None:
     different fact.
     """
     try:
-        rows = results_io.read_rows(path)
+        rows = results_io.read_rows_compatible(path)  # `[2026-08-23]` v2 roots re-gate
     except Exception:
         return None
     counts = {status: 0 for status in schema.RUN_STATUSES}

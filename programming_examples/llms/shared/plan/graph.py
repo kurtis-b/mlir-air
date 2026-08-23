@@ -221,7 +221,8 @@ def decoder_graph(spec):
 QWEN3_0_6B = ModelSpec(
     name="qwen3_0_6b", hf_id="Qwen/Qwen3-0.6B", n_layers=28, emb_dim=1024, n_heads=16, n_kv_heads=8,
     head_dim=128, hidden_dim=3072, vocab_size=151936, qk_norm=True, tied_embeddings=True,
-    rope_theta=1_000_000.0, eps=1e-6, lm_head_rows_per_launch=8192,   # qwen3_0_6b_decode._LM_N_PART
+    rope_theta=1_000_000.0, eps=1e-6, lm_head_rows_per_launch=0,
+    # `[2026-08-23]` derived: the driver ships the planner's own 9 x 16384 + 4480 (qwen3_0_6b_decode._LM_PARTS)
 )
 LLAMA32_1B = ModelSpec(
     name="llama32_1b", hf_id="meta-llama/Llama-3.2-1B-Instruct", n_layers=16, emb_dim=2048, n_heads=32,

@@ -108,7 +108,8 @@ class Profiler:
             self.cpu_times.setdefault(name, []).append(duration)
 
     def record_breakdown(
-        self, name, write_ms, kernel_ms, read_ms, n_written, bytes_written, n_readback
+        self, name, write_ms, kernel_ms, read_ms, n_written, bytes_written, n_readback,
+        bytes_readback=0,
     ):
         if self.enabled:
             self.kernel_breakdowns.setdefault(name, []).append(
@@ -119,6 +120,11 @@ class Profiler:
                     "n_written": n_written,
                     "bytes_written": bytes_written,
                     "n_readback": n_readback,
+                    # `[2026-08-23]` the readback half of the sync traffic, so a
+                    # model-scope dispatch vector (shared/model_adapter.py) can
+                    # count bytes_transferred in both directions as the layer
+                    # study's DispatchVector does.
+                    "bytes_readback": bytes_readback,
                 }
             )
 
@@ -906,5 +912,6 @@ class KernelCache:
             n_written,
             bytes_written,
             len(readback_set),
+            bytes_readback=sum(sizes_in_bytes[i] for i in readback_set),
         )
         return results

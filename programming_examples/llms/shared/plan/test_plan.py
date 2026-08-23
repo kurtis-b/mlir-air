@@ -58,10 +58,13 @@ def test_graph_shapes_resolve():
 # their ARCHITECTURE.md, read 2026-08-21.
 
 SHIPPED = {
+    # `[2026-08-23]` re-read after queue items 11 and 12: qwen decode QKV is the 2-launch
+    # head-epilogue form (rms_qkv_qknorm_rope_gemv2) and its LM head the 9 x 16384 + 4480
+    # mixed partition (10 launches); llama's head is 8 x 16384 at m_input 8.
     ("qwen3_0_6b", "prefill"): dict(elfs=["rms_qkv_qknorm_rope", "flash_attn", "o_ffn_qwen"], launches=[9, 1, 12],
-                                     host=["transpose_seq_to_head", "kv_append", "transpose_head_to_seq"], lm_head=19),
-    ("qwen3_0_6b", "decode"): dict(elfs=["rms_qkv_qknorm_rope_gemv4", "o_gemv_ffn"], launches=[4, 3],
-                                    host=["kv_append", "decode_attention_cpu"], lm_head=19),
+                                     host=["transpose_seq_to_head", "kv_append", "transpose_head_to_seq"], lm_head=10),
+    ("qwen3_0_6b", "decode"): dict(elfs=["rms_qkv_qknorm_rope_gemv2", "o_gemv_ffn"], launches=[2, 3],
+                                    host=["kv_append", "decode_attention_cpu"], lm_head=10),
     ("llama32_1b", "prefill"): dict(elfs=["rms_gemms_rope", "flash_attn", "o_ffn"], launches=[7, 1, 12],
                                      host=["kv_append"], lm_head=8),
     ("llama32_1b", "decode"): dict(elfs=["rms_gemv_rope", "o_gemv_ffn"], launches=[6, 3],
@@ -88,13 +91,17 @@ def test_plan_reproduces_shipped_sequence():
 
 
 def test_qwen_decode_token_counts_match_doc57():
-    """Doc 57 section 2 (after O1): 28 x 7 + 19 = 215 boundaries, 57 submissions per token."""
+    """Doc 57 section 5 after items 5c and 5/5b: 28 x (2 + 3) + 10 = 150 boundaries, 57
+    submissions per token (was 28 x 7 + 19 = 215 on 2026-08-21, the H0 gate's number)."""
     p = plan(decoder_graph(QWEN3_0_6B), Workload("decode", 1, 512))
-    assert p.total_launches == 215
+    assert p.total_launches == 150, p.total_launches
     assert p.total_submissions == 57
     assert p.total_host_ops == 28 * 2 + 2
-    # the planner sees the LM-head partitioning the driver pins is not the repeat cap's best
-    assert any(r[0] == "lm_head_gemv partitioning" and "10 launches" in r[1] and "4480" in r[1] for r in p.rejected)
+    # the LM head is the planner's own derivation, shipped: 9 full partitions + a 4480 tail
+    head = [s for s in p.stages if s.name == "lm_head_gemv"][0]
+    assert head.launches == 10 and "[16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 4480]" in head.launch_breakdown[0][2]
+    assert not any(r[0] == "lm_head_gemv partitioning" for r in p.rejected)
+    assert any(r[0] == "rms_qkv_qknorm_rope_gemv4" for r in p.rejected)
 
 
 def test_plan_hash_is_value_identity():

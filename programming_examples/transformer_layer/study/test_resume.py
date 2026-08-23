@@ -108,6 +108,56 @@ def test_row_key_agrees_across_the_file_boundary():
     assert resume.row_key({**row, "seq_len": "512"}) == ("hybrid", 512)
 
 
+def test_row_key_extends_for_a_model_row_and_stays_the_pair_for_a_layer_row():
+    """Schema v3 `[2026-08-23]`: a model row keys on six more columns, through
+    the same int coercion, and a layer row keys exactly as it always did."""
+    layer = _row("coarse", 512, "passed")
+    assert resume.row_key(layer) == ("hybrid", 512)
+    model = dict(layer, measurement_scope="model", model_id="qwen3_0_6b", phase="decode",
+                 seq_len=1, ubatch_tokens=1, context_end_tokens=512, precision_plan_id="bf16")
+    key = resume.row_key(model)
+    assert key == ("hybrid", 1, "model", "qwen3_0_6b", "decode", "1", "512", "bf16")
+    assert resume.row_key({**model, "seq_len": "1", "context_end_tokens": "512.0"}) == key
+    other = resume.row_key({**model, "context_end_tokens": 1024})
+    assert other != key  # three contexts at seq_len 1 are three rungs
+    assert resume.rung_key("coarse", 1, key[2:]) == key
+    assert resume.describe_key(key).startswith("hybrid seq 1 measurement_scope=model")
+
+
+def test_the_ledger_records_the_model_key_and_audits_by_it():
+    """Two decode rungs at seq_len 1 must be two ledger entries, and the audit
+    must match each to its own row -- a pair-keyed ledger would attribute both
+    to one and call the other unclaimed."""
+    base = _row("coarse", 1, "passed")
+    base.update({name: None for name in schema.DISPATCH_VECTOR_FIELDNAMES})  # null in model rows
+    rows = [dict(base, measurement_scope="model", model_id="m", phase="decode", ubatch_tokens=1,
+                 context_end_tokens=ctx, precision_plan_id="bf16", study_case_id=f"ctx{ctx}")
+            for ctx in (512, 1024)]
+    with tempfile.TemporaryDirectory() as d:
+        results_io.write_rows(Path(d) / "model_m.csv", rows)
+        ledger = resume.Ledger.load(d)
+        ledger.open_session(profile="model-smoke", started_utc="t", devq_job_id=None,
+                            git_sha=None, npu_power_mode="turbo", toolchain_fingerprint="x")
+        for row in rows:
+            ledger.record_rung("coarse", 1, row, "measured")
+        ledger.close_session()
+        keys = [tuple(r["model_key"]) for r in ledger.sessions[-1]["rungs"]]
+        assert keys == [("model", "m", "decode", "1", "512", "bf16"), ("model", "m", "decode", "1", "1024", "bf16")]
+        prior = resume.scan(d, ["model_m.csv"])
+        assert set(prior.rows) == {resume.row_key(r) for r in rows}
+        block = resume.walk_block(ledger, prior)
+        assert block["attribution_problems"] == [], block["attribution_problems"]
+        assert block["rungs_measured"] == 2 and block["rungs_unattributed"] == 0
+        # a pre-v3 ledger (no model_key on its rungs) reads back as layer rungs
+        payload = json.loads(ledger.path.read_text())
+        for rung in payload["sessions"][0]["rungs"]:
+            del rung["model_key"]
+        ledger.path.write_text(json.dumps(payload))
+        old = resume.Ledger.load(d)
+        assert old.unreadable is None
+        assert all(r["model_key"] is None for r in old.sessions[0]["rungs"])
+
+
 # ---------------------------------------------------------------------------
 # The plan.
 # ---------------------------------------------------------------------------

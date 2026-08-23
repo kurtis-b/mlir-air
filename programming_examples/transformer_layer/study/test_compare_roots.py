@@ -307,6 +307,92 @@ def test_there_is_no_intended_rename_exception_table():
     assert "pattern_label" not in compare_roots.IDENTIFIER_FIELDS
 
 
+def test_key_fields_gained_the_model_scope_and_layer_rows_key_as_before():
+    """Doc 56 section 3.6 `[2026-08-23]`: two model rows that differ only in
+    context_end_tokens are two measurements; a layer row's key is unchanged
+    in content (the six new members are empty strings)."""
+    assert compare_roots.KEY_FIELDS[:3] == ("study_case_id", "execution_mode", "seq_len")
+    assert compare_roots.KEY_FIELDS[3:] == (
+        "measurement_scope", "model_id", "phase", "ubatch_tokens",
+        "context_end_tokens", "precision_plan_id")
+    layer = compare_roots.row_key(_row())
+    assert layer == ("baseline_768", "hybrid", "1024", "None", "None", "None", "None", "None", "None"), layer
+    # through a CSV the empty cells read back as None and key identically
+    tmp, a, _b = _roots([_row()], [_row()])
+    with tmp:
+        assert compare_roots.row_key(results_io.read_rows(a / "coarse.csv")[0]) == layer
+    a = compare_roots.row_key(_model_row(512))
+    b = compare_roots.row_key(_model_row(1024))
+    assert a != b and a[:3] == b[:3]
+
+
+def _model_row(ctx, tps=13.0, **over):
+    fields = dict(
+        study_case_id="qwen3_0_6b/decode", host_submissions_per_layer=None,
+        measurement_scope="model", model_id="qwen3_0_6b", phase="decode",
+        logical_token_count=32, ubatch_tokens=1, context_start_tokens=ctx - 32,
+        context_end_tokens=ctx, measured_token_count=32, tokens_per_second=tps,
+        precision_plan_id="bf16", plan_hash="b" * 64, host_ops=58,
+        model_dispatch_vector_json='{"scope": "decode_token", "host_submissions": 57, '
+        '"runlist_entries": 57, "air_launches": 150, "herd_launches": 206, '
+        '"sync_boundaries": 200, "bytes_transferred": 100}')
+    fields.update(over)
+    return _row("hybrid", 1, 1000.0 / tps, **fields)
+
+
+def test_tokens_per_second_is_gated_with_the_mode_tolerance():
+    """A 20% tok/s drift on a `hybrid` model row fails (band 5/15); the same
+    drift at 4% warns at most. The plan hash is an identifier: a moved hash
+    is a different planned sequence, not drift."""
+    tmp, a, b = _roots([_model_row(512, 13.0), _model_row(1024, 12.0)],
+                       [_model_row(512, 10.4), _model_row(1024, 9.6)], name="model.csv")
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["model.csv"])
+    assert report.failures >= 1
+    assert any("tokens_per_second" in line and "exceeds the fail" in line for line in report.lines), report.lines
+    tmp, a, b = _roots([_model_row(512, 13.0)], [_model_row(512, 13.3)], name="model.csv")
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["model.csv"])
+    assert report.failures == 0, report.render()
+    tmp, a, b = _roots([_model_row(512, 13.0)], [_model_row(512, 13.0, plan_hash="c" * 64)], name="model.csv")
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["model.csv"])
+    assert report.failures == 1 and any("plan_hash" in line for line in report.lines)
+
+
+def test_two_v2_roots_still_compare_after_the_v3_bump():
+    """The roots this tool is pointed at were written at schema v2; the bump
+    must not take them out of it. A v2 root against a v3 root fails on the
+    version identifier rather than being compared column for column."""
+    import csv
+
+    v2_names = [n for n in schema.RESULTS_FIELDNAMES if n not in schema.MODEL_SCOPE_FIELDNAMES]
+
+    def write_v2(path, latency):
+        with path.open("w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=v2_names)
+            w.writeheader()
+            row = {n: "" for n in v2_names}
+            row.update(schema_version=2, study_case_id="baseline_768", execution_mode="hybrid",
+                       seq_len=1024, run_status="passed", avg_latency_ms=latency)
+            w.writerow(row)
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        for side, latency in (("a", 100.0), ("b", 101.0)):
+            (root / side).mkdir()
+            write_v2(root / side / "coarse.csv", latency)
+        report = compare_roots.compare_roots(root / "a", root / "b", ["coarse.csv"])
+        assert report.failures == 0, report.render()
+        v3 = schema.empty_row()
+        v3.update(study_case_id="baseline_768", execution_mode="hybrid", seq_len=1024,
+                  run_status="passed", avg_latency_ms=100.0)
+        results_io.write_rows(root / "b" / "coarse.csv", [v3])
+        report = compare_roots.compare_roots(root / "a", root / "b", ["coarse.csv"])
+        assert report.failures == 1, report.render()
+        assert any("schema_version: baseline='2' candidate='3'" in line for line in report.lines)
+
+
 def test_every_gating_field_is_also_reported():
     reported = set(compare_roots.LATENCY_FIELDS) | set(compare_roots.POWER_FIELDS)
     assert set(compare_roots.GATING_FIELDS) <= reported

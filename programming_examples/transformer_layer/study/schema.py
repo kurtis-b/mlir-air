@@ -68,7 +68,17 @@ from dataclasses import dataclass
 #: meaning and position; the five new columns are appended AFTER all of them
 #: (see the v2 section below), so a v1-shaped reader keeps working column for
 #: column and only the version check tells the two apart.
-SCHEMA_VERSION = 2
+#:
+#: v3 `[2026-08-23]` (doc 56 section 3.6, H1a): the MODEL scope. Thirteen
+#: columns appended AFTER every v2 column -- the same additive rule, the same
+#: pinned prefix -- so a row measured over a whole model forward (prefill of a
+#: prompt, decode of N tokens) is written to the SAME table as a layer row and
+#: distinguished by ``measurement_scope``, not by a second schema. Every
+#: recorded v1 and v2 CSV still reads through ``results_io.read_rows_compatible``
+#: (the analysis tier's reader since 2026-08-14); the strict ``read_rows`` that
+#: every WRITER uses now rejects them, which is the point of the version: a v2
+#: row must not be carried into a v3 CSV and look complete.
+SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -381,6 +391,104 @@ _RECONFIGURATION = (
     ),
 )
 
+# ---------------------------------------------------------------------------
+# v3: the MODEL scope `[2026-08-23]` -- doc 56 section 3.6, H1a.
+#
+# Appended AFTER every v2 column, never interleaved -- ``test_schema.py`` pins
+# the v2 prefix exactly as it pins the v1 one -- so a v2-shaped reader reads a
+# v3 file column for column and the thirteen new columns are strictly additive.
+#
+# WHAT A MODEL ROW IS. One measurement of one PHASE of one model's forward --
+# the prefill of a prompt, or the decode of N tokens -- through the production
+# drivers (``llms/shared/model_adapter.py``), under the study's discipline: the
+# clock is the forward pass only (dispatch to the instant the result is
+# CPU-readable; verification outside), the power mode is recorded, and a
+# failure is a complete row. The REUSED columns keep their meaning: ``seq_len``
+# is the physical M the kernels were compiled for (``ubatch_tokens`` for
+# prefill, 1 for decode), ``weights_source`` is the checkpoint and its immutable
+# revision, and every timing / power / quant / outcome / provenance field means
+# what it means for a layer row. ``execution_mode`` keeps doc 03's meaning: the
+# drivers' per-ELF ``load_and_run`` path IS ``hybrid`` (one submission per ELF,
+# split at every host op), and a one-runlist-per-token path would be ``runlist``.
+#
+# THE PER-LAYER DISPATCH COLUMNS STAY NULL IN A MODEL ROW. ``air_launches_per_elf``
+# counts launches IN a module and ``host_submissions_per_layer`` is per layer;
+# neither survives summation over 28 layers and an LM head without changing
+# meaning. A model row's dispatch record is ``model_dispatch_vector_json`` --
+# the same seven-key record for the whole phase or per token, where
+# ``air_launches`` is the launches EXECUTED in the scope (the boundary count doc
+# 57 prices at ~107 us each), not the per-module figure. ``validate_row``
+# refuses a model row that fills a per-layer dispatch column, so the two
+# definitions cannot be read as one.
+#
+# THE BLOCK COMMENTS BELOW THAT SAY "SCHEMA_VERSION STAYS 2" record their own
+# day's decision (items 15, 16 and resume each declined a bump for a fact that
+# was not a per-row quantity). A whole-forward measurement IS a per-row
+# quantity with its own columns, which is exactly what those comments said a
+# bump was for; the v2 roots they protected read through
+# ``results_io.read_rows_compatible``, which ``compare_roots``, ``smoke_gate``
+# and ``manifest`` use since this bump.
+# ---------------------------------------------------------------------------
+
+_MODEL_SCOPE = (
+    Field(
+        "measurement_scope",
+        "One of MEASUREMENT_SCOPES: `layer` (every row written before v3, and "
+        "every layer-study row since) or `model` (a whole-forward row). None "
+        "reads as `layer` -- the v1/v2 corpus never said, because it had "
+        "nothing else to be.",
+    ),
+    Field("model_id", "The llms/ deployment directory name, e.g. qwen3_0_6b. None in a layer row."),
+    Field("phase", "One of MODEL_PHASES: prefill or decode. None in a layer row."),
+    Field(
+        "logical_token_count",
+        "Tokens the phase processed as the workload sees them: the valid prompt "
+        "length for prefill (padding excluded), the tokens generated for decode.",
+    ),
+    Field(
+        "ubatch_tokens",
+        "The physical chunk the kernels were compiled for and dispatched at: "
+        "M for prefill, 1 for decode. Equal to seq_len in a model row; a "
+        "kernel-scaling row has prompt length == ubatch_tokens (no chunking) "
+        "and says so in study_case_label (doc 56 section 3.4).",
+    ),
+    Field("context_start_tokens", "KV positions already held when the phase began: 0 for a fresh prefill."),
+    Field("context_end_tokens", "KV positions held when the phase ended: prompt length after prefill, start + tokens generated after decode."),
+    Field(
+        "measured_token_count",
+        "Tokens inside the timed region that the throughput counts: valid "
+        "prompt tokens for prefill (padded tail rows are dispatched and "
+        "EXCLUDED from the numerator), sampled tokens for decode.",
+        timing="Inside. The numerator of tokens_per_second.",
+    ),
+    Field(
+        "tokens_per_second",
+        "measured_token_count / timed_total_sec.",
+        timing="Derived from the same region as avg_latency_ms: the forward "
+        "pass only -- dispatch to the instant logits are CPU-readable -- "
+        "summed over the samples. Tokenization, EOS padding, the HF gate and "
+        "the per-row verification are OUTSIDE. This is NOT a TTFT.",
+    ),
+    Field("precision_plan_id", "The doc 56 section 3.5 precision plan the row ran under: bf16 | w4_decode | w_bfp16_prefill | a8."),
+    Field(
+        "plan_hash",
+        "`Plan.sha` (llms/shared/plan) of the workload this row measured: the "
+        "artifact cache key, so two rows with one hash ran one planned "
+        "sequence. 64 hex characters.",
+    ),
+    Field("host_ops", "Host-side operations executed inside the timed region (named Profiler.time_cpu buckets, counted per call)."),
+    Field(
+        "model_dispatch_vector_json",
+        "JSON object with EXACTLY the keys MODEL_DISPATCH_VECTOR_KEYS: `scope` "
+        "(one of MODEL_DISPATCH_SCOPES) and six non-negative integers. "
+        "`host_submissions` counts xrt.run submissions, `runlist_entries` the "
+        "run objects in them, `air_launches` and `herd_launches` the launches "
+        "EXECUTED in the scope, `sync_boundaries` the bo.sync calls and "
+        "`bytes_transferred` their bytes. Validated strictly: a missing key, an "
+        "extra key or a negative count is refused at write time.",
+    ),
+)
+
 RESULTS_FIELDS: tuple[Field, ...] = (
     *_IDENTITY,
     *_SHAPE,
@@ -389,10 +497,12 @@ RESULTS_FIELDS: tuple[Field, ...] = (
     *_POWER,
     *_QUANT,
     *_OUTCOME,
-    # v2 additions -- LAST, and appended in this order. See the section
-    # comment above; test_schema.py pins the v1 prefix and this suffix.
+    # v2 additions -- appended in this order. See the section comment above;
+    # test_schema.py pins the v1 prefix and this v2 suffix.
     *_DECOMPOSITION,
     *_RECONFIGURATION,
+    # v3 additions -- LAST. test_schema.py pins the v2 prefix and this suffix.
+    *_MODEL_SCOPE,
 )
 
 # The per-candidate tuning table: one row per candidate config per operator.
@@ -841,6 +951,28 @@ POWER_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _POWER)
 QUANT_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _QUANT)
 DECOMPOSITION_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _DECOMPOSITION)
 RECONFIGURATION_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _RECONFIGURATION)
+MODEL_SCOPE_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in _MODEL_SCOPE)
+
+#: ``measurement_scope`` values. ``layer`` is what every row before v3 was.
+MEASUREMENT_SCOPES: tuple[str, ...] = ("layer", "model")
+#: ``phase`` values of a model row.
+MODEL_PHASES: tuple[str, ...] = ("prefill", "decode")
+#: The precision plans doc 56 section 3.5 names. Open for a reason the conditions
+#: block states for power modes: refusing a name would refuse to record it.
+PRECISION_PLANS: tuple[str, ...] = ("bf16", "w4_decode", "w_bfp16_prefill", "a8")
+#: What a model dispatch vector may describe: one whole phase, or one token.
+MODEL_DISPATCH_SCOPES: tuple[str, ...] = ("prefill", "decode", "decode_token")
+#: The seven keys of ``model_dispatch_vector_json``, in this order. Strict: see
+#: the field and ``validate_model_dispatch_vector``.
+MODEL_DISPATCH_VECTOR_KEYS: tuple[str, ...] = (
+    "scope",
+    "host_submissions",
+    "runlist_entries",
+    "air_launches",
+    "herd_launches",
+    "sync_boundaries",
+    "bytes_transferred",
+)
 
 #: The CSV values ``execution_mode`` may take -- taxonomy points as they appear
 #: in a results file. ``fused_elf`` is a VALUE here, never a column.
@@ -877,7 +1009,9 @@ EXECUTION_MODE_CSV: dict[str, str] = {
 
 #: Where attention ran. See the ``attention_path`` field on why this is not
 #: derivable from ``execution_mode``.
-ATTENTION_PATHS: tuple[str, ...] = ("device", "host_torch")
+#: `host_numpy` `[2026-08-23]`: the drivers' decode attention (schema v3 model
+#: rows) runs on the host in numpy, which is neither of the layer study's two.
+ATTENTION_PATHS: tuple[str, ...] = ("device", "host_torch", "host_numpy")
 
 RUN_STATUSES: tuple[str, ...] = ("passed", "failed", "skipped")
 
@@ -940,7 +1074,11 @@ def validate_row(row: dict[str, object], table: str = "results") -> None:
         ("execution_mode", EXECUTION_MODES),
         ("run_status", RUN_STATUSES),
         ("attention_path", ATTENTION_PATHS),
+        ("measurement_scope", MEASUREMENT_SCOPES),
+        ("phase", MODEL_PHASES),
     ):
+        if name not in row:
+            continue  # a table without the column (tuning, resource, ...)
         value = row.get(name)
         if value is not None and value not in domain:
             raise ValueError(
@@ -953,6 +1091,81 @@ def validate_row(row: dict[str, object], table: str = "results") -> None:
                     else ""
                 )
             )
+    if table == "results":
+        _validate_model_scope(row)
+
+
+def _validate_model_scope(row: dict[str, object]) -> None:
+    """The v3 clauses. A layer row (scope None or `layer`) must carry NO model
+    column; a model row must carry the scope's own record and NO per-layer
+    dispatch column. Either direction silently redefines a column otherwise."""
+    scope = row.get("measurement_scope")
+    model_columns = [n for n in MODEL_SCOPE_FIELDNAMES if n != "measurement_scope"]
+    if scope in (None, "layer"):
+        if filled := [n for n in model_columns if row.get(n) is not None]:
+            raise ValueError(
+                f"a layer row (measurement_scope={scope!r}) carries model-scope "
+                f"columns {filled}; set measurement_scope='model' or leave them None"
+            )
+        return
+    # scope == "model"
+    if filled := [n for n in DISPATCH_VECTOR_FIELDNAMES if row.get(n) is not None]:
+        raise ValueError(
+            f"a model row fills per-layer dispatch columns {filled}; they stay "
+            "None in model rows (doc 56 section 3.6) -- the whole-phase record "
+            "is model_dispatch_vector_json"
+        )
+    for name in ("model_id", "phase", "precision_plan_id"):
+        if row.get(name) is None:
+            raise ValueError(f"a model row must name its {name}")
+    plan_hash = row.get("plan_hash")
+    if plan_hash is not None:
+        text = str(plan_hash)
+        if len(text) != 64 or any(c not in "0123456789abcdef" for c in text):
+            raise ValueError(f"plan_hash={plan_hash!r} is not a 64-hex Plan.sha")
+    vector = row.get("model_dispatch_vector_json")
+    if vector is not None:
+        validate_model_dispatch_vector(vector)
+
+
+def validate_model_dispatch_vector(value: object) -> dict[str, object]:
+    """Parse and check a ``model_dispatch_vector_json`` value; returns the dict.
+
+    Strict by design (doc 56 section 3.6): exactly MODEL_DISPATCH_VECTOR_KEYS,
+    `scope` in MODEL_DISPATCH_SCOPES, every count a non-negative integer. A
+    JSON string (as read from a CSV) or a dict (as built in memory) both work.
+    """
+    import json as _json
+
+    if isinstance(value, str):
+        try:
+            parsed = _json.loads(value)
+        except ValueError as exc:
+            raise ValueError(f"model_dispatch_vector_json is not JSON: {exc}") from None
+    else:
+        parsed = value
+    if not isinstance(parsed, dict):
+        raise ValueError("model_dispatch_vector_json must be a JSON object")
+    expected = set(MODEL_DISPATCH_VECTOR_KEYS)
+    got = set(parsed)
+    if missing := expected - got:
+        raise ValueError(f"model_dispatch_vector_json is missing keys: {sorted(missing)}")
+    if extra := got - expected:
+        raise ValueError(
+            f"model_dispatch_vector_json has keys not in the schema: {sorted(extra)}"
+        )
+    if parsed["scope"] not in MODEL_DISPATCH_SCOPES:
+        raise ValueError(
+            f"model_dispatch_vector_json scope={parsed['scope']!r} is not one of "
+            f"{list(MODEL_DISPATCH_SCOPES)}"
+        )
+    for key in MODEL_DISPATCH_VECTOR_KEYS[1:]:
+        count = parsed[key]
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(
+                f"model_dispatch_vector_json {key}={count!r} is not a non-negative integer"
+            )
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -1249,7 +1462,18 @@ RUNG_SOURCES: tuple[str, ...] = ("measured", "reused", "skipped")
 #: rest is identity.
 SESSION_RUNG_FIELDS: tuple[Field, ...] = (
     Field("execution_mode", "The row's `execution_mode` CSV value, not the code name."),
-    Field("seq_len", "The rung's sequence length. With the mode, the row key."),
+    Field("seq_len", "The rung's sequence length. With the mode, the LAYER row key."),
+    Field(
+        "model_key",
+        "`[2026-08-23]` None for a layer rung. For a model rung, the list "
+        "`[measurement_scope, model_id, phase, ubatch_tokens, "
+        "context_end_tokens, precision_plan_id]` (`resume.MODEL_KEY_FIELDS`) "
+        "that, with the mode and seq_len, is the row key: a decode rung at "
+        "three contexts is three rows at seq_len 1, and a ledger keyed on the "
+        "layer pair alone would attribute all three to one. A ledger written "
+        "before this field reads back with None here (`Ledger.load` fills it), "
+        "never a guess.",
+    ),
     Field("source", "One of RUNG_SOURCES: how this session came by the row."),
     Field("run_status", "The row's `run_status`, copied so the ledger is readable alone."),
     Field(

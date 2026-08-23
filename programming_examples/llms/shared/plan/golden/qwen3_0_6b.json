@@ -16,7 +16,7 @@
   "activation": "swiglu",
   "weight_dtype": "bf16",
   "rope_convention": "halfsplit",
-  "lm_head_rows_per_launch": 8192
+  "lm_head_rows_per_launch": 0
  },
  "tensors": [
   {

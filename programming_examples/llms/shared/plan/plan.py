@@ -221,9 +221,13 @@ def fuse(graph, wl, placements, caps=NPU2_CAPS):
             rejected.append(("o_ffn fused", "spatial: the fused cascade needs the lean form"))
     else:  # decode
         if qk:
-            bd = (("attn_norm_L", 1, "RMSNorm"), ("qkv_proj", 1, "ONE GEMV over [wq; wk; wv]"),
-                  ("qk_norm", 1, "ONE per-row-weighted QK-norm over Q|K"), ("rope", 1, "ONE RoPE over Q|K"))
-            name = "rms_qkv_qknorm_rope_gemv4"
+            # `[2026-08-23]` doc 57 section 5 item 5c (queue item 11): ONE head-aligned GEMV whose
+            # cores apply QK-norm + RoPE in L1 (mv_heads.cc), so the stage is RMSNorm + GEMV.
+            bd = (("attn_norm_L", 1, "RMSNorm"),
+                  ("qkv_proj+qk_norm+rope", 1, "ONE head-aligned GEMV over [wq; wk; wv] with the QK-norm + RoPE epilogue in L1 (mv_heads)"))
+            name = "rms_qkv_qknorm_rope_gemv2"
+            rejected.append(("rms_qkv_qknorm_rope_gemv4", "4 launches (GEMV, QK-norm, RoPE as separate launches): superseded by the "
+                             "head-epilogue GEMV, 0.672 -> 0.494 ms per layer (devq 555); kept behind QWEN3_RMS_QKV_LAUNCHES=4 for A/B"))
         else:
             bd = (("attn_norm_L", 1, "RMSNorm"), ("q_proj_L", 1, "GEMV"), ("k_proj_L", 1, "GEMV"), ("v_proj_L", 1, "GEMV"),
                   ("rope_q_L", 1, "RoPE"), ("rope_k_L", 1, "RoPE"))
@@ -301,7 +305,7 @@ class Plan:
     est_us: float = 0.0
     est_breakdown: dict = field(default_factory=dict)
     source: str = MEASURED
-    planner_version: str = "h0.1"
+    planner_version: str = "h0.2"   # h0.1 -> h0.2 `[2026-08-23]`: decode QKV 2-launch form, derived Qwen LM head
     sha: str = ""
 
     def elf_sequence(self, repeated=None):

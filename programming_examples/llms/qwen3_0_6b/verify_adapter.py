@@ -106,12 +106,21 @@ class NpuRunner:
             bfloat16
         )
 
-        _cache_root = _THIS_DIR / "build_peano"
+        # `[2026-08-23]` LLMS_VERIFY_CACHE_ROOT lets the model study (doc 56 H1a,
+        # transformer_layer/study/run_model.py) run THIS gate against a prefill
+        # artifact set compiled at another M in its own directory; unset, the
+        # production `make verify` path is byte-for-byte what it was.
+        _cache_root = Path(os.environ.get("LLMS_VERIFY_CACHE_ROOT") or _THIS_DIR / "build_peano")
         self.prefill_cache = KernelCache(
             str(_cache_root / "prefill_kernel_cache"), verbose=False
         )
+        # `[2026-08-23]` LLMS_VERIFY_O_FFN_GEMM_METHOD: the model study gates an
+        # artifact set whose O+FFN cascade was compiled with a forced GEMM
+        # method (doc 56 H1a, M=1024); the gate must build the same artifact.
+        _forced = os.environ.get("LLMS_VERIFY_O_FFN_GEMM_METHOD") or None
         compile_prefill_kernels(
-            self.prefill_cache, config, seq_len=max_seq, cpu_attn=self.cpu_attn
+            self.prefill_cache, config, seq_len=max_seq, cpu_attn=self.cpu_attn,
+            **({"o_ffn_gemm_method": _forced} if _forced else {}),
         )
         self.decode_cache = KernelCache(
             str(_cache_root / "decode_kernel_cache"), verbose=False

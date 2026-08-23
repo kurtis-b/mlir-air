@@ -183,13 +183,19 @@ def test_v2_keeps_every_v1_column_first_and_unchanged():
     )
 
 
+# Every v2 column after the v1 prefix, in v2 order. Frozen HERE for the reason
+# the v1 tuple is: the v3 bump `[2026-08-23]` is additive over THIS prefix.
+_V2_SUFFIX = ("device_ms", "sync_ms", "host_cpu_ms", "context_loads", "kernel_attaches")
+
+
 def test_v2_appends_the_decomposition_then_the_reconfiguration_columns():
-    """The five v2 columns, in order, after every v1 column and nowhere else."""
-    assert schema.SCHEMA_VERSION == 2
+    """The five v2 columns, in order, directly after every v1 column."""
     assert schema.DECOMPOSITION_FIELDNAMES == ("device_ms", "sync_ms", "host_cpu_ms")
     assert schema.RECONFIGURATION_FIELDNAMES == ("context_loads", "kernel_attaches")
     suffix = schema.DECOMPOSITION_FIELDNAMES + schema.RECONFIGURATION_FIELDNAMES
-    assert schema.RESULTS_FIELDNAMES[-len(suffix):] == suffix
+    assert suffix == _V2_SUFFIX
+    start = len(_V1_RESULTS_FIELDNAMES)
+    assert schema.RESULTS_FIELDNAMES[start : start + len(suffix)] == suffix
     for name in suffix:
         assert name not in _V1_RESULTS_FIELDNAMES
 
@@ -309,10 +315,14 @@ def test_the_conditions_block_is_not_a_csv_table():
 
 
 def test_recording_the_condition_did_not_bump_the_schema_version():
-    """The point of the design: every recorded v2 CSV still reads."""
-    assert schema.SCHEMA_VERSION == 2
+    """The point of the design: the condition is a BLOCK, not a column, so no
+    condition name is a results column and the v1 prefix is intact. (The
+    version itself is 3 since `[2026-08-23]` -- the model scope's columns, a
+    per-row quantity -- which is the bump this block declined to be.)"""
     prefix = schema.RESULTS_FIELDNAMES[: len(_V1_RESULTS_FIELDNAMES)]
     assert prefix == _V1_RESULTS_FIELDNAMES
+    for name in schema.CONDITION_FIELDNAMES:
+        assert name not in schema.RESULTS_FIELDNAMES
 
 
 def test_every_condition_field_has_a_meaning():
@@ -426,9 +436,11 @@ def test_the_toolchain_block_did_not_bump_the_schema_version():
     the version check -- it took 56 v1 files out of every reader on 08-10, and
     would take the 16 v2 files that survive, which are the roots compare_roots
     is pointed at. ``RESOURCE_FIELDS`` states the rule: adding a table is not a
-    version bump.
+    version bump. `[2026-08-23]` The version is 3 for the model scope's thirteen
+    COLUMNS; none of this block's fields is among them.
     """
-    assert schema.SCHEMA_VERSION == 2, schema.SCHEMA_VERSION
+    for name in schema.TOOLCHAIN_FIELDNAMES:
+        assert name not in schema.RESULTS_FIELDNAMES, name
 
 
 def test_the_toolchain_block_is_not_a_csv_table():
@@ -570,10 +582,12 @@ def test_the_walk_block_did_not_bump_the_schema_version():
     attribution and is the wrong one: it bumps SCHEMA_VERSION to 3, and
     `results_io.read_rows` rejects both a header and a version mismatch, so it
     would take every surviving v2 root out of every reader -- including the ones
-    `compare_roots` is pointed at. Item 15's decision, unchanged."""
-    assert schema.SCHEMA_VERSION == 2
+    `compare_roots` is pointed at. Item 15's decision, unchanged: v3's bump
+    `[2026-08-23]` carries model-scope columns and still no session column."""
     assert "session_id" not in schema.RESULTS_FIELDNAMES
     assert "walk_session" not in schema.RESULTS_FIELDNAMES
+    for name in schema.WALK_FIELDNAMES + schema.SESSION_FIELDNAMES:
+        assert name not in schema.RESULTS_FIELDNAMES, name
 
 
 def test_the_walk_block_is_not_a_csv_table():
@@ -661,6 +675,164 @@ def test_every_walk_field_is_documented_and_unique():
         assert len(names) == len(set(names)), names
         for f in fields:
             assert f.meaning and len(f.meaning) > 20, f.name
+
+
+# ---------------------------------------------------------------------------
+# Schema v3 `[2026-08-23]` -- the MODEL scope (doc 56 section 3.6, H1a).
+# ---------------------------------------------------------------------------
+
+_V2_RESULTS_FIELDNAMES = _V1_RESULTS_FIELDNAMES + _V2_SUFFIX
+
+
+def _model_row(**overrides):
+    import json
+
+    row = schema.empty_row()
+    row.update(
+        {
+            "study_id": "h1a",
+            "study_case_id": "qwen3_0_6b/prefill/M2048",
+            "execution_mode": "hybrid",
+            "attention_path": "device",
+            "seq_len": 2048,
+            "dtype": "bf16",
+            "run_status": "passed",
+            "failure_message": "",
+            "measurement_scope": "model",
+            "model_id": "qwen3_0_6b",
+            "phase": "prefill",
+            "logical_token_count": 2048,
+            "ubatch_tokens": 2048,
+            "context_start_tokens": 0,
+            "context_end_tokens": 2048,
+            "measured_token_count": 2048,
+            "tokens_per_second": 812.5,
+            "precision_plan_id": "bf16",
+            "plan_hash": "a" * 64,
+            "host_ops": 59,
+            "model_dispatch_vector_json": json.dumps(
+                {
+                    "scope": "prefill",
+                    "host_submissions": 85,
+                    "runlist_entries": 85,
+                    "air_launches": 626,
+                    "herd_launches": 1018,
+                    "sync_boundaries": 340,
+                    "bytes_transferred": 1234567,
+                }
+            ),
+        }
+    )
+    row.update(overrides)
+    return row
+
+
+def test_v3_keeps_every_v2_column_first_and_appends_the_model_scope_last():
+    """The same additive rule as v2 over v1: the v2 header is an exact ordered
+    PREFIX, and the thirteen section-3.6 columns follow in the order the doc
+    lists them, last and nowhere else."""
+    assert schema.SCHEMA_VERSION == 3
+    prefix = schema.RESULTS_FIELDNAMES[: len(_V2_RESULTS_FIELDNAMES)]
+    assert prefix == _V2_RESULTS_FIELDNAMES
+    assert schema.MODEL_SCOPE_FIELDNAMES == (
+        "measurement_scope", "model_id", "phase", "logical_token_count",
+        "ubatch_tokens", "context_start_tokens", "context_end_tokens",
+        "measured_token_count", "tokens_per_second", "precision_plan_id",
+        "plan_hash", "host_ops", "model_dispatch_vector_json",
+    )
+    n = len(schema.MODEL_SCOPE_FIELDNAMES)
+    assert schema.RESULTS_FIELDNAMES[-n:] == schema.MODEL_SCOPE_FIELDNAMES
+    assert len(schema.RESULTS_FIELDNAMES) == len(_V2_RESULTS_FIELDNAMES) + n
+    for name in schema.MODEL_SCOPE_FIELDNAMES:
+        assert name not in _V2_RESULTS_FIELDNAMES
+
+
+def test_v3_model_row_round_trips_through_the_csv_writer():
+    import tempfile
+    from pathlib import Path
+
+    import results_io
+
+    row = _model_row()
+    schema.validate_row(row)
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "model.csv"
+        results_io.write_rows(path, [row])
+        back = results_io.read_rows(path)
+    assert len(back) == 1
+    assert back[0]["measurement_scope"] == "model"
+    assert back[0]["plan_hash"] == "a" * 64
+    assert schema.validate_model_dispatch_vector(back[0]["model_dispatch_vector_json"])["air_launches"] == 626
+    schema.validate_row(back[0])  # a read-back model row is writable again
+    # a v2-shaped file is a strict prefix and reads through the compatible reader
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "v2.csv"
+        import csv
+
+        with path.open("w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(_V2_RESULTS_FIELDNAMES))
+            w.writeheader()
+            v2 = {k: "" for k in _V2_RESULTS_FIELDNAMES}
+            v2.update(schema_version=2, execution_mode="hybrid", run_status="passed")
+            w.writerow(v2)
+        _raises(ValueError, "does not match schema v3", results_io.read_rows, path)
+        old = results_io.read_rows_compatible(path)
+    assert old[0]["measurement_scope"] is None and old[0]["tokens_per_second"] is None
+
+
+def test_v3_a_layer_row_is_unchanged_and_may_not_carry_model_columns():
+    row = schema.empty_row()
+    row["execution_mode"] = "hybrid"
+    row["run_status"] = "passed"
+    schema.validate_row(row)  # scope None == layer, as every v1/v2 row
+    row["measurement_scope"] = "layer"
+    schema.validate_row(row)
+    row["tokens_per_second"] = 12.0
+    _raises(ValueError, "carries model-scope columns", schema.validate_row, row)
+
+
+def test_v3_validation_failures_each_name_their_clause():
+    import json
+
+    _raises(ValueError, "not one of", schema.validate_row, _model_row(measurement_scope="token"))
+    _raises(ValueError, "not one of", schema.validate_row, _model_row(phase="generate"))
+    _raises(ValueError, "per-layer dispatch columns", schema.validate_row,
+            _model_row(host_submissions_per_layer=4))
+    _raises(ValueError, "must name its model_id", schema.validate_row, _model_row(model_id=None))
+    _raises(ValueError, "must name its precision_plan_id", schema.validate_row,
+            _model_row(precision_plan_id=None))
+    _raises(ValueError, "64-hex", schema.validate_row, _model_row(plan_hash="deadbeef"))
+    good = json.loads(_model_row()["model_dispatch_vector_json"])
+    _raises(ValueError, "missing keys", schema.validate_row,
+            _model_row(model_dispatch_vector_json=json.dumps({k: v for k, v in good.items() if k != "sync_boundaries"})))
+    _raises(ValueError, "not in the schema", schema.validate_row,
+            _model_row(model_dispatch_vector_json=json.dumps({**good, "context_loads": 1})))
+    _raises(ValueError, "scope=", schema.validate_row,
+            _model_row(model_dispatch_vector_json=json.dumps({**good, "scope": "layer"})))
+    _raises(ValueError, "non-negative integer", schema.validate_row,
+            _model_row(model_dispatch_vector_json=json.dumps({**good, "air_launches": -1})))
+    _raises(ValueError, "non-negative integer", schema.validate_row,
+            _model_row(model_dispatch_vector_json=json.dumps({**good, "air_launches": 1.5})))
+    _raises(ValueError, "not JSON", schema.validate_row, _model_row(model_dispatch_vector_json="{"))
+    # a FAILED model row is still a complete, valid row: every metric None
+    failed = _model_row(run_status="failed", failure_message="ERT_CMD_STATE_TIMEOUT",
+                        tokens_per_second=None, plan_hash=None, model_dispatch_vector_json=None,
+                        host_ops=None, measured_token_count=None)
+    schema.validate_row(failed)
+
+
+def test_v3_the_model_key_is_a_session_rung_field_and_old_ledgers_read_back():
+    """`resume.row_key` keys a model row on six more columns; the ledger must be
+    able to record them or three decode rows at seq_len 1 are one rung."""
+    names = schema.SESSION_RUNG_FIELDNAMES
+    assert "model_key" in names
+    rung = {"execution_mode": "hybrid", "seq_len": 1, "model_key": None,
+            "source": "measured", "run_status": "passed", "row_digest": "0" * 16}
+    record = {n: None for n in schema.SESSION_FIELDNAMES}
+    record.update(session_id="s001", status="complete", rungs=[rung])
+    schema.validate_session(record)
+    record["rungs"] = [{k: v for k, v in rung.items() if k != "model_key"}]
+    _raises(ValueError, "does not match SESSION_RUNG_FIELDS", schema.validate_session, record)
 
 
 def main():

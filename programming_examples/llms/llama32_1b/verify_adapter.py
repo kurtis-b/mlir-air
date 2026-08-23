@@ -127,7 +127,11 @@ class NpuRunner:
         # share one per-model cache (no recompile between commands). The path is
         # absolute (anchored to _THIS_DIR) so it stays per-model and never
         # contaminates another model's cache regardless of CWD.
-        _cache_root = _THIS_DIR / "build_peano"
+        # `[2026-08-23]` LLMS_VERIFY_CACHE_ROOT lets the model study (doc 56 H1a,
+        # transformer_layer/study/run_model.py) run THIS gate against a prefill
+        # artifact set compiled at another M in its own directory; unset, the
+        # production `make verify` path is byte-for-byte what it was.
+        _cache_root = Path(os.environ.get("LLMS_VERIFY_CACHE_ROOT") or _THIS_DIR / "build_peano")
         self.prefill_cache = KernelCache(
             str(_cache_root / "prefill_kernel_cache"), verbose=False
         )

@@ -148,19 +148,64 @@ def row_digest(row: dict) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def row_key(row: dict) -> tuple[str, int]:
-    """``(execution_mode, seq_len)`` -- the rung a row belongs to.
+#: `[2026-08-23]` The columns that, with ``(execution_mode, seq_len)``, identify
+#: a MODEL row (schema v3, doc 56 section 3.6). A layer row's key is the pair
+#: alone -- unchanged, so every recorded ledger keeps meaning what it meant.
+MODEL_KEY_FIELDS: tuple[str, ...] = (
+    "measurement_scope",
+    "model_id",
+    "phase",
+    "ubatch_tokens",
+    "context_end_tokens",
+    "precision_plan_id",
+)
+
+
+def model_key(row: dict) -> tuple[str, ...] | None:
+    """The MODEL_KEY_FIELDS of a model-scope row as strings; None for a layer row.
+
+    Integers are normalised through ``int(float())`` for ``row_key``'s reason:
+    a CSV hands back ``"512"`` where memory holds ``512``.
+    """
+    if row.get("measurement_scope") != "model":
+        return None
+    out = []
+    for name in MODEL_KEY_FIELDS:
+        value = row.get(name)
+        try:
+            value = int(float(value))
+        except (TypeError, ValueError):
+            pass
+        out.append("" if value is None else str(value))
+    return tuple(out)
+
+
+def row_key(row: dict) -> tuple:
+    """``(execution_mode, seq_len)`` -- the rung a row belongs to -- extended by
+    MODEL_KEY_FIELDS for a model-scope row.
 
     ``seq_len`` is coerced because a row read from a CSV carries it as a string
     and a row built in memory carries an int; keying on the raw value would make
     the same rung two different keys depending on which side of a file it came
     from, and the reuse lookup would silently miss every time.
+
+    A layer row keys on the pair alone, exactly as before v3. A model row
+    appends ``model_key(row)``: three decode rows at seq_len 1 and three
+    contexts are three rungs, and the pair would fold them into one.
     """
     try:
         seq = int(float(row.get("seq_len")))
     except (TypeError, ValueError):
         seq = -1
-    return (str(row.get("execution_mode")), seq)
+    key = (str(row.get("execution_mode")), seq)
+    extra = model_key(row)
+    return key if extra is None else key + extra
+
+
+def rung_key(mode: str, seq: int, extra=None) -> tuple:
+    """The key of a rung named by its CODE mode, as ``row_key`` would key its row."""
+    key = (schema.EXECUTION_MODE_CSV.get(mode, mode), int(seq))
+    return key if extra is None else key + tuple(extra)
 
 
 @dataclass(frozen=True)
@@ -179,8 +224,8 @@ class PriorWalk:
     rows: dict[tuple[str, int], PriorRow] = field(default_factory=dict)
     unreadable: dict[str, str] = field(default_factory=dict)
 
-    def get(self, mode: str, seq: int) -> PriorRow | None:
-        return self.rows.get((schema.EXECUTION_MODE_CSV.get(mode, mode), int(seq)))
+    def get(self, mode: str, seq: int, extra=None) -> PriorRow | None:
+        return self.rows.get(rung_key(mode, seq, extra))
 
 
 def scan(results_root, expected_files: list[str]) -> PriorWalk:
@@ -216,17 +261,18 @@ def scan(results_root, expected_files: list[str]) -> PriorWalk:
 class ResumePlan:
     """Per rung: carry it forward, or walk it. Keyed by the CODE mode name."""
 
-    #: ``(code_mode, seq) -> (row, digest)`` handed to ``run_ladder.walk``.
-    reuse: dict[tuple[str, int], tuple[dict, str]]
-    #: ``(code_mode, seq)`` the walk must actually attempt.
-    remeasure: tuple[tuple[str, int], ...]
-    #: ``(code_mode, seq)`` the profile's applicability rule refuses.
-    skipped: tuple[tuple[str, int], ...]
+    #: ``(code_mode, seq) -> (row, digest)`` handed to ``run_ladder.walk``. A
+    #: model rung's key is ``(code_mode, seq, *MODEL_KEY_FIELDS values)``.
+    reuse: dict[tuple, tuple[dict, str]]
+    #: the keys the walk must actually attempt.
+    remeasure: tuple[tuple, ...]
+    #: the keys the profile's applicability rule refuses.
+    skipped: tuple[tuple, ...]
     #: Why each rung was not reused, for the plan printout. Never silent.
-    reasons: dict[tuple[str, int], str]
+    reasons: dict[tuple, str]
 
     @property
-    def reuse_for_walk(self) -> dict[tuple[str, int], dict]:
+    def reuse_for_walk(self) -> dict[tuple, dict]:
         return {key: row for key, (row, _) in self.reuse.items()}
 
 
@@ -243,7 +289,10 @@ def plan(profile, prior: PriorWalk, *, enabled: bool = True) -> ResumePlan:
     reasons: dict[tuple[str, int], str] = {}
 
     for rung in profile.rungs():
-        key = (rung.mode, rung.seq)
+        # A model rung (model_profiles.ModelRung) carries the v3 key columns as
+        # `extra`; a layer rung has none and keys on the pair, as always.
+        extra = getattr(rung, "extra", None)
+        key = (rung.mode, rung.seq) if extra is None else (rung.mode, rung.seq) + tuple(extra)
         if rung.skip_reason:
             skipped.append(key)
             continue
@@ -251,7 +300,7 @@ def plan(profile, prior: PriorWalk, *, enabled: bool = True) -> ResumePlan:
             remeasure.append(key)
             reasons[key] = "not a resume: every rung is walked"
             continue
-        found = prior.get(rung.mode, rung.seq)
+        found = prior.get(rung.mode, rung.seq, extra)
         if found is None:
             remeasure.append(key)
             reasons[key] = "no row on disk for this rung"
@@ -340,6 +389,13 @@ class Ledger:
             if not isinstance(sessions, list):
                 raise ValueError("`sessions` is not a list")
             for record in sessions:
+                # `[2026-08-23]` A ledger written before `model_key` existed
+                # names layer rungs only; it reads back as exactly that, and
+                # the field is filled with None -- "a layer rung", which is the
+                # only thing a rung recorded then could have been.
+                for rung in record.get("rungs") or []:
+                    if isinstance(rung, dict):
+                        rung.setdefault("model_key", None)
                 schema.validate_session(record)
         except Exception as exc:
             return cls(path, [], unreadable=f"{type(exc).__name__}: {exc}")
@@ -383,10 +439,12 @@ class Ledger:
             raise RuntimeError("record_rung before open_session")
         if source not in schema.RUNG_SOURCES:
             raise ValueError(f"rung source {source!r} not in {schema.RUNG_SOURCES}")
+        extra = model_key(row)
         self._open["rungs"].append(
             {
                 "execution_mode": schema.EXECUTION_MODE_CSV.get(mode, mode),
                 "seq_len": int(seq),
+                "model_key": None if extra is None else list(extra),
                 "source": source,
                 "run_status": row.get("run_status"),
                 "row_digest": row_digest(row),
@@ -469,10 +527,12 @@ def walk_block(
     block["session_count"] = len(sessions)
     block["walk_source"] = "resumed" if len(sessions) > 1 else "single_session"
 
-    claimed: dict[tuple[str, int], tuple[str, str]] = {}
+    claimed: dict[tuple, tuple[str, str]] = {}
     for record in sessions:
         for rung in record["rungs"]:
             key = (str(rung["execution_mode"]), int(rung["seq_len"]))
+            if rung.get("model_key") is not None:
+                key = key + tuple(str(v) for v in rung["model_key"])
             if rung["source"] == "measured":
                 block["rungs_measured"] += 1
             elif rung["source"] == "reused":
@@ -503,8 +563,7 @@ def walk_block(
     wanted = None
     if profile is not None:
         wanted = {
-            (schema.EXECUTION_MODE_CSV.get(r.mode, r.mode), r.seq)
-            for r in profile.rungs()
+            rung_key(r.mode, r.seq, getattr(r, "extra", None)) for r in profile.rungs()
         }
     orphans = sorted(
         key for key in prior.rows if key not in claimed and (wanted is None or key in wanted)
@@ -513,7 +572,7 @@ def walk_block(
     if orphans:
         problems.append(
             f"{len(orphans)} row(s) belong to no session: "
-            f"{', '.join(f'{m} seq {s}' for m, s in orphans[:6])}"
+            f"{', '.join(describe_key(k) for k in orphans[:6])}"
             + (" ..." if len(orphans) > 6 else "")
             + ". A row nobody measured has unknown provenance; the ledger exists "
             "so that there are none of those."
@@ -573,18 +632,19 @@ def fidelity_problems(
     """
     final = {row_key(row): row for row in walked}
     out = []
-    for (mode, seq), (_, digest) in sorted(plan_reuse.items()):
-        csv_mode = schema.EXECUTION_MODE_CSV.get(mode, mode)
-        row = final.get((csv_mode, int(seq)))
+    for key, (_, digest) in sorted(plan_reuse.items()):
+        mode, seq, *extra = key
+        csv_key = rung_key(mode, seq, extra or None)
+        row = final.get(csv_key)
         if row is None:
             out.append(
-                f"rung {csv_mode} seq {seq} was planned as REUSED and is absent "
+                f"rung {describe_key(csv_key)} was planned as REUSED and is absent "
                 "from the walk's output; a carried-forward row must still be "
                 "written into its mode's CSV."
             )
         elif row_digest(row) != digest:
             out.append(
-                f"rung {csv_mode} seq {seq} was planned as REUSED and its row "
+                f"rung {describe_key(csv_key)} was planned as REUSED and its row "
                 f"changed ({digest} -> {row_digest(row)}). The walker re-ran a "
                 "rung the plan said it would carry forward, so the run's own "
                 "account of what it measured is wrong."
@@ -592,18 +652,29 @@ def fidelity_problems(
     return out
 
 
+def describe_key(key: tuple) -> str:
+    """A rung key as prose: ``hybrid seq 512`` for a layer rung, the model
+    columns appended for a model rung."""
+    text = f"{key[0]} seq {key[1]}"
+    if len(key) > 2:
+        text += " " + " ".join(f"{n}={v}" for n, v in zip(MODEL_KEY_FIELDS, key[2:]))
+    return text
+
+
 def describe(plan_: ResumePlan) -> list[str]:
     """The plan as lines. Every rung named, because a silent reuse is the trap."""
     lines = []
+
+    def name(key):
+        extra = " " + " ".join(str(v) for v in key[2:]) if len(key) > 2 else ""
+        return f"{key[0]:<9} seq {key[1]:<6}{extra}"
+
     for key, (_, digest) in sorted(plan_.reuse.items()):
-        lines.append(f"REUSE  {key[0]:<9} seq {key[1]:<6} row {digest}")
+        lines.append(f"REUSE  {name(key)} row {digest}")
     for key in plan_.remeasure:
-        lines.append(
-            f"WALK   {key[0]:<9} seq {key[1]:<6} "
-            f"{plan_.reasons.get(key, 'planned')}"
-        )
+        lines.append(f"WALK   {name(key)} {plan_.reasons.get(key, 'planned')}")
     for key in plan_.skipped:
-        lines.append(f"SKIP   {key[0]:<9} seq {key[1]:<6} the profile refuses it")
+        lines.append(f"SKIP   {name(key)} the profile refuses it")
     return lines
 
 

@@ -466,5 +466,41 @@
 // timed iteration fails the row -- every iteration's verdict governs. (The interim --no-stage-stats flag and its six
 // tests, 613 -> 617 earlier the same day, are superseded and gone.)
 //
+// `[2026-08-23]` 615 -> 652 and 27 -> 30 modules, queue item 13 (doc 56 H1a):
+// the MODEL scope. SCHEMA v3 -- the first column bump since 2026-08-10, and
+// the first the "stays 2" pins declined for a fact that was NOT per-row: a
+// whole-forward measurement is. Thirteen columns appended LAST (the v2 header
+// is now the pinned prefix exactly as v1 was); `read_rows_compatible` reads
+// every recorded v1/v2 root, and compare_roots / smoke_gate / manifest moved
+// onto it so the v2 roots they are pointed at keep reading -- a v2 root
+// against a v3 root FAILS on `schema_version`, an identifier, rather than
+// comparing silently. +5 test_schema (the prefix/suffix pin, a model row's
+// round trip, a layer row that may carry no model column, eleven validation
+// refusals each naming its clause, the ledger's `model_key`), six existing
+// version pins moved to the v3 truth. +2 test_resume: `row_key` extends by
+// `MODEL_KEY_FIELDS` for a model row and stays the pair for a layer row; a
+// ledger keyed on the pair alone would attribute three decode rows at seq_len
+// 1 to ONE rung, so `SESSION_RUNG_FIELDS` gains `model_key` (old ledgers read
+// back with None). +3 test_compare_roots: KEY_FIELDS gained the six,
+// tokens_per_second gates at the mode's band, plan_hash is an identifier, and
+// two v2 roots still compare. The three new modules: test_model_adapter (+9)
+// -- THE LOAD-BEARING ONE: for both models and both phases the dispatch
+// vector derived from the cached manifests and the plan equals the one the
+// measured path's arithmetic produces for the plan's own sequence (qwen
+// prefill 85 submissions / 626 launches, decode 57 / 150; llama 49 / 328,
+// 33 / 152), and every plan stage's launch count equals the manifest's --
+// which needed the planner brought to the items-11/12 kernels (decode QKV
+// gemv2, the derived 10-launch Qwen head; PLAN stays 10/10 with its golden
+// regenerated); the gate is shown to be `make verify`'s command line and a
+// FAIL on one prompt is not a pass. test_model_profiles (+8): the walk's
+// shape, every prefill rung labelled kernel-scaling and never ubatch, the gate
+// prompt fitting the compiled max_seq, the v3 resume identity, a missing
+// artifact set as a derived skip with its reason. test_run_model (+10): the
+// runner with an injected worker and verifier -- complete rows for a gate
+// failure (that rung only), a raising worker, a raising verifier, --no-verify
+// (never a passed row), a dry run; a resume that reuses 8 and walks the newly
+// compiled set; two walks compare OK and a 25 % tok/s drift fails; an exact
+// prompt length under an uneven tokenizer.
+//
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 615/615 passed in 27 modules
+// CHECK: study host tests: 652/652 passed in 30 modules

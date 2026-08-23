@@ -148,8 +148,22 @@ if _HERE not in sys.path:
 import results_io  # noqa: E402
 import schema  # noqa: E402
 
-#: What makes two rows the same measurement. Doc 03's key.
-KEY_FIELDS = ("study_case_id", "execution_mode", "seq_len")
+#: What makes two rows the same measurement. Doc 03's key, extended `[2026-08-23]`
+#: by schema v3's model-scope columns (doc 56 section 3.6): a layer row reads
+#: them as empty strings and keys exactly as before; a model row is keyed by
+#: what it measured -- three decode rows at seq_len 1 and three contexts are
+#: three measurements, not one.
+KEY_FIELDS = (
+    "study_case_id",
+    "execution_mode",
+    "seq_len",
+    "measurement_scope",
+    "model_id",
+    "phase",
+    "ubatch_tokens",
+    "context_end_tokens",
+    "precision_plan_id",
+)
 
 #: Must match exactly. Shape, configuration, structural counts and outcome:
 #: everything whose change means the runs are not comparable rather than that
@@ -189,6 +203,15 @@ IDENTIFIER_FIELDS = (
     "npu_unique_xclbin_count",
     "validation_error_count",
     "run_status",
+    # v3 model-scope identity `[2026-08-23]`: the planned sequence (its hash),
+    # the token accounting and the whole-phase dispatch record are counts and
+    # keys, and a row whose plan hash moved measured a different sequence.
+    "logical_token_count",
+    "context_start_tokens",
+    "measured_token_count",
+    "plan_hash",
+    "host_ops",
+    "model_dispatch_vector_json",
 )
 
 #: Reported as drift. Only GATING_FIELDS can fail the run.
@@ -196,6 +219,7 @@ LATENCY_FIELDS = (
     "avg_latency_ms",
     "min_latency_ms",
     "max_latency_ms",
+    "tokens_per_second",
     "device_ms",
     "sync_ms",
     "host_cpu_ms",
@@ -208,7 +232,15 @@ POWER_FIELDS = (
     "power_std_w",
     "raw_avg_power_w",
 )
-GATING_FIELDS = ("avg_latency_ms", "effective_gflops_per_sec", "avg_power_w")
+#: `tokens_per_second` `[2026-08-23]` is gated with the row's execution_mode's
+#: latency tolerance (it is avg_latency_ms's reciprocal over a token count, so
+#: the same band applies); a layer row never carries it and is unaffected.
+GATING_FIELDS = (
+    "avg_latency_ms",
+    "effective_gflops_per_sec",
+    "avg_power_w",
+    "tokens_per_second",
+)
 
 #: (warn, fail) percent, applied to the median AND the p90 of the drift spread.
 #: Doc 03's table.
@@ -619,9 +651,14 @@ def compare_csv(
     if not right.exists():
         report.fail("missing in candidate")
         return
+    # `[2026-08-23]` Through the prefix-tolerant reader: this is the analysis
+    # tier, and the v2 roots recorded before schema v3 are exactly the roots
+    # this tool is pointed at. A v2 root against a v3 root still FAILS -- on
+    # `schema_version`, an identifier field -- rather than being silently
+    # compared column for column; two v2 roots compare as they always did.
     try:
-        baseline_rows = results_io.read_rows(left)
-        candidate_rows = results_io.read_rows(right)
+        baseline_rows = results_io.read_rows_compatible(left)
+        candidate_rows = results_io.read_rows_compatible(right)
     except Exception as e:
         report.fail(f"unreadable as the current schema -- {e}")
         return

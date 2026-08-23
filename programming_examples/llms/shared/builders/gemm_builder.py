@@ -115,19 +115,28 @@ def with_tile_n(spec, tile_n):
     return retiled
 
 
-def gemm_registry_config(m, k, n, output_dtype="bf16", precision="high"):
+def gemm_registry_config(m, k, n, output_dtype="bf16", precision="high", method=None):
     """Full per-shape build recipe from the registry: the chosen method's spec
     (build_kwargs / suffix / launches) MERGED with the registry tile sizes. This is
     the single entry point llama builders use so tiles + method are never hardcoded.
 
+    `method` `[2026-08-23]` FORCES a registry method (its MEASURED tiles for this
+    shape, via `gemm_config_method`) instead of the tier's best -- for a caller
+    whose cascade supports one form only (the o_ffn builders are fused-cast-only;
+    doc 56 H1a met this at Qwen3-0.6B M=512/1024 where the best is drain). A
+    forced method is a deviation from the plan and must be recorded as one.
+
     Returns the gemm_method_spec dict plus:
       tile_k_l2, tile_k_l1, tile_n : from the registry JSON (tile_m comes from the
                                      method spec — drain=32 / fused-cast=64)
-      method                       : the registry-selected method name
+      method                       : the registry-selected (or forced) method name
     """
-    from kernel_registry.registry_lookup import gemm_config
+    from kernel_registry.registry_lookup import gemm_config, gemm_config_method
 
-    cfg = gemm_config(m, k, n, output_dtype, precision)
+    if method is not None:
+        cfg = gemm_config_method(m, k, n, output_dtype, method, precision)
+    else:
+        cfg = gemm_config(m, k, n, output_dtype, precision)
     return _spec_with_tiles(cfg["method"], cfg["tile"])
 
 

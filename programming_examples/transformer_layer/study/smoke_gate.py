@@ -94,7 +94,10 @@ def check_results_root(
             )
             continue
         try:
-            rows = results_io.read_rows(path)
+            # `[2026-08-23]` prefix-tolerant: a recorded v2 root re-gated under
+            # schema v3 (`run_profile --gate-only`) still reads; a foreign or
+            # reordered header, or a NEWER version, still fails here.
+            rows = results_io.read_rows_compatible(path)
         except Exception as e:
             problems.append(f"{rel}: unreadable as the current schema -- {e}")
             continue

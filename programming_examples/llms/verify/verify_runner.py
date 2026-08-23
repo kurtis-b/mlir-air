@@ -299,7 +299,10 @@ def main():
     )
 
     config = adapter.build_config()
-    max_seq = 2048  # Production prefill kernels are tiled for seq_len=2048.
+    # Production prefill kernels are tiled for seq_len=2048. `[2026-08-23]`
+    # LLMS_VERIFY_MAX_SEQ pairs with the adapters' LLMS_VERIFY_CACHE_ROOT so the
+    # model study can gate an artifact set compiled at another M (doc 56 H1a).
+    max_seq = int(os.environ.get("LLMS_VERIFY_MAX_SEQ", "2048"))
 
     in_verify_mode = args.prompts == "topk_token"
     report = Report(
