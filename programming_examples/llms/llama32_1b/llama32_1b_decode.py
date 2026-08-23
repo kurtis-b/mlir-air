@@ -35,6 +35,22 @@ from shared.infra.backend_presets import (
 # ---------------------------------------------------------------------------
 
 
+def build_lm_head_gemv_llama_module(emb_dim):
+    """The production head: 8 x 16384 rows (vocab 128256 + 2816 pad rows).
+
+    `[2026-08-23]` m_input 8 (one kernel call per 8-row tile), as the Qwen3
+    heads since 08-21: 15.10 -> 13.91 ms p50 on the head alone, interleaved
+    x20 under Turbo (devq 563). The mixed partition 7 x 16384 + 13568 that
+    drops the pad rows measured NO gain at either m_input (15.15 / 14.16 ms
+    against 15.10 / 13.91; doc 57 section 5 item 5d), so the partitions stay
+    uniform and the host slicing (`_LM_N_PART`) is untouched. Gated by
+    `make verify` and `make check-lm-head-reexec`.
+    """
+    from shared.builders.lm_head_gemv_multi import build_lm_head_gemv_module
+
+    return build_lm_head_gemv_module(emb_dim, m_input=8)
+
+
 def compile_decode_kernels(cache, config):
     """Compile the 3 merged decode kernels."""
     from shared.infra.external_kernels import compile_all_external_kernels
@@ -76,13 +92,9 @@ def compile_decode_kernels(cache, config):
     )
 
     # 3. LM Head GEMV multi-launch: 8-partition GEMV in one ELF
-    from shared.builders.lm_head_gemv_multi import (
-        build_lm_head_gemv_module,
-    )
-
     cache.compile_and_cache(
         "lm_head_gemv",
-        build_lm_head_gemv_module(emb_dim),
+        build_lm_head_gemv_llama_module(emb_dim),
         {"verbose": cache.verbose, **LM_GEMV_BACKEND},
     )
 

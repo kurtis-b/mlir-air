@@ -519,6 +519,31 @@ H2/H3 phases measure.
    bytes are the ~48 µs still paid (a partial BO sync or a host index trick could recover
    some); the form assumes `rows_per_col % head_dim == 0` (true for 0.6B / 1.7B / 4B); the
    1.7B port (K = 2048) is not done.
+5d. **`[2026-08-23]` Llama-3.2-1B head (queue item 12): the mixed partition does NOT pay; `m_input
+   8` does — LANDED** (devq 563 probe, 564 landing; evidence `results/llama1b-head-20260823/`).
+   The queue carried "2,816 pad rows, ~0.36 ms" — byte arithmetic (2816 × 4 KB at 32 GB/s),
+   never measured. Measured, four cells interleaved ×20 under Turbo on the head alone (random
+   weights, every cell correct vs f32, max_rel 2.75e-3, argmax agrees):
+   8 × 16384 at `m_input 4` (production) **15.10** ms p50 (min 14.84); 7 × 16384 + 13568 at
+   `m_input 4` **15.15** (14.91); 7 × 16384 + 13568 at `m_input 8` **14.16** (13.84);
+   8 × 16384 at `m_input 8` **13.91** (13.83). Dropping the pad rows is never faster — the
+   13568-row tail (212 iterations, not a multiple of the preset's 16-iteration loop tiling) costs
+   what its 11.5 MB saves — while `m_input 8` alone is **−1.19 ms** (as on the Qwen3 heads,
+   §1.4). A preset trap on the way: the Qwen probe's backend fails aiecc on a 16384-row partition
+   at `m_input 4` (`push_queue ... Repeat count exceeds the [0:255] range`, devq 562); Llama's
+   `LM_GEMV_BACKEND` carries `runtime_loop_tiling_sizes [16, 16]`, which is what keeps it under
+   the cap. **Port**: `build_lm_head_gemv_llama_module` (`m_input=8`, partitions unchanged, host
+   slicing untouched); the re-execution gate factored into `shared/infra/lm_head_reexec.py`
+   (the Qwen wrapper keeps its name and lit; Llama gets `make check-lm-head-reexec`). **Landing**
+   (devq 564, same session, Turbo before and after): `make verify` PASS 2 / 0;
+   `check-lm-head-reexec` 7/7 clean, bit-identical; `make profile N_TOKENS=32` ×2 before / after
+   on the instruct prompt (9 tokens to EOT, 10 head calls each): `lm_head_gemv` **14.94 / 14.94
+   → 13.86 / 13.98 ms** avg (min 14.71 / 14.74 → 13.73 / 13.74), per-layer wall 4.82 / 4.73 →
+   4.66 / 4.72 ms, `o_gemv_ffn` 3.13 / 3.10 → 3.12 / 3.13 and `rms_gemv_rope` 0.96 → 0.91–0.93
+   unchanged within spread: **−1.0 ms per token** (≈ 89 → 88 ms by 16 × per-layer wall + head;
+   the README's 92 ms / 10.8 tok/s is the June figure, pmode unrecorded). The Qwen3-0.6B
+   wrapper on the shared gate body: 7/7 (devq 565). Llama-3.2-3B (emb 3072) and the int4
+   sibling keep `m_input 4` — not measured here.
 5b. **`[2026-08-21]` LM-head partitioning, the planner's finding — DONE and LANDED** (devq
    476 probe, 478 verify, 479 profile). Doc 56 H0's planner derived that at `m_input = 8`
    the BD repeat cap admits 16384-row partitions, and that stitching takes launches of

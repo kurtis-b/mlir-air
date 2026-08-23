@@ -26,7 +26,7 @@ N_TOKENS ?= 1000
 PROMPT   ?= What is the capital of France?
 MODEL    ?= instruct
 
-.PHONY: help compile run profile chat verify verify-full diagnosis clean
+.PHONY: help compile run profile chat verify check-lm-head-reexec verify-full diagnosis clean
 
 # ============================================================
 # Help
@@ -98,6 +98,13 @@ RUNNER_ADAPTER = llama32_1b.verify_adapter
 
 ## Run the top-k token-level inclusion gate (NPU vs HF bf16, 2 prompts × 32 tokens, k=5).
 ## This is the fast CI gate. For the full 8-prompt sweep, use `make verify-full`.
+## LM-head ELF back-to-back re-execution gate (no HF weights): the production
+## head compiled fresh, dispatched seven times, 7/7 clean required
+## (shared/infra/lm_head_reexec.py; doc 57 section 1.5 for the family it guards).
+check-lm-head-reexec:
+	@mkdir -p $(BUILD_DIR)
+	cd $(BUILD_DIR) && python3 $(srcdir)/lm_head_reexec_gate.py lm_head_reexec_cache
+
 verify:
 	@mkdir -p $(BUILD_DIR)
 	cd $(BUILD_DIR) && python3 $(VERIFY_RUNNER) --runner=$(RUNNER_ADAPTER) \

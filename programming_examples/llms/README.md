@@ -43,7 +43,7 @@ per token.
 
 | Model | Prefill (TTFT) | Decode (TPS) | ELF/layer (prefill / decode) |
 |---|---|---|---|
-| Llama-3.2-1B (bf16) | 1.21 s | 12.2 tok/s | 3 / 2 |
+| Llama-3.2-1B (bf16) | 1.21 s | 12.2 tok/s (06; head −1.0 ms on 08-23) | 3 / 2 |
 | SmolLM2-1.7B (bf16) | 2.02 s | 8.0 tok/s | 3 / 2 |
 | Qwen2.5-0.5B | 0.99 s | 11.9 tok/s | 4 / 5 |
 | Qwen3-0.6B | 1.52 s | **13.4–13.5 tok/s** (08-23) | 3 / 2 |

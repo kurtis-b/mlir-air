@@ -7,7 +7,8 @@ End-to-end LLAMA-3.2-1B (1B parameter, BF16) inference running on AMD NPU2 (AIE2
 | Phase | Time | vs IRON |
 |-------|------|---------|
 | Prefill / TTFT (2048 tokens) | 1.27s wall | **2.17x faster** |
-| Decode / TPOT (steady-state) | 92ms/token (10.8 tok/s) | **4.0x faster** |
+| Decode / TPOT (steady-state) | 92ms/token (10.8 tok/s; 2026-06, pmode unrecorded) | **4.0x faster** |
+| Decode LM head (`lm_head_gemv`, 8 × 16384 at `m_input 8` since 2026-08-23) | 14.94 → 13.86–13.98 ms per token (Turbo recorded, devq 564; ≈ 88 ms/token by 16 × per-layer wall 4.7 + head) | |
 
 ## Prerequisites
 
