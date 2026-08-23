@@ -201,24 +201,35 @@ context all verified (devq 524) — the re-execution shape passes.
 **Latency, forward-only clock, same session, Turbo** (devq 523 / 524; one context, weights
 uploaded once; a forward = 32 band dispatches; 1 warm-up, 10 samples, each verified outside the clock):
 
-| at 512, the layer's AN1 + FFN + AN2 | latency | device (execute+wait) |
+| at 512, the layer's AN1 + FFN + AN2 | wall (forward-only clock) | device (execute+wait, rule T1) |
 |---|---|---|
-| `tail_pipeline`, `n_b 2` | **26.39 ms** (min 26.02, max 26.91) | 26.02 = 0.813 ms/band × 32 |
+| `tail_pipeline`, `n_b 2` (32 band dispatches, 10 samples) | **26.39 ms** (min 26.02, max 26.91) | **26.02** = 0.813 ms/band × 32 |
 | `tail_pipeline`, `n_b 1` | 34.04 (min 33.70) | 33.64 = 1.051/band |
-| `coarse`'s tail — submissions AN1 1.04 + FFN 2.46 + AN2 1.04 | — | **4.66** (+ 0.46 sync); whole forward 12.77 |
+| `coarse`'s tail — submissions AN1 + FFN + AN2, 10-sample means 1.19 + 2.44 + 1.02 | not instrumented on its own (the whole forward is 12.77) | **4.66** (+ 0.46 host sync) |
 | `fused`, whole forward (one submission, no stage split) | 9.22 (min 8.74) | 6.08 |
 
+Like against like: **device 26.02 vs 4.66 ms — 5.6×**; and the resident tail's wall time alone
+(26.39) is 2.1× `coarse`'s *whole* forward (12.77), which bounds `coarse`'s tail-only wall time
+from above. (`coarse`'s three tail submissions have no forward-only wall clock of their own; its
+0.46 ms of sync and its un-instrumented host gaps between submissions are not in the 4.66.)
+
 **Why it is 5× slower, and why that was predictable.** A 16-row band must stream both weight
-matrices (`w_up` + `w_down` = 9.4 MB) from DRAM, so band-serial re-streams them 32 times per
-layer: ~302 MB against `coarse`'s 22 MB for the *whole* layer ([54 §1](54-first-full-profile-and-decoder-families.md)).
-What residency saves — the H round trip, ~0.4 MB per band, 12 MB per layer — is 25× smaller than
-what the band structure costs, which is §3.6's band-serial weight term, now measured: 0.81 ms per
-band ≈ 11.6 GB/s of weight streaming through two shim columns. The only escapes are a wider band
-(more rows per weight pass — capped by L1 at `tile_m 16` with `tile_k 192`), more columns (capped
-at 2 by placement), or in-module band pipelining (unexpressible under AIE DMA tasks today). None
-of them closes a 5× gap. **R1's question is answered on hardware: at this width, a resident FFN
-tail is weight-bandwidth-bound and loses to `coarse`'s whole-array GEMMs.** The builder, its two
-lits and the measurement stay as the study's resident-tail instrument; the record is closed.
+matrices (`w_up` + `w_down` = 9,437,184 B) from L3 through the memtile — the builder refills the
+`w_up` slices and the `w_down` chunks per band, nothing about them is resident across bands — so
+band-serial reads them 32 times per layer: **302 MB of device-side weight reads**. What residency
+saves is the H round trip: 16 × 3072 × 2 B per band each way, 197 KB per band, **6.3 MB per
+layer — 48× less** than the weight re-streaming costs. That is §3.6's band-serial weight term, now
+measured: 0.81 ms per band ≈ 11.6 GB/s of weight streaming through two shim columns. `coarse`'s
+FFN GEMMs tile the other way — a weight chunk staged in L2 is reused across the row tiles of a K
+step — so their weight reads are of order one pass of the matrices, not 32; that is a structural
+statement about `builders/block.py`'s GEMM tiling, not a measured byte count (the dispatch vector's
+`bytes_transferred`, 22 MB for `coarse`'s whole layer at 512, counts host↔device `bo.sync` traffic
+and cannot see device-side DRAM reads, §3.1). The only escapes are a wider band (more rows per
+weight pass — capped by L1 at `tile_m 16` with `tile_k 192`), more columns (capped at 2 by
+placement), or in-module band pipelining (unexpressible under AIE DMA tasks today). None of them
+closes a 5× gap. **R1's question is answered on hardware: at this width, a resident FFN tail is
+weight-bandwidth-bound and loses to `coarse`'s whole-array GEMMs.** The builder, its two lits and
+the measurement stay as the study's resident-tail instrument; the record is closed.
 
 ---
 

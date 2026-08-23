@@ -547,11 +547,21 @@ def check_shape(label, kwargs, backend_kwargs=None):
             if len(bufs) > 1 and bufs[i] == bufs[(i + 1) % len(bufs)]
         ]
         inits = sorted(lock_init.get(a, -1) for a in acq)
-        if consecutive or inits != [2]:
+        # A strict two-buffer alternation: EXACTLY two distinct buffers, an even
+        # chain length, every other BD the same buffer -- [A] and [A, B, C]
+        # were accepted by "no adjacent duplicates" alone (review, 2026-08-22).
+        two_alternating = (
+            len(set(bufs)) == 2
+            and len(bufs) >= 2
+            and len(bufs) % 2 == 0
+            and all(bufs[i] == bufs[i % 2] for i in range(len(bufs)))
+        )
+        if consecutive or not two_alternating or inits != [2]:
             problems.append(
                 f"{label}: tile {t} (down) feed chain {bufs} acquires {sorted(acq)} "
-                f"(init {inits}); need a strict two-buffer alternation with one "
-                "acquire lock initialised to 2 (the feed's round-robin rule)"
+                f"(init {inits}); need a strict two-buffer alternation (exactly two "
+                "distinct buffers, even length, alternating) with one acquire lock "
+                "initialised to 2 (the feed's round-robin rule)"
             )
         else:
             feed_ok += 1
