@@ -53,14 +53,23 @@ THE DATAFLOW (one air.launch, one air.segment, four herds)
     UP ->[tp_h]-> DOWN herd [n_b,1]            core->core, L1->L1: the
         finished [tile_m, tile_n] H tile, one per sweep
     memtile ->[tp_down_feed]-> DOWN herd       ONE channel per down core
-        carrying, per (sweep, block d): the w_down chunk, then accumulator
-        block d (its ``curr_acc_c``); after the sweeps, per d: the final
-        block d, then the neighbour's partial (``buffer_to_reduce``)
+        carrying, per (sweep, block d): the w_down chunk into l1_b, then
+        accumulator block d (its ``curr_acc_c``) into l1_acc_in; after the
+        sweeps, per d, for every core but the chain's last: the partial to
+        fold in (``buffer_to_reduce``) into l1_b's [tile_m, tile_k] PREFIX,
+        then the final block d into l1_acc_in -- a strict (b, acc)
+        alternation from the first transfer to the last (see FOOTGUNS)
     DOWN ->[tp_acc_store]-> memtile            accumulator block d back to
-        its ring buffer (``new_acc_c``), one L2 buffer PER BLOCK per core
-    DOWN ->[tp_reduce]-> memtile ->(feed)-> DOWN   core tx+1's reduced
-        partial to core tx, relayed through L2 (see PORT ARITHMETIC)
-    DOWN core 0 ->[tp_down_out]-> memtile      the final reduced block d
+        its ring buffer (``new_acc_c``), one L2 buffer PER BLOCK per core;
+        a lone core (n_b 1) first stores the zero partials its tail folds
+        in, one L2 buffer per block
+    DOWN core k ->[tp_reduce]-> memtile ->(feed)-> DOWN core k-1
+        the reduced block, relayed through L2, for 1 <= k <= n_b-2; the
+        chain's LAST core has no tail at all -- its final blocks are
+        already in its ring, and the memtile relays them into core n_b-2's
+        b-slot directly (iron's last core sends and does not add)
+    DOWN core 0 ->[tp_down_out]-> memtile      the final reduced block d,
+        from l1_red (the add's output; never a get destination)
     memtile ->[tp_an2_feed]-> AN2 herd [2,1]   gamma2; h1 rows (residual,
         from l2_ln[c]); then per d a 4-D memtile put UN-TILES half c of
         the blocked block into column block d of the core's row-major
@@ -89,9 +98,10 @@ PORT ARITHMETIC -- why the hops are where they are
       one sub-channel, matching gets on the core). L2 buffers referenced
       by one channel are bucketed onto one memtile by air-to-aie, which is
       what lets one port source all of them.
-    - the reduction therefore relays through L2 (core tx+1 -> l2_red[tx]
-      -> core tx's feed) instead of L1->L1, and H keeps the core->core
-      edge (the one iron hop that survives verbatim).
+    - the reduction therefore relays through L2 (core k -> l2_red[k-1] ->
+      core k-1's feed, and the last core's ring blocks -> core n_b-2's
+      feed) instead of L1->L1, and H keeps the core->core edge (the one
+      iron hop that survives verbatim).
     - the AN1 core's x, residual and gamma1 would be three inbound streams;
       all three stage through L2 and arrive on ONE channel. The LN kernel
       needs x and residual as two base pointers, so the norm_tail packing
@@ -110,14 +120,21 @@ PORT ARITHMETIC -- why the hops are where they are
       up->down edges). The structure check pins that number.
 
     Memtile ports: the L2 buffers bucket (by shared channel) into the down
-    group {w_down stage, rings, relays}, the AN group {l2_ln, out blocks,
-    gamma2}, the AN1 input group {x, residual, gamma1} and the w_up stage
-    -- measured: four memtiles in the routed design at both pinned shapes,
-    one per group. The down group's S2MM demand is ``2*n_b`` (stores +
-    relays + one shim refill), within a memtile's six for ``n_b <= 3``;
-    ``n_b`` is capped there rather than guessed past it. The A broadcast is
-    ONE memtile MM2S port fanning to every up core (measured: one
-    ``aie.flow`` source, n_b destinations).
+    group {w_down stage, rings, relays, a lone core's zeros}, the AN group
+    {l2_ln, out blocks, gamma2}, the AN1 input group {x, residual, gamma1}
+    and the w_up stage -- measured: four memtiles in the routed design at
+    both pinned shapes, one per group. The down group's S2MM demand is at
+    most ``2*n_b`` (stores + relays + one shim refill), within a memtile's
+    six for ``n_b <= 3``; ``n_b`` is capped there rather than guessed past
+    it. The A broadcast is ONE memtile MM2S port fanning to every up core
+    (measured: one ``aie.flow`` source, n_b destinations).
+
+    The bisection instrument: ``stop_after`` in ``STOP_STAGES`` cuts the
+    module after the AN1, up or down herd and routes that herd's output to
+    ``y`` (see the builder's docstring); ``tail_pipeline_stage_reference``
+    is each cut's oracle and ``tail_pipeline_rung.py --stop-after`` runs
+    it. It is what located the 2026-08-22 deadlock and the two wrong
+    answers behind it, one hop at a time (devq 513-516).
 
 WHAT THE HOST SEES
     ``tail_pipeline_pack_weights(w_up, w_down, ...)`` pre-tiles both
@@ -132,12 +149,69 @@ WHAT THE HOST SEES
 
 FOOTGUNS
     - ``emb_dim`` must be a multiple of 32 for the NUMBERS to be right:
-      ``fused_add_layer_norm_2outs`` steps 32 lanes and silently truncates
-      a row (``vector_chunks = cols / 32``). iron's baseline has emb 48,
-      which compiles and routes identically but normalizes the first 32
-      columns only. The builder REFUSES it unless
+      ``fused_add_layer_norm_2outs`` steps 32 lanes (``vector_chunks =
+      cols / 32``) and then rewinds its row pointer by ``cols``, so at
+      emb 48 every pass after the first starts 16 elements BEFORE the row
+      and the output is unrelated to any LayerNorm -- measured: the AN1 cut
+      at iron's baseline reads corr 0.11 against the true LN AND against a
+      "first 32 lanes only" model (devq 516). iron's baseline has emb 48;
+      it compiles and routes identically and runs to completion, so it is
+      a hang/no-hang datum, never a number. The builder REFUSES it unless
       ``allow_an_lane_truncation=True`` is passed -- the structure check
-      passes it, explicitly, for the baseline; nothing numeric may.
+      passes it, explicitly, for the baseline; nothing numeric may. The
+      numeric witness of the baseline GEOMETRY (one band, one sweep, depth
+      1, one column) is emb 32 with tile_k 32.
+    - THE ONE-TOKEN RULE (the 2026-08-22 deadlock, devq 512/513). An L1
+      buffer that is the destination of channel gets AND the source of a
+      channel put gets its put BD's lock counts from air-to-aie's
+      buffer-level ``getLockValuePair`` -- ``ceil(#gets / #puts)`` tokens
+      per fire -- while the core releases ONE token per put: with two gets
+      and one put (the first port's tail forwarded ``l1_acc_in``) the put
+      BD waited for 2 and the core gave 1, every dispatch, both shapes
+      (``aie.use_lock(%lock, AcquireGreaterEqual, %c2_i32)`` on the down
+      core's MM2S against a single ``Release, %c1_i32``). And a buffer put
+      on TWO channels gets two lock pairs with the second's acquire hoisted
+      to its own block start, so the second put's producing write races
+      the first channel's DMA read. Hence: every L1 buffer is a channel
+      destination OR a channel source, never both; every source feeds one
+      channel; a value that must be forwarded is first written by a kernel
+      into its own source buffer (the tail's ``l1_red``). The structure
+      check pins every core-tile BD lock at one token.
+    - THE FEED'S ROUND-ROBIN RULE (the wrong answer under the deadlock,
+      devq 514/515). Several gets on one core S2MM channel share ONE lock
+      pair whose init is the number of distinct destination buffers, so
+      the DMA may run that many transfers ahead of the core; air-to-aie
+      also emits one BD per get OP and cycles them in program order. Both
+      are only right when the channel's transfers are a strict round-robin
+      over its buffers, each op firing once per cycle. Two things broke
+      that here and each was a measured wrong answer: the block loop as an
+      scf.for (four ops with equal trip counts became one 4-BD cycle while
+      the band fired them as two bursts: a w_down chunk landed on a
+      block-sized BD, corr 0.31); and the tail's partial in a third buffer
+      (init 3 let the second w_down chunk overwrite the first under the
+      matmul: y[d0] = C0[d1] + C1[d0], exactly). Hence: d is
+      Python-unrolled on the core side too, and the feed is a strict
+      (l1_b, l1_acc_in) alternation -- the partial lands in l1_b's prefix,
+      the add's first operand is declared at l1_b's type (aiecc passes
+      bare pointers), and the chain's last core, which has nothing to fold
+      in, has no tail. The structure check pins the feed lock's init at 2.
+    - BD-chain order is program order ONLY when every op on a channel has
+      the same trip count inside the band. At ``sweeps > 1`` the sweep
+      pair and the tail pair differ, air-to-aie emits two terminated tasks
+      (``repeat_count`` bands*sweeps-1, then bands-1) and every band's
+      sweeps precede every band's tail (measured hermetically); the
+      geometry REFUSES ``sweeps > 1 and bands > 1``. Lifting it means
+      Python-unrolling the sweep loop on the core side under the 16-BD
+      core cap (``2*depth*(sweeps+1) + 3 <= 16``), unmeasured.
+    - A lone core's zero partials are stored BEFORE its ring primes. The
+      store channel's per-band sequence [zero, ring, ring] stays one BD per
+      op; [ring, zero, ring] is read by air-to-aie's repeating-prefix
+      detection as a [ring, zero] cycle -- exact on one band, wrong from
+      the second.
+    - A single ``scf.index_switch`` per band carries a core's whole tail:
+      two in sequence make the second depend on the first's token, which
+      ``air-dependency-canonicalize`` refuses ("'scf.index_switch' op
+      unknown op type producing async token").
     - Every L2/L1 offset is a literal. The block index d and the k' index
       are Python-unrolled at segment scope because they address staged
       buffers; the band and sweep loops are real because they only move
@@ -161,7 +235,7 @@ FOOTGUNS
       from the structure at sweeps == 1, which is both shapes the check
       pins.
     - The feed put order per (sweep, d) is w_down THEN the accumulator
-      block, and per tail step d the final block THEN the partial. The
+      block, and per tail step d the partial THEN the final block. The
       transfers differ in size, so a swapped get order is a hang.
     - ``ffn_gelu_bf16``'s operands are ``__restrict``: GeLU keeps separate
       in/out tiles (iron runs it in place; its kernel is not this one).
@@ -182,7 +256,7 @@ FOOTGUNS
       scope, outside every loop, and aircc allocates exactly one
       ``aie.buffer`` per alloc (measured on both pinned shapes: the AN
       cores carry 5, the up cores 3, the down cores 6 -- the chain's last
-      core 5, its unreferenced partial dropped after role specialization).
+      core 5, its unreferenced l1_red dropped after role specialization).
       ``tail_pipeline_l1_bytes`` counts that, not ffn_resident's doubling
       rule, and the structure check pins the per-core buffer set. Moving an
       alloc inside a loop invites the ping-pong rotation and the baseline
@@ -192,8 +266,8 @@ FOOTGUNS
       last use sits inside an ``scf.index_switch`` region -- the tail's
       role switch -- with "operand #0 does not dominate this use" (the
       dealloc is handed a token defined in the child region). The three
-      tail buffers are therefore NOT deallocated when ``n_b > 1``; nothing
-      downstream needs the dealloc. (2) ``air-split-l2-memref`` (armed
+      tail buffers (l1_b, l1_acc_in, l1_red) are therefore NOT deallocated
+      when ``n_b > 1``; nothing downstream needs the dealloc. (2) ``air-split-l2-memref`` (armed
       once a segment holds more than 4 tiles) asserts -- an unengaged
       ``std::optional`` in ``getTargetMemrefAllocs``, from
       ``getOffsetDimFromMemrefDim`` on a whole-buffer put -- on ``l2_ln``,
@@ -272,6 +346,10 @@ SHIM_BD_STRIDE_MAX = 1 << 20
 MEMTILE_DMA_PORTS = 6
 MAX_N_B = MEMTILE_DMA_PORTS // 2
 
+# The bisection cuts ``build_tail_pipeline_module(stop_after=...)`` accepts,
+# in pipeline order; ``None`` is the whole pipeline.
+STOP_STAGES = ("an1", "up", "down", None)
+
 
 def compile_tail_pipeline_kernels(tile_m=64, tile_k=48, tile_n=96):
     """Build both objects into the CWD, where aiecc's link_with looks.
@@ -315,25 +393,24 @@ def _mul_add_map(factor, offset=0):
     )
 
 
+def _linear_map(factors, offset=0):
+    """AffineMap for ``sum_i s_i * factors[i] + offset`` over symbols."""
+    expr = AffineConstantExpr.get(offset)
+    for i, f in enumerate(factors):
+        expr = AffineExpr.get_add(
+            expr, AffineExpr.get_mul(AffineSymbolExpr.get(i), AffineConstantExpr.get(f))
+        )
+    return AffineMap.get(0, len(factors), [expr])
+
+
 def _two_iv_map(factor0, factor1, offset=0):
     """AffineMap for ``s0 * factor0 + s1 * factor1 + offset``."""
-    return AffineMap.get(
-        0,
-        2,
-        [
-            AffineExpr.get_add(
-                AffineExpr.get_add(
-                    AffineExpr.get_mul(
-                        AffineSymbolExpr.get(0), AffineConstantExpr.get(factor0)
-                    ),
-                    AffineExpr.get_mul(
-                        AffineSymbolExpr.get(1), AffineConstantExpr.get(factor1)
-                    ),
-                ),
-                AffineConstantExpr.get(offset),
-            )
-        ],
-    )
+    return _linear_map([factor0, factor1], offset)
+
+
+def _three_iv_map(factor0, factor1, factor2, offset=0):
+    """AffineMap for ``s0 * factor0 + s1 * factor1 + s2 * factor2 + offset``."""
+    return _linear_map([factor0, factor1, factor2], offset)
 
 
 def tail_pipeline_geometry(
@@ -402,6 +479,18 @@ def tail_pipeline_geometry(
         )
     if (tile_m * tile_n) % FFN_VEC_LEN or (tile_m * tile_k) % FFN_VEC_LEN:
         raise ValueError("H and accumulator tiles must be multiples of 16 elements")
+    sweeps = ffn_dim // (n_b * tile_n)
+    bands = seq_len // tile_m
+    if sweeps > 1 and bands > 1:
+        raise ValueError(
+            f"sweeps ({sweeps}) > 1 with bands ({bands}) > 1: a down core's feed "
+            "channel then lowers to two terminated DMA tasks (the sweep pair "
+            f"repeated bands*sweeps times, then the tail pair repeated bands "
+            "times), which orders every band's sweeps before any band's tail -- "
+            "measured hermetically on the routed dump (2026-08-22). Use one band "
+            "(seq_len == tile_m) or one sweep (ffn_dim == n_b * tile_n); see "
+            "FOOTGUNS for the unrolling that would lift this."
+        )
     return {
         "bands": seq_len // tile_m,
         "rpc": tile_m // AN_CORES,
@@ -444,8 +533,12 @@ def tail_pipeline_l1_bytes(emb_dim, tile_m, tile_k, tile_n, n_b, np_dtype=bfloat
             ("l1_b", tile_n * tile_k),
             ("l1_acc_in", tile_m * tile_k),
             ("l1_acc_out", tile_m * tile_k),
-        ]
-        + ([("l1_part", tile_m * tile_k)] if n_b > 1 else []),
+            # The block a core's tail forwards (the partial it folds in lands
+            # in l1_b's prefix). The chain's last core has no tail and the
+            # compiler drops its unreferenced l1_red: see FOOTGUNS, the
+            # one-token rule and the feed's round-robin rule.
+            ("l1_red", tile_m * tile_k),
+        ],
         HERD_AN2: an_plan,
     }
     return {
@@ -467,6 +560,7 @@ def build_tail_pipeline_module(
     n_a=1,
     np_dtype=bfloat16,
     allow_an_lane_truncation=False,
+    stop_after=None,
 ):
     """Build the one-segment tail pipeline.
 
@@ -487,12 +581,34 @@ def build_tail_pipeline_module(
             of 32. The module then compiles and routes exactly as otherwise
             but the AN kernel normalizes the first ``32 * (emb_dim // 32)``
             columns only (see FOOTGUNS). For structural checks only.
+        stop_after: the bisection knob -- ``None`` (the whole pipeline) or
+            one of ``STOP_STAGES``: the module keeps every stage up to and
+            including that herd and routes THAT herd's output to ``y``;
+            later herds, their channels, feeds and L2 buffers are not
+            emitted. ``"an1"``: ``y`` is the ``[seq_len, emb_dim]`` h1 rows,
+            stored by the AN1 cores herd-direct. ``"up"``: ``y`` is the flat
+            ``[seq_len * ffn_dim]`` run of H tiles in (band, sweep, column,
+            blocked [tile_m, tile_n]) order, stored by the up cores
+            herd-direct (the up->down core edge is replaced by a shim
+            store). ``"down"``: ``y`` is the flat ``[seq_len * emb_dim]`` run
+            of reduced C blocks in (band, d, blocked [tile_m, tile_k])
+            order -- the down herd's protocol is UNCHANGED (its final block
+            still leaves on ``tp_down_out`` into ``l2_out[d]``); the segment
+            stores each block from L2 to ``y`` in the AN2 feed's place.
+            ``tail_pipeline_stage_reference`` computes the matching oracle.
+            The function signature is the same for every cut, so one input
+            list serves them all.
 
     Returns:
         air.ir.Module with one function
         ``tail_pipeline(x, residual, gamma1, w_up_packed, w_down_packed,
         gamma2, y)``.
     """
+    if stop_after not in STOP_STAGES:
+        raise ValueError(f"stop_after must be one of {STOP_STAGES}, not {stop_after!r}")
+    emit_up = stop_after != "an1"
+    emit_down = stop_after not in ("an1", "up")
+    emit_an2 = stop_after is None
     geo = tail_pipeline_geometry(
         seq_len, emb_dim, ffn_dim, tile_m, tile_k, tile_n, down_proj_depth, n_b, n_a
     )
@@ -533,7 +649,8 @@ def build_tail_pipeline_module(
         + wup_stage
         + wdown_stage
         + n_b * depth * blk  # rings
-        + (n_b - 1) * blk  # relays
+        + max(n_b - 2, 0) * blk  # relays
+        + (depth if n_b == 1 else 0) * blk  # a lone core's zero partials
         + depth * blk  # out blocks
     )
     if 2 * l2_elems * itemsize > L2_BYTES:
@@ -555,6 +672,10 @@ def build_tail_pipeline_module(
     l3_g_ty = MemRefType.get([emb_dim], xrt_dtype)
     l3_wup_ty = MemRefType.get([emb_dim * ffn_dim], xrt_dtype)
     l3_wdown_ty = MemRefType.get([ffn_dim * emb_dim], xrt_dtype)
+    # y's shape follows the cut (see tail_pipeline_stage_shape).
+    l3_y_ty = MemRefType.get(
+        list(tail_pipeline_stage_shape(seq_len, emb_dim, ffn_dim, stop_after)), xrt_dtype
+    )
 
     l2_space = IntegerAttr.get(T.i32(), MemorySpace.L2)
     l2_g_ty = MemRefType.get([emb_dim], xrt_dtype, memory_space=l2_space)
@@ -591,24 +712,35 @@ def build_tail_pipeline_module(
         DOWN_MM_SYMBOL, [l1_h_ty, l1_bdown_ty, l1_acc_ty, l1_acc_ty], FFN_KERNEL_OBJ
     )
     gelu_func = _extern(GELU_SYMBOL, [l1_h_ty, l1_h_ty, T.i32()], FFN_KERNEL_OBJ)
+    # The add's first operand is the partial, which lands in the w_down
+    # slot (l1_b, a [tile_m, tile_k] prefix of it): declared at l1_b's type.
+    # aiecc passes external kernels bare pointers, and the kernel reads
+    # ``size`` elements from it. See FOOTGUNS, the feed's round-robin rule.
     add_func = _extern(
-        ADD_SYMBOL, [l1_acc_ty, l1_acc_ty, l1_acc_ty, T.i32()], FFN_KERNEL_OBJ
+        ADD_SYMBOL, [l1_bdown_ty, l1_acc_ty, l1_acc_ty, T.i32()], FFN_KERNEL_OBJ
     )
 
+    # Channels: only those the cut uses are declared.
     Channel(CHANNEL_AN1_FEED, size=[AN_CORES, 1])
-    Channel(CHANNEL_AN1_OUT, size=[AN_CORES, 1])
-    if n_b > 1:
-        Channel(CHANNEL_A_FEED, size=[1, 1], broadcast_shape=[n_b, 1])
-    else:
-        Channel(CHANNEL_A_FEED, size=[1, 1])
-    Channel(CHANNEL_WUP_FEED, size=[n_b, 1])
-    Channel(CHANNEL_H, size=[n_b, 1])
-    Channel(CHANNEL_DOWN_FEED, size=[n_b, 1])
-    Channel(CHANNEL_ACC_STORE, size=[n_b, 1])
-    if n_b > 1:
-        Channel(CHANNEL_REDUCE, size=[n_b - 1, 1])
-    Channel(CHANNEL_DOWN_OUT, size=[1, 1])
-    Channel(CHANNEL_AN2_FEED, size=[AN_CORES, 1])
+    if emit_up:
+        Channel(CHANNEL_AN1_OUT, size=[AN_CORES, 1])
+        if n_b > 1:
+            Channel(CHANNEL_A_FEED, size=[1, 1], broadcast_shape=[n_b, 1])
+        else:
+            Channel(CHANNEL_A_FEED, size=[1, 1])
+        Channel(CHANNEL_WUP_FEED, size=[n_b, 1])
+    if emit_down:
+        Channel(CHANNEL_H, size=[n_b, 1])
+        Channel(CHANNEL_DOWN_FEED, size=[n_b, 1])
+        Channel(CHANNEL_ACC_STORE, size=[n_b, 1])
+        if n_b > 2:
+            # Core k (1 <= k <= n_b-2) relays its reduced block to core k-1
+            # through l2_red[k-1]; the chain's last core sends nothing (its
+            # finals are already in its ring).
+            Channel(CHANNEL_REDUCE, size=[n_b - 2, 1])
+        Channel(CHANNEL_DOWN_OUT, size=[1, 1])
+    if emit_an2:
+        Channel(CHANNEL_AN2_FEED, size=[AN_CORES, 1])
 
     # The 4-D retile of AN1 core c's row-major [rpc, emb] rows into the
     # blocked [rpc, tile_k] half-tile for k' step kb: stream order (mi, ki,
@@ -621,8 +753,16 @@ def build_tail_pipeline_module(
     untile_sizes = [rpc // MICRO, MICRO, tile_k // MICRO, MICRO]
     untile_strides = [tile_k * MICRO, MICRO, MICRO * MICRO, 1]
 
+    # The herd-direct row store AN1 (at the "an1" cut) and AN2 share.
+    row_map = _two_iv_map(tile_m, rpc)
+    # The "up" cut's flat H store: (band, sweep, tx) -> tile offset.
+    h_tile = tile_m * tile_n
+    h_off_map = _three_iv_map(sweeps * n_b * h_tile, n_b * h_tile, h_tile)
+    # The "down" cut's flat block store: band -> band offset; d is literal.
+    c_off_maps = [_mul_add_map(depth * blk, d * blk) for d in range(depth)]
+
     @FuncOp.from_py_func(
-        l3_act_ty, l3_act_ty, l3_g_ty, l3_wup_ty, l3_wdown_ty, l3_g_ty, l3_act_ty
+        l3_act_ty, l3_act_ty, l3_g_ty, l3_wup_ty, l3_wdown_ty, l3_g_ty, l3_y_ty
     )
     def tail_pipeline(arg0, arg1, arg2, arg3, arg4, arg5, arg6):
 
@@ -647,19 +787,26 @@ def build_tail_pipeline_module(
                     return a
 
                 l2_g1 = _l2(l2_g_ty)
-                l2_g2 = _l2(l2_g_ty)
                 l2_x = _l2(l2_band_ty)
                 l2_r = _l2(l2_band_ty)
-                l2_ln = [_l2(l2_ln_ty) for _ in range(AN_CORES)]
-                l2_wup = _l2(l2_wup_ty)
-                l2_wdown = _l2(l2_wdown_ty)
-                l2_ring = [[_l2(l2_blk_ty) for _ in range(depth)] for _ in range(n_b)]
-                l2_red = [_l2(l2_blk_ty) for _ in range(n_b - 1)]
-                l2_out = [_l2(l2_blk_ty) for _ in range(depth)]
+                l2_ln = [_l2(l2_ln_ty) for _ in range(AN_CORES)] if emit_up else []
+                l2_wup = _l2(l2_wup_ty) if emit_up else None
+                l2_wdown = _l2(l2_wdown_ty) if emit_down else None
+                l2_ring = (
+                    [[_l2(l2_blk_ty) for _ in range(depth)] for _ in range(n_b)]
+                    if emit_down
+                    else []
+                )
+                l2_red = [_l2(l2_blk_ty) for _ in range(max(n_b - 2, 0))] if emit_down else []
+                # A lone down core folds in a zero partial; it stores the
+                # zeros itself, one L2 buffer per block (one lock pair each,
+                # as the ring).
+                l2_zero = [_l2(l2_blk_ty) for _ in range(depth)] if emit_down and n_b == 1 else []
+                l2_out = [_l2(l2_blk_ty) for _ in range(depth)] if emit_down else []
+                l2_g2 = _l2(l2_g_ty) if emit_an2 else None
 
                 # ---------------- AN1 herd ----------------
-                @herd(name=HERD_AN1, sizes=[AN_CORES, 1])
-                def an1_herd(tx, ty, _sx, _sy):
+                def an1_body(tx, ty, h_y):
                     l1_x = AllocOp(l1_rows_ty, [], [])
                     l1_r = AllocOp(l1_rows_ty, [], [])
                     l1_g = AllocOp(l1_g_ty, [], [])
@@ -667,7 +814,7 @@ def build_tail_pipeline_module(
                     l1_o2 = AllocOp(l1_rows_ty, [], [])
                     cols_i32 = ConstantOp(T.i32(), emb_dim)
                     rows_i32 = ConstantOp(T.i32(), rpc)
-                    for _band in range_(0, bands):
+                    for band in range_(0, bands):
                         ChannelGet(CHANNEL_AN1_FEED, l1_g, indices=[tx, ty])
                         ChannelGet(CHANNEL_AN1_FEED, l1_x, indices=[tx, ty])
                         ChannelGet(CHANNEL_AN1_FEED, l1_r, indices=[tx, ty])
@@ -675,7 +822,18 @@ def build_tail_pipeline_module(
                             an_func,
                             [l1_x, l1_r, l1_g, l1_o1, l1_o2, cols_i32, rows_i32],
                         )
-                        ChannelPut(CHANNEL_AN1_OUT, l1_o1, indices=[tx, ty])
+                        if h_y is None:
+                            ChannelPut(CHANNEL_AN1_OUT, l1_o1, indices=[tx, ty])
+                        else:
+                            # The "an1" cut: h1 rows straight to y.
+                            row = affine_apply(row_map, [band, tx])
+                            dma_memcpy_nd(
+                                h_y,
+                                l1_o1,
+                                dst_offsets=[row, 0],
+                                dst_sizes=[rpc, emb_dim],
+                                dst_strides=[emb_dim, 1],
+                            )
                         yield_([])
                     DeallocOp(l1_x)
                     DeallocOp(l1_r)
@@ -683,16 +841,27 @@ def build_tail_pipeline_module(
                     DeallocOp(l1_o1)
                     DeallocOp(l1_o2)
 
+                if emit_up:
+
+                    @herd(name=HERD_AN1, sizes=[AN_CORES, 1])
+                    def an1_herd(tx, ty, _sx, _sy):
+                        an1_body(tx, ty, None)
+
+                else:
+
+                    @herd(name=HERD_AN1, sizes=[AN_CORES, 1], operands=[s_y])
+                    def an1_herd(tx, ty, _sx, _sy, h_y):
+                        an1_body(tx, ty, h_y)
+
                 an1_herd.attributes["link_with"] = StringAttr.get(AN_KERNEL_OBJ)
 
                 # ---------------- UP herd ----------------
-                @herd(name=HERD_UP, sizes=[n_b, 1])
-                def up_herd(tx, ty, _sx, _sy):
+                def up_body(tx, ty, h_y):
                     l1_a = AllocOp(l1_a_ty, [], [])
                     l1_b = AllocOp(l1_bup_ty, [], [])
                     l1_c = AllocOp(l1_h_ty, [], [])
-                    for _band in range_(0, bands):
-                        for _s in range_(0, sweeps):
+                    for band in range_(0, bands):
+                        for s in range_(0, sweeps):
                             CallOp(up_zero_func, [l1_c])
                             for _k in range_(0, k_steps):
                                 # The two AN1 halves land in the two halves
@@ -709,57 +878,121 @@ def build_tail_pipeline_module(
                                 ChannelGet(CHANNEL_WUP_FEED, l1_b, indices=[tx, ty])
                                 CallOp(up_mm_func, [l1_a, l1_b, l1_c])
                                 yield_([])
-                            ChannelPut(CHANNEL_H, l1_c, indices=[tx, ty])
+                            if h_y is None:
+                                ChannelPut(CHANNEL_H, l1_c, indices=[tx, ty])
+                            else:
+                                # The "up" cut: the H tile straight to y, in
+                                # (band, sweep, column) order.
+                                off = affine_apply(h_off_map, [band, s, tx])
+                                dma_memcpy_nd(
+                                    h_y,
+                                    l1_c,
+                                    dst_offsets=[off],
+                                    dst_sizes=[h_tile],
+                                    dst_strides=[1],
+                                )
                             yield_([])
                         yield_([])
                     DeallocOp(l1_a)
                     DeallocOp(l1_b)
                     DeallocOp(l1_c)
 
-                up_herd.attributes["link_with"] = StringAttr.get(FFN_KERNEL_OBJ)
+                if emit_down:
+
+                    @herd(name=HERD_UP, sizes=[n_b, 1])
+                    def up_herd(tx, ty, _sx, _sy):
+                        up_body(tx, ty, None)
+
+                elif emit_up:
+
+                    @herd(name=HERD_UP, sizes=[n_b, 1], operands=[s_y])
+                    def up_herd(tx, ty, _sx, _sy, h_y):
+                        up_body(tx, ty, h_y)
+
+                if emit_up:
+                    up_herd.attributes["link_with"] = StringAttr.get(FFN_KERNEL_OBJ)
 
                 # ---------------- DOWN herd ----------------
-                @herd(name=HERD_DOWN, sizes=[n_b, 1])
-                def down_herd(tx, ty, _sx, _sy):
+                def down_body(tx, ty):
                     l1_h = AllocOp(l1_h_ty, [], [])
                     l1_g = AllocOp(l1_h_ty, [], [])
                     l1_b = AllocOp(l1_bdown_ty, [], [])
                     l1_acc_in = AllocOp(l1_acc_ty, [], [])
                     l1_acc_out = AllocOp(l1_acc_ty, [], [])
-                    # The neighbour's partial: only a chain has one.
-                    l1_part = AllocOp(l1_acc_ty, [], []) if n_b > 1 else None
+                    # The block this core forwards (its tail's sum). Each L1
+                    # buffer is either a channel destination or a channel
+                    # source, never both, and every source feeds ONE
+                    # channel (the one-token rule; FOOTGUNS). The chain's
+                    # last core has no tail and never references it.
+                    l1_red = AllocOp(l1_acc_ty, [], [])
                     h_elems_i32 = ConstantOp(T.i32(), tile_m * tile_n)
                     blk_i32 = ConstantOp(T.i32(), blk)
 
-                    def _tail_step(has_partial, out_channel, out_index):
-                        """One block of the reduction tail for one role."""
-                        ChannelGet(CHANNEL_DOWN_FEED, l1_acc_in, indices=[tx, ty])
-                        if has_partial:
-                            ChannelGet(CHANNEL_DOWN_FEED, l1_part, indices=[tx, ty])
-                            CallOp(add_func, [l1_part, l1_acc_in, l1_acc_out, blk_i32])
-                            ChannelPut(out_channel, l1_acc_out, indices=[out_index, 0])
-                        else:
-                            ChannelPut(out_channel, l1_acc_in, indices=[out_index, 0])
+                    def _tail(out_channel, out_index):
+                        """The reduction tail of a core that has one: per
+                        block d, the partial into the feed's b-slot (a
+                        [tile_m, tile_k] prefix of l1_b), the final block into
+                        its acc-slot -- the feed stays a strict (b, acc)
+                        alternation -- and their sum out."""
+                        for _d in range(depth):
+                            ChannelGet(
+                                CHANNEL_DOWN_FEED,
+                                l1_b,
+                                offsets=[0, 0],
+                                sizes=[tile_m, tile_k],
+                                strides=[tile_k, 1],
+                                indices=[tx, ty],
+                            )
+                            ChannelGet(CHANNEL_DOWN_FEED, l1_acc_in, indices=[tx, ty])
+                            CallOp(add_func, [l1_b, l1_acc_in, l1_red, blk_i32])
+                            ChannelPut(out_channel, l1_red, indices=[out_index, 0])
 
                     def _role(k):
-                        """Core k's tail: k == 0 drains to AN2, k > 0 to core k-1;
-                        every core but the last folds in core k+1's partial."""
-                        has_partial = k < n_b - 1
+                        """Core k's tail: k == 0 drains to the out block, 0 <
+                        k < n_b-1 to core k-1; the chain's last core has no
+                        tail -- its finals are already in its ring, and the
+                        memtile relays them to core n_b-2 directly (iron's
+                        last core sends and does not add). ONE
+                        scf.index_switch per band carries the whole tail: two
+                        switches in sequence make the second depend on the
+                        first's token, which air-dependency-canonicalize
+                        refuses ("'scf.index_switch' op unknown op type
+                        producing async token")."""
                         if k == 0:
-                            _tail_step(has_partial, CHANNEL_DOWN_OUT, 0)
-                        else:
-                            _tail_step(has_partial, CHANNEL_REDUCE, k - 1)
+                            _tail(CHANNEL_DOWN_OUT, 0)
+                        elif k < n_b - 1:
+                            _tail(CHANNEL_REDUCE, k - 1)
 
+                    # The block index d is Python-unrolled HERE TOO, not only
+                    # on the memtile side: air-to-aie builds one BD per
+                    # channel op and cycles them round-robin; with d an
+                    # scf.for, the feed's ops (b, acc_in, ...) had equal trip
+                    # counts, became one cycle, and a band's third transfer
+                    # (a w_down chunk) landed on a block-sized BD. Measured:
+                    # corr 0.31, no hang, every lock conserved (devq 514).
+                    # One op per transfer per band makes the chain the
+                    # program order. See FOOTGUNS for the budget this costs.
                     for _band in range_(0, bands):
+                        # A lone core's zero partials, one per block, BEFORE
+                        # the priming: the store channel's per-band sequence
+                        # is then [zero.., ring.., ring..], which air-to-aie
+                        # keeps as one BD per op; primes first would read
+                        # [ring, zero, ring] at depth 1, which its
+                        # repeating-prefix detection collapses to a [ring,
+                        # zero] cycle -- exact on one band, wrong from the
+                        # second (measured hermetically, 2026-08-22).
+                        if n_b == 1:
+                            for _d in range(depth):
+                                CallOp(down_zero_func, [l1_acc_out])
+                                ChannelPut(CHANNEL_ACC_STORE, l1_acc_out, indices=[tx, ty])
                         # Prime the ring, block by block, as iron's core does.
-                        for _d in range_(0, depth):
+                        for _d in range(depth):
                             CallOp(down_zero_func, [l1_acc_out])
                             ChannelPut(CHANNEL_ACC_STORE, l1_acc_out, indices=[tx, ty])
-                            yield_([])
                         for _s in range_(0, sweeps):
                             ChannelGet(CHANNEL_H, l1_h, indices=[tx, ty])
                             CallOp(gelu_func, [l1_h, l1_g, h_elems_i32])
-                            for _d in range_(0, depth):
+                            for _d in range(depth):
                                 # w_down chunk THEN the accumulator block.
                                 ChannelGet(CHANNEL_DOWN_FEED, l1_b, indices=[tx, ty])
                                 ChannelGet(
@@ -769,32 +1002,25 @@ def build_tail_pipeline_module(
                                 ChannelPut(
                                     CHANNEL_ACC_STORE, l1_acc_out, indices=[tx, ty]
                                 )
-                                yield_([])
                             yield_([])
-                        # The reduction tail: final block d, plus the
-                        # neighbour's partial where there is one.
-                        for _d in range_(0, depth):
-                            if n_b == 1:
-                                _role(0)
-                            else:
-                                index_switch(
-                                    [],
-                                    tx,
-                                    list(range(n_b - 1)),
-                                    case_body_builder=lambda op, k, cv: (
-                                        _role(k),
-                                        yield_([]),
-                                    )[-1],
-                                    default_body_builder=lambda op: (
-                                        _role(n_b - 1),
-                                        yield_([]),
-                                    )[-1],
-                                )
-                            yield_([])
+                        # The reduction tail, by role.
+                        if n_b == 1:
+                            _role(0)
+                        else:
+                            index_switch(
+                                [],
+                                tx,
+                                list(range(n_b - 1)),
+                                case_body_builder=lambda op, k, cv: (
+                                    _role(k),
+                                    yield_([]),
+                                )[-1],
+                                default_body_builder=lambda op: yield_([]),
+                            )
                         yield_([])
                     DeallocOp(l1_h)
                     DeallocOp(l1_g)
-                    DeallocOp(l1_b)
+                    DeallocOp(l1_acc_out)
                     if n_b == 1:
                         # With a role switch in the tail these buffers' last
                         # uses sit inside scf.index_switch regions, and
@@ -802,16 +1028,20 @@ def build_tail_pipeline_module(
                         # defined in a child region ("operand #0 does not
                         # dominate this use"). Leaving them un-deallocated is
                         # the measured way through; see FOOTGUNS.
+                        DeallocOp(l1_b)
                         DeallocOp(l1_acc_in)
-                        DeallocOp(l1_acc_out)
+                        DeallocOp(l1_red)
 
-                down_herd.attributes["link_with"] = StringAttr.get(FFN_KERNEL_OBJ)
+                if emit_down:
+
+                    @herd(name=HERD_DOWN, sizes=[n_b, 1])
+                    def down_herd(tx, ty, _sx, _sy):
+                        down_body(tx, ty)
+
+                    down_herd.attributes["link_with"] = StringAttr.get(FFN_KERNEL_OBJ)
 
                 # ---------------- AN2 herd ----------------
-                row_map = _two_iv_map(tile_m, rpc)
-
-                @herd(name=HERD_AN2, sizes=[AN_CORES, 1], operands=[s_y])
-                def an2_herd(tx, ty, _sx, _sy, h_y):
+                def an2_body(tx, ty, h_y):
                     l1_in = AllocOp(l1_rows_ty, [], [])
                     l1_r = AllocOp(l1_rows_ty, [], [])
                     l1_g = AllocOp(l1_g_ty, [], [])
@@ -852,7 +1082,13 @@ def build_tail_pipeline_module(
                     DeallocOp(l1_o1)
                     DeallocOp(l1_o2)
 
-                an2_herd.attributes["link_with"] = StringAttr.get(AN_KERNEL_OBJ)
+                if emit_an2:
+
+                    @herd(name=HERD_AN2, sizes=[AN_CORES, 1], operands=[s_y])
+                    def an2_herd(tx, ty, _sx, _sy, h_y):
+                        an2_body(tx, ty, h_y)
+
+                    an2_herd.attributes["link_with"] = StringAttr.get(AN_KERNEL_OBJ)
 
                 # ---------------- the memtile programs ----------------
                 # Emitted after the herds (the structure check brace-matches
@@ -890,110 +1126,142 @@ def build_tail_pipeline_module(
                                 strides=[1],
                                 indices=[c, 0],
                             )
-                    # AN1 output rows, one buffer per core (one writer each).
-                    for c in range(AN_CORES):
-                        ChannelGet(CHANNEL_AN1_OUT, l2_ln[c], indices=[c, 0])
+                    if emit_up:
+                        # AN1 output rows, one buffer per core (one writer
+                        # each).
+                        for c in range(AN_CORES):
+                            ChannelGet(CHANNEL_AN1_OUT, l2_ln[c], indices=[c, 0])
 
-                    # The A feed: per (sweep, k') the two halves, retiled,
-                    # broadcast to every up core. k' is Python-unrolled:
-                    # its offset addresses a staged buffer.
-                    for _s in range_(0, sweeps):
-                        for kb in range(k_steps):
-                            for c in range(AN_CORES):
-                                ChannelPut(
-                                    CHANNEL_A_FEED,
-                                    l2_ln[c],
-                                    offsets=[0, kb * (tile_k // MICRO), 0, 0],
-                                    sizes=retile_sizes,
-                                    strides=retile_strides,
-                                )
-                        yield_([])
-
-                    # w_up: refill per (sweep, k'), L3 offsets only; each up
-                    # core's slice at a tx-literal offset.
-                    for s in range_(0, sweeps):
-                        for k in range_(0, k_steps):
-                            w_off = affine_apply(wup_off_map, [s, k])
-                            dma_memcpy_nd(
-                                l2_wup,
-                                s_wup,
-                                src_offsets=[w_off],
-                                src_sizes=[wup_stage],
-                                src_strides=[1],
-                            )
-                            for t in range(n_b):
-                                ChannelPut(
-                                    CHANNEL_WUP_FEED,
-                                    l2_wup,
-                                    offsets=[t * tile_k * tile_n],
-                                    sizes=[tile_k * tile_n],
-                                    strides=[1],
-                                    indices=[t, 0],
-                                )
+                        # The A feed: per (sweep, k') the two halves,
+                        # retiled, broadcast to every up core. k' is
+                        # Python-unrolled: its offset addresses a staged
+                        # buffer.
+                        for _s in range_(0, sweeps):
+                            for kb in range(k_steps):
+                                for c in range(AN_CORES):
+                                    ChannelPut(
+                                        CHANNEL_A_FEED,
+                                        l2_ln[c],
+                                        offsets=[0, kb * (tile_k // MICRO), 0, 0],
+                                        sizes=retile_sizes,
+                                        strides=retile_strides,
+                                    )
                             yield_([])
-                        yield_([])
 
-                    # The ring priming stores.
-                    for t in range(n_b):
-                        for d in range(depth):
-                            ChannelGet(CHANNEL_ACC_STORE, l2_ring[t][d], indices=[t, 0])
+                        # w_up: refill per (sweep, k'), L3 offsets only;
+                        # each up core's slice at a tx-literal offset.
+                        for s in range_(0, sweeps):
+                            for k in range_(0, k_steps):
+                                w_off = affine_apply(wup_off_map, [s, k])
+                                dma_memcpy_nd(
+                                    l2_wup,
+                                    s_wup,
+                                    src_offsets=[w_off],
+                                    src_sizes=[wup_stage],
+                                    src_strides=[1],
+                                )
+                                for t in range(n_b):
+                                    ChannelPut(
+                                        CHANNEL_WUP_FEED,
+                                        l2_wup,
+                                        offsets=[t * tile_k * tile_n],
+                                        sizes=[tile_k * tile_n],
+                                        strides=[1],
+                                        indices=[t, 0],
+                                    )
+                                yield_([])
+                            yield_([])
 
-                    # The down feed: per sweep refill the w_down chunks for
-                    # every (block, column), then per block d and core t:
-                    # w_down slice, ring block d; and take the store back.
-                    for s in range_(0, sweeps):
-                        wd_off = affine_apply(wdown_off_map, [s])
-                        dma_memcpy_nd(
-                            l2_wdown,
-                            s_wdown,
-                            src_offsets=[wd_off],
-                            src_sizes=[wdown_stage],
-                            src_strides=[1],
-                        )
+                    if emit_down:
+                        # A lone core's zero partials, then the ring priming
+                        # stores (the order the core sends them; see the
+                        # core).
                         for d in range(depth):
-                            for t in range(n_b):
-                                ChannelPut(
-                                    CHANNEL_DOWN_FEED,
-                                    l2_wdown,
-                                    offsets=[(d * n_b + t) * tile_n * tile_k],
-                                    sizes=[tile_n * tile_k],
-                                    strides=[1],
-                                    indices=[t, 0],
-                                )
-                                ChannelPut(
-                                    CHANNEL_DOWN_FEED, l2_ring[t][d], indices=[t, 0]
-                                )
+                            if n_b == 1:
+                                ChannelGet(CHANNEL_ACC_STORE, l2_zero[d], indices=[0, 0])
+                        for t in range(n_b):
+                            for d in range(depth):
                                 ChannelGet(
                                     CHANNEL_ACC_STORE, l2_ring[t][d], indices=[t, 0]
                                 )
-                        yield_([])
 
-                    # The reduction tail, block by block: the final ring
-                    # block to every core; core t+1's partial relayed to
-                    # core t; core 0's result to the out block.
-                    for d in range(depth):
-                        for t in range(n_b):
-                            ChannelPut(CHANNEL_DOWN_FEED, l2_ring[t][d], indices=[t, 0])
-                        for t in reversed(range(n_b - 1)):
-                            ChannelGet(CHANNEL_REDUCE, l2_red[t], indices=[t, 0])
-                            ChannelPut(CHANNEL_DOWN_FEED, l2_red[t], indices=[t, 0])
-                        ChannelGet(CHANNEL_DOWN_OUT, l2_out[d], indices=[0, 0])
-
-                    # AN2 inputs: gamma2, the residual rows (AN1's output),
-                    # then every block un-tiled into its column block.
-                    dma_memcpy_nd(l2_g2, s_g2)
-                    for c in range(AN_CORES):
-                        ChannelPut(CHANNEL_AN2_FEED, l2_g2, indices=[c, 0])
-                        ChannelPut(CHANNEL_AN2_FEED, l2_ln[c], indices=[c, 0])
-                        for d in range(depth):
-                            ChannelPut(
-                                CHANNEL_AN2_FEED,
-                                l2_out[d],
-                                offsets=[c * (rpc // MICRO), 0, 0, 0],
-                                sizes=untile_sizes,
-                                strides=untile_strides,
-                                indices=[c, 0],
+                        # The down feed: per sweep refill the w_down chunks
+                        # for every (block, column), then per block d and
+                        # core t: w_down slice, ring block d; and take the
+                        # store back.
+                        for s in range_(0, sweeps):
+                            wd_off = affine_apply(wdown_off_map, [s])
+                            dma_memcpy_nd(
+                                l2_wdown,
+                                s_wdown,
+                                src_offsets=[wd_off],
+                                src_sizes=[wdown_stage],
+                                src_strides=[1],
                             )
+                            for d in range(depth):
+                                for t in range(n_b):
+                                    ChannelPut(
+                                        CHANNEL_DOWN_FEED,
+                                        l2_wdown,
+                                        offsets=[(d * n_b + t) * tile_n * tile_k],
+                                        sizes=[tile_n * tile_k],
+                                        strides=[1],
+                                        indices=[t, 0],
+                                    )
+                                    ChannelPut(
+                                        CHANNEL_DOWN_FEED, l2_ring[t][d], indices=[t, 0]
+                                    )
+                                    ChannelGet(
+                                        CHANNEL_ACC_STORE, l2_ring[t][d], indices=[t, 0]
+                                    )
+                            yield_([])
+
+                        # The reduction tail, block by block, from the
+                        # chain's far end: into core t's b-slot the partial
+                        # -- the last core's final block itself for t =
+                        # n_b-2, core t+1's relayed sum below that, the zero
+                        # for a lone core -- THEN its final block into the
+                        # acc-slot; core 0's sum to the out block -- and at
+                        # the "down" cut, from there straight to y.
+                        for d in range(depth):
+                            for t in reversed(range(max(n_b - 1, 1))):
+                                if n_b == 1:
+                                    partial = l2_zero[d]
+                                elif t == n_b - 2:
+                                    partial = l2_ring[n_b - 1][d]
+                                else:
+                                    ChannelGet(CHANNEL_REDUCE, l2_red[t], indices=[t, 0])
+                                    partial = l2_red[t]
+                                ChannelPut(CHANNEL_DOWN_FEED, partial, indices=[t, 0])
+                                ChannelPut(CHANNEL_DOWN_FEED, l2_ring[t][d], indices=[t, 0])
+                            ChannelGet(CHANNEL_DOWN_OUT, l2_out[d], indices=[0, 0])
+                            if not emit_an2:
+                                c_off = affine_apply(c_off_maps[d], [band])
+                                dma_memcpy_nd(
+                                    s_y,
+                                    l2_out[d],
+                                    dst_offsets=[c_off],
+                                    dst_sizes=[blk],
+                                    dst_strides=[1],
+                                )
+
+                    if emit_an2:
+                        # AN2 inputs: gamma2, the residual rows (AN1's
+                        # output), then every block un-tiled into its column
+                        # block.
+                        dma_memcpy_nd(l2_g2, s_g2)
+                        for c in range(AN_CORES):
+                            ChannelPut(CHANNEL_AN2_FEED, l2_g2, indices=[c, 0])
+                            ChannelPut(CHANNEL_AN2_FEED, l2_ln[c], indices=[c, 0])
+                            for d in range(depth):
+                                ChannelPut(
+                                    CHANNEL_AN2_FEED,
+                                    l2_out[d],
+                                    offsets=[c * (rpc // MICRO), 0, 0, 0],
+                                    sizes=untile_sizes,
+                                    strides=untile_strides,
+                                    indices=[c, 0],
+                                )
                     yield_([])
 
                 for buf in (
@@ -1001,9 +1269,11 @@ def build_tail_pipeline_module(
                     + l2_ln
                     + [b for ring in l2_ring for b in ring]
                     + l2_red
+                    + l2_zero
                     + l2_out
                 ):
-                    DeallocOp(buf)
+                    if buf is not None:
+                        DeallocOp(buf)
 
 
 def tail_pipeline_pack_w_up(w_up, tile_k, tile_n, n_b):
@@ -1094,3 +1364,56 @@ def tail_pipeline_reference(x, residual, gamma1, w_up, w_down, gamma2):
     c = h.astype(f32) @ w_down.astype(f32)
     y = addnorm_reference(c, h1.astype(f32), gamma2.astype(f32), eps=EPS)
     return y.astype(x.dtype)
+
+
+def tail_pipeline_stage_shape(seq_len, emb_dim, ffn_dim, stop_after=None):
+    """``y``'s shape for a cut: what ``build_tail_pipeline_module`` declares."""
+    if stop_after not in STOP_STAGES:
+        raise ValueError(f"stop_after must be one of {STOP_STAGES}, not {stop_after!r}")
+    if stop_after == "up":
+        return (seq_len * ffn_dim,)
+    if stop_after == "down":
+        return (seq_len * emb_dim,)
+    return (seq_len, emb_dim)
+
+
+def tail_pipeline_stage_reference(
+    x, residual, gamma1, w_up, w_down, gamma2, tile_m, tile_k, tile_n, n_b,
+    down_proj_depth, stop_after=None,
+):
+    """The oracle for a cut, in the layout the device writes ``y`` in.
+
+    ``"an1"``: h1 rows ``[seq_len, emb_dim]``. ``"up"``: the flat run of
+    H = h1 @ w_up tiles (BEFORE GeLU: that is what leaves the up core) in
+    (band, sweep, column, blocked [tile_m, tile_n]) order. ``"down"``: the
+    flat run of C = gelu(H) @ w_down blocks in (band, d, blocked [tile_m,
+    tile_k]) order. ``None``: ``tail_pipeline_reference``. FP32 throughout,
+    one rounding at the end, as the full reference.
+    """
+    if stop_after is None:
+        return tail_pipeline_reference(x, residual, gamma1, w_up, w_down, gamma2)
+    f32 = np.float32
+    seq_len, emb_dim = x.shape
+    ffn_dim = w_up.shape[1]
+    bands = seq_len // tile_m
+    h1 = addnorm_reference(x.astype(f32), residual.astype(f32), gamma1.astype(f32), eps=EPS)
+    if stop_after == "an1":
+        return h1.astype(x.dtype)
+    h = h1.astype(f32) @ w_up.astype(f32)
+    if stop_after == "up":
+        sweeps = ffn_dim // (n_b * tile_n)
+        # (band, mi, ri, s, t, ni, si) -> (band, s, t, mi, ni, ri, si)
+        packed = (
+            h.reshape(bands, tile_m // MICRO, MICRO, sweeps, n_b, tile_n // MICRO, MICRO)
+            .transpose(0, 3, 4, 1, 5, 2, 6)
+            .reshape(-1)
+        )
+        return np.ascontiguousarray(packed).astype(x.dtype)
+    c = gelu_tanh_reference(h).astype(f32) @ w_down.astype(f32)
+    # (band, mi, ri, d, ki, si) -> (band, d, mi, ki, ri, si)
+    packed = (
+        c.reshape(bands, tile_m // MICRO, MICRO, down_proj_depth, tile_k // MICRO, MICRO)
+        .transpose(0, 3, 1, 4, 2, 5)
+        .reshape(-1)
+    )
+    return np.ascontiguousarray(packed).astype(x.dtype)

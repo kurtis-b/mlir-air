@@ -53,13 +53,29 @@ CONTRACT
        ``fused_add_layer_norm_2outs``; every up core ``ffn_zero_bf16_up_proj``
        and ``ffn_matmul_bf16_bf16_up_proj``; every down core
        ``ffn_gelu_bf16``, ``ffn_zero_bf16_down_proj`` and
-       ``ffn_matmul_with_acc_bf16_bf16_down_proj``; and EXACTLY ``n_b - 1``
-       down cores ``ffn_eltwise_add_bf16_vector`` (the chain's role
+       ``ffn_matmul_with_acc_bf16_bf16_down_proj``; and EXACTLY
+       ``max(n_b - 1, 1)`` down cores ``ffn_eltwise_add_bf16_vector``: the
+       chain's last core has no tail (its finals are relayed from its
+       ring), a lone core folds in its own zero (the chain's role
        specialization survived air-to-aie).
    10. LIVENESS, so no count passes vacuously: the air-dma-to-channel dump
        has no residual ``air.dma_memcpy_nd`` and every composed channel by
        name; the final dump carries no ``air.channel`` and at least one
        ``aie.flow``.
+   11. ONE TOKEN. Every ``aie.use_lock`` inside a core tile -- its
+       ``aie.mem`` BDs and its ``aie.core`` program -- acquires or releases
+       exactly 1. The 2026-08-22 deadlock was a put BD acquiring 2 (an L1
+       buffer that was two gets' destination and one put's source) against
+       a core releasing 1: this clause reads it off the routed dump, no
+       device needed (builders/tail_pipeline.py FOOTGUNS, the one-token
+       rule).
+   12. THE FEED ALTERNATES. In every down core's ``aie.mem``, the S2MM
+       chain carrying the ``[tile_n, tile_k]`` w_down buffer never puts two
+       consecutive BDs (cyclically) on one buffer, and its acquire lock is
+       initialised to 2 -- the strict (b, acc) round-robin with two
+       distinct destinations. A third destination (init 3) or a repeated
+       destination is the measured wrong answer (FOOTGUNS, the feed's
+       round-robin rule).
 
 FOOTGUNS
     - Clause 3's constant moves with the design. If a hop legitimately
@@ -165,6 +181,7 @@ _BUFFER_RE = re.compile(
     r"aie\.buffer\(%(\S+)\)[^\n]*memref<([0-9x]+)xbf16"
 )
 _CORE_RE = re.compile(r"aie\.core\(%(\S+)\)")
+_USE_LOCK_RE = re.compile(r"aie\.use_lock\(%(\S+), (\w+), %c(\d+)_i32\)")
 _HERD_NAME_RE = re.compile(r'air\.herd_name = "([^"]+)"')
 
 
@@ -271,7 +288,7 @@ def check_shape(label, kwargs):
             CHANNEL_AN1_FEED, CHANNEL_AN1_OUT, CHANNEL_A_FEED, CHANNEL_WUP_FEED,
             CHANNEL_H, CHANNEL_DOWN_FEED, CHANNEL_ACC_STORE, CHANNEL_DOWN_OUT,
             CHANNEL_AN2_FEED,
-        ] + ([CHANNEL_REDUCE] if n_b > 1 else [])
+        ] + ([CHANNEL_REDUCE] if n_b > 2 else [])
         missing = [c for c in expected_channels if f"@{c}" not in chan]
         if missing:
             problems.append(
@@ -387,9 +404,9 @@ def check_shape(label, kwargs):
     for t, herd_name in sorted(tile_herd.items()):
         want = [e for _, e in plan[herd_name][1]]
         if herd_name == HERD_DOWN and f"call @{ADD_SYMBOL}(" not in tile_body[t]:
-            # The chain's last core folds in no partial; air-to-aie drops
-            # its unreferenced l1_part after role specialization.
-            want = [e for n, e in plan[herd_name][1] if n != "l1_part"]
+            # The chain's last core has no tail; air-to-aie drops its
+            # unreferenced l1_red after role specialization.
+            want = [e for n, e in plan[herd_name][1] if n != "l1_red"]
         want = sorted(want)
         got = sorted(bufs.get(t, []))
         nbytes = sum(got) * 2 + L1_STACK_BYTES
@@ -447,11 +464,66 @@ def check_shape(label, kwargs):
                 )
         if h.group(1) == HERD_DOWN and f"call @{ADD_SYMBOL}(" in body:
             adders += 1
-    if adders != n_b - 1:
+    if adders != max(n_b - 1, 1):
         problems.append(
             f"{label}: {adders} down cores call @{ADD_SYMBOL}, need exactly "
-            f"{n_b - 1} -- the chain's role specialization did not survive "
-            "air-to-aie"
+            f"{max(n_b - 1, 1)} -- the chain's role specialization did not "
+            "survive air-to-aie"
+        )
+
+    # 11. one token on every core-tile lock op
+    lock_init = {
+        m.group(1): int(m.group(2))
+        for m in re.finditer(r"%(lock_\S+) = aie.lock\([^)]*\) \{init = (\d+)", final)
+    }
+    multi = []
+    for opener in ("= aie.mem(", "aie.core("):
+        for header, body in _regions(final, opener):
+            for m in _USE_LOCK_RE.finditer(body):
+                if m.group(3) != "1":
+                    multi.append((header.strip()[:40], m.group(1), m.group(2), m.group(3)))
+    if multi:
+        problems.append(
+            f"{label}: {len(multi)} core-tile lock op(s) with a count other than "
+            f"1, e.g. {multi[:3]} -- an L1 buffer is a channel destination AND "
+            "source, or is put on two channels (the one-token rule)"
+        )
+
+    # 12. the down feed alternates (b, acc) and its lock init is 2
+    b_shape = f"{kwargs['tile_n']}x{kwargs['tile_k']}xbf16"
+    feed_ok = 0
+    for t, herd_name in sorted(tile_herd.items()):
+        if herd_name != HERD_DOWN:
+            continue
+        mem = next((b for h, b in _regions(final, "= aie.mem(") if f"aie.mem(%{t})" in h), "")
+        chains = re.split(r"aie\.dma_start\(", mem)[1:]
+        feed = [c for c in chains if c.startswith("S2MM") and b_shape in c]
+        if len(feed) != 1:
+            problems.append(
+                f"{label}: tile {t} (down) has {len(feed)} S2MM chains carrying the "
+                f"[{b_shape}] w_down buffer, need exactly 1"
+            )
+            continue
+        bufs = re.findall(r"aie\.dma_bd\(%(\S+) :", feed[0])
+        acq = {m.group(1) for m in _USE_LOCK_RE.finditer(feed[0]) if m.group(2).startswith("Acquire")}
+        consecutive = [
+            (bufs[i], bufs[(i + 1) % len(bufs)])
+            for i in range(len(bufs))
+            if len(bufs) > 1 and bufs[i] == bufs[(i + 1) % len(bufs)]
+        ]
+        inits = sorted(lock_init.get(a, -1) for a in acq)
+        if consecutive or inits != [2]:
+            problems.append(
+                f"{label}: tile {t} (down) feed chain {bufs} acquires {sorted(acq)} "
+                f"(init {inits}); need a strict two-buffer alternation with one "
+                "acquire lock initialised to 2 (the feed's round-robin rule)"
+            )
+        else:
+            feed_ok += 1
+    if feed_ok != n_b:
+        problems.append(
+            f"{label}: {feed_ok} down feed chains read as a (b, acc) round-robin, "
+            f"need {n_b}"
         )
 
     verdict = "FAIL" if problems else "PASS"
@@ -462,7 +534,8 @@ def check_shape(label, kwargs):
         f"worst column {mm2s_worst}, memtile BDs max "
         f"{max(memtile_bds.values(), default=0)}/{MEMTILE_BD_CAP}, core BDs max "
         f"{max(core_bds.values(), default=0)}/{CORE_BD_CAP}, L1 worst {l1_worst} B, "
-        f"memtile 4-D BDs {mt_4d}, adders {adders})"
+        f"memtile 4-D BDs {mt_4d}, adders {adders}, multi-token core locks "
+        f"{len(multi)}, alternating feeds {feed_ok}/{n_b})"
     )
     return problems
 
