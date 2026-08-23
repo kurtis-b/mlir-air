@@ -125,7 +125,52 @@ builder checks host-only):
 
 The two-form comparison therefore has no hardware instance to run. What R1 at real width would
 cost in boundaries is larger by ~60× than what it saves in DRAM traffic, under today's launch
-cost; the increment is returned to the operator with that arithmetic (queue file).
+cost; the increment was returned to the operator with that arithmetic.
+
+### 2.2 `[2026-08-22]` The operator's route: partial-sum staging, ported from iron's `addnorm_ffn`
+
+The operator's answer: **use the partial-sum staging**, and port iron's fused
+AN1 → FFN → AN2 pipeline as the reference — `dev-addnorm-ffn` (`5cebcd7`, 2026-02-08),
+`operators/addnorm_ffn/design_old.py` (1,427 lines; its later siblings `ffn-an-new-1`
+`operators/ffn_addnorm/design.py` and `dev-mha-an-combine-bufs` `operators/encoder_pipeline/design.py`
+drop or extend the first AN stage). "Not the most optimized, but it fused those operations." It ran at
+the layer's width in iron: test rows `(M 512, K 768, N 3072)` on 8 columns, 16-row tiles, `k 96/128`,
+`n 128/96`, `down_proj_depth 6–8`, `nA 2–4` replicas × `nB 2–6` column slices.
+
+**Its dataflow, and why it has none of R1's walls.** Per replica: two AN1 cores produce LN rows and
+broadcast them to `nB` up-projection cores (no memtile); each up core computes an `(m, n)` tile of H
+for its column slice and streams it **L1→L1** to its paired down core — H is never staged through a
+shared buffer (wall 7 cannot arise) and never resident as a whole in any core (wall 1 cannot arise);
+each down core applies GeLU, then accumulates its **private** `(m × K_out)` partial of C_Down as a
+**ring through the memory tile** — `curr_acc_c` (L2→L1) / `new_acc_c` (L1→L2), depth
+`down_proj_depth`, one `(m, k)` block in L1 at a time, `matmul_with_acc` per block — while `w_down`
+streams per K chunk through the memtile as in J7b; after all H column tiles are consumed the `nB`
+partials are reduced by an **L1→L1 chain** (`buffer_to_reduce` + `add`) into the AN2 cores. The
+accumulator lives in L2 (`m × 768` bf16 per core), so `m` is small (16) and L1 holds a block.
+
+**The port, in increments** (all gated; hermetic first, device second, shape last):
+
+1. Builder `builders/tail_pipeline.py` (name provisional): one `air.segment`, four herds per replica
+   (`an1 [2,1]`, `up [nB,1]`, `down [nB,1]`, `an2 [2,1]`), L3→L2→L1 feeds for rows (`x`, `residual`),
+   `w_up` column slices and streamed `w_down` row chunks; up→down `L1→L1` channels; a private L2
+   accumulator memref per down core with get/put per block; the reduction chain; AN2. Kernels: the
+   lineage's own, already ported in `kernels/encoder.cc` (`fused_add_layer_norm_1outs`,
+   `ffn_matmul_with_acc_bf16_bf16_down_proj`, `ffn_zero_bf16_down_proj`, `ffn_gelu_bf16`,
+   `ffn_eltwise_add_bf16_vector`). Structure script + hermetic lit (compile through `aircc` with
+   `debug_ir`, count flows/channels/BDs, no device), as `ffn_resident_structure.py` does.
+2. Hardware at iron's baseline `(64, 48, 96)` on 2 columns, numerically exact against the
+   AN→FFN→AN reference; then the 16-row-tile shapes. The re-execution gate shape runs before
+   anything is cited.
+3. The layer's width `(512, 768, 3072)` with iron's parameter rows; each AIR wall met is named
+   and either derived as a skip or fixed at the builder (the BD stride cap, the 48-block memtile
+   cap, the per-column shim budget, placement).
+4. A lit in the suite; latency under the forward-only clock against `coarse`'s and `fused`'s
+   AN1+FFN+AN2 stages at 512, same session; DRAM traffic from the dispatch vector. That number is
+   the first resident-tail measurement the study has ever had.
+
+What it does NOT promise: that AIR's lowering of a long `w_down` stream plus an L2 ring is free of
+the `≥ 7` wedge — J7b's 96-step `w_down` stream passes on hardware, which is the evidence it is
+R1's composition and not the stream; increment 2 is where that is learned.
 
 ---
 
