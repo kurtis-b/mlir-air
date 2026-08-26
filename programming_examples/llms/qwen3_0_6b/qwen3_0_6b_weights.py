@@ -227,9 +227,10 @@ def load_weights(
         lm_head=lm_head,
     )
 
-    # `[2026-08-26]` doc 56 H2b (queue item 18): the w4_decode weight path,
-    # selected by QWEN3_W4_DECODE (default OFF -- this branch is dead on the
-    # production bf16 path). ONE owner (w4_decode_pack): RTN-quantize + pack
+    # `[2026-08-26]` doc 56 H2b (queue items 18, 24): the w4_decode weight
+    # path, selected by QWEN3_W4_DECODE -- default ON, so this branch IS the
+    # production path; QWEN3_W4_DECODE=0 takes the bf16 A/B arm. ONE owner
+    # (w4_decode_pack): RTN-quantize + pack
     # the decode O+FFN matrices AND substitute the bf16 fields with the
     # dequantized copy, so prefill (bf16 GEMMs), decode (in-kernel dequant)
     # and the verify oracle's HF patch all see the same numbers.

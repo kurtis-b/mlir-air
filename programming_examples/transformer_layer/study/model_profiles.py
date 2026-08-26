@@ -181,6 +181,15 @@ class ModelProfile:
     #: carry a precision A/B whose two arms are two artifact sets. Distinct
     #: from `prefill_Ms`, which takes the profile's own `precision_plan`.
     prefill_points: tuple = ()
+    #: `[2026-08-26]` doc 56 H2b (queue item 24): the DECODE mirror of
+    #: `prefill_points` -- (model_id, context_end, precision_plan) triples, one
+    #: decode rung each on the shipped prefill M under THAT plan. Same reason
+    #: as its prefill sibling: when a precision becomes a DEFAULT, its A/B
+    #: against the precision it replaced has to be one walk in one session on
+    #: one prompt, or the comparison is two sessions' drift as much as the
+    #: precision. Distinct from `decode_ctxs`, which takes the profile's own
+    #: `precision_plan`.
+    decode_points: tuple = ()
     #: (model_id, M, precision_plan) -> {"prefill_cache": dir, "decode_cache": dir};
     #: set by `bind`. The precision plan is part of the ARTIFACT SET key because
     #: a plan selects ELFs (H2b the decode set, H4 the prefill set) -- two rungs
@@ -209,6 +218,9 @@ class ModelProfile:
         for _mid, _M, plan in self.prefill_points:
             if plan not in seen:
                 seen.append(plan)
+        for _mid, _ctx, plan in self.decode_points:
+            if plan not in seen:
+                seen.append(plan)
         return tuple(seen)
 
     def rungs(self) -> tuple:
@@ -229,6 +241,11 @@ class ModelProfile:
             for ctx in self.decode_ctxs:
                 M = SHIPPED_PREFILL_M
                 out.append(ModelRung(model_id, "decode", M, ctx, self.decode_n_tokens, self.precision_plan, DECODE_CONTEXT, self._skip(model_id, M, self.precision_plan)))
+            for mid, ctx, plan in self.decode_points:
+                if mid != model_id:
+                    continue
+                M = SHIPPED_PREFILL_M
+                out.append(ModelRung(model_id, "decode", M, ctx, self.decode_n_tokens, plan, DECODE_CONTEXT, self._skip(model_id, M, plan)))
         return tuple(out)
 
     def artifact_sets(self) -> list:
@@ -261,6 +278,7 @@ class ModelProfile:
             "decode_ctxs": list(self.decode_ctxs),
             "ubatch_points": [list(t) for t in self.ubatch_points],
             "prefill_points": [list(t) for t in self.prefill_points],
+            "decode_points": [list(t) for t in self.decode_points],
             "decode_n_tokens": self.decode_n_tokens,
             "prefill_samples": self.prefill_samples,
             "prefill_warmup": self.prefill_warmup,
@@ -334,6 +352,27 @@ PROFILES = {
         prefill_Ms={"qwen3_0_6b": ()},
         decode_ctxs=(512, 1024, 2048),
         precision_plan="w4_decode",
+    ),
+    "w4-default-qwen": ModelProfile(
+        name="w4-default-qwen",
+        description=(
+            "doc 56 H2b (queue item 24): the standing Qwen3-0.6B decode numbers RE-TAKEN "
+            "after `QWEN3_W4_DECODE` became the default -- both precisions in ONE walk, one "
+            "session, one prompt per context, so the A/B is the precision and not two "
+            "sessions' drift. Six decode rungs: ctx 512/1024/2048 under precision_plan_id="
+            "w4_decode (the new default: the int4 O+FFN cascade on "
+            "<compiled_root>/qwen3_0_6b/w4_decode/decode_kernel_cache) and the same three "
+            "under bf16 (the shipped build_peano decode set), all on the shipped M=2048 "
+            "prefill set. Supersedes item 18's `w4-decode-qwen` walks as the standing "
+            "number; that profile stays as it was, so its walks stay reproducible"
+        ),
+        models=("qwen3_0_6b",),
+        prefill_Ms={"qwen3_0_6b": ()},
+        decode_ctxs=(512, 1024, 2048),
+        precision_plan="w4_decode",
+        decode_points=(("qwen3_0_6b", 512, "bf16"),
+                       ("qwen3_0_6b", 1024, "bf16"),
+                       ("qwen3_0_6b", 2048, "bf16")),
     ),
     "model-smoke": ModelProfile(
         name="model-smoke",

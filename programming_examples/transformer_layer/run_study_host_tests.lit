@@ -671,4 +671,4 @@
 // `test_model_profiles.py`. The pin is a shared counter, so it is set to what
 // the suite actually reports; whichever item commits last owns reconciling it.
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 715/715 passed in 33 modules
+// CHECK: study host tests: 720/720 passed in 33 modules

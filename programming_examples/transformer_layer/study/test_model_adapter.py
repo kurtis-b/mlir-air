@@ -39,7 +39,12 @@ from shared import model_adapter as ma  # noqa: E402
 PINNED_MANIFESTS = {
     "qwen3_0_6b": {
         "prefill": {"rms_qkv_qknorm_rope": (9, 15), "o_ffn_qwen": (12, 20), "flash_attn": (1, 1)},
-        "decode": {"rms_qkv_qknorm_rope_gemv2": (2, 2), "o_gemv_ffn": (3, 5), "lm_head_gemv": (10, 10)},
+        # `[2026-08-26]` queue item 24: BOTH O+FFN forms, because the shipped
+        # cache implements whichever precision was compiled last and the
+        # recorded H1a driver traces are the bf16 one. Same launch structure --
+        # that identity is item 18's central structural claim.
+        "decode": {"rms_qkv_qknorm_rope_gemv2": (2, 2), "o_gemv_ffn": (3, 5),
+                   "o_gemv_ffn_int4": (3, 5), "lm_head_gemv": (10, 10)},
     },
     "llama32_1b": {
         "prefill": {"rms_gemms_rope": (7, 13), "o_ffn": (12, 20), "flash_attn": (1, 1)},
@@ -109,8 +114,12 @@ def test_models_bind_the_three_drivers_and_nothing_else():
     assert ma.SUPPORTED_PRECISION_PLANS == ("bf16",)
     # llama's plans are DRIVERS (doc 56 H2a); qwen3_0_6b's w4_decode is
     # flag-selected since H2b (queue item 18) -- its FIRST plan names what the
-    # shipped build_peano decode cache implements (bf16), and the env map pins
-    # the flag in BOTH directions so an inherited env cannot flip a bf16 row.
+    # shipped build_peano decode cache implements, and the env map pins the
+    # flag in BOTH directions so an inherited env cannot move a row.
+    # `[2026-08-26]` queue item 24 flipped the DEFAULT and deliberately did NOT
+    # reorder this: the first entry says which plan binds to `build_peano`, and
+    # qwen's decode compile is additive across the flag, so that cache serves
+    # the bf16 rows after the flip exactly as before.
     bq = ma.MODELS["qwen3_0_6b"]
     assert bq.precision_plans == ("bf16", "w4_decode")
     assert bq.quant_contract_module == "qwen3_0_6b.w4_decode_pack"
@@ -150,7 +159,14 @@ def test_plan_for_is_value_identity_and_64_hex():
 def test_plan_launch_counts_equal_the_cached_manifests_for_both_models():
     for (model_id, phase), (subs, air, herd) in sorted(EXPECTED_TOTALS.items()):
         counts, source = _launch_counts(model_id)
-        plan_ = ma.plan_for(model_id, phase, 2048 if phase == "prefill" else 1, 2048 if phase == "prefill" else 512)
+        # `[2026-08-26]` queue item 24: the SHIPPED plan, not a hard-coded
+        # "bf16". `build_peano` holds whatever `make compile` last produced,
+        # and after the qwen default flip that is the int4 decode cascade --
+        # this test would otherwise go red the first time anyone ran
+        # `make verify` on the production default.
+        shipped = ma.MODELS[model_id].precision_plans[0]
+        plan_ = ma.plan_for(model_id, phase, 2048 if phase == "prefill" else 1,
+                            2048 if phase == "prefill" else 512, precision_plan=shipped)
         problems = ma.plan_launches_match_manifest(plan_, counts)
         assert problems == [], (model_id, phase, source, problems)
         vec = ma.model_dispatch_vector_from_manifest(plan_, counts, phase)

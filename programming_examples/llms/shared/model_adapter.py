@@ -131,6 +131,13 @@ class ModelBinding:
     #: `[2026-08-26]` doc 56 H2a: the plans THIS driver implements; any other
     #: is a derived skip in `prepare` (the bf16 drivers are bf16-only, the
     #: int4 driver is w4_decode-only -- a plan is a driver, not a flag).
+    #: **The FIRST entry is the plan `discover_compiled` binds to the model's
+    #: `build_peano` caches**; every other plan needs its own compiled set
+    #: under `--compiled-root`. It is an ARTIFACT-LOCATION statement, not a
+    #: claim about which precision the driver runs by default -- `[2026-08-26]`
+    #: queue item 24 flipped qwen3_0_6b's default to `w4_decode` and left this
+    #: order alone, because that model's decode compile is additive across the
+    #: flag and `build_peano` therefore serves both.
     precision_plans: tuple = SUPPORTED_PRECISION_PLANS
     #: The driver Session's model-identity kwarg: the bf16 Sessions take
     #: model_variant (the --model choice), the int4 Session takes model_path
@@ -148,9 +155,11 @@ class ModelBinding:
     #: select a plan, per plan -- {plan: {ENV: value}}. Empty for a driver
     #: whose plan needs no flag (the bf16-only drivers; the int4 llama driver,
     #: whose ONE plan is the driver itself). For qwen3_0_6b the w4_decode path
-    #: is flag-selected (QWEN3_W4_DECODE, default OFF), and the bf16 row PINS
-    #: the flag to 0 so an inherited env cannot silently flip a bf16 row to
-    #: w4. `prepare` applies this BEFORE importing the driver (the flag is
+    #: is flag-selected (QWEN3_W4_DECODE; `[2026-08-26]` queue item 24 flipped
+    #: its DEFAULT to on), and BOTH rows pin the flag explicitly -- the bf16
+    #: row to 0 and the w4_decode row to 1 -- so neither an inherited env nor a
+    #: future default flip can silently move a row to the other precision.
+    #: `prepare` applies this BEFORE importing the driver (the flag is
     #: read at import time); the verify gate subprocess gets the same dict.
     precision_env_map: dict = field(default_factory=dict)
 
@@ -174,10 +183,20 @@ MODELS: dict[str, ModelBinding] = {
     # `[2026-08-26]` doc 56 H2b (queue item 18): the qwen driver gains a
     # flag-selected w4_decode path (o_gemv_ffn_int4 over packed RTN weights;
     # QKV + LM head stay bf16 -- priced negatives, PREDICTION.md section 2).
-    # Default stays bf16; the flag row for bf16 PINS the env to 0.
+    # `[2026-08-26]` queue item 24: w4_decode is now the DRIVER'S DEFAULT; both
+    # rows pin the env explicitly, so a row's precision is the plan's and never
+    # the ambient default's.
     "qwen3_0_6b": ModelBinding(
         "qwen3_0_6b", "qwen3_0_6b", QWEN3_0_6B, "Qwen/Qwen3-0.6B", "instruct",
         "qwen3_0_6b.verify_adapter", prefill_prompt_len_kwarg=False,
+        # `[2026-08-26]` queue item 24 flipped the DEFAULT to w4_decode but the
+        # order here is deliberately UNCHANGED: `precision_plans[0]` names the
+        # plan `discover_compiled` binds to `build_peano`, and the qwen decode
+        # compile is additive across the flag (`compile_decode_kernels` carries
+        # the sibling precision's O+FFN entry), so that cache serves the bf16
+        # rows exactly as it did before the flip. Reordering would have sent
+        # every existing bf16 rung -- `model-smoke` included -- looking for a
+        # compiled set that does not exist.
         precision_plans=("bf16", "w4_decode"),
         quant_contract_module="qwen3_0_6b.w4_decode_pack",
         precision_env_map={"bf16": {"QWEN3_W4_DECODE": "0"},

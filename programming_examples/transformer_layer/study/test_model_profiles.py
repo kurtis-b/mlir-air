@@ -167,6 +167,40 @@ def test_w4_decode_is_the_h2a_row_of_doc_56():
     assert not keys & bf16
 
 
+def test_w4_default_qwen_carries_both_precisions_in_one_walk():
+    """`[2026-08-26]` Queue item 24 (doc 56 H2b, the default flip): the standing
+    decode numbers re-taken with BOTH precisions in one walk. `decode_points` is
+    the decode mirror of item 20's `prefill_points`, and it exists for the same
+    reason: an A/B whose two arms are two sessions measures session drift as
+    much as it measures the thing. Six rungs, three plans-per-context pairs, two
+    artifact sets, distinct resume keys, and item 18's profile left untouched so
+    its walks stay reproducible."""
+    prof = mp.profile("w4-default-qwen")
+    assert prof.models == ("qwen3_0_6b",)
+    assert prof.precision_plan == "w4_decode", "the DEFAULT is the profile's plan"
+    assert prof.precision_plans_used() == ("w4_decode", "bf16")
+    rungs = prof.rungs()
+    assert [r.case_id for r in rungs] == (
+        [f"qwen3_0_6b/decode/M2048/ctx{c}/w4_decode" for c in (512, 1024, 2048)]
+        + [f"qwen3_0_6b/decode/M2048/ctx{c}/bf16" for c in (512, 1024, 2048)])
+    assert all(r.phase == "decode" and r.n_tokens == 32 for r in rungs)
+    # two artifact sets, one per plan -- and each rung skips on ITS OWN plan's set
+    bound = prof.bind({("qwen3_0_6b", 2048, "w4_decode"): {"prefill_cache": "/c/p", "decode_cache": "/c/w4/d"}})
+    got = {(r.precision_plan, r.skip_reason is None) for r in bound.rungs()}
+    assert got == {("w4_decode", True), ("bf16", False)}
+    assert bound.expected_rows()["model_qwen3_0_6b.csv"] == {"rows": 6, "measured": 3, "skipped": 3}
+    both = prof.bind({("qwen3_0_6b", 2048, "w4_decode"): {"prefill_cache": "/c/p", "decode_cache": "/c/w4/d"},
+                      ("qwen3_0_6b", 2048, "bf16"): {"prefill_cache": "/c/p", "decode_cache": "/c/bf16/d"}})
+    assert both.artifact_sets() == [("qwen3_0_6b", 2048, "w4_decode"), ("qwen3_0_6b", 2048, "bf16")]
+    keys = {resume.rung_key(r.mode, r.seq, r.extra) for r in both.rungs()}
+    assert len(keys) == 6, "a plan-blind resume key would collapse the A/B to 3 rows"
+    # item 18's profile is untouched
+    assert mp.profile("w4-decode-qwen").decode_points == ()
+    assert [r.case_id for r in mp.profile("w4-decode-qwen").rungs()] == [
+        f"qwen3_0_6b/decode/M2048/ctx{c}/w4_decode" for c in (512, 1024, 2048)]
+    assert "decode_points" in prof.summary()
+
+
 def test_w4_decode_qwen_is_the_h2b_row_of_doc_56():
     """`[2026-08-26]` Queue item 18 (doc 56 H2b): three qwen decode rungs under
     w4_decode. The DECODE artifact set is plan-selected: qwen's shipped

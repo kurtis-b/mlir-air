@@ -1,7 +1,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""Verify adapter for the bf16 Qwen3-0.6B example.
+"""Verify adapter for the Qwen3-0.6B example, both decode precisions.
 
 Wraps the production `qwen3_0_6b_inference` driver into a Runner that
 satisfies `verify/runners/base.Runner`. The shared verify framework
@@ -72,7 +72,16 @@ def build_config():
 
 
 def build_hf_model(npu_model_name: str, hf_ref_model: str, config):
-    """`[2026-08-26]` doc 56 H2b (queue item 18): the w4_decode oracle.
+    """`[2026-08-26]` doc 56 H2b (queue items 18, 24): the w4_decode oracle.
+
+    `[2026-08-26]` queue item 24 flipped `QWEN3_W4_DECODE` ON by default, so
+    this hook is now on the DEFAULT path and the patched oracle is what
+    `make verify` compares against. Read that gate for exactly what it is: it
+    isolates NPU drift from quantization error, and therefore cannot see
+    quantization error at all. The other half -- the same top-5 token-set bar
+    against the UNPATCHED checkpoint -- is `make verify-quant-bar`, which gets
+    the plain oracle from this function's `return None` by running its compare
+    phase at `QWEN3_W4_DECODE=0`. Both are gated by `run_npu2_verify.lit`.
 
     Under QWEN3_W4_DECODE the NPU path computes on RTN-quantized O+FFN
     weights (decode dequants in-kernel; prefill runs the dequantized bf16
@@ -135,9 +144,20 @@ def build_runner(
 
 
 class NpuRunner:
-    """Adapter over the bf16 production NPU prefill + decode functions."""
+    """Adapter over the production NPU prefill + decode functions.
 
-    name = "npu_bf16"
+    `name` reports the decode precision actually selected, so the runner tag
+    in the gate's own warnings and reports never says bf16 while the int4
+    cascade is dispatching (`[2026-08-26]`, queue item 24: bf16 stopped being
+    the default and a hard-coded `npu_bf16` would have been a lie in every
+    report from that day on).
+    """
+
+    @property
+    def name(self) -> str:
+        from w4_decode_pack import w4_decode_selected
+
+        return "npu_w4_decode" if w4_decode_selected() else "npu_bf16"
 
     def __init__(
         self, weights, config, max_seq, tokenizer, npu_attn=True, lite_mode=False

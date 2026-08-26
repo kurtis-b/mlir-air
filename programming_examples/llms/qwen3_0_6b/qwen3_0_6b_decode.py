@@ -68,8 +68,9 @@ _RMS_QKV_LAUNCHES = int(_os.environ.get("QWEN3_RMS_QKV_LAUNCHES", "2"))
 assert _RMS_QKV_LAUNCHES in (2, 4), _RMS_QKV_LAUNCHES
 _RMS_QKV_KERNEL = f"rms_qkv_qknorm_rope_gemv{_RMS_QKV_LAUNCHES}"
 
-# `[2026-08-26]` doc 56 H2b (queue item 18): the w4_decode path, selected by
-# QWEN3_W4_DECODE=1 (default OFF -- bf16 stays the production default). What
+# `[2026-08-26]` doc 56 H2b (queue items 18, 24): the w4_decode path,
+# selected by QWEN3_W4_DECODE -- **default ON**, the production default for
+# this model since 2026-08-26; QWEN3_W4_DECODE=0 selects bf16 for A/B. What
 # changes: the O+FFN stage compiles/dispatches `o_gemv_ffn_int4` (the llama
 # 3-launch int4 cascade at q_dim=2048 / k_chunk=1024, SAME launch structure)
 # from the packed BOs `w4_decode_pack.quantize_decode_weights` attaches; the
@@ -81,6 +82,44 @@ from w4_decode_pack import w4_decode_selected as _w4_decode_selected  # noqa: E4
 
 _W4_DECODE = _w4_decode_selected()
 _O_FFN_KERNEL = "o_gemv_ffn_int4" if _W4_DECODE else "o_gemv_ffn"
+
+
+def required_decode_artifacts():
+    """The decode ELF names the CURRENT precision selection dispatches.
+
+    ONE derivation of the set: the same module-level `_RMS_QKV_KERNEL` /
+    `_O_FFN_KERNEL` the compile and dispatch paths use, so the check below
+    can never drift from what `compile_decode_kernels` writes.
+    """
+    return (_RMS_QKV_KERNEL, _O_FFN_KERNEL, "lm_head_gemv")
+
+
+def require_decode_artifacts(cache):
+    """`[2026-08-26]` queue item 24 (the w4_decode default flip): refuse a
+    decode cache that does not hold the selected precision's ELFs, with the
+    fix named.
+
+    Why here rather than at the dispatch: `load_and_run` indexes
+    `cache.artifacts[name]`, so a cache compiled BEFORE the flip (it has
+    `o_gemv_ffn`, not `o_gemv_ffn_int4`) surfaces as a bare `KeyError` deep
+    inside the first decode step -- after the weights loaded, after a prefill
+    ran, and with nothing in the message about precision. A stale cache is the
+    single most likely consequence of flipping a default, so it gets a
+    sentence instead of a traceback.
+    """
+    missing = [n for n in required_decode_artifacts() if n not in cache.artifacts]
+    if not missing:
+        return
+    sel = "w4_decode" if _W4_DECODE else "bf16"
+    other = "QWEN3_W4_DECODE=0" if _W4_DECODE else "QWEN3_W4_DECODE=1"
+    raise RuntimeError(
+        f"decode cache {str(cache.cache_dir)!r} does not contain {missing} -- it was "
+        f"not compiled for the selected precision ({sel}; QWEN3_W4_DECODE "
+        f"default is {'1' if _W4_DECODE else '0'} since 2026-08-26, doc 56 H2b "
+        f"queue item 24). It holds {sorted(cache.artifacts)}. Recompile "
+        f"(`make compile`, or `run_model.py compile-decode --precision-plan "
+        f"{sel}`), or select the other precision with {other}."
+    )
 
 
 def build_rms_qkv_qknorm_rope_gemv_module(config, n_launches=None):
@@ -382,6 +421,62 @@ def _lm_gemv_backend(verbose=False):
 # ---------------------------------------------------------------------------
 
 
+def _sibling_o_ffn_entry(cache):
+    """`[2026-08-26]` queue item 24: the manifest entry for the OTHER
+    precision's O+FFN ELF, if this cache already holds one.
+
+    `QWEN3_W4_DECODE` is documented as an A/B knob, and `o_gemv_ffn` /
+    `o_gemv_ffn_int4` is the ONE artifact that differs between the two
+    precisions. `_save_manifest` writes exactly what the current compile
+    produced, so without this a `make compile` at the default would erase the
+    bf16 entry (the ELF stays on disk; the manifest stops naming it) and every
+    bf16 consumer -- `QWEN3_W4_DECODE=0 make run`, the study's bf16 decode
+    rungs on `build_peano` -- would refuse until someone recompiled.
+
+    Deliberately NARROW: exactly this one name is carried across, never the
+    whole previous manifest. Resurrecting every stale entry (this cache also
+    holds `rms_qkv_qknorm_rope_gemv` / `_gemv4` ELFs from an older selection)
+    is the hazard this avoids while still letting one build tree serve both
+    precisions.
+    """
+    import json as _json
+
+    name = "o_gemv_ffn" if _W4_DECODE else "o_gemv_ffn_int4"
+    man = Path(cache.cache_dir) / cache.MANIFEST_FILE
+    if not man.is_file():
+        return None
+    try:
+        info = _json.loads(man.read_text()).get(name)
+    except (ValueError, OSError):
+        return None
+    if not info or not info.get("output_binary"):
+        return None
+    for cand in (Path(info["output_binary"]),
+                 Path(cache.cache_dir) / Path(info["output_binary"]).name):
+        if cand.is_file():
+            info = dict(info, output_binary=str(cand))
+            return name, info
+    return None
+
+
+def _restore_sibling_o_ffn(cache, carried):
+    """Put the entry `_sibling_o_ffn_entry` found back, after the compile."""
+    if not carried:
+        return
+    from air.backend.xrt import XRTCompileArtifact
+
+    name, info = carried
+    cache.artifacts[name] = XRTCompileArtifact(
+        info["output_binary"], info["kernel"], info.get("insts")
+    )
+    if info.get("launches"):
+        cache.launch_counts[name] = info["launches"]
+    if info.get("n_args") is not None:
+        cache.arg_counts[name] = int(info["n_args"])
+    print(f"  carried over the other precision's O+FFN ELF: {name} "
+          f"({info['output_binary']}) -- this cache serves both precisions")
+
+
 def compile_decode_kernels(cache, config, verbose=False):
     """Compile the Qwen3 decode kernels."""
     from shared.infra.external_kernels import (
@@ -395,7 +490,11 @@ def compile_decode_kernels(cache, config, verbose=False):
     hidden_dim = config.hidden_dim
     q_dim = config.n_heads * config.head_dim
 
-    print(f"\n{'='*60}\nCompiling Qwen3 decode kernels...\n{'='*60}\n")
+    # read BEFORE anything is written; restored after (queue item 24)
+    carried = _sibling_o_ffn_entry(cache)
+
+    print(f"\n{'='*60}\nCompiling Qwen3 decode kernels "
+          f"({'w4_decode int4' if _W4_DECODE else 'bf16'} O+FFN)...\n{'='*60}\n")
 
     # External .o kernels: GEMV (mv.o), 2tile-add/swiglu (mv_bf16.o), RoPE.
     compile_mv()
@@ -444,6 +543,7 @@ def compile_decode_kernels(cache, config, verbose=False):
         _lm_gemv_backend(verbose),
     )
 
+    _restore_sibling_o_ffn(cache, carried)
     cache._save_manifest()
     print(f"\nAll {len(cache.artifacts)} decode kernels compiled.")
 

@@ -46,6 +46,7 @@ from qwen3_0_6b_decode import (
     _LM_PARTS,
     lm_head_partition_slices,
     _W4_DECODE,
+    require_decode_artifacts,
     _run_o_gemv_ffn_int4,
 )
 
@@ -96,6 +97,11 @@ def prepare_runtime(
 ):
     """One-time runtime init: transpose decode GEMV weights, tag layer idx,
     pre-load prefill + decode + LM-head BOs."""
+    # `[2026-08-26]` queue item 24: the ONE place the production driver, the
+    # verify adapter and `model_adapter.prepare` all pass through -- so the
+    # "this cache was built for the other precision" refusal is stated once,
+    # before any weight transposition or device work.
+    require_decode_artifacts(decode_cache)
     print(f"\n{'='*60}")
     print("Preparing runtime (one-time init, outside profiling scope)...")
     print(f"{'='*60}")

@@ -854,9 +854,96 @@ vs bf16's 62.9–65.6.
 optimistic edge carried; the residual after the charges is 0.46 ms/call = **12.8 ms/token of
 dequant excess** vs the predicted ≤11.2 (13 % over; plausibly k_chunk 1024's doubled
 per-chunk fixed cost vs llama's 2048 — not separately measured). O4's conclusion sharpens:
-a faster int4 GEMV is now worth up to ~12.8 ms/token on this model's own decode. bf16 stays
+a faster int4 GEMV is now worth up to ~12.8 ms/token on this model's own decode. ~~bf16 stays
 the default and the standing-numbers table is unchanged; the operator flips
-`QWEN3_W4_DECODE` (or runs the `w4-decode-qwen` profile) to take the 14.9 tok/s path.
+`QWEN3_W4_DECODE` (or runs the `w4-decode-qwen` profile) to take the 14.9 tok/s path.~~
+**`[2026-08-26]` superseded by the flip below.**
+
+**`[2026-08-26]` H2b's default flipped — `w4_decode` is Qwen3-0.6B's production decode**
+(queue item 24; evidence `results/item24-w4-default-20260826/`, local: `PREDICTION.md`, the
+job scripts, the lit logs, the walk root, `compare_*.txt`, devq logs 649, 652–655, 659–660, 662–665;
+prediction written 14:18:44, first device job submitted 14:20:37). The
+operator's decision was "flip it on by default, **responsibly**", and the substance is the
+second word: item 18 left the w4 path with **no standing gate at all** (its device gate was a
+one-off, devq 621) and with the correctness bar for a quantized default never stated.
+
+**The bar, decided.** Every shipped default in this tree is held to top-5 token-set inclusion
+vs HF bf16 over 32 greedy tokens. For this path that phrase hides a fork, because the verify
+adapter patches the HF reference with the SAME dequantized O+FFN weights the kernel consumes
+(item 18's oracle, and the right design for what it measures): **that comparison cannot see
+quantization error, because both sides carry it.** So the bar is now two clauses, both in the
+suite, plus the bf16 arm:
+
+| arm of `run_npu2_verify.lit` | proves | oracle | measured |
+|---|---|---|---|
+| `QWEN3_W4_DECODE=0 make verify` | the bf16 A/B path has not rotted | plain HF bf16 | **PASS 2/2**, first divergence steps 23 / 25, mutual rank #2 |
+| `QWEN3_W4_DECODE=1 make verify` | **NPU drift** — the int4 cascade computes the quantized model correctly | dequant-patched HF | **PASS 2/2**, steps 19 / 14, mutual rank #2 |
+| `make verify-quant-bar` (NEW) | **the quantization bar** — the int4 default's tokens are still top-5-included in the REAL checkpoint's | plain HF bf16 | **PASS 2/2**, steps 16 / 2, mutual ranks #2/#2 and #3/#2 |
+
+Arm 3 is the clause that makes the flip responsible, and it needed **no new flag**: it reuses
+one w4 NPU capture and runs the compare phase at `QWEN3_W4_DECODE=0`, which is exactly what
+makes `build_hf_model` return `None` and the framework load the plain checkpoint. Both
+precisions are PINNED in the lit rather than inherited, so a future default move cannot
+silently change what the test means, and the arms are distinguished in the OUTPUT (arm 2 must
+print the adapter's patch line; arm 3 carries the matching `CHECK-NOT`).
+
+**What the standing gate still does not prove, said out loud**: per-element numerics inside the
+int4 cascade — the token-set criterion stops at the first divergence. Item 18's per-stage SHIP
+gate remains the instrument (each stage read back, checked at its own kernel family's published
+`rtol`/`atol` against its own device-side input) and stays a RELEASE-time gate for a change to
+the int4 cascade builder or `mv_int4_bf16.cc`: ~8 minutes and a bespoke harness against the
+cascade's private arg indices, for a subject that moves about monthly. It was re-run here: devq 654, and again as devq 664 on the final shipped bytes — `o_gemv_ffn_int4` carries **3 LOAD_PDIs, ODD**, so the [16 §18](16-compiler-changes.md) pad is what makes it clean, and it did: 0/1024, 0/3072, 0/1024 mismatches at each stage's own family bound, d2/d3 back-to-back and d4 after another ELF byte-equal to d1, d5 new-input clean; `rms_qkv_qknorm_rope_gemv2` and `lm_head_gemv` (even) clean too.
+
+**Suite cost, measured rather than asserted**: the naive form — three plain `make verify` invocations, each recompiling the whole set because `compile_and_cache` never skips — took **1332 s** (devq 652); the shared form takes **592 s** (devq 662) for the same three arms and the same three PASSes. The difference is entirely compiles: a gate arm itself is ~17–25 s of NPU capture plus HF reference decode, and a full compile is ~7.5 min. **The quantization bar costs ONE NPU capture and one HF decode and no compile at all** — about 25 s on this host.
+
+**The flip itself** is one constant (`w4_decode_pack.W4_DEFAULT`); the flag keeps its name and
+its sense, so there are not two ways to mean the same thing. Two things were tightened because
+a default flip makes them reachable: an unparseable `QWEN3_W4_DECODE` is now a REFUSAL rather
+than a silent bf16, and a decode cache compiled before the flip is refused at `prepare_runtime`
+— the one place the driver, the verify adapter and `model_adapter.prepare` all pass through —
+with both repairs named, instead of a bare `KeyError` from `load_and_run` after a prefill
+already ran. `make clean-build` joins `make clean`: the three qwen lits use it, because
+`clean`'s `rm -rf ../verify/reports` escapes the caller's cwd (item 20's recorded hazard).
+
+**The standing numbers, re-taken after the flip.** Study runner, profile `w4-default-qwen`
+(new: `decode_points`, the decode mirror of item 20's `prefill_points`, so BOTH precisions run
+in ONE walk, one session, one prompt per context — an A/B across two sessions measures session
+drift as much as it measures the precision):
+
+| ctx (per token) | plan | tok/s | ms/token | device | sync | host-cpu |
+|---|---|---|---|---|---|---|
+| 480 → 512 | **w4_decode (default)** | **15.05** | **66.44** | 48.99 | 0.88 | 11.49 |
+| 480 → 512 | bf16 | 12.46 | 80.25 | 61.29 | 0.78 | 11.98 |
+| 992 → 1024 | **w4_decode** | **12.60** | **79.38** | 48.71 | 0.96 | 23.83 |
+| 992 → 1024 | bf16 | 10.57 | 94.58 | 61.65 | 1.02 | 23.78 |
+| 2016 → 2048 | **w4_decode** | **8.41** | **118.85** | 49.46 | 1.56 | 57.77 |
+| 2016 → 2048 | bf16 | 7.25 | 137.95 | 64.05 | 1.75 | 58.51 |
+
+**In-session, same prompt, same prefill bytes: 1.208× / 1.192× / 1.161× tok/s — −13.8 / −15.2
+/ −19.1 ms per token at ctx 512 / 1024 / 2048.** `complete: True`, 6/6 passed, verify PASS on
+both artifact sets on the timed bytes, and the per-token dispatch vector is **identical across
+the two precisions on every rung** (57 submissions / 150 launches / 206 herds / 179 syncs /
+4.34 MB, `host_ops` 58, live-checked) — item 18's central structural claim, now measured
+against its own bf16 arm in one session rather than across two. All of the difference is
+`device_ms`, which is ctx-flat at 48.7–49.5 ms under w4 against 61.3–64.1 under bf16.
+
+**Against the prediction** (`PREDICTION.md` §2, written before any device job): five of the six
+walk rungs landed inside their bands; the bf16 ctx-512 point read 80.25 ms against a
+81.0–86.0 band, 0.9 % under. All three predicted in-session ratios held (1.17–1.27 / 1.13–1.25 /
+1.08–1.20 against 1.208 / 1.192 / 1.161). On the `make profile` clock BOTH arms came in ~2–3 %
+faster than their bands (w4 17.27–17.68 against 15.9–17.1, bf16 13.72–13.93 against 13.2–13.6),
+which is the session and not the model — the reason for measuring the two arms alternating in
+one of them. `compare_roots` against item 18's walk 2: **identifier mismatches 0** and tok/s
+drift median 0.93 % / p90 1.57 % on the three comparable `w4_decode` rows; the PROBLEM verdict
+is the three bf16 rows item 18 never had, plus the anticipated WARN that item 18's manifest
+predates the `timing` contract block (queue item 19) so its `device_ms` definition is not
+recoverable — the token-level figures, which is what this table cites, are contract-independent.
+
+`make profile N_TOKENS=32` — **a different clock, never in the same table** (operator rule
+2026-08-22): **w4 (the new default) 17.27 / 17.46 / 17.68 tok/s** (56.6–57.9 ms/token) against the **bf16 arm's 13.72 / 13.73 / 13.93** (71.8–72.9 ms) — three runs each, alternating, one session, devq 663; **+27 % on the median**. TTFT is 1.48–1.50 s on both arms, as predicted: prefill is bf16 GEMMs under either plan. Per call: `o_gemv_ffn_int4` 1.08–1.09 ms, `rms_qkv_qknorm_rope_gemv2` 0.46–0.47, `lm_head_gemv` 7.67–7.69.
+
+Host suite 715 → **720/720 in 33 modules**; seam `PLAN 14/14`, `DISPATCH 42/42`, `POOL 33/33`,
+`QKV4 4/4` unchanged; verify-runner 5/5.
 
 **`[2026-08-26]` H3 stages 1–2 landed, 3–5 scoped** (queue item 19; evidence
 `results/item19-h3-20260826/`, local: `STAGES-3-5-SCOPE.md`, per-stage predictions, devq logs

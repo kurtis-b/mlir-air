@@ -46,7 +46,7 @@ per token.
 | Llama-3.2-1B (bf16) | 1.21 s | 12.2 tok/s (06; head −1.0 ms on 08-23) | 3 / 2 |
 | SmolLM2-1.7B (bf16) | 2.02 s | 8.0 tok/s | 3 / 2 |
 | Qwen2.5-0.5B | 0.99 s | 11.9 tok/s | 4 / 5 |
-| Qwen3-0.6B | 1.52 s | **13.4–13.5 tok/s** (08-23) | 3 / 2 |
+| Qwen3-0.6B | 1.48–1.50 s | **17.3–17.7 tok/s** (08-26, **int4 decode by default**; bf16 arm 13.7–13.9) | 3 / 2 |
 | Qwen3-1.7B | 2.08 s | **7.8 tok/s** (08-21) | 3 / 2 |
 | Qwen2.5-1.5B | 2.43 s | 6.6 tok/s | 5 / 5 |
 | Llama-3.2-3B | 3.70 s | 4.7 tok/s | 3 / 5 |
@@ -58,7 +58,15 @@ June rows). **Qwen3-0.6B and Qwen3-1.7B decode re-measured 2026-08-21 under reco
 three launch-count changes (decode QKV stage 8 → 4 launches, LM head `m_input` 8 and 10 mixed
 partitions; `docs/plans/transformer-layer-execution-studies/57-…md` §5): 77 and 128–130 ms/token.
 All pass `make verify`
-(top-5 token-set vs HF bf16, exit 0). The lean **3-ELF prefill / 2-ELF decode**
+(top-5 token-set vs HF bf16, exit 0). **`[2026-08-26]` Qwen3-0.6B's decode is int4
+(`w4_decode`) by default** (doc 56 H2b, queue item 24): the O+FFN cascade dequants RTN uint4
+gs=128 weights in-kernel, QKV / LM head / prefill stay bf16, and `QWEN3_W4_DECODE=0` is the
+bf16 A/B arm. It is the one shipped default carrying quantization error, so it carries an
+extra standing gate the others do not need — `make verify-quant-bar`, the same top-5 token-set
+bar against the UNPATCHED bf16 checkpoint (PASS 2/2; the int4 default's generation first
+differs from the checkpoint's at steps 16 and 2, mutual ranks ≤ 3).
+
+The lean **3-ELF prefill / 2-ELF decode**
 form (Qwen3-0.6B/1.7B, matching Llama-3.2-1B) needs aligned dims + emb<2560 +
 hidden÷512; bigger models split the FFN and run a 5-ELF decode (the fused
 `o_gemv_ffn` cascade is capped at 4 cascade core-rows and needs hidden÷512).

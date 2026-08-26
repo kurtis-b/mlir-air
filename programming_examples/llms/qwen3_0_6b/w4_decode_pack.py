@@ -5,8 +5,10 @@
 
 ONE owner of, in this order:
 
-* the selection flag (`QWEN3_W4_DECODE`, default OFF -- bf16 stays the
-  production default until the operator flips it);
+* the selection flag (`QWEN3_W4_DECODE`, default **ON** since
+  2026-08-26 -- `w4_decode` IS the production default for this model;
+  `QWEN3_W4_DECODE=0` selects bf16 for A/B, and that is the ONLY way to
+  say it: one env, one function, one meaning);
 * the quantization parameters (RTN asymmetric uint4, GROUP_SIZE=128 --
   the same in-kernel `(q - z) * s` contract as the llama AWQ path; the
   packing tiling K_CHUNK=1024 = qwen's emb, the int4 cascade's DIM_K);
@@ -51,6 +53,14 @@ if str(_LLMS_DIR) not in sys.path:
 #: `precision_plan` before the driver import.
 W4_ENV = "QWEN3_W4_DECODE"
 
+#: `[2026-08-26]` doc 56 H2b (queue item 24): what an UNSET flag means. The
+#: operator flipped the default to `w4_decode` after item 18 measured
+#: +19-24 % tok/s at ctx 512/1024 with the launch structure unchanged. The
+#: flip is a change of THIS constant and nothing else -- the flag keeps its
+#: name and its sense ("is w4_decode on"), so there are not two ways to say
+#: the same thing. `QWEN3_W4_DECODE=0` is the bf16 A/B arm.
+W4_DEFAULT = True
+
 #: RTN asymmetric uint4 group size. 128 mirrors the llama AWQ contract (the
 #: one owner of the contract NAME is `llama32_1b_int4.awq_repacker`); the
 #: kernel dequants `(q - z) * s` per group either way.
@@ -66,9 +76,26 @@ N_CORES = 8
 
 
 def w4_decode_selected() -> bool:
-    """True when the operator (or the study runner) selected the w4_decode
-    path. Default OFF: bf16 is the production default (doc 56 H2b)."""
-    return os.environ.get(W4_ENV, "0") == "1"
+    """True when the `w4_decode` path is selected. **Default ON**
+    (`W4_DEFAULT`, 2026-08-26): `w4_decode` is this model's production
+    default; `QWEN3_W4_DECODE=0` selects bf16 (doc 56 H2b).
+
+    Unset (or empty, the `FOO= cmd` shell idiom) means the default. Any
+    other value is a REFUSAL rather than a silent fall back to bf16: this
+    one string decides which ELF the driver compiles, which weights the
+    loader packs and which oracle the verify gate builds, and a typo that
+    quietly moved all three would be invisible in every log.
+    """
+    raw = os.environ.get(W4_ENV)
+    if raw is None or raw == "":
+        return W4_DEFAULT
+    if raw not in ("0", "1"):
+        raise ValueError(
+            f"{W4_ENV}={raw!r} is neither '0' nor '1'. The flag selects this "
+            f"model's decode precision (1 = w4_decode, 0 = bf16); unset means "
+            f"the default, {'w4_decode' if W4_DEFAULT else 'bf16'}."
+        )
+    return raw == "1"
 
 
 def _fake_quantize(W_out_in):

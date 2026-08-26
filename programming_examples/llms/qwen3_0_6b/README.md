@@ -1,6 +1,6 @@
-# Qwen3-0.6B BF16 Inference on AMD NPU2 (MLIR-AIR)
+# Qwen3-0.6B Inference on AMD NPU2 (MLIR-AIR)
 
-End-to-end Qwen3-0.6B (0.6B parameter, BF16) inference running on AMD NPU2
+End-to-end Qwen3-0.6B (0.6B parameter) inference running on AMD NPU2
 (AIE2P) hardware via MLIR-AIR. Supports both prefill (seq_len=2048) and
 autoregressive decode with a KV cache. Built kernel-first on the shared LLM
 infrastructure (`../shared/`, `../verify/`) and the `../llama32_1b/` reference
@@ -8,14 +8,39 @@ exemplar; the Qwen3-specific deltas (per-head QK-norm, head_dim=128, decoupled
 q/kv dims, eps=1e-6, vocab=151936) are handled inside the per-layer block
 runners and fused onto the NPU.
 
+## Decode precision: int4 by default `[2026-08-26]`
+
+**The decode O+FFN cascade runs int4 (`w4_decode`) by default.** Prefill, the decode QKV
+stage and the LM head stay bf16 under both settings; `QWEN3_W4_DECODE=0` selects the bf16
+decode for A/B, and that env is the only way to name the axis (doc 56 H2b, queue items 18
+and 24).
+
+**The default therefore carries quantization error.** The O, gate, up and down matrices are
+round-to-nearest asymmetric uint4 at group size 128, fake-quantized from the bf16 checkpoint
+by `w4_decode_pack.py`; prefill and the verify oracle then compute on the DEQUANTIZED copy, so
+prefill, decode and the reference are numerically one model. What that costs in tokens is
+measured, not assumed — see Verification below. To get bf16 back:
+`QWEN3_W4_DECODE=0 make run` (likewise `profile`, `verify`, `compile`). A build tree compiled
+before the flip is refused by name, with the recompile command in the message.
+
 ## Performance
 
-Measured on NPU2 (AIE2P), `make profile N_TOKENS=32`, 2026-06-28.
+Two clocks, never mixed (operator rule 2026-08-22). This table is `make profile`'s.
+
+Measured on NPU2 (AIE2P), `make profile N_TOKENS=32`, 2026-08-26, **Turbo recorded**,
+three runs per arm alternating in one session (devq 663).
 
 | Phase | Measured | Notes |
 |-------|----------|-------|
-| Prefill / TTFT (2048 tokens) | **1.52 s wall** | head_dim=128 → host head-first FA seq↔head transpose included in wall; NPU-kernel time is lower (~1.29 s) |
-| Decode / TPOT (steady-state) | **13.4–13.5 tok/s** (74–75 ms/token, 2026-08-23, Turbo recorded; 13.0 on 08-21, 11.7 in 2026-06) | 28 layers; per token: 28 × (`rms_qkv_qknorm_rope_gemv2` 0.49 + `o_gemv_ffn` 1.6 + host attention 0.11 ms) + `lm_head_gemv` 7.7 ms; 150 `air.launch` boundaries at ~107 µs each are ~22 % of it |
+| Prefill / TTFT (2048 tokens) | **1.48–1.50 s** | unchanged by the precision — prefill is bf16 GEMMs under both plans (bf16 arm 1.49 s); head_dim=128 → host head-first FA seq↔head transpose included in wall |
+| Decode / TPOT, **int4 default** | **17.3–17.7 tok/s** (56.6–57.9 ms/token) | 28 layers; per token: 28 × (`rms_qkv_qknorm_rope_gemv2` 0.49 + `o_gemv_ffn_int4` ~1.07 + host attention 0.11 ms) + `lm_head_gemv` 7.7 ms |
+| Decode / TPOT, bf16 arm (`QWEN3_W4_DECODE=0`) | 13.7–13.9 tok/s (71.8–72.9 ms/token) | the same session's A/B; 13.4–13.5 on 2026-08-23, 13.0 on 08-21, 11.7 in 2026-06 |
+
+**+27 % on decode's median (17.46 vs 13.73 tok/s), at an unchanged launch structure** — the
+int4 cascade is the same 3 launches / 1 submission as the bf16 one, so the whole gain is
+weight bytes. The study runner's clock (a DIFFERENT clock — do not put its numbers in the
+table above) reads 66.4 ms/token at ctx 512 against bf16's 80.3 in the same session; see doc
+56 §4's H2b block, queue item 24.
 
 ## Model Config
 
@@ -64,11 +89,36 @@ make verify
 make diagnosis
 ```
 
-## Verification
+## Verification — and what the gate does and does not prove
 
-`make verify` is the PASS/FAIL gate: it greedily decodes 32 tokens on the NPU
-and on HF transformers (bf16) for each prompt and checks that every NPU token is
-in HF's top-5 set at that position. Current status: **PASS, exit 0, 2/2 prompts**.
+`make verify` is the PASS/FAIL gate: it greedily decodes 32 tokens on the NPU and on HF
+transformers (bf16) for each prompt and checks, at the first position where the two disagree,
+that each side's token is in the other's top-5 set.
+
+Because the default is quantized, that is **two** questions, and this model gates both. The
+standing test `run_npu2_verify.lit` runs three arms, both precisions pinned explicitly:
+
+| Arm | Command | What it proves | Oracle |
+|---|---|---|---|
+| 1 | `QWEN3_W4_DECODE=0 make verify` | the bf16 A/B path still works | plain HF bf16 |
+| 2 | `make verify` (the default) | **NPU drift**: the int4 cascade computes the quantized model correctly | HF patched with the same dequantized O+FFN weights |
+| 3 | `make verify-quant-bar` | **the quantization bar**: the int4 default's tokens are still top-5-included in the REAL checkpoint's | plain HF bf16, unpatched |
+
+Arm 2 is the one `make verify` runs, and by construction it **cannot see quantization error** —
+both sides carry it. That is deliberate: it isolates NPU drift. Arm 3 is the other half. It
+re-judges the same NPU capture against the unpatched checkpoint at the same k=5 / 32-token bar
+every bf16 default in this tree meets, and it needs no new flag (its capture phase runs at
+`QWEN3_W4_DECODE=1`, its compare phase at `0`, and it is the `0` that makes the oracle plain).
+
+Current status: **PASS on all three arms, 2/2 prompts each, reproduced identically across two independent lit runs** (devq 652 and 662). The quantization bar's own reading, which is the number worth knowing: against the unpatched bf16 checkpoint the int4 default's greedy generation first differs at **step 16** on one prompt and **step 2** on the other, and at both points each side's token is inside the other's top-5 (ranks 2/2 and 3/2). That is what RTN int4 on the O+FFN mass costs at 32 tokens — stated, not implied.
+
+**What none of the three prove**: per-element numerics inside the int4 cascade. The token-set
+criterion stops at the first divergence, so a numerical regression that preserves the top-5
+sets passes. That bound is queue item 18's per-stage SHIP gate
+(`transformer_layer/results/item18-h2b-20260826/reexec_w4_qwen_gate.py`, devq 621) — each
+stage read back and checked at its own kernel family's published `rtol`/`atol`. It is a
+release-time gate for a change to the int4 cascade builder or `mv_int4_bf16.cc` (~8 min, a
+bespoke harness), not a per-commit one.
 
 ## Key Files
 
@@ -80,5 +130,6 @@ in HF's top-5 set at that position. Current status: **PASS, exit 0, 2/2 prompts*
 | `qwen3_0_6b_weights.py` | Weight loading from HuggingFace safetensors (incl. q_norm/k_norm, tied lm_head) |
 | `qwen3_0_6b_cpu_helpers.py` | NumPy helpers shared by production + verify: `rms_norm`, `qk_norm_per_head` (Qwen3 delta), `attention_reference`, `softmax` |
 | `verify_adapter.py` | Hooks this model's prefill/decode into the shared `../verify/` subsystem |
-| `Makefile` | compile / run / profile / chat / verify / verify-full / diagnosis / clean |
+| `w4_decode_pack.py` | The int4 decode path's ONE owner: the `QWEN3_W4_DECODE` flag and its default, the RTN uint4 gs=128 quantization + packing, the dequantized-copy substitution, and the `quant_*` contract |
+| `Makefile` | compile / run / profile / chat / verify / verify-full / verify-quant-bar / diagnosis / clean / clean-build |
 | `ARCHITECTURE.md` | Per-layer kernel sequence, NPU/CPU mapping, runtime flow, deltas |

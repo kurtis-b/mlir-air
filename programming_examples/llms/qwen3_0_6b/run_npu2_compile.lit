@@ -11,10 +11,15 @@
 // shared/builders + shared/infra assembly. Run on demand:
 //   lit -v programming_examples/llms/qwen3_0_6b/run_npu2_compile.lit
 //
+// `[2026-08-26]` queue item 24: `make compile` follows the production default,
+// so this now builds the int4 `w4_decode` O+FFN cascade rather than the bf16
+// one (`QWEN3_W4_DECODE=0` builds the bf16 arm). `clean-build` rather than
+// `clean`, for the reason run_npu2_verify.lit gives.
+//
 // REQUIRES: ryzen_ai_npu2, peano
 //
 // RUN: mkdir -p test_peano_compile
 // RUN: cd test_peano_compile
-// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile clean-build
 // RUN: make -f %S/Makefile compile PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
 // CHECK: Compilation passed.
