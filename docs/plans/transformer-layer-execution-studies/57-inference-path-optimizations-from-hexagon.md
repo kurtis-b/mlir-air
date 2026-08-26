@@ -725,6 +725,73 @@ double-buffered, K transposed on-device by scatter; their FA solver packs `Br` q
 `G` GQA heads into the 32-row tile (`br_unit = ceil(32/G)`, `htp/flash-attn-ops.h:277`) so GQA
 *fills* the matrix engine instead of replicating K. That is H3 stage 4.
 
+**`[2026-08-26]` Item 23 built the integer GEMV and measured it: integer compute
+LOSES to fused-dequant-to-bf16 by 11× at decode, and the reason is the scalar
+unit, not the MAC (devq 651/657/661/658/667; `programming_examples/transformer_layer/results/item23-int-gemv-20260826/`).**
+Three ISA facts first, all from the headers and from disassembly, none from a
+datasheet. (a) AIE2P's **elementwise** integer MAC has **no rate advantage
+whatsoever** over bf16 — both are `mac_elem_64_conf`, 64 lanes, 64
+MACs/instruction (`aie_api/detail/aie2p/mul_acc32.hpp:70`,
+`mul_acc32_fp.hpp:45`) — so "integer arithmetic is faster" is a priced negative
+on the engine a GEMV uses. (b) The MAC array *does* carry a dense int8×int4 mode,
+`mac_4x16_16x16_conf(v64int8, v256int4, v64acc32)` (`aie2p_vmult.h:39583`) at
+1024 MACs/intrinsic against bf16's 512-via-bfp16 — and AIE2P has **no native
+dense bf16 MAC-array instruction at all**, `mac_4x8_8x8_bf16` being absent from
+the entire aie2p Peano header set, which is why
+`-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16` is mandatory in seven places in this
+tree and why compiling a bf16 `mmul` without it silently emulates at 32
+MACs/issue. But at decode M=1 that mode idles 3 of its 4 A-rows and runs ~6×
+past the 40.8 GB/s stream wall, so it cannot be paid for; deliberately not built.
+(c) **There is no `vrmpy` analogue**: `sliding_mul`'s int8 mode is a real 8× over
+its bf16 emulation (`mac_conv_64x8`, 512 MACs/instruction) but computes
+`out[l] = Σ_p data[l+p]·coeff[p]`, a convolution, not Hexagon's per-lane grouped
+dot product — **§5b's design cannot be transliterated instruction-for-instruction.**
+Measured at Qwen3-0.6B's gate/up GEMV (M=6144, K=1024, gs=128, M_TILE=8, 3.293 MB
+packed; fixed cost fitted in-session from a three-point M sweep, residuals
+≤ 2.3 µs), compute-only: **shipped bf16 22.92 GB/s; the int8 prototype 2.06 GB/s
+(0.09×); the same prototype with activation quantisation removed 2.63 GB/s
+(0.11×)**. **The kernel is CORRECT** — 0/6144 violations of a derived strict
+per-element bound at all three M — and 3.9× less accurate than bf16 (rel RMS
+0.00929 vs 0.00238), of which 0.00758 is the int8 activation quantisation itself,
+against 0.66 % derived before measuring. **Where it dies is the scalar unit:** the
+integer fold needs a per-(row, group) *product* of the weight scale and the
+on-device activation scale, where bf16 needs one bf16 **load** and no arithmetic;
+compiled side by side that is **58 VLIW bundles against 17, with stack spills**
+(`isa_probe/probe_scalar.cc`), executed 64× per kernel call against an inner loop
+of 8×8×25 vector ops. Removing the quantiser recovers only 27.7 %, so the
+quantiser is not the problem — the fold is. A production repair exists and costs
+the thing that motivated the design: `s_b` must stop varying per group (per-K-chunk
+activation quantisation, **not** Hexagon's per-32) so it factors out of the group
+loop. **Recommendation: stop.** Two traps are worth carrying regardless: on an
+INTEGER accumulator `acc32→bf16` compiles to one instruction and
+**bit-reinterprets rather than converts** (`accum.hpp:1090-1095` does not
+constrain the accumulator `Class`; the whole GEMV returned ~0, rel RMS 1.0, devq
+651), and `accum<accfloat>::to_vector<int8>()` does the same in reverse — the
+tree's correct route is FP-accum → bf16 vector → `aie::to_fixed`, as
+`llama2_mha/mha.cc:137` already does. **An instruction-count probe cannot see
+either; only a value check on device can.**
+
+**`[2026-08-26]` A free 1.10× on the SHIPPED int4 GEMV, found while building the
+control for item 23 (devq 658/667).** `mv_int4_bf16.cc` runs its inner loop at
+`r = 32`. At `r = 64` the identical source's weight load becomes a single fused
+**`vldb.unpack`** instead of `vldb.128` + a separate `vunpack`, because the load
+unit's int4→int8 unpack mode wants a 32-byte source: **47 → 34 vector ops per
+gs=128 group** (`isa_probe/probe_r64.dis`), measured **22.92 → 25.22 GB/s
+compute-only** at M=6144 with **0/6144** bound violations and an unchanged
+accuracy class (rel RMS 0.00236 vs 0.00238). No format, layout, packer or
+accuracy consequence — one token. **This item does not propose it for the shipped
+path**: a standalone harness measures 22.92 GB/s where the cascade measures 10.0
+(doc 56 §4 H2b, devq 616), the two are not interchangeable, and it earns its own
+gated experiment on `o_gemv_ffn_int4` rather than a change.
+
+**On the ms/token question.** Item 23's prediction committed to a 5.2–6.4 ms/token saving.
+**That figure is withdrawn, not restated.** Falsifier F2 — declared in `PREDICTION.md` before any
+device job — said that if the standalone harness's baseline rate fell outside
+7.5–13.0 GB/s it would not be comparable to doc 56 §4's cascade and no ms/token
+number could be quoted from it. It measured 22.92. **No ms/token claim is made by
+this item**, and doc 56 §4's 12.8 ms/token dequant residual stands unaltered and
+unexplained by it.
+
 **And the gap that dwarfs both.** They issue **one DSP round-trip per graph split, up to 1024 ops**
 (`opt_opbatch`, `ggml-hexagon.cpp:83`) as a flat `{buffer, tensor, op}` descriptor array in shared
 memory, with tiling parameters solved **on the host** once per graph uid; the DSP walks the batch
