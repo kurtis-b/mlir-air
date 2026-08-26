@@ -309,6 +309,15 @@ whether the firmware keys the skip on id alone or (id, address) per context — 
 across contexts" is shown; upstream could make `expand-load-pdi`'s alternation dispatch-aware
 instead of this mlir-air-side pad.
 
+**`[2026-08-26]` Three more rows, predicted then observed** (doc 56 H2a, devq 608): the SHIPPED
+`llama32_1b_int4` decode ELFs are 2026-08-19 bytes (pre-fix). Two-dispatch check on the shipped
+bytes through the production call sites, prediction written first: `rms_qkv_int4_rope` 6 loads
+(even) clean, `lm_head_gemv` 8 (even) clean, `o_gemv_ffn_int4` **3 (odd) wrong at d2/d3
+back-to-back** (2047/2048 outputs differ, max|d| 263; d1 correct vs the dequant reference,
+healed by one other-ELF dispatch). **Odd ⇔ wrong/hang now 10/10.** Production alternation never
+re-executes these back-to-back; recompiling under the fixed compiler is the repair when those
+caches are next rebuilt.
+
 ## 2. The structural fact: every `air.launch` boundary is a partition reconfiguration
 
 [29](25-mode-rebuilds-and-results.md) records the multi-launch mechanism: a module with N

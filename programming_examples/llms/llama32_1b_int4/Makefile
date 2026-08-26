@@ -16,7 +16,11 @@
 # Performance (NPU2 AMD Strix, seq=2048, 16 layers, NPU flash_attn):
 #   --prefill-dtype=int4 :  ~700 ms/layer  (kernel-bound; see PR for bisection)
 #   --prefill-dtype=bf16 :  ~80 ms/layer   (~9x faster, same AWQ weights)
-#   int4 NPU decode      :  ~56 ms/token   (17.8 tok/s on instruct model)
+#   int4 NPU decode      :  68-89 ms/token by context (14.7 / 13.6 / 11.2 tok/s
+#                           at ctx 512/1024/2048; Turbo recorded, devq 610,
+#                           doc 56 s4 H2a 2026-08-26 -- the study clock, forward
+#                           pass only. The June "~56 ms (17.8 tok/s)" header was
+#                           pmode-unrecorded and has no artifact in tree.)
 
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 

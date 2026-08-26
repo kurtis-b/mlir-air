@@ -148,6 +148,22 @@ class Stage:
     note: str = ""
 
 
+#: `[2026-08-26]` doc 56 H2a: the w4_decode GEMV quantization contract's NAME.
+#: The one OWNER of the contract is the packing code
+#: (`llama32_1b_int4/awq_repacker.quant_contract`), which the study's quant_*
+#: columns read; this literal mirrors its `quant_gemv_contract_name` so the
+#: plan's stages name the contract without importing the model dir (the plan
+#: package stays dependency-free -- the fa_cache_name pattern; a host test
+#: pins the agreement).
+W4_GEMV_CONTRACT = "awq_u4_asym_g128_bf16s_u8z_dequant_in_kernel"
+W4_BYTES_NOTE = ("weight_bytes are int4 nibbles (bf16 // 4); per-group bf16 scales + u8 zeros "
+                 "ride on top (~+4.7 %); the exact packed BO bytes are the driver's")
+
+
+def _w4_bytes(bf16_bytes):
+    return bf16_bytes // 4
+
+
 def _lean_form(spec, caps):
     return spec.emb_dim < caps.lean_form_emb_max and spec.hidden_dim % caps.lean_form_hidden_multiple == 0
 
@@ -259,6 +275,14 @@ def fuse(graph, wl, placements, caps=NPU2_CAPS, forced=None):
                                 weight_bytes=wbytes("w_down_L"), candidates={"down_proj_L": cands["down_proj_L"]}))
             rejected.append(("o_ffn fused", "spatial: the fused cascade needs the lean form"))
     else:  # decode
+        w4 = wl.precision_plan == "w4_decode"
+        if w4 and (qk or not lean):
+            # H2b brings w4_decode to the qk-norm models (the planner's int4
+            # GEMV candidates); the shipped int4 driver is the lean llama form
+            # only. Refusing beats silently naming bf16 stages a w4 plan.
+            raise ValueError(
+                f"w4_decode decode plan exists only for the lean non-qk-norm form "
+                f"(the shipped llama32_1b_int4 driver); {spec.name} needs doc 56 H2b")
         if qk:
             # `[2026-08-23]` doc 57 section 5 item 5c (queue item 11): ONE head-aligned GEMV whose
             # cores apply QK-norm + RoPE in L1 (mv_heads.cc), so the stage is RMSNorm + GEMV.
@@ -267,19 +291,42 @@ def fuse(graph, wl, placements, caps=NPU2_CAPS, forced=None):
             name = "rms_qkv_qknorm_rope_gemv2"
             rejected.append(("rms_qkv_qknorm_rope_gemv4", "4 launches (GEMV, QK-norm, RoPE as separate launches): superseded by the "
                              "head-epilogue GEMV, 0.672 -> 0.494 ms per layer (devq 555); kept behind QWEN3_RMS_QKV_LAUNCHES=4 for A/B"))
+        elif w4:
+            # `[2026-08-26]` doc 56 H2a (queue item 17): the SHIPPED int4 decode
+            # stage -- same 6-launch shape as rms_gemv_rope, the three GEMVs
+            # dequanting in-kernel. The contract NAME mirrors the packing code's
+            # (llama32_1b_int4/awq_repacker.quant_contract; the plan package
+            # stays dependency-free, a host test pins the agreement -- the
+            # fa_cache_name pattern).
+            gemv = f"int4 GEMV ({W4_GEMV_CONTRACT})"
+            bd = (("attn_norm_L", 1, "RMSNorm"), ("q_proj_L", 1, gemv), ("k_proj_L", 1, gemv), ("v_proj_L", 1, gemv),
+                  ("rope_q_L", 1, "RoPE"), ("rope_k_L", 1, "RoPE"))
+            name = "rms_qkv_int4_rope"
         else:
             bd = (("attn_norm_L", 1, "RMSNorm"), ("q_proj_L", 1, "GEMV"), ("k_proj_L", 1, "GEMV"), ("v_proj_L", 1, "GEMV"),
                   ("rope_q_L", 1, "RoPE"), ("rope_k_L", 1, "RoPE"))
             name = "rms_gemv_rope"
         ops = ["attn_norm_L", "q_proj_L", "k_proj_L", "v_proj_L"] + (["q_norm_L", "k_norm_L"] if qk else []) + ["rope_q_L", "rope_k_L"]
+        qkv_wb = wbytes("attn_norm_w_L") + (_w4_bytes(wbytes("wq_L", "wk_L", "wv_L")) if w4 else wbytes("wq_L", "wk_L", "wv_L")) \
+            + (wbytes("q_norm_w_L", "k_norm_w_L") if qk else 0)
         stages.append(Stage(name, DEVICE, tuple(ops), launches=sum(b[1] for b in bd), launch_breakdown=bd,
-                            weight_bytes=wbytes("attn_norm_w_L", "wq_L", "wk_L", "wv_L") + (wbytes("q_norm_w_L", "k_norm_w_L") if qk else 0),
-                            boundary_bytes=g.nbytes("x_in_L") + (spec.n_heads + spec.n_kv_heads) * spec.head_dim * 2))  # x_in + the position LUT
+                            weight_bytes=qkv_wb,
+                            boundary_bytes=g.nbytes("x_in_L") + (spec.n_heads + spec.n_kv_heads) * spec.head_dim * 2,  # x_in + the position LUT
+                            note=W4_BYTES_NOTE if w4 else ""))
         stages.append(Stage("kv_append", HOST, ("kv_append_L",), boundary_bytes=g.nbytes("k_roped_L") + g.nbytes("v_L") + g.nbytes("q_roped_L"),
                             note=placements["kv_append_L"].reason))
         stages.append(Stage("decode_attention_cpu", HOST, ("attention_L",), note=placements["attention_L"].reason,
                             boundary_bytes=g.nbytes("attn_out_L")))
-        if lean:
+        if lean and w4:
+            bd = (("o_proj_L+residual_1_L", 1, f"int4 matvec_add ({W4_GEMV_CONTRACT})"),
+                  ("ffn_norm_L+gate_proj_L+up_proj_L+swiglu_L", 1, f"int4 matvec_swiglu_rms cascade, gate/up nibble-interleaved ({W4_GEMV_CONTRACT})"),
+                  ("down_proj_L+residual_2_L", 1, f"int4 matvec_add ({W4_GEMV_CONTRACT})"))
+            stages.append(Stage("o_gemv_ffn_int4", DEVICE, ("o_proj_L", "residual_1_L", "ffn_norm_L", "gate_proj_L", "up_proj_L", "swiglu_L", "down_proj_L", "residual_2_L"),
+                                launches=3, launch_breakdown=bd,
+                                weight_bytes=wbytes("ffn_norm_w_L") + _w4_bytes(wbytes("wo_L", "w_gate_L", "w_up_L", "w_down_L")),
+                                boundary_bytes=g.nbytes("x_out_L"),
+                                note="lean fused int4 O+FFN cascade (3 launches); " + W4_BYTES_NOTE))
+        elif lean:
             bd = (("o_proj_L+residual_1_L", 1, "matvec_2tile_add"), ("ffn_norm_L+gate_proj_L+up_proj_L+swiglu_L", 1, "matvec_swiglu_rms cascade"),
                   ("down_proj_L+residual_2_L", 1, "matvec_2tile_add"))
             stages.append(Stage("o_gemv_ffn", DEVICE, ("o_proj_L", "residual_1_L", "ffn_norm_L", "gate_proj_L", "up_proj_L", "swiglu_L", "down_proj_L", "residual_2_L"),

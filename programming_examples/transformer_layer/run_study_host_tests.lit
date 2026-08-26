@@ -591,5 +591,14 @@
 // lut_static=True through the chunked path must BREAK the equality exactly at
 // chunk 2's positions (chunk 1 byte-equal, rows 8+ not), proving the fake
 // models the static-store and the test can catch the silent-wrong-RoPE class.
+// `[2026-08-26]` 681 -> 685, queue item 17 (doc 56 H2a): the int4 sibling
+// bound under the runner -- test_model_adapter +3 (the w4_decode decode plan
+// against the SHIPPED int4 manifest with a bf16-precision negative control;
+// the quant_* columns read from the packing module and never hand-typed, the
+// GEMM/GEMV contracts asserted DIFFERENT, the plan's contract name pinned to
+// awq_repacker's; the driver's host-stage buckets / seam surface / verify
+// adapter's loaded-cache hop by source) and test_model_profiles +1 (the
+// w4-decode profile's three decode rungs, skip rule, resume keys disjoint
+// from the bf16 llama's).
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 681/681 passed in 31 modules
+// CHECK: study host tests: 685/685 passed in 31 modules

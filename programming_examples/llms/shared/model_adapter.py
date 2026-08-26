@@ -79,7 +79,7 @@ for _p in (str(_PE), str(_LLMS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from shared.plan import LLAMA32_1B, QWEN3_0_6B, NPU2_CAPS, Workload, decoder_graph, plan as _plan, plan_ubatch_prefill as _plan_ubatch_prefill  # noqa: E402
+from shared.plan import LLAMA32_1B, LLAMA32_1B_INT4, QWEN3_0_6B, NPU2_CAPS, Workload, decoder_graph, plan as _plan, plan_ubatch_prefill as _plan_ubatch_prefill  # noqa: E402
 
 #: The seven keys, in the schema's order (`study/schema.py` MODEL_DISPATCH_VECTOR_KEYS).
 DISPATCH_VECTOR_KEYS = (
@@ -92,8 +92,9 @@ DISPATCH_VECTOR_KEYS = (
     "bytes_transferred",
 )
 
-#: Precision plans these drivers implement. `w4_decode` lives in the int4 sibling
-#: drivers (llama32_1b_int4); `w_bfp16_prefill` and `a8` are H4 / later.
+#: Precision plans the bf16 drivers implement (the per-binding default).
+#: `w4_decode` is the int4 sibling driver's (its binding says so);
+#: `w_bfp16_prefill` and `a8` are H4 / later.
 SUPPORTED_PRECISION_PLANS = ("bf16",)
 
 PREFILL_CACHE = "prefill_kernel_cache"
@@ -102,7 +103,7 @@ DECODE_CACHE = "decode_kernel_cache"
 
 @dataclass(frozen=True)
 class ModelBinding:
-    """What differs between the two drivers, and nothing else."""
+    """What differs between the drivers, and nothing else."""
 
     model_id: str  # llms/ directory and the schema's model_id
     package: str  # driver module prefix: <package>_inference etc.
@@ -111,10 +112,26 @@ class ModelBinding:
     model_variant: str  # the driver's --model choice
     verify_adapter: str  # verify_runner --runner dotted path
     prefill_prompt_len_kwarg: bool  # run_npu_prefill accepts prompt_len=
+    #: `[2026-08-26]` doc 56 H2a: the plans THIS driver implements; any other
+    #: is a derived skip in `prepare` (the bf16 drivers are bf16-only, the
+    #: int4 driver is w4_decode-only -- a plan is a driver, not a flag).
+    precision_plans: tuple = SUPPORTED_PRECISION_PLANS
+    #: The driver Session's model-identity kwarg: the bf16 Sessions take
+    #: model_variant (the --model choice), the int4 Session takes model_path
+    #: (the checkpoint id). See session_model_kwargs().
+    session_model_kwarg: str = "model_variant"
+    #: Dotted module (under llms/) whose `quant_contract()` owns the quant_*
+    #: column values for a non-bf16 plan; None for the bf16 drivers.
+    quant_contract_module: str | None = None
 
     @property
     def directory(self) -> Path:
         return _LLMS / self.model_id
+
+    def session_model_kwargs(self) -> dict:
+        if self.session_model_kwarg == "model_path":
+            return {"model_path": self.hf_id}
+        return {"model_variant": self.model_variant}
 
 
 MODELS: dict[str, ModelBinding] = {
@@ -125,6 +142,16 @@ MODELS: dict[str, ModelBinding] = {
     "llama32_1b": ModelBinding(
         "llama32_1b", "llama32_1b", LLAMA32_1B, "meta-llama/Llama-3.2-1B-Instruct", "instruct",
         "llama32_1b.verify_adapter", prefill_prompt_len_kwarg=True,
+    ),
+    # `[2026-08-26]` doc 56 H2a (queue item 17): the EXISTING int4 driver bound
+    # like the bf16 models -- bf16 NPU prefill on dequantized AWQ weights +
+    # int4 NPU decode, one binding row, no fork.
+    "llama32_1b_int4": ModelBinding(
+        "llama32_1b_int4", "llama32_1b_int4", LLAMA32_1B_INT4,
+        "amd/Llama-3.2-1B-Instruct-awq-uint4-asym-g128-bf16-lmhead", "instruct",
+        "llama32_1b_int4.verify_adapter", prefill_prompt_len_kwarg=True,
+        precision_plans=("w4_decode",), session_model_kwarg="model_path",
+        quant_contract_module="llama32_1b_int4.awq_repacker",
     ),
 }
 
@@ -270,6 +297,24 @@ def plan_launches_match_manifest(plan_, launch_counts: dict[str, dict]) -> list[
                 f"manifest says {counts['air_launches']}"
             )
     return problems
+
+
+def quant_columns(model_id: str, precision_plan: str) -> dict:
+    """`[2026-08-26]` doc 56 H2a: the schema's quant_* column values for a row
+    measured under `precision_plan` -- EMPTY for bf16 (doc 03: the columns are
+    present and empty), populated for w4_decode from the model's OWN packing
+    module (`binding.quant_contract_module`.quant_contract), never hand-typed
+    in the study. The group size is parsed from the checkpoint id (…-g128-…)
+    and cross-checked against the loader's default by the contract owner."""
+    b = MODELS[model_id]
+    if precision_plan == "bf16" or not b.quant_contract_module:
+        return {}
+    import importlib
+    import re
+
+    m = re.search(r"-g(\d+)-", b.hf_id)
+    mod = importlib.import_module(b.quant_contract_module)
+    return mod.quant_contract(int(m.group(1)) if m else None)
 
 
 def weights_source(hf_id: str) -> str:
@@ -464,11 +509,11 @@ class ModelAdapter:
         """
         if model != self.binding.model_id:
             raise ValueError(f"adapter is bound to {self.binding.model_id!r}, asked to prepare {model!r}")
-        if precision_plan not in SUPPORTED_PRECISION_PLANS:
+        if precision_plan not in self.binding.precision_plans:
             raise ValueError(
-                f"precision_plan {precision_plan!r} is not implemented by the {model} bf16 driver "
-                f"(it implements {list(SUPPORTED_PRECISION_PLANS)}; w4_decode is the int4 sibling driver, "
-                "doc 56 H2a) -- a derived skip, not a failure"
+                f"precision_plan {precision_plan!r} is not implemented by the {model} driver "
+                f"(it implements {list(self.binding.precision_plans)}; a plan is a driver, not a flag: "
+                "w4_decode is the int4 sibling driver, doc 56 H2a) -- a derived skip, not a failure"
             )
         if self.ms is not None:
             raise RuntimeError("prepare() twice in one process: the drivers' prepare_runtime is one-shot")
@@ -509,7 +554,7 @@ class ModelAdapter:
         session = driver.Session(
             config=config, seq_len=M, weights=weights, tokenizer=tokenizer,
             prefill_cache=prefill_cache, decode_cache=decode_cache,
-            rope_lut_bf16=rope_lut, model_variant=self.binding.model_variant,
+            rope_lut_bf16=rope_lut, **self.binding.session_model_kwargs(),
         )
         self.ms = ModelSession(
             binding=self.binding, driver=driver, session=session, prefill_M=M,

@@ -348,6 +348,7 @@ def run_npu_prefill(
     max_seq,
     tokenizer,
     cpu_attn=True,
+    profile=False,  # accepted for the adapter seam, unused (as in the bf16 sibling)
     quiet=False,
     prompt_len=None,
 ):
@@ -382,7 +383,7 @@ def run_npu_prefill(
             cpu_attn=cpu_attn,
             verbose=False,
         )
-        with prefill_cache.profiler.time_cpu("kv_cache_extract"):
+        with prefill_cache.profiler.time_cpu("kv_append"):  # the plan's stage name (was kv_cache_extract)
             k_roped = intermediates["k_roped"]
             v_raw = intermediates["v"]
             k_cache[layer_idx, :, :seq_len, :] = (

@@ -261,6 +261,20 @@ PROFILES = {
         decode_ctxs=(),
         ubatch_points=(("qwen3_0_6b", 1024, 512), ("qwen3_0_6b", 1024, 1024)),
     ),
+    "w4-decode": ModelProfile(
+        name="w4-decode",
+        description=(
+            "doc 56 H2a (queue item 17): the EXISTING llama32_1b_int4 decode -- bf16 NPU "
+            "prefill on dequantized AWQ weights + int4 NPU decode, the shipped build_peano "
+            "caches -- under the study's decomposition: decode at ctx 512/1024/2048 on the "
+            "shipped M=2048 artifact set, precision_plan_id=w4_decode, quant_* populated "
+            "from the packing code, the prediction written before the walk"
+        ),
+        models=("llama32_1b_int4",),
+        prefill_Ms={"llama32_1b_int4": ()},
+        decode_ctxs=(512, 1024, 2048),
+        precision_plan="w4_decode",
+    ),
     "model-smoke": ModelProfile(
         name="model-smoke",
         description=(

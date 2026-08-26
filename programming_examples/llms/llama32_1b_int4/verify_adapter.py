@@ -230,26 +230,64 @@ class Int4NpuRunner:
         # `make profile` compile into) so verify/diagnosis and run/profile
         # share one per-model cache. Absolute path (anchored to _THIS_DIR)
         # keeps it per-model — no cross-model contamination regardless of CWD.
+        # `[2026-08-26]` THE TIMED ARTIFACT SET (doc 56 H2a; the H1a review's
+        # finding 1, as the bf16 adapters since 08-23). When
+        # LLMS_VERIFY_PREFILL_CACHE / LLMS_VERIFY_DECODE_CACHE name cache
+        # directories, this gate LOADS them (manifest, no compile) so the ELF
+        # bytes it verifies are the bytes the model study timed;
+        # LLMS_VERIFY_PREFILL_M is the M those prefill ELFs were compiled for
+        # (the pad target), which `max_seq` — the KV / RoPE capacity — may
+        # exceed by the gate's 32 generation slots. Unset, the production
+        # `make verify` path is what it was: compile, pad to max_seq.
+        _prefill_dir = os.environ.get("LLMS_VERIFY_PREFILL_CACHE")
+        _decode_dir = os.environ.get("LLMS_VERIFY_DECODE_CACHE")
+        self.prefill_M = int(os.environ.get("LLMS_VERIFY_PREFILL_M") or max_seq)
+        if self.prefill_M > max_seq:
+            raise ValueError(
+                f"LLMS_VERIFY_PREFILL_M {self.prefill_M} exceeds max_seq {max_seq}"
+            )
         _cache_root = _THIS_DIR / "build_peano"
         self.prefill_cache = KernelCache(
-            str(_cache_root / "prefill_kernel_cache"), verbose=False
+            _prefill_dir or str(_cache_root / "prefill_kernel_cache"), verbose=False
         )
-        with _multi_launch_dir(str(_LLAMA_BF16)):
-            compile_prefill_kernels(
-                self.prefill_cache, config, seq_len=max_seq, cpu_attn=self.cpu_attn
-            )
+        if _prefill_dir:
+            if not self.prefill_cache.load_manifest():
+                raise RuntimeError(
+                    f"LLMS_VERIFY_PREFILL_CACHE {_prefill_dir}: no loadable manifest"
+                )
+        else:
+            with _multi_launch_dir(str(_LLAMA_BF16)):
+                compile_prefill_kernels(
+                    self.prefill_cache, config, seq_len=max_seq, cpu_attn=self.cpu_attn
+                )
         self.decode_cache = KernelCache(
-            str(_cache_root / "decode_kernel_cache"), verbose=False
+            _decode_dir or str(_cache_root / "decode_kernel_cache"), verbose=False
         )
-        with _multi_launch_dir(str(_THIS_DIR)):
-            compile_decode_kernels(self.decode_cache, config)
+        if _decode_dir:
+            if not self.decode_cache.load_manifest():
+                raise RuntimeError(
+                    f"LLMS_VERIFY_DECODE_CACHE {_decode_dir}: no loadable manifest"
+                )
+        else:
+            with _multi_launch_dir(str(_THIS_DIR)):
+                compile_decode_kernels(self.decode_cache, config)
+        self.loaded_artifacts = {
+            name: art.output_binary
+            for cache in (self.prefill_cache, self.decode_cache)
+            for name, art in cache.artifacts.items()
+        }
+        print(
+            f"[verify-adapter] artifact set: prefill_M={self.prefill_M} max_seq={max_seq} "
+            f"{'LOADED' if _prefill_dir or _decode_dir else 'compiled'}: "
+            f"{sorted(self.loaded_artifacts.values())}"
+        )
 
         prepare_runtime(
             self.prefill_cache,
             self.decode_cache,
             weights,
             config,
-            max_seq,
+            self.prefill_M,
             self.rope_lut_bf16,
         )
 
@@ -257,14 +295,14 @@ class Int4NpuRunner:
         self.v_cache = None
 
     def prefill(self, prompt_tokens: np.ndarray) -> PrefillRecord:
-        # Pad to max_seq (mirrors run_once in production driver). int4
-        # production driver uses the same shape so the test path is
-        # identical to make run.
+        # Pad to the compiled prefill M (mirrors run_once in the production
+        # driver; == max_seq on the production path, decoupled when the study
+        # hands a loaded artifact set via LLMS_VERIFY_PREFILL_M).
         eos = self._tokenizer.eos_token_id
-        if len(prompt_tokens) < self.max_seq:
-            padded = list(prompt_tokens) + [eos] * (self.max_seq - len(prompt_tokens))
+        if len(prompt_tokens) < self.prefill_M:
+            padded = list(prompt_tokens) + [eos] * (self.prefill_M - len(prompt_tokens))
         else:
-            padded = list(prompt_tokens)[: self.max_seq]
+            padded = list(prompt_tokens)[: self.prefill_M]
         prefill_token, logits_row, k_cache, v_cache, prompt_len = run_npu_prefill(
             padded,
             self.weights,

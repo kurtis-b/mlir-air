@@ -213,9 +213,15 @@ def weights_only_gflops(model_id: str, tokens: int, seconds: float) -> float | N
     return (2.0 * total * tokens / seconds) / 1e9 if seconds > 0 else None
 
 
-def measured_row(rung, study_id: str, result: dict, plan_hash: str, extras: dict) -> dict:
-    """A complete row from a worker's measurement dict (see `worker`)."""
+def measured_row(rung, study_id: str, result: dict, plan_hash: str, extras: dict, quant: dict | None = None) -> dict:
+    """A complete row from a worker's measurement dict (see `worker`). `quant`
+    `[2026-08-26]` (doc 56 H2a): the model's quant_* column values under the
+    rung's precision plan (`model_adapter.quant_columns` -- read from the
+    packing code, empty for bf16); only keys that ARE schema columns land on
+    the row (the contract dict may carry extra keys for the plan's use)."""
     row = _base_row(rung, study_id, result["weights_source"])
+    if quant:
+        row.update({k: v for k, v in quant.items() if k in row})
     samples = result["samples_s"]
     n = len(samples)
     total = float(sum(samples))
@@ -340,6 +346,7 @@ def worker(args) -> int:
     note_path = ms.prefill_cache_dir / model_adapter.COMPILE_NOTE
     deviation = json.loads(note_path.read_text(encoding="utf-8")).get("artifact_deviation") if note_path.is_file() else None
     forced = model_adapter.forced_methods_of(deviation)
+    quant = model_adapter.quant_columns(model_id, spec["precision_plan"])
     work_dir = Path(args.out).parent
 
     prompt_cache: dict[int, str] = {}
@@ -440,7 +447,7 @@ def worker(args) -> int:
                 "predicted_vector": predicted,
                 "trace_file": str(trace_path),
             }
-            row = measured_row(rung, spec["study_id"], result, plan_.sha, extras)
+            row = measured_row(rung, spec["study_id"], result, plan_.sha, extras, quant=quant)
             if deviation:
                 row["study_case_label"] += f" [ARTIFACT DEVIATES FROM PLAN: o_ffn GEMMs forced {deviation['o_ffn_gemm_method']}]"
             out["rows"].append(row)

@@ -135,6 +135,36 @@ def test_summary_is_json_and_names_every_rung():
         assert r.case_id in text
 
 
+def test_w4_decode_is_the_h2a_row_of_doc_56():
+    """`[2026-08-26]` Queue item 17: three decode rungs of the EXISTING int4
+    driver at ctx 512/1024/2048 on the shipped M=2048 set, precision_plan_id
+    w4_decode on every row, decode-context labels, one CSV; the shipped
+    build_peano caches are the artifact set (discover_compiled's convention),
+    and an unbound profile is three skips, not a shrunken walk."""
+    prof = mp.profile("w4-decode")
+    assert prof.models == ("llama32_1b_int4",)
+    assert prof.prefill_Ms == {"llama32_1b_int4": ()}
+    assert prof.decode_ctxs == (512, 1024, 2048)
+    assert prof.precision_plan == "w4_decode"
+    rungs = prof.rungs()
+    assert len(rungs) == 3 and all(r.phase == "decode" and r.curve == mp.DECODE_CONTEXT for r in rungs)
+    assert [r.case_id for r in rungs] == [
+        f"llama32_1b_int4/decode/M2048/ctx{c}/w4_decode" for c in (512, 1024, 2048)]
+    assert all(r.precision_plan == "w4_decode" and r.M == mp.SHIPPED_PREFILL_M for r in rungs)
+    assert all(r.skip_reason and "no compiled prefill artifact set" in r.skip_reason for r in rungs)
+    assert prof.expected_files() == ["model_llama32_1b_int4.csv"]
+    bound = prof.bind({("llama32_1b_int4", 2048): {"prefill_cache": "/c/p", "decode_cache": "/c/d"}})
+    assert all(r.skip_reason is None for r in bound.rungs())
+    assert bound.artifact_sets() == [("llama32_1b_int4", 2048)]
+    assert bound.expected_rows() == {"model_llama32_1b_int4.csv": {"rows": 3, "measured": 3, "skipped": 0}}
+    # resume identity: three decode rungs at seq 1 are three keys, distinct
+    # from the bf16 llama rungs at the same contexts by the model AND plan.
+    keys = {resume.rung_key(r.mode, r.seq, r.extra) for r in bound.rungs()}
+    assert len(keys) == 3
+    bf16 = {resume.rung_key(r.mode, r.seq, r.extra) for r in mp.profile("model-smoke").rungs() if r.phase == "decode"}
+    assert not keys & bf16
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

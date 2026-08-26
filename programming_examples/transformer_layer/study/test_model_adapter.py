@@ -45,6 +45,12 @@ PINNED_MANIFESTS = {
         "prefill": {"rms_gemms_rope": (7, 13), "o_ffn": (12, 20), "flash_attn": (1, 1)},
         "decode": {"rms_gemv_rope": (6, 6), "o_gemv_ffn": (3, 5), "lm_head_gemv": (8, 8)},
     },
+    # `[2026-08-26]` doc 56 H2a: the shipped int4 sibling caches (build_peano,
+    # ELFs of 2026-08-19). bf16 prefill on dequantized AWQ weights; int4 decode.
+    "llama32_1b_int4": {
+        "prefill": {"rms_gemms_rope": (7, 13), "o_ffn": (12, 20), "flash_attn": (1, 1)},
+        "decode": {"rms_qkv_int4_rope": (6, 6), "o_gemv_ffn_int4": (3, 5), "lm_head_gemv": (8, 8)},
+    },
 }
 
 #: The Qwen3-0.6B M=1024 prefill set (devq 570): the registry-driven QKV stage is
@@ -92,8 +98,8 @@ def _traces():
     return out
 
 
-def test_models_bind_both_drivers_and_nothing_else():
-    assert sorted(ma.MODELS) == ["llama32_1b", "qwen3_0_6b"]
+def test_models_bind_the_three_drivers_and_nothing_else():
+    assert sorted(ma.MODELS) == ["llama32_1b", "llama32_1b_int4", "qwen3_0_6b"]
     for model_id, b in ma.MODELS.items():
         assert b.spec.name == model_id
         assert b.directory.is_dir(), b.directory
@@ -101,6 +107,14 @@ def test_models_bind_both_drivers_and_nothing_else():
         assert (b.directory / "verify_adapter.py").is_file()
         assert b.verify_adapter == f"{model_id}.verify_adapter"
     assert ma.SUPPORTED_PRECISION_PLANS == ("bf16",)
+    # a precision plan is a DRIVER, not a flag (doc 56 sections 3.5 / H2a):
+    assert ma.MODELS["qwen3_0_6b"].precision_plans == ("bf16",)
+    assert ma.MODELS["llama32_1b"].precision_plans == ("bf16",)
+    b4 = ma.MODELS["llama32_1b_int4"]
+    assert b4.precision_plans == ("w4_decode",)
+    assert b4.session_model_kwargs() == {"model_path": b4.hf_id}
+    assert ma.MODELS["llama32_1b"].session_model_kwargs() == {"model_variant": "instruct"}
+    assert b4.quant_contract_module == "llama32_1b_int4.awq_repacker"
 
 
 def test_plan_for_is_value_identity_and_64_hex():
@@ -218,6 +232,9 @@ def test_prepare_refuses_before_touching_a_driver():
     _raises(KeyError, "unknown model", ma.ModelAdapter, "qwen3_4b")
     _raises(ValueError, "bound to", a.prepare, "llama32_1b", "bf16", {})
     _raises(ValueError, "derived skip", a.prepare, "qwen3_0_6b", "w4_decode", {})
+    # ... and the int4 driver is w4_decode-ONLY: asking it for bf16 is the
+    # same derived skip in the other direction (doc 56 H2a).
+    _raises(ValueError, "derived skip", ma.ModelAdapter("llama32_1b_int4").prepare, "llama32_1b_int4", "bf16", {})
     with tempfile.TemporaryDirectory() as d:
         _raises(FileNotFoundError, "never compiles", a.prepare, "qwen3_0_6b", "bf16",
                 {"prefill_M": 512, "prefill_cache": d, "decode_cache": d})
@@ -448,6 +465,117 @@ def test_a_forced_artifact_sets_recorded_deviation_reaches_the_restore():
     assert "method=o_ffn_gemm_method" in ast.unparse(restore)
     va = (Path(_PE) / "llms" / "qwen3_0_6b" / "verify_adapter.py").read_text(encoding="utf-8")
     assert "artifact_deviation" in va and "o_ffn_gemm_method" in va
+
+
+# ---------------------------------------------------------------------------
+# `[2026-08-26]` Queue item 17 (doc 56 H2a): the int4 sibling under the runner.
+# ---------------------------------------------------------------------------
+
+
+def test_the_w4_decode_plan_matches_the_shipped_int4_manifest():
+    """The w4_decode decode plan names the SHIPPED int4 ELF sequence with its
+    launch counts (rms_qkv_int4_rope 6 / o_gemv_ffn_int4 3 / lm_head_gemv 8:
+    33 submissions, 152 executed launches, 184 herd launches per token -- doc
+    57 section 1.3's counts), its host stages are exactly the driver's named
+    buckets (34 host ops), and the w4_decode PREFILL plan is the bf16 prefill
+    (dequantized AWQ weights through the bf16 stitchers -- doc 56 section
+    3.5's 'bf16 prefill weights resident separately')."""
+    counts, source = _launch_counts("llama32_1b_int4")
+    p = ma.plan_for("llama32_1b_int4", "decode", 1, 512, 2048, "w4_decode")
+    assert p.elf_sequence() == ["rms_qkv_int4_rope", "o_gemv_ffn_int4", "lm_head_gemv"]
+    assert ma.plan_launches_match_manifest(p, counts) == [], source
+    vec = ma.model_dispatch_vector_from_manifest(p, counts, "decode")
+    assert (vec["host_submissions"], vec["air_launches"], vec["herd_launches"]) == (33, 152, 184), (source, vec)
+    assert p.host_sequence() == ["embed_lookup", "kv_append", "decode_attention_cpu", "final_rms_norm"]
+    assert p.total_host_ops == 34
+    schema.validate_model_dispatch_vector(vec)
+    # the int4 stages carry less than a quarter of the bf16 weight bytes
+    bf16_llama = ma.plan_for("llama32_1b", "decode", 1, 512)
+    assert p.resident_weight_bytes < bf16_llama.resident_weight_bytes * 0.45, (
+        p.resident_weight_bytes, bf16_llama.resident_weight_bytes)
+    # value identity: the precision plan and the spec are both in the hash
+    assert p.sha != bf16_llama.sha
+    assert p.sha != ma.plan_for("llama32_1b_int4", "decode", 1, 1024, 2048, "w4_decode").sha
+    # prefill under w4_decode is the bf16 kernel sequence, matching the shipped prefill cache
+    pp = ma.plan_for("llama32_1b_int4", "prefill", 2048, 2048, 2048, "w4_decode")
+    assert pp.elf_sequence() == ["rms_gemms_rope", "flash_attn", "o_ffn", "lm_head_gemv"]
+    assert ma.plan_launches_match_manifest(pp, counts) == [], source
+    # NEGATIVE control: a bf16-precision decode plan against the int4 manifest
+    # names rms_gemv_rope / o_gemv_ffn, and the mismatch is REPORTED, not
+    # silently absorbed -- precision changes the artifact names.
+    pb = ma.plan_for("llama32_1b_int4", "decode", 1, 512, 2048, "bf16")
+    problems = ma.plan_launches_match_manifest(pb, counts)
+    assert any("rms_gemv_rope" in x for x in problems), problems
+
+
+def test_the_quant_columns_come_from_the_packing_code_and_differ_by_path():
+    """quant_* for a w4_decode row are read from the model's packing module
+    (awq_repacker.quant_contract), never hand-typed in the study: gs parsed
+    from the checkpoint id AND equal to the loader's own default (read by
+    ast), the GEMM and GEMV contracts DIFFERENT (doc 56 section 3.6: the
+    columns are populated, not duplicated), the accumulator pinned against
+    the kernel source. bf16 rows get EMPTY quant columns. The plan's stage
+    contract NAME equals the packing code's (the fa_cache_name pattern)."""
+    q = ma.quant_columns("llama32_1b_int4", "w4_decode")
+    assert q["quant_group_size"] == 128
+    import importlib
+
+    qc = importlib.import_module("llama32_1b_int4.awq_repacker").quant_contract()
+    assert qc == q, "the study's columns must BE the packing module's contract"
+    assert q["quant_gemm_contract"] != q["quant_gemv_contract"]
+    assert "dequant_to_bf16" in q["quant_gemm_contract"]
+    assert "in-kernel" in q["quant_gemv_contract"]
+    assert "accfloat" in q["quant_accum_type"]
+    # schema columns only, plus the plan-facing name key
+    quant_fields = {f for f in schema.empty_row("results") if f.startswith("quant_")}
+    assert set(q) - {"quant_gemv_contract_name"} == quant_fields, sorted(q)
+    # the plan mirrors the NAME without importing the model dir
+    from shared.plan import W4_GEMV_CONTRACT
+
+    assert W4_GEMV_CONTRACT == q["quant_gemv_contract_name"]
+    p = ma.plan_for("llama32_1b_int4", "decode", 1, 512, 2048, "w4_decode")
+    for stage in p.stages:
+        if stage.name in ("rms_qkv_int4_rope", "o_gemv_ffn_int4"):
+            assert any(W4_GEMV_CONTRACT in why for _op, _n, why in stage.launch_breakdown), stage.name
+    # bf16 rows: empty (doc 03 -- present and empty)
+    assert ma.quant_columns("llama32_1b", "bf16") == {}
+    assert ma.quant_columns("qwen3_0_6b", "bf16") == {}
+    # a qk-norm model has no w4_decode plan until H2b builds its candidates
+    _raises(ValueError, "H2b", ma.plan_for, "qwen3_0_6b", "decode", 1, 512, 2048, "w4_decode")
+
+
+def test_the_int4_driver_buckets_every_planned_host_stage():
+    """By source (ast), as the qwen scratch-layout hops are pinned: the int4
+    decode block buckets kv_append and decode_attention_cpu, the decode step
+    buckets final_rms_norm (embed_lookup is the adapter's bucket), the prefill
+    loop uses the plan's kv_append name (not the old kv_cache_extract), the
+    prefill entry accepts the seam's profile= kwarg, and the verify adapter
+    has the loaded-cache hop (LLMS_VERIFY_*: the gate runs on the timed bytes,
+    never compiles on that path)."""
+    import ast
+
+    d = Path(_PE) / "llms" / "llama32_1b_int4"
+    dec = (d / "llama32_1b_int4_decode.py").read_text(encoding="utf-8")
+    fns = {n.name: n for n in ast.walk(ast.parse(dec)) if isinstance(n, ast.FunctionDef)}
+    block = ast.unparse(fns["run_decode_block"])
+    assert "time_cpu('kv_append')" in block and "time_cpu('decode_attention_cpu')" in block
+    inf = (d / "llama32_1b_int4_inference.py").read_text(encoding="utf-8")
+    assert "time_cpu('kv_cache_extract')" not in ast.unparse(ast.parse(inf)), \
+        "the prefill bucket must carry the plan's stage name (kv_append)"
+    fns_i = {n.name: n for n in ast.walk(ast.parse(inf)) if isinstance(n, ast.FunctionDef)}
+    assert "time_cpu('final_rms_norm')" in ast.unparse(fns_i["run_npu_decode_step"])
+    prefill_fn = fns_i["run_npu_prefill"]
+    assert "profile" in [a.arg for a in prefill_fn.args.args], "the adapter passes profile="
+    assert "time_cpu('kv_append')" in ast.unparse(prefill_fn)
+    # the driver Session takes model_path -- exactly what the binding declares
+    sessions = [n for n in ast.walk(ast.parse(inf)) if isinstance(n, ast.ClassDef) and n.name == "Session"]
+    assert "model_path" in ast.unparse(sessions[0])
+    # weights module presents the seam surface (load_weights / generate_rope_lut)
+    w = (d / "llama32_1b_int4_weights.py").read_text(encoding="utf-8")
+    assert "load_weights = load_weights_awq" in w and "generate_rope_lut" in w
+    va = (d / "verify_adapter.py").read_text(encoding="utf-8")
+    for needle in ("LLMS_VERIFY_PREFILL_CACHE", "LLMS_VERIFY_DECODE_CACHE", "LLMS_VERIFY_PREFILL_M", "load_manifest"):
+        assert needle in va, needle
 
 
 def main():

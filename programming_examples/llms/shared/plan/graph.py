@@ -229,3 +229,17 @@ LLAMA32_1B = ModelSpec(
     n_kv_heads=8, head_dim=64, hidden_dim=8192, vocab_size=128256, qk_norm=False, tied_embeddings=True,
     rope_theta=500_000.0, eps=1e-5, lm_head_rows_per_launch=16384,    # lm_head_gemv_multi default n_part
 )
+# `[2026-08-26]` doc 56 H2a (queue item 17): the int4 sibling. Same architecture
+# as LLAMA32_1B; what differs is the checkpoint (AMD's AWQ uint4 asym gs=128,
+# bf16 lm_head) and the precision plan the driver ships (`w4_decode`: int4
+# storage for the decode GEMVs, bf16 compute/accumulate, bf16 prefill weights
+# resident separately -- doc 56 section 3.5). `weight_dtype` stays bf16: it is
+# the GRAPH's storage default (embed / norms / lm_head / the dequant prefill
+# copy ARE bf16); the decode stages' int4 storage is the w4_decode plan's,
+# expressed in `fuse` (plan.py), not a per-tensor rewrite H2b will do properly.
+LLAMA32_1B_INT4 = ModelSpec(
+    name="llama32_1b_int4", hf_id="amd/Llama-3.2-1B-Instruct-awq-uint4-asym-g128-bf16-lmhead",
+    n_layers=16, emb_dim=2048, n_heads=32, n_kv_heads=8, head_dim=64, hidden_dim=8192,
+    vocab_size=128256, qk_norm=False, tied_embeddings=True, rope_theta=500_000.0, eps=1e-5,
+    lm_head_rows_per_launch=16384,    # the driver's _LM_N_PART (8 x 16384, bf16 head)
+)

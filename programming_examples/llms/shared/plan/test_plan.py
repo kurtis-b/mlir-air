@@ -150,6 +150,44 @@ def test_ubatch_prefill_composition():
         assert "whole number" in str(e)
 
 
+def test_w4_decode_names_the_shipped_int4_decode_stages():
+    """`[2026-08-26]` doc 56 H2a (queue item 17): the w4_decode decode plan is
+    the SHIPPED llama32_1b_int4 sequence -- rms_qkv_int4_rope 6 launches /
+    o_gemv_ffn_int4 3 / lm_head_gemv 8 (33 submissions, 152 launches, 34 host
+    ops per token, doc 57 section 1.3), the int4 GEMV whys naming the quant
+    contract (`W4_GEMV_CONTRACT`, mirrored from awq_repacker.quant_contract --
+    the fa_cache_name pattern), weight_bytes at int4 nibbles; the same
+    workload at bf16 keeps the bf16 names and a different sha; prefill under
+    w4_decode is the bf16 prefill plan (dequantized weights, section 3.5); a
+    qk-norm model's w4_decode is refused until H2b builds its candidates."""
+    from shared.plan import LLAMA32_1B_INT4, W4_GEMV_CONTRACT
+    g = decoder_graph(LLAMA32_1B_INT4)
+    p = plan(g, Workload("decode", 1, 512, 2048, "w4_decode"))
+    assert p.elf_sequence() == ["rms_qkv_int4_rope", "o_gemv_ffn_int4", "lm_head_gemv"]
+    assert [s.launches for s in p.stages if s.where == "device"] == [6, 3, 8]
+    assert p.host_sequence() == ["embed_lookup", "kv_append", "decode_attention_cpu", "final_rms_norm"]
+    assert (p.total_submissions, p.total_launches, p.total_host_ops) == (33, 152, 34)
+    for s in p.stages:
+        if s.name in ("rms_qkv_int4_rope", "o_gemv_ffn_int4"):
+            assert any(W4_GEMV_CONTRACT in why for _op, _n, why in s.launch_breakdown), s.name
+            assert "int4 nibbles" in s.note
+    pb = plan(g, Workload("decode", 1, 512, 2048, "bf16"))
+    assert pb.elf_sequence() == ["rms_gemv_rope", "o_gemv_ffn", "lm_head_gemv"]
+    assert pb.sha != p.sha
+    # int4 storage: under a quarter of the bf16 stage bytes plus the bf16 head
+    assert p.resident_weight_bytes < pb.resident_weight_bytes
+    head = [s for s in p.stages if s.name == "lm_head_gemv"][0]
+    assert p.resident_weight_bytes - head.weight_bytes < (pb.resident_weight_bytes - head.weight_bytes) * 0.27
+    pp = plan(g, Workload("prefill", 2048, 2048, 2048, "w4_decode"))
+    assert pp.elf_sequence() == ["rms_gemms_rope", "flash_attn", "o_ffn", "lm_head_gemv"]
+    try:
+        plan(decoder_graph(QWEN3_0_6B), Workload("decode", 1, 512, 2048, "w4_decode"))
+    except ValueError as e:
+        assert "H2b" in str(e)
+    else:
+        raise AssertionError("a qk-norm w4_decode plan must be refused until H2b")
+
+
 def test_non_lean_form_splits_o_ffn():
     """A model outside the lean bounds gets the split O+FFN forms (qwen25_0_5b's shape: hidden 4864)."""
     from shared.plan.graph import ModelSpec

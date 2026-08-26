@@ -10,8 +10,9 @@ The bf16 path is the recommended one for prefill today; the int4 prefill
 path is preserved for its kernel work. End-to-end inference
 (`llama32_1b_int4_inference.py`, `make run-inference` / `make chat`) runs
 bf16 NPU prefill on dequantized AWQ weights followed by **int4 NPU decode**
-(`rms_qkv_int4_rope` + `o_gemv_ffn_int4` ELFs), ~56 ms/token (17.8 tok/s)
-on NPU2 per the Makefile header.
+(`rms_qkv_int4_rope` + `o_gemv_ffn_int4` ELFs), 68–89 ms/token by context
+(14.7 / 13.6 / 11.2 tok/s at ctx 512/1024/2048; Turbo recorded, devq 610,
+doc 56 §4 H2a).
 
 ## Performance
 
@@ -34,10 +35,17 @@ kernel:
 
 Decode streams int4 weights (a 4× narrower payload than bf16 before
 scales/zero-points); the int4 decode driver is `llama32_1b_int4_decode.py`,
-wired by `llama32_1b_int4_inference.py`, and measures ~56 ms/token (17.8
-tok/s) against the bf16 sibling's 12.2 tok/s — 1.46×, not the ~4× the byte
-ratio alone would predict; attributing the rest is an open item
-(docs/plans/transformer-layer-execution-studies/56 §4 H2a).
+wired by `llama32_1b_int4_inference.py`. Measured under the study runner
+(Turbo recorded, the forward-pass clock; doc 56 §4 H2a, 2026-08-26, devq
+609/610): **68.2 / 73.6 / 89.2 ms/token at context 512/1024/2048** (14.7 /
+13.6 / 11.2 tok/s) against the bf16 sibling's 92.0 / 98.6 / 112.5 —
+1.35×/1.34×/1.26×, not the ~4× the byte ratio alone would predict. The
+attribution (doc 56 §4 H2a): the device's ~57 ms is a 25.7 ms weight-stream
+floor + 16.3 ms of launch boundaries (152 × 107 µs) + ~15.5 ms of
+dequant-bound GEMV time, nearly all in the `o_gemv_ffn_int4` line (14.5 GB/s
+effective vs the machine's 40.8); host attention (7.5 → 25.5 ms by context)
+rides on top. The earlier "~56 ms/token (17.8 tok/s)" here was the June
+header — pmode-unrecorded, no artifact in tree.
 
 ## Prerequisites
 

@@ -45,8 +45,13 @@
 // runner's live checks enforce (169 submissions / 171 host ops at 2 x 512),
 // hashes as its own identity, degenerates to the whole plan at one chunk,
 // and refuses a partial chunk (no padding path).
+// `[2026-08-26]` 11 -> 12, queue item 17 (doc 56 H2a): the w4_decode decode
+// plan names the SHIPPED int4 sequence (rms_qkv_int4_rope 6 / o_gemv_ffn_int4
+// 3 / lm_head_gemv 8 -- 33 submissions, 152 launches, 34 host ops per token)
+// with the quant contract named per int4 GEMV, hashes apart from bf16, keeps
+// prefill bf16 (dequantized weights), and refuses a qk-norm model until H2b.
 // RUN: python3 %S/../llms/shared/plan/test_plan.py | FileCheck %s --check-prefix=PLAN
-// PLAN: 11/11 passed
+// PLAN: 12/12 passed
 //
 // `[2026-08-23]` Doc 57 O1 second half: the Qwen3 QKV stage's two host ABIs --
 // the driver's argument helper follows QWEN3_RMS_QKV_LAUNCHES, the 2-launch

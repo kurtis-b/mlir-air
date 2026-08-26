@@ -261,7 +261,7 @@ is `passed` only if the gate passed under the same plan hash. Study runs default
 | **H0 — planner, host-only, two models** — **DONE 2026-08-21**, see below | `llms/shared/plan/`: `ModelGraph` + golden JSON for Qwen3-0.6B and Llama-3.2-1B, `DeviceCaps`, candidate providers over the lifted bounds, placement, solver with registry override and `analytical_unmeasured` marking, fusion/residency/dispatch grouping, `Plan` hash. | Host suite: the plan for each of the two models **reproduces its hand-built ELF sequence and NPU/CPU split**; every study skip in `profiles.skip_reason` is reproduced by `placement`; solver vs registry on the 36 swept shapes, mismatches explained by a named bound. Pinned count moves and is verified red. Host tests cannot validate routing or ranking — that is H1/H4's job. |
 | **H1a — model adapter + runner, fixed shapes (S0)** | The adapter seam over the Qwen3-0.6B and Llama-1B drivers; `study/run_model.py`; schema v3; `model-smoke` profile; manifest / resume / `compare_roots` extended; artifacts keyed by plan hash; the kernel-scaling curve at `M ∈ {512, 1024, 2048}` and decode at `ctx ∈ {512, 1024, 2048}`. Six registry sweep rows for Qwen3-0.6B at `M = 512, 1024`. | Two walks, `complete: True`, `compare_roots OK`, verify PASS per plan hash, Turbo recorded, failures as complete rows. |
 | **H1b — valid ubatch prefill (S1)** | Incremental causal prefill for Qwen3-0.6B: chunk-outer / layer-inner, per-layer KV append, rectangular head-first FA at `(512, 512)`, `(512, 1024)`, `(1024, 1024)` (or the run-time trip count), masked tail; EOS padding gone. | **The two-point ubatch curve** (§5): same 1024-token prompt at ubatch 512 and 1024; verify PASS at both; TTFT and prefill-only tok/s reported separately. |
-| **H2a — decompose the existing int4 decode (S3.1)** | `llama32_1b_int4` decode under `run_model.py`: `device / sync / host` decomposition, dispatch vector, `quant_*` populated, a prediction written first. | The 56 ms token attributed: weight stream vs dequant vs dispatch vs host attention/glue. |
+| **H2a — decompose the existing int4 decode (S3.1)** — **DONE 2026-08-26**, see below | `llama32_1b_int4` decode under `run_model.py`: `device / sync / host` decomposition, dispatch vector, `quant_*` populated, a prediction written first. | The 56 ms token attributed: weight stream vs dequant vs dispatch vs host attention/glue. |
 | **H2b — `w4_decode` for Qwen3-0.6B** | The planner's int4 GEMV candidates (head_dim 128, QK-norm) over the existing int4 builders. | verify PASS; decode tok/s against the prediction from H2a's attribution. |
 | **H3 — fewer submissions per token, staged** | (1) re-execute one decode projection artifact across layers; (2) aggregate the two projections per layer into one runlist; (3) aggregate all layers; (4) move KV update + attention on device (the `attn_decode_npu2` kernel generalized to head_dim 128 / GQA 2, device-owned KV layout, context-length parameterization); (5) glue + LM head. | Each step: dispatch vector shows the reduction; verify PASS; the re-execution gate shape (`fused_reexec_gate.py`) extended to N tokens. |
 | **H4 — prefill precision** | `w_bfp16_prefill` through the existing bfp16 GEMM; planner GEMM family gains the entry. | verify PASS; prefill tok/s vs `bf16` at the same ubatch. |
@@ -672,3 +672,98 @@ for two hours and was cancelled; no further findings were produced.
 **Not adopted**: nothing substantive — one wording point: Codex's "16 buffers is not
 established by `fit_op`" is true of the function but `HTP_OP_MAX_BUFS` is 16 at this sha
 (`htp-ops.h:112`), so the bound is stated with its constant.
+
+**`[2026-08-26]` H2a landed** (queue item 17; evidence `results/item17-h2a-20260826/`, local:
+`PREDICTION.md`, the re-execution check + log, the two walk roots, `compare_walk1_walk2.txt`,
+devq logs). The EXISTING int4 driver bound like the bf16 models — one `ModelBinding` row
+(`precision_plans=("w4_decode",)`, Session takes `model_path`, `quant_contract_module`), no fork:
+the seam-facing driver deltas are an alias (`load_weights = load_weights_awq`), a re-export
+(`generate_rope_lut`), the accepted `profile=` kwarg, and every planned host stage a named
+`time_cpu` bucket (`kv_append` in the decode block and the prefill loop — the item-15 shape).
+The verify adapter gained the bf16 adapters' loaded-cache hop (`LLMS_VERIFY_*`: the gate LOADS
+the timed bytes, never compiles on that path). **The plan side, minimal as briefed**: the
+`w4_decode` decode plan names the SHIPPED sequence — `rms_qkv_int4_rope` 6 launches /
+`o_gemv_ffn_int4` 3 / `lm_head_gemv` 8 (bf16 head), host `embed_lookup` + 16 × (`kv_append`,
+`decode_attention_cpu`) + `final_rms_norm` — **33 submissions / 152 launches / 34 host ops per
+token**, each int4 GEMV's why naming the quant contract (`W4_GEMV_CONTRACT`, mirroring
+`awq_repacker.quant_contract`'s name — the `fa_cache_name` pattern, host-test-pinned); prefill
+under `w4_decode` is the bf16 prefill plan (§3.5's dequantized-weights copy); a qk-norm model's
+`w4_decode` is refused until H2b. The `quant_*` columns are POPULATED from the packing code
+(`awq_repacker.quant_contract`: gs 128 read from the loader's own default by ast and the
+checkpoint id's `-g128-`; packing/scale/zero layouts beside the functions that implement them;
+the accumulator pinned against `mv_int4_bf16.cc`'s `accfloat`), and `quant_gemm_contract` ≠
+`quant_gemv_contract` on every row — prefill is host-dequant bf16 GEMMs, decode is in-kernel
+`(q−z)·s` — which is what the two columns were for (§3.5/§3.6). Host suite 685/685 in 31
+(+3 adapter, +1 profiles), seam PLAN 11 → **12/12**.
+
+**The prediction predates the measurement by file time**: `PREDICTION.md` written 01:04:01,
+first measure job (devq 608) submitted 01:16:47 (`job-000608.meta`). Its provenance finding
+first: the brief's "~56 ms/token (17.8 tok/s)" is the JUNE Makefile-header number (commit
+aa73c0d7), pmode-unrecorded, **no artifact in tree**; the Turbo-recorded baseline is doc 57
+§1.3 (devq 438/440: 64–66 ms at ~57-token context), and the prediction was stated against
+devq 440's per-kernel lines, not the June header.
+
+**Walks** (devq 609 walk 1 / 610 walk 2, the `w4-decode` profile on the SHIPPED build_peano
+caches — ELFs of 2026-08-19; Turbo before/after; `complete: True` both, 3/3 passed; verify
+**PASS** both walks, 3/3 prompts (480/992/2016 tokens, top-5 vs the AWQ-dequant-patched HF
+reference) on the LOADED timed bytes; `compare_roots` **VERDICT: OK**, 0 failures — 3 warnings,
+all from walk 1's host-attention transient below; `device_ms` drift med **0.9 %**). The
+dispatch vector measured = the plan's on every rung, live: 33 / 33 / 152 / 184, `host_ops` 34.
+
+| ctx (per token) | predicted (PREDICTION.md §2C) | walk 1 | **walk 2 (citable)** | tok/s w1 / w2 |
+|---|---|---|---|---|
+| 480 → 512 | 72–88 ms | 73.7 | **68.2** | 13.56 / **14.67** |
+| 992 → 1024 | 78–95 ms | 77.0 | **73.6** | 12.99 / **13.60** |
+| 2016 → 2048 | 90–107 ms | 102.0 | **89.2** | 9.80 / **11.21** |
+
+Walk 1's host attention (12.3 / 14.9 / 39.0 ms) is transient-inflated — its ctx-2048 max token
+read 505.7 ms while the min tokens agree across walks (85.3 vs 83.6) — the same class as item
+15's walk-5 qwen transient; walk 2's attention (7.5 / 13.0 / 25.5 ms) equals the bf16
+sibling's (7.7 / 14.2 / 25.6, walks 3/4), which is what the prediction asserted (same head
+geometry, same numpy code). Per-component, predicted → measured (walk 2 / walk 1 per call):
+
+| component | predicted | measured |
+|---|---|---|
+| `lm_head_gemv` (bf16, 536.9 MB padded) | 14.4–15.3 ms | 14.61–15.18 (36.6 GB/s incl. its 8 boundaries) |
+| `o_gemv_ffn_int4` (28.541 MB packed) | 2.0–2.6 ms | **1.96–1.99** — 2–3 % below the band's devq-440 edge: **14.4–14.6 GB/s**, not the head probe's 11 |
+| `rms_qkv_int4_rope` (3.293 MB packed) | 0.72–0.82 ms | **0.69–0.71** — 0.64 of it is its 6 boundaries |
+| device_ms / token | 59–70 ms | **56.9–58.1**, ctx-flat |
+| sync / kv_append+embed+final_norm | ~0.8 / ~0.3 | 0.7–0.9 / 0.11–0.12 |
+| untimed Python glue | 4–10 ms | 2.9–4.7 |
+
+**The attribution the gate asks for.** The token's 1046.2 MB of weights (52.7 qkv + 456.7
+o_ffn int4-packed + 536.9 bf16 head — exact packed-BO bytes, computed from the packers) at the
+machine's boundary-free 40.8 GB/s stream class would take **25.7 ms**; the device spends
+**~57.0**. The ~31 ms that is not weight stream is charged, not independently measured, so its
+split is a set of BOUNDS `[2026-08-26, per this commit's review]`: **16.3 ms of launch
+boundaries** (152 × 107 µs — 10.3 of it in the 16 QKV calls: that line is ~90 % boundary, 0.64
+of its 0.70 ms/call, its "4.7 GB/s" being boundary dilution, not dequant), **~4.8 ms of fixed
+submission cost** (33 `xrt.run`s × the §1.5 fit's 146 µs — inside `kernel_ms`, which times
+`run.start()+wait()`), and a **residual ≤ ~10.7 ms attributable to dequant, nearly all in the
+`o_gemv_ffn_int4` line** (per call 1.97 = 0.32 boundaries + 0.15 submission + 0.70
+stream-at-40.8 + **≤ 0.80 residual**; × 16 ≈ 12.8, with the bf16 head ~0.6; "dequant" is the
+residual after the charges, an upper bound — isolating it would need a dequant-free control
+kernel at the same shape, not run here). The closure to ~1 % is the charges summing to the
+measured device_ms, i.e. consistency of the charge set, not an independent confirmation of any
+single term. Host attention (7.5 → 25.5 ms, ctx) and ~3–5 ms of glue ride on top. Against the bf16 sibling (92.0 / 98.6 / 112.5 ms, walks 7/8):
+**1.35× / 1.34× / 1.26×** — not the 4× byte ratio, for exactly these two reasons; the June
+"56 ms / 17.8 tok/s" header is not reproducible under the study clock at any measured context
+(nearest point 68.2 ms at ctx 512; the short-context arithmetic lands at ~65 ms = devq 438's
+64). What H2b/H3 buy is now priced: a faster int4 GEMV (O4's prerequisite) is worth up to
+~10.7 ms/token here (the dequant residual bound), boundary removal up to 16.3 and submission
+reduction up to ~4.8, and all are device-side — the bf16 head
+(14.6 ms, 26 % of device_ms and 21.4 % of the walk-2 ctx-512 token) is the single largest line and O4's accuracy
+question is still unasked.
+
+**The re-execution check** (gate 5; devq 608): the shipped decode ELFs predate the 08-22
+parity fix and none is in doc 57 §1.5's family table, so the two-dispatch device check ran on
+the shipped bytes through the production `load_and_run` call sites (synthetic AWQ weights, f32
+dequant references). **The parity rule called all three, 3/3, predicted in PREDICTION.md §3
+before the run**: `lm_head_gemv` (8 loads, even) and `rms_qkv_int4_rope` (6, even) clean —
+d1 correct, d2/d3 back-to-back and d4 byte-equal; `o_gemv_ffn_int4` (**3 loads, ODD**) d1
+correct (cos 0.99701 vs the dequant cascade reference), **d2/d3 back-to-back WRONG**
+(2047/2048 output values differ, max|d| = 263), **healed by one intervening other-ELF
+dispatch** (d4 byte-equal to d1). Production is unaffected — the token's sequence never
+dispatches the same ELF back-to-back — and the walks above ran on exactly that alternation;
+recompiling the caches under the current (post-fix) compiler is the repair whenever these
+artifacts are next rebuilt, and doc 57 §1.5's rule now has ten rows for ten.

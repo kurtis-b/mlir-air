@@ -39,6 +39,7 @@ from llama32_1b_weights import (  # noqa: E402
     LlamaConfig,
     LayerWeights,
     LlamaWeights,
+    generate_rope_lut,  # re-exported: the adapter seam's `weights_mod.generate_rope_lut`
     _resolve_safetensor_files,
     _load_tensor,
 )
@@ -236,3 +237,11 @@ def load_weights_awq(
         final_norm=final_norm,
         lm_head=lm_head,
     )
+
+
+# `[2026-08-26]` doc 56 H2a (queue item 17): the adapter seam
+# (llms/shared/model_adapter.prepare) loads every model through
+# `<package>_weights.load_weights(hf_id, config=...)`. This model's loader IS
+# load_weights_awq -- the alias presents the same seam surface as the bf16
+# siblings without forking either.
+load_weights = load_weights_awq

@@ -136,6 +136,69 @@ def repack_for_gemv(
 
 
 # ---------------------------------------------------------------------------
+# `[2026-08-26]` doc 56 H2a (queue item 17): the quantization contract, owned
+# by the packing code. The study's schema carries quant_* columns (doc 03,
+# populated for w4_decode rows -- doc 56 section 3.6) and MUST NOT hand-type
+# their values: this function derives them from THIS module (the decode GEMV
+# packer), the loader's own defaults (read from llama32_1b_int4_weights.py by
+# ast -- that module imports `air` transitively, this one must not), and the
+# int4 GEMV kernel source's accumulator. The plan package mirrors only the
+# NAME (`shared.plan.W4_GEMV_CONTRACT`); a host test pins the agreement.
+# ---------------------------------------------------------------------------
+
+
+def quant_contract(group_size=None):
+    """The w4_decode quantization contract as schema-ready quant_* columns.
+
+    `group_size` defaults to the loader's (`load_weights_awq`'s signature
+    default, read by ast). The GEMM and GEMV contracts DIFFER by design
+    (doc 56 section 3.5): under w4_decode the decode GEMVs dequant in-kernel
+    from the packed BO while prefill runs plain bf16 GEMMs on the host-side
+    `dequant_to_bf16` copy -- one column each so the difference is visible.
+    """
+    import ast
+    import re
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    tree = ast.parse(open(os.path.join(here, "llama32_1b_int4_weights.py")).read())
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "load_weights_awq")
+    defaults = {a.arg: d for a, d in zip(fn.args.args[-len(fn.args.defaults):], fn.args.defaults)}
+    loader_gs = ast.literal_eval(defaults["group_size"])
+    if group_size is None:
+        group_size = loader_gs
+    elif group_size != loader_gs:
+        # The review of dc8f5288: a caller-supplied gs (parsed from a checkpoint
+        # id) used to bypass this owner's ast branch entirely; the cross-check
+        # lives HERE now, not only in the host test.
+        raise ValueError(
+            f"quant_contract: caller-supplied group_size {group_size} contradicts "
+            f"load_weights_awq's default {loader_gs}; the loader is the owner"
+        )
+    # The accumulator, from the kernel source itself (mv_int4_bf16.cc), not typed here.
+    cc = open(os.path.join(here, "..", "..", "matrix_vector_multiplication", "int4_awq", "mv_int4_bf16.cc")).read()
+    if not re.search(r"aie::accum<accfloat", cc):
+        raise RuntimeError("mv_int4_bf16.cc no longer accumulates in accfloat; update quant_contract")
+    accum = "f32 (accfloat; per-group accfloat folded via bf16 scale mac)"
+    name = f"awq_u4_asym_g{group_size}_bf16s_u8z_dequant_in_kernel"
+    return {
+        # repack_hf_awq_linear: low = q_mn[:, 0::2] & 0x0F; high = (q_mn[:, 1::2]) << 4
+        "quant_packing_scheme": "two_uint4_per_byte_low_nibble_first (A_q[M, K/2]; pack_inputs slab per tile: Q|S|Z)",
+        "quant_group_size": int(group_size),
+        # repack_hf_awq_linear returns A_s bf16 [K/gs, M] (fp16 -> bf16 cast), A_z uint8 [K/gs, M]
+        "quant_scale_layout": "per_group bf16 [K/gs, M], packed after Q in each tile slab",
+        "quant_zero_point_layout": "per_group uint8 [K/gs, M] (asymmetric), packed after S",
+        "quant_accum_type": accum,
+        "quant_gemm_contract": (
+            "prefill: host dequant_to_bf16 ((q - z) * s, scales cast fp16->bf16), "
+            "device GEMMs are plain bf16 on the dense copy (awq_repacker.dequant_to_bf16)"),
+        "quant_gemv_contract": (
+            f"decode: {name} -- in-kernel (q - z) * s per group of {group_size}, "
+            "bf16 compute, accfloat accumulate, bf16 visible (matvec_int4_packed / mv_int4_bf16.cc)"),
+        "quant_gemv_contract_name": name,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Synthetic AWQ generator + self-test
 # ---------------------------------------------------------------------------
 

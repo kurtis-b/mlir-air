@@ -260,8 +260,12 @@ def run_decode_block(
     q_roped = results[11].reshape(n_heads, head_dim).astype(bfloat16)
     k_roped = results[12].reshape(n_kv_heads, head_dim).astype(bfloat16)
 
-    k_cache_layer[:, current_pos, :] = k_roped
-    v_cache_layer[:, current_pos, :] = v.reshape(n_kv_heads, head_dim)
+    # `[2026-08-26]` doc 56 H2a: every planned host stage is a named bucket
+    # (the plan's stage name), as item 15 did for the bf16 siblings -- the
+    # runner's host_ops live check counts these against the plan.
+    with cache.profiler.time_cpu("kv_append"):
+        k_cache_layer[:, current_pos, :] = k_roped
+        v_cache_layer[:, current_pos, :] = v.reshape(n_kv_heads, head_dim)
 
     with cache.profiler.time_cpu("decode_attention_cpu"):
         attn_out = decode_attention_cpu(
