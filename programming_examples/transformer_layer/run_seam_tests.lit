@@ -39,8 +39,14 @@
 // counts / NPU-CPU split, profiles.skip_reason reproduced over every family, the
 // caps cross-checked against the study constants, the tile solver ranked against
 // the registry with every mismatch in a named class.
+// `[2026-08-25]` 10 -> 11, queue item 16 (doc 56 H1b): plan_ubatch_prefill --
+// the chunked-prefill plan composes per-chunk stages (the FA artifact named
+// per context, rectangular past chunk 1), derives the totals the model
+// runner's live checks enforce (169 submissions / 171 host ops at 2 x 512),
+// hashes as its own identity, degenerates to the whole plan at one chunk,
+// and refuses a partial chunk (no padding path).
 // RUN: python3 %S/../llms/shared/plan/test_plan.py | FileCheck %s --check-prefix=PLAN
-// PLAN: 10/10 passed
+// PLAN: 11/11 passed
 //
 // `[2026-08-23]` Doc 57 O1 second half: the Qwen3 QKV stage's two host ABIs --
 // the driver's argument helper follows QWEN3_RMS_QKV_LAUNCHES, the 2-launch

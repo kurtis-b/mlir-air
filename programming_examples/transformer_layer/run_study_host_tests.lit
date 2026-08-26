@@ -557,5 +557,39 @@
 // argument-count mismatch at the dispatch chokepoint -- is the seam suite's
 // (run_seam_tests.lit, DISPATCH 35 -> 40).
 //
+// `[2026-08-25]` 662 -> 679, +1 module: queue item 16, doc 56 H1b -- the
+// chunked (incremental) prefill. test_ubatch_prefill.py (17) pins, device-free:
+// the MATH the device path implements against an f32 reference (chunk
+// composition == whole-prompt causal attention; the kernel's block mask with
+// the (Lk-Lq)/64 q-base == the elementwise causal mask; the KV-cache layout /
+// dv-chunk V pack from the cache byte-equal to the seq-first pack; a garbage
+// tail beyond the prompt provably unable to touch valid rows and overwritten
+// by the first decode append; RoPE slices at absolute positions); the
+// REFUSALS (no padding path: driver, composed plan and profile all refuse a
+// partial chunk; unknown ubatch policies refused); the composed plan's
+// totals (169 submissions / 171 host ops for 2 x 512 over 28 layers, the
+// live checks' own numbers), its sha identity, `plan_for`'s kv_len > M
+// routing, the planner/fa_headfirst artifact-name agreement, and the
+// predicted dispatch vector over a manifest MISSING the rectangular ELF
+// (raises, never silently square); the `ubatch-curve` profile (two UBATCH
+// rungs, same 1024-token prompt, distinct resume keys, gate at the logical
+// prompt + 32 with the decode rungs' gate capacity pinned UNMOVED); and the
+// hops by source (worker policy off the curve label, LLMS_VERIFY_UBATCH into
+// the gate subprocess, the verify adapter's chunked branch, and the chunk
+// block's lut_static=False -- a static-skipped LUT would silently RoPE chunk
+// 2 at chunk 1's positions).
+// `[2026-08-26]` 679 -> 681, item 16's review round (blocking finding 3a):
+// the chunked scheduler is now exercised as CODE, not only as math --
+// test_ubatch_prefill gains a fake-NPU boundary (the test_dispatch /
+// test_bo_pool fake-runtime pattern) that computes each ELF's contract in
+// float64->bf16 AND reproduces load_and_run's static-skip semantics, so the
+// REAL `run_npu_prefill_chunked` runs end-to-end (per-layer cache append, LUT
+// slice+refresh, fused-block wiring, chunk boundaries, final norm + LM head)
+// against the REAL `run_npu_prefill` on the same fake kernels: prefill token,
+// full logits row and every layer's KV cache rows asserted BYTE-equal, the
+// beyond-prompt cache rows asserted untouched. +1 teeth check: forcing
+// lut_static=True through the chunked path must BREAK the equality exactly at
+// chunk 2's positions (chunk 1 byte-equal, rows 8+ not), proving the fake
+// models the static-store and the test can catch the silent-wrong-RoPE class.
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 662/662 passed in 30 modules
+// CHECK: study host tests: 681/681 passed in 31 modules

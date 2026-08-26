@@ -73,7 +73,13 @@ def build_module(
     Args:
         lk: Total K/V sequence length (default: 512)
         lkp: K/V chunk size per tile (default: 64)
-        lq: Total Q sequence length (default: 512)
+        lq: Total Q sequence length (default: 512). Under causal masking
+            lq may be SMALLER than lk (`[2026-08-25]`, doc 56 H1b): the lq
+            queries are then the LAST lq rows of the lk-key context (chunked
+            prefill -- a chunk attends to every earlier chunk's KV plus its
+            own), implemented by basing the q_block counter at
+            (lk - lq) / tile_size_q. lq == lk emits byte-identical IR to what
+            this builder always emitted.
         lqp: Q chunk size per launch iteration (default: 256)
         dk: Key dimension (default: 64)
         dv: Value dimension (default: 64)
@@ -120,11 +126,30 @@ def build_module(
     assert dv % dv_tile == 0, f"dv ({dv}) must be divisible by dv_tile/lkp ({dv_tile})"
     dv_chunks = dv // dv_tile
     if causal:
-        assert lq == lk, f"Causal masking requires lq == lk, got lq={lq}, lk={lk}"
+        # `[2026-08-25]` RECTANGULAR causal (doc 56 H1b): lq < lk means the lq
+        # queries are the LAST lq rows of the lk-key context (chunked prefill:
+        # a chunk attends to every earlier chunk's KV plus its own). The mask
+        # kernel (apply_causal_mask) already works on GLOBAL block indices, so
+        # the only change is the q_block counter's base: it boots at and wraps
+        # back to (lk - lq) / tile_size_q instead of 0. lq == lk emits exactly
+        # the IR this builder always emitted (byte-identical, checked).
+        assert lq <= lk, (
+            f"Causal masking requires lq <= lk (queries are the last lq rows "
+            f"of the context), got lq={lq}, lk={lk}"
+        )
+        assert (lk - lq) % lkp == 0, (
+            f"Causal lq/lk offset must be a whole number of blocks: "
+            f"(lk - lq) = {lk - lq} not divisible by lkp ({lkp})"
+        )
         assert lqp // num_q_tiles == lkp, (
             f"Causal masking requires tile_size_q == lkp, got "
             f"tile_size_q={lqp // num_q_tiles}, lkp={lkp}"
         )
+        if window > 0:
+            assert lq == lk, (
+                f"window > 0 is square-only (the banded mask kernel takes "
+                f"unshifted block indices); got lq={lq}, lk={lk}"
+            )
     assert window >= 0, f"window must be >= 0, got {window}"
     if window > 0:
         # Fail CLOSED: a window without causal masking would emit no mask call
@@ -166,6 +191,10 @@ def build_module(
     num_chunks = lk // lkp
     chunks_per_stage = num_chunks // num_cascade_stages
     lk_per_stage = lkp * chunks_per_stage
+    # Rectangular causal: the q_block counter's base, in tile_size_q (== lkp
+    # under causal) block units. 0 for the square case -- and the square case
+    # must emit byte-identical IR, so every emission below guards on it.
+    q_offset_blocks = (lk - lq) // lkp if causal else 0
 
     NQ = num_q_tiles
     NS = num_cascade_stages
@@ -696,7 +725,9 @@ def build_module(
                         )
                         if_first = scf.IfOp(is_first)
                         with InsertionPoint(if_first.then_block):
-                            store(ConstantOp(i32, 0), counter_buf, [c0_ctr])
+                            # Boots at the rectangular base (0 when square --
+                            # the very constant this always stored).
+                            store(ConstantOp(i32, q_offset_blocks), counter_buf, [c0_ctr])
                             store(ConstantOp(i32, 1), counter_buf, [c1_ctr])
                             store(ConstantOp(i32, 0), counter_buf, [c2_ctr])
                             if dv_chunks > 1:
@@ -1086,7 +1117,19 @@ def build_module(
                                 # execution q_next never exceeds the total, so
                                 # the wrap changes no in-flight value.
                                 c_total_q = ConstantOp(i32, num_lq_iters * NQ)
-                                q_wrapped = arith.RemSIOp(q_next.result, c_total_q)
+                                if q_offset_blocks:
+                                    # Rectangular: wrap RELATIVE to the base so
+                                    # the counter returns to q_offset_blocks
+                                    # (not 0) at the end of every complete
+                                    # execution -- dispatch 2 must mask exactly
+                                    # as dispatch 1 did (the re-execution gate's
+                                    # clause).
+                                    c_qoff = ConstantOp(i32, q_offset_blocks)
+                                    q_rel = arith.SubIOp(q_next.result, c_qoff)
+                                    q_rel_wrapped = arith.RemSIOp(q_rel.result, c_total_q)
+                                    q_wrapped = arith.AddIOp(q_rel_wrapped.result, c_qoff)
+                                else:
+                                    q_wrapped = arith.RemSIOp(q_next.result, c_total_q)
                                 store(q_wrapped.result, counter_buf, [c0_ctr])
                                 store(ConstantOp(i32, 0), counter_buf, [c2_ctr])
                                 scf.YieldOp([])
@@ -1436,12 +1479,20 @@ if __name__ == "__main__":
         Vf = input_v_orig[kv_h].astype(np.float32)
         scores = Qf @ Kf.T * inv_sqrt_dk
         if causal:
-            # Upper triangle: k_abs > q_abs.
-            mask = np.triu(np.ones(scores.shape, dtype=bool), k=1)
+            # `[2026-08-26]` RECTANGULAR causal (doc 56 H1b, item-16 review
+            # blocking finding 1): under lq < lk the device's queries are the
+            # LAST lq rows of the lk context (build_module's contract), so
+            # oracle row i sits at absolute position (lk - lq) + i and the
+            # mask offsets by that base. lq == lk keeps k=1 exactly as before.
+            q_abs_off = lk - lq
+            # Upper triangle: k_abs > q_abs = q_abs_off + row.
+            mask = np.triu(np.ones(scores.shape, dtype=bool), k=1 + q_abs_off)
             if window > 0:
-                # Lower band edge: k_abs <= q_abs - window, i.e. row-col >= window.
-                # The diagonal is always kept, so no row is ever wholly masked.
-                mask |= np.tril(np.ones(scores.shape, dtype=bool), k=-window)
+                # Lower band edge: k_abs <= q_abs - window. window > 0 is
+                # square-only (build_module asserts lq == lk), so q_abs_off
+                # is 0 here; written with it anyway so the two arms share one
+                # position convention.
+                mask |= np.tril(np.ones(scores.shape, dtype=bool), k=-window + q_abs_off)
             scores = np.where(mask, -1e9, scores)
         mx = np.max(scores, axis=-1, keepdims=True)
         P = np.exp(scores - mx)

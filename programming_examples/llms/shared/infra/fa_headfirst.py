@@ -50,17 +50,33 @@ def _fa_backend_kwargs(verbose=False):
     }
 
 
-def compile_headfirst_fa(cache, seq_len, n_heads, n_kv_heads, head_dim, verbose=False):
-    """Compile the head-first FlashAttention ELF into `cache` as "flash_attn".
+def fa_cache_name(q_len, kv_len):
+    """The cache/artifact name of the head-first FA at (Lq, Lk): the square
+    kernel keeps its historical name "flash_attn"; a rectangular one (chunked
+    prefill, doc 56 H1b: Lq queries over a longer Lk context) is
+    "flash_attn_ctx<Lk>". ONE owner -- the compile below, the run path below,
+    the planner's fuse() and the drivers all go through this."""
+    return "flash_attn" if kv_len == q_len else f"flash_attn_ctx{kv_len}"
+
+
+def compile_headfirst_fa(cache, seq_len, n_heads, n_kv_heads, head_dim, verbose=False, kv_len=None):
+    """Compile the head-first FlashAttention ELF into `cache`.
+
+    `kv_len` (default: seq_len, the square case) is the K/V context length;
+    kv_len > seq_len builds the RECTANGULAR causal kernel (doc 56 H1b): the
+    seq_len queries are the LAST seq_len rows of the kv_len-key context. The
+    artifact name is `fa_cache_name(seq_len, kv_len)`.
 
     Only supports head_dim=128 (the case the seq-first kernel can't handle).
     Compiles attn_npu2.o first (so prepare_air_project copies it into
-    air_project/ for the ELF link), then the "flash_attn" ELF.
+    air_project/ for the ELF link), then the ELF.
     """
     assert head_dim == 128, (
         f"compile_headfirst_fa is the head_dim=128 path; got head_dim={head_dim}. "
         f"Use the seq-first kernel for head_dim=64."
     )
+    kv_len = seq_len if kv_len is None else int(kv_len)
+    assert kv_len >= seq_len, f"kv_len {kv_len} < seq_len {seq_len}"
 
     from shared.infra.external_kernels import compile_attn_npu2
 
@@ -79,7 +95,7 @@ def compile_headfirst_fa(cache, seq_len, n_heads, n_kv_heads, head_dim, verbose=
     from flash_attention.kernel_fusion_based.attn_npu2 import build_module
 
     mod = build_module(
-        lk=seq_len,
+        lk=kv_len,
         lkp=lkp,
         lq=seq_len,
         lqp=lqp,
@@ -92,7 +108,7 @@ def compile_headfirst_fa(cache, seq_len, n_heads, n_kv_heads, head_dim, verbose=
         causal=True,
         num_heads_per_unroll=2,
     )
-    cache.compile_and_cache("flash_attn", mod, _fa_backend_kwargs(verbose))
+    cache.compile_and_cache(fa_cache_name(seq_len, kv_len), mod, _fa_backend_kwargs(verbose))
 
 
 def npu_fa_headfirst(
@@ -158,5 +174,83 @@ def npu_fa_headfirst(
             gp.reshape(n_heads, dv_chunks, seq_len, lkp)
             .transpose(2, 0, 1, 3)  # [seq, n_heads, dv_chunks, lkp]
             .reshape(seq_len, q_dim)
+        ).astype(bfloat16)
+    return attn_out
+
+
+def npu_fa_headfirst_kv(
+    cache,
+    q_roped,
+    k_cache_layer,
+    v_cache_layer,
+    kv_len,
+    n_heads,
+    n_kv_heads,
+    head_dim,
+    q_len,
+    verbose=False,
+):
+    """Head-first FlashAttention over the HOST KV CACHE (doc 56 H1b chunked
+    prefill): the q_len chunk queries attend to cache rows [0:kv_len] -- every
+    earlier chunk's K/V plus the chunk's own, already appended. kv_len == q_len
+    dispatches the square "flash_attn"; kv_len > q_len the rectangular
+    "flash_attn_ctx<kv_len>" (whose causal base is (kv_len - q_len), baked at
+    compile).
+
+    Args:
+        cache: KernelCache holding `fa_cache_name(q_len, kv_len)`.
+        q_roped: (q_len, n_heads*head_dim) seq-first, post-QK-norm post-RoPE
+            (RoPE at the chunk's ABSOLUTE positions).
+        k_cache_layer: (n_kv_heads, >=kv_len, head_dim) -- the layer's K cache,
+            head-first, rows [0:kv_len] valid (k_roped values).
+        v_cache_layer: (n_kv_heads, >=kv_len, head_dim) -- raw V projections.
+    Returns:
+        (q_len, n_heads*head_dim) seq-first bf16 attention output.
+
+    The host work around the launch stays in the SAME two plan-stage buckets
+    as `npu_fa_headfirst` (transpose_seq_to_head / transpose_head_to_seq), so
+    a chunk's host-op count equals the square path's and the plan's.
+    """
+    assert head_dim == 128, f"head_dim={head_dim} unsupported (head_dim=128 only)"
+    lkp = 64
+    dv_chunks = head_dim // lkp  # 2
+    q_dim = n_heads * head_dim
+
+    q = np.asarray(q_roped, dtype=bfloat16).reshape(q_len, n_heads, head_dim)
+
+    with cache.profiler.time_cpu("transpose_seq_to_head"):
+        # Q L3: [n_heads, q_len, head_dim]
+        q_hf = np.ascontiguousarray(q.transpose(1, 0, 2))
+        # K L3: [n_kv_heads, kv_len, head_dim] -- the cache IS head-first;
+        # slicing to kv_len needs one contiguous copy.
+        k_hf = np.ascontiguousarray(
+            np.asarray(k_cache_layer[:, :kv_len, :], dtype=bfloat16)
+        )
+        # V L3: [n_kv_heads*dv_chunks, kv_len, lkp] -- same dv-chunk pack as
+        # npu_fa_headfirst, from the cache's head-first layout.
+        v_hf = np.ascontiguousarray(
+            np.asarray(v_cache_layer[:, :kv_len, :], dtype=bfloat16)
+            .reshape(n_kv_heads, kv_len, dv_chunks, lkp)
+            .transpose(0, 2, 1, 3)
+            .reshape(n_kv_heads * dv_chunks, kv_len, lkp)
+        )
+
+    out_hf = np.zeros((n_heads * dv_chunks, q_len, lkp), dtype=bfloat16)
+
+    results = cache.load_and_run(
+        fa_cache_name(q_len, kv_len),
+        _fa_backend_kwargs(verbose),
+        q_hf,
+        k_hf,
+        v_hf,
+        out_hf,
+    )
+    gp = results[-1].reshape(n_heads * dv_chunks, q_len, lkp)
+
+    with cache.profiler.time_cpu("transpose_head_to_seq"):
+        attn_out = np.ascontiguousarray(
+            gp.reshape(n_heads, dv_chunks, q_len, lkp)
+            .transpose(2, 0, 1, 3)
+            .reshape(q_len, q_dim)
         ).astype(bfloat16)
     return attn_out

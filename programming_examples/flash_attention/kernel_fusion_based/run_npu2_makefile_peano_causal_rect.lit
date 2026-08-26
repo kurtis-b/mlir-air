@@ -1,0 +1,18 @@
+// (c) Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// RECTANGULAR causal (doc 56 H1b, queue item 16): lq < lk, the lq queries are
+// the LAST lq rows of the lk-key context (chunked prefill's later chunks).
+// The head-first hd=128 tiling (lkp 64, tile_size_q 64, dv_chunks 2), GQA 2:1
+// -- the qwen3_0_6b configuration at probe scale. The CLI's NumPy oracle
+// offsets its causal mask by (lk - lq); the device kernel bases its q_block
+// counter the same way, and this test is what keeps the two in agreement
+// (the item-16 review caught the oracle applying the SQUARE mask here).
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_causal_rect
+// RUN: cd test_causal_rect
+// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile run PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR LQ=256 LK=512 LKP=64 LQP=256 DK=128 DV=128 NUM_HEADS=2 NUM_KV_HEADS=1 EXTRA_PY_FLAGS="--causal" | FileCheck %s
+// CHECK: PASS!

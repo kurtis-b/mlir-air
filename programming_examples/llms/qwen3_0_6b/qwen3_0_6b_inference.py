@@ -392,6 +392,125 @@ def run_npu_prefill(
 
 
 # ---------------------------------------------------------------------------
+# NPU Chunked (incremental) prefill -- doc 56 H1b: chunk-outer / layer-inner.
+# ---------------------------------------------------------------------------
+
+
+def run_npu_prefill_chunked(
+    token_ids,
+    weights,
+    config,
+    prefill_cache,
+    decode_cache,
+    rope_lut_bf16,
+    max_seq,
+    tokenizer,
+    ubatch,
+    profile=False,
+    quiet=False,
+    on_chunk=None,
+):
+    """Incremental NPU prefill: the prompt in `ubatch`-token chunks, chunk-outer /
+    layer-inner, per-layer KV append, each chunk attending to all earlier
+    chunks' KV plus its own (square FA at chunk 1, rectangular after), RoPE at
+    absolute positions. The ONE owner of the chunked path (doc 56 H1b): the
+    model adapter's `prefill(ubatch_policy="chunked")` and the verify adapter's
+    `LLMS_VERIFY_UBATCH` branch both call THIS.
+
+    `token_ids` is the VALID prompt only -- no EOS padding, and the length must
+    be a multiple of `ubatch` (this scheduler has no padding path; a partial
+    tail is a refusal, not a silent pad). The whole-prompt `run_npu_prefill`
+    keeps its EOS-padded contract.
+
+    `on_chunk(chunk_idx, context_start, context_end, elapsed_s)` fires after
+    each chunk; the LAST chunk's callback fires after the final RMSNorm + LM
+    head, so per-chunk times sum to the forward clock.
+
+    Returns (prefill_token, logits_row, k_cache, v_cache, prompt_len) --
+    exactly `run_npu_prefill`'s tuple; the KV state handed to decode IS the
+    incrementally built cache.
+    """
+    prompt_len = len(token_ids)
+    if ubatch <= 0 or prompt_len % ubatch != 0:
+        raise ValueError(
+            f"chunked prefill: prompt of {prompt_len} tokens is not a whole "
+            f"number of ubatch={ubatch} chunks (no padding path; doc 56 H1b)"
+        )
+    if any(t == tokenizer.eos_token_id for t in token_ids):
+        raise ValueError(
+            "chunked prefill: token_ids is the valid prompt only (no EOS "
+            "padding), but it contains the EOS id"
+        )
+    if prompt_len > max_seq:
+        raise ValueError(f"prompt of {prompt_len} tokens exceeds max_seq {max_seq}")
+    if rope_lut_bf16.shape[0] < prompt_len:
+        raise ValueError(
+            f"rope LUT covers {rope_lut_bf16.shape[0]} positions < prompt {prompt_len}"
+        )
+    n_chunks = prompt_len // ubatch
+    emb_dim = config.emb_dim
+    n_kv_heads = config.n_kv_heads
+    head_dim = config.head_dim
+    vocab_size = weights.lm_head.shape[0]
+
+    k_cache = np.zeros((config.n_layers, n_kv_heads, max_seq, head_dim), dtype=bfloat16)
+    v_cache = np.zeros((config.n_layers, n_kv_heads, max_seq, head_dim), dtype=bfloat16)
+
+    if not quiet:
+        print(
+            f"Running NPU chunked prefill ({config.n_layers} layers, "
+            f"prompt {prompt_len} = {n_chunks} x ubatch {ubatch})..."
+        )
+    from qwen3_0_6b_prefill import run_transformer_block_qwen3_chunk
+
+    t_start = time.time()
+    prefill_token = None
+    logits_row = None
+    for c in range(n_chunks):
+        t_chunk = time.perf_counter()
+        start, end = c * ubatch, (c + 1) * ubatch
+        with prefill_cache.profiler.time_cpu("embed_lookup"):
+            x_bf16 = (
+                weights.embed_table[list(token_ids[start:end])]
+                .astype(np.float32)
+                .astype(bfloat16)
+            )
+        for layer_idx in range(config.n_layers):
+            t0 = prefill_cache.profiler.start_layer()
+            x_bf16 = run_transformer_block_qwen3_chunk(
+                x_bf16,
+                weights.layers[layer_idx],
+                rope_lut_bf16,
+                config,
+                prefill_cache,
+                layer_idx,
+                k_cache[layer_idx],
+                v_cache[layer_idx],
+                start,
+                verbose=profile,
+            )
+            prefill_cache.profiler.end_layer(layer_idx, t0)
+        if c == n_chunks - 1:
+            # Final RMSNorm (eps=1e-6) on the last valid row + NPU LM-head.
+            with prefill_cache.profiler.time_cpu("final_rms_norm"):
+                last_hidden = np.asarray(x_bf16, dtype=np.float32)[-1:]
+                last_normed = (
+                    rms_norm(last_hidden, weights.final_norm, eps=EPS)
+                    .flatten()
+                    .astype(bfloat16)
+                )
+            logits_row = _run_lm_head(decode_cache, weights, last_normed, vocab_size)
+            prefill_token = int(np.argmax(logits_row))
+        if on_chunk is not None:
+            on_chunk(c, start, end, time.perf_counter() - t_chunk)
+
+    t_prefill = time.time() - t_start
+    if not quiet:
+        print(f"NPU chunked prefill done in {t_prefill:.2f}s. First token: {prefill_token}")
+    return prefill_token, logits_row, k_cache, v_cache, prompt_len
+
+
+# ---------------------------------------------------------------------------
 # Single decode step
 # ---------------------------------------------------------------------------
 

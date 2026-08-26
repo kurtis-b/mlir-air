@@ -315,6 +315,10 @@ def worker(args) -> int:
     prompts_dir.mkdir(parents=True, exist_ok=True)
     out = {"model_id": model_id, "M": M, "rows": [], "gate": None, "errors": []}
     reserve = max([r.n_tokens for r in rungs] + [model_profiles.GATE_N_TOKENS]) + spec["decode_warmup"]
+    # `[2026-08-25]` an ubatch rung's LOGICAL prompt exceeds the compiled M;
+    # the KV arrays and RoPE LUT are sized M + reserve, so the reserve carries
+    # the overhang (doc 56 H1b).
+    reserve += max([r.context_end - r.M for r in rungs if r.phase == "prefill"] + [0])
 
     adapter = model_adapter.ModelAdapter(model_id)
     try:
@@ -370,7 +374,11 @@ def worker(args) -> int:
             predicted = model_adapter.model_dispatch_vector_from_manifest(plan_, adapter._launch_counts, "prefill" if rung.phase == "prefill" else "decode")
             c0 = reconf()
             if rung.phase == "prefill":
-                res = adapter.prefill(ids, "whole", None, samples=spec["prefill_samples"], warmup=spec["prefill_warmup"])
+                # `[2026-08-25]` the ubatch curve's rungs run the drivers'
+                # INCREMENTAL path (doc 56 H1b); policy by the rung's curve
+                # label, never inferred from shapes.
+                policy = "chunked" if rung.curve == model_profiles.UBATCH else "whole"
+                res = adapter.prefill(ids, policy, None, samples=spec["prefill_samples"], warmup=spec["prefill_warmup"])
                 warm = spec["prefill_warmup"]
             else:
                 pre = adapter.prefill(ids, "whole", None, samples=1, warmup=0)
@@ -416,6 +424,14 @@ def worker(args) -> int:
                 "effective_gflops_note": "weights-only FLOPs (2 x matmul weight elements x tokens); attention excluded",
                 "host_ops_note": "every planned host stage is a named Profiler.time_cpu bucket since 2026-08-25 (kv_append, transpose_seq_to_head/head_to_seq, embed_lookup, attention, final norm); equals plan_total_host_ops and is enforced by the live check; unplanned Python glue is in avg_latency_ms only",
                 "phase_dispatch_vector": adapter.dispatch_vector("decode") if rung.phase == "decode" else res.dispatch,
+                # `[2026-08-25]` doc 56 H1b: per-chunk records (context window,
+                # per-sample seconds, dispatch vector and device/sync/host split
+                # per chunk; the LAST chunk's segment includes the final norm +
+                # LM head) and TTFT = the forward clock per sample (embed ->
+                # logits CPU-readable; prepare/tokenize outside, doc 56 s3.6).
+                "ubatch_policy": ("chunked" if rung.curve == model_profiles.UBATCH else "whole") if rung.phase == "prefill" else None,
+                "chunks": res.chunks if rung.phase == "prefill" else None,
+                "ttft_s_per_sample": res.samples_s if rung.phase == "prefill" else None,
                 "qkv_scratch_layout": adapter._scratch_layout,
                 "artifact_deviation": deviation,
                 "plan_forced": forced,
@@ -438,8 +454,15 @@ def worker(args) -> int:
             out["errors"].append(f"{rung.case_id}: {msg}")
     gate_file = prompts_dir / "gate_prompts.txt"
     gate_file.write_text("".join(prompt(n) + "\n" for n in gate_prompts), encoding="utf-8")
+    ubatch_rungs = [r for r in rungs if r.curve == model_profiles.UBATCH]
+    gate_max_seq = max(r.gate_max_seq for r in rungs) if rungs else M + model_profiles.GATE_N_TOKENS
     out["gate"] = {"prompts_file": str(gate_file), "prompt_tokens": gate_prompts, "map": gate_map,
-                   "prefill_M": M, "max_seq": M + model_profiles.GATE_N_TOKENS,
+                   "prefill_M": M, "max_seq": gate_max_seq,
+                   # `[2026-08-25]` doc 56 H1b: the gate's prefill runs the SAME
+                   # chunked path as the measurement (LLMS_VERIFY_UBATCH; the
+                   # ubatch is the compiled M) -- the state its 32-token decode
+                   # continues from is the incrementally built KV cache.
+                   "ubatch": M if ubatch_rungs else None,
                    "prefill_cache": str(ms.prefill_cache_dir), "decode_cache": str(ms.decode_cache_dir)}
     Path(args.out).write_text(json.dumps(out, indent=1, default=str), encoding="utf-8")
     return 0
@@ -484,8 +507,10 @@ def run_verify(model_id: str, M: int, gate: dict, *, compiled: dict, out_dir: Pa
     report_root = out_dir / "verify" / f"{model_id}_M{M}"
     cwd = out_dir / "verify" / f"{model_id}_M{M}" / "cwd"
     before = model_adapter.artifact_content_sha([prefill_cache, decode_cache])
+    extra_env = {"LLMS_VERIFY_UBATCH": str(gate["ubatch"])} if gate.get("ubatch") else None
     verdict = adapter.verify_against_hf(gate["prompts_file"], report_root, prefill_cache=prefill_cache, decode_cache=decode_cache,
-                                        prefill_M=gate.get("prefill_M", M), max_seq=gate.get("max_seq", M + model_profiles.GATE_N_TOKENS), cwd=cwd)
+                                        prefill_M=gate.get("prefill_M", M), max_seq=gate.get("max_seq", M + model_profiles.GATE_N_TOKENS), cwd=cwd,
+                                        extra_env=extra_env)
     after = model_adapter.artifact_content_sha([prefill_cache, decode_cache])
     problems = []
     if timed_sha is not None and before["sha256"] != timed_sha["sha256"]:
@@ -701,6 +726,8 @@ def main(argv=None) -> int:
     c.add_argument("--M", type=int, required=True)
     c.add_argument("--compiled-root", required=True)
     c.add_argument("--o-ffn-gemm-method", default=None, help="force the Qwen O+FFN cascade's GEMM method (recorded as a deviation)")
+    c.add_argument("--fa-ctx", type=int, action="append", default=[],
+                   help="doc 56 H1b: also compile a RECTANGULAR head-first FA ELF (flash_attn_ctx<N>) for this K/V context length; repeatable")
     w = sub.add_parser("worker")
     w.add_argument("--rungs", required=True)
     w.add_argument("--out", required=True)
@@ -714,7 +741,8 @@ def main(argv=None) -> int:
         cache = target / model_adapter.PREFILL_CACHE
         print(f"[run-model] compiling {args.model} prefill at M={args.M} into {cache} (cwd {target})")
         try:
-            man = model_adapter.compile_prefill(args.model, args.M, cache, cwd=target, o_ffn_gemm_method=args.o_ffn_gemm_method)
+            man = model_adapter.compile_prefill(args.model, args.M, cache, cwd=target, o_ffn_gemm_method=args.o_ffn_gemm_method,
+                                                attn_ctx_lens=tuple(args.fa_ctx))
         except Exception as exc:
             # the wall, verbatim, where `discover_compiled` reads it into the
             # rung's skip reason -- a point that cannot be compiled says why
@@ -723,7 +751,7 @@ def main(argv=None) -> int:
                 if stale.exists():
                     stale.unlink()
             (cache / model_adapter.COMPILE_NOTE).write_text(json.dumps(
-                {"model_id": args.model, "M": args.M, "o_ffn_gemm_method": args.o_ffn_gemm_method,
+                {"model_id": args.model, "M": args.M, "o_ffn_gemm_method": args.o_ffn_gemm_method, "attn_ctx_lens": args.fa_ctx or None,
                  "failed": f"{type(exc).__name__}: {str(exc).splitlines()[-1][:400]}"}, indent=1), encoding="utf-8")
             raise
         print(f"[run-model] compiled {sorted(k for k in man if not k.startswith('_'))} in {man['_compile']['wall_s']:.1f}s")

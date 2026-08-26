@@ -69,6 +69,13 @@ SHIPPED_PREFILL_M = 2048
 
 KERNEL_SCALING = "kernel-scaling"
 DECODE_CONTEXT = "decode-context"
+#: `[2026-08-25]` doc 56 H1b: the ubatch curve -- the LOGICAL prompt fixed,
+#: the physical chunk varied. A rung with this label runs the drivers'
+#: incremental (chunked) prefill: M is the compiled ubatch, context_end the
+#: logical prompt (context_end > M means > 1 chunk), and the adapter policy
+#: is "chunked", not "whole". Distinct from KERNEL_SCALING by label AND by
+#: mechanism, never inferred (doc 56 section 3.4).
+UBATCH = "ubatch"
 
 
 @dataclass(frozen=True)
@@ -109,6 +116,10 @@ class ModelRung:
 
     @property
     def label(self) -> str:
+        if self.curve == UBATCH:
+            n_chunks = self.context_end // self.M
+            return (f"{self.curve} prefill: prompt {self.context_end} tokens in {n_chunks} x ubatch {self.M} chunk(s), "
+                    f"incremental KV, no padding ({self.model_id}, {self.precision_plan})")
         if self.phase == "prefill":
             return f"{self.curve} prefill: prompt {self.context_end} tokens = M {self.M}, no chunking ({self.model_id}, {self.precision_plan})"
         return f"{self.curve} decode: {self.n_tokens} tokens ending at context {self.context_end} on the M {self.M} artifact set ({self.model_id}, {self.precision_plan})"
@@ -133,10 +144,12 @@ class ModelRung:
 
     @property
     def gate_max_seq(self) -> int:
-        """KV / RoPE capacity the gate runs with: the compiled M plus the 32
-        generation steps (LLMS_VERIFY_MAX_SEQ); the prefill ELF still pads to
-        M (LLMS_VERIFY_PREFILL_M)."""
-        return self.M + GATE_N_TOKENS
+        """KV / RoPE capacity the gate runs with (LLMS_VERIFY_MAX_SEQ): the
+        prompt the gate prefills plus the 32 generation steps. For a prefill
+        rung the prompt is context_end (== M kernel-scaling; > M on an ubatch
+        rung, whose gate runs the CHUNKED path over the logical prompt); for
+        a decode rung the gate prefills at the compiled M as before."""
+        return (self.context_end if self.phase == "prefill" else self.M) + GATE_N_TOKENS
 
 
 #: The production gate decodes 32 tokens after each prompt (verify_runner.GATE_N_TOKENS).
@@ -155,6 +168,13 @@ class ModelProfile:
     prefill_warmup: int = 1
     decode_warmup: int = 1
     precision_plan: str = "bf16"
+    #: `[2026-08-25]` doc 56 H1b ubatch points: (model_id, logical_tokens,
+    #: ubatch) triples. Each becomes ONE prefill rung with curve=UBATCH on the
+    #: M=ubatch artifact set (whose cache must hold the rectangular FA ELFs
+    #: for every chunk context > ubatch): context_end = the logical prompt,
+    #: chunked through the driver's incremental path. logical % ubatch must be
+    #: 0 (the scheduler has no padding path).
+    ubatch_points: tuple = ()
     #: (model_id, M) -> {"prefill_cache": dir, "decode_cache": dir}; set by `bind`.
     compiled: dict = field(default_factory=dict)
     skip_notes: dict = field(default_factory=dict)
@@ -176,8 +196,14 @@ class ModelProfile:
     def rungs(self) -> tuple:
         out = []
         for model_id in self.models:
-            for M in self.prefill_Ms[model_id]:
+            for M in self.prefill_Ms.get(model_id, ()):
                 out.append(ModelRung(model_id, "prefill", M, M, 0, self.precision_plan, KERNEL_SCALING, self._skip(model_id, M, "prefill")))
+            for mid, logical, ubatch in self.ubatch_points:
+                if mid != model_id:
+                    continue
+                if logical % ubatch:
+                    raise ValueError(f"ubatch point ({mid}, {logical}, {ubatch}): logical prompt is not a whole number of chunks")
+                out.append(ModelRung(model_id, "prefill", ubatch, logical, 0, self.precision_plan, UBATCH, self._skip(model_id, ubatch, "prefill")))
             for ctx in self.decode_ctxs:
                 M = SHIPPED_PREFILL_M
                 out.append(ModelRung(model_id, "decode", M, ctx, self.decode_n_tokens, self.precision_plan, DECODE_CONTEXT, self._skip(model_id, M, "decode")))
@@ -209,6 +235,7 @@ class ModelProfile:
             "models": list(self.models),
             "prefill_Ms": {k: list(v) for k, v in self.prefill_Ms.items()},
             "decode_ctxs": list(self.decode_ctxs),
+            "ubatch_points": [list(t) for t in self.ubatch_points],
             "decode_n_tokens": self.decode_n_tokens,
             "prefill_samples": self.prefill_samples,
             "prefill_warmup": self.prefill_warmup,
@@ -220,6 +247,20 @@ class ModelProfile:
 
 
 PROFILES = {
+    "ubatch-curve": ModelProfile(
+        name="ubatch-curve",
+        description=(
+            "doc 56 H1b (section 5, the first real milestone): the two-point Qwen3-0.6B bf16 "
+            "ubatch curve -- the SAME 1024-token prompt at ubatch 512 (2 chunks, incremental "
+            "KV, rectangular FA at (512,1024)) and ubatch 1024 (1 chunk) -- chunked prefill "
+            "through the driver's incremental path, verify gate per artifact set on the same "
+            "prompt through the same chunked path"
+        ),
+        models=("qwen3_0_6b",),
+        prefill_Ms={"qwen3_0_6b": ()},
+        decode_ctxs=(),
+        ubatch_points=(("qwen3_0_6b", 1024, 512), ("qwen3_0_6b", 1024, 1024)),
+    ),
     "model-smoke": ModelProfile(
         name="model-smoke",
         description=(

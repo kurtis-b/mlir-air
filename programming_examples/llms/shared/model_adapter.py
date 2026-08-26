@@ -79,7 +79,7 @@ for _p in (str(_PE), str(_LLMS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from shared.plan import LLAMA32_1B, QWEN3_0_6B, NPU2_CAPS, Workload, decoder_graph, plan as _plan  # noqa: E402
+from shared.plan import LLAMA32_1B, QWEN3_0_6B, NPU2_CAPS, Workload, decoder_graph, plan as _plan, plan_ubatch_prefill as _plan_ubatch_prefill  # noqa: E402
 
 #: The seven keys, in the schema's order (`study/schema.py` MODEL_DISPATCH_VECTOR_KEYS).
 DISPATCH_VECTOR_KEYS = (
@@ -140,6 +140,11 @@ def plan_for(model_id: str, phase: str, M: int, kv_len: int, ctx: int = 2048, pr
     deviation (`compile.json`), so the hash names the plan that BUILT the timed
     artifacts, not the registry's best (H1a review, finding 4)."""
     spec = MODELS[model_id].spec
+    if phase == "prefill" and kv_len > M:
+        # `[2026-08-25]` doc 56 H1b: a prefill whose context exceeds its
+        # physical M is CHUNKED -- the composed per-chunk plan (ubatch = M,
+        # logical prompt = kv_len), never a silent square plan.
+        return _plan_ubatch_prefill(decoder_graph(spec), kv_len, M, NPU2_CAPS, ctx, precision_plan, forced=forced)
     return _plan(decoder_graph(spec), Workload(phase, M, kv_len, ctx, precision_plan), NPU2_CAPS, forced=forced)
 
 
@@ -330,6 +335,12 @@ class PhaseResult:
     state: DecodeState | None = None
     trace: dict = field(default_factory=dict)  # `trace_since` over the timed samples (summed)
     trace_samples: int = 1  # forwards (prefill) or tokens (decode) the trace sums over
+    #: `[2026-08-25]` chunked prefill (doc 56 H1b): one record per chunk --
+    #: {chunk, context_start, context_end, samples_s, dispatch, decomposition}
+    #: (dispatch/decomposition from the LAST timed sample's profiler delta;
+    #: the last chunk's segment includes the final norm + LM head). Empty for
+    #: the whole-prompt path and decode.
+    chunks: list = field(default_factory=list)
 
     @property
     def tokens_per_second(self) -> float:
@@ -557,39 +568,87 @@ class ModelAdapter:
         return (s.prefill_cache.profiler, s.decode_cache.profiler)
 
     def prefill(self, token_ids: list, ubatch_policy: str, state=None, *, samples: int = 1, warmup: int = 0) -> PhaseResult:
-        """Prefill `token_ids` (valid tokens; padded here to M). `ubatch_policy`
-        must be `whole` -- H1a has no chunking -- and `state` must be None (a
-        fresh context). Runs `warmup` untimed forwards, then `samples` timed
-        ones; the last one's KV state is returned for `decode`.
+        """Prefill `token_ids`. `ubatch_policy`:
+
+        - `whole` (H1a): the prompt EOS-padded to the compiled M, one shot.
+        - `chunked` `[2026-08-25]` (doc 56 H1b): the prompt (which may EXCEED
+          the compiled M) through the driver's incremental path in M-token
+          chunks -- chunk-outer / layer-inner, per-layer KV append, RoPE at
+          absolute positions, NO padding (a partial tail is the driver's
+          refusal). The ubatch IS the compiled M. Per-chunk timing and
+          dispatch land in the result's `chunks`.
+
+        `state` must be None (a fresh context). Runs `warmup` untimed
+        forwards, then `samples` timed ones; the last one's KV state is
+        returned for `decode`.
         """
-        if ubatch_policy != "whole":
-            raise ValueError(f"ubatch_policy {ubatch_policy!r}: H1a prefill is whole-prompt only (doc 56 section 3.4); chunking is H1b")
+        if ubatch_policy not in ("whole", "chunked"):
+            raise ValueError(f"ubatch_policy {ubatch_policy!r}: known policies are 'whole' (H1a) and 'chunked' (H1b)")
         if state is not None:
             raise ValueError("prefill() starts a fresh context; decode() continues one")
         s = self.ms.session
         drv = self.ms.driver
         valid = list(token_ids)
         prompt_len = len(valid)
-        padded = self.pad(valid)
         max_seq = s.seq_len + self.ms.n_tokens_reserved
-        kwargs = dict(tokenizer=s.tokenizer, cpu_attn=False, profile=False, quiet=True)
-        if self.binding.prefill_prompt_len_kwarg:
-            kwargs["prompt_len"] = prompt_len
+        chunk_infos: list = []
+        if ubatch_policy == "chunked":
+            if not hasattr(drv, "run_npu_prefill_chunked"):
+                raise ValueError(f"{self.binding.model_id}: the driver has no chunked prefill path (doc 56 H1b is the qwen3_0_6b driver)")
+            if prompt_len > max_seq:
+                raise ValueError(f"prompt of {prompt_len} tokens exceeds the reserved max_seq {max_seq}")
+            ubatch = s.seq_len
+            chunk_mark = None
 
-        def forward():
-            t0 = time.perf_counter()
-            out = drv.run_npu_prefill(padded, s.weights, s.config, s.prefill_cache, s.decode_cache, s.rope_lut_bf16, max_seq, **kwargs)
-            return time.perf_counter() - t0, out
+            def on_chunk(ci, cs, ce, dt):
+                nonlocal chunk_mark
+                v, d, _tr = _delta(chunk_mark, self._launch_counts, "prefill")
+                chunk_infos.append({"chunk": ci, "context_start": cs, "context_end": ce,
+                                    "seconds": dt, "dispatch": v, "decomposition": d})
+                chunk_mark = _ProfilerMark(self._profilers())
+
+            def forward(collect=False):
+                nonlocal chunk_mark
+                chunk_mark = _ProfilerMark(self._profilers())
+                t0 = time.perf_counter()
+                out = drv.run_npu_prefill_chunked(
+                    valid, s.weights, s.config, s.prefill_cache, s.decode_cache,
+                    s.rope_lut_bf16, max_seq, tokenizer=s.tokenizer, ubatch=ubatch,
+                    profile=False, quiet=True, on_chunk=on_chunk if collect else None)
+                return time.perf_counter() - t0, out
+        else:
+            padded = self.pad(valid)
+            kwargs = dict(tokenizer=s.tokenizer, cpu_attn=False, profile=False, quiet=True)
+            if self.binding.prefill_prompt_len_kwarg:
+                kwargs["prompt_len"] = prompt_len
+
+            def forward(collect=False):
+                t0 = time.perf_counter()
+                out = drv.run_npu_prefill(padded, s.weights, s.config, s.prefill_cache, s.decode_cache, s.rope_lut_bf16, max_seq, **kwargs)
+                return time.perf_counter() - t0, out
 
         for _ in range(warmup):
             forward()
         mark = _ProfilerMark(self._profilers())
         times = []
+        chunk_samples: list[list] = []
         out = None
-        for _ in range(samples):
-            dt, out = forward()
+        for i in range(samples):
+            chunk_infos = []
+            dt, out = forward(collect=True)
             times.append(dt)
+            if chunk_infos:
+                chunk_samples.append(chunk_infos)
         vector, decomposition, trace = _delta(mark, self._launch_counts, "prefill")
+        chunks = []
+        if chunk_samples:
+            # per-chunk seconds from every timed sample; the dispatch record
+            # from the last sample (identical across samples by construction)
+            for ci in range(len(chunk_samples[-1])):
+                rec = dict(chunk_samples[-1][ci])
+                rec["samples_s"] = [cs[ci]["seconds"] for cs in chunk_samples]
+                del rec["seconds"]
+                chunks.append(rec)
         # the vector is per forward: divide the accumulated counts by the sample count
         vector = {k: (v if k == "scope" else v // samples) for k, v in vector.items()}
         decomposition = {k: (v if k == "distinct_elfs" else v / samples) for k, v in decomposition.items()}
@@ -603,7 +662,7 @@ class ModelAdapter:
             phase="prefill", elapsed_s=sum(times), samples_s=times, logical_tokens=prompt_len,
             measured_tokens=prompt_len * samples, context_start=0, context_end=prompt_len,
             dispatch=vector, decomposition=decomposition, tokens=[int(prefill_token)], state=st,
-            trace=trace, trace_samples=samples,
+            trace=trace, trace_samples=samples, chunks=chunks,
         )
 
     def decode(self, state: DecodeState, n_tokens: int, *, warmup: int = 0) -> PhaseResult:
@@ -733,7 +792,7 @@ class ModelAdapter:
 COMPILE_NOTE = "compile.json"
 
 
-def compile_prefill(model_id: str, M: int, cache_dir: str | Path, *, cwd: str | Path, verbose: bool = False, o_ffn_gemm_method: str | None = None) -> dict:
+def compile_prefill(model_id: str, M: int, cache_dir: str | Path, *, cwd: str | Path, verbose: bool = False, o_ffn_gemm_method: str | None = None, attn_ctx_lens: tuple = ()) -> dict:
     """Compile the model's prefill artifact set at seq_len M into `cache_dir`,
     running in `cwd` (XRTBackend writes `air_project/` into the cwd -- two
     compiles from one directory clobber each other). Returns the manifest.
@@ -741,7 +800,11 @@ def compile_prefill(model_id: str, M: int, cache_dir: str | Path, *, cwd: str | 
     `o_ffn_gemm_method` forces the O+FFN cascade's GEMM method (Qwen3-0.6B
     driver only; see `build_o_ffn_qwen_module`). It is written into
     `<cache_dir>/compile.json` as `artifact_deviation`, which the worker copies
-    onto every row measured on the set: a forced method is not the plan."""
+    onto every row measured on the set: a forced method is not the plan.
+
+    `attn_ctx_lens` `[2026-08-25]` (doc 56 H1b): extra K/V context lengths --
+    one RECTANGULAR head-first FA ELF (`flash_attn_ctx<len>`) is compiled per
+    entry, for the chunked prefill's later chunks. Recorded in compile.json."""
     adapter = ModelAdapter(model_id)
     driver_dir = adapter.binding.directory
     cwd = Path(cwd)
@@ -758,6 +821,8 @@ def compile_prefill(model_id: str, M: int, cache_dir: str | Path, *, cwd: str | 
 
         cache = KernelCache(str(Path(cache_dir).resolve()), verbose=verbose, profiler=Profiler(enabled=False))
         kwargs = {"o_ffn_gemm_method": o_ffn_gemm_method} if o_ffn_gemm_method else {}
+        if attn_ctx_lens:
+            kwargs["attn_ctx_lens"] = tuple(int(c) for c in attn_ctx_lens)
         t0 = time.perf_counter()
         prefill_mod.compile_all_kernels(cache, weights_mod.LlamaConfig(), int(M), verbose=verbose, cpu_attn=False, **kwargs)
         wall = time.perf_counter() - t0
@@ -765,6 +830,7 @@ def compile_prefill(model_id: str, M: int, cache_dir: str | Path, *, cwd: str | 
         os.chdir(old)
     manifest = read_cache_manifest(cache_dir)
     note = {"model_id": model_id, "M": int(M), "wall_s": wall, "cwd": str(cwd), "driver_dir": str(driver_dir), "driver": drv.__name__,
+            "attn_ctx_lens": sorted(int(c) for c in attn_ctx_lens) if attn_ctx_lens else None,
             "artifact_deviation": (
                 {"o_ffn_gemm_method": o_ffn_gemm_method,
                  "why": "gemm_method= is a test-only override since item 14 (the cascade is per-GEMM and needs no forcing); this set was deliberately compiled off the registry's best method for this M, the deviation is recorded per set, and the drivers restore THIS layout from it"}

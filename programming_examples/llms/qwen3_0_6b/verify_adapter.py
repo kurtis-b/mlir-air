@@ -37,6 +37,7 @@ from qwen3_0_6b_decode import compile_decode_kernels  # noqa: E402
 from qwen3_0_6b_inference import (  # noqa: E402
     prepare_runtime,
     run_npu_prefill,
+    run_npu_prefill_chunked,
     run_npu_decode_step,
 )
 from qwen3_0_6b_weights import (  # noqa: E402
@@ -115,6 +116,18 @@ class NpuRunner:
         self.prefill_M = int(os.environ.get("LLMS_VERIFY_PREFILL_M") or max_seq)
         if self.prefill_M > max_seq:
             raise ValueError(f"LLMS_VERIFY_PREFILL_M {self.prefill_M} exceeds max_seq {max_seq}")
+        # `[2026-08-25]` LLMS_VERIFY_UBATCH (doc 56 H1b): gate the CHUNKED
+        # prefill path -- the prompt (which may be LONGER than the compiled M)
+        # runs through `run_npu_prefill_chunked` in ubatch-token chunks, and
+        # the state handed to the 32-token decode is the incrementally built
+        # KV cache. The ubatch IS the compiled M (the QKV / o_ffn / square-FA
+        # ELFs are compiled at that seq_len); anything else is a refusal.
+        self.ubatch = int(os.environ.get("LLMS_VERIFY_UBATCH") or 0)
+        if self.ubatch and self.ubatch != self.prefill_M:
+            raise ValueError(
+                f"LLMS_VERIFY_UBATCH {self.ubatch} != LLMS_VERIFY_PREFILL_M "
+                f"{self.prefill_M}: the chunk is the compiled M"
+            )
         _cache_root = _THIS_DIR / "build_peano"
         self.prefill_cache = KernelCache(
             _prefill_dir or str(_cache_root / "prefill_kernel_cache"), verbose=False
@@ -173,6 +186,37 @@ class NpuRunner:
         self.v_cache = None
 
     def prefill(self, prompt_tokens: np.ndarray) -> PrefillRecord:
+        if self.ubatch:
+            # Chunked path (doc 56 H1b): the EXACT prompt, no EOS padding, no
+            # truncation -- a prompt that is not a whole number of chunks is
+            # the driver's refusal, not a silent fix-up here.
+            if not self.lite_mode:
+                raise RuntimeError(
+                    "LLMS_VERIFY_UBATCH is a topk_token (lite) gate path; the "
+                    "per-layer diagnosis re-run has no chunked form"
+                )
+            prefill_token, logits_row, k_cache, v_cache, _plen = run_npu_prefill_chunked(
+                list(prompt_tokens),
+                self.weights,
+                self.config,
+                self.prefill_cache,
+                self.decode_cache,
+                self.rope_lut_bf16,
+                self.max_seq,
+                tokenizer=self._tokenizer,
+                ubatch=self.ubatch,
+                profile=False,
+                quiet=True,
+            )
+            self.k_cache = k_cache
+            self.v_cache = v_cache
+            empty = np.empty((0,), dtype=np.float32)
+            return PrefillRecord(
+                layer_intermediates=[],
+                final_hidden_normed=empty,
+                logits_at_pred=logits_row,
+                top1_token=prefill_token,
+            )
         eos = self._tokenizer.eos_token_id
         if len(prompt_tokens) < self.prefill_M:
             padded = list(prompt_tokens) + [eos] * (self.prefill_M - len(prompt_tokens))

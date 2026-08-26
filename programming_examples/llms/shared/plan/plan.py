@@ -218,8 +218,14 @@ def fuse(graph, wl, placements, caps=NPU2_CAPS, forced=None):
                                 note=pa.reason))
         stages.append(Stage("kv_append", HOST, ("kv_append_L",), boundary_bytes=g.nbytes("k_roped_L", Mq) + g.nbytes("v_L", Mq),
                             note=placements["kv_append_L"].reason))
-        stages.append(Stage("flash_attn", pa.where, ("attention_L",), launches=1,
-                            launch_breakdown=(("attention_L", 1, "FlashAttention, one launch"),), note=pa.reason))
+        # `[2026-08-25]` doc 56 H1b: kv_len > M is a chunked-prefill chunk whose
+        # queries attend to the whole context -- a RECTANGULAR FA artifact,
+        # named per context length. Mirrors fa_headfirst.fa_cache_name (the
+        # plan package stays dependency-free; a host test pins the agreement).
+        fa_name = "flash_attn" if wl.kv_len == Mq else f"flash_attn_ctx{wl.kv_len}"
+        stages.append(Stage(fa_name, pa.where, ("attention_L",), launches=1,
+                            launch_breakdown=(("attention_L", 1, "FlashAttention, one launch"),),
+                            note=pa.reason + ("" if wl.kv_len == Mq else f"; rectangular (Lq={Mq}, Lk={wl.kv_len}), causal base {wl.kv_len - Mq}")))
         for hop in pa.extra_host_ops[1:]:
             stages.append(Stage(hop, HOST, ("attention_L",), boundary_bytes=g.nbytes("attn_out_L", Mq), note=pa.reason))
         # --- O + FFN ---
@@ -395,5 +401,88 @@ def plan(graph, wl, caps=NPU2_CAPS, forced=None):
     body = json.dumps({"spec": asdict(spec), "workload": p.workload, "caps": p.caps, "placements": p.placements,
                        "stages": [asdict(s) for s in stages], "planner_version": p.planner_version, "forced": forced},
                       sort_keys=True, default=str)
+    p.sha = hashlib.sha256(body.encode()).hexdigest()
+    return p
+
+
+# ---------------------------------------------------------------------------
+# 5. `[2026-08-25]` doc 56 H1b: the chunked-prefill plan -- per-chunk stages.
+# ---------------------------------------------------------------------------
+
+def plan_ubatch_prefill(graph, logical_tokens, ubatch, caps=NPU2_CAPS, ctx=2048,
+                        precision_plan="bf16", forced=None):
+    """The plan of an INCREMENTAL prefill: a `logical_tokens` prompt in
+    `ubatch`-token chunks, chunk-outer / layer-inner (doc 56 sections 3.4 / 5).
+
+    Chunk i is the ordinary prefill plan at Workload("prefill", M=ubatch,
+    kv_len=(i+1)*ubatch) -- its FA stage is the square "flash_attn" for chunk
+    1 and the rectangular "flash_attn_ctx<kv>" after. The composed Plan holds
+    every chunk's stages IN ORDER (each chunk: its embed_lookup of the chunk's
+    rows, then the per-layer stages; the LAST chunk also final_rms_norm + the
+    LM head), so `total_host_ops` / `total_launches` / `total_submissions`
+    are what the driver must dispatch and the runner's live checks enforce --
+    the chunked form is MODELLED, never special-cased at the check.
+
+    logical_tokens == ubatch composes one chunk and returns the base plan
+    unchanged (same sha as the whole-prompt plan: it IS the same execution).
+
+    A prompt that is not a whole number of chunks is a refusal -- the chunked
+    scheduler has no padding path (H1b: EOS padding gone; a padded tail would
+    need masking and exclusion from the numerator, and nothing ships that).
+    """
+    logical_tokens, ubatch = int(logical_tokens), int(ubatch)
+    if ubatch <= 0 or logical_tokens <= 0 or logical_tokens % ubatch != 0:
+        raise ValueError(
+            f"ubatch prefill: prompt of {logical_tokens} tokens is not a whole "
+            f"number of ubatch={ubatch} chunks (no padding path; doc 56 H1b)")
+    n_chunks = logical_tokens // ubatch
+    chunk_plans = [
+        plan(graph, Workload("prefill", ubatch, (i + 1) * ubatch, ctx, precision_plan), caps, forced=forced)
+        for i in range(n_chunks)
+    ]
+    if n_chunks == 1:
+        return chunk_plans[0]
+
+    from dataclasses import replace as _replace
+
+    spec = graph.spec
+    L = spec.n_layers
+    stages, rejected = [], list(chunk_plans[0].rejected)
+    for i, cp in enumerate(chunk_plans):
+        tag = f"chunk {i}: context {i * ubatch}->{(i + 1) * ubatch}"
+        for s in cp.stages:
+            if s.repeated or s.name == "embed_lookup":
+                stages.append(_replace(s, note=(tag + ("; " + s.note if s.note else ""))))
+        if i == n_chunks - 1:
+            for s in cp.stages:
+                if not s.repeated and s.name != "embed_lookup":
+                    tail_tag = tag + " (after the last chunk)"
+                    stages.append(_replace(s, note=(tail_tag + ("; " + s.note if s.note else ""))))
+
+    p = Plan(spec.name,
+             {**chunk_plans[0].workload, "kv_len": logical_tokens,
+              "logical_tokens": logical_tokens, "ubatch_tokens": ubatch, "n_chunks": n_chunks},
+             caps.as_dict(), chunk_plans[0].placements, stages, rejected, forced=dict(forced or {}))
+    dev = [s for s in stages if s.where == DEVICE]
+    hst = [s for s in stages if s.where == HOST]
+    reps = lambda s: L if s.repeated else 1
+    p.per_layer_launches = chunk_plans[0].per_layer_launches      # per layer per chunk
+    p.per_layer_submissions = chunk_plans[0].per_layer_submissions
+    p.per_layer_host_ops = chunk_plans[0].per_layer_host_ops
+    p.total_launches = sum(s.launches * reps(s) for s in dev)
+    p.total_submissions = sum(reps(s) for s in dev)
+    p.total_host_ops = sum(reps(s) for s in hst)
+    # weights are RESIDENT once, not per chunk; boundary bytes cross per chunk
+    p.resident_weight_bytes = chunk_plans[0].resident_weight_bytes
+    p.boundary_bytes = sum(s.boundary_bytes * reps(s) for s in stages)
+    bnd = p.total_launches * caps.launch_boundary_us
+    sub = p.total_submissions * caps.run_fixed_us
+    gemm_us = sum(cp.est_breakdown.get("gemm_us_from_registry", 0.0) for cp in chunk_plans)
+    p.est_breakdown = {"boundaries_us": bnd, "submissions_us": sub, "gemm_us_from_registry": gemm_us}
+    p.est_us = sum(p.est_breakdown.values())
+    p.source = (FORCED if forced else ANALYTICAL) if any(cp.source != MEASURED for cp in chunk_plans) else MEASURED
+    body = json.dumps({"composition": "ubatch_prefill", "chunks": [cp.sha for cp in chunk_plans],
+                       "logical_tokens": logical_tokens, "ubatch": ubatch,
+                       "planner_version": p.planner_version, "forced": dict(forced or {})}, sort_keys=True)
     p.sha = hashlib.sha256(body.encode()).hexdigest()
     return p

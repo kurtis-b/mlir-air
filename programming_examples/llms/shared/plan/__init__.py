@@ -9,4 +9,4 @@ them into a compiler. See docs/plans/transformer-layer-execution-studies/56.
 from .graph import ModelSpec, Tensor, Node, ModelGraph, decoder_graph, QWEN3_0_6B, LLAMA32_1B  # noqa: F401
 from .caps import DeviceCaps, NPU2_CAPS  # noqa: F401
 from .placement import Workload, Placement, place, study_skip  # noqa: F401
-from .plan import Plan, Stage, plan  # noqa: F401
+from .plan import Plan, Stage, plan, plan_ubatch_prefill  # noqa: F401

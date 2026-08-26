@@ -497,6 +497,103 @@ loaded artifact set and the model adapter all call it. Whether the 17-arg call w
 device (devq 486's 12.96 tok/s came from it) was not separately tested; the gate now runs the
 18-arg path and passes.
 
+**`[2026-08-25]` H1b landed** (queue item 16; evidence `results/item16-h1b-20260825/`, local:
+the probe + decision record, the compiled sets, the re-execution gate, the two walk roots,
+`compare_walk1_walk2.txt`, devq logs). **The §3.4 decision, by probe**: rectangular head-first
+FA (the compile-time `(Lq, Lk)` grid), NOT a run-time kv trip count — the FA launch signature
+`attention_bf16(q,k,v,gp)` has no host-scalar path and every kv bound is a compile-time
+constant threaded through ~1,600 builder lines, while the rectangular form is ~20 lines
+confined to the causal counter: the builder always carried `lq`/`lk` independently and
+`apply_causal_mask` takes GLOBAL block indices, so "the lq queries are the LAST lq rows of the
+lk context" is exactly "boot and wrap the q_block counter at `(lk−lq)/64` instead of 0"
+(`attn_npu2.py`; `lq == lk` emits byte-identical IR, sha-pinned before/after). Probe (walls
+doctrine): tiny `(256, 512)` through FULL aircc in 7.5 s, no walls (devq 595); on the NPU
+cos 0.9991 vs the offset-mask f32 reference, dispatch 2 byte-equal, square-mask control 0.35
+(devq 596). The run-time trip count stays the recorded alternative for a finer ubatch grid
+(the triangular artifact growth starts at ubatch 256).
+
+What landed: `run_npu_prefill_chunked` (qwen3_0_6b, the ONE owner of the incremental path —
+chunk-outer / layer-inner, per-layer `kv_append` BEFORE attention so a chunk attends to every
+earlier chunk's KV plus its own straight off the cache, RoPE LUT sliced at ABSOLUTE positions
+and passed NON-static (`_fused_qknorm_rope_call(lut_static=False)` — the static-skip would
+silently RoPE chunk 2 at chunk 1's positions), NO padding path: a partial chunk is a refusal,
+EOS padding gone); `fa_headfirst.npu_fa_headfirst_kv` + `fa_cache_name` (the FA fed from the
+host KV cache; square "flash_attn" at chunk 1, `flash_attn_ctx<Lk>` after);
+`compile_all_kernels(attn_ctx_lens=)` / `run_model.py compile --fa-ctx`; the adapter's
+`prefill(ubatch_policy="chunked")` with per-chunk profiler deltas; **the plan models the
+chunked phase** (`plan_ubatch_prefill`: per-chunk stages composed in order, the FA artifact
+named per context, one chunk degenerates to the whole plan with the same sha; 169 submissions /
+171 host_ops / 962 launches at 2 × 512 over 28 layers — the live dispatch and host_ops checks
+enforce exactly these, never loosened); the `ubatch-curve` profile (two UBATCH-labelled rungs,
+`ubatch_tokens` 512/1024, `context 0→1024`, per-chunk records + TTFT in every row); and the
+gate runs the SAME chunked path (`LLMS_VERIFY_UBATCH` → the verify adapter's chunked branch,
+its 32-token decode continuing from the incrementally built KV cache — decode correctness
+after chunked prefill IS the point). Host suite 662 → **679/679 in 31 modules**
+(`test_ubatch_prefill.py`: the chunk math against an f32 reference — composition equality,
+the kernel's block mask vs the elementwise causal mask, KV layout / V-pack byte-equality, a
+garbage tail provably unable to touch valid rows — the refusals, the composed plan's totals,
+and the hops by source); seam PLAN 10 → **11/11**.
+
+**Gates on silicon** (all Turbo before/after): the M=512 set compiled WITH
+`flash_attn_ctx1024` and the M=1024 set, both `artifact_deviation: null`, launch counts = the
+plan's (devq 597). The two-dispatch re-execution gate (doc 57 §1.5 shape, production call
+site): first run FAILED an arbitrary 0.999 f32-cos threshold — `rect(512,1024) dispatch 1 cos
+0.998987 < 0.999`, identical on dispatch 2 (devq 598) — settled by measurement, not by
+lowering the number (devq 599, then STRICTLY re-asserted after the review round, devq 604):
+no cosine criterion at all — accuracy is the kernel family's own per-element standard
+verbatim (the standalone harness's `np.isclose(rtol=1.6e-2, atol=1e-1)`), **0 mismatches on
+every shape and dispatch** (rect atol_required 2.41e-2 — per-element TIGHTER than the squares'
+9.25e-2); dispatch 2 byte-equal per shape; and **the composition identity ASSERTED BIT-EXACT**
+— the rectangular kernel's 512 rows equal rows [512:1024) of the square (1024,1024) device
+kernel byte-for-byte (`bit-equal=1.0, max_abs=0`), so the rectangular change introduced no
+numeric deviation at all; the square-mask negative control misclosed on 303k/1.05M elements.
+
+**The two-point curve** (devq 600 walk 1 / 601 walk 2; the SAME 1024-token prompt, both points
+chunked-path, 3 timed samples each after 1 warmup; `complete: True` both, verify PASS per set
+on the timed bytes, `compare_roots` **VERDICT: OK** — 0 warnings, 0 failures, tok/s drift med
+1.48 %):
+
+| point | tok/s (w1 / w2) | TTFT s | device / sync / host-cpu ms | per-forward vector |
+|---|---|---|---|---|
+| ubatch 512 (2 chunks) | **1179.9 / 1173.6** | 0.854–0.889 | 697 / 55 / 46–49 | 169 subs, 962 launches, 1746 herds, 795 syncs, 1233 MB |
+| ubatch 1024 (1 chunk) | **1334.5 / 1302.1** | 0.753–0.792 | 605–614 / 54–58 / 50 | 85 subs, 486 launches, 878 herds, 403 syncs, 1175 MB |
+
+Per chunk at ubatch 512: chunk 0 (ctx 0→512) 0.39–0.41 s, 84 subs / 476 launches / 587 MB;
+chunk 1 (ctx 512→1024, rectangular FA, LM head after) 0.45–0.48 s, 85 / 486 / 646 MB. Reading
+it against the §1 hypothesis (throughput rises with ubatch until a capacity cap): the
+direction holds on XDNA2 — halving the ubatch costs **~11 %** (and +0.09–0.10 s TTFT), and the
+cost is attributable: +84 submissions and +476 launch boundaries (the composed plan's own
+derivation), +59 MB boundary traffic (chunk 2's FA re-reads the full 1024-row KV), and chunk
+2's rectangular FA runs 2× the keys per query. The 1-chunk ubatch-1024 point reads 1302–1334
+vs the kernel-scaling whole-path M=1024 standing numbers 1346–1393 (walks 7–9): the
+incremental form's price at one chunk (~1–3 %) is the per-layer KV append plus the FA fed
+from a contiguous KV-cache slice copy. Kernel-scaling standing numbers unmoved.
+
+**`[2026-08-26]` Item 16's one review round** (devq 602; 3 blocking + 1 non-blocking, all
+fixed, no second round). (1) The FA standalone CLI's causal oracle applied the SQUARE mask at
+rectangular shapes — fixed (mask offset by lk−lq) and the rectangular case joined the CLI's
+own verify path (`run_npu2_makefile_peano_causal_rect.lit`; on device: PASS, 0/65536
+mismatches at the family standard, 3.66× atol margin, devq 603). (2) The re-execution gate
+now ASSERTS everything it claims (above; devq 604). (3) The chunked scheduler is tested as
+CODE, both sides of the NPU boundary: host — a fake-NPU KernelCache (float64→bf16 contracts,
+load_and_run's static-skip REPRODUCED) runs the real `run_npu_prefill_chunked` end-to-end
+against the real `run_npu_prefill`: token, logits and every layer's KV byte-equal, plus a
+teeth check that forcing `lut_static=True` breaks equality exactly at chunk 2's positions
+(host suite 679 → **681/681 in 31**); device — the same 1024-token prompt three ways
+(whole-1024, chunked-512, and a no-chunking CONTROL: single-shot on the shipped M=2048 set,
+which MEASURES the cross-M tiling divergence the tolerance derives from; gate factor 2×
+declared before the control ran): **chunked diverges LESS than the single-shot control at
+every layer** (worst chunked/control mismatch-fraction ratio 0.76 k / 0.80 v; logits 0.21 vs
+0.25), layer-0 K/V BYTE-equal (the chunk mechanics — absolute RoPE, per-layer append, both
+chunk boundaries — carry no tolerance), top-1 equal across all three, top-5 equal for the
+pair under test; the control's own 5th slot differs from whole-1024 — the cross-tiling
+instability that is exactly why §3.7 gates against HF top-k set-inclusion, not cross-plan
+equality (legs devq 607). (4) The square-IR pin now covers the production 1024 square too
+(three shapes, byte-identical against the pre-change builder). Kernels unchanged in the
+round, so one fresh walk revalidates: walk 3 (devq 606) `complete: True`, verify PASS both
+sets, ubatch 512 / 1024 = **1125.2 / 1345.3 tok/s**, `compare_roots` walk1→walk3 OK (drift
+med 2.72 %, max 4.63 %, inside the band).
+
 ## 5. The first measurable milestone
 
 **A two-point Qwen3-0.6B bf16 prefill curve at ubatch 512 and 1024 over the same 1024-token

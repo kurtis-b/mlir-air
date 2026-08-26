@@ -124,6 +124,32 @@ def test_plan_hash_is_value_identity():
     assert forced.source == "forced"
 
 
+def test_ubatch_prefill_composition():
+    """`[2026-08-25]` doc 56 H1b: the chunked-prefill plan. Per-chunk stages
+    with the FA artifact named per context (rectangular past chunk 1), totals
+    the runner's live checks enforce, one-chunk degenerating to the whole
+    plan, and the no-padding refusal."""
+    from shared.plan import plan_ubatch_prefill
+    g = decoder_graph(QWEN3_0_6B)
+    p = plan_ubatch_prefill(g, 1024, 512, ctx=512)
+    assert [s.name for s in p.stages if s.where == "device"] == [
+        "rms_qkv_qknorm_rope", "flash_attn", "o_ffn_qwen",
+        "rms_qkv_qknorm_rope", "flash_attn_ctx1024", "o_ffn_qwen", "lm_head_gemv"]
+    assert p.total_submissions == 169 and p.total_host_ops == 171
+    assert p.workload["n_chunks"] == 2 and len(p.sha) == 64
+    assert p.sha != plan(g, Workload("prefill", 512, 512, 512)).sha
+    assert p.sha != plan(g, Workload("prefill", 1024, 1024, 512)).sha
+    assert plan_ubatch_prefill(g, 1024, 1024, ctx=1024).sha == plan(g, Workload("prefill", 1024, 1024, 1024)).sha
+    # a square prefill's FA stage keeps its historical name at every M
+    sq = plan(g, Workload("prefill", 2048, 2048))
+    assert [s.name for s in sq.stages if s.name.startswith("flash_attn")] == ["flash_attn"]
+    try:
+        plan_ubatch_prefill(g, 1000, 512)
+        raise AssertionError("partial chunk accepted")
+    except ValueError as e:
+        assert "whole number" in str(e)
+
+
 def test_non_lean_form_splits_o_ffn():
     """A model outside the lean bounds gets the split O+FFN forms (qwen25_0_5b's shape: hidden 4864)."""
     from shared.plan.graph import ModelSpec

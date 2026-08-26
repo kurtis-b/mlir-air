@@ -200,7 +200,11 @@ def restore_scratch_layout(config, seq_len, o_ffn_gemm_method=None):
     return list(scratch_for)
 
 
-def compile_all_kernels(cache, config, seq_len, verbose=False, cpu_attn=False, o_ffn_gemm_method=None):
+def compile_all_kernels(cache, config, seq_len, verbose=False, cpu_attn=False, o_ffn_gemm_method=None, attn_ctx_lens=()):
+    """`attn_ctx_lens` `[2026-08-25]` (doc 56 H1b): extra K/V context lengths to
+    compile RECTANGULAR head-first FA ELFs for, one per length, named
+    `flash_attn_ctx<len>` -- the chunked prefill's later chunks attend to
+    kv_len > seq_len keys. () compiles exactly what this always compiled."""
     global _FUSED_SCRATCH_FOR, _OFFN_SCRATCH_FOR
     emb_dim = config.emb_dim
     n_heads = config.n_heads
@@ -247,10 +251,18 @@ def compile_all_kernels(cache, config, seq_len, verbose=False, cpu_attn=False, o
     # Flash Attention (head-first, head_dim=128). Skip if using CPU fallback.
     if not cpu_attn:
         print("\n--- flash_attn (head-first FA, head_dim=128) ---")
-        from shared.infra.fa_headfirst import compile_headfirst_fa
+        from shared.infra.fa_headfirst import compile_headfirst_fa, fa_cache_name
 
         compile_headfirst_fa(cache, seq_len, n_heads, n_kv_heads, head_dim, verbose)
+        for ctx in sorted(set(int(c) for c in attn_ctx_lens)):
+            if ctx == seq_len:
+                continue  # the square ELF above IS this context
+            print(f"\n--- {fa_cache_name(seq_len, ctx)} (rectangular FA, Lq={seq_len} Lk={ctx}) ---")
+            compile_headfirst_fa(
+                cache, seq_len, n_heads, n_kv_heads, head_dim, verbose, kv_len=ctx
+            )
     else:
+        assert not attn_ctx_lens, "attn_ctx_lens needs the NPU FA path (cpu_attn=False)"
         print("\n--- Skipping flash_attn (CPU attention fallback) ---")
 
     cache._save_manifest()
@@ -263,7 +275,7 @@ def compile_all_kernels(cache, config, seq_len, verbose=False, cpu_attn=False, o
 
 
 def _fused_qknorm_rope_call(
-    cache, lw, config, seq_len, lut_q, lut_k, layer_idx, x_in, verbose=False
+    cache, lw, config, seq_len, lut_q, lut_k, layer_idx, x_in, verbose=False, lut_static=True
 ):
     """Issue one rms_qkv_qknorm_rope ELF call (fused prefill attention-input).
 
@@ -271,6 +283,14 @@ def _fused_qknorm_rope_call(
     runner (x_in = real hidden). Returns the cache.load_and_run result tuple
     (output_indices=[8, 15, 16] -> v, q_roped, k_roped). The single owner of
     the fused arg layout + index sets so the warmup BO set lines up exactly.
+
+    `lut_static` `[2026-08-25]` (doc 56 H1b): the whole-prompt path's RoPE LUT
+    is position-0-based and identical every call, so args 13/14 ride the
+    static-skip (written at warmup, skipped after). The CHUNKED path's LUT is
+    a per-chunk slice at the chunk's ABSOLUTE positions -- static-skipping it
+    would silently RoPE chunk 2 at chunk 1's positions (load_and_run writes a
+    static arg only on the bo_key's first call). The chunk runner passes
+    lut_static=False: same BO set, args 13/14 rewritten every call.
     """
     emb_dim = config.emb_dim
     n_heads = config.n_heads
@@ -305,12 +325,13 @@ def _fused_qknorm_rope_call(
             args.append(np.zeros((seq_len, cols), dtype=np.float32))
             inter.add(nxt)
             nxt += 1
+    static = {1, 3, 5, 7, 9, 10} | ({13, 14} if lut_static else set())
     return cache.load_and_run(
         "rms_qkv_qknorm_rope",
         _rms_qkv_qknorm_rope_backend(verbose),
         *args,
         output_indices=[8, 15, 16],
-        static_input_indices={1, 3, 5, 7, 9, 10, 13, 14},
+        static_input_indices=static,
         intermediate_indices=inter,
         bo_key=f"rms_qkv_qknorm_rope_L{layer_idx}",
         shared_nonstatic=True,
@@ -532,3 +553,107 @@ def run_transformer_block_qwen3(
     output_bf16 = results[14].reshape(seq_len, emb_dim)
     inter["ffn_out"] = output_bf16
     return output_bf16, inter
+
+
+# ---------------------------------------------------------------------------
+# Chunked (incremental) transformer block -- doc 56 H1b.
+# ---------------------------------------------------------------------------
+
+
+def run_transformer_block_qwen3_chunk(
+    x_bf16,
+    layer_weights,
+    rope_lut_bf16,
+    config,
+    cache,
+    layer_idx,
+    k_cache_layer,
+    v_cache_layer,
+    pos_start,
+    verbose=False,
+):
+    """One Qwen3 block over ONE prefill chunk (doc 56 H1b: chunk-outer /
+    layer-inner). x_bf16 is the chunk's (ubatch, emb) hidden rows at absolute
+    positions [pos_start : pos_start + ubatch); the layer's KV cache holds
+    every earlier chunk's K/V in rows [0 : pos_start).
+
+    Per layer: the SAME fused QKV ELF as the whole path, with the RoPE LUT
+    sliced at the chunk's absolute positions (and NOT static -- see
+    `_fused_qknorm_rope_call(lut_static=)`); the chunk's K/V appended to the
+    cache (`kv_append`, the plan's stage name); head-first FlashAttention over
+    cache rows [0 : pos_start + ubatch) -- square at chunk 1, rectangular
+    after; the same o_ffn ELF. Cross-chunk information flows ONLY through the
+    KV cache.
+
+    Returns the chunk's (ubatch, emb) output rows.
+    """
+    from shared.infra.fa_headfirst import npu_fa_headfirst_kv
+
+    ubatch = x_bf16.shape[0]
+    emb_dim = config.emb_dim
+    n_heads = config.n_heads
+    n_kv_heads = config.n_kv_heads
+    head_dim = config.head_dim
+    q_dim = n_heads * head_dim
+    kv_dim = n_kv_heads * head_dim
+    kv_end = pos_start + ubatch
+
+    # RoPE LUTs at the chunk's ABSOLUTE positions (chunk 2 starts at 512).
+    lut_rows = rope_lut_bf16[pos_start:kv_end]
+    assert lut_rows.shape[0] == ubatch, (
+        f"rope LUT holds {rope_lut_bf16.shape[0]} positions; chunk needs "
+        f"[{pos_start}:{kv_end})"
+    )
+    lut_q = np.repeat(lut_rows, n_heads, axis=0).flatten()
+    lut_k = np.repeat(lut_rows, n_kv_heads, axis=0).flatten()
+
+    res = _fused_qknorm_rope_call(
+        cache,
+        layer_weights,
+        config,
+        ubatch,
+        lut_q,
+        lut_k,
+        layer_idx,
+        x_bf16,
+        verbose=verbose,
+        lut_static=False,
+    )
+    v = res[8].reshape(ubatch, kv_dim)
+    q_roped = res[15].reshape(ubatch, q_dim)
+    k_roped = res[16].reshape(ubatch, kv_dim)
+
+    # Per-layer KV append BEFORE attention: the chunk attends to all earlier
+    # chunks' rows PLUS its own, straight off the cache.
+    with cache.profiler.time_cpu("kv_append"):
+        k_cache_layer[:, pos_start:kv_end, :] = (
+            k_roped.astype(bfloat16).reshape(ubatch, n_kv_heads, head_dim).transpose(1, 0, 2)
+        )
+        v_cache_layer[:, pos_start:kv_end, :] = (
+            v.astype(bfloat16).reshape(ubatch, n_kv_heads, head_dim).transpose(1, 0, 2)
+        )
+
+    attn_out = npu_fa_headfirst_kv(
+        cache,
+        np.ascontiguousarray(q_roped),
+        k_cache_layer,
+        v_cache_layer,
+        kv_end,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        ubatch,
+        verbose=verbose,
+    )
+
+    results = _o_ffn_call(
+        cache,
+        layer_weights,
+        config,
+        ubatch,
+        attn_out,
+        x_bf16,
+        layer_idx,
+        verbose=verbose,
+    )
+    return results[14].reshape(ubatch, emb_dim)
