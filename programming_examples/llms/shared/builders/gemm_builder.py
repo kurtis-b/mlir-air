@@ -205,6 +205,51 @@ def gemm_method_spec(method, tile_n):
     }
 
 
+def o_ffn_gemm_layout(seq_len, emb_dim, hidden_dim, q_dim=None, method=None, base_arg_count=15):
+    """`[2026-08-25]` The O+FFN cascade's per-GEMM registry specs and f32-scratch
+    tail, derived WITHOUT building anything (queue item 14, doc 56 H1a wall).
+
+    The single owner of the cascade's GEMM identity: `_build_o_ffn` builds from
+    it, `compile_all_kernels` compiles the mm.o variants it names, and the
+    drivers' `restore_scratch_layout` re-derives the ELF's scratch-arg tail from
+    it in a process that loads the manifest instead of compiling. Air-free on
+    purpose (registry JSON + `alloc_gemm_scratch` only) so host tests can pin it.
+
+    `q_dim` is the O GEMM's inner dim (decoupled Qwen head: K = q_dim != emb_dim);
+    None means the square llama form. `method` forces every GEMM's registry
+    method (test-only since the cascade went per-GEMM; a forced method is a plan
+    deviation). Returns {"o", "gate_up", "down": spec, "scratch_args",
+    "scratch_for" (order O/gate/up/down), "launches" (GEMM + 4 non-GEMM)}.
+    """
+    from shared.infra.stitching import alloc_gemm_scratch
+
+    if q_dim is None:
+        q_dim = emb_dim
+    o_spec = gemm_registry_config(seq_len, q_dim, emb_dim, "bf16", "high", method=method)
+    g_spec = gemm_registry_config(seq_len, emb_dim, hidden_dim, "bf16", "high", method=method)
+    d_spec = gemm_registry_config(seq_len, hidden_dim, emb_dim, "bf16", "high", method=method)
+    scratch_args, scratch_for = alloc_gemm_scratch(
+        [
+            (o_spec, seq_len, emb_dim),
+            (g_spec, seq_len, hidden_dim),
+            (g_spec, seq_len, hidden_dim),
+            (d_spec, seq_len, emb_dim),
+        ],
+        base_arg_count=base_arg_count,
+    )
+    launches = (
+        o_spec["n_launches"] + 2 * g_spec["n_launches"] + d_spec["n_launches"] + 4
+    )  # + res add, RMSNorm, SwiGLU, FFN add
+    return {
+        "o": o_spec,
+        "gate_up": g_spec,
+        "down": d_spec,
+        "scratch_args": scratch_args,
+        "scratch_for": scratch_for,
+        "launches": launches,
+    }
+
+
 def _build_gemm_module(
     m,
     k,

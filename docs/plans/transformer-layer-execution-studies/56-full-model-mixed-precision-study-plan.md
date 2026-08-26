@@ -412,6 +412,82 @@ drain-capable cascade (per-GEMM arg maps and extern sets, as `rms_qkv_qknorm_rop
 does through `alloc_gemm_scratch`) is the repair that makes the curve the registry's own at
 every M.
 
+**`[2026-08-25]` Both walls closed** (queue item 14; evidence `results/item14-20260825/`, local:
+job scripts, compiled roots, the two walk roots, `compare_walk7_walk8.txt`, the re-execution
+gate). The cascade is PER-GEMM now: the shared `o_ffn_multi._build_o_ffn` takes each GEMM's
+registry method + tile_n independently (drain = 3-arg / 1 launch / tile_m 32, fused-cast =
+4-arg + f32 scratch + cast launch / tile_m 64) with per-GEMM `mm.o` objects and sym suffixes
+co-linked in one ELF — exactly the `rms_qkv_qknorm_rope_multi` mechanics, via a new air-free
+layout owner `gemm_builder.o_ffn_gemm_layout` (specs + `alloc_gemm_scratch` tail; base arg 15)
+that the builder, `compile_all_kernels`'s mm-variant compiles and the driver's
+`restore_scratch_layout` / `_o_ffn_call` all read (one owner, so a loaded artifact set is
+called with exactly its own arg count). `build_o_ffn_qwen_module` is a thin delegate
+(`q_dim=`, `func_name="o_ffn_qwen"`) — the ~250-line Qwen copy is gone — and `gemm_method=`
+survives as the explicit override, test-only, still recorded as a deviation when used. The
+stitched M = 2048 module is BYTE-IDENTICAL before/after for both models (captured/regenerated,
+string-equal); the recompiled M = 2048 ELFs match the shipped ones to their sizes and launch
+counts with only aircc's per-run `aie_image` metadata differing (913/576/228 bytes of 9.4/6.6/
+2.4 MB — the untouched flash_attn builder shows the same drift, the control; devq 582,
+`m2048-policy-identity.md`). Host suite 656 → **660/660 in 30 modules** (+4 test_model_adapter:
+the layout vs the PLANNER's launch count at all three M — two independent derivations — the
+forced M = 1024 layout reproducing the recorded 12-launch artifact, the M = 512 two-variant mix
+`_m64n96`/`_m64n128` that wall 2 refused, and the driver bound to the layout owner by ast);
+seam suite unchanged.
+
+On the device (all Turbo before/after): the M = 512 / 1024 sets compiled with NO forced method
+(devq 582, ~5 min each, `artifact_deviation: null`, o_ffn_qwen **8 air launches / 16 herd** =
+the plan's own derivation, QKV 8/14); production `make verify` PASS on the recompiled M = 2048
+path (devq 584, topk 2/2, rc 0). Walks 7 and 8 (devq 585 / 586, `results/item14-20260825/`,
+compiled root the item-14 sets + the shipped M 2048): **`complete: True` both, 10/10 passed,
+the curve 3/3** — Qwen3-0.6B prefill M 512 **1270 / 1273 tok/s** (the first measured M = 512
+point), M 1024 **1372 / 1353** on the drain plan (486 launches, `forced = {}`, plan source
+back to derived, no `artifact_deviation` label; the forced fused-cast walks 3/4 read 1359 /
+1338 at 598 launches), M 2048 **1376 / 1390** (626 launches, unchanged plan); decode ctx
+512/1024/2048 11.94/10.08/7.30 and 12.04/10.43/7.19; llama untouched (prefill 1759.9/1759.9,
+decode 10.87/10.14/8.89 and 10.69/10.09/8.70). `compare_roots` walk7 vs walk8 **VERDICT: OK**
+(0 warnings, 0 failures, identifier mismatches 0, tok/s drift med 1.19 % qwen / 1.11 % llama);
+verify PASS per artifact set on the timed bytes (M 512 and 1024 1/1, M 2048 4/4 both models),
+the item-15 `host_ops` live check green on every rung. The two-dispatch re-execution gate
+(doc 57 §1.5 shape: one loaded set, two back-to-back dispatches through the production call
+sites, `reexec_o_ffn_gate.py`) **PASS on both new all-drain sets** (devq 589): o_ffn corr
+0.9997 vs the CPU cascade reference on BOTH dispatches, QKV's V path 0.99994, dispatch 2
+byte-equal to dispatch 1 for every output, at M = 512 and 1024.
+
+**The deviation plumbing had to change, and it explains devq 583.** A LOADED artifact set must
+be restored with ITS OWN layout, not the registry's: the old forced fused-cast M = 1024 set run
+through the per-GEMM driver got the drain restore — 15 args set on a 19-arg ELF, and
+`load_and_run`'s ELF path `set_arg`s only the bos it is given, so the four f32 C-scratch args
+the fused-cast GEMMs write stayed UNBOUND. That is a nondeterministic wrong answer the token
+gate catches only sometimes — the disjoint-top-5 M = 1024 verify FAIL devq 583 hit on bytes
+walks 3–6 had passed (under the old 19-arg driver). `restore_scratch_layout` now takes
+`o_ffn_gemm_method=`; `model_adapter.prepare` and the qwen verify adapter's loaded-cache path
+read the set's `compile.json` `artifact_deviation` and pass it (661st host test pins all three
+hops by source). Re-run of the exact 583 scenario — the production gate ×3 on the old forced
+M = 1024 set — PASS 2/2 every leg (devq 590, Turbo before/after).
+
+**`[2026-08-25]` Item 14's one review round** (devq 591, one blocking + one non-blocking,
+both fixed; no second round): metadata alone was still trusted — absent or garbled
+compile.json restored the registry layout unchecked. Now the **ELF is the ABI ground
+truth**: `dispatch.elf_arg_count` reads the kernel's buffer-argument count from the
+binary's own `.dynsym` (the numeric symbol names ARE the argument indices; verified
+against every shipped cache) and `load_and_run` refuses — before `ensure_loaded`, at the
+one chokepoint every load path dispatches through — any call that does not match it, and
+any manifest `n_args` contradicting its ELF (recorded at compile time now).
+`artifact_content_sha` folds each cache's `artifact_deviation` into the timed-vs-verified
+identity (absence hashes as absence; `wall_s`/`cwd` stay out). Seam suite 35 → **40/40**
+(synthetic-ELF parser, both refusal directions, the stale-manifest clause, the chokepoint's
+position by source), study 661 → **662/662**. On the device: a deliberately mismatched
+cache (the forced M = 1024 ELFs with compile.json deleted, then garbled) is REFUSED by the
+production gate with `ArgCountMismatchError: o_ffn_qwen: called with 15 arguments but the
+loaded artifact ... declares 19 ... refusing before any device work` (devq 592 / clean
+re-run 594, control leg with metadata restored PASS 2/2); a fresh model-smoke walk with the
+validation live on every dispatch is `complete: True` 10/10, curve 3/3 (M 512/1024/2048 =
+1281 / 1346 / 1393 tok/s), verify PASS per set, walk8→walk9 drift med 1.0 % (devq 593).
+The `--run-only` semantics chosen for a forced cache: refuse at the first o_ffn dispatch
+(the run-only driver never reads compile.json); a set with valid metadata restores
+correctly through the adapters. Non-blocking: the recorded deviation's `why` text updated
+to the per-GEMM reality.
+
 **Also found, and fixed.** The drivers' `--run-only` path (`make run` / `make profile`) left
 `qwen3_0_6b_prefill._FUSED_SCRATCH_FOR` at `None`, so the block runner passed 17 args to the
 M = 2048 QKV ELF that declares 18 (Q is fused-cast there). `qwen3_0_6b_prefill.restore_scratch_layout`

@@ -1,10 +1,10 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""O Projection + Residual Add + FFN — 8-launch multi-launch ELF.
+"""O Projection + Residual Add + FFN — multi-launch ELF, per-GEMM method.
 
-Merges o_proj_add (2 launches) + ffn_full (6 launches) into a single
-AIR function with 8 sequential air.launch operations:
+Merges o_proj_add + ffn_full into a single AIR function with 8 sequential
+stages (a fused-cast GEMM stage is 2 air.launch ops, a drain GEMM 1):
   1. O GEMM          [8,4]   attn_out x wo -> proj
   2. Residual Add    [8,1]   proj + x_residual -> res1 (2D, collapse inside)
   3. FFN RMSNorm     [8,1]   res1 x ffn_norm_w -> normed2
@@ -14,7 +14,9 @@ AIR function with 8 sequential air.launch operations:
   7. Down GEMM       [8,4]   swiglu x w_down -> down
   8. FFN Add         [8,1]   down + res1 -> output (1D)
 
-15 func args (8 launches). The res1 buffer (arg4) is shared between the
+15 base func args plus one f32 C-scratch tail arg per FUSED-CAST GEMM
+(`o_ffn_gemm_layout`; all-fused-cast = 19 args / 12 launches, all-drain =
+15 args / 8 launches). The res1 buffer (arg4) is shared between the
 Residual Add output and FFN input — 2D canonical type with collapse_shape
 inside both add launches.
 
@@ -183,26 +185,32 @@ def build_o_ffn_module(
     hidden_dim=8192,
     print_kernels=False,
 ):
-    """Build the fused O-proj + Residual + FFN ELF (12 launches, 19 args).
+    """Build the fused O-proj + Residual + FFN ELF (8 GEMM/eltwise stages).
 
     The 4 GEMMs (O/Gate/Up/Down) use external mm.o kernels whose method + tiles come
-    from the kernel_registry JSON per shape (gemm_registry_config). All 4 are large
-    (M*K*N>=4e9) so the registry resolves them to fused-cast (tile_m=64, f32 C scratch
-    + on-chip cast launch); 4 extra f32-scratch func args (15..18) carry the scratch.
-    Same 9.3e-3 GPU-standard precision as drain, but faster.
+    from the kernel_registry JSON per shape (gemm_registry_config), EACH GEMM
+    independently. At the llama shapes all 4 are large (M*K*N>=4e9) so the registry
+    resolves them to fused-cast (tile_m=64, f32 C scratch + on-chip cast launch,
+    12 launches / 19 args); a drain GEMM (small/thin shapes) contributes 1 launch
+    and no scratch arg. Same 9.3e-3 GPU-standard precision either way.
     """
-    return _build_o_ffn(
+    module, _scratch_for = _build_o_ffn(
         seq_len=seq_len,
         emb_dim=emb_dim,
         hidden_dim=hidden_dim,
         print_kernels=print_kernels,
     )
+    return module
 
 
 def _build_o_ffn(
     seq_len=2048,
     emb_dim=2048,
     hidden_dim=8192,
+    q_dim=None,
+    gemm_method=None,
+    func_name="o_ffn",
+    debug_dump_path="/tmp/debug_o_ffn.mlir",
     o_herd_m=8,
     o_herd_n=4,
     gate_herd_m=8,
@@ -215,28 +223,42 @@ def _build_o_ffn(
     swiglu_herd_y=1,
     print_kernels=False,
 ):
-    """O-proj + Residual + FFN, all-bf16 outward buffers, 12 launches / 19 args.
+    """O-proj + Residual + FFN, all-bf16 outward buffers. Returns (module, scratch_for).
 
-    The 4 GEMMs (O/Gate/Up/Down) get their method + tiles from the kernel_registry
-    JSON per shape (gemm_registry_config, "bf16"/"high"). All 4 are large so they
-    resolve to fused-cast (external mm.o GEMM with an f32 C scratch + a separate
-    on-chip cast launch each = @gemm_cast_bf16, 2 launches/GEMM). The 4 f32 scratch
-    buffers are func args 15..18. GPU-standard 9.3e-3 precision. Needs mm_m64n128.o +
+    `[2026-08-25]` PER-GEMM (queue item 14, doc 56 H1a wall): each of the 4 GEMMs
+    (O/Gate/Up/Down) independently takes its registry method + tiles per shape
+    (gemm_registry_config via `o_ffn_gemm_layout`) — drain = 3-arg, 1 launch,
+    tile_m 32; fused-cast = 4-arg + f32 C scratch + cast launch, tile_m 64 — with
+    per-GEMM mm.o objects / sym suffixes co-linked in one ELF, exactly as
+    `rms_qkv_qknorm_rope_multi` already does through `alloc_gemm_scratch`. The
+    f32 scratch tail args (base index 15) exist only for the fused-cast GEMMs;
+    `scratch_for` (order O/gate/up/down, None = drain) is the ELF's arg-layout
+    contract the drivers thread into their call sites.
+
+    `q_dim` decouples the O GEMM (Qwen: attn_out (seq, q_dim), wo (q_dim, emb_dim));
+    None = the square llama form. `gemm_method` forces every GEMM's registry method
+    (test-only; a forced method is a plan deviation recorded by the caller).
+    GPU-standard 9.3e-3 precision. Needs the layout's mm_*.o variants +
     runtime_loop_tiling_sizes=[2,2] (BD-ID recycling).
     """
     from shared.builders.gemm_builder import (
         _build_gemm_module,
-        gemm_registry_config,
+        o_ffn_gemm_layout,
     )
     from weighted_rms_norm.weighted_rms_norm import build_module as build_rms
+
+    if q_dim is None:
+        q_dim = emb_dim
 
     # Per-GEMM config from the kernel_registry JSON (single source of truth): method
     # (fused-cast vs drain) AND all tiles are looked up per shape — never hardcoded.
     # The lookup is per-shape so this adapts automatically to other models. Distinct
     # _m64/_m32 symbols + mm_*.o let any method mix co-link in one ELF.
-    o_spec = gemm_registry_config(seq_len, emb_dim, emb_dim, "bf16", "high")
-    g_spec = gemm_registry_config(seq_len, emb_dim, hidden_dim, "bf16", "high")
-    d_spec = gemm_registry_config(seq_len, hidden_dim, emb_dim, "bf16", "high")
+    layout = o_ffn_gemm_layout(
+        seq_len, emb_dim, hidden_dim, q_dim=q_dim, method=gemm_method
+    )
+    o_spec, g_spec, d_spec = layout["o"], layout["gate_up"], layout["down"]
+    scratch_for = layout["scratch_for"]
 
     def _tiles(spec):
         return (
@@ -255,12 +277,12 @@ def _build_o_ffn(
 
     # ---- Build sub-kernels ----
 
-    # L1: O GEMM
-    print(f"  [1/8] O GEMM ({o_spec['method']})...")
+    # L1: O GEMM (K = q_dim; equals emb_dim in the square llama form)
+    print(f"  [1/8] O GEMM ({o_spec['method']})  {seq_len}x{q_dim}x{emb_dim}...")
     o_ir = str(
         _build_gemm_module(
             seq_len,
-            emb_dim,
+            q_dim,
             emb_dim,
             _o_m,
             _o_k2,
@@ -466,20 +488,28 @@ def _build_o_ffn(
             print(ir)
 
     # ---- Stitch (declarative via stitch_elf) ----
-    # o_ffn is unconditionally all-fused-cast: all 4 GEMMs (O/Gate/Up/Down) share
-    # one method (_m64n128), each a 2-launch @gemm_cast_bf16 (A, W, C-f32-scratch,
-    # D-bf16-out). The 4 f32 scratches are fixed func args 15..18; non-GEMM kernels
-    # keep bf16 arg_maps. The mm.o symbols (suffix from o_spec) must not be renamed.
-    _gemm_sym = o_spec["sym_suffix"]
-    _gemm_externs = {
-        "@op_has_no_registered_library_name" + _gemm_sym,
-        "@zero_f32_mn" + _gemm_sym,
-        "@f32_to_bf16_mn" + _gemm_sym,
-    }
+    # Per-GEMM method + tile_n: a fused-cast GEMM is a 2-launch @gemm_cast_bf16
+    # (A, W, C-f32-scratch, D-bf16-out) with its scratch tail arg from
+    # alloc_gemm_scratch; a drain GEMM is 1 launch, 3 args, no scratch. Each
+    # GEMM's mm.o symbols (its own sym_suffix) must not be renamed, and each
+    # GEMM slice contributes its own private decls (set-deduped across slices,
+    # so two GEMMs of one variant declare it once).
+    def _gemm_externs(spec):
+        sfx = spec["sym_suffix"]
+        return {
+            "@op_has_no_registered_library_name" + sfx,
+            "@zero_f32_mn" + sfx,
+            "@f32_to_bf16_mn" + sfx,
+        }
+
+    def _gemm_arg_map(in_idx, w_idx, out_idx, sc):
+        if sc is not None:
+            return {0: in_idx, 1: w_idx, 2: sc, 3: out_idx}
+        return {0: in_idx, 1: w_idx, 2: out_idx}
 
     base_args = [
-        FuncArg("%arg0", f"memref<{seq_len}x{emb_dim}xbf16>"),
-        FuncArg("%arg1", f"memref<{emb_dim}x{emb_dim}xbf16>"),
+        FuncArg("%arg0", f"memref<{seq_len}x{q_dim}xbf16>"),
+        FuncArg("%arg1", f"memref<{q_dim}x{emb_dim}xbf16>"),
         FuncArg("%arg2", f"memref<{seq_len}x{emb_dim}xbf16>"),
         FuncArg("%arg3", f"memref<{seq_len}x{emb_dim}xbf16>"),
         FuncArg("%arg4", f"memref<{seq_len}x{emb_dim}xbf16>"),
@@ -494,33 +524,30 @@ def _build_o_ffn(
         FuncArg("%arg13", f"memref<{seq_len}x{emb_dim}xbf16>"),
         FuncArg("%arg14", f"memref<{n_total}xbf16>"),
     ]
-    # 4 f32-scratch args (proj/gate/up/down C-scratch), fixed indices 15..18.
-    scratch_args = [
-        FuncArg("%arg15", f"memref<{seq_len}x{emb_dim}xf32>"),
-        FuncArg("%arg16", f"memref<{seq_len}x{hidden_dim}xf32>"),
-        FuncArg("%arg17", f"memref<{seq_len}x{hidden_dim}xf32>"),
-        FuncArg("%arg18", f"memref<{seq_len}x{emb_dim}xf32>"),
-    ]
+    # Registry-driven f32-scratch tail (base index 15): one arg per FUSED-CAST
+    # GEMM in slice order O/gate/up/down; a drain GEMM gets None.
+    scratch_args = layout["scratch_args"]
 
-    # Privates only from the GEMM (o_ir covers all 4 mm.o symbols) and SwiGLU
-    # (@silu_and_mul_bf16); the other slices carry no private decls of their own.
     slices = [
-        KernelSlice(o_ir, "og", {0: 0, 1: 1, 2: 15, 3: 2}, extern_syms=_gemm_externs),
+        KernelSlice(
+            o_ir,
+            "og",
+            _gemm_arg_map(0, 1, 2, scratch_for[0]),
+            extern_syms=_gemm_externs(o_spec),
+        ),
         KernelSlice(res_add_ir, "ra", {0: 2, 1: 3, 2: 4}, private_from=False),
         KernelSlice(rms_ir, "rm", {0: 4, 1: 5, 2: 6}, private_from=False),
         KernelSlice(
             gate_ir,
             "gg",
-            {0: 6, 1: 7, 2: 16, 3: 8},
-            extern_syms=_gemm_externs,
-            private_from=False,
+            _gemm_arg_map(6, 7, 8, scratch_for[1]),
+            extern_syms=_gemm_externs(g_spec),
         ),
         KernelSlice(
             up_ir,
             "ug",
-            {0: 6, 1: 9, 2: 17, 3: 10},
-            extern_syms=_gemm_externs,
-            private_from=False,
+            _gemm_arg_map(6, 9, 10, scratch_for[2]),
+            extern_syms=_gemm_externs(g_spec),
         ),
         KernelSlice(
             swiglu_ir, "sw", {0: 8, 1: 10, 2: 11}, extern_syms={"@silu_and_mul_bf16"}
@@ -528,22 +555,21 @@ def _build_o_ffn(
         KernelSlice(
             down_ir,
             "dg",
-            {0: 11, 1: 12, 2: 18, 3: 13},
-            extern_syms=_gemm_externs,
-            private_from=False,
+            _gemm_arg_map(11, 12, 13, scratch_for[3]),
+            extern_syms=_gemm_externs(d_spec),
         ),
         KernelSlice(ffn_add_ir, "fa", {0: 13, 1: 4, 2: 14}, private_from=False),
     ]
 
     module = stitch_elf(
-        "o_ffn",
+        func_name,
         base_args,
         slices,
         scratch_args=scratch_args,
-        debug_dump_path="/tmp/debug_o_ffn.mlir",
+        debug_dump_path=debug_dump_path,
     )
     print(f"  Module: {len(str(module).splitlines())} lines, parsed OK")
-    return module
+    return module, scratch_for
 
 
 # ---------------------------------------------------------------------------

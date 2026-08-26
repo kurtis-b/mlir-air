@@ -317,6 +317,139 @@ def test_artifact_key_changes_with_the_binaries():
     assert len(k1) == 64 and k1 != k2 and k2 != k3
 
 
+
+# ---------------------------------------------------------------------------
+# `[2026-08-25]` Queue item 14: the O+FFN cascade is per-GEMM. The layout owner
+# (`shared.builders.gemm_builder.o_ffn_gemm_layout`, air-free) derives each
+# GEMM's registry method / tile_n / scratch tail; these pin it against the
+# planner's independent derivation and against the recorded artifact shapes.
+# ---------------------------------------------------------------------------
+
+
+def _offn_layout(M, method=None):
+    from shared.builders.gemm_builder import o_ffn_gemm_layout
+
+    # Qwen3-0.6B: emb 1024, hidden 3072, decoupled q_dim 2048.
+    return o_ffn_gemm_layout(M, 1024, 3072, q_dim=2048, method=method)
+
+
+def test_the_o_ffn_cascade_layout_is_per_gemm_from_the_registry():
+    """At M=512/1024 the registry best is drain for ALL FOUR GEMMs: 1 launch
+    each, NO f32 scratch args (the ELF has 15 args, not 19) -- the doc 56 H1a
+    wall 1 shape, now buildable. At M=2048 all four are fused-cast: the
+    scratch tail is exactly 15..18 and the cascade is byte-identical policy to
+    the shipped artifact. The layout's launch count must equal the PLANNER's
+    o_ffn_qwen stage launches (two independent derivations of one artifact)."""
+    for M, method, scratch, launches in (
+        (512, "drain", [None, None, None, None], 8),
+        (1024, "drain", [None, None, None, None], 8),
+        (2048, "fused-cast", [15, 16, 17, 18], 12),
+    ):
+        lay = _offn_layout(M)
+        for role in ("o", "gate_up", "down"):
+            assert lay[role]["method"] == method, (M, role, lay[role]["method"])
+        assert lay["scratch_for"] == scratch, (M, lay["scratch_for"])
+        assert len(lay["scratch_args"]) == len([s for s in scratch if s is not None])
+        assert lay["launches"] == launches, (M, lay["launches"])
+        stage = [s for s in ma.plan_for("qwen3_0_6b", "prefill", M, M, M).stages if s.name == "o_ffn_qwen"][0]
+        assert stage.launches == lay["launches"], (M, stage.launches, lay["launches"])
+        assert stage.source == "measured"
+
+
+def test_a_forced_cascade_layout_is_the_recorded_m1024_artifact_shape():
+    """`gemm_method=` stays as the explicit override (test-only): forced
+    fused-cast at M=1024 reproduces the recorded forced artifact's shape --
+    12 air launches (PINNED_MANIFEST_QWEN_M1024) and the 15..18 scratch tail
+    -- and equals the forced plan's launch count."""
+    lay = _offn_layout(1024, method="fused-cast")
+    assert lay["scratch_for"] == [15, 16, 17, 18]
+    assert lay["launches"] == PINNED_MANIFEST_QWEN_M1024["o_ffn_qwen"][0]
+    p = ma.plan_for("qwen3_0_6b", "prefill", 1024, 1024, 1024, forced={"o_ffn_qwen": "fused-cast"})
+    stage = [s for s in p.stages if s.name == "o_ffn_qwen"][0]
+    assert stage.launches == lay["launches"] and stage.source == "forced"
+
+
+def test_the_m512_mix_names_a_distinct_mm_variant_per_gemm():
+    """Doc 56 H1a wall 2 was `one mm.o variant per ELF`: the M=512 fused-cast
+    registry rows are tile_n 96 (gate/up) vs 128 (O/down). Per-GEMM naming
+    must give the two DIFFERENT variants their own sym suffix + object -- and
+    the unforced M=512 layout names one drain variant for all four."""
+    forced = _offn_layout(512, method="fused-cast")
+    assert forced["gate_up"]["sym_suffix"] == "_m64n96" and forced["gate_up"]["obj"] == "mm_m64n96.o"
+    assert forced["o"]["sym_suffix"] == "_m64n128" and forced["down"]["sym_suffix"] == "_m64n128"
+    lay = _offn_layout(512)
+    assert {lay[r]["sym_suffix"] for r in ("o", "gate_up", "down")} == {"_m32n128"}
+    assert {lay[r]["obj"] for r in ("o", "gate_up", "down")} == {"mm_m32n128.o"}
+
+
+def test_the_driver_binds_its_o_ffn_scratch_layout_to_the_layout_owner():
+    """The Qwen driver's run-only path must re-derive the o_ffn scratch tail
+    from `o_ffn_gemm_layout` (the QKV half of this bug shipped once: 17 args
+    to an 18-arg ELF). Read from source by ast, not imported -- the driver
+    module needs weights/numpy this suite deliberately does not."""
+    import ast
+
+    src = (Path(_PE) / "llms" / "qwen3_0_6b" / "qwen3_0_6b_prefill.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    restore = ast.unparse(fns["restore_scratch_layout"])
+    assert "o_ffn_gemm_layout" in restore and "_OFFN_SCRATCH_FOR" in restore
+    call = ast.unparse(fns["_o_ffn_call"])
+    assert "_OFFN_SCRATCH_FOR" in call and "RuntimeError" in call, "the call site must refuse an unset layout, not guess 19 args"
+    # both call sites go through the one owner
+    for consumer in ("preload_prefill_weights", "run_transformer_block_qwen3"):
+        assert "_o_ffn_call(" in ast.unparse(fns[consumer]), consumer
+
+
+def test_artifact_content_sha_sees_the_abi_metadata():
+    """`[2026-08-25]` (item 14 review, blocking) compile.json's
+    `artifact_deviation` is ABI metadata -- it decides which scratch layout
+    the drivers restore -- so the timed-vs-verified identity must move when it
+    is deleted or edited between timing and gating, with the ELF bytes
+    unchanged. Absence hashes as absence (two never-forced caches still agree)
+    and the REST of compile.json (wall_s, cwd) stays out of the identity."""
+    with tempfile.TemporaryDirectory() as d:
+        cache = Path(d) / "prefill_kernel_cache"
+        cache.mkdir()
+        (cache / "a.elf").write_bytes(b"x" * 10)
+        (cache / "manifest.json").write_text(json.dumps({"a": {"output_binary": str(cache / "a.elf"), "kernel": "k", "insts": None, "launches": {"air_launches": 1, "herd_launches": 1}}}))
+        absent = ma.artifact_content_sha([cache])["sha256"]
+        (cache / "compile.json").write_text(json.dumps({"artifact_deviation": {"o_ffn_gemm_method": "fused-cast"}, "wall_s": 1.0}))
+        forced = ma.artifact_content_sha([cache])["sha256"]
+        (cache / "compile.json").write_text(json.dumps({"artifact_deviation": None, "wall_s": 1.0}))
+        unforced = ma.artifact_content_sha([cache])["sha256"]
+        (cache / "compile.json").write_text(json.dumps({"artifact_deviation": None, "wall_s": 99.0, "cwd": "/elsewhere"}))
+        unforced2 = ma.artifact_content_sha([cache])["sha256"]
+    assert len({absent, forced, unforced}) == 3, "deleting or editing the deviation must move the identity"
+    assert unforced == unforced2, "wall_s/cwd are not part of the identity"
+
+
+def test_a_forced_artifact_sets_recorded_deviation_reaches_the_restore():
+    """`[2026-08-25]` The layout restored for a LOADED artifact set must be the
+    set's OWN: a forced set's compile.json `artifact_deviation` names the
+    method its ELF was built with, and restoring the registry-best layout
+    against a forced fused-cast o_ffn ELF sets 15 of its 19 args -- the f32
+    scratch args stay UNBOUND, a nondeterministic wrong answer the token gate
+    catches only sometimes (observed live, devq 583). Pinned at all three
+    hops by source: the adapter reads the note and passes the method, the
+    driver's restore accepts and forwards it, the verify adapter does the
+    same on its loaded-cache path."""
+    import ast
+    import inspect
+
+    src = inspect.getsource(ma.ModelAdapter._restore_scratch_layout)
+    assert "COMPILE_NOTE" in src and "artifact_deviation" in src and "o_ffn_gemm_method" in src
+    prep = inspect.getsource(ma.ModelAdapter.prepare)
+    assert "_restore_scratch_layout(config, M, prefill_dir)" in prep
+    driver = (Path(_PE) / "llms" / "qwen3_0_6b" / "qwen3_0_6b_prefill.py").read_text(encoding="utf-8")
+    fns = {n.name: n for n in ast.walk(ast.parse(driver)) if isinstance(n, ast.FunctionDef)}
+    restore = fns["restore_scratch_layout"]
+    assert "o_ffn_gemm_method" in [a.arg for a in restore.args.args], "restore must accept the deviation"
+    assert "method=o_ffn_gemm_method" in ast.unparse(restore)
+    va = (Path(_PE) / "llms" / "qwen3_0_6b" / "verify_adapter.py").read_text(encoding="utf-8")
+    assert "artifact_deviation" in va and "o_ffn_gemm_method" in va
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

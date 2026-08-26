@@ -523,5 +523,39 @@
 // the M-32 clause. PLAN stays 10/10 with a forced GEMM method now part of the
 // plan and its hash (the M=1024 cascade hashes as the plan that built it).
 //
+// `[2026-08-25]` 656 -> 660, no module added: queue item 14, the O+FFN cascade
+// went PER-GEMM (each GEMM its own registry method / tile_n / mm.o variant,
+// co-linked in one ELF; the doc 56 H1a walls). +4 test_model_adapter around the
+// new air-free layout owner `shared.builders.gemm_builder.o_ffn_gemm_layout`:
+// the unforced layout at M 512/1024/2048 (all-drain 8 launches with NO scratch
+// tail; all-fused-cast 12 with 15..18) must equal the PLANNER's o_ffn_qwen
+// stage launch count -- two independent derivations of one artifact -- with
+// plan source `measured`; the forced M=1024 layout reproduces the recorded
+// forced artifact's 12 launches and hashes as `forced` (the `gemm_method=`
+// override stays, test-only); the M=512 fused-cast mix names TWO mm variants
+// (`_m64n96` gate/up vs `_m64n128` O/down -- the exact pair wall 2 refused)
+// while the unforced M=512 names one drain variant; and the driver's
+// `restore_scratch_layout` / `_o_ffn_call` are bound to the layout owner by
+// ast (the QKV half of that bug shipped once: 17 args to an 18-arg ELF).
+//
+// `[2026-08-25]` 660 -> 661, same item, the deviation plumbing: devq 583 showed
+// a LOADED forced artifact set restored with the registry-best layout -- 15 of
+// the forced ELF's 19 args set, f32 scratch args unbound, a nondeterministic
+// wrong answer the token gate catches only sometimes. +1: the recorded
+// `artifact_deviation` must reach `restore_scratch_layout` at all three hops
+// (model_adapter reads compile.json and passes it; the driver's restore
+// accepts and forwards `o_ffn_gemm_method`; the verify adapter's loaded-cache
+// path does the same), each pinned by source.
+//
+// `[2026-08-25]` 661 -> 662, item 14's review round (blocking, second half):
+// compile.json's `artifact_deviation` is ABI metadata and now part of
+// `artifact_content_sha`, so deleting or editing it between timing and gating
+// fails the timed-vs-verified equality instead of passing unseen. +1
+// test_model_adapter: absent / forced / null-deviation hash as three
+// identities while wall_s and cwd stay out (byte-identical ELFs recompiled
+// elsewhere still hash alike). The ELF-side half of the finding -- refusing an
+// argument-count mismatch at the dispatch chokepoint -- is the seam suite's
+// (run_seam_tests.lit, DISPATCH 35 -> 40).
+//
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 656/656 passed in 30 modules
+// CHECK: study host tests: 662/662 passed in 30 modules

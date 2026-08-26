@@ -21,8 +21,18 @@
 // RUN: python3 %S/../llms/shared/infra/test_bo_pool.py | FileCheck %s --check-prefix=POOL
 // POOL: 33/33 passed
 //
+// `[2026-08-25]` 35 -> 40, item 14's review round (blocking): the ELF is the
+// ABI ground truth. `dispatch.elf_arg_count` reads the kernel's buffer-arg
+// count from the binary's own .dynsym (numeric names ARE the arg indices) and
+// `validate_arg_count` refuses -- BEFORE any device work, at load_and_run, the
+// one chokepoint every load path dispatches through -- a call that does not
+// match it, in either direction, plus a manifest n_args contradicting its ELF.
+// The five pin the parser on synthetic ELFs, both refusal directions (the devq
+// 583 unbound-scratch class and its inverse), the stale-manifest clause with
+// the manifest-only fallback, and by source that the check precedes
+// ensure_loaded and that compile time records n_args.
 // RUN: python3 %S/../llms/shared/infra/test_dispatch.py | FileCheck %s --check-prefix=DISPATCH
-// DISPATCH: 35/35 passed
+// DISPATCH: 40/40 passed
 //
 // `[2026-08-21]` Doc 56 H0: the analytical planner's host gates -- the two golden
 // graphs pinned, each model's plan reproducing its shipped ELF sequence / launch

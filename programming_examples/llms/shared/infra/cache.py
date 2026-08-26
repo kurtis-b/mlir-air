@@ -351,6 +351,8 @@ class KernelCache:
         self.context_loads = 0
         self.kernel_attaches = 0
         self._cached_bos = {}  # name -> list of xrt.bo for BO reuse
+        self.arg_counts = {}  # name -> ELF buffer-arg count (manifest n_args)
+        self._elf_arg_counts = {}  # name -> elf_arg_count(binary), memoized
         self._pools = {}  # PoolPlan.signature -> BoPool, for run_sequence
         self._instr_synced = set()  # artifact names whose instruction BO is resident
         # Pool of BOs shared across bo_keys (see shared_nonstatic in
@@ -376,6 +378,11 @@ class KernelCache:
                 # from the MLIR module, which --run-only does not have, so they
                 # are persisted here rather than recomputed.
                 "launches": self.launch_counts.get(name),
+                # The ELF's own buffer-argument count (dispatch.elf_arg_count),
+                # recorded at compile time. Informational: load_and_run always
+                # re-reads the ELF (the ground truth) and REFUSES a manifest
+                # that contradicts it (item 14 review, blocking).
+                "n_args": self.arg_counts.get(name),
             }
         manifest_path = self.cache_dir / self.MANIFEST_FILE
         with open(manifest_path, "w") as f:
@@ -421,6 +428,8 @@ class KernelCache:
             # missing entry costs the launch counts, not the run.
             if info.get("launches"):
                 self.launch_counts[name] = info["launches"]
+            if info.get("n_args") is not None:
+                self.arg_counts[name] = int(info["n_args"])
 
         self._log(f"Loaded manifest with {len(self.artifacts)} entries")
         return True
@@ -465,6 +474,11 @@ class KernelCache:
         ext = src_binary.suffix  # .xclbin, .elf, or .txn
         cached_binary = self.cache_dir / f"{name}{ext}"
         shutil.copy2(src_binary, cached_binary)
+        from shared.infra.dispatch import elf_arg_count
+
+        n_args = elf_arg_count(str(cached_binary))
+        if n_args is not None:
+            self.arg_counts[name] = n_args
 
         # Copy instructions file if present (xclbin mode)
         cached_insts = None
@@ -810,6 +824,31 @@ class KernelCache:
         import filelock
         import pyxrt as xrt
 
+        # Level 0 (item 14 review, blocking): the ELF's OWN argument count is
+        # the ABI ground truth. Refuse a call whose argument list does not
+        # match it BEFORE any device work -- xrt.run.set_arg binds only the
+        # args it is handed, so a mismatched call starts the kernel with part
+        # of its signature UNBOUND (the devq 583 failure class: a forced
+        # fused-cast 19-arg o_ffn restored with the 15-arg drain layout). A
+        # manifest n_args that contradicts its ELF is refused as stale
+        # metadata by the same check. Covers every load path (verify adapters,
+        # ModelAdapter.prepare, build_session --run-only) at the one
+        # chokepoint they all dispatch through.
+        _binary = self.artifacts[name].output_binary
+        is_elf = _binary.endswith(".elf")
+        if is_elf:
+            from shared.infra.dispatch import elf_arg_count, validate_arg_count
+
+            if name not in self._elf_arg_counts:
+                self._elf_arg_counts[name] = elf_arg_count(_binary)
+            validate_arg_count(
+                name,
+                _binary,
+                len(inputs),
+                manifest_n_args=self.arg_counts.get(name),
+                elf_n_args=self._elf_arg_counts[name],
+            )
+
         # Level 1: Load backend on first call (XRT context reuse). See
         # ensure_loaded for why /tmp/npu.lock is a different inode from the
         # project's outer /tmp/mlir-air-npu.lock flock convention.
@@ -819,7 +858,6 @@ class KernelCache:
         # bo_key allows separate BO sets for the same kernel (e.g., per-layer weights)
         _bo_key = bo_key if bo_key is not None else name
         sizes_in_bytes = [a.size * a.itemsize for a in inputs]
-        is_elf = self.artifacts[name].output_binary.endswith(".elf")
         static_indices = set(static_input_indices or [])
         intermediate_set = set(intermediate_indices or [])
 

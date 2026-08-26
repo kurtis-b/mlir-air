@@ -22,6 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from shared.infra.bo_pool import BufferSpec  # noqa: E402
 from shared.infra.cache import KernelCache  # noqa: E402
 from shared.infra.dispatch import (  # noqa: E402
+    ArgCountMismatchError,
+    elf_arg_count,
+    validate_arg_count,
     INSTR_WORD_BYTES,
     N_XCLBIN_PREFIX_ARGS,
     OPCODE_DPU,
@@ -619,6 +622,137 @@ def test_a_shared_binary_attaches_instead_of_reloading():
         assert cache.reconfiguration_counts() == (1, 0)
         cache.ensure_loaded("s2", {})
         assert cache.reconfiguration_counts() == (1, 1)
+
+
+# ---------------------------------------------------------------------------
+# `[2026-08-25]` Item 14 review (blocking): the ELF is the ABI ground truth.
+# A loaded artifact called with the wrong argument count must be REFUSED before
+# any device work -- xrt.run.set_arg binds only the args it is handed, so a
+# mismatched call starts the kernel with part of its signature UNBOUND (devq
+# 583: the forced fused-cast 19-arg o_ffn restored with the registry's 15-arg
+# drain layout, four f32 scratches dangling, a nondeterministic wrong answer).
+# These pin the parser, both refusal directions, the stale-manifest clause and
+# the chokepoint's position, all on synthetic ELFs -- no device, no XRT.
+# ---------------------------------------------------------------------------
+
+
+def _mk_elf(names, path):
+    """A minimal ELF32 whose .dynsym carries exactly `names` (plus the
+    conventional null symbol). Layout: ehdr | .dynstr | .dynsym | shdrs."""
+    import struct
+
+    strtab = b"\x00"
+    offs = []
+    for n in names:
+        offs.append(len(strtab))
+        strtab += n.encode() + b"\x00"
+    ehsize = 52
+    str_off = ehsize
+    sym_off = str_off + len(strtab)
+    syms = struct.pack("<IIIBBH", 0, 0, 0, 0, 0, 0)  # null symbol
+    for o in offs:
+        syms += struct.pack("<IIIBBH", o, 0, 0, 0x11, 0, 1)
+    shoff = sym_off + len(syms)
+    ehdr = b"\x7fELF" + bytes([1, 1, 1]) + b"\x00" * 9
+    ehdr += struct.pack("<HHIIIIIHHHHHH", 2, 0x5C, 1, 0, 0, shoff, 0, ehsize, 0, 0, 40, 3, 0)
+    assert len(ehdr) == ehsize
+    shdrs = struct.pack("<10I", *([0] * 10))  # NULL section
+    # .dynsym: type 11, link -> section 2 (.dynstr), entsize 16
+    shdrs += struct.pack("<10I", 0, 11, 0, 0, sym_off, len(syms), 2, 0, 0, 16)
+    # .dynstr: type 3
+    shdrs += struct.pack("<10I", 0, 3, 0, 0, str_off, len(strtab), 0, 0, 0, 0)
+    with open(path, "wb") as f:
+        f.write(ehdr + strtab + syms + shdrs)
+    return path
+
+
+def test_elf_arg_count_reads_the_abi_from_the_binary_itself():
+    """Numeric dynsym names ARE the buffer-arg indices; .pdi.* configuration
+    images are not; the count is max+1 (a trailing arg no launch references is
+    invisible to the ELF and to XRT alike). Non-ELF and symbol-free files are
+    UNKNOWN (None), never zero."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        p = _mk_elf(["0", "1", "2", "3", "4", ".pdi.1", ".pdi.2"], f"{d}/a.elf")
+        assert elf_arg_count(p) == 5
+        p = _mk_elf(["14", "0", "7", ".pdi.1"], f"{d}/gap.elf")
+        assert elf_arg_count(p) == 15  # max + 1, indices need not be dense here
+        p = _mk_elf([".pdi.1", ".pdi.2"], f"{d}/nonum.elf")
+        assert elf_arg_count(p) is None
+        with open(f"{d}/not.elf", "wb") as f:
+            f.write(b"not an elf at all")
+        assert elf_arg_count(f"{d}/not.elf") is None
+        assert elf_arg_count(f"{d}/absent.elf") is None
+
+
+def test_a_call_that_does_not_match_the_elf_abi_is_refused():
+    """The devq-583 scenario: a FORCED fused-cast ELF (19 args) whose
+    compile.json is absent or garbled restores the registry drain layout (15
+    args). The call must be refused naming both counts -- not started with
+    unbound scratch args."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        p = _mk_elf([str(i) for i in range(19)], f"{d}/o_ffn_qwen.elf")
+        with raises(ArgCountMismatchError, match="called with 15 arguments"):
+            validate_arg_count("o_ffn_qwen", p, 15)
+        try:
+            validate_arg_count("o_ffn_qwen", p, 15)
+        except ArgCountMismatchError as e:
+            assert "19" in str(e) and "unbound" in str(e)
+        # control: the matching call passes and reports the validated count
+        assert validate_arg_count("o_ffn_qwen", p, 19) == 19
+
+
+def test_stale_metadata_claiming_the_other_method_is_refused():
+    """The inverse mismatch: metadata claims fused-cast (19-arg layout
+    restored) beside an ELF that is actually the 15-arg drain cascade."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        p = _mk_elf([str(i) for i in range(15)], f"{d}/o_ffn_qwen.elf")
+        with raises(ArgCountMismatchError, match="called with 19 arguments"):
+            validate_arg_count("o_ffn_qwen", p, 19)
+
+
+def test_a_manifest_contradicting_its_elf_is_refused():
+    """A manifest n_args that disagrees with the ELF it names is stale
+    metadata: refused outright, even when the CALL happens to match one of
+    them. When the binary's ABI is unreadable the manifest count is the
+    fallback (clause 3) -- still enforced, never ignored."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        p = _mk_elf([str(i) for i in range(19)], f"{d}/o_ffn_qwen.elf")
+        with raises(ArgCountMismatchError, match="stale or contradictory"):
+            validate_arg_count("o_ffn_qwen", p, 19, manifest_n_args=15)
+        assert validate_arg_count("o_ffn_qwen", p, 19, manifest_n_args=19) == 19
+        with open(f"{d}/blob.bin", "wb") as f:
+            f.write(b"\x00" * 64)
+        with raises(ArgCountMismatchError, match="called with 15"):
+            validate_arg_count("k", f"{d}/blob.bin", 15, manifest_n_args=19)
+        assert validate_arg_count("k", f"{d}/blob.bin", 4) is None  # nothing known
+
+
+def test_the_dispatch_chokepoint_runs_before_any_device_work():
+    """Every load path -- the verify adapters, ModelAdapter.prepare and
+    build_session --run-only -- dispatches through KernelCache.load_and_run,
+    so the validation there is the one gate; pinned by source: it runs BEFORE
+    ensure_loaded (no XRT is touched by a refused call), and compile time
+    records the ELF's own count into the manifest. Chosen semantics for
+    --run-only on a FORCED cache (it never reads compile.json): the first
+    o_ffn dispatch is REFUSED with the remediation in the message; a set with
+    valid metadata restores correctly through the adapters instead."""
+    import inspect
+
+    src = inspect.getsource(KernelCache.load_and_run)
+    assert "validate_arg_count" in src
+    assert src.index("validate_arg_count") < src.index("ensure_loaded")
+    cc = inspect.getsource(KernelCache.compile_and_cache)
+    assert "elf_arg_count" in cc
+    sm = inspect.getsource(KernelCache._save_manifest)
+    assert '"n_args"' in sm
 
 
 def _main():

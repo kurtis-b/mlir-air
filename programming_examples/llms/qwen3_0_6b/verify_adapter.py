@@ -122,10 +122,23 @@ class NpuRunner:
         if _prefill_dir:
             if not self.prefill_cache.load_manifest():
                 raise RuntimeError(f"LLMS_VERIFY_PREFILL_CACHE {_prefill_dir}: no loadable manifest")
-            # the QKV ELF's scratch-arg layout, which only compiling used to set
+            # the QKV + o_ffn scratch-arg layouts, which only compiling used to
+            # set. A FORCED artifact set (compile.json artifact_deviation, the
+            # gemm_method= override) restores the DEVIATION's o_ffn layout: the
+            # ELF's arg count is the deviation's, and the registry layout would
+            # leave a forced fused-cast ELF's f32 scratch args unbound (item 14;
+            # observed live as a nondeterministic token-gate FAIL, devq 583).
+            import json as _json
+
             from qwen3_0_6b_prefill import restore_scratch_layout
 
-            restore_scratch_layout(config, self.prefill_M)
+            _kwargs = {}
+            _note = Path(_prefill_dir) / "compile.json"
+            if _note.is_file():
+                _dev = _json.loads(_note.read_text(encoding="utf-8")).get("artifact_deviation") or {}
+                if _dev.get("o_ffn_gemm_method"):
+                    _kwargs["o_ffn_gemm_method"] = _dev["o_ffn_gemm_method"]
+            restore_scratch_layout(config, self.prefill_M, **_kwargs)
         else:
             compile_prefill_kernels(
                 self.prefill_cache, config, seq_len=max_seq, cpu_attn=self.cpu_attn

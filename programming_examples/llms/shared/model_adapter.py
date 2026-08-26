@@ -154,11 +154,27 @@ def artifact_content_sha(cache_dirs) -> dict:
     """Content identity of an artifact set: sha256 of every manifest binary's
     BYTES (and its instruction file), and one digest over all of them, keyed by
     kernel name. Not mtimes, not paths: this is what "the same ELFs" means
-    (H1a review, finding 1). Relative manifest paths anchor to the cache's parent."""
+    (H1a review, finding 1). Relative manifest paths anchor to the cache's parent.
+
+    `[2026-08-25]` (item 14 review, blocking): each cache's `compile.json`
+    `artifact_deviation` is part of the identity -- it is ABI metadata (which
+    scratch layout the drivers restore for the set), so deleting or editing it
+    between timing and gating must fail the timed-vs-verified equality, not
+    pass unseen. Absence is hashed as absence; the rest of compile.json
+    (wall_s, cwd) stays out so byte-identical ELFs recompiled elsewhere still
+    hash alike."""
     per = {}
     for d in cache_dirs:
         d = Path(d)
         manifest = read_cache_manifest(d)
+        note = d / COMPILE_NOTE
+        deviation = "absent"
+        if note.is_file():
+            try:
+                deviation = json.loads(note.read_text(encoding="utf-8")).get("artifact_deviation")
+            except ValueError:
+                deviation = "unreadable"
+        per[f"{d.name}/compile.json:artifact_deviation"] = deviation
         for name in sorted(manifest):
             info = manifest[name]
             files = []
@@ -470,7 +486,7 @@ class ModelAdapter:
 
         weights_mod = importlib.import_module(f"{self.binding.package}_weights")
         config = weights_mod.LlamaConfig()
-        self._scratch_layout = self._restore_scratch_layout(config, M)
+        self._scratch_layout = self._restore_scratch_layout(config, M, prefill_dir)
         hf_id = self.binding.hf_id
         weights = weights_mod.load_weights(hf_id, config=config)
         from ml_dtypes import bfloat16
@@ -492,17 +508,31 @@ class ModelAdapter:
         )
         return self.ms
 
-    def _restore_scratch_layout(self, config, M):
-        """The QKV ELF's f32-scratch arg layout a run-only process lacks, set by
-        the driver's own `restore_scratch_layout` (the single owner, shared
-        with `--run-only` and the verify adapter). None for a driver without
-        the global (llama32_1b)."""
+    def _restore_scratch_layout(self, config, M, prefill_dir=None):
+        """The f32-scratch arg layouts a run-only process lacks, set by the
+        driver's own `restore_scratch_layout` (the single owner, shared with
+        `--run-only` and the verify adapter). None for a driver without the
+        global (llama32_1b).
+
+        `[2026-08-25]` (item 14) A FORCED artifact set restores the layout of
+        the deviation its `compile.json` records, not the registry's best: the
+        ELF's arg count is the deviation's, and restoring the registry layout
+        against a forced fused-cast o_ffn ELF sets 15 of its 19 args, leaving
+        the f32 scratch args UNBOUND — a nondeterministic wrong answer the
+        token gate catches only sometimes (observed live, devq 583)."""
         import importlib
 
         prefill_mod = importlib.import_module(f"{self.binding.package}_prefill")
         if not hasattr(prefill_mod, "restore_scratch_layout"):
             return None
-        return prefill_mod.restore_scratch_layout(config, M)
+        kwargs = {}
+        if prefill_dir is not None:
+            note = Path(prefill_dir) / COMPILE_NOTE
+            if note.is_file():
+                dev = json.loads(note.read_text(encoding="utf-8")).get("artifact_deviation") or {}
+                if dev.get("o_ffn_gemm_method"):
+                    kwargs["o_ffn_gemm_method"] = dev["o_ffn_gemm_method"]
+        return prefill_mod.restore_scratch_layout(config, M, **kwargs)
 
     # -- tokens ---------------------------------------------------------------
 
@@ -737,7 +767,7 @@ def compile_prefill(model_id: str, M: int, cache_dir: str | Path, *, cwd: str | 
     note = {"model_id": model_id, "M": int(M), "wall_s": wall, "cwd": str(cwd), "driver_dir": str(driver_dir), "driver": drv.__name__,
             "artifact_deviation": (
                 {"o_ffn_gemm_method": o_ffn_gemm_method,
-                 "why": "the o_ffn cascade builder binds 4-arg fused-cast GEMMs only; the registry's best at this M is another method"}
+                 "why": "gemm_method= is a test-only override since item 14 (the cascade is per-GEMM and needs no forcing); this set was deliberately compiled off the registry's best method for this M, the deviation is recorded per set, and the drivers restore THIS layout from it"}
                 if o_ffn_gemm_method else None)}
     (Path(cache_dir) / COMPILE_NOTE).write_text(json.dumps(note, indent=1), encoding="utf-8")
     manifest["_compile"] = note

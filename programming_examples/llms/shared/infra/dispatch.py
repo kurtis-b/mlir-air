@@ -325,6 +325,126 @@ def _bind_args(xrt, run, bos, elf_abi, instr_bo=None, instr_len=0):
         run.set_arg(i + N_XCLBIN_PREFIX_ARGS, bo)
 
 
+class ArgCountMismatchError(RuntimeError):
+    """A kernel invocation whose argument list does not match the loaded ELF's
+    own ABI. Raised BEFORE any device work: `xrt.run.set_arg` binds only the
+    arguments it is handed and starts the run with the rest of the kernel's
+    signature UNBOUND -- a nondeterministic wrong answer, not an error (the
+    devq 583 failure class: a forced fused-cast 19-arg o_ffn ELF restored with
+    the registry's 15-arg drain layout ran with its four f32 C-scratch args
+    pointing at whatever the slots held)."""
+
+
+def elf_arg_count(binary_path):
+    """The kernel's buffer-argument count read from the ELF ITSELF.
+
+    `[2026-08-25]` (item 14 review, blocking): the artifact is the ground truth
+    for its ABI -- manifest fields and compile.json sidecars can be absent,
+    stale, or contradictory, and a layout restored from the registry can
+    disagree with the ELF that was actually compiled. In an aircc ELF every
+    launch's buffer argument is a dynamic symbol whose NAME is the argument
+    index ("0".."18" on the 19-arg fused o_ffn; ".pdi.*" entries are the
+    configuration images), so the ABI's size is max(numeric dynsym name) + 1.
+    Verified against every shipped cache: fused o_ffn 19, drain o_ffn 15, QKV
+    18 (fused Q) / 15 (all-drain), flash_attn 4, the 10-partition LM head 21.
+
+    Returns None when the file is not an ELF or carries no numeric dynamic
+    symbols (an xclbin artifact, or a future format) -- unknown, not zero.
+    Pure struct parsing, no XRT and no binutils, so host suites can pin it.
+    """
+    import struct
+
+    try:
+        with open(binary_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    if len(data) < 52 or data[:4] != b"\x7fELF":
+        return None
+    is64 = data[4] == 2
+    little = data[5] == 1
+    end = "<" if little else ">"
+    if is64:
+        e_shoff, = struct.unpack_from(end + "Q", data, 0x28)
+        e_shentsize, e_shnum = struct.unpack_from(end + "HH", data, 0x3A)
+    else:
+        e_shoff, = struct.unpack_from(end + "I", data, 0x20)
+        e_shentsize, e_shnum = struct.unpack_from(end + "HH", data, 0x2E)
+    if e_shoff == 0 or e_shnum == 0:
+        return None
+
+    def shdr(i):
+        off = e_shoff + i * e_shentsize
+        if is64:
+            name, typ = struct.unpack_from(end + "II", data, off)
+            offset, size = struct.unpack_from(end + "QQ", data, off + 0x18)
+            link, = struct.unpack_from(end + "I", data, off + 0x28)
+            entsize, = struct.unpack_from(end + "Q", data, off + 0x38)
+        else:
+            name, typ = struct.unpack_from(end + "II", data, off)
+            offset, size = struct.unpack_from(end + "II", data, off + 0x10)
+            link, = struct.unpack_from(end + "I", data, off + 0x18)
+            entsize, = struct.unpack_from(end + "I", data, off + 0x24)
+        return typ, offset, size, link, entsize
+
+    SHT_DYNSYM = 11
+    top = None
+    for i in range(e_shnum):
+        typ, offset, size, link, entsize = shdr(i)
+        if typ != SHT_DYNSYM or entsize == 0:
+            continue
+        _t, str_off, str_size, _l, _e = shdr(link)
+        strtab = data[str_off : str_off + str_size]
+        sym_size = 24 if is64 else 16
+        for off in range(offset, offset + size, max(entsize, sym_size)):
+            st_name, = struct.unpack_from(end + "I", data, off)
+            nul = strtab.find(b"\x00", st_name)
+            sym = strtab[st_name:nul].decode("ascii", "replace")
+            if sym.isdigit():
+                idx = int(sym)
+                top = idx if top is None or idx > top else top
+    return None if top is None else top + 1
+
+
+def validate_arg_count(kernel_name, binary_path, n_inputs, manifest_n_args=None, elf_n_args=None):
+    """Refuse an invocation whose argument list does not match the ELF's ABI.
+
+    The three clauses, in order (item 14 review, blocking):
+      1. a manifest `n_args` that CONTRADICTS the ELF it names is stale
+         metadata and is refused outright -- whichever half is wrong, running
+         would trust one of them blindly;
+      2. `n_inputs` != the ELF's own count is refused (absent or garbled
+         compile.json under a forced artifact restores the registry layout;
+         the ELF is the ground truth, so the mismatch must fail the call, not
+         start a run with unbound args);
+      3. an artifact whose ABI cannot be read (non-ELF: the xclbin path binds
+         through its own prefix ABI and the kernel enforces arity) falls back
+         to the manifest count when one is recorded, else stays unvalidated.
+
+    `elf_n_args` lets a caller memoize `elf_arg_count`; None means parse here.
+    Returns the count validated against (None when nothing was known).
+    """
+    expected = elf_n_args if elf_n_args is not None else elf_arg_count(binary_path)
+    if expected is not None and manifest_n_args is not None and int(manifest_n_args) != expected:
+        raise ArgCountMismatchError(
+            f"{kernel_name}: the cache manifest records n_args={manifest_n_args} but the ELF "
+            f"at {binary_path} declares {expected} arguments -- stale or contradictory "
+            f"artifact metadata; recompile the set or fix the manifest"
+        )
+    if expected is None:
+        expected = int(manifest_n_args) if manifest_n_args is not None else None
+    if expected is not None and n_inputs != expected:
+        raise ArgCountMismatchError(
+            f"{kernel_name}: called with {n_inputs} arguments but the loaded artifact "
+            f"({binary_path}) declares {expected} -- the restored scratch layout does not "
+            f"match this ELF's ABI. A forced artifact set must carry its compile.json "
+            f"`artifact_deviation` (the registry-best layout was restored otherwise), and "
+            f"running would leave arguments unbound (the devq 583 failure class); refusing "
+            f"before any device work"
+        )
+    return expected
+
+
 def instr_bo_nbytes(backend):
     """Bytes an artifact's instruction BO moves when it is synced to device.
 
