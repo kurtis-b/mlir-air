@@ -25,7 +25,73 @@ The four modes (`coarse`, `offload`, `runlist`, `fused`; `study/profiles.py:307`
 | 6 | **A `dtype`/`quant_*` producer for layer rows** | `run_mode.py`, `pattern/*/` | no | small, after 1–2 |
 | 7 | **A workload→mode dispatcher** (doc 03:87, doc 55:69-88 — "nothing in the port expresses such a choice yet") | new | no | open design, and NOT required for this program |
 
-## 2. The cost-halving fact
+## 1a. `[2026-08-26]` M0 ran — three findings, and the plan below is amended by them
+
+Phase M0 executed read-only ([58a](58a-4a-m0-scope.md), 605 lines, verbatim). It did what M0
+existed to do: it replaced a guess with a number, and it corrected two things in this doc's own
+first draft. Read 58a before starting any phase.
+
+**(i) §2's cost-halving conclusion holds, but its stated mechanism was wrong.** Every file in
+`llms/shared/builders/` is a whole-ELF **stage** builder — its own `__init__.py:5-6` says so —
+and `gemm_builder` is *not* the leaf exception §2 originally named. The real importable leaves
+are top-level example dirs (`weighted_rms_norm`, the best-shaped leaf in the tree;
+`silu_and_mul.build_module_2d`) and the **private single-launch `@module_builder` functions
+inside** the shipped stage builders: `_build_rope_2d` (`rms_gemms_rope_multi.py:61`),
+`_build_qknorm_2d` (`rms_qkv_qknorm_rope_multi.py:90`), `_build_add_2d_to_2d` (which the study
+*already* imports, `builders/elementwise_add.py:57`). With `stitching.stitch_elf`, the
+**device-IR half** of gap 2 really is re-assembly. The **oracle** and **shape-plumbing** halves
+are not, and this doc's first draft priced neither.
+
+**(ii) Qwen3-0.6B is the wrong first family, and one of its cells is a structural refusal.**
+`block_config` (`builders/block.py:296`) and `runlist_config` (`pattern/runlist/runlist.py:287`)
+**require `num_heads * head_dim == emb_dim`**, which Qwen3-0.6B violates (2048 ≠ 1024). And the
+study composes the **seq-first** FA, which asserts `dv_chunks == 1`
+(`attn_npu2_seqfirst.py:121`), while `fa_headfirst.py:7-13` states that head_dim 128 **must**
+use the heads-first kernel with two host transposes. Consequences: **`(fused, Qwen3-0.6B)` is a
+structural refusal** — host transposes contradict its one-submission definition — and
+`(coarse, Qwen3-0.6B)` is measurable only with a caveat. This is **falsifiable in one compile,
+no device time**, and is the first hour of M1.
+
+**(iii) The registry is legal at M = 512/1024 and holed at M = 2048.** All six Qwen3-0.6B
+prefill GEMM shapes carry all three methods at M = 512/1024; at **M = 2048 five of six carry
+exactly one high-precision method**, so `offload`'s shared-xclbin `drain` pin
+(`pattern/offload/offload.py:420-423`) **raises at M = 2048**, and filling those holes is
+blocked by the append-only writer's ownership rule (`registry_writer.py:196,246`). So
+**M = 512/1024 are the only rungs where all four modes are shape-legal** (`fused` caps at 1024
+rows at emb 1024). Llama-3.2-1B is the exact inverse: head_dim 64 satisfies the MHA equality and
+has no FA problem, but its rows exist only at M = 2048, where `fused`'s 512-row cap makes that
+cell a refusal.
+
+**Revised estimate** (replacing "weeks-to-months per mode per family"): M1 **1 session**,
+M2 **3–5**, M3 **3–4**, M4 **2–3**, M5 **1–2** — **10–15 agent-sessions ≈ 2–3 weeks per family
+for all four modes**. M4 is far cheaper than §3 assumed because `shared/model_adapter.py` and
+`study/run_model.py` already own the N-layer loop, embedding, LM head, KV cache and verify: M4
+is a **swap, not a build**.
+
+**Amendments to §3 adopted from M0's recommendation:**
+- **M2 runs `offload` first, not `coarse`.** `offload` needs *zero* new device builders for
+  RMSNorm / QK-norm / RoPE / SwiGLU — by the mode's own definition those are host numpy, and the
+  reference implementations are importable from `qwen3_0_6b_cpu_helpers.py`. It therefore
+  produces the first real (model, mode) cell **without touching the attention problem**. Merge
+  the first-cell measurement into M2 so that phase delivers a number even if the attention spike
+  goes badly.
+- **Llama-3.2-1B is not deferred to "after M4".** It is the *cheaper* family for `coarse` and a
+  useful control; run it alongside once M2 has a shape.
+- **No decode / M = 1 column.** There is no GEMV registry or resolver at all
+  (`registry_lookup.py` has no GEMV entry point), so decode-in-a-mode is a separate program, not
+  a column of this one.
+
+**A trap M1 must not walk into** (58a §3): the fault-injection negative control's
+`FAULT_DELTA = 2.0` was calibrated against `val_range 0.05` synthetic draws, and the
+static-weight `content_key` must stay **content-derived**. A name-keyed or in-place-mutated real
+weight would make the injected run **PASS** — silently voiding the gate every later phase rests
+on.
+
+**Three named uncertainties**: the head_dim-128 attention question; whether a real-weight layer
+fits under the `1e-1` hard ceiling that today sits at a 1.35× margin (`opcheck_specs.py:834-851`
+— "a defect report, never a wider tolerance"); and whether M4 is genuinely a swap.
+
+## 2. The cost-halving fact (as first drafted — see §1a(i) for the correction)
 
 `llms/shared/` is off limits to **edit** — "editing it puts all ten shipped deployments' `make
 verify` on the line" (`builders/gemm_spec.py:49-53`) — but the study **already imports it and
@@ -51,7 +117,10 @@ discipline items 13–20 used.
 | **M4 — the model** | N-layer loop, embedding, LM head, KV cache, sampling in the mode harness | A whole Qwen3-0.6B forward through ≥1 mode, gated by the production top-5 verify against HF |
 | **M5 — the matrix** | The measurement the program exists for: model × mode × dtype, on real weights | Two walks, `compare_roots` OK, verify per artifact set, every cell either measured or a recorded refusal |
 
-**Second family (Llama-1B, GQA + no QK-norm) only after M4**, and only if M0's estimate holds.
+~~**Second family (Llama-1B, GQA + no QK-norm) only after M4**, and only if M0's estimate
+holds.~~ **Superseded by §1a**: Llama-1B is the cheaper family for `coarse` and runs alongside
+once M2 has a shape. The M2 row's "coarse (simplest, fastest…)" is likewise superseded — M2
+runs `offload` first.
 
 ## 4. What this program does NOT buy
 
