@@ -14,8 +14,8 @@
     "n_readback": 256,
     "bytes_written": 131072,
     "bytes_readback": 8388608,
-    "kernel_ms": 438.4170452831313,
-    "sync_ms": 0.7330242078751326
+    "kernel_ms": 438.73231112957,
+    "sync_ms": 1.2708909343928099
    },
    "rms_gemv_rope": {
     "calls": 512,
@@ -23,8 +23,8 @@
     "n_readback": 1536,
     "bytes_written": 4718592,
     "bytes_readback": 3145728,
-    "kernel_ms": 437.1250629192218,
-    "sync_ms": 9.909847285598516
+    "kernel_ms": 436.8873070925474,
+    "sync_ms": 10.500250034965575
    },
    "o_gemv_ffn": {
     "calls": 512,
@@ -32,18 +32,26 @@
     "n_readback": 512,
     "bytes_written": 4194304,
     "bytes_readback": 2097152,
-    "kernel_ms": 1556.7714021308348,
-    "sync_ms": 9.484353358857334
+    "kernel_ms": 1562.7235060092062,
+    "sync_ms": 10.16014814376831
    }
   },
   "cpu": {
+   "embed_lookup": {
+    "calls": 32,
+    "ms": 0.10057829786092043
+   },
+   "kv_append": {
+    "calls": 512,
+    "ms": 1.645375625230372
+   },
    "decode_attention_cpu": {
     "calls": 512,
-    "ms": 235.96836742945015
+    "ms": 239.58702851086855
    },
    "final_rms_norm": {
     "calls": 32,
-    "ms": 1.415512408129871
+    "ms": 1.5594310825690627
    }
   }
  },
@@ -94,6 +102,6 @@
   "bytes_transferred": 0
  },
  "timed_artifact_sha": "c571a6158c4e86fb29931a1ef91d8b46ea894c549d7956e6fda047156497324d",
- "devq_job_id": "574",
- "recorded_utc": "2026-08-23T12:25:53.779777+00:00"
+ "devq_job_id": "580",
+ "recorded_utc": "2026-08-26T04:16:34.567218+00:00"
 }

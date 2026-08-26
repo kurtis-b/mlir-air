@@ -478,7 +478,7 @@ def run_npu_prefill(
 
         # Extract KV cache from intermediates (CPU: reshape + transpose +
         # cast + slice-assign). 16 invocations per prefill, one per layer.
-        with prefill_cache.profiler.time_cpu("kv_cache_extract"):
+        with prefill_cache.profiler.time_cpu("kv_append"):  # the plan's stage name (was kv_cache_extract)
             k_roped = intermediates["k_roped"]
             v_raw = intermediates["v"]
             k_cache[layer_idx, :, :seq_len, :] = (
@@ -826,7 +826,7 @@ def _print_dataflow_summary(prefill_cache, decode_cache, n_layers, n_decode_toke
         rms_p = k_avg(pp, "rms_gemms_rope")
         fa_p = k_avg(pp, "flash_attn")
         offn_p = k_avg(pp, "o_ffn")
-        kv_extract = c_avg(pp, "kv_cache_extract")
+        kv_extract = c_avg(pp, "kv_append")  # renamed 2026-08-25 (the plan's stage name)
         layer_avg = (
             sum(t for _, t in pp.layer_times) * 1000.0 / n_layers
             if pp.layer_times
@@ -862,7 +862,7 @@ def _print_dataflow_summary(prefill_cache, decode_cache, n_layers, n_decode_toke
         row("  rms_gemms_rope.elf", "NPU", rms_p)
         row("  flash_attn.elf", "NPU", fa_p)
         row("  o_ffn.elf", "NPU", offn_p)
-        row("  kv_cache_extract", "CPU", kv_extract)
+        row("  kv_append", "CPU", kv_extract)
         row("  python/numpy scheduling", "—", layer_sched)
         print(f"  │  {'─'*52}")
         print(f"  │  {'per-layer wall':<{col-3}}{'':<6}{layer_avg:>8.2f} ms")

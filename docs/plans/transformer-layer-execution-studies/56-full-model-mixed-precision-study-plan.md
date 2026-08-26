@@ -373,9 +373,22 @@ plan's to the launch (150 and 152 executed launches; 57 and 33 submissions), che
 every rung. The prefill clock is the forward only (tokenization and EOS padding outside;
 `measured_token_count` = valid prompt tokens; the first-forward BO allocation lands in the
 warmup). Qwen prefill at M = 2048 leaves ~200 ms per forward outside device + sync + host-cpu —
-the untimed host glue (the head-first FA transposes, Python) that `host_cpu_ms` does not bucket;
-`host_ops` counts the instrumented buckets only (n_layers + 1 per decode token, + 2 per prefill),
-fewer than the plan's host ops (kv_append and the embed lookup are not bucketed).
+untimed Python glue that `host_cpu_ms` does not bucket. ~~`host_ops` counts the instrumented
+buckets only (n_layers + 1 per decode token, + 2 per prefill), fewer than the plan's host ops
+(kv_append and the embed lookup are not bucketed).~~ **`[2026-08-25]` closed (queue item 15)**:
+every planned host stage is now a named `time_cpu` bucket — `kv_append` in both decode blocks
+and both prefill loops (renamed from `kv_cache_extract` to the plan's stage name), the
+head-first FA transposes (`transpose_seq_to_head` / `transpose_head_to_seq` in
+`fa_headfirst.py`, which also moves that part of the ~200 ms into `host_cpu_ms`), and the
+adapter's decode `embed_lookup` — so measured `host_ops` equals `plan_total_host_ops`
+(qwen 58 / 86 per decode token / prefill forward, llama 34 / 18) and the runner's live check
+fails the row on any inequality. Verified on the device: walk 5 ran the check green end to end
+(devq 579; its qwen numbers are a transient — attention 2.2× and device +7 % across the board,
+gone on the immediate re-run) and walk 6 (devq 580) is the citable one: qwen decode 11.71 /
+10.03 / 7.09 tok/s at ctx 512 / 1024 / 2048 with `kv_append` 0.10–0.14 ms and `embed_lookup`
+0.01 ms per token (the buckets cost nothing; they only name what was already inside the token),
+`host_ops` 58 / 86 (qwen decode / prefill) and 34 / 18 (llama) — equal to the plan on every
+rung. The five fixture traces are walk 6's.
 
 **Two walls, met on the kernel-scaling curve.** (1) `o_ffn_qwen` (and the shared `o_ffn`) is
 fused-cast-only: its slices bind a 4-arg GEMM with an f32 scratch, and the registry's best at

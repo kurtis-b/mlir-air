@@ -457,8 +457,11 @@ def run_decode_block(
     )
 
     # --- Update KV cache (K after qk-norm AND rope; V raw projection) ---
-    k_cache_layer[:, current_pos, :] = k_roped.reshape(n_kv_heads, head_dim)
-    v_cache_layer[:, current_pos, :] = v.reshape(n_kv_heads, head_dim)
+    # `[2026-08-25]` bucketed so host_ops equals the plan's host-stage count
+    # (doc 56 s3.6; the kv_append stage was the uncounted one).
+    with cache.profiler.time_cpu("kv_append"):
+        k_cache_layer[:, current_pos, :] = k_roped.reshape(n_kv_heads, head_dim)
+        v_cache_layer[:, current_pos, :] = v.reshape(n_kv_heads, head_dim)
 
     # --- CPU attention ---
     with cache.profiler.time_cpu("decode_attention_cpu"):

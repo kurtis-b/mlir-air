@@ -356,7 +356,7 @@ def run_npu_prefill(
             cpu_attn=cpu_attn,
             verbose=profile,
         )
-        with prefill_cache.profiler.time_cpu("kv_cache_extract"):
+        with prefill_cache.profiler.time_cpu("kv_append"):  # the plan's stage name (was kv_cache_extract)
             k_roped = inter["k_roped"]
             v_raw = inter["v"]
             k_cache[layer_idx, :, :seq_len, :] = (

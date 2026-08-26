@@ -119,19 +119,23 @@ def npu_fa_headfirst(
     v = np.asarray(v, dtype=bfloat16).reshape(seq_len, n_kv_heads, head_dim)
 
     # ---- Host transpose seq-first -> head-first ----
-    # Q L3: [n_heads, seq, head_dim]
-    q_hf = np.ascontiguousarray(q.transpose(1, 0, 2))
-    # K L3: [n_kv_heads, seq, head_dim]
-    k_hf = np.ascontiguousarray(k.transpose(1, 0, 2))
-    # V L3: [n_kv_heads*dv_chunks, seq, dv_tile] -- split head_dim into
-    # dv_chunks slices of dv_tile=lkp, dv-chunk axis nests inside the kv-head
-    # axis (head*dv_chunks + chunk), matching the kernel's head_v_off.
-    v_hf = np.ascontiguousarray(
-        v.transpose(1, 0, 2)  # [n_kv, seq, head_dim]
-        .reshape(n_kv_heads, seq_len, dv_chunks, lkp)
-        .transpose(0, 2, 1, 3)  # [n_kv, dv_chunks, seq, lkp]
-        .reshape(n_kv_heads * dv_chunks, seq_len, lkp)
-    )
+    # Bucketed `[2026-08-25]` under the plan's stage name (doc 56 s3.6:
+    # transpose_seq_to_head is a planned host op of the head-first FA path).
+    with cache.profiler.time_cpu("transpose_seq_to_head"):
+        # Q L3: [n_heads, seq, head_dim]
+        q_hf = np.ascontiguousarray(q.transpose(1, 0, 2))
+        # K L3: [n_kv_heads, seq, head_dim]
+        k_hf = np.ascontiguousarray(k.transpose(1, 0, 2))
+        # V L3: [n_kv_heads*dv_chunks, seq, dv_tile] -- split head_dim into
+        # dv_chunks slices of dv_tile=lkp, dv-chunk axis nests inside the
+        # kv-head axis (head*dv_chunks + chunk), matching the kernel's
+        # head_v_off.
+        v_hf = np.ascontiguousarray(
+            v.transpose(1, 0, 2)  # [n_kv, seq, head_dim]
+            .reshape(n_kv_heads, seq_len, dv_chunks, lkp)
+            .transpose(0, 2, 1, 3)  # [n_kv, dv_chunks, seq, lkp]
+            .reshape(n_kv_heads * dv_chunks, seq_len, lkp)
+        )
 
     # Output BO: [n_heads*dv_chunks, seq, dv_tile]
     out_hf = np.zeros((n_heads * dv_chunks, seq_len, lkp), dtype=bfloat16)
@@ -149,9 +153,10 @@ def npu_fa_headfirst(
     # ---- Host transpose head-first -> seq-first ----
     # gp [n_heads*dv_chunks, seq, lkp] : axes nest as (head, dv_chunk).
     # Concat the dv_chunks back to head_dim, then move seq to the front.
-    attn_out = (
-        gp.reshape(n_heads, dv_chunks, seq_len, lkp)
-        .transpose(2, 0, 1, 3)  # [seq, n_heads, dv_chunks, lkp]
-        .reshape(seq_len, q_dim)
-    )
-    return np.ascontiguousarray(attn_out).astype(bfloat16)
+    with cache.profiler.time_cpu("transpose_head_to_seq"):
+        attn_out = np.ascontiguousarray(
+            gp.reshape(n_heads, dv_chunks, seq_len, lkp)
+            .transpose(2, 0, 1, 3)  # [seq, n_heads, dv_chunks, lkp]
+            .reshape(seq_len, q_dim)
+        ).astype(bfloat16)
+    return attn_out

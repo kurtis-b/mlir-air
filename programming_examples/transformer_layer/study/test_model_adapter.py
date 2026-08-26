@@ -158,14 +158,21 @@ def test_the_recorded_driver_traces_reproduce_the_plan_vector():
             assert per[key] == static[key], (t["case_id"], key, per[key], static[key])
         # the driver's own record, which the plan cannot produce: syncs and bytes are real
         assert per["sync_boundaries"] > 0 and per["bytes_transferred"] > 0
-        # host_ops counts the driver's INSTRUMENTED time_cpu buckets, which is
-        # fewer than the plan's host ops (kv_append and the embed lookup are not
-        # bucketed): decode = n_layers attention + final norm; prefill =
-        # n_layers kv_cache_extract + embed + final norm. The plan's count is
-        # the upper bound the row's host_ops_note states.
-        L = ma.MODELS[model_id].spec.n_layers
-        assert decomposition["host_ops"] // n == (L + 1 if phase == "decode" else L + 2), (t["case_id"], decomposition["host_ops"] // n)
-        assert decomposition["host_ops"] // n <= plan_.total_host_ops
+        # `[2026-08-25]` (queue item 15) every planned host stage is a named
+        # time_cpu bucket -- kv_append in both decode blocks and both prefill
+        # loops, the head-first FA transposes, the adapter's decode embed --
+        # so the measured count EQUALS the plan's, and the trace's bucket
+        # names are exactly the plan's host-stage names. run_model's live
+        # check enforces the count on every rung; this pins it offline on the
+        # recorded traces (walk 6, devq 580).
+        raw_total = sum(c["calls"] for c in t["trace"]["cpu"].values())
+        assert raw_total == plan_.total_host_ops * n, (t["case_id"], raw_total, plan_.total_host_ops, n)
+        # decomposition here is over the WHOLE trace (the adapter divides per
+        # sample only on the live path), so the raw-total assertion above is
+        # the offline form of run_model's live check.
+        assert decomposition["host_ops"] == raw_total
+        plan_host_names = {st.name for st in plan_.stages if st.where == "host"}
+        assert set(t["trace"]["cpu"]) == plan_host_names, (t["case_id"], sorted(t["trace"]["cpu"]), sorted(plan_host_names))
         assert decomposition["distinct_elfs"] == len(plan_.elf_sequence())
         assert per == t["measured_vector"], (t["case_id"], per, t["measured_vector"])
         schema.validate_model_dispatch_vector(per)

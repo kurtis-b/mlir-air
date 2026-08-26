@@ -14,8 +14,8 @@
     "n_readback": 252,
     "bytes_written": 352321536,
     "bytes_readback": 1409286144,
-    "kernel_ms": 681.091042002663,
-    "sync_ms": 49.989365972578526
+    "kernel_ms": 671.458892757073,
+    "sync_ms": 42.27937839459628
    },
    "flash_attn": {
     "calls": 84,
@@ -23,8 +23,8 @@
     "n_readback": 84,
     "bytes_written": 2113929216,
     "bytes_readback": 704643072,
-    "kernel_ms": 1794.2821914330125,
-    "sync_ms": 130.81640924792737
+    "kernel_ms": 1785.8833140926436,
+    "sync_ms": 131.70321471989155
    },
    "o_ffn_qwen": {
     "calls": 84,
@@ -32,8 +32,8 @@
     "n_readback": 84,
     "bytes_written": 1056964608,
     "bytes_readback": 352321536,
-    "kernel_ms": 1074.6332695707679,
-    "sync_ms": 64.64286986738443
+    "kernel_ms": 1068.5269287787378,
+    "sync_ms": 66.8796660611406
    },
    "lm_head_gemv": {
     "calls": 3,
@@ -41,22 +41,30 @@
     "n_readback": 30,
     "bytes_written": 6144,
     "bytes_readback": 911616,
-    "kernel_ms": 24.02693801559508,
-    "sync_ms": 0.24106097407639027
+    "kernel_ms": 24.36623303219676,
+    "sync_ms": 0.19473594147711992
    }
   },
   "cpu": {
    "embed_lookup": {
     "calls": 3,
-    "ms": 3.0020561534911394
+    "ms": 3.3647558884695172
    },
-   "kv_cache_extract": {
+   "transpose_seq_to_head": {
     "calls": 84,
-    "ms": 75.49573539290577
+    "ms": 172.24790062755346
+   },
+   "transpose_head_to_seq": {
+    "calls": 84,
+    "ms": 103.3778841374442
+   },
+   "kv_append": {
+    "calls": 84,
+    "ms": 72.56043329834938
    },
    "final_rms_norm": {
     "calls": 3,
-    "ms": 1.377240987494588
+    "ms": 1.7867491114884615
    }
   }
  },
@@ -106,7 +114,7 @@
   "sync_boundaries": 0,
   "bytes_transferred": 0
  },
- "timed_artifact_sha": "4974673a197c07d1108642f6f53800271ea622c1312a53e1055cf76207b1acb0",
- "devq_job_id": "574",
- "recorded_utc": "2026-08-23T12:24:59.244749+00:00"
+ "timed_artifact_sha": "8754a7b90ec75540d770383bcfde5db6f12ca7f46b0dc9e6a956a53535d57aa0",
+ "devq_job_id": "580",
+ "recorded_utc": "2026-08-26T04:14:47.462112+00:00"
 }

@@ -245,9 +245,11 @@ def run_decode_block(
     q_roped = results[11].reshape(n_heads, head_dim).astype(bfloat16)
     k_roped = results[12].reshape(n_kv_heads, head_dim).astype(bfloat16)
 
-    # Update KV cache
-    k_cache_layer[:, current_pos, :] = k_roped
-    v_cache_layer[:, current_pos, :] = v.reshape(n_kv_heads, head_dim)
+    # Update KV cache (bucketed `[2026-08-25]` so host_ops equals the plan's
+    # host-stage count, doc 56 s3.6)
+    with cache.profiler.time_cpu("kv_append"):
+        k_cache_layer[:, current_pos, :] = k_roped
+        v_cache_layer[:, current_pos, :] = v.reshape(n_kv_heads, head_dim)
 
     # --- CPU Attention ---
     # Single-query attention against the growing K/V cache. CPU-side because

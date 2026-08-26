@@ -381,6 +381,15 @@ def worker(args) -> int:
             # forward or per token, equals what the plan + manifest derive.
             drift = {k: (res.dispatch[k], predicted[k]) for k in ("host_submissions", "runlist_entries", "air_launches", "herd_launches")
                      if res.dispatch[k] != predicted[k]}
+            # `[2026-08-25]` host_ops joins the live check: the drivers now
+            # bucket every planned host stage (kv_append, the FA transposes,
+            # embed via the adapter), so the measured count must equal the
+            # plan's. RAW totals, not the adapter's rounded per-sample average
+            # (review of 7cbf180e: 1855 or 1857 calls both round to 58 -- one
+            # missing or extra bucket call must fail, so compare exactly).
+            total_ops = sum(c["calls"] for c in res.trace["cpu"].values())
+            if total_ops != plan_.total_host_ops * res.trace_samples:
+                drift["host_ops_total"] = (total_ops, plan_.total_host_ops * res.trace_samples)
             trace_path = work_dir / f"trace_{rung.case_id.replace('/', '_')}.json"
             trace_path.write_text(json.dumps({
                 "model_id": model_id, "case_id": rung.case_id, "phase": rung.phase, "M": M, "context_end": rung.context_end,
@@ -405,7 +414,7 @@ def worker(args) -> int:
                 "plan_total_submissions": plan_.total_submissions, "plan_total_host_ops": plan_.total_host_ops,
                 "samples_s": res.samples_s, "tokens": res.tokens[:64], "context": [res.context_start, res.context_end],
                 "effective_gflops_note": "weights-only FLOPs (2 x matmul weight elements x tokens); attention excluded",
-                "host_ops_note": "named Profiler.time_cpu buckets only; untimed host glue (FA transposes, Python) is in avg_latency_ms and not here",
+                "host_ops_note": "every planned host stage is a named Profiler.time_cpu bucket since 2026-08-25 (kv_append, transpose_seq_to_head/head_to_seq, embed_lookup, attention, final norm); equals plan_total_host_ops and is enforced by the live check; unplanned Python glue is in avg_latency_ms only",
                 "phase_dispatch_vector": adapter.dispatch_vector("decode") if rung.phase == "decode" else res.dispatch,
                 "qkv_scratch_layout": adapter._scratch_layout,
                 "artifact_deviation": deviation,

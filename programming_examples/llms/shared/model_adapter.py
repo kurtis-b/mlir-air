@@ -587,7 +587,8 @@ class ModelAdapter:
 
         def step(tok, pos):
             t0 = time.perf_counter()
-            x = s.weights.embed_table[tok].astype(bfloat16)
+            with s.decode_cache.profiler.time_cpu("embed_lookup"):
+                x = s.weights.embed_table[tok].astype(bfloat16)
             next_tok, _logits = drv.run_npu_decode_step(x, s.weights, s.config, s.decode_cache, s.rope_lut_bf16, state.k_cache, state.v_cache, pos)
             return time.perf_counter() - t0, int(next_tok)
 

@@ -14,8 +14,8 @@
     "n_readback": 320,
     "bytes_written": 65536,
     "bytes_readback": 9723904,
-    "kernel_ms": 243.42281033750623,
-    "sync_ms": 0.9559239260852337
+    "kernel_ms": 245.18628185614944,
+    "sync_ms": 1.1877849465236068
    },
    "rms_qkv_qknorm_rope_gemv2": {
     "calls": 896,
@@ -23,8 +23,8 @@
     "n_readback": 896,
     "bytes_written": 4358144,
     "bytes_readback": 117440512,
-    "kernel_ms": 398.6699302913621,
-    "sync_ms": 11.513797100633383
+    "kernel_ms": 400.771732092835,
+    "sync_ms": 13.199773500673473
    },
    "o_gemv_ffn": {
     "calls": 896,
@@ -32,18 +32,26 @@
     "n_readback": 896,
     "bytes_written": 5505024,
     "bytes_readback": 1835008,
-    "kernel_ms": 1371.2425444973633,
-    "sync_ms": 12.921256246045232
+    "kernel_ms": 1381.0522843850777,
+    "sync_ms": 15.98805736284703
    }
   },
   "cpu": {
+   "embed_lookup": {
+    "calls": 32,
+    "ms": 0.09174027945846319
+   },
+   "kv_append": {
+    "calls": 896,
+    "ms": 3.2884737011045218
+   },
    "decode_attention_cpu": {
     "calls": 896,
-    "ms": 364.96062437072396
+    "ms": 385.9088394092396
    },
    "final_rms_norm": {
     "calls": 32,
-    "ms": 1.439757994376123
+    "ms": 1.5823120484128594
    }
   }
  },
@@ -93,7 +101,7 @@
   "sync_boundaries": 0,
   "bytes_transferred": 0
  },
- "timed_artifact_sha": "4974673a197c07d1108642f6f53800271ea622c1312a53e1055cf76207b1acb0",
- "devq_job_id": "574",
- "recorded_utc": "2026-08-23T12:25:03.443519+00:00"
+ "timed_artifact_sha": "8754a7b90ec75540d770383bcfde5db6f12ca7f46b0dc9e6a956a53535d57aa0",
+ "devq_job_id": "580",
+ "recorded_utc": "2026-08-26T04:14:51.788189+00:00"
 }
