@@ -264,6 +264,27 @@ def test_the_flag_hops_exist_by_source():
         assert "PREFILL_DTYPE" in body and needle in body, fn_name
     # the KV append needs k_roped/v from the bfp16 block: with_kv must be passed
     assert "with_kv=True" in drv
+    # `[2026-08-26, review round]` THE TWO ARMS MUST MATCH ON BO RESIDENCY.
+    # The bf16 branch runs `run_transformer_block`, which passes
+    # shared_nonstatic=True on both fused stages and gives flash_attn no
+    # per-layer bo_key; the bfp16 branch must ask for the same policy, or the
+    # H4 A/B differs in residency as well as in its two GEMM ELFs and the
+    # difference lands in the measured GEMM delta (Codex review of a3a8f9f3).
+    assert "shared_nonstatic=True" in drv, "the bfp16 arm must run the bf16 arm's residency policy"
+    pf = Path(_PE, "llms", "llama32_1b_int4", "llama32_1b_int4_prefill.py").read_text(encoding="utf-8")
+    ptree = ast.parse(pf)
+    fn = next(n for n in ptree.body if isinstance(n, ast.FunctionDef) and n.name == "_run_layer_bfp16")
+    assert "shared_nonstatic" in [a.arg for a in fn.args.args + fn.args.kwonlyargs]
+    body = ast.unparse(fn)
+    # both fused stages honour it, and the FA call drops its per-layer bo_key
+    assert body.count("if shared_nonstatic else") >= 2, body.count("if shared_nonstatic else")
+    assert "_fa_kw" in body and "shared_nonstatic" in body
+    assert "'bo_key': f'flash_attn_L{layer_idx}'" in body or 'bo_key": f"flash_attn_L{layer_idx}"' in body
+    # and the DEFAULT is off, so the standalone verify / diagnosis paths, which
+    # persist per-layer intermediates, never receive pooled views
+    d = dict(zip([a.arg for a in fn.args.args][-len(fn.args.defaults):],
+                 [ast.literal_eval(x) for x in fn.args.defaults]))
+    assert d["shared_nonstatic"] is False, d
     # the binding drives the flag, and pins BOTH directions
     b = ma.MODELS["llama32_1b_int4"]
     assert set(b.precision_env_map) == {"w4_decode", "w_bfp16_prefill"}

@@ -963,9 +963,12 @@ in-core-prologue version is worth building, and that is a kernel change.
 **`[2026-08-26]` H4 landed, and it is a priced NEGATIVE** (queue item 20; evidence
 `results/item20-h4-20260826/`, local: `PREDICTION.md`, `RESULTS.md`, the launch-count
 derivation and artifact-set assembly tools, the assembled bfp16 set with its provenance, the
-re-execution gate + records, four walk roots, three `compare_walk*.txt`, devq logs 634–639).
+re-execution gate + records at two declared input scales, seven walk roots, five
+`compare_walk*.txt`, devq logs 634–648. **One Codex review round, devq 641, four blocking
+findings, all four fixed below and named where they land; no second round.**)
 **The prediction predates the device by file time**: `PREDICTION.md` mtime 19:25:02Z, this
-item's first devq job (631) submitted 19:44:28Z (`job-000631.meta`). Turbo observed before and after every job.
+item's first devq job (631) submitted 19:44:28Z (`job-000631.meta`). Turbo observed before and
+after every job.
 
 **The brief's byte arithmetic was wrong and correcting it is half the answer.** `bfp16ebs8` is
 **9 bytes per 8 elements = 9 bits/elt**, not 4.5: **1.778× under bf16, not 3.5×**
@@ -973,101 +976,151 @@ item's first devq job (631) submitted 19:44:28Z (`job-000631.meta`). Turbo obser
 weight set is 1946.2 MB bf16 against **1094.7 MB** bfp16 — and the packer produced exactly
 1094.7 MB on the device path, so the arithmetic is confirmed, not assumed.
 
-**The decisive question, committed before the walk and answered.** At `M = 2048` each weight
-element feeds 2048 MACs, so the *whole* weight-byte prize — 851.4 MB at the boundary-free
-40.8 GB/s — is **≤ 20.9 ms of a ~1180 ms forward, 1.8 %**. Prefill at the shipped ubatch is
-compute-bound; `bfp16` storage buys ~nothing *from bytes*. The prediction therefore committed to
-**bfp16 being SLOWER**, because the only bfp16 GEMM this tree has is built at `tile_n = 32`
-against the registry's 128 — 4× the A-panel re-reads per GEMM, and A is the activation matrix,
-which weight storage does not shrink. Measured, that is exactly what happened.
+**The A/B, and what it does and does not hold fixed.** One walk, one model, one compiled
+`M = 2048`, one 2048-token prompt, one session; the same AWQ checkpoint and the same
+dequantized bf16 weights, of which the bfp16 BOs are a transcode; the same `flash_attn.elf`
+byte for byte (sha `603f1f41cacc`); the same driver, the same host prefill loop, and — since
+the review round — **the same BO residency policy** (`review finding 2`: the bf16 branch runs
+`shared_nonstatic=True` on both fused stages and gives `flash_attn` no per-layer `bo_key`,
+while the bfp16 branch did neither, so the arms differed in BO residency and address reuse as
+well as in their GEMM ELFs; `_run_layer_bfp16` now takes the policy as a parameter, the
+inference driver passes the bf16 branch's, and walks 5–7 are the re-measure). `rms_gemms_rope`
+7 launches / `o_ffn` 12 become `rms_gemms_rope_bfp16` **6** / `o_ffn_bfp16` **8**: 328 → **248**
+launches per forward at 49 submissions and 18 host ops either way, checked LIVE against the
+plan on every rung of every walk.
 
-**The two arms differ in exactly two ELFs**: one walk, one model, one compiled `M = 2048`, one
-2048-token prompt, one session, the SAME `flash_attn.elf` byte for byte (sha `603f1f41cacc` —
-attention is a control, not a second variable), the same AWQ checkpoint and the same
-dequantized bf16 weights, of which the bfp16 BOs are a transcode. `rms_gemms_rope` 7 launches /
-`o_ffn` 12 become `rms_gemms_rope_bfp16` **6** / `o_ffn_bfp16` **8**: 328 → **248** launches per
-forward at 49 submissions and 18 host ops either way, checked LIVE against the plan on every
-rung of every walk.
+**What still co-varies, and therefore what this A/B can and cannot attribute.** Between the two
+arms the following change *together*: `tile_m` (64/32 → 32), `tile_n` (**128 → 32**),
+`tile_k_l1` (32 → 128), `tile_k_l2`, the GEMM microkernel itself (`mm_aie2p.cc` fused-cast/drain
+against `mm_bf16_x_bfp16.cc`), the presence of the fused-cast cast launches, the weight operand
+type and its packed BO layout, and the per-launch DMA/BD schedule those tiles generate.
+**No measurement in this item isolates any one of them**, and none is claimed to.
 
-| | tok/s (walk 3 / walk 4) | ms per forward | device / sync / host-cpu ms | GEMM-stage TFLOP/s |
+| | tok/s (walk 6 / walk 7) | ms per forward | device / sync / host-cpu ms | GEMM-stage TFLOP/s |
 |---|---|---|---|---|
-| bf16 (`w4_decode`) | **1745.7 / 1722.7** | 1173.2 / 1188.8 | 1097.5–1104.4 / 47–50 / 13–15 | **5.06** |
-| `bfp16` (`w_bfp16_prefill`) | **1184.4 / 1189.4** | 1729.1 / 1721.9 | 1636.1–1651.7 / 46–48 / 16–21 | **2.99** |
+| bf16 (`w4_decode`) | **1754.6 / 1750.9** | 1167.2 / 1169.7 | 1097.8 / 1097.4 · 46–48 · 13.2 / 12.6 | **5.08** |
+| `bfp16` (`w_bfp16_prefill`) | **1201.5 / 1210.3** | 1704.6 / 1692.1 | 1629.9 / 1628.2 · 46–50 · 13.7 / 11.2 | **3.02** |
 
-`compare_roots` walk3 → walk4 **VERDICT: OK** (0 warnings, 0 failures, identifier mismatches 0,
-tok/s drift median 0.87 % / p90 1.32 %, `device_ms` 0.37 %); the production top-5 gate **PASS on
-both arms in all four walks**, on the LOADED timed bytes at the timed prompt length. All six
-predicted quantities landed inside their bands: bf16 1722.7/1745.7 in 1625–1780, bfp16
-1184.4/1189.4 in 860–1225, bfp16 device 1636–1652 in 1500–2400, Δlaunches −80 exactly, the
-packed bytes exact.
+`compare_roots` walk6 → walk7 **VERDICT: OK** (0 warnings, 0 failures, identifier mismatches 0,
+tok/s drift median 0.48 % / p90 0.74 %, `device_ms` 0.07 %); the production top-5 gate **PASS on
+both arms in all seven walks**, on the LOADED timed bytes at the timed prompt length. Every
+predicted quantity landed inside its band: bf16 1750.9/1754.6 in 1625–1780, bfp16 1201.5/1210.3
+in 860–1225, bfp16 device 1628–1630 in 1500–2400, Δlaunches −80 exactly, the packed bytes exact.
+**Matching the residency policy moved the device delta from +549 ms to +531 ms — ~18 ms, 3.3 %
+of it — so the confound was real, is now removed, and the headline stands.**
 
-**Where the time moved, per call, stable to ≤ 1 % across four walks.** QKV **7.25–7.39 →
-10.66–10.81** ms (+47 %); `flash_attn` **18.60–18.75 → 18.63–18.74** (the control, 0.5 %);
-O+FFN **41.84–41.95 → 72.06–72.77** (+73 %); LM head unchanged. Per forward the two GEMM stages
-go 787 → 1331 ms over the same 3.986 TFLOP of work — **5.06 → 2.99 TFLOP/s, 0.59×**, the first
-measured `bfp16ebs8` GEMM rate in this tree. The accounting: the weight bytes are worth
-≤ −20.9 ms and the 80 removed launch boundaries −8.6 ms; the N tile costs **+577 ms**; net
-**+548 ms**. *The two things `bfp16ebs8` buys are worth 29.5 ms and the tile it is built at
-costs 577.*
+**Where the time moved, per call, over walks 5–7 (residency matched; ≤ 1 % spread).** QKV
+**7.228–7.250 → 10.584–10.672** ms (+47 %); `flash_attn` **18.616–18.663 → 18.577–18.653** (the
+control, 0.3 %); O+FFN **41.806–41.843 → 71.633–72.015** (+72 %); LM head unchanged. Per forward
+the two GEMM stages go **785 → 1319 ms** over the same 3.986 TFLOP of work — **5.08 → 3.02
+TFLOP/s, 0.59×**, the first measured `bfp16ebs8` GEMM rate in this tree.
 
-**The format is not what failed.** Its accuracy is the bf16 GEMM's own class — mean relative L1
-**0.0073** against an f32 reference at each GEMM's own device-side input, versus the registry's
-published `mean_rel_L1 ≈ 0.0097` for these bf16 shapes — and there is no dequant pass anywhere:
-the block's shared 8-bit exponent IS the scale and the MMUL applies it (doc 57 §5b's claim,
-confirmed structurally and priced at zero benefit here). The **registry decision was declared
-before the measurement** (`PREDICTION.md` §6) and is unchanged by it: use the builder's own
-tiles and mark every row `analytical_unmeasured` (§3.3), because `gemm_config` has no quant axis
-and the tiles are not free — `o_ffn_bfp16_multi` needs ONE `(tile_m, tile_n, tile_k_l1)` for all
-four GEMMs (shared private kernel decls in one ELF) and the single `mm_bf16_x_bfp16.o` bakes
-`DIM_M/DIM_N/DIM_K`. **So the negative is priced against THIS tile set**, the plan records it as
-a rejected alternative carrying that cost, and the repair that would let the question be asked
-again is item 14's, applied to the bfp16 cascade: per-GEMM tiles, co-linked `mm` variants,
-`tile_n = 128`.
+**The accounting, with the residual labelled as a residual** (`review finding 1`). Δdevice per
+forward is **+531 ms**. This item can price exactly one term of it: the **80 removed launch
+boundaries, −8.6 ms** at doc 57 §1.5's constant. The weight-byte term it cannot price: 851.4 MB
+at the machine's *maximum* measured rate (40.8 GB/s) takes 20.9 ms, and because 40.8 is a
+maximum, **20.9 ms is a LOWER bound on the time those bytes occupy — not an upper bound on what
+removing them saves** — and how much of that time is exposed rather than overlapped with compute
+is not measured here. `PREDICTION.md` used it as an upper bound on the saving; that was a
+reasoning error, and it is conservative with respect to this item's conclusion: correcting it can
+only make the weight-byte term **larger**, and the bfp16 arm is still 531 ms slower. So with
+`W ≥ 0` the unmeasured weight-byte saving, the **residual after the modelled terms is
+`R = 531 + 8.6 + W ≥ 540 ms`**, and R is charged to *the whole co-varying set listed above*, not
+to any member of it.
 
-**The re-execution two-dispatch gate, parity predicted first — 6/6, so doc 57 §1.5 goes 10/10 →
-16/16** (devq 635, identical to the first clean pass devq 634). `rms_gemms_rope_bfp16` (6 loads,
-even) and `o_ffn_bfp16` (8, even) clean — d2/d3/d4 byte-equal to d1, d1 correct per family at
-each stage's own device-side input; `flash_attn` (**1, odd**, the ELF both arms share) d1
-correct and **d2/d3 wrong at rel L1 0.62**, healed byte-exactly by one intervening dispatch;
-`rms_gemms_rope` bf16 (**7, odd**) d1 correct and **d2 HANGS**. Production alternates
-`rms → flash_attn → o_ffn` and never re-executes a prefill ELF back-to-back, so the walks are
-unaffected — but two by-products are worth keeping. (i) **A new row for §1.5**: the documented
-"one intervening dispatch heals it" holds for the wrong-VALUE case; when the odd ELF *hangs*,
-the timeout is followed by ABORT, then `unexpected command state`, then `bad command state` —
-the XRT context is poisoned for the rest of the process and the heal cannot be evaluated, which
-is why the gate now runs one process per ELF. (ii) **A gate whose inputs do not exercise the
-kernel cannot see the defect**: at a small input scale the FA logits are ~0.16, the softmax is
-nearly uniform and `attn_out` barely depends on `q`, so the same corruption read as 0.009 % of
-elements; at a realistic logit spread it is rel L1 0.62.
+**A hypothesis, not a conclusion** (`review finding 1`). The narrowed N tile is the most
+plausible single member of that set — the traffic argument is that `tile_n·herd_n` falls
+128 → 32 per pass, i.e. 4× the A-panel re-reads, and A is the activation matrix, which weight
+storage does not shrink. **It is a hypothesis and this item does not test it**, and the item's
+own traffic model is evidence against taking it at face value: it predicted a 2.52× GEMM-stage
+ratio and measured **1.69×**, so the model does not describe these arms. **The test is a bfp16
+control at `tile_n = 128`** — per-GEMM tiles and co-linked `mm_bf16_x_bfp16.o` variants, exactly
+item 14's repair applied to the bfp16 cascade — which is item 22. Until that runs, the correct
+statement is: *`w_bfp16_prefill` as built costs 531 ms of device time per forward more than bf16
+prefill, and which of the co-varying differences is responsible is unknown.*
+
+**The format's own numbers are good, which is why the question is worth re-asking.** At each
+GEMM family's **own harness input distribution** (`A, B ~ N(0, 1/√K)` —
+`bf16_in_bf16_out/run.py:1222`, `matmul_bf16_x_bfp16.py:640`), every stage of every prefill ELF
+in both arms is **inside its published per-element bound: 6/6 and 8/8 stages, 0 elements
+outside** (devq 647), with the bfp16 GEMMs' mean relative L1 **0.0068–0.0080** against the bf16
+arm's 0.0098–0.0107. There is no dequant pass anywhere: the block's shared 8-bit exponent IS the
+scale and the MMUL applies it — doc 57 §5b's claim, confirmed structurally and worth nothing
+here at this shape.
+
+**The registry decision was declared before the measurement** (`PREDICTION.md` §6) and is
+unchanged by it: use the builder's own tiles and mark every row `analytical_unmeasured` (§3.3),
+because `gemm_config` has no quant axis and the tiles are not free — `o_ffn_bfp16_multi` needs
+ONE `(tile_m, tile_n, tile_k_l1)` for all four GEMMs (shared private kernel decls in one ELF)
+and the single `mm_bf16_x_bfp16.o` bakes `DIM_M/DIM_N/DIM_K`. The plan records it as a rejected
+alternative carrying that cost.
+
+**The re-execution two-dispatch gate, parity predicted first — 5 unique ELFs, 5/5, so doc 57
+§1.5's family goes 10/10 → 15/15** (`review finding 3`: the first version counted six legs, but
+the two `flash_attn` legs load the SAME sha256 `603f1f41cacc` and exercise the same
+one-LOAD_PDI configuration; a different cache path or intervening arm is not a new parity
+configuration, so the rule counts **unique ELFs**, not legs). Run at BOTH declared input scales,
+identical results (devq 647 family, 648 production): `rms_gemms_rope_bfp16` (6 loads, even),
+`o_ffn_bfp16` (8, even) and `o_ffn` bf16 (12, even) **clean** — d2/d3/d4 byte-equal to d1;
+`flash_attn` (**1, odd**) d1 correct and **d2/d3 wrong at rel L1 0.62**, healed byte-exactly by
+one intervening dispatch; `rms_gemms_rope` bf16 (**7, odd**) d1 correct and **d2 HANGS**.
+Production alternates `rms → flash_attn → o_ffn` and never re-executes a prefill ELF
+back-to-back. Two by-products. **(i) A new row for §1.5**: the documented "one intervening
+dispatch heals it" holds for the wrong-VALUE case; when the odd ELF *hangs*, the timeout is
+followed by ABORT, then `unexpected command state`, then `bad command state` — the XRT context
+is poisoned for the rest of the process and the heal cannot be evaluated, which is why the gate
+runs one process per ELF. **(ii) A gate whose inputs do not exercise the kernel cannot see the
+defect**: at a small input scale the FA logits are ~0.16, the softmax is nearly uniform and
+`attn_out` barely depends on `q`, so the same corruption read as 0.009 % of elements; at a
+realistic logit spread it is rel L1 0.62.
+
+**What "correct per family" means here, exactly** (`review finding 4`). The gate's first version
+set `passed` from `rel_L1 ≤ 5e-2` **even when the published per-element bound was violated**, and
+the first version of this block then claimed d1 was correct per family on records where 19–29 %
+of the bf16 arm's Q/K/V, gate/up and down elements were outside theirs. The criterion is now the
+family bound itself, and the gate declares its input scale, because a published `atol` belongs to
+the distribution its harness measured at — `kernel_registry/details/FFN_bf16.md:92` says so
+outright. At the **family** scale the claim above is true and is a real correctness-per-family
+result. At **production activation scale** (norm weights O(1), so GEMM outputs ~45× the
+harness's) the bf16 arm's GEMMs sit **19.6–29.0 % outside** their published `atol` while their
+`rel_L1` stays at 0.0098–0.0112, and the bfp16 arm's sit 0 % outside because its family's bound
+is looser (rtol 0.1 / atol 0.05 against 1.6e-2 / 1.5e-3); that gap is a fixed `atol` failing to
+scale, not a datapath fault, and neither arm's numbers can be read as the other's. One of the
+"failures" was the gate's own: SwiGLU was being judged at the generic elementwise bound instead
+of the SiLU-and-Mul registry page's `atol = 8e-2`, and passes at both scales once judged by its
+own family.
 
 **The host transient, characterized — and why the verdict is not read off `tokens_per_second`
-alone.** Over four walks `device_ms` is stable to 0.63 % / 0.95 % and every per-kernel line to
-≤ 1.9 %, while the `kv_append` host bucket (identical numpy in both arms, reading `k_roped`/`v`
-out of device-mapped BOs into a transposed copy) read **9.8 / 10.0 / 10.6 / 11.3 / 17.3 / 116.5
-/ 169.0 / 1080.5 ms per forward** across the eight arm-walks — the last is one 4.3 s sample
-inside walk 2. Walks 1 and 2 are recorded and `compare_roots` calls both pairings PROBLEM, with
-**every** gate failure driven by `host_cpu_ms` (median drift 447 %) and none by `device_ms`
-(0.24 %) or `min_latency_ms` (1.5 %). The transient-free check agrees on all four walks:
-min-sample forward 1169–1203 ms bf16 (1702–1752 tok/s) and 1708–1723 ms bfp16 (1189–1199), ratio
-**0.68× every time**. Same class as item 15's walk 5 and item 17's walk 1.
+alone.** Over seven walks `device_ms` is stable to ≤ 1 % and every per-kernel line to ≤ 1.9 %,
+while the `kv_append` host bucket (identical numpy in both arms, reading `k_roped`/`v` out of
+device-mapped BOs into a transposed copy) read **7.4 … 1080.5 ms per forward** across fourteen
+arm-walks; the worst is one 4.3 s sample inside walk 2, and walk 5 caught another after the
+residency fix, so BO count is not its cause. Walks 1, 2 and 5 are recorded and `compare_roots`
+calls their pairings PROBLEM, with **every** gate failure driven by `host_cpu_ms` and none by
+`device_ms` (0.07–0.37 %) or `min_latency_ms` (≤ 1.5 %). The transient-free check agrees on all
+seven walks: min-sample forward 1161–1203 ms bf16 and 1690–1723 ms bfp16, ratio **0.68–0.69
+every time**. Same class as item 15's walk 5 and item 17's walk 1.
 
 **What landed in code.** `LLAMA32_1B_INT4_PREFILL_DTYPE` on the existing int4 driver (default
 `bf16` — the operator default is unchanged; read once at import, the H2b flag shape), the
 load-time `bfp16ebs8` transcode of the SAME dequantized array both arms compute over,
-`_run_layer_bfp16` gaining `with_kv=` and the bf16 sibling's per-layer argument cache (without
-it the two RoPE-LUT expansions are rebuilt 16× per forward INSIDE the study's clock — ~0.5 s
-that has nothing to do with the weight format under test), `awq_bfp_pack.quant_contract()` as
-the ONE owner of the plan's `quant_*` columns (the plan mirrors only its NAME and imports
-nothing from a model directory), the verify adapter refusing to compile bf16 ELFs under a bfp16
-plan, the planner's bfp16 GEMM family with its refusals and its recorded registry-policy
-rejection (bf16 plan shas untouched), per-plan contract owners and `PRECISION_PLAN_PHASE` in the
-adapter, and — the one structural change — **the study's ARTIFACT SET is now keyed by
-`(model, M, precision plan)`**, since a plan selects ELFs (H2b the decode set, H4 the prefill
-set): two rungs at one `M` under two plans are two sets, two worker processes and two gates
-inside one walk. Host suite 705 → **715/715 in 33 modules** (`study/test_bfp16_prefill.py`);
-seam `PLAN 14/14` unchanged.
+`_run_layer_bfp16` gaining `with_kv=`, the bf16 sibling's per-layer argument cache and its
+**`shared_nonstatic` residency policy** (default off, so the standalone verify/diagnosis paths,
+which persist per-layer intermediates, keep the behaviour they had),
+`awq_bfp_pack.quant_contract()` as the ONE owner of the plan's `quant_*` columns (the plan
+mirrors only its NAME and imports nothing from a model directory), the verify adapter refusing to
+compile bf16 ELFs under a bfp16 plan, the planner's bfp16 GEMM family with its refusals and its
+recorded registry-policy rejection (bf16 plan shas untouched), per-plan contract owners and
+`PRECISION_PLAN_PHASE` in the adapter, and — the one structural change — **the study's ARTIFACT
+SET is now keyed by `(model, M, precision plan)`**, since a plan selects ELFs (H2b the decode
+set, H4 the prefill set): two rungs at one `M` under two plans are two sets, two worker processes
+and two gates inside one walk. Host suite 705 → **715/715 in 33 modules** from this item
+(`study/test_bfp16_prefill.py`, whose flag-hop test now also pins the residency parity); the
+tree's pin reads **719** because queue item 24 is adding four tests to the same suite
+concurrently. Seam `PLAN 14/14` unchanged.
 
-**Left.** The bfp16 arm is measured AS BUILT, and the one experiment this item did not run is
-the one its result argues for: the same cascade with per-GEMM tiles at `tile_n = 128`. Until
-that exists, `w_bfp16_prefill` is a working, gate-passing, accuracy-neutral plan that costs
-48 % more device time than bf16 prefill, and **bf16 remains the default for every model**.
+**Left.** The bfp16 arm is measured AS BUILT and the one experiment its result argues for is the
+one this item did not run: **item 22, the bfp16 cascade with per-GEMM tiles at `tile_n = 128`**,
+which is the only thing that would turn the tile hypothesis into an attribution. Until then
+`w_bfp16_prefill` is a working, gate-passing, accuracy-neutral plan that costs 48 % more device
+time than bf16 prefill, and **bf16 remains the default for every model**.

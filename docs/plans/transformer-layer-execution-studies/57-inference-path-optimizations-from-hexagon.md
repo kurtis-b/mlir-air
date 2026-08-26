@@ -347,14 +347,25 @@ healed by one other-ELF dispatch). **Odd ⇔ wrong/hang now 10/10.** Production 
 re-executes these back-to-back; recompiling under the fixed compiler is the repair when those
 caches are next rebuilt.
 
-**`[2026-08-26]` Six more rows, predicted then observed — odd ⇔ wrong/hang 16/16** (doc 56 H4,
-queue item 20, devq 635; devq 634 is the identical first pass). Both arms' Llama-3.2-1B PREFILL
-ELFs, all pre-fix bytes, through the production per-layer call sites:
+**`[2026-08-26]` Five more rows, predicted then observed — odd ⇔ wrong/hang 15/15** (doc 56 H4,
+queue item 20, devq 647 and 648, one per declared input scale, identical results; devq 634/635
+are the earlier passes). **The rule counts UNIQUE ELFs, not legs**: this item ran six legs, but
+the two `flash_attn` legs load the SAME sha256 `603f1f41cacc` and exercise the same one-LOAD_PDI
+configuration — a different cache path or intervening arm does not make a new parity
+configuration — so the five unique prefill ELFs contribute five rows, not six (the first
+version of this note said 16/16 and was wrong; Codex review of `a3a8f9f3`, blocking finding 3).
+Both arms' Llama-3.2-1B PREFILL ELFs, all pre-fix bytes, through the production per-layer call
+sites:
 `rms_gemms_rope_bfp16` (6, even) and `o_ffn_bfp16` (8, even) and `o_ffn` bf16 (12, even) **clean**
-— d2/d3/d4 byte-equal to d1, d1 correct per family at each stage's own device-side input;
-`flash_attn` (**1, odd**, the ELF both arms share) d1 correct and **d2/d3 wrong at rel L1 0.62**,
-healed byte-exactly by one intervening dispatch; `rms_gemms_rope` bf16 (**7, odd**) d1 correct and
-**d2 HANGS**. Production alternates `rms → flash_attn → o_ffn`, so no prefill ELF is ever
+— d2/d3/d4 byte-equal to d1; `flash_attn` (**1, odd**, the ELF both arms share) d1 correct and
+**d2/d3 wrong at rel L1 0.62**, healed byte-exactly by one intervening dispatch;
+`rms_gemms_rope` bf16 (**7, odd**) d1 correct and **d2 HANGS**. Every d1 is checked per family at
+each stage's OWN device-side input, and the gate declares the input scale it did so at: at the
+GEMM families' own harness distribution (`A, B ~ N(0, 1/√K)`) all 6/6 and 8/8 stages of both arms
+are inside their published bounds, while at production activation magnitudes the bf16 arm's GEMMs
+sit 19.6–29.0 % outside a fixed `atol` that does not scale with the output (rel L1 unchanged at
+~0.010). The gate's first version marked those `passed` from `rel_L1` alone, which is a coarse
+corruption check and not a per-family claim (blocking finding 4). Production alternates `rms → flash_attn → o_ffn`, so no prefill ELF is ever
 dispatched back-to-back. Two by-products. **(i) The heal is a fact about the wrong-VALUE case
 only**: when the odd ELF *hangs*, `ERT_CMD_STATE_TIMEOUT` is followed by `ERT_CMD_STATE_ABORT`,
 then `qds_device::wait() unexpected command state`, then `bad command state, can't launch` — the
@@ -686,17 +697,23 @@ is a *native MMUL operand type* on AIE2P, so a bf16 × bfp16 GEMM needs **no deq
 their own solver prices that pass at `HTP_MM_HMX_COST_W_DEQUANT = 3` against
 `HTP_MM_HMX_COST_A_CONVERT = 2` (`htp/matmul-ops.h:45-46`). That term is one we can make **zero**,
 and doc 56 §4's H4 is the measurement that would show it.
-**`[2026-08-26]` H4 measured it (queue item 20, devq 636–639): the zero-dequant-pass advantage is
-REAL and worth NOTHING at prefill's shipped ubatch.** There is no dequant kernel and no dequant
-time in the bfp16 arm — the shared 8-bit exponent IS the scale and the MMUL applies it — and its
-accuracy is the bf16 GEMM's own class (mean rel L1 0.0073 against the registry's published
-0.0097); but `bfp16ebs8` is **9 bits/elt, 1.778× under bf16, not 3.5×**, so at `M = 2048`, where
-each weight element feeds 2048 MACs, the entire weight-byte prize is **≤ 21 ms of a ~1180 ms
-forward**. Measured end to end on Llama-3.2-1B-AWQ: **1184–1189 tok/s against bf16's 1723–1746,
-+548 ms of device time**, because the only bfp16 GEMM in the tree is built at `tile_n = 32`
-against the registry's 128 and pays 4× the activation re-reads — a term the storage format does
-not touch. Hexagon prices `COST_W_DEQUANT` in a regime where the matrix engine works on 32×32
-fp16 tiles; ours is not that regime. See doc 56 §4's H4 block. (iii) They reject bf16 outright and
+**`[2026-08-26]` H4 measured it (queue item 20, devq 643/644 after the review round's
+residency fix): the zero-dequant-pass advantage is REAL and does not pay at prefill's shipped
+ubatch.** There is no dequant kernel and no dequant time in the bfp16 arm — the shared 8-bit
+exponent IS the scale and the MMUL applies it — and at each GEMM family's own harness input
+distribution every stage of both arms is inside its published per-element bound, with the bfp16
+GEMMs' mean rel L1 0.0068–0.0080 against the bf16 arm's 0.0098–0.0107 (devq 647). But
+`bfp16ebs8` is **9 bits/elt, 1.778× under bf16, not 3.5×**, and measured end to end on
+Llama-3.2-1B-AWQ the bfp16 arm runs at **1201–1210 tok/s against bf16's 1751–1755, +531 ms of
+device time per forward**. Of that delta this item prices one term — the 80 removed launch
+boundaries, −8.6 ms — and leaves the rest as a labelled residual (≥ 540 ms) charged to the whole
+set of differences that co-vary between the arms (`tile_m`, `tile_n` 128 → 32, `tile_k_l1`,
+`tile_k_l2`, the GEMM microkernel, the cast launches, the weight operand layout and the DMA
+schedule); **no measurement here isolates any one of them**, and the narrowed N tile is a
+hypothesis whose test is a bfp16 `tile_n = 128` control (item 22). What is settled is the
+direction: Hexagon prices `COST_W_DEQUANT` where its matrix engine works on 32×32 fp16 tiles, and
+at `M = 2048` — each weight element feeding 2048 MACs — removing 851.4 MB of weight traffic does
+not come close to paying for whatever else changed. See doc 56 §4's H4 block. (iii) They reject bf16 outright and
 support no K-quants; we ship q4_0 gs=32, AWQ gs=128 and RTN gs=128.
 
 **Where we are behind.** (i) **No integer compute anywhere** — our int4 path is int4 *storage* →

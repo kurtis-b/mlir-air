@@ -662,5 +662,13 @@
 // The other three modules are unchanged in count and updated for the
 // artifact-set key gaining the precision plan (a plan selects ELFs, so two
 // rungs at one M under two plans are two sets, two workers and two gates).
+//
+// `[2026-08-26, item 20 review round]` 715 -> 719, still 33 modules, and only
+// ONE of those four is this item's: the H4 review added assertions to
+// `test_bfp16_prefill.py` without adding a test function. The other four come
+// from a CONCURRENT queue item working the same tree (item 24, the
+// `QWEN3_W4_DECODE` default flip): +3 in `test_w4_decode_pack.py` and +1 in
+// `test_model_profiles.py`. The pin is a shared counter, so it is set to what
+// the suite actually reports; whichever item commits last owns reconciling it.
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
 // CHECK: study host tests: 715/715 passed in 33 modules

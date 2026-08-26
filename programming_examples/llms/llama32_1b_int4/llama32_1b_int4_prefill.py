@@ -377,6 +377,7 @@ def _run_layer_bfp16(
     return_intermediates=False,
     cpu_attn=False,
     with_kv=False,
+    shared_nonstatic=False,
 ):
     """Run one transformer block through the bfp16 prefill stitchers.
 
@@ -386,6 +387,22 @@ def _run_layer_bfp16(
     `llama32_1b_prefill.run_transformer_block` already has. Default False keeps
     every existing caller (the standalone verify/diagnosis paths below)
     returning exactly what it returned before.
+
+    `shared_nonstatic` `[2026-08-26, review round]` (doc 56 H4, queue item 20):
+    draw every NON-static argument from the process-wide BO pool instead of
+    allocating one set per layer -- and, with it, call `flash_attn` exactly the
+    way the bf16 sibling does (no per-layer `bo_key`). THIS IS A RESIDENCY
+    POLICY, AND IT MUST MATCH THE ARM IT IS COMPARED AGAINST.
+    `llama32_1b_prefill.run_transformer_block` passes `shared_nonstatic=True`
+    on both fused stages and gives `flash_attn` no `bo_key`; leaving this False
+    here gave the bfp16 arm sixteen per-layer activation/intermediate BO sets
+    and sixteen per-layer FA sets against the bf16 arm's one each, so BO
+    residency and address reuse differed between the two arms of the H4 A/B and
+    any device-time effect of that difference was folded into the GEMM delta
+    (Codex review of `a3a8f9f3`, blocking finding 2). Default stays False so the
+    standalone verify / diagnosis paths -- which PERSIST per-layer
+    intermediates across calls and must not receive pooled views (the
+    documented `load_and_run` footgun) -- keep the behaviour they had.
 
     THE CONSTANT ARGUMENTS ARE CACHED PER LAYER, for the same reason the bf16
     sibling caches them (`llama32_1b_prefill.run_transformer_block:270` and
@@ -428,6 +445,7 @@ def _run_layer_bfp16(
     rms_args = _arg_cache[_rms_key]
     rms_args[0] = np.asarray(x_bf16, dtype=bfloat16).reshape(seq_len, emb_dim)
     output_idx = [2, 4, 6, 8, 11, 12] if return_intermediates else [8, 11, 12]
+    _rms_kw = {"shared_nonstatic": True} if shared_nonstatic else {}
     results = cache.load_and_run(
         "rms_gemms_rope_bfp16",
         {"verbose": cache.verbose, **RMS_GEMMS_ROPE_BFP16_BACKEND},
@@ -435,7 +453,8 @@ def _run_layer_bfp16(
         output_indices=output_idx,
         static_input_indices={1, 3, 5, 7, 9, 10},
         intermediate_indices={2, 4, 6, 8, 11, 12},
-        bo_key=f"rms_bfp16_L{layer_idx}",
+        bo_key=_rms_key,
+        **_rms_kw,
     )
     if return_intermediates:
         normed = results[2].reshape(seq_len, emb_dim)
@@ -460,6 +479,9 @@ def _run_layer_bfp16(
             ).astype(bfloat16)
     else:
         attn_buf = np.zeros((seq_len, n_heads * head_dim), dtype=bfloat16)
+        # Under the shared-residency policy the FA call is the bf16 sibling's,
+        # byte for byte -- no per-layer bo_key, so ONE BO set and not sixteen.
+        _fa_kw = {} if shared_nonstatic else {"bo_key": f"flash_attn_L{layer_idx}"}
         res = cache.load_and_run(
             "flash_attn",
             FLASH_ATTN_BACKEND,
@@ -468,7 +490,7 @@ def _run_layer_bfp16(
             np.ascontiguousarray(v),
             attn_buf,
             output_indices=[3],
-            bo_key=f"flash_attn_L{layer_idx}",
+            **_fa_kw,
         )
         attn_out = res[3].reshape(seq_len, n_heads * head_dim)
 
@@ -505,6 +527,7 @@ def _run_layer_bfp16(
     offn_args = _arg_cache[_offn_key]
     offn_args[0] = np.asarray(attn_out, dtype=bfloat16).reshape(seq_len, emb_dim)
     offn_args[3] = np.asarray(x_bf16, dtype=bfloat16).reshape(seq_len, emb_dim)
+    _offn_kw = {"shared_nonstatic": True} if shared_nonstatic else {}
     results = cache.load_and_run(
         "o_ffn_bfp16",
         {"verbose": cache.verbose, **O_FFN_BFP16_BACKEND},
@@ -513,6 +536,7 @@ def _run_layer_bfp16(
         static_input_indices={1, 5, 7, 9, 12},
         intermediate_indices={2, 4, 6, 8, 10, 11, 13, 14},
         bo_key=_offn_key,
+        **_offn_kw,
     )
     x_out = results[14].reshape(seq_len, emb_dim)
     if with_kv:

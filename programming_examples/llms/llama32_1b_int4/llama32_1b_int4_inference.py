@@ -483,6 +483,16 @@ def run_npu_prefill(
                 layer_idx=layer_idx,
                 cpu_attn=cpu_attn,
                 with_kv=True,
+                # `[2026-08-26, review round]` the SAME BO residency policy the
+                # bf16 branch below runs under (run_transformer_block passes
+                # shared_nonstatic=True on both fused stages and gives
+                # flash_attn no per-layer bo_key). Without this the two arms of
+                # doc 56 H4's A/B differ in residency as well as in the two GEMM
+                # ELFs, and the difference lands in the measured GEMM delta.
+                # Safe here for the same reason it is safe there: this loop
+                # consumes k_roped / v / the block output before the next call
+                # of the same ELF.
+                shared_nonstatic=True,
             )
         else:
             x_bf16, intermediates = run_prefill_block(
