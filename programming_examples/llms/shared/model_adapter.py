@@ -94,11 +94,27 @@ DISPATCH_VECTOR_KEYS = (
 
 #: Precision plans the bf16 drivers implement (the per-binding default).
 #: `w4_decode` is the int4 sibling driver's (its binding says so);
-#: `w_bfp16_prefill` and `a8` are H4 / later.
+#: `w_bfp16_prefill` `[2026-08-26]` (doc 56 H4, queue item 20) is the int4
+#: llama driver's second plan -- `bfp16ebs8` prefill GEMM weight storage,
+#: env-selected, decode unchanged; `a8` is later.
 SUPPORTED_PRECISION_PLANS = ("bf16",)
 
 PREFILL_CACHE = "prefill_kernel_cache"
 DECODE_CACHE = "decode_kernel_cache"
+
+#: `[2026-08-26]` doc 56 H4 (queue item 20): which ARTIFACT SET a non-shipped
+#: precision plan replaces. `w4_decode` replaces the decode ELFs and leaves
+#: prefill alone (H2b's convention, `<root>/<model>/<plan>/decode_kernel_cache`);
+#: `w_bfp16_prefill` is its mirror -- it replaces the PREFILL ELFs
+#: (`<root>/<model>/<plan>/M<M>/prefill_kernel_cache`) and leaves decode alone,
+#: because `bfp16ebs8` names the prefill GEMM's weight operand and the decode
+#: GEMV is whatever that driver ships. A plan absent here replaces decode.
+PRECISION_PLAN_PHASE = {"w4_decode": "decode", "w_bfp16_prefill": "prefill"}
+
+
+def plan_phase(precision_plan: str) -> str:
+    """`prefill` | `decode`: the phase whose artifact set this plan replaces."""
+    return PRECISION_PLAN_PHASE.get(precision_plan, "decode")
 
 
 @dataclass(frozen=True)
@@ -123,6 +139,11 @@ class ModelBinding:
     #: Dotted module (under llms/) whose `quant_contract()` owns the quant_*
     #: column values for a non-bf16 plan; None for the bf16 drivers.
     quant_contract_module: str | None = None
+    #: `[2026-08-26]` doc 56 H4 (queue item 20): PER-PLAN contract owners, for
+    #: a driver that implements more than one non-bf16 plan. A plan absent
+    #: here falls back to `quant_contract_module`. The owner is always the
+    #: code that DOES the packing, never the study.
+    quant_contract_modules: dict = field(default_factory=dict)
     #: `[2026-08-26]` doc 56 H2b (queue item 18): the env the driver reads to
     #: select a plan, per plan -- {plan: {ENV: value}}. Empty for a driver
     #: whose plan needs no flag (the bf16-only drivers; the int4 llama driver,
@@ -145,6 +166,9 @@ class ModelBinding:
     def precision_env(self, precision_plan: str) -> dict:
         return dict(self.precision_env_map.get(precision_plan, {}))
 
+    def contract_module(self, precision_plan: str) -> str | None:
+        return self.quant_contract_modules.get(precision_plan, self.quant_contract_module)
+
 
 MODELS: dict[str, ModelBinding] = {
     # `[2026-08-26]` doc 56 H2b (queue item 18): the qwen driver gains a
@@ -166,12 +190,23 @@ MODELS: dict[str, ModelBinding] = {
     # `[2026-08-26]` doc 56 H2a (queue item 17): the EXISTING int4 driver bound
     # like the bf16 models -- bf16 NPU prefill on dequantized AWQ weights +
     # int4 NPU decode, one binding row, no fork.
+    # `[2026-08-26]` doc 56 H4 (queue item 20): the SAME driver gains a second
+    # plan, `w_bfp16_prefill` -- the prefill GEMM's weight operand stored as
+    # `bfp16ebs8` through the stitchers that already ship beside it
+    # (rms_gemms_rope_bfp16 / o_ffn_bfp16, gated by
+    # run_npu2_verify_prefill_bfp16.lit). Decode is int4 under BOTH plans; the
+    # flag names the prefill storage and nothing else, and the w4_decode row
+    # PINS it to bf16 so an inherited env cannot silently move a baseline row.
     "llama32_1b_int4": ModelBinding(
         "llama32_1b_int4", "llama32_1b_int4", LLAMA32_1B_INT4,
         "amd/Llama-3.2-1B-Instruct-awq-uint4-asym-g128-bf16-lmhead", "instruct",
         "llama32_1b_int4.verify_adapter", prefill_prompt_len_kwarg=True,
-        precision_plans=("w4_decode",), session_model_kwarg="model_path",
+        precision_plans=("w4_decode", "w_bfp16_prefill"), session_model_kwarg="model_path",
         quant_contract_module="llama32_1b_int4.awq_repacker",
+        quant_contract_modules={"w4_decode": "llama32_1b_int4.awq_repacker",
+                                "w_bfp16_prefill": "llama32_1b_int4.awq_bfp_pack"},
+        precision_env_map={"w4_decode": {"LLAMA32_1B_INT4_PREFILL_DTYPE": "bf16"},
+                           "w_bfp16_prefill": {"LLAMA32_1B_INT4_PREFILL_DTYPE": "bfp16"}},
     ),
 }
 
@@ -327,13 +362,14 @@ def quant_columns(model_id: str, precision_plan: str) -> dict:
     in the study. The group size is parsed from the checkpoint id (…-g128-…)
     and cross-checked against the loader's default by the contract owner."""
     b = MODELS[model_id]
-    if precision_plan == "bf16" or not b.quant_contract_module:
+    module = b.contract_module(precision_plan)
+    if precision_plan == "bf16" or not module:
         return {}
     import importlib
     import re
 
     m = re.search(r"-g(\d+)-", b.hf_id)
-    mod = importlib.import_module(b.quant_contract_module)
+    mod = importlib.import_module(module)
     return mod.quant_contract(int(m.group(1)) if m else None)
 
 

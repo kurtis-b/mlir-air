@@ -175,7 +175,16 @@ class ModelProfile:
     #: chunked through the driver's incremental path. logical % ubatch must be
     #: 0 (the scheduler has no padding path).
     ubatch_points: tuple = ()
-    #: (model_id, M) -> {"prefill_cache": dir, "decode_cache": dir}; set by `bind`.
+    #: `[2026-08-26]` doc 56 H4 (queue item 20): (model_id, M, precision_plan)
+    #: triples. Each becomes ONE kernel-scaling prefill rung at that M under
+    #: THAT plan, so one profile -- one walk, one session, one prompt -- can
+    #: carry a precision A/B whose two arms are two artifact sets. Distinct
+    #: from `prefill_Ms`, which takes the profile's own `precision_plan`.
+    prefill_points: tuple = ()
+    #: (model_id, M, precision_plan) -> {"prefill_cache": dir, "decode_cache": dir};
+    #: set by `bind`. The precision plan is part of the ARTIFACT SET key because
+    #: a plan selects ELFs (H2b the decode set, H4 the prefill set) -- two rungs
+    #: at one M under two plans are two sets and two worker processes.
     compiled: dict = field(default_factory=dict)
     skip_notes: dict = field(default_factory=dict)
 
@@ -183,38 +192,53 @@ class ModelProfile:
         """The profile with its applicability rule applied to what is compiled."""
         return replace(self, compiled=dict(compiled), skip_notes=dict(skip_notes or {}))
 
-    def _skip(self, model_id: str, M: int, phase: str) -> str | None:
-        if (model_id, M) in self.compiled:
+    def _skip(self, model_id: str, M: int, plan: str) -> str | None:
+        if (model_id, M, plan) in self.compiled:
             return None
-        why = self.skip_notes.get((model_id, M), "")
+        why = self.skip_notes.get((model_id, M, plan), "")
         return (
-            f"no compiled prefill artifact set for {model_id} at M={M}"
+            f"no compiled artifact set for {model_id} at M={M} under {plan}"
             + (f": {why}" if why else "")
             + (" -- compile it with `run_model.py compile` (its own cwd, a build-class devq job)" if M != SHIPPED_PREFILL_M else " -- the shipped build_peano caches are missing")
         )
+
+    def precision_plans_used(self) -> tuple:
+        """Every precision plan any rung of this profile runs under, in rung
+        order -- what `discover_compiled` must look for."""
+        seen = [self.precision_plan]
+        for _mid, _M, plan in self.prefill_points:
+            if plan not in seen:
+                seen.append(plan)
+        return tuple(seen)
 
     def rungs(self) -> tuple:
         out = []
         for model_id in self.models:
             for M in self.prefill_Ms.get(model_id, ()):
-                out.append(ModelRung(model_id, "prefill", M, M, 0, self.precision_plan, KERNEL_SCALING, self._skip(model_id, M, "prefill")))
+                out.append(ModelRung(model_id, "prefill", M, M, 0, self.precision_plan, KERNEL_SCALING, self._skip(model_id, M, self.precision_plan)))
+            for mid, M, plan in self.prefill_points:
+                if mid != model_id:
+                    continue
+                out.append(ModelRung(model_id, "prefill", M, M, 0, plan, KERNEL_SCALING, self._skip(model_id, M, plan)))
             for mid, logical, ubatch in self.ubatch_points:
                 if mid != model_id:
                     continue
                 if logical % ubatch:
                     raise ValueError(f"ubatch point ({mid}, {logical}, {ubatch}): logical prompt is not a whole number of chunks")
-                out.append(ModelRung(model_id, "prefill", ubatch, logical, 0, self.precision_plan, UBATCH, self._skip(model_id, ubatch, "prefill")))
+                out.append(ModelRung(model_id, "prefill", ubatch, logical, 0, self.precision_plan, UBATCH, self._skip(model_id, ubatch, self.precision_plan)))
             for ctx in self.decode_ctxs:
                 M = SHIPPED_PREFILL_M
-                out.append(ModelRung(model_id, "decode", M, ctx, self.decode_n_tokens, self.precision_plan, DECODE_CONTEXT, self._skip(model_id, M, "decode")))
+                out.append(ModelRung(model_id, "decode", M, ctx, self.decode_n_tokens, self.precision_plan, DECODE_CONTEXT, self._skip(model_id, M, self.precision_plan)))
         return tuple(out)
 
     def artifact_sets(self) -> list:
-        """Distinct (model_id, M) the walk dispatches on, in rung order, measurable only."""
+        """Distinct (model_id, M, precision_plan) the walk dispatches on, in rung
+        order, measurable only."""
         seen = []
         for r in self.rungs():
-            if r.skip_reason is None and (r.model_id, r.M) not in seen:
-                seen.append((r.model_id, r.M))
+            key = (r.model_id, r.M, r.precision_plan)
+            if r.skip_reason is None and key not in seen:
+                seen.append(key)
         return seen
 
     def expected_files(self) -> list:
@@ -236,6 +260,7 @@ class ModelProfile:
             "prefill_Ms": {k: list(v) for k, v in self.prefill_Ms.items()},
             "decode_ctxs": list(self.decode_ctxs),
             "ubatch_points": [list(t) for t in self.ubatch_points],
+            "prefill_points": [list(t) for t in self.prefill_points],
             "decode_n_tokens": self.decode_n_tokens,
             "prefill_samples": self.prefill_samples,
             "prefill_warmup": self.prefill_warmup,
@@ -275,6 +300,26 @@ PROFILES = {
         decode_ctxs=(512, 1024, 2048),
         precision_plan="w4_decode",
     ),
+    "bfp16-prefill": ModelProfile(
+        name="bfp16-prefill",
+        description=(
+            "doc 56 H4 (queue item 20): the FIRST performance number for the bfp16 prefill "
+            "path. Llama-3.2-1B-AWQ prefill at the shipped ubatch M=2048 measured twice in "
+            "one walk, one session, on the SAME 2048-token prompt -- the baseline arm "
+            "(precision_plan_id=w4_decode, the bf16 prefill stitchers on dequantized AWQ "
+            "weights, the shipped build_peano set) against the bfp16 arm "
+            "(precision_plan_id=w_bfp16_prefill, rms_gemms_rope_bfp16 / o_ffn_bfp16 over "
+            "bfp16ebs8 weight BOs, 248 launches against 328). quant_* from the bfp16 "
+            "packer's own contract; the prediction written before the walk "
+            "(results/item20-h4-20260826/PREDICTION.md)"
+        ),
+        models=("llama32_1b_int4",),
+        prefill_Ms={"llama32_1b_int4": ()},
+        decode_ctxs=(),
+        prefill_points=(("llama32_1b_int4", SHIPPED_PREFILL_M, "w4_decode"),
+                        ("llama32_1b_int4", SHIPPED_PREFILL_M, "w_bfp16_prefill")),
+        precision_plan="w4_decode",
+    ),
     "w4-decode-qwen": ModelProfile(
         name="w4-decode-qwen",
         description=(
@@ -311,75 +356,113 @@ def profile(name: str) -> ModelProfile:
         raise ValueError(f"unknown model profile {name!r}; known: {sorted(PROFILES)}") from None
 
 
-def discover_compiled(models, compiled_root: str | Path | None, llms_dir: str | Path | None = None, precision_plan: str = "bf16") -> tuple:
-    """(compiled, notes): every (model_id, M) with a manifest on disk.
+def discover_compiled(models, compiled_root: str | Path | None, llms_dir: str | Path | None = None,
+                      precision_plan: str = "bf16", precision_plans=None) -> tuple:
+    """(compiled, notes), both keyed by **(model_id, M, precision_plan)**.
 
-    M == SHIPPED_PREFILL_M is the model's own `build_peano` caches; any other M
-    is `<compiled_root>/<model_id>/M<M>/prefill_kernel_cache` with the shipped
-    decode cache. A directory without `manifest.json` is not compiled.
+    A precision plan selects an ARTIFACT SET, so it is part of the key. Which
+    set it selects is the plan's own property (`model_adapter.plan_phase`):
 
-    `precision_plan` `[2026-08-26]` (doc 56 H2b, queue item 18): the profile's
-    plan selects the DECODE artifact set. A model's shipped `build_peano`
-    decode cache implements its binding's FIRST (shipped) plan -- bf16 for the
-    bf16 drivers, w4_decode for the int4 llama driver, so those bindings are
-    unchanged. Any OTHER plan's decode set lives at
-    `<compiled_root>/<model_id>/<plan>/decode_kernel_cache` (decode ELFs carry
-    no M), compiled by `run_model.py compile-decode`; a missing set is a
-    derived skip naming that command, never a silent fall-through to the
-    shipped bytes (the worker's plan-vs-manifest check would fail the rows,
-    but the skip says WHY before any device work).
+    - the model's SHIPPED plan (its binding's first) is the `build_peano`
+      caches, prefill and decode both; other prefill `M` live at
+      `<compiled_root>/<model_id>/M<M>/prefill_kernel_cache` with the shipped
+      decode cache -- unchanged from H1a;
+    - a `decode`-phase plan (`w4_decode`, doc 56 H2b) keeps that prefill set
+      and takes `<compiled_root>/<model_id>/<plan>/decode_kernel_cache`;
+    - a `prefill`-phase plan (`w_bfp16_prefill`, doc 56 H4) is the mirror: it
+      takes `<compiled_root>/<model_id>/<plan>/M<M>/prefill_kernel_cache` and
+      keeps the SHIPPED decode set, because `bfp16ebs8` names the prefill
+      GEMM's weight operand and leaves the decode GEMV alone.
+
+    A missing set is a derived skip NAMING what to run, never a silent
+    fall-through to the shipped bytes.
+
+    `precision_plans` `[2026-08-26]` (queue item 20): look for ALL of these
+    plans, so one profile can carry a precision A/B. `precision_plan` remains
+    for callers with a single plan.
     """
+    from shared.model_adapter import MODELS as _BINDINGS, plan_phase
+
+    plans = tuple(precision_plans) if precision_plans else (precision_plan,)
     llms = Path(llms_dir) if llms_dir else Path(_PE) / "llms"
     compiled, notes = {}, {}
     for model_id in models:
         build = llms / model_id / "build_peano"
-        prefill = build / "prefill_kernel_cache"
+        shipped_prefill = build / "prefill_kernel_cache"
+        shipped_decode = build / "decode_kernel_cache"
         try:
-            from shared.model_adapter import MODELS as _BINDINGS
-
             shipped_plan = _BINDINGS[model_id].precision_plans[0]
         except Exception:
             shipped_plan = "bf16"
-        if precision_plan == shipped_plan:
-            decode = build / "decode_kernel_cache"
-            decode_note = None
-        else:
-            decode = (Path(compiled_root) / model_id / precision_plan / "decode_kernel_cache") if compiled_root else None
-            decode_note = (
-                f"no {precision_plan} decode artifact set"
-                + (f" at {decode}" if decode else " (no --compiled-root)")
-                + f" -- compile it with `run_model.py compile-decode --model {model_id} "
-                  f"--precision-plan {precision_plan}` (its own cwd, a build-class devq job)"
-            )
-        decode_ok = decode is not None and (decode / "manifest.json").is_file()
-        if (prefill / "manifest.json").is_file() and decode_ok:
-            compiled[(model_id, SHIPPED_PREFILL_M)] = {"prefill_cache": str(prefill), "decode_cache": str(decode)}
-        else:
-            notes[(model_id, SHIPPED_PREFILL_M)] = (
-                decode_note if ((prefill / "manifest.json").is_file() and not decode_ok and decode_note)
-                else f"{build} holds no prefill+decode manifests")
-        if compiled_root:
-            for d in sorted(Path(compiled_root).glob(f"{model_id}/M*/prefill_kernel_cache")):
-                try:
-                    M = int(d.parent.name[1:])
-                except ValueError:
-                    continue
-                if (d / "manifest.json").is_file() and decode_ok:
-                    compiled[(model_id, M)] = {"prefill_cache": str(d), "decode_cache": str(decode)}
-                else:
-                    note = d / "compile.json"
-                    failed = None
-                    if note.is_file():
-                        try:
-                            failed = json.loads(note.read_text(encoding="utf-8")).get("failed")
-                        except ValueError:
-                            failed = None
-                    notes[(model_id, M)] = (
-                        f"compile failed: {failed}" if failed
-                        else (decode_note if ((d / "manifest.json").is_file() and not decode_ok and decode_note)
-                              else f"{d} has no manifest.json (compile did not finish)")
-                    )
+        for plan in plans:
+            phase = plan_phase(plan)
+            is_shipped = plan == shipped_plan
+            # -- decode set
+            if is_shipped or phase == "prefill":
+                decode, decode_note = shipped_decode, None
+            else:
+                decode = (Path(compiled_root) / model_id / plan / "decode_kernel_cache") if compiled_root else None
+                decode_note = (
+                    f"no {plan} decode artifact set"
+                    + (f" at {decode}" if decode else " (no --compiled-root)")
+                    + f" -- compile it with `run_model.py compile-decode --model {model_id} "
+                      f"--precision-plan {plan}` (its own cwd, a build-class devq job)"
+                )
+            decode_ok = decode is not None and (decode / "manifest.json").is_file()
+            # -- prefill sets, per M
+            if phase == "prefill" and not is_shipped:
+                roots = []
+                if compiled_root:
+                    roots = sorted(Path(compiled_root).glob(f"{model_id}/{plan}/M*/prefill_kernel_cache"))
+                if not roots:
+                    notes[(model_id, SHIPPED_PREFILL_M, plan)] = (
+                        f"no {plan} prefill artifact set under "
+                        + (f"{Path(compiled_root) / model_id / plan}" if compiled_root else "(no --compiled-root)")
+                        + f" -- it replaces the PREFILL ELFs, so it must be compiled and placed at "
+                          f"<compiled-root>/{model_id}/{plan}/M<M>/prefill_kernel_cache")
+                for d in roots:
+                    try:
+                        M = int(d.parent.name[1:])
+                    except ValueError:
+                        continue
+                    if (d / "manifest.json").is_file() and decode_ok:
+                        compiled[(model_id, M, plan)] = {"prefill_cache": str(d), "decode_cache": str(decode)}
+                    else:
+                        notes[(model_id, M, plan)] = _compile_note(d, decode, decode_ok, decode_note)
+                continue
+            if (shipped_prefill / "manifest.json").is_file() and decode_ok:
+                compiled[(model_id, SHIPPED_PREFILL_M, plan)] = {"prefill_cache": str(shipped_prefill), "decode_cache": str(decode)}
+            else:
+                notes[(model_id, SHIPPED_PREFILL_M, plan)] = (
+                    decode_note if ((shipped_prefill / "manifest.json").is_file() and not decode_ok and decode_note)
+                    else f"{build} holds no prefill+decode manifests")
+            if compiled_root:
+                for d in sorted(Path(compiled_root).glob(f"{model_id}/M*/prefill_kernel_cache")):
+                    try:
+                        M = int(d.parent.name[1:])
+                    except ValueError:
+                        continue
+                    if (d / "manifest.json").is_file() and decode_ok:
+                        compiled[(model_id, M, plan)] = {"prefill_cache": str(d), "decode_cache": str(decode)}
+                    else:
+                        notes[(model_id, M, plan)] = _compile_note(d, decode, decode_ok, decode_note)
     return compiled, notes
+
+
+def _compile_note(d: Path, decode, decode_ok: bool, decode_note) -> str:
+    """Why a prefill cache directory is not a usable artifact set."""
+    note = d / "compile.json"
+    failed = None
+    if note.is_file():
+        try:
+            failed = json.loads(note.read_text(encoding="utf-8")).get("failed")
+        except ValueError:
+            failed = None
+    if failed:
+        return f"compile failed: {failed}"
+    if (d / "manifest.json").is_file() and not decode_ok and decode_note:
+        return decode_note
+    return f"{d} has no manifest.json (compile did not finish)"
 
 
 def main(argv=None) -> int:
@@ -395,7 +478,7 @@ def main(argv=None) -> int:
             print(f"{name}: {PROFILES[name].description}")
         return 0
     prof = profile(args.name)
-    compiled, notes = discover_compiled(prof.models, args.compiled_root, precision_plan=prof.precision_plan)
+    compiled, notes = discover_compiled(prof.models, args.compiled_root, precision_plans=prof.precision_plans_used())
     print(json.dumps(prof.bind(compiled, notes).summary(), indent=2))
     return 0
 

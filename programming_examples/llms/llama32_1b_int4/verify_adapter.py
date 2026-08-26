@@ -38,6 +38,8 @@ from llama32_1b_weights import LlamaConfig, generate_rope_lut  # noqa: E402
 from llama32_1b_cpu_helpers import rms_norm  # noqa: E402
 from llama32_1b_int4_weights import load_weights_awq  # noqa: E402
 from llama32_1b_int4_inference import (  # noqa: E402
+    PREFILL_DTYPE_ENV,
+    PREFILL_DTYPE as _INFERENCE_PREFILL_DTYPE,
     _multi_launch_dir,
     prepare_runtime,
     run_npu_prefill,
@@ -48,6 +50,14 @@ from llama32_1b_prefill import (
     compile_all_kernels as compile_prefill_kernels,
 )  # noqa: E402
 from runners._records import DecodeStepRecord, PrefillRecord  # noqa: E402
+
+
+def inference_prefill_dtype() -> str:
+    """The prefill weight storage the driver this adapter runs was imported
+    with (`llama32_1b_int4_inference.PREFILL_DTYPE`) -- read from the driver,
+    never re-derived from the environment here, so the gate and the timed run
+    cannot disagree about which path they took."""
+    return _INFERENCE_PREFILL_DTYPE
 
 # Default AWQ checkpoint exposed by AMD; un-gated, no HF_TOKEN needed.
 # `build_hf_model` reuses this checkpoint's config to construct the HF
@@ -256,6 +266,18 @@ class Int4NpuRunner:
                     f"LLMS_VERIFY_PREFILL_CACHE {_prefill_dir}: no loadable manifest"
                 )
         else:
+            # `[2026-08-26]` doc 56 H4: `compile_prefill_kernels` is the BF16
+            # stitcher compile. Under the bfp16 prefill plan there is nothing
+            # here that would build the right ELFs, so refuse and say which
+            # command does -- never compile bf16 ELFs and gate them as bfp16.
+            if inference_prefill_dtype() != "bf16":
+                raise RuntimeError(
+                    f"{PREFILL_DTYPE_ENV}={inference_prefill_dtype()!r} but no "
+                    "LLMS_VERIFY_PREFILL_CACHE was given: this fallback compiles the BF16 "
+                    "prefill stitchers only. Point the gate at a bfp16 artifact set "
+                    "(LLMS_VERIFY_PREFILL_CACHE), built by "
+                    "`make compile-bfp16` / the item-20 assembly step."
+                )
             with _multi_launch_dir(str(_LLAMA_BF16)):
                 compile_prefill_kernels(
                     self.prefill_cache, config, seq_len=max_seq, cpu_attn=self.cpu_attn

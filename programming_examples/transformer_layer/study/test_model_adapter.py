@@ -119,11 +119,23 @@ def test_models_bind_the_three_drivers_and_nothing_else():
     assert ma.MODELS["llama32_1b"].precision_plans == ("bf16",)
     assert ma.MODELS["llama32_1b"].precision_env("bf16") == {}
     b4 = ma.MODELS["llama32_1b_int4"]
-    assert b4.precision_plans == ("w4_decode",)
-    assert b4.precision_env("w4_decode") == {}
+    # `[2026-08-26]` doc 56 H4 (queue item 20): the int4 driver's SECOND plan,
+    # `w_bfp16_prefill`. Its FIRST plan is still what the shipped build_peano
+    # caches implement (w4_decode = bf16 prefill + int4 decode), the flag is
+    # pinned in BOTH directions, and each plan names its OWN contract owner --
+    # the code that does the packing, never the study.
+    assert b4.precision_plans == ("w4_decode", "w_bfp16_prefill")
+    assert b4.precision_env("w4_decode") == {"LLAMA32_1B_INT4_PREFILL_DTYPE": "bf16"}
+    assert b4.precision_env("w_bfp16_prefill") == {"LLAMA32_1B_INT4_PREFILL_DTYPE": "bfp16"}
     assert b4.session_model_kwargs() == {"model_path": b4.hf_id}
     assert ma.MODELS["llama32_1b"].session_model_kwargs() == {"model_variant": "instruct"}
     assert b4.quant_contract_module == "llama32_1b_int4.awq_repacker"
+    assert b4.contract_module("w4_decode") == "llama32_1b_int4.awq_repacker"
+    assert b4.contract_module("w_bfp16_prefill") == "llama32_1b_int4.awq_bfp_pack"
+    # a decode-phase plan replaces the decode set; a prefill-phase plan the prefill set
+    assert ma.plan_phase("w4_decode") == "decode"
+    assert ma.plan_phase("w_bfp16_prefill") == "prefill"
+    assert ma.plan_phase("bf16") == "decode"
 
 
 def test_plan_for_is_value_identity_and_64_hex():

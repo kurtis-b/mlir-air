@@ -129,6 +129,59 @@ def gemm_candidate(M, K, N, caps=NPU2_CAPS, method=None):
     return sol
 
 
+#: `[2026-08-26]` doc 56 H4 (queue item 20): the bfp16 GEMM family's contract
+#: NAME. The one OWNER is the packing code
+#: (`llama32_1b_int4/awq_bfp_pack.quant_contract`), which the study's quant_*
+#: columns read; this literal mirrors its `quant_gemm_contract_name` so the
+#: plan's stages can name the contract without importing a model directory
+#: (the `fa_cache_name` / `W4_GEMV_CONTRACT` pattern; a host test pins the
+#: agreement).
+W_BFP16_GEMM_CONTRACT = "bfp16ebs8_shared_exp8_mantissa8_native_mmul_operand"
+
+#: The bfp16 stitchers' SHARED tile geometry -- `rms_gemms_rope_bfp16_multi`
+#: and `o_ffn_bfp16_multi` build every GEMM at these values, and must: the four
+#: O+FFN GEMMs share one set of private kernel declarations in one ELF, and the
+#: single `mm_bf16_x_bfp16.o` they link bakes DIM_M / DIM_N / DIM_K. So this is
+#: not a solver choice, and the registry (which has ZERO non-bf16 rows and no
+#: quant axis in `gemm_config`) has nothing to override it with.
+BFP16_TILE_M, BFP16_TILE_N, BFP16_TILE_K_L1 = 32, 32, 128
+BFP16_HERD = (8, 4)
+
+#: bfp16ebs8: 9 bytes per 8 elements = 1.125 B/elt = 9 bits/elt.
+BFP16_BITS_PER_ELEMENT = 9
+BFP16_BYTES_NOTE = (
+    "weight_bytes are bfp16ebs8 -- 9 bytes per 8 elements = 1.125 B/elt = 9 bits/elt "
+    "(NOT 4.5), i.e. 1.778x under bf16, not 3.5x; the block's shared 8-bit exponent IS "
+    "the scale and the MMUL applies it, so there is no scale plane and NO DEQUANT PASS "
+    "(doc 57 s5b prices Hexagon's at HTP_MM_HMX_COST_W_DEQUANT = 3)")
+
+
+def _bfp16_bytes(bf16_bytes):
+    """bf16 weight bytes -> bfp16ebs8 weight bytes (x 9/16)."""
+    return bf16_bytes * BFP16_BITS_PER_ELEMENT // 16
+
+
+def bfp16_gemm_candidate(M, K, N, caps=NPU2_CAPS, tile_k_l2=None):
+    """The bfp16 GEMM family's candidate: the BUILDER's own tiles, marked
+    `analytical_unmeasured` (doc 56 section 3.3's policy).
+
+    Deliberately NOT solved and NOT looked up. The registry is bf16/f32 only
+    and `gemm_config` carries no quant parameter, so there is nothing measured
+    to override with; and the tiles are not free -- see `BFP16_TILE_*`. The
+    candidate therefore records what WILL be built, with `gflops: None` so no
+    reader can mistake it for a measured rate, and names the storage contract.
+    """
+    if M % (BFP16_TILE_M * BFP16_HERD[0]) or N % (BFP16_TILE_N * BFP16_HERD[1]):
+        return None
+    if K % BFP16_TILE_K_L1:
+        return None
+    return {"tile": {"tile_m": BFP16_TILE_M, "tile_n": BFP16_TILE_N,
+                     "tile_k_l1": BFP16_TILE_K_L1,
+                     "tile_k_l2": int(tile_k_l2) if tile_k_l2 else K},
+            "herd": BFP16_HERD, "method": "bfp16-direct", "gflops": None,
+            "source": ANALYTICAL, "contract": W_BFP16_GEMM_CONTRACT}
+
+
 # ---------------------------------------------------------------------------
 # 3. fusion -- the builder patterns the drivers ship, with derived launch counts
 # ---------------------------------------------------------------------------
@@ -202,15 +255,49 @@ def fuse(graph, wl, placements, caps=NPU2_CAPS, forced=None):
     def wbytes(*tids):
         return sum(g.nbytes(t, Mq, wl.kv_len) for t in tids)
 
+    qk = spec.qk_norm
+    # `[2026-08-26]` doc 56 H4 (queue item 20): `w_bfp16_prefill` names the
+    # PREFILL GEMM operand's weight storage and nothing else -- the same
+    # builder patterns, the same launch structure minus every fused-cast's cast
+    # launch, `bfp16ebs8` weight BOs, bf16 activations, f32 accumulate.
+    bfp16 = wl.precision_plan == "w_bfp16_prefill"
+    if bfp16 and wl.phase == "prefill":
+        if qk:
+            raise ValueError(
+                "w_bfp16_prefill has no qk-norm prefill stitcher: the bfp16 pair is "
+                "rms_gemms_rope_bfp16 / o_ffn_bfp16 (llama32_1b_int4), and a qk-norm "
+                f"model ({spec.name}) would need a bfp16 sibling of "
+                "rms_qkv_qknorm_rope_multi that does not exist -- refuse rather than "
+                "name bf16 stages a bfp16 plan")
+        if not lean:
+            raise ValueError(
+                "w_bfp16_prefill's O+FFN stitcher is the LEAN fused cascade "
+                f"(o_ffn_bfp16, 8 launches); {spec.name} is outside the lean bounds")
+    if bfp16 and wl.phase == "decode":
+        raise ValueError(
+            "w_bfp16_prefill names the PREFILL GEMM's weight storage; the decode plan "
+            "under it is whatever that driver ships (int4 GEMV for llama32_1b_int4, "
+            "bf16 for the bf16 drivers) and must be named explicitly -- refuse rather "
+            "than silently plan a bf16 decode for a driver whose decode is int4")
+
     def gemm(op, w, stage=None):
         Min, Nout = g.shape_of(w)
+        if bfp16:
+            # The down projection is the one GEMM the builder gives a shallower
+            # K-l2 stage (`down_tile_k_l2=128`, K = hidden_dim); the rest take
+            # the default, tile_k_l2 = K.
+            return bfp16_gemm_candidate(Mq, Min, Nout, caps,
+                                        tile_k_l2=128 if op == "down_proj_L" else None)
         return gemm_candidate(Mq, Min, Nout, caps, method=forced.get(stage))
+
+    def w_bytes_gemm(*tids):
+        """GEMM weight bytes under the workload's precision plan."""
+        return _bfp16_bytes(wbytes(*tids)) if bfp16 else wbytes(*tids)
 
     # embed (host)
     stages.append(Stage("embed_lookup", HOST, ("embed",), repeated=False,
                         boundary_bytes=g.nbytes("x_0", Mq), note="host table lookup, x_0 uploaded"))
 
-    qk = spec.qk_norm
     if wl.phase == "prefill":
         # --- QKV stage ---
         cands = {op: gemm(op, w) for op, w in (("q_proj_L", "wq_L"), ("k_proj_L", "wk_L"), ("v_proj_L", "wv_L"))}
@@ -221,10 +308,12 @@ def fuse(graph, wl, placements, caps=NPU2_CAPS, forced=None):
         if qk:
             bd += [("q_norm_L", 1, "per-head RMSNorm"), ("k_norm_L", 1, "per-head RMSNorm")]
         bd += [("rope_q_L", 1, "RoPE"), ("rope_k_L", 1, "RoPE")]
-        stages.append(Stage("rms_qkv_qknorm_rope" if qk else "rms_gemms_rope", DEVICE, tuple(ops),
+        qkv_name = "rms_gemms_rope_bfp16" if bfp16 else ("rms_qkv_qknorm_rope" if qk else "rms_gemms_rope")
+        stages.append(Stage(qkv_name, DEVICE, tuple(ops),
                             launches=sum(b[1] for b in bd), launch_breakdown=tuple(bd),
-                            weight_bytes=wbytes("attn_norm_w_L", "wq_L", "wk_L", "wv_L") + (wbytes("q_norm_w_L", "k_norm_w_L") if qk else 0),
-                            candidates=cands, source=MEASURED if all(c and c["source"] == MEASURED for c in cands.values()) else ANALYTICAL))
+                            weight_bytes=wbytes("attn_norm_w_L") + w_bytes_gemm("wq_L", "wk_L", "wv_L") + (wbytes("q_norm_w_L", "k_norm_w_L") if qk else 0),
+                            candidates=cands, source=MEASURED if all(c and c["source"] == MEASURED for c in cands.values()) else ANALYTICAL,
+                            note=BFP16_BYTES_NOTE if bfp16 else ""))
         # --- attention ---
         pa = placements["attention_L"]
         if pa.where == REFUSE:
@@ -245,7 +334,7 @@ def fuse(graph, wl, placements, caps=NPU2_CAPS, forced=None):
         for hop in pa.extra_host_ops[1:]:
             stages.append(Stage(hop, HOST, ("attention_L",), boundary_bytes=g.nbytes("attn_out_L", Mq), note=pa.reason))
         # --- O + FFN ---
-        o_ffn_stage = ("o_ffn_qwen" if qk else "o_ffn") if lean else "o_ffn_head"
+        o_ffn_stage = "o_ffn_bfp16" if bfp16 else (("o_ffn_qwen" if qk else "o_ffn") if lean else "o_ffn_head")
         cands = {op: gemm(op, w, o_ffn_stage) for op, w in (("o_proj_L", "wo_L"), ("gate_proj_L", "w_gate_L"),
                                                             ("up_proj_L", "w_up_L"), ("down_proj_L", "w_down_L"))}
         if o_ffn_stage in forced:
@@ -257,13 +346,14 @@ def fuse(graph, wl, placements, caps=NPU2_CAPS, forced=None):
         if lean:
             bd = [gl("o_proj_L", "O"), ("residual_1_L", 1, "add"), ("ffn_norm_L", 1, "RMSNorm"), gl("gate_proj_L", "gate"),
                   gl("up_proj_L", "up"), ("swiglu_L", 1, "SwiGLU"), gl("down_proj_L", "down"), ("residual_2_L", 1, "add")]
-            stages.append(Stage("o_ffn_qwen" if qk else "o_ffn", DEVICE,
+            stages.append(Stage(o_ffn_stage, DEVICE,
                                 ("o_proj_L", "residual_1_L", "ffn_norm_L", "gate_proj_L", "up_proj_L", "swiglu_L", "down_proj_L", "residual_2_L"),
                                 launches=sum(b[1] for b in bd), launch_breakdown=tuple(bd),
-                                weight_bytes=wbytes("wo_L", "ffn_norm_w_L", "w_gate_L", "w_up_L", "w_down_L"), candidates=cands,
-                                source=FORCED if o_ffn_stage in forced else MEASURED,
+                                weight_bytes=wbytes("ffn_norm_w_L") + w_bytes_gemm("wo_L", "w_gate_L", "w_up_L", "w_down_L"), candidates=cands,
+                                source=ANALYTICAL if bfp16 else (FORCED if o_ffn_stage in forced else MEASURED),
                                 note=f"lean fused O+FFN: emb {spec.emb_dim} < {caps.lean_form_emb_max} and hidden {spec.hidden_dim} % {caps.lean_form_hidden_multiple} == 0"
-                                + (f"; GEMM method FORCED to {forced[o_ffn_stage]!r} (the cascade builder's only form)" if o_ffn_stage in forced else "")))
+                                + (f"; GEMM method FORCED to {forced[o_ffn_stage]!r} (the cascade builder's only form)" if o_ffn_stage in forced else "")
+                                + ("; " + BFP16_BYTES_NOTE if bfp16 else "")))
         else:
             bd1 = [gl("o_proj_L", "O"), ("residual_1_L", 1, "add"), ("ffn_norm_L", 1, "RMSNorm"), gl("gate_proj_L", "gate"), gl("up_proj_L", "up"), ("swiglu_L", 1, "SwiGLU")]
             stages.append(Stage("o_ffn_head", DEVICE, ("o_proj_L", "residual_1_L", "ffn_norm_L", "gate_proj_L", "up_proj_L", "swiglu_L"),
@@ -274,6 +364,23 @@ def fuse(graph, wl, placements, caps=NPU2_CAPS, forced=None):
             stages.append(Stage("down_add", DEVICE, ("down_proj_L", "residual_2_L"), launches=sum(b[1] for b in bd2), launch_breakdown=tuple(bd2),
                                 weight_bytes=wbytes("w_down_L"), candidates={"down_proj_L": cands["down_proj_L"]}))
             rejected.append(("o_ffn fused", "spatial: the fused cascade needs the lean form"))
+        if bfp16:
+            # doc 56 section 3.3: a derived candidate is marked
+            # `analytical_unmeasured` and needs an explicit policy to compile.
+            # The policy here is named, and so is what it costs.
+            rejected.append((
+                "bf16 registry tiles for the bfp16 GEMMs",
+                "the measured registry is bf16/f32 only (ZERO non-bf16 rows) and gemm_config "
+                "has no quant parameter, so there is nothing measured to override the builder "
+                "with; and the tiles are not free -- o_ffn_bfp16_multi requires ONE (tile_m, "
+                "tile_n, tile_k_l1) shared by all four GEMMs (they share private kernel decls "
+                "in one ELF) and the single mm_bf16_x_bfp16.o they link bakes DIM_M/DIM_N/DIM_K. "
+                "Policy taken (doc 56 H4, queue item 20): run the builder's own "
+                f"tile_m {BFP16_TILE_M} / tile_n {BFP16_TILE_N} / tile_k_l1 {BFP16_TILE_K_L1} at "
+                f"herd {BFP16_HERD[0]}x{BFP16_HERD[1]} and mark every row analytical_unmeasured. "
+                "COST OF THE POLICY: tile_n 32 against the registry's 128 is 4x the A-panel "
+                "re-reads per GEMM, which no weight-byte saving can offset at large M -- this "
+                "plan prices the bfp16 GEMM AS BUILT, not the best bfp16 GEMM"))
     else:  # decode
         w4 = wl.precision_plan == "w4_decode"
         if w4 and not lean:

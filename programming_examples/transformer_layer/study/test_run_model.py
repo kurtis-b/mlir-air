@@ -40,8 +40,8 @@ def _profile(compiled_Ms=((2048,), (2048,))):
     compiled = {}
     for m, Ms in zip(prof.models, compiled_Ms):
         for M in Ms:
-            compiled[(m, M)] = {"prefill_cache": f"/c/{m}/M{M}/prefill_kernel_cache", "decode_cache": f"/c/{m}/decode_kernel_cache"}
-    return prof.bind(compiled, {("qwen3_0_6b", 512): "six registry rows pending (devq 567)"})
+            compiled[(m, M, prof.precision_plan)] = {"prefill_cache": f"/c/{m}/M{M}/prefill_kernel_cache", "decode_cache": f"/c/{m}/decode_kernel_cache"}
+    return prof.bind(compiled, {("qwen3_0_6b", 512, prof.precision_plan): "six registry rows pending (devq 567)"})
 
 
 def _result(rung, tps, *, samples=3):
@@ -62,7 +62,7 @@ _TIMED_SHA = {"sha256": "f" * 64, "files": {}}
 
 
 def _fake_worker(tps=100.0, *, raise_on=None, fail_on=(), nonce=0.0):
-    def worker(model_id, M, rungs, compiled):
+    def worker(model_id, M, rungs, compiled, precision_plan="bf16"):
         if raise_on == (model_id, M):
             raise RuntimeError("worker exploded")
         rows, gate_map, prompts = [], {}, []
@@ -164,7 +164,7 @@ def test_a_full_walk_writes_complete_v3_rows_and_a_complete_manifest():
         assert manifest["complete"] is True
         assert manifest[schema.CONDITIONS_KEY]["npu_power_mode"] == "turbo"
         assert manifest[schema.WALK_KEY]["rungs_measured"] == 8
-        assert report["verify"]["qwen3_0_6b_M2048"]["passed"] is True
+        assert report["verify"]["qwen3_0_6b_M2048_bf16"]["passed"] is True
 
 
 def test_a_gate_failure_on_one_prompt_fails_only_that_rung():
@@ -248,7 +248,7 @@ def test_a_raising_worker_propagates_and_leaves_the_session_interrupted_honestly
         assert l["llama32_1b/decode/M2048/ctx512/bf16"]["run_status"] == "failed"
         assert "the gate exited None" in l["llama32_1b/decode/M2048/ctx512/bf16"]["failure_message"]
         assert "verify subprocess died" in l["llama32_1b/decode/M2048/ctx512/bf16"]["failure_message"]
-        assert report["verify"]["llama32_1b_M2048"]["error"].startswith("RuntimeError")
+        assert report["verify"]["llama32_1b_M2048_bf16"]["error"].startswith("RuntimeError")
         assert len(l) == 4
 
 
@@ -285,9 +285,9 @@ def test_a_resumed_walk_reuses_passed_rows_and_walks_a_newly_compiled_set():
         prof2 = _profile(((512, 2048), (2048,)))
         seen = []
 
-        def worker(model_id, M, rungs, compiled):
+        def worker(model_id, M, rungs, compiled, precision_plan="bf16"):
             seen.append((model_id, M, [r.case_id for r in rungs]))
-            return _fake_worker()(model_id, M, rungs, compiled)
+            return _fake_worker()(model_id, M, rungs, compiled, precision_plan)
 
         report = _run(d, prof2, worker_fn=worker, resume=True)
         assert seen == [("qwen3_0_6b", 512, ["qwen3_0_6b/prefill/M512/ctx512/bf16"])]

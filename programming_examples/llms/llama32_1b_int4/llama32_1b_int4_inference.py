@@ -77,6 +77,58 @@ import contextlib  # noqa: E402
 _LM_N_PART = 16384
 _LM_N_PARTITIONS = 8
 
+# ---------------------------------------------------------------------------
+# `[2026-08-26]` doc 56 H4 (queue item 20): the prefill weight STORAGE dtype.
+# ---------------------------------------------------------------------------
+#
+# One flag, read ONCE at import time, default `bf16` -- the operator default is
+# unchanged and every existing caller of this module keeps the bf16 prefill it
+# has today. `bfp16` routes prefill through the `bfp16ebs8` stitchers that
+# already ship beside this driver (`multi_launch_builder/{rms_gemms_rope_bfp16,
+# o_ffn_bfp16}_multi.py`, gated by `run_npu2_verify_prefill_bfp16.lit`), with
+# the SAME AWQ-dequantized bf16 weights transcoded to block floating point at
+# load time -- 9 bytes per 8 elements, the shared exponent IS the scale, so
+# there is no dequant step at inference (doc 57 section 5b).
+#
+# DECODE IS UNAFFECTED: int4 GEMV either way. This flag names the prefill GEMM
+# operand storage and nothing else.
+#
+# The flag is the seam the model adapter's `precision_env_map` drives
+# (`w4_decode` pins it to bf16, `w_bfp16_prefill` sets bfp16) -- the same shape
+# as qwen's `QWEN3_W4_DECODE` (doc 56 H2b). It is read at import because the
+# module-level kernel/backend selection below depends on it.
+PREFILL_DTYPE_ENV = "LLAMA32_1B_INT4_PREFILL_DTYPE"
+PREFILL_DTYPES = ("bf16", "bfp16")
+
+
+def _read_prefill_dtype() -> str:
+    v = (os.environ.get(PREFILL_DTYPE_ENV) or "bf16").strip().lower()
+    if v not in PREFILL_DTYPES:
+        raise ValueError(
+            f"{PREFILL_DTYPE_ENV}={v!r}: this driver's prefill weight storage is "
+            f"one of {PREFILL_DTYPES} (int4 prefill lives in the standalone "
+            "llama32_1b_int4_prefill.py, 698 ms/layer -- not an inference path)"
+        )
+    return v
+
+
+PREFILL_DTYPE = _read_prefill_dtype()
+
+
+def _bfp16_layer_runner():
+    """The bfp16 transformer block, from the standalone prefill driver that
+    already owns it (and whose `--prefill-dtype bfp16` lit gates it) -- ONE
+    implementation, both entry points, no fork.
+
+    Imported lazily rather than at module scope: that module pulls in
+    `awq_pack`, which re-orders `sys.path` around the two `multi_launch_builder`
+    packages, and a bf16 run must not pay for or be perturbed by an import it
+    never uses.
+    """
+    from llama32_1b_int4_prefill import _run_layer_bfp16
+
+    return _run_layer_bfp16
+
 
 @contextlib.contextmanager
 def _multi_launch_dir(dir_path: str):
@@ -206,8 +258,19 @@ def prepare_runtime(
     for i, lw in enumerate(weights.layers):
         lw._layer_idx = i
 
-    # bf16 prefill weight + RoPE LUT BO preload (same path as bf16 sibling).
-    preload_prefill_weights(weights, config, prefill_cache, seq_len, rope_lut_bf16)
+    # Prefill weight residency. bf16: the sibling's per-layer BO preload.
+    # bfp16 `[2026-08-26]` (doc 56 H4): transcode the SAME dequantized bf16
+    # projections to bfp16ebs8 and hang them on the layer; the bfp16 stitchers
+    # mark those slots `static_input_indices`, so the first (warmup) forward
+    # writes them once and every later forward skips the write -- which is the
+    # residency the bf16 preload buys ahead of time. Both arms therefore run
+    # their TIMED samples with weights already resident, and the bf16 preload
+    # is not called here because its ELF (`rms_gemms_rope`) is not in a bfp16
+    # artifact set at all.
+    if PREFILL_DTYPE == "bfp16":
+        _pack_prefill_weights_bfp16(weights, config)
+    else:
+        preload_prefill_weights(weights, config, prefill_cache, seq_len, rope_lut_bf16)
 
     # Decode-side preload: packed BOs into the int4 decode ELFs.
     _preload_decode_weights(decode_cache, weights, config)
@@ -216,6 +279,39 @@ def prepare_runtime(
     print(f"  Runtime prepared in {t_prep:.1f}s")
     prefill_cache.profiler.preprocessing_s = t_prep
     decode_cache.profiler.preprocessing_s = t_prep
+
+
+def _pack_prefill_weights_bfp16(weights, config):
+    """`[2026-08-26]` doc 56 H4: dense bf16 projections -> `bfp16ebs8` BOs.
+
+    One owner for the transcode (`awq_bfp_pack.pack_layer_bfp16`) and one
+    owner for the tile geometry it must match (the same module's
+    `BFP16_N_TILE` / `BFP16_K_CHUNK`, which ARE the two bfp16 stitchers'
+    shared `tile_n` / `tile_k_l1`). Idempotent, like every other surface
+    `prepare_runtime` touches.
+
+    Cost is load-time and host-side: 973 M weight elements at 1.125 B/elt =
+    1.09 GB of packed BOs beside the 1.95 GB of bf16 the loader already
+    produced. Nothing here runs per token or per forward, and nothing here
+    dequantizes -- in `bfp16ebs8` the shared exponent IS the scale.
+    """
+    if getattr(weights, "_bfp16_prefill_packed", False):
+        return
+    from awq_bfp_pack import pack_layer_bfp16
+
+    t0 = time.time()
+    total = 0
+    for layer_idx, lw in enumerate(weights.layers):
+        lw._bfp_packed = pack_layer_bfp16(lw)
+        total += sum(b.nbytes for b in lw._bfp_packed.values())
+        if (layer_idx + 1) % 4 == 0 or layer_idx == 0:
+            print(f"  bfp16 layer {layer_idx + 1}/{config.n_layers} packed")
+    weights._bfp16_prefill_packed = True
+    weights._bfp16_packed_bytes = total
+    print(
+        f"  Packed {config.n_layers} layers to bfp16ebs8: "
+        f"{total / 1e6:.1f} MB in {time.time() - t0:.1f}s"
+    )
 
 
 def _preload_decode_weights(decode_cache, weights, config):
@@ -373,16 +469,32 @@ def run_npu_prefill(
 
     for layer_idx in range(config.n_layers):
         t0 = prefill_cache.profiler.start_layer()
-        x_bf16, intermediates = run_prefill_block(
-            x_bf16,
-            weights.layers[layer_idx],
-            rope_lut_bf16,
-            config,
-            prefill_cache,
-            layer_idx=layer_idx,
-            cpu_attn=cpu_attn,
-            verbose=False,
-        )
+        if PREFILL_DTYPE == "bfp16":
+            # `[2026-08-26]` doc 56 H4: the SAME block, bfp16ebs8 weight
+            # storage. `with_kv=True` returns the k_roped / v the KV-cache
+            # append below needs -- the shape run_prefill_block already has.
+            x_bf16, intermediates = _bfp16_layer_runner()(
+                x_bf16,
+                weights.layers[layer_idx],
+                weights.layers[layer_idx]._bfp_packed,
+                rope_lut_bf16,
+                config,
+                prefill_cache,
+                layer_idx=layer_idx,
+                cpu_attn=cpu_attn,
+                with_kv=True,
+            )
+        else:
+            x_bf16, intermediates = run_prefill_block(
+                x_bf16,
+                weights.layers[layer_idx],
+                rope_lut_bf16,
+                config,
+                prefill_cache,
+                layer_idx=layer_idx,
+                cpu_attn=cpu_attn,
+                verbose=False,
+            )
         with prefill_cache.profiler.time_cpu("kv_append"):  # the plan's stage name (was kv_cache_extract)
             k_roped = intermediates["k_roped"]
             v_raw = intermediates["v"]

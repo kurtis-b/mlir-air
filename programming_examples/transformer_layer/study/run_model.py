@@ -480,13 +480,15 @@ def worker(args) -> int:
     return 0
 
 
-def run_worker(model_id: str, M: int, rungs: list, *, compiled: dict, study_id: str, profile, out_dir: Path) -> dict:
+def run_worker(model_id: str, M: int, rungs: list, *, compiled: dict, study_id: str, profile, out_dir: Path,
+               precision_plan: str | None = None) -> dict:
     """Spawn `worker` for one artifact set and return its JSON."""
-    work = out_dir / "work" / f"{model_id}_M{M}"
+    precision_plan = precision_plan or profile.precision_plan
+    work = out_dir / "work" / f"{model_id}_M{M}_{precision_plan}"
     work.mkdir(parents=True, exist_ok=True)
     spec = {
         "model_id": model_id, "M": M, "study_id": study_id, "compiled": {"prefill_M": M, **compiled},
-        "precision_plan": profile.precision_plan, "prefill_samples": profile.prefill_samples,
+        "precision_plan": precision_plan, "prefill_samples": profile.prefill_samples,
         "prefill_warmup": profile.prefill_warmup, "decode_warmup": profile.decode_warmup,
         "rungs": [
             {"model_id": r.model_id, "phase": r.phase, "M": r.M, "context_end": r.context_end, "n_tokens": r.n_tokens,
@@ -498,7 +500,7 @@ def run_worker(model_id: str, M: int, rungs: list, *, compiled: dict, study_id: 
     out_json = work / "worker_out.json"
     if out_json.exists():
         out_json.unlink()
-    cmd = [sys.executable, os.path.abspath(__file__), "worker", "--rungs", str(work / "rungs.json"), "--out", str(out_json), "--prompts-dir", str(out_dir / "prompts" / f"{model_id}_M{M}")]
+    cmd = [sys.executable, os.path.abspath(__file__), "worker", "--rungs", str(work / "rungs.json"), "--out", str(out_json), "--prompts-dir", str(out_dir / "prompts" / f"{model_id}_M{M}_{precision_plan}")]
     log = work / "worker.log"
     with log.open("w", encoding="utf-8") as fh:
         proc = subprocess.run(cmd, cwd=str(work), stdout=fh, stderr=subprocess.STDOUT, text=True)
@@ -516,8 +518,9 @@ def run_verify(model_id: str, M: int, gate: dict, *, compiled: dict, out_dir: Pa
     an `artifact_problems` entry that fails every row of the set."""
     adapter = model_adapter.ModelAdapter(model_id)
     prefill_cache, decode_cache = Path(compiled["prefill_cache"]), Path(compiled["decode_cache"])
-    report_root = out_dir / "verify" / f"{model_id}_M{M}"
-    cwd = out_dir / "verify" / f"{model_id}_M{M}" / "cwd"
+    tag = f"{model_id}_M{M}_{gate.get('precision_plan', 'bf16')}"
+    report_root = out_dir / "verify" / tag
+    cwd = report_root / "cwd"
     before = model_adapter.artifact_content_sha([prefill_cache, decode_cache])
     extra_env = {"LLMS_VERIFY_UBATCH": str(gate["ubatch"])} if gate.get("ubatch") else {}
     # `[2026-08-26]` doc 56 H2b: the gate runs the plan's driver path (the
@@ -580,7 +583,7 @@ def run(profile, out_dir, *, study_id: str, worker_fn=None, verifier=None, repo=
     tests; production uses `run_worker` / `run_verify`."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    worker_fn = worker_fn or (lambda model_id, M, rungs, compiled: run_worker(model_id, M, rungs, compiled=compiled, study_id=study_id, profile=profile, out_dir=out_dir))
+    worker_fn = worker_fn or (lambda model_id, M, rungs, compiled, precision_plan="bf16": run_worker(model_id, M, rungs, compiled=compiled, study_id=study_id, profile=profile, out_dir=out_dir, precision_plan=precision_plan))
     verifier = verifier or (lambda model_id, M, g, compiled, timed_sha=None: run_verify(model_id, M, g, compiled=compiled, out_dir=out_dir, timed_sha=timed_sha))
     repo_root = Path(repo) if repo else Path(_PE).parent
     expected_files = profile.expected_files()
@@ -621,27 +624,30 @@ def run(profile, out_dir, *, study_id: str, worker_fn=None, verifier=None, repo=
                     row, _digest = plan.reuse[code_key]
                     rows_by_key[key] = row
                     ledger.record_rung(rung.mode, rung.seq, row, "reused")
-            # then one worker per artifact set, then its gate
-            for (model_id, M) in profile.artifact_sets():
-                todo = [r for r in rungs if (r.model_id, r.M) == (model_id, M) and r.skip_reason is None
+            # then one worker per artifact set, then its gate. `[2026-08-26]`
+            # doc 56 H4: the set is keyed by (model, M, PRECISION PLAN) -- a
+            # plan selects ELFs, so two rungs at one M under two plans are two
+            # sets, two worker processes and two gates, inside one walk.
+            for (model_id, M, pplan) in profile.artifact_sets():
+                todo = [r for r in rungs if (r.model_id, r.M, r.precision_plan) == (model_id, M, pplan) and r.skip_reason is None
                         and (r.mode, r.seq) + r.extra in set(plan.remeasure)]
                 if not todo:
                     continue
-                compiled = profile.compiled[(model_id, M)]
+                compiled = profile.compiled[(model_id, M, pplan)]
                 if dry_run:
                     for r in todo:
                         row = skipped_row(r, study_id, "dry run: no device was dispatched to")
                         rows_by_key[resume_mod.rung_key(r.mode, r.seq, r.extra)] = row
                         ledger.record_rung(r.mode, r.seq, row, "skipped")
                     continue
-                result = worker_fn(model_id, M, todo, compiled=compiled)
+                result = worker_fn(model_id, M, todo, compiled=compiled, precision_plan=pplan)
                 verdict = None
                 if verify and result.get("gate"):
                     try:
                         verdict = verifier(model_id, M, result["gate"], compiled=compiled, timed_sha=result.get("timed_artifact_sha"))
                     except Exception as exc:
                         verdict = {"passed": False, "returncode": None, "per_prompt": [], "report_json": None, "error": f"{type(exc).__name__}: {exc}"}
-                    verdicts[f"{model_id}_M{M}"] = {k: v for k, v in verdict.items() if k != "log"}
+                    verdicts[f"{model_id}_M{M}_{pplan}"] = {k: v for k, v in verdict.items() if k != "log"}
                 gate_spec = result.get("gate") or {}
                 gate_map = gate_spec.get("map") or {}
                 gate_tokens = gate_spec.get("prompt_tokens") or []
@@ -712,7 +718,7 @@ def _bound_profile(args):
     if getattr(args, "models", None):
         wanted = tuple(m.strip() for m in args.models.split(",") if m.strip())
         prof = replace(prof, models=wanted, prefill_Ms={m: prof.prefill_Ms[m] for m in wanted})
-    compiled, notes = model_profiles.discover_compiled(prof.models, args.compiled_root, precision_plan=prof.precision_plan)
+    compiled, notes = model_profiles.discover_compiled(prof.models, args.compiled_root, precision_plans=prof.precision_plans_used())
     return prof.bind(compiled, notes)
 
 

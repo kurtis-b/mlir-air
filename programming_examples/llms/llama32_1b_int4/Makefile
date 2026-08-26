@@ -16,6 +16,17 @@
 # Performance (NPU2 AMD Strix, seq=2048, 16 layers, NPU flash_attn):
 #   --prefill-dtype=int4 :  ~700 ms/layer  (kernel-bound; see PR for bisection)
 #   --prefill-dtype=bf16 :  ~80 ms/layer   (~9x faster, same AWQ weights)
+#   --prefill-dtype=bfp16:  1184-1189 tok/s vs bf16's 1723-1746 -- 0.68x, a
+#                           PRICED NEGATIVE (Turbo recorded, devq 638/639,
+#                           doc 56 s4 H4 2026-08-26; the study clock, forward
+#                           pass only). bfp16ebs8 is 9 bits/elt (1.778x under
+#                           bf16, NOT 3.5x) and at M=2048 the whole weight-byte
+#                           prize is <=21 ms of a ~1180 ms forward, while the
+#                           builder's shared tile_n=32 (registry bf16: 128)
+#                           costs +577 ms of activation re-reads. Accuracy is
+#                           bf16's own class (mean rel L1 0.0073) and there is
+#                           no dequant pass at all -- the TILE is the problem,
+#                           not the format. bf16 stays the default.
 #   int4 NPU decode      :  68-89 ms/token by context (14.7 / 13.6 / 11.2 tok/s
 #                           at ctx 512/1024/2048; Turbo recorded, devq 610,
 #                           doc 56 s4 H2a 2026-08-26 -- the study clock, forward

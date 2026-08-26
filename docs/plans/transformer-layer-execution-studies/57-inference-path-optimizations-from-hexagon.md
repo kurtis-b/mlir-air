@@ -347,6 +347,23 @@ healed by one other-ELF dispatch). **Odd ⇔ wrong/hang now 10/10.** Production 
 re-executes these back-to-back; recompiling under the fixed compiler is the repair when those
 caches are next rebuilt.
 
+**`[2026-08-26]` Six more rows, predicted then observed — odd ⇔ wrong/hang 16/16** (doc 56 H4,
+queue item 20, devq 635; devq 634 is the identical first pass). Both arms' Llama-3.2-1B PREFILL
+ELFs, all pre-fix bytes, through the production per-layer call sites:
+`rms_gemms_rope_bfp16` (6, even) and `o_ffn_bfp16` (8, even) and `o_ffn` bf16 (12, even) **clean**
+— d2/d3/d4 byte-equal to d1, d1 correct per family at each stage's own device-side input;
+`flash_attn` (**1, odd**, the ELF both arms share) d1 correct and **d2/d3 wrong at rel L1 0.62**,
+healed byte-exactly by one intervening dispatch; `rms_gemms_rope` bf16 (**7, odd**) d1 correct and
+**d2 HANGS**. Production alternates `rms → flash_attn → o_ffn`, so no prefill ELF is ever
+dispatched back-to-back. Two by-products. **(i) The heal is a fact about the wrong-VALUE case
+only**: when the odd ELF *hangs*, `ERT_CMD_STATE_TIMEOUT` is followed by `ERT_CMD_STATE_ABORT`,
+then `qds_device::wait() unexpected command state`, then `bad command state, can't launch` — the
+XRT context is poisoned for the rest of the process and the heal cannot be evaluated at all, so a
+gate over this family must run one process per ELF. **(ii) A gate whose inputs do not exercise the
+kernel cannot see the defect**: at a small input scale the FA logits are ~0.16, the softmax is
+nearly uniform and `attn_out` barely depends on `q`, and the same corruption read as 0.009 % of
+elements; at a realistic logit spread it is rel L1 0.62.
+
 ## 2. The structural fact: every `air.launch` boundary is a partition reconfiguration
 
 [29](25-mode-rebuilds-and-results.md) records the multi-launch mechanism: a module with N
@@ -668,7 +685,18 @@ prefill accumulator is **fp16**, round-tripped through fp16 on every FA KV block
 is a *native MMUL operand type* on AIE2P, so a bf16 × bfp16 GEMM needs **no dequant pass at all** —
 their own solver prices that pass at `HTP_MM_HMX_COST_W_DEQUANT = 3` against
 `HTP_MM_HMX_COST_A_CONVERT = 2` (`htp/matmul-ops.h:45-46`). That term is one we can make **zero**,
-and doc 56 §4's H4 is the measurement that would show it. (iii) They reject bf16 outright and
+and doc 56 §4's H4 is the measurement that would show it.
+**`[2026-08-26]` H4 measured it (queue item 20, devq 636–639): the zero-dequant-pass advantage is
+REAL and worth NOTHING at prefill's shipped ubatch.** There is no dequant kernel and no dequant
+time in the bfp16 arm — the shared 8-bit exponent IS the scale and the MMUL applies it — and its
+accuracy is the bf16 GEMM's own class (mean rel L1 0.0073 against the registry's published
+0.0097); but `bfp16ebs8` is **9 bits/elt, 1.778× under bf16, not 3.5×**, so at `M = 2048`, where
+each weight element feeds 2048 MACs, the entire weight-byte prize is **≤ 21 ms of a ~1180 ms
+forward**. Measured end to end on Llama-3.2-1B-AWQ: **1184–1189 tok/s against bf16's 1723–1746,
++548 ms of device time**, because the only bfp16 GEMM in the tree is built at `tile_n = 32`
+against the registry's 128 and pays 4× the activation re-reads — a term the storage format does
+not touch. Hexagon prices `COST_W_DEQUANT` in a regime where the matrix engine works on 32×32
+fp16 tiles; ours is not that regime. See doc 56 §4's H4 block. (iii) They reject bf16 outright and
 support no K-quants; we ship q4_0 gs=32, AWQ gs=128 and RTN gs=128.
 
 **Where we are behind.** (i) **No integer compute anywhere** — our int4 path is int4 *storage* →

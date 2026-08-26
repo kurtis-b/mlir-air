@@ -22,7 +22,8 @@ import schema  # noqa: E402
 
 
 def _compiled_all(prof):
-    return {(m, M): {"prefill_cache": f"/c/{m}/M{M}/p", "decode_cache": f"/c/{m}/d"} for m in prof.models for M in prof.prefill_Ms[m]}
+    return {(m, M, prof.precision_plan): {"prefill_cache": f"/c/{m}/M{M}/p", "decode_cache": f"/c/{m}/d"}
+            for m in prof.models for M in prof.prefill_Ms[m]}
 
 
 def test_model_smoke_is_the_h1a_row_of_doc_56():
@@ -89,11 +90,11 @@ def test_resume_identity_is_the_v3_row_key():
 def test_bind_turns_a_missing_artifact_set_into_a_skip_with_the_reason():
     prof = mp.profile("model-smoke")
     unbound = prof.rungs()
-    assert all(r.skip_reason and "no compiled prefill artifact set" in r.skip_reason for r in unbound)
+    assert all(r.skip_reason and "no compiled artifact set" in r.skip_reason for r in unbound)
     compiled = _compiled_all(prof)
-    del compiled[("qwen3_0_6b", 512)]
-    del compiled[("qwen3_0_6b", 1024)]
-    bound = prof.bind(compiled, {("qwen3_0_6b", 512): "registry lacks 512x1024x2048 (devq 567)"})
+    del compiled[("qwen3_0_6b", 512, "bf16")]
+    del compiled[("qwen3_0_6b", 1024, "bf16")]
+    bound = prof.bind(compiled, {("qwen3_0_6b", 512, "bf16"): "registry lacks 512x1024x2048 (devq 567)"})
     skips = {r.case_id: r.skip_reason for r in bound.rungs() if r.skip_reason}
     assert set(skips) == {"qwen3_0_6b/prefill/M512/ctx512/bf16", "qwen3_0_6b/prefill/M1024/ctx1024/bf16"}
     assert "devq 567" in skips["qwen3_0_6b/prefill/M512/ctx512/bf16"]
@@ -102,9 +103,10 @@ def test_bind_turns_a_missing_artifact_set_into_a_skip_with_the_reason():
         "model_qwen3_0_6b.csv": {"rows": 6, "measured": 4, "skipped": 2},
         "model_llama32_1b.csv": {"rows": 4, "measured": 4, "skipped": 0},
     }
-    assert bound.artifact_sets() == [("qwen3_0_6b", 2048), ("llama32_1b", 2048)]
+    assert bound.artifact_sets() == [("qwen3_0_6b", 2048, "bf16"), ("llama32_1b", 2048, "bf16")]
     full = prof.bind(_compiled_all(prof))
-    assert full.artifact_sets() == [("qwen3_0_6b", 512), ("qwen3_0_6b", 1024), ("qwen3_0_6b", 2048), ("llama32_1b", 2048)]
+    assert full.artifact_sets() == [("qwen3_0_6b", 512, "bf16"), ("qwen3_0_6b", 1024, "bf16"),
+                                    ("qwen3_0_6b", 2048, "bf16"), ("llama32_1b", 2048, "bf16")]
     assert all(r.skip_reason is None for r in full.rungs())
     assert full.summary()["expected_rows"]["model_qwen3_0_6b.csv"]["skipped"] == 0
 
@@ -122,10 +124,10 @@ def test_discover_compiled_needs_a_manifest_not_a_directory():
         (root / "qwen3_0_6b" / "M1024" / "prefill_kernel_cache").mkdir(parents=True)
         (root / "qwen3_0_6b" / "M1024" / "prefill_kernel_cache" / "manifest.json").write_text("{}")
         compiled, notes = mp.discover_compiled(("qwen3_0_6b", "llama32_1b"), root, llms_dir=llms)
-    assert set(compiled) == {("qwen3_0_6b", 2048), ("qwen3_0_6b", 1024)}
-    assert ("llama32_1b", 2048) in notes and ("qwen3_0_6b", 512) in notes
-    assert "compile did not finish" in notes[("qwen3_0_6b", 512)]
-    assert compiled[("qwen3_0_6b", 1024)]["decode_cache"].endswith("build_peano/decode_kernel_cache")
+    assert set(compiled) == {("qwen3_0_6b", 2048, "bf16"), ("qwen3_0_6b", 1024, "bf16")}
+    assert ("llama32_1b", 2048, "bf16") in notes and ("qwen3_0_6b", 512, "bf16") in notes
+    assert "compile did not finish" in notes[("qwen3_0_6b", 512, "bf16")]
+    assert compiled[("qwen3_0_6b", 1024, "bf16")]["decode_cache"].endswith("build_peano/decode_kernel_cache")
 
 
 def test_summary_is_json_and_names_every_rung():
@@ -151,11 +153,11 @@ def test_w4_decode_is_the_h2a_row_of_doc_56():
     assert [r.case_id for r in rungs] == [
         f"llama32_1b_int4/decode/M2048/ctx{c}/w4_decode" for c in (512, 1024, 2048)]
     assert all(r.precision_plan == "w4_decode" and r.M == mp.SHIPPED_PREFILL_M for r in rungs)
-    assert all(r.skip_reason and "no compiled prefill artifact set" in r.skip_reason for r in rungs)
+    assert all(r.skip_reason and "no compiled artifact set" in r.skip_reason for r in rungs)
     assert prof.expected_files() == ["model_llama32_1b_int4.csv"]
-    bound = prof.bind({("llama32_1b_int4", 2048): {"prefill_cache": "/c/p", "decode_cache": "/c/d"}})
+    bound = prof.bind({("llama32_1b_int4", 2048, "w4_decode"): {"prefill_cache": "/c/p", "decode_cache": "/c/d"}})
     assert all(r.skip_reason is None for r in bound.rungs())
-    assert bound.artifact_sets() == [("llama32_1b_int4", 2048)]
+    assert bound.artifact_sets() == [("llama32_1b_int4", 2048, "w4_decode")]
     assert bound.expected_rows() == {"model_llama32_1b_int4.csv": {"rows": 3, "measured": 3, "skipped": 0}}
     # resume identity: three decode rungs at seq 1 are three keys, distinct
     # from the bf16 llama rungs at the same contexts by the model AND plan.
@@ -191,20 +193,20 @@ def test_w4_decode_qwen_is_the_h2b_row_of_doc_56():
         # no w4 decode set yet: NOT compiled, and the note names compile-decode
         compiled, notes = mp.discover_compiled(("qwen3_0_6b",), root, llms_dir=llms, precision_plan="w4_decode")
         assert compiled == {}
-        assert "compile-decode" in notes[("qwen3_0_6b", mp.SHIPPED_PREFILL_M)]
-        assert "w4_decode" in notes[("qwen3_0_6b", mp.SHIPPED_PREFILL_M)]
+        assert "compile-decode" in notes[("qwen3_0_6b", mp.SHIPPED_PREFILL_M, "w4_decode")]
+        assert "w4_decode" in notes[("qwen3_0_6b", mp.SHIPPED_PREFILL_M, "w4_decode")]
         # the compiled w4 decode set binds with the SHIPPED prefill cache
         w4d = root / "qwen3_0_6b" / "w4_decode" / "decode_kernel_cache"
         w4d.mkdir(parents=True)
         (w4d / "manifest.json").write_text("{}")
         compiled, notes = mp.discover_compiled(("qwen3_0_6b",), root, llms_dir=llms, precision_plan="w4_decode")
-        assert compiled[("qwen3_0_6b", mp.SHIPPED_PREFILL_M)]["decode_cache"] == str(w4d)
-        assert compiled[("qwen3_0_6b", mp.SHIPPED_PREFILL_M)]["prefill_cache"].endswith("build_peano/prefill_kernel_cache")
+        assert compiled[("qwen3_0_6b", mp.SHIPPED_PREFILL_M, "w4_decode")]["decode_cache"] == str(w4d)
+        assert compiled[("qwen3_0_6b", mp.SHIPPED_PREFILL_M, "w4_decode")]["prefill_cache"].endswith("build_peano/prefill_kernel_cache")
         # bf16 discovery on the same tree is untouched: the shipped decode cache
         compiled_b, _ = mp.discover_compiled(("qwen3_0_6b",), root, llms_dir=llms, precision_plan="bf16")
-        assert compiled_b[("qwen3_0_6b", mp.SHIPPED_PREFILL_M)]["decode_cache"].endswith("build_peano/decode_kernel_cache")
+        assert compiled_b[("qwen3_0_6b", mp.SHIPPED_PREFILL_M, "bf16")]["decode_cache"].endswith("build_peano/decode_kernel_cache")
     # resume identity: distinct from the bf16 qwen decode rungs by the plan column
-    bound = prof.bind({("qwen3_0_6b", 2048): {"prefill_cache": "/c/p", "decode_cache": "/c/w4/d"}})
+    bound = prof.bind({("qwen3_0_6b", 2048, "w4_decode"): {"prefill_cache": "/c/p", "decode_cache": "/c/w4/d"}})
     keys = {resume.rung_key(r.mode, r.seq, r.extra) for r in bound.rungs()}
     bf16 = {resume.rung_key(r.mode, r.seq, r.extra) for r in mp.profile("model-smoke").rungs()
             if r.phase == "decode" and r.model_id == "qwen3_0_6b"}

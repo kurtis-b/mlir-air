@@ -322,10 +322,10 @@ def test_ubatch_curve_profile():
     assert a.extra != b.extra and a.seq == 512 and b.seq == 1024
     # unbound: both skip with the compile hint; bound: measurable
     assert all(r.skip_reason and "compile" in r.skip_reason for r in rungs)
-    bound = prof.bind({("qwen3_0_6b", 512): {"prefill_cache": "p", "decode_cache": "d"},
-                       ("qwen3_0_6b", 1024): {"prefill_cache": "p2", "decode_cache": "d"}})
+    bound = prof.bind({("qwen3_0_6b", 512, "bf16"): {"prefill_cache": "p", "decode_cache": "d"},
+                       ("qwen3_0_6b", 1024, "bf16"): {"prefill_cache": "p2", "decode_cache": "d"}})
     assert all(r.skip_reason is None for r in bound.rungs())
-    assert bound.artifact_sets() == [("qwen3_0_6b", 512), ("qwen3_0_6b", 1024)]
+    assert bound.artifact_sets() == [("qwen3_0_6b", 512, "bf16"), ("qwen3_0_6b", 1024, "bf16")]
     counts = bound.expected_rows()["model_qwen3_0_6b.csv"]
     assert counts == {"rows": 2, "measured": 2, "skipped": 0}
     assert bound.summary()["ubatch_points"] == [["qwen3_0_6b", 1024, 512], ["qwen3_0_6b", 1024, 1024]]

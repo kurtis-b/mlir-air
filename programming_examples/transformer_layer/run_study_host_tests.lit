@@ -638,5 +638,29 @@
 // contracts say so and add no warning, a pre-block manifest FLAGS on both sides
 // and keeps gating, a differing run-cache state warns naming which numbers it
 // touches, and there is no bypass flag).
+//
+// `[2026-08-26]` 705 -> 715 in 32 -> 33 modules, queue item 20 (doc 56 H4):
+// `w_bfp16_prefill`, the prefill GEMM's weight operand stored as `bfp16ebs8`.
+// The new module `test_bfp16_prefill.py` is 10 of the 10, and each one is a
+// way this could have gone silently wrong: the packed BO layout IS the two
+// stitchers' tile geometry, checked against the BUILDERS' signature defaults
+// rather than a copy (disagree and the ELF reads the weight BO as garbage and
+// the only symptom is a wrong token); 9 bytes per 8 elements = 1.125 B/elt
+// asserted on a real packed array, against the 4.5 bits/elt this item's brief
+// assumed; `pack_layer_bfp16` transcodes the SAME dequantized bf16 array the
+// bf16 arm's GEMMs consume, so both arms and the HF oracle compute one model;
+// the contract has ONE owner (`awq_bfp_pack.quant_contract`) and the plan
+// package mirrors only its NAME while importing nothing from a model
+// directory; the plan is the shipped stitchers launch for launch (6 + 1 + 8
+// per layer = 248 against bf16's 328) with every GEMM candidate
+// `analytical_unmeasured` at the builder's tiles and the registry policy a
+// RECORDED rejected alternative carrying its cost; the plan REFUSES a qk-norm
+// model and a decode workload rather than naming bf16 stages a bfp16 plan; the
+// profile's two rungs are one model, one M, one prompt and two artifact sets;
+// a prefill-phase precision plan takes the prefill ELFs and keeps the SHIPPED
+// decode set; and the flag hops exist by source, end to end.
+// The other three modules are unchanged in count and updated for the
+// artifact-set key gaining the precision plan (a plan selects ELFs, so two
+// rungs at one M under two plans are two sets, two workers and two gates).
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 705/705 passed in 32 modules
+// CHECK: study host tests: 715/715 passed in 33 modules

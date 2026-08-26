@@ -376,8 +376,27 @@ def _run_layer_bfp16(
     layer_idx,
     return_intermediates=False,
     cpu_attn=False,
+    with_kv=False,
 ):
-    """Run one transformer block through the bfp16 prefill stitchers."""
+    """Run one transformer block through the bfp16 prefill stitchers.
+
+    `with_kv` `[2026-08-26]` (doc 56 H4, queue item 20): return
+    `(x_out, {"k_roped", "v"})` instead of `x_out` alone, so the e2e driver's
+    prefill loop can fill the KV cache -- the shape
+    `llama32_1b_prefill.run_transformer_block` already has. Default False keeps
+    every existing caller (the standalone verify/diagnosis paths below)
+    returning exactly what it returned before.
+
+    THE CONSTANT ARGUMENTS ARE CACHED PER LAYER, for the same reason the bf16
+    sibling caches them (`llama32_1b_prefill.run_transformer_block:270` and
+    `preload_prefill_weights:461`, "~500ms saved"): every argument except the
+    two dynamic activations is identical on every call, the weight BOs are
+    already resident through `static_input_indices`, and rebuilding the two
+    RoPE LUT expansions (10.5 MB per layer per forward at seq 2048) on each
+    call is host work that lands INSIDE the study's forward-pass clock. Without
+    this the bfp16 arm would be charged ~0.5 s per forward that has nothing to
+    do with the weight format under test.
+    """
     seq_len = x_bf16.shape[0]
     emb_dim = config.emb_dim
     n_heads = config.n_heads
@@ -386,24 +405,28 @@ def _run_layer_bfp16(
     hidden_dim = config.hidden_dim
     kv_dim = n_kv_heads * head_dim
 
-    rope_q = np.repeat(rope_lut_bf16[:seq_len], n_heads, axis=0).flatten()
-    rope_k = np.repeat(rope_lut_bf16[:seq_len], n_kv_heads, axis=0).flatten()
+    _arg_cache = getattr(_run_layer_bfp16, "_arg_cache", {})
+    _run_layer_bfp16._arg_cache = _arg_cache
 
-    rms_args = [
-        np.asarray(x_bf16, dtype=bfloat16).reshape(seq_len, emb_dim),
-        np.asarray(layer.attn_norm, dtype=bfloat16).reshape(emb_dim),
-        np.zeros((seq_len, emb_dim), dtype=bfloat16),
-        layer_packed["wq"],
-        np.zeros((seq_len, emb_dim), dtype=bfloat16),
-        layer_packed["wk"],
-        np.zeros((seq_len, kv_dim), dtype=bfloat16),
-        layer_packed["wv"],
-        np.zeros((seq_len, kv_dim), dtype=bfloat16),
-        rope_q,
-        rope_k,
-        np.zeros((seq_len, emb_dim), dtype=bfloat16),
-        np.zeros((seq_len, kv_dim), dtype=bfloat16),
-    ]
+    _rms_key = f"rms_bfp16_L{layer_idx}"
+    if _rms_key not in _arg_cache:
+        _arg_cache[_rms_key] = [
+            None,  # arg0: x_in (dynamic, replaced each call)
+            np.asarray(layer.attn_norm, dtype=bfloat16).reshape(emb_dim),
+            np.zeros((seq_len, emb_dim), dtype=bfloat16),
+            layer_packed["wq"],
+            np.zeros((seq_len, emb_dim), dtype=bfloat16),
+            layer_packed["wk"],
+            np.zeros((seq_len, kv_dim), dtype=bfloat16),
+            layer_packed["wv"],
+            np.zeros((seq_len, kv_dim), dtype=bfloat16),
+            np.repeat(rope_lut_bf16[:seq_len], n_heads, axis=0).flatten(),
+            np.repeat(rope_lut_bf16[:seq_len], n_kv_heads, axis=0).flatten(),
+            np.zeros((seq_len, emb_dim), dtype=bfloat16),
+            np.zeros((seq_len, kv_dim), dtype=bfloat16),
+        ]
+    rms_args = _arg_cache[_rms_key]
+    rms_args[0] = np.asarray(x_bf16, dtype=bfloat16).reshape(seq_len, emb_dim)
     output_idx = [2, 4, 6, 8, 11, 12] if return_intermediates else [8, 11, 12]
     results = cache.load_and_run(
         "rms_gemms_rope_bfp16",
@@ -449,24 +472,6 @@ def _run_layer_bfp16(
         )
         attn_out = res[3].reshape(seq_len, n_heads * head_dim)
 
-    n_total = seq_len * emb_dim
-    offn_args = [
-        np.asarray(attn_out, dtype=bfloat16).reshape(seq_len, emb_dim),
-        layer_packed["wo"],
-        np.zeros((seq_len, emb_dim), dtype=bfloat16),
-        np.asarray(x_bf16, dtype=bfloat16).reshape(seq_len, emb_dim),
-        np.zeros((seq_len, emb_dim), dtype=bfloat16),
-        np.asarray(layer.ffn_norm, dtype=bfloat16).reshape(emb_dim),
-        np.zeros((seq_len, emb_dim), dtype=bfloat16),
-        layer_packed["w_gate"],
-        np.zeros((seq_len, hidden_dim), dtype=bfloat16),
-        layer_packed["w_up"],
-        np.zeros((seq_len, hidden_dim), dtype=bfloat16),
-        np.zeros((seq_len, hidden_dim), dtype=bfloat16),
-        layer_packed["w_down"],
-        np.zeros((seq_len, emb_dim), dtype=bfloat16),
-        np.zeros(n_total, dtype=bfloat16),
-    ]
     if return_intermediates:
         return None, {
             "normed": normed,
@@ -477,6 +482,29 @@ def _run_layer_bfp16(
             "k_roped": k_roped,
             "attn_out": attn_out,
         }
+    n_total = seq_len * emb_dim
+    _offn_key = f"offn_bfp16_L{layer_idx}"
+    if _offn_key not in _arg_cache:
+        _arg_cache[_offn_key] = [
+            None,  # arg0: attn_out (dynamic)
+            layer_packed["wo"],
+            np.zeros((seq_len, emb_dim), dtype=bfloat16),
+            None,  # arg3: x_residual (dynamic)
+            np.zeros((seq_len, emb_dim), dtype=bfloat16),
+            np.asarray(layer.ffn_norm, dtype=bfloat16).reshape(emb_dim),
+            np.zeros((seq_len, emb_dim), dtype=bfloat16),
+            layer_packed["w_gate"],
+            np.zeros((seq_len, hidden_dim), dtype=bfloat16),
+            layer_packed["w_up"],
+            np.zeros((seq_len, hidden_dim), dtype=bfloat16),
+            np.zeros((seq_len, hidden_dim), dtype=bfloat16),
+            layer_packed["w_down"],
+            np.zeros((seq_len, emb_dim), dtype=bfloat16),
+            np.zeros(n_total, dtype=bfloat16),
+        ]
+    offn_args = _arg_cache[_offn_key]
+    offn_args[0] = np.asarray(attn_out, dtype=bfloat16).reshape(seq_len, emb_dim)
+    offn_args[3] = np.asarray(x_bf16, dtype=bfloat16).reshape(seq_len, emb_dim)
     results = cache.load_and_run(
         "o_ffn_bfp16",
         {"verbose": cache.verbose, **O_FFN_BFP16_BACKEND},
@@ -484,9 +512,12 @@ def _run_layer_bfp16(
         output_indices=[14],
         static_input_indices={1, 5, 7, 9, 12},
         intermediate_indices={2, 4, 6, 8, 10, 11, 13, 14},
-        bo_key=f"offn_bfp16_L{layer_idx}",
+        bo_key=_offn_key,
     )
-    return results[14].reshape(seq_len, emb_dim)
+    x_out = results[14].reshape(seq_len, emb_dim)
+    if with_kv:
+        return x_out, {"k_roped": k_roped, "v": v}
+    return x_out
 
 
 # ---------------------------------------------------------------------------
