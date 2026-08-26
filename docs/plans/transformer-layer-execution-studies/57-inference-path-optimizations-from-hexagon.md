@@ -627,6 +627,84 @@ H2/H3 phases measure.
    (RTN int4 on the LM head under the top-5 gate) stays unasked until then.
 7. Then O3 / O5 / O6(ii) / O8 / O9 per [56](56-full-model-mixed-precision-study-plan.md)'s phases.
 
+## 5b. The Hexagon backend re-read at kernel level `[2026-08-26]`
+
+The operator asked whether the four modes can run LLMs with and without quantization, and what
+`ggml-hexagon` actually implements per phase. A full read of `~/llama.cpp/ggml/src/ggml-hexagon/`
+(host 4510 lines + ~30k lines of `htp/` DSP firmware) sharpens §§1-6 and corrects one line of §6.
+Nothing here is measured on our hardware; it is a design comparison.
+
+**One threshold governs their whole design, and it switches the ARITHMETIC, not the tiling.**
+`HTP_MM_HMX_MIN_NROWS = 4` (`htp/matmul-ops.h:20`):
+
+| | M ≤ 4 ("decode") | M ≥ 5 ("prefill") |
+|---|---|---|
+| engine | HVX vector | HMX matrix (a single dedicated thread) |
+| weights | 4/8-bit tiles DMA'd from DDR, used once | **dequantized to fp16 in a separate VTCM pass** |
+| activations | **dynamically quantized to int8 on-device**, per 32 elements | f32 → fp16 |
+| multiply | `Q6_Vw_vrmpyacc_VwVbVb` — **int8 × int8** | HMX `.hf` — fp16 |
+| accumulate | int32, then × (`d_w`·`d_a`) into f32 | **fp16** |
+
+Their GEMV never dequantizes: unpack nibbles, subtract the zero point (or a LUT), integer-dot the
+whole 32-element K-tile, and multiply the *integer result* by the product of two fp16 scales
+(`htp/hvx-mm-kernels-tiled.h:256-274`, `:381-407`). The enabler is a memory trade we have not
+considered: each 32-value activation block is written **32× replicated, 1152 B** into VTCM
+(`HTP_MM_ACT_TILE_SIZE_Q8_0`, `htp/matmul-ops.h:38`), so the tile dots in 8 instructions with no
+shuffles. A "flat" variant does the replication inside the loop when VTCM is tighter.
+
+Their weight tile is **one format for both engines**: 32 rows × 32 K, quants column-pair-major /
+row-minor in a 512 B plane (4 vector loads), **scales in a trailing plane at +512** (32 × fp16, or
+32 × uint8 E8M0 for MXFP4). It dequantizes to exactly one 2 KB HMX fp16 tile *or* feeds `vrmpy`
+directly, and the repack is byte-count preserving (`32 * type_size == tile_size`). Repacking is
+host-side scalar C++ at model-load time through ggml's extra-buffer-type hook
+(`ggml-hexagon.cpp:502`, `:4251`), not offline and not on the DSP.
+
+**MXFP4 on their decode path is an int4 dot product, not float math** — the E2M1 values are held as
+2× integers in a LUT with one trailing `×0.5`, and the E8M0 byte scale becomes f32 by exponent
+injection (`vasl(x, 23)`), no table (`htp/matmul-ops.c:154`, `:928-947`).
+
+**Where we already stand better.** (i) Our MMA is BFP16-emulated with an **f32** accumulator; their
+prefill accumulator is **fp16**, round-tripped through fp16 on every FA KV block. (ii) `bfp16ebs8`
+is a *native MMUL operand type* on AIE2P, so a bf16 × bfp16 GEMM needs **no dequant pass at all** —
+their own solver prices that pass at `HTP_MM_HMX_COST_W_DEQUANT = 3` against
+`HTP_MM_HMX_COST_A_CONVERT = 2` (`htp/matmul-ops.h:45-46`). That term is one we can make **zero**,
+and doc 56 §4's H4 is the measurement that would show it. (iii) They reject bf16 outright and
+support no K-quants; we ship q4_0 gs=32, AWQ gs=128 and RTN gs=128.
+
+**Where we are behind.** (i) **No integer compute anywhere** — our int4 path is int4 *storage* →
+fused dequant → **bf16 MAC**, which is where the ≤10.7 ms/token (Llama, devq 610) and 12.8 ms/token
+(Qwen, devq 616) dequant residuals live, and why the int4 GEMV runs at 10-14.6 GB/s against a
+40.8 GB/s stream class. Our i8 kernels are NPU1-only, carry no scale/zero-point and have no
+consumer. (ii) **Attention is on their DSP and on our host** — DDR-resident KV streamed per block,
+double-buffered, K transposed on-device by scatter; their FA solver packs `Br` query positions ×
+`G` GQA heads into the 32-row tile (`br_unit = ceil(32/G)`, `htp/flash-attn-ops.h:277`) so GQA
+*fills* the matrix engine instead of replicating K. That is H3 stage 4.
+
+**And the gap that dwarfs both.** They issue **one DSP round-trip per graph split, up to 1024 ops**
+(`opt_opbatch`, `ggml-hexagon.cpp:83`) as a flat `{buffer, tensor, op}` descriptor array in shared
+memory, with tiling parameters solved **on the host** once per graph uid; the DSP walks the batch
+sequentially. Submissions per token: **1-3**. Ours: 57 submissions and 150 `air.launch` boundaries
+≈ 16.1 ms/token (§1.4, §2). They have **no per-op ELF and no reconfiguration at all** — one
+firmware image per arch, every shape handled by runtime parameters against a VTCM budget, and an op
+whose working set exceeds VTCM is *refused at `supports_op` time* and runs on CPU rather than being
+re-tiled. Host and device build the VTCM layout from one shared header function precisely so the
+admission estimate and the placement cannot desync.
+
+**What they do not do**, which bounds how much of this is worth copying: no K-quants, no bf16, **no
+quantized KV cache** (K/V must be F16), the **LM head always runs on CPU** (`src0->ne[1] > 32768` is
+a hardcoded refusal, `ggml-hexagon.cpp:2804`), quantized token embeddings fall back to CPU, and a
+device-side `VTCM_TOO_SMALL` is logged and ignored (`// TODO: handle errors`, `:1593`) with no
+runtime fallback.
+
+**§6 correction.** §6 lists "the `M > 4` HMX threshold (an HMX/HVX fact)" and "Q8 activation
+quantization as the first precision step (Hexagon's HMX path does not use it either)" as things
+that do not transfer. The first half stands — the threshold is an artifact of HMX having no integer
+mode. The second half needs narrowing: their HMX path indeed does not quantize activations, but
+their **decode** path does, and decode is exactly where our GEMVs live. The reason it still may not
+transfer is the one §6 gives elsewhere and doc 56 §4's H3 block now quantifies: our decode GEMVs are
+boundary-bound before they are MAC-bound (16.1 ms of boundaries against a 25.7 ms weight stream),
+so activation quantization is priced *after* the boundary work, not before it.
+
 ## 6. What does not transfer, restated for the inference path
 
 `NDEV` sessions (no VA cliff); the `M > 4` HMX threshold (an HMX/HVX fact); Q8 activation
