@@ -587,6 +587,129 @@ def compare_toolchain(report: Report, baseline: Path, candidate: Path) -> None:
         )
 
 
+def compare_timing(report: Report, baseline: Path, candidate: Path) -> bool:
+    """The timing-CONTRACT guard: does `device_ms` mean the same thing on both
+    sides? Returns whether drift may GATE.
+
+    `[2026-08-26]`, queue item 19 review (finding 5). `device_ms` is the sum of
+    every dispatch's `kernel_ms`, and until 2026-08-26 `KernelCache.load_and_run`
+    timed the host-side construction of the `xrt.run` and the binding of its
+    arguments INSIDE that number -- 38-57 us per call, measured. A change that
+    skipped that work therefore moved `device_ms` by 30-50 us/call with the
+    device doing exactly the same thing, and nothing in either root said so.
+
+    WHY THIS REFUSES WHERE THE TOOLCHAIN FLAGS. `compare_toolchain`'s four
+    reasons are all reasons why a toolchain difference makes the number
+    *doubtful*; a contract difference makes it *a different number*. Reading its
+    four points in order: (1) MAGNITUDE is not the argument -- the two contracts
+    do not add noise to one quantity, they define two, and 30-50 us/call over
+    57 calls is ~2-3 ms of a ~70 ms token, comfortably inside a latency band, so
+    a flag would be read past; (2) THE EXIT IS AVAILABLE and cheap, unlike a
+    destroyed toolchain -- re-walk one side under the current build, or read the
+    token-level figures, which both contracts agree on; (3) THE CONTRACT IS
+    NEVER THE INDEPENDENT VARIABLE -- nobody measures to compare definitions of
+    `kernel_ms`; (4) it is not provenance, it is the unit. So the pmode rule
+    applies for the pmode's reason: two roots naming different contracts are not
+    a comparison of one thing.
+
+    An ABSENT or UNKNOWN side FLAGS and keeps gating, exactly as
+    `compare_conditions` does for an unknown pmode and for its reason: every
+    root recorded before this block has no contract stamp, refusing there would
+    make the module useless against the whole recorded corpus, and a recorded
+    root cannot be stamped after the fact. Two roots that both record nothing
+    are not two roots that agree.
+
+    `xrt_run_cache` is the other identity field and it does NOT refuse on its
+    own: under `start_wait_only` it cannot move `device_ms` (that is what the
+    split bought), but it moves the TOKEN-level wall by ~2-3 ms, so a difference
+    is reported as a warning naming which numbers it touches.
+    """
+    report.say("\n=== timing contract (what `kernel_ms` includes) ===")
+    left_payload, left_why = load_manifest(baseline)
+    right_payload, right_why = load_manifest(candidate)
+    left = schema.timing_from_manifest(left_payload)
+    right = schema.timing_from_manifest(right_payload)
+
+    for name in schema.TIMING_IDENTITY_FIELDNAMES:
+        report.say(f"  {name}: baseline={left[name]}  candidate={right[name]}")
+
+    left_c = schema.normalise_power_mode(left["kernel_ms_contract"])
+    right_c = schema.normalise_power_mode(right["kernel_ms_contract"])
+
+    blind = [
+        (label, block, why)
+        for label, contract, block, why in (
+            ("baseline", left_c, left, left_why),
+            ("candidate", right_c, right, right_why),
+        )
+        if contract == schema.UNKNOWN_CONDITION
+    ]
+    if blind:
+        for label, block, why in blind:
+            reason = why or block["timing_detail"] or "no reason recorded"
+            report.warn(
+                f"the {label} root does not record which terms its `kernel_ms` "
+                f"includes -- {reason}"
+            )
+        report.say(
+            "        `device_ms` below is therefore of UNKNOWN definition on at "
+            "least one side: a root\n"
+            "        older than 2026-08-26 timed the host-side xrt.run build "
+            "(38-57 us/call) inside it, so a\n"
+            "        30-50 us/call `improvement` may be the definition changing "
+            "rather than the device. The\n"
+            "        token-level figures (tok/s, layer-loop wall) are contract-"
+            "independent and still hold.\n"
+            "        Flagged rather than refused because a recorded root's "
+            "contract is not recoverable from\n"
+            "        its files and must not be stamped after the fact; two roots "
+            "that both record nothing do\n"
+            "        not agree."
+        )
+        return True
+
+    if left_c != right_c:
+        report.refuse(
+            f"COMPARISON REFUSED: the two roots recorded `kernel_ms` under "
+            f"different contracts (baseline={left_c}, candidate={right_c}).",
+            "`device_ms` is the sum of `kernel_ms`, and the two contracts do "
+            "not measure the same quantity: `bind_and_start_wait` includes the "
+            "host-side xrt.run construction and argument binding (38-57 us per "
+            "call, measured -- queue item 19 stage 1, devq 622/623) and "
+            "`start_wait_only` does not. Over a 57-submission decode token that "
+            "is ~2-3 ms of device_ms appearing or disappearing with no device "
+            "change, which would read as a regression or an improvement. "
+            "Re-walk one side under the current build, or read the token-level "
+            "figures (tok/s, layer-loop wall), which both contracts agree on. "
+            "The identifier comparison below is contract-independent and still "
+            "holds.",
+        )
+        return False
+
+    report.say(
+        f"  both roots recorded `kernel_ms` as `{left_c}` -- `device_ms` means "
+        f"the same thing on both sides"
+    )
+
+    differences = schema.timing_differences(left, right)
+    cache_moved = [d for d in differences if d[0] == "xrt_run_cache"]
+    if cache_moved:
+        _, before, after = cache_moved[0]
+        report.warn(
+            f"the two roots ran with different `xrt_run_cache` states "
+            f"(baseline={before}, candidate={after})"
+        )
+        report.say(
+            "        Under this contract that does NOT move `device_ms` -- the "
+            "run build is timed outside it --\n"
+            "        but it moves the TOKEN-level wall by ~2-3 ms on a "
+            "57-submission decode token, so read a\n"
+            "        tok/s or latency drift here as `code OR run-cache state`. "
+            "Gating continues."
+        )
+    return True
+
+
 def compare_manifests(report: Report, baseline: Path, candidate: Path) -> None:
     """Provenance first: a toolchain change explains drift that code does not."""
     left, right = manifest_path(baseline), manifest_path(candidate)
@@ -792,6 +915,11 @@ def compare_roots(baseline: Path, candidate: Path, csvs: list[str]) -> Report:
     # condition. It FLAGS rather than refusing, so it returns nothing and cannot
     # move `may_gate` -- the argument is in its docstring.
     compare_toolchain(report, baseline, candidate)
+    # The third pre-CSV question, and the only one about the UNIT rather than
+    # the conditions: does `device_ms` mean the same thing on both sides? It
+    # REFUSES like the pmode does -- the argument is in its docstring -- so it
+    # can only ever narrow `may_gate`, never widen it.
+    may_gate = compare_timing(report, baseline, candidate) and may_gate
     for rel in csvs:
         compare_csv(report, rel, baseline, candidate, may_gate=may_gate)
 

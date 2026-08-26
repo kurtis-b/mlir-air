@@ -201,6 +201,35 @@ Three estimates of the per-boundary cost, from two independent forms:
 - **tiny-only slopes**: (t19 − t1) / 18 = **106.4 µs**, (t38 − t19) / 19 = **106.1 µs**;
   least-squares over N = 1, 19, 38: **106.3 µs per launch, 146 µs intercept** (the fixed
   per-`xrt.run` cost: submission, completion wait, the 2 KB input and 128 B output syncs).
+  **`[2026-08-26]` this intercept is NOT decomposed, and the first version of this note —
+  which claimed H3 stage 1 had "split" it — is WITHDRAWN** (queue item 19 and its review;
+  devq 622/623/628/630). Two things were wrong with the claim. The fit above is over **tiny
+  ELFs with a 3-argument ABI**, while stage 1's 57.5 µs was measured on a **15-argument** one,
+  so the terms were never comparable; and 57.5 + 16.8 = 74.3 µs leaves **71.7 µs of the 146
+  unaccounted**, which the 46.5 µs token-level figure does not supply (that one overlaps the
+  submission, the syncs and the lock).
+
+  Measured properly instead — `bind_ms` timed as its own phase on the three shipped Qwen3-0.6B
+  decode ELFs, whose ABIs are 5 / 15 / 21 buffer arguments (devq 628, reproduced 630, 40 reps
+  each): building an `xrt.run` and binding its arguments costs **10.2 / 20.2 / 36.5 µs**, a fit
+  of **1.58 µs per argument + 0.6 µs fixed** (R² 0.92). At the tiny ELF's own **3-argument**
+  ABI that extrapolates to **~5 µs — about 4 % of the intercept**, not half of it. The
+  remaining **~141 µs** (the fixed submission cost, the completion wait, the 2 KB input and
+  128 B output syncs, the `/tmp/npu.lock` acquire/release and the Python frame) is **not
+  decomposed here and is not claimed to be**: `submit` on a production ELF is that kernel's
+  device work (0.4 / 1.5 / 7.7 ms on those three), and the intercept is a least-squares
+  extrapolation to N → 0 launches on ELFs that move 128 KB, so nothing measured on a shipped
+  kernel reconstructs it. Closing it needs the t1/t19/t38 family re-run with the phases timed
+  separately.
+
+  What H3's numbers do say, each at its own ABI: **not rebuilding a 15-argument run saves
+  57.5 µs per call** (devq 622 — a difference of loop p50s, of which the *timed* construction
+  is 20.2 µs; the rest is allocation and Python the timer does not enclose, and is
+  unattributed); **the submission itself, once a run exists, is 16.8 µs**; and **a submission
+  removed at the token level is worth 46.5–61.5 µs**, since it takes its syncs and lock with
+  it. Reusing a run collects the first of those without changing the dispatch vector, which is
+  what the H3 `xrt.run` cache does (**+3.7…+6.6 %** on the Qwen3-0.6B token, +4.8 % on the
+  pooled means of four before / four after profiles across two sessions).
 
 They agree to 2 %, and the additive form agreeing with the tiny-only form says the cost does
 **not depend on the neighbouring device** — it is a per-configuration constant. Each figure

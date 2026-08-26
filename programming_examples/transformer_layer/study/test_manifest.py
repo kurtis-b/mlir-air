@@ -526,6 +526,65 @@ def test_no_expected_rows_leaves_the_verdict_and_the_keys_alone():
         assert m["expected_files"][0]["observed_rows"]["total"] == 1
 
 
+
+# `[2026-08-26]` The TIMING-CONTRACT block -- queue item 19 review, finding 5.
+
+
+def test_observe_timing_stamps_this_builds_contract_and_the_cache_state():
+    import os
+
+    saved = os.environ.get("LLMS_CACHE_XRT_RUNS")
+    try:
+        os.environ.pop("LLMS_CACHE_XRT_RUNS", None)
+        block = manifest.observe_timing()
+        schema.validate_timing(block)
+        assert block["kernel_ms_contract"] == schema.KERNEL_MS_CONTRACT_NOW
+        assert block["xrt_run_cache"] == "on"          # KernelCache's default
+        assert block["timing_source"] == "probed_at_manifest_build"
+        os.environ["LLMS_CACHE_XRT_RUNS"] = "0"
+        assert manifest.observe_timing()["xrt_run_cache"] == "off"
+        os.environ["LLMS_CACHE_XRT_RUNS"] = "1"
+        assert manifest.observe_timing()["xrt_run_cache"] == "on"
+    finally:
+        if saved is None:
+            os.environ.pop("LLMS_CACHE_XRT_RUNS", None)
+        else:
+            os.environ["LLMS_CACHE_XRT_RUNS"] = saved
+
+
+def test_a_manifest_without_a_supplied_timing_block_records_unknown_with_a_reason():
+    """The toolchain block's rule: NOT assumed. Which terms a recorded
+    `kernel_ms` includes is a property of the build that MEASURED, not of the
+    build that writes the manifest."""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        (root / "coarse.csv").write_text("x")
+        payload = manifest.build_manifest(root, ["coarse.csv"])
+        block = payload[schema.TIMING_KEY]
+        assert block["kernel_ms_contract"] == schema.UNKNOWN_CONDITION
+        assert "NOT assumed" in block["timing_detail"]
+        assert schema.timing_from_manifest(payload)["timing_source"] == \
+            schema.UNKNOWN_CONDITION
+
+
+def test_a_supplied_timing_block_is_validated_and_written_under_its_key():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        (root / "coarse.csv").write_text("x")
+        good = manifest.observe_timing()
+        payload = manifest.build_manifest(root, ["coarse.csv"], timing=good)
+        assert payload[schema.TIMING_KEY]["kernel_ms_contract"] == \
+            schema.KERNEL_MS_CONTRACT_NOW
+        bad = dict(good)
+        bad.pop("xrt_run_cache")
+        try:
+            manifest.build_manifest(root, ["coarse.csv"], timing=bad)
+        except ValueError as exc:
+            assert "missing keys" in str(exc), exc
+        else:
+            raise AssertionError("a typo'd timing block must fail at build time")
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

@@ -866,26 +866,52 @@ def run_sequence(
             vector.sync_ms += (time.perf_counter() - t_sync) * 1000.0
 
         for sub_idx, sub in enumerate(subs):
-            runs = []
-            for step in sub.steps:
-                # Per step, not per submission: a submission may span artifacts
-                # under the ELF ABI, and each entry has to be a run of *its own*
-                # artifact's kernel. Taking the first step's kernel for all of
-                # them would execute the wrong program with the right buffers.
-                backend, _ = cache._loaded[step.kernel]
-                bos = [pool.bo_for(n, plan) for n in step.args]
-                run = xrt.run(backend.kernel)
-                _bind_args(
-                    xrt,
-                    run,
-                    bos,
-                    elf_abi,
-                    instr_bo=backend.bo_instr,
-                    instr_len=(
-                        len(backend.instr_v) if backend.instr_v is not None else 0
-                    ),
-                )
-                runs.append(run)
+            # `[2026-08-26]` doc 56 H3 stage 1 (item 19, devq 622): building the
+            # runs and binding their arguments costs ~47-57 us per entry, which
+            # is ~3x what removing the submission itself buys (16.8 us). A
+            # repeated sequence rebuilds identical bindings every call: the
+            # plan is memoized, the pool is keyed on `plan.signature`, and a
+            # pool's BOs are never replaced, so the bindings are constant for
+            # as long as the pool object lives. Cache keyed on the pool's
+            # identity: `evict_pools_for` / `_pools.clear()` replace the object,
+            # which misses and rebuilds rather than starting a run against BOs
+            # or a context that are gone -- and the entry's strong reference to
+            # the pool is what makes that identity check sound (a freed pool's
+            # id could otherwise be recycled).
+            #
+            # OFF BY DEFAULT, and the reason is that same strong reference: it
+            # keeps an evicted pool's BOs alive, which is exactly what
+            # `pattern/offload`'s per-dispatch pool eviction exists to prevent.
+            # See `KernelCache.cache_xrt_runs_in_sequences`.
+            run_key = ("seq", plan.signature, sub_idx)
+            runs = None
+            if getattr(cache, "cache_xrt_runs_in_sequences", False):
+                hit = cache._cached_runs.get(run_key)
+                if hit is not None and hit[0] is pool:
+                    runs = hit[1]
+            if runs is None:
+                runs = []
+                for step in sub.steps:
+                    # Per step, not per submission: a submission may span artifacts
+                    # under the ELF ABI, and each entry has to be a run of *its own*
+                    # artifact's kernel. Taking the first step's kernel for all of
+                    # them would execute the wrong program with the right buffers.
+                    backend, _ = cache._loaded[step.kernel]
+                    bos = [pool.bo_for(n, plan) for n in step.args]
+                    run = xrt.run(backend.kernel)
+                    _bind_args(
+                        xrt,
+                        run,
+                        bos,
+                        elf_abi,
+                        instr_bo=backend.bo_instr,
+                        instr_len=(
+                            len(backend.instr_v) if backend.instr_v is not None else 0
+                        ),
+                    )
+                    runs.append(run)
+                if getattr(cache, "cache_xrt_runs_in_sequences", False):
+                    cache._cached_runs[run_key] = (pool, runs)
 
             ctx_backend, _ = cache._loaded[sub.steps[0].kernel]
             elapsed = submit(xrt, ctx_backend.context, runs, sub.steps, sub_idx)

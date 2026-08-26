@@ -359,6 +359,41 @@ def test_registry_override_marks_source():
     assert c is not None and c["source"] == ANALYTICAL and c["method"] == "direct"
 
 
+
+def test_the_o2_pair_aggregation_is_a_recorded_rejected_candidate_on_every_decode_plan():
+    """`[2026-08-26]` doc 56 H3 stage 2 (queue item 19 review, finding 6). O2 was
+    BUILT and MEASURED and came in under its pre-registered threshold; the
+    canonical record of a measured-and-rejected alternative is `Plan.rejected`,
+    not the evidence directory, or a later phase re-derives it as unmeasured.
+
+    Two clauses beyond "the entry exists": it carries the MEASUREMENT (a reason
+    without the number is what "unmeasured" looks like from the outside), and it
+    does NOT move the plan hash -- `rejected` is deliberately outside the hashed
+    body (`plan()`'s `body` names spec/workload/caps/placements/stages/
+    planner_version/forced), so recording a negative can never invalidate an
+    artifact set keyed by a plan sha. That is the property this test protects.
+    """
+    for spec in (QWEN3_0_6B, LLAMA32_1B):
+        g = decoder_graph(spec)
+        dec = plan(g, Workload("decode", 1, 512))
+        hits = [r for r in dec.rejected if r[0].startswith("dispatch grouping: O2")]
+        assert len(hits) == 1, (spec.name, dec.rejected)
+        why = hits[0][1]
+        for token in ("-1.427", "-1.484", "864 MB", "devq 623", "3.44 ms"):
+            assert token in why, (spec.name, token, why)
+        # prefill has no per-layer host op splitting two device stages, so the
+        # candidate does not exist there and must not be claimed.
+        pre = plan(g, Workload("prefill", 2048, 2048, 2048))
+        assert not [r for r in pre.rejected if r[0].startswith("dispatch grouping")]
+
+    # The hash is unmoved by the record: same stages, same sha as the recorded
+    # driver-trace fixtures carry.
+    g = decoder_graph(QWEN3_0_6B)
+    assert plan(g, Workload("decode", 1, 512)).sha == (
+        "49ba58fc59e5fa5d88ce9b2a3970fa414d79fbc0c17c62fc14ba345eaf3fdae7"
+    )
+
+
 def _main():
     tests = [(n, o) for n, o in globals().items() if n.startswith("test_") and callable(o)]
     failed, skipped = [], []

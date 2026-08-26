@@ -937,6 +937,108 @@ TOOLCHAIN_FIELDNAMES: tuple[str, ...] = TOOLCHAIN_IDENTITY_FIELDNAMES + tuple(
     f.name for f in TOOLCHAIN_PROVENANCE_FIELDS
 )
 
+# ---------------------------------------------------------------------------
+# THE TIMING-CONTRACT BLOCK `[2026-08-26]` -- queue item 19 review, finding 5.
+#
+# WHAT WAS BROKEN. `device_ms` is the sum of every dispatch's `kernel_ms`
+# (`shared/model_adapter.dispatch_vector_from_trace`), and `KernelCache.
+# load_and_run` used to time the construction of the `xrt.run` and the binding
+# of its arguments INSIDE that number. Measured, that host work is 38-57 us per
+# call (item 19 stage 1, devq 622/623). So the moment the run cache could skip
+# it, `device_ms` fell by 30-50 us per call with the device doing exactly the
+# same work -- and `compare_roots` would have reported a parent root against a
+# post-commit root as a device improvement, under an unchanged schema, with the
+# deciding variable (`LLMS_CACHE_XRT_RUNS`) recorded nowhere.
+#
+# THE FIX IS IN TWO HALVES AND BOTH ARE NEEDED.
+#   1. `load_and_run` now times build/bind separately on BOTH paths, so
+#      `kernel_ms` is start+wait only and no longer moves with the cache state.
+#      That removes the phantom instead of labelling it.
+#   2. The block below records WHICH CONTRACT a root's numbers were measured
+#      under, because half 1 is itself a change of meaning: every root recorded
+#      before it has run construction inside `kernel_ms` and every root after it
+#      does not, and nothing in the files said so. `compare_roots.compare_timing`
+#      REFUSES a comparison between two roots that name different contracts --
+#      the pmode rule, for the pmode's reason: they are not two measurements of
+#      one quantity.
+#
+# WHY A SIBLING BLOCK, AGAIN. The toolchain block's three reasons hold verbatim:
+# a `results` column would bump `SCHEMA_VERSION` and take every recorded CSV out
+# of every reader; `validate_conditions` rejects unknown keys so widening
+# CONDITION_FIELDS changes the validation surface of every block item 15 shipped;
+# and this answers a third question -- not "what mode did the device run at" and
+# not "what was it built with", but "what does the recorded number MEAN". So:
+# a new declared block, **`SCHEMA_VERSION` STAYS 2**, and deliberately NOT in
+# `_FIELDS_BY_TABLE`.
+#
+# `absent` IS NOT A MATCH, for the toolchain block's reason. Every root recorded
+# before today has no such block; `timing_from_manifest` synthesises `absent`
+# and `compare_timing` FLAGS that (it cannot refuse -- refusing would make every
+# recorded root uncomparable, which is the trade `compare_conditions` already
+# reasoned through for an unknown pmode).
+# ---------------------------------------------------------------------------
+
+#: The contracts `kernel_ms` has been recorded under. Open-ended in the sense
+#: that a future change adds a NAME here rather than silently changing what the
+#: current name means -- that silent change is the defect this block exists for.
+#:
+#:   start_wait_only          -- `[2026-08-26]` and after: `kernel_ms` times
+#:                               `run.start()` + `run.wait2()` (ELF) or the
+#:                               kernel functor + `wait()` (xclbin), and the
+#:                               host-side build/bind is reported separately as
+#:                               `bind_ms`.
+#:   bind_and_start_wait      -- before that: construction and argument binding
+#:                               were inside `kernel_ms`, worth 38-57 us/call.
+KERNEL_MS_CONTRACTS: tuple[str, ...] = ("start_wait_only", "bind_and_start_wait")
+
+#: What the CURRENT code records. `manifest.observe_timing()` stamps it; a root
+#: that names anything else was measured by a different build.
+KERNEL_MS_CONTRACT_NOW = "start_wait_only"
+
+TIMING_FIELDS: tuple[Field, ...] = (
+    Field(
+        "kernel_ms_contract",
+        "What a recorded `kernel_ms` -- and therefore `device_ms`, which is its "
+        "sum -- INCLUDES. One of KERNEL_MS_CONTRACTS. `bind_and_start_wait` "
+        "roots carry 38-57 us/call of host-side `xrt.run` construction inside "
+        "the device number; `start_wait_only` roots do not. Two roots that name "
+        "different contracts are not two measurements of one quantity, and "
+        "`compare_roots` refuses them.",
+    ),
+    Field(
+        "xrt_run_cache",
+        "Whether `KernelCache` reused one `xrt.run` per (kernel, bo_key) during "
+        "this run -- `on`, `off`, or UNKNOWN_CONDITION, from "
+        "`LLMS_CACHE_XRT_RUNS`. Under `start_wait_only` it does not move "
+        "`device_ms` (that is the point of the split), but it does move the "
+        "TOKEN-level wall by ~2-3 ms on a 57-submission decode token, so a "
+        "tok/s comparison across two states is a comparison of two "
+        "configurations.",
+    ),
+)
+
+#: PROVENANCE, recorded beside the block and NOT compared -- the split, and the
+#: reasoning, of `toolchain_source`/`toolchain_detail`.
+TIMING_PROVENANCE_FIELDS: tuple[Field, ...] = (
+    Field(
+        "timing_source",
+        "One of CONDITION_SOURCES, reused rather than duplicated.",
+    ),
+    Field(
+        "timing_detail",
+        "Where the values came from, or why a field is unknown. An `unknown` "
+        "that does not say why is indistinguishable from one nobody filled.",
+    ),
+)
+
+#: The manifest key the timing-contract block lives under.
+TIMING_KEY = "timing"
+
+TIMING_IDENTITY_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in TIMING_FIELDS)
+TIMING_FIELDNAMES: tuple[str, ...] = TIMING_IDENTITY_FIELDNAMES + tuple(
+    f.name for f in TIMING_PROVENANCE_FIELDS
+)
+
 RESULTS_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in RESULTS_FIELDS)
 TUNING_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in TUNING_FIELDS)
 RESOURCE_FIELDNAMES: tuple[str, ...] = tuple(f.name for f in RESOURCE_FIELDS)
@@ -1377,6 +1479,117 @@ def toolchain_differences(left: dict, right: dict) -> list[tuple[str, str, str]]
     """
     out = []
     for name in TOOLCHAIN_IDENTITY_FIELDNAMES:
+        a = normalise_power_mode(left.get(name))
+        b = normalise_power_mode(right.get(name))
+        if UNKNOWN_CONDITION in (a, b):
+            continue
+        if a != b:
+            out.append((name, a, b))
+    return out
+
+
+
+def empty_timing() -> dict[str, object]:
+    """A complete timing-contract block that claims nothing."""
+    block: dict[str, object] = {
+        name: UNKNOWN_CONDITION for name in TIMING_IDENTITY_FIELDNAMES
+    }
+    block["timing_source"] = UNKNOWN_CONDITION
+    block["timing_detail"] = None
+    return block
+
+
+def timing_from_manifest(manifest: object) -> dict[str, object]:
+    """The timing-contract block of a manifest dict, degrading to ``absent``.
+
+    THE ONLY SUPPORTED READER, for ``toolchain_from_manifest``'s reason: no
+    manifest written before `[2026-08-26]` has this key, and every one of them
+    was measured under ``bind_and_start_wait`` without saying so. ``absent`` is
+    what a reader gets, and it is NOT a match -- see the section comment.
+    """
+    if not isinstance(manifest, dict):
+        block = None
+    else:
+        block = manifest.get(TIMING_KEY)
+
+    out = empty_timing()
+    if not isinstance(block, dict):
+        out["timing_source"] = "absent"
+        out["timing_detail"] = (
+            "this manifest has no timing block -- it was written before the "
+            "kernel_ms contract was recorded (queue item 19, finding 5). Its "
+            "kernel_ms almost certainly includes the host-side xrt.run "
+            "construction (the 'bind_and_start_wait' contract), but that is an "
+            "inference from the file's age and must not be stamped into the "
+            "data."
+        )
+        return out
+
+    for name in TIMING_FIELDNAMES:
+        if name in block:
+            out[name] = block[name]
+    for name in TIMING_IDENTITY_FIELDNAMES:
+        out[name] = normalise_power_mode(out[name])
+    out["timing_source"] = normalise_power_mode(out["timing_source"])
+    return out
+
+
+def validate_timing(block: dict[str, object]) -> None:
+    """Raise ``ValueError`` unless ``block`` is a writable timing block.
+
+    ``kernel_ms_contract`` has a CLOSED domain, unlike the toolchain's version
+    strings: a contract this module has never heard of is a contract nothing can
+    interpret, and recording it would put an uninterpretable value where a
+    comparison guard reads. Adding one is a declaration in
+    ``KERNEL_MS_CONTRACTS``.
+    """
+    expected = set(TIMING_FIELDNAMES)
+    got = set(block)
+    if missing := expected - got:
+        raise ValueError(f"timing block is missing keys: {sorted(missing)}")
+    if extra := got - expected:
+        raise ValueError(
+            f"timing block has keys not in the schema: {sorted(extra)}. Adding "
+            "a timing fact is a declaration in schema.TIMING_FIELDS, not a key "
+            "invented at the call site."
+        )
+    source = normalise_power_mode(block.get("timing_source"))
+    if source not in CONDITION_SOURCES:
+        raise ValueError(
+            f"timing_source={block.get('timing_source')!r} is not one of "
+            f"{list(CONDITION_SOURCES)}"
+        )
+    if source == "absent":
+        raise ValueError(
+            "timing_source='absent' is READER-ONLY -- it is what "
+            "timing_from_manifest synthesises for a manifest older than the "
+            "block, and writing it would claim a run predates a field it "
+            "carries. Use 'unknown' if the contract could not be determined."
+        )
+    contract = normalise_power_mode(block.get("kernel_ms_contract"))
+    if contract not in KERNEL_MS_CONTRACTS + (UNKNOWN_CONDITION,):
+        raise ValueError(
+            f"kernel_ms_contract={block.get('kernel_ms_contract')!r} is not one "
+            f"of {list(KERNEL_MS_CONTRACTS)}. A contract name that is not "
+            "declared cannot be interpreted by the guard that reads it."
+        )
+    cache = normalise_power_mode(block.get("xrt_run_cache"))
+    if cache not in ("on", "off", UNKNOWN_CONDITION):
+        raise ValueError(
+            f"xrt_run_cache={block.get('xrt_run_cache')!r} is not 'on', 'off' "
+            f"or {UNKNOWN_CONDITION!r}"
+        )
+
+
+def timing_differences(left: dict, right: dict) -> list[tuple[str, str, str]]:
+    """``(field, left, right)`` for each IDENTITY field the two disagree on.
+
+    An ``unknown`` on either side is NOT a difference -- "we do not know" is a
+    different finding from "these differ", exactly as in
+    ``toolchain_differences``, and the caller reports the two separately.
+    """
+    out = []
+    for name in TIMING_IDENTITY_FIELDNAMES:
         a = normalise_power_mode(left.get(name))
         b = normalise_power_mode(right.get(name))
         if UNKNOWN_CONDITION in (a, b):

@@ -731,7 +731,7 @@ def test_v3_keeps_every_v2_column_first_and_appends_the_model_scope_last():
     """The same additive rule as v2 over v1: the v2 header is an exact ordered
     PREFIX, and the thirteen section-3.6 columns follow in the order the doc
     lists them, last and nowhere else."""
-    assert schema.SCHEMA_VERSION == 3
+    assert schema.SCHEMA_VERSION == 3   # a BLOCK is not a version bump
     prefix = schema.RESULTS_FIELDNAMES[: len(_V2_RESULTS_FIELDNAMES)]
     assert prefix == _V2_RESULTS_FIELDNAMES
     assert schema.MODEL_SCOPE_FIELDNAMES == (
@@ -833,6 +833,66 @@ def test_v3_the_model_key_is_a_session_rung_field_and_old_ledgers_read_back():
     schema.validate_session(record)
     record["rungs"] = [{k: v for k, v in rung.items() if k != "model_key"}]
     _raises(ValueError, "does not match SESSION_RUNG_FIELDS", schema.validate_session, record)
+
+
+
+# `[2026-08-26]` The TIMING-CONTRACT block -- queue item 19 review, finding 5.
+
+
+def test_the_timing_block_is_declared_and_is_not_a_csv_table():
+    """A block, not a column: the toolchain block's three reasons hold, and the
+    decisive one is that a `results` column bumps SCHEMA_VERSION (3 today) and takes
+    recorded CSV out of every reader."""
+    assert schema.SCHEMA_VERSION == 3   # a BLOCK is not a version bump
+    assert schema.TIMING_KEY == "timing"
+    assert schema.TIMING_IDENTITY_FIELDNAMES == ("kernel_ms_contract", "xrt_run_cache")
+    assert schema.TIMING_FIELDNAMES[-2:] == ("timing_source", "timing_detail")
+    assert "kernel_ms_contract" not in schema.RESULTS_FIELDNAMES
+    _raises(ValueError, "unknown table", schema.fields_for, "timing")
+
+
+def test_the_current_contract_is_declared_not_free_text():
+    """The guard reads this value; an undeclared contract name is one nothing
+    can interpret, so the domain is CLOSED (unlike a wheel version)."""
+    assert schema.KERNEL_MS_CONTRACT_NOW in schema.KERNEL_MS_CONTRACTS
+    block = schema.empty_timing()
+    block["kernel_ms_contract"] = "start_and_pray"
+    block["timing_source"] = "probed_at_manifest_build"
+    _raises(ValueError, "is not one of", schema.validate_timing, block)
+
+
+def test_validate_timing_rejects_an_invented_key_and_a_written_absent():
+    block = schema.empty_timing()
+    block["timing_source"] = "probed_at_manifest_build"
+    block["kernel_ms_contract"] = schema.KERNEL_MS_CONTRACT_NOW
+    block["xrt_run_cache"] = "on"
+    schema.validate_timing(block)
+    bad = dict(block, kernel_ms_contract_v2="x")
+    _raises(ValueError, "not in the schema", schema.validate_timing, bad)
+    _raises(ValueError, "missing keys", schema.validate_timing,
+            {k: v for k, v in block.items() if k != "xrt_run_cache"})
+    _raises(ValueError, "READER-ONLY", schema.validate_timing,
+            dict(block, timing_source="absent"))
+    _raises(ValueError, "is not 'on', 'off'", schema.validate_timing,
+            dict(block, xrt_run_cache="maybe"))
+
+
+def test_a_manifest_without_the_block_reads_as_absent_and_says_why():
+    out = schema.timing_from_manifest({"conditions": {}})
+    assert out["timing_source"] == "absent"
+    assert "before the kernel_ms contract was recorded" in out["timing_detail"]
+    assert out["kernel_ms_contract"] == schema.UNKNOWN_CONDITION
+    assert schema.timing_from_manifest(None)["timing_source"] == "absent"
+
+
+def test_timing_differences_reports_only_real_disagreements():
+    a = {"kernel_ms_contract": "start_wait_only", "xrt_run_cache": "on"}
+    b = {"kernel_ms_contract": "bind_and_start_wait", "xrt_run_cache": "on"}
+    assert schema.timing_differences(a, b) == [
+        ("kernel_ms_contract", "start_wait_only", "bind_and_start_wait")
+    ]
+    unknown = {"kernel_ms_contract": schema.UNKNOWN_CONDITION, "xrt_run_cache": "on"}
+    assert schema.timing_differences(a, unknown) == []
 
 
 def main():

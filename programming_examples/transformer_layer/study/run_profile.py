@@ -396,6 +396,7 @@ def gate(
     repo=None,
     conditions=None,
     toolchain=None,
+    timing=None,
     walk=None,
 ) -> dict:
     """Run the gate over an existing tree and write its manifest. No device.
@@ -436,6 +437,7 @@ def gate(
         conditions=conditions,
         toolchain=toolchain,
         walk=walk,
+        timing=timing,
     )
     # The cross-mode clause, for a profile that walks all four modes: doc 08e's
     # distinguishability criterion over the recorded dispatch vectors, at every
@@ -527,6 +529,12 @@ def run(
     ledger = resume_mod.Ledger.load(out_dir)
     conditions = manifest.observe_conditions(npu_power_mode)
     toolchain = manifest.observe_toolchain()
+    # `[2026-08-26]` item 19 review, finding 5: what a recorded
+    # `kernel_ms` INCLUDES. Stamped beside the toolchain because it is
+    # the same class of fact -- a property of the build that measured --
+    # and `compare_roots.compare_timing` REFUSES two roots that name
+    # different contracts.
+    timing = manifest.observe_timing()
 
     plan = resume_mod.plan(profile, prior, enabled=resume)
     if resume:
@@ -602,6 +610,7 @@ def run(
         conditions=conditions,
         toolchain=toolchain,
         walk=walk_block,
+        timing=timing,
     )
 
     by_status: dict[str, int] = {}

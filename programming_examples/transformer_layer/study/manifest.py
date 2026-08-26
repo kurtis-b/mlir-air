@@ -376,6 +376,39 @@ def observe_toolchain() -> dict:
     return block
 
 
+def observe_timing() -> dict:
+    """What a `kernel_ms` recorded by THIS build means, plus the run-cache state.
+
+    Unlike `observe_toolchain`, one of these is not probed but READ OFF THE
+    CODE: `schema.KERNEL_MS_CONTRACT_NOW` is what `KernelCache.load_and_run`
+    times, and a manifest written by this tree describes this tree. The other,
+    `xrt_run_cache`, is an environment variable the measuring process read at
+    KernelCache construction, so it is probed from the environment here -- with
+    the caveat, recorded in the detail, that a run which constructed its cache
+    under a different environment is not described by this stamp. Never raises.
+    """
+    import os
+
+    block = schema.empty_timing()
+    block["kernel_ms_contract"] = schema.KERNEL_MS_CONTRACT_NOW
+    raw = os.environ.get("LLMS_CACHE_XRT_RUNS")
+    if raw is None:
+        block["xrt_run_cache"] = "on"          # KernelCache's default
+        how = "LLMS_CACHE_XRT_RUNS unset, so KernelCache's default (on)"
+    else:
+        block["xrt_run_cache"] = "off" if raw in ("", "0") else "on"
+        how = f"LLMS_CACHE_XRT_RUNS={raw!r}"
+    block["timing_source"] = "probed_at_manifest_build"
+    block["timing_detail"] = (
+        f"kernel_ms_contract read from schema.KERNEL_MS_CONTRACT_NOW (the "
+        f"contract THIS build's KernelCache.load_and_run implements); "
+        f"xrt_run_cache from {how}, read at manifest build -- a measuring "
+        f"process that constructed its KernelCache under a different "
+        f"environment is not described by this stamp."
+    )
+    return block
+
+
 def _file_record(root: Path, rel: str) -> dict:
     path = root / rel
     exists = path.is_file()
@@ -474,6 +507,7 @@ def build_manifest(
     expected_rows: dict | None = None,
     toolchain=None,
     walk=None,
+    timing=None,
 ) -> dict:
     """Describe ``results_root``; ``complete`` means every expected CSV measured.
 
@@ -525,6 +559,20 @@ def build_manifest(
             "probes by default."
         )
     schema.validate_toolchain(toolchain)
+    # `[2026-08-26]` item 19 review, finding 5: what a recorded `kernel_ms`
+    # MEANS. Same shape and the same default-refusal as the toolchain block --
+    # omitting it records `unknown` with a reason rather than assuming this
+    # build's contract for a manifest somebody else's build may be describing.
+    if timing is None:
+        timing = schema.empty_timing()
+        timing["timing_detail"] = (
+            "no timing contract was supplied to build_manifest. It is NOT "
+            "assumed: which terms a recorded kernel_ms includes is a property "
+            "of the build that measured, not of the build that writes the "
+            "manifest. Pass manifest.observe_timing(), or run this module's "
+            "CLI, which probes by default."
+        )
+    schema.validate_timing(timing)
 
     walk_checked = walk is not None
     if walk is None:
@@ -583,6 +631,12 @@ def build_manifest(
         # diffed -- before this, that loop iterated `{}` on both sides and the
         # toolchain half of every comparison compared nothing (queue item 16).
         schema.TOOLCHAIN_KEY: toolchain,
+        # What the recorded numbers MEAN -- not the device's condition and not
+        # the build's identity, but the definition of `kernel_ms` (and so of
+        # `device_ms`, its sum). `compare_roots.compare_timing` REFUSES two
+        # roots that name different contracts. NOT part of `complete`, for the
+        # conditions block's reason.
+        schema.TIMING_KEY: timing,
         # Which session walked which rung. NOT part of the conditions block: a
         # pmode is one value for a run, while this is a value PER ROW, and the
         # whole reason it exists is that a resumed run has more than one.
@@ -637,6 +691,7 @@ def main(argv: list[str] | None = None) -> int:
 
     conditions = None
     toolchain = None
+    timing = None
     if not args.no_probe or args.npu_power_mode is not None:
         conditions = observe_conditions(args.npu_power_mode)
     if not args.no_probe:
@@ -644,9 +699,11 @@ def main(argv: list[str] | None = None) -> int:
         # a toolchain is observable at measurement time and not at manifest
         # build, so an override would only be a way to write a claim by hand.
         toolchain = observe_toolchain()
+        timing = observe_timing()
 
     manifest = build_manifest(
-        args.results_root, args.expect, conditions=conditions, toolchain=toolchain
+        args.results_root, args.expect, conditions=conditions, toolchain=toolchain,
+        timing=timing,
     )
     write_manifest(args.output, manifest)
 
@@ -676,6 +733,17 @@ def main(argv: list[str] | None = None) -> int:
         for name in schema.TOOLCHAIN_IDENTITY_FIELDNAMES
     ):
         print(f"[manifest]   {tools['toolchain_detail']}")
+    tm = manifest[schema.TIMING_KEY]
+    print(
+        "[manifest] timing: "
+        + " ".join(f"{name}={tm[name]}" for name in schema.TIMING_IDENTITY_FIELDNAMES)
+        + f" ({tm['timing_source']})"
+    )
+    if tm["kernel_ms_contract"] == schema.UNKNOWN_CONDITION:
+        # Loud for `compare_conditions`' reason: a root whose `device_ms` has no
+        # stated definition cannot be compared against one that has, and the
+        # guard that says so reads THIS field.
+        print(f"[manifest]   {tm['timing_detail']}")
     for reason in manifest["incomplete_reasons"]:
         print(f"[manifest]   {reason}")
     return 0 if manifest["complete"] else 1

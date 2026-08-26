@@ -552,7 +552,7 @@ def run_verify(model_id: str, M: int, gate: dict, *, compiled: dict, out_dir: Pa
 # ---------------------------------------------------------------------------
 
 
-def gate(profile, out_dir: str | Path, repo=None, conditions=None, toolchain=None, walk=None) -> dict:
+def gate(profile, out_dir: str | Path, repo=None, conditions=None, toolchain=None, walk=None, timing=None) -> dict:
     """Smoke gate + manifest over an existing tree; no device. `run_profile.gate`'s
     shape without the four-mode distinguishability clause (a model walk has
     one execution mode and nothing to distinguish)."""
@@ -563,7 +563,7 @@ def gate(profile, out_dir: str | Path, repo=None, conditions=None, toolchain=Non
     for line in problems:
         print(f"[smoke-gate] {line}")
     print(f"[smoke-gate] {'FAIL' if problems else 'PASS'} ({len(expected)} CSV(s))")
-    built = manifest.build_manifest(out_dir, expected, repo=repo, expected_rows=expected_rows, conditions=conditions, toolchain=toolchain, walk=walk)
+    built = manifest.build_manifest(out_dir, expected, repo=repo, expected_rows=expected_rows, conditions=conditions, toolchain=toolchain, walk=walk, timing=timing)
     built["distinguish"] = {"gated_lengths": 0, "lines": ["not applicable: a model walk has one execution mode"]}
     manifest.write_manifest(out_dir / MANIFEST_NAME, built)
     print(f"[manifest] wrote {out_dir / MANIFEST_NAME}")
@@ -589,6 +589,12 @@ def run(profile, out_dir, *, study_id: str, worker_fn=None, verifier=None, repo=
     ledger = resume_mod.Ledger.load(out_dir)
     conditions = manifest.observe_conditions(npu_power_mode)
     toolchain = manifest.observe_toolchain()
+    # `[2026-08-26]` item 19 review, finding 5: what a recorded
+    # `kernel_ms` INCLUDES. Stamped beside the toolchain because it is
+    # the same class of fact -- a property of the build that measured --
+    # and `compare_roots.compare_timing` REFUSES two roots that name
+    # different contracts.
+    timing = manifest.observe_timing()
     plan = resume_mod.plan(profile, prior, enabled=resume)
     for line in resume_mod.describe(plan):
         print(f"[run-model] {line}")
@@ -661,7 +667,7 @@ def run(profile, out_dir, *, study_id: str, worker_fn=None, verifier=None, repo=
         print(f"[run-model] RESUME DEFECT {line}")
     after = resume_mod.scan(out_dir, expected_files)
     walk_block = resume_mod.walk_block(ledger, after, profile=profile, fidelity=fidelity)
-    built = gate(profile, out_dir, repo=repo, conditions=conditions, toolchain=toolchain, walk=walk_block)
+    built = gate(profile, out_dir, repo=repo, conditions=conditions, toolchain=toolchain, walk=walk_block, timing=timing)
     conditions_after = manifest.observe_conditions() if not dry_run else conditions
 
     by_status: dict[str, int] = {}

@@ -663,9 +663,48 @@ def _tc(**overrides):
     return dict(_TOOLCHAIN_A, **overrides)
 
 
-def _tool_manifest(toolchain, mode="turbo"):
-    """A manifest with a matched pmode, so only the toolchain axis varies."""
+#: A writable timing block naming the CURRENT contract. `[2026-08-26]`, item 19
+#: review finding 5 -- see `compare_roots.compare_timing`.
+_TIMING_A = {
+    "kernel_ms_contract": schema.KERNEL_MS_CONTRACT_NOW,
+    "xrt_run_cache": "on",
+    "timing_source": "probed_at_manifest_build",
+    "timing_detail": "fixture",
+}
+
+
+def _tm(**overrides):
+    return dict(_TIMING_A, **overrides)
+
+
+def _timing_manifest(timing, mode="turbo"):
+    """A manifest with a matched pmode and toolchain, so only the timing
+    contract varies."""
     payload = _manifest(mode)
+    payload["toolchain"] = _tc()
+    if timing is None:
+        payload.pop(schema.TIMING_KEY, None)  # a manifest predating the block
+    else:
+        payload[schema.TIMING_KEY] = timing
+    return payload
+
+
+def _timing_roots(left, right, *, drift=0.0):
+    return _roots(
+        [_row(latency=100.0)],
+        [_row(latency=100.0 * (1 + drift / 100.0))],
+        manifests=(_timing_manifest(left), _timing_manifest(right)),
+    )
+
+
+def _tool_manifest(toolchain, mode="turbo"):
+    """A manifest with a matched pmode AND a matched timing contract, so only
+    the toolchain axis varies. `[2026-08-26]` the timing block is part of the
+    fixture for the same reason the pmode is: `compare_timing` warns when a root
+    does not say what its `kernel_ms` includes, and a toolchain test that
+    inherited that warning would be asserting two axes at once."""
+    payload = _manifest(mode)
+    payload[schema.TIMING_KEY] = _tm()
     if toolchain is None:
         payload.pop("toolchain", None)  # a manifest predating the block
     else:
@@ -849,6 +888,100 @@ def test_every_toolchain_identity_field_is_reported_and_compared():
             text = compare_roots.compare_roots(a, b, ["coarse.csv"]).render()
         assert f"  {name}: baseline=" in text, (name, text)
         assert f"different {name}" in text, (name, text)
+
+
+
+# ---------------------------------------------------------------------------
+# `[2026-08-26]` The TIMING-CONTRACT guard -- queue item 19 review, finding 5.
+# `device_ms` is the sum of `kernel_ms`, and until this block existed
+# `load_and_run` timed the host-side xrt.run construction inside it (38-57 us
+# per call, measured). A build that skipped that work moved `device_ms` by
+# 30-50 us/call with the device unchanged, and compare_roots called the two
+# roots the same metric. These pin the guard's three outcomes and the split
+# between the field that REFUSES and the field that only warns.
+# ---------------------------------------------------------------------------
+
+
+def test_two_roots_under_different_kernel_ms_contracts_are_refused():
+    """The core of finding 5: not two measurements of one quantity."""
+    tmp, a, b = _timing_roots(
+        _tm(kernel_ms_contract="bind_and_start_wait"),
+        _tm(kernel_ms_contract="start_wait_only"),
+    )
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    text = report.render()
+    assert "COMPARISON REFUSED" in text, text
+    assert "bind_and_start_wait" in text and "start_wait_only" in text, text
+    assert report.refusals, text
+
+
+def test_a_refused_contract_withdraws_gating_but_keeps_the_unit_free_half():
+    """A refusal must not silently pass a real latency regression as OK, and it
+    must not throw away the comparisons that do not depend on the unit."""
+    tmp, a, b = _timing_roots(
+        _tm(kernel_ms_contract="bind_and_start_wait"),
+        _tm(kernel_ms_contract="start_wait_only"),
+        drift=400.0,
+    )
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    text = report.render()
+    assert "[SPLICED]" in text, text
+    assert "=== timing contract" in text, text
+
+
+def test_matching_contracts_say_so_and_add_no_warning():
+    tmp, a, b = _timing_roots(_tm(), _tm())
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    text = report.render()
+    assert "means the same thing on both sides" in text, text
+    assert report.warnings == 0, text
+    assert not report.refusals, text
+
+
+def test_a_manifest_predating_the_timing_block_flags_and_keeps_gating():
+    """Every root recorded before 2026-08-26. It must not crash, must not read
+    as agreement, and must not refuse -- refusing would make the whole recorded
+    corpus uncomparable, which is `compare_conditions`' own argument."""
+    tmp, a, b = _timing_roots(None, None, drift=400.0)
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    text = report.render()
+    assert text.count("does not record which terms its `kernel_ms` includes") == 2, text
+    assert "must not be stamped after the fact" in text, text
+    assert "means the same thing on both sides" not in text, text
+    assert not report.refusals, text
+    # still gating: a real regression at an unknown contract must still fail
+    assert "[SPLICED]" not in text, text
+    assert report.failures > 0, text
+
+
+def test_a_run_cache_difference_warns_but_does_not_refuse():
+    """Under `start_wait_only` the cache cannot move `device_ms` -- that is what
+    the split bought -- but it moves the token wall, so it is a warning that
+    names which numbers it touches, not a refusal."""
+    tmp, a, b = _timing_roots(_tm(xrt_run_cache="off"), _tm(xrt_run_cache="on"))
+    with tmp:
+        report = compare_roots.compare_roots(a, b, ["coarse.csv"])
+    text = report.render()
+    assert "different `xrt_run_cache` states" in text, text
+    assert "does NOT move `device_ms`" in text, text
+    assert not report.refusals, text
+    assert report.warnings >= 1, text
+
+
+def test_there_is_no_way_to_defeat_the_timing_guard():
+    """The pmode guard's rule, transferred: nothing added for a guard may become
+    its bypass. No flag, no environment variable, no argument."""
+    import inspect
+
+    src = inspect.getsource(compare_roots)
+    for bypass in ("--allow-contract-splice", "--ignore-timing", "--any-contract"):
+        assert bypass not in src, bypass
+    sig = inspect.signature(compare_roots.compare_timing)
+    assert list(sig.parameters) == ["report", "baseline", "candidate"], sig
 
 
 def main():

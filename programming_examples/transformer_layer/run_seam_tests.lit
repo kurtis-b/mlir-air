@@ -31,8 +31,20 @@
 // 583 unbound-scratch class and its inverse), the stale-manifest clause with
 // the manifest-only fallback, and by source that the check precedes
 // ensure_loaded and that compile time records n_args.
+// `[2026-08-26]` 40 -> 42, queue item 19 (doc 56 H3 stages 1-2): the `xrt.run`
+// cache. Building a run and binding its arguments costs 57.5 us per call
+// (devq 622) against 16.8 us for the submission a runlist removes, so a
+// 57-submission decode token pays ~3.3 ms for bindings that never change; the
+// cache is worth -2.2 ms/token measured (devq 623) and +4.1 % tok/s end to end
+// (devq 624). The two tests pin where reuse is legal and where it is REFUSED:
+// ON in `load_and_run`, one run per (kernel, bo_key) while that bo_key's BO
+// list stands, discarded by `xrt.kernel` identity when a context is evicted
+// and reloaded; OFF by default in `run_sequence`, because a sequence's runs
+// can only be keyed on the pool object and the entry would then keep an
+// evicted pool's BOs alive -- defeating exactly the per-dispatch pool eviction
+// `pattern/offload` is defined by. Driven against a fake pyxrt, no device.
 // RUN: python3 %S/../llms/shared/infra/test_dispatch.py | FileCheck %s --check-prefix=DISPATCH
-// DISPATCH: 40/40 passed
+// DISPATCH: 42/42 passed
 //
 // `[2026-08-21]` Doc 56 H0: the analytical planner's host gates -- the two golden
 // graphs pinned, each model's plan reproducing its shipped ELF sequence / launch
@@ -50,8 +62,15 @@
 // 3 / lm_head_gemv 8 -- 33 submissions, 152 launches, 34 host ops per token)
 // with the quant contract named per int4 GEMV, hashes apart from bf16, keeps
 // prefill bf16 (dequantized weights), and refuses a qk-norm model until H2b.
+// `[2026-08-26]` 13 -> 14, queue item 19 review (finding 6): the O2 pair
+// aggregation is a RECORDED rejected candidate on every decode plan, carrying
+// its measurement (-1.427/-1.484 ms/token, devq 623/624, ~864 MB of doubled
+// weights) -- and recording it does NOT move the plan hash, because `rejected`
+// is outside `plan()`'s hashed body. That second clause is the property worth
+// pinning: a measured negative can never invalidate an artifact set keyed by a
+// plan sha.
 // RUN: python3 %S/../llms/shared/plan/test_plan.py | FileCheck %s --check-prefix=PLAN
-// PLAN: 13/13 passed
+// PLAN: 14/14 passed
 //
 // `[2026-08-23]` Doc 57 O1 second half: the Qwen3 QKV stage's two host ABIs --
 // the driver's argument helper follows QWEN3_RMS_QKV_LAUNCHES, the 2-launch

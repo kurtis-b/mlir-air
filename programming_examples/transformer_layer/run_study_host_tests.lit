@@ -620,5 +620,23 @@
 // evidence into test_w4_decode_pack.py -- parameter-neutrality (default ==
 // explicit q_dim=emb_dim) plus the reviewed control's golden sha, pinned the way
 // test_plan pins its goldens.
+// `[2026-08-26]` 691 -> 705, queue item 19's review round (devq 626, blocking
+// finding 5): `device_ms` is the sum of `kernel_ms`, and `load_and_run` timed
+// the host-side `xrt.run` construction INSIDE it -- 38-57 us/call -- so an
+// environment variable moved a device number with the device doing identical
+// work, under an unchanged schema, with the deciding variable recorded nowhere.
+// Both halves of the repair are pinned here. test_schema +5 (the TIMING block is
+// declared and is NOT a CSV table, so no SCHEMA_VERSION bump; the contract
+// domain is CLOSED because a guard reads it; validate rejects an invented key, a
+// missing key, a written reader-only `absent` and a bad cache state; a manifest
+// without the block reads `absent` WITH its reason; differences ignore unknown).
+// test_manifest +3 (observe_timing stamps this build's contract and reads the
+// cache state from the environment; an unsupplied block records `unknown` with a
+// reason rather than assuming; a typo'd block fails at build time).
+// test_compare_roots +6 (two contracts REFUSE -- the pmode rule for the pmode's
+// reason -- a refusal withdraws gating and keeps the unit-free half, matching
+// contracts say so and add no warning, a pre-block manifest FLAGS on both sides
+// and keeps gating, a differing run-cache state warns naming which numbers it
+// touches, and there is no bypass flag).
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 691/691 passed in 32 modules
+// CHECK: study host tests: 705/705 passed in 32 modules

@@ -755,6 +755,269 @@ def test_the_dispatch_chokepoint_runs_before_any_device_work():
     assert '"n_args"' in sm
 
 
+# ---------------------------------------------------------------------------
+# `[2026-08-26]` Doc 56 H3 stage 1/2 (queue item 19): the `xrt.run` cache.
+# Building a run and binding its arguments was measured at 57.5 us per call
+# (devq 622: 28 x o_gemv_ffn over one set of BOs, 1.5132 -> 1.4557 ms/call),
+# against 16.8 us for the submission a runlist removes -- so a 57-submission
+# decode token spends ~3.3 ms re-binding runs it could build once, and
+# -2.205 ms/token of it is recovered on the whole token (devq 623). Reuse is
+# only legal while the bindings stay valid, which is what these pin: a bo_key's
+# BO list is allocated once and never replaced, so the run is reused per
+# (kernel, bo_key); a context that was evicted and reloaded has a NEW
+# xrt.kernel and the run bound to the dead one must be discarded, not started;
+# and in `run_sequence` the runs belong to the POOL, so evicting the pool
+# rebuilds them. Driven against a fake `pyxrt` -- no device.
+# ---------------------------------------------------------------------------
+
+
+class _FakeXrtBo:
+    def __init__(self, nbytes):
+        self._buf = bytearray(int(nbytes))
+
+    def map(self):
+        return memoryview(self._buf)
+
+    def sync(self, direction):
+        pass
+
+    def size(self):
+        return len(self._buf)
+
+
+class _FakeXrtRuntime:
+    """A `pyxrt` stand-in that counts the run objects the code under test builds."""
+
+    def __init__(self):
+        self.runs_created = 0
+        rt = self
+
+        class _Run:
+            def __init__(self, kernel):
+                rt.runs_created += 1
+                self.kernel = kernel
+                self.bound = {}
+
+            def set_arg(self, i, bo):
+                self.bound[i] = bo
+
+            def start(self):
+                pass
+
+            def wait2(self):
+                pass
+
+            def state(self):
+                return "COMPLETED"
+
+        class _Runlist:
+            def __init__(self, context):
+                self.context = context
+                self.entries = []
+
+            def add(self, run):
+                self.entries.append(run)
+
+            def execute(self):
+                pass
+
+            def wait(self):
+                pass
+
+        class _Ext:
+            @staticmethod
+            def bo(device, nbytes):
+                return _FakeXrtBo(nbytes)
+
+        class _Dir:
+            XCL_BO_SYNC_BO_TO_DEVICE = "to"
+            XCL_BO_SYNC_BO_FROM_DEVICE = "from"
+
+        class _State:
+            ERT_CMD_STATE_COMPLETED = "COMPLETED"
+
+        self.run = _Run
+        self.runlist = _Runlist
+        self.ext = _Ext
+        self.xclBOSyncDirection = _Dir
+        self.ert_cmd_state = _State
+
+
+class _FakeXrtBackend:
+    """What `load_and_run` / `run_sequence` read off an `XRTBackend`."""
+
+    _n = 0
+
+    def __init__(self, **kwargs):
+        self.bo_instr = None
+        self.instr_v = None
+        self.loaded_binary = None
+        self.device = "device0"
+
+    def load(self, artifact):
+        self.loaded_binary = artifact.output_binary
+        # A fresh kernel OBJECT per load: that identity is what the run cache
+        # checks, and reusing one across loads would make the check vacuous.
+        _FakeXrtBackend._n += 1
+        self.kernel = f"kernel#{_FakeXrtBackend._n}"
+        self.context = f"context#{_FakeXrtBackend._n}"
+        return "invoker"
+
+    def attach_kernel(self, artifact):
+        return self
+
+    def unload(self):
+        pass
+
+
+@contextmanager
+def _fake_xrt_runtime():
+    """`filelock`, `air.backend.xrt` and `pyxrt` stand-ins, restored on exit."""
+    import types
+
+    names = ("filelock", "air", "air.backend", "air.backend.xrt", "pyxrt")
+    saved = {name: sys.modules.get(name) for name in names}
+
+    class _FakeFileLock:
+        def __init__(self, path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    filelock = types.ModuleType("filelock")
+    filelock.FileLock = _FakeFileLock
+    air = types.ModuleType("air")
+    air_backend = types.ModuleType("air.backend")
+    air_xrt = types.ModuleType("air.backend.xrt")
+    air_xrt.XRTBackend = _FakeXrtBackend
+    air.backend = air_backend
+    air_backend.xrt = air_xrt
+    rt = _FakeXrtRuntime()
+    pyxrt = types.ModuleType("pyxrt")
+    for attr in ("run", "runlist", "ext", "xclBOSyncDirection", "ert_cmd_state"):
+        setattr(pyxrt, attr, getattr(rt, attr))
+    sys.modules.update(
+        {
+            "filelock": filelock,
+            "air": air,
+            "air.backend": air_backend,
+            "air.backend.xrt": air_xrt,
+            "pyxrt": pyxrt,
+        }
+    )
+    try:
+        yield rt
+    finally:
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+def test_the_xrt_run_cache_reuses_one_run_per_bo_key_and_dies_with_its_context():
+    """`load_and_run`: OFF builds a run per call (today's 57 per decode token);
+    ON builds one per (kernel, bo_key) and reuses it; a different bo_key is a
+    different BO set and gets its own; and a context evicted and reloaded
+    invalidates the cached run by kernel identity rather than starting a run
+    bound to a dead context."""
+    import tempfile
+
+    import numpy as np
+
+    with tempfile.TemporaryDirectory() as d, _fake_xrt_runtime() as rt:
+        p = _mk_elf(["0", "1", "2"], f"{d}/k.elf")
+        cache = KernelCache(cache_dir=d)
+        cache.artifacts = {"k": _FakeArtifact(p)}
+        args = tuple(np.zeros(4, dtype=np.uint8) for _ in range(3))
+        call = lambda key: cache.load_and_run(
+            "k", {}, *args, output_indices=[2], static_input_indices={0},
+            intermediate_indices={2}, bo_key=key)
+
+        cache.cache_xrt_runs = False
+        for _ in range(3):
+            call("L0")
+        assert rt.runs_created == 3, rt.runs_created
+
+        cache.cache_xrt_runs = True
+        base = rt.runs_created
+        for _ in range(5):
+            call("L0")
+        assert rt.runs_created == base + 1, rt.runs_created
+        call("L1")
+        assert rt.runs_created == base + 2
+
+        # What `pattern/offload._evict_context` does: the kernel object changes.
+        stale = cache._cached_runs[("k", "L0")][1]
+        cache._loaded.pop("k")[0].unload()
+        cache.ensure_loaded("k", {})
+        call("L0")
+        assert rt.runs_created == base + 3
+        assert cache._cached_runs[("k", "L0")][1] is not stale
+
+
+def test_run_sequence_deliberately_rebuilds_its_runs_every_call():
+    """`run_sequence` pays the ~47 us of re-binding per entry (devq 622) on
+    EVERY call on purpose, and this pins the reason so a later aggregation item
+    does not "obviously" turn it on without the second half.
+
+    A cached run must be keyed on something that dies when its BOs die, and the
+    only such thing is the POOL object -- so the entry holds a strong reference
+    to the pool. `pattern/offload._evict_context` clears `cache._pools` before
+    EVERY dispatch precisely so a dispatch's buffers do not outlive it
+    ("nothing may stay device resident between GEMMs" is that mode's
+    definition), and `pattern/runlist` evicts per artifact. A run cache would
+    keep one evicted pool -- and its BOs -- alive per plan signature, turning
+    those evictions into no-ops for memory in the two modes whose subject is
+    residency. Landing it needs an eviction-aware clear on both paths, which
+    belongs with the aggregation that would use it (doc 56 H3 stage 3), not
+    with stage 2. `LLMS_CACHE_XRT_RUNS_SEQ=1` opts in for a probe.
+
+    `load_and_run` has no such problem: `_cached_bos` is never cleared by any
+    eviction path, so a run kept beside it retains nothing new -- which is why
+    the cache is ON there and OFF here.
+    """
+    import tempfile
+
+    import numpy as np
+
+    with tempfile.TemporaryDirectory() as d, _fake_xrt_runtime() as rt:
+        p = _mk_elf(["0", "1", "2"], f"{d}/k.elf")
+        cache = KernelCache(cache_dir=d)
+        cache.artifacts = {"k": _FakeArtifact(p)}
+        cache.launch_counts = {"k": {"air_launches": 1, "herd_launches": 1}}
+        steps = [DispatchStep("k", ("w", "x", "y"), writes=(2,))]
+        specs = {
+            "w": BufferSpec("w", 4, static=True, content_key="sha256:aa"),
+            "x": BufferSpec("x", 4),
+            "y": BufferSpec("y", 4, host_output=True),
+        }
+        arrays = {n: np.zeros(4, dtype=np.uint8) for n in ("w", "x", "y")}
+
+        # The load_and_run cache is ON by default and must NOT leak into here.
+        assert cache.cache_xrt_runs is True
+        assert cache.cache_xrt_runs_in_sequences is False
+        for _ in range(3):
+            _, vec = cache.run_sequence(steps, specs, {}, arrays)
+        assert rt.runs_created == 3, rt.runs_created
+        assert (vec.host_submissions, vec.runlist_entries) == (1, 1)
+
+        # Opted in, the runs are reused per (plan signature, submission) while
+        # the pool object lives, and rebuilt when it is evicted.
+        cache.cache_xrt_runs_in_sequences = True
+        base = rt.runs_created
+        for _ in range(4):
+            cache.run_sequence(steps, specs, {}, arrays)
+        assert rt.runs_created == base + 1, rt.runs_created
+        cache.evict_pools_for({"k"})
+        cache.run_sequence(steps, specs, {}, arrays)
+        assert rt.runs_created == base + 2
+
+
 def _main():
     tests = [
         (n, o) for n, o in globals().items() if n.startswith("test_") and callable(o)

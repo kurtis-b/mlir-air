@@ -857,3 +857,104 @@ per-chunk fixed cost vs llama's 2048 — not separately measured). O4's conclusi
 a faster int4 GEMV is now worth up to ~12.8 ms/token on this model's own decode. bf16 stays
 the default and the standing-numbers table is unchanged; the operator flips
 `QWEN3_W4_DECODE` (or runs the `w4-decode-qwen` profile) to take the 14.9 tok/s path.
+
+**`[2026-08-26]` H3 stages 1–2 landed, 3–5 scoped** (queue item 19; evidence
+`results/item19-h3-20260826/`, local: `STAGES-3-5-SCOPE.md`, per-stage predictions, devq logs
+622–630; **review round devq 626, six blocking findings + one non-blocking, all fixed — the
+corrections are folded into this block and named where they land**). The phase's headline is
+a **corrected constant**, not a saving.
+
+**The ladder was priced against a number nobody had decomposed — and it still is not
+decomposed.** Doc 57 §1.5's **146 µs** per-`xrt.run` intercept was fitted over whole
+`load_and_run` calls on **3-argument** tiny ELFs. Stage 1 measured a run-build term of 57.5 µs
+on a **15-argument** ELF and this block first called the pair a "split"; **that claim is
+withdrawn** (review finding 1). Measured at a stated ABI instead — `bind_ms` timed as its own
+phase on the three shipped decode ELFs at 5 / 15 / 21 arguments (devq 628, reproduced 630) —
+building and binding a run costs **10.2 / 20.2 / 36.5 µs**, i.e. **1.58 µs/argument + 0.6 µs**
+(R² 0.92), so at the intercept's own 3-argument ABI it is **~5 µs, about 4 % of the 146**. The
+other ~141 µs is **not decomposed by this item** and doc 57 §1.4 now says so.
+
+What the numbers do support, each at its own ABI: not rebuilding a 15-argument run saves
+**57.5 µs per call** (devq 622; the *timed* construction is 20.2 µs of that and the rest is
+unattributed), the submission itself is **16.8 µs**, and a submission removed at the token
+level is worth **46.5–61.5 µs** (devq 623 / 624 — two p50s of the same interleaved experiment
+twelve minutes apart). Taking the **largest supported** estimate, as an upper bound must
+(review finding 2), *every* submission the whole ladder could remove is worth
+**56 × 61.5 µs = 3.44 ms/token** (2.60 ms at the smaller estimate) — against the same token's
+**150 `air.launch` boundaries × 107 µs = 16.1 ms**. H3's entire budget is **under a quarter**
+of O1/O3's, and that is the number the remaining stages are priced against.
+
+**Stage 1 — the mechanism exists and is already production** (devq 622, PASS). "One ELF loaded
+once, BOs re-pointed per layer" is what the drivers already do (`context_loads 1` over 112
+dispatches of one artifact). 28 entries of the shipped `o_gemv_ffn.elf` in **one runlist** are
+byte-identical to 28 separate submissions, stable over 8 back-to-back repeats and after ~80×28
+timed dispatches, and a new input set moves every layer — so **stages 3/4's mechanism is
+correct**, and the LOAD_PDI parity risk does not fire (all three shipped decode ELFs carry an
+even device-PDI count). p50 over the dispatch region: production 42.369, cached runs 40.760,
+one submission 40.306, one submission with fresh runs 41.620 ms. Both halves of the stage's
+prediction were wrong in opposite directions; the correction above is the finding.
+
+**Stage 2 — O2 priced and NOT landed; the `xrt.run` cache landed instead** (devq 623/624/625).
+Four forms of a whole decode token, twice, all four byte-identical, each with 8 back-to-back
+**replays of one identical token** clean: P0 67.10 / 67.38, P0c 64.90 / 65.52, P1 (30
+submissions, vector live at **30 subs / 57 entries**) 65.68 / 65.89, P1c 63.64 / 63.86 ms. **O2 pairs are worth −1.427 /
+−1.484 ms/token** — under the *pre-registered* 1.5 ms threshold, against ~864 MB of doubled
+resident weights (or a preload rewrite) plus a plan and live-check extension. Priced, stopped:
+the "do not double resident weights; if unavoidable, price it and stop" clause of the row —
+and **recorded where a planner will find it**, as a `Plan.rejected` candidate on every decode
+plan carrying its measurement (review finding 6). It moves **no plan hash**: `rejected` is
+outside `plan()`'s hashed body, so a measured negative can never invalidate an artifact set
+keyed by a plan sha, and a host test pins that property.
+What landed is the **`xrt.run` cache** in `load_and_run` (default ON): profiles **13.44 /
+13.30 / 13.47 / 13.26 → 13.99 / 13.94 / 13.97 / 14.13 tok/s** over two sessions (devq 624, 627)
+— **−2.5…−4.6 ms/token, +3.7…+6.6 %** (pooled means 74.8 → 71.4 ms, +4.8 %), inside the
+predicted band — `make verify` **PASS 2/0** twice, and the dispatch vector **unchanged**
+(57/57/150/206), the honest gate here because this makes a submission cheaper, not rarer.
+**The N-token gate was rebuilt** (review finding 3: the first one replayed ONE identical token
+with no advancing state and judged it against itself, so a cached run that stopped executing
+would have passed): `stage2_ntoken_gate.py` runs a genuinely autoregressive chain — token id,
+position, KV cache and hidden state all advance — and judges **every step against the
+cache-OFF path**, plus a staleness probe that mutates an input between two dispatches of the
+same cached run and requires the output to move. **devq 627: 12/12 steps bit-identical, 10
+distinct token ids, 12/12 distinct logits vectors, KV advanced, staleness probe clean.** The
+gate driver itself was rewritten to accumulate and fail fast (review finding 4: it printed leg
+return codes and ignored them, so devq 624's green status proved only that the script reached
+its last line).
+Blast radius, since it is shared infra and on by default (devq 625): `check-runlist`,
+`check-offload` (context_loads 30 unmoved), `check-fused-decoder-reexec` 12/12 corr 0.9995 and
+`llama32_1b make verify` all PASS. One hazard found and closed: the same reuse inside
+`run_sequence` must key on the pool object, whose entry would then pin the pool and defeat
+`pattern/offload`'s per-dispatch eviction (~25 MB/shape) — so that half is **default OFF**
+(`LLMS_CACHE_XRT_RUNS_SEQ`), the shipped sequence path is byte-for-byte HEAD's, and a host test
+pins the reason.
+
+**Two consequences for anyone reading older numbers.** (1) **`device_ms` was silently
+changing meaning, and that is now FIXED rather than annotated** (review finding 5).
+`load_and_run` timed the host-side run construction *inside* `t_kernel_ms`, which
+`dispatch_vector_from_trace` sums into `device_ms` — so an environment variable moved a
+"device" number by 30–50 µs/call with the device doing the same work. Both halves of the
+repair landed: the construction is now its own `bind_ms` phase and `kernel_ms` is **start+wait
+only on both paths**, so `device_ms` no longer depends on the cache state (measured: decode
+`NPU Run` totals 1978.5 / 1980.4 ms cache-off vs 1973.8 / 1964.0 cache-on, while the `Bind`
+column moves **43.3 / 44.3 → 1.1 / 0.9 ms**, devq 627); and a new manifest **`timing` block**
+records `kernel_ms_contract` and `xrt_run_cache` per root, with `compare_roots.compare_timing`
+**REFUSING** a comparison across two contracts (the pmode rule, for the pmode's reason) and
+flagging an absent stamp. Every root recorded before this commit is `bind_and_start_wait` and
+reads as `absent`; token-level figures are contract-independent. (2) **An open question worth more
+than stages 3 and 5 combined**: the shipped bf16 `o_gemv_ffn.elf` carries **6 device PDIs for
+its 3 `air.launch`es** (`readelf -S`; corroborated by the compiled LM-head module's 10
+configures / 11 devices and by stage 1's clean back-to-back dispatches, which require an even
+count). If the ~107 µs is per *PDI* rather than per `air.launch`, the token's real
+configuration count is 28 × (2 + 6) + 10 = **234 ≈ 25 ms/token** and doc 57 §2 undercounts this
+cascade ~2×. Unsettled — it needs the §1.4 ladder re-run against PDI counts, not launch counts.
+
+**Left, with falsifiable predictions** (`STAGES-3-5-SCOPE.md`): **stage 3 is structurally
+unreachable before stage 4** — host attention splits every layer, so the pair form's 30
+submissions is already the maximum; its ceiling once unblocked is **−3.4 ms/token** (56 × the
+largest supported per-removal estimate, 61.5 µs; −2.6 ms at the smaller 46.5 µs one). **Stage 4
+is the only large prize left**: predicted **−2.0 / −7.0 / −15.6 ms/token** at ctx 512 / 1024 /
+2048 with a **crossover near ctx 350**, and four walls to probe in order (head_dim 128 L1
+capacity; the runtime trip count against the `push_queue` [0:255] cap — 256 iterations at ctx
+2048 sits exactly on it; device-owned KV at 235 MB for ctx 2048; GQA 2). **Stage 5 is predicted
+negligible and negative** in its extra-launch form (−0.1…+0.06 ms/token); only the
+in-core-prologue version is worth building, and that is a kernel change.

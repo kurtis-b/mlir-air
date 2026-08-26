@@ -365,6 +365,31 @@ def fuse(graph, wl, placements, caps=NPU2_CAPS, forced=None):
                                  ("up_gemv", ("up_proj_L",), ("w_up_L",)), ("down_gemv", ("swiglu_L", "down_proj_L", "residual_2_L"), ("w_down_L",))):
                 stages.append(Stage(nm, DEVICE, ops_, launches=1, launch_breakdown=((nm, 1, "GEMV"),), weight_bytes=wbytes(*ws)))
             rejected.append(("o_gemv_ffn fused", "spatial: the cascade needs the lean form"))
+    if wl.phase == "decode":
+        # `[2026-08-26]` doc 56 H3 stage 2 (queue item 19): the O2 pair form --
+        # aggregating layer L's O+FFN with layer L+1's QKV into ONE runlist
+        # submission, the only aggregation the host attention between a layer's
+        # two device stages leaves available (per token: 1 + 27 pairs + 1 + the
+        # head = 30 submissions instead of 57, entries unchanged at 57). BUILT,
+        # MEASURED and REJECTED, so a later phase does not re-derive it as
+        # unmeasured: it is recorded here with its numbers because the canonical
+        # rejected-alternative record is this list, not the evidence directory.
+        rejected.append((
+            "dispatch grouping: O2 (o_gemv_ffn L, rms_qkv L+1) pairs as one submission",
+            "MEASURED and rejected (devq 623/624, results/item19-h3-20260826): the pair "
+            "form saves -1.427 / -1.484 ms per token on Qwen3-0.6B bf16 (52.8 / 61.5 us "
+            "per removed submission at the token level), UNDER the 1.5 ms/token threshold "
+            "registered before the measurement, and it costs a SECOND resident copy of "
+            "layers 1..27's QKV weights and layers 0..26's O+FFN weights -- ~864 MB -- "
+            "unless the preload is rewritten to be aware of it. Correctness is not the "
+            "objection: all four measured forms returned byte-identical logits and the "
+            "vector read 30 subs / 57 entries live. What landed instead is the xrt.run "
+            "cache (a cheaper submission, not a rarer one: -2.2 ms/token, dispatch vector "
+            "unchanged). The ceiling on the whole aggregation ladder is 56 x 61.5 us = "
+            "3.44 ms/token and needs device attention (H3 stage 4) first, against 150 "
+            "air.launch boundaries x 107 us = 16.1 ms in the same token",
+        ))
+
     # --- once: final norm (host) + LM head ---
     stages.append(Stage("final_rms_norm", HOST, ("final_norm",), repeated=False, note=placements["final_norm"].reason,
                         boundary_bytes=g.nbytes("x_final_normed")))

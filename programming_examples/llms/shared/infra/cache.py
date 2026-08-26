@@ -4,6 +4,7 @@
 """Kernel compilation cache, profiling, and air_project utilities."""
 
 import json
+import os
 import shutil
 import time
 from pathlib import Path
@@ -109,7 +110,7 @@ class Profiler:
 
     def record_breakdown(
         self, name, write_ms, kernel_ms, read_ms, n_written, bytes_written, n_readback,
-        bytes_readback=0,
+        bytes_readback=0, bind_ms=0.0,
     ):
         if self.enabled:
             self.kernel_breakdowns.setdefault(name, []).append(
@@ -125,6 +126,12 @@ class Profiler:
                     # count bytes_transferred in both directions as the layer
                     # study's DispatchVector does.
                     "bytes_readback": bytes_readback,
+                    # `[2026-08-26]` APPENDED LAST (item 19 review, finding 5):
+                    # the host-side cost of building an `xrt.run` and binding
+                    # its arguments, which `kernel_ms` used to contain. Kept as
+                    # its own field rather than folded into `write_ms` -- it is
+                    # not sync traffic, and `sync_ms` is derived from write+read.
+                    "bind_ms": bind_ms,
                 }
             )
 
@@ -281,44 +288,49 @@ class Profiler:
                 f"  Three-segment timing of each XRT call:\n"
                 f"    BO Write = host→DDR memcpy of dynamic inputs (weights\n"
                 f"               pre-loaded once via static_input_indices)\n"
-                f"    NPU Run  = xrt.run.start() + wait() — actual NPU exec\n"
+                f"    Bind     = xrt.run construction + set_arg (host; ~0 when\n"
+                f"               the run cache serves it -- item 19, finding 5)\n"
+                f"    NPU Run  = xrt.run.start() + wait() — actual NPU exec, and\n"
+                f"               the ONLY term the study sums into device_ms\n"
                 f"    BO Read  = numpy view construction (zero-copy, ~0)"
             )
             print(
-                f"  {'Kernel':20s} {'BO Write':>10s} {'NPU Run':>10s} {'BO Read':>10s} {'Total':>10s}  {'Written':>8s} {'Read':>6s}"
+                f"  {'Kernel':20s} {'BO Write':>10s} {'Bind':>10s} {'NPU Run':>10s} {'BO Read':>10s} {'Total':>10s}  {'Written':>8s} {'Read':>6s}"
             )
             print(
-                f"  {'\u2500'*20} {'\u2500'*10} {'\u2500'*10} {'\u2500'*10} {'\u2500'*10}  {'\u2500'*8} {'\u2500'*6}"
+                f"  {'\u2500'*20} {'\u2500'*10} {'\u2500'*10} {'\u2500'*10} {'\u2500'*10} {'\u2500'*10}  {'\u2500'*8} {'\u2500'*6}"
             )
-            total_write = total_kernel = total_read = 0
+            total_write = total_kernel = total_read = total_bind = 0
             for name in sorted(self.kernel_breakdowns.keys()):
                 entries = self.kernel_breakdowns[name]
                 n = len(entries)
                 avg_w = sum(e["write_ms"] for e in entries) / n
                 avg_k = sum(e["kernel_ms"] for e in entries) / n
                 avg_r = sum(e["read_ms"] for e in entries) / n
-                avg_total = avg_w + avg_k + avg_r
+                avg_b = sum(e.get("bind_ms", 0.0) for e in entries) / n
+                avg_total = avg_w + avg_b + avg_k + avg_r
                 avg_bytes = sum(e["bytes_written"] for e in entries) / n
                 avg_nw = sum(e["n_written"] for e in entries) / n
                 avg_nr = sum(e["n_readback"] for e in entries) / n
                 total_write += avg_w * n
                 total_kernel += avg_k * n
                 total_read += avg_r * n
+                total_bind += avg_b * n
                 mb = avg_bytes / 1024 / 1024
                 print(
-                    f"  {name:20s} {avg_w:8.2f}ms {avg_k:8.2f}ms {avg_r:8.2f}ms {avg_total:8.2f}ms"
+                    f"  {name:20s} {avg_w:8.2f}ms {avg_b:8.2f}ms {avg_k:8.2f}ms {avg_r:8.2f}ms {avg_total:8.2f}ms"
                     f"  {mb:6.1f}MB {avg_nr:4.0f}bo  (x{n})"
                 )
-            grand_total = total_write + total_kernel + total_read
+            grand_total = total_write + total_bind + total_kernel + total_read
             print(
-                f"  {'\u2500'*20} {'\u2500'*10} {'\u2500'*10} {'\u2500'*10} {'\u2500'*10}"
+                f"  {'\u2500'*20} {'\u2500'*10} {'\u2500'*10} {'\u2500'*10} {'\u2500'*10} {'\u2500'*10}"
             )
             print(
-                f"  {'TOTAL':20s} {total_write:8.1f}ms {total_kernel:8.1f}ms {total_read:8.1f}ms {grand_total:8.1f}ms"
+                f"  {'TOTAL':20s} {total_write:8.1f}ms {total_bind:8.1f}ms {total_kernel:8.1f}ms {total_read:8.1f}ms {grand_total:8.1f}ms"
             )
             if grand_total > 0:
                 print(
-                    f"  {'%':20s} {total_write/grand_total*100:7.0f}%  {total_kernel/grand_total*100:7.0f}%  {total_read/grand_total*100:7.0f}%"
+                    f"  {'%':20s} {total_write/grand_total*100:7.0f}%  {total_bind/grand_total*100:7.0f}%  {total_kernel/grand_total*100:7.0f}%  {total_read/grand_total*100:7.0f}%"
                 )
 
 
@@ -351,6 +363,51 @@ class KernelCache:
         self.context_loads = 0
         self.kernel_attaches = 0
         self._cached_bos = {}  # name -> list of xrt.bo for BO reuse
+        #: `[2026-08-26]` doc 56 H3 stage 1 (queue item 19, devq 622): building
+        #: an `xrt.run` and binding its arguments costs **57.5 us per call**
+        #: measured (28 x `o_gemv_ffn` over one set of BOs: 1.5132 ms/call with
+        #: a fresh run, 1.4557 with the run built once), against **16.8 us**
+        #: for the submission a runlist removes. A 57-submission decode token
+        #: therefore spends ~3.3 ms re-binding runs it could build once --
+        #: 3.5x the whole aggregation budget.
+        #:
+        #: Reusing the run object is legal because a bo_key's BO list is
+        #: allocated on its first call and NEVER replaced (see `_alloc_bo` /
+        #: `first_call` below), so the bindings a cached run carries stay
+        #: valid for the life of this cache. The entry stores the
+        #: `xrt.kernel` it was built from and is discarded when that object is
+        #: not the one now loaded, so a caller that evicts and reloads a
+        #: context (`pattern/offload._evict_context`) can never start a run
+        #: against a dead context.
+        #:
+        #: ELF ABI only: the xclbin path calls the kernel functor, which owns
+        #: its own run object.
+        #:
+        #: DEFAULT ON since the H3 stage-2 gate set (devq 623/624/625): on a
+        #: whole simulated Qwen3-0.6B decode token it is **-2.205 ms/token**
+        #: (67.104 -> 64.899 ms p50, 38.7 us per submission averaged over the
+        #: token's three ABIs -- 5, 15 and 21 arguments), byte-identical
+        #: outputs, dispatch vector unchanged. `LLMS_CACHE_XRT_RUNS=0` restores
+        #: the per-call run, which is how the A/B is measured.
+        self._cached_runs = {}  # (name, bo_key) -> (xrt.kernel, xrt.run)
+        self.cache_xrt_runs = os.environ.get("LLMS_CACHE_XRT_RUNS", "1") not in ("", "0")
+        #: The SAME reuse inside `dispatch.run_sequence`, and it is **OFF by
+        #: default** for a reason that is not performance. A sequence's runs can
+        #: only be keyed on the POOL object (the plan is memoized and rebuilt,
+        #: the BOs are the pool's), so the cache entry holds a strong reference
+        #: to that pool. `pattern/offload._evict_context` clears `_pools` before
+        #: EVERY dispatch precisely so a dispatch's buffers do not outlive it
+        #: ("nothing may stay device resident between GEMMs" is that mode's
+        #: definition) and `pattern/runlist` evicts per artifact -- a run cache
+        #: would keep one evicted pool, and its BOs, alive per plan signature
+        #: and make those evictions no-ops for memory in the two modes whose
+        #: subject is residency. Nothing in production dispatches decode through
+        #: `run_sequence` today (doc 56 H3 stage 2 measured the O2 pair form at
+        #: -1.4 ms/token and did not land it), so the flag exists for the probes
+        #: that price aggregation; turning it on for real needs an
+        #: eviction-aware clear on both paths first. `LLMS_CACHE_XRT_RUNS_SEQ=1`.
+        self.cache_xrt_runs_in_sequences = os.environ.get(
+            "LLMS_CACHE_XRT_RUNS_SEQ", "0") not in ("", "0")
         self.arg_counts = {}  # name -> ELF buffer-arg count (manifest n_args)
         self._elf_arg_counts = {}  # name -> elf_arg_count(binary), memoized
         self._pools = {}  # PoolPlan.signature -> BoPool, for run_sequence
@@ -921,15 +978,47 @@ class KernelCache:
                 bytes_written += len(src)
             t_write_ms = (time.perf_counter() - t_write) * 1000
 
-            # Phase 2: Launch kernel
+            # Phase 2a: build/bind the run. `[2026-08-26]` (item 19 review,
+            # blocking finding 5) THIS IS TIMED SEPARATELY, ON BOTH PATHS.
+            # It used to sit inside `t_kernel_ms`, which meant the number the
+            # study sums into `device_ms` contained 38-57 us of host-side
+            # argument binding per call -- and once the run cache could skip
+            # that work, `device_ms` moved by 30-50 us/call while the device did
+            # exactly the same thing. A metric that changes when an environment
+            # variable changes cannot be compared across roots, so the fix is to
+            # take the host work OUT of it rather than to label the two
+            # variants: `kernel_ms` is now start+wait ONLY, identically whether
+            # the run was built here or reused, and `bind_ms` carries the
+            # construction so nothing is hidden. The manifest records the
+            # contract (`schema.TIMING_KEY`) and `compare_roots` refuses a
+            # comparison across two contracts.
+            t_bind = time.perf_counter()
+            run = None
+            if is_elf:
+                if self.cache_xrt_runs:
+                    hit = self._cached_runs.get((name, _bo_key))
+                    # Identity check, not presence: an evicted-and-reloaded
+                    # context has a NEW xrt.kernel, and the run bound to the
+                    # old one must not be started.
+                    if hit is not None and hit[0] is backend.kernel:
+                        run = hit[1]
+                if run is None:
+                    run = xrt.run(backend.kernel)
+                    for i, bo in enumerate(bos):
+                        run.set_arg(i, bo)
+                    if self.cache_xrt_runs:
+                        self._cached_runs[(name, _bo_key)] = (backend.kernel, run)
+            t_bind_ms = (time.perf_counter() - t_bind) * 1000
+
+            # Phase 2b: launch and wait -- the device region, and nothing else.
             t_kernel = time.perf_counter()
             if is_elf:
-                run = xrt.run(backend.kernel)
-                for i, bo in enumerate(bos):
-                    run.set_arg(i, bo)
                 run.start()
                 run.wait2()
             else:
+                # The xclbin path has no run object to reuse: the kernel functor
+                # builds and submits in one call, so its `kernel_ms` has always
+                # been start+wait and this change does not move it.
                 h = backend.kernel(3, backend.bo_instr, len(backend.instr_v), *bos)
                 h.wait()
             t_kernel_ms = (time.perf_counter() - t_kernel) * 1000
@@ -967,5 +1056,6 @@ class KernelCache:
             bytes_written,
             len(readback_set),
             bytes_readback=sum(sizes_in_bytes[i] for i in readback_set),
+            bind_ms=t_bind_ms,
         )
         return results

@@ -433,7 +433,7 @@ def trace_since(mark: _ProfilerMark) -> dict:
             new = records[k0.get(name, 0):]
             if not new:
                 continue
-            k = kernels.setdefault(name, {"calls": 0, "n_written": 0, "n_readback": 0, "bytes_written": 0, "bytes_readback": 0, "kernel_ms": 0.0, "sync_ms": 0.0})
+            k = kernels.setdefault(name, {"calls": 0, "n_written": 0, "n_readback": 0, "bytes_written": 0, "bytes_readback": 0, "kernel_ms": 0.0, "sync_ms": 0.0, "bind_ms": 0.0})
             k["calls"] += len(new)
             for r in new:
                 k["n_written"] += int(r["n_written"])
@@ -442,6 +442,13 @@ def trace_since(mark: _ProfilerMark) -> dict:
                 k["bytes_readback"] += int(r.get("bytes_readback", 0))
                 k["kernel_ms"] += float(r["kernel_ms"])
                 k["sync_ms"] += float(r["write_ms"]) + float(r["read_ms"])
+                # `[2026-08-26]` item 19 review, finding 5: the host-side
+                # `xrt.run` build/bind, which `kernel_ms` used to contain. It is
+                # carried so a trace still accounts for the whole call, and it
+                # is deliberately NOT summed into `device_ms` below -- that is
+                # the point of splitting it. `.get` because fixtures recorded
+                # before the split have no such key.
+                k["bind_ms"] += float(r.get("bind_ms", 0.0))
         for name, times in p.cpu_times.items():
             new = times[c0.get(name, 0):]
             if new:
