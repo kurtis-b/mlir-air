@@ -340,9 +340,14 @@ def compile_mv_int4_bf16(m_tile=8, k_chunk=2048, gs=128):
     same-name-different-content class `compile_gemm_mm` was bitten by. The
     canonical copy runs on every call, so the right variant is staged even
     when the tagged object is reused.
+
+    `[2026-08-26]` (doc 56 H2b, queue item 18) The tag carries K_CHUNK for the
+    same reason: DIM_K is baked in, and Qwen3-0.6B's int4 decode cascade runs
+    at k_chunk=1024 (its emb) against llama's 2048 -- an untagged k_chunk in a
+    shared CWD is the identical stale-reuse class.
     """
     src = _PROJ_ROOT / "matrix_vector_multiplication" / "int4_awq" / "mv_int4_bf16.cc"
-    tagged = f"mv_int4_bf16_gemv_gs{gs}.o"
+    tagged = f"mv_int4_bf16_gemv_gs{gs}_k{k_chunk}.o"
     _compile_kernel(
         src,
         tagged,
@@ -519,7 +524,7 @@ def compile_softmax_streaming(vec_len=64, out_name="softmax_streaming.o"):
     )
 
 
-def compile_all_external_kernels(head_dim=64, quant="bf16", int4_gs=128):
+def compile_all_external_kernels(head_dim=64, quant="bf16", int4_gs=128, int4_k_chunk=2048):
     """Compile all external C++ kernels from source.
 
     Call this before kernel compilation to ensure all .o files are fresh.
@@ -550,4 +555,7 @@ def compile_all_external_kernels(head_dim=64, quant="bf16", int4_gs=128):
         # gs=32 staging and immediately BEFORE aiecc links -- the first
         # SmolLM2 int4 build linked the wrong group size exactly this way
         # (devq 372/376: k/v from the decode ELF uncorrelated with host).
-        compile_mv_int4_bf16(gs=int4_gs)
+        # `int4_k_chunk` rides the same channel (doc 56 H2b: qwen's int4
+        # cascade is DIM_K=1024; a default here would restage llama's 2048
+        # kernel right before aiecc links the qwen ELF).
+        compile_mv_int4_bf16(gs=int4_gs, k_chunk=int4_k_chunk)

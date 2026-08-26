@@ -180,12 +180,62 @@ def test_w4_decode_names_the_shipped_int4_decode_stages():
     assert p.resident_weight_bytes - head.weight_bytes < (pb.resident_weight_bytes - head.weight_bytes) * 0.27
     pp = plan(g, Workload("prefill", 2048, 2048, 2048, "w4_decode"))
     assert pp.elf_sequence() == ["rms_gemms_rope", "flash_attn", "o_ffn", "lm_head_gemv"]
+    # `[2026-08-26]` H2b lifted the qk-norm refusal (see the next test); the
+    # NON-lean form still refuses -- no int4 split-form driver exists.
+    from shared.plan.graph import ModelSpec
+    non_lean = ModelSpec(name="x", hf_id="x", n_layers=2, emb_dim=896, n_heads=14, n_kv_heads=2,
+                         head_dim=64, hidden_dim=4864, vocab_size=151936, lm_head_rows_per_launch=8192)
     try:
-        plan(decoder_graph(QWEN3_0_6B), Workload("decode", 1, 512, 2048, "w4_decode"))
+        plan(decoder_graph(non_lean), Workload("decode", 1, 512, 2048, "w4_decode"))
     except ValueError as e:
-        assert "H2b" in str(e)
+        assert "lean" in str(e)
     else:
-        raise AssertionError("a qk-norm w4_decode plan must be refused until H2b")
+        raise AssertionError("a non-lean w4_decode plan must be refused")
+
+
+def test_w4_decode_qwen_qknorm_candidates():
+    """`[2026-08-26]` doc 56 H2b (queue item 18): the qk-norm w4_decode plan.
+
+    The refusal lifts ONLY where a real candidate exists: the O+FFN cascade
+    goes int4 (`o_gemv_ffn_int4`, the llama 3-launch cascade decoupled at
+    q_dim / k_chunk=emb -- SAME launch structure, so the dispatch vector
+    equals the bf16 plan's), while the QKV stage and the LM head STAY bf16
+    with the priced negatives recorded as rejected candidates
+    (results/item18-h2b-20260826/PREDICTION.md section 2; doc 57 section 5
+    item 6 for the head). bf16 rows are untouched: same stages, same sha as
+    before H2b."""
+    from shared.plan import W4_GEMV_CONTRACT
+    g = decoder_graph(QWEN3_0_6B)
+    p = plan(g, Workload("decode", 1, 512, 2048, "w4_decode"))
+    pb = plan(g, Workload("decode", 1, 512, 2048, "bf16"))
+    assert p.elf_sequence() == ["rms_qkv_qknorm_rope_gemv2", "o_gemv_ffn_int4", "lm_head_gemv"]
+    assert [s.launches for s in p.stages if s.where == "device"] == [2, 3, 10]
+    # the int4 swap keeps the launch structure: the dispatch counts ARE the bf16 plan's
+    assert (p.total_submissions, p.total_launches, p.total_host_ops) == \
+        (pb.total_submissions, pb.total_launches, pb.total_host_ops) == (57, 150, 58)
+    assert p.sha != pb.sha
+    by_name = {s.name: s for s in p.stages}
+    by_name_b = {s.name: s for s in pb.stages}
+    # QKV stays bf16: same weight bytes as the bf16 plan, and the note says why
+    assert by_name["rms_qkv_qknorm_rope_gemv2"].weight_bytes == by_name_b["rms_qkv_qknorm_rope_gemv2"].weight_bytes
+    assert "priced negative" in by_name["rms_qkv_qknorm_rope_gemv2"].note
+    # the head stays bf16 at the shipped 10 partitions
+    assert by_name["lm_head_gemv"].weight_bytes == by_name_b["lm_head_gemv"].weight_bytes
+    # the O+FFN candidate is int4: nibble bytes, the contract named per GEMV
+    o4 = by_name["o_gemv_ffn_int4"]
+    assert o4.weight_bytes < by_name_b["o_gemv_ffn"].weight_bytes * 0.27
+    assert any(W4_GEMV_CONTRACT in why for _op, _n, why in o4.launch_breakdown)
+    assert "int4 nibbles" in o4.note and "decoupled" in o4.note
+    # the priced negatives are REJECTED CANDIDATES, each naming its decisive term
+    rej = dict((r[0], r[1]) for r in p.rejected)
+    assert "107 us boundary" in rej["rms_qkv int4 (launch-structure fallback)"]
+    assert "NEW kernel" in rej["rms_qkv int4 (in-core epilogue)"]
+    assert "-0.46 ms/token" in rej["lm_head int4"] and "O4" in rej["lm_head int4"]
+    # bf16 carries none of the w4 rejected entries
+    assert not any("int4" in r[0] for r in pb.rejected)
+    # prefill under w4_decode is the bf16 prefill plan (section 3.5's dequantized copy)
+    pp = plan(g, Workload("prefill", 2048, 2048, 2048, "w4_decode"))
+    assert pp.elf_sequence() == ["rms_qkv_qknorm_rope", "flash_attn", "o_ffn_qwen", "lm_head_gemv"]
 
 
 def test_non_lean_form_splits_o_ffn():

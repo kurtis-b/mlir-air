@@ -71,6 +71,55 @@ def build_config():
     return LlamaConfig()
 
 
+def build_hf_model(npu_model_name: str, hf_ref_model: str, config):
+    """`[2026-08-26]` doc 56 H2b (queue item 18): the w4_decode oracle.
+
+    Under QWEN3_W4_DECODE the NPU path computes on RTN-quantized O+FFN
+    weights (decode dequants in-kernel; prefill runs the dequantized bf16
+    copy the loader substitutes), so the HF reference must carry the SAME
+    dequantized values -- the llama int4 adapter's oracle pattern: patch
+    the four Linears per layer from the loader's own substituted fields
+    (one owner, `w4_decode_pack.quantize_decode_weights` via
+    `load_weights`). Everything else (QKV, norms, embed, LM head) stays
+    the checkpoint's -- those paths are bf16 on the NPU too.
+
+    Returns None on the bf16 path: the framework then loads the plain HF
+    reference exactly as before.
+    """
+    from w4_decode_pack import w4_decode_selected
+
+    if not w4_decode_selected():
+        return None
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    print(f"[verify_adapter] w4_decode: loading HF reference {hf_ref_model} to patch O+FFN...")
+    model = AutoModelForCausalLM.from_pretrained(hf_ref_model, torch_dtype=torch.bfloat16)
+    # A FRESH w4 load: build_runner's weights object is collapsed to
+    # zero-stride broadcasts by prepare_runtime after preload, so it cannot
+    # be shared; fake-quantize is deterministic, so this reproduces the
+    # runner's exact values.
+    weights = load_weights(npu_model_name, config=config)
+    assert getattr(weights, "_w4_decode_applied", False), (
+        "build_hf_model reached with QWEN3_W4_DECODE set but the loader did "
+        "not apply the w4 transform -- the oracle would test the wrong model"
+    )
+
+    def _to_bf16_tensor(arr):
+        return torch.from_numpy(np.ascontiguousarray(arr).view(np.int16)).view(torch.bfloat16)
+
+    for li in range(config.n_layers):
+        lw = weights.layers[li]
+        hf_layer = model.model.layers[li]
+        # HF Linear stores (out, in); the loader fields are (in, out).
+        hf_layer.self_attn.o_proj.weight.data = _to_bf16_tensor(np.asarray(lw.wo).T)
+        hf_layer.mlp.gate_proj.weight.data = _to_bf16_tensor(np.asarray(lw.w_gate).T)
+        hf_layer.mlp.up_proj.weight.data = _to_bf16_tensor(np.asarray(lw.w_up).T)
+        hf_layer.mlp.down_proj.weight.data = _to_bf16_tensor(np.asarray(lw.w_down).T)
+    print("[verify_adapter] HF reference patched with the w4_decode dequant O+FFN weights")
+    return model
+
+
 def build_runner(
     model_name, config, max_seq, tokenizer, *, npu_attn=True, lite_mode=False
 ):

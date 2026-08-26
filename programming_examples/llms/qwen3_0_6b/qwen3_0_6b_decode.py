@@ -68,6 +68,20 @@ _RMS_QKV_LAUNCHES = int(_os.environ.get("QWEN3_RMS_QKV_LAUNCHES", "2"))
 assert _RMS_QKV_LAUNCHES in (2, 4), _RMS_QKV_LAUNCHES
 _RMS_QKV_KERNEL = f"rms_qkv_qknorm_rope_gemv{_RMS_QKV_LAUNCHES}"
 
+# `[2026-08-26]` doc 56 H2b (queue item 18): the w4_decode path, selected by
+# QWEN3_W4_DECODE=1 (default OFF -- bf16 stays the production default). What
+# changes: the O+FFN stage compiles/dispatches `o_gemv_ffn_int4` (the llama
+# 3-launch int4 cascade at q_dim=2048 / k_chunk=1024, SAME launch structure)
+# from the packed BOs `w4_decode_pack.quantize_decode_weights` attaches; the
+# QKV stage and the LM head stay bf16 (priced negatives -- see
+# results/item18-h2b-20260826/PREDICTION.md section 2 and doc 57 section 5
+# item 6). Read at import time like _RMS_QKV_LAUNCHES; model_adapter.prepare
+# sets the env from `precision_plan` before importing the driver.
+from w4_decode_pack import w4_decode_selected as _w4_decode_selected  # noqa: E402
+
+_W4_DECODE = _w4_decode_selected()
+_O_FFN_KERNEL = "o_gemv_ffn_int4" if _W4_DECODE else "o_gemv_ffn"
+
 
 def build_rms_qkv_qknorm_rope_gemv_module(config, n_launches=None):
     """Fused decode ELF: RMSNorm + Q/K/V GEMV + per-head QK-norm + RoPE (M=1).
@@ -283,6 +297,31 @@ def build_o_gemv_ffn_qwen_module(emb_dim, q_dim, hidden_dim):
     return module
 
 
+def build_o_gemv_ffn_int4_qwen_module(emb_dim, q_dim, hidden_dim):
+    """w4_decode O+FFN: the llama 3-launch int4 cascade (matvec_int4_packed_add
+    / swiglu_rms / packed_add over one `mv_int4_bf16.o`), decoupled exactly as
+    `build_o_gemv_ffn_qwen_module` decouples the bf16 cascade (O GEMV M=emb,
+    K=q_dim) and at k_chunk=emb_dim (stage 2 requires K == K_CHUNK; O and
+    down split into 2 / 3 chunks). Same 15-arg ABI, arg1 is q_dim wide,
+    arg0/7/12 are packed-uint8 BOs. Thin delegate -- the llama builder is the
+    one owner (doc 56 H2b: REUSE the existing int4 builders)."""
+    from llama32_1b_int4.multi_launch_builder.o_gemv_ffn_int4_multi import (
+        build_o_gemv_ffn_int4_module,
+    )
+    from w4_decode_pack import GROUP_SIZE, M_TILE, K_CHUNK, N_CORES
+
+    assert K_CHUNK == emb_dim, (K_CHUNK, emb_dim)
+    return build_o_gemv_ffn_int4_module(
+        emb_dim=emb_dim,
+        hidden_dim=hidden_dim,
+        gs=GROUP_SIZE,
+        m_tile=M_TILE,
+        k_chunk=K_CHUNK,
+        n_cores=N_CORES,
+        q_dim=q_dim,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Builder 2: LM-head GEMV (19 partitions, n_part=8192 for vocab 151936).
 # ---------------------------------------------------------------------------
@@ -310,6 +349,8 @@ def build_lm_head_gemv_qwen_module(emb_dim):
 
 
 def _o_gemv_ffn_backend(verbose=False):
+    if _W4_DECODE:
+        return _o_gemv_ffn_int4_backend(verbose)
     return {
         "verbose": verbose,
         "omit_while_true_loop": False,
@@ -317,6 +358,14 @@ def _o_gemv_ffn_backend(verbose=False):
         "instance_name": "o_gemv_ffn",
         "use_lock_race_condition_fix": False,
     }
+
+
+def _o_gemv_ffn_int4_backend(verbose=False):
+    """The llama int4 cascade's preset (ping-pong on -- dropping it regressed
+    the llama e2e 12.4 -> 7.8 tok/s)."""
+    from shared.infra.backend_presets import OGF_INT4_BACKEND
+
+    return {"verbose": verbose, **OGF_INT4_BACKEND}
 
 
 def _lm_gemv_backend(verbose=False):
@@ -368,12 +417,25 @@ def compile_decode_kernels(cache, config, verbose=False):
         _rms_qkv_qknorm_rope_gemv_backend(verbose),
     )
 
-    print("\n--- o_gemv_ffn (O GEMV decoupled + Residual + FFN) ---")
-    cache.compile_and_cache(
-        "o_gemv_ffn",
-        build_o_gemv_ffn_qwen_module(emb_dim, q_dim, hidden_dim),
-        _o_gemv_ffn_backend(verbose),
-    )
+    if _W4_DECODE:
+        from w4_decode_pack import GROUP_SIZE, K_CHUNK
+
+        print("\n--- o_gemv_ffn_int4 (w4_decode: int4 O GEMV decoupled + FFN) ---")
+        cache.compile_and_cache(
+            "o_gemv_ffn_int4",
+            build_o_gemv_ffn_int4_qwen_module(emb_dim, q_dim, hidden_dim),
+            # int4_gs / int4_k_chunk ride the backend kwargs so the per-compile
+            # kernel sweep stages THIS model's mv_int4_bf16.o (DIM_K=1024), not
+            # llama's 2048 default (cache.compile_and_cache pops them).
+            {**_o_gemv_ffn_int4_backend(verbose), "int4_gs": GROUP_SIZE, "int4_k_chunk": K_CHUNK},
+        )
+    else:
+        print("\n--- o_gemv_ffn (O GEMV decoupled + Residual + FFN) ---")
+        cache.compile_and_cache(
+            "o_gemv_ffn",
+            build_o_gemv_ffn_qwen_module(emb_dim, q_dim, hidden_dim),
+            _o_gemv_ffn_backend(verbose),
+        )
 
     print("\n--- lm_head_gemv (19-partition, vocab 151936) ---")
     cache.compile_and_cache(
@@ -481,14 +543,71 @@ def run_decode_block(
     )
 
 
+# Cache of dead-ABI placeholders for the w4 path (the llama int4 pattern:
+# reallocating the hidden x emb buffer per call is pure host glue).
+_DEAD_PLACEHOLDERS = {}
+
+
+def _dead_buf(shape):
+    key = shape if isinstance(shape, tuple) else (shape,)
+    buf = _DEAD_PLACEHOLDERS.get(key)
+    if buf is None:
+        buf = np.zeros(shape, dtype=bfloat16)
+        _DEAD_PLACEHOLDERS[key] = buf
+    return buf
+
+
+def _run_o_gemv_ffn_int4(
+    attn_out, x_bf16, layer_weights, config, cache, layer_idx, verbose=False
+):
+    """w4_decode Stage E: int4 O-proj(decoupled) + Residual + RMSNorm + SwiGLU.
+
+    Same 15-arg ABI and BO indices as the bf16 cascade; slots 0/7/12 hold the
+    packed-uint8 BOs `w4_decode_pack.quantize_decode_weights` attached."""
+    emb_dim = config.emb_dim
+    hidden_dim = config.hidden_dim
+    z_emb = _dead_buf(emb_dim)
+    z_hidden = _dead_buf(hidden_dim)
+    z_hidden_emb = _dead_buf((hidden_dim, emb_dim))
+    results = cache.load_and_run(
+        "o_gemv_ffn_int4",
+        _o_gemv_ffn_int4_backend(verbose),
+        layer_weights._wo_packed,  # arg0 wo (static, packed-i8, decoupled K=q_dim)
+        attn_out,  # arg1 attn_out (q_dim)
+        z_emb,  # arg2 (dead)
+        x_bf16.flatten().astype(bfloat16),  # arg3 x_residual
+        z_emb,  # arg4 (dead)
+        z_emb,  # arg5 (dead)
+        layer_weights._packed_rms_buf,  # arg6 packed RMS input (static)
+        layer_weights._wgateup_packed,  # arg7 gate/up (static, packed-i8)
+        z_hidden,  # arg8 (dead)
+        z_hidden_emb,  # arg9 (dead)
+        z_hidden,  # arg10 (dead)
+        z_hidden,  # arg11 swiglu
+        layer_weights._wdown_packed,  # arg12 wdown (static, packed-i8)
+        z_emb,  # arg13 (dead)
+        z_emb,  # arg14 output
+        output_indices=[14],
+        static_input_indices={0, 6, 7, 12},
+        intermediate_indices={2, 4, 5, 8, 9, 10, 11, 13, 14},
+        bo_key=f"o_gemv_ffn_int4_L{layer_idx}" if layer_idx is not None else None,
+    )
+    return results[14].astype(bfloat16)
+
+
 def _run_o_gemv_ffn(
     attn_out, x_bf16, layer_weights, config, cache, layer_idx, verbose=False
 ):
     """Decode Stage E: O-proj(decoupled) + Residual + RMSNorm + SwiGLU FFN.
 
     Shared by the fused and legacy decode paths so the o_gemv_ffn arg layout +
-    BO indices have a single owner.
+    BO indices have a single owner. Dispatches the w4_decode int4 cascade when
+    QWEN3_W4_DECODE selected it (same launch structure, packed weights).
     """
+    if _W4_DECODE:
+        return _run_o_gemv_ffn_int4(
+            attn_out, x_bf16, layer_weights, config, cache, layer_idx, verbose
+        )
     emb_dim = config.emb_dim
     hidden_dim = config.hidden_dim
     z_emb = np.zeros(emb_dim, dtype=bfloat16)

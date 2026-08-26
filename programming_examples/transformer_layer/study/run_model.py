@@ -465,6 +465,11 @@ def worker(args) -> int:
     gate_max_seq = max(r.gate_max_seq for r in rungs) if rungs else M + model_profiles.GATE_N_TOKENS
     out["gate"] = {"prompts_file": str(gate_file), "prompt_tokens": gate_prompts, "map": gate_map,
                    "prefill_M": M, "max_seq": gate_max_seq,
+                   # `[2026-08-26]` doc 56 H2b: the gate subprocess must select
+                   # the SAME driver path the rows timed (qwen w4_decode is
+                   # env-flag-selected); run_verify maps this through the
+                   # binding's precision_env.
+                   "precision_plan": spec["precision_plan"],
                    # `[2026-08-25]` doc 56 H1b: the gate's prefill runs the SAME
                    # chunked path as the measurement (LLMS_VERIFY_UBATCH; the
                    # ubatch is the compiled M) -- the state its 32-token decode
@@ -514,7 +519,11 @@ def run_verify(model_id: str, M: int, gate: dict, *, compiled: dict, out_dir: Pa
     report_root = out_dir / "verify" / f"{model_id}_M{M}"
     cwd = out_dir / "verify" / f"{model_id}_M{M}" / "cwd"
     before = model_adapter.artifact_content_sha([prefill_cache, decode_cache])
-    extra_env = {"LLMS_VERIFY_UBATCH": str(gate["ubatch"])} if gate.get("ubatch") else None
+    extra_env = {"LLMS_VERIFY_UBATCH": str(gate["ubatch"])} if gate.get("ubatch") else {}
+    # `[2026-08-26]` doc 56 H2b: the gate runs the plan's driver path (the
+    # binding's env; qwen w4_decode sets QWEN3_W4_DECODE=1, bf16 pins it 0).
+    extra_env.update(adapter.binding.precision_env(gate.get("precision_plan", "bf16")))
+    extra_env = extra_env or None
     verdict = adapter.verify_against_hf(gate["prompts_file"], report_root, prefill_cache=prefill_cache, decode_cache=decode_cache,
                                         prefill_M=gate.get("prefill_M", M), max_seq=gate.get("max_seq", M + model_profiles.GATE_N_TOKENS), cwd=cwd,
                                         extra_env=extra_env)
@@ -697,7 +706,7 @@ def _bound_profile(args):
     if getattr(args, "models", None):
         wanted = tuple(m.strip() for m in args.models.split(",") if m.strip())
         prof = replace(prof, models=wanted, prefill_Ms={m: prof.prefill_Ms[m] for m in wanted})
-    compiled, notes = model_profiles.discover_compiled(prof.models, args.compiled_root)
+    compiled, notes = model_profiles.discover_compiled(prof.models, args.compiled_root, precision_plan=prof.precision_plan)
     return prof.bind(compiled, notes)
 
 
@@ -732,6 +741,12 @@ def main(argv=None) -> int:
     c.add_argument("--model", required=True)
     c.add_argument("--M", type=int, required=True)
     c.add_argument("--compiled-root", required=True)
+    cd = sub.add_parser("compile-decode",
+                        help="doc 56 H2b: compile a model's DECODE artifact set under a precision plan "
+                             "(decode ELFs carry no M) into <root>/<model>/<plan>/decode_kernel_cache")
+    cd.add_argument("--model", required=True)
+    cd.add_argument("--precision-plan", required=True)
+    cd.add_argument("--compiled-root", required=True)
     c.add_argument("--o-ffn-gemm-method", default=None, help="force the Qwen O+FFN cascade's GEMM method (recorded as a deviation)")
     c.add_argument("--fa-ctx", type=int, action="append", default=[],
                    help="doc 56 H1b: also compile a RECTANGULAR head-first FA ELF (flash_attn_ctx<N>) for this K/V context length; repeatable")
@@ -743,6 +758,23 @@ def main(argv=None) -> int:
 
     if args.cmd == "worker":
         return worker(args)
+    if args.cmd == "compile-decode":
+        target = Path(args.compiled_root) / args.model / args.precision_plan
+        cache = target / model_adapter.DECODE_CACHE
+        print(f"[run-model] compiling {args.model} decode under {args.precision_plan} into {cache} (cwd {target})")
+        try:
+            man = model_adapter.compile_decode(args.model, cache, cwd=target, precision_plan=args.precision_plan)
+        except Exception as exc:
+            cache.mkdir(parents=True, exist_ok=True)
+            for stale in (cache / "manifest.json",):
+                if stale.exists():
+                    stale.unlink()
+            (cache / model_adapter.COMPILE_NOTE).write_text(json.dumps(
+                {"model_id": args.model, "precision_plan": args.precision_plan,
+                 "failed": f"{type(exc).__name__}: {str(exc).splitlines()[-1][:400]}"}, indent=1), encoding="utf-8")
+            raise
+        print(f"[run-model] compiled {sorted(k for k in man if not k.startswith('_'))} in {man['_compile']['wall_s']:.1f}s")
+        return 0
     if args.cmd == "compile":
         target = Path(args.compiled_root) / args.model / f"M{args.M}"
         cache = target / model_adapter.PREFILL_CACHE

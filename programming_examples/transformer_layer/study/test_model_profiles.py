@@ -165,6 +165,52 @@ def test_w4_decode_is_the_h2a_row_of_doc_56():
     assert not keys & bf16
 
 
+def test_w4_decode_qwen_is_the_h2b_row_of_doc_56():
+    """`[2026-08-26]` Queue item 18 (doc 56 H2b): three qwen decode rungs under
+    w4_decode. The DECODE artifact set is plan-selected: qwen's shipped
+    build_peano decode implements its binding's FIRST plan (bf16), so the w4
+    walk needs `<root>/qwen3_0_6b/w4_decode/decode_kernel_cache` from
+    `run_model.py compile-decode` -- a missing set is a derived skip NAMING
+    that command, never a silent fall-through to the shipped bf16 bytes. The
+    llama w4 profile keeps binding the shipped caches (its shipped plan IS
+    w4_decode)."""
+    prof = mp.profile("w4-decode-qwen")
+    assert prof.models == ("qwen3_0_6b",)
+    assert prof.decode_ctxs == (512, 1024, 2048) and prof.precision_plan == "w4_decode"
+    rungs = prof.rungs()
+    assert [r.case_id for r in rungs] == [
+        f"qwen3_0_6b/decode/M2048/ctx{c}/w4_decode" for c in (512, 1024, 2048)]
+    # discovery: shipped prefill + PLAN-suffixed decode set, or a skip that says how
+    with tempfile.TemporaryDirectory() as d:
+        llms = Path(d) / "llms"
+        (llms / "qwen3_0_6b" / "build_peano" / "prefill_kernel_cache").mkdir(parents=True)
+        (llms / "qwen3_0_6b" / "build_peano" / "decode_kernel_cache").mkdir(parents=True)
+        for c in ("prefill_kernel_cache", "decode_kernel_cache"):
+            (llms / "qwen3_0_6b" / "build_peano" / c / "manifest.json").write_text("{}")
+        root = Path(d) / "compiled"
+        # no w4 decode set yet: NOT compiled, and the note names compile-decode
+        compiled, notes = mp.discover_compiled(("qwen3_0_6b",), root, llms_dir=llms, precision_plan="w4_decode")
+        assert compiled == {}
+        assert "compile-decode" in notes[("qwen3_0_6b", mp.SHIPPED_PREFILL_M)]
+        assert "w4_decode" in notes[("qwen3_0_6b", mp.SHIPPED_PREFILL_M)]
+        # the compiled w4 decode set binds with the SHIPPED prefill cache
+        w4d = root / "qwen3_0_6b" / "w4_decode" / "decode_kernel_cache"
+        w4d.mkdir(parents=True)
+        (w4d / "manifest.json").write_text("{}")
+        compiled, notes = mp.discover_compiled(("qwen3_0_6b",), root, llms_dir=llms, precision_plan="w4_decode")
+        assert compiled[("qwen3_0_6b", mp.SHIPPED_PREFILL_M)]["decode_cache"] == str(w4d)
+        assert compiled[("qwen3_0_6b", mp.SHIPPED_PREFILL_M)]["prefill_cache"].endswith("build_peano/prefill_kernel_cache")
+        # bf16 discovery on the same tree is untouched: the shipped decode cache
+        compiled_b, _ = mp.discover_compiled(("qwen3_0_6b",), root, llms_dir=llms, precision_plan="bf16")
+        assert compiled_b[("qwen3_0_6b", mp.SHIPPED_PREFILL_M)]["decode_cache"].endswith("build_peano/decode_kernel_cache")
+    # resume identity: distinct from the bf16 qwen decode rungs by the plan column
+    bound = prof.bind({("qwen3_0_6b", 2048): {"prefill_cache": "/c/p", "decode_cache": "/c/w4/d"}})
+    keys = {resume.rung_key(r.mode, r.seq, r.extra) for r in bound.rungs()}
+    bf16 = {resume.rung_key(r.mode, r.seq, r.extra) for r in mp.profile("model-smoke").rungs()
+            if r.phase == "decode" and r.model_id == "qwen3_0_6b"}
+    assert len(keys) == 3 and not keys & bf16
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

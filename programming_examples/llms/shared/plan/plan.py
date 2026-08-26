@@ -276,13 +276,16 @@ def fuse(graph, wl, placements, caps=NPU2_CAPS, forced=None):
             rejected.append(("o_ffn fused", "spatial: the fused cascade needs the lean form"))
     else:  # decode
         w4 = wl.precision_plan == "w4_decode"
-        if w4 and (qk or not lean):
-            # H2b brings w4_decode to the qk-norm models (the planner's int4
-            # GEMV candidates); the shipped int4 driver is the lean llama form
-            # only. Refusing beats silently naming bf16 stages a w4 plan.
+        if w4 and not lean:
+            # `[2026-08-26]` doc 56 H2b (queue item 18) lifted the qk-norm
+            # refusal: the int4 GEMV family covers the lean qk-norm form
+            # (Qwen3-0.6B: o_gemv_ffn_int4 at q_dim/k_chunk=emb). The
+            # NON-lean form still refuses -- no int4 split-form driver
+            # exists, and refusing beats naming bf16 stages a w4 plan.
             raise ValueError(
-                f"w4_decode decode plan exists only for the lean non-qk-norm form "
-                f"(the shipped llama32_1b_int4 driver); {spec.name} needs doc 56 H2b")
+                f"w4_decode decode plan exists only for the lean fused form "
+                f"(llama32_1b_int4's 3-launch cascade; qwen3_0_6b's decoupled sibling, doc 56 H2b); "
+                f"{spec.name} is outside the lean bounds")
         if qk:
             # `[2026-08-23]` doc 57 section 5 item 5c (queue item 11): ONE head-aligned GEMV whose
             # cores apply QK-norm + RoPE in L1 (mv_heads.cc), so the stage is RMSNorm + GEMV.
@@ -291,6 +294,25 @@ def fuse(graph, wl, placements, caps=NPU2_CAPS, forced=None):
             name = "rms_qkv_qknorm_rope_gemv2"
             rejected.append(("rms_qkv_qknorm_rope_gemv4", "4 launches (GEMV, QK-norm, RoPE as separate launches): superseded by the "
                              "head-epilogue GEMV, 0.672 -> 0.494 ms per layer (devq 555); kept behind QWEN3_RMS_QKV_LAUNCHES=4 for A/B"))
+            if w4:
+                # `[2026-08-26]` doc 56 H2b (queue item 18): under w4_decode
+                # the qk-norm QKV stage STAYS bf16 -- both int4 forms priced
+                # negative (results/item18-h2b-20260826/PREDICTION.md s2.B):
+                rejected.append(("rms_qkv int4 (launch-structure fallback)",
+                                 "int4 QKV without the in-core epilogue needs RMSNorm + int4 GEMV + QK-norm + RoPE "
+                                 "launches: +2 boundaries = +0.214 ms/layer against a stream ceiling of 0.152 ms/layer "
+                                 "(6.19 MB/layer at the boundary-free 40.8 GB/s) -- the measured 107 us boundary "
+                                 "(devq 450) beats the byte ceiling at ANY dequant speed; priced negative, doc 56 H2b"))
+                rejected.append(("rms_qkv int4 (in-core epilogue)",
+                                 "an int4 mv_heads (dequant + persistent-head accumulate + QK-norm/RoPE epilogue) is a "
+                                 "NEW kernel family, ceiling <= 2.3-4.5 ms/token at the measured 11-19 GB/s int4 rates, "
+                                 "with Q/K quantization error injected directly into attention; H2b's deliverable is "
+                                 "over the EXISTING int4 builders -- deferred, priced in PREDICTION.md s2.B1"))
+                rejected.append(("lm_head int4",
+                                 "doc 57 s5 item 6 (O4) measured the ten-launch int4 head on this model: -0.46 ms/token "
+                                 "ceiling (devq 488, 11 GB/s dequant-bound), the one-launch form cannot compile past 2 "
+                                 "iterations (push_queue repeat cap, devq 468), and the top-5 accuracy question is "
+                                 "deliberately unasked until a faster int4 GEMV exists; head stays bf16"))
         elif w4:
             # `[2026-08-26]` doc 56 H2a (queue item 17): the SHIPPED int4 decode
             # stage -- same 6-launch shape as rms_gemv_rope, the three GEMVs
@@ -307,12 +329,17 @@ def fuse(graph, wl, placements, caps=NPU2_CAPS, forced=None):
                   ("rope_q_L", 1, "RoPE"), ("rope_k_L", 1, "RoPE"))
             name = "rms_gemv_rope"
         ops = ["attn_norm_L", "q_proj_L", "k_proj_L", "v_proj_L"] + (["q_norm_L", "k_norm_L"] if qk else []) + ["rope_q_L", "rope_k_L"]
-        qkv_wb = wbytes("attn_norm_w_L") + (_w4_bytes(wbytes("wq_L", "wk_L", "wv_L")) if w4 else wbytes("wq_L", "wk_L", "wv_L")) \
+        # `[2026-08-26]` doc 56 H2b: under w4_decode a qk-norm model's QKV
+        # weights STAY bf16 (both int4 QKV forms priced negative, see the
+        # rejected entries above) -- only the non-qk llama form is int4 here.
+        qkv_w4 = w4 and not qk
+        qkv_wb = wbytes("attn_norm_w_L") + (_w4_bytes(wbytes("wq_L", "wk_L", "wv_L")) if qkv_w4 else wbytes("wq_L", "wk_L", "wv_L")) \
             + (wbytes("q_norm_w_L", "k_norm_w_L") if qk else 0)
         stages.append(Stage(name, DEVICE, tuple(ops), launches=sum(b[1] for b in bd), launch_breakdown=bd,
                             weight_bytes=qkv_wb,
                             boundary_bytes=g.nbytes("x_in_L") + (spec.n_heads + spec.n_kv_heads) * spec.head_dim * 2,  # x_in + the position LUT
-                            note=W4_BYTES_NOTE if w4 else ""))
+                            note=W4_BYTES_NOTE if qkv_w4 else
+                            ("w4_decode: QKV stays bf16 (int4 QKV priced negative, doc 56 H2b)" if w4 else "")))
         stages.append(Stage("kv_append", HOST, ("kv_append_L",), boundary_bytes=g.nbytes("k_roped_L") + g.nbytes("v_L") + g.nbytes("q_roped_L"),
                             note=placements["kv_append_L"].reason))
         stages.append(Stage("decode_attention_cpu", HOST, ("attention_L",), note=placements["attention_L"].reason,
@@ -325,7 +352,8 @@ def fuse(graph, wl, placements, caps=NPU2_CAPS, forced=None):
                                 launches=3, launch_breakdown=bd,
                                 weight_bytes=wbytes("ffn_norm_w_L") + _w4_bytes(wbytes("wo_L", "w_gate_L", "w_up_L", "w_down_L")),
                                 boundary_bytes=g.nbytes("x_out_L"),
-                                note="lean fused int4 O+FFN cascade (3 launches); " + W4_BYTES_NOTE))
+                                note="lean fused int4 O+FFN cascade (3 launches); " + W4_BYTES_NOTE
+                                + ("; O GEMV decoupled (K=q_dim), k_chunk=emb -- doc 56 H2b" if qk else "")))
         elif lean:
             bd = (("o_proj_L+residual_1_L", 1, "matvec_2tile_add"), ("ffn_norm_L+gate_proj_L+up_proj_L+swiglu_L", 1, "matvec_swiglu_rms cascade"),
                   ("down_proj_L+residual_2_L", 1, "matvec_2tile_add"))

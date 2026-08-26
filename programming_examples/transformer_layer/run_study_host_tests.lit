@@ -600,5 +600,25 @@
 // adapter's loaded-cache hop by source) and test_model_profiles +1 (the
 // w4-decode profile's three decode rungs, skip rule, resume keys disjoint
 // from the bf16 llama's).
+// `[2026-08-26]` 685 -> 690 in 32 modules, queue item 18 (doc 56 H2b): the
+// qwen w4_decode path -- test_w4_decode_pack.py NEW +3 (flag default OFF and
+// call-time env read; packed-BO dims equal the int4 cascade builder's OWN
+// `_packed_dims` at qwen's shapes (256/768/384 x 4288, k_chunk=1024); the
+// substituted loader fields bit-equal an independent dequant of what the
+// packed BOs hold, QKV untouched, quantization provably not a no-op,
+// idempotent), test_model_adapter +1 (the flag's wiring by source through
+// every hop: binding env map -> prepare-before-import -> driver import-time
+// read -> int4 dispatch/preload -> loader transform -> verify oracle patch
+// (o/gate/up/down and NEVER q_proj) -> gate subprocess env; plus the qwen
+// w4 quant columns from w4_decode_pack and the lifted-refusal plan counts
+// inside the existing quant-columns test), test_model_profiles +1 (the
+// w4-decode-qwen profile; plan-aware decode-set discovery: a missing
+// w4_decode set is a skip NAMING compile-decode, never a silent fall-through
+// to the shipped bf16 bytes; bf16 discovery byte-identical).
+// `[2026-08-26]` 690 -> 691, item 18's review round (devq 617, non-blocking b):
+// the llama o_gemv_ffn_int4 default-IR byte-identity control moves from ignored
+// evidence into test_w4_decode_pack.py -- parameter-neutrality (default ==
+// explicit q_dim=emb_dim) plus the reviewed control's golden sha, pinned the way
+// test_plan pins its goldens.
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 685/685 passed in 31 modules
+// CHECK: study host tests: 691/691 passed in 32 modules

@@ -107,11 +107,20 @@ def test_models_bind_the_three_drivers_and_nothing_else():
         assert (b.directory / "verify_adapter.py").is_file()
         assert b.verify_adapter == f"{model_id}.verify_adapter"
     assert ma.SUPPORTED_PRECISION_PLANS == ("bf16",)
-    # a precision plan is a DRIVER, not a flag (doc 56 sections 3.5 / H2a):
-    assert ma.MODELS["qwen3_0_6b"].precision_plans == ("bf16",)
+    # llama's plans are DRIVERS (doc 56 H2a); qwen3_0_6b's w4_decode is
+    # flag-selected since H2b (queue item 18) -- its FIRST plan names what the
+    # shipped build_peano decode cache implements (bf16), and the env map pins
+    # the flag in BOTH directions so an inherited env cannot flip a bf16 row.
+    bq = ma.MODELS["qwen3_0_6b"]
+    assert bq.precision_plans == ("bf16", "w4_decode")
+    assert bq.quant_contract_module == "qwen3_0_6b.w4_decode_pack"
+    assert bq.precision_env("bf16") == {"QWEN3_W4_DECODE": "0"}
+    assert bq.precision_env("w4_decode") == {"QWEN3_W4_DECODE": "1"}
     assert ma.MODELS["llama32_1b"].precision_plans == ("bf16",)
+    assert ma.MODELS["llama32_1b"].precision_env("bf16") == {}
     b4 = ma.MODELS["llama32_1b_int4"]
     assert b4.precision_plans == ("w4_decode",)
+    assert b4.precision_env("w4_decode") == {}
     assert b4.session_model_kwargs() == {"model_path": b4.hf_id}
     assert ma.MODELS["llama32_1b"].session_model_kwargs() == {"model_variant": "instruct"}
     assert b4.quant_contract_module == "llama32_1b_int4.awq_repacker"
@@ -231,7 +240,10 @@ def test_prepare_refuses_before_touching_a_driver():
     a = ma.ModelAdapter("qwen3_0_6b")
     _raises(KeyError, "unknown model", ma.ModelAdapter, "qwen3_4b")
     _raises(ValueError, "bound to", a.prepare, "llama32_1b", "bf16", {})
-    _raises(ValueError, "derived skip", a.prepare, "qwen3_0_6b", "w4_decode", {})
+    # a8 is nobody's plan yet (doc 56 section 3.5, scheduled last); qwen's
+    # w4_decode stopped being a refusal at H2b (queue item 18) and is
+    # exercised by test_qwen_w4_decode_is_flag_selected_through_every_hop.
+    _raises(ValueError, "derived skip", a.prepare, "qwen3_0_6b", "a8", {})
     # ... and the int4 driver is w4_decode-ONLY: asking it for bf16 is the
     # same derived skip in the other direction (doc 56 H2a).
     _raises(ValueError, "derived skip", ma.ModelAdapter("llama32_1b_int4").prepare, "llama32_1b_int4", "bf16", {})
@@ -540,8 +552,19 @@ def test_the_quant_columns_come_from_the_packing_code_and_differ_by_path():
     # bf16 rows: empty (doc 03 -- present and empty)
     assert ma.quant_columns("llama32_1b", "bf16") == {}
     assert ma.quant_columns("qwen3_0_6b", "bf16") == {}
-    # a qk-norm model has no w4_decode plan until H2b builds its candidates
-    _raises(ValueError, "H2b", ma.plan_for, "qwen3_0_6b", "decode", 1, 512, 2048, "w4_decode")
+    # `[2026-08-26]` H2b (queue item 18): qwen's w4_decode columns come from
+    # ITS packing owner (w4_decode_pack) -- same kernel contract and NAME as
+    # llama's (one mv_int4_bf16.cc, one packer layout), the provenance fields
+    # rewritten to the RTN reality (no AWQ checkpoint).
+    qq = ma.quant_columns("qwen3_0_6b", "w4_decode")
+    assert qq["quant_gemv_contract_name"] == W4_GEMV_CONTRACT
+    assert qq["quant_group_size"] == 128
+    assert "RTN" in qq["quant_gemm_contract"] and "fake_quantize" in qq["quant_gemm_contract"]
+    assert "in-kernel" in qq["quant_gemv_contract"] and "DIM_K=1024" in qq["quant_gemv_contract"]
+    assert set(qq) == set(q), "same schema columns as the llama contract"
+    pq = ma.plan_for("qwen3_0_6b", "decode", 1, 512, 2048, "w4_decode")
+    assert pq.elf_sequence() == ["rms_qkv_qknorm_rope_gemv2", "o_gemv_ffn_int4", "lm_head_gemv"]
+    assert (pq.total_submissions, pq.total_launches, pq.total_host_ops) == (57, 150, 58)
 
 
 def test_the_int4_driver_buckets_every_planned_host_stage():
@@ -576,6 +599,61 @@ def test_the_int4_driver_buckets_every_planned_host_stage():
     va = (d / "verify_adapter.py").read_text(encoding="utf-8")
     for needle in ("LLMS_VERIFY_PREFILL_CACHE", "LLMS_VERIFY_DECODE_CACHE", "LLMS_VERIFY_PREFILL_M", "load_manifest"):
         assert needle in va, needle
+
+
+def test_qwen_w4_decode_is_flag_selected_through_every_hop():
+    """`[2026-08-26]` doc 56 H2b (queue item 18), pinned by source (ast) the
+    way the scratch-layout hops are: the flag travels binding -> prepare env
+    -> driver import-time read -> dispatch, the loader applies the ONE
+    owner's transform under the flag, the verify oracle patches from the same
+    owner, and the gate subprocess gets the binding's env. Behavior tests for
+    the plan/profile sides live beside them; THIS test is the wiring."""
+    import ast
+
+    qdir = Path(_PE) / "llms" / "qwen3_0_6b"
+    # 1. the driver reads the flag at import time and dispatches the int4 stage
+    dec = (qdir / "qwen3_0_6b_decode.py").read_text(encoding="utf-8")
+    assert "from w4_decode_pack import w4_decode_selected" in dec
+    fns = {n.name: n for n in ast.walk(ast.parse(dec)) if isinstance(n, ast.FunctionDef)}
+    run = ast.unparse(fns["_run_o_gemv_ffn"])
+    assert "_W4_DECODE" in run and "_run_o_gemv_ffn_int4" in run
+    int4 = ast.unparse(fns["_run_o_gemv_ffn_int4"])
+    assert "_wo_packed" in int4 and "_wgateup_packed" in int4 and "_wdown_packed" in int4
+    assert "'o_gemv_ffn_int4'" in int4
+    comp = ast.unparse(fns["compile_decode_kernels"])
+    assert "o_gemv_ffn_int4" in comp and "int4_k_chunk" in comp
+    # the builder is a thin delegate over the llama int4 cascade (REUSE)
+    bld = ast.unparse(fns["build_o_gemv_ffn_int4_qwen_module"])
+    assert "o_gemv_ffn_int4_multi" in bld and "q_dim=q_dim" in bld
+    # 2. the loader applies the owner's transform under the flag
+    w = (qdir / "qwen3_0_6b_weights.py").read_text(encoding="utf-8")
+    assert "w4_decode_selected" in w and "quantize_decode_weights" in w
+    # 3. the owner substitutes dequant copies AND attaches the packed BOs
+    pack = (qdir / "w4_decode_pack.py").read_text(encoding="utf-8")
+    for needle in ("_wo_packed", "_wgateup_packed", "_wdown_packed", "GROUP_SIZE = 128", "K_CHUNK = 1024"):
+        assert needle in pack, needle
+    # 4. the verify oracle patches HF from the loader's substituted fields
+    va = (qdir / "verify_adapter.py").read_text(encoding="utf-8")
+    fns_v = {n.name: n for n in ast.walk(ast.parse(va)) if isinstance(n, ast.FunctionDef)}
+    hf = ast.unparse(fns_v["build_hf_model"])
+    assert "w4_decode_selected" in hf and "return None" in hf
+    for proj in ("o_proj", "gate_proj", "up_proj", "down_proj"):
+        assert proj in hf, proj
+    assert "q_proj" not in hf, "QKV stays bf16 -- the oracle must NOT patch it"
+    # 5. prepare applies the binding env BEFORE the driver import
+    maw = (Path(_PE) / "llms" / "shared" / "model_adapter.py").read_text(encoding="utf-8")
+    fns_m = {n.name: n for n in ast.walk(ast.parse(maw)) if isinstance(n, ast.FunctionDef)}
+    prep = ast.unparse(fns_m["prepare"])
+    assert prep.index("precision_env") < prep.index("_import_driver")
+    # ... and compile_decode exists and applies the same env
+    cdec = ast.unparse(fns_m["compile_decode"])
+    assert "precision_env" in cdec and "compile_decode_kernels" in cdec
+    # 6. the gate subprocess gets the binding env (run_model.run_verify)
+    rmw = (Path(_HERE) / "run_model.py").read_text(encoding="utf-8")
+    fns_r = {n.name: n for n in ast.walk(ast.parse(rmw)) if isinstance(n, ast.FunctionDef)}
+    rv = ast.unparse(fns_r["run_verify"])
+    assert "precision_env" in rv and "extra_env" in rv
+    assert "'precision_plan': spec['precision_plan']" in ast.unparse(fns_r["worker"])
 
 
 def main():

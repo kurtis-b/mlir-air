@@ -12,7 +12,7 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 
-def prepare_air_project(quant: str = "bf16", int4_gs: int = 128):
+def prepare_air_project(quant: str = "bf16", int4_gs: int = 128, int4_k_chunk: int = 2048):
     """Clean and prepare the air_project/ directory for a fresh compilation.
 
     aircc defaults to 'air_project/' as its working directory. Sequential
@@ -32,7 +32,7 @@ def prepare_air_project(quant: str = "bf16", int4_gs: int = 128):
     # Compile external kernels from source (not stale .o copies)
     from shared.infra.external_kernels import compile_all_external_kernels
 
-    compile_all_external_kernels(quant=quant, int4_gs=int4_gs)
+    compile_all_external_kernels(quant=quant, int4_gs=int4_gs, int4_k_chunk=int4_k_chunk)
 
     # Copy compiled .o files to air_project/ for aiecc to find. Must include
     # every external symbol referenced by `link_with` in the kernel modules:
@@ -461,7 +461,10 @@ class KernelCache:
         # prevents.
         backend_kwargs = dict(backend_kwargs)
         int4_gs = backend_kwargs.pop("int4_gs", 128)
-        prepare_air_project(quant=quant, int4_gs=int4_gs)
+        # `[2026-08-26]` doc 56 H2b: DIM_K rides the same channel as DIM_GS
+        # (qwen's int4 cascade is k_chunk=1024; llama's is 2048).
+        int4_k_chunk = backend_kwargs.pop("int4_k_chunk", 2048)
+        prepare_air_project(quant=quant, int4_gs=int4_gs, int4_k_chunk=int4_k_chunk)
         backend = XRTBackend(**backend_kwargs)
 
         t0 = time.time()

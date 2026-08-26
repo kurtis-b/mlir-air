@@ -123,6 +123,15 @@ class ModelBinding:
     #: Dotted module (under llms/) whose `quant_contract()` owns the quant_*
     #: column values for a non-bf16 plan; None for the bf16 drivers.
     quant_contract_module: str | None = None
+    #: `[2026-08-26]` doc 56 H2b (queue item 18): the env the driver reads to
+    #: select a plan, per plan -- {plan: {ENV: value}}. Empty for a driver
+    #: whose plan needs no flag (the bf16-only drivers; the int4 llama driver,
+    #: whose ONE plan is the driver itself). For qwen3_0_6b the w4_decode path
+    #: is flag-selected (QWEN3_W4_DECODE, default OFF), and the bf16 row PINS
+    #: the flag to 0 so an inherited env cannot silently flip a bf16 row to
+    #: w4. `prepare` applies this BEFORE importing the driver (the flag is
+    #: read at import time); the verify gate subprocess gets the same dict.
+    precision_env_map: dict = field(default_factory=dict)
 
     @property
     def directory(self) -> Path:
@@ -133,11 +142,22 @@ class ModelBinding:
             return {"model_path": self.hf_id}
         return {"model_variant": self.model_variant}
 
+    def precision_env(self, precision_plan: str) -> dict:
+        return dict(self.precision_env_map.get(precision_plan, {}))
+
 
 MODELS: dict[str, ModelBinding] = {
+    # `[2026-08-26]` doc 56 H2b (queue item 18): the qwen driver gains a
+    # flag-selected w4_decode path (o_gemv_ffn_int4 over packed RTN weights;
+    # QKV + LM head stay bf16 -- priced negatives, PREDICTION.md section 2).
+    # Default stays bf16; the flag row for bf16 PINS the env to 0.
     "qwen3_0_6b": ModelBinding(
         "qwen3_0_6b", "qwen3_0_6b", QWEN3_0_6B, "Qwen/Qwen3-0.6B", "instruct",
         "qwen3_0_6b.verify_adapter", prefill_prompt_len_kwarg=False,
+        precision_plans=("bf16", "w4_decode"),
+        quant_contract_module="qwen3_0_6b.w4_decode_pack",
+        precision_env_map={"bf16": {"QWEN3_W4_DECODE": "0"},
+                           "w4_decode": {"QWEN3_W4_DECODE": "1"}},
     ),
     "llama32_1b": ModelBinding(
         "llama32_1b", "llama32_1b", LLAMA32_1B, "meta-llama/Llama-3.2-1B-Instruct", "instruct",
@@ -512,11 +532,16 @@ class ModelAdapter:
         if precision_plan not in self.binding.precision_plans:
             raise ValueError(
                 f"precision_plan {precision_plan!r} is not implemented by the {model} driver "
-                f"(it implements {list(self.binding.precision_plans)}; a plan is a driver, not a flag: "
-                "w4_decode is the int4 sibling driver, doc 56 H2a) -- a derived skip, not a failure"
+                f"(it implements {list(self.binding.precision_plans)}; llama's w4_decode is the "
+                "int4 sibling driver (doc 56 H2a), qwen3_0_6b's is flag-selected (doc 56 H2b)) "
+                "-- a derived skip, not a failure"
             )
         if self.ms is not None:
             raise RuntimeError("prepare() twice in one process: the drivers' prepare_runtime is one-shot")
+        # `[2026-08-26]` doc 56 H2b: apply the plan's driver env BEFORE the
+        # driver import (qwen reads QWEN3_W4_DECODE at import time; the bf16
+        # row pins it to 0 so an inherited flag cannot flip a bf16 row).
+        os.environ.update(self.binding.precision_env(precision_plan))
         M = int(compiled_shapes["prefill_M"])
         prefill_dir = Path(compiled_shapes["prefill_cache"])
         decode_dir = Path(compiled_shapes["decode_cache"])
@@ -880,6 +905,47 @@ def compile_prefill(model_id: str, M: int, cache_dir: str | Path, *, cwd: str | 
                 {"o_ffn_gemm_method": o_ffn_gemm_method,
                  "why": "gemm_method= is a test-only override since item 14 (the cascade is per-GEMM and needs no forcing); this set was deliberately compiled off the registry's best method for this M, the deviation is recorded per set, and the drivers restore THIS layout from it"}
                 if o_ffn_gemm_method else None)}
+    (Path(cache_dir) / COMPILE_NOTE).write_text(json.dumps(note, indent=1), encoding="utf-8")
+    manifest["_compile"] = note
+    return manifest
+
+
+def compile_decode(model_id: str, cache_dir: str | Path, *, cwd: str | Path, precision_plan: str = "bf16", verbose: bool = False) -> dict:
+    """`[2026-08-26]` doc 56 H2b (queue item 18): compile the model's DECODE
+    artifact set under `precision_plan` into `cache_dir`, running in `cwd`
+    (each compile its own cwd -- the compile_prefill rule). The plan's driver
+    env is applied BEFORE the driver import (qwen's w4_decode is
+    flag-selected at import time); the plan and env are recorded in
+    `compile.json`. Decode ELFs are M-independent, so the set carries no M.
+    """
+    adapter = ModelAdapter(model_id)
+    if precision_plan not in adapter.binding.precision_plans:
+        raise ValueError(
+            f"precision_plan {precision_plan!r} is not implemented by the {model_id} driver "
+            f"(it implements {list(adapter.binding.precision_plans)})")
+    env = adapter.binding.precision_env(precision_plan)
+    os.environ.update(env)
+    cwd = Path(cwd)
+    cwd.mkdir(parents=True, exist_ok=True)
+    old = os.getcwd()
+    os.chdir(cwd)
+    try:
+        adapter._import_driver()  # puts llms/ + the model dir on sys.path
+        import importlib
+
+        decode_mod = importlib.import_module(f"{adapter.binding.package}_decode")
+        weights_mod = importlib.import_module(f"{adapter.binding.package}_weights")
+        from shared.infra.cache import KernelCache, Profiler
+
+        cache = KernelCache(str(Path(cache_dir).resolve()), verbose=verbose, profiler=Profiler(enabled=False))
+        t0 = time.perf_counter()
+        decode_mod.compile_decode_kernels(cache, weights_mod.LlamaConfig())
+        wall = time.perf_counter() - t0
+    finally:
+        os.chdir(old)
+    manifest = read_cache_manifest(cache_dir)
+    note = {"model_id": model_id, "precision_plan": precision_plan, "precision_env": env,
+            "wall_s": wall, "cwd": str(cwd), "artifact_deviation": None}
     (Path(cache_dir) / COMPILE_NOTE).write_text(json.dumps(note, indent=1), encoding="utf-8")
     manifest["_compile"] = note
     return manifest

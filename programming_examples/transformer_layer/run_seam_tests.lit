@@ -51,7 +51,7 @@
 // with the quant contract named per int4 GEMV, hashes apart from bf16, keeps
 // prefill bf16 (dequantized weights), and refuses a qk-norm model until H2b.
 // RUN: python3 %S/../llms/shared/plan/test_plan.py | FileCheck %s --check-prefix=PLAN
-// PLAN: 12/12 passed
+// PLAN: 13/13 passed
 //
 // `[2026-08-23]` Doc 57 O1 second half: the Qwen3 QKV stage's two host ABIs --
 // the driver's argument helper follows QWEN3_RMS_QKV_LAUNCHES, the 2-launch
