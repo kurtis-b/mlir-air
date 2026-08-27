@@ -594,6 +594,86 @@ round, so one fresh walk revalidates: walk 3 (devq 606) `complete: True`, verify
 sets, ubatch 512 / 1024 = **1125.2 / 1345.3 tok/s**, `compare_roots` walk1→walk3 OK (drift
 med 2.72 %, max 4.63 %, inside the band).
 
+### `[2026-08-26]` Item 27 — the GEMV used 8 of 32 cores, and the read ceiling is 50–54 GB/s, not 40.8
+
+**`results/item27-herd-rows-20260826/`**; prediction 02:04:25Z predates the first device job
+(devq 673, 02:32) by file time; devq 670–681.
+
+**The fact.** `matvec.py:163` built `@herd(sizes=[herd_m, 1])` and every shipped caller passed
+`herd_m = 8`, so every GEMV in the tree — the LM head, QKV, the int4 O+FFN cascade — occupied
+**8 of the device's 32 compute tiles: all 8 columns, 1 of 4 core rows.** The compiled artifact
+says so directly (`results/o1-epilogue-20260822/air_project/npu.air.mlir` names only
+`aie.tile(0..7, 0|1|2)`, and shows the L2 A-panel as eight `memref<1x8x1088xbf16, 1>` buffers,
+one per memtile — which also settles that the `herd_m` axis IS the column axis).
+
+**What was built.** `matvec.py` gains `herd_rows` (default 1; the eight shipped call-site
+shapes are **byte-identical**, SHA-256 checked both directions by `control/ir_sha.py --check`,
+and an explicit `herd_rows=1` equals the default). The split is **output-stationary** — core
+`(tx,ty)` owns `tile_m` rows and the full K, so no partial sum crosses a core and no reduction
+is added. At decode M=1 there is no weight reuse, so weight-stationary is not an available
+choice; a **K split** is the alternative and is unbuilt, and the shape that forces it is named:
+`M < tile_m·herd_m·herd_rows = 256` rows, i.e. `kv_dim < 256`. **Rows cost no DDR path** —
+one shim MM2S per column at every row count, verified in the artifacts; the memtile fans out.
+
+**The curve** (K=1024, `tile_m=8`, M ∈ {1536, 3072, 6144}, each geometry its OWN fitted slope
+and intercept per item 23 §7.3, residuals ≤ 2.5 µs, Turbo before and after every job):
+
+| cores (8 cols × rows) | int4 GB/s | bf16 GB/s | fixed µs (int4 / bf16) |
+|---|---|---|---|
+| 8 (rows 1) | **22.79** | **35.72** | 180.5 / 158.8 |
+| 16 (rows 2) | **38.99** (1.71×) | **44.43** (1.24×) | 222.3 / 208.5 |
+| 32 (rows 4) | **53.85** (2.36×) | **50.03** (1.40×) | 336.8 / 325.5 |
+
+**Item 23 §7.2's "the shipped int4 GEMV is compute-bound at 8 cores" is CONFIRMED** — the
+falsifier needed < 1.2× at 16 cores and got 1.71×. The instrument reproduces item 23: its
+unmodified builder reads 20.84 GB/s here against 21.10 there, 1.2 % apart (devq 679).
+
+**The wall, and the three-way contest settled.** Two different kernels on two different byte
+streams converge at **50.03 and 53.85 GB/s**. **All three contested ceilings are too low**:
+DAM-RS's read-half **36.5 is exceeded by 47 %**, **§4's own 40.8 by 32 %**, PANG26's **45.3 by
+19 %**. DAM-RS's 72.9 aggregate is not reached (53.85 is 74 % of it) and is not contradicted.
+A geometry sweep holding cores fixed and varying columns (devq 680) resolves it into **three
+nested ceilings — ~4.5 GB/s per core, ~10.1 GB/s per column, 50–54 GB/s device-wide** — since
+8 columns × 4 rows demands 81 GB/s at the per-column figure and receives 50–54.
+
+**PROPOSED CORRECTION, not applied here.** §4:1108's "the machine's *maximum* measured rate
+(40.8 GB/s)" is contradicted by measurement: 40.8 is one production kernel's rate at 8 of 32
+compute tiles, not a device property. The replacement text is drafted in the item's
+`RESULTS.md` §12; **it is proposed for the operator rather than made silently**, and every
+figure in this document derived from 40.8 *as a maximum* should be re-derived at 50–54.
+Doc 57 §7.7's two OPEN flags can both close on this evidence.
+
+**What it means for the decode token — and what may NOT be claimed.** Rows raise the slope AND
+the fixed cost (~+6.5 µs per added core, and `tile_m=16` does not shrink it, devq 681), so the
+answer is a byte threshold, not a yes/no: **2 rows pay above 2.29 MB of packed int4 / 9.06 MB
+of bf16; 4 rows above 6.18 / 20.82 MB.** Priced at shipped shapes, the Qwen3-0.6B LM head
+partition (33.6 MB) wants 2 rows (−12 %), the 1.7B partition (67.1 MB) wants 4 (−18 %), the
+`o_gemv_ffn_int4` cascade (6.04 MB/call) wants 2 (−15 %), and the QKV GEMVs (2.1–8.4 MB) want
+1. **No ms/token figure is claimed**: item 23's F2 forbids carrying this standalone harness's
+fixed cost into the cascade, so only the slope transfers — for the int4 cascade that is
+**110 µs of streaming time per call removed at 2 rows**, against an intercept that must be
+re-measured in the driver. **Nothing is flipped; `herd_rows` lands at 1 and no caller passes
+it.**
+
+**Two walls, both with their exact text in the item's §6.** (1) At `herd_rows > 1` each
+column's L2 A tile becomes single-writer / multi-reader and the shipped decode preset **hangs
+the device** (`ERT_CMD_STATE_TIMEOUT`, devq 673); bisected over three knobs (devq 674), **only
+`--use-lock-race-condition-fix` unblocks it** — ping-pong and `runtime_loop_tiling_sizes` are
+irrelevant — and it costs +0.8 % at 8 cores. **Any future caller of `herd_rows > 1` must set a
+lock fix or the device hangs.** (2) `air-split-l2-memref` **aborts aircc** (returncode −6, in
+`tileChannelOpByFactor`) on a 2-D L2 staging memref; flattening the buffers works around it in
+the builder, `mlir/` untouched, but the pass still refuses the int4 row builder at `herd_m` 4
+and 2. It deserves its own queue item; the reproducer is `run_matrix.sh`.
+
+**Correctness.** A derived per-element bound, no cosine: for bf16 the three rounding sites of
+`mv.cc` charged separately (exact bf16 products, `2⁻²⁴` per lane accumulation, a binary-tree
+`reduce_add`, and a **2⁻⁸ half-ulp** bf16 store — the guaranteed figure, where item 23's family
+used the optimistic 2⁻⁹); for int4, item 23's own `fold_bounds` imported unmodified.
+**0 violations of 150,528 elements over 42 measured points**, worst point at 0.994 of its bound.
+`air.launch` count and PDI count are **invariant with rows** (1 and 5 at rows 1/2/4), so no new
+multi-launch form exists and LOAD_PDI parity is unchanged. Study host suite 720/720 in 33,
+unchanged.
+
 ## 5. The first measurable milestone
 
 **A two-point Qwen3-0.6B bf16 prefill curve at ubatch 512 and 1024 over the same 1024-token
