@@ -32,11 +32,11 @@
 // Entries (all take the SAME (packed, b_bf16, c_bf16) signature as the bf16
 // kernel, so no builder change is needed to swap one in):
 //
-//   matvec_int4_int8_packed        - zero point subtracted in the inner loop.
-//                                    Numerically the closest match to the bf16
-//                                    kernel: the value the group accumulator
-//                                    truncates to bf16 is the same centred
-//                                    (q - z) * b it truncates there.
+//   (The entry that subtracted the zero point inside the inner loop,
+//    `matvec_int4_int8_packed`, was REMOVED on 2026-08-26 -- it measured
+//    rel RMS 0.18 on device against an unexplained cause and no gated arm
+//    used it. See the note above its former position.)
+//
 //   matvec_int4_int8_packed_zhoist - zero point hoisted out of the inner loop
 //                                    via  sum (q-z)b = sum qb - z sum b.
 //                                    3 fewer ops per group; the group
@@ -128,7 +128,8 @@ static void quantize_activation(const bfloat16 *__restrict b,
 // ---------------------------------------------------------------------------
 // The GEMV itself. c[row] += sum_g s_a[g,row]*s_b[g] * sum_{k in g} (q-z)*bq
 // ---------------------------------------------------------------------------
-template <unsigned m, unsigned k, unsigned gs, bool ZHOIST>
+template <unsigned m, unsigned k, unsigned gs, bool ZHOIST,
+          bool WITH_CORR = true>
 static void matvec_int4_int8_impl(const uint8_t *__restrict a_q,
                                   const bfloat16 *__restrict a_s,
                                   const uint8_t *__restrict a_z,
@@ -165,7 +166,12 @@ static void matvec_int4_int8_impl(const uint8_t *__restrict a_q,
           g_acc = aie::mac(g_acc, w, bv);
         }
         // - z * sum(bq) folded on the scalar side, once per (row, group).
-        corr += sab_f * (float)zs * (float)bsum[g];
+        // WITH_CORR=false DELETES this at compile time (arm B1) rather than
+        // zeroing an input at run time -- zeroing leaves the two scalar float
+        // multiplies and the add in the instruction stream, which is exactly
+        // why arm C could not ablate what it claimed to.
+        if constexpr (WITH_CORR)
+          corr += sab_f * (float)zs * (float)bsum[g];
       } else {
         const aie::vector<int8, R> zv = aie::broadcast<int8, R>(zs);
 #pragma clang loop unroll(full)
@@ -203,24 +209,112 @@ static void matvec_int4_int8_impl(const uint8_t *__restrict a_q,
   }
 }
 
+
+// Per-K-CHUNK activation quantisation: ONE scale for the whole chunk instead of
+// one per group of gs. This is the repair item 23 proposed and never built. It
+// exists so that `s_b` factors out of the group loop entirely --
+//     c[row] = s_b * sum_g s_a[g,row] * L_g
+// -- leaving the inner fold a single bf16 LOAD feeding a vector MAC (exactly
+// the shipped bf16 kernel's fold, zero scalar float) and ONE scalar multiply
+// per ROW instead of 64 per call. It costs accuracy: the activation scale is
+// now set by the chunk maximum, not the group maximum.
+template <unsigned k>
+static void quantize_activation_chunk(const bfloat16 *__restrict b,
+                                      int8_t *__restrict bq, float *sb_out) {
+  ::aie::set_rounding(aie::rounding_mode::conv_even);
+  bfloat16 mx = (bfloat16)0.0f;
+  for (unsigned i = 0; i < k; i += R) {
+    aie::vector<bfloat16, R> v = aie::load_v<R>(b + i);
+    bfloat16 mm = aie::reduce_max(aie::abs(v));
+    mx = (float)mm > (float)mx ? mm : mx;
+  }
+  float s = (float)mx * (1.0f / 127.0f);
+  float inv = ((float)mx == 0.0f) ? 0.0f : (127.0f / (float)mx);
+  *sb_out = s;
+  for (unsigned i = 0; i < k; i += R) {
+    aie::vector<bfloat16, R> v = aie::load_v<R>(b + i);
+    aie::accum<accfloat, R> sc = aie::mul(v, (bfloat16)inv);
+    aie::vector<bfloat16, R> vs = sc.template to_vector<bfloat16>();
+    aie::store_v(bq + i, aie::to_fixed<int8>(vs, 0));
+  }
+}
+
+// The repaired GEMV. Per (row, group) the ONLY scalar work is a bf16 load --
+// byte for byte the shipped bf16 kernel's fold. WIDE=true swaps aie::mac for
+// the wide elementwise form `::mac_elem_64_2_conf(v128int8, v128int8, v64acc32)`
+// = 128 int8 MACs in ONE instruction, which aie::mac cannot reach (it is pinned
+// to the half-width I512 form and chunks by 64: aie_api mul_acc32.hpp:64-72,
+// 79-102; verified by disassembly in isa_probe/probe_wide.dis -- aie::mac over
+// 128 int8 emits TWO vmac, the intrinsic emits ONE).
+template <unsigned m, unsigned k, unsigned gs, bool WIDE>
+static void matvec_int4_int8_chunk_impl(const uint8_t *__restrict a_q,
+                                        const bfloat16 *__restrict a_s,
+                                        const uint8_t *__restrict a_z,
+                                        const int8_t *__restrict bq,
+                                        float sb, bfloat16 *__restrict c) {
+  ::aie::set_rounding(aie::rounding_mode::conv_even);
+  constexpr unsigned RW = WIDE ? 128 : R;   // elements consumed per MAC
+  constexpr unsigned NSUB = gs / RW;
+
+  for (unsigned row = 0; row < m; row++) {
+    aie::accum<accfloat, R> acc;
+    acc.from_vector(aie::zeros<float, R>());
+    const uint8_t *__restrict aq = a_q + row * (k / 2);
+
+    for (unsigned g = 0; g < k / gs; g++) {
+      aie::accum<acc32, R> g_acc;
+      g_acc.from_vector(aie::zeros<int32, R>());
+
+      if constexpr (WIDE) {
+        const aie::vector<int8, 128> zv = aie::broadcast<int8, 128>(
+            (int8_t)a_z[g * m + row]);
+#pragma clang loop unroll(full)
+        for (unsigned i = 0; i < NSUB; i++) {
+          const unsigned off = (g * gs + i * 128) / 2;
+          aie::vector<uint8, 64> packed = aie::load_v<64>(aq + off);
+          aie::vector<int8, 128> w =
+              packed.template cast_to<uint4>().template unpack_sign<int8>(false);
+          w = aie::sub(w, zv);
+          aie::vector<int8, 128> bv = aie::load_v<128>(bq + g * gs + i * 128);
+          g_acc = aie::accum<acc32, R>(::mac_elem_64_2_conf(
+              (v128int8)w, (v128int8)bv, (v64acc32)g_acc, 0, 0, 0, 0));
+        }
+      } else {
+        const aie::vector<int8, R> zv =
+            aie::broadcast<int8, R>((int8_t)a_z[g * m + row]);
+#pragma clang loop unroll(full)
+        for (unsigned i = 0; i < NSUB; i++) {
+          const unsigned off = (g * gs + i * R) / 2;
+          aie::vector<uint8, R / 2> packed = aie::load_v<R / 2>(aq + off);
+          aie::vector<int8, R> w =
+              packed.template cast_to<uint4>().template unpack_sign<int8>(false);
+          w = aie::sub(w, zv);
+          aie::vector<int8, R> bv = aie::load_v<R>(bq + g * gs + i * R);
+          g_acc = aie::mac(g_acc, w, bv);
+        }
+      }
+
+      aie::vector<int16, R> g_i16 = g_acc.template to_vector<int16>(0);
+      aie::vector<bfloat16, R> g_bf16 = aie::to_float<bfloat16>(g_i16, 0);
+      // THE POINT OF THIS VARIANT: a bf16 LOAD, no scalar float at all.
+      acc = aie::mac(acc, g_bf16, a_s[g * m + row]);
+    }
+    // one scalar float multiply per ROW, not 64 per call
+    float s = aie::reduce_add(acc.template to_vector<float>());
+    c[row] = (bfloat16)((float)c[row] + sb * s);
+  }
+}
+
 extern "C" {
 
-// Primary entry: zero point subtracted in the inner loop (accuracy-matched to
-// mv_int4_bf16.cc's group accumulator magnitude).
-void matvec_int4_int8_packed(uint8_t *packed, bfloat16 *b, bfloat16 *c) {
-  constexpr unsigned Q_BYTES = DIM_M * (DIM_K / 2);
-  constexpr unsigned S_BYTES = (DIM_K / DIM_GS) * DIM_M * 2;
-  const uint8_t *a_q = packed;
-  const bfloat16 *a_s = reinterpret_cast<const bfloat16 *>(packed + Q_BYTES);
-  const uint8_t *a_z = packed + Q_BYTES + S_BYTES;
-
-  alignas(32) int8_t bq[DIM_K];
-  alignas(32) bfloat16 sb[DIM_K / DIM_GS];
-  alignas(32) int32_t bsum[DIM_K / DIM_GS];
-  quantize_activation<DIM_K, DIM_GS>(b, bq, sb, bsum);
-  matvec_int4_int8_impl<DIM_M, DIM_K, DIM_GS, false>(a_q, a_s, a_z, bq, sb,
-                                                     bsum, c);
-}
+// NOTE (2026-08-26, after the DAM-RS cross-check): the entry that subtracted
+// the zero point inside the inner loop, `matvec_int4_int8_packed`, HAS BEEN
+// REMOVED. It measured relative RMS 0.18 on device (devq 661) against an
+// unexplained cause, while every gated arm invoked `_zhoist`. Exporting a
+// symbol that is known-wrong and ungated is a trap for any caller that picks
+// the nominal name, so it is gone rather than documented. The in-loop subtract
+// itself is not the suspect -- `matvec_int4_int8_chunk` below uses it and is
+// gated -- so the discrepancy remains an open lead, not a known defect.
 
 // Zero point hoisted out of the inner loop.
 void matvec_int4_int8_packed_zhoist(uint8_t *packed, bfloat16 *b, bfloat16 *c) {
@@ -298,6 +392,56 @@ void matvec_int4_int8_packed_diag(uint8_t *packed, bfloat16 *b, bfloat16 *c) {
   c[5] = (bfloat16)(float)a_z[0];     // zero point
   c[6] = (bfloat16)(float)(int)w[0];  // first unpacked, centred weight
   c[7] = gb[0];                       // first lane of the folded group product
+}
+
+
+// B1 ablation -- TIMING ONLY, NUMERICALLY WRONG BY CONSTRUCTION. `_zhoist`
+// with the zero-point correction chain deleted (the `corr` accumulation, two
+// scalar float multiplies and an add per (row,group)). It drops the z term, so
+// its OUTPUT IS NOT THE GEMV and no correctness claim is made or accepted for
+// it. It exists to price the corr chain, which arm C did NOT ablate.
+void matvec_int4_int8_packed_nocorr(uint8_t *packed, bfloat16 *b, bfloat16 *c) {
+  constexpr unsigned Q_BYTES = DIM_M * (DIM_K / 2);
+  constexpr unsigned S_BYTES = (DIM_K / DIM_GS) * DIM_M * 2;
+  const uint8_t *a_q = packed;
+  const bfloat16 *a_s = reinterpret_cast<const bfloat16 *>(packed + Q_BYTES);
+  const uint8_t *a_z = packed + Q_BYTES + S_BYTES;
+  alignas(32) int8_t bq[DIM_K];
+  alignas(32) bfloat16 sb[DIM_K / DIM_GS];
+  alignas(32) int32_t bsum[DIM_K / DIM_GS];
+  quantize_activation<DIM_K, DIM_GS>(b, bq, sb, bsum);
+  matvec_int4_int8_impl<DIM_M, DIM_K, DIM_GS, true, /*WITH_CORR=*/false>(
+      a_q, a_s, a_z, bq, sb, bsum, c);
+}
+
+// B2 -- per-K-chunk activation scale, in-loop zero subtract, no scalar float in
+// the group loop. NUMERICALLY CORRECT (a coarser but legitimate activation
+// quantisation) and gated.
+void matvec_int4_int8_chunk(uint8_t *packed, bfloat16 *b, bfloat16 *c) {
+  constexpr unsigned Q_BYTES = DIM_M * (DIM_K / 2);
+  constexpr unsigned S_BYTES = (DIM_K / DIM_GS) * DIM_M * 2;
+  const uint8_t *a_q = packed;
+  const bfloat16 *a_s = reinterpret_cast<const bfloat16 *>(packed + Q_BYTES);
+  const uint8_t *a_z = packed + Q_BYTES + S_BYTES;
+  alignas(32) int8_t bq[DIM_K];
+  float sb;
+  quantize_activation_chunk<DIM_K>(b, bq, &sb);
+  matvec_int4_int8_chunk_impl<DIM_M, DIM_K, DIM_GS, false>(a_q, a_s, a_z, bq,
+                                                           sb, c);
+}
+
+// B3 -- B2 plus the WIDE elementwise int8 MAC at 128 elements/instruction.
+void matvec_int4_int8_chunk_wide(uint8_t *packed, bfloat16 *b, bfloat16 *c) {
+  constexpr unsigned Q_BYTES = DIM_M * (DIM_K / 2);
+  constexpr unsigned S_BYTES = (DIM_K / DIM_GS) * DIM_M * 2;
+  const uint8_t *a_q = packed;
+  const bfloat16 *a_s = reinterpret_cast<const bfloat16 *>(packed + Q_BYTES);
+  const uint8_t *a_z = packed + Q_BYTES + S_BYTES;
+  alignas(32) int8_t bq[DIM_K];
+  float sb;
+  quantize_activation_chunk<DIM_K>(b, bq, &sb);
+  matvec_int4_int8_chunk_impl<DIM_M, DIM_K, DIM_GS, true>(a_q, a_s, a_z, bq, sb,
+                                                          c);
 }
 
 // Same zero epilogue the bf16 kernel exports, so the builder's zero call

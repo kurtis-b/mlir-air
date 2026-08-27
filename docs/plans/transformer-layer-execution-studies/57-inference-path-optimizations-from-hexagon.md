@@ -725,64 +725,144 @@ double-buffered, K transposed on-device by scatter; their FA solver packs `Br` q
 `G` GQA heads into the 32-row tile (`br_unit = ceil(32/G)`, `htp/flash-attn-ops.h:277`) so GQA
 *fills* the matrix engine instead of replicating K. That is H3 stage 4.
 
-**`[2026-08-26]` Item 23 built the integer GEMV and measured it: integer compute
-LOSES to fused-dequant-to-bf16 by 11× at decode, and the reason is the scalar
-unit, not the MAC (devq 651/657/661/658/667; `programming_examples/transformer_layer/results/item23-int-gemv-20260826/`).**
-Three ISA facts first, all from the headers and from disassembly, none from a
-datasheet. (a) AIE2P's **elementwise** integer MAC has **no rate advantage
-whatsoever** over bf16 — both are `mac_elem_64_conf`, 64 lanes, 64
-MACs/instruction (`aie_api/detail/aie2p/mul_acc32.hpp:70`,
-`mul_acc32_fp.hpp:45`) — so "integer arithmetic is faster" is a priced negative
-on the engine a GEMV uses. (b) The MAC array *does* carry a dense int8×int4 mode,
-`mac_4x16_16x16_conf(v64int8, v256int4, v64acc32)` (`aie2p_vmult.h:39583`) at
-1024 MACs/intrinsic against bf16's 512-via-bfp16 — and AIE2P has **no native
-dense bf16 MAC-array instruction at all**, `mac_4x8_8x8_bf16` being absent from
-the entire aie2p Peano header set, which is why
-`-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16` is mandatory in seven places in this
-tree and why compiling a bf16 `mmul` without it silently emulates at 32
-MACs/issue. But at decode M=1 that mode idles 3 of its 4 A-rows and runs ~6×
-past the 40.8 GB/s stream wall, so it cannot be paid for; deliberately not built.
-(c) **There is no `vrmpy` analogue**: `sliding_mul`'s int8 mode is a real 8× over
-its bf16 emulation (`mac_conv_64x8`, 512 MACs/instruction) but computes
-`out[l] = Σ_p data[l+p]·coeff[p]`, a convolution, not Hexagon's per-lane grouped
-dot product — **§5b's design cannot be transliterated instruction-for-instruction.**
-Measured at Qwen3-0.6B's gate/up GEMV (M=6144, K=1024, gs=128, M_TILE=8, 3.293 MB
-packed; fixed cost fitted in-session from a three-point M sweep, residuals
-≤ 2.3 µs), compute-only: **shipped bf16 22.92 GB/s; the int8 prototype 2.06 GB/s
-(0.09×); the same prototype with activation quantisation removed 2.63 GB/s
-(0.11×)**. **The kernel is CORRECT** — 0/6144 violations of a derived strict
-per-element bound at all three M — and 3.9× less accurate than bf16 (rel RMS
-0.00929 vs 0.00238), of which 0.00758 is the int8 activation quantisation itself,
-against 0.66 % derived before measuring. **Where it dies is the scalar unit:** the
-integer fold needs a per-(row, group) *product* of the weight scale and the
-on-device activation scale, where bf16 needs one bf16 **load** and no arithmetic;
-compiled side by side that is **58 VLIW bundles against 17, with stack spills**
-(`isa_probe/probe_scalar.cc`), executed 64× per kernel call against an inner loop
-of 8×8×25 vector ops. Removing the quantiser recovers only 27.7 %, so the
-quantiser is not the problem — the fold is. A production repair exists and costs
-the thing that motivated the design: `s_b` must stop varying per group (per-K-chunk
-activation quantisation, **not** Hexagon's per-32) so it factors out of the group
-loop. **Recommendation: stop.** Two traps are worth carrying regardless: on an
-INTEGER accumulator `acc32→bf16` compiles to one instruction and
-**bit-reinterprets rather than converts** (`accum.hpp:1090-1095` does not
-constrain the accumulator `Class`; the whole GEMV returned ~0, rel RMS 1.0, devq
-651), and `accum<accfloat>::to_vector<int8>()` does the same in reverse — the
-tree's correct route is FP-accum → bf16 vector → `aie::to_fixed`, as
-`llama2_mha/mha.cc:137` already does. **An instruction-count probe cannot see
-either; only a value check on device can.**
+**`[2026-08-26, corrected 2026-08-26 after the DAM-RS cross-check]` Item 23 built the
+integer GEMV and measured it: integer compute LOSES to fused-dequant-to-bf16 at decode
+by 10.0× as built and by 1.7× after every repair, and a four-rung ablation now says
+why (devq 651/657/661/658/667/669;
+`programming_examples/transformer_layer/results/item23-int-gemv-20260826/`).**
+This block supersedes the version committed at `4ba343f8`, which stated ISA claim (a)
+falsely and mis-attributed the deficit. The corrections were forced by
+`results/item26-damrs-recon-20260826/` (a DAM-RS reconciliation and a Codex review, both
+of which the operator was right to order) and then settled on device.
 
-**`[2026-08-26]` A free 1.10× on the SHIPPED int4 GEMV, found while building the
+**(a) — CORRECTED, the committed version was FALSE.** The machine *does* give integer a
+**2×** elementwise advantage. AIE2P's elementwise MAC unit is 1024b × 1024b → 2048b
+accumulator either way; bf16 gets **64** MACs out of that operand pair
+(`mac_elem_64_conf(v64bfloat16,…)` → `__builtin_aie2p_I1024_I1024_ACC2048_bf_mac_conf`,
+`aie2p_vmult.h:38752`) and **int8 gets 128**
+(`mac_elem_64_2_conf(v128int8, v128int8, v64acc32,…)` →
+`__builtin_aie2p_I1024_I1024_ACC2048_mac_conf`, `aie2p_vmult.h:5348`). What item 23
+originally measured was `aie::mac`'s int8 specialisation, which is hard-coded to the
+**half-width** `I512_I512` form and chunks operands by 64
+(`aie_api/detail/aie2p/mul_acc32.hpp:64-72, 79-102`) — an `aie_api` wrapper, not the ISA.
+Verified here by disassembly, not by header reading (`isa_probe/probe_wide.dis`):
+**`aie::mac` over `vector<int8,128>` emits TWO `vmac`; `mac_elem_64_2_conf` emits ONE.**
+This 2:1 matches AM027's documented peak (int8 512 vs bf16 256 MAC/cycle) and Taka et
+al.'s measured GEMM ratio (450.6 vs 158.1). The correct statement is: *the shipped
+kernel's* integer MAC has no advantage, because `aie::mac` cannot reach the wide form.
+**Note also the unit**: everything item 23 counts is work per *emitted instruction*, not
+issue cadence — no throughput claim here rests on a measured rate.
+**And it is immaterial at this kernel**: arm B3 below applies the wide form and measures
+**+0.8 %**, because the MAC is ~2 of 25 instructions in the group body.
+
+**(b) — RESTATED.** The MAC array carries a dense int8×int4 mode,
+`mac_4x16_16x16_conf(v64int8, v256int4, v64acc32)` (`aie2p_vmult.h:39583`), 1024
+MACs/intrinsic over 2 issues, against bf16's 512-via-bfp16 in 1 — and AIE2P has **no
+native dense bf16 MAC-array instruction**, `mac_4x8_8x8_bf16` being absent from the whole
+aie2p Peano header set (which is why `-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16` is
+mandatory in seven places here; DAM-RS measures the consequence on this machine at **9×**,
+27.4–27.6 vs 238.6–254.4 MAC/cycle — two independent methods, one phenomenon). The
+committed version then concluded the array route "cannot be paid for". **That proves the
+wrong thing.** After idling 3 of 4 A-rows at M=1 the mode still supplies 128 useful
+MACs/issue — **2× the elementwise 64**. At the *measured* clock (below) the loop's 32
+packed B/cycle/core over 8 cores is **458 GB/s** of weight demand against DAM-RS's
+measured **72.9 GB/s** aggregate DDR: that shows the array route would be
+**bandwidth-bound — surplus compute, not an unusable route**. It is the right instrument
+for prefill and for batched/speculative decode (the weights are reused across
+`ceil(B/4)` calls, so the crossover is B ≳ 25 at 72.9 GB/s, B ≳ 45 at 40.8), and it is
+unreachable at B = 1 for a bandwidth reason, not an efficiency one. **It was deliberately
+not built, so its exclusion at decode is an argument, not a measurement.**
+
+**(c) — SOFTENED.** `sliding_mul`'s int8 mode is a real 8× over its bf16 emulation
+(`mac_conv_64x8`) but computes `out[l] = Σ_p data[l+p]·coeff[p]`, a sliding window, which
+does not map onto a GEMV. But "AIE2P has no `vrmpy` analogue" is too strong:
+`mac_elem_64_2_conf` **is** a per-lane grouped dot product, 2-way against Hexagon's 4-way,
+int8 only.
+
+**THE CLOCK — every rate in the committed version was 1.8× low.** Item 23 converted
+instruction counts at "~1 GHz", which is Phoenix/XDNA1. This machine measures
+**1789.4 MHz** (DAM-RS `calibration/results/clock-2026-08-23.txt`, trace-measured,
+corroborated by Taka 1.8 and Estévez 1.808 GHz). Redone at 1.7894 GHz × 8 cores, the
+instruction-count model predicts **19.5 GB/s** for the shipped bf16 body (47 ops/group)
+and **26.9** for the r=64 body (34 ops), against measured **21.10** and **22.48** — **7–20 %**,
+where the committed "within 9 %" was a coincidence of a 1.8× clock error landing on a
+cascade measurement item 23 had *itself* already declared non-comparable (falsifier F2).
+**Consequence: the shipped int4 GEMV is compute-bound at 8 cores, not stream-bound.**
+The committed claim that "bf16 is stream-bound" rested on a 205 GB/s figure derived from a
+*bare MAC loop*, not from the kernel; it is withdrawn.
+
+**THE MEASUREMENT (corrected).** Qwen3-0.6B's gate/up GEMV, M=6144 / K=1024 / gs=128 /
+M_TILE=8 / N_CORES=8, 3.293 MB packed. **Every rate below is that arm's OWN fitted slope
+over a three-point M sweep** (residuals ≤ 2.5 µs); the committed 11× came from replacing
+each arm's intercept with the mean of all arms', which is a shared-intercept substitution.
+
+| arm | compute-only GB/s | vs shipped | vs best bf16 |
+|---|---|---|---|
+| A — bf16 r=32, **shipped** | **21.10** | 1.00× | 0.94× |
+| A2 — bf16 r=64 (one-token change) | **22.48** | 1.07× | 1.00× |
+| B0 — int8 as built | **2.10** | **0.10×** | 0.09× |
+| B1 — B0, zero-point `corr` chain deleted at compile time | **8.71** | 0.41× | 0.39× |
+| B2 — B1 + per-K-chunk `s_b` (no scalar float in the group loop) | **13.07** | 0.62× | 0.58× |
+| B3 — B2 + the wide `mac_elem_64_2_conf` at R=128 | **13.18** | 0.62× | 0.59× |
+
+**The mechanism is now measured, not asserted.** The committed version blamed the
+per-(row,group) scalar scale fold and priced it at 58 VLIW bundles against bf16's 17 —
+which accounts for only 1.4–1.9× of the deficit, leaving ~6–8× unexplained, as the
+reconciliation correctly objected. The ablation closes most of that gap and reorders the
+causes: **deleting the zero-point correction alone is 4.15×** (two scalar float multiplies
+and an add per (row,group) — a term item 23 never ablated and the reconciliation predicted
+at "<2×"), **and per-K-chunk `s_b` adds a further 1.50×**, for **6.2× of the 10.0×**
+recovered by removing scalar floating-point alone. **A residual ~1.6× is still
+unexplained** (B2 measures 13.07 against the 32.7 its 28-op body predicts) and is *not*
+attributed here. **The wide MAC contributes +0.8 %** — the ISA correction in (a) is a
+documentation fix at this kernel structure.
+
+**Arm C's conclusion is withdrawn.** The committed version said removing the quantiser
+"recovers only 27.7 %, so the quantiser is not the problem — the fold is." Arm C ran the
+same implementation with runtime `sb=1, bsum=0`, so the scale fold and `corr` chain stayed
+in the instruction stream: it ruled out the quantiser (valid) and **could not confirm the
+fold** (invalid). B1 above is the real ablation — the term is deleted at compile time.
+
+**Does "stop" survive? Yes, on corrected reasoning.** The best integer variant, with every
+scalar float removed and the wide MAC applied, reaches **13.18 GB/s against the best bf16
+arm's 22.48 — it still loses by 1.7×** — and it is **4.3× less accurate**
+(rel RMS 0.01019 vs 0.00236), of which 0.00995 is the coarser per-chunk activation
+quantisation the repair required. All four integer rungs meet the derived strict
+per-element bound (0 violations of 6144, all M). So the repair costs accuracy *and* still
+loses. **What is worth carrying forward is A2 and core count, not integer compute.**
+
+**Two ISA traps worth the record regardless.** On an INTEGER accumulator `acc32→bf16`
+compiles to one instruction and **bit-reinterprets rather than converts**
+(`accum.hpp:1090-1095` does not constrain the accumulator `Class`; the whole GEMV returned
+~0, rel RMS 1.0, devq 651), and `accum<accfloat>::to_vector<int8>()` does the same in
+reverse — the tree's correct route is FP-accum → bf16 vector → `aie::to_fixed`, as
+`llama2_mha/mha.cc:137` already does. **An instruction-count probe cannot see either; only
+a value check on device can.** Item 23's original probe measured the broken fold at 4
+instructions and "confirmed" the design.
+
+**Two study numbers this item flags as OPEN, and does not rewrite.** (i) doc 56 §4:1108
+calls **40.8 GB/s** "the machine's maximum measured rate"; it is one production kernel's
+rate between its launch boundaries, and DAM-RS measures **72.9 GB/s** aggregate DDR on this
+machine — but DAM-RS's `ddr.py:124` counts each byte twice, so its read half is ~36.5, and
+**neither party has run a read-only sweep**. "Maximum" is unsupported in both directions.
+(ii) PANG26/TileFuse reports a W4A16 GEMV 1×4096×14336 at 181.22 GOP/s on **this exact
+part** (HX 370) = **45.3 GB/s of int4 weight bytes**, i.e. *above* the claimed wall and ~2×
+the shipped kernel's standalone rate. Both are recorded as contradictions with their
+provenance; settling either needs the read-only DDR sweep and reading the paper.
+
+**`[2026-08-26]` A free 1.07× on the SHIPPED int4 GEMV, found while building the
 control for item 23 (devq 658/667).** `mv_int4_bf16.cc` runs its inner loop at
 `r = 32`. At `r = 64` the identical source's weight load becomes a single fused
 **`vldb.unpack`** instead of `vldb.128` + a separate `vunpack`, because the load
 unit's int4→int8 unpack mode wants a 32-byte source: **47 → 34 vector ops per
-gs=128 group** (`isa_probe/probe_r64.dis`), measured **22.92 → 25.22 GB/s
-compute-only** at M=6144 with **0/6144** bound violations and an unchanged
-accuracy class (rel RMS 0.00236 vs 0.00238). No format, layout, packer or
+gs=128 group** (`isa_probe/probe_r64.dis`), measured **21.10 → 22.48 GB/s
+compute-only** on each arm's own fitted slope, with **0/6144** bound violations and an
+unchanged accuracy class (rel RMS 0.00236 vs 0.00238). No format, layout, packer or
 accuracy consequence — one token. **This item does not propose it for the shipped
-path**: a standalone harness measures 22.92 GB/s where the cascade measures 10.0
+path**: a standalone harness measures 21.10 GB/s where the cascade measures 10.0
 (doc 56 §4 H2b, devq 616), the two are not interchangeable, and it earns its own
-gated experiment on `o_gemv_ffn_int4` rather than a change.
+gated experiment on `o_gemv_ffn_int4` rather than a change. It is still larger than
+anything the integer route delivered.
 
 **On the ms/token question.** Item 23's prediction committed to a 5.2–6.4 ms/token saving.
 **That figure is withdrawn, not restated.** Falsifier F2 — declared in `PREDICTION.md` before any
