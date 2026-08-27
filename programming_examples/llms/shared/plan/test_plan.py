@@ -61,10 +61,17 @@ SHIPPED = {
     # `[2026-08-23]` re-read after queue items 11 and 12: qwen decode QKV is the 2-launch
     # head-epilogue form (rms_qkv_qknorm_rope_gemv2) and its LM head the 9 x 16384 + 4480
     # mixed partition (10 launches); llama's head is 8 x 16384 at m_input 8.
+    # `[2026-08-26]` queue item 28: qwen's head is now 2 x 65536 + 20864 -- THREE
+    # launches. The activation broadcast's BD repeat cap scales with the herd's
+    # row count, so at 4 core rows a partition may carry 65536 rows instead of
+    # 16384. Measured 7.663 -> 6.470 ms for the same 311.16 MB (devq 691), and
+    # 7.58 -> 6.48 ms in the driver (devq 699); the ROWS on their own, at ten
+    # launches, were worth -0.4 % (devq 688). llama pins its partitioning
+    # (`lm_head_rows_per_launch`) and does not move.
     ("qwen3_0_6b", "prefill"): dict(elfs=["rms_qkv_qknorm_rope", "flash_attn", "o_ffn_qwen"], launches=[9, 1, 12],
-                                     host=["transpose_seq_to_head", "kv_append", "transpose_head_to_seq"], lm_head=10),
+                                     host=["transpose_seq_to_head", "kv_append", "transpose_head_to_seq"], lm_head=3),
     ("qwen3_0_6b", "decode"): dict(elfs=["rms_qkv_qknorm_rope_gemv2", "o_gemv_ffn"], launches=[2, 3],
-                                    host=["kv_append", "decode_attention_cpu"], lm_head=10),
+                                    host=["kv_append", "decode_attention_cpu"], lm_head=3),
     ("llama32_1b", "prefill"): dict(elfs=["rms_gemms_rope", "flash_attn", "o_ffn"], launches=[7, 1, 12],
                                      host=["kv_append"], lm_head=8),
     ("llama32_1b", "decode"): dict(elfs=["rms_gemv_rope", "o_gemv_ffn"], launches=[6, 3],
@@ -92,14 +99,20 @@ def test_plan_reproduces_shipped_sequence():
 
 def test_qwen_decode_token_counts_match_doc57():
     """Doc 57 section 5 after items 5c and 5/5b: 28 x (2 + 3) + 10 = 150 boundaries, 57
-    submissions per token (was 28 x 7 + 19 = 215 on 2026-08-21, the H0 gate's number)."""
+    submissions per token (was 28 x 7 + 19 = 215 on 2026-08-21, the H0 gate's number).
+    `[2026-08-26]` queue item 28: 28 x (2 + 3) + 3 = 143. The head lost seven
+    boundaries by taking four core rows, which raises the broadcast's BD repeat
+    cap and so the partition size; SUBMISSIONS are unchanged, because the head
+    was always one submission however many launches it holds."""
     p = plan(decoder_graph(QWEN3_0_6B), Workload("decode", 1, 512))
-    assert p.total_launches == 150, p.total_launches
+    assert p.total_launches == 143, p.total_launches
     assert p.total_submissions == 57
     assert p.total_host_ops == 28 * 2 + 2
-    # the LM head is the planner's own derivation, shipped: 9 full partitions + a 4480 tail
+    # the LM head is the planner's own derivation, shipped: 2 full partitions + a 20864 tail
     head = [s for s in p.stages if s.name == "lm_head_gemv"][0]
-    assert head.launches == 10 and "[16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 16384, 4480]" in head.launch_breakdown[0][2]
+    assert head.launches == 3 and "[65536, 65536, 20864]" in head.launch_breakdown[0][2]
+    # zero pad rows now, against 64 at one row
+    assert head.weight_bytes == 151936 * 1024 * 2
     assert not any(r[0] == "lm_head_gemv partitioning" for r in p.rejected)
     assert any(r[0] == "rms_qkv_qknorm_rope_gemv4" for r in p.rejected)
 
@@ -209,10 +222,10 @@ def test_w4_decode_qwen_qknorm_candidates():
     p = plan(g, Workload("decode", 1, 512, 2048, "w4_decode"))
     pb = plan(g, Workload("decode", 1, 512, 2048, "bf16"))
     assert p.elf_sequence() == ["rms_qkv_qknorm_rope_gemv2", "o_gemv_ffn_int4", "lm_head_gemv"]
-    assert [s.launches for s in p.stages if s.where == "device"] == [2, 3, 10]
+    assert [s.launches for s in p.stages if s.where == "device"] == [2, 3, 3]
     # the int4 swap keeps the launch structure: the dispatch counts ARE the bf16 plan's
     assert (p.total_submissions, p.total_launches, p.total_host_ops) == \
-        (pb.total_submissions, pb.total_launches, pb.total_host_ops) == (57, 150, 58)
+        (pb.total_submissions, pb.total_launches, pb.total_host_ops) == (57, 143, 58)
     assert p.sha != pb.sha
     by_name = {s.name: s for s in p.stages}
     by_name_b = {s.name: s for s in pb.stages}
@@ -389,8 +402,15 @@ def test_the_o2_pair_aggregation_is_a_recorded_rejected_candidate_on_every_decod
     # The hash is unmoved by the record: same stages, same sha as the recorded
     # driver-trace fixtures carry.
     g = decoder_graph(QWEN3_0_6B)
+    # `[2026-08-26]` queue item 28 moved this sha: the LM head went from 10
+    # launches to 3, which is a STAGE change and therefore inside `plan()`'s
+    # hashed body. The recorded `h1a_driver_traces` fixtures are re-recorded
+    # with it -- that is the mechanism working, not a nuisance. Only Qwen3-0.6B
+    # moves: the row count is a `plan.py` constant rather than a `ModelSpec`
+    # field precisely because `asdict(spec)` is in the hashed body, so a field
+    # would have moved llama32_1b's sha too, for a change it has no part in.
     assert plan(g, Workload("decode", 1, 512)).sha == (
-        "49ba58fc59e5fa5d88ce9b2a3970fa414d79fbc0c17c62fc14ba345eaf3fdae7"
+        "5a279766c6468fd0c76b8ebb4cd5944c2e5cb08fde50a840bde54592bbdce0c9"
     )
 
 

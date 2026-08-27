@@ -552,6 +552,234 @@ def _first_failed(xrt, runs):
     return 0, None
 
 
+# ---------------------------------------------------------------------------
+# Herd geometry, and the hazard that rides on it
+# ---------------------------------------------------------------------------
+#
+# `[2026-08-26]` queue item 28. In the bf16 GEMV (`matvec.py`) a herd whose
+# SECOND dimension is > 1 hangs the device under the shipped decode preset --
+# `ERT_CMD_STATE_TIMEOUT`, not a compile error. Item 27 bisected it over three
+# knobs x two row counts (devq 673/674): only `use_lock_race_condition_fix`
+# (v1 or v2) unblocks it; ping-pong and `runtime_loop_tiling_sizes` are
+# irrelevant. v1 costs +0.8 % at 8 cores.
+#
+# WHAT WE DO NOT KNOW, AND WHY THIS FAILS CLOSED `[2026-08-27, review finding 1]`.
+# Item 27 explained the hang as "the column's L2 slab becomes single-writer /
+# multi-reader", and item 28's first guard trusted that explanation: it refused
+# only herds linking `mv.o`. Two things are wrong with that.
+#
+#   * The explanation does not separate the hazardous form from the safe ones.
+#     Measured on the shipped modules (`results/item28-land-herd-rows-20260826/
+#     herd_rows_sweep.py`): the prefill GEMM herds are `8 x 4` and take an L2 A
+#     panel of `memref<8x1x64x256xbf16, 1>` -- ONE slab per column, read by all
+#     four rows, the same single-writer/multi-reader shape -- and they have
+#     never hung. So "shared L2 slab" is not the discriminator, and no
+#     structural test in this file can honestly claim to be one.
+#   * A filename filter fails OPEN in the direction that hangs the device. The
+#     tree already emits tagged micro-kernel objects (`mv_heads_hd128.o`,
+#     `mv_int4_bf16_gemv_gs128_k1024.o`), so a copied or renamed GEMV object is
+#     the norm rather than a hypothesis -- and it would have sailed past.
+#
+# So the rule is inverted. **A multi-row herd needs a lock fix unless this
+# module's kernel name is on a list of kernels MEASURED green at multi-row**,
+# and **geometry that cannot be decoded counts as multi-row**. Every failure
+# mode -- a missing attribute, a non-constant size, an unwalkable module, no
+# bindings at all -- refuses instead of reading as one row. The cost of a false
+# refusal is a message naming the fix; the cost of a false pass is a device
+# that hangs.
+#
+# The two halves of the fact live in different files -- the row count is the
+# BUILDER's, the lock fix is the CALLER's backend kwargs -- so neither can
+# check it alone. `KernelCache.compile_and_cache` is the one place both are in
+# scope, and this is the function it asks.
+
+#: Kernel cache names whose modules hold a multi-row herd and run WITHOUT a
+#: lock-race fix today. Keyed on the `compile_and_cache` name -- the manifest
+#: key, which is stable and human-meaningful -- and NOT on a micro-kernel
+#: filename, which renames (the tree already emits `mv_heads_hd128.o`,
+#: `mv_int4_bf16_gemv_gs128_k1024.o`, so a renamed GEMV object is the norm).
+#:
+#: MEMBERSHIP WAS MEASURED, not guessed: `herd_rows_sweep.py` and
+#: `review/probe_remaining.py` (item 28's evidence root) build every shipped
+#: model's modules and read the geometry off the IR. Every entry below came
+#: back `rows = 4`; every shipped kernel NOT below came back `rows = 1` and so
+#: never reaches this rule at all. That mattered, because a guard that fails
+#: closed refuses every call site it does not know about.
+#:
+#: The evidence for "green" is that these are the kernels every model's
+#: `make verify` and `make profile` have run for months. It is NOT a claim that
+#: their dataflow is safe in general -- see the note above: nothing in the IR
+#: separates them from the GEMV form that hangs. Adding an entry is a deliberate
+#: act that says "this kernel has run multi-row on device".
+HERD_ROWS_MEASURED_GREEN = {
+    # --- prefill GEMM stitchers: 8 x 4 GEMM herds ---
+    "rms_gemms_rope": "llama/smollm prefill QKV stitcher (rows=4 measured)",
+    "rms_gemms_rope_int4": "same, int4 weights (rows=4)",
+    "rms_gemms_rope_bfp16": "same, bfp16 weights (rows=4)",
+    "rms_qkv_qknorm_rope": "qwen3 prefill QKV + QK-norm stitcher (rows=4)",
+    "rms_qkv_bias_rope": "qwen2.5 prefill QKV + bias stitcher (rows=4)",
+    "o_ffn": "llama prefill O+FFN stitcher, four 8 x 4 GEMM herds (rows=4)",
+    "o_ffn_qwen": "qwen3 prefill O+FFN stitcher (rows=4)",
+    "o_ffn_int4": "same, int4 weights (rows=4)",
+    "o_ffn_bfp16": "same, bfp16 weights (rows=4)",
+    "o_ffn_head": "qwen2.5-0.5B prefill O+FFN+head stitcher (rows=4)",
+    # --- prefill, the per-GEMM split some models ship instead of a stitcher ---
+    "o_res_norm": "qwen2.5 / qwen3-4B prefill O + residual + norm GEMM (rows=4)",
+    "gate": "qwen2.5-3B / qwen3-4B prefill gate GEMM (rows=4)",
+    "gate_up": "qwen2.5-1.5B prefill fused gate+up GEMM (rows=4)",
+    "up": "qwen2.5-3B / qwen3-4B prefill up GEMM (rows=4)",
+    "down_add": "qwen2.5 / qwen3-4B prefill down GEMM + add (rows=4)",
+    # --- flash attention: `num_cascade_stages = 4` is the herd's row axis ---
+    "flash_attn": "prefill FA, 4 cascade stages (rows=4)",
+    # --- decode: the bf16 O+FFN cascade's stage 2 is a K-cascade GEMV ---
+    "o_gemv_ffn": "decode bf16 cascade; matvec_swiglu_rms stage 2 is 8 x 4 (n_cascade=4)",
+}
+
+#: The one name FAMILY that is generated rather than written down:
+#: `fa_headfirst.fa_cache_name` returns "flash_attn" for a square kernel and
+#: "flash_attn_ctx<kv>" for a rectangular one. Prefix matching is deliberately
+#: confined to this single documented family -- everywhere else the match is
+#: exact, so that `o_ffn_something_new` does NOT inherit `o_ffn`'s record.
+HERD_ROWS_GREEN_PREFIXES = ("flash_attn_ctx",)
+
+
+def _herd_rows_recorded_green(name, green=None, prefixes=None):
+    green = HERD_ROWS_MEASURED_GREEN if green is None else green
+    prefixes = HERD_ROWS_GREEN_PREFIXES if prefixes is None else prefixes
+    return name in green or any(name.startswith(p) for p in prefixes)
+
+
+class HerdGeometryUndecidable(Exception):
+    """The module's herd geometry could not be read. Treated as HAZARDOUS."""
+
+
+def _herd_size_operand(op, index):
+    """The `index`-th herd size, as an int. Raises if it is not decodable."""
+    seg = None
+    for i in range(len(op.attributes)):
+        if op.attributes[i].name == "operandSegmentSizes":
+            seg = [int(x) for x in op.attributes[i].attr]
+    if seg is None or len(seg) < 2 or seg[1] < 2:
+        raise HerdGeometryUndecidable(
+            "air.herd without a readable two-element size segment"
+        )
+    value = op.operands[seg[0] + index]
+    owner = value.owner
+    for i in range(len(owner.attributes)):
+        if owner.attributes[i].name == "value":
+            return int(owner.attributes[i].attr)
+    raise HerdGeometryUndecidable(
+        f"air.herd size {index} is not an arith.constant ({owner.name})"
+    )
+
+
+def herd_row_geometry(mlir_module):
+    """[(herd name, core rows)] for every `air.herd` in the module.
+
+    Raises `HerdGeometryUndecidable` the moment anything cannot be read -- the
+    bindings, the walk, a herd's operand segments, a non-constant size. The
+    caller treats that as hazardous; nothing here may quietly report one row.
+    """
+    try:
+        from air.ir import WalkResult
+    except Exception as exc:  # no bindings: we cannot see the geometry at all
+        raise HerdGeometryUndecidable(f"air.ir unavailable ({exc})") from exc
+
+    found, failure = [], []
+
+    def visit(op):
+        if op.name == "air.herd":
+            try:
+                name = "?"
+                for i in range(len(op.attributes)):
+                    if op.attributes[i].name == "sym_name":
+                        name = str(op.attributes[i].attr).strip('"')
+                found.append((name, _herd_size_operand(op, 1)))
+            except Exception as exc:  # recorded, re-raised after the walk
+                failure.append(str(exc))
+        return WalkResult.ADVANCE
+
+    try:
+        mlir_module.operation.walk(visit)
+    except Exception as exc:
+        raise HerdGeometryUndecidable(f"the module could not be walked ({exc})") from exc
+    if failure:
+        raise HerdGeometryUndecidable("; ".join(failure))
+    return found
+
+
+def _has_lock_fix(backend_kwargs):
+    return bool(
+        backend_kwargs.get("use_lock_race_condition_fix")
+        or backend_kwargs.get("use_lock_race_condition_fix_v2")
+    )
+
+
+def require_lock_fix(name, geometry, backend_kwargs, green=None, prefixes=None):
+    """The POLICY half. `geometry` is [(herd, rows)] or the sentinel `None`,
+    which means "undecidable, therefore hazardous". Returns the max row count,
+    or `None` when it is not known.
+
+    Split from the extraction so the rule is testable without a toolchain and
+    is stated in one place whatever produced the geometry.
+    """
+    if geometry is not None:
+        rows = max([r for _h, r in geometry] + [1])
+        if rows <= 1:
+            return rows
+        detail = ", ".join(f"{h}={r}" for h, r in geometry if r > 1)
+    else:
+        rows, detail = None, "the geometry could not be read"
+    if _has_lock_fix(backend_kwargs):
+        return rows
+    if _herd_rows_recorded_green(name, green, prefixes):
+        return rows
+    raise ValueError(
+        f"{name}: this module has a multi-row air.herd ({detail}) and is being "
+        f"compiled WITHOUT a lock-race fix. A multi-row herd is only known to "
+        f"be safe where it has been measured: `matvec.py`'s GEMV form HANGS the "
+        f"device (ERT_CMD_STATE_TIMEOUT, item 27 section 6.1, devq 673/674), and "
+        f"nothing in the IR distinguishes that form from the shipped GEMM herds "
+        f"that do not -- so the default is to refuse. Either set "
+        f"use_lock_race_condition_fix=True in this kernel's backend kwargs "
+        f"(backend_presets.with_herd_rows() derives it from the row count so the "
+        f"two cannot drift apart), or, if {name!r} is a kernel that has been "
+        f"MEASURED to run multi-row without it, add it to "
+        f"dispatch.HERD_ROWS_MEASURED_GREEN with the evidence."
+    )
+
+
+def check_herd_rows_lock_fix(name, mlir_module, backend_kwargs):
+    """Refuse a multi-row herd that is not compiled with a lock-race fix.
+
+    Raises `ValueError` at COMPILE time, before a backend is constructed. The
+    alternative is a device hang whose only symptom is `ERT_CMD_STATE_TIMEOUT`
+    from a run that already burned a compile. Returns the row count, or `None`
+    when the geometry was undecidable but the caller is entitled to proceed.
+    """
+    try:
+        geometry = herd_row_geometry(mlir_module)
+    except HerdGeometryUndecidable as exc:
+        try:
+            return require_lock_fix(name, None, backend_kwargs)
+        except ValueError as refusal:
+            raise ValueError(f"{refusal} (reading the geometry failed: {exc})") from exc
+    return require_lock_fix(name, geometry, backend_kwargs)
+
+
+def max_herd_rows(mlir_module):
+    """Largest second `air.herd` dimension, or `None` if it cannot be read.
+
+    Reporting only -- `check_herd_rows_lock_fix` is what decides. Never call
+    this to answer the hazard question: it returns a value where the guard
+    would refuse.
+    """
+    try:
+        return max([r for _h, r in herd_row_geometry(mlir_module)] + [1])
+    except HerdGeometryUndecidable:
+        return None
+
+
 @dataclass
 class LaunchCounts:
     """Static per-artifact counts, taken from the MLIR module at compile time.

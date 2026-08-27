@@ -43,8 +43,37 @@
 // can only be keyed on the pool object and the entry would then keep an
 // evicted pool's BOs alive -- defeating exactly the per-dispatch pool eviction
 // `pattern/offload` is defined by. Driven against a fake pyxrt, no device.
+//
+// `[2026-08-26]` 42 -> 53, queue item 28: the herd-rows lock-race coupling. A
+// herd occupying more than ONE CORE ROW hangs the device in `matvec.py`'s GEMV
+// form (ERT_CMD_STATE_TIMEOUT, item 27 section 6.1, bisected devq 673/674 --
+// only `use_lock_race_condition_fix` unblocks it). The row count belongs to the
+// builder and the lock fix to the caller, so the rule is enforced where both
+// are in scope, `KernelCache.compile_and_cache`, and it REFUSES before a
+// backend is constructed rather than letting the device time out after a
+// multi-minute compile.
+//
+// `[2026-08-27]` THE RULE FAILS CLOSED, and the tests that say so are the
+// point of the count going 52 -> 53. Item 28's first guard filtered on
+// `link_with == "mv.o"` and converted every unreadable geometry into "one
+// row" -- so the same builder reached through a renamed micro-kernel object
+// (this tree renames them routinely: `mv_heads_hd128.o`,
+// `mv_int4_bf16_gemv_gs128_k1024.o`) sailed past and would have hung, which is
+// the worst possible direction for a hazard guard. There is no honest
+// structural discriminator either: MEASURED on the shipped modules, the
+// prefill GEMM herds share one L2 A panel per column across all four rows --
+// the very shape item 27 blamed -- and they do not hang. So the default is to
+// refuse, geometry that cannot be decoded counts as multi-row, and the
+// exemption is a registry of kernels MEASURED green (membership itself
+// measured, by building every shipped model's modules). Pinned here: the
+// geometry read including the async-token operand form; every unreadable form
+// raising instead of reading as one row; a multi-row herd refused whatever
+// object it links; undecidable geometry refused; both fix versions accepted;
+// exemption only by exact name plus the one generated `flash_attn_ctx*`
+// family; the landed `lm_head_gemv` NOT exempt but carrying the fix; and the
+// refusal happening ahead of any compile.
 // RUN: python3 %S/../llms/shared/infra/test_dispatch.py | FileCheck %s --check-prefix=DISPATCH
-// DISPATCH: 42/42 passed
+// DISPATCH: 53/53 passed
 //
 // `[2026-08-21]` Doc 56 H0: the analytical planner's host gates -- the two golden
 // graphs pinned, each model's plan reproducing its shipped ELF sequence / launch

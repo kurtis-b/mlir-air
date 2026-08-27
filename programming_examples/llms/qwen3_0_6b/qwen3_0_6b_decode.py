@@ -215,17 +215,113 @@ def _rms_qkv_qknorm_rope_gemv_backend(verbose=False):
 
 # LM-head decode partitioning. vocab=151936.
 # Per-partition GEMV broadcasts the K=emb_dim input vector with a hardware
-# push_queue repeat_count ~= n_part/32 - 1, capped at the [0:255] range. So
-# n_part must be <= 8192 (8192/32 - 1 = 255). 19 * 8192 = 155648 >= 151936;
-# the final partition carries 3712 zero-padded rows (logits truncated to
-# vocab on host).
-# `[2026-08-21]` Mixed partitions: 9 full partitions at the BD-repeat cap for
-# m_input 8 (16384 rows: 16384/64 launch iterations x 1 kernel call = 256
-# broadcasts, repeat 255) plus one 4480-row tail on the 64-row tile grid --
-# 10 launches and 64 pad rows against the former 19 x 8192 (3712 pad rows).
-# Measured 9.35 -> 8.25 ms per token on the probe (devq 476); the planner
-# (shared/plan, doc 56 H0) derived it. Gated by `make verify`.
-_LM_PARTS = tuple([16384] * 9 + [4480])   # sum 151936 == vocab
+# push_queue repeat_count, capped at the [0:255] range. The repeat is
+#     M / (herd_m * m_input * herd_rows) - 1
+# so at m_input 8 and ONE core row a partition may carry at most 16384 rows;
+# past that aircc refuses with
+#     error: 'aiex.npu.push_queue' op Repeat count exceeds the [0:255] range
+# (item 28, devq 691 leg 5, the exact text). 19 * 8192 was the pre-2026-08-21
+# uniform form at m_input 4 (3712 pad rows, logits truncated on host).
+# `[2026-08-21]` Mixed partitions: full partitions at the cap plus one tail on
+# the tile grid -- 10 launches and 64 pad rows at one row. Measured 9.35 ->
+# 8.25 ms per token on the probe (devq 476); the planner (shared/plan, doc 56
+# H0) derived it. Gated by `make verify`.
+#
+# `[2026-08-26]` queue item 28 -- THE LM HEAD FILLS MORE THAN ONE CORE ROW, AND
+# THE PARTITIONING FOLLOWS FROM THAT.
+#
+# The GEMV built `@herd(sizes=[herd_m, 1])`: 8 columns x ONE compute row, i.e.
+# 8 of the device's 32 compute tiles, with all eight shim/DDR paths already in
+# use (item 27, commit 2e14f533). Item 27 measured its standalone bf16 GEMV at
+# 35.72 / 44.43 / 50.03 GB/s over 8 / 16 / 32 cores and predicted -12 % here.
+# MEASURED ON THIS HEAD (devq 688), rows alone are a NULL: 7.58 -> 7.55 ms at
+# two rows, +9.1 % at four. The reason is that this head, unlike that harness,
+# was ALREADY near the device's read ceiling -- 311.16 MB in 7.58 ms is
+# 41.1 GB/s end to end and ~48 GB/s once its ten launch boundaries are charged,
+# against item 27's measured device-wide 50-54 GB/s.
+#
+# What rows DO buy is the repeat cap: it scales with `herd_rows`, so a
+# partition may carry 16384 / 32768 / 65536 rows at 1 / 2 / 4 rows, and the
+# head needs 10 / 5 / 3 launches to cover the vocab. At ~130 us per launch
+# boundary that is the win: devq 691 measured the same 311.16 MB at
+# 7.663 / 6.844 / 6.470 ms over 10 / 5 / 3 launches (-10.7 % and -15.6 %), all
+# at 0 violations of a derived per-element bound. **The partitioning is
+# therefore DERIVED from the row count rather than written down**, so the two
+# cannot disagree and `QWEN3_LM_HERD_ROWS=1` reproduces the pre-item-28 head
+# byte for byte.
+#
+# A value > 1 REQUIRES aircc's `--use-lock-race-condition-fix` or the device
+# hangs with ERT_CMD_STATE_TIMEOUT (item 27 section 6.1); `_lm_gemv_backend`
+# derives that flag from this same constant through
+# `backend_presets.with_herd_rows`, and `KernelCache.compile_and_cache` fails
+# closed if it is ever missing -- `lm_head_gemv` is deliberately NOT on
+# `dispatch.HERD_ROWS_MEASURED_GREEN`, so dropping the flag here is a refusal
+# rather than a hang.
+_LM_TILE_M = 8
+_LM_HERD_M = 8
+_LM_M_INPUT = 8
+_LM_BD_REPEAT_CAP = 255  # aiex.npu.push_queue's [0:255]
+_LM_VOCAB = 151936
+_LM_HERD_ROWS = int(_os.environ.get("QWEN3_LM_HERD_ROWS", "4"))
+assert _LM_HERD_ROWS in (1, 2, 4), (
+    f"QWEN3_LM_HERD_ROWS={_LM_HERD_ROWS}: NPU2 has four core rows and the herd "
+    "grid is a power of two (1, 2 or 4)"
+)
+
+
+def lm_head_parts(herd_rows=None):
+    """Partition row counts at `herd_rows`: full partitions at the BD repeat
+    cap, plus one tail rounded up to the tile grid.
+
+    At 1 / 2 / 4 rows this is 9x16384+4480 / 4x32768+20864 / 2x65536+20864 --
+    10, 5 and 3 launches, and every one of them covers the vocab exactly (0 pad
+    rows at 2 and 4 rows, 64 at 1).
+    """
+    herd_rows = _LM_HERD_ROWS if herd_rows is None else herd_rows
+    cap = (_LM_BD_REPEAT_CAP + 1) * _LM_HERD_M * _LM_M_INPUT * herd_rows
+    grid = _LM_TILE_M * _LM_HERD_M
+    full, rem = divmod(_LM_VOCAB, cap)
+    return tuple([cap] * full + ([-(-rem // grid) * grid] if rem else []))
+
+
+def lm_head_herd_rows(parts=None, want=None):
+    """Per-partition `herd_rows`, halved for any partition it does not divide.
+
+    A partition of M rows can only use R rows when M % (tile_m*herd_m*R) == 0.
+    The 20864-row tail divides by 128 but not by 256, so at `want=4` it caps at
+    2 while the 65536-row partitions take 4. Returning a per-partition tuple
+    (which `build_lm_head_gemv_module` accepts) is what keeps the tail legal
+    without shrinking the whole head to the tail's limit.
+    """
+    want = _LM_HERD_ROWS if want is None else want
+    out = []
+    for rows in lm_head_parts(want) if parts is None else parts:
+        r = want
+        while r > 1 and rows % (_LM_TILE_M * _LM_HERD_M * r):
+            r //= 2
+        # `[2026-08-26]` The two caps pull in OPPOSITE directions and a tail can
+        # fall between them: halving `r` for divisibility DOUBLES the broadcast
+        # repeat, so a partition that divides at 2 rows may exceed the [0:255]
+        # range that only 4 rows would have satisfied. It does not happen at
+        # this model's m_input 8 (the 20864 tail reads 162), and it DOES happen
+        # at m_input 4 (the same tail would read 325) -- which is why this is an
+        # assertion and not a comment. The fix when it fires is to round the
+        # tail up to `tile_m * herd_m * want` in `lm_head_parts` so it can take
+        # the full row count, at the cost of a few pad rows.
+        repeat = rows // (_LM_HERD_M * _LM_M_INPUT * r) - 1
+        assert repeat <= _LM_BD_REPEAT_CAP, (
+            f"partition of {rows} rows at herd_rows={r} (capped down from "
+            f"{want} for divisibility) needs a broadcast repeat of {repeat}, "
+            f"past the [0:{_LM_BD_REPEAT_CAP}] range -- aircc refuses with "
+            f"\"'aiex.npu.push_queue' op Repeat count exceeds the [0:255] "
+            f"range\". Round the tail up to tile_m*herd_m*{want} in "
+            f"lm_head_parts so it can take {want} rows."
+        )
+        out.append(r)
+    return tuple(out)
+
+
+_LM_PARTS = lm_head_parts()
 _LM_N_PARTITIONS = len(_LM_PARTS)
 _LM_N_PART = 8192  # the pre-2026-08-21 uniform partition (repeat cap at m_input 4); kept for A/B
 
@@ -372,13 +468,17 @@ def build_lm_head_gemv_qwen_module(emb_dim):
     return build_lm_head_gemv_module(
         emb_dim=emb_dim,
         parts=_LM_PARTS,
-        tile_m=8,
+        tile_m=_LM_TILE_M,
         # m_input 8 (one kernel call per 8-row tile, B-broadcast repeat ~127)
         # measured 8.5 % faster than m_input 4 at the same launch count and
         # bytes (doc 57 section 1.4, devq 449: 9.12 vs 9.96 ms); gated by
         # `make verify`.
-        m_input=8,
-        herd_m=8,
+        m_input=_LM_M_INPUT,
+        herd_m=_LM_HERD_M,
+        # queue item 28: 4 core rows per full partition (32 of the 32 compute
+        # tiles), 2 on the tail. Coupled to `use_lock_race_condition_fix` in
+        # `_lm_gemv_backend` below -- see `_LM_HERD_ROWS`.
+        herd_rows=lm_head_herd_rows(_LM_PARTS),
     )
 
 
@@ -408,12 +508,23 @@ def _o_gemv_ffn_int4_backend(verbose=False):
 
 
 def _lm_gemv_backend(verbose=False):
-    return {
-        "verbose": verbose,
-        "omit_while_true_loop": False,
-        "output_format": "elf",
-        "instance_name": "lm_head_gemv",
-    }
+    # `[2026-08-26]` queue item 28: `with_herd_rows` adds
+    # use_lock_race_condition_fix iff the head takes more than one core row.
+    # A multi-row herd without it does not fail -- it HANGS
+    # (ERT_CMD_STATE_TIMEOUT, item 27 section 6.1, devq 673/674). Deriving the
+    # flag from the row count is the reason the two cannot drift apart here;
+    # `compile_and_cache` refuses if some other path ever lets them.
+    from shared.infra.backend_presets import with_herd_rows
+
+    return with_herd_rows(
+        {
+            "verbose": verbose,
+            "omit_while_true_loop": False,
+            "output_format": "elf",
+            "instance_name": "lm_head_gemv",
+        },
+        lm_head_herd_rows(_LM_PARTS),
+    )
 
 
 # ---------------------------------------------------------------------------

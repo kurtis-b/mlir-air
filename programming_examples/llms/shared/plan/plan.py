@@ -225,12 +225,32 @@ def _gemm_launches(cand):
     return 2 if (cand and cand.get("method") == "fused-cast") else 1
 
 
-def _gemv_partitions(rows, caps, herd_m=8, m_input=4, tile_m=8):
+#: `[2026-08-26]` queue item 28: how many of NPU2's four CORE ROWS the derived
+#: LM-head partitioning assumes. It is NOT a `ModelSpec` field, deliberately:
+#: `asdict(spec)` is inside `plan()`'s hashed body, so a new spec field would
+#: move EVERY model's plan sha -- including models this item never touched and
+#: whose recorded driver traces pin theirs. A model that PINS its partitioning
+#: (`lm_head_rows_per_launch`) is unaffected either way; only a model on the
+#: derived branch sees this, and today that is Qwen3-0.6B, whose driver ships
+#: exactly this derivation (`qwen3_0_6b_decode.lm_head_parts`).
+LM_HEAD_HERD_ROWS = 4
+
+
+def _gemv_partitions(rows, caps, herd_m=8, m_input=4, tile_m=8, herd_rows=1):
     """(launch count, partition rows) for a GEMV of `rows`: full partitions at the BD
     repeat cap plus ONE tail partition sized to the remainder (rounded up to the
     tile grid) -- stitching accepts launches of different shapes, so padding the
-    vocab to a whole number of full partitions is never required."""
-    cap = (caps.bd_repeat_cap + 1) * herd_m * m_input
+    vocab to a whole number of full partitions is never required.
+
+    `herd_rows` `[2026-08-26]`, queue item 28: the broadcast's repeat is
+    `M / (herd_m * m_input * herd_rows) - 1`, so more CORE ROWS raise the cap in
+    proportion and the partitions get bigger rather than the cores getting
+    busier. That is where the measured win is -- 10 -> 3 launches on the
+    Qwen3-0.6B head, 7.663 -> 6.470 ms for the same bytes (devq 691) -- while
+    the rows on their own moved it -0.4 % (devq 688). The tail is rounded to the
+    ROW-independent tile grid, so it may not be legal at the full row count; the
+    driver caps it per partition and so does `lm_head_herd_rows` there."""
+    cap = (caps.bd_repeat_cap + 1) * herd_m * m_input * herd_rows
     grid = tile_m * herd_m
     full, rem = divmod(rows, cap)
     parts = [cap] * full + ([math.ceil(rem / grid) * grid] if rem else [])
@@ -502,7 +522,9 @@ def fuse(graph, wl, placements, caps=NPU2_CAPS, forced=None):
                         boundary_bytes=g.nbytes("x_final_normed")))
     # LM head: the shipped partitioning is a driver fact (spec.lm_head_rows_per_launch); the
     # BD-repeat derivation is reported beside it, as an alternative when it differs.
-    derived_count, derived_parts = _gemv_partitions(spec.vocab_size, caps, herd_m=8, m_input=8)
+    derived_count, derived_parts = _gemv_partitions(
+        spec.vocab_size, caps, herd_m=8, m_input=8, herd_rows=LM_HEAD_HERD_ROWS
+    )
     if spec.lm_head_rows_per_launch:
         n_part = spec.lm_head_rows_per_launch
         n_part_count = math.ceil(spec.vocab_size / n_part)
@@ -519,7 +541,8 @@ def fuse(graph, wl, placements, caps=NPU2_CAPS, forced=None):
                              f"than the shipped {n_part_count} x {n_part}; untested, an O3 knob"))
     else:
         n_part_count, parts = derived_count, derived_parts
-        why = f"BD repeat cap {caps.bd_repeat_cap} x herd 8 x m_input 8, tail partition on the tile grid"
+        why = (f"BD repeat cap {caps.bd_repeat_cap} x herd 8 x m_input 8 x "
+               f"{LM_HEAD_HERD_ROWS} core row(s), tail partition on the tile grid")
     rows_total = sum(parts)
     stages.append(Stage("lm_head_gemv", DEVICE, ("lm_head",), launches=n_part_count, repeated=False,
                         launch_breakdown=(("lm_head", n_part_count, f"GEMV partitions {list(parts)}: {why}"),),

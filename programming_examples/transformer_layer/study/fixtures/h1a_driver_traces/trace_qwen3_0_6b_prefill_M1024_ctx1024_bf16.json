@@ -14,8 +14,9 @@
     "n_readback": 252,
     "bytes_written": 176160768,
     "bytes_readback": 704643072,
-    "kernel_ms": 426.30657635163516,
-    "sync_ms": 28.521657455712557
+    "kernel_ms": 412.10153116844594,
+    "sync_ms": 27.91071985848248,
+    "bind_ms": 0.15993532724678516
    },
    "flash_attn": {
     "calls": 84,
@@ -23,8 +24,9 @@
     "n_readback": 84,
     "bytes_written": 1056964608,
     "bytes_readback": 352321536,
-    "kernel_ms": 693.1346547789872,
-    "sync_ms": 74.71377856563777
+    "kernel_ms": 682.4399593751878,
+    "sync_ms": 66.46718084812164,
+    "bind_ms": 0.1684448216110468
    },
    "o_ffn_qwen": {
     "calls": 84,
@@ -32,39 +34,41 @@
     "n_readback": 84,
     "bytes_written": 528482304,
     "bytes_readback": 176160768,
-    "kernel_ms": 642.5950437551364,
-    "sync_ms": 48.55873144697398
+    "kernel_ms": 616.9549243059009,
+    "sync_ms": 43.40633284300566,
+    "bind_ms": 0.1762518659234047
    },
    "lm_head_gemv": {
     "calls": 3,
     "n_written": 3,
-    "n_readback": 30,
+    "n_readback": 9,
     "bytes_written": 6144,
     "bytes_readback": 911616,
-    "kernel_ms": 23.919014143757522,
-    "sync_ms": 0.19711896311491728
+    "kernel_ms": 19.465162651613355,
+    "sync_ms": 0.1244440209120512,
+    "bind_ms": 0.00491878017783165
    }
   },
   "cpu": {
    "embed_lookup": {
     "calls": 3,
-    "ms": 1.8952620448544621
+    "ms": 1.4200161676853895
    },
    "transpose_seq_to_head": {
     "calls": 84,
-    "ms": 97.08532120566815
+    "ms": 88.54127605445683
    },
    "transpose_head_to_seq": {
     "calls": 84,
-    "ms": 60.906052705831826
+    "ms": 51.045787055045366
    },
    "kv_append": {
     "calls": 84,
-    "ms": 40.007792646065354
+    "ms": 34.55596836283803
    },
    "final_rms_norm": {
     "calls": 3,
-    "ms": 0.8839558577165008
+    "ms": 0.8150697685778141
    }
   }
  },
@@ -83,18 +87,26 @@
   },
   "rms_qkv_qknorm_rope_gemv2": {
    "air_launches": 2,
-   "herd_launches": 2
+   "herd_launches": 2,
+   "herd_rows": 1
   },
   "o_gemv_ffn": {
    "air_launches": 3,
-   "herd_launches": 5
+   "herd_launches": 5,
+   "herd_rows": 4
   },
   "lm_head_gemv": {
-   "air_launches": 10,
-   "herd_launches": 10
+   "air_launches": 3,
+   "herd_launches": 3,
+   "herd_rows": 4
+  },
+  "o_gemv_ffn_int4": {
+   "air_launches": 3,
+   "herd_launches": 5,
+   "herd_rows": 1
   }
  },
- "plan_sha": "f06dddbc887838f16a2dfec72e11903d1966b2771605149f202481b2813bf217",
+ "plan_sha": "6abce1f2e5f530085ec2265a32dc1ff750c4854032385d79f256a06632e2d709",
  "forced": {
   "o_ffn_qwen": "fused-cast",
   "o_ffn": "fused-cast"
@@ -103,21 +115,21 @@
   "scope": "prefill",
   "host_submissions": 85,
   "runlist_entries": 85,
-  "air_launches": 598,
-  "herd_launches": 990,
-  "sync_boundaries": 347,
+  "air_launches": 591,
+  "herd_launches": 983,
+  "sync_boundaries": 340,
   "bytes_transferred": 998550272
  },
  "predicted_vector": {
   "scope": "prefill",
   "host_submissions": 85,
   "runlist_entries": 85,
-  "air_launches": 598,
-  "herd_launches": 990,
+  "air_launches": 591,
+  "herd_launches": 983,
   "sync_boundaries": 0,
   "bytes_transferred": 0
  },
- "timed_artifact_sha": "7271ecd33e6e70c1e0f8721735d9b582fa8e7937f3c9bda1d60085637d0af51f",
- "devq_job_id": "580",
- "recorded_utc": "2026-08-26T04:14:09.826285+00:00"
+ "timed_artifact_sha": "80732ffeccf5e705dfd4aa1a7e02bf236b50176b0e9c5afa19702b72dd4890a2",
+ "devq_job_id": "712",
+ "recorded_utc": "2026-08-27T06:56:46.129602+00:00"
 }

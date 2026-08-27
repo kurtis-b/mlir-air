@@ -46,7 +46,7 @@ per token.
 | Llama-3.2-1B (bf16) | 1.21 s | 12.2 tok/s (06; head −1.0 ms on 08-23) | 3 / 2 |
 | SmolLM2-1.7B (bf16) | 2.02 s | 8.0 tok/s | 3 / 2 |
 | Qwen2.5-0.5B | 0.99 s | 11.9 tok/s | 4 / 5 |
-| Qwen3-0.6B | 1.48–1.50 s | **17.3–17.7 tok/s** (08-26, **int4 decode by default**; bf16 arm 13.7–13.9) | 3 / 2 |
+| Qwen3-0.6B | 1.48–1.50 s | **18.1–18.3 tok/s** (08-26, **int4 decode by default**; bf16 arm 14.0–14.2) — LM head 10 → 3 launches, queue item 28 | 3 / 2 |
 | Qwen3-1.7B | 2.08 s | **7.8 tok/s** (08-21) | 3 / 2 |
 | Qwen2.5-1.5B | 2.43 s | 6.6 tok/s | 5 / 5 |
 | Llama-3.2-3B | 3.70 s | 4.7 tok/s | 3 / 5 |

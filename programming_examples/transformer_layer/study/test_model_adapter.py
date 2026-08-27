@@ -43,8 +43,11 @@ PINNED_MANIFESTS = {
         # cache implements whichever precision was compiled last and the
         # recorded H1a driver traces are the bf16 one. Same launch structure --
         # that identity is item 18's central structural claim.
+        # `[2026-08-26]` queue item 28: the head is 3 launches (2 x 65536 + 20864
+        # at 4 core rows). It is the DECODE cache's entry but the PREFILL plan
+        # names it too, so both of this model's phases moved.
         "decode": {"rms_qkv_qknorm_rope_gemv2": (2, 2), "o_gemv_ffn": (3, 5),
-                   "o_gemv_ffn_int4": (3, 5), "lm_head_gemv": (10, 10)},
+                   "o_gemv_ffn_int4": (3, 5), "lm_head_gemv": (3, 3)},
     },
     "llama32_1b": {
         "prefill": {"rms_gemms_rope": (7, 13), "o_ffn": (12, 20), "flash_attn": (1, 1)},
@@ -63,9 +66,15 @@ PINNED_MANIFESTS = {
 PINNED_MANIFEST_QWEN_M1024 = {"rms_qkv_qknorm_rope": (8, 14), "o_ffn_qwen": (12, 20), "flash_attn": (1, 1)}
 
 #: Executed launches / submissions per phase (doc 57 section 5 after items 5c, 5/5b).
+# `[2026-08-26]` queue item 28: Qwen3-0.6B's LM head went from 10 launches to 3
+# (2 x 65536 + 20864 at 4 core rows -- the activation broadcast's BD repeat cap
+# scales with the row count, so bigger partitions become legal). Both of that
+# model's rows lose 7 air.launches and 7 herd launches; the submission count is
+# unchanged, because the head was always one submission. llama32_1b pins its own
+# partitioning and does not move.
 EXPECTED_TOTALS = {
-    ("qwen3_0_6b", "prefill"): (85, 626, 1018),
-    ("qwen3_0_6b", "decode"): (57, 150, 206),
+    ("qwen3_0_6b", "prefill"): (85, 619, 1011),
+    ("qwen3_0_6b", "decode"): (57, 143, 199),
     ("llama32_1b", "prefill"): (49, 328, 552),
     ("llama32_1b", "decode"): (33, 152, 184),
 }
@@ -592,7 +601,9 @@ def test_the_quant_columns_come_from_the_packing_code_and_differ_by_path():
     assert set(qq) == set(q), "same schema columns as the llama contract"
     pq = ma.plan_for("qwen3_0_6b", "decode", 1, 512, 2048, "w4_decode")
     assert pq.elf_sequence() == ["rms_qkv_qknorm_rope_gemv2", "o_gemv_ffn_int4", "lm_head_gemv"]
-    assert (pq.total_submissions, pq.total_launches, pq.total_host_ops) == (57, 150, 58)
+    # `[2026-08-26]` queue item 28: 150 -> 143. The LM head is 3 launches, not
+    # 10; the submission count is unchanged because the head was always one.
+    assert (pq.total_submissions, pq.total_launches, pq.total_host_ops) == (57, 143, 58)
 
 
 def test_the_int4_driver_buckets_every_planned_host_stage():

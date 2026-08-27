@@ -636,7 +636,8 @@ A geometry sweep holding cores fixed and varying columns (devq 680) resolves it 
 nested ceilings — ~4.5 GB/s per core, ~10.1 GB/s per column, 50–54 GB/s device-wide** — since
 8 columns × 4 rows demands 81 GB/s at the per-column figure and receives 50–54.
 
-**PROPOSED CORRECTION, not applied here.** §4:1108's "the machine's *maximum* measured rate
+**CORRECTION APPLIED `[2026-08-26]`** (it was proposed here and left unapplied by item 27; the
+operator session applied it at §4:1188 in the same form). §4:1108's "the machine's *maximum* measured rate
 (40.8 GB/s)" is contradicted by measurement: 40.8 is one production kernel's rate at 8 of 32
 compute tiles, not a device property. The replacement text is drafted in the item's
 `RESULTS.md` §12; **it is proposed for the operator rather than made silently**, and every
@@ -664,6 +665,11 @@ lock fix or the device hangs.** (2) `air-split-l2-memref` **aborts aircc** (retu
 `tileChannelOpByFactor`) on a 2-D L2 staging memref; flattening the buffers works around it in
 the builder, `mlir/` untouched, but the pass still refuses the int4 row builder at `herd_m` 4
 and 2. It deserves its own queue item; the reproducer is `run_matrix.sh`.
+**`[2026-08-27, item 29]` The pass's launch-endpoint cap
+(`max-launch-channels-mm2s = num_cols * 2 = 16`) means it never RAN on the 8-column arms this
+item shipped**, so "11 / 11 combinations compile" is not evidence about that pass at those
+geometries. Item 29 found four defects in it, one a silent miscompile. §4's curve is unaffected —
+the arms that produced it do not go through the pass.
 
 **Correctness.** A derived per-element bound, no cosine: for bf16 the three rounding sites of
 `mv.cc` charged separately (exact bf16 products, `2⁻²⁴` per lane accumulation, a binary-tree
@@ -673,6 +679,103 @@ used the optimistic 2⁻⁹); for int4, item 23's own `fold_bounds` imported unm
 `air.launch` count and PDI count are **invariant with rows** (1 and 5 at rows 1/2/4), so no new
 multi-launch form exists and LOAD_PDI parity is unchanged. Study host suite 720/720 in 33,
 unchanged.
+
+### `[2026-08-26]` Item 28 — landing the rows: they are worth **nothing** on the shipped LM head, and **−14.5 %** once you use what they unlock
+
+`results/item28-land-herd-rows-20260826/`, base commit `2e14f533`, devq **684, 688, 691, 692,
+699, 703, 705**. Prediction before the first device job (`PREDICTION.md`, its addendum written
+between devq 688 and devq 691 and saying so). Turbo before and after every measure job.
+
+**§4's own prediction, applied to the shipped kernel, was wrong, and the falsifier it named
+fired.** Item 27's byte-threshold model priced the Qwen3-0.6B LM-head partition (33.55 MB) at
+**−12 %** for two core rows. Measured on the production head, three alternating rounds per arm
+in one session (devq 688, `make profile`'s clock):
+
+| arm | cores | `lm_head_gemv` device ms | vs 1 row |
+|---|---|---|---|
+| 1 row | 8 | 7.58, 7.59, 7.57 | — |
+| 2 rows | 16 | 7.53, 7.57, 7.55 | **−0.4 %** |
+| 4 rows | 32 | 8.26, 8.30, 8.27 | **+9.1 %** |
+
+The rows are real — the artifacts place 8 / 16 / 32 compute tiles on rows {2} / {2,3} /
+{2,3,4,5} — so this is rows measured and found not to pay. **The reason is that the production
+head was ALREADY at the wall this document's own §4 located.** 311.16 MB in 7.58 ms is
+**41.1 GB/s** end to end, and ~48 GB/s once its ten launch boundaries are charged, against the
+50–54 GB/s device ceiling. Item 27's harness read 35.72 GB/s at the same 8-core geometry — it
+was 13 % *below* the shipped kernel, which is why doubling its cores bought it 24 % and doubling
+the shipped kernel's bought 0.4 %. **This is item 23's F2 discipline biting one level up: not
+only does the harness's intercept not transfer, its HEADROOM does not either.**
+
+**What rows are actually worth is a bigger partition.** The activation broadcast's BD repeat is
+`M / (herd_m · m_input · herd_rows) − 1` against a `[0:255]` hardware range, so a partition may
+carry **16384 / 32768 / 65536 rows at 1 / 2 / 4 core rows**, and the vocab needs **10 / 5 / 3**
+launches. The 5-launch form at one row does not build — `error: 'aiex.npu.push_queue' op Repeat
+count exceeds the [0:255] range` (devq 691 leg 5, compile-only, never dispatched). Measured on a
+standalone head harness (devq 691, a third clock, 0 violations of a derived per-element bound at
+every point, worst 0.994 of the bound):
+
+| partitions | rows | launches | ms (3 walks) | GB/s | vs shipped |
+|---|---|---|---|---|---|
+| 9 × 16384 + 4480 | 1 | 10 | 7.678, 7.663, 7.661 | 40.6 | — |
+| 9 × 16384 + 4480 | 2 | 10 | 7.579, 7.578, 7.548 | 41.1 | −1.1 % |
+| 4 × 32768 + 20864 | 2 | 5 | 6.852, 6.807, 6.844 | 45.5 | **−10.7 %** |
+| **2 × 65536 + 20864** | **4 / 4 / 2** | **3** | 6.464, 6.492, 6.470 | **48.1** | **−15.6 %** |
+
+**Two of the three steps are clean controls and the third is not, so only two are attributed**
+`[2026-08-27]`: **A → B** holds the launch count and moves rows 1 → 2 (**−1.1 %**, the rows'
+whole worth); **B → C** holds rows at 2 and moves launches 10 → 5 (**−0.734 ms = 147 µs per
+launch boundary**, beside doc 57 §1.5's independently measured 106–108 for a different kernel).
+**C → D moves both axes at once, and there is no legal 3-launch one-row control to separate them
+— the BD cap forbids it — so D's gain is NOT decomposed into "boundaries" and "rate" here.** An
+earlier draft of this block published per-row boundary constants and streaming rates for 1 and
+4 rows; those were a model rather than a measurement and are withdrawn. The four end-to-end
+rates in the table are bytes over time and stand.
+
+**LANDED** on Qwen3-0.6B, whose driver now DERIVES its partitioning from the row count
+(`lm_head_parts`), so `QWEN3_LM_HERD_ROWS=1` reproduces the pre-item-28 head byte for byte.
+A-B-A on `make profile`'s clock, one session, one prompt (devq 699): `lm_head_gemv`
+**7.58 → 6.48 ms (−14.5 %)**, decode **17.68 → 18.10 tok/s (+2.4 %)**,
+**56.58 → 55.25 ms/token (−1.33)**; the 1-row arm read 17.68 / 17.69 / 17.67 / 17.60 across the
+walk, so the A-B-A shows no drift. The re-execution gate is **7/7 clean at 3 launches** — an ODD
+LOAD_PDI count, which doc 57 §1.5's defect family is about, and the compiler pad holds. The other
+three decode ELFs are byte-identical across the whole job. **`make verify` PASS on both
+precisions** (devq 703). **Two `w4-default-qwen` walks, 6/6 rungs each, verify PASS on both
+artifact sets, `compare_roots` VERDICT OK** with 0 identifier mismatches and 0.13 % median
+`device_ms` drift (devq 707) — and the runner's own live check passed on every rung, which is
+what says the driver and the planner still agree after the head moved (143 `air.launch` per
+decode token against 150). The planner learned the row count as a `plan.py` constant rather than
+a `ModelSpec` field, deliberately: `asdict(spec)` is inside `plan()`'s hashed body, so a field
+would have moved **every** model's plan sha, including llama32_1b's, which has no part in this.
+Qwen3-0.6B's three recorded driver traces are re-recorded (devq 707/712); llama32_1b's two are
+untouched.
+
+**§4's "any future caller of `herd_rows > 1` must set a lock fix" is TOO BROAD, and this item
+found out by refusing the shipped prefill.** A first draft of the compile-time guard read it
+literally; `o_ffn_qwen` runs **four `8 × 4` GEMM herds — all 32 cores, `link_with =
+mm_m64n128.o`, no lock fix — and has never hung.** **Nor is it only the GEMMs: the shipped bf16
+`o_gemv_ffn`'s stage 2 (`matvec_swiglu_rms`, a decode GEMV) is `@herd(sizes=[8, 4])` at
+`_STAGE2_N_CASCADE = 4` — 32 compute tiles, no lock fix, today.** So §4's premise "every shipped
+GEMV used 8 of 32 cores" is not general either: the FFN GEMV has used 32 all along, by a **K
+cascade** rather than an output-stationary row split. **And item 27's explanation does not
+discriminate**: the prefill GEMM herds take an L2 A panel of `memref<8x1x64x256xbf16, 1>` — one
+slab per column read by all four rows, the very single-writer/multi-reader shape it blamed — and
+do not hang. So the guard **fails closed** instead of naming a mechanism it cannot identify: a
+multi-row herd needs the lock fix unless its kernel name is on a registry of kernels MEASURED
+green (membership itself measured, by building every shipped model's modules), geometry that
+cannot be decoded counts as multi-row, and the micro-kernel filename is not consulted at all —
+an earlier draft filtered on `mv.o` and would have let the same builder through a renamed object.
+It refuses before a backend is constructed; `backend_presets.with_herd_rows()` is the call-site
+half.
+
+**§4's `o_gemv_ffn_int4` −15 % is re-priced and is really −3.1 %.** §4 priced the cascade as ONE
+6.04 MB call; it is THREE `air.launch` ops of 1.098 / 3.293 / 1.647 MB, each paying its own fixed
+cost, against a 2.29 MB crossover. Measured at the three real stage shapes on item 27's own
+harness (devq 692): stage 1 **+11.8 %**, stage 2 **−7.5 %**, stage 3 **+6.1 %** at two rows —
+the per-stage best is **−3.1 %**, i.e. **−0.69 ms/token** over 28 layers, and taking rows on all
+three is **+2.1 %**, a loss. Item 27's model predicted every one of those six points within
+1.5 %. **Nothing is wired there**: the int4 builders hard-code `sizes=[N_CORES, 1]` and the packed
+tile order encodes the row mapping, so it is a builder port plus a weight-ABI change — its own
+item, now with its ceiling attached.
 
 ## 5. The first measurable milestone
 
@@ -813,7 +916,7 @@ geometry, same numpy code). Per-component, predicted → measured (walk 2 / walk
 
 **The attribution the gate asks for.** The token's 1046.2 MB of weights (52.7 qkv + 456.7
 o_ffn int4-packed + 536.9 bf16 head — exact packed-BO bytes, computed from the packers) at the
-machine's boundary-free 40.8 GB/s stream class would take **25.7 ms**; the device spends
+machine's boundary-free 40.8 GB/s stream class would take **25.7 ms**; the device spends *(40.8 is one kernel's rate at 8 of 32 tiles, not a device maximum — item 27; this attribution is at THAT geometry and is not re-derived here)*
 **~57.0**. The ~31 ms that is not weight stream is charged, not independently measured, so its
 split is a set of BOUNDS `[2026-08-26, per this commit's review]`: **16.3 ms of launch
 boundaries** (152 × 107 µs — 10.3 of it in the 16 QKV calls: that line is ~90 % boundary, 0.64
@@ -1185,12 +1288,31 @@ TFLOP/s, 0.59×**, the first measured `bfp16ebs8` GEMM rate in this tree.
 **The accounting, with the residual labelled as a residual** (`review finding 1`). Δdevice per
 forward is **+531 ms**. This item can price exactly one term of it: the **80 removed launch
 boundaries, −8.6 ms** at doc 57 §1.5's constant. The weight-byte term it cannot price: 851.4 MB
-at the machine's *maximum* measured rate (40.8 GB/s) takes 20.9 ms, and because 40.8 is a
-maximum, **20.9 ms is a LOWER bound on the time those bytes occupy — not an upper bound on what
-removing them saves** — and how much of that time is exposed rather than overlapped with compute
-is not measured here. `PREDICTION.md` used it as an upper bound on the saving; that was a
-reasoning error, and it is conservative with respect to this item's conclusion: correcting it can
-only make the weight-byte term **larger**, and the bfp16 arm is still 531 ms slower. So with
+at **40.8 GB/s** takes 20.9 ms. `[2026-08-26, item 27 — APPLIED]` **40.8 is NOT the machine's
+maximum**; it is the production bf16 LM head's rate between its launch boundaries (doc 57 §1.5),
+measured at **8 of the device's 32 compute tiles**. Filling all four core rows measures
+**50.03 GB/s** for the same bf16 GEMV and **53.85 GB/s** for the int4 GEMV (devq 677/678, own
+fitted slopes per geometry, 0 bound violations of 150,528 elements across all 42 successful
+points, devq 677–681). **What that does and does not establish** (per this correction's own
+pre-commit review): it is **an observed rate for the tested access pattern — two related
+K = 1024, `tile_m = 8`, output-stationary decode-weight-stream GEMVs at one 32-tile geometry —
+NOT a device-wide ceiling.** Their convergence, and the fact that 8 columns × 4 rows would
+demand ~81 GB/s at the per-column rate observed at 16 cores, suggest a *shared bottleneck* for
+that pattern; they do not distinguish a DDR/device limit from a common kernel, DMA or dataflow
+limit, and **no read-only device sweep has been run by anyone**. The per-core ~4.5 and
+per-column ~10.1 GB/s figures are likewise observed rates at their own geometries, not
+independently established capacities — item 27's falsifier F4 explicitly invalidated the
+instruction-count model that could have supported a capacity claim. At 50.03 the same 851.4 MB
+takes **17.0 ms**, not 20.9. The original sentence's own reasoning — "because 40.8 is a maximum,
+20.9 ms is a LOWER bound on the time those bytes occupy, not an upper bound on what removing them
+saves" — **rested on the false premise and is withdrawn**, and so is its companion claim that
+"correcting it can only make the weight-byte term larger": with 40.8 no longer a demonstrated
+maximum, 20.9 ms is **neither** a universal lower nor upper bound, and the 17.0 ms figure is a
+counterexample in the smaller direction. Note also that neither measured rate is a *prefill-GEMM*
+rate, which is what this passage's term actually needs. How much of that time is exposed rather
+than overlapped with compute is not measured here. `PREDICTION.md` used it as an upper bound on
+the saving; that was a reasoning error whose direction is now **undetermined**, and the bfp16 arm
+is still 531 ms slower regardless. So with
 `W ≥ 0` the unmeasured weight-byte saving, the **residual after the modelled terms is
 `R = 531 + 8.6 + W ≥ 540 ms`**, and R is charged to *the whole co-varying set listed above*, not
 to any member of it.

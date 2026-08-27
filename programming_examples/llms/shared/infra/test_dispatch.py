@@ -13,6 +13,7 @@ No test-framework dependency — see `test_bo_pool.py` for why.
 """
 
 import sys
+import tempfile
 import traceback
 from contextlib import contextmanager
 from pathlib import Path
@@ -1016,6 +1017,298 @@ def test_run_sequence_deliberately_rebuilds_its_runs_every_call():
         cache.evict_pools_for({"k"})
         cache.run_sequence(steps, specs, {}, arrays)
         assert rt.runs_created == base + 2
+
+
+# ---------------------------------------------------------------------------
+# Herd rows and the lock-race coupling (queue item 28)
+# ---------------------------------------------------------------------------
+#
+# A herd occupying more than one CORE ROW hangs the device in `matvec.py`'s GEMV
+# form -- `ERT_CMD_STATE_TIMEOUT`, item 27 section 6.1, bisected devq 673/674;
+# only `use_lock_race_condition_fix` unblocks it. The row count is the builder's
+# and the lock fix is the caller's, so the rule is enforced where both are in
+# scope: `KernelCache.compile_and_cache`.
+#
+# `[2026-08-27, review finding 1]` THE RULE FAILS CLOSED, and these tests exist
+# because the first version did not. It filtered on `link_with == "mv.o"` and
+# turned every unreadable geometry into "one row", so the same builder reached
+# through a renamed object -- and this tree renames micro-kernel objects as a
+# matter of course (`mv_heads_hd128.o`) -- sailed past and would have hung. The
+# discriminator that replaced it is not structural, deliberately: measured on the
+# shipped modules, the prefill GEMM herds share ONE L2 A panel per column across
+# all four rows, the very shape item 27 blamed, and they do not hang. So nothing
+# in the IR separates the hazardous form, and the default is to refuse.
+#
+# Driven with a stand-in module so the suite keeps its no-toolchain property
+# (`test_profiles._module_constant`'s rule). Real IR goes through it on every
+# compile.
+
+
+class _FakeAttr:
+    def __init__(self, name, attr):
+        self.name = name
+        self.attr = attr
+
+
+class _FakeAttrs:
+    def __init__(self, pairs):
+        self._pairs = [_FakeAttr(k, v) for k, v in pairs]
+
+    def __len__(self):
+        return len(self._pairs)
+
+    def __getitem__(self, i):
+        return self._pairs[i]
+
+
+class _FakeOp:
+    def __init__(self, name, attrs=(), operands=()):
+        self.name = name
+        self.attributes = _FakeAttrs(attrs)
+        self.operands = list(operands)
+
+
+def _fake_const(value):
+    return _FakeOp("arith.constant", [("value", value)])
+
+
+class _FakeValue:
+    def __init__(self, owner):
+        self.owner = owner
+
+
+class _FakeModule:
+    """Just enough of `air.ir.Module` for `herd_row_geometry` to walk it."""
+
+    def __init__(self, ops):
+        class _Operation:
+            @staticmethod
+            def walk(fn):
+                for op in ops:
+                    fn(op)
+
+        self.operation = _Operation()
+
+
+def _fake_herd(cols, rows, n_deps=0, n_operands=3, sym="herd_0", link="mv.o",
+               seg=True, const_rows=True):
+    sizes = [_FakeValue(_fake_const(cols)),
+             _FakeValue(_fake_const(rows) if const_rows
+                        else _FakeOp("air.wait_all"))]
+    operands = [_FakeValue(_fake_const(0)) for _ in range(n_deps)]
+    operands += sizes + [_FakeValue(_fake_const(0)) for _ in range(n_operands)]
+    attrs = [("sym_name", f'"{sym}"')]
+    if seg:
+        attrs.append(("operandSegmentSizes", [n_deps, 2, n_operands]))
+    if link is not None:
+        attrs.append(("link_with", f'"{link}"'))
+    return _FakeOp("air.herd", attrs, operands)
+
+
+def test_herd_row_geometry_reads_every_herd():
+    from shared.infra.dispatch import herd_row_geometry
+
+    assert herd_row_geometry(_FakeModule([_fake_herd(8, 1)])) == [("herd_0", 1)]
+    mixed = _FakeModule([_fake_herd(8, 1, sym="a"), _fake_herd(8, 4, sym="b"),
+                         _fake_herd(8, 2, sym="c")])
+    assert herd_row_geometry(mixed) == [("a", 1), ("b", 4), ("c", 2)]
+    # a launch-only module is not an error
+    assert herd_row_geometry(_FakeModule([_FakeOp("air.launch")])) == []
+
+
+def test_herd_row_geometry_skips_the_async_dependency_operands():
+    """The sizes are found through `operandSegmentSizes`, not by position, so
+    the async-token form does not read a dependency as a herd size."""
+    from shared.infra.dispatch import herd_row_geometry
+
+    assert herd_row_geometry(_FakeModule([_fake_herd(8, 2, n_deps=3)])) == [("herd_0", 2)]
+
+
+def test_unreadable_geometry_raises_rather_than_reading_as_one_row():
+    """`[review finding 1]` The old version returned 1 here, which is the worst
+    possible direction for a hang hazard: it made an undecodable module look
+    safe. Every failure mode must now surface."""
+    from shared.infra.dispatch import HerdGeometryUndecidable, herd_row_geometry
+
+    for label, mod in (
+        ("no operandSegmentSizes", _FakeModule([_fake_herd(8, 4, seg=False)])),
+        ("non-constant row size", _FakeModule([_fake_herd(8, 4, const_rows=False)])),
+    ):
+        try:
+            herd_row_geometry(mod)
+        except HerdGeometryUndecidable:
+            pass
+        else:
+            raise AssertionError(f"{label} was decoded rather than refused")
+
+    class _Explodes:
+        @property
+        def operation(self):
+            raise RuntimeError("no bindings here")
+
+    try:
+        herd_row_geometry(_Explodes())
+    except HerdGeometryUndecidable:
+        pass
+    else:
+        raise AssertionError("an unwalkable module was decoded rather than refused")
+
+
+def test_a_multi_row_herd_needs_a_lock_fix_whatever_object_it_links():
+    """`[review finding 1]` THE REGRESSION TEST. The old guard keyed on
+    `link_with == "mv.o"`, so the same `matvec.py` dataflow reached through a
+    copied or renamed object -- `down_mv.o`, a per-model tagged variant, which
+    is how this tree names micro-kernels anyway -- reached four rows with no
+    lock fix and hung. The object name is not consulted at all now."""
+    from shared.infra.dispatch import herd_row_geometry, require_lock_fix
+
+    for link in ("mv.o", "down_mv.o", "mv_heads_hd128.o", None):
+        geom = herd_row_geometry(_FakeModule([_fake_herd(8, 4, link=link)]))
+        try:
+            require_lock_fix("a_new_gemv", geom, {"omit_pingpong": ""})
+        except ValueError as exc:
+            assert "ERT_CMD_STATE_TIMEOUT" in str(exc)
+            assert "HERD_ROWS_MEASURED_GREEN" in str(exc)
+        else:
+            raise AssertionError(f"link_with={link!r} was accepted without a lock fix")
+
+
+def test_undecidable_geometry_is_treated_as_hazardous():
+    from shared.infra.dispatch import require_lock_fix
+
+    try:
+        require_lock_fix("mystery", None, {})
+    except ValueError as exc:
+        assert "could not be read" in str(exc)
+    else:
+        raise AssertionError("an undecidable module was let through")
+    # ... but a caller that already asked for the fix is entitled to proceed,
+    # and gets `None` rather than a row count nobody measured.
+    assert require_lock_fix("mystery", None, {"use_lock_race_condition_fix": True}) is None
+
+
+def test_either_lock_fix_version_satisfies_the_coupling():
+    from shared.infra.dispatch import herd_row_geometry, require_lock_fix
+
+    geom = herd_row_geometry(_FakeModule([_fake_herd(8, 4)]))
+    assert require_lock_fix("k", geom, {"use_lock_race_condition_fix": True}) == 4
+    assert require_lock_fix("k", geom, {"use_lock_race_condition_fix_v2": True}) == 4
+    # a key that is present but FALSE is not a lock fix
+    try:
+        require_lock_fix("k", geom, {"use_lock_race_condition_fix": False})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("use_lock_race_condition_fix=False was accepted")
+
+
+def test_only_measured_green_kernels_are_exempt_and_only_by_exact_name():
+    """The shipped prefill stitchers, flash attention and the bf16 decode
+    cascade all hold `8 x 4` herds and ship without a lock fix -- membership was
+    MEASURED (`herd_rows_sweep.py`), not assumed. Prefix matching is confined to
+    the one generated family, so a new kernel cannot inherit a neighbour's
+    record by sharing a stem."""
+    from shared.infra.dispatch import (
+        HERD_ROWS_MEASURED_GREEN,
+        herd_row_geometry,
+        require_lock_fix,
+    )
+
+    geom = herd_row_geometry(_FakeModule([_fake_herd(8, 4)]))
+    for name in ("o_ffn_qwen", "rms_gemms_rope", "flash_attn", "o_gemv_ffn"):
+        assert name in HERD_ROWS_MEASURED_GREEN, name
+        assert require_lock_fix(name, geom, {}) == 4
+    # the generated FA family, by prefix
+    assert require_lock_fix("flash_attn_ctx1024", geom, {}) == 4
+    # and nothing else inherits a stem
+    for name in ("o_ffn_something_new", "flash_attn2", "lm_head_gemv"):
+        try:
+            require_lock_fix(name, geom, {})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{name} inherited an exemption it was not given")
+
+
+def test_the_landed_lm_head_is_not_exempt_it_carries_the_fix():
+    """`lm_head_gemv` is the one kernel item 28 moved to multi-row, and it is
+    deliberately NOT on the green list: it passes because its backend carries
+    the lock fix, so removing that flag fails loudly instead of silently."""
+    from shared.infra.dispatch import (
+        HERD_ROWS_MEASURED_GREEN,
+        herd_row_geometry,
+        require_lock_fix,
+    )
+
+    assert "lm_head_gemv" not in HERD_ROWS_MEASURED_GREEN
+    geom = herd_row_geometry(_FakeModule([_fake_herd(8, 4)]))
+    assert require_lock_fix("lm_head_gemv", geom, {"use_lock_race_condition_fix": True}) == 4
+
+
+def test_with_herd_rows_derives_the_flag_from_the_row_count():
+    """The EASY half of the coupling: one call at the call site, so a caller
+    cannot set the row count and forget the flag. Accepts the per-partition
+    sequence the mixed LM head passes."""
+    from shared.infra.backend_presets import LM_GEMV_BACKEND, with_herd_rows
+
+    assert "use_lock_race_condition_fix" not in with_herd_rows({"a": 1}, 1)
+    assert with_herd_rows({"a": 1}, 2)["use_lock_race_condition_fix"] is True
+    assert with_herd_rows({"a": 1}, (4,) * 9 + (2,))["use_lock_race_condition_fix"] is True
+    assert with_herd_rows({"a": 1}, (1, 1)) == {"a": 1}
+    assert with_herd_rows({"use_lock_race_condition_fix": False}, 1) == {
+        "use_lock_race_condition_fix": False
+    }
+    # it copies rather than mutating -- the presets are module-level dicts that
+    # every model shares
+    before = dict(LM_GEMV_BACKEND)
+    with_herd_rows(LM_GEMV_BACKEND, 4)
+    assert LM_GEMV_BACKEND == before
+
+
+def test_the_compile_chokepoint_refuses_before_it_compiles_anything():
+    """`compile_and_cache` must raise BEFORE constructing a backend. The whole
+    point is that the caller gets a message instead of a device timeout after a
+    multi-minute compile."""
+    import shared.infra.cache as cache_mod
+    from shared.infra.cache import KernelCache
+
+    calls = []
+
+    class _Boom:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+            raise AssertionError("a backend was constructed despite the refusal")
+
+    with tempfile.TemporaryDirectory() as d:
+        cache = KernelCache(cache_dir=d)
+        module = _FakeModule([_fake_herd(8, 2)])
+        real_prepare = cache_mod.prepare_air_project
+        cache_mod.prepare_air_project = lambda **kw: None
+        try:
+            try:
+                cache.compile_and_cache("a_new_gemv", module, {"output_format": "elf"})
+            except ValueError as exc:
+                assert "a_new_gemv" in str(exc)
+            else:
+                raise AssertionError("the multi-row compile was not refused")
+        finally:
+            cache_mod.prepare_air_project = real_prepare
+    assert calls == [], calls
+
+
+def test_the_row_count_is_recorded_in_the_manifest_only_when_it_is_known():
+    """The ELF does not carry the herd geometry and the cache name does not
+    encode it, so an A/B that recompiles the same name at a different row count
+    would otherwise be invisible. Additive key; and an unknown geometry records
+    NOTHING rather than a number nobody measured."""
+    from shared.infra.dispatch import LaunchCounts
+
+    counts = LaunchCounts(air_launches=10, herd_launches=10).as_dict()
+    # as_dict itself is unchanged -- the key is added by compile_and_cache, so
+    # nothing that compares LaunchCounts values moves
+    assert counts == {"air_launches": 10, "herd_launches": 10}
+    counts["herd_rows"] = 2
+    assert counts.get("air_launches") == 10 and counts.get("herd_rows") == 2
 
 
 def _main():

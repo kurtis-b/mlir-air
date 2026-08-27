@@ -28,13 +28,28 @@ before the flip is refused by name, with the recompile command in the message.
 Two clocks, never mixed (operator rule 2026-08-22). This table is `make profile`'s.
 
 Measured on NPU2 (AIE2P), `make profile N_TOKENS=32`, 2026-08-26, **Turbo recorded**,
-three runs per arm alternating in one session (devq 663).
+one session (devq 699 for the int4 arm, an A-B-A of four 10-launch-head rounds against
+three 3-launch-head ones; devq 707 for the bf16 arm; devq 663 for the pre-item-28 numbers).
 
 | Phase | Measured | Notes |
 |-------|----------|-------|
 | Prefill / TTFT (2048 tokens) | **1.48–1.50 s** | unchanged by the precision — prefill is bf16 GEMMs under both plans (bf16 arm 1.49 s); head_dim=128 → host head-first FA seq↔head transpose included in wall |
-| Decode / TPOT, **int4 default** | **17.3–17.7 tok/s** (56.6–57.9 ms/token) | 28 layers; per token: 28 × (`rms_qkv_qknorm_rope_gemv2` 0.49 + `o_gemv_ffn_int4` ~1.07 + host attention 0.11 ms) + `lm_head_gemv` 7.7 ms |
-| Decode / TPOT, bf16 arm (`QWEN3_W4_DECODE=0`) | 13.7–13.9 tok/s (71.8–72.9 ms/token) | the same session's A/B; 13.4–13.5 on 2026-08-23, 13.0 on 08-21, 11.7 in 2026-06 |
+| Decode / TPOT, **int4 default** | **18.08–18.28 tok/s** (54.7–55.3 ms/token) | 28 layers; per token: 28 × (`rms_qkv_qknorm_rope_gemv2` 0.49 + `o_gemv_ffn_int4` ~1.07 + host attention 0.11 ms) + `lm_head_gemv` **6.48 ms** |
+| Decode / TPOT, bf16 arm (`QWEN3_W4_DECODE=0`) | 14.03–14.23 tok/s (70.3–71.3 ms/token) | the same `lm_head_gemv` (6.47–6.50 ms). Its own before/after is NOT controlled — `o_gemv_ffn.elf` was recompiled between the two measurements — so read the head, not the token; 13.7–13.9 on 08-26 before item 28, 13.0 on 08-21, 11.7 in 2026-06 |
+
+`[2026-08-26]` **queue item 28: the LM head covers the vocab in 3 launches, not 10.**
+The activation broadcast's BD repeat cap scales with the herd's core-row count, so at 4 rows a
+partition carries 65536 rows instead of 16384 and the head is `2 × 65536 + 20864`. **A-B-A in
+one session: `lm_head_gemv` 7.58 → 6.48 ms (−14.5 %), decode 17.68 → 18.10 tok/s (+2.4 %),
+56.58 → 55.25 ms/token** (devq 699; `make verify` PASS on both precisions, devq 703;
+`make check-lm-head-reexec` 7/7 at an odd LOAD_PDI count). The **rows themselves** are worth
+−0.4 % (devq 688) — at 41.1 GB/s end to end this head was already above item 27's harness at
+the same 8-core geometry, so there was little rate to buy — so the win is the
+seven launch boundaries the bigger partitions remove — though only part of that is separable:
+holding rows at 2 and taking launches 10 → 5 is a clean control (147 µs per boundary), while the
+5 → 3 step moves rows too and is not decomposed. `QWEN3_LM_HERD_ROWS=1` is the A/B arm and
+reproduces the pre-item-28 head byte for byte. Evidence:
+`transformer_layer/results/item28-land-herd-rows-20260826/`.
 
 **+27 % on decode's median (17.46 vs 13.73 tok/s), at an unchanged launch structure** — the
 int4 cascade is the same 3 launches / 1 submission as the bf16 one, so the whole gain is

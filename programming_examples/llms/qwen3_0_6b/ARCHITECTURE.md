@@ -27,7 +27,7 @@ x ─[NPU elf:rms_qkv_qknorm_rope]   FUSED, 1 ELF, 9 launches (8 ops + the Q GEM
       (HOST) seq→head transpose → NPU FA → (HOST) head→seq transpose → attn_out[seq,2048]
   ─[NPU elf:o_ffn_qwen]   FUSED, 1 ELF
       { O GEMM + Add + RMSNorm + Gate + Up + SwiGLU + Down + Add } → layer_out[seq,1024]
-once: (HOST) final RMSNorm → [NPU elf:lm_head_gemv] (10 partitions: 9 × 16384 + 4480 = vocab 151936, m_input 8; was 19 × 8192 before 2026-08-21)
+once: (HOST) final RMSNorm → [NPU elf:lm_head_gemv] (3 partitions: 2 × 65536 + 20864 = vocab 151936, m_input 8, herd_rows 4/4/2 — queue item 28, 2026-08-26; was 9 × 16384 + 4480 at one core row, and 19 × 8192 before 2026-08-21)
 ```
 
 **Decode — 2 NPU ELFs/layer (+ lm_head once/token).** `[2026-08-26]` The
@@ -55,7 +55,7 @@ x ─[NPU elf:rms_qkv_qknorm_rope_gemv4]   FUSED, 1 ELF, 4 launches (was 8 befor
        whole saving is weight bytes, 6.04 MB packed vs 24.1 MB bf16 per layer. QWEN3_W4_DECODE=0
        selects `o_gemv_ffn`, the bf16 cascade, for A/B; the QKV stage and the LM head are bf16
        under BOTH (priced negatives, doc 56 H2b).)
-once: (HOST) embed/final RMSNorm → [NPU elf:lm_head_gemv] (10 partitions, 9 × 16384 + 4480)
+once: (HOST) embed/final RMSNorm → [NPU elf:lm_head_gemv] (3 partitions, 2 × 65536 + 20864)
 ```
 
 The fused 2-ELF decode cascade is reachable here because emb=1024 (< 2560) and

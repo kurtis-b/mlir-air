@@ -235,7 +235,25 @@ They agree to 2 %, and the additive form agreeing with the tiny-only form says t
 **not depend on the neighbouring device** — it is a per-configuration constant. Each figure
 still contains the tiny launch's own work (128 KB at the streaming rate is ~4 µs, plus one
 kernel call and one L1→L3 return), so **~100 µs is reconfiguration proper** and 106–108 µs
-is the number to charge per `air.launch` boundary in a multi-launch ELF. Doc 57's "~110 µs"
+is the number to charge per `air.launch` boundary in a multi-launch ELF.
+
+**`[2026-08-26]` Queue item 28 spends this constant, and re-measures it in passing.** The
+Qwen3-0.6B LM head's ten launches exist because the activation broadcast's BD repeat
+`M / (herd_m · m_input · herd_rows) − 1` caps a partition at 16384 rows *at one core row*. Item
+27's `herd_rows` scales that cap, so at four rows a partition carries 65536 and the vocab needs
+**three** launches. Measured on a standalone head harness (devq 691, 311.16 MB every time,
+0 violations of a derived per-element bound): **10 launches 7.663 ms → 5 launches 6.844 →
+3 launches 6.470**, i.e. **−15.6 %**, and in the driver (devq 699, A-B-A, one session)
+`lm_head_gemv` **7.58 → 6.48 ms**, decode **17.68 → 18.10 tok/s**. **One step of that sweep
+is a clean control for this section's constant** and is the only one quoted here: holding the
+row count at 2 and taking the launch count from 10 to 5 costs **−0.734 ms, i.e. 147 µs per
+launch boundary** — a *different* kernel and a *different* row count from the 106–108 µs
+measured above, and consistent with it once item 27's ~+6.5 µs per added core is allowed for.
+**The 10 → 3 step moves rows as well as launches and is deliberately NOT decomposed**: the BD
+cap makes a 3-launch one-row control illegal, so nothing separates its gain into boundary and
+rate. What is measured without a model is the end-to-end rate, 40.6 → 48.1 GB/s over
+10 → 3 launches; and that **rows alone**, at ten launches, moved the head −0.4 % at 2 rows and
++9.1 % at 4 (devq 688). Doc 57's "~110 µs"
 stands; the 120–164 µs band of §1.4 was the repeat-geometry effect stacked on top of it, and
 that effect is a *separate*, additive knob (O3), not an error bar on the boundary. Two
 by-products: the production LM head spends 19 × 107 = **2.0 ms of its 9.83 ms in
@@ -845,10 +863,41 @@ calls **40.8 GB/s** "the machine's maximum measured rate"; it is one production 
 rate between its launch boundaries, and DAM-RS measures **72.9 GB/s** aggregate DDR on this
 machine — but DAM-RS's `ddr.py:124` counts each byte twice, so its read half is ~36.5, and
 **neither party has run a read-only sweep**. "Maximum" is unsupported in both directions.
+**`[2026-08-26]` (ii) IS ANSWERED; (i) IS NARROWED, NOT CLOSED — item 27.** Two GEMVs on two
+different byte streams reach **50.03 / 53.85 GB/s** with all 32 compute tiles (devq 677/678),
+so **PANG26's 45.3 GB/s is exceeded by 19 % and is no longer above anything we achieve** — (ii)
+is answered, and the remaining gap to TileFuse is a kernel-efficiency question, not a bandwidth
+one. (i) is only *narrowed*: 40.8 is definitively **not** a maximum — it is one kernel's rate at
+8 of 32 tiles — but the replacement is an **observed rate for one access pattern at one
+geometry** (K = 1024, `tile_m = 8`, output-stationary decode weight stream), not a device
+ceiling. It does not distinguish a DDR limit from a shared kernel/DMA/dataflow limit; the
+per-core ~4.5 and per-column ~10.1 GB/s figures are observed rates at their own geometries, not
+capacities (F4 invalidated the model that could have made them capacities); **`[2026-08-27]`
+item 29** unblocked the two int4 off-8-column geometries item 27's compiler wall had refused, so
+the per-column figure is now pinned on the **int4** stream as well as the bf16 one. Two
+independent runs, fitted separately (devq 715 / 721): 8 cores in 2 columns read 20.62 / 20.36
+GB/s — **10.31 / 10.18 per column**, both within 2 % of the model — and 8 cores in 4 columns
+21.06 / 20.01 (2.63 / 2.50 per core, against item 27's int4 per-core ~2.9 branch and its
+8-column 22.79).
+Item 27 §4.4's model is **confirmed, not corrected**, and its int4 branch now rests on three
+points rather than one — but this changes nothing about the paragraph above: they are still
+observed rates at their own geometries, and no read-only sweep has been run. DAM-RS's 72.9
+aggregate is 74 % reached and remains uncontradicted; and **a read-only device sweep — still run
+by nobody — remains what would establish a hardware ceiling.** Doc 56 §4's "maximum" sentence is
+corrected. Figures elsewhere derived from 40.8 are **not** all flagged: doc 56 §4's H2a
+attribution carries a marker, but its H2b `stream-at-40.8` residual bounds and its int4-QKV
+priced negative **still lean on 40.8 and their directions may flip** — a faster stream rate
+lowers the stream charge and *raises* the dequant residual, so "≤ 0.80 ms/call / ≤ 10.7
+ms/token" is not safe as an upper bound, and the int4-QKV rejection (6.19 MB / 40.8 = 0.152 ms
+against 0.214 ms of boundaries) should be re-derived at the int4 rate item 27 measured. Both are
+recorded here as **open**, and re-deriving them needs its own measurement, not a doc edit.
 (ii) PANG26/TileFuse reports a W4A16 GEMV 1×4096×14336 at 181.22 GOP/s on **this exact
 part** (HX 370) = **45.3 GB/s of int4 weight bytes**, i.e. *above* the claimed wall and ~2×
-the shipped kernel's standalone rate. Both are recorded as contradictions with their
-provenance; settling either needs the read-only DDR sweep and reading the paper.
+the shipped kernel's standalone rate. Both were recorded as contradictions with their
+provenance; settling either needed the read-only DDR sweep and reading the paper. **Status as of
+`[2026-08-26]`: see the item-27 block immediately below — (ii) is answered (45.3 is exceeded),
+(i) is narrowed but NOT closed (40.8 is not a maximum; the replacement is an observed rate at one
+geometry, and the read-only sweep is still what would establish a hardware ceiling).**
 
 **`[2026-08-26]` A free 1.07× on the SHIPPED int4 GEMV, found while building the
 control for item 23 (devq 658/667).** `mv_int4_bf16.cc` runs its inner loop at
