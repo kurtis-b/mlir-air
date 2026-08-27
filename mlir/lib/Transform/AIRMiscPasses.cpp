@@ -1566,6 +1566,28 @@ FailureOr<Value> tileChannelOpByFactor(
 
     int splitDimOnOffsets = splitInfoDimOnOffsets;
 
+    // Every use of `splitDimOnOffsets` below indexes this op's offset /
+    // wrap / stride lists. An air.channel put/get may legally carry fewer
+    // offsets than sizes and strides, in which case the split dimension can
+    // name an offset that is not there; indexing it read past the end of the
+    // SmallVector and aborted the compiler under assertions. Callers decline
+    // such shapes up front; refuse here as well rather than trust that.
+    {
+      auto opOffsets = air::getOffsetsAsValues(originalChanOp);
+      auto opWraps = air::getSizesAsValues(originalChanOp);
+      unsigned numOffsetDims =
+          (opOffsets.empty() && opWraps.empty())
+              ? air::getTensorShape(originalChanOp.getMemref().getType()).size()
+              : opOffsets.size();
+      if (splitDimOnOffsets < 0 ||
+          (unsigned)splitDimOnOffsets >= numOffsetDims) {
+        originalChanOp->emitOpError("cannot be split at offset dimension ")
+            << splitDimOnOffsets << ": the op carries " << numOffsetDims
+            << " offset dimension(s)";
+        return failure();
+      }
+    }
+
     Operation *affineApplyOp = nullptr;
     // Get any existing affine map operating on the target split dimension.
     if (!air::getOffsetsAsValues(originalChanOp).empty()) {
@@ -2424,6 +2446,274 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
       continue;
     }
 
+    // Precondition: one execution of the far side must not carry more than one
+    // execution of the L2 side stages.
+    //
+    // `tileChannelOpByFactor` cuts the far side CONTIGUOUSLY -- split i takes
+    // offset += i * (size / factor) with size /= factor -- which inverts the L2
+    // side's cut only when the two accesses run in step, one buffer for one
+    // buffer. That holds for the pattern the pass was written for, where both
+    // sides walk the same tile in matching loops (the two sizes may still count
+    // different units, L2 tiles on one side and rows on the other, and the pass
+    // handles that).
+    //
+    // It does not hold when the L2 buffer is re-staged inside a loop while the
+    // far side delivers the whole loop's worth in ONE access: the buffer's
+    // sub-regions are then INTERLEAVED through that stream rather than laid out
+    // as its halves, so the contiguous cut hands each sub-buffer the wrong
+    // rows. Measured on a per-column int4 GEMV feed (one L3 put of 24 x 8576
+    // bytes against an 8576-byte staging buffer): it compiles, it runs, and it
+    // failed a per-element bound on 6031 of 6144 outputs. Expressing it would
+    // need a strided far-side cut (offset += i plus an extra wrap-and-stride
+    // dimension), which this pass only arms from an scf.for step. Until then,
+    // decline -- the buffer comes out intact, exactly as it does at the
+    // geometries where the launch-endpoint cap already declines the split.
+    // EVERY test below refuses when it cannot decide. This pass has already
+    // shipped two failures of the shape "the check could not tell, so the split
+    // went ahead" -- one of them a silent miscompile -- so an input whose
+    // access pattern is not statically knowable is declined, never permitted.
+    // std::optional is the carrier: nullopt means "cannot tell", and nullopt
+    // declines.
+
+    // Elements one execution of `ci` moves, or nullopt when that is not
+    // statically knowable.
+    auto accessVolumeOf =
+        [](air::ChannelInterface ci) -> std::optional<int64_t> {
+      auto memrefTy =
+          dyn_cast_if_present<MemRefType>(ci.getMemref().getType());
+      auto sizes = air::getSizesAsValues(ci);
+      if (sizes.empty()) {
+        // `runOnOperation` populates defaults from the op's own memref, so the
+        // volume is the memref's -- but only if that is static.
+        if (!memrefTy || !memrefTy.hasStaticShape())
+          return std::nullopt;
+        return (int64_t)air::getTensorVolume(memrefTy);
+      }
+      int64_t volume = 1;
+      for (auto size : sizes) {
+        auto constSize = getConstantIntValue(size);
+        if (!constSize || *constSize < 0)
+          return std::nullopt;
+        volume *= *constSize;
+      }
+      return volume;
+    };
+
+    // Offset entries `ci` will carry by the time `tileChannelOpByFactor`
+    // indexes them, or nullopt when that cannot be modelled.
+    auto numOffsetDimsOf = [](air::ChannelInterface ci,
+                              unsigned refSizeRank) -> std::optional<unsigned> {
+      auto offsets = air::getOffsetsAsValues(ci);
+      auto sizes = air::getSizesAsValues(ci);
+      // Matches `tileChannelOpByFactor`: defaults are populated only when BOTH
+      // lists are empty, and then they take the memref's rank.
+      if (offsets.empty() && sizes.empty()) {
+        auto memrefTy =
+            dyn_cast_if_present<MemRefType>(ci.getMemref().getType());
+        if (!memrefTy || !memrefTy.hasStaticShape())
+          return std::nullopt;
+        return (unsigned)memrefTy.getRank();
+      }
+      // Sizes but no offsets: the rank-matching step in `runOnOperation` starts
+      // at `offsets.size() - 1`, which underflows to -1 on an empty list and
+      // indexes off the front of the SmallVector. It cannot run at all here, so
+      // there is nothing to model -- refuse.
+      if (offsets.empty())
+        return std::nullopt;
+      if (sizes.size() >= refSizeRank)
+        return (unsigned)offsets.size();
+      // The rank-matching step inserts into `offsets` once for each insert into
+      // `wraps`, so it can add at most `refSizeRank - sizes.size()` entries; it
+      // may stop earlier. This is an UPPER bound, so it can still approve an op
+      // that ends up short -- and that residual is caught by the range check in
+      // `tileChannelOpByFactor`, which refuses with a diagnostic rather than
+      // reading past the end. Approving here can therefore cost a clean pass
+      // failure, never a crash and never a wrong split.
+      return (unsigned)offsets.size() + (refSizeRank - (unsigned)sizes.size());
+    };
+
+    // Whether `other` is the far-side partner of `chanUser`, or nullopt when
+    // the two bundle index lists cannot be compared.
+    auto pairsByBundleIndex =
+        [](air::ChannelInterface chanUser,
+           air::ChannelInterface other) -> std::optional<bool> {
+      auto refIndices = chanUser.getIndices();
+      auto otherIndices = other.getIndices();
+      if (refIndices.empty() && otherIndices.empty())
+        return true; // Scalar channel: the symbol has one endpoint pair.
+      if (refIndices.size() != otherIndices.size())
+        return std::nullopt;
+      for (auto [refIdx, otherIdx] : llvm::zip_equal(refIndices, otherIndices)) {
+        auto refConst = getConstantIntValue(refIdx);
+        auto otherConst = getConstantIntValue(otherIdx);
+        if (!refConst || !otherConst)
+          return std::nullopt;
+        if (*refConst != *otherConst)
+          return false;
+      }
+      return true;
+    };
+
+    bool splitIsExpressible = true;
+    std::string declineReason;
+    auto decline = [&declineReason, &splitIsExpressible]() {
+      declineReason.clear();
+      splitIsExpressible = false;
+      return llvm::raw_string_ostream(declineReason);
+    };
+    for (auto user : memref.getUsers()) {
+      auto chanUser = dyn_cast_if_present<air::ChannelInterface>(user);
+      if (!chanUser)
+        continue;
+      // Only the single-channel side is tiled; the multiple-channel side is
+      // partitioned instead. Mirrors the direction test in `runOnOperation`.
+      if (isa<air::ChannelPutOp>(user) && getChanCount(MM2SChannels) > 1)
+        continue;
+      if (isa<air::ChannelGetOp>(user) && getChanCount(S2MMChannels) > 1)
+        continue;
+
+      // `runOnOperation` resolves the far side's split dimension from THIS op's
+      // strides and falls back to `splitDim` when that fails. The fallback is
+      // exact only for an op with no access pattern at all, where the defaults
+      // it will be given are the memref's own row-major layout; with a stride
+      // list present and no stride matching, it is a guess.
+      auto chanUserStrides = air::getStridesAsValues(chanUser);
+      auto offsetDimOpt = air::getOffsetDimFromMemrefDim(
+          *splitDim, chanUserStrides, air::getTensorShape(memref.getType()));
+      if (!offsetDimOpt && !chanUserStrides.empty()) {
+        decline() << "no dimension of @" << chanUser.getChanName()
+                  << "'s access pattern has the stride of memref dimension "
+                  << *splitDim << ", so the dimension to split it on is a guess";
+        break;
+      }
+      unsigned offsetDim = offsetDimOpt ? *offsetDimOpt : (unsigned)*splitDim;
+
+      unsigned refSizeRank = air::getSizesAsValues(chanUser).size();
+      if (!refSizeRank) {
+        auto refTy =
+            dyn_cast_if_present<MemRefType>(chanUser.getMemref().getType());
+        if (!refTy || !refTy.hasStaticShape()) {
+          decline() << "@" << chanUser.getChanName()
+                    << " has neither an access pattern nor a static memref "
+                       "shape to derive one from";
+          break;
+        }
+        refSizeRank = refTy.getRank();
+      }
+
+      auto l2Volume = accessVolumeOf(chanUser);
+      if (!l2Volume) {
+        decline() << "the number of elements @" << chanUser.getChanName()
+                  << " stages into this buffer is not statically known, so the "
+                     "split cannot be shown to be the same partition on both "
+                     "sides";
+        break;
+      }
+      auto l2OffsetDims = numOffsetDimsOf(chanUser, refSizeRank);
+      if (!l2OffsetDims || offsetDim >= *l2OffsetDims) {
+        decline() << "splitting memref dimension " << *splitDim
+                  << " needs an offset at access dimension " << offsetDim
+                  << " on every channel op it touches, and @"
+                  << chanUser.getChanName() << " cannot be shown to carry one";
+        break;
+      }
+
+      for (auto otherChanOp :
+           air::getTheOtherChannelOpThroughSymbol(chanUser)) {
+        // Pairing decides which far-side ops this split rewrites. Guessing it
+        // either way is unsafe -- keeping a stranger duplicates the transfer,
+        // dropping a partner leaves it untiled against a tiled channel -- so an
+        // undecidable pairing declines the whole split.
+        auto pairs = pairsByBundleIndex(chanUser, otherChanOp);
+        if (!pairs) {
+          decline() << "@" << otherChanOp.getChanName()
+                    << "'s bundle indices cannot be compared with this op's, "
+                       "so whether it is this buffer's far side is undecidable";
+          break;
+        }
+        if (!*pairs)
+          continue; // Belongs to a different buffer on the same symbol.
+
+        auto farVolume = accessVolumeOf(otherChanOp);
+        if (!farVolume) {
+          decline() << "the number of elements one execution of @"
+                    << otherChanOp.getChanName()
+                    << " moves is not statically known, so it cannot be shown "
+                       "to stay in step with the " << *l2Volume
+                    << " this buffer stages";
+          break;
+        }
+        // `tileChannelOpByFactor` cuts the far side CONTIGUOUSLY -- split i
+        // takes offset += i * (size / factor) with size /= factor -- which
+        // inverts the L2 side's cut only when the two accesses run in step, one
+        // buffer for one buffer. That holds for the pattern the pass was
+        // written for, where both sides walk the same tile in matching loops
+        // (the two sizes may still count different units, L2 tiles on one side
+        // and rows on the other, and the pass handles that).
+        //
+        // It does not hold when the L2 buffer is re-staged inside a loop while
+        // the far side delivers the whole loop's worth in ONE access: the
+        // buffer's sub-regions are then INTERLEAVED through that stream rather
+        // than laid out as its halves, so the contiguous cut hands each
+        // sub-buffer the wrong rows. Measured on a per-column int4 GEMV feed
+        // (one L3 put of 24 x 8576 bytes against an 8576-byte staging buffer):
+        // it compiles, it runs, and it failed a per-element bound on 6031 of
+        // 6144 outputs. Expressing it would need a strided far-side cut
+        // (offset += i plus an extra wrap-and-stride dimension), which this
+        // pass only arms from an scf.for step. Until then, decline -- the
+        // buffer comes out intact, exactly as it does at the geometries where
+        // the launch-endpoint cap already declines the split.
+        if (*farVolume > *l2Volume) {
+          decline() << "one execution of channel @" << otherChanOp.getChanName()
+                    << " moves " << *farVolume << " elements against the "
+                    << *l2Volume
+                    << " this buffer stages, so a contiguous split of the two "
+                       "would not be the same partition";
+          break;
+        }
+        // An air.channel put/get may legally carry FEWER offsets than sizes and
+        // strides -- `verifySizesStridesRank` only ties sizes to strides -- and
+        //   air.channel.get @outD[%c0] (%arg[%off] [24, 2, 8] [8, 192, 1])
+        // (one offset into a rank-1 L3 memref carrying a three-dimensional
+        // wrap-and-stride pattern) is what the shipped builders emit. The split
+        // dimension comes from the L2 side and is reused here verbatim, so on
+        // such an op it can name an offset that is not there.
+        // When the rank-matching step will run on this op it dereferences its
+        // strides unguarded (`*getConstantIntValue(strides[currIdx])`), so a
+        // dynamic stride there is an abort, not a bad split. Require them all
+        // to be static in that case.
+        auto farSizes = air::getSizesAsValues(otherChanOp);
+        if (farSizes.size() < refSizeRank) {
+          auto farStrides = air::getStridesAsValues(otherChanOp);
+          if (llvm::any_of(farStrides, [](Value stride) {
+                return !getConstantIntValue(stride);
+              })) {
+            decline() << "@" << otherChanOp.getChanName()
+                      << " has a dynamic stride and fewer access dimensions "
+                         "than this buffer, so matching their ranks is not "
+                         "statically decidable";
+            break;
+          }
+        }
+        auto farOffsetDims = numOffsetDimsOf(otherChanOp, refSizeRank);
+        if (!farOffsetDims || offsetDim >= *farOffsetDims) {
+          decline() << "splitting memref dimension " << *splitDim
+                    << " needs an offset at access dimension " << offsetDim
+                    << " on every channel op it touches, and @"
+                    << otherChanOp.getChanName()
+                    << " cannot be shown to carry one";
+          break;
+        }
+      }
+      if (!splitIsExpressible)
+        break;
+    }
+    if (!splitIsExpressible) {
+      allocOp->emitRemark("air-split-l2-memref: skipping split (factor=")
+          << tilingFactor << ") on L2 alloc: " << declineReason;
+      continue;
+    }
+
     // Methods to get root offset/size/stride from air.channel's operands, where
     // root is either a constant, or a loop's induction variable.
     auto getRootOffset = [&](Value offsetVal) {
@@ -2720,14 +3010,78 @@ void AIRSplitL2MemrefForBufferConstraintPass::runOnOperation() {
       auto newWaitAll = tileChannelOpByFactor(
           chanUserOp, targetColTilingFactor, memrefShape[dim], infoEntryVec,
           opToSplitInfoMap, new_chan, loc, ctx);
-      if (failed(newWaitAll))
+      if (failed(newWaitAll)) {
+        // The IR is already partly rewritten; stopping quietly would emit a
+        // half-split module. Fail the pass instead.
+        signalPassFailure();
         return;
+      }
       rewriter.replaceAllUsesWith(air::getAsyncTokenFromOp(chanUserOp),
                                   *newWaitAll);
 
       // Now that one side of those channels are tiled, perform tiling on the
       // other side, too. Process ALL channel ops on the other side.
       auto theOtherChanOps = air::getTheOtherChannelOpThroughSymbol(chanUserOp);
+
+      // ...but only the ones that actually pair with THIS op.
+      //
+      // `getTheOtherChannelOpThroughSymbol` resolves the channel SYMBOL and is
+      // blind to the bundle index, so on a per-column staging pattern -- N L2
+      // buffers, buffer c fed by @chan[c] -- it hands back all N far-side ops
+      // for every one of the N buffers. Two things then go wrong, and both
+      // reach the ELF:
+      //  * each far-side op is re-tiled once per L2 buffer, so N-1 of every N
+      //    tiled copies feed a channel index no get consumes;
+      //  * the copies of an earlier round are still in the IR (they are only
+      //    queued in `erased` and removed at the end of the pass), so round k
+      //    re-tiles round k-1's output and the count doubles per round -- four
+      //    columns produced 8 + 16 + 32 + 64 = 120 launch-level puts against 8
+      //    gets, which compiles and then hangs the device with
+      //    ERT_CMD_STATE_TIMEOUT.
+      // Keep an op when its bundle indices match `chanUserOp`'s, and when they
+      // cannot be compared (different arity, or any non-constant index) keep it
+      // too -- that is the pre-existing behaviour for everything except the
+      // pattern above.
+      // Undecidable pairing does not reach here: `getTargetMemrefAllocs`
+      // declines the alloc rather than guess, because guessing is unsafe in
+      // both directions -- keeping a stranger duplicates the transfer, dropping
+      // a partner leaves it untiled against a tiled channel. Mirror that rule
+      // here so the two cannot drift, and refuse outright if it ever does.
+      bool pairingIsDecidable = true;
+      auto pairsWithChanUser = [&](air::ChannelInterface other) {
+        if (erased.contains(other.getOperation()))
+          return false;
+        auto refIndices = chanUserOp.getIndices();
+        auto otherIndices = other.getIndices();
+        if (refIndices.empty() && otherIndices.empty())
+          return true;
+        if (refIndices.size() != otherIndices.size()) {
+          pairingIsDecidable = false;
+          return false;
+        }
+        for (auto [refIdx, otherIdx] : llvm::zip_equal(refIndices,
+                                                       otherIndices)) {
+          auto refConst = getConstantIntValue(refIdx);
+          auto otherConst = getConstantIntValue(otherIdx);
+          if (!refConst || !otherConst) {
+            pairingIsDecidable = false;
+            return false;
+          }
+          if (*refConst != *otherConst)
+            return false;
+        }
+        return true;
+      };
+      llvm::erase_if(theOtherChanOps, [&](air::ChannelInterface other) {
+        return !pairsWithChanUser(other);
+      });
+      if (!pairingIsDecidable) {
+        chanUserOp->emitOpError(
+            "far-side channel ops cannot be paired to this one by bundle "
+            "index; the split plan should have declined this buffer");
+        signalPassFailure();
+        return;
+      }
 
       // Process each channel op on the other side
       for (auto &theOtherChanOp : theOtherChanOps) {
@@ -2741,6 +3095,19 @@ void AIRSplitL2MemrefForBufferConstraintPass::runOnOperation() {
           rewriter.setInsertionPoint(theOtherChanOp);
           air::populateDefaultWrapsAndStrides(
               rewriter, theOtherChanOp.getMemref(), offsets, wraps, strides);
+        }
+
+        // The rank-matching step below starts at `offsets.size() - 1`, which
+        // underflows to -1 on an empty offset list and indexes off the front of
+        // the SmallVector. `getTargetMemrefAllocs` declines such an op up
+        // front; refuse here too rather than rely on that.
+        if (offsets.empty()) {
+          theOtherChanOp->emitOpError(
+              "carries no offsets, so its access pattern cannot be matched to "
+              "the split buffer's rank; the split plan should have declined "
+              "this buffer");
+          signalPassFailure();
+          return;
         }
 
         // Bump up the offset, wrap and stride list to match both sides.
@@ -2826,8 +3193,10 @@ void AIRSplitL2MemrefForBufferConstraintPass::runOnOperation() {
             *getConstantIntValue(wraps[offsetDim]), infoEntryVec,
             opToSplitInfoMap, new_chan, loc, ctx);
 
-        if (failed(newWaitAll1))
+        if (failed(newWaitAll1)) {
+          signalPassFailure();
           return;
+        }
 
         // Update dependency.
         rewriter.replaceAllUsesWith(air::getAsyncTokenFromOp(updatedChanOp),

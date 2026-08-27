@@ -3253,6 +3253,36 @@ LogicalResult dependencyTracer::traceDependencyFromScfForOp(scf::ForOp &forOp) {
             sink_op_memref_writes, sink_wait_all_op, "WAW/WAR")))
       return failure();
   }
+
+  // `sink_wait_all_op` is the loop's iter_arg init operand and sits immediately
+  // BEFORE `forOp`, so every token it carries must be defined above the loop.
+  // The trace above walks the loop BODY, so a buffer that is also ALLOCATED in
+  // the body -- one L2 staging buffer per iteration, which is what a
+  // per-iteration double-buffered feed looks like -- contributes its in-loop
+  // producer here. The init operand then becomes a use that its own definition
+  // does not dominate, and the module fails verification with
+  // "operand #0 does not dominate this use". Those in-loop producers are
+  // already dependences of the in-loop consumers that read the buffer, so
+  // nothing is lost by dropping them: only tokens defined above the loop can
+  // legally be loop-carried init operands.
+  SmallVector<Value> nonDominatingDeps;
+  for (Value dep : sink_wait_all_op.getAsyncDependencies()) {
+    Operation *owner = dep.getDefiningOp();
+    if (!owner)
+      if (auto blockArg = dyn_cast<BlockArgument>(dep))
+        owner = blockArg.getOwner()->getParentOp();
+    if (owner && forOp->isAncestor(owner))
+      nonDominatingDeps.push_back(dep);
+  }
+  for (Value dep : nonDominatingDeps) {
+    auto deps = sink_wait_all_op.getAsyncDependencies();
+    auto it = llvm::find(deps, dep);
+    while (it != deps.end()) {
+      sink_wait_all_op.eraseAsyncDependency(std::distance(deps.begin(), it));
+      deps = sink_wait_all_op.getAsyncDependencies();
+      it = llvm::find(deps, dep);
+    }
+  }
   return success();
 }
 

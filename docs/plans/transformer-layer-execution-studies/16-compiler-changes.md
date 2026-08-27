@@ -37,10 +37,11 @@ shipped models. The H9 hardware fixture moved from `agents/scripts/port-loop/fix
 | 12 | J7b — accumulator ring formed by `air-hoist-dma-in-accum-pattern` | `builders/ffn_accum.py` | — | `run_npu2_ffn_accum_peano.lit` |
 | 13 | fused-decoder re-execution — causal Q-block counter wrapped | `flash_attention/kernel_fusion_based/attn_npu2*.py` | `03402cc1` | `run_npu2_fused_decoder_reexec_peano.lit` |
 | 14 | static legality and the mapping-space census | `study/mapping_space.py` | — | `run_mapping_space_tests.lit`, `run_study_host_tests.lit` |
+| 19 | `air-split-l2-memref` on a per-column staging feed — dominance, `-6` abort, far-side duplication, contiguous far-side cut | `AIRMiscPasses.cpp`, `Util/Dependency.cpp` | — (item 29, uncommitted at writing) | `air_split_l2_memref_alloc_in_loop.mlir`, `air_split_l2_memref_repeated_feed.mlir`, `air_split_l2_memref_short_offset_list.mlir` |
 
 `check-air-mlir` along the way: 486/500 (H, 7 UNSUPPORTED + 7 XFAIL) → 488 (H1s) → 489/489 (H10)
 → 492 → 497 (items 8, 9, wall 6, H8) → 498 (item 23) → 499 (item 29) → 500 (end of 2026-08-12)
-→ 505/0 (2026-08-20, README status board).
+→ 505/0 (2026-08-20, README status board) → 506 (§18, LOAD_PDI parity pad) → **509** (§19, item 29).
 
 ## 1. `air-fuse-packet-put-loops` — the two-trip `addnorm` miscompile `[2026-08-06]`
 
@@ -734,6 +735,128 @@ discriminators clean ×5 with the pad (devq 533/534); cost 26–32 µs per dispa
 535–537). Complete fix, re-gated under Turbo (devq 551): `qwen3_0_6b` compile (every kernel) + verify PASS, `check-lm-head-reexec` 7/7, the tl suite 40/1/0. The pre-existing reset rule (§13's
 `deviceHasRepeatCountDMAs` / cascade) is untouched — it addresses core/memtile DMA state inside
 one dispatch, not the cross-dispatch firmware skip.
+
+## 19. `air-split-l2-memref` on a per-column L2 staging feed — four defects `[2026-08-26/27]`
+
+**Defect class**: four independent failures of the same pass on one shape family — an L2 buffer
+staged per iteration inside an `scf.for`, fed from a channel symbol shared across columns. Item 27
+hit the first two and worked around them builder-side, leaving the pass refusing its int4 row
+builder at `herd_m` 4 and 2 (devq 680 legs 5, 6, 11, 12, 17, 18); item 29 found the other two by
+fixing those. **All four are pass bugs**: every input is legal AIR by the dialect's own verifiers,
+and both trigger shapes are what the shipped builders already emit. The reason it bites at `herd_m`
+4 and 2 and not 8 is the launch-endpoint cap, not the herd: `aircc` passes
+`max-launch-channels-mm2s = num_cols * 2 = 16`, the builder has `herd_m + 1` launch MM2S endpoints,
+and only `4 x 2` and `2 x 4` leave the ×2 split under the cap (9 ≤ 16) — at `8 x 2` and `4 x 4` it
+is 17 and the pass declines, which is why every arm item 27 shipped was green.
+
+**Mechanisms.** **(A) the dominance error.** `partitionMemref` ends by calling
+`dependencyTracer::traceDependencyFromScfForOp` on every `scf.for` whose channel ops it rewrote;
+that helper puts an empty `air.wait_all` immediately *before* the loop, makes it the loop's
+`iter_arg` init, then walks the loop *body* attaching the producer of every buffer the body touches.
+With the L2 buffer allocated above the loop — which is what the pass's own `Passes.td` example
+shows, and the assumption was written nowhere else — the producer dominates; with it allocated in
+the body the init operand is a use its definition does not dominate, and the module is rejected with
+`error: operand #0 does not dominate this use`. Rank is irrelevant: 1-D and 2-D both fail in the
+loop and both pass hoisted, in both channel directions. **(B) the `-6` abort.** An `air.channel`
+put/get may legally carry fewer offsets than sizes and strides — `verifySizesStridesRank` ties sizes
+to strides only, and `air.channel.get @outD[%c0] (%arg9[%6] [24, 2, 8] [8, 192, 1])` is what the
+builders emit for an L3 operand. `tileChannelOpByFactor` derives the split dimension from the L2
+side and reuses it on the far side unguarded, so on such an op it indexes past the end of the
+SmallVector: `Assertion 'idx < size()' failed`, `#10 tileChannelOpByFactor` / `#11
+runOnOperation`, which `aircc` reports as `returncode -6`. Needs split dim ≥ 1, hence a 2-D+ L2
+buffer — which is why item 27 stopped seeing it once it flattened. **(C) the far side is looked up
+by symbol.** `getTheOtherChannelOpThroughSymbol` ignores the bundle index, so N per-column buffers
+on one symbol each re-tile all N far-side ops; and the copies of earlier rounds are still in the IR
+(queued in `erased`, removed at the end of the pass) so each round re-tiles the last one's output.
+Four columns produced **120 launch-level puts against 8 gets**, which compiles and then hangs
+(`ERT_CMD_STATE_TIMEOUT`, devq 690). **(D) the far side is cut contiguously.**
+`tileChannelOpByFactor` takes `offset += i * (size / factor)` on both sides, which inverts the L2
+cut only when the two accesses run in step, one buffer for one buffer. When the buffer is re-staged
+per iteration while the far side delivers the whole loop's worth in one access, the buffer's
+sub-regions are *interleaved* through that stream, not laid out as its halves, and the cut sends
+each sub-buffer the wrong rows. **It compiles, it runs, and it is wrong**: item 27's per-element
+bound, 6031 of 6144 elements violated at 6144 (devq 698). D, not A, is what actually governs item
+27's geometry.
+
+**Change**. `mlir/lib/Util/Dependency.cpp` (A): in `traceDependencyFromScfForOp`, drop from the
+loop-init `wait_all` every token whose defining op is inside the loop — they are already
+dependences of the in-loop consumers, and only tokens defined above the loop can legally be
+loop-carried init operands. Single caller, so the change is scoped to this pass.
+`mlir/lib/Transform/AIRMiscPasses.cpp` (B, C, D): `getTargetMemrefAllocs` gains two preconditions,
+each declining the alloc with a remark naming the reason, in the same idiom as the existing
+launch-cap skip — the far side must move no more elements than the L2 side stages (D), and the
+split dimension must name an offset every participating op carries (B); `runOnOperation` pairs
+`getTheOtherChannelOpThroughSymbol`'s result by bundle index and skips ops already queued for
+erasure (C), and its two `if (failed(...)) return;` sites become `signalPassFailure()` so a
+half-rewritten module is a compile error rather than silent output; `tileChannelOpByFactor` refuses
+an out-of-range split dimension instead of indexing past the end (B's backstop — it can no longer
+SIGABRT for any input). **D declines rather than expresses.** Expressing it needs a strided
+far-side cut (`offset += i` plus an extra wrap-and-stride dimension); the machinery is there but is
+only armed from an `scf.for` step, and nothing in production needs it — the 8-column geometry has
+always been on the declining side of the launch cap. Declining leaves the buffer intact, which is
+exactly what those geometries already do.
+
+**Gate**: three new lits in `mlir/test/Transform/AIRMiscPasses/` —
+`air_split_l2_memref_alloc_in_loop.mlir` (A in both directions, the alloc-above control that must
+keep splitting, and C at two columns), `air_split_l2_memref_repeated_feed.mlir` (D in both
+directions), `air_split_l2_memref_short_offset_list.mlir` (B). **Verified failing** at two points,
+because A masks C and D — its error aborts the module before their output exists. At `2e14f533` all
+three fail: `alloc_in_loop:79:12: error: operand #0 does not dominate this use` on cases 1, 2 and 4
+(case 3, the control, passes through), the same on both `repeated_feed` cases, and
+`short_offset_list` SIGABRTs with `Assertion 'idx < size()' failed` / `#10 tileChannelOpByFactor`.
+At `2e14f533` + fix A: `alloc_in_loop` cases 1–3 pass and case 4 fails
+`CHECK-NOT: air.channel.put{{.*}}@channel_0` with 12 puts where 4 are wanted (C); `repeated_feed`
+fails its first `CHECK` in both directions, the buffer having been split (D); `short_offset_list`
+still aborts (B). No lit passes before its own fix. `check-air-mlir` **506 → 509** / 7 XFAIL / 7
+UNSUPPORTED (520 → 523 discovered), the eight pre-existing `air_split_l2_memref*` lits unchanged.
+
+**Measured**. Item 27's reproducer through full `aircc` at the eight geometries: **6 of 8 failed
+before, 8 of 8 compile after** (devq 714, re-run 720). The same six on device under item 27's own
+per-element bound, Turbo: **6 / 6 PASS, 0 violations** of 1536 / 3072 / 6144 elements, twice
+(devq 715, 721) — against 6 / 6 hang before C (devq 690) and 6 / 6 FAIL before D, up to 6033 of
+6144 elements out of bound (devq 698). Production re-gate from a
+pristine worktree at `2e14f533` (queue item 28 was concurrently editing `programming_examples/llms/`,
+so the working tree was not used): the transformer-layer study host suite **720 / 720 in 33
+modules**, `qwen3_0_6b` compile and `make verify` PASS — run twice, devq 716 and 722, both RC 0. On item 27's own input the pass
+now declines all four column buffers with a remark and the module comes out with its 4 puts and
+4 gets on `@inL3` intact — the behaviour it already had at 8 columns.
+
+**Review round (devq 723) — the same class again, in this item's own fixes.** Codex returned two
+blocking findings and both were right: **D's volume test compared a `-1` sentinel as a number**, so a
+far-side size that is SSA-dynamic but runtime-equal permitted the split (the configuration measured
+at 6031/6144 out of bound; on the reduced input it then aborted on a `std::optional` deref, exit
+134), and **B's precheck credited the rank-matching step with growing an offset list it cannot
+touch**, approving a legal zero-offset/one-size far side that then indexed `offsets.size() - 1` =
+−1 (`Assertion 'idx < size()' failed`, exit 134). A check that cannot decide and proceeds anyway is
+the defect C and D already were. Every plan-time decision now carries `std::optional` and **nullopt
+declines**: unknown access volume, non-static memref shape where defaults would be derived from it,
+sizes-but-no-offsets, an undecidable far-side bundle-index pairing (guessing is unsafe in both
+directions — keeping a stranger duplicates the transfer, dropping a partner leaves it untiled), a
+split dimension no stride matches when a stride list is present, and a dynamic far-side stride under
+rank matching (found by auditing the rest of the diff, not by the review). `runOnOperation` gained
+two matching refusals as defence in depth. One over-approximation is deliberate and stated: the
+growth credit when the far side has fewer access dimensions is an upper bound, and the residual is
+caught by `tileChannelOpByFactor`'s range guard — a clean pass failure, never a crash and never a
+wrong split. Both findings are lit-covered as new cases in the existing files, **verified failing on
+the round-1 binary** with their own signatures (`prefix/lit_round2_before_failopen_fix.txt`); the
+lits now carry 9 cases across 3 files, so `check-air-mlir` stays at **509** and the delta from the
+506 baseline remains exactly those three files. Re-gated after the fix: 8/8 geometries compile
+(devq 728), 6/6 device points at **0 violations** (devq 729), production re-gate RC 0 (devq 730,
+pristine worktree at the tip, re-checked as still `2e14f533`). The two non-blocking findings — the
+`DenseMap` iteration order and the symbol-scoped `putgets` collection — are agreed latent and
+recorded below rather than fixed.
+
+**Item 27's open geometry question, answered as a by-product.** The two off-8-column int4 points
+its wall had refused now run, so doc 57's per-column figure is pinned on the int4 stream as well
+as the bf16 one: fitted separately over two runs, 8 cores in 2 columns read 20.62 / 20.36 GB/s
+(10.31 / 10.18 per column, both within 2 % of item 27 §4.4's ~10.1) and 8 cores in 4 columns
+21.06 / 20.01 (2.63 / 2.50 per core, against its int4 per-core ~2.9 branch). **Confirmed, not
+corrected**; the int4 branch now rests on three points instead of one.
+
+Two latent hazards are named and untouched: `getTargetMemrefAllocs` iterates a `DenseMap`, so the
+order allocs are considered in is not deterministic (benign only because the fixes made the per-alloc
+work independent), and its `putgets` collection is symbol-scoped in the same way C was, so
+`infoEntryMap` can carry entries belonging to other buffers on the same symbol.
 
 ## 15. Compiler items not started
 
