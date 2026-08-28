@@ -122,12 +122,20 @@ def _compile_mm_bf16_x_bfp16(tile_m=32, tile_n=32, tile_k_l1=128):
 _INT4_TILE_N = 16  # overridden by --tile-n
 
 
-def _prepare_air_project_int4(quant=None):
+def _prepare_air_project_int4(quant=None, **kwargs):
     """Replacement for cache.prepare_air_project: wipe + repopulate
     air_project/ with `mv_int4_bf16.o` (GEMM flags), `rope.o`, and
     `silu_and_mul.o`. `quant` is accepted for cache.compile_and_cache
-    compatibility but unused (the kernel flavor is determined here)."""
-    del quant
+    compatibility but unused (the kernel flavor is determined here).
+
+    `[2026-08-27]` queue item 22: `**kwargs` because the seam it replaces grew
+    two parameters (`int4_gs`, `int4_k_chunk`) that `compile_and_cache` now
+    always passes; without it every compile through this driver dies with
+    `TypeError: unexpected keyword argument 'int4_gs'` BEFORE any kernel is
+    built. This function determines the kernel flavour itself, so the extra
+    arguments are correctly ignored -- but they must be accepted.
+    """
+    del quant, kwargs
     air_proj = Path("air_project")
     if air_proj.exists():
         shutil.rmtree(air_proj)
@@ -154,17 +162,23 @@ def _prepare_air_project_int4(quant=None):
             shutil.copy2(src, air_proj / obj_name)
 
 
-def _prepare_air_project_bfp16(quant=None):
+def _prepare_air_project_bfp16(quant=None, **kwargs):
     """Replacement for cache.prepare_air_project: same as int4 but with the
     bfp16-mixed kernel `mm_bf16_x_bfp16.o` in place of `mv_int4_bf16.o`.
-    `quant` accepted for cache.compile_and_cache compatibility but unused."""
-    del quant
+    `quant` accepted for cache.compile_and_cache compatibility but unused;
+    `**kwargs` for the same reason as the int4 sibling above (queue item 22).
+    """
+    del quant, kwargs
     air_proj = Path("air_project")
     if air_proj.exists():
         shutil.rmtree(air_proj)
     air_proj.mkdir(parents=True, exist_ok=True)
 
-    _compile_mm_bf16_x_bfp16()
+    # `[2026-08-27]` queue item 22: -DDIM_N must be the width the stitcher is
+    # built at and the width the host packs at. One source for all three.
+    from awq_bfp_pack import BFP16_N_TILE as _tn, BFP16_K_CHUNK as _tk
+
+    _compile_mm_bf16_x_bfp16(tile_n=_tn, tile_k_l1=_tk)
     compile_rope()
     compile_silu_and_mul()
     compile_attn_npu2()
@@ -1087,11 +1101,14 @@ def main():
     if args.prefill_dtype == "bfp16":
         from awq_bfp_pack import load_awq_weights_bfp
 
+        # `[2026-08-27]` queue item 22: the width is not hardcoded here any
+        # more -- it follows `awq_bfp_pack.BFP16_N_TILE`. NOTHING is checked
+        # here: loading a checkpoint is not where the weights meet an ELF, and
+        # the compile block below may not have built the ELFs yet. The layout
+        # invariant is enforced once, after that block, before the first run.
         weights_bf16, layers_packed = load_awq_weights_bfp(
             args.model,
             config=config,
-            n_tile=32,
-            k_chunk=128,
             seq_len=seq_len,
         )
     else:
@@ -1178,8 +1195,29 @@ def main():
                 build_o_ffn_bfp16_module,
             )
 
+            # `[2026-08-27]` queue item 22: ONE width for the ELFs, the linked
+            # micro-kernel's -DDIM_N and the host packer. `_prepare_air_project_bfp16`
+            # reads the same `BFP16_N_TILE`, and the set records it below, so a
+            # later run cannot pack for a different one without being refused.
+            from awq_bfp_pack import (
+                BFP16_N_TILE as _BFP_TN,
+                BFP16_K_CHUNK as _BFP_TK,
+                assert_can_build_into as _can_build_bfp,
+                write_declared_layout as _write_bfp_geom,
+            )
+
+            # CREATE-path preflight, BEFORE anything is compiled or reused: a
+            # set may be built into only when it is empty of bfp16 ELFs or
+            # already declares exactly this layout. Without it, cached 32-wide
+            # ELFs plus a 128 request skipped both compiles and then RELABELLED
+            # the set 128 -- the guard rubber-stamping the very mismatch it
+            # exists to catch (final review of queue item 22).
+            _can_build_bfp(cache.cache_dir, _BFP_TN, _BFP_TK)
+            _bfp_compiled = False
+
             if _need("rms_gemms_rope_bfp16"):
-                print("\nCompiling rms_gemms_rope_bfp16...")
+                _bfp_compiled = True
+                print(f"\nCompiling rms_gemms_rope_bfp16 (tile_n={_BFP_TN})...")
                 cache.compile_and_cache(
                     "rms_gemms_rope_bfp16",
                     build_rms_gemms_rope_bfp16_module(
@@ -1189,20 +1227,38 @@ def main():
                         n_heads=config.n_heads,
                         n_kv_heads=n_kv_heads,
                         head_dim=head_dim,
+                        tile_n=_BFP_TN,
+                        tile_k_l1=_BFP_TK,
                     ),
                     {"verbose": args.verbose, **RMS_GEMMS_ROPE_BFP16_BACKEND},
                 )
             if _need("o_ffn_bfp16"):
-                print("Compiling o_ffn_bfp16...")
+                _bfp_compiled = True
+                print(f"Compiling o_ffn_bfp16 (tile_n={_BFP_TN})...")
                 cache.compile_and_cache(
                     "o_ffn_bfp16",
                     build_o_ffn_bfp16_module(
                         seq_len=seq_len,
                         emb_dim=emb_dim,
                         hidden_dim=hidden_dim,
+                        tile_n=_BFP_TN,
+                        tile_k_l1=_BFP_TK,
                     ),
                     {"verbose": args.verbose, **O_FFN_BFP16_BACKEND},
                 )
+            # The set DECLARES what it was built at, and ONLY the act that
+            # actually built ELFs may write that -- so this is inside
+            # `if _bfp_compiled`. When everything was already cached, the set
+            # keeps whatever it declared (the preflight above proved that is
+            # this same layout, or refused); an undeclared cached set is left
+            # undeclared and the consume-time check refuses it, which is the
+            # correct outcome for ELFs of unknown width.
+            if _bfp_compiled:
+                _write_bfp_geom(cache.cache_dir, _BFP_TN, _BFP_TK,
+                                why=f"compiled by {os.path.basename(__file__)} "
+                                    f"--prefill-dtype bfp16 at seq_len={seq_len}",
+                                tile_m=32, herd=[8, 4],
+                                builders=["rms_gemms_rope_bfp16", "o_ffn_bfp16"])
         else:
             # bf16 prefill: dequantized AWQ weights through the bf16 stitchers
             # (~3-6x faster compute per layer; see bisection findings).
@@ -1293,6 +1349,17 @@ def main():
         # Marker matched by run_npu2_compile.lit.
         print("Compilation passed.")
         return
+
+    # THE layout invariant, enforced once, HERE: past this line every dispatch
+    # consumes a packed weight BO, and by now the ELFs exist -- either loaded
+    # from the cache or just compiled by the block above, which declared what
+    # it built them for. The check derives the buffers' layout from the buffers
+    # and requires the set's declaration to be buildable and equal to it.
+    if args.prefill_dtype == "bfp16" and not args.skip_npu:
+        from awq_bfp_pack import assert_layout_agrees
+
+        assert_layout_agrees(weights_bf16, cache.cache_dir,
+                             packed_layers=layers_packed)
 
     # ---- Multi-prompt (`make verify-full`) and diagnosis (`make diagnosis`)
     # paths build the HF model once and dispatch to the per-prompt helpers.

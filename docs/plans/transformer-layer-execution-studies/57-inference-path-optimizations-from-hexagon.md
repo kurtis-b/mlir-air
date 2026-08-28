@@ -393,6 +393,19 @@ kernel cannot see the defect**: at a small input scale the FA logits are ~0.16, 
 nearly uniform and `attn_out` barely depends on `q`, and the same corruption read as 0.009 % of
 elements; at a realistic logit spread it is rel L1 0.62.
 
+**`[2026-08-27]` Two more rows, predicted then observed — odd ⇔ wrong/hang 17/17** (doc 56 H4
+follow-up, queue item 22, devq 755, both declared input scales, identical results). The two
+ELFs are NEW bytes, not re-runs: `rms_gemms_rope_bfp16` and `o_ffn_bfp16` rebuilt at
+`tile_n = 128`, the tile-width control item 20 §7 named. Parity predicted first from the launch
+count alone — **6 loads (even) and 8 (even), so both predicted clean** — and both are: d1 within
+each stage's own family bound at its own device-side input (**6/6** and **8/8** stages, 0
+elements outside), d2 and d3 back-to-back byte-equal to d1, d4 after one intervening dispatch
+byte-equal to d1, d5 on a new input moved, `parity_rule_holds` true, `heal_evaluable` true. Item
+29's compiler work adds no row to this family: it changed `air-split-l2-memref`, which these
+ELFs do go through (it splits all three of their L2 buffers), but the two-dispatch parity rule
+is about LOAD_PDI counts and neither count moved — `tile_n` changes a launch's N iteration
+count, not the number of `air.launch` ops.
+
 ## 2. The structural fact: every `air.launch` boundary is a partition reconfiguration
 
 [29](25-mode-rebuilds-and-results.md) records the multi-launch mechanism: a module with N
@@ -728,7 +741,19 @@ boundaries, −8.6 ms — and leaves the rest as a labelled residual (≥ 540 ms
 set of differences that co-vary between the arms (`tile_m`, `tile_n` 128 → 32, `tile_k_l1`,
 `tile_k_l2`, the GEMM microkernel, the cast launches, the weight operand layout and the DMA
 schedule); **no measurement here isolates any one of them**, and the narrowed N tile is a
-hypothesis whose test is a bfp16 `tile_n = 128` control (item 22). What is settled is the
+hypothesis whose test is a bfp16 `tile_n = 128` control (item 22).
+**`[2026-08-27]` ITEM 22 RAN THAT CONTROL AND THE ADVANTAGE DOES SHOW UP AS A NUMBER**: with the
+N tile at the registry's 128 — one builder parameter, one `-DDIM_N`, nothing else in the arm
+changed — the same bfp16 stitchers run Llama-3.2-1B-AWQ prefill at **1085.7 / 1087.4 / 1088.4 ms of device
+time per forward against the bf16 arm's 1097.8 / 1099.3 / 1095.5, a ratio of 0.990**, where at
+`tile_n = 32` it was 0.685–0.691×; five walks, one session each, `compare_roots` OK on the two
+transient-free roots, top-5 gate PASSING on all ten rungs, 248
+launches against 328, and 851.4 MB/forward less weight traffic. So the term Hexagon prices at
+`HTP_MM_HMX_COST_W_DEQUANT = 3` is one we make **zero** and it now **pays, marginally**, at
+prefill's shipped ubatch — but the win is the TILE, not the byte saving: at GEMM level the two
+formats are a dead heat at the registry's width (41.86 ms of bfp16 GEMM per layer against 41.94 bf16,
+re-measured in the same session), and what item 20 priced as a negative was a 32-wide N tile
+re-reading the activation panel four times over. What is settled is the
 direction: Hexagon prices `COST_W_DEQUANT` where its matrix engine works on 32×32 fp16 tiles, and
 at `M = 2048` — each weight element feeding 2048 MACs — removing 851.4 MB of weight traffic does
 not come close to paying for whatever else changed. See doc 56 §4's H4 block. (iii) They reject bf16 outright and

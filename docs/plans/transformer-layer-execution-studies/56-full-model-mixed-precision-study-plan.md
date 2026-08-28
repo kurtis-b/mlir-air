@@ -1413,3 +1413,164 @@ one this item did not run: **item 22, the bfp16 cascade with per-GEMM tiles at `
 which is the only thing that would turn the tile hypothesis into an attribution. Until then
 `w_bfp16_prefill` is a working, gate-passing, accuracy-neutral plan that costs 48 % more device
 time than bf16 prefill, and **bf16 remains the default for every model**.
+
+**`[2026-08-27]` H4 FOLLOW-UP — the tile WAS the confound, and at the registry's width bfp16
+prefill is a marginal WIN** (queue item 22; evidence `results/item22-bfp16-tile-20260826/`:
+`PREDICTION.md` 10:56:58 PDT and `PREDICTION_ADDENDUM.md` 11:12:38, each predating its own first
+device job by file time; `RESULTS.md`; `evidence/` — the split-pass finding, the ELF-equivalence
+control, the GEMM tile sweep, the re-measured bf16 control, the walk table and the reexec
+records; devq 734–757. Turbo observed before and after every measure job.)
+
+**First, the contamination question item 29 raised, settled — and settled the opposite way round
+from the guess.** `air-split-l2-memref` **does** run on the bfp16 stitchers' L2 staging at the
+shipped 8-column geometry, and it **does** split. Rebuilt with `aircc --debug-ir`, both ELFs cut
+the A panel `8x1x32x2048xbf16` into 8, the packed-weight buffer `1x4x16x4608xi8` into 4 and the C
+buffer `8x4x32x32xbf16` into 8 (`o_ffn_bfp16` also cuts the Down GEMM's K-l2 staging), with **zero
+decline remarks** from a pass that emits one on every decline path. Item 29's cap
+(`max-launch-channels-mm2s = 16`) does not bite here because THIS builder stages the whole herd's
+A panel in ONE launch-level `air.channel.put` — 2 launch-level MM2S endpoints, so an ×8 split
+lands at 9 ≤ 16 — where item 27's builder already had `herd_m + 1 = 9` and its ×2 landed at 17.
+**The cap is a property of the builder's launch-endpoint count, not of the column count**, and
+item 29's "the production 8-column geometry has always been on the declining side of the cap" is
+true of its own builder, not of this one. **But item 20 is NOT contaminated**: recompiling both
+stitchers today at the shipped geometry reproduces the 2026-08-11 ELFs at IDENTICAL SIZE, differing
+only inside ≤ 56-byte clusters at a regular stride (205 bytes / 36 clusters for
+`rms_gemms_rope_bfp16`, 61 / 10 for `o_ffn_bfp16`; those clusters are not shown to be PDI
+headers — see below) — and the CONTROL settles what that means: **two builds made TODAY, minutes
+apart, on one compiler, differ by 149 bytes in 29 windows of the same kind**, i.e. more than the
+shipped ELF differs from either. **What that comparison does and does not show** (both review rounds). It shows equal SIZE, 205
+of 3.86 M bytes differing in 36 clusters of ≤56 bytes at a regular stride, and a CONTROL in which
+two builds made today differ the same way. It does NOT show that those regions are PDI headers or
+that the code and configuration payload is unchanged — raw offsets were grouped, the container was
+not parsed, and the claim that it did is withdrawn. So for **defect D, which announces nothing**
+(it compiles green and returns wrong values, unlike A's compile error, B's SIGABRT and C's
+timeout, none of which item 20 saw), the load-bearing evidence is **item 20's own full-output
+element-wise checks**: every stage of both prefill ELFs inside its published per-element bound at
+the family scale, 0 elements outside, top-5 gate PASSING on seven walks — which a miscompile
+putting 6031 of 6144 elements out of bound does not survive. **Its
+0.685–0.691× stands as measured.**
+
+**`tile_n > 32` did not compile before this item, for a one-expression reason.**
+`matmul_bf16_x_bfp16.py`'s `drain_dst_layout` gave the drain buffer's n_b stride as `tile_n * r`
+where the contiguous buffer it types has `tile_m * t` — the value its two siblings in the same
+file (`c_subview_layout`, and the drain DMA's own `src_strides`) both use, each with the comment
+"skip full M-block column". The two are equal ONLY while `tile_n == tile_m`, and every shipped
+bfp16 GEMM is 32×32, so it was invisible; at 64 and 128 aircc rejects the module with a
+`'func.call' op operand type mismatch` naming the two strided types. Corrected: the module is
+**byte-identical at 32×32** (so nothing shipped moves) and 64/128 then compile green through full
+aircc at every model GEMM shape (12/12). That first claim is **re-runnable** — the item's review
+refused a version of it that retained only a post-fix module and a note saying `diff -q` had been
+clean. `results/item22-bfp16-tile-20260826/tools/drainfix_evidence.py` rebuilds BOTH the pre- and
+post-fix modules from source in one run and records paired sha256: at 32×32
+`pre = post = f8df6496…` with an EMPTY diff, and at 32×64 they differ (162 lines), which is where
+a stride correction is supposed to change something.
+
+**The tile, isolated.** Standalone `bf16 × bfp16ebs8` GEMM at the four shapes the stitchers run,
+herd 8×4, `tile_m = 32`, `tile_k_l1 = 128`, one microkernel source, **`tile_n` the only parameter
+that moves**; two interleaved rounds, Turbo, ≤ 4.6 % spread (devq 742 / 746):
+
+| GEMM | `tn=32` | `tn=128` | `t(128)/t(32)` |
+|---|---|---|---|
+| O / Q 2048×2048×2048 | 5.814 ms | **3.273** | 0.563 |
+| gate / up 2048×2048×8192 | 22.446 | **11.956** | 0.533 |
+| down 2048×8192×2048 | 16.221 | **9.117** | 0.562 |
+| K / V 2048×2048×512 | 1.748 | **1.140** | 0.652 |
+
+The O GEMM goes **2.955 → 5.249 TFLOP/s**; down **4.236 → 7.538**. Accuracy is invariant in the
+width — mean relative L1 **0.00656 at every width and every shape**, 0 elements outside the
+family's own bound — which is what the format's structure predicts, since its group is 8 elements
+along K and `tile_n` does not touch it. So **H4's hypothesis is confirmed at its own named test**:
+the N tile was worth ~1.8× on this GEMM, and the residual `R ≥ 540 ms` charged to the whole
+co-varying set is now mostly attributable to ONE member of it. What still co-varies **between the
+two arms** is unchanged and is NOT separated here: `tile_m` (32 vs 64), `tile_k_l1` (128 vs 32),
+`tile_k_l2`, the microkernel, and the bf16 arm's fused-cast launches.
+
+**And the model number — the sentence H4 could not write.** Five walks, two rungs each, one
+2048-token prompt, one session per walk, the same `flash_attn.elf` byte for byte, the production
+top-5 gate PASSING on all TEN rungs on the LOADED timed bytes (sha equal before timing, before
+the gate and after it), 49 / **248** / 472 against 49 / 328 / 552 checked live:
+
+| | tok/s (walks 1 / 2 / 3) | device ms per forward | QKV /layer | `flash_attn` /layer | O+FFN /layer |
+|---|---|---|---|---|---|
+| bf16 (`w4_decode`) | 1297.2 † / 1753.1 / 1758.4 | 1097.845 / 1099.259 / 1095.503 | 7.226–7.266 | 18.565–18.659 | 41.763–41.857 |
+| **bfp16 `tile_n = 128`** | **1777.3 / 1756.7 / 1780.9** | **1087.367 / 1088.395 / 1085.743** | **6.918–6.959** | 18.524–18.626 | **41.480–41.521** |
+
+**Device ratio 0.9905 / 0.9901 / 0.9911 / 0.9923 / 0.9857 — bfp16 is 0.8–1.4 % FASTER than bf16**, five times (walks 4 and 5, devq 784 and 808, are the re-gates after each review round, on identical ELF bytes), where at
+`tile_n = 32` it was 0.685–0.691×; against item 20's own bfp16 arm that is **1.497–1.500×** (the
+cross-session comparison is licensed by the bf16 arm, which reads within 0.21 % of item 20's).
+† walk1's bf16 `tok/s` is dragged to 1297 by one 424 ms `kv_append` sample — §8b's characterised
+host transient, identical numpy in both arms — while its `device_ms` sits within 0.05 % of item
+20's. `compare_roots` on the two transient-free roots (walk2 → walk3) is **VERDICT OK**: 0
+warnings, 0 failures, identifier mismatches 0, tok/s drift median **0.84 %**, `device_ms`
+**0.29 %**; walk1 → walk2 says PROBLEM with all three failures on `host_cpu_ms`-driven columns and
+`device_ms` drift 0.11 %, which is §8b's pattern exactly. Every predicted quantity landed inside
+its band except one, stated as a miss: the speed-up over `tn=32` was predicted at 1.50–1.55× and
+measured **1.497 / 1.498 / 1.500×**. The two central predictions — device ms (1082 predicted, 1087.4 measured) and
+the ratio (0.99 predicted, 0.9905 measured) — landed within 0.5 %, and the projection was made
+from standalone GEMM rates plus each arm's own measured non-GEMM overhead. **That method
+transferred here**, which is worth recording against item 23's F2 and item 28's finding that a
+harness's HEADROOM does not: it transferred because the standalone arm is the same kernel at the
+same shape, not a proxy for it.
+
+**The re-execution gate on both new ELFs, parity predicted first**: `rms_gemms_rope_bfp16` (6
+loads, even) and `o_ffn_bfp16` (8, even) both **clean** at BOTH declared input scales — d1 within
+the family bound 6/6 and 8/8, d2/d3/d4 byte-equal to d1, d5 moved, `parity_rule_holds` — so doc 57
+§1.5's family goes **15/15 → 17/17** (devq 755).
+
+**A same-session bf16 GEMM control, and a discrepancy reported rather than reconciled.** At the
+registry's own tiles the two formats are a **dead heat at GEMM level**: per layer all seven GEMMs
+take 41.94 ms bf16 against 41.86 ms bfp16 `tn=128` (bfp16 ahead on down by 8 % and on O by 2 %,
+behind on K/V by 20 %). The registry's published June rows for those same shapes are **15–22 %
+ABOVE** what the same harness, tiles and shapes measure here on Turbo today (6215 vs 5140 GFLOP/s
+at 2048³); this item does not reconcile that and uses only its own re-measured numbers.
+
+**What landed in code** (as revised by the item's own three review rounds — devq 760, six
+blocking; devq 787, four more plus a weakened gate; devq 811, four more plus three
+non-blocking; all fixed). The `tile_n` correction in
+`matmul_bf16_x_bfp16.py`; the N tile as a selectable parameter
+(`LLAMA32_1B_INT4_BFP16_TILE_N`, unsupported widths refuse at import); and a guard built around
+**one invariant** — *the layout the weights were packed in equals the layout the ELF about to
+consume them was built for* — after the first attempt enforced it at four call sites with four
+different answers to "what does a missing fact mean?", which produced a guard that was
+simultaneously too permissive and **too strict: it locked bfp16 bootstrapping**, since the
+compile path (the act that establishes what a set was built for) was made to demand that fact
+already existed. The two facts are established differently and that is the whole design. **Fact
+A, what the buffers ARE, is DERIVED from them**: `pack_b_bfp16ebs8` emits
+`[N/tile_n, K/tile_k_l1, tile_n·tile_k_l1//8·9]`, so against the dense array the tiles are
+solvable and the record axis cross-checks them — every (layer, field) pair is solved and they
+must agree, so a repacked or swapped layer REFUSES instead of leaving a stale record, and there
+is no stamp to forge. **Fact B, what the ELF expects, is not derivable at all** (its weight
+argument is the same byte count at every width, which is the hazard) so it is DECLARED by
+whatever built the set — and a declaration is **evidence, not authority**: one naming a layout
+this build cannot produce is not read as a declaration, which closes the self-certification a
+hand-written `tile_n = 256` sidecar otherwise gets by matching a packer told the same number.
+CREATE writes the declaration and proceeds; CONSUME requires it. The check runs once per driver,
+where the buffers meet an ELF, and `load_awq_weights_bfp`'s cache parameter was deleted rather
+than tightened. **CREATE is itself constrained**, because the third round found the write was
+unconditional: a set of 32-wide ELFs plus a request for 128 skipped both compiles as "already
+built" and then RELABELLED itself 128 — the guard rubber-stamping the very mismatch it exists
+to catch. An existing declaration is now READ-ONLY, a set may be built into only when it is
+empty or already declares that layout (so a partially populated set cannot become a
+mixed-width set under one label), and the declaration is written only by an invocation that
+actually compiled. The same round closed two more consume paths that the newly configurable
+width had turned live: item 20's re-execution gate now packs for **the set's own declared
+layout** rather than the environment, and both stitcher `__main__` self-tests rebuild
+`mm_bf16_x_bfp16.o` from their own constants so a module built at 32 cannot link a 128-wide
+object left behind by a production compile. The shipped `verify_kernel_cache` carries a declaration whose `why` cites this
+item's rebuild-and-compare as the evidence for 32. The plan package mirrors the same env read (it
+stays dependency-free) so a plan priced at 128 hashes differently from one priced at 32. Also repaired on the way: both of
+the int4/bfp16 drivers' `prepare_air_project` replacements took only `quant` while
+`KernelCache.compile_and_cache` had grown to pass `int4_gs` and `int4_k_chunk`, so **every compile
+through that driver died with a `TypeError` before building a kernel** — a host test now reads the
+caller's keywords out of `cache.py` and pins that both hooks accept them (the first version of
+that test took the LAST call site of two and was vacuous; it now unions them, and it was verified
+failing against each pre-fix signature). Host suite **728 → 741/741 in 34 modules** from this
+item, green with the width override unset and at 32 / 64 / 128, and
+`run_study_host_tests.lit`'s pinned counter moves with it; **every bypass either review found has
+a test verified failing before its fix** — including the bootstrap lock, whose test is read from
+the driver's AST with import aliases resolved, after tamper-checking showed an aliased early
+check walking past the first version. Env hygiene is enforced by the suite runner rather than
+remembered per test: a test that leaves `LLAMA32_1B_INT4_BFP16_TILE_N` changed now FAILS, because
+in a single-process suite a leaked width silently weakens every test after it. `bf16` remains every model's default and the bfp16 default width stays 32, because the
+shipped `verify_kernel_cache` ELFs are built at 32 and the geometry check would (correctly) refuse
+a 128 packer against them; flipping the default means rebuilding that cache first.

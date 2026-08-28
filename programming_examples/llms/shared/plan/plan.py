@@ -144,8 +144,34 @@ W_BFP16_GEMM_CONTRACT = "bfp16ebs8_shared_exp8_mantissa8_native_mmul_operand"
 #: single `mm_bf16_x_bfp16.o` they link bakes DIM_M / DIM_N / DIM_K. So this is
 #: not a solver choice, and the registry (which has ZERO non-bf16 rows and no
 #: quant axis in `gemm_config`) has nothing to override it with.
-BFP16_TILE_M, BFP16_TILE_N, BFP16_TILE_K_L1 = 32, 32, 128
+BFP16_TILE_M, BFP16_TILE_N_DEFAULT, BFP16_TILE_K_L1 = 32, 32, 128
 BFP16_HERD = (8, 4)
+
+#: `[2026-08-27]` queue item 22: the N tile is selectable. This package stays
+#: DEPENDENCY-FREE, so it reads the same environment variable the packer
+#: (`llama32_1b_int4/awq_bfp_pack.py`) reads rather than importing it -- the
+#: `fa_cache_name` / `W4_GEMV_CONTRACT` mirroring pattern, and a host test pins
+#: the two readings against each other. An unsupported width REFUSES here too:
+#: a plan that priced a geometry nobody can build is worse than no plan.
+BFP16_TILE_N_ENV = "LLAMA32_1B_INT4_BFP16_TILE_N"
+BFP16_TILE_N_SUPPORTED = (32, 64, 128)
+
+
+def _read_bfp16_tile_n():
+    import os
+
+    raw = (os.environ.get(BFP16_TILE_N_ENV) or "").strip()
+    if not raw:
+        return BFP16_TILE_N_DEFAULT
+    if not raw.isdigit() or int(raw) not in BFP16_TILE_N_SUPPORTED:
+        raise ValueError(
+            f"{BFP16_TILE_N_ENV}={raw!r}: the bfp16 prefill N tile must be one of "
+            f"{BFP16_TILE_N_SUPPORTED} (mirrors awq_bfp_pack._read_bfp16_tile_n)"
+        )
+    return int(raw)
+
+
+BFP16_TILE_N = _read_bfp16_tile_n()
 
 #: bfp16ebs8: 9 bytes per 8 elements = 1.125 B/elt = 9 bits/elt.
 BFP16_BITS_PER_ELEMENT = 9

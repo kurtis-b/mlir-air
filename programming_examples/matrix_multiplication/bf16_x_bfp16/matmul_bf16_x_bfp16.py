@@ -278,7 +278,20 @@ def build_module(
         [
             tile_m * tile_n * herd_n,
             tile_m * tile_n,
-            tile_n * r,
+            # n_b: skip one full M-block COLUMN of the drain buffer. That is
+            # `tile_m * t` -- `l1_c_drain` is a contiguous
+            # [herd_m, herd_n, tile_n/t, tile_m/r, r, t] buffer, so its dim-2
+            # stride is (tile_m/r)*r*t. The same expression appears in
+            # `c_subview_layout` above and in the drain DMA's `src_strides`
+            # below. `[2026-08-27]` queue item 22: it was written `tile_n * r`
+            # here, which is EQUAL only while tile_n == tile_m (r == t == 8) --
+            # every shipped bfp16 GEMM is 32x32, so the error was invisible.
+            # At tile_n != tile_m aircc rejects the module:
+            #   'func.call' op operand type mismatch: expected operand type
+            #   'memref<1x1x8x4x8x8xbf16, strided<[8192, 2048, 512, 64, 8, 1],
+            #   offset: ?>, 2 : i32>', but provided '...strided<[8192, 2048,
+            #   256, 64, 8, 1]...>'
+            tile_m * t,
             r * t,
             t,
             1,

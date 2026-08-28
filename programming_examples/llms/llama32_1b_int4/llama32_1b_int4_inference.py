@@ -269,6 +269,16 @@ def prepare_runtime(
     # artifact set at all.
     if PREFILL_DTYPE == "bfp16":
         _pack_prefill_weights_bfp16(weights, config)
+        # THE layout invariant, enforced once, here: `prepare_runtime` is the
+        # last thing between these buffers and the first dispatch that consumes
+        # them, and it runs per (weights, artifact set) pair -- so reused
+        # weights meeting a second set are checked against THAT set. The check
+        # DERIVES the layout from the packed buffers themselves (a repacked or
+        # swapped layer is a refusal, not a stale record) and requires the set
+        # to declare a buildable layout equal to it.
+        from awq_bfp_pack import assert_layout_agrees
+
+        assert_layout_agrees(weights, prefill_cache.cache_dir)
     else:
         preload_prefill_weights(weights, config, prefill_cache, seq_len, rope_lut_bf16)
 
@@ -288,7 +298,11 @@ def _pack_prefill_weights_bfp16(weights, config):
     owner for the tile geometry it must match (the same module's
     `BFP16_N_TILE` / `BFP16_K_CHUNK`, which ARE the two bfp16 stitchers'
     shared `tile_n` / `tile_k_l1`). Idempotent, like every other surface
-    `prepare_runtime` touches.
+    `prepare_runtime` touches -- **which is why the layout check is NOT here**:
+    this returns early on the second call, so a check inside it only ever sees
+    the first artifact set. `prepare_runtime` runs `assert_layout_agrees` after
+    it, per set, and that derives the layout from the buffers this produced
+    rather than from anything this records.
 
     Cost is load-time and host-side: 973 M weight elements at 1.125 B/elt =
     1.09 GB of packed BOs beside the 1.95 GB of bf16 the loader already
@@ -297,7 +311,10 @@ def _pack_prefill_weights_bfp16(weights, config):
     """
     if getattr(weights, "_bfp16_prefill_packed", False):
         return
-    from awq_bfp_pack import pack_layer_bfp16
+    from awq_bfp_pack import BFP16_N_TILE, BFP16_K_CHUNK, pack_layer_bfp16
+
+    print(f"  bfp16 prefill tile geometry: tile_n={BFP16_N_TILE} "
+          f"tile_k_l1={BFP16_K_CHUNK}")
 
     t0 = time.time()
     total = 0

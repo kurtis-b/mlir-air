@@ -693,5 +693,53 @@
 // pinned in run_seam_tests.lit instead, because it lives in the compile
 // chokepoint rather than at a call site. No toolchain: the call sites are read
 // with ast, since the builders import air and this suite must not.
+//
+// `[2026-08-27]` 728 -> 741 in 34 modules, queue item 22: the bfp16 prefill N
+// tile becomes a PARAMETER, and the seven new tests are all about the one thing
+// that makes that dangerous -- the packed weight BO is 1.125 B/elt at EVERY
+// width, so a packer/ELF width mismatch passes every shape and size check the
+// runtime makes and surfaces only as a wrong token. There is no loud failure to
+// wait for, so admission has to rest on positive evidence and refuse without
+// it. What this module pins: the two readers (packer and plan) accept exactly
+// the same widths under exactly the same env name and agree with each other;
+// the builders' signature defaults equal the packer's DEFAULT (the live width
+// cannot be read from source at all -- that is the run-time check's job);
+// `pack_layer_bfp16` with no explicit tile follows the LIVE width; and the
+// three fail-open bypasses the item's own review found -- an UNDECLARED
+// artifact set is refused even at the default width, weights carry the width
+// they were packed at so a second artifact set is checked against THEM rather
+// than against the environment, and no packer entry point defaults to a
+// hardcoded width. The seventh reads the keywords `KernelCache.compile_and_cache`
+// passes and pins that both `prepare_air_project` hooks accept them: they took
+// only `quant` while the caller had grown two more, so every compile through
+// that driver raised TypeError before building a kernel.
+//
+// `[2026-08-27, second review]` The guard those tests describe was rebuilt
+// around ONE invariant -- *the layout the weights were packed in equals the
+// layout the ELF about to consume them was built for* -- because enforcing it
+// at four call sites produced four different answers to "what does a missing
+// fact mean?", including one that was too strict: the compile path, which is
+// the act that ESTABLISHES what a set was built for, was made to demand that
+// fact already existed, so a clean cache could never be compiled. What the
+// tests pin now: the packed layout is DERIVED from the buffers (solved out of
+// `[N/tile_n, K/tile_k_l1, tile_n*tile_k_l1//8*9]` against the dense array, so
+// a repacked layer refuses instead of leaving a stale record); a declaration is
+// EVIDENCE, not authority (one naming a layout this build cannot produce is not
+// read as a declaration at all); create-vs-consume, read structurally from the
+// driver so no check may precede the compile block that writes the declaration;
+// and the single-process env hygiene that a leaked width would otherwise use to
+// weaken every later test.
+//
+// `[2026-08-27, final review]` Three more, all one defect at the CREATE end:
+// the declaration was written UNCONDITIONALLY after the compile block, so a set
+// of 32-wide ELFs plus a request for 128 skipped both compiles as "already
+// built" and then RELABELLED itself 128 -- the guard rubber-stamping the exact
+// mismatch it exists to catch, which is worse than carrying no declaration at
+// all. Pinned now: an existing declaration is READ-ONLY (same value idempotent,
+// different value refuses unless the caller states it just rebuilt the ELFs); a
+// set may be built into only when it is empty of bfp16 ELFs or already declares
+// that layout, so a partially populated set cannot become a mixed-width set
+// under one label; and the driver runs that preflight BEFORE compiling and
+// writes the declaration only when it actually compiled something.
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 728/728 passed in 34 modules
+// CHECK: study host tests: 741/741 passed in 34 modules

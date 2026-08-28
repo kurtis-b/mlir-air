@@ -563,9 +563,37 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+
     SEQ_LEN, EMB_DIM, HIDDEN_DIM = 2048, 2048, 8192
     TILE_N = 32  # must match build_o_ffn_bfp16_module's tile_n default
     TILE_K_L1 = 128
+    TILE_M = 32  # the builders' tile_m default; the object bakes it too
+
+    # `[2026-08-27, queue item 22 final review]` COUPLE the module's tile width
+    # to the object it links. The module is built at TILE_N and
+    # `mm_bf16_x_bfp16.o` BAKES -DDIM_N; nothing in the ELF checks that they
+    # agree, and a production compile at another width leaves a stale object in
+    # `air_project/` -- so this self-test would build and pack at 32 while
+    # linking a 128-wide kernel: same byte counts, wrong values, or an
+    # unchecked compile-only artifact. Rebuilding the object HERE from THESE
+    # constants makes the two one fact.
+    if not args.print_module_only:
+        import shutil as _shutil
+        from pathlib import Path as _Path
+
+        from shared.infra.external_kernels import _compile_kernel as _ck
+
+        _air = _Path("air_project")
+        _air.mkdir(parents=True, exist_ok=True)
+        _mm_src = (_Path(__file__).resolve().parents[3] / "matrix_multiplication"
+                   / "bf16_x_bfp16" / "mm_bf16_x_bfp16.cc")
+        print(f"  staging mm_bf16_x_bfp16.o at DIM_M={TILE_M} DIM_N={TILE_N} "
+              f"DIM_K={TILE_K_L1} (matching this module)")
+        _ck(_mm_src, "mm_bf16_x_bfp16.o",
+            extra_flags=[f"-DDIM_M={TILE_M}", f"-DDIM_N={TILE_N}",
+                         f"-DDIM_K={TILE_K_L1}"],
+            force=True)
+        _shutil.copy2("mm_bf16_x_bfp16.o", _air / "mm_bf16_x_bfp16.o")
 
     print(
         f"O+FFN bfp16 Multi-Launch: seq={SEQ_LEN}, emb={EMB_DIM}, "
