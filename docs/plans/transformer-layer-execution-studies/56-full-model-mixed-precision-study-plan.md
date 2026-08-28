@@ -1052,7 +1052,22 @@ vs bf16's 62.9–65.6.
 optimistic edge carried; the residual after the charges is 0.46 ms/call = **12.8 ms/token of
 dequant excess** vs the predicted ≤11.2 (13 % over; plausibly k_chunk 1024's doubled
 per-chunk fixed cost vs llama's 2048 — not separately measured). O4's conclusion sharpens:
-a faster int4 GEMV is now worth up to ~12.8 ms/token on this model's own decode. ~~bf16 stays
+a faster int4 GEMV is now worth up to ~12.8 ms/token on this model's own decode. **`[2026-08-27, corrected 2026-08-28]` That
+ceiling is now measured against, and it under-states what a GEMV change is worth.** The
+r=64 experiment ([doc 57 §5B](57-inference-path-optimizations-from-hexagon.md), evidence
+`results/r64-shipped-20260827/`, devq 831–852) took **0.61–0.67 ms/token** here —
+`o_gemv_ffn_int4` **1.0402 → 1.0164 ms/call** at ctx 512, **−2.1 to −2.3 %** across three
+contexts, on eight counterbalanced walks with n=4 per arm and arms proven distinct by
+`artifact_sha_timed` in the run record. **Two cautions for anyone pricing a GEMV change
+from the 10.0 GB/s figure above.** (i) It **under-predicts by ~2×**: the division built on
+it (marginal compute = 47 % of the kernel region) put the ceiling at −1.05 % and the
+measurement came in at −2.20 %. The same division applied to llama32_1b_int4, whose
+cascade is 91 % accounted for, predicted −2.64 % and measured **−3.54 %** — so the
+fraction-accounted-for **ranks** two consumers correctly and **understates** both. Treat
+it as closer to a lower bound than an upper one. (ii) It is invisible at token scale here:
+the same walks' **bf16 rungs, identical bytes in both arms, move by more than the effect
+does**, so no tok/s number is claimed. The mechanism is unknown; ELF size was tested on
+both models and rejected. ~~bf16 stays
 the default and the standing-numbers table is unchanged; the operator flips
 `QWEN3_W4_DECODE` (or runs the `w4-decode-qwen` profile) to take the 14.9 tok/s path.~~
 **`[2026-08-26]` superseded by the flip below.**

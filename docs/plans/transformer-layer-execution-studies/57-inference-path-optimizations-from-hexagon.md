@@ -938,6 +938,164 @@ path**: a standalone harness measures 21.10 GB/s where the cascade measures 10.0
 gated experiment on `o_gemv_ffn_int4` rather than a change. It is still larger than
 anything the integer route delivered.
 
+**`[2026-08-27]` THE GATED EXPERIMENT RAN, and its result is a MECHANISM THAT IS NOT
+KNOWN.** Evidence `results/r64-shipped-20260827/` (devq **831, 834, 835, 836, 838, 841,
+842, 843**; `PREDICTION.md` 17:38:58 predates the first device job's 17:47:58 submission
+by file time, `PREDICTION-ADDENDUM.md` 17:55:38 predates the re-execution gate; Turbo
+before and after every measure job).
+
+**Lead with what is unexplained.** The change makes the shipped int4 GEMV measurably
+faster on **both** consumers that link it — **−2.1 to −2.3 %** per call on Qwen3-0.6B and
+**−3.4 to −3.7 %** on llama32_1b_int4 — and **no mechanism here explains the size of
+either**. The division written before the device work ranked the two correctly but
+under-stated both by 1.3–2.1×, and the obvious candidate (program size) was tested on both
+models and rejected. What follows is the evidence for that, not a speed-up announcement.
+
+**And one finding is about this item's own method.** The first llama A/B reported a NULL.
+It was invalid — four walks that timed the same artifact — and the null, plus the two
+claims built on it, were the **opposite** of the truth. That retraction is below, and it
+is the more useful half of this entry.
+
+**First, the two ratios in the paragraph above are reconciled, and neither is an
+op-count figure.** The queue ledger's **1.10×** and this section's **1.065×** come from
+the *same six device points* (arm A / A2, devq 658/667) and differ only in how the fixed
+cost is charged. Re-fitted from the raw points:
+
+| convention | what it does | ratio |
+|---|---|---|
+| **shared intercept** | charges every arm the mean of the three arms' intercepts, 178.8 µs | **1.1004×** |
+| **own slope** (this section) | each arm's own fitted slope, 21.10 → 22.49 GB/s | **1.0655×** |
+| **raw total time** at M=6144 | 322.4 → 309.3 µs, fixed cost included | **1.0424×** |
+| **op count** | 47 → 34 ops/group; clock-corrected model 19.5 → 26.9 GB/s | **1.382× / 1.380×** |
+
+The shared-intercept convention is the one **item 26 struck down** — it is what produced
+the withdrawn "integer is 11× slower" — and it was still circulating in the queue ledger
+a day later. The **op count predicts neither measurement, missing both by ~30 %**, which
+is a better fact than either ratio: the op count is not the rate.
+
+**A fourth number supersedes all of them.** Item 23's A2 arm used a *prototype file*
+(`mv_int4_bf16_r64.cc`) and a different entry symbol. This item re-ran the sweep with the
+**shipped file and shipped entry at both widths**, differing only in `-DDIM_R`
+(devq 835): **22.08 → 23.00 GB/s = 1.0417×**.
+
+**And the ratio is only meaningful within one session.** The r=32 baseline reads **21.10
+(item 23, devq 667), 20.84 (item 27, devq 679), 22.08 (this item, devq 835)** — a **6 %
+spread across three sessions, larger than the effect being measured.** Any r=64 figure
+formed by dividing one session's number by another's is noise. Both arms of every
+comparison below are alternated inside a single job.
+
+**The division, done before any device job, and it did not hold — but it ranked correctly.**
+Two independent decompositions of the shipped Qwen call agreed on the fixed cost to 7 %
+(467 µs from doc 56 §4's imported boundary + submission charges; 498 µs from 3 × the
+item-23 harness's own fitted intercept, importing nothing). Marginal compute is 47 % of
+Qwen's kernel region against **91 % of llama's**, so on this session's own rates the
+serial-model ceilings are **−1.05 %** (Qwen) and **−2.64 %** (llama).
+
+**THE MEASUREMENT** (devq **851 / 852**, replacing devq 841/842 — see the retraction
+below). Eight walks per model in a **counterbalanced ABBA/BAAB order** (each arm's
+positions sum to 18), **n = 4 per arm**, arms proven distinct **by `artifact_sha_timed` in
+the run record**, not by the path handed to the runner:
+
+| model / kernel | ctx | r32 | r64 | Δ | Δ % | p(perm) |
+|---|---|---|---|---|---|---|
+| **qwen `o_gemv_ffn_int4`** | 512 / 1024 / 2048 | 1.0402 / 1.0431 / 1.0537 | 1.0164 / 1.0197 / 1.0318 | −23.8 / −23.4 / −21.9 µs | **−2.29 / −2.24 / −2.08** | 0.0286 each |
+| **llama `o_gemv_ffn_int4`** | 512 / 1024 / 2048 | 1.9528 / 1.9536 / 1.9675 | 1.8852 / 1.8867 / 1.8942 | −67.6 / −66.9 / −73.3 µs | **−3.46 / −3.42 / −3.73** | 0.0286 each |
+| llama `rms_qkv_int4_rope` | 512 / 1024 / 2048 | 0.6533 / 0.6521 / 0.6616 | 0.6430 / 0.6447 / 0.6464 | −10.3 / −7.4 / −15.2 µs | −1.58 / −1.13 / −2.30 | 0.086 / 0.14 / 0.086 |
+
+**0.0286 is this design's FLOOR** — with n = 4 per arm the smallest attainable exact
+two-sided permutation p is 2/70 — so it is reported as "the strongest this design can
+say", not as a small p. What carries the result is that **all three Qwen rungs and all
+three llama rungs hit that floor in the same direction with consistent magnitude**, while
+the controls do not.
+
+**Controls, in the same walks.** Kernels that do not link the changed object:
+`lm_head_gemv` −0.03 / +0.16 / +0.05 % on llama and +0.10 / −0.13 / +0.12 % on Qwen,
+`rms_qkv_qknorm_rope_gemv2` −0.19 / +0.12 / +0.16 % on Qwen, and Qwen's **bf16 rungs**,
+which are identical bytes in both arms. Of twelve Qwen control comparisons, one
+(`ctx2048 bf16 lm_head_gemv`, p(perm) = 0.057) is nominally low — which is what twelve
+tests at n = 4 produce, and it is on a kernel whose bytes are identical across arms.
+
+**Per token: Qwen −0.61 to −0.67 ms; llama −1.07 to −1.17 ms** on the cascade, plus
+−0.12 to −0.24 on llama's QKV.
+
+**What the division got right and wrong.** Right: **the ordering.** It predicted llama
+would gain more than Qwen and llama does, 1.61× on the measurement against 2.51×
+predicted. Wrong: **both magnitudes**, exceeded by **2.10×** (Qwen) and **1.34×** (llama).
+So "what fraction of the shipped call the harness's marginal rate accounts for" **ranks**
+two consumers correctly and **under-states** what the change is worth on each. The band
+[overlap floor, serial ceiling] is **not a bound**; it is closer to a lower bound.
+
+**The token-level instrument still cannot resolve the Qwen effect.** 0.6 ms on a 67–118 ms
+token is 0.5–1.0 %, while the same walks' **bf16 rungs — identical bytes in both arms —
+move by more than that.** No tok/s number is claimed for this change on Qwen.
+
+**`[2026-08-28]` RETRACTED: the first llama A/B (devq 842) and everything built on it.**
+Those four walks passed `--compiled-root` and **the study runner ignored it**:
+`discover_compiled` classes a plan as SHIPPED when it is the model's
+`precision_plans[0]`, and for llama32_1b_int4 that plan **is** `w4_decode`, so every arm
+took `build_peano/decode_kernel_cache`. All four `lwalk_*/model_run.json` record the same
+`artifact_sha_timed = ea929db7…`. **The reported llama "null" of +0.04 / −0.07 / −0.43 %
+was one unchanged artifact measured four times**, and the two claims derived from it —
+that the division's predicted ordering was "inverted by 2.5×", and that ELF size was
+thereby rejected — were **false, and are reversed above**: the ordering was right, and
+llama gains *more* than Qwen, not nothing.
+
+**The lesson is the pinning, not the plumbing.** The Qwen arms were pinned by object sha,
+`-DDIM_R` and a prebuilt ELF path, and checked. The llama arms were pinned by *the same
+argument name*, which that profile does not honour, and the run record was not read.
+**The path handed to a runner is not evidence of what it ran.** The re-measurement asserts,
+before any statistic, that the records hold exactly two distinct `artifact_sha_timed`
+values, one per arm; llama's read `175f2b52…` (r32) and `a4b6d757…` (r64), neither equal
+to the stock `ea929db7…`. Because no flag redirects llama's decode set, the shipped cache
+was swapped per arm inside the job — safe only because devq serialises the device — moved
+aside once, restored in a counted leg, and **verified byte-identical afterwards**.
+
+**ELF size, re-tested with real data on both sides, and still REJECTED.** Qwen's cascade
+ELF shrinks 2.08 % and gains 2.20 %; llama's shrinks **2.13 %** — the same — and gains
+**3.54 %**, 1.6× more; llama's QKV shrinks **4.68 %**, twice as much, and gains **1.67 %**,
+half as much. Program size does not order the effect. **The mechanism remains unknown**,
+and what distinguishes the two models (`k_chunk` 1024 vs 2048, 6.04 vs 28.54 MB/call,
+cascade K-division) is not separated by anything measured here.
+
+
+**It is not a one-token change.** `matvec_int4_bf16_impl` static_asserts `gs % r == 0`
+and **SmolLM2-1.7B int4 decode ships at gs = 32**, as do the six `run_q4_0*` targets:
+`<..., 32>` → `<..., 64>` would not have compiled. What shipped is a **predicate**,
+`#define DIM_R (DIM_GS % 64 == 0 ? 64 : 32)`, and the edited source at r=32 disassembles
+**identically to HEAD** at both gs=128 (496 instructions) and gs=32 (539). The host
+builder computes the same predicate and **the object tag now carries `r`** — the third
+instance of the stale-`.o` class `compile_mv_int4_bf16` already documents twice, and
+without it a control arm rebuilt at r=32 in a CWD holding an r=64 object would have
+linked r=64 and been reported as the control.
+
+**Gates.** Derived per-element bound at 6 points on both widths: **0 violations**, rel RMS
+0.002363 (r64) vs 0.002381 (r32). `run_packed` / `run_packed_add` (gs=128 → r=64) PASS;
+`run_q4_0` / `run_q4_0_sym` (gs=32 → r=32) PASS with the reference cross-check, and the
+`run_q4_0_sym_wrongzp` **negative control fired as required**. `make verify` PASS on the
+r=64 set, the r=32 control and the bf16 arm, plus the **quantization bar** against the
+unpatched HF checkpoint (devq 836) — every leg asserted on `topk_passed: 2, topk_failed:
+0`, not on `rc=0`. **Re-execution gate PASS on both arms** (devq 843), parity predicted
+first: 3 launches, ODD, the pad engages, d2/d3/d4 byte-equal.
+
+**Arm provenance, because `devq` serialises the device and not the tree** (item 21's
+lesson, learned the same day): every arm is pinned by an explicit `-DDIM_R` whose object
+was hashed and disassembled, or by a path to a **prebuilt** ELF set — the walks are
+`--run-only` and compile nothing. Independently corroborated by item 21's audit, which
+found `o_gemv_ffn_int4` is 903,904 B at r=64 and 923,104 B at r=32; this item's
+`compiled_r32` and an independent rebuild both measure 923,104 B and `compiled_r64`
+903,904 B. The five job scripts and the imported re-execution gate were hashed before the
+queued jobs ran and re-checked after: all unchanged.
+
+**Also settled on the way**: the decode ELF is **not byte-reproducible** — two builds of
+the *same* configuration differ by 79–312 bytes — so an ELF sha cannot discriminate arms;
+the object-level check can, and `o_gemv_ffn_int4` differs by 631,222 bytes across widths
+against 312 for a same-arm rebuild.
+
+**Open, and stated as open:** why Qwen gains and llama does not; where the 20–25 µs comes
+from, given it exceeds the marginal-compute ceiling; SmolLM2-1.7B int4 was never run on
+device (its evidence is the byte-identical gs=32 disassembly plus the q4_0 lits); the int4
+GEMM/prefill path and `decode_ffn_swiglu`'s standalone harness were not measured.
+
 **On the ms/token question.** Item 23's prediction committed to a 5.2–6.4 ms/token saving.
 **That figure is withdrawn, not restated.** Falsifier F2 — declared in `PREDICTION.md` before any
 device job — said that if the standalone harness's baseline rate fell outside

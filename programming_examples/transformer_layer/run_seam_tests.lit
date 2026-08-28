@@ -127,3 +127,34 @@
 // inverse of the device's slot layout.
 // RUN: python3 %S/../llms/shared/infra/test_decode_qkv4.py | FileCheck %s --check-prefix=QKV4
 // QKV4: 4/4 passed
+//
+// `[2026-08-27]` The int4 prefill driver's `--gs` reached the host packer and
+// never the KERNEL: `--gs 64` packed in groups of 64 and dequantized on device
+// in groups of 128. Nothing failed -- both halves are well formed, the ELF
+// builds, the run completes, and the answer is simply not the model's. The
+// dead-flag audit in `llms/verify/test_verify_runner.py` could not have caught
+// it and says so in its own SCOPE section: `--gs` IS read, by the packer. So
+// this is the behavioural half that file asks for, and it recreates the pre-fix
+// call as a negative control on every run rather than trusting that the audit
+// still bites. Found while wiring r=64 (`results/r64-shipped-20260827/`);
+// unrelated to that change, fixed with it.
+//
+// `[2026-08-28]` 4 -> 7, review round: wiring the value through was only the
+// first of THREE layers. `_compile_kernel` skips an object by NAME, so a stale
+// `mv_int4_bf16_matmul.o` from a gs=128 run satisfied a gs=64 request; and a
+// cached ELF was loaded by filename alone, so a gs=128 cache directory served a
+// `--gs 64` run and reached neither repair. The first version of this file used
+// an always-recording fake compiler in a fresh temp dir, so it could see the
+// pre-fix CALL and neither real cache. The fake now has `_compile_kernel`'s own
+// skip-by-name semantics, and the ELF refusal is a module-level function so it
+// can be exercised against real files. A cache is a correctness surface
+// whenever its key omits something the artifact depends on.
+// RUN: python3 %S/../llms/llama32_1b_int4/test_prefill_gs_reaches_kernel.py | FileCheck %s --check-prefix=INT4GS
+// INT4GS: PASS  test_the_recorder_sees_a_real_compile
+// INT4GS: PASS  test_gs_reaches_the_gemm_kernel
+// INT4GS: PASS  test_a_stale_gemm_object_is_not_reused_across_group_sizes
+// INT4GS: PASS  test_the_cache_object_name_carries_every_build_affecting_flag
+// INT4GS: PASS  test_a_stale_ELF_is_refused_at_a_different_group_size
+// INT4GS: PASS  test_the_audit_can_actually_fail
+// INT4GS: PASS  test_disagreeing_channels_are_refused
+// INT4GS: 7/7 passed
