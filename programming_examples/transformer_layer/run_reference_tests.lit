@@ -50,3 +50,33 @@
 // CHECK: PASS  test_the_gelu_is_the_tanh_approximation
 // CHECK: PASS  test_the_residual_ordering_is_pre_add
 // CHECK: reference tests: 7/7 passed
+//
+// `[2026-08-27]` doc 58 phase M1 adds the weights-injection seam to the same
+// golden model: `weights=` replaces the drawn tensor set and `layer_inputs`
+// builds any mode's ordered device-input list from that mode's own NAMES tuple.
+// It belongs here because it is the same file's contract, and because the two
+// things it can get wrong are the two this suite already exists to catch -- a
+// composition that looks right and is not, and a plumbing change no numerical
+// gate would report.
+//
+// The BYTE-identity claim (injecting the generated weights reproduces the whole
+// run, digest for digest, at four configurations and five modes, and the
+// generated path matches a baseline recorded from the pre-M1 commit) is the SHA
+// control under results/item31-4a-m1-20260827/control/, not a suite test: it
+// needs the baseline file and takes minutes at the 4096 rung. What runs here is
+// the set of invariants a later edit could break with no baseline to hand --
+// including the content-key trap, whose BROKEN half is demonstrated rather than
+// warned about, because a weights design that mutates a keyed array in place
+// makes the fault-injection negative control PASS.
+//
+// RUN: python3 %S/pattern/test_weights_injection.py | FileCheck %s --check-prefix=INJECT
+//
+// INJECT: PASS  test_a_perturbed_weight_keys_differently
+// INJECT: PASS  test_a_vacuous_band_is_a_refusal_and_not_a_wider_delta
+// INJECT: PASS  test_in_place_mutation_defeats_the_cached_key
+// INJECT: PASS  test_injecting_the_generated_weights_reproduces_the_run
+// INJECT: PASS  test_the_derived_delta_grows_when_the_band_swallows_the_response
+// INJECT: PASS  test_the_derived_delta_keeps_the_shipped_one_when_it_already_trips
+// INJECT: PASS  test_the_new_parameter_does_not_move_the_generated_path
+// INJECT: PASS  test_the_seam_hands_through_the_callers_own_array_objects
+// INJECT: weights-injection tests: 16/16 passed

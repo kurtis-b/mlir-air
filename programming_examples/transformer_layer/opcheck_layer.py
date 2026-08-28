@@ -38,6 +38,8 @@ import math
 import os
 import sys
 
+import numpy as np
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PROJ_ROOT = os.path.dirname(_HERE)  # programming_examples/
 for _p in (_PROJ_ROOT, os.path.join(_PROJ_ROOT, "llms"), _HERE):
@@ -56,8 +58,8 @@ from builders.block import (  # noqa: E402
 )
 from opcheck_prepare import _spec_digest  # noqa: E402
 from pattern.reference import (  # noqa: E402
-    fuse_qkv_weight,
     generate_golden_reference,
+    layer_inputs,
 )
 
 # ---------------------------------------------------------------------------
@@ -365,6 +367,170 @@ def dispatch_vector_totals(rows):
     return totals
 
 
+# ---------------------------------------------------------------------------
+# The fault-injection delta, DERIVED for an injected weight set (doc 58 M1)
+#
+# WHY THE SHIPPED CONSTANT CANNOT SIMPLY BE CARRIED OVER
+#     `opcheck.py:145-148` sizes FAULT_DELTA = 2.0 "two orders of magnitude
+#     above the tolerance band AT THESE INPUT SCALES", where the scales are
+#     `pattern/reference.py`'s VAL_RANGE 0.05 `randn` weights and `torch.rand`
+#     gammas. `atol` is ABSOLUTE, so the constant's discriminating power is
+#     really `atol / (layer output scale)` -- and a weight set with a different
+#     scale moves that ratio without touching a line of code.
+#
+#     MEASURED, doc 58 M1, at 512x768x3072x12 with real layer-0 tensors sliced
+#     to these shapes (results/item31-4a-m1-20260827/evidence/fault-delta-*):
+#
+#         variant   weights            output rms   ln1+2.0 max|d|   outside band
+#         encoder   generated             0.5716         1.526e+0          36855
+#         encoder   real Qwen3-0.6B       0.5428         8.523e+0          19621
+#         encoder   real Llama-3.2-1B     0.2163         3.488e+0           2295
+#         decoder   generated             1.4153         1.842e+0          43948
+#         decoder   real Qwen3-0.6B       0.3130         6.914e-1             25
+#         decoder   real Llama-3.2-1B     0.0789         7.202e-2              0
+#
+#     The last row is the trap doc 58a section 3.2(c) named, arriving: the
+#     injected run PASSES and the negative control proves nothing. The mechanism
+#     is not the gamma's magnitude (it is O(1) in every source) but the
+#     DECODER's output scale. The encoder is post-norm, so its final boundary is
+#     renormalized and its scale is set by the gamma; the pre-norm decoder's
+#     final boundary is the RAW residual sum, so its scale is set by the weights
+#     -- and real projections (rms 1.2e-2 to 3.1e-2) are 2-4x smaller than the
+#     generated 5.0e-2 over a four-multiply chain. The decoder's atol is also
+#     4.5x wider. At Llama's scale the band (4.5e-1) exceeds the layer output's
+#     own absmax (3.75e-1): EVERY candidate reads zero elements outside, and a
+#     device returning zeros would pass. That is a statement about the absolute
+#     tolerance table, not about the delta, and it is recorded in doc 58 as the
+#     thing M2 must settle before it trusts a real-weight cell.
+#
+# WHAT THIS DOES INSTEAD
+#     Derives the delta from the RESPONSE, using the same oracle the preparer
+#     already owns: perturb, recompute the layer, measure how far outside the
+#     band the worst element lands, and double until it clears MIN_EXCESS. The
+#     generated path never reaches here -- it keeps FAULT_DELTA exactly, which
+#     is what "no behaviour change for any existing caller" means.
+# ---------------------------------------------------------------------------
+
+#: How far outside the band the derived delta must push the worst element.
+#: 2x, and the reason is the device's own error rather than a round number: a
+#: clean run that PASSES has every element inside the band by definition, so a
+#: perturbation whose response exceeds the band by 2x cannot be closed by the
+#: device error the clean run just demonstrated is smaller than 1x. Below that
+#: the host margin can be real and the device verdict still a coin flip -- the
+#: 25-elements-of-393216 row above is exactly that case.
+FAULT_EXCESS_MIN = 2.0
+
+#: Doublings allowed before the search gives up. 8 doublings from the shipped
+#: 2.0 reaches 512, well past the 32 the widest measured case needed. A cap hit
+#: is a REFUSAL, not a fallback: it means no perturbation of this target leaves
+#: this tolerance band, i.e. the band is vacuous at this scale, and silently
+#: running on would be the vacuous negative control this whole section exists to
+#: prevent.
+FAULT_DELTA_MAX_DOUBLINGS = 8
+
+
+def band_excess(actual, expected, atol, rtol):
+    """How far outside ``np.isclose``'s band the worst element lands, as a ratio.
+
+    ``max |a - e| / (atol + rtol * |e|)``, elementwise. ``1.0`` is exactly on
+    the band; ``opcheck.py``'s comparison rejects a run iff this exceeds 1.0
+    somewhere. Returning the RATIO rather than a count is what makes a margin
+    comparable across two tolerance tables and two output scales -- a count
+    depends on how many elements happen to sit near the edge.
+    """
+    a = np.asarray(actual, np.float32)
+    e = np.asarray(expected, np.float32)
+    band = atol + rtol * np.abs(e)
+    return float(np.max(np.abs(a - e) / band))
+
+
+def derive_fault_delta(
+    golden_kwargs, weights, target_key, target_index, clean_output, atol, rtol, base
+):
+    """The smallest ``base * 2^k`` whose injection provably leaves the band.
+
+    Args:
+        golden_kwargs: what ``generate_golden_reference`` was called with, minus
+            ``weights`` -- so the recomputation is the SAME layer, not a second
+            transcription of it.
+        weights: the injected weight set. Never mutated; each probe perturbs a
+            fresh copy of the one tensor, exactly as ``opcheck.py::_inject``
+            does, so the content key moves for the same reason it does there.
+        target_key, target_index: the weight and element the injection hits.
+        clean_output: the layer output the reference already computed.
+        atol, rtol: the tolerances the whole-layer comparison will actually use.
+        base: ``opcheck.py``'s ``FAULT_DELTA``, the starting point.
+
+    Returns ``(delta, excess)``. Raises ``ValueError`` at the cap, with the
+    measured responses, because a target that cannot be pushed outside this band
+    is a tolerance defect and not something to work around.
+    """
+    delta = float(base)
+    trace = []
+    for _ in range(FAULT_DELTA_MAX_DOUBLINGS + 1):
+        perturbed = dict(weights)
+        buf = np.array(weights[target_key], copy=True)
+        before = float(buf[target_index])
+        buf[target_index] = np.asarray(before + delta, dtype=buf.dtype)
+        perturbed[target_key] = buf
+        probe = generate_golden_reference(**golden_kwargs, weights=perturbed)["output"]
+        excess = band_excess(probe, clean_output, atol, rtol)
+        trace.append((delta, excess))
+        if excess >= FAULT_EXCESS_MIN:
+            return delta, excess
+        delta *= 2.0
+    raise ValueError(
+        f"no delta up to {trace[-1][0]:g} pushes {target_key}{list(target_index)} "
+        f"more than {FAULT_EXCESS_MIN}x outside the band "
+        f"(atol {atol:.3e}, rtol {rtol:.3e}); measured excess "
+        + ", ".join(f"{d:g}->{e:.3f}" for d, e in trace)
+        + ". The negative control cannot discriminate at this weight scale: the "
+        "band is wide relative to the layer output, which is a defect report "
+        "about the tolerance table, not a delta to widen further."
+    )
+
+
+def fault_delta_hook(golden_kwargs, weights, target_key, target_index, clean_output, atol):
+    """A callable ``opcheck.py`` resolves ONLY when it is actually injecting.
+
+    ``None`` for the generated path, so that path pays nothing and behaves
+    exactly as before. For an injected weight set this returns a zero-argument
+    callable -- deferred because the derivation costs one whole-layer oracle
+    evaluation per doubling, and a clean run must not pay for a control it is
+    not running.
+    """
+    if weights is None:
+        return None
+
+    def resolve():
+        # opcheck.py imports opcheck_specs, which imports this module, so the
+        # import must be deferred to call time. Under `python3 opcheck.py` the
+        # script is `__main__` and this loads a second module object: harmless
+        # (module level is imports and constants; `main()` is guarded) and it
+        # keeps ONE definition of RTOL and FAULT_DELTA rather than a mirror
+        # here that could drift from the file the gate actually reads.
+        import opcheck
+
+        delta, excess = derive_fault_delta(
+            golden_kwargs,
+            weights,
+            target_key,
+            target_index,
+            clean_output,
+            atol,
+            opcheck.RTOL,
+            opcheck.FAULT_DELTA,
+        )
+        print(
+            f"[fault-delta] injected weights: {target_key}{list(target_index)} "
+            f"+{delta:g} puts the worst element {excess:.2f}x outside the band "
+            f"(atol {atol:.1e}); shipped FAULT_DELTA is {opcheck.FAULT_DELTA:g}"
+        )
+        return delta
+
+    return resolve
+
+
 def reconfiguration_delta(cache, baseline):
     """The ``(context_loads, kernel_attaches)`` THIS dispatch performed, as a dict.
 
@@ -416,18 +582,18 @@ def print_dispatch_totals(label, vector_rows):
     return totals
 
 
-def prepare_block(shape, seed=42):
+def prepare_block(shape, seed=42, weights=None):
     """One whole ``encoder_bert`` layer against the golden model.
 
     Compiles and dispatches inside the returned ``dispatch`` callable's closure
     rather than here, so the injection -- which ``opcheck.py`` applies to
     ``inputs`` after this function has returned -- reaches the device buffers.
     """
-    return prepare_layer_dispatch(shape, seed=seed)
+    return prepare_layer_dispatch(shape, seed=seed, weights=weights)
 
 
 def prepare_layer_dispatch(
-    shape, seed=42, cache_dir=BLOCK_CACHE_DIR, label="block", extra=None
+    shape, seed=42, cache_dir=BLOCK_CACHE_DIR, label="block", extra=None, weights=None
 ):
     """The full-layer preparation ``prepare_block`` and the Phase E modes share.
 
@@ -450,6 +616,13 @@ def prepare_layer_dispatch(
         extra: merged into ``record_extra`` -- a mode adds its
             ``execution_mode`` CSV value here, from the one mapping in
             ``pattern/__init__.py``.
+        weights: doc 58 phase M1's injection seam. ``None`` draws the weight set
+            as every pre-M1 caller does; a dict replaces it. The input
+            activation, the draw order, the oracle, the injection target and the
+            per-boundary tolerances are untouched either way -- only the tensors
+            move. See ``pattern/reference.py::generate_golden_reference`` for why
+            the arrays are kept BY IDENTITY, which is what keeps the negative
+            control's content key content-derived.
 
     The vectors are recorded UNCONDITIONALLY, on the fault-injected path as
     well as the clean one, then validated and summed by
@@ -473,21 +646,19 @@ def prepare_layer_dispatch(
     cfg = block_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim, causal=causal)
     describe_block(cfg)
 
-    golden = generate_golden_reference(
-        seq_len, emb_dim, ffn_dim, num_heads, seed=seed, workload_variant=variant
+    golden_kwargs = dict(
+        seq_len=seq_len,
+        hidden_size=emb_dim,
+        intermediate_size=ffn_dim,
+        num_heads=num_heads,
+        seed=seed,
+        workload_variant=variant,
     )
-    weights = golden["weights"]
+    golden = generate_golden_reference(**golden_kwargs, weights=weights)
     reference = golden["boundaries"]
-    # The order is BLOCK_INPUT_NAMES; `inject` below indexes into it.
-    inputs = [
-        golden["input"],
-        fuse_qkv_weight(weights),
-        weights["attn_output_weight"],
-        weights["ln1_weight"],
-        weights["ffn_up_weight"],
-        weights["ffn_down_weight"],
-        weights["ln2_weight"],
-    ]
+    # The order is BLOCK_INPUT_NAMES, read back OUT of the tuple rather than
+    # transcribed beside it; `inject` below indexes into the same tuple.
+    inputs = layer_inputs(golden, BLOCK_INPUT_NAMES)
 
     from shared.infra.cache import KernelCache, Profiler
 
@@ -544,6 +715,11 @@ def prepare_layer_dispatch(
         "variant": variant,
         "causal": causal,
         "golden_seed": seed,
+        # Which of the two weight sources this run used. Recorded rather than
+        # inferred: a results tree that mixes generated and injected weights is
+        # mixing two experiments, and the seed alone no longer identifies the
+        # tensors once injection exists.
+        "weight_source": "injected" if weights is not None else "generated",
         "gemm_spec_source": cfg["qkv_source"],
         "gemm_spec_qkv": _spec_digest(cfg["qkv_spec"]),
         "gemm_spec_ffn_up": _spec_digest(cfg["ffn_up_spec"]),
@@ -576,6 +752,22 @@ def prepare_layer_dispatch(
         "dispatch": dispatch,
         "record_extra": record_extra,
     }
+    # Injected weights only: the delta is DERIVED from the response, because the
+    # shipped constant is calibrated against the generated scale and a real
+    # weight set moves that calibration. Deferred -- `opcheck.py` resolves it
+    # only when it is actually injecting. See the section header above for the
+    # measurement, and for the decoder case where the shipped 2.0 stops
+    # discriminating entirely.
+    hook = fault_delta_hook(
+        golden_kwargs,
+        weights,
+        "ln1_weight",
+        (0,),
+        reference["output"],
+        stage_atol["output"],
+    )
+    if hook is not None:
+        prepared["fault_delta"] = hook
     if causal:
         # The decoder's whole-layer comparison must run at ITS output
         # boundary's atol, not the spec row's encoder-measured one: same

@@ -19,6 +19,13 @@ CONTRACT
     oracles, ``opcheck.py`` -- is numpy. Only the random draws are torch; see
     below.
 
+    ``weights=`` (doc 58 phase M1) replaces the drawn weight set with one from
+    outside, leaving the input activation, the draw order and the oracle exactly
+    where they are. ``layer_inputs(golden, names)`` then builds any mode's
+    ordered device-input list from that mode's own NAMES tuple. Together they are
+    the weights-injection seam: the four modes stopped writing their input list
+    out by hand, so a tuple and its list can no longer drift.
+
 WHY THE DRAWS ARE torch AND THE ARITHMETIC IS NOT
     The draw ORDER is load-bearing: ``torch.manual_seed(seed)`` then, in order,
     ``input``, ``q_weight``, ``k_weight``, ``v_weight``, ``attn_output_weight``,
@@ -207,6 +214,65 @@ def _draw(shape, uniform=False):
     return _to_numpy(drawn.to(torch.bfloat16))
 
 
+def weight_shapes(hidden_size, intermediate_size):
+    """Every drawn weight's name and shape, at one configuration.
+
+    The one place the layer's weight geometry is written down. ``_draw``'s
+    branch below reads it, and so does ``check_weights`` -- so an injected
+    tensor set is validated against the shapes the generator would itself have
+    produced, rather than against a second transcription of them.
+    """
+    return {
+        "q_weight": (hidden_size, hidden_size),
+        "k_weight": (hidden_size, hidden_size),
+        "v_weight": (hidden_size, hidden_size),
+        "attn_output_weight": (hidden_size, hidden_size),
+        "ln1_weight": (hidden_size,),
+        "ffn_up_weight": (hidden_size, intermediate_size),
+        "ffn_down_weight": (intermediate_size, hidden_size),
+        "ln2_weight": (hidden_size,),
+    }
+
+
+def check_weights(weights, hidden_size, intermediate_size):
+    """Refuse an injected weight set that is not what the layer takes.
+
+    Checked: the key set is EXACTLY ``WEIGHT_DRAW_ORDER`` (no extras, none
+    missing), every shape is the one ``weight_shapes`` names, and every dtype is
+    ``bfloat16``. The dtype clause is not pedantry -- ``_draw`` rounds once to
+    bf16 because that is what the device is given, and an f32 tensor injected
+    here would be compared against a device that was handed bf16, which reads as
+    a kernel error rather than as the type mismatch it is.
+
+    Returns ``weights`` unchanged (never a copy: see ``generate_golden_reference``
+    on why the caller's own array objects must survive the seam).
+    """
+    expected = weight_shapes(hidden_size, intermediate_size)
+    missing = sorted(set(expected) - set(weights))
+    extra = sorted(set(weights) - set(expected))
+    if missing or extra:
+        raise ValueError(
+            f"injected weights must be exactly {sorted(expected)}; "
+            f"missing={missing} unexpected={extra}"
+        )
+    for name in WEIGHT_DRAW_ORDER:
+        array = weights[name]
+        want = expected[name]
+        if tuple(getattr(array, "shape", ())) != want:
+            raise ValueError(
+                f"injected weight {name!r} has shape "
+                f"{tuple(getattr(array, 'shape', ()))}, expected {want}"
+            )
+        if getattr(array, "dtype", None) != bfloat16:
+            raise ValueError(
+                f"injected weight {name!r} has dtype "
+                f"{getattr(array, 'dtype', None)}, expected bfloat16 -- the "
+                f"device is given bf16 and the oracle computes in f32 from it, "
+                f"so the single rounding belongs to the caller"
+            )
+    return weights
+
+
 def generate_golden_reference(
     seq_len,
     hidden_size,
@@ -216,6 +282,7 @@ def generate_golden_reference(
     workload_variant="encoder_bert",
     include_output=True,
     include_attention_mask=None,
+    weights=None,
 ):
     """The layer's inputs, weights and -- optionally -- every boundary it passes.
 
@@ -233,9 +300,31 @@ def generate_golden_reference(
             to ``include_output``. It is iron's dense mask and is descriptive
             only: the device path takes causality as a builder flag rather than
             as a tensor, and ``encoder_bert``'s mask is all ones.
+        weights: inject the weight set instead of drawing it (doc 58 phase M1).
+            ``None`` -- every pre-M1 caller -- draws exactly as before.
 
     Returns:
         dict as described in the module docstring.
+
+    WHAT INJECTION DOES AND DOES NOT MOVE
+        The input activation is still DRAWN, from the same seed, as the first
+        draw. That is deliberate and is M0's own scoping (doc 58a section 3.1):
+        the seam replaces the tensors, not the activation or the oracle. Because
+        ``input`` is drawn BEFORE the weight loop, skipping that loop cannot
+        move it -- the generated path is byte-identical, which
+        ``control/seam_sha.py`` checks rather than asserts.
+
+        The injected arrays are stored BY IDENTITY, never copied. Two reasons,
+        both load-bearing. ``bo_pool.content_key_once`` caches a static buffer's
+        sha256 by ``id(array)`` with an identity re-check, so a per-dispatch copy
+        would re-hash every weight on every forward (the operator's standing S1
+        rule: once per plan). And ``opcheck.py::_inject`` perturbs a FRESH copy,
+        so the clean array the caller still holds is untouched and its cached key
+        stays valid -- the two runs therefore key differently BECAUSE their bytes
+        differ, which is the property the negative control rests on. A caller
+        that mutates an injected array in place must call
+        ``bo_pool.forget_content_key``; ``test_weights_injection.py`` pins that
+        this is the failure mode and not a silent pass.
     """
     import torch
 
@@ -267,16 +356,15 @@ def generate_golden_reference(
             mask = torch.ones(seq_len, seq_len, dtype=torch.float32)
         attention_mask = _to_numpy(mask.to(torch.bfloat16))
 
-    weights = {}
-    for name in WEIGHT_DRAW_ORDER:
-        if name in ("ln1_weight", "ln2_weight"):
-            weights[name] = _draw((hidden_size,), uniform=True)
-        elif name == "ffn_up_weight":
-            weights[name] = _draw((hidden_size, intermediate_size))
-        elif name == "ffn_down_weight":
-            weights[name] = _draw((intermediate_size, hidden_size))
-        else:
-            weights[name] = _draw((hidden_size, hidden_size))
+    if weights is None:
+        shapes = weight_shapes(hidden_size, intermediate_size)
+        weights = {}
+        for name in WEIGHT_DRAW_ORDER:
+            uniform = name in ("ln1_weight", "ln2_weight")
+            weights[name] = _draw(shapes[name], uniform=uniform)
+    else:
+        # Injected. Validated, never copied -- see the docstring.
+        weights = check_weights(weights, hidden_size, intermediate_size)
 
     result = {
         "input": input_tensor,
@@ -308,6 +396,52 @@ def fuse_qkv_weight(weights):
     return np.concatenate(
         [weights["q_weight"], weights["k_weight"], weights["v_weight"]], axis=1
     )
+
+
+#: How each mode's INPUT NAME maps onto the golden model. The four modes differ
+#: only in whether the QKV weight is fused, so one table serves all of them --
+#: which is the point. ``builders/block.py:24-27`` records why the device input
+#: list is a positional LIST (``opcheck.py`` perturbs ``inputs[i]``), and the
+#: consequence is that the list and the mode's NAMES tuple must move together.
+#: Building the list FROM the tuple is what makes that true by construction
+#: instead of by four hand-written literals that agree today.
+_INPUT_SOURCES = {
+    "x": lambda g: g["input"],
+    "w_qkv": lambda g: fuse_qkv_weight(g["weights"]),
+    "w_q": lambda g: g["weights"]["q_weight"],
+    "w_k": lambda g: g["weights"]["k_weight"],
+    "w_v": lambda g: g["weights"]["v_weight"],
+    "w_o": lambda g: g["weights"]["attn_output_weight"],
+    "ln1_weight": lambda g: g["weights"]["ln1_weight"],
+    "w_up": lambda g: g["weights"]["ffn_up_weight"],
+    "w_down": lambda g: g["weights"]["ffn_down_weight"],
+    "ln2_weight": lambda g: g["weights"]["ln2_weight"],
+}
+
+
+def layer_inputs(golden, names):
+    """One mode's ordered device-input list, built from its own NAMES tuple.
+
+    ``names`` is ``BLOCK_INPUT_NAMES`` / ``OFFLOAD_INPUT_NAMES`` /
+    ``RUNLIST_INPUT_NAMES`` / ``FUSED_INPUT_NAMES``. The returned list is in the
+    tuple's order and the same length, so
+    ``prepared["inject"] = (NAMES.index(target), ...)`` -- which every mode
+    already computes rather than writes down (doc 58a section 3.2b) -- indexes
+    the tensor it names, and cannot silently mis-index when the tuple grows.
+
+    ``w_qkv`` is the only entry that is not a weight-dict lookup: it is
+    ``fuse_qkv_weight``'s fresh concatenation, in ``(q, k, v)`` column order. It
+    is therefore a NEW array on every call, which is why ``content_key_once``
+    re-hashes it per preparation while the unfused weights are keyed once for
+    the life of the caller's arrays.
+    """
+    unknown = [n for n in names if n not in _INPUT_SOURCES]
+    if unknown:
+        raise ValueError(
+            f"no golden-model source for device input(s) {unknown}; add them to "
+            f"pattern/reference.py::_INPUT_SOURCES beside the mode's NAMES tuple"
+        )
+    return [_INPUT_SOURCES[name](golden) for name in names]
 
 
 def _attention(x, weights, num_heads, causal):

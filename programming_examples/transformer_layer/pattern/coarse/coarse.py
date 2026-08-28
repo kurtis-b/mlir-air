@@ -97,7 +97,7 @@ BLEND_SELECTED_BY = (
 )
 
 
-def prepare_coarse(shape, seed=42):
+def prepare_coarse(shape, seed=42, weights=None):
     """The ``coarse`` mode's ``SPECS`` preparer: the D2 layer, measured as a mode.
 
     Same golden model, same injection target, same per-boundary comparisons as
@@ -108,6 +108,7 @@ def prepare_coarse(shape, seed=42):
     return prepare_layer_dispatch(
         shape,
         seed=seed,
+        weights=weights,
         cache_dir=COARSE_CACHE_DIR,
         label="coarse",
         extra={

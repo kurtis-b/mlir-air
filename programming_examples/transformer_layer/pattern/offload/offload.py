@@ -165,6 +165,7 @@ from builders.gemm_spec import resolve_gemm_spec, spec_herd  # noqa: E402
 from opcheck_layer import (  # noqa: E402
     BLOCK_STAGE_ATOL,
     decoder_stage_atol,
+    fault_delta_hook,
     print_dispatch_totals,
     reconfiguration_delta,
 )
@@ -175,6 +176,7 @@ from pattern.reference import (  # noqa: E402
     DECODER_BOUNDARIES,
     ENCODER_BOUNDARIES,
     generate_golden_reference,
+    layer_inputs,
 )
 
 # `[2026-08-11]` The RETIRED switch. ``AIR_OFFLOAD_SHARED_XCLBIN=1`` selected
@@ -869,7 +871,7 @@ def _host_gelu(x):
     return torch.nn.functional.gelu(_torch_f32(x), approximate="tanh").numpy()
 
 
-def prepare_offload(shape, seed=42):
+def prepare_offload(shape, seed=42, weights=None):
     """The ``offload`` mode's ``SPECS`` preparer: the D2 layer, host-mediated.
 
     Same golden model, same per-boundary comparisons at ``BLOCK_STAGE_ATOL``,
@@ -879,6 +881,11 @@ def prepare_offload(shape, seed=42):
     f32, which damps them further, not less). What differs is the execution
     boundary: six one-step device GEMM dispatches, host torch for everything
     between them.
+
+    ``weights`` is doc 58 phase M1's injection seam. ``None`` -- every pre-M1
+    caller -- draws the weight set exactly as before; a dict replaces it,
+    leaving the input activation, the draw order, the oracle and the injection
+    target where they are.
     """
     seq_len, emb_dim = shape["seq_len"], shape["emb_dim"]
     ffn_dim, num_heads = shape["ffn_dim"], shape["num_heads"]
@@ -896,24 +903,20 @@ def prepare_offload(shape, seed=42):
     cfg = offload_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim)
     describe_offload(cfg, causal=causal)
 
-    golden = generate_golden_reference(
-        seq_len, emb_dim, ffn_dim, num_heads, seed=seed, workload_variant=variant
+    golden_kwargs = dict(
+        seq_len=seq_len,
+        hidden_size=emb_dim,
+        intermediate_size=ffn_dim,
+        num_heads=num_heads,
+        seed=seed,
+        workload_variant=variant,
     )
-    weights = golden["weights"]
+    golden = generate_golden_reference(**golden_kwargs, weights=weights)
     reference = golden["boundaries"]
-    # The order is OFFLOAD_INPUT_NAMES; `inject` below indexes into it. The
+    # The order is OFFLOAD_INPUT_NAMES, read back OUT of the tuple rather than
+    # transcribed beside it; `inject` below indexes into the same tuple. The
     # q/k/v weights stay separate — this mode dispatches three projections.
-    inputs = [
-        golden["input"],
-        weights["q_weight"],
-        weights["k_weight"],
-        weights["v_weight"],
-        weights["attn_output_weight"],
-        weights["ln1_weight"],
-        weights["ffn_up_weight"],
-        weights["ffn_down_weight"],
-        weights["ln2_weight"],
-    ]
+    inputs = layer_inputs(golden, OFFLOAD_INPUT_NAMES)
 
     from shared.infra.cache import KernelCache, Profiler
 
@@ -1114,6 +1117,11 @@ def prepare_offload(shape, seed=42):
         "variant": variant,
         "causal": causal,
         "golden_seed": seed,
+        # Which of the two weight sources this run used (doc 58 M1). Recorded
+        # rather than inferred: a results tree that mixes generated and injected
+        # weights is mixing two experiments, and the seed alone no longer
+        # identifies the tensors once injection exists.
+        "weight_source": "injected" if weights is not None else "generated",
         "execution_mode": EXECUTION_MODE_CSV["offload"],
         "attention_path": ATTENTION_PATH,
         "n_dispatches": cfg["n_dispatches"],
@@ -1138,6 +1146,22 @@ def prepare_offload(shape, seed=42):
         "dispatch": dispatch,
         "record_extra": record_extra,
     }
+    # Injected weights only: the delta is DERIVED from the response, because
+    # `opcheck.py`'s constant is calibrated against the generated scale and a
+    # real weight set moves that calibration. Deferred -- resolved only when
+    # `opcheck.py` is actually injecting. `opcheck_layer.py`'s section header
+    # carries the measurement, including the decoder case where the shipped 2.0
+    # stops discriminating entirely.
+    hook = fault_delta_hook(
+        golden_kwargs,
+        weights,
+        "ln1_weight",
+        (0,),
+        reference["output"],
+        stage_atol["output"],
+    )
+    if hook is not None:
+        prepared["fault_delta"] = hook
     if causal:
         # Same seam as opcheck_layer's: the decoder's whole-layer comparison
         # runs at its own output boundary's atol, not the spec row's

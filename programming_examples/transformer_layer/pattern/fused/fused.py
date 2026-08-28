@@ -171,6 +171,7 @@ from builders.qkv_proj import build_qkv_proj_module  # noqa: E402
 from opcheck_layer import (  # noqa: E402
     BLOCK_STAGE_ATOL,
     decoder_stage_atol,
+    fault_delta_hook,
     print_dispatch_totals,
     reconfiguration_delta,
 )
@@ -180,8 +181,8 @@ from pattern.blocked_attention import round_bf16  # noqa: E402
 from pattern.reference import (  # noqa: E402
     DECODER_BOUNDARIES,
     ENCODER_BOUNDARIES,
-    fuse_qkv_weight,
     generate_golden_reference,
+    layer_inputs,
 )
 
 #: This mode's ELF cache, relative to the working directory. Its OWN — see the
@@ -785,7 +786,7 @@ def _ordered_args(idx, rename):
     return tuple(rename[n] for n, _ in sorted(idx.items(), key=lambda kv: kv[1]))
 
 
-def prepare_fused(shape, seed=42):
+def prepare_fused(shape, seed=42, weights=None):
     """The ``fused`` mode's ``SPECS`` preparer: the D2 layer, one submission.
 
     Same golden model, same per-boundary comparisons at ``BLOCK_STAGE_ATOL``,
@@ -794,6 +795,11 @@ def prepare_fused(shape, seed=42):
     and cascading through both residual paths exactly as in the block). What
     differs is the execution boundary: three ELFs, one runlist, no
     intermediate host sync.
+
+    ``weights`` is doc 58 phase M1's injection seam. ``None`` -- every pre-M1
+    caller -- draws the weight set exactly as before; a dict replaces it,
+    leaving the input activation, the draw order, the oracle and the injection
+    target where they are.
     """
     seq_len, emb_dim = shape["seq_len"], shape["emb_dim"]
     ffn_dim, num_heads = shape["ffn_dim"], shape["num_heads"]
@@ -810,21 +816,19 @@ def prepare_fused(shape, seed=42):
     cfg = fused_config(seq_len, emb_dim, ffn_dim, num_heads, head_dim, causal=causal)
     describe_fused(cfg)
 
-    golden = generate_golden_reference(
-        seq_len, emb_dim, ffn_dim, num_heads, seed=seed, workload_variant=variant
+    golden_kwargs = dict(
+        seq_len=seq_len,
+        hidden_size=emb_dim,
+        intermediate_size=ffn_dim,
+        num_heads=num_heads,
+        seed=seed,
+        workload_variant=variant,
     )
-    weights = golden["weights"]
+    golden = generate_golden_reference(**golden_kwargs, weights=weights)
     reference = golden["boundaries"]
-    # The order is FUSED_INPUT_NAMES; `inject` below indexes into it.
-    inputs = [
-        golden["input"],
-        fuse_qkv_weight(weights),
-        weights["attn_output_weight"],
-        weights["ln1_weight"],
-        weights["ffn_up_weight"],
-        weights["ffn_down_weight"],
-        weights["ln2_weight"],
-    ]
+    # The order is FUSED_INPUT_NAMES, read back OUT of the tuple rather than
+    # transcribed beside it; `inject` below indexes into the same tuple.
+    inputs = layer_inputs(golden, FUSED_INPUT_NAMES)
 
     from shared.infra.cache import KernelCache, Profiler
 
@@ -1196,6 +1200,11 @@ def prepare_fused(shape, seed=42):
         "variant": variant,
         "causal": causal,
         "golden_seed": seed,
+        # Which of the two weight sources this run used (doc 58 M1). Recorded
+        # rather than inferred: a results tree that mixes generated and injected
+        # weights is mixing two experiments, and the seed alone no longer
+        # identifies the tensors once injection exists.
+        "weight_source": "injected" if weights is not None else "generated",
         "execution_mode": EXECUTION_MODE_CSV["fused"],
         "elf_count": len(names),
         "fusion": (
@@ -1232,6 +1241,22 @@ def prepare_fused(shape, seed=42):
         "dispatch": dispatch,
         "record_extra": record_extra,
     }
+    # Injected weights only: the delta is DERIVED from the response, because
+    # `opcheck.py`'s constant is calibrated against the generated scale and a
+    # real weight set moves that calibration. Deferred -- resolved only when
+    # `opcheck.py` is actually injecting. `opcheck_layer.py`'s section header
+    # carries the measurement, including the decoder case where the shipped 2.0
+    # stops discriminating entirely.
+    hook = fault_delta_hook(
+        golden_kwargs,
+        weights,
+        "ln1_weight",
+        (0,),
+        reference["output"],
+        stage_atol["output"],
+    )
+    if hook is not None:
+        prepared["fault_delta"] = hook
     if causal:
         # Same seam as opcheck_layer's: the decoder's whole-layer comparison
         # runs at its own output boundary's atol.

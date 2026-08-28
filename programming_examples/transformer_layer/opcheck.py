@@ -320,7 +320,18 @@ def run_spec(spec, fault_inject=None, verbose=False):
 
     inputs = prepared["inputs"]
     if fault_inject == "input":
-        inputs = _inject(inputs, prepared["inject"])
+        # `[2026-08-27]` doc 58 M1. A preparer may override the shipped
+        # FAULT_DELTA -- and only a preparer can, because the constant is
+        # calibrated against the GENERATED weight scale
+        # (`pattern/reference.py`'s VAL_RANGE 0.05) and an injected weight set
+        # moves that calibration. A CALLABLE is resolved rather than a number,
+        # so the derivation (one whole-layer oracle evaluation per doubling)
+        # runs only on the run that is actually injecting. Absent -- every
+        # pre-M1 preparer -- is FAULT_DELTA unchanged.
+        delta = prepared.get("fault_delta", FAULT_DELTA)
+        if callable(delta):
+            delta = delta()
+        inputs = _inject(inputs, prepared["inject"], delta=delta)
     elif fault_inject is not None:
         raise ValueError(f"unknown fault-inject mode {fault_inject!r}")
 
