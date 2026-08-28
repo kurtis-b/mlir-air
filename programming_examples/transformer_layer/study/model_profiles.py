@@ -374,6 +374,64 @@ PROFILES = {
                        ("qwen3_0_6b", 1024, "bf16"),
                        ("qwen3_0_6b", 2048, "bf16")),
     ),
+    "h5-cells": ModelProfile(
+        name="h5-cells",
+        description=(
+            "doc 56 H5 (queue item 21): the PLANNER-SELECTED cells plus two declared "
+            "controls. Not a Cartesian matrix -- 15 rungs against a 288-cell axis "
+            "product. The selection rule is applied per cell in "
+            "results/item21-h5-20260827/rederive_selection.py and its output is the "
+            "authority; this description states which of these rungs it selects and "
+            "which are here for another reason, because an earlier version of this "
+            "text asserted reasons the rule did not actually give. "
+            "SELECTED: the four Qwen prefill rungs by S1 -- the LM head went 10 "
+            "air.launches to 3 at f0262b18, moving the plan to 479/479/619/955 "
+            "against the 486/486/626/962 the newest passing rows recorded; the three "
+            "Qwen w4_decode rungs by S1b, comparing today's w4 artifact set against "
+            "the recorded one FOR THAT PRECISION (an earlier scan compared it against "
+            "the bf16 set and manufactured the difference); and the four llama32_1b "
+            "rungs by S1b plus S1c. "
+            "NOT SELECTED, and here as the CONTROL ARM of the precision A/B: the "
+            "three Qwen bf16 decode rungs. The rule REJECTS them -- plan, bytes and "
+            "timing contract all stand -- but item 24 established that an A/B whose "
+            "two arms are two sessions measures session drift as much as precision, "
+            "so the control belongs in the same walk. "
+            "CARRIED AS A DERIVED SKIP: the Qwen w_bfp16_prefill rung, refused twice "
+            "over (the planner has no qk-norm bfp16 prefill stitcher, and no artifact "
+            "set exists), so the walk demonstrates that its skips are derived. "
+            "S1c, added after the review: a standing row whose root carries no "
+            "`timing` block predates item 19's contract, so its device_ms is not the "
+            "quantity measured today and the cell cannot be rejected on bytes."
+        ),
+        models=("qwen3_0_6b", "llama32_1b"),
+        prefill_Ms={"qwen3_0_6b": (512, 1024, 2048), "llama32_1b": (2048,)},
+        decode_ctxs=(512, 1024, 2048),
+        precision_plan="bf16",
+        ubatch_points=(("qwen3_0_6b", 1024, 512),),
+        prefill_points=(("qwen3_0_6b", SHIPPED_PREFILL_M, "w_bfp16_prefill"),),
+        decode_points=(("qwen3_0_6b", 512, "w4_decode"),
+                       ("qwen3_0_6b", 1024, "w4_decode"),
+                       ("qwen3_0_6b", 2048, "w4_decode")),
+    ),
+    "h5-cold": ModelProfile(
+        name="h5-cold",
+        description=(
+            "doc 56 H5 (queue item 21), the COLD/WARM control. The planner cannot select on this "
+            "axis -- `plan()` has no cold/warm term, its cost model is steady state -- so this is "
+            "a control, not a planner-selected cell. It is `h5-cells`'s ctx-2048 bf16 decode rung "
+            "with `decode_warmup = 0`, so the FIRST timed token is the first dispatch of every "
+            "decode ELF in the process and `samples_s[0]` against the median of the rest is the "
+            "cold/warm ratio. Its own profile rather than a knob on `h5-cells` because the row "
+            "key does not carry the warm-up count: sharing a profile would collide, and folding "
+            "the cold token into the standing 32-token mean would move the standing number by the "
+            "act of measuring it."
+        ),
+        models=("qwen3_0_6b",),
+        prefill_Ms={"qwen3_0_6b": ()},
+        decode_ctxs=(2048,),
+        decode_warmup=0,
+        precision_plan="bf16",
+    ),
     "model-smoke": ModelProfile(
         name="model-smoke",
         description=(

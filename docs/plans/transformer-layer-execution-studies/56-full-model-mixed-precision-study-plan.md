@@ -32,7 +32,7 @@ From [55 §4](55-hexagon-llama-cpp-lessons-for-xdna2.md) as corrected, and the s
 | **Kernel-family cascade** (`MM_SELECT`: HMX iff `M > 4` ∧ K%32 ∧ padded N%32 → HVX tiled → HVX flat → CPU) | Legality first, capacity second, fixed order | candidate providers per op family; **no hard `M` threshold** — `M > 4` is an HMX/HVX fact, not an XDNA2 one; choose by legality then by the traffic model |
 | **Capacity solvers** (HMX: `compute_chunks` minimizes `mblocks·N·3 + nblocks·M·2` reload counts under VTCM, largest chunk on ties, `pipeline` iff `M > 32`; HVX: deepest prefetch 16 → 2 that fits) | **Traffic** models, not latency models | the same objective over L1/L2 reloads with the builders' bounds lifted into pure functions, **spatially** (per-column L2, channels, BDs); the measured registry is the override table |
 | **Fusion by budget** (`try_fuse_node`: quantized QKV / gate-up and matmul+add guarded by "VTCM needed ≤ budget"; `RMS_NORM+MUL` unguarded) | Fusion is mostly a capacity question | the seven multi-launch builders *are* the fusion patterns; the planner picks which applies by the budget rules the README states by hand |
-| **`supports_op` + `OPFILTER`** | `(op, type, shape) → device \| other backend`; split count is the diagnostic and the split is not free | a `placement` predicate `device \| host \| refuse` with `host_ops` and boundary bytes recorded per row; study default `refuse_on_unplanned_split` |
+| **`supports_op` + `OPFILTER`** | `(op, type, shape) → device \| other backend`; split count is the diagnostic and the split is not free | a `placement` predicate `device \| host \| refuse` with `host_ops` and boundary bytes recorded per row; study default `refuse_on_unplanned_split` (**`[2026-08-27, H5]` no such symbol exists; the behaviour is always-on, not a settable policy — see §3.7**) |
 | **Power voted at `start()`** | DCVS off, corners MAX | Turbo refusal (exists) + pmode recorded on every row (exists) |
 | **Mixed precision** (weights Q4_0/Q4_1/Q8_0/IQ4_NL/MXFP4 repacked; matmul in f32/f16, out f32; HVX quant path: f32 → Q8_0/Q8_1 activations in VTCM; HMX path: weights → fp16 tiles, f32 activations → fp16 tiles; norms/softmax f32; KV dtype a run-time choice, FA requires F16 K/V) | **Separate storage type, scratch compute type, accumulator type and model-visible type** — not "int4 × int8 everywhere" | a `precision_plan` with those four fields per tensor class; phase 1 = audit the existing int4 decode path, bf16 or `bfp16ebs8` for prefill; on-device activation quantization last |
 | **`ubatch`** (`n_ubatch` default 512; the reference scripts run `--ubatch-size 1024`; `M` of every prefill matmul; each ubatch = one `graph_compute`) | Throughput rises with `M` while `U ≤ m_chunk`, flattens once VTCM caps the reusable row tile; no universal saturation point | compile prefill at `M ∈ {128, 256, 512, 1024}`; a true ubatch curve holds the **logical prompt fixed** and varies only the physical chunk (§3.4) |
@@ -252,7 +252,11 @@ per-mode tolerances.
 The model's verify adapter (top-5 token-set vs HF, 32 tokens) is the gate for every plan, run
 at the plan's ubatch and precision; per-layer cosine and final-logit top-k are the lenses. A row
 is `passed` only if the gate passed under the same plan hash. Study runs default to
-`refuse_on_unplanned_split`.
+`refuse_on_unplanned_split`. **`[2026-08-27, H5]` That name does not exist in the repository** —
+the *behaviour* ships (the runner refuses a rung on any dispatch-vector or raw `host_ops`
+difference) but as an always-on per-rung refusal, not a policy that can be set or varied. So it
+is not a fallback-policy AXIS the planner can select on, and H5 could not treat it as one. See
+the H5 record later in this document.
 
 ## 4. Phases and gates
 
@@ -265,10 +269,12 @@ is `passed` only if the gate passed under the same plan hash. Study runs default
 | **H2b — `w4_decode` for Qwen3-0.6B** — **DONE 2026-08-26**, see below | The planner's int4 GEMV candidates (head_dim 128, QK-norm) over the existing int4 builders. | verify PASS; decode tok/s against the prediction from H2a's attribution. |
 | **H3 — fewer submissions per token, staged** | (1) re-execute one decode projection artifact across layers; (2) aggregate the two projections per layer into one runlist; (3) aggregate all layers; (4) move KV update + attention on device (the `attn_decode_npu2` kernel generalized to head_dim 128 / GQA 2, device-owned KV layout, context-length parameterization); (5) glue + LM head. | Each step: dispatch vector shows the reduction; verify PASS; the re-execution gate shape (`fused_reexec_gate.py`) extended to N tokens. |
 | **H4 — prefill precision** — **DONE 2026-08-26, a priced NEGATIVE**, see below | `w_bfp16_prefill` through the existing bfp16 GEMM; planner GEMM family gains the entry. | verify PASS; prefill tok/s vs `bf16` at the same ubatch. |
-| **H5 — planner-selected cells (S4)** | Not a Cartesian matrix: `(model, phase, prompt length, ubatch, context start/end, precision plan, power mode, cold/warm, fallback policy)` cells the planner selects plus negative controls; two walks; the standing numbers. | `complete: True`, `compare_roots OK`, every row `passed` or a derived skip, a prediction before each kernel/design experiment. |
+| **H5 — planner-selected cells (S4)** — **DONE 2026-08-27**, see below | Not a Cartesian matrix: `(model, phase, prompt length, ubatch, context start/end, precision plan, power mode, cold/warm, fallback policy)` cells the planner selects plus negative controls; two walks; the standing numbers. | `complete: True`, `compare_roots OK`, every row `passed` or a derived skip, a prediction before each kernel/design experiment. |
 
 H0 and H1a are independent and can run in parallel; H2a needs only H1a's runner; H2b and H3
 need H1a; H4 needs H0; H5 last.
+
+**All six phases have landed.**
 
 **`[2026-08-21]` H0 landed** — `programming_examples/llms/shared/plan/` (`graph.py`, `caps.py`,
 `placement.py`, `plan.py`, `golden/`, `test_plan.py`; pure Python, no `air`), its gate pinned in
@@ -1604,3 +1610,143 @@ remembered per test: a test that leaves `LLAMA32_1B_INT4_BFP16_TILE_N` changed n
 in a single-process suite a leaked width silently weakens every test after it. `bf16` remains every model's default and the bfp16 default width stays 32, because the
 shipped `verify_kernel_cache` ELFs are built at 32 and the geometry check would (correctly) refuse
 a 128 packer against them; flipping the default means rebuilding that cache first.
+
+**`[2026-08-27, revised 2026-08-28 after one Codex round]` H5 landed — the study's last phase**
+(queue item 21; evidence `results/item21-h5-20260827/`; devq **830** compile, **832/833** walks 1–2,
+**837** controls, **839** walks 3–4, **854** the standing pair at HEAD, **856** the controls re-run.
+`PREDICTION.md` mtime 17:35:25 PDT predates devq 830's 17:36:52 by file time. Turbo observed before
+and after every job. **The review round, devq 847, returned `fail` with eight blocking findings;
+three of them changed the result and are folded in below rather than appended.**)
+
+**What "planner-selected" turned out to mean.** Three of the nine axes H5's tuple names — **power
+mode, cold/warm and fallback policy** — do not appear in `llms/shared/plan/` at all: counted over
+`caps.py` / `graph.py` / `placement.py` / `plan.py`, the six modelled axes appear 5–38 times each and
+`cold`, `warm`, `power`, `turbo`, `pmode` appear **zero** times between them. The planner cannot
+select on an axis it does not model, which is what makes the spec's own phrase — "cells the planner
+selects **plus negative controls**" — the right shape.
+
+**One of them has no implementation at all.** §3.7 above says *"Study runs default to
+`refuse_on_unplanned_split`"*. **That identifier exists nowhere in the repository** except those two
+lines. The *behaviour* is implemented — `run_model.worker` raises when the driver's dispatch vector
+or its raw `host_ops` total differs from the plan's — but as an always-on per-rung refusal with no
+alternative branch, not a policy that can be varied to make a cell.
+
+**THE SELECTION HAD TO BE RE-DERIVED, AND THE MEMBERSHIP CHANGED.** The first derivation was not
+applied per cell: its scan hashed the shipped **bf16** caches whatever precision was being evaluated,
+so Qwen `w4_decode`'s recorded set was compared against a bf16 set, and its hand-written list omitted
+one cell entirely. Worse, both scans read `artifact_content_sha` as if it settled comparability. It
+covers ELF bytes and nothing else — item 19's default-on `xrt.run` cache moved latency ~2.2 ms/token
+with plan and ELFs unchanged, which is why `compare_roots.compare_timing` refuses across contracts.
+The rule therefore gains **S1c**: a standing row whose root carries **no `timing` block** predates
+that contract and cannot be rejected on bytes at all. Item 17's and item 14's roots have none.
+
+Re-derived per cell (`rederive_selection.py`, output `evidence/selection_rederived.json`):
+**14 SELECT / 4 REJECT / 1 REJECT-UNRESOLVED**. The tally matches the first derivation's 14/5 and the
+membership does not — a coincidence worth naming, because a surviving tally reads like confirmation:
+
+* the three **Qwen bf16 decode** cells now **REJECT** (plan, bytes and timing contract all stand);
+* the three **Llama-1B-int4 decode** cells now **SELECT** on S1c — so the first derivation's most
+  quotable sentence, *"the rule rejects a whole model"*, was **wrong**;
+* `(llama32_1b_int4, prefill, w_bfp16_prefill)` is **REJECT-UNRESOLVED**: never scanned before, and
+  no bfp16 artifact set resolves today, so S1b cannot be evaluated. An absence of evidence is
+  recorded as such rather than counted with the confident rejections.
+
+**Three selected cells cannot be measured at all, and the reason is structural.** For
+`llama32_1b_int4`, `w4_decode` is `precision_plans[0]` — the *shipped* plan — so `discover_compiled`
+**ignores `--compiled-root` for it by design**; the r=64 item retracted a published null for exactly
+this, having timed the stock cache in four walks while believing otherwise. The stock cache is an
+08-19 build whose `o_gemv_ffn_int4.elf` is 899,920 B (`r = 32`) where HEAD ships `r = 64`. Closing
+this needs a `build_peano` rebuild in place, or a runner change; neither is H5's. Recorded as
+selected-and-unmeasured.
+
+**THE STANDING NUMBERS ARE WALKS 5–6 (devq 854), AT HEAD `20fad8c8`.** Neither earlier pair describes
+HEAD: walks 1–2 timed an *uncommitted* r=64 GEMV, walks 3–4 timed r=32 which was HEAD then and is not
+now, and the shipped Qwen caches were rebuilt by a concurrent agent **between** the pairs
+(`32c496d9…` → `99ef04c6…` at M2048), so the four-walk pooling I published — and the **1237 ± 60**
+restatement of P4/P5 built on it — is **withdrawn**. devq 854 ran compile and both walks in one
+window on purpose.
+
+| cell | walk 5 | walk 6 |
+|---|---|---|
+| Qwen3-0.6B prefill M 512 / 1024 / 2048 (tok/s) | 1265.6 / 1376.6 / 1399.4 | 1275.3 / 1348.9 / 1384.7 |
+| Qwen3-0.6B prefill ubatch 512 over a 1024-token prompt | 1198.1 | 1204.9 |
+| Qwen3-0.6B decode bf16, ctx 512 / 1024 / 2048 *(control arm)* | 12.39 / 10.57 / 7.60 | 11.49 / 10.03 / 7.35 |
+| Qwen3-0.6B decode `w4_decode`, ctx 512 / 1024 / 2048 | 15.42 / 12.90 / 8.51 | 15.38 / 12.49 / 8.57 |
+| Llama-3.2-1B prefill M 2048 | 1745.7 | 1737.4 |
+| Llama-3.2-1B decode, ctx 512 / 1024 / 2048 | 10.99 / 10.17 / 9.00 | 10.94 / 10.23 / 8.95 |
+
+Both `complete: True`, 14 passed + 1 derived skip, `compare_roots` **OK**, 10/10 verify gates, Turbo
+before and after — **and the pair is checked to have timed identical bytes** before `compare_roots`
+is trusted, because `compare_roots` never looks at `timed_artifact_sha` and therefore returns OK for
+two mutually consistent runs on different artifacts. That check is
+`results/item21-h5-20260827/tools/walk_sha_agreement.py`; it is the single most useful thing the
+review produced, and it reproduces the four-walk defect exactly (rc=1 pooled, rc=0 within either
+pair).
+
+**THE PLANNER-ACCURACY HEADLINE WAS COMPUTED OVER ONE MODEL AND IS WRONG ACROSS TWO.** The published
+claim was *"right about the device to within 4 %"*. Recomputed on the clean pair over **both** models:
+
+| cell | planner `est_us` | measured `device_ms` | error |
+|---|---|---|---|
+| Qwen3-0.6B bf16 | 60.9 ms | 60.4–61.2 | **−0.7 % … +0.6 %** |
+| Qwen3-0.6B `w4_decode` | 45.7 ms | 46.9–47.9 | **+2.6 % … +4.7 %** |
+| **Llama-3.2-1B bf16** | **98.7 ms** | **74.6–75.4** | **−23.6 % … −24.4 %** |
+
+**Range −24.4 % to +4.7 %.** The review caught that the w4 half rested on contaminated bytes; the
+larger error was one my own table could not show, because Llama was not in it. It attributes to a
+single constant — `DeviceCaps.gemv_stream_gbs = 32.0`, the only rate in the decode cost model.
+Inverting each cell for the rate that would make the estimate match: Qwen bf16 **32.2 GB/s** (the
+constant is right), Qwen w4 **30.3**, Llama bf16 **46.1 — 44 % above the constant**. So the planner
+is accurate where its one stream constant happens to fit, and **a single constant does not fit across
+weight-set sizes**: the larger, more contiguous stream runs materially faster per byte. That is items
+27 and 30's geometry-dependent read rate arriving on the planner's own constant, and it is the first
+cell where getting it wrong costs 24 % of a prediction.
+
+**What still holds**: the estimate is context-invariant by construction and the measured `device_ms`
+is context-flat too, so the whole context dependence is outside the plan — Qwen bf16 **20.3 → 74.8
+ms**, Qwen w4 **17.9 → 69.6**, Llama bf16 **16.4 → 36.4** from ctx 512 to 2048, i.e. **52–55 %** of a
+Qwen bf16 token at ctx 2048 and **32–33 %** of a Llama one. H0 recorded host attention as unmodelled;
+these are the first measurements of how much.
+
+**The LM head's 10 → 3 launches is real in the structure and below the noise in the result** — the
+four Qwen prefill plans lost 7 launches each (486→479, 486→479, 626→619, 962→955, live-checked on
+device), which is 0.75 ms against 1.17 s. The earlier claim that this *"reproduces the record within
+0.2 %"* was false twice over: 0.2 % is the agreement between H5's own two walks, against item 14's
+record M 1024 is **+1.4 to +2.0 %**; and by H5's own S1c that comparison should not be drawn at all,
+item 14's root having no `timing` block.
+
+**Controls (devq 837, re-run as 856).** NC1 the runner refuses off Turbo 6/6, including the
+fail-open case — an *undeterminable* mode refuses — with an accepting arm so the refusal is not
+vacuous. NC1b `compare_roots` **refuses** a power-mode splice 5/5 on a copy whose CSVs are
+byte-identical to the honest candidate's. NC3 the missing artifact set is a derived skip naming its
+compile command. NC4a a stale artifact set refuses all three w4 rungs (`ArgCountMismatchError`, 7
+args vs 21 — item 14's ELF-is-ground-truth guard) while the bf16 rows pass in the same run.
+**NC4b is the one the other predictions depend on**: three arms through the real worker differing
+only in the planner's view — the unmutated control passes at 57/143/199, `lm_head_rows_per_launch =
+16384` fails at the manifest guard, and `n_layers = 27` reaches and fails the **live dispatch check**
+(*"air_launches (143, 138) … host_ops_total (1856, 1792)"*), so that check demonstrably goes red and
+the `host_ops` clause — the behaviour §3.7 calls `refuse_on_unplanned_split` — goes red with it.
+
+**Two control defects the review found in my own work, fixed in the job rather than the write-up —
+and fixing one of them changed a result.** NC2 had **no assertion at all**: it merely ran `h5-cold`,
+so a cold/warm ratio ≤ 1.05, or `context_loads` staying 0 (the rung never actually cold), would still
+have exited 0. With the assertion in place the repeat run gives cold/warm **1.0061** against the
+first run's 1.068, a third of the warm tokens at or above the cold one, **so P10 MISSES** — and
+without the assertion that run would have been reported green. The *mechanism* survives
+(`context_loads` 1 at warm-up 0, 0 at warm-up 1); the magnitude does not. And the controls job
+**ended `OVERALL RC=1` while I reported it green** — NC4a's expected-to-fail walk ran through the
+ordinary `leg`. The template propagated the failure honestly and the summary did not; an
+expected-failure leg now uses an **inverted** assertion (`xleg`, red when the command succeeds),
+tamper-checked both ways. devq 856 ends RC=1 for the right reason: four controls pass and one
+asserted control fails.
+
+**Gates**: study host tests **741 → 744/744 in 34 modules**, `run_study_host_tests.lit` PASS through
+the real lit runner and verified RED at a wrong pin. The new
+`test_h5_selection_still_fires_where_the_profile_says_it_does` replaces a test that only inspected
+the hard-coded profile — it derives the counts from `shared.plan` (which pulls in no heavy module)
+and asserts both that they are what H5 scored against and that they still **differ** from the
+pre-item-28 counts S1 fired on; verified red against two planner mutations.
+
+**Recorded gate limitations rather than fixed**: `compare_roots` does not check
+`timed_artifact_sha`, so **two mutually consistent contaminated walks return OK** — which is exactly
+what happened here; and the host lit can establish neither NPU results nor artifact provenance.

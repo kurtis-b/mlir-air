@@ -258,3 +258,183 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+#: `[2026-08-28]` Queue item 21, review finding 1. The counts H5's S1 clause
+#: fired on, and the counts P2/P3 are scored against. They are DERIVED from the
+#: planner below, never read from a table -- the first version of this test
+#: inspected only the hard-coded profile, so a planner change that moved the
+#: selection left the same 15 rungs passing and the gate could not tell.
+H5_PLANNER_COUNTS = {
+    # (phase, ubatch, context_end, precision) -> (air_launches, host_submissions)
+    ("qwen3_0_6b", "prefill", 512, 512, "bf16"): (479, 85),
+    ("qwen3_0_6b", "prefill", 1024, 1024, "bf16"): (479, 85),
+    ("qwen3_0_6b", "prefill", 2048, 2048, "bf16"): (619, 85),
+    ("qwen3_0_6b", "prefill", 512, 1024, "bf16"): (955, 169),   # 2 chunks
+    ("qwen3_0_6b", "decode", 1, 2048, "bf16"): (143, 57),
+    ("qwen3_0_6b", "decode", 1, 2048, "w4_decode"): (143, 57),
+    ("llama32_1b", "prefill", 2048, 2048, "bf16"): (328, 49),
+    ("llama32_1b", "decode", 1, 2048, "bf16"): (152, 33),
+}
+
+#: What S1 fired ON: the launch counts the newest passing rows recorded BEFORE
+#: item 28's LM head went 10 launches to 3. If the planner ever agrees with these
+#: again, S1 no longer fires and H5's Qwen-prefill selection is stale.
+H5_PRE_ITEM28_LAUNCHES = {
+    ("qwen3_0_6b", "prefill", 512, 512, "bf16"): 486,
+    ("qwen3_0_6b", "prefill", 1024, 1024, "bf16"): 486,
+    ("qwen3_0_6b", "prefill", 2048, 2048, "bf16"): 626,
+    ("qwen3_0_6b", "prefill", 512, 1024, "bf16"): 962,
+}
+
+
+def _planner_counts(model_id, phase, ubatch, context_end, precision):
+    """The planner's own numbers, through `shared.plan` (pure Python, no `air`,
+    no torch -- checked: it pulls in no heavy module, which is why a host test
+    may call it)."""
+    import sys, os
+    _pe = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    for _p in (_pe, os.path.join(_pe, "llms")):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
+    from shared.plan.graph import decoder_graph, QWEN3_0_6B, LLAMA32_1B
+    from shared.plan.plan import plan as _plan, plan_ubatch_prefill as _ub
+    from shared.plan.placement import Workload
+    spec = {"qwen3_0_6b": QWEN3_0_6B, "llama32_1b": LLAMA32_1B}[model_id]
+    g = decoder_graph(spec)
+    if phase == "decode":
+        p = _plan(g, Workload("decode", 1, context_end, 2048, precision))
+    elif context_end > ubatch:
+        p = _ub(g, context_end, ubatch, ctx=ubatch, precision_plan=precision)
+    else:
+        p = _plan(g, Workload("prefill", ubatch, context_end, ubatch, precision))
+    return p.total_launches, p.total_submissions
+
+
+def test_h5_selection_still_fires_where_the_profile_says_it_does():
+    """`[2026-08-28]` Queue item 21, review finding 1 -- the gate that makes the
+    `h5-cells` profile a claim about the WORLD rather than a transcript of one
+    afternoon.
+
+    H5's S1 clause selected the four Qwen prefill cells because item 28's LM head
+    (10 launches to 3) moved the planner's count away from what the newest passing
+    rows recorded. Two things must therefore stay true, and both are computed from
+    `shared.plan` rather than copied from a table:
+
+      1. the planner's counts are what H5 measured against (P2 and P3 are scored
+         on exactly these numbers), and
+      2. they still DIFFER from the pre-item-28 counts S1 fired on.
+
+    If a later change moves the planner back -- or moves it anywhere else -- this
+    goes red and the selection has to be re-derived, which is precisely what the
+    first version of this test could not detect."""
+    for key, (want_L, want_subs) in H5_PLANNER_COUNTS.items():
+        got_L, got_subs = _planner_counts(*key)
+        assert (got_L, got_subs) == (want_L, want_subs), (
+            f"{key}: planner now says {got_L} launches / {got_subs} submissions, "
+            f"H5 measured and scored against {want_L}/{want_subs}; re-derive the selection")
+    for key, pre in H5_PRE_ITEM28_LAUNCHES.items():
+        got_L, _ = _planner_counts(*key)
+        assert got_L != pre, (
+            f"{key}: the planner agrees with the pre-item-28 count {pre} again, so S1 "
+            f"no longer fires here and H5's Qwen-prefill selection is stale")
+
+
+def test_h5_cells_is_planner_selected_and_carries_a_derived_skip_on_purpose():
+    """`[2026-08-27]` Queue item 21 (doc 56 H5). The spec's own words are
+    "planner-selected cells ... plus negative controls", and the revision at doc
+    56 line 859 changed H5 AWAY from a Cartesian matrix -- so the test that
+    matters is that this profile is NOT one. Over the axes it spans (2 models x
+    2 phases x 4 prompt lengths x 3 ubatches x 3 contexts x 2 precisions) a
+    Cartesian product would be far larger than 15 rungs, and the specific cells
+    absent are the ones whose planner account has not moved.
+
+    `[2026-08-28]` The three Qwen bf16 DECODE rungs are in this profile as the
+    CONTROL ARM of the w4 A/B, not because the rule selected them -- the
+    re-derived selection REJECTS them (plan, bytes and timing contract all
+    stand). That is stated here so the profile cannot be read as claiming they
+    were selected; item 24 established that a precision A/B whose two arms are
+    two sessions measures session drift as much as it measures the precision.
+
+    The `w_bfp16_prefill` Qwen rung is carried DELIBERATELY as a derived skip:
+    H5's gate is "every row `passed` or a derived skip", and while that clause is
+    satisfied vacuously when no skip occurs, a walk with no skip in it cannot
+    DEMONSTRATE that its skips are derived rather than asserted. Its reason must
+    name the command that would make it measurable."""
+    prof = mp.profile("h5-cells")
+    assert prof.models == ("qwen3_0_6b", "llama32_1b"), "two models: the model axis needs more than one"
+    assert prof.precision_plans_used() == ("bf16", "w_bfp16_prefill", "w4_decode")
+    rungs = prof.rungs()
+    assert len(rungs) == 15
+    # NOT a Cartesian matrix: llama gets one prefill M and no w4 arm; qwen gets
+    # no ctx-512/1024 ubatch points and no bf16-vs-w4 crossing on prefill.
+    axes = (len(prof.models) * 2 * 4 * 3 * 3 * 2)
+    assert len(rungs) < axes / 4, f"{len(rungs)} rungs must be far short of the {axes}-cell product"
+    assert [r.case_id for r in rungs if r.model_id == "llama32_1b"] == [
+        "llama32_1b/prefill/M2048/ctx2048/bf16"] + [
+        f"llama32_1b/decode/M2048/ctx{c}/bf16" for c in (512, 1024, 2048)]
+    # the three curves are LABELLED, never inferred
+    by_curve = {}
+    for r in rungs:
+        by_curve.setdefault(r.curve, []).append(r.case_id)
+    assert len(by_curve[mp.UBATCH]) == 1 and by_curve[mp.UBATCH] == ["qwen3_0_6b/prefill/M512/ctx1024/bf16"]
+    assert len(by_curve[mp.KERNEL_SCALING]) == 5 and len(by_curve[mp.DECODE_CONTEXT]) == 9
+
+    # every measured rung must be a cell the planner can actually account for
+    for r in rungs:
+        if r.model_id not in ("qwen3_0_6b", "llama32_1b"):
+            continue
+        key = (r.model_id, r.phase, r.ubatch_tokens, r.context_end, r.precision_plan)
+        if r.precision_plan == "w_bfp16_prefill":
+            continue  # the deliberate skip; the planner refuses it structurally
+        probe = (r.model_id, r.phase, r.ubatch_tokens if r.phase == "prefill" else 1,
+                 r.context_end if r.phase == "prefill" else 2048, r.precision_plan)
+        assert probe in H5_PLANNER_COUNTS, f"{key}: no planner count pinned for a measured rung"
+
+    # No two rungs may share a resume key: the ubatch point at (1024, 1024)
+    # would be the SAME execution as the M=1024 kernel-scaling rung and the same
+    # key, so it is deliberately not a separate cell.
+    keys = {resume.rung_key(r.mode, r.seq, r.extra) for r in rungs}
+    assert len(keys) == 15, "a collapsed key would silently drop a cell"
+
+    # bound to everything the walk actually has, the bfp16 rung is the ONLY skip
+    have = {("qwen3_0_6b", M, "bf16"): {"prefill_cache": f"/c/q{M}", "decode_cache": "/c/qd"} for M in (512, 1024, 2048)}
+    have[("qwen3_0_6b", 2048, "w4_decode")] = {"prefill_cache": "/c/q2048", "decode_cache": "/c/w4d"}
+    have[("llama32_1b", 2048, "bf16")] = {"prefill_cache": "/c/lp", "decode_cache": "/c/ld"}
+    bound = prof.bind(have)
+    skipped = [r for r in bound.rungs() if r.skip_reason]
+    assert [r.case_id for r in skipped] == ["qwen3_0_6b/prefill/M2048/ctx2048/w_bfp16_prefill"]
+    assert "w_bfp16_prefill" in skipped[0].skip_reason
+    assert bound.expected_rows() == {
+        "model_qwen3_0_6b.csv": {"rows": 11, "measured": 10, "skipped": 1},
+        "model_llama32_1b.csv": {"rows": 4, "measured": 4, "skipped": 0},
+    }
+
+
+def test_h5_cold_is_a_control_not_a_cell_and_cannot_move_the_standing_number():
+    """`[2026-08-27]` Queue item 21, the cold/warm control. `plan()` has no
+    cold/warm term -- its cost model is steady state -- so the planner cannot
+    select on that axis and this is a control, not a planner-selected cell.
+
+    It is its own profile for a reason the row key makes unavoidable: the key is
+    (model, phase, ubatch, context_end, precision) and does NOT carry the
+    warm-up count, so a warmup-0 rung inside `h5-cells` would collide with the
+    standing ctx-2048 rung. Folding it in the other way -- setting
+    `decode_warmup = 0` on `h5-cells` itself -- would put the cold token inside
+    the standing 32-token mean, i.e. would move the standing number by the act
+    of measuring the control. Both failures are asserted here."""
+    cold, cells = mp.profile("h5-cold"), mp.profile("h5-cells")
+    assert cold.decode_warmup == 0, "the cold rung's first TIMED token is the first dispatch"
+    assert cells.decode_warmup == 1, "the standing profile keeps its warm-up token"
+    assert len(cold.rungs()) == 1
+    (r,) = cold.rungs()
+    assert (r.model_id, r.phase, r.context_end, r.precision_plan) == ("qwen3_0_6b", "decode", 2048, "bf16")
+    assert r.n_tokens == mp.GATE_N_TOKENS, "the cold rung samples the same 32 tokens as the standing one"
+    # the collision the separate profile avoids, demonstrated rather than asserted
+    standing = [x for x in cells.rungs()
+                if x.model_id == "qwen3_0_6b" and x.phase == "decode"
+                and x.context_end == 2048 and x.precision_plan == "bf16"]
+    assert len(standing) == 1
+    assert resume.rung_key(r.mode, r.seq, r.extra) == resume.rung_key(
+        standing[0].mode, standing[0].seq, standing[0].extra), (
+        "same key by construction -- which is exactly why the control needs its own root")

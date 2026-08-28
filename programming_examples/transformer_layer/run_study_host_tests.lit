@@ -694,6 +694,22 @@
 // chokepoint rather than at a call site. No toolchain: the call sites are read
 // with ast, since the builders import air and this suite must not.
 //
+// `[2026-08-27]` 741 -> 744, queue item 21 (doc 56 H5): tests over the
+// `h5-cells` / `h5-cold` model profiles -- that the selected cell set is NOT a
+// Cartesian product of its own axes, that its one derived skip is carried on
+// purpose, and that the cold/warm control shares a resume key with the standing
+// rung, which is why it is a separate profile rather than a knob.
+//
+// `[2026-08-28]` +1 from item 21's review round. Two corrections in that text:
+// H5's "every row passed or a derived skip" clause is NOT vacuous when no skip
+// occurs -- it is satisfied -- so the deliberate skip is a CONTROL (it lets a
+// walk demonstrate that its skips are derived), not something the clause
+// requires. And the first two tests only inspected the hard-coded profile, so a
+// planner change that moved the selection left the same 15 rungs passing:
+// `test_h5_selection_still_fires_where_the_profile_says_it_does` now derives the
+// counts from `shared.plan` (pure Python, pulls in no heavy module) and asserts
+// both that they are what H5 scored against AND that they still differ from the
+// pre-item-28 counts S1 fired on. Verified red against two planner mutations.
 // `[2026-08-27]` 728 -> 741 in 34 modules, queue item 22: the bfp16 prefill N
 // tile becomes a PARAMETER, and the seven new tests are all about the one thing
 // that makes that dangerous -- the packed weight BO is 1.125 B/elt at EVERY
@@ -742,4 +758,4 @@
 // under one label; and the driver runs that preflight BEFORE compiling and
 // writes the declaration only when it actually compiled something.
 // RUN: python3 %S/study/run_host_tests.py | FileCheck %s
-// CHECK: study host tests: 741/741 passed in 34 modules
+// CHECK: study host tests: 744/744 passed in 34 modules
