@@ -12,6 +12,7 @@ No test-framework dependency — see `test_bo_pool.py` for why.
     python shared/infra/test_dispatch.py
 """
 
+import pathlib
 import sys
 import tempfile
 import traceback
@@ -1020,24 +1021,23 @@ def test_run_sequence_deliberately_rebuilds_its_runs_every_call():
 
 
 # ---------------------------------------------------------------------------
-# Herd rows and the lock-race coupling (queue item 28)
+# The lock-race fix: one family needs it, one is broken by it (queue item 28)
 # ---------------------------------------------------------------------------
 #
-# A herd occupying more than one CORE ROW hangs the device in `matvec.py`'s GEMV
-# form -- `ERT_CMD_STATE_TIMEOUT`, item 27 section 6.1, bisected devq 673/674;
-# only `use_lock_race_condition_fix` unblocks it. The row count is the builder's
-# and the lock fix is the caller's, so the rule is enforced where both are in
-# scope: `KernelCache.compile_and_cache`.
+# `matvec.py`'s multi-row herd HANGS without aircc's
+# `--use-lock-race-condition-fix` (ERT_CMD_STATE_TIMEOUT, item 27 section 6.1,
+# devq 673/674). `[2026-08-27]` and the same flag FAULTS the device on the
+# transformer-layer study's QKV split-cast form -- `RunlistExecutionError`,
+# `fatal_error_exception_pc = 0x00000000`, devq 812 and devq 813 with item 31
+# excluded. `off_gemm_*` and `rl_gemm_*` take it and are fine. So it is a
+# transform with preconditions, not insurance, and the rule is a POSITIVE
+# statement about the one family measured to need it: the builder marks its own
+# herd and nothing else is touched.
 #
-# `[2026-08-27, review finding 1]` THE RULE FAILS CLOSED, and these tests exist
-# because the first version did not. It filtered on `link_with == "mv.o"` and
-# turned every unreadable geometry into "one row", so the same builder reached
-# through a renamed object -- and this tree renames micro-kernel objects as a
-# matter of course (`mv_heads_hd128.o`) -- sailed past and would have hung. The
-# discriminator that replaced it is not structural, deliberately: measured on the
-# shipped modules, the prefill GEMM herds share ONE L2 A panel per column across
-# all four rows, the very shape item 27 blamed, and they do not hang. So nothing
-# in the IR separates the hazardous form, and the default is to refuse.
+# Four earlier drafts tried to decide this from outside the builder -- a
+# `link_with` filename, then three shapes of allow-list -- and all four were
+# unsound. These tests pin what replaced them, including that no injection
+# reaches an unmarked module.
 #
 # Driven with a stand-in module so the suite keeps its no-toolchain property
 # (`test_profiles._module_constant`'s rule). Real IR goes through it on every
@@ -1078,7 +1078,7 @@ class _FakeValue:
 
 
 class _FakeModule:
-    """Just enough of `air.ir.Module` for `herd_row_geometry` to walk it."""
+    """Just enough of `air.ir.Module` for the herd walk."""
 
     def __init__(self, ops):
         class _Operation:
@@ -1090,8 +1090,10 @@ class _FakeModule:
         self.operation = _Operation()
 
 
-def _fake_herd(cols, rows, n_deps=0, n_operands=3, sym="herd_0", link="mv.o",
-               seg=True, const_rows=True):
+def _fake_herd(cols, rows, marked=False, n_deps=0, n_operands=3, sym="herd_0",
+               link="mv.o", seg=True, const_rows=True):
+    from shared.infra.dispatch import LOCK_RACE_FIX_REQUIRED_ATTR
+
     sizes = [_FakeValue(_fake_const(cols)),
              _FakeValue(_fake_const(rows) if const_rows
                         else _FakeOp("air.wait_all"))]
@@ -1102,44 +1104,90 @@ def _fake_herd(cols, rows, n_deps=0, n_operands=3, sym="herd_0", link="mv.o",
         attrs.append(("operandSegmentSizes", [n_deps, 2, n_operands]))
     if link is not None:
         attrs.append(("link_with", f'"{link}"'))
+    if marked:
+        attrs.append((LOCK_RACE_FIX_REQUIRED_ATTR, "unit"))
     return _FakeOp("air.herd", attrs, operands)
 
 
-def test_herd_row_geometry_reads_every_herd():
-    from shared.infra.dispatch import herd_row_geometry
+def test_the_marked_family_gets_the_fix_whatever_it_links():
+    """The mark comes from `matvec.py` itself, so a renamed or copied
+    micro-kernel object cannot escape it -- which is the defect that killed
+    draft 1, where the rule was `link_with == "mv.o"`."""
+    from shared.infra.dispatch import ensure_lock_fix_for_marked_herds as ensure
 
-    assert herd_row_geometry(_FakeModule([_fake_herd(8, 1)])) == [("herd_0", 1)]
-    mixed = _FakeModule([_fake_herd(8, 1, sym="a"), _fake_herd(8, 4, sym="b"),
-                         _fake_herd(8, 2, sym="c")])
-    assert herd_row_geometry(mixed) == [("a", 1), ("b", 4), ("c", 2)]
-    # a launch-only module is not an error
-    assert herd_row_geometry(_FakeModule([_FakeOp("air.launch")])) == []
-
-
-def test_herd_row_geometry_skips_the_async_dependency_operands():
-    """The sizes are found through `operandSegmentSizes`, not by position, so
-    the async-token form does not read a dependency as a herd size."""
-    from shared.infra.dispatch import herd_row_geometry
-
-    assert herd_row_geometry(_FakeModule([_fake_herd(8, 2, n_deps=3)])) == [("herd_0", 2)]
+    for link in ("mv.o", "down_mv.o", "mv_heads_hd128.o", None):
+        module = _FakeModule([_fake_herd(8, 4, marked=True, link=link)])
+        kwargs, rows, applied = ensure("any_name_at_all", module, {})
+        assert kwargs["use_lock_race_condition_fix"] is True, link
+        assert rows == 4 and applied is True, link
 
 
-def test_unreadable_geometry_raises_rather_than_reading_as_one_row():
-    """`[review finding 1]` The old version returned 1 here, which is the worst
-    possible direction for a hang hazard: it made an undecodable module look
-    safe. Every failure mode must now surface."""
-    from shared.infra.dispatch import HerdGeometryUndecidable, herd_row_geometry
+def test_an_unmarked_module_is_returned_untouched():
+    """THE MEASURED CONTRAINDICATION. Injecting the flag into the study's QKV
+    split-cast artifacts faults the device (devq 812/813), and `off_gemm_*` /
+    `rl_gemm_*` tolerate it but were never shown to need it. So an unmarked
+    module keeps exactly the kwargs its caller wrote -- no injection, for any
+    name, at any row count."""
+    from shared.infra.dispatch import ensure_lock_fix_for_marked_herds as ensure
 
-    for label, mod in (
-        ("no operandSegmentSizes", _FakeModule([_fake_herd(8, 4, seg=False)])),
-        ("non-constant row size", _FakeModule([_fake_herd(8, 4, const_rows=False)])),
-    ):
-        try:
-            herd_row_geometry(mod)
-        except HerdGeometryUndecidable:
-            pass
-        else:
-            raise AssertionError(f"{label} was decoded rather than refused")
+    for rows in (1, 2, 4):
+        for name in ("blk_qkv_proj_4096x768", "fused_qkv_proj_1024x768",
+                     "off_gemm_4096x768x768", "rl_gemm_up_4096x768x3072",
+                     "o_ffn_qwen", "flash_attn", "o_gemv_ffn"):
+            module = _FakeModule([_fake_herd(8, rows, marked=False)])
+            given = {"omit_pingpong": "", "output_format": "elf"}
+            kwargs, _r, applied = ensure(name, module, given)
+            assert kwargs == given, (name, rows)
+            assert applied is False, (name, rows)
+
+
+def test_a_mixed_module_is_decided_by_the_mark_not_the_row_count():
+    """A stitched ELF can hold both forms. One marked herd is enough; unmarked
+    multi-row herds beside it do not make the difference either way."""
+    from shared.infra.dispatch import ensure_lock_fix_for_marked_herds as ensure
+
+    mixed = _FakeModule([_fake_herd(8, 4, marked=False, sym="gemm"),
+                         _fake_herd(8, 2, marked=True, sym="gemv"),
+                         _fake_herd(8, 1, marked=False, sym="small")])
+    kwargs, rows, applied = ensure("stitched", mixed, {})
+    assert kwargs["use_lock_race_condition_fix"] is True
+    assert applied is True and rows == 4
+
+    unmarked = _FakeModule([_fake_herd(8, 4, marked=False, sym="gemm"),
+                            _fake_herd(8, 4, marked=False, sym="gemm2")])
+    kwargs, _rows, applied = ensure("stitched", unmarked, {})
+    assert kwargs == {} and applied is False
+
+
+def test_the_async_token_form_does_not_read_a_dependency_as_a_herd_size():
+    """`[2026-08-27, restored]` The sizes are found THROUGH `operandSegmentSizes`
+    (`operands[seg[0] + index]`), never by position, so an `air.herd` carrying
+    async dependency tokens does not read a dependency as its row count.
+
+    Round 6 rewrote this module and dropped the only test that passed
+    `n_deps > 0`; the helper kept the parameter but nothing exercised it, so
+    positional indexing would have passed every remaining test while reading the
+    WRONG operand on the real async form -- a row count that was never read,
+    which is the defect this whole item is about. This test discriminates: with
+    three dependency tokens, positional indexing reads 0 rather than 2.
+    """
+    from shared.infra.dispatch import (ensure_lock_fix_for_marked_herds,
+                                       herd_row_geometry)
+
+    assert herd_row_geometry(_FakeModule([_fake_herd(8, 2, n_deps=3)])) == [
+        ("herd_0", 2)
+    ]
+    # and the decision path reads the same geometry through the same seam
+    _kw, rows, applied = ensure_lock_fix_for_marked_herds(
+        "async_form", _FakeModule([_fake_herd(8, 2, marked=True, n_deps=3)]), {}
+    )
+    assert (rows, applied) == (2, True)
+
+
+def test_a_module_that_cannot_be_walked_is_refused_not_guessed():
+    """Neither applying nor withholding the transform is defensible when the
+    module cannot be read: one direction hangs, the other faults."""
+    from shared.infra.dispatch import ensure_lock_fix_for_marked_herds as ensure
 
     class _Explodes:
         @property
@@ -1147,167 +1195,190 @@ def test_unreadable_geometry_raises_rather_than_reading_as_one_row():
             raise RuntimeError("no bindings here")
 
     try:
-        herd_row_geometry(_Explodes())
-    except HerdGeometryUndecidable:
-        pass
-    else:
-        raise AssertionError("an unwalkable module was decoded rather than refused")
-
-
-def test_a_multi_row_herd_needs_a_lock_fix_whatever_object_it_links():
-    """`[review finding 1]` THE REGRESSION TEST. The old guard keyed on
-    `link_with == "mv.o"`, so the same `matvec.py` dataflow reached through a
-    copied or renamed object -- `down_mv.o`, a per-model tagged variant, which
-    is how this tree names micro-kernels anyway -- reached four rows with no
-    lock fix and hung. The object name is not consulted at all now."""
-    from shared.infra.dispatch import herd_row_geometry, require_lock_fix
-
-    for link in ("mv.o", "down_mv.o", "mv_heads_hd128.o", None):
-        geom = herd_row_geometry(_FakeModule([_fake_herd(8, 4, link=link)]))
-        try:
-            require_lock_fix("a_new_gemv", geom, {"omit_pingpong": ""})
-        except ValueError as exc:
-            assert "ERT_CMD_STATE_TIMEOUT" in str(exc)
-            assert "HERD_ROWS_MEASURED_GREEN" in str(exc)
-        else:
-            raise AssertionError(f"link_with={link!r} was accepted without a lock fix")
-
-
-def test_undecidable_geometry_is_treated_as_hazardous():
-    from shared.infra.dispatch import require_lock_fix
-
-    try:
-        require_lock_fix("mystery", None, {})
+        ensure("mystery", _Explodes(), {})
     except ValueError as exc:
         assert "could not be read" in str(exc)
+        assert "FAULTS" in str(exc) or "faults" in str(exc)
     else:
-        raise AssertionError("an undecidable module was let through")
-    # ... but a caller that already asked for the fix is entitled to proceed,
-    # and gets `None` rather than a row count nobody measured.
-    assert require_lock_fix("mystery", None, {"use_lock_race_condition_fix": True}) is None
+        raise AssertionError("an unreadable module was guessed at")
 
 
-def test_either_lock_fix_version_satisfies_the_coupling():
-    from shared.infra.dispatch import herd_row_geometry, require_lock_fix
-
-    geom = herd_row_geometry(_FakeModule([_fake_herd(8, 4)]))
-    assert require_lock_fix("k", geom, {"use_lock_race_condition_fix": True}) == 4
-    assert require_lock_fix("k", geom, {"use_lock_race_condition_fix_v2": True}) == 4
-    # a key that is present but FALSE is not a lock fix
-    try:
-        require_lock_fix("k", geom, {"use_lock_race_condition_fix": False})
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("use_lock_race_condition_fix=False was accepted")
-
-
-def test_only_measured_green_kernels_are_exempt_and_only_by_exact_name():
-    """The shipped prefill stitchers, flash attention and the bf16 decode
-    cascade all hold `8 x 4` herds and ship without a lock fix -- membership was
-    MEASURED (`herd_rows_sweep.py`), not assumed. Prefix matching is confined to
-    the one generated family, so a new kernel cannot inherit a neighbour's
-    record by sharing a stem."""
+def test_an_undecodable_size_is_hazardous_not_single_row():
+    """`[2026-08-27, review round 6]` THE DEFECT THIS ITEM CHASED FIVE TIMES,
+    found once more inside the decode that was reported as fail-closed: a herd
+    whose row count could not be decoded was being REPORTED AS ONE ROW. A value
+    that says "small and safe" where nothing was established is the whole family
+    of bugs. Undecodable geometry must refuse."""
     from shared.infra.dispatch import (
-        HERD_ROWS_MEASURED_GREEN,
+        HerdGeometryUndecidable,
+        ensure_lock_fix_for_marked_herds as ensure,
         herd_row_geometry,
-        require_lock_fix,
+        max_herd_rows,
     )
 
-    geom = herd_row_geometry(_FakeModule([_fake_herd(8, 4)]))
-    for name in ("o_ffn_qwen", "rms_gemms_rope", "flash_attn", "o_gemv_ffn"):
-        assert name in HERD_ROWS_MEASURED_GREEN, name
-        assert require_lock_fix(name, geom, {}) == 4
-    # the generated FA family, by prefix
-    assert require_lock_fix("flash_attn_ctx1024", geom, {}) == 4
-    # and nothing else inherits a stem
-    for name in ("o_ffn_something_new", "flash_attn2", "lm_head_gemv"):
+    for marked in (True, False):
+        module = _FakeModule([_fake_herd(8, 4, marked=marked, const_rows=False)])
         try:
-            require_lock_fix(name, geom, {})
+            herd_row_geometry(module)
+        except HerdGeometryUndecidable:
+            pass
+        else:
+            raise AssertionError(f"marked={marked}: an undecodable size was decoded")
+        assert max_herd_rows(module) is None, marked
+        try:
+            ensure("k", module, {})
+        except ValueError as exc:
+            assert "could not be read" in str(exc), marked
+        else:
+            raise AssertionError(f"marked={marked}: an undecodable size was guessed at")
+
+    # the same for a herd with no readable size segment at all
+    for kwargs in ({}, {"use_lock_race_condition_fix": True}):
+        module = _FakeModule([_fake_herd(8, 4, marked=True, seg=False)])
+        try:
+            ensure("k", module, kwargs)
         except ValueError:
             pass
         else:
-            raise AssertionError(f"{name} inherited an exemption it was not given")
+            raise AssertionError("a herd with no size segment was accepted")
 
 
-def test_the_landed_lm_head_is_not_exempt_it_carries_the_fix():
-    """`lm_head_gemv` is the one kernel item 28 moved to multi-row, and it is
-    deliberately NOT on the green list: it passes because its backend carries
-    the lock fix, so removing that flag fails loudly instead of silently."""
-    from shared.infra.dispatch import (
-        HERD_ROWS_MEASURED_GREEN,
-        herd_row_geometry,
-        require_lock_fix,
+def test_nothing_reports_a_row_count_it_did_not_read():
+    """The reporting paths must not manufacture a number either: a mixed module
+    with one undecodable herd is unknown, not `max(the ones that worked)`."""
+    from shared.infra.dispatch import HerdGeometryUndecidable, herd_row_geometry, max_herd_rows
+
+    mixed = _FakeModule([_fake_herd(8, 2, sym="ok"),
+                         _fake_herd(8, 4, sym="bad", const_rows=False)])
+    assert max_herd_rows(mixed) is None
+    try:
+        herd_row_geometry(mixed)
+    except HerdGeometryUndecidable:
+        pass
+    else:
+        raise AssertionError("a partially undecodable module returned a geometry")
+
+
+def test_an_explicit_false_on_a_marked_herd_is_refused():
+    """The one refusal that earned its place. `GEMV_K2048_BACKEND` carried
+    `False` as a legacy default while `o_gemv_ffn` inherited it -- a real find,
+    and the reason this check exists rather than a silent override."""
+    from shared.infra.dispatch import ensure_lock_fix_for_marked_herds as ensure
+
+    module = _FakeModule([_fake_herd(8, 4, marked=True)])
+    for key in ("use_lock_race_condition_fix", "use_lock_race_condition_fix_v2"):
+        try:
+            ensure("k", module, {key: False})
+        except ValueError as exc:
+            assert "ERT_CMD_STATE_TIMEOUT" in str(exc)
+        else:
+            raise AssertionError(f"{key}=False was silently overridden")
+    # ... and on an UNMARKED module it is simply the caller's business
+    plain = _FakeModule([_fake_herd(8, 4, marked=False)])
+    kwargs, _rows, applied = ensure("k", plain, {"use_lock_race_condition_fix": False})
+    assert kwargs == {"use_lock_race_condition_fix": False} and applied is False
+
+
+def test_a_caller_that_already_asked_for_the_fix_is_not_double_applied():
+    from shared.infra.dispatch import ensure_lock_fix_for_marked_herds as ensure
+
+    module = _FakeModule([_fake_herd(8, 4, marked=True)])
+    for asked in ({"use_lock_race_condition_fix": True},
+                  {"use_lock_race_condition_fix_v2": True}):
+        kwargs, rows, applied = ensure("k", module, asked)
+        assert kwargs == asked and applied is False and rows == 4
+
+
+def test_the_mark_is_the_only_thing_that_injects_the_flag():
+    """`[2026-08-27, review round 6]` Round 5 claimed the mark was the only
+    trigger while `backend_presets.with_herd_rows` was still injecting the flag
+    from a ROW COUNT. Over-broad injection is exactly what faulted the device
+    (devq 812/813), so there must be no second trigger -- and the claim has to be
+    true rather than nearly true, because the mode lits' green depends on it
+    being causally what fixed them."""
+    import shared.infra.backend_presets as bp
+
+    assert not hasattr(bp, "with_herd_rows"), (
+        "with_herd_rows is a second, row-based injection trigger; the mark is "
+        "supposed to be the only one"
     )
-
-    assert "lm_head_gemv" not in HERD_ROWS_MEASURED_GREEN
-    geom = herd_row_geometry(_FakeModule([_fake_herd(8, 4)]))
-    assert require_lock_fix("lm_head_gemv", geom, {"use_lock_race_condition_fix": True}) == 4
-
-
-def test_with_herd_rows_derives_the_flag_from_the_row_count():
-    """The EASY half of the coupling: one call at the call site, so a caller
-    cannot set the row count and forget the flag. Accepts the per-partition
-    sequence the mixed LM head passes."""
-    from shared.infra.backend_presets import LM_GEMV_BACKEND, with_herd_rows
-
-    assert "use_lock_race_condition_fix" not in with_herd_rows({"a": 1}, 1)
-    assert with_herd_rows({"a": 1}, 2)["use_lock_race_condition_fix"] is True
-    assert with_herd_rows({"a": 1}, (4,) * 9 + (2,))["use_lock_race_condition_fix"] is True
-    assert with_herd_rows({"a": 1}, (1, 1)) == {"a": 1}
-    assert with_herd_rows({"use_lock_race_condition_fix": False}, 1) == {
-        "use_lock_race_condition_fix": False
-    }
-    # it copies rather than mutating -- the presets are module-level dicts that
-    # every model shares
-    before = dict(LM_GEMV_BACKEND)
-    with_herd_rows(LM_GEMV_BACKEND, 4)
-    assert LM_GEMV_BACKEND == before
+    # no preset may SET the flag (prose about why is fine and wanted)
+    code = [ln for ln in pathlib.Path(bp.__file__).read_text().splitlines()
+            if not ln.lstrip().startswith("#")]
+    offenders = [ln for ln in code if "use_lock_race_condition_fix" in ln]
+    assert not offenders, (
+        f"a preset sets the flag: {offenders}. The compile chokepoint supplies "
+        "it, and only for a marked herd"
+    )
+    # and no preset dict actually carries the key at runtime
+    for name in dir(bp):
+        value = getattr(bp, name)
+        if isinstance(value, dict):
+            assert "use_lock_race_condition_fix" not in value, name
 
 
-def test_the_compile_chokepoint_refuses_before_it_compiles_anything():
-    """`compile_and_cache` must raise BEFORE constructing a backend. The whole
-    point is that the caller gets a message instead of a device timeout after a
-    multi-minute compile."""
+def test_there_is_no_exemption_mechanism_left_to_audit():
+    """Four drafts died on ways of deciding this from outside the builder. If
+    one comes back, this is the test that should have to be deleted first."""
+    import shared.infra.dispatch as d
+
+    for gone in ("HERD_ROWS_MEASURED_GREEN", "HERD_ROWS_GREEN_PREFIXES",
+                 "MEASURED_MULTI_ROW", "HERD_ROW_HAZARD_OBJECTS",
+                 "_herd_rows_recorded_green", "require_lock_fix",
+                 "check_herd_rows_lock_fix", "ensure_lock_fix_for_multi_row"):
+        assert not hasattr(d, gone), f"{gone} came back"
+    src = pathlib.Path(d.__file__).read_text()
+    body = src[src.index("def ensure_lock_fix_for_marked_herds"):]
+    body = body[:body.index("\ndef ")]
+    assert "startswith" not in body and "link_with" not in body
+
+
+def test_the_compile_chokepoint_applies_the_rule_before_it_compiles_anything():
+    """The flag must reach the BACKEND, not merely be computed."""
     import shared.infra.cache as cache_mod
     from shared.infra.cache import KernelCache
 
-    calls = []
+    seen = {}
 
-    class _Boom:
+    class _Stop(Exception):
+        pass
+
+    class _Backend:
         def __init__(self, **kwargs):
-            calls.append(kwargs)
-            raise AssertionError("a backend was constructed despite the refusal")
+            seen.update(kwargs)
+            raise _Stop
 
     with tempfile.TemporaryDirectory() as d:
         cache = KernelCache(cache_dir=d)
-        module = _FakeModule([_fake_herd(8, 2)])
+        module = _FakeModule([_fake_herd(8, 4, marked=True)])
         real_prepare = cache_mod.prepare_air_project
         cache_mod.prepare_air_project = lambda **kw: None
         try:
+            import air.backend.xrt as xrt_mod
+
+            real_backend = xrt_mod.XRTBackend
+            xrt_mod.XRTBackend = _Backend
             try:
-                cache.compile_and_cache("a_new_gemv", module, {"output_format": "elf"})
-            except ValueError as exc:
-                assert "a_new_gemv" in str(exc)
-            else:
-                raise AssertionError("the multi-row compile was not refused")
+                cache.compile_and_cache("anything", module, {"output_format": "elf"})
+            except _Stop:
+                pass
+            finally:
+                xrt_mod.XRTBackend = real_backend
+        except ImportError:
+            return
         finally:
             cache_mod.prepare_air_project = real_prepare
-    assert calls == [], calls
+    assert seen.get("use_lock_race_condition_fix") is True, seen
+    assert cache.launch_counts["anything"]["lock_race_fix_applied"] is True
 
 
 def test_the_row_count_is_recorded_in_the_manifest_only_when_it_is_known():
-    """The ELF does not carry the herd geometry and the cache name does not
-    encode it, so an A/B that recompiles the same name at a different row count
-    would otherwise be invisible. Additive key; and an unknown geometry records
-    NOTHING rather than a number nobody measured."""
     from shared.infra.dispatch import LaunchCounts
 
     counts = LaunchCounts(air_launches=10, herd_launches=10).as_dict()
-    # as_dict itself is unchanged -- the key is added by compile_and_cache, so
-    # nothing that compares LaunchCounts values moves
     assert counts == {"air_launches": 10, "herd_launches": 10}
     counts["herd_rows"] = 2
+    counts["lock_race_fix_applied"] = True
     assert counts.get("air_launches") == 10 and counts.get("herd_rows") == 2
 
 

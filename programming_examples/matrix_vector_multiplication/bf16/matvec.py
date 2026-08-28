@@ -330,6 +330,33 @@ def build_module(
 
                 herd_body.attributes["link_with"] = StringAttr.get(link_with)
 
+                # `[2026-08-27]` queue item 28: THE BUILDER MARKS ITS OWN HAZARD.
+                #
+                # At herd_rows > 1 this herd is the form item 27 measured to hang
+                # without aircc's `--use-lock-race-condition-fix`
+                # (ERT_CMD_STATE_TIMEOUT, devq 673/674). Nothing downstream can
+                # recognise that form on its own: a filename cannot (the tree
+                # renames micro-kernel objects routinely, and item 28's first
+                # guard let a renamed one through), and neither can the IR shape
+                # (the shipped prefill GEMM herds have the same
+                # single-writer/multi-reader L2 panel and do NOT hang). So the
+                # builder that produces the form says so, and
+                # `KernelCache.compile_and_cache` supplies the flag when it sees
+                # this mark and for no other reason.
+                #
+                # It is emitted ONLY at herd_rows > 1, so the default IR is
+                # byte-identical and item 27's `control/ir_sha.py` still reads
+                # IDENTICAL over all eight shipped call-site shapes.
+                #
+                # NOT a general "multi-row herds need this" claim -- the opposite
+                # is measured: applying the flag to the transformer-layer study's
+                # GEMM herds FAULTS the device (devq 812/813,
+                # fatal_error_exception_pc = 0x00000000). The flag is a transform
+                # with preconditions, not free insurance, so it is scoped to the
+                # one family where it was measured to help.
+                if herd_rows > 1:
+                    herd_body.attributes["air.lock_race_fix_required"] = UnitAttr.get()
+
                 # L2→L3: C
                 dma_memcpy_nd(
                     l3_c_data_s,

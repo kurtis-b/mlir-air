@@ -256,7 +256,10 @@ def _o_gemv_ffn_backend(verbose=False):
         "omit_while_true_loop": False,
         "output_format": "elf",
         "instance_name": "o_gemv_ffn",
-        "use_lock_race_condition_fix": False,
+        # `[2026-08-27]` queue item 28: no explicit False. This cascade's stage 2
+        # (`matvec_swiglu_rms`, n_cascade=4) is an 8 x 4 herd, so the compile
+        # chokepoint supplies the lock-race fix; writing False here would be
+        # refused as a contradiction rather than silently overridden.
     }
 
 

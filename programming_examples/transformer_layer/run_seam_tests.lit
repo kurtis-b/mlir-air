@@ -44,36 +44,56 @@
 // evicted pool's BOs alive -- defeating exactly the per-dispatch pool eviction
 // `pattern/offload` is defined by. Driven against a fake pyxrt, no device.
 //
-// `[2026-08-26]` 42 -> 53, queue item 28: the herd-rows lock-race coupling. A
-// herd occupying more than ONE CORE ROW hangs the device in `matvec.py`'s GEMV
-// form (ERT_CMD_STATE_TIMEOUT, item 27 section 6.1, bisected devq 673/674 --
-// only `use_lock_race_condition_fix` unblocks it). The row count belongs to the
-// builder and the lock fix to the caller, so the rule is enforced where both
-// are in scope, `KernelCache.compile_and_cache`, and it REFUSES before a
-// backend is constructed rather than letting the device time out after a
-// multi-minute compile.
+// `[2026-08-26]` 42 -> 54, queue item 28: the lock-race fix. `matvec.py`'s
+// multi-row herd HANGS without aircc's `--use-lock-race-condition-fix`
+// (ERT_CMD_STATE_TIMEOUT, item 27 section 6.1, devq 673/674).
 //
-// `[2026-08-27]` THE RULE FAILS CLOSED, and the tests that say so are the
-// point of the count going 52 -> 53. Item 28's first guard filtered on
-// `link_with == "mv.o"` and converted every unreadable geometry into "one
-// row" -- so the same builder reached through a renamed micro-kernel object
-// (this tree renames them routinely: `mv_heads_hd128.o`,
-// `mv_int4_bf16_gemv_gs128_k1024.o`) sailed past and would have hung, which is
-// the worst possible direction for a hazard guard. There is no honest
-// structural discriminator either: MEASURED on the shipped modules, the
-// prefill GEMM herds share one L2 A panel per column across all four rows --
-// the very shape item 27 blamed -- and they do not hang. So the default is to
-// refuse, geometry that cannot be decoded counts as multi-row, and the
-// exemption is a registry of kernels MEASURED green (membership itself
-// measured, by building every shipped model's modules). Pinned here: the
-// geometry read including the async-token operand form; every unreadable form
-// raising instead of reading as one row; a multi-row herd refused whatever
-// object it links; undecidable geometry refused; both fix versions accepted;
-// exemption only by exact name plus the one generated `flash_attn_ctx*`
-// family; the landed `lm_head_gemv` NOT exempt but carrying the fix; and the
-// refusal happening ahead of any compile.
+// `[2026-08-27]` AND THE SAME FLAG FAULTS THE DEVICE ELSEWHERE, which is the
+// finding that settled four rounds of argument about where to apply it.
+// Injecting it into the transformer-layer study's QKV split-cast artifacts
+// gives `RunlistExecutionError` with `fatal_error_exception_pc = 0x00000000`
+// on `blk_qkv_proj_4096x768` and `fused_qkv_proj_1024x768` (devq 812; devq 813
+// with item 31 excluded reproduces it, so it is the injection and nothing
+// else), while `off_gemm_*` and `rl_gemm_*` take the same flag and pass. So it
+// is a transform with preconditions, not free insurance, and applying it more
+// widely is NOT the safe direction.
+//
+// The rule is therefore a positive statement about the one family measured to
+// need it: `matvec.py` marks its own herd `air.lock_race_fix_required` at
+// herd_rows > 1, the compile chokepoint supplies the flag for that mark and
+// for no other reason, and every unmarked module goes through untouched. Four
+// earlier drafts tried to decide this from outside the builder -- a
+// `link_with` filename, then three shapes of allow-list -- and all four were
+// unsound, the last of them because a geometry sweep cannot establish safety.
+// Pinned here: the marked family recognised whatever object it links (the
+// rename that defeated draft 1); an unmarked module returned byte-identical
+// for every study and llms kernel name at 1, 2 and 4 rows; a mixed stitched
+// module decided by the mark rather than the row count; a module that cannot
+// be walked REFUSED rather than guessed, because one direction hangs and the
+// other faults; an explicit False on a marked herd refused (the
+// `GEMV_K2048_BACKEND` legacy default this caught); and that no exemption
+// symbol exists.
+//
+// `[2026-08-27]` 53 -> 54, review round 6. Two more properties, both of which
+// were BELIEVED and false one round earlier: geometry that cannot be fully
+// decoded refuses rather than reporting ONE ROW (the item's own defect class,
+// found inside the decode reported as fail-closed), and the builder-emitted
+// mark is the ONLY thing that injects the flag -- `backend_presets`'
+// `with_herd_rows` was a second, row-count-driven trigger and is deleted, with
+// a test that no preset sets or carries the flag.
+//
+// `[2026-08-27]` 54 -> 55, RESTORED coverage. Round 6's rewrite replaced ten
+// tests with eleven and every removal had a successor but one: nothing was left
+// that passed `n_deps > 0`. The helper kept the parameter, so the async-token
+// `air.herd` form -- the one real modules actually use -- went unexercised, and
+// `_herd_size_operand` indexes THROUGH `operandSegmentSizes`
+// (`operands[seg[0] + index]`) precisely to skip those dependency operands.
+// Positional indexing would have passed the whole suite while reading a
+// dependency token as the ROW COUNT: a number reported without being read,
+// which is the defect this item exists to remove. Confirmed by mutation --
+// with `operands[index]` the suite goes 54/55 and the one red test is this one.
 // RUN: python3 %S/../llms/shared/infra/test_dispatch.py | FileCheck %s --check-prefix=DISPATCH
-// DISPATCH: 53/53 passed
+// DISPATCH: 55/55 passed
 //
 // `[2026-08-21]` Doc 56 H0: the analytical planner's host gates -- the two golden
 // graphs pinned, each model's plan reproducing its shipped ELF sequence / launch

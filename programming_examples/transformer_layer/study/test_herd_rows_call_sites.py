@@ -148,9 +148,19 @@ def test_the_enabled_call_site_states_its_row_count_in_one_place():
     assert len(builder) == 1
     rows_kw = _kwarg(builder[0], "herd_rows")
     assert rows_kw is not None and getattr(rows_kw.value.func, "id", "") == "lm_head_herd_rows"
-    wrapped = _calls(tree, "with_herd_rows")
-    assert len(wrapped) == 1, "the LM-head backend must derive its lock fix from the row count"
-    assert getattr(wrapped[0].args[1].func, "id", "") == "lm_head_herd_rows"
+    # `[2026-08-27]` the backend derives NOTHING any more. `matvec.py` marks its
+    # own herd at herd_rows > 1 and the compile chokepoint supplies the lock-race
+    # fix for that mark alone; a row-count-driven helper in the presets was a
+    # SECOND injection trigger and is deleted, because over-broad injection is
+    # what faulted the device (devq 812/813).
+    assert not _calls(tree, "with_herd_rows"), (
+        "with_herd_rows is deleted; the builder-emitted mark is the only trigger"
+    )
+    src = open(os.path.join(_LLMS, rel), encoding="utf-8").read()
+    code = [ln for ln in src.splitlines() if not ln.lstrip().startswith("#")]
+    assert not [ln for ln in code if "use_lock_race_condition_fix" in ln], (
+        "this driver sets the lock-race flag by hand; the chokepoint owns it"
+    )
 
 
 def test_the_partitioning_is_derived_from_the_row_count():
@@ -223,18 +233,29 @@ def test_the_enabled_shapes_are_above_the_measured_byte_threshold():
         assert mb(rows, emb) < BF16_CROSSOVER_MB[2], (rows, emb)
 
 
-def test_the_lock_fix_helper_is_the_one_that_ships():
-    """`with_herd_rows` is pure Python and safe to import here; it is the easy
-    half of the coupling and the call site above is asserted to use it."""
-    from shared.infra.backend_presets import LM_GEMV_BACKEND, with_herd_rows
+def test_no_preset_or_driver_carries_the_lock_race_flag():
+    """`[2026-08-27]` One trigger, in one place. The presets used to expose
+    `with_herd_rows`, which injected the flag from a row count -- a second way in
+    beside the builder's mark, and over-broad injection is what faulted the
+    device on the study's QKV split-cast form (devq 809/812/813)."""
+    import importlib
 
-    assert with_herd_rows(LM_GEMV_BACKEND, 1).get("use_lock_race_condition_fix") is False
-    assert with_herd_rows(LM_GEMV_BACKEND, 2)["use_lock_race_condition_fix"] is True
-    assert with_herd_rows(LM_GEMV_BACKEND, (4,) * 9 + (2,))["use_lock_race_condition_fix"] is True
+    bp = importlib.import_module("shared.infra.backend_presets")
+    assert not hasattr(bp, "with_herd_rows")
+    for name in dir(bp):
+        value = getattr(bp, name)
+        if isinstance(value, dict):
+            assert "use_lock_race_condition_fix" not in value, name
 
 
 def test_the_two_caps_pull_opposite_ways_and_the_tail_can_fall_between_them():
-    """Halving a tail's `herd_rows` for divisibility DOUBLES its broadcast
+    """`[2026-08-27, restored]` Round 6 deleted this test with no justification
+    in its diff and no replacement anywhere, in a round about the lock-race flag
+    -- while the invariant it pins stayed live: the assert is still in
+    `qwen3_0_6b_decode.py`'s `_lm_partitions`, and the README still says "the
+    driver now asserts it". Restored verbatim; the original docstring follows.
+
+    Halving a tail's `herd_rows` for divisibility DOUBLES its broadcast
     repeat, so `M % (tile_m*herd_m*r) == 0` and `repeat <= 255` can be
     unsatisfiable together. It does not bite at Qwen3-0.6B's m_input 8 (the
     20864 tail reads 162) and it DOES at m_input 4 (325), which is why the

@@ -759,13 +759,28 @@ GEMV used 8 of 32 cores" is not general either: the FFN GEMV has used 32 all alo
 cascade** rather than an output-stationary row split. **And item 27's explanation does not
 discriminate**: the prefill GEMM herds take an L2 A panel of `memref<8x1x64x256xbf16, 1>` — one
 slab per column read by all four rows, the very single-writer/multi-reader shape it blamed — and
-do not hang. So the guard **fails closed** instead of naming a mechanism it cannot identify: a
-multi-row herd needs the lock fix unless its kernel name is on a registry of kernels MEASURED
-green (membership itself measured, by building every shipped model's modules), geometry that
-cannot be decoded counts as multi-row, and the micro-kernel filename is not consulted at all —
-an earlier draft filtered on `mv.o` and would have let the same builder through a renamed object.
-It refuses before a backend is constructed; `backend_presets.with_herd_rows()` is the call-site
-half.
+do not hang.
+
+**`[2026-08-27, review round 6]` The name-registry guard described in earlier drafts of this
+section did NOT ship, and neither did its call-site half `backend_presets.with_herd_rows()`.
+Both are deleted** — see `results/item28-land-herd-rows-20260826/RESULTS.md` §9g. Two rounds of
+evidence killed them, and the reason is worth keeping: **a registry has to answer for a kernel it
+has never heard of, and both answers are wrong.** Treat the unknown as needing the fix and you
+inject into forms the flag FAULTS — devq 812/813 measured exactly that on the QKV split-cast
+form. Treat it as safe and the rule fails open on the one case it exists for. `with_herd_rows()`
+was worse than redundant: it derived the flag from a **row count**, a second injection trigger
+that reached every `8 × 4` module in the tree.
+
+What ships is **narrow and positive**. `matvec.py` stamps `air.lock_race_fix_required` on the
+herd it builds above one row; `ensure_lock_fix_for_marked_herds` supplies the flag **iff that
+mark is present**, before a backend is constructed, and refuses a caller that contradicts it with
+an explicit `False`. **A module with no mark is returned untouched** — `o_ffn_qwen`,
+`rms_qkv_qknorm_rope` and `o_gemv_ffn`, all `8 × 4`, come back `fix=None`, verified on the real
+modules rather than argued. And geometry that cannot be decoded does **not** "count as
+multi-row": it **raises**, because neither applying the flag nor withholding it is defensible for
+a module that was never read. An earlier version reported such a herd as **one row** — the same
+assert-what-was-never-established defect this whole item is about, sitting inside the decode that
+had been reported as fail-closed.
 
 **§4's `o_gemv_ffn_int4` −15 % is re-priced and is really −3.1 %.** §4 priced the cascade as ONE
 6.04 MB call; it is THREE `air.launch` ops of 1.098 / 3.293 / 1.647 MB, each paying its own fixed

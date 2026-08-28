@@ -503,22 +503,29 @@ class KernelCache:
             output_binary_name: Base name for output binary
         """
         from air.backend.xrt import XRTBackend
-        from shared.infra.dispatch import LaunchCounts, check_herd_rows_lock_fix
+        from shared.infra.dispatch import LaunchCounts, ensure_lock_fix_for_marked_herds
 
         self.launch_counts[name] = LaunchCounts.from_module(mlir_module).as_dict()
-        # `[2026-08-26]` queue item 28: a multi-row herd HANGS on device without
-        # a lock-race fix (item 27 section 6.1). Row count and backend kwargs are
-        # only both in scope here, so this is where the coupling is enforced --
-        # a refusal before the compile, never a timeout after it.
-        rows = check_herd_rows_lock_fix(name, mlir_module, backend_kwargs)
-        # Self-describing artifacts: the ELF does not carry the herd geometry
-        # and the cache name does not encode it, so an A/B that recompiles the
-        # same name at a different row count would otherwise be invisible in the
-        # manifest. Additive key -- every reader uses .get(). `None` means the
-        # geometry could not be read, and the key is then left out rather than
-        # recorded as a number nobody measured.
+        # `[2026-08-26]` queue item 28: the multi-row `matvec.py` herd HANGS on
+        # device without a lock-race fix (item 27 section 6.1). The module and
+        # the backend kwargs are only both in scope here, so this is where the
+        # flag is supplied -- and `[2026-08-27]` ONLY for that family, which the
+        # builder marks itself. Injecting it more widely is measured HARMFUL:
+        # devq 812/813 fault the device on the block/fused QKV split-cast form.
+        # A module with no marked herd goes through untouched.
+        backend_kwargs, rows, applied = ensure_lock_fix_for_marked_herds(
+            name, mlir_module, backend_kwargs
+        )
+        # Self-describing artifacts: the ELF carries neither the herd geometry
+        # nor the flags it was built with, so an A/B that recompiles the same
+        # name would otherwise be invisible in the manifest. Additive keys --
+        # every reader uses .get(). `rows=None` means the geometry could not be
+        # read, and the key is then left out rather than recorded as a number
+        # nobody measured.
         if rows is not None:
             self.launch_counts[name]["herd_rows"] = rows
+        if applied:
+            self.launch_counts[name]["lock_race_fix_applied"] = True
         self._log(f"Compiling {name}...")
         # Int4 ELFs need the AWQ GEMV micro-kernel staged alongside the bf16
         # objects. Detect from kernel name so existing call sites don't need
@@ -593,7 +600,7 @@ class KernelCache:
         taken from `entries` rather than from dict iteration so it is explicit.
         """
         from air.backend.xrt import XRTBackend, XRTCompileArtifact
-        from shared.infra.dispatch import LaunchCounts, check_herd_rows_lock_fix
+        from shared.infra.dispatch import LaunchCounts, ensure_lock_fix_for_marked_herds
 
         if not entries:
             return
@@ -640,7 +647,11 @@ class KernelCache:
         chained, kernels = "", {}
         for i, (name, module, kwargs) in enumerate(entries):
             self.launch_counts[name] = LaunchCounts.from_module(module).as_dict()
-            check_herd_rows_lock_fix(name, module, kwargs)
+            kwargs, rows, applied = ensure_lock_fix_for_marked_herds(name, module, kwargs)
+            if rows is not None:
+                self.launch_counts[name]["herd_rows"] = rows
+            if applied:
+                self.launch_counts[name]["lock_race_fix_applied"] = True
             self._log(f"Compiling {name} into the shared xclbin...")
             backend = XRTBackend(**dict(kwargs, xclbin_input=chained))
             t0 = time.time()

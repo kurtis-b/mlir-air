@@ -251,12 +251,18 @@ def _rms_qkv_qknorm_rope_gemv_backend(verbose=False):
 # byte for byte.
 #
 # A value > 1 REQUIRES aircc's `--use-lock-race-condition-fix` or the device
-# hangs with ERT_CMD_STATE_TIMEOUT (item 27 section 6.1); `_lm_gemv_backend`
-# derives that flag from this same constant through
-# `backend_presets.with_herd_rows`, and `KernelCache.compile_and_cache` fails
-# closed if it is ever missing -- `lm_head_gemv` is deliberately NOT on
-# `dispatch.HERD_ROWS_MEASURED_GREEN`, so dropping the flag here is a refusal
-# rather than a hang.
+# hangs with ERT_CMD_STATE_TIMEOUT (item 27 section 6.1). `[2026-08-27, review
+# round 6]` The flag is NOT derived from this constant, and the comment that
+# used to stand here described a rule that was WITHDRAWN: it said every
+# multi-row herd gets the flag "with no exemption list", which is what devq
+# 812/813 measured FAULTING the device on the QKV split-cast form. What
+# actually happens is narrower and does not consult this constant at all --
+# `matvec.py`, which builds this kernel, stamps `air.lock_race_fix_required` on
+# any herd it emits above one row, and `KernelCache.compile_and_cache` supplies
+# the flag iff that mark is on the module. So `lm_head_gemv` is covered because
+# of what its BUILDER emitted (verified on the real module), not because of
+# anything written here; a herd built some other way at rows > 1 would NOT be
+# covered. Stating it at the call site keeps the requirement legible.
 _LM_TILE_M = 8
 _LM_HERD_M = 8
 _LM_M_INPUT = 8
@@ -495,7 +501,10 @@ def _o_gemv_ffn_backend(verbose=False):
         "omit_while_true_loop": False,
         "output_format": "elf",
         "instance_name": "o_gemv_ffn",
-        "use_lock_race_condition_fix": False,
+        # `[2026-08-27]` queue item 28: no explicit False. This cascade's stage 2
+        # (`matvec_swiglu_rms`, n_cascade=4) is an 8 x 4 herd, so the compile
+        # chokepoint supplies the lock-race fix; writing False here would be
+        # refused as a contradiction rather than silently overridden.
     }
 
 
@@ -508,23 +517,18 @@ def _o_gemv_ffn_int4_backend(verbose=False):
 
 
 def _lm_gemv_backend(verbose=False):
-    # `[2026-08-26]` queue item 28: `with_herd_rows` adds
-    # use_lock_race_condition_fix iff the head takes more than one core row.
-    # A multi-row herd without it does not fail -- it HANGS
-    # (ERT_CMD_STATE_TIMEOUT, item 27 section 6.1, devq 673/674). Deriving the
-    # flag from the row count is the reason the two cannot drift apart here;
-    # `compile_and_cache` refuses if some other path ever lets them.
-    from shared.infra.backend_presets import with_herd_rows
-
-    return with_herd_rows(
-        {
-            "verbose": verbose,
-            "omit_while_true_loop": False,
-            "output_format": "elf",
-            "instance_name": "lm_head_gemv",
-        },
-        lm_head_herd_rows(_LM_PARTS),
-    )
+    # `[2026-08-27]` queue item 28: this dict says NOTHING about the lock-race
+    # fix, on purpose. `matvec.py` marks its own herd at `herd_rows > 1` and
+    # `KernelCache.compile_and_cache` supplies the flag for that mark -- one
+    # trigger, in one place. A row-count-driven helper used to live here too,
+    # and a second trigger is how the flag reached kernels it faults (devq
+    # 812/813).
+    return {
+        "verbose": verbose,
+        "omit_while_true_loop": False,
+        "output_format": "elf",
+        "instance_name": "lm_head_gemv",
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -60,11 +60,13 @@ def build_lm_head_gemv_module(
     `rows % (tile_m * herd_m * R) == 0` -- Qwen3-1.7B's 4480-row tail divides by
     128 but not by 256, so it caps at 2 while the 16384-row partitions take 4.
 
-    **A caller that sets `herd_rows > 1` MUST compile with
-    `use_lock_race_condition_fix`** or the device hangs with
-    `ERT_CMD_STATE_TIMEOUT` (item 27 section 6.1). Use
-    `backend_presets.with_herd_rows()` to derive the flag from the same number;
-    `KernelCache.compile_and_cache` fails closed if it is missing.
+    A partition built at `herd_rows > 1` carries `matvec.py`'s
+    `air.lock_race_fix_required` mark, and `KernelCache.compile_and_cache`
+    supplies aircc's `--use-lock-race-condition-fix` for it -- without which the
+    device hangs (`ERT_CMD_STATE_TIMEOUT`, item 27 section 6.1). Callers set
+    nothing: the mark is the only trigger, because the same flag FAULTS other
+    herd forms (devq 812/813) and a second, row-count-driven trigger is how it
+    reached them.
 
     Rows are worth taking only above a byte threshold -- item 27 section 5.2
     measured 9.06 MB (2 rows) and 20.82 MB (4 rows) for bf16, against +49.7 /
