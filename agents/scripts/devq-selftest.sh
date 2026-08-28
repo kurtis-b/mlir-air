@@ -2,7 +2,17 @@
 # devq-selftest.sh -- prove the four scheduling properties of devq.sh with sleep
 # jobs and NO device.  Runs against a throwaway DEVQ_DIR and a throwaway device
 # lock so it never touches the real queue or the real NPU lock.
+#
+# Run it from a PLAIN shell.  If DEVQ_JOB_ID is set -- which it is inside any
+# queued devq job -- tests 5 and 7 take devq's nesting and bypass paths and fail
+# for environmental reasons rather than real ones.  This unsets it rather than
+# leaving a confusing red for the next person to debug.
 set -uo pipefail
+if [ -n "${DEVQ_JOB_ID:-}" ]; then
+  printf 'devq-selftest: DEVQ_JOB_ID=%s is set; unsetting it (tests 5 and 7 probe the nesting refusal)\n' \
+    "$DEVQ_JOB_ID" >&2
+  unset DEVQ_JOB_ID
+fi
 
 DEVQ=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/devq.sh
 ROOT=$(mktemp -d /tmp/devq-selftest.XXXXXX)
@@ -159,6 +169,121 @@ if ( exec 7>>"$DEVQ_NPU_LOCK" && flock -n -x 7 ) 2>/dev/null; then
 else
   bad "preflight left the device lock held; it must only ever ask"
 fi
+
+# TEST 8 exists because devq records a job's exit code FAITHFULLY -- so a script
+# that swallows a leg's status makes the job read done/0 with every leg red. That
+# happened in four scripts and burned three device slots (devq 806/810/814: six
+# profile legs at rc=2, job done/0).
+#
+# The first version of this test PASSED ON A BROKEN TEMPLATE -- a review found
+# that `leg x -- bash -c 'false | true'` exited 0 and every assertion here was
+# still green. So each case below is a concrete input that was measured failing
+# BEFORE the corresponding fix, not a restatement of the template's comments.
+echo "TEST 8: new-job writes a skeleton that cannot exit 0 on red legs"
+JOBSH="$ROOT/gen-job.sh"
+JR="$ROOT/jr"
+# gen LEGS BODY : regenerate the skeleton with EXPECT_LEGS=LEGS and BODY as its legs
+gen() {
+  rm -f "$JOBSH"
+  "$DEVQ" new-job "$JOBSH" "selftest generated" >/dev/null 2>&1
+  sed -i "s/^EXPECT_LEGS=0 /EXPECT_LEGS=$1 /" "$JOBSH"
+  python3 - "$JOBSH" "$2" <<'PY'
+import io, sys
+p, body = sys.argv[1], sys.argv[2]
+s = io.open(p).read()
+old = "# leg build -- make -C some/dir\n# leg verify -- python3 some/check.py"
+assert s.count(old) == 1, "skeleton lost its leg placeholder"
+io.open(p, "w").write(s.replace(old, body))
+PY
+}
+runjob() { RC=0; OUT=$(R="$JR" bash "$JOBSH" 2>&1) || RC=$?; }
+
+if [ -x "$JOBSH" ] 2>/dev/null || "$DEVQ" new-job "$JOBSH" "t" >/dev/null 2>&1; then
+  [ -x "$JOBSH" ] && ok "new-job writes an executable script" || bad "new-job did not write an executable script"
+fi
+# the refusal must also leave the existing file BYTE-IDENTICAL, not merely return 2
+BEFORE=$(md5sum < "$JOBSH")
+RC=0; "$DEVQ" new-job "$JOBSH" >/dev/null 2>&1 || RC=$?
+check "$RC == 2" "new-job REFUSES to overwrite an existing job script (rc=$RC)"
+[ "$(md5sum < "$JOBSH")" = "$BEFORE" ] && ok "the refused overwrite left the existing script untouched" \
+  || bad "new-job modified the file it refused to overwrite"
+
+# a DANGLING symlink is not "absent": cat > would create the target through it
+rm -f "$ROOT/dangle" "$ROOT/dangle-target"
+ln -s "$ROOT/dangle-target" "$ROOT/dangle"
+RC=0; "$DEVQ" new-job "$ROOT/dangle" >/dev/null 2>&1 || RC=$?
+if [ "$RC" -ne 0 ] && [ ! -e "$ROOT/dangle-target" ]; then
+  ok "new-job refuses a dangling symlink without creating its target"
+else
+  bad "new-job followed a dangling symlink (rc=$RC, target exists: $([ -e "$ROOT/dangle-target" ] && echo yes || echo no))"
+fi
+# an unwritable target must not be reported as written
+RC=0; "$DEVQ" new-job /proc/devq-selftest-job >/dev/null 2>&1 || RC=$?
+check "$RC != 0" "new-job reports failure when it cannot create the file (rc=$RC)"
+# a TITLE is not sed replacement syntax: & would expand, | would abort the substitution
+rm -f "$ROOT/t-amp.sh"; "$DEVQ" new-job "$ROOT/t-amp.sh" 'A&B|C' >/dev/null 2>&1
+case $(sed -n 2p "$ROOT/t-amp.sh") in "# A&B|C") ok "a TITLE containing & and | is written verbatim";;
+  *) bad "TITLE mangled: $(sed -n 2p "$ROOT/t-amp.sh")";; esac
+
+# --- the generated script's own accounting -------------------------------------
+gen 0 "leg green -- true"
+runjob; check "$RC != 0" "an untouched EXPECT_LEGS=0 skeleton is RED, not a clean exit 0 over nothing"
+
+gen oops "leg green -- true"
+runjob; check "$RC != 0" "a MALFORMED EXPECT_LEGS is RED rather than failing open (rc=$RC)"
+case $OUT in *"not a number"*) ok "the malformed-count refusal names the value";;
+              *) bad "a malformed EXPECT_LEGS did not say so: $OUT";; esac
+
+gen 2 "leg green -- true
+leg red -- false"
+runjob; check "$RC != 0" "one green leg and one RED leg exits non-zero (rc=$RC)"
+case $OUT in *"### red rc=1"*) ok "the failing leg is named in the log with its status";;
+              *) bad "the log does not name the failing leg: $OUT";; esac
+
+# rc=2 is the status the motivating incident actually had (devq 806/810/814).
+# An implementation that only accumulated rc==1 would pass the `false` case above.
+gen 1 "leg two -- bash -o pipefail -c 'exit 2'"
+runjob; check "$RC == 2" "a leg failing with rc=2 propagates as 2, not just 'nonzero-if-1' (rc=$RC)"
+
+# pipefail is NOT inherited by a child shell; this exact input exited 0 before the fix
+gen 1 "leg piped -- bash -c 'false | true'"
+runjob; check "$RC != 0" "a pipeline inside a child-shell leg is RED (pipefail handed to the child)"
+case $OUT in *"### piped rc=0"*) bad "the child-shell pipeline still reports rc=0";;
+              *) ok "the child-shell pipeline leg records a failing status";; esac
+
+# an empty leg does no work and must not count as a passing one
+gen 1 "leg empty --"
+runjob; check "$RC != 0" "a leg with NO command is a failure, not a free pass (rc=$RC)"
+
+# a leg's status must survive a subshell -- a shell variable would not
+gen 2 "leg one -- true & leg two -- true & wait"
+runjob; check "$RC == 0" "backgrounded legs still COUNT (status kept in a file, not a variable)"
+case $OUT in *"legs run: 2"*) ok "both backgrounded legs reached the tally";;
+              *) bad "backgrounded legs were lost from the tally: $OUT";; esac
+
+# an EXIT trap that calls exit would replace the status wholesale
+gen 1 "trap 'exit 0' EXIT
+leg red -- false"
+runjob; check "$RC != 0" "an EXIT trap calling exit cannot turn a red job green (rc=$RC)"
+
+# fewer legs than declared, and MORE legs than declared, are both wrong
+gen 2 "leg only -- true"
+runjob; check "$RC != 0" "running FEWER legs than declared is RED even when each one passed"
+case $OUT in *"LEG COUNT WRONG"*) ok "the leg-count refusal says what it counted";;
+              *) bad "a short leg count did not name itself: $OUT";; esac
+gen 1 "leg a -- true
+leg b -- true"
+runjob; check "$RC != 0" "running MORE legs than declared is RED too (an -lt check would miss this)"
+
+# and the both-green case must still pass, or the template is merely failing closed
+gen 2 "leg a -- true
+leg b -- true"
+runjob; check "$RC == 0" "two green legs exit 0 (the template does not fail closed on everything)"
+
+# a toolchain env that did not load means nothing below it measured what it claims
+gen 1 "leg a -- true"
+RC=0; OUT=$(TLENV=/nonexistent-tlenv R="$JR" bash "$JOBSH" 2>&1) || RC=$?
+check "$RC != 0" "an unloadable toolchain env is RED rather than silently unset (rc=$RC)"
 
 echo
 printf 'RESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
