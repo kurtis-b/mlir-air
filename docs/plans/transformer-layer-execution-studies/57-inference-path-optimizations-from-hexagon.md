@@ -1129,6 +1129,280 @@ transfer is the one §6 gives elsewhere and doc 56 §4's H3 block now quantifies
 boundary-bound before they are MAC-bound (16.1 ms of boundaries against a 25.7 ms weight stream),
 so activation quantization is priced *after* the boundary work, not before it.
 
+## 5c. The lock-race flag, characterized — and two claims this project treats as established are wrong `[2026-08-28]`
+
+**Why this document.** The flag is a mechanism on the `llms/` inference path: it is applied by
+`KernelCache.compile_and_cache`, gated by `shared/infra/dispatch.py`, and the family it exists
+for is `matvec.py`'s multi-row GEMV — the LM head and the decode cascade of §5 items 5b–5d.
+Doc 56 is the analytical planner and the study refactor; nothing here is planner work.
+
+`programming_examples/llms/shared/infra/dispatch.py` carried, until today, this:
+
+> THE OPEN QUESTION, and it is one item rather than two: **neither direction is characterized.**
+> Nobody knows why the `mv.o` multi-row form hangs without the flag, nor why the QKV split-cast
+> form faults with it.
+
+One direction is now characterized. The other **did not reproduce** — which is deliberately
+the weaker claim, and is written as the weaker claim throughout: these runs show the failure
+does not occur on this tree under these conditions, not that it never occurred. See the end
+of §5c.1 for why the stronger claim is unavailable.
+
+### 5c.1 Correction 1 — the flag does not fault the QKV form; that direction does not reproduce
+
+Nine device arms **all PASS**. Five of them were flag-built; the other four are deliberate
+no-flag controls (`full_off`, `gemm_off`, `full_off_ppall`, `blockctl`):
+
+| job | arms | result |
+|---|---|---|
+| devq **850** | `full_off`, `full_on`, `gemm_off`, `gemm_on`, `full_on_ppall`, `full_off_ppall`, `full_on_ppL2` | **7/7 PASS**, including `blk_qkv_proj_4096x768` built WITH the flag |
+| devq **853** | `blockctl` (no injection), `blockinj` (flag scoped to `blk_qkv_proj`) through the study's own `make check-block` → `run_block` → `cache.run_sequence` **runlist** path — the exact path devq 812 died on | **both PASS** |
+
+The flag really reached those compiles, and that is checked by artifact rather than asserted:
+all four devq-850 flag arms carry **24 zero-length dummy BDs** in their `aie.air.mlir`, and
+for the three that have a matching control the pairing is +24 total BDs exactly
+(`full_on` 328 vs `full_off` 304; `gemm_on` 232 vs `gemm_off` 208; `full_on_ppall` 232 vs
+`full_off_ppall` 208). `full_on_ppL2` (280 BDs, 24 dummies) has **no matching off arm**, so the
+pairwise assertion is unavailable for it and only the dummy count is evidence. All seven
+devq-850 ELF hashes are distinct, and `full_on` is **1,217,608 bytes** against `full_off` at
+**1,210,696 bytes** — the same two sizes an independent bare-`aircc` build produced (devq 845).
+The control size is also the exact byte size of the study's own cached
+`coarse_cache/blk_qkv_proj_4096x768.elf`, so the harness builds the study's artifact.
+
+**The devq-853 block-path arm is weaker evidence than the devq-850 arms, and is not auditable
+from preserved artifacts.** `lockfix-runblock.sh` saved only the run transcript; the temporary
+worktree was removed after the run, and neither block transcript records an ELF size, hash or
+dummy-BD count. The two byte sizes above belong to devq 845/850, **not** to the ELFs devq 853
+dispatched. What the block transcripts do establish, from the run's own log: the probe line
+fired (`use_lock_race_condition_fix=True injected into blk_qkv_proj_4096x768`), the artifact
+was genuinely **recompiled** rather than reused (`== compiling blk_qkv_proj_4096x768 ==`,
+8.6 s), and the layer completed and compared clean. Anyone re-running this should preserve the
+ELF hash and dummy-BD count per arm.
+
+**This is load-bearing beyond this item.** Commit `58fe8af7` narrowed the lock-race guard to a
+builder-emitted mark, and its stated justification was that this form *faults* with the flag.
+**The guard is still right** — narrow and positive is safe either way, and there is still no
+evidence the flag is *needed* outside `matvec.py` — **but its justification is unsupported.**
+Nothing should cite "it faults the QKV form" again; the surviving reason is "no measured need,
+and a measured cost".
+
+**What this does not establish.** Round 4's tree is gone (the injection was never committed),
+so nobody can say whether devq 812/813 was the flag plus something else, or never the flag.
+The claim being withdrawn is "the flag contraindicates this builder family", not "812/813 did
+not happen".
+
+**And the recorded symptom was wrong.** devq 812/813 is `ERT_CMD_STATE_TIMEOUT` with
+`ctx_pc = 0x28B060AD` and `fatal_error_type`, `fatal_error_exception_type`,
+`fatal_error_exception_pc`, `fatal_error_app_module` **all `0x00000000`** — i.e. *no fatal
+error was recorded*, not "a null exception PC, which is what a core running into unprogrammed
+memory looks like". It is a **hang**, with the same `ctx_pc` as the mv hang of item 27 §6.1.
+Both directions of this item were always the same symptom.
+
+### 5c.2 Correction 2 — item 27's "the IR shape cannot discriminate" was a conflation
+
+The record says the prefill GEMM herds "have the same single-writer/multi-reader L2 panel and
+do not hang", and concluded that only the builder can identify the hazard. That conflated
+**read by 4 cores** with **read by 4 DMA channels**. At the memtile they are different objects:
+
+```
+mv bf16 rows=2   aie.flow(%mem_tile_0_1, DMA : 1, %tile_0_2, DMA : 1)
+                 aie.flow(%mem_tile_0_1, DMA : 2, %tile_0_3, DMA : 1)      TWO channels,
+                 memtile BDs at offset 0 / 8192, ONE shared lock pair      disjoint sub-regions
+
+every 8x4 GEMM   aie.flow(%mem_tile_0_1, DMA : 1, %tile_0_2, DMA : 0)
+                 aie.flow(%mem_tile_0_1, DMA : 1, %tile_0_3, DMA : 0)
+                 aie.flow(%mem_tile_0_1, DMA : 1, %tile_0_4, DMA : 0)
+                 aie.flow(%mem_tile_0_1, DMA : 1, %tile_0_5, DMA : 0)      ONE broadcast channel
+```
+
+**The property, stated so it predicts.** In the post-`air-to-aie` memtile DMA program, for each
+L2 buffer count the distinct `(direction, physical channel)` endpoints. **Two or more on one
+side** means those channels share a single *counting* semaphore, and nothing binds a credit to
+a channel: a channel whose BD chain re-arms can take a peer's credit, deliver the wrong
+sub-region and starve the peer — `ERT_CMD_STATE_TIMEOUT`.
+
+| form | consumer channels | producer channels | measured |
+|---|---|---|---|
+| mv bf16 `herd_rows=1` | 1 | 1 | PASS (devq 674) |
+| mv bf16 `herd_rows=2` | **2** | 2 | **HANG** (devq 673/674) |
+| mv bf16 `herd_rows=4` | **4** | 4 | **HANG** (devq 673) |
+| mv int4 `herd_rows=2` | **2** | 2 | PASS (devq 676) |
+| mv int4 `herd_rows=4` | **4** | 4 | PASS (devq 676) |
+| `off_gemm_*` drain 8x4 | 1 (broadcast) | 4 | PASS |
+| QKV fused-cast GEMM 8x4 | 1 (broadcast) | 4 | PASS |
+| `blk_qkv_proj_4096x768`, 4 launches | 1 (broadcast) | 4 | PASS |
+| shipped Qwen3-0.6B prefill stitcher 8x4, **96 L2 buffers** | 1 (broadcast) | 4 | PASS |
+
+So the IR shape **does** separate the hazardous family from every shipped GEMM herd, and a
+property test on it would have refused none of them.
+
+**Necessary but not sufficient.** The rule was written down and used to predict, in advance and
+in writing, that the int4 AWQ GEMV hangs at `herd_rows` 2 and 4 — its IR was inspected first
+(`%buf71` read by MM2S0 at offset 0 and MM2S1 at offset 4288, one shared pair, filled by one
+S2MM releasing ×2: byte-for-byte the bf16 topology), *then* the recorded logs were opened.
+**Measured PASS at 1, 2 and 4** (devq 676). The prediction failed and the first version of the
+rule was falsified. Fan-out is necessary for the hang; it is not sufficient.
+
+### 5c.3 The int4 GEMV: a hazard I claimed and then withdrew
+
+**An earlier revision of this section claimed a live hazard here. It was wrong, and the
+correction is recorded rather than quietly deleted, because the wrong version was circulated.**
+
+The claim was that `matvec_int4_packed.py` ships a multi-row form carrying the exposed topology
+while setting `use_lock_race_condition_fix=False` explicitly. The shipped builder has no such
+form:
+
+* `matvec_int4_packed.build_module` takes **no `herd_rows` parameter** and hard-codes
+  `@herd(name="matvec_h", sizes=[N_CORES, 1])` (`matvec_int4_packed.py:265`) — always one row.
+* devq 676's int4 rows-2/4 artifacts were produced by item 27's **evidence-only**
+  `results/item27-herd-rows-20260826/gemv_builder_rows.py`, whose own header says it differs
+  precisely in that "the herd is `sizes=[N_COLS, N_ROWS]` instead of `[N_CORES, 1]`". They are
+  not the shipped kernel.
+* `matvec_int4_packed.py:376` and `:411` are backend settings on the shipped **one-row** CLI
+  path, where the flag has nothing to act on.
+
+So the explicit `False` exposes **no live multi-row int4 kernel today**. What is true, and the
+reason to leave a note here at all: *if* a multi-row int4 form is ever built, that explicit
+`False` becomes a hazard on a form with the §5c.2 topology. If such a builder marks its herd the
+way `matvec.py` does, the guard refuses the contradiction at compile time — that refusal already
+exists and already caught `GEMV_K2048_BACKEND`'s legacy `False`. If it does not mark its herd,
+nothing catches it.
+
+**And the two GEMV forms are not structurally identical, so the earlier "identical topology,
+therefore timing" reasoning does not hold either.** They share the fan-out topology of §5c.2 —
+same consumer-channel counts, same shared counting semaphore, same acquire/release values — but
+they differ in a way the preserved evidence records and the earlier text overlooked
+(`scratchpad-rescue/lockfix-PREDICTION.md:51`):
+
+| form | rotating memtile channels (no flag) | rotation depth |
+|---|---|---|
+| mv bf16 `herd_rows=2` / `=4` | **0** of 48 | none |
+| mv int4 `herd_rows=2` | **24** of 48 | 2 |
+| mv int4 `herd_rows=4` | **40** of 80 | 2 |
+
+A two-deep rotation interleaves each consumer's access across two buffers with separate lock
+pairs, which is a plausible reason the race is harder to win in the int4 form. That is a
+hypothesis, not a result — but it means the bf16/int4 divergence has a live structural candidate
+and must not be attributed to timing alone. It is carried in §5c.8 as open.
+
+### 5c.4 What the flag actually does, and what it costs
+
+The brief for this item asserted the flag's only effect is
+`insertDummyChannelOpsForL2Memrefs`. It has **three** effects, and that is not the load-bearing
+one:
+
+| # | site | effect |
+|---|---|---|
+| 1 | `AIRToAIESchedulingUtils.cpp:1398` (`getLockForDMA`) | **the load-bearing one** — an entirely different memtile lock-allocation policy: without the flag every BD on one memtile buffer shares one lock pair with fan-scaled acquire/release values; with it, pairs are matched on (air.channel symbol, physical DMA channel) plus a passive-direction rule |
+| 2 | `AIRToAIEPass.cpp:4760` (`insertDummyChannelOpsForL2Memrefs`) | balances put/get counts per L2 memref — it exists **only** to give (1) BDs to hang its extra handshakes on: an AIE2 BD carries exactly one acquire and one release, so N private lock pairs on the fan side need N BDs on the single side, and N−1 of them are zero-length dummies |
+| 3 | `AIRToAIEPass.cpp:6391` (`generateDmaBdProgram`) | sorts dummy-bearing channels to the end of the memtile BD program |
+
+**The cost, and why `matvec.py` is the only family that pays nothing.** `getLockForDMA`'s
+Case 1 (`AIRToAIESchedulingUtils.cpp:1414`) matches on `(air_chan, channel)` and **never
+compares `bufferOp`** — every other reuse rule in that function does. So a multi-buffered L2
+rotation (ping-pong / K-unroll) collapses onto **one** lock pair, taking its depth from N to 1:
+
+| module | rotating memtile channels | collapsed by the flag |
+|---|---|---|
+| `blk_qkv_proj_4096x768` | 24, depth 3 | 24 |
+| `off_gemm_*` drain 8x4 | 24, depth 3 | 24 |
+| shipped Qwen3-0.6B prefill stitcher | 72, depth 2–6 | 72 |
+| `blk_qkv` compiled `omit_pingpong=all` | 0 | 0 |
+| **mv bf16 `herd_rows=2`** | **0** | **0** |
+
+The bf16 GEMV is the one family in the tree that takes the fix without this damage, because it
+has no rotation to lose. **The reason is not `omit_pingpong`.** An earlier revision said it
+was; that is false for the production path, which uses `GEMV_K2048_BACKEND` with
+`omit_pingpong: ""` — ping-pong **on** — and item 27 ran the shipped preset that way. Measured
+on item 27's own artifacts the zero holds either way: `lockprobe/lfnone_ppon_tl16x16_r2`
+(ping-pong on) and `lfnone_ppall_tl16x16_r2` (omitted) both report **0 rotating channels of
+48**. `omit_pingpong=True` appears only in `matvec.py`'s standalone CLI and explains nothing.
+
+The reason is **where the L2 buffer is allocated**. `air-ping-pong-transform` multi-buffers an
+L2 buffer only when there is an enclosing loop to pipeline. `matvec.py` allocates its L2 A and
+C panels at **segment scope, outside every loop**, and fills A with a single `dma_memcpy_nd` at
+the same scope (`matvec.py:186-193`) — one fill per launch iteration, no loop to pipeline, so
+nothing rotates whatever the ping-pong setting. The int4 builder allocates its L2 staging
+buffer **inside a two-deep `for_` nest** (`matvec_int4_packed.py:239-258`), which is exactly
+what gets multi-buffered — hence its depth-2 rotation. That, and not a builder identity or a
+backend flag, is the real shape of the rule.
+
+The collapse is **not** by itself fatal, and that was established from existing artifacts
+*before* any device arm ran: `lockprobe4/int4_lfv1_r{2,4}` (devq 676) are the int4 GEMV compiled
+*with* the flag, showing 16/24 and 32/40 channels collapsed, and **both pass**. The prediction
+that depended on the collapse being fatal was downgraded in writing at that point.
+
+### 5c.5 The "TOLERATED" row has no artifact behind it
+
+The shipped rule's third row — `off_gemm_*`, `rl_gemm_*` and the `llms/` 8x4 kernels "take the
+same injection and do not fault" — is **not supported by the logs**. Two independent reasons:
+
+* `block_artifact_fingerprint` hashes `cfg["backend_kwargs"]`, and round 4's injection happened
+  *inside* `compile_and_cache` / `compile_shared_xclbin`, i.e. **downstream of the fingerprint**.
+  A warm cache therefore reused a pre-injection ELF and the flag never reached those compiles.
+  (This is exactly why devq 853's injection was placed in `block_config`'s cfg instead: it
+  changes the fingerprint and forces a real rebuild, which the 1,217,608-byte ELF confirms.)
+* lit suppresses a passing test's output, so devq 809's `offload` and `runlist` logs contain no
+  evidence either way.
+
+And the three **failing** lits all died at `runlist submission 0 failed at entry 0` — the
+**first** dispatch. Every other artifact in those sequences was never reached. "Only the QKV
+split-cast form faults" was therefore a statement about **dispatch order**, not about the QKV
+form.
+
+### 5c.6 A harness trap that counterfeits the signal
+
+With `output_format="elf"`, `air/backend/xrt.py:472-492` builds the XRT kernel id as
+`main:<instance_name>` and requires `instance_name` to name a `func.func` in the module. Both failure modes are quiet.
+A **missing** name skips the whole block (the guard is `instance_name != ""`), emits **no
+warning at all**, and silently leaves the kernel id at the default `MLIR_AIE` — that is the
+case these arms hit. A **nonempty but wrong** name does reach `warnings.warn`, whose own text
+names the symptom: *"may cause ERT_CMD_STATE_TIMEOUT or a runtime deadlock"* — **the same
+symptom these arms exist to measure**. A harness bug that counterfeits the result is the worst
+available failure shape.
+
+Three device jobs were lost to it and to a sibling import bug (devq 844, 846, 848 — all seven
+arms `COMPILE_FAIL`). The fix, in `results/lockfix-20260827-INCOMPLETE/work/lockfix-arm5.py`:
+the warning is caught and re-raised as a **hard error**, `art.kernel` is asserted equal to
+`main:<instance_name>` on every arm including the device ones, and all seven arms were
+pre-flighted `COMPILEONLY` — a full `aircc` compile with no device — before anything was queued.
+
+### 5c.7 Method notes
+
+* **The `air-opt` probe is faithful.** `lockfix-airopt.sh` replays aircc's placement +
+  `air-to-aie` pipeline; its output reproduces real aircc `air_project/aie.air.mlir`
+  **byte-for-byte at the memtile level** against item 27's own measured artifacts
+  (`lockprobe/lfnone_ppall_tl16x16_r2` and `lfv1_ppall_tl16x16_r2`, devq 674) and against a
+  full `aircc` build of the QKV module (devq 845, residual diff = a channel-symbol renumbering).
+  Both QKV arms also compile cleanly to an ELF, so there is no aircc-only wall here.
+* **The `gemm_*` arms' tolerance is loose** — `atol` 2e-2 on values of σ ≈ 0.036. They
+  discriminate hang-vs-run, not numerics. The `full_*` arms compare against
+  `qkv_proj_reference` at the operator gate's own `atol` 5e-3.
+* **Process finding.** Jobs 844 and 846 were hand-written rather than generated by
+  `devq.sh new-job`, and both printed five legs at `rc=4` followed by **`OVERALL RC=0`** — the
+  exact swallow-the-status bug the template landed this session to prevent. Job 848, templated,
+  reported `failed 4` correctly. Every job after that used `devq.sh new-job`, with verdict
+  classification so a *predicted* `TIMEOUT` counts as data while `ERROR` / `COMPILE_FAIL` is red.
+
+### 5c.8 What is still open
+
+* **Why the bf16 form fires the race and the int4 form does not.** Same fan-out topology and
+  identical lock arithmetic, but **not** structurally identical: int4 carries a two-deep L2
+  rotation on the fan-out channel (24 channels at rows 2, 40 at rows 4) and bf16 carries none
+  (§5c.3). Whether that rotation is what protects the int4 form is untested. Until this is
+  understood, "exposed" cannot be turned into "will hang".
+* **What actually hung at devq 812/813.** Not reproduced; round 4's tree no longer exists.
+* **Whether a compile-time property test should replace the builder mark.** The property in
+  §5c.2 is implemented and validated
+  (`results/lockfix-20260827-INCOMPLETE/work/lockfix-property-test.py`) but is **not wired in**:
+  it would also, correctly, flag the int4 form, and turning it on is a behaviour change nobody
+  has measured.
+
+Artifacts: `programming_examples/transformer_layer/results/lockfix-20260827-INCOMPLETE/` —
+`device-evidence/` (16 files: devq 844/845/846/848/850/853 logs, all seven arm transcripts, both
+block-path transcripts, the scoped-injection diff), `scratchpad-rescue/lockfix-PREDICTION.md`
+(every prediction with the timestamp at which it was written, and its outcome), and `work/`
+(the probe, the property test and the job scripts).
+
 ## 6. What does not transfer, restated for the inference path
 
 `NDEV` sessions (no VA cliff); the `M > 4` HMX threshold (an HMX/HVX fact); Q8 activation

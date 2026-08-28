@@ -1021,18 +1021,20 @@ def test_run_sequence_deliberately_rebuilds_its_runs_every_call():
 
 
 # ---------------------------------------------------------------------------
-# The lock-race fix: one family needs it, one is broken by it (queue item 28)
+# The lock-race fix: one family needs it; the rest only pay for it (item 28)
 # ---------------------------------------------------------------------------
 #
 # `matvec.py`'s multi-row herd HANGS without aircc's
 # `--use-lock-race-condition-fix` (ERT_CMD_STATE_TIMEOUT, item 27 section 6.1,
-# devq 673/674). `[2026-08-27]` and the same flag FAULTS the device on the
-# transformer-layer study's QKV split-cast form -- `RunlistExecutionError`,
-# `fatal_error_exception_pc = 0x00000000`, devq 812 and devq 813 with item 31
-# excluded. `off_gemm_*` and `rl_gemm_*` take it and are fine. So it is a
-# transform with preconditions, not insurance, and the rule is a POSITIVE
+# devq 673/674). `[2026-08-28]` The claim that the same flag FAULTS the
+# transformer-layer study's QKV split-cast form (devq 812/813) DID NOT
+# REPRODUCE: devq 850 ran that ELF flag-built and clean 7/7, and devq 853 ran it
+# clean through the study's own runlist path. What survives is that the flag has
+# no measured NEED outside the marked family and a measured COST inside every
+# other one -- it collapses multi-buffered L2 rotations onto a single lock pair.
+# So it is a transform with costs, not insurance, and the rule is a POSITIVE
 # statement about the one family measured to need it: the builder marks its own
-# herd and nothing else is touched.
+# herd and nothing else is touched. Doc 57 section 5c.
 #
 # Four earlier drafts tried to decide this from outside the builder -- a
 # `link_with` filename, then three shapes of allow-list -- and all four were
@@ -1123,11 +1125,15 @@ def test_the_marked_family_gets_the_fix_whatever_it_links():
 
 
 def test_an_unmarked_module_is_returned_untouched():
-    """THE MEASURED CONTRAINDICATION. Injecting the flag into the study's QKV
-    split-cast artifacts faults the device (devq 812/813), and `off_gemm_*` /
-    `rl_gemm_*` tolerate it but were never shown to need it. So an unmarked
-    module keeps exactly the kwargs its caller wrote -- no injection, for any
-    name, at any row count."""
+    """NO MEASURED NEED, AND A MEASURED COST. `[2026-08-28]` the old reason --
+    "injecting the flag into the study's QKV artifacts faults the device (devq
+    812/813)" -- did not reproduce (devq 850/853, doc 57 section 5c). What
+    survives: nothing outside the marked family has been shown to NEED the flag,
+    `off_gemm_*` / `rl_gemm_*` were never even shown to have RECEIVED it (a warm
+    cache reused pre-injection ELFs), and applying it collapses every
+    multi-buffered L2 rotation onto one lock pair. So an unmarked module keeps
+    exactly the kwargs its caller wrote -- no injection, for any name, at any
+    row count."""
     from shared.infra.dispatch import ensure_lock_fix_for_marked_herds as ensure
 
     for rows in (1, 2, 4):
@@ -1186,7 +1192,9 @@ def test_the_async_token_form_does_not_read_a_dependency_as_a_herd_size():
 
 def test_a_module_that_cannot_be_walked_is_refused_not_guessed():
     """Neither applying nor withholding the transform is defensible when the
-    module cannot be read: one direction hangs, the other faults."""
+    module cannot be read: one direction is measured to hang, and the other has
+    no measured need and a measured cost (`[2026-08-28]`, doc 57 section 5c --
+    the "it faults" half of the old wording did not reproduce)."""
     from shared.infra.dispatch import ensure_lock_fix_for_marked_herds as ensure
 
     class _Explodes:
@@ -1198,7 +1206,7 @@ def test_a_module_that_cannot_be_walked_is_refused_not_guessed():
         ensure("mystery", _Explodes(), {})
     except ValueError as exc:
         assert "could not be read" in str(exc)
-        assert "FAULTS" in str(exc) or "faults" in str(exc)
+        assert "Neither applying nor withholding" in str(exc)
     else:
         raise AssertionError("an unreadable module was guessed at")
 

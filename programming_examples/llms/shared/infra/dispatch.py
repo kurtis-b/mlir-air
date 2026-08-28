@@ -553,7 +553,7 @@ def _first_failed(xrt, runs):
 
 
 # ---------------------------------------------------------------------------
-# The lock-race fix: one builder family needs it, one is broken by it
+# The lock-race fix: one builder family needs it; the rest only pay for it
 # ---------------------------------------------------------------------------
 #
 # `[2026-08-26]` queue item 28. In the bf16 GEMV (`matvec.py`) a herd whose
@@ -562,49 +562,129 @@ def _first_failed(xrt, runs):
 # knobs x two row counts (devq 673/674): only `use_lock_race_condition_fix`
 # unblocks it; ping-pong and `runtime_loop_tiling_sizes` are irrelevant.
 #
-# `[2026-08-27]` AND THE FIX IS NOT FREE INSURANCE -- IT IS A TRANSFORM WITH
-# PRECONDITIONS. Item 28 spent four review rounds trying to decide WHERE to
-# apply it, on the assumption that applying it more widely was the safe
-# direction. That assumption is now measured false:
+# `[2026-08-28]` CHARACTERIZED -- AND TWO CLAIMS THIS COMMENT USED TO MAKE ARE
+# WRONG. Full account, every artifact and every job id: doc 57 section 5c.
 #
-#   * applying it to the transformer-layer study's QKV split-cast artifacts
-#     FAULTS THE DEVICE -- `RunlistExecutionError` on `blk_qkv_proj_4096x768`
-#     and `fused_qkv_proj_1024x768` with
-#     `fatal_error_exception_pc = 0x00000000` (devq 812, and devq 813 with
-#     item 31 excluded: identical fault, so it is this injection and nothing
-#     else). The last green run of those lits was devq 782, where the study
-#     artifacts were exempt.
-#   * `off_gemm_*` and `rl_gemm_*` take the same injection and do NOT fault
-#     (item 31): `offload` and `runlist` pass. So the incompatibility is
-#     specific to the block/fused QKV split-cast form, not to multi-row herds.
+# 1. THE FLAG DID NOT FAULT THE QKV FORM IN ANY RUN WE CAN MAKE. Nine device
+#    arms all PASS -- devq 850 (7/7, including `blk_qkv_proj_4096x768` built
+#    WITH the flag) and devq 853 (both legs, through the study's own
+#    `make check-block` -> `run_block` -> `cache.run_sequence` RUNLIST path,
+#    the exact path devq 812 died on). FIVE of the nine were flag-built; the
+#    other four (`full_off`, `gemm_off`, `full_off_ppall`, `blockctl`) are
+#    deliberate no-flag controls.
 #
-# The mechanism is in `AIRToAIESchedulingUtils.cpp:1398`: the flag re-allocates
-# MEMTILE LOCKS. Without it, BDs on different channels referencing the same
-# memtile buffer share one lock pair; with it, locks are matched on (channel
-# symbol, physical channel number) and the opposite direction. The surrounding
-# code names its buffer-shape preconditions. A fan-out it was not validated
-# against gets mis-paired or unreleased locks -- a hang, or a malformed BD
-# program whose core runs into unprogrammed memory, which is what a null
-# exception PC looks like.
+#    THIS IS A NON-REPRODUCTION, NOT A NON-EXISTENCE. It says the failure does
+#    not occur on this tree under these conditions. It cannot say the
+#    direction never existed -- see the `NOT ESTABLISHED` paragraph below.
+#    The flag really reached those compiles: +24 zero-length dummy BDs over the
+#    matching off arm, distinct ELF hashes, a forced recompile, and a flag-built
+#    ELF of 1,217,608 bytes against a 1,210,696-byte control -- the same two
+#    sizes an independent bare-`aircc` build produced (devq 845).
 #
-# SO THE RULE IS A POSITIVE STATEMENT ABOUT ONE FAMILY, AND NOTHING ELSE IS
-# TOUCHED. `matvec.py` marks its own herd `air.lock_race_fix_required` when it
-# builds the multi-row form -- the builder that produces the hazard is the only
-# thing that can identify it, since a filename cannot (the tree renames
-# micro-kernel objects routinely) and the IR shape cannot (the prefill GEMM
-# herds have the same single-writer/multi-reader L2 panel and do not hang).
-# Modules without that mark are passed through with their kwargs untouched:
+#    `58fe8af7` narrowed this guard to a builder-emitted mark and justified the
+#    narrowing by saying the flag FAULTS this form. THE GUARD IS STILL RIGHT --
+#    narrow and positive is safe either way, and there is still no evidence the
+#    flag is NEEDED outside `matvec.py` -- but ITS JUSTIFICATION IS UNSUPPORTED.
+#    Do not cite "it faults the QKV form" again; cite "no measured need".
 #
-#   evidence it is REQUIRED     -> `mv.o` multi-row form (item 27, devq 673/674)
-#   evidence it is HARMFUL      -> block/fused QKV split-cast (devq 809/812/813)
-#   evidence it is TOLERATED    -> off_gemm_*, rl_gemm_*, the shipped llms 8 x 4
-#                                  kernels -- but NO evidence it is needed, so
-#                                  they keep whatever they ship with
+#    NOT ESTABLISHED: round 4's tree is gone, so nobody can say whether devq
+#    812/813 was the flag plus something else, or never the flag at all.
 #
-# THE OPEN QUESTION, and it is one item rather than two: **neither direction is
-# characterized.** Nobody knows why the `mv.o` multi-row form hangs without the
-# flag, nor why the QKV split-cast form faults with it. Until that is understood
-# this rule is a record of two measurements, not a theory.
+#    Also: devq 812/813 is a HANG, not a fault. Every `fatal_error_*` field is
+#    0x00000000 -- unset, not "a null exception PC" -- and `ctx_pc` is the same
+#    0x28B060AD as the mv hang. Both directions are the same symptom.
+#
+# 2. THE IR SHAPE *DOES* DISCRIMINATE. This comment used to say it cannot,
+#    because "the prefill GEMM herds have the same single-writer/multi-reader
+#    L2 panel". That conflated READ BY 4 CORES with READ BY 4 DMA CHANNELS; at
+#    the memtile they are different objects:
+#
+#      mv bf16 rows=2  aie.flow(%mem_tile_0_1, DMA:1 -> %tile_0_2)
+#                      aie.flow(%mem_tile_0_1, DMA:2 -> %tile_0_3)  TWO channels
+#      every 8x4 GEMM  aie.flow(%mem_tile_0_1, DMA:1 -> %tile_0_2, 0_3, 0_4,
+#                                                       0_5)   ONE broadcast
+#
+#    THE PROPERTY, stated so it predicts: in the memtile DMA program, per L2
+#    buffer, count the distinct (direction, physical channel) endpoints. Two or
+#    more ON ONE SIDE means those channels share a single COUNTING semaphore,
+#    and nothing binds a credit to a channel -- a channel whose BD chain re-arms
+#    can take a peer's credit and starve it.
+#
+#      mv bf16 rows 1 / 2 / 4                      consumers 1/2/4  PASS/HANG/HANG
+#      mv int4 rows 2 / 4                          consumers 2/4    PASS/PASS
+#      off_gemm drain, the QKV fused-cast GEMM,
+#      `blk_qkv`, the shipped Qwen3 prefill
+#      stitcher (96 L2 buffers)                    consumers 1      PASS
+#
+#    NECESSARY BUT NOT SUFFICIENT: int4 has the fan-out and passes. That
+#    falsified the first version of this rule, which had been written down and
+#    predicted a hang before the devq 676 logs were read.
+#
+# A CLAIMED int4 LIVE HAZARD, WITHDRAWN. An earlier revision of this comment
+# said `matvec_int4_packed.py` ships a multi-row form carrying the exposed
+# topology while setting `use_lock_race_condition_fix=False` explicitly. It
+# does not: `build_module` takes no `herd_rows` and hard-codes
+# `@herd(sizes=[N_CORES, 1])` (`matvec_int4_packed.py:265`), devq 676's int4
+# rows-2/4 artifacts came from item 27's EVIDENCE-ONLY `gemv_builder_rows.py`,
+# and `:376` / `:411` are backend settings on the shipped ONE-ROW CLI path.
+# So that `False` exposes no live multi-row int4 kernel today. What is true:
+# IF a multi-row int4 form is ever built, the explicit `False` becomes a
+# hazard -- and if that builder marks its herd, the refusal below catches the
+# contradiction; if it does not mark, nothing does.
+# Nor are the two GEMV forms structurally identical: int4 carries a two-deep
+# L2 rotation on the fan-out channel (24 rotating channels at rows 2, 40 at
+# rows 4) and bf16 carries none. That is a live candidate for why one fires
+# and the other does not, so the divergence is NOT attributable to timing
+# alone. Doc 57 section 5c.3.
+#
+# WHAT THE FLAG COSTS, and why `matvec.py` is the one family that pays nothing:
+# `getLockForDMA` Case 1 (`AIRToAIESchedulingUtils.cpp:1414`) matches on
+# (air.channel symbol, physical DMA channel) and NEVER compares `bufferOp` --
+# every other reuse rule in that function does. So a multi-buffered L2 rotation
+# collapses onto ONE lock pair, depth N -> 1: `blk_qkv` 24 channels at depth 3,
+# the shipped prefill stitcher 72 at depth 2-6, and mv bf16 ZERO.
+# THE REASON FOR THAT ZERO IS NOT `omit_pingpong` -- an earlier revision said
+# it was, and that is false for the production path, which uses
+# `GEMV_K2048_BACKEND` with `omit_pingpong: ""` (ping-pong ON). Item 27's own
+# artifacts show 0 rotating channels of 48 with ping-pong on AND omitted. The
+# reason is WHERE the L2 buffer is allocated: `matvec.py` allocates and fills
+# its L2 panels at SEGMENT SCOPE, outside every loop (`matvec.py:186-193`), so
+# `air-ping-pong-transform` has no enclosing loop to pipeline and emits no
+# rotation whatever the setting.
+# The flag has THREE effects, not one: that lock policy (the load-bearing one),
+# `insertDummyChannelOpsForL2Memrefs` (`AIRToAIEPass.cpp:4760`, which exists
+# only to give the policy BDs to hang its extra handshakes on), and the
+# dummy-BD channel ordering at `AIRToAIEPass.cpp:6391`.
+#
+# SO THE RULE IS UNCHANGED, AND IS A POSITIVE STATEMENT ABOUT ONE FAMILY.
+# `matvec.py` marks its own herd `air.lock_race_fix_required` at `herd_rows > 1`
+# and `KernelCache.compile_and_cache` supplies the flag for that mark and for no
+# other reason. A module without the mark is returned with its kwargs UNTOUCHED;
+# a module whose herds cannot be read is REFUSED. The property in (2) could one
+# day replace the mark with a compile-time test -- it is NOT wired in, because
+# it would also (correctly) flag the int4 form, and switching that on is a
+# behaviour change nobody has measured.
+#
+#   evidence it is REQUIRED   -> `mv.o` multi-row form (item 27, devq 673/674)
+#   evidence it is HARMFUL    -> NONE. The QKV claim did not reproduce
+#                                (devq 850/853), and the recorded fault was a
+#                                hang with every fatal-error field unset
+#   evidence it is TOLERATED  -> still NO ARTIFACT. devq 809's `offload` and
+#                                `runlist` lits passed, but lit suppresses a
+#                                passing test's output, and
+#                                `block_artifact_fingerprint` hashes
+#                                `backend_kwargs` BEFORE the injection (which
+#                                happened inside `compile_and_cache`), so a warm
+#                                cache reused a pre-injection ELF and the flag
+#                                never reached those compiles. The three FAILING
+#                                lits died at runlist submission 0 entry 0 --
+#                                the first dispatch -- so "only the QKV form
+#                                faults" was a statement about dispatch ORDER,
+#                                not about the QKV form
+#
+# STILL OPEN: why the bf16 form fires the race and the int4 form does not, on
+# byte-comparable memtile topology and identical lock arithmetic; and what
+# actually hung at devq 812/813.
 
 
 class HerdGeometryUndecidable(Exception):
@@ -702,8 +782,11 @@ def ensure_lock_fix_for_marked_herds(name, mlir_module, backend_kwargs):
     precisely because the earlier wording invited the reading that None meant
     unknown -- and a caller treating unknown-as-a-value is this item's defect. **A module with no marked
     herd is returned untouched** -- no injection, anywhere, for any other
-    kernel: devq 812/813 measured that injecting it into the QKV split-cast form
-    faults the device.
+    kernel. `[2026-08-28]` The reason is no longer "devq 812/813 measured that
+    injecting it into the QKV split-cast form faults the device" -- that did NOT
+    reproduce (devq 850/853; doc 57 section 5c). The reason is that outside the
+    marked family the flag has no measured NEED and a measured COST: it
+    collapses every multi-buffered L2 rotation onto one lock pair.
 
     Refuses two things:
       * a module that cannot be walked -- neither applying nor withholding the
@@ -718,9 +801,11 @@ def ensure_lock_fix_for_marked_herds(name, mlir_module, backend_kwargs):
             f"{name}: the herds in this module could not be read ({exc}), so it "
             f"cannot be established whether it contains the multi-row "
             f"`matvec.py` form that REQUIRES aircc's "
-            f"--use-lock-race-condition-fix (item 27 section 6.1) or a form that "
-            f"the same flag FAULTS (devq 812/813). Neither applying nor "
-            f"withholding it is defensible here. Fix the module or the bindings."
+            f"--use-lock-race-condition-fix (item 27 section 6.1) or a form for "
+            f"which that flag has no measured need and a measured cost -- it "
+            f"collapses multi-buffered L2 rotations onto one lock pair (doc 57 "
+            f"section 5c). Neither applying nor withholding it is defensible "
+            f"here. Fix the module or the bindings."
         ) from exc
 
     marked = [(n, r) for n, m, r in herds if m]
