@@ -3,6 +3,14 @@ name: debug-bo-corruption
 description: "Use when an NPU kernel passes its standalone shape test but produces NaN, garbage, or stale values when invoked as part of a larger pipeline. Common symptoms: correct first invocation but wrong on subsequent calls; correct in isolation but wrong when chained with other kernels."
 ---
 
+## Reviewer contract (agent-standards/WORKFLOW.md)
+
+Codex is advisory-only in this repo: diagnose per this skill, then REPORT the matched root cause
+and the documented fix as a finding — `file:line — claim — concrete failing scenario — minimal
+suggested edit` — ranked P0–P3. Do not edit files; the coding agent applies fixes and re-runs the
+gates. The recipes below describe WHAT the fix is, for the report.
+
+
 ## Purpose
 
 Diagnose Buffer Object (BO) corruption — bugs that surface only at

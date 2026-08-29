@@ -1,7 +1,15 @@
 ---
 name: debug-fa-runtime-failure
-description: "Use when NPU FlashAttention hangs (`ERT_CMD_STATE_TIMEOUT`) or produces NaN at head_dim ≥ 128. Discriminates the three known root causes (compile-flag mismatch, seq-first dk_chunks bug, true L1 overflow) via a symptom-classification table and applies the documented fix."
+description: "Use when NPU FlashAttention hangs (`ERT_CMD_STATE_TIMEOUT`) or produces NaN at head_dim ≥ 128. Discriminates the three known root causes (compile-flag mismatch, seq-first dk_chunks bug, true L1 overflow) via a symptom-classification table and reports the documented fix as a finding."
 ---
+
+## Reviewer contract (agent-standards/WORKFLOW.md)
+
+Codex is advisory-only in this repo: diagnose per this skill, then REPORT the matched root cause
+and the documented fix as a finding — `file:line — claim — concrete failing scenario — minimal
+suggested edit` — ranked P0–P3. Do not edit files; the coding agent applies fixes and re-runs the
+gates. The recipes below describe WHAT the fix is, for the report.
+
 
 ## Purpose
 

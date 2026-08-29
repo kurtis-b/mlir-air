@@ -3,6 +3,14 @@ name: debug-multi-launch-merge
 description: "Use when stitching kernels into a multi-launch ELF and the AIE compiler rejects the merged module (BD exhaustion, channel routing, herd shape conflict, IR validation error, DMA stride limitation). Discriminates the 6 known compile blockers via a symptom-classification table."
 ---
 
+## Reviewer contract (agent-standards/WORKFLOW.md)
+
+Codex is advisory-only in this repo: diagnose per this skill, then REPORT the matched root cause
+and the documented fix as a finding — `file:line — claim — concrete failing scenario — minimal
+suggested edit` — ranked P0–P3. Do not edit files; the coding agent applies fixes and re-runs the
+gates. The recipes below describe WHAT the fix is, for the report.
+
+
 ## Purpose
 
 When `opt-merge-multi-launch-kernels` produces a fused ELF and `aircc.py`
