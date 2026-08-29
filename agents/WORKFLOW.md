@@ -48,7 +48,13 @@ single source for the rules below; `AGENTS.md` adds only repo-specific context a
    first (or stop and name it to the human if it cannot be landed).
 8. This fork is origin-only: `origin` (kurtis-b/mlir-air) is the only push target. `upstream`
    (Xilinx/mlir-air) is PULL-ONLY — never push to it or open PRs against it; upstream syncs into
-   `main` are the operator's own action.
+   `main` are the operator's own action. Enforced in three local layers, none of which may be
+   undone by an agent: the `upstream` remote's push URL is `no_push`; `gh repo set-default` is
+   `kurtis-b/mlir-air` (gh otherwise prefers the `upstream` remote, so a bare `gh pr` would hit
+   Xilinx); and `agents/hooks/origin-only-guard.mjs` + `permissions.deny` refuse upstream pushes,
+   re-arming the remote, and `gh` writes addressed to Xilinx/ (reads stay allowed). The one
+   GitHub-side hard block — *Leave fork network*, which makes a PR against upstream impossible —
+   is irreversible and the operator's call.
 
 ## Landing gate (`pr.sh land`)
 
@@ -131,10 +137,12 @@ Before writing, find the fact's single home; extend or link, never restate.
 ## Enforcement
 
 Three layers: these rules (advisory context) → `.claude/hooks/guard.sh` running
-`agents/hooks/main-branch-guard.mjs` as a PreToolUse(Bash) hook plus the `permissions.deny` list
+`agents/hooks/main-branch-guard.mjs` (vendored verbatim) then `agents/hooks/origin-only-guard.mjs`
+(repo rule 8) as a PreToolUse(Bash) hook plus the `permissions.deny` list
 in `.claude/settings.json` (agent-side; a denial reason contains the fix — follow it, never
 bypass with `sh -c`, aliases, or wrappers) → a GitHub ruleset on `main` (PR required, required
 checks on an up-to-date branch, no force-push/deletion; the gate account merges — no human-review
 requirement). The hook is a guardrail, not a sandbox; the ruleset is the backstop and binds
-everyone. Tests: `bash agents/hooks/test_guard.sh`, `bash agents/scripts/test_pr.sh`,
+everyone. Tests: `bash agents/hooks/test_guard.sh`, `bash agents/hooks/test_origin_only.sh`,
+`bash agents/scripts/test_pr.sh`,
 `bash agents/scripts/test_check_pr_deps.sh` — hermetic (stubbed `gh`, no network).

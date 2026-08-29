@@ -1,5 +1,25 @@
 {
   "permissions": {
+    "allow": [
+      "Bash(bash agents/scripts/pr.sh *)",
+      "Bash(bash agents/scripts/check_pr_size.sh*)",
+      "Bash(bash agents/scripts/check_pr_deps.sh *)",
+      "Bash(bash agents/hooks/test_guard.sh)",
+      "Bash(bash agents/hooks/test_origin_only.sh)",
+      "Bash(bash agents/scripts/test_pr.sh)",
+      "Bash(bash agents/scripts/test_check_pr_deps.sh)",
+      "Bash(git push -u origin *)",
+      "Bash(git push origin *)",
+      "Bash(git push https://github.com/kurtis-b/*)",
+      "Bash(gh pr view *)",
+      "Bash(gh pr checks *)",
+      "Bash(gh pr list*)",
+      "Bash(gh pr status*)",
+      "Bash(gh pr comment *)",
+      "Bash(gh pr create *)",
+      "Bash(gh pr edit *)",
+      "Bash(gh pr close *)"
+    ],
     "deny": [
       "Bash(git push --force*)",
       "Bash(git push -f*)",
@@ -17,7 +37,20 @@
       "Bash(gh pr merge *)",
       "Bash(gh pr review *)",
       "Bash(gh * pr merge *)",
-      "Bash(gh * pr review *)"
+      "Bash(gh * pr review *)",
+      "Bash(git push upstream*)",
+      "Bash(git push * upstream *)",
+      "Bash(git push *Xilinx/*)",
+      "Bash(gh pr create *Xilinx/*)",
+      "Bash(gh -R Xilinx/* pr create*)",
+      "Bash(gh --repo Xilinx/* pr create*)",
+      "Bash(gh repo set-default Xilinx/*)",
+      "Bash(git remote set-url upstream*)",
+      "Bash(git remote set-url --push upstream*)",
+      "Bash(git push * +*)",
+      "Bash(gh repo set-default --unset*)",
+      "Bash(git config * remote.*.pushurl *Xilinx/*)",
+      "Bash(git config * remote.*.url *Xilinx/*)"
     ]
   },
   "hooks": {
