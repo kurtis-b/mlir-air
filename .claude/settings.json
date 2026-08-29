@@ -46,7 +46,11 @@
       "Bash(gh --repo Xilinx/* pr create*)",
       "Bash(gh repo set-default Xilinx/*)",
       "Bash(git remote set-url upstream*)",
-      "Bash(git remote set-url --push upstream*)"
+      "Bash(git remote set-url --push upstream*)",
+      "Bash(git push * +*)",
+      "Bash(gh repo set-default --unset*)",
+      "Bash(git config * remote.*.pushurl *Xilinx/*)",
+      "Bash(git config * remote.*.url *Xilinx/*)"
     ]
   },
   "hooks": {

@@ -17,6 +17,19 @@ run() { # run <expected: deny|allow|ask> <command...>
   else fail=$((fail+1)); echo "FAIL  [expected $expect, got $decision] $cmd"; fi
 }
 
+runenv() { # runenv <expected> <VAR=value> <command...>: like run, with one env var set for the hook
+  local expect="$1" kv="$2"; shift 2
+  local cmd="$*" json out decision
+  json=$(node -e 'process.stdout.write(JSON.stringify({tool_name:"Bash",tool_input:{command:process.argv[1]},cwd:"/x"}))' "$cmd")
+  out=$(printf '%s' "$json" | env "$kv" node "$HOOK" 2>/dev/null)
+  if [[ -z "$out" ]]; then decision=allow
+  elif grep -q '"permissionDecision":"deny"' <<<"$out"; then decision=deny
+  elif grep -q '"permissionDecision":"ask"' <<<"$out"; then decision=ask
+  else decision="unknown($out)"; fi
+  if [[ "$decision" == "$expect" ]]; then pass=$((pass+1)); echo "PASS  [$expect] $kv $cmd"
+  else fail=$((fail+1)); echo "FAIL  [expected $expect, got $decision] $kv $cmd"; fi
+}
+
 echo "--- U1: no push to upstream ---"
 run deny  git push upstream feat/x
 run deny  git push -u upstream feat/x
@@ -26,6 +39,10 @@ run deny  git push https://github.com/Xilinx/mlir-air HEAD:feat/x
 run deny  git push git@github.com:Xilinx/mlir-air.git HEAD:feat/x
 run deny  "git fetch upstream && git push upstream HEAD"
 run deny  'git push "upstream" feat/x'
+run deny  git push origin +HEAD:feat/x
+run deny  git push -u origin +feat/x
+run deny  git push origin feat/x +refs/heads/other:refs/heads/other
+run allow git push origin HEAD:feat/x
 run allow git push -u origin feat/x
 run allow git push origin HEAD
 run allow git push https://github.com/kurtis-b/mlir-air.git feat/x
@@ -40,6 +57,14 @@ run deny  git config --unset remote.upstream.pushurl
 run allow git remote -v
 run allow git remote get-url upstream
 run allow git remote show upstream
+run deny  git config remote.origin.pushurl https://github.com/Xilinx/mlir-air
+run deny  git config --local remote.origin.url git@github.com:Xilinx/mlir-air.git
+run deny  git -c remote.origin.pushurl=https://github.com/Xilinx/mlir-air push origin feat/x
+run deny  git -cremote.origin.pushurl=https://github.com/Xilinx/mlir-air push origin feat/x
+run deny  git config url.https://github.com/Xilinx/.insteadOf https://github.com/kurtis-b/
+run deny  git config url.https://github.com/Xilinx/mlir-air.pushInsteadOf https://github.com/kurtis-b/mlir-air
+run allow git config remote.origin.pushurl https://github.com/kurtis-b/mlir-air.git
+run allow git -c core.editor=true commit -m x
 run allow git config --get remote.upstream.url
 run allow git remote add fork2 https://github.com/kurtis-b/mlir-air.git
 run allow git fetch upstream
@@ -54,6 +79,26 @@ run deny  gh pr edit 5 -R Xilinx/mlir-air --title x
 run deny  gh issue create -R Xilinx/mlir-air --title x
 run deny  gh release create v1 -R Xilinx/mlir-air
 run deny  gh repo set-default Xilinx/mlir-air
+run deny  gh repo set-default --unset
+run deny  gh repo set-default
+run allow gh repo set-default --view
+run deny  gh -RXilinx/mlir-air pr create --fill
+run deny  gh pr create -RXilinx/mlir-air --fill
+run deny  gh api -XPOST repos/Xilinx/mlir-air/issues
+run deny  gh api repos/Xilinx/mlir-air/issues -ftitle=x
+run deny  gh api repos/Xilinx/mlir-air/issues -Ftitle=x
+run deny  gh pr update-branch 5 -R Xilinx/mlir-air
+run deny  gh workflow run build.yml -R Xilinx/mlir-air
+run deny  gh pr merge 5 -R Xilinx/mlir-air
+run deny  gh release upload v1 file.tgz -R Xilinx/mlir-air
+run allow gh run list -R Xilinx/mlir-air
+run allow gh release list -R Xilinx/mlir-air
+run allow gh search prs --repo Xilinx/mlir-air --state open
+runenv deny  GH_REPO=Xilinx/mlir-air gh pr create --fill
+runenv deny  GH_REPO=Xilinx/mlir-air gh pr comment 5 -b hi
+runenv allow GH_REPO=Xilinx/mlir-air gh pr view 5
+runenv allow GH_REPO=kurtis-b/mlir-air gh pr create --fill
+runenv allow GH_REPO=Xilinx/mlir-air gh pr create --fill -R kurtis-b/mlir-air
 run deny  gh api -X POST repos/Xilinx/mlir-air/pulls -f title=x
 run deny  gh api --method PATCH repos/Xilinx/mlir-air/pulls/5
 run deny  gh api repos/Xilinx/mlir-air/issues -f title=x
