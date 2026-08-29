@@ -25,8 +25,10 @@ upstream is pulled into `main` by the operator.
 - Review findings are implemented only when they affect correctness or stated requirements;
   everything else is explicitly adjudicated (fix or reject with reason), never silently applied
   or dropped.
-- Hardware gates run on the device scheduler when it lands on main (goal-4 port); until then,
-  the gates available on main are the lit subset (`build-xrt/mlir/test`) and the per-example
+- Hardware gates run through the device scheduler, `agents/scripts/devq.sh` (FIFO broker for the
+  single NPU: `run --class build|measure -- CMD` is the drop-in for a bare `flock`; `preflight`
+  asks before dispatching; never `tee /dev/stderr` inside a job — the script's header explains
+  each rule). Software gates on main: the lit subset (`build-xrt/mlir/test`) and the per-example
   verify targets.
 - PRs are landed by `agents/scripts/pr.sh land` (see the workflow's Landing gate); the fork-side
   `.github/workflows/pr-size.yml` is a deliberate divergence of the upstream workflows dir.
