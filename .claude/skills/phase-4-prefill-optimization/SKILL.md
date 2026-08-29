@@ -58,7 +58,7 @@ PRIMARY:
 - `programming_examples/llms/<model>/docs/development_progress/phase3_full.md`
   — Phase 3 baseline timings + cosine numbers (the "before" state to
   measure against and preserve)
-- `programming_examples/llms/llama_kernel_builder/cache.py` — the
+- `programming_examples/llms/shared/infra/cache.py` — the
   `KernelCache` host-optimization knobs (`static_input_indices`,
   `intermediate_indices`); the `opt-buffer-object-reuse` skill owns how to
   wire them, this is just the source file it touches
@@ -66,13 +66,13 @@ PRIMARY:
 REFERENCE EXEMPLARS (read/mirror to compose your own fused ELFs; import
 directly only on a bit-for-bit kernel-sequence match):
 
-- `programming_examples/llms/llama32_1b/multi_launch_builder/` — the full set
+- `programming_examples/llms/shared/builders/` — the full set
   of fused-ELF builders, the worked example of how registry leaf kernels
   stitch into multi-launch ELFs. Mirror these for your model's kernel
   sequence. Two representative ones:
   - `rms_gemms_rope_multi.py` — fused 6-launch ELF for RMSNorm + Q/K/V GEMM + RoPE Q/K
   - `o_ffn_multi.py` — fused 8-launch ELF for O + add + RMSNorm + Gate/Up + SwiGLU + Down + add
-- `programming_examples/llms/llama_kernel_builder/` — the shared toolkit
+- `programming_examples/llms/shared/infra/` — the shared toolkit
   (KernelCache, stitching, external_kernels) every fused-ELF build uses,
   inheritance or kernel-first alike.
 

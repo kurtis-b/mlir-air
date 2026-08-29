@@ -94,10 +94,10 @@ deployment's measured value at same shape signals no regression).
 
 PRIMARY:
 
-- `programming_examples/llms/llama_kernel_builder/` — the shared toolkit
+- `programming_examples/llms/shared/infra/` — the shared toolkit
   (KernelCache, stitching, external_kernels) you compose the block FROM
   (kernel-first default).
-- `programming_examples/llms/llama32_1b/multi_launch_builder/` +
+- `programming_examples/llms/shared/builders/` +
   `llama32_1b_prefill.py:run_transformer_block` — the reference exemplar:
   read to see how the leaf kernels stitch into a block. On a bit-for-bit
   kernel-sequence match you may call `run_transformer_block` directly
@@ -126,13 +126,13 @@ reference impl; the patterns below describe the technique, not a shipped file):
 **Kernel-first (default).** Derive the model's per-layer kernel sequence
 from its config and build the block by composing the registry leaf kernels
 (verified in Phase 1) into model-specific multi-launch ELFs under
-`<model>/multi_launch_builder/`, using the shared `llama_kernel_builder`
+`<model>/multi_launch_builder/`, using the shared `shared/infra`
 toolkit (KernelCache, stitching, external_kernels). This is the general
 path — it does not assume the model resembles llama, so it generalizes to
 any decoder-only architecture in scope.
 
 Read `llama32_1b`'s assembly (`llama32_1b_prefill.run_transformer_block`
-and `llama32_1b/multi_launch_builder/*`) as a **worked exemplar** of how
+and `programming_examples/llms/shared/builders/*`) as a **worked exemplar** of how
 the leaf kernels stitch into a block — mirror its structure, adapting the
 kernel sequence and shapes to your model.
 
@@ -187,7 +187,7 @@ In `<model>/<model>_prefill.py`, implement
   `run_transformer_block_<model>(...)` that runs the per-model multi-launch
   ELFs in order via the shared `KernelCache`. Minimal skeleton:
   ```python
-  from llama_kernel_builder.cache import KernelCache
+  from shared.infra.cache import KernelCache
   cache = KernelCache()                      # compile-once, run-many
   def run_transformer_block_<model>(hidden, weights, cfg, cache):
       # one _run_cached per fused ELF you built in Step 1, in order:

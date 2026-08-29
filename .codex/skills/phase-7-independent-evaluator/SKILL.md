@@ -3,6 +3,13 @@ name: phase-7-independent-evaluator
 description: "Phase 7 of LLM deployment — run a fresh-context Codex audit that treats the deployment as UNTRUSTED, audits the `make verify` implementation (anti-reward-hacking: confirms the token-set gate runs the production path vs HF bf16), then re-runs it as the primary gate. Use a fresh Codex subagent when multi-agent tools are available; otherwise record that the audit was not fresh-context independent. Produces a structured `evaluation_report.md` a human can read in 2 minutes to know the full deployment state. Invoke as `$phase-7-independent-evaluator model directory` or auto-dispatch from `$deploy-new-llm` after Phase 6 PASS."
 ---
 
+## Write exception (agent-standards/WORKFLOW.md)
+
+Documented exception to "Codex never edits": this skill's ONLY writes are
+`<model>/docs/evaluation_report.md` and the TODO/progress rows that record the audit — the
+independent-audit artifact the workflow assigns to Codex. It never edits code, tests, or builds.
+
+
 ## Purpose
 
 The `$deploy-new-llm` chain is autonomous. Phase 6 wires up a `make verify`

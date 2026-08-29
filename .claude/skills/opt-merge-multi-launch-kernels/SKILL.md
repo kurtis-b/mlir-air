@@ -32,14 +32,14 @@ document and accept or revert.
 
 ## Knowledge base references
 
-- `programming_examples/llms/llama_kernel_builder/stitching.py` —
+- `programming_examples/llms/shared/infra/stitching.py` —
   the helpers this recipe uses (`_rename_all`, `_fix_launch_func_args`,
   `_wrap_ir_in_launch`, `_rename_all_with_externs`, `_rename_all_gemv`)
-- `programming_examples/llms/llama32_1b/multi_launch_builder/rms_gemms_rope_multi.py`
+- `programming_examples/llms/shared/builders/rms_gemms_rope_multi.py`
   — reference 6-launch prefill merge (RMSNorm + Q/K/V GEMM + RoPE Q/K)
-- `programming_examples/llms/llama32_1b/multi_launch_builder/o_ffn_multi.py`
+- `programming_examples/llms/shared/builders/o_ffn_multi.py`
   — reference 8-launch prefill merge (O + add + RMSNorm + Gate/Up + SwiGLU + Down + add)
-- `programming_examples/llms/llama32_1b/multi_launch_builder/o_gemv_ffn_multi.py`
+- `programming_examples/llms/shared/builders/o_gemv_ffn_multi.py`
   — decode merge with 2-K extern rename (the pattern to extend to 3-K
   when `n_heads*head_dim != emb_dim`)
 - `programming_examples/kernel_registry/supported_kernels.md`
@@ -78,7 +78,7 @@ For each group, create `<model>/multi_launch_builder/<group_name>_multi.py`
 that:
 
 1. Builds each sub-kernel's IR via `@module_builder`
-2. Imports stitching helpers: `from llama_kernel_builder.stitching import (_rename_all, _fix_launch_func_args, _wrap_ir_in_launch, ...)` (resolved against the shared `programming_examples/llms/llama_kernel_builder/` via sys.path)
+2. Imports stitching helpers: `from shared.infra.stitching import (_rename_all, _fix_launch_func_args, _wrap_ir_in_launch, ...)` (resolved against the shared `programming_examples/llms/shared/infra/` via sys.path)
 3. For each sub-kernel: extract its function body via `_extract_between_func_and_return(ir_text)`
 4. Rename SSA values with a per-kernel prefix via `_rename_all(body, prefix=...)` to avoid collisions across the merged module
 5. Remap function arguments to the merged module's args via `_fix_launch_func_args(body, prefix, arg_map)`

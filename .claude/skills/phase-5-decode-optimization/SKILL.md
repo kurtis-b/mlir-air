@@ -55,7 +55,7 @@ PRIMARY:
   deployment's profiling breakdown; the reference for what "good" looks like
 - `programming_examples/llms/<model>/docs/development_progress/phase4_prefill.md`
   — Phase 4 baseline (prefill numbers + the integration path used)
-- `programming_examples/llms/llama32_1b/multi_launch_builder/o_gemv_ffn_multi.py`
+- `programming_examples/llms/shared/builders/o_gemv_ffn_multi.py`
   — decode-specific merge pattern + 2-K extern kernel rename, in code
 - `programming_examples/kernel_registry/details/GEMV_bf16.md` — per-kernel
   constraints / placeability notes (the authority for that kernel's hard
@@ -65,14 +65,14 @@ PRIMARY:
 REFERENCE EXEMPLARS (read/mirror to compose your own decode ELFs; import
 directly only on a bit-for-bit kernel-sequence match):
 
-- `programming_examples/llms/llama32_1b/multi_launch_builder/rms_gemv_rope_multi.py`
+- `programming_examples/llms/shared/builders/rms_gemv_rope_multi.py`
   — fused 6-launch decode ELF for RMSNorm + Q/K/V GEMV + RoPE Q/K
-- `programming_examples/llms/llama32_1b/multi_launch_builder/o_gemv_ffn_multi.py`
+- `programming_examples/llms/shared/builders/o_gemv_ffn_multi.py`
   — fused 8-launch decode ELF (with 2-K extern rename for K=8192 Down)
-- `programming_examples/llms/llama32_1b/multi_launch_builder/lm_head_gemv_multi.py`
+- `programming_examples/llms/shared/builders/lm_head_gemv_multi.py`
   — vocab-partitioned LM Head GEMV (part of the model's decode assembly,
   built in Phase 3/finalize; profiled here, not a separate optimization)
-- `programming_examples/llms/llama_kernel_builder/` — the shared toolkit
+- `programming_examples/llms/shared/infra/` — the shared toolkit
   every decode-ELF build uses (KernelCache, stitching, external_kernels).
 
 ## Workflow
