@@ -1,0 +1,18 @@
+# Fork-only (kurtis-b/mlir-air): PR size gate required by the main ruleset.
+# Deliberate fork divergence of .github/workflows — listed in AGENTS.md's adoption record.
+name: PR size
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  size:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check added lines against the cap
+        run: |
+          git fetch origin main
+          bash agents/scripts/check_pr_size.sh

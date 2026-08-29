@@ -67,3 +67,7 @@ CLAUDE.md
 /docs/AIRTransformPasses.md
 /docs/AIRTransformOps.md
 /docs/build_info.json
+# --- agent-standards adoption (BOOTSTRAP PR): track the workflow's own files ---
+!CLAUDE.md
+!.claude/settings.json
+!.claude/hooks/
