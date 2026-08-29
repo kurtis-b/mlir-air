@@ -11,8 +11,14 @@
       "Bash(git push -u origin *)",
       "Bash(git push origin *)",
       "Bash(git push https://github.com/kurtis-b/*)",
-      "Bash(gh pr view *)", "Bash(gh pr checks *)", "Bash(gh pr list*)", "Bash(gh pr status*)",
-      "Bash(gh pr comment *)", "Bash(gh pr create *)", "Bash(gh pr edit *)", "Bash(gh pr close *)"
+      "Bash(gh pr view *)",
+      "Bash(gh pr checks *)",
+      "Bash(gh pr list*)",
+      "Bash(gh pr status*)",
+      "Bash(gh pr comment *)",
+      "Bash(gh pr create *)",
+      "Bash(gh pr edit *)",
+      "Bash(gh pr close *)"
     ],
     "deny": [
       "Bash(git push --force*)",
@@ -38,7 +44,9 @@
       "Bash(gh pr create *Xilinx/*)",
       "Bash(gh -R Xilinx/* pr create*)",
       "Bash(gh --repo Xilinx/* pr create*)",
-      "Bash(gh repo set-default Xilinx/*)"
+      "Bash(gh repo set-default Xilinx/*)",
+      "Bash(git remote set-url upstream*)",
+      "Bash(git remote set-url --push upstream*)"
     ]
   },
   "hooks": {
