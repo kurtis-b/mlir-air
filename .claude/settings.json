@@ -17,7 +17,16 @@
       "Bash(gh pr merge *)",
       "Bash(gh pr review *)",
       "Bash(gh * pr merge *)",
-      "Bash(gh * pr review *)"
+      "Bash(gh * pr review *)",
+      "Bash(git push upstream*)",
+      "Bash(git push * upstream *)",
+      "Bash(git push *Xilinx/*)",
+      "Bash(git remote set-url upstream*)",
+      "Bash(git remote set-url --push upstream*)",
+      "Bash(gh pr create *Xilinx/*)",
+      "Bash(gh -R Xilinx/* pr create*)",
+      "Bash(gh --repo Xilinx/* pr create*)",
+      "Bash(gh repo set-default Xilinx/*)"
     ]
   },
   "hooks": {
