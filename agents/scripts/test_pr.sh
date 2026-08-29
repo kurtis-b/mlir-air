@@ -20,7 +20,11 @@ cat <<'JSON'
 ]}
 JSON
 elif [[ "$1 $2" == "api user" ]]; then echo gatebot
-elif [[ "$1" == "repo" ]]; then echo x/y
+elif [[ "$1 $2" == "pr checks" ]]; then
+  if [[ " $* " == *" --required "* ]]; then
+    [ -n "${FAKE_REQUIRED:-}" ] && printf '%s' "$FAKE_REQUIRED" || { echo "no required checks reported on the branch"; exit 1; }
+  else printf '%s' "${FAKE_CHECKS:-[]}"; fi
+elif [[ "$1" == "repo" ]]; then echo "${GH_REPO:-unset}"
 fi
 EOF
 chmod +x "$FAKE/gh"
@@ -83,8 +87,27 @@ check "cleanup clears the global so it cannot fire twice" "" "$(cat "$FAKE/wt_af
 check "a second cleanup is a safe no-op" "0" "$(cat "$FAKE/wt_rc2")"
 check "the worktree directory is gone" "gone" "$([ ! -d "$FAKE/cleanup-wt" ] && echo gone)"
 
+echo "--- gh is pinned to origin's repository, whatever other remotes the clone has ---"
+check "GH_REPO is exported as owner/repo derived from origin" "yes" "$([[ "${GH_REPO:-}" == */* ]] && [[ "$(git remote get-url origin)" == *"$GH_REPO"* ]] && echo yes)"
+check "gh sees the pin (fake gh echoes GH_REPO)" "$GH_REPO" "$(repo)"
+check "https URL parses" "kurtis-b/mlir-air" "$(git() { echo https://github.com/kurtis-b/mlir-air.git; }; origin_repo; unset -f git)"
+check "scp-style ssh URL parses" "kurtis-b/mlir-air" "$(git() { echo git@github.com:kurtis-b/mlir-air.git; }; origin_repo; unset -f git)"
+check "ssh:// URL parses" "kurtis-b/mlir-air" "$(git() { echo ssh://git@github.com/kurtis-b/mlir-air; }; origin_repo; unset -f git)"
+
+echo "--- only required checks decide CI; offline hardware runners cannot wedge the gate ---"
+ALLPASS='[{"name":"size","bucket":"pass"},{"name":"Build and Test (Assert, 22.04)","bucket":"pass"}]'
+RYZEN='{"name":"Build and Test with AIE tools on Ryzen AI (amd8845hs)","bucket":"pending"}'
+cidec() { export FAKE_REQUIRED="$1" FAKE_CHECKS="$2"; ci_decide "$(ci_checks_json 3)"; }  # fixtures reach the fake gh
+check "no required checks + pending Ryzen runner -> PASS" "PASS" "$(cidec "" "${ALLPASS%]},${RYZEN}]")"
+check "no required checks + a pending non-hardware check -> PENDING" "PENDING" "$(cidec "" "${ALLPASS%]},{\"name\":\"C/C++ clang-tidy\",\"bucket\":\"pending\"}]")"
+check "no required checks + a FAILED Ryzen run still counts -> FAIL" "FAIL" "$(cidec "" "${ALLPASS%]},${RYZEN/pending/fail}]")"
+check "required checks named: only they decide (a pending optional one is ignored)" "PASS" "$(cidec '[{"name":"size","bucket":"pass"}]' "${ALLPASS%]},{\"name\":\"other\",\"bucket\":\"pending\"}]")"
+check "required checks named: a required failure -> FAIL" "FAIL" "$(cidec '[{"name":"size","bucket":"fail"}]' "$ALLPASS")"
+check "nothing reported yet -> NONE" "NONE" "$(cidec "" "[]")"
+check "unparseable output -> NONE, not a crash" "NONE" "$(cidec "" "garbage")"
+
 echo "--- every helper the commands call is defined (a refactor once dropped one) ---"
-for fn in die note need repo retry git_fetch gh_json cleanup_review_worktree gate_comments latest_record ensure_labels verdict_of run_branch_review_at instruction_paths unlink_symlinked_components materialize_base_instructions post_review_comment gate_login base_sha decl_digest latest_review_record latest_adjudication body_field cmd_open ci_state cmd_status cmd_land cmd_adjudicate; do
+for fn in die note need origin_repo repo retry ci_checks_json ci_decide git_fetch gh_json cleanup_review_worktree gate_comments latest_record ensure_labels verdict_of run_branch_review_at instruction_paths unlink_symlinked_components materialize_base_instructions post_review_comment gate_login base_sha decl_digest latest_review_record latest_adjudication body_field cmd_open ci_state cmd_status cmd_land cmd_adjudicate; do
   check "function $fn is defined" "yes" "$(declare -F "$fn" >/dev/null && echo yes)"
 done
 # and nothing in the command bodies calls a name that is neither a defined function nor a program

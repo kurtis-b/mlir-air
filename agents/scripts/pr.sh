@@ -20,7 +20,12 @@
 #   agents/scripts/pr.sh status <N>
 #       Show the gate inputs without acting.
 #
-# Environment: gh (authenticated), codex (authenticated), git remote `origin` = the only remote.
+# Environment: gh (authenticated), codex (authenticated). Every gh call is pinned to the repository
+# behind git remote `origin` (GH_REPO), whatever other remotes the clone carries — gh would otherwise
+# prefer a remote named `upstream`, which here is the pull-only Xilinx/mlir-air.
+# CI: only REQUIRED checks decide; while the base has no ruleset naming any, every check decides
+# except pending ones whose name matches PR_CI_OPTIONAL (default: the self-hosted Ryzen runners,
+# which sit pending forever when the boxes are offline) — a failure there still counts.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -28,6 +33,7 @@ STATE_DIR="${ROOT_DIR}/agents/.state"
 DEPS="${ROOT_DIR}/agents/scripts/check_pr_deps.sh"
 BASE="main"
 CI_TIMEOUT_MIN="${PR_CI_TIMEOUT_MIN:-30}"
+CI_OPTIONAL_RE="${PR_CI_OPTIONAL:-Ryzen AI}"
 mkdir -p "${STATE_DIR}"
 cd "${ROOT_DIR}"
 
@@ -36,6 +42,11 @@ note() { echo "pr.sh: $*" >&2; }
 need() { command -v "$1" >/dev/null 2>&1 || die "$1 not found on PATH"; }
 need gh; need git; need codex; need jq; need python3
 
+# owner/repo behind `origin`, for https, ssh and scp-style URLs. Exported as GH_REPO so gh never
+# resolves a PR number against another remote (a bare `gh pr view 3` here once meant Xilinx#3).
+origin_repo() { git remote get-url origin | sed -E 's#^(https?://[^/]+/|ssh://[^/]+/|[^@]+@[^:]+:)##; s#\.git/?$##'; }
+GH_REPO="$(origin_repo)"; export GH_REPO
+[[ "$GH_REPO" == */* ]] || die "cannot derive owner/repo from origin ($(git remote get-url origin 2>/dev/null))"
 repo() { gh repo view --json nameWithOwner --jq .nameWithOwner; }
 
 # Retry a command that talks to the network. Transient DNS/TLS/HTTP failures are common enough
@@ -303,26 +314,49 @@ BODY
 }
 
 # Waits for CI at the PR head. Prints PASS / FAIL / NONE.
+# The checks that decide CI at a PR head, as a JSON list: the required ones when the base's
+# ruleset names any; otherwise every reported check minus pending PR_CI_OPTIONAL matches.
+ci_checks_json() { # ci_checks_json <N>
+  local json
+  set +e
+  json="$(gh pr checks "$1" --required --json name,state,bucket 2>/dev/null)"
+  set -e
+  if printf '%s' "$json" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin) else 1)' 2>/dev/null; then
+    printf '%s' "$json"; return
+  fi
+  set +e
+  # gh pr checks exits 8 while checks are pending (and still prints JSON); never append to it.
+  json="$(gh pr checks "$1" --json name,state,bucket 2>/dev/null)"
+  set -e
+  printf '%s' "$json" | CI_OPTIONAL_RE="$CI_OPTIONAL_RE" python3 -c '
+import json, os, re, sys
+try: checks = json.load(sys.stdin)
+except Exception: checks = []
+opt = re.compile(os.environ["CI_OPTIONAL_RE"])
+print(json.dumps([c for c in checks if not (c.get("bucket") == "pending" and opt.search(c.get("name", "")))]))'
+}
+
+# One poll's verdict: NONE (nothing reported yet), FAIL, PENDING or PASS.
+ci_decide() { # ci_decide <checks-json>
+  printf '%s' "$1" | python3 -c '
+import json, sys
+try: checks = json.load(sys.stdin)
+except Exception: checks = []
+if not checks: print("NONE")
+elif any(c.get("bucket") in ("fail", "cancel") for c in checks): print("FAIL")
+elif any(c.get("bucket") == "pending" for c in checks): print("PENDING")
+else: print("PASS")'
+}
+
 ci_state() {
-  local n="$1" deadline=$(( $(date +%s) + CI_TIMEOUT_MIN * 60 ))
+  local n="$1" deadline=$(( $(date +%s) + CI_TIMEOUT_MIN * 60 )) verdict
   while :; do
-    # gh pr checks exits 8 while checks are pending (and still prints JSON); never append to it.
-    local json
-    set +e
-    json="$(gh pr checks "$n" --json name,state,bucket 2>/dev/null)"
-    set -e
-    printf '%s' "$json" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null || json='[]'
-    local total pending failed
-    total="$(printf '%s' "$json" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')"
-    if [ "$total" = "0" ]; then
-      if [ "$(date +%s)" -gt "$deadline" ]; then echo "NONE"; return; fi
-      sleep 20; continue
-    fi
-    pending="$(printf '%s' "$json" | python3 -c 'import json,sys; print(sum(1 for c in json.load(sys.stdin) if c.get("bucket")=="pending"))')"
-    failed="$(printf '%s' "$json" | python3 -c 'import json,sys; print(sum(1 for c in json.load(sys.stdin) if c.get("bucket") in ("fail","cancel")))')"
-    if [ "$failed" != "0" ]; then echo "FAIL"; return; fi
-    if [ "$pending" = "0" ]; then echo "PASS"; return; fi
-    if [ "$(date +%s)" -gt "$deadline" ]; then echo "TIMEOUT"; return; fi
+    verdict="$(ci_decide "$(ci_checks_json "$n")")"
+    case "$verdict" in
+      PASS|FAIL) echo "$verdict"; return ;;
+      NONE)      if [ "$(date +%s)" -gt "$deadline" ]; then echo "NONE"; return; fi ;;
+      *)         if [ "$(date +%s)" -gt "$deadline" ]; then echo "TIMEOUT"; return; fi ;;
+    esac
     sleep 20
   done
 }
