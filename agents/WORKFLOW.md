@@ -36,9 +36,11 @@ single source for the rules below; `AGENTS.md` adds only repo-specific context a
    implementation.
 5. Done = `agents/scripts/pr.sh open --weakened "none|<declaration>"` (pushes the branch,
    creates the PR) and `agents/scripts/pr.sh land <N>` (the gate, which runs the PR's single
-   review). One concern per PR; ≤ 500 added lines (`agents/scripts/check_pr_size.sh`; vendored
-   files, submodule bumps, lockfiles and declared generated files exempt; total churn above the
-   advisory threshold must be acknowledged in the review record).
+   review). One concern per PR; ≤ 500 added lines (`agents/scripts/check_pr_size.sh`; submodule
+   bumps and lockfiles exempt, vendored/generated files exempt only via exact-path
+   `PR-Size-Exempt` commit trailers, which the gate prints with their line counts and hands to
+   the review as declarations to judge; total churn above the advisory threshold must be
+   acknowledged in the review record).
 6. NEVER run `gh pr merge`, `gh pr review`, or the merge/review REST endpoints directly. The only
    merge path is `pr.sh land`, which verifies the gate first. `gh pr comment` is fine for notes.
 7. Dependent work waits: if the task depends on PR #N, run
@@ -80,6 +82,13 @@ when CI is red or timed out — the review binds to the reviewed SHA and its fin
 through `pr.sh adjudicate`, so a red CI does not cost a review. Network calls retry with backoff
 (`PR_NET_RETRIES`); the review worktree is removed however the review exits; a failure that
 survives the retries stops the gate with nothing recorded, so re-running `land` is always safe.
+
+`pr.sh land` and `pr.sh adjudicate` run from `origin/main`'s own copy of `pr.sh` and
+`check_pr_deps.sh` (materialised under `agents/.state/`), never the PR's — a PR that edits the
+gate cannot land itself through the edit; the one exception is the bootstrap PR that introduces
+the gate. Records bind `(H, B, declaration digest)`: a PASS lands only while the body's
+`Weakened checks:`/`Depends on:` lines still hash to the reviewed digest, and an adjudication
+binds the head and digest it was recorded at.
 
 `pr.sh land` re-checks that head and base are still `(H, B)` and merges exactly `H`
 (`--match-head-commit`) with a merge commit (branch history kept; branches not deleted). If the

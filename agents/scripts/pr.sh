@@ -28,9 +28,9 @@
 # which sit pending forever when the boxes are offline) — a failure there still counts.
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ROOT_DIR="${PR_SH_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 STATE_DIR="${ROOT_DIR}/agents/.state"
-DEPS="${ROOT_DIR}/agents/scripts/check_pr_deps.sh"
+DEPS="${PR_SH_DEPS:-${ROOT_DIR}/agents/scripts/check_pr_deps.sh}"
 BASE="main"
 CI_TIMEOUT_MIN="${PR_CI_TIMEOUT_MIN:-30}"
 CI_OPTIONAL_RE="${PR_CI_OPTIONAL:-Ryzen AI}"
@@ -126,9 +126,12 @@ run_branch_review_at() { # run_branch_review_at <sha> [<weakened-declaration>] [
   REVIEW_WORKTREE="$worktree"
   materialize_base_instructions "$worktree" "origin/${BASE}"
   local scope="The change under review is the current branch relative to origin/${BASE}: \`git diff origin/${BASE}...HEAD\` (commits: \`git log --oneline origin/${BASE}..HEAD\`)."
+  local exempt; exempt="$(git log --format='%(trailers:key=PR-Size-Exempt,valueonly)' "origin/${BASE}..${sha}" | tr ' ' '\n' | sed '/^$/d' | sort -u \
+    | while read -r p; do printf '%s (+%s) ' "$p" "$(git diff -M --numstat "origin/${BASE}...${sha}" -- "$p" | awk '$1!="-"{a+=$1} END{print a+0}')"; done)"
   local decl="PR body declarations to check against the diff:
 - Weakened checks: ${weakened:-<missing>}  (every weakened, deleted, skipped or loosened test, assertion, tolerance or timeout in the diff must be named here; an undeclared one is P1; 'none' must be true)
-- Depends on: ${depends:-<missing>}"
+- Depends on: ${depends:-<missing>}
+- Size exemptions (PR-Size-Exempt commit trailers, excluded from the 500-added-line count): ${exempt:-none}  (each must be a vendored/generated file, submodule bump or lockfile; authored code under an exemption is P1)"
   set +e
   REVIEW_TEXT="$( cd "$worktree" && { printf '%s\n\n%s\n\n%s\n' "$scope" "$decl" "$policy"; } | codex review - 2>/dev/null )"
   REVIEW_STATUS=$?
@@ -154,6 +157,26 @@ post_review_comment() { # post_review_comment <N> <sha> <base_sha> <decl_digest>
 
 gate_login() { gh api user --jq .login; }
 base_sha() { git_fetch "$BASE"; git rev-parse "origin/${BASE}"; }
+
+# `land`/`adjudicate` run from origin/$BASE's own copy of pr.sh and check_pr_deps.sh, never the
+# PR's: the ruleset has no review requirement, so the gate code IS the review requirement, and a
+# PR that edits cmd_land must not be able to land itself through the edit. Bootstrap: while
+# origin/$BASE has no pr.sh — the adoption PR itself — the working copy runs and says so.
+trusted_exec() { # trusted_exec <argv...>
+  [ -z "${PR_SH_TRUSTED:-}" ] || return 0
+  git_fetch "$BASE"
+  if ! git cat-file -e "origin/${BASE}:agents/scripts/pr.sh" 2>/dev/null; then
+    note "BOOTSTRAP: origin/${BASE} has no agents/scripts/pr.sh yet; running the working copy"
+    export PR_SH_TRUSTED=bootstrap; return 0
+  fi
+  local dir; dir="${STATE_DIR}/trusted-$(git rev-parse --short "origin/${BASE}")"
+  mkdir -p "$dir"
+  git show "origin/${BASE}:agents/scripts/pr.sh" > "$dir/pr.sh"
+  if ! git show "origin/${BASE}:agents/scripts/check_pr_deps.sh" > "$dir/check_pr_deps.sh" 2>/dev/null; then cp "$DEPS" "$dir/check_pr_deps.sh"; fi
+  chmod +x "$dir/pr.sh" "$dir/check_pr_deps.sh"
+  cmp -s "$dir/pr.sh" "${BASH_SOURCE[0]}" || note "gate code differs from origin/${BASE}; running the trusted copy"
+  PR_SH_TRUSTED=1 PR_SH_ROOT="$ROOT_DIR" PR_SH_DEPS="$dir/check_pr_deps.sh" exec bash "$dir/pr.sh" "$@"
+}
 
 # Codex loads AGENTS.md / AGENTS.override.md (root and nested), CLAUDE.md and .codex/ from the
 # tree it runs in. In a
@@ -204,7 +227,9 @@ materialize_base_instructions() { # materialize_base_instructions <worktree> <ba
 gate_comments() { # gate_comments <N> <login>
   local n="$1" me="$2" json
   json="$(retry gh pr view "$n" --json comments)" || return 1
-  printf '%s' "$json" | jq -r --arg me "$me" '.comments[] | select(.author.login == $me) | .body' 2>/dev/null || return 1
+  # Only a gate comment's FIRST line is a record: the review text appended after the header is
+  # untrusted Codex output and may quote marker-shaped lines for the same SHA.
+  printf '%s' "$json" | jq -r --arg me "$me" '.comments[] | select(.author.login == $me) | (.body | split("\n")[0])' 2>/dev/null || return 1
 }
 
 # The latest record matching <regex> in <login>'s comments on PR <N>, or "" when there is none.
@@ -228,9 +253,9 @@ latest_review_record() { # latest_review_record <N> <login>
 # The latest adjudication record on PR <N> by <login>: "reviewed_sha fixed_sha" or "".
 latest_adjudication() { # latest_adjudication <N> <login>
   local line
-  line="$(latest_record "$1" "$2" '<!-- codex-adjudication reviewed=[0-9a-f]+ fixed=[0-9a-f]+ -->')" || return 1
+  line="$(latest_record "$1" "$2" '<!-- codex-adjudication reviewed=[0-9a-f]+ fixed=[0-9a-f]+ decl=[0-9a-f]+ -->')" || return 1
   [ -n "$line" ] || return 0
-  printf '%s\n' "$line" | sed -nE 's/.*reviewed=([0-9a-f]+) fixed=([0-9a-f]+).*/\1 \2/p'
+  printf '%s\n' "$line" | sed -nE 's/.*reviewed=([0-9a-f]+) fixed=([0-9a-f]+) decl=([0-9a-f]+).*/\1 \2 \3/p'
   return 0
 }
 
@@ -415,11 +440,11 @@ cmd_land() {
   #    - PASS recorded: only the reviewed head may land (a new head needs... nothing more: the
   #      budget is spent, so a head that differs from the reviewed one needs an adjudication).
   #    - BLOCK recorded: the current head must be the one named by `pr.sh adjudicate`.
+  local digest; digest="$(decl_digest "$weak" "$deps")"
   local me; me="$(gate_login)"
   local record; record="$(latest_review_record "$n" "$me")"
   local r_sha r_base r_decl r_verdict
   if [ -z "$record" ]; then
-    local digest; digest="$(decl_digest "$weak" "$deps")"
     local attempt verdict=""
     for attempt in 1 2; do
       note "running the PR's single Codex branch review at ${sha:0:10} against ${base:0:10} (attempt ${attempt})"
@@ -441,19 +466,22 @@ cmd_land() {
     note "review budget already spent: ${r_verdict} at ${r_sha:0:10}"
     case "$r_verdict" in
       PASS)
-        if [ "$r_sha" != "$sha" ]; then
+        if [ "$r_sha" = "$sha" ]; then
+          # Same head, but the body's declarations may have been edited since the review.
+          [ "$r_decl" = "$digest" ] || refusals+=("PR body declarations changed since the review (digest ${r_decl} -> ${digest}): restore them, or push a commit and record the change with \`pr.sh adjudicate $n --text ...\`")
+        else
           local adj; adj="$(latest_adjudication "$n" "$me")"
-          local a_rev a_fixed; read -r a_rev a_fixed <<<"${adj:-x x}"
-          if [ "$a_rev" != "$r_sha" ] || [ "$a_fixed" != "$sha" ]; then
-            refusals+=("head ${sha:0:10} differs from the reviewed head ${r_sha:0:10} and no adjudication names it: run \`pr.sh adjudicate $n --text ...\` at this head")
+          local a_rev a_fixed a_decl; read -r a_rev a_fixed a_decl <<<"${adj:-x x x}"
+          if [ "$a_rev" != "$r_sha" ] || [ "$a_fixed" != "$sha" ] || [ "$a_decl" != "$digest" ]; then
+            refusals+=("head ${sha:0:10} or its declarations differ from the reviewed state (review at ${r_sha:0:10}) and no adjudication binds both: run \`pr.sh adjudicate $n --text ...\` at this head")
           fi
         fi
         ;;
       BLOCK)
         local adj; adj="$(latest_adjudication "$n" "$me")"
-        local a_rev a_fixed; read -r a_rev a_fixed <<<"${adj:-x x}"
-        if [ "$a_rev" != "$r_sha" ] || [ "$a_fixed" != "$sha" ]; then
-          refusals+=("review BLOCKed at ${r_sha:0:10}; landing needs fixes pushed and \`pr.sh adjudicate $n --text ...\` recorded at the current head ${sha:0:10}")
+        local a_rev a_fixed a_decl; read -r a_rev a_fixed a_decl <<<"${adj:-x x x}"
+        if [ "$a_rev" != "$r_sha" ] || [ "$a_fixed" != "$sha" ] || [ "$a_decl" != "$digest" ]; then
+          refusals+=("review BLOCKed at ${r_sha:0:10}; landing needs fixes pushed and \`pr.sh adjudicate $n --text ...\` recorded at the current head ${sha:0:10} with the current declarations")
         fi
         ;;
       *)
@@ -509,7 +537,12 @@ cmd_adjudicate() {
   local r_sha r_base r_decl r_verdict; read -r r_sha r_base r_decl r_verdict <<<"$record"
   local sha; sha="$(gh_json pr view "$n" --json headRefOid --jq .headRefOid)"
   [ "$sha" != "$r_sha" ] || die "head ${sha:0:10} is the reviewed head; push the fixes first"
-  retry gh pr comment "$n" --body "$(printf '<!-- codex-adjudication reviewed=%s fixed=%s -->\n## Adjudication of the Codex review at `%s`, resolved at `%s`\n\n%s\n' "$r_sha" "$sha" "${r_sha:0:10}" "${sha:0:10}" "$text")" >/dev/null ||
+  local body; body="$(gh_json pr view "$n" --json body --jq .body)"
+  local weak deps; weak="$(body_field "$body" "Weakened checks")"; deps="$(body_field "$body" "Depends on")"
+  [ -n "$weak" ] || die "PR body has no 'Weakened checks:' line"
+  local digest; digest="$(decl_digest "$weak" "$deps")"
+  [ "$digest" = "$r_decl" ] || note "declarations changed since the review (digest ${r_decl} -> ${digest}); this adjudication binds the current ones"
+  retry gh pr comment "$n" --body "$(printf '<!-- codex-adjudication reviewed=%s fixed=%s decl=%s -->\n## Adjudication of the Codex review at `%s`, resolved at `%s`\n\n%s\n' "$r_sha" "$sha" "$digest" "${r_sha:0:10}" "${sha:0:10}" "$text")" >/dev/null ||
     die "could not post the adjudication for #${n}"
   echo "ADJUDICATED #$n: review ${r_sha:0:10} -> fixes at ${sha:0:10}"
 }
@@ -518,8 +551,8 @@ cmd_adjudicate() {
 [[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0 2>/dev/null || true
 case "${1:-}" in
   open) shift; cmd_open "$@" ;;
-  land) [ $# -ge 2 ] || die "usage: pr.sh land <N>"; cmd_land "$2" ;;
-  adjudicate) [ $# -ge 2 ] || die "usage: pr.sh adjudicate <N> --text ..."; n="$2"; shift 2; cmd_adjudicate "$n" "$@" ;;
+  land) [ $# -ge 2 ] || die "usage: pr.sh land <N>"; trusted_exec "$@"; cmd_land "$2" ;;
+  adjudicate) [ $# -ge 2 ] || die "usage: pr.sh adjudicate <N> --text ..."; trusted_exec "$@"; n="$2"; shift 2; cmd_adjudicate "$n" "$@" ;;
   status) [ $# -ge 2 ] || die "usage: pr.sh status <N>"; cmd_status "$2" ;;
   -h|--help|"") sed -n '2,24p' "$0" ;;
   *) die "unknown command $1" ;;

@@ -2,8 +2,9 @@
 # PR size gate (repo policy, LOOP-QUEUE 2b): <=500 ADDED lines vs the merge-base with
 # origin/main, rename-aware. Churn (added+deleted) above the advisory threshold does not
 # fail the gate but must be acknowledged in the review.
-# Exemptions (declared in the PR body, adjudicated by the human, not this script):
-# submodule pointer bumps, lockfiles, generated files.
+# Exemptions: submodule pointer bumps and lockfiles always; vendored/generated files only via
+# exact-path `PR-Size-Exempt` commit trailers, which are printed here with their added-line counts
+# and handed to the landing gate's review as declarations (authored code under one is P1 there).
 set -euo pipefail
 CAP=${PR_SIZE_CAP:-500}
 CHURN_ADVISORY=${PR_CHURN_ADVISORY:-2000}
@@ -15,8 +16,13 @@ base=$(git merge-base HEAD origin/main)
 exempt_args=()
 while IFS= read -r spec; do
   [ -n "$spec" ] || continue
+  case "$spec" in *'*'*|*'?'*|*'['*) echo "FAIL: PR-Size-Exempt '$spec' is a pattern; exemptions must be exact paths"; exit 1;; esac
+  if ! git diff --name-only "$base"..HEAD -- "$spec" | grep -q .; then
+    echo "FAIL: PR-Size-Exempt '$spec' matches nothing in the diff"; exit 1
+  fi
+  added=$(git diff -M --numstat "$base"..HEAD -- "$spec" | awk '$1!="-"{a+=$1} END{print a+0}')
   exempt_args+=(":(exclude)$spec")
-  echo "EXEMPT (declared by trailer): $spec"
+  echo "EXEMPT (declared by trailer): $spec (+$added)"
 done < <(git log --format='%(trailers:key=PR-Size-Exempt,valueonly)' "$base"..HEAD | tr ' ' '\n' | sed '/^$/d' | sort -u)
 read -r ins del <<<"$(git diff -M --numstat "$base"..HEAD \
   -- ':(exclude).gitmodules' ':(exclude)*.lock' ${exempt_args[@]+"${exempt_args[@]}"} \

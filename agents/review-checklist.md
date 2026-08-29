@@ -28,7 +28,8 @@ Check, in this order:
    (naming the existing file/symbol and its compatibility) or `no smaller alternative` with the
    search scope. Structure/behavior mixing is reported at its normal severity when it creates
    concrete risk — never ahead of a real blocker.
-5. **Scope** — no unrelated changes; ≤ 500 added lines unless the PR body declares the vendored/
-   generated exemption; churn advisory acknowledged when fired; `.claude/skills` is the canonical
+5. **Scope** — no unrelated changes; ≤ 500 added lines net of the `PR-Size-Exempt` trailers listed
+   in the declarations — each exempt path must be a vendored/generated file, submodule bump or
+   lockfile, and authored code under one is P1; churn advisory acknowledged when fired; `.claude/skills` is the canonical
    coding-skill home and `.codex/skills` is the findings-only reviewer manifest — a change that
    re-drifts them is P2.
