@@ -55,10 +55,12 @@ single source for the rules below; `AGENTS.md` adds only repo-specific context a
 A PR lands when, at its current head `H` and the current `origin/main` `B`:
 
 1. `H` contains `B` (a stale branch is synced with `git merge origin/main`);
-2. CI is green at `H` (`gh pr checks --required`; the self-hosted Ryzen runners count only when
-   they are required checks — offline hardware runners must not wedge a docs-only PR. Until the
-   ruleset names required checks, every check decides except pending ones matching
-   `PR_CI_OPTIONAL`, default the Ryzen runners; a failure there still counts);
+2. CI is green at `H`: every check the `main` ruleset requires has reported and passed — one that
+   has not reported yet is pending, never absent (matrix jobs register late). The self-hosted
+   Ryzen runners count only when they are required checks — offline hardware runners must not
+   wedge a docs-only PR. Without a ruleset, every reported check and every workflow run at `H`
+   decide, except names matching `PR_CI_OPTIONAL` (default the Ryzen runners), which never
+   count;
 3. the PR body's `Weakened checks:` line is present (`none` or names each one) and its
    `Depends on:` PRs are all MERGED;
 4. the PR's **single Codex review** is satisfied:

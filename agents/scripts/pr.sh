@@ -23,9 +23,10 @@
 # Environment: gh (authenticated), codex (authenticated). Every gh call is pinned to the repository
 # behind git remote `origin` (GH_REPO), whatever other remotes the clone carries — gh would otherwise
 # prefer a remote named `upstream`, which here is the pull-only Xilinx/mlir-air.
-# CI: only REQUIRED checks decide; while the base has no ruleset naming any, every check decides
-# except pending ones whose name matches PR_CI_OPTIONAL (default: the self-hosted Ryzen runners,
-# which sit pending forever when the boxes are offline) — a failure there still counts.
+# CI: the base ruleset's REQUIRED checks decide, and one that has not reported yet is pending.
+# While the base has no ruleset, every reported check and every workflow run at the head decide,
+# except names matching PR_CI_OPTIONAL (default: the self-hosted Ryzen runners, which never start
+# on this fork) — those never count, pending or failed.
 set -euo pipefail
 
 ROOT_DIR="${PR_SH_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
@@ -339,26 +340,45 @@ BODY
 }
 
 # Waits for CI at the PR head. Prints PASS / FAIL / NONE.
-# The checks that decide CI at a PR head, as a JSON list: the required ones when the base's
-# ruleset names any; otherwise every reported check minus pending PR_CI_OPTIONAL matches.
-ci_checks_json() { # ci_checks_json <N>
-  local json
-  set +e
-  json="$(gh pr checks "$1" --required --json name,state,bucket 2>/dev/null)"
-  set -e
-  if printf '%s' "$json" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin) else 1)' 2>/dev/null; then
-    printf '%s' "$json"; return
+# The checks that decide CI at a PR head, as a JSON list. With a ruleset on the base, the
+# required set decides — and a required check that has not REPORTED yet is pending: a matrix
+# job is registered only when its workflow reaches it, so "everything reported passes" is not
+# "CI passed" (PR #3's first run read PASS with 8 of 28 checks registered). Without a ruleset,
+# every reported check decides except PR_CI_OPTIONAL matches (which never count, pending or
+# failed — WORKFLOW.md: non-required hardware runners do not count at all), and every
+# non-optional workflow RUN at the head must have completed.
+ci_checks_json() { # ci_checks_json <N> <sha>
+  local n="$1" sha="$2" json required
+  required="$(gh api "repos/${GH_REPO}/rules/branches/${BASE}" --jq '[.[] | select(.type=="required_status_checks") | .parameters.required_status_checks[].context]' 2>/dev/null || echo '[]')"
+  printf '%s' "$required" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin) else 1)' 2>/dev/null || required='[]'
+  if [ "$required" != '[]' ]; then
+    set +e
+    json="$(gh pr checks "$n" --required --json name,state,bucket 2>/dev/null)"
+    set -e
+    printf '%s' "$json" | REQUIRED="$required" python3 -c '
+import json, os, sys
+try: checks = json.load(sys.stdin)
+except Exception: checks = []
+names = {c.get("name") for c in checks}
+missing = [r for r in json.loads(os.environ["REQUIRED"]) if r not in names]
+print(json.dumps(checks + [{"name": m, "bucket": "pending", "state": "UNREPORTED"} for m in missing]))'
+    return
   fi
   set +e
   # gh pr checks exits 8 while checks are pending (and still prints JSON); never append to it.
-  json="$(gh pr checks "$1" --json name,state,bucket 2>/dev/null)"
+  json="$(gh pr checks "$n" --json name,state,bucket 2>/dev/null)"
   set -e
-  printf '%s' "$json" | CI_OPTIONAL_RE="$CI_OPTIONAL_RE" python3 -c '
+  local runs; runs="$(gh run list --commit "$sha" --json status,workflowName --jq '[.[] | select(.status != "completed") | .workflowName]' 2>/dev/null || echo '[]')"
+  printf '%s' "$json" | CI_OPTIONAL_RE="$CI_OPTIONAL_RE" RUNS="$runs" python3 -c '
 import json, os, re, sys
 try: checks = json.load(sys.stdin)
 except Exception: checks = []
 opt = re.compile(os.environ["CI_OPTIONAL_RE"])
-print(json.dumps([c for c in checks if not (c.get("bucket") == "pending" and opt.search(c.get("name", "")))]))'
+checks = [c for c in checks if not opt.search(c.get("name", ""))]
+try: runs = json.loads(os.environ["RUNS"])
+except Exception: runs = []
+checks += [{"name": "run:" + w, "bucket": "pending", "state": "IN_PROGRESS"} for w in runs if not opt.search(w)]
+print(json.dumps(checks))'
 }
 
 # One poll's verdict: NONE (nothing reported yet), FAIL, PENDING or PASS.
@@ -373,10 +393,10 @@ elif any(c.get("bucket") == "pending" for c in checks): print("PENDING")
 else: print("PASS")'
 }
 
-ci_state() {
-  local n="$1" deadline=$(( $(date +%s) + CI_TIMEOUT_MIN * 60 )) verdict
+ci_state() { # ci_state <N> <sha>
+  local n="$1" sha="$2" deadline=$(( $(date +%s) + CI_TIMEOUT_MIN * 60 )) verdict
   while :; do
-    verdict="$(ci_decide "$(ci_checks_json "$n")")"
+    verdict="$(ci_decide "$(ci_checks_json "$n" "$sha")")"
     case "$verdict" in
       PASS|FAIL) echo "$verdict"; return ;;
       NONE)      if [ "$(date +%s)" -gt "$deadline" ]; then echo "NONE"; return; fi ;;
@@ -431,7 +451,7 @@ cmd_land() {
 
   # 3. CI at head
   note "waiting for CI (timeout ${CI_TIMEOUT_MIN} min)"
-  local ci; ci="$(ci_state "$n")"
+  local ci; ci="$(ci_state "$n" "$sha")"
   note "CI: ${ci}"
   [ "$ci" = "PASS" ] || refusals+=("CI at ${sha:0:10} is ${ci}")
 

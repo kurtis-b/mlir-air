@@ -21,6 +21,8 @@ cat <<'JSON'
 ]}
 JSON
 elif [[ "$1 $2" == "api user" ]]; then echo gatebot
+elif [[ "$1 $2" == api\ repos/*/rules/branches/* ]]; then printf '%s' "${FAKE_REQUIRED_SET:-[]}"
+elif [[ "$1 $2" == "run list" ]]; then printf '%s' "${FAKE_RUNS:-[]}"
 elif [[ "$1 $2" == "pr checks" ]]; then
   if [[ " $* " == *" --required "* ]]; then
     [ -n "${FAKE_REQUIRED:-}" ] && printf '%s' "$FAKE_REQUIRED" || { echo "no required checks reported on the branch"; exit 1; }
@@ -31,6 +33,7 @@ EOF
 chmod +x "$FAKE/gh"
 for t in codex jq python3 git; do command -v "$t" >/dev/null || { echo "need $t"; exit 2; }; done
 PATH="$FAKE:$PATH"
+export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@x GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@x
 # shellcheck source=pr.sh
 source "$HERE/pr.sh"
 set +e +o pipefail   # pr.sh enables errexit; the test harness must keep running past failures
@@ -78,7 +81,10 @@ check "a readable PR with no matching record succeeds with empty output" "0:" \
 
 echo "--- worktree cleanup is one-shot, idempotent and safe when nothing is registered ---"
 check "cleanup with nothing registered is a no-op" "0" "$(REVIEW_WORKTREE=""; cleanup_review_worktree; echo $?)"
-WTDIR="$FAKE/repo"; ( cd "$WTDIR" && git worktree add -q --detach "$FAKE/cleanup-wt" HEAD 2>/dev/null ) || true
+WTDIR="$FAKE/cleanup-repo"
+( git init -q -b main "$WTDIR" && git -C "$WTDIR" commit -q --allow-empty -m seed && git -C "$WTDIR" worktree add -q --detach "$FAKE/cleanup-wt" HEAD ) \
+  || { fail=$((fail+1)); echo "FAIL  fixture: cleanup repo + worktree"; }
+check "fixture: the worktree to clean up exists" "yes" "$([ -d "$FAKE/cleanup-wt" ] && echo yes)"
 ( cd "$WTDIR"
   REVIEW_WORKTREE="$FAKE/cleanup-wt"
   cleanup_review_worktree
@@ -98,12 +104,16 @@ check "ssh:// URL parses" "kurtis-b/mlir-air" "$(git() { echo ssh://git@github.c
 echo "--- only required checks decide CI; offline hardware runners cannot wedge the gate ---"
 ALLPASS='[{"name":"size","bucket":"pass"},{"name":"Build and Test (Assert, 22.04)","bucket":"pass"}]'
 RYZEN='{"name":"Build and Test with AIE tools on Ryzen AI (amd8845hs)","bucket":"pending"}'
-cidec() { export FAKE_REQUIRED="$1" FAKE_CHECKS="$2"; ci_decide "$(ci_checks_json 3)"; }  # fixtures reach the fake gh
+cidec() { export FAKE_REQUIRED="$1" FAKE_CHECKS="$2" FAKE_REQUIRED_SET="${3:-[]}" FAKE_RUNS="${4:-[]}"; ci_decide "$(ci_checks_json 3 deadbeef)"; }  # fixtures reach the fake gh
 check "no required checks + pending Ryzen runner -> PASS" "PASS" "$(cidec "" "${ALLPASS%]},${RYZEN}]")"
 check "no required checks + a pending non-hardware check -> PENDING" "PENDING" "$(cidec "" "${ALLPASS%]},{\"name\":\"C/C++ clang-tidy\",\"bucket\":\"pending\"}]")"
-check "no required checks + a FAILED Ryzen run still counts -> FAIL" "FAIL" "$(cidec "" "${ALLPASS%]},${RYZEN/pending/fail}]")"
-check "required checks named: only they decide (a pending optional one is ignored)" "PASS" "$(cidec '[{"name":"size","bucket":"pass"}]' "${ALLPASS%]},{\"name\":\"other\",\"bucket\":\"pending\"}]")"
-check "required checks named: a required failure -> FAIL" "FAIL" "$(cidec '[{"name":"size","bucket":"fail"}]' "$ALLPASS")"
+check "no required checks + a FAILED Ryzen run: not required, never counts -> PASS" "PASS" "$(cidec "" "${ALLPASS%]},${RYZEN/pending/fail}]")"
+check "no required checks + a workflow run still in progress (matrix jobs unregistered) -> PENDING" "PENDING" "$(cidec "" "$ALLPASS" "[]" '["Build mlir-air Wheels"]')"
+check "no required checks + only the Ryzen workflow run in progress -> PASS" "PASS" "$(cidec "" "$ALLPASS" "[]" '["Build and Test with AIE tools on Ryzen AI"]')"
+check "ruleset names checks: only they decide (a pending non-required one is ignored)" "PASS" "$(cidec '[{"name":"size","bucket":"pass"}]' "${ALLPASS%]},{\"name\":\"other\",\"bucket\":\"pending\"}]" '["size"]')"
+check "ruleset names checks: a required failure -> FAIL" "FAIL" "$(cidec '[{"name":"size","bucket":"fail"}]' "$ALLPASS" '["size"]')"
+check "ruleset names checks: a required check not yet reported -> PENDING, not PASS" "PENDING" "$(cidec '[{"name":"size","bucket":"pass"}]' "$ALLPASS" '["size","Build and Test (Assert, 22.04)"]')"
+check "ruleset names checks: all required reported and passing -> PASS" "PASS" "$(cidec '[{"name":"size","bucket":"pass"},{"name":"Build and Test (Assert, 22.04)","bucket":"pass"}]' "$ALLPASS" '["size","Build and Test (Assert, 22.04)"]')"
 check "nothing reported yet -> NONE" "NONE" "$(cidec "" "[]")"
 check "unparseable output -> NONE, not a crash" "NONE" "$(cidec "" "garbage")"
 
@@ -155,7 +165,6 @@ check "P1 wins over a claimed PASS" "BLOCK" "$(verdict_of $'- [P1] x\nVERDICT: P
 
 echo "--- materialize_base_instructions: deletions and symlinks on the head cannot escape the base policy ---"
 REPO="$FAKE/repo"; git init -q -b main "$REPO" || { echo "FAIL  fixture: git init"; exit 1; }
-export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@x GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@x
 ( cd "$REPO" && printf 'BASE POLICY\n' > AGENTS.md && mkdir -p .codex sub && printf 'base codex\n' > .codex/config.toml \
   && printf 'nested base\n' > sub/AGENTS.md && git add -A && git commit -q -m base && git branch -q base-ref \
   && git rm -q AGENTS.md sub/AGENTS.md && rm -rf .codex && printf 'victim\n' > "$FAKE/victim" \
