@@ -1,0 +1,3 @@
+[submodule "agent-standards"]
+	path = agent-standards
+	url = https://github.com/kurtis-b/agent-standards.git

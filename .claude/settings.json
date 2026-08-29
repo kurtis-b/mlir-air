@@ -1,0 +1,37 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git push -uf*)",
+      "Bash(git push -fu*)",
+      "Bash(git push * :*)",
+      "Bash(git push :*)",
+      "Bash(git push --mirror*)",
+      "Bash(git push --all*)",
+      "Bash(git push * main*)",
+      "Bash(git push *:main)",
+      "Bash(git reset --hard*)",
+      "Bash(git switch main*)",
+      "Bash(git checkout main*)",
+      "Bash(gh pr merge *)",
+      "Bash(gh pr review *)",
+      "Bash(gh * pr merge *)",
+      "Bash(gh * pr review *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
