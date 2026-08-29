@@ -65,8 +65,9 @@ A PR lands when, at its current head `H` and the current `origin/main` `B`:
    has not reported yet is pending, never absent (matrix jobs register late). The self-hosted
    Ryzen runners count only when they are required checks — offline hardware runners must not
    wedge a docs-only PR. Without a ruleset, every reported check and every workflow run at `H`
-   decide, except names matching `PR_CI_OPTIONAL` (default the Ryzen runners), which never
-   count;
+   decide (a run that ends without ever creating a job check — a startup failure — fails),
+   except names matching `PR_CI_OPTIONAL` (default the Ryzen runners), which never count; a
+   ruleset or run list that cannot be read counts as pending, never as "nothing required";
 3. the PR body's `Weakened checks:` line is present (`none` or names each one) and its
    `Depends on:` PRs are all MERGED;
 4. the PR's **single Codex review** is satisfied:

@@ -345,12 +345,19 @@ BODY
 # job is registered only when its workflow reaches it, so "everything reported passes" is not
 # "CI passed" (PR #3's first run read PASS with 8 of 28 checks registered). Without a ruleset,
 # every reported check decides except PR_CI_OPTIONAL matches (which never count, pending or
-# failed — WORKFLOW.md: non-required hardware runners do not count at all), and every
-# non-optional workflow RUN at the head must have completed.
+# failed — WORKFLOW.md: non-required hardware runners do not count at all), plus every
+# non-optional workflow RUN at the head: still running -> pending; completed with a failure-like
+# conclusion (a startup_failure never creates a job check) -> fail. FAIL CLOSED: a ruleset or
+# run-list read that stays unreadable after the retries is "not yet known", synthesised as
+# pending, never as "nothing required".
 ci_checks_json() { # ci_checks_json <N> <sha>
-  local n="$1" sha="$2" json required
-  required="$(gh api "repos/${GH_REPO}/rules/branches/${BASE}" --jq '[.[] | select(.type=="required_status_checks") | .parameters.required_status_checks[].context]' 2>/dev/null || echo '[]')"
-  printf '%s' "$required" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin) else 1)' 2>/dev/null || required='[]'
+  local n="$1" sha="$2" json required runs
+  if ! required="$(gh_json api "repos/${GH_REPO}/rules/branches/${BASE}" --jq '[.[] | select(.type=="required_status_checks") | .parameters.required_status_checks[].context]' 2>/dev/null)"; then
+    echo '[{"name":"ruleset lookup","bucket":"pending","state":"UNREADABLE"}]'; return
+  fi
+  if ! printf '%s' "$required" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+    echo '[{"name":"ruleset lookup","bucket":"pending","state":"MALFORMED"}]'; return
+  fi
   if [ "$required" != '[]' ]; then
     set +e
     json="$(gh pr checks "$n" --required --json name,state,bucket 2>/dev/null)"
@@ -368,7 +375,9 @@ print(json.dumps(checks + [{"name": m, "bucket": "pending", "state": "UNREPORTED
   # gh pr checks exits 8 while checks are pending (and still prints JSON); never append to it.
   json="$(gh pr checks "$n" --json name,state,bucket 2>/dev/null)"
   set -e
-  local runs; runs="$(gh run list --commit "$sha" --json status,workflowName --jq '[.[] | select(.status != "completed") | .workflowName]' 2>/dev/null || echo '[]')"
+  if ! runs="$(gh_json run list --commit "$sha" --json status,conclusion,workflowName 2>/dev/null)"; then
+    echo '[{"name":"workflow-run lookup","bucket":"pending","state":"UNREADABLE"}]'; return
+  fi
   printf '%s' "$json" | CI_OPTIONAL_RE="$CI_OPTIONAL_RE" RUNS="$runs" python3 -c '
 import json, os, re, sys
 try: checks = json.load(sys.stdin)
@@ -376,8 +385,13 @@ except Exception: checks = []
 opt = re.compile(os.environ["CI_OPTIONAL_RE"])
 checks = [c for c in checks if not opt.search(c.get("name", ""))]
 try: runs = json.loads(os.environ["RUNS"])
-except Exception: runs = []
-checks += [{"name": "run:" + w, "bucket": "pending", "state": "IN_PROGRESS"} for w in runs if not opt.search(w)]
+except Exception: runs = [{"workflowName": "workflow-run lookup", "status": "MALFORMED"}]
+BAD = {"failure", "cancelled", "timed_out", "startup_failure", "action_required", "stale"}
+for r in runs:
+    w = r.get("workflowName", "")
+    if opt.search(w): continue
+    if r.get("status") != "completed": checks.append({"name": "run:" + w, "bucket": "pending", "state": str(r.get("status"))})
+    elif r.get("conclusion") in BAD: checks.append({"name": "run:" + w, "bucket": "fail", "state": str(r.get("conclusion"))})
 print(json.dumps(checks))'
 }
 

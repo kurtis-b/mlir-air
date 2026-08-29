@@ -21,8 +21,8 @@ cat <<'JSON'
 ]}
 JSON
 elif [[ "$1 $2" == "api user" ]]; then echo gatebot
-elif [[ "$1 $2" == api\ repos/*/rules/branches/* ]]; then printf '%s' "${FAKE_REQUIRED_SET:-[]}"
-elif [[ "$1 $2" == "run list" ]]; then printf '%s' "${FAKE_RUNS:-[]}"
+elif [[ "$1 $2" == api\ repos/*/rules/branches/* ]]; then [ -z "${FAKE_RULES_FAIL:-}" ] || exit 1; printf '%s' "${FAKE_REQUIRED_SET:-[]}"
+elif [[ "$1 $2" == "run list" ]]; then [ -z "${FAKE_RUNS_FAIL:-}" ] || exit 1; printf '%s' "${FAKE_RUNS:-[]}"
 elif [[ "$1 $2" == "pr checks" ]]; then
   if [[ " $* " == *" --required "* ]]; then
     [ -n "${FAKE_REQUIRED:-}" ] && printf '%s' "$FAKE_REQUIRED" || { echo "no required checks reported on the branch"; exit 1; }
@@ -104,12 +104,21 @@ check "ssh:// URL parses" "kurtis-b/mlir-air" "$(git() { echo ssh://git@github.c
 echo "--- only required checks decide CI; offline hardware runners cannot wedge the gate ---"
 ALLPASS='[{"name":"size","bucket":"pass"},{"name":"Build and Test (Assert, 22.04)","bucket":"pass"}]'
 RYZEN='{"name":"Build and Test with AIE tools on Ryzen AI (amd8845hs)","bucket":"pending"}'
-cidec() { export FAKE_REQUIRED="$1" FAKE_CHECKS="$2" FAKE_REQUIRED_SET="${3:-[]}" FAKE_RUNS="${4:-[]}"; ci_decide "$(ci_checks_json 3 deadbeef)"; }  # fixtures reach the fake gh
+cidec() { RETRIES=1; RETRY_SLEEP=0; export FAKE_REQUIRED="$1" FAKE_CHECKS="$2" FAKE_REQUIRED_SET="${3:-[]}" FAKE_RUNS="${4:-[]}"; ci_decide "$(ci_checks_json 3 deadbeef)"; }  # fixtures reach the fake gh
+RUN_WHEELS='{"status":"in_progress","conclusion":null,"workflowName":"Build mlir-air Wheels"}'
+RUN_RYZEN='{"status":"queued","conclusion":null,"workflowName":"Build and Test with AIE tools on Ryzen AI"}'
 check "no required checks + pending Ryzen runner -> PASS" "PASS" "$(cidec "" "${ALLPASS%]},${RYZEN}]")"
 check "no required checks + a pending non-hardware check -> PENDING" "PENDING" "$(cidec "" "${ALLPASS%]},{\"name\":\"C/C++ clang-tidy\",\"bucket\":\"pending\"}]")"
 check "no required checks + a FAILED Ryzen run: not required, never counts -> PASS" "PASS" "$(cidec "" "${ALLPASS%]},${RYZEN/pending/fail}]")"
-check "no required checks + a workflow run still in progress (matrix jobs unregistered) -> PENDING" "PENDING" "$(cidec "" "$ALLPASS" "[]" '["Build mlir-air Wheels"]')"
-check "no required checks + only the Ryzen workflow run in progress -> PASS" "PASS" "$(cidec "" "$ALLPASS" "[]" '["Build and Test with AIE tools on Ryzen AI"]')"
+check "no required checks + a workflow run still in progress (matrix jobs unregistered) -> PENDING" "PENDING" "$(cidec "" "$ALLPASS" "[]" "[$RUN_WHEELS]")"
+check "no required checks + only the Ryzen workflow run queued -> PASS" "PASS" "$(cidec "" "$ALLPASS" "[]" "[$RUN_RYZEN]")"
+check "no required checks + a completed run with startup_failure (no job check ever) -> FAIL" "FAIL" "$(cidec "" "$ALLPASS" "[]" '[{"status":"completed","conclusion":"startup_failure","workflowName":"Build and Test"}]')"
+check "no required checks + a completed cancelled run -> FAIL" "FAIL" "$(cidec "" "$ALLPASS" "[]" '[{"status":"completed","conclusion":"cancelled","workflowName":"Build and Test"}]')"
+check "no required checks + completed successful runs -> PASS" "PASS" "$(cidec "" "$ALLPASS" "[]" '[{"status":"completed","conclusion":"success","workflowName":"Build and Test"}]')"
+check "no required checks + a FAILED Ryzen run: not required, never counts -> PASS (run level too)" "PASS" "$(cidec "" "$ALLPASS" "[]" '[{"status":"completed","conclusion":"failure","workflowName":"Build and Test with AIE tools on Ryzen AI"}]')"
+check "ruleset lookup unreadable after retries -> PENDING, never PASS" "PENDING" "$(FAKE_RULES_FAIL=1 cidec "" "$ALLPASS" "[]" "[]")"
+check "workflow-run lookup unreadable after retries -> PENDING, never PASS" "PENDING" "$(FAKE_RUNS_FAIL=1 cidec "" "$ALLPASS" "[]" "[]")"
+check "malformed ruleset response -> PENDING" "PENDING" "$(cidec "" "$ALLPASS" "not json" "[]")"
 check "ruleset names checks: only they decide (a pending non-required one is ignored)" "PASS" "$(cidec '[{"name":"size","bucket":"pass"}]' "${ALLPASS%]},{\"name\":\"other\",\"bucket\":\"pending\"}]" '["size"]')"
 check "ruleset names checks: a required failure -> FAIL" "FAIL" "$(cidec '[{"name":"size","bucket":"fail"}]' "$ALLPASS" '["size"]')"
 check "ruleset names checks: a required check not yet reported -> PENDING, not PASS" "PENDING" "$(cidec '[{"name":"size","bucket":"pass"}]' "$ALLPASS" '["size","Build and Test (Assert, 22.04)"]')"
