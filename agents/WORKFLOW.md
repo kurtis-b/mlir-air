@@ -48,17 +48,26 @@ single source for the rules below; `AGENTS.md` adds only repo-specific context a
    first (or stop and name it to the human if it cannot be landed).
 8. This fork is origin-only: `origin` (kurtis-b/mlir-air) is the only push target. `upstream`
    (Xilinx/mlir-air) is PULL-ONLY — never push to it or open PRs against it; upstream syncs into
-   `main` are the operator's own action.
+   `main` are the operator's own action. Enforced in three local layers, none of which may be
+   undone by an agent: the `upstream` remote's push URL is `no_push`; `gh repo set-default` is
+   `kurtis-b/mlir-air` (gh otherwise prefers the `upstream` remote, so a bare `gh pr` would hit
+   Xilinx); and `agents/hooks/origin-only-guard.mjs` + `permissions.deny` refuse upstream pushes,
+   re-arming the remote, and `gh` writes addressed to Xilinx/ (reads stay allowed). The one
+   GitHub-side hard block — *Leave fork network*, which makes a PR against upstream impossible —
+   is irreversible and the operator's call.
 
 ## Landing gate (`pr.sh land`)
 
 A PR lands when, at its current head `H` and the current `origin/main` `B`:
 
 1. `H` contains `B` (a stale branch is synced with `git merge origin/main`);
-2. CI is green at `H` (`gh pr checks --required`; the self-hosted Ryzen runners count only when
-   they are required checks — offline hardware runners must not wedge a docs-only PR. Until the
-   ruleset names required checks, every check decides except pending ones matching
-   `PR_CI_OPTIONAL`, default the Ryzen runners; a failure there still counts);
+2. CI is green at `H`: every check the `main` ruleset requires has reported and passed — one that
+   has not reported yet is pending, never absent (matrix jobs register late). The self-hosted
+   Ryzen runners count only when they are required checks — offline hardware runners must not
+   wedge a docs-only PR. Without a ruleset, every reported check and every workflow run at `H`
+   decide (a run that ends without ever creating a job check — a startup failure — fails),
+   except names matching `PR_CI_OPTIONAL` (default the Ryzen runners), which never count; a
+   ruleset or run list that cannot be read counts as pending, never as "nothing required";
 3. the PR body's `Weakened checks:` line is present (`none` or names each one) and its
    `Depends on:` PRs are all MERGED;
 4. the PR's **single Codex review** is satisfied:
@@ -129,10 +138,12 @@ Before writing, find the fact's single home; extend or link, never restate.
 ## Enforcement
 
 Three layers: these rules (advisory context) → `.claude/hooks/guard.sh` running
-`agents/hooks/main-branch-guard.mjs` as a PreToolUse(Bash) hook plus the `permissions.deny` list
+`agents/hooks/main-branch-guard.mjs` (vendored verbatim) then `agents/hooks/origin-only-guard.mjs`
+(repo rule 8) as a PreToolUse(Bash) hook plus the `permissions.deny` list
 in `.claude/settings.json` (agent-side; a denial reason contains the fix — follow it, never
 bypass with `sh -c`, aliases, or wrappers) → a GitHub ruleset on `main` (PR required, required
 checks on an up-to-date branch, no force-push/deletion; the gate account merges — no human-review
 requirement). The hook is a guardrail, not a sandbox; the ruleset is the backstop and binds
-everyone. Tests: `bash agents/hooks/test_guard.sh`, `bash agents/scripts/test_pr.sh`,
+everyone. Tests: `bash agents/hooks/test_guard.sh`, `bash agents/hooks/test_origin_only.sh`,
+`bash agents/scripts/test_pr.sh`,
 `bash agents/scripts/test_check_pr_deps.sh` — hermetic (stubbed `gh`, no network).
