@@ -133,6 +133,7 @@ llms/
 ├── llama31_8b_q4nx/    # Q4NX 4-bit Llama-3.1-8B (fused decode, split weight BOs)
 ├── gemma3_4b_q4nx/     # Q4NX 4-bit Gemma3-4B (fused decode + batched prefill)
 ├── smollm2_1_7b/       # bf16 SmolLM2-1.7B (MHA)
+├── smollm2_1_7b_int4/  # int4 GGUF Q4_0 SmolLM2-1.7B (gs=32 decode, reuses llama32_1b_int4)
 ├── qwen25_0_5b/        # Qwen2.5-0.5B  (QKV bias, head_dim=64)
 ├── qwen25_1_5b/        # Qwen2.5-1.5B  (QKV bias, head_dim=128)
 ├── qwen25_3b/          # Qwen2.5-3B    (QKV bias, head_dim=128)
