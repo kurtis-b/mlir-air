@@ -68,6 +68,7 @@ def air_Dialect : Dialect {
   }];
   let useDefaultTypePrinterParser = 1;
   let useDefaultAttributePrinterParser = 1;
+  let hasOperationAttrVerify = 1;
 }
 
 // Base class for AIR dialect attributes.
