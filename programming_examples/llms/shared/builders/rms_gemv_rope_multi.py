@@ -92,7 +92,7 @@ EPS = 1e-5
 
 
 @module_builder
-def _build_rms_1d(n, np_dtype, vector_size=16):
+def _build_rms_1d(n, np_dtype, vector_size=16, out_total=None):
     """Build RMSNorm for M=1 with 1D func args (decode-friendly).
 
     The standard weighted_rms_norm builds with 2D (M, N) I/O memrefs.
@@ -102,17 +102,25 @@ def _build_rms_1d(n, np_dtype, vector_size=16):
       - The herd body is the standard M=1 single-tile RMSNorm
 
     Func signature: (x_1d: [N], weight: [N], out_1d: [N])
+
+    out_total `[2026-08-22]`: when given (> N), the
+    out arg is [out_total] and the launch writes its first N elements with a
+    1-D DMA -- the normalized vector becomes the HEAD of a packed buffer whose
+    tail the host fills (the 2-launch QKV stage's B = [normed | lut | q_norm |
+    k_norm]). Default None keeps the original 2-D form byte for byte.
     """
     from air.dialects.memref import expand_shape as memref_expand_shape
 
     xrt_dtype = type_mapper(np_dtype)
     assert n % vector_size == 0
+    assert out_total is None or out_total > n, (out_total, n)
 
     vecTy = VectorType.get([vector_size], xrt_dtype)
     identity_map = AffineMapAttr.get(AffineMap.get_identity(1))
 
     # L3 types
     l3_1d_ty = MemRefType.get([n], xrt_dtype)
+    l3_out_ty = MemRefType.get([out_total if out_total else n], xrt_dtype)
     l3_2d_ty = MemRefType.get([1, n], xrt_dtype)
 
     # L1 types
@@ -120,13 +128,16 @@ def _build_rms_1d(n, np_dtype, vector_size=16):
     l1RowTy = MemRefType.get([n], xrt_dtype, memory_space=l1_mem_space)
     l1VecTy = MemRefType.get([vector_size], xrt_dtype, memory_space=l1_mem_space)
 
-    @FuncOp.from_py_func(l3_1d_ty, l3_1d_ty, l3_1d_ty)
+    @FuncOp.from_py_func(l3_1d_ty, l3_1d_ty, l3_out_ty)
     def rms_norm_1d(x_1d, weight, out_1d):
         @launch(operands=[x_1d, weight, out_1d])
         def rms_launch(l_x_1d, l_weight, l_out_1d):
             # Expand 1D -> 2D for RMSNorm herd (which uses 2D DMA offsets)
             l_x_2d = memref_expand_shape(l3_2d_ty, l_x_1d, [[0, 1]], [], [1, n])
-            l_out_2d = memref_expand_shape(l3_2d_ty, l_out_1d, [[0, 1]], [], [1, n])
+            if out_total:
+                l_out_2d = l_out_1d  # the packed [out_total] buffer, written 1-D
+            else:
+                l_out_2d = memref_expand_shape(l3_2d_ty, l_out_1d, [[0, 1]], [], [1, n])
 
             @segment(name="rms_seg", operands=[l_x_2d, l_weight, l_out_2d])
             def rms_seg(s_x_2d, s_weight, s_out_2d):
@@ -222,14 +233,24 @@ def _build_rms_1d(n, np_dtype, vector_size=16):
                         )
                         yield_([])
 
-                    # DMA: write result row back to 2D L3
-                    dma_memcpy_nd(
-                        l3_out,
-                        l1_out,
-                        dst_offsets=[row, 0],
-                        dst_sizes=[1, n],
-                        dst_strides=[n, 1],
-                    )
+                    # DMA: write result row back to 2D L3 (or the head of the
+                    # packed 1-D buffer when out_total is set)
+                    if out_total:
+                        dma_memcpy_nd(
+                            l3_out,
+                            l1_out,
+                            dst_offsets=[0],
+                            dst_sizes=[n],
+                            dst_strides=[1],
+                        )
+                    else:
+                        dma_memcpy_nd(
+                            l3_out,
+                            l1_out,
+                            dst_offsets=[row, 0],
+                            dst_sizes=[1, n],
+                            dst_strides=[n, 1],
+                        )
 
                     DeallocOp(l1_row)
                     DeallocOp(l1_out)

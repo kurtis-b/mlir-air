@@ -1,0 +1,16 @@
+// (c) Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// The head-aligned QKV GEMV kernel (mv_heads.cc) and its builder
+// (matvec_heads.py), run standalone on the Qwen3-0.6B geometry
+// (K=1024, head_dim=128, 16 Q heads, 8 KV heads: M=4096) and checked
+// against numpy: rope(qknorm(W x)) for the Q/K heads, W x for the V heads.
+// Compiles the kernel object into the test dir, as the LLM drivers do.
+//
+// RUN: mkdir -p test_npu2_heads_peano
+// RUN: cd test_npu2_heads_peano
+// RUN: PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR %PYTHON %S/matvec_heads.py --k 1024 --head-dim 128 --n-heads 16 --n-kv-heads 8 | FileCheck %s
+// CHECK: 0 of 4096 outside
+// CHECK: PASS!
