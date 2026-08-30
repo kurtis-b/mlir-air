@@ -23,7 +23,7 @@ authored data under the cap.
 | D `transformer_layer/` | 0 | 0 | 69,330 | — | 0 | excluded (Q1) |
 | C plan docs | 0 | 0 | 12,805 | — | 0 | excluded (Q3) |
 | other | 0 | 29 | 41 | 0 | 29 | rides with B |
-| **total** | **17,436** | **13,361** | **94,437** | **1,772** | **29,025** | 35 PRs include-only; 62 at full refactor size |
+| **total** | **17,436** | **13,361** | **94,437** | **2,178** | **28,619** | 35 PRs include-only; 62 at full refactor size |
 
 Loop-stop condition: Remaining = 0 for the include set; refactor rows close when their
 re-derivation lands or is recorded as not needed.

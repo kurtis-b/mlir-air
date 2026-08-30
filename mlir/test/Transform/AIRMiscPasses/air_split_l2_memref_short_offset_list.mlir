@@ -144,3 +144,70 @@ func.func @zero_offset_far_side(%arg0: memref<8576xi8>) {
   }
   return
 }
+
+// -----
+
+// A far-side op whose offset list is short AND whose rank matching against the
+// L2 side's [24, 16] stops early: one offset, one size 24. The rank-matching
+// step in `runOnOperation` breaks at 24 % 16, so no offset is ever inserted and
+// offset #1 still does not exist when `wraps[1]` is read -- before the tiler's
+// guard. The plan-time check must model the match exactly, not bound it.
+
+// CHECK-LABEL: func.func @rank_match_stops_short
+// CHECK: memref.alloc() : memref<24x16xbf16, 1 : i32>
+// CHECK-NOT: memref.alloc() : memref<24x8xbf16, 1 : i32>
+
+air.channel @dL1ToL2 [1, 2]
+air.channel @outD [1]
+func.func @rank_match_stops_short(%arg0: memref<384xbf16>) {
+  %c1 = arith.constant 1 : index
+  %0 = air.launch async (%tx, %ty) in (%sx=%c1, %sy=%c1) args(%a0=%arg0) : memref<384xbf16> attributes {id = 1 : i32} {
+    %c0 = arith.constant 0 : index
+    %c1_0 = arith.constant 1 : index
+    %c2_0 = arith.constant 2 : index
+    %c8_0 = arith.constant 8 : index
+    %c24_0 = arith.constant 24 : index
+    %c192 = arith.constant 192 : index
+    // One offset and one size: rank matching against [24, 16] stops at 24 % 16.
+    %g = air.channel.get async @outD[%c0] (%a0[%c0] [%c24_0] [%c1_0]) {id = 1 : i32} : (memref<384xbf16>)
+    %s = air.segment @seg async attributes {id = 2 : i32} {
+      %c0_1 = arith.constant 0 : index
+      %c1_1 = arith.constant 1 : index
+      %c2_1 = arith.constant 2 : index
+      %c4 = arith.constant 4 : index
+      %c8 = arith.constant 8 : index
+      %c16 = arith.constant 16 : index
+      %c24 = arith.constant 24 : index
+      %h = air.herd @h async tile (%hx, %hy) in (%hsx=%c4, %hsy=%c2_1) attributes {id = 3 : i32, x_loc = 0 : i64, y_loc = 2 : i64} {
+        %c0_2 = arith.constant 0 : index
+        %c1_2 = arith.constant 1 : index
+        %c24_2 = arith.constant 24 : index
+        %wh = air.wait_all async
+        %fh = scf.for %j = %c0_2 to %c24_2 step %c1_2 iter_args(%ith = %wh) -> (!air.async.token) {
+          %tokl, %bufl = air.execute -> (memref<8xbf16, 2 : i32>) {
+            %alloc = memref.alloc() : memref<8xbf16, 2 : i32>
+            air.execute_terminator %alloc : memref<8xbf16, 2 : i32>
+          }
+          %pl = air.channel.put async [%ith, %tokl] @dL1ToL2[%hx, %hy] (%bufl[] [] []) {id = 2 : i32} : (memref<8xbf16, 2 : i32>)
+          %dl = air.execute [%pl] {
+            memref.dealloc %bufl : memref<8xbf16, 2 : i32>
+          }
+          scf.yield %pl : !air.async.token
+        }
+      }
+      // Two gets on the leading dimension's full extent, differing at dim 1:
+      // the split dimension is 1, not 0.
+      %tok, %buf = air.execute -> (memref<24x16xbf16, 1 : i32>) {
+        %alloc = memref.alloc() : memref<24x16xbf16, 1 : i32>
+        air.execute_terminator %alloc : memref<24x16xbf16, 1 : i32>
+      }
+      %g0 = air.channel.get async [%h, %tok] @dL1ToL2[%c0_1, %c0_1] (%buf[%c0_1, %c0_1] [%c24, %c8] [%c16, %c1_1]) {id = 3 : i32} : (memref<24x16xbf16, 1 : i32>)
+      %g1 = air.channel.get async [%h, %tok] @dL1ToL2[%c0_1, %c1_1] (%buf[%c0_1, %c8] [%c24, %c8] [%c16, %c1_1]) {id = 4 : i32} : (memref<24x16xbf16, 1 : i32>)
+      %pp = air.channel.put async [%g0, %g1] @outD[%c0_1] (%buf[] [] []) {id = 5 : i32} : (memref<24x16xbf16, 1 : i32>)
+      %dt = air.execute [%pp] {
+        memref.dealloc %buf : memref<24x16xbf16, 1 : i32>
+      }
+    }
+  }
+  return
+}

@@ -2435,14 +2435,19 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
     // std::optional is the carrier: nullopt means "cannot tell", and nullopt
     // declines.
 
-    // Offset entries `ci` will carry by the time `tileChannelOpByFactor`
-    // indexes them, or nullopt when that cannot be modelled.
-    auto numOffsetDimsOf = [](air::ChannelInterface ci,
-                              unsigned refSizeRank) -> std::optional<unsigned> {
+    // Offset entries `ci` will carry once `runOnOperation` has rank-matched its
+    // access pattern to the L2 side's `refSizes`, or nullopt when that cannot
+    // be modelled. This MIRRORS the rank-matching loop rather than bounding it:
+    // that loop stops at the first size it cannot divide, so an upper bound
+    // approves lists that end up short, and `wraps[offsetDim]` is read before
+    // `tileChannelOpByFactor`'s guard can refuse.
+    auto numOffsetDimsOf =
+        [](air::ChannelInterface ci,
+           ArrayRef<int64_t> refSizes) -> std::optional<unsigned> {
       auto offsets = air::getOffsetsAsValues(ci);
       auto sizes = air::getSizesAsValues(ci);
-      // Matches `tileChannelOpByFactor`: defaults are populated only when BOTH
-      // lists are empty, and then they take the memref's rank.
+      // Matches `populateDefaultWrapsAndStrides`: defaults are populated only
+      // when BOTH lists are empty, and then they take the memref's rank.
       if (offsets.empty() && sizes.empty()) {
         auto memrefTy =
             dyn_cast_if_present<MemRefType>(ci.getMemref().getType());
@@ -2450,22 +2455,42 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
           return std::nullopt;
         return (unsigned)memrefTy.getRank();
       }
-      // Sizes but no offsets: the rank-matching step in `runOnOperation` starts
-      // at `offsets.size() - 1`, which underflows to -1 on an empty list and
-      // indexes off the front of the SmallVector. It cannot run at all here, so
-      // there is nothing to model -- refuse.
-      if (offsets.empty())
+      // One list empty, or more offsets than sizes: the rank-matching step
+      // starts at `offsets.size() - 1` and indexes `wraps` with it, so either
+      // reads outside a list. Nothing to model -- refuse.
+      if (offsets.empty() || sizes.empty() || offsets.size() > sizes.size())
         return std::nullopt;
-      if (sizes.size() >= refSizeRank)
+      if (sizes.size() >= refSizes.size())
         return (unsigned)offsets.size();
-      // The rank-matching step inserts into `offsets` once for each insert into
-      // `wraps`, so it can add at most `refSizeRank - sizes.size()` entries; it
-      // may stop earlier. This is an UPPER bound, so it can still approve an op
-      // that ends up short -- and that residual is caught by the range check in
-      // `tileChannelOpByFactor`, which refuses with a diagnostic rather than
-      // reading past the end. Approving here can therefore cost a clean pass
-      // failure, never a crash and never a wrong split.
-      return (unsigned)offsets.size() + (refSizeRank - (unsigned)sizes.size());
+      SmallVector<int64_t> wraps;
+      for (auto size : sizes) {
+        auto constSize = getConstantIntValue(size);
+        if (!constSize)
+          return std::nullopt;
+        wraps.push_back(*constSize);
+      }
+      // The loop below is `runOnOperation`'s rank-matching step on constants:
+      // every `insert` there inserts one offset too, and `break` ends it.
+      unsigned numOffsets = offsets.size();
+      int currIdx = numOffsets - 1;
+      for (int i = refSizes.size() - 1; i >= 0; i--) {
+        if (refSizes[i] == 1) {
+          wraps.insert(wraps.begin() + currIdx, 1);
+          numOffsets++;
+          continue;
+        }
+        if (wraps[currIdx] == refSizes[i]) {
+          currIdx = currIdx == 0 ? 0 : currIdx - 1;
+          continue;
+        }
+        if (wraps[currIdx] % refSizes[i])
+          break;
+        int64_t factor = wraps[currIdx] / refSizes[i];
+        wraps.insert(wraps.begin() + currIdx, factor);
+        wraps[currIdx + 1] = refSizes[i];
+        numOffsets++;
+      }
+      return numOffsets;
     };
 
     bool splitIsExpressible = true;
@@ -2503,8 +2528,22 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
       }
       unsigned offsetDim = offsetDimOpt ? *offsetDimOpt : (unsigned)*splitDim;
 
-      unsigned refSizeRank = air::getSizesAsValues(chanUser).size();
-      if (!refSizeRank) {
+      // The L2 side's sizes as the rank-matching step will see them: its own
+      // list, or the memref shape `populateDefaultWrapsAndStrides` derives.
+      SmallVector<int64_t> refSizes;
+      for (auto size : air::getSizesAsValues(chanUser)) {
+        auto constSize = getConstantIntValue(size);
+        if (!constSize) {
+          decline() << "@" << chanUser.getChanName()
+                    << " has a non-constant size, so its rank cannot be "
+                       "matched against the far side";
+          break;
+        }
+        refSizes.push_back(*constSize);
+      }
+      if (!splitIsExpressible)
+        break;
+      if (refSizes.empty()) {
         auto refTy =
             dyn_cast_if_present<MemRefType>(chanUser.getMemref().getType());
         if (!refTy || !refTy.hasStaticShape()) {
@@ -2513,10 +2552,11 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
                        "shape to derive one from";
           break;
         }
-        refSizeRank = refTy.getRank();
+        llvm::append_range(refSizes, refTy.getShape());
       }
+      unsigned refSizeRank = refSizes.size();
 
-      auto l2OffsetDims = numOffsetDimsOf(chanUser, refSizeRank);
+      auto l2OffsetDims = numOffsetDimsOf(chanUser, refSizes);
       if (!l2OffsetDims || offsetDim >= *l2OffsetDims) {
         decline() << "splitting memref dimension " << *splitDim
                   << " needs an offset at access dimension " << offsetDim
@@ -2551,7 +2591,7 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
             break;
           }
         }
-        auto farOffsetDims = numOffsetDimsOf(otherChanOp, refSizeRank);
+        auto farOffsetDims = numOffsetDimsOf(otherChanOp, refSizes);
         if (!farOffsetDims || offsetDim >= *farOffsetDims) {
           decline() << "splitting memref dimension " << *splitDim
                     << " needs an offset at access dimension " << offsetDim
