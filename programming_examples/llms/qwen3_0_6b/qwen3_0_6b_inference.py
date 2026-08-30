@@ -38,6 +38,7 @@ from qwen3_0_6b_prefill import (
 )
 from qwen3_0_6b_decode import (
     compile_decode_kernels,
+    prep_rms_qkv_weights,
     run_decode_block,
     run_rms_qkv,
     _o_gemv_ffn_backend,
@@ -120,6 +121,7 @@ def prepare_runtime(
             lw._wv_t = np.ascontiguousarray(
                 lw.wv.astype(bfloat16).reshape(emb_dim, kv_dim).T
             )  # (kv_dim, emb_dim)
+            prep_rms_qkv_weights(lw, config)  # the QKV stage's static weight
             lw._wo_t = np.ascontiguousarray(
                 lw.wo.astype(bfloat16).reshape(q_dim, emb_dim).T
             )  # (emb_dim, q_dim) DECOUPLED
@@ -199,8 +201,8 @@ def _preload_decode_weights(decode_cache, weights, config):
     for li in range(config.n_layers):
         lw = weights.layers[li]
 
-        # Fused decode ELF warmup (RMSNorm+QKV GEMV+QK-norm+RoPE); the LUTs
-        # (args 13/14) are position-dependent -> NOT static, dummies here.
+        # Fused decode ELF warmup (RMSNorm+QKV GEMV+QK-norm+RoPE); the RoPE
+        # LUTs are position-dependent -> NOT static, dummies here.
         run_rms_qkv(
             decode_cache,
             lw,

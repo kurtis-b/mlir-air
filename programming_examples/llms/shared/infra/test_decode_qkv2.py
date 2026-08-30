@@ -1,14 +1,18 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""Host-only tests for the head-aligned QKV GEMV kernel's layout contract
-(shared/infra/qkv2_layout.py): the weight augmentation and the slot gather are
-each other's inverse, so the device never reorders rows the host cannot undo.
-No NPU, no air. No test-framework dependency -- see `test_bo_pool.py` for why.
+"""Host-only tests for the Qwen3 decode QKV stage's host side: the 0.6B
+driver's argument helper follows `QWEN3_RMS_QKV_LAUNCHES` (2 or 8), the 2-launch
+ABI (shared/infra/decode_qkv2.py) has the ELF's shapes, and the layout contract
+(shared/infra/qkv2_layout.py) -- weight augmentation and slot gather -- is its
+own inverse, so the device never reorders rows the host cannot undo. No NPU, no
+air. No test-framework dependency -- see `test_bo_pool.py` for why.
 
     python shared/infra/test_decode_qkv2.py
 """
 
+import importlib
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -19,8 +23,11 @@ from ml_dtypes import bfloat16
 
 _LLMS = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_LLMS))
+sys.path.insert(0, str(_LLMS / "qwen3_0_6b"))
 
+from shared.infra import decode_qkv2 as q2  # noqa: E402
 from shared.infra.qkv2_layout import (  # noqa: E402
+    K_PAD,
     QKV2_HERD_M,
     QKV2_TILE_M,
     qkv2_gather,
@@ -47,6 +54,62 @@ def _layer(seed=0):
         _wk_t=f(KV_DIM, CFG.emb_dim),
         _wv_t=f(KV_DIM, CFG.emb_dim),
     )
+
+
+def _driver(launches):
+    os.environ["QWEN3_RMS_QKV_LAUNCHES"] = str(launches)
+    name = "qwen3_0_6b_decode"
+    if name in sys.modules:
+        return importlib.reload(sys.modules[name])
+    return importlib.import_module(name)
+
+
+def test_driver_args_follow_the_launch_count():
+    """`rms_qkv_args` returns the ABI of the form `_RMS_QKV_KERNEL` names (the
+    study branch's review found it pinned to one form while the module
+    defaulted to the other)."""
+    x = np.zeros(CFG.emb_dim, bfloat16)
+    lut_q = np.zeros(Q_DIM, bfloat16)
+    lut_k = np.zeros(KV_DIM, bfloat16)
+    cases = (
+        (2, 5, "rms_qkv_qknorm_rope_gemv2", q2.OUTPUT_INDICES_2),
+        (8, 17, "rms_qkv_qknorm_rope_gemv", [8, 15, 16]),
+    )
+    saved = os.environ.get("QWEN3_RMS_QKV_LAUNCHES")
+    try:
+        for launches, n_args, kernel, out_idx in cases:
+            d = _driver(launches)
+            assert d._RMS_QKV_KERNEL == kernel, d._RMS_QKV_KERNEL
+            ins, outs, statics, inters = d.rms_qkv_args(_layer(), x, lut_q, lut_k, CFG)
+            assert len(ins) == n_args, (launches, len(ins))
+            assert list(outs) == list(out_idx)
+            assert max(statics | inters | set(outs)) < n_args
+    finally:
+        if saved is None:
+            os.environ.pop("QWEN3_RMS_QKV_LAUNCHES", None)
+        else:
+            os.environ["QWEN3_RMS_QKV_LAUNCHES"] = saved
+
+
+def test_two_launch_args_have_the_elf_shapes():
+    lw = _layer()
+    x, lut_row = np.zeros(CFG.emb_dim, bfloat16), np.ones(CFG.head_dim, bfloat16)
+    ins = q2.call_args_2(lw, x, lut_row, CFG)
+    assert [a.shape for a in ins] == [
+        (CFG.emb_dim,),
+        (CFG.emb_dim,),
+        (CFG.emb_dim + 3 * CFG.head_dim,),
+        (QKV_DIM, CFG.emb_dim + K_PAD),
+        (qkv2_out_total(QKV_DIM, CFG.head_dim),),
+    ], [a.shape for a in ins]
+    assert all(a.dtype == bfloat16 for a in ins)
+    bvec = ins[2]
+    e, h = CFG.emb_dim, CFG.head_dim
+    assert np.all(bvec[e : e + h] == 1)
+    assert np.array_equal(bvec[e + h : e + 2 * h], lw.q_norm)
+    assert np.array_equal(bvec[e + 2 * h :], lw.k_norm)
+    # idempotent: the augmented weight is built once and reused
+    assert ins[3] is lw._wqkv2 and q2.call_args_2(lw, x, lut_row, CFG)[3] is lw._wqkv2
 
 
 def test_augmented_weight_rows_tag_and_kind():
@@ -98,6 +161,11 @@ def test_slot_gather_inverts_the_device_slot_layout():
     g = qkv2_gather(QKV_DIM, h)
     assert np.array_equal(g, qkv_heads_slot_gather(QKV_DIM, herd, h, tile))
     assert np.array_equal(slots[g], logical)
+    res = {4: slots.astype(bfloat16)}
+    v, q, k = q2.split_outputs_2(res, CFG)
+    assert np.array_equal(q.astype(np.float32), logical[:Q_DIM])
+    assert np.array_equal(k.astype(np.float32), logical[Q_DIM : Q_DIM + KV_DIM])
+    assert np.array_equal(v.astype(np.float32), logical[Q_DIM + KV_DIM :])
 
 
 def _main():

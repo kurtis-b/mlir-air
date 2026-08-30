@@ -12,8 +12,10 @@ prefill handled:
      the (nonlinear) QK-norm past it, so we CANNOT use the llama
      `rms_gemv_rope` ELF (which fuses RoPE right after the GEMV). We instead
      build a Qwen-specific fused decode ELF that does RMSNorm + Q/K/V GEMV +
-     per-head QK-norm + RoPE (M=1) entirely on the NPU
-     (rms_qkv_qknorm_rope_gemv).
+     per-head QK-norm + RoPE (M=1) entirely on the NPU: 2 launches
+     (rms_qkv_qknorm_rope_gemv2, the head-aligned GEMV with the in-core
+     epilogue) by default, 8 launches (rms_qkv_qknorm_rope_gemv) under
+     QWEN3_RMS_QKV_LAUNCHES=8 for A/B.
 
   2. Decoupled head_dim: n_heads*head_dim = 2048 != hidden_size = 1024.
         q_proj : 1024 -> 2048   (16 heads x 128)
@@ -32,6 +34,7 @@ prefill handled:
 Decode attention is CPU (decode_attention_cpu), matching llama.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -46,24 +49,44 @@ if _LLMS_DIR not in sys.path:
     sys.path.insert(0, _LLMS_DIR)
 
 from qwen3_0_6b_weights import LlamaConfig
+from shared.infra import decode_qkv2 as _qkv2
 from shared.infra.cache import KernelCache
 
+# The decode QKV stage ELF. 2 launches: RMSNorm, then ONE head-aligned GEMV
+# whose cores apply QK-norm + RoPE in L1 (kernel mv_heads.cc; host layout in
+# shared.infra.qkv2_layout, host ABI in shared.infra.decode_qkv2).
+# QWEN3_RMS_QKV_LAUNCHES=8 selects the 8-launch form for A/B. Each form's
+# artifact name is bound to its own ABI: the 8-launch ELF keeps the name its
+# 17-arg caches already carry, the 2-launch ELF gets its own, so a cache can
+# never bind one ABI to the other's ELF.
+_RMS_QKV_LAUNCHES = int(os.environ.get("QWEN3_RMS_QKV_LAUNCHES", "2"))
+assert _RMS_QKV_LAUNCHES in (2, 8), _RMS_QKV_LAUNCHES
+_RMS_QKV_KERNEL = {2: "rms_qkv_qknorm_rope_gemv2", 8: "rms_qkv_qknorm_rope_gemv"}[
+    _RMS_QKV_LAUNCHES
+]
 
-def build_rms_qkv_qknorm_rope_gemv_module(config):
-    """Fused decode ELF: RMSNorm + Q/K/V GEMV + per-head QK-norm + RoPE (M=1)."""
+
+def build_rms_qkv_qknorm_rope_gemv_module(config, n_launches=None):
+    """Fused decode ELF: RMSNorm + Q/K/V GEMV + per-head QK-norm + RoPE (M=1).
+
+    n_launches: 2 (the head-aligned GEMV with the in-core epilogue) or 8 (the
+    separate QK-norm and RoPE launches, kept for A/B). Default: `_RMS_QKV_LAUNCHES`.
+    """
     from shared.builders.rms_qkv_qknorm_rope_multi import (
-        build_rms_qkv_qknorm_rope_gemv_module as _build,
+        build_rms_qkv_qknorm_rope_gemv_module as _build8,
+        build_rms_qkv_qknorm_rope_gemv2_module as _build2,
     )
 
+    if n_launches is None:
+        n_launches = _RMS_QKV_LAUNCHES
     emb_dim = config.emb_dim
     n_heads = config.n_heads
     n_kv_heads = config.n_kv_heads
     head_dim = config.head_dim
     q_dim = n_heads * head_dim
     kv_dim = n_kv_heads * head_dim
-    return _build(
-        emb_dim, q_dim, kv_dim, n_heads, n_kv_heads, head_dim, qknorm_eps=1e-6
-    )
+    build = {2: _build2, 8: _build8}[n_launches]
+    return build(emb_dim, q_dim, kv_dim, n_heads, n_kv_heads, head_dim, qknorm_eps=1e-6)
 
 
 def _rms_qkv_qknorm_rope_gemv_backend(verbose=False):
@@ -75,10 +98,10 @@ def _rms_qkv_qknorm_rope_gemv_backend(verbose=False):
     }
 
 
-# The fused RMSNorm + Q/K/V GEMV + QK-norm + RoPE ELF's host ABI, in one place: the
-# decode step and the inference pre-load used to carry two hand-copied 17-argument
-# lists that had to agree by inspection. Positions 13/14 are the RoPE LUTs, which are
-# position-dependent and therefore never static.
+# The 8-launch ELF's host ABI, in one place: the decode step and the inference
+# pre-load used to carry two hand-copied 17-argument lists that had to agree by
+# inspection. Positions 13/14 are the RoPE LUTs, which are position-dependent and
+# therefore never static. (The 2-launch ABI is `shared.infra.decode_qkv2`'s.)
 RMS_QKV_OUTPUT_INDICES = [8, 15, 16]  # v, q_roped, k_roped
 RMS_QKV_STATIC_INDICES = {1, 3, 5, 7, 9, 10}  # norm_w, wq, wk, wv, q_norm, k_norm
 RMS_QKV_INTERMEDIATE_INDICES = {2, 4, 6, 8, 11, 12, 15, 16}
@@ -92,14 +115,35 @@ def rms_qkv_luts(rope_lut_bf16, current_pos, config):
     return lut_q, lut_k
 
 
+def prep_rms_qkv_weights(layer_weights, config):
+    """Once per layer, host side: the static weight of the selected form. Idempotent.
+    The 8-launch form binds `_wq_t`/`_wk_t`/`_wv_t` as they are."""
+    if _RMS_QKV_LAUNCHES == 2:
+        _qkv2.prep_weights_2(layer_weights, config)
+
+
 def rms_qkv_args(layer_weights, x_bf16, lut_q, lut_k, config):
-    """The ELF's 17 positional buffers in ABI order (see the index constants)."""
+    """(inputs, output_indices, static_input_indices, intermediate_indices) of
+    the QKV stage in the form `_RMS_QKV_KERNEL` names: the 2-launch ABI (5 args,
+    one LUT row) or the 8-launch ABI (17 args, the per-head LUTs). `run_rms_qkv`
+    and the inference pre-load both go through here, so the args can never
+    disagree with the ELF the launch count selects."""
+    if _RMS_QKV_LAUNCHES == 2:
+        lut_row = np.asarray(lut_q, bfloat16).reshape(-1)[: config.head_dim]
+        return (
+            _qkv2.call_args_2(layer_weights, x_bf16, lut_row, config),
+            _qkv2.OUTPUT_INDICES_2,
+            _qkv2.STATIC_INDICES_2,
+            _qkv2.INTERMEDIATE_INDICES_2,
+        )
     emb_dim = config.emb_dim
     head_dim = config.head_dim
     q_dim = config.n_heads * head_dim
     kv_dim = config.n_kv_heads * head_dim
-    return [
-        np.asarray(x_bf16, bfloat16).reshape(emb_dim),  # 0 x_in
+    inputs = [
+        np.asarray(
+            x_bf16, bfloat16
+        ).flatten(),  # 0 x_in (flatten: always a contiguous copy)
         layer_weights.attn_norm.reshape(emb_dim).astype(bfloat16),  # 1 norm_w (static)
         np.zeros(emb_dim, dtype=bfloat16),  # 2 normed
         layer_weights._wq_t,  # 3 wq (static)
@@ -121,23 +165,33 @@ def rms_qkv_args(layer_weights, x_bf16, lut_q, lut_k, config):
         np.zeros(q_dim, dtype=bfloat16),  # 15 q_roped
         np.zeros(kv_dim, dtype=bfloat16),  # 16 k_roped
     ]
+    return (
+        inputs,
+        RMS_QKV_OUTPUT_INDICES,
+        RMS_QKV_STATIC_INDICES,
+        RMS_QKV_INTERMEDIATE_INDICES,
+    )
 
 
 def run_rms_qkv(
     cache, layer_weights, x_bf16, lut_q, lut_k, config, layer_idx, verbose=False
 ):
-    """Run the fused QKV ELF for one layer; returns load_and_run's result list."""
-    return cache.load_and_run(
-        "rms_qkv_qknorm_rope_gemv",
-        _rms_qkv_qknorm_rope_gemv_backend(verbose),
-        *rms_qkv_args(layer_weights, x_bf16, lut_q, lut_k, config),
-        output_indices=RMS_QKV_OUTPUT_INDICES,
-        static_input_indices=RMS_QKV_STATIC_INDICES,
-        intermediate_indices=RMS_QKV_INTERMEDIATE_INDICES,
-        bo_key=(
-            f"rms_qkv_qknorm_rope_gemv_L{layer_idx}" if layer_idx is not None else None
-        ),
+    """One call of the QKV stage for one layer -> (v, q_roped, k_roped)."""
+    inputs, outs, statics, inters = rms_qkv_args(
+        layer_weights, x_bf16, lut_q, lut_k, config
     )
+    res = cache.load_and_run(
+        _RMS_QKV_KERNEL,
+        _rms_qkv_qknorm_rope_gemv_backend(verbose),
+        *inputs,
+        output_indices=outs,
+        static_input_indices=statics,
+        intermediate_indices=inters,
+        bo_key=f"{_RMS_QKV_KERNEL}_L{layer_idx}" if layer_idx is not None else None,
+    )
+    if _RMS_QKV_LAUNCHES == 2:
+        return _qkv2.split_outputs_2(res, config)
+    return res[8].astype(bfloat16), res[15].astype(bfloat16), res[16].astype(bfloat16)
 
 
 # LM-head decode partitioning. vocab=151936.
@@ -299,6 +353,7 @@ def compile_decode_kernels(cache, config, verbose=False):
     from shared.infra.external_kernels import (
         compile_mv,
         compile_mv_bf16,
+        compile_mv_heads,
         compile_rope,
         compile_silu_and_mul,
     )
@@ -309,17 +364,20 @@ def compile_decode_kernels(cache, config, verbose=False):
 
     print(f"\n{'='*60}\nCompiling Qwen3 decode kernels...\n{'='*60}\n")
 
-    # External .o kernels: GEMV (mv.o), 2tile-add/swiglu (mv_bf16.o), RoPE.
+    # External .o kernels: GEMV (mv.o), head-aligned GEMV + epilogue
+    # (mv_heads_hd{head_dim}.o), 2tile-add/swiglu (mv_bf16.o), RoPE.
     compile_mv()
+    compile_mv_heads(config.head_dim)
     compile_mv_bf16()
     compile_rope()
     compile_silu_and_mul()
 
     print(
-        "\n--- rms_qkv_qknorm_rope_gemv (FUSED: RMSNorm+QKV+QK-norm+RoPE, 8 launches) ---"
+        f"\n--- {_RMS_QKV_KERNEL} (FUSED: RMSNorm+QKV+QK-norm+RoPE, "
+        f"{_RMS_QKV_LAUNCHES} launches) ---"
     )
     cache.compile_and_cache(
-        "rms_qkv_qknorm_rope_gemv",
+        _RMS_QKV_KERNEL,
         build_rms_qkv_qknorm_rope_gemv_module(config),
         _rms_qkv_qknorm_rope_gemv_backend(verbose),
     )
@@ -397,8 +455,8 @@ def run_decode_block(
 ):
     """Run one Qwen3 transformer block for a single decode token.
 
-    Stages: rms_qkv_qknorm_rope_gemv (NPU: RMSNorm + Q/K/V GEMV + per-head
-    QK-norm + RoPE) -> KV-cache write -> CPU attention -> o_gemv_ffn (NPU).
+    Stages: the QKV stage ELF `_RMS_QKV_KERNEL` (NPU: RMSNorm + Q/K/V GEMV +
+    per-head QK-norm + RoPE) -> KV-cache write -> CPU attention -> o_gemv_ffn (NPU).
     """
     emb_dim = config.emb_dim
     n_heads = config.n_heads
@@ -411,12 +469,9 @@ def run_decode_block(
 
     # --- One ELF = RMSNorm + Q/K/V GEMV + per-head QK-norm + RoPE ---
     lut_q, lut_k = rms_qkv_luts(rope_lut_bf16, current_pos, config)
-    res = run_rms_qkv(
+    v, q_roped, k_roped = run_rms_qkv(
         cache, layer_weights, x_bf16, lut_q, lut_k, config, layer_idx, verbose
     )
-    v = res[8].astype(bfloat16)
-    q_roped = res[15].astype(bfloat16)
-    k_roped = res[16].astype(bfloat16)
 
     # --- Update KV cache (K after qk-norm AND rope; V raw projection) ---
     k_cache_layer[:, current_pos, :] = k_roped.reshape(n_kv_heads, head_dim)
