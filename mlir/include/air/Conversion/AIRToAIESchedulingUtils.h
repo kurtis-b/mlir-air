@@ -47,8 +47,15 @@ std::vector<unsigned> convertToStdVec(SmallVector<int64_t, 6> vec);
 
 bool areIdenticalVectors(std::vector<unsigned> &a, std::vector<unsigned> &b);
 
-int64_t get1DOffset(ArrayRef<OpFoldResult> memcpy_offsets,
-                    ArrayRef<OpFoldResult> memcpy_strides);
+// Linearize an N-d (offsets, strides) access into the 1-d offset an
+// aie.dma_bd carries. Returns std::nullopt when any offset, or any stride it
+// multiplies against, is not a compile-time constant: a BD offset is static,
+// so a non-constant value here (typically a loop induction variable walking a
+// staged buffer) has no correct lowering, and the caller must refuse rather
+// than default to 0 — a silent 0 freezes every BD in the chain onto the same
+// block.
+std::optional<int64_t> get1DOffset(ArrayRef<OpFoldResult> memcpy_offsets,
+                                   ArrayRef<OpFoldResult> memcpy_strides);
 
 // Given a vector of memcpy operations, split them into BD tasks paired with the
 // repeat count each task runs at, relative to a common ancestor region. Tasks
@@ -76,7 +83,11 @@ bool chansPartOfSameRotation(air::ChannelInterface chanA,
 llvm::SetVector<Operation *>
 getUniqueBDPattern(llvm::SetVector<Operation *> memcpyIOps);
 
-std::vector<AIE::BDDimLayoutAttr>
+// Build the aie.dma_bd (wrap, stride) dim layout from the memcpy sizes and
+// strides. Returns std::nullopt when any wrap or stride is not a compile-time
+// constant — same class of failure as get1DOffset: the dim layout is baked
+// into the static BD and cannot vary per loop iteration.
+std::optional<std::vector<AIE::BDDimLayoutAttr>>
 getWrapsAndStrides(ArrayRef<OpFoldResult> memcpy_sizes,
                    ArrayRef<OpFoldResult> memcpy_strides, MLIRContext *ctx);
 
