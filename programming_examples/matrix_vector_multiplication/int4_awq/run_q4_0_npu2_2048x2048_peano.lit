@@ -13,8 +13,8 @@
 // checkpoint; runs against real GGUF weights go through
 // `make run_q4_0 GGUF=... TENSOR=...`.
 //
-// The host bridge carries its own self-test (legs (a)-(g), including a
-// negative control that is asserted to be non-vacuous).
+// The host bridge carries its own self-test (legs (a)-(g) and (k)-(m),
+// including negative controls that are asserted to be non-vacuous).
 // RUN: make -f %S/Makefile selftest_q4_0 | FileCheck %s --check-prefix=SELFTEST
 // SELFTEST: All self-tests PASSED.
 //
