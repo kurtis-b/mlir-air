@@ -108,8 +108,12 @@ def rms_qkv_args(layer_weights, x_bf16, lut_q, lut_k, config):
         np.zeros(kv_dim, dtype=bfloat16),  # 6 k
         layer_weights._wv_t,  # 7 wv (static)
         np.zeros(kv_dim, dtype=bfloat16),  # 8 v
-        np.asarray(layer_weights.q_norm, bfloat16).reshape(head_dim),  # 9 q_norm (static)
-        np.asarray(layer_weights.k_norm, bfloat16).reshape(head_dim),  # 10 k_norm (static)
+        np.asarray(layer_weights.q_norm, bfloat16).reshape(
+            head_dim
+        ),  # 9 q_norm (static)
+        np.asarray(layer_weights.k_norm, bfloat16).reshape(
+            head_dim
+        ),  # 10 k_norm (static)
         np.zeros(q_dim, dtype=bfloat16),  # 11 q_n
         np.zeros(kv_dim, dtype=bfloat16),  # 12 k_n
         lut_q,  # 13 lut_q (DYNAMIC -- position-dependent)
@@ -119,7 +123,9 @@ def rms_qkv_args(layer_weights, x_bf16, lut_q, lut_k, config):
     ]
 
 
-def run_rms_qkv(cache, layer_weights, x_bf16, lut_q, lut_k, config, layer_idx, verbose=False):
+def run_rms_qkv(
+    cache, layer_weights, x_bf16, lut_q, lut_k, config, layer_idx, verbose=False
+):
     """Run the fused QKV ELF for one layer; returns load_and_run's result list."""
     return cache.load_and_run(
         "rms_qkv_qknorm_rope_gemv",
@@ -405,7 +411,9 @@ def run_decode_block(
 
     # --- One ELF = RMSNorm + Q/K/V GEMV + per-head QK-norm + RoPE ---
     lut_q, lut_k = rms_qkv_luts(rope_lut_bf16, current_pos, config)
-    res = run_rms_qkv(cache, layer_weights, x_bf16, lut_q, lut_k, config, layer_idx, verbose)
+    res = run_rms_qkv(
+        cache, layer_weights, x_bf16, lut_q, lut_k, config, layer_idx, verbose
+    )
     v = res[8].astype(bfloat16)
     q_roped = res[15].astype(bfloat16)
     k_roped = res[16].astype(bfloat16)

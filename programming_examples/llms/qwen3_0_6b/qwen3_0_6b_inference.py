@@ -202,7 +202,13 @@ def _preload_decode_weights(decode_cache, weights, config):
         # Fused decode ELF warmup (RMSNorm+QKV GEMV+QK-norm+RoPE); the LUTs
         # (args 13/14) are position-dependent -> NOT static, dummies here.
         run_rms_qkv(
-            decode_cache, lw, np.zeros(emb_dim, dtype=bfloat16), lut_q_dummy, lut_k_dummy, config, li
+            decode_cache,
+            lw,
+            np.zeros(emb_dim, dtype=bfloat16),
+            lut_q_dummy,
+            lut_k_dummy,
+            config,
+            li,
         )
 
         # o_gemv_ffn: build interleaved w_gateup + packed RMS-input buffer.
