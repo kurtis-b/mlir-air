@@ -1317,7 +1317,7 @@ stays on the tag.</p>
 <p>Decisions that shaped the include set (operator, 2026-08-29): no <code>transformer_layer</code> example on
 <code>main</code> (the execution-mode study continues as full end-to-end LLM inference); int4 covers
 GGUF Q4_0 (ported) and Q4_K_M (new work, tracked separately); plan docs stay on the tag unless a
-living path cites one; multi-launch uses the ELF path only; the GEMM kernel-registry rows port as
+living path cites one; multi-launch uses the ELF path only; the Qwen3-0.6B QKV stage ports at 2 launches only, A/B against main's 8-launch form, no 4-launch stage (Q7, 2026-08-30); the GEMM kernel-registry rows port as
 authored data under the cap.</p>
 <h2 id="scoreboard-branch-added-lines-updated-in-the-pr-that-moves-a-row">Scoreboard (branch-added lines; updated in the PR that moves a row)<a class="headerlink" href="#scoreboard-branch-added-lines-updated-in-the-pr-that-moves-a-row" title="Permanent link">&para;</a></h2>
 <table>
@@ -1356,9 +1356,9 @@ authored data under the cap.</p>
 <td style="text-align: right;">14,477</td>
 <td style="text-align: right;">7,233</td>
 <td style="text-align: right;">6,236</td>
-<td style="text-align: right;">807</td>
-<td style="text-align: right;">20,903</td>
-<td>qkv-heads kernel + layout (this PR, 395); rms/qkv host-ABI seam refactor (#15, main-side structure-only, net +3 — not branch lines); verify_runner host tests (#14, 412); next: shared decode_qkv4 + test, then the qwen3 / llama32_1b_int4 / smollm2 int4 model rows, int4_awq q4_0, registry rows (data, ≈11 PRs)</td>
+<td style="text-align: right;">1,286</td>
+<td style="text-align: right;">20,424</td>
+<td>2-launch QKV ELF builder (this PR, 479 after its review fixes); qkv-heads kernel + layout (#16, 395); rms/qkv host-ABI seam refactor (#15, main-side structure-only, net +3 — not branch lines); verify_runner host tests (#14, 412); next: shared decode_qkv4 + test, then the qwen3 / llama32_1b_int4 / smollm2 int4 model rows, int4_awq q4_0, registry rows (data, ≈11 PRs)</td>
 </tr>
 <tr>
 <td>D <code>transformer_layer/</code></td>
@@ -1392,8 +1392,8 @@ authored data under the cap.</p>
 <td style="text-align: right;"><strong>17,436</strong></td>
 <td style="text-align: right;"><strong>13,361</strong></td>
 <td style="text-align: right;"><strong>94,437</strong></td>
-<td style="text-align: right;"><strong>3,927</strong></td>
-<td style="text-align: right;"><strong>26,870</strong></td>
+<td style="text-align: right;"><strong>4,406</strong></td>
+<td style="text-align: right;"><strong>26,391</strong></td>
 <td>35 PRs include-only; 62 at full refactor size</td>
 </tr>
 </tbody>
