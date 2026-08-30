@@ -5,7 +5,21 @@
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: air-opt -air-fuse-channels="aggressive-mode=L1,L2,L3" -air-place-herds='num-rows=2 num-cols=2 row-anchor=3 col-anchor=5' -air-to-aie="emit-while-loop=false use-objectfifo=false row-offset=3 col-offset=5 device=xcve2802" %s | FileCheck %s
+// -air-opt-memtile-dma-bds is REQUIRED here and must not be dropped as noise.
+// This test's feed loops carry the k-loop induction variable in an L2 channel
+// put's offset. An aie.dma_bd offset is a static descriptor, so that walk has to
+// be folded into BD wrap/stride dimensions first -- which is what this pass does
+// (AIRUnrollScfForIntoBDChain), and what the production aircc pipeline runs.
+// Without it, air-to-aie used to substitute 0 for the induction variable and
+// emit a chain that re-read block 0 forever: measured pre-fix (artifact: the
+// BD-offset comment on the port PR, kurtis-b/mlir-air#7), the B feed walked
+// {0, 32, 0, 32} where the folded walk is {0, 2048, 32, 2080}, and the A feed
+// {0, 0, 2048, 2048}. The CHECK lines below pin tiles, buffers, cores
+// and locks but no BD offset, so that was structurally green over frozen data
+// movement. air-to-aie now refuses a non-constant BD offset rather than freezing
+// it (phase H10, docs/plans/.../24), so this pass is what keeps the test lowering
+// -- and lowering CORRECTLY. See the AIRToAIE non_constant_bd_offset test.
+// RUN: air-opt -air-fuse-channels="aggressive-mode=L1,L2,L3" -air-place-herds='num-rows=2 num-cols=2 row-anchor=3 col-anchor=5' -air-opt-memtile-dma-bds="device=xcve2802" -air-to-aie="emit-while-loop=false use-objectfifo=false row-offset=3 col-offset=5 device=xcve2802" %s | FileCheck %s
 
 // CHECK-LABEL:   aie.device(xcve2802) @segment_0 {
 // CHECK-DAG:   %[[SHIM:.*]] = aie.logical_tile<ShimNOCTile>(?, ?)
