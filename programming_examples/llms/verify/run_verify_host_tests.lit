@@ -33,11 +33,13 @@
 // Editing this header: lit scans the WHOLE file for its directives, so naming
 // one in prose registers as a directive. Describe them, never spell them out.
 //
-// RUN: python3 %S/test_verify_runner.py | FileCheck %s
+// RUN: %PYTHON %S/test_verify_runner.py | FileCheck %s
 //
+// CHECK: PASS  test_a_stored_flag_does_not_count_as_read
 // CHECK: PASS  test_no_flag_is_parsed_and_never_read
 // CHECK: PASS  test_the_audit_can_actually_fail
 // CHECK: PASS  test_the_driver_parses_flags_at_all
 // CHECK: PASS  test_the_gate_decodes_greedily_which_is_why_no_seed_is_needed
+// CHECK: PASS  test_the_greedy_check_can_actually_fail
 // CHECK: PASS  test_the_seed_flag_is_gone_and_stays_gone
-// CHECK: verify runner tests: 5/5 passed
+// CHECK: verify runner tests: 7/7 passed

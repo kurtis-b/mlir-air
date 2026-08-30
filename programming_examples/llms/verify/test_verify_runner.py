@@ -51,8 +51,13 @@ _RUNNER = os.path.join(_HERE, "verify_runner.py")
 _ARGPARSE_INTERNAL = {"help"}
 
 
-def _tree():
-    return ast.parse(open(_RUNNER, encoding="utf-8").read(), _RUNNER)
+def _tree(source: str | None = None) -> ast.AST:
+    """The driver's AST, or the AST of ``source`` when a control injects one.
+    Every helper below takes the tree it audits, so a control exercises the
+    SAME code the production check runs -- never a private re-walk."""
+    if source is None:
+        source = open(_RUNNER, encoding="utf-8").read()
+    return ast.parse(source, _RUNNER)
 
 
 def _dest_for(call: ast.Call) -> str | None:
@@ -74,10 +79,10 @@ def _dest_for(call: ast.Call) -> str | None:
     return name.lstrip("-").replace("-", "_") if name else None
 
 
-def parsed_flags() -> dict[str, str]:
-    """``dest -> the option string`` for every ``add_argument`` in the driver."""
+def parsed_flags(tree: ast.AST) -> dict[str, str]:
+    """``dest -> the option string`` for every ``add_argument`` in ``tree``."""
     out = {}
-    for node in ast.walk(_tree()):
+    for node in ast.walk(tree):
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -97,18 +102,25 @@ def parsed_flags() -> dict[str, str]:
     return out
 
 
-def read_names() -> set[str]:
-    """Every attribute read off the parsed namespace, plus wholesale uses.
+def read_names(tree: ast.AST) -> set[str]:
+    """Every attribute LOADED off the parsed namespace, plus wholesale uses.
 
-    ``args.x`` is the ordinary form. ``vars(args)`` / ``**vars(args)`` would
-    make every flag reachable, so it is detected and reported rather than
-    silently defeating the audit.
+    ``args.x`` in a Load context is the ordinary form. A Store
+    (``args.x = ...``) is not a read: a driver that overwrites a parsed value
+    and never looks at what the caller passed has ignored the flag exactly as
+    if it had never read it. ``vars(args)`` / ``**vars(args)`` would make
+    every flag reachable, so it is detected and reported rather than silently
+    defeating the audit.
     """
     names, wholesale = set(), False
-    for node in ast.walk(_tree()):
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-            if node.value.id == "args":
-                names.add(node.attr)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "args"
+            and isinstance(node.ctx, ast.Load)
+        ):
+            names.add(node.attr)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id == "vars" and any(
                 isinstance(a, ast.Name) and a.id == "args" for a in node.args
@@ -119,10 +131,117 @@ def read_names() -> set[str]:
     return names
 
 
+def dead_flags(tree: ast.AST) -> list[str]:
+    """The flags ``tree`` parses and never loads -- THE predicate. The
+    production check and every control below call this one function."""
+    flags = parsed_flags(tree)
+    read = read_names(tree)
+    if "*" in read:
+        raise AssertionError(
+            "verify_runner reads its namespace wholesale (vars(args)), which "
+            "makes this audit unable to see a dead flag. Read flags by name."
+        )
+    return sorted(
+        f"{option} (args.{dest})" for dest, option in flags.items() if dest not in read
+    )
+
+
+#: Names that would mean a sampled, seed-needing decode if they were called
+#: on the token-selection path.
+_SAMPLER_NAMES = {"multinomial", "sample", "pick_token", "choice", "random"}
+
+
+def greedy_violations(tree: ast.AST) -> tuple[int, list[str]]:
+    """Inspect ``_generate_with_topk``: every expression that becomes a chosen
+    token (``chosen = [...]``, ``chosen.append(...)``, ``next_tok = ...``) must
+    be a ``.top1_token`` load, and nothing on that path may call a sampler.
+
+    Returns ``(selection sites seen, violations)``; the caller asserts the site
+    count so a renamed function cannot make the check vacuous.
+    """
+    fn = next(
+        (
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "_generate_with_topk"
+        ),
+        None,
+    )
+    if fn is None:
+        return 0, ["_generate_with_topk is missing"]
+
+    def is_top1_load(e: ast.AST) -> bool:
+        return (
+            isinstance(e, ast.Attribute)
+            and e.attr == "top1_token"
+            and isinstance(e.ctx, ast.Load)
+        )
+
+    sites, bad = 0, []
+    for node in ast.walk(fn):
+        selected = []
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id in ("chosen", "next_tok")
+            for t in node.targets
+        ):
+            v = node.value
+            selected = list(v.elts) if isinstance(v, ast.List) else [v]
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "append"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "chosen"
+        ):
+            selected = list(node.args)
+        for e in selected:
+            sites += 1
+            if not is_top1_load(e):
+                bad.append(ast.unparse(e))
+        if isinstance(node, ast.Call):
+            f = node.func
+            name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+            if name in _SAMPLER_NAMES:
+                bad.append(ast.unparse(node))
+    return sites, bad
+
+
+def _inject_after_parse(source: str, lines: str) -> str:
+    """A copy of the driver source with ``lines`` inserted around the
+    ``parse_args`` anchor; the control asserts the anchor was found."""
+    injected = source.replace("    args = p.parse_args()", lines, 1)
+    assert injected != source, (
+        "STALE: the anchor 'args = p.parse_args()' is no longer in "
+        "verify_runner.py, so this control injected nothing and proved "
+        "nothing. Re-anchor it rather than deleting it."
+    )
+    return injected
+
+
+def test_a_stored_flag_does_not_count_as_read():
+    """Negative control for the Load rule: a flag the driver parses and then
+    OVERWRITES (``args.x = "fixed"``) has ignored the caller's value, and the
+    real predicate must still report it dead."""
+    source = open(_RUNNER, encoding="utf-8").read()
+    injected = _inject_after_parse(
+        source,
+        '    p.add_argument("--never-read", type=int, default=42)\n'
+        "    args = p.parse_args()\n"
+        '    args.never_read = "fixed"\n',
+    )
+    tree = _tree(injected)
+    assert "never_read" in parsed_flags(tree), "the walk did not see the flag"
+    assert "never_read" not in read_names(tree), (
+        "a Store of args.never_read was counted as a read; the audit would "
+        "pass a flag whose supplied value is thrown away"
+    )
+    assert "--never-read (args.never_read)" in dead_flags(tree)
+
+
 def test_the_driver_parses_flags_at_all():
     """Guard the audit itself: an ast walk that finds nothing would pass every
     check below by vacuity, which is this batch's whole subject."""
-    flags = parsed_flags()
+    flags = parsed_flags(_tree())
     assert len(flags) >= 10, (
         f"only {len(flags)} flags parsed from verify_runner.py -- the ast walk "
         "has broken, not the driver. Every check in this module is vacuous "
@@ -135,16 +254,7 @@ def test_the_driver_parses_flags_at_all():
 def test_no_flag_is_parsed_and_never_read():
     """THE ITEM. A flag the driver accepts and never reads is a promise it does
     not keep -- and the caller cannot tell, because the run still passes."""
-    flags = parsed_flags()
-    read = read_names()
-    if "*" in read:
-        raise AssertionError(
-            "verify_runner reads its namespace wholesale (vars(args)), which "
-            "makes this audit unable to see a dead flag. Read flags by name."
-        )
-    dead = sorted(
-        f"{option} (args.{dest})" for dest, option in flags.items() if dest not in read
-    )
+    dead = dead_flags(_tree())
     assert not dead, (
         "verify_runner.py parses these and never reads them, so asking for "
         f"them changes nothing: {dead}. Either wire each to the code that "
@@ -153,51 +263,26 @@ def test_no_flag_is_parsed_and_never_read():
 
 
 def test_the_audit_can_actually_fail():
-    """The negative control, run on every invocation.
-
-    A dead-flag audit that cannot detect a dead flag is the same defect it
-    exists to catch. This injects one into a copy of the real source text and
-    asserts the same walk finds it -- so the check is exercised against a
-    positive case every time, not only on the day something breaks.
-    """
+    """The negative control, run on every invocation, THROUGH THE REAL
+    PREDICATE: a dead flag injected into a copy of the driver source must come
+    back from ``dead_flags`` -- the same function the production check calls,
+    so a regression in ``parsed_flags``/``read_names`` turns this red too."""
     source = open(_RUNNER, encoding="utf-8").read()
-    injected = source.replace(
-        "    args = p.parse_args()",
+    injected = _inject_after_parse(
+        source,
         '    p.add_argument("--never-read", type=int, default=42)\n'
         "    args = p.parse_args()",
-        1,
     )
-    assert injected != source, (
-        "STALE: the anchor 'args = p.parse_args()' is no longer in "
-        "verify_runner.py, so this control injected nothing and proved "
-        "nothing. Re-anchor it rather than deleting it."
-    )
-    tree = ast.parse(injected)
-    dests = set()
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "add_argument"
-        ):
-            d = _dest_for(node)
-            if d:
-                dests.add(d)
-    assert "never_read" in dests, "the walk did not see the injected flag"
-    read = {
-        n.attr
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Attribute)
-        and isinstance(n.value, ast.Name)
-        and n.value.id == "args"
-    }
-    assert "never_read" not in read, "the injected flag was somehow read"
+    dead = dead_flags(_tree(injected))
+    assert (
+        "--never-read (args.never_read)" in dead
+    ), f"the real predicate did not report the injected dead flag: {dead}"
 
 
 def test_the_seed_flag_is_gone_and_stays_gone():
     """The specific one. Re-adding ``--seed`` without a consumer would be caught
     by the audit above; this names it so the reason is not lost to a diff."""
-    flags = parsed_flags()
+    flags = parsed_flags(_tree())
     assert "seed" not in flags, (
         "--seed is back. Nothing on the verify path consumes randomness "
         "(greedy decode, checkpoint weights, deterministic tokenization), so a "
@@ -208,16 +293,37 @@ def test_the_seed_flag_is_gone_and_stays_gone():
 
 
 def test_the_gate_decodes_greedily_which_is_why_no_seed_is_needed():
-    """The claim the removal rests on, checked against the source rather than
-    remembered: the driver takes ``top1_token``, never a sampled token."""
+    """The claim the removal rests on, checked against the EXECUTABLE token
+    selection rather than the source text: every chosen token in
+    ``_generate_with_topk`` is a ``.top1_token`` load and no sampler is called
+    on that path. Comments and docstrings cannot satisfy this."""
+    sites, bad = greedy_violations(_tree())
+    assert sites >= 3, (
+        f"only {sites} token-selection sites found in _generate_with_topk; "
+        "the walk no longer sees the decode loop, so this check is vacuous"
+    )
+    assert not bad, (
+        f"_generate_with_topk selects tokens by something other than "
+        f"top1_token: {bad}. If the gate has gained a sampled decode it is no "
+        "longer deterministic, and it needs a seed -- a real one, wired to "
+        "the sampler."
+    )
+
+
+def test_the_greedy_check_can_actually_fail():
+    """Mutation control for the check above: replace the decode-step token
+    read with an unlisted sampler and the same predicate must object."""
     source = open(_RUNNER, encoding="utf-8").read()
-    assert "top1_token" in source
-    for sampler in ("multinomial", "temperature", "top_p", "do_sample"):
-        assert sampler not in source, (
-            f"verify_runner now mentions {sampler!r}. If the gate has gained a "
-            "sampled decode it is no longer deterministic, and it needs a seed "
-            "-- a real one, wired to the sampler."
-        )
+    mutated = source.replace(
+        "chosen.append(ds.top1_token)", "chosen.append(runner.pick_token(ds))", 1
+    )
+    assert (
+        mutated != source
+    ), "STALE: 'chosen.append(ds.top1_token)' anchor is gone; re-anchor"
+    sites, bad = greedy_violations(_tree(mutated))
+    assert (
+        sites >= 3 and bad
+    ), f"the greedy check did not object to a sampled token: sites={sites} bad={bad}"
 
 
 def main():
