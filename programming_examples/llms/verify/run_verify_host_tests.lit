@@ -43,3 +43,11 @@
 // CHECK: PASS  test_the_greedy_check_can_actually_fail
 // CHECK: PASS  test_the_seed_flag_is_gone_and_stays_gone
 // CHECK: verify runner tests: 7/7 passed
+//
+// The Llama drivers' prompt-length seam (llama32_1b/test_prompt_len.py): the
+// real prompt length must reach the prefill, since instruct templates carry EOS
+// inside the prompt.
+// RUN: %PYTHON %S/../llama32_1b/test_prompt_len.py | FileCheck %s --check-prefix=PLEN
+// PLEN: PASS  llama32_1b: run_once -> generate carries prompt_len=7
+// PLEN: PASS  llama32_1b_int4: run_once -> generate carries prompt_len=7
+// PLEN: prompt_len seam tests: 2/2 passed
