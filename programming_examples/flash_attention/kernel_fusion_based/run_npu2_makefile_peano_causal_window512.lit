@@ -1,0 +1,40 @@
+// (c) Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Sliding-window (banded causal) FlashAttention: --window W keeps only
+// q_abs - W < k_abs <= q_abs, a band of W keys ending at (and including) the
+// query's own position. The builder swaps apply_causal_mask for
+// apply_window_mask and threads window_blocks = W / LKP into the call as a
+// constant; that call is the window's only IR effect, and this is the one
+// test that executes the banded mask path on hardware at all.
+//
+// Shape: 2048x2048, dk/dv 64, the full-chip config lqp=256 / num_q_tiles=4 /
+// num_heads_per_unroll=2 / num_cascade_stages=4, GQA 32:8. The existing
+// causal coverage already exercises this tiling unbanded, so the only
+// variable between this and run_npu2_makefile_peano_causal.lit is the mask.
+//
+// W = 512 is a multiple of LKP = 64; the builder refuses a window that is not
+// chunk-aligned (and a window without --causal), so the band's trailing edge
+// always lands on a block boundary.
+//
+// The single --window flag feeds both the builder's IR and the harness's
+// banded NumPy reference in one process, so the device and the reference
+// cannot be given different masks from the command line. An implementation
+// that silently degraded to full causal would disagree with the banded
+// reference on over a quarter of the output elements at these tolerances,
+// far past the 0.5% mismatch cap -- the check has no silent-pass mode, which
+// is why no separate negative-control recipe accompanies this test.
+//
+// Windowing is correctness-only and buys no speedup without --causal-skip:
+// the KV chunk loop bound is static, so a windowed run multiplies every
+// (Q tile, KV block) pair exactly as an unwindowed one does and then masks
+// more of the result. Any GFLOP/s figure from this recipe follows the same
+// convention as the causal rows and must not be rescaled by the band ratio.
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_causal_window512
+// RUN: cd test_causal_window512
+// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile run PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR LK=2048 LKP=64 LQ=2048 LQP=256 DK=64 DV=64 NUM_HEADS=32 NUM_KV_HEADS=8 EXTRA_PY_FLAGS="--causal --window 512" | FileCheck %s
+// CHECK: PASS!
