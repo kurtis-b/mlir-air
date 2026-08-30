@@ -33,7 +33,7 @@ ifneq ($(GGUF),)
   GGUF_ARG := --gguf "$(GGUF)"
 endif
 
-.PHONY: help compile run profile chat verify verify-full diagnosis all clean
+.PHONY: help compile run profile chat verify verify-full all clean
 
 help:
 	@echo "============================================================"
@@ -51,7 +51,6 @@ help:
 	@echo "                        deliberately includes q4_0 quantization error."
 	@echo "  make verify           Top-k token-set inclusion gate vs the PLAIN HF bf16"
 	@echo "  make verify-full      Same, full prompt set"
-	@echo "  make diagnosis        Single-prompt lens (informational)"
 	@echo "  make clean            Remove build artifacts and verify reports"
 	@echo ""
 	@echo "Options (override with make VAR=value):"
@@ -92,11 +91,6 @@ verify-full:
 	@mkdir -p $(BUILD_DIR)
 	cd $(BUILD_DIR) && $(PYTHON) $(VERIFY_RUNNER) --runner=$(RUNNER_ADAPTER) \
 		--prompts topk_token --model instruct
-
-diagnosis:
-	@mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && $(PYTHON) $(VERIFY_RUNNER) --runner=$(RUNNER_ADAPTER) \
-		--prompts single --prompt "$(PROMPT)" --model instruct
 
 clean:
 	rm -r $(BUILD_DIR) 2>/dev/null || true

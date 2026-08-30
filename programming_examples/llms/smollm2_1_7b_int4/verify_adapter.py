@@ -143,6 +143,12 @@ class Int4NpuRunner:
         self.npu_attn = npu_attn
         self.cpu_attn = not npu_attn
         self.lite_mode = lite_mode
+        if not lite_mode:
+            raise NotImplementedError(
+                "smollm2_1_7b_int4 exposes no per-layer intermediates yet: "
+                "non-lite (diagnosis) mode would report PASS with zero "
+                "comparisons. Run the verify gate (lite) instead."
+            )
         self._tokenizer = tokenizer
 
         self.rope_lut_bf16 = generate_rope_lut(config=config, seq_len=max_seq).astype(
