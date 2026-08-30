@@ -1,0 +1,16 @@
+# Build / kernel cache artifacts
+build_peano/
+build_chess/
+__pycache__/
+*.pyc
+air_project/
+.debug/
+.pytest_cache/
+
+# Stray artifacts from running a script outside build_*/ (xrt.py and
+# external_kernels.py write these to the CWD by design; `make` cd's first).
+air.mlir
+air.elf
+air.xclbin
+air.insts.bin
+*.o
