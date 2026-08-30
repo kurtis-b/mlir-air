@@ -8,9 +8,10 @@
 // -air-opt-memtile-dma-bds is REQUIRED here and must not be dropped as noise.
 // See async_gemm_to_locks_aie2.mlir for the full reasoning. This test makes the
 // old failure starkest: its feed loops run FOUR trips and its buffers are
-// asymmetric, so pre-fix the A feed (64x128xi32) emitted {0, 4096} where it
-// needed eight offsets, and the B feed (128x64xi32) emitted {0, 32} where it
-// needed {0,2048,4096,6144} interleaved with {32,2080,4128,6176}. The CHECK
+// asymmetric, so pre-fix (artifact: the BD-offset comment on the port PR,
+// kurtis-b/mlir-air#7) one feed emitted {0, 4096} and the other {0, 32} where
+// the folded walks are {0,2048,4096,6144,32,2080,4128,6176} and
+// {0,32,64,96,4096,4128,4160,4192}. The CHECK
 // lines pin no BD offset, so none of that was visible. This pass folds the walk
 // into BD wrap/stride dims; air-to-aie now refuses the unfolded form outright
 // (phase H10).

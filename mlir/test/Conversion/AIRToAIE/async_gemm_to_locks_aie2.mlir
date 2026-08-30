@@ -11,9 +11,10 @@
 // be folded into BD wrap/stride dimensions first -- which is what this pass does
 // (AIRUnrollScfForIntoBDChain), and what the production aircc pipeline runs.
 // Without it, air-to-aie used to substitute 0 for the induction variable and
-// emit a chain that re-read block 0 forever: measured pre-fix, the A feed walked
-// {0, 0, 2048, 2048} and the B feed {0, 32, 0, 32} instead of the four tile
-// corners {0, 32, 2048, 2080}. The CHECK lines below pin tiles, buffers, cores
+// emit a chain that re-read block 0 forever: measured pre-fix (artifact: the
+// BD-offset comment on the port PR, kurtis-b/mlir-air#7), the B feed walked
+// {0, 32, 0, 32} where the folded walk is {0, 2048, 32, 2080}, and the A feed
+// {0, 0, 2048, 2048}. The CHECK lines below pin tiles, buffers, cores
 // and locks but no BD offset, so that was structurally green over frozen data
 // movement. air-to-aie now refuses a non-constant BD offset rather than freezing
 // it (phase H10, docs/plans/.../24), so this pass is what keeps the test lowering
