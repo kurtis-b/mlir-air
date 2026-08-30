@@ -59,8 +59,8 @@ void air::airDialect::initialize() {
 // attribute is caught at the pass that broke it rather than at the consumer.
 // Unknown air.* attributes are accepted -- many passes use ad-hoc markers --
 // so this validates the documented user-facing ones.
-LogicalResult
-air::airDialect::verifyOperationAttribute(Operation *op, NamedAttribute attr) {
+LogicalResult air::airDialect::verifyOperationAttribute(Operation *op,
+                                                        NamedAttribute attr) {
   StringRef name = attr.getName().strref();
   if (name == "air.disable_ping_pong") {
     if (!llvm::isa<UnitAttr>(attr.getValue()))
