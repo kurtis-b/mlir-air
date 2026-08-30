@@ -66,7 +66,8 @@ def _check_driver(sub):
     )
     params = inspect.signature(mod.run_npu_prefill).parameters
     assert "prompt_len" in params and params["prompt_len"].default is None, sub
-    mod.generate = _raise  # run_once must hand generate the pre-pad length
+    orig_generate = mod.generate
+    mod.generate = _raise  # leg 1: run_once must hand generate the pre-pad length
     try:
         mod.run_once(session, "hi", n_tokens=4)
         raise AssertionError(f"{sub}: run_once did not call generate")
@@ -76,6 +77,24 @@ def _check_driver(sub):
             TOKENS
         ), f"{sub}: run_once passed prompt_len={got}, want {len(TOKENS)}"
     print(f"PASS  {sub}: run_once -> generate carries prompt_len={len(TOKENS)}")
+    # leg 2: END TO END through the REAL generate -- if a driver drops the
+    # prompt_len= forwarding from its prefill call, this leg goes red while
+    # leg 1 stays green.
+    mod.generate = orig_generate
+    mod.run_npu_prefill = _raise
+    try:
+        mod.run_once(session, "hi", n_tokens=4)
+        raise AssertionError(f"{sub}: generate did not call run_npu_prefill")
+    except _Captured as e:
+        got = e.kw.get("prompt_len")
+        assert got == len(TOKENS), (
+            f"{sub}: the real generate forwarded prompt_len={got} to "
+            f"run_npu_prefill, want {len(TOKENS)}"
+        )
+    print(
+        f"PASS  {sub}: the real generate forwards prompt_len={len(TOKENS)} "
+        "to run_npu_prefill"
+    )
 
 
 def main():

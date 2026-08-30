@@ -49,5 +49,7 @@
 // inside the prompt.
 // RUN: %PYTHON %S/../llama32_1b/test_prompt_len.py | FileCheck %s --check-prefix=PLEN
 // PLEN: PASS  llama32_1b: run_once -> generate carries prompt_len=7
+// PLEN: PASS  llama32_1b: the real generate forwards prompt_len=7 to run_npu_prefill
 // PLEN: PASS  llama32_1b_int4: run_once -> generate carries prompt_len=7
+// PLEN: PASS  llama32_1b_int4: the real generate forwards prompt_len=7 to run_npu_prefill
 // PLEN: prompt_len seam tests: 2/2 passed
