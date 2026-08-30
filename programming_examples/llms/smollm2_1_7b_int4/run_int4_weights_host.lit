@@ -1,0 +1,22 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Host-only test of the SmolLM2-1.7B GGUF q4_0 loader (one layer, CPU, no
+// device): layer 0's dense fields against the HF safetensors, the packed-BO
+// shapes, and the promoted-tensor provenance. Collected by the unfiltered
+// check-programming-examples only. Needs the bf16 HF snapshot in the cache and
+// the Q4_0 GGUF named by `SMOLLM2_GGUF` on the host (lit.cfg.py forwards the
+// variable and lights the feature whenever it is set; a set-but-wrong path is a
+// failure, not a skip). The hub-cache feature is deliberately NOT accepted
+// here: it only says some bytes of the multi-file repository are cached, not
+// that the Q4_0 file is.
+//
+// REQUIRES: hfweights_huggingfacetb_smollm2_1_7b_instruct
+// REQUIRES: smollm2_gguf
+//
+// RUN: %PYTHON %S/test_int4_weights.py | FileCheck %s
+//
+// CHECK: PASS  test_dense_fields_match_hf_and_the_unpermute_is_load_bearing
+// CHECK: PASS  test_packed_bos_have_the_pack_inputs_shape
+// CHECK: PASS  test_provenance_names_the_promoted_linear_and_not_the_embedding
+// CHECK: int4 weights tests: 3/3 passed
