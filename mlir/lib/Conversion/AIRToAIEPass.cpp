@@ -6182,6 +6182,71 @@ public:
     return false;
   }
 
+  /// True if `op`, or anything nested inside it, reads or writes any view of
+  /// the buffer (`views` = the buffer and its subview/cast aliases: a producer
+  /// kernel is usually handed a memref.subview, never the base value). The
+  /// nested case is load bearing: a core's producing writes usually sit inside
+  /// an scf.for whose own operands are only the loop bounds, so an operand-only
+  /// check reports a K loop that fills the buffer as untouching.
+  bool accessesBufferRecursively(Operation *op, const SetVector<Value> &views) {
+    if (isReadOrWriteToBuffer(op, views))
+      return true;
+    bool found = false;
+    for (Region &region : op->getRegions())
+      region.walk([&](Operation *o) {
+        if (isReadOrWriteToBuffer(o, views))
+          found = true;
+      });
+    return found;
+  }
+
+  /// True if a DMA on any view of the buffer is nested inside `op` (an scf.for
+  /// carrying one of the shared puts, for example).
+  bool containsMemcpyOnBuffer(Operation *op, const SetVector<Value> &views) {
+    bool found = false;
+    for (Region &region : op->getRegions())
+      region.walk([&](air::MemcpyInterface m) {
+        if (views.count(m.getSrcMemref()) || views.count(m.getDstMemref()))
+          found = true;
+      });
+    return found;
+  }
+
+  /// The op an outbound put's acquire must be placed before: the EARLIEST op in
+  /// the same block that touches a view of `alloc` and follows the previous DMA
+  /// on it. Null when nothing touches `alloc` in that window. Failure when a
+  /// DMA on the buffer is nested inside a preceding op: its acquire/release are
+  /// invisible to this sibling scan, and hoisting this put's acquire above it
+  /// would consume the lock that nested put must take first -- a deadlock on
+  /// the device. The pass refuses rather than guessing.
+  ///
+  /// The window is bounded by the previous memcpy on the same buffer so the
+  /// acquire is never hoisted above another DMA's lock ops.
+  FailureOr<Operation *>
+  findFirstBufferAccessSincePrevDma(air::MemcpyInterface memcpyOpIf,
+                                    Value alloc) {
+    llvm::SmallDenseSet<Value> aliasSet;
+    air::collectBufferAliases(alloc, aliasSet);
+    SetVector<Value> views(aliasSet.begin(), aliasSet.end());
+    Operation *earliest = nullptr;
+    for (Operation *op = memcpyOpIf->getPrevNode(); op;
+         op = op->getPrevNode()) {
+      if (auto other = dyn_cast_if_present<air::MemcpyInterface>(op))
+        if (views.count(other.getSrcMemref()) ||
+            views.count(other.getDstMemref()))
+          break;
+      if (containsMemcpyOnBuffer(op, views))
+        return memcpyOpIf->emitOpError(
+            "puts sharing one L1 buffer must sit in one block: another DMA on "
+            "the buffer is nested inside a preceding region (e.g. an scf.for), "
+            "and hoisting this put's write-lock acquire above it would "
+            "deadlock that put's own acquire. Unroll or restructure the loop.");
+      if (accessesBufferRecursively(op, views))
+        earliest = op;
+    }
+    return earliest;
+  }
+
   /// Walks ops in the block and finds the last reader/writer. Returns the last
   /// operation in the same block that accesses `destBuffer`.
   Operation *findLastReadOrWriteOp(Operation *memcpyOp, Value destBuffer) {
@@ -6334,10 +6399,35 @@ public:
     else if (!tileInbound.value() &&
              isa<AIE::BufferOp>(alloc.getDefiningOp())) {
       if (sharedStagingBuffer) {
-        // Interleaved mode: acquire immediately before this specific put, so
-        // the core waits for the DMA to finish reading the previous put's
-        // data before overwriting the buffer.
-        builder.setInsertionPoint(memcpyOpIf);
+        // Interleaved mode: acquire before this specific put, so the core waits
+        // for the DMA to finish reading the previous put's data before
+        // overwriting the buffer.
+        //
+        // Placing it immediately before the put paces put i+1 against put i,
+        // but says nothing about the core's OWN writes.  When a core PRODUCES
+        // a buffer once and then sends it out in N>1 slices -- the resident
+        // FFN's up herd, where an L1-resident accumulator leaves in
+        // chunks_per_group pieces -- the last release is the last op of the
+        // round, so the next round's producing write races the last BD.
+        // Measured on NPU2 as a DETERMINISTIC wrong answer: the final slice
+        // arrives with only its first run intact and the rest zeroed, because
+        // the core's memset overtakes the DMA part way through the BD.
+        //
+        // So hoist to the earliest op that touches the buffer since the
+        // previous DMA on it.  Acquires and releases still alternate N times
+        // per round, which makes the round's FIRST acquire satisfiable only by
+        // the previous round's LAST BD release -- the ordering the
+        // non-interleaved path gets by hoisting to block start.  When nothing
+        // touches the buffer in that window (a pure relay: put, put, ...) this
+        // is exactly the original placement.
+        FailureOr<Operation *> firstAccess =
+            findFirstBufferAccessSincePrevDma(memcpyOpIf, alloc);
+        if (failed(firstAccess))
+          return failure();
+        if (*firstAccess)
+          builder.setInsertionPoint(*firstAccess);
+        else
+          builder.setInsertionPoint(memcpyOpIf);
       } else {
         auto br = dyn_cast_if_present<cf::BranchOp>(
             memcpyOpIf->getBlock()->getTerminator());
