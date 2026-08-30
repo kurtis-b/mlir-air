@@ -196,6 +196,14 @@ if os.environ.get("HF_HUB_DISABLE_XET"):
 if os.environ.get("HF_HUB_OFFLINE"):
     llvm_config.with_environment("HF_HUB_OFFLINE", os.environ["HF_HUB_OFFLINE"])
 
+# The int4 SmolLM2 example reads a GGUF that may live outside the HF cache
+# (`SMOLLM2_GGUF`). Forward it and mark `smollm2_gguf` when it names a file, so
+# `REQUIRES: smollm2_gguf` tests skip cleanly instead of failing on a missing
+# checkpoint (the hub copy, when cached, lights its hfweights_* feature instead).
+if os.path.isfile(os.environ.get("SMOLLM2_GGUF", "")):
+    config.available_features.add("smollm2_gguf")
+    llvm_config.with_environment("SMOLLM2_GGUF", os.environ["SMOLLM2_GGUF"])
+
 
 # Gate each LLM example on the weights it loads actually being present in the
 # local HF cache, so the suite runs whatever is seeded and auto-includes a model
