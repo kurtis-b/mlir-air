@@ -1,0 +1,26 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// SmolLM2-1.7B int4 (GGUF q4_0) compile-only smoke test: builds the bf16
+// prefill kernels at SmolLM2 shapes plus the three int4 decode ELFs at gs=32
+// through the AIR -> AIE -> aiecc -> Peano pipeline. No NPU dispatch, no
+// HuggingFace weight download, no GGUF read.
+//
+// Collected by path (`llms/.*/run_npu2_compile`) into the
+// check-programming-examples-llms-compile suite (programming_examples/
+// CMakeLists.txt), which no PR workflow runs: the PR gate is the llama32_1b-
+// only variant and the peano suite filters `llms/` out. So this lit is an
+// on-demand check, not a CI signal; it is the only compile of the int4 decode
+// builders at gs=32 (the llama32_1b_int4 compile lit builds them at gs=128):
+//   lit -v programming_examples/llms/smollm2_1_7b_int4/run_npu2_compile.lit
+//
+// Gated on ryzen_ai_npu2 because the shared builders hardcode the AIE2P
+// target; the compile does not touch the NPU device.
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// RUN: mkdir -p test_peano_compile
+// RUN: cd test_peano_compile
+// RUN: make -f %S/Makefile clean
+// RUN: make -f %S/Makefile compile PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
+// CHECK: Compilation passed.
