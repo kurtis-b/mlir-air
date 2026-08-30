@@ -75,6 +75,71 @@ def _rms_qkv_qknorm_rope_gemv_backend(verbose=False):
     }
 
 
+# The fused RMSNorm + Q/K/V GEMV + QK-norm + RoPE ELF's host ABI, in one place: the
+# decode step and the inference pre-load used to carry two hand-copied 17-argument
+# lists that had to agree by inspection. Positions 13/14 are the RoPE LUTs, which are
+# position-dependent and therefore never static.
+RMS_QKV_OUTPUT_INDICES = [8, 15, 16]  # v, q_roped, k_roped
+RMS_QKV_STATIC_INDICES = {1, 3, 5, 7, 9, 10}  # norm_w, wq, wk, wv, q_norm, k_norm
+RMS_QKV_INTERMEDIATE_INDICES = {2, 4, 6, 8, 11, 12, 15, 16}
+
+
+def rms_qkv_luts(rope_lut_bf16, current_pos, config):
+    """Per-head RoPE LUTs for one position: (lut_q, lut_k), each flat bf16."""
+    rope_lut_pos = rope_lut_bf16[current_pos : current_pos + 1]  # (1, head_dim)
+    lut_q = np.tile(rope_lut_pos, (config.n_heads, 1)).flatten().astype(bfloat16)
+    lut_k = np.tile(rope_lut_pos, (config.n_kv_heads, 1)).flatten().astype(bfloat16)
+    return lut_q, lut_k
+
+
+def rms_qkv_args(layer_weights, x_bf16, lut_q, lut_k, config):
+    """The ELF's 17 positional buffers in ABI order (see the index constants)."""
+    emb_dim = config.emb_dim
+    head_dim = config.head_dim
+    q_dim = config.n_heads * head_dim
+    kv_dim = config.n_kv_heads * head_dim
+    return [
+        np.asarray(x_bf16, bfloat16).reshape(emb_dim),  # 0 x_in
+        layer_weights.attn_norm.reshape(emb_dim).astype(bfloat16),  # 1 norm_w (static)
+        np.zeros(emb_dim, dtype=bfloat16),  # 2 normed
+        layer_weights._wq_t,  # 3 wq (static)
+        np.zeros(q_dim, dtype=bfloat16),  # 4 q
+        layer_weights._wk_t,  # 5 wk (static)
+        np.zeros(kv_dim, dtype=bfloat16),  # 6 k
+        layer_weights._wv_t,  # 7 wv (static)
+        np.zeros(kv_dim, dtype=bfloat16),  # 8 v
+        np.asarray(layer_weights.q_norm, bfloat16).reshape(
+            head_dim
+        ),  # 9 q_norm (static)
+        np.asarray(layer_weights.k_norm, bfloat16).reshape(
+            head_dim
+        ),  # 10 k_norm (static)
+        np.zeros(q_dim, dtype=bfloat16),  # 11 q_n
+        np.zeros(kv_dim, dtype=bfloat16),  # 12 k_n
+        lut_q,  # 13 lut_q (DYNAMIC -- position-dependent)
+        lut_k,  # 14 lut_k (DYNAMIC)
+        np.zeros(q_dim, dtype=bfloat16),  # 15 q_roped
+        np.zeros(kv_dim, dtype=bfloat16),  # 16 k_roped
+    ]
+
+
+def run_rms_qkv(
+    cache, layer_weights, x_bf16, lut_q, lut_k, config, layer_idx, verbose=False
+):
+    """Run the fused QKV ELF for one layer; returns load_and_run's result list."""
+    return cache.load_and_run(
+        "rms_qkv_qknorm_rope_gemv",
+        _rms_qkv_qknorm_rope_gemv_backend(verbose),
+        *rms_qkv_args(layer_weights, x_bf16, lut_q, lut_k, config),
+        output_indices=RMS_QKV_OUTPUT_INDICES,
+        static_input_indices=RMS_QKV_STATIC_INDICES,
+        intermediate_indices=RMS_QKV_INTERMEDIATE_INDICES,
+        bo_key=(
+            f"rms_qkv_qknorm_rope_gemv_L{layer_idx}" if layer_idx is not None else None
+        ),
+    )
+
+
 # LM-head decode partitioning. vocab=151936.
 # Per-partition GEMV broadcasts the K=emb_dim input vector with a hardware
 # push_queue repeat_count ~= n_part/32 - 1, capped at the [0:255] range. So
@@ -344,42 +409,10 @@ def run_decode_block(
 
     layer_idx = getattr(layer_weights, "_layer_idx", None)
 
-    # RoPE LUT for this position (position-dependent — NOT static).
-    rope_lut_pos = rope_lut_bf16[current_pos : current_pos + 1]  # (1, head_dim)
-    lut_q = np.tile(rope_lut_pos, (n_heads, 1)).flatten().astype(bfloat16)
-    lut_k = np.tile(rope_lut_pos, (n_kv_heads, 1)).flatten().astype(bfloat16)
-
     # --- One ELF = RMSNorm + Q/K/V GEMV + per-head QK-norm + RoPE ---
-    res = cache.load_and_run(
-        "rms_qkv_qknorm_rope_gemv",
-        _rms_qkv_qknorm_rope_gemv_backend(verbose),
-        x_bf16.flatten().astype(bfloat16),  # 0 x_in
-        layer_weights.attn_norm.reshape(emb_dim).astype(bfloat16),  # 1 norm_w (static)
-        np.zeros(emb_dim, dtype=bfloat16),  # 2 normed
-        layer_weights._wq_t,  # 3 wq (static)
-        np.zeros(q_dim, dtype=bfloat16),  # 4 q
-        layer_weights._wk_t,  # 5 wk (static)
-        np.zeros(kv_dim, dtype=bfloat16),  # 6 k
-        layer_weights._wv_t,  # 7 wv (static)
-        np.zeros(kv_dim, dtype=bfloat16),  # 8 v
-        np.asarray(layer_weights.q_norm, bfloat16).reshape(
-            head_dim
-        ),  # 9 q_norm (static)
-        np.asarray(layer_weights.k_norm, bfloat16).reshape(
-            head_dim
-        ),  # 10 k_norm (static)
-        np.zeros(q_dim, dtype=bfloat16),  # 11 q_n
-        np.zeros(kv_dim, dtype=bfloat16),  # 12 k_n
-        lut_q,  # 13 lut_q (DYNAMIC — position-dependent)
-        lut_k,  # 14 lut_k (DYNAMIC)
-        np.zeros(q_dim, dtype=bfloat16),  # 15 q_roped
-        np.zeros(kv_dim, dtype=bfloat16),  # 16 k_roped
-        output_indices=[8, 15, 16],
-        static_input_indices={1, 3, 5, 7, 9, 10},
-        intermediate_indices={2, 4, 6, 8, 11, 12, 15, 16},
-        bo_key=(
-            f"rms_qkv_qknorm_rope_gemv_L{layer_idx}" if layer_idx is not None else None
-        ),
+    lut_q, lut_k = rms_qkv_luts(rope_lut_bf16, current_pos, config)
+    res = run_rms_qkv(
+        cache, layer_weights, x_bf16, lut_q, lut_k, config, layer_idx, verbose
     )
     v = res[8].astype(bfloat16)
     q_roped = res[15].astype(bfloat16)

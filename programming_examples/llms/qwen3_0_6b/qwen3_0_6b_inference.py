@@ -39,7 +39,7 @@ from qwen3_0_6b_prefill import (
 from qwen3_0_6b_decode import (
     compile_decode_kernels,
     run_decode_block,
-    _rms_qkv_qknorm_rope_gemv_backend,
+    run_rms_qkv,
     _o_gemv_ffn_backend,
     _lm_gemv_backend,
     _LM_N_PARTITIONS,
@@ -199,32 +199,16 @@ def _preload_decode_weights(decode_cache, weights, config):
     for li in range(config.n_layers):
         lw = weights.layers[li]
 
-        # Fused decode ELF warmup (RMSNorm+QKV GEMV+QK-norm+RoPE). LUTs
-        # (args 13/14) are position-dependent -> NOT static.
-        decode_cache.load_and_run(
-            "rms_qkv_qknorm_rope_gemv",
-            _rms_qkv_qknorm_rope_gemv_backend(),
-            np.zeros(emb_dim, dtype=bfloat16),  # 0 x_in
-            lw.attn_norm.reshape(emb_dim).astype(bfloat16),  # 1 norm_w (static)
-            np.zeros(emb_dim, dtype=bfloat16),  # 2 normed
-            lw._wq_t,  # 3 wq (static)
-            np.zeros(q_dim, dtype=bfloat16),  # 4 q
-            lw._wk_t,  # 5 wk (static)
-            np.zeros(kv_dim, dtype=bfloat16),  # 6 k
-            lw._wv_t,  # 7 wv (static)
-            np.zeros(kv_dim, dtype=bfloat16),  # 8 v
-            np.asarray(lw.q_norm, bfloat16).reshape(head_dim),  # 9 q_norm (static)
-            np.asarray(lw.k_norm, bfloat16).reshape(head_dim),  # 10 k_norm (static)
-            np.zeros(q_dim, dtype=bfloat16),  # 11 q_n
-            np.zeros(kv_dim, dtype=bfloat16),  # 12 k_n
-            lut_q_dummy,  # 13 lut_q (dynamic)
-            lut_k_dummy,  # 14 lut_k (dynamic)
-            np.zeros(q_dim, dtype=bfloat16),  # 15 q_roped
-            np.zeros(kv_dim, dtype=bfloat16),  # 16 k_roped
-            output_indices=[8, 15, 16],
-            static_input_indices={1, 3, 5, 7, 9, 10},
-            intermediate_indices={2, 4, 6, 8, 11, 12, 15, 16},
-            bo_key=f"rms_qkv_qknorm_rope_gemv_L{li}",
+        # Fused decode ELF warmup (RMSNorm+QKV GEMV+QK-norm+RoPE); the LUTs
+        # (args 13/14) are position-dependent -> NOT static, dummies here.
+        run_rms_qkv(
+            decode_cache,
+            lw,
+            np.zeros(emb_dim, dtype=bfloat16),
+            lut_q_dummy,
+            lut_k_dummy,
+            config,
+            li,
         )
 
         # o_gemv_ffn: build interleaved w_gateup + packed RMS-input buffer.

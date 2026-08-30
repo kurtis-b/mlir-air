@@ -1,0 +1,45 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Host-only audit of the shared verify driver's command line.
+//
+// `[2026-08-12]` verify_runner.py parsed a seed option and never read it, so a
+// verification invoked with one was NOT seeded by it and any reproducibility
+// claim resting on it was empty -- while the run passed and looked seeded. This
+// is the gate all ten shipped models pass through, which is what made it the
+// highest-stakes instance of that day's pattern: a mechanism that reads as
+// present, does nothing, and produces a green result rather than a wrong one.
+//
+// The option was removed rather than wired, because nothing the gate reaches
+// consumes randomness -- both decode paths are greedy, weights come from a
+// checkpoint, tokenization and the top-k comparison are deterministic. That was
+// measured, not assumed: an ast walk of the driver's repo-local import closure
+// (verify_runner plus all ten verify_adapter modules) puts every RNG site
+// inside a builder's __main__ self-test block or inside synthetic_weights(),
+// which has zero call sites anywhere in the tree.
+//
+// What runs here is the audit that keeps the next one from landing: every flag
+// the driver parses must be read somewhere in the same module. It PARSES the
+// driver and never imports it -- no numpy, no torch, no transformers, no XRT --
+// so it needs neither `ryzen_ai_npu2` nor `peano` and costs milliseconds. Its
+// own negative control runs on every invocation: a dead flag is injected into a
+// copy of the real source text and the same walk must find it, so an audit that
+// has stopped being able to detect one fails rather than reporting zero.
+//
+// There is deliberately no `make` target for this arm, matching the study host
+// suite and the ffn_resident emulation arm; the two lit-only arms in this tree
+// are lit-only on purpose.
+//
+// Editing this header: lit scans the WHOLE file for its directives, so naming
+// one in prose registers as a directive. Describe them, never spell them out.
+//
+// RUN: %PYTHON %S/test_verify_runner.py | FileCheck %s
+//
+// CHECK: PASS  test_a_stored_flag_does_not_count_as_read
+// CHECK: PASS  test_no_flag_is_parsed_and_never_read
+// CHECK: PASS  test_the_audit_can_actually_fail
+// CHECK: PASS  test_the_driver_parses_flags_at_all
+// CHECK: PASS  test_the_gate_decodes_greedily_which_is_why_no_seed_is_needed
+// CHECK: PASS  test_the_greedy_check_can_actually_fail
+// CHECK: PASS  test_the_seed_flag_is_gone_and_stays_gone
+// CHECK: verify runner tests: 7/7 passed

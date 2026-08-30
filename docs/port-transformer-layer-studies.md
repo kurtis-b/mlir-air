@@ -18,12 +18,12 @@ authored data under the cap.
 | Cluster | Include | Refactor | Excluded | Landed | Remaining | PRs |
 |---|---:|---:|---:|---:|---:|---|
 | B `agents/` | 1,017 | 0 | 3,194 (+1,397 already on main) | 839 | 178 | #6 devq core (B1); B2 new-job + selftest (this PR, 432); B3 audit script rides with E's GEMM feature |
-| F compiler | 1,942 | 6,099 | 2,831 | 290 | 7,751 | H10 non-constant BD offset refusal (this PR, 290); prepared: shared-L1 put guard, shrink extent, H3 verifier, split-l2 B |
-| E `llms/` + kernels | 14,477 | 7,233 | 6,236 | 377 | 21,333 | qkv-heads kernel + layout (this PR, 377); prepared: verify_runner host tests (304), qwen3 QKV seam refactor; next: the 2-launch ELF builder, then the driver switch (E2 plan) |
+| F compiler | 1,942 | 6,099 | 2,831 | 1,819 | 6,222 | H10 (#7, 290); shared-L1 put guard (#9, 155); shrink-memref extent (#10, 440); H3 attribute verifier (#11, 123); split-l2 short offsets (#12, 438); split-l2 repeated feed (#13, 373 after its review fixes); prepared: split-l2 C |
+| E `llms/` + kernels | 14,477 | 7,233 | 6,236 | 805 | 20,905 | qkv-heads kernel + layout (this PR, 393); rms/qkv host-ABI seam refactor (#15, main-side structure-only, net +3 — not branch lines); verify_runner host tests (#14, 412); next: shared decode_qkv4 + test, then the qwen3 / llama32_1b_int4 / smollm2 int4 model rows, int4_awq q4_0, registry rows (data, ≈11 PRs) |
 | D `transformer_layer/` | 0 | 0 | 69,330 | — | 0 | excluded (Q1) |
 | C plan docs | 0 | 0 | 12,805 | — | 0 | excluded (Q3) |
 | other | 0 | 29 | 41 | 0 | 29 | rides with B |
-| **total** | **17,436** | **13,361** | **94,437** | **1,506** | **29,291** | 35 PRs include-only; 62 at full refactor size |
+| **total** | **17,436** | **13,361** | **94,437** | **3,463** | **27,334** | 35 PRs include-only; 62 at full refactor size |
 
 Loop-stop condition: Remaining = 0 for the include set; refactor rows close when their
 re-derivation lands or is recorded as not needed.

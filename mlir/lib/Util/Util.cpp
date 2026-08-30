@@ -2137,6 +2137,141 @@ air::getEffectiveMemrefSizeFromAccessPattern(SmallVector<int> memref_shape,
   return access_bounds;
 }
 
+// Bound one access-pattern offset entry, for the purposes of memref shrinkage.
+//
+// Shrinkage is only entitled to discard an offset when that offset varies over
+// a SPATIAL iteration space -- an air.herd tile index, or an scf.parallel
+// induction variable. In that case the buffer is replicated per PE, each PE
+// touches only its own slice, and getUpdatedOffsetsAfterShrinkage rewrites the
+// offset to 0; the offset then contributes nothing to the extent one PE must
+// hold. THIS FUNCTION MUST STAY IN STEP WITH getUpdatedOffsetsAfterShrinkage:
+// every offset that function leaves alone survives the rewrite verbatim, so it
+// does contribute to the extent, and a memref shrunk below offset + span
+// leaves that access reading or writing off the end of the buffer.
+//
+// Returns the largest value the entry can take, or nullopt when the analysis
+// cannot bound it -- in which case the caller must decline to shrink rather
+// than assume 0.
+//
+// `sweepFoldedIntoSizes` says whether this pattern came from a writer that ran
+// updateAccessPatternByScfForNest over its offsets. That helper rewrites an
+// scf.for-induction-variable offset into the access SIZES (size := trip count,
+// stride := stride * step), so for those patterns the sequential sweep is
+// already accounted for and adding the offset on top would double count. An
+// air.channel put/get pattern gets no such treatment -- its offsets are taken
+// verbatim -- so there the sweep must be bounded here or not at all.
+static std::optional<int64_t>
+getShrinkageOffsetUpperBound(Value offset, bool sweepFoldedIntoSizes,
+                             unsigned depth = 0) {
+  if (!offset)
+    return std::nullopt;
+  // A literal offset survives shrinkage verbatim and contributes in full.
+  // This is the case memref shrinkage used to drop on the floor.
+  if (auto constOffset = getConstantIntValue(offset))
+    return *constOffset;
+  if (depth > 8)
+    return std::nullopt; // Give up rather than guess.
+  // Spatially-variant offsets are rewritten to 0 by the shrinkage fix-up
+  // (getUpdatedOffsetsAfterShrinkage): the buffer is replicated per PE and
+  // each PE touches only its own slice.
+  if (air::getHerdArgOwner(offset))
+    return 0;
+  if (scf::getParallelForInductionVarOwner(offset))
+    return 0;
+  // A sequential scf.for induction variable.
+  if (auto forOp = scf::getForInductionVarOwner(offset)) {
+    if (sweepFoldedIntoSizes)
+      return 0; // Already counted in the sizes.
+    auto tripCount = air::getStaticScfForTripCountAsInt(forOp);
+    auto lb = getConstantIntValue(forOp.getLowerBound());
+    auto step = getConstantIntValue(forOp.getStep());
+    if (tripCount && *tripCount > 0 && lb && step)
+      return *lb + (*tripCount - 1) * (*step);
+    return std::nullopt;
+  }
+  // Walk through air.execute wrappers and computations (affine.apply,
+  // arith.muli, affine.delinearize_index, ...) onto whatever drives them. The
+  // bound is the worst case over the operands, which is why an unbounded
+  // operand poisons the whole entry.
+  Operation *defOp = offset.getDefiningOp();
+  if (!defOp)
+    return std::nullopt;
+  SmallVector<Value> operands;
+  if (auto exec = dyn_cast_if_present<air::ExecuteOp>(defOp)) {
+    for (auto &childOp : exec.getChildOps())
+      for (auto oper : childOp.getOperands())
+        operands.push_back(oper);
+  } else {
+    for (auto oper : defOp->getOperands())
+      operands.push_back(oper);
+  }
+  bool sawIterationIndex = false;
+  for (auto oper : operands) {
+    if (getConstantIntValue(oper))
+      continue; // A constant basis/step, not an index.
+    auto operBound =
+        getShrinkageOffsetUpperBound(oper, sweepFoldedIntoSizes, depth + 1);
+    if (!operBound)
+      return std::nullopt;
+    sawIterationIndex = true;
+    if (*operBound != 0)
+      return std::nullopt; // A non-zero bound through an opaque computation
+                           // cannot be scaled correctly here.
+  }
+  if (!sawIterationIndex)
+    return std::nullopt;
+  return 0;
+}
+
+// The memref extent each dimension is actually REACHED to: offset + span, not
+// span alone (getEffectiveMemrefSizeFromAccessPattern answers "how much does
+// one transfer move"; a buffer sized to that is too small once two transfers
+// land at different offsets). Sets `bounded` false if an offset could not be
+// bounded; the caller must then not shrink.
+SmallVector<int64_t> air::getEffectiveMemrefExtentFromAccessPattern(
+    SmallVector<int> memref_shape, SmallVector<Value> offsets,
+    SmallVector<Value> sizes, SmallVector<Value> strides,
+    bool sweepFoldedIntoSizes, bool &bounded) {
+  SmallVector<int64_t> access_bounds(memref_shape.size(), 1);
+  // Offsets, sizes and strides are a triple; a mismatched arity means the
+  // pattern is not one this analysis understands.
+  if (offsets.size() != sizes.size() || sizes.size() != strides.size()) {
+    bounded = false;
+    return access_bounds;
+  }
+  for (int i = sizes.size() - 1; i >= 0; i--) {
+    auto constStride = getConstantIntValue(strides[i]);
+    auto constSize = getConstantIntValue(sizes[i]);
+    if (!constStride || !constSize) {
+      bounded = false;
+      return access_bounds;
+    }
+    auto maxOffset =
+        getShrinkageOffsetUpperBound(offsets[i], sweepFoldedIntoSizes);
+    if (!maxOffset) {
+      bounded = false;
+      return access_bounds;
+    }
+    int current_memref_volume = 1;
+    for (int j = memref_shape.size() - 1; j >= 0; j--) {
+      current_memref_volume *= memref_shape[j];
+      if (llvm::divideFloorSigned(*constStride, current_memref_volume))
+        continue;
+      // Entry i lives in dimension j; its step there is
+      // stride/naturalStride(j). The offset is a starting INDEX (unscaled, as
+      // get1DOffset treats it) and the access spans size * step from it: the
+      // FOOTPRINT, trailing gap included -- consuming kernels read all of it
+      // (sizing to the last element reached broke Qwen3-0.6B decode on NPU2).
+      int64_t strideUnits = llvm::divideFloorSigned(
+          *constStride, current_memref_volume / memref_shape[j]);
+      int64_t bound = *maxOffset + *constSize * strideUnits;
+      access_bounds[j] = std::max(access_bounds[j], bound);
+      break; // an entry lives in exactly one dimension
+    }
+  }
+  return access_bounds;
+}
+
 // Get the overall data access pattern from air.channel ops which access the
 // memref.
 SmallVector<int64_t> air::getDataAccessShapeFromMemcpyOp(
@@ -2144,9 +2279,22 @@ SmallVector<int64_t> air::getDataAccessShapeFromMemcpyOp(
     SmallVector<
         std::tuple<SmallVector<Value>, SmallVector<Value>, SmallVector<Value>>>
         patterns) {
+  bool bounded = true;
+  // No provenance available for these patterns, so assume the conservative
+  // reading: sequential sweeps were NOT already folded into the sizes.
+  SmallVector<bool> sweepFolded(patterns.size(), false);
+  return getDataAccessShapeFromMemcpyOp(memref, patterns, sweepFolded, bounded);
+}
+
+SmallVector<int64_t> air::getDataAccessShapeFromMemcpyOp(
+    Value memref,
+    SmallVector<
+        std::tuple<SmallVector<Value>, SmallVector<Value>, SmallVector<Value>>>
+        patterns,
+    SmallVector<bool> sweepFoldedIntoSizes, bool &bounded) {
   auto memref_shape = getTensorShape(memref.getType());
   SmallVector<int64_t> overall_access_bounds(memref_shape.size(), 1);
-  for (auto pattern : patterns) {
+  for (auto [idx, pattern] : llvm::enumerate(patterns)) {
     SmallVector<int64_t> access_bounds(memref_shape.size(), 1);
     // Empty offsets list means default data access pattern spaning the entire
     // memref
@@ -2154,8 +2302,13 @@ SmallVector<int64_t> air::getDataAccessShapeFromMemcpyOp(
       for (unsigned i = 0; i < memref_shape.size(); i++)
         access_bounds[i] = memref_shape[i];
     else
-      access_bounds = getEffectiveMemrefSizeFromAccessPattern(
-          memref_shape, std::get<1>(pattern), std::get<2>(pattern));
+      access_bounds = getEffectiveMemrefExtentFromAccessPattern(
+          memref_shape, std::get<0>(pattern), std::get<1>(pattern),
+          std::get<2>(pattern),
+          idx < sweepFoldedIntoSizes.size() ? sweepFoldedIntoSizes[idx] : false,
+          bounded);
+    if (!bounded)
+      return overall_access_bounds;
     // Update overall access bounds.
     for (unsigned i = 0; i < memref_shape.size(); i++)
       overall_access_bounds[i] =
@@ -2427,6 +2580,11 @@ SmallVector<int64_t> air::getDataAccessShapeFromMemcpyOp(
 SmallVector<int64_t>
 air::getDataAccessShapeFromMemcpyOp(Value memref,
                                     SmallVector<Operation *> users) {
+  bool bounded = true;
+  return getDataAccessShapeFromMemcpyOp(memref, users, bounded);
+}
+SmallVector<int64_t> air::getDataAccessShapeFromMemcpyOp(
+    Value memref, SmallVector<Operation *> users, bool &bounded) {
   if (users.empty())
     return SmallVector<int64_t>();
   SmallVector<
@@ -2436,45 +2594,61 @@ air::getDataAccessShapeFromMemcpyOp(Value memref,
   Region *commonAncestorReg = findCommonRegionContainingAllAncestors(
       users, users.front()->getParentWithTrait<OpTrait::IsIsolatedFromAbove>());
 
+  // Track, per pattern, whether its writer already folded any enclosing
+  // scf.for sweep into the access sizes. Only the memref.subview and
+  // vector.transfer_read/write writers run updateAccessPatternByScfForNest;
+  // air.channel put/get offsets are taken verbatim.
+  SmallVector<bool> sweepFoldedIntoSizes;
   for (auto user : users) {
-    if (auto chanUser = dyn_cast_if_present<air::ChannelInterface>(user))
+    if (auto chanUser = dyn_cast_if_present<air::ChannelInterface>(user)) {
       accessPatterns.push_back(writeAccessPattern(chanUser));
-    else if (auto svUser = dyn_cast_if_present<memref::SubViewOp>(user))
+      sweepFoldedIntoSizes.push_back(false);
+    } else if (auto svUser = dyn_cast_if_present<memref::SubViewOp>(user)) {
       accessPatterns.push_back(writeAccessPattern(svUser, commonAncestorReg));
-    else if (auto vecReadUser =
-                 dyn_cast_if_present<mlir::vector::TransferReadOp>(user))
+      sweepFoldedIntoSizes.push_back(true);
+    } else if (auto vecReadUser =
+                   dyn_cast_if_present<mlir::vector::TransferReadOp>(user)) {
       accessPatterns.push_back(writeAccessPattern(vecReadUser));
-    else if (auto vecWriteUser =
-                 dyn_cast_if_present<mlir::vector::TransferWriteOp>(user))
+      sweepFoldedIntoSizes.push_back(true);
+    } else if (auto vecWriteUser =
+                   dyn_cast_if_present<mlir::vector::TransferWriteOp>(user)) {
       accessPatterns.push_back(writeAccessPattern(vecWriteUser));
+      sweepFoldedIntoSizes.push_back(true);
+    }
   }
-  return getDataAccessShapeFromMemcpyOp(memref, accessPatterns);
+  return getDataAccessShapeFromMemcpyOp(memref, accessPatterns,
+                                        sweepFoldedIntoSizes, bounded);
 }
 
-// Update strides after memref shrinkage. Assuming there is only one dimension
-// being shrunk.
+// Update strides after memref shrinkage: each entry's step in its dimension
+// times the SHRUNK shape's natural stride; beyond the buffer, by volume.
 SmallVector<int>
 air::getUpdatedStridesAfterShrinkage(SmallVector<int> old_memref_shape,
                                      SmallVector<int64_t> new_memref_shape,
                                      SmallVector<Value> strides) {
   SmallVector<int> new_strides(strides.size(), -1);
-  int shrinkage_volume = 1;
-  int shrinkage_factor = 1;
-  for (int j = old_memref_shape.size() - 1; j >= 0; j--) {
-    shrinkage_volume *= old_memref_shape[j];
-    if (old_memref_shape[j] != new_memref_shape[j]) {
-      shrinkage_factor =
-          llvm::divideCeilSigned(old_memref_shape[j], new_memref_shape[j]);
-      break;
-    }
+  int64_t old_volume = 1, new_volume = 1;
+  for (size_t j = 0; j < old_memref_shape.size(); j++) {
+    old_volume *= old_memref_shape[j];
+    new_volume *= new_memref_shape[j];
   }
   for (int i = strides.size() - 1; i >= 0; i--) {
-    if (llvm::divideFloorSigned(*getConstantIntValue(strides[i]),
-                                shrinkage_volume))
-      new_strides[i] = llvm::divideCeilSigned(*getConstantIntValue(strides[i]),
-                                              shrinkage_factor);
-    else
-      new_strides[i] = *getConstantIntValue(strides[i]);
+    int64_t s = *getConstantIntValue(strides[i]);
+    int64_t old_natural = 1, new_natural = 1;
+    bool placed = false;
+    for (int j = old_memref_shape.size() - 1; j >= 0; j--) {
+      int64_t old_cumulative = old_natural * old_memref_shape[j];
+      if (s < old_cumulative) {
+        int64_t units = llvm::divideFloorSigned(s, old_natural);
+        new_strides[i] = units * new_natural;
+        placed = true;
+        break;
+      }
+      old_natural = old_cumulative;
+      new_natural *= new_memref_shape[j];
+    }
+    if (!placed)
+      new_strides[i] = llvm::divideFloorSigned(s, old_volume) * new_volume;
   }
   return new_strides;
 }
