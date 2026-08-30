@@ -52,6 +52,37 @@ run_packed: compile-kernel
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
 	  ${powershell} $(PYTHON) ${srcdir}/matvec_int4_packed.py $(OUTPUT_FORMAT_FLAG) $(PY_ARGS)
 
+# --- llama.cpp q4_0 -------------------------------------------------------
+# q4_0 is the same kernel with the zero-point pinned to 8 and gs pinned to 32,
+# so GS is forced here rather than inherited. Point GGUF at a checkpoint to run
+# on real weights; without it the harness synthesizes a q4_0 payload.
+#   make run_q4_0 GGUF=/path/model.gguf TENSOR=blk.0.attn_q.weight
+#   make run_q4_0_negative NEG=no-uninterleave GGUF=...
+GGUF   ?=
+TENSOR ?= blk.0.attn_q.weight
+NEG    ?= no-uninterleave
+Q4_0_SRC = $(if $(GGUF),--gguf $(GGUF) --tensor $(TENSOR),--m $(M) --k $(K))
+Q4_0_ARGS = --m-tile $(M_TILE) --k-chunk $(K_CHUNK) $(Q4_0_SRC)
+
+selftest_q4_0:
+	${powershell} $(PYTHON) ${srcdir}/gguf_q4_0.py --self-test
+
+run_q4_0:
+	$(MAKE) -f $(firstword $(MAKEFILE_LIST)) compile-kernel GS=32
+	mkdir -p $(BUILD_DIR)
+	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
+	  ${powershell} $(PYTHON) ${srcdir}/matvec_q4_0.py $(OUTPUT_FORMAT_FLAG) \
+	    --check-reference $(Q4_0_ARGS)
+
+# The gate is only worth its PASS if a broken pack fails. Inverted exit code:
+# this target succeeds when the device run does NOT match.
+run_q4_0_negative:
+	$(MAKE) -f $(firstword $(MAKEFILE_LIST)) compile-kernel GS=32
+	mkdir -p $(BUILD_DIR)
+	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
+	  ${powershell} $(PYTHON) ${srcdir}/matvec_q4_0.py $(OUTPUT_FORMAT_FLAG) \
+	    --negative-control $(NEG) $(Q4_0_ARGS)
+
 # GEMV + fused residual add (LA-style 2-tile cascade)
 run_packed_add: compile-kernel
 	mkdir -p $(BUILD_DIR)
