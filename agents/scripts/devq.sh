@@ -2,10 +2,9 @@
 # devq.sh -- FIFO device job broker for the single shared NPU.
 #
 # WHY NOT A READERS-WRITER LOCK.  The obvious design (builds take `flock -s`,
-# measurements take `flock -x`) was refuted by measurement: Linux flock(2) has no
-# FIFO order, no writer preference and no fairness, so churning readers starve a
-# queued writer indefinitely (observed: writer blocked 3197ms while a LATER reader
-# acquired in 4us).  This is a real queue instead: jobs get monotonic sequence
+# measurements take `flock -x`) does not serialise: Linux flock(2) documents no
+# FIFO order, no writer preference and no fairness, so churning readers can starve
+# a queued writer indefinitely.  This is a real queue instead: jobs get monotonic sequence
 # numbers and a measurement at the head is an absolute barrier -- later builds are
 # not admitted until it has run.
 #
@@ -74,7 +73,12 @@
 set -uo pipefail
 
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
-DEVQ_DIR=${DEVQ_DIR:-$(cd "$(dirname "$SELF")/.." && pwd)/.state/devq}   # agents/.state/devq (ignored)
+# ONE QUEUE PER HOST, not per worktree: the NPU is one device.  The default lives
+# under the MAIN checkout's agents/.state (git's common dir is shared by every
+# worktree of a repository); outside a repository it falls back to /tmp.
+_devq_common=$(git -C "$(dirname "$SELF")" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+DEVQ_DIR=${DEVQ_DIR:-${_devq_common:+$(dirname "$_devq_common")/agents/.state/devq}}
+DEVQ_DIR=${DEVQ_DIR:-/tmp/mlir-air-devq}
 NPU_LOCK=${DEVQ_NPU_LOCK:-/tmp/mlir-air-npu.lock}   # override is TEST-ONLY
 NPU_LOCK_WAIT=${DEVQ_NPU_LOCK_WAIT:-1800}
 POLL=${DEVQ_POLL:-0.2}
@@ -195,10 +199,13 @@ cmd_submit() {
   cmdstr=$(printf '%q ' "$@")
   lock_state
   id=$(( $(cat "$DEVQ_DIR/seq" 2>/dev/null || echo 0) + 1 ))
-  printf '%s\n' "$id" > "$DEVQ_DIR/seq"
+  # Every write is checked: an id printed without its record would leave `run`
+  # polling a job that does not exist (the script deliberately runs without set -e).
+  printf '%s\n' "$id" > "$DEVQ_DIR/seq" || { unlock_state; die "submit: cannot write $DEVQ_DIR/seq"; }
   M_id=$id M_class=$class M_name=$name M_state=queued M_submitted=$(now) \
     M_started= M_finished= M_exit= M_pid= M_note= M_cmd=$cmdstr
-  write_meta "$(metaf "$id")"
+  write_meta "$(metaf "$id")" || { unlock_state; die "submit: cannot write $(metaf "$id")"; }
+  : >> "$DEVQ_DIR/runner.log" || { unlock_state; die "submit: cannot write $DEVQ_DIR/runner.log"; }
   unlock_state
   # DEVQ_JOB_ID must be in the exec-time environment: /proc/<pid>/environ does not
   # reflect variables exported after exec, and reconciliation reads it.
@@ -282,7 +289,7 @@ relay() {
   [ -e "$lf" ] || { printf '%s' "$off"; return 0; }
   sz=$(wc -c <"$lf" 2>/dev/null); sz=${sz//[^0-9]/}; sz=${sz:-0}
   if [ "$sz" -gt "$off" ]; then
-    tail -c "+$((off + 1))" "$lf" >&3
+    tail -c "+$((off + 1))" "$lf" | head -c "$((sz - off))" >&3   # never past the snapshot
     off=$sz
   fi
   printf '%s' "$off"

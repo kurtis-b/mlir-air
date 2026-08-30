@@ -19,6 +19,9 @@
 #   int4 NPU decode      :  ~56 ms/token   (17.8 tok/s on instruct model)
 
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+# Device jobs go through the FIFO broker; `run` is the drop-in for `flock CMD` and a
+# bare flock on the NPU lock must never be nested inside a devq job (deadlock).
+DEVQ := $(srcdir)/../../../agents/scripts/devq.sh
 
 PYTHON ?= $(if $(filter Windows_NT,$(OS)),python,python3)
 
@@ -209,7 +212,7 @@ compile-decode:
 ## on the NPU. Override PROMPT, N_TOKENS, MODEL via the command line.
 run-inference:
 	@mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && flock /tmp/mlir-air-npu.lock $(PYTHON) \
+	cd $(BUILD_DIR) && $(DEVQ) run --class measure --name int4-inference -- $(PYTHON) \
 		$(srcdir)/llama32_1b_int4_inference.py \
 		--run-only --n-tokens $(N_TOKENS) --prompt "$(PROMPT)" \
 		--model-path $(MODEL) \
@@ -218,6 +221,9 @@ run-inference:
 
 ## Interactive chat REPL — each prompt is independent (no chat history).
 ## Ctrl-D / /quit exits.
+# chat keeps the bare lock deliberately: the broker's runner is setsid'd with stdin
+# from /dev/null, so an interactive REPL cannot run through it. Never nest chat in a
+# devq job.
 chat:
 	@mkdir -p $(BUILD_DIR)
 	cd $(BUILD_DIR) && flock /tmp/mlir-air-npu.lock $(PYTHON) \

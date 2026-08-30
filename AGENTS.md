@@ -27,9 +27,11 @@ upstream is pulled into `main` by the operator.
   or dropped.
 - Hardware gates run through the device scheduler, `agents/scripts/devq.sh` (FIFO broker for the
   single NPU: `run --class build|measure -- CMD` is the drop-in for a bare `flock`; `preflight`
-  asks before dispatching; never `tee /dev/stderr` inside a job — the script's header explains
-  each rule). Software gates on main: the lit subset (`build-xrt/mlir/test`) and the per-example
-  verify targets.
+  asks before dispatching; never `tee /dev/stderr` inside a job, and never nest a bare `flock`
+  on the NPU lock inside a devq job — the runner already holds it, so the inner flock waits for
+  its own parent; `chat` keeps the bare lock because it needs a terminal — the script's header
+  explains each rule; its selftest lands with slice B2). Software gates on main: the lit subset
+  (`build-xrt/mlir/test`) and the per-example verify targets.
 - PRs are landed by `agents/scripts/pr.sh land` (see the workflow's Landing gate); the fork-side
   `.github/workflows/pr-size.yml` is a deliberate divergence of the upstream workflows dir.
 
