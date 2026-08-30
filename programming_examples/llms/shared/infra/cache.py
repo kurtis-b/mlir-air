@@ -59,6 +59,9 @@ def prepare_air_project(quant: str = "bf16"):
         "mm_m32.o",
         "mm_m64.o",
     ]
+    # the head-aligned QKV GEMV kernel (compile_mv_heads) is head_dim-tagged
+    # by head_dim like the GEMM variants: `mv_heads_hd128.o`.
+    obj_names.extend(sorted(p.name for p in Path(".").glob("mv_heads_hd*.o")))
     if quant == "awq":
         obj_names.append("mv_int4_bf16.o")
     for obj_name in obj_names:

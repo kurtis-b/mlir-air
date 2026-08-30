@@ -294,6 +294,31 @@ def compile_mv(tile_m=8):
     _compile_kernel(src, "mv.o", extra_flags=[f"-DDIM_M_OUTPUT={tile_m}"])
 
 
+def compile_mv_heads(head_dim=128):
+    """Compile `mv_heads_hd{head_dim}.o`: the GEMV rows kernel plus the in-core
+    per-head QK-norm + RoPE epilogue (doc 57 O1 second half, 2026-08-22) from
+    programming_examples/matrix_vector_multiplication/bf16/mv_heads.cc.
+
+    HEAD_DIM is baked in (the per-head loops unroll; no float division), so
+    the object is head_dim-tagged like the GEMM variants and the builder's
+    `link_with` names the tagged object directly -- no canonical copy to
+    go stale between models of different head_dim.
+    """
+    src = _PROJ_ROOT / "matrix_vector_multiplication" / "bf16" / "mv_heads.cc"
+    name = mv_heads_object_name(head_dim)
+    # Rebuild when the source is newer than the object: a stale same-name .o
+    # in a build cwd otherwise links silently (or fails on a renamed symbol
+    # several frames away, as it did on 2026-08-23).
+    out = Path(name)
+    stale = out.exists() and out.stat().st_mtime < src.stat().st_mtime
+    _compile_kernel(src, name, extra_flags=[f"-DHEAD_DIM={head_dim}"], force=stale)
+    return name
+
+
+def mv_heads_object_name(head_dim=128):
+    return f"mv_heads_hd{head_dim}.o"
+
+
 def compile_mv_int4_bf16(m_tile=8, k_chunk=2048, gs=128):
     """Compile mv_int4_bf16.o (int4-AWQ GEMV micro-kernel) from source.
 
