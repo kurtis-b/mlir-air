@@ -199,3 +199,46 @@ module {
     return
   }
 }
+
+// -----
+
+// A non-unit innermost stride with a non-zero innermost offset. An AIR offset
+// is a starting INDEX in its dimension (memref.subview convention; get1DOffset
+// leaves the innermost offset unscaled), so the last element a get reaches
+// along a dimension is offset + (size - 1) * stride + 1 -- here
+// 1 + 15 * 2 + 1 = 32 -- and the band shrinks to 2x32, the row stride the pass
+// rewrites the get to. Scaling the offset by the stride as well (2 * (1 + 16))
+// measured 34: an allocation whose rows are 34 wide while the DMA fills them
+// 32 wide, a silent miscompile for any later reader of row 1.
+
+// CHECK-LABEL: @strided_offset_extent_is_not_offset_times_stride
+// CHECK: memref.alloc() {{.*}} : memref<2x32xbf16, 2 : i32>
+// CHECK-NOT: memref<2x34xbf16, 2 : i32>
+// CHECK: air.channel.get {{.*}} (%{{.*}}[%c0, %c1{{.*}}] [%c2, %c16] [32, 2]) {id = 1 : i32} : (memref<2x32xbf16, 2 : i32>)
+module {
+  air.channel @rows [1, 1]
+  func.func @strided_offset_extent_is_not_offset_times_stride() {
+    %c1 = arith.constant 1 : index
+    %0 = air.launch async (%arg0) in (%arg1=%c1) {
+      %1 = air.segment @seg async {
+        %c1_0 = arith.constant 1 : index
+        %2 = air.herd @herd_0 async tile (%tx, %ty) in (%sx=%c1_0, %sy=%c1_0) {
+          %c0 = arith.constant 0 : index
+          %c1_1 = arith.constant 1 : index
+          %c2 = arith.constant 2 : index
+          %c16 = arith.constant 16 : index
+          %c64 = arith.constant 64 : index
+          %async_token, %results = air.execute -> (memref<2x64xbf16, 2 : i32>) {
+            %alloc = memref.alloc() : memref<2x64xbf16, 2 : i32>
+            air.execute_terminator %alloc : memref<2x64xbf16, 2 : i32>
+          }
+          %g0 = air.channel.get async [%async_token] @rows[%c0, %c0] (%results[%c0, %c1_1] [%c2, %c16] [%c64, %c2]) {id = 1 : i32} : (memref<2x64xbf16, 2 : i32>)
+          %async_token_2 = air.execute [%g0] {
+            memref.dealloc %results : memref<2x64xbf16, 2 : i32>
+          }
+        }
+      }
+    }
+    return
+  }
+}

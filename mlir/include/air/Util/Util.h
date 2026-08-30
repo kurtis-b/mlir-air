@@ -406,10 +406,9 @@ getDataAccessShapeFromMemcpyOp(Value memref, SmallVector<Operation *> users);
 // As above, but reports via `bounded` whether every offset in every user's
 // access pattern could be bounded. A caller that shrinks an allocation must
 // check it.
-SmallVector<int64_t> getDataAccessShapeFromMemcpyOp(Value memref,
-                                                    SmallVector<Operation *>
-                                                        users,
-                                                    bool &bounded);
+SmallVector<int64_t>
+getDataAccessShapeFromMemcpyOp(Value memref, SmallVector<Operation *> users,
+                               bool &bounded);
 
 // Update strides after memref shrinkage. Assuming there is only one dimension
 // being shrunk.

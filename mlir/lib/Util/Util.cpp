@@ -2264,13 +2264,22 @@ SmallVector<int64_t> air::getEffectiveMemrefExtentFromAccessPattern(
       if (llvm::divideFloorSigned(*constStride, current_memref_volume))
         continue;
       // Entry i lives in dimension j. Its stride expressed in dim-j units is
-      // stride / naturalStride(j); the entry reaches (offset + size) of those
-      // units along j.
-      int64_t bound =
-          llvm::divideFloorSigned(*constStride,
-                                  current_memref_volume / memref_shape[j]) *
-          (*maxOffset + *constSize);
+      // stride / naturalStride(j). The offset is a starting INDEX along j
+      // (memref.subview convention; get1DOffset leaves the innermost offset
+      // unscaled), so the last element reached along j is
+      //   offset + (size - 1) * strideUnits,
+      // and the extent is one past it. Scaling the offset by the stride as
+      // well over-measured: offsets [0,1] sizes [2,16] strides [64,2] on a
+      // 2x64 buffer gave 34 columns while the DMA fills 32.
+      int64_t strideUnits = llvm::divideFloorSigned(
+          *constStride, current_memref_volume / memref_shape[j]);
+      int64_t bound = *maxOffset + (*constSize - 1) * strideUnits + 1;
       access_bounds[j] = std::max(access_bounds[j], bound);
+      // An entry lives in exactly one dimension. Without this, the innermost
+      // entry was also folded into every outer dimension with strideUnits
+      // rounded to 0 -- invisible while the extent was scaled by the stride,
+      // a phantom `offset + 1` rows once it was not.
+      break;
     }
   }
   return access_bounds;
@@ -2587,9 +2596,8 @@ air::getDataAccessShapeFromMemcpyOp(Value memref,
   bool bounded = true;
   return getDataAccessShapeFromMemcpyOp(memref, users, bounded);
 }
-SmallVector<int64_t>
-air::getDataAccessShapeFromMemcpyOp(Value memref, SmallVector<Operation *> users,
-                                    bool &bounded) {
+SmallVector<int64_t> air::getDataAccessShapeFromMemcpyOp(
+    Value memref, SmallVector<Operation *> users, bool &bounded) {
   if (users.empty())
     return SmallVector<int64_t>();
   SmallVector<
