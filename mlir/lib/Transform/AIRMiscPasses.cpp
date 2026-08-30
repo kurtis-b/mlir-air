@@ -2428,12 +2428,66 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
       continue;
     }
 
+    // Precondition: one execution of the far side must not carry more than one
+    // execution of the L2 side stages.
+    //
+    // `tileChannelOpByFactor` cuts the far side CONTIGUOUSLY -- split i takes
+    // offset += i * (size / factor) with size /= factor -- which inverts the L2
+    // side's cut only when the two accesses run in step, one buffer for one
+    // buffer. That holds for the pattern the pass was written for, where both
+    // sides walk the same tile in matching loops (the two sizes may still count
+    // different units, L2 tiles on one side and rows on the other, and the pass
+    // handles that).
+    //
+    // It does not hold when the L2 buffer is re-staged inside a loop while the
+    // far side delivers the whole loop's worth in ONE access: the buffer's
+    // sub-regions are then INTERLEAVED through that stream rather than laid out
+    // as its halves, so the contiguous cut hands each sub-buffer the wrong
+    // rows. Measured on a per-column int4 GEMV feed (one L3 put of 24 x 8576
+    // bytes against an 8576-byte staging buffer): it compiles, it runs, and it
+    // failed a per-element bound on 6031 of 6144 outputs. Expressing it would
+    // need a strided far-side cut (offset += i plus an extra wrap-and-stride
+    // dimension), which this pass only arms from an scf.for step. Until then,
+    // decline -- the buffer comes out intact, exactly as it does at the
+    // geometries where the launch-endpoint cap already declines the split.
     // EVERY test below refuses when it cannot decide. This pass has already
     // shipped two failures of the shape "the check could not tell, so the split
     // went ahead" -- one of them a silent miscompile -- so an input whose
     // access pattern is not statically knowable is declined, never permitted.
     // std::optional is the carrier: nullopt means "cannot tell", and nullopt
     // declines.
+
+    // BITS one execution of `ci` moves, or nullopt when that is not statically
+    // knowable. Bits, not elements: the two sides of a channel may carry
+    // different element widths, and a far side of 2 x 2144 i32 holds two
+    // stagings of an 8576 x i8 buffer while counting half its elements.
+    auto accessVolumeOf =
+        [](air::ChannelInterface ci) -> std::optional<int64_t> {
+      // The far side may be an unranked memref; only the element type is
+      // needed from it unless the sizes are defaulted from its shape below.
+      auto baseTy =
+          dyn_cast_if_present<BaseMemRefType>(ci.getMemref().getType());
+      if (!baseTy || !baseTy.getElementType().isIntOrFloat())
+        return std::nullopt;
+      int64_t bits = baseTy.getElementType().getIntOrFloatBitWidth();
+      auto sizes = air::getSizesAsValues(ci);
+      if (sizes.empty()) {
+        // `runOnOperation` populates defaults from the op's own memref, so the
+        // volume is the memref's -- but only if that is ranked and static.
+        auto memrefTy = dyn_cast<MemRefType>(baseTy);
+        if (!memrefTy || !memrefTy.hasStaticShape())
+          return std::nullopt;
+        return (int64_t)air::getTensorVolume(memrefTy) * bits;
+      }
+      int64_t volume = bits;
+      for (auto size : sizes) {
+        auto constSize = getConstantIntValue(size);
+        if (!constSize || *constSize < 0)
+          return std::nullopt;
+        volume *= *constSize;
+      }
+      return volume;
+    };
 
     // Offset entries `ci` will carry once `runOnOperation` has rank-matched its
     // access pattern to the L2 side's `refSizes`, or nullopt when that cannot
@@ -2556,6 +2610,15 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
       }
       unsigned refSizeRank = refSizes.size();
 
+      auto l2Volume = accessVolumeOf(chanUser);
+      if (!l2Volume) {
+        decline() << "the number of bits @" << chanUser.getChanName()
+                  << " stages into this buffer is not statically known, so the "
+                     "split cannot be shown to be the same partition on both "
+                     "sides";
+        break;
+      }
+
       auto l2OffsetDims = numOffsetDimsOf(chanUser, refSizes);
       if (!l2OffsetDims || offsetDim >= *l2OffsetDims) {
         decline() << "splitting memref dimension " << *splitDim
@@ -2567,6 +2630,25 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
 
       for (auto otherChanOp :
            air::getTheOtherChannelOpThroughSymbol(chanUser)) {
+        auto farVolume = accessVolumeOf(otherChanOp);
+        if (!farVolume) {
+          decline() << "the number of bits one execution of @"
+                    << otherChanOp.getChanName()
+                    << " moves is not statically known, so it cannot be shown "
+                       "to stay in step with the "
+                    << *l2Volume << " this buffer stages";
+          break;
+        }
+        // The contiguous-cut precondition (see the head of this loop): one
+        // far-side execution may carry at most one L2 staging.
+        if (*farVolume > *l2Volume) {
+          decline() << "one execution of channel @" << otherChanOp.getChanName()
+                    << " moves " << *farVolume << " bits against the "
+                    << *l2Volume
+                    << " this buffer stages, so a contiguous split of the two "
+                       "would not be the same partition";
+          break;
+        }
         // An air.channel put/get may legally carry FEWER offsets than sizes and
         // strides -- `verifySizesStridesRank` only ties sizes to strides -- and
         //   air.channel.get @outD[%c0] (%arg[%off] [24, 2, 8] [8, 192, 1])
