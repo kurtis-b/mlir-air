@@ -19,11 +19,13 @@ authored data under the cap.
 |---|---:|---:|---:|---:|---:|---|
 | B `agents/` | 1,017 | 0 | 3,194 (+1,397 already on main) | 839 | 178 | #6 devq core (B1); B2 new-job + selftest (this PR, 432); B3 audit script rides with E's GEMM feature |
 | F compiler | 1,942 | 6,099 | 2,831 | 0 | 8,041 | — |
+| B `agents/` | 1,017 | 0 | 3,194 (+1,397 already on main) | 407 | 610 | #6 devq core (B1), B2 new-job + selftest, B3 audit script |
+| F compiler | 1,942 | 6,099 | 2,831 | 290 | 7,751 | H10 non-constant BD offset refusal (this PR, 290); prepared: shared-L1 put guard, shrink extent, H3 verifier, split-l2 B |
 | E `llms/` + kernels | 14,477 | 7,233 | 6,236 | 0 | 21,710 | — |
 | D `transformer_layer/` | 0 | 0 | 69,330 | — | 0 | excluded (Q1) |
 | C plan docs | 0 | 0 | 12,805 | — | 0 | excluded (Q3) |
 | other | 0 | 29 | 41 | 0 | 29 | rides with B |
-| **total** | **17,436** | **13,361** | **94,437** | **839** | **29,958** | 35 PRs include-only; 62 at full refactor size |
+| **total** | **17,436** | **13,361** | **94,437** | **1,129** | **29,668** | 35 PRs include-only; 62 at full refactor size |
 
 Loop-stop condition: Remaining = 0 for the include set; refactor rows close when their
 re-derivation lands or is recorded as not needed.

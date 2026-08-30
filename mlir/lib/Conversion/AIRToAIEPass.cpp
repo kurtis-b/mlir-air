@@ -3923,6 +3923,78 @@ static void removeDeadGlobalOps(AIE::DeviceOp device) {
 // for keep_pkt_header / air.src_writes_pkt_header channels (the kernel writes
 // the whole header).
 
+// Best-effort back-slice walk from `v` to the innermost loop whose induction
+// variable it transitively depends on, for diagnosis. Returns nullptr if the
+// value does not trace to a loop IV.
+static Operation *findLoopCarryingIv(Value v) {
+  SmallVector<Value, 8> worklist{v};
+  llvm::SmallPtrSet<Value, 8> visited;
+  while (!worklist.empty()) {
+    Value cur = worklist.pop_back_val();
+    if (!visited.insert(cur).second)
+      continue;
+    if (auto ba = dyn_cast<BlockArgument>(cur)) {
+      auto *parent = ba.getOwner()->getParentOp();
+      if (isa_and_nonnull<LoopLikeOpInterface>(parent))
+        return parent;
+      continue;
+    }
+    if (Operation *def = cur.getDefiningOp())
+      worklist.append(def->operand_begin(), def->operand_end());
+  }
+  return nullptr;
+}
+
+// Refuse a memcpy whose BD-relevant operand (offset, wrap or stride) is not a
+// compile-time constant. An aie.dma_bd is a static hardware descriptor: its
+// offset and (wrap, stride) dims are baked in at compile time and cannot
+// advance per loop iteration, so a non-constant value here — typically a loop
+// induction variable walking a staged buffer — has no correct lowering.
+// Continuing anyway (the pre-diagnostic behaviour: dereferencing the
+// disengaged getConstantIntValue optional, observed as a silent 0) freezes
+// every BD in the chain onto the same block, and the design compiles, routes
+// and hangs on hardware with no hint. This path is reached only for tile-side
+// (core and memtile) BDs; L3 transfers are programmed per task by the runtime
+// sequence, which CAN materialize an offset that advances — hence the advice
+// in the message.
+static LogicalResult
+refuseNonConstantBdOperand(air::MemcpyInterface memcpyOp, StringRef what,
+                           ArrayRef<OpFoldResult> primary,
+                           ArrayRef<OpFoldResult> secondary = {}) {
+  // Locate the offending value for the attached notes.
+  Value offending = nullptr;
+  for (auto vals : {primary, secondary}) {
+    for (auto ofr : vals)
+      if (!getConstantIntValue(ofr)) {
+        offending = llvm::dyn_cast_if_present<Value>(ofr);
+        break;
+      }
+    if (offending)
+      break;
+  }
+  InFlightDiagnostic diag = memcpyOp->emitOpError();
+  if (auto chanIf = dyn_cast<air::ChannelInterface>(memcpyOp.getOperation()))
+    diag << "channel @" << chanIf.getChanName() << ": ";
+  diag << "BD " << what
+       << " is not a compile-time constant: an aie.dma_bd is a static "
+          "descriptor whose offset cannot advance per loop iteration, so "
+          "this transfer cannot be lowered to a tile-side (L1/L2) BD. Stage "
+          "the operand per iteration from L3 instead — L3-side transfers are "
+          "programmed by the runtime sequence, which can materialize a "
+          "moving offset. (Dynamic BD indexing on the tile side is not "
+          "implemented.)";
+  if (offending) {
+    if (auto *def = offending.getDefiningOp())
+      diag.attachNote(def->getLoc())
+          << "non-constant " << what << " produced by '" << def->getName()
+          << "' here";
+    if (Operation *loop = findLoopCarryingIv(offending))
+      diag.attachNote(loop->getLoc())
+          << "the value varies with the induction variable of this loop";
+  }
+  return failure();
+}
+
 class AIRToAIEPass : public air::impl::AIRToAIEBase<AIRToAIEPass> {
 
   uint64_t BufferId = 0;
@@ -4640,9 +4712,22 @@ public:
     air::populateAIRunrollAIRChannelPutGetInScfParallelPatterns(patterns);
     (void)applyPatternsGreedily(aie_device, std::move(patterns));
 
-    // Substituting index operands, such as strides and offsets, to constant
-    // zero for convenience. TODO: generalize this
+    // Substitute non-constant offsets, sizes and strides with constant zero,
+    // but ONLY on channel ops whose memref is L3: those transfers are
+    // programmed per task by the runtime sequence (or shim DMA), which
+    // materializes the real — possibly per-iteration — values, so at the
+    // device level zero is a placeholder, matching the segment kernel
+    // argument remapping above. Tile-side (L1/L2) ops are deliberately left
+    // untouched: a non-constant operand there either folds to a constant
+    // once air.execute and loop scaffolding are lowered, or it reaches
+    // generateDmaBd, which refuses it with a diagnostic. Substituting zero
+    // for tile-side ops here is what used to freeze every BD in the chain
+    // onto block 0 — a silent miscompile presenting as a hardware hang.
     aie_device.walk([](air::ChannelInterface chanI) {
+      auto memrefTy =
+          llvm::dyn_cast<BaseMemRefType>(chanI.getMemref().getType());
+      if (!memrefTy || !air::isL3(memrefTy))
+        return;
       OpBuilder b(chanI);
       auto offsets = chanI.getMixedOffsets();
       auto sizes = chanI.getMixedSizes();
@@ -4677,7 +4762,9 @@ public:
         return false;
       int current_stride = 1;
       for (int i = opStrides.size() - 1; i >= 0; i--) {
-        if (*getConstantIntValue(opStrides[i]) != current_stride)
+        auto constStride = getConstantIntValue(opStrides[i]);
+        // A non-constant stride cannot be proven contiguous row-major.
+        if (!constStride || *constStride != current_stride)
           return false;
         current_stride *= memrefShape[i];
       }
@@ -4706,12 +4793,19 @@ public:
         bool isOverlappingPair =
             true; // True if every dimension is overlapping.
         for (unsigned k = 0; k < op1Offsets.size(); k++) {
-          int op1Offset = *getConstantIntValue(op1Offsets[k]);
-          int op2Offset = *getConstantIntValue(op2Offsets[k]);
+          auto op1OffsetC = getConstantIntValue(op1Offsets[k]);
+          auto op2OffsetC = getConstantIntValue(op2Offsets[k]);
+          auto op1SizeC = getConstantIntValue(op1Sizes[k]);
+          auto op2SizeC = getConstantIntValue(op2Sizes[k]);
+          // A non-constant offset or size cannot be proven non-overlapping.
+          if (!op1OffsetC || !op2OffsetC || !op1SizeC || !op2SizeC)
+            return false;
+          int op1Offset = *op1OffsetC;
+          int op2Offset = *op2OffsetC;
           int op1LowerRange = op1Offset;
-          int op1UpperRange = op1Offset + *getConstantIntValue(op1Sizes[k]);
+          int op1UpperRange = op1Offset + *op1SizeC;
           int op2LowerRange = op2Offset;
-          int op2UpperRange = op2Offset + *getConstantIntValue(op2Sizes[k]);
+          int op2UpperRange = op2Offset + *op2SizeC;
           bool isOverlappingDim = false;
           if (op1Offset >= op2LowerRange && op1Offset < op2UpperRange)
             isOverlappingDim = true;
@@ -6423,8 +6517,10 @@ public:
           // Attribute task_id is necessary to ensure that BDs do not get shared
           // across tasks, otherwise MLIR may fold BDs and cause BD sharing
           // across tasks.
+          // generateDmaBd diagnoses its own failures at the offending op;
+          // propagate without wrapping so the primary diagnostic stays primary.
           if (failed(newBD))
-            return bufferOp.value()->emitOpError("failed to generate dma bd.");
+            return failure();
           newBD.value()->setAttr(
               "task_id",
               IntegerAttr::get(IntegerType::get(b.getContext(), 32), taskId));
@@ -6607,7 +6703,10 @@ public:
         }
 
     int64_t len = getMemcpySizesAsInt(memref, sizes);
-    int64_t offset = air::get1DOffset(offsets, strides);
+    std::optional<int64_t> maybeOffset = air::get1DOffset(offsets, strides);
+    if (!maybeOffset)
+      return refuseNonConstantBdOperand(ndcpy, "offset", offsets, strides);
+    int64_t offset = *maybeOffset;
 
     Value length =
         arith::ConstantIndexOp::create(b, memcpyOp.getLoc(), len)->getResult(0);
@@ -6649,8 +6748,12 @@ public:
             AIE::PacketInfoAttr::get(ndcpy->getContext(), 0, it->second);
     }
 
-    std::vector<AIE::BDDimLayoutAttr> dims =
+    auto maybeDims =
         air::getWrapsAndStrides(sizes, strides, ndcpy->getContext());
+    if (!maybeDims)
+      return refuseNonConstantBdOperand(ndcpy, "wrap or stride", sizes,
+                                        strides);
+    std::vector<AIE::BDDimLayoutAttr> dims = *maybeDims;
     auto wraps_and_strides =
         AIE::BDDimLayoutArrayAttr::get(ndcpy->getContext(), ArrayRef(dims));
     bool useDefaultDataAccessPattern =
@@ -6718,8 +6821,15 @@ public:
                 arith::ConstantIndexOp::create(b, memcpyOp.getLoc(), 1)
                     ->getResult(0));
           }
-          // Recompute wraps and strides
-          dims = air::getWrapsAndStrides(sizes, strides, ndcpy->getContext());
+          // Recompute wraps and strides. The reconstructed sizes/strides are
+          // built from constants above, so this cannot fail in practice, but
+          // check anyway rather than reintroduce the unchecked deref.
+          maybeDims =
+              air::getWrapsAndStrides(sizes, strides, ndcpy->getContext());
+          if (!maybeDims)
+            return refuseNonConstantBdOperand(ndcpy, "wrap or stride", sizes,
+                                              strides);
+          dims = *maybeDims;
           wraps_and_strides = AIE::BDDimLayoutArrayAttr::get(
               ndcpy->getContext(), ArrayRef(dims));
         }
@@ -7481,13 +7591,12 @@ public:
         mem = AIE::MemOp::create(rewriter, loc, tile);
       }
 
+      // generateDmaBdProgram diagnoses its own failures at the offending op.
       if (failed(generateDmaBdProgram<air::TileDMAAllocator, AIE::BufferOp,
                                       AIE::MemOp>(
               rewriter, target_model, tile_dma_memcpys, tileDmaAlloc, loc, mem,
-              tile))) {
-        mem->emitOpError("failed to generate dma bd program.");
+              tile)))
         return failure();
-      }
 
       // Materialize cascade put and get allocated on cores into put_ and
       // get_cascade ops.
@@ -7586,13 +7695,12 @@ public:
       auto loc = rewriter.getUnknownLoc();
 
       // Generate DMA BD program
+      // generateDmaBdProgram diagnoses its own failures at the offending op.
       if (failed(generateDmaBdProgram<air::ShimDMAAllocator,
                                       AIE::ExternalBufferOp, AIE::ShimDMAOp>(
               rewriter, target_model, shim_dma_memcpys, shimDmaAlloc, loc,
-              shimDMA, tile))) {
-        shimDMA->emitOpError("failed to generate dma bd program.");
+              shimDMA, tile)))
         return failure();
-      }
     }
 
     // Generate L2 DMA program
@@ -7635,14 +7743,13 @@ public:
       auto loc = rewriter.getUnknownLoc();
 
       // Generate DMA BD program
+      // generateDmaBdProgram diagnoses its own failures at the offending op.
       if (failed(generateDmaBdProgram<air::MemTileDMAAllocator, AIE::BufferOp,
                                       AIE::MemTileDMAOp>(
               rewriter, target_model, memtile_dma_memcpys, memTileDmaAlloc, loc,
               memTileDMA, tile, options.use_lock_race_condition_fix,
-              options.use_lock_race_condition_fix_v2))) {
-        memTileDMA->emitOpError("failed to generate dma bd program.");
+              options.use_lock_race_condition_fix_v2)))
         return failure();
-      }
     }
 
     // Clear air::allocation_info_t allocations' memcpyOps field
