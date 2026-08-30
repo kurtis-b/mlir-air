@@ -16,8 +16,12 @@ zero point pinned to 8 and the group size to 32, so
   * `Q` is un-interleaved: q4_0 packs elements `j` and `j+16` of a 32-block
     into byte `j`; the kernel's `Q` is row-major (byte `b` = elements `2b`,
     `2b+1`).
-`llama_unpermute_rows` undoes llama.cpp's RoPE row permute of q/k, and
-`--self-test` proves the codec, the repack and the un-permute synthetically.
+`llama_unpermute_rows` undoes llama.cpp's RoPE row permute of q/k.
+`q4_0_payload_for` is the packer's one entry point: Q4_0 bytes as stored;
+tensors llama.cpp promoted to q4_1 (fractional zero point, not in the
+kernel's uint8 Z plane) re-quantised from the source weights, never
+transcoded silently -- the attributed decision record below says why.
+`--self-test` proves the codec, the repack, the un-permute and that route.
 
 No dependency on the `gguf` Python package: the container is simple enough to
 parse directly, and no package may be installed while gates run.
@@ -251,6 +255,235 @@ def repack_q4_0_linear(raw, K, M):
     return A_q, A_s, A_z
 
 
+# ---------------------------------------------------------------------------
+# q4_1 -> q4_0, because the kernel's zero-point is an INTEGER
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS, AND WHY IT IS NOT A REPACK LIKE EVERYTHING ABOVE.
+#
+# llama.cpp promotes a few tensors to `q4_1` when symmetric q4_0 fits them
+# badly. In `bartowski/SmolLM2-1.7B-Instruct-Q4_0.gguf` exactly three do --
+# `blk.{0,1,10}.ffn_down.weight` -- against 165 pure q4_0 linears (`--list`
+# re-derives the histogram; `promoted_tensors` names them).
+#
+# q4_1 dequantises as `w = d*q + m` (two fp16 per 32-element block: a scale and
+# a MINIMUM). The device kernel computes `(q - z) * s`. Matching the two:
+#
+#     d*q + m = s*q - s*z   =>   s = d,  z = -m/d
+#
+# and `-m/d` is a real number, while the kernel's zero-point plane is
+# `uint8_t *a_z` (`mv_int4_bf16.cc`) -- an INTEGER. So q4_1 is not
+# representable in this kernel's form, and no repack can make it so. That is a
+# statement about the kernel's signature, not about effort.
+#
+# Three routes were considered:
+#
+#   (a) Round `z` to the nearest integer. REJECTED, and this is the one that
+#       looks cheapest and is worst. The residual is a per-group ADDITIVE
+#       constant of up to d/2 on every weight in the group, and a GEMV sums
+#       over the group -- so it does not cancel like rounding noise, it
+#       accumulates as `shift * sum(b)`. Systematically biased, and biased per
+#       group, which is the shape of an error that survives averaging.
+#
+#   (b) Run those three `ffn_down` in bf16. Exact, but it makes the decode path
+#       mixed-dtype for 3 of 168 linears, which costs a second builder
+#       instantiation to avoid a 1.8% traffic difference.
+#
+#   (c) TRANSCODE q4_1 -> q4_0 by dequantising and re-quantising with
+#       llama.cpp's own rule, on the argument that the result lands in the same
+#       error class as the 165 tensors already quantised that way. PROPOSED
+#       HERE AND THEN REFUSED BY ITS OWN MEASUREMENT -- see the table below. It
+#       does not land in that class; it lands about a third outside it, because
+#       re-quantising already-quantised data compounds two roundings. q4_0's
+#       scale is set from the element of largest magnitude divided by -8, so
+#       the round trip is exact only when a block contains a `q = 0` element;
+#       otherwise the grid shifts (measured on already-q4_0 tensors:
+#       rms/rms 3.6e-2 added by a transcode that should be free).
+#
+#   (d) QUANTISE THE THREE FROM THE ORIGINAL bf16 WEIGHTS instead of from the
+#       checkpoint's q4_1 -- one rounding, not two. SHIPS.
+#
+# The figures here were measured on the study branch, commit 8d67c1f3
+# (2026-08-14), on `bartowski/SmolLM2-1.7B-Instruct-Q4_0.gguf` vs the bf16
+# `HuggingFaceTB/SmolLM2-1.7B-Instruct` weights; not re-measured on main.
+# They are re-derivable with `requantization_error` (the transcode arm) and
+# `quantize_q4_0` of the HF weights (the source arm); the mechanism -- two
+# roundings lose to one -- is reproduced synthetically by self-test leg (l).
+# rms error over rms weight:
+#
+#     the pure-q4_0 ffn_down tensors (the error llama.cpp ACCEPTED)
+#                                              0.0828 .. 0.0853
+#     the three as q4_1 (why they were promoted) 0.0720 .. 0.0729
+#     (c) transcoded q4_1 -> q4_0                0.1109 .. 0.1124   OUT of family
+#     (d) quantised from the bf16 source         0.0869 .. 0.0884   in family
+#
+# So (d) keeps ONE uniform int4 path with no kernel and no builder change --
+# the property the whole q4_0 bridge exists to preserve -- and pays about 4%
+# more error than the average accepted tensor rather than 32% more. It needs
+# the bf16 weights at pack time, which costs nothing: the pipeline already
+# loads them for the tied embedding / lm_head, which is Q6_K in the checkpoint
+# and never consumed from it (`awq_pack.py:270-277` does the same for
+# Llama-3.2-1B).
+#
+# `requantize_q4_1_to_q4_0` is KEPT rather than deleted. It is the refused
+# route, and the comparison above is only checkable because both are here.
+
+
+def q4_1_blocks(raw, n_blocks):
+    """Split a q4_1 payload into per-block `d`, `m` (both fp16) and `qs`.
+
+    A `block_q4_1` is 20 bytes: fp16 delta, fp16 min, then the same 16 packed
+    bytes q4_0 uses with the same nibble interleave.
+    """
+    if raw.size != n_blocks * 20:
+        raise ValueError("q4_1 payload %d B != %d blocks x 20 B" % (raw.size, n_blocks))
+    blocks = np.asarray(raw).reshape(n_blocks, 20)
+    d = blocks[:, 0:2].copy().view(np.float16).reshape(n_blocks)
+    m = blocks[:, 2:4].copy().view(np.float16).reshape(n_blocks)
+    qs = blocks[:, 4:20]
+    return d, m, qs
+
+
+def dequant_q4_1_reference(raw, K, M):
+    """Exact q4_1 dequantisation to float32 [M, K]. `w = d*q + m`."""
+    if K % QK4_0 != 0:
+        raise ValueError("K=%d is not a multiple of the block size 32" % K)
+    bpr = K // QK4_0
+    d, m, qs = q4_1_blocks(raw, M * bpr)
+    nibs = q4_0_nibbles(qs).astype(np.float32)
+    w = nibs * d.astype(np.float32)[:, None] + m.astype(np.float32)[:, None]
+    return w.reshape(M, K)
+
+
+def quantize_q4_0(w):
+    """float32 [n_blocks, 32] -> a q4_0 payload, by llama.cpp's own rule.
+
+    Transcribed from `quantize_row_q4_0_ref`: the scale is set from the element
+    of LARGEST MAGNITUDE (signed, divided by -8, so the sign convention puts
+    that element at nibble 0 or 15), and each element is
+    ``min(15, floor(x/d + 8.5))``. The C cast `(int8_t)(x0 + 8.5f)` truncates
+    toward zero and its argument is non-negative over the representable range,
+    so `floor` is the faithful spelling.
+
+    Deviating from this rule -- rounding differently, or fitting the scale by
+    least squares -- would produce a tensor that is not what llama.cpp would
+    have produced for the same weights, and the point of re-quantising is to
+    land in the SAME error class as the checkpoint's other 165 tensors.
+    """
+    w = np.asarray(w, dtype=np.float32)
+    n_blocks = w.shape[0]
+    idx = np.argmax(np.abs(w), axis=1)
+    amax_signed = w[np.arange(n_blocks), idx]
+    d = (amax_signed / -8.0).astype(np.float32)
+    d16 = d.astype(np.float16)  # stored as fp16, so quantise against that
+    dq = d16.astype(np.float32)
+    inv = np.where(dq != 0, 1.0 / np.where(dq != 0, dq, 1.0), 0.0)
+
+    q = np.floor(w * inv[:, None] + 8.5)
+    q = np.clip(q, 0, 15).astype(np.uint8)
+
+    out = np.zeros((n_blocks, 18), dtype=np.uint8)
+    out[:, 0:2] = d16.view(np.uint8).reshape(n_blocks, 2)
+    out[:, 2:18] = q[:, 0:16] | (q[:, 16:32] << 4)
+    return out.reshape(-1)
+
+
+def requantize_q4_1_to_q4_0(raw, K, M):
+    """A q4_1 tensor payload -> an equivalent q4_0 payload. Lossy; measured.
+
+    Returns the q4_0 payload only. Use ``requantization_error`` for what it
+    cost -- the two are separate so a caller cannot get the bytes without the
+    error being computable from the same inputs.
+    """
+    w = dequant_q4_1_reference(raw, K, M)
+    return quantize_q4_0(w.reshape(-1, QK4_0))
+
+
+def requantization_error(raw_q4_1, K, M):
+    """What re-quantising this tensor cost, as numbers rather than adjectives.
+
+    Compares the q4_0 round trip against the EXACT q4_1 dequantisation, and
+    also reports q4_1's own distance from... nothing, because the original
+    float weights are not in the checkpoint. That bound is the honest one: this
+    is the error ADDED on top of whatever q4_1 already carried, not a total.
+    """
+    exact = dequant_q4_1_reference(raw_q4_1, K, M)
+    requant = requantize_q4_1_to_q4_0(raw_q4_1, K, M)
+    got = dequant_q4_0_reference(requant, K, M)
+
+    a, b = exact.reshape(-1), got.reshape(-1)
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    cos = float(np.dot(a, b) / denom) if denom else 1.0
+    scale = float(np.max(np.abs(a))) or 1.0
+    return {
+        "cosine": cos,
+        "max_abs_err": float(np.max(np.abs(a - b))),
+        "max_err_over_tensor_max": float(np.max(np.abs(a - b)) / scale),
+        "rms_err": float(np.sqrt(np.mean((a - b) ** 2))),
+        "rms_over_rms": float(
+            np.sqrt(np.mean((a - b) ** 2)) / (np.sqrt(np.mean(a**2)) or 1.0)
+        ),
+    }
+
+
+def q4_0_payload_for(g, name, reference=None):
+    """The q4_0 payload for `name`, whatever the checkpoint stored it as.
+
+    The one entry point a model packer should call, so the promoted-tensor
+    policy lives in exactly one place instead of at every call site.
+
+      * already `q4_0` -> the checkpoint's own bytes, untouched.
+      * promoted (`q4_1` and anything else) -> quantised from `reference`,
+        which must be the ORIGINAL float weights for this tensor, shaped
+        [out_features, in_features] as HF stores them (== [M, K] here).
+
+    Raises rather than transcoding when a promoted tensor arrives with no
+    reference: route (c) in the record above compounds two roundings, and
+    falling back to it silently would degrade three layers of the model in a
+    way nothing downstream could see -- the packer would succeed and the
+    tokens would just be slightly worse.
+
+    Returns (payload, provenance) where provenance is "checkpoint" or
+    "quantized_from_reference", so a caller can report which tensors it had to
+    re-derive instead of asserting it did not.
+    """
+    info = g.tensors[name]
+    kind = GGML_TYPES.get(info.ggml_type, ("?",))[0]
+    if kind == "Q4_0":
+        return np.asarray(g.raw_bytes(name)), "checkpoint"
+    if reference is None:
+        raise ValueError(
+            f"{name} is {kind}, not Q4_0, and no reference weights were given. "
+            f"The kernel's zero-point plane is uint8 (mv_int4_bf16.cc), so "
+            f"{kind}'s fractional zero-point is not representable, and "
+            "transcoding compounds two roundings (the route-(c) record in "
+            "gguf_q4_0.py). Pass the original bf16 weights for this tensor."
+        )
+    K, M = info.ne[0], info.ne[1]
+    ref = np.asarray(reference, dtype=np.float32)
+    if ref.shape != (M, K):
+        raise ValueError(
+            f"{name}: reference has shape {ref.shape}, expected {(M, K)} "
+            "([out_features, in_features], as HF stores it)"
+        )
+    return quantize_q4_0(ref.reshape(-1, QK4_0)), "quantized_from_reference"
+
+
+def promoted_tensors(g):
+    """Every 2-D tensor the checkpoint did NOT store as q4_0, with its type.
+
+    The tensors a packer needs reference weights for (`q4_0_payload_for`).
+    """
+    out = {}
+    for name, info in g.tensors.items():
+        if len(info.ne) != 2:
+            continue
+        kind = GGML_TYPES.get(info.ggml_type, ("?",))[0]
+        if kind != "Q4_0":
+            out[name] = kind
+    return out
+
+
 def llama_unpermute_rows(w, n_head):
     """Undo llama.cpp's RoPE row permutation on a [out_features, in_features] matrix.
 
@@ -482,6 +715,111 @@ def self_test(K=256, M=64, seed=42, verbose=True):
         )
     if verbose:
         print("  [g] un-permute moves Q rows and S/Z together: PASS")
+
+    # (k) q4_1 round trip: the block split and the exact dequant, against a
+    #     payload built here so the arithmetic is checked rather than assumed.
+    rng = np.random.default_rng(seed + 7)
+    n_blk = M * bpr
+    d41 = (rng.random(n_blk).astype(np.float32) * 0.05 + 0.01).astype(np.float16)
+    m41 = ((rng.random(n_blk).astype(np.float32) - 0.5) * 0.2).astype(np.float16)
+    q41 = rng.integers(0, 16, size=(n_blk, QK4_0), dtype=np.uint8)
+    blk = np.zeros((n_blk, 20), dtype=np.uint8)
+    blk[:, 0:2] = d41.view(np.uint8).reshape(n_blk, 2)
+    blk[:, 2:4] = m41.view(np.uint8).reshape(n_blk, 2)
+    blk[:, 4:20] = q41[:, 0:16] | (q41[:, 16:32] << 4)
+    raw41 = blk.reshape(-1)
+
+    want = (
+        q41.astype(np.float32) * d41.astype(np.float32)[:, None]
+        + m41.astype(np.float32)[:, None]
+    )
+    got = dequant_q4_1_reference(raw41, K, M).reshape(n_blk, QK4_0)
+    if not np.allclose(want, got, rtol=0, atol=0):
+        raise AssertionError("q4_1 dequant does not match d*q + m exactly")
+    if verbose:
+        print("  [k] q4_1 block split + exact `d*q + m` dequant: PASS")
+
+    # (l) THE ONE THAT DECIDED THE ROUTE. Quantising from the float source must
+    #     beat transcoding the q4_1, on the same weights. If this ever inverts,
+    #     the comment block above is wrong and the packer should be revisited --
+    #     so it is asserted, not described.
+    #
+    #     THE FIXTURE IS THE SUBTLE PART, and getting it wrong made this leg
+    #     pass vacuously on first writing: if the source is generated AS
+    #     `d*q + m` it is exactly q4_1-representable, the q4_1 step is lossless,
+    #     and both routes are then byte-identical by construction (the two rms
+    #     values come out equal). The transcode penalty exists only because
+    #     q4_1 is ALREADY an approximation of the float source, so the source
+    #     here is unconstrained noise and is quantised to q4_1 by llama.cpp's
+    #     own rule (`d = (max-min)/15`, `m = min`).
+    src = rng.standard_normal((n_blk, QK4_0)).astype(np.float32) * 0.05
+    lo = src.min(axis=1)
+    hi = src.max(axis=1)
+    d_f = ((hi - lo) / 15.0).astype(np.float16)
+    m_f = lo.astype(np.float16)
+    dq_ = d_f.astype(np.float32)
+    q_f = np.clip(
+        np.round(
+            (src - m_f.astype(np.float32)[:, None])
+            / np.where(dq_ != 0, dq_, 1.0)[:, None]
+        ),
+        0,
+        15,
+    ).astype(np.uint8)
+    blk2 = np.zeros((n_blk, 20), dtype=np.uint8)
+    blk2[:, 0:2] = d_f.view(np.uint8).reshape(n_blk, 2)
+    blk2[:, 2:4] = m_f.view(np.uint8).reshape(n_blk, 2)
+    blk2[:, 4:20] = q_f[:, 0:16] | (q_f[:, 16:32] << 4)
+    raw41b = blk2.reshape(-1)
+
+    direct = dequant_q4_0_reference(quantize_q4_0(src), K, M).reshape(n_blk, QK4_0)
+    transcoded = dequant_q4_0_reference(
+        requantize_q4_1_to_q4_0(raw41b, K, M), K, M
+    ).reshape(n_blk, QK4_0)
+
+    def _rms(a, b):
+        return float(np.sqrt(np.mean((a - b) ** 2)))
+
+    e_direct, e_trans = _rms(src, direct), _rms(src, transcoded)
+    if not e_direct < e_trans:
+        raise AssertionError(
+            "quantising from the source (%.6g) did not beat transcoding the "
+            "q4_1 (%.6g); the promoted-tensor route rests on this" % (e_direct, e_trans)
+        )
+    if verbose:
+        print(
+            "  [l] quantise-from-source beats transcode-from-q4_1: PASS "
+            "(rms %.4g < %.4g)" % (e_direct, e_trans)
+        )
+
+    # (m) negative control for (l): a promoted tensor with no reference must be
+    #     REFUSED, not silently transcoded. Without this the packer could
+    #     degrade three layers and still report success.
+    class _FakeInfo:
+        ne = (K, M)
+        ggml_type = 3  # Q4_1
+
+    class _FakeGGUF:
+        tensors = {"promoted": _FakeInfo()}
+
+        def raw_bytes(self, name):
+            return raw41
+
+    try:
+        q4_0_payload_for(_FakeGGUF(), "promoted")
+        raise AssertionError(
+            "NEGATIVE CONTROL FAILED: a promoted tensor was transcoded with no "
+            "reference weights"
+        )
+    except ValueError:
+        pass
+    payload, prov = q4_0_payload_for(
+        _FakeGGUF(), "promoted", reference=src.reshape(M, K)
+    )
+    if prov != "quantized_from_reference" or payload.size != n_blk * 18:
+        raise AssertionError("promoted tensor with a reference did not quantise")
+    if verbose:
+        print("  [m] promoted tensor without reference: correctly REFUSED")
 
 
 def _main():

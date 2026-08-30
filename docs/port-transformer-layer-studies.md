@@ -19,11 +19,11 @@ authored data under the cap.
 |---|---:|---:|---:|---:|---:|---|
 | B `agents/` | 1,017 | 0 | 3,194 (+1,397 already on main) | 839 | 178 | #6 devq core (B1); B2 new-job + selftest (this PR, 432); B3 audit script rides with E's GEMM feature |
 | F compiler | 1,942 | 6,099 | 2,831 | 2,281 | 5,760 | H10 (#7, 290); shared-L1 put guard (#9, 155); shrink-memref extent (#10, 440); H3 attribute verifier (#11, 123); split-l2 short offsets (#12, 438); split-l2 repeated feed (#13, 373 after its review fixes); split-l2 far-side pairing (this PR, 462 after its review fix) |
-| E `llms/` + kernels | 14,477 | 7,233 | 6,236 | 2,784 | 18,926 | q4_0 GEMV harness + device lit (this PR, 370; plan PR 5); q4_0 codec + repack + self-test (#23, 342; plan PR 4); GGUF container reader (#22, 356; plan PR 3); prompt_len on the Llama drivers (#21, 26; plan PR 2); int4_gs plumbing (#20, 147; int4 Q4_0 plan PR 1); Qwen3-0.6B decode QKV at 2 launches (#19, 257); 2-launch QKV ELF builder (#17, 479); qkv-heads kernel + layout (#16, 395); rms/qkv host-ABI seam refactor (#15, main-side structure-only, net +3 — not branch lines); verify_runner host tests (#14, 412); next: shared decode_qkv4 + test, then the qwen3 / llama32_1b_int4 / smollm2 int4 model rows, int4_awq q4_0, registry rows (data, ≈11 PRs) |
+| E `llms/` + kernels | 14,477 | 7,233 | 6,236 | 3,129 | 18,581 | promoted q4_1→q4_0 route (this PR, 345; plan PR 6); q4_0 GEMV harness + device lit (#24, 370; plan PR 5); q4_0 codec + repack + self-test (#23, 342; plan PR 4); GGUF container reader (#22, 356; plan PR 3); prompt_len on the Llama drivers (#21, 26; plan PR 2); int4_gs plumbing (#20, 147; int4 Q4_0 plan PR 1); Qwen3-0.6B decode QKV at 2 launches (#19, 257); 2-launch QKV ELF builder (#17, 479); qkv-heads kernel + layout (#16, 395); rms/qkv host-ABI seam refactor (#15, main-side structure-only, net +3 — not branch lines); verify_runner host tests (#14, 412); next: shared decode_qkv4 + test, then the qwen3 / llama32_1b_int4 / smollm2 int4 model rows, int4_awq q4_0, registry rows (data, ≈11 PRs) |
 | D `transformer_layer/` | 0 | 0 | 69,330 | — | 0 | excluded (Q1) |
 | C plan docs | 0 | 0 | 12,805 | — | 0 | excluded (Q3) |
 | other | 0 | 29 | 41 | 0 | 29 | rides with B |
-| **total** | **17,436** | **13,361** | **94,437** | **5,904** | **24,893** | 35 PRs include-only; 62 at full refactor size |
+| **total** | **17,436** | **13,361** | **94,437** | **6,249** | **24,548** | 35 PRs include-only; 62 at full refactor size |
 
 Loop-stop condition: Remaining = 0 for the include set; refactor rows close when their
 re-derivation lands or is recorded as not needed.

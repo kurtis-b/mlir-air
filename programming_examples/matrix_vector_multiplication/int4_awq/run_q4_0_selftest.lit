@@ -14,4 +14,7 @@
 // CHECK: [e] negative control (skip un-interleave): correctly DIFFERS on {{[1-9][0-9]*}} / 16384 nibbles
 // CHECK: [f] llama_unpermute_rows inverts llama.cpp's RoPE permute: PASS
 // CHECK: [g] un-permute moves Q rows and S/Z together: PASS
+// CHECK: [k] q4_1 block split + exact `d*q + m` dequant: PASS
+// CHECK: [l] quantise-from-source beats transcode-from-q4_1: PASS (rms {{[0-9.e-]+}} < {{[0-9.e-]+}})
+// CHECK: [m] promoted tensor without reference: correctly REFUSED
 // CHECK: All self-tests PASSED.
