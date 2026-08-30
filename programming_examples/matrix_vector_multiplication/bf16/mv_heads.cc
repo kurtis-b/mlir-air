@@ -6,20 +6,20 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// GEMV rows + an in-core per-head epilogue (doc 57 O1, second half).
+// GEMV rows + an in-core per-head epilogue.
 //
 // The decode QKV stage projects x (K) onto [wq; wk; wv] (M rows) and then
 // applies, to the Q and K heads only, a per-head RMSNorm (QK-norm: RMS over the
 // head's HEAD_DIM outputs, times a per-element weight) and the half-split RoPE
 // rotation with one position's cos|sin LUT. When a core owns a WHOLE head's
-// rows, both can run on the L1 output tile before it leaves the core, which is
-// two `air.launch` boundaries (~107 us each) fewer than the separate QK-norm
-// and RoPE launches of `rms_qkv_qknorm_rope_gemv4`.
+// rows, both can run on the L1 output tile before it leaves the core, which
+// removes the separate QK-norm and RoPE launches of the multi-launch forms:
+// two `air.launch` boundaries (PDI loads) per layer. (Measured on the study
+// branch only; the driver PR's profile vs main's 8-launch form is the number.)
 //
 // One call per m-row CHUNK of a head (m = 8 rows, the matvec.py tile, so the
-// L2 pipeline keeps matvec.py's 16 KB granularity -- a 256 KB whole-head tile
-// serializes its fill against the core's drain and costs 0.13 ms per layer,
-// measured in results/o1-epilogue-20260822/probe_gemv_variants*.json):
+// L2 pipeline keeps matvec.py's 16 KB granularity; a whole-head tile
+// serializes its fill against the core's drain -- chunking avoids that):
 //
 //   qkv_heads_chunk_bf16(m, k, a, b, c, out, eps)
 //     a   : [m, k + K_PAD] the chunk's weight rows; element a[r][k] is the
