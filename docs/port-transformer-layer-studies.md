@@ -18,8 +18,6 @@ authored data under the cap.
 | Cluster | Include | Refactor | Excluded | Landed | Remaining | PRs |
 |---|---:|---:|---:|---:|---:|---|
 | B `agents/` | 1,017 | 0 | 3,194 (+1,397 already on main) | 839 | 178 | #6 devq core (B1); B2 new-job + selftest (this PR, 432); B3 audit script rides with E's GEMM feature |
-| F compiler | 1,942 | 6,099 | 2,831 | 0 | 8,041 | — |
-| B `agents/` | 1,017 | 0 | 3,194 (+1,397 already on main) | 407 | 610 | #6 devq core (B1), B2 new-job + selftest, B3 audit script |
 | F compiler | 1,942 | 6,099 | 2,831 | 290 | 7,751 | H10 non-constant BD offset refusal (this PR, 290); prepared: shared-L1 put guard, shrink extent, H3 verifier, split-l2 B |
 | E `llms/` + kernels | 14,477 | 7,233 | 6,236 | 0 | 21,710 | — |
 | D `transformer_layer/` | 0 | 0 | 69,330 | — | 0 | excluded (Q1) |
