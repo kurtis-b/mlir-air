@@ -2497,7 +2497,8 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
       if (!offsetDimOpt && !chanUserStrides.empty()) {
         decline() << "no dimension of @" << chanUser.getChanName()
                   << "'s access pattern has the stride of memref dimension "
-                  << *splitDim << ", so the dimension to split it on is a guess";
+                  << *splitDim
+                  << ", so the dimension to split it on is a guess";
         break;
       }
       unsigned offsetDim = offsetDimOpt ? *offsetDimOpt : (unsigned)*splitDim;
