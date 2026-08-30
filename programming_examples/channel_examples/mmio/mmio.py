@@ -26,6 +26,7 @@ from air.dialects.func import FuncOp
 from air.dialects.memref import AllocOp, DeallocOp, GlobalOp, get_global, load, store
 from air.dialects.scf import for_, yield_
 from air.backend.xrt_runner import XRTRunner
+from air.backend.xrt import XRTBackend
 
 N = 64  # vector length
 CONST_VALUE = 42
@@ -123,6 +124,24 @@ if __name__ == "__main__":
     mlir_module = build_module()
     if args.print_module_only:
         print(mlir_module)
+        exit(0)
+
+    # `[2026-08-12]` queue item 19: `--compile-mode` was PARSED AND NEVER READ,
+    # so `--compile-mode compile-only` fell straight through to `run_test` and
+    # DISPATCHED. A flag that accepts the safe branch and takes the unsafe one
+    # fails open -- here, onto a shared NPU that a devq measurement may be
+    # holding. The default is left at `compile-and-run` because that is what
+    # every other example in this tree defaults to and what this example's own
+    # lit recipe invokes; the defect was never the default, it was that asking
+    # changed nothing.
+    if args.compile_mode == "compile-only":
+        backend = XRTBackend(
+            verbose=args.verbose,
+            omit_while_true_loop=False,
+            output_format=args.output_format,
+        )
+        backend.compile(mlir_module)
+        backend.unload()
         exit(0)
 
     rng = np.random.default_rng(0)

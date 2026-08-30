@@ -1,0 +1,10 @@
+// (c) Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// The tanh example lowers to the AIE2P hardware tanh intrinsic and has no
+// aie2 path; asking for aie2 must be refused, never silently ignored (it used
+// to build a byte-identical aie2p module and exit 0). Host-only: no device,
+// no Peano. Modeled on matrix_multiplication/bfp16/run_npu1_unsupported_arch.lit.
+//
+// RUN: not %PYTHON %S/vector_tanh.py --arch aie2 -p 2>&1 | FileCheck %s
+// CHECK: invalid choice: 'aie2'

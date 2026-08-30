@@ -120,15 +120,24 @@ if __name__ == "__main__":
         default=VECTOR_SIZE,
         help="Vector size for SIMD operations",
     )
+    # `[2026-08-12]` fail-open census: this flag accepted `aie2` as well and
+    # was then never read: `--arch aie2` and `--arch aie2p` built a
+    # BYTE-IDENTICAL module and both exited 0, so asking for the other target
+    # silently got you this one. Unlike its siblings (see vector_exp.py), which
+    # key their lowering off the resolved --target, this example has no aie2
+    # path at all -- it lowers to the AIE2P hardware tanh intrinsic
+    # (math.tanh -> aievec.tanh -> xllvm.intr.aie2p.tanh). So the fix is to
+    # REFUSE the unsupported ask rather than ignore it. The flag is kept, not
+    # deleted, because the Makefile drives it through AIE_TARGET and that knob
+    # should fail loudly rather than disappear.
     parser.add_argument(
         "--arch",
         type=str,
-        choices=["aie2", "aie2p"],
+        choices=["aie2p"],
         default="aie2p",
-        help="Accepted for Makefile compatibility and otherwise unused: the "
-        "vector width comes from --vector-size, which the lits always set, and "
-        "the device from --target. Inherited from the predecessor, which also "
-        "ignored it",
+        help="Target AIE architecture. AIE2P only: this example lowers to the "
+        "AIE2P hardware tanh intrinsic and has no aie2 path, so aie2 is "
+        "refused rather than silently ignored.",
     )
     parser.add_argument(
         "--compile-mode",
@@ -153,6 +162,18 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    # The flag is READ here, not merely parsed. argparse's `choices` already
+    # rejects anything but aie2p today; this guard is what catches the NEXT
+    # person widening `choices` without also giving build_module an arch
+    # path -- which is exactly how this flag went dead the first time.
+    if args.arch != "aie2p":
+        raise SystemExit(
+            f"vector_tanh: --arch {args.arch} is accepted by the argument table "
+            "but no lowering implements it. This example emits the AIE2P "
+            "hardware tanh intrinsic unconditionally. Implement the arch "
+            "branch in build_module (see vector_exp.py) before offering it."
+        )
 
     launch = build_module(args.n, args.tile_n, INPUT_DATATYPE, args.vector_size)
     mlir_module = launch.build(target=args.target)
