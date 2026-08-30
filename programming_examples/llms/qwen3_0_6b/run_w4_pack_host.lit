@@ -1,0 +1,16 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Host-only gate for the qwen3-0.6b W4 decode pack (synthetic weights, CPU,
+// no device, no model download): the selection flag stays default-OFF until
+// R3c, the quant contract columns, the round-trip dequant band, and the
+// production-shape pack/substitution/idempotence test. Collected by the
+// unfiltered check-programming-examples (review of PR #32, P2).
+//
+// RUN: %PYTHON %S/test_w4_decode_pack.py | FileCheck %s
+//
+// CHECK: PASS  test_flag_zero_selects_nothing
+// CHECK: PASS  test_quant_contract_columns
+// CHECK: PASS  test_quantize_packs_production_shapes_bit_exact_and_idempotent
+// CHECK: PASS  test_roundtrip_dequant_band
+// CHECK: w4_decode_pack tests: 4/4 passed

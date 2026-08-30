@@ -220,12 +220,27 @@ def load_weights(
         print("  Tied embeddings: reusing embed_table as lm_head.")
         lm_head = embed_table
 
-    return LlamaWeights(
+    weights = LlamaWeights(
         embed_table=embed_table,
         layers=layers,
         final_norm=final_norm,
         lm_head=lm_head,
     )
+
+    # doc 56 H2b (queue items 18, 24): the w4_decode weight path, selected
+    # by QWEN3_W4_DECODE -- default OFF until R3c lands the verify gate;
+    # QWEN3_W4_DECODE=1 takes the w4 arm. ONE owner
+    # (w4_decode_pack): RTN-quantize + pack
+    # the decode O+FFN matrices AND substitute the bf16 fields with the
+    # dequantized copy, so prefill (bf16 GEMMs), decode (in-kernel dequant)
+    # and the verify oracle's HF patch all see the same numbers.
+    from w4_decode_pack import w4_decode_selected, quantize_decode_weights
+
+    if w4_decode_selected():
+        print("  w4_decode selected: RTN-quantizing decode O+FFN weights (gs=128)...")
+        quantize_decode_weights(weights, config)
+
+    return weights
 
 
 def generate_rope_lut(
