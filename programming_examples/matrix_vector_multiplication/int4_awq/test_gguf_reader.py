@@ -8,8 +8,8 @@
 Writes a minimal GGUF v3 file per the spec (header, scalar/string/array KVs,
 three tensor infos, alignment padding, payloads) and checks the parsed table
 -- names, shapes, types, absolute offsets, payload bytes -- against what was
-written. Negative controls: a wrong magic, a tensor table cut short, and a
-payload cut short must each raise. No checkpoint, no device, no toolchain.
+written. Negative controls: a wrong magic, a tensor table cut short, a payload cut
+short, and a v1 or v4 header must each raise. No checkpoint, no device, no toolchain.
 """
 
 import os
@@ -107,6 +107,17 @@ def test_bad_magic_and_truncations_raise(tmp):
         except ValueError:
             continue
         raise AssertionError("%s: the reader did not raise" % what)
+
+
+def test_unsupported_versions_raise(tmp):
+    raw = build_gguf()[0]
+    for version in (1, 4):
+        broken = raw[:4] + struct.pack("<I", version) + raw[8:]
+        try:
+            GGUFFile(_write(tmp, broken))
+        except ValueError:
+            continue
+        raise AssertionError("GGUF v%d: the reader did not raise" % version)
 
 
 if __name__ == "__main__":

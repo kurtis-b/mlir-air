@@ -122,8 +122,12 @@ class GGUFFile:
             if magic != GGUF_MAGIC:
                 raise ValueError("not a GGUF file: magic=%r" % magic)
             self.version = self._u32(f)
-            if self.version < 2:
-                raise ValueError("GGUF v%d has 32-bit counts; need v2+" % self.version)
+            # v1 has 32-bit counts; anything above v3 has a layout this reader
+            # has not seen -- parsing it as v3 would return wrong offsets.
+            if self.version not in (2, 3):
+                raise ValueError(
+                    "unsupported GGUF v%d (this reader knows v2 and v3)" % self.version
+                )
             n_tensors = self._u64(f)
             n_kv = self._u64(f)
             for _ in range(n_kv):

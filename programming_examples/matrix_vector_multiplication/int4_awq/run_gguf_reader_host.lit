@@ -1,0 +1,13 @@
+// (c) Copyright 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Host-only: the GGUF container reader's regression suite (synthetic file
+// per the spec, negative controls). No checkpoint, no device, no toolchain
+// beyond python. Collected by the unfiltered check-programming-examples.
+//
+// RUN: %PYTHON %S/test_gguf_reader.py | FileCheck %s
+// CHECK: PASS  test_bad_magic_and_truncations_raise
+// CHECK: PASS  test_header_and_metadata
+// CHECK: PASS  test_tensor_table_offsets_and_payloads
+// CHECK: PASS  test_unsupported_versions_raise
+// CHECK: gguf reader tests: 4/4 passed
