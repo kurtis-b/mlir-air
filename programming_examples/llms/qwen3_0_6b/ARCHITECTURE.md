@@ -33,8 +33,15 @@ once: (HOST) final RMSNorm → [NPU elf:lm_head_gemv] (19 partitions ×8192, voc
 **Decode — 2 NPU ELFs/layer (+ lm_head once/token):**
 
 ```
-x ─[NPU elf:rms_qkv_qknorm_rope_gemv]   FUSED, 1 ELF
-      { RMSNorm + Q/K/V GEMV + QK-norm(Q,K) + RoPE-Q/K }   (RoPE LUT per-position, NOT a static BO)
+x ─[NPU elf:rms_qkv_qknorm_rope_gemv2]   FUSED, 1 ELF, 2 launches
+      { RMSNorm | ONE head-aligned GEMV over [wq;wk;wv] with QK-norm(Q,K) + RoPE-Q/K in-core }
+      (RMSNorm writes the head of the packed B = [normed | RoPE LUT | q_norm | k_norm], the LUT
+       per-position so B is NOT a static BO; the GEMV is mv_heads.cc: each herd column owns whole
+       heads, accumulates a head in L1 over its row chunks and runs the epilogue on the last one;
+       chunk TAG / Q-K-V KIND ride in a 64-element row padding of the static weight, and the head
+       goes out through per-iteration slots the host gathers -- shared/infra/qkv2_layout.py.
+       QWEN3_RMS_QKV_LAUNCHES=8 selects the 8-launch elf:rms_qkv_qknorm_rope_gemv for A/B:
+       { RMSNorm + Q/K/V GEMV + QK-norm(Q,K) + RoPE-Q/K } as separate launches, 17-arg ABI.)
   (HOST) KV-cache write → (HOST) decode_attention_cpu (single-token GQA over KV cache)
   ─[NPU elf:o_gemv_ffn]   FUSED cascade, 1 ELF
       { O GEMV + Add + RMSNorm + Gate/Up cascade + SwiGLU + Down } → layer_out[1024]
