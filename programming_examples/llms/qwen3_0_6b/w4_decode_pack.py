@@ -54,14 +54,13 @@ if str(_LLMS_DIR) not in sys.path:
 #: `precision_plan` before the driver import.
 W4_ENV = "QWEN3_W4_DECODE"
 
-#: `[2026-08-26]` doc 56 H2b (queue item 24): what an UNSET flag means. The
-#: operator flipped the default to `w4_decode` after item 18 measured
-#: +19-24 % tok/s at ctx 512/1024 with the launch structure unchanged
-#: (measurement recorded at study commit 0d08d195). The flip is a change of
-#: THIS constant and nothing else -- the flag keeps its name and its sense
-#: ("is w4_decode on"), so there are not two ways to say the same thing.
-#: `QWEN3_W4_DECODE=0` is the bf16 A/B arm.
-W4_DEFAULT = True
+#: What an UNSET flag means. OFF: until the R3b packed consumer and the R3c
+#: three-arm verify gate land on main, nothing may read the pack by default.
+#: The study flipped this default ON (doc 56 H2b, queue item 24; +19-24 %
+#: tok/s measured at study commit 0d08d195); that flip re-lands in R3c as a
+#: change of THIS constant and nothing else, with verify evidence attached --
+#: the flag keeps its name and its sense ("is w4_decode on").
+W4_DEFAULT = False
 
 #: RTN asymmetric uint4 group size. 128 mirrors the llama AWQ contract (the
 #: one owner of the contract NAME is `llama32_1b_int4.awq_repacker`); the
@@ -78,9 +77,9 @@ N_CORES = 8
 
 
 def w4_decode_selected() -> bool:
-    """True when the `w4_decode` path is selected. **Default ON**
-    (`W4_DEFAULT`, 2026-08-26): `w4_decode` is this model's production
-    default; `QWEN3_W4_DECODE=0` selects bf16 (doc 56 H2b).
+    """True when the `w4_decode` path is selected. **Default OFF**
+    (`W4_DEFAULT`): bf16 stays the production default until R3c lands the
+    three-arm verify gate; `QWEN3_W4_DECODE=1` selects w4_decode.
 
     Unset (or empty, the `FOO= cmd` shell idiom) means the default. Any
     other value is a REFUSAL rather than a silent fall back to bf16: this

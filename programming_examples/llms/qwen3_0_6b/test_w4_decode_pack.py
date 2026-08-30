@@ -39,8 +39,11 @@ def _selected(value):
 
 
 def test_flag_zero_selects_nothing():
-    assert _selected(None) is wp.W4_DEFAULT
-    assert _selected("") is wp.W4_DEFAULT  # the `FOO= cmd` shell idiom
+    # R3a ships the pack default-OFF: the flip to w4_decode is R3c's, landing
+    # with the three-arm verify gate (review of PR #32, P1).
+    assert wp.W4_DEFAULT is False
+    assert _selected(None) is False
+    assert _selected("") is False  # the `FOO= cmd` shell idiom
     assert _selected("1") is True
     assert _selected("0") is False, "QWEN3_W4_DECODE=0 must select bf16"
     try:
@@ -109,6 +112,72 @@ def test_roundtrip_dequant_band():
         assert cos >= 0.99, f"round-trip cosine {cos:.5f} < 0.99 band ({M}x{K})"
         # non-vacuity: quantization actually changed the bytes.
         assert not np.array_equal(W.view(np.uint16), Wd.view(np.uint16))
+
+
+def test_quantize_packs_production_shapes_bit_exact_and_idempotent():
+    """quantize_decode_weights through the production `_fake_quantize` /
+    `_pack` at qwen3-0.6b shapes: the packed BOs match the int4 cascade
+    builder's own `_packed_dims` arithmetic (one disagreement and the ELF
+    strides into garbage), the substituted bf16 fields ARE the dequantized
+    copies bit-exact, QKV is untouched, and a second call is a no-op."""
+    from llama32_1b_int4.multi_launch_builder.o_gemv_ffn_int4_multi import (
+        _packed_dims,
+    )
+
+    class _NS:
+        pass
+
+    emb, hidden, kv = 1024, 3072, 1024
+    cfg = _NS()
+    cfg.emb_dim, cfg.hidden_dim, cfg.n_layers = emb, hidden, 1
+    cfg.n_heads, cfg.head_dim = 16, 128
+    q_dim = cfg.n_heads * cfg.head_dim
+    rng = np.random.default_rng(11)
+    lw = _NS()
+    shapes = (
+        ("wq", (emb, q_dim)),
+        ("wk", (emb, kv)),
+        ("wv", (emb, kv)),
+        ("wo", (q_dim, emb)),
+        ("w_gate", (emb, hidden)),
+        ("w_up", (emb, hidden)),
+        ("w_down", (hidden, emb)),
+    )
+    for name, shape in shapes:
+        setattr(lw, name, (rng.standard_normal(shape) * 0.02).astype(bfloat16))
+    weights = _NS()
+    weights.layers = [lw]
+    orig = {name: np.array(getattr(lw, name)) for name, _ in shapes}
+
+    wp.quantize_decode_weights(weights, cfg)
+    assert weights._w4_decode_applied is True
+    for k in ("wq", "wk", "wv"):  # QKV untouched, bit for bit
+        assert np.array_equal(
+            getattr(lw, k).view(np.uint16), orig[k].view(np.uint16)
+        ), k
+    for packed, (M, K) in (
+        (lw._wo_packed, (emb, q_dim)),
+        (lw._wgateup_packed, (2 * hidden, emb)),
+        (lw._wdown_packed, (emb, hidden)),
+    ):
+        want_dims = _packed_dims(
+            M, K, wp.GROUP_SIZE, wp.M_TILE, wp.K_CHUNK, wp.N_CORES, M
+        )
+        assert packed.dtype == np.uint8 and packed.shape == want_dims, (M, K)
+    # the qwen dims, concretely (the study's recorded byte arithmetic)
+    assert lw._wo_packed.shape == (256, 4288)
+    assert lw._wgateup_packed.shape == (768, 4288)
+    assert lw._wdown_packed.shape == (384, 4288)
+    for k in ("wo", "w_gate", "w_up", "w_down"):
+        q, s, z = wp._fake_quantize(orig[k].T)
+        want = wp.dequant_rows(q, s, z).T
+        got = getattr(lw, k)
+        assert np.array_equal(got.view(np.uint16), want.view(np.uint16)), k
+        # non-vacuity: quantization actually changed the field
+        assert not np.array_equal(got.view(np.uint16), orig[k].view(np.uint16)), k
+    snap = lw.wo.copy()
+    wp.quantize_decode_weights(weights, cfg)  # idempotent
+    assert np.array_equal(lw.wo.view(np.uint16), snap.view(np.uint16))
 
 
 def main():
