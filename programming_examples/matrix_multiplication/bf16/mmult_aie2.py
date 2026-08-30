@@ -157,4 +157,11 @@ if __name__ == "__main__":
     with open(opts.input_file, "r") as f:
         air_ir_string = f.read()
 
-    latency = mmult_runner(air_ir_string=air_ir_string)
+    # `[2026-08-12]` queue item 22: these were parsed and never passed, so asking for a
+    # herd shape silently got the default one and the latency printed below was
+    # attributed to a shape that never ran. No shipped caller passes them (the Makefile
+    # invokes this script bare), so no recorded figure was affected -- the defect was
+    # latent, waiting for the first hand-run sweep.
+    latency = mmult_runner(
+        air_ir_string=air_ir_string, herd_m=opts.herd_m, herd_n=opts.herd_n
+    )

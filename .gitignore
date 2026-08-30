@@ -37,6 +37,16 @@ build_*
 build-xrt
 install
 install-xrt
+# Out-of-tree toolchain trees checked out beside the build dirs. 25 GB between them, and
+# untracked-but-not-ignored is the dangerous state: one `git add -A` stages the lot.
+# Anchored, so a future programming_examples/*/llvm/ is not silently swallowed too.
+/llvm/
+/my_install/
+# Kernel objects and aircc output written to the REPO ROOT by a build run from the wrong cwd
+# (twelve *.o, air.mlir and coarse_cache/ were committed this way once). Anchored to the root.
+/*.o
+/air.mlir
+/coarse_cache/
 platform_repo
 myproj
 sw_comp
@@ -47,6 +57,18 @@ air_project
 __pycache__/
 sandbox
 agents/.state/
+
+# Study and measurement result trees (Phase F/G). A completed results root is
+# ~2.4 GB and an unattended runner writes one tree per run.
+#
+# Scoped to result TREES, deliberately not to the *.csv extension that iron's
+# rule set uses. A blanket `*.csv` silently ignores any CSV a future test wants
+# to track as a fixture, and the failure mode is a file that seems to commit and
+# does not. iron's own rules carry two negations to claw specific files back out
+# from under exactly that -- evidence they hit it. Measurements belong in a
+# result tree; if a CSV is being written outside one, that is the thing to fix.
+results/
+results_unattended_*/
 
 # build results
 libadf.a
