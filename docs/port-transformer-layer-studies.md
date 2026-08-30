@@ -10,7 +10,7 @@ stays on the tag.
 Decisions that shaped the include set (operator, 2026-08-29): no `transformer_layer` example on
 `main` (the execution-mode study continues as full end-to-end LLM inference); int4 covers
 GGUF Q4_0 (ported) and Q4_K_M (new work, tracked separately); plan docs stay on the tag unless a
-living path cites one; multi-launch uses the ELF path only; the GEMM kernel-registry rows port as
+living path cites one; multi-launch uses the ELF path only; the Qwen3-0.6B QKV stage ports at 2 launches only, A/B against main's 8-launch form, no 4-launch stage (Q7, 2026-08-30); the GEMM kernel-registry rows port as
 authored data under the cap.
 
 ## Scoreboard (branch-added lines; updated in the PR that moves a row)
@@ -19,11 +19,11 @@ authored data under the cap.
 |---|---:|---:|---:|---:|---:|---|
 | B `agents/` | 1,017 | 0 | 3,194 (+1,397 already on main) | 839 | 178 | #6 devq core (B1); B2 new-job + selftest (this PR, 432); B3 audit script rides with E's GEMM feature |
 | F compiler | 1,942 | 6,099 | 2,831 | 1,819 | 6,222 | H10 (#7, 290); shared-L1 put guard (#9, 155); shrink-memref extent (#10, 440); H3 attribute verifier (#11, 123); split-l2 short offsets (#12, 438); split-l2 repeated feed (#13, 373 after its review fixes); prepared: split-l2 C |
-| E `llms/` + kernels | 14,477 | 7,233 | 6,236 | 807 | 20,903 | qkv-heads kernel + layout (this PR, 395); rms/qkv host-ABI seam refactor (#15, main-side structure-only, net +3 — not branch lines); verify_runner host tests (#14, 412); next: shared decode_qkv4 + test, then the qwen3 / llama32_1b_int4 / smollm2 int4 model rows, int4_awq q4_0, registry rows (data, ≈11 PRs) |
+| E `llms/` + kernels | 14,477 | 7,233 | 6,236 | 1,189 | 20,521 | 2-launch QKV ELF builder (this PR, 382); qkv-heads kernel + layout (#16, 395); rms/qkv host-ABI seam refactor (#15, main-side structure-only, net +3 — not branch lines); verify_runner host tests (#14, 412); next: shared decode_qkv4 + test, then the qwen3 / llama32_1b_int4 / smollm2 int4 model rows, int4_awq q4_0, registry rows (data, ≈11 PRs) |
 | D `transformer_layer/` | 0 | 0 | 69,330 | — | 0 | excluded (Q1) |
 | C plan docs | 0 | 0 | 12,805 | — | 0 | excluded (Q3) |
 | other | 0 | 29 | 41 | 0 | 29 | rides with B |
-| **total** | **17,436** | **13,361** | **94,437** | **3,465** | **27,332** | 35 PRs include-only; 62 at full refactor size |
+| **total** | **17,436** | **13,361** | **94,437** | **4,305** | **26,492** | 35 PRs include-only; 62 at full refactor size |
 
 Loop-stop condition: Remaining = 0 for the include set; refactor rows close when their
 re-derivation lands or is recorded as not needed.

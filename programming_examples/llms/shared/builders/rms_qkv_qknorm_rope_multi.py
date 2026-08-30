@@ -797,3 +797,116 @@ def build_rms_qkv_qknorm_rope_gemv_module(
         f"  rms_qkv_qknorm_rope_gemv module: {len(str(module).splitlines())} lines, parsed OK"
     )
     return module
+
+
+# ---------------------------------------------------------------------------
+# DECODE (M=1) fused builder, 2 launches: RMSNorm, then ONE GEMV over
+# [wq; wk; wv] whose columns own whole heads and whose cores apply QK-norm +
+# RoPE in L1 (matvec_heads.py + mv_heads.cc). Host contract: qkv2_layout.py.
+# ---------------------------------------------------------------------------
+
+
+def build_rms_qkv_qknorm_rope_gemv2_module(
+    emb_dim,
+    q_dim,
+    kv_dim,
+    n_heads,
+    n_kv_heads,
+    head_dim,
+    tile_m=None,
+    herd_m=None,
+    qknorm_eps=1e-6,
+    link_with=None,
+):
+    """2-launch decode ELF. The 8-launch form's separate QK-norm and RoPE
+    launches -- four `air.launch` boundaries -- are gone, and so are its q/k/qn/kn
+    intermediates and the per-head LUT tiling.
+
+    5 args:
+    %arg0  x_in   (emb_dim,)
+    %arg1  norm_w (emb_dim,)                         static
+    %arg2  bvec   (emb_dim + 3*head_dim,)            [normed | lut | q_norm | k_norm]:
+                                                     the RMSNorm launch writes [0, emb_dim);
+                                                     the host fills the tail every call
+    %arg3  wqkv_aug (q_dim+2*kv_dim, emb_dim+K_PAD)  static: `qkv2_prep_weight`
+                                                     of the row-packed [wq; wk; wv]
+    %arg4  out    (qkv2_out_total,)                  per-iteration head slots; the host's
+                                                     `qkv2_gather` reads q_roped | k_roped | v
+    """
+    import shared.builders.rms_gemv_rope_multi as rgr
+    from matvec_heads import build_module as build_heads_gemv
+    from shared.infra.stitching import stitch_elf, KernelSlice, FuncArg
+    from shared.infra.external_kernels import mv_heads_object_name
+    from shared.infra.qkv2_layout import (
+        K_PAD,
+        QKV2_HERD_M,
+        QKV2_TILE_M,
+        qkv2_out_total,
+    )
+
+    assert q_dim == n_heads * head_dim
+    assert kv_dim == n_kv_heads * head_dim
+    qkv_dim = q_dim + 2 * kv_dim
+    b_total = emb_dim + 3 * head_dim
+    if link_with is None:
+        link_with = mv_heads_object_name(head_dim)
+    tile_m = QKV2_TILE_M if tile_m is None else tile_m
+    herd_m = QKV2_HERD_M if herd_m is None else herd_m
+    assert (tile_m, herd_m) == (
+        QKV2_TILE_M,
+        QKV2_HERD_M,
+    ), "the host hooks (qkv2_*) assume these"
+
+    # RMSNorm (decode 1D) reads rgr.EPS; Qwen3 = 1e-6.
+    _saved_eps = rgr.EPS
+    rgr.EPS = qknorm_eps
+    try:
+        print(
+            "  [1/2] RMSNorm (decode 1D, eps=%g, into the packed B head)..."
+            % qknorm_eps
+        )
+        rms_ir = str(rgr._build_rms_1d(emb_dim, bfloat16, 16, out_total=b_total))
+    finally:
+        rgr.EPS = _saved_eps
+
+    print(
+        f"  [2/2] head-aligned QKV GEMV M={qkv_dim} K={emb_dim}(+{K_PAD} pad) "
+        f"tile_m={tile_m} (+ in-core QK-norm/RoPE on the Q|K heads)..."
+    )
+    gemv_ir = str(
+        build_heads_gemv(
+            qkv_dim,
+            emb_dim,
+            head_dim,
+            bfloat16,
+            tile_m=tile_m,
+            herd_m=herd_m,
+            eps=qknorm_eps,
+            link_with=link_with,
+        )
+    )
+
+    base_args = [
+        FuncArg("%arg0", f"memref<{emb_dim}xbf16>"),
+        FuncArg("%arg1", f"memref<{emb_dim}xbf16>"),
+        FuncArg("%arg2", f"memref<{b_total}xbf16>"),
+        FuncArg("%arg3", f"memref<{qkv_dim}x{emb_dim + K_PAD}xbf16>"),
+        FuncArg("%arg4", f"memref<{qkv2_out_total(qkv_dim, head_dim)}xbf16>"),
+    ]
+    slices = [
+        KernelSlice(rms_ir, "r", {0: 0, 1: 1, 2: 2}, private_from=False),
+        # GEMV func args: {0: A (wqkv_aug), 1: B (packed bvec), 2: OUT}.
+        KernelSlice(gemv_ir, "qh", {0: 3, 1: 2, 2: 4}),
+    ]
+    module = stitch_elf(
+        "rms_qkv_qknorm_rope_gemv",
+        base_args,
+        slices,
+        extra_externs={"@zero_vectorized_bf16", "@qkv_heads_chunk_bf16"},
+        debug_dump_path="/tmp/debug_rms_qkv_qknorm_rope_gemv2.mlir",
+    )
+    print(
+        f"  rms_qkv_qknorm_rope_gemv2 module: {len(str(module).splitlines())} lines, "
+        f"2 launches, parsed OK"
+    )
+    return module
