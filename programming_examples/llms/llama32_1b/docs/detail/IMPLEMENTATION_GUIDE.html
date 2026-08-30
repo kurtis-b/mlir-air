@@ -1245,13 +1245,14 @@ prompt_len_actual = <span class="fn">len</span>(tokens)                  <span c
 
 <h3>Step 3 — Recovering the real prompt length inside prefill</h3>
 
-<p>The prefill function doesn't receive <code>prompt_len_actual</code> directly — it gets only the padded <code>token_ids</code> array. It recovers the real length by counting non-EOS tokens (<span class="file-ref">llama32_1b_inference.py:422</span>):</p>
+<p>The prefill function receives <code>prompt_len_actual</code> explicitly: <code>run_once</code> passes it to <code>generate(prompt_len=...)</code>, which forwards it to <code>run_npu_prefill(prompt_len=...)</code>. Counting the non-EOS tokens of the padded array is only the fallback when no length is given — it is wrong for instruct prompts, because the chat templates put EOS <em>inside</em> the prompt (Llama-3's <code>&lt;|eot_id|&gt;</code> after every message), which made <code>pred_pos</code> land two tokens early before the length was passed through.</p>
 
-<pre><code>prompt_len = <span class="fn">len</span>([t <span class="kw">for</span> t <span class="kw">in</span> token_ids <span class="kw">if</span> t != tokenizer.eos_token_id])
+<pre><code><span class="kw">if</span> prompt_len <span class="kw">is</span> <span class="kw">None</span>:  <span class="com"># fallback only; the drivers always pass it</span>
+    prompt_len = <span class="fn">len</span>([t <span class="kw">for</span> t <span class="kw">in</span> token_ids <span class="kw">if</span> t != tokenizer.eos_token_id])
 pred_pos = prompt_len - <span class="num">1</span>     <span class="com"># index of the last real prompt token</span></code></pre>
 
 <div class="highlight-warn">
-  <strong>Caveat:</strong> this assumes the real prompt does NOT contain any EOS tokens. For typical text inputs that's true. The instruct chat template uses <code>&lt;|begin_of_text|&gt;</code>, <code>&lt;|start_header_id|&gt;</code>, etc. — none of which are EOS — so this works in practice. If a prompt legitimately contained EOS, this counting would be wrong.
+  <strong>Caveat:</strong> the fallback count assumes the real prompt contains no EOS token — false for the instruct chat templates, which emit <code>&lt;|eot_id|&gt;</code> (the tokenizer's EOS) after every message. That is why the real length is passed explicitly; <code>llama32_1b/test_prompt_len.py</code> fails if the forwarding is dropped.
 </div>
 
 <h3>Step 4 — Prefill processes ALL 2048 positions but only reads pred_pos's logits</h3>
@@ -2749,8 +2750,9 @@ self._cached_bos = {
         k_cache[layer_idx, :, :seq_len, :] = intermediates[<span class="str">"k_roped"</span>]<span class="com">...</span>
         v_cache[layer_idx, :, :seq_len, :] = intermediates[<span class="str">"v"</span>]<span class="com">...</span>
 
-    <span class="com"># Find last real token (see Part A5 padding)</span>
-    prompt_len = <span class="fn">len</span>([t <span class="kw">for</span> t <span class="kw">in</span> token_ids <span class="kw">if</span> t != tokenizer.eos_token_id])
+    <span class="com"># Last real token: the explicit prompt_len from run_once (see Part A5)</span>
+    <span class="kw">if</span> prompt_len <span class="kw">is</span> <span class="kw">None</span>:
+        prompt_len = <span class="fn">len</span>([t <span class="kw">for</span> t <span class="kw">in</span> token_ids <span class="kw">if</span> t != tokenizer.eos_token_id])
     pred_pos = prompt_len - <span class="num">1</span>
 
     <span class="com"># Final RMSNorm + LM Head — only the last real-token row</span>
