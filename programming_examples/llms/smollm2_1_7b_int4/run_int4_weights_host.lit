@@ -5,12 +5,14 @@
 // device): layer 0's dense fields against the HF safetensors, the packed-BO
 // shapes, and the promoted-tensor provenance. Collected by the unfiltered
 // check-programming-examples only. Needs the bf16 HF snapshot in the cache and
-// the Q4_0 GGUF: `SMOLLM2_GGUF` set on the host (lit.cfg.py forwards it and
-// lights the feature) or the hub file in the HF cache (the loader's fallback
-// resolves it offline).
+// the Q4_0 GGUF named by `SMOLLM2_GGUF` on the host (lit.cfg.py forwards the
+// variable and lights the feature whenever it is set; a set-but-wrong path is a
+// failure, not a skip). The hub-cache feature is deliberately NOT accepted
+// here: it only says some bytes of the multi-file repository are cached, not
+// that the Q4_0 file is.
 //
 // REQUIRES: hfweights_huggingfacetb_smollm2_1_7b_instruct
-// REQUIRES: smollm2_gguf || hfweights_bartowski_smollm2_1_7b_instruct_gguf
+// REQUIRES: smollm2_gguf
 //
 // RUN: %PYTHON %S/test_int4_weights.py | FileCheck %s
 //

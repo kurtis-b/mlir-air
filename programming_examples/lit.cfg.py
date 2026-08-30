@@ -197,10 +197,12 @@ if os.environ.get("HF_HUB_OFFLINE"):
     llvm_config.with_environment("HF_HUB_OFFLINE", os.environ["HF_HUB_OFFLINE"])
 
 # The int4 SmolLM2 example reads a GGUF that may live outside the HF cache
-# (`SMOLLM2_GGUF`). Forward it and mark `smollm2_gguf` when it names a file, so
-# `REQUIRES: smollm2_gguf` tests skip cleanly instead of failing on a missing
-# checkpoint (the hub copy, when cached, lights its hfweights_* feature instead).
-if os.path.isfile(os.environ.get("SMOLLM2_GGUF", "")):
+# (`SMOLLM2_GGUF`). Forward it and light `smollm2_gguf` whenever the variable
+# is SET -- not only when it names an existing file -- so `REQUIRES:
+# smollm2_gguf` tests skip cleanly when it is unset and reach their own
+# missing-file error when it is set to a stale path (a set-but-wrong path must
+# be a failure, never an UNSUPPORTED that greens the suite).
+if os.environ.get("SMOLLM2_GGUF"):
     config.available_features.add("smollm2_gguf")
     llvm_config.with_environment("SMOLLM2_GGUF", os.environ["SMOLLM2_GGUF"])
 
