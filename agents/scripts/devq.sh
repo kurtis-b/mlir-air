@@ -430,9 +430,10 @@ cmd_newjob() {
 #     leg in a subshell or a background job still counts (a shell variable would
 #     not survive the subshell, and the leg would vanish from the tally);
 #   * a leg with NO command is a failure, not a free pass;
-#   * `bash -c` / `sh -c` legs are re-invoked with `-o pipefail`, because
-#     pipefail is NOT inherited by a child shell -- `leg x -- bash -c 'false |
-#     true'` would otherwise report rc=0;
+#   * `bash -c` legs are re-invoked with `-o pipefail`, because pipefail is NOT
+#     inherited by a child shell -- `leg x -- bash -c 'false | true'` would
+#     otherwise report rc=0. Bash only: /bin/sh (dash) has no pipefail, so an
+#     `sh -c` leg carries its own pipe status (the last command's);
 #   * EXPECT_LEGS must be a number and must match the legs actually run; a
 #     malformed value is RED, not ignored;
 #   * the toolchain env and the `cd` are CHECKED -- an env that failed to load is
@@ -454,7 +455,9 @@ if [ ! -r "$TLENV" ] || ! source "$TLENV" >/dev/null 2>&1; then
 fi
 cd "$ROOT" || { echo "== FATAL: cd $ROOT failed"; exit 1; }
 
-R=${R:-$ROOT/agents/.state/devq-results/CHANGEME}
+# One results dir PER JOB: two overlapping jobs sharing a ledger let a green one
+# replace a red one's rows. Under devq the job id names it; outside, the pid.
+R=${R:-$ROOT/agents/.state/devq-results/${DEVQ_JOB_ID:-pid$$}}
 mkdir -p "$R/logs" || { echo "== FATAL: cannot create $R/logs"; exit 1; }
 LEDGER="$R/logs/.legs"
 : > "$LEDGER" || { echo "== FATAL: cannot write $LEDGER"; exit 1; }
@@ -474,9 +477,9 @@ leg() {
     printf '%s\t2\n' "$name" >> "$LEDGER"
     return 2
   fi
-  # pipefail does not cross into a child shell; hand it back explicitly
-  if { [ "$1" = bash ] || [ "$1" = sh ] || [ "$1" = /bin/bash ] || [ "$1" = /bin/sh ]; } \
-     && [ "${2:-}" = "-c" ]; then
+  # pipefail does not cross into a child shell; hand it back explicitly (bash
+  # only -- dash rejects -o pipefail, so `sh -c` legs are left as written)
+  if { [ "$1" = bash ] || [ "$1" = /bin/bash ]; } && [ "${2:-}" = "-c" ]; then
     local sh0=$1; shift 2
     set -- "$sh0" -o pipefail -c "$@"
   fi
@@ -522,15 +525,16 @@ case $EXPECT_LEGS in
     } ;;
 esac
 
-# Detecting this is not enough: the trap fires on our own `exit` and replaces the
-# status wholesale, so a warning alone still exits 0. Clear it. A trap that does
-# NOT call exit cannot change the status and is left alone to do its cleanup.
-if trap -p EXIT | grep -q 'exit'; then
-  echo "== AN EXIT TRAP CALLS exit -- it would REPLACE this script's status. CLEARED, and this job is RED:"
-  echo "==   $(trap -p EXIT)"
-  echo "== a job that reports its cleanup's status instead of its legs' has been lying; fix the trap."
-  trap - EXIT
-  RC_ALL=1
+# An EXIT trap that calls exit replaces this script's status wholesale -- and
+# `trap -p` shows only the handler TEXT, so `trap cleanup EXIT` hides the exit
+# behind a function name. Clear the trap unconditionally, run the captured
+# handler in a SUBSHELL (its exit cannot touch ours), then exit with the legs'
+# verdict. A cleanup that must run still runs; it just cannot vote.
+_exit_handler=$(trap -p EXIT | sed -E "s/^trap -- '(.*)' EXIT\$/\1/")
+trap - EXIT
+if [ -n "$_exit_handler" ]; then
+  echo "== EXIT trap ($_exit_handler) run in a subshell; this job's status is its legs' verdict"
+  ( eval "$_exit_handler" ) || true
 fi
 
 echo "== legs run: $NLEG (expect $EXPECT_LEGS)"

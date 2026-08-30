@@ -187,6 +187,7 @@ gen() {
   rm -f "$JOBSH"
   "$DEVQ" new-job "$JOBSH" "selftest generated" >/dev/null 2>&1
   sed -i "s/^EXPECT_LEGS=0 /EXPECT_LEGS=$1 /" "$JOBSH"
+  sed -i "s|^ROOT=.*|ROOT=$ROOT   # rewritten by the selftest: hermetic, never the real repo|" "$JOBSH"
   python3 - "$JOBSH" "$2" <<'PY'
 import io, sys
 p, body = sys.argv[1], sys.argv[2]
@@ -266,6 +267,22 @@ case $OUT in *"legs run: 2"*) ok "both backgrounded legs reached the tally";;
 gen 1 "trap 'exit 0' EXIT
 leg red -- false"
 runjob; check "$RC != 0" "an EXIT trap calling exit cannot turn a red job green (rc=$RC)"
+# ...and one hidden behind a FUNCTION NAME (`trap -p` shows only the handler text)
+gen 1 "cleanup() { exit 0; }; trap cleanup EXIT
+leg red -- false"
+runjob; check "$RC != 0" "an EXIT trap that calls exit through a function cannot turn a red job green (rc=$RC)"
+# /bin/sh legs must not be handed bash's pipefail (dash rejects it)
+gen 1 "leg shell -- sh -c 'true'"
+runjob; check "$RC == 0" "a /bin/sh -c leg succeeds: no bash-only pipefail handed to dash (rc=$RC)"
+# two generated jobs overlapping keep SEPARATE ledgers (R defaults per job id)
+gen 1 "leg slow -- sh -c 'sleep 1; exit 3'"
+cp "$JOBSH" "$ROOT/gen-job-red.sh"
+gen 1 "leg quick -- true"
+( TLENV="$ROOT/tlenv-stub.sh" DEVQ_JOB_ID=901 bash "$ROOT/gen-job-red.sh" >/dev/null 2>&1; echo $? > "$ROOT/rc-red" ) &
+sleep 0.3; TLENV="$ROOT/tlenv-stub.sh" DEVQ_JOB_ID=902 bash "$JOBSH" >/dev/null 2>&1; RCG=$?; wait
+check "$(cat "$ROOT/rc-red") != 0" "a red job overlapping a green one stays red: per-job ledgers (rc=$(cat "$ROOT/rc-red"))"
+check "$RCG == 0" "and the overlapping green job stays green (rc=$RCG)"
+[ -d "$ROOT/agents/.state/devq-results/901" ] && [ -d "$ROOT/agents/.state/devq-results/902" ] && ok "each job got its own results dir" || bad "per-job results dirs missing"
 
 # fewer legs than declared, and MORE legs than declared, are both wrong
 gen 2 "leg only -- true"
