@@ -72,7 +72,8 @@
 template <uint32_t r>
 void matvec_heads_vectorized(uint32_t m, uint32_t k, uint32_t row_stride,
                              const bfloat16 *__restrict a,
-                             const bfloat16 *__restrict b, bfloat16 *__restrict c) {
+                             const bfloat16 *__restrict b,
+                             bfloat16 *__restrict c) {
   ::aie::set_rounding(aie::rounding_mode::conv_even);
   bfloat16 *c_end = c + m;
   const bfloat16 *b_end = b + k;
@@ -117,7 +118,8 @@ void qknorm_rope_head(const T *__restrict c, const T *__restrict w,
     ::aie::store_v(out + j, weighted);
   }
 
-  // --- RoPE, half-split (rope_halfsplit.cc): LUT = [cos_0..cos_{h-1}, sin_0..] ---
+  // --- RoPE, half-split (rope_halfsplit.cc): LUT = [cos_0..cos_{h-1}, sin_0..]
+  // ---
   const int half = dims / 2;
   for (int v = 0; v < half; v += N) {
     ::aie::vector<T, N> x1 = ::aie::load_v<N>(out + v);
@@ -150,8 +152,8 @@ void qkv_heads_chunk_bf16(uint32_t m, uint32_t k, const bfloat16 *__restrict a,
   matvec_heads_vectorized<64>(m, k, row_stride, a, b, c + tag * m);
   if (static_cast<uint32_t>(tag + 1) * m == HEAD_DIM) { // the head's last chunk
     if (kind < 2)
-      qknorm_rope_head<bfloat16, 16, HEAD_DIM>(
-          c, b + k + HEAD_DIM * (1 + kind), b + k, out, eps);
+      qknorm_rope_head<bfloat16, 16, HEAD_DIM>(c, b + k + HEAD_DIM * (1 + kind),
+                                               b + k, out, eps);
     else
       copy_head<bfloat16, 16, HEAD_DIM>(c, out);
   }
