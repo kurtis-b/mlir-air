@@ -26,7 +26,9 @@ def qkv_heads_store_perm(m, herd_m, tile_m):
     for i in range(n_iter):
         for tx in range(herd_m):
             base = i * herd_m * tile_m + tx * tile_m
-            perm[base:base + tile_m] = tx * rows_per_col + i * tile_m + np.arange(tile_m)
+            perm[base : base + tile_m] = (
+                tx * rows_per_col + i * tile_m + np.arange(tile_m)
+            )
     return perm
 
 
@@ -41,7 +43,9 @@ def qkv_heads_slot_gather(m, herd_m, head_dim, tile_m=8):
         for h in range(rows_per_col // head_dim):
             it = h * cph + cph - 1
             lo = tx * rows_per_col + h * head_dim
-            g[lo:lo + head_dim] = it * herd_m * head_dim + tx * head_dim + np.arange(head_dim)
+            g[lo : lo + head_dim] = (
+                it * herd_m * head_dim + tx * head_dim + np.arange(head_dim)
+            )
     return g
 
 
@@ -64,7 +68,9 @@ def qkv_heads_augment_weight(w_logical, q_rows, qk_rows, head_dim, herd_m=8, til
 
 def qkv2_prep_weight(w_logical, q_dim, qk_dim, head_dim):
     """Static weight of the 2-launch ELF from the logical [wq; wk; wv] (M, K)."""
-    return qkv_heads_augment_weight(w_logical, q_dim, qk_dim, head_dim, QKV2_HERD_M, QKV2_TILE_M)
+    return qkv_heads_augment_weight(
+        w_logical, q_dim, qk_dim, head_dim, QKV2_HERD_M, QKV2_TILE_M
+    )
 
 
 def qkv2_out_total(qkv_dim, head_dim):

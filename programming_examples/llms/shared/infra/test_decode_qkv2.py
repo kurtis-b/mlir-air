@@ -40,8 +40,12 @@ def _layer(seed=0):
     rng = np.random.default_rng(seed)
     f = lambda *s: (rng.standard_normal(s, dtype=np.float32) * 0.02).astype(bfloat16)
     return SimpleNamespace(
-        attn_norm=f(CFG.emb_dim), q_norm=f(CFG.head_dim), k_norm=f(CFG.head_dim),
-        _wq_t=f(Q_DIM, CFG.emb_dim), _wk_t=f(KV_DIM, CFG.emb_dim), _wv_t=f(KV_DIM, CFG.emb_dim),
+        attn_norm=f(CFG.emb_dim),
+        q_norm=f(CFG.head_dim),
+        k_norm=f(CFG.head_dim),
+        _wq_t=f(Q_DIM, CFG.emb_dim),
+        _wk_t=f(KV_DIM, CFG.emb_dim),
+        _wv_t=f(KV_DIM, CFG.emb_dim),
     )
 
 
@@ -53,13 +57,15 @@ def test_augmented_weight_rows_tag_and_kind():
     aug = qkv2_prep_weight(w, Q_DIM, Q_DIM + KV_DIM, CFG.head_dim)
     perm = qkv_heads_store_perm(QKV_DIM, QKV2_HERD_M, QKV2_TILE_M)
     assert sorted(perm.tolist()) == list(range(QKV_DIM))
-    assert np.array_equal(aug[:, :CFG.emb_dim], w[perm])
+    assert np.array_equal(aug[:, : CFG.emb_dim], w[perm])
     logical = perm
     tag = aug[:, CFG.emb_dim].astype(np.int64)
     kind = aug[:, CFG.emb_dim + 1].astype(np.int64)
     assert np.array_equal(tag, (logical % CFG.head_dim) // QKV2_TILE_M)
-    assert np.array_equal(kind, np.where(logical < Q_DIM, 0, np.where(logical < Q_DIM + KV_DIM, 1, 2)))
-    assert not aug[:, CFG.emb_dim + 2:].any()
+    assert np.array_equal(
+        kind, np.where(logical < Q_DIM, 0, np.where(logical < Q_DIM + KV_DIM, 1, 2))
+    )
+    assert not aug[:, CFG.emb_dim + 2 :].any()
     # a column owns whole heads, in order: stored block (iteration i, column tx)
     # is logical rows tx*rows_per_col + i*tile_m ...
     rows_per_col = QKV_DIM // QKV2_HERD_M
@@ -86,14 +92,18 @@ def test_slot_gather_inverts_the_device_slot_layout():
         for hd in range(rows_per_col // h):
             it = hd * cph + cph - 1
             lo = tx * rows_per_col + hd * h
-            slots[it * herd * h + tx * h: it * herd * h + (tx + 1) * h] = logical[lo:lo + h]
+            slots[it * herd * h + tx * h : it * herd * h + (tx + 1) * h] = logical[
+                lo : lo + h
+            ]
     g = qkv2_gather(QKV_DIM, h)
     assert np.array_equal(g, qkv_heads_slot_gather(QKV_DIM, herd, h, tile))
     assert np.array_equal(slots[g], logical)
 
 
 def _main():
-    tests = [(n, o) for n, o in globals().items() if n.startswith("test_") and callable(o)]
+    tests = [
+        (n, o) for n, o in globals().items() if n.startswith("test_") and callable(o)
+    ]
     failed = []
     for name, fn in tests:
         try:
