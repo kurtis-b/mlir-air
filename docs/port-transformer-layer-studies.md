@@ -18,12 +18,12 @@ authored data under the cap.
 | Cluster | Include | Refactor | Excluded | Landed | Remaining | PRs |
 |---|---:|---:|---:|---:|---:|---|
 | B `agents/` | 1,017 | 0 | 3,194 (+1,397 already on main) | 839 | 178 | #6 devq core (B1); B2 new-job + selftest (this PR, 432); B3 audit script rides with E's GEMM feature |
-| F compiler | 1,942 | 6,099 | 2,831 | 1,008 | 7,033 | H10 (#7, 290); shared-L1 put guard (#9, 155); shrink-memref extent (#10, 440); H3 attribute verifier (this PR, 123); prepared: split-l2 B |
+| F compiler | 1,942 | 6,099 | 2,831 | 1,446 | 6,595 | H10 (#7, 290); shared-L1 put guard (#9, 155); shrink-memref extent (#10, 440); H3 attribute verifier (#11, 123); split-l2 short offsets (this PR, 438); prepared: split-l2 D, C |
 | E `llms/` + kernels | 14,477 | 7,233 | 6,236 | 0 | 21,710 | — |
 | D `transformer_layer/` | 0 | 0 | 69,330 | — | 0 | excluded (Q1) |
 | C plan docs | 0 | 0 | 12,805 | — | 0 | excluded (Q3) |
 | other | 0 | 29 | 41 | 0 | 29 | rides with B |
-| **total** | **17,436** | **13,361** | **94,437** | **1,772** | **29,025** | 35 PRs include-only; 62 at full refactor size |
+| **total** | **17,436** | **13,361** | **94,437** | **2,285** | **28,512** | 35 PRs include-only; 62 at full refactor size |
 
 Loop-stop condition: Remaining = 0 for the include set; refactor rows close when their
 re-derivation lands or is recorded as not needed.
