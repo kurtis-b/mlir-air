@@ -1347,18 +1347,18 @@ authored data under the cap.</p>
 <td style="text-align: right;">1,942</td>
 <td style="text-align: right;">6,099</td>
 <td style="text-align: right;">2,831</td>
-<td style="text-align: right;">1,745</td>
-<td style="text-align: right;">6,296</td>
-<td>H10 (#7, 290); shared-L1 put guard (#9, 155); shrink-memref extent (#10, 440); H3 attribute verifier (#11, 123); split-l2 short offsets (#12, 438); split-l2 repeated feed (this PR, 299); prepared: split-l2 C</td>
+<td style="text-align: right;">1,819</td>
+<td style="text-align: right;">6,222</td>
+<td>H10 (#7, 290); shared-L1 put guard (#9, 155); shrink-memref extent (#10, 440); H3 attribute verifier (#11, 123); split-l2 short offsets (#12, 438); split-l2 repeated feed (#13, 373 after its review fixes); prepared: split-l2 C</td>
 </tr>
 <tr>
 <td>E <code>llms/</code> + kernels</td>
 <td style="text-align: right;">14,477</td>
 <td style="text-align: right;">7,233</td>
 <td style="text-align: right;">6,236</td>
-<td style="text-align: right;">0</td>
-<td style="text-align: right;">21,710</td>
-<td>—</td>
+<td style="text-align: right;">412</td>
+<td style="text-align: right;">21,298</td>
+<td>verify_runner host tests (this PR, 412 after its review fixes); next: shared decode_qkv4 + test, then the qwen3 / llama32_1b_int4 / smollm2 int4 model rows, int4_awq q4_0, registry rows (data, ≈11 PRs)</td>
 </tr>
 <tr>
 <td>D <code>transformer_layer/</code></td>
@@ -1392,8 +1392,8 @@ authored data under the cap.</p>
 <td style="text-align: right;"><strong>17,436</strong></td>
 <td style="text-align: right;"><strong>13,361</strong></td>
 <td style="text-align: right;"><strong>94,437</strong></td>
-<td style="text-align: right;"><strong>2,584</strong></td>
-<td style="text-align: right;"><strong>28,213</strong></td>
+<td style="text-align: right;"><strong>3,070</strong></td>
+<td style="text-align: right;"><strong>27,727</strong></td>
 <td>35 PRs include-only; 62 at full refactor size</td>
 </tr>
 </tbody>
