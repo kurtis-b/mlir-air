@@ -122,18 +122,20 @@ def _compile_mm_bf16_x_bfp16(tile_m=32, tile_n=32, tile_k_l1=128):
 _INT4_TILE_N = 16  # overridden by --tile-n
 
 
-def _prepare_air_project_int4(quant=None):
+def _prepare_air_project_int4(quant=None, int4_gs=128):
     """Replacement for cache.prepare_air_project: wipe + repopulate
     air_project/ with `mv_int4_bf16.o` (GEMM flags), `rope.o`, and
     `silu_and_mul.o`. `quant` is accepted for cache.compile_and_cache
-    compatibility but unused (the kernel flavor is determined here)."""
+    compatibility but unused (the kernel flavor is determined here);
+    `int4_gs` is the group size cache.compile_and_cache forwards from the
+    backend kwargs and is baked into the GEMM object."""
     del quant
     air_proj = Path("air_project")
     if air_proj.exists():
         shutil.rmtree(air_proj)
     air_proj.mkdir(parents=True, exist_ok=True)
 
-    _compile_mv_int4_bf16_matmul(tile_n=_INT4_TILE_N)
+    _compile_mv_int4_bf16_matmul(tile_n=_INT4_TILE_N, gs=int4_gs)
     compile_rope()
     compile_silu_and_mul()
     compile_attn_npu2()
@@ -154,11 +156,12 @@ def _prepare_air_project_int4(quant=None):
             shutil.copy2(src, air_proj / obj_name)
 
 
-def _prepare_air_project_bfp16(quant=None):
+def _prepare_air_project_bfp16(quant=None, int4_gs=128):
     """Replacement for cache.prepare_air_project: same as int4 but with the
     bfp16-mixed kernel `mm_bf16_x_bfp16.o` in place of `mv_int4_bf16.o`.
-    `quant` accepted for cache.compile_and_cache compatibility but unused."""
-    del quant
+    `quant` and `int4_gs` accepted for cache.compile_and_cache compatibility
+    but unused (no int4 object here)."""
+    del quant, int4_gs
     air_proj = Path("air_project")
     if air_proj.exists():
         shutil.rmtree(air_proj)
