@@ -13,7 +13,9 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 
-def prepare_air_project(quant: str = "bf16", int4_gs: int = 128):
+def prepare_air_project(
+    quant: str = "bf16", int4_gs: int = 128, int4_k_chunk: int = 2048
+):
     """Clean and prepare the air_project/ directory for a fresh compilation.
 
     aircc defaults to 'air_project/' as its working directory. Sequential
@@ -26,6 +28,8 @@ def prepare_air_project(quant: str = "bf16", int4_gs: int = 128):
             `mv_int4_bf16.o` so the int4 decode ELFs can link it.
         int4_gs: group size baked into that object (see
             `external_kernels.compile_mv_int4_bf16`); "awq" only.
+        int4_k_chunk: DIM_K baked into that object; "awq" only. Qwen3-0.6B's
+            int4 decode cascade is 1024 vs llama's 2048 (doc 56 H2b).
     """
     air_proj = Path("air_project")
     if air_proj.exists():
@@ -35,7 +39,9 @@ def prepare_air_project(quant: str = "bf16", int4_gs: int = 128):
     # Compile external kernels from source (not stale .o copies)
     from shared.infra.external_kernels import compile_all_external_kernels
 
-    compile_all_external_kernels(quant=quant, int4_gs=int4_gs)
+    compile_all_external_kernels(
+        quant=quant, int4_gs=int4_gs, int4_k_chunk=int4_k_chunk
+    )
 
     # Copy compiled .o files to air_project/ for aiecc to find. Must include
     # every external symbol referenced by `link_with` in the kernel modules:
@@ -474,7 +480,8 @@ class KernelCache:
         # prevents.
         backend_kwargs = dict(backend_kwargs)
         int4_gs = backend_kwargs.pop("int4_gs", 128)
-        prepare_air_project(quant=quant, int4_gs=int4_gs)
+        int4_k_chunk = backend_kwargs.pop("int4_k_chunk", 2048)
+        prepare_air_project(quant=quant, int4_gs=int4_gs, int4_k_chunk=int4_k_chunk)
         backend = XRTBackend(**backend_kwargs)
 
         t0 = time.time()

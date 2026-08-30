@@ -374,7 +374,9 @@ def compile_attn_decode_npu2(head_dim=64):
     )
 
 
-def compile_all_external_kernels(head_dim=64, quant="bf16", int4_gs=128):
+def compile_all_external_kernels(
+    head_dim=64, quant="bf16", int4_gs=128, int4_k_chunk=2048
+):
     """Compile all external C++ kernels from source.
 
     Call this before kernel compilation to ensure all .o files are fresh.
@@ -389,6 +391,8 @@ def compile_all_external_kernels(head_dim=64, quant="bf16", int4_gs=128):
             so mixed paths (e.g. bf16 prefill + int4 decode) keep working.
         int4_gs: the checkpoint's group size baked into that micro-kernel
             (AWQ 128, GGUF q4_0 32); only read when quant == "awq".
+        int4_k_chunk: DIM_K baked into that micro-kernel; only read when
+            quant == "awq".
     """
     compile_silu_and_mul()
     compile_rope()
@@ -402,5 +406,7 @@ def compile_all_external_kernels(head_dim=64, quant="bf16", int4_gs=128):
         # restages the canonical mv_int4_bf16.o at gs=128 AFTER any earlier
         # gs=32 staging and immediately BEFORE aiecc links -- the study
         # branch's first SmolLM2 int4 build linked the wrong group size
-        # exactly this way.
-        compile_mv_int4_bf16(gs=int4_gs)
+        # exactly this way. `int4_k_chunk` rides the same channel (doc 56
+        # H2b: qwen's int4 cascade is DIM_K=1024; a default here would
+        # restage llama's 2048 kernel right before aiecc links the qwen ELF).
+        compile_mv_int4_bf16(gs=int4_gs, k_chunk=int4_k_chunk)
