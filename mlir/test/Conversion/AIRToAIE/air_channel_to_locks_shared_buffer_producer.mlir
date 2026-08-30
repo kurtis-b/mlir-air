@@ -89,3 +89,57 @@ func.func @shared_buffer_producer_then_puts() {
   }
   return
 }
+
+// -----
+
+// The same shape, but the core produces through a memref.subview of the L1
+// buffer (the common form: a producer kernel is handed a view, never the base
+// value). The guard must see the view as the buffer: the write-lock acquire
+// precedes the producer call, exactly as in the base-value case above.
+
+// CHECK: aie.device
+// CHECK-DAG:         %[[TILE:.*]] = aie.tile(2, 3)
+// CHECK-DAG:         %[[WLOCK:.*]] = aie.lock(%[[TILE]], {{[0-9]+}}) {init = 1 : i32}
+// CHECK-DAG:         %[[RLOCK:.*]] = aie.lock(%[[TILE]], {{[0-9]+}}) {init = 0 : i32}
+// CHECK-DAG:         %[[BUF:.*]] = aie.buffer(%[[TILE]]) {{{.*}}} : memref<64x64xbf16, 2>
+// CHECK:    aie.core(%[[TILE]])  {
+// CHECK:           memref.subview %[[BUF]]
+// CHECK:           aie.use_lock(%[[WLOCK]], AcquireGreaterEqual, %{{.*}})
+// CHECK-NEXT:      func.call @producer_sub
+// CHECK:           aie.use_lock(%[[RLOCK]], Release, %{{.*}})
+// CHECK:           aie.use_lock(%[[WLOCK]], AcquireGreaterEqual, %{{.*}})
+// CHECK-NEXT:      aie.use_lock(%[[RLOCK]], Release, %{{.*}})
+// CHECK:           aie.end
+// CHECK:         }
+
+air.channel @channel_0 [1, 1]
+func.func private @producer_sub(memref<64x64xbf16, strided<[64, 1]>, 2>) attributes {link_with = "kernel.o", llvm.emit_c_interface}
+func.func @shared_buffer_subview_producer_then_puts() {
+  %c1 = arith.constant 1 : index
+  %0 = air.launch async (%arg4, %arg5) in (%arg6=%c1, %arg7=%c1) {
+    %1 = air.segment async {
+      %c1_0 = arith.constant 1 : index
+      %async_token_0, %l2_buf = air.execute -> (memref<2048xbf16, 1>) {
+        %alloc = memref.alloc() : memref<2048xbf16, 1>
+        air.execute_terminator %alloc : memref<2048xbf16, 1>
+      }
+      %3 = air.channel.get async @channel_0[] (%l2_buf[] [] []) : (memref<2048xbf16, 1>)
+      %2 = air.herd @herd_0 async tile (%arg8, %arg9) in (%arg10=%c1_0, %arg11=%c1_0) attributes {link_with = "kernel.o"} {
+        %async_token_2, %buf = air.execute -> (memref<64x64xbf16, 2>) {
+          %alloc = memref.alloc() : memref<64x64xbf16, 2>
+          air.execute_terminator %alloc : memref<64x64xbf16, 2>
+        }
+        %async_token_w = air.execute [%async_token_2] {
+          %sub = memref.subview %buf[0, 0] [64, 64] [1, 1] : memref<64x64xbf16, 2> to memref<64x64xbf16, strided<[64, 1]>, 2>
+          func.call @producer_sub(%sub) : (memref<64x64xbf16, strided<[64, 1]>, 2>) -> ()
+        }
+        %tok_1 = air.channel.put async [%async_token_w] @channel_0[] (%buf[0, 0, 0] [1, 16, 128] [128, 256, 1]) : (memref<64x64xbf16, 2>)
+        %tok_2 = air.channel.put async [%tok_1] @channel_0[] (%buf[1, 0, 0] [1, 16, 128] [128, 256, 1]) : (memref<64x64xbf16, 2>)
+        %async_token_3 = air.execute [%tok_2] {
+          memref.dealloc %buf : memref<64x64xbf16, 2>
+        }
+      }
+    }
+  }
+  return
+}
