@@ -58,6 +58,7 @@ from air.backend.xrt_runner import type_mapper
 
 # The kernel's host-side layout contract owns K_PAD (llms/shared/infra).
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "llms"))
+from shared.infra.external_kernels import mv_heads_object_name  # noqa: E402
 from shared.infra.qkv2_layout import K_PAD  # noqa: E402
 
 
@@ -70,12 +71,20 @@ def build_module(
     tile_m=8,
     herd_m=8,
     eps=1e-6,
-    link_with="mv_heads_hd128.o",
+    link_with=None,
 ):
+    # HEAD_DIM is baked into the kernel object, so the object must be the one
+    # compiled for THIS head_dim (a 128-wide object walks 128 elements through
+    # a narrower head's L1 buffers).
+    if link_with is None:
+        link_with = mv_heads_object_name(head_dim)
     assert m % herd_m == 0, (m, herd_m)
     rows_per_col = m // herd_m
     assert rows_per_col % head_dim == 0, (rows_per_col, head_dim)
     assert head_dim % tile_m == 0, (head_dim, tile_m)
+    # The epilogue's RoPE walks each HALF head in 16-lane vectors with no tail
+    # (mv_heads.cc), so a half head must be a whole number of vectors.
+    assert head_dim % 32 == 0, (head_dim, "half head must be a multiple of 16")
     n_iter = rows_per_col // tile_m
     assert k % 64 == 0, k
     k_pad = k + K_PAD
@@ -235,3 +244,75 @@ def build_module(
 
                 for buf in (l2_a, l2_out, l1_a, l1_b, l1_c, l1_out):
                     DeallocOp(buf)
+
+
+if __name__ == "__main__":
+    # Standalone device check of the GEMV launch + epilogue against numpy, on
+    # the Qwen3-0.6B geometry by default: PASS! when every gathered head
+    # matches rope(qknorm(W x)) (Q/K) or W x (V) within a bf16 tolerance.
+    import argparse
+
+    import numpy as np
+    from air.backend.xrt import XRTBackend
+    from ml_dtypes import bfloat16
+    from shared.infra.external_kernels import compile_mv_heads
+    from shared.infra.qkv2_layout import qkv2_gather, qkv2_out_total, qkv2_prep_weight
+
+    p = argparse.ArgumentParser(
+        description="head-aligned QKV GEMV + epilogue, on the NPU"
+    )
+    p.add_argument("--k", type=int, default=1024)
+    p.add_argument("--head-dim", type=int, default=128)
+    p.add_argument("--n-heads", type=int, default=16)
+    p.add_argument("--n-kv-heads", type=int, default=8)
+    p.add_argument("-v", "--verbose", action="store_true")
+    a = p.parse_args()
+    hd, k = a.head_dim, a.k
+    q_dim, kv_dim = a.n_heads * hd, a.n_kv_heads * hd
+    m, half, eps = q_dim + 2 * kv_dim, hd // 2, 1e-6
+    rng = np.random.default_rng(0)
+    w = (rng.standard_normal((m, k)) * 0.05).astype(bfloat16)
+    x = rng.standard_normal(k).astype(bfloat16)
+    qn = (1 + 0.1 * rng.standard_normal(hd)).astype(bfloat16)
+    kn = (1 + 0.1 * rng.standard_normal(hd)).astype(bfloat16)
+    ang = rng.uniform(0, 2 * np.pi, half)
+    lut = np.concatenate([np.cos(ang), np.sin(ang)]).astype(bfloat16)  # [cos | sin]
+    f32 = np.float32
+    # The kernel's arithmetic, step by step in bf16: bf16 dot, rstd over the
+    # head, times the norm weight, then the half-split rotation.
+    y = (w.astype(f32) @ x.astype(f32)).astype(bfloat16)
+    ref = y.copy()
+    for h in range(m // hd):
+        lo = h * hd
+        kind = 0 if lo < q_dim else (1 if lo < q_dim + kv_dim else 2)
+        if kind == 2:
+            continue
+        c = y[lo : lo + hd].astype(f32)
+        t = (c / np.sqrt(np.mean(c * c) + eps)).astype(bfloat16).astype(f32)
+        t = (t * (qn if kind == 0 else kn).astype(f32)).astype(bfloat16).astype(f32)
+        t1, t2 = t[:half], t[half:]
+        cs, sn = lut[:half].astype(f32), lut[half:].astype(f32)
+        ref[lo : lo + half] = (t1 * cs - t2 * sn).astype(bfloat16)
+        ref[lo + half : lo + hd] = (t1 * sn + t2 * cs).astype(bfloat16)
+    obj = compile_mv_heads(hd)  # in cwd, like the driver's build dir
+    mod = build_module(m, k, hd, bfloat16, eps=eps, link_with=obj)
+    be = XRTBackend(
+        verbose=a.verbose,
+        omit_while_true_loop=False,
+        output_format="elf",
+        instance_name="matvec_heads",  # ELF mode: must name the module's func
+    )
+    fn = be.compile_and_load(mod)
+    A = qkv2_prep_weight(w, q_dim, q_dim + kv_dim, hd)
+    B = np.concatenate([x, lut, qn, kn]).astype(bfloat16)
+    out = np.zeros(qkv2_out_total(m, hd), dtype=bfloat16)
+    got = fn(A, B, out)[2][qkv2_gather(m, hd)].astype(f32)
+    be.unload()
+    err = np.abs(got - ref.astype(f32))
+    bound = 0.05 * np.abs(ref.astype(f32)) + 0.02
+    bad = int((err > bound).sum())
+    print(
+        f"max abs err {err.max():.4f}, {bad} of {m} outside 5% + 0.02 (Q/K roped, V plain)"
+    )
+    print("PASS!" if bad == 0 else "FAIL")
+    raise SystemExit(0 if bad == 0 else 1)
