@@ -224,3 +224,68 @@ func.func @repeated_feed_dynamic_far_size(%arg0: memref<48x4288xi8>) {
   }
   return
 }
+
+// -----
+
+// Case 4 -- mixed element widths. One L3 put of 2 x 2144 i32 (4288 elements,
+// 137216 bits) covering TWO stagings of the 8576 x i8 L2 buffer (68608 bits).
+// Counted in elements the far side looks smaller than one staging and the
+// split goes ahead; counted in bits it carries two. Must not split.
+
+// CHECK-LABEL: func.func @repeated_feed_mixed_width
+// CHECK: memref.alloc() : memref<8576xi8, 1 : i32>
+// CHECK-NOT: memref.alloc() : memref<4288xi8, 1 : i32>
+
+air.channel @inL3 [1]
+air.channel @aL2ToL1 [1, 2]
+func.func @repeated_feed_mixed_width(%arg0: memref<2x2144xi32>) {
+  %c1 = arith.constant 1 : index
+  %0 = air.launch async (%tx, %ty) in (%sx=%c1, %sy=%c1) args(%a0=%arg0) : memref<2x2144xi32> attributes {id = 1 : i32} {
+    %c0 = arith.constant 0 : index
+    %c1_0 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c2144 = arith.constant 2144 : index
+    %p = air.channel.put async @inL3[%c0] (%a0[%c0, %c0] [%c2, %c2144] [%c2144, %c1_0]) {id = 1 : i32} : (memref<2x2144xi32>)
+    %s = air.segment @seg async attributes {id = 2 : i32} {
+      %c0_1 = arith.constant 0 : index
+      %c1_1 = arith.constant 1 : index
+      %c2_1 = arith.constant 2 : index
+      %c4 = arith.constant 4 : index
+      %c2_s = arith.constant 2 : index
+      %c4288_1 = arith.constant 4288 : index
+      %w0 = air.wait_all async
+      %f = scf.for %i = %c0_1 to %c2_s step %c1_1 iter_args(%it = %w0) -> (!air.async.token) {
+        %tok, %buf = air.execute -> (memref<8576xi8, 1 : i32>) {
+          %alloc = memref.alloc() : memref<8576xi8, 1 : i32>
+          air.execute_terminator %alloc : memref<8576xi8, 1 : i32>
+        }
+        %g = air.channel.get async [%it, %tok] @inL3[%c0_1] (%buf[] [] []) {id = 2 : i32} : (memref<8576xi8, 1 : i32>)
+        %p0 = air.channel.put async [%g] @aL2ToL1[%c0_1, %c0_1] (%buf[%c0_1] [%c4288_1] [%c1_1]) {id = 3 : i32} : (memref<8576xi8, 1 : i32>)
+        %p1 = air.channel.put async [%g] @aL2ToL1[%c0_1, %c1_1] (%buf[%c4288_1] [%c4288_1] [%c1_1]) {id = 4 : i32} : (memref<8576xi8, 1 : i32>)
+        %dt = air.execute [%p0, %p1] {
+          memref.dealloc %buf : memref<8576xi8, 1 : i32>
+        }
+        %wa = air.wait_all async [%p0, %p1]
+        scf.yield %wa : !air.async.token
+      }
+      %h = air.herd @h async tile (%hx, %hy) in (%hsx=%c4, %hsy=%c2_1) attributes {id = 3 : i32, x_loc = 0 : i64, y_loc = 2 : i64} {
+        %c0_2 = arith.constant 0 : index
+        %c1_2 = arith.constant 1 : index
+        %c24_2 = arith.constant 24 : index
+        %wh = air.wait_all async
+        %fh = scf.for %j = %c0_2 to %c24_2 step %c1_2 iter_args(%ith = %wh) -> (!air.async.token) {
+          %tokl, %bufl = air.execute -> (memref<4288xi8, 2 : i32>) {
+            %alloc = memref.alloc() : memref<4288xi8, 2 : i32>
+            air.execute_terminator %alloc : memref<4288xi8, 2 : i32>
+          }
+          %gl = air.channel.get async [%ith, %tokl] @aL2ToL1[%hx, %hy] (%bufl[] [] []) {id = 5 : i32} : (memref<4288xi8, 2 : i32>)
+          %dl = air.execute [%gl] {
+            memref.dealloc %bufl : memref<4288xi8, 2 : i32>
+          }
+          scf.yield %gl : !air.async.token
+        }
+      }
+    }
+  }
+  return
+}

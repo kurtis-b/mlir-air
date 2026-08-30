@@ -2457,20 +2457,29 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
     // std::optional is the carrier: nullopt means "cannot tell", and nullopt
     // declines.
 
-    // Elements one execution of `ci` moves, or nullopt when that is not
-    // statically knowable.
+    // BITS one execution of `ci` moves, or nullopt when that is not statically
+    // knowable. Bits, not elements: the two sides of a channel may carry
+    // different element widths, and a far side of 2 x 2144 i32 holds two
+    // stagings of an 8576 x i8 buffer while counting half its elements.
     auto accessVolumeOf =
         [](air::ChannelInterface ci) -> std::optional<int64_t> {
-      auto memrefTy = dyn_cast_if_present<MemRefType>(ci.getMemref().getType());
+      // The far side may be an unranked memref; only the element type is
+      // needed from it unless the sizes are defaulted from its shape below.
+      auto baseTy =
+          dyn_cast_if_present<BaseMemRefType>(ci.getMemref().getType());
+      if (!baseTy || !baseTy.getElementType().isIntOrFloat())
+        return std::nullopt;
+      int64_t bits = baseTy.getElementType().getIntOrFloatBitWidth();
       auto sizes = air::getSizesAsValues(ci);
       if (sizes.empty()) {
         // `runOnOperation` populates defaults from the op's own memref, so the
-        // volume is the memref's -- but only if that is static.
+        // volume is the memref's -- but only if that is ranked and static.
+        auto memrefTy = dyn_cast<MemRefType>(baseTy);
         if (!memrefTy || !memrefTy.hasStaticShape())
           return std::nullopt;
-        return (int64_t)air::getTensorVolume(memrefTy);
+        return (int64_t)air::getTensorVolume(memrefTy) * bits;
       }
-      int64_t volume = 1;
+      int64_t volume = bits;
       for (auto size : sizes) {
         auto constSize = getConstantIntValue(size);
         if (!constSize || *constSize < 0)
@@ -2603,7 +2612,7 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
 
       auto l2Volume = accessVolumeOf(chanUser);
       if (!l2Volume) {
-        decline() << "the number of elements @" << chanUser.getChanName()
+        decline() << "the number of bits @" << chanUser.getChanName()
                   << " stages into this buffer is not statically known, so the "
                      "split cannot be shown to be the same partition on both "
                      "sides";
@@ -2623,7 +2632,7 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
            air::getTheOtherChannelOpThroughSymbol(chanUser)) {
         auto farVolume = accessVolumeOf(otherChanOp);
         if (!farVolume) {
-          decline() << "the number of elements one execution of @"
+          decline() << "the number of bits one execution of @"
                     << otherChanOp.getChanName()
                     << " moves is not statically known, so it cannot be shown "
                        "to stay in step with the "
@@ -2634,7 +2643,7 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
         // far-side execution may carry at most one L2 staging.
         if (*farVolume > *l2Volume) {
           decline() << "one execution of channel @" << otherChanOp.getChanName()
-                    << " moves " << *farVolume << " elements against the "
+                    << " moves " << *farVolume << " bits against the "
                     << *l2Volume
                     << " this buffer stages, so a contiguous split of the two "
                        "would not be the same partition";
