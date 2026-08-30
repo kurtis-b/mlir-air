@@ -349,6 +349,7 @@ def run_npu_prefill(
     tokenizer,
     cpu_attn=True,
     quiet=False,
+    prompt_len=None,
 ):
     """NPU bf16 prefill on dequantized AWQ weights → first token + KV cache."""
     from llama32_1b_cpu_helpers import rms_norm
@@ -396,7 +397,15 @@ def run_npu_prefill(
             )
         prefill_cache.profiler.end_layer(layer_idx, t0)
 
-    prompt_len = len([t for t in token_ids if t != tokenizer.eos_token_id])
+    if prompt_len is None:
+        # Fallback for callers that do not pass it: count the non-EOS tokens
+        # of the padded array. Right only when the chat template puts no EOS
+        # inside the prompt -- wrong by one per closed message for ChatML
+        # (SmolLM2's <|im_end|> is its EOS) and for Llama-3.x instruct
+        # tokenizers whose eos_token is <|eot_id|> -- so the logits are read
+        # at the wrong row and the first "generated" token is a prompt token
+        # (study branch 4cddf4fe). Callers that know the real length pass it.
+        prompt_len = len([t for t in token_ids if t != tokenizer.eos_token_id])
     pred_pos = prompt_len - 1
 
     with prefill_cache.profiler.time_cpu("final_rms_norm"):
@@ -503,6 +512,7 @@ def generate(
     cpu_attn=True,
     on_token=None,
     ttft_start=None,
+    prompt_len=None,
 ):
     seq_len = len(prompt_tokens)
     max_seq = seq_len + n_tokens
@@ -526,6 +536,7 @@ def generate(
         tokenizer=tokenizer,
         cpu_attn=cpu_attn,
         quiet=streaming,
+        prompt_len=prompt_len,
     )
 
     ttft = time.perf_counter() - ttft_start
@@ -684,6 +695,7 @@ def run_once(
         cpu_attn=cpu_attn,
         on_token=on_token,
         ttft_start=ttft_start,
+        prompt_len=prompt_len_actual,  # pre-pad length (see run_npu_prefill)
     )
     return generated, prompt_len_actual
 
