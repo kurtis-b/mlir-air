@@ -2547,6 +2547,29 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
       return numOffsets;
     };
 
+    // Whether `other` is the far-side partner of `chanUser`, or nullopt when
+    // the two bundle index lists cannot be compared.
+    auto pairsByBundleIndex =
+        [](air::ChannelInterface chanUser,
+           air::ChannelInterface other) -> std::optional<bool> {
+      auto refIndices = chanUser.getIndices();
+      auto otherIndices = other.getIndices();
+      if (refIndices.empty() && otherIndices.empty())
+        return true; // Scalar channel: the symbol has one endpoint pair.
+      if (refIndices.size() != otherIndices.size())
+        return std::nullopt;
+      for (auto [refIdx, otherIdx] :
+           llvm::zip_equal(refIndices, otherIndices)) {
+        auto refConst = getConstantIntValue(refIdx);
+        auto otherConst = getConstantIntValue(otherIdx);
+        if (!refConst || !otherConst)
+          return std::nullopt;
+        if (*refConst != *otherConst)
+          return false;
+      }
+      return true;
+    };
+
     bool splitIsExpressible = true;
     std::string declineReason;
     auto decline = [&declineReason, &splitIsExpressible]() {
@@ -2630,6 +2653,20 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
 
       for (auto otherChanOp :
            air::getTheOtherChannelOpThroughSymbol(chanUser)) {
+        // Pairing decides which far-side ops this split rewrites. Guessing it
+        // either way is unsafe -- keeping a stranger duplicates the transfer,
+        // dropping a partner leaves it untiled against a tiled channel -- so an
+        // undecidable pairing declines the whole split.
+        auto pairs = pairsByBundleIndex(chanUser, otherChanOp);
+        if (!pairs) {
+          decline() << "@" << otherChanOp.getChanName()
+                    << "'s bundle indices cannot be compared with this op's, "
+                       "so whether it is this buffer's far side is undecidable";
+          break;
+        }
+        if (!*pairs)
+          continue; // Belongs to a different buffer on the same symbol.
+
         auto farVolume = accessVolumeOf(otherChanOp);
         if (!farVolume) {
           decline() << "the number of bits one execution of @"
@@ -3060,6 +3097,63 @@ void AIRSplitL2MemrefForBufferConstraintPass::runOnOperation() {
       // Now that one side of those channels are tiled, perform tiling on the
       // other side, too. Process ALL channel ops on the other side.
       auto theOtherChanOps = air::getTheOtherChannelOpThroughSymbol(chanUserOp);
+
+      // ...but only the ones that actually pair with THIS op.
+      //
+      // `getTheOtherChannelOpThroughSymbol` resolves the channel SYMBOL and is
+      // blind to the bundle index, so on a per-column staging pattern -- N L2
+      // buffers, buffer c fed by @chan[c] -- it hands back all N far-side ops
+      // for every one of the N buffers. Two things then go wrong, and both
+      // reach the ELF:
+      //  * each far-side op is re-tiled once per L2 buffer, so N-1 of every N
+      //    tiled copies feed a channel index no get consumes;
+      //  * the copies of an earlier round are still in the IR (they are only
+      //    queued in `erased` and removed at the end of the pass), so round k
+      //    re-tiles round k-1's output and the count doubles per round -- four
+      //    columns produced 8 + 16 + 32 + 64 = 120 launch-level puts against 8
+      //    gets, which compiles and then hangs the device with
+      //    ERT_CMD_STATE_TIMEOUT.
+      // Keep an op only when its bundle indices match `chanUserOp`'s.
+      // Undecidable pairing does not reach here: `getTargetMemrefAllocs`
+      // declines the alloc rather than guess, because guessing is unsafe in
+      // both directions -- keeping a stranger duplicates the transfer, dropping
+      // a partner leaves it untiled against a tiled channel. Mirror that rule
+      // here so the two cannot drift, and refuse outright if it ever does.
+      bool pairingIsDecidable = true;
+      auto pairsWithChanUser = [&](air::ChannelInterface other) {
+        if (erased.contains(other.getOperation()))
+          return false;
+        auto refIndices = chanUserOp.getIndices();
+        auto otherIndices = other.getIndices();
+        if (refIndices.empty() && otherIndices.empty())
+          return true;
+        if (refIndices.size() != otherIndices.size()) {
+          pairingIsDecidable = false;
+          return false;
+        }
+        for (auto [refIdx, otherIdx] :
+             llvm::zip_equal(refIndices, otherIndices)) {
+          auto refConst = getConstantIntValue(refIdx);
+          auto otherConst = getConstantIntValue(otherIdx);
+          if (!refConst || !otherConst) {
+            pairingIsDecidable = false;
+            return false;
+          }
+          if (*refConst != *otherConst)
+            return false;
+        }
+        return true;
+      };
+      llvm::erase_if(theOtherChanOps, [&](air::ChannelInterface other) {
+        return !pairsWithChanUser(other);
+      });
+      if (!pairingIsDecidable) {
+        chanUserOp->emitOpError(
+            "far-side channel ops cannot be paired to this one by bundle "
+            "index; the split plan should have declined this buffer");
+        signalPassFailure();
+        return;
+      }
 
       // Process each channel op on the other side
       for (auto &theOtherChanOp : theOtherChanOps) {
