@@ -182,3 +182,8 @@ if __name__ == "__main__":
             cpu_attn=args.cpu_attn,
         )
         _print_one_shot_output(session, args.prompt, generated)
+        if args.profile:
+            print("\n=== Prefill profile ===")
+            session.prefill_cache.profiler.report()
+            print("\n=== Decode profile ===")
+            session.decode_cache.profiler.report()
