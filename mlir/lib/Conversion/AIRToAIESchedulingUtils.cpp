@@ -178,18 +178,22 @@ bool air::areIdenticalVectors(std::vector<unsigned> &a,
   return a == b;
 }
 
-int64_t air::get1DOffset(ArrayRef<OpFoldResult> memcpy_offsets,
-                         ArrayRef<OpFoldResult> memcpy_strides) {
+std::optional<int64_t> air::get1DOffset(ArrayRef<OpFoldResult> memcpy_offsets,
+                                        ArrayRef<OpFoldResult> memcpy_strides) {
   if (memcpy_offsets.empty())
     return 0;
 
   int64_t one_d_offset = 0;
   for (int i = memcpy_offsets.size() - 1; i >= 0; i--) {
     auto offset = mlir::getConstantIntValue(memcpy_offsets[i]);
+    if (!offset)
+      return std::nullopt;
     if ((unsigned)i == memcpy_offsets.size() - 1)
       one_d_offset += *offset;
     else {
       auto stride_i = mlir::getConstantIntValue(memcpy_strides[i]);
+      if (!stride_i)
+        return std::nullopt;
       one_d_offset += (*offset) * (*stride_i);
     }
   }
@@ -450,7 +454,7 @@ air::getRepeatCounts(std::vector<Operation *> memcpy_ops) {
   return repeatCounts;
 }
 
-std::vector<AIE::BDDimLayoutAttr>
+std::optional<std::vector<AIE::BDDimLayoutAttr>>
 air::getWrapsAndStrides(ArrayRef<OpFoldResult> memcpy_sizes,
                         ArrayRef<OpFoldResult> memcpy_strides,
                         MLIRContext *ctx) {
@@ -461,6 +465,8 @@ air::getWrapsAndStrides(ArrayRef<OpFoldResult> memcpy_sizes,
        llvm::zip_equal(memcpy_sizes, memcpy_strides)) {
     auto stepsize = mlir::getConstantIntValue(stepsizeVal);
     auto wrap = mlir::getConstantIntValue(wrapVal);
+    if (!wrap || !stepsize)
+      return std::nullopt;
     auto tuple = AIE::BDDimLayoutAttr::get(ctx, *wrap, *stepsize);
     output.push_back(tuple);
   }

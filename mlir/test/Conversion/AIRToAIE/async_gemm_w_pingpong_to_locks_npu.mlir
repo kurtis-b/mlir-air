@@ -5,7 +5,13 @@
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: air-opt -air-fuse-channels="aggressive-mode=L1,L2,L3" -air-to-aie="row-offset=2 col-offset=0 device=npu1" -canonicalize -cse %s | FileCheck %s
+// -air-opt-memtile-dma-bds is REQUIRED here and must not be dropped as noise.
+// Same segment code as async_gemm_w_pingpong_to_locks_aie2.mlir, targeting npu1;
+// see that file and async_gemm_to_locks_aie2.mlir for the reasoning. The feed
+// loops carry the k-loop induction variable into an L2 BD offset, which is
+// static, so the walk must be folded into BD wrap/stride dims first. air-to-aie
+// now refuses the unfolded form rather than silently substituting 0 (phase H10).
+// RUN: air-opt -air-fuse-channels="aggressive-mode=L1,L2,L3" -air-opt-memtile-dma-bds="device=npu1" -air-to-aie="row-offset=2 col-offset=0 device=npu1" -canonicalize -cse %s | FileCheck %s
 
 // CHECK-LABEL:   aie.device(npu1) @segment_0 {
 // One shim LTO per memtile LTO (Path B buckets shim allocations by the
