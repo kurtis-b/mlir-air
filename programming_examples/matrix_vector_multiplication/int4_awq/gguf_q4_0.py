@@ -312,7 +312,7 @@ def repack_q4_0_linear(raw, K, M):
 # rms error over rms weight:
 #
 #     the pure-q4_0 ffn_down tensors (the error llama.cpp ACCEPTED)
-#                                              0.0828 .. 0.0853
+#                                              0.0828 .. 0.0967
 #     the three as q4_1 (why they were promoted) 0.0720 .. 0.0729
 #     (c) transcoded q4_1 -> q4_0                0.1109 .. 0.1124   OUT of family
 #     (d) quantised from the bf16 source         0.0869 .. 0.0884   in family
@@ -375,9 +375,15 @@ def quantize_q4_0(w):
     idx = np.argmax(np.abs(w), axis=1)
     amax_signed = w[np.arange(n_blocks), idx]
     d = (amax_signed / -8.0).astype(np.float32)
-    d16 = d.astype(np.float16)  # stored as fp16, so quantise against that
-    dq = d16.astype(np.float32)
-    inv = np.where(dq != 0, 1.0 / np.where(dq != 0, dq, 1.0), 0.0)
+    # The reciprocal comes from the fp32 scale, as in `quantize_row_q4_0_ref`
+    # (`id = 1/d`); only the STORED scale is rounded to fp16. Deriving the
+    # reciprocal from the rounded scale moves elements near a nibble threshold
+    # to the other nibble -- different bytes from llama.cpp's for the same
+    # weights (self-test leg (n) pins this).
+    inv = np.where(d != 0, np.float32(1.0) / np.where(d != 0, d, 1.0), 0.0).astype(
+        np.float32
+    )
+    d16 = d.astype(np.float16)
 
     q = np.floor(w * inv[:, None] + 8.5)
     q = np.clip(q, 0, 15).astype(np.uint8)
@@ -753,19 +759,18 @@ def self_test(K=256, M=64, seed=42, verbose=True):
     #     here is unconstrained noise and is quantised to q4_1 by llama.cpp's
     #     own rule (`d = (max-min)/15`, `m = min`).
     src = rng.standard_normal((n_blk, QK4_0)).astype(np.float32) * 0.05
-    lo = src.min(axis=1)
-    hi = src.max(axis=1)
-    d_f = ((hi - lo) / 15.0).astype(np.float16)
-    m_f = lo.astype(np.float16)
-    dq_ = d_f.astype(np.float32)
+    # llama.cpp's `quantize_row_q4_1_ref`: fp32 min/scale, index =
+    # trunc((x - min) * (1/d) + 0.5) clamped to 15, and only the stored d/m
+    # rounded to fp16 afterwards.
+    lo = src.min(axis=1).astype(np.float32)
+    hi = src.max(axis=1).astype(np.float32)
+    d32 = ((hi - lo) / np.float32(15.0)).astype(np.float32)
+    id32 = np.where(d32 != 0, np.float32(1.0) / np.where(d32 != 0, d32, 1.0), 0.0)
     q_f = np.clip(
-        np.round(
-            (src - m_f.astype(np.float32)[:, None])
-            / np.where(dq_ != 0, dq_, 1.0)[:, None]
-        ),
-        0,
-        15,
+        np.floor((src - lo[:, None]) * id32[:, None].astype(np.float32) + 0.5), 0, 15
     ).astype(np.uint8)
+    d_f = d32.astype(np.float16)
+    m_f = lo.astype(np.float16)
     blk2 = np.zeros((n_blk, 20), dtype=np.uint8)
     blk2[:, 0:2] = d_f.view(np.uint8).reshape(n_blk, 2)
     blk2[:, 2:4] = m_f.view(np.uint8).reshape(n_blk, 2)
@@ -820,6 +825,64 @@ def self_test(K=256, M=64, seed=42, verbose=True):
         raise AssertionError("promoted tensor with a reference did not quantise")
     if verbose:
         print("  [m] promoted tensor without reference: correctly REFUSED")
+
+    # (n) quantize_q4_0 reproduces llama.cpp's bytes. A scalar transcription of
+    #     `quantize_row_q4_0_ref` (fp32 reciprocal, C truncation of x0 + 8.5,
+    #     fp16 only for the stored scale) is compared byte for byte on random
+    #     blocks plus blocks crafted so that a threshold falls between the fp32
+    #     and the fp16-rounded reciprocal; the control shows that the rounded
+    #     reciprocal gives different bytes on some of them.
+    def _ref_q4_0_bytes(x):
+        x = np.asarray(x, dtype=np.float32)
+        amax, mx = np.float32(0.0), np.float32(0.0)
+        for v in x:
+            if abs(v) > amax:
+                amax, mx = abs(v), v
+        d = np.float32(mx / np.float32(-8.0))
+        inv = np.float32(1.0) / d if d != 0 else np.float32(0.0)
+        qs = bytearray(16)
+        for j in range(16):
+            x0 = np.float32(x[j] * inv + np.float32(8.5))
+            x1 = np.float32(x[16 + j] * inv + np.float32(8.5))
+            qs[j] = min(15, int(x0)) | (min(15, int(x1)) << 4)
+        return np.frombuffer(np.float16(d).tobytes() + bytes(qs), dtype=np.uint8)
+
+    blocks = rng.standard_normal((2048, QK4_0)).astype(np.float32) * 0.05
+    # crafted: elements sitting just below a nibble threshold under the fp32
+    # scale, where the fp16-rounded scale can push them over
+    craft = np.zeros((256, QK4_0), dtype=np.float32)
+    craft[:, 0] = -0.0731 * (1 + np.arange(256) / 4096.0)  # an amax not fp16-exact
+    craft[:, 1:] = (craft[:, :1] / -8.0) * (np.arange(1, QK4_0) - 8.0 - 0.5 + 1e-3)
+    blocks = np.concatenate([blocks, craft])
+    got = quantize_q4_0(blocks).reshape(-1, 18)
+    ref = np.stack([_ref_q4_0_bytes(b) for b in blocks])
+    if not np.array_equal(got, ref):
+        bad = int((got != ref).any(axis=1).sum())
+        raise AssertionError(
+            "quantize_q4_0 differs from quantize_row_q4_0_ref on %d of %d blocks"
+            % (bad, len(blocks))
+        )
+    # control: the fp16-reciprocal rule must differ somewhere, or this leg is vacuous
+    d16 = (
+        quantize_q4_0(blocks)
+        .reshape(-1, 18)[:, 0:2]
+        .copy()
+        .view(np.float16)
+        .reshape(-1)
+    )
+    inv16 = np.where(d16 != 0, 1.0 / d16.astype(np.float32), 0.0)
+    q16 = np.clip(np.floor(blocks * inv16[:, None] + 8.5), 0, 15).astype(np.uint8)
+    alt = q16[:, 0:16] | (q16[:, 16:32] << 4)
+    n_diff = int((alt != ref[:, 2:18]).any(axis=1).sum())
+    if n_diff == 0:
+        raise AssertionError(
+            "leg (n) is vacuous: the fp16-reciprocal rule agreed everywhere"
+        )
+    if verbose:
+        print(
+            "  [n] quantize_q4_0 == quantize_row_q4_0_ref bytes: PASS (%d blocks; "
+            "the fp16-reciprocal rule differs on %d)" % (len(blocks), n_diff)
+        )
 
 
 def _main():
