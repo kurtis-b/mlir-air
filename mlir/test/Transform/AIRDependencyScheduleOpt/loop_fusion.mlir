@@ -176,7 +176,7 @@ func.func @func1() {
 // CHECK-DAG: %[[CST4:.*]] = arith.constant 4 : index
 // CHECK-DAG: %[[CST16:.*]] = arith.constant 16 : index
 // CHECK-DAG: %[[CST0:.*]] = arith.constant 0 : index
-// CHECK: air.channel.put async [{{.*}}]  @channel_12[%{{.*}}, %{{.*}}] (%{{.*}}[%[[CST0]], %[[CST0]], 0, 0, %[[CST0]], %[[CST0]]] [%[[CST1]], %[[CST1]], %[[CST16]], %[[CST4]], %[[CST16]], %[[CST4]]] [8192, 8192, 16, 4, 256, 1]) {{.*}} : (memref<1x1x16x16x4x4xbf16, 2 : i32>)
+// CHECK: air.channel.put async [{{.*}}]  @channel_12[%{{.*}}, %{{.*}}] (%{{.*}}[%[[CST0]], %[[CST0]], 0, 0, %[[CST0]], %[[CST0]]] [%[[CST1]], %[[CST1]], %[[CST16]], %[[CST4]], %[[CST16]], %[[CST4]]] [4096, 4096, 16, 4, 256, 1]) {{.*}} : (memref<1x1x16x16x4x4xbf16, 2 : i32>)
 // CHECK: memref.dealloc %{{.*}} : memref<1x1x16x16x4x4xbf16, 2 : i32>
 
 #map = affine_map<()[s0] -> (s0 * 128)>

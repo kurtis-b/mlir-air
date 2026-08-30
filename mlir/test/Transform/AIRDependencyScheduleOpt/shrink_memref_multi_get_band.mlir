@@ -202,19 +202,14 @@ module {
 
 // -----
 
-// A non-unit innermost stride with a non-zero innermost offset. An AIR offset
-// is a starting INDEX in its dimension (memref.subview convention; get1DOffset
-// leaves the innermost offset unscaled), so the last element a get reaches
-// along a dimension is offset + (size - 1) * stride + 1 -- here
-// 1 + 15 * 2 + 1 = 32 -- and the band shrinks to 2x32, the row stride the pass
-// rewrites the get to. Scaling the offset by the stride as well (2 * (1 + 16))
-// measured 34: an allocation whose rows are 34 wide while the DMA fills them
-// 32 wide, a silent miscompile for any later reader of row 1.
+// Non-unit innermost stride, non-zero innermost offset: extent = offset + size
+// * stride (the footprint the core reads) = 33; the get's row stride follows the
+// shrunk shape. Scaling the offset by the stride too gave 34 rows on a 32 stride.
 
 // CHECK-LABEL: @strided_offset_extent_is_not_offset_times_stride
-// CHECK: memref.alloc() {{.*}} : memref<2x32xbf16, 2 : i32>
+// CHECK: memref.alloc() {{.*}} : memref<2x33xbf16, 2 : i32>
 // CHECK-NOT: memref<2x34xbf16, 2 : i32>
-// CHECK: air.channel.get {{.*}} (%{{.*}}[%c0, %c1{{.*}}] [%c2, %c16] [32, 2]) {id = 1 : i32} : (memref<2x32xbf16, 2 : i32>)
+// CHECK: air.channel.get {{.*}} (%{{.*}}[%c0, %c1{{.*}}] [%c2, %c16] [33, 2]) {id = 1 : i32} : (memref<2x33xbf16, 2 : i32>)
 module {
   air.channel @rows [1, 1]
   func.func @strided_offset_extent_is_not_offset_times_stride() {

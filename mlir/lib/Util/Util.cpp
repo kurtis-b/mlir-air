@@ -2223,17 +2223,11 @@ getShrinkageOffsetUpperBound(Value offset, bool sweepFoldedIntoSizes,
   return 0;
 }
 
-// Get the memref extent along each dimension that the access pattern actually
-// REACHES -- offset + size, not size alone.
-//
-// getEffectiveMemrefSizeFromAccessPattern above answers a different question
-// ("how much data does one transfer move"), and one caller genuinely wants
-// that. Shrinking an allocation needs this one instead: a buffer sized to the
-// largest single transfer is too small the moment two transfers land at
-// different offsets in it.
-//
-// Sets `bounded` to false if any offset entry could not be bounded; the shape
-// returned is then meaningless and the caller must not shrink.
+// The memref extent each dimension is actually REACHED to: offset + span, not
+// span alone (getEffectiveMemrefSizeFromAccessPattern answers "how much does
+// one transfer move"; a buffer sized to that is too small once two transfers
+// land at different offsets). Sets `bounded` false if an offset could not be
+// bounded; the caller must then not shrink.
 SmallVector<int64_t> air::getEffectiveMemrefExtentFromAccessPattern(
     SmallVector<int> memref_shape, SmallVector<Value> offsets,
     SmallVector<Value> sizes, SmallVector<Value> strides,
@@ -2263,23 +2257,16 @@ SmallVector<int64_t> air::getEffectiveMemrefExtentFromAccessPattern(
       current_memref_volume *= memref_shape[j];
       if (llvm::divideFloorSigned(*constStride, current_memref_volume))
         continue;
-      // Entry i lives in dimension j. Its stride expressed in dim-j units is
-      // stride / naturalStride(j). The offset is a starting INDEX along j
-      // (memref.subview convention; get1DOffset leaves the innermost offset
-      // unscaled), so the last element reached along j is
-      //   offset + (size - 1) * strideUnits,
-      // and the extent is one past it. Scaling the offset by the stride as
-      // well over-measured: offsets [0,1] sizes [2,16] strides [64,2] on a
-      // 2x64 buffer gave 34 columns while the DMA fills 32.
+      // Entry i lives in dimension j; its step there is
+      // stride/naturalStride(j). The offset is a starting INDEX (unscaled, as
+      // get1DOffset treats it) and the access spans size * step from it: the
+      // FOOTPRINT, trailing gap included -- consuming kernels read all of it
+      // (sizing to the last element reached broke Qwen3-0.6B decode on NPU2).
       int64_t strideUnits = llvm::divideFloorSigned(
           *constStride, current_memref_volume / memref_shape[j]);
-      int64_t bound = *maxOffset + (*constSize - 1) * strideUnits + 1;
+      int64_t bound = *maxOffset + *constSize * strideUnits;
       access_bounds[j] = std::max(access_bounds[j], bound);
-      // An entry lives in exactly one dimension. Without this, the innermost
-      // entry was also folded into every outer dimension with strideUnits
-      // rounded to 0 -- invisible while the extent was scaled by the stride,
-      // a phantom `offset + 1` rows once it was not.
-      break;
+      break; // an entry lives in exactly one dimension
     }
   }
   return access_bounds;
@@ -2633,30 +2620,35 @@ SmallVector<int64_t> air::getDataAccessShapeFromMemcpyOp(
                                         sweepFoldedIntoSizes, bounded);
 }
 
-// Update strides after memref shrinkage. Assuming there is only one dimension
-// being shrunk.
+// Update strides after memref shrinkage: each entry's step in its dimension
+// times the SHRUNK shape's natural stride; beyond the buffer, by volume.
 SmallVector<int>
 air::getUpdatedStridesAfterShrinkage(SmallVector<int> old_memref_shape,
                                      SmallVector<int64_t> new_memref_shape,
                                      SmallVector<Value> strides) {
   SmallVector<int> new_strides(strides.size(), -1);
-  int shrinkage_volume = 1;
-  int shrinkage_factor = 1;
-  for (int j = old_memref_shape.size() - 1; j >= 0; j--) {
-    shrinkage_volume *= old_memref_shape[j];
-    if (old_memref_shape[j] != new_memref_shape[j]) {
-      shrinkage_factor =
-          llvm::divideCeilSigned(old_memref_shape[j], new_memref_shape[j]);
-      break;
-    }
+  int64_t old_volume = 1, new_volume = 1;
+  for (size_t j = 0; j < old_memref_shape.size(); j++) {
+    old_volume *= old_memref_shape[j];
+    new_volume *= new_memref_shape[j];
   }
   for (int i = strides.size() - 1; i >= 0; i--) {
-    if (llvm::divideFloorSigned(*getConstantIntValue(strides[i]),
-                                shrinkage_volume))
-      new_strides[i] = llvm::divideCeilSigned(*getConstantIntValue(strides[i]),
-                                              shrinkage_factor);
-    else
-      new_strides[i] = *getConstantIntValue(strides[i]);
+    int64_t s = *getConstantIntValue(strides[i]);
+    int64_t old_natural = 1, new_natural = 1;
+    bool placed = false;
+    for (int j = old_memref_shape.size() - 1; j >= 0; j--) {
+      int64_t old_cumulative = old_natural * old_memref_shape[j];
+      if (s < old_cumulative) {
+        int64_t units = llvm::divideFloorSigned(s, old_natural);
+        new_strides[i] = units * new_natural;
+        placed = true;
+        break;
+      }
+      old_natural = old_cumulative;
+      new_natural *= new_memref_shape[j];
+    }
+    if (!placed)
+      new_strides[i] = llvm::divideFloorSigned(s, old_volume) * new_volume;
   }
   return new_strides;
 }
