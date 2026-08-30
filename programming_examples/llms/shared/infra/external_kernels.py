@@ -322,25 +322,35 @@ def mv_heads_object_name(head_dim=128):
 def compile_mv_int4_bf16(m_tile=8, k_chunk=2048, gs=128):
     """Compile mv_int4_bf16.o (int4-AWQ GEMV micro-kernel) from source.
 
-    Produces `mv_int4_bf16_gemv.o` (config-tagged) and stages it as the
-    canonical `mv_int4_bf16.o` (the name link_with attributes expect).
-    The int4 GEMM prefill compiles the same .cc with DIM_M=16 to a
-    different config-tagged name (`mv_int4_bf16_matmul.o`), so the two
-    variants don't clobber each other in CWD across sessions; the
-    last-staged canonical .o is whichever variant the current compile
+    Produces the config-tagged `mv_int4_bf16_gemv_m{m_tile}_gs{gs}_k{k_chunk}.o`
+    and stages it as the canonical `mv_int4_bf16.o` (the name link_with
+    attributes expect). The int4 GEMM prefill compiles the same .cc with
+    DIM_M=16 to a different config-tagged name (`mv_int4_bf16_matmul.o`),
+    so the two variants don't clobber each other in CWD across sessions;
+    the last-staged canonical .o is whichever variant the current compile
     needs.
+
+    The tag carries EVERY define this function bakes in (as `compile_mv_heads`
+    tags head_dim): `_compile_kernel` skips an existing .o by NAME, so an
+    untagged name hands every later caller the first variant built in that
+    CWD -- a gs=32 build (GGUF q4_0) after a gs=128 one (AWQ) silently
+    reused the gs=128 kernel. The canonical copy runs on every call, so the
+    right variant is staged even when the tagged object is reused. Adding a
+    -D below without adding it to the name re-opens the same hole.
     """
     src = _PROJ_ROOT / "matrix_vector_multiplication" / "int4_awq" / "mv_int4_bf16.cc"
+    tagged = f"mv_int4_bf16_gemv_m{m_tile}_gs{gs}_k{k_chunk}.o"
     _compile_kernel(
         src,
-        "mv_int4_bf16_gemv.o",
+        tagged,
         extra_flags=[
             f"-DDIM_M={m_tile}",
             f"-DDIM_K={k_chunk}",
             f"-DDIM_GS={gs}",
         ],
     )
-    shutil.copy2("mv_int4_bf16_gemv.o", "mv_int4_bf16.o")
+    shutil.copy2(tagged, "mv_int4_bf16.o")
+    return tagged
 
 
 def compile_mv_bf16():
@@ -364,7 +374,7 @@ def compile_attn_decode_npu2(head_dim=64):
     )
 
 
-def compile_all_external_kernels(head_dim=64, quant="bf16"):
+def compile_all_external_kernels(head_dim=64, quant="bf16", int4_gs=128):
     """Compile all external C++ kernels from source.
 
     Call this before kernel compilation to ensure all .o files are fresh.
@@ -377,6 +387,8 @@ def compile_all_external_kernels(head_dim=64, quant="bf16"):
             micro-kernel (`mv_int4_bf16.o`) is also built so the int4
             decode ELFs can link it. bf16 GEMV objects are still built
             so mixed paths (e.g. bf16 prefill + int4 decode) keep working.
+        int4_gs: the checkpoint's group size baked into that micro-kernel
+            (AWQ 128, GGUF q4_0 32); only read when quant == "awq".
     """
     compile_silu_and_mul()
     compile_rope()
@@ -385,4 +397,10 @@ def compile_all_external_kernels(head_dim=64, quant="bf16"):
     compile_mv()
     compile_mv_bf16()
     if quant == "awq":
-        compile_mv_int4_bf16()
+        # `int4_gs` MUST reach this call: this sweep runs inside EVERY
+        # compile_and_cache via prepare_air_project, so a default here
+        # restages the canonical mv_int4_bf16.o at gs=128 AFTER any earlier
+        # gs=32 staging and immediately BEFORE aiecc links -- the study
+        # branch's first SmolLM2 int4 build linked the wrong group size
+        # exactly this way.
+        compile_mv_int4_bf16(gs=int4_gs)
