@@ -428,6 +428,7 @@ def run_npu_prefill(
     cpu_attn=True,
     profile=False,
     quiet=False,
+    prompt_len=None,
 ):
     """Run NPU prefill and extract KV cache for decode.
 
@@ -499,7 +500,15 @@ def run_npu_prefill(
     # Do CPU RMSNorm on just that row (<1 ms) and reuse the decode-side
     # 8-partition GEMV ELF (~14 ms NPU) instead of the full-seq GEMM ELF.
     vocab_size = weights.lm_head.shape[0]
-    prompt_len = len([t for t in token_ids if t != tokenizer.eos_token_id])
+    if prompt_len is None:
+        # Fallback for callers that do not pass it: count the non-EOS tokens
+        # of the padded array. Right only when the chat template puts no EOS
+        # inside the prompt -- wrong by one per closed message for ChatML
+        # (SmolLM2's <|im_end|> is its EOS) and for Llama-3.x instruct
+        # tokenizers whose eos_token is <|eot_id|> -- so the logits are read
+        # at the wrong row and the first "generated" token is a prompt token
+        # (study branch 4cddf4fe). Callers that know the real length pass it.
+        prompt_len = len([t for t in token_ids if t != tokenizer.eos_token_id])
     pred_pos = prompt_len - 1
 
     from llama32_1b_cpu_helpers import rms_norm
@@ -647,6 +656,7 @@ def generate(
     cpu_attn=True,
     on_token=None,
     ttft_start=None,
+    prompt_len=None,
 ):
     """Run NPU prefill + NPU decode generation.
 
@@ -689,6 +699,7 @@ def generate(
         cpu_attn=cpu_attn,
         profile=profile,
         quiet=True,
+        prompt_len=prompt_len,
     )
 
     ttft = time.perf_counter() - ttft_start
@@ -1061,6 +1072,7 @@ def run_once(
         cpu_attn=cpu_attn,
         on_token=on_token,
         ttft_start=ttft_start,
+        prompt_len=prompt_len_actual,  # pre-pad length (see run_npu_prefill)
     )
     return generated, prompt_len_actual
 
