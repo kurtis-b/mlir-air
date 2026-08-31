@@ -1,0 +1,15 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Host-only gate for the W4 decode driver seams (no device, no downloads):
+// flag -> artifact set, the narrow toolchain-gated sibling carry, the qwen
+// 1e-6 RMS eps in the int4 FFN IR, and llama default-IR neutrality under the
+// builder's new kwargs. Review of #33 (P0 eps regression gate + P2 tests).
+//
+// RUN: %PYTHON %S/test_w4_decode_driver.py | FileCheck %s
+//
+// CHECK: PASS  test_llama_default_ir_is_neutral_under_new_params
+// CHECK: PASS  test_qwen_int4_ffn_carries_the_model_eps
+// CHECK: PASS  test_selected_artifact_set_follows_the_flag
+// CHECK: PASS  test_sibling_carry_is_narrow_and_toolchain_gated
+// CHECK: w4_decode_driver tests: 4/4 passed

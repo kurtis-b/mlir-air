@@ -65,6 +65,60 @@ _RMS_QKV_KERNEL = {2: "rms_qkv_qknorm_rope_gemv2", 8: "rms_qkv_qknorm_rope_gemv"
     _RMS_QKV_LAUNCHES
 ]
 
+# `[2026-08-26]` doc 56 H2b (queue items 18, 24): the w4_decode path,
+# selected by QWEN3_W4_DECODE -- default OFF until R3c lands the three-arm
+# verify gate and flips W4_DEFAULT; QWEN3_W4_DECODE=1 selects w4 for A/B. What
+# changes: the O+FFN stage compiles/dispatches `o_gemv_ffn_int4` (the llama
+# 3-launch int4 cascade at q_dim=2048 / k_chunk=1024, SAME launch structure)
+# from the packed BOs `w4_decode_pack.quantize_decode_weights` attaches; the
+# QKV stage and the LM head stay bf16 (priced negatives -- doc 57 section 5
+# item 6). Read at import time like _RMS_QKV_LAUNCHES.
+from w4_decode_pack import (
+    W4_DEFAULT,
+    w4_decode_selected as _w4_decode_selected,
+)  # noqa: E402
+
+_W4_DECODE = _w4_decode_selected()
+_O_FFN_KERNEL = "o_gemv_ffn_int4" if _W4_DECODE else "o_gemv_ffn"
+
+
+def required_decode_artifacts():
+    """The decode ELF names the CURRENT precision selection dispatches.
+
+    ONE derivation of the set: the same module-level `_RMS_QKV_KERNEL` /
+    `_O_FFN_KERNEL` the compile and dispatch paths use, so the check below
+    can never drift from what `compile_decode_kernels` writes.
+    """
+    return (_RMS_QKV_KERNEL, _O_FFN_KERNEL, "lm_head_gemv")
+
+
+def require_decode_artifacts(cache):
+    """`[2026-08-26]` queue item 24 (the w4_decode default flip): refuse a
+    decode cache that does not hold the selected precision's ELFs, with the
+    fix named.
+
+    Why here rather than at the dispatch: `load_and_run` indexes
+    `cache.artifacts[name]`, so a cache compiled BEFORE the flip (it has
+    `o_gemv_ffn`, not `o_gemv_ffn_int4`) surfaces as a bare `KeyError` deep
+    inside the first decode step -- after the weights loaded, after a prefill
+    ran, and with nothing in the message about precision. A stale cache is the
+    single most likely consequence of flipping a default, so it gets a
+    sentence instead of a traceback.
+    """
+    missing = [n for n in required_decode_artifacts() if n not in cache.artifacts]
+    if not missing:
+        return
+    sel = "w4_decode" if _W4_DECODE else "bf16"
+    other = "QWEN3_W4_DECODE=0" if _W4_DECODE else "QWEN3_W4_DECODE=1"
+    raise RuntimeError(
+        f"decode cache {str(cache.cache_dir)!r} does not contain {missing} -- it was "
+        f"not compiled for the selected precision ({sel}: QWEN3_W4_DECODE is "
+        f"{'1' if _W4_DECODE else '0'} here; unset default "
+        f"{'1' if W4_DEFAULT else '0'}). It holds {sorted(cache.artifacts)}. Recompile "
+        f"(`make compile` with the same flag), or select the other precision "
+        f"with {other}."
+    )
+
 
 def build_rms_qkv_qknorm_rope_gemv_module(config, n_launches=None):
     """Fused decode ELF: RMSNorm + Q/K/V GEMV + per-head QK-norm + RoPE (M=1).
@@ -301,6 +355,37 @@ def build_o_gemv_ffn_qwen_module(emb_dim, q_dim, hidden_dim):
     return module
 
 
+def build_o_gemv_ffn_int4_qwen_module(emb_dim, q_dim, hidden_dim):
+    """w4_decode O+FFN: the llama 3-launch int4 cascade (matvec_int4_packed_add
+    / swiglu_rms / packed_add over one `mv_int4_bf16.o`), decoupled exactly as
+    `build_o_gemv_ffn_qwen_module` decouples the bf16 cascade (O GEMV M=emb,
+    K=q_dim) and at k_chunk=emb_dim (stage 2 requires K == K_CHUNK; O and
+    down split into 2 / 3 chunks). Same 15-arg ABI, arg1 is q_dim wide,
+    arg0/7/12 are packed-uint8 BOs. Thin delegate -- the llama builder is the
+    one owner (doc 56 H2b: REUSE the existing int4 builders)."""
+    from llama32_1b_int4.multi_launch_builder.o_gemv_ffn_int4_multi import (
+        build_o_gemv_ffn_int4_module,
+    )
+    from w4_decode_pack import GROUP_SIZE, M_TILE, K_CHUNK, N_CORES
+
+    assert K_CHUNK == emb_dim, (K_CHUNK, emb_dim)
+    return build_o_gemv_ffn_int4_module(
+        emb_dim=emb_dim,
+        hidden_dim=hidden_dim,
+        gs=GROUP_SIZE,
+        m_tile=M_TILE,
+        k_chunk=K_CHUNK,
+        n_cores=N_CORES,
+        q_dim=q_dim,
+        # Qwen3's RMS eps is 1e-6 (the model contract; matches qknorm_eps at
+        # build_rms_qkv and inference EPS). Llama callers keep the builder
+        # default 1e-5. NOTE: the bf16 sibling stage 2 (matvec_swiglu_rms)
+        # still hard-codes 1e-5 on main -- pre-existing, logged as a
+        # follow-up, outside this PR's diff.
+        eps=1e-6,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Builder 2: LM-head GEMV (19 partitions, n_part=8192 for vocab 151936).
 # ---------------------------------------------------------------------------
@@ -325,6 +410,8 @@ def build_lm_head_gemv_qwen_module(emb_dim):
 
 
 def _o_gemv_ffn_backend(verbose=False):
+    if _W4_DECODE:
+        return _o_gemv_ffn_int4_backend(verbose)
     return {
         "verbose": verbose,
         "omit_while_true_loop": False,
@@ -332,6 +419,15 @@ def _o_gemv_ffn_backend(verbose=False):
         "instance_name": "o_gemv_ffn",
         "use_lock_race_condition_fix": False,
     }
+
+
+def _o_gemv_ffn_int4_backend(verbose=False):
+    """The llama int4 cascade's preset (ping-pong on; the llama study measured
+    a large e2e decode regression without it -- artifact not ported, so no
+    number is claimed here; the preset is owned by shared.infra)."""
+    from shared.infra.backend_presets import OGF_INT4_BACKEND
+
+    return {"verbose": verbose, **OGF_INT4_BACKEND}
 
 
 def _lm_gemv_backend(verbose=False):
@@ -348,6 +444,66 @@ def _lm_gemv_backend(verbose=False):
 # ---------------------------------------------------------------------------
 
 
+def _sibling_o_ffn_entry(cache):
+    """`[2026-08-26]` queue item 24: the manifest entry for the OTHER
+    precision's O+FFN ELF, if this cache already holds one.
+
+    `QWEN3_W4_DECODE` is documented as an A/B knob, and `o_gemv_ffn` /
+    `o_gemv_ffn_int4` is the ONE artifact that differs between the two
+    precisions. `_save_manifest` writes exactly what the current compile
+    produced, so without this a `make compile` at the default would erase the
+    bf16 entry (the ELF stays on disk; the manifest stops naming it) and every
+    bf16 consumer -- `QWEN3_W4_DECODE=0 make run`, a bf16 A/B rung on
+    `build_peano` -- would refuse until someone recompiled.
+
+    Deliberately NARROW: exactly this one name is carried across, never the
+    whole previous manifest. Resurrecting every stale entry is the hazard this
+    avoids while still letting one build tree serve both precisions.
+    """
+    import json as _json
+
+    name = "o_gemv_ffn" if _W4_DECODE else "o_gemv_ffn_int4"
+    man = Path(cache.cache_dir) / cache.MANIFEST_FILE
+    if not man.is_file():
+        return None
+    try:
+        data = _json.loads(man.read_text())
+    except (ValueError, OSError):
+        return None
+    # Review of #33, P1: never carry across a toolchain change. The normal
+    # cache path treats a different or missing `_toolchain` stamp as cold
+    # (KernelCache.load_manifest); the carry must not be a side door that
+    # re-stamps a stale ELF as current after `_save_manifest`.
+    if data.get("_toolchain") != cache._toolchain_id():
+        return None
+    info = data.get("entries", {}).get(name)
+    if not info or not info.get("output_binary"):
+        return None
+    for cand in (
+        Path(info["output_binary"]),
+        Path(cache.cache_dir) / Path(info["output_binary"]).name,
+    ):
+        if cand.is_file():
+            return name, dict(info, output_binary=str(cand))
+    return None
+
+
+def _restore_sibling_o_ffn(cache, carried):
+    """Put the entry `_sibling_o_ffn_entry` found back, after the compile."""
+    if not carried:
+        return
+    from air.backend.xrt import XRTCompileArtifact
+
+    name, info = carried
+    cache.artifacts[name] = XRTCompileArtifact(
+        info["output_binary"], info["kernel"], info.get("insts")
+    )
+    print(
+        f"  carried over the other precision's O+FFN ELF: {name} "
+        f"({info['output_binary']}) -- this cache serves both precisions"
+    )
+
+
 def compile_decode_kernels(cache, config, verbose=False):
     """Compile the Qwen3 decode kernels."""
     from shared.infra.external_kernels import (
@@ -362,7 +518,13 @@ def compile_decode_kernels(cache, config, verbose=False):
     hidden_dim = config.hidden_dim
     q_dim = config.n_heads * config.head_dim
 
-    print(f"\n{'='*60}\nCompiling Qwen3 decode kernels...\n{'='*60}\n")
+    # read BEFORE anything is written; restored after (queue item 24)
+    carried = _sibling_o_ffn_entry(cache)
+
+    print(
+        f"\n{'='*60}\nCompiling Qwen3 decode kernels "
+        f"({'w4_decode int4' if _W4_DECODE else 'bf16'} O+FFN)...\n{'='*60}\n"
+    )
 
     # External .o kernels: GEMV (mv.o), head-aligned GEMV + epilogue
     # (mv_heads_hd{head_dim}.o), 2tile-add/swiglu (mv_bf16.o), RoPE.
@@ -382,12 +544,29 @@ def compile_decode_kernels(cache, config, verbose=False):
         _rms_qkv_qknorm_rope_gemv_backend(verbose),
     )
 
-    print("\n--- o_gemv_ffn (O GEMV decoupled + Residual + FFN) ---")
-    cache.compile_and_cache(
-        "o_gemv_ffn",
-        build_o_gemv_ffn_qwen_module(emb_dim, q_dim, hidden_dim),
-        _o_gemv_ffn_backend(verbose),
-    )
+    if _W4_DECODE:
+        from w4_decode_pack import GROUP_SIZE, K_CHUNK
+
+        print("\n--- o_gemv_ffn_int4 (w4_decode: int4 O GEMV decoupled + FFN) ---")
+        cache.compile_and_cache(
+            "o_gemv_ffn_int4",
+            build_o_gemv_ffn_int4_qwen_module(emb_dim, q_dim, hidden_dim),
+            # int4_gs / int4_k_chunk ride the backend kwargs so the per-compile
+            # kernel sweep stages THIS model's mv_int4_bf16.o (DIM_K=1024), not
+            # llama's 2048 default (cache.compile_and_cache pops them).
+            {
+                **_o_gemv_ffn_int4_backend(verbose),
+                "int4_gs": GROUP_SIZE,
+                "int4_k_chunk": K_CHUNK,
+            },
+        )
+    else:
+        print("\n--- o_gemv_ffn (O GEMV decoupled + Residual + FFN) ---")
+        cache.compile_and_cache(
+            "o_gemv_ffn",
+            build_o_gemv_ffn_qwen_module(emb_dim, q_dim, hidden_dim),
+            _o_gemv_ffn_backend(verbose),
+        )
 
     print("\n--- lm_head_gemv (19-partition, vocab 151936) ---")
     cache.compile_and_cache(
@@ -396,6 +575,7 @@ def compile_decode_kernels(cache, config, verbose=False):
         _lm_gemv_backend(verbose),
     )
 
+    _restore_sibling_o_ffn(cache, carried)
     cache._save_manifest()
     print(f"\nAll {len(cache.artifacts)} decode kernels compiled.")
 
@@ -495,14 +675,71 @@ def run_decode_block(
     )
 
 
+# Cache of dead-ABI placeholders for the w4 path (the llama int4 pattern:
+# reallocating the hidden x emb buffer per call is pure host glue).
+_DEAD_PLACEHOLDERS = {}
+
+
+def _dead_buf(shape):
+    key = shape if isinstance(shape, tuple) else (shape,)
+    buf = _DEAD_PLACEHOLDERS.get(key)
+    if buf is None:
+        buf = np.zeros(shape, dtype=bfloat16)
+        _DEAD_PLACEHOLDERS[key] = buf
+    return buf
+
+
+def _run_o_gemv_ffn_int4(
+    attn_out, x_bf16, layer_weights, config, cache, layer_idx, verbose=False
+):
+    """w4_decode Stage E: int4 O-proj(decoupled) + Residual + RMSNorm + SwiGLU.
+
+    Same 15-arg ABI and BO indices as the bf16 cascade; slots 0/7/12 hold the
+    packed-uint8 BOs `w4_decode_pack.quantize_decode_weights` attached."""
+    emb_dim = config.emb_dim
+    hidden_dim = config.hidden_dim
+    z_emb = _dead_buf(emb_dim)
+    z_hidden = _dead_buf(hidden_dim)
+    z_hidden_emb = _dead_buf((hidden_dim, emb_dim))
+    results = cache.load_and_run(
+        "o_gemv_ffn_int4",
+        _o_gemv_ffn_int4_backend(verbose),
+        layer_weights._wo_packed,  # arg0 wo (static, packed-i8, decoupled K=q_dim)
+        attn_out,  # arg1 attn_out (q_dim)
+        z_emb,  # arg2 (dead)
+        x_bf16.flatten().astype(bfloat16),  # arg3 x_residual
+        z_emb,  # arg4 (dead)
+        z_emb,  # arg5 (dead)
+        layer_weights._packed_rms_buf,  # arg6 packed RMS input (static)
+        layer_weights._wgateup_packed,  # arg7 gate/up (static, packed-i8)
+        z_hidden,  # arg8 (dead)
+        z_hidden_emb,  # arg9 (dead)
+        z_hidden,  # arg10 (dead)
+        z_hidden,  # arg11 swiglu
+        layer_weights._wdown_packed,  # arg12 wdown (static, packed-i8)
+        z_emb,  # arg13 (dead)
+        z_emb,  # arg14 output
+        output_indices=[14],
+        static_input_indices={0, 6, 7, 12},
+        intermediate_indices={2, 4, 5, 8, 9, 10, 11, 13, 14},
+        bo_key=f"o_gemv_ffn_int4_L{layer_idx}" if layer_idx is not None else None,
+    )
+    return results[14].astype(bfloat16)
+
+
 def _run_o_gemv_ffn(
     attn_out, x_bf16, layer_weights, config, cache, layer_idx, verbose=False
 ):
     """Decode Stage E: O-proj(decoupled) + Residual + RMSNorm + SwiGLU FFN.
 
     Shared by the fused and legacy decode paths so the o_gemv_ffn arg layout +
-    BO indices have a single owner.
+    BO indices have a single owner. Dispatches the w4_decode int4 cascade when
+    QWEN3_W4_DECODE selected it (same launch structure, packed weights).
     """
+    if _W4_DECODE:
+        return _run_o_gemv_ffn_int4(
+            attn_out, x_bf16, layer_weights, config, cache, layer_idx, verbose
+        )
     emb_dim = config.emb_dim
     hidden_dim = config.hidden_dim
     z_emb = np.zeros(emb_dim, dtype=bfloat16)

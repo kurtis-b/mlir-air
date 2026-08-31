@@ -45,6 +45,9 @@ from qwen3_0_6b_decode import (
     _lm_gemv_backend,
     _LM_N_PARTITIONS,
     _LM_N_PART,
+    _W4_DECODE,
+    require_decode_artifacts,
+    _run_o_gemv_ffn_int4,
 )
 
 EPS = 1e-6
@@ -94,6 +97,11 @@ def prepare_runtime(
 ):
     """One-time runtime init: transpose decode GEMV weights, tag layer idx,
     pre-load prefill + decode + LM-head BOs."""
+    # `[2026-08-26]` queue item 24: the ONE place the production driver and
+    # the verify adapter both pass through -- so the "this cache was built
+    # for the other precision" refusal is stated once, before any weight
+    # transposition or device work.
+    require_decode_artifacts(decode_cache)
     print(f"\n{'='*60}")
     print("Preparing runtime (one-time init, outside profiling scope)...")
     print(f"{'='*60}")
@@ -122,18 +130,24 @@ def prepare_runtime(
                 lw.wv.astype(bfloat16).reshape(emb_dim, kv_dim).T
             )  # (kv_dim, emb_dim)
             prep_rms_qkv_weights(lw, config)  # the QKV stage's static weight
-            lw._wo_t = np.ascontiguousarray(
-                lw.wo.astype(bfloat16).reshape(q_dim, emb_dim).T
-            )  # (emb_dim, q_dim) DECOUPLED
-            lw._wgate_t = np.ascontiguousarray(
-                lw.w_gate.astype(bfloat16).reshape(emb_dim, hidden_dim).T
-            )  # (hidden, emb)
-            lw._wup_t = np.ascontiguousarray(
-                lw.w_up.astype(bfloat16).reshape(emb_dim, hidden_dim).T
-            )  # (hidden, emb)
-            lw._wdown_t = np.ascontiguousarray(
-                lw.w_down.astype(bfloat16).reshape(hidden_dim, emb_dim).T
-            )  # (emb, hidden)
+            # `[2026-08-26]` doc 56 H2b: under w4_decode the O+FFN decode
+            # weights are the packed int4 BOs the loader attached
+            # (`_wo_packed` / `_wgateup_packed` / `_wdown_packed`); the bf16
+            # transposes below would copy the dequantized prefill weights for
+            # nothing (~630 MB host RAM).
+            if not _W4_DECODE:
+                lw._wo_t = np.ascontiguousarray(
+                    lw.wo.astype(bfloat16).reshape(q_dim, emb_dim).T
+                )  # (emb_dim, q_dim) DECOUPLED
+                lw._wgate_t = np.ascontiguousarray(
+                    lw.w_gate.astype(bfloat16).reshape(emb_dim, hidden_dim).T
+                )  # (hidden, emb)
+                lw._wup_t = np.ascontiguousarray(
+                    lw.w_up.astype(bfloat16).reshape(emb_dim, hidden_dim).T
+                )  # (hidden, emb)
+                lw._wdown_t = np.ascontiguousarray(
+                    lw.w_down.astype(bfloat16).reshape(hidden_dim, emb_dim).T
+                )  # (emb, hidden)
         weights._decode_weights_transposed = True
 
     # 2. Tag layer index for per-layer BO isolation.
@@ -213,18 +227,27 @@ def _preload_decode_weights(decode_cache, weights, config):
             li,
         )
 
-        # o_gemv_ffn: build interleaved w_gateup + packed RMS-input buffer.
+        # o_gemv_ffn: packed RMS-input buffer (both paths); interleaved
+        # w_gateup only on the bf16 path (w4_decode preloads the packed BOs
+        # the loader attached, through the SAME run helper the decode loop
+        # uses -- one owner of the arg layout).
+        packed = np.empty((2, emb_dim), dtype=bfloat16)
+        packed[0] = 0.0
+        packed[1] = lw.ffn_norm.reshape(emb_dim).astype(bfloat16)
+        lw._packed_rms_buf = packed
+
+        if _W4_DECODE:
+            z_q = np.zeros(q_dim, dtype=bfloat16)
+            z_emb = np.zeros(emb_dim, dtype=bfloat16)
+            _run_o_gemv_ffn_int4(z_q, z_emb, lw, config, decode_cache, li)
+            continue
+
         wgateup = np.empty((2 * hidden_dim, emb_dim), dtype=bfloat16)
         wgateup[0::2] = lw._wgate_t
         wgateup[1::2] = lw._wup_t
         lw._wgateup_t = wgateup
         del lw._wgate_t
         del lw._wup_t
-
-        packed = np.empty((2, emb_dim), dtype=bfloat16)
-        packed[0] = 0.0
-        packed[1] = lw.ffn_norm.reshape(emb_dim).astype(bfloat16)
-        lw._packed_rms_buf = packed
 
         z_emb = np.zeros(emb_dim, dtype=bfloat16)
         z_q = np.zeros(q_dim, dtype=bfloat16)

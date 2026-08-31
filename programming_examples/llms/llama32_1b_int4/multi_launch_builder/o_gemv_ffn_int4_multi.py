@@ -114,9 +114,22 @@ def build_o_gemv_ffn_int4_module(
     m_tile=8,
     k_chunk=2048,
     n_cores=8,
+    q_dim=None,
+    eps=1.0e-5,
 ):
-    """Build full-int4 3-launch ELF2."""
-    assert emb_dim % k_chunk == 0 and hidden_dim % k_chunk == 0
+    """Build full-int4 3-launch ELF2.
+
+    `q_dim` `[2026-08-26]` (doc 56 H2b, queue item 18): the O GEMV's K (the
+    attention output width). Defaults to `emb_dim` -- the LLAMA square O,
+    byte-identical IR to the pre-parameter builder. Qwen3-0.6B passes
+    q_dim=2048 with emb_dim=1024 (the decoupled O the bf16
+    `build_o_gemv_ffn_qwen_module` applies to the shared cascade) and
+    k_chunk=1024 (stage 2 requires K == K_CHUNK == emb_dim; K_div becomes
+    2/1/3 for O/gate-up/down against one `mv_int4_bf16.o` at DIM_K=k_chunk).
+    """
+    if q_dim is None:
+        q_dim = emb_dim
+    assert q_dim % k_chunk == 0 and hidden_dim % k_chunk == 0
     # Stage 2's int4 module requires K == K_CHUNK; emb_dim must equal k_chunk.
     assert (
         emb_dim == k_chunk
@@ -125,10 +138,10 @@ def build_o_gemv_ffn_int4_module(
     matvec_int4_packed_add.KERNEL_OBJ_NAME = "mv_int4_bf16.o"
     matvec_int4_swiglu_rms.KERNEL_OBJ_NAME = "mv_int4_bf16.o"
 
-    # Stage 1: O proj (M=emb, K=emb), int4 GEMV+R.
+    # Stage 1: O proj (M=emb, K=q_dim; llama q_dim == emb), int4 GEMV+R.
     stage1 = build_int4_gemv_add(
         emb_dim,
-        emb_dim,
+        q_dim,
         GS=gs,
         M_TILE=m_tile,
         K_CHUNK=k_chunk,
@@ -143,6 +156,7 @@ def build_o_gemv_ffn_int4_module(
         M_TILE=m_tile,
         K_CHUNK=k_chunk,
         N_CORES=n_cores,
+        eps=eps,
     )
 
     # Stage 3: Down proj (M=emb, K=hidden), int4 GEMV+R.
@@ -157,7 +171,7 @@ def build_o_gemv_ffn_int4_module(
 
     # Packed BO dims for the three int4 args.
     tq, tile_bytes_o = _packed_dims(
-        emb_dim, emb_dim, gs, m_tile, k_chunk, n_cores, emb_dim
+        emb_dim, q_dim, gs, m_tile, k_chunk, n_cores, emb_dim
     )
     tg, tile_bytes_g = _packed_dims(
         2 * hidden_dim, emb_dim, gs, m_tile, k_chunk, n_cores, 2 * hidden_dim
@@ -240,7 +254,7 @@ module {{
 {privs_block}
   func.func @o_gemv_ffn_int4(
     %arg0: memref<{tq}x{tile_bytes}xi8>,
-    %arg1: memref<{emb_dim}xbf16>,
+    %arg1: memref<{q_dim}xbf16>,
     %arg2: memref<{emb_dim}xbf16>,
     %arg3: memref<{emb_dim}xbf16>,
     %arg4: memref<{emb_dim}xbf16>,

@@ -89,7 +89,7 @@ KERNEL_OBJ_NAME = "mv_int4_bf16.o"
 range_ = for_
 
 
-def build_module(M, K, GS=128, M_TILE=8, K_CHUNK=2048, N_CORES=8):
+def build_module(M, K, GS=128, M_TILE=8, K_CHUNK=2048, N_CORES=8, eps=1.0e-5):
     """int4-AWQ fused FFN: RMSNorm → int4 GEMV → SwiGLU pair.
 
     Output is M/2 elements (gate/up paired). M is the interleaved gate+up
@@ -315,7 +315,7 @@ def build_module(M, K, GS=128, M_TILE=8, K_CHUNK=2048, N_CORES=8):
                         )
                         total_sum_f32 = vector_reduction(f32_ty, "add", v_final_f32)
                         k_f32_const = arith.ConstantOp(f32_ty, float(K))
-                        eps_f32_const = arith.ConstantOp(f32_ty, 1.0e-5)
+                        eps_f32_const = arith.ConstantOp(f32_ty, float(eps))
                         mean_f32 = arith.divf(total_sum_f32, k_f32_const)
                         mean_eps_f32 = arith.addf(mean_f32, eps_f32_const)
                         rstd_f32 = math_dialect.rsqrt(mean_eps_f32)
