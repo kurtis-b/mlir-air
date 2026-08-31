@@ -193,6 +193,20 @@ The projection GEMMs the transformer-layer execution study's case matrix needs, 
 
 The projection GEMMs the transformer-layer execution study's `baseline_512` case needs — same sweep, provenance, and carry gate as the `baseline_768` section above (study branch, tag `pre-port-20260829`; rows carried verbatim; the tag's ladder omits `ffn_down` `seq = 2048` and `o_proj` `seq = 512`). Full per-candidate detail, and why the high-precision `atol` is K-scaled, in [`details/GEMM_bf16_in_bf16_out.md`](details/GEMM_bf16_in_bf16_out.md).
 
+**`qkv_proj`** — `K = 512` → `N = 1536`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 64 | 64×512×1536 | 292 | **548** | 405 | 32/512/32/96 (2×4) | 9.2e-3 / 1.0e-2 | ✅ |
+| 128 | 128×512×1536 | 545 | **1124** | 956 | 32/256/32/96 (4×4) | 9.3e-3 / 1.0e-2 | ✅ |
+| 256 | 256×512×1536 | 876 | **1973** | 1847 | 32/512/32/96 (8×4) | 9.3e-3 / 1.0e-2 | ✅ |
+| 512 | 512×512×1536 | 1218 | **2653** | 3287 | 32/256/32/96 (8×4) | 9.3e-3 / 1.0e-2 | ✅ |
+| 1024 | 1024×512×1536 | 1929 | **2849** | 3778 | 32/256/32/96 (8×4) | 9.3e-3 / 1.0e-2 | ✅ |
+| 2048 | 2048×512×1536 | 2565 | **2871** | 4460 | 32/512/32/96 (8×4) | 9.3e-3 / 1.0e-2 | ✅ |
+| 4096 | 4096×512×1536 | **2751** | 2585 | 4620 | 64/256/32/128 (8×4) | 9.7e-3 / 1.0e-2 | ✅ |
+| 8192 | 8192×512×1536 | **3377** | 3070 | 4684 | 64/256/32/96 (8×4) | 9.7e-3 / 1.0e-2 | ✅ |
+| 16384 | 16384×512×1536 | **3571** | 3059 | 4730 | 64/256/32/96 (8×4) | 9.7e-3 / 1.0e-2 | ✅ |
+
 **`ffn_down`** — `K = 2048` → `N = 512`
 
 | seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
