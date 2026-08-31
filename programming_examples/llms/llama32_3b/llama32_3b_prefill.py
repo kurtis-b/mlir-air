@@ -97,14 +97,10 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=False, rope_dim=None):
     print(f"Compiling unique kernels (Llama-3.2-3B, seq_len={seq_len})...")
     print(f"{'='*60}\n")
 
-    from shared.infra.external_kernels import compile_gemm_mm
+    from shared.infra.external_kernels import compile_gemm_mm_variant
 
-    compile_gemm_mm(
-        tile_m=32, tile_n=128, tile_k_l1=32, sym_suffix="_m32", out_name="mm_m32.o"
-    )
-    compile_gemm_mm(
-        tile_m=64, tile_n=128, tile_k_l1=32, sym_suffix="_m64", out_name="mm_m64.o"
-    )
+    compile_gemm_mm_variant(tile_m=32, tile_n=128, tile_k_l1=32)
+    compile_gemm_mm_variant(tile_m=64, tile_n=128, tile_k_l1=32)
 
     # 1. RMSNorm + QKV GEMMs + RoPE Q+K: one ELF (registry-driven per-GEMM method).
     from shared.builders.rms_gemms_rope_multi import build_rms_gemms_rope_module
