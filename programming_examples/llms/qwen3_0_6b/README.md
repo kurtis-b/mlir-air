@@ -76,8 +76,9 @@ make run PROMPT="How does photosynthesis work?" N_TOKENS=64
 # Run with profiling breakdown (per-kernel + per-phase)
 make profile
 
-# Top-k token-level correctness gate (NPU bf16 vs HF transformers bf16,
-# 2 prompts × 32 greedy tokens, k=5) — the production-readiness gate
+# Top-k token-level correctness gate. Default = W4 decode vs the dequant-
+# PATCHED HF oracle: NPU drift only, NOT quantization error — that bar is
+# `make verify-quant-bar` (2 prompts × 32 greedy tokens, k=5)
 make verify
 
 # Per-layer cosine diagnosis lens (informational, single prompt)
