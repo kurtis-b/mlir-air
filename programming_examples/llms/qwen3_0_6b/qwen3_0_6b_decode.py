@@ -66,8 +66,8 @@ _RMS_QKV_KERNEL = {2: "rms_qkv_qknorm_rope_gemv2", 8: "rms_qkv_qknorm_rope_gemv"
 ]
 
 # `[2026-08-26]` doc 56 H2b (queue items 18, 24): the w4_decode path,
-# selected by QWEN3_W4_DECODE -- default OFF until R3c lands the three-arm
-# verify gate and flips W4_DEFAULT; QWEN3_W4_DECODE=1 selects w4 for A/B. What
+# selected by QWEN3_W4_DECODE -- default ON (W4_DEFAULT; the three-arm
+# verify lit in this dir is the gate); QWEN3_W4_DECODE=0 selects bf16. What
 # changes: the O+FFN stage compiles/dispatches `o_gemv_ffn_int4` (the llama
 # 3-launch int4 cascade at q_dim=2048 / k_chunk=1024, SAME launch structure)
 # from the packed BOs `w4_decode_pack.quantize_decode_weights` attaches; the

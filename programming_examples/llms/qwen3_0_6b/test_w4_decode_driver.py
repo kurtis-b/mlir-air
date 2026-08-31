@@ -41,7 +41,7 @@ def _decode_at(flag):
 def test_selected_artifact_set_follows_the_flag():
     bf16 = ("rms_qkv_qknorm_rope_gemv2", "o_gemv_ffn", "lm_head_gemv")
     int4 = ("rms_qkv_qknorm_rope_gemv2", "o_gemv_ffn_int4", "lm_head_gemv")
-    assert _decode_at(None).required_decode_artifacts() == bf16  # default OFF
+    assert _decode_at(None).required_decode_artifacts() == int4  # default ON
     assert _decode_at("0").required_decode_artifacts() == bf16
     assert _decode_at("1").required_decode_artifacts() == int4
 

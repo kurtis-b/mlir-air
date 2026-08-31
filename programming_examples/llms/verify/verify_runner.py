@@ -299,12 +299,18 @@ def main():
     )
 
     config = adapter.build_config()
-    max_seq = 2048  # Production prefill kernels are tiled for seq_len=2048.
+    # Production prefill kernels are tiled for seq_len=2048. `[2026-08-23]`
+    # LLMS_VERIFY_MAX_SEQ is the KV / RoPE capacity; it pairs with the adapters'
+    # LLMS_VERIFY_PREFILL_CACHE / _DECODE_CACHE / _PREFILL_M so the model study
+    # can gate the artifact set it TIMED, at a prompt of the full compiled M
+    # plus the gate's 32 generation slots (doc 56 H1a).
+    max_seq = int(os.environ.get("LLMS_VERIFY_MAX_SEQ", "2048"))
 
     in_verify_mode = args.prompts == "topk_token"
     report = Report(
         config={
             "mode": "verify" if in_verify_mode else "diagnosis",
+            "max_seq": max_seq,
             "runner": args.runner,
             "model": model_choice,
             "model_name": model_name,

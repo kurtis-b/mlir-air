@@ -1,4 +1,4 @@
-# Qwen3-0.6B BF16 Inference — Architecture
+# Qwen3-0.6B Inference — Architecture
 
 Companion to [README.md](README.md). This doc describes the per-layer kernel
 chain (which ELF runs each op, what is fused inside it, what stays on CPU and
@@ -30,7 +30,9 @@ x ─[NPU elf:rms_qkv_qknorm_rope]   FUSED, 8 launches, 1 ELF
 once: (HOST) final RMSNorm → [NPU elf:lm_head_gemv] (19 partitions ×8192, vocab 151936)
 ```
 
-**Decode — 2 NPU ELFs/layer (+ lm_head once/token):**
+**Decode — 2 NPU ELFs/layer (+ lm_head once/token).** `[2026-08-26]` The
+O+FFN ELF is the **int4 cascade by default** (doc 56 H2b, queue item 24);
+everything else in this sequence is bf16 under both precisions:
 
 ```
 x ─[NPU elf:rms_qkv_qknorm_rope_gemv2]   FUSED, 1 ELF, 2 launches
@@ -43,8 +45,13 @@ x ─[NPU elf:rms_qkv_qknorm_rope_gemv2]   FUSED, 1 ELF, 2 launches
        QWEN3_RMS_QKV_LAUNCHES=8 selects the 8-launch elf:rms_qkv_qknorm_rope_gemv for A/B:
        { RMSNorm + Q/K/V GEMV + QK-norm(Q,K) + RoPE-Q/K } as separate launches, 17-arg ABI.)
   (HOST) KV-cache write → (HOST) decode_attention_cpu (single-token GQA over KV cache)
-  ─[NPU elf:o_gemv_ffn]   FUSED cascade, 1 ELF
+  ─[NPU elf:o_gemv_ffn_int4]   FUSED cascade, 1 ELF -- THE DEFAULT since 2026-08-26
       { O GEMV + Add + RMSNorm + Gate/Up cascade + SwiGLU + Down } → layer_out[1024]
+      (int4: wo / gate|up (nibble-row-interleaved) / wdown are RTN asym uint4 gs=128, packed by
+       `w4_decode_pack.py`, dequanted `(q - z) * s` IN-KERNEL by mv_int4_bf16.cc at DIM_K=1024
+       (K_div 2/1/3). Same launch structure as the bf16 form -- the whole saving is weight
+       bytes, a quarter of bf16's per layer. QWEN3_W4_DECODE=0 selects `o_gemv_ffn`, the bf16
+       cascade, for A/B; the QKV stage and the LM head are bf16 under BOTH.)
 once: (HOST) embed/final RMSNorm → [NPU elf:lm_head_gemv]
 ```
 
@@ -96,8 +103,11 @@ is position-dependent → deliberately NON-static.
 - **Decoupled q/kv dims** (q_dim=2048 ≠ emb=1024, kv_dim=1024) → non-square O
   projection (2048→1024).
 - **O+FFN fused into one ELF** (hidden=3072 small + aligned).
-- **Decode O+FFN fully on NPU** via the fused `o_gemv_ffn` cascade (only with
-  qwen3_1_7b does decode reach the lean 2-ELF form).
+- **Decode O+FFN fully on NPU** via the fused O+FFN cascade (only with
+  qwen3_1_7b does decode reach the lean 2-ELF form). `[2026-08-26]` that
+  cascade is **int4 by default** (`o_gemv_ffn_int4`; `QWEN3_W4_DECODE=0`
+  selects the bf16 `o_gemv_ffn`) -- same launch structure, a quarter of the
+  weight bytes.
 - **Multi-launch ELF + text-based MLIR stitching** (shared infra): multiple
   `air.launch` ops → one `xrt.run()`; intermediates flow through DDR with no CPU
   round-trip. Half-split RoPE LUT `[cos..., sin...]` matches HF's

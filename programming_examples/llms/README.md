@@ -139,7 +139,7 @@ llms/
 ├── qwen25_3b/          # Qwen2.5-3B    (QKV bias, head_dim=128)
 ├── qwen25_3b_q4/       # Q4_0 4-bit Qwen2.5-3B (prefill + fused NPU decode)
 ├── qwen25_7b_q4nx/     # Q4NX 4-bit Qwen2.5-7B (fused decode, QKV bias)
-├── qwen3_0_6b/         # Qwen3-0.6B    (QK-norm, head_dim=128)
+├── qwen3_0_6b/         # Qwen3-0.6B    (QK-norm, head_dim=128; int4 w4_decode O+FFN decode by default, QWEN3_W4_DECODE=0 for bf16)
 ├── qwen3_1_7b/         # Qwen3-1.7B    (QK-norm, head_dim=128)
 ├── qwen3_4b/           # Qwen3-4B      (QK-norm, decoupled q_dim=4096)
 ├── qwen3_8b_q4nx/      # Q4NX 4-bit Qwen3-8B (fused decode, split weight BOs)

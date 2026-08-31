@@ -39,11 +39,11 @@ def _selected(value):
 
 
 def test_flag_zero_selects_nothing():
-    # R3a ships the pack default-OFF: the flip to w4_decode is R3c's, landing
-    # with the three-arm verify gate (review of PR #32, P1).
-    assert wp.W4_DEFAULT is False
-    assert _selected(None) is False
-    assert _selected("") is False  # the `FOO= cmd` shell idiom
+    # The default flipped ON together with the three-arm verify gate (this
+    # slice; #32's P1 held it OFF until the gate existed on main).
+    assert wp.W4_DEFAULT is True
+    assert _selected(None) is True
+    assert _selected("") is True  # the `FOO= cmd` shell idiom
     assert _selected("1") is True
     assert _selected("0") is False, "QWEN3_W4_DECODE=0 must select bf16"
     try:
