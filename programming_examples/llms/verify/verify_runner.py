@@ -217,6 +217,28 @@ def _load_adapter(dotted_path: str):
     return importlib.import_module(dotted_path)
 
 
+def _gate_max_seq(npu_data, local_max_seq):
+    """Bind the reported max_seq to the NPU capture (review of #34, P1).
+
+    Split phases may run on different hosts with different environments; the
+    shape the NPU actually ran is the one the capture recorded, so a mismatch
+    is refused and the CAPTURED value is what the report carries. A gate file
+    from before this record has no value: the local one is used, and the
+    second return says it is unverified.
+    """
+    got = npu_data.get("_max_seq") if npu_data else None
+    if got is None:
+        return int(local_max_seq), False
+    if int(got) != int(local_max_seq):
+        sys.exit(
+            f"[verify] gate file captured max_seq={got} but this compare "
+            f"phase has LLMS_VERIFY_MAX_SEQ={local_max_seq}; rerun the "
+            "capture or match it -- the report must not claim a shape the "
+            "NPU did not run."
+        )
+    return int(got), True
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -299,12 +321,18 @@ def main():
     )
 
     config = adapter.build_config()
-    max_seq = 2048  # Production prefill kernels are tiled for seq_len=2048.
+    # Production prefill kernels are tiled for seq_len=2048. `[2026-08-23]`
+    # LLMS_VERIFY_MAX_SEQ is the KV / RoPE capacity; it pairs with the adapters'
+    # LLMS_VERIFY_PREFILL_CACHE / _DECODE_CACHE / _PREFILL_M so the model study
+    # can gate the artifact set it TIMED, at a prompt of the full compiled M
+    # plus the gate's 32 generation slots (doc 56 H1a).
+    max_seq = int(os.environ.get("LLMS_VERIFY_MAX_SEQ", "2048"))
 
     in_verify_mode = args.prompts == "topk_token"
     report = Report(
         config={
             "mode": "verify" if in_verify_mode else "diagnosis",
+            "max_seq": max_seq,
             "runner": args.runner,
             "model": model_choice,
             "model_name": model_name,
@@ -450,6 +478,8 @@ def main():
                 "chosen": [int(c) for c in chosen],
                 "topk": [[int(t) for t in row] for row in topk],
             }
+        # the shape the NPU ran, bound into the handoff (review of #34, P1)
+        captured["_max_seq"] = int(max_seq)
         with open(args.gate_file, "w") as f:
             json.dump(captured, f)
         print(f"[verify] NPU capture written to {args.gate_file}")
@@ -461,6 +491,13 @@ def main():
             sys.exit("--gate-phase compare-hf requires --gate-file")
         with open(args.gate_file) as f:
             npu_data = json.load(f)
+        max_seq, _ms_bound = _gate_max_seq(npu_data, max_seq)
+        report.config["max_seq"] = max_seq
+        if not _ms_bound:
+            print(
+                "[verify] note: gate file predates the max_seq record; "
+                "reporting the compare-side value unverified"
+            )
     else:  # both: single-process (higher peak; debugging / non-split hosts)
         npu = build_npu()
         npu_data = None

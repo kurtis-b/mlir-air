@@ -53,3 +53,13 @@
 // PLEN: PASS  llama32_1b_int4: run_once -> generate carries prompt_len=7
 // PLEN: PASS  llama32_1b_int4: the real generate forwards prompt_len=7 to run_npu_prefill
 // PLEN: prompt_len seam tests: 2/2 passed
+//
+// The split-phase max_seq binding: the capture records the shape the NPU ran;
+// a mismatched compare environment is refused, and an old gate file is
+// reported unverified rather than claimed.
+// RUN: %PYTHON %S/test_gate_max_seq.py | FileCheck %s --check-prefix=GMAX
+// GMAX: PASS  test_absent_record_reports_unverified
+// GMAX: PASS  test_capture_writes_the_record
+// GMAX: PASS  test_match_binds_captured_value
+// GMAX: PASS  test_mismatch_is_refused
+// GMAX: gate max_seq tests: 4/4 passed

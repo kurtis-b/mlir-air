@@ -6,12 +6,93 @@
 // the full sweep locally). Exercises the full production prefill + decode path
 // through the verify subsystem (verify/verify_runner.py).
 //
+// `[2026-08-26]` **THREE ARMS, because the production default is quantized**
+// (doc 56 H2b, queue item 24). The decode O+FFN cascade runs int4 by default
+// (`QWEN3_W4_DECODE`, default 1); bf16 is the A/B arm at `QWEN3_W4_DECODE=0`.
+// Both precisions are PINNED here rather than inherited, so this test's meaning
+// does not move the next time a default does. What each arm proves:
+//
+//   1. bf16 (`QWEN3_W4_DECODE=0`) — the arm this file has always been. The
+//      bf16 decode path is still shipped for A/B and must not rot.
+//   2. w4_decode, the DEFAULT, against the dequant-patched oracle. The
+//      adapter's `build_hf_model` patches HF's o/gate/up/down with the same
+//      dequantized weights the loader substituted, so this arm isolates NPU
+//      drift from quantization error: it answers "did the NPU compute the
+//      model it was given". By construction it CANNOT see quantization error,
+//      because both sides carry it — which is why arm 3 exists.
+//   3. w4_decode against the UNPATCHED HF bf16 checkpoint (`make
+//      verify-quant-bar`) — THE QUANTIZATION BAR. One w4 NPU capture judged at
+//      the same top-5 token-set inclusion bar every bf16 default in this tree
+//      is held to, against the real checkpoint. This is the clause that makes
+//      the int4 default's quantization error a GATED property rather than an
+//      unmeasured one. It costs one NPU capture plus one HF reference decode.
+//
+// What these arms do NOT prove: per-element numerics inside the int4 cascade.
+// The token-set criterion stops at the first divergence, so a numerical
+// regression that keeps the top-5 sets can pass. That bound is queue item 18's
+// per-stage per-element SHIP gate (`reexec_w4_qwen_gate.py` on the pre-port
+// study tree, tag pre-port-20260829, devq 621), which reads each stage's
+// intermediates back and checks them at their own kernel family's published
+// rtol/atol — a release-time gate for a change to the int4 cascade builder or
+// to `mv_int4_bf16.cc`, not a per-commit one (~8 min, a bespoke harness).
+//
+// **The three arms SHARE one artifact set, and the lit is what says so.** The
+// verify adapter compiles into `%S/build_peano/*_kernel_cache` (source-tree,
+// not this test's cwd) and `compile_and_cache` never skips, so three plain
+// `make verify` invocations would compile the whole set three times -- measured
+// at ~7.5 min per full compile on this host (pre-port study, devq 652). Instead:
+//
+//   arm 1  compiles everything (the fresh-bytes gate: prefill set + bf16 decode);
+//   arm 2  LOADS arm 1's prefill cache (`LLMS_VERIFY_PREFILL_CACHE`, the seam
+//          item 13 built for exactly this) and compiles only the decode set,
+//          which is where the precision lives -- so the two precisions are
+//          gated on BYTE-IDENTICAL prefill ELFs and the A/B is the decode
+//          cascade and nothing else;
+//   arm 3  LOADS both of arm 2's caches and compiles nothing, so the
+//          quantization bar is measured on EXACTLY the ELFs arm 2 just gated.
+//
+// The env lives here, in the test, rather than in the Makefile: `make verify`
+// and `make verify-quant-bar` stay the production command lines an operator
+// runs (which do compile), and the sharing is a property of this suite run.
+//
+// `clean-build`, NOT `clean`: `make clean` also deletes
+// `$(srcdir)/../verify/reports/`, a SOURCE-tree path that is not scoped to this
+// test's cwd and that other examples' evaluation reports cite by filename (see
+// the Makefile's `clean-build` comment). This test only needs its own build
+// tree gone -- and note what `clean-build` actually removes here: the .o
+// staging tree under this test's cwd. The kernel CACHES the verify adapter
+// uses are `%S/build_peano/*_kernel_cache` in the SOURCE tree, and the fresh
+// compile comes from `compile_and_cache` never skipping, not from the clean.
+// Running this test therefore REWRITES the model's shipped decode and prefill
+// caches -- which is also why arm 1 must come first: its compile is what arms
+// 2 and 3 then load.
+//
 // Skips cleanly when HF_TOKEN is unset (model downloads require it).
 //
 // REQUIRES: ryzen_ai_npu2, peano, hf_token, hfweights_qwen_qwen3_0_6b
 //
 // RUN: mkdir -p test_peano_verify
 // RUN: cd test_peano_verify
-// RUN: make -f %S/Makefile clean
-// RUN: make -f %S/Makefile verify PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s
-// CHECK: [verify] PASS
+// RUN: make -f %S/Makefile clean-build
+// RUN: env QWEN3_W4_DECODE=0 make -f %S/Makefile verify PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s --check-prefix=BF16
+// RUN: env QWEN3_W4_DECODE=1 LLMS_VERIFY_PREFILL_CACHE=%S/build_peano/prefill_kernel_cache make -f %S/Makefile verify PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s --check-prefix=W4
+// RUN: env LLMS_VERIFY_PREFILL_CACHE=%S/build_peano/prefill_kernel_cache LLMS_VERIFY_DECODE_CACHE=%S/build_peano/decode_kernel_cache make -f %S/Makefile verify-quant-bar PEANO_INSTALL_DIR=%PEANO_INSTALL_DIR | FileCheck %s --check-prefix=QUANTBAR
+//
+// BF16: [verify] PASS
+//
+// Arm 2 must build the PATCHED oracle. `[verify] adapter is building custom HF
+// reference model` prints on both arms (the runner calls the hook whenever the
+// adapter defines it), so the discriminating line is the adapter's own, which
+// only the patched path emits -- without it arm 2 would silently become arm 3
+// and stop testing what it says.
+// W4: artifact set: prefill_M=2048 max_seq=2048 LOADED
+// W4: HF reference patched with the w4_decode dequant O+FFN weights
+// W4: [verify] PASS
+//
+// Conversely arm 3 must NOT patch: the target runs its capture phase at
+// QWEN3_W4_DECODE=1 and its compare phase at QWEN3_W4_DECODE=0, and it is the
+// 0 that makes the oracle the plain checkpoint.
+// QUANTBAR: artifact set: prefill_M=2048 max_seq=2048 LOADED
+// QUANTBAR: NPU capture written to
+// QUANTBAR-NOT: HF reference patched with the w4_decode dequant O+FFN weights
+// QUANTBAR: [verify] PASS
