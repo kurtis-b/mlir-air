@@ -116,6 +116,47 @@ def test_the_host_scratch_plan_matches_the_builder_contract():
             assert args[idx] == f"memref<{rows}x{cols}xf32>", (seq, idx, args[idx])
 
 
+def test_checked_plan_binds_the_cache_to_the_registry():
+    """Review of #51, P1: a loaded cache must match the recomputed plan."""
+    import json
+    import tempfile
+    from pathlib import Path
+
+    import qwen3_0_6b_prefill as qp
+
+    class _C:
+        def __init__(self, d):
+            self.cache_dir = d
+
+    config = _CFG
+    plan = qp._o_ffn_scratch_plan(2048, config)[0]
+    with tempfile.TemporaryDirectory() as d:
+        # round-trip: matching sidecar passes
+        (Path(d) / qp._SCRATCH_SIDECAR).write_text(
+            json.dumps({"seq_len": 2048, "scratch_for": list(plan)})
+        )
+        qp._checked_o_ffn_plan(_C(d), 2048, config)
+        # mismatch: a stale plan is refused with a sentence
+        (Path(d) / qp._SCRATCH_SIDECAR).write_text(
+            json.dumps({"seq_len": 2048, "scratch_for": [None, None, None, 15]})
+        )
+        try:
+            qp._checked_o_ffn_plan(_C(d), 2048, config)
+        except RuntimeError as e:
+            assert "argument layout does not match" in str(e)
+        else:
+            raise AssertionError("a mismatched cached plan was accepted")
+    with tempfile.TemporaryDirectory() as d:
+        # no sidecar: legacy all-fused 2048 proceeds; short seq is refused
+        qp._checked_o_ffn_plan(_C(d), 2048, config)
+        try:
+            qp._checked_o_ffn_plan(_C(d), 512, config)
+        except RuntimeError as e:
+            assert "no scratch" in str(e)
+        else:
+            raise AssertionError("an unverifiable short-seq cache was accepted")
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

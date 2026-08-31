@@ -11,7 +11,8 @@
 //
 // RUN: %PYTHON %S/test_o_ffn_layout.py | FileCheck %s
 //
+// CHECK: PASS  test_checked_plan_binds_the_cache_to_the_registry
 // CHECK: PASS  test_seq2048_layout_is_the_prior_all_fused_one
 // CHECK: PASS  test_short_seq_mixed_methods_build
 // CHECK: PASS  test_the_host_scratch_plan_matches_the_builder_contract
-// CHECK: o_ffn layout tests: 3/3 passed
+// CHECK: o_ffn layout tests: 4/4 passed

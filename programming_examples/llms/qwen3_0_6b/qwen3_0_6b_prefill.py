@@ -129,6 +129,48 @@ def _o_ffn_scratch_plan(seq_len, config):
     return scratch_for, shapes, inter
 
 
+_SCRATCH_SIDECAR = "o_ffn_qwen.scratch.json"
+
+
+def _checked_o_ffn_plan(cache, seq_len, config):
+    """The registry-derived plan, BOUND to the cached ELF (review of #51, P1).
+
+    compile_all_kernels persists the plan it asserted against the builder as
+    a sidecar beside the manifest; a loaded cache must match the recomputed
+    plan or dispatch is refused with a sentence (an old ELF called with a
+    newer registry's arg plan would misbind XRT arguments). A cache without
+    the sidecar predates this contract, which is provably safe only for the
+    all-fused seq=2048 layout (short-seq ELFs could not be built before the
+    mixed-method rewire) -- anything else is refused as unverifiable.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    plan, shapes, inter = _o_ffn_scratch_plan(seq_len, config)
+    sc = _Path(cache.cache_dir) / _SCRATCH_SIDECAR
+    if sc.is_file():
+        rec = _json.loads(sc.read_text())
+        if rec.get("seq_len") != seq_len or rec.get("scratch_for") != list(plan):
+            raise RuntimeError(
+                f"o_ffn_qwen cache {str(cache.cache_dir)!r} was compiled with "
+                f"scratch plan {rec.get('scratch_for')} at seq_len "
+                f"{rec.get('seq_len')}, but the current registry derives "
+                f"{list(plan)} at seq_len {seq_len} -- the cached ELF's "
+                "argument layout does not match. Recompile (`make compile`) "
+                "or point at a cache built from this registry."
+            )
+    else:
+        legacy_ok = seq_len == 2048 and all(x is not None for x in plan)
+        if not legacy_ok:
+            raise RuntimeError(
+                f"o_ffn_qwen cache {str(cache.cache_dir)!r} has no scratch "
+                "sidecar and the requested layout is not the legacy all-fused "
+                "seq=2048 shape -- cannot verify the cached ELF's argument "
+                "layout. Recompile (`make compile`)."
+            )
+    return plan, shapes, inter
+
+
 # ---------------------------------------------------------------------------
 # Backend kwargs
 # ---------------------------------------------------------------------------
@@ -202,6 +244,14 @@ def compile_all_kernels(cache, config, seq_len, verbose=False, cpu_attn=False):
         f"builder={offn_scratch} plan={offn_plan}"
     )
     cache.compile_and_cache("o_ffn_qwen", offn_mod, _o_ffn_backend(verbose))
+    # Persist the asserted plan beside the manifest so a LOADED cache can be
+    # checked against the registry it will be dispatched with (review of #51).
+    import json as _json
+    from pathlib import Path as _Path
+
+    (_Path(cache.cache_dir) / _SCRATCH_SIDECAR).write_text(
+        _json.dumps({"seq_len": seq_len, "scratch_for": list(offn_plan)})
+    )
 
     # Flash Attention (head-first, head_dim=128). Skip if using CPU fallback.
     if not cpu_attn:
@@ -356,7 +406,7 @@ def preload_prefill_weights(weights, config, cache, seq_len, rope_lut_bf16):
         # f32 C-scratch tail (base index 15): one arg per FUSED-CAST GEMM per
         # the registry plan (mixed methods at seq 512/1024 declare fewer than
         # 4 -- the hardcoded four would overrun the ELF's signature).
-        _, offn_shapes, offn_inter = _o_ffn_scratch_plan(seq_len, config)
+        _, offn_shapes, offn_inter = _checked_o_ffn_plan(cache, seq_len, config)
         offn_args += [np.zeros(s, dtype=np.float32) for s in offn_shapes]
         cache.load_and_run(
             "o_ffn_qwen",
