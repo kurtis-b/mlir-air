@@ -10,6 +10,20 @@ pages mirror them for humans; model code (e.g. llama) calls the lookups here so
 tile sizes are never hand-copied (which caused drift / stale-config bugs).
 
 Currently provides GEMM lookups; other kernels add their own as their JSON lands.
+
+THE HERD IS PART OF THE CONFIG, NOT A CALLER'S CHOICE
+    A GEMM row's tiles were measured at a particular herd, and the example
+    builders assert ``M % (tile_m * herd_m) == 0`` and
+    ``N % (tile_n * herd_n) == 0`` (``matrix_multiplication/bf16_in_bf16_out/
+    run.py:64,67``). Most rows use the full 8x4 array, so the file-level
+    ``herd`` covers them; a row whose ``M`` is too short for that carries a
+    per-method ``herd`` that overrides it (the transformer-layer study's
+    sequence ladder starts at ``M = 64``, which cannot hold 8 rows of either
+    method's forced ``tile_m``).
+
+    ``gemm_config`` therefore returns ``herd`` alongside ``tile``, and a caller
+    that builds must pass it through instead of assuming 8x4 -- assuming it at
+    a short-``M`` shape trips that assert at build time.
 """
 
 import json
@@ -24,6 +38,21 @@ _GEMM_JSON = {
 }
 
 _cache = {}
+
+# Herd used by every shape measured before per-row herds existed, and the
+# fallback for a registry JSON that predates the file-level "herd" key.
+_DEFAULT_HERD = (8, 4)
+
+
+def _herd(data, method_entry):
+    """(herd_m, herd_n) this method's tiles were measured at.
+
+    Per-method override first, then the file-level default. Both are stored as
+    a two-element JSON list; the tuple keeps a caller from mutating the cached
+    registry document in place.
+    """
+    herd = method_entry.get("herd") or data.get("herd") or _DEFAULT_HERD
+    return tuple(herd)
 
 
 def _load(filename):
@@ -47,9 +76,13 @@ def gemm_config(M, K, N, output_dtype="bf16", precision="high"):
     Returns dict:
         {"method": str,
          "tile": {"tile_m":.., "tile_k_l2":.., "tile_k_l1":.., "tile_n":..},
+         "herd": (herd_m, herd_n),
          "gflops": float, "mean_rel_L1": float}
         - method names: f32 page -> external/direct; bf16 page -> fused-cast/drain/direct.
         - tile is a named dict (self-describing; copied from the JSON verbatim).
+        - herd is the array these tiles were measured at, per-method override
+          first and the page default second. Pass it to the builder; see the
+          module docstring on why assuming 8x4 is a build-time failure.
 
     Raises:
         KeyError if (M,K,N) is not in the registry for this dtype, or the
@@ -72,19 +105,13 @@ def gemm_config(M, K, N, output_dtype="bf16", precision="high"):
                 )
             method = best[precision]
             m = s["methods"][method]
-            out = {
+            return {
                 "method": method,
                 "tile": dict(m["tile"]),
+                "herd": _herd(data, m),
                 "gflops": m["gflops"],
                 "mean_rel_L1": m["mean_rel_L1"],
             }
-            # Most shapes run the full 8x4 herd (the JSON top-level "herd"); a few
-            # tiny-M shapes (e.g. SmolVLA connector 64x12288x960) must shrink herd_m
-            # so tile_m*herd_m == M. Surface a per-method herd override only when
-            # present, so every existing shape's return dict is unchanged.
-            if "herd" in m:
-                out["herd"] = list(m["herd"])
-            return out
     raise KeyError(
         f"gemm_config: shape {M}x{K}x{N} (out={output_dtype}) not in registry "
         f"{_GEMM_JSON[output_dtype]}. Measured shapes: "
@@ -116,6 +143,7 @@ def gemm_config_method(M, K, N, output_dtype, method, precision="high"):
             return {
                 "method": method,
                 "tile": dict(m["tile"]),
+                "herd": _herd(data, m),
                 "gflops": m["gflops"],
                 "mean_rel_L1": m["mean_rel_L1"],
             }

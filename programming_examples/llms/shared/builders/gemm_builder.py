@@ -172,7 +172,15 @@ def gemm_registry_config(m, k, n, output_dtype="bf16", precision="high", method=
         cfg = gemm_config_method(m, k, n, output_dtype, method, precision)
     else:
         cfg = gemm_config(m, k, n, output_dtype, precision)
-    return _spec_with_tiles(cfg["method"], cfg["tile"])
+    spec = _spec_with_tiles(cfg["method"], cfg["tile"])
+    # Review of #38, P1: the lookup always returns the EFFECTIVE herd
+    # (per-row override first, file-level 8x4 fallback); the canonical
+    # recipe hands it to the builder or a short-M build trips
+    # M % (tile_m * herd_m).
+    herd = cfg.get("herd")
+    if herd:
+        spec["herd_m"], spec["herd_n"] = int(herd[0]), int(herd[1])
+    return spec
 
 
 def _spec_with_tiles(method, tile):

@@ -125,6 +125,27 @@ This is **documentation, not executable code** — it records results produced b
 > GFLOPS, all PASS. **Bold** = faster high-precision method (what `auto` picks); the `M*K*N ≥ 4e9` threshold matches the bold winner for all 7 shapes.
 > Qwen3-0.6B rows: only the `auto`-selected high-precision method was swept (`—` = the other method not measured for that shape); all `auto` picks PASS at 9.4–9.9e-3. **2048×1024×3072 (Gate/Up) ⚠️**: both high-precision methods compute the in-tier result (mean_rel_L1 = 9.4e-3) but the harness element-wise gate trips on a single near-zero-reference output element (abs_err ≈ 1.7e-3 > the high-precision `atol = 1.5e-3`, `rtol·|ref|≈0`); the shape PASSES on the low-precision `direct` path (`atol = 4e-3`, 1.1e-2). Harness tolerance edge, not a datapath failure — see [`details/GEMM_bf16_in_bf16_out.md`](details/GEMM_bf16_in_bf16_out.md). fused-cast is tile_m=64, drain is tile_m=32. The high-precision tier preserves f32-out accuracy (9.3–9.9e-3) via a single cast; low-precision direct degrades with the L2-tile count (`K / tile_k_l2`). See [`details/GEMM_bf16_in_bf16_out.md`](details/GEMM_bf16_in_bf16_out.md).
 
+<!-- BEGIN transformer-layer-sweep baseline_768 -->
+### Transformer-layer execution study — `baseline_768` sweep
+
+The projection GEMMs the transformer-layer execution study's case matrix needs, swept across the full 9-point sequence ladder on the study branch by `transformer_layer/sweep/registry_sweep.py` (tag `pre-port-20260829` — the sweep tool is not on main); rows carried verbatim from that tag, re-derivable via the `kernel_registry` driver (#1933). Full per-candidate detail, and why the high-precision `atol` is K-scaled here, in [`details/GEMM_bf16_in_bf16_out.md`](details/GEMM_bf16_in_bf16_out.md).
+
+**`qkv_proj`** — `K = 768` → `N = 2304`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 64 | 64×768×2304 | 446 | **945** | 568 | 32/128/32/96 (2×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 128 | 128×768×2304 | 952 | **1785** | 1150 | 32/256/32/96 (4×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 256 | 256×768×2304 | 1511 | **3043** | 2242 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 512 | 512×768×2304 | 2146 | **3981** | 4003 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 1024 | 1024×768×2304 | 3124 | **4209** | 4896 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 2048 | 2048×768×2304 | 3875 | **4132** | 4580 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 4096 | 4096×768×2304 | **4226** | 4123 | 5027 | 64/256/32/96 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+| 8192 | 8192×768×2304 | **4694** | 4477 | 5122 | 64/256/32/96 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+| 16384 | 16384×768×2304 | **4867** | 4436 | 5180 | 64/256/32/96 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+
+<!-- END transformer-layer-sweep baseline_768 -->
+
 ---
 
 ## GEMV — tested shapes

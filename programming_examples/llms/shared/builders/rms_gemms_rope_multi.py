@@ -261,6 +261,8 @@ def build_rms_gemms_rope_module(
             spec["tile_k_l2"],
             spec["tile_k_l1"],
             spec["tile_n"],
+            spec.get("herd_m"),
+            spec.get("herd_n"),
         )
 
     q_total = seq_len * emb_dim  # = n_heads * seq_len * head_dim
@@ -281,9 +283,9 @@ def build_rms_gemms_rope_module(
     )
 
     # 2-4. Q/K/V GEMMs — method + ALL tiles come from the registry spec per shape.
-    _q_kw, _q_tm, _q_k2, _q_k1, _q_tn = _gemm_kw_and_tiles(q_spec)
-    _k_kw, _k_tm, _k_k2, _k_k1, _k_tn = _gemm_kw_and_tiles(k_spec)
-    _v_kw, _v_tm, _v_k2, _v_k1, _v_tn = _gemm_kw_and_tiles(v_spec)
+    _q_kw, _q_tm, _q_k2, _q_k1, _q_tn, _q_hm, _q_hn = _gemm_kw_and_tiles(q_spec)
+    _k_kw, _k_tm, _k_k2, _k_k1, _k_tn, _k_hm, _k_hn = _gemm_kw_and_tiles(k_spec)
+    _v_kw, _v_tm, _v_k2, _v_k1, _v_tn, _v_hm, _v_hn = _gemm_kw_and_tiles(v_spec)
     _qm = q_spec["method"]
     _km = k_spec["method"]
     _vm = v_spec["method"]
@@ -297,8 +299,8 @@ def build_rms_gemms_rope_module(
             _q_k2,
             _q_k1,
             _q_tn,
-            herd_m,
-            herd_n,
+            _q_hm if _q_hm else herd_m,
+            _q_hn if _q_hn else herd_n,
             **_q_kw,
         )
     )
@@ -312,8 +314,8 @@ def build_rms_gemms_rope_module(
             _k_k2,
             _k_k1,
             _k_tn,
-            herd_m,
-            herd_n,
+            _k_hm if _k_hm else herd_m,
+            _k_hn if _k_hn else herd_n,
             **_k_kw,
         )
     )
@@ -327,8 +329,8 @@ def build_rms_gemms_rope_module(
             _v_k2,
             _v_k1,
             _v_tn,
-            herd_m,
-            herd_n,
+            _v_hm if _v_hm else herd_m,
+            _v_hn if _v_hn else herd_n,
             **_v_kw,
         )
     )

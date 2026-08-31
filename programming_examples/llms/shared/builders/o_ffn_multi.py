@@ -279,11 +279,13 @@ def _build_o_ffn(
             spec["tile_k_l2"],
             spec["tile_k_l1"],
             spec["tile_n"],
+            spec.get("herd_m"),
+            spec.get("herd_n"),
         )
 
-    _o_kw, _o_m, _o_k2, _o_k1, _o_n = _tiles(o_spec)
-    _g_kw, _g_m, _g_k2, _g_k1, _g_n = _tiles(g_spec)
-    _d_kw, _d_m, _d_k2, _d_k1, _d_n = _tiles(d_spec)
+    _o_kw, _o_m, _o_k2, _o_k1, _o_n, _o_hm, _o_hn = _tiles(o_spec)
+    _g_kw, _g_m, _g_k2, _g_k1, _g_n, _g_hm, _g_hn = _tiles(g_spec)
+    _d_kw, _d_m, _d_k2, _d_k1, _d_n, _d_hm, _d_hn = _tiles(d_spec)
 
     n_total = seq_len * emb_dim
 
@@ -300,8 +302,8 @@ def _build_o_ffn(
             _o_k2,
             _o_k1,
             _o_n,
-            o_herd_m,
-            o_herd_n,
+            _o_hm if _o_hm else o_herd_m,
+            _o_hn if _o_hn else o_herd_n,
             **_o_kw,
         )
     )
@@ -327,8 +329,8 @@ def _build_o_ffn(
             _g_k2,
             _g_k1,
             _g_n,
-            gate_herd_m,
-            gate_herd_n,
+            _g_hm if _g_hm else gate_herd_m,
+            _g_hn if _g_hn else gate_herd_n,
             **_g_kw,
         )
     )
@@ -344,8 +346,8 @@ def _build_o_ffn(
             _g_k2,
             _g_k1,
             _g_n,
-            gate_herd_m,
-            gate_herd_n,
+            _g_hm if _g_hm else gate_herd_m,
+            _g_hn if _g_hn else gate_herd_n,
             **_g_kw,
         )
     )
@@ -378,8 +380,8 @@ def _build_o_ffn(
             _d_k2,
             _d_k1,
             _d_n,
-            down_herd_m,
-            down_herd_n,
+            _d_hm if _d_hm else down_herd_m,
+            _d_hn if _d_hn else down_herd_n,
             **_d_kw,
         )
     )

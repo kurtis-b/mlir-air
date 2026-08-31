@@ -84,11 +84,13 @@ Same GEMM knobs as the [f32-out page](GEMM_bf16_in_fp32_out.md#tunable-parameter
 | `tile_k_l2` | 256–512 | `K % tile_k_l2 == 0` | also reduces direct-bf16 truncation count |
 | `tile_k_l1` | 32 | `tile_k_l2 % tile_k_l1 == 0` | inner-accumulation chunk |
 | `tile_n` | **128** | **`N % (tile_n × herd_n) == 0`** ⚠️ | **dominant perf knob** — 128 beats 64 by ~1.3–1.4× |
-| `herd_m` | 8 | `M ≥ tile_m × herd_m` | row-parallel; 8 = full chip rows |
+| `herd_m` | 8 | `M ≥ tile_m × herd_m` | row-parallel; 8 = full chip rows. Per-row override, see below |
 | `herd_n` | 4 | `N ≥ tile_n × herd_n` | col-parallel; 4 = full chip cols → 8×4 = 32-tile herd |
 | `--cast-tile-n` (fused only) | shape-dependent | `N % cast_tile_n == 0` | the cast launch's tile; ~10% spread, near-optimal at default |
 
 ⚠️ **Silent-corruption trap**: `N % (tile_n × herd_n) != 0` is **not asserted** — verify before running.
+
+**The herd is per-row, not a global 8×4.** Most rows use the full chip, so the JSON carries `herd: [8, 4]` at the top level and says nothing per shape. A row whose `M` cannot hold 8 of its method's `tile_m` — every short-sequence row of the transformer-layer study sweep below, starting at `M = 64` — carries its own `herd` inside the method entry, which overrides the file-level one. `registry_lookup.gemm_config()` returns the effective pair alongside the tile; **build with it.** Assuming 8×4 at one of those shapes trips `M % (tile_m × herd_m) == 0` before anything compiles.
 
 ---
 
@@ -444,6 +446,29 @@ The `@L=4096 prefill` rows are those same projections at the padded length the n
 - **vs the [f32-out page](GEMM_bf16_in_fp32_out.md)**: the bf16 epilogue cast costs ~7% on Down (fused 8898 vs external-f32 9797). If the consumer can take f32, skip the cast; if it needs bf16 at GPU precision, fused-cast delivers it.
 
 ---
+
+<!-- BEGIN transformer-layer-sweep baseline_768 -->
+### Transformer-layer execution study — `baseline_768` sweep
+
+Swept on the study branch by `transformer_layer/sweep/registry_sweep.py` (tag `pre-port-20260829` — the sweep tool is not on main), which measures every candidate tiling for a shape and keeps the fastest that passes; rows carried verbatim from that tag, re-derivable via the `kernel_registry` driver (#1933). The persistent measurement record is the tag itself — `git show pre-port-20260829:programming_examples/kernel_registry/details/GEMM_bf16_in_bf16_out.json` is an immutable in-repo object, and this repo's carry gate byte-compares every inserted row against it. **Bold** = the winner recorded in `best` for that tier. Short-sequence rows carry a per-method `herd` overriding the file-level `8×4` (see *The herd is per-row* above); the herd used is in the table's tile column.
+
+The high tier is checked at `atol = 1.5e-3 × sqrt(8192 / K)`, not the fixed `1.5e-3`: the harness scales inputs by `1/sqrt(K)`, so the absolute error of a fixed-relative-precision datapath goes as `K^-1/2`, and the published `atol` is that rule evaluated at `K = 8192` — held fixed at this family's `K = 768` it would be a 3.3× tightening, exactly the "harness tolerance edge, not a datapath failure" already recorded for Qwen3-0.6B and Qwen2.5-0.5B Gate/Up above. The K-scaled gate reproduces the registry's own ~2.5× design margin at every K (measured: 2.5× at K=8192, 2.9× at K=3072, 2.8× at K=768); `rtol` stays the canonical `1.6e-2`, the low tier's `4e-3` is unchanged, and every run must additionally land inside its tier's `mean_rel_L1` band — a scale-free check the example harness does not make at all.
+
+**`qkv_proj`** — `K = 768` → `N = 2304`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 64 | 64×768×2304 | 446 | **945** | 568 | 32/128/32/96 (2×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 128 | 128×768×2304 | 952 | **1785** | 1150 | 32/256/32/96 (4×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 256 | 256×768×2304 | 1511 | **3043** | 2242 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 512 | 512×768×2304 | 2146 | **3981** | 4003 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 1024 | 1024×768×2304 | 3124 | **4209** | 4896 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 2048 | 2048×768×2304 | 3875 | **4132** | 4580 | 32/256/32/96 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 4096 | 4096×768×2304 | **4226** | 4123 | 5027 | 64/256/32/96 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+| 8192 | 8192×768×2304 | **4694** | 4477 | 5122 | 64/256/32/96 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+| 16384 | 16384×768×2304 | **4867** | 4436 | 5180 | 64/256/32/96 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+
+<!-- END transformer-layer-sweep baseline_768 -->
 
 ## How to reproduce (correctness + performance, one command)
 
