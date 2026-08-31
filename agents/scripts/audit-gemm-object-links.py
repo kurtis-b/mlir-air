@@ -58,6 +58,7 @@ FOOTGUNS
 """
 
 import re
+import tempfile
 import subprocess
 import sys
 from pathlib import Path
@@ -96,6 +97,7 @@ def audit(model):
 
     import shared.infra.cache as cache_mod
     import shared.infra.external_kernels as ek
+    from shared.builders.gemm_builder import gemm_variant_names
 
     built = {}  # object name -> {"DIM_M": ..., "DIM_N": ..., "DIM_K": ...}
     linked = {}  # artifact name -> set of objects its MLIR names in `link_with`
@@ -106,6 +108,9 @@ def audit(model):
             match = re.match(r"-D(DIM_[MNK])=(\d+)$", flag)
             if match:
                 dims[match.group(1)] = int(match.group(2))
+            match = re.match(r"-DSYM_SUFFIX=(\S+)$", flag)
+            if match:
+                dims["SYM_SUFFIX"] = match.group(1)
         built[output_name] = dims
 
     def stub_compile_and_cache(self, name, module, backend_kwargs=None, **kwargs):
@@ -120,7 +125,11 @@ def audit(model):
     cache_mod.KernelCache.load_manifest = lambda self, *a, **k: False
 
     adapter = __import__(f"{model}.verify_adapter", fromlist=["*"])
-    cache = cache_mod.KernelCache(f"audit_{model}_cache", verbose=False)
+    # Caches go under a tempdir, never the CWD (AGENTS.md: generated local
+    # state stays out of the tree; review of #37, P2).
+    cache = cache_mod.KernelCache(
+        tempfile.mkdtemp(prefix=f"audit_{model}_"), verbose=False
+    )
     adapter.compile_prefill_kernels(
         cache, adapter.build_config(), seq_len=SEQ_LEN, cpu_attn=False
     )
@@ -135,14 +144,35 @@ def audit(model):
             if obj not in built:
                 problems.append(f"{artifact} links {obj}, which nothing compiled")
                 continue
-            match = re.search(r"n(\d+)\.o$", obj)
-            # A bare name (mm_m32.o / mm_m64.o) is the tile_n=128 alias.
-            claimed = int(match.group(1)) if match else 128
-            actual = built[obj].get("DIM_N")
-            if actual != claimed:
+            match = re.match(r"mm_m(\d+)(?:n(\d+))?\.o$", obj)
+            if not match:
+                problems.append(f"{artifact} links unparseable GEMM name {obj}")
+                continue
+            # A bare name (mm_m32.o / mm_m64.o) is the tile_n=128 alias. The
+            # FULL identity is (tile_m, tile_n, sym_suffix) -- derived from the
+            # production naming authority, not re-encoded here (review of #37,
+            # P1: DIM_N alone lets a wrong-DIM_M or wrong-suffix build pass).
+            claimed_m = int(match.group(1))
+            claimed_n = int(match.group(2)) if match.group(2) else 128
+            want_suffix, want_obj = gemm_variant_names(claimed_m, claimed_n)
+            assert want_obj == obj, (want_obj, obj)
+            got = built[obj]
+            if got.get("DIM_M") != claimed_m:
                 problems.append(
-                    f"{artifact} links {obj} but it was built at DIM_N={actual} "
+                    f"{artifact} links {obj} but it was built at "
+                    f"DIM_M={got.get('DIM_M')} -- wrong tile height behind the name"
+                )
+            if got.get("DIM_N") != claimed_n:
+                problems.append(
+                    f"{artifact} links {obj} but it was built at "
+                    f"DIM_N={got.get('DIM_N')} "
                     f"-- it would link cleanly and compute the wrong tile width"
+                )
+            if got.get("SYM_SUFFIX", "") != want_suffix:
+                problems.append(
+                    f"{artifact} links {obj} but it was compiled with "
+                    f"SYM_SUFFIX={got.get('SYM_SUFFIX', '')!r} (want "
+                    f"{want_suffix!r}) -- the module's symbols would not resolve"
                 )
     return sorted(built), linked, problems
 
