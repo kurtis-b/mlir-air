@@ -512,6 +512,26 @@ The high tier is checked at `atol = 1.5e-3 × sqrt(8192 / K)`, not the fixed `1.
 
 <!-- END transformer-layer-sweep baseline_768 -->
 
+<!-- BEGIN transformer-layer-sweep baseline_512 -->
+### Transformer-layer execution study — `baseline_512` sweep
+
+Same sweep, provenance, and carry gate as the `baseline_768` section above (swept on the study branch by `transformer_layer/sweep/registry_sweep.py`; tag `pre-port-20260829` is the persistent measurement record, and rows are carried verbatim from it). **Bold** = the winner recorded in `best` for that tier. The per-method `herd` override on short-sequence rows and the K-scaled high-precision `atol` apply exactly as documented in the `baseline_768` preamble above, here at this family's `K = 512` (`qkv_proj`, `ffn_up`, `o_proj`) and `K = 2048` (`ffn_down`); the tag's ladder omits two points (`ffn_down` has no `seq = 2048` row, `o_proj` no `seq = 512`).
+
+**`ffn_down`** — `K = 2048` → `N = 512`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 64 | 64×2048×512 | 386 | **857** | 488 | 32/256/32/64 (2×4) | 9.3e-3 / 1.3e-2 | ✅ |
+| 128 | 128×2048×512 | 717 | **1657** | 1110 | 32/256/32/64 (4×4) | 9.3e-3 / 1.3e-2 | ✅ |
+| 256 | 256×2048×512 | 1205 | **3211** | 2181 | 32/256/32/64 (8×4) | 9.3e-3 / 1.3e-2 | ✅ |
+| 512 | 512×2048×512 | 1769† | 3945† | 4126† | 32/256/32/128 (8×4)† | 9.3e-3 / 1.3e-2 | † tag-only sweep, NOT adopted (Q10): the active registry keeps main's llama-3.2-1B K/V proj @L=512 prefill row — drain 4092 (high) at 32/256/32/128, direct 3481 (low), fused-cast 1665 — all three methods resolve at main's values |
+| 1024 | 1024×2048×512 | 2781† | 4325† | 4819† | 32/256/32/128 (8×4)† | 9.3e-3 / 1.3e-2 | † tag-only sweep, NOT adopted (Q10): the active registry keeps main's llama-3.2-1B K/V proj @L=1024 prefill row — drain 4866 (high) at 32/256/32/128, direct 4167 (low), fused-cast 2765 — all three methods resolve at main's values |
+| 4096 | 4096×2048×512 | 4638† | 4392† | 5132† | 64/256/32/64 (8×4)† | 9.7e-3 / 1.3e-2 | † tag-only sweep, NOT adopted (Q10): the active registry keeps main's llama-3.2-1B K/V proj row — drain 4373 (high) at 32/256/32/128, direct 4273 (low), fused-cast 4270 — `best.high` stays `drain`, not the tag's `fused-cast` |
+| 8192 | 8192×2048×512 | **4881** | 4318 | 5218 | 64/512/32/128 (8×4) | 9.7e-3 / 1.3e-2 | ✅ |
+| 16384 | 16384×2048×512 | **5632** | 4670 | 5330 | 64/256/32/64 (8×4) | 9.7e-3 / 1.3e-2 | ✅ |
+
+<!-- END transformer-layer-sweep baseline_512 -->
+
 ## How to reproduce (correctness + performance, one command)
 
 `make run` drives `run.py --compile-mode compile-and-run` (correctness + `--perf-iters` timing in one invocation). Example: the 2048×8192×2048 (Down) row.
