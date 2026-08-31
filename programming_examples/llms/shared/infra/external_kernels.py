@@ -319,12 +319,12 @@ def mv_heads_object_name(head_dim=128):
     return f"mv_heads_hd{head_dim}.o"
 
 
-def compile_mv_int4_bf16(m_tile=8, k_chunk=2048, gs=128):
+def compile_mv_int4_bf16(m_tile=8, k_chunk=2048, gs=128, r=None):
     """Compile mv_int4_bf16.o (int4-AWQ GEMV micro-kernel) from source.
 
-    Produces the config-tagged `mv_int4_bf16_gemv_m{m_tile}_gs{gs}_k{k_chunk}.o`
-    and stages it as the canonical `mv_int4_bf16.o` (the name link_with
-    attributes expect). The int4 GEMM prefill compiles the same .cc with
+    Produces the config-tagged
+    `mv_int4_bf16_gemv_m{m_tile}_gs{gs}_k{k_chunk}_r{r}.o` and stages it as
+    the canonical `mv_int4_bf16.o` (the name link_with attributes expect). The int4 GEMM prefill compiles the same .cc with
     DIM_M=16 to a different config-tagged name (`mv_int4_bf16_matmul.o`),
     so the two variants don't clobber each other in CWD across sessions;
     the last-staged canonical .o is whichever variant the current compile
@@ -337,9 +337,41 @@ def compile_mv_int4_bf16(m_tile=8, k_chunk=2048, gs=128):
     reused the gs=128 kernel. The canonical copy runs on every call, so the
     right variant is staged even when the tagged object is reused. Adding a
     -D below without adding it to the name re-opens the same hole.
+
+    `r` is the inner vector width of the GEMV bodies (queue item 23: at r=64
+    the weight load fuses into one `vldb.unpack`, 47 -> 34 vector ops per
+    gs=128 group, measured at study commit 20fad8c8). Default None computes
+    the kernel's own DIM_R predicate (64 where gs % 64 == 0, else 32) and
+    passes it explicitly; the kernel static_asserts the two agree. `r` is
+    baked in exactly like DIM_GS and DIM_K, so the tag carries it: without
+    that, a control arm rebuilt at r=32 in a CWD that already held an r=64
+    object would silently link the r=64 kernel and be reported as the
+    control -- an A/B whose two arms are the same bytes. `MV_INT4_GEMV_R` in
+    the environment is the only override besides the `r=` argument, and it
+    exists for exactly that A/B.
     """
+    if r is None:
+        env_r = os.environ.get("MV_INT4_GEMV_R")
+        if env_r:
+            try:
+                r = int(env_r)
+            except ValueError:
+                raise ValueError(
+                    f"MV_INT4_GEMV_R={env_r!r} is not an integer -- refusing to "
+                    "guess an inner vector width"
+                )
+        else:
+            # Must match mv_int4_bf16.cc's DIM_R predicate exactly.
+            r = 64 if gs % 64 == 0 else 32
+    if r not in (32, 64):
+        raise ValueError(f"inner vector width r={r} is not 32 or 64")
+    if gs % r:
+        raise ValueError(
+            f"inner vector width r={r} does not divide group size gs={gs}; the "
+            "kernel static_asserts this and the build would fail late"
+        )
     src = _PROJ_ROOT / "matrix_vector_multiplication" / "int4_awq" / "mv_int4_bf16.cc"
-    tagged = f"mv_int4_bf16_gemv_m{m_tile}_gs{gs}_k{k_chunk}.o"
+    tagged = f"mv_int4_bf16_gemv_m{m_tile}_gs{gs}_k{k_chunk}_r{r}.o"
     _compile_kernel(
         src,
         tagged,
@@ -347,6 +379,7 @@ def compile_mv_int4_bf16(m_tile=8, k_chunk=2048, gs=128):
             f"-DDIM_M={m_tile}",
             f"-DDIM_K={k_chunk}",
             f"-DDIM_GS={gs}",
+            f"-DDIM_R={r}",
         ],
     )
     shutil.copy2(tagged, "mv_int4_bf16.o")

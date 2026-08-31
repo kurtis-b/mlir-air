@@ -52,6 +52,35 @@
 #define DIM_K_CHUNK 128
 #endif
 
+// Inner vector width `r` of the GEMV bodies. At r = 64 the weight load
+// expression fuses into a single `vldb.unpack` instead of `vldb.128` + a
+// separate `vunpack`, because the load unit's int4->int8 unpack mode wants a
+// 32-byte source: 47 -> 34 vector ops per gs=128 group (queue item 23,
+// measured at study commit 20fad8c8). The arithmetic is unchanged -- only
+// the lane count of the per-group accumulate differs, so there is no format,
+// layout, packer or accuracy-class consequence.
+//
+// It is a PREDICATE, not a constant, because `matvec_int4_bf16_impl`
+// static_asserts `gs % r == 0` and two shipped configurations run gs = 32:
+// SmolLM2-1.7B int4 decode (q4_0 blocks, `smollm2_1_7b_int4_decode.py`) and
+// the `run_q4_0*` targets of this directory's Makefile. Those keep r = 32 and
+// gain nothing; gs = 128 (llama32_1b_int4, qwen3_0_6b w4_decode,
+// decode_ffn_swiglu, the `run_packed*` lits) takes r = 64.
+//
+// Overridable so a control arm can rebuild the r = 32 body at gs = 128. The
+// host-side builder (`llms/shared/infra/external_kernels.py`) computes the
+// same predicate and passes it explicitly; the two must agree, and the
+// static_assert below is what catches it if they ever do not.
+#ifndef DIM_R
+#define DIM_R (DIM_GS % 64 == 0 ? 64 : 32)
+#endif
+
+static_assert(DIM_R == 32 || DIM_R == 64,
+              "DIM_R must be 32 or 64 -- no other width is measured");
+static_assert(DIM_GS % DIM_R == 0,
+              "DIM_R must divide DIM_GS (r=64 needs a group size multiple "
+              "of 64)");
+
 static_assert(DIM_K % DIM_GS == 0, "DIM_K must be a multiple of DIM_GS");
 static_assert(DIM_K_CHUNK % DIM_GS == 0,
               "DIM_K_CHUNK must be a multiple of DIM_GS");
@@ -406,7 +435,7 @@ void matvec_int4_bf16_packed(uint8_t *packed, bfloat16 *b, bfloat16 *c) {
   uint8_t *a_q = packed;
   bfloat16 *a_s = reinterpret_cast<bfloat16 *>(packed + Q_BYTES);
   uint8_t *a_z = packed + Q_BYTES + S_BYTES;
-  matvec_int4_bf16_impl<DIM_M, DIM_K, DIM_GS, 32>(a_q, a_s, a_z, b, c);
+  matvec_int4_bf16_impl<DIM_M, DIM_K, DIM_GS, DIM_R>(a_q, a_s, a_z, b, c);
 }
 
 // Same as matvec_int4_bf16_packed but takes an offset into b. Lets callers
@@ -418,8 +447,8 @@ void matvec_int4_bf16_packed_b_offset(uint8_t *packed, bfloat16 *b,
   uint8_t *a_q = packed;
   bfloat16 *a_s = reinterpret_cast<bfloat16 *>(packed + Q_BYTES);
   uint8_t *a_z = packed + Q_BYTES + S_BYTES;
-  matvec_int4_bf16_impl<DIM_M, DIM_K, DIM_GS, 32>(a_q, a_s, a_z, b + b_offset,
-                                                  c);
+  matvec_int4_bf16_impl<DIM_M, DIM_K, DIM_GS, DIM_R>(a_q, a_s, a_z,
+                                                     b + b_offset, c);
 }
 
 // Overwriting matvec entry for callers that don't K-chunk. Folds the per-tile
@@ -430,7 +459,7 @@ void matvec_int4_bf16_packed_store(uint8_t *packed, bfloat16 *b, bfloat16 *c) {
   uint8_t *a_q = packed;
   bfloat16 *a_s = reinterpret_cast<bfloat16 *>(packed + Q_BYTES);
   uint8_t *a_z = packed + Q_BYTES + S_BYTES;
-  matvec_int4_bf16_store_impl<DIM_M, DIM_K, DIM_GS, 32>(a_q, a_s, a_z, b, c);
+  matvec_int4_bf16_store_impl<DIM_M, DIM_K, DIM_GS, DIM_R>(a_q, a_s, a_z, b, c);
 }
 
 void zero_vectorized_bf16(bfloat16 *c) { zero_impl<DIM_M>(c); }

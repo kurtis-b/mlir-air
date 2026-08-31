@@ -22,6 +22,12 @@ TILE_K_L2 ?= $(K)
 HERD_M  ?= 2
 HERD_N  ?= 4
 
+# Inner vector width baked into mv_int4_bf16.o's GEMV bodies. Empty uses the
+# source's own DIM_R predicate (64 where GS % 64 == 0, else 32). R=32 at
+# GS=128 rebuilds the pre-r64 control arm; R=64 at GS % 64 != 0 is refused by
+# the kernel's static_assert.
+R ?=
+
 ifdef PEANO_INSTALL_DIR
   BUILD_DIR := build_peano
 else
@@ -50,12 +56,35 @@ compile-kernel:
 	fi
 	$(PEANO_INSTALL_DIR)/bin/clang++ ${PEANOWRAP2P_FLAGS} \
 		-DDIM_M=$(TILE_M) -DDIM_N=$(TILE_N) -DDIM_K_CHUNK=$(TILE_K_L1) -DDIM_GS=$(GS) \
+		$(if $(R),-DDIM_R=$(R),) \
 		-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16 \
 		-c $(INT4_SRCDIR)/mv_int4_bf16.cc -o $(BUILD_DIR)/mv_int4_bf16.o
 
 run_packed: compile-kernel
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
 	  ${powershell} $(PYTHON) ${srcdir}/matmul_int4_packed.py $(PY_ARGS)
+
+# r-width A/B arms of run_packed: the SHIPPED file and entries at both
+# widths, differing only in -DDIM_R -- how the r=64 decision was measured
+# (study commit 20fad8c8, devq 835). run_packed_r64 at GS % 64 != 0 fails in
+# compile-kernel by static_assert, deliberately.
+run_packed_r32:
+	$(MAKE) -f $(firstword $(MAKEFILE_LIST)) run_packed R=32
+
+run_packed_r64:
+	$(MAKE) -f $(firstword $(MAKEFILE_LIST)) run_packed R=64
+
+# The r=64 PROTOTYPE control object (distinct entry symbols
+# matvec_int4_bf16_packed_r64 / zero_vectorized_bf16_r64, linked by no
+# shipped ELF) at its study shape (m=8, k=1024, gs=128): keep it compiling.
+compile-kernel-r64:
+	mkdir -p $(BUILD_DIR)
+	@if [ -z "$(PEANO_INSTALL_DIR)" ]; then \
+		echo "Error: PEANO_INSTALL_DIR not set (source utils/env_setup.sh)."; \
+		exit 1; \
+	fi
+	$(PEANO_INSTALL_DIR)/bin/clang++ ${PEANOWRAP2P_FLAGS} \
+		-c $(INT4_SRCDIR)/mv_int4_bf16_r64.cc -o $(BUILD_DIR)/mv_int4_bf16_r64.o
 
 run1x1: compile-kernel
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \
