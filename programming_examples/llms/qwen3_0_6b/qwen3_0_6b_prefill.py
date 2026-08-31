@@ -17,8 +17,11 @@ Qwen3 diverges from LLAMA-3.2 in two ways that break the llama
         q_proj : 1024 -> 2048   (16 heads x 128)
         k/v    : 1024 -> 1024   (8 heads x 128)
         o_proj : 2048 -> 1024   (NOT square — llama's o_ffn assumes square wo)
-     We build a Qwen-specific o_ffn ELF whose O GEMM is K=q_dim=2048,
-     N=emb_dim=1024; the residual/RMSNorm/FFN tail stays emb_dim=1024.
+     The o_ffn ELF is built through the shared mixed-method seam
+     (shared.builders.o_ffn_multi._build_o_ffn with q_dim=2048): each GEMM
+     independently resolves drain vs fused-cast per the registry, so the
+     short-seq rows (O/Gate/Up drain at seq 512/1024) co-link with a
+     fused-cast Down; the residual/RMSNorm/FFN tail stays emb_dim=1024.
 
 Attention uses the CPU fallback (cpu_attn=True), matching llama prefill.
 """
@@ -73,347 +76,99 @@ def build_rms_qkv_qknorm_rope_module(seq_len, config):
 
 # ---------------------------------------------------------------------------
 # Builder 2: O proj (decoupled wo: q_dim->emb_dim) + Residual + FFN.
-#   Copy of shared _build_o_ffn but the O GEMM is K=q_dim, N=emb_dim, with
-#   attn_out arg shape (seq, q_dim) and wo (q_dim, emb_dim). Everything from
-#   the residual add onward stays emb_dim.
+#   Shared mixed-method seam (shared.builders.o_ffn_multi._build_o_ffn):
+#   each of the 4 GEMMs independently resolves drain vs fused-cast per the
+#   registry (o_ffn_gemm_layout), so the decoupled O (seq x q_dim x emb_dim)
+#   can be drain while Down stays fused-cast. Replaces the all-fused-cast
+#   copy that asserted one _m64 suffix for all four and refused seq 512/1024.
 # ---------------------------------------------------------------------------
 
 
-def build_o_ffn_qwen_module(
-    seq_len,
-    emb_dim,
-    q_dim,
-    hidden_dim,
-    o_herd_m=8,
-    o_herd_n=4,
-    gate_herd_m=8,
-    gate_herd_n=4,
-    down_herd_m=8,
-    down_herd_n=4,
-    swiglu_tile_n=4096,
-    swiglu_herd_x=8,
-    swiglu_herd_y=1,
-):
-    """O-proj(q_dim->emb_dim) + Residual + FFN, 8 launches.
+def build_o_ffn_qwen_module(seq_len, emb_dim, q_dim, hidden_dim):
+    """O-proj(q_dim->emb_dim) + Residual + FFN via the shared per-GEMM seam.
 
-    Func args:
-      %arg0  attn_out  (seq, q_dim)         <- DECOUPLED (q_dim, not emb_dim)
-      %arg1  wo        (q_dim, emb_dim)      <- DECOUPLED
-      %arg2  proj      (seq, emb_dim)
-      %arg3  x_resid   (seq, emb_dim)
-      %arg4  res1      (seq, emb_dim)
-      %arg5  ffn_norm  (emb_dim,)
-      %arg6  normed2   (seq, emb_dim)
-      %arg7  w_gate    (emb_dim, hidden)
-      %arg8  gate      (seq, hidden)
-      %arg9  w_up      (emb_dim, hidden)
-      %arg10 up        (seq, hidden)
-      %arg11 swiglu    (seq, hidden)
-      %arg12 w_down    (hidden, emb_dim)
-      %arg13 down      (seq, emb_dim)
-      %arg14 output    (seq*emb_dim,)
-      %arg15..18  f32 C-scratch (proj[seq,emb], gate[seq,hid], up[seq,hid], down[seq,emb])
+    Returns (module, scratch_for). scratch_for (order O/Gate/Up/Down, None =
+    drain) is the ELF's f32 C-scratch arg-layout contract from base index 15;
+    the host side derives the same contract registry-side through
+    _o_ffn_scratch_plan (compile_all_kernels asserts them equal).
     """
-    from shared.builders.gemm_builder import _build_gemm_module, gemm_registry_config
-    from shared.builders.o_ffn_multi import _build_add_2d_to_2d
-    from shared.infra.stitching import (
-        _wrap_ir_in_launch,
-        stitch_elf,
-        KernelSlice,
-        FuncArg,
-    )
-    from weighted_rms_norm.weighted_rms_norm import build_module as build_rms
-    from silu_and_mul.silu_and_mul import build_module_2d as build_swiglu
-    from air.ir import MemRefType, IntegerAttr, AffineMap, AffineExpr
-    from air.ir import AffineSymbolExpr, AffineConstantExpr, AffineMapAttr, VectorType
-    from air.dialects.air import module_builder, launch, segment, herd, dma_memcpy_nd
-    from air.dialects.air import MemorySpace, T
-    from air.dialects.affine import apply as affine_apply
-    from air.dialects import arith
-    from air.dialects.memref import AllocOp, DeallocOp, subview
-    from air.dialects.vector import transfer_read, transfer_write
-    from air.dialects.func import FuncOp
-    from air.dialects.scf import for_ as range_, yield_
-    from air.backend.xrt_runner import type_mapper
+    from shared.builders.o_ffn_multi import _build_o_ffn
 
-    n_total = seq_len * emb_dim
-
-    # O GEMM is decoupled: M=seq, K=q_dim, N=emb_dim.
-    o_spec = gemm_registry_config(seq_len, q_dim, emb_dim, "bf16", "high")
-    g_spec = gemm_registry_config(seq_len, emb_dim, hidden_dim, "bf16", "high")
-    d_spec = gemm_registry_config(seq_len, hidden_dim, emb_dim, "bf16", "high")
-
-    def _tiles(spec):
-        return (
-            dict(spec["build_kwargs"]),
-            spec["tile_m"],
-            spec["tile_k_l2"],
-            spec["tile_k_l1"],
-            spec["tile_n"],
-        )
-
-    _o_kw, _o_m, _o_k2, _o_k1, _o_n = _tiles(o_spec)
-    _g_kw, _g_m, _g_k2, _g_k1, _g_n = _tiles(g_spec)
-    _d_kw, _d_m, _d_k2, _d_k1, _d_n = _tiles(d_spec)
-
-    print(f"  [1/8] O GEMM ({o_spec['method']})  {seq_len}x{q_dim}x{emb_dim}...")
-    o_ir = str(
-        _build_gemm_module(
-            seq_len,
-            q_dim,
-            emb_dim,
-            _o_m,
-            _o_k2,
-            _o_k1,
-            _o_n,
-            o_herd_m,
-            o_herd_n,
-            **_o_kw,
-        )
-    )
-    print("  [2/8] Residual Add...")
-    res_add_ir = str(_build_add_2d_to_2d(seq_len, emb_dim, bfloat16))
-    print("  [3/8] FFN RMSNorm...")
-    rms_ir = _wrap_ir_in_launch(
-        str(build_rms(seq_len, emb_dim, bfloat16, 16, herd_x=8))
-    )
-    print(
-        f"  [4/8] Gate GEMM ({g_spec['method']})  {seq_len}x{emb_dim}x{hidden_dim}..."
-    )
-    gate_ir = str(
-        _build_gemm_module(
-            seq_len,
-            emb_dim,
-            hidden_dim,
-            _g_m,
-            _g_k2,
-            _g_k1,
-            _g_n,
-            gate_herd_m,
-            gate_herd_n,
-            **_g_kw,
-        )
-    )
-    print(f"  [5/8] Up GEMM ({g_spec['method']})...")
-    up_ir = str(
-        _build_gemm_module(
-            seq_len,
-            emb_dim,
-            hidden_dim,
-            _g_m,
-            _g_k2,
-            _g_k1,
-            _g_n,
-            gate_herd_m,
-            gate_herd_n,
-            **_g_kw,
-        )
-    )
-    print("  [6/8] SwiGLU...")
-    swiglu_ir = _wrap_ir_in_launch(
-        str(
-            build_swiglu(
-                seq_len,
-                hidden_dim,
-                swiglu_tile_n,
-                bfloat16,
-                swiglu_herd_x,
-                swiglu_herd_y,
-            )
-        )
-    )
-    print(
-        f"  [7/8] Down GEMM ({d_spec['method']})  {seq_len}x{hidden_dim}x{emb_dim}..."
-    )
-    down_ir = str(
-        _build_gemm_module(
-            seq_len,
-            hidden_dim,
-            emb_dim,
-            _d_m,
-            _d_k2,
-            _d_k1,
-            _d_n,
-            down_herd_m,
-            down_herd_n,
-            **_d_kw,
-        )
-    )
-
-    print("  [8/8] FFN Add (2D -> 1D)...")
-
-    @module_builder
-    def _build_add_2d_to_1d():
-        from air.dialects.memref import collapse_shape as memref_collapse_shape
-
-        xrt_dtype = type_mapper(bfloat16)
-        l3_2d_ty = MemRefType.get([seq_len, emb_dim], xrt_dtype)
-        l3_1d_ty = MemRefType.get([n_total], xrt_dtype)
-        total_tiles = 8
-        chunk_size = n_total // total_tiles
-        tile_n = emb_dim
-        l1_space = IntegerAttr.get(T.i32(), MemorySpace.L1)
-        l1_ty = MemRefType.get([tile_n], xrt_dtype, memory_space=l1_space)
-        vec_ty = VectorType.get([16], xrt_dtype)
-        identity_map = AffineMapAttr.get(AffineMap.get_identity(1))
-
-        @FuncOp.from_py_func(l3_2d_ty, l3_2d_ty, l3_1d_ty)
-        def eltwise_add(a_2d, b_2d, out_1d):
-            @launch(operands=[a_2d, b_2d, out_1d])
-            def add_launch(l_a, l_b, l_out):
-                a_flat = memref_collapse_shape(l3_1d_ty, l_a, [[0, 1]])
-                b_flat = memref_collapse_shape(l3_1d_ty, l_b, [[0, 1]])
-
-                @segment(name="add_seg", operands=[a_flat, b_flat, l_out])
-                def add_seg(s_a, s_b, s_out):
-                    offset_map = AffineMap.get(
-                        0,
-                        3,
-                        [
-                            AffineExpr.get_add(
-                                AffineSymbolExpr.get(0),
-                                AffineExpr.get_mul(
-                                    AffineExpr.get_add(
-                                        AffineExpr.get_mul(
-                                            AffineSymbolExpr.get(1),
-                                            AffineConstantExpr.get(1),
-                                        ),
-                                        AffineSymbolExpr.get(2),
-                                    ),
-                                    AffineConstantExpr.get(chunk_size),
-                                ),
-                            )
-                        ],
-                    )
-
-                    @herd(name="add_herd", sizes=[8, 1], operands=[s_a, s_b, s_out])
-                    def add_body(_tx, _ty, _sx, _sy, h_a, h_b, h_out):
-                        l1_a = AllocOp(l1_ty, [], [])
-                        l1_b = AllocOp(l1_ty, [], [])
-                        l1_out = AllocOp(l1_ty, [], [])
-                        c0 = arith.ConstantOp.create_index(0)
-                        cst0 = arith.ConstantOp(xrt_dtype, 0.0)
-                        for loop_iv in range_(0, chunk_size, tile_n):
-                            offset = affine_apply(offset_map, [loop_iv, _tx, _ty])
-                            dma_memcpy_nd(
-                                l1_a,
-                                h_a,
-                                src_offsets=[offset],
-                                src_sizes=[tile_n],
-                                src_strides=[1],
-                            )
-                            dma_memcpy_nd(
-                                l1_b,
-                                h_b,
-                                src_offsets=[offset],
-                                src_sizes=[tile_n],
-                                src_strides=[1],
-                            )
-                            for j in range_(0, tile_n, 16):
-                                sub_a = subview(l1_a.result, [j], [16], [1])
-                                sub_b = subview(l1_b.result, [j], [16], [1])
-                                sub_out = subview(l1_out.result, [j], [16], [1])
-                                v_a = transfer_read(
-                                    vec_ty, sub_a, [c0], identity_map, cst0, [True]
-                                )
-                                v_b = transfer_read(
-                                    vec_ty, sub_b, [c0], identity_map, cst0, [True]
-                                )
-                                v_sum = arith.addf(v_a, v_b)
-                                transfer_write(
-                                    None, v_sum, sub_out, [c0], identity_map, [True]
-                                )
-                                yield_([])
-                            dma_memcpy_nd(
-                                h_out,
-                                l1_out,
-                                dst_offsets=[offset],
-                                dst_sizes=[tile_n],
-                                dst_strides=[1],
-                            )
-                            yield_([])
-                        DeallocOp(l1_a)
-                        DeallocOp(l1_b)
-                        DeallocOp(l1_out)
-
-    ffn_add_ir = str(_build_add_2d_to_1d())
-
-    # All GEMMs here resolve to fused-cast (large shapes). One mm.o suffix.
-    _gemm_sym = o_spec["sym_suffix"]
-    _gemm_externs = {
-        "@op_has_no_registered_library_name" + _gemm_sym,
-        "@zero_f32_mn" + _gemm_sym,
-        "@f32_to_bf16_mn" + _gemm_sym,
-    }
-    assert g_spec["sym_suffix"] == _gemm_sym and d_spec["sym_suffix"] == _gemm_sym, (
-        "Qwen o_ffn assumes all 4 GEMMs share the fused-cast mm_m64.o suffix; "
-        f"got O={o_spec['method']} G={g_spec['method']} D={d_spec['method']}"
-    )
-
-    base_args = [
-        FuncArg("%arg0", f"memref<{seq_len}x{q_dim}xbf16>"),  # attn_out (DECOUPLED)
-        FuncArg("%arg1", f"memref<{q_dim}x{emb_dim}xbf16>"),  # wo       (DECOUPLED)
-        FuncArg("%arg2", f"memref<{seq_len}x{emb_dim}xbf16>"),  # proj
-        FuncArg("%arg3", f"memref<{seq_len}x{emb_dim}xbf16>"),  # x_resid
-        FuncArg("%arg4", f"memref<{seq_len}x{emb_dim}xbf16>"),  # res1
-        FuncArg("%arg5", f"memref<{emb_dim}xbf16>"),  # ffn_norm
-        FuncArg("%arg6", f"memref<{seq_len}x{emb_dim}xbf16>"),  # normed2
-        FuncArg("%arg7", f"memref<{emb_dim}x{hidden_dim}xbf16>"),  # w_gate
-        FuncArg("%arg8", f"memref<{seq_len}x{hidden_dim}xbf16>"),  # gate
-        FuncArg("%arg9", f"memref<{emb_dim}x{hidden_dim}xbf16>"),  # w_up
-        FuncArg("%arg10", f"memref<{seq_len}x{hidden_dim}xbf16>"),  # up
-        FuncArg("%arg11", f"memref<{seq_len}x{hidden_dim}xbf16>"),  # swiglu
-        FuncArg("%arg12", f"memref<{hidden_dim}x{emb_dim}xbf16>"),  # w_down
-        FuncArg("%arg13", f"memref<{seq_len}x{emb_dim}xbf16>"),  # down
-        FuncArg("%arg14", f"memref<{n_total}xbf16>"),  # output
-    ]
-    scratch_args = [
-        FuncArg("%arg15", f"memref<{seq_len}x{emb_dim}xf32>"),
-        FuncArg("%arg16", f"memref<{seq_len}x{hidden_dim}xf32>"),
-        FuncArg("%arg17", f"memref<{seq_len}x{hidden_dim}xf32>"),
-        FuncArg("%arg18", f"memref<{seq_len}x{emb_dim}xf32>"),
-    ]
-
-    slices = [
-        KernelSlice(o_ir, "og", {0: 0, 1: 1, 2: 15, 3: 2}, extern_syms=_gemm_externs),
-        KernelSlice(res_add_ir, "ra", {0: 2, 1: 3, 2: 4}, private_from=False),
-        KernelSlice(rms_ir, "rm", {0: 4, 1: 5, 2: 6}, private_from=False),
-        KernelSlice(
-            gate_ir,
-            "gg",
-            {0: 6, 1: 7, 2: 16, 3: 8},
-            extern_syms=_gemm_externs,
-            private_from=False,
-        ),
-        KernelSlice(
-            up_ir,
-            "ug",
-            {0: 6, 1: 9, 2: 17, 3: 10},
-            extern_syms=_gemm_externs,
-            private_from=False,
-        ),
-        KernelSlice(
-            swiglu_ir, "sw", {0: 8, 1: 10, 2: 11}, extern_syms={"@silu_and_mul_bf16"}
-        ),
-        KernelSlice(
-            down_ir,
-            "dg",
-            {0: 11, 1: 12, 2: 18, 3: 13},
-            extern_syms=_gemm_externs,
-            private_from=False,
-        ),
-        KernelSlice(ffn_add_ir, "fa", {0: 13, 1: 4, 2: 14}, private_from=False),
-    ]
-
-    module = stitch_elf(
-        "o_ffn_qwen",
-        base_args,
-        slices,
-        scratch_args=scratch_args,
+    return _build_o_ffn(
+        seq_len=seq_len,
+        emb_dim=emb_dim,
+        hidden_dim=hidden_dim,
+        q_dim=q_dim,
+        func_name="o_ffn_qwen",
         debug_dump_path="/tmp/debug_o_ffn_qwen.mlir",
     )
-    print(f"  o_ffn_qwen module: {len(str(module).splitlines())} lines, parsed OK")
-    return module
+
+
+def _o_ffn_scratch_plan(seq_len, config):
+    """Registry-driven f32 C-scratch plan for the o_ffn_qwen ELF.
+
+    Returns (scratch_for, shapes, inter): scratch_for as in
+    build_o_ffn_qwen_module; shapes the (seq_len, cols) of each fused-cast
+    GEMM's f32 scratch arg in O/Gate/Up/Down order; inter their arg-index
+    set. Derived from the SAME o_ffn_gemm_layout lookup _build_o_ffn builds
+    from (llama32_1b_prefill._o_ffn_scratch_plan's pattern, decoupled-O
+    variant), so the host args cannot drift from the ELF signature -- and it
+    reads only the registry JSON, so the loaded-cache verify path (which
+    skips compile_all_kernels) stays aligned without rebuilding any module.
+    """
+    from shared.builders.gemm_builder import o_ffn_gemm_layout
+
+    emb_dim, hidden_dim = config.emb_dim, config.hidden_dim
+    q_dim = config.n_heads * config.head_dim
+    scratch_for = o_ffn_gemm_layout(seq_len, emb_dim, hidden_dim, q_dim=q_dim)[
+        "scratch_for"
+    ]
+    cols = (emb_dim, hidden_dim, hidden_dim, emb_dim)
+    shapes = [(seq_len, c) for sc, c in zip(scratch_for, cols) if sc is not None]
+    inter = {sc for sc in scratch_for if sc is not None}
+    return scratch_for, shapes, inter
+
+
+_SCRATCH_SIDECAR = "o_ffn_qwen.scratch.json"
+
+
+def _checked_o_ffn_plan(cache, seq_len, config):
+    """The registry-derived plan, BOUND to the cached ELF (review of #51, P1).
+
+    compile_all_kernels persists the plan it asserted against the builder as
+    a sidecar beside the manifest; a loaded cache must match the recomputed
+    plan or dispatch is refused with a sentence (an old ELF called with a
+    newer registry's arg plan would misbind XRT arguments). A cache without
+    the sidecar predates this contract, which is provably safe only for the
+    all-fused seq=2048 layout (short-seq ELFs could not be built before the
+    mixed-method rewire) -- anything else is refused as unverifiable.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    plan, shapes, inter = _o_ffn_scratch_plan(seq_len, config)
+    sc = _Path(cache.cache_dir) / _SCRATCH_SIDECAR
+    if sc.is_file():
+        rec = _json.loads(sc.read_text())
+        if rec.get("seq_len") != seq_len or rec.get("scratch_for") != list(plan):
+            raise RuntimeError(
+                f"o_ffn_qwen cache {str(cache.cache_dir)!r} was compiled with "
+                f"scratch plan {rec.get('scratch_for')} at seq_len "
+                f"{rec.get('seq_len')}, but the current registry derives "
+                f"{list(plan)} at seq_len {seq_len} -- the cached ELF's "
+                "argument layout does not match. Recompile (`make compile`) "
+                "or point at a cache built from this registry."
+            )
+    else:
+        legacy_ok = seq_len == 2048 and all(x is not None for x in plan)
+        if not legacy_ok:
+            raise RuntimeError(
+                f"o_ffn_qwen cache {str(cache.cache_dir)!r} has no scratch "
+                "sidecar and the requested layout is not the legacy all-fused "
+                "seq=2048 shape -- cannot verify the cached ELF's argument "
+                "layout. Recompile (`make compile`)."
+            )
+    return plan, shapes, inter
 
 
 # ---------------------------------------------------------------------------
@@ -479,11 +234,23 @@ def compile_all_kernels(cache, config, seq_len, verbose=False, cpu_attn=False):
         "rms_qkv_qknorm_rope", fused_mod, _rms_qkv_qknorm_rope_backend(verbose)
     )
 
-    print("\n--- o_ffn_qwen (O proj decoupled + Residual + FFN) ---")
-    cache.compile_and_cache(
-        "o_ffn_qwen",
-        build_o_ffn_qwen_module(seq_len, emb_dim, q_dim, hidden_dim),
-        _o_ffn_backend(verbose),
+    print("\n--- o_ffn_qwen (O proj decoupled + Residual + FFN, per-GEMM method) ---")
+    offn_mod, offn_scratch = build_o_ffn_qwen_module(
+        seq_len, emb_dim, q_dim, hidden_dim
+    )
+    offn_plan = _o_ffn_scratch_plan(seq_len, config)[0]
+    assert offn_scratch == offn_plan, (
+        "o_ffn_qwen scratch layout drifted from the registry plan: "
+        f"builder={offn_scratch} plan={offn_plan}"
+    )
+    cache.compile_and_cache("o_ffn_qwen", offn_mod, _o_ffn_backend(verbose))
+    # Persist the asserted plan beside the manifest so a LOADED cache can be
+    # checked against the registry it will be dispatched with (review of #51).
+    import json as _json
+    from pathlib import Path as _Path
+
+    (_Path(cache.cache_dir) / _SCRATCH_SIDECAR).write_text(
+        _json.dumps({"seq_len": seq_len, "scratch_for": list(offn_plan)})
     )
 
     # Flash Attention (head-first, head_dim=128). Skip if using CPU fallback.
@@ -635,18 +402,19 @@ def preload_prefill_weights(weights, config, cache, seq_len, rope_lut_bf16):
             ),  # 12 w_down (static)
             np.zeros((seq_len, emb_dim), dtype=bfloat16),  # 13 down (inter)
             np.zeros(n_total, dtype=bfloat16),  # 14 output (inter)
-            np.zeros((seq_len, emb_dim), dtype=np.float32),  # 15 scratch (inter)
-            np.zeros((seq_len, hidden_dim), dtype=np.float32),  # 16 scratch (inter)
-            np.zeros((seq_len, hidden_dim), dtype=np.float32),  # 17 scratch (inter)
-            np.zeros((seq_len, emb_dim), dtype=np.float32),  # 18 scratch (inter)
         ]
+        # f32 C-scratch tail (base index 15): one arg per FUSED-CAST GEMM per
+        # the registry plan (mixed methods at seq 512/1024 declare fewer than
+        # 4 -- the hardcoded four would overrun the ELF's signature).
+        _, offn_shapes, offn_inter = _checked_o_ffn_plan(cache, seq_len, config)
+        offn_args += [np.zeros(s, dtype=np.float32) for s in offn_shapes]
         cache.load_and_run(
             "o_ffn_qwen",
             _o_ffn_backend(),
             *offn_args,
             output_indices=[14],
             static_input_indices={1, 5, 7, 9, 12},
-            intermediate_indices={2, 4, 6, 8, 10, 11, 13, 14, 15, 16, 17, 18},
+            intermediate_indices={2, 4, 6, 8, 10, 11, 13, 14} | offn_inter,
             bo_key=f"o_ffn_qwen_L{layer_idx}",
             shared_nonstatic=True,
         )
@@ -753,18 +521,17 @@ def run_transformer_block_qwen3(
         np.asarray(layer_weights.w_down, dtype=bfloat16).reshape(hidden_dim, emb_dim),
         np.zeros((seq_len, emb_dim), dtype=bfloat16),
         np.zeros(n_total, dtype=bfloat16),
-        np.zeros((seq_len, emb_dim), dtype=np.float32),
-        np.zeros((seq_len, hidden_dim), dtype=np.float32),
-        np.zeros((seq_len, hidden_dim), dtype=np.float32),
-        np.zeros((seq_len, emb_dim), dtype=np.float32),
     ]
+    # f32 C-scratch tail per the registry plan (see _o_ffn_scratch_plan).
+    _, offn_shapes, offn_inter = _o_ffn_scratch_plan(seq_len, config)
+    offn_args += [np.zeros(s, dtype=np.float32) for s in offn_shapes]
     results = cache.load_and_run(
         "o_ffn_qwen",
         _o_ffn_backend(verbose),
         *offn_args,
         output_indices=[14],
         static_input_indices={1, 5, 7, 9, 12},
-        intermediate_indices={2, 4, 6, 8, 10, 11, 13, 14, 15, 16, 17, 18},
+        intermediate_indices={2, 4, 6, 8, 10, 11, 13, 14} | offn_inter,
         bo_key=f"o_ffn_qwen_L{layer_idx}",
         shared_nonstatic=True,
     )
