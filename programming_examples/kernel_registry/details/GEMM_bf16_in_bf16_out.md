@@ -633,6 +633,34 @@ Same sweep, provenance, and carry gate as the `baseline_768` section above (swep
 
 <!-- END transformer-layer-sweep baseline_1024 -->
 
+<!-- BEGIN transformer-layer-sweep qwen3_0_6b -->
+### Transformer-layer execution study — `qwen3_0_6b` sweep
+
+Same sweep, provenance, and carry gate as the `baseline_768` section above (swept on the study branch by `transformer_layer/sweep/registry_sweep.py`; tag `pre-port-20260829` is the persistent measurement record, and rows are carried verbatim from it). **Bold** = the winner recorded in `best` for that tier. The K-scaled high-precision `atol` applies exactly as documented in the `baseline_768` preamble above, here at this family's `K = 1024` (`q_proj`), `K = 2048` (`o_proj_q`), and `K = 3072` (`ffn_down`); the tag swept only `seq = 512` and `seq = 1024`, so no row is short enough to carry the per-method `herd` override — every row uses the file-level `8×4`. Both `ffn_down` shapes collide with main's model-deployment rows and are kept at main's values (daggered below), so this family adds no `ffn_down` row to the JSON.
+
+**`q_proj`** — `K = 1024` → `N = 2048`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 512 | 512×1024×2048 | 2341 | **3862** | 4415 | 32/256/32/128 (8×4) | 9.5e-3 / 1.1e-2 | ✅ |
+| 1024 | 1024×1024×2048 | 3309 | **4007** | 4983 | 32/256/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+
+**`o_proj_q`** — `K = 2048` → `N = 1024`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 512 | 512×2048×1024 | 2764 | **4515** | 4794 | 32/256/32/128 (8×4) | 9.3e-3 / 1.3e-2 | ✅ |
+| 1024 | 1024×2048×1024 | 3910 | **4751** | 5253 | 32/256/32/128 (8×4) | 9.3e-3 / 1.3e-2 | ✅ |
+
+**`ffn_down`** — `K = 3072` → `N = 1024`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 512 | 512×3072×1024 | 3474† | 5010† | 5162† | 32/256/32/128 (8×4)† | 9.4e-3 / 1.4e-2 | † tag-only sweep, NOT adopted (Q10): the active registry keeps main's Qwen3-0.6B Down proj @L=512 prefill row — fused-cast 3645 (high) at 64/256/32/128 — so only `fused-cast` resolves; `precision="low"` has no row here |
+| 1024 | 1024×3072×1024 | 4677† | 5148† | 5465† | 32/256/32/128 (8×4)† | 9.4e-3 / 1.4e-2 | † tag-only sweep, NOT adopted (Q10): the active registry keeps main's Qwen3-0.6B Down proj @L=1024 prefill row — fused-cast 4058 (high) at 64/256/32/128 — so only `fused-cast` resolves; `precision="low"` has no row here |
+
+<!-- END transformer-layer-sweep qwen3_0_6b -->
+
 ## How to reproduce (correctness + performance, one command)
 
 `make run` drives `run.py --compile-mode compile-and-run` (correctness + `--perf-iters` timing in one invocation). Example: the 2048×8192×2048 (Down) row.
