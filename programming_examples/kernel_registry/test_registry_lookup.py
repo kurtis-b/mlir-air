@@ -53,6 +53,11 @@ def test_override_row_returns_its_herd():
     assert tuple(cfg["herd"]) == (2, 4), cfg["herd"]  # high tier -> drain
     cfg = gemm_config(64, 1024, 3072, "bf16", "low")
     assert tuple(cfg["herd"]) == (1, 4), cfg["herd"]  # low tier -> direct
+    # review of #47, P2: the baseline_1024 ffn_up short-M key, both tiers
+    cfg = gemm_config(64, 1024, 4096)
+    assert tuple(cfg["herd"]) == (2, 4), cfg["herd"]  # high tier -> drain
+    cfg = gemm_config(64, 1024, 4096, "bf16", "low")
+    assert tuple(cfg["herd"]) == (1, 4), cfg["herd"]  # low tier -> direct
 
 
 def test_default_row_falls_back_to_file_level_herd():
