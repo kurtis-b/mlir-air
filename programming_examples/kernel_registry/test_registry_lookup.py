@@ -70,6 +70,16 @@ def test_override_row_returns_its_herd():
     assert tuple(cfg["herd"]) == (2, 4), cfg["herd"]  # high tier -> drain
     cfg = gemm_config(64, 1024, 1024, "bf16", "low")
     assert tuple(cfg["herd"]) == (1, 4), cfg["herd"]  # low tier -> direct
+    # R5c-13 / review of #50: the qwen3_0_6b o_proj_q rows make the short
+    # prefill O shapes REACHABLE through the registry for the first time
+    # (they KeyError'd before). Pin that resolution here; the qwen prefill
+    # builder still refuses their mixed suffixes loudly
+    # (qwen3_0_6b_prefill.py:348) until the mixed-method _build_o_ffn
+    # rewire lands (logged follow-up).
+    cfg = gemm_config(512, 2048, 1024)
+    assert cfg["method"] == "drain", cfg["method"]
+    cfg = gemm_config(1024, 2048, 1024)
+    assert cfg["method"] == "drain", cfg["method"]
 
 
 def test_default_row_falls_back_to_file_level_herd():

@@ -309,6 +309,34 @@ The projection GEMMs the transformer-layer execution study's `baseline_1024` cas
 
 <!-- END transformer-layer-sweep baseline_1024 -->
 
+<!-- BEGIN transformer-layer-sweep qwen3_0_6b -->
+### Transformer-layer execution study — `qwen3_0_6b` sweep
+
+The projection GEMMs the transformer-layer execution study's `qwen3_0_6b` case needs — same sweep, provenance, and carry gate as the `baseline_768` section above (study branch, tag `pre-port-20260829`; rows carried verbatim; the tag swept only `seq = 512` and `seq = 1024`, so no row carries the per-method short-sequence `herd` override; both `ffn_down` shapes are kept at main's model-deployment rows, daggered below). Full per-candidate detail, and why the high-precision `atol` is K-scaled, in [`details/GEMM_bf16_in_bf16_out.md`](details/GEMM_bf16_in_bf16_out.md).
+
+**`q_proj`** — `K = 1024` → `N = 2048`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 512 | 512×1024×2048 | 2341 | **3862** | 4415 | 32/256/32/128 (8×4) | 9.5e-3 / 1.1e-2 | ✅ |
+| 1024 | 1024×1024×2048 | 3309 | **4007** | 4983 | 32/256/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+
+**`o_proj_q`** — `K = 2048` → `N = 1024`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 512 | 512×2048×1024 | 2764 | **4515** | 4794 | 32/256/32/128 (8×4) | 9.3e-3 / 1.3e-2 | ✅ |
+| 1024 | 1024×2048×1024 | 3910 | **4751** | 5253 | 32/256/32/128 (8×4) | 9.3e-3 / 1.3e-2 | ✅ |
+
+**`ffn_down`** — `K = 3072` → `N = 1024`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 512 | 512×3072×1024 | 3474† | 5010† | 5162† | 32/256/32/128 (8×4)† | 9.4e-3 / 1.4e-2 | † tag-only sweep, NOT adopted (Q10): the active registry keeps main's Qwen3-0.6B Down proj @L=512 prefill row — fused-cast 3645 (high) at 64/256/32/128 — so only `fused-cast` resolves; `precision="low"` has no row here |
+| 1024 | 1024×3072×1024 | 4677† | 5148† | 5465† | 32/256/32/128 (8×4)† | 9.4e-3 / 1.4e-2 | † tag-only sweep, NOT adopted (Q10): the active registry keeps main's Qwen3-0.6B Down proj @L=1024 prefill row — fused-cast 4058 (high) at 64/256/32/128 — so only `fused-cast` resolves; `precision="low"` has no row here |
+
+<!-- END transformer-layer-sweep qwen3_0_6b -->
+
 ---
 
 ## GEMV — tested shapes
