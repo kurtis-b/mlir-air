@@ -59,9 +59,11 @@ from shared.infra.backend_presets import (
 
 # Prefill GEMM is always the external high-precision path, registry-driven: every
 # GEMM's method (fused-cast vs drain) + tile sizes come from the kernel_registry JSON
-# per shape (gemm_registry_config). o_ffn = 4 fused-cast GEMMs (mm_m64.o); rms =
-# Q fused-cast (mm_m64.o) + K/V drain (mm_m32.o), mixed in one ELF. All GPU-standard
-# 9.3e-3 precision. The external GEMM herds need BD-ID-recycling tiling [2,2].
+# per shape (gemm_registry_config), with sym_suffix/obj minted per (tile_m,
+# tile_n) (gemm_variant_names; the bare names ARE the tile_n=128 variants).
+# o_ffn = 4 fused-cast GEMMs (mm_m64.o); rms = Q fused-cast (mm_m64.o) + K/V
+# drain (mm_m32.o), mixed in one ELF. All GPU-standard 9.3e-3 precision. The
+# external GEMM herds need BD-ID-recycling tiling [2,2].
 
 
 def _o_ffn_run_backend():
@@ -167,17 +169,16 @@ def compile_all_kernels(cache, config, seq_len, cpu_attn=True):
 
     # External-GEMM mm.o variants — compile FIRST (before any compile_and_cache, so
     # prepare_air_project copies them into air_project/ for every ELF that links
-    # them). The per-GEMM-method builders reference SUFFIXED symbols + filenames so
-    # drain (_m32 / mm_m32.o, tile_m=32) and fused-cast (_m64 / mm_m64.o, tile_m=64)
-    # can co-link in ONE ELF (rms mixes them; o_ffn is all-fused).
-    from shared.infra.external_kernels import compile_gemm_mm
+    # them). The builders reference symbols + filenames minted per (tile_m,
+    # tile_n) — here (32, 128) -> _m32 / mm_m32.o and (64, 128) -> _m64 /
+    # mm_m64.o — so drain and fused-cast co-link in ONE ELF (rms mixes them;
+    # o_ffn is all-fused). compile_gemm_mm_variant derives the SAME names from
+    # the same authority (gemm_variant_names), so builder and object cannot
+    # drift apart.
+    from shared.infra.external_kernels import compile_gemm_mm_variant
 
-    compile_gemm_mm(
-        tile_m=32, tile_n=128, tile_k_l1=32, sym_suffix="_m32", out_name="mm_m32.o"
-    )
-    compile_gemm_mm(
-        tile_m=64, tile_n=128, tile_k_l1=32, sym_suffix="_m64", out_name="mm_m64.o"
-    )
+    compile_gemm_mm_variant(tile_m=32, tile_n=128, tile_k_l1=32)
+    compile_gemm_mm_variant(tile_m=64, tile_n=128, tile_k_l1=32)
 
     # Fused-cast GEMM requires seq_len % (tile_m * herd_m) == 0 with tile_m<=64.
     # Small contexts (seq_len < 512) can't use herd_m=8 (64*8=512 > seq_len), so

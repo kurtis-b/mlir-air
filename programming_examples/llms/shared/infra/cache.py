@@ -60,13 +60,18 @@ def prepare_air_project(
         "mv.o",
         "mv_bf16.o",
         "attn_decode_npu2.o",
-        # external GEMM microkernel variants (prefill o_ffn / rms_gemms_rope):
-        # bare mm.o (legacy f32-out / single-variant) + suffixed _m32 (drain,
-        # tile_m=32) / _m64 (fused-cast, tile_m=64) so mixed-method ELFs link.
+        # bare mm.o: legacy f32-out / single-variant ELFs that name their own
+        # object. The per-(tile_m, tile_n) GEMM variants are globbed below.
         "mm.o",
-        "mm_m32.o",
-        "mm_m64.o",
     ]
+    # External GEMM microkernel variants (prefill o_ffn / rms_gemms_rope /
+    # rms_qkv_bias_rope), named per (tile_m, tile_n) by
+    # `gemm_builder.gemm_variant_names` -- bare `mm_m32.o` / `mm_m64.o` for
+    # the tile_n=128 variants, `mm_m32n64.o`-style otherwise. GLOBBED, not
+    # enumerated: which variants exist depends on which shapes the caller
+    # resolved, and an object that never reaches air_project/ fails inside
+    # aiecc, several frames from the fixed list that omitted it.
+    obj_names.extend(sorted(p.name for p in Path(".").glob("mm_m*.o")))
     # the head-aligned QKV GEMV kernel (compile_mv_heads) is head_dim-tagged
     # by head_dim like the GEMM variants: `mv_heads_hd128.o`.
     obj_names.extend(sorted(p.name for p in Path(".").glob("mv_heads_hd*.o")))
