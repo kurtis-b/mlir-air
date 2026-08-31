@@ -64,6 +64,12 @@ def test_override_row_returns_its_herd():
     assert tuple(cfg["herd"]) == (2, 4), cfg["herd"]  # high tier -> drain
     cfg = gemm_config(64, 4096, 1024, "bf16", "low")
     assert tuple(cfg["herd"]) == (1, 4), cfg["herd"]  # low tier -> direct
+    # R5c-12: the baseline_1024 o_proj short-M key, both tiers (pre-review,
+    # per the series' standing per-slice coverage convention)
+    cfg = gemm_config(64, 1024, 1024)
+    assert tuple(cfg["herd"]) == (2, 4), cfg["herd"]  # high tier -> drain
+    cfg = gemm_config(64, 1024, 1024, "bf16", "low")
+    assert tuple(cfg["herd"]) == (1, 4), cfg["herd"]  # low tier -> direct
 
 
 def test_default_row_falls_back_to_file_level_herd():
