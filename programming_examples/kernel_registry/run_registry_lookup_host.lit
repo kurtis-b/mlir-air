@@ -1,0 +1,13 @@
+// Copyright (C) 2026, Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+//
+// Host-only gate for the registry's per-row herd resolution and its
+// threading through the canonical builder recipe (review of #38). No
+// device, no downloads.
+//
+// RUN: %PYTHON %S/test_registry_lookup.py | FileCheck %s
+//
+// CHECK: PASS  test_default_row_falls_back_to_file_level_herd
+// CHECK: PASS  test_override_row_returns_its_herd
+// CHECK: PASS  test_registry_config_threads_the_herd_into_the_spec
+// CHECK: registry lookup tests: 3/3 passed
