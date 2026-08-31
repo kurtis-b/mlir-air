@@ -19,6 +19,9 @@ OUTPUT_FORMAT_FLAG = --output-format $(OUTPUT_FORMAT)
 M       ?= 2048
 K       ?= 2048
 GS      ?= 128
+# Inner dequant row-strip width A/B (study commit 20fad8c8, devq 835): unset =
+# the kernel's own predicate (DIM_GS % 64 == 0 ? 64 : 32); R=32/R=64 forces it.
+R       ?=
 M_TILE  ?= 8
 K_CHUNK ?= 2048
 
@@ -43,10 +46,20 @@ compile-kernel:
 		exit 1; \
 	fi
 	$(PEANO_INSTALL_DIR)/bin/clang++ ${PEANOWRAP2P_FLAGS} \
-		-DDIM_M=$(M_TILE) -DDIM_K=$(K_CHUNK) -DDIM_GS=$(GS) \
+		-DDIM_M=$(M_TILE) -DDIM_K=$(K_CHUNK) -DDIM_GS=$(GS) $(if $(R),-DDIM_R=$(R)) \
 		-c ${srcdir}/mv_int4_bf16.cc -o $(BUILD_DIR)/mv_int4_bf16.o
 
 # GEMV: D = dequant(A) @ B
+# The r-width A/B on the entries DIM_R actually changes (this GEMV): default
+# run_packed at GS=128 bakes r=64 by the predicate; run_packed_r32 forces the
+# old width on the same file. run_packed_r64 at GS % 64 != 0 fails in
+# compile-kernel by static_assert, deliberately.
+run_packed_r32:
+	$(MAKE) -f $(firstword $(MAKEFILE_LIST)) run_packed R=32
+
+run_packed_r64:
+	$(MAKE) -f $(firstword $(MAKEFILE_LIST)) run_packed R=64
+
 run_packed: compile-kernel
 	mkdir -p $(BUILD_DIR)
 	PEANO_INSTALL_DIR=$(PEANO_INSTALL_DIR) cd $(BUILD_DIR) && \

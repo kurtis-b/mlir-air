@@ -51,6 +51,33 @@ def test_canonical_object_follows_the_last_group_size():
         ek._compile_kernel = real
 
 
+def test_r_width_tags_the_object_and_stages_dim_r():
+    """Review of #35, P2: the _r{r} suffix is what keeps a forced r32 control
+    from silently reusing a same-CWD r64 build under the skip-by-name rule.
+    Same shape at r=64 then r=32: distinct tagged objects must exist and the
+    canonical object must carry the LAST request's -DDIM_R."""
+    real = ek._compile_kernel
+    ek._compile_kernel = _stub_compile_kernel
+    cwd = os.getcwd()
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            ek.compile_mv_int4_bf16(gs=128, r=64)
+            ek.compile_mv_int4_bf16(gs=128, r=32)
+            tagged = sorted(p.name for p in Path(".").glob("mv_int4_bf16_gemv_*.o"))
+            assert len(tagged) == 2 and tagged[0] != tagged[1], tagged
+            assert any(t.endswith("_r64.o") for t in tagged), tagged
+            assert any(t.endswith("_r32.o") for t in tagged), tagged
+            canonical = Path("mv_int4_bf16.o").read_text()
+            assert "-DDIM_R=32" in canonical, (
+                "the forced-r32 control staged the r64 bytes as canonical -- "
+                f"both A/B arms would run the same kernel: {canonical!r}"
+            )
+    finally:
+        os.chdir(cwd)
+        ek._compile_kernel = real
+
+
 def test_int4_gs_is_forwarded_to_the_preparer_and_kept_from_xrt():
     import air.backend.xrt as xrt_mod
 
