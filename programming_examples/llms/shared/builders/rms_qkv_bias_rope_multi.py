@@ -361,7 +361,11 @@ def build_rms_qkv_bias_rope_module(
 
     Returns (module, scratch_for).
     """
-    from shared.builders.gemm_builder import _build_gemm_module, gemm_registry_config
+    from shared.builders.gemm_builder import (
+        _build_gemm_module,
+        gemm_registry_config,
+        with_tile_n,
+    )
     from shared.builders.rms_gemms_rope_multi import _build_rope_2d
     from shared.infra.stitching import (
         _wrap_ir_in_launch,
@@ -394,11 +398,15 @@ def build_rms_qkv_bias_rope_module(
         k_spec = dict(gemm_registry_config(seq_len, emb_dim, kv_dim, "bf16", "high"))
         v_spec = dict(gemm_registry_config(seq_len, emb_dim, kv_dim, "bf16", "high"))
     # Force tile_n=128 for the N-padded drain GEMMs (matches split rms_qkv).
+    # `with_tile_n`, not a bare `spec["tile_n"] = 128`: the object name and
+    # symbol suffix are minted per (tile_m, tile_n), so retiling has to
+    # re-mint them or the module asks for an `mm_*.o` nobody compiles. At 128
+    # the minted names are the bare ones these drivers always linked.
     if q_pad != q_dim:
-        q_spec["tile_n"] = 128
+        q_spec = with_tile_n(q_spec, 128)
     if kv_pad != kv_dim:
-        k_spec["tile_n"] = 128
-        v_spec["tile_n"] = 128
+        k_spec = with_tile_n(k_spec, 128)
+        v_spec = with_tile_n(v_spec, 128)
 
     def _kw_tiles(spec):
         return (

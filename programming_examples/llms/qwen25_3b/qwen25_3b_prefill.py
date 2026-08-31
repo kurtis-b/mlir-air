@@ -29,7 +29,7 @@ gemm_registry_config, with the Down-launch-0 split layered on top.
 
 Registry-selected methods (seq=2048):
     Q/O    (2048x2048)   -> fused-cast (mm_m64.o, tile_n=128) — needs f32 scratch
-    K/V    (2048x256)    -> drain      (mm_m32.o, tile_n=64)
+    K/V    (2048x256)    -> drain      (mm_m32n64.o, tile_n=64)
     Gate/Up(2048x11008)  -> direct (low-precision, tile_n=64, tile_k_l2=128)
     Down   (11008x2048)  -> fused-cast (mm_m64.o, tile_n=128, launch 0)
 
@@ -833,18 +833,17 @@ def compile_all_kernels(cache, config, seq_len, verbose=False, cpu_attn=False):
         f"\n{'='*60}\nCompiling Qwen2.5-3B prefill kernels (seq_len={seq_len})...\n{'='*60}\n"
     )
 
-    from shared.infra.external_kernels import compile_gemm_mm, compile_rope
+    from shared.infra.external_kernels import compile_gemm_mm_variant, compile_rope
 
     # mm.o variants for the external GEMMs:
-    #   _m32 drain    tile_n=64  (K/V projections)
-    #   _m64 fused    tile_n=128 (Q, O, Down projections)
-    # Gate/Up direct-codegen needs NO external .o. rope.o for head_dim=128.
-    compile_gemm_mm(
-        tile_m=32, tile_n=64, tile_k_l1=32, sym_suffix="_m32", out_name="mm_m32.o"
-    )
-    compile_gemm_mm(
-        tile_m=64, tile_n=128, tile_k_l1=32, sym_suffix="_m64", out_name="mm_m64.o"
-    )
+    #   (32, 64)  -> _m32n64 / mm_m32n64.o  drain (K/V projections)
+    #   (64, 128) -> _m64    / mm_m64.o     fused (Q, O, Down projections)
+    # Names derive from gemm_variant_names, the same authority the builders
+    # mint from, so the K/V modules' `_m32n64` symbols resolve against an
+    # object actually baked at DIM_N=64. Gate/Up direct-codegen needs NO
+    # external .o. rope.o for head_dim=128.
+    compile_gemm_mm_variant(tile_m=32, tile_n=64, tile_k_l1=32)
+    compile_gemm_mm_variant(tile_m=64, tile_n=128, tile_k_l1=32)
     compile_rope()
     from shared.infra.external_kernels import compile_silu_and_mul
 

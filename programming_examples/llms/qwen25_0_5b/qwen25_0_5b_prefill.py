@@ -56,9 +56,23 @@ from qwen25_0_5b_cpu_helpers import attention_reference
 # ---------------------------------------------------------------------------
 
 
+def _retile_n(spec, tile_n):
+    """`gemm_builder.with_tile_n`, with the import kept local like `_gemm_spec`.
+
+    Retiling N re-mints the variant's `sym_suffix` / `obj` / `build_kwargs`,
+    because both names are functions of (tile_m, tile_n). Assigning
+    `spec["tile_n"]` directly does not, and leaves the GEMM linking an object
+    nobody compiles. At tile_n=128 the minted names are the bare `_m32` /
+    `_m64` ones this driver always linked (see `gemm_variant_names`).
+    """
+    from shared.builders.gemm_builder import with_tile_n
+
+    return with_tile_n(spec, tile_n)
+
+
 def _gemm_spec(m, k, n, precision):
     """Registry config for one GEMM. precision: 'high' or 'low'."""
-    from shared.builders.gemm_builder import gemm_registry_config, gemm_method_spec
+    from shared.builders.gemm_builder import gemm_registry_config
 
     if precision == "low":
         # 'low' best is 'direct' for the Gate/Up shape; synthesize a spec since
@@ -473,8 +487,12 @@ def build_o_ffn_head_module(
     # (seq, n_pad); the residual add reads only the first emb columns.
     n_pad = _padded_n_for_down(emb_dim)
     o_spec = _gemm_spec(seq_len, emb_dim, emb_dim, "high")  # method=drain
-    o_spec = dict(o_spec)
-    o_spec["tile_n"] = 128
+    # `_retile_n`, not `o_spec["tile_n"] = 128`: the object name and symbol
+    # suffix are minted per (tile_m, tile_n), so retiling re-mints them. A bare
+    # assignment leaves this module linking `mm_m32n32.o` -- the registry's
+    # broken narrow tile -- which nothing compiles. At 128 the minted names are
+    # the bare `_m32` / `mm_m32.o` this driver always linked.
+    o_spec = _retile_n(o_spec, 128)
     g_spec = _gemm_spec(seq_len, emb_dim, hidden_dim, "low")
     print(f"  [head] GEMM methods: O={o_spec['method']} Gate/Up={g_spec['method']}")
 
@@ -732,8 +750,7 @@ def build_down_add_module(seq_len, emb_dim, hidden_dim, down_herd_m=8, down_herd
     # 1024/(128*4)=2. Use the fused-cast method spec at the registry tiles for
     # the 1024-N shape (proven correct); force tile_n=128.
     d_spec = _gemm_spec(seq_len, hidden_dim, emb_dim, "high")  # method=fused-cast
-    d_spec = dict(d_spec)
-    d_spec["tile_n"] = 128
+    d_spec = _retile_n(d_spec, 128)  # re-mints obj/sym_suffix; see the O GEMM
     print(
         f"  [down_add] Down GEMM ({d_spec['method']}) {seq_len}x{hidden_dim}x{n_pad} "
         f"(N padded from {emb_dim}, tile_n=128)..."
@@ -896,16 +913,15 @@ def compile_all_kernels(cache, config, seq_len, verbose=False, cpu_attn=True):
         f"\n{'='*60}\nCompiling Qwen2.5 prefill kernels (seq_len={seq_len})...\n{'='*60}\n"
     )
 
-    from shared.infra.external_kernels import compile_gemm_mm, compile_rope
+    from shared.infra.external_kernels import compile_gemm_mm_variant, compile_rope
 
-    # mm.o variants for the external GEMMs (drain _m32, fused-cast _m64).
-    # Gate/Up direct-codegen needs NO external .o. rope.o for head_dim=64.
-    compile_gemm_mm(
-        tile_m=32, tile_n=128, tile_k_l1=32, sym_suffix="_m32", out_name="mm_m32.o"
-    )
-    compile_gemm_mm(
-        tile_m=64, tile_n=128, tile_k_l1=32, sym_suffix="_m64", out_name="mm_m64.o"
-    )
+    # mm.o variants for the external GEMMs (drain _m32, fused-cast _m64 -- the
+    # minted (tile_m, 128) names). Every GEMM spec in this driver is retiled to
+    # tile_n=128 (_retile_n / with_tile_n), so builder and object names agree
+    # by construction. Gate/Up direct-codegen needs NO external .o. rope.o for
+    # head_dim=64.
+    compile_gemm_mm_variant(tile_m=32, tile_n=128, tile_k_l1=32)
+    compile_gemm_mm_variant(tile_m=64, tile_n=128, tile_k_l1=32)
     compile_rope()
 
     print("\n--- rms_qkv_bias_rope (FUSED: RMSNorm+QKV+bias+RoPE, 9 launches) ---")
