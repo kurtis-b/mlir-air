@@ -188,6 +188,26 @@ The projection GEMMs the transformer-layer execution study's case matrix needs, 
 
 <!-- END transformer-layer-sweep baseline_768 -->
 
+<!-- BEGIN transformer-layer-sweep baseline_512 -->
+### Transformer-layer execution study — `baseline_512` sweep
+
+The projection GEMMs the transformer-layer execution study's `baseline_512` case needs — same sweep, provenance, and carry gate as the `baseline_768` section above (study branch, tag `pre-port-20260829`; rows carried verbatim; the tag's ladder omits `ffn_down` `seq = 2048` and `o_proj` `seq = 512`). Full per-candidate detail, and why the high-precision `atol` is K-scaled, in [`details/GEMM_bf16_in_bf16_out.md`](details/GEMM_bf16_in_bf16_out.md).
+
+**`ffn_down`** — `K = 2048` → `N = 512`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 64 | 64×2048×512 | 386 | **857** | 488 | 32/256/32/64 (2×4) | 9.3e-3 / 1.3e-2 | ✅ |
+| 128 | 128×2048×512 | 717 | **1657** | 1110 | 32/256/32/64 (4×4) | 9.3e-3 / 1.3e-2 | ✅ |
+| 256 | 256×2048×512 | 1205 | **3211** | 2181 | 32/256/32/64 (8×4) | 9.3e-3 / 1.3e-2 | ✅ |
+| 512 | 512×2048×512 | 1769† | 3945† | 4126† | 32/256/32/128 (8×4)† | 9.3e-3 / 1.3e-2 | † tag-only sweep, NOT adopted (Q10): the active registry keeps main's llama-3.2-1B K/V proj @L=512 prefill row — drain 4092 (high) at 32/256/32/128, direct 3481 (low), fused-cast 1665 — all three methods resolve at main's values |
+| 1024 | 1024×2048×512 | 2781† | 4325† | 4819† | 32/256/32/128 (8×4)† | 9.3e-3 / 1.3e-2 | † tag-only sweep, NOT adopted (Q10): the active registry keeps main's llama-3.2-1B K/V proj @L=1024 prefill row — drain 4866 (high) at 32/256/32/128, direct 4167 (low), fused-cast 2765 — all three methods resolve at main's values |
+| 4096 | 4096×2048×512 | 4638† | 4392† | 5132† | 64/256/32/64 (8×4)† | 9.7e-3 / 1.3e-2 | † tag-only sweep, NOT adopted (Q10): the active registry keeps main's llama-3.2-1B K/V proj row — drain 4373 (high) at 32/256/32/128, direct 4273 (low), fused-cast 4270 — `best.high` stays `drain`, not the tag's `fused-cast` |
+| 8192 | 8192×2048×512 | **4881** | 4318 | 5218 | 64/512/32/128 (8×4) | 9.7e-3 / 1.3e-2 | ✅ |
+| 16384 | 16384×2048×512 | **5632** | 4670 | 5330 | 64/256/32/64 (8×4) | 9.7e-3 / 1.3e-2 | ✅ |
+
+<!-- END transformer-layer-sweep baseline_512 -->
+
 ---
 
 ## GEMV — tested shapes
