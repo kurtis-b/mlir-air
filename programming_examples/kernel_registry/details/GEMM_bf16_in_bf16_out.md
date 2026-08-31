@@ -573,6 +573,26 @@ Same sweep, provenance, and carry gate as the `baseline_768` section above (swep
 
 <!-- END transformer-layer-sweep baseline_512 -->
 
+<!-- BEGIN transformer-layer-sweep baseline_1024 -->
+### Transformer-layer execution study — `baseline_1024` sweep
+
+Same sweep, provenance, and carry gate as the `baseline_768` section above (swept on the study branch by `transformer_layer/sweep/registry_sweep.py`; tag `pre-port-20260829` is the persistent measurement record, and rows are carried verbatim from it). **Bold** = the winner recorded in `best` for that tier. The per-method `herd` override on short-sequence rows and the K-scaled high-precision `atol` apply exactly as documented in the `baseline_768` preamble above, here at this family's `K = 1024` (`qkv_proj`, `ffn_up`, `o_proj`) and `K = 4096` (`ffn_down`); the tag's ladder omits three points (`qkv_proj` has no `seq = 2048` row, `o_proj` no `seq = 1024` and no `seq = 2048`).
+
+**`qkv_proj`** — `K = 1024` → `N = 3072`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 64 | 64×1024×3072 | 508 | **927** | 520 | 32/256/32/128 (2×4) | 9.5e-3 / 1.1e-2 | ✅ |
+| 128 | 128×1024×3072 | 1073 | **1796** | 1234 | 32/256/32/128 (4×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 256 | 256×1024×3072 | 1852 | **3200** | 2403 | 32/512/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 512 | 512×1024×3072 | 2754 | **3952** | 4506 | 32/256/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 1024 | 1024×1024×3072 | 3739 | **3977** | 4878 | 32/256/32/128 (8×4) | 9.4e-3 / 1.1e-2 | ✅ |
+| 4096 | 4096×1024×3072 | 4709† | 4153† | 4967† | 64/256/32/128 (8×4)† | 9.9e-3 / 1.1e-2 | † tag-only sweep, NOT adopted (Q10): the active registry keeps main's Qwen3-0.6B Gate/Up proj row — fused-cast 4929 (high) at 64/256/32/128, direct 5007 (low) — both tiers resolve at main's values; `drain` has no row here |
+| 8192 | 8192×1024×3072 | **4784** | 4142 | 5194 | 64/256/32/96 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+| 16384 | 16384×1024×3072 | **5042** | 4180 | 5286 | 64/256/32/128 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
+
+<!-- END transformer-layer-sweep baseline_1024 -->
+
 ## How to reproduce (correctness + performance, one command)
 
 `make run` drives `run.py --compile-mode compile-and-run` (correctness + `--perf-iters` timing in one invocation). Example: the 2048×8192×2048 (Down) row.
