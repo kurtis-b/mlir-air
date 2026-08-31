@@ -605,6 +605,20 @@ Same sweep, provenance, and carry gate as the `baseline_768` section above (swep
 | 8192 | 8192×1024×4096 | **4966** | 4065 | 5264 | 64/256/32/128 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
 | 16384 | 16384×1024×4096 | **5053** | 4180 | 5222 | 64/256/32/128 (8×4) | 9.9e-3 / 1.1e-2 | ✅ |
 
+**`ffn_down`** — `K = 4096` → `N = 1024`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 64 | 64×4096×1024 | 648 | **1239** | 584 | 32/256/32/128 (2×4) | 9.4e-3 / 1.5e-2 | ✅ |
+| 128 | 128×4096×1024 | 1318 | **2454** | 1364 | 32/256/32/128 (4×4) | 9.5e-3 / 1.5e-2 | ✅ |
+| 256 | 256×4096×1024 | 2439 | **4656** | 2674 | 32/512/32/128 (8×4) | 9.4e-3 / 1.5e-2 | ✅ |
+| 512 | 512×4096×1024 | 4081† | 5266† | 5122† | 32/256/32/128 (8×4)† | 9.4e-3 / 1.5e-2 | † tag-only sweep, NOT adopted (Q10): the active registry keeps main's Qwen3-8B K/V proj @L=512 prefill row — fused-cast 4331 (high) at 64/256/32/128 — so only `fused-cast` resolves; `precision="low"` has no row here |
+| 1024 | 1024×4096×1024 | 5125† | 5243† | 5553† | 32/256/32/128 (8×4)† | 9.4e-3 / 1.5e-2 | † tag-only sweep, NOT adopted (Q10): the active registry keeps main's Qwen3-8B K/V proj @L=1024 prefill row — fused-cast 4496 (high) at 64/256/32/128 — so only `fused-cast` resolves; `precision="low"` has no row here |
+| 2048 | 2048×4096×1024 | 5835† | 5433† | 5551† | 64/512/32/128 (8×4)† | 9.9e-3 / 1.5e-2 | † tag-only sweep, NOT adopted (Q10): the active registry keeps main's Qwen3-8B K/V proj row — fused-cast 7092 (high) at 64/256/32/128 — so only `fused-cast` resolves; `precision="low"` has no row here |
+| 4096 | 4096×4096×1024 | 6379† | 5433† | 5676† | 64/256/32/128 (8×4)† | 9.9e-3 / 1.5e-2 | † tag-only sweep, NOT adopted (Q10): the active registry keeps main's Qwen3-8B K/V proj row — fused-cast 7137 (high) at 64/256/32/128 — so only `fused-cast` resolves; `precision="low"` has no row here |
+| 8192 | 8192×4096×1024 | **6655** | 5528 | 5735 | 64/256/32/128 (8×4) | 9.9e-3 / 1.5e-2 | ✅ |
+| 16384 | 16384×4096×1024 | **6780** | 5563 | 5762 | 64/256/32/128 (8×4) | 9.9e-3 / 1.5e-2 | ✅ |
+
 <!-- END transformer-layer-sweep baseline_1024 -->
 
 ## How to reproduce (correctness + performance, one command)
