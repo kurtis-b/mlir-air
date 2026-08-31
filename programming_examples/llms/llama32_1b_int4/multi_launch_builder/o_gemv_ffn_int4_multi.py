@@ -115,6 +115,7 @@ def build_o_gemv_ffn_int4_module(
     k_chunk=2048,
     n_cores=8,
     q_dim=None,
+    eps=1.0e-5,
 ):
     """Build full-int4 3-launch ELF2.
 
@@ -155,6 +156,7 @@ def build_o_gemv_ffn_int4_module(
         M_TILE=m_tile,
         K_CHUNK=k_chunk,
         N_CORES=n_cores,
+        eps=eps,
     )
 
     # Stage 3: Down proj (M=emb, K=hidden), int4 GEMV+R.

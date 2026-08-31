@@ -73,7 +73,10 @@ _RMS_QKV_KERNEL = {2: "rms_qkv_qknorm_rope_gemv2", 8: "rms_qkv_qknorm_rope_gemv"
 # from the packed BOs `w4_decode_pack.quantize_decode_weights` attaches; the
 # QKV stage and the LM head stay bf16 (priced negatives -- doc 57 section 5
 # item 6). Read at import time like _RMS_QKV_LAUNCHES.
-from w4_decode_pack import w4_decode_selected as _w4_decode_selected  # noqa: E402
+from w4_decode_pack import (
+    W4_DEFAULT,
+    w4_decode_selected as _w4_decode_selected,
+)  # noqa: E402
 
 _W4_DECODE = _w4_decode_selected()
 _O_FFN_KERNEL = "o_gemv_ffn_int4" if _W4_DECODE else "o_gemv_ffn"
@@ -109,9 +112,9 @@ def require_decode_artifacts(cache):
     other = "QWEN3_W4_DECODE=0" if _W4_DECODE else "QWEN3_W4_DECODE=1"
     raise RuntimeError(
         f"decode cache {str(cache.cache_dir)!r} does not contain {missing} -- it was "
-        f"not compiled for the selected precision ({sel}; QWEN3_W4_DECODE "
-        f"default is {'1' if _W4_DECODE else '0'} since 2026-08-26, doc 56 H2b "
-        f"queue item 24). It holds {sorted(cache.artifacts)}. Recompile "
+        f"not compiled for the selected precision ({sel}: QWEN3_W4_DECODE is "
+        f"{'1' if _W4_DECODE else '0'} here; unset default "
+        f"{'1' if W4_DEFAULT else '0'}). It holds {sorted(cache.artifacts)}. Recompile "
         f"(`make compile` with the same flag), or select the other precision "
         f"with {other}."
     )
@@ -374,6 +377,12 @@ def build_o_gemv_ffn_int4_qwen_module(emb_dim, q_dim, hidden_dim):
         k_chunk=K_CHUNK,
         n_cores=N_CORES,
         q_dim=q_dim,
+        # Qwen3's RMS eps is 1e-6 (the model contract; matches qknorm_eps at
+        # build_rms_qkv and inference EPS). Llama callers keep the builder
+        # default 1e-5. NOTE: the bf16 sibling stage 2 (matvec_swiglu_rms)
+        # still hard-codes 1e-5 on main -- pre-existing, logged as a
+        # follow-up, outside this PR's diff.
+        eps=1e-6,
     )
 
 
@@ -413,8 +422,9 @@ def _o_gemv_ffn_backend(verbose=False):
 
 
 def _o_gemv_ffn_int4_backend(verbose=False):
-    """The llama int4 cascade's preset (ping-pong on -- dropping it regressed
-    the llama e2e 12.4 -> 7.8 tok/s)."""
+    """The llama int4 cascade's preset (ping-pong on; the llama study measured
+    a large e2e decode regression without it -- artifact not ported, so no
+    number is claimed here; the preset is owned by shared.infra)."""
     from shared.infra.backend_presets import OGF_INT4_BACKEND
 
     return {"verbose": verbose, **OGF_INT4_BACKEND}
@@ -457,9 +467,16 @@ def _sibling_o_ffn_entry(cache):
     if not man.is_file():
         return None
     try:
-        info = _json.loads(man.read_text()).get("entries", {}).get(name)
+        data = _json.loads(man.read_text())
     except (ValueError, OSError):
         return None
+    # Review of #33, P1: never carry across a toolchain change. The normal
+    # cache path treats a different or missing `_toolchain` stamp as cold
+    # (KernelCache.load_manifest); the carry must not be a side door that
+    # re-stamps a stale ELF as current after `_save_manifest`.
+    if data.get("_toolchain") != cache._toolchain_id():
+        return None
+    info = data.get("entries", {}).get(name)
     if not info or not info.get("output_binary"):
         return None
     for cand in (
