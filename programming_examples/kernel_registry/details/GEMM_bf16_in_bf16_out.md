@@ -517,6 +517,20 @@ The high tier is checked at `atol = 1.5e-3 × sqrt(8192 / K)`, not the fixed `1.
 
 Same sweep, provenance, and carry gate as the `baseline_768` section above (swept on the study branch by `transformer_layer/sweep/registry_sweep.py`; tag `pre-port-20260829` is the persistent measurement record, and rows are carried verbatim from it). **Bold** = the winner recorded in `best` for that tier. The per-method `herd` override on short-sequence rows and the K-scaled high-precision `atol` apply exactly as documented in the `baseline_768` preamble above, here at this family's `K = 512` (`qkv_proj`, `ffn_up`, `o_proj`) and `K = 2048` (`ffn_down`); the tag's ladder omits two points (`ffn_down` has no `seq = 2048` row, `o_proj` no `seq = 512`).
 
+**`qkv_proj`** — `K = 512` → `N = 1536`
+
+| seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
+|---|---|---|---|---|---|---|---|
+| 64 | 64×512×1536 | 292 | **548** | 405 | 32/512/32/96 (2×4) | 9.2e-3 / 1.0e-2 | ✅ |
+| 128 | 128×512×1536 | 545 | **1124** | 956 | 32/256/32/96 (4×4) | 9.3e-3 / 1.0e-2 | ✅ |
+| 256 | 256×512×1536 | 876 | **1973** | 1847 | 32/512/32/96 (8×4) | 9.3e-3 / 1.0e-2 | ✅ |
+| 512 | 512×512×1536 | 1218 | **2653** | 3287 | 32/256/32/96 (8×4) | 9.3e-3 / 1.0e-2 | ✅ |
+| 1024 | 1024×512×1536 | 1929 | **2849** | 3778 | 32/256/32/96 (8×4) | 9.3e-3 / 1.0e-2 | ✅ |
+| 2048 | 2048×512×1536 | 2565 | **2871** | 4460 | 32/512/32/96 (8×4) | 9.3e-3 / 1.0e-2 | ✅ |
+| 4096 | 4096×512×1536 | **2751** | 2585 | 4620 | 64/256/32/128 (8×4) | 9.7e-3 / 1.0e-2 | ✅ |
+| 8192 | 8192×512×1536 | **3377** | 3070 | 4684 | 64/256/32/96 (8×4) | 9.7e-3 / 1.0e-2 | ✅ |
+| 16384 | 16384×512×1536 | **3571** | 3059 | 4730 | 64/256/32/96 (8×4) | 9.7e-3 / 1.0e-2 | ✅ |
+
 **`ffn_down`** — `K = 2048` → `N = 512`
 
 | seq | (M×K×N) | fused-cast | drain | direct | best tile (m/kl2/kl1/n) (herd) | mean_rel_L1 (high / low) | Status |
