@@ -366,14 +366,6 @@ getEffectiveMemrefSizeFromAccessPattern(SmallVector<int> memref_shape,
 // function above, whenever the answer decides how big an allocation may be.
 // Sets `bounded` to false if any offset could not be bounded, in which case
 // the result is meaningless and the caller must not shrink.
-// `sweepFoldedIntoSizes` says whether the pattern's writer already folded an
-// enclosing scf.for sweep into the sizes (true for memref.subview and
-// vector.transfer_read/write, false for air.channel put/get).
-SmallVector<int64_t> getEffectiveMemrefExtentFromAccessPattern(
-    SmallVector<int> memref_shape, SmallVector<Value> offsets,
-    SmallVector<Value> sizes, SmallVector<Value> strides,
-    bool sweepFoldedIntoSizes, bool &bounded);
-
 // Get the overall data access pattern from air.channel ops which access the
 // memref.
 std::tuple<SmallVector<Value>, SmallVector<Value>, SmallVector<Value>>
