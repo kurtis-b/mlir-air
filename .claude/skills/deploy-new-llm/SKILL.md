@@ -35,8 +35,8 @@ triages.
   `make diagnosis` per-layer cosine is the informational lens); every model
   hooks in via its own `verify_adapter.py`, not by copying this.
 - `programming_examples/llms/shared/infra/` — the **shared** kernel
-  builder (KernelCache, external kernels, stitching, the `ffn_swiglu/`
-  harness); per-model scripts import from it.
+  builder (KernelCache, external kernels, stitching); per-model scripts
+  import from it.
 - `programming_examples/kernel_registry/` — the model-agnostic kernel
   registry. Human half: `supported_kernels.md` (index) + `details/<Kernel>_bf16.md`
   per kernel (GEMM is split by output dtype: `GEMM_bf16_in_bf16_out.md` +
