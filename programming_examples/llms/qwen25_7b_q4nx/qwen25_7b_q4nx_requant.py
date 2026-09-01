@@ -16,22 +16,13 @@ import os
 import numpy as np
 from ml_dtypes import bfloat16
 
+import sys
 
-def _requant_q4k(Wm, group):
-    """Per-32-column-group min/max 4-bit re-quant of a matrix [M,K] -> (q, sc, mn).
+_LLMS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _LLMS_DIR not in sys.path:
+    sys.path.insert(0, _LLMS_DIR)
 
-    The Q4NX affine codec: w ~= sc*q + mn, q in [0,15], one (sc, mn) per group of
-    `group` elements along the reduction axis. This is the ONLY quantizer in the
-    example -- the prefill weights and the decode cascade cache both go through
-    it, so the two see bit-identical values."""
-    M, Kc = Wm.shape
-    Wg = Wm.reshape(M, Kc // group, group)
-    mn = Wg.min(2)
-    mx = Wg.max(2)
-    sc = (mx - mn) / 15.0
-    sc = np.where(sc <= 0, 1.0, sc).astype(np.float32)
-    q = np.clip(np.round((Wg - mn[..., None]) / sc[..., None]), 0, 15).astype(np.uint8)
-    return q.reshape(M, Kc), sc, mn.astype(np.float32)
+from shared.infra.q4nx import requant_q4k as _requant_q4k  # noqa: E402
 
 
 def _dequant_q4k(q, sc, mn, group):

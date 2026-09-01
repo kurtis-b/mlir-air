@@ -33,6 +33,15 @@ from proj_qmm_pack import (  # noqa: E402
     BLOCK_BF16,
 )
 
+import os
+
+_LLMS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _LLMS_DIR not in sys.path:
+    sys.path.insert(0, _LLMS_DIR)
+
+from shared.infra.q4nx import proj_dims as _proj_dims  # noqa: E402
+from shared.infra.q4nx import resolve_q4nx_model  # noqa: E402
+
 # Qwen2.5-7B-Instruct dims (HF config.json; matches FLM's
 # generic_decoding_layer/models/qwen2.5-7b.h).
 D = 3584  # hidden_size
@@ -54,22 +63,6 @@ ROPE_THETA = 1000000.0
 
 def _bf(a):
     return a.astype(bfloat16).astype(np.float32)
-
-
-def resolve_q4nx_model(model):
-    """Resolve `model` to a local model.q4nx path. `model` may be an HF repo id
-    (contains '/'), a directory containing model.q4nx, or a direct file path."""
-    import os
-
-    if os.path.isfile(model):
-        return model
-    if os.path.isdir(model):
-        p = os.path.join(model, "model.q4nx")
-        if os.path.isfile(p):
-            return p
-    from huggingface_hub import hf_hub_download
-
-    return hf_hub_download(model, "model.q4nx")
 
 
 # Row-group reorder (identical Q4NX codec to llama; w = scale*q + min, 32x256
@@ -304,21 +297,6 @@ def open_weight_source(model):
     if os.path.isdir(model) and os.path.isfile(os.path.join(model, "model.q4nx")):
         return Q4nxModel(model)
     return HFQ4nxModel(model)
-
-
-def _proj_dims(c):
-    """Logical (out, K) per projection, for I8-packed Q4NX headers."""
-    dq = c.n_heads * c.head_dim
-    dkv = c.n_kv_heads * c.head_dim
-    return {
-        "q": (dq, c.emb_dim),
-        "k": (dkv, c.emb_dim),
-        "v": (dkv, c.emb_dim),
-        "o": (c.emb_dim, dq),
-        "gate": (c.hidden_dim, c.emb_dim),
-        "up": (c.hidden_dim, c.emb_dim),
-        "down": (c.emb_dim, c.hidden_dim),
-    }
 
 
 def load_q4nx_weights(model_source, config=None):

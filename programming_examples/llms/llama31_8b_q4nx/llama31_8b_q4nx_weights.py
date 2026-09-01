@@ -47,6 +47,8 @@ from llama32_3b_weights import (  # noqa: E402
     LlamaWeights,
 )
 
+from shared.infra.q4nx import proj_dims as _proj_dims  # noqa: E402
+
 # HF repo id of the bf16 reference `make verify` compares against. FastFlowLM's
 # bundle declares base_model: meta-llama/Llama-3.1-8B-Instruct, which is gated;
 # this is a faithful ungated re-upload whose config matches the FLM bundle's
@@ -122,21 +124,6 @@ def generate_rope_lut(config=None, seq_len=2048, dtype=bfloat16):
     lut[:, :half] = np.cos(angles)
     lut[:, half:] = np.sin(angles)
     return lut.astype(dtype)
-
-
-def _proj_dims(c):
-    """Logical (out, K) per projection, for I8-packed Q4NX headers."""
-    dq = c.n_heads * c.head_dim
-    dkv = c.n_kv_heads * c.head_dim
-    return {
-        "q": (dq, c.emb_dim),
-        "k": (dkv, c.emb_dim),
-        "v": (dkv, c.emb_dim),
-        "o": (c.emb_dim, dq),
-        "gate": (c.hidden_dim, c.emb_dim),
-        "up": (c.hidden_dim, c.emb_dim),
-        "down": (c.emb_dim, c.hidden_dim),
-    }
 
 
 def load_q4nx_weights(model_source=None, config=None):

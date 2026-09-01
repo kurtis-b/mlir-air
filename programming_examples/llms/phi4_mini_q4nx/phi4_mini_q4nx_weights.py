@@ -47,6 +47,8 @@ from llama32_3b_weights import (  # noqa: E402
     LlamaWeights,
 )
 
+from shared.infra.q4nx import proj_dims as _proj_dims  # noqa: E402
+
 # bf16 reference `make verify` compares against -- ungated, and the same repo
 # FastFlowLM's own reference generator uses (models_simple/verify_phi4.py).
 HF_REPO = "microsoft/Phi-4-mini-instruct"
@@ -144,21 +146,6 @@ def generate_rope_lut(
         padded[:, :ROPE_DIM] = lut
         lut = padded
     return lut.astype(dtype)
-
-
-def _proj_dims(c):
-    """Logical (out, K) per projection, for I8-packed Q4NX headers."""
-    dq = c.n_heads * c.head_dim
-    dkv = c.n_kv_heads * c.head_dim
-    return {
-        "q": (dq, c.emb_dim),
-        "k": (dkv, c.emb_dim),
-        "v": (dkv, c.emb_dim),
-        "o": (c.emb_dim, dq),
-        "gate": (c.hidden_dim, c.emb_dim),
-        "up": (c.hidden_dim, c.emb_dim),
-        "down": (c.emb_dim, c.hidden_dim),
-    }
 
 
 def load_q4nx_weights(model_source=None, config=None):

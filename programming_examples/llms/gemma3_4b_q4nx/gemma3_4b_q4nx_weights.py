@@ -38,6 +38,14 @@ from proj_qmm_pack import (  # noqa: E402
     BLOCK_BF16,
 )
 
+import os
+
+_LLMS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _LLMS_DIR not in sys.path:
+    sys.path.insert(0, _LLMS_DIR)
+
+from shared.infra.q4nx import resolve_q4nx_model  # noqa: E402
+
 # Gemma3-4B (text) dims (models/Gemma3-4B-NPU2/config.json).
 D = 2560  # hidden_size
 DH = 256  # head_dim
@@ -71,22 +79,6 @@ def is_global_layer(layer_idx):
 
 def _bf(a):
     return a.astype(bfloat16).astype(np.float32)
-
-
-def resolve_q4nx_model(model):
-    """Resolve `model` to a local model.q4nx path. `model` may be an HF repo id
-    (contains '/'), a directory containing model.q4nx, or a direct file path."""
-    import os
-
-    if os.path.isfile(model):
-        return model
-    if os.path.isdir(model):
-        p = os.path.join(model, "model.q4nx")
-        if os.path.isfile(p):
-            return p
-    from huggingface_hub import hf_hub_download
-
-    return hf_hub_download(model, "model.q4nx")
 
 
 # Row-group reorder (identical Q4NX codec to llama; w = scale*(q - min), 32x256
