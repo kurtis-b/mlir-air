@@ -3,6 +3,7 @@
 
 """Kernel compilation cache, profiling, and air_project utilities."""
 
+import contextlib
 import json
 import os
 import shutil
@@ -137,23 +138,19 @@ class Profiler:
         if self.enabled and t0 is not None:
             self.layer_times.append((layer_idx, time.perf_counter() - t0))
 
+    @contextlib.contextmanager
     def time_cpu(self, name):
         """Context manager: `with prof.time_cpu("embed_lookup"): ...`
         Records the elapsed wall time as a CPU op named `name`. Safe to
-        use whether enabled or disabled (zero overhead when disabled)."""
-        prof = self
-
-        class _Ctx:
-            def __enter__(self_inner):
-                self_inner.t0 = time.perf_counter() if prof.enabled else None
-                return self_inner
-
-            def __exit__(self_inner, *exc):
-                if self_inner.t0 is not None:
-                    prof.record_cpu(name, time.perf_counter() - self_inner.t0)
-                return False
-
-        return _Ctx()
+        use whether enabled or disabled (zero overhead when disabled).
+        The finally records on the way out of an exception too, as the
+        hand-rolled __exit__ this replaces did."""
+        t0 = time.perf_counter() if self.enabled else None
+        try:
+            yield
+        finally:
+            if t0 is not None:
+                self.record_cpu(name, time.perf_counter() - t0)
 
     def per_token_walls_ms(self, n_layers):
         """Sum every consecutive `n_layers` layer-time entries into one
