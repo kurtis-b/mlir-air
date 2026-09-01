@@ -45,7 +45,7 @@ if _LLMS_DIR not in sys.path:
     sys.path.insert(0, _LLMS_DIR)
 
 from llama32_1b_weights import LlamaConfig, load_weights, generate_rope_lut
-from llama32_1b_cpu_helpers import attention_reference
+from shared.infra.cpu_attn import attention_reference
 from shared.infra.cache import KernelCache, Profiler
 from shared.infra.backend_presets import (
     SIMPLE_BACKEND,

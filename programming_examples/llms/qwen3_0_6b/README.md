@@ -126,7 +126,7 @@ published `rtol`/`atol`; a release-time gate for a change to the int4 cascade bu
 | `qwen3_0_6b_prefill.py` | Prefill kernel builders + `run_transformer_block_qwen3` + `preload_prefill_weights` |
 | `qwen3_0_6b_decode.py` | Decode kernel builders + `run_decode_block` (KV cache) |
 | `qwen3_0_6b_weights.py` | Weight loading from HuggingFace safetensors (incl. q_norm/k_norm, tied lm_head) |
-| `qwen3_0_6b_cpu_helpers.py` | NumPy helpers shared by production + verify: `rms_norm`, `qk_norm_per_head` (Qwen3 delta), `attention_reference`, `softmax` |
+| `qwen3_0_6b_cpu_helpers.py` | NumPy helpers shared by production + verify: `rms_norm`, `qk_norm_per_head` (Qwen3 delta) (`attention_reference` now in `shared/infra/cpu_attn.py`) |
 | `verify_adapter.py` | Hooks this model's prefill/decode into the shared `../verify/` subsystem |
 | `w4_decode_pack.py` | The int4 decode path's ONE owner: the `QWEN3_W4_DECODE` flag and its default, the RTN uint4 gs=128 quantization + packing, the dequantized-copy substitution, and the `quant_*` contract |
 | `Makefile` | compile / run / profile / chat / verify / verify-full / verify-quant-bar / diagnosis / clean / clean-build |

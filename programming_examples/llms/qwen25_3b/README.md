@@ -79,7 +79,7 @@ in HF's top-5 set at that position. Current status: **PASS, exit 0, 2/2 prompts*
 | `qwen25_3b_prefill.py` | Prefill kernel builders + `run_transformer_block_qwen25` + `preload_prefill_weights` |
 | `qwen25_3b_decode.py` | Decode kernel builders + `run_decode_block` (KV cache) |
 | `qwen25_3b_weights.py` | Weight loading from HuggingFace safetensors (incl. QKV bias, tied lm_head) |
-| `qwen25_3b_cpu_helpers.py` | NumPy helpers shared by production + verify: `rms_norm`, `attention_reference`, `softmax` |
+| `qwen25_3b_cpu_helpers.py` | NumPy helpers shared by production + verify: `rms_norm` (`attention_reference` now in `shared/infra/cpu_attn.py`) |
 | `verify_adapter.py` | Hooks this model's prefill/decode into the shared `../verify/` subsystem |
 | `Makefile` | compile / run / profile / chat / verify / verify-full / diagnosis / clean |
 | `ARCHITECTURE.md` | Per-layer kernel sequence, NPU/CPU mapping, runtime flow, deltas |

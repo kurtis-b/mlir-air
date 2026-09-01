@@ -85,7 +85,7 @@ in HF's top-5 set at that position. Current status: **PASS, exit 0, 2/2 prompts*
 | `llama32_3b_prefill.py` | Prefill: reuses the llama32_1b builders verbatim (config-driven) |
 | `llama32_3b_decode.py` | Decode: NPU rms_gemv_rope + CPU attention + NPU O/Gate/Up/Down GEMVs |
 | `llama32_3b_weights.py` | Weight loading from HuggingFace safetensors |
-| `llama32_3b_cpu_helpers.py` | NumPy helpers shared by production + verify: `rms_norm`, `attention_reference`, `softmax` |
+| `llama32_3b_cpu_helpers.py` | NumPy helpers shared by production + verify: `rms_norm` (`attention_reference` now in `shared/infra/cpu_attn.py`) |
 | `verify_adapter.py` | Hooks this model into the shared `../verify/` subsystem |
 | `Makefile` | compile / run / profile / chat / verify / verify-full / diagnosis / clean |
 | `ARCHITECTURE.md` | Per-layer kernel sequence, NPU/CPU mapping, runtime flow, deltas |

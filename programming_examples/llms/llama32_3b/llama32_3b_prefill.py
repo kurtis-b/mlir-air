@@ -57,7 +57,7 @@ from llama32_1b_prefill import (  # noqa: E402,F401
     _rms_gemms_rope_run_backend,
     _rms_scratch_specs,
 )
-from llama32_1b_cpu_helpers import attention_reference  # noqa: E402
+from shared.infra.cpu_attn import attention_reference  # noqa: E402
 
 
 def use_temporal_fa(seq_len, n_heads, n_kv_heads, head_dim):

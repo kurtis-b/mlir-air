@@ -45,7 +45,7 @@ if _LLMS_DIR not in sys.path:
     sys.path.insert(0, _LLMS_DIR)
 
 from qwen3_1_7b_weights import LlamaConfig
-from qwen3_1_7b_cpu_helpers import attention_reference
+from shared.infra.cpu_attn import attention_reference
 from shared.infra.cache import KernelCache, Profiler
 
 # ---------------------------------------------------------------------------

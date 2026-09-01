@@ -76,7 +76,7 @@ make verify
 | `llama32_1b_prefill.py` | Standalone prefill (with profiler report) |
 | `llama32_1b_decode.py` | Standalone decode |
 | `llama32_1b_weights.py` | Weight loading from HuggingFace safetensors |
-| `llama32_1b_cpu_helpers.py` | NumPy helpers shared by production + verify: `rms_norm` (LM-head GEMV final norm), `attention_reference` (prefill `cpu_attn=True` fallback), `softmax` (used by `attention_reference`). |
+| `llama32_1b_cpu_helpers.py` | NumPy helpers shared by production + verify: `rms_norm` (LM-head GEMV final norm). The prefill `cpu_attn=True` fallback `attention_reference` now lives in `shared/infra/cpu_attn.py`. |
 | `gemm_builder.py` | bf16 GEMM module builder + transform IR (per-model; int4 sibling under `../llama32_1b_int4/`) |
 | `../llama_kernel_builder/` | Shared (between bf16 and int4 Llamas): MLIR stitching, kernel cache, external `.o` compilation, SwiGLU + RoPE C sources |
 | `multi_launch_builder/` | Multi-launch ELF builders (one per fused kernel) |

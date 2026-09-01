@@ -50,6 +50,6 @@ and MHA (3 scratch) with no model-specific code. See
 |---|---|
 | `smollm2_1_7b_inference.py` | production runner (setup → prefill → decode); reuses `llama32_1b_inference` Session + loops |
 | `smollm2_1_7b_weights.py` | HF weight loader + Config + RoPE LUT |
-| `smollm2_1_7b_cpu_helpers.py` | rms_norm / attention_reference / softmax |
+| `smollm2_1_7b_cpu_helpers.py` | rms_norm (`attention_reference` now in `shared/infra/cpu_attn.py`) |
 | `verify_adapter.py` | hooks into shared `../verify/` subsystem |
 | `Makefile` | run / verify / verify-full / diagnosis / profile / compile / clean |
