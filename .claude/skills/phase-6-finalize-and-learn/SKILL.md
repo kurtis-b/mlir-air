@@ -160,7 +160,7 @@ Mirror `programming_examples/llms/llama32_1b/Makefile` — note the verify
 runner is the **shared** one at `../verify/`, selected via `--runner`:
 
 The recipes do NOT take the NPU lock themselves — no sibling example's do. The
-caller serialises through the broker (`agents/scripts/devq.sh run --class measure
+caller serialises through the broker (`"$DEVQ" run --class measure
 -- make verify`); a bare `flock` inside a recipe would wait on its own parent when
 the recipe runs inside a devq job.
 
@@ -190,8 +190,9 @@ profile:
 ### Step 4: Run `make verify` — the production-readiness gate
 
 ```bash
+DEVQ="$(git rev-parse --show-toplevel)/agents/scripts/devq.sh"
 cd programming_examples/llms/<model>
-agents/scripts/devq.sh run --class measure -- make verify
+"$DEVQ" run --class measure -- make verify
 ```
 
 The runner: both NPU and HF bf16 greedy-decode each prompt × 32 tokens,

@@ -117,9 +117,10 @@ is a failure. No manual per-prompt probability classification is needed.
 ### Step 3: Run both lenses + collect metrics
 
 ```bash
+DEVQ="$(git rev-parse --show-toplevel)/agents/scripts/devq.sh"
 cd programming_examples/llms/<model>
-agents/scripts/devq.sh run --class measure -- make diagnosis    # per-layer cosine, all layers
-agents/scripts/devq.sh run --class measure -- make verify       # token-set gate (exit 0/1)
+"$DEVQ" run --class measure -- make diagnosis    # per-layer cosine, all layers
+"$DEVQ" run --class measure -- make verify       # token-set gate (exit 0/1)
 ```
 
 From verify: PASS/FAIL (criterion 1, the gate); the report under

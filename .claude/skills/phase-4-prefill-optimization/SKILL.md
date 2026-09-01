@@ -84,8 +84,9 @@ Before invoking any optimization skill, capture the baseline prefill time —
 this is the number every skill must beat:
 
 ```bash
+DEVQ="$(git rev-parse --show-toplevel)/agents/scripts/devq.sh"
 cd programming_examples/llms/<model>
-agents/scripts/devq.sh run --class measure -- make profile
+"$DEVQ" run --class measure -- make profile
 ```
 
 Record: kernel time (ms) + wall time as the baseline. Also note the Phase 3
@@ -114,7 +115,8 @@ gate.
 After every applied (or attempted) optimization skill, re-run the gate:
 
 ```bash
-agents/scripts/devq.sh run --class measure -- make verify      # GATE: token-set, exit 1 on FAIL
+DEVQ="$(git rev-parse --show-toplevel)/agents/scripts/devq.sh"
+"$DEVQ" run --class measure -- make verify      # GATE: token-set, exit 1 on FAIL
 ```
 
 `make verify` PASS is the correctness gate. If it regresses to FAIL,
@@ -123,7 +125,8 @@ revert the change and document why.
 Only when verify FAILs, run diagnosis to **localize** the break:
 
 ```bash
-agents/scripts/devq.sh run --class measure -- make diagnosis   # informational: per-layer cosine table
+DEVQ="$(git rev-parse --show-toplevel)/agents/scripts/devq.sh"
+"$DEVQ" run --class measure -- make diagnosis   # informational: per-layer cosine table
 ```
 
 A cosine cliff at layer *i* points at the broken assumption there (e.g. a

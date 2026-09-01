@@ -83,8 +83,9 @@ Capture the decode time/token before invoking any optimization skill —
 this is the number every skill must beat:
 
 ```bash
+DEVQ="$(git rev-parse --show-toplevel)/agents/scripts/devq.sh"
 cd programming_examples/llms/<model>
-agents/scripts/devq.sh run --class measure -- make profile
+"$DEVQ" run --class measure -- make profile
 ```
 
 Record: ms/token + per-layer + LM head time breakdown (where the
@@ -111,7 +112,8 @@ Phase 3/finalize, profiled here — not a separate optimization skill.
 After every applied (or attempted) optimization skill, re-run the gate:
 
 ```bash
-agents/scripts/devq.sh run --class measure -- make verify      # GATE: token-set, exit 1 on FAIL
+DEVQ="$(git rev-parse --show-toplevel)/agents/scripts/devq.sh"
+"$DEVQ" run --class measure -- make verify      # GATE: token-set, exit 1 on FAIL
 ```
 
 `make verify` PASS is the correctness gate (its 32-token generation is
