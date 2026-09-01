@@ -64,6 +64,52 @@ def _load(filename):
     return _cache[filename]
 
 
+def _NOT_FOUND_FULL(output_dtype):
+    """gemm_config's closing guidance; it lists what IS measured."""
+    data = _load(_GEMM_JSON[output_dtype])
+    return (
+        f"Measured shapes: {[(s['M'], s['K'], s['N']) for s in data['shapes']]}. "
+        f"Run a sweep for this shape (matrix_multiplication/bf16_in_{'bf16' if output_dtype=='bf16' else 'fp32'}_out) "
+        f"and add it to the JSON before using it."
+    )
+
+
+def _find_shape(fn, M, K, N, output_dtype, not_found_tail):
+    """Validate `output_dtype`, load its page, and return (page, shape entry).
+
+    `fn` is the caller's name and `not_found_tail` a CALLABLE giving its own
+    closing guidance. It must stay lazy: gemm_config's tail lists the measured
+    shapes, which means loading the page, which would raise KeyError on a bad
+    `output_dtype` before the ValueError below could report it properly.
+    The module contract is to raise rather than guess, so the two lookups keep
+    the exact diagnostics they had -- they differ, and the difference is not
+    this refactor's to change.
+    """
+    if output_dtype not in _GEMM_JSON:
+        raise ValueError(
+            f"{fn}: output_dtype must be one of {sorted(_GEMM_JSON)}, got {output_dtype!r}"
+        )
+    data = _load(_GEMM_JSON[output_dtype])
+    for s in data["shapes"]:
+        if (s["M"], s["K"], s["N"]) == (M, K, N):
+            return data, s
+    raise KeyError(
+        f"{fn}: shape {M}x{K}x{N} (out={output_dtype}) not in registry "
+        f"{_GEMM_JSON[output_dtype]}. {not_found_tail()}"
+    )
+
+
+def _entry(data, method, m):
+    """The public result dict for one measured method."""
+    return {
+        "method": method,
+        "tile": dict(m["tile"]),
+        "herd": _herd(data, m),
+        "gflops": m["gflops"],
+        "mean_rel_L1": m["mean_rel_L1"],
+    }
+
+
 def gemm_config(M, K, N, output_dtype="bf16", precision="high"):
     """Best measured GEMM config for one shape + contract, from the registry JSON.
 
@@ -89,36 +135,18 @@ def gemm_config(M, K, N, output_dtype="bf16", precision="high"):
         requested precision tier has no measured entry. Message tells you to run
         a sweep + add the shape to the JSON (no silent fallback to a guessed config).
     """
-    if output_dtype not in _GEMM_JSON:
-        raise ValueError(
-            f"gemm_config: output_dtype must be one of {sorted(_GEMM_JSON)}, got {output_dtype!r}"
-        )
-    data = _load(_GEMM_JSON[output_dtype])
-    for s in data["shapes"]:
-        if (s["M"], s["K"], s["N"]) == (M, K, N):
-            best = s.get("best", {})
-            if precision not in best:
-                raise KeyError(
-                    f"gemm_config: shape {M}x{K}x{N} (out={output_dtype}) has no "
-                    f"'{precision}'-precision best in {_GEMM_JSON[output_dtype]} "
-                    f"(available: {sorted(best)}). Run a sweep for this tier and add it."
-                )
-            method = best[precision]
-            m = s["methods"][method]
-            return {
-                "method": method,
-                "tile": dict(m["tile"]),
-                "herd": _herd(data, m),
-                "gflops": m["gflops"],
-                "mean_rel_L1": m["mean_rel_L1"],
-            }
-    raise KeyError(
-        f"gemm_config: shape {M}x{K}x{N} (out={output_dtype}) not in registry "
-        f"{_GEMM_JSON[output_dtype]}. Measured shapes: "
-        f"{[(s['M'], s['K'], s['N']) for s in data['shapes']]}. "
-        f"Run a sweep for this shape (matrix_multiplication/bf16_in_{'bf16' if output_dtype=='bf16' else 'fp32'}_out) "
-        f"and add it to the JSON before using it."
+    data, s = _find_shape(
+        "gemm_config", M, K, N, output_dtype, lambda: _NOT_FOUND_FULL(output_dtype)
     )
+    best = s.get("best", {})
+    if precision not in best:
+        raise KeyError(
+            f"gemm_config: shape {M}x{K}x{N} (out={output_dtype}) has no "
+            f"'{precision}'-precision best in {_GEMM_JSON[output_dtype]} "
+            f"(available: {sorted(best)}). Run a sweep for this tier and add it."
+        )
+    method = best[precision]
+    return _entry(data, method, s["methods"][method])
 
 
 def gemm_config_method(M, K, N, output_dtype, method, precision="high"):
@@ -126,28 +154,13 @@ def gemm_config_method(M, K, N, output_dtype, method, precision="high"):
     best). Use when a caller forces a method (e.g. all-drain A/B comparison) but
     still wants the registry's tiles for it. Raises KeyError if the shape or the
     requested method isn't in the registry for this dtype."""
-    if output_dtype not in _GEMM_JSON:
-        raise ValueError(
-            f"gemm_config_method: output_dtype must be one of {sorted(_GEMM_JSON)}, got {output_dtype!r}"
-        )
-    data = _load(_GEMM_JSON[output_dtype])
-    for s in data["shapes"]:
-        if (s["M"], s["K"], s["N"]) == (M, K, N):
-            if method not in s["methods"]:
-                raise KeyError(
-                    f"gemm_config_method: shape {M}x{K}x{N} (out={output_dtype}) has no "
-                    f"method '{method}' in {_GEMM_JSON[output_dtype]} "
-                    f"(available: {sorted(s['methods'])})."
-                )
-            m = s["methods"][method]
-            return {
-                "method": method,
-                "tile": dict(m["tile"]),
-                "herd": _herd(data, m),
-                "gflops": m["gflops"],
-                "mean_rel_L1": m["mean_rel_L1"],
-            }
-    raise KeyError(
-        f"gemm_config_method: shape {M}x{K}x{N} (out={output_dtype}) not in registry "
-        f"{_GEMM_JSON[output_dtype]}. Run a sweep and add it."
+    data, s = _find_shape(
+        "gemm_config_method", M, K, N, output_dtype, lambda: "Run a sweep and add it."
     )
+    if method not in s["methods"]:
+        raise KeyError(
+            f"gemm_config_method: shape {M}x{K}x{N} (out={output_dtype}) has no "
+            f"method '{method}' in {_GEMM_JSON[output_dtype]} "
+            f"(available: {sorted(s['methods'])})."
+        )
+    return _entry(data, method, s["methods"][method])

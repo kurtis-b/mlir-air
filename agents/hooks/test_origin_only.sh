@@ -4,30 +4,23 @@
 set -u
 HOOK="$(cd "$(dirname "$0")" && pwd)/origin-only-guard.mjs"
 pass=0; fail=0
+# ENV_KV, when set by runenv, is one VAR=value handed to the hook process only.
 run() { # run <expected: deny|allow|ask> <command...>
   local expect="$1"; shift
   local cmd="$*" json out decision
   json=$(node -e 'process.stdout.write(JSON.stringify({tool_name:"Bash",tool_input:{command:process.argv[1]},cwd:"/x"}))' "$cmd")
-  out=$(printf '%s' "$json" | node "$HOOK" 2>/dev/null)
+  out=$(printf '%s' "$json" | env ${ENV_KV:+"$ENV_KV"} node "$HOOK" 2>/dev/null)
   if [[ -z "$out" ]]; then decision=allow
   elif grep -q '"permissionDecision":"deny"' <<<"$out"; then decision=deny
   elif grep -q '"permissionDecision":"ask"' <<<"$out"; then decision=ask
   else decision="unknown($out)"; fi
-  if [[ "$decision" == "$expect" ]]; then pass=$((pass+1)); echo "PASS  [$expect] $cmd"
-  else fail=$((fail+1)); echo "FAIL  [expected $expect, got $decision] $cmd"; fi
+  if [[ "$decision" == "$expect" ]]; then pass=$((pass+1)); echo "PASS  [$expect] ${ENV_KV:+$ENV_KV }$cmd"
+  else fail=$((fail+1)); echo "FAIL  [expected $expect, got $decision] ${ENV_KV:+$ENV_KV }$cmd"; fi
 }
 
-runenv() { # runenv <expected> <VAR=value> <command...>: like run, with one env var set for the hook
+runenv() { # runenv <expected> <VAR=value> <command...>: run with one env var set for the hook
   local expect="$1" kv="$2"; shift 2
-  local cmd="$*" json out decision
-  json=$(node -e 'process.stdout.write(JSON.stringify({tool_name:"Bash",tool_input:{command:process.argv[1]},cwd:"/x"}))' "$cmd")
-  out=$(printf '%s' "$json" | env "$kv" node "$HOOK" 2>/dev/null)
-  if [[ -z "$out" ]]; then decision=allow
-  elif grep -q '"permissionDecision":"deny"' <<<"$out"; then decision=deny
-  elif grep -q '"permissionDecision":"ask"' <<<"$out"; then decision=ask
-  else decision="unknown($out)"; fi
-  if [[ "$decision" == "$expect" ]]; then pass=$((pass+1)); echo "PASS  [$expect] $kv $cmd"
-  else fail=$((fail+1)); echo "FAIL  [expected $expect, got $decision] $kv $cmd"; fi
+  ENV_KV="$kv" run "$expect" "$@"
 }
 
 echo "--- U1: no push to upstream ---"
