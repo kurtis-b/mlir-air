@@ -110,8 +110,9 @@ BEFORE running anything, READ:
 ### Step 3: Run `make verify` — the PRIMARY gate
 
 ```bash
+DEVQ="$(git rev-parse --show-toplevel)/agents/scripts/devq.sh"
 cd <model_dir>
-flock -x -w 1800 /tmp/mlir-air-npu.lock make verify
+"$DEVQ" run --class measure -- make verify
 ```
 
 Expected (per Phase 6 / verify subsystem design):
@@ -159,7 +160,7 @@ and why. Use the structure below:
 
 ## 3. Manual reproduce
     cd <model_dir>
-    flock -x -w 1800 /tmp/mlir-air-npu.lock make verify
+    "$(git rev-parse --show-toplevel)/agents/scripts/devq.sh" run --class measure -- make verify
 ```
 
 ## Failure modes

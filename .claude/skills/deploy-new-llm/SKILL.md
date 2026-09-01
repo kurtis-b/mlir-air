@@ -341,7 +341,8 @@ If the evaluator reports:
 > `programming_examples/llms/shared/infra/`, `programming_examples/llms/verify/`, or the reference
 > `programming_examples/llms/llama32_1b/`), re-run `make verify` on the OTHER deployments under
 > `programming_examples/llms/<model>/` before tagging — a shared-infra change can silently break
-> a sibling. NPU is a singleton, so run sequentially with `flock`.
+> a sibling. NPU is a singleton; the devq broker serialises them, so submit each
+> run with `"$DEVQ" run --class measure -- make verify`.
 
 ### Step 9: On all-PASS, hand off to the human
 
