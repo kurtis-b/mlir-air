@@ -7,9 +7,13 @@
 Each runner CLI is driven end to end (parse -> forward -> place) as a
 subprocess on a small module printed by run.py -p; the placed IR the runner
 writes to air_ir_debug.mlir must carry x_size/y_size matching --herd-m 2
---herd-n 2, and the default arm must stay the runner's own default (4x4 / 8x4). Exit codes are ignored: the
-runner fails AFTER the placement (the pre-existing simulator arch-schema
-failure), and the IR on disk is the gate.
+--herd-n 2, and the default arm must stay the runner's own default (4x4 / 8x4).
+
+The runner must also EXIT 0. It did not always: it used to die after placement
+on a stale arch model, and this test ignored the exit code so it could still
+gate the placement. Both runners complete now, so ignoring the code would leave
+that repair unguarded -- the test would stay green if the arch model regressed.
+Completion is part of the gate.
 """
 
 import os
@@ -34,7 +38,13 @@ def _placed_sizes(script, ir_path, herd_args):
     """Run the runner CLI in a temp cwd; return the placed segment x/y sizes."""
     d = tempfile.mkdtemp()
     cmd = [sys.executable, os.path.join(_HERE, script), "--input-file", ir_path]
-    subprocess.run(cmd + herd_args, cwd=d, capture_output=True, timeout=600)
+    r = subprocess.run(
+        cmd + herd_args, cwd=d, capture_output=True, timeout=600, text=True
+    )
+    assert r.returncode == 0, (
+        f"{script}: exited {r.returncode}; the runner must complete, not just place. "
+        f"stderr tail: {r.stderr.strip().splitlines()[-1] if r.stderr.strip() else '(empty)'}"
+    )
     debug = os.path.join(d, "air_ir_debug.mlir")
     assert os.path.exists(debug), f"{script}: no air_ir_debug.mlir (died pre-placement)"
     with open(debug) as f:

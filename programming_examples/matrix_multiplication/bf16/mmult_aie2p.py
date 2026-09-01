@@ -70,6 +70,11 @@ def mmult_runner(air_ir_string: str, herd_m: int = HERD_M, herd_n: int = HERD_N)
             {"bytes": 1, "name": "i8"},
             {"bytes": 2, "name": "bf16"},
             {"bytes": 4, "name": "i32"},
+            # The aie2p path accumulates in f32 (the aie2 path stays bf16), so the
+            # model must know its width or the runner cannot size a transfer.
+            # Width only -- `datatypes` is consulted solely for bytes-per-element
+            # (Runner.cpp getTransferCost, RunnerNode.cpp getMemoryCostInBytes).
+            {"bytes": 4, "name": "f32"},
         ],
         "devicename": "testdevice",
         "cost_model": {
