@@ -222,7 +222,6 @@ mechanism, the measurements and the `.decode_windows` manifest guard.
 | `llama31_8b_q4nx_prefill.py` | thin driver over the `llama32_3b` builders + its `causal_lm` interface |
 | `llama31_8b_q4nx_weights.py` | `model.q4nx` loader, Q4NX dequant, llama3-scaled RoPE LUTs |
 | `q4nx_decode_8b.py` | fused decode wrapper: template load, split weight BOs, KV seeding, per-token dispatch |
-| `decode_bringup_8b.py` | standalone on-device decode bring-up (no prefill), for isolating the decode |
 | `Makefile` | build / run / verify / verify-full / verify-paris / diagnosis / profile |
 | `verify_adapter.py` | binds the Q4NX prefill + fused decode to the shared `verify/` runner contract |
 | `../llama32_1b_q4nx/q4nx_requant.py` | shared Q4NX -> q4k-cascade re-quantization (`tie_lm_head=False` here) |
