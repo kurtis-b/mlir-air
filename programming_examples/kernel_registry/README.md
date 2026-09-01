@@ -13,7 +13,7 @@ This is **documentation, not executable code** — nothing here compiles or runs
 
 ## Scope
 
-This registry targets **NPU2 (Strix / AIE2P) only** — all shapes, tile configs, tolerances, and measured numbers are for the aie2p target. It is built up **one kernel at a time** — only kernels we have independently understood and verified against the GPU/HF numerical standard are included, so every number here can be trusted and reproduced. Currently the registry covers **GEMM**, **GEMV**, **RMSNorm**, **FlashAttention** (driven by the heads-first harness; a seq-first variant shares the same compute kernel and is bit-identical), **Element-wise Add**, **SiLU-and-Mul**, **RoPE** (half-split, the variant llama links), **GELU** (tanh approximation, the SmolVLA SigLIP vision MLP activation), and **Conv1D** (causal depthwise k=3, the LFM2 `Lfm2ShortConv` convolution and the first non-transformer primitive here) — the core LLM leaf kernels are now covered.
+This registry targets **NPU2 (Strix / AIE2P) only** — all shapes, tile configs, tolerances, and measured numbers are for the aie2p target. It is built up **one kernel at a time** — only kernels we have independently understood and verified against the GPU/HF numerical standard are included, so every number here can be trusted and reproduced. **Which kernels are covered is listed in exactly one place**: the index table in [`supported_kernels.md`](supported_kernels.md). The file table below links each one's detail page. The core LLM leaf kernels are now covered.
 
 | File | What it is |
 |---|---|

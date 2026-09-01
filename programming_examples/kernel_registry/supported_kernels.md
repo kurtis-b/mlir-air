@@ -13,7 +13,7 @@ This is **documentation, not executable code** — it records results produced b
 
 **Status legend**: ✅ verified on real NPU2, accuracy in line with the bf16 standard · ⚠️ verified on real NPU2 but with a documented precision/coverage caveat · ❌ broken/missing
 
-> **Scope**: currently **GEMM**, **GEMV**, **RMSNorm**, **LayerNorm**, **FlashAttention**, **Element-wise Add**, **SiLU-and-Mul**, **RoPE**, and **GELU** — the registry is built up one verified kernel at a time. The core LLM leaf kernels are now covered; see [`README.md`](README.md) for the roadmap.
+> **Scope**: the kernels covered are the rows of the **Kernels** index table below — that table is their single home, so this line does not restate them. The registry is built up one verified kernel at a time; the core LLM leaf kernels are now covered. See [`README.md`](README.md) for the roadmap.
 
 ---
 
