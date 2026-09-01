@@ -2122,6 +2122,32 @@ std::optional<int> AIRSplitL2MemrefForBufferConstraintPass::getMemrefSplitDim(
                                         memrefShape);
 }
 
+// Whether `other` is the far-side partner of `chanUser` by bundle index, or
+// nullopt when the two index lists cannot be compared. Undecidable pairing is
+// unsafe in both directions -- keeping a stranger duplicates the transfer,
+// dropping a partner leaves it untiled against a tiled channel -- so callers
+// must refuse rather than guess. File-scope precisely so the plan
+// (getTargetMemrefAllocs) and the rewrite (runOnOperation) apply ONE rule;
+// they were two hand-kept copies under a comment asking them not to drift.
+static std::optional<bool> pairsByBundleIndex(air::ChannelInterface chanUser,
+                                              air::ChannelInterface other) {
+  auto refIndices = chanUser.getIndices();
+  auto otherIndices = other.getIndices();
+  if (refIndices.empty() && otherIndices.empty())
+    return true; // Scalar channel: the symbol has one endpoint pair.
+  if (refIndices.size() != otherIndices.size())
+    return std::nullopt;
+  for (auto [refIdx, otherIdx] : llvm::zip_equal(refIndices, otherIndices)) {
+    auto refConst = getConstantIntValue(refIdx);
+    auto otherConst = getConstantIntValue(otherIdx);
+    if (!refConst || !otherConst)
+      return std::nullopt;
+    if (*refConst != *otherConst)
+      return false;
+  }
+  return true;
+}
+
 // Get a vector of allocs whose memrefs require splitting; label the single
 // split dimension with split factor, split_type and affine_map (if any).
 FailureOr<llvm::MapVector<memref::AllocOp, memrefSplitInfoTy>>
@@ -2547,28 +2573,6 @@ AIRSplitL2MemrefForBufferConstraintPass::getTargetMemrefAllocs(
       return numOffsets;
     };
 
-    // Whether `other` is the far-side partner of `chanUser`, or nullopt when
-    // the two bundle index lists cannot be compared.
-    auto pairsByBundleIndex =
-        [](air::ChannelInterface chanUser,
-           air::ChannelInterface other) -> std::optional<bool> {
-      auto refIndices = chanUser.getIndices();
-      auto otherIndices = other.getIndices();
-      if (refIndices.empty() && otherIndices.empty())
-        return true; // Scalar channel: the symbol has one endpoint pair.
-      if (refIndices.size() != otherIndices.size())
-        return std::nullopt;
-      for (auto [refIdx, otherIdx] :
-           llvm::zip_equal(refIndices, otherIndices)) {
-        auto refConst = getConstantIntValue(refIdx);
-        auto otherConst = getConstantIntValue(otherIdx);
-        if (!refConst || !otherConst)
-          return std::nullopt;
-        if (*refConst != *otherConst)
-          return false;
-      }
-      return true;
-    };
 
     bool splitIsExpressible = true;
     std::string declineReason;
@@ -3123,26 +3127,12 @@ void AIRSplitL2MemrefForBufferConstraintPass::runOnOperation() {
       auto pairsWithChanUser = [&](air::ChannelInterface other) {
         if (erased.contains(other.getOperation()))
           return false;
-        auto refIndices = chanUserOp.getIndices();
-        auto otherIndices = other.getIndices();
-        if (refIndices.empty() && otherIndices.empty())
-          return true;
-        if (refIndices.size() != otherIndices.size()) {
+        auto paired = pairsByBundleIndex(chanUserOp, other);
+        if (!paired) {
           pairingIsDecidable = false;
           return false;
         }
-        for (auto [refIdx, otherIdx] :
-             llvm::zip_equal(refIndices, otherIndices)) {
-          auto refConst = getConstantIntValue(refIdx);
-          auto otherConst = getConstantIntValue(otherIdx);
-          if (!refConst || !otherConst) {
-            pairingIsDecidable = false;
-            return false;
-          }
-          if (*refConst != *otherConst)
-            return false;
-        }
-        return true;
+        return *paired;
       };
       llvm::erase_if(theOtherChanOps, [&](air::ChannelInterface other) {
         return !pairsWithChanUser(other);
