@@ -19,7 +19,7 @@
 #
 # On a machine where several sessions share one NPU, wrap the device-touching
 # targets the way the sibling examples are wrapped:
-#     flock -x -w 1800 /tmp/mlir-air-npu.lock make verify
+#     agents/scripts/devq.sh run --class measure -- make verify
 # The recipes deliberately do NOT take that lock themselves — doing so would
 # deadlock exactly that invocation. `shared/infra/cache.py` separately holds
 # /tmp/npu.lock around each dispatch, which keeps concurrent runs correct; the
