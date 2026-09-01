@@ -65,10 +65,10 @@
 #
 # Usage:
 #   devq.sh run    --class build|measure [--name TAG] -- CMD [ARG...]
-#   devq.sh submit --class build|measure [--name TAG] [--wait] -- CMD [ARG...]
+#   devq.sh submit --class build|measure [--name TAG] -- CMD [ARG...]
 #   devq.sh preflight [--quiet]        # 0 = device free, 3 = held by another job
 #   devq.sh status [--raw]
-#   devq.sh wait ID [--timeout SEC]
+#   devq.sh wait ID
 #   devq.sh log ID
 #   devq.sh new-job FILE [TITLE]  # write a job-script skeleton that cannot exit 0 on red legs
 set -uo pipefail
@@ -183,12 +183,11 @@ eligible() {  # id class
 device_idle() { ( exec 7>>"$NPU_LOCK" && flock -n -x 7 ) 2>/dev/null; }
 
 cmd_submit() {
-  local class= name=- dowait=0
+  local class= name=-
   while [ $# -gt 0 ]; do
     case $1 in
       --class) class=${2:-}; shift 2;;
       --name)  name=${2:-}; shift 2;;
-      --wait)  dowait=1; shift;;
       --) shift; break;;
       *) die "submit: unexpected argument '$1' (did you forget --?)";;
     esac
@@ -213,7 +212,6 @@ cmd_submit() {
   DEVQ_JOB_ID=$id setsid "$SELF" __run "$id" >>"$DEVQ_DIR/runner.log" 2>&1 </dev/null &
   disown 2>/dev/null
   printf '%s\n' "$id"
-  [ "$dowait" = 1 ] && { cmd_wait "$id"; return $?; }
   return 0
 }
 
@@ -377,9 +375,7 @@ cmd_preflight() {
 }
 
 cmd_wait() {
-  local id=${1:?wait: need an id} deadline= f
-  # printf, not print: awk's default OFMT (%.6g) mangles epoch floats to 1.78e+09.
-  [ "${2:-}" = "--timeout" ] && deadline=$(awk "BEGIN{printf \"%.6f\", $(now) + ${3:?}}")
+  local id=${1:?wait: need an id} f
   f=$(metaf "$id"); [ -e "$f" ] || die "wait: no such job $id"
   while :; do
     lock_state; reconcile; unlock_state
@@ -388,9 +384,6 @@ cmd_wait() {
       done|failed) [ -n "$M_note" ] && printf 'devq: job %s %s (%s)\n' "$id" "$M_state" "$M_note" >&2
                    return "${M_exit:-1}";;
     esac
-    if [ -n "$deadline" ] && awk "BEGIN{exit !($(now) > $deadline)}"; then
-      printf 'devq: wait timeout, job %s still %s\n' "$id" "$M_state" >&2; return 125
-    fi
     sleep "$POLL"
   done
 }
