@@ -1,7 +1,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""NumPy CPU attention reference shared by the llms/ prefill drivers.
+"""NumPy CPU attention references shared by the llms/ prefill and decode drivers.
 
 `attention_reference` is the `cpu_attn=True` prefill fallback: full GQA
 attention in F32, for the models whose semantics are plain causal GQA over
@@ -9,6 +9,12 @@ already-RoPE'd Q/K. Nine model dirs carried a byte-identical copy of it (two
 spellings of one implementation, differing only in whether the causal mask is
 added in one statement or two) plus a private `softmax` that nothing else
 called; this is that single copy.
+
+`decode_attention_cpu` is the decode-side counterpart: single-query attention
+over the KV cache, which eight decode drivers carried as one identical
+implementation with one identical signature (`smollm2_1_7b_int4` already
+imported it across model dirs from `llama32_1b_int4_decode`, which is the seam
+this replaces).
 
 Not every model belongs here. `lfm2_1_2b_q4nx` keeps its own
 `lfm2_1_2b_q4nx_cpu_attn.attention_reference` because its implementation
@@ -19,6 +25,7 @@ silently change a model's numerics.
 """
 
 import numpy as np
+from ml_dtypes import bfloat16
 
 
 def softmax(x, axis=-1):
@@ -62,3 +69,40 @@ def attention_reference(q, k, v, n_heads, n_kv_heads):
         probs = softmax(scores, axis=-1)
         out_heads[h] = probs @ v[kv_idx]
     return out_heads.transpose(1, 0, 2).reshape(seq_len, n_heads * head_dim)
+
+
+def decode_attention_cpu(
+    q, k_cache, v_cache, current_pos, n_heads, n_kv_heads, head_dim
+):
+    """Single-query GQA attention over the KV cache (decode step).
+
+    Args:
+        q: (emb_dim,) -- query vector for the current token.
+        k_cache: (n_kv_heads, max_seq, head_dim) -- cached keys, read [0:current_pos+1].
+        v_cache: (n_kv_heads, max_seq, head_dim) -- cached values, read [0:current_pos+1].
+        current_pos: current token position (0-indexed).
+        n_heads: number of Q heads.
+        n_kv_heads: number of KV heads (GQA group = n_heads // n_kv_heads).
+        head_dim: head dimension.
+
+    Returns:
+        attn_out: (emb_dim,) attention output, bf16 -- the dtype the decode
+        drivers feed straight back into the next NPU dispatch.
+    """
+    group_size = n_heads // n_kv_heads
+    scale = 1.0 / np.sqrt(head_dim)
+    seq_len = current_pos + 1
+
+    q_heads = q.astype(np.float32).reshape(n_heads, head_dim)
+    k_cached = k_cache[:, :seq_len, :].astype(np.float32)  # (n_kv, seq, hd)
+    v_cached = v_cache[:, :seq_len, :].astype(np.float32)
+
+    out = np.zeros((n_heads, head_dim), dtype=np.float32)
+    for h in range(n_heads):
+        kv_h = h // group_size
+        scores = (q_heads[h] @ k_cached[kv_h].T) * scale  # (seq,)
+        probs = np.exp(scores - scores.max())
+        probs = probs / probs.sum()
+        out[h] = probs @ v_cached[kv_h]  # (hd,)
+
+    return out.reshape(-1).astype(bfloat16)

@@ -39,6 +39,7 @@ for _p in (_PROG_EXAMPLES, _LLAMA_BF16, _THIS_DIR):
     sys.path.insert(0, _p)
 
 from llama32_1b_weights import LlamaConfig  # noqa: E402
+from shared.infra.cpu_attn import decode_attention_cpu
 from shared.infra.cache import KernelCache  # noqa: E402
 from shared.infra.backend_presets import (  # noqa: E402
     RGR_INT4_BACKEND,
@@ -130,42 +131,6 @@ def compile_decode_kernels(cache, config):
 # ---------------------------------------------------------------------------
 # CPU decode attention (with KV cache) — identical to bf16 sibling.
 # ---------------------------------------------------------------------------
-
-
-def decode_attention_cpu(
-    q, k_cache, v_cache, current_pos, n_heads, n_kv_heads, head_dim
-):
-    """Single-query attention with KV cache.
-
-    Args:
-        q: (emb_dim,) — query vector for current token
-        k_cache: (n_kv_heads, max_seq, head_dim) — cached keys [0:current_pos+1]
-        v_cache: (n_kv_heads, max_seq, head_dim) — cached values [0:current_pos+1]
-        current_pos: current token position (0-indexed)
-        n_heads: number of Q heads (32)
-        n_kv_heads: number of KV heads (8)
-        head_dim: head dimension (64)
-
-    Returns:
-        attn_out: (emb_dim,) — attention output
-    """
-    group_size = n_heads // n_kv_heads
-    scale = 1.0 / np.sqrt(head_dim)
-    seq_len = current_pos + 1
-
-    q_heads = q.astype(np.float32).reshape(n_heads, head_dim)
-    k_cached = k_cache[:, :seq_len, :].astype(np.float32)
-    v_cached = v_cache[:, :seq_len, :].astype(np.float32)
-
-    out = np.zeros((n_heads, head_dim), dtype=np.float32)
-    for h in range(n_heads):
-        kv_h = h // group_size
-        scores = (q_heads[h] @ k_cached[kv_h].T) * scale
-        probs = np.exp(scores - scores.max())
-        probs = probs / probs.sum()
-        out[h] = probs @ v_cached[kv_h]
-
-    return out.reshape(-1).astype(bfloat16)
 
 
 # ---------------------------------------------------------------------------

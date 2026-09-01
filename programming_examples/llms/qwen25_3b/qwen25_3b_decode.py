@@ -68,6 +68,7 @@ _LLMS_DIR = str(Path(__file__).resolve().parent.parent)
 if _LLMS_DIR not in sys.path:
     sys.path.insert(0, _LLMS_DIR)
 
+from shared.infra.cpu_attn import decode_attention_cpu
 from qwen25_3b_weights import LlamaConfig
 from qwen25_3b_cpu_helpers import rms_norm
 
@@ -313,38 +314,6 @@ def compile_decode_kernels(cache, config, verbose=False):
 # ---------------------------------------------------------------------------
 # CPU decode attention (with KV cache)
 # ---------------------------------------------------------------------------
-
-
-def decode_attention_cpu(
-    q, k_cache, v_cache, current_pos, n_heads, n_kv_heads, head_dim
-):
-    """Single-query GQA attention with KV cache.
-
-    Args:
-        q: (q_dim,) — RoPE'd (and bias-added) query vector for the current token.
-        k_cache: (n_kv_heads, max_seq, head_dim) — cached keys (after bias+RoPE).
-        v_cache: (n_kv_heads, max_seq, head_dim) — cached values (after bias).
-        current_pos: current token position (0-indexed).
-    Returns:
-        attn_out: (q_dim,) bfloat16.
-    """
-    group_size = n_heads // n_kv_heads
-    scale = 1.0 / np.sqrt(head_dim)
-    seq_len = current_pos + 1
-
-    q_heads = q.astype(np.float32).reshape(n_heads, head_dim)
-    k_cached = k_cache[:, :seq_len, :].astype(np.float32)
-    v_cached = v_cache[:, :seq_len, :].astype(np.float32)
-
-    out = np.zeros((n_heads, head_dim), dtype=np.float32)
-    for h in range(n_heads):
-        kv_h = h // group_size
-        scores = (q_heads[h] @ k_cached[kv_h].T) * scale
-        probs = np.exp(scores - scores.max())
-        probs = probs / probs.sum()
-        out[h] = probs @ v_cached[kv_h]
-
-    return out.reshape(-1).astype(bfloat16)
 
 
 # ---------------------------------------------------------------------------

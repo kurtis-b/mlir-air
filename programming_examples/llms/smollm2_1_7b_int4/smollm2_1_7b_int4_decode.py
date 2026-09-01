@@ -40,10 +40,8 @@ for _p in (_LLMS_DIR, _SMOLLM2_BF16, _LLAMA_INT4, _THIS_DIR):
     sys.path.insert(0, _p)
 
 from smollm2_1_7b_weights import LlamaConfig  # noqa: E402
-from llama32_1b_int4_decode import (  # noqa: E402,F401
-    decode_attention_cpu,
-    run_decode_block,
-)
+from shared.infra.cpu_attn import decode_attention_cpu  # noqa: E402,F401
+from llama32_1b_int4_decode import run_decode_block  # noqa: E402,F401
 from shared.infra.cache import KernelCache  # noqa: E402
 from shared.infra.backend_presets import (  # noqa: E402
     RGR_INT4_BACKEND,
