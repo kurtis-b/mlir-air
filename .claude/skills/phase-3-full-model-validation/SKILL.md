@@ -158,7 +158,7 @@ using Phase 2's CPU-fallback technique.
 | NaN in output | Uninitialized BO / reused stale buffer | Invoke `debug-bo-corruption` |
 | Per-layer cos OK, prefill prediction OK, but multi-token generation diverges quickly | KV cache update bug at decode time (per-layer cosine only probes prefill; verify's 32-token generation catches it) | Validate KV cache values at end of prefill match HF |
 
-For any failure not in the table, invoke `superpowers:systematic-debugging`.
+For any failure not in the table, use the systematic-debugging fallback: capture a minimal repro, bisect the last relevant change, isolate the failing layer or kernel, and document the blocker in the model TODO.
 
 ## Update protocol
 

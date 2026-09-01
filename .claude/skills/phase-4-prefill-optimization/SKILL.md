@@ -144,7 +144,7 @@ diagnosis does not PASS/FAIL — it is the microscope, verify is the gate.
 | Cosine drops after an optimization skill | the skill has a layout/type assumption your model violates | Revert the change; check whether the assumption (e.g., seq-first only, all weights pre-transposed) holds |
 | Latency unchanged after `opt-merge-multi-launch-kernels` | Multi-launch ELF compiled but XRT call count didn't drop | Check `xrt-smi top` for actual call count; verify the new fused ELF is what `_run_cached` actually invokes (not falling back to per-kernel path) |
 
-For any failure not in the table, invoke `superpowers:systematic-debugging`.
+For any failure not in the table, use the systematic-debugging fallback: capture a minimal repro, bisect the last relevant change, isolate the failing layer or kernel, and document the blocker in the model TODO.
 
 ## Update protocol
 

@@ -125,7 +125,7 @@ output. Don't apply remedies speculatively.
 | Symptom doesn't fit any of 4 hypotheses | What to check |
 |---|---|
 | Output is wrong on iter 1 too (not just stale across calls) | Not BO corruption; this is a kernel correctness bug — re-run Phase 1 standalone test for that kernel |
-| Output is wrong only at specific seq_len / layer index | Could be KV cache layout bug; invoke `superpowers:systematic-debugging` |
+| Output is wrong only at specific seq_len / layer index | Could be KV cache layout bug; use the systematic-debugging fallback: capture a minimal repro, bisect the last relevant change, isolate the failing layer or kernel, and document the blocker in the model TODO |
 | `bo_key` is unique per layer but still aliasing | `KernelCache` may be reusing artifact across `bo_key` — inspect `cache.artifacts` dict at runtime |
 
 ## Update protocol

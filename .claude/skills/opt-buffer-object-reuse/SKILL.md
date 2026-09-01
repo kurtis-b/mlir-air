@@ -98,7 +98,7 @@ Same mechanic, two contexts (pass which one as the caller's parameter):
 | Output mismatch on the very 1st call | a slot marked `intermediate` is actually read before being written | Re-classify that slot as a real input (drop it from `intermediate_indices`) |
 | No host-time reduction | the per-call upload wasn't the bottleneck (kernel-bound) | Document; the merge skill (dispatch) or opt-layout-alignment may be the bigger win |
 
-For any failure not in the table, invoke `superpowers:systematic-debugging`.
+For any failure not in the table, use the systematic-debugging fallback: capture a minimal repro, bisect the last relevant change, isolate the failing layer or kernel, and document the blocker in the model TODO.
 
 ## Update protocol
 

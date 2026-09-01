@@ -134,7 +134,7 @@ reverting optimization skills instead.
 | Cosine drops after an optimization skill | the skill has a layout/type assumption this model violates | Revert the change; check the assumption (e.g., decode already seq-first, weights already pre-transposed) |
 | ms/token unchanged after `opt-merge-multi-launch-kernels` | Per-call XRT overhead dominates; fusion alone insufficient | `opt-buffer-object-reuse` (static weight BOs) is likely the missing piece — apply it next |
 
-For any failure not in the table, invoke `superpowers:systematic-debugging`.
+For any failure not in the table, use the systematic-debugging fallback: capture a minimal repro, bisect the last relevant change, isolate the failing layer or kernel, and document the blocker in the model TODO.
 
 ## Update protocol
 

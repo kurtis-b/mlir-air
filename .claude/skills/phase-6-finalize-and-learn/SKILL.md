@@ -263,7 +263,7 @@ If gaps, fix here before Phase 7.
 | TPS regressed vs Phase 5 baseline | Same as above for decode | Compare Phase 5 standalone profile |
 | `make profile` shows huge "Setup" time inside profiled scope | `setup()` called inside the timed region instead of once before | Refactor — `inference()` must call `setup()` BEFORE `t0 = time.time()` |
 
-For any failure not in the table, invoke `superpowers:systematic-debugging`.
+For any failure not in the table, use the systematic-debugging fallback: capture a minimal repro, bisect the last relevant change, isolate the failing layer or kernel, and document the blocker in the model TODO.
 
 ## Update protocol
 
