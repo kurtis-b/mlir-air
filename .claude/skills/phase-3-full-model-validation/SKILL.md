@@ -118,8 +118,8 @@ is a failure. No manual per-prompt probability classification is needed.
 
 ```bash
 cd programming_examples/llms/<model>
-flock -x -w 1800 /tmp/mlir-air-npu.lock make diagnosis    # per-layer cosine, all layers
-flock -x -w 1800 /tmp/mlir-air-npu.lock make verify       # token-set gate (exit 0/1)
+agents/scripts/devq.sh run --class measure -- make diagnosis    # per-layer cosine, all layers
+agents/scripts/devq.sh run --class measure -- make verify       # token-set gate (exit 0/1)
 ```
 
 From verify: PASS/FAIL (criterion 1, the gate); the report under

@@ -169,8 +169,8 @@ If a standalone harness or top-level example covers the shape:
 
 ```bash
 cd programming_examples/<harness_or_example_dir>
-flock -x -w 1800 /tmp/mlir-air-npu.lock make run       # element-wise atol/rtol vs FP32 ref → PASS!/failed.
-flock -x -w 1800 /tmp/mlir-air-npu.lock make profile   # timing
+agents/scripts/devq.sh run --class measure -- make run       # element-wise atol/rtol vs FP32 ref → PASS!/failed.
+agents/scripts/devq.sh run --class measure -- make profile   # timing
 ```
 
 If no standalone harness exists for the kernel, use the deployment's
@@ -178,11 +178,14 @@ per-layer diagnosis:
 
 ```bash
 cd programming_examples/llms/<model>
-flock -x -w 1800 /tmp/mlir-air-npu.lock make diagnosis  # per-layer ffn_out cosine vs HF bf16
+agents/scripts/devq.sh run --class measure -- make diagnosis  # per-layer ffn_out cosine vs HF bf16
 ```
 
-NPU is shared on this machine — every NPU command must be `flock`-wrapped
-(see project memory). Compile-only steps don't need the lock.
+NPU is shared on this machine — every NPU command goes through the device
+scheduler, `agents/scripts/devq.sh run --class measure -- CMD` (AGENTS.md).
+Never wrap one in a bare `flock` on the NPU lock: inside a devq job the runner
+already holds that lock, so the inner flock waits on its own parent. Compile
+steps use `--class build`.
 
 If the harness reports `failed.` (or, for a no-harness kernel, the
 diagnosis cosine drops) → see "Failure modes" below. Bound: 1 retry per

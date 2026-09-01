@@ -111,7 +111,7 @@ BEFORE running anything, READ:
 
 ```bash
 cd <model_dir>
-flock -x -w 1800 /tmp/mlir-air-npu.lock make verify
+agents/scripts/devq.sh run --class measure -- make verify
 ```
 
 Expected (per Phase 6 / verify subsystem design):
@@ -159,7 +159,7 @@ and why. Use the structure below:
 
 ## 3. Manual reproduce
     cd <model_dir>
-    flock -x -w 1800 /tmp/mlir-air-npu.lock make verify
+    agents/scripts/devq.sh run --class measure -- make verify
 ```
 
 ## Failure modes

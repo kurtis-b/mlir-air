@@ -84,7 +84,7 @@ this is the number every skill must beat:
 
 ```bash
 cd programming_examples/llms/<model>
-flock -x -w 1800 /tmp/mlir-air-npu.lock make profile
+agents/scripts/devq.sh run --class measure -- make profile
 ```
 
 Record: ms/token + per-layer + LM head time breakdown (where the
@@ -111,7 +111,7 @@ Phase 3/finalize, profiled here — not a separate optimization skill.
 After every applied (or attempted) optimization skill, re-run the gate:
 
 ```bash
-flock -x -w 1800 /tmp/mlir-air-npu.lock make verify      # GATE: token-set, exit 1 on FAIL
+agents/scripts/devq.sh run --class measure -- make verify      # GATE: token-set, exit 1 on FAIL
 ```
 
 `make verify` PASS is the correctness gate (its 32-token generation is

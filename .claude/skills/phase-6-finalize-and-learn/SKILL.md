@@ -159,29 +159,29 @@ at the right `programming_examples/llms/verify/prompts/*.txt`.
 Mirror `programming_examples/llms/llama32_1b/Makefile` — note the verify
 runner is the **shared** one at `../verify/`, selected via `--runner`:
 
+The recipes do NOT take the NPU lock themselves — no sibling example's do. The
+caller serialises through the broker (`agents/scripts/devq.sh run --class measure
+-- make verify`); a bare `flock` inside a recipe would wait on its own parent when
+the recipe runs inside a devq job.
+
 ```makefile
 RUNNER_ADAPTER := <model>.verify_adapter
 VERIFY_RUNNER  := $(srcdir)/../verify/verify_runner.py
 
 run:
-	flock -x -w 1800 /tmp/mlir-air-npu.lock \
-		bash -c 'cd $(BUILD_DIR) && python3 $(srcdir)/<model>_inference.py --n-tokens 100'
+	cd $(BUILD_DIR) && python3 $(srcdir)/<model>_inference.py --n-tokens 100
 
 verify:
-	flock -x -w 1800 /tmp/mlir-air-npu.lock \
-		bash -c 'cd $(BUILD_DIR) && python3 $(VERIFY_RUNNER) --runner=$(RUNNER_ADAPTER) --prompts topk_token --model $(MODEL) --max-prompts 2'
+	cd $(BUILD_DIR) && python3 $(VERIFY_RUNNER) --runner=$(RUNNER_ADAPTER) --prompts topk_token --model $(MODEL) --max-prompts 2
 
 verify-full:
-	flock -x -w 1800 /tmp/mlir-air-npu.lock \
-		bash -c 'cd $(BUILD_DIR) && python3 $(VERIFY_RUNNER) --runner=$(RUNNER_ADAPTER) --prompts topk_token --model $(MODEL)'
+	cd $(BUILD_DIR) && python3 $(VERIFY_RUNNER) --runner=$(RUNNER_ADAPTER) --prompts topk_token --model $(MODEL)
 
 diagnosis:
-	flock -x -w 1800 /tmp/mlir-air-npu.lock \
-		bash -c 'cd $(BUILD_DIR) && python3 $(VERIFY_RUNNER) --runner=$(RUNNER_ADAPTER) --prompts single --model $(MODEL)'
+	cd $(BUILD_DIR) && python3 $(VERIFY_RUNNER) --runner=$(RUNNER_ADAPTER) --prompts single --model $(MODEL)
 
 profile:
-	flock -x -w 1800 /tmp/mlir-air-npu.lock \
-		bash -c 'cd $(BUILD_DIR) && python3 $(srcdir)/<model>_inference.py --profile --n-tokens 20'
+	cd $(BUILD_DIR) && python3 $(srcdir)/<model>_inference.py --profile --n-tokens 20
 ```
 
 `MODEL` defaults to `instruct` (matches what production stacks deploy);
@@ -191,7 +191,7 @@ profile:
 
 ```bash
 cd programming_examples/llms/<model>
-flock -x -w 1800 /tmp/mlir-air-npu.lock make verify
+agents/scripts/devq.sh run --class measure -- make verify
 ```
 
 The runner: both NPU and HF bf16 greedy-decode each prompt × 32 tokens,
